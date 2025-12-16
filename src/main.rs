@@ -25,13 +25,15 @@
 //! | レイテンシ | コンテキストスイッチ削減 |
 //! | ゼロコピー | sendfile + TLS暗号化 |
 //!
-//! ### 有効化条件
+//! ### 有効化方法
+//!
+//! kTLSはs2n-tls経由でサポートされています。
 //!
 //! ```bash
 //! # 1. カーネルモジュールのロード
 //! sudo modprobe tls
 //!
-//! # 2. 機能フラグ付きでビルド
+//! # 2. s2n-tlsフィーチャー付きでビルド
 //! cargo build --release --features ktls
 //!
 //! # 3. 設定ファイルで有効化
@@ -47,28 +49,14 @@
 //! - Linux 5.15以上（推奨）
 //! - `tls`カーネルモジュールがロード済み
 //! - AES-GCM暗号スイート（TLS 1.2/1.3）
-//!
-//! ### 現在の実装状況
-//!
-//! **実装済み:**
-//! - kTLSカーネルモジュールの可用性チェック
-//! - 設定ファイルでのkTLSオプション
-//! - kTLS設定のための低レベルAPI（`ktls_support`モジュール）
-//!
-//! **未実装（今後の課題）:**
-//! - monoio-rustlsからのTLSセッションキー抽出
-//!   - 理由: monoio-rustlsが内部のrustls::Connectionへのアクセスを提供していない
-//!   - 解決策: カスタムTLSハンドシェイク実装、またはmonoio-rustlsの拡張
-//! - kTLS有効時のsendfile最適化
-//!   - 理由: 現在はユーザースペースでファイル読み込み後にTLSストリームに書き込み
-//!   - 解決策: kTLS設定後、直接splice/sendfileシステムコールを使用
+//! - s2n-tlsフィーチャーでビルド（`--features ktls`）
 //!
 //! ### セキュリティ考慮事項
 //!
 //! | リスク | 緩和策 |
 //! |--------|--------|
 //! | カーネルバグ | カーネルバージョン固定、定期的なパッチ適用 |
-//! | セッションキー露出 | TLSハンドシェイクはrustlsで実行 |
+//! | セッションキー露出 | TLSハンドシェイクはs2n-tlsで実行 |
 //! | DoS攻撃 | カーネルリソース監視、レート制限 |
 //! | NICファームウェア脆弱性 | ハードウェアオフロード無効化オプション |
 //!
@@ -77,12 +65,12 @@
 //! kTLSの効果を測定するには：
 //!
 //! ```bash
-//! # 1. ベースライン（kTLS無効）
+//! # 1. ベースライン（kTLS無効 / rustls使用）
 //! cargo build --release
 //! ./target/release/zerocopy-server &
 //! wrk -t4 -c100 -d30s https://localhost/
 //!
-//! # 2. kTLS有効
+//! # 2. kTLS有効（s2n-tls使用）
 //! cargo build --release --features ktls
 //! # config.tomlでktls_enabled = true
 //! ./target/release/zerocopy-server &
@@ -95,8 +83,7 @@
 //! ### 参考資料
 //!
 //! - [Linux Kernel TLS](https://docs.kernel.org/networking/tls.html)
-//! - [Flukeプロジェクト](https://github.com/fluke): io_uring + kTLSの参考実装
-//! - [rustls kTLS issue](https://github.com/rustls/rustls/issues/198)
+//! - [s2n-tls](https://github.com/aws/s2n-tls): AWS製のTLS実装（kTLSネイティブサポート）
 
 use mimalloc::MiMalloc;
 
@@ -104,7 +91,7 @@ use mimalloc::MiMalloc;
 static GLOBAL: MiMalloc = MiMalloc;
 
 // s2n-tls モジュール（kTLS 対応）
-#[cfg(feature = "s2n")]
+#[cfg(feature = "ktls")]
 mod s2n_tls;
 
 use httparse::{Request, Status, Header};
@@ -117,35 +104,40 @@ use serde::Deserialize;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-#[cfg(not(feature = "s2n"))]
+#[cfg(not(feature = "ktls"))]
 use std::fs::File;
 use std::io;
-#[cfg(not(feature = "s2n"))]
+#[cfg(not(feature = "ktls"))]
 use std::io::BufReader;
 use std::net::SocketAddr;
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::AtomicUsize;
 use std::thread;
 use std::time::Duration;
 use ftlog::{info, error, warn};
+use memchr::memchr3;
 use time::OffsetDateTime;
 
 // rustls（デフォルト）
-#[cfg(not(feature = "s2n"))]
+#[cfg(not(feature = "ktls"))]
 use monoio_rustls::{TlsAcceptor, TlsConnector, ServerTlsStream, ClientTlsStream};
-#[cfg(not(feature = "s2n"))]
+#[cfg(not(feature = "ktls"))]
 use rustls::{ServerConfig, ClientConfig, RootCertStore};
-#[cfg(not(feature = "s2n"))]
+#[cfg(not(feature = "ktls"))]
 use rustls::crypto::CryptoProvider;
-#[cfg(not(feature = "s2n"))]
+#[cfg(not(feature = "ktls"))]
 use rustls::pki_types::ServerName;
-#[cfg(not(feature = "s2n"))]
+#[cfg(not(feature = "ktls"))]
 use rustls_pemfile::{certs, private_key};
 
 // s2n-tls（kTLS 対応）
-#[cfg(feature = "s2n")]
-use s2n_tls::{S2nConfig, S2nAcceptor, S2nConnector, S2nTlsStream};
+#[cfg(feature = "ktls")]
+use s2n_tls::{S2nConfig, S2nAcceptor, S2nConnector, S2nTlsStream, SplicePipe};
 
 // ====================
 // TLS ストリーム型エイリアス
@@ -154,305 +146,29 @@ use s2n_tls::{S2nConfig, S2nAcceptor, S2nConnector, S2nTlsStream};
 // s2n フィーチャーの有無に応じて、使用する TLS ストリーム型を切り替えます。
 // これにより、コードの大部分を共通化できます。
 
-#[cfg(not(feature = "s2n"))]
+#[cfg(not(feature = "ktls"))]
 type ServerTls = ServerTlsStream<TcpStream>;
 
-#[cfg(feature = "s2n")]
+#[cfg(feature = "ktls")]
 type ServerTls = S2nTlsStream;
 
-#[cfg(not(feature = "s2n"))]
+#[cfg(not(feature = "ktls"))]
 type ClientTls = ClientTlsStream<TcpStream>;
 
 // s2n-tls 使用時のクライアント TLS ストリーム
 // 注: s2n-tls でのバックエンド接続は将来の実装
-#[cfg(feature = "s2n")]
+#[cfg(feature = "ktls")]
 type ClientTls = S2nTlsStream;
 
-// kTLS（Kernel TLS）サポート
-// 注: 現在のmonoio-rustls APIではAsRawFdへのアクセスが制限されているため、
-// このimportは将来の実装用に残されています。
-#[cfg(all(target_os = "linux", feature = "ktls"))]
-#[allow(unused_imports)]
-use std::os::unix::io::AsRawFd;
-
 // ====================
-// kTLS（Kernel TLS）モジュール
+// kTLS設定情報
 // ====================
 //
-// kTLSはLinuxカーネルの機能で、TLS暗号化/復号化をカーネルレベルで
-// 行うことにより、以下のメリットを提供します：
+// kTLSはs2n-tls経由でサポートされています。
+// `cargo build --features ktls` でビルドしてください。
 //
-// 1. ゼロコピー送信: sendfile(2)がTLS暗号化済みデータを直接送信
-// 2. CPU使用率削減: カーネルでの暗号化によりコンテキストスイッチ削減
-// 3. スループット向上: 高負荷時に20-40%のCPU節約、最大2倍のスループット
-//
-// セキュリティ考慮事項:
-// - TLSハンドシェイクはrustls（ユーザースペース）で実行
-// - データ転送フェーズのみkTLSにオフロード
-// - カーネルバグの影響範囲に注意（CVE等）
-// - フォワードシークレシ(PFS)は維持される
-//
-// 要件:
-// - Linux 5.15+
-// - `modprobe tls` でkTLSモジュールをロード
-// - AES-GCM暗号スイート（TLS 1.2/1.3）
-// ====================
 
-#[cfg(all(target_os = "linux", feature = "ktls"))]
-mod ktls_support {
-    use std::os::unix::io::RawFd;
-    use std::io;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    
-    // kTLS関連の定数（Linux kernel headers より）
-    const SOL_TLS: libc::c_int = 282;
-    const TLS_TX: libc::c_int = 1;
-    #[allow(dead_code)]
-    const TLS_RX: libc::c_int = 2;
-    
-    // TLSバージョン
-    const TLS_1_2_VERSION: u16 = 0x0303;
-    const TLS_1_3_VERSION: u16 = 0x0304;
-    
-    // 暗号スイート識別子
-    const TLS_CIPHER_AES_GCM_128: u16 = 51;
-    const TLS_CIPHER_AES_GCM_256: u16 = 52;
-    #[allow(dead_code)]
-    const TLS_CIPHER_CHACHA20_POLY1305: u16 = 54;
-    
-    // kTLS可用性のキャッシュ
-    static KTLS_AVAILABLE: AtomicBool = AtomicBool::new(false);
-    static KTLS_CHECKED: AtomicBool = AtomicBool::new(false);
-    
-    /// kTLSの利用可能性をチェック
-    /// 
-    /// カーネルがkTLSをサポートしているかを確認します。
-    /// 結果はキャッシュされ、以降の呼び出しでは即座に返されます。
-    pub fn is_ktls_available() -> bool {
-        if KTLS_CHECKED.load(Ordering::Relaxed) {
-            return KTLS_AVAILABLE.load(Ordering::Relaxed);
-        }
-        
-        let available = check_ktls_support();
-        KTLS_AVAILABLE.store(available, Ordering::Relaxed);
-        KTLS_CHECKED.store(true, Ordering::Relaxed);
-        available
-    }
-    
-    /// カーネルのkTLSサポートを確認
-    fn check_ktls_support() -> bool {
-        // /proc/modulesでtlsモジュールがロードされているか確認
-        if let Ok(modules) = std::fs::read_to_string("/proc/modules") {
-            if !modules.lines().any(|line| line.starts_with("tls ")) {
-                ftlog::warn!("kTLS: TLS kernel module not loaded. Run 'modprobe tls' to enable.");
-                return false;
-            }
-        } else {
-            return false;
-        }
-        
-        // カーネルバージョンをチェック（5.15+推奨）
-        if let Ok(version) = std::fs::read_to_string("/proc/version") {
-            if let Some(ver_str) = version.split_whitespace().nth(2) {
-                let parts: Vec<&str> = ver_str.split('.').collect();
-                if parts.len() >= 2 {
-                    if let (Ok(major), Ok(minor)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
-                        if major < 5 || (major == 5 && minor < 15) {
-                            ftlog::warn!("kTLS: Kernel version {}.{} detected. 5.15+ recommended for full kTLS support.", major, minor);
-                        }
-                    }
-                }
-            }
-        }
-        
-        true
-    }
-    
-    /// TLS 1.2用のkTLS暗号情報構造体（AES-128-GCM）
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct TlsCryptoInfoAesGcm128 {
-        version: u16,
-        cipher_type: u16,
-        iv: [u8; 8],
-        key: [u8; 16],
-        salt: [u8; 4],
-        rec_seq: [u8; 8],
-    }
-    
-    /// TLS 1.2用のkTLS暗号情報構造体（AES-256-GCM）
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct TlsCryptoInfoAesGcm256 {
-        version: u16,
-        cipher_type: u16,
-        iv: [u8; 8],
-        key: [u8; 32],
-        salt: [u8; 4],
-        rec_seq: [u8; 8],
-    }
-    
-    /// kTLS設定の結果
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum KtlsConfigResult {
-        /// 成功
-        Success,
-        /// kTLSが利用不可
-        NotAvailable,
-        /// サポートされていない暗号スイート
-        UnsupportedCipher,
-        /// 設定エラー
-        ConfigError,
-    }
-    
-    /// ソケットにkTLSを設定
-    /// 
-    /// TLSハンドシェイク完了後、セッションキーを使用してカーネルにTLSオフロードを設定します。
-    /// 
-    /// # Safety
-    /// 
-    /// この関数はTLSハンドシェイクが完全に完了した後にのみ呼び出す必要があります。
-    /// セッションキーはTLSセッションから抽出されたものである必要があります。
-    /// 
-    /// # Arguments
-    /// 
-    /// * `fd` - ソケットのファイルディスクリプタ
-    /// * `tls_version` - TLSバージョン (0x0303 = TLS 1.2, 0x0304 = TLS 1.3)
-    /// * `cipher_suite` - 暗号スイート識別子
-    /// * `key` - 暗号化キー (16 or 32 bytes)
-    /// * `iv` - 初期化ベクトル (8 bytes)
-    /// * `salt` - ソルト値 (4 bytes)
-    /// * `rec_seq` - レコードシーケンス番号 (8 bytes)
-    /// 
-    /// # Returns
-    /// 
-    /// kTLS設定の結果
-    #[allow(dead_code)]
-    pub fn configure_ktls_tx(
-        fd: RawFd,
-        tls_version: u16,
-        cipher_suite: u16,
-        key: &[u8],
-        iv: &[u8],
-        salt: &[u8],
-        rec_seq: &[u8],
-    ) -> KtlsConfigResult {
-        if !is_ktls_available() {
-            return KtlsConfigResult::NotAvailable;
-        }
-        
-        // TCP ULPとしてTLSを設定
-        let ulp_name = b"tls\0";
-        let ret = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_TCP,
-                libc::TCP_ULP,
-                ulp_name.as_ptr() as *const libc::c_void,
-                ulp_name.len() as libc::socklen_t,
-            )
-        };
-        
-        if ret < 0 {
-            let err = io::Error::last_os_error();
-            ftlog::warn!("kTLS: Failed to set TCP_ULP: {}", err);
-            return KtlsConfigResult::ConfigError;
-        }
-        
-        // 暗号スイートに応じた設定
-        let result = match (tls_version, cipher_suite, key.len()) {
-            (TLS_1_2_VERSION | TLS_1_3_VERSION, TLS_CIPHER_AES_GCM_128, 16) => {
-                let mut crypto_info = TlsCryptoInfoAesGcm128 {
-                    version: tls_version,
-                    cipher_type: TLS_CIPHER_AES_GCM_128,
-                    iv: [0u8; 8],
-                    key: [0u8; 16],
-                    salt: [0u8; 4],
-                    rec_seq: [0u8; 8],
-                };
-                crypto_info.iv.copy_from_slice(&iv[..8]);
-                crypto_info.key.copy_from_slice(&key[..16]);
-                crypto_info.salt.copy_from_slice(&salt[..4]);
-                crypto_info.rec_seq.copy_from_slice(&rec_seq[..8]);
-                
-                unsafe {
-                    libc::setsockopt(
-                        fd,
-                        SOL_TLS,
-                        TLS_TX,
-                        &crypto_info as *const _ as *const libc::c_void,
-                        std::mem::size_of::<TlsCryptoInfoAesGcm128>() as libc::socklen_t,
-                    )
-                }
-            }
-            (TLS_1_2_VERSION | TLS_1_3_VERSION, TLS_CIPHER_AES_GCM_256, 32) => {
-                let mut crypto_info = TlsCryptoInfoAesGcm256 {
-                    version: tls_version,
-                    cipher_type: TLS_CIPHER_AES_GCM_256,
-                    iv: [0u8; 8],
-                    key: [0u8; 32],
-                    salt: [0u8; 4],
-                    rec_seq: [0u8; 8],
-                };
-                crypto_info.iv.copy_from_slice(&iv[..8]);
-                crypto_info.key.copy_from_slice(&key[..32]);
-                crypto_info.salt.copy_from_slice(&salt[..4]);
-                crypto_info.rec_seq.copy_from_slice(&rec_seq[..8]);
-                
-                unsafe {
-                    libc::setsockopt(
-                        fd,
-                        SOL_TLS,
-                        TLS_TX,
-                        &crypto_info as *const _ as *const libc::c_void,
-                        std::mem::size_of::<TlsCryptoInfoAesGcm256>() as libc::socklen_t,
-                    )
-                }
-            }
-            _ => {
-                ftlog::warn!("kTLS: Unsupported cipher suite: version=0x{:04x}, cipher={}", tls_version, cipher_suite);
-                return KtlsConfigResult::UnsupportedCipher;
-            }
-        };
-        
-        if result < 0 {
-            let err = io::Error::last_os_error();
-            ftlog::warn!("kTLS: Failed to configure TLS_TX: {}", err);
-            return KtlsConfigResult::ConfigError;
-        }
-        
-        KtlsConfigResult::Success
-    }
-    
-    /// kTLSが正常に設定されているかをテスト
-    #[allow(dead_code)]
-    pub fn test_ktls_configuration() -> bool {
-        // ダミーソケットを作成してkTLS設定が可能かテスト
-        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-        if fd < 0 {
-            return false;
-        }
-        
-        let ulp_name = b"tls\0";
-        let ret = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_TCP,
-                libc::TCP_ULP,
-                ulp_name.as_ptr() as *const libc::c_void,
-                ulp_name.len() as libc::socklen_t,
-            )
-        };
-        
-        unsafe { libc::close(fd) };
-        
-        // ENOPROTOOPT(-92)はkTLSが利用できないことを示す
-        // 0または他のエラー(接続されていないなど)は利用可能の可能性
-        ret == 0 || (ret < 0 && io::Error::last_os_error().raw_os_error() != Some(92))
-    }
-}
-
-/// kTLS設定情報（将来の拡張用）
+/// kTLS設定情報
 #[derive(Clone, Debug, Default)]
 pub struct KtlsConfig {
     /// kTLSを有効化するかどうか
@@ -510,7 +226,7 @@ static SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
 // ====================
 
 // rustls 用の TLS コネクター
-#[cfg(not(feature = "s2n"))]
+#[cfg(not(feature = "ktls"))]
 thread_local! {
     static TLS_CONNECTOR: TlsConnector = {
         let mut root_store = RootCertStore::empty();
@@ -525,7 +241,7 @@ thread_local! {
 }
 
 // s2n-tls 用の TLS コネクター
-#[cfg(feature = "s2n")]
+#[cfg(feature = "ktls")]
 thread_local! {
     static TLS_CONNECTOR: S2nConnector = {
         let config = S2nConfig::new_client()
@@ -643,6 +359,130 @@ thread_local! {
     static HTTPS_POOL: RefCell<HttpsConnectionPool> = RefCell::new(HttpsConnectionPool::new());
 }
 
+// kTLS 有効時のスレッドローカル Splice パイプ
+// splice(2) によるゼロコピー転送に使用
+#[cfg(feature = "ktls")]
+thread_local! {
+    static SPLICE_PIPE: RefCell<Option<SplicePipe>> = RefCell::new(None);
+}
+
+/// スレッドローカルな Splice パイプを取得または初期化
+#[cfg(feature = "ktls")]
+fn get_splice_pipe() -> std::cell::Ref<'static, Option<SplicePipe>> {
+    SPLICE_PIPE.with(|p| {
+        {
+            let mut pipe = p.borrow_mut();
+            if pipe.is_none() {
+                match SplicePipe::new() {
+                    Ok(new_pipe) => {
+                        *pipe = Some(new_pipe);
+                        ftlog::info!("Splice pipe initialized for this thread");
+                    }
+                    Err(e) => {
+                        ftlog::warn!("Failed to create splice pipe: {}", e);
+                    }
+                }
+            }
+        }
+        // Safety: ライフタイムを'staticに拡張（thread_localなので安全）
+        unsafe { std::mem::transmute(p.borrow()) }
+    })
+}
+
+// ====================
+// Raw I/O ヘルパー関数（kTLS + splice 用）
+// ====================
+//
+// monoio の所有権ベースの I/O を回避するため、
+// libc::read/write を直接使用します。
+// 非同期待機は TcpStream::readable()/writable() を使用。
+// ====================
+
+/// libc::read のラッパー（ノンブロッキング対応）
+#[cfg(feature = "ktls")]
+#[inline]
+fn raw_read(fd: std::os::unix::io::RawFd, buf: &mut [u8]) -> io::Result<usize> {
+    let result = unsafe {
+        libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(result as usize)
+    }
+}
+
+/// libc::write のラッパー（ノンブロッキング対応）
+#[cfg(feature = "ktls")]
+#[inline]
+fn raw_write(fd: std::os::unix::io::RawFd, buf: &[u8]) -> io::Result<usize> {
+    let result = unsafe {
+        libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len())
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(result as usize)
+    }
+}
+
+/// 非同期 raw read（TcpStream から FD 経由で読み取り）
+/// 
+/// monoio の所有権ベース I/O を回避し、libc::read を直接使用。
+/// WouldBlock の場合は readable() で待機してリトライ。
+#[cfg(feature = "ktls")]
+async fn async_raw_read(stream: &TcpStream, buf: &mut [u8]) -> io::Result<usize> {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    
+    loop {
+        match raw_read(fd, buf) {
+            Ok(n) => return Ok(n),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // 読み取り可能になるまで待機
+                stream.readable(false).await?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// 非同期 raw write（TcpStream へ FD 経由で書き込み）
+/// 
+/// monoio の所有権ベース I/O を回避し、libc::write を直接使用。
+/// WouldBlock の場合は writable() で待機してリトライ。
+#[cfg(feature = "ktls")]
+async fn async_raw_write(stream: &TcpStream, buf: &[u8]) -> io::Result<usize> {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let mut written = 0;
+    
+    while written < buf.len() {
+        match raw_write(fd, &buf[written..]) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0")),
+            Ok(n) => written += n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // 書き込み可能になるまで待機
+                stream.writable(false).await?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    
+    Ok(written)
+}
+
+/// 非同期 raw write all（全バイト書き込み完了まで）
+#[cfg(feature = "ktls")]
+async fn async_raw_write_all(stream: &TcpStream, buf: &[u8]) -> io::Result<()> {
+    let written = async_raw_write(stream, buf).await?;
+    if written < buf.len() {
+        Err(io::Error::new(io::ErrorKind::WriteZero, "failed to write all bytes"))
+    } else {
+        Ok(())
+    }
+}
+
 // ====================
 // バッファプール
 // ====================
@@ -698,6 +538,8 @@ fn buf_put(mut buf: Vec<u8>) {
 struct Config {
     server: ServerConfigSection,
     tls: TlsConfigSection,
+    #[serde(default)]
+    performance: PerformanceConfigSection,
     host_routes: Option<HashMap<String, BackendConfig>>,
     path_routes: Option<HashMap<String, HashMap<String, BackendConfig>>>,
 }
@@ -705,6 +547,10 @@ struct Config {
 #[derive(Deserialize)]
 struct ServerConfigSection {
     listen: String,
+    /// ワーカースレッド数
+    /// 未指定または0の場合はCPUコア数と同じスレッド数を使用
+    #[serde(default)]
+    threads: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -724,6 +570,45 @@ struct TlsConfigSection {
     /// - カーネルバグの影響範囲に注意
     #[serde(default)]
     ktls_enabled: bool,
+}
+
+/// パフォーマンス設定
+#[derive(Deserialize, Clone, Default)]
+struct PerformanceConfigSection {
+    /// SO_REUSEPORTの振り分け方式
+    /// - "kernel": カーネルデフォルト（3元タプルハッシュ）
+    /// - "cbpf": クライアントIPベースのCBPF振り分け（Linux 4.6+必須）
+    #[serde(default)]
+    reuseport_balancing: ReuseportBalancing,
+}
+
+/// SO_REUSEPORTの振り分け方式
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+enum ReuseportBalancing {
+    /// カーネルデフォルト（3元タプルハッシュ: protocol + source IP + source port）
+    #[default]
+    Kernel,
+    /// クライアントIPベースのCBPF振り分け
+    /// 同一クライアントIPからの接続を常に同じワーカースレッドに振り分け
+    /// CPUキャッシュ効率とセッション再開効率を向上
+    Cbpf,
+}
+
+impl<'de> serde::Deserialize<'de> for ReuseportBalancing {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "kernel" => Ok(ReuseportBalancing::Kernel),
+            "cbpf" => Ok(ReuseportBalancing::Cbpf),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown reuseport_balancing value: '{}', expected 'kernel' or 'cbpf'",
+                other
+            ))),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -895,14 +780,14 @@ impl AsyncWriter for TcpStream {
 }
 
 // ServerTlsStream用の実装（rustls）
-#[cfg(not(feature = "s2n"))]
+#[cfg(not(feature = "ktls"))]
 impl AsyncReader for ServerTlsStream<TcpStream> {
     async fn read_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
         self.read(buf).await
     }
 }
 
-#[cfg(not(feature = "s2n"))]
+#[cfg(not(feature = "ktls"))]
 impl AsyncWriter for ServerTlsStream<TcpStream> {
     async fn write_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
         self.write_all(buf).await
@@ -910,14 +795,14 @@ impl AsyncWriter for ServerTlsStream<TcpStream> {
 }
 
 // ClientTlsStream用の実装（rustls）
-#[cfg(not(feature = "s2n"))]
+#[cfg(not(feature = "ktls"))]
 impl AsyncReader for ClientTlsStream<TcpStream> {
     async fn read_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
         self.read(buf).await
     }
 }
 
-#[cfg(not(feature = "s2n"))]
+#[cfg(not(feature = "ktls"))]
 impl AsyncWriter for ClientTlsStream<TcpStream> {
     async fn write_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
         self.write_all(buf).await
@@ -925,14 +810,14 @@ impl AsyncWriter for ClientTlsStream<TcpStream> {
 }
 
 // S2nTlsStream用の実装（s2n-tls + kTLS）
-#[cfg(feature = "s2n")]
+#[cfg(feature = "ktls")]
 impl AsyncReader for S2nTlsStream {
     async fn read_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
         self.read(buf).await
     }
 }
 
-#[cfg(feature = "s2n")]
+#[cfg(feature = "ktls")]
 impl AsyncWriter for S2nTlsStream {
     async fn write_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
         self.write_all(buf).await
@@ -944,7 +829,7 @@ impl AsyncWriter for S2nTlsStream {
 // ====================
 
 // rustls 用の TLS 設定読み込み
-#[cfg(not(feature = "s2n"))]
+#[cfg(not(feature = "ktls"))]
 fn load_tls_config(tls_config: &TlsConfigSection) -> io::Result<Arc<ServerConfig>> {
     let cert_file = File::open(&tls_config.cert_path)?;
     let key_file = File::open(&tls_config.key_path)?;
@@ -965,7 +850,7 @@ fn load_tls_config(tls_config: &TlsConfigSection) -> io::Result<Arc<ServerConfig
 }
 
 // s2n-tls 用の TLS 設定読み込み
-#[cfg(feature = "s2n")]
+#[cfg(feature = "ktls")]
 fn load_tls_config(tls_config: &TlsConfigSection) -> io::Result<Arc<S2nConfig>> {
     let cert_pem = fs::read(&tls_config.cert_path)?;
     let key_pem = fs::read(&tls_config.key_path)?;
@@ -977,23 +862,27 @@ fn load_tls_config(tls_config: &TlsConfigSection) -> io::Result<Arc<S2nConfig>> 
 }
 
 /// 設定読み込みの戻り値型（rustls）
-#[cfg(not(feature = "s2n"))]
+#[cfg(not(feature = "ktls"))]
 struct LoadedConfig {
     listen_addr: String,
     tls_config: Arc<ServerConfig>,
     host_routes: Arc<HashMap<Box<[u8]>, Backend>>,
     path_routes: Arc<HashMap<Box<[u8]>, SortedPathMap>>,
     ktls_config: KtlsConfig,
+    reuseport_balancing: ReuseportBalancing,
+    num_threads: usize,
 }
 
 /// 設定読み込みの戻り値型（s2n-tls）
-#[cfg(feature = "s2n")]
+#[cfg(feature = "ktls")]
 struct LoadedConfig {
     listen_addr: String,
     tls_config: Arc<S2nConfig>,
     host_routes: Arc<HashMap<Box<[u8]>, Backend>>,
     path_routes: Arc<HashMap<Box<[u8]>, SortedPathMap>>,
     ktls_config: KtlsConfig,
+    reuseport_balancing: ReuseportBalancing,
+    num_threads: usize,
 }
 
 fn load_config(path: &Path) -> io::Result<LoadedConfig> {
@@ -1039,12 +928,20 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         }
     }
 
+    // スレッド数の決定: 未指定または0の場合はCPUコア数を使用
+    let num_threads = match config.server.threads {
+        Some(n) if n > 0 => n,
+        _ => num_cpus::get(),
+    };
+
     Ok(LoadedConfig {
         listen_addr: config.server.listen,
         tls_config,
         host_routes: Arc::new(host_routes_bytes),
         path_routes: Arc::new(path_routes_bytes),
         ktls_config,
+        reuseport_balancing: config.performance.reuseport_balancing,
+        num_threads,
     })
 }
 
@@ -1081,12 +978,12 @@ fn load_backend(config: &BackendConfig) -> io::Result<Backend> {
 
 fn main() {
     // rustls 使用時: プロセスレベルで暗号プロバイダーをインストール（ring使用）
-    #[cfg(not(feature = "s2n"))]
+    #[cfg(not(feature = "ktls"))]
     CryptoProvider::install_default(rustls::crypto::ring::default_provider())
         .expect("Failed to install rustls crypto provider");
     
     // s2n-tls 使用時: s2n-tls ライブラリを初期化
-    #[cfg(feature = "s2n")]
+    #[cfg(feature = "ktls")]
     s2n_tls::init().expect("Failed to initialize s2n-tls");
     
     let _guard = ftlog::Builder::new().try_init().unwrap();
@@ -1100,10 +997,10 @@ fn main() {
     };
     
     // TLS アクセプターを作成
-    #[cfg(not(feature = "s2n"))]
+    #[cfg(not(feature = "ktls"))]
     let acceptor = TlsAcceptor::from(loaded_config.tls_config);
     
-    #[cfg(feature = "s2n")]
+    #[cfg(feature = "ktls")]
     let acceptor = S2nAcceptor::new(loaded_config.tls_config.clone())
         .with_ktls(loaded_config.ktls_config.enabled);
     
@@ -1115,11 +1012,15 @@ fn main() {
         .map(|h| h.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "unknown".to_string());
     
+    let num_threads = loaded_config.num_threads;
+    
     info!("============================================");
     info!("High-Performance Reverse Proxy Server");
     info!("Hostname: {}", hostname);
     info!("Listen Address: {}", listen_addr);
-    info!("Threads: {}", num_cpus::get());
+    info!("Threads: {} (CPU cores: {})", num_threads, num_cpus::get());
+    info!("CPU Affinity: Enabled (pinning workers to cores)");
+    info!("Reuseport Balancing: {:?}", loaded_config.reuseport_balancing);
     info!("Read Timeout: {:?}", READ_TIMEOUT);
     info!("Write Timeout: {:?}", WRITE_TIMEOUT);
     info!("Connect Timeout: {:?}", CONNECT_TIMEOUT);
@@ -1133,8 +1034,21 @@ fn main() {
     // Graceful Shutdown用のシグナルハンドラを設定
     setup_signal_handler();
 
-    let num_threads = num_cpus::get();
     let mut handles = Vec::with_capacity(num_threads);
+
+    // CPUアフィニティ設定のためのコアID取得
+    let core_ids = core_affinity::get_core_ids();
+    let core_ids_available = core_ids.as_ref().map(|ids| ids.len()).unwrap_or(0);
+    
+    if core_ids.is_some() && core_ids_available > 0 {
+        info!("CPU Affinity: {} cores available, pinning {} worker threads", 
+              core_ids_available, num_threads);
+    } else {
+        warn!("CPU Affinity: Could not detect core IDs, workers will not be pinned");
+    }
+
+    // SO_REUSEPORT振り分け設定
+    let reuseport_balancing = loaded_config.reuseport_balancing;
 
     for thread_id in 0..num_threads {
         let acceptor_clone = acceptor.clone();
@@ -1142,14 +1056,34 @@ fn main() {
         let path_routes_clone = loaded_config.path_routes.clone();
         let ktls_config_clone = ktls_config.clone();
         let addr = listen_addr;
+        let balancing = reuseport_balancing;
+        let workers = num_threads;
+        
+        // このスレッドに割り当てるコアIDを決定
+        // コア数よりスレッド数が多い場合はモジュロ演算でラップアラウンド
+        let assigned_core = core_ids.as_ref().map(|ids| {
+            let core_index = thread_id % ids.len();
+            ids[core_index]
+        });
 
         let handle = thread::spawn(move || {
+            // スレッド開始直後にCPUアフィニティを設定
+            // これによりL1/L2キャッシュミスを削減し、レイテンシのジッターを安定化
+            if let Some(core_id) = assigned_core {
+                if core_affinity::set_for_current(core_id) {
+                    info!("[Thread {}] Pinned to CPU core {:?}", thread_id, core_id);
+                } else {
+                    warn!("[Thread {}] Failed to pin to CPU core {:?}, running unpinned", 
+                          thread_id, core_id);
+                }
+            }
+            
             let mut rt = RuntimeBuilder::<monoio::IoUringDriver>::new()
                 .enable_timer()
                 .build()
                 .expect("Failed to create runtime");
             rt.block_on(async move {
-                let listener = match create_listener(addr) {
+                let listener = match create_listener(addr, balancing, workers, thread_id) {
                     Ok(l) => l,
                     Err(e) => {
                         error!("[Thread {}] Bind error: {}", thread_id, e);
@@ -1210,7 +1144,7 @@ fn main() {
 fn log_ktls_status(ktls_config: &KtlsConfig) {
     if ktls_config.enabled {
         // s2n-tls + kTLS 使用時
-        #[cfg(feature = "s2n")]
+        #[cfg(feature = "ktls")]
         {
             if s2n_tls::is_ktls_available() {
                 info!("kTLS: Enabled via s2n-tls (TX={}, RX={})", ktls_config.enable_tx, ktls_config.enable_rx);
@@ -1221,27 +1155,16 @@ fn log_ktls_status(ktls_config: &KtlsConfig) {
                 warn!("kTLS: Falling back to userspace TLS via s2n-tls");
             }
         }
-        // rustls + ktls feature 使用時
-        #[cfg(all(not(feature = "s2n"), target_os = "linux", feature = "ktls"))]
+        // rustls 使用時（kTLS非対応）
+        #[cfg(not(feature = "ktls"))]
         {
-            if ktls_support::is_ktls_available() {
-                info!("kTLS: Enabled (TX={}, RX={})", ktls_config.enable_tx, ktls_config.enable_rx);
-                info!("kTLS: Kernel TLS offload active - reduced CPU usage expected");
-            } else {
-                warn!("kTLS: Requested but not available - falling back to userspace TLS");
-                warn!("kTLS: Ensure 'modprobe tls' has been run and kernel 5.15+ is used");
-            }
-        }
-        // rustls without ktls feature
-        #[cfg(all(not(feature = "s2n"), not(all(target_os = "linux", feature = "ktls"))))]
-        {
-            warn!("kTLS: Enabled in config but not compiled with kTLS support");
-            warn!("kTLS: Rebuild with: cargo build --features ktls (rustls) or --features s2n (s2n-tls)");
+            warn!("kTLS: Enabled in config but rustls does not support kTLS");
+            warn!("kTLS: Rebuild with: cargo build --features ktls (s2n-tls) for kTLS support");
         }
     } else {
-        #[cfg(feature = "s2n")]
+        #[cfg(feature = "ktls")]
         info!("kTLS: Disabled (using userspace TLS via s2n-tls)");
-        #[cfg(not(feature = "s2n"))]
+        #[cfg(not(feature = "ktls"))]
         info!("kTLS: Disabled (using userspace TLS via rustls)");
     }
 }
@@ -1255,11 +1178,159 @@ fn setup_signal_handler() {
     }).expect("Failed to set signal handler");
 }
 
-fn create_listener(addr: SocketAddr) -> io::Result<TcpListener> {
+// ====================
+// SO_REUSEPORT CBPF ロードバランシング
+// ====================
+
+/// CBPFプログラムがアタッチ済みかどうかを追跡するグローバルカウンター
+/// 最初のワーカーのみがCBPFプログラムをアタッチする
+#[cfg(target_os = "linux")]
+static CBPF_ATTACHED: AtomicUsize = AtomicUsize::new(0);
+
+/// クライアントIPハッシュに基づく振り分けCBPFプログラムを生成
+/// 
+/// このBPFプログラムは、accept()時に呼び出され、
+/// クライアントのソースIPアドレスをハッシュしてワーカーインデックスを返す
+/// 
+/// # 引数
+/// * `num_workers` - ワーカースレッド数
+/// 
+/// # 戻り値
+/// BPF命令列（sock_filter配列）
+#[cfg(target_os = "linux")]
+fn create_reuseport_cbpf_program(num_workers: u32) -> Vec<libc::sock_filter> {
+    // BPF命令セット:
+    // 1. ソースIPアドレスを取得（sk_reuseport_mdからオフセット0でソースIPを読み取り）
+    // 2. ワーカー数でmod演算
+    // 3. 結果をソケットインデックスとして返す
+    //
+    // BPF_LD + BPF_W + BPF_ABS: 32ビットワードをパケットから絶対オフセットで読み込み
+    // BPF_ALU + BPF_MOD + BPF_K: 即値でmod演算
+    // BPF_RET + BPF_A: Aレジスタの値を返す
+    vec![
+        // LD A, [0]: ソースIPアドレスを読み込み（sk_reuseport_md構造体のオフセット0）
+        libc::sock_filter {
+            code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+            jt: 0,
+            jf: 0,
+            k: 0, // remote_ip4 のオフセット
+        },
+        // ALU MOD #num_workers: A = A % num_workers
+        libc::sock_filter {
+            code: (libc::BPF_ALU | libc::BPF_MOD | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: num_workers,
+        },
+        // RET A: Aレジスタの値（ソケットインデックス）を返す
+        libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_A) as u16,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+    ]
+}
+
+/// CBPFプログラムをソケットにアタッチする
+/// 
+/// SO_ATTACH_REUSEPORT_CBPF を使用して、クライアントIPベースの
+/// 振り分けロジックをカーネルに設定する
+/// 
+/// # 引数
+/// * `fd` - ソケットファイルディスクリプタ
+/// * `num_workers` - ワーカースレッド数
+/// 
+/// # 戻り値
+/// 成功時はOk(()), 失敗時はエラー
+#[cfg(target_os = "linux")]
+fn attach_reuseport_cbpf(fd: i32, num_workers: usize) -> io::Result<()> {
+    let program = create_reuseport_cbpf_program(num_workers as u32);
+    
+    #[repr(C)]
+    struct SockFprog {
+        len: u16,
+        filter: *const libc::sock_filter,
+    }
+    
+    let prog = SockFprog {
+        len: program.len() as u16,
+        filter: program.as_ptr(),
+    };
+    
+    // SO_ATTACH_REUSEPORT_CBPF の値（Linux 4.5+）
+    // include/uapi/asm-generic/socket.h: #define SO_ATTACH_REUSEPORT_CBPF 51
+    const SO_ATTACH_REUSEPORT_CBPF: libc::c_int = 51;
+    
+    let result = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            SO_ATTACH_REUSEPORT_CBPF,
+            &prog as *const _ as *const libc::c_void,
+            std::mem::size_of::<SockFprog>() as libc::socklen_t,
+        )
+    };
+    
+    if result < 0 {
+        let err = io::Error::last_os_error();
+        warn!("Failed to attach CBPF program: {} (errno: {})", err, err.raw_os_error().unwrap_or(-1));
+        return Err(err);
+    }
+    
+    Ok(())
+}
+
+/// リスナーソケットを作成する（SO_REUSEPORT + オプションのCBPF振り分け）
+/// 
+/// # 引数
+/// * `addr` - バインドするアドレス
+/// * `balancing` - 振り分け方式
+/// * `num_workers` - ワーカースレッド数（CBPF使用時に必要）
+/// * `worker_id` - このワーカーのID（最初のワーカーがCBPFをアタッチ）
+fn create_listener(
+    addr: SocketAddr,
+    #[allow(unused_variables)] balancing: ReuseportBalancing,
+    #[allow(unused_variables)] num_workers: usize,
+    #[allow(unused_variables)] worker_id: usize,
+) -> io::Result<TcpListener> {
     let config = monoio::net::ListenerConfig::default()
         .reuse_port(true)
         .backlog(8192);
-    TcpListener::bind_with_config(addr, &config)
+    let listener = TcpListener::bind_with_config(addr, &config)?;
+    
+    // Linux環境でCBPF振り分けが有効な場合、最初のワーカーのみCBPFプログラムをアタッチ
+    // 後続のワーカーはreuseportグループに参加し、自動的にBPFプログラムを継承する
+    #[cfg(target_os = "linux")]
+    if balancing == ReuseportBalancing::Cbpf {
+        // CAS操作で最初の1回だけアタッチを実行
+        let prev = CBPF_ATTACHED.compare_exchange(
+            0,
+            1,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        
+        if prev.is_ok() {
+            // このワーカーが最初にリスナーを作成した
+            let fd = listener.as_raw_fd();
+            match attach_reuseport_cbpf(fd, num_workers) {
+                Ok(()) => {
+                    info!("[Worker {}] CBPF reuseport load balancing enabled (client IP hash -> {} workers)", 
+                          worker_id, num_workers);
+                }
+                Err(e) => {
+                    // CBPFアタッチに失敗した場合はカーネルデフォルトにフォールバック
+                    warn!("[Worker {}] CBPF attach failed, falling back to kernel default: {}", 
+                          worker_id, e);
+                    // フラグをリセットして他のワーカーも試行できるようにする（オプション）
+                    // CBPF_ATTACHED.store(0, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+    
+    Ok(listener)
 }
 
 // ====================
@@ -1267,14 +1338,14 @@ fn create_listener(addr: SocketAddr) -> io::Result<TcpListener> {
 // ====================
 
 // rustls 使用時の接続処理
-#[cfg(not(feature = "s2n"))]
+#[cfg(not(feature = "ktls"))]
 async fn handle_connection(
     stream: TcpStream,
     acceptor: TlsAcceptor,
     host_routes: Arc<HashMap<Box<[u8]>, Backend>>,
     path_routes: Arc<HashMap<Box<[u8]>, SortedPathMap>>,
     _peer_addr: SocketAddr,
-    ktls_config: Arc<KtlsConfig>,
+    _ktls_config: Arc<KtlsConfig>,
 ) {
     // TLSハンドシェイクにタイムアウトを設定
     let tls_result = timeout(CONNECT_TIMEOUT, acceptor.accept(stream)).await;
@@ -1291,35 +1362,14 @@ async fn handle_connection(
         }
     };
 
-    // kTLS設定の試行（TLSハンドシェイク完了後）
-    // 
-    // 注意: 現在のmonoio-rustls APIでは、以下の理由によりkTLSの完全な統合が困難です:
-    // 
-    // 1. monoio-rustls::Stream は内部のTcpStreamへの直接アクセスを提供していない
-    //    - get_ref()/get_mut() メソッドがない
-    //    - AsRawFdトレイトが実装されていない
-    // 
-    // 2. rustls::ServerConnectionからセッションキーを抽出するAPIが危険とマークされている
-    //    - dangerous_extract_secrets() が必要
-    //    - セキュリティ上のリスクがある
-    // 
-    // kTLS を使用するには --features s2n でビルドし、s2n-tls を使用してください。
-    #[cfg(all(target_os = "linux", feature = "ktls"))]
-    {
-        if ktls_config.enabled && ktls_support::is_ktls_available() {
-            // kTLS可用性チェックのみ実行（実際の設定は将来の実装）
-            // 現在はユーザースペースTLSを使用
-        }
-    }
-    
-    // kTLS未使用時の警告抑制
-    let _ = &ktls_config;
+    // 注意: rustls では kTLS はサポートされていません。
+    // kTLS を使用するには --features ktls でビルドし、s2n-tls を使用してください。
 
     handle_requests(tls_stream, &host_routes, &path_routes).await;
 }
 
 // s2n-tls + kTLS 使用時の接続処理
-#[cfg(feature = "s2n")]
+#[cfg(feature = "ktls")]
 async fn handle_connection(
     stream: TcpStream,
     acceptor: S2nAcceptor,
@@ -1577,15 +1627,24 @@ fn is_valid_header_name(name: &[u8]) -> bool {
 /// obs-fold（折り返しヘッダー）は許容しない方針とする。
 /// これにより、プロキシとバックエンド間の解釈の違いを悪用した
 /// HTTP Request Smuggling攻撃を防止する。
+/// 
+/// ## 実装詳細
+/// 
+/// `memchr`クレートのSIMD最適化された`memchr3`関数を使用して、
+/// 3つの禁止文字（CR, LF, NUL）を並列に検索します。
+/// 
+/// - AVX2対応CPUでは32バイト単位で並列検査
+/// - SSE2対応CPUでは16バイト単位で並列検査
+/// - 小さな入力では自動的に最適なフォールバックを選択
+/// 
+/// これにより、大きなヘッダー値（Cookie、Authorization等）の
+/// 検証パフォーマンスが向上します。
 #[inline]
 fn is_valid_header_value(value: &[u8]) -> bool {
-    for &b in value {
-        // CR, LF, NULは絶対に禁止
-        if b == b'\r' || b == b'\n' || b == 0 {
-            return false;
-        }
-    }
-    true
+    // memchr3: 3つの文字を一度に検索（SIMD最適化）
+    // いずれかの禁止文字が見つかった場合はSome(位置)を返す
+    // 見つからなければNone -> 有効なヘッダー値
+    memchr3(b'\r', b'\n', 0, value).is_none()
 }
 
 // ====================
@@ -2159,6 +2218,48 @@ async fn proxy_http_pooled(
     };
 
     // リクエスト送信とレスポンス受信
+    // kTLS 有効時は splice(2) を使用してゼロコピー転送
+    #[cfg(feature = "ktls")]
+    let result = {
+        // kTLS + splice 版を試みる（Content-Length の場合のみ有効）
+        if client_stream.is_ktls_enabled() && !is_chunked {
+            let splice_result = proxy_http_request_splice(
+                &client_stream,
+                &backend_stream,
+                &request,
+                content_length,
+                is_chunked,
+                initial_body,
+            ).await;
+            
+            if splice_result.is_some() {
+                ftlog::debug!("HTTP proxy: kTLS + splice used for zero-copy transfer");
+                splice_result
+            } else {
+                // splice 版が失敗した場合は通常版にフォールバック
+                proxy_http_request(
+                    &mut client_stream,
+                    &mut backend_stream,
+                    request,
+                    content_length,
+                    is_chunked,
+                    initial_body,
+                ).await
+            }
+        } else {
+            // kTLS が無効または Chunked の場合は通常版を使用
+            proxy_http_request(
+                &mut client_stream,
+                &mut backend_stream,
+                request,
+                content_length,
+                is_chunked,
+                initial_body,
+            ).await
+        }
+    };
+    
+    #[cfg(not(feature = "ktls"))]
     let result = proxy_http_request(
         &mut client_stream,
         &mut backend_stream,
@@ -2234,6 +2335,293 @@ async fn proxy_http_request(
 }
 
 // ====================
+// kTLS + splice(2) によるHTTPプロキシ（高速版）
+// ====================
+//
+// kTLS が有効な場合、splice(2) を使用してカーネル空間で直接
+// データを転送します。HTTPバックエンド（平文）への接続で効果的です。
+//
+// 注意: Chunked 転送の場合は終端検出のためユーザー空間での
+// 処理が必要なため、splice は使用しません。
+// ====================
+
+/// kTLS + splice によるボディ転送（Content-Length固定長のみ）
+///
+/// FD間でsplice(2)を使用してゼロコピー転送を行います。
+/// 非ブロッキングソケットに対応し、WouldBlockの場合は待機します。
+///
+/// splice(2) によるボディ転送（固定長）
+#[cfg(feature = "ktls")]
+async fn splice_body_transfer(
+    src_stream: &TcpStream,
+    dst_stream: &TcpStream,
+    pipe: &SplicePipe,
+    mut remaining: usize,
+) -> u64 {
+    use std::os::unix::io::AsRawFd;
+    
+    let src_fd = src_stream.as_raw_fd();
+    let dst_fd = dst_stream.as_raw_fd();
+    let mut total = 0u64;
+    
+    const SPLICE_CHUNK_SIZE: usize = 65536;
+    
+    while remaining > 0 {
+        let chunk_size = remaining.min(SPLICE_CHUNK_SIZE);
+        
+        match pipe.transfer(src_fd, dst_fd, chunk_size) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n as u64;
+                remaining = remaining.saturating_sub(n);
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // 読み取り可能になるまで待機
+                if let Err(_) = src_stream.readable(false).await {
+                    break;
+                }
+            }
+            Err(e) => {
+                warn!("splice body transfer error: {}", e);
+                break;
+            }
+        }
+    }
+    
+    total
+}
+
+// ====================
+// kTLS + splice(2) によるHTTPプロキシ転送
+// ====================
+//
+// kTLS が有効な場合、以下のフローでゼロコピー転送を実現：
+//
+// [リクエスト] クライアント(kTLS) → splice → バックエンド(TCP)
+//   1. ヘッダー: raw_read で読み取り → パース → raw_write で送信
+//   2. ボディ(Content-Length): splice(2) でゼロコピー転送
+//   3. ボディ(Chunked): 通常の転送（終端検出が必要）
+//
+// [レスポンス] バックエンド(TCP) → splice → クライアント(kTLS)
+//   1. ヘッダー: raw_read で読み取り → パース → raw_write で送信
+//   2. ボディ(Content-Length): splice(2) でゼロコピー転送
+//   3. ボディ(Chunked): 通常の転送（終端検出が必要）
+// ====================
+
+/// kTLS + splice を使用したHTTPプロキシリクエスト処理
+///
+/// Content-Length が指定されている場合はボディ転送に splice を使用。
+/// Chunked 転送の場合は通常の転送を使用。
+#[cfg(feature = "ktls")]
+async fn proxy_http_request_splice(
+    client_stream: &S2nTlsStream,
+    backend_stream: &TcpStream,
+    request: &[u8],
+    content_length: usize,
+    is_chunked: bool,
+    initial_body: &[u8],
+) -> Option<(u16, u64, bool)> {
+    // splice パイプを取得
+    let pipe_ref = get_splice_pipe();
+    let pipe = match pipe_ref.as_ref() {
+        Some(p) => p,
+        None => {
+            warn!("splice pipe not available, falling back to normal transfer");
+            return None;
+        }
+    };
+    
+    // kTLS が有効でない場合はフォールバック
+    if !client_stream.is_ktls_enabled() {
+        return None;
+    }
+    
+    let client_tcp = client_stream.get_ref();
+    
+    // 1. リクエストヘッダーをバックエンドに送信（raw_write）
+    if let Err(e) = async_raw_write_all(backend_stream, request).await {
+        warn!("Failed to send request header: {}", e);
+        return None;
+    }
+    
+    // 2. 初期ボディがあれば送信
+    if !initial_body.is_empty() {
+        if let Err(e) = async_raw_write_all(backend_stream, initial_body).await {
+            warn!("Failed to send initial body: {}", e);
+            return None;
+        }
+    }
+    
+    // 3. 残りのリクエストボディを転送
+    let remaining_body = content_length.saturating_sub(initial_body.len());
+    if remaining_body > 0 {
+        if is_chunked {
+            // Chunked 転送はフォールバック（終端検出が必要）
+            return None;
+        }
+        
+        // Content-Length の場合: splice でゼロコピー転送
+        // kTLS クライアント → バックエンド TCP
+        let transferred = splice_body_transfer(
+            client_tcp,
+            backend_stream,
+            pipe,
+            remaining_body,
+        ).await;
+        
+        if transferred < remaining_body as u64 {
+            warn!("Request body transfer incomplete: {} < {}", transferred, remaining_body);
+            return None;
+        }
+    }
+    
+    // 4. レスポンスを受信して転送（splice 使用）
+    let result = splice_transfer_response_ktls(
+        backend_stream,
+        client_stream,
+        pipe,
+    ).await;
+    
+    Some(result)
+}
+
+/// kTLS + splice によるレスポンス転送
+///
+/// バックエンド(TCP) からヘッダーを読み取り、パースしてクライアント(kTLS)に送信。
+/// ボディは Content-Length の場合は splice、Chunked の場合は通常転送。
+#[cfg(feature = "ktls")]
+async fn splice_transfer_response_ktls(
+    backend_stream: &TcpStream,
+    client_stream: &S2nTlsStream,
+    pipe: &SplicePipe,
+) -> (u16, u64, bool) {
+    let client_tcp = client_stream.get_ref();
+    
+    let mut total = 0u64;
+    let mut status_code = 502u16;
+    let mut accumulated = Vec::with_capacity(4096);
+    let mut backend_wants_keep_alive: bool;
+    
+    // ヘッダー読み取り用バッファ
+    let mut header_buf = [0u8; 8192];
+    
+    // 1. ヘッダーを読み取り（raw_read + パース）
+    loop {
+        // バックエンドからヘッダーを読み取り
+        let n = match async_raw_read(backend_stream, &mut header_buf).await {
+            Ok(0) => {
+                // EOF
+                return (status_code, total, false);
+            }
+            Ok(n) => n,
+            Err(e) => {
+                warn!("Failed to read response header: {}", e);
+                return (status_code, total, false);
+            }
+        };
+        
+        accumulated.extend_from_slice(&header_buf[..n]);
+        
+        // ヘッダーが完全に受信されたかチェック
+        if let Some(parsed) = parse_http_response(&accumulated) {
+            status_code = parsed.status_code;
+            backend_wants_keep_alive = !parsed.is_connection_close;
+            
+            let header_len = parsed.header_len;
+            let body_start_len = accumulated.len().saturating_sub(header_len);
+            
+            // ヘッダー + 初期ボディをクライアントに送信（raw_write）
+            if let Err(e) = async_raw_write_all(client_tcp, &accumulated).await {
+                warn!("Failed to send response header: {}", e);
+                return (status_code, total, false);
+            }
+            total += accumulated.len() as u64;
+            
+            // ボディ転送
+            if parsed.is_chunked {
+                // Chunked 転送: 通常の方法で転送（終端検出が必要）
+                let mut chunked_decoder = ChunkedDecoder::new();
+                
+                // 初期ボディ部分をデコーダにフィード
+                if body_start_len > 0 {
+                    if chunked_decoder.feed(&accumulated[header_len..]) {
+                        // 初期ボディで完了
+                        return (status_code, total, backend_wants_keep_alive);
+                    }
+                }
+                
+                // 残りの Chunked ボディを転送
+                loop {
+                    let n = match async_raw_read(backend_stream, &mut header_buf).await {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(_) => {
+                            backend_wants_keep_alive = false;
+                            break;
+                        }
+                    };
+                    
+                    let is_complete = chunked_decoder.feed(&header_buf[..n]);
+                    
+                    if let Err(_) = async_raw_write_all(client_tcp, &header_buf[..n]).await {
+                        backend_wants_keep_alive = false;
+                        break;
+                    }
+                    total += n as u64;
+                    
+                    if is_complete {
+                        break;
+                    }
+                }
+            } else if let Some(content_length) = parsed.content_length {
+                // Content-Length 転送: splice でゼロコピー
+                let remaining = content_length.saturating_sub(body_start_len);
+                
+                if remaining > 0 {
+                    let transferred = splice_body_transfer(
+                        backend_stream,
+                        client_tcp,
+                        pipe,
+                        remaining,
+                    ).await;
+                    
+                    total += transferred;
+                    
+                    if transferred < remaining as u64 {
+                        backend_wants_keep_alive = false;
+                    }
+                }
+            } else {
+                // Content-Length も Chunked もない場合: 接続クローズまで読み取り
+                // この場合は Keep-Alive 不可
+                backend_wants_keep_alive = false;
+                
+                loop {
+                    let n = match async_raw_read(backend_stream, &mut header_buf).await {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    
+                    if let Err(_) = async_raw_write_all(client_tcp, &header_buf[..n]).await {
+                        break;
+                    }
+                    total += n as u64;
+                }
+            }
+            
+            return (status_code, total, backend_wants_keep_alive);
+        }
+        
+        // ヘッダーが大きすぎる場合は中止
+        if accumulated.len() > MAX_HEADER_SIZE {
+            warn!("Response header too large");
+            return (502, 0, false);
+        }
+    }
+}
+
+// ====================
 // HTTPS プロキシ（コネクションプール対応）
 // ====================
 
@@ -2276,7 +2664,7 @@ async fn proxy_https_pooled(
             
             // TLS接続（タイムアウト付き）
             // rustls 使用時
-            #[cfg(not(feature = "s2n"))]
+            #[cfg(not(feature = "ktls"))]
             let tls_stream = {
                 let server_name = match ServerName::try_from(target.host.clone()) {
                     Ok(name) => name,
@@ -2309,7 +2697,7 @@ async fn proxy_https_pooled(
             };
             
             // s2n-tls 使用時
-            #[cfg(feature = "s2n")]
+            #[cfg(feature = "ktls")]
             let tls_stream = {
                 let connector = TLS_CONNECTOR.with(|c| c.clone());
                 let tls_result = timeout(CONNECT_TIMEOUT, connector.connect(backend_tcp, &target.host)).await;
@@ -2462,6 +2850,41 @@ async fn transfer_exact_bytes<R: AsyncReader, W: AsyncWriter>(
     
     total
 }
+
+// ====================
+// kTLS + splice(2) によるゼロコピー転送（Linux 固有）
+// ====================
+//
+// kTLS が有効な場合、splice(2) を使用してカーネル空間で直接
+// データを転送します。これにより、ボディ転送時にユーザー空間への
+// コピーが完全に不要になります。
+//
+// ## 実装状況
+//
+// - **ファイル送信（sendfile）**: kTLS有効時にゼロコピー対応 ✅
+// - **プロキシ転送（splice）**: kTLS有効時 + Content-Length で対応 ✅
+//
+// ## プロキシ転送でのsplice使用
+//
+// libc::read/write を直接使用し、monoio の所有権ベース I/O を回避。
+// 非同期待機は TcpStream::readable()/writable() を使用。
+//
+// ### 対応状況
+// - Content-Length 転送: splice(2) でゼロコピー ✅
+// - Chunked 転送: 通常転送（終端検出が必要なため）
+//
+// ## splice(2) の転送フロー
+//
+// [リクエスト] クライアント(kTLS) → splice → バックエンド(TCP)
+//   1. ヘッダー: raw_read で読み取り → パース → raw_write で送信
+//   2. ボディ: splice(2) でゼロコピー転送
+//
+// [レスポンス] バックエンド(TCP) → splice → クライアント(kTLS)
+//   1. ヘッダー: raw_read で読み取り → パース → raw_write で送信
+//   2. ボディ: splice(2) でゼロコピー転送
+//
+// 注意: splice(2) は少なくとも一方のFDがパイプである必要があります。
+// ====================
 
 /// Chunkedボディを転送（ステートマシンベース）
 /// 
@@ -2872,6 +3295,30 @@ async fn transfer_response_with_keepalive<R: AsyncReader, W: AsyncWriter>(
 // ====================
 // SendFile処理
 // ====================
+//
+// kTLS + sendfile によるゼロコピー送信をサポートします。
+//
+// ## 通常の送信フロー（kTLS無効時）
+//
+// ファイル → ユーザー空間バッファ → TLS暗号化 → ネットワーク
+// （2回のコピーが発生）
+//
+// ## ゼロコピー送信フロー（kTLS有効時）
+//
+// ファイル → カーネル空間でTLS暗号化 → NIC
+// （ユーザー空間へのコピーなし）
+//
+// ### パフォーマンス効果
+//
+// - コンテキストスイッチの削減
+// - メモリアクセスの削減（L3キャッシュミスの減少）
+// - CPU使用率の低下（特に大きなファイル送信時）
+//
+// ### セキュリティ
+//
+// - ファイルの内容は変更されず、そのまま送信される
+// - TLS暗号化はカーネル内で行われるため安全
+// ====================
 
 async fn handle_sendfile(
     mut tls_stream: ServerTls,
@@ -2978,6 +3425,79 @@ async fn handle_sendfile(
     }
 
     // ファイル転送
+    // kTLS が有効な場合は sendfile によるゼロコピー送信を使用
+    #[cfg(feature = "ktls")]
+    {
+        if tls_stream.is_ktls_send_enabled() {
+            return handle_sendfile_zerocopy(tls_stream, &file, file_size, client_wants_close).await;
+        }
+    }
+    
+    // kTLS が無効な場合は従来の read/write を使用
+    handle_sendfile_userspace(tls_stream, &file, file_size, client_wants_close).await
+}
+
+/// kTLS + sendfile によるゼロコピーファイル送信
+///
+/// kTLS が有効な場合に使用されます。
+/// ファイルの内容をカーネル空間で直接 TLS 暗号化して送信します。
+#[cfg(feature = "ktls")]
+async fn handle_sendfile_zerocopy(
+    tls_stream: ServerTls,
+    file: &monoio::fs::File,
+    file_size: u64,
+    client_wants_close: bool,
+) -> Option<(ServerTls, u16, u64, bool)> {
+    use std::os::unix::io::AsRawFd;
+    
+    let file_fd = file.as_raw_fd();
+    let mut offset: i64 = 0;
+    let mut total_sent = 0u64;
+    
+    // sendfile を使用してファイルをゼロコピー送信
+    // sendfile はブロッキング呼び出しのため、大きなファイルはチャンク分割して送信
+    const SENDFILE_CHUNK_SIZE: usize = 1024 * 1024; // 1MB チャンク
+    
+    while (offset as u64) < file_size {
+        let remaining = file_size - (offset as u64);
+        let chunk_size = (remaining as usize).min(SENDFILE_CHUNK_SIZE);
+        
+        // sendfile 実行
+        match tls_stream.sendfile(file_fd, &mut offset, chunk_size) {
+            Ok(0) => {
+                // EOF
+                break;
+            }
+            Ok(n) => {
+                total_sent += n as u64;
+            }
+            Err(e) => {
+                // EAGAIN/EWOULDBLOCK の場合は再試行（非同期ソケットの場合）
+                if e.kind() == io::ErrorKind::WouldBlock {
+                    // writable を待ってから再試行
+                    if let Err(_) = tls_stream.get_ref().writable(false).await {
+                        break;
+                    }
+                    continue;
+                }
+                error!("sendfile error: {}", e);
+                break;
+            }
+        }
+    }
+
+    Some((tls_stream, 200, total_sent, client_wants_close))
+}
+
+/// 従来の read/write によるファイル送信（ユーザー空間経由）
+///
+/// kTLS が無効な場合、または rustls 使用時に使用されます。
+async fn handle_sendfile_userspace(
+    mut tls_stream: ServerTls,
+    file: &monoio::fs::File,
+    file_size: u64,
+    client_wants_close: bool,
+) -> Option<(ServerTls, u16, u64, bool)> {
     let mut total_sent = 0u64;
     let mut offset = 0u64;
     
