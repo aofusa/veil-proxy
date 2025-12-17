@@ -7,6 +7,8 @@ io_uring (monoio) と rustls を使用した高性能リバースプロキシサ
 - **非同期I/O**: monoio (io_uring) による効率的なI/O処理
 - **TLS**: rustls によるメモリ安全な Pure Rust TLS実装
 - **kTLS**: rustls + ktls2 によるカーネルTLSオフロード対応（Linux 5.15+）
+- **高速アロケータ**: mimalloc による高速メモリ割り当て + Huge Pages対応
+- **高速ルーティング**: Radix Tree (matchit) によるO(log n)パスマッチング
 - **コネクションプール**: バックエンド接続の再利用によるレイテンシ削減
 - **バッファプール**: メモリアロケーションの削減
 - **Keep-Alive**: HTTP/1.1 Keep-Alive完全サポート
@@ -82,6 +84,10 @@ threads = 4
 # "cbpf"   = クライアントIPベースのCBPF（キャッシュ効率向上、Linux 4.6+必須）
 reuseport_balancing = "cbpf"
 
+# Huge Pages (Large OS Pages) の使用
+# TLBミス削減により5-10%のパフォーマンス向上
+huge_pages_enabled = true
+
 [tls]
 cert_path = "/path/to/cert.pem"
 key_path = "/path/to/key.pem"
@@ -97,6 +103,50 @@ ktls_fallback_enabled = true # kTLS失敗時のrustlsフォールバック（デ
 [path_routes."example.com"]
 "/api/" = { type = "Proxy", url = "http://localhost:8080" }
 "/static/" = { type = "File", path = "/var/www/static", mode = "sendfile" }
+```
+
+## ルーティング
+
+### ルーティングの優先順位
+
+1. **ホストベースルーティング** (`[host_routes]`): Hostヘッダーで完全一致
+2. **パスベースルーティング** (`[path_routes."hostname"]`): パスの最長一致（Radix Tree）
+
+### バックエンドタイプ
+
+| タイプ | 説明 | 設定例 |
+|--------|------|--------|
+| `Proxy` | HTTPリバースプロキシ | `{ type = "Proxy", url = "http://localhost:8080" }` |
+| `File` | 静的ファイル配信 | `{ type = "File", path = "/var/www", mode = "sendfile" }` |
+
+### ファイル配信モード
+
+| モード | 説明 | 用途 |
+|--------|------|------|
+| `sendfile` | sendfileシステムコールでゼロコピー送信 | 大きなファイル、動画、画像 |
+| `memory` | ファイルをメモリに読み込んで配信 | 小さなファイル、favicon.ico等 |
+
+```toml
+# ディレクトリ配信（sendfileモード）
+"/static/" = { type = "File", path = "/var/www/static", mode = "sendfile" }
+
+# 単一ファイル配信（memoryモード）
+"/favicon.ico" = { type = "File", path = "/var/www/favicon.ico", mode = "memory" }
+
+# typeとmodeを省略した場合のデフォルト
+"/" = { path = "/var/www/html" }  # type = "File", mode = "sendfile"
+```
+
+### プロキシ設定
+
+HTTPおよびHTTPSバックエンドへのプロキシに対応：
+
+```toml
+# HTTPバックエンド
+"/api/" = { type = "Proxy", url = "http://localhost:8080" }
+
+# HTTPSバックエンド（TLSクライアント接続）
+"/secure/" = { type = "Proxy", url = "https://backend.example.com" }
 ```
 
 ## kTLS（Kernel TLS）サポート
@@ -236,6 +286,59 @@ reuseport_balancing = "cbpf"
 - **Linux 4.6以上**（SO_ATTACH_REUSEPORT_CBPFサポート）
 - CBPFアタッチ失敗時は自動的にカーネルデフォルトにフォールバック
 
+### Huge Pages（Large OS Pages）
+
+#### 概要
+
+mimallocアロケータでHuge Pages（2MB）を使用することで、TLB（Translation Lookaside Buffer）ミスを削減し、パフォーマンスを向上させます。
+
+#### 効果
+
+| 項目 | 効果 |
+|------|------|
+| TLBミス | 大幅削減（ページテーブル参照の減少） |
+| ページフォルト | 大容量メモリ使用時に減少 |
+| パフォーマンス | 5-10%向上（ワークロード依存） |
+| kTLS/splice | カーネル連携時に特に効果的 |
+
+#### 設定
+
+```toml
+[performance]
+huge_pages_enabled = true
+```
+
+#### OSレベルの設定（Linux）
+
+```bash
+# 一時的にHuge Pagesを有効化（128ページ = 256MB）
+echo 128 | sudo tee /proc/sys/vm/nr_hugepages
+
+# 永続化（/etc/sysctl.conf）
+echo "vm.nr_hugepages=128" | sudo tee -a /etc/sysctl.conf
+sudo sysctl -p
+
+# 現在のHuge Pages状態を確認
+grep -i huge /proc/meminfo
+```
+
+#### コンテナ環境での注意
+
+Docker/Kubernetes環境では、ホスト側でHuge Pagesを事前に確保する必要があります：
+
+```bash
+# ホスト側でHuge Pagesを確保
+echo 128 | sudo tee /proc/sys/vm/nr_hugepages
+
+# Docker起動時（オプション）
+docker run --shm-size=256m ...
+
+# Kubernetes（Pod仕様に追加）
+# resources.limits.hugepages-2Mi: "256Mi"
+```
+
+Huge Pagesが利用できない場合は、自動的に通常の4KBページにフォールバックします。
+
 ### システム設定
 
 ```bash
@@ -284,10 +387,23 @@ wrk -t4 -c100 -d30s https://localhost/
 
 ## 参考資料
 
-- [Linux Kernel TLS](https://docs.kernel.org/networking/tls.html)
+### コアライブラリ
+
+- [monoio](https://github.com/bytedance/monoio): io_uringベースの非同期ランタイム
 - [rustls](https://github.com/rustls/rustls): Pure Rust TLS実装
 - [ktls2](https://crates.io/crates/ktls2): rustls用kTLS統合クレート
-- [monoio](https://github.com/bytedance/monoio): io_uringベースの非同期ランタイム
+
+### パフォーマンス
+
+- [mimalloc](https://github.com/microsoft/mimalloc): 高速汎用メモリアロケータ
+- [matchit](https://crates.io/crates/matchit): 高速Radix Treeルーター
+- [Linux Huge Pages](https://docs.kernel.org/admin-guide/mm/hugetlbpage.html): Large OS Pages設定ガイド
+
+### カーネル機能
+
+- [Linux Kernel TLS](https://docs.kernel.org/networking/tls.html): kTLSドキュメント
+- [io_uring](https://kernel.dk/io_uring.pdf): io_uring設計ドキュメント
+- [SO_REUSEPORT](https://lwn.net/Articles/542629/): ポート共有とロードバランシング
 
 ## ライセンス
 
