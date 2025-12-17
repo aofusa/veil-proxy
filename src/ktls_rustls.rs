@@ -200,6 +200,10 @@ fn raw_write(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
 }
 
 /// rustls コネクションを使用して非同期ハンドシェイクを実行（サーバー側）
+/// 
+/// 重要: ハンドシェイク完了後、kTLS のシークレット抽出に備えて
+/// バッファリングされた全ての TLS レコードを送信する必要があります。
+/// TLS 1.3 ではハンドシェイク完了後もセッションチケット等が送信されます。
 async fn do_server_handshake(
     stream: &TcpStream,
     conn: &mut ServerConnection,
@@ -246,10 +250,37 @@ async fn do_server_handshake(
         }
     }
 
+    // ハンドシェイク完了後、バッファリングされた TLS レコードを全て送信
+    // TLS 1.3 ではセッションチケット (NewSessionTicket) がハンドシェイク後に送信される
+    // これを送信しないと dangerous_extract_secrets() が失敗する
+    while conn.wants_write() {
+        let mut write_buf = Vec::new();
+        conn.write_tls(&mut write_buf)?;
+        
+        if write_buf.is_empty() {
+            break;
+        }
+        
+        let mut written = 0;
+        while written < write_buf.len() {
+            match raw_write(fd, &write_buf[written..]) {
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0")),
+                Ok(n) => written += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    stream.writable(false).await?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     Ok(())
 }
 
 /// rustls コネクションを使用して非同期ハンドシェイクを実行（クライアント側）
+/// 
+/// 重要: ハンドシェイク完了後、kTLS のシークレット抽出に備えて
+/// バッファリングされた全ての TLS レコードを送信する必要があります。
 async fn do_client_handshake(
     stream: &TcpStream,
     conn: &mut ClientConnection,
@@ -296,6 +327,29 @@ async fn do_client_handshake(
         }
     }
 
+    // ハンドシェイク完了後、バッファリングされた TLS レコードを全て送信
+    // これを送信しないと dangerous_extract_secrets() が失敗する
+    while conn.wants_write() {
+        let mut write_buf = Vec::new();
+        conn.write_tls(&mut write_buf)?;
+        
+        if write_buf.is_empty() {
+            break;
+        }
+        
+        let mut written = 0;
+        while written < write_buf.len() {
+            match raw_write(fd, &write_buf[written..]) {
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0")),
+                Ok(n) => written += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    stream.writable(false).await?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -303,53 +357,112 @@ async fn do_client_handshake(
 // kTLS 有効化（低レベル実装）
 // ====================
 
-/// kTLS を有効化する（サーバー側）
+/// kTLS 有効化の結果
 #[cfg(feature = "ktls")]
-fn enable_ktls_server(
+pub enum KtlsEnableResult<C> {
+    /// kTLS 有効化成功
+    Enabled(TlsMode),
+    /// kTLS 有効化失敗、rustls へフォールバック（conn を返す）
+    Fallback(C, String),
+    /// 致命的エラー（復旧不可）
+    Fatal(io::Error),
+}
+
+/// kTLS を有効化する（サーバー側）
+/// 
+/// ULP設定を先に試み、失敗時はconnを返してrustlsへフォールバック可能にする
+#[cfg(feature = "ktls")]
+fn try_enable_ktls_server(
     stream: &TcpStream,
     conn: ServerConnection,
-) -> io::Result<TlsMode> {
+) -> KtlsEnableResult<ServerConnection> {
     let fd = stream.as_raw_fd();
     
-    // rustls::Connection に変換して kTLS を設定
-    let rustls_conn = rustls::Connection::Server(conn);
-    setup_ktls(fd, rustls_conn)?;
+    // Step 1: ULP設定を試みる（connを消費しない）
+    // これが失敗した場合はフォールバック可能
+    if let Err(e) = setup_ulp(fd) {
+        let msg = format!("ULP setup failed: {}", e);
+        ftlog::warn!("kTLS: {}, falling back to rustls", msg);
+        return KtlsEnableResult::Fallback(conn, msg);
+    }
     
-    ftlog::info!("ktls2: kTLS enabled for server connection");
-    Ok(TlsMode::KtlsFull)
+    // Step 2: 暗号スイートを取得
+    let cipher_suite = match conn.negotiated_cipher_suite() {
+        Some(cs) => cs,
+        None => {
+            let msg = "No negotiated cipher suite".to_string();
+            ftlog::warn!("kTLS: {}, falling back to rustls", msg);
+            return KtlsEnableResult::Fallback(conn, msg);
+        }
+    };
+    
+    // Step 3: rustls::Connection に変換してシークレット抽出とkTLS設定
+    // この時点で conn は消費される
+    let rustls_conn = rustls::Connection::Server(conn);
+    match setup_ktls_after_ulp(fd, rustls_conn, cipher_suite) {
+        Ok(()) => {
+            ftlog::info!("ktls2: kTLS enabled for server connection");
+            KtlsEnableResult::Enabled(TlsMode::KtlsFull)
+        }
+        Err(e) => {
+            // シークレット抽出後の失敗は致命的（connは既に消費済み）
+            KtlsEnableResult::Fatal(e)
+        }
+    }
 }
 
 /// kTLS を有効化する（クライアント側）
+/// 
+/// ULP設定を先に試み、失敗時はconnを返してrustlsへフォールバック可能にする
 #[cfg(feature = "ktls")]
-fn enable_ktls_client(
+fn try_enable_ktls_client(
     stream: &TcpStream,
     conn: ClientConnection,
-) -> io::Result<TlsMode> {
+) -> KtlsEnableResult<ClientConnection> {
     let fd = stream.as_raw_fd();
     
-    // rustls::Connection に変換して kTLS を設定
-    let rustls_conn = rustls::Connection::Client(conn);
-    setup_ktls(fd, rustls_conn)?;
+    // Step 1: ULP設定を試みる（connを消費しない）
+    if let Err(e) = setup_ulp(fd) {
+        let msg = format!("ULP setup failed: {}", e);
+        ftlog::warn!("kTLS: {}, falling back to rustls", msg);
+        return KtlsEnableResult::Fallback(conn, msg);
+    }
     
-    ftlog::info!("ktls2: kTLS enabled for client connection");
-    Ok(TlsMode::KtlsFull)
+    // Step 2: 暗号スイートを取得
+    let cipher_suite = match conn.negotiated_cipher_suite() {
+        Some(cs) => cs,
+        None => {
+            let msg = "No negotiated cipher suite".to_string();
+            ftlog::warn!("kTLS: {}, falling back to rustls", msg);
+            return KtlsEnableResult::Fallback(conn, msg);
+        }
+    };
+    
+    // Step 3: rustls::Connection に変換してシークレット抽出とkTLS設定
+    let rustls_conn = rustls::Connection::Client(conn);
+    match setup_ktls_after_ulp(fd, rustls_conn, cipher_suite) {
+        Ok(()) => {
+            ftlog::info!("ktls2: kTLS enabled for client connection");
+            KtlsEnableResult::Enabled(TlsMode::KtlsFull)
+        }
+        Err(e) => {
+            KtlsEnableResult::Fatal(e)
+        }
+    }
 }
 
-/// 低レベルの kTLS 設定
+/// ULP設定後のkTLS設定（シークレット抽出とTX/RX設定）
 #[cfg(feature = "ktls")]
-fn setup_ktls(fd: RawFd, conn: rustls::Connection) -> io::Result<()> {
+fn setup_ktls_after_ulp(
+    fd: RawFd,
+    conn: rustls::Connection,
+    cipher_suite: rustls::SupportedCipherSuite,
+) -> io::Result<()> {
     use ktls2::CryptoInfo;
-    
-    // ネゴシエートされた暗号スイートを取得
-    let cipher_suite = conn.negotiated_cipher_suite()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "No negotiated cipher suite"))?;
     
     // シークレットを抽出
     let secrets = conn.dangerous_extract_secrets()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to extract secrets: {:?}", e)))?;
-    
-    // ULP を設定
-    setup_ulp(fd)?;
     
     // TX 設定
     let tx = CryptoInfo::from_rustls(cipher_suite, secrets.tx)
@@ -428,6 +541,9 @@ fn setup_tls_info(fd: RawFd, dir: Direction, info: &ktls2::CryptoInfo) -> io::Re
 // ====================
 
 /// TLS ハンドシェイクを実行しサーバー TLS ストリームを作成
+/// 
+/// kTLS の有効化に失敗した場合は、可能な限り rustls にフォールバックして
+/// 接続を継続します。致命的なエラーの場合のみエラーを返します。
 pub async fn accept(
     stream: TcpStream,
     config: Arc<ServerConfig>,
@@ -444,12 +560,22 @@ pub async fn accept(
     // kTLS の有効化を試みる
     #[cfg(feature = "ktls")]
     let (mode, conn_option) = if enable_ktls {
-        match enable_ktls_server(&stream, conn) {
-            Ok(mode) => (mode, None),
-            Err(e) => {
-                ftlog::warn!("kTLS enable failed: {}, falling back to rustls", e);
-                // エラー時は新しい接続を作成（conn は既に消費されている）
-                // この場合、接続を再利用できないのでエラーを返す
+        match try_enable_ktls_server(&stream, conn) {
+            KtlsEnableResult::Enabled(mode) => {
+                // kTLS 有効化成功
+                (mode, None)
+            }
+            KtlsEnableResult::Fallback(returned_conn, reason) => {
+                // ULP設定失敗等、復旧可能なエラー - rustls にフォールバック
+                ftlog::info!(
+                    "kTLS unavailable ({}), using rustls for this connection",
+                    reason
+                );
+                (TlsMode::Rustls, Some(returned_conn))
+            }
+            KtlsEnableResult::Fatal(e) => {
+                // シークレット抽出後の失敗等、致命的エラー
+                ftlog::error!("kTLS fatal error: {}, connection cannot continue", e);
                 return Err(e);
             }
         }
@@ -471,6 +597,9 @@ pub async fn accept(
 }
 
 /// TLS ハンドシェイクを実行しクライアント TLS ストリームを作成
+/// 
+/// kTLS の有効化に失敗した場合は、可能な限り rustls にフォールバックして
+/// 接続を継続します。致命的なエラーの場合のみエラーを返します。
 pub async fn connect(
     stream: TcpStream,
     config: Arc<ClientConfig>,
@@ -488,10 +617,22 @@ pub async fn connect(
     // kTLS の有効化を試みる
     #[cfg(feature = "ktls")]
     let (mode, conn_option) = if enable_ktls {
-        match enable_ktls_client(&stream, conn) {
-            Ok(mode) => (mode, None),
-            Err(e) => {
-                ftlog::warn!("kTLS enable failed: {}, falling back to rustls", e);
+        match try_enable_ktls_client(&stream, conn) {
+            KtlsEnableResult::Enabled(mode) => {
+                // kTLS 有効化成功
+                (mode, None)
+            }
+            KtlsEnableResult::Fallback(returned_conn, reason) => {
+                // ULP設定失敗等、復旧可能なエラー - rustls にフォールバック
+                ftlog::info!(
+                    "kTLS unavailable ({}), using rustls for this connection",
+                    reason
+                );
+                (TlsMode::Rustls, Some(returned_conn))
+            }
+            KtlsEnableResult::Fatal(e) => {
+                // シークレット抽出後の失敗等、致命的エラー
+                ftlog::error!("kTLS fatal error: {}, connection cannot continue", e);
                 return Err(e);
             }
         }
@@ -1290,14 +1431,32 @@ pub fn is_ktls_available() -> bool {
 // クライアント設定ヘルパー
 // ====================
 
-/// デフォルトのクライアント TLS 設定を作成
-pub fn default_client_config() -> Arc<ClientConfig> {
+/// クライアント TLS 設定を作成
+/// 
+/// # Arguments
+/// 
+/// * `enable_ktls` - kTLS を有効化する場合は true。
+///                   true の場合、シークレット抽出が有効化される。
+pub fn client_config(enable_ktls: bool) -> Arc<ClientConfig> {
     let mut root_store = RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-    let config = ClientConfig::builder()
+    let mut config = ClientConfig::builder()
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
+    // kTLS が有効な場合のみシークレット抽出を有効化
+    if enable_ktls {
+        config.enable_secret_extraction = true;
+        ftlog::debug!("Client TLS secret extraction enabled for kTLS support");
+    }
+
     Arc::new(config)
+}
+
+/// デフォルトのクライアント TLS 設定を作成（kTLS 無効）
+/// 
+/// 後方互換性のためのラッパー関数
+pub fn default_client_config() -> Arc<ClientConfig> {
+    client_config(false)
 }

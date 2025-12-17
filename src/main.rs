@@ -221,10 +221,13 @@ static SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
 // ====================
 
 // rustls 用の TLS コネクター（kTLS 有効時は ktls_rustls を使用）
+// kTLSフィーチャー有効時はシークレット抽出を有効化し、kTLS利用可能な状態にする
 #[cfg(feature = "ktls")]
 thread_local! {
     static TLS_CONNECTOR: RustlsConnector = {
-        let config = ktls_rustls::default_client_config();
+        // kTLSフィーチャーが有効な場合はシークレット抽出を有効化
+        // 実際のkTLS使用はRustlsConnector::with_ktls()で制御
+        let config = ktls_rustls::client_config(true);
         RustlsConnector::new(config)
     };
 }
@@ -908,7 +911,7 @@ impl AsyncWriter for simple_tls::SimpleTlsClientStream {
 // ====================
 
 // rustls 用の TLS 設定読み込み（統一）
-fn load_tls_config(tls_config: &TlsConfigSection) -> io::Result<Arc<ServerConfig>> {
+fn load_tls_config(tls_config: &TlsConfigSection, ktls_enabled: bool) -> io::Result<Arc<ServerConfig>> {
     let cert_file = File::open(&tls_config.cert_path)?;
     let key_file = File::open(&tls_config.key_path)?;
 
@@ -919,10 +922,24 @@ fn load_tls_config(tls_config: &TlsConfigSection) -> io::Result<Arc<ServerConfig
     let keys = private_key(&mut key_reader)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Private key not found"))?;
 
-    let config = ServerConfig::builder()
+    // kTLS 有効時のみ config を変更するため、条件付きで mut を使用
+    #[allow(unused_mut)]
+    let mut config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(cert_chain, keys)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    // kTLS が有効な場合のみシークレット抽出を有効化
+    // これにより dangerous_extract_secrets() が使用可能になる
+    #[cfg(feature = "ktls")]
+    if ktls_enabled {
+        config.enable_secret_extraction = true;
+        info!("TLS secret extraction enabled for kTLS support");
+    }
+
+    // kTLS 無効時は警告を抑制
+    #[cfg(not(feature = "ktls"))]
+    let _ = ktls_enabled;
 
     Ok(Arc::new(config))
 }
@@ -943,14 +960,15 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     let config: Config = toml::from_str(&config_str)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("TOML parse error: {}", e)))?;
 
-    let tls_config = load_tls_config(&config.tls)?;
-    
-    // kTLS設定
+    // kTLS設定（TLS設定より先に読み込む）
     let ktls_config = KtlsConfig {
         enabled: config.tls.ktls_enabled,
         enable_tx: config.tls.ktls_enabled,
         enable_rx: config.tls.ktls_enabled,
     };
+
+    // TLS設定（kTLS有効時はシークレット抽出を有効化）
+    let tls_config = load_tls_config(&config.tls, ktls_config.enabled)?;
 
     let mut host_routes_bytes: HashMap<Box<[u8]>, Backend> = HashMap::new();
     if let Some(host_routes) = config.host_routes {
