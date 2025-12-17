@@ -14,6 +14,10 @@ reuseport_balancing = "cbpf"
 cert_path = "/path/to/cert.pem"
 key_path = "/path/to/key.pem"
 ktls_enabled = false  # kTLS有効化（Linux 5.15+、feature flag必須）
+# kTLS有効化失敗時にrustlsへフォールバックするかどうか
+# false: kTLS必須（失敗時は接続拒否）
+# true: kTLS失敗時はrustlsで継続（デフォルト）
+ktls_fallback_enabled = false
 
 # ホストベースルーティング
 [host_routes]
