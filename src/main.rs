@@ -1944,12 +1944,27 @@ enum ChunkedState {
     ExpectingTrailerLF,
     /// 転送完了
     Complete,
+    /// サイズ制限超過（DoS対策）
+    SizeLimitExceeded,
+}
+
+/// Chunkedデコーダのフィード結果
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ChunkedFeedResult {
+    /// まだ転送中
+    Continue,
+    /// 転送完了
+    Complete,
+    /// サイズ制限超過
+    SizeLimitExceeded,
 }
 
 /// Chunked転送デコーダ（ステートマシン）
 /// 
 /// RFC 7230 Section 4.1に準拠し、トレーラーの有無にかかわらず
 /// 正確に終端を検出します。
+/// 
+/// DoS対策として累積サイズの制限機能を持ちます。
 #[derive(Debug, Clone)]
 struct ChunkedDecoder {
     /// 現在の状態
@@ -1962,35 +1977,57 @@ struct ChunkedDecoder {
     size_has_digit: bool,
     /// トレーラー行が空かどうか（終端検出用）
     trailer_line_empty: bool,
+    /// 累積ボディサイズ（DoS対策）
+    total_body_size: u64,
+    /// 最大許容ボディサイズ（0の場合は制限なし）
+    max_body_size: u64,
 }
 
 impl ChunkedDecoder {
-    /// 新しいChunkedDecoderを作成
-    fn new() -> Self {
+    /// 新しいChunkedDecoderを作成（サイズ制限付き）
+    /// 
+    /// # Arguments
+    /// * `max_body_size` - 最大許容ボディサイズ（0の場合は制限なし）
+    fn new(max_body_size: u64) -> Self {
         Self {
             state: ChunkedState::ReadingChunkSize,
             chunk_remaining: 0,
             size_accumulator: 0,
             size_has_digit: false,
             trailer_line_empty: true,
+            total_body_size: 0,
+            max_body_size,
         }
+    }
+    
+    /// 新しいChunkedDecoderを作成（制限なし - レスポンス用）
+    fn new_unlimited() -> Self {
+        Self::new(0)
     }
     
     /// データをフィードして状態を更新
-    /// 完了した場合はtrueを返す
-    fn feed(&mut self, data: &[u8]) -> bool {
+    /// 完了またはサイズ制限超過の場合は適切な結果を返す
+    fn feed(&mut self, data: &[u8]) -> ChunkedFeedResult {
         for &byte in data {
-            if self.feed_byte(byte) {
-                return true;
+            match self.feed_byte(byte) {
+                ChunkedFeedResult::Continue => continue,
+                result => return result,
             }
         }
-        false
+        ChunkedFeedResult::Continue
+    }
+    
+    /// サイズ制限を超過したかどうか
+    #[inline]
+    #[allow(dead_code)]
+    fn is_size_exceeded(&self) -> bool {
+        self.state == ChunkedState::SizeLimitExceeded
     }
     
     /// 1バイトを処理して状態を更新
-    /// 完了した場合はtrueを返す
+    /// 完了またはサイズ制限超過の場合は適切な結果を返す
     #[inline]
-    fn feed_byte(&mut self, byte: u8) -> bool {
+    fn feed_byte(&mut self, byte: u8) -> ChunkedFeedResult {
         match self.state {
             ChunkedState::ReadingChunkSize => {
                 match byte {
@@ -2040,6 +2077,15 @@ impl ChunkedDecoder {
                         self.trailer_line_empty = true;
                     } else {
                         // 通常のチャンク - データセクションへ
+                        // サイズ制限チェック（DoS対策）
+                        if self.max_body_size > 0 {
+                            let new_total = self.total_body_size.saturating_add(self.size_accumulator);
+                            if new_total > self.max_body_size {
+                                self.state = ChunkedState::SizeLimitExceeded;
+                                return ChunkedFeedResult::SizeLimitExceeded;
+                            }
+                            self.total_body_size = new_total;
+                        }
                         self.chunk_remaining = self.size_accumulator;
                         self.state = ChunkedState::ReadingChunkData;
                     }
@@ -2096,7 +2142,7 @@ impl ChunkedDecoder {
                     if self.trailer_line_empty {
                         // 空行 = 転送完了
                         self.state = ChunkedState::Complete;
-                        return true;
+                        return ChunkedFeedResult::Complete;
                     } else {
                         // トレーラーヘッダー行が完了、次の行へ
                         self.state = ChunkedState::ReadingTrailerLine;
@@ -2110,10 +2156,14 @@ impl ChunkedDecoder {
             }
             
             ChunkedState::Complete => {
-                return true;
+                return ChunkedFeedResult::Complete;
+            }
+            
+            ChunkedState::SizeLimitExceeded => {
+                return ChunkedFeedResult::SizeLimitExceeded;
             }
         }
-        false
+        ChunkedFeedResult::Continue
     }
     
     /// 転送が完了したかどうかを返す
@@ -2373,9 +2423,15 @@ async fn proxy_http_request(
 
     // 3. 残りのリクエストボディを転送
     if is_chunked {
-        // Chunked転送の場合
-        if !transfer_chunked_body(client_stream, backend_stream, initial_body).await {
-            return None;
+        // Chunked転送の場合（DoS対策: MAX_BODY_SIZEで制限）
+        match transfer_chunked_body(client_stream, backend_stream, initial_body, MAX_BODY_SIZE as u64).await {
+            ChunkedTransferResult::Complete => {}
+            ChunkedTransferResult::Failed => return None,
+            ChunkedTransferResult::SizeLimitExceeded => {
+                // サイズ制限超過 - 413エラーを返すべきだが、
+                // ここではバックエンド接続を閉じて失敗として扱う
+                return None;
+            }
         }
     } else {
         // Content-Length転送の場合
@@ -2600,11 +2656,12 @@ async fn splice_transfer_response_ktls(
             // ボディ転送
             if parsed.is_chunked {
                 // Chunked 転送: 通常の方法で転送（終端検出が必要）
-                let mut chunked_decoder = ChunkedDecoder::new();
+                // レスポンス受信時は制限なし（バックエンドを信頼）
+                let mut chunked_decoder = ChunkedDecoder::new_unlimited();
                 
                 // 初期ボディ部分をデコーダにフィード
                 if body_start_len > 0 {
-                    if chunked_decoder.feed(&accumulated[header_len..]) {
+                    if chunked_decoder.feed(&accumulated[header_len..]) == ChunkedFeedResult::Complete {
                         // 初期ボディで完了
                         return (status_code, total, backend_wants_keep_alive);
                     }
@@ -2621,7 +2678,7 @@ async fn splice_transfer_response_ktls(
                         }
                     };
                     
-                    let is_complete = chunked_decoder.feed(&header_buf[..n]);
+                    let feed_result = chunked_decoder.feed(&header_buf[..n]);
                     
                     if let Err(_) = async_raw_write_all(client_tcp, &header_buf[..n]).await {
                         backend_wants_keep_alive = false;
@@ -2629,7 +2686,7 @@ async fn splice_transfer_response_ktls(
                     }
                     total += n as u64;
                     
-                    if is_complete {
+                    if feed_result == ChunkedFeedResult::Complete {
                         break;
                     }
                 }
@@ -2798,8 +2855,14 @@ async fn proxy_https_request(
 
     // 3. 残りのリクエストボディを転送
     if is_chunked {
-        if !transfer_chunked_body(client_stream, backend_stream, initial_body).await {
-            return None;
+        // Chunked転送の場合（DoS対策: MAX_BODY_SIZEで制限）
+        match transfer_chunked_body(client_stream, backend_stream, initial_body, MAX_BODY_SIZE as u64).await {
+            ChunkedTransferResult::Complete => {}
+            ChunkedTransferResult::Failed => return None,
+            ChunkedTransferResult::SizeLimitExceeded => {
+                // サイズ制限超過 - 接続を閉じて失敗として扱う
+                return None;
+            }
         }
     } else {
         let remaining = content_length.saturating_sub(initial_body.len());
@@ -2907,20 +2970,44 @@ async fn transfer_exact_bytes<R: AsyncReader, W: AsyncWriter>(
 // 注意: splice(2) は少なくとも一方のFDがパイプである必要があります。
 // ====================
 
+/// Chunkedボディ転送の結果
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ChunkedTransferResult {
+    /// 転送完了
+    Complete,
+    /// 転送失敗（I/Oエラー等）
+    Failed,
+    /// サイズ制限超過（DoS対策）
+    SizeLimitExceeded,
+}
+
 /// Chunkedボディを転送（ステートマシンベース）
 /// 
 /// RFC 7230準拠のChunkedDecoderを使用して、トレーラーの有無に
 /// かかわらず正確に終端を検出します。
+/// 
+/// DoS対策として、max_body_size を超えた場合は転送を中止します。
+/// 
+/// # Arguments
+/// * `reader` - 読み取り元ストリーム
+/// * `writer` - 書き込み先ストリーム
+/// * `initial_body` - 初期ボディデータ（ヘッダー後に既に読み取り済みのデータ）
+/// * `max_body_size` - 最大許容ボディサイズ（0の場合は制限なし）
 async fn transfer_chunked_body<R: AsyncReader, W: AsyncWriter>(
     reader: &mut R,
     writer: &mut W,
     initial_body: &[u8],
-) -> bool {
-    let mut decoder = ChunkedDecoder::new();
+    max_body_size: u64,
+) -> ChunkedTransferResult {
+    let mut decoder = ChunkedDecoder::new(max_body_size);
     
     // 初期ボディが既に終端を含んでいるかチェック
-    if !initial_body.is_empty() && decoder.feed(initial_body) {
-        return true;
+    if !initial_body.is_empty() {
+        match decoder.feed(initial_body) {
+            ChunkedFeedResult::Complete => return ChunkedTransferResult::Complete,
+            ChunkedFeedResult::SizeLimitExceeded => return ChunkedTransferResult::SizeLimitExceeded,
+            ChunkedFeedResult::Continue => {}
+        }
     }
     
     loop {
@@ -2929,7 +3016,7 @@ async fn transfer_chunked_body<R: AsyncReader, W: AsyncWriter>(
         
         let (res, returned_buf) = match read_result {
             Ok(result) => result,
-            Err(_) => return false,
+            Err(_) => return ChunkedTransferResult::Failed,
         };
         
         let n = match res {
@@ -2940,12 +3027,18 @@ async fn transfer_chunked_body<R: AsyncReader, W: AsyncWriter>(
             Ok(n) => n,
             Err(_) => {
                 buf_put(returned_buf);
-                return false;
+                return ChunkedTransferResult::Failed;
             }
         };
         
         // ステートマシンにデータをフィード
-        let is_complete = decoder.feed(&returned_buf[..n]);
+        let feed_result = decoder.feed(&returned_buf[..n]);
+        
+        // サイズ制限超過チェック
+        if feed_result == ChunkedFeedResult::SizeLimitExceeded {
+            buf_put(returned_buf);
+            return ChunkedTransferResult::SizeLimitExceeded;
+        }
         
         // バックエンドに転送
         let mut write_buf = returned_buf;
@@ -2958,18 +3051,18 @@ async fn transfer_chunked_body<R: AsyncReader, W: AsyncWriter>(
             }
             Ok((Err(_), returned)) => {
                 buf_put(returned);
-                return false;
+                return ChunkedTransferResult::Failed;
             }
-            Err(_) => return false,
+            Err(_) => return ChunkedTransferResult::Failed,
         }
         
         // 終端チェック
-        if is_complete {
-            return true;
+        if feed_result == ChunkedFeedResult::Complete {
+            return ChunkedTransferResult::Complete;
         }
     }
     
-    false
+    ChunkedTransferResult::Failed
 }
 
 /// レスポンスを受信して転送（ジェネリック版）
@@ -2986,7 +3079,8 @@ async fn transfer_response<R: AsyncReader, W: AsyncWriter>(
     let mut is_chunked = false;
     let mut body_remaining: Option<usize> = None;
     // ステートマシンベースのChunkedデコーダを使用
-    let mut chunked_decoder = ChunkedDecoder::new();
+    // レスポンス受信時は制限なし（バックエンドを信頼）
+    let mut chunked_decoder = ChunkedDecoder::new_unlimited();
     
     loop {
         let buf = buf_get();
@@ -3049,7 +3143,7 @@ async fn transfer_response<R: AsyncReader, W: AsyncWriter>(
                 
                 // Chunked の場合、初期ボディ部分をデコーダにフィード
                 if is_chunked && body_start_len > 0 {
-                    chunked_decoder.feed(&header_with_body[header_len..]);
+                    let _ = chunked_decoder.feed(&header_with_body[header_len..]);
                 }
                 
                 let write_result = timeout(WRITE_TIMEOUT, client.write_buf(header_with_body)).await;
@@ -3069,7 +3163,7 @@ async fn transfer_response<R: AsyncReader, W: AsyncWriter>(
             // ヘッダー解析済み
             if is_chunked {
                 // Chunked転送 - デコーダにデータをフィード
-                let is_complete = chunked_decoder.feed(&returned_buf[..n]);
+                let feed_result = chunked_decoder.feed(&returned_buf[..n]);
                 
                 let mut write_buf = returned_buf;
                 write_buf.truncate(n);
@@ -3089,7 +3183,7 @@ async fn transfer_response<R: AsyncReader, W: AsyncWriter>(
                 total += n as u64;
                 
                 // ステートマシンによる終端チェック
-                if is_complete {
+                if feed_result == ChunkedFeedResult::Complete {
                     break;
                 }
             } else {
@@ -3148,7 +3242,8 @@ async fn transfer_response_with_keepalive<R: AsyncReader, W: AsyncWriter>(
     let mut is_chunked = false;
     let mut body_remaining: Option<usize> = None;
     // ステートマシンベースのChunkedデコーダを使用
-    let mut chunked_decoder = ChunkedDecoder::new();
+    // レスポンス受信時は制限なし（バックエンドを信頼）
+    let mut chunked_decoder = ChunkedDecoder::new_unlimited();
     let mut backend_wants_keep_alive = false;  // デフォルトはfalse（安全側）
     
     loop {
@@ -3215,7 +3310,7 @@ async fn transfer_response_with_keepalive<R: AsyncReader, W: AsyncWriter>(
                 
                 // Chunked の場合、初期ボディ部分をデコーダにフィード
                 if is_chunked && body_start_len > 0 {
-                    chunked_decoder.feed(&header_with_body[header_len..]);
+                    let _ = chunked_decoder.feed(&header_with_body[header_len..]);
                 }
                 
                 let write_result = timeout(WRITE_TIMEOUT, client.write_buf(header_with_body)).await;
@@ -3239,7 +3334,7 @@ async fn transfer_response_with_keepalive<R: AsyncReader, W: AsyncWriter>(
             // ヘッダー解析済み
             if is_chunked {
                 // Chunked転送 - デコーダにデータをフィード
-                let is_complete = chunked_decoder.feed(&returned_buf[..n]);
+                let feed_result = chunked_decoder.feed(&returned_buf[..n]);
                 
                 let mut write_buf = returned_buf;
                 write_buf.truncate(n);
@@ -3263,7 +3358,7 @@ async fn transfer_response_with_keepalive<R: AsyncReader, W: AsyncWriter>(
                 total += n as u64;
                 
                 // ステートマシンによる終端チェック
-                if is_complete {
+                if feed_result == ChunkedFeedResult::Complete {
                     break;
                 }
             } else {
