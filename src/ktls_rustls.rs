@@ -400,10 +400,7 @@ fn try_enable_ktls_server(
     // この時点で conn は消費される
     let rustls_conn = rustls::Connection::Server(conn);
     match setup_ktls_after_ulp(fd, rustls_conn, cipher_suite) {
-        Ok(()) => {
-            ftlog::info!("ktls2: kTLS enabled for server connection");
-            KtlsEnableResult::Enabled(TlsMode::KtlsFull)
-        }
+        Ok(()) => KtlsEnableResult::Enabled(TlsMode::KtlsFull),
         Err(e) => {
             // シークレット抽出後の失敗は致命的（connは既に消費済み）
             KtlsEnableResult::Fatal(e)
@@ -441,13 +438,8 @@ fn try_enable_ktls_client(
     // Step 3: rustls::Connection に変換してシークレット抽出とkTLS設定
     let rustls_conn = rustls::Connection::Client(conn);
     match setup_ktls_after_ulp(fd, rustls_conn, cipher_suite) {
-        Ok(()) => {
-            ftlog::info!("ktls2: kTLS enabled for client connection");
-            KtlsEnableResult::Enabled(TlsMode::KtlsFull)
-        }
-        Err(e) => {
-            KtlsEnableResult::Fatal(e)
-        }
+        Ok(()) => KtlsEnableResult::Enabled(TlsMode::KtlsFull),
+        Err(e) => KtlsEnableResult::Fatal(e),
     }
 }
 
@@ -559,8 +551,6 @@ pub async fn accept(
     // ハンドシェイクを実行
     do_server_handshake(&stream, &mut conn).await?;
 
-    ftlog::debug!("rustls: Server handshake complete");
-
     // kTLS の有効化を試みる
     #[cfg(feature = "ktls")]
     let (mode, conn_option) = if enable_ktls {
@@ -572,10 +562,8 @@ pub async fn accept(
             KtlsEnableResult::Fallback(returned_conn, reason) => {
                 if allow_fallback {
                     // ULP設定失敗等、復旧可能なエラー - rustls にフォールバック
-                    ftlog::info!(
-                        "kTLS unavailable ({}), using rustls for this connection",
-                        reason
-                    );
+                    // warnログは try_enable_ktls_server 内で既に出力済み
+                    let _ = reason;
                     (TlsMode::Rustls, Some(returned_conn))
                 } else {
                     // フォールバック無効 - 接続を拒否
@@ -633,8 +621,6 @@ pub async fn connect(
     // ハンドシェイクを実行
     do_client_handshake(&stream, &mut conn).await?;
 
-    ftlog::debug!("rustls: Client handshake complete");
-
     // kTLS の有効化を試みる
     #[cfg(feature = "ktls")]
     let (mode, conn_option) = if enable_ktls {
@@ -646,10 +632,8 @@ pub async fn connect(
             KtlsEnableResult::Fallback(returned_conn, reason) => {
                 if allow_fallback {
                     // ULP設定失敗等、復旧可能なエラー - rustls にフォールバック
-                    ftlog::info!(
-                        "kTLS unavailable ({}), using rustls for this connection",
-                        reason
-                    );
+                    // warnログは try_enable_ktls_client 内で既に出力済み
+                    let _ = reason;
                     (TlsMode::Rustls, Some(returned_conn))
                 } else {
                     // フォールバック無効 - 接続を拒否
@@ -1506,7 +1490,6 @@ pub fn client_config(enable_ktls: bool) -> Arc<ClientConfig> {
     // kTLS が有効な場合のみシークレット抽出を有効化
     if enable_ktls {
         config.enable_secret_extraction = true;
-        ftlog::debug!("Client TLS secret extraction enabled for kTLS support");
     }
 
     Arc::new(config)

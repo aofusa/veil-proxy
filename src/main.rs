@@ -1459,11 +1459,6 @@ async fn handle_connection(
         }
     };
 
-    // kTLS 状態をログ出力
-    if tls_stream.is_ktls_enabled() {
-        ftlog::debug!("kTLS: Active for this connection");
-    }
-
     // 警告抑制
     let _ = &ktls_config;
 
@@ -2375,7 +2370,6 @@ async fn proxy_http_pooled(
             ).await;
             
             if splice_result.is_some() {
-                ftlog::debug!("HTTP proxy: kTLS + splice used for zero-copy transfer");
                 splice_result
             } else {
                 // splice 版が失敗した場合は通常版にフォールバック
