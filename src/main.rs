@@ -324,6 +324,8 @@ fn configure_huge_pages(enabled: bool) {
 static ERR_MSG_BAD_REQUEST: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 static ERR_MSG_FORBIDDEN: &[u8] = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 static ERR_MSG_NOT_FOUND: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+static ERR_MSG_METHOD_NOT_ALLOWED: &[u8] = b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+static ERR_MSG_TOO_MANY_REQUESTS: &[u8] = b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 static ERR_MSG_BAD_GATEWAY: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 static ERR_MSG_REQUEST_TOO_LARGE: &[u8] = b"HTTP/1.1 413 Request Entity Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 static ERR_MSG_GATEWAY_TIMEOUT: &[u8] = b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -348,9 +350,221 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
-// バックエンドコネクションプール設定
+// バックエンドコネクションプール設定（デフォルト値）
 const BACKEND_POOL_MAX_IDLE_PER_HOST: usize = 8;    // ホストあたりの最大アイドル接続数
 const BACKEND_POOL_IDLE_TIMEOUT_SECS: u64 = 30;     // アイドル接続のタイムアウト（秒）
+
+// ====================
+// セキュリティ設定構造体
+// ====================
+//
+// ルートごとのセキュリティ設定を保持します。
+// config.toml の各ルートに security セクションを追加することで
+// 個別の制限を設定できます。
+// ====================
+
+/// セキュリティ設定のデフォルト値関数
+fn default_max_body_size() -> usize { MAX_BODY_SIZE }
+fn default_max_header_size() -> usize { MAX_HEADER_SIZE }
+fn default_client_header_timeout() -> u64 { 30 }
+fn default_client_body_timeout() -> u64 { 30 }
+fn default_backend_connect_timeout() -> u64 { 10 }
+fn default_max_idle_connections() -> usize { BACKEND_POOL_MAX_IDLE_PER_HOST }
+fn default_idle_connection_timeout() -> u64 { BACKEND_POOL_IDLE_TIMEOUT_SECS }
+
+/// ルートごとのセキュリティ設定
+#[derive(Deserialize, Clone, Debug)]
+pub struct SecurityConfig {
+    /// リクエストボディ最大サイズ（バイト）
+    #[serde(default = "default_max_body_size")]
+    pub max_request_body_size: usize,
+    
+    /// Chunked転送時の累積最大サイズ（バイト）
+    #[serde(default = "default_max_body_size")]
+    pub max_chunked_body_size: usize,
+    
+    /// クライアントヘッダー受信タイムアウト（秒）
+    #[serde(default = "default_client_header_timeout")]
+    pub client_header_timeout_secs: u64,
+    
+    /// クライアントボディ受信タイムアウト（秒）
+    #[serde(default = "default_client_body_timeout")]
+    pub client_body_timeout_secs: u64,
+    
+    /// 許可するHTTPメソッド（空 = すべて許可）
+    #[serde(default)]
+    pub allowed_methods: Vec<String>,
+    
+    /// 分間リクエスト数上限（0 = 無制限）
+    #[serde(default)]
+    pub rate_limit_requests_per_min: u64,
+    
+    /// バックエンド接続タイムアウト（秒）
+    #[serde(default = "default_backend_connect_timeout")]
+    pub backend_connect_timeout_secs: u64,
+    
+    /// ホストごとの最大アイドル接続数
+    #[serde(default = "default_max_idle_connections")]
+    pub max_idle_connections_per_host: usize,
+    
+    /// アイドル接続の維持時間（秒）
+    #[serde(default = "default_idle_connection_timeout")]
+    pub idle_connection_timeout_secs: u64,
+    
+    /// リクエストヘッダー最大サイズ（バイト）
+    #[serde(default = "default_max_header_size")]
+    pub max_request_header_size: usize,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            max_request_body_size: default_max_body_size(),
+            max_chunked_body_size: default_max_body_size(),
+            client_header_timeout_secs: default_client_header_timeout(),
+            client_body_timeout_secs: default_client_body_timeout(),
+            allowed_methods: Vec::new(),
+            rate_limit_requests_per_min: 0,
+            backend_connect_timeout_secs: default_backend_connect_timeout(),
+            max_idle_connections_per_host: default_max_idle_connections(),
+            idle_connection_timeout_secs: default_idle_connection_timeout(),
+            max_request_header_size: default_max_header_size(),
+        }
+    }
+}
+
+/// グローバルセキュリティ設定
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct GlobalSecurityConfig {
+    /// 起動後に降格するユーザー名（非root推奨）
+    #[serde(default)]
+    pub drop_privileges_user: Option<String>,
+    
+    /// 起動後に降格するグループ名
+    #[serde(default)]
+    pub drop_privileges_group: Option<String>,
+    
+    /// グローバル同時接続上限（0 = 無制限）
+    #[serde(default)]
+    pub max_concurrent_connections: usize,
+}
+
+// ====================
+// 権限降格機能
+// ====================
+//
+// root権限で起動した後、非特権ユーザーに降格することで
+// セキュリティを向上させます。
+//
+// 注意: 特権ポート（1024未満）を使用する場合は、
+// リスナー作成後に権限降格を行う必要があります。
+// 現在のSO_REUSEPORT設計では、各スレッドがリスナーを作成するため、
+// CAP_NET_BIND_SERVICEケイパビリティを付与するか、
+// 非特権ポート（1024以上）を使用することを推奨します。
+//
+// ケイパビリティ付与例:
+//   sudo setcap 'cap_net_bind_service=+ep' ./target/release/zerocopy-server
+// ====================
+
+/// ユーザー名からUIDを取得
+#[cfg(target_os = "linux")]
+fn get_uid_by_name(username: &str) -> Option<u32> {
+    use std::ffi::CString;
+    
+    let username_cstr = CString::new(username).ok()?;
+    
+    unsafe {
+        let pwd = libc::getpwnam(username_cstr.as_ptr());
+        if pwd.is_null() {
+            None
+        } else {
+            Some((*pwd).pw_uid)
+        }
+    }
+}
+
+/// グループ名からGIDを取得
+#[cfg(target_os = "linux")]
+fn get_gid_by_name(groupname: &str) -> Option<u32> {
+    use std::ffi::CString;
+    
+    let groupname_cstr = CString::new(groupname).ok()?;
+    
+    unsafe {
+        let grp = libc::getgrnam(groupname_cstr.as_ptr());
+        if grp.is_null() {
+            None
+        } else {
+            Some((*grp).gr_gid)
+        }
+    }
+}
+
+/// 権限降格を実行
+/// 
+/// グループ→ユーザーの順で降格する（逆順では失敗する可能性あり）
+#[cfg(target_os = "linux")]
+fn drop_privileges(security: &GlobalSecurityConfig) -> io::Result<()> {
+    // rootでない場合は何もしない
+    if unsafe { libc::getuid() } != 0 {
+        info!("Not running as root, skipping privilege drop");
+        return Ok(());
+    }
+    
+    // グループ降格（先に行う）
+    if let Some(ref group_name) = security.drop_privileges_group {
+        let gid = get_gid_by_name(group_name)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, 
+                format!("Group '{}' not found", group_name)))?;
+        
+        if unsafe { libc::setgid(gid) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        
+        // 補助グループをクリア
+        if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
+            warn!("Failed to clear supplementary groups: {}", io::Error::last_os_error());
+        }
+        
+        info!("Dropped group privileges to '{}' (gid={})", group_name, gid);
+    }
+    
+    // ユーザー降格
+    if let Some(ref user_name) = security.drop_privileges_user {
+        let uid = get_uid_by_name(user_name)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, 
+                format!("User '{}' not found", user_name)))?;
+        
+        if unsafe { libc::setuid(uid) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        
+        info!("Dropped user privileges to '{}' (uid={})", user_name, uid);
+    }
+    
+    // 降格成功の確認
+    if security.drop_privileges_user.is_some() || security.drop_privileges_group.is_some() {
+        let current_uid = unsafe { libc::getuid() };
+        let current_gid = unsafe { libc::getgid() };
+        info!("Current privileges: uid={}, gid={}", current_uid, current_gid);
+        
+        // rootに戻れないことを確認
+        if security.drop_privileges_user.is_some() {
+            if unsafe { libc::setuid(0) } == 0 {
+                warn!("WARNING: Process can still regain root privileges!");
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+/// Linux以外のプラットフォーム用のスタブ
+#[cfg(not(target_os = "linux"))]
+fn drop_privileges(_security: &GlobalSecurityConfig) -> io::Result<()> {
+    warn!("Privilege dropping is only supported on Linux");
+    Ok(())
+}
 
 // ====================
 // Graceful Shutdown フラグ
@@ -751,6 +965,9 @@ struct Config {
     tls: TlsConfigSection,
     #[serde(default)]
     performance: PerformanceConfigSection,
+    /// グローバルセキュリティ設定（権限降格など）
+    #[serde(default)]
+    security: GlobalSecurityConfig,
     host_routes: Option<HashMap<String, BackendConfig>>,
     path_routes: Option<HashMap<String, HashMap<String, BackendConfig>>>,
 }
@@ -854,12 +1071,13 @@ impl<'de> serde::Deserialize<'de> for ReuseportBalancing {
 
 #[derive(Clone)]
 enum BackendConfig {
-    Proxy { url: String },
+    Proxy { url: String, security: SecurityConfig },
     /// File バックエンド設定
     /// - path: ファイルまたはディレクトリのパス
     /// - mode: "sendfile" または "memory"
     /// - index: ディレクトリアクセス時に返すファイル名（デフォルト: "index.html"）
-    File { path: String, mode: String, index: Option<String> },
+    /// - security: ルートごとのセキュリティ設定
+    File { path: String, mode: String, index: Option<String>, security: SecurityConfig },
 }
 
 impl<'de> serde::Deserialize<'de> for BackendConfig {
@@ -887,6 +1105,7 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                 let mut path: Option<String> = None;
                 let mut mode: Option<String> = None;
                 let mut index: Option<String> = None;
+                let mut security: Option<SecurityConfig> = None;
                 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -895,21 +1114,23 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                         "path" => path = Some(map.next_value()?),
                         "mode" => mode = Some(map.next_value()?),
                         "index" => index = Some(map.next_value()?),
+                        "security" => security = Some(map.next_value()?),
                         _ => { let _: serde::de::IgnoredAny = map.next_value()?; }
                     }
                 }
                 
                 let backend_type = backend_type.unwrap_or_else(|| "File".to_string());
+                let security = security.unwrap_or_default();
                 
                 match backend_type.as_str() {
                     "Proxy" => {
                         let url = url.ok_or_else(|| serde::de::Error::missing_field("url"))?;
-                        Ok(BackendConfig::Proxy { url })
+                        Ok(BackendConfig::Proxy { url, security })
                     }
                     "File" | _ => {
                         let path = path.ok_or_else(|| serde::de::Error::missing_field("path"))?;
                         let mode = mode.unwrap_or_else(|| "sendfile".to_string());
-                        Ok(BackendConfig::File { path, mode, index })
+                        Ok(BackendConfig::File { path, mode, index, security })
                     }
                 }
             }
@@ -925,13 +1146,33 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
 
 #[derive(Clone)]
 enum Backend {
-    Proxy(Arc<ProxyTarget>),
-    MemoryFile(Arc<Vec<u8>>, Arc<str>),  // (content, mime_type)
+    /// Proxy バックエンド
+    /// - Arc<ProxyTarget>: プロキシターゲット
+    /// - Arc<SecurityConfig>: ルートごとのセキュリティ設定
+    Proxy(Arc<ProxyTarget>, Arc<SecurityConfig>),
+    /// MemoryFile バックエンド
+    /// - Arc<Vec<u8>>: ファイルコンテンツ
+    /// - Arc<str>: MIMEタイプ
+    /// - Arc<SecurityConfig>: ルートごとのセキュリティ設定
+    MemoryFile(Arc<Vec<u8>>, Arc<str>, Arc<SecurityConfig>),
     /// SendFile バックエンド
     /// - Arc<PathBuf>: ベースパス
     /// - bool: ディレクトリかどうか
     /// - Option<Arc<str>>: インデックスファイル名（None = "index.html"）
-    SendFile(Arc<PathBuf>, bool, Option<Arc<str>>),
+    /// - Arc<SecurityConfig>: ルートごとのセキュリティ設定
+    SendFile(Arc<PathBuf>, bool, Option<Arc<str>>, Arc<SecurityConfig>),
+}
+
+impl Backend {
+    /// このバックエンドのセキュリティ設定を取得
+    #[inline]
+    fn security(&self) -> &SecurityConfig {
+        match self {
+            Backend::Proxy(_, security) => security,
+            Backend::MemoryFile(_, _, security) => security,
+            Backend::SendFile(_, _, _, security) => security,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1248,6 +1489,8 @@ struct LoadedConfig {
     num_threads: usize,
     /// Huge Pages (Large OS Pages) を有効化するかどうか
     huge_pages_enabled: bool,
+    /// グローバルセキュリティ設定
+    global_security: GlobalSecurityConfig,
 }
 
 // ====================
@@ -1282,6 +1525,8 @@ struct RuntimeConfig {
     tls_config: Option<Arc<ServerConfig>>,
     /// kTLS設定
     ktls_config: Arc<KtlsConfig>,
+    /// グローバルセキュリティ設定
+    global_security: Arc<GlobalSecurityConfig>,
 }
 
 impl Default for RuntimeConfig {
@@ -1291,6 +1536,7 @@ impl Default for RuntimeConfig {
             path_routes: Arc::new(HashMap::new()),
             tls_config: None,
             ktls_config: Arc::new(KtlsConfig::default()),
+            global_security: Arc::new(GlobalSecurityConfig::default()),
         }
     }
 }
@@ -1313,6 +1559,7 @@ fn reload_config(path: &Path) -> io::Result<()> {
         path_routes: loaded.path_routes,
         tls_config: Some(loaded.tls_config),
         ktls_config: Arc::new(loaded.ktls_config),
+        global_security: Arc::new(loaded.global_security),
     };
     
     // アトミックに設定を入れ替え
@@ -1382,21 +1629,23 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         reuseport_balancing: config.performance.reuseport_balancing,
         num_threads,
         huge_pages_enabled: config.performance.huge_pages_enabled,
+        global_security: config.security,
     })
 }
 
 fn load_backend(config: &BackendConfig) -> io::Result<Backend> {
     match config {
-        BackendConfig::Proxy { url } => {
+        BackendConfig::Proxy { url, security } => {
             let target = ProxyTarget::parse(url)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid proxy URL"))?;
-            Ok(Backend::Proxy(Arc::new(target)))
+            Ok(Backend::Proxy(Arc::new(target), Arc::new(security.clone())))
         }
-        BackendConfig::File { path, mode, index } => {
+        BackendConfig::File { path, mode, index, security } => {
             let metadata = fs::metadata(path)?;
             let is_dir = metadata.is_dir();
             // インデックスファイル名を Arc<str> に変換（None = デフォルトで "index.html"）
             let index_file: Option<Arc<str>> = index.as_ref().map(|s| Arc::from(s.as_str()));
+            let security = Arc::new(security.clone());
             
             match mode.as_str() {
                 "memory" => {
@@ -1406,9 +1655,9 @@ fn load_backend(config: &BackendConfig) -> io::Result<Backend> {
                     let data = fs::read(path)?;
                     let mime_type = mime_guess::from_path(path).first_or_octet_stream();
                     
-                    Ok(Backend::MemoryFile(Arc::new(data), Arc::from(mime_type.as_ref())))
+                    Ok(Backend::MemoryFile(Arc::new(data), Arc::from(mime_type.as_ref()), security))
                 }
-                "sendfile" | "" => Ok(Backend::SendFile(Arc::new(PathBuf::from(path)), is_dir, index_file)),
+                "sendfile" | "" => Ok(Backend::SendFile(Arc::new(PathBuf::from(path)), is_dir, index_file, security)),
                 _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid mode")),
             }
         }
@@ -1495,6 +1744,15 @@ fn main() {
 
     // SO_REUSEPORT振り分け設定
     let reuseport_balancing = loaded_config.reuseport_balancing;
+
+    // 権限降格（設定されている場合）
+    // 注意: 特権ポート（1024未満）を使用する場合は、
+    // CAP_NET_BIND_SERVICEケイパビリティを付与するか、
+    // 権限降格を無効にする必要があります。
+    if let Err(e) = drop_privileges(&loaded_config.global_security) {
+        error!("Failed to drop privileges: {}", e);
+        return;
+    }
 
     for thread_id in 0..num_threads {
         let acceptor_clone = acceptor.clone();
@@ -1973,6 +2231,28 @@ async fn handle_requests(
                         return;
                     }
                 };
+                
+                // セキュリティ設定を取得
+                let security = backend.security();
+                
+                // 許可メソッドチェック
+                if !security.allowed_methods.is_empty() {
+                    let method_str = std::str::from_utf8(&method_bytes).unwrap_or("GET");
+                    let is_allowed = security.allowed_methods.iter()
+                        .any(|m| m.eq_ignore_ascii_case(method_str));
+                    if !is_allowed {
+                        let err_buf = ERR_MSG_METHOD_NOT_ALLOWED.to_vec();
+                        let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+                        return;
+                    }
+                }
+                
+                // ルートごとのボディサイズ制限（chunked以外）
+                if !is_chunked && content_length > security.max_request_body_size {
+                    let err_buf = ERR_MSG_REQUEST_TOO_LARGE.to_vec();
+                    let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+                    return;
+                }
 
                 let start_time = OffsetDateTime::now_utc();
                 
@@ -2162,10 +2442,10 @@ async fn handle_backend(
     client_wants_close: bool,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     match backend {
-        Backend::Proxy(target) => {
-            handle_proxy(tls_stream, &target, method, req_path, &prefix, content_length, is_chunked, headers, initial_body, client_wants_close).await
+        Backend::Proxy(target, security) => {
+            handle_proxy(tls_stream, &target, &security, method, req_path, &prefix, content_length, is_chunked, headers, initial_body, client_wants_close).await
         }
-        Backend::MemoryFile(data, mime_type) => {
+        Backend::MemoryFile(data, mime_type, _security) => {
             // ファイル完全一致チェック
             // MemoryFileはファイル指定なので、プレフィックス以降にパスがあれば404
             let path_str = std::str::from_utf8(req_path).unwrap_or("/");
@@ -2216,7 +2496,7 @@ async fn handle_backend(
                 _ => None,
             }
         }
-        Backend::SendFile(base_path, is_dir, index_file) => {
+        Backend::SendFile(base_path, is_dir, index_file, _security) => {
             handle_sendfile(tls_stream, &base_path, is_dir, index_file.as_deref(), req_path, &prefix, client_wants_close).await
         }
     }
@@ -2589,6 +2869,7 @@ impl ChunkedDecoder {
 async fn handle_proxy(
     client_stream: ServerTls,
     target: &ProxyTarget,
+    security: &SecurityConfig,
     method: &[u8],
     req_path: &[u8],
     prefix: &[u8],
@@ -2681,9 +2962,9 @@ async fn handle_proxy(
     request.extend_from_slice(b"Connection: keep-alive\r\n\r\n");
 
     if target.use_tls {
-        proxy_https_pooled(client_stream, target, &pool_key, request, content_length, is_chunked, initial_body, client_wants_close).await
+        proxy_https_pooled(client_stream, target, security, &pool_key, request, content_length, is_chunked, initial_body, client_wants_close).await
     } else {
-        proxy_http_pooled(client_stream, target, &pool_key, request, content_length, is_chunked, initial_body, client_wants_close).await
+        proxy_http_pooled(client_stream, target, security, &pool_key, request, content_length, is_chunked, initial_body, client_wants_close).await
     }
 }
 
@@ -2694,6 +2975,7 @@ async fn handle_proxy(
 async fn proxy_http_pooled(
     mut client_stream: ServerTls,
     target: &ProxyTarget,
+    security: &SecurityConfig,
     pool_key: &str,
     request: Vec<u8>,
     content_length: usize,
@@ -2701,13 +2983,16 @@ async fn proxy_http_pooled(
     initial_body: &[u8],
     client_wants_close: bool,
 ) -> Option<(ServerTls, u16, u64, bool)> {
+    // セキュリティ設定からタイムアウトを取得
+    let connect_timeout = Duration::from_secs(security.backend_connect_timeout_secs);
+    
     // プールから接続を取得、または新規作成
     let mut backend_stream = match HTTP_POOL.with(|p| p.borrow_mut().get(pool_key)) {
         Some(stream) => stream,
         None => {
             // 新規接続を作成
             let addr = format!("{}:{}", target.host, target.port);
-            let connect_result = timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr)).await;
+            let connect_result = timeout(connect_timeout, TcpStream::connect(&addr)).await;
             
             match connect_result {
                 Ok(Ok(stream)) => {
@@ -2730,6 +3015,9 @@ async fn proxy_http_pooled(
         }
     };
 
+    // セキュリティ設定からchunked最大サイズを取得
+    let max_chunked = security.max_chunked_body_size as u64;
+    
     // リクエスト送信とレスポンス受信
     // kTLS 有効時は splice(2) を使用してゼロコピー転送
     #[cfg(feature = "ktls")]
@@ -2756,6 +3044,7 @@ async fn proxy_http_pooled(
                     content_length,
                     is_chunked,
                     initial_body,
+                    max_chunked,
                 ).await
             }
         } else {
@@ -2767,6 +3056,7 @@ async fn proxy_http_pooled(
                 content_length,
                 is_chunked,
                 initial_body,
+                max_chunked,
             ).await
         }
     };
@@ -2779,6 +3069,7 @@ async fn proxy_http_pooled(
         content_length,
         is_chunked,
         initial_body,
+        max_chunked,
     ).await;
 
     match result {
@@ -2807,6 +3098,7 @@ async fn proxy_http_request(
     content_length: usize,
     is_chunked: bool,
     initial_body: &[u8],
+    max_chunked_body_size: u64,
 ) -> Option<(u16, u64, bool)> {
     // 1. リクエストヘッダー送信（タイムアウト付き）
     let write_result = timeout(WRITE_TIMEOUT, backend_stream.write_all(request)).await;
@@ -2825,8 +3117,8 @@ async fn proxy_http_request(
 
     // 3. 残りのリクエストボディを転送
     if is_chunked {
-        // Chunked転送の場合（DoS対策: MAX_BODY_SIZEで制限）
-        match transfer_chunked_body(client_stream, backend_stream, initial_body, MAX_BODY_SIZE as u64).await {
+        // Chunked転送の場合（DoS対策: ルートごとのmax_chunked_body_sizeで制限）
+        match transfer_chunked_body(client_stream, backend_stream, initial_body, max_chunked_body_size).await {
             ChunkedTransferResult::Complete => {}
             ChunkedTransferResult::Failed => return None,
             ChunkedTransferResult::SizeLimitExceeded => {
@@ -3147,6 +3439,7 @@ async fn splice_transfer_response_ktls(
 async fn proxy_https_pooled(
     mut client_stream: ServerTls,
     target: &ProxyTarget,
+    security: &SecurityConfig,
     pool_key: &str,
     request: Vec<u8>,
     content_length: usize,
@@ -3154,13 +3447,16 @@ async fn proxy_https_pooled(
     initial_body: &[u8],
     client_wants_close: bool,
 ) -> Option<(ServerTls, u16, u64, bool)> {
+    // セキュリティ設定からタイムアウトを取得
+    let connect_timeout = Duration::from_secs(security.backend_connect_timeout_secs);
+    
     // プールから接続を取得、または新規作成
     let mut backend_stream = match HTTPS_POOL.with(|p| p.borrow_mut().get(pool_key)) {
         Some(stream) => stream,
         None => {
             // 新規TCP接続を作成
             let addr = format!("{}:{}", target.host, target.port);
-            let connect_result = timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr)).await;
+            let connect_result = timeout(connect_timeout, TcpStream::connect(&addr)).await;
             
             let backend_tcp = match connect_result {
                 Ok(Ok(stream)) => {
@@ -3183,7 +3479,7 @@ async fn proxy_https_pooled(
             
             // TLS接続（タイムアウト付き）
             let connector = TLS_CONNECTOR.with(|c| c.clone());
-            let tls_result = timeout(CONNECT_TIMEOUT, connector.connect(backend_tcp, &target.host)).await;
+            let tls_result = timeout(connect_timeout, connector.connect(backend_tcp, &target.host)).await;
             
             match tls_result {
                 Ok(Ok(stream)) => stream,
@@ -3203,6 +3499,9 @@ async fn proxy_https_pooled(
         }
     };
 
+    // セキュリティ設定からchunked最大サイズを取得
+    let max_chunked = security.max_chunked_body_size as u64;
+    
     // リクエスト送信とレスポンス受信
     let result = proxy_https_request(
         &mut client_stream,
@@ -3211,6 +3510,7 @@ async fn proxy_https_pooled(
         content_length,
         is_chunked,
         initial_body,
+        max_chunked,
     ).await;
 
     match result {
@@ -3239,6 +3539,7 @@ async fn proxy_https_request(
     content_length: usize,
     is_chunked: bool,
     initial_body: &[u8],
+    max_chunked_body_size: u64,
 ) -> Option<(u16, u64, bool)> {
     // 1. リクエストヘッダー送信
     let write_result = timeout(WRITE_TIMEOUT, backend_stream.write_all(request)).await;
@@ -3257,8 +3558,8 @@ async fn proxy_https_request(
 
     // 3. 残りのリクエストボディを転送
     if is_chunked {
-        // Chunked転送の場合（DoS対策: MAX_BODY_SIZEで制限）
-        match transfer_chunked_body(client_stream, backend_stream, initial_body, MAX_BODY_SIZE as u64).await {
+        // Chunked転送の場合（DoS対策: ルートごとのmax_chunked_body_sizeで制限）
+        match transfer_chunked_body(client_stream, backend_stream, initial_body, max_chunked_body_size).await {
             ChunkedTransferResult::Complete => {}
             ChunkedTransferResult::Failed => return None,
             ChunkedTransferResult::SizeLimitExceeded => {
