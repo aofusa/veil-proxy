@@ -78,6 +78,12 @@ listen = "0.0.0.0:443"
 # 未指定または0の場合はCPUコア数と同じスレッド数を使用
 threads = 4
 
+[security]
+# 権限降格設定（Linux専用）
+# drop_privileges_user = "nobody"
+# drop_privileges_group = "nogroup"
+# max_concurrent_connections = 10000
+
 [performance]
 # SO_REUSEPORT の振り分け方式
 # "kernel" = カーネルデフォルト（3元タプルハッシュ）
@@ -95,33 +101,53 @@ ktls_enabled = true         # kTLS有効化（Linux 5.15+、feature flag必須�
 ktls_fallback_enabled = true # kTLS失敗時のrustlsフォールバック（デフォルト: true）
 
 # ホストベースルーティング
-[host_routes]
-"example.com" = { type = "File", path = "/var/www/example", mode = "sendfile" }
-"api.example.com" = { type = "Proxy", url = "http://localhost:8080" }
+[host_routes."example.com"]
+type = "File"
+path = "/var/www/example"
+mode = "sendfile"
+
+[host_routes."api.example.com"]
+type = "Proxy"
+url = "http://localhost:8080"
 
 # パスベースルーティング
-[path_routes."example.com"]
 
 # 静的ファイル（完全一致）
-"/robots.txt" = { type = "File", path = "/var/www/robots.txt" }
+[path_routes."example.com"."/robots.txt"]
+type = "File"
+path = "/var/www/robots.txt"
 
 # ディレクトリ配信（末尾スラッシュあり）
-"/static/" = { type = "File", path = "/var/www/assets/", mode = "sendfile" }
+[path_routes."example.com"."/static/"]
+type = "File"
+path = "/var/www/assets/"
+mode = "sendfile"
 
 # ディレクトリ配信（末尾スラッシュなし - 同じ動作、リダイレクトなし）
-"/docs" = { type = "File", path = "/var/www/docs/" }
+[path_routes."example.com"."/docs"]
+type = "File"
+path = "/var/www/docs/"
 
 # カスタムインデックスファイル
-"/user/" = { type = "File", path = "/var/www/user/", index = "profile.html" }
+[path_routes."example.com"."/user/"]
+type = "File"
+path = "/var/www/user/"
+index = "profile.html"
 
 # プロキシ（末尾スラッシュあり）
-"/api/" = { type = "Proxy", url = "http://localhost:8080/app/" }
+[path_routes."example.com"."/api/"]
+type = "Proxy"
+url = "http://localhost:8080/app/"
 
 # プロキシ（末尾スラッシュなし - 同じ動作）
-"/backend" = { type = "Proxy", url = "http://localhost:3000" }
+[path_routes."example.com"."/backend"]
+type = "Proxy"
+url = "http://localhost:3000"
 
 # ルート
-"/" = { type = "File", path = "/var/www/index.html" }
+[path_routes."example.com"."/"]
+type = "File"
+path = "/var/www/index.html"
 ```
 
 ## ルーティング
@@ -147,7 +173,9 @@ ktls_fallback_enabled = true # kTLS失敗時のrustlsフォールバック（デ
 ```toml
 # /robots.txt → /var/www/robots.txt を返す
 # /robots.txt/extra → 404 Not Found（ファイルの下は掘れない）
-"/robots.txt" = { type = "File", path = "/var/www/robots.txt" }
+[path_routes."example.com"."/robots.txt"]
+type = "File"
+path = "/var/www/robots.txt"
 ```
 
 #### 2. ディレクトリ配信（Alias動作）
@@ -157,10 +185,14 @@ ktls_fallback_enabled = true # kTLS失敗時のrustlsフォールバック（デ
 
 ```toml
 # 末尾スラッシュあり（従来の書き方）
-"/static/" = { type = "File", path = "/var/www/assets/" }
+[path_routes."example.com"."/static/"]
+type = "File"
+path = "/var/www/assets/"
 
 # 末尾スラッシュなし（同じ動作、301リダイレクトなし）
-"/docs" = { type = "File", path = "/var/www/docs/" }
+[path_routes."example.com"."/docs"]
+type = "File"
+path = "/var/www/docs/"
 ```
 
 | リクエスト | 設定 | 解決パス |
@@ -178,10 +210,16 @@ ktls_fallback_enabled = true # kTLS失敗時のrustlsフォールバック（デ
 
 ```toml
 # /user/ → /var/www/user/profile.html を返す
-"/user/" = { type = "File", path = "/var/www/user/", index = "profile.html" }
+[path_routes."example.com"."/user/"]
+type = "File"
+path = "/var/www/user/"
+index = "profile.html"
 
 # /app/ → /var/www/app/dashboard.html を返す
-"/app/" = { type = "File", path = "/var/www/app/", index = "dashboard.html" }
+[path_routes."example.com"."/app/"]
+type = "File"
+path = "/var/www/app/"
+index = "dashboard.html"
 ```
 
 #### 4. プロキシ（Proxy Pass動作）
@@ -191,10 +229,14 @@ ktls_fallback_enabled = true # kTLS失敗時のrustlsフォールバック（デ
 
 ```toml
 # 末尾スラッシュあり
-"/api/" = { type = "Proxy", url = "http://localhost:8080/app/" }
+[path_routes."example.com"."/api/"]
+type = "Proxy"
+url = "http://localhost:8080/app/"
 
 # 末尾スラッシュなし（同じ動作）
-"/backend" = { type = "Proxy", url = "http://localhost:3000" }
+[path_routes."example.com"."/backend"]
+type = "Proxy"
+url = "http://localhost:3000"
 ```
 
 | リクエスト | 設定 | 転送先 |
@@ -212,13 +254,20 @@ ktls_fallback_enabled = true # kTLS失敗時のrustlsフォールバック（デ
 
 ```toml
 # ディレクトリ配信（sendfileモード）
-"/static/" = { type = "File", path = "/var/www/static", mode = "sendfile" }
+[path_routes."example.com"."/static/"]
+type = "File"
+path = "/var/www/static"
+mode = "sendfile"
 
 # 単一ファイル配信（memoryモード）
-"/favicon.ico" = { type = "File", path = "/var/www/favicon.ico", mode = "memory" }
+[path_routes."example.com"."/favicon.ico"]
+type = "File"
+path = "/var/www/favicon.ico"
+mode = "memory"
 
-# typeとmodeを省略した場合のデフォルト
-"/" = { path = "/var/www/html" }  # type = "File", mode = "sendfile"
+# typeとmodeを省略した場合のデフォルト（type = "File", mode = "sendfile"）
+[path_routes."example.com"."/"]
+path = "/var/www/html"
 ```
 
 ### プロキシ設定
@@ -227,11 +276,81 @@ HTTPおよびHTTPSバックエンドへのプロキシに対応：
 
 ```toml
 # HTTPバックエンド
-"/api/" = { type = "Proxy", url = "http://localhost:8080" }
+[path_routes."example.com"."/api/"]
+type = "Proxy"
+url = "http://localhost:8080"
 
 # HTTPSバックエンド（TLSクライアント接続）
-"/secure/" = { type = "Proxy", url = "https://backend.example.com" }
+[path_routes."example.com"."/secure/"]
+type = "Proxy"
+url = "https://backend.example.com"
 ```
+
+### ルートごとのセキュリティ設定
+
+各ルートに `security` サブセクションを追加することで、細かいセキュリティ設定が可能です。
+
+#### 設定オプション一覧
+
+| カテゴリ | オプション | 説明 | デフォルト |
+|----------|-----------|------|-----------|
+| サイズ制限 | `max_request_body_size` | リクエストボディ最大サイズ（バイト） | 10MB |
+| | `max_chunked_body_size` | Chunked転送時の累積最大サイズ | 10MB |
+| | `max_request_header_size` | リクエストヘッダー最大サイズ | 8KB |
+| タイムアウト | `client_header_timeout_secs` | クライアントヘッダー受信タイムアウト | 30秒 |
+| | `client_body_timeout_secs` | クライアントボディ受信タイムアウト | 30秒 |
+| | `backend_connect_timeout_secs` | バックエンド接続タイムアウト | 10秒 |
+| アクセス制御 | `allowed_methods` | 許可するHTTPメソッド（配列） | すべて許可 |
+| | `rate_limit_requests_per_min` | 分間リクエスト数上限 | 0（無制限） |
+| | `allowed_ips` | 許可するIP/CIDR（配列） | すべて許可 |
+| | `denied_ips` | 拒否するIP/CIDR（配列、優先） | なし |
+| コネクションプール | `max_idle_connections_per_host` | ホストごとの最大アイドル接続数 | 8 |
+| | `idle_connection_timeout_secs` | アイドル接続の維持時間 | 30秒 |
+
+#### セキュリティ設定例
+
+```toml
+# API用セキュリティ設定
+[path_routes."example.com"."/api/"]
+type = "Proxy"
+url = "http://localhost:8080/app/"
+
+  [path_routes."example.com"."/api/".security]
+  allowed_methods = ["GET", "POST", "PUT"]
+  max_request_body_size = 5_242_880  # 5MB
+  backend_connect_timeout_secs = 5
+  rate_limit_requests_per_min = 60
+
+# IP制限付き管理API
+[path_routes."example.com"."/admin/"]
+type = "Proxy"
+url = "http://localhost:9000/"
+
+  [path_routes."example.com"."/admin/".security]
+  allowed_ips = [
+    "192.168.0.0/16",
+    "10.0.0.0/8",
+    "127.0.0.1"
+  ]
+  denied_ips = ["192.168.1.100"]
+  allowed_methods = ["GET", "POST"]
+```
+
+#### IP制限の評価順序
+
+IP制限は **deny → allow** の順で評価されます（denyが優先）。
+
+1. `denied_ips` にマッチ → 拒否（403 Forbidden）
+2. `allowed_ips` が空 → 許可
+3. `allowed_ips` にマッチ → 許可
+4. それ以外 → 拒否（403 Forbidden）
+
+| 形式 | 例 |
+|------|-----|
+| 単一IPv4 | `192.168.1.1` |
+| IPv4 CIDR | `192.168.0.0/24` |
+| 単一IPv6 | `::1` |
+| IPv6 CIDR | `2001:db8::/32` |
 
 ## kTLS（Kernel TLS）サポート
 
