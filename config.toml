@@ -60,12 +60,14 @@ ktls_fallback_enabled = false
 #          "/robots.txt/extra" → 404 Not Found
 #
 # 2. ディレクトリ配信（Alias動作）
-#    - パスが末尾スラッシュあり → ディレクトリとして扱う
+#    - 設定pathがディレクトリ → ディレクトリとして扱う
+#    - 末尾スラッシュの有無は問わない（どちらでも同じ動作）
 #    - プレフィックス除去後の残りパスをディレクトリに結合
 #    - ディレクトリ自体へのアクセス時はインデックスファイルを返す
-#    - 例: "/static/" + path="/var/www/assets/"
-#          リクエスト "/static/css/style.css" → "/var/www/assets/css/style.css"
+#    - 例: "/static/" または "/static" + path="/var/www/assets/"
+#          リクエスト "/static" → "/var/www/assets/index.html" (リダイレクトなし)
 #          リクエスト "/static/" → "/var/www/assets/index.html"
+#          リクエスト "/static/css/style.css" → "/var/www/assets/css/style.css"
 #
 # 3. インデックスファイルの指定
 #    - index オプションでディレクトリアクセス時に返すファイルを指定可能
@@ -100,14 +102,28 @@ ktls_fallback_enabled = false
 # リクエスト: /app/style.css → /var/www/app/style.css を返す
 "/app/" = { type = "File", path = "/var/www/app/", index = "dashboard.html" }
 
-# 5. バックエンドAPIへのプロキシ (Proxy Pass動作)
+# 5. 末尾スラッシュなしのディレクトリ配信
+# 末尾スラッシュなしでもディレクトリ配信として動作（301リダイレクトなし）
+# リクエスト: /docs → /var/www/docs/index.html を直接返す
+# リクエスト: /docs/ → /var/www/docs/index.html を返す
+# リクエスト: /docs/guide/intro.html → /var/www/docs/guide/intro.html を返す
+"/docs" = { type = "File", path = "/var/www/docs/" }
+
+# 6. 末尾スラッシュなしのプロキシ配信
+# 末尾スラッシュなしでもプロキシとして動作
+# リクエスト: /backend → http://localhost:3000/ へ転送
+# リクエスト: /backend/ → http://localhost:3000/ へ転送
+# リクエスト: /backend/users → http://localhost:3000/users へ転送
+"/backend" = { type = "Proxy", url = "http://localhost:3000" }
+
+# 7. バックエンドAPIへのプロキシ (Proxy Pass動作 - 末尾スラッシュあり)
 # リクエスト: /api/v1/users
 # マッチ: /api/
 # 残りパス: v1/users
 # 解決URL: http://localhost:8080/app/ + v1/users → http://localhost:8080/app/v1/users
 "/api/" = { type = "Proxy", url = "http://localhost:8080/app/" }
 
-# 6. ルート (SPAやデフォルトファイル)
+# 8. ルート (SPAやデフォルトファイル)
 # "/" は完全一致（/へのリクエストのみマッチ）
 # catch-all動作はなし: マッチしないパスは404
 "/" = { type = "File", path = "/var/www/index.html" }

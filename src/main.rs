@@ -1003,14 +1003,15 @@ impl ProxyTarget {
 // ## 動作例
 //
 // 設定:
-//   "/static" = { path = "./www/static/" }
+//   "/static" = { path = "./www/static/" }  ← 末尾スラッシュなしでもOK
 //   "/api"    = { url = "http://backend:8080" }
 //   "/"       = { path = "./www/index.html" }
 //
 // リクエスト → マッチするルート:
 //   /                     → /       (完全一致)
+//   /static               → /static (完全一致) → index.html を返す
+//   /static/              → /static (ディレクトリアクセス) → index.html を返す
 //   /static/css/style.css → /static (プレフィックスマッチ)
-//   /static               → /static (完全一致)
 //   /api/users            → /api    (プレフィックスマッチ)
 //   /favicon.ico          → 404     (マッチなし)
 //   /unknown              → 404     (マッチなし)
@@ -1072,9 +1073,13 @@ impl PathRouter {
                 let _ = router.insert(format!("{base}/{{*rest}}"), i);
             } else {
                 // "/api" スタイル（通常のプレフィックス）
+                // 末尾スラッシュなしでもディレクトリ配信やプロキシが動作するように
+                // 3つのパターンを登録：
                 // 1. "/api" への完全一致
                 let _ = router.insert(prefix.clone(), i);
-                // 2. "/api/{*rest}" でサブパスにマッチ
+                // 2. "/api/" への完全一致（ディレクトリアクセス）
+                let _ = router.insert(format!("{prefix}/"), i);
+                // 3. "/api/{*rest}" でサブパスにマッチ
                 let _ = router.insert(format!("{prefix}/{{*rest}}"), i);
             }
         }
