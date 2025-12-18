@@ -98,6 +98,12 @@ ktls_fallback_enabled = false
 #   アクセス制御:
 #     allowed_methods               許可するHTTPメソッド（配列）             デフォルト: すべて許可
 #     rate_limit_requests_per_min   分間リクエスト数上限                     デフォルト: 0（無制限）
+#     allowed_ips                   許可するIP/CIDR（配列）                  デフォルト: すべて許可
+#     denied_ips                    拒否するIP/CIDR（配列、denyが優先）      デフォルト: なし
+#
+#   IP制限の評価順序: deny → allow（denyが優先）
+#     例: allowed_ips = ["192.168.0.0/16"], denied_ips = ["192.168.1.100"]
+#         → 192.168.1.100 は拒否、それ以外の 192.168.x.x は許可
 #
 #   コネクションプール:
 #     max_idle_connections_per_host ホストごとの最大アイドル接続数           デフォルト: 8
@@ -179,6 +185,22 @@ ktls_fallback_enabled = false
         backend_connect_timeout_secs = 5, 
         rate_limit_requests_per_min = 60 
     } 
+}
+
+# ------------------------------------------
+# 管理用API（IP制限付き）
+# ------------------------------------------
+# 内部ネットワークからのみアクセス許可
+# - 許可: 192.168.0.0/16, 10.0.0.0/8
+# - 拒否: 192.168.1.100（特定のホストを除外）
+"/admin/" = {
+    type = "Proxy",
+    url = "http://localhost:9000/",
+    security = {
+        allowed_ips = ["192.168.0.0/16", "10.0.0.0/8", "127.0.0.1"],
+        denied_ips = ["192.168.1.100"],
+        allowed_methods = ["GET", "POST"]
+    }
 }
 
 # ------------------------------------------

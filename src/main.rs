@@ -372,6 +372,251 @@ fn default_backend_connect_timeout() -> u64 { 10 }
 fn default_max_idle_connections() -> usize { BACKEND_POOL_MAX_IDLE_PER_HOST }
 fn default_idle_connection_timeout() -> u64 { BACKEND_POOL_IDLE_TIMEOUT_SECS }
 
+// ====================
+// IP制限機能（CIDR対応）
+// ====================
+//
+// allowed_ips と denied_ips でルートごとのIP制限を設定できます。
+// CIDR記法（例: "192.168.1.0/24"）と単一IP（例: "10.0.0.1"）の両方をサポート。
+//
+// 評価順序: deny → allow（denyが優先）
+// - denied_ips にマッチ → 拒否
+// - allowed_ips が空 → 許可
+// - allowed_ips にマッチ → 許可
+// - それ以外 → 拒否
+// ====================
+
+/// CIDR範囲を表す構造体
+#[derive(Clone, Debug)]
+pub struct CidrRange {
+    /// ネットワークアドレス（IPv4は32ビット、IPv6は128ビット）
+    network: u128,
+    /// プレフィックス長
+    prefix_len: u8,
+    /// IPv6かどうか
+    is_ipv6: bool,
+}
+
+impl CidrRange {
+    /// CIDR文字列をパース（例: "192.168.1.0/24" または "10.0.0.1"）
+    pub fn parse(s: &str) -> Option<Self> {
+        let (ip_str, prefix_len) = if let Some(idx) = s.find('/') {
+            let prefix: u8 = s[idx + 1..].parse().ok()?;
+            (&s[..idx], prefix)
+        } else {
+            // プレフィックスなし = 単一IP
+            (s, 255) // 255は後で適切な値に変換
+        };
+        
+        // IPv4をパース
+        if let Some(ipv4) = Self::parse_ipv4(ip_str) {
+            let prefix = if prefix_len == 255 { 32 } else { prefix_len };
+            if prefix > 32 {
+                return None;
+            }
+            // IPv4を128ビットの上位に配置（IPv6-mapped形式ではなく単純に格納）
+            let network = (ipv4 as u128) & Self::mask_v4(prefix);
+            return Some(CidrRange {
+                network,
+                prefix_len: prefix,
+                is_ipv6: false,
+            });
+        }
+        
+        // IPv6をパース
+        if let Some(ipv6) = Self::parse_ipv6(ip_str) {
+            let prefix = if prefix_len == 255 { 128 } else { prefix_len };
+            if prefix > 128 {
+                return None;
+            }
+            let network = ipv6 & Self::mask_v6(prefix);
+            return Some(CidrRange {
+                network,
+                prefix_len: prefix,
+                is_ipv6: true,
+            });
+        }
+        
+        None
+    }
+    
+    /// IPv4アドレス文字列をパース
+    fn parse_ipv4(s: &str) -> Option<u32> {
+        let parts: Vec<&str> = s.split('.').collect();
+        if parts.len() != 4 {
+            return None;
+        }
+        
+        let mut result: u32 = 0;
+        for (i, part) in parts.iter().enumerate() {
+            let octet: u8 = part.parse().ok()?;
+            result |= (octet as u32) << (24 - i * 8);
+        }
+        Some(result)
+    }
+    
+    /// IPv6アドレス文字列をパース（簡易実装）
+    fn parse_ipv6(s: &str) -> Option<u128> {
+        // :: の展開を処理
+        let parts: Vec<&str> = s.split(':').collect();
+        
+        // :: がある場合の処理
+        let has_double_colon = s.contains("::");
+        if has_double_colon {
+            let sides: Vec<&str> = s.split("::").collect();
+            if sides.len() > 2 {
+                return None;
+            }
+            
+            let left_parts: Vec<&str> = if sides[0].is_empty() {
+                vec![]
+            } else {
+                sides[0].split(':').collect()
+            };
+            
+            let right_parts: Vec<&str> = if sides.len() < 2 || sides[1].is_empty() {
+                vec![]
+            } else {
+                sides[1].split(':').collect()
+            };
+            
+            let missing = 8 - left_parts.len() - right_parts.len();
+            let mut all_parts: Vec<u16> = Vec::with_capacity(8);
+            
+            for part in &left_parts {
+                all_parts.push(u16::from_str_radix(part, 16).ok()?);
+            }
+            for _ in 0..missing {
+                all_parts.push(0);
+            }
+            for part in &right_parts {
+                all_parts.push(u16::from_str_radix(part, 16).ok()?);
+            }
+            
+            if all_parts.len() != 8 {
+                return None;
+            }
+            
+            let mut result: u128 = 0;
+            for (i, &part) in all_parts.iter().enumerate() {
+                result |= (part as u128) << (112 - i * 16);
+            }
+            return Some(result);
+        }
+        
+        // :: がない場合
+        if parts.len() != 8 {
+            return None;
+        }
+        
+        let mut result: u128 = 0;
+        for (i, part) in parts.iter().enumerate() {
+            let segment: u16 = u16::from_str_radix(part, 16).ok()?;
+            result |= (segment as u128) << (112 - i * 16);
+        }
+        Some(result)
+    }
+    
+    /// IPv4用のネットマスクを生成
+    #[inline]
+    fn mask_v4(prefix: u8) -> u128 {
+        if prefix == 0 {
+            0
+        } else if prefix >= 32 {
+            0xFFFF_FFFF
+        } else {
+            ((1u128 << prefix) - 1) << (32 - prefix)
+        }
+    }
+    
+    /// IPv6用のネットマスクを生成
+    #[inline]
+    fn mask_v6(prefix: u8) -> u128 {
+        if prefix == 0 {
+            0
+        } else if prefix >= 128 {
+            u128::MAX
+        } else {
+            ((1u128 << prefix) - 1) << (128 - prefix)
+        }
+    }
+    
+    /// IPアドレスがこのCIDR範囲に含まれるかチェック
+    pub fn contains(&self, ip: &str) -> bool {
+        if self.is_ipv6 {
+            // IPv6
+            if let Some(ipv6) = Self::parse_ipv6(ip) {
+                let masked = ipv6 & Self::mask_v6(self.prefix_len);
+                return masked == self.network;
+            }
+        } else {
+            // IPv4
+            if let Some(ipv4) = Self::parse_ipv4(ip) {
+                let masked = (ipv4 as u128) & Self::mask_v4(self.prefix_len);
+                return masked == self.network;
+            }
+        }
+        false
+    }
+}
+
+/// IPフィルター（許可/拒否リスト）
+#[derive(Clone, Debug, Default)]
+pub struct IpFilter {
+    /// 許可するIP/CIDR範囲（空 = すべて許可）
+    pub allowed: Vec<CidrRange>,
+    /// 拒否するIP/CIDR範囲
+    pub denied: Vec<CidrRange>,
+}
+
+impl IpFilter {
+    /// 文字列リストからIpFilterを構築
+    pub fn from_lists(allowed_ips: &[String], denied_ips: &[String]) -> Self {
+        let allowed: Vec<CidrRange> = allowed_ips
+            .iter()
+            .filter_map(|s| CidrRange::parse(s))
+            .collect();
+        
+        let denied: Vec<CidrRange> = denied_ips
+            .iter()
+            .filter_map(|s| CidrRange::parse(s))
+            .collect();
+        
+        Self { allowed, denied }
+    }
+    
+    /// IPアドレスが許可されているかチェック
+    /// 評価順序: deny → allow（denyが優先）
+    pub fn is_allowed(&self, ip: &str) -> bool {
+        // denyリストにマッチしたら拒否
+        for cidr in &self.denied {
+            if cidr.contains(ip) {
+                return false;
+            }
+        }
+        
+        // allowリストが空なら許可
+        if self.allowed.is_empty() {
+            return true;
+        }
+        
+        // allowリストにマッチしたら許可
+        for cidr in &self.allowed {
+            if cidr.contains(ip) {
+                return true;
+            }
+        }
+        
+        // どちらにもマッチしない場合は拒否
+        false
+    }
+    
+    /// フィルターが設定されているか（空でないか）
+    pub fn is_configured(&self) -> bool {
+        !self.allowed.is_empty() || !self.denied.is_empty()
+    }
+}
+
 /// ルートごとのセキュリティ設定
 #[derive(Deserialize, Clone, Debug)]
 pub struct SecurityConfig {
@@ -414,6 +659,23 @@ pub struct SecurityConfig {
     /// リクエストヘッダー最大サイズ（バイト）
     #[serde(default = "default_max_header_size")]
     pub max_request_header_size: usize,
+    
+    /// 許可するIPアドレス/CIDR（空 = すべて許可）
+    /// 例: ["192.168.1.0/24", "10.0.0.1"]
+    #[serde(default)]
+    pub allowed_ips: Vec<String>,
+    
+    /// 拒否するIPアドレス/CIDR（denyが優先）
+    /// 例: ["192.168.1.100", "10.0.0.0/8"]
+    #[serde(default)]
+    pub denied_ips: Vec<String>,
+}
+
+impl SecurityConfig {
+    /// IP制限フィルターを構築
+    pub fn ip_filter(&self) -> IpFilter {
+        IpFilter::from_lists(&self.allowed_ips, &self.denied_ips)
+    }
 }
 
 impl Default for SecurityConfig {
@@ -429,6 +691,8 @@ impl Default for SecurityConfig {
             max_idle_connections_per_host: default_max_idle_connections(),
             idle_connection_timeout_secs: default_idle_connection_timeout(),
             max_request_header_size: default_max_header_size(),
+            allowed_ips: Vec::new(),
+            denied_ips: Vec::new(),
         }
     }
 }
@@ -2401,6 +2665,14 @@ async fn handle_requests(
                 
                 // セキュリティ設定を取得
                 let security = backend.security();
+                
+                // IP制限チェック（deny → allow の順で評価）
+                let ip_filter = security.ip_filter();
+                if ip_filter.is_configured() && !ip_filter.is_allowed(client_ip) {
+                    let err_buf = ERR_MSG_FORBIDDEN.to_vec();
+                    let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+                    return;
+                }
                 
                 // 許可メソッドチェック
                 if !security.allowed_methods.is_empty() {
