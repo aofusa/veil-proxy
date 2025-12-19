@@ -1087,10 +1087,14 @@ fn drop_privileges(_security: &GlobalSecurityConfig) -> io::Result<()> {
 }
 
 // ====================
-// Graceful Shutdown フラグ
+// Graceful Shutdown / Hot Reload フラグ
 // ====================
 
 static SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
+
+/// 設定リロード要求フラグ（SIGHUP でトリガー）
+/// Arc<AtomicBool> として初期化（signal-hook の要件）
+static RELOAD_FLAG: Lazy<Arc<AtomicBool>> = Lazy::new(|| Arc::new(AtomicBool::new(false)));
 
 // ====================
 // 同時接続数カウンター
@@ -1608,6 +1612,65 @@ fn buf_put_vec(mut buf: Vec<u8>) {
 // 設定構造体
 // ====================
 
+/// Upstream 設定（ロードバランシング用）
+#[derive(Deserialize, Clone, Debug)]
+struct UpstreamConfig {
+    /// ロードバランシングアルゴリズム
+    /// - "round_robin": ラウンドロビン（デフォルト）
+    /// - "least_conn": Least Connections
+    /// - "ip_hash": クライアントIPハッシュ
+    #[serde(default)]
+    algorithm: LoadBalanceAlgorithm,
+    /// バックエンドサーバーURL一覧
+    servers: Vec<String>,
+    /// 健康チェック設定（オプション）
+    #[serde(default)]
+    health_check: Option<HealthCheckConfig>,
+}
+
+/// 健康チェック設定
+#[derive(Deserialize, Clone, Debug)]
+struct HealthCheckConfig {
+    /// チェック間隔（秒）
+    #[serde(default = "default_health_check_interval")]
+    interval_secs: u64,
+    /// チェック対象パス
+    #[serde(default = "default_health_check_path")]
+    path: String,
+    /// タイムアウト（秒）
+    #[serde(default = "default_health_check_timeout")]
+    timeout_secs: u64,
+    /// 成功と判断するHTTPステータスコード（デフォルト: 200-399）
+    #[serde(default = "default_healthy_statuses")]
+    healthy_statuses: Vec<u16>,
+    /// 何回連続で失敗したら unhealthy とするか
+    #[serde(default = "default_unhealthy_threshold")]
+    unhealthy_threshold: u32,
+    /// 何回連続で成功したら healthy に戻すか
+    #[serde(default = "default_healthy_threshold")]
+    healthy_threshold: u32,
+}
+
+fn default_health_check_interval() -> u64 { 10 }
+fn default_health_check_path() -> String { "/".to_string() }
+fn default_health_check_timeout() -> u64 { 5 }
+fn default_healthy_statuses() -> Vec<u16> { vec![200, 201, 202, 204, 301, 302, 304] }
+fn default_unhealthy_threshold() -> u32 { 3 }
+fn default_healthy_threshold() -> u32 { 2 }
+
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: default_health_check_interval(),
+            path: default_health_check_path(),
+            timeout_secs: default_health_check_timeout(),
+            healthy_statuses: default_healthy_statuses(),
+            unhealthy_threshold: default_unhealthy_threshold(),
+            healthy_threshold: default_healthy_threshold(),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct Config {
     server: ServerConfigSection,
@@ -1620,6 +1683,9 @@ struct Config {
     /// ログ設定（非同期ログの最適化）
     #[serde(default)]
     logging: LoggingConfigSection,
+    /// Upstream グループ定義（ロードバランシング用）
+    #[serde(default)]
+    upstreams: Option<HashMap<String, UpstreamConfig>>,
     host_routes: Option<HashMap<String, BackendConfig>>,
     path_routes: Option<HashMap<String, HashMap<String, BackendConfig>>>,
 }
@@ -1841,7 +1907,10 @@ impl<'de> serde::Deserialize<'de> for ReuseportBalancing {
 
 #[derive(Clone)]
 enum BackendConfig {
+    /// 単一URLプロキシ（後方互換性のため維持）
     Proxy { url: String, security: SecurityConfig },
+    /// Upstream グループ参照（ロードバランシング用）
+    ProxyUpstream { upstream: String, security: SecurityConfig },
     /// File バックエンド設定
     /// - path: ファイルまたはディレクトリのパス
     /// - mode: "sendfile" または "memory"
@@ -1872,6 +1941,7 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
             {
                 let mut backend_type: Option<String> = None;
                 let mut url: Option<String> = None;
+                let mut upstream: Option<String> = None;
                 let mut path: Option<String> = None;
                 let mut mode: Option<String> = None;
                 let mut index: Option<String> = None;
@@ -1881,6 +1951,7 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                     match key.as_str() {
                         "type" => backend_type = Some(map.next_value()?),
                         "url" => url = Some(map.next_value()?),
+                        "upstream" => upstream = Some(map.next_value()?),
                         "path" => path = Some(map.next_value()?),
                         "mode" => mode = Some(map.next_value()?),
                         "index" => index = Some(map.next_value()?),
@@ -1894,8 +1965,13 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                 
                 match backend_type.as_str() {
                     "Proxy" => {
-                        let url = url.ok_or_else(|| serde::de::Error::missing_field("url"))?;
-                        Ok(BackendConfig::Proxy { url, security })
+                        // upstream が指定されている場合はロードバランシング用
+                        if let Some(upstream_name) = upstream {
+                            Ok(BackendConfig::ProxyUpstream { upstream: upstream_name, security })
+                        } else {
+                            let url = url.ok_or_else(|| serde::de::Error::missing_field("url or upstream"))?;
+                            Ok(BackendConfig::Proxy { url, security })
+                        }
                     }
                     "File" | _ => {
                         let path = path.ok_or_else(|| serde::de::Error::missing_field("path"))?;
@@ -1916,10 +1992,10 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
 
 #[derive(Clone)]
 enum Backend {
-    /// Proxy バックエンド
-    /// - Arc<ProxyTarget>: プロキシターゲット
+    /// Proxy バックエンド（ロードバランシング対応）
+    /// - Arc<UpstreamGroup>: アップストリームグループ（単一または複数バックエンド）
     /// - Arc<SecurityConfig>: ルートごとのセキュリティ設定
-    Proxy(Arc<ProxyTarget>, Arc<SecurityConfig>),
+    Proxy(Arc<UpstreamGroup>, Arc<SecurityConfig>),
     /// MemoryFile バックエンド
     /// - Arc<Vec<u8>>: ファイルコンテンツ
     /// - Arc<str>: MIMEタイプ
@@ -1993,6 +2069,226 @@ impl ProxyTarget {
         } else {
             self.port == 80
         }
+    }
+}
+
+// ====================
+// ロードバランシング（Upstream Group）
+// ====================
+//
+// 複数のバックエンドサーバーへのリクエスト分散をサポートします。
+//
+// ## サポートするアルゴリズム
+// - RoundRobin: 順番に振り分け（デフォルト）
+// - LeastConnections: 接続数が最も少ないサーバーを選択
+// - IpHash: クライアントIPに基づいて一貫したサーバーを選択
+//
+// ## 設定例
+// ```toml
+// [upstreams."backend-pool"]
+// algorithm = "round_robin"
+// servers = ["http://localhost:8080", "http://localhost:8081"]
+//
+// [path_routes."example.com"."/api/"]
+// type = "Proxy"
+// upstream = "backend-pool"
+// ```
+// ====================
+
+/// ロードバランシングアルゴリズム
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum LoadBalanceAlgorithm {
+    /// ラウンドロビン（順番に振り分け）
+    #[default]
+    RoundRobin,
+    /// Least Connections（接続数が最も少ないサーバー）
+    LeastConnections,
+    /// IP Hash（クライアントIPに基づく一貫したルーティング）
+    IpHash,
+}
+
+impl<'de> serde::Deserialize<'de> for LoadBalanceAlgorithm {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().as_str() {
+            "round_robin" | "roundrobin" => Ok(LoadBalanceAlgorithm::RoundRobin),
+            "least_conn" | "least_connections" | "leastconn" => Ok(LoadBalanceAlgorithm::LeastConnections),
+            "ip_hash" | "iphash" => Ok(LoadBalanceAlgorithm::IpHash),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown load balance algorithm: '{}', expected 'round_robin', 'least_conn', or 'ip_hash'",
+                other
+            ))),
+        }
+    }
+}
+
+/// Upstream サーバーの状態
+#[derive(Clone)]
+struct UpstreamServer {
+    /// バックエンドターゲット
+    target: ProxyTarget,
+    /// 現在のアクティブ接続数（Least Connections用）
+    active_connections: Arc<AtomicUsize>,
+    /// サーバーが利用可能かどうか（ヘルスチェック用）
+    healthy: Arc<AtomicBool>,
+    /// 連続成功回数（健康チェック用）
+    consecutive_successes: Arc<AtomicUsize>,
+    /// 連続失敗回数（健康チェック用）
+    consecutive_failures: Arc<AtomicUsize>,
+}
+
+impl UpstreamServer {
+    fn new(target: ProxyTarget) -> Self {
+        Self {
+            target,
+            active_connections: Arc::new(AtomicUsize::new(0)),
+            healthy: Arc::new(AtomicBool::new(true)),
+            consecutive_successes: Arc::new(AtomicUsize::new(0)),
+            consecutive_failures: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+    
+    /// 接続カウンターを増加
+    fn acquire(&self) {
+        self.active_connections.fetch_add(1, Ordering::Relaxed);
+    }
+    
+    /// 接続カウンターを減少
+    fn release(&self) {
+        self.active_connections.fetch_sub(1, Ordering::Relaxed);
+    }
+    
+    /// 現在の接続数を取得
+    fn connections(&self) -> usize {
+        self.active_connections.load(Ordering::Relaxed)
+    }
+    
+    /// サーバーが健全かどうか
+    fn is_healthy(&self) -> bool {
+        self.healthy.load(Ordering::Relaxed)
+    }
+    
+    /// 健康チェック成功を記録
+    fn record_success(&self, healthy_threshold: u32) {
+        self.consecutive_failures.store(0, Ordering::Relaxed);
+        let successes = self.consecutive_successes.fetch_add(1, Ordering::Relaxed) + 1;
+        
+        // 閾値に達したら healthy に設定
+        if successes >= healthy_threshold as usize && !self.is_healthy() {
+            self.healthy.store(true, Ordering::SeqCst);
+            info!("Upstream {}:{} is now healthy", self.target.host, self.target.port);
+        }
+    }
+    
+    /// 健康チェック失敗を記録
+    fn record_failure(&self, unhealthy_threshold: u32) {
+        self.consecutive_successes.store(0, Ordering::Relaxed);
+        let failures = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        
+        // 閾値に達したら unhealthy に設定
+        if failures >= unhealthy_threshold as usize && self.is_healthy() {
+            self.healthy.store(false, Ordering::SeqCst);
+            warn!("Upstream {}:{} is now unhealthy", self.target.host, self.target.port);
+        }
+    }
+}
+
+/// Upstream グループ（複数バックエンドのロードバランシング）
+#[derive(Clone)]
+pub struct UpstreamGroup {
+    /// グループ名（ログ出力用）
+    #[allow(dead_code)]
+    name: String,
+    /// バックエンドサーバーリスト
+    servers: Vec<UpstreamServer>,
+    /// ロードバランシングアルゴリズム
+    algorithm: LoadBalanceAlgorithm,
+    /// ラウンドロビン用カウンター
+    rr_counter: Arc<AtomicUsize>,
+    /// 健康チェック設定（オプション）
+    health_check: Option<HealthCheckConfig>,
+}
+
+impl UpstreamGroup {
+    /// 新しい Upstream グループを作成
+    fn new(name: String, urls: Vec<String>, algorithm: LoadBalanceAlgorithm, health_check: Option<HealthCheckConfig>) -> Option<Self> {
+        let servers: Vec<UpstreamServer> = urls.iter()
+            .filter_map(|url| ProxyTarget::parse(url).map(UpstreamServer::new))
+            .collect();
+        
+        if servers.is_empty() {
+            return None;
+        }
+        
+        Some(Self {
+            name,
+            servers,
+            algorithm,
+            rr_counter: Arc::new(AtomicUsize::new(0)),
+            health_check,
+        })
+    }
+    
+    /// 単一サーバーからグループを作成
+    fn single(target: ProxyTarget) -> Self {
+        Self {
+            name: String::new(),
+            servers: vec![UpstreamServer::new(target)],
+            algorithm: LoadBalanceAlgorithm::RoundRobin,
+            rr_counter: Arc::new(AtomicUsize::new(0)),
+            health_check: None, // 単一サーバーでは健康チェックなし
+        }
+    }
+    
+    /// 次のバックエンドサーバーを選択
+    /// 
+    /// # Arguments
+    /// * `client_ip` - クライアントIPアドレス（IpHash用）
+    /// 
+    /// # Returns
+    /// 選択されたサーバーへの参照（健全なサーバーがない場合は None）
+    fn select(&self, client_ip: &str) -> Option<&UpstreamServer> {
+        let healthy_servers: Vec<(usize, &UpstreamServer)> = self.servers.iter()
+            .enumerate()
+            .filter(|(_, s)| s.is_healthy())
+            .collect();
+        
+        if healthy_servers.is_empty() {
+            return None;
+        }
+        
+        let selected_idx = match self.algorithm {
+            LoadBalanceAlgorithm::RoundRobin => {
+                let counter = self.rr_counter.fetch_add(1, Ordering::Relaxed);
+                counter % healthy_servers.len()
+            }
+            LoadBalanceAlgorithm::LeastConnections => {
+                healthy_servers.iter()
+                    .enumerate()
+                    .min_by_key(|(_, (_, s))| s.connections())
+                    .map(|(i, _)| i)
+                    .unwrap_or(0)
+            }
+            LoadBalanceAlgorithm::IpHash => {
+                // シンプルなハッシュ関数（FNV-1a風）
+                let mut hash: u64 = 14695981039346656037;
+                for byte in client_ip.bytes() {
+                    hash ^= byte as u64;
+                    hash = hash.wrapping_mul(1099511628211);
+                }
+                (hash as usize) % healthy_servers.len()
+            }
+        };
+        
+        healthy_servers.get(selected_idx).map(|(_, s)| *s)
+    }
+    
+    /// サーバー数を取得
+    fn len(&self) -> usize {
+        self.servers.len()
     }
 }
 
@@ -2221,6 +2517,116 @@ impl AsyncWriter for simple_tls::SimpleTlsClientStream {
 // 設定読み込み
 // ====================
 
+/// 設定ファイルのバリデーション
+/// 
+/// 設定読み込み前に、必須ファイルの存在とパスの妥当性をチェックします。
+fn validate_config(config: &Config) -> io::Result<()> {
+    // TLS証明書ファイルの存在チェック
+    let cert_path = Path::new(&config.tls.cert_path);
+    if !cert_path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("TLS certificate file not found: {}", config.tls.cert_path)
+        ));
+    }
+    
+    let key_path = Path::new(&config.tls.key_path);
+    if !key_path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("TLS key file not found: {}", config.tls.key_path)
+        ));
+    }
+    
+    // バインドアドレスの妥当性チェック
+    if config.server.listen.parse::<SocketAddr>().is_err() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Invalid listen address: {}", config.server.listen)
+        ));
+    }
+    
+    // Upstream設定の妥当性チェック
+    if let Some(ref upstreams) = config.upstreams {
+        for (name, upstream) in upstreams {
+            if upstream.servers.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Upstream '{}' has no servers configured", name)
+                ));
+            }
+            
+            for server_url in &upstream.servers {
+                if ProxyTarget::parse(server_url).is_none() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("Invalid server URL in upstream '{}': {}", name, server_url)
+                    ));
+                }
+            }
+        }
+    }
+    
+    // ホストルートの妥当性チェック
+    if let Some(ref host_routes) = config.host_routes {
+        for (host, backend) in host_routes {
+            validate_backend_config(backend, host)?;
+        }
+    }
+    
+    // パスルートの妥当性チェック
+    if let Some(ref path_routes) = config.path_routes {
+        for (host, paths) in path_routes {
+            for (path, backend) in paths {
+                validate_backend_config(backend, &format!("{}:{}", host, path))?;
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+/// バックエンド設定の妥当性チェック
+fn validate_backend_config(config: &BackendConfig, route_name: &str) -> io::Result<()> {
+    match config {
+        BackendConfig::Proxy { url, .. } => {
+            if ProxyTarget::parse(url).is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Invalid proxy URL for route '{}': {}", route_name, url)
+                ));
+            }
+        }
+        BackendConfig::ProxyUpstream { upstream, .. } => {
+            // upstream の存在は load_backend でチェックされる
+            if upstream.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Empty upstream name for route '{}'", route_name)
+                ));
+            }
+        }
+        BackendConfig::File { path, mode, .. } => {
+            let file_path = Path::new(path);
+            if !file_path.exists() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("File/directory not found for route '{}': {}", route_name, path)
+                ));
+            }
+            
+            if !["sendfile", "memory", ""].contains(&mode.as_str()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Invalid mode for route '{}': {} (expected 'sendfile' or 'memory')", route_name, mode)
+                ));
+            }
+        }
+    }
+    
+    Ok(())
+}
+
 // rustls 用の TLS 設定読み込み（統一）
 fn load_tls_config(tls_config: &TlsConfigSection, ktls_enabled: bool) -> io::Result<Arc<ServerConfig>> {
     let cert_file = File::open(&tls_config.cert_path)?;
@@ -2270,6 +2676,8 @@ struct LoadedConfig {
     global_security: GlobalSecurityConfig,
     /// ログ設定
     logging: LoggingConfigSection,
+    /// Upstream グループ（健康チェック用）
+    upstream_groups: Arc<HashMap<String, Arc<UpstreamGroup>>>,
 }
 
 // ====================
@@ -2306,6 +2714,8 @@ struct RuntimeConfig {
     ktls_config: Arc<KtlsConfig>,
     /// グローバルセキュリティ設定
     global_security: Arc<GlobalSecurityConfig>,
+    /// Upstream グループ（健康チェック用）
+    upstream_groups: Arc<HashMap<String, Arc<UpstreamGroup>>>,
 }
 
 impl Default for RuntimeConfig {
@@ -2316,6 +2726,7 @@ impl Default for RuntimeConfig {
             tls_config: None,
             ktls_config: Arc::new(KtlsConfig::default()),
             global_security: Arc::new(GlobalSecurityConfig::default()),
+            upstream_groups: Arc::new(HashMap::new()),
         }
     }
 }
@@ -2339,6 +2750,7 @@ fn reload_config(path: &Path) -> io::Result<()> {
         tls_config: Some(loaded.tls_config),
         ktls_config: Arc::new(loaded.ktls_config),
         global_security: Arc::new(loaded.global_security),
+        upstream_groups: loaded.upstream_groups,
     };
     
     // アトミックに設定を入れ替え
@@ -2352,6 +2764,9 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     let config_str = fs::read_to_string(path)?;
     let config: Config = toml::from_str(&config_str)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("TOML parse error: {}", e)))?;
+    
+    // 設定ファイルのバリデーション
+    validate_config(&config)?;
 
     // kTLS設定（TLS設定より先に読み込む）
     let ktls_config = KtlsConfig {
@@ -2363,11 +2778,33 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
 
     // TLS設定（kTLS有効時はシークレット抽出を有効化）
     let tls_config = load_tls_config(&config.tls, ktls_config.enabled)?;
+    
+    // Upstream グループを構築（ロードバランシング用）
+    let mut upstream_groups: HashMap<String, Arc<UpstreamGroup>> = HashMap::new();
+    if let Some(upstreams) = &config.upstreams {
+        for (name, cfg) in upstreams {
+            if let Some(group) = UpstreamGroup::new(
+                name.clone(), 
+                cfg.servers.clone(), 
+                cfg.algorithm,
+                cfg.health_check.clone(),
+            ) {
+                info!("Loaded upstream '{}' with {} servers ({:?})", 
+                      name, group.len(), cfg.algorithm);
+                if cfg.health_check.is_some() {
+                    info!("  Health check enabled for '{}'", name);
+                }
+                upstream_groups.insert(name.clone(), Arc::new(group));
+            } else {
+                warn!("Failed to load upstream '{}': no valid servers", name);
+            }
+        }
+    }
 
     let mut host_routes_bytes: HashMap<Box<[u8]>, Backend> = HashMap::new();
     if let Some(host_routes) = config.host_routes {
         for (k, v) in host_routes {
-            let backend = load_backend(&v)?;
+            let backend = load_backend(&v, &upstream_groups)?;
             host_routes_bytes.insert(k.into_bytes().into_boxed_slice(), backend);
         }
     }
@@ -2377,7 +2814,7 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         for (host, path_map) in path_routes {
             let mut entries: Vec<(String, Backend)> = Vec::with_capacity(path_map.len());
             for (k, v) in path_map {
-                entries.push((k, load_backend(&v)?));
+                entries.push((k, load_backend(&v, &upstream_groups)?));
             }
             // 長さ降順でソート（最長一致の優先順位を維持）
             // PathRouter内部でRadix Treeに登録する際に使用
@@ -2410,6 +2847,7 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         huge_pages_enabled: config.performance.huge_pages_enabled,
         global_security: config.security,
         logging: config.logging,
+        upstream_groups: Arc::new(upstream_groups),
     })
 }
 
@@ -2476,12 +2914,26 @@ fn init_logging(config: &LoggingConfigSection) -> ftlog::LoggerGuard {
     }
 }
 
-fn load_backend(config: &BackendConfig) -> io::Result<Backend> {
+fn load_backend(
+    config: &BackendConfig,
+    upstream_groups: &HashMap<String, Arc<UpstreamGroup>>,
+) -> io::Result<Backend> {
     match config {
         BackendConfig::Proxy { url, security } => {
+            // 単一URLの場合は UpstreamGroup::single で単一サーバーのグループを作成
             let target = ProxyTarget::parse(url)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid proxy URL"))?;
-            Ok(Backend::Proxy(Arc::new(target), Arc::new(security.clone())))
+            let group = UpstreamGroup::single(target);
+            Ok(Backend::Proxy(Arc::new(group), Arc::new(security.clone())))
+        }
+        BackendConfig::ProxyUpstream { upstream, security } => {
+            // Upstream グループ参照
+            let group = upstream_groups.get(upstream)
+                .ok_or_else(|| io::Error::new(
+                    io::ErrorKind::InvalidInput, 
+                    format!("Upstream '{}' not found", upstream)
+                ))?;
+            Ok(Backend::Proxy(group.clone(), Arc::new(security.clone())))
         }
         BackendConfig::File { path, mode, index, security } => {
             let metadata = fs::metadata(path)?;
@@ -2552,7 +3004,20 @@ fn main() {
     
     let listen_addr = loaded_config.listen_addr.parse::<SocketAddr>()
         .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 443)));
-    let ktls_config = Arc::new(loaded_config.ktls_config);
+    let ktls_config = Arc::new(loaded_config.ktls_config.clone());
+    
+    // CURRENT_CONFIG を初期化（ホットリロード対応）
+    // ワーカースレッドは CURRENT_CONFIG.load() を使用して最新の設定を取得
+    let runtime_config = RuntimeConfig {
+        host_routes: loaded_config.host_routes.clone(),
+        path_routes: loaded_config.path_routes.clone(),
+        tls_config: Some(loaded_config.tls_config.clone()),
+        ktls_config: ktls_config.clone(),
+        global_security: Arc::new(loaded_config.global_security.clone()),
+        upstream_groups: loaded_config.upstream_groups.clone(),
+    };
+    CURRENT_CONFIG.store(Arc::new(runtime_config));
+    info!("Runtime configuration initialized (hot reload enabled via SIGHUP)");
 
     let hostname = hostname::get()
         .map(|h| h.to_string_lossy().into_owned())
@@ -2590,6 +3055,12 @@ fn main() {
 
     // Graceful Shutdown用のシグナルハンドラを設定
     setup_signal_handler();
+    
+    // 設定リロードスレッドを起動（SIGHUP で設定を動的更新）
+    spawn_reload_thread();
+    
+    // 健康チェックスレッドを起動（Upstream の健康状態を監視）
+    spawn_health_check_thread();
 
     let mut handles = Vec::with_capacity(num_threads);
 
@@ -2621,9 +3092,8 @@ fn main() {
     
     for thread_id in 0..num_threads {
         let acceptor_clone = acceptor.clone();
-        let host_routes_clone = loaded_config.host_routes.clone();
-        let path_routes_clone = loaded_config.path_routes.clone();
-        let ktls_config_clone = ktls_config.clone();
+        // 注: host_routes と path_routes は CURRENT_CONFIG から取得するため、ここでは不要
+        // ホットリロード時に各接続が最新の設定を参照できるようにする
         let addr = listen_addr;
         let balancing = reuseport_balancing;
         let workers = num_threads;
@@ -2702,12 +3172,11 @@ fn main() {
                     let _ = stream.set_nodelay(true);
                     
                     let acceptor = acceptor_clone.clone();
-                    let host_routes = host_routes_clone.clone();
-                    let path_routes = path_routes_clone.clone();
-                    let ktls_cfg = ktls_config_clone.clone();
                     
                     monoio::spawn(async move {
-                        handle_connection(stream, acceptor, host_routes, path_routes, peer_addr, ktls_cfg).await;
+                        // handle_connection 内で CURRENT_CONFIG から最新の設定を取得
+                        // これによりホットリロード時に新しい設定が即座に反映される
+                        handle_connection(stream, acceptor, peer_addr).await;
                         // 接続カウンター減少
                         CURRENT_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
                     });
@@ -2769,6 +3238,181 @@ fn setup_signal_handler() {
         info!("Received shutdown signal, initiating graceful shutdown...");
         SHUTDOWN_FLAG.store(true, Ordering::SeqCst);
     }).expect("Failed to set signal handler");
+    
+    // SIGHUP をキャッチして設定リロードをトリガー（Linux/Unix）
+    #[cfg(unix)]
+    {
+        use signal_hook::consts::SIGHUP;
+        use signal_hook::flag as signal_flag;
+        
+        // SIGHUP で RELOAD_FLAG を true に設定
+        // signal-hook はシグナルセーフな方法でフラグを更新
+        if let Err(e) = signal_flag::register(SIGHUP, Arc::clone(&RELOAD_FLAG)) {
+            warn!("Failed to register SIGHUP handler: {}", e);
+        } else {
+            info!("SIGHUP handler registered for configuration hot reload");
+        }
+    }
+}
+
+/// 設定リロードスレッドを起動
+/// 
+/// RELOAD_FLAG を監視し、シグナルを受け取ったら設定をリロードします。
+/// ワーカースレッドは CURRENT_CONFIG を参照するため、
+/// リロード後の新規リクエストは自動的に新しい設定を使用します。
+fn spawn_reload_thread() {
+    use std::path::Path;
+    
+    thread::spawn(move || {
+        info!("Configuration reload thread started");
+        
+        loop {
+            thread::sleep(Duration::from_millis(500));
+            
+            // シャットダウン中はリロードしない
+            if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
+                break;
+            }
+            
+            // リロードフラグをチェック
+            if RELOAD_FLAG.swap(false, Ordering::SeqCst) {
+                info!("SIGHUP received, reloading configuration...");
+                
+                match reload_config(Path::new("config.toml")) {
+                    Ok(()) => {
+                        info!("Configuration reloaded successfully");
+                        info!("New requests will use updated routes");
+                    }
+                    Err(e) => {
+                        error!("Failed to reload configuration: {}", e);
+                        error!("Keeping previous configuration");
+                    }
+                }
+            }
+        }
+        
+        info!("Configuration reload thread stopped");
+    });
+}
+
+/// 健康チェックスレッドを起動
+/// 
+/// CURRENT_CONFIG から Upstream グループを取得し、
+/// 設定された間隔で各サーバーにHTTPリクエストを送信してヘルスをチェック。
+fn spawn_health_check_thread() {
+    thread::spawn(move || {
+        info!("Health check thread started");
+        
+        loop {
+            // シャットダウン中はチェックしない
+            if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
+                break;
+            }
+            
+            // 設定を取得
+            let config = CURRENT_CONFIG.load();
+            
+            // 各 Upstream グループをチェック
+            for (name, group) in config.upstream_groups.iter() {
+                if let Some(ref hc_config) = group.health_check {
+                    // 各サーバーをチェック
+                    for server in &group.servers {
+                        if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        
+                        let target = &server.target;
+                        let addr = format!("{}:{}", target.host, target.port);
+                        
+                        // 同期的な TCP 接続でヘルスチェック
+                        let check_result = perform_health_check(
+                            &addr,
+                            &target.host,
+                            &hc_config.path,
+                            target.use_tls,
+                            Duration::from_secs(hc_config.timeout_secs),
+                            &hc_config.healthy_statuses,
+                        );
+                        
+                        if check_result {
+                            server.record_success(hc_config.healthy_threshold);
+                        } else {
+                            server.record_failure(hc_config.unhealthy_threshold);
+                            ftlog::debug!("Health check failed for {} (upstream: {})", addr, name);
+                        }
+                    }
+                }
+            }
+            
+            // 次のチェックまで待機（最短間隔を使用）
+            let min_interval = config.upstream_groups.values()
+                .filter_map(|g| g.health_check.as_ref())
+                .map(|hc| hc.interval_secs)
+                .min()
+                .unwrap_or(10);
+            thread::sleep(Duration::from_secs(min_interval));
+        }
+        
+        info!("Health check thread stopped");
+    });
+}
+
+/// 同期的な健康チェックを実行
+/// 
+/// TCP 接続して HTTP GET リクエストを送信し、レスポンスをチェック。
+fn perform_health_check(
+    addr: &str,
+    host: &str,
+    path: &str,
+    _use_tls: bool,  // TODO: TLS バックエンドの健康チェック
+    timeout: Duration,
+    healthy_statuses: &[u16],
+) -> bool {
+    use std::net::TcpStream as StdTcpStream;
+    use std::io::{Read, Write};
+    
+    // TCP 接続
+    let mut stream = match StdTcpStream::connect_timeout(
+        &addr.parse().unwrap_or_else(|_| std::net::SocketAddr::from(([127, 0, 0, 1], 80))),
+        timeout,
+    ) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    
+    // HTTP リクエスト送信
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: HealthCheck/1.0\r\n\r\n",
+        path, host
+    );
+    
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    
+    // レスポンス読み取り
+    let mut response = [0u8; 1024];
+    let n = match stream.read(&mut response) {
+        Ok(n) if n > 0 => n,
+        _ => return false,
+    };
+    
+    // ステータスコードを抽出
+    let response_str = String::from_utf8_lossy(&response[..n]);
+    if let Some(status_line) = response_str.lines().next() {
+        // "HTTP/1.1 200 OK" のようなパターン
+        let parts: Vec<&str> = status_line.split_whitespace().collect();
+        if parts.len() >= 2 {
+            if let Ok(status_code) = parts[1].parse::<u16>() {
+                return healthy_statuses.contains(&status_code);
+            }
+        }
+    }
+    
+    false
 }
 
 // ====================
@@ -2935,11 +3579,14 @@ fn create_listener(
 async fn handle_connection(
     stream: TcpStream,
     acceptor: RustlsAcceptor,
-    host_routes: Arc<HashMap<Box<[u8]>, Backend>>,
-    path_routes: Arc<HashMap<Box<[u8]>, SortedPathMap>>,
     peer_addr: SocketAddr,
-    ktls_config: Arc<KtlsConfig>,
 ) {
+    // CURRENT_CONFIG から最新の設定を取得（ホットリロード対応）
+    // ArcSwap::load() はロックフリーで数ナノ秒
+    let config = CURRENT_CONFIG.load();
+    let host_routes = config.host_routes.clone();
+    let path_routes = config.path_routes.clone();
+    
     // TLSハンドシェイクにタイムアウトを設定
     // rustls でハンドシェイク後、ktls2 で kTLS を有効化
     let tls_result = timeout(CONNECT_TIMEOUT, acceptor.accept(stream)).await;
@@ -2955,9 +3602,6 @@ async fn handle_connection(
             return;
         }
     };
-
-    // 警告抑制
-    let _ = &ktls_config;
     
     // クライアントIPアドレスを文字列に変換
     let client_ip = peer_addr.ip().to_string();
@@ -2970,11 +3614,14 @@ async fn handle_connection(
 async fn handle_connection(
     stream: TcpStream,
     acceptor: simple_tls::SimpleTlsAcceptor,
-    host_routes: Arc<HashMap<Box<[u8]>, Backend>>,
-    path_routes: Arc<HashMap<Box<[u8]>, SortedPathMap>>,
     peer_addr: SocketAddr,
-    _ktls_config: Arc<KtlsConfig>,
 ) {
+    // CURRENT_CONFIG から最新の設定を取得（ホットリロード対応）
+    // ArcSwap::load() はロックフリーで数ナノ秒
+    let config = CURRENT_CONFIG.load();
+    let host_routes = config.host_routes.clone();
+    let path_routes = config.path_routes.clone();
+    
     // TLSハンドシェイクにタイムアウトを設定
     let tls_result = timeout(CONNECT_TIMEOUT, acceptor.accept(stream)).await;
     
@@ -3084,11 +3731,32 @@ async fn handle_requests(
                     .map(|h| is_chunked_encoding(h.value))
                     .unwrap_or(false);
                 
-                // Connection: close チェック（Keep-Alive対応）
-                let client_wants_close: bool = req.headers.iter()
+                // Connection ヘッダーチェック（Keep-Alive / Upgrade対応）
+                let connection_header: Option<&[u8]> = req.headers.iter()
                     .find(|h| h.name.eq_ignore_ascii_case("connection"))
-                    .map(|h| h.value.eq_ignore_ascii_case(b"close"))
+                    .map(|h| h.value);
+                
+                let client_wants_close: bool = connection_header
+                    .map(|v| v.eq_ignore_ascii_case(b"close"))
                     .unwrap_or(false);
+                
+                // WebSocket Upgrade チェック
+                // Connection: upgrade と Upgrade: websocket の両方が必要
+                let is_upgrade_connection: bool = connection_header
+                    .map(|v| {
+                        // "upgrade" または "keep-alive, upgrade" などのパターンに対応
+                        v.to_ascii_lowercase()
+                            .windows(7)
+                            .any(|w| w == b"upgrade")
+                    })
+                    .unwrap_or(false);
+                
+                let is_websocket_upgrade: bool = req.headers.iter()
+                    .find(|h| h.name.eq_ignore_ascii_case("upgrade"))
+                    .map(|h| h.value.eq_ignore_ascii_case(b"websocket"))
+                    .unwrap_or(false);
+                
+                let is_websocket: bool = is_upgrade_connection && is_websocket_upgrade;
 
                 // ボディサイズ制限
                 if !is_chunked && content_length > MAX_BODY_SIZE {
@@ -3174,6 +3842,56 @@ async fn handle_requests(
                 // バッファクリア（次のリクエストに備える）
                 accumulated.clear();
 
+                // WebSocket Upgrade の場合は専用ハンドラーを使用
+                if is_websocket {
+                    // WebSocket はプロキシバックエンドでのみサポート
+                    if let Backend::Proxy(ref upstream_group, ref security) = backend {
+                        info!("WebSocket upgrade request detected for path: {}", 
+                              std::str::from_utf8(&path_bytes).unwrap_or("-"));
+                        
+                        // UpstreamGroup からサーバーを選択
+                        let server = match upstream_group.select(client_ip) {
+                            Some(s) => s,
+                            None => {
+                                error!("No healthy upstream servers for WebSocket");
+                                let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
+                                let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+                                return;
+                            }
+                        };
+                        
+                        server.acquire();
+                        
+                        // WebSocket プロキシ処理（双方向転送）
+                        let ws_result = handle_websocket_proxy(
+                            tls_stream,
+                            &server.target,
+                            security,
+                            &method_bytes,
+                            &path_bytes,
+                            &prefix,
+                            &headers_for_proxy,
+                            &initial_body,
+                        ).await;
+                        
+                        server.release();
+                        
+                        match ws_result {
+                            Some((status, resp_size)) => {
+                                log_access(&path_bytes, &user_agent, content_length as u64, status, resp_size, start_instant);
+                            }
+                            None => {}
+                        }
+                        // WebSocket 接続終了後は HTTP 接続も終了
+                        return;
+                    } else {
+                        // ファイルバックエンドでは WebSocket 非対応
+                        let err_buf = ERR_MSG_BAD_REQUEST.to_vec();
+                        let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+                        return;
+                    }
+                }
+
                 // Backend処理
                 let result = handle_backend(
                     tls_stream,
@@ -3186,6 +3904,7 @@ async fn handle_requests(
                     &headers_for_proxy,
                     &initial_body,
                     client_wants_close,
+                    client_ip,
                 ).await;
 
                 match result {
@@ -3348,10 +4067,11 @@ async fn handle_backend(
     headers: &[(Box<[u8]>, Box<[u8]>)],
     initial_body: &[u8],
     client_wants_close: bool,
+    client_ip: &str,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     match backend {
-        Backend::Proxy(target, security) => {
-            handle_proxy(tls_stream, &target, &security, method, req_path, &prefix, content_length, is_chunked, headers, initial_body, client_wants_close).await
+        Backend::Proxy(upstream_group, security) => {
+            handle_proxy(tls_stream, &upstream_group, &security, method, req_path, &prefix, content_length, is_chunked, headers, initial_body, client_wants_close, client_ip).await
         }
         Backend::MemoryFile(data, mime_type, _security) => {
             // ファイル完全一致チェック
@@ -3766,6 +4486,463 @@ impl ChunkedDecoder {
 }
 
 // ====================
+// WebSocket プロキシ処理
+// ====================
+//
+// WebSocket アップグレードリクエストを検出し、双方向転送を行います。
+//
+// フロー:
+// 1. クライアントから Upgrade: websocket リクエストを受信
+// 2. バックエンドに接続し、アップグレードリクエストを転送
+// 3. バックエンドから 101 Switching Protocols を受信
+// 4. クライアントに 101 を転送
+// 5. 以降は双方向でバイトストリームを透過的に転送
+// 6. どちらかが接続を閉じるまで継続
+// ====================
+
+/// WebSocket プロキシ処理（双方向転送）
+/// 
+/// HTTP Upgrade をバックエンドに転送し、成功後は双方向のバイト転送を行う。
+/// WebSocket 接続が終了するまでブロックし、終了後はクライアント接続も閉じる。
+/// 
+/// # Returns
+/// Some((status_code, bytes_transferred)) - 成功時
+/// None - エラー時
+async fn handle_websocket_proxy(
+    client_stream: ServerTls,
+    target: &ProxyTarget,
+    security: &SecurityConfig,
+    method: &[u8],
+    req_path: &[u8],
+    prefix: &[u8],
+    headers: &[(Box<[u8]>, Box<[u8]>)],
+    initial_body: &[u8],
+) -> Option<(u16, u64)> {
+    let connect_timeout = Duration::from_secs(security.backend_connect_timeout_secs);
+    
+    // リクエストパス構築
+    let path_str = std::str::from_utf8(req_path).unwrap_or("/");
+    let sub_path = if prefix.is_empty() {
+        path_str.to_string()
+    } else {
+        let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
+        if path_str.starts_with(prefix_str) {
+            let remaining = &path_str[prefix_str.len()..];
+            let base = target.path_prefix.trim_end_matches('/');
+            
+            if remaining.is_empty() {
+                if base.is_empty() { "/".to_string() } else { format!("{}/", base) }
+            } else if remaining.starts_with('/') {
+                if base.is_empty() { remaining.to_string() } else { format!("{}{}", base, remaining) }
+            } else {
+                if base.is_empty() { format!("/{}", remaining) } else { format!("{}/{}", base, remaining) }
+            }
+        } else {
+            path_str.to_string()
+        }
+    };
+    
+    let final_path = if sub_path.is_empty() { "/" } else { &sub_path };
+    
+    // WebSocket アップグレードリクエスト構築
+    // Connection: Upgrade と Upgrade: websocket を維持
+    let mut request = Vec::with_capacity(1024);
+    request.extend_from_slice(method);
+    request.extend_from_slice(HEADER_SPACE);
+    request.extend_from_slice(final_path.as_bytes());
+    request.extend_from_slice(HEADER_HTTP11_HOST);
+    request.extend_from_slice(target.host.as_bytes());
+    
+    if !target.is_default_port() {
+        request.extend_from_slice(HEADER_PORT_COLON);
+        let mut port_buf = itoa::Buffer::new();
+        request.extend_from_slice(port_buf.format(target.port).as_bytes());
+    }
+    
+    request.extend_from_slice(HEADER_CRLF);
+    
+    // すべてのヘッダーを転送（Host 以外）
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case(b"host") {
+            continue;
+        }
+        
+        if !is_valid_header_name(name) || !is_valid_header_value(value) {
+            continue;
+        }
+        
+        request.extend_from_slice(name);
+        request.extend_from_slice(HEADER_COLON);
+        request.extend_from_slice(value);
+        request.extend_from_slice(HEADER_CRLF);
+    }
+    request.extend_from_slice(HEADER_CRLF);
+    
+    // 初期ボディがあれば追加
+    if !initial_body.is_empty() {
+        request.extend_from_slice(initial_body);
+    }
+    
+    // バックエンドに接続
+    if target.use_tls {
+        // HTTPS バックエンドへの WebSocket
+        handle_websocket_proxy_https(client_stream, target, connect_timeout, request).await
+    } else {
+        // HTTP バックエンドへの WebSocket
+        handle_websocket_proxy_http(client_stream, target, connect_timeout, request).await
+    }
+}
+
+/// HTTP バックエンドへの WebSocket プロキシ
+async fn handle_websocket_proxy_http(
+    mut client_stream: ServerTls,
+    target: &ProxyTarget,
+    connect_timeout: Duration,
+    request: Vec<u8>,
+) -> Option<(u16, u64)> {
+    // バックエンドに接続
+    let addr = format!("{}:{}", target.host, target.port);
+    let connect_result = timeout(connect_timeout, TcpStream::connect(&addr)).await;
+    
+    let mut backend_stream = match connect_result {
+        Ok(Ok(stream)) => {
+            let _ = stream.set_nodelay(true);
+            stream
+        }
+        Ok(Err(e)) => {
+            error!("WebSocket proxy connect error: {}", e);
+            let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
+            let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
+            return Some((502, 0));
+        }
+        Err(_) => {
+            let err_buf = ERR_MSG_GATEWAY_TIMEOUT.to_vec();
+            let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
+            return Some((504, 0));
+        }
+    };
+    
+    // アップグレードリクエストを送信
+    let (write_res, _) = backend_stream.write_all(request).await;
+    if write_res.is_err() {
+        let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
+        let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
+        return Some((502, 0));
+    }
+    
+    // バックエンドからのレスポンスを読み取り
+    let mut response_buf = Vec::with_capacity(4096);
+    let status_code;
+    
+    loop {
+        let buf = buf_get();
+        let (res, mut returned_buf) = backend_stream.read(buf).await;
+        
+        let n = match res {
+            Ok(0) => {
+                buf_put(returned_buf);
+                let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
+                let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
+                return Some((502, 0));
+            }
+            Ok(n) => n,
+            Err(_) => {
+                buf_put(returned_buf);
+                let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
+                let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
+                return Some((502, 0));
+            }
+        };
+        
+        returned_buf.set_valid_len(n);
+        response_buf.extend_from_slice(returned_buf.as_valid_slice());
+        buf_put(returned_buf);
+        
+        // レスポンスヘッダーを解析
+        if let Some(parsed) = parse_http_response(&response_buf) {
+            status_code = parsed.status_code;
+            
+            // クライアントにレスポンスを転送
+            let resp_data = response_buf.clone();
+            let (write_res, _) = client_stream.write_all(resp_data).await;
+            if write_res.is_err() {
+                return None;
+            }
+            
+            // 101 Switching Protocols の場合は双方向転送開始
+            if status_code == 101 {
+                info!("WebSocket upgrade successful, starting bidirectional transfer");
+                let total = websocket_bidirectional_transfer(&mut client_stream, &mut backend_stream).await;
+                return Some((101, total));
+            } else {
+                // アップグレード失敗（通常の HTTP レスポンス）
+                return Some((status_code, response_buf.len() as u64));
+            }
+        }
+        
+        // ヘッダーが大きすぎる
+        if response_buf.len() > MAX_HEADER_SIZE {
+            let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
+            let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
+            return Some((502, 0));
+        }
+    }
+}
+
+/// HTTPS バックエンドへの WebSocket プロキシ
+async fn handle_websocket_proxy_https(
+    mut client_stream: ServerTls,
+    target: &ProxyTarget,
+    connect_timeout: Duration,
+    request: Vec<u8>,
+) -> Option<(u16, u64)> {
+    // バックエンドに TCP 接続
+    let addr = format!("{}:{}", target.host, target.port);
+    let connect_result = timeout(connect_timeout, TcpStream::connect(&addr)).await;
+    
+    let backend_tcp = match connect_result {
+        Ok(Ok(stream)) => {
+            let _ = stream.set_nodelay(true);
+            stream
+        }
+        Ok(Err(e)) => {
+            error!("WebSocket proxy connect error: {}", e);
+            let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
+            let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
+            return Some((502, 0));
+        }
+        Err(_) => {
+            let err_buf = ERR_MSG_GATEWAY_TIMEOUT.to_vec();
+            let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
+            return Some((504, 0));
+        }
+    };
+    
+    // TLS 接続
+    let connector = TLS_CONNECTOR.with(|c| c.clone());
+    let tls_result = timeout(connect_timeout, connector.connect(backend_tcp, &target.host)).await;
+    
+    let mut backend_stream = match tls_result {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => {
+            error!("WebSocket TLS connect error: {}", e);
+            let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
+            let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
+            return Some((502, 0));
+        }
+        Err(_) => {
+            let err_buf = ERR_MSG_GATEWAY_TIMEOUT.to_vec();
+            let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
+            return Some((504, 0));
+        }
+    };
+    
+    // アップグレードリクエストを送信
+    let (write_res, _) = backend_stream.write_all(request).await;
+    if write_res.is_err() {
+        let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
+        let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
+        return Some((502, 0));
+    }
+    
+    // バックエンドからのレスポンスを読み取り
+    let mut response_buf = Vec::with_capacity(4096);
+    let status_code;
+    
+    loop {
+        let buf = buf_get();
+        let (res, mut returned_buf) = backend_stream.read(buf).await;
+        
+        let n = match res {
+            Ok(0) => {
+                buf_put(returned_buf);
+                let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
+                let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
+                return Some((502, 0));
+            }
+            Ok(n) => n,
+            Err(_) => {
+                buf_put(returned_buf);
+                let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
+                let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
+                return Some((502, 0));
+            }
+        };
+        
+        returned_buf.set_valid_len(n);
+        response_buf.extend_from_slice(returned_buf.as_valid_slice());
+        buf_put(returned_buf);
+        
+        // レスポンスヘッダーを解析
+        if let Some(parsed) = parse_http_response(&response_buf) {
+            status_code = parsed.status_code;
+            
+            // クライアントにレスポンスを転送
+            let resp_data = response_buf.clone();
+            let (write_res, _) = client_stream.write_all(resp_data).await;
+            if write_res.is_err() {
+                return None;
+            }
+            
+            // 101 Switching Protocols の場合は双方向転送開始
+            if status_code == 101 {
+                info!("WebSocket upgrade successful (TLS), starting bidirectional transfer");
+                let total = websocket_bidirectional_transfer_tls(&mut client_stream, &mut backend_stream).await;
+                return Some((101, total));
+            } else {
+                // アップグレード失敗
+                return Some((status_code, response_buf.len() as u64));
+            }
+        }
+        
+        // ヘッダーが大きすぎる
+        if response_buf.len() > MAX_HEADER_SIZE {
+            let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
+            let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
+            return Some((502, 0));
+        }
+    }
+}
+
+/// WebSocket 双方向転送（HTTP バックエンド）
+/// 
+/// クライアント ⇔ バックエンド間でデータを双方向に転送。
+/// monoio の select! 相当を手動で実装し、どちらの方向も待機。
+async fn websocket_bidirectional_transfer(
+    client: &mut ServerTls,
+    backend: &mut TcpStream,
+) -> u64 {
+    let mut total = 0u64;
+    
+    // 簡易実装: 交互に読み書きを試みる
+    // 注: monoio は select! マクロを直接サポートしないため、
+    // ポーリングベースで両方向をチェック
+    loop {
+        // クライアント → バックエンド
+        let client_buf = buf_get();
+        let read_result = timeout(Duration::from_millis(100), client.read(client_buf)).await;
+        
+        match read_result {
+            Ok((Ok(0), buf)) => {
+                buf_put(buf);
+                break; // クライアントが接続を閉じた
+            }
+            Ok((Ok(n), mut buf)) => {
+                buf.set_valid_len(n);
+                let write_buf = buf.into_truncated();
+                let (write_res, returned) = backend.write_all(write_buf).await;
+                buf_put_vec(returned);
+                if write_res.is_err() {
+                    break;
+                }
+                total += n as u64;
+            }
+            Ok((Err(_), buf)) => {
+                buf_put(buf);
+                break;
+            }
+            Err(_) => {
+                // タイムアウト - 反対方向をチェック
+            }
+        }
+        
+        // バックエンド → クライアント
+        let backend_buf = buf_get();
+        let read_result = timeout(Duration::from_millis(100), backend.read(backend_buf)).await;
+        
+        match read_result {
+            Ok((Ok(0), buf)) => {
+                buf_put(buf);
+                break; // バックエンドが接続を閉じた
+            }
+            Ok((Ok(n), mut buf)) => {
+                buf.set_valid_len(n);
+                let write_buf = buf.into_truncated();
+                let (write_res, returned) = client.write_all(write_buf).await;
+                buf_put_vec(returned);
+                if write_res.is_err() {
+                    break;
+                }
+                total += n as u64;
+            }
+            Ok((Err(_), buf)) => {
+                buf_put(buf);
+                break;
+            }
+            Err(_) => {
+                // タイムアウト - ループ継続
+            }
+        }
+    }
+    
+    total
+}
+
+/// WebSocket 双方向転送（HTTPS バックエンド）
+async fn websocket_bidirectional_transfer_tls(
+    client: &mut ServerTls,
+    backend: &mut ClientTls,
+) -> u64 {
+    let mut total = 0u64;
+    
+    loop {
+        // クライアント → バックエンド
+        let client_buf = buf_get();
+        let read_result = timeout(Duration::from_millis(100), client.read(client_buf)).await;
+        
+        match read_result {
+            Ok((Ok(0), buf)) => {
+                buf_put(buf);
+                break;
+            }
+            Ok((Ok(n), mut buf)) => {
+                buf.set_valid_len(n);
+                let write_buf = buf.into_truncated();
+                let (write_res, returned) = backend.write_all(write_buf).await;
+                buf_put_vec(returned);
+                if write_res.is_err() {
+                    break;
+                }
+                total += n as u64;
+            }
+            Ok((Err(_), buf)) => {
+                buf_put(buf);
+                break;
+            }
+            Err(_) => {}
+        }
+        
+        // バックエンド → クライアント
+        let backend_buf = buf_get();
+        let read_result = timeout(Duration::from_millis(100), backend.read(backend_buf)).await;
+        
+        match read_result {
+            Ok((Ok(0), buf)) => {
+                buf_put(buf);
+                break;
+            }
+            Ok((Ok(n), mut buf)) => {
+                buf.set_valid_len(n);
+                let write_buf = buf.into_truncated();
+                let (write_res, returned) = client.write_all(write_buf).await;
+                buf_put_vec(returned);
+                if write_res.is_err() {
+                    break;
+                }
+                total += n as u64;
+            }
+            Ok((Err(_), buf)) => {
+                buf_put(buf);
+                break;
+            }
+            Err(_) => {}
+        }
+    }
+    
+    total
+}
+
+// ====================
 // プロキシ処理
 // ====================
 //
@@ -3775,8 +4952,8 @@ impl ChunkedDecoder {
 // ====================
 
 async fn handle_proxy(
-    client_stream: ServerTls,
-    target: &ProxyTarget,
+    mut client_stream: ServerTls,
+    upstream_group: &UpstreamGroup,
     security: &SecurityConfig,
     method: &[u8],
     req_path: &[u8],
@@ -3786,7 +4963,24 @@ async fn handle_proxy(
     headers: &[(Box<[u8]>, Box<[u8]>)],
     initial_body: &[u8],
     client_wants_close: bool,
+    client_ip: &str,
 ) -> Option<(ServerTls, u16, u64, bool)> {
+    // ロードバランシング: UpstreamGroup からサーバーを選択
+    let server = match upstream_group.select(client_ip) {
+        Some(s) => s,
+        None => {
+            // 利用可能なサーバーがない
+            error!("No healthy upstream servers available");
+            let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
+            let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
+            return Some((client_stream, 502, 0, true));
+        }
+    };
+    
+    // 接続カウンターを増加（Least Connections 用）
+    server.acquire();
+    
+    let target = &server.target;
     let pool_key = format!("{}:{}", target.host, target.port);
     
     // リクエストパス構築
@@ -3870,11 +5064,16 @@ async fn handle_proxy(
     // バックエンドにはKeep-Aliveを要求
     request.extend_from_slice(HEADER_CONNECTION_KEEPALIVE_END);
 
-    if target.use_tls {
+    let result = if target.use_tls {
         proxy_https_pooled(client_stream, target, security, &pool_key, request, content_length, is_chunked, initial_body, client_wants_close).await
     } else {
         proxy_http_pooled(client_stream, target, security, &pool_key, request, content_length, is_chunked, initial_body, client_wants_close).await
-    }
+    };
+    
+    // 接続カウンターを減少（Least Connections 用）
+    server.release();
+    
+    result
 }
 
 // ====================

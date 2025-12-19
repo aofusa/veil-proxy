@@ -117,6 +117,41 @@ ktls_fallback_enabled = false
 
 
 # ==========================================
+# Upstream グループ定義（ロードバランシング）
+# ==========================================
+# 複数のバックエンドサーバーを定義し、リクエストを分散できます。
+#
+# アルゴリズム:
+#   - round_robin: ラウンドロビン（順番に振り分け、デフォルト）
+#   - least_conn: Least Connections（接続数が最小のサーバーを選択）
+#   - ip_hash: クライアントIPハッシュ（同一クライアントは同一サーバーへ）
+#
+# 健康チェック設定（オプション）:
+#   interval_secs: チェック間隔（秒、デフォルト: 10）
+#   path: チェック対象パス（デフォルト: /）
+#   timeout_secs: タイムアウト（秒、デフォルト: 5）
+#   healthy_statuses: 成功と判断するステータスコード（デフォルト: [200, 201, 202, 204, 301, 302, 304]）
+#   unhealthy_threshold: 何回連続失敗で unhealthy にするか（デフォルト: 3）
+#   healthy_threshold: 何回連続成功で healthy に戻すか（デフォルト: 2）
+
+# [upstreams."backend-pool"]
+# algorithm = "round_robin"
+# servers = [
+#   "http://localhost:8080",
+#   "http://localhost:8081",
+#   "http://localhost:8082"
+# ]
+# 
+#   [upstreams."backend-pool".health_check]
+#   interval_secs = 10
+#   path = "/health"
+#   timeout_secs = 5
+#   healthy_statuses = [200]
+#   unhealthy_threshold = 3
+#   healthy_threshold = 2
+
+
+# ==========================================
 # ホストベースのルーティング定義
 # ==========================================
 # ホスト名が完全一致した場合のデフォルトバックエンド
