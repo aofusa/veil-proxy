@@ -314,6 +314,17 @@ path = "/var/www/docs/"
 type = "Proxy"
 url = "http://localhost:3000"
 
+# ------------------------------------------
+# SNI名指定付きHTTPSプロキシ
+# ------------------------------------------
+# バックエンドがIPアドレス指定の場合、SNIにドメイン名を指定可能
+# これにより、仮想ホスト構成のサーバーでも正しい証明書を取得できます
+#
+# [path_routes."example.com"."/internal-api/"]
+# type = "Proxy"
+# url = "https://192.168.1.100:443"
+# sni_name = "api.internal.example.com"
+
 # セキュリティ設定付きプロキシ
 # - 許可メソッド: GET, POST, PUT のみ
 # - ボディサイズ制限: 5MB

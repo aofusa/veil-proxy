@@ -2274,7 +2274,8 @@ impl<'de> serde::Deserialize<'de> for ReuseportBalancing {
 #[derive(Clone)]
 enum BackendConfig {
     /// 単一URLプロキシ（後方互換性のため維持）
-    Proxy { url: String, security: SecurityConfig },
+    /// - sni_name: TLS接続時のSNI名（IP直打ち時にドメイン名を指定可能）
+    Proxy { url: String, sni_name: Option<String>, security: SecurityConfig },
     /// Upstream グループ参照（ロードバランシング用）
     ProxyUpstream { upstream: String, security: SecurityConfig },
     /// File バックエンド設定
@@ -2321,6 +2322,8 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                 let mut redirect_url: Option<String> = None;
                 let mut redirect_status: Option<u16> = None;
                 let mut preserve_path: Option<bool> = None;
+                // SNI 用フィールド（Proxy用）
+                let mut sni_name: Option<String> = None;
                 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -2334,6 +2337,7 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                         "redirect_url" => redirect_url = Some(map.next_value()?),
                         "redirect_status" => redirect_status = Some(map.next_value()?),
                         "preserve_path" => preserve_path = Some(map.next_value()?),
+                        "sni_name" => sni_name = Some(map.next_value()?),
                         _ => { let _: serde::de::IgnoredAny = map.next_value()?; }
                     }
                 }
@@ -2348,7 +2352,7 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                             Ok(BackendConfig::ProxyUpstream { upstream: upstream_name, security })
                         } else {
                             let url = url.ok_or_else(|| serde::de::Error::missing_field("url or upstream"))?;
-                            Ok(BackendConfig::Proxy { url, security })
+                            Ok(BackendConfig::Proxy { url, sni_name, security })
                         }
                     }
                     "Redirect" => {
@@ -2427,6 +2431,9 @@ struct ProxyTarget {
     port: u16,
     use_tls: bool,
     path_prefix: String,
+    /// SNI (Server Name Indication) に使用するホスト名
+    /// Noneの場合はhostを使用。IP直打ちの場合にドメイン名を指定可能
+    sni_name: Option<String>,
 }
 
 impl ProxyTarget {
@@ -2458,7 +2465,20 @@ impl ProxyTarget {
             port,
             use_tls: scheme,
             path_prefix: path.to_string(),
+            sni_name: None,
         })
+    }
+    
+    /// SNI名を設定したコピーを作成
+    fn with_sni_name(mut self, sni_name: Option<String>) -> Self {
+        self.sni_name = sni_name;
+        self
+    }
+    
+    /// TLS接続時に使用するSNI名を取得
+    #[inline]
+    fn sni(&self) -> &str {
+        self.sni_name.as_deref().unwrap_or(&self.host)
     }
     
     /// デフォルトポートかどうかを判定
@@ -3333,10 +3353,11 @@ fn load_backend(
     upstream_groups: &HashMap<String, Arc<UpstreamGroup>>,
 ) -> io::Result<Backend> {
     match config {
-        BackendConfig::Proxy { url, security } => {
+        BackendConfig::Proxy { url, sni_name, security } => {
             // 単一URLの場合は UpstreamGroup::single で単一サーバーのグループを作成
             let target = ProxyTarget::parse(url)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid proxy URL"))?;
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid proxy URL"))?
+                .with_sni_name(sni_name.clone());
             let group = UpstreamGroup::single(target);
             Ok(Backend::Proxy(Arc::new(group), Arc::new(security.clone())))
         }
@@ -5581,7 +5602,13 @@ async fn handle_proxy(
     server.acquire();
     
     let target = &server.target;
-    let pool_key = format!("{}:{}", target.host, target.port);
+    // コネクションプールキーの生成
+    // HTTPS接続でSNI名が設定されている場合は、異なるSNI名は異なるプールとして扱う
+    let pool_key = if target.use_tls && target.sni_name.is_some() {
+        format!("{}:{}:{}", target.host, target.port, target.sni())
+    } else {
+        format!("{}:{}", target.host, target.port)
+    };
     
     // リクエストパス構築
     let path_str = std::str::from_utf8(req_path).unwrap_or("/");
@@ -6226,19 +6253,21 @@ async fn proxy_https_pooled(
             };
             
             // TLS接続（タイムアウト付き）
+            // SNI名を使用（sni_nameが設定されていればそれを使用、なければhostを使用）
+            let sni = target.sni();
             let connector = TLS_CONNECTOR.with(|c| c.clone());
-            let tls_result = timeout(connect_timeout, connector.connect(backend_tcp, &target.host)).await;
+            let tls_result = timeout(connect_timeout, connector.connect(backend_tcp, sni)).await;
             
             match tls_result {
                 Ok(Ok(stream)) => stream,
                 Ok(Err(e)) => {
-                    error!("TLS connect error to {}: {}", target.host, e);
+                    error!("TLS connect error to {} (SNI: {}): {}", target.host, sni, e);
                     let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
                     let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
                     return Some((client_stream, 502, 0, true));
                 }
                 Err(_) => {
-                    error!("TLS connect timeout to {}", target.host);
+                    error!("TLS connect timeout to {} (SNI: {})", target.host, sni);
                     let err_buf = ERR_MSG_GATEWAY_TIMEOUT.to_vec();
                     let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
                     return Some((client_stream, 504, 0, true));
