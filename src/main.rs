@@ -2124,6 +2124,14 @@ struct Config {
 #[derive(Deserialize)]
 struct ServerConfigSection {
     listen: String,
+    /// HTTPリスナーアドレス（オプション）
+    /// 
+    /// 指定した場合、HTTPアクセスをHTTPSにリダイレクトするリスナーを起動します。
+    /// 例: "0.0.0.0:80"
+    /// 
+    /// リダイレクトのみを行い、コンテンツは配信しません（セキュリティ考慮）。
+    #[serde(default)]
+    http: Option<String>,
     /// ワーカースレッド数
     /// 未指定または0の場合はCPUコア数と同じスレッド数を使用
     #[serde(default)]
@@ -3167,6 +3175,8 @@ fn load_tls_config(tls_config: &TlsConfigSection, ktls_enabled: bool) -> io::Res
 /// 設定読み込みの戻り値型（統一）
 struct LoadedConfig {
     listen_addr: String,
+    /// HTTPリスナーアドレス（HTTPSリダイレクト用、オプション）
+    listen_http_addr: Option<SocketAddr>,
     tls_config: Arc<ServerConfig>,
     host_routes: Arc<HashMap<Box<[u8]>, Backend>>,
     path_routes: Arc<HashMap<Box<[u8]>, PathRouter>>,
@@ -3347,8 +3357,20 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         _ => num_cpus::get(),
     };
 
+    // HTTPリスナーアドレスをパース（HTTPSリダイレクト用）
+    let listen_http_addr = config.server.http.as_ref().and_then(|addr| {
+        match addr.parse::<SocketAddr>() {
+            Ok(socket_addr) => Some(socket_addr),
+            Err(e) => {
+                warn!("Invalid HTTP listen address '{}': {}", addr, e);
+                None
+            }
+        }
+    });
+
     Ok(LoadedConfig {
         listen_addr: config.server.listen,
+        listen_http_addr,
         tls_config,
         host_routes: Arc::new(host_routes_bytes),
         path_routes: Arc::new(path_routes_bytes),
@@ -3477,6 +3499,84 @@ fn load_backend(
 // ====================
 // コマンドライン引数パース
 // ====================
+
+// ====================
+// HTTP to HTTPS リダイレクトハンドラー
+// ====================
+//
+// HTTPアクセスをHTTPSにリダイレクトするための軽量ハンドラー。
+// セキュリティ上の理由から、HTTPではリダイレクトのみを行い、
+// コンテンツは一切配信しません。
+//
+// 301 Moved Permanently を使用することで、ブラウザがリダイレクト先を
+// キャッシュし、以降のアクセスでは直接HTTPSに接続します。
+
+/// HTTP 301リダイレクトレスポンスのテンプレート
+const HTTP_301_REDIRECT_TEMPLATE: &[u8] = b"HTTP/1.1 301 Moved Permanently\r\nLocation: ";
+const HTTP_301_REDIRECT_SUFFIX: &[u8] = b"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+
+/// HTTPリクエストを処理し、HTTPSにリダイレクトする
+/// 
+/// リクエストからHostヘッダーとパスを読み取り、
+/// https://{host}{path} への301リダイレクトを返します。
+async fn handle_http_redirect(mut stream: TcpStream) {
+    // リクエストを読み取るためのバッファ（ヘッダーのみなので小さめ）
+    let mut buffer = vec![0u8; 4096];
+    
+    // タイムアウト付きで読み取り
+    let read_result = timeout(Duration::from_secs(5), stream.read(buffer)).await;
+    
+    let (result, buf) = match read_result {
+        Ok(r) => r,
+        Err(_) => {
+            // タイムアウト
+            return;
+        }
+    };
+    buffer = buf;
+    
+    let bytes_read = match result {
+        Ok(n) if n > 0 => n,
+        _ => return,
+    };
+    
+    // HTTPリクエストをパース
+    let mut headers = [httparse::EMPTY_HEADER; 32];
+    let mut req = Request::new(&mut headers);
+    
+    let path = match req.parse(&buffer[..bytes_read]) {
+        Ok(Status::Complete(_)) | Ok(Status::Partial) => {
+            req.path.unwrap_or("/")
+        }
+        Err(_) => "/",
+    };
+    
+    // Hostヘッダーを取得
+    let host = req.headers.iter()
+        .find(|h| h.name.eq_ignore_ascii_case("Host"))
+        .map(|h| std::str::from_utf8(h.value).unwrap_or(""))
+        .unwrap_or("");
+    
+    // リダイレクトURLを構築
+    let redirect_url = if host.is_empty() {
+        format!("https://localhost{}", path)
+    } else {
+        // ホストにポート番号が含まれている場合は除去（HTTPSのデフォルトポート443を使用）
+        let clean_host = host.split(':').next().unwrap_or(host);
+        format!("https://{}{}", clean_host, path)
+    };
+    
+    // 301レスポンスを構築
+    let mut response = Vec::with_capacity(
+        HTTP_301_REDIRECT_TEMPLATE.len() + redirect_url.len() + HTTP_301_REDIRECT_SUFFIX.len()
+    );
+    response.extend_from_slice(HTTP_301_REDIRECT_TEMPLATE);
+    response.extend_from_slice(redirect_url.as_bytes());
+    response.extend_from_slice(HTTP_301_REDIRECT_SUFFIX);
+    
+    // レスポンスを送信
+    let _ = timeout(Duration::from_secs(5), stream.write_all(response)).await;
+}
 
 /// High-Performance Reverse Proxy Server
 /// 
@@ -3725,6 +3825,68 @@ fn main() {
             });
         });
         handles.push(handle);
+    }
+
+    // HTTP to HTTPS リダイレクトワーカー（設定されている場合のみ）
+    if let Some(http_addr) = loaded_config.listen_http_addr {
+        info!("============================================");
+        info!("HTTP to HTTPS Redirect Server");
+        info!("HTTP Listen Address: {}", http_addr);
+        info!("All HTTP requests will be redirected to HTTPS (301)");
+        info!("============================================");
+        
+        let http_handle = thread::spawn(move || {
+            let mut rt = RuntimeBuilder::<monoio::IoUringDriver>::new()
+                .enable_timer()
+                .build()
+                .expect("Failed to create HTTP runtime");
+            
+            rt.block_on(async move {
+                // HTTPリスナーを作成（SO_REUSEADDRを有効化）
+                let listener = match TcpListener::bind(http_addr) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        error!("[HTTP] Bind error on {}: {}", http_addr, e);
+                        return;
+                    }
+                };
+                
+                info!("[HTTP] Redirect worker started");
+                
+                loop {
+                    // Shutdown チェック
+                    if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
+                        info!("[HTTP] Shutting down...");
+                        break;
+                    }
+                    
+                    // タイムアウト付きaccept
+                    let accept_result = timeout(Duration::from_secs(1), listener.accept()).await;
+                    
+                    let (stream, _peer_addr) = match accept_result {
+                        Ok(Ok(s)) => s,
+                        Ok(Err(e)) => {
+                            error!("[HTTP] Accept error: {}", e);
+                            continue;
+                        }
+                        Err(_) => {
+                            // タイムアウト - ループを継続してshutdownチェック
+                            continue;
+                        }
+                    };
+                    
+                    let _ = stream.set_nodelay(true);
+                    
+                    // 軽量なリダイレクト処理をspawn
+                    monoio::spawn(async move {
+                        handle_http_redirect(stream).await;
+                    });
+                }
+                
+                info!("[HTTP] Redirect worker stopped");
+            });
+        });
+        handles.push(http_handle);
     }
 
     for handle in handles {
