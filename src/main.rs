@@ -778,6 +778,11 @@ fn default_backend_connect_timeout() -> u64 { 10 }
 fn default_max_idle_connections() -> usize { BACKEND_POOL_MAX_IDLE_PER_HOST }
 fn default_idle_connection_timeout() -> u64 { BACKEND_POOL_IDLE_TIMEOUT_SECS }
 
+// WebSocket ポーリング設定のデフォルト値
+fn default_websocket_poll_timeout_ms() -> u64 { 1 }
+fn default_websocket_poll_max_timeout_ms() -> u64 { 100 }
+fn default_websocket_backoff_multiplier() -> f64 { 2.0 }
+
 // ====================
 // IP制限機能（CIDR対応）
 // ====================
@@ -1023,6 +1028,91 @@ impl IpFilter {
     }
 }
 
+// ====================
+// WebSocket ポーリング設定
+// ====================
+
+/// WebSocketポーリングモード
+/// 
+/// - `Fixed`: 固定タイムアウト（低レイテンシ優先）
+/// - `Adaptive`: バックオフ方式による動的調整（CPU効率優先）
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum WebSocketPollMode {
+    /// 固定タイムアウト - 常に同じタイムアウト値を使用
+    /// 低レイテンシが最優先の場合（リアルタイムゲームなど）に推奨
+    Fixed,
+    /// バックオフ方式 - アクティブ時は短く、アイドル時は長くなる
+    /// CPU効率とレイテンシのバランスを取る場合（チャットなど）に推奨
+    #[default]
+    Adaptive,
+}
+
+impl<'de> serde::Deserialize<'de> for WebSocketPollMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().as_str() {
+            "fixed" => Ok(WebSocketPollMode::Fixed),
+            "adaptive" => Ok(WebSocketPollMode::Adaptive),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown websocket_poll_mode: '{}', expected 'fixed' or 'adaptive'",
+                other
+            ))),
+        }
+    }
+}
+
+/// WebSocketポーリング設定
+/// 
+/// この設定は、WebSocket双方向転送時のポーリング動作を制御します。
+/// 
+/// ## モード
+/// 
+/// - **Fixed**: 常に `initial_timeout_ms` でポーリング
+/// - **Adaptive**: データ転送時は `initial_timeout_ms` を使用し、
+///   アイドル時は `max_timeout_ms` まで徐々に延長
+/// 
+/// ## 設定例
+/// 
+/// ```toml
+/// # リアルタイムゲーム（低レイテンシ最優先）
+/// websocket_poll_mode = "fixed"
+/// websocket_poll_timeout_ms = 1
+/// 
+/// # チャットアプリ（バランス重視）
+/// websocket_poll_mode = "adaptive"
+/// websocket_poll_timeout_ms = 1
+/// websocket_poll_max_timeout_ms = 50
+/// ```
+#[derive(Clone, Debug)]
+pub struct WebSocketPollConfig {
+    /// ポーリングモード
+    pub mode: WebSocketPollMode,
+    /// 初期タイムアウト（ミリ秒）
+    /// Fixedモード: この値を固定で使用
+    /// Adaptiveモード: この値から開始
+    pub initial_timeout_ms: u64,
+    /// 最大タイムアウト（ミリ秒）- Adaptiveモードでのみ使用
+    /// タイムアウトはこの値を超えて延長されない
+    pub max_timeout_ms: u64,
+    /// バックオフ倍率 - Adaptiveモードでのみ使用
+    /// タイムアウト発生時に現在値に掛ける倍率
+    pub backoff_multiplier: f64,
+}
+
+impl Default for WebSocketPollConfig {
+    fn default() -> Self {
+        Self {
+            mode: WebSocketPollMode::Adaptive,
+            initial_timeout_ms: default_websocket_poll_timeout_ms(),
+            max_timeout_ms: default_websocket_poll_max_timeout_ms(),
+            backoff_multiplier: default_websocket_backoff_multiplier(),
+        }
+    }
+}
+
 /// ルートごとのセキュリティ設定
 #[derive(Deserialize, Clone, Debug)]
 pub struct SecurityConfig {
@@ -1104,6 +1194,47 @@ pub struct SecurityConfig {
     /// 例: ["Server", "X-Powered-By"]
     #[serde(default)]
     pub remove_response_headers: Vec<String>,
+    
+    // ====================
+    // WebSocket設定
+    // ====================
+    
+    /// WebSocketポーリングモード
+    /// 
+    /// - `"fixed"`: 固定タイムアウト（低レイテンシ優先）
+    /// - `"adaptive"`: バックオフ方式による動的調整（CPU効率優先）
+    /// 
+    /// デフォルト: `"adaptive"`
+    #[serde(default)]
+    pub websocket_poll_mode: WebSocketPollMode,
+    
+    /// WebSocketポーリング初期タイムアウト（ミリ秒）
+    /// 
+    /// - fixedモード: この値を固定で使用
+    /// - adaptiveモード: この値から開始し、アイドル時に徐々に延長
+    /// 
+    /// デフォルト: `1`
+    #[serde(default = "default_websocket_poll_timeout_ms")]
+    pub websocket_poll_timeout_ms: u64,
+    
+    /// WebSocketポーリング最大タイムアウト（ミリ秒）
+    /// 
+    /// adaptiveモードでのみ使用。
+    /// タイムアウトはこの値を超えて延長されない。
+    /// 
+    /// デフォルト: `100`
+    #[serde(default = "default_websocket_poll_max_timeout_ms")]
+    pub websocket_poll_max_timeout_ms: u64,
+    
+    /// WebSocketバックオフ倍率
+    /// 
+    /// adaptiveモードでタイムアウト発生時に現在値に掛ける倍率。
+    /// 
+    /// 例: `2.0` → 1ms → 2ms → 4ms → 8ms → ... → 100ms（最大値）
+    /// 
+    /// デフォルト: `2.0`
+    #[serde(default = "default_websocket_backoff_multiplier")]
+    pub websocket_poll_backoff_multiplier: f64,
 }
 
 impl SecurityConfig {
@@ -1139,6 +1270,20 @@ impl SecurityConfig {
         !self.allowed_methods.is_empty() ||
         self.rate_limit_requests_per_min > 0
     }
+    
+    /// WebSocketポーリング設定を構築
+    /// 
+    /// SecurityConfigのWebSocket関連フィールドから
+    /// WebSocketPollConfig構造体を生成します。
+    #[inline]
+    pub fn websocket_poll_config(&self) -> WebSocketPollConfig {
+        WebSocketPollConfig {
+            mode: self.websocket_poll_mode,
+            initial_timeout_ms: self.websocket_poll_timeout_ms,
+            max_timeout_ms: self.websocket_poll_max_timeout_ms,
+            backoff_multiplier: self.websocket_poll_backoff_multiplier,
+        }
+    }
 }
 
 impl Default for SecurityConfig {
@@ -1160,6 +1305,11 @@ impl Default for SecurityConfig {
             remove_request_headers: Vec::new(),
             add_response_headers: HashMap::new(),
             remove_response_headers: Vec::new(),
+            // WebSocket設定
+            websocket_poll_mode: WebSocketPollMode::default(),
+            websocket_poll_timeout_ms: default_websocket_poll_timeout_ms(),
+            websocket_poll_max_timeout_ms: default_websocket_poll_max_timeout_ms(),
+            websocket_poll_backoff_multiplier: default_websocket_backoff_multiplier(),
         }
     }
 }
@@ -4968,13 +5118,16 @@ async fn handle_websocket_proxy(
         request.extend_from_slice(initial_body);
     }
     
+    // WebSocketポーリング設定を取得
+    let poll_config = security.websocket_poll_config();
+    
     // バックエンドに接続
     if target.use_tls {
         // HTTPS バックエンドへの WebSocket
-        handle_websocket_proxy_https(client_stream, target, connect_timeout, request).await
+        handle_websocket_proxy_https(client_stream, target, connect_timeout, request, &poll_config).await
     } else {
         // HTTP バックエンドへの WebSocket
-        handle_websocket_proxy_http(client_stream, target, connect_timeout, request).await
+        handle_websocket_proxy_http(client_stream, target, connect_timeout, request, &poll_config).await
     }
 }
 
@@ -4984,6 +5137,7 @@ async fn handle_websocket_proxy_http(
     target: &ProxyTarget,
     connect_timeout: Duration,
     request: Vec<u8>,
+    poll_config: &WebSocketPollConfig,
 ) -> Option<(u16, u64)> {
     // バックエンドに接続
     let addr = format!("{}:{}", target.host, target.port);
@@ -5057,7 +5211,7 @@ async fn handle_websocket_proxy_http(
             // 101 Switching Protocols の場合は双方向転送開始
             if status_code == 101 {
                 info!("WebSocket upgrade successful, starting bidirectional transfer");
-                let total = websocket_bidirectional_transfer(&mut client_stream, &mut backend_stream).await;
+                let total = websocket_bidirectional_transfer(&mut client_stream, &mut backend_stream, poll_config).await;
                 return Some((101, total));
             } else {
                 // アップグレード失敗（通常の HTTP レスポンス）
@@ -5080,6 +5234,7 @@ async fn handle_websocket_proxy_https(
     target: &ProxyTarget,
     connect_timeout: Duration,
     request: Vec<u8>,
+    poll_config: &WebSocketPollConfig,
 ) -> Option<(u16, u64)> {
     // バックエンドに TCP 接続
     let addr = format!("{}:{}", target.host, target.port);
@@ -5172,7 +5327,7 @@ async fn handle_websocket_proxy_https(
             // 101 Switching Protocols の場合は双方向転送開始
             if status_code == 101 {
                 info!("WebSocket upgrade successful (TLS), starting bidirectional transfer");
-                let total = websocket_bidirectional_transfer_tls(&mut client_stream, &mut backend_stream).await;
+                let total = websocket_bidirectional_transfer_tls(&mut client_stream, &mut backend_stream, poll_config).await;
                 return Some((101, total));
             } else {
                 // アップグレード失敗
@@ -5194,10 +5349,16 @@ async fn handle_websocket_proxy_https(
 /// クライアント ⇔ バックエンド間でデータを双方向に転送。
 /// monoio の select! 相当を手動で実装し、どちらの方向も待機。
 /// 
-/// ## パフォーマンス最適化
+/// ## ポーリングモード
 /// 
-/// ポーリングタイムアウトを100ms → 1msに短縮し、レイテンシを改善。
-/// 短いタイムアウトにより、データが利用可能になった際の応答性が向上。
+/// ### Fixed モード
+/// 設定されたタイムアウト値を固定で使用。
+/// 低レイテンシが最優先の場合（リアルタイムゲームなど）に推奨。
+/// 
+/// ### Adaptive モード（デフォルト）
+/// データ転送があればタイムアウトをリセット（初期値に戻す）。
+/// アイドル時はバックオフ方式でタイムアウトを延長（最大値まで）。
+/// CPU効率とレイテンシのバランスを取る場合に推奨。
 /// 
 /// ## 将来的な改善
 /// 
@@ -5206,18 +5367,20 @@ async fn handle_websocket_proxy_https(
 async fn websocket_bidirectional_transfer(
     client: &mut ServerTls,
     backend: &mut TcpStream,
+    poll_config: &WebSocketPollConfig,
 ) -> u64 {
     let mut total = 0u64;
     
-    // 短いタイムアウトで交互に読み書き（レイテンシ改善）
-    // 1msタイムアウトにより、ポーリングオーバーヘッドを維持しながら
-    // データが利用可能な際の応答性を向上
-    const POLL_TIMEOUT: Duration = Duration::from_millis(1);
+    // 現在のタイムアウト値（Adaptive モードで動的に変更）
+    let mut current_timeout_ms = poll_config.initial_timeout_ms;
     
     loop {
+        let poll_timeout = Duration::from_millis(current_timeout_ms);
+        let mut had_activity = false;
+        
         // クライアント → バックエンド
         let client_buf = buf_get();
-        let read_result = timeout(POLL_TIMEOUT, client.read(client_buf)).await;
+        let read_result = timeout(poll_timeout, client.read(client_buf)).await;
         
         match read_result {
             Ok((Ok(0), buf)) => {
@@ -5233,6 +5396,7 @@ async fn websocket_bidirectional_transfer(
                     break;
                 }
                 total += n as u64;
+                had_activity = true;
             }
             Ok((Err(_), buf)) => {
                 buf_put(buf);
@@ -5245,7 +5409,7 @@ async fn websocket_bidirectional_transfer(
         
         // バックエンド → クライアント
         let backend_buf = buf_get();
-        let read_result = timeout(POLL_TIMEOUT, backend.read(backend_buf)).await;
+        let read_result = timeout(poll_timeout, backend.read(backend_buf)).await;
         
         match read_result {
             Ok((Ok(0), buf)) => {
@@ -5261,6 +5425,7 @@ async fn websocket_bidirectional_transfer(
                     break;
                 }
                 total += n as u64;
+                had_activity = true;
             }
             Ok((Err(_), buf)) => {
                 buf_put(buf);
@@ -5270,6 +5435,19 @@ async fn websocket_bidirectional_transfer(
                 // タイムアウト - ループ継続
             }
         }
+        
+        // Adaptive モードでのタイムアウト調整
+        if poll_config.mode == WebSocketPollMode::Adaptive {
+            if had_activity {
+                // データ転送があった場合: タイムアウトをリセット（初期値に戻す）
+                current_timeout_ms = poll_config.initial_timeout_ms;
+            } else {
+                // タイムアウトした場合: バックオフ（最大値まで延長）
+                let new_timeout = (current_timeout_ms as f64 * poll_config.backoff_multiplier) as u64;
+                current_timeout_ms = new_timeout.min(poll_config.max_timeout_ms);
+            }
+        }
+        // Fixed モードでは current_timeout_ms は変更されない
     }
     
     total
@@ -5277,22 +5455,25 @@ async fn websocket_bidirectional_transfer(
 
 /// WebSocket 双方向転送（HTTPS バックエンド）
 /// 
-/// ## パフォーマンス最適化
-/// 
-/// HTTP版と同様に、ポーリングタイムアウトを1msに短縮。
+/// HTTP版と同様のポーリングモード（Fixed/Adaptive）をサポート。
+/// 詳細は `websocket_bidirectional_transfer` のドキュメントを参照。
 async fn websocket_bidirectional_transfer_tls(
     client: &mut ServerTls,
     backend: &mut ClientTls,
+    poll_config: &WebSocketPollConfig,
 ) -> u64 {
     let mut total = 0u64;
     
-    // 短いタイムアウトで交互に読み書き（レイテンシ改善）
-    const POLL_TIMEOUT: Duration = Duration::from_millis(1);
+    // 現在のタイムアウト値（Adaptive モードで動的に変更）
+    let mut current_timeout_ms = poll_config.initial_timeout_ms;
     
     loop {
+        let poll_timeout = Duration::from_millis(current_timeout_ms);
+        let mut had_activity = false;
+        
         // クライアント → バックエンド
         let client_buf = buf_get();
-        let read_result = timeout(POLL_TIMEOUT, client.read(client_buf)).await;
+        let read_result = timeout(poll_timeout, client.read(client_buf)).await;
         
         match read_result {
             Ok((Ok(0), buf)) => {
@@ -5308,6 +5489,7 @@ async fn websocket_bidirectional_transfer_tls(
                     break;
                 }
                 total += n as u64;
+                had_activity = true;
             }
             Ok((Err(_), buf)) => {
                 buf_put(buf);
@@ -5318,7 +5500,7 @@ async fn websocket_bidirectional_transfer_tls(
         
         // バックエンド → クライアント
         let backend_buf = buf_get();
-        let read_result = timeout(POLL_TIMEOUT, backend.read(backend_buf)).await;
+        let read_result = timeout(poll_timeout, backend.read(backend_buf)).await;
         
         match read_result {
             Ok((Ok(0), buf)) => {
@@ -5334,6 +5516,7 @@ async fn websocket_bidirectional_transfer_tls(
                     break;
                 }
                 total += n as u64;
+                had_activity = true;
             }
             Ok((Err(_), buf)) => {
                 buf_put(buf);
@@ -5341,6 +5524,19 @@ async fn websocket_bidirectional_transfer_tls(
             }
             Err(_) => {}
         }
+        
+        // Adaptive モードでのタイムアウト調整
+        if poll_config.mode == WebSocketPollMode::Adaptive {
+            if had_activity {
+                // データ転送があった場合: タイムアウトをリセット（初期値に戻す）
+                current_timeout_ms = poll_config.initial_timeout_ms;
+            } else {
+                // タイムアウトした場合: バックオフ（最大値まで延長）
+                let new_timeout = (current_timeout_ms as f64 * poll_config.backoff_multiplier) as u64;
+                current_timeout_ms = new_timeout.min(poll_config.max_timeout_ms);
+            }
+        }
+        // Fixed モードでは current_timeout_ms は変更されない
     }
     
     total

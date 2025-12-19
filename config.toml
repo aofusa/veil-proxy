@@ -190,6 +190,35 @@ ktls_fallback_enabled = false
 #     add_response_headers          クライアントに返送前に追加するヘッダー   デフォルト: なし
 #     remove_response_headers       クライアントに返送前に削除するヘッダー   デフォルト: なし
 #
+#   WebSocket設定（Proxyバックエンドでのみ有効）:
+#     websocket_poll_mode           ポーリングモード                         デフォルト: "adaptive"
+#                                     - "fixed": 固定タイムアウト（低レイテンシ優先）
+#                                     - "adaptive": バックオフ方式（CPU効率優先）
+#     websocket_poll_timeout_ms     初期タイムアウト（ミリ秒）               デフォルト: 1
+#                                     fixedモード: この値を固定で使用
+#                                     adaptiveモード: この値から開始
+#     websocket_poll_max_timeout_ms 最大タイムアウト（ミリ秒）               デフォルト: 100
+#                                     adaptiveモードでのみ使用
+#     websocket_poll_backoff_multiplier バックオフ倍率                       デフォルト: 2.0
+#                                     タイムアウト発生時に現在値に掛ける倍率
+#
+#   WebSocketポーリング設定例:
+#     リアルタイムゲーム（低レイテンシ最優先）:
+#       websocket_poll_mode = "fixed"
+#       websocket_poll_timeout_ms = 1
+#
+#     チャットアプリ（バランス重視）:
+#       websocket_poll_mode = "adaptive"
+#       websocket_poll_timeout_ms = 1
+#       websocket_poll_max_timeout_ms = 50
+#       websocket_poll_backoff_multiplier = 2.0
+#
+#     監視ダッシュボード（CPU効率優先）:
+#       websocket_poll_mode = "adaptive"
+#       websocket_poll_timeout_ms = 10
+#       websocket_poll_max_timeout_ms = 200
+#       websocket_poll_backoff_multiplier = 1.5
+#
 # ==========================================
 # Prometheusメトリクス
 # ==========================================
