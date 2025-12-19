@@ -317,6 +317,71 @@ fn configure_huge_pages(enabled: bool) {
 }
 
 // ====================
+// Coarse Timer（粗いタイマー）
+// ====================
+//
+// Nginxと同様の最適化。システムコール（clock_gettime）の呼び出しを削減するため、
+// 時刻をキャッシュし、一定間隔でのみ更新する。
+//
+// - ログのタイムスタンプ表示用: キャッシュした OffsetDateTime を使用
+// - 処理時間計測用: std::time::Instant を使用（モノトニック・高精度）
+//
+// スレッドローカルでキャッシュするため、マルチスレッド環境でもロックフリー。
+
+use std::cell::Cell;
+use std::time::Instant;
+
+/// Coarse Timer の更新間隔（ミリ秒）
+/// 100ms間隔で時刻を更新。ログのタイムスタンプには十分な精度。
+const COARSE_TIMER_UPDATE_INTERVAL_MS: u128 = 100;
+
+thread_local! {
+    /// キャッシュされた時刻（ログ表示用）
+    static CACHED_TIME: Cell<OffsetDateTime> = Cell::new(OffsetDateTime::now_utc());
+    /// 最後に時刻を更新したInstant
+    static LAST_UPDATE: Cell<Instant> = Cell::new(Instant::now());
+}
+
+/// Coarse Timer から現在時刻を取得（ログ表示用）
+/// 
+/// キャッシュされた時刻を返す。COARSE_TIMER_UPDATE_INTERVAL_MS 経過していれば更新。
+/// システムコールの呼び出しを大幅に削減。
+#[inline]
+fn coarse_now() -> OffsetDateTime {
+    CACHED_TIME.with(|cached| {
+        LAST_UPDATE.with(|last| {
+            let now_instant = Instant::now();
+            let elapsed = now_instant.duration_since(last.get()).as_millis();
+            
+            if elapsed >= COARSE_TIMER_UPDATE_INTERVAL_MS {
+                // 更新間隔を超えた場合のみシステムコールを発行
+                let now_time = OffsetDateTime::now_utc();
+                cached.set(now_time);
+                last.set(now_instant);
+                now_time
+            } else {
+                // キャッシュされた時刻を返す
+                cached.get()
+            }
+        })
+    })
+}
+
+/// Coarse Timer を強制更新
+/// 
+/// イベントループの開始時などに呼び出して、時刻を最新に更新する。
+#[inline]
+#[allow(dead_code)]
+fn coarse_update() {
+    CACHED_TIME.with(|cached| {
+        LAST_UPDATE.with(|last| {
+            cached.set(OffsetDateTime::now_utc());
+            last.set(Instant::now());
+        })
+    });
+}
+
+// ====================
 // 定数定義（パフォーマンスチューニング済み）
 // ====================
 
@@ -2702,7 +2767,8 @@ async fn handle_requests(
                     }
                 }
 
-                let start_time = OffsetDateTime::now_utc();
+                // 処理時間計測開始（Instant: モノトニック・高精度）
+                let start_instant = Instant::now();
                 
                 // 初期ボディ（ヘッダー後のデータ）
                 let initial_body: Vec<u8> = if header_len < accumulated.len() {
@@ -2730,7 +2796,7 @@ async fn handle_requests(
 
                 match result {
                     Some((stream_back, status, resp_size, should_close)) => {
-                        log_access(&path_bytes, &user_agent, content_length as u64, status, resp_size, start_time);
+                        log_access(&path_bytes, &user_agent, content_length as u64, status, resp_size, start_instant);
                         tls_stream = stream_back;
                         
                         // Connection: close が要求された場合、またはエラー時は接続を閉じる
@@ -4852,14 +4918,20 @@ async fn handle_sendfile_userspace(
 // ロギング
 // ====================
 
-fn log_access(path: &[u8], ua: &[u8], req_body_size: u64, status: u16, resp_body_size: u64, start_time: OffsetDateTime) {
-    let end_time = OffsetDateTime::now_utc();
-    let duration_ms = (end_time - start_time).whole_milliseconds();
+/// アクセスログを記録
+/// 
+/// - 処理時間: `start_instant` からの経過時間を高精度で計測（Instant使用）
+/// - タイムスタンプ: Coarse Timer でキャッシュした時刻を使用（システムコール削減）
+fn log_access(path: &[u8], ua: &[u8], req_body_size: u64, status: u16, resp_body_size: u64, start_instant: Instant) {
+    // 処理時間は Instant で高精度計測
+    let duration_ms = start_instant.elapsed().as_millis();
+    // タイムスタンプは Coarse Timer を使用（システムコール削減）
+    let log_time = coarse_now();
     let path_str = std::str::from_utf8(path).unwrap_or("-");
     let ua_str = std::str::from_utf8(ua).unwrap_or("-");
     
     info!("Access: time={} duration={}ms path={} ua={} req_body_size={} status={} resp_body_size={}",
-        start_time, duration_ms, path_str, ua_str, req_body_size, status, resp_body_size);
+        log_time, duration_ms, path_str, ua_str, req_body_size, status, resp_body_size);
 }
 
 #[allow(dead_code)]
