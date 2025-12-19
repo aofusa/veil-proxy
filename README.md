@@ -16,6 +16,8 @@ io_uring (monoio) と rustls を使用した高性能リバースプロキシサ
 - **ロードバランシング**: 複数バックエンドへのリクエスト分散（Round Robin/Least Connections/IP Hash）
 - **健康チェック**: HTTPベースのアクティブヘルスチェックによる自動フェイルオーバー
 - **WebSocketサポート**: Upgradeヘッダー検知による双方向プロキシ
+- **ヘッダー操作**: リクエスト/レスポンスヘッダーの追加・削除（X-Real-IP, HSTS等）
+- **リダイレクト**: 301/302/307/308 HTTPリダイレクト（パス保持オプション付き）
 
 ### HTTP処理
 - **Keep-Alive**: HTTP/1.1 Keep-Alive完全サポート
@@ -31,6 +33,7 @@ io_uring (monoio) と rustls を使用した高性能リバースプロキシサ
 - **Graceful Reload**: SIGHUPによる設定のホットリロード（ゼロダウンタイム）
 - **非同期ログ**: ftlog による高性能非同期ログ
 - **設定バリデーション**: 起動時の詳細な設定ファイル検証
+- **Prometheusメトリクス**: `/__metrics` エンドポイントでリクエスト数、レイテンシ等を出力
 
 ### セキュリティ
 - **同時接続数制限**: グローバルな接続数上限設定
@@ -199,6 +202,7 @@ path = "/var/www/index.html"
 | `Proxy` | HTTPリバースプロキシ（単一） | `{ type = "Proxy", url = "http://localhost:8080" }` |
 | `Proxy` | HTTPリバースプロキシ（LB） | `{ type = "Proxy", upstream = "backend-pool" }` |
 | `File` | 静的ファイル配信 | `{ type = "File", path = "/var/www", mode = "sendfile" }` |
+| `Redirect` | HTTPリダイレクト | `{ type = "Redirect", redirect_url = "https://new.example.com", redirect_status = 301 }` |
 
 > **Note**: `Proxy` タイプは `url`（単一バックエンド）または `upstream`（ロードバランシング）のいずれかを指定します。WebSocketは両方で自動サポートされます。
 
@@ -415,6 +419,10 @@ max_concurrent_connections = 10000
 | | `denied_ips` | 拒否するIP/CIDR（配列、優先） | なし |
 | コネクションプール | `max_idle_connections_per_host` | ホストごとの最大アイドル接続数 | 8 |
 | | `idle_connection_timeout_secs` | アイドル接続の維持時間 | 30秒 |
+| ヘッダー操作 | `add_request_headers` | バックエンドに転送前に追加するヘッダー | なし |
+| | `remove_request_headers` | バックエンドに転送前に削除するヘッダー | なし |
+| | `add_response_headers` | クライアントに返送前に追加するヘッダー | なし |
+| | `remove_response_headers` | クライアントに返送前に削除するヘッダー | なし |
 
 #### セキュリティ設定例
 
@@ -460,6 +468,165 @@ IP制限は **deny → allow** の順で評価されます（denyが優先）。
 | IPv4 CIDR | `192.168.0.0/24` |
 | 単一IPv6 | `::1` |
 | IPv6 CIDR | `2001:db8::/32` |
+
+## ヘッダー操作
+
+リクエスト/レスポンスヘッダーの追加・削除が可能です。X-Real-IP、X-Forwarded-Proto、HSTSなどのセキュリティヘッダーを設定できます。
+
+### リクエストヘッダー操作
+
+バックエンドへ転送する前にヘッダーを追加・削除します。
+
+| オプション | 説明 | 例 |
+|-----------|------|-----|
+| `add_request_headers` | 追加するヘッダー（テーブル形式） | `{ "X-Real-IP" = "$client_ip" }` |
+| `remove_request_headers` | 削除するヘッダー（配列） | `["X-Debug-Token"]` |
+
+#### 特殊変数
+
+`add_request_headers` の値では以下の変数を使用できます：
+
+| 変数 | 説明 |
+|------|------|
+| `$client_ip` | クライアントのIPアドレス |
+| `$host` | リクエストのHostヘッダー |
+| `$request_uri` | リクエストURI（パス + クエリ文字列） |
+
+### レスポンスヘッダー操作
+
+クライアントへ返送する前にヘッダーを追加・削除します。静的ファイル配信時にも適用されます。
+
+| オプション | 説明 | 例 |
+|-----------|------|-----|
+| `add_response_headers` | 追加するヘッダー | `{ "Strict-Transport-Security" = "max-age=31536000" }` |
+| `remove_response_headers` | 削除するヘッダー | `["Server", "X-Powered-By"]` |
+
+### 設定例
+
+```toml
+# セキュリティヘッダー付きプロキシ
+[path_routes."example.com"."/api/"]
+type = "Proxy"
+url = "http://localhost:8080"
+
+  [path_routes."example.com"."/api/".security]
+  # バックエンドに転送前に追加
+  add_request_headers = { "X-Real-IP" = "$client_ip", "X-Forwarded-Proto" = "https" }
+  # バックエンドに転送前に削除
+  remove_request_headers = ["X-Debug-Token", "X-Internal-Auth"]
+  # クライアントに返送前に追加（セキュリティヘッダー）
+  add_response_headers = { "Strict-Transport-Security" = "max-age=31536000; includeSubDomains", "X-Frame-Options" = "DENY", "X-Content-Type-Options" = "nosniff" }
+  # クライアントに返送前に削除
+  remove_response_headers = ["X-Powered-By"]
+```
+
+## リダイレクト
+
+HTTPリダイレクト（301/302/303/307/308）を設定できます。WWW非対応、HTTPS強制、旧URL移行などに使用します。
+
+### 設定オプション
+
+| オプション | 説明 | デフォルト |
+|-----------|------|-----------|
+| `redirect_url` | リダイレクト先URL（必須） | - |
+| `redirect_status` | ステータスコード（301, 302, 303, 307, 308） | 301 |
+| `preserve_path` | 元のパスをリダイレクト先に追加するか | false |
+
+### ステータスコードの使い分け
+
+| コード | 説明 | 用途 |
+|--------|------|------|
+| 301 | Moved Permanently | 永続的な移転（SEO引き継ぎ） |
+| 302 | Found | 一時的なリダイレクト |
+| 303 | See Other | POSTからGETへのリダイレクト |
+| 307 | Temporary Redirect | 一時的（メソッド維持） |
+| 308 | Permanent Redirect | 永続的（メソッド維持） |
+
+### 設定例
+
+```toml
+# WWWへのリダイレクト
+[path_routes."example.com"."/"]
+type = "Redirect"
+redirect_url = "https://www.example.com/"
+redirect_status = 301
+
+# 旧URLから新URLへの移行（パス保持）
+[path_routes."example.com"."/legacy/"]
+type = "Redirect"
+redirect_url = "https://example.com/v2"
+redirect_status = 301
+preserve_path = true
+# /legacy/users → https://example.com/v2/users
+# /legacy/api/data → https://example.com/v2/api/data
+
+# HTTPからHTTPSへの強制リダイレクト（別のhostで設定）
+[path_routes."http.example.com"."/"]
+type = "Redirect"
+redirect_url = "https://example.com$request_uri"
+redirect_status = 301
+```
+
+### 特殊変数
+
+`redirect_url` では以下の変数を使用できます：
+
+| 変数 | 説明 |
+|------|------|
+| `$request_uri` | 元のリクエストURI |
+| `$path` | prefix除去後のパス部分 |
+
+## Prometheusメトリクス
+
+リクエスト数、レイテンシ、ボディサイズなどのメトリクスをPrometheus形式でエクスポートします。
+
+### エンドポイント
+
+```
+GET /__metrics
+```
+
+このエンドポイントは自動的に有効化され、Prometheusからのスクレイピングに対応しています。
+
+### 利用可能なメトリクス
+
+| メトリクス | タイプ | ラベル | 説明 |
+|-----------|--------|--------|------|
+| `zerocopy_proxy_http_requests_total` | Counter | method, status, host | リクエスト総数 |
+| `zerocopy_proxy_http_request_duration_seconds` | Histogram | method, host | リクエスト処理時間（秒） |
+| `zerocopy_proxy_http_request_size_bytes` | Histogram | - | リクエストボディサイズ |
+| `zerocopy_proxy_http_response_size_bytes` | Histogram | - | レスポンスボディサイズ |
+
+### Grafanaダッシュボード例
+
+```promql
+# リクエストレート（リクエスト/秒）
+rate(zerocopy_proxy_http_requests_total[5m])
+
+# エラー率（4xx + 5xx）
+sum(rate(zerocopy_proxy_http_requests_total{status=~"4..|5.."}[5m])) 
+  / sum(rate(zerocopy_proxy_http_requests_total[5m]))
+
+# レイテンシP95
+histogram_quantile(0.95, rate(zerocopy_proxy_http_request_duration_seconds_bucket[5m]))
+
+# ホスト別リクエストレート
+sum by (host) (rate(zerocopy_proxy_http_requests_total[5m]))
+```
+
+### Prometheus設定例
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: 'zerocopy-proxy'
+    static_configs:
+      - targets: ['your-proxy-server:443']
+    scheme: https
+    tls_config:
+      insecure_skip_verify: true  # 自己署名証明書の場合
+    metrics_path: /__metrics
+```
 
 ## kTLS（Kernel TLS）サポート
 
@@ -944,6 +1111,10 @@ file_path = "/var/log/zerocopy-server.log"
 - [ftlog](https://crates.io/crates/ftlog): 高性能非同期ログライブラリ
 - [memchr](https://crates.io/crates/memchr): SIMD最適化文字列検索
 - [Linux Huge Pages](https://docs.kernel.org/admin-guide/mm/hugetlbpage.html): Large OS Pages設定ガイド
+
+### モニタリング
+
+- [prometheus](https://crates.io/crates/prometheus): Prometheusメトリクスライブラリ
 
 ### 並行制御
 
