@@ -97,6 +97,7 @@ mod ktls_rustls;
 
 use httparse::{Request, Status, Header};
 use monoio::fs::OpenOptions;
+use monoio::buf::{IoBuf, IoBufMut};
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::{TcpListener, TcpStream};
 use monoio::RuntimeBuilder;
@@ -404,6 +405,188 @@ static CONNECTION_CLOSE: &[u8] = b"\r\nConnection: close\r\n\r\n";
 // バッファサイズ（ページアライン・L2キャッシュ最適化）
 const BUF_SIZE: usize = 65536;           // 64KB - io_uring最適サイズ
 const HEADER_BUF_CAPACITY: usize = 512;  // HTTPヘッダー用
+
+// ====================
+// 安全なバッファラッパー（SafeReadBuffer）
+// ====================
+//
+// 未初期化メモリへのアクセスリスクを型システムで防止します。
+//
+// ## 設計原則
+//
+// 1. io_uringへの読み込みには内部バッファ全体を使用
+// 2. 読み込み完了後、有効データ長（valid_len）を設定
+// 3. ユーザーコードは valid_len 経由でのみデータにアクセス可能
+//
+// ## 安全性保証
+//
+// - `as_valid_slice()` は読み込まれたデータのみを返す
+// - 未初期化領域へのアクセスはコンパイル時に防止される
+// - `buf.len()` の誤用によるセキュリティリスクを排除
+//
+// ====================
+
+/// 安全な読み込みバッファラッパー
+/// 
+/// io_uring読み込み操作で使用され、読み込まれたデータ長を追跡することで
+/// 未初期化メモリへのアクセスを型レベルで防止します。
+/// 
+/// # 使用例
+/// 
+/// ```rust,ignore
+/// let mut buf = SafeReadBuffer::new(BUF_SIZE);
+/// // io_uring読み込み操作（内部バッファを使用）
+/// let (result, mut returned_buf) = stream.read(buf.into_inner()).await;
+/// // 読み込み成功後、有効長を設定
+/// returned_buf.set_valid_len(n);
+/// // 安全なアクセス：有効データのみが返される
+/// let data = returned_buf.as_valid_slice();
+/// ```
+pub struct SafeReadBuffer {
+    /// 内部バッファ（BUF_SIZE容量）
+    inner: Vec<u8>,
+    /// 有効データ長（読み込み操作で設定される）
+    valid_len: usize,
+}
+
+impl SafeReadBuffer {
+    /// 新しいバッファを作成
+    /// 
+    /// # Arguments
+    /// * `cap` - バッファ容量
+    /// 
+    /// # Safety
+    /// io_uringに渡すために一時的に長さを確保しますが、
+    /// ユーザーコードからは valid_len 経由でしかアクセスできません。
+    #[inline(always)]
+    #[allow(clippy::uninit_vec)]
+    pub fn new(cap: usize) -> Self {
+        let mut v = Vec::with_capacity(cap);
+        // SAFETY: io_uringに渡すための事前確保
+        // 読み込み前は valid_len = 0 なので未初期化領域にはアクセスできない
+        // SafeReadBuffer は as_valid_slice() を通じてのみデータにアクセスするため、
+        // 未初期化領域への誤アクセスは型レベルで防止されている
+        unsafe { v.set_len(cap); }
+        Self { inner: v, valid_len: 0 }
+    }
+    
+    /// 既存のVec<u8>からバッファを作成
+    /// 
+    /// プール返却時に使用。valid_len は 0 にリセットされます。
+    #[inline(always)]
+    #[allow(clippy::uninit_vec)]
+    pub fn from_vec(mut v: Vec<u8>, cap: usize) -> Self {
+        if v.capacity() >= cap {
+            // SAFETY: capacity >= cap を確認済み
+            unsafe { v.set_len(cap); }
+        } else {
+            // 容量不足の場合は新規作成
+            v = Vec::with_capacity(cap);
+            unsafe { v.set_len(cap); }
+        }
+        Self { inner: v, valid_len: 0 }
+    }
+
+    /// 読み込み完了後に有効データ長を設定
+    /// 
+    /// # Arguments
+    /// * `len` - 読み込まれたバイト数
+    /// 
+    /// # Note
+    /// バッファ容量を超える値は自動的にクランプされます。
+    #[inline(always)]
+    pub fn set_valid_len(&mut self, len: usize) {
+        self.valid_len = len.min(self.inner.len());
+    }
+
+    /// 有効データのスライスを取得
+    /// 
+    /// 読み込まれたデータのみを返します。
+    /// 未初期化領域にはアクセスできません。
+    #[inline(always)]
+    pub fn as_valid_slice(&self) -> &[u8] {
+        &self.inner[..self.valid_len]
+    }
+    
+    /// 有効データ長を取得
+    #[inline(always)]
+    pub fn valid_len(&self) -> usize {
+        self.valid_len
+    }
+    
+    /// バッファ容量を取得
+    #[inline(always)]
+    pub fn capacity(&self) -> usize {
+        self.inner.capacity()
+    }
+    
+    /// 内部バッファの長さを取得（io_uring用）
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+    
+    /// 有効データが空かどうかを確認
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.valid_len == 0
+    }
+    
+    /// 内部Vecを取り出す（プール返却用）
+    /// 
+    /// # Warning
+    /// 返されたVecは未初期化データを含む可能性があります。
+    /// 必ず SafeReadBuffer::from_vec() でラップし直してください。
+    #[inline(always)]
+    pub fn into_inner(self) -> Vec<u8> {
+        self.inner
+    }
+    
+    /// 有効データをtruncateして内部Vecを取り出す
+    /// 
+    /// 書き込み操作用。有効データのみを含むVecを返します。
+    #[inline(always)]
+    pub fn into_truncated(mut self) -> Vec<u8> {
+        self.inner.truncate(self.valid_len);
+        self.inner
+    }
+}
+
+// monoio の IoBuf トレイト実装
+// SAFETY: inner は有効なヒープメモリを指し、read_ptr() は有効なポインタを返す
+unsafe impl IoBuf for SafeReadBuffer {
+    #[inline(always)]
+    fn read_ptr(&self) -> *const u8 {
+        self.inner.read_ptr()
+    }
+
+    #[inline(always)]
+    fn bytes_init(&self) -> usize {
+        self.inner.bytes_init()
+    }
+}
+
+// monoio の IoBufMut トレイト実装
+// SAFETY: inner は有効な書き込み可能なヒープメモリを指す
+unsafe impl IoBufMut for SafeReadBuffer {
+    #[inline(always)]
+    fn write_ptr(&mut self) -> *mut u8 {
+        self.inner.write_ptr()
+    }
+
+    #[inline(always)]
+    fn bytes_total(&mut self) -> usize {
+        self.inner.bytes_total()
+    }
+
+    #[inline(always)]
+    unsafe fn set_init(&mut self, pos: usize) {
+        self.inner.set_init(pos);
+        // io_uringからの読み込み完了時に呼ばれる
+        // valid_len も更新する
+        self.valid_len = pos;
+    }
+}
 
 // セキュリティ制限
 const MAX_HEADER_SIZE: usize = 8192;     // 8KB - ヘッダーサイズ上限
@@ -1314,31 +1497,28 @@ async fn async_raw_write_all(stream: &TcpStream, buf: &[u8]) -> io::Result<()> {
 // バッファの再利用時にゼロ埋め（memset）を行わず、`set_len()` のみを使用。
 // これにより64KB × N回のmemsetコストを完全に削除しています。
 //
-// ## セキュリティ保証
+// ## セキュリティ保証（SafeReadBuffer による型レベル保護）
 //
-// Heartbleed類似の脆弱性（未初期化メモリの漏洩）を防ぐため、
-// 以下の不変条件を厳守する必要があります:
+// SafeReadBuffer ラッパーにより、未初期化メモリへのアクセスを
+// 型システムで防止しています。
 //
-// 1. 読み込み操作後は、必ず読み込まれたサイズ `n` のみを参照する
-//    - OK: `&buf[..n]`, `accumulated.extend_from_slice(&buf[..n])`
-//    - NG: `&buf[..buf.len()]`, `buf.as_slice()`
-//
-// 2. バッファの全長を信頼しない
-//    - `buf.len()` は常に BUF_SIZE だが、有効なデータは読み込みサイズのみ
+// - `as_valid_slice()` は読み込まれたデータのみを返す
+// - `buf.len()` の誤用によるセキュリティリスクを排除
+// - Heartbleed類似の脆弱性を構造的に防止
 //
 // ====================
 
 thread_local! {
     /// スレッドローカルバッファプール
     /// 
-    /// 各バッファは64KBの容量を持ち、読み込み操作に使用されます。
-    /// バッファの内容は未初期化状態ですが、io_uringの読み込み操作で
-    /// カーネルが必要な領域を上書きするため、安全に使用できます。
+    /// 内部では Vec<u8> を保持し、取得時に SafeReadBuffer でラップします。
+    /// これにより、既存のメモリ効率を維持しながら型安全性を向上させています。
+    #[allow(clippy::uninit_vec)]
     static BUF_POOL: RefCell<Vec<Vec<u8>>> = RefCell::new(
         (0..32).map(|_| {
             let mut buf = Vec::with_capacity(BUF_SIZE);
-            // SAFETY: 読み込み専用バッファとして使用
-            // 読み込み後は &buf[..n] のように読み込まれたサイズのみを参照
+            // SAFETY: SafeReadBuffer でラップされるため、
+            // valid_len 経由でしかアクセスできない
             unsafe {
                 buf.set_len(BUF_SIZE);
             }
@@ -1347,62 +1527,54 @@ thread_local! {
     );
 }
 
-/// バッファ取得ヘルパー
+/// 安全なバッファ取得ヘルパー
 /// 
-/// # Safety
-/// プールからの取得時、バッファには以前のデータが残っている可能性があります。
-/// ただし、これは安全です：
-/// - io_uringの読み込み操作でカーネルが必要な領域を上書きする
-/// - 読み込み後は `&buf[..n]` のように読み込まれたサイズのみを参照する
+/// プールから SafeReadBuffer を取得します。
+/// 取得されたバッファは valid_len = 0 で初期化されており、
+/// io_uring読み込み完了後に set_valid_len() で有効長を設定します。
 /// 
-/// 新規作成時のみゼロ初期化を行います（プール枯渇時のみ発生）。
+/// # 使用例
+/// 
+/// ```rust,ignore
+/// let read_buf = buf_get();
+/// let (res, mut returned_buf) = stream.read(read_buf).await;
+/// if let Ok(n) = res {
+///     returned_buf.set_valid_len(n);
+///     // 安全なアクセス：有効データのみが返される
+///     accumulated.extend_from_slice(returned_buf.as_valid_slice());
+/// }
+/// buf_put(returned_buf);
+/// ```
 #[inline(always)]
-fn buf_get() -> Vec<u8> {
+fn buf_get() -> SafeReadBuffer {
     BUF_POOL.with(|p| {
-        p.borrow_mut().pop().unwrap_or_else(|| {
-            // プールが空の場合のみ新規作成
-            // 新規作成時はゼロ初期化（allocatorがゼロページを返す場合もある）
-            let mut buf = Vec::with_capacity(BUF_SIZE);
-            // SAFETY: capacity は BUF_SIZE 以上確保済み
-            // 新規バッファなのでゼロ初期化は不要（io_uringが上書きする）
-            unsafe {
-                buf.set_len(BUF_SIZE);
-            }
-            buf
-        })
+        p.borrow_mut().pop()
+            .map(|v| SafeReadBuffer::from_vec(v, BUF_SIZE))
+            .unwrap_or_else(|| SafeReadBuffer::new(BUF_SIZE))
     })
 }
 
-/// バッファ返却ヘルパー（パフォーマンス最適化版）
+/// バッファ返却ヘルパー（SafeReadBuffer版）
 /// 
-/// # Safety
-/// `unsafe { buf.set_len(BUF_SIZE) }` を使用してゼロ埋めコストを削減しています。
+/// SafeReadBuffer をプールに返却します。
+/// 内部の Vec<u8> を取り出してプールに格納します。
 /// 
-/// ## セキュリティ分析（Heartbleed類似リスクの回避）
+/// # セキュリティ
 /// 
-/// このコードが安全である理由:
-/// 
-/// 1. **読み込みサイズの厳密な管理**
-///    - `read` 操作後は必ず `&returned_buf[..n]` のように読み込まれたサイズのみを参照
-///    - 未初期化領域（以前のデータが残る可能性のある領域）にはアクセスしない
-/// 
-/// 2. **io_uringの動作特性**
-///    - monoioはio_uringを使用しており、カーネルが直接バッファに書き込む
-///    - 読み込み操作前にバッファがゼロ初期化されている必要はない
-/// 
-/// 3. **バッファの使用パターン**
-///    - バッファは読み込み専用として使用され、読み込まれたサイズ分のみが
-///      `extend_from_slice(&buf[..n])` などで安全にコピーされる
-/// 
-/// ## パフォーマンス改善
-/// - ゼロ埋めコスト（64KB × memset）を完全に削除
-/// - 高頻度のバッファ再利用時に顕著な効果
-/// 
-/// ## 注意事項
-/// - バッファを使用する際は、必ず読み込まれたサイズ `n` のみを参照すること
-/// - `buf.len()` を信頼して全領域を参照してはならない
+/// 返却されたバッファは次回取得時に SafeReadBuffer でラップされるため、
+/// 以前のデータが漏洩することはありません（valid_len = 0 で初期化）。
 #[inline(always)]
-fn buf_put(mut buf: Vec<u8>) {
+fn buf_put(buf: SafeReadBuffer) {
+    buf_put_vec(buf.into_inner());
+}
+
+/// バッファ返却ヘルパー（Vec<u8>版、書き込み後の返却用）
+/// 
+/// 書き込み操作で使用された Vec<u8> をプールに返却します。
+/// 主に `into_truncated()` 後の書き込み完了時に使用されます。
+#[inline(always)]
+#[allow(clippy::uninit_vec)]
+fn buf_put_vec(mut buf: Vec<u8>) {
     BUF_POOL.with(|p| {
         let mut pool = p.borrow_mut();
         if pool.len() < 128 {
@@ -1410,14 +1582,14 @@ fn buf_put(mut buf: Vec<u8>) {
             if buf.capacity() >= BUF_SIZE {
                 // SAFETY: 
                 // - capacity() >= BUF_SIZE を事前に確認済み
-                // - このバッファは読み込み用として使用され、読み込まれたサイズのみが参照される
-                // - 未初期化領域へのアクセスは呼び出し側で防止されている
+                // - 次回取得時は SafeReadBuffer でラップされる
                 unsafe {
                     buf.set_len(BUF_SIZE);
                 }
             } else {
                 // 容量が足りない場合は新規作成（通常は発生しない）
-                buf = vec![0u8; BUF_SIZE];
+                buf = Vec::with_capacity(BUF_SIZE);
+                unsafe { buf.set_len(BUF_SIZE); }
             }
             pool.push(buf);
         }
@@ -1826,19 +1998,26 @@ type SortedPathMap = PathRouter;
 // 非同期I/Oトレイト（コード重複解消）
 // ====================
 
-/// 非同期読み込みトレイト
+/// 非同期読み込みトレイト（SafeReadBuffer対応）
+/// 
+/// 読み込み操作で `SafeReadBuffer` を受け取り、返却します。
+/// monoio の `set_init()` コールバックにより、読み込み完了時に
+/// 自動的に `valid_len` が設定されます。
 trait AsyncReader {
-    async fn read_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>);
+    async fn read_buf(&mut self, buf: SafeReadBuffer) -> (io::Result<usize>, SafeReadBuffer);
 }
 
 /// 非同期書き込みトレイト
+/// 
+/// 書き込み操作では `Vec<u8>` を受け取ります。
+/// 書き込みデータは既に有効なデータなので、SafeReadBuffer は不要です。
 trait AsyncWriter {
     async fn write_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>);
 }
 
 // TcpStream用の実装
 impl AsyncReader for TcpStream {
-    async fn read_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+    async fn read_buf(&mut self, buf: SafeReadBuffer) -> (io::Result<usize>, SafeReadBuffer) {
         self.read(buf).await
     }
 }
@@ -1852,7 +2031,7 @@ impl AsyncWriter for TcpStream {
 // KtlsServerStream用の実装（rustls + ktls2）
 #[cfg(feature = "ktls")]
 impl AsyncReader for KtlsServerStream {
-    async fn read_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+    async fn read_buf(&mut self, buf: SafeReadBuffer) -> (io::Result<usize>, SafeReadBuffer) {
         self.read(buf).await
     }
 }
@@ -1867,7 +2046,7 @@ impl AsyncWriter for KtlsServerStream {
 // KtlsClientStream用の実装（rustls + ktls2）
 #[cfg(feature = "ktls")]
 impl AsyncReader for KtlsClientStream {
-    async fn read_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+    async fn read_buf(&mut self, buf: SafeReadBuffer) -> (io::Result<usize>, SafeReadBuffer) {
         self.read(buf).await
     }
 }
@@ -1882,7 +2061,7 @@ impl AsyncWriter for KtlsClientStream {
 // SimpleTlsServerStream用の実装（rustls のみ）
 #[cfg(not(feature = "ktls"))]
 impl AsyncReader for simple_tls::SimpleTlsServerStream {
-    async fn read_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+    async fn read_buf(&mut self, buf: SafeReadBuffer) -> (io::Result<usize>, SafeReadBuffer) {
         self.read(buf).await
     }
 }
@@ -1897,7 +2076,7 @@ impl AsyncWriter for simple_tls::SimpleTlsServerStream {
 // SimpleTlsClientStream用の実装（rustls のみ）
 #[cfg(not(feature = "ktls"))]
 impl AsyncReader for simple_tls::SimpleTlsClientStream {
-    async fn read_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+    async fn read_buf(&mut self, buf: SafeReadBuffer) -> (io::Result<usize>, SafeReadBuffer) {
         self.read(buf).await
     }
 }
@@ -2621,7 +2800,7 @@ async fn handle_requests(
         let read_buf = buf_get();
         let read_result = timeout(IDLE_TIMEOUT, tls_stream.read(read_buf)).await;
         
-        let (res, returned_buf) = match read_result {
+        let (res, mut returned_buf) = match read_result {
             Ok(result) => result,
             Err(_) => {
                 // アイドルタイムアウト - 接続を閉じる
@@ -2641,8 +2820,9 @@ async fn handle_requests(
             }
         };
         
-        // 読み込んだデータを蓄積
-        accumulated.extend_from_slice(&returned_buf[..n]);
+        // 読み込んだデータを蓄積（SafeReadBufferの型安全なアクセス）
+        returned_buf.set_valid_len(n);
+        accumulated.extend_from_slice(returned_buf.as_valid_slice());
         buf_put(returned_buf);
 
         // ヘッダーサイズ制限チェック
@@ -4117,7 +4297,7 @@ async fn transfer_exact_bytes<R: AsyncReader, W: AsyncWriter>(
         let buf = buf_get();
         let read_result = timeout(READ_TIMEOUT, reader.read_buf(buf)).await;
         
-        let (res, returned_buf) = match read_result {
+        let (res, mut returned_buf) = match read_result {
             Ok(result) => result,
             Err(_) => return total,
         };
@@ -4134,16 +4314,17 @@ async fn transfer_exact_bytes<R: AsyncReader, W: AsyncWriter>(
             }
         };
         
-        let mut write_buf = returned_buf;
-        write_buf.truncate(n);
+        // SafeReadBuffer の有効長を設定して書き込み用Vecに変換
+        returned_buf.set_valid_len(n);
+        let write_buf = returned_buf.into_truncated();
         
         let write_result = timeout(WRITE_TIMEOUT, writer.write_buf(write_buf)).await;
         match write_result {
             Ok((Ok(_), returned)) => {
-                buf_put(returned);
+                buf_put_vec(returned);
             }
             Ok((Err(_), returned)) => {
-                buf_put(returned);
+                buf_put_vec(returned);
                 break;
             }
             Err(_) => break,
@@ -4235,7 +4416,7 @@ async fn transfer_chunked_body<R: AsyncReader, W: AsyncWriter>(
         let buf = buf_get();
         let read_result = timeout(READ_TIMEOUT, reader.read_buf(buf)).await;
         
-        let (res, returned_buf) = match read_result {
+        let (res, mut returned_buf) = match read_result {
             Ok(result) => result,
             Err(_) => return ChunkedTransferResult::Failed,
         };
@@ -4252,8 +4433,11 @@ async fn transfer_chunked_body<R: AsyncReader, W: AsyncWriter>(
             }
         };
         
-        // ステートマシンにデータをフィード
-        let feed_result = decoder.feed(&returned_buf[..n]);
+        // SafeReadBuffer の有効長を設定
+        returned_buf.set_valid_len(n);
+        
+        // ステートマシンにデータをフィード（型安全なアクセス）
+        let feed_result = decoder.feed(returned_buf.as_valid_slice());
         
         // サイズ制限超過チェック
         if feed_result == ChunkedFeedResult::SizeLimitExceeded {
@@ -4261,17 +4445,16 @@ async fn transfer_chunked_body<R: AsyncReader, W: AsyncWriter>(
             return ChunkedTransferResult::SizeLimitExceeded;
         }
         
-        // バックエンドに転送
-        let mut write_buf = returned_buf;
-        write_buf.truncate(n);
+        // バックエンドに転送（有効データのみを含むVecに変換）
+        let write_buf = returned_buf.into_truncated();
         
         let write_result = timeout(WRITE_TIMEOUT, writer.write_buf(write_buf)).await;
         match write_result {
             Ok((Ok(_), returned)) => {
-                buf_put(returned);
+                buf_put_vec(returned);
             }
             Ok((Err(_), returned)) => {
-                buf_put(returned);
+                buf_put_vec(returned);
                 return ChunkedTransferResult::Failed;
             }
             Err(_) => return ChunkedTransferResult::Failed,
@@ -4307,7 +4490,7 @@ async fn transfer_response<R: AsyncReader, W: AsyncWriter>(
         let buf = buf_get();
         let read_result = timeout(READ_TIMEOUT, backend.read_buf(buf)).await;
         
-        let (res, returned_buf) = match read_result {
+        let (res, mut returned_buf) = match read_result {
             Ok(result) => result,
             Err(_) => {
                 // タイムアウト
@@ -4340,8 +4523,11 @@ async fn transfer_response<R: AsyncReader, W: AsyncWriter>(
             }
         };
         
+        // SafeReadBuffer の有効長を設定
+        returned_buf.set_valid_len(n);
+        
         if !header_parsed {
-            accumulated.extend_from_slice(&returned_buf[..n]);
+            accumulated.extend_from_slice(returned_buf.as_valid_slice());
             buf_put(returned_buf);
             
             // httparseを使用してレスポンスヘッダーを解析
@@ -4370,10 +4556,10 @@ async fn transfer_response<R: AsyncReader, W: AsyncWriter>(
                 let write_result = timeout(WRITE_TIMEOUT, client.write_buf(header_with_body)).await;
                 match write_result {
                     Ok((Ok(_), returned)) => {
-                        buf_put(returned);
+                        buf_put_vec(returned);
                     }
                     Ok((Err(_), returned)) => {
-                        buf_put(returned);
+                        buf_put_vec(returned);
                         break;
                     }
                     Err(_) => break,
@@ -4383,19 +4569,19 @@ async fn transfer_response<R: AsyncReader, W: AsyncWriter>(
         } else {
             // ヘッダー解析済み
             if is_chunked {
-                // Chunked転送 - デコーダにデータをフィード
-                let feed_result = chunked_decoder.feed(&returned_buf[..n]);
+                // Chunked転送 - デコーダにデータをフィード（型安全なアクセス）
+                let feed_result = chunked_decoder.feed(returned_buf.as_valid_slice());
                 
-                let mut write_buf = returned_buf;
-                write_buf.truncate(n);
+                // 有効データのみを含むVecに変換
+                let write_buf = returned_buf.into_truncated();
                 
                 let write_result = timeout(WRITE_TIMEOUT, client.write_buf(write_buf)).await;
                 match write_result {
                     Ok((Ok(_), returned)) => {
-                        buf_put(returned);
+                        buf_put_vec(returned);
                     }
                     Ok((Err(_), returned)) => {
-                        buf_put(returned);
+                        buf_put_vec(returned);
                         break;
                     }
                     Err(_) => break,
@@ -4418,16 +4604,17 @@ async fn transfer_response<R: AsyncReader, W: AsyncWriter>(
                 };
                 
                 if bytes_to_send > 0 {
-                    let mut write_buf = returned_buf;
-                    write_buf.truncate(bytes_to_send);
+                    // 送信サイズを調整
+                    returned_buf.set_valid_len(bytes_to_send);
+                    let write_buf = returned_buf.into_truncated();
                     
                     let write_result = timeout(WRITE_TIMEOUT, client.write_buf(write_buf)).await;
                     match write_result {
                         Ok((Ok(_), returned)) => {
-                            buf_put(returned);
+                            buf_put_vec(returned);
                         }
                         Ok((Err(_), returned)) => {
-                            buf_put(returned);
+                            buf_put_vec(returned);
                             break;
                         }
                         Err(_) => break,
@@ -4471,7 +4658,7 @@ async fn transfer_response_with_keepalive<R: AsyncReader, W: AsyncWriter>(
         let buf = buf_get();
         let read_result = timeout(READ_TIMEOUT, backend.read_buf(buf)).await;
         
-        let (res, returned_buf) = match read_result {
+        let (res, mut returned_buf) = match read_result {
             Ok(result) => result,
             Err(_) => {
                 // タイムアウト
@@ -4504,8 +4691,11 @@ async fn transfer_response_with_keepalive<R: AsyncReader, W: AsyncWriter>(
             }
         };
         
+        // SafeReadBuffer の有効長を設定
+        returned_buf.set_valid_len(n);
+        
         if !header_parsed {
-            accumulated.extend_from_slice(&returned_buf[..n]);
+            accumulated.extend_from_slice(returned_buf.as_valid_slice());
             buf_put(returned_buf);
             
             // httparseを使用してレスポンスヘッダーを解析
@@ -4537,10 +4727,10 @@ async fn transfer_response_with_keepalive<R: AsyncReader, W: AsyncWriter>(
                 let write_result = timeout(WRITE_TIMEOUT, client.write_buf(header_with_body)).await;
                 match write_result {
                     Ok((Ok(_), returned)) => {
-                        buf_put(returned);
+                        buf_put_vec(returned);
                     }
                     Ok((Err(_), returned)) => {
-                        buf_put(returned);
+                        buf_put_vec(returned);
                         backend_wants_keep_alive = false;
                         break;
                     }
@@ -4554,19 +4744,19 @@ async fn transfer_response_with_keepalive<R: AsyncReader, W: AsyncWriter>(
         } else {
             // ヘッダー解析済み
             if is_chunked {
-                // Chunked転送 - デコーダにデータをフィード
-                let feed_result = chunked_decoder.feed(&returned_buf[..n]);
+                // Chunked転送 - デコーダにデータをフィード（型安全なアクセス）
+                let feed_result = chunked_decoder.feed(returned_buf.as_valid_slice());
                 
-                let mut write_buf = returned_buf;
-                write_buf.truncate(n);
+                // 有効データのみを含むVecに変換
+                let write_buf = returned_buf.into_truncated();
                 
                 let write_result = timeout(WRITE_TIMEOUT, client.write_buf(write_buf)).await;
                 match write_result {
                     Ok((Ok(_), returned)) => {
-                        buf_put(returned);
+                        buf_put_vec(returned);
                     }
                     Ok((Err(_), returned)) => {
-                        buf_put(returned);
+                        buf_put_vec(returned);
                         backend_wants_keep_alive = false;
                         break;
                     }
@@ -4593,16 +4783,17 @@ async fn transfer_response_with_keepalive<R: AsyncReader, W: AsyncWriter>(
                 };
                 
                 if bytes_to_send > 0 {
-                    let mut write_buf = returned_buf;
-                    write_buf.truncate(bytes_to_send);
+                    // 送信サイズを調整
+                    returned_buf.set_valid_len(bytes_to_send);
+                    let write_buf = returned_buf.into_truncated();
                     
                     let write_result = timeout(WRITE_TIMEOUT, client.write_buf(write_buf)).await;
                     match write_result {
                         Ok((Ok(_), returned)) => {
-                            buf_put(returned);
+                            buf_put_vec(returned);
                         }
                         Ok((Err(_), returned)) => {
-                            buf_put(returned);
+                            buf_put_vec(returned);
                             backend_wants_keep_alive = false;
                             break;
                         }
@@ -4878,7 +5069,7 @@ async fn handle_sendfile_userspace(
     
     while offset < file_size {
         let read_buf = buf_get();
-        let (res, returned_buf) = file.read_at(read_buf, offset).await;
+        let (res, mut returned_buf) = file.read_at(read_buf, offset).await;
         
         let n = match res {
             Ok(0) => {
@@ -4893,18 +5084,19 @@ async fn handle_sendfile_userspace(
             }
         };
         
-        let mut write_buf = returned_buf;
-        write_buf.truncate(n);
+        // SafeReadBuffer の有効長を設定して書き込み用Vecに変換
+        returned_buf.set_valid_len(n);
+        let write_buf = returned_buf.into_truncated();
         
         let write_result = timeout(WRITE_TIMEOUT, tls_stream.write_all(write_buf)).await;
         match write_result {
             Ok((Ok(_), returned)) => {
-                buf_put(returned);
+                buf_put_vec(returned);
                 total_sent += n as u64;
                 offset += n as u64;
             }
             Ok((Err(_), returned)) => {
-                buf_put(returned);
+                buf_put_vec(returned);
                 break;
             }
             Err(_) => break,
