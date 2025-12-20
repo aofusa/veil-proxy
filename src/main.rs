@@ -114,12 +114,6 @@ pub mod protocol;
 #[cfg(feature = "http2")]
 pub mod http2;
 
-// 旧 HTTP/3 自前実装（現在は quiche ベースの http3_server を使用）
-// #[cfg(feature = "http3")]
-// pub mod http3;
-// #[cfg(feature = "http3")]
-// pub mod udp;
-
 /// HTTP/3 サーバー (monoio + quiche ベース)
 /// - QUIC プロトコル (RFC 9000)
 /// - HTTP/3 (RFC 9114)
