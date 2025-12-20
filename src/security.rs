@@ -207,9 +207,13 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     18,  // pwrite64
     19,  // readv
     20,  // writev
+    40,  // sendfile (kTLS ゼロコピー転送)
     72,  // fcntl
+    79,  // getcwd (canonicalize() で使用)
+    89,  // readlink (canonicalize() で使用)
     257, // openat
     262, // newfstatat
+    275, // splice (kTLS ゼロコピー転送)
     
     // ============================================
     // ネットワーク（TCP/UDP ソケット）
@@ -342,14 +346,19 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     // ============================================
     // ファイル I/O
     // ============================================
+    17,  // getcwd (canonicalize() で使用)
     56,  // openat
     57,  // close
+    62,  // lseek
     63,  // read
     64,  // write
     65,  // readv
     66,  // writev
     67,  // pread64
     68,  // pwrite64
+    71,  // sendfile (kTLS ゼロコピー転送)
+    76,  // splice (kTLS ゼロコピー転送)
+    78,  // readlinkat (canonicalize() で使用)
     79,  // fstatat
     80,  // fstat
 
