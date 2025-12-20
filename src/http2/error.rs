@@ -180,6 +180,12 @@ impl Http2Error {
         Self::ConnectionError(Http2ErrorCode::CompressionError, msg.into())
     }
 
+    /// ストリームがクローズされたエラーを作成
+    pub fn stream_closed(stream_id: u32, error_code: u32) -> Self {
+        let code = Http2ErrorCode::from_u32(error_code);
+        Self::StreamError(stream_id, code, format!("Stream closed with error code {}", error_code))
+    }
+
     /// GOAWAY を送信すべきかどうか
     pub fn should_goaway(&self) -> bool {
         matches!(self, Self::ConnectionError(_, _))

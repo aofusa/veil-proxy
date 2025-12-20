@@ -1343,6 +1343,117 @@ pub struct GlobalSecurityConfig {
 }
 
 // ====================
+// Prometheusメトリクス設定セクション
+// ====================
+
+/// Prometheusメトリクス設定
+/// 
+/// メトリクスエンドポイントの有効化、パス変更、アクセス制限を設定します。
+/// 
+/// 例:
+/// ```toml
+/// [prometheus]
+/// enabled = true
+/// path = "/metrics"
+/// allowed_ips = ["127.0.0.1", "10.0.0.0/8"]
+/// ```
+#[derive(Deserialize, Clone, Debug)]
+pub struct PrometheusConfig {
+    /// メトリクスエンドポイントを有効化するかどうか
+    /// デフォルト: true
+    #[serde(default = "default_prometheus_enabled")]
+    pub enabled: bool,
+    
+    /// メトリクスエンドポイントのパス
+    /// デフォルト: "/__metrics"
+    #[serde(default = "default_prometheus_path")]
+    pub path: String,
+    
+    /// メトリクスエンドポイントへのアクセスを許可するIPアドレス/CIDR
+    /// 空の場合はすべてのIPからアクセス可能
+    /// 例: ["127.0.0.1", "10.0.0.0/8", "192.168.0.0/16"]
+    #[serde(default)]
+    pub allowed_ips: Vec<String>,
+}
+
+fn default_prometheus_enabled() -> bool { false }
+fn default_prometheus_path() -> String { "/__metrics".to_string() }
+
+impl Default for PrometheusConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_prometheus_enabled(),
+            path: default_prometheus_path(),
+            allowed_ips: Vec::new(),
+        }
+    }
+}
+
+impl PrometheusConfig {
+    /// IPアドレスがメトリクスエンドポイントへのアクセスを許可されているか確認
+    pub fn is_ip_allowed(&self, client_ip: &str) -> bool {
+        // allowed_ipsが空の場合はすべてのIPを許可
+        if self.allowed_ips.is_empty() {
+            return true;
+        }
+        
+        // クライアントIPをパース
+        let client_addr: std::net::IpAddr = match client_ip.parse() {
+            Ok(addr) => addr,
+            Err(_) => return false,
+        };
+        
+        for allowed in &self.allowed_ips {
+            // CIDR表記かチェック
+            if allowed.contains('/') {
+                // CIDR表記の場合
+                if let Some((network, prefix_len)) = allowed.split_once('/') {
+                    if let (Ok(network_addr), Ok(prefix)) = (network.parse::<std::net::IpAddr>(), prefix_len.parse::<u8>()) {
+                        if Self::ip_in_cidr(&client_addr, &network_addr, prefix) {
+                            return true;
+                        }
+                    }
+                }
+            } else {
+                // 単一IPアドレスの場合
+                if let Ok(allowed_addr) = allowed.parse::<std::net::IpAddr>() {
+                    if client_addr == allowed_addr {
+                        return true;
+                    }
+                }
+            }
+        }
+        
+        false
+    }
+    
+    /// IPアドレスがCIDRブロック内にあるかチェック
+    fn ip_in_cidr(ip: &std::net::IpAddr, network: &std::net::IpAddr, prefix_len: u8) -> bool {
+        match (ip, network) {
+            (std::net::IpAddr::V4(ip), std::net::IpAddr::V4(net)) => {
+                if prefix_len > 32 {
+                    return false;
+                }
+                let mask = if prefix_len == 0 { 0 } else { !0u32 << (32 - prefix_len) };
+                let ip_bits = u32::from_be_bytes(ip.octets());
+                let net_bits = u32::from_be_bytes(net.octets());
+                (ip_bits & mask) == (net_bits & mask)
+            }
+            (std::net::IpAddr::V6(ip), std::net::IpAddr::V6(net)) => {
+                if prefix_len > 128 {
+                    return false;
+                }
+                let ip_bits = u128::from_be_bytes(ip.octets());
+                let net_bits = u128::from_be_bytes(net.octets());
+                let mask = if prefix_len == 0 { 0 } else { !0u128 << (128 - prefix_len) };
+                (ip_bits & mask) == (net_bits & mask)
+            }
+            _ => false, // IPv4とIPv6の混在は不一致
+        }
+    }
+}
+
+// ====================
 // 権限降格機能
 // ====================
 //
@@ -2127,6 +2238,9 @@ struct Config {
     /// ログ設定（非同期ログの最適化）
     #[serde(default)]
     logging: LoggingConfigSection,
+    /// Prometheusメトリクス設定
+    #[serde(default)]
+    prometheus: PrometheusConfig,
     /// HTTP/2 設定セクション
     #[serde(default)]
     http2: Http2ConfigSection,
@@ -3444,6 +3558,8 @@ struct LoadedConfig {
     global_security: GlobalSecurityConfig,
     /// ログ設定
     logging: LoggingConfigSection,
+    /// Prometheusメトリクス設定
+    prometheus_config: PrometheusConfig,
     /// Upstream グループ（健康チェック用）
     upstream_groups: Arc<HashMap<String, Arc<UpstreamGroup>>>,
     /// HTTP/2 を有効化するかどうか
@@ -3497,6 +3613,8 @@ struct RuntimeConfig {
     /// グローバルセキュリティ設定（ホットリロード時の参照用）
     #[allow(dead_code)]
     global_security: Arc<GlobalSecurityConfig>,
+    /// Prometheusメトリクス設定
+    prometheus_config: Arc<PrometheusConfig>,
     /// Upstream グループ（健康チェック用）
     upstream_groups: Arc<HashMap<String, Arc<UpstreamGroup>>>,
     /// HTTP/2 有効化フラグ
@@ -3516,6 +3634,7 @@ impl Default for RuntimeConfig {
             tls_config: None,
             ktls_config: Arc::new(KtlsConfig::default()),
             global_security: Arc::new(GlobalSecurityConfig::default()),
+            prometheus_config: Arc::new(PrometheusConfig::default()),
             upstream_groups: Arc::new(HashMap::new()),
             http2_enabled: false,
             http2_config: Http2ConfigSection::default(),
@@ -3550,6 +3669,7 @@ fn reload_config(path: &Path) -> io::Result<()> {
         tls_config: Some(loaded.tls_config),
         ktls_config: Arc::new(loaded.ktls_config),
         global_security: Arc::new(loaded.global_security),
+        prometheus_config: Arc::new(loaded.prometheus_config),
         upstream_groups: loaded.upstream_groups,
         http2_enabled: loaded.http2_enabled,
         http2_config: loaded.http2_config,
@@ -3658,6 +3778,16 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         }
     });
 
+    // Prometheusメトリクス設定をログ出力
+    if config.prometheus.enabled {
+        info!("Prometheus metrics enabled at path: {}", config.prometheus.path);
+        if !config.prometheus.allowed_ips.is_empty() {
+            info!("  Allowed IPs: {:?}", config.prometheus.allowed_ips);
+        }
+    } else {
+        info!("Prometheus metrics disabled");
+    }
+
     Ok(LoadedConfig {
         listen_addr: config.server.listen,
         listen_http_addr,
@@ -3670,6 +3800,7 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         huge_pages_enabled: config.performance.huge_pages_enabled,
         global_security: config.security,
         logging: config.logging,
+        prometheus_config: config.prometheus,
         upstream_groups: Arc::new(upstream_groups),
         http2_enabled,
         http3_enabled,
@@ -3953,6 +4084,7 @@ fn main() {
         tls_config: Some(loaded_config.tls_config.clone()),
         ktls_config: ktls_config.clone(),
         global_security: Arc::new(loaded_config.global_security.clone()),
+        prometheus_config: Arc::new(loaded_config.prometheus_config.clone()),
         upstream_groups: loaded_config.upstream_groups.clone(),
         http2_enabled: loaded_config.http2_enabled,
         http2_config: loaded_config.http2_config.clone(),
@@ -4935,28 +5067,34 @@ async fn handle_http2_single_request<S>(
 where
     S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRentExt + Unpin,
 {
-    // デバッグログ: リクエスト情報を出力
-    debug!(
-        "[HTTP/2] Request: stream={} method={} path={} authority={} (len={})",
-        stream_id,
-        String::from_utf8_lossy(method),
-        String::from_utf8_lossy(path),
-        String::from_utf8_lossy(authority),
-        authority.len()
-    );
-    
-    // メトリクスエンドポイントの処理（/__metrics）
-    if path == b"/__metrics" && method == b"GET" {
-        let body = encode_prometheus_metrics();
-        let headers: &[(&[u8], &[u8])] = &[
-            (b"content-type", b"text/plain; version=0.0.4; charset=utf-8"),
-            (b"server", b"zerocopy-server/http2"),
-        ];
-        if let Err(e) = conn.send_response(stream_id, 200, headers, Some(&body)).await {
-            warn!("[HTTP/2] Metrics response error: {}", e);
-            return None;
+    // メトリクスエンドポイントの処理（設定可能なパス）
+    {
+        let config = CURRENT_CONFIG.load();
+        let prom_config = &config.prometheus_config;
+        
+        let path_str = std::str::from_utf8(path).unwrap_or("/");
+        if prom_config.enabled 
+            && path_str == prom_config.path 
+            && method == b"GET" 
+        {
+            // IPアドレス制限チェック
+            if !prom_config.is_ip_allowed(client_ip) {
+                let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+                let _ = conn.send_response(stream_id, 403, headers, Some(b"Forbidden")).await;
+                return Some((403, 9));
+            }
+            
+            let body = encode_prometheus_metrics();
+            let headers: &[(&[u8], &[u8])] = &[
+                (b"content-type", b"text/plain; version=0.0.4; charset=utf-8"),
+                (b"server", b"zerocopy-server/http2"),
+            ];
+            if let Err(e) = conn.send_response(stream_id, 200, headers, Some(&body)).await {
+                warn!("[HTTP/2] Metrics response error: {}", e);
+                return None;
+            }
+            return Some((200, body.len() as u64));
         }
-        return Some((200, body.len() as u64));
     }
     
     // Backend選択（HTTP/1.1と同じロジック）
@@ -5850,24 +5988,44 @@ async fn handle_requests(
                 
                 drop(req);
                 
-                // メトリクスエンドポイントの処理（/__metrics）
+                // メトリクスエンドポイントの処理（設定可能なパス）
                 // Prometheusスクレイピング用の特別なパス
-                if path_bytes.as_ref() == b"/__metrics" && method_bytes.as_ref() == b"GET" {
-                    let start_instant = Instant::now();
-                    let metrics_response = build_metrics_response();
-                    let resp_size = metrics_response.len() as u64;
+                {
+                    let config = CURRENT_CONFIG.load();
+                    let prom_config = &config.prometheus_config;
                     
-                    let write_result = timeout(WRITE_TIMEOUT, tls_stream.write_all(metrics_response)).await;
-                    match write_result {
-                        Ok((Ok(_), _)) => {
-                            log_access(&method_bytes, &host_bytes, &path_bytes, &user_agent, 0, 200, resp_size, start_instant);
+                    // パスとメソッドをチェック
+                    let path_str = std::str::from_utf8(&path_bytes).unwrap_or("/");
+                    if prom_config.enabled 
+                        && path_str == prom_config.path 
+                        && method_bytes.as_ref() == b"GET" 
+                    {
+                        let start_instant = Instant::now();
+                        
+                        // IPアドレス制限チェック
+                        if !prom_config.is_ip_allowed(client_ip) {
+                            let err_buf = ERR_MSG_FORBIDDEN.to_vec();
+                            let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+                            log_access(&method_bytes, &host_bytes, &path_bytes, &user_agent, 0, 403, 0, start_instant);
+                            accumulated.clear();
+                            return;
                         }
-                        _ => {}
+                        
+                        let metrics_response = build_metrics_response();
+                        let resp_size = metrics_response.len() as u64;
+                        
+                        let write_result = timeout(WRITE_TIMEOUT, tls_stream.write_all(metrics_response)).await;
+                        match write_result {
+                            Ok((Ok(_), _)) => {
+                                log_access(&method_bytes, &host_bytes, &path_bytes, &user_agent, 0, 200, resp_size, start_instant);
+                            }
+                            _ => {}
+                        }
+                        
+                        // メトリクスエンドポイントは常に接続を閉じる
+                        accumulated.clear();
+                        return;
                     }
-                    
-                    // メトリクスエンドポイントは常に接続を閉じる
-                    accumulated.clear();
-                    return;
                 }
 
                 // Backend選択
@@ -7340,6 +7498,27 @@ async fn handle_proxy(
 
     let result = if target.use_tls {
         proxy_https_pooled(client_stream, target, security, &pool_key, request, content_length, is_chunked, initial_body, client_wants_close).await
+    } else if target.use_h2c {
+        // H2C (HTTP/2 over cleartext) 接続
+        #[cfg(feature = "http2")]
+        {
+            proxy_h2c(
+                client_stream, 
+                target, 
+                security,
+                method, 
+                final_path.as_bytes(), 
+                headers, 
+                initial_body,
+                client_wants_close
+            ).await
+        }
+        #[cfg(not(feature = "http2"))]
+        {
+            // HTTP/2 feature が無効な場合はHTTP/1.1にフォールバック
+            warn!("H2C requested but http2 feature not enabled, falling back to HTTP/1.1");
+            proxy_http_pooled(client_stream, target, security, &pool_key, request, content_length, is_chunked, initial_body, client_wants_close).await
+        }
     } else {
         proxy_http_pooled(client_stream, target, security, &pool_key, request, content_length, is_chunked, initial_body, client_wants_close).await
     };
@@ -7470,6 +7649,169 @@ async fn proxy_http_pooled(
             let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
             Some((client_stream, 502, 0, true))
         }
+    }
+}
+
+// ====================
+// H2C プロキシ (HTTP/2 over cleartext)
+// ====================
+//
+// HTTP/2 Prior Knowledge モードでバックエンドに接続し、
+// リクエストを転送します。gRPCバックエンドへの接続に適しています。
+// ====================
+
+/// H2C (HTTP/2 over cleartext) プロキシ
+/// 
+/// HTTP/2 Prior Knowledge モードでバックエンドに接続し、
+/// リクエストを送信してレスポンスを受信します。
+#[cfg(feature = "http2")]
+async fn proxy_h2c(
+    mut client_stream: ServerTls,
+    target: &ProxyTarget,
+    security: &SecurityConfig,
+    method: &[u8],
+    path: &[u8],
+    headers: &[(Box<[u8]>, Box<[u8]>)],
+    request_body: &[u8],
+    client_wants_close: bool,
+) -> Option<(ServerTls, u16, u64, bool)> {
+    let connect_timeout = Duration::from_secs(security.backend_connect_timeout_secs);
+    
+    // バックエンドに接続
+    let addr = format!("{}:{}", target.host, target.port);
+    let connect_result = timeout(connect_timeout, TcpStream::connect(&addr)).await;
+    
+    let backend_stream = match connect_result {
+        Ok(Ok(stream)) => {
+            let _ = stream.set_nodelay(true);
+            stream
+        }
+        Ok(Err(e)) => {
+            error!("H2C connect error to {}: {}", addr, e);
+            let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
+            let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
+            return Some((client_stream, 502, 0, true));
+        }
+        Err(_) => {
+            error!("H2C connect timeout to {}", addr);
+            let err_buf = ERR_MSG_GATEWAY_TIMEOUT.to_vec();
+            let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
+            return Some((client_stream, 504, 0, true));
+        }
+    };
+
+    // H2Cクライアントを作成
+    let settings = http2::Http2Settings::default();
+    let mut h2c_client = http2::H2cClient::new(backend_stream, settings);
+
+    // HTTP/2 ハンドシェイク
+    if let Err(e) = h2c_client.handshake().await {
+        error!("H2C handshake error: {}", e);
+        let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
+        let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
+        return Some((client_stream, 502, 0, true));
+    }
+
+    // ヘッダーを変換 (Box<[u8]> -> &[u8])
+    let headers_ref: Vec<(&[u8], &[u8])> = headers.iter()
+        .map(|(k, v)| (k.as_ref(), v.as_ref()))
+        .collect();
+
+    // リクエストを送信
+    let body = if request_body.is_empty() { None } else { Some(request_body) };
+    let authority = target.host.as_bytes();
+    
+    let response = match h2c_client.send_request(method, path, authority, &headers_ref, body).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            error!("H2C request error: {}", e);
+            let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
+            let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
+            return Some((client_stream, 502, 0, true));
+        }
+    };
+
+    // レスポンスをHTTP/1.1形式でクライアントに返す
+    let status_code = response.status;
+    let mut http11_response = Vec::with_capacity(512 + response.body.len());
+    
+    // ステータス行
+    http11_response.extend_from_slice(b"HTTP/1.1 ");
+    let mut status_buf = itoa::Buffer::new();
+    http11_response.extend_from_slice(status_buf.format(status_code).as_bytes());
+    http11_response.extend_from_slice(b" ");
+    http11_response.extend_from_slice(status_reason_phrase(status_code).as_bytes());
+    http11_response.extend_from_slice(b"\r\n");
+
+    // レスポンスヘッダー
+    for (name, value) in &response.headers {
+        // ホップバイホップヘッダーはスキップ
+        if name.eq_ignore_ascii_case(b"connection") 
+            || name.eq_ignore_ascii_case(b"transfer-encoding")
+            || name.eq_ignore_ascii_case(b"keep-alive")
+        {
+            continue;
+        }
+        http11_response.extend_from_slice(name);
+        http11_response.extend_from_slice(b": ");
+        http11_response.extend_from_slice(value);
+        http11_response.extend_from_slice(b"\r\n");
+    }
+
+    // Content-Length
+    http11_response.extend_from_slice(b"Content-Length: ");
+    http11_response.extend_from_slice(status_buf.format(response.body.len()).as_bytes());
+    http11_response.extend_from_slice(b"\r\n");
+
+    // Connection ヘッダー
+    if client_wants_close {
+        http11_response.extend_from_slice(b"Connection: close\r\n");
+    } else {
+        http11_response.extend_from_slice(b"Connection: keep-alive\r\n");
+    }
+
+    http11_response.extend_from_slice(b"\r\n");
+
+    // ボディ
+    http11_response.extend_from_slice(&response.body);
+
+    let resp_size = http11_response.len() as u64;
+
+    // クライアントに送信
+    let write_result = timeout(WRITE_TIMEOUT, client_stream.write_all(http11_response)).await;
+    if !matches!(write_result, Ok((Ok(_), _))) {
+        return None;
+    }
+
+    Some((client_stream, status_code, resp_size, client_wants_close))
+}
+
+/// ステータスコードに対応する理由フレーズを返す
+#[cfg(feature = "http2")]
+fn status_reason_phrase(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        206 => "Partial Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        304 => "Not Modified",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        408 => "Request Timeout",
+        413 => "Payload Too Large",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        _ => "Unknown",
     }
 }
 

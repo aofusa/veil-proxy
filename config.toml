@@ -374,8 +374,7 @@ ktls_fallback_enabled = false
 # ==========================================
 # Prometheusメトリクス
 # ==========================================
-# メトリクスエンドポイント: /__metrics (GET)
-# Prometheusスクレイピング用のエンドポイントを自動提供
+# Prometheusスクレイピング用のメトリクスエンドポイントを提供します。
 #
 # 利用可能なメトリクス:
 #   zerocopy_proxy_http_requests_total          リクエスト総数（method, status, hostラベル付き）
@@ -384,6 +383,32 @@ ktls_fallback_enabled = false
 #   zerocopy_proxy_http_response_size_bytes     レスポンスボディサイズ
 #   zerocopy_proxy_http_active_connections      アクティブな接続数
 #   zerocopy_proxy_http_upstream_health         アップストリームの健康状態
+#
+# 設定例:
+#
+# [prometheus]
+# # メトリクスエンドポイントの有効化（デフォルト: true）
+# enabled = true
+#
+# # メトリクスエンドポイントのパス（デフォルト: "/__metrics"）
+# path = "/metrics"
+#
+# # アクセスを許可するIPアドレス/CIDR（空の場合は全てのIPを許可）
+# # 例: 内部ネットワークとlocalhostのみ許可
+# allowed_ips = [
+#   "127.0.0.1",
+#   "::1",
+#   "10.0.0.0/8",
+#   "172.16.0.0/12",
+#   "192.168.0.0/16"
+# ]
+
+# [prometheus]
+# # メトリクスエンドポイントの有効化（デフォルト: false）
+# enabled = true
+# path = "/__metrics"
+# allowed_ips = []  # 空の場合は全てのIPを許可
+
 
 [host_routes."example.com"]
 type = "File"

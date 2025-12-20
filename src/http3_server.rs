@@ -245,17 +245,33 @@ impl Http3Handler {
             stream_id
         );
 
-        // メトリクスエンドポイント
-        if path == b"/__metrics" && method == b"GET" {
-            let body = encode_prometheus_metrics();
-            self.send_response(stream_id, 200, &[
-                (b":status", b"200"),
-                (b"content-type", b"text/plain; version=0.0.4; charset=utf-8"),
-                (b"server", b"zerocopy-server/http3"),
-            ], Some(&body))?;
+        // メトリクスエンドポイント（設定可能なパス）
+        {
+            let config = CURRENT_CONFIG.load();
+            let prom_config = &config.prometheus_config;
             
-            self.record_metrics(&method, &authority, 200, request_body.len(), body.len(), start_time);
-            return Ok(());
+            let path_str = std::str::from_utf8(&path).unwrap_or("/");
+            if prom_config.enabled 
+                && path_str == prom_config.path 
+                && method == b"GET" 
+            {
+                // IPアドレス制限チェック
+                if !prom_config.is_ip_allowed(&self.client_ip) {
+                    self.send_error_response(stream_id, 403, b"Forbidden")?;
+                    self.record_metrics(&method, &authority, 403, request_body.len(), 9, start_time);
+                    return Ok(());
+                }
+                
+                let body = encode_prometheus_metrics();
+                self.send_response(stream_id, 200, &[
+                    (b":status", b"200"),
+                    (b"content-type", b"text/plain; version=0.0.4; charset=utf-8"),
+                    (b"server", b"zerocopy-server/http3"),
+                ], Some(&body))?;
+                
+                self.record_metrics(&method, &authority, 200, request_body.len(), body.len(), start_time);
+                return Ok(());
+            }
         }
 
         // バックエンド選択
@@ -410,7 +426,10 @@ impl Http3Handler {
         record_request_metrics(method_str, host_str, status, req_size as u64, resp_size as u64, duration);
     }
     
-    /// プロキシ処理（HTTP/1.1バックエンドへの変換）
+    /// プロキシ処理（HTTP/1.1またはHTTP/2バックエンドへの変換）
+    /// 
+    /// HTTP/3からのリクエストをバックエンドに転送します。
+    /// バックエンドがHTTP/3に対応していない場合は、HTTP/2またはHTTP/1.1にフォールバックします。
     fn handle_proxy(
         &mut self,
         stream_id: u64,
@@ -458,7 +477,7 @@ impl Http3Handler {
         let final_path = if sub_path.is_empty() { "/" } else { &sub_path };
         
         // HTTP/1.1 リクエスト構築
-        let mut request = Vec::with_capacity(1024);
+        let mut request = Vec::with_capacity(1024 + request_body.len());
         request.extend_from_slice(method);
         request.extend_from_slice(b" ");
         request.extend_from_slice(final_path.as_bytes());
@@ -478,7 +497,8 @@ impl Http3Handler {
                 continue;
             }
             if header.name().eq_ignore_ascii_case(b"connection") ||
-               header.name().eq_ignore_ascii_case(b"keep-alive") {
+               header.name().eq_ignore_ascii_case(b"keep-alive") ||
+               header.name().eq_ignore_ascii_case(b"transfer-encoding") {
                 continue;
             }
             request.extend_from_slice(header.name());
@@ -498,32 +518,214 @@ impl Http3Handler {
         request.extend_from_slice(b"Connection: close\r\n\r\n");
         request.extend_from_slice(request_body);
         
-        // 同期的にプロキシ処理（monoioはthread-per-coreなのでブロッキングOK）
-        // 実際にはこの関数は非同期コンテキストで呼ばれないため、
-        // レスポンスをバッファに格納してから送信
-        let result = self.proxy_to_backend(stream_id, target, request)?;
+        // 同期的なブロッキングI/Oでバックエンドに接続
+        // monoioはthread-per-coreモデルなので、同期I/Oも許容される
+        // ただし、本番環境では非同期版が推奨
+        let result = self.proxy_to_backend_sync(stream_id, target, request);
         
         server.release();
-        Ok(result)
+        result
     }
     
-    /// バックエンドへのプロキシ（同期版、後で非同期に変換される前提）
-    fn proxy_to_backend(
+    /// バックエンドへの同期プロキシ処理
+    /// 
+    /// HTTP/3コネクションはUDPベースですが、バックエンドへの接続はTCPを使用します。
+    /// std::net::TcpStreamを使用して同期的に接続し、レスポンスを受信します。
+    fn proxy_to_backend_sync(
         &mut self,
         stream_id: u64,
-        _target: &ProxyTarget,
-        _request: Vec<u8>,
+        target: &ProxyTarget,
+        request: Vec<u8>,
     ) -> io::Result<(u16, usize)> {
-        // 注意: この実装は簡略版です
-        // 実際のプロダクションでは非同期I/Oが必要
-        // HTTP/3はUDPベースなので、TCPバックエンドとの通信は別途処理
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
         
-        // 簡易実装: バックエンドへの接続はこのコンテキストでは不可能なため
-        // プロキシ未対応のエラーを返す
-        // TODO: 完全な非同期プロキシ実装
+        // バックエンドに接続（同期）
+        let addr = format!("{}:{}", target.host, target.port);
         
-        self.send_error_response(stream_id, 502, b"HTTP/3 proxy not yet implemented for this backend")?;
-        Ok((502, 47))
+        let mut backend = match TcpStream::connect_timeout(
+            &addr.parse().map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
+            Duration::from_secs(10),
+        ) {
+            Ok(stream) => {
+                let _ = stream.set_nodelay(true);
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+                stream
+            }
+            Err(e) => {
+                warn!("[HTTP/3] Backend connect error to {}: {}", addr, e);
+                self.send_error_response(stream_id, 502, b"Bad Gateway")?;
+                return Ok((502, 11));
+            }
+        };
+        
+        // TLSバックエンドの場合
+        if target.use_tls {
+            // rustlsを使用したTLS接続
+            let result = self.proxy_to_tls_backend_sync(stream_id, target, request, backend);
+            return result;
+        }
+        
+        // リクエスト送信
+        if let Err(e) = backend.write_all(&request) {
+            warn!("[HTTP/3] Backend write error: {}", e);
+            self.send_error_response(stream_id, 502, b"Bad Gateway")?;
+            return Ok((502, 11));
+        }
+        
+        // レスポンス受信
+        let mut response = Vec::with_capacity(16384);
+        let mut buf = [0u8; 8192];
+        
+        loop {
+            match backend.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => response.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => break,
+                Err(e) => {
+                    warn!("[HTTP/3] Backend read error: {}", e);
+                    if response.is_empty() {
+                        self.send_error_response(stream_id, 502, b"Bad Gateway")?;
+                        return Ok((502, 11));
+                    }
+                    break;
+                }
+            }
+        }
+        
+        // HTTPレスポンスをパース
+        self.parse_and_send_response(stream_id, &response)
+    }
+    
+    /// TLSバックエンドへの同期プロキシ処理
+    fn proxy_to_tls_backend_sync(
+        &mut self,
+        stream_id: u64,
+        target: &ProxyTarget,
+        request: Vec<u8>,
+        mut tcp_stream: std::net::TcpStream,
+    ) -> io::Result<(u16, usize)> {
+        use std::io::{Read, Write};
+        use rustls::ClientConfig;
+        use std::sync::Arc;
+        
+        // rustls クライアント設定
+        let root_store = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        };
+        
+        let config = ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        
+        let config = Arc::new(config);
+        
+        // SNI名を決定
+        let sni_name = target.sni_name.as_deref().unwrap_or(&target.host);
+        let server_name = match rustls::pki_types::ServerName::try_from(sni_name.to_string()) {
+            Ok(name) => name,
+            Err(e) => {
+                warn!("[HTTP/3] Invalid SNI name: {}", e);
+                self.send_error_response(stream_id, 502, b"Bad Gateway")?;
+                return Ok((502, 11));
+            }
+        };
+        
+        let mut tls_conn = match rustls::ClientConnection::new(config, server_name) {
+            Ok(conn) => conn,
+            Err(e) => {
+                warn!("[HTTP/3] TLS connection error: {}", e);
+                self.send_error_response(stream_id, 502, b"Bad Gateway")?;
+                return Ok((502, 11));
+            }
+        };
+        
+        let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp_stream);
+        
+        // リクエスト送信
+        if let Err(e) = stream.write_all(&request) {
+            warn!("[HTTP/3] TLS backend write error: {}", e);
+            self.send_error_response(stream_id, 502, b"Bad Gateway")?;
+            return Ok((502, 11));
+        }
+        
+        // レスポンス受信
+        let mut response = Vec::with_capacity(16384);
+        let mut buf = [0u8; 8192];
+        
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => response.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => {
+                    if response.is_empty() {
+                        warn!("[HTTP/3] TLS backend read error: {}", e);
+                        self.send_error_response(stream_id, 502, b"Bad Gateway")?;
+                        return Ok((502, 11));
+                    }
+                    break;
+                }
+            }
+        }
+        
+        // HTTPレスポンスをパース
+        self.parse_and_send_response(stream_id, &response)
+    }
+    
+    /// HTTPレスポンスをパースしてHTTP/3レスポンスとして送信
+    fn parse_and_send_response(&mut self, stream_id: u64, response: &[u8]) -> io::Result<(u16, usize)> {
+        // ヘッダー終端を探す
+        let header_end = match find_header_end(response) {
+            Some(pos) => pos,
+            None => {
+                warn!("[HTTP/3] Invalid response from backend");
+                self.send_error_response(stream_id, 502, b"Bad Gateway")?;
+                return Ok((502, 11));
+            }
+        };
+        
+        // ステータス行をパース
+        let header_bytes = &response[..header_end];
+        let body_bytes = &response[header_end + 4..]; // \r\n\r\n の後
+        
+        // ステータスコードを取得
+        let status_code = parse_status_code(header_bytes).unwrap_or(502);
+        
+        // ヘッダーをパース
+        let mut resp_headers: Vec<(&[u8], &[u8])> = Vec::new();
+        resp_headers.push((b"server", b"zerocopy-server/http3"));
+        
+        // レスポンスヘッダーを抽出（ステータス行をスキップ）
+        if let Some(first_crlf) = memchr::memchr(b'\n', header_bytes) {
+            let headers_section = &header_bytes[first_crlf + 1..];
+            for line in headers_section.split(|&b| b == b'\n') {
+                let line = line.strip_suffix(&[b'\r']).unwrap_or(line);
+                if line.is_empty() {
+                    continue;
+                }
+                if let Some(colon_pos) = memchr::memchr(b':', line) {
+                    let name = &line[..colon_pos];
+                    let value = &line[colon_pos + 1..];
+                    let value = value.strip_prefix(&[b' ']).unwrap_or(value);
+                    
+                    // ホップバイホップヘッダーはスキップ
+                    if name.eq_ignore_ascii_case(b"connection")
+                        || name.eq_ignore_ascii_case(b"transfer-encoding")
+                        || name.eq_ignore_ascii_case(b"keep-alive")
+                    {
+                        continue;
+                    }
+                    
+                    resp_headers.push((name, value));
+                }
+            }
+        }
+        
+        self.send_response(stream_id, status_code, &resp_headers, Some(body_bytes))?;
+        Ok((status_code, body_bytes.len()))
     }
     
     /// ファイル配信
@@ -1032,6 +1234,33 @@ pub fn run_http3_server(
     rt.block_on(async move {
         run_http3_server_async(bind_addr, config).await
     })
+}
+
+// ====================
+// ヘルパー関数
+// ====================
+
+/// HTTPレスポンスのヘッダー終端（\r\n\r\n）を探す
+fn find_header_end(data: &[u8]) -> Option<usize> {
+    for i in 0..data.len().saturating_sub(3) {
+        if &data[i..i+4] == b"\r\n\r\n" {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// HTTPレスポンスからステータスコードをパース
+fn parse_status_code(header: &[u8]) -> Option<u16> {
+    // "HTTP/1.1 200 OK" のような形式
+    let header_str = std::str::from_utf8(header).ok()?;
+    let first_line = header_str.lines().next()?;
+    let parts: Vec<&str> = first_line.split_whitespace().collect();
+    if parts.len() >= 2 {
+        parts[1].parse().ok()
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

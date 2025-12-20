@@ -29,8 +29,10 @@ pub mod stream;
 pub mod connection;
 pub mod error;
 pub mod settings;
+pub mod client;
 
 pub use error::{Http2Error, Http2ErrorCode};
 pub use settings::Http2Settings;
 pub use connection::{Http2Connection, ProcessedRequest};
 pub use stream::{Stream, StreamState, StreamManager};
+pub use client::{H2cClient, H2cResponse};
