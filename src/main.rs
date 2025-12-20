@@ -131,6 +131,13 @@ pub mod http3;
 #[cfg(feature = "http3")]
 pub mod udp;
 
+/// HTTP/3 サーバー (quiche ベース)
+/// - QUIC プロトコル (RFC 9000)
+/// - HTTP/3 (RFC 9114)
+/// - mio イベントループで動作
+#[cfg(feature = "http3")]
+pub mod http3_server;
+
 use httparse::{Request, Status, Header};
 use monoio::fs::OpenOptions;
 use monoio::buf::{IoBuf, IoBufMut};
@@ -4004,6 +4011,54 @@ fn main() {
             });
         });
         handles.push(http_handle);
+    }
+
+    // HTTP/3 (QUIC/UDP) サーバー（設定されている場合のみ）
+    #[cfg(feature = "http3")]
+    if loaded_config.http3_enabled {
+        let http3_addr_str = loaded_config.http3_listen
+            .clone()
+            .unwrap_or_else(|| loaded_config.listen_addr.clone());
+        
+        let http3_addr: SocketAddr = match http3_addr_str.parse() {
+            Ok(addr) => addr,
+            Err(e) => {
+                error!("Invalid HTTP/3 listen address '{}': {}", http3_addr_str, e);
+                return;
+            }
+        };
+        
+        // TLS 設定パスを設定ファイルから再取得
+        let (tls_cert, tls_key) = match std::fs::read_to_string(&config_path)
+            .ok()
+            .and_then(|s| toml::from_str::<Config>(&s).ok())
+        {
+            Some(cfg) => (cfg.tls.cert_path.clone(), cfg.tls.key_path.clone()),
+            None => {
+                error!("Failed to read TLS config for HTTP/3");
+                return;
+            }
+        };
+        
+        info!("============================================");
+        info!("HTTP/3 (QUIC/UDP) Server");
+        info!("HTTP/3 Listen Address: {} (UDP)", http3_addr);
+        info!("TLS Cert: {}", tls_cert);
+        info!("TLS Key: {}", tls_key);
+        info!("============================================");
+        
+        let http3_handle = thread::spawn(move || {
+            let config = http3_server::Http3ServerConfig {
+                cert_path: tls_cert,
+                key_path: tls_key,
+                ..Default::default()
+            };
+            
+            if let Err(e) = http3_server::run_http3_server(http3_addr, config) {
+                error!("[HTTP/3] Server error: {}", e);
+            }
+        });
+        handles.push(http3_handle);
     }
 
     for handle in handles {

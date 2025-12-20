@@ -26,7 +26,7 @@ http2 = []
 # UDP/QUIC を使用した HTTP/3 プロトコル
 # 注意: HTTP/3 は UDP ベースのため kTLS は使用不可
 # GSO/GRO による高パフォーマンス UDP 処理
-http3 = []
+http3 = ["quiche"]
 
 # 全プロトコルサポート
 all-protocols = ["http2", "http3"]
@@ -79,3 +79,13 @@ signal-hook = "0.3.18"
 # リクエスト数、レイテンシ、エラー率などを計測・エクスポート
 prometheus = "0.13"
 clap = { version = "4.5.53", features = ["derive"] }
+
+# HTTP/3 用 QUIC 実装（Cloudflare quiche）
+# 実績のある QUIC/HTTP/3 実装を使用
+quiche = { version = "0.23", optional = true }
+
+# リング型バッファ（HTTP/3 パケット処理用）
+ring = "0.17"
+
+# mio (HTTP/3 UDP イベントループ用)
+mio = { version = "1.0", features = ["net", "os-poll"] }
