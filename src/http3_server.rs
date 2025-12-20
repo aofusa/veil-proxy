@@ -24,6 +24,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use monoio::net::udp::UdpSocket;
@@ -37,7 +38,7 @@ use crate::{
     Backend, SortedPathMap, SecurityConfig, UpstreamGroup, ProxyTarget,
     find_backend, check_security, SecurityCheckResult,
     encode_prometheus_metrics, record_request_metrics,
-    CURRENT_CONFIG,
+    CURRENT_CONFIG, SHUTDOWN_FLAG,
 };
 
 /// HTTP/3 サーバー設定
@@ -686,6 +687,104 @@ impl Http3Handler {
 /// コネクション管理（Rc<RefCell> で共有）
 type ConnectionMap = Rc<RefCell<HashMap<ConnectionId<'static>, Http3Handler>>>;
 
+/// SO_REUSEPORT を設定した UDP ソケットを作成
+/// 
+/// 複数ワーカースレッドが同じポートでリッスンし、
+/// カーネルがフローに基づいてパケットを分散します。
+fn create_reuseport_udp_socket(bind_addr: SocketAddr) -> io::Result<UdpSocket> {
+    use std::os::unix::io::FromRawFd;
+    
+    // socket2 を使用せず libc を直接使用
+    let domain = if bind_addr.is_ipv4() {
+        libc::AF_INET
+    } else {
+        libc::AF_INET6
+    };
+    
+    let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    
+    // SO_REUSEADDR を設定
+    let optval: libc::c_int = 1;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            &optval as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        unsafe { libc::close(fd) };
+        return Err(io::Error::last_os_error());
+    }
+    
+    // SO_REUSEPORT を設定
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEPORT,
+            &optval as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        unsafe { libc::close(fd) };
+        return Err(io::Error::last_os_error());
+    }
+    
+    // アドレスをバインド
+    let ret = match bind_addr {
+        SocketAddr::V4(addr) => {
+            let sin = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: addr.port().to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes(addr.ip().octets()),
+                },
+                sin_zero: [0; 8],
+            };
+            unsafe {
+                libc::bind(
+                    fd,
+                    &sin as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            }
+        }
+        SocketAddr::V6(addr) => {
+            let sin6 = libc::sockaddr_in6 {
+                sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                sin6_port: addr.port().to_be(),
+                sin6_flowinfo: addr.flowinfo(),
+                sin6_addr: libc::in6_addr {
+                    s6_addr: addr.ip().octets(),
+                },
+                sin6_scope_id: addr.scope_id(),
+            };
+            unsafe {
+                libc::bind(
+                    fd,
+                    &sin6 as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            }
+        }
+    };
+    if ret < 0 {
+        unsafe { libc::close(fd) };
+        return Err(io::Error::last_os_error());
+    }
+    
+    // std::net::UdpSocket を作成し、monoio の UdpSocket に変換
+    let std_socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
+    UdpSocket::from_std(std_socket)
+}
+
 /// HTTP/3 サーバーを起動（monoio ランタイム上で実行）
 /// 
 /// この関数は monoio のスレッド内から呼び出す必要があります。
@@ -725,7 +824,8 @@ pub async fn run_http3_server_async(
     let quic_config = Rc::new(RefCell::new(quic_config));
 
     // UDP ソケットを作成（monoio io_uring ベース）
-    let socket = UdpSocket::bind(bind_addr)?;
+    // SO_REUSEPORT を設定して複数ワーカーで並列処理を可能に
+    let socket = create_reuseport_udp_socket(bind_addr)?;
     let socket = Rc::new(socket);
     let local_addr = bind_addr;
 
@@ -745,6 +845,12 @@ pub async fn run_http3_server_async(
 
     // メインループ: パケット受信とディスパッチ
     loop {
+        // シャットダウンチェック
+        if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
+            info!("[HTTP/3] Shutting down...");
+            break Ok(());
+        }
+        
         // 最小タイムアウトを計算
         let timeout = {
             let conns = connections.borrow();

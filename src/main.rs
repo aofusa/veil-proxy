@@ -123,7 +123,7 @@ pub mod http2;
 #[cfg(feature = "http3")]
 pub mod http3_server;
 
-use httparse::{Request, Status, Header};
+use httparse::{Request, Status};
 use monoio::fs::OpenOptions;
 use monoio::buf::{IoBuf, IoBufMut};
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
@@ -401,19 +401,6 @@ fn coarse_now() -> OffsetDateTime {
     })
 }
 
-/// Coarse Timer を強制更新
-/// 
-/// イベントループの開始時などに呼び出して、時刻を最新に更新する。
-#[inline]
-#[allow(dead_code)]
-fn coarse_update() {
-    CACHED_TIME.with(|cached| {
-        LAST_UPDATE.with(|last| {
-            cached.set(OffsetDateTime::now_utc());
-            last.set(Instant::now());
-        })
-    });
-}
 
 // ====================
 // Prometheusメトリクス
@@ -576,10 +563,6 @@ static ERR_MSG_GATEWAY_TIMEOUT: &[u8] = b"HTTP/1.1 504 Gateway Timeout\r\nConten
 // HTTP ヘッダー部品（事前計算）
 static HTTP_200_PREFIX: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: ";
 static CONTENT_LENGTH_HEADER: &[u8] = b"\r\nContent-Length: ";
-#[allow(dead_code)]
-static CONNECTION_KEEP_ALIVE: &[u8] = b"\r\nConnection: keep-alive\r\n\r\n";
-#[allow(dead_code)]
-static CONNECTION_CLOSE: &[u8] = b"\r\nConnection: close\r\n\r\n";
 
 // HTTPリクエスト構築用定数（ホットパス最適化）
 static HEADER_HTTP11_HOST: &[u8] = b" HTTP/1.1\r\nHost: ";
@@ -1480,7 +1463,9 @@ fn drop_privileges(_security: &GlobalSecurityConfig) -> io::Result<()> {
 // Graceful Shutdown / Hot Reload フラグ
 // ====================
 
-static SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
+/// シャットダウンフラグ（Ctrl+C等でtrueに設定）
+/// HTTP/3モジュールからも参照できるようにpub
+pub static SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
 
 /// 設定リロード要求フラグ（SIGHUP でトリガー）
 /// Arc<AtomicBool> として初期化（signal-hook の要件）
@@ -2790,16 +2775,6 @@ impl ProxyTarget {
         })
     }
     
-    /// H2C対応でパース（HTTP/2 over cleartext を有効化）
-    fn parse_with_h2c(url: &str, enable_h2c: bool) -> Option<Self> {
-        let mut target = Self::parse(url)?;
-        // H2Cは非TLSの場合のみ有効
-        if enable_h2c && !target.use_tls {
-            target.use_h2c = true;
-        }
-        Some(target)
-    }
-    
     /// SNI名を設定したコピーを作成
     fn with_sni_name(mut self, sni_name: Option<String>) -> Self {
         self.sni_name = sni_name;
@@ -3503,17 +3478,22 @@ struct LoadedConfig {
 // ```
 
 /// ランタイムで使用する設定（ホットリロード対応）
-#[allow(dead_code)]
+/// 
+/// 一部のフィールドはホットリロード機能のために保持されているが、
+/// 現在は読み取られていない（将来的にTLS再設定などで使用予定）
 struct RuntimeConfig {
     /// ホストベースのルーティング（O(1) HashMap）
     host_routes: Arc<HashMap<Box<[u8]>, Backend>>,
     /// パスベースのルーティング（O(log n) Radix Tree）
     path_routes: Arc<HashMap<Box<[u8]>, PathRouter>>,
-    /// TLS設定
+    /// TLS設定（ホットリロード時の参照用）
+    #[allow(dead_code)]
     tls_config: Option<Arc<ServerConfig>>,
-    /// kTLS設定
+    /// kTLS設定（ホットリロード時の参照用）
+    #[allow(dead_code)]
     ktls_config: Arc<KtlsConfig>,
-    /// グローバルセキュリティ設定
+    /// グローバルセキュリティ設定（ホットリロード時の参照用）
+    #[allow(dead_code)]
     global_security: Arc<GlobalSecurityConfig>,
     /// Upstream グループ（健康チェック用）
     upstream_groups: Arc<HashMap<String, Arc<UpstreamGroup>>>,
@@ -3521,7 +3501,8 @@ struct RuntimeConfig {
     http2_enabled: bool,
     /// HTTP/2 設定（詳細設定）
     http2_config: Http2ConfigSection,
-    /// HTTP/3 設定（詳細設定）
+    /// HTTP/3 設定（ホットリロード時の参照用）
+    #[allow(dead_code)]
     http3_config: Http3ConfigSection,
 }
 
@@ -3558,7 +3539,6 @@ static CONFIG_PATH: Lazy<ArcSwap<PathBuf>> =
 /// 
 /// 実行中のリクエストは古い設定を参照し続け、
 /// 新規リクエストは新しい設定を使用します。
-#[allow(dead_code)]
 fn reload_config(path: &Path) -> io::Result<()> {
     let loaded = load_config(path)?;
     
@@ -4221,6 +4201,7 @@ fn main() {
     }
 
     // HTTP/3 (QUIC/UDP) サーバー（設定されている場合のみ）
+    // TCP側と同様に複数スレッドで並列起動し、CPUコアにピンニング
     #[cfg(feature = "http3")]
     if loaded_config.http3_enabled {
         let http3_addr_str = loaded_config.http3_listen
@@ -4250,22 +4231,49 @@ fn main() {
         info!("============================================");
         info!("HTTP/3 (QUIC/UDP) Server");
         info!("HTTP/3 Listen Address: {} (UDP)", http3_addr);
+        info!("HTTP/3 Workers: {} (SO_REUSEPORT enabled)", num_threads);
         info!("TLS Cert: {}", tls_cert);
         info!("TLS Key: {}", tls_key);
         info!("============================================");
         
-        let http3_handle = thread::spawn(move || {
-            let config = http3_server::Http3ServerConfig {
-                cert_path: tls_cert,
-                key_path: tls_key,
-                ..Default::default()
-            };
+        // TCP側と同様に複数スレッドで起動（SO_REUSEPORTでパケット分散）
+        for thread_id in 0..num_threads {
+            let cert = tls_cert.clone();
+            let key = tls_key.clone();
+            let addr = http3_addr;
             
-            if let Err(e) = http3_server::run_http3_server(http3_addr, config) {
-                error!("[HTTP/3] Server error: {}", e);
-            }
-        });
-        handles.push(http3_handle);
+            // CPUコアにピンニング
+            let assigned_core = core_ids.as_ref().map(|ids| {
+                let core_index = thread_id % ids.len();
+                ids[core_index]
+            });
+            
+            let http3_handle = thread::spawn(move || {
+                // スレッド開始直後にCPUアフィニティを設定
+                if let Some(core_id) = assigned_core {
+                    if core_affinity::set_for_current(core_id) {
+                        info!("[HTTP/3 Worker {}] Pinned to CPU core {:?}", thread_id, core_id);
+                    } else {
+                        warn!("[HTTP/3 Worker {}] Failed to pin to CPU core {:?}", thread_id, core_id);
+                    }
+                }
+                
+                let config = http3_server::Http3ServerConfig {
+                    cert_path: cert,
+                    key_path: key,
+                    ..Default::default()
+                };
+                
+                info!("[HTTP/3 Worker {}] Starting...", thread_id);
+                
+                if let Err(e) = http3_server::run_http3_server(addr, config) {
+                    error!("[HTTP/3 Worker {}] Server error: {}", thread_id, e);
+                }
+                
+                info!("[HTTP/3 Worker {}] Stopped", thread_id);
+            });
+            handles.push(http3_handle);
+        }
     }
 
     for handle in handles {
@@ -4426,12 +4434,21 @@ fn spawn_health_check_thread() {
             }
             
             // 次のチェックまで待機（最短間隔を使用）
+            // シャットダウン時に迅速に終了するため、短い間隔で分割してスリープ
             let min_interval = config.upstream_groups.values()
                 .filter_map(|g| g.health_check.as_ref())
                 .map(|hc| hc.interval_secs)
                 .min()
                 .unwrap_or(10);
-            thread::sleep(Duration::from_secs(min_interval));
+            
+            // 500ms間隔でシャットダウンフラグをチェック
+            let sleep_iterations = (min_interval * 2) as usize; // 500ms × 2 = 1秒
+            for _ in 0..sleep_iterations {
+                if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(500));
+            }
         }
         
         info!("Health check thread stopped");
@@ -6343,22 +6360,6 @@ fn parse_http_response(data: &[u8]) -> Option<ParsedResponse> {
     }
 }
 
-/// HTTPレスポンスヘッダーが完全に受信されているかチェック
-/// 
-/// httparseを使用して、ヘッダーが完全に受信されたかを判定します。
-/// 完全な場合はヘッダー終端位置（ボディ開始位置）を返します。
-#[inline]
-#[allow(dead_code)]
-fn check_response_header_complete(data: &[u8]) -> Option<usize> {
-    let mut headers_storage = [httparse::EMPTY_HEADER; 64];
-    let mut response = httparse::Response::new(&mut headers_storage);
-    
-    match response.parse(data) {
-        Ok(Status::Complete(header_len)) => Some(header_len),
-        _ => None,
-    }
-}
-
 // ====================
 // Chunked Transfer Encoding パーサー（RFC 7230 Section 4.1 準拠）
 // ====================
@@ -6467,13 +6468,6 @@ impl ChunkedDecoder {
             }
         }
         ChunkedFeedResult::Continue
-    }
-    
-    /// サイズ制限を超過したかどうか
-    #[inline]
-    #[allow(dead_code)]
-    fn is_size_exceeded(&self) -> bool {
-        self.state == ChunkedState::SizeLimitExceeded
     }
     
     /// 1バイトを処理して状態を更新
@@ -6616,13 +6610,6 @@ impl ChunkedDecoder {
             }
         }
         ChunkedFeedResult::Continue
-    }
-    
-    /// 転送が完了したかどうかを返す
-    #[inline]
-    #[allow(dead_code)]
-    fn is_complete(&self) -> bool {
-        self.state == ChunkedState::Complete
     }
 }
 
@@ -8135,174 +8122,6 @@ async fn transfer_chunked_body<R: AsyncReader, W: AsyncWriter>(
     ChunkedTransferResult::Failed
 }
 
-/// レスポンスを受信して転送（ジェネリック版）
-/// 注: 現在は transfer_response_with_keepalive を使用
-#[allow(dead_code)]
-async fn transfer_response<R: AsyncReader, W: AsyncWriter>(
-    backend: &mut R,
-    client: &mut W,
-) -> (u64, u16) {
-    let mut total = 0u64;
-    let mut status_code = 502u16;
-    let mut header_parsed = false;
-    let mut accumulated = Vec::with_capacity(4096);
-    let mut is_chunked = false;
-    let mut body_remaining: Option<usize> = None;
-    // ステートマシンベースのChunkedデコーダを使用
-    // レスポンス受信時は制限なし（バックエンドを信頼）
-    let mut chunked_decoder = ChunkedDecoder::new_unlimited();
-    
-    loop {
-        let buf = buf_get();
-        let read_result = timeout(READ_TIMEOUT, backend.read_buf(buf)).await;
-        
-        let (res, mut returned_buf) = match read_result {
-            Ok(result) => result,
-            Err(_) => {
-                // タイムアウト
-                if !accumulated.is_empty() {
-                    let data = std::mem::take(&mut accumulated);
-                    let len = data.len();
-                    let _ = timeout(WRITE_TIMEOUT, client.write_buf(data)).await;
-                    total += len as u64;
-                }
-                break;
-            }
-        };
-        
-        let n = match res {
-            Ok(0) => {
-                buf_put(returned_buf);
-                // EOFに達した
-                if !accumulated.is_empty() {
-                    let data = std::mem::take(&mut accumulated);
-                    let len = data.len();
-                    let _ = timeout(WRITE_TIMEOUT, client.write_buf(data)).await;
-                    total += len as u64;
-                }
-                break;
-            }
-            Ok(n) => n,
-            Err(_) => {
-                buf_put(returned_buf);
-                break;
-            }
-        };
-        
-        // SafeReadBuffer の有効長を設定
-        returned_buf.set_valid_len(n);
-        
-        if !header_parsed {
-            accumulated.extend_from_slice(returned_buf.as_valid_slice());
-            buf_put(returned_buf);
-            
-            // httparseを使用してレスポンスヘッダーを解析
-            if let Some(parsed) = parse_http_response(&accumulated) {
-                header_parsed = true;
-                status_code = parsed.status_code;
-                is_chunked = parsed.is_chunked;
-                
-                let header_len = parsed.header_len;
-                let header_with_body = std::mem::take(&mut accumulated);
-                let data_len = header_with_body.len();
-                
-                // ボディ開始部分の長さを計算
-                let body_start_len = data_len.saturating_sub(header_len);
-                
-                // Content-Lengthがある場合、残りのボディサイズを計算
-                if let Some(cl) = parsed.content_length {
-                    body_remaining = Some(cl.saturating_sub(body_start_len));
-                }
-                
-                // Chunked の場合、初期ボディ部分をデコーダにフィード
-                if is_chunked && body_start_len > 0 {
-                    let _ = chunked_decoder.feed(&header_with_body[header_len..]);
-                }
-                
-                let write_result = timeout(WRITE_TIMEOUT, client.write_buf(header_with_body)).await;
-                match write_result {
-                    Ok((Ok(_), returned)) => {
-                        buf_put_vec(returned);
-                    }
-                    Ok((Err(_), returned)) => {
-                        buf_put_vec(returned);
-                        break;
-                    }
-                    Err(_) => break,
-                }
-                total += data_len as u64;
-            }
-        } else {
-            // ヘッダー解析済み
-            if is_chunked {
-                // Chunked転送 - デコーダにデータをフィード（型安全なアクセス）
-                let feed_result = chunked_decoder.feed(returned_buf.as_valid_slice());
-                
-                // 有効データのみを含むVecに変換
-                let write_buf = returned_buf.into_truncated();
-                
-                let write_result = timeout(WRITE_TIMEOUT, client.write_buf(write_buf)).await;
-                match write_result {
-                    Ok((Ok(_), returned)) => {
-                        buf_put_vec(returned);
-                    }
-                    Ok((Err(_), returned)) => {
-                        buf_put_vec(returned);
-                        break;
-                    }
-                    Err(_) => break,
-                }
-                
-                total += n as u64;
-                
-                // ステートマシンによる終端チェック
-                if feed_result == ChunkedFeedResult::Complete {
-                    break;
-                }
-            } else {
-                // Content-Length転送
-                let bytes_to_send = if let Some(remaining) = body_remaining {
-                    let to_send = n.min(remaining);
-                    body_remaining = Some(remaining - to_send);
-                    to_send
-                } else {
-                    n
-                };
-                
-                if bytes_to_send > 0 {
-                    // 送信サイズを調整
-                    returned_buf.set_valid_len(bytes_to_send);
-                    let write_buf = returned_buf.into_truncated();
-                    
-                    let write_result = timeout(WRITE_TIMEOUT, client.write_buf(write_buf)).await;
-                    match write_result {
-                        Ok((Ok(_), returned)) => {
-                            buf_put_vec(returned);
-                        }
-                        Ok((Err(_), returned)) => {
-                            buf_put_vec(returned);
-                            break;
-                        }
-                        Err(_) => break,
-                    }
-                    
-                    total += bytes_to_send as u64;
-                } else {
-                    buf_put(returned_buf);
-                }
-                
-                if let Some(remaining) = body_remaining {
-                    if remaining == 0 {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    
-    (total, status_code)
-}
-
 /// レスポンスを受信して転送（Keep-Aliveサポート版）
 /// バックエンドがKeep-Aliveを許可しているかどうかも返す
 async fn transfer_response_with_keepalive<R: AsyncReader, W: AsyncWriter>(
@@ -8820,9 +8639,4 @@ fn log_access(
     
     // Prometheusメトリクスを記録
     record_request_metrics(method_str, host_str, status, req_body_size, resp_body_size, duration_secs);
-}
-
-#[allow(dead_code)]
-fn find_header<'a>(headers: &'a [Header<'a>], name: &str) -> Option<&'a [u8]> {
-    headers.iter().find(|h| h.name.eq_ignore_ascii_case(name)).map(|h| h.value)
 }
