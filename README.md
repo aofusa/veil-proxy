@@ -221,10 +221,20 @@ max_log_size = 104857600
 
 [security]
 # 権限降格設定（Linux専用）
-# drop_privileges_user = "nobody"
-# drop_privileges_group = "nogroup"
+drop_privileges_user = "nobody"
+drop_privileges_group = "nogroup"
 # グローバル同時接続上限（0 = 無制限）
-# max_concurrent_connections = 10000
+max_concurrent_connections = 10000
+
+# seccomp システムコール制限（Linux専用）
+# まずログモードで動作確認後、filterモードに変更推奨
+enable_seccomp = true
+seccomp_mode = "filter"  # "disabled" / "log" / "filter" / "strict"
+
+# Landlock ファイルシステム制限（Linux 5.13+）
+enable_landlock = true
+landlock_read_paths = ["/etc/zerocopy-server", "/usr", "/lib", "/lib64"]
+landlock_write_paths = ["/var/log/zerocopy-server"]
 
 [performance]
 # SO_REUSEPORT の振り分け方式
@@ -619,18 +629,60 @@ url = "http://localhost:3002"
 ```toml
 [security]
 # 権限降格設定（Linux専用、root起動時のみ有効）
-drop_privileges_user = "nobody"
-drop_privileges_group = "nogroup"
+drop_privileges_user = "zerocopy"
+drop_privileges_group = "zerocopy"
 
 # グローバル同時接続上限（0 = 無制限）
 max_concurrent_connections = 10000
+
+# seccomp システムコール制限
+enable_seccomp = true
+seccomp_mode = "filter"
+
+# Landlock ファイルシステム制限（Linux 5.13+）
+enable_landlock = true
+landlock_read_paths = ["/etc/zerocopy-server", "/usr", "/lib", "/lib64"]
+landlock_write_paths = ["/var/log/zerocopy-server"]
 ```
+
+#### 権限・接続制限
 
 | オプション | 説明 | デフォルト |
 |-----------|------|-----------|
 | `drop_privileges_user` | 起動後に降格するユーザー名 | なし |
 | `drop_privileges_group` | 起動後に降格するグループ名 | なし |
 | `max_concurrent_connections` | 同時接続数の上限 | 0（無制限） |
+
+#### seccomp 設定
+
+| オプション | 説明 | デフォルト |
+|-----------|------|-----------|
+| `enable_seccomp` | seccompフィルタを有効化 | false |
+| `seccomp_mode` | seccompモード | "disabled" |
+
+| seccompモード | 説明 |
+|--------------|------|
+| `disabled` | 無効 |
+| `log` | 違反をログに記録（ブロックしない、導入時推奨） |
+| `filter` | 違反をEPERMで拒否（**本番推奨**） |
+| `strict` | 違反したプロセスをSIGKILL（最も厳格） |
+
+#### Landlock 設定 (Linux 5.13+)
+
+| オプション | 説明 | デフォルト |
+|-----------|------|-----------|
+| `enable_landlock` | Landlockを有効化 | false |
+| `landlock_read_paths` | 読み取り専用パス | ["/etc", "/usr", "/lib", "/lib64"] |
+| `landlock_write_paths` | 読み書き可能パス | ["/var/log", "/tmp"] |
+
+**対応ABIバージョン:**
+
+| ABI | カーネル | 追加機能 |
+|-----|---------|---------|
+| v1 | 5.13+ | 基本的なファイルシステムアクセス制御 |
+| v2 | 5.19+ | ファイル参照権限 (REFER) |
+| v3 | 6.2+ | TRUNCATE権限 |
+| v4 | 6.7+ | ioctl権限 |
 
 > **注意**: 特権ポート（1024未満）を使用する場合は、`CAP_NET_BIND_SERVICE` ケイパビリティを付与するか、非特権ポートを使用してください。
 >
