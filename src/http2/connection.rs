@@ -149,8 +149,11 @@ where
         Ok(())
     }
 
-    /// フレームを読み込み
-    async fn read_frame(&mut self) -> Http2Result<Frame> {
+    /// フレームを読み込み（外部からアクセス可能）
+    /// 
+    /// HTTP/2 フレームを1つ読み込んでデコードします。
+    /// コネクションがクローズされた場合は ConnectionClosed エラーを返します。
+    pub async fn read_frame(&mut self) -> Http2Result<Frame> {
         // フレームヘッダー (9 bytes) を確保
         while self.buf_end - self.buf_start < FrameHeader::SIZE {
             self.read_more().await?;
@@ -232,8 +235,10 @@ where
         Ok(())
     }
 
-    /// フレームを処理
-    async fn process_frame(&mut self, frame: Frame) -> Http2Result<Option<ProcessedRequest>> {
+    /// フレームを処理（外部からアクセス可能）
+    /// 
+    /// 受信したフレームを処理し、リクエストが完了した場合は ProcessedRequest を返します。
+    pub async fn process_frame(&mut self, frame: Frame) -> Http2Result<Option<ProcessedRequest>> {
         match frame {
             Frame::Settings { ack, settings } => {
                 self.handle_settings(ack, &settings).await?;
@@ -771,6 +776,11 @@ where
     /// 基盤ストリームへの参照を取得
     pub fn get_inner(&self) -> &S {
         &self.stream
+    }
+    
+    /// クローズ済みストリームをクリーンアップ（外部からアクセス可能）
+    pub fn cleanup_closed(&mut self) {
+        self.streams.cleanup_closed();
     }
 }
 

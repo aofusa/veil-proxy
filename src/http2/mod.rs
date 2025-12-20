@@ -32,5 +32,5 @@ pub mod settings;
 
 pub use error::{Http2Error, Http2ErrorCode};
 pub use settings::Http2Settings;
-pub use connection::Http2Connection;
+pub use connection::{Http2Connection, ProcessedRequest};
 pub use stream::{Stream, StreamState, StreamManager};

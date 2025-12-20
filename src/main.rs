@@ -2142,11 +2142,189 @@ struct Config {
     /// ログ設定（非同期ログの最適化）
     #[serde(default)]
     logging: LoggingConfigSection,
+    /// HTTP/2 設定セクション
+    #[serde(default)]
+    http2: Http2ConfigSection,
+    /// HTTP/3 設定セクション
+    #[serde(default)]
+    http3: Http3ConfigSection,
     /// Upstream グループ定義（ロードバランシング用）
     #[serde(default)]
     upstreams: Option<HashMap<String, UpstreamConfig>>,
     host_routes: Option<HashMap<String, BackendConfig>>,
     path_routes: Option<HashMap<String, HashMap<String, BackendConfig>>>,
+}
+
+// ====================
+// HTTP/2 設定セクション (RFC 7540)
+// ====================
+
+/// HTTP/2 設定
+#[derive(Deserialize, Clone)]
+pub struct Http2ConfigSection {
+    /// HTTP/2を有効化（ALPNでネゴシエート）
+    #[serde(default)]
+    pub enabled: bool,
+    
+    /// SETTINGS_HEADER_TABLE_SIZE (HPACK動的テーブルサイズ)
+    /// デフォルト: 4096 (4KB)
+    /// 高パフォーマンス: 65536 (64KB)
+    #[serde(default = "default_h2_header_table_size")]
+    pub header_table_size: u32,
+    
+    /// SETTINGS_MAX_CONCURRENT_STREAMS (同時ストリーム数)
+    /// デフォルト: 100
+    #[serde(default = "default_h2_max_concurrent_streams")]
+    pub max_concurrent_streams: u32,
+    
+    /// SETTINGS_INITIAL_WINDOW_SIZE (ストリームウィンドウサイズ)
+    /// デフォルト: 65535 (64KB - 1)
+    #[serde(default = "default_h2_initial_window_size")]
+    pub initial_window_size: u32,
+    
+    /// SETTINGS_MAX_FRAME_SIZE (最大フレームサイズ)
+    /// デフォルト: 16384 (16KB)
+    #[serde(default = "default_h2_max_frame_size")]
+    pub max_frame_size: u32,
+    
+    /// SETTINGS_MAX_HEADER_LIST_SIZE (最大ヘッダーリストサイズ)
+    /// デフォルト: 16384 (16KB)
+    #[serde(default = "default_h2_max_header_list_size")]
+    pub max_header_list_size: u32,
+    
+    /// コネクションウィンドウサイズ（コネクション全体のフロー制御）
+    /// デフォルト: 65535 (64KB - 1)
+    #[serde(default = "default_h2_connection_window_size")]
+    pub connection_window_size: u32,
+}
+
+fn default_h2_header_table_size() -> u32 { 4096 }
+fn default_h2_max_concurrent_streams() -> u32 { 100 }
+fn default_h2_initial_window_size() -> u32 { 65535 }
+fn default_h2_max_frame_size() -> u32 { 16384 }
+fn default_h2_max_header_list_size() -> u32 { 16384 }
+fn default_h2_connection_window_size() -> u32 { 65535 }
+
+impl Default for Http2ConfigSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            header_table_size: default_h2_header_table_size(),
+            max_concurrent_streams: default_h2_max_concurrent_streams(),
+            initial_window_size: default_h2_initial_window_size(),
+            max_frame_size: default_h2_max_frame_size(),
+            max_header_list_size: default_h2_max_header_list_size(),
+            connection_window_size: default_h2_connection_window_size(),
+        }
+    }
+}
+
+impl Http2ConfigSection {
+    /// HTTP/2 設定を Http2Settings に変換
+    #[cfg(feature = "http2")]
+    pub fn to_http2_settings(&self) -> http2::Http2Settings {
+        http2::Http2Settings {
+            header_table_size: self.header_table_size,
+            max_concurrent_streams: self.max_concurrent_streams,
+            initial_window_size: self.initial_window_size,
+            max_frame_size: self.max_frame_size,
+            max_header_list_size: self.max_header_list_size,
+            enable_push: false, // サーバーではpush無効
+        }
+    }
+}
+
+// ====================
+// HTTP/3 設定セクション (RFC 9114, QUIC RFC 9000)
+// ====================
+
+/// HTTP/3 設定
+#[derive(Deserialize, Clone)]
+pub struct Http3ConfigSection {
+    /// HTTP/3を有効化（UDPリスナー）
+    #[serde(default)]
+    pub enabled: bool,
+    
+    /// HTTP/3リッスンアドレス（UDP）
+    #[serde(default)]
+    pub listen: Option<String>,
+    
+    /// 最大アイドルタイムアウト（ミリ秒）
+    /// デフォルト: 30000 (30秒)
+    #[serde(default = "default_h3_max_idle_timeout")]
+    pub max_idle_timeout: u64,
+    
+    /// 最大UDPペイロードサイズ
+    /// デフォルト: 1350 (MTU考慮)
+    #[serde(default = "default_h3_max_udp_payload_size")]
+    pub max_udp_payload_size: u64,
+    
+    /// 初期最大データサイズ（コネクション全体）
+    /// デフォルト: 10000000 (10MB)
+    #[serde(default = "default_h3_initial_max_data")]
+    pub initial_max_data: u64,
+    
+    /// 初期最大ストリームデータサイズ（双方向ローカル）
+    #[serde(default = "default_h3_initial_max_stream_data")]
+    pub initial_max_stream_data_bidi_local: u64,
+    
+    /// 初期最大ストリームデータサイズ（双方向リモート）
+    #[serde(default = "default_h3_initial_max_stream_data")]
+    pub initial_max_stream_data_bidi_remote: u64,
+    
+    /// 初期最大ストリームデータサイズ（単方向）
+    #[serde(default = "default_h3_initial_max_stream_data")]
+    pub initial_max_stream_data_uni: u64,
+    
+    /// 初期最大双方向ストリーム数
+    #[serde(default = "default_h3_max_streams")]
+    pub initial_max_streams_bidi: u64,
+    
+    /// 初期最大単方向ストリーム数
+    #[serde(default = "default_h3_max_streams")]
+    pub initial_max_streams_uni: u64,
+}
+
+fn default_h3_max_idle_timeout() -> u64 { 30000 }
+fn default_h3_max_udp_payload_size() -> u64 { 1350 }
+fn default_h3_initial_max_data() -> u64 { 10_000_000 }
+fn default_h3_initial_max_stream_data() -> u64 { 1_000_000 }
+fn default_h3_max_streams() -> u64 { 100 }
+
+impl Default for Http3ConfigSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: None,
+            max_idle_timeout: default_h3_max_idle_timeout(),
+            max_udp_payload_size: default_h3_max_udp_payload_size(),
+            initial_max_data: default_h3_initial_max_data(),
+            initial_max_stream_data_bidi_local: default_h3_initial_max_stream_data(),
+            initial_max_stream_data_bidi_remote: default_h3_initial_max_stream_data(),
+            initial_max_stream_data_uni: default_h3_initial_max_stream_data(),
+            initial_max_streams_bidi: default_h3_max_streams(),
+            initial_max_streams_uni: default_h3_max_streams(),
+        }
+    }
+}
+
+#[cfg(feature = "http3")]
+impl Http3ConfigSection {
+    /// HTTP/3 設定を Http3ServerConfig に変換
+    pub fn to_http3_config(&self, cert_path: &str, key_path: &str) -> http3_server::Http3ServerConfig {
+        http3_server::Http3ServerConfig {
+            cert_path: cert_path.to_string(),
+            key_path: key_path.to_string(),
+            max_idle_timeout: self.max_idle_timeout,
+            max_udp_payload_size: self.max_udp_payload_size,
+            initial_max_data: self.initial_max_data,
+            initial_max_stream_data_bidi_local: self.initial_max_stream_data_bidi_local,
+            initial_max_stream_data_bidi_remote: self.initial_max_stream_data_bidi_remote,
+            initial_max_stream_data_uni: self.initial_max_stream_data_uni,
+            initial_max_streams_bidi: self.initial_max_streams_bidi,
+            initial_max_streams_uni: self.initial_max_streams_uni,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -2418,7 +2596,8 @@ impl<'de> serde::Deserialize<'de> for ReuseportBalancing {
 enum BackendConfig {
     /// 単一URLプロキシ（後方互換性のため維持）
     /// - sni_name: TLS接続時のSNI名（IP直打ち時にドメイン名を指定可能）
-    Proxy { url: String, sni_name: Option<String>, security: SecurityConfig },
+    /// - use_h2c: H2C (HTTP/2 over cleartext) を使用するかどうか
+    Proxy { url: String, sni_name: Option<String>, use_h2c: bool, security: SecurityConfig },
     /// Upstream グループ参照（ロードバランシング用）
     ProxyUpstream { upstream: String, security: SecurityConfig },
     /// File バックエンド設定
@@ -2467,6 +2646,8 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                 let mut preserve_path: Option<bool> = None;
                 // SNI 用フィールド（Proxy用）
                 let mut sni_name: Option<String> = None;
+                // H2C 用フィールド（Proxy用）
+                let mut use_h2c: Option<bool> = None;
                 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -2481,6 +2662,7 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                         "redirect_status" => redirect_status = Some(map.next_value()?),
                         "preserve_path" => preserve_path = Some(map.next_value()?),
                         "sni_name" => sni_name = Some(map.next_value()?),
+                        "use_h2c" | "h2c" => use_h2c = Some(map.next_value()?),
                         _ => { let _: serde::de::IgnoredAny = map.next_value()?; }
                     }
                 }
@@ -2495,7 +2677,8 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                             Ok(BackendConfig::ProxyUpstream { upstream: upstream_name, security })
                         } else {
                             let url = url.ok_or_else(|| serde::de::Error::missing_field("url or upstream"))?;
-                            Ok(BackendConfig::Proxy { url, sni_name, security })
+                            let use_h2c = use_h2c.unwrap_or(false);
+                            Ok(BackendConfig::Proxy { url, sni_name, use_h2c, security })
                         }
                     }
                     "Redirect" => {
@@ -2577,6 +2760,10 @@ struct ProxyTarget {
     /// SNI (Server Name Indication) に使用するホスト名
     /// Noneの場合はhostを使用。IP直打ちの場合にドメイン名を指定可能
     sni_name: Option<String>,
+    /// H2C (HTTP/2 over cleartext) を使用するかどうか
+    /// true の場合、非TLSバックエンドにHTTP/2で接続
+    /// HTTP/2 Upgrade 経由ではなく、Prior Knowledge モードを使用
+    use_h2c: bool,
 }
 
 impl ProxyTarget {
@@ -2609,12 +2796,32 @@ impl ProxyTarget {
             use_tls: scheme,
             path_prefix: path.to_string(),
             sni_name: None,
+            use_h2c: false, // デフォルトでは無効
         })
+    }
+    
+    /// H2C対応でパース（HTTP/2 over cleartext を有効化）
+    fn parse_with_h2c(url: &str, enable_h2c: bool) -> Option<Self> {
+        let mut target = Self::parse(url)?;
+        // H2Cは非TLSの場合のみ有効
+        if enable_h2c && !target.use_tls {
+            target.use_h2c = true;
+        }
+        Some(target)
     }
     
     /// SNI名を設定したコピーを作成
     fn with_sni_name(mut self, sni_name: Option<String>) -> Self {
         self.sni_name = sni_name;
+        self
+    }
+    
+    /// H2C設定を変更したコピーを作成
+    fn with_h2c(mut self, use_h2c: bool) -> Self {
+        // H2Cは非TLSの場合のみ有効
+        if !self.use_tls {
+            self.use_h2c = use_h2c;
+        }
         self
     }
     
@@ -3278,6 +3485,10 @@ struct LoadedConfig {
     http3_enabled: bool,
     /// HTTP/3 リスナーアドレス (UDP)
     http3_listen: Option<String>,
+    /// HTTP/2 設定（詳細設定）
+    http2_config: Http2ConfigSection,
+    /// HTTP/3 設定（詳細設定）
+    http3_config: Http3ConfigSection,
 }
 
 // ====================
@@ -3318,6 +3529,10 @@ struct RuntimeConfig {
     upstream_groups: Arc<HashMap<String, Arc<UpstreamGroup>>>,
     /// HTTP/2 有効化フラグ
     http2_enabled: bool,
+    /// HTTP/2 設定（詳細設定）
+    http2_config: Http2ConfigSection,
+    /// HTTP/3 設定（詳細設定）
+    http3_config: Http3ConfigSection,
 }
 
 impl Default for RuntimeConfig {
@@ -3330,6 +3545,8 @@ impl Default for RuntimeConfig {
             global_security: Arc::new(GlobalSecurityConfig::default()),
             upstream_groups: Arc::new(HashMap::new()),
             http2_enabled: false,
+            http2_config: Http2ConfigSection::default(),
+            http3_config: Http3ConfigSection::default(),
         }
     }
 }
@@ -3363,6 +3580,8 @@ fn reload_config(path: &Path) -> io::Result<()> {
         global_security: Arc::new(loaded.global_security),
         upstream_groups: loaded.upstream_groups,
         http2_enabled: loaded.http2_enabled,
+        http2_config: loaded.http2_config,
+        http3_config: loaded.http3_config,
     };
     
     // アトミックに設定を入れ替え
@@ -3389,9 +3608,31 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     };
 
     // HTTP/2・HTTP/3 設定を読み込み
-    let http2_enabled = config.server.http2_enabled;
-    let http3_enabled = config.server.http3_enabled;
-    let http3_listen = config.server.http3_listen.clone();
+    // 互換性のため、server.http2_enabled と [http2].enabled の両方をサポート
+    // [http2] セクションの enabled が優先され、なければ server.http2_enabled を使用
+    let http2_config = {
+        let mut cfg = config.http2.clone();
+        // [http2].enabled が明示的に設定されていない場合、server.http2_enabled を使用
+        if !cfg.enabled && config.server.http2_enabled {
+            cfg.enabled = true;
+        }
+        cfg
+    };
+    let http3_config = {
+        let mut cfg = config.http3.clone();
+        // [http3].enabled が明示的に設定されていない場合、server.http3_enabled を使用
+        if !cfg.enabled && config.server.http3_enabled {
+            cfg.enabled = true;
+        }
+        // [http3].listen が設定されていない場合、server.http3_listen を使用
+        if cfg.listen.is_none() && config.server.http3_listen.is_some() {
+            cfg.listen = config.server.http3_listen.clone();
+        }
+        cfg
+    };
+    let http2_enabled = http2_config.enabled;
+    let http3_enabled = http3_config.enabled;
+    let http3_listen = http3_config.listen.clone();
     
     // TLS設定（kTLS有効時はシークレット抽出を有効化、HTTP/2有効時はALPN設定）
     let tls_config = load_tls_config(&config.tls, ktls_config.enabled, http2_enabled)?;
@@ -3480,6 +3721,8 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         http2_enabled,
         http3_enabled,
         http3_listen,
+        http2_config,
+        http3_config,
     })
 }
 
@@ -3551,11 +3794,17 @@ fn load_backend(
     upstream_groups: &HashMap<String, Arc<UpstreamGroup>>,
 ) -> io::Result<Backend> {
     match config {
-        BackendConfig::Proxy { url, sni_name, security } => {
+        BackendConfig::Proxy { url, sni_name, use_h2c, security } => {
             // 単一URLの場合は UpstreamGroup::single で単一サーバーのグループを作成
             let target = ProxyTarget::parse(url)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid proxy URL"))?
-                .with_sni_name(sni_name.clone());
+                .with_sni_name(sni_name.clone())
+                .with_h2c(*use_h2c);
+            
+            if *use_h2c && !target.use_tls {
+                info!("H2C (HTTP/2 over cleartext) enabled for backend: {}", url);
+            }
+            
             let group = UpstreamGroup::single(target);
             Ok(Backend::Proxy(Arc::new(group), Arc::new(security.clone())))
         }
@@ -3753,6 +4002,8 @@ fn main() {
         global_security: Arc::new(loaded_config.global_security.clone()),
         upstream_groups: loaded_config.upstream_groups.clone(),
         http2_enabled: loaded_config.http2_enabled,
+        http2_config: loaded_config.http2_config.clone(),
+        http3_config: loaded_config.http3_config.clone(),
     };
     CURRENT_CONFIG.store(Arc::new(runtime_config));
     info!("Runtime configuration initialized (hot reload enabled via SIGHUP)");
@@ -4434,29 +4685,129 @@ fn create_listener(
 // ====================
 
 // ====================
+// 共通セキュリティチェック（HTTP/1.1, HTTP/2, HTTP/3 共用）
+// ====================
+//
+// プロトコル非依存のセキュリティチェック関数群。
+// 各プロトコルハンドラーから呼び出されます。
+
+/// セキュリティチェック結果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecurityCheckResult {
+    /// 許可（処理を継続）
+    Allowed,
+    /// IP拒否（403 Forbidden）
+    IpDenied,
+    /// メソッド不許可（405 Method Not Allowed）
+    MethodNotAllowed,
+    /// レート制限超過（429 Too Many Requests）
+    RateLimitExceeded,
+    /// リクエストサイズ超過（413 Request Entity Too Large）
+    RequestTooLarge,
+}
+
+impl SecurityCheckResult {
+    /// HTTPステータスコードに変換
+    #[inline]
+    pub fn status_code(&self) -> u16 {
+        match self {
+            SecurityCheckResult::Allowed => 200,
+            SecurityCheckResult::IpDenied => 403,
+            SecurityCheckResult::MethodNotAllowed => 405,
+            SecurityCheckResult::RateLimitExceeded => 429,
+            SecurityCheckResult::RequestTooLarge => 413,
+        }
+    }
+    
+    /// エラーメッセージを取得
+    #[inline]
+    pub fn message(&self) -> &'static [u8] {
+        match self {
+            SecurityCheckResult::Allowed => b"OK",
+            SecurityCheckResult::IpDenied => b"Forbidden",
+            SecurityCheckResult::MethodNotAllowed => b"Method Not Allowed",
+            SecurityCheckResult::RateLimitExceeded => b"Too Many Requests",
+            SecurityCheckResult::RequestTooLarge => b"Request Entity Too Large",
+        }
+    }
+}
+
+/// 統合セキュリティチェック（すべてのプロトコル共用）
+/// 
+/// ## チェック項目
+/// 1. IP制限（allowed_ips, denied_ips）
+/// 2. HTTPメソッド制限（allowed_methods）
+/// 3. レートリミット（rate_limit_requests_per_min）
+/// 4. ボディサイズ制限（max_request_body_size）
+/// 
+/// ## パフォーマンス
+/// 設定がデフォルトの場合、has_security_checks() で早期リターンし、
+/// オーバーヘッドを最小化。
+#[inline]
+fn check_security(
+    security: &SecurityConfig,
+    client_ip: &str,
+    method: &[u8],
+    content_length: usize,
+    is_chunked: bool,
+) -> SecurityCheckResult {
+    // IP制限チェック
+    let ip_filter = security.ip_filter();
+    if ip_filter.is_configured() && !ip_filter.is_allowed(client_ip) {
+        return SecurityCheckResult::IpDenied;
+    }
+    
+    // 許可メソッドチェック
+    if !security.allowed_methods.is_empty() {
+        let method_str = std::str::from_utf8(method).unwrap_or("GET");
+        let is_allowed = security.allowed_methods.iter()
+            .any(|m| m.eq_ignore_ascii_case(method_str));
+        if !is_allowed {
+            return SecurityCheckResult::MethodNotAllowed;
+        }
+    }
+    
+    // レートリミットチェック
+    if security.rate_limit_requests_per_min > 0 {
+        if !check_rate_limit(client_ip, security.rate_limit_requests_per_min) {
+            return SecurityCheckResult::RateLimitExceeded;
+        }
+    }
+    
+    // ボディサイズ制限（chunked以外）
+    if !is_chunked && content_length > security.max_request_body_size {
+        return SecurityCheckResult::RequestTooLarge;
+    }
+    
+    SecurityCheckResult::Allowed
+}
+
+// ====================
 // HTTP/2 ハンドラー
 // ====================
 //
 // HTTP/2 (RFC 7540) 接続を処理します。
 // ALPN ネゴシエーションで h2 が選択された場合に呼び出されます。
+// HTTP/1.1 と同等のセキュリティ機能とルーティングをサポート。
 
 /// HTTP/2 リクエストを処理
 /// 
 /// HTTP/2 コネクションのメインループを実行し、各ストリームのリクエストを処理します。
+/// HTTP/1.1 と同等のセキュリティチェック、ルーティング、プロキシ機能をサポート。
 #[cfg(feature = "http2")]
-#[allow(dead_code)]
 async fn handle_http2_connection<S>(
     tls_stream: S,
-    _host_routes: &Arc<HashMap<Box<[u8]>, Backend>>,
-    _path_routes: &Arc<HashMap<Box<[u8]>, SortedPathMap>>,
+    host_routes: &Arc<HashMap<Box<[u8]>, Backend>>,
+    path_routes: &Arc<HashMap<Box<[u8]>, SortedPathMap>>,
     client_ip: &str,
 ) where
     S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRentExt + Unpin,
 {
-    use http2::{Http2Connection, Http2Settings};
+    use http2::Http2Connection;
     
-    // HTTP/2 設定（高パフォーマンス設定を使用）
-    let settings = Http2Settings::high_performance();
+    // HTTP/2 設定をCURRENT_CONFIGから取得（ホットリロード対応）
+    let config = CURRENT_CONFIG.load();
+    let settings = config.http2_config.to_http2_settings();
     
     // HTTP/2 コネクションを作成
     let mut conn = Http2Connection::new(tls_stream, settings);
@@ -4469,15 +4820,790 @@ async fn handle_http2_connection<S>(
     
     info!("[HTTP/2] Connection established from {}", client_ip);
     
-    // メインループ: リクエストを処理
-    // 簡略化: 各リクエストに対してダミーレスポンスを返す
-    let result = conn.run_simple().await;
+    // カスタムリクエストハンドラーを使用してメインループ実行
+    let result = handle_http2_requests(&mut conn, host_routes, path_routes, client_ip).await;
     
     if let Err(e) = result {
         warn!("[HTTP/2] Connection error: {}", e);
     }
     
     info!("[HTTP/2] Connection closed from {}", client_ip);
+}
+
+/// HTTP/2 メインループ（カスタムリクエスト処理）
+#[cfg(feature = "http2")]
+async fn handle_http2_requests<S>(
+    conn: &mut http2::Http2Connection<S>,
+    host_routes: &Arc<HashMap<Box<[u8]>, Backend>>,
+    path_routes: &Arc<HashMap<Box<[u8]>, SortedPathMap>>,
+    client_ip: &str,
+) -> Result<(), http2::Http2Error>
+where
+    S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRentExt + Unpin,
+{
+    use http2::Http2Error;
+    use std::io;
+    
+    loop {
+        // フレームを読み込み
+        let frame = match conn.read_frame().await {
+            Ok(f) => f,
+            Err(Http2Error::ConnectionClosed) => break,
+            Err(Http2Error::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(e) => {
+                // エラー時は GOAWAY を送信
+                let _ = conn.send_goaway(e.error_code(), e.to_string().as_bytes()).await;
+                return Err(e);
+            }
+        };
+        
+        // フレームを処理
+        match conn.process_frame(frame).await {
+            Ok(Some(req)) => {
+                // リクエストが完了 - HTTP/1.1と同様のロジックで処理
+                let stream_id = req.stream_id;
+                
+                // ストリーム情報を取得
+                let (method, path, authority, body_len) = {
+                    if let Some(stream) = conn.get_stream(stream_id) {
+                        let method = stream.method().map(|m| m.to_vec()).unwrap_or_else(|| b"GET".to_vec());
+                        let path = stream.path().map(|p| p.to_vec()).unwrap_or_else(|| b"/".to_vec());
+                        let authority = stream.authority().map(|a| a.to_vec()).unwrap_or_default();
+                        let body_len = stream.request_body.len();
+                        (method, path, authority, body_len)
+                    } else {
+                        continue;
+                    }
+                };
+                
+                // 処理時間計測開始
+                let start_instant = Instant::now();
+                
+                // HTTP/2 リクエスト処理
+                let result = handle_http2_single_request(
+                    conn,
+                    stream_id,
+                    &method,
+                    &path,
+                    &authority,
+                    body_len,
+                    host_routes,
+                    path_routes,
+                    client_ip,
+                ).await;
+                
+                // メトリクス記録
+                let duration = start_instant.elapsed().as_secs_f64();
+                let (status, resp_size) = result.unwrap_or((500, 0));
+                
+                let method_str = std::str::from_utf8(&method).unwrap_or("UNKNOWN");
+                let host_str = std::str::from_utf8(&authority).unwrap_or("-");
+                record_request_metrics(method_str, host_str, status, body_len as u64, resp_size, duration);
+            }
+            Ok(None) => {
+                // フレーム処理完了、次のフレームへ
+            }
+            Err(e) => {
+                if e.should_goaway() {
+                    let _ = conn.send_goaway(e.error_code(), e.to_string().as_bytes()).await;
+                    return Err(e);
+                } else if let Some(id) = e.rst_stream_id() {
+                    let _ = conn.send_rst_stream(id, e.error_code()).await;
+                }
+            }
+        }
+        
+        // クリーンアップ
+        conn.cleanup_closed();
+    }
+    
+    Ok(())
+}
+
+/// HTTP/2 単一リクエスト処理
+#[cfg(feature = "http2")]
+async fn handle_http2_single_request<S>(
+    conn: &mut http2::Http2Connection<S>,
+    stream_id: u32,
+    method: &[u8],
+    path: &[u8],
+    authority: &[u8],
+    body_len: usize,
+    host_routes: &Arc<HashMap<Box<[u8]>, Backend>>,
+    path_routes: &Arc<HashMap<Box<[u8]>, SortedPathMap>>,
+    client_ip: &str,
+) -> Option<(u16, u64)>
+where
+    S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRentExt + Unpin,
+{
+    // メトリクスエンドポイントの処理（/__metrics）
+    if path == b"/__metrics" && method == b"GET" {
+        let body = encode_prometheus_metrics();
+        let headers: &[(&[u8], &[u8])] = &[
+            (b"content-type", b"text/plain; version=0.0.4; charset=utf-8"),
+            (b"server", b"zerocopy-server/http2"),
+        ];
+        if let Err(e) = conn.send_response(stream_id, 200, headers, Some(&body)).await {
+            warn!("[HTTP/2] Metrics response error: {}", e);
+            return None;
+        }
+        return Some((200, body.len() as u64));
+    }
+    
+    // Backend選択（HTTP/1.1と同じロジック）
+    let backend_result = find_backend(authority, path, host_routes, path_routes);
+    
+    let (prefix, backend) = match backend_result {
+        Some(b) => b,
+        None => {
+            let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+            let _ = conn.send_response(stream_id, 400, headers, Some(b"Bad Request")).await;
+            return Some((400, 11));
+        }
+    };
+    
+    // セキュリティチェック（共通関数を使用）
+    let security = backend.security();
+    let check_result = check_security(security, client_ip, method, body_len, false);
+    
+    if check_result != SecurityCheckResult::Allowed {
+        let status = check_result.status_code();
+        let msg = check_result.message();
+        let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+        let _ = conn.send_response(stream_id, status, headers, Some(msg)).await;
+        return Some((status, msg.len() as u64));
+    }
+    
+    // Backend処理
+    match backend {
+        Backend::Proxy(upstream_group, _) => {
+            handle_http2_proxy(conn, stream_id, &upstream_group, method, path, &prefix, client_ip).await
+        }
+        Backend::MemoryFile(data, mime_type, security) => {
+            // ファイル完全一致チェック
+            let path_str = std::str::from_utf8(path).unwrap_or("/");
+            let prefix_str = std::str::from_utf8(&prefix).unwrap_or("");
+            
+            let remainder = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
+                &path_str[prefix_str.len()..]
+            } else {
+                ""
+            };
+            
+            let clean_remainder = remainder.trim_matches('/');
+            if !clean_remainder.is_empty() {
+                let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+                let _ = conn.send_response(stream_id, 404, headers, Some(b"Not Found")).await;
+                return Some((404, 9));
+            }
+            
+            let mut headers: Vec<(&[u8], &[u8])> = vec![
+                (b"content-type", mime_type.as_bytes()),
+                (b"server", b"zerocopy-server/http2"),
+            ];
+            
+            // セキュリティヘッダー追加
+            let security_headers: Vec<(Vec<u8>, Vec<u8>)> = security.add_response_headers.iter()
+                .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec()))
+                .collect();
+            
+            for (k, v) in &security_headers {
+                headers.push((k.as_slice(), v.as_slice()));
+            }
+            
+            if let Err(e) = conn.send_response(stream_id, 200, &headers, Some(&data)).await {
+                warn!("[HTTP/2] Memory file response error: {}", e);
+                return None;
+            }
+            Some((200, data.len() as u64))
+        }
+        Backend::SendFile(base_path, is_dir, index_file, security) => {
+            handle_http2_sendfile(conn, stream_id, &base_path, is_dir, index_file.as_deref(), path, &prefix, &security).await
+        }
+        Backend::Redirect(redirect_url, status_code, preserve_path) => {
+            handle_http2_redirect(conn, stream_id, &redirect_url, status_code, preserve_path, path, &prefix).await
+        }
+    }
+}
+
+/// HTTP/2 プロキシ処理（HTTP/1.1バックエンドへ変換）
+#[cfg(feature = "http2")]
+async fn handle_http2_proxy<S>(
+    conn: &mut http2::Http2Connection<S>,
+    stream_id: u32,
+    upstream_group: &Arc<UpstreamGroup>,
+    method: &[u8],
+    req_path: &[u8],
+    prefix: &[u8],
+    client_ip: &str,
+) -> Option<(u16, u64)>
+where
+    S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRentExt + Unpin,
+{
+    // サーバー選択
+    let server = match upstream_group.select(client_ip) {
+        Some(s) => s,
+        None => {
+            let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+            let _ = conn.send_response(stream_id, 502, headers, Some(b"Bad Gateway")).await;
+            return Some((502, 11));
+        }
+    };
+    
+    server.acquire();
+    let target = &server.target;
+    
+    // リクエストパス構築
+    let path_str = std::str::from_utf8(req_path).unwrap_or("/");
+    let sub_path = if prefix.is_empty() {
+        path_str.to_string()
+    } else {
+        let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
+        if path_str.starts_with(prefix_str) {
+            let remaining = &path_str[prefix_str.len()..];
+            let base = target.path_prefix.trim_end_matches('/');
+            
+            if remaining.is_empty() {
+                if base.is_empty() { "/".to_string() } else { format!("{}/", base) }
+            } else if remaining.starts_with('/') {
+                if base.is_empty() { remaining.to_string() } else { format!("{}{}", base, remaining) }
+            } else {
+                if base.is_empty() { format!("/{}", remaining) } else { format!("{}/{}", base, remaining) }
+            }
+        } else {
+            path_str.to_string()
+        }
+    };
+    
+    let final_path = if sub_path.is_empty() { "/" } else { &sub_path };
+    
+    // リクエストボディを取得
+    let request_body = if let Some(stream) = conn.get_stream(stream_id) {
+        stream.request_body.clone()
+    } else {
+        Vec::new()
+    };
+    
+    // HTTP/1.1 リクエスト構築
+    let mut request = Vec::with_capacity(1024);
+    request.extend_from_slice(method);
+    request.extend_from_slice(b" ");
+    request.extend_from_slice(final_path.as_bytes());
+    request.extend_from_slice(b" HTTP/1.1\r\nHost: ");
+    request.extend_from_slice(target.host.as_bytes());
+    
+    if !target.is_default_port() {
+        request.extend_from_slice(b":");
+        let mut port_buf = itoa::Buffer::new();
+        request.extend_from_slice(port_buf.format(target.port).as_bytes());
+    }
+    
+    request.extend_from_slice(b"\r\n");
+    
+    // リクエストヘッダーを追加（疑似ヘッダー以外）
+    if let Some(stream) = conn.get_stream(stream_id) {
+        for header in &stream.request_headers {
+            // 疑似ヘッダーをスキップ
+            if header.name.starts_with(b":") {
+                continue;
+            }
+            // ホップバイホップヘッダーをスキップ
+            if header.name.eq_ignore_ascii_case(b"connection") ||
+               header.name.eq_ignore_ascii_case(b"keep-alive") ||
+               header.name.eq_ignore_ascii_case(b"transfer-encoding") {
+                continue;
+            }
+            request.extend_from_slice(&header.name);
+            request.extend_from_slice(b": ");
+            request.extend_from_slice(&header.value);
+            request.extend_from_slice(b"\r\n");
+        }
+    }
+    
+    // Content-Length追加（ボディがある場合）
+    if !request_body.is_empty() {
+        request.extend_from_slice(b"Content-Length: ");
+        let mut len_buf = itoa::Buffer::new();
+        request.extend_from_slice(len_buf.format(request_body.len()).as_bytes());
+        request.extend_from_slice(b"\r\n");
+    }
+    
+    request.extend_from_slice(b"Connection: keep-alive\r\n\r\n");
+    request.extend_from_slice(&request_body);
+    
+    // バックエンドに接続して転送
+    let addr = format!("{}:{}", target.host, target.port);
+    let result = if target.use_tls {
+        handle_http2_proxy_https(conn, stream_id, &addr, target.sni(), request).await
+    } else {
+        handle_http2_proxy_http(conn, stream_id, &addr, request).await
+    };
+    
+    server.release();
+    result
+}
+
+/// HTTP/2 → HTTP/1.1 プロキシ（HTTPバックエンド）
+#[cfg(feature = "http2")]
+async fn handle_http2_proxy_http<S>(
+    conn: &mut http2::Http2Connection<S>,
+    stream_id: u32,
+    addr: &str,
+    request: Vec<u8>,
+) -> Option<(u16, u64)>
+where
+    S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRentExt + Unpin,
+{
+    // バックエンドに接続
+    let connect_result = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await;
+    
+    let mut backend = match connect_result {
+        Ok(Ok(stream)) => {
+            let _ = stream.set_nodelay(true);
+            stream
+        }
+        Ok(Err(e)) => {
+            warn!("[HTTP/2] Backend connect error: {}", e);
+            let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+            let _ = conn.send_response(stream_id, 502, headers, Some(b"Bad Gateway")).await;
+            return Some((502, 11));
+        }
+        Err(_) => {
+            let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+            let _ = conn.send_response(stream_id, 504, headers, Some(b"Gateway Timeout")).await;
+            return Some((504, 15));
+        }
+    };
+    
+    // リクエスト送信
+    let (write_res, _) = backend.write_all(request).await;
+    if write_res.is_err() {
+        let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+        let _ = conn.send_response(stream_id, 502, headers, Some(b"Bad Gateway")).await;
+        return Some((502, 11));
+    }
+    
+    // レスポンス受信
+    let mut response_buf = Vec::with_capacity(BUF_SIZE);
+    
+    loop {
+        let buf = buf_get();
+        let read_result = timeout(READ_TIMEOUT, backend.read(buf)).await;
+        
+        let (res, mut returned_buf) = match read_result {
+            Ok(r) => r,
+            Err(_) => {
+                let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+                let _ = conn.send_response(stream_id, 504, headers, Some(b"Gateway Timeout")).await;
+                return Some((504, 15));
+            }
+        };
+        
+        let n = match res {
+            Ok(0) => {
+                buf_put(returned_buf);
+                break;
+            }
+            Ok(n) => n,
+            Err(_) => {
+                buf_put(returned_buf);
+                let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+                let _ = conn.send_response(stream_id, 502, headers, Some(b"Bad Gateway")).await;
+                return Some((502, 11));
+            }
+        };
+        
+        returned_buf.set_valid_len(n);
+        response_buf.extend_from_slice(returned_buf.as_valid_slice());
+        buf_put(returned_buf);
+        
+        // ヘッダーが完了したかチェック
+        if let Some(parsed) = parse_http_response(&response_buf) {
+            // HTTP/1.1 レスポンスを HTTP/2 に変換
+            let status = parsed.status_code;
+            let body_start = parsed.header_len;
+            let body = &response_buf[body_start..];
+            
+            // レスポンスヘッダーを解析
+            let mut headers_storage = [httparse::EMPTY_HEADER; 64];
+            let mut resp = httparse::Response::new(&mut headers_storage);
+            let _ = resp.parse(&response_buf);
+            
+            // HTTP/2用のヘッダーを構築（ホップバイホップヘッダー除外）
+            let mut h2_headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(16);
+            h2_headers.push((b"server", b"zerocopy-server/http2"));
+            
+            for header in resp.headers.iter() {
+                if header.name.is_empty() {
+                    continue;
+                }
+                // ホップバイホップヘッダーを除外
+                if header.name.eq_ignore_ascii_case("connection") ||
+                   header.name.eq_ignore_ascii_case("keep-alive") ||
+                   header.name.eq_ignore_ascii_case("transfer-encoding") ||
+                   header.name.eq_ignore_ascii_case("upgrade") {
+                    continue;
+                }
+                h2_headers.push((header.name.as_bytes(), header.value));
+            }
+            
+            // Content-Length が chunked の場合は計算
+            let final_body = if parsed.is_chunked {
+                // TODO: Chunkedデコード
+                body.to_vec()
+            } else if let Some(content_len) = parsed.content_length {
+                // 残りのボディを読む
+                let mut full_body = body.to_vec();
+                while full_body.len() < content_len {
+                    let buf = buf_get();
+                    let read_result = timeout(READ_TIMEOUT, backend.read(buf)).await;
+                    let (res, mut returned_buf) = match read_result {
+                        Ok(r) => r,
+                        Err(_) => break,
+                    };
+                    
+                    let n = match res {
+                        Ok(0) => { buf_put(returned_buf); break; }
+                        Ok(n) => n,
+                        Err(_) => { buf_put(returned_buf); break; }
+                    };
+                    
+                    returned_buf.set_valid_len(n);
+                    full_body.extend_from_slice(returned_buf.as_valid_slice());
+                    buf_put(returned_buf);
+                }
+                full_body
+            } else {
+                body.to_vec()
+            };
+            
+            // HTTP/2 レスポンス送信
+            if let Err(e) = conn.send_response(stream_id, status, &h2_headers, Some(&final_body)).await {
+                warn!("[HTTP/2] Response send error: {}", e);
+                return None;
+            }
+            
+            return Some((status, final_body.len() as u64));
+        }
+        
+        // ヘッダーが大きすぎる
+        if response_buf.len() > MAX_HEADER_SIZE {
+            let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+            let _ = conn.send_response(stream_id, 502, headers, Some(b"Bad Gateway")).await;
+            return Some((502, 11));
+        }
+    }
+    
+    // ストリーム終了（空レスポンス）
+    let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+    let _ = conn.send_response(stream_id, 502, headers, Some(b"Bad Gateway")).await;
+    Some((502, 11))
+}
+
+/// HTTP/2 → HTTP/1.1 プロキシ（HTTPSバックエンド）
+#[cfg(feature = "http2")]
+async fn handle_http2_proxy_https<S>(
+    conn: &mut http2::Http2Connection<S>,
+    stream_id: u32,
+    addr: &str,
+    sni: &str,
+    request: Vec<u8>,
+) -> Option<(u16, u64)>
+where
+    S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRentExt + Unpin,
+{
+    // バックエンドに TCP 接続
+    let connect_result = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await;
+    
+    let backend_tcp = match connect_result {
+        Ok(Ok(stream)) => {
+            let _ = stream.set_nodelay(true);
+            stream
+        }
+        Ok(Err(e)) => {
+            warn!("[HTTP/2] Backend connect error: {}", e);
+            let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+            let _ = conn.send_response(stream_id, 502, headers, Some(b"Bad Gateway")).await;
+            return Some((502, 11));
+        }
+        Err(_) => {
+            let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+            let _ = conn.send_response(stream_id, 504, headers, Some(b"Gateway Timeout")).await;
+            return Some((504, 15));
+        }
+    };
+    
+    // TLS ハンドシェイク
+    let connector = TLS_CONNECTOR.with(|c| c.clone());
+    let tls_result = timeout(CONNECT_TIMEOUT, connector.connect(backend_tcp, sni)).await;
+    
+    let mut backend = match tls_result {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => {
+            warn!("[HTTP/2] TLS handshake error: {}", e);
+            let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+            let _ = conn.send_response(stream_id, 502, headers, Some(b"Bad Gateway")).await;
+            return Some((502, 11));
+        }
+        Err(_) => {
+            let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+            let _ = conn.send_response(stream_id, 504, headers, Some(b"Gateway Timeout")).await;
+            return Some((504, 15));
+        }
+    };
+    
+    // リクエスト送信
+    let (write_res, _) = backend.write_all(request).await;
+    if write_res.is_err() {
+        let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+        let _ = conn.send_response(stream_id, 502, headers, Some(b"Bad Gateway")).await;
+        return Some((502, 11));
+    }
+    
+    // レスポンス受信（HTTP と同様）
+    let mut response_buf = Vec::with_capacity(BUF_SIZE);
+    
+    loop {
+        let buf = buf_get();
+        let read_result = timeout(READ_TIMEOUT, backend.read(buf)).await;
+        
+        let (res, mut returned_buf) = match read_result {
+            Ok(r) => r,
+            Err(_) => {
+                let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+                let _ = conn.send_response(stream_id, 504, headers, Some(b"Gateway Timeout")).await;
+                return Some((504, 15));
+            }
+        };
+        
+        let n = match res {
+            Ok(0) => {
+                buf_put(returned_buf);
+                break;
+            }
+            Ok(n) => n,
+            Err(_) => {
+                buf_put(returned_buf);
+                break;
+            }
+        };
+        
+        returned_buf.set_valid_len(n);
+        response_buf.extend_from_slice(returned_buf.as_valid_slice());
+        buf_put(returned_buf);
+        
+        // ヘッダーが完了したかチェック
+        if let Some(parsed) = parse_http_response(&response_buf) {
+            let status = parsed.status_code;
+            let body_start = parsed.header_len;
+            let body = &response_buf[body_start..];
+            
+            // レスポンスヘッダーを解析
+            let mut headers_storage = [httparse::EMPTY_HEADER; 64];
+            let mut resp = httparse::Response::new(&mut headers_storage);
+            let _ = resp.parse(&response_buf);
+            
+            // HTTP/2用のヘッダーを構築
+            let mut h2_headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(16);
+            h2_headers.push((b"server", b"zerocopy-server/http2"));
+            
+            for header in resp.headers.iter() {
+                if header.name.is_empty() {
+                    continue;
+                }
+                if header.name.eq_ignore_ascii_case("connection") ||
+                   header.name.eq_ignore_ascii_case("keep-alive") ||
+                   header.name.eq_ignore_ascii_case("transfer-encoding") {
+                    continue;
+                }
+                h2_headers.push((header.name.as_bytes(), header.value));
+            }
+            
+            // 残りのボディを読む
+            let final_body = if let Some(content_len) = parsed.content_length {
+                let mut full_body = body.to_vec();
+                while full_body.len() < content_len {
+                    let buf = buf_get();
+                    let read_result = timeout(READ_TIMEOUT, backend.read(buf)).await;
+                    let (res, mut returned_buf) = match read_result {
+                        Ok(r) => r,
+                        Err(_) => break,
+                    };
+                    
+                    let n = match res {
+                        Ok(0) => { buf_put(returned_buf); break; }
+                        Ok(n) => n,
+                        Err(_) => { buf_put(returned_buf); break; }
+                    };
+                    
+                    returned_buf.set_valid_len(n);
+                    full_body.extend_from_slice(returned_buf.as_valid_slice());
+                    buf_put(returned_buf);
+                }
+                full_body
+            } else {
+                body.to_vec()
+            };
+            
+            if let Err(e) = conn.send_response(stream_id, status, &h2_headers, Some(&final_body)).await {
+                warn!("[HTTP/2] Response send error: {}", e);
+                return None;
+            }
+            
+            return Some((status, final_body.len() as u64));
+        }
+        
+        if response_buf.len() > MAX_HEADER_SIZE {
+            break;
+        }
+    }
+    
+    let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+    let _ = conn.send_response(stream_id, 502, headers, Some(b"Bad Gateway")).await;
+    Some((502, 11))
+}
+
+/// HTTP/2 ファイル配信
+#[cfg(feature = "http2")]
+async fn handle_http2_sendfile<S>(
+    conn: &mut http2::Http2Connection<S>,
+    stream_id: u32,
+    base_path: &PathBuf,
+    is_dir: bool,
+    index_file: Option<&str>,
+    req_path: &[u8],
+    prefix: &[u8],
+    security: &SecurityConfig,
+) -> Option<(u16, u64)>
+where
+    S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRentExt + Unpin,
+{
+    let path_str = std::str::from_utf8(req_path).unwrap_or("/");
+    let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
+    
+    // プレフィックス除去後のサブパス
+    let sub_path = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
+        &path_str[prefix_str.len()..]
+    } else {
+        path_str
+    };
+    
+    let clean_sub = sub_path.trim_start_matches('/');
+    
+    // パストラバーサル防止
+    if clean_sub.contains("..") {
+        let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+        let _ = conn.send_response(stream_id, 403, headers, Some(b"Forbidden")).await;
+        return Some((403, 9));
+    }
+    
+    // ファイルパス構築
+    let file_path = if is_dir {
+        let mut p = base_path.clone();
+        if clean_sub.is_empty() || clean_sub == "/" {
+            p.push(index_file.unwrap_or("index.html"));
+        } else {
+            p.push(clean_sub);
+            if p.is_dir() {
+                p.push(index_file.unwrap_or("index.html"));
+            }
+        }
+        p
+    } else {
+        if !clean_sub.is_empty() {
+            let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+            let _ = conn.send_response(stream_id, 404, headers, Some(b"Not Found")).await;
+            return Some((404, 9));
+        }
+        base_path.clone()
+    };
+    
+    // ファイル読み込み
+    let data = match std::fs::read(&file_path) {
+        Ok(d) => d,
+        Err(_) => {
+            let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+            let _ = conn.send_response(stream_id, 404, headers, Some(b"Not Found")).await;
+            return Some((404, 9));
+        }
+    };
+    
+    let mime_type = mime_guess::from_path(&file_path).first_or_octet_stream();
+    let mime_str = mime_type.as_ref();
+    
+    let mut headers: Vec<(&[u8], &[u8])> = vec![
+        (b"content-type", mime_str.as_bytes()),
+        (b"server", b"zerocopy-server/http2"),
+    ];
+    
+    // セキュリティヘッダー追加
+    let security_headers: Vec<(Vec<u8>, Vec<u8>)> = security.add_response_headers.iter()
+        .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec()))
+        .collect();
+    
+    for (k, v) in &security_headers {
+        headers.push((k.as_slice(), v.as_slice()));
+    }
+    
+    if let Err(e) = conn.send_response(stream_id, 200, &headers, Some(&data)).await {
+        warn!("[HTTP/2] File response error: {}", e);
+        return None;
+    }
+    
+    Some((200, data.len() as u64))
+}
+
+/// HTTP/2 リダイレクト処理
+#[cfg(feature = "http2")]
+async fn handle_http2_redirect<S>(
+    conn: &mut http2::Http2Connection<S>,
+    stream_id: u32,
+    redirect_url: &str,
+    status_code: u16,
+    preserve_path: bool,
+    req_path: &[u8],
+    prefix: &[u8],
+) -> Option<(u16, u64)>
+where
+    S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRentExt + Unpin,
+{
+    let path_str = std::str::from_utf8(req_path).unwrap_or("/");
+    let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
+    
+    // パス部分（prefix除去後）
+    let sub_path = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
+        &path_str[prefix_str.len()..]
+    } else {
+        path_str
+    };
+    
+    // 変数置換とパス追加
+    let mut final_url = redirect_url
+        .replace("$request_uri", path_str)
+        .replace("$path", sub_path);
+    
+    if preserve_path && !sub_path.is_empty() {
+        if final_url.ends_with('/') && sub_path.starts_with('/') {
+            final_url.push_str(&sub_path[1..]);
+        } else if !final_url.ends_with('/') && !sub_path.starts_with('/') {
+            final_url.push('/');
+            final_url.push_str(sub_path);
+        } else {
+            final_url.push_str(sub_path);
+        }
+    }
+    
+    let headers: &[(&[u8], &[u8])] = &[
+        (b"location", final_url.as_bytes()),
+        (b"server", b"zerocopy-server/http2"),
+    ];
+    
+    if let Err(e) = conn.send_response(stream_id, status_code, headers, None).await {
+        warn!("[HTTP/2] Redirect response error: {}", e);
+        return None;
+    }
+    
+    Some((status_code, 0))
 }
 
 // kTLS 有効時の接続処理（rustls + ktls2）
