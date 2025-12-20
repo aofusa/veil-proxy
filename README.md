@@ -37,7 +37,7 @@ io_uring (monoio) と rustls を使用した高性能リバースプロキシサ
 - **Graceful Reload**: SIGHUPによる設定のホットリロード（ゼロダウンタイム）
 - **非同期ログ**: ftlog による高性能非同期ログ
 - **設定バリデーション**: 起動時の詳細な設定ファイル検証
-- **Prometheusメトリクス**: `/__metrics` エンドポイントでリクエスト数、レイテンシ等を出力
+- **Prometheusメトリクス**: メトリクスエンドポイントでリクエスト数、レイテンシ等を出力（要設定、デフォルト無効）
 
 ### セキュリティ
 - **HTTP to HTTPSリダイレクト**: HTTPアクセスを自動的にHTTPSへ301リダイレクト
@@ -820,13 +820,30 @@ redirect_status = 301
 
 リクエスト数、レイテンシ、ボディサイズなどのメトリクスをPrometheus形式でエクスポートします。
 
+### 有効化
+
+Prometheusメトリクスはデフォルトで**無効**です。`[prometheus]` セクションで明示的に有効化する必要があります。
+
+```toml
+[prometheus]
+enabled = true
+```
+
+### 設定オプション
+
+| オプション | 説明 | デフォルト |
+|-----------|------|-----------|
+| `enabled` | メトリクスエンドポイントを有効化 | false |
+| `path` | メトリクスエンドポイントのパス | `/__metrics` |
+| `allowed_ips` | アクセスを許可するIP/CIDR（配列） | []（すべて許可） |
+
 ### エンドポイント
 
 ```
 GET /__metrics
 ```
 
-このエンドポイントは自動的に有効化され、Prometheusからのスクレイピングに対応しています。
+`path` オプションでエンドポイントのパスを変更できます。
 
 ### 利用可能なメトリクス
 
@@ -855,6 +872,39 @@ histogram_quantile(0.95, rate(zerocopy_proxy_http_request_duration_seconds_bucke
 # ホスト別リクエストレート
 sum by (host) (rate(zerocopy_proxy_http_requests_total[5m]))
 ```
+
+### 設定例（config.toml）
+
+```toml
+# 基本設定（全IPからアクセス可能）
+[prometheus]
+enabled = true
+path = "/__metrics"
+
+# セキュリティ強化版（内部ネットワークのみ許可）
+[prometheus]
+enabled = true
+path = "/metrics"
+allowed_ips = [
+  "127.0.0.1",
+  "::1",
+  "10.0.0.0/8",
+  "172.16.0.0/12",
+  "192.168.0.0/16"
+]
+```
+
+### アクセス制御
+
+`allowed_ips` を設定すると、指定したIPアドレス/CIDRからのみメトリクスエンドポイントにアクセス可能になります。
+空の場合（デフォルト）は全てのIPからアクセス可能です。
+
+| 形式 | 例 |
+|------|-----|
+| 単一IPv4 | `127.0.0.1` |
+| IPv4 CIDR | `10.0.0.0/8` |
+| 単一IPv6 | `::1` |
+| IPv6 CIDR | `2001:db8::/32` |
 
 ### Prometheus設定例
 
