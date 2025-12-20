@@ -1638,6 +1638,47 @@ pub static SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
 static RELOAD_FLAG: Lazy<Arc<AtomicBool>> = Lazy::new(|| Arc::new(AtomicBool::new(false)));
 
 // ====================
+// セキュアなメモリ操作
+// ====================
+
+/// セキュアなバイト配列のゼロ化
+/// 
+/// メモリ上の機密データを安全にゼロ化します。
+/// コンパイラによる最適化（デッドストア削除）を防ぐため、
+/// volatile 書き込みを使用します。
+fn secure_zero(data: &mut [u8]) {
+    // volatile 書き込みで最適化を防止
+    for byte in data.iter_mut() {
+        unsafe {
+            std::ptr::write_volatile(byte, 0);
+        }
+    }
+    // メモリバリアで確実に書き込みを完了
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Arc<Vec<u8>> をセキュアにゼロ化して解放
+/// 
+/// Arc の参照カウントが 1（自分だけ）の場合、
+/// 内部の Vec をゼロ化してからドロップします。
+/// 参照カウントが 2 以上の場合は警告を出力します。
+fn secure_clear_arc_vec(arc: &mut Arc<Vec<u8>>, name: &str) {
+    match Arc::get_mut(arc) {
+        Some(vec) => {
+            let len = vec.len();
+            secure_zero(vec);
+            vec.clear();
+            vec.shrink_to_fit();
+            info!("[Security] {} securely zeroed ({} bytes)", name, len);
+        }
+        None => {
+            // 他の参照が存在する場合（通常は発生しない）
+            warn!("[Security] {} cannot be zeroed: other references exist", name);
+        }
+    }
+}
+
+// ====================
 // 同時接続数カウンター
 // ====================
 //
@@ -2468,6 +2509,8 @@ impl Http3ConfigSection {
         http3_server::Http3ServerConfig {
             cert_path: cert_path.to_string(),
             key_path: key_path.to_string(),
+            cert_pem: None,  // quicheはファイルパスからの読み込みのみサポート
+            key_pem: None,
             max_idle_timeout: self.max_idle_timeout,
             max_udp_payload_size: self.max_udp_payload_size,
             initial_max_data: self.initial_max_data,
@@ -3602,6 +3645,21 @@ struct LoadedConfig {
     /// HTTPリスナーアドレス（HTTPSリダイレクト用、オプション）
     listen_http_addr: Option<SocketAddr>,
     tls_config: Arc<ServerConfig>,
+    /// TLS証明書パス（ログ・表示用）
+    tls_cert_path: String,
+    /// TLS秘密鍵パス（ログ・表示用）
+    tls_key_path: String,
+    /// TLS証明書（PEM形式、事前読み込み済み）
+    /// 
+    /// Landlock適用前に読み込まれた証明書データ。
+    /// HTTP/3ではmemfd経由でquicheに渡すことで、
+    /// Landlockによるファイルシステム制限下でも動作可能。
+    tls_cert_pem: Arc<Vec<u8>>,
+    /// TLS秘密鍵（PEM形式、事前読み込み済み）
+    /// 
+    /// Landlock適用前に読み込まれた秘密鍵データ。
+    /// HTTP/3ではmemfd経由でquicheに渡す。
+    tls_key_pem: Arc<Vec<u8>>,
     host_routes: Arc<HashMap<Box<[u8]>, Backend>>,
     path_routes: Arc<HashMap<Box<[u8]>, PathRouter>>,
     ktls_config: KtlsConfig,
@@ -3715,14 +3773,26 @@ static CONFIG_PATH: Lazy<ArcSwap<PathBuf>> =
 /// 
 /// 実行中のリクエストは古い設定を参照し続け、
 /// 新規リクエストは新しい設定を使用します。
+/// 
+/// ## セキュリティに関する注意
+/// 
+/// TLS証明書・秘密鍵はホットリロードの対象外です。
+/// これはLandlockによるファイルシステム制限を適用後、
+/// 証明書ファイルへのアクセスを禁止するためです。
+/// 
+/// 証明書を更新する場合は、サーバーを再起動してください。
 fn reload_config(path: &Path) -> io::Result<()> {
-    let loaded = load_config(path)?;
+    let loaded = load_config_without_tls(path)?;
+    
+    // 現在のTLS設定を維持（ホットリロード対象外）
+    let current = CURRENT_CONFIG.load();
     
     let runtime_config = RuntimeConfig {
         host_routes: loaded.host_routes,
         path_routes: loaded.path_routes,
-        tls_config: Some(loaded.tls_config),
-        ktls_config: Arc::new(loaded.ktls_config),
+        // TLS設定は起動時のものを維持（セキュリティ上の理由）
+        tls_config: current.tls_config.clone(),
+        ktls_config: current.ktls_config.clone(),
         global_security: Arc::new(loaded.global_security),
         prometheus_config: Arc::new(loaded.prometheus_config),
         upstream_groups: loaded.upstream_groups,
@@ -3734,8 +3804,95 @@ fn reload_config(path: &Path) -> io::Result<()> {
     // アトミックに設定を入れ替え
     CURRENT_CONFIG.store(Arc::new(runtime_config));
     
-    info!("Configuration reloaded successfully");
+    info!("Configuration reloaded successfully (TLS certificates unchanged - restart required for TLS updates)");
     Ok(())
+}
+
+/// ホットリロード用の設定（TLS証明書を除く）
+/// 
+/// Landlock適用後はTLS証明書ファイルへのアクセスが制限されるため、
+/// ホットリロード時はルーティング設定等のみを更新します。
+struct LoadedConfigWithoutTls {
+    host_routes: Arc<HashMap<Box<[u8]>, Backend>>,
+    path_routes: Arc<HashMap<Box<[u8]>, PathRouter>>,
+    global_security: GlobalSecurityConfig,
+    prometheus_config: PrometheusConfig,
+    upstream_groups: Arc<HashMap<String, Arc<UpstreamGroup>>>,
+    http2_enabled: bool,
+    http2_config: Http2ConfigSection,
+    http3_config: Http3ConfigSection,
+}
+
+/// TLS証明書を除いた設定をロード（ホットリロード用）
+/// 
+/// Landlock適用後は証明書ファイルへのアクセスが制限されるため、
+/// この関数ではTLS関連の読み込みをスキップします。
+fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
+    let config_str = fs::read_to_string(path)?;
+    let config: Config = toml::from_str(&config_str)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("TOML parse error: {}", e)))?;
+    
+    // 設定ファイルのバリデーション
+    validate_config(&config)?;
+
+    // HTTP/2・HTTP/3 設定を読み込み
+    let http2_enabled = config.server.http2_enabled;
+    let http2_config = config.http2.clone();
+    let http3_config = config.http3.clone();
+
+    // Upstream グループを構築（ロードバランシング用）
+    let mut upstream_groups: HashMap<String, Arc<UpstreamGroup>> = HashMap::new();
+    if let Some(upstreams) = &config.upstreams {
+        for (name, cfg) in upstreams {
+            if let Some(group) = UpstreamGroup::new(
+                name.clone(), 
+                cfg.servers.clone(), 
+                cfg.algorithm,
+                cfg.health_check.clone(),
+            ) {
+                info!("Reloaded upstream '{}' with {} servers ({:?})", 
+                      name, group.len(), cfg.algorithm);
+                upstream_groups.insert(name.clone(), Arc::new(group));
+            } else {
+                warn!("Failed to reload upstream '{}': no valid servers", name);
+            }
+        }
+    }
+
+    let mut host_routes_bytes: HashMap<Box<[u8]>, Backend> = HashMap::new();
+    if let Some(host_routes) = config.host_routes {
+        for (k, v) in host_routes {
+            let backend = load_backend(&v, &upstream_groups)?;
+            host_routes_bytes.insert(k.into_bytes().into_boxed_slice(), backend);
+        }
+    }
+
+    let mut path_routes_bytes: HashMap<Box<[u8]>, PathRouter> = HashMap::new();
+    if let Some(path_routes) = config.path_routes {
+        for (host, path_map) in path_routes {
+            let mut entries: Vec<(String, Backend)> = Vec::with_capacity(path_map.len());
+            for (k, v) in path_map {
+                entries.push((k, load_backend(&v, &upstream_groups)?));
+            }
+            entries.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+            let router = PathRouter::new(entries)?;
+            path_routes_bytes.insert(
+                host.into_bytes().into_boxed_slice(),
+                router
+            );
+        }
+    }
+
+    Ok(LoadedConfigWithoutTls {
+        host_routes: Arc::new(host_routes_bytes),
+        path_routes: Arc::new(path_routes_bytes),
+        global_security: config.security,
+        prometheus_config: config.prometheus,
+        upstream_groups: Arc::new(upstream_groups),
+        http2_enabled,
+        http2_config,
+        http3_config,
+    })
 }
 
 fn load_config(path: &Path) -> io::Result<LoadedConfig> {
@@ -3843,10 +4000,24 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         info!("Prometheus metrics disabled");
     }
 
+    // TLS証明書をバイト列として読み込み（HTTP/3用、Landlock適用前に読み込み）
+    // これによりLandlock適用後も証明書ファイルへのアクセスなしで動作可能
+    let tls_cert_pem = fs::read(&config.tls.cert_path)
+        .map_err(|e| io::Error::new(e.kind(), format!("Failed to read TLS cert '{}': {}", config.tls.cert_path, e)))?;
+    let tls_key_pem = fs::read(&config.tls.key_path)
+        .map_err(|e| io::Error::new(e.kind(), format!("Failed to read TLS key '{}': {}", config.tls.key_path, e)))?;
+    
+    info!("TLS certificates pre-loaded for Landlock compatibility (cert: {} bytes, key: {} bytes)",
+          tls_cert_pem.len(), tls_key_pem.len());
+
     Ok(LoadedConfig {
         listen_addr: config.server.listen,
         listen_http_addr,
         tls_config,
+        tls_cert_path: config.tls.cert_path.clone(),
+        tls_key_path: config.tls.key_path.clone(),
+        tls_cert_pem: Arc::new(tls_cert_pem),
+        tls_key_pem: Arc::new(tls_key_pem),
         host_routes: Arc::new(host_routes_bytes),
         path_routes: Arc::new(path_routes_bytes),
         ktls_config,
@@ -4103,7 +4274,7 @@ fn main() {
     // 追加の非同期化層（tokio::sync::mpsc等）は不要
     let _guard = init_logging(&logging_config);
 
-    let loaded_config = match load_config(&config_path) {
+    let mut loaded_config = match load_config(&config_path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Config load error: {}", e);
@@ -4437,6 +4608,9 @@ fn main() {
 
     // HTTP/3 (QUIC/UDP) サーバー（設定されている場合のみ）
     // TCP側と同様に複数スレッドで並列起動し、CPUコアにピンニング
+    // 
+    // 注意: quicheはファイルパスからの証明書読み込みのみサポートしているため、
+    // HTTP/3を使用する場合はLandlock設定で証明書パスを許可する必要があります。
     #[cfg(feature = "http3")]
     if loaded_config.http3_enabled {
         let http3_addr_str = loaded_config.http3_listen
@@ -4451,30 +4625,34 @@ fn main() {
             }
         };
         
-        // TLS 設定パスを設定ファイルから再取得
-        let (tls_cert, tls_key) = match std::fs::read_to_string(&config_path)
-            .ok()
-            .and_then(|s| toml::from_str::<Config>(&s).ok())
-        {
-            Some(cfg) => (cfg.tls.cert_path.clone(), cfg.tls.key_path.clone()),
-            None => {
-                error!("Failed to read TLS config for HTTP/3");
-                return;
-            }
-        };
+        // TLS証明書パス
+        let tls_cert_path = loaded_config.tls_cert_path.clone();
+        let tls_key_path = loaded_config.tls_key_path.clone();
+        
+        // TLS証明書データ（事前読み込み済み、memfd経由でquicheに渡す）
+        let tls_cert_pem = loaded_config.tls_cert_pem.clone();
+        let tls_key_pem = loaded_config.tls_key_pem.clone();
+        
+        // Landlock有効時の情報: memfd経由で証明書をロードするため、
+        // ファイルパスをlandlock_read_pathsに追加する必要はない
+        if loaded_config.global_security.enable_landlock {
+            info!("[HTTP/3] Landlock enabled - using memfd for certificate loading");
+            info!("[HTTP/3] No need to add certificate paths to landlock_read_paths");
+        }
         
         info!("============================================");
         info!("HTTP/3 (QUIC/UDP) Server");
         info!("HTTP/3 Listen Address: {} (UDP)", http3_addr);
         info!("HTTP/3 Workers: {} (SO_REUSEPORT enabled)", num_threads);
-        info!("TLS Cert: {}", tls_cert);
-        info!("TLS Key: {}", tls_key);
+        info!("TLS Cert: {} (pre-loaded, {} bytes)", tls_cert_path, tls_cert_pem.len());
+        info!("TLS Key: {} (pre-loaded, {} bytes)", tls_key_path, tls_key_pem.len());
+        info!("TLS loading method: memfd (Landlock compatible)");
         info!("============================================");
         
         // TCP側と同様に複数スレッドで起動（SO_REUSEPORTでパケット分散）
         for thread_id in 0..num_threads {
-            let cert = tls_cert.clone();
-            let key = tls_key.clone();
+            let cert_pem = tls_cert_pem.clone();
+            let key_pem = tls_key_pem.clone();
             let addr = http3_addr;
             
             // CPUコアにピンニング
@@ -4493,9 +4671,24 @@ fn main() {
                     }
                 }
                 
+                // memfd経由で証明書をロード（Landlock対応）
+                // 事前読み込み済みのPEMデータをmemfdに書き込み、
+                // /proc/self/fd/<fd>パス経由でquicheに渡す
+                // 
+                // セキュリティ: Vec をクローンした後、Arc を即座にドロップして
+                // メインスレッドでのゼロ化を可能にする
+                let cert_data = (*cert_pem).clone();
+                let key_data = (*key_pem).clone();
+                
+                // Arc 参照を即座にドロップ（参照カウントを減らす）
+                drop(cert_pem);
+                drop(key_pem);
+                
                 let config = http3_server::Http3ServerConfig {
-                    cert_path: cert,
-                    key_path: key,
+                    cert_path: String::new(),  // memfd使用時は不要
+                    key_path: String::new(),   // memfd使用時は不要
+                    cert_pem: Some(cert_data),
+                    key_pem: Some(key_data),
                     ..Default::default()
                 };
                 
@@ -4509,6 +4702,24 @@ fn main() {
             });
             handles.push(http3_handle);
         }
+        
+        // ローカル変数の Arc をドロップ（参照カウントを減らす）
+        drop(tls_cert_pem);
+        drop(tls_key_pem);
+    }
+    
+    // HTTP/3 ワーカーが証明書データをクローンするまで短時間待機
+    // その後、LoadedConfig の証明書データをセキュアにゼロ化
+    #[cfg(feature = "http3")]
+    if loaded_config.http3_enabled {
+        // ワーカースレッドが Arc 参照をドロップするまで少し待機
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        
+        // LoadedConfig の証明書データをセキュアにゼロ化
+        secure_clear_arc_vec(&mut loaded_config.tls_cert_pem, "TLS certificate (LoadedConfig)");
+        secure_clear_arc_vec(&mut loaded_config.tls_key_pem, "TLS private key (LoadedConfig)");
+        
+        info!("[Security] Pre-loaded TLS credentials have been securely cleared from memory");
     }
 
     for handle in handles {

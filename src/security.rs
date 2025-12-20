@@ -244,6 +244,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     151, // mlockall
     152, // munlockall
     325, // mlock2 (io_uring 登録バッファ)
+    319, // memfd_create (HTTP/3 TLS証明書のLandlock対応用)
 
     // ============================================
     // スレッド・プロセス管理
@@ -384,6 +385,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     229, // munlock
     230, // mlockall
     231, // munlockall
+    279, // memfd_create (HTTP/3 TLS証明書のLandlock対応用)
 
     // ============================================
     // スレッド・プロセス管理
@@ -849,7 +851,7 @@ fn apply_landlock(config: &SecurityConfig) -> io::Result<()> {
     // ============================================
     
     // ABI v1 (Linux 5.13+) - 基本権限
-    const LANDLOCK_ACCESS_FS_EXECUTE: u64 = 1 << 0;
+    // 注: EXECUTE (1 << 0) はサーバーでは不要のため定義しない
     const LANDLOCK_ACCESS_FS_WRITE_FILE: u64 = 1 << 1;
     const LANDLOCK_ACCESS_FS_READ_FILE: u64 = 1 << 2;
     const LANDLOCK_ACCESS_FS_READ_DIR: u64 = 1 << 3;

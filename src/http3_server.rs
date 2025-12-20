@@ -19,8 +19,10 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::io;
+use std::ffi::CString;
+use std::io::{self, Write as IoWrite, Seek};
 use std::net::SocketAddr;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -41,13 +43,147 @@ use crate::{
     CURRENT_CONFIG, SHUTDOWN_FLAG,
 };
 
+/// memfd_create システムコールのラッパー（セキュリティ強化版）
+/// 
+/// 匿名のメモリファイルを作成します。このファイルはファイルシステム上には
+/// 存在せず、メモリ上にのみ存在します。Landlock のファイルシステム制限を
+/// バイパスしながら、ファイルディスクリプタ経由でアクセスできます。
+/// 
+/// ## セキュリティ対策
+/// - MFD_CLOEXEC: exec() 時に自動的に閉じる（fd リーク防止）
+/// - MFD_ALLOW_SEALING: 書き込み後にシールを適用可能にする
+fn memfd_create_secure(name: &str) -> io::Result<std::fs::File> {
+    let c_name = CString::new(name).map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidInput, format!("invalid memfd name: {}", e))
+    })?;
+    
+    // MFD_CLOEXEC (1): exec() 時に自動クローズ
+    // MFD_ALLOW_SEALING (2): シール機能を有効化
+    const MFD_CLOEXEC: libc::c_uint = 1;
+    const MFD_ALLOW_SEALING: libc::c_uint = 2;
+    
+    let fd = unsafe {
+        libc::memfd_create(c_name.as_ptr(), MFD_CLOEXEC | MFD_ALLOW_SEALING)
+    };
+    
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// memfd にシールを適用（書き込み禁止・サイズ変更禁止）
+/// 
+/// シールを適用することで、memfd の内容が改ざんされることを防ぎます。
+/// これにより、攻撃者が memfd の内容を書き換えて不正な証明書を
+/// 注入することを防止できます。
+fn apply_memfd_seals(fd: i32) -> io::Result<()> {
+    // F_ADD_SEALS = 1033
+    // F_SEAL_SEAL = 1 (これ以上シールを追加できなくする)
+    // F_SEAL_SHRINK = 2 (サイズ縮小禁止)
+    // F_SEAL_GROW = 4 (サイズ拡大禁止)
+    // F_SEAL_WRITE = 8 (書き込み禁止)
+    const F_ADD_SEALS: libc::c_int = 1033;
+    const F_SEAL_SEAL: libc::c_int = 1;
+    const F_SEAL_SHRINK: libc::c_int = 2;
+    const F_SEAL_GROW: libc::c_int = 4;
+    const F_SEAL_WRITE: libc::c_int = 8;
+    
+    let seals = F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL;
+    
+    let result = unsafe {
+        libc::fcntl(fd, F_ADD_SEALS, seals)
+    };
+    
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    
+    Ok(())
+}
+
+/// PEM データを memfd に書き込み、/proc/self/fd/<fd> パスを返す（セキュリティ強化版）
+/// 
+/// この関数は以下のことを行います：
+/// 1. memfd_create で匿名ファイルを作成（MFD_CLOEXEC + MFD_ALLOW_SEALING）
+/// 2. PEM データを書き込み
+/// 3. シールを適用（書き込み禁止・サイズ変更禁止・追加シール禁止）
+/// 4. ファイル位置を先頭に戻す
+/// 5. /proc/self/fd/<fd> パスを生成
+/// 
+/// ## セキュリティ特性
+/// - memfd の内容は書き込み後に変更不可能（シール適用）
+/// - exec() 時に自動的に閉じる（MFD_CLOEXEC）
+/// - ファイルシステム上には存在しない（Landlock バイパス）
+/// 
+/// ## 注意
+/// 戻り値の File オブジェクトはスコープ内で保持し続ける必要があります。
+/// ドロップされると fd が閉じられ、パスが無効になります。
+fn create_memfd_for_pem(name: &str, pem_data: &[u8]) -> io::Result<(std::fs::File, String)> {
+    // memfd を作成（セキュリティフラグ付き）
+    let mut memfd = memfd_create_secure(name)?;
+    
+    // PEM データを書き込み
+    memfd.write_all(pem_data)?;
+    
+    // ファイル位置を先頭に戻す（読み取り用）
+    memfd.seek(io::SeekFrom::Start(0))?;
+    
+    // /proc/self/fd/<fd> パスを生成
+    let fd = memfd.as_raw_fd();
+    let proc_path = format!("/proc/self/fd/{}", fd);
+    
+    // シールを適用（書き込み禁止、サイズ変更禁止）
+    // 注意: シール適用後は quiche がファイルを読み取る必要があるため、
+    // 読み取りは引き続き可能
+    if let Err(e) = apply_memfd_seals(fd) {
+        warn!("[HTTP/3] Failed to apply memfd seals: {} (continuing without seals)", e);
+        // シール適用失敗は致命的ではないため、警告のみで続行
+    } else {
+        debug!("[HTTP/3] memfd seals applied: WRITE|SHRINK|GROW|SEAL");
+    }
+    
+    Ok((memfd, proc_path))
+}
+
+/// セキュアなバイト配列のゼロ化
+/// 
+/// メモリ上の機密データを安全にゼロ化します。
+/// コンパイラによる最適化（デッドストア削除）を防ぐため、
+/// volatile 書き込みを使用します。
+fn secure_zero(data: &mut [u8]) {
+    // volatile 書き込みで最適化を防止
+    for byte in data.iter_mut() {
+        unsafe {
+            std::ptr::write_volatile(byte, 0);
+        }
+    }
+    // メモリバリアで確実に書き込みを完了
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+}
+
 /// HTTP/3 サーバー設定
 #[derive(Clone)]
 pub struct Http3ServerConfig {
-    /// TLS 証明書パス
+    /// TLS 証明書パス（後方互換性のため残す、cert_pem優先）
     pub cert_path: String,
-    /// TLS 秘密鍵パス
+    /// TLS 秘密鍵パス（後方互換性のため残す、key_pem優先）
     pub key_path: String,
+    /// TLS 証明書（PEM形式、事前読み込み済み）
+    /// 
+    /// Landlock適用前に読み込まれた証明書バイト列。
+    /// 設定されている場合、cert_pathより優先される。
+    /// 
+    /// 注意: 使用後にセキュアにゼロ化されます。
+    pub cert_pem: Option<Vec<u8>>,
+    /// TLS 秘密鍵（PEM形式、事前読み込み済み）
+    /// 
+    /// Landlock適用前に読み込まれた秘密鍵バイト列。
+    /// 設定されている場合、key_pathより優先される。
+    /// 
+    /// 注意: 使用後にセキュアにゼロ化されます。
+    pub key_pem: Option<Vec<u8>>,
     /// 最大アイドルタイムアウト（ミリ秒）
     pub max_idle_timeout: u64,
     /// 最大 UDP ペイロードサイズ
@@ -71,6 +207,8 @@ impl Default for Http3ServerConfig {
         Self {
             cert_path: String::new(),
             key_path: String::new(),
+            cert_pem: None,
+            key_pem: None,
             max_idle_timeout: 30000,
             max_udp_payload_size: 1350,
             initial_max_data: 10_000_000,
@@ -991,19 +1129,80 @@ fn create_reuseport_udp_socket(bind_addr: SocketAddr) -> io::Result<UdpSocket> {
 /// 
 /// この関数は monoio のスレッド内から呼び出す必要があります。
 /// HTTP/1.1と同等のルーティング・セキュリティ・プロキシ機能をサポートします。
+/// 
+/// ## セキュリティ
+/// 証明書データ（cert_pem, key_pem）は quiche へのロード完了後、
+/// セキュアにゼロ化してからメモリから解放されます。
 pub async fn run_http3_server_async(
     bind_addr: SocketAddr,
-    config: Http3ServerConfig,
+    mut config: Http3ServerConfig,
 ) -> io::Result<()> {
     // QUIC 設定を作成
     let mut quic_config = Config::new(quiche::PROTOCOL_VERSION)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
     // TLS 証明書を設定
-    quic_config.load_cert_chain_from_pem_file(&config.cert_path)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("cert load error: {}", e)))?;
-    quic_config.load_priv_key_from_pem_file(&config.key_path)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("key load error: {}", e)))?;
+    // memfd アプローチ: 事前読み込み済みの PEM バイト列を memfd に書き込み、
+    // /proc/self/fd/<fd> パス経由で quiche に渡す
+    // これにより Landlock でファイルシステムアクセスを制限しながら HTTP/3 を使用可能
+    // 
+    // セキュリティ: quiche が証明書を読み込んだ後:
+    // 1. memfd を即座にドロップ（カーネルがメモリ解放）
+    // 2. config 内の Vec<u8> をセキュアにゼロ化してからドロップ
+    if let (Some(mut cert_pem), Some(mut key_pem)) = (config.cert_pem.take(), config.key_pem.take()) {
+        // memfd 経由でロード（Landlock 対応）
+        info!("[HTTP/3] Loading certificates via memfd (Landlock compatible)");
+        
+        // 証明書を memfd に書き込み
+        let (cert_memfd, cert_path) = create_memfd_for_pem("tls_cert", &cert_pem)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, 
+                format!("Failed to create memfd for cert: {}", e)))?;
+        
+        // quiche が証明書を読み込む
+        quic_config.load_cert_chain_from_pem_file(&cert_path)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, 
+                format!("cert load error (memfd): {}", e)))?;
+        
+        // 証明書 memfd を即座にドロップ（fd を閉じてカーネルにメモリ解放を依頼）
+        drop(cert_memfd);
+        
+        // 証明書データをセキュアにゼロ化
+        secure_zero(&mut cert_pem);
+        drop(cert_pem);
+        debug!("[HTTP/3] Certificate data securely zeroed and released");
+        
+        // 秘密鍵を memfd に書き込み
+        let (key_memfd, key_path) = create_memfd_for_pem("tls_key", &key_pem)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, 
+                format!("Failed to create memfd for key: {}", e)))?;
+        
+        // quiche が秘密鍵を読み込む
+        quic_config.load_priv_key_from_pem_file(&key_path)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, 
+                format!("key load error (memfd): {}", e)))?;
+        
+        // 秘密鍵 memfd を即座にドロップ
+        drop(key_memfd);
+        
+        // 秘密鍵データをセキュアにゼロ化
+        secure_zero(&mut key_pem);
+        drop(key_pem);
+        debug!("[HTTP/3] Private key data securely zeroed and released");
+        
+        info!("[HTTP/3] Certificates loaded, memfd closed, sensitive data zeroed");
+    } else {
+        // ファイルパスから直接ロード（後方互換性）
+        info!("[HTTP/3] Loading certificates from file path (legacy mode)");
+        warn!("[HTTP/3] Note: When using Landlock, add cert/key paths to landlock_read_paths");
+        
+        quic_config.load_cert_chain_from_pem_file(&config.cert_path)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, 
+                format!("cert load error: {}", e)))?;
+        
+        quic_config.load_priv_key_from_pem_file(&config.key_path)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, 
+                format!("key load error: {}", e)))?;
+    }
 
     // QUIC パラメータを設定
     quic_config.set_max_idle_timeout(config.max_idle_timeout);
