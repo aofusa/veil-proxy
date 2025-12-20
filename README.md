@@ -16,7 +16,7 @@ io_uring (monoio) と rustls を使用した高性能リバースプロキシサ
 ### プロキシ機能
 - **コネクションプール**: バックエンド接続の再利用によるレイテンシ削減（HTTP/HTTPS両対応）
 - **ロードバランシング**: 複数バックエンドへのリクエスト分散（Round Robin/Least Connections/IP Hash）
-- **健康チェック**: HTTPベースのアクティブヘルスチェックによる自動フェイルオーバー
+- **ヘルスチェック**: HTTPベースのアクティブヘルスチェックによる自動フェイルオーバー
 - **WebSocketサポート**: Upgradeヘッダー検知による双方向プロキシ（Fixed/Adaptiveポーリングモード）
 - **H2C (HTTP/2 over cleartext)**: TLSなしのHTTP/2バックエンド接続（gRPC対応）
 - **ヘッダー操作**: リクエスト/レスポンスヘッダーの追加・削除（X-Real-IP, HSTS等）
@@ -33,7 +33,7 @@ io_uring (monoio) と rustls を使用した高性能リバースプロキシサ
 - **CBPF振り分け**: SO_REUSEPORTのクライアントIPベースロードバランシング（Linux 4.6+）
 
 ### 運用機能
-- **Graceful Shutdown**: SIGINT/SIGTERMによる優雅な終了
+- **Graceful Shutdown**: SIGINT/SIGTERMによる安全な終了
 - **Graceful Reload**: SIGHUPによる設定のホットリロード（ゼロダウンタイム）
 - **非同期ログ**: ftlog による高性能非同期ログ
 - **設定バリデーション**: 起動時の詳細な設定ファイル検証
@@ -501,7 +501,7 @@ servers = [
   "http://api3:8080"
 ]
 
-  # 健康チェック（オプション）
+  # ヘルスチェック（オプション）
   [upstreams."api-pool".health_check]
   interval_secs = 10
   path = "/health"
@@ -674,8 +674,8 @@ landlock_write_paths = ["/var/log/veil"]
 | オプション | 説明 | デフォルト |
 |-----------|------|-----------|
 | `enable_landlock` | Landlockを有効化 | false |
-| `landlock_read_paths` | 読み取り専用パス | ["/etc", "/usr", "/lib", "/lib64"] |
-| `landlock_write_paths` | 読み書き可能パス | ["/var/log", "/tmp"] |
+| `landlock_read_paths` | 読み取り専用パス | `["/etc", "/usr", "/lib", "/lib64"]` |
+| `landlock_write_paths` | 読み書き可能パス | `["/var/log", "/tmp"]` |
 
 **対応ABIバージョン:**
 
@@ -1048,23 +1048,23 @@ http2_enabled = true  # HTTP/2を有効化（ALPN h2）
 
 ```toml
 [http2]
-# HPACK動的テーブルサイズ（デフォルト: 4096）
+# HPACK動的テーブルサイズ（デフォルト: 65536）
 header_table_size = 65536
 
-# 同時ストリーム数（デフォルト: 100）
-max_concurrent_streams = 1000
+# 同時ストリーム数（デフォルト: 256）
+max_concurrent_streams = 256
 
-# ストリームウィンドウサイズ（デフォルト: 65535）
-initial_window_size = 4194304
+# ストリームウィンドウサイズ（デフォルト: 1048576 = 1MB）
+initial_window_size = 1048576
 
-# 最大フレームサイズ（デフォルト: 16384）
+# 最大フレームサイズ（デフォルト: 65536）
 max_frame_size = 65536
 
-# 最大ヘッダーリストサイズ（デフォルト: 16384）
+# 最大ヘッダーリストサイズ（デフォルト: 65536）
 max_header_list_size = 65536
 
-# コネクションウィンドウサイズ（デフォルト: 65535）
-connection_window_size = 16777216
+# コネクションウィンドウサイズ（デフォルト: 1048576 = 1MB）
+connection_window_size = 1048576
 ```
 
 ### HTTP/1.1フォールバック
@@ -1376,7 +1376,7 @@ wrk -t4 -c100 -d30s https://localhost/
 
 ## Graceful Shutdown
 
-SIGINT（Ctrl+C）またはSIGTERMを受信すると、サーバーは優雅に終了します：
+SIGINT（Ctrl+C）またはSIGTERMを受信すると、サーバーは安全に終了します：
 
 1. 新規接続の受付を停止
 2. 既存のリクエスト処理を完了
@@ -1387,7 +1387,7 @@ SIGINT（Ctrl+C）またはSIGTERMを受信すると、サーバーは優雅に�
 # サーバー起動
 ./veil -c ./config.toml &
 
-# 優雅な終了
+# 安全に終了する
 kill -SIGTERM $!
 # または Ctrl+C
 ```
@@ -1422,7 +1422,7 @@ kill -SIGHUP $(pgrep veil)
 | ルーティング設定 | ✅ |
 | セキュリティ設定 | ✅ |
 | Upstream設定 | ✅ |
-| TLS証明書 | ✅ |
+| TLS証明書 | ❌ |
 | リッスンアドレス | ❌（再起動が必要） |
 | ワーカースレッド数 | ❌（再起動が必要） |
 
@@ -1536,7 +1536,7 @@ type = "Proxy"
 url = "http://localhost:8080"
 ```
 
-## 健康チェック（Health Check）
+## ヘルスチェック（Health Check）
 
 バックエンドサーバーの健康状態を監視し、異常なサーバーを自動的に除外します。
 
