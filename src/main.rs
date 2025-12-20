@@ -1375,6 +1375,128 @@ pub struct GlobalSecurityConfig {
     /// Landlock読み書きパス
     #[serde(default = "default_landlock_write_paths")]
     pub landlock_write_paths: Vec<String>,
+    
+    // ====================
+    // サンドボックス設定（bubblewrap相当）
+    // ====================
+    //
+    // Linuxのnamespace分離、bind mounts、capabilities制限を
+    // プログラム起動時に適用することで、bubblewrapと同等の
+    // セキュリティ分離を実現します。
+    //
+    // 適用順序:
+    // 1. サンドボックス（namespace分離、bind mounts、capabilities）
+    // 2. 権限降格（setuid/setgid）
+    // 3. Landlock（ファイルシステム制限）
+    // 4. seccomp（システムコール制限）
+    //
+    
+    /// サンドボックスを有効化
+    /// bubblewrap相当のnamespace分離、bind mounts、capabilities制限を適用
+    #[serde(default)]
+    pub enable_sandbox: bool,
+    
+    /// PID namespace分離
+    /// サンドボックス内のプロセスは外部のプロセスを見ることができなくなります
+    #[serde(default)]
+    pub sandbox_unshare_pid: bool,
+    
+    /// Mount namespace分離
+    /// サンドボックス内で独自のマウントポイントを持ちます
+    #[serde(default = "default_sandbox_unshare_mount")]
+    pub sandbox_unshare_mount: bool,
+    
+    /// UTS namespace分離
+    /// サンドボックス内で独自のホスト名を持ちます
+    #[serde(default = "default_sandbox_unshare_uts")]
+    pub sandbox_unshare_uts: bool,
+    
+    /// IPC namespace分離
+    /// サンドボックス内で独自のIPC（共有メモリ、セマフォ等）を持ちます
+    #[serde(default = "default_sandbox_unshare_ipc")]
+    pub sandbox_unshare_ipc: bool,
+    
+    /// User namespace分離
+    /// 注: 複雑なケースがあるためデフォルトは無効
+    #[serde(default)]
+    pub sandbox_unshare_user: bool,
+    
+    /// Network namespace分離
+    /// 警告: trueにするとネットワーク通信ができなくなります
+    /// サーバーでは通常false（--share-net相当）
+    #[serde(default)]
+    pub sandbox_unshare_net: bool,
+    
+    /// 読み取り専用バインドマウント
+    /// source:dest 形式で指定（例: "/usr:/usr"）
+    #[serde(default = "default_sandbox_ro_binds")]
+    pub sandbox_ro_bind_mounts: Vec<String>,
+    
+    /// 読み書きバインドマウント
+    /// source:dest 形式で指定（例: "/var/log:/var/log"）
+    #[serde(default)]
+    pub sandbox_rw_bind_mounts: Vec<String>,
+    
+    /// tmpfsマウント先
+    /// 指定されたパスにtmpfs（メモリファイルシステム）をマウント
+    #[serde(default = "default_sandbox_tmpfs")]
+    pub sandbox_tmpfs_mounts: Vec<String>,
+    
+    /// /proc をマウントするかどうか
+    #[serde(default = "default_true")]
+    pub sandbox_mount_proc: bool,
+    
+    /// /dev に最小限のデバイスノードを作成するかどうか
+    #[serde(default = "default_true")]
+    pub sandbox_mount_dev: bool,
+    
+    /// ドロップするケイパビリティのリスト
+    /// 例: ["CAP_SYS_ADMIN", "CAP_NET_RAW"]
+    #[serde(default)]
+    pub sandbox_drop_capabilities: Vec<String>,
+    
+    /// 保持するケイパビリティのリスト（他は全てドロップ）
+    /// drop_capabilitiesより優先されます
+    /// 例: ["CAP_NET_BIND_SERVICE"]
+    #[serde(default)]
+    pub sandbox_keep_capabilities: Vec<String>,
+    
+    /// サンドボックス内のホスト名
+    #[serde(default = "default_sandbox_hostname")]
+    pub sandbox_hostname: Option<String>,
+    
+    /// PR_SET_NO_NEW_PRIVSを設定するかどうか
+    #[serde(default = "default_true")]
+    pub sandbox_no_new_privs: bool,
+}
+
+fn default_sandbox_unshare_mount() -> bool { true }
+fn default_sandbox_unshare_uts() -> bool { true }
+fn default_sandbox_unshare_ipc() -> bool { true }
+fn default_true() -> bool { true }
+
+fn default_sandbox_ro_binds() -> Vec<String> {
+    vec![
+        "/usr:/usr".to_string(),
+        "/lib:/lib".to_string(),
+        "/lib64:/lib64".to_string(),
+        "/etc/ssl:/etc/ssl".to_string(),
+        "/etc/resolv.conf:/etc/resolv.conf".to_string(),
+        "/etc/hosts:/etc/hosts".to_string(),
+        "/etc/passwd:/etc/passwd".to_string(),
+        "/etc/group:/etc/group".to_string(),
+    ]
+}
+
+fn default_sandbox_tmpfs() -> Vec<String> {
+    vec![
+        "/tmp".to_string(),
+        "/run".to_string(),
+    ]
+}
+
+fn default_sandbox_hostname() -> Option<String> {
+    Some("zerocopy-sandbox".to_string())
 }
 
 fn default_seccomp_mode() -> String {
@@ -1623,6 +1745,68 @@ fn drop_privileges(security: &GlobalSecurityConfig) -> io::Result<()> {
 fn drop_privileges(_security: &GlobalSecurityConfig) -> io::Result<()> {
     warn!("Privilege dropping is only supported on Linux");
     Ok(())
+}
+
+// ====================
+// サンドボックス設定構築
+// ====================
+
+/// GlobalSecurityConfigからSandboxConfigを構築
+/// 
+/// 設定ファイルのsandbox_*フィールドをsecurity::SandboxConfigに変換します。
+fn build_sandbox_config(global_security: &GlobalSecurityConfig) -> security::SandboxConfig {
+    // 読み取り専用バインドマウントのパース
+    let ro_bind_mounts: Vec<security::BindMount> = global_security.sandbox_ro_bind_mounts
+        .iter()
+        .filter_map(|s| {
+            let parts: Vec<&str> = s.splitn(2, ':').collect();
+            if parts.len() == 2 {
+                Some(security::BindMount::new(parts[0], parts[1]))
+            } else if parts.len() == 1 && !parts[0].is_empty() {
+                // source:dest が同じ場合は source のみでも可
+                Some(security::BindMount::new(parts[0], parts[0]))
+            } else {
+                warn!("Invalid ro-bind mount format: '{}' (expected 'source:dest')", s);
+                None
+            }
+        })
+        .collect();
+    
+    // 読み書きバインドマウントのパース
+    let rw_bind_mounts: Vec<security::BindMount> = global_security.sandbox_rw_bind_mounts
+        .iter()
+        .filter_map(|s| {
+            let parts: Vec<&str> = s.splitn(2, ':').collect();
+            if parts.len() == 2 {
+                Some(security::BindMount::new(parts[0], parts[1]))
+            } else if parts.len() == 1 && !parts[0].is_empty() {
+                Some(security::BindMount::new(parts[0], parts[0]))
+            } else {
+                warn!("Invalid rw-bind mount format: '{}' (expected 'source:dest')", s);
+                None
+            }
+        })
+        .collect();
+    
+    security::SandboxConfig {
+        enabled: global_security.enable_sandbox,
+        unshare_pid: global_security.sandbox_unshare_pid,
+        unshare_mount: global_security.sandbox_unshare_mount,
+        unshare_uts: global_security.sandbox_unshare_uts,
+        unshare_ipc: global_security.sandbox_unshare_ipc,
+        unshare_user: global_security.sandbox_unshare_user,
+        unshare_net: global_security.sandbox_unshare_net,
+        new_root: None,
+        ro_bind_mounts,
+        rw_bind_mounts,
+        tmpfs_mounts: global_security.sandbox_tmpfs_mounts.clone(),
+        mount_proc: global_security.sandbox_mount_proc,
+        mount_dev: global_security.sandbox_mount_dev,
+        drop_capabilities: global_security.sandbox_drop_capabilities.clone(),
+        keep_capabilities: global_security.sandbox_keep_capabilities.clone(),
+        hostname: global_security.sandbox_hostname.clone(),
+        no_new_privs: global_security.sandbox_no_new_privs,
+    }
 }
 
 // ====================
@@ -4388,6 +4572,58 @@ fn main() {
 
     // SO_REUSEPORT振り分け設定
     let reuseport_balancing = loaded_config.reuseport_balancing;
+
+    // ====================
+    // サンドボックス適用（bubblewrap相当）
+    // ====================
+    //
+    // Linuxのnamespace分離、bind mounts、capabilities制限を適用します。
+    // 権限降格やseccomp/Landlockより先に適用します。
+    //
+    // 適用順序:
+    // 1. サンドボックス（namespace分離、bind mounts、capabilities）
+    // 2. 権限降格（setuid/setgid）
+    // 3. Landlock（ファイルシステム制限）
+    // 4. seccomp（システムコール制限）
+    // ====================
+    
+    if loaded_config.global_security.enable_sandbox {
+        // サンドボックスサポート状況をレポート
+        security::report_sandbox_support();
+        
+        // サンドボックス設定を構築
+        let sandbox_config = build_sandbox_config(&loaded_config.global_security);
+        
+        match security::apply_sandbox(&sandbox_config) {
+            Ok(()) => {
+                info!("Sandbox restrictions applied successfully");
+                if sandbox_config.unshare_mount {
+                    info!("Sandbox: Mount namespace isolated");
+                }
+                if sandbox_config.unshare_uts {
+                    info!("Sandbox: UTS namespace isolated (hostname: {})", 
+                          sandbox_config.hostname.as_deref().unwrap_or("default"));
+                }
+                if sandbox_config.unshare_ipc {
+                    info!("Sandbox: IPC namespace isolated");
+                }
+                if sandbox_config.unshare_pid {
+                    info!("Sandbox: PID namespace isolated");
+                }
+                if !sandbox_config.keep_capabilities.is_empty() {
+                    info!("Sandbox: Keeping only capabilities: {:?}", sandbox_config.keep_capabilities);
+                } else if !sandbox_config.drop_capabilities.is_empty() {
+                    info!("Sandbox: Dropped capabilities: {:?}", sandbox_config.drop_capabilities);
+                }
+            }
+            Err(e) => {
+                // サンドボックス適用失敗は警告として扱い、続行する
+                // 本番環境ではエラー扱いにすることも検討
+                warn!("Failed to apply sandbox restrictions: {} - continuing without sandbox", e);
+                warn!("Hint: Sandbox may require root privileges or CAP_SYS_ADMIN");
+            }
+        }
+    }
 
     // 権限降格（設定されている場合）
     // 注意: 特権ポート（1024未満）を使用する場合は、

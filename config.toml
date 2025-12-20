@@ -192,6 +192,137 @@ max_log_size = 104857600
 # landlock_read_paths = ["/etc/zerocopy-server", "/usr", "/lib", "/lib64"]
 # landlock_write_paths = ["/var/log/zerocopy-server"]
 
+# ============================================
+# サンドボックス設定（bubblewrap相当）
+# ============================================
+#
+# Linuxのnamespace分離、bind mounts、capabilities制限を
+# プログラム起動時に適用することで、bubblewrapと同等の
+# セキュリティ分離を実現します。
+#
+# 適用順序:
+#   1. サンドボックス（namespace分離、bind mounts、capabilities）
+#   2. 権限降格（setuid/setgid）
+#   3. Landlock（ファイルシステム制限）
+#   4. seccomp（システムコール制限）
+#
+# 注意:
+#   - rootまたはCAP_SYS_ADMINが必要です
+#   - namespace分離とLandlockの両方が使用可能です（相互補完）
+#   - sandbox_unshare_net = true にするとネットワークが使用不可になります
+#
+# ============================================
+
+# サンドボックスを有効化（デフォルト: false）
+# enable_sandbox = true
+
+# Namespace分離設定
+# -------------------
+# PID namespace分離（プロセス一覧の隔離）
+# sandbox_unshare_pid = false
+
+# Mount namespace分離（ファイルシステムの隔離）
+# デフォルト: true（サンドボックス有効時）
+# sandbox_unshare_mount = true
+
+# UTS namespace分離（ホスト名の隔離）
+# デフォルト: true（サンドボックス有効時）
+# sandbox_unshare_uts = true
+
+# IPC namespace分離（共有メモリ・セマフォの隔離）
+# デフォルト: true（サンドボックス有効時）
+# sandbox_unshare_ipc = true
+
+# User namespace分離（UID/GIDマッピングの隔離）
+# 複雑なケースがあるためデフォルト: false
+# sandbox_unshare_user = false
+
+# Network namespace分離（警告: ネットワークが使用不可になる）
+# サーバーでは通常 false
+# sandbox_unshare_net = false
+
+# バインドマウント設定
+# -------------------
+# 読み取り専用バインドマウント（source:dest 形式）
+# sandbox_ro_bind_mounts = [
+#   "/usr:/usr",
+#   "/lib:/lib",
+#   "/lib64:/lib64",
+#   "/etc/ssl:/etc/ssl",
+#   "/etc/resolv.conf:/etc/resolv.conf",
+#   "/etc/hosts:/etc/hosts",
+#   "/etc/passwd:/etc/passwd",
+#   "/etc/group:/etc/group"
+# ]
+
+# 読み書きバインドマウント（source:dest 形式）
+# 設定ファイル、ログディレクトリなどを指定
+# sandbox_rw_bind_mounts = [
+#   "/var/log/zerocopy-server:/var/log/zerocopy-server",
+#   "/etc/zerocopy-server:/etc/zerocopy-server"
+# ]
+
+# tmpfsマウント先（メモリファイルシステム）
+# sandbox_tmpfs_mounts = ["/tmp", "/run"]
+
+# /proc をマウント（デフォルト: true）
+# sandbox_mount_proc = true
+
+# /dev に最小限のデバイスノードを作成（デフォルト: true）
+# sandbox_mount_dev = true
+
+# ケイパビリティ設定
+# -------------------
+# ドロップするケイパビリティ（個別指定）
+# sandbox_drop_capabilities = ["CAP_SYS_ADMIN", "CAP_NET_RAW", "CAP_SYS_PTRACE"]
+
+# 保持するケイパビリティ（これ以外は全てドロップ、優先度高）
+# リバースプロキシ推奨設定:
+# sandbox_keep_capabilities = ["CAP_NET_BIND_SERVICE"]
+
+# その他の設定
+# -------------------
+# サンドボックス内のホスト名
+# sandbox_hostname = "zerocopy-sandbox"
+
+# PR_SET_NO_NEW_PRIVS を設定（デフォルト: true）
+# sandbox_no_new_privs = true
+
+# ============================================
+# サンドボックス + seccomp + Landlock 推奨設定例
+# ============================================
+#
+# [security]
+# # サンドボックス（namespace分離）
+# enable_sandbox = true
+# sandbox_unshare_mount = true
+# sandbox_unshare_uts = true
+# sandbox_unshare_ipc = true
+# sandbox_keep_capabilities = ["CAP_NET_BIND_SERVICE"]
+# sandbox_ro_bind_mounts = [
+#   "/usr:/usr",
+#   "/lib:/lib",
+#   "/lib64:/lib64",
+#   "/etc/ssl:/etc/ssl",
+#   "/etc/resolv.conf:/etc/resolv.conf"
+# ]
+# sandbox_rw_bind_mounts = [
+#   "/var/log/zerocopy-server:/var/log/zerocopy-server"
+# ]
+#
+# # 権限降格
+# drop_privileges_user = "www-data"
+# drop_privileges_group = "www-data"
+#
+# # Landlock（ファイルシステム制限）
+# enable_landlock = true
+# landlock_read_paths = ["/etc/zerocopy-server", "/usr", "/lib", "/lib64", "/etc/ssl"]
+# landlock_write_paths = ["/var/log/zerocopy-server"]
+#
+# # seccomp（システムコール制限）
+# enable_seccomp = true
+# seccomp_mode = "filter"
+
 
 # ==========================================
 # パフォーマンス設定

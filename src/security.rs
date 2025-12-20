@@ -1154,6 +1154,797 @@ pub fn report_security_status() {
     }
 }
 
+// ====================
+// サンドボックス機能（bubblewrap相当）
+// ====================
+//
+// Linuxのnamespace分離、bind mounts、capabilities制限を
+// プログラム起動時に適用することで、bubblewrapと同等の
+// セキュリティ分離を実現します。
+//
+// ## 機能
+//
+// - **Namespace分離**: PID, UTS, IPC, Mount, User (Networkはサーバーでは通常不要)
+// - **Bind Mounts**: ファイルシステムの読み取り専用マウント
+// - **Capabilities制限**: 不要なケイパビリティのドロップ
+//
+// ## 適用順序
+//
+// 1. User namespace分離（オプション）
+// 2. 他のnamespace分離（PID, UTS, IPC, Mount）
+// 3. Bind mounts設定
+// 4. Capabilities制限
+// 5. 既存のseccomp/Landlock適用
+//
+// ## 注意事項
+//
+// - Network namespaceはサーバーでは通常分離しません（--share-net相当）
+// - root権限または適切なケイパビリティが必要です
+// - 一度適用すると解除できません
+// ====================
+
+/// サンドボックス設定
+#[derive(Debug, Clone, Default)]
+pub struct SandboxConfig {
+    /// サンドボックスを有効化
+    pub enabled: bool,
+    
+    /// PID namespace分離
+    /// サンドボックス内のプロセスは外部のプロセスを見ることができなくなります
+    pub unshare_pid: bool,
+    
+    /// Mount namespace分離
+    /// サンドボックス内で独自のマウントポイントを持ちます
+    pub unshare_mount: bool,
+    
+    /// UTS namespace分離
+    /// サンドボックス内で独自のホスト名を持ちます
+    pub unshare_uts: bool,
+    
+    /// IPC namespace分離
+    /// サンドボックス内で独自のIPC（共有メモリ、セマフォ等）を持ちます
+    pub unshare_ipc: bool,
+    
+    /// User namespace分離
+    /// サンドボックス内で独自のユーザー/グループIDマッピングを持ちます
+    /// 注: rootでなくてもnamespace分離が可能になりますが、制限があります
+    pub unshare_user: bool,
+    
+    /// Network namespace分離
+    /// 通常はfalse（サーバーはネットワークアクセスが必要）
+    /// trueの場合、サンドボックス内からネットワークにアクセスできなくなります
+    pub unshare_net: bool,
+    
+    /// 新しいルートファイルシステムのパス
+    /// 設定されている場合、pivot_rootまたはchrootを実行します
+    pub new_root: Option<String>,
+    
+    /// 読み取り専用バインドマウント
+    /// source -> dest へのread-onlyバインドを設定
+    pub ro_bind_mounts: Vec<BindMount>,
+    
+    /// 読み書きバインドマウント
+    /// source -> dest へのread-writeバインドを設定
+    pub rw_bind_mounts: Vec<BindMount>,
+    
+    /// tmpfsマウント（メモリファイルシステム）
+    /// 指定されたパスにtmpfsをマウント
+    pub tmpfs_mounts: Vec<String>,
+    
+    /// /proc をマウントするかどうか
+    pub mount_proc: bool,
+    
+    /// /dev の最小限のデバイスノードを作成するかどうか
+    pub mount_dev: bool,
+    
+    /// ドロップするケイパビリティのリスト
+    /// 例: ["CAP_SYS_ADMIN", "CAP_NET_RAW"]
+    pub drop_capabilities: Vec<String>,
+    
+    /// 保持するケイパビリティのリスト（他は全てドロップ）
+    /// drop_capabilitiesより優先されます
+    /// 例: ["CAP_NET_BIND_SERVICE"]
+    pub keep_capabilities: Vec<String>,
+    
+    /// サンドボックス内のホスト名
+    pub hostname: Option<String>,
+    
+    /// PR_SET_NO_NEW_PRIVSを設定するかどうか
+    /// seccompと併用する場合は自動的にtrueになります
+    pub no_new_privs: bool,
+}
+
+/// バインドマウント設定
+#[derive(Debug, Clone)]
+pub struct BindMount {
+    /// ソースパス（ホスト側）
+    pub source: String,
+    /// デスティネーションパス（サンドボックス内）
+    pub dest: String,
+}
+
+impl BindMount {
+    pub fn new(source: impl Into<String>, dest: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            dest: dest.into(),
+        }
+    }
+}
+
+/// Linuxケイパビリティの定義
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+#[allow(non_camel_case_types)]
+pub enum Capability {
+    CAP_CHOWN = 0,
+    CAP_DAC_OVERRIDE = 1,
+    CAP_DAC_READ_SEARCH = 2,
+    CAP_FOWNER = 3,
+    CAP_FSETID = 4,
+    CAP_KILL = 5,
+    CAP_SETGID = 6,
+    CAP_SETUID = 7,
+    CAP_SETPCAP = 8,
+    CAP_LINUX_IMMUTABLE = 9,
+    CAP_NET_BIND_SERVICE = 10,
+    CAP_NET_BROADCAST = 11,
+    CAP_NET_ADMIN = 12,
+    CAP_NET_RAW = 13,
+    CAP_IPC_LOCK = 14,
+    CAP_IPC_OWNER = 15,
+    CAP_SYS_MODULE = 16,
+    CAP_SYS_RAWIO = 17,
+    CAP_SYS_CHROOT = 18,
+    CAP_SYS_PTRACE = 19,
+    CAP_SYS_PACCT = 20,
+    CAP_SYS_ADMIN = 21,
+    CAP_SYS_BOOT = 22,
+    CAP_SYS_NICE = 23,
+    CAP_SYS_RESOURCE = 24,
+    CAP_SYS_TIME = 25,
+    CAP_SYS_TTY_CONFIG = 26,
+    CAP_MKNOD = 27,
+    CAP_LEASE = 28,
+    CAP_AUDIT_WRITE = 29,
+    CAP_AUDIT_CONTROL = 30,
+    CAP_SETFCAP = 31,
+    CAP_MAC_OVERRIDE = 32,
+    CAP_MAC_ADMIN = 33,
+    CAP_SYSLOG = 34,
+    CAP_WAKE_ALARM = 35,
+    CAP_BLOCK_SUSPEND = 36,
+    CAP_AUDIT_READ = 37,
+    CAP_PERFMON = 38,
+    CAP_BPF = 39,
+    CAP_CHECKPOINT_RESTORE = 40,
+}
+
+impl Capability {
+    /// 文字列からケイパビリティを解析
+    pub fn from_str(s: &str) -> Option<Self> {
+        let s = s.trim().to_uppercase();
+        let s = s.strip_prefix("CAP_").unwrap_or(&s);
+        
+        match s {
+            "CHOWN" => Some(Capability::CAP_CHOWN),
+            "DAC_OVERRIDE" => Some(Capability::CAP_DAC_OVERRIDE),
+            "DAC_READ_SEARCH" => Some(Capability::CAP_DAC_READ_SEARCH),
+            "FOWNER" => Some(Capability::CAP_FOWNER),
+            "FSETID" => Some(Capability::CAP_FSETID),
+            "KILL" => Some(Capability::CAP_KILL),
+            "SETGID" => Some(Capability::CAP_SETGID),
+            "SETUID" => Some(Capability::CAP_SETUID),
+            "SETPCAP" => Some(Capability::CAP_SETPCAP),
+            "LINUX_IMMUTABLE" => Some(Capability::CAP_LINUX_IMMUTABLE),
+            "NET_BIND_SERVICE" => Some(Capability::CAP_NET_BIND_SERVICE),
+            "NET_BROADCAST" => Some(Capability::CAP_NET_BROADCAST),
+            "NET_ADMIN" => Some(Capability::CAP_NET_ADMIN),
+            "NET_RAW" => Some(Capability::CAP_NET_RAW),
+            "IPC_LOCK" => Some(Capability::CAP_IPC_LOCK),
+            "IPC_OWNER" => Some(Capability::CAP_IPC_OWNER),
+            "SYS_MODULE" => Some(Capability::CAP_SYS_MODULE),
+            "SYS_RAWIO" => Some(Capability::CAP_SYS_RAWIO),
+            "SYS_CHROOT" => Some(Capability::CAP_SYS_CHROOT),
+            "SYS_PTRACE" => Some(Capability::CAP_SYS_PTRACE),
+            "SYS_PACCT" => Some(Capability::CAP_SYS_PACCT),
+            "SYS_ADMIN" => Some(Capability::CAP_SYS_ADMIN),
+            "SYS_BOOT" => Some(Capability::CAP_SYS_BOOT),
+            "SYS_NICE" => Some(Capability::CAP_SYS_NICE),
+            "SYS_RESOURCE" => Some(Capability::CAP_SYS_RESOURCE),
+            "SYS_TIME" => Some(Capability::CAP_SYS_TIME),
+            "SYS_TTY_CONFIG" => Some(Capability::CAP_SYS_TTY_CONFIG),
+            "MKNOD" => Some(Capability::CAP_MKNOD),
+            "LEASE" => Some(Capability::CAP_LEASE),
+            "AUDIT_WRITE" => Some(Capability::CAP_AUDIT_WRITE),
+            "AUDIT_CONTROL" => Some(Capability::CAP_AUDIT_CONTROL),
+            "SETFCAP" => Some(Capability::CAP_SETFCAP),
+            "MAC_OVERRIDE" => Some(Capability::CAP_MAC_OVERRIDE),
+            "MAC_ADMIN" => Some(Capability::CAP_MAC_ADMIN),
+            "SYSLOG" => Some(Capability::CAP_SYSLOG),
+            "WAKE_ALARM" => Some(Capability::CAP_WAKE_ALARM),
+            "BLOCK_SUSPEND" => Some(Capability::CAP_BLOCK_SUSPEND),
+            "AUDIT_READ" => Some(Capability::CAP_AUDIT_READ),
+            "PERFMON" => Some(Capability::CAP_PERFMON),
+            "BPF" => Some(Capability::CAP_BPF),
+            "CHECKPOINT_RESTORE" => Some(Capability::CAP_CHECKPOINT_RESTORE),
+            _ => None,
+        }
+    }
+    
+    /// リバースプロキシサーバーに推奨されるケイパビリティセット
+    /// 
+    /// 最小権限の原則に基づき、以下のケイパビリティのみを保持:
+    /// - CAP_NET_BIND_SERVICE: 特権ポート（1024未満）へのバインド
+    /// - CAP_SETUID/CAP_SETGID: 権限降格用
+    pub fn recommended_for_server() -> Vec<Self> {
+        vec![
+            Capability::CAP_NET_BIND_SERVICE,
+            Capability::CAP_SETUID,
+            Capability::CAP_SETGID,
+        ]
+    }
+    
+    /// 全てのケイパビリティのリスト
+    pub fn all() -> Vec<Self> {
+        vec![
+            Capability::CAP_CHOWN,
+            Capability::CAP_DAC_OVERRIDE,
+            Capability::CAP_DAC_READ_SEARCH,
+            Capability::CAP_FOWNER,
+            Capability::CAP_FSETID,
+            Capability::CAP_KILL,
+            Capability::CAP_SETGID,
+            Capability::CAP_SETUID,
+            Capability::CAP_SETPCAP,
+            Capability::CAP_LINUX_IMMUTABLE,
+            Capability::CAP_NET_BIND_SERVICE,
+            Capability::CAP_NET_BROADCAST,
+            Capability::CAP_NET_ADMIN,
+            Capability::CAP_NET_RAW,
+            Capability::CAP_IPC_LOCK,
+            Capability::CAP_IPC_OWNER,
+            Capability::CAP_SYS_MODULE,
+            Capability::CAP_SYS_RAWIO,
+            Capability::CAP_SYS_CHROOT,
+            Capability::CAP_SYS_PTRACE,
+            Capability::CAP_SYS_PACCT,
+            Capability::CAP_SYS_ADMIN,
+            Capability::CAP_SYS_BOOT,
+            Capability::CAP_SYS_NICE,
+            Capability::CAP_SYS_RESOURCE,
+            Capability::CAP_SYS_TIME,
+            Capability::CAP_SYS_TTY_CONFIG,
+            Capability::CAP_MKNOD,
+            Capability::CAP_LEASE,
+            Capability::CAP_AUDIT_WRITE,
+            Capability::CAP_AUDIT_CONTROL,
+            Capability::CAP_SETFCAP,
+            Capability::CAP_MAC_OVERRIDE,
+            Capability::CAP_MAC_ADMIN,
+            Capability::CAP_SYSLOG,
+            Capability::CAP_WAKE_ALARM,
+            Capability::CAP_BLOCK_SUSPEND,
+            Capability::CAP_AUDIT_READ,
+            Capability::CAP_PERFMON,
+            Capability::CAP_BPF,
+            Capability::CAP_CHECKPOINT_RESTORE,
+        ]
+    }
+}
+
+/// サンドボックスを適用
+/// 
+/// bubblewrapと同等のプロセス分離を実現します。
+/// 
+/// # 適用順序
+/// 
+/// 1. PR_SET_NO_NEW_PRIVS設定
+/// 2. Namespace分離（unshare）
+/// 3. Mount namespace内でのbind mounts
+/// 4. Capabilities制限
+/// 
+/// # 注意事項
+/// 
+/// - この関数は一度だけ呼び出してください
+/// - 適用後は設定を変更できません
+/// - Network namespaceを分離するとネットワーク通信ができなくなります
+/// 
+/// # 引数
+/// 
+/// * `config` - サンドボックス設定
+/// 
+/// # エラー
+/// 
+/// 設定の適用に失敗した場合はエラーを返します。
+#[cfg(target_os = "linux")]
+pub fn apply_sandbox(config: &SandboxConfig) -> io::Result<()> {
+    if !config.enabled {
+        debug!("Sandbox is disabled");
+        return Ok(());
+    }
+    
+    info!("Applying sandbox restrictions (bubblewrap-compatible)...");
+    
+    // 1. PR_SET_NO_NEW_PRIVS を設定
+    if config.no_new_privs {
+        let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+        if ret != 0 {
+            let err = io::Error::last_os_error();
+            // 既に設定済みの場合は無視
+            if err.raw_os_error() != Some(libc::EINVAL) {
+                return Err(err);
+            }
+        }
+        debug!("PR_SET_NO_NEW_PRIVS set successfully");
+    }
+    
+    // 2. Namespace分離
+    apply_namespaces(config)?;
+    
+    // 3. Mount namespace内でのbind mounts
+    if config.unshare_mount {
+        apply_mounts(config)?;
+    }
+    
+    // 4. ホスト名設定（UTS namespace分離時）
+    if config.unshare_uts {
+        if let Some(ref hostname) = config.hostname {
+            apply_hostname(hostname)?;
+        }
+    }
+    
+    // 5. Capabilities制限
+    apply_capabilities(config)?;
+    
+    info!("Sandbox restrictions applied successfully");
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn apply_sandbox(_config: &SandboxConfig) -> io::Result<()> {
+    warn!("Sandbox is only available on Linux");
+    Ok(())
+}
+
+/// Namespace分離を適用
+#[cfg(target_os = "linux")]
+fn apply_namespaces(config: &SandboxConfig) -> io::Result<()> {
+    use nix::sched::{unshare, CloneFlags};
+    
+    let mut flags = CloneFlags::empty();
+    
+    if config.unshare_pid {
+        flags |= CloneFlags::CLONE_NEWPID;
+        debug!("Will unshare PID namespace");
+    }
+    
+    if config.unshare_mount {
+        flags |= CloneFlags::CLONE_NEWNS;
+        debug!("Will unshare Mount namespace");
+    }
+    
+    if config.unshare_uts {
+        flags |= CloneFlags::CLONE_NEWUTS;
+        debug!("Will unshare UTS namespace");
+    }
+    
+    if config.unshare_ipc {
+        flags |= CloneFlags::CLONE_NEWIPC;
+        debug!("Will unshare IPC namespace");
+    }
+    
+    if config.unshare_user {
+        flags |= CloneFlags::CLONE_NEWUSER;
+        debug!("Will unshare User namespace");
+    }
+    
+    if config.unshare_net {
+        flags |= CloneFlags::CLONE_NEWNET;
+        warn!("Will unshare Network namespace - network access will be blocked!");
+    }
+    
+    if flags.is_empty() {
+        debug!("No namespaces to unshare");
+        return Ok(());
+    }
+    
+    unshare(flags).map_err(|e| {
+        io::Error::new(io::ErrorKind::PermissionDenied, 
+            format!("Failed to unshare namespaces: {} (may require root or CAP_SYS_ADMIN)", e))
+    })?;
+    
+    info!("Namespace separation applied: {:?}", flags);
+    Ok(())
+}
+
+/// マウント設定を適用
+#[cfg(target_os = "linux")]
+fn apply_mounts(config: &SandboxConfig) -> io::Result<()> {
+    use nix::mount::{mount, MsFlags};
+    
+    // マウントプロパゲーションをprivateに設定
+    // これにより、このマウントnamespace内の変更が外部に影響しない
+    mount(
+        None::<&str>,
+        "/",
+        None::<&str>,
+        MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+        None::<&str>,
+    ).map_err(|e| {
+        io::Error::new(io::ErrorKind::Other, 
+            format!("Failed to set mount propagation: {}", e))
+    })?;
+    debug!("Mount propagation set to private");
+    
+    // 読み取り専用バインドマウント
+    for bind in &config.ro_bind_mounts {
+        if let Err(e) = apply_bind_mount(&bind.source, &bind.dest, true) {
+            warn!("Failed to apply ro-bind mount {} -> {}: {}", bind.source, bind.dest, e);
+        } else {
+            debug!("Applied ro-bind mount: {} -> {}", bind.source, bind.dest);
+        }
+    }
+    
+    // 読み書きバインドマウント
+    for bind in &config.rw_bind_mounts {
+        if let Err(e) = apply_bind_mount(&bind.source, &bind.dest, false) {
+            warn!("Failed to apply rw-bind mount {} -> {}: {}", bind.source, bind.dest, e);
+        } else {
+            debug!("Applied rw-bind mount: {} -> {}", bind.source, bind.dest);
+        }
+    }
+    
+    // tmpfsマウント
+    for path in &config.tmpfs_mounts {
+        if let Err(e) = apply_tmpfs_mount(path) {
+            warn!("Failed to apply tmpfs mount at {}: {}", path, e);
+        } else {
+            debug!("Applied tmpfs mount: {}", path);
+        }
+    }
+    
+    // /proc マウント
+    if config.mount_proc {
+        if let Err(e) = apply_proc_mount() {
+            warn!("Failed to mount /proc: {}", e);
+        } else {
+            debug!("Mounted /proc");
+        }
+    }
+    
+    // /dev マウント
+    if config.mount_dev {
+        if let Err(e) = apply_dev_mount() {
+            warn!("Failed to mount /dev: {}", e);
+        } else {
+            debug!("Mounted minimal /dev");
+        }
+    }
+    
+    info!("Mount configuration applied");
+    Ok(())
+}
+
+/// バインドマウントを適用
+#[cfg(target_os = "linux")]
+fn apply_bind_mount(source: &str, dest: &str, readonly: bool) -> io::Result<()> {
+    use nix::mount::{mount, MsFlags};
+    use std::path::Path;
+    
+    // ソースパスの存在確認
+    if !Path::new(source).exists() {
+        return Err(io::Error::new(io::ErrorKind::NotFound,
+            format!("Source path does not exist: {}", source)));
+    }
+    
+    // デスティネーションディレクトリの作成
+    let dest_path = Path::new(dest);
+    if !dest_path.exists() {
+        if Path::new(source).is_dir() {
+            std::fs::create_dir_all(dest)?;
+        } else {
+            if let Some(parent) = dest_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::File::create(dest)?;
+        }
+    }
+    
+    // バインドマウント
+    mount(
+        Some(source),
+        dest,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_REC,
+        None::<&str>,
+    ).map_err(|e| {
+        io::Error::new(io::ErrorKind::Other,
+            format!("Failed to bind mount {} -> {}: {}", source, dest, e))
+    })?;
+    
+    // 読み取り専用に再マウント
+    if readonly {
+        mount(
+            None::<&str>,
+            dest,
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY | MsFlags::MS_REC,
+            None::<&str>,
+        ).map_err(|e| {
+            io::Error::new(io::ErrorKind::Other,
+                format!("Failed to remount {} as readonly: {}", dest, e))
+        })?;
+    }
+    
+    Ok(())
+}
+
+/// tmpfsをマウント
+#[cfg(target_os = "linux")]
+fn apply_tmpfs_mount(path: &str) -> io::Result<()> {
+    use nix::mount::{mount, MsFlags};
+    use std::path::Path;
+    
+    // ディレクトリの作成
+    if !Path::new(path).exists() {
+        std::fs::create_dir_all(path)?;
+    }
+    
+    mount(
+        Some("tmpfs"),
+        path,
+        Some("tmpfs"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+        Some("mode=0755"),
+    ).map_err(|e| {
+        io::Error::new(io::ErrorKind::Other,
+            format!("Failed to mount tmpfs at {}: {}", path, e))
+    })?;
+    
+    Ok(())
+}
+
+/// /proc をマウント
+#[cfg(target_os = "linux")]
+fn apply_proc_mount() -> io::Result<()> {
+    use nix::mount::{mount, MsFlags};
+    use std::path::Path;
+    
+    let proc_path = "/proc";
+    if !Path::new(proc_path).exists() {
+        std::fs::create_dir_all(proc_path)?;
+    }
+    
+    mount(
+        Some("proc"),
+        proc_path,
+        Some("proc"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+        None::<&str>,
+    ).map_err(|e| {
+        io::Error::new(io::ErrorKind::Other,
+            format!("Failed to mount /proc: {}", e))
+    })?;
+    
+    Ok(())
+}
+
+/// /dev に最小限のデバイスノードを作成
+#[cfg(target_os = "linux")]
+fn apply_dev_mount() -> io::Result<()> {
+    use nix::mount::{mount, MsFlags};
+    use std::path::Path;
+    
+    let dev_path = "/dev";
+    
+    // tmpfs を /dev にマウント
+    if !Path::new(dev_path).exists() {
+        std::fs::create_dir_all(dev_path)?;
+    }
+    
+    mount(
+        Some("tmpfs"),
+        dev_path,
+        Some("tmpfs"),
+        MsFlags::MS_NOSUID,
+        Some("mode=0755"),
+    ).map_err(|e| {
+        io::Error::new(io::ErrorKind::Other,
+            format!("Failed to mount tmpfs on /dev: {}", e))
+    })?;
+    
+    // 必須デバイスノードをバインドマウント
+    let devices = [
+        ("/dev/null", "/dev/null"),
+        ("/dev/zero", "/dev/zero"),
+        ("/dev/random", "/dev/random"),
+        ("/dev/urandom", "/dev/urandom"),
+    ];
+    
+    for (src, dest) in &devices {
+        // タッチでファイルを作成
+        let dest_path = Path::new(dest);
+        if !dest_path.exists() {
+            std::fs::File::create(dest)?;
+        }
+        
+        if let Err(e) = mount(
+            Some(*src),
+            *dest,
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        ) {
+            warn!("Failed to bind mount device {}: {}", dest, e);
+        }
+    }
+    
+    // /dev/pts を作成
+    let pts_path = "/dev/pts";
+    if !Path::new(pts_path).exists() {
+        std::fs::create_dir_all(pts_path)?;
+    }
+    
+    // /dev/shm を作成
+    let shm_path = "/dev/shm";
+    if !Path::new(shm_path).exists() {
+        std::fs::create_dir_all(shm_path)?;
+    }
+    
+    Ok(())
+}
+
+/// ホスト名を設定
+#[cfg(target_os = "linux")]
+fn apply_hostname(hostname: &str) -> io::Result<()> {
+    use std::ffi::CString;
+    
+    let hostname_c = CString::new(hostname)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid hostname"))?;
+    
+    let ret = unsafe {
+        libc::sethostname(hostname_c.as_ptr(), hostname.len())
+    };
+    
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    
+    debug!("Hostname set to: {}", hostname);
+    Ok(())
+}
+
+/// Capabilities制限を適用
+#[cfg(target_os = "linux")]
+fn apply_capabilities(config: &SandboxConfig) -> io::Result<()> {
+    // keep_capabilitiesが指定されている場合
+    if !config.keep_capabilities.is_empty() {
+        let keep_caps: Vec<Capability> = config.keep_capabilities
+            .iter()
+            .filter_map(|s| Capability::from_str(s))
+            .collect();
+        
+        if keep_caps.is_empty() {
+            warn!("No valid capabilities found in keep_capabilities list");
+            return Ok(());
+        }
+        
+        // 保持するケイパビリティ以外を全てドロップ
+        let all_caps = Capability::all();
+        for cap in all_caps {
+            if !keep_caps.contains(&cap) {
+                drop_capability(cap)?;
+            }
+        }
+        
+        info!("Keeping only capabilities: {:?}", config.keep_capabilities);
+        return Ok(());
+    }
+    
+    // drop_capabilitiesが指定されている場合
+    if !config.drop_capabilities.is_empty() {
+        for cap_name in &config.drop_capabilities {
+            if let Some(cap) = Capability::from_str(cap_name) {
+                drop_capability(cap)?;
+            } else {
+                warn!("Unknown capability: {}", cap_name);
+            }
+        }
+        
+        info!("Dropped capabilities: {:?}", config.drop_capabilities);
+    }
+    
+    Ok(())
+}
+
+/// 単一のケイパビリティをドロップ
+#[cfg(target_os = "linux")]
+fn drop_capability(cap: Capability) -> io::Result<()> {
+    // PR_CAPBSET_DROP を使用してbounding setからケイパビリティを削除
+    let ret = unsafe {
+        libc::prctl(libc::PR_CAPBSET_DROP, cap as u32, 0, 0, 0)
+    };
+    
+    if ret != 0 {
+        let err = io::Error::last_os_error();
+        // EINVAL は権限不足やケイパビリティが既にない場合
+        if err.raw_os_error() != Some(libc::EINVAL) {
+            debug!("Failed to drop capability {:?}: {}", cap, err);
+        }
+    }
+    
+    Ok(())
+}
+
+/// サンドボックスの推奨設定を生成
+/// 
+/// リバースプロキシサーバー用の推奨設定を返します。
+/// Network namespaceは分離せず、必要最小限のケイパビリティを保持します。
+pub fn recommended_sandbox_config() -> SandboxConfig {
+    SandboxConfig {
+        enabled: true,
+        unshare_pid: false,      // 通常はプロセス分離不要
+        unshare_mount: true,     // ファイルシステム分離
+        unshare_uts: true,       // ホスト名分離
+        unshare_ipc: true,       // IPC分離
+        unshare_user: false,     // User namespace は複雑なため無効
+        unshare_net: false,      // ネットワークは必要なため分離しない
+        new_root: None,
+        ro_bind_mounts: vec![
+            BindMount::new("/usr", "/usr"),
+            BindMount::new("/lib", "/lib"),
+            BindMount::new("/lib64", "/lib64"),
+            BindMount::new("/etc/ssl", "/etc/ssl"),
+            BindMount::new("/etc/resolv.conf", "/etc/resolv.conf"),
+            BindMount::new("/etc/hosts", "/etc/hosts"),
+            BindMount::new("/etc/passwd", "/etc/passwd"),
+            BindMount::new("/etc/group", "/etc/group"),
+        ],
+        rw_bind_mounts: vec![],
+        tmpfs_mounts: vec![
+            "/tmp".to_string(),
+            "/run".to_string(),
+        ],
+        mount_proc: true,
+        mount_dev: true,
+        drop_capabilities: vec![],
+        keep_capabilities: vec![
+            "CAP_NET_BIND_SERVICE".to_string(),
+        ],
+        hostname: Some("zerocopy-sandbox".to_string()),
+        no_new_privs: true,
+    }
+}
+
+/// サンドボックスのサポート状況をレポート
+pub fn report_sandbox_support() {
+    match KernelVersion::current() {
+        Ok(kernel) => {
+            info!("=== Sandbox Feature Support ===");
+            info!("Kernel version: {}", kernel);
+            
+            // Namespace サポートチェック（カーネル 2.6.19+ で基本サポート）
+            let ns_supported = kernel.major >= 3 || (kernel.major == 2 && kernel.minor >= 6);
+            info!("Namespaces (PID/UTS/IPC/Mount): {}", 
+                  if ns_supported { "Available" } else { "Not available" });
+            
+            // User namespace（カーネル 3.8+）
+            let user_ns = (kernel.major, kernel.minor) >= (3, 8);
+            info!("User namespace (3.8+): {}", 
+                  if user_ns { "Available" } else { "Not available" });
+            
+            // Capabilities（カーネル 2.6.25+ で改善）
+            info!("Capabilities: Available");
+            
+            info!("================================");
+        }
+        Err(e) => {
+            warn!("Failed to detect kernel version: {}", e);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

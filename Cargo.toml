@@ -92,4 +92,7 @@ ring = "0.17"
 # nix: Unix システムコール用のRustラッパー
 # - uname() でカーネルバージョン取得
 # - セキュリティモジュールで使用
-nix = { version = "0.29", features = ["uio", "process", "feature"] }
+# - sched: namespace分離 (unshare)
+# - mount: バインドマウント
+# - hostname: ホスト名設定
+nix = { version = "0.29", features = ["uio", "process", "feature", "sched", "mount", "hostname"] }
