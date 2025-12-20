@@ -404,7 +404,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     215, // munmap
     222, // mmap
     226, // mprotect
-    228, // mremap
+    227, // mremap
     233, // madvise
     228, // mlock
     229, // munlock
