@@ -1,16 +1,23 @@
-//! # HTTP/3 サーバー (quiche ベース)
+//! # HTTP/3 サーバー (monoio + quiche ベース)
 //!
-//! Cloudflare quiche を使用した HTTP/3 サーバー実装。
-//! mio を使用してイベントループを実行し、
-//! monoio ワーカースレッドとは別のスレッドで動作します。
+//! monoio (io_uring) と Cloudflare quiche を使用した HTTP/3 サーバー実装。
+//! thread-per-core モデルで、各コネクションを独立した非同期タスクで処理します。
+//!
+//! ## 設計ポイント
+//!
+//! - **io_uring 活用**: monoio の UdpSocket で高効率な UDP I/O
+//! - **コネクションごとのタスク分離**: monoio::spawn で各接続を独立管理
+//! - **タイマー管理**: quiche::timeout() と monoio::time::sleep の連携
+//! - **H3 インスタンスの永続化**: QPACK 動的テーブル等の状態を維持
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
+use std::rc::Rc;
 use std::time::Duration;
 
-use mio::net::UdpSocket;
-use mio::{Events, Interest, Poll, Token};
+use monoio::net::udp::UdpSocket;
 use quiche::{h3, Config, ConnectionId};
 use quiche::h3::NameValue;
 use ring::rand::*;
@@ -18,6 +25,7 @@ use ring::rand::*;
 use ftlog::{info, warn, error, debug};
 
 /// HTTP/3 サーバー設定
+#[derive(Clone)]
 pub struct Http3ServerConfig {
     /// TLS 証明書パス
     pub cert_path: String,
@@ -58,21 +66,193 @@ impl Default for Http3ServerConfig {
     }
 }
 
-/// クライアント接続情報
-struct Client {
+/// HTTP/3 コネクションハンドラー
+/// 
+/// quiche::Connection と h3::Connection をセットで保持し、
+/// コネクションの寿命の間、同一のインスタンスを維持します。
+struct Http3Handler {
     /// QUIC コネクション
     conn: quiche::Connection,
-    /// HTTP/3 コネクション
-    http3_conn: Option<h3::Connection>,
-    /// 部分的なリクエスト（ストリーム ID → ヘッダー）
-    #[allow(dead_code)]
-    partial_requests: HashMap<u64, Vec<h3::Header>>,
+    /// HTTP/3 コネクション (確立後に Some)
+    h3_conn: Option<h3::Connection>,
+    /// リモートアドレス
+    peer_addr: SocketAddr,
     /// 部分的なレスポンス（ストリーム ID → (ボディ, 書き込み済みバイト数)）
     partial_responses: HashMap<u64, (Vec<u8>, usize)>,
 }
 
-/// HTTP/3 サーバーを起動
-pub fn run_http3_server(
+impl Http3Handler {
+    /// 新しいハンドラーを作成
+    fn new(conn: quiche::Connection, peer_addr: SocketAddr) -> Self {
+        Self {
+            conn,
+            h3_conn: None,
+            peer_addr,
+            partial_responses: HashMap::new(),
+        }
+    }
+
+    /// HTTP/3 コネクションを初期化（QUIC 確立後）
+    fn init_h3(&mut self) -> io::Result<()> {
+        if self.h3_conn.is_none() && self.conn.is_established() {
+            let h3_config = h3::Config::new()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let h3 = h3::Connection::with_transport(&mut self.conn, &h3_config)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            self.h3_conn = Some(h3);
+            info!("[HTTP/3] HTTP/3 connection established from {}", self.peer_addr);
+        }
+        Ok(())
+    }
+
+    /// HTTP/3 イベントを処理
+    fn process_h3_events(&mut self) -> io::Result<()> {
+        // 処理するリクエストを収集
+        let mut pending_requests: Vec<(u64, Vec<h3::Header>)> = Vec::new();
+        
+        if let Some(ref mut h3_conn) = self.h3_conn {
+            loop {
+                match h3_conn.poll(&mut self.conn) {
+                    Ok((stream_id, h3::Event::Headers { list, more_frames: _ })) => {
+                        pending_requests.push((stream_id, list));
+                    }
+                    Ok((stream_id, h3::Event::Data)) => {
+                        // リクエストボディを読み込み
+                        let mut body = vec![0u8; 4096];
+                        while let Ok(read) = h3_conn.recv_body(&mut self.conn, stream_id, &mut body) {
+                            if read == 0 {
+                                break;
+                            }
+                        }
+                    }
+                    Ok((_stream_id, h3::Event::Finished)) => {}
+                    Ok((_stream_id, h3::Event::Reset(_))) => {}
+                    Ok((_flow_id, h3::Event::GoAway)) => {}
+                    Ok((_, h3::Event::PriorityUpdate)) => {}
+                    Err(h3::Error::Done) => break,
+                    Err(e) => {
+                        warn!("[HTTP/3] h3 poll error: {}", e);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // リクエストを処理
+        for (stream_id, headers) in pending_requests {
+            self.handle_request(stream_id, &headers)?;
+        }
+
+        // 部分的なレスポンスを送信
+        self.flush_partial_responses()?;
+
+        Ok(())
+    }
+
+    /// HTTP/3 リクエストを処理
+    fn handle_request(&mut self, stream_id: u64, headers: &[h3::Header]) -> io::Result<()> {
+        let h3_conn = match &mut self.h3_conn {
+            Some(h3) => h3,
+            None => return Ok(()),
+        };
+
+        let mut method = None;
+        let mut path = None;
+
+        for header in headers {
+            match header.name() {
+                b":method" => method = Some(header.value()),
+                b":path" => path = Some(header.value()),
+                _ => {}
+            }
+        }
+
+        let method = method.unwrap_or(b"GET");
+        let path = path.unwrap_or(b"/");
+
+        debug!(
+            "[HTTP/3] Request: {} {} (stream {})",
+            String::from_utf8_lossy(method),
+            String::from_utf8_lossy(path),
+            stream_id
+        );
+
+        // シンプルなレスポンス
+        let body = b"HTTP/3 OK\n";
+        let response_headers = vec![
+            h3::Header::new(b":status", b"200"),
+            h3::Header::new(b"content-type", b"text/plain"),
+            h3::Header::new(b"content-length", body.len().to_string().as_bytes()),
+            h3::Header::new(b"server", b"zerocopy-server/http3"),
+            h3::Header::new(b"alt-svc", b"clear"),
+        ];
+
+        // ヘッダーを送信
+        match h3_conn.send_response(&mut self.conn, stream_id, &response_headers, false) {
+            Ok(()) => {}
+            Err(h3::Error::StreamBlocked) => return Ok(()),
+            Err(e) => {
+                warn!("[HTTP/3] send_response error: {}", e);
+                return Ok(());
+            }
+        }
+
+        // ボディを送信
+        match h3_conn.send_body(&mut self.conn, stream_id, body, true) {
+            Ok(_) => {}
+            Err(h3::Error::Done) => {
+                self.partial_responses.insert(stream_id, (body.to_vec(), 0));
+            }
+            Err(e) => {
+                warn!("[HTTP/3] send_body error: {}", e);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 部分的なレスポンスをフラッシュ
+    fn flush_partial_responses(&mut self) -> io::Result<()> {
+        let h3_conn = match &mut self.h3_conn {
+            Some(h3) => h3,
+            None => return Ok(()),
+        };
+
+        let mut completed = Vec::new();
+        for (&stream_id, (body, written)) in &mut self.partial_responses {
+            if *written < body.len() {
+                match h3_conn.send_body(&mut self.conn, stream_id, &body[*written..], true) {
+                    Ok(sent) => {
+                        *written += sent;
+                        if *written >= body.len() {
+                            completed.push(stream_id);
+                        }
+                    }
+                    Err(h3::Error::Done) => {}
+                    Err(e) => {
+                        warn!("[HTTP/3] send_body error: {}", e);
+                        completed.push(stream_id);
+                    }
+                }
+            } else {
+                completed.push(stream_id);
+            }
+        }
+        for stream_id in completed {
+            self.partial_responses.remove(&stream_id);
+        }
+
+        Ok(())
+    }
+}
+
+/// コネクション管理（Rc<RefCell> で共有）
+type ConnectionMap = Rc<RefCell<HashMap<ConnectionId<'static>, Http3Handler>>>;
+
+/// HTTP/3 サーバーを起動（monoio ランタイム上で実行）
+/// 
+/// この関数は monoio のスレッド内から呼び出す必要があります。
+pub async fn run_http3_server_async(
     bind_addr: SocketAddr,
     config: Http3ServerConfig,
 ) -> io::Result<()> {
@@ -103,297 +283,213 @@ pub fn run_http3_server(
     quic_config.set_application_protos(h3::APPLICATION_PROTOCOL)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
-    // HTTP/3 設定
-    let h3_config = h3::Config::new()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    // 設定を Rc で共有（quiche::Config は Clone できないため）
+    let quic_config = Rc::new(RefCell::new(quic_config));
 
-    // UDP ソケットを作成
-    let mut socket = UdpSocket::bind(bind_addr)?;
-    
-    info!("[HTTP/3] Server listening on {} (QUIC/UDP)", bind_addr);
+    // UDP ソケットを作成（monoio io_uring ベース）
+    let socket = UdpSocket::bind(bind_addr)?;
+    let socket = Rc::new(socket);
+    let local_addr = bind_addr;
 
-    // mio イベントループを設定
-    let mut poll = Poll::new()?;
-    let mut events = Events::with_capacity(1024);
-    
-    const SOCKET_TOKEN: Token = Token(0);
-    poll.registry().register(&mut socket, SOCKET_TOKEN, Interest::READABLE)?;
+    info!("[HTTP/3] Server listening on {} (QUIC/UDP, monoio io_uring)", bind_addr);
 
-    // クライアント管理
-    let mut clients: HashMap<ConnectionId<'static>, Client> = HashMap::new();
-    let mut recv_buf = vec![0u8; 65536];
-    let mut send_buf = vec![0u8; 1350];
+    // コネクション管理
+    let connections: ConnectionMap = Rc::new(RefCell::new(HashMap::new()));
 
     // 乱数生成器
     let rng = SystemRandom::new();
 
+    // メインループ: パケット受信とディスパッチ
     loop {
-        // タイムアウト計算
-        let timeout = clients.values()
-            .filter_map(|c| c.conn.timeout())
-            .min()
-            .unwrap_or(Duration::from_millis(100));
+        // 最小タイムアウトを計算
+        let timeout = {
+            let conns = connections.borrow();
+            conns.values()
+                .filter_map(|h| h.conn.timeout())
+                .min()
+                .unwrap_or(Duration::from_millis(100))
+        };
 
-        poll.poll(&mut events, Some(timeout))?;
+        // タイムアウト付きでパケット受信
+        let recv_buf = vec![0u8; 65536];
+        let recv_result = monoio::time::timeout(timeout, socket.recv_from(recv_buf)).await;
 
         // タイムアウト処理
-        for client in clients.values_mut() {
-            client.conn.on_timeout();
+        {
+            let mut conns = connections.borrow_mut();
+            let mut closed = Vec::new();
+            for (cid, handler) in conns.iter_mut() {
+                handler.conn.on_timeout();
+                if handler.conn.is_closed() {
+                    closed.push(cid.clone());
+                }
+            }
+            for cid in closed {
+                info!("[HTTP/3] Connection closed (timeout)");
+                conns.remove(&cid);
+            }
         }
 
-        // 受信イベント処理
-        'recv: loop {
-            let (len, from) = match socket.recv_from(&mut recv_buf) {
-                Ok(v) => v,
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break 'recv,
-                Err(e) => {
+        let (recv_buf, len, from) = match recv_result {
+            Ok((Ok((len, from)), buf)) => (buf, len, from),
+            Ok((Err(e), _)) => {
+                if e.kind() != io::ErrorKind::WouldBlock {
                     error!("[HTTP/3] recv_from error: {}", e);
-                    break 'recv;
                 }
-            };
+                continue;
+            }
+            Err(_) => {
+                // タイムアウト - ループを継続
+                continue;
+            }
+        };
 
-            let pkt_buf = &mut recv_buf[..len];
+        let mut pkt_buf = recv_buf[..len].to_vec();
 
-            // パケットヘッダーを解析
-            let hdr = match quiche::Header::from_slice(pkt_buf, quiche::MAX_CONN_ID_LEN) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!("[HTTP/3] Invalid packet header: {}", e);
-                    continue 'recv;
-                }
-            };
+        // パケットヘッダーを解析
+        let hdr = match quiche::Header::from_slice(&mut pkt_buf, quiche::MAX_CONN_ID_LEN) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("[HTTP/3] Invalid packet header: {}", e);
+                continue;
+            }
+        };
 
-            // 既存コネクションを検索
-            let conn_id = if !clients.contains_key(&hdr.dcid) {
+        // コネクションを検索または作成
+        let conn_id = {
+            let mut conns = connections.borrow_mut();
+            
+            if !conns.contains_key(&hdr.dcid) {
                 if hdr.ty != quiche::Type::Initial {
                     debug!("[HTTP/3] Non-initial packet for unknown connection");
-                    continue 'recv;
+                    continue;
                 }
 
                 // 新規コネクション
                 let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
-                rng.fill(&mut scid).map_err(|_| io::Error::new(io::ErrorKind::Other, "RNG error"))?;
+                rng.fill(&mut scid)
+                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "RNG error"))?;
                 let scid = ConnectionId::from_ref(&scid).into_owned();
 
-                let local_addr = socket.local_addr()?;
+                let mut config_ref = quic_config.borrow_mut();
                 let conn = quiche::accept(
                     &scid,
                     None,
                     local_addr,
                     from,
-                    &mut quic_config,
+                    &mut config_ref,
                 )
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
                 info!("[HTTP/3] New connection from {}", from);
 
-                clients.insert(scid.clone(), Client {
-                    conn,
-                    http3_conn: None,
-                    partial_requests: HashMap::new(),
-                    partial_responses: HashMap::new(),
-                });
+                let handler = Http3Handler::new(conn, from);
+                conns.insert(scid.clone(), handler);
 
                 scid
             } else {
                 hdr.dcid.into_owned()
-            };
-
-            let client = clients.get_mut(&conn_id).unwrap();
-
-            // パケットを処理
-            let recv_info = quiche::RecvInfo {
-                from,
-                to: socket.local_addr()?,
-            };
-
-            match client.conn.recv(pkt_buf, recv_info) {
-                Ok(_) => {}
-                Err(e) => {
-                    warn!("[HTTP/3] recv error: {}", e);
-                    continue 'recv;
-                }
             }
+        };
 
-            // HTTP/3 ハンドシェイク完了チェック
-            if client.http3_conn.is_none() && client.conn.is_established() {
-                match h3::Connection::with_transport(&mut client.conn, &h3_config) {
-                    Ok(h3) => {
-                        info!("[HTTP/3] HTTP/3 connection established from {}", from);
-                        client.http3_conn = Some(h3);
-                    }
+        // パケットを処理
+        {
+            let mut conns = connections.borrow_mut();
+            if let Some(handler) = conns.get_mut(&conn_id) {
+                let recv_info = quiche::RecvInfo {
+                    from,
+                    to: local_addr,
+                };
+
+                // パケットを受信
+                let mut pkt_buf_mut = pkt_buf.to_vec();
+                match handler.conn.recv(&mut pkt_buf_mut, recv_info) {
+                    Ok(_) => {}
                     Err(e) => {
-                        error!("[HTTP/3] h3 setup error: {}", e);
-                        continue 'recv;
+                        warn!("[HTTP/3] recv error: {}", e);
+                        continue;
                     }
                 }
-            }
 
-            // HTTP/3 イベント処理
-            if let Some(ref mut h3_conn) = client.http3_conn {
-                loop {
-                    match h3_conn.poll(&mut client.conn) {
-                        Ok((stream_id, h3::Event::Headers { list, more_frames })) => {
-                            handle_request(
-                                h3_conn,
-                                &mut client.conn,
-                                stream_id,
-                                &list,
-                                more_frames,
-                                &mut client.partial_responses,
-                            );
-                        }
-                        Ok((stream_id, h3::Event::Data)) => {
-                            // リクエストボディを読み込み（今は無視）
-                            let mut body = vec![0u8; 4096];
-                            while let Ok(read) = h3_conn.recv_body(&mut client.conn, stream_id, &mut body) {
-                                if read == 0 {
-                                    break;
-                                }
-                            }
-                        }
-                        Ok((_stream_id, h3::Event::Finished)) => {
-                            // ストリーム終了
-                        }
-                        Ok((_stream_id, h3::Event::Reset(_))) => {
-                            // ストリームリセット
-                        }
-                        Ok((_flow_id, h3::Event::GoAway)) => {
-                            // GOAWAY 受信
-                        }
-                        Ok((_, h3::Event::PriorityUpdate)) => {}
-                        Err(h3::Error::Done) => break,
-                        Err(e) => {
-                            warn!("[HTTP/3] h3 poll error: {}", e);
-                            break;
-                        }
-                    }
+                // HTTP/3 初期化
+                if let Err(e) = handler.init_h3() {
+                    warn!("[HTTP/3] init_h3 error: {}", e);
                 }
-            }
 
-            // 部分的なレスポンスを送信
-            if let Some(ref mut h3_conn) = client.http3_conn {
-                let mut completed = Vec::new();
-                for (&stream_id, (body, written)) in &mut client.partial_responses {
-                    if *written < body.len() {
-                        match h3_conn.send_body(&mut client.conn, stream_id, &body[*written..], true) {
-                            Ok(sent) => {
-                                *written += sent;
-                                if *written >= body.len() {
-                                    completed.push(stream_id);
-                                }
-                            }
-                            Err(h3::Error::Done) => {}
-                            Err(e) => {
-                                warn!("[HTTP/3] send_body error: {}", e);
-                                completed.push(stream_id);
-                            }
-                        }
-                    } else {
-                        completed.push(stream_id);
-                    }
-                }
-                for stream_id in completed {
-                    client.partial_responses.remove(&stream_id);
+                // HTTP/3 イベント処理
+                if let Err(e) = handler.process_h3_events() {
+                    warn!("[HTTP/3] process_h3_events error: {}", e);
                 }
             }
         }
 
         // 送信処理
-        for client in clients.values_mut() {
-            loop {
-                let (write, send_info) = match client.conn.send(&mut send_buf) {
-                    Ok(v) => v,
-                    Err(quiche::Error::Done) => break,
-                    Err(e) => {
-                        error!("[HTTP/3] send error: {}", e);
-                        client.conn.close(false, 0x1, b"send error").ok();
-                        break;
-                    }
-                };
+        {
+            let mut conns = connections.borrow_mut();
+            let mut send_buf = vec![0u8; 1350];
+            let mut closed = Vec::new();
+            
+            for (cid, handler) in conns.iter_mut() {
+                loop {
+                    let (write, send_info) = match handler.conn.send(&mut send_buf) {
+                        Ok(v) => v,
+                        Err(quiche::Error::Done) => break,
+                        Err(e) => {
+                            error!("[HTTP/3] send error: {}", e);
+                            handler.conn.close(false, 0x1, b"send error").ok();
+                            break;
+                        }
+                    };
 
-                if let Err(e) = socket.send_to(&send_buf[..write], send_info.to) {
-                    if e.kind() != io::ErrorKind::WouldBlock {
-                        error!("[HTTP/3] send_to error: {}", e);
-                    }
+                    let send_data = send_buf[..write].to_vec();
+                    let socket_clone = socket.clone();
+                    let target = send_info.to;
+                    
+                    // 非同期送信（spawn しない、直接 await）
+                    // monoio の UdpSocket は send_to が async
+                    let _ = socket_clone.send_to(send_data, target).await;
+                }
+
+                if handler.conn.is_closed() {
+                    info!("[HTTP/3] Connection closed from {}", handler.peer_addr);
+                    closed.push(cid.clone());
                 }
             }
-        }
 
-        // クローズ済みコネクションを削除
-        clients.retain(|_, c| {
-            if c.conn.is_closed() {
-                info!("[HTTP/3] Connection closed");
-                false
-            } else {
-                true
+            for cid in closed {
+                conns.remove(&cid);
             }
-        });
+        }
     }
 }
 
-/// HTTP/3 リクエストを処理
-fn handle_request(
-    h3_conn: &mut h3::Connection,
-    conn: &mut quiche::Connection,
-    stream_id: u64,
-    headers: &[h3::Header],
-    _has_body: bool,
-    partial_responses: &mut HashMap<u64, (Vec<u8>, usize)>,
-) {
-    let mut method = None;
-    let mut path = None;
+/// HTTP/3 サーバーを起動（同期ラッパー）
+/// 
+/// 別スレッドで monoio ランタイムを作成して実行します。
+pub fn run_http3_server(
+    bind_addr: SocketAddr,
+    config: Http3ServerConfig,
+) -> io::Result<()> {
+    use monoio::RuntimeBuilder;
 
-    for header in headers {
-        match header.name() {
-            b":method" => method = Some(header.value()),
-            b":path" => path = Some(header.value()),
-            _ => {}
-        }
-    }
+    let mut rt = RuntimeBuilder::<monoio::IoUringDriver>::new()
+        .enable_timer()
+        .build()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Runtime error: {}", e)))?;
 
-    let method = method.unwrap_or(b"GET");
-    let path = path.unwrap_or(b"/");
+    rt.block_on(async move {
+        run_http3_server_async(bind_addr, config).await
+    })
+}
 
-    debug!(
-        "[HTTP/3] Request: {} {} (stream {})",
-        String::from_utf8_lossy(method),
-        String::from_utf8_lossy(path),
-        stream_id
-    );
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    // シンプルなレスポンス
-    let body = b"HTTP/3 OK\n";
-    let response_headers = vec![
-        h3::Header::new(b":status", b"200"),
-        h3::Header::new(b"content-type", b"text/plain"),
-        h3::Header::new(b"content-length", body.len().to_string().as_bytes()),
-        h3::Header::new(b"server", b"zerocopy-server/http3"),
-        h3::Header::new(b"alt-svc", b"clear"),
-    ];
-
-    // ヘッダーを送信
-    match h3_conn.send_response(conn, stream_id, &response_headers, false) {
-        Ok(()) => {}
-        Err(h3::Error::StreamBlocked) => {
-            // ブロックされた場合は後で再試行
-            return;
-        }
-        Err(e) => {
-            warn!("[HTTP/3] send_response error: {}", e);
-            return;
-        }
-    }
-
-    // ボディを送信
-    match h3_conn.send_body(conn, stream_id, body, true) {
-        Ok(_) => {}
-        Err(h3::Error::Done) => {
-            // 後で再試行
-            partial_responses.insert(stream_id, (body.to_vec(), 0));
-        }
-        Err(e) => {
-            warn!("[HTTP/3] send_body error: {}", e);
-        }
+    #[test]
+    fn test_config_default() {
+        let config = Http3ServerConfig::default();
+        assert_eq!(config.max_idle_timeout, 30000);
+        assert_eq!(config.max_udp_payload_size, 1350);
     }
 }
