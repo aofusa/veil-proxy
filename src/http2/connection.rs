@@ -70,6 +70,9 @@ where
             settings.max_concurrent_streams,
             settings.initial_window_size as i32,
         );
+        
+        // コネクションウィンドウサイズを設定から取得
+        let conn_window = settings.connection_window_size as i32;
 
         Self {
             stream,
@@ -80,8 +83,8 @@ where
             hpack_encoder,
             frame_encoder,
             frame_decoder,
-            conn_send_window: defaults::CONNECTION_WINDOW_SIZE as i32,
-            conn_recv_window: defaults::CONNECTION_WINDOW_SIZE as i32,
+            conn_send_window: conn_window,
+            conn_recv_window: conn_window,
             goaway_sent: false,
             goaway_received: false,
             settings_ack_pending: false,
@@ -96,8 +99,8 @@ where
     ///
     /// 1. クライアントプリフェースを受信
     /// 2. サーバー SETTINGS を送信
-    /// 3. クライアント SETTINGS を受信
-    /// 4. SETTINGS ACK を送受信
+    /// 3. コネクションウィンドウを拡張 (必要な場合)
+    /// 4. クライアント SETTINGS を受信して ACK (run() ループで処理)
     pub async fn handshake(&mut self) -> Http2Result<()> {
         // 1. クライアントプリフェースを受信
         self.expect_preface().await?;
@@ -105,8 +108,15 @@ where
         // 2. サーバー SETTINGS を送信
         self.send_settings().await?;
 
-        // 3. クライアント SETTINGS を受信して ACK
-        // (run() ループで処理)
+        // 3. コネクションウィンドウを拡張
+        // RFC 7540: デフォルトの 65535 から設定値まで拡張
+        let target_window = self.local_settings.connection_window_size as i32;
+        let default_window = defaults::CONNECTION_WINDOW_SIZE as i32;
+        if target_window > default_window {
+            let increment = (target_window - default_window) as u32;
+            let frame = self.frame_encoder.encode_window_update(0, increment);
+            self.write_all(&frame).await?;
+        }
 
         Ok(())
     }
@@ -657,37 +667,79 @@ where
     }
 
     /// DATA フレームを送信
+    /// 
+    /// フロー制御ウィンドウを考慮してデータを分割送信します。
+    /// ウィンドウが不足した場合は WINDOW_UPDATE を待機します。
     pub async fn send_data(&mut self, stream_id: u32, data: &[u8], end_stream: bool) -> Http2Result<()> {
         let max_frame_size = self.remote_settings.max_frame_size as usize;
         let mut offset = 0;
+        let mut window_update_wait_count = 0;
+        const MAX_WINDOW_UPDATE_WAITS: usize = 100; // 無限ループ防止
 
         while offset < data.len() {
-            let chunk_len = (data.len() - offset).min(max_frame_size);
+            // 送信可能な最大サイズを計算（フレームサイズとウィンドウの両方を考慮）
+            let remaining = data.len() - offset;
+            
+            // ストリームウィンドウを取得
+            let stream_window = self.streams.get_ref(stream_id)
+                .map(|s| s.send_window)
+                .unwrap_or(0);
+            
+            // コネクションとストリームの両方のウィンドウを考慮
+            let available_window = self.conn_send_window.min(stream_window).max(0) as usize;
+            
+            if available_window == 0 {
+                // ウィンドウが0の場合、WINDOW_UPDATEを待つ
+                window_update_wait_count += 1;
+                if window_update_wait_count > MAX_WINDOW_UPDATE_WAITS {
+                    return Err(Http2Error::stream_error(
+                        stream_id,
+                        Http2ErrorCode::FlowControlError,
+                        "Flow control window exhausted after max waits",
+                    ));
+                }
+                
+                // WINDOW_UPDATE フレームを読み込む
+                match self.read_frame().await {
+                    Ok(frame) => {
+                        // WINDOW_UPDATE の処理
+                        if let Frame::WindowUpdate { stream_id: wid, increment } = frame {
+                            self.handle_window_update(wid, increment)?;
+                        } else {
+                            // 他のフレームも処理（PING、SETTINGS など）
+                            let _ = self.process_frame(frame).await;
+                        }
+                    }
+                    Err(Http2Error::ConnectionClosed) => {
+                        return Err(Http2Error::ConnectionClosed);
+                    }
+                    Err(e) => {
+                        // 読み取りエラーの場合は続行を試みる
+                        if !matches!(e, Http2Error::Io(ref io_err) if io_err.kind() == io::ErrorKind::WouldBlock) {
+                            return Err(e);
+                        }
+                    }
+                }
+                continue;
+            }
+            
+            // 送信可能なチャンクサイズを決定
+            let chunk_len = remaining.min(max_frame_size).min(available_window);
             let is_last = offset + chunk_len >= data.len();
             let chunk = &data[offset..offset + chunk_len];
-
-            // フロー制御チェック
             let len = chunk.len() as i32;
-            if len > self.conn_send_window {
-                // ウィンドウ不足 - 待機が必要
-                // 簡略化のためエラーを返す
-                return Err(Http2Error::stream_error(
-                    stream_id,
-                    Http2ErrorCode::FlowControlError,
-                    "Send window exhausted",
-                ));
-            }
 
+            // ウィンドウを減少
             self.conn_send_window -= len;
-
             if let Some(stream) = self.streams.get(stream_id) {
-                stream.prepare_send_data(chunk.len())?;
+                stream.send_window -= len;
             }
 
             let frame = self.frame_encoder.encode_data(stream_id, chunk, end_stream && is_last);
             self.write_all(&frame).await?;
 
             offset += chunk_len;
+            window_update_wait_count = 0; // 送信成功したのでリセット
         }
 
         // 状態更新

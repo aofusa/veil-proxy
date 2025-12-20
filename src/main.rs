@@ -2425,6 +2425,7 @@ impl Http2ConfigSection {
             max_frame_size: self.max_frame_size,
             max_header_list_size: self.max_header_list_size,
             enable_push: false, // サーバーではpush無効
+            connection_window_size: self.connection_window_size,
         }
     }
 }

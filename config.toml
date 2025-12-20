@@ -262,12 +262,13 @@ ktls_fallback_enabled = false
 # SETTINGS_INITIAL_WINDOW_SIZE (ストリームウィンドウサイズ)
 # デフォルト: 65535 (64KB - 1)
 # 高スループット: 4194304 (4MB) - 大きなファイル転送時のパフォーマンス向上
-# initial_window_size = 4194304
+# 注意: FLOW_CONTROL_ERROR を防ぐため、大きなレスポンス用に増加推奨
+initial_window_size = 4194304
 
 # SETTINGS_MAX_FRAME_SIZE (最大フレームサイズ)
 # デフォルト: 16384 (16KB)
 # 高パフォーマンス: 65536 (64KB) - フレーム分割オーバーヘッド削減
-# max_frame_size = 65536
+max_frame_size = 65536
 
 # SETTINGS_MAX_HEADER_LIST_SIZE (最大ヘッダーリストサイズ)
 # デフォルト: 16384 (16KB)
@@ -277,7 +278,8 @@ ktls_fallback_enabled = false
 # コネクションウィンドウサイズ（コネクション全体のフロー制御）
 # デフォルト: 65535 (64KB - 1)
 # 高スループット: 16777216 (16MB)
-# connection_window_size = 16777216
+# 注意: 大きなレスポンスを複数ストリームで同時に送信する場合に増加推奨
+connection_window_size = 16777216
 
 
 # ==========================================

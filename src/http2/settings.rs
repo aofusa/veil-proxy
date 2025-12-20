@@ -74,6 +74,8 @@ pub struct Http2Settings {
     pub max_frame_size: u32,
     /// 最大ヘッダーリストサイズ (bytes)
     pub max_header_list_size: u32,
+    /// コネクションレベルのウィンドウサイズ (bytes)
+    pub connection_window_size: u32,
 }
 
 impl Default for Http2Settings {
@@ -85,6 +87,7 @@ impl Default for Http2Settings {
             initial_window_size: defaults::INITIAL_WINDOW_SIZE,
             max_frame_size: defaults::MAX_FRAME_SIZE,
             max_header_list_size: defaults::MAX_HEADER_LIST_SIZE,
+            connection_window_size: defaults::CONNECTION_WINDOW_SIZE,
         }
     }
 }
@@ -104,6 +107,7 @@ impl Http2Settings {
             initial_window_size: 1048576,       // 1MB (より大きなウィンドウ)
             max_frame_size: 65536,              // 64KB (より大きなフレーム)
             max_header_list_size: 65536,        // 64KB
+            connection_window_size: 16777216,   // 16MB (より大きなコネクションウィンドウ)
         }
     }
 
@@ -215,6 +219,7 @@ mod tests {
             initial_window_size: 131072,
             max_frame_size: 32768,
             max_header_list_size: 32768,
+            connection_window_size: 1048576,
         };
 
         let encoded = original.encode();
