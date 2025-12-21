@@ -4338,6 +4338,98 @@ fn escape_json(s: &str) -> String {
     result
 }
 
+/// JSON形式ログ用カスタムWriter
+/// 
+/// ftlogが出力するログ行からプレフィックス（タイムスタンプと遅延時間）を削除し、
+/// JSONのみを出力します。
+/// 
+/// ftlogの出力形式: `{timestamp} {delay}ms {json_message}\n`
+/// 出力形式: `{json_message}\n`
+struct JsonLogWriter<W: io::Write + Send> {
+    inner: W,
+}
+
+impl<W: io::Write + Send> JsonLogWriter<W> {
+    fn new(writer: W) -> Self {
+        Self { inner: writer }
+    }
+}
+
+impl<W: io::Write + Send> io::Write for JsonLogWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // ftlogの出力からJSON部分を抽出
+        // 形式: "{timestamp} {delay}ms {json}\n"
+        // JSONは '{' で始まるため、最初の '{' を見つける
+        if let Some(json_start) = buf.iter().position(|&b| b == b'{') {
+            // JSON部分のみを書き込み
+            self.inner.write_all(&buf[json_start..])?;
+            Ok(buf.len())
+        } else {
+            // JSONが見つからない場合はそのまま書き込み
+            self.inner.write_all(buf)?;
+            Ok(buf.len())
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// JSON形式ログ用FileAppender
+/// 
+/// ファイルへのJSON形式ログ出力用のカスタムAppenderです。
+/// ftlogのプレフィックスを削除してJSONのみをファイルに書き込みます。
+struct JsonFileAppender {
+    writer: JsonLogWriter<std::io::BufWriter<std::fs::File>>,
+}
+
+impl JsonFileAppender {
+    fn new(path: &str) -> io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        let buf_writer = std::io::BufWriter::new(file);
+        Ok(Self {
+            writer: JsonLogWriter::new(buf_writer),
+        })
+    }
+}
+
+impl io::Write for JsonFileAppender {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.writer.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+/// 標準エラー出力用JSON形式Writer
+struct JsonStderrWriter {
+    writer: JsonLogWriter<std::io::Stderr>,
+}
+
+impl JsonStderrWriter {
+    fn new() -> Self {
+        Self {
+            writer: JsonLogWriter::new(std::io::stderr()),
+        }
+    }
+}
+
+impl io::Write for JsonStderrWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.writer.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
 /// ftlogを設定に基づいて初期化
 /// 
 /// ftlogは内部でバックグラウンドスレッドとチャネルを使用した非同期ログライブラリです。
@@ -4363,46 +4455,53 @@ fn init_logging(config: &LoggingConfigSection) -> ftlog::LoggerGuard {
     
     // ファイル出力が設定されている場合
     if let Some(ref file_path) = config.file_path {
-        // ログファイルへの出力を設定
-        // ftlogのFileAppenderを使用（非同期バッファリング済み）
-        // ファイルローテーションを設定（日次ローテーション、サイズ制限は将来的に対応可能）
-        let file_appender = ftlog::appender::FileAppender::builder()
-            .path(file_path)
-            .rotate(ftlog::appender::Period::Day)  // 日次ローテーション
-            .build();
-        
-        let mut builder = ftlog::builder()
-            .max_log_level(level)
-            // チャネルサイズを設定
-            // 高負荷時のバックプレッシャーを軽減し、ログドロップを防止
-            // デフォルト(100_000)から設定可能に
-            // false = ログがオーバーフローした場合はドロップ（ブロックしない）
-            .bounded(config.channel_size, false)
-            // ファイルアペンダーを設定
-            .root(file_appender);
-        
-        // JSON形式の場合はカスタムフォーマッタを適用
         if use_json {
-            builder = builder.format(JsonLogFormat);
+            // JSON形式: カスタムWriterを使用してftlogのプレフィックスを削除
+            let json_appender = JsonFileAppender::new(file_path)
+                .expect("Failed to create JSON file appender");
+            
+            ftlog::builder()
+                .max_log_level(level)
+                .bounded(config.channel_size, false)
+                .format(JsonLogFormat)
+                .root(json_appender)
+                .try_init()
+                .expect("Failed to initialize ftlog with JSON file appender")
+        } else {
+            // テキスト形式: ftlogの標準FileAppenderを使用
+            let file_appender = ftlog::appender::FileAppender::builder()
+                .path(file_path)
+                .rotate(ftlog::appender::Period::Day)
+                .build();
+            
+            ftlog::builder()
+                .max_log_level(level)
+                .bounded(config.channel_size, false)
+                .root(file_appender)
+                .try_init()
+                .expect("Failed to initialize ftlog with file appender")
         }
-        
-        builder.try_init()
-            .expect("Failed to initialize ftlog with file appender")
     } else {
-        // 標準エラー出力（デフォルト）
-        let mut builder = ftlog::builder()
-            .max_log_level(level)
-            // チャネルサイズを設定
-            // 高負荷時のバックプレッシャーを軽減し、ログドロップを防止
-            .bounded(config.channel_size, false);
-        
-        // JSON形式の場合はカスタムフォーマッタを適用
+        // 標準エラー出力
         if use_json {
-            builder = builder.format(JsonLogFormat);
+            // JSON形式: カスタムWriterを使用してftlogのプレフィックスを削除
+            let json_writer = JsonStderrWriter::new();
+            
+            ftlog::builder()
+                .max_log_level(level)
+                .bounded(config.channel_size, false)
+                .format(JsonLogFormat)
+                .root(json_writer)
+                .try_init()
+                .expect("Failed to initialize ftlog with JSON stderr writer")
+        } else {
+            // テキスト形式（デフォルト）
+            ftlog::builder()
+                .max_log_level(level)
+                .bounded(config.channel_size, false)
+                .try_init()
+                .expect("Failed to initialize ftlog")
         }
-        
-        builder.try_init()
-            .expect("Failed to initialize ftlog")
     }
 }
 
