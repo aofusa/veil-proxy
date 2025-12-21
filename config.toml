@@ -76,6 +76,17 @@ threads = 4
 # ログレベル: "trace", "debug", "info", "warn", "error", "off"
 level = "info"
 
+# ログ出力形式: "text", "json"
+# 
+# text形式（デフォルト）:
+#   INFO main [examples/ftlog.rs:27] Hello, world!
+#
+# json形式:
+#   {"timestamp":"2024-01-01T00:00:00.000Z","level":"INFO","target":"veil","file":"main.rs","line":123,"message":"..."}
+#
+# JSON形式は構造化ログ収集システム（Elasticsearch, Loki等）との連携に適しています。
+# format = "text"
+
 # ログチャネルサイズ（内部バッファ）
 # 高負荷時のログドロップを防止するため、デフォルト(100)より大幅に増加
 # 推奨範囲: 10000 - 1000000

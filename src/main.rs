@@ -2849,6 +2849,17 @@ struct PerformanceConfigSection {
 // - level: 本番環境ではinfo以上を推奨
 // ====================
 
+/// ログ出力形式
+#[derive(Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum LogFormat {
+    /// テキスト形式（デフォルト）
+    #[default]
+    Text,
+    /// JSON形式
+    Json,
+}
+
 /// ログ設定セクション
 #[derive(Deserialize, Clone, Debug)]
 struct LoggingConfigSection {
@@ -2860,6 +2871,12 @@ struct LoggingConfigSection {
     /// - "error": エラーのみ
     #[serde(default = "default_log_level")]
     level: String,
+    
+    /// ログ出力形式
+    /// - "text": テキスト形式（デフォルト）
+    /// - "json": JSON形式
+    #[serde(default)]
+    format: LogFormat,
     
     /// ログチャネルサイズ
     /// 
@@ -2923,6 +2940,7 @@ impl Default for LoggingConfigSection {
     fn default() -> Self {
         Self {
             level: default_log_level(),
+            format: LogFormat::default(),
             channel_size: default_channel_size(),
             flush_interval_ms: default_flush_interval(),
             max_log_size: default_max_log_size(),
@@ -4236,6 +4254,90 @@ fn load_logging_config(path: &Path) -> io::Result<LoggingConfigSection> {
     Ok(config.logging)
 }
 
+// ====================
+// JSON形式ログフォーマッタ
+// ====================
+
+use ftlog::{FtLogFormat, Level, Record};
+use std::borrow::Cow;
+use std::fmt::{Display, Formatter, Result as FmtResult};
+
+/// JSON形式ログフォーマッタ
+/// 
+/// ログメッセージをJSON形式で出力するカスタムフォーマッタです。
+/// 出力形式:
+/// ```json
+/// {"timestamp":"2024-01-01T00:00:00.000Z","level":"INFO","target":"veil","file":"main.rs","line":123,"message":"..."}
+/// ```
+struct JsonLogFormat;
+
+/// JSON形式ログメッセージ
+struct JsonLogMessage {
+    level: Level,
+    target: Cow<'static, str>,
+    file: Cow<'static, str>,
+    line: Option<u32>,
+    args: String,
+}
+
+impl Display for JsonLogMessage {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        // タイムスタンプを取得（RFC 3339形式）
+        let now = time::OffsetDateTime::now_utc();
+        let timestamp = now.format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| now.to_string());
+        
+        // JSON形式でフォーマット
+        // メッセージ内の特殊文字をエスケープ
+        write!(
+            f,
+            r#"{{"timestamp":"{}","level":"{}","target":"{}","file":"{}","line":{},"message":"{}"}}"#,
+            timestamp,
+            self.level,
+            escape_json(&self.target),
+            escape_json(&self.file),
+            self.line.unwrap_or(0),
+            escape_json(&self.args)
+        )
+    }
+}
+
+impl FtLogFormat for JsonLogFormat {
+    fn msg(&self, record: &Record) -> Box<dyn Send + Sync + Display> {
+        Box::new(JsonLogMessage {
+            level: record.level(),
+            target: record.target().to_string().into(),
+            file: record
+                .file_static()
+                .map(Cow::Borrowed)
+                .or_else(|| record.file().map(|s| Cow::Owned(s.to_owned())))
+                .unwrap_or(Cow::Borrowed("")),
+            line: record.line(),
+            args: format!("{}", record.args()),
+        })
+    }
+}
+
+/// JSON文字列内の特殊文字をエスケープ
+fn escape_json(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => result.push_str(r#"\""#),
+            '\\' => result.push_str(r"\\"),
+            '\n' => result.push_str(r"\n"),
+            '\r' => result.push_str(r"\r"),
+            '\t' => result.push_str(r"\t"),
+            c if c.is_control() => {
+                // 制御文字はUnicodeエスケープ
+                result.push_str(&format!(r"\u{:04x}", c as u32));
+            }
+            c => result.push(c),
+        }
+    }
+    result
+}
+
 /// ftlogを設定に基づいて初期化
 /// 
 /// ftlogは内部でバックグラウンドスレッドとチャネルを使用した非同期ログライブラリです。
@@ -4257,6 +4359,7 @@ fn load_logging_config(path: &Path) -> io::Result<LoggingConfigSection> {
 /// 代わりに、ftlogの設定を最適化することで同等以上の効果を得られます。
 fn init_logging(config: &LoggingConfigSection) -> ftlog::LoggerGuard {
     let level = parse_log_level(&config.level);
+    let use_json = config.format == LogFormat::Json;
     
     // ファイル出力が設定されている場合
     if let Some(ref file_path) = config.file_path {
@@ -4268,7 +4371,7 @@ fn init_logging(config: &LoggingConfigSection) -> ftlog::LoggerGuard {
             .rotate(ftlog::appender::Period::Day)  // 日次ローテーション
             .build();
         
-        ftlog::builder()
+        let mut builder = ftlog::builder()
             .max_log_level(level)
             // チャネルサイズを設定
             // 高負荷時のバックプレッシャーを軽減し、ログドロップを防止
@@ -4276,17 +4379,29 @@ fn init_logging(config: &LoggingConfigSection) -> ftlog::LoggerGuard {
             // false = ログがオーバーフローした場合はドロップ（ブロックしない）
             .bounded(config.channel_size, false)
             // ファイルアペンダーを設定
-            .root(file_appender)
-            .try_init()
+            .root(file_appender);
+        
+        // JSON形式の場合はカスタムフォーマッタを適用
+        if use_json {
+            builder = builder.format(JsonLogFormat);
+        }
+        
+        builder.try_init()
             .expect("Failed to initialize ftlog with file appender")
     } else {
         // 標準エラー出力（デフォルト）
-        ftlog::builder()
+        let mut builder = ftlog::builder()
             .max_log_level(level)
             // チャネルサイズを設定
             // 高負荷時のバックプレッシャーを軽減し、ログドロップを防止
-            .bounded(config.channel_size, false)
-            .try_init()
+            .bounded(config.channel_size, false);
+        
+        // JSON形式の場合はカスタムフォーマッタを適用
+        if use_json {
+            builder = builder.format(JsonLogFormat);
+        }
+        
+        builder.try_init()
             .expect("Failed to initialize ftlog")
     }
 }
