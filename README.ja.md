@@ -29,6 +29,7 @@ io_uring (monoio) と rustls を使用した高性能リバースプロキシサ
 - **Keep-Alive**: HTTP/1.1 Keep-Alive完全サポート
 - **Chunked転送**: RFC 7230準拠のChunkedデコーダ（ステートマシンベース）
 - **バッファプール**: メモリアロケーションの削減
+- **レスポンス圧縮**: Gzip/Brotli/Zstdによる動的圧縮（Accept-Encodingネゴシエーション対応）
 
 ### パフォーマンス
 - **CPUアフィニティ**: ワーカースレッドのCPUコアピン留め
@@ -912,6 +913,132 @@ redirect_status = 301
 |------|------|
 | `$request_uri` | 元のリクエストURI |
 | `$path` | prefix除去後のパス部分 |
+
+## レスポンス圧縮
+
+動的レスポンス圧縮（Gzip、Brotli、Zstd）をサポートします。Accept-Encodingヘッダーに基づいて、クライアントに送信する前にレスポンスを圧縮します。
+
+### 特徴
+
+| 項目 | 説明 |
+|------|------|
+| **複数アルゴリズム対応** | Gzip、Brotli、Zstd、Deflateをサポート |
+| **Content-Typeフィルタリング** | text/HTML/JSON等のみ圧縮 |
+| **最小サイズ閾値** | 小さなレスポンスは圧縮スキップ |
+| **Accept-Encodingネゴシエーション** | 最適なエンコーディングを自動選択 |
+
+### 有効化
+
+圧縮はデフォルトで**無効**です（kTLS最適化のゼロコピーsendfileを維持）。
+ルートごとに `compression` セクションで有効化します：
+
+```toml
+[path_routes."example.com"."/api/"]
+type = "Proxy"
+url = "http://localhost:8080"
+
+  [path_routes."example.com"."/api/".compression]
+  enabled = true
+```
+
+### 設定オプション
+
+| オプション | 説明 | デフォルト |
+|-----------|------|-----------|
+| `enabled` | 圧縮を有効化 | false |
+| `preferred_encodings` | エンコーディング優先順位（配列） | ["zstd", "br", "gzip"] |
+| `gzip_level` | Gzip圧縮レベル（1-9） | 4 |
+| `brotli_level` | Brotli圧縮レベル（0-11） | 4 |
+| `zstd_level` | Zstd圧縮レベル（1-22） | 3 |
+| `min_size` | 圧縮する最小サイズ（バイト） | 1024 |
+| `compressible_types` | 圧縮対象のMIMEタイプ（プレフィックスマッチ） | text/*, application/json等 |
+| `skip_types` | スキップするMIMEタイプ（プレフィックスマッチ） | image/*, video/*, audio/*等 |
+
+### 圧縮レベルガイドライン
+
+| アルゴリズム | レベル | 速度 | 圧縮率 | 用途 |
+|-------------|--------|------|--------|------|
+| Gzip | 1-3 | 高速 | 低 | リアルタイム、高スループット |
+| Gzip | 4-6 | バランス | 中 | 汎用 |
+| Gzip | 7-9 | 低速 | 高 | 静的アセット、帯域優先 |
+| Brotli | 0-4 | 高速 | 中 | 動的コンテンツ |
+| Brotli | 5-9 | バランス | 高 | 汎用 |
+| Brotli | 10-11 | 低速 | 最高 | 静的アセット |
+| Zstd | 1-3 | 高速 | 中 | リアルタイムAPI |
+| Zstd | 4-9 | バランス | 高 | 汎用 |
+| Zstd | 10-22 | 低速 | 最高 | アーカイブ |
+
+### 設定例
+
+```toml
+# API圧縮（高速、バランス重視）
+[path_routes."example.com"."/api/"]
+type = "Proxy"
+url = "http://localhost:8080"
+
+  [path_routes."example.com"."/api/".compression]
+  enabled = true
+  preferred_encodings = ["zstd", "br", "gzip"]
+  zstd_level = 3
+  brotli_level = 4
+  gzip_level = 4
+  min_size = 1024
+
+# 静的アセット（高圧縮率）
+[path_routes."example.com"."/static/"]
+type = "File"
+path = "/var/www/static"
+
+  [path_routes."example.com"."/static/".compression]
+  enabled = true
+  preferred_encodings = ["br", "gzip"]
+  brotli_level = 6
+  gzip_level = 6
+  min_size = 256
+```
+
+### デフォルト圧縮対象タイプ
+
+以下のMIMEタイプはデフォルトで圧縮されます：
+
+- `text/*`（HTML、CSS、プレーンテキスト等）
+- `application/json`
+- `application/javascript`
+- `application/xml`
+- `application/xhtml+xml`
+- `application/rss+xml`
+- `application/atom+xml`
+- `image/svg+xml`
+- `application/wasm`
+
+### デフォルトスキップタイプ
+
+以下のMIMEタイプは圧縮**されません**（既に圧縮済み、またはバイナリ）：
+
+- `image/*`
+- `video/*`
+- `audio/*`
+- `application/octet-stream`
+- `application/zip`
+- `application/gzip`
+- `application/x-gzip`
+- `application/x-brotli`
+
+### HTTP/3圧縮設定
+
+HTTP/3では `[http3]` セクションで別途圧縮設定が可能です：
+
+```toml
+[http3]
+compression_enabled = true
+
+  [http3.compression]
+  preferred_encodings = ["br", "gzip"]
+  brotli_level = 5
+  gzip_level = 5
+```
+
+> **Note**: 圧縮を有効にすると、圧縮されたレスポンスに対してはkTLSのゼロコピーsendfile最適化は使用されません。大きなファイルの最大スループットを得るには、静的ファイルルートでは圧縮を無効にすることを検討してください。
 
 ## Prometheusメトリクス
 

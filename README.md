@@ -29,6 +29,7 @@ A high-performance reverse proxy server using io_uring (monoio) and rustls.
 - **Keep-Alive**: Full HTTP/1.1 Keep-Alive support
 - **Chunked Transfer**: RFC 7230 compliant chunked decoder (state machine based)
 - **Buffer Pool**: Reduced memory allocation
+- **Response Compression**: Dynamic Gzip/Brotli/Zstd compression with Accept-Encoding negotiation
 
 ### Performance
 - **CPU Affinity**: Pin worker threads to CPU cores
@@ -912,6 +913,132 @@ The following variables can be used in `redirect_url`:
 |----------|-------------|
 | `$request_uri` | Original request URI |
 | `$path` | Path portion after prefix removal |
+
+## Response Compression
+
+Supports dynamic response compression (Gzip, Brotli, Zstd). Compress responses before sending to clients based on Accept-Encoding header.
+
+### Features
+
+| Feature | Description |
+|---------|-------------|
+| **Multiple Algorithms** | Gzip, Brotli, Zstd, Deflate support |
+| **Content-Type Filtering** | Only compress text/HTML/JSON/etc. |
+| **Minimum Size Threshold** | Skip compression for small responses |
+| **Accept-Encoding Negotiation** | Automatically select best encoding |
+
+### Enabling
+
+Compression is **disabled by default** to maintain kTLS optimization (zero-copy sendfile).
+Enable per-route using the `compression` section:
+
+```toml
+[path_routes."example.com"."/api/"]
+type = "Proxy"
+url = "http://localhost:8080"
+
+  [path_routes."example.com"."/api/".compression]
+  enabled = true
+```
+
+### Configuration Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `enabled` | Enable compression | false |
+| `preferred_encodings` | Encoding priority order (array) | ["zstd", "br", "gzip"] |
+| `gzip_level` | Gzip compression level (1-9) | 4 |
+| `brotli_level` | Brotli compression level (0-11) | 4 |
+| `zstd_level` | Zstd compression level (1-22) | 3 |
+| `min_size` | Minimum size to compress (bytes) | 1024 |
+| `compressible_types` | MIME types to compress (prefix match) | text/*, application/json, etc. |
+| `skip_types` | MIME types to skip (prefix match) | image/*, video/*, audio/*, etc. |
+
+### Compression Level Guidelines
+
+| Algorithm | Level | Speed | Ratio | Use Case |
+|-----------|-------|-------|-------|----------|
+| Gzip | 1-3 | Fast | Low | Real-time, high throughput |
+| Gzip | 4-6 | Balanced | Medium | General purpose |
+| Gzip | 7-9 | Slow | High | Static assets, bandwidth priority |
+| Brotli | 0-4 | Fast | Medium | Dynamic content |
+| Brotli | 5-9 | Balanced | High | General purpose |
+| Brotli | 10-11 | Slow | Highest | Static assets |
+| Zstd | 1-3 | Fast | Medium | Real-time APIs |
+| Zstd | 4-9 | Balanced | High | General purpose |
+| Zstd | 10-22 | Slow | Highest | Archival |
+
+### Configuration Examples
+
+```toml
+# API compression (fast, balanced)
+[path_routes."example.com"."/api/"]
+type = "Proxy"
+url = "http://localhost:8080"
+
+  [path_routes."example.com"."/api/".compression]
+  enabled = true
+  preferred_encodings = ["zstd", "br", "gzip"]
+  zstd_level = 3
+  brotli_level = 4
+  gzip_level = 4
+  min_size = 1024
+
+# Static assets (high compression)
+[path_routes."example.com"."/static/"]
+type = "File"
+path = "/var/www/static"
+
+  [path_routes."example.com"."/static/".compression]
+  enabled = true
+  preferred_encodings = ["br", "gzip"]
+  brotli_level = 6
+  gzip_level = 6
+  min_size = 256
+```
+
+### Default Compressible Types
+
+The following MIME types are compressed by default:
+
+- `text/*` (HTML, CSS, plain text, etc.)
+- `application/json`
+- `application/javascript`
+- `application/xml`
+- `application/xhtml+xml`
+- `application/rss+xml`
+- `application/atom+xml`
+- `image/svg+xml`
+- `application/wasm`
+
+### Default Skip Types
+
+The following MIME types are **not** compressed (already compressed or binary):
+
+- `image/*`
+- `video/*`
+- `audio/*`
+- `application/octet-stream`
+- `application/zip`
+- `application/gzip`
+- `application/x-gzip`
+- `application/x-brotli`
+
+### HTTP/3 Compression Settings
+
+HTTP/3 can have separate compression settings in the `[http3]` section:
+
+```toml
+[http3]
+compression_enabled = true
+
+  [http3.compression]
+  preferred_encodings = ["br", "gzip"]
+  brotli_level = 5
+  gzip_level = 5
+```
+
+> **Note**: When compression is enabled, kTLS zero-copy sendfile optimization is not used for compressed responses. For maximum throughput with large files, consider disabling compression for static file routes.
 
 ## Prometheus Metrics
 
