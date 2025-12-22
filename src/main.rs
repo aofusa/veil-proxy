@@ -568,12 +568,11 @@ static CACHE_ENTRIES: Lazy<IntGaugeVec> = Lazy::new(|| {
 });
 
 /// バッファリング使用数カウンター（mode ラベル付き）
-/// mode: "full", "adaptive_buffered", "adaptive_streaming"
-#[allow(dead_code)]
+/// バッファリングが使用された回数（ホストごと）
 static BUFFERING_USED_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     let opts = Opts::new("buffering_used_total", "Total number of requests using buffering")
         .namespace("veil_proxy");
-    let counter = CounterVec::new(opts, &["mode"]).unwrap();
+    let counter = CounterVec::new(opts, &["host"]).unwrap();
     METRICS_REGISTRY.register(Box::new(counter.clone())).unwrap();
     counter
 });
@@ -612,10 +611,10 @@ fn update_cache_size_metrics(stats: &cache::CacheStats) {
 }
 
 /// メトリクス: バッファリング使用を記録
+/// バッファリングモード使用を記録
 #[inline]
-#[allow(dead_code)]
-fn record_buffering_used(mode: &str) {
-    BUFFERING_USED_TOTAL.with_label_values(&[mode]).inc();
+fn record_buffering_used(host: &str) {
+    BUFFERING_USED_TOTAL.with_label_values(&[host]).inc();
 }
 
 // ====================
@@ -9640,11 +9639,11 @@ async fn handle_proxy(
         {
             // HTTP/2 feature が無効な場合はHTTP/1.1にフォールバック
             warn!("H2C requested but http2 feature not enabled, falling back to HTTP/1.1");
-            proxy_http_pooled(client_stream, target, security, compression, client_encoding, &pool_key, request, content_length, is_chunked, initial_body, client_wants_close, cache_save_ctx.as_mut()).await
+            proxy_http_pooled(client_stream, target, security, compression, buffering_config, client_encoding, &pool_key, request, content_length, is_chunked, initial_body, client_wants_close, cache_save_ctx.as_mut()).await
         }
     } else {
-        // HTTP接続（キャッシュ保存対応）
-        proxy_http_pooled(client_stream, target, security, compression, client_encoding, &pool_key, request, content_length, is_chunked, initial_body, client_wants_close, cache_save_ctx.as_mut()).await
+        // HTTP接続（キャッシュ保存・バッファリング対応）
+        proxy_http_pooled(client_stream, target, security, compression, buffering_config, client_encoding, &pool_key, request, content_length, is_chunked, initial_body, client_wants_close, cache_save_ctx.as_mut()).await
     };
     
     // 接続カウンターを減少（Least Connections 用）
@@ -9662,6 +9661,7 @@ async fn proxy_http_pooled(
     target: &ProxyTarget,
     security: &SecurityConfig,
     compression: &CompressionConfig,
+    buffering_config: &buffering::BufferingConfig,
     client_encoding: AcceptedEncoding,
     pool_key: &str,
     request: Vec<u8>,
@@ -9714,13 +9714,24 @@ async fn proxy_http_pooled(
     // キャッシュ保存が必要な場合はsplice転送を使用できない（ユーザー空間でボディをキャプチャする必要がある）
     let cache_save_needed = cache_ctx.is_some();
     
+    // メトリクス用ホスト名
+    let host_str_for_metrics = &target.host;
+    
+    // バッファリングが有効かどうか判定
+    let buffering_enabled = buffering_config.is_enabled() && buffering_config.should_buffer(Some(content_length));
+    
     // リクエスト送信とレスポンス受信
     // kTLS 有効時は splice(2) を使用してゼロコピー転送
-    // ただし、圧縮有効またはキャッシュ保存が必要な場合はkTLSを迂回
+    // ただし、圧縮有効、キャッシュ保存が必要、またはバッファリング有効な場合はkTLSを迂回
     #[cfg(feature = "ktls")]
     let result = {
-        // kTLS + splice 版を試みる（Content-Length の場合のみ有効、圧縮無効時、キャッシュ保存不要時のみ）
-        if client_stream.is_ktls_enabled() && !is_chunked && !compression_enabled && !cache_save_needed {
+        // kTLS + splice 版を試みる条件:
+        // - kTLS有効
+        // - Content-Length転送（非chunked）
+        // - 圧縮無効
+        // - キャッシュ保存不要
+        // - バッファリング無効
+        if client_stream.is_ktls_enabled() && !is_chunked && !compression_enabled && !cache_save_needed && !buffering_enabled {
             let splice_result = proxy_http_request_splice(
                 &client_stream,
                 &backend_stream,
@@ -9747,8 +9758,23 @@ async fn proxy_http_pooled(
                     cache_ctx,
                 ).await
             }
+        } else if buffering_enabled && !compression_enabled {
+            // バッファリング有効時（圧縮無効の場合のみ）
+            // 圧縮が有効な場合は、通常版で圧縮後にバッファリングするか検討が必要
+            record_buffering_used(&host_str_for_metrics);
+            proxy_http_request_buffered(
+                &mut client_stream,
+                &mut backend_stream,
+                request,
+                content_length,
+                is_chunked,
+                initial_body,
+                max_chunked,
+                buffering_config,
+                cache_ctx,
+            ).await
         } else {
-            // kTLS が無効、Chunked、圧縮有効、またはキャッシュ保存が必要な場合は通常版を使用
+            // kTLS が無効、Chunked、圧縮有効、キャッシュ保存が必要、またはバッファリング無効の場合は通常版を使用
             proxy_http_request_with_compression(
                 &mut client_stream,
                 &mut backend_stream,
@@ -9765,18 +9791,34 @@ async fn proxy_http_pooled(
     };
     
     #[cfg(not(feature = "ktls"))]
-    let result = proxy_http_request_with_compression(
-        &mut client_stream,
-        &mut backend_stream,
-        request,
-        content_length,
-        is_chunked,
-        initial_body,
-        max_chunked,
-        compression,
-        client_encoding,
-        cache_ctx,
-    ).await;
+    let result = if buffering_enabled && !compression_enabled {
+        // バッファリング有効時（圧縮無効の場合のみ）
+        record_buffering_used(&host_str_for_metrics);
+        proxy_http_request_buffered(
+            &mut client_stream,
+            &mut backend_stream,
+            request,
+            content_length,
+            is_chunked,
+            initial_body,
+            max_chunked,
+            buffering_config,
+            cache_ctx,
+        ).await
+    } else {
+        proxy_http_request_with_compression(
+            &mut client_stream,
+            &mut backend_stream,
+            request,
+            content_length,
+            is_chunked,
+            initial_body,
+            max_chunked,
+            compression,
+            client_encoding,
+            cache_ctx,
+        ).await
+    };
 
     match result {
         Some((status_code, total, backend_wants_keep_alive)) => {
@@ -9958,6 +10000,323 @@ fn status_reason_phrase(status: u16) -> &'static str {
         504 => "Gateway Timeout",
         _ => "Unknown",
     }
+}
+
+// ====================
+// HTTPリクエスト送信とレスポンス受信（バッファリング対応版）
+// ====================
+//
+// バッファリングが有効な場合、バックエンドからのレスポンス全体を
+// メモリにバッファリングしてからクライアントに転送します。
+// これにより、バックエンド接続を早期に解放し、低速クライアントによる
+// バックエンドスレッド占有を防止します。
+// ====================
+
+/// バッファリング転送でHTTPリクエストを処理
+/// 
+/// バックエンドからレスポンス全体を受信してバッファに格納し、
+/// バックエンド接続を解放してからクライアントへ送信します。
+/// 
+/// 戻り値: Option<(status_code, response_size, backend_wants_keep_alive)>
+async fn proxy_http_request_buffered(
+    client_stream: &mut ServerTls,
+    backend_stream: &mut TcpStream,
+    request: Vec<u8>,
+    content_length: usize,
+    is_chunked: bool,
+    initial_body: &[u8],
+    max_chunked_body_size: u64,
+    buffering_config: &buffering::BufferingConfig,
+    cache_ctx: Option<&mut CacheSaveContext>,
+) -> Option<(u16, u64, bool)> {
+    // 1. リクエストヘッダー送信
+    let write_result = timeout(WRITE_TIMEOUT, backend_stream.write_all(request)).await;
+    if !matches!(write_result, Ok((Ok(_), _))) {
+        return None;
+    }
+
+    // 2. リクエストボディ送信
+    if !initial_body.is_empty() {
+        let body_buf = initial_body.to_vec();
+        let write_result = timeout(WRITE_TIMEOUT, backend_stream.write_all(body_buf)).await;
+        if !matches!(write_result, Ok((Ok(_), _))) {
+            return None;
+        }
+    }
+
+    // 3. 残りのリクエストボディを転送
+    if is_chunked {
+        match transfer_chunked_body(client_stream, backend_stream, initial_body, max_chunked_body_size).await {
+            ChunkedTransferResult::Complete => {}
+            ChunkedTransferResult::Failed => return None,
+            ChunkedTransferResult::SizeLimitExceeded => return None,
+        }
+    } else {
+        let remaining = content_length.saturating_sub(initial_body.len());
+        if remaining > 0 {
+            let transferred = transfer_exact_bytes(client_stream, backend_stream, remaining).await;
+            if transferred < remaining as u64 {
+                return None;
+            }
+        }
+    }
+
+    // 4. レスポンスを受信してバッファリング
+    let buffered = receive_and_buffer_response(backend_stream, buffering_config, cache_ctx).await;
+    
+    match buffered {
+        Some((status_code, headers_data, body_data, backend_wants_keep_alive)) => {
+            // 5. バッファからクライアントへ送信
+            // ヘッダー送信
+            let write_result = timeout(
+                Duration::from_secs(buffering_config.client_write_timeout_secs),
+                client_stream.write_all(headers_data.clone())
+            ).await;
+            
+            if !matches!(write_result, Ok((Ok(_), _))) {
+                return Some((status_code, 0, false));
+            }
+            
+            let mut total = headers_data.len() as u64;
+            
+            // ボディ送信
+            if !body_data.is_empty() {
+                let write_result = timeout(
+                    Duration::from_secs(buffering_config.client_write_timeout_secs),
+                    client_stream.write_all(body_data.clone())
+                ).await;
+                
+                if !matches!(write_result, Ok((Ok(_), _))) {
+                    return Some((status_code, total, false));
+                }
+                
+                total += body_data.len() as u64;
+            }
+            
+            Some((status_code, total, backend_wants_keep_alive))
+        }
+        None => None,
+    }
+}
+
+/// バックエンドからレスポンスを受信してバッファリング
+/// 
+/// 戻り値: Option<(status_code, headers_data, body_data, backend_wants_keep_alive)>
+async fn receive_and_buffer_response(
+    backend_stream: &mut TcpStream,
+    buffering_config: &buffering::BufferingConfig,
+    mut cache_ctx: Option<&mut CacheSaveContext>,
+) -> Option<(u16, Vec<u8>, Vec<u8>, bool)> {
+    let mut accumulated = Vec::with_capacity(BUF_SIZE);
+    
+    // ヘッダー読み取り
+    loop {
+        let read_buf = buf_get();
+        let read_result = timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
+        
+        let (res, mut returned_buf) = match read_result {
+            Ok(result) => result,
+            Err(_) => return None,
+        };
+        
+        let n = match res {
+            Ok(0) => {
+                buf_put(returned_buf);
+                return None;
+            }
+            Ok(n) => n,
+            Err(_) => {
+                buf_put(returned_buf);
+                return None;
+            }
+        };
+        
+        returned_buf.set_valid_len(n);
+        accumulated.extend_from_slice(returned_buf.as_valid_slice());
+        buf_put(returned_buf);
+        
+        // ヘッダーが完全に受信されたかチェック
+        if let Some(parsed) = parse_http_response(&accumulated) {
+            let status_code = parsed.status_code;
+            let backend_wants_keep_alive = !parsed.is_connection_close;
+            
+            let header_len = parsed.header_len;
+            let body_start = accumulated[header_len..].to_vec();
+            let headers_data = accumulated[..header_len].to_vec();
+            
+            // キャッシュコンテキストにヘッダーを設定
+            if let Some(ref mut ctx) = cache_ctx {
+                let mut headers_storage = [httparse::EMPTY_HEADER; 64];
+                let mut response = httparse::Response::new(&mut headers_storage);
+                if response.parse(&headers_data).is_ok() {
+                    let headers: Vec<(Box<[u8]>, Box<[u8]>)> = response.headers.iter()
+                        .map(|h| (h.name.as_bytes().into(), h.value.into()))
+                        .collect();
+                    ctx.set_headers(headers, status_code);
+                }
+            }
+            
+            // ボディをバッファリング
+            let body_data = buffer_response_body(
+                backend_stream,
+                parsed.content_length,
+                parsed.is_chunked,
+                body_start,
+                buffering_config,
+                cache_ctx,
+            ).await;
+            
+            return Some((status_code, headers_data, body_data, backend_wants_keep_alive));
+        }
+        
+        // ヘッダーが大きすぎる場合は中止
+        if accumulated.len() > MAX_HEADER_SIZE {
+            return None;
+        }
+    }
+}
+
+/// レスポンスボディをバッファリング
+async fn buffer_response_body(
+    backend_stream: &mut TcpStream,
+    content_length: Option<usize>,
+    is_chunked: bool,
+    initial_body: Vec<u8>,
+    buffering_config: &buffering::BufferingConfig,
+    mut cache_ctx: Option<&mut CacheSaveContext>,
+) -> Vec<u8> {
+    let mut body = initial_body;
+    
+    // キャッシュコンテキストに初期ボディをキャプチャ
+    if let Some(ref mut ctx) = cache_ctx {
+        ctx.append_body(&body);
+    }
+    
+    if let Some(cl) = content_length {
+        // Content-Length 転送
+        let remaining = cl.saturating_sub(body.len());
+        if remaining > 0 {
+            // バッファサイズ制限チェック
+            if body.len() + remaining > buffering_config.max_memory_buffer {
+                // 制限超過: 可能な範囲でバッファリング
+                let max_additional = buffering_config.max_memory_buffer.saturating_sub(body.len());
+                if max_additional > 0 {
+                    let additional = buffer_exact_bytes(backend_stream, max_additional, &mut cache_ctx).await;
+                    body.extend(additional);
+                }
+            } else {
+                let additional = buffer_exact_bytes(backend_stream, remaining, &mut cache_ctx).await;
+                body.extend(additional);
+            }
+        }
+    } else if is_chunked {
+        // Chunked 転送
+        let mut decoder = ChunkedDecoder::new_unlimited();
+        decoder.feed(&body);
+        
+        if decoder.is_complete() {
+            // キャッシュに保存
+            if let Some(ctx) = cache_ctx {
+                ctx.save_to_cache();
+            }
+            return body;
+        }
+        
+        loop {
+            // バッファサイズ制限チェック
+            if body.len() >= buffering_config.max_memory_buffer {
+                break;
+            }
+            
+            let read_buf = buf_get();
+            let read_result = timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
+            
+            let (res, mut returned_buf) = match read_result {
+                Ok(result) => result,
+                Err(_) => break,
+            };
+            
+            let n = match res {
+                Ok(0) => {
+                    buf_put(returned_buf);
+                    break;
+                }
+                Ok(n) => n,
+                Err(_) => {
+                    buf_put(returned_buf);
+                    break;
+                }
+            };
+            
+            returned_buf.set_valid_len(n);
+            let chunk = returned_buf.as_valid_slice();
+            let feed_result = decoder.feed(chunk);
+            
+            // キャッシュコンテキストにキャプチャ
+            if let Some(ref mut ctx) = cache_ctx {
+                ctx.append_body(chunk);
+            }
+            
+            body.extend_from_slice(chunk);
+            buf_put(returned_buf);
+            
+            if feed_result == ChunkedFeedResult::Complete {
+                break;
+            }
+        }
+    }
+    
+    // キャッシュに保存
+    if let Some(ctx) = cache_ctx {
+        ctx.save_to_cache();
+    }
+    
+    body
+}
+
+/// バックエンドから正確なバイト数を読み取りバッファに格納
+async fn buffer_exact_bytes(
+    backend_stream: &mut TcpStream,
+    mut remaining: usize,
+    cache_ctx: &mut Option<&mut CacheSaveContext>,
+) -> Vec<u8> {
+    let mut result = Vec::with_capacity(remaining);
+    
+    while remaining > 0 {
+        let read_buf = buf_get();
+        let read_result = timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
+        
+        let (res, mut returned_buf) = match read_result {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+        
+        let n = match res {
+            Ok(0) => {
+                buf_put(returned_buf);
+                break;
+            }
+            Ok(n) => n.min(remaining),
+            Err(_) => {
+                buf_put(returned_buf);
+                break;
+            }
+        };
+        
+        returned_buf.set_valid_len(n);
+        let chunk = &returned_buf.as_valid_slice()[..n];
+        
+        // キャッシュコンテキストにキャプチャ
+        if let Some(ref mut ctx) = cache_ctx {
+            ctx.append_body(chunk);
+        }
+        
+        result.extend_from_slice(chunk);
+        buf_put(returned_buf);
+        remaining = remaining.saturating_sub(n);
+    }
+    
+    result
 }
 
 // ====================
