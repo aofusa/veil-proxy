@@ -870,5 +870,103 @@ pub struct ProcessedRequest {
 mod tests {
     use super::*;
 
-    // テストはモック TLS ストリームが必要なため、統合テストで実施
+    // ====================
+    // CONNECTION_PREFACE テスト
+    // ====================
+
+    #[test]
+    fn test_connection_preface_value() {
+        // HTTP/2 コネクションプリフェースの正確な値を検証
+        assert_eq!(CONNECTION_PREFACE, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    }
+
+    #[test]
+    fn test_connection_preface_length() {
+        // プリフェースの長さは24バイト
+        assert_eq!(CONNECTION_PREFACE.len(), 24);
+    }
+
+    // ====================
+    // ProcessedRequest テスト
+    // ====================
+
+    #[test]
+    fn test_processed_request_creation() {
+        // ProcessedRequestの作成
+        let req = ProcessedRequest { stream_id: 1 };
+        assert_eq!(req.stream_id, 1);
+        
+        let req2 = ProcessedRequest { stream_id: 3 };
+        assert_eq!(req2.stream_id, 3);
+    }
+
+    #[test]
+    fn test_processed_request_odd_stream_ids() {
+        // クライアント開始ストリームは奇数ID
+        let req = ProcessedRequest { stream_id: 1 };
+        assert!(req.stream_id % 2 == 1);
+        
+        let req2 = ProcessedRequest { stream_id: 5 };
+        assert!(req2.stream_id % 2 == 1);
+    }
+
+    // ====================
+    // Http2Settings 統合テスト
+    // ====================
+
+    #[test]
+    fn test_default_settings() {
+        // デフォルト設定の検証
+        let settings = Http2Settings::default();
+        
+        // RFC 7540 デフォルト値
+        assert!(settings.max_concurrent_streams > 0);
+        assert!(settings.initial_window_size > 0);
+        assert!(settings.max_frame_size >= 16384); // 最小値
+        assert!(settings.max_frame_size <= 16777215); // 最大値
+    }
+
+    #[test]
+    fn test_settings_encode_decode() {
+        // 設定のエンコード
+        let settings = Http2Settings::default();
+        let encoded = settings.encode();
+        
+        // エンコード結果は6の倍数（各設定は6バイト: ID 2バイト + 値 4バイト）
+        assert!(encoded.len() % 6 == 0);
+    }
+
+    // ====================
+    // フレームサイズ制約テスト
+    // ====================
+
+    #[test]
+    fn test_frame_size_constraints() {
+        // RFC 7540 Section 4.2: フレームサイズ制約
+        let min_frame_size = 16384u32;  // 2^14
+        let max_frame_size = 16777215u32; // 2^24 - 1
+        
+        let settings = Http2Settings::default();
+        
+        assert!(settings.max_frame_size >= min_frame_size);
+        assert!(settings.max_frame_size <= max_frame_size);
+    }
+
+    // ====================
+    // ウィンドウサイズテスト
+    // ====================
+
+    #[test]
+    fn test_window_size_constraints() {
+        // RFC 7540 Section 6.9.2: ウィンドウサイズ制約
+        let max_window_size = 2147483647i32; // 2^31 - 1
+        
+        let settings = Http2Settings::default();
+        
+        assert!(settings.initial_window_size > 0);
+        assert!((settings.initial_window_size as i32) <= max_window_size);
+    }
+
+    // 注: 実際のコネクション処理のテストはモックTLSストリームが必要なため、
+    // 統合テストとして別途実施することを推奨
 }

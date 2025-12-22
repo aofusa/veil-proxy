@@ -159,12 +159,29 @@ impl BufferingConfig {
 mod tests {
     use super::*;
 
+    // ====================
+    // BufferingMode テスト
+    // ====================
+
     #[test]
     fn test_buffering_mode_default() {
         let config = BufferingConfig::default();
         assert_eq!(config.mode, BufferingMode::Streaming);
         assert!(!config.is_enabled());
     }
+
+    #[test]
+    fn test_buffering_mode_equality() {
+        assert_eq!(BufferingMode::Streaming, BufferingMode::Streaming);
+        assert_eq!(BufferingMode::Full, BufferingMode::Full);
+        assert_eq!(BufferingMode::Adaptive, BufferingMode::Adaptive);
+        assert_ne!(BufferingMode::Streaming, BufferingMode::Full);
+        assert_ne!(BufferingMode::Full, BufferingMode::Adaptive);
+    }
+
+    // ====================
+    // should_buffer テスト
+    // ====================
 
     #[test]
     fn test_should_buffer_streaming() {
@@ -202,6 +219,144 @@ mod tests {
         assert!(!config.should_buffer(Some(1024 * 1024 + 1)));
         // Content-Length不明はストリーミング
         assert!(!config.should_buffer(None));
+    }
+
+    #[test]
+    fn test_should_buffer_adaptive_boundary() {
+        // 境界値テスト
+        let config = BufferingConfig {
+            mode: BufferingMode::Adaptive,
+            adaptive_threshold: 1000,
+            ..Default::default()
+        };
+        
+        assert!(config.should_buffer(Some(999)));   // 閾値未満
+        assert!(config.should_buffer(Some(1000)));  // 閾値ちょうど
+        assert!(!config.should_buffer(Some(1001))); // 閾値超過
+    }
+
+    // ====================
+    // is_enabled テスト
+    // ====================
+
+    #[test]
+    fn test_is_enabled() {
+        let streaming = BufferingConfig {
+            mode: BufferingMode::Streaming,
+            ..Default::default()
+        };
+        assert!(!streaming.is_enabled());
+        
+        let full = BufferingConfig {
+            mode: BufferingMode::Full,
+            ..Default::default()
+        };
+        assert!(full.is_enabled());
+        
+        let adaptive = BufferingConfig {
+            mode: BufferingMode::Adaptive,
+            ..Default::default()
+        };
+        assert!(adaptive.is_enabled());
+    }
+
+    // ====================
+    // disk_buffer_available テスト
+    // ====================
+
+    #[test]
+    fn test_disk_buffer_available() {
+        let without_disk = BufferingConfig::default();
+        assert!(!without_disk.disk_buffer_available());
+        
+        let with_disk = BufferingConfig {
+            disk_buffer_path: Some(PathBuf::from("/tmp/buffer")),
+            ..Default::default()
+        };
+        assert!(with_disk.disk_buffer_available());
+    }
+
+    // ====================
+    // Default値 テスト
+    // ====================
+
+    #[test]
+    fn test_default_values() {
+        let config = BufferingConfig::default();
+        
+        // デフォルト値の検証
+        assert_eq!(config.max_memory_buffer, 10 * 1024 * 1024); // 10MB
+        assert_eq!(config.adaptive_threshold, 1024 * 1024);      // 1MB
+        assert_eq!(config.max_disk_buffer, 100 * 1024 * 1024);   // 100MB
+        assert_eq!(config.client_write_timeout_secs, 60);
+        assert!(config.buffer_headers);
+        assert!(config.disk_buffer_path.is_none());
+    }
+
+    #[test]
+    fn test_custom_config() {
+        let config = BufferingConfig {
+            mode: BufferingMode::Adaptive,
+            max_memory_buffer: 5 * 1024 * 1024,
+            adaptive_threshold: 512 * 1024,
+            disk_buffer_path: Some(PathBuf::from("/var/tmp/veil")),
+            max_disk_buffer: 50 * 1024 * 1024,
+            client_write_timeout_secs: 120,
+            buffer_headers: false,
+        };
+        
+        assert_eq!(config.max_memory_buffer, 5 * 1024 * 1024);
+        assert_eq!(config.adaptive_threshold, 512 * 1024);
+        assert_eq!(config.disk_buffer_path, Some(PathBuf::from("/var/tmp/veil")));
+        assert_eq!(config.max_disk_buffer, 50 * 1024 * 1024);
+        assert_eq!(config.client_write_timeout_secs, 120);
+        assert!(!config.buffer_headers);
+    }
+
+    // ====================
+    // Streaming/Full/Adaptive 動作テスト
+    // ====================
+
+    #[test]
+    fn test_streaming_never_buffers() {
+        let config = BufferingConfig {
+            mode: BufferingMode::Streaming,
+            adaptive_threshold: 0, // どんな閾値でも
+            ..Default::default()
+        };
+        
+        // どんなサイズでもバッファリングしない
+        assert!(!config.should_buffer(Some(0)));
+        assert!(!config.should_buffer(Some(1)));
+        assert!(!config.should_buffer(Some(usize::MAX)));
+    }
+
+    #[test]
+    fn test_full_always_buffers() {
+        let config = BufferingConfig {
+            mode: BufferingMode::Full,
+            adaptive_threshold: usize::MAX, // どんな閾値でも
+            ..Default::default()
+        };
+        
+        // どんなサイズでもバッファリングする
+        assert!(config.should_buffer(Some(0)));
+        assert!(config.should_buffer(Some(usize::MAX)));
+        assert!(config.should_buffer(None));
+    }
+
+    #[test]
+    fn test_adaptive_zero_threshold() {
+        // 閾値0の場合は全てストリーミング（0以下はバッファ）
+        let config = BufferingConfig {
+            mode: BufferingMode::Adaptive,
+            adaptive_threshold: 0,
+            ..Default::default()
+        };
+        
+        assert!(config.should_buffer(Some(0)));   // ちょうど0はバッファ
+        assert!(!config.should_buffer(Some(1)));  // 1以上はストリーミング
+        assert!(!config.should_buffer(None));     // 不明はストリーミング
     }
 }
 

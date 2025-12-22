@@ -1955,6 +1955,10 @@ pub fn report_sandbox_support() {
 mod tests {
     use super::*;
 
+    // ====================
+    // KernelVersion テスト
+    // ====================
+
     #[test]
     fn test_kernel_version_parse() {
         let kernel = KernelVersion {
@@ -1968,6 +1972,52 @@ mod tests {
     }
 
     #[test]
+    fn test_kernel_version_5_10() {
+        // Linux 5.10 - io_uring制限サポート、Landlockなし
+        let kernel = KernelVersion { major: 5, minor: 10, patch: 0 };
+        assert!(kernel.supports_uring_restrictions());
+        assert!(kernel.supports_seccomp());
+        assert!(!kernel.supports_landlock());
+    }
+
+    #[test]
+    fn test_kernel_version_5_13() {
+        // Linux 5.13 - Landlockサポート開始
+        let kernel = KernelVersion { major: 5, minor: 13, patch: 0 };
+        assert!(kernel.supports_uring_restrictions());
+        assert!(kernel.supports_seccomp());
+        assert!(kernel.supports_landlock());
+    }
+
+    #[test]
+    fn test_kernel_version_old() {
+        // 古いカーネル (3.10)
+        let kernel = KernelVersion { major: 3, minor: 10, patch: 0 };
+        assert!(!kernel.supports_uring_restrictions());
+        assert!(!kernel.supports_seccomp());
+        assert!(!kernel.supports_landlock());
+    }
+
+    #[test]
+    fn test_kernel_version_3_17() {
+        // Linux 3.17 - seccompサポート開始
+        let kernel = KernelVersion { major: 3, minor: 17, patch: 0 };
+        assert!(!kernel.supports_uring_restrictions());
+        assert!(kernel.supports_seccomp());
+        assert!(!kernel.supports_landlock());
+    }
+
+    #[test]
+    fn test_kernel_version_display() {
+        let kernel = KernelVersion { major: 6, minor: 8, patch: 48 };
+        assert_eq!(format!("{}", kernel), "6.8.48");
+    }
+
+    // ====================
+    // SeccompMode テスト
+    // ====================
+
+    #[test]
     fn test_seccomp_mode_parse() {
         assert_eq!(SeccompMode::from_str("disabled"), SeccompMode::Disabled);
         assert_eq!(SeccompMode::from_str("log"), SeccompMode::Log);
@@ -1977,11 +2027,243 @@ mod tests {
     }
 
     #[test]
+    fn test_seccomp_mode_case_insensitive() {
+        // 大文字小文字を区別しない
+        assert_eq!(SeccompMode::from_str("DISABLED"), SeccompMode::Disabled);
+        assert_eq!(SeccompMode::from_str("Log"), SeccompMode::Log);
+        assert_eq!(SeccompMode::from_str("STRICT"), SeccompMode::Strict);
+        assert_eq!(SeccompMode::from_str("Filter"), SeccompMode::Filter);
+    }
+
+    #[test]
+    fn test_seccomp_mode_aliases() {
+        // エイリアス
+        assert_eq!(SeccompMode::from_str("off"), SeccompMode::Disabled);
+        assert_eq!(SeccompMode::from_str("none"), SeccompMode::Disabled);
+        assert_eq!(SeccompMode::from_str("audit"), SeccompMode::Log);
+        assert_eq!(SeccompMode::from_str("kill"), SeccompMode::Strict);
+        assert_eq!(SeccompMode::from_str("errno"), SeccompMode::Filter);
+        assert_eq!(SeccompMode::from_str("deny"), SeccompMode::Filter);
+    }
+
+    // ====================
+    // SecurityConfig テスト
+    // ====================
+
+    #[test]
     fn test_default_security_config() {
         let config = SecurityConfig::default();
         assert!(!config.enable_io_uring_restrictions);
         assert!(!config.enable_seccomp);
         assert_eq!(config.seccomp_mode, SeccompMode::Disabled);
+        assert!(!config.enable_landlock);
+    }
+
+    #[test]
+    fn test_security_config_landlock_paths() {
+        let config = SecurityConfig::default();
+        // デフォルトの読み取りパス
+        assert!(config.landlock_read_paths.contains(&"/etc".to_string()));
+        assert!(config.landlock_read_paths.contains(&"/usr".to_string()));
+        assert!(config.landlock_read_paths.contains(&"/lib".to_string()));
+        
+        // デフォルトの書き込みパス
+        assert!(config.landlock_write_paths.contains(&"/var/log".to_string()));
+        assert!(config.landlock_write_paths.contains(&"/tmp".to_string()));
+    }
+
+    // ====================
+    // Capability テスト
+    // ====================
+
+    #[test]
+    fn test_capability_from_str() {
+        // 標準的なケイパビリティ名
+        assert_eq!(Capability::from_str("CAP_NET_BIND_SERVICE"), Some(Capability::CAP_NET_BIND_SERVICE));
+        assert_eq!(Capability::from_str("CAP_SETUID"), Some(Capability::CAP_SETUID));
+        assert_eq!(Capability::from_str("CAP_SETGID"), Some(Capability::CAP_SETGID));
+        assert_eq!(Capability::from_str("CAP_SYS_ADMIN"), Some(Capability::CAP_SYS_ADMIN));
+    }
+
+    #[test]
+    fn test_capability_from_str_without_prefix() {
+        // CAP_プレフィックスなし
+        assert_eq!(Capability::from_str("NET_BIND_SERVICE"), Some(Capability::CAP_NET_BIND_SERVICE));
+        assert_eq!(Capability::from_str("SETUID"), Some(Capability::CAP_SETUID));
+        assert_eq!(Capability::from_str("SYS_ADMIN"), Some(Capability::CAP_SYS_ADMIN));
+    }
+
+    #[test]
+    fn test_capability_from_str_case_insensitive() {
+        // 大文字小文字を区別しない
+        assert_eq!(Capability::from_str("cap_net_bind_service"), Some(Capability::CAP_NET_BIND_SERVICE));
+        assert_eq!(Capability::from_str("Net_Bind_Service"), Some(Capability::CAP_NET_BIND_SERVICE));
+    }
+
+    #[test]
+    fn test_capability_from_str_invalid() {
+        // 無効なケイパビリティ
+        assert_eq!(Capability::from_str("INVALID"), None);
+        assert_eq!(Capability::from_str("CAP_INVALID"), None);
+        assert_eq!(Capability::from_str(""), None);
+    }
+
+    #[test]
+    fn test_capability_recommended_for_server() {
+        let recommended = Capability::recommended_for_server();
+        
+        // サーバーに必要なケイパビリティが含まれている
+        assert!(recommended.contains(&Capability::CAP_NET_BIND_SERVICE));
+        assert!(recommended.contains(&Capability::CAP_SETUID));
+        assert!(recommended.contains(&Capability::CAP_SETGID));
+        
+        // 危険なケイパビリティは含まれていない
+        assert!(!recommended.contains(&Capability::CAP_SYS_ADMIN));
+        assert!(!recommended.contains(&Capability::CAP_SYS_PTRACE));
+    }
+
+    #[test]
+    fn test_capability_all() {
+        let all = Capability::all();
+        
+        // 全てのケイパビリティが含まれている
+        assert!(all.len() >= 40); // Linux 5.9時点で41個
+        assert!(all.contains(&Capability::CAP_CHOWN));
+        assert!(all.contains(&Capability::CAP_SYS_ADMIN));
+        assert!(all.contains(&Capability::CAP_NET_BIND_SERVICE));
+    }
+
+    // ====================
+    // BindMount テスト
+    // ====================
+
+    #[test]
+    fn test_bind_mount_new() {
+        let bind = BindMount::new("/source", "/dest");
+        assert_eq!(bind.source, "/source");
+        assert_eq!(bind.dest, "/dest");
+    }
+
+    #[test]
+    fn test_bind_mount_from_string() {
+        let bind = BindMount::new(String::from("/usr"), String::from("/usr"));
+        assert_eq!(bind.source, "/usr");
+        assert_eq!(bind.dest, "/usr");
+    }
+
+    // ====================
+    // SandboxConfig テスト
+    // ====================
+
+    #[test]
+    fn test_sandbox_config_default() {
+        let config = SandboxConfig::default();
+        assert!(!config.enabled);
+        assert!(!config.unshare_pid);
+        assert!(!config.unshare_mount);
+        assert!(!config.unshare_uts);
+        assert!(!config.unshare_ipc);
+        assert!(!config.unshare_user);
+        assert!(!config.unshare_net);
+    }
+
+    #[test]
+    fn test_recommended_sandbox_config() {
+        let config = recommended_sandbox_config();
+        
+        // 有効化されている
+        assert!(config.enabled);
+        
+        // 推奨されるnamespace分離
+        assert!(config.unshare_mount);
+        assert!(config.unshare_uts);
+        assert!(config.unshare_ipc);
+        
+        // ネットワークは分離しない（サーバーには必要）
+        assert!(!config.unshare_net);
+        
+        // User namespaceは無効（複雑なため）
+        assert!(!config.unshare_user);
+        
+        // PID namespaceは無効
+        assert!(!config.unshare_pid);
+        
+        // 必要なケイパビリティが保持される
+        assert!(config.keep_capabilities.contains(&"CAP_NET_BIND_SERVICE".to_string()));
+        
+        // PR_SET_NO_NEW_PRIVS
+        assert!(config.no_new_privs);
+        
+        // /proc と /dev のマウント
+        assert!(config.mount_proc);
+        assert!(config.mount_dev);
+        
+        // ホスト名設定
+        assert_eq!(config.hostname, Some("veil-sandbox".to_string()));
+    }
+
+    #[test]
+    fn test_sandbox_config_ro_binds() {
+        let config = recommended_sandbox_config();
+        
+        // 標準的な読み取り専用バインドマウントが含まれている
+        let sources: Vec<&str> = config.ro_bind_mounts.iter()
+            .map(|b| b.source.as_str())
+            .collect();
+        
+        assert!(sources.contains(&"/usr"));
+        assert!(sources.contains(&"/lib"));
+        assert!(sources.contains(&"/etc/resolv.conf"));
+        assert!(sources.contains(&"/etc/hosts"));
+    }
+
+    #[test]
+    fn test_sandbox_config_tmpfs() {
+        let config = recommended_sandbox_config();
+        
+        // tmpfsマウントが含まれている
+        assert!(config.tmpfs_mounts.contains(&"/tmp".to_string()));
+    }
+
+    // ====================
+    // ALLOWED_SYSCALLS テスト
+    // ====================
+
+    #[test]
+    fn test_allowed_syscalls_contains_io_uring() {
+        // io_uringシステムコールが含まれている
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert!(ALLOWED_SYSCALLS.contains(&425)); // io_uring_setup
+            assert!(ALLOWED_SYSCALLS.contains(&426)); // io_uring_enter
+            assert!(ALLOWED_SYSCALLS.contains(&427)); // io_uring_register
+        }
+    }
+
+    #[test]
+    fn test_allowed_syscalls_contains_network() {
+        // ネットワークシステムコールが含まれている
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert!(ALLOWED_SYSCALLS.contains(&41)); // socket
+            assert!(ALLOWED_SYSCALLS.contains(&42)); // connect
+            assert!(ALLOWED_SYSCALLS.contains(&49)); // bind
+            assert!(ALLOWED_SYSCALLS.contains(&50)); // listen
+        }
+    }
+
+    #[test]
+    fn test_allowed_syscalls_no_dangerous() {
+        // 危険なシステムコールは含まれていない
+        #[cfg(target_arch = "x86_64")]
+        {
+            // execve (59) は含まれていない
+            assert!(!ALLOWED_SYSCALLS.contains(&59));
+            // ptrace (101) は含まれていない
+            assert!(!ALLOWED_SYSCALLS.contains(&101));
+            // mount (165) は含まれていない
+            assert!(!ALLOWED_SYSCALLS.contains(&165));
+        }
     }
 }
 

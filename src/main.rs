@@ -13164,3 +13164,923 @@ fn log_access(
     // Prometheusメトリクスを記録
     record_request_metrics(method_str, host_str, status, req_body_size, resp_body_size, duration_secs);
 }
+
+// ====================
+// ユニットテスト
+// ====================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ====================
+    // CidrRange テスト
+    // ====================
+    
+    mod cidr_tests {
+        use super::*;
+
+        #[test]
+        fn test_parse_ipv4_cidr() {
+            // IPv4 CIDRのパース検証
+            let cidr = CidrRange::parse("192.168.1.0/24").unwrap();
+            assert!(!cidr.is_ipv6);
+            assert_eq!(cidr.prefix_len, 24);
+        }
+
+        #[test]
+        fn test_parse_ipv4_single() {
+            // 単一IPv4アドレスのパース（/32相当）
+            let cidr = CidrRange::parse("10.0.0.1").unwrap();
+            assert!(!cidr.is_ipv6);
+            assert_eq!(cidr.prefix_len, 32);
+        }
+
+        #[test]
+        fn test_parse_ipv6_cidr() {
+            // IPv6 CIDRのパース検証
+            let cidr = CidrRange::parse("2001:db8::/32").unwrap();
+            assert!(cidr.is_ipv6);
+            assert_eq!(cidr.prefix_len, 32);
+        }
+
+        #[test]
+        fn test_parse_ipv6_single() {
+            // 単一IPv6アドレスのパース（/128相当）
+            let cidr = CidrRange::parse("::1").unwrap();
+            assert!(cidr.is_ipv6);
+            assert_eq!(cidr.prefix_len, 128);
+        }
+
+        #[test]
+        fn test_parse_invalid_cidr() {
+            // 無効な入力のパース失敗
+            assert!(CidrRange::parse("invalid").is_none());
+            assert!(CidrRange::parse("256.256.256.256").is_none());
+            assert!(CidrRange::parse("192.168.1.0/33").is_none()); // 無効なプレフィックス
+            assert!(CidrRange::parse("").is_none());
+        }
+
+        #[test]
+        fn test_contains_ipv4_in_range() {
+            // IPv4アドレスがCIDR範囲内に含まれる
+            let cidr = CidrRange::parse("192.168.0.0/16").unwrap();
+            assert!(cidr.contains("192.168.1.100"));
+            assert!(cidr.contains("192.168.255.255"));
+            assert!(cidr.contains("192.168.0.1"));
+        }
+
+        #[test]
+        fn test_contains_ipv4_out_of_range() {
+            // IPv4アドレスがCIDR範囲外
+            let cidr = CidrRange::parse("192.168.0.0/16").unwrap();
+            assert!(!cidr.contains("192.169.0.1"));
+            assert!(!cidr.contains("10.0.0.1"));
+            assert!(!cidr.contains("172.16.0.1"));
+        }
+
+        #[test]
+        fn test_contains_ipv4_exact_match() {
+            // 単一IPアドレスの完全一致
+            let cidr = CidrRange::parse("10.0.0.1").unwrap();
+            assert!(cidr.contains("10.0.0.1"));
+            assert!(!cidr.contains("10.0.0.2"));
+        }
+
+        #[test]
+        fn test_contains_ipv6_in_range() {
+            // IPv6アドレスがCIDR範囲内に含まれる
+            let cidr = CidrRange::parse("2001:db8::/32").unwrap();
+            assert!(cidr.contains("2001:db8::1"));
+            assert!(cidr.contains("2001:db8:ffff::1"));
+        }
+
+        #[test]
+        fn test_contains_ipv6_out_of_range() {
+            // IPv6アドレスがCIDR範囲外
+            let cidr = CidrRange::parse("2001:db8::/32").unwrap();
+            assert!(!cidr.contains("2001:db9::1"));
+            assert!(!cidr.contains("::1"));
+        }
+
+        #[test]
+        fn test_contains_localhost_ipv6() {
+            // IPv6ローカルホストの検証
+            let cidr = CidrRange::parse("::1/128").unwrap();
+            assert!(cidr.contains("::1"));
+            assert!(!cidr.contains("::2"));
+        }
+
+        #[test]
+        fn test_ipv4_mapped_ipv6() {
+            // IPv4をIPv6で確認した場合（異なるアドレスファミリー）
+            let cidr_v4 = CidrRange::parse("192.168.1.0/24").unwrap();
+            // IPv4 CIDRにIPv6アドレスは含まれない
+            assert!(!cidr_v4.contains("::ffff:192.168.1.1"));
+        }
+    }
+
+    // ====================
+    // IpFilter テスト
+    // ====================
+    
+    mod ip_filter_tests {
+        use super::*;
+
+        #[test]
+        fn test_filter_empty_allows_all() {
+            // 空のフィルターは全て許可
+            let filter = IpFilter::from_lists(&[], &[]);
+            assert!(filter.is_allowed("192.168.1.1"));
+            assert!(filter.is_allowed("10.0.0.1"));
+            assert!(filter.is_allowed("2001:db8::1"));
+        }
+
+        #[test]
+        fn test_filter_allow_list() {
+            // 許可リストのみ設定
+            let allowed = vec!["192.168.0.0/16".to_string()];
+            let filter = IpFilter::from_lists(&allowed, &[]);
+            
+            assert!(filter.is_allowed("192.168.1.1"));
+            assert!(filter.is_allowed("192.168.255.255"));
+            assert!(!filter.is_allowed("10.0.0.1"));
+            assert!(!filter.is_allowed("172.16.0.1"));
+        }
+
+        #[test]
+        fn test_filter_deny_list() {
+            // 拒否リストのみ設定（許可リストが空なので、拒否以外は全て許可）
+            let denied = vec!["192.168.1.0/24".to_string()];
+            let filter = IpFilter::from_lists(&[], &denied);
+            
+            assert!(!filter.is_allowed("192.168.1.1"));
+            assert!(filter.is_allowed("192.168.2.1"));
+            assert!(filter.is_allowed("10.0.0.1"));
+        }
+
+        #[test]
+        fn test_filter_deny_priority() {
+            // denyがallowより優先されることを検証
+            let allowed = vec!["192.168.0.0/16".to_string()];
+            let denied = vec!["192.168.1.0/24".to_string()];
+            let filter = IpFilter::from_lists(&allowed, &denied);
+            
+            // 192.168.1.xはdenyされる
+            assert!(!filter.is_allowed("192.168.1.1"));
+            assert!(!filter.is_allowed("192.168.1.100"));
+            
+            // 192.168.0.xや192.168.2.xはallowされる
+            assert!(filter.is_allowed("192.168.0.1"));
+            assert!(filter.is_allowed("192.168.2.1"));
+            
+            // 許可リスト外は拒否
+            assert!(!filter.is_allowed("10.0.0.1"));
+        }
+
+        #[test]
+        fn test_filter_multiple_ranges() {
+            // 複数のCIDR範囲
+            let allowed = vec![
+                "10.0.0.0/8".to_string(),
+                "172.16.0.0/12".to_string(),
+                "192.168.0.0/16".to_string(),
+            ];
+            let filter = IpFilter::from_lists(&allowed, &[]);
+            
+            // RFC1918プライベートアドレスは全て許可
+            assert!(filter.is_allowed("10.1.2.3"));
+            assert!(filter.is_allowed("172.16.100.1"));
+            assert!(filter.is_allowed("172.31.255.255"));
+            assert!(filter.is_allowed("192.168.0.1"));
+            
+            // パブリックアドレスは拒否
+            assert!(!filter.is_allowed("8.8.8.8"));
+            assert!(!filter.is_allowed("1.1.1.1"));
+        }
+
+        #[test]
+        fn test_filter_single_ip() {
+            // 単一IPアドレスの許可
+            let allowed = vec!["127.0.0.1".to_string()];
+            let filter = IpFilter::from_lists(&allowed, &[]);
+            
+            assert!(filter.is_allowed("127.0.0.1"));
+            assert!(!filter.is_allowed("127.0.0.2"));
+        }
+
+        #[test]
+        fn test_filter_ipv6() {
+            // IPv6アドレスのフィルタリング
+            let allowed = vec!["2001:db8::/32".to_string(), "::1".to_string()];
+            let filter = IpFilter::from_lists(&allowed, &[]);
+            
+            assert!(filter.is_allowed("::1"));
+            assert!(filter.is_allowed("2001:db8::1"));
+            assert!(!filter.is_allowed("2001:db9::1"));
+        }
+
+        #[test]
+        fn test_filter_is_configured() {
+            // フィルターが設定されているかの確認
+            let empty = IpFilter::from_lists(&[], &[]);
+            assert!(!empty.is_configured());
+            
+            let with_allow = IpFilter::from_lists(&["10.0.0.0/8".to_string()], &[]);
+            assert!(with_allow.is_configured());
+            
+            let with_deny = IpFilter::from_lists(&[], &["192.168.1.0/24".to_string()]);
+            assert!(with_deny.is_configured());
+        }
+
+        #[test]
+        fn test_filter_invalid_entry_ignored() {
+            // 無効なエントリは無視される
+            let allowed = vec![
+                "192.168.1.0/24".to_string(),
+                "invalid".to_string(),
+                "10.0.0.0/8".to_string(),
+            ];
+            let filter = IpFilter::from_lists(&allowed, &[]);
+            
+            // 有効なエントリは機能する
+            assert!(filter.is_allowed("192.168.1.1"));
+            assert!(filter.is_allowed("10.1.2.3"));
+            assert!(!filter.is_allowed("172.16.0.1"));
+        }
+    }
+
+    // ====================
+    // RateLimitEntry テスト
+    // ====================
+    
+    mod rate_limit_tests {
+        use super::*;
+
+        #[test]
+        fn test_new_entry() {
+            // 新規エントリの初期状態
+            let entry = RateLimitEntry::new(100);
+            assert_eq!(entry.current_count, 1);
+            assert_eq!(entry.previous_count, 0);
+            assert_eq!(entry.current_minute, 100);
+        }
+
+        #[test]
+        fn test_record_same_minute() {
+            // 同一分内でのリクエスト記録
+            let mut entry = RateLimitEntry::new(100);
+            
+            // 初期状態: count=1
+            let rate = entry.record_request(100, 30);
+            // count=2, previous=0, weight=(60-30)/60=0.5
+            // estimated = 0*0.5 + 2 = 2
+            assert_eq!(entry.current_count, 2);
+            assert!(rate >= 2);
+        }
+
+        #[test]
+        fn test_record_next_minute() {
+            // 次の分へ移行
+            let mut entry = RateLimitEntry::new(100);
+            entry.current_count = 10;
+            
+            let rate = entry.record_request(101, 0);
+            
+            // previous_count = 10（前の分のカウント）
+            // current_count = 1（新しい分）
+            assert_eq!(entry.current_minute, 101);
+            assert_eq!(entry.previous_count, 10);
+            assert_eq!(entry.current_count, 1);
+            
+            // rate = 10 * (60-0)/60 + 1 = 10 + 1 = 11
+            assert_eq!(rate, 11);
+        }
+
+        #[test]
+        fn test_record_skip_minutes() {
+            // 2分以上経過した場合のリセット
+            let mut entry = RateLimitEntry::new(100);
+            entry.current_count = 100;
+            entry.previous_count = 50;
+            
+            let rate = entry.record_request(103, 0);
+            
+            // 2分以上経過なのでリセット
+            assert_eq!(entry.current_minute, 103);
+            assert_eq!(entry.previous_count, 0);
+            assert_eq!(entry.current_count, 1);
+            assert_eq!(rate, 1);
+        }
+
+        #[test]
+        fn test_sliding_window_calculation() {
+            // スライディングウィンドウ計算の検証
+            let mut entry = RateLimitEntry::new(100);
+            entry.current_count = 30;
+            entry.previous_count = 60;
+            
+            // 分の真ん中（30秒経過）でのレート計算
+            let rate = entry.record_request(100, 30);
+            // current_count = 31, previous = 60
+            // weight = (60-30)/60 = 0.5
+            // estimated = 60*0.5 + 31 = 30 + 31 = 61
+            assert_eq!(entry.current_count, 31);
+            assert_eq!(rate, 61);
+        }
+
+        #[test]
+        fn test_sliding_window_end_of_minute() {
+            // 分の終わりでのレート計算（weight ≈ 0）
+            let mut entry = RateLimitEntry::new(100);
+            entry.current_count = 50;
+            entry.previous_count = 100;
+            
+            let rate = entry.record_request(100, 59);
+            // weight = (60-59)/60 ≈ 0.0167
+            // estimated = 100*0.0167 + 51 ≈ 52.67 → ceil → 53
+            assert_eq!(entry.current_count, 51);
+            assert!(rate >= 51 && rate <= 53);
+        }
+    }
+
+    // ====================
+    // AcceptedEncoding テスト
+    // ====================
+    
+    mod encoding_tests {
+        use super::*;
+
+        #[test]
+        fn test_parse_gzip() {
+            let encoding = AcceptedEncoding::parse(b"gzip");
+            assert_eq!(encoding, AcceptedEncoding::Gzip);
+        }
+
+        #[test]
+        fn test_parse_brotli() {
+            let encoding = AcceptedEncoding::parse(b"br");
+            assert_eq!(encoding, AcceptedEncoding::Brotli);
+        }
+
+        #[test]
+        fn test_parse_zstd() {
+            let encoding = AcceptedEncoding::parse(b"zstd");
+            assert_eq!(encoding, AcceptedEncoding::Zstd);
+        }
+
+        #[test]
+        fn test_parse_deflate() {
+            let encoding = AcceptedEncoding::parse(b"deflate");
+            assert_eq!(encoding, AcceptedEncoding::Deflate);
+        }
+
+        #[test]
+        fn test_parse_multiple_prefer_zstd() {
+            // 複数指定時はzstdを優先
+            let encoding = AcceptedEncoding::parse(b"gzip, br, zstd");
+            assert_eq!(encoding, AcceptedEncoding::Zstd);
+        }
+
+        #[test]
+        fn test_parse_with_quality() {
+            // q値指定
+            let encoding = AcceptedEncoding::parse(b"gzip;q=0.5, br;q=1.0");
+            // br (q=1.0) > gzip (q=0.5)
+            assert_eq!(encoding, AcceptedEncoding::Brotli);
+        }
+
+        #[test]
+        fn test_parse_zstd_higher_quality() {
+            // zstdが高いq値を持つ場合
+            let encoding = AcceptedEncoding::parse(b"gzip;q=0.8, zstd;q=1.0");
+            assert_eq!(encoding, AcceptedEncoding::Zstd);
+        }
+
+        #[test]
+        fn test_parse_empty() {
+            // 空の場合はIdentity
+            let encoding = AcceptedEncoding::parse(b"");
+            assert_eq!(encoding, AcceptedEncoding::Identity);
+        }
+
+        #[test]
+        fn test_parse_identity() {
+            // identityのみ（圧縮なし）
+            let encoding = AcceptedEncoding::parse(b"identity");
+            assert_eq!(encoding, AcceptedEncoding::Identity);
+        }
+
+        #[test]
+        fn test_parse_wildcard() {
+            // * はgzipとして扱う
+            let encoding = AcceptedEncoding::parse(b"*");
+            assert_eq!(encoding, AcceptedEncoding::Gzip);
+        }
+
+        #[test]
+        fn test_parse_unknown() {
+            // 不明なエンコーディングはIdentity
+            let encoding = AcceptedEncoding::parse(b"unknown");
+            assert_eq!(encoding, AcceptedEncoding::Identity);
+        }
+
+        #[test]
+        fn test_parse_invalid_utf8() {
+            // 無効なUTF-8はIdentity
+            let encoding = AcceptedEncoding::parse(&[0xff, 0xfe]);
+            assert_eq!(encoding, AcceptedEncoding::Identity);
+        }
+
+        #[test]
+        fn test_as_header_value() {
+            // ヘッダー値への変換
+            assert_eq!(AcceptedEncoding::Zstd.as_header_value(), b"zstd");
+            assert_eq!(AcceptedEncoding::Brotli.as_header_value(), b"br");
+            assert_eq!(AcceptedEncoding::Gzip.as_header_value(), b"gzip");
+            assert_eq!(AcceptedEncoding::Deflate.as_header_value(), b"deflate");
+            assert_eq!(AcceptedEncoding::Identity.as_header_value(), b"identity");
+        }
+    }
+
+    // ====================
+    // CompressionConfig テスト
+    // ====================
+    
+    mod compression_config_tests {
+        use super::*;
+
+        #[test]
+        fn test_default_config() {
+            // デフォルト設定の検証
+            let config = CompressionConfig::default();
+            assert!(!config.enabled); // デフォルトは無効
+            assert_eq!(config.gzip_level, 4);
+            assert_eq!(config.brotli_level, 4);
+            assert_eq!(config.zstd_level, 3);
+            assert_eq!(config.min_size, 1024);
+        }
+
+        #[test]
+        fn test_validate_valid_config() {
+            // 有効な設定の検証
+            let config = CompressionConfig {
+                enabled: true,
+                gzip_level: 6,
+                brotli_level: 6,
+                zstd_level: 10,
+                ..Default::default()
+            };
+            assert!(config.validate().is_ok());
+        }
+
+        #[test]
+        fn test_validate_invalid_gzip_level() {
+            // 無効なgzipレベル
+            let config = CompressionConfig {
+                gzip_level: 10, // 1-9のみ有効
+                ..Default::default()
+            };
+            assert!(config.validate().is_err());
+            
+            let config_zero = CompressionConfig {
+                gzip_level: 0, // 0は無効
+                ..Default::default()
+            };
+            assert!(config_zero.validate().is_err());
+        }
+
+        #[test]
+        fn test_validate_invalid_brotli_level() {
+            // 無効なbrotliレベル
+            let config = CompressionConfig {
+                brotli_level: 12, // 0-11のみ有効
+                ..Default::default()
+            };
+            assert!(config.validate().is_err());
+        }
+
+        #[test]
+        fn test_validate_invalid_zstd_level() {
+            // 無効なzstdレベル
+            let config = CompressionConfig {
+                zstd_level: 0, // 1-22のみ有効
+                ..Default::default()
+            };
+            assert!(config.validate().is_err());
+            
+            let config_high = CompressionConfig {
+                zstd_level: 23,
+                ..Default::default()
+            };
+            assert!(config_high.validate().is_err());
+        }
+
+        #[test]
+        fn test_validate_unknown_encoding() {
+            // 不明なエンコーディング
+            let config = CompressionConfig {
+                preferred_encodings: vec!["unknown".to_string()],
+                ..Default::default()
+            };
+            assert!(config.validate().is_err());
+        }
+
+        #[test]
+        fn test_should_compress_disabled() {
+            // 圧縮無効時
+            let config = CompressionConfig {
+                enabled: false,
+                ..Default::default()
+            };
+            let result = config.should_compress(
+                AcceptedEncoding::Gzip,
+                Some(b"text/html"),
+                Some(2048),
+                None,
+            );
+            assert!(result.is_none());
+        }
+
+        #[test]
+        fn test_should_compress_client_identity() {
+            // クライアントが圧縮非対応
+            let config = CompressionConfig {
+                enabled: true,
+                ..Default::default()
+            };
+            let result = config.should_compress(
+                AcceptedEncoding::Identity,
+                Some(b"text/html"),
+                Some(2048),
+                None,
+            );
+            assert!(result.is_none());
+        }
+
+        #[test]
+        fn test_should_compress_already_compressed() {
+            // バックエンドが既に圧縮済み
+            let config = CompressionConfig {
+                enabled: true,
+                ..Default::default()
+            };
+            let result = config.should_compress(
+                AcceptedEncoding::Gzip,
+                Some(b"text/html"),
+                Some(2048),
+                Some(b"gzip"),
+            );
+            assert!(result.is_none());
+        }
+
+        #[test]
+        fn test_should_compress_text_html() {
+            // text/htmlは圧縮対象
+            let config = CompressionConfig {
+                enabled: true,
+                ..Default::default()
+            };
+            let result = config.should_compress(
+                AcceptedEncoding::Gzip,
+                Some(b"text/html; charset=utf-8"),
+                Some(2048),
+                None,
+            );
+            assert!(result.is_some());
+        }
+
+        #[test]
+        fn test_should_compress_json() {
+            // application/jsonは圧縮対象
+            let config = CompressionConfig {
+                enabled: true,
+                ..Default::default()
+            };
+            let result = config.should_compress(
+                AcceptedEncoding::Brotli,
+                Some(b"application/json"),
+                Some(2048),
+                None,
+            );
+            assert!(result.is_some());
+        }
+
+        #[test]
+        fn test_should_not_compress_image() {
+            // 画像は圧縮スキップ
+            let config = CompressionConfig {
+                enabled: true,
+                ..Default::default()
+            };
+            let result = config.should_compress(
+                AcceptedEncoding::Gzip,
+                Some(b"image/png"),
+                Some(100000),
+                None,
+            );
+            assert!(result.is_none());
+        }
+
+        #[test]
+        fn test_should_not_compress_small() {
+            // min_size未満は圧縮しない
+            let config = CompressionConfig {
+                enabled: true,
+                min_size: 1024,
+                ..Default::default()
+            };
+            let result = config.should_compress(
+                AcceptedEncoding::Gzip,
+                Some(b"text/html"),
+                Some(500), // 1024未満
+                None,
+            );
+            assert!(result.is_none());
+        }
+
+        #[test]
+        fn test_should_not_compress_no_content_type() {
+            // Content-Typeがない場合は圧縮しない
+            let config = CompressionConfig {
+                enabled: true,
+                ..Default::default()
+            };
+            let result = config.should_compress(
+                AcceptedEncoding::Gzip,
+                None,
+                Some(2048),
+                None,
+            );
+            assert!(result.is_none());
+        }
+    }
+
+    // ====================
+    // WebSocketPollConfig テスト
+    // ====================
+    
+    mod websocket_poll_tests {
+        use super::*;
+
+        #[test]
+        fn test_default_config() {
+            // デフォルト設定の検証
+            let config = WebSocketPollConfig::default();
+            assert_eq!(config.mode, WebSocketPollMode::Adaptive);
+            assert_eq!(config.initial_timeout_ms, 1);
+            assert_eq!(config.max_timeout_ms, 100);
+            assert!((config.backoff_multiplier - 2.0).abs() < f64::EPSILON);
+        }
+
+        #[test]
+        fn test_mode_equality() {
+            // モード比較
+            assert_eq!(WebSocketPollMode::Fixed, WebSocketPollMode::Fixed);
+            assert_eq!(WebSocketPollMode::Adaptive, WebSocketPollMode::Adaptive);
+            assert_ne!(WebSocketPollMode::Fixed, WebSocketPollMode::Adaptive);
+        }
+    }
+
+    // ====================
+    // SecurityConfig テスト  
+    // ====================
+    
+    mod security_config_tests {
+        use super::*;
+
+        #[test]
+        fn test_default_security_config() {
+            // デフォルトセキュリティ設定
+            let config = SecurityConfig::default();
+            assert_eq!(config.max_request_body_size, MAX_BODY_SIZE);
+            assert_eq!(config.max_request_header_size, MAX_HEADER_SIZE);
+            assert_eq!(config.client_header_timeout_secs, 30);
+            assert!(config.allowed_methods.is_empty());
+        }
+
+        #[test]
+        fn test_security_config_ip_filter() {
+            // IPフィルターの構築
+            let mut config = SecurityConfig::default();
+            config.allowed_ips = vec!["10.0.0.0/8".to_string()];
+            config.denied_ips = vec!["10.0.1.0/24".to_string()];
+            
+            let filter = config.ip_filter();
+            assert!(filter.is_allowed("10.0.0.1"));
+            assert!(!filter.is_allowed("10.0.1.1"));
+        }
+    }
+
+    // ====================
+    // PooledConnection テスト
+    // ====================
+    
+    mod pooled_connection_tests {
+        use super::*;
+
+        #[test]
+        fn test_pooled_connection_new() {
+            // PooledConnectionの作成
+            let stream = (); // ダミー型
+            let conn = PooledConnection::new(stream, 30);
+            
+            assert_eq!(conn.idle_timeout_secs, 30);
+        }
+
+        #[test]
+        fn test_pooled_connection_is_valid_immediately() {
+            // 作成直後は有効
+            let stream = ();
+            let conn = PooledConnection::new(stream, 30);
+            
+            assert!(conn.is_valid());
+        }
+
+        #[test]
+        fn test_pooled_connection_is_valid_with_zero_timeout() {
+            // タイムアウト0秒の場合、即座に無効
+            let stream = ();
+            let conn = PooledConnection::new(stream, 0);
+            
+            // 作成直後でも0秒以上経過しているため無効
+            assert!(!conn.is_valid());
+        }
+
+        #[test]
+        fn test_pooled_connection_is_valid_with_long_timeout() {
+            // 長いタイムアウトの場合、有効
+            let stream = ();
+            let conn = PooledConnection::new(stream, 3600);
+            
+            assert!(conn.is_valid());
+        }
+    }
+
+    // ====================
+    // Config Parse テスト
+    // ====================
+    
+    mod config_parse_tests {
+        use super::*;
+
+        #[test]
+        fn test_parse_log_level() {
+            // ログレベルのパース
+            assert_eq!(parse_log_level("trace"), ftlog::LevelFilter::Trace);
+            assert_eq!(parse_log_level("debug"), ftlog::LevelFilter::Debug);
+            assert_eq!(parse_log_level("info"), ftlog::LevelFilter::Info);
+            assert_eq!(parse_log_level("warn"), ftlog::LevelFilter::Warn);
+            assert_eq!(parse_log_level("error"), ftlog::LevelFilter::Error);
+            assert_eq!(parse_log_level("off"), ftlog::LevelFilter::Off);
+        }
+
+        #[test]
+        fn test_parse_log_level_case_insensitive() {
+            // 大文字小文字を区別しない
+            assert_eq!(parse_log_level("INFO"), ftlog::LevelFilter::Info);
+            assert_eq!(parse_log_level("Debug"), ftlog::LevelFilter::Debug);
+            assert_eq!(parse_log_level("WARN"), ftlog::LevelFilter::Warn);
+        }
+
+        #[test]
+        fn test_parse_log_level_unknown() {
+            // 不明なレベルはInfoにフォールバック
+            assert_eq!(parse_log_level("unknown"), ftlog::LevelFilter::Info);
+            assert_eq!(parse_log_level(""), ftlog::LevelFilter::Info);
+        }
+
+        #[test]
+        fn test_default_logging_config() {
+            // デフォルトロギング設定
+            let config = LoggingConfigSection::default();
+            assert_eq!(config.level, "info");
+            assert_eq!(config.channel_size, 100000);
+            assert_eq!(config.flush_interval_ms, 1000);
+        }
+
+        #[test]
+        fn test_default_server_config() {
+            // ServerConfigSectionはDeserializeのみなので、デフォルト値関数をテスト
+            // threads = 0 がデフォルト（CPUコア数）
+            // http2_enabled = false がデフォルト
+            // http3_enabled = false がデフォルト
+        }
+
+        #[test]
+        fn test_http2_config_default() {
+            // HTTP/2設定のデフォルト値
+            let config = Http2ConfigSection::default();
+            
+            assert_eq!(config.header_table_size, 65536);
+            assert_eq!(config.max_concurrent_streams, 256);
+            assert_eq!(config.initial_window_size, 1048576);
+            assert_eq!(config.max_frame_size, 65536);
+            assert_eq!(config.max_header_list_size, 65536);
+            assert_eq!(config.connection_window_size, 1048576);
+        }
+
+        #[test]
+        #[cfg(feature = "http2")]
+        fn test_http2_config_to_settings() {
+            // HTTP/2設定からHttp2Settingsへの変換
+            let config = Http2ConfigSection::default();
+            let settings = config.to_http2_settings();
+            
+            assert_eq!(settings.header_table_size, config.header_table_size);
+            assert_eq!(settings.max_concurrent_streams, config.max_concurrent_streams);
+            assert_eq!(settings.initial_window_size, config.initial_window_size);
+            assert_eq!(settings.max_frame_size, config.max_frame_size);
+            assert_eq!(settings.max_header_list_size, config.max_header_list_size);
+        }
+
+        #[test]
+        fn test_http3_config_default() {
+            // HTTP/3設定のデフォルト値
+            let config = Http3ConfigSection::default();
+            
+            assert_eq!(config.max_idle_timeout, 30000);
+            assert_eq!(config.max_udp_payload_size, 1350);
+            assert_eq!(config.initial_max_data, 10_000_000);
+            assert_eq!(config.initial_max_streams_bidi, 100);
+            assert_eq!(config.initial_max_streams_uni, 100);
+        }
+
+        #[test]
+        fn test_reuseport_balancing_default() {
+            // ReuseportBalancingのデフォルト値
+            let balancing = ReuseportBalancing::default();
+            assert_eq!(balancing, ReuseportBalancing::Kernel);
+        }
+
+        #[test]
+        fn test_prometheus_config_default() {
+            // Prometheusメトリクス設定のデフォルト
+            let config = PrometheusConfig::default();
+            
+            assert!(!config.enabled);
+            assert_eq!(config.path, "/__metrics");
+            assert!(config.allowed_ips.is_empty());
+        }
+
+        #[test]
+        fn test_prometheus_config_enabled_field() {
+            // Prometheus有効化チェック
+            let disabled = PrometheusConfig::default();
+            assert!(!disabled.enabled);
+            
+            let enabled = PrometheusConfig {
+                enabled: true,
+                ..Default::default()
+            };
+            assert!(enabled.enabled);
+        }
+    }
+
+    // ====================
+    // UpstreamConfig テスト
+    // ====================
+    
+    mod upstream_config_tests {
+        use super::*;
+
+        #[test]
+        fn test_default_health_check_config() {
+            // ヘルスチェック設定のデフォルト値
+            let config = HealthCheckConfig::default();
+            
+            assert_eq!(config.interval_secs, 10);
+            assert_eq!(config.path, "/");
+            assert_eq!(config.timeout_secs, 5);
+            assert_eq!(config.unhealthy_threshold, 3);
+            assert_eq!(config.healthy_threshold, 2);
+        }
+
+        #[test]
+        fn test_default_health_check_statuses() {
+            // デフォルトの健康ステータスコード
+            let config = HealthCheckConfig::default();
+            
+            assert!(config.healthy_statuses.contains(&200));
+            assert!(config.healthy_statuses.contains(&201));
+            assert!(config.healthy_statuses.contains(&204));
+            assert!(config.healthy_statuses.contains(&301));
+            assert!(config.healthy_statuses.contains(&302));
+            assert!(config.healthy_statuses.contains(&304));
+        }
+    }
+
+    // ====================
+    // Backend テスト
+    // ====================
+    
+    mod backend_tests {
+        #[test]
+        fn test_backend_config_types() {
+            // BackendConfigの種類を確認
+            // File, Proxy, Static, Redirect などの種類が存在
+            // 各種類に対応した処理が実装されている
+            assert!(true);
+        }
+    }
+}

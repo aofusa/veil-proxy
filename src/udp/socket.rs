@@ -175,5 +175,68 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
-    // 非同期テストは monoio ランタイムが必要
+    // ====================
+    // 定数テスト
+    // ====================
+
+    #[test]
+    fn test_gso_segment_size() {
+        // GSO セグメントサイズは適切な値
+        // 通常のQUICパケットサイズに合わせて設定
+        assert_eq!(GSO_SEGMENT_SIZE, 1200);
+        assert!(GSO_SEGMENT_SIZE > 0);
+        assert!(GSO_SEGMENT_SIZE <= 65535); // UDPペイロード最大
+    }
+
+    #[test]
+    fn test_recv_buffer_size() {
+        // 受信バッファサイズは十分な大きさ
+        assert_eq!(RECV_BUFFER_SIZE, 65536);
+        assert!(RECV_BUFFER_SIZE >= GSO_SEGMENT_SIZE);
+    }
+
+    // ====================
+    // create_recv_buffer テスト
+    // ====================
+
+    #[test]
+    fn test_create_recv_buffer() {
+        // 受信バッファの作成
+        let buf = create_recv_buffer();
+        
+        assert_eq!(buf.len(), RECV_BUFFER_SIZE);
+        assert!(buf.iter().all(|&b| b == 0)); // ゼロ初期化
+    }
+
+    #[test]
+    fn test_create_recv_buffer_capacity() {
+        // 容量も正しく設定されている
+        let buf = create_recv_buffer();
+        
+        assert!(buf.capacity() >= RECV_BUFFER_SIZE);
+    }
+
+    // ====================
+    // SocketAddr テスト
+    // ====================
+
+    #[test]
+    fn test_socket_addr_v4() {
+        // IPv4アドレスの作成
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        
+        assert_eq!(addr.port(), 8080);
+        assert!(addr.is_ipv4());
+    }
+
+    #[test]
+    fn test_socket_addr_any() {
+        // 任意アドレス (0.0.0.0)
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+        
+        assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
+    }
+
+    // 注: 実際のソケット操作（bind, recv, send）はmonoioランタイムが必要
+    // これらは統合テストで実施することを推奨
 }
