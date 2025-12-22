@@ -3,7 +3,7 @@
 <p align="center">
   <img src="docs/images/veil_logo.webp" alt="Veil ロゴ" width="300" align="middle" />
   &nbsp;&nbsp;&nbsp;
-  <img src="docs/images/veil_logo_text.svg" alt="Veil" height="100" align="middle" />
+  <img src="docs/images/veil_logo_text.svg" alt="Veil" height="50" align="middle" />
 </p>
 
 # Veil - High-Performance Reverse Proxy Server
