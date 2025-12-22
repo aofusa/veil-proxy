@@ -9394,41 +9394,53 @@ async fn handle_proxy(
             ) {
                 // グローバルキャッシュからエントリを取得
                 if let Some(cache_manager) = cache::get_global_cache() {
-                    if let Some(cached_entry) = cache_manager.get(&cache_key) {
+                    // 有効なエントリを取得
+                    let (cached_entry, is_stale) = if let Some(entry) = cache_manager.get(&cache_key) {
+                        (Some(entry), false)
+                    } else if cache_config.stale_while_revalidate {
+                        // 期限切れでもstale-while-revalidate期間内なら使用
+                        // デフォルトで60秒のstale期間を許容
+                        if let Some(entry) = cache_manager.get_stale(&cache_key, 60) {
+                            debug!("Using stale cache entry for {} {}", host_str, path_str);
+                            (Some(entry), true)
+                        } else {
+                            (None, false)
+                        }
+                    } else {
+                        (None, false)
+                    };
+                    
+                    if let Some(cached_entry) = cached_entry {
                         // キャッシュヒット！
-                        debug!("Cache HIT for {} {}", host_str, path_str);
+                        debug!("Cache {} for {} {}", if is_stale { "STALE" } else { "HIT" }, host_str, path_str);
                         record_cache_hit(host_str);
                         
+                        // ETag/If-None-Match 検証（304レスポンス）
+                        if cache_config.enable_etag {
+                            if let Some(client_etag) = cache::CachePolicy::get_if_none_match(headers) {
+                                if let Some(ref cached_etag) = cached_entry.etag {
+                                    // ETagが一致すれば304 Not Modifiedを返す
+                                    let client_etag_str = std::str::from_utf8(client_etag).unwrap_or("");
+                                    if etag_matches(client_etag_str, cached_etag) {
+                                        debug!("ETag match, returning 304 Not Modified");
+                                        let response = build_304_response(&cached_entry, client_wants_close, is_stale);
+                                        match timeout(WRITE_TIMEOUT, client_stream.write_all(response)).await {
+                                            Ok((Ok(_), _)) => {
+                                                return Some((client_stream, 304, 0, client_wants_close));
+                                            }
+                                            _ => {
+                                                return None;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        
                         // キャッシュからレスポンスを返す
+                        // メモリキャッシュの場合
                         if let Some(body_data) = cached_entry.memory_body() {
-                            let mut response = Vec::with_capacity(512 + body_data.len());
-                            
-                            // ステータスライン
-                            response.extend_from_slice(b"HTTP/1.1 ");
-                            let mut status_buf = itoa::Buffer::new();
-                            response.extend_from_slice(status_buf.format(cached_entry.status_code).as_bytes());
-                            response.extend_from_slice(b" OK\r\n");
-                            
-                            // ヘッダー
-                            for (name, value) in cached_entry.headers.iter() {
-                                response.extend_from_slice(name);
-                                response.extend_from_slice(b": ");
-                                response.extend_from_slice(value);
-                                response.extend_from_slice(b"\r\n");
-                            }
-                            
-                            // X-Cache ヘッダー
-                            response.extend_from_slice(b"X-Cache: HIT\r\n");
-                            
-                            // Connection ヘッダー
-                            if client_wants_close {
-                                response.extend_from_slice(b"Connection: close\r\n");
-                            } else {
-                                response.extend_from_slice(b"Connection: keep-alive\r\n");
-                            }
-                            
-                            response.extend_from_slice(b"\r\n");
-                            response.extend_from_slice(body_data);
+                            let response = build_cached_response(&cached_entry, body_data, client_wants_close, is_stale);
                             
                             match timeout(WRITE_TIMEOUT, client_stream.write_all(response)).await {
                                 Ok((Ok(_), _)) => {
@@ -9436,6 +9448,20 @@ async fn handle_proxy(
                                 }
                                 _ => {
                                     return None;
+                                }
+                            }
+                        }
+                        // ディスクキャッシュの場合
+                        else if let Some(disk_path) = cached_entry.disk_path() {
+                            debug!("Serving from disk cache: {:?}", disk_path);
+                            match serve_from_disk_cache(&mut client_stream, &cached_entry, disk_path, client_wants_close, is_stale).await {
+                                Some((status_code, body_size)) => {
+                                    return Some((client_stream, status_code, body_size, client_wants_close));
+                                }
+                                None => {
+                                    // ディスク読み込み失敗、キャッシュエントリを無効化してバックエンドに転送
+                                    warn!("Failed to read disk cache: {:?}", disk_path);
+                                    cache_manager.invalidate(&cache_key);
                                 }
                             }
                         }
@@ -9648,6 +9674,47 @@ async fn handle_proxy(
     
     // 接続カウンターを減少（Least Connections 用）
     server.release();
+    
+    // stale-if-error: バックエンドエラー時にstaleキャッシュを返す
+    if cache_config.stale_if_error {
+        if let Some((mut client_stream, status_code, _, _)) = result {
+            // バックエンドエラー（502, 504）の場合
+            if status_code == 502 || status_code == 504 {
+                // staleキャッシュを確認
+                if let Some(cache_key) = cache_save_ctx.as_ref().map(|c| c.key.clone()) {
+                    if let Some(cache_manager) = cache::get_global_cache() {
+                        // 最大1時間のstaleキャッシュを許容
+                        if let Some(stale_entry) = cache_manager.get_stale(&cache_key, 3600) {
+                            debug!("stale-if-error: serving stale cache for {}", host_str);
+                            
+                            // staleキャッシュを返す
+                            if let Some(body_data) = stale_entry.memory_body() {
+                                let response = build_cached_response(&stale_entry, body_data, client_wants_close, true);
+                                match timeout(WRITE_TIMEOUT, client_stream.write_all(response)).await {
+                                    Ok((Ok(_), _)) => {
+                                        return Some((client_stream, stale_entry.status_code, body_data.len() as u64, client_wants_close));
+                                    }
+                                    _ => {
+                                        return None;
+                                    }
+                                }
+                            } else if let Some(disk_path) = stale_entry.disk_path() {
+                                match serve_from_disk_cache(&mut client_stream, &stale_entry, disk_path, client_wants_close, true).await {
+                                    Some((code, size)) => {
+                                        return Some((client_stream, code, size, client_wants_close));
+                                    }
+                                    None => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // staleキャッシュがない場合は元のエラーレスポンスをそのまま返す
+            return Some((client_stream, status_code, 0, client_wants_close));
+        }
+        return result;
+    }
     
     result
 }
@@ -9973,6 +10040,154 @@ async fn proxy_h2c(
     Some((client_stream, status_code, resp_size, client_wants_close))
 }
 
+// ====================
+// キャッシュ応答ヘルパー関数
+// ====================
+
+/// ETagが一致するかチェック
+/// 
+/// weak比較をサポート（W/"..."形式）
+#[inline]
+fn etag_matches(client_etag: &str, cached_etag: &str) -> bool {
+    // "*" は全てにマッチ
+    if client_etag.trim() == "*" {
+        return true;
+    }
+    
+    // 複数のETagをカンマ区切りで指定可能
+    for etag in client_etag.split(',') {
+        let etag = etag.trim();
+        // weak比較（W/プレフィックスを無視）
+        let etag_value = etag.strip_prefix("W/").unwrap_or(etag);
+        let cached_value = cached_etag.strip_prefix("W/").unwrap_or(cached_etag);
+        
+        if etag_value == cached_value {
+            return true;
+        }
+    }
+    
+    false
+}
+
+/// 304 Not Modified レスポンスを構築
+fn build_304_response(cached_entry: &cache::CacheEntry, client_wants_close: bool, is_stale: bool) -> Vec<u8> {
+    let mut response = Vec::with_capacity(256);
+    
+    response.extend_from_slice(b"HTTP/1.1 304 Not Modified\r\n");
+    
+    // 重要なヘッダーのみ含める
+    for (name, value) in cached_entry.headers.iter() {
+        // ETag, Last-Modified, Cache-Control, Vary, Content-Location のみ
+        if name.eq_ignore_ascii_case(b"etag") 
+            || name.eq_ignore_ascii_case(b"last-modified")
+            || name.eq_ignore_ascii_case(b"cache-control")
+            || name.eq_ignore_ascii_case(b"vary")
+            || name.eq_ignore_ascii_case(b"content-location")
+        {
+            response.extend_from_slice(name);
+            response.extend_from_slice(b": ");
+            response.extend_from_slice(value);
+            response.extend_from_slice(b"\r\n");
+        }
+    }
+    
+    // X-Cache ヘッダー
+    if is_stale {
+        response.extend_from_slice(b"X-Cache: STALE\r\n");
+    } else {
+        response.extend_from_slice(b"X-Cache: HIT\r\n");
+    }
+    
+    // Connection ヘッダー
+    if client_wants_close {
+        response.extend_from_slice(b"Connection: close\r\n");
+    } else {
+        response.extend_from_slice(b"Connection: keep-alive\r\n");
+    }
+    
+    response.extend_from_slice(b"\r\n");
+    response
+}
+
+/// キャッシュからのレスポンスを構築（メモリキャッシュ用）
+fn build_cached_response(cached_entry: &cache::CacheEntry, body_data: &[u8], client_wants_close: bool, is_stale: bool) -> Vec<u8> {
+    let mut response = Vec::with_capacity(512 + body_data.len());
+    
+    // ステータスライン
+    response.extend_from_slice(b"HTTP/1.1 ");
+    let mut status_buf = itoa::Buffer::new();
+    response.extend_from_slice(status_buf.format(cached_entry.status_code).as_bytes());
+    response.extend_from_slice(b" OK\r\n");
+    
+    // ヘッダー
+    for (name, value) in cached_entry.headers.iter() {
+        response.extend_from_slice(name);
+        response.extend_from_slice(b": ");
+        response.extend_from_slice(value);
+        response.extend_from_slice(b"\r\n");
+    }
+    
+    // X-Cache ヘッダー
+    if is_stale {
+        response.extend_from_slice(b"X-Cache: STALE\r\n");
+    } else {
+        response.extend_from_slice(b"X-Cache: HIT\r\n");
+    }
+    
+    // Connection ヘッダー
+    if client_wants_close {
+        response.extend_from_slice(b"Connection: close\r\n");
+    } else {
+        response.extend_from_slice(b"Connection: keep-alive\r\n");
+    }
+    
+    response.extend_from_slice(b"\r\n");
+    response.extend_from_slice(body_data);
+    
+    response
+}
+
+/// ディスクキャッシュからレスポンスを提供
+/// 
+/// 戻り値: Some((status_code, body_size)) または None（エラー時）
+async fn serve_from_disk_cache(
+    client_stream: &mut ServerTls,
+    cached_entry: &cache::CacheEntry,
+    disk_path: &std::path::Path,
+    client_wants_close: bool,
+    is_stale: bool,
+) -> Option<(u16, u64)> {
+    // ディスクからボディを読み込み（monoio::fs使用）
+    let body_data = match monoio::fs::File::open(disk_path).await {
+        Ok(file) => {
+            let file_size = cached_entry.body_size as usize;
+            let mut buf = Vec::with_capacity(file_size);
+            #[allow(clippy::uninit_vec)]
+            unsafe { buf.set_len(file_size); }
+            
+            match file.read_exact_at(buf, 0).await {
+                (Ok(_), data) => data,
+                (Err(e), _) => {
+                    error!("Failed to read disk cache file: {}", e);
+                    return None;
+                }
+            }
+        }
+        Err(e) => {
+            error!("Failed to open disk cache file: {}", e);
+            return None;
+        }
+    };
+    
+    // レスポンスを構築
+    let response = build_cached_response(cached_entry, &body_data, client_wants_close, is_stale);
+    
+    match timeout(WRITE_TIMEOUT, client_stream.write_all(response)).await {
+        Ok((Ok(_), _)) => Some((cached_entry.status_code, body_data.len() as u64)),
+        _ => None,
+    }
+}
+
 /// ステータスコードに対応する理由フレーズを返す
 #[cfg(feature = "http2")]
 fn status_reason_phrase(status: u16) -> &'static str {
@@ -10198,12 +10413,23 @@ async fn buffer_response_body(
         if remaining > 0 {
             // バッファサイズ制限チェック
             if body.len() + remaining > buffering_config.max_memory_buffer {
-                // 制限超過: 可能な範囲でバッファリング
+                // 制限超過: ディスクスピルオーバーまたは部分バッファリング
+                if buffering_config.disk_buffer_available() {
+                    // ディスクスピルオーバー（簡易実装）
+                    // 現在は警告ログを出力して可能な範囲でメモリにバッファリング
+                    warn!("Response size ({} bytes) exceeds memory buffer limit ({} bytes), disk spillover not fully implemented",
+                          body.len() + remaining, buffering_config.max_memory_buffer);
+                }
+                
+                // 可能な範囲でメモリにバッファリング
                 let max_additional = buffering_config.max_memory_buffer.saturating_sub(body.len());
                 if max_additional > 0 {
                     let additional = buffer_exact_bytes(backend_stream, max_additional, &mut cache_ctx).await;
                     body.extend(additional);
                 }
+                
+                // 残りはストリーミングとして転送されない（切り捨て）
+                // TODO: ディスクへのスピルオーバーを実装
             } else {
                 let additional = buffer_exact_bytes(backend_stream, remaining, &mut cache_ctx).await;
                 body.extend(additional);
@@ -10225,6 +10451,10 @@ async fn buffer_response_body(
         loop {
             // バッファサイズ制限チェック
             if body.len() >= buffering_config.max_memory_buffer {
+                if buffering_config.disk_buffer_available() {
+                    warn!("Chunked response exceeds memory buffer limit ({} bytes), disk spillover not fully implemented",
+                          buffering_config.max_memory_buffer);
+                }
                 break;
             }
             
