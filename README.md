@@ -1,5 +1,10 @@
 [English](README.md) | [日本語](README.ja.md)
 
+<p align="center">
+  <img src="docs/images/veil_logo.webp" alt="Veil Logo" width="200" />
+  <img src="docs/images/veil_logo_text.svg" alt="Veil" height="120" style="vertical-align: middle;" />
+</p>
+
 # Veil - High-Performance Reverse Proxy Server
 
 A high-performance reverse proxy server using io_uring (monoio) and rustls.
@@ -2117,6 +2122,26 @@ In this configuration, systemd creates the outer "container" and bubblewrap prov
 - [Landlock](https://docs.kernel.org/userspace-api/landlock.html): Filesystem sandbox
 - [io_uring Security](https://www.kernel.org/doc/html/latest/userspace-api/io_uring.html): io_uring security considerations
 - [bubblewrap](https://github.com/containers/bubblewrap): Unprivileged sandboxing tool
+
+## Logos
+
+### Main Logo (WebP)
+
+<p align="center">
+  <img src="docs/images/veil_logo.webp" alt="Veil Main Logo" width="400" />
+</p>
+
+### Alternative Logo (SVG)
+
+<p align="center">
+  <img src="docs/images/veil_logo_alternative.svg" alt="Veil Alternative Logo" width="400" />
+</p>
+
+### Logo Text (SVG)
+
+<p align="center">
+  <img src="docs/images/veil_logo_text.svg" alt="Veil Logo Text" width="400" />
+</p>
 
 ## License
 

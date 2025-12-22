@@ -1,5 +1,10 @@
 [English](README.md) | [日本語](README.ja.md)
 
+<p align="center">
+  <img src="docs/images/veil_logo.webp" alt="Veil ロゴ" width="200" />
+  <img src="docs/images/veil_logo_text.svg" alt="Veil" height="120" style="vertical-align: middle;" />
+</p>
+
 # Veil - High-Performance Reverse Proxy Server
 
 io_uring (monoio) と rustls を使用した高性能リバースプロキシサーバー。
@@ -2117,6 +2122,26 @@ ExecStart=/usr/bin/bwrap \
 - [Landlock](https://docs.kernel.org/userspace-api/landlock.html): ファイルシステムサンドボックス
 - [io_uring Security](https://www.kernel.org/doc/html/latest/userspace-api/io_uring.html): io_uringセキュリティ考慮事項
 - [bubblewrap](https://github.com/containers/bubblewrap): 非特権サンドボックスツール
+
+## ロゴ
+
+### メインロゴ (WebP)
+
+<p align="center">
+  <img src="docs/images/veil_logo.webp" alt="Veil メインロゴ" width="400" />
+</p>
+
+### 代替ロゴ (SVG)
+
+<p align="center">
+  <img src="docs/images/veil_logo_alternative.svg" alt="Veil 代替ロゴ" width="400" />
+</p>
+
+### ロゴ文字 (SVG)
+
+<p align="center">
+  <img src="docs/images/veil_logo_text.svg" alt="Veil ロゴ文字" width="400" />
+</p>
 
 ## ライセンス
 
