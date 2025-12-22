@@ -1,15 +1,10 @@
 [English](README.md) | [日本語](README.ja.md)
 
-<table align="center">
-  <tr>
-    <td align="center">
-      <img src="docs/images/veil_logo.webp" alt="Veil Logo" width="150" />
-    </td>
-    <td align="center">
-      <img src="docs/images/veil_logo_text.svg" alt="Veil" height="100" />
-    </td>
-  </tr>
-</table>
+<p align="center">
+  <img src="docs/images/veil_logo.webp" alt="Veil Logo" width="300" align="middle" />
+  &nbsp;&nbsp;&nbsp;
+  <img src="docs/images/veil_logo_text.svg" alt="Veil" height="100" align="middle" />
+</p>
 
 # Veil - High-Performance Reverse Proxy Server
 
