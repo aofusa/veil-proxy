@@ -199,7 +199,7 @@ impl CacheManager {
         if let Some(entry) = self.index.remove(key) {
             // ディスクファイルも削除
             if let Some(path) = entry.disk_path() {
-                if let Some(ref disk) = self.disk {
+                if self.disk.is_some() {
                     let _ = std::fs::remove_file(path);
                 }
             }
@@ -207,7 +207,8 @@ impl CacheManager {
     }
     
     /// パターンに一致するエントリを削除
-    pub fn invalidate_pattern(&self, pattern: &str) -> usize {
+    #[allow(dead_code)]
+    pub fn invalidate_pattern(&self, _pattern: &str) -> usize {
         // 注意: 現在の実装ではパターンマッチングは非効率
         // TODO: より効率的な実装
         0

@@ -73,6 +73,7 @@ impl DiskCache {
     }
     
     /// ハッシュ値からファイルパスを生成
+    #[allow(dead_code)]
     fn hash_to_path(&self, hash: u64) -> PathBuf {
         let dir1 = format!("{:02x}", (hash >> 56) as u8);
         let dir2 = format!("{:02x}", (hash >> 48) as u8);
@@ -260,6 +261,7 @@ impl DiskCache {
 
 /// monoio非同期I/O操作
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 pub mod async_io {
     use monoio::fs::File;
     use std::io;
@@ -311,6 +313,7 @@ pub mod async_io {
 }
 
 /// CacheStorageからディスクパスを抽出するヘルパー
+#[allow(dead_code)]
 pub fn get_disk_path(storage: &CacheStorage) -> Option<&PathBuf> {
     match storage {
         CacheStorage::Disk { path, .. } => Some(path),

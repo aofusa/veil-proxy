@@ -32,6 +32,7 @@ struct MemoryCacheEntry {
     /// キャッシュエントリ
     entry: Arc<CacheEntry>,
     /// 挿入時刻
+    #[allow(dead_code)]
     inserted_at: Instant,
 }
 
@@ -206,6 +207,7 @@ impl MemoryCache {
 }
 
 /// ボディデータからCacheEntryを作成するヘルパー
+#[allow(dead_code)]
 pub fn create_memory_entry(
     status_code: u16,
     headers: Vec<(Box<[u8]>, Box<[u8]>)>,

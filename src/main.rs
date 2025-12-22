@@ -3679,6 +3679,7 @@ impl Backend {
     
     /// このバックエンドのバッファリング設定を取得
     #[inline]
+    #[allow(dead_code)]
     fn buffering(&self) -> Option<&buffering::BufferingConfig> {
         match self {
             Backend::Proxy(_, _, _, buffering, _) => Some(buffering),
@@ -3688,9 +3689,8 @@ impl Backend {
     
     /// このバックエンドのキャッシュ設定を取得
     #[inline]
+    #[allow(dead_code)]
     fn cache(&self) -> Option<&cache::CacheConfig> {
-        static DEFAULT_CACHE: Lazy<cache::CacheConfig> = Lazy::new(cache::CacheConfig::default);
-        
         match self {
             Backend::Proxy(_, _, _, _, cache) => Some(cache),
             Backend::SendFile(_, _, _, _, cache) => Some(cache),
@@ -5328,6 +5328,27 @@ fn main() {
     };
     CURRENT_CONFIG.store(Arc::new(runtime_config));
     info!("Runtime configuration initialized (hot reload enabled via SIGHUP)");
+    
+    // グローバルプロキシキャッシュの初期化
+    // デフォルト設定でグローバルキャッシュを初期化（各ルートのcache設定で有効化される）
+    let global_cache_config = cache::CacheConfig {
+        enabled: true,
+        max_memory_size: 100 * 1024 * 1024, // 100MB
+        disk_path: None,
+        max_disk_size: 1024 * 1024 * 1024, // 1GB
+        memory_threshold: 64 * 1024, // 64KB
+        default_ttl_secs: 300, // 5分
+        ..Default::default()
+    };
+    
+    match cache::init_global_cache(global_cache_config) {
+        Ok(()) => {
+            info!("Global proxy cache initialized (max_memory=100MB, default_ttl=300s)");
+        }
+        Err(e) => {
+            warn!("Failed to initialize global cache: {}", e);
+        }
+    }
     
     // HTTP/2・HTTP/3 の設定ログ
     if loaded_config.http2_enabled {
@@ -8024,8 +8045,24 @@ async fn handle_backend(
     client_ip: &str,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     match backend {
-        Backend::Proxy(upstream_group, security, compression, _buffering, _cache) => {
-            handle_proxy(tls_stream, &upstream_group, &security, &compression, method, req_path, &prefix, content_length, is_chunked, headers, initial_body, client_wants_close, client_ip).await
+        Backend::Proxy(upstream_group, security, compression, buffering, cache) => {
+            handle_proxy(
+                tls_stream, 
+                &upstream_group, 
+                &security, 
+                &compression,
+                &buffering,
+                &cache,
+                method, 
+                req_path, 
+                &prefix, 
+                content_length, 
+                is_chunked, 
+                headers, 
+                initial_body, 
+                client_wants_close, 
+                client_ip
+            ).await
         }
         Backend::MemoryFile(data, mime_type, security) => {
             // ファイル完全一致チェック
@@ -9049,6 +9086,8 @@ async fn handle_proxy(
     upstream_group: &UpstreamGroup,
     security: &SecurityConfig,
     compression: &CompressionConfig,
+    buffering_config: &buffering::BufferingConfig,
+    cache_config: &cache::CacheConfig,
     method: &[u8],
     req_path: &[u8],
     prefix: &[u8],
@@ -9064,6 +9103,92 @@ async fn handle_proxy(
         .find(|(name, _)| name.eq_ignore_ascii_case(b"accept-encoding"))
         .map(|(_, value)| AcceptedEncoding::parse(value))
         .unwrap_or(AcceptedEncoding::Identity);
+    
+    // ホスト名を取得
+    let host_str = headers.iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(b"host"))
+        .and_then(|(_, v)| std::str::from_utf8(v).ok())
+        .unwrap_or("unknown");
+    
+    let path_str = std::str::from_utf8(req_path).unwrap_or("/");
+    
+    // ===================
+    // キャッシュヒット判定
+    // ===================
+    if cache_config.enabled {
+        // キャッシュ対象かチェック
+        if cache_config.is_cacheable_method(method) && !cache_config.should_bypass(path_str) {
+            // キャッシュキー生成
+            let query = path_str.find('?').map(|i| &path_str[i+1..]);
+            let path_only = path_str.find('?').map(|i| &path_str[..i]).unwrap_or(path_str);
+            
+            if let Some(cache_key) = cache::CacheKey::from_request(
+                method,
+                host_str,
+                path_only,
+                query,
+                cache_config.include_query,
+                None, // Varyヘッダーは初回リクエストでは不明
+            ) {
+                // グローバルキャッシュからエントリを取得
+                if let Some(cache_manager) = cache::get_global_cache() {
+                    if let Some(cached_entry) = cache_manager.get(&cache_key) {
+                        // キャッシュヒット！
+                        debug!("Cache HIT for {} {}", host_str, path_str);
+                        
+                        // キャッシュからレスポンスを返す
+                        if let Some(body_data) = cached_entry.memory_body() {
+                            let mut response = Vec::with_capacity(512 + body_data.len());
+                            
+                            // ステータスライン
+                            response.extend_from_slice(b"HTTP/1.1 ");
+                            let mut status_buf = itoa::Buffer::new();
+                            response.extend_from_slice(status_buf.format(cached_entry.status_code).as_bytes());
+                            response.extend_from_slice(b" OK\r\n");
+                            
+                            // ヘッダー
+                            for (name, value) in cached_entry.headers.iter() {
+                                response.extend_from_slice(name);
+                                response.extend_from_slice(b": ");
+                                response.extend_from_slice(value);
+                                response.extend_from_slice(b"\r\n");
+                            }
+                            
+                            // X-Cache ヘッダー
+                            response.extend_from_slice(b"X-Cache: HIT\r\n");
+                            
+                            // Connection ヘッダー
+                            if client_wants_close {
+                                response.extend_from_slice(b"Connection: close\r\n");
+                            } else {
+                                response.extend_from_slice(b"Connection: keep-alive\r\n");
+                            }
+                            
+                            response.extend_from_slice(b"\r\n");
+                            response.extend_from_slice(body_data);
+                            
+                            match timeout(WRITE_TIMEOUT, client_stream.write_all(response)).await {
+                                Ok((Ok(_), _)) => {
+                                    return Some((client_stream, cached_entry.status_code, body_data.len() as u64, client_wants_close));
+                                }
+                                _ => {
+                                    return None;
+                                }
+                            }
+                        }
+                    } else {
+                        debug!("Cache MISS for {} {}", host_str, path_str);
+                    }
+                }
+            }
+        }
+    }
+    
+    // バッファリングモードのログ出力（デバッグ用）
+    if buffering_config.is_enabled() {
+        debug!("Buffering enabled for {} {} (mode={:?})", 
+               host_str, path_str, buffering_config.mode);
+    }
     
     // ロードバランシング: UpstreamGroup からサーバーを選択
     let server = match upstream_group.select(client_ip) {

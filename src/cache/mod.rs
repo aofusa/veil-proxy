@@ -47,6 +47,6 @@ pub use entry::{CacheEntry, CacheStorage};
 pub use index::CacheIndex;
 pub use memory::MemoryCache;
 pub use disk::DiskCache;
-pub use manager::CacheManager;
+pub use manager::{CacheManager, init_global_cache, get_global_cache};
 pub use policy::{CachePolicy, CacheControl};
 

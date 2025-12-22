@@ -181,6 +181,7 @@ impl CacheStorage {
 }
 
 /// キャッシュエントリビルダー
+#[allow(dead_code)]
 pub struct CacheEntryBuilder {
     status_code: u16,
     headers: Vec<(Box<[u8]>, Box<[u8]>)>,
@@ -188,6 +189,7 @@ pub struct CacheEntryBuilder {
     max_age_secs: u64,
 }
 
+#[allow(dead_code)]
 impl CacheEntryBuilder {
     /// 新しいビルダーを作成
     pub fn new(status_code: u16) -> Self {
