@@ -6119,10 +6119,233 @@ fn spawn_reload_thread() {
     });
 }
 
-/// 健康チェックスレッドを起動
+/// stale-while-revalidate: バックグラウンドでキャッシュを更新
 /// 
-/// CURRENT_CONFIG から Upstream グループを取得し、
-/// 設定された間隔で各サーバーにHTTPリクエストを送信してヘルスをチェック。
+/// staleキャッシュを返した後、バックグラウンドでバックエンドに再リクエストし、
+/// レスポンスでキャッシュを更新します。
+fn spawn_background_revalidation(
+    cache_key: cache::CacheKey,
+    upstream_group: UpstreamGroup,
+    security: SecurityConfig,
+    method: Vec<u8>,
+    req_path: Vec<u8>,
+    prefix: Vec<u8>,
+    headers: Vec<(Box<[u8]>, Box<[u8]>)>,
+) {
+    monoio::spawn(async move {
+        debug!("Background revalidation started for {:?}", cache_key.path());
+        
+        // サーバーを選択
+        let server = match upstream_group.select("revalidation") {
+            Some(s) => s,
+            None => {
+                debug!("No healthy server for background revalidation");
+                return;
+            }
+        };
+        
+        let target = &server.target;
+        let addr = format!("{}:{}", target.host, target.port);
+        
+        // バックエンドに接続
+        let connect_timeout = Duration::from_secs(security.backend_connect_timeout_secs);
+        let connect_result = timeout(connect_timeout, TcpStream::connect(&addr)).await;
+        
+        let mut backend_stream = match connect_result {
+            Ok(Ok(stream)) => {
+                let _ = stream.set_nodelay(true);
+                stream
+            }
+            _ => {
+                debug!("Background revalidation: failed to connect to {}", addr);
+                return;
+            }
+        };
+        
+        // リクエストを構築
+        let path_str = std::str::from_utf8(&req_path).unwrap_or("/");
+        let sub_path = if prefix.is_empty() {
+            path_str.to_string()
+        } else {
+            let prefix_str = std::str::from_utf8(&prefix).unwrap_or("");
+            if path_str.starts_with(prefix_str) {
+                path_str[prefix_str.len()..].to_string()
+            } else {
+                path_str.to_string()
+            }
+        };
+        
+        // ホスト名を取得
+        let host_header = headers.iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(b"host"))
+            .map(|(_, v)| v.as_ref())
+            .unwrap_or(target.host.as_bytes());
+        
+        let method_str = std::str::from_utf8(&method).unwrap_or("GET");
+        
+        // HTTPリクエストを構築
+        let mut request = Vec::with_capacity(512);
+        request.extend_from_slice(method_str.as_bytes());
+        request.extend_from_slice(b" ");
+        request.extend_from_slice(sub_path.as_bytes());
+        request.extend_from_slice(b" HTTP/1.1\r\nHost: ");
+        request.extend_from_slice(host_header);
+        request.extend_from_slice(b"\r\nConnection: close\r\n");
+        
+        // 元のヘッダーを追加（一部除外）
+        for (name, value) in &headers {
+            if name.eq_ignore_ascii_case(b"host") 
+                || name.eq_ignore_ascii_case(b"connection")
+                || name.eq_ignore_ascii_case(b"content-length")
+            {
+                continue;
+            }
+            request.extend_from_slice(name);
+            request.extend_from_slice(b": ");
+            request.extend_from_slice(value);
+            request.extend_from_slice(b"\r\n");
+        }
+        request.extend_from_slice(b"\r\n");
+        
+        // リクエスト送信
+        let write_result = timeout(WRITE_TIMEOUT, backend_stream.write_all(request)).await;
+        if !matches!(write_result, Ok((Ok(_), _))) {
+            debug!("Background revalidation: failed to send request");
+            return;
+        }
+        
+        // レスポンス受信
+        let mut accumulated = Vec::with_capacity(BUF_SIZE);
+        let mut status_code = 0u16;
+        
+        loop {
+            let read_buf = buf_get();
+            let read_result = timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
+            
+            let (res, mut returned_buf) = match read_result {
+                Ok(result) => result,
+                Err(_) => break,
+            };
+            
+            let n = match res {
+                Ok(0) | Err(_) => {
+                    buf_put(returned_buf);
+                    break;
+                }
+                Ok(n) => n,
+            };
+            
+            returned_buf.set_valid_len(n);
+            accumulated.extend_from_slice(returned_buf.as_valid_slice());
+            buf_put(returned_buf);
+            
+            // ヘッダー解析
+            if let Some(parsed) = parse_http_response(&accumulated) {
+                status_code = parsed.status_code;
+                let header_len = parsed.header_len;
+                let body_start = accumulated[header_len..].to_vec();
+                
+                // ボディを読み込み（Content-Length または接続終了まで）
+                let mut body = body_start;
+                if let Some(cl) = parsed.content_length {
+                    let remaining = cl.saturating_sub(body.len());
+                    if remaining > 0 {
+                        let additional = buffer_exact_bytes_simple(&mut backend_stream, remaining).await;
+                        body.extend(additional);
+                    }
+                } else if !parsed.is_chunked {
+                    // 接続終了まで読む（最大10MB）
+                    const MAX_SIZE: usize = 10 * 1024 * 1024;
+                    loop {
+                        if body.len() >= MAX_SIZE {
+                            break;
+                        }
+                        let read_buf = buf_get();
+                        let read_result = timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
+                        
+                        let (res, mut returned_buf) = match read_result {
+                            Ok(result) => result,
+                            Err(_) => break,
+                        };
+                        
+                        let n = match res {
+                            Ok(0) | Err(_) => {
+                                buf_put(returned_buf);
+                                break;
+                            }
+                            Ok(n) => n,
+                        };
+                        
+                        returned_buf.set_valid_len(n);
+                        body.extend_from_slice(returned_buf.as_valid_slice());
+                        buf_put(returned_buf);
+                    }
+                }
+                
+                // ヘッダー抽出
+                let headers_data = &accumulated[..header_len];
+                let mut headers_storage = [httparse::EMPTY_HEADER; 64];
+                let mut response = httparse::Response::new(&mut headers_storage);
+                
+                if response.parse(headers_data).is_ok() {
+                    let response_headers: Vec<(Box<[u8]>, Box<[u8]>)> = response.headers.iter()
+                        .map(|h| (h.name.as_bytes().into(), h.value.into()))
+                        .collect();
+                    
+                    // キャッシュを更新
+                    if let Some(cache_manager) = cache::get_global_cache() {
+                        if cache_manager.store(cache_key.clone(), status_code, response_headers, body) {
+                            info!("Background revalidation: cache updated for {:?}", cache_key.path());
+                        }
+                    }
+                }
+                
+                break;
+            }
+            
+            // ヘッダーが大きすぎる
+            if accumulated.len() > MAX_HEADER_SIZE {
+                break;
+            }
+        }
+        
+        debug!("Background revalidation completed (status={})", status_code);
+    });
+}
+
+/// バックグラウンド更新用の簡易バイト読み込み
+async fn buffer_exact_bytes_simple(
+    backend_stream: &mut TcpStream,
+    mut remaining: usize,
+) -> Vec<u8> {
+    let mut result = Vec::with_capacity(remaining);
+    
+    while remaining > 0 {
+        let read_buf = buf_get();
+        let read_result = timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
+        
+        let (res, mut returned_buf) = match read_result {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+        
+        let n = match res {
+            Ok(0) | Err(_) => {
+                buf_put(returned_buf);
+                break;
+            }
+            Ok(n) => n.min(remaining),
+        };
+        
+        returned_buf.set_valid_len(n);
+        result.extend_from_slice(&returned_buf.as_valid_slice()[..n]);
+        buf_put(returned_buf);
+        remaining = remaining.saturating_sub(n);
+    }
+    
+    result
+}
+
 /// キャッシュクリーンアップスレッドを起動
 /// 
 /// 定期的に以下の処理を実行:
@@ -9437,6 +9660,19 @@ async fn handle_proxy(
                             }
                         }
                         
+                        // stale-while-revalidate: バックグラウンド更新タスクをスポーン
+                        if is_stale {
+                            spawn_background_revalidation(
+                                cache_key.clone(),
+                                upstream_group.clone(),
+                                security.clone(),
+                                method.to_vec(),
+                                req_path.to_vec(),
+                                prefix.to_vec(),
+                                headers.to_vec(),
+                            );
+                        }
+                        
                         // キャッシュからレスポンスを返す
                         // メモリキャッシュの場合
                         if let Some(body_data) = cached_entry.memory_body() {
@@ -10218,6 +10454,35 @@ fn status_reason_phrase(status: u16) -> &'static str {
 }
 
 // ====================
+// バッファリング結果型
+// ====================
+
+/// バッファリングされたボディ結果
+enum BufferedBodyResult {
+    /// メモリ内にバッファリング
+    Memory(Vec<u8>),
+    /// ディスクにスピルオーバー
+    Disk {
+        path: std::path::PathBuf,
+        size: u64,
+    },
+    /// バッファリング失敗（ストリーミングにフォールバック）
+    Failed,
+}
+
+impl BufferedBodyResult {
+    /// サイズを取得
+    #[allow(dead_code)]
+    fn size(&self) -> u64 {
+        match self {
+            BufferedBodyResult::Memory(data) => data.len() as u64,
+            BufferedBodyResult::Disk { size, .. } => *size,
+            BufferedBodyResult::Failed => 0,
+        }
+    }
+}
+
+// ====================
 // HTTPリクエスト送信とレスポンス受信（バッファリング対応版）
 // ====================
 //
@@ -10280,7 +10545,7 @@ async fn proxy_http_request_buffered(
     let buffered = receive_and_buffer_response(backend_stream, buffering_config, cache_ctx).await;
     
     match buffered {
-        Some((status_code, headers_data, body_data, backend_wants_keep_alive)) => {
+        Some((status_code, headers_data, body_result, backend_wants_keep_alive)) => {
             // 5. バッファからクライアントへ送信
             // ヘッダー送信
             let write_result = timeout(
@@ -10289,23 +10554,50 @@ async fn proxy_http_request_buffered(
             ).await;
             
             if !matches!(write_result, Ok((Ok(_), _))) {
+                // ディスクファイルがあればクリーンアップ
+                if let BufferedBodyResult::Disk { ref path, .. } = body_result {
+                    let _ = std::fs::remove_file(path);
+                }
                 return Some((status_code, 0, false));
             }
             
             let mut total = headers_data.len() as u64;
             
-            // ボディ送信
-            if !body_data.is_empty() {
-                let write_result = timeout(
-                    Duration::from_secs(buffering_config.client_write_timeout_secs),
-                    client_stream.write_all(body_data.clone())
-                ).await;
-                
-                if !matches!(write_result, Ok((Ok(_), _))) {
+            // ボディ送信（メモリまたはディスクから）
+            match body_result {
+                BufferedBodyResult::Memory(body_data) => {
+                    if !body_data.is_empty() {
+                        let write_result = timeout(
+                            Duration::from_secs(buffering_config.client_write_timeout_secs),
+                            client_stream.write_all(body_data.clone())
+                        ).await;
+                        
+                        if !matches!(write_result, Ok((Ok(_), _))) {
+                            return Some((status_code, total, false));
+                        }
+                        
+                        total += body_data.len() as u64;
+                    }
+                }
+                BufferedBodyResult::Disk { path, size } => {
+                    // ディスクから読み込んでクライアントに送信
+                    match send_disk_buffer_to_client(client_stream, &path, size, buffering_config.client_write_timeout_secs).await {
+                        Some(sent) => {
+                            total += sent;
+                        }
+                        None => {
+                            // 送信失敗、クリーンアップ
+                            let _ = std::fs::remove_file(&path);
+                            return Some((status_code, total, false));
+                        }
+                    }
+                    // 成功後クリーンアップ
+                    let _ = std::fs::remove_file(&path);
+                }
+                BufferedBodyResult::Failed => {
+                    // バッファリング失敗
                     return Some((status_code, total, false));
                 }
-                
-                total += body_data.len() as u64;
             }
             
             Some((status_code, total, backend_wants_keep_alive))
@@ -10316,12 +10608,12 @@ async fn proxy_http_request_buffered(
 
 /// バックエンドからレスポンスを受信してバッファリング
 /// 
-/// 戻り値: Option<(status_code, headers_data, body_data, backend_wants_keep_alive)>
+/// 戻り値: Option<(status_code, headers_data, body_result, backend_wants_keep_alive)>
 async fn receive_and_buffer_response(
     backend_stream: &mut TcpStream,
     buffering_config: &buffering::BufferingConfig,
     mut cache_ctx: Option<&mut CacheSaveContext>,
-) -> Option<(u16, Vec<u8>, Vec<u8>, bool)> {
+) -> Option<(u16, Vec<u8>, BufferedBodyResult, bool)> {
     let mut accumulated = Vec::with_capacity(BUF_SIZE);
     
     // ヘッダー読み取り
@@ -10372,7 +10664,7 @@ async fn receive_and_buffer_response(
             }
             
             // ボディをバッファリング
-            let body_data = buffer_response_body(
+            let body_result = buffer_response_body_with_spillover(
                 backend_stream,
                 parsed.content_length,
                 parsed.is_chunked,
@@ -10381,7 +10673,7 @@ async fn receive_and_buffer_response(
                 cache_ctx,
             ).await;
             
-            return Some((status_code, headers_data, body_data, backend_wants_keep_alive));
+            return Some((status_code, headers_data, body_result, backend_wants_keep_alive));
         }
         
         // ヘッダーが大きすぎる場合は中止
@@ -10391,7 +10683,233 @@ async fn receive_and_buffer_response(
     }
 }
 
-/// レスポンスボディをバッファリング
+/// ディスクバッファをクライアントに送信
+async fn send_disk_buffer_to_client(
+    client_stream: &mut ServerTls,
+    path: &std::path::Path,
+    size: u64,
+    timeout_secs: u64,
+) -> Option<u64> {
+    // ディスクから読み込み
+    let file = match monoio::fs::File::open(path).await {
+        Ok(f) => f,
+        Err(e) => {
+            error!("Failed to open disk buffer: {}", e);
+            return None;
+        }
+    };
+    
+    let mut buf = Vec::with_capacity(size as usize);
+    #[allow(clippy::uninit_vec)]
+    unsafe { buf.set_len(size as usize); }
+    
+    let (res, data) = file.read_exact_at(buf, 0).await;
+    if res.is_err() {
+        error!("Failed to read disk buffer");
+        return None;
+    }
+    
+    // クライアントに送信
+    let write_result = timeout(
+        Duration::from_secs(timeout_secs),
+        client_stream.write_all(data)
+    ).await;
+    
+    match write_result {
+        Ok((Ok(_), _)) => Some(size),
+        _ => None,
+    }
+}
+
+/// レスポンスボディをバッファリング（ディスクスピルオーバー対応）
+async fn buffer_response_body_with_spillover(
+    backend_stream: &mut TcpStream,
+    content_length: Option<usize>,
+    is_chunked: bool,
+    initial_body: Vec<u8>,
+    buffering_config: &buffering::BufferingConfig,
+    mut cache_ctx: Option<&mut CacheSaveContext>,
+) -> BufferedBodyResult {
+    let mut body = initial_body;
+    
+    // キャッシュコンテキストに初期ボディをキャプチャ
+    if let Some(ref mut ctx) = cache_ctx {
+        ctx.append_body(&body);
+    }
+    
+    if let Some(cl) = content_length {
+        // Content-Length 転送
+        let remaining = cl.saturating_sub(body.len());
+        if remaining > 0 {
+            // バッファサイズ制限チェック
+            if body.len() + remaining > buffering_config.max_memory_buffer {
+                // ディスクスピルオーバー
+                if let Some(ref disk_path) = buffering_config.disk_buffer_path {
+                    debug!("Response size exceeds memory limit, spilling to disk");
+                    
+                    // まず残りのデータをメモリに読み込み
+                    let additional = buffer_exact_bytes(backend_stream, remaining, &mut cache_ctx).await;
+                    body.extend(additional);
+                    
+                    // ディスクに書き込み
+                    let key = format!("buffer_{}", std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos());
+                    
+                    match buffering::disk_buffer::write_to_disk(disk_path, key.as_bytes(), body).await {
+                        Ok(path) => {
+                            let size = cl as u64;
+                            return BufferedBodyResult::Disk { path, size };
+                        }
+                        Err(e) => {
+                            error!("Failed to write disk buffer: {}", e);
+                            return BufferedBodyResult::Failed;
+                        }
+                    }
+                } else {
+                    // ディスクなし: 可能な範囲でメモリにバッファリング
+                    let max_additional = buffering_config.max_memory_buffer.saturating_sub(body.len());
+                    if max_additional > 0 {
+                        let additional = buffer_exact_bytes(backend_stream, max_additional, &mut cache_ctx).await;
+                        body.extend(additional);
+                    }
+                    warn!("Response truncated: memory limit exceeded and no disk buffer configured");
+                }
+            } else {
+                let additional = buffer_exact_bytes(backend_stream, remaining, &mut cache_ctx).await;
+                body.extend(additional);
+            }
+        }
+    } else if is_chunked {
+        // Chunked 転送
+        let mut decoder = ChunkedDecoder::new_unlimited();
+        decoder.feed(&body);
+        
+        if decoder.is_complete() {
+            if let Some(ctx) = cache_ctx {
+                ctx.save_to_cache();
+            }
+            return BufferedBodyResult::Memory(body);
+        }
+        
+        loop {
+            // バッファサイズ制限チェック
+            if body.len() >= buffering_config.max_memory_buffer {
+                // ディスクスピルオーバー（Chunked）
+                if let Some(ref disk_path) = buffering_config.disk_buffer_path {
+                    debug!("Chunked response exceeds memory limit, spilling to disk");
+                    
+                    // 残りを読み込み続ける
+                    let mut overflow = Vec::new();
+                    loop {
+                        let read_buf = buf_get();
+                        let read_result = timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
+                        
+                        let (res, mut returned_buf) = match read_result {
+                            Ok(result) => result,
+                            Err(_) => break,
+                        };
+                        
+                        let n = match res {
+                            Ok(0) => {
+                                buf_put(returned_buf);
+                                break;
+                            }
+                            Ok(n) => n,
+                            Err(_) => {
+                                buf_put(returned_buf);
+                                break;
+                            }
+                        };
+                        
+                        returned_buf.set_valid_len(n);
+                        let chunk = returned_buf.as_valid_slice();
+                        let feed_result = decoder.feed(chunk);
+                        
+                        if let Some(ref mut ctx) = cache_ctx {
+                            ctx.append_body(chunk);
+                        }
+                        
+                        overflow.extend_from_slice(chunk);
+                        buf_put(returned_buf);
+                        
+                        if feed_result == ChunkedFeedResult::Complete {
+                            break;
+                        }
+                    }
+                    
+                    // 全体をディスクに書き込み
+                    body.extend(overflow);
+                    let key = format!("buffer_chunked_{}", std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos());
+                    
+                    let size = body.len() as u64;
+                    match buffering::disk_buffer::write_to_disk(disk_path, key.as_bytes(), body).await {
+                        Ok(path) => {
+                            if let Some(ctx) = cache_ctx {
+                                ctx.save_to_cache();
+                            }
+                            return BufferedBodyResult::Disk { path, size };
+                        }
+                        Err(e) => {
+                            error!("Failed to write chunked disk buffer: {}", e);
+                            return BufferedBodyResult::Failed;
+                        }
+                    }
+                }
+                break;
+            }
+            
+            let read_buf = buf_get();
+            let read_result = timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
+            
+            let (res, mut returned_buf) = match read_result {
+                Ok(result) => result,
+                Err(_) => break,
+            };
+            
+            let n = match res {
+                Ok(0) => {
+                    buf_put(returned_buf);
+                    break;
+                }
+                Ok(n) => n,
+                Err(_) => {
+                    buf_put(returned_buf);
+                    break;
+                }
+            };
+            
+            returned_buf.set_valid_len(n);
+            let chunk = returned_buf.as_valid_slice();
+            let feed_result = decoder.feed(chunk);
+            
+            if let Some(ref mut ctx) = cache_ctx {
+                ctx.append_body(chunk);
+            }
+            
+            body.extend_from_slice(chunk);
+            buf_put(returned_buf);
+            
+            if feed_result == ChunkedFeedResult::Complete {
+                break;
+            }
+        }
+    }
+    
+    // キャッシュに保存
+    if let Some(ctx) = cache_ctx {
+        ctx.save_to_cache();
+    }
+    
+    BufferedBodyResult::Memory(body)
+}
+
+/// レスポンスボディをバッファリング（旧版、互換性のため残す）
+#[allow(dead_code)]
 async fn buffer_response_body(
     backend_stream: &mut TcpStream,
     content_length: Option<usize>,

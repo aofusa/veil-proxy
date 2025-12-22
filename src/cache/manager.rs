@@ -207,11 +207,31 @@ impl CacheManager {
     }
     
     /// パターンに一致するエントリを削除
-    #[allow(dead_code)]
-    pub fn invalidate_pattern(&self, _pattern: &str) -> usize {
-        // 注意: 現在の実装ではパターンマッチングは非効率
-        // TODO: より効率的な実装
-        0
+    /// 
+    /// globパターンでパス（ホスト/パス形式）をマッチングし、
+    /// 一致するエントリを削除します。
+    /// 
+    /// # Arguments
+    /// 
+    /// * `pattern` - globパターン（例: "example.com/api/*", "*/admin/*"）
+    /// 
+    /// # Returns
+    /// 
+    /// 削除されたエントリ数
+    pub fn invalidate_pattern(&self, pattern: &str) -> usize {
+        let count = self.index.invalidate_pattern(pattern);
+        
+        // ディスクキャッシュのクリーンアップは別途実行される
+        // (エントリ削除時にパスが失われるため、ここでは行わない)
+        
+        count
+    }
+    
+    /// ホストの全エントリを削除
+    /// 
+    /// 指定されたホストの全キャッシュを無効化します。
+    pub fn invalidate_host(&self, host: &str) -> usize {
+        self.index.invalidate_host(host)
     }
     
     /// 期限切れエントリを削除

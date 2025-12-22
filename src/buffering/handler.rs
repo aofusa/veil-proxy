@@ -181,7 +181,6 @@ impl BufferingHandler {
 
 /// ディスクバッファ操作（monoio::fs使用）
 #[cfg(target_os = "linux")]
-#[allow(dead_code)]
 pub mod disk_buffer {
     use monoio::fs::File;
     use std::io;

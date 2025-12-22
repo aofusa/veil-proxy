@@ -275,6 +275,82 @@ impl CacheIndex {
         self.hits.store(0, Ordering::Relaxed);
         self.misses.store(0, Ordering::Relaxed);
     }
+    
+    /// パターンに一致するエントリを削除
+    /// 
+    /// globパターンでパス（ホスト/パス形式）をマッチングし、
+    /// 一致するエントリを削除します。
+    /// 
+    /// # Arguments
+    /// 
+    /// * `pattern` - globパターン（例: "example.com/api/*", "*/admin/*"）
+    /// 
+    /// # Returns
+    /// 
+    /// 削除されたエントリ数
+    pub fn invalidate_pattern(&self, pattern: &str) -> usize {
+        let glob_pattern = match glob::Pattern::new(pattern) {
+            Ok(p) => p,
+            Err(_) => return 0,
+        };
+        
+        let mut keys_to_remove = Vec::new();
+        
+        // 全エントリをスキャンしてマッチするものを収集
+        for entry in self.entries.iter() {
+            let index_entry = entry.value();
+            // ホスト/パス形式でマッチング
+            let full_path = format!("{}{}", index_entry.key.host(), index_entry.key.path());
+            
+            if glob_pattern.matches(&full_path) {
+                keys_to_remove.push(*entry.key());
+            }
+        }
+        
+        // 収集したキーを削除
+        let mut removed = 0;
+        for hash in keys_to_remove {
+            if let Some((_, entry)) = self.entries.remove(&hash) {
+                self.entry_count.fetch_sub(1, Ordering::Relaxed);
+                self.memory_usage.fetch_sub(entry.entry.memory_usage(), Ordering::Relaxed);
+                removed += 1;
+            }
+        }
+        
+        removed
+    }
+    
+    /// ホストに一致するエントリを全て削除
+    /// 
+    /// 指定されたホストの全キャッシュを無効化します。
+    /// 
+    /// # Arguments
+    /// 
+    /// * `host` - ホスト名
+    /// 
+    /// # Returns
+    /// 
+    /// 削除されたエントリ数
+    pub fn invalidate_host(&self, host: &str) -> usize {
+        let mut keys_to_remove = Vec::new();
+        
+        for entry in self.entries.iter() {
+            if entry.value().key.host() == host {
+                keys_to_remove.push(*entry.key());
+            }
+        }
+        
+        let mut removed = 0;
+        for hash in keys_to_remove {
+            if let Some((_, entry)) = self.entries.remove(&hash) {
+                self.entry_count.fetch_sub(1, Ordering::Relaxed);
+                self.memory_usage.fetch_sub(entry.entry.memory_usage(), Ordering::Relaxed);
+                removed += 1;
+            }
+        }
+        
+        removed
+    }
 }
 
 impl Default for CacheIndex {
