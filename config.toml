@@ -494,9 +494,10 @@ connection_window_size = 16777216
 #
 # # HTTP/3専用の圧縮パラメータ（パス設定より優先）
 # [http3.compression]
-# preferred_encodings = ["br", "gzip"]  # Brotli優先
+# preferred_encodings = ["zstd", "br", "gzip"]  # Zstd最優先
 # gzip_level = 6           # HTTP/3は帯域節約が重要なためやや高めに
 # brotli_level = 5         # Brotli圧縮レベル
+# zstd_level = 3           # Zstd圧縮レベル (1-22)
 # min_size = 512           # 小さいレスポンスも圧縮（HTTP/3では効果的）
 # compressible_types = [
 #     "text/",
@@ -792,8 +793,8 @@ url = "http://localhost:8080/app/"
 #   enabled = true
 #   
 #   # 圧縮方式の優先順位（クライアントのAccept-Encodingと照合）
-#   # サポート: "br" (Brotli), "gzip", "deflate"
-#   preferred_encodings = ["br", "gzip"]
+#   # サポート: "zstd", "br" (Brotli), "gzip", "deflate"
+#   preferred_encodings = ["zstd", "br", "gzip"]
 #   
 #   # Gzip圧縮レベル (1-9)
 #   # 1: 最速（圧縮率低）、9: 最遅（圧縮率高）
@@ -868,7 +869,7 @@ url = "http://localhost:8080/app/"
 #   min_size = 256
 #   gzip_level = 6              # 圧縮率優先
 #   brotli_level = 6
-#   preferred_encodings = ["br", "gzip"]  # Brotliを優先
+#   preferred_encodings = ["zstd", "br", "gzip"]  # Zstdを最優先
 
 # ------------------------------------------
 # 管理用API（IP制限付き）

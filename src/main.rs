@@ -1347,9 +1347,11 @@ impl Default for SecurityConfig {
 /// クライアントがサポートする圧縮方式
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcceptedEncoding {
-    /// Brotli (br)
+    /// Zstandard (zstd) - 最高効率
+    Zstd,
+    /// Brotli (br) - 高圧縮率
     Brotli,
-    /// Gzip
+    /// Gzip - 標準的な圧縮
     Gzip,
     /// Deflate（互換性のため）
     Deflate,
@@ -1360,7 +1362,7 @@ pub enum AcceptedEncoding {
 impl AcceptedEncoding {
     /// Accept-Encodingヘッダーから最適な圧縮方式を選択
     /// 
-    /// 優先順位: br > gzip > deflate > identity
+    /// 優先順位: zstd > br > gzip > deflate > identity
     /// q値（品質値）も考慮します。
     pub fn parse(value: &[u8]) -> Self {
         let value_str = match std::str::from_utf8(value) {
@@ -1380,6 +1382,7 @@ impl AcceptedEncoding {
             };
             
             let candidate = match encoding {
+                "zstd" => (Self::Zstd, q),
                 "br" => (Self::Brotli, q),
                 "gzip" => (Self::Gzip, q),
                 "deflate" => (Self::Deflate, q),
@@ -1387,9 +1390,10 @@ impl AcceptedEncoding {
                 _ => continue,
             };
             
-            // q値が高いもの、または同じq値ならBrotliを優先
+            // q値が高いもの、または同じq値ならZstd > Brotliを優先
             if candidate.1 > best.1 || 
-               (candidate.1 == best.1 && matches!(candidate.0, Self::Brotli)) {
+               (candidate.1 == best.1 && matches!(candidate.0, Self::Zstd)) ||
+               (candidate.1 == best.1 && matches!(candidate.0, Self::Brotli) && !matches!(best.0, Self::Zstd)) {
                 best = candidate;
             }
         }
@@ -1400,6 +1404,7 @@ impl AcceptedEncoding {
     /// Content-Encodingヘッダー値を返す
     pub fn as_header_value(&self) -> &'static [u8] {
         match self {
+            Self::Zstd => b"zstd",
             Self::Brotli => b"br",
             Self::Gzip => b"gzip",
             Self::Deflate => b"deflate",
@@ -1417,8 +1422,8 @@ pub struct CompressionConfig {
     pub enabled: bool,
     
     /// 圧縮方式の優先順位
-    /// サポート: "br" (Brotli), "gzip", "deflate"
-    /// デフォルト: ["br", "gzip"]
+    /// サポート: "zstd", "br" (Brotli), "gzip", "deflate"
+    /// デフォルト: ["zstd", "br", "gzip"]
     pub preferred_encodings: Vec<String>,
     
     /// Gzip圧縮レベル (1-9)
@@ -1432,6 +1437,12 @@ pub struct CompressionConfig {
     /// デフォルト: 4（バランス重視）
     #[serde(default = "default_brotli_level")]
     pub brotli_level: u32,
+    
+    /// Zstd圧縮レベル (1-22)
+    /// 1: 最速、22: 最遅（圧縮率最高）
+    /// デフォルト: 3（高速重視）
+    #[serde(default = "default_zstd_level")]
+    pub zstd_level: i32,
     
     /// 最小圧縮サイズ（バイト）
     /// これより小さいレスポンスは圧縮オーバーヘッドの方が大きいためスキップ
@@ -1454,6 +1465,7 @@ pub struct CompressionConfig {
 // 圧縮設定のデフォルト値
 fn default_gzip_level() -> u32 { 4 }
 fn default_brotli_level() -> u32 { 4 }
+fn default_zstd_level() -> i32 { 3 }  // zstdは1-22、3が高速でバランス良好
 fn default_compression_min_size() -> usize { 1024 }
 
 fn default_compressible_types() -> Vec<String> {
@@ -1484,7 +1496,7 @@ fn default_skip_types() -> Vec<String> {
 }
 
 fn default_preferred_encodings() -> Vec<String> {
-    vec!["br".into(), "gzip".into()]
+    vec!["zstd".into(), "br".into(), "gzip".into()]
 }
 
 impl Default for CompressionConfig {
@@ -1494,6 +1506,7 @@ impl Default for CompressionConfig {
             preferred_encodings: default_preferred_encodings(),
             gzip_level: default_gzip_level(),
             brotli_level: default_brotli_level(),
+            zstd_level: default_zstd_level(),
             min_size: default_compression_min_size(),
             compressible_types: default_compressible_types(),
             skip_types: default_skip_types(),
@@ -1510,9 +1523,12 @@ impl CompressionConfig {
         if self.brotli_level > 11 {
             return Err(format!("invalid brotli_level: {} (must be 0-11)", self.brotli_level));
         }
+        if self.zstd_level < 1 || self.zstd_level > 22 {
+            return Err(format!("invalid zstd_level: {} (must be 1-22)", self.zstd_level));
+        }
         for enc in &self.preferred_encodings {
             match enc.as_str() {
-                "gzip" | "br" | "deflate" => {}
+                "zstd" | "gzip" | "br" | "deflate" => {}
                 _ => return Err(format!("unknown encoding: {}", enc)),
             }
         }
@@ -1586,9 +1602,10 @@ impl CompressionConfig {
         // 6. クライアントがサポートし、かつ設定で許可されている圧縮方式を選択
         let client_supports = |enc: &str| -> bool {
             match (enc, client_encoding) {
-                ("br", AcceptedEncoding::Brotli) => true,
-                ("gzip", AcceptedEncoding::Gzip | AcceptedEncoding::Brotli) => true,
-                ("deflate", AcceptedEncoding::Deflate | AcceptedEncoding::Gzip | AcceptedEncoding::Brotli) => true,
+                ("zstd", AcceptedEncoding::Zstd) => true,
+                ("br", AcceptedEncoding::Brotli | AcceptedEncoding::Zstd) => true,
+                ("gzip", AcceptedEncoding::Gzip | AcceptedEncoding::Brotli | AcceptedEncoding::Zstd) => true,
+                ("deflate", AcceptedEncoding::Deflate | AcceptedEncoding::Gzip | AcceptedEncoding::Brotli | AcceptedEncoding::Zstd) => true,
                 _ => false,
             }
         };
@@ -1596,8 +1613,9 @@ impl CompressionConfig {
         for enc in &self.preferred_encodings {
             if client_supports(enc) {
                 return match enc.as_str() {
-                    "br" if client_encoding == AcceptedEncoding::Brotli => Some(AcceptedEncoding::Brotli),
-                    "gzip" if matches!(client_encoding, AcceptedEncoding::Gzip | AcceptedEncoding::Brotli) => Some(AcceptedEncoding::Gzip),
+                    "zstd" if client_encoding == AcceptedEncoding::Zstd => Some(AcceptedEncoding::Zstd),
+                    "br" if matches!(client_encoding, AcceptedEncoding::Brotli | AcceptedEncoding::Zstd) => Some(AcceptedEncoding::Brotli),
+                    "gzip" if matches!(client_encoding, AcceptedEncoding::Gzip | AcceptedEncoding::Brotli | AcceptedEncoding::Zstd) => Some(AcceptedEncoding::Gzip),
                     "deflate" => Some(AcceptedEncoding::Deflate),
                     _ => continue,
                 };
@@ -1640,6 +1658,8 @@ pub fn resolve_http3_compression_config(
                 .unwrap_or(path_compression.gzip_level),
             brotli_level: h3_comp.brotli_level
                 .unwrap_or(path_compression.brotli_level),
+            zstd_level: h3_comp.zstd_level
+                .unwrap_or(path_compression.zstd_level),
             min_size: h3_comp.min_size
                 .unwrap_or(path_compression.min_size),
             compressible_types: h3_comp.compressible_types
@@ -1665,6 +1685,8 @@ pub fn resolve_http3_compression_config(
                 .unwrap_or(path_compression.gzip_level),
             brotli_level: h3_comp.brotli_level
                 .unwrap_or(path_compression.brotli_level),
+            zstd_level: h3_comp.zstd_level
+                .unwrap_or(path_compression.zstd_level),
             min_size: h3_comp.min_size
                 .unwrap_or(path_compression.min_size),
             compressible_types: h3_comp.compressible_types
@@ -2981,7 +3003,7 @@ impl Http2ConfigSection {
 #[serde(default)]
 pub struct Http3CompressionConfig {
     /// 圧縮方式の優先順位
-    /// サポート: "br" (Brotli), "gzip", "deflate"
+    /// サポート: "zstd", "br" (Brotli), "gzip", "deflate"
     /// 未設定時はパスごとの設定を使用
     pub preferred_encodings: Option<Vec<String>>,
     
@@ -2992,6 +3014,10 @@ pub struct Http3CompressionConfig {
     /// Brotli圧縮レベル (0-11)
     /// 未設定時はパスごとの設定を使用
     pub brotli_level: Option<u32>,
+    
+    /// Zstd圧縮レベル (1-22)
+    /// 未設定時はパスごとの設定を使用
+    pub zstd_level: Option<i32>,
     
     /// 最小圧縮サイズ（バイト）
     /// 未設定時はパスごとの設定を使用
@@ -3019,9 +3045,14 @@ impl Http3CompressionConfig {
                 return Err(format!("http3.compression.brotli_level: {} (must be 0-11)", level));
             }
         }
+        if let Some(level) = self.zstd_level {
+            if level < 1 || level > 22 {
+                return Err(format!("http3.compression.zstd_level: {} (must be 1-22)", level));
+            }
+        }
         if let Some(ref encodings) = self.preferred_encodings {
             for enc in encodings {
-                if !["br", "gzip", "deflate"].contains(&enc.as_str()) {
+                if !["zstd", "br", "gzip", "deflate"].contains(&enc.as_str()) {
                     return Err(format!("http3.compression.preferred_encodings: unknown encoding '{}'", enc));
                 }
             }
@@ -6761,6 +6792,7 @@ where
             let encoding_value: Vec<u8>;
             if let Some(enc) = should_compress {
                 encoding_value = match enc {
+                    AcceptedEncoding::Zstd => b"zstd".to_vec(),
                     AcceptedEncoding::Brotli => b"br".to_vec(),
                     AcceptedEncoding::Gzip => b"gzip".to_vec(),
                     AcceptedEncoding::Deflate => b"deflate".to_vec(),
@@ -7005,6 +7037,7 @@ where
             let encoding_value: Vec<u8>;
             if let Some(enc) = should_compress {
                 encoding_value = match enc {
+                    AcceptedEncoding::Zstd => b"zstd".to_vec(),
                     AcceptedEncoding::Brotli => b"br".to_vec(),
                     AcceptedEncoding::Gzip => b"gzip".to_vec(),
                     AcceptedEncoding::Deflate => b"deflate".to_vec(),
@@ -7131,6 +7164,12 @@ fn compress_body_h2(body: &[u8], encoding: AcceptedEncoding, compression: &Compr
     use std::io::Write;
     
     match encoding {
+        AcceptedEncoding::Zstd => {
+            match zstd::encode_all(std::io::Cursor::new(body), compression.zstd_level) {
+                Ok(compressed) => compressed,
+                Err(_) => body.to_vec(),
+            }
+        }
         AcceptedEncoding::Gzip => {
             let level = Compression::new(compression.gzip_level);
             let mut encoder = GzEncoder::new(Vec::with_capacity(body.len()), level);
@@ -9755,6 +9794,18 @@ async fn transfer_compressed_response(
     
     // 2. ボディを圧縮
     let compressed_body = match encoding {
+        AcceptedEncoding::Zstd => {
+            match zstd::encode_all(std::io::Cursor::new(&body_data), compression.zstd_level) {
+                Ok(compressed) => compressed,
+                Err(_) => {
+                    return transfer_uncompressed_fallback(
+                        client_stream,
+                        original_headers,
+                        &body_data,
+                    ).await;
+                }
+            }
+        }
         AcceptedEncoding::Gzip => {
             let level = Compression::new(compression.gzip_level);
             let mut encoder = GzEncoder::new(Vec::new(), level);
@@ -10797,6 +10848,14 @@ async fn transfer_compressed_https_response(
     
     // 2. ボディを圧縮
     let compressed_body = match encoding {
+        AcceptedEncoding::Zstd => {
+            match zstd::encode_all(std::io::Cursor::new(&body_data), compression.zstd_level) {
+                Ok(compressed) => compressed,
+                Err(_) => {
+                    return transfer_uncompressed_fallback(client_stream, original_headers, &body_data).await;
+                }
+            }
+        }
         AcceptedEncoding::Gzip => {
             let level = Compression::new(compression.gzip_level);
             let mut encoder = GzEncoder::new(Vec::new(), level);

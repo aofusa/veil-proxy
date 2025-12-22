@@ -983,6 +983,7 @@ impl Http3Handler {
         let encoding_value: Vec<u8>;
         if let Some(enc) = should_compress {
             encoding_value = match enc {
+                AcceptedEncoding::Zstd => b"zstd".to_vec(),
                 AcceptedEncoding::Brotli => b"br".to_vec(),
                 AcceptedEncoding::Gzip => b"gzip".to_vec(),
                 AcceptedEncoding::Deflate => b"deflate".to_vec(),
@@ -1648,6 +1649,12 @@ fn compress_body_h3(body: &[u8], encoding: AcceptedEncoding, compression: &Compr
     use std::io::Write;
     
     match encoding {
+        AcceptedEncoding::Zstd => {
+            match zstd::encode_all(std::io::Cursor::new(body), compression.zstd_level) {
+                Ok(compressed) => compressed,
+                Err(_) => body.to_vec(),
+            }
+        }
         AcceptedEncoding::Gzip => {
             let level = Compression::new(compression.gzip_level);
             let mut encoder = GzEncoder::new(Vec::with_capacity(body.len()), level);
