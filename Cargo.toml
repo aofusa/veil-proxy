@@ -146,3 +146,20 @@ glob = "0.3"
 [dev-dependencies]
 # テスト用一時ディレクトリ
 tempfile = "3.10"
+
+# TLS証明書生成（テスト用自己署名証明書）
+rcgen = "0.13"
+
+# ベンチマーク用
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# システム情報取得（リソース使用量測定）
+sysinfo = "0.32"
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[[bench]]
+name = "latency"
+harness = false

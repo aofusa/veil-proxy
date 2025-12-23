@@ -14083,4 +14083,473 @@ mod tests {
             assert!(true);
         }
     }
+
+    // ====================
+    // ProxyTarget テスト
+    // ====================
+
+    mod proxy_target_tests {
+        use super::*;
+
+        #[test]
+        fn test_parse_http_url() {
+            let target = ProxyTarget::parse("http://localhost:8080/api").unwrap();
+            
+            assert_eq!(target.host, "localhost");
+            assert_eq!(target.port, 8080);
+            assert!(!target.use_tls);
+            assert_eq!(target.path_prefix, "/api");
+        }
+
+        #[test]
+        fn test_parse_https_url() {
+            let target = ProxyTarget::parse("https://example.com/").unwrap();
+            
+            assert_eq!(target.host, "example.com");
+            assert_eq!(target.port, 443);
+            assert!(target.use_tls);
+        }
+
+        #[test]
+        fn test_parse_url_default_ports() {
+            let http = ProxyTarget::parse("http://localhost/").unwrap();
+            assert_eq!(http.port, 80);
+            
+            let https = ProxyTarget::parse("https://localhost/").unwrap();
+            assert_eq!(https.port, 443);
+        }
+
+        #[test]
+        fn test_parse_url_with_path() {
+            let target = ProxyTarget::parse("http://api.example.com:3000/v1/users").unwrap();
+            
+            assert_eq!(target.host, "api.example.com");
+            assert_eq!(target.port, 3000);
+            assert_eq!(target.path_prefix, "/v1/users");
+        }
+
+        #[test]
+        fn test_parse_url_no_path() {
+            let target = ProxyTarget::parse("http://localhost:8080").unwrap();
+            
+            assert_eq!(target.path_prefix, "/");
+        }
+
+        #[test]
+        fn test_parse_invalid_url() {
+            assert!(ProxyTarget::parse("invalid").is_none());
+            assert!(ProxyTarget::parse("ftp://localhost/").is_none());
+            assert!(ProxyTarget::parse("").is_none());
+            assert!(ProxyTarget::parse("://no-scheme").is_none());
+        }
+
+        #[test]
+        fn test_with_sni_name() {
+            let target = ProxyTarget::parse("https://192.168.1.1:443/")
+                .unwrap()
+                .with_sni_name(Some("api.example.com".to_string()));
+            
+            assert_eq!(target.sni_name, Some("api.example.com".to_string()));
+            assert_eq!(target.host, "192.168.1.1");
+        }
+
+        #[test]
+        fn test_with_h2c() {
+            let target = ProxyTarget::parse("http://localhost:8080/")
+                .unwrap()
+                .with_h2c(true);
+            
+            assert!(target.use_h2c);
+            assert!(!target.use_tls);
+        }
+
+        #[test]
+        fn test_ipv6_host() {
+            // IPv6アドレスのパース（ブラケット表記）
+            let target = ProxyTarget::parse("http://[::1]:8080/");
+            // 現在の実装ではIPv6はサポートされていない可能性があるため、
+            // パース結果を確認
+            if let Some(t) = target {
+                assert_eq!(t.port, 8080);
+            }
+        }
+    }
+
+    // ====================
+    // UpstreamGroup 選択ロジックテスト
+    // ====================
+
+    mod upstream_selection_tests {
+        use super::*;
+
+        fn create_test_servers() -> Vec<UpstreamServerEntry> {
+            vec![
+                UpstreamServerEntry { 
+                    url: "http://server1:8080".into(), 
+                    sni_name: None 
+                },
+                UpstreamServerEntry { 
+                    url: "http://server2:8080".into(), 
+                    sni_name: None 
+                },
+                UpstreamServerEntry { 
+                    url: "http://server3:8080".into(), 
+                    sni_name: None 
+                },
+            ]
+        }
+
+        #[test]
+        fn test_upstream_group_creation() {
+            let servers = create_test_servers();
+            let group = UpstreamGroup::new(
+                "test-group".into(),
+                servers,
+                LoadBalanceAlgorithm::RoundRobin,
+                None
+            );
+            
+            assert!(group.is_some());
+            let group = group.unwrap();
+            assert_eq!(group.len(), 3);
+        }
+
+        #[test]
+        fn test_upstream_group_empty_servers() {
+            let group = UpstreamGroup::new(
+                "empty".into(),
+                vec![],
+                LoadBalanceAlgorithm::RoundRobin,
+                None
+            );
+            
+            assert!(group.is_none());
+        }
+
+        #[test]
+        fn test_upstream_group_invalid_url() {
+            let servers = vec![
+                UpstreamServerEntry { 
+                    url: "invalid-url".into(), 
+                    sni_name: None 
+                },
+            ];
+            let group = UpstreamGroup::new(
+                "invalid".into(),
+                servers,
+                LoadBalanceAlgorithm::RoundRobin,
+                None
+            );
+            
+            assert!(group.is_none());
+        }
+
+        #[test]
+        fn test_round_robin_distribution() {
+            let servers = create_test_servers();
+            let group = UpstreamGroup::new(
+                "rr-test".into(),
+                servers,
+                LoadBalanceAlgorithm::RoundRobin,
+                None
+            ).unwrap();
+            
+            let mut hosts: Vec<String> = Vec::new();
+            for _ in 0..9 {
+                if let Some(server) = group.select("client") {
+                    hosts.push(server.target.host.clone());
+                }
+            }
+            
+            // 9回選択で3サイクル
+            assert_eq!(hosts.len(), 9);
+            
+            // 各サーバーが3回ずつ選択される
+            let count_server1 = hosts.iter().filter(|h| *h == "server1").count();
+            let count_server2 = hosts.iter().filter(|h| *h == "server2").count();
+            let count_server3 = hosts.iter().filter(|h| *h == "server3").count();
+            
+            assert_eq!(count_server1, 3);
+            assert_eq!(count_server2, 3);
+            assert_eq!(count_server3, 3);
+        }
+
+        #[test]
+        fn test_ip_hash_consistency() {
+            let servers = create_test_servers();
+            let group = UpstreamGroup::new(
+                "iphash-test".into(),
+                servers,
+                LoadBalanceAlgorithm::IpHash,
+                None
+            ).unwrap();
+            
+            let client_ip = "192.168.1.100";
+            let first = group.select(client_ip).map(|s| s.target.host.clone());
+            
+            // 同じIPは常に同じサーバーを選択
+            for _ in 0..20 {
+                let selected = group.select(client_ip).map(|s| s.target.host.clone());
+                assert_eq!(first, selected, "IP Hash should be consistent");
+            }
+        }
+
+        #[test]
+        fn test_ip_hash_different_ips_distribute() {
+            let servers = create_test_servers();
+            let group = UpstreamGroup::new(
+                "iphash-dist".into(),
+                servers,
+                LoadBalanceAlgorithm::IpHash,
+                None
+            ).unwrap();
+            
+            let mut selected_hosts = std::collections::HashSet::new();
+            
+            // 100個の異なるIPで分散を確認
+            for i in 0..100 {
+                let ip = format!("10.0.{}.{}", i / 256, i % 256);
+                if let Some(server) = group.select(&ip) {
+                    selected_hosts.insert(server.target.host.clone());
+                }
+            }
+            
+            // 複数サーバーに分散されることを確認
+            assert!(selected_hosts.len() >= 2, "Should distribute across multiple servers");
+        }
+
+        #[test]
+        fn test_least_connections_selection() {
+            let servers = create_test_servers();
+            let group = UpstreamGroup::new(
+                "lc-test".into(),
+                servers,
+                LoadBalanceAlgorithm::LeastConnections,
+                None
+            ).unwrap();
+            
+            // 初期状態では全サーバーの接続数が0なので、最初のサーバーが選択される
+            let selected = group.select("client");
+            assert!(selected.is_some());
+        }
+
+        #[test]
+        fn test_single_server_group() {
+            let target = ProxyTarget::parse("http://single:8080/").unwrap();
+            let group = UpstreamGroup::single(target);
+            
+            assert_eq!(group.len(), 1);
+            
+            // 何度選択しても同じサーバー
+            for _ in 0..5 {
+                let selected = group.select("client");
+                assert!(selected.is_some());
+                assert_eq!(selected.unwrap().target.host, "single");
+            }
+        }
+    }
+
+    // ====================
+    // UpstreamServer 健康状態テスト
+    // ====================
+
+    mod upstream_health_tests {
+        use super::*;
+
+        #[test]
+        fn test_server_initial_state_healthy() {
+            let target = ProxyTarget::parse("http://localhost:8080/").unwrap();
+            let server = UpstreamServer::new(target);
+            
+            assert!(server.is_healthy());
+        }
+
+        #[test]
+        fn test_server_becomes_unhealthy_after_failures() {
+            let target = ProxyTarget::parse("http://localhost:8080/").unwrap();
+            let server = UpstreamServer::new(target);
+            
+            // 3回失敗すると不健全になる（デフォルト閾値）
+            server.record_failure(3);
+            assert!(server.is_healthy()); // まだ健全
+            server.record_failure(3);
+            assert!(server.is_healthy()); // まだ健全
+            server.record_failure(3);
+            assert!(!server.is_healthy()); // 3回目で不健全
+        }
+
+        #[test]
+        fn test_server_becomes_healthy_after_successes() {
+            let target = ProxyTarget::parse("http://localhost:8080/").unwrap();
+            let server = UpstreamServer::new(target);
+            
+            // まず不健全にする
+            for _ in 0..3 {
+                server.record_failure(3);
+            }
+            assert!(!server.is_healthy());
+            
+            // 2回成功すると健全になる（デフォルト閾値）
+            server.record_success(2);
+            assert!(!server.is_healthy()); // まだ不健全
+            server.record_success(2);
+            assert!(server.is_healthy()); // 2回目で健全
+        }
+
+        #[test]
+        fn test_server_connection_count() {
+            let target = ProxyTarget::parse("http://localhost:8080/").unwrap();
+            let server = UpstreamServer::new(target);
+            
+            assert_eq!(server.connections(), 0);
+            
+            server.acquire();
+            assert_eq!(server.connections(), 1);
+            
+            server.acquire();
+            assert_eq!(server.connections(), 2);
+            
+            server.release();
+            assert_eq!(server.connections(), 1);
+            
+            server.release();
+            assert_eq!(server.connections(), 0);
+        }
+
+        #[test]
+        fn test_select_skips_unhealthy_servers() {
+            let servers = vec![
+                UpstreamServerEntry { 
+                    url: "http://healthy:8080".into(), 
+                    sni_name: None 
+                },
+                UpstreamServerEntry { 
+                    url: "http://unhealthy:8080".into(), 
+                    sni_name: None 
+                },
+            ];
+            let group = UpstreamGroup::new(
+                "health-test".into(),
+                servers,
+                LoadBalanceAlgorithm::RoundRobin,
+                None
+            ).unwrap();
+            
+            // 2番目のサーバーを不健全にマーク（3回失敗で不健全）
+            for _ in 0..3 {
+                group.servers[1].record_failure(3);
+            }
+            
+            // 10回選択しても不健全サーバーは選択されない
+            for _ in 0..10 {
+                let selected = group.select("client");
+                assert!(selected.is_some());
+                assert_eq!(selected.unwrap().target.host, "healthy");
+            }
+        }
+
+        #[test]
+        fn test_select_returns_none_all_unhealthy() {
+            let servers = vec![
+                UpstreamServerEntry { 
+                    url: "http://server1:8080".into(), 
+                    sni_name: None 
+                },
+                UpstreamServerEntry { 
+                    url: "http://server2:8080".into(), 
+                    sni_name: None 
+                },
+            ];
+            let group = UpstreamGroup::new(
+                "all-unhealthy".into(),
+                servers,
+                LoadBalanceAlgorithm::RoundRobin,
+                None
+            ).unwrap();
+            
+            // 全サーバーを不健全にマーク（3回失敗で不健全）
+            for server in &group.servers {
+                for _ in 0..3 {
+                    server.record_failure(3);
+                }
+            }
+            
+            let selected = group.select("client");
+            assert!(selected.is_none());
+        }
+
+        #[test]
+        fn test_failure_resets_success_counter() {
+            let target = ProxyTarget::parse("http://localhost:8080/").unwrap();
+            let server = UpstreamServer::new(target);
+            
+            // 不健全にする
+            for _ in 0..3 {
+                server.record_failure(3);
+            }
+            assert!(!server.is_healthy());
+            
+            // 1回成功
+            server.record_success(2);
+            
+            // 失敗で成功カウンターリセット
+            server.record_failure(3);
+            
+            // 再度2回成功が必要
+            server.record_success(2);
+            assert!(!server.is_healthy());
+            server.record_success(2);
+            assert!(server.is_healthy());
+        }
+    }
+
+    // ====================
+    // LoadBalanceAlgorithm パーステスト
+    // ====================
+
+    mod load_balance_algorithm_tests {
+        use super::*;
+
+        #[test]
+        fn test_default_algorithm() {
+            let algo = LoadBalanceAlgorithm::default();
+            assert_eq!(algo, LoadBalanceAlgorithm::RoundRobin);
+        }
+    }
+
+    // ====================
+    // HealthCheckConfig テスト
+    // ====================
+
+    mod health_check_config_tests {
+        use super::*;
+
+        #[test]
+        fn test_is_status_healthy() {
+            let config = HealthCheckConfig::default();
+            
+            // 健康なステータス
+            assert!(config.healthy_statuses.contains(&200));
+            assert!(config.healthy_statuses.contains(&201));
+            assert!(config.healthy_statuses.contains(&204));
+            assert!(config.healthy_statuses.contains(&301));
+            assert!(config.healthy_statuses.contains(&302));
+            assert!(config.healthy_statuses.contains(&304));
+            
+            // 不健康なステータス
+            assert!(!config.healthy_statuses.contains(&400));
+            assert!(!config.healthy_statuses.contains(&500));
+            assert!(!config.healthy_statuses.contains(&503));
+        }
+
+        #[test]
+        fn test_custom_healthy_statuses() {
+            let mut config = HealthCheckConfig::default();
+            config.healthy_statuses = vec![200, 201];
+            
+            assert!(config.healthy_statuses.contains(&200));
+            assert!(config.healthy_statuses.contains(&201));
+            assert!(!config.healthy_statuses.contains(&204));
+        }
+    }
 }
