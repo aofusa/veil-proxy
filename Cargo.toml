@@ -159,10 +159,49 @@ sysinfo = "0.32"
 # E2Eテスト用TLS接続
 native-tls = "0.2"
 
+# ベンチマーク用依存関係
+base64 = "0.22"
+
 [[bench]]
 name = "throughput"
 harness = false
 
 [[bench]]
 name = "latency"
+harness = false
+
+[[bench]]
+name = "http2"
+harness = false
+
+[[bench]]
+name = "compression"
+harness = false
+
+[[bench]]
+name = "tls"
+harness = false
+
+[[bench]]
+name = "connection_pool"
+harness = false
+
+[[bench]]
+name = "cache"
+harness = false
+
+[[bench]]
+name = "load_balancing"
+harness = false
+
+[[bench]]
+name = "http3"
+harness = false
+
+[[bench]]
+name = "websocket"
+harness = false
+
+[[bench]]
+name = "memory"
 harness = false
