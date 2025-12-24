@@ -24,7 +24,7 @@ io_uring (monoio) と rustls を使用した高性能リバースプロキシサ
 ### プロキシ機能
 - **コネクションプール**: バックエンド接続の再利用によるレイテンシ削減（HTTP/HTTPS両対応）
 - **ロードバランシング**: 複数バックエンドへのリクエスト分散（Round Robin/Least Connections/IP Hash）
-- **ヘルスチェック**: HTTPベースのアクティブヘルスチェックによる自動フェイルオーバー
+- **ヘルスチェック**: HTTP/TLSベースのアクティブヘルスチェックによる自動フェイルオーバー
 - **プロキシキャッシュ**: メモリ・ディスクベースのレスポンスキャッシュ（ETag/304、stale-while-revalidate、stale-if-error）
 - **バッファリング制御**: 低速クライアントによるバックエンド占有防止のためのレスポンスバッファリング（Streaming/Full/Adaptiveモード）
 - **WebSocketサポート**: Upgradeヘッダー検知による双方向プロキシ（Fixed/Adaptiveポーリングモード）
@@ -48,7 +48,7 @@ io_uring (monoio) と rustls を使用した高性能リバースプロキシサ
 - **Graceful Reload**: SIGHUPによる設定のホットリロード（ゼロダウンタイム）
 - **非同期ログ**: ftlog による高性能非同期ログ
 - **設定バリデーション**: 起動時の詳細な設定ファイル検証
-- **Prometheusメトリクス**: メトリクスエンドポイントでリクエスト数、レイテンシ等を出力（要設定、デフォルト無効）
+- **Prometheusメトリクス**: メトリクスエンドポイントでリクエスト数、レイテンシ、アクティブ接続数、アップストリーム健康状態等を出力（要設定、デフォルト無効）
 
 ### セキュリティ
 - **HTTP to HTTPSリダイレクト**: HTTPアクセスを自動的にHTTPSへ301リダイレクト
@@ -1237,6 +1237,8 @@ enabled = true
 | `enabled` | メトリクスエンドポイントを有効化 | **false** |
 | `path` | メトリクスエンドポイントのパス | `/__metrics` |
 | `allowed_ips` | アクセスを許可するIP/CIDR（配列） | []（すべて許可） |
+| `enable_active_connections` | アクティブ接続数メトリクスを有効化 | **true** |
+| `enable_upstream_health` | アップストリーム健康状態メトリクスを有効化 | **true** |
 
 ### エンドポイント
 
@@ -1299,6 +1301,9 @@ allowed_ips = [
   "172.16.0.0/12",
   "192.168.0.0/16"
 ]
+# 特定のメトリクスの有効化/無効化（デフォルト: 両方有効）
+enable_active_connections = true
+enable_upstream_health = true
 ```
 
 ### アクセス制御
@@ -2035,6 +2040,8 @@ url = "http://localhost:8080"
 | `healthy_statuses` | 成功と判断するステータスコード | [200, 201, 202, 204, 301, 302, 304] |
 | `unhealthy_threshold` | unhealthyにする連続失敗回数 | 3 |
 | `healthy_threshold` | healthyに戻す連続成功回数 | 2 |
+| `use_tls` | TLS接続を使用したヘルスチェック | **false** |
+| `verify_cert` | TLS証明書の検証（use_tls=true時のみ有効） | **true** |
 
 ### 設定例
 
@@ -2054,7 +2061,37 @@ servers = [
   healthy_statuses = [200]
   unhealthy_threshold = 3
   healthy_threshold = 2
+  # TLSヘルスチェック（HTTPSバックエンド用）
+  use_tls = false
+  verify_cert = true
 ```
+
+### TLSヘルスチェック
+
+`use_tls = true` を設定すると、プレーンHTTPではなくTLS接続を使用してヘルスチェックを実行します。HTTPSバックエンドの監視に有用です。
+
+**TLSヘルスチェックの設定例:**
+
+```toml
+[upstreams."api-servers"]
+algorithm = "least_conn"
+servers = [
+  "https://api1.internal:8443",
+  "https://api2.internal:8443"
+]
+
+  [upstreams."api-servers".health_check]
+  interval_secs = 10
+  path = "/health"
+  timeout_secs = 5
+  healthy_statuses = [200]
+  # TLSヘルスチェックを有効化
+  use_tls = true
+  # 証明書検証（自己署名証明書の場合はfalseに設定）
+  verify_cert = true
+```
+
+> **Note**: `verify_cert = false` に設定すると、自己署名証明書が許可されます。開発環境では有用ですが、本番環境では推奨されません。
 
 ### ログ出力
 

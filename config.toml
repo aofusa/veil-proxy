@@ -524,6 +524,8 @@ connection_window_size = 16777216
 #   healthy_statuses: 成功と判断するステータスコード（デフォルト: [200, 201, 202, 204, 301, 302, 304]）
 #   unhealthy_threshold: 何回連続失敗で unhealthy にするか（デフォルト: 3）
 #   healthy_threshold: 何回連続成功で healthy に戻すか（デフォルト: 2）
+#   use_tls: TLS接続を使用したヘルスチェック（デフォルト: false）
+#   verify_cert: TLS証明書の検証（use_tls=true時のみ有効、デフォルト: true）
 
 # [upstreams."backend-pool"]
 # algorithm = "round_robin"
@@ -540,6 +542,9 @@ connection_window_size = 16777216
 #   healthy_statuses = [200]
 #   unhealthy_threshold = 3
 #   healthy_threshold = 2
+#   # TLSヘルスチェック（HTTPSバックエンド用）
+#   use_tls = false
+#   verify_cert = true
 
 # ------------------------------------------
 # SNI名指定付きHTTPSアップストリーム
@@ -558,6 +563,17 @@ connection_window_size = 16777216
 #   { url = "https://192.168.1.101:443", sni_name = "api.example.com" },
 #   "https://api.example.com:443"  # 通常のドメイン名指定（sni_name不要）
 # ]
+# 
+#   [upstreams."https-pool".health_check]
+#   interval_secs = 10
+#   path = "/health"
+#   timeout_secs = 5
+#   healthy_statuses = [200]
+#   unhealthy_threshold = 3
+#   healthy_threshold = 2
+#   # HTTPSバックエンドの場合はTLSヘルスチェックを有効化
+#   use_tls = true
+#   verify_cert = true  # 自己署名証明書の場合は false に設定
 
 
 # ==========================================
@@ -659,12 +675,20 @@ connection_window_size = 16777216
 #   "172.16.0.0/12",
 #   "192.168.0.0/16"
 # ]
+#
+# # アクティブ接続数メトリクスを有効化（デフォルト: true）
+# enable_active_connections = true
+#
+# # アップストリーム健康状態メトリクスを有効化（デフォルト: true）
+# enable_upstream_health = true
 
 # [prometheus]
 # # メトリクスエンドポイントの有効化（デフォルト: false）
 # enabled = true
 # path = "/__metrics"
 # allowed_ips = []  # 空の場合は全てのIPを許可
+# enable_active_connections = true
+# enable_upstream_health = true
 
 
 [host_routes."example.com"]

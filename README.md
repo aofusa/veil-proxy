@@ -24,7 +24,7 @@ A high-performance reverse proxy server using io_uring (monoio) and rustls.
 ### Proxy Features
 - **Connection Pool**: Latency reduction through backend connection reuse (HTTP/HTTPS support)
 - **Load Balancing**: Request distribution to multiple backends (Round Robin/Least Connections/IP Hash)
-- **Health Check**: Automatic failover with HTTP-based active health checks
+- **Health Check**: Automatic failover with HTTP/TLS-based active health checks
 - **Proxy Cache**: Memory and disk-based response caching (ETag/304, stale-while-revalidate, stale-if-error)
 - **Buffering Control**: Response buffering to prevent slow clients from blocking backends (Streaming/Full/Adaptive modes)
 - **WebSocket Support**: Bidirectional proxy with Upgrade header detection (Fixed/Adaptive polling modes)
@@ -48,7 +48,7 @@ A high-performance reverse proxy server using io_uring (monoio) and rustls.
 - **Graceful Reload**: Hot reload configuration via SIGHUP (zero downtime)
 - **Async Logging**: High-performance async logging with ftlog
 - **Config Validation**: Detailed configuration file validation at startup
-- **Prometheus Metrics**: Export request counts, latency, etc. via metrics endpoint (requires configuration, disabled by default)
+- **Prometheus Metrics**: Export request counts, latency, active connections, upstream health, etc. via metrics endpoint (requires configuration, disabled by default)
 
 ### Security
 - **HTTP to HTTPS Redirect**: Automatic 301 redirect from HTTP to HTTPS
@@ -1237,6 +1237,8 @@ enabled = true
 | `enabled` | Enable metrics endpoint | **false** |
 | `path` | Metrics endpoint path | `/__metrics` |
 | `allowed_ips` | Allowed IP/CIDR for access (array) | [] (all allowed) |
+| `enable_active_connections` | Enable active connections metric | **true** |
+| `enable_upstream_health` | Enable upstream health status metric | **true** |
 
 ### Endpoint
 
@@ -1299,6 +1301,9 @@ allowed_ips = [
   "172.16.0.0/12",
   "192.168.0.0/16"
 ]
+# Enable/disable specific metrics (default: both enabled)
+enable_active_connections = true
+enable_upstream_health = true
 ```
 
 ### Access Control
@@ -2035,6 +2040,8 @@ Monitors backend server health and automatically excludes unhealthy servers.
 | `healthy_statuses` | Status codes considered successful | [200, 201, 202, 204, 301, 302, 304] |
 | `unhealthy_threshold` | Consecutive failures to mark unhealthy | 3 |
 | `healthy_threshold` | Consecutive successes to mark healthy | 2 |
+| `use_tls` | Use TLS connection for health check | **false** |
+| `verify_cert` | Verify TLS certificate (use_tls=true only) | **true** |
 
 ### Configuration Example
 
@@ -2054,7 +2061,37 @@ servers = [
   healthy_statuses = [200]
   unhealthy_threshold = 3
   healthy_threshold = 2
+  # TLS health check (for HTTPS backends)
+  use_tls = false
+  verify_cert = true
 ```
+
+### TLS Health Check
+
+When `use_tls = true`, the health check uses TLS connection instead of plain HTTP. This is useful for monitoring HTTPS backends.
+
+**Configuration Example for TLS Health Check:**
+
+```toml
+[upstreams."api-servers"]
+algorithm = "least_conn"
+servers = [
+  "https://api1.internal:8443",
+  "https://api2.internal:8443"
+]
+
+  [upstreams."api-servers".health_check]
+  interval_secs = 10
+  path = "/health"
+  timeout_secs = 5
+  healthy_statuses = [200]
+  # Enable TLS health check
+  use_tls = true
+  # Verify certificate (set to false for self-signed certificates)
+  verify_cert = true
+```
+
+> **Note**: When `verify_cert = false`, self-signed certificates are accepted. This is useful for development environments, but not recommended for production.
 
 ### Log Output
 
