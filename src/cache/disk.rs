@@ -401,6 +401,9 @@ pub mod async_io {
     /// 非同期ファイル削除
     /// 
     /// 注意: monoio::fsにはremoveがないため同期操作
+    /// 
+    /// 将来の使用に備えた関数。非同期削除の実装が追加される可能性がある。
+    #[allow(dead_code)]
     pub fn remove_file(path: &Path) -> io::Result<()> {
         std::fs::remove_file(path)
     }
