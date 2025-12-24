@@ -2455,6 +2455,7 @@ static RELOAD_FLAG: Lazy<Arc<AtomicBool>> = Lazy::new(|| Arc::new(AtomicBool::ne
 /// メモリ上の機密データを安全にゼロ化します。
 /// コンパイラによる最適化（デッドストア削除）を防ぐため、
 /// volatile 書き込みを使用します。
+#[cfg(feature = "http3")]
 fn secure_zero(data: &mut [u8]) {
     // volatile 書き込みで最適化を防止
     for byte in data.iter_mut() {
@@ -2471,6 +2472,7 @@ fn secure_zero(data: &mut [u8]) {
 /// Arc の参照カウントが 1（自分だけ）の場合、
 /// 内部の Vec をゼロ化してからドロップします。
 /// 参照カウントが 2 以上の場合は警告を出力します。
+#[cfg(feature = "http3")]
 fn secure_clear_arc_vec(arc: &mut Arc<Vec<u8>>, name: &str) {
     match Arc::get_mut(arc) {
         Some(vec) => {
@@ -3158,9 +3160,11 @@ struct Config {
     prometheus: PrometheusConfig,
     /// HTTP/2 設定セクション
     #[serde(default)]
+    #[cfg_attr(not(feature = "http2"), allow(dead_code))]
     http2: Http2ConfigSection,
     /// HTTP/3 設定セクション
     #[serde(default)]
+    #[cfg_attr(not(feature = "http3"), allow(dead_code))]
     http3: Http3ConfigSection,
     /// Upstream グループ定義（ロードバランシング用）
     #[serde(default)]
@@ -3459,6 +3463,7 @@ struct ServerConfigSection {
     /// 
     /// 注意: `--features http2` でビルドする必要があります
     #[serde(default)]
+    #[cfg_attr(not(feature = "http2"), allow(dead_code))]
     http2_enabled: bool,
     
     /// HTTP/3 を有効化するかどうか
@@ -3476,6 +3481,7 @@ struct ServerConfigSection {
     /// - GSO/GRO による高パフォーマンス UDP 処理を使用
     /// - リッスンアドレスは [http3].listen で設定
     #[serde(default)]
+    #[cfg_attr(not(feature = "http3"), allow(dead_code))]
     http3_enabled: bool,
 }
 
@@ -4651,19 +4657,23 @@ struct LoadedConfig {
     listen_http_addr: Option<SocketAddr>,
     tls_config: Arc<ServerConfig>,
     /// TLS証明書パス（ログ・表示用）
+    #[cfg_attr(not(feature = "http3"), allow(dead_code))]
     tls_cert_path: String,
     /// TLS秘密鍵パス（ログ・表示用）
+    #[cfg_attr(not(feature = "http3"), allow(dead_code))]
     tls_key_path: String,
     /// TLS証明書（PEM形式、事前読み込み済み）
     /// 
     /// Landlock適用前に読み込まれた証明書データ。
     /// HTTP/3ではmemfd経由でquicheに渡すことで、
     /// Landlockによるファイルシステム制限下でも動作可能。
+    #[cfg_attr(not(feature = "http3"), allow(dead_code))]
     tls_cert_pem: Arc<Vec<u8>>,
     /// TLS秘密鍵（PEM形式、事前読み込み済み）
     /// 
     /// Landlock適用前に読み込まれた秘密鍵データ。
     /// HTTP/3ではmemfd経由でquicheに渡す。
+    #[cfg_attr(not(feature = "http3"), allow(dead_code))]
     tls_key_pem: Arc<Vec<u8>>,
     host_routes: Arc<HashMap<Box<[u8]>, Backend>>,
     path_routes: Arc<HashMap<Box<[u8]>, PathRouter>>,
@@ -4681,14 +4691,19 @@ struct LoadedConfig {
     /// Upstream グループ（健康チェック用）
     upstream_groups: Arc<HashMap<String, Arc<UpstreamGroup>>>,
     /// HTTP/2 を有効化するかどうか
+    #[cfg(feature = "http2")]
     http2_enabled: bool,
     /// HTTP/3 を有効化するかどうか
+    #[cfg(feature = "http3")]
     http3_enabled: bool,
     /// HTTP/3 リスナーアドレス (UDP)
+    #[cfg(feature = "http3")]
     http3_listen: Option<String>,
     /// HTTP/2 設定（詳細設定）
+    #[cfg(feature = "http2")]
     http2_config: Http2ConfigSection,
     /// HTTP/3 設定（詳細設定）
+    #[cfg(feature = "http3")]
     http3_config: Http3ConfigSection,
 }
 
@@ -4736,10 +4751,13 @@ struct RuntimeConfig {
     /// Upstream グループ（健康チェック用）
     upstream_groups: Arc<HashMap<String, Arc<UpstreamGroup>>>,
     /// HTTP/2 有効化フラグ
+    #[cfg(feature = "http2")]
     http2_enabled: bool,
     /// HTTP/2 設定（詳細設定）
+    #[cfg(feature = "http2")]
     http2_config: Http2ConfigSection,
     /// HTTP/3 設定（圧縮設定の解決に使用）
+    #[cfg(feature = "http3")]
     http3_config: Http3ConfigSection,
 }
 
@@ -4753,8 +4771,11 @@ impl Default for RuntimeConfig {
             global_security: Arc::new(GlobalSecurityConfig::default()),
             prometheus_config: Arc::new(PrometheusConfig::default()),
             upstream_groups: Arc::new(HashMap::new()),
+            #[cfg(feature = "http2")]
             http2_enabled: false,
+            #[cfg(feature = "http2")]
             http2_config: Http2ConfigSection::default(),
+            #[cfg(feature = "http3")]
             http3_config: Http3ConfigSection::default(),
         }
     }
@@ -4800,8 +4821,11 @@ fn reload_config(path: &Path) -> io::Result<()> {
         global_security: Arc::new(loaded.global_security),
         prometheus_config: Arc::new(loaded.prometheus_config),
         upstream_groups: loaded.upstream_groups,
+        #[cfg(feature = "http2")]
         http2_enabled: loaded.http2_enabled,
+        #[cfg(feature = "http2")]
         http2_config: loaded.http2_config,
+        #[cfg(feature = "http3")]
         http3_config: loaded.http3_config,
     };
     
@@ -4822,8 +4846,11 @@ struct LoadedConfigWithoutTls {
     global_security: GlobalSecurityConfig,
     prometheus_config: PrometheusConfig,
     upstream_groups: Arc<HashMap<String, Arc<UpstreamGroup>>>,
+    #[cfg(feature = "http2")]
     http2_enabled: bool,
+    #[cfg(feature = "http2")]
     http2_config: Http2ConfigSection,
+    #[cfg(feature = "http3")]
     http3_config: Http3ConfigSection,
 }
 
@@ -4840,8 +4867,11 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
     validate_config(&config)?;
 
     // HTTP/2・HTTP/3 設定を読み込み
+    #[cfg(feature = "http2")]
     let http2_enabled = config.server.http2_enabled;
+    #[cfg(feature = "http2")]
     let http2_config = config.http2.clone();
+    #[cfg(feature = "http3")]
     let http3_config = config.http3.clone();
 
     // Upstream グループを構築（ロードバランシング用）
@@ -4893,8 +4923,11 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
         global_security: config.security,
         prometheus_config: config.prometheus,
         upstream_groups: Arc::new(upstream_groups),
+        #[cfg(feature = "http2")]
         http2_enabled,
+        #[cfg(feature = "http2")]
         http2_config,
+        #[cfg(feature = "http3")]
         http3_config,
     })
 }
@@ -4917,14 +4950,22 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
 
     // HTTP/2・HTTP/3 設定を読み込み
     // 有効化フラグは server セクションで管理、詳細設定は [http2]/[http3] セクション
+    #[cfg(feature = "http2")]
     let http2_enabled = config.server.http2_enabled;
+    #[cfg(feature = "http3")]
     let http3_enabled = config.server.http3_enabled;
+    #[cfg(feature = "http2")]
     let http2_config = config.http2.clone();
+    #[cfg(feature = "http3")]
     let http3_config = config.http3.clone();
+    #[cfg(feature = "http3")]
     let http3_listen = http3_config.listen.clone();
     
     // TLS設定（kTLS有効時はシークレット抽出を有効化、HTTP/2有効時はALPN設定）
+    #[cfg(feature = "http2")]
     let tls_config = load_tls_config(&config.tls, ktls_config.enabled, http2_enabled)?;
+    #[cfg(not(feature = "http2"))]
+    let tls_config = load_tls_config(&config.tls, ktls_config.enabled, false)?;
     
     // Upstream グループを構築（ロードバランシング用）
     let mut upstream_groups: HashMap<String, Arc<UpstreamGroup>> = HashMap::new();
@@ -5032,10 +5073,15 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         logging: config.logging,
         prometheus_config: config.prometheus,
         upstream_groups: Arc::new(upstream_groups),
+        #[cfg(feature = "http2")]
         http2_enabled,
+        #[cfg(feature = "http3")]
         http3_enabled,
+        #[cfg(feature = "http3")]
         http3_listen,
+        #[cfg(feature = "http2")]
         http2_config,
+        #[cfg(feature = "http3")]
         http3_config,
     })
 }
@@ -5530,7 +5576,16 @@ fn main() {
     // 追加の非同期化層（tokio::sync::mpsc等）は不要
     let _guard = init_logging(&logging_config);
 
+    #[cfg(feature = "http3")]
     let mut loaded_config = match load_config(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Config load error: {}", e);
+            return;
+        }
+    };
+    #[cfg(not(feature = "http3"))]
+    let loaded_config = match load_config(&config_path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Config load error: {}", e);
@@ -5568,8 +5623,11 @@ fn main() {
         global_security: Arc::new(loaded_config.global_security.clone()),
         prometheus_config: Arc::new(loaded_config.prometheus_config.clone()),
         upstream_groups: loaded_config.upstream_groups.clone(),
+        #[cfg(feature = "http2")]
         http2_enabled: loaded_config.http2_enabled,
+        #[cfg(feature = "http2")]
         http2_config: loaded_config.http2_config.clone(),
+        #[cfg(feature = "http3")]
         http3_config: loaded_config.http3_config.clone(),
     };
     CURRENT_CONFIG.store(Arc::new(runtime_config));
@@ -5597,9 +5655,11 @@ fn main() {
     }
     
     // HTTP/2・HTTP/3 の設定ログ
+    #[cfg(feature = "http2")]
     if loaded_config.http2_enabled {
         info!("HTTP/2 enabled via ALPN negotiation");
     }
+    #[cfg(feature = "http3")]
     if loaded_config.http3_enabled {
         info!("HTTP/3 enabled (UDP listener: {})", 
               loaded_config.http3_listen.as_deref().unwrap_or(&loaded_config.listen_addr));
@@ -6880,6 +6940,7 @@ impl SecurityCheckResult {
 /// ## パフォーマンス
 /// 設定がデフォルトの場合、has_security_checks() で早期リターンし、
 /// オーバーヘッドを最小化。
+#[cfg(any(feature = "http2", feature = "http3"))]
 #[inline]
 fn check_security(
     security: &SecurityConfig,
