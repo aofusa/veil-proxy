@@ -6,6 +6,10 @@
 #   - バックエンド1: veil (ポート9001、静的ファイル配信)
 #   - バックエンド2: veil (ポート9002、静的ファイル配信)
 #
+# 環境適応型フィーチャー選択:
+#   - kTLSが利用可能な場合: ktls,http2,http3 を使用（推奨構成）
+#   - kTLSが利用不可の場合: http2,http3 にフォールバック
+#
 # 使用方法:
 #   ./tests/e2e_setup.sh start   # 環境起動
 #   ./tests/e2e_setup.sh stop    # 環境停止
@@ -49,12 +53,41 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+# kTLS利用可能性チェック
+# kTLSが利用可能な場合0を返し、利用不可の場合1を返す
+check_ktls_available() {
+    # /proc/sys/net/ipv4/tcp_available_ulp が存在し、tlsが含まれているか確認
+    if [ -f /proc/sys/net/ipv4/tcp_available_ulp ]; then
+        if grep -q tls /proc/sys/net/ipv4/tcp_available_ulp 2>/dev/null; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# ビルド用フィーチャーを決定
+# kTLSが利用可能な場合は "ktls,http2,http3"、利用不可の場合は "http2,http3" を返す
+determine_build_features() {
+    if check_ktls_available; then
+        echo "ktls,http2,http3"
+    else
+        echo "http2,http3"
+    fi
+}
+
 # veilバイナリの存在確認・ビルド
+# 注意: kTLSが利用可能な場合は推奨構成（ktls,http2,http3）でビルドします
+# kTLS対応には Linux 5.15+ と modprobe tls が必要です
 ensure_veil_binary() {
     if [ ! -f "$VEIL_BIN" ]; then
-        log_info "Building veil..."
+        FEATURES=$(determine_build_features)
+        if check_ktls_available; then
+            log_info "Building veil with recommended features (ktls,http2,http3)..."
+        else
+            log_warn "kTLS not available, falling back to http2,http3"
+        fi
         cd "$PROJECT_DIR"
-        cargo build --features http2
+        cargo build --features "$FEATURES"
         cd - > /dev/null
     fi
     
