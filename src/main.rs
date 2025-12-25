@@ -14467,7 +14467,8 @@ mod tests {
                 "test-group".into(),
                 servers,
                 LoadBalanceAlgorithm::RoundRobin,
-                None
+                None,
+                false
             );
             
             assert!(group.is_some());
@@ -14481,7 +14482,8 @@ mod tests {
                 "empty".into(),
                 vec![],
                 LoadBalanceAlgorithm::RoundRobin,
-                None
+                None,
+                false
             );
             
             assert!(group.is_none());
@@ -14499,7 +14501,8 @@ mod tests {
                 "invalid".into(),
                 servers,
                 LoadBalanceAlgorithm::RoundRobin,
-                None
+                None,
+                false
             );
             
             assert!(group.is_none());
@@ -14512,7 +14515,8 @@ mod tests {
                 "rr-test".into(),
                 servers,
                 LoadBalanceAlgorithm::RoundRobin,
-                None
+                None,
+                false
             ).unwrap();
             
             let mut hosts: Vec<String> = Vec::new();
@@ -14542,7 +14546,8 @@ mod tests {
                 "iphash-test".into(),
                 servers,
                 LoadBalanceAlgorithm::IpHash,
-                None
+                None,
+                false
             ).unwrap();
             
             let client_ip = "192.168.1.100";
@@ -14562,7 +14567,8 @@ mod tests {
                 "iphash-dist".into(),
                 servers,
                 LoadBalanceAlgorithm::IpHash,
-                None
+                None,
+                false
             ).unwrap();
             
             let mut selected_hosts = std::collections::HashSet::new();
@@ -14586,7 +14592,8 @@ mod tests {
                 "lc-test".into(),
                 servers,
                 LoadBalanceAlgorithm::LeastConnections,
-                None
+                None,
+                false
             ).unwrap();
             
             // 初期状態では全サーバーの接続数が0なので、最初のサーバーが選択される
@@ -14693,7 +14700,8 @@ mod tests {
                 "health-test".into(),
                 servers,
                 LoadBalanceAlgorithm::RoundRobin,
-                None
+                None,
+                false
             ).unwrap();
             
             // 2番目のサーバーを不健全にマーク（3回失敗で不健全）
@@ -14725,7 +14733,8 @@ mod tests {
                 "all-unhealthy".into(),
                 servers,
                 LoadBalanceAlgorithm::RoundRobin,
-                None
+                None,
+                false
             ).unwrap();
             
             // 全サーバーを不健全にマーク（3回失敗で不健全）
