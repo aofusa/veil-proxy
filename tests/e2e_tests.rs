@@ -37,17 +37,81 @@ use rustls::pki_types::ServerName;
 
 // E2E環境のポート設定（e2e_setup.shと一致させる）
 const PROXY_PORT: u16 = 8443;  // プロキシHTTPSポート
-const PROXY_HTTP_PORT: u16 = 8080;  // プロキシHTTPポート（環境チェック用）
 const BACKEND1_PORT: u16 = 9001;
 const BACKEND2_PORT: u16 = 9002;
 
-/// E2E環境が起動しているか確認
-/// 注意: HTTPポートを使用して接続確認（TLSハンドシェイク不要）
+/// E2E環境が起動しているか確認（HTTPS、TLSハンドシェイクを正しく行う）
 fn is_e2e_environment_ready() -> bool {
-    // プロキシHTTPポートへの接続確認（TLSハンドシェイクを避ける）
-    if TcpStream::connect(format!("127.0.0.1:{}", PROXY_HTTP_PORT)).is_err() {
-        eprintln!("E2E environment not ready: Proxy not running on port {}", PROXY_HTTP_PORT);
+    use std::io::ErrorKind;
+    
+    // プロキシHTTPSポートへの接続確認（TLSハンドシェイクを正しく行う）
+    let mut stream = match TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)) {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("E2E environment not ready: Proxy not running on port {}", PROXY_PORT);
         eprintln!("Please run: ./tests/e2e_setup.sh start");
+        return false;
+    }
+    };
+    
+    if stream.set_read_timeout(Some(Duration::from_secs(2))).is_err() {
+        eprintln!("E2E environment not ready: Failed to set read timeout");
+        return false;
+    }
+    if stream.set_write_timeout(Some(Duration::from_secs(2))).is_err() {
+        eprintln!("E2E environment not ready: Failed to set write timeout");
+        return false;
+    }
+    
+    // rustlsクライアント設定を作成
+    let config = create_client_config();
+    
+    // サーバー名を決定
+    let server_name = match ServerName::try_from("localhost".to_string()) {
+        Ok(name) => name,
+        Err(_) => {
+            eprintln!("E2E environment not ready: Failed to create server name");
+            return false;
+        }
+    };
+    
+    // TLS接続を確立
+    let mut tls_conn = match ClientConnection::new(config, server_name) {
+        Ok(conn) => conn,
+        Err(_) => {
+            eprintln!("E2E environment not ready: Failed to create TLS connection");
+            return false;
+        }
+    };
+    
+    // TLSハンドシェイクを開始（完了まで待たない）
+    let mut handshake_started = false;
+    for _ in 0..10 {
+        if !tls_conn.is_handshaking() {
+            return true;
+        }
+        
+        match tls_conn.complete_io(&mut stream) {
+            Ok(_) => {
+                handshake_started = true;
+                if !tls_conn.is_handshaking() {
+                    return true;
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(_) => {
+                eprintln!("E2E environment not ready: TLS handshake failed");
+                return false;
+            }
+        }
+    }
+    
+    // ハンドシェイクが開始されていればサーバーは起動していると判断
+    if !handshake_started {
+        eprintln!("E2E environment not ready: TLS handshake did not start");
         return false;
     }
     

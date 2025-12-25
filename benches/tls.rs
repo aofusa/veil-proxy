@@ -33,9 +33,58 @@ fn init_crypto_provider() {
     });
 }
 
-/// プロキシサーバーが起動しているか確認
+/// プロキシサーバーが起動しているか確認（HTTPS、TLSハンドシェイクを正しく行う）
 fn is_proxy_running() -> bool {
-    TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).is_ok()
+    init_crypto_provider();
+    
+    let mut stream = match TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    
+    if stream.set_read_timeout(Some(Duration::from_secs(2))).is_err() {
+        return false;
+    }
+    if stream.set_write_timeout(Some(Duration::from_secs(2))).is_err() {
+        return false;
+    }
+    
+    let config = create_tls_config();
+    let server_name = match ServerName::try_from("localhost".to_string()) {
+        Ok(name) => name,
+        Err(_) => return false,
+    };
+    
+    let mut tls_conn = match ClientConnection::new(config, server_name) {
+        Ok(conn) => conn,
+        Err(_) => return false,
+    };
+    
+    // TLSハンドシェイクを開始（完了まで待たない）
+    use std::io::ErrorKind;
+    let mut handshake_started = false;
+    for _ in 0..10 {
+        if !tls_conn.is_handshaking() {
+            return true;
+        }
+        
+        match tls_conn.complete_io(&mut stream) {
+            Ok(_) => {
+                handshake_started = true;
+                if !tls_conn.is_handshaking() {
+                    return true;
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(_) => return false,
+        }
+    }
+    
+    // ハンドシェイクが開始されていればサーバーは起動していると判断
+    handshake_started
 }
 
 /// 証明書検証をスキップするカスタム検証器
