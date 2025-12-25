@@ -175,7 +175,17 @@ fn send_request(port: u16, path: &str, headers: &[(&str, &str)]) -> Result<Vec<u
     tls_stream.write_all(request.as_bytes())?;
     
     let mut response = Vec::new();
-    tls_stream.read_to_end(&mut response)?;
+    // TLS close_notify なしでの接続終了を許容
+    // HTTP/1.1 では Content-Length やチャンク転送で完全性を保証するため、
+    // close_notify がなくても実用上問題ない
+    match tls_stream.read_to_end(&mut response) {
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+            // サーバーが close_notify を送信せずに接続を閉じた場合は許容
+            // レスポンスが既に受信されていれば問題なし
+        }
+        Err(e) => return Err(e),
+    }
     
     Ok(response)
 }
