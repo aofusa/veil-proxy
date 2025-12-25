@@ -165,7 +165,12 @@ fn send_request(port: u16, path: &str, headers: &[(&str, &str)]) -> Option<Strin
     let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
     
     // リクエスト構築
-    let mut request = format!("GET {} HTTP/1.1\r\nHost: localhost\r\n", path);
+    // Hostヘッダーが明示的に指定されているか確認
+    let has_host_header = headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("host"));
+    let mut request = format!("GET {} HTTP/1.1\r\n", path);
+    if !has_host_header {
+        request.push_str("Host: localhost\r\n");
+    }
     for (name, value) in headers {
         request.push_str(&format!("{}: {}\r\n", name, value));
     }
@@ -736,18 +741,12 @@ fn test_different_host_headers() {
     let response1 = send_request(PROXY_PORT, "/", &[]);
     assert!(response1.is_some(), "localhost should work");
     
-    // 127.0.0.1 のHost
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    // 127.0.0.1 のHost（TLS接続を使用）
+    let response2 = send_request(PROXY_PORT, "/", &[("Host", "127.0.0.1")]);
+    assert!(response2.is_some(), "127.0.0.1 Host should work");
     
-    let request = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
-    stream.write_all(request.as_bytes()).unwrap();
-    
-    let mut response = Vec::new();
-    let _ = stream.read_to_end(&mut response);
-    
-    let response_str = String::from_utf8_lossy(&response);
-    let status = get_status_code(&response_str);
+    let response2 = response2.unwrap();
+    let status = get_status_code(&response2);
     assert_eq!(status, Some(200), "127.0.0.1 Host should work");
 }
 

@@ -4366,11 +4366,13 @@ impl PathRouter {
         // より具体的なプレフィックスが自動的に優先される
         for (i, (prefix, _)) in entries.iter().enumerate() {
             if prefix == "/" {
-                // "/" は完全一致のみ（"/" へのリクエストのみマッチ）
-                // catch-all動作なし: マッチしないパスは404エラー
+                // "/" はcatch-allとして機能（すべてのパスにマッチ）
+                // 1. "/" への完全一致
                 if let Err(e) = router.insert("/".to_string(), i) {
                     warn!("Route registration failed for '/': {}", e);
                 }
+                // 2. "/{*rest}" でサブパスにマッチ（catch-all）
+                let _ = router.insert("/{*rest}".to_string(), i);
             } else if prefix.ends_with('/') {
                 // "/api/" スタイル（ディレクトリ）
                 let base = prefix.trim_end_matches('/');
@@ -8755,10 +8757,31 @@ fn find_backend(
     host_routes: &Arc<HashMap<Box<[u8]>, Backend>>,
     path_routes: &Arc<HashMap<Box<[u8]>, PathRouter>>,
 ) -> Option<(Box<[u8]>, Backend)> {
+    // ホスト名からポート番号を除去（例: "127.0.0.1:8443" -> "127.0.0.1"）
+    let host_without_port = if let Some(colon_pos) = host.iter().position(|&b| b == b':') {
+        &host[..colon_pos]
+    } else {
+        host
+    };
+    
+    // まず完全一致で検索
+    if let Some(backend) = host_routes.get(host_without_port) {
+        return Some((Box::new([]), backend.clone()));
+    }
+    
+    // ポート番号付きでも試す（後方互換性のため）
     if let Some(backend) = host_routes.get(host) {
         return Some((Box::new([]), backend.clone()));
     }
     
+    // path_routesで検索（ポート番号なし）
+    if let Some(sorted_map) = path_routes.get(host_without_port) {
+        if let Some((prefix, backend)) = sorted_map.find_longest(path) {
+            return Some((prefix.into(), backend.clone()));
+        }
+    }
+    
+    // path_routesで検索（ポート番号付き、後方互換性のため）
     if let Some(sorted_map) = path_routes.get(host) {
         if let Some((prefix, backend)) = sorted_map.find_longest(path) {
             return Some((prefix.into(), backend.clone()));
