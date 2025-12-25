@@ -38,19 +38,22 @@ use rustls::pki_types::ServerName;
 
 // E2E環境のポート設定（e2e_setup.shと一致させる）
 const PROXY_PORT: u16 = 8443;  // プロキシHTTPSポート
+const PROXY_HTTP_PORT: u16 = 8080;  // プロキシHTTPポート（環境チェック用）
 const BACKEND1_PORT: u16 = 9001;
 const BACKEND2_PORT: u16 = 9002;
 
 /// E2E環境が起動しているか確認
+/// 注意: HTTPポートを使用して接続確認（TLSハンドシェイク不要）
 fn is_e2e_environment_ready() -> bool {
-    // プロキシへの接続確認
-    if TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).is_err() {
-        eprintln!("E2E environment not ready: Proxy not running on port {}", PROXY_PORT);
+    // プロキシHTTPポートへの接続確認（TLSハンドシェイクを避ける）
+    if TcpStream::connect(format!("127.0.0.1:{}", PROXY_HTTP_PORT)).is_err() {
+        eprintln!("E2E environment not ready: Proxy not running on port {}", PROXY_HTTP_PORT);
         eprintln!("Please run: ./tests/e2e_setup.sh start");
         return false;
     }
     
-    // バックエンドへの接続確認
+    // バックエンドへの接続確認（TCPレベルで十分）
+    // 注意: バックエンドはTLS必須だが、TCPconnect成功=ポート開放を確認
     if TcpStream::connect(format!("127.0.0.1:{}", BACKEND1_PORT)).is_err() {
         eprintln!("E2E environment not ready: Backend 1 not running on port {}", BACKEND1_PORT);
         return false;
@@ -129,9 +132,11 @@ fn create_client_config() -> Arc<ClientConfig> {
 
 /// HTTPS リクエストを送信してレスポンスを取得
 fn send_request(port: u16, path: &str, headers: &[(&str, &str)]) -> Option<String> {
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-    stream.set_write_timeout(Some(Duration::from_secs(5))).ok()?;
+    use rustls::StreamOwned;
+    
+    let stream = TcpStream::connect(format!("127.0.0.1:{}", port)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
+    stream.set_write_timeout(Some(Duration::from_secs(10))).ok()?;
     
     // rustlsクライアント設定を作成
     let config = create_client_config();
@@ -141,24 +146,10 @@ fn send_request(port: u16, path: &str, headers: &[(&str, &str)]) -> Option<Strin
         .ok()?;
     
     // TLS接続を確立
-    let mut tls_conn = ClientConnection::new(config, server_name).ok()?;
+    let tls_conn = ClientConnection::new(config, server_name).ok()?;
     
-    // ハンドシェイクを実行（同期）
-    use std::io::ErrorKind;
-    while tls_conn.is_handshaking() {
-        match tls_conn.complete_io(&mut stream) {
-            Ok(_) => {}
-            Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                // 非ブロッキングI/Oの場合は待機
-                std::thread::sleep(Duration::from_millis(10));
-                continue;
-            }
-            Err(_) => return None,
-        }
-    }
-    
-    // rustls::Streamを使用して読み書き
-    let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
+    // StreamOwnedを使用 - ハンドシェイクとI/Oを自動処理
+    let mut tls_stream = StreamOwned::new(tls_conn, stream);
     
     // リクエスト構築
     let mut request = format!("GET {} HTTP/1.1\r\nHost: localhost\r\n", path);
@@ -167,8 +158,11 @@ fn send_request(port: u16, path: &str, headers: &[(&str, &str)]) -> Option<Strin
     }
     request.push_str("Connection: close\r\n\r\n");
     
+    // リクエスト送信
     tls_stream.write_all(request.as_bytes()).ok()?;
+    tls_stream.flush().ok()?;
     
+    // レスポンス受信
     let mut response = Vec::new();
     tls_stream.read_to_end(&mut response).ok()?;
     
