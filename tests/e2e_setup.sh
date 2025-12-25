@@ -224,6 +224,7 @@ servers = [
     "https://127.0.0.1:${BACKEND1_PORT}",
     "https://127.0.0.1:${BACKEND2_PORT}"
 ]
+tls_insecure = true
 
 [path_routes."localhost"."/"]
 type = "Proxy"
