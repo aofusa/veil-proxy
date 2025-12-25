@@ -132,9 +132,9 @@ fn create_client_config() -> Arc<ClientConfig> {
 
 /// HTTPS リクエストを送信してレスポンスを取得
 fn send_request(port: u16, path: &str, headers: &[(&str, &str)]) -> Option<String> {
-    use rustls::StreamOwned;
+    use std::io::{ErrorKind, Read, Write};
     
-    let stream = TcpStream::connect(format!("127.0.0.1:{}", port)).ok()?;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
     stream.set_write_timeout(Some(Duration::from_secs(10))).ok()?;
     
@@ -146,10 +146,23 @@ fn send_request(port: u16, path: &str, headers: &[(&str, &str)]) -> Option<Strin
         .ok()?;
     
     // TLS接続を確立
-    let tls_conn = ClientConnection::new(config, server_name).ok()?;
+    let mut tls_conn = ClientConnection::new(config, server_name).ok()?;
     
-    // StreamOwnedを使用 - ハンドシェイクとI/Oを自動処理
-    let mut tls_stream = StreamOwned::new(tls_conn, stream);
+    // ハンドシェイクを明示的に完了
+    while tls_conn.is_handshaking() {
+        match tls_conn.complete_io(&mut stream) {
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                // 非ブロッキングI/Oの場合は短い待機
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(_) => return None,
+        }
+    }
+    
+    // rustls::Streamを使用してI/Oを実行
+    let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
     
     // リクエスト構築
     let mut request = format!("GET {} HTTP/1.1\r\nHost: localhost\r\n", path);
@@ -164,7 +177,25 @@ fn send_request(port: u16, path: &str, headers: &[(&str, &str)]) -> Option<Strin
     
     // レスポンス受信
     let mut response = Vec::new();
-    tls_stream.read_to_end(&mut response).ok()?;
+    // read_to_endは接続が閉じられるまで読み続ける
+    // エラーが発生した場合でも、既に読み取ったデータがあれば返す
+    match tls_stream.read_to_end(&mut response) {
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+            // EOFは正常終了（サーバーが接続を閉じた）
+            // 既に読み取ったデータがあれば返す
+        }
+        Err(_) => {
+            // その他のエラーは、既に読み取ったデータがあれば返す
+            if response.is_empty() {
+                return None;
+            }
+        }
+    }
+    
+    if response.is_empty() {
+        return None;
+    }
     
     String::from_utf8(response).ok()
 }
