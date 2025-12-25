@@ -2658,6 +2658,15 @@ thread_local! {
     };
 }
 
+// 証明書検証をスキップする TLS コネクター（自己署名証明書用）
+#[cfg(not(feature = "ktls"))]
+thread_local! {
+    static TLS_CONNECTOR_INSECURE: simple_tls::SimpleTlsConnector = {
+        let config = simple_tls::insecure_client_config();
+        simple_tls::SimpleTlsConnector::new(config)
+    };
+}
+
 // ====================
 // バックエンドコネクションプール
 // ====================
@@ -3088,6 +3097,11 @@ struct UpstreamConfig {
     /// 健康チェック設定（オプション）
     #[serde(default)]
     health_check: Option<HealthCheckConfig>,
+    /// TLS証明書検証を無効化（自己署名証明書を許可）
+    /// デフォルト: false（証明書検証を有効）
+    /// 注意: 本番環境では false を推奨
+    #[serde(default)]
+    tls_insecure: bool,
 }
 
 /// 健康チェック設定
@@ -10141,7 +10155,9 @@ async fn handle_proxy(
 
     let result = if target.use_tls {
         // HTTPS接続（キャッシュ保存はHTTPのみサポート、HTTPSは別途実装が必要）
-        proxy_https_pooled(client_stream, target, security, compression, client_encoding, &pool_key, request, content_length, is_chunked, initial_body, client_wants_close).await
+        // 環境変数VEIL_TLS_INSECUREでも証明書検証スキップを制御可能（E2Eテスト用）
+        let tls_insecure = std::env::var("VEIL_TLS_INSECURE").map(|v| v == "1" || v == "true").unwrap_or(false);
+        proxy_https_pooled(client_stream, target, security, compression, client_encoding, &pool_key, request, content_length, is_chunked, initial_body, client_wants_close, tls_insecure).await
     } else if target.use_h2c {
         // H2C (HTTP/2 over cleartext) 接続
         #[cfg(feature = "http2")]
@@ -12354,6 +12370,7 @@ async fn proxy_https_pooled(
     is_chunked: bool,
     initial_body: &[u8],
     client_wants_close: bool,
+    tls_insecure: bool,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // セキュリティ設定からタイムアウトを取得
     let connect_timeout = Duration::from_secs(security.backend_connect_timeout_secs);
@@ -12387,9 +12404,15 @@ async fn proxy_https_pooled(
             
             // TLS接続（タイムアウト付き）
             // SNI名を使用（sni_nameが設定されていればそれを使用、なければhostを使用）
+            // tls_insecure が true の場合、証明書検証をスキップ
             let sni = target.sni();
-            let connector = TLS_CONNECTOR.with(|c| c.clone());
-            let tls_result = timeout(connect_timeout, connector.connect(backend_tcp, sni)).await;
+            let tls_result = if tls_insecure {
+                let connector = TLS_CONNECTOR_INSECURE.with(|c| c.clone());
+                timeout(connect_timeout, connector.connect(backend_tcp, sni)).await
+            } else {
+                let connector = TLS_CONNECTOR.with(|c| c.clone());
+                timeout(connect_timeout, connector.connect(backend_tcp, sni)).await
+            };
             
             match tls_result {
                 Ok(Ok(stream)) => stream,

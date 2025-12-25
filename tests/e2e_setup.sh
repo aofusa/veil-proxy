@@ -72,17 +72,22 @@ prepare_fixtures() {
     mkdir -p "${FIXTURES_DIR}/backend1"
     mkdir -p "${FIXTURES_DIR}/backend2"
     
-    # テスト用証明書を生成（veilのtest機能を使用）
+    # テスト用証明書を生成
+    # CA:FALSE を指定して end-entity 証明書として生成
+    # （CA 証明書として生成すると CaUsedAsEndEntity エラーになる）
     if [ ! -f "${FIXTURES_DIR}/cert.pem" ]; then
         log_info "Generating test certificates..."
         
-        # OpenSSLで自己署名証明書を生成
+        # OpenSSLで自己署名証明書を生成（end-entity証明書）
         openssl req -x509 -newkey rsa:2048 -nodes \
             -keyout "${FIXTURES_DIR}/key.pem" \
             -out "${FIXTURES_DIR}/cert.pem" \
             -days 365 \
             -subj "/CN=localhost" \
             -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+            -addext "basicConstraints=critical,CA:FALSE" \
+            -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
+            -addext "extendedKeyUsage=serverAuth" \
             2>/dev/null
         
         log_info "Certificates generated"
@@ -230,8 +235,8 @@ start_servers() {
     
     log_info "Starting proxy server..."
     
-    # プロキシ起動
-    "$VEIL_BIN" -c "${FIXTURES_DIR}/proxy.toml" &
+    # プロキシ起動（自己署名証明書を許可するためVEIL_TLS_INSECURE=1を設定）
+    VEIL_TLS_INSECURE=1 "$VEIL_BIN" -c "${FIXTURES_DIR}/proxy.toml" &
     echo $! >> "$PIDS_FILE"
     log_info "Proxy started on ports ${PROXY_HTTPS_PORT}/${PROXY_HTTP_PORT} (PID: $!)"
     
