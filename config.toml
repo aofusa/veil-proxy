@@ -406,33 +406,36 @@ ktls_fallback_enabled = false
 #
 [http2]
 # SETTINGS_HEADER_TABLE_SIZE (HPACK動的テーブルサイズ)
-# デフォルト: 4096 (4KB)
-# 高パフォーマンス: 65536 (64KB) - メモリ使用増加と引き換えに圧縮効率向上
+# デフォルト: 65536 (64KB) - high-performance設定
+# RFC 7540標準: 4096 (4KB)
 # header_table_size = 65536
 
 # SETTINGS_MAX_CONCURRENT_STREAMS (同時ストリーム数)
-# デフォルト: 100
+# デフォルト: 256
+# RFC 7540標準: 100
 # 高負荷サーバー: 1000 - 並列リクエスト処理能力向上
 # max_concurrent_streams = 1000
 
 # SETTINGS_INITIAL_WINDOW_SIZE (ストリームウィンドウサイズ)
-# デフォルト: 65535 (64KB - 1)
+# デフォルト: 1048576 (1MB) - high-performance設定
+# RFC 7540標準: 65535 (64KB - 1)
 # 高スループット: 4194304 (4MB) - 大きなファイル転送時のパフォーマンス向上
 # 注意: FLOW_CONTROL_ERROR を防ぐため、大きなレスポンス用に増加推奨
 initial_window_size = 4194304
 
 # SETTINGS_MAX_FRAME_SIZE (最大フレームサイズ)
-# デフォルト: 16384 (16KB)
-# 高パフォーマンス: 65536 (64KB) - フレーム分割オーバーヘッド削減
+# デフォルト: 65536 (64KB) - high-performance設定
+# RFC 7540標準: 16384 (16KB)
 max_frame_size = 65536
 
 # SETTINGS_MAX_HEADER_LIST_SIZE (最大ヘッダーリストサイズ)
-# デフォルト: 16384 (16KB)
-# 大きなCookie/ヘッダー対応: 65536 (64KB)
+# デフォルト: 65536 (64KB)
+# 大きなCookie/ヘッダー対応に最適
 # max_header_list_size = 65536
 
 # コネクションウィンドウサイズ（コネクション全体のフロー制御）
-# デフォルト: 65535 (64KB - 1)
+# デフォルト: 1048576 (1MB) - high-performance設定
+# RFC 7540標準: 65535 (64KB - 1)
 # 高スループット: 16777216 (16MB)
 # 注意: 大きなレスポンスを複数ストリームで同時に送信する場合に増加推奨
 connection_window_size = 16777216
@@ -574,6 +577,10 @@ connection_window_size = 16777216
 #   # HTTPSバックエンドの場合はTLSヘルスチェックを有効化
 #   use_tls = true
 #   verify_cert = true  # 自己署名証明書の場合は false に設定
+#
+# # TLS証明書検証を無効化（自己署名証明書対応、デフォルト: false）
+# # 注意: 本番環境では false を推奨
+# tls_insecure = false
 
 
 # ==========================================
@@ -644,6 +651,49 @@ connection_window_size = 16777216
 #       websocket_poll_max_timeout_ms = 200
 #       websocket_poll_backoff_multiplier = 1.5
 #
+
+# ==========================================
+# WASM拡張設定（Proxy-WASM互換）
+# ==========================================
+#
+# Proxy-WASM ABI互換のWASMモジュールを使用して
+# リクエスト/レスポンス処理をカスタマイズできます。
+#
+# [wasm]
+# # WASM拡張を有効化（デフォルト: false）
+# enabled = true
+#
+#   # デフォルト設定
+#   [wasm.defaults]
+#   # 最大実行時間（ミリ秒、デフォルト: 100）
+#   max_execution_time_ms = 100
+#
+#     # Poolingアロケータ設定
+#     [wasm.defaults.pooling]
+#     # メモリプール総数（デフォルト: 128）
+#     total_memories = 128
+#     # テーブルプール総数（デフォルト: 128）
+#     total_tables = 128
+#     # インスタンスごとの最大メモリサイズ（デフォルト: 10MB）
+#     max_memory_size = 10485760
+#
+# # モジュール定義
+# [[wasm.modules]]
+# name = "auth_filter"         # モジュール名（一意識別子）
+# path = "/etc/veil/wasm/auth.wasm"  # .wasm または .cwasm ファイルパス
+# configuration = '{"key": "value"}'  # プラグイン設定（JSON文字列）
+#
+#   # ケーパビリティ設定（モジュールが使用可能なAPIを制限）
+#   [wasm.modules.capabilities]
+#   allow_http_calls = true
+#   allow_header_manipulation = true
+#   allow_body_manipulation = true
+#   allow_grpc_calls = false
+#
+# # ルートごとのモジュール適用
+# [wasm.routes."api.example.com"]
+# modules = ["auth_filter"]  # 適用するモジュール名のリスト
+
 # ==========================================
 # Prometheusメトリクス
 # ==========================================
@@ -660,7 +710,7 @@ connection_window_size = 16777216
 # 設定例:
 #
 # [prometheus]
-# # メトリクスエンドポイントの有効化（デフォルト: true）
+# # メトリクスエンドポイントの有効化（デフォルト: false）
 # enabled = true
 #
 # # メトリクスエンドポイントのパス（デフォルト: "/__metrics"）
@@ -963,6 +1013,18 @@ url = "http://localhost:9000/"
 #   
 #   # クエリパラメータをキャッシュキーに含めるか
 #   include_query = true
+#
+#   # stale-while-revalidate（期限切れキャッシュを返しながらバックグラウンド更新）
+#   stale_while_revalidate = false
+#
+#   # stale-if-error（バックエンドエラー時に期限切れキャッシュを返す）
+#   stale_if_error = false
+#
+#   # キャッシュキーに含めるヘッダー（ユーザーごとのキャッシュ等）
+#   key_headers = ["Authorization"]
+#
+#   # 非同期I/O使用（io_uring環境のみ、デフォルト: true）
+#   use_async_io = true
 
 # ------------------------------------------
 # バッファリング制御設定
@@ -1000,6 +1062,12 @@ url = "http://localhost:9000/"
 #   # クライアント書き込みタイムアウト（秒）
 #   # バッファからクライアントへの書き込みがこの時間を超えると接続を切断
 #   client_write_timeout_secs = 60
+#
+#   # レスポンスヘッダーもバッファに含めるか（デフォルト: true）
+#   buffer_headers = true
+#
+#   # ディスクバッファ最大サイズ（デフォルト: 100MB）
+#   max_disk_buffer = 104857600
 
 # ------------------------------------------
 # WebSocket プロキシ
@@ -1052,7 +1120,7 @@ url = "http://localhost:9000/"
 # ------------------------------------------
 # リダイレクト設定
 # ------------------------------------------
-# 301/302/307/308 リダイレクトを設定
+# 301/302/303/307/308 リダイレクトを設定
 # WWW非対応やHTTPS強制、旧URL移行などに使用
 #
 # 例1: WWWへリダイレクト
