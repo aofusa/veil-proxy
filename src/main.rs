@@ -7047,7 +7047,7 @@ fn check_security(
 /// **重要**: これらのエラーはクライアントが接続を閉じた場合の正常な動作であり、
 /// サーバー側の問題ではありません。リクエスト処理は正常に完了しています。
 /// ログには警告として出力しますが、接続は正常終了として扱います。
-#[cfg(feature = "http2")]
+#[cfg_attr(not(feature = "http2"), allow(dead_code))]
 #[inline]
 fn is_connection_closed_error(e: &std::io::Error) -> bool {
     use std::io::ErrorKind;
@@ -12658,6 +12658,7 @@ async fn transfer_https_response_with_compression(
         let (res, mut returned_buf) = match read_result {
             Ok(result) => result,
             Err(_) => {
+                warn!("Backend response timeout while reading headers");
                 return (total, status_code, backend_wants_keep_alive);
             }
         };
@@ -12665,11 +12666,19 @@ async fn transfer_https_response_with_compression(
         let n = match res {
             Ok(0) => {
                 buf_put(returned_buf);
+                warn!("Backend closed connection without sending response (read returned 0 bytes)");
                 return (total, status_code, backend_wants_keep_alive);
             }
             Ok(n) => n,
-            Err(_) => {
+            Err(e) => {
                 buf_put(returned_buf);
+                // kTLS使用時はEIO (os error 5) が発生することがある
+                // これはバックエンドがTLS close_notifyを送信せずに接続を閉じた場合に発生
+                if is_connection_closed_error(&e) {
+                    warn!("Backend closed connection (kTLS EIO or connection reset): {}", e);
+                } else {
+                    warn!("Backend read error: {}", e);
+                }
                 return (total, status_code, backend_wants_keep_alive);
             }
         };
