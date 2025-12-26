@@ -31,6 +31,11 @@ http2 = []
 # GSO/GRO による高パフォーマンス UDP 処理
 http3 = ["quiche"]
 
+# WASM Extension サポート (Proxy-Wasm v0.2.1)
+# Wasmtime ランタイムによる WebAssembly フィルタ
+# AOT コンパイル、Pooling Allocator、InstancePre 使用
+wasm = ["wasmtime", "wasmtime-wasi"]
+
 # 全プロトコルサポート
 all-protocols = ["http2", "http3"]
 
@@ -86,6 +91,13 @@ clap = { version = "4.5.53", features = ["derive"] }
 # HTTP/3 用 QUIC 実装（Cloudflare quiche）
 # 実績のある QUIC/HTTP/3 実装を使用
 quiche = { version = "0.23", optional = true }
+
+# Wasmtime: WebAssembly ランタイム (Proxy-Wasm v0.2.1)
+# - pooling-allocator: 高速インスタンス化
+# - cranelift: AOT コンパイル
+# - component-model: WASI対応
+wasmtime = { version = "29.0", optional = true, features = ["pooling-allocator", "cranelift"] }
+wasmtime-wasi = { version = "29.0", optional = true }
 
 # ring: 暗号化ライブラリ
 # - rustls の依存として使用（TLS 1.2/1.3）
