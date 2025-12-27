@@ -131,6 +131,44 @@ impl Closure {
     }
 }
 
+/// Coroutine status
+#[derive(Clone, Debug, PartialEq)]
+pub enum CoroutineStatus {
+    Suspended,  // yieldで一時停止
+    Running,    // 実行中
+    Dead,       // 終了
+}
+
+/// Scope snapshot for coroutine state
+#[derive(Clone, Debug)]
+pub struct ScopeSnapshot {
+    pub values: HashMap<String, Rc<RefCell<LuaValue>>>,
+}
+
+/// Coroutine state
+#[derive(Clone, Debug)]
+pub struct CoroutineState {
+    /// 実行中のクロージャ
+    pub closure: Rc<Closure>,
+    
+    /// スコープスタックの状態（コルーチン実行時のスナップショット）
+    pub scopes: Vec<ScopeSnapshot>,
+    
+    /// 現在のステートメントインデックス（closure.body内の位置）
+    pub statement_index: usize,
+    
+    /// 実行状態フラグ
+    pub break_flag: bool,
+    pub return_values: Option<Vec<LuaValue>>,
+    pub varargs: Vec<LuaValue>,
+    
+    /// コルーチンの状態
+    pub status: CoroutineStatus,
+    
+    /// 呼び出し元に返す値（yield時の値）
+    pub yield_values: Option<Vec<LuaValue>>,
+}
+
 /// Lua value types
 #[derive(Clone, Debug)]
 pub enum LuaValue {
@@ -143,6 +181,7 @@ pub enum LuaValue {
     Function(String), // Named function reference
     Closure(Rc<Closure>), // Closure with captured environment
     NativeFunction(String), // Built-in function name
+    Coroutine(Rc<RefCell<CoroutineState>>), // Coroutine state
 }
 
 impl Default for LuaValue {
@@ -172,6 +211,7 @@ impl LuaValue {
             LuaValue::String(_) => "string",
             LuaValue::Table(_) => "table",
             LuaValue::Function(_) | LuaValue::Closure(_) | LuaValue::NativeFunction(_) => "function",
+            LuaValue::Coroutine(_) => "thread",
         }
     }
 
@@ -205,6 +245,14 @@ impl LuaValue {
                 }
             }
             LuaValue::NativeFunction(name) => format!("function: {}", name),
+            LuaValue::Coroutine(co) => {
+                let status = co.borrow().status.clone();
+                match status {
+                    CoroutineStatus::Suspended => "thread: suspended".to_string(),
+                    CoroutineStatus::Running => "thread: running".to_string(),
+                    CoroutineStatus::Dead => "thread: dead".to_string(),
+                }
+            },
         }
     }
 

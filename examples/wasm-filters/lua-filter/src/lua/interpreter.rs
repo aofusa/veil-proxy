@@ -2,7 +2,7 @@
 
 use crate::lua::ast::*;
 use crate::lua::pattern;
-use crate::lua::value::{Closure, LuaTable, LuaValue, Metatable, Upvalue};
+use crate::lua::value::{Closure, CoroutineState, CoroutineStatus, LuaTable, LuaValue, Metatable, ScopeSnapshot, Upvalue};
 use crate::lua::lexer;
 use crate::lua::parser;
 use std::cell::RefCell;
@@ -112,6 +112,9 @@ pub struct Interpreter {
     
     /// Call depth counter for preventing stack overflow
     call_depth: usize,
+    
+    /// Current running coroutine (for yield support)
+    current_coroutine: Option<Rc<RefCell<CoroutineState>>>,
 }
 
 impl Interpreter {
@@ -217,6 +220,16 @@ impl Interpreter {
         package_table.set("loaded".to_string(), LuaValue::Table(loaded_table));
         globals.insert("package".to_string(), LuaValue::Table(package_table));
 
+        // Register coroutine table
+        let mut coroutine_table = LuaTable::new();
+        for name in &["create", "resume", "yield", "status", "wrap"] {
+            coroutine_table.set(
+                name.to_string(),
+                LuaValue::NativeFunction(format!("coroutine.{}", name)),
+            );
+        }
+        globals.insert("coroutine".to_string(), LuaValue::Table(coroutine_table));
+
         Self {
             globals,
             scopes: Vec::new(),
@@ -230,6 +243,7 @@ impl Interpreter {
             random_state: 0,
             modules: HashMap::new(),
             call_depth: 0,
+            current_coroutine: None,
         }
     }
     
@@ -963,6 +977,12 @@ impl Interpreter {
             }
 
             LuaValue::NativeFunction(name) => {
+                // Special handling for coroutine.yield
+                if name == "coroutine.yield" {
+                    // Yield is handled specially - it returns an error that resume_coroutine catches
+                    return self.call_native(name, args).map(|_| vec![]);
+                }
+                
                 // Special handling for functions that return multiple values
                 if name == "load" || name == "pcall" || name.starts_with("string.unpack") {
                     // These functions return tables that represent multiple values
@@ -1798,6 +1818,11 @@ impl Interpreter {
         // UTF8 library
         if let Some(method) = name.strip_prefix("utf8.") {
             return self.call_utf8_method(method, args);
+        }
+
+        // Coroutine library
+        if let Some(method) = name.strip_prefix("coroutine.") {
+            return self.call_coroutine_method(method, args);
         }
 
         // Standard library
@@ -3574,6 +3599,331 @@ impl Interpreter {
 
             _ => Err(format!("Unknown utf8 method: {}", method)),
         }
+    }
+
+    /// Coroutine library methods
+    fn call_coroutine_method(&mut self, method: &str, args: &[LuaValue]) -> Result<LuaValue, String> {
+        match method {
+            "create" => {
+                // coroutine.create(f)
+                if args.is_empty() {
+                    return Err("coroutine.create: function expected".to_string());
+                }
+                
+                let func = args.first().unwrap();
+                let closure = match func {
+                    LuaValue::Closure(c) => c.clone(),
+                    LuaValue::Function(name) => {
+                        self.functions.get(name)
+                            .ok_or_else(|| format!("coroutine.create: function '{}' not found", name))?
+                            .clone()
+                    }
+                    _ => return Err("coroutine.create: function expected".to_string()),
+                };
+                
+                // Create coroutine state
+                let coroutine_state = CoroutineState {
+                    closure: closure.clone(),
+                    scopes: Vec::new(),
+                    statement_index: 0,
+                    break_flag: false,
+                    return_values: None,
+                    varargs: Vec::new(),
+                    status: CoroutineStatus::Suspended,
+                    yield_values: None,
+                };
+                
+                Ok(LuaValue::Coroutine(Rc::new(RefCell::new(coroutine_state))))
+            }
+            
+            "resume" => {
+                // coroutine.resume(co, ...)
+                if args.is_empty() {
+                    return Err("coroutine.resume: coroutine expected".to_string());
+                }
+                
+                let co_value = args.first().unwrap();
+                let co = match co_value {
+                    LuaValue::Coroutine(co) => co.clone(),
+                    _ => return Err("coroutine.resume: coroutine expected".to_string()),
+                };
+                
+                let mut co_state = co.borrow_mut();
+                
+                // Check status
+                if co_state.status == CoroutineStatus::Dead {
+                    // Return (false, error_message)
+                    let mut result = LuaTable::new();
+                    result.set("1".to_string(), LuaValue::Boolean(false));
+                    result.set("2".to_string(), LuaValue::String("cannot resume dead coroutine".to_string()));
+                    return Ok(LuaValue::Table(result));
+                }
+                
+                // Set arguments
+                let resume_args = &args[1..];
+                co_state.varargs = resume_args.to_vec();
+                
+                // Set status to running
+                co_state.status = CoroutineStatus::Running;
+                
+                // Save current coroutine and set this as current
+                let prev_coroutine = self.current_coroutine.take();
+                self.current_coroutine = Some(co.clone());
+                
+                // Execute coroutine
+                let result = self.resume_coroutine(&co);
+                
+                // Restore previous coroutine
+                self.current_coroutine = prev_coroutine;
+                
+                result
+            }
+            
+            "yield" => {
+                // coroutine.yield(...)
+                if self.current_coroutine.is_none() {
+                    return Err("attempt to yield from outside a coroutine".to_string());
+                }
+                
+                let co = self.current_coroutine.as_ref().unwrap().clone();
+                let mut co_state = co.borrow_mut();
+                
+                // Save yield values
+                co_state.yield_values = Some(args.to_vec());
+                
+                // Save current execution state
+                self.save_coroutine_state(&mut co_state)?;
+                
+                // Set status to suspended
+                co_state.status = CoroutineStatus::Suspended;
+                
+                // Return a special error that resume_coroutine will catch
+                Err("__COROUTINE_YIELD__".to_string())
+            }
+            
+            "status" => {
+                // coroutine.status(co)
+                if args.is_empty() {
+                    return Err("coroutine.status: coroutine expected".to_string());
+                }
+                
+                let co_value = args.first().unwrap();
+                let co = match co_value {
+                    LuaValue::Coroutine(co) => co,
+                    _ => return Err("coroutine.status: coroutine expected".to_string()),
+                };
+                
+                let status = co.borrow().status.clone();
+                let status_str = match status {
+                    CoroutineStatus::Suspended => "suspended",
+                    CoroutineStatus::Running => "running",
+                    CoroutineStatus::Dead => "dead",
+                };
+                
+                Ok(LuaValue::String(status_str.to_string()))
+            }
+            
+            "wrap" => {
+                // coroutine.wrap(f) - returns a function that resumes the coroutine
+                if args.is_empty() {
+                    return Err("coroutine.wrap: function expected".to_string());
+                }
+                
+                // Create coroutine
+                let co = match self.call_coroutine_method("create", args) {
+                    Ok(LuaValue::Coroutine(co)) => co,
+                    Ok(_) => return Err("coroutine.wrap: internal error".to_string()),
+                    Err(e) => return Err(e),
+                };
+                
+                // Create a closure that resumes the coroutine
+                let co_clone = co.clone();
+                let mut upvalues = HashMap::new();
+                upvalues.insert("_coroutine".to_string(), Upvalue::new(LuaValue::Coroutine(co_clone)));
+                
+                // Create a closure with special handling
+                let closure = Rc::new(Closure::new(
+                    Some("coroutine.wrap".to_string()),
+                    vec!["...".to_string()],
+                    true,
+                    vec![], // Empty body - we'll handle this specially
+                    upvalues,
+                ));
+                
+                Ok(LuaValue::Closure(closure))
+            }
+            
+            _ => Err(format!("Unknown coroutine method: {}", method)),
+        }
+    }
+
+    /// Resume a coroutine
+    fn resume_coroutine(&mut self, co: &Rc<RefCell<CoroutineState>>) -> Result<LuaValue, String> {
+        let mut co_state = co.borrow_mut();
+        
+        // Restore coroutine state
+        self.restore_coroutine_state(&mut co_state)?;
+        
+        // Get closure and arguments
+        let closure = co_state.closure.clone();
+        let args = co_state.varargs.clone();
+        
+        // Execute from saved statement index
+        let mut i = co_state.statement_index;
+        let body = &closure.body;
+        
+        // If we're at the start, set up the closure execution environment
+        if i == 0 {
+            self.push_scope();
+            
+            // Restore upvalues
+            for (name, upvalue) in &closure.upvalues {
+                if let Some(scope) = self.scopes.last_mut() {
+                    scope.values.insert(name.clone(), upvalue.value.clone());
+                }
+            }
+            
+            // Bind parameters
+            for (j, param) in closure.params.iter().enumerate() {
+                let arg = args.get(j).cloned().unwrap_or(LuaValue::Nil);
+                self.set_local(param.clone(), arg);
+            }
+            
+            // Set varargs if function accepts them
+            if closure.vararg {
+                let vararg_start = closure.params.len();
+                self.varargs = args[vararg_start..].to_vec();
+            }
+        }
+        
+        // Execute statements
+        while i < body.len() {
+            let stmt = &body[i];
+            
+            // Execute statement
+            match self.execute_statement(stmt) {
+                Ok(()) => {
+                    // Check if we yielded (coroutine.yield was called)
+                    let co_state_check = co.borrow();
+                    if co_state_check.status == CoroutineStatus::Suspended {
+                        // Yield occurred - save state and return yield values
+                        drop(co_state_check);
+                        let mut co_state_mut = co.borrow_mut();
+                        self.save_coroutine_state(&mut co_state_mut)?;
+                        co_state_mut.statement_index = i + 1; // Next statement after yield
+                        
+                        // Return yield values
+                        let yield_values = co_state_mut.yield_values.take().unwrap_or_default();
+                        if yield_values.is_empty() {
+                            let mut result = LuaTable::new();
+                            result.set("1".to_string(), LuaValue::Boolean(true));
+                            return Ok(LuaValue::Table(result));
+                        } else {
+                            let mut result = LuaTable::new();
+                            result.set("1".to_string(), LuaValue::Boolean(true));
+                            for (idx, val) in yield_values.iter().enumerate() {
+                                result.set((idx + 2).to_string(), val.clone());
+                            }
+                            return Ok(LuaValue::Table(result));
+                        }
+                    }
+                    
+                    // Check if function returned
+                    if self.return_values.is_some() {
+                        let return_vals = self.return_values.take().unwrap_or_default();
+                        drop(co_state);
+                        let mut co_state_mut = co.borrow_mut();
+                        co_state_mut.status = CoroutineStatus::Dead;
+                        co_state_mut.return_values = Some(return_vals.clone());
+                        
+                        // Return (true, return_values...)
+                        let mut result = LuaTable::new();
+                        result.set("1".to_string(), LuaValue::Boolean(true));
+                        for (idx, val) in return_vals.iter().enumerate() {
+                            result.set((idx + 2).to_string(), val.clone());
+                        }
+                        return Ok(LuaValue::Table(result));
+                    }
+                }
+                Err(e) => {
+                    // Check if this is a yield signal
+                    if e == "__COROUTINE_YIELD__" {
+                        // Yield occurred - save state and return yield values
+                        drop(co_state);
+                        let mut co_state_mut = co.borrow_mut();
+                        self.save_coroutine_state(&mut co_state_mut)?;
+                        co_state_mut.statement_index = i + 1; // Next statement after yield
+                        
+                        // Return yield values
+                        let yield_values = co_state_mut.yield_values.take().unwrap_or_default();
+                        if yield_values.is_empty() {
+                            let mut result = LuaTable::new();
+                            result.set("1".to_string(), LuaValue::Boolean(true));
+                            return Ok(LuaValue::Table(result));
+                        } else {
+                            let mut result = LuaTable::new();
+                            result.set("1".to_string(), LuaValue::Boolean(true));
+                            for (idx, val) in yield_values.iter().enumerate() {
+                                result.set((idx + 2).to_string(), val.clone());
+                            }
+                            return Ok(LuaValue::Table(result));
+                        }
+                    }
+                    
+                    // Error occurred - set status to dead and return error
+                    drop(co_state);
+                    let mut co_state_mut = co.borrow_mut();
+                    co_state_mut.status = CoroutineStatus::Dead;
+                    
+                    // Return (false, error_message)
+                    let mut result = LuaTable::new();
+                    result.set("1".to_string(), LuaValue::Boolean(false));
+                    result.set("2".to_string(), LuaValue::String(e.clone()));
+                    return Ok(LuaValue::Table(result));
+                }
+            }
+            
+            i += 1;
+        }
+        
+        // Function completed - set status to dead
+        drop(co_state);
+        let mut co_state_mut = co.borrow_mut();
+        co_state_mut.status = CoroutineStatus::Dead;
+        
+        // Return (true)
+        let mut result = LuaTable::new();
+        result.set("1".to_string(), LuaValue::Boolean(true));
+        Ok(LuaValue::Table(result))
+    }
+
+    /// Save coroutine state (scopes, variables, etc.)
+    fn save_coroutine_state(&self, co_state: &mut CoroutineState) -> Result<(), String> {
+        // Save current scopes
+        co_state.scopes = self.scopes.iter().map(|scope| {
+            ScopeSnapshot {
+                values: scope.values.clone(),
+            }
+        }).collect();
+        
+        Ok(())
+    }
+
+    /// Restore coroutine state
+    fn restore_coroutine_state(&mut self, co_state: &mut CoroutineState) -> Result<(), String> {
+        // Restore scopes
+        self.scopes = co_state.scopes.iter().map(|snapshot| {
+            Scope {
+                values: snapshot.values.clone(),
+            }
+        }).collect();
+        
+        // Restore execution state
+        self.break_flag = co_state.break_flag;
+        self.return_values = co_state.return_values.clone();
+        self.varargs = co_state.varargs.clone();
+        
+        Ok(())
     }
 
     /// string.pack implementation
