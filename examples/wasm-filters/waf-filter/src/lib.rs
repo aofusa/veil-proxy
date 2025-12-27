@@ -16,7 +16,7 @@ mod crs_level2;
 mod crs_level3;
 mod rules;
 
-use rules::{CrsLevel, RuleEngine, WafAction, WafConfig, WafMode};
+use rules::{RuleEngine, WafAction, WafConfig, WafMode};
 
 proxy_wasm::main! {{
     proxy_wasm::set_log_level(LogLevel::Info);

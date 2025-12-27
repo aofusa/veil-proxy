@@ -57,7 +57,9 @@ fn get_protocol_anomaly_rules() -> Vec<CompiledRule> {
         CompiledRule::try_new(
             "crs-920130",
             "Protocol Anomaly - Duplicate Headers",
-            r"(?i)(transfer-encoding|content-length)[^:]*:[^:]+\1",
+            // バックリファレンスの代替: 同じヘッダー名が2回出現することを検出
+            // Rustのregexクレートはバックリファレンスをサポートしていないため、明示的なパターンに置き換え
+            r"(?i)(transfer-encoding[^:]*:[^:]+.*transfer-encoding[^:]*:[^:]+|content-length[^:]*:[^:]+.*content-length[^:]*:[^:]+)",
             Severity::High,
             WafAction::Block,
             vec![],

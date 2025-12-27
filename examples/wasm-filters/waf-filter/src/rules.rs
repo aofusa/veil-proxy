@@ -301,6 +301,7 @@ impl CompiledRule {
     
     /// Create a new compiled rule (deprecated, use try_new)
     #[deprecated(note = "Use try_new instead to avoid panics")]
+    #[allow(dead_code)] // Kept for backward compatibility
     pub fn new(id: &str, category: &str, pattern: &str, severity: Severity, action: WafAction) -> Self {
         Self::try_new(id, category, pattern, severity, action, vec![])
             .unwrap_or_else(|e| {
@@ -565,9 +566,14 @@ mod tests {
         targets.insert("cmd".to_string(), "; cat /etc/passwd".to_string());
 
         let result = engine.inspect(&targets);
-        assert!(result.is_some());
+        assert!(result.is_some(), "Command injection should be detected");
         let violation = result.unwrap();
-        assert!(violation.rule_id.starts_with("crs-932"));
+        // crs-932100 (Shell Metacharacters) または crs-932120 (Common Commands) のいずれかにマッチ
+        assert!(
+            violation.rule_id.starts_with("crs-932"),
+            "Expected rule_id starting with 'crs-932', got: {}",
+            violation.rule_id
+        );
     }
 
     #[test]
