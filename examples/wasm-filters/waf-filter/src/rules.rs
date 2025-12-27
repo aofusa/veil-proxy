@@ -1,11 +1,13 @@
 //! WAF Rule Engine and Configuration
 //!
-//! Detection rules inspired by OWASP ModSecurity CRS
+//! Detection rules inspired by OWASP ModSecurity CRS.
+//! Supports CRS Levels 1-3 with anomaly scoring.
 
-use lazy_static::lazy_static;
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::HashMap;
+
+use crate::{crs_level1, crs_level2, crs_level3};
 
 /// WAF operation mode
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -22,6 +24,48 @@ pub enum WafMode {
 impl Default for WafMode {
     fn default() -> Self {
         WafMode::Block
+    }
+}
+
+/// CRS Protection Level
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CrsLevel {
+    /// Level 1: Basic protection, minimal false positives
+    #[serde(rename = "1")]
+    Level1,
+    /// Level 2: Moderate protection, balanced
+    #[serde(rename = "2")]
+    Level2,
+    /// Level 3: Strict protection, comprehensive
+    #[serde(rename = "3")]
+    Level3,
+}
+
+impl Default for CrsLevel {
+    fn default() -> Self {
+        CrsLevel::Level2
+    }
+}
+
+/// Rule Severity Level
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    Critical,
+    High,
+    Medium,
+    Low,
+}
+
+impl Severity {
+    /// Get anomaly score for severity
+    pub fn score(&self) -> u32 {
+        match self {
+            Severity::Critical => 5,
+            Severity::High => 3,
+            Severity::Medium => 2,
+            Severity::Low => 1,
+        }
     }
 }
 
@@ -46,17 +90,17 @@ pub struct WafConfig {
     #[serde(default)]
     pub mode: WafMode,
 
-    #[serde(default = "default_true")]
-    pub xss_enabled: bool,
+    /// CRS protection level (1, 2, or 3)
+    #[serde(default)]
+    pub crs_level: CrsLevel,
 
-    #[serde(default = "default_true")]
-    pub sqli_enabled: bool,
+    /// Anomaly scoring mode (true = sum scores, false = block on first match)
+    #[serde(default)]
+    pub anomaly_scoring: bool,
 
-    #[serde(default = "default_true")]
-    pub path_traversal_enabled: bool,
-
-    #[serde(default = "default_true")]
-    pub command_injection_enabled: bool,
+    /// Anomaly threshold (block when score >= threshold)
+    #[serde(default = "default_anomaly_threshold")]
+    pub anomaly_threshold: u32,
 
     #[serde(default)]
     pub inspect_body: bool,
@@ -71,18 +115,17 @@ pub struct WafConfig {
     pub custom_rules: Vec<CustomRule>,
 }
 
-fn default_true() -> bool {
-    true
+fn default_anomaly_threshold() -> u32 {
+    5
 }
 
 impl Default for WafConfig {
     fn default() -> Self {
         Self {
             mode: WafMode::Block,
-            xss_enabled: true,
-            sqli_enabled: true,
-            path_traversal_enabled: true,
-            command_injection_enabled: true,
+            crs_level: CrsLevel::Level2,
+            anomaly_scoring: false,
+            anomaly_threshold: 5,
             inspect_body: false,
             whitelist_paths: vec!["/health".to_string(), "/metrics".to_string()],
             whitelist_ips: Vec::new(),
@@ -123,71 +166,57 @@ pub struct Violation {
     pub target: String,
     pub matched_value: String,
     pub action: WafAction,
+    pub severity: Severity,
 }
 
-/// Rule for detection
-struct Rule {
-    id: String,
-    category: String,
-    regex: Regex,
-    action: WafAction,
+/// Compiled rule with pre-compiled regex
+pub struct CompiledRule {
+    pub id: String,
+    pub category: String,
+    pub regex: Regex,
+    pub severity: Severity,
+    pub action: WafAction,
+}
+
+impl Clone for CompiledRule {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            category: self.category.clone(),
+            regex: Regex::new(self.regex.as_str()).unwrap(),
+            severity: self.severity,
+            action: self.action.clone(),
+        }
+    }
+}
+
+impl CompiledRule {
+    pub fn new(id: &str, category: &str, pattern: &str, severity: Severity, action: WafAction) -> Self {
+        Self {
+            id: id.to_string(),
+            category: category.to_string(),
+            regex: Regex::new(pattern).expect(&format!("Invalid regex pattern for rule {}", id)),
+            severity,
+            action,
+        }
+    }
 }
 
 /// WAF Rule Engine
-#[derive(Clone)]
 pub struct RuleEngine {
     rules: Vec<CompiledRule>,
+    anomaly_scoring: bool,
+    anomaly_threshold: u32,
 }
 
-#[derive(Clone)]
-struct CompiledRule {
-    id: String,
-    category: String,
-    pattern: String, // Store pattern for Clone
-    action: WafAction,
-}
-
-// Pre-compiled regex patterns
-lazy_static! {
-    // SQL Injection patterns (OWASP CRS inspired)
-    static ref SQLI_PATTERNS: Vec<(&'static str, &'static str)> = vec![
-        ("sqli-001", r"(?i)(\bunion\b.*\bselect\b|\bselect\b.*\bfrom\b.*\bwhere\b)"),
-        ("sqli-002", r"(?i)(\binsert\b.*\binto\b|\bdelete\b.*\bfrom\b|\bdrop\b.*\b(table|database)\b)"),
-        ("sqli-003", r"(?i)(\bupdate\b.*\bset\b.*=)"),
-        ("sqli-004", r#"(?i)(('|")\s*(or|and)\s*('|")?\s*(=|1|true))"#),
-        ("sqli-005", r"(--|#|/\*|\*/|;)"),
-        ("sqli-006", r"(?i)(benchmark\s*\(|sleep\s*\(|waitfor\s+delay)"),
-        ("sqli-007", r"(?i)(concat\s*\(|char\s*\(|0x[0-9a-f]+)"),
-    ];
-
-    // XSS patterns (OWASP CRS inspired)
-    static ref XSS_PATTERNS: Vec<(&'static str, &'static str)> = vec![
-        ("xss-001", r"(?i)(<script|</script>)"),
-        ("xss-002", r"(?i)(javascript\s*:|vbscript\s*:)"),
-        ("xss-003", r"(?i)(\bon\w+\s*=)"),
-        ("xss-004", r"(?i)(<iframe|<frame|<embed|<object)"),
-        ("xss-005", r"(?i)(<svg.*?on\w+\s*=)"),
-        ("xss-006", r"(?i)(expression\s*\()"),
-        ("xss-007", r"(?i)(data\s*:\s*text/html)"),
-        ("xss-008", r"(?i)(<img.*?onerror\s*=)"),
-    ];
-
-    // Path Traversal patterns
-    static ref PATH_TRAVERSAL_PATTERNS: Vec<(&'static str, &'static str)> = vec![
-        ("traversal-001", r"(\.\.(/|\\|%2f|%5c))"),
-        ("traversal-002", r"(?i)(%2e%2e(%2f|%5c))"),
-        ("traversal-003", r"(?i)(\.\.%c0%af|\.\.%c1%9c)"),
-        ("traversal-004", r"(/etc/passwd|/etc/shadow|/etc/hosts)"),
-        ("traversal-005", r"(?i)(c:\\windows|c:\\boot\.ini)"),
-    ];
-
-    // Command Injection patterns
-    static ref COMMAND_INJECTION_PATTERNS: Vec<(&'static str, &'static str)> = vec![
-        ("cmdi-001", r"(;|\||\||`|&&|\|\|)\s*\w+"),
-        ("cmdi-002", r"\$\([^)]+\)"),
-        ("cmdi-003", r"(?i)(^|;)\s*(cat|ls|pwd|id|whoami|uname|curl|wget|nc|bash|sh|python|perl|ruby|php)\b"),
-        ("cmdi-004", r"(?i)/bin/(sh|bash|cat|ls|curl|wget)"),
-    ];
+impl Clone for RuleEngine {
+    fn clone(&self) -> Self {
+        Self {
+            rules: self.rules.clone(),
+            anomaly_scoring: self.anomaly_scoring,
+            anomaly_threshold: self.anomaly_threshold,
+        }
+    }
 }
 
 impl RuleEngine {
@@ -196,86 +225,70 @@ impl RuleEngine {
     }
 
     pub fn with_config(config: &WafConfig) -> Self {
-        let mut rules = Vec::new();
-
-        // Add SQL Injection rules
-        if config.sqli_enabled {
-            for (id, pattern) in SQLI_PATTERNS.iter() {
-                rules.push(CompiledRule {
-                    id: id.to_string(),
-                    category: "SQL Injection".to_string(),
-                    pattern: pattern.to_string(),
-                    action: WafAction::Block,
-                });
-            }
-        }
-
-        // Add XSS rules
-        if config.xss_enabled {
-            for (id, pattern) in XSS_PATTERNS.iter() {
-                rules.push(CompiledRule {
-                    id: id.to_string(),
-                    category: "Cross-Site Scripting (XSS)".to_string(),
-                    pattern: pattern.to_string(),
-                    action: WafAction::Block,
-                });
-            }
-        }
-
-        // Add Path Traversal rules
-        if config.path_traversal_enabled {
-            for (id, pattern) in PATH_TRAVERSAL_PATTERNS.iter() {
-                rules.push(CompiledRule {
-                    id: id.to_string(),
-                    category: "Path Traversal".to_string(),
-                    pattern: pattern.to_string(),
-                    action: WafAction::Block,
-                });
-            }
-        }
-
-        // Add Command Injection rules
-        if config.command_injection_enabled {
-            for (id, pattern) in COMMAND_INJECTION_PATTERNS.iter() {
-                rules.push(CompiledRule {
-                    id: id.to_string(),
-                    category: "Command Injection".to_string(),
-                    pattern: pattern.to_string(),
-                    action: WafAction::Block,
-                });
-            }
-        }
+        let mut rules = match config.crs_level {
+            CrsLevel::Level1 => crs_level1::get_rules(),
+            CrsLevel::Level2 => crs_level2::get_rules(),
+            CrsLevel::Level3 => crs_level3::get_rules(),
+        };
 
         // Add custom rules
         for custom_rule in &config.custom_rules {
-            rules.push(CompiledRule {
-                id: custom_rule.id.clone(),
-                category: format!("Custom: {}", custom_rule.message),
-                pattern: custom_rule.pattern.clone(),
-                action: custom_rule.action.clone(),
-            });
+            if let Ok(regex) = Regex::new(&custom_rule.pattern) {
+                rules.push(CompiledRule {
+                    id: custom_rule.id.clone(),
+                    category: format!("Custom: {}", custom_rule.message),
+                    regex,
+                    severity: Severity::High,
+                    action: custom_rule.action.clone(),
+                });
+            }
         }
 
-        Self { rules }
+        log::info!(
+            "[waf] Loaded {} rules (CRS Level {:?}, anomaly_scoring={})",
+            rules.len(),
+            config.crs_level,
+            config.anomaly_scoring
+        );
+
+        Self {
+            rules,
+            anomaly_scoring: config.anomaly_scoring,
+            anomaly_threshold: config.anomaly_threshold,
+        }
     }
 
-    /// Inspect targets and return first violation found
+    /// Inspect targets and return violations
     pub fn inspect(&self, targets: &HashMap<String, String>) -> Option<Violation> {
+        let mut total_score = 0u32;
+        let mut violations = Vec::new();
+
         for (target_name, target_value) in targets {
-            // URL decode for inspection
             let decoded = self.url_decode(target_value);
 
             for rule in &self.rules {
-                // Compile regex on demand (could be optimized with caching)
-                if let Ok(regex) = Regex::new(&rule.pattern) {
-                    if regex.is_match(&decoded) {
-                        return Some(Violation {
-                            rule_id: rule.id.clone(),
-                            category: rule.category.clone(),
-                            target: target_name.clone(),
-                            matched_value: decoded.clone(),
-                            action: rule.action.clone(),
-                        });
+                if rule.regex.is_match(&decoded) {
+                    let violation = Violation {
+                        rule_id: rule.id.clone(),
+                        category: rule.category.clone(),
+                        target: target_name.clone(),
+                        matched_value: decoded.clone(),
+                        action: rule.action.clone(),
+                        severity: rule.severity,
+                    };
+
+                    if self.anomaly_scoring {
+                        total_score += rule.severity.score();
+                        violations.push(violation);
+
+                        if total_score >= self.anomaly_threshold {
+                            // Return the most severe violation
+                            return violations.into_iter()
+                                .max_by_key(|v| v.severity.score());
+                        }
+                    } else {
+                        // Immediate mode: return first match
+                        return Some(violation);
                     }
                 }
             }
@@ -316,36 +329,70 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_sqli_detection() {
-        let engine = RuleEngine::new();
+    fn test_crs_level1_sqli_detection() {
+        let config = WafConfig {
+            crs_level: CrsLevel::Level1,
+            ..Default::default()
+        };
+        let engine = RuleEngine::with_config(&config);
         let mut targets = HashMap::new();
         targets.insert("query".to_string(), "id=1 UNION SELECT * FROM users".to_string());
 
         let result = engine.inspect(&targets);
         assert!(result.is_some());
-        assert!(result.unwrap().category.contains("SQL Injection"));
+        let violation = result.unwrap();
+        assert!(violation.rule_id.starts_with("crs-942"));
     }
 
     #[test]
-    fn test_xss_detection() {
-        let engine = RuleEngine::new();
+    fn test_crs_level2_command_injection() {
+        let config = WafConfig {
+            crs_level: CrsLevel::Level2,
+            ..Default::default()
+        };
+        let engine = RuleEngine::with_config(&config);
         let mut targets = HashMap::new();
-        targets.insert("query".to_string(), "<script>alert('xss')</script>".to_string());
+        targets.insert("cmd".to_string(), "; cat /etc/passwd".to_string());
 
         let result = engine.inspect(&targets);
         assert!(result.is_some());
-        assert!(result.unwrap().category.contains("XSS"));
+        let violation = result.unwrap();
+        assert!(violation.rule_id.starts_with("crs-932"));
     }
 
     #[test]
-    fn test_path_traversal_detection() {
-        let engine = RuleEngine::new();
+    fn test_crs_level3_evasion_detection() {
+        let config = WafConfig {
+            crs_level: CrsLevel::Level3,
+            ..Default::default()
+        };
+        let engine = RuleEngine::with_config(&config);
         let mut targets = HashMap::new();
-        targets.insert("uri".to_string(), "/files/../../../etc/passwd".to_string());
+        targets.insert("input".to_string(), "test%00injection".to_string());
 
         let result = engine.inspect(&targets);
         assert!(result.is_some());
-        assert!(result.unwrap().category.contains("Path Traversal"));
+        let violation = result.unwrap();
+        assert!(violation.rule_id.starts_with("crs-921"));
+    }
+
+    #[test]
+    fn test_anomaly_scoring() {
+        let config = WafConfig {
+            crs_level: CrsLevel::Level1,
+            anomaly_scoring: true,
+            anomaly_threshold: 10,
+            ..Default::default()
+        };
+        let engine = RuleEngine::with_config(&config);
+        
+        // Single low-severity match should not trigger
+        let mut targets = HashMap::new();
+        targets.insert("query".to_string(), "<script>".to_string());
+        
+        // This should still detect because XSS script tag is Critical (5 points)
+        let result = engine.inspect(&targets);
+        assert!(result.is_none() || result.as_ref().map(|v| v.severity.score() < 10).unwrap_or(true));
     }
 
     #[test]

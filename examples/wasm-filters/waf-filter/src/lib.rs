@@ -1,22 +1,22 @@
 //! Web Application Firewall (WAF) Proxy-Wasm Filter
 //!
-//! Protects against common web attacks:
-//! - SQL Injection (SQLi)
-//! - Cross-Site Scripting (XSS)
-//! - Path Traversal
-//! - Command Injection
+//! Protects against common web attacks with configurable CRS levels:
+//! - Level 1: Basic protection (SQLi, XSS, Path Traversal)
+//! - Level 2: Moderate protection (+Command Injection, RFI/LFI, Scanner Detection)
+//! - Level 3: Strict protection (+Protocol Anomalies, Evasion, Data Leakage)
 //!
 //! Inspired by OWASP ModSecurity Core Rule Set (CRS)
 
 use proxy_wasm::traits::*;
 use proxy_wasm::types::*;
-use regex::Regex;
-use serde::Deserialize;
 use std::collections::HashMap;
 
+mod crs_level1;
+mod crs_level2;
+mod crs_level3;
 mod rules;
 
-use rules::{RuleEngine, WafAction, WafConfig};
+use rules::{CrsLevel, RuleEngine, WafAction, WafConfig, WafMode};
 
 proxy_wasm::main! {{
     proxy_wasm::set_log_level(LogLevel::Info);
@@ -44,16 +44,21 @@ impl Context for WafFilterRoot {}
 impl RootContext for WafFilterRoot {
     fn on_configure(&mut self, plugin_configuration_size: usize) -> bool {
         if plugin_configuration_size == 0 {
-            log::info!("[waf] Using default configuration");
+            log::info!("[waf] Using default configuration (CRS Level 2)");
             return true;
         }
 
         if let Some(config_bytes) = self.get_plugin_configuration() {
             match serde_json::from_slice::<WafConfig>(&config_bytes) {
                 Ok(config) => {
-                    log::info!("[waf] Configuration loaded: mode={:?}", config.mode);
+                    log::info!(
+                        "[waf] Configuration loaded: mode={:?}, crs_level={:?}, anomaly_scoring={}",
+                        config.mode,
+                        config.crs_level,
+                        config.anomaly_scoring
+                    );
+                    self.engine = RuleEngine::with_config(&config);
                     self.config = config;
-                    self.engine = RuleEngine::with_config(&self.config);
                 }
                 Err(e) => {
                     log::error!("[waf] Failed to parse configuration: {}", e);
@@ -88,7 +93,7 @@ impl Context for WafFilter {}
 impl HttpContext for WafFilter {
     fn on_http_request_headers(&mut self, _num_headers: usize, _end_of_stream: bool) -> Action {
         // Skip if WAF is disabled
-        if self.config.mode == rules::WafMode::Off {
+        if self.config.mode == WafMode::Off {
             return Action::Continue;
         }
 
@@ -105,46 +110,38 @@ impl HttpContext for WafFilter {
 
         // URI/Path
         if let Some(path) = self.get_http_request_header(":path") {
-            targets.insert("uri".to_string(), path);
-        }
-
-        // Query string (extracted from path)
-        if let Some(path) = self.get_http_request_header(":path") {
+            targets.insert("uri".to_string(), path.clone());
+            
+            // Query string
             if let Some(pos) = path.find('?') {
                 targets.insert("query".to_string(), path[pos + 1..].to_string());
             }
         }
 
-        // User-Agent
+        // Headers
         if let Some(ua) = self.get_http_request_header("user-agent") {
             targets.insert("user-agent".to_string(), ua);
         }
-
-        // Referer
         if let Some(referer) = self.get_http_request_header("referer") {
             targets.insert("referer".to_string(), referer);
         }
-
-        // Cookie
         if let Some(cookie) = self.get_http_request_header("cookie") {
             targets.insert("cookie".to_string(), cookie);
         }
 
         // Run rule engine
-        let result = self.engine.inspect(&targets);
-
-        if let Some(violation) = result {
+        if let Some(violation) = self.engine.inspect(&targets) {
             log::warn!(
-                "[waf:{}] {} detected: rule={}, target={}, value={}",
+                "[waf:{}] {} detected: rule={}, severity={:?}, target={}, value={}",
                 self.context_id,
                 violation.category,
                 violation.rule_id,
+                violation.severity,
                 violation.target,
                 &violation.matched_value[..std::cmp::min(50, violation.matched_value.len())]
             );
 
-            // Determine action
-            let action = if self.config.mode == rules::WafMode::Detect {
+            let action = if self.config.mode == WafMode::Detect {
                 WafAction::Log
             } else {
                 violation.action.clone()
@@ -157,17 +154,13 @@ impl HttpContext for WafFilter {
                         vec![
                             ("content-type", "text/plain"),
                             ("x-waf-block", &violation.rule_id),
+                            ("x-waf-category", &violation.category),
                         ],
                         Some(format!("Blocked by WAF: {}", violation.category).as_bytes()),
                     );
                     return Action::Pause;
                 }
-                WafAction::Log => {
-                    // Already logged above, continue
-                }
-                WafAction::Allow => {
-                    // Allow through
-                }
+                WafAction::Log | WafAction::Allow => {}
             }
         }
 
@@ -175,25 +168,20 @@ impl HttpContext for WafFilter {
     }
 
     fn on_http_request_body(&mut self, body_size: usize, end_of_stream: bool) -> Action {
-        // Skip body inspection if disabled or in detect-only mode for performance
-        if self.config.mode == rules::WafMode::Off || !self.config.inspect_body {
+        if self.config.mode == WafMode::Off || !self.config.inspect_body {
             return Action::Continue;
         }
 
-        // Only inspect when we have the full body
         if !end_of_stream {
             return Action::Continue;
         }
 
-        // Get body
         if let Some(body) = self.get_http_request_body(0, body_size) {
             if let Ok(body_str) = String::from_utf8(body) {
                 let mut targets = HashMap::new();
                 targets.insert("body".to_string(), body_str);
 
-                let result = self.engine.inspect(&targets);
-
-                if let Some(violation) = result {
+                if let Some(violation) = self.engine.inspect(&targets) {
                     log::warn!(
                         "[waf:{}] {} detected in body: rule={}",
                         self.context_id,
@@ -201,9 +189,7 @@ impl HttpContext for WafFilter {
                         violation.rule_id
                     );
 
-                    if self.config.mode == rules::WafMode::Block
-                        && violation.action == WafAction::Block
-                    {
+                    if self.config.mode == WafMode::Block && violation.action == WafAction::Block {
                         self.send_http_response(
                             403,
                             vec![
