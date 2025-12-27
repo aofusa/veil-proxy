@@ -93,6 +93,10 @@ pub struct HttpContext {
     // === Capabilities ===
     /// Module capabilities
     pub capabilities: ModuleCapabilities,
+
+    // === Timer ===
+    /// Tick period in milliseconds (0 = disabled)
+    pub tick_period_ms: u32,
 }
 
 impl HttpContext {
@@ -131,6 +135,7 @@ impl HttpContext {
             shared_data: Arc::new(RwLock::new(HashMap::new())),
             shared_data_cas: 1,
             capabilities,
+            tick_period_ms: 0,
         }
     }
 

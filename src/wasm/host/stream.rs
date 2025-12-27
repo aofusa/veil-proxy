@@ -111,6 +111,51 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
         PROXY_RESULT_OK
     })?;
 
+    // proxy_set_tick_period_milliseconds
+    // Sets the timer period for periodic on_tick callbacks
+    // Currently stores the value but tick callbacks are not yet implemented
+    linker.func_wrap(
+        "env",
+        "proxy_set_tick_period_milliseconds",
+        |mut caller: Caller<'_, HostState>, period_ms: i32| -> i32 {
+            let state = caller.data_mut();
+            state.http_ctx.tick_period_ms = period_ms as u32;
+            if period_ms > 0 {
+                ftlog::debug!("WASM module requested tick period: {}ms", period_ms);
+            }
+            PROXY_RESULT_OK
+        },
+    )?;
+
+    // proxy_get_current_time_nanoseconds
+    // Returns the current time in nanoseconds since Unix epoch
+    linker.func_wrap(
+        "env",
+        "proxy_get_current_time_nanoseconds",
+        |mut caller: Caller<'_, HostState>, return_time_ptr: i32| -> i32 {
+            // Get current time in nanoseconds
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+
+            // Write to WASM memory
+            let memory = match caller.get_export("memory") {
+                Some(wasmtime::Extern::Memory(mem)) => mem,
+                _ => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
+            };
+
+            let data = memory.data_mut(&mut caller);
+            let ptr = return_time_ptr as usize;
+            if ptr + 8 > data.len() {
+                return PROXY_RESULT_INVALID_MEMORY_ACCESS;
+            }
+            data[ptr..ptr + 8].copy_from_slice(&nanos.to_le_bytes());
+
+            PROXY_RESULT_OK
+        },
+    )?;
+
     Ok(())
 }
 
