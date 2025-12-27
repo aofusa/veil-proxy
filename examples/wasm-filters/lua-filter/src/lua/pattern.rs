@@ -33,6 +33,8 @@ enum PatternItem {
     StartAnchor,
     /// End anchor $
     EndAnchor,
+    /// Frontier pattern %f[set]
+    Frontier(Vec<SetItem>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -129,6 +131,16 @@ impl Pattern {
                             let open = chars.next().ok_or("%b needs two chars")?;
                             let close = chars.next().ok_or("%b needs two chars")?;
                             PatternItem::Balanced(open, close)
+                        }
+                        'f' => {
+                            // Frontier pattern: %f[set]
+                            if chars.peek() == Some(&'[') {
+                                chars.next(); // consume '['
+                                let (set, _) = Self::parse_set(&mut chars)?;
+                                PatternItem::Frontier(set)
+                            } else {
+                                return Err("%f must be followed by [set]".to_string());
+                            }
                         }
                         '1'..='9' => {
                             let idx = next.to_digit(10).unwrap() as usize;
@@ -309,6 +321,38 @@ fn try_match(
             }
             PatternItem::EndAnchor => {
                 if pos != chars.len() {
+                    return None;
+                }
+            }
+            PatternItem::Frontier(set_items) => {
+                // Frontier pattern: matches if previous char is NOT in set and current char IS in set
+                let prev_in_set = if pos == 0 {
+                    false
+                } else {
+                    let prev_char = chars[pos - 1];
+                    set_items.iter().any(|item| match item {
+                        SetItem::Char(sc) => prev_char == *sc,
+                        SetItem::Range(start, end) => prev_char >= *start && prev_char <= *end,
+                        SetItem::Class(class) => class.matches(prev_char),
+                    })
+                };
+                
+                let curr_in_set = if pos < chars.len() {
+                    let curr_char = chars[pos];
+                    set_items.iter().any(|item| match item {
+                        SetItem::Char(sc) => curr_char == *sc,
+                        SetItem::Range(start, end) => curr_char >= *start && curr_char <= *end,
+                        SetItem::Class(class) => class.matches(curr_char),
+                    })
+                } else {
+                    false
+                };
+                
+                // Match if prev NOT in set AND curr IS in set
+                if !prev_in_set && curr_in_set {
+                    // Frontier matches at this position, but doesn't consume any characters
+                    // Continue to next pattern item
+                } else {
                     return None;
                 }
             }

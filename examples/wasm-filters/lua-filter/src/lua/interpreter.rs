@@ -2,7 +2,7 @@
 
 use crate::lua::ast::*;
 use crate::lua::pattern;
-use crate::lua::value::{Closure, LuaTable, LuaValue, Upvalue};
+use crate::lua::value::{Closure, LuaTable, LuaValue, Metatable, Upvalue};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -95,6 +95,9 @@ pub struct Interpreter {
 
     /// Current varargs
     varargs: Vec<LuaValue>,
+    
+    /// Goto target label (for goto statement)
+    goto_target: Option<String>,
 }
 
 impl Interpreter {
@@ -196,6 +199,7 @@ impl Interpreter {
             break_flag: false,
             return_values: None,
             varargs: Vec::new(),
+            goto_target: None,
         }
     }
 
@@ -219,11 +223,28 @@ impl Interpreter {
     fn execute_statement(&mut self, stmt: &Stmt) -> Result<(), String> {
         match stmt {
             Stmt::Assign { targets, values, local } => {
-                let evaluated: Vec<LuaValue> = values
-                    .iter()
-                    .map(|expr| self.evaluate(expr))
-                    .collect::<Result<_, _>>()?;
+                // Evaluate all expressions, expanding function call results
+                let mut evaluated: Vec<LuaValue> = Vec::new();
+                for expr in values {
+                    match expr {
+                        Expr::Call { func, args } => {
+                            // Function call - expand multiple return values
+                            let func_val = self.evaluate(func)?;
+                            let arg_vals: Vec<LuaValue> = args
+                                .iter()
+                                .map(|a| self.evaluate(a))
+                                .collect::<Result<_, _>>()?;
+                            let results = self.call_function(&func_val, &arg_vals)?;
+                            evaluated.extend(results);
+                        }
+                        _ => {
+                            // Single value expression
+                            evaluated.push(self.evaluate(expr)?);
+                        }
+                    }
+                }
 
+                // Assign values to targets
                 for (i, target) in targets.iter().enumerate() {
                     let value = evaluated.get(i).cloned().unwrap_or(LuaValue::Nil);
                     match target {
@@ -239,7 +260,8 @@ impl Interpreter {
                             let key_val = self.evaluate(key_expr)?;
 
                             if let LuaValue::Table(mut t) = table_val {
-                                t.set(key_val.to_lua_string(), value);
+                                let key_str = key_val.to_lua_string();
+                                self.table_set(&mut t, key_str, value);
                                 // Re-assign the table
                                 if let Expr::Variable(name) = table_expr {
                                     self.set_variable(name.clone(), LuaValue::Table(t));
@@ -379,10 +401,10 @@ impl Interpreter {
                     let results = self.call_function(&iter_func, &[iter_state.clone(), iter_var.clone()])?;
                     
                     // First result is the new control variable
-                    let first = match &results {
-                        LuaValue::Nil => break,
-                        v => v.clone(),
-                    };
+                    let first = results.first().cloned().unwrap_or(LuaValue::Nil);
+                    if matches!(first, LuaValue::Nil) {
+                        break;
+                    }
 
                     // Assign variables
                     if !vars.is_empty() {
@@ -443,8 +465,12 @@ impl Interpreter {
                 self.execute_block(body)?;
             }
 
-            Stmt::Goto(_) | Stmt::Label(_) => {
-                // Simplified: labels and goto not fully implemented
+            Stmt::Goto(label) => {
+                // Set goto target
+                self.goto_target = Some(label.clone());
+            }
+            Stmt::Label(_) => {
+                // Labels are handled in execute_block
             }
         }
 
@@ -454,12 +480,51 @@ impl Interpreter {
     fn execute_block(&mut self, statements: &[Stmt]) -> Result<(), String> {
         self.push_scope();
 
-        for stmt in statements {
+        // Collect labels first
+        let labels: HashMap<String, usize> = statements.iter()
+            .enumerate()
+            .filter_map(|(i, stmt)| {
+                if let Stmt::Label(name) = stmt {
+                    Some((name.clone(), i))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Execute statements with goto support
+        let mut i = 0;
+        while i < statements.len() {
+            // Check for goto target
+            if let Some(ref target) = self.goto_target {
+                if let Some(&target_idx) = labels.get(target) {
+                    i = target_idx;
+                    self.goto_target = None;
+                } else {
+                    return Err(format!("Label '{}' not found", target));
+                }
+            }
+
+            let stmt = &statements[i];
+            
+            // Skip label statements (they're just markers)
+            if let Stmt::Label(_) = stmt {
+                i += 1;
+                continue;
+            }
+
             self.execute_statement(stmt)?;
 
             if self.break_flag || self.return_values.is_some() {
                 break;
             }
+
+            // If goto was set, continue loop to jump
+            if self.goto_target.is_some() {
+                continue;
+            }
+
+            i += 1;
         }
 
         self.pop_scope();
@@ -487,7 +552,7 @@ impl Interpreter {
                 match &table {
                     LuaValue::Table(t) => {
                         let key_str = key.to_lua_string();
-                        Ok(t.get(&key_str).cloned().unwrap_or(LuaValue::Nil))
+                        Ok(self.table_get(t, &key_str))
                     }
                     LuaValue::String(s) => {
                         // String indexing (for string methods)
@@ -541,7 +606,9 @@ impl Interpreter {
                     .map(|a| self.evaluate(a))
                     .collect::<Result<_, _>>()?;
 
-                self.call_function(&func_val, &arg_vals)
+                let results = self.call_function(&func_val, &arg_vals)?;
+                // For expression evaluation, return first value
+                Ok(results.first().cloned().unwrap_or(LuaValue::Nil))
             }
 
             Expr::Table(entries) => {
@@ -598,7 +665,7 @@ impl Interpreter {
         upvalues
     }
 
-    fn call_function(&mut self, func: &LuaValue, args: &[LuaValue]) -> Result<LuaValue, String> {
+    fn call_function(&mut self, func: &LuaValue, args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
         match func {
             LuaValue::Function(name) => {
                 if let Some(closure) = self.functions.get(name).cloned() {
@@ -612,13 +679,106 @@ impl Interpreter {
                 self.call_closure(closure, args)
             }
 
-            LuaValue::NativeFunction(name) => self.call_native(name, args),
+            LuaValue::NativeFunction(name) => {
+                // Native functions return single value, wrap in Vec
+                self.call_native(name, args).map(|v| vec![v])
+            },
+            
+            LuaValue::Table(t) => {
+                // Check for __call metamethod
+                if let Some(mt) = &t.metatable {
+                    if let Some(call) = &mt.call {
+                        // Call __call(table, args...)
+                        let mut call_args = vec![func.clone()];
+                        call_args.extend_from_slice(args);
+                        return self.call_function(call, &call_args);
+                    }
+                }
+                Err("Cannot call table without __call metamethod".to_string())
+            },
 
             _ => Err(format!("Cannot call {:?}", func)),
         }
     }
+    
+    fn table_get(&mut self, table: &LuaTable, key: &str) -> LuaValue {
+        // First try direct access
+        if let Some(v) = table.get(key) {
+            return v.clone();
+        }
+        
+        // Check for __index metamethod
+        if let Some(mt) = &table.metatable {
+            if let Some(index) = &mt.index {
+                match index.as_ref() {
+                    LuaValue::Table(t) => {
+                        // Recursive lookup in the index table
+                        return self.table_get(t, key);
+                    }
+                    LuaValue::Closure(_) | LuaValue::Function(_) | LuaValue::NativeFunction(_) => {
+                        // Call the __index function
+                        let args = vec![
+                            LuaValue::Table(table.clone()),
+                            LuaValue::String(key.to_string()),
+                        ];
+                        if let Ok(results) = self.call_function(index, &args) {
+                            return results.first().cloned().unwrap_or(LuaValue::Nil);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        
+        LuaValue::Nil
+    }
+    
+    fn table_set(&mut self, table: &mut LuaTable, key: String, value: LuaValue) {
+        // Check if key exists in table
+        let key_exists = table.get(&key).is_some();
+        
+        // If key doesn't exist, check for __newindex metamethod
+        if !key_exists {
+            if let Some(mt) = &table.metatable {
+                if let Some(newindex) = &mt.newindex {
+                    match newindex.as_ref() {
+                        LuaValue::Table(t) => {
+                            // Set in the newindex table
+                            let mut t_mut = t.clone();
+                            t_mut.set(key.clone(), value);
+                            return;
+                        }
+                        LuaValue::Closure(_) | LuaValue::Function(_) | LuaValue::NativeFunction(_) => {
+                            // Call the __newindex function
+                            let args = vec![
+                                LuaValue::Table(table.clone()),
+                                LuaValue::String(key.clone()),
+                                value.clone(),
+                            ];
+                            let _ = self.call_function(newindex, &args);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        
+        // Normal set operation
+        table.set(key, value);
+    }
 
-    fn call_closure(&mut self, closure: &Rc<Closure>, args: &[LuaValue]) -> Result<LuaValue, String> {
+    fn call_closure(&mut self, closure: &Rc<Closure>, args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+        // Special handling for iterator functions
+        if let Some(name) = &closure.name {
+            if name == "utf8.codes_iter" {
+                return self.call_utf8_codes_iter(closure);
+            }
+            if name == "string.gmatch_iter" {
+                return self.call_gmatch_iter(closure);
+            }
+        }
+        
         self.push_scope();
 
         // Restore upvalues
@@ -649,15 +809,111 @@ impl Interpreter {
             }
         }
 
-        let result = self.return_values.take()
-            .and_then(|v| v.into_iter().next())
-            .unwrap_or(LuaValue::Nil);
+        let results = self.return_values.take()
+            .unwrap_or_else(|| vec![]);
         
         self.return_values = prev_return;
         self.varargs.clear();
         self.pop_scope();
 
-        Ok(result)
+        Ok(results)
+    }
+    
+    fn call_utf8_codes_iter(&mut self, closure: &Rc<Closure>) -> Result<Vec<LuaValue>, String> {
+        // Get the string and position from upvalues
+        let s = closure.upvalues.get("_utf8_codes_str")
+            .and_then(|uv| {
+                if let LuaValue::String(ref s) = *uv.value.borrow() {
+                    Some(s.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+        
+        let pos = closure.upvalues.get("_utf8_codes_pos")
+            .and_then(|uv| {
+                if let LuaValue::Number(n) = *uv.value.borrow() {
+                    Some(n as usize)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        
+        // Get the next character and its byte position
+        let mut char_count = 0;
+        let mut next_codepoint = None;
+        let mut next_byte_pos = 0;
+        
+        for (i, c) in s.char_indices() {
+            if char_count == pos {
+                next_codepoint = Some(c as u32);
+                next_byte_pos = i + 1; // Lua is 1-indexed
+                break;
+            }
+            char_count += 1;
+        }
+        
+        if let Some(codepoint) = next_codepoint {
+            // Update position in upvalue
+            if let Some(upvalue) = closure.upvalues.get("_utf8_codes_pos") {
+                upvalue.set(LuaValue::Number((pos + 1) as f64));
+            }
+            
+            // Return (codepoint, byte_position)
+            Ok(vec![
+                LuaValue::Number(codepoint as f64),
+                LuaValue::Number(next_byte_pos as f64),
+            ])
+        } else {
+            // End of string
+            Ok(vec![])
+        }
+    }
+    
+    fn call_gmatch_iter(&mut self, closure: &Rc<Closure>) -> Result<Vec<LuaValue>, String> {
+        // Get the matches table and index from upvalues
+        let matches = closure.upvalues.get("_gmatch_matches")
+            .and_then(|uv| {
+                if let LuaValue::Table(ref t) = *uv.value.borrow() {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            });
+        
+        let index = closure.upvalues.get("_gmatch_index")
+            .and_then(|uv| {
+                if let LuaValue::Number(n) = *uv.value.borrow() {
+                    Some(n as usize)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        
+        if let Some(matches_table) = matches {
+            let len = matches_table.len();
+            if index < len {
+                // Get the next match
+                let next_match = matches_table.get(&(index + 1).to_string())
+                    .cloned()
+                    .unwrap_or(LuaValue::Nil);
+                
+                // Update index in upvalue
+                if let Some(upvalue) = closure.upvalues.get("_gmatch_index") {
+                    upvalue.set(LuaValue::Number((index + 1) as f64));
+                }
+                
+                Ok(vec![next_match])
+            } else {
+                // End of matches
+                Ok(vec![])
+            }
+        } else {
+            Ok(vec![])
+        }
     }
 
     fn call_native(&mut self, name: &str, args: &[LuaValue]) -> Result<LuaValue, String> {
@@ -726,8 +982,29 @@ impl Interpreter {
             }
 
             "pcall" => {
-                // Simplified pcall
-                Ok(LuaValue::Boolean(true))
+                // pcall(func, ...) - protected call
+                // Returns: (true, result...) on success, (false, error_msg) on failure
+                let func = args.first().cloned().unwrap_or(LuaValue::Nil);
+                let func_args = &args[1..];
+                
+                match self.call_function(&func, func_args) {
+                    Ok(results) => {
+                        // Success: (true, result...)
+                        let mut table = LuaTable::new();
+                        table.set("1".to_string(), LuaValue::Boolean(true));
+                        for (i, result) in results.iter().enumerate() {
+                            table.set((i + 2).to_string(), result.clone());
+                        }
+                        Ok(LuaValue::Table(table))
+                    }
+                    Err(msg) => {
+                        // Failure: (false, error_msg)
+                        let mut table = LuaTable::new();
+                        table.set("1".to_string(), LuaValue::Boolean(false));
+                        table.set("2".to_string(), LuaValue::String(msg));
+                        Ok(LuaValue::Table(table))
+                    }
+                }
             }
 
             "pairs" | "ipairs" => {
@@ -741,7 +1018,7 @@ impl Interpreter {
                     let key = args.get(1);
                     let mut found_next = key.is_none();
                     
-                    for (k, v) in &t.data {
+                    for (k, _v) in &t.data {
                         if found_next {
                             return Ok(LuaValue::String(k.clone()));
                         }
@@ -773,12 +1050,101 @@ impl Interpreter {
             }
 
             "setmetatable" => {
-                // Simplified version - just return the table
-                Ok(args.first().cloned().unwrap_or(LuaValue::Nil))
+                // setmetatable(table, metatable)
+                if let (Some(LuaValue::Table(t)), Some(metatable)) = (args.first(), args.get(1)) {
+                    let mut t = t.clone();
+                    // Convert metatable LuaValue to Metatable struct
+                    let mt = if let LuaValue::Table(mt_table) = metatable.clone() {
+                        let mut meta = Metatable::default();
+                        
+                        // Extract metamethods from the metatable table
+                        if let Some(index) = mt_table.get("__index") {
+                            meta.index = Some(Box::new(index.clone()));
+                        }
+                        if let Some(newindex) = mt_table.get("__newindex") {
+                            meta.newindex = Some(Box::new(newindex.clone()));
+                        }
+                        if let Some(call) = mt_table.get("__call") {
+                            meta.call = Some(Box::new(call.clone()));
+                        }
+                        if let Some(tostring) = mt_table.get("__tostring") {
+                            meta.tostring = Some(Box::new(tostring.clone()));
+                        }
+                        if let Some(add) = mt_table.get("__add") {
+                            meta.add = Some(Box::new(add.clone()));
+                        }
+                        if let Some(sub) = mt_table.get("__sub") {
+                            meta.sub = Some(Box::new(sub.clone()));
+                        }
+                        if let Some(mul) = mt_table.get("__mul") {
+                            meta.mul = Some(Box::new(mul.clone()));
+                        }
+                        if let Some(div) = mt_table.get("__div") {
+                            meta.div = Some(Box::new(div.clone()));
+                        }
+                        if let Some(mod_) = mt_table.get("__mod") {
+                            meta.mod_ = Some(Box::new(mod_.clone()));
+                        }
+                        if let Some(pow) = mt_table.get("__pow") {
+                            meta.pow = Some(Box::new(pow.clone()));
+                        }
+                        if let Some(unm) = mt_table.get("__unm") {
+                            meta.unm = Some(Box::new(unm.clone()));
+                        }
+                        if let Some(eq) = mt_table.get("__eq") {
+                            meta.eq = Some(Box::new(eq.clone()));
+                        }
+                        if let Some(lt) = mt_table.get("__lt") {
+                            meta.lt = Some(Box::new(lt.clone()));
+                        }
+                        if let Some(le) = mt_table.get("__le") {
+                            meta.le = Some(Box::new(le.clone()));
+                        }
+                        if let Some(len) = mt_table.get("__len") {
+                            meta.len = Some(Box::new(len.clone()));
+                        }
+                        if let Some(concat) = mt_table.get("__concat") {
+                            meta.concat = Some(Box::new(concat.clone()));
+                        }
+                        
+                        Some(Box::new(meta))
+                    } else {
+                        None
+                    };
+                    
+                    t.metatable = mt;
+                    Ok(LuaValue::Table(t))
+                } else {
+                    Ok(args.first().cloned().unwrap_or(LuaValue::Nil))
+                }
             }
 
             "getmetatable" => {
-                Ok(LuaValue::Nil)
+                // getmetatable(table)
+                if let Some(LuaValue::Table(t)) = args.first() {
+                    if let Some(mt) = &t.metatable {
+                        // Convert Metatable back to Lua table
+                        let mut mt_table = LuaTable::new();
+                        if let Some(index) = &mt.index {
+                            mt_table.set("__index".to_string(), index.as_ref().clone());
+                        }
+                        if let Some(newindex) = &mt.newindex {
+                            mt_table.set("__newindex".to_string(), newindex.as_ref().clone());
+                        }
+                        if let Some(call) = &mt.call {
+                            mt_table.set("__call".to_string(), call.as_ref().clone());
+                        }
+                        if let Some(tostring) = &mt.tostring {
+                            mt_table.set("__tostring".to_string(), tostring.as_ref().clone());
+                        }
+                        // Add other metamethods as needed
+                        Ok(LuaValue::Table(mt_table))
+                    } else {
+                        Ok(LuaValue::Nil)
+                    }
+                } else {
+                    Ok(LuaValue::Nil)
+                }
             }
 
             "rawget" => {
@@ -885,8 +1251,42 @@ impl Interpreter {
             }
 
             "gmatch" => {
-                // Simplified: just return the string
-                Ok(args.first().cloned().unwrap_or(LuaValue::Nil))
+                // string.gmatch(s, pattern) - returns an iterator function
+                let s = args.first().map(|v| v.to_lua_string()).unwrap_or_default();
+                let pat = args.get(1).map(|v| v.to_lua_string()).unwrap_or_default();
+                
+                // Use pattern::match_all to get all matches
+                use crate::lua::pattern::match_all;
+                let matches = match_all(&s, &pat).unwrap_or_else(|_| vec![]);
+                
+                // Create a closure that captures the matches and current index
+                let mut upvalues = HashMap::new();
+                let match_strings: Vec<String> = matches.iter()
+                    .map(|m| {
+                        if m.captures.is_empty() {
+                            m.matched.clone()
+                        } else {
+                            m.captures[0].clone()
+                        }
+                    })
+                    .collect();
+                let match_table = LuaValue::table(
+                    match_strings.iter().enumerate()
+                        .map(|(i, s)| ((i + 1).to_string(), LuaValue::String(s.clone())))
+                        .collect()
+                );
+                upvalues.insert("_gmatch_matches".to_string(), Upvalue::new(match_table));
+                upvalues.insert("_gmatch_index".to_string(), Upvalue::new(LuaValue::Number(0.0)));
+                
+                let closure = Rc::new(Closure::new(
+                    Some("string.gmatch_iter".to_string()),
+                    vec![],
+                    false,
+                    vec![],
+                    upvalues,
+                ));
+                
+                Ok(LuaValue::Closure(closure))
             }
 
             "gsub" => {
@@ -1010,6 +1410,20 @@ impl Interpreter {
                 let x = get_num(0).unwrap_or(0.0);
                 let y = get_num(1).unwrap_or(1.0);
                 Ok(LuaValue::Number(x % y))
+            }
+            "ult" => {
+                // math.ult(m, n) - unsigned less than
+                let m = args.get(0).and_then(|v| v.to_number()).map(|n| n as u64).unwrap_or(0);
+                let n = args.get(1).and_then(|v| v.to_number()).map(|n| n as u64).unwrap_or(0);
+                Ok(LuaValue::Boolean(m < n))
+            }
+            "tointeger" => {
+                // math.tointeger(x) - convert to integer, return nil if not integer
+                let n = args.first().and_then(|v| v.to_number());
+                match n {
+                    Some(f) if f.fract() == 0.0 => Ok(LuaValue::Number(f)),
+                    _ => Ok(LuaValue::Nil),
+                }
             }
             _ => Err(format!("Unknown math method: {}", method)),
         }
@@ -1146,6 +1560,47 @@ impl Interpreter {
                     Ok(t.get(&i.to_string()).cloned().unwrap_or(LuaValue::Nil))
                 } else {
                     Ok(LuaValue::Nil)
+                }
+            }
+            
+            "move" => {
+                // table.move(a1, f, e, t[, a2])
+                // Move elements from a1[f..e] to a2[t..] (or a1[t..] if a2 is nil)
+                if args.len() < 4 {
+                    return Err("table.move requires at least 4 arguments".to_string());
+                }
+                
+                let a1 = args.get(0);
+                let f = args.get(1).and_then(|v| v.to_number()).map(|n| n as i64).unwrap_or(1);
+                let e = args.get(2).and_then(|v| v.to_number()).map(|n| n as i64).unwrap_or(1);
+                let t = args.get(3).and_then(|v| v.to_number()).map(|n| n as i64).unwrap_or(1);
+                let a2 = args.get(4);
+                
+                if let Some(LuaValue::Table(source)) = a1.cloned() {
+                    let mut target = if let Some(LuaValue::Table(t)) = a2.cloned() {
+                        t
+                    } else {
+                        source.clone()
+                    };
+                    
+                    // Copy elements from source[f..e] to target[t..]
+                    let mut src_idx = f;
+                    let mut dst_idx = t;
+                    
+                    while src_idx <= e {
+                        let src_key = src_idx.to_string();
+                        if let Some(value) = source.get(&src_key).cloned() {
+                            let dst_key = dst_idx.to_string();
+                            target.set(dst_key, value);
+                        }
+                        src_idx += 1;
+                        dst_idx += 1;
+                    }
+                    
+                    // Return the target table
+                    Ok(LuaValue::Table(target))
+                } else {
+                    Err("table.move: first argument must be a table".to_string())
                 }
             }
             
@@ -1585,8 +2040,27 @@ impl Interpreter {
             }
 
             "codes" => {
-                // Returns an iterator function (simplified: return nil)
-                Ok(LuaValue::NativeFunction("utf8.codes_iter".to_string()))
+                // utf8.codes(s) - returns an iterator function
+                // The iterator returns (codepoint, byte_position) for each UTF-8 character
+                let s = args.first().map(|v| v.to_lua_string()).unwrap_or_default();
+                
+                // Create a closure that captures the string and current position
+                // We'll use a NativeFunction with special handling for now
+                // Store the string and position in upvalues-like structure
+                let mut upvalues = HashMap::new();
+                upvalues.insert("_utf8_codes_str".to_string(), Upvalue::new(LuaValue::String(s)));
+                upvalues.insert("_utf8_codes_pos".to_string(), Upvalue::new(LuaValue::Number(0.0)));
+                
+                // Create a closure with a special name that we'll handle specially
+                let closure = Rc::new(Closure::new(
+                    Some("utf8.codes_iter".to_string()),
+                    vec![],
+                    false,
+                    vec![], // Empty body - we'll handle this in call_closure
+                    upvalues,
+                ));
+                
+                Ok(LuaValue::Closure(closure))
             }
 
             "offset" => {
@@ -1600,7 +2074,7 @@ impl Interpreter {
                 let mut byte_pos = 0;
                 let mut char_count = 0;
                 
-                for (i, c) in s.char_indices() {
+                for (i, _c) in s.char_indices() {
                     char_count += 1;
                     if char_count == n as usize {
                         byte_pos = i + 1; // Lua is 1-indexed
