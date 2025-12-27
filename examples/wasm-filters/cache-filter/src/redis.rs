@@ -16,10 +16,14 @@ pub struct RedisGetResponse {
 }
 
 /// Redis SET response
+/// 
+/// Note: Currently unused due to fire-and-forget pattern in cache storage.
+/// This structure is kept for future use when response validation is needed.
 #[derive(Debug, Deserialize)]
-pub struct RedisSetResponse {
+#[allow(dead_code)]
+struct RedisSetResponse {
     #[serde(rename = "SET")]
-    pub result: (bool, String),
+    result: (bool, String),
 }
 
 /// Build Redis GET request path
