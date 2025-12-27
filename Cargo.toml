@@ -44,7 +44,7 @@ monoio = { version = "0.2.4" }
 # rustls を直接使用（ハンドシェイク後に kTLS へオフロード）
 rustls = { version = "0.23.35", features = ["tls12", "ring"] }
 webpki-roots = "1.0.4"
-rustls-pemfile = "2.2.0"
+rustls-pki-types = "1.13.2"
 libc = "0.2.178"
 mimalloc = { version = "0.1.48", default-features = false }
 # Huge Pages (Large OS Pages) 設定用

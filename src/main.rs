@@ -182,7 +182,7 @@ use prometheus::{
 // rustls 共通インポート
 use rustls::ServerConfig;
 use rustls::crypto::CryptoProvider;
-use rustls_pemfile::{certs, private_key};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 
 // ktls_rustls（kTLS 対応）
 #[cfg(feature = "ktls")]
@@ -4821,12 +4821,14 @@ fn load_tls_config(
     let cert_file = File::open(&tls_config.cert_path)?;
     let key_file = File::open(&tls_config.key_path)?;
 
-    let mut cert_reader = BufReader::new(cert_file);
-    let cert_chain = certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+    let cert_reader = BufReader::new(cert_file);
+    let cert_chain: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(cert_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Certificate parse error: {}", e)))?;
 
-    let mut key_reader = BufReader::new(key_file);
-    let keys = private_key(&mut key_reader)?
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Private key not found"))?;
+    let key_reader = BufReader::new(key_file);
+    let keys: PrivateKeyDer<'static> = PrivateKeyDer::from_pem_reader(key_reader)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Private key parse error: {}", e)))?;
 
     // kTLS 有効時のみ config を変更するため、条件付きで mut を使用
     #[allow(unused_mut)]
