@@ -17,14 +17,14 @@ pub fn generate_test_certs(output_dir: &std::path::Path) -> std::io::Result<(Pat
         "::1".to_string(),
     ];
     
-    let CertifiedKey { cert, key_pair } = generate_simple_self_signed(subject_alt_names)
+    let CertifiedKey { cert, signing_key } = generate_simple_self_signed(subject_alt_names)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     
     let cert_path = output_dir.join("test_cert.pem");
     let key_path = output_dir.join("test_key.pem");
     
     std::fs::write(&cert_path, cert.pem())?;
-    std::fs::write(&key_path, key_pair.serialize_pem())?;
+    std::fs::write(&key_path, signing_key.serialize_pem())?;
     
     Ok((cert_path, key_path))
 }
