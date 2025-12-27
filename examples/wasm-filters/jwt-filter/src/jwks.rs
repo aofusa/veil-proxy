@@ -237,8 +237,11 @@ mod tests {
         // Wait a bit and check (should be expired)
         std::thread::sleep(std::time::Duration::from_millis(100));
         let cached = cache.get(&url);
-        // Note: This test may be flaky due to timing, but TTL=0 should expire immediately
-        // In practice, we'd use a mock time provider
+        
+        // TTL=0なので、即座に期限切れになるはず
+        // ただし、時刻取得の精度により、わずかな遅延がある可能性がある
+        // そのため、Noneであることを確認する（期限切れ）
+        assert!(cached.is_none(), "Cache should be expired with TTL=0");
     }
     
     #[test]

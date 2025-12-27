@@ -15,7 +15,7 @@ type HmacSha256 = Hmac<Sha256>;
 pub enum VerifyResult {
     Valid,
     InvalidSignature,
-    UnsupportedAlgorithm,
+    // UnsupportedAlgorithm,  // 削除: アルゴリズム検証はlib.rsで行われる
     InvalidKey,
     InvalidFormat,
 }
