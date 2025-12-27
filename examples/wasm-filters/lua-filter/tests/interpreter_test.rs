@@ -76,7 +76,7 @@ fn test_pcall_error() {
 fn test_table_operations() {
     let mut interpreter = create_interpreter();
     let tokens = lexer::tokenize(
-        "local t = {}; t['key'] = 'value'; return t['key']"
+        "local t = {}; t.key = 'value'; return t.key"
     ).unwrap();
     let program = parser::parse(&tokens).unwrap();
     let result = interpreter.execute(&program).unwrap();
@@ -87,7 +87,7 @@ fn test_table_operations() {
 fn test_metatable_index() {
     let mut interpreter = create_interpreter();
     let tokens = lexer::tokenize(
-        "local t = {}; local mt = {__index = {default = 'default'}}; setmetatable(t, mt); return t.default"
+        "local t = {}; local mt = {__index = {default = 'default'}}; t = setmetatable(t, mt); return t.default"
     ).unwrap();
     let program = parser::parse(&tokens).unwrap();
     let result = interpreter.execute(&program).unwrap();
@@ -197,7 +197,7 @@ fn test_rawget() {
 fn test_rawset() {
     let mut interpreter = create_interpreter();
     let tokens = lexer::tokenize(
-        "local t = {}; local mt = {__newindex = function() error('should not be called') end}; setmetatable(t, mt); rawset(t, 'key', 'value'); return t.key"
+        "local t = {}; local mt = {__newindex = function() error('should not be called') end}; setmetatable(t, mt); t = rawset(t, 'key', 'value'); return t.key"
     ).unwrap();
     let program = parser::parse(&tokens).unwrap();
     let result = interpreter.execute(&program).unwrap();
@@ -241,7 +241,7 @@ fn test_load_error() {
 fn test_require() {
     let mut interpreter = create_interpreter();
     let tokens = lexer::tokenize(
-        "package.loaded.test = {value = 42}; local m = require('test'); return m.value"
+        "package.loaded['test'] = {value = 42}; local m = require('test'); return m.value"
     ).unwrap();
     let program = parser::parse(&tokens).unwrap();
     let result = interpreter.execute(&program).unwrap();
@@ -296,7 +296,7 @@ fn test_utf8_codes() {
 fn test_metatable_newindex() {
     let mut interpreter = create_interpreter();
     let tokens = lexer::tokenize(
-        "local t = {}; local calls = 0; local mt = {__newindex = function(t, k, v) calls = calls + 1 end}; setmetatable(t, mt); t.key = 'value'; return calls"
+        "local t = {}; local calls = 0; local mt = {__newindex = function(t, k, v) calls = calls + 1 end}; t = setmetatable(t, mt); t.key = 'value'; return calls"
     ).unwrap();
     let program = parser::parse(&tokens).unwrap();
     let result = interpreter.execute(&program).unwrap();
@@ -307,7 +307,7 @@ fn test_metatable_newindex() {
 fn test_metatable_call() {
     let mut interpreter = create_interpreter();
     let tokens = lexer::tokenize(
-        "local t = {}; local mt = {__call = function(self, x) return x * 2 end}; setmetatable(t, mt); return t(21)"
+        "local t = {}; local mt = {__call = function(self, x) return x * 2 end}; t = setmetatable(t, mt); return t(21)"
     ).unwrap();
     let program = parser::parse(&tokens).unwrap();
     let result = interpreter.execute(&program).unwrap();
@@ -318,7 +318,7 @@ fn test_metatable_call() {
 fn test_metatable_add() {
     let mut interpreter = create_interpreter();
     let tokens = lexer::tokenize(
-        "local t1 = {}; local t2 = {}; local mt = {__add = function(a, b) return 42 end}; setmetatable(t1, mt); return t1 + t2"
+        "local t1 = {}; local t2 = {}; local mt = {__add = function(a, b) return 42 end}; t1 = setmetatable(t1, mt); return t1 + t2"
     ).unwrap();
     let program = parser::parse(&tokens).unwrap();
     let result = interpreter.execute(&program).unwrap();
@@ -329,7 +329,7 @@ fn test_metatable_add() {
 fn test_metatable_eq() {
     let mut interpreter = create_interpreter();
     let tokens = lexer::tokenize(
-        "local t1 = {}; local t2 = {}; local mt = {__eq = function(a, b) return true end}; setmetatable(t1, mt); setmetatable(t2, mt); return t1 == t2"
+        "local t1 = {}; local t2 = {}; local mt = {__eq = function(a, b) return true end}; t1 = setmetatable(t1, mt); t2 = setmetatable(t2, mt); return t1 == t2"
     ).unwrap();
     let program = parser::parse(&tokens).unwrap();
     let result = interpreter.execute(&program).unwrap();
@@ -340,7 +340,7 @@ fn test_metatable_eq() {
 fn test_metatable_len() {
     let mut interpreter = create_interpreter();
     let tokens = lexer::tokenize(
-        "local t = {}; local mt = {__len = function(self) return 42 end}; setmetatable(t, mt); return #t"
+        "local t = {}; local mt = {__len = function(self) return 42 end}; t = setmetatable(t, mt); return #t"
     ).unwrap();
     let program = parser::parse(&tokens).unwrap();
     let result = interpreter.execute(&program).unwrap();
@@ -351,7 +351,7 @@ fn test_metatable_len() {
 fn test_metatable_tostring() {
     let mut interpreter = create_interpreter();
     let tokens = lexer::tokenize(
-        "local t = {}; local mt = {__tostring = function(self) return 'custom' end}; setmetatable(t, mt); return tostring(t)"
+        "local t = {}; local mt = {__tostring = function(self) return 'custom' end}; t = setmetatable(t, mt); return tostring(t)"
     ).unwrap();
     let program = parser::parse(&tokens).unwrap();
     let result = interpreter.execute(&program).unwrap();

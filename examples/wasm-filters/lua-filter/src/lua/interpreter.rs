@@ -208,6 +208,12 @@ impl Interpreter {
         }
         globals.insert("veil".to_string(), LuaValue::Table(veil));
 
+        // Register package table with loaded modules
+        let mut package_table = LuaTable::new();
+        let loaded_table = LuaTable::new();
+        package_table.set("loaded".to_string(), LuaValue::Table(loaded_table));
+        globals.insert("package".to_string(), LuaValue::Table(package_table));
+
         Self {
             globals,
             scopes: Vec::new(),
@@ -296,9 +302,24 @@ impl Interpreter {
                             if let LuaValue::Table(mut t) = table_val {
                                 let key_str = key_val.to_lua_string();
                                 self.table_set(&mut t, key_str, value);
-                                // Re-assign the table
-                                if let Expr::Variable(name) = table_expr {
-                                    self.set_variable(name.clone(), LuaValue::Table(t));
+                                // Re-assign the table back to the variable or nested table
+                                match table_expr {
+                                    Expr::Variable(name) => {
+                                        self.set_variable(name.clone(), LuaValue::Table(t));
+                                    }
+                                    Expr::Index(inner_table_expr, inner_key_expr) => {
+                                        // Handle nested table assignment (e.g., package.loaded['test'])
+                                        let inner_table_val = self.evaluate(&*inner_table_expr)?;
+                                        let inner_key_val = self.evaluate(&*inner_key_expr)?;
+                                        if let LuaValue::Table(mut inner_t) = inner_table_val {
+                                            let inner_key_str = inner_key_val.to_lua_string();
+                                            inner_t.set(inner_key_str, LuaValue::Table(t));
+                                            if let Expr::Variable(inner_name) = &**inner_table_expr {
+                                                self.set_variable(inner_name.clone(), LuaValue::Table(inner_t));
+                                            }
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -419,9 +440,18 @@ impl Interpreter {
                     .collect::<Result<_, _>>()?;
 
                 // Get iterator function, state, and initial value
-                let iter_func = iterator_vals.get(0).cloned().unwrap_or(LuaValue::Nil);
-                let iter_state = iterator_vals.get(1).cloned().unwrap_or(LuaValue::Nil);
-                let mut iter_var = iterator_vals.get(2).cloned().unwrap_or(LuaValue::Nil);
+                // If only one expression, it's the iterator function (e.g., string.gmatch)
+                let (iter_func, iter_state, mut iter_var) = if iterator_vals.len() == 1 {
+                    // Single iterator function - use it directly with nil state and var
+                    (iterator_vals[0].clone(), LuaValue::Nil, LuaValue::Nil)
+                } else {
+                    // Multiple expressions - use as (func, state, var)
+                    (
+                        iterator_vals.get(0).cloned().unwrap_or(LuaValue::Nil),
+                        iterator_vals.get(1).cloned().unwrap_or(LuaValue::Nil),
+                        iterator_vals.get(2).cloned().unwrap_or(LuaValue::Nil),
+                    )
+                };
 
                 self.break_flag = false;
                 self.push_scope();
@@ -634,12 +664,12 @@ impl Interpreter {
                 }
 
                 let rval = self.evaluate(right)?;
-                self.apply_binary_op(op, &lval, &rval)
+                Ok(self.apply_binary_op(op, &lval, &rval)?)
             }
 
             Expr::UnaryOp { op, operand } => {
                 let val = self.evaluate(operand)?;
-                self.apply_unary_op(op, &val)
+                Ok(self.apply_unary_op(op, &val)?)
             }
 
             Expr::Call { func, args } => {
@@ -746,7 +776,7 @@ impl Interpreter {
 
             LuaValue::NativeFunction(name) => {
                 // Special handling for functions that return multiple values
-                if name == "load" || name == "pcall" {
+                if name == "load" || name == "pcall" || name.starts_with("string.unpack") {
                     // These functions return tables that represent multiple values
                     let result = self.call_native(name, args)?;
                     if let LuaValue::Table(t) = result {
@@ -1021,25 +1051,30 @@ impl Interpreter {
             .unwrap_or(0);
         
         if let Some(matches_table) = matches {
+            // Use table.len() to get the number of matches
             let len = matches_table.len();
+            
             if index < len {
-                // Get the next match
+                // Get the next match (index is 0-based, table keys are 1-based)
                 let next_match = matches_table.get(&(index + 1).to_string())
                     .cloned()
                     .unwrap_or(LuaValue::Nil);
                 
-                // Update index in upvalue
+                // Update index in upvalue for next call (before returning)
+                let new_index = index + 1;
                 if let Some(upvalue) = closure.upvalues.get("_gmatch_index") {
-                    upvalue.set(LuaValue::Number((index + 1) as f64));
+                    upvalue.set(LuaValue::Number(new_index as f64));
                 }
                 
+                // Return the match
                 Ok(vec![next_match])
             } else {
-                // End of matches
-                Ok(vec![])
+                // End of matches - return nil to signal end
+                Ok(vec![LuaValue::Nil])
             }
         } else {
-            Ok(vec![])
+            // No matches - return nil to signal end
+            Ok(vec![LuaValue::Nil])
         }
     }
 
@@ -1081,9 +1116,24 @@ impl Interpreter {
                 Ok(LuaValue::Nil)
             }
 
-            "tostring" => Ok(LuaValue::String(
-                args.first().map(|v| v.to_lua_string()).unwrap_or_else(|| "nil".to_string()),
-            )),
+            "tostring" => {
+                if let Some(val) = args.first() {
+                    // Check for __tostring metamethod
+                    if let LuaValue::Table(t) = val {
+                        if let Some(mt) = &t.metatable {
+                            if let Some(tostring) = &mt.tostring {
+                                let args = vec![val.clone()];
+                                if let Ok(results) = self.call_function(tostring, &args) {
+                                    return Ok(results.first().cloned().unwrap_or(LuaValue::String("nil".to_string())));
+                                }
+                            }
+                        }
+                    }
+                    Ok(LuaValue::String(val.to_lua_string()))
+                } else {
+                    Ok(LuaValue::String("nil".to_string()))
+                }
+            },
 
             "tonumber" => {
                 let result = args.first().and_then(|v| v.to_number());
@@ -1384,7 +1434,16 @@ impl Interpreter {
                 
                 let modname = args.first().map(|v| v.to_lua_string()).unwrap_or_default();
                 
-                // Search in module table
+                // First check package.loaded
+                if let Some(LuaValue::Table(package)) = self.globals.get("package") {
+                    if let Some(LuaValue::Table(loaded)) = package.get("loaded") {
+                        if let Some(module) = loaded.get(&modname) {
+                            return Ok(module.clone());
+                        }
+                    }
+                }
+                
+                // Then search in module registry
                 if let Some(module) = self.modules.get(&modname) {
                     Ok(module.clone())
                 } else {
@@ -1511,11 +1570,11 @@ impl Interpreter {
                         }
                     })
                     .collect();
-                let match_table = LuaValue::table(
-                    match_strings.iter().enumerate()
-                        .map(|(i, s)| ((i + 1).to_string(), LuaValue::String(s.clone())))
-                        .collect()
-                );
+                let mut match_table_data = HashMap::new();
+                for (i, s) in match_strings.iter().enumerate() {
+                    match_table_data.insert((i + 1).to_string(), LuaValue::String(s.clone()));
+                }
+                let match_table = LuaValue::table(match_table_data);
                 upvalues.insert("_gmatch_matches".to_string(), Upvalue::new(match_table));
                 upvalues.insert("_gmatch_index".to_string(), Upvalue::new(LuaValue::Number(0.0)));
                 
@@ -1965,9 +2024,33 @@ impl Interpreter {
         }
     }
 
-    fn apply_binary_op(&self, op: &BinaryOperator, left: &LuaValue, right: &LuaValue) -> Result<LuaValue, String> {
+    fn apply_binary_op(&mut self, op: &BinaryOperator, left: &LuaValue, right: &LuaValue) -> Result<LuaValue, String> {
         match op {
             BinaryOperator::Add => {
+                // Check for __add metamethod (Lua checks left operand first, then right)
+                if let LuaValue::Table(t) = left {
+                    if let Some(mt) = &t.metatable {
+                        if let Some(add) = &mt.add {
+                            let args = vec![left.clone(), right.clone()];
+                            match self.call_function(add, &args) {
+                                Ok(results) => return Ok(results.first().cloned().unwrap_or(LuaValue::Nil)),
+                                Err(_) => {} // Fall through to try right operand or default behavior
+                            }
+                        }
+                    }
+                }
+                if let LuaValue::Table(t) = right {
+                    if let Some(mt) = &t.metatable {
+                        if let Some(add) = &mt.add {
+                            let args = vec![left.clone(), right.clone()];
+                            match self.call_function(add, &args) {
+                                Ok(results) => return Ok(results.first().cloned().unwrap_or(LuaValue::Nil)),
+                                Err(_) => {} // Fall through to default behavior
+                            }
+                        }
+                    }
+                }
+                // Default behavior: try to add as numbers
                 let l = left.to_number().ok_or("cannot add non-numbers")?;
                 let r = right.to_number().ok_or("cannot add non-numbers")?;
                 Ok(LuaValue::Number(l + r))
@@ -2002,7 +2085,30 @@ impl Interpreter {
                 let r = right.to_number().ok_or("cannot pow non-numbers")?;
                 Ok(LuaValue::Number(l.powf(r)))
             }
-            BinaryOperator::Eq => Ok(LuaValue::Boolean(left == right)),
+            BinaryOperator::Eq => {
+                // Check for __eq metamethod
+                if let LuaValue::Table(t) = left {
+                    if let Some(mt) = &t.metatable {
+                        if let Some(eq) = &mt.eq {
+                            let args = vec![left.clone(), right.clone()];
+                            if let Ok(results) = self.call_function(eq, &args) {
+                                return Ok(results.first().cloned().unwrap_or(LuaValue::Boolean(false)));
+                            }
+                        }
+                    }
+                }
+                if let LuaValue::Table(t) = right {
+                    if let Some(mt) = &t.metatable {
+                        if let Some(eq) = &mt.eq {
+                            let args = vec![left.clone(), right.clone()];
+                            if let Ok(results) = self.call_function(eq, &args) {
+                                return Ok(results.first().cloned().unwrap_or(LuaValue::Boolean(false)));
+                            }
+                        }
+                    }
+                }
+                Ok(LuaValue::Boolean(left == right))
+            },
             BinaryOperator::NotEq => Ok(LuaValue::Boolean(left != right)),
             BinaryOperator::Lt => {
                 let l = left.to_number().ok_or("cannot compare non-numbers")?;
@@ -2058,17 +2164,30 @@ impl Interpreter {
         }
     }
 
-    fn apply_unary_op(&self, op: &UnaryOperator, val: &LuaValue) -> Result<LuaValue, String> {
+    fn apply_unary_op(&mut self, op: &UnaryOperator, val: &LuaValue) -> Result<LuaValue, String> {
         match op {
             UnaryOperator::Neg => {
                 let n = val.to_number().ok_or("cannot negate non-number")?;
                 Ok(LuaValue::Number(-n))
             }
             UnaryOperator::Not => Ok(LuaValue::Boolean(!val.is_truthy())),
-            UnaryOperator::Len => match val {
-                LuaValue::String(s) => Ok(LuaValue::Number(s.len() as f64)),
-                LuaValue::Table(t) => Ok(LuaValue::Number(t.len() as f64)),
-                _ => Err(format!("cannot get length of {}: expected string or table", val.type_name())),
+            UnaryOperator::Len => {
+                // Check for __len metamethod
+                if let LuaValue::Table(t) = val {
+                    if let Some(mt) = &t.metatable {
+                        if let Some(len) = &mt.len {
+                            let args = vec![val.clone()];
+                            if let Ok(results) = self.call_function(len, &args) {
+                                return Ok(results.first().cloned().unwrap_or(LuaValue::Number(0.0)));
+                            }
+                        }
+                    }
+                }
+                match val {
+                    LuaValue::String(s) => Ok(LuaValue::Number(s.len() as f64)),
+                    LuaValue::Table(t) => Ok(LuaValue::Number(t.len() as f64)),
+                    _ => Err(format!("cannot get length of {}: expected string or table", val.type_name())),
+                }
             },
             UnaryOperator::BNot => {
                 let n = val.to_number().ok_or("cannot bitwise not non-number")? as i64;
@@ -2651,15 +2770,74 @@ impl Interpreter {
                     pos += 2;
                 }
                 'i' | 'I' => {
-                    if pos + 3 >= bytes.len() {
+                    // Read optional size (e.g., 'i4' means 4-byte integer)
+                    let mut size = 4; // Default size
+                    let mut j = i + 1;
+                    if j < chars.len() && chars[j].is_ascii_digit() {
+                        let mut n = 0;
+                        while j < chars.len() && chars[j].is_ascii_digit() {
+                            n = n * 10 + chars[j].to_digit(10).unwrap_or(0) as usize;
+                            j += 1;
+                        }
+                        size = n;
+                        i = j - 1; // Will be incremented at end of loop
+                    }
+                    
+                    if pos + size - 1 >= bytes.len() {
                         break;
                     }
-                    let val = match endian {
-                        Endian::Big => u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]),
-                        Endian::Little | Endian::Native => u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]),
+                    
+                    let val: i64 = match size {
+                        1 => {
+                            if chars[i] == 'i' {
+                                bytes[pos] as i8 as i64
+                            } else {
+                                bytes[pos] as u8 as i64
+                            }
+                        }
+                        2 => {
+                            let v = match endian {
+                                Endian::Big => u16::from_be_bytes([bytes[pos], bytes[pos + 1]]),
+                                Endian::Little | Endian::Native => u16::from_le_bytes([bytes[pos], bytes[pos + 1]]),
+                            };
+                            if chars[i] == 'i' {
+                                v as i16 as i64
+                            } else {
+                                v as i64
+                            }
+                        }
+                        4 => {
+                            let v = match endian {
+                                Endian::Big => u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]),
+                                Endian::Little | Endian::Native => u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]),
+                            };
+                            if chars[i] == 'i' {
+                                v as i32 as i64
+                            } else {
+                                v as i64
+                            }
+                        }
+                        8 => {
+                            let v = match endian {
+                                Endian::Big => u64::from_be_bytes([
+                                    bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3],
+                                    bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7],
+                                ]),
+                                Endian::Little | Endian::Native => u64::from_le_bytes([
+                                    bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3],
+                                    bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7],
+                                ]),
+                            };
+                            if chars[i] == 'i' {
+                                v as i64
+                            } else {
+                                v as i64
+                            }
+                        }
+                        _ => return Err(format!("string.unpack: unsupported integer size {}", size)),
                     };
-                    result.push(LuaValue::Number(if chars[i] == 'i' { val as i32 as f64 } else { val as f64 }));
-                    pos += 4;
+                    result.push(LuaValue::Number(val as f64));
+                    pos += size;
                 }
                 'l' | 'L' => {
                     if pos + 7 >= bytes.len() {

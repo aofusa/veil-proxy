@@ -327,6 +327,7 @@ impl<'a> Parser<'a> {
 
     fn parse_assignment_or_call(&mut self) -> Result<Stmt, String> {
         let expr = self.parse_prefix_expression()?;
+        let expr = self.parse_expression_rest(expr)?;
 
         // Check for assignment
         if self.current() == &Token::Assign {
