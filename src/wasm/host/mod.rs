@@ -3,13 +3,17 @@
 //! Implements all required host functions exposed to WASM modules.
 
 mod buffers;
+mod foreign;
+mod grpc;
 mod headers;
 mod http_call;
 mod logging;
 mod metrics;
 mod properties;
 mod shared_data;
+mod shared_queue;
 mod stream;
+mod wasi;
 
 use wasmtime::Linker;
 
@@ -24,7 +28,11 @@ pub fn add_host_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> 
     properties::add_functions(linker)?;
     http_call::add_functions(linker)?;
     shared_data::add_functions(linker)?;
+    shared_queue::add_functions(linker)?;
+    grpc::add_functions(linker)?;
+    foreign::add_functions(linker)?;
     metrics::add_functions(linker)?;
+    wasi::add_functions(linker)?;
 
     Ok(())
 }

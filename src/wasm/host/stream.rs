@@ -127,6 +127,56 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
         },
     )?;
 
+    // proxy_get_status
+    // Returns the status code and message from an HTTP call or gRPC response
+    // Typically called in proxy_on_http_call_response or proxy_on_grpc_close callbacks
+    linker.func_wrap(
+        "env",
+        "proxy_get_status",
+        |mut caller: Caller<'_, HostState>,
+         return_status_code_ptr: i32,
+         return_status_msg_ptr: i32,
+         return_status_msg_size_ptr: i32|
+         -> i32 {
+            let memory = match caller.get_export("memory") {
+                Some(wasmtime::Extern::Memory(mem)) => mem,
+                _ => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
+            };
+
+            // Get the current HTTP call response status if available
+            let status_code = {
+                let state = caller.data();
+                if let Some(token) = state.http_ctx.current_http_call_token {
+                    state.http_ctx.http_call_responses
+                        .get(&token)
+                        .map(|r| r.status_code as u32)
+                        .unwrap_or(0)
+                } else {
+                    state.http_ctx.response_status as u32
+                }
+            };
+
+            // Write status code
+            let data = memory.data_mut(&mut caller);
+            let ptr = return_status_code_ptr as usize;
+            if ptr + 4 > data.len() {
+                return PROXY_RESULT_INVALID_MEMORY_ACCESS;
+            }
+            data[ptr..ptr + 4].copy_from_slice(&status_code.to_le_bytes());
+
+            // For message, write empty string (no message stored currently)
+            let _msg_ptr = return_status_msg_ptr as usize;
+            let msg_size_ptr = return_status_msg_size_ptr as usize;
+            if msg_size_ptr + 4 > data.len() {
+                return PROXY_RESULT_INVALID_MEMORY_ACCESS;
+            }
+            // Write size = 0 (no message)
+            data[msg_size_ptr..msg_size_ptr + 4].copy_from_slice(&0u32.to_le_bytes());
+
+            PROXY_RESULT_OK
+        },
+    )?;
+
     // Note: proxy_get_current_time_nanoseconds is defined in logging.rs
 
     Ok(())
