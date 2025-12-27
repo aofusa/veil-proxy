@@ -234,7 +234,7 @@ cargo build --target wasm32-wasip1 --release
 | `io.*` | ファイルI/O |
 | `debug.*` | デバッグ機能 |
 | `package.*` | 動的モジュール読み込み |
-| `coroutine.*` | スレッド状態管理 |
+| `coroutine.*` | ✅ | コルーチン機能（create, resume, yield, status, wrap） |
 
 #### utf8.*
 | 関数 | サポート |
@@ -279,6 +279,58 @@ function on_response()
     return 'continue'
 end
 ```
+
+---
+
+## コルーチン機能
+
+### 概要
+
+Luaのコルーチン機能を実装しています。コルーチンは、関数の実行を一時停止し、後で再開できる協調的マルチタスク機能です。
+
+### サポート機能
+
+| 関数 | 説明 |
+|------|------|
+| `coroutine.create(f)` | 関数`f`からコルーチンを作成します。戻り値は`thread`型です。 |
+| `coroutine.resume(co, ...)` | コルーチン`co`を再開します。引数を渡すことができます。戻り値は`(ok, ...)`の形式で、`ok`は成功フラグ、その後にコルーチンから返された値が続きます。 |
+| `coroutine.yield(...)` | コルーチンを一時停止し、呼び出し元に値を返します。コルーチン外で呼び出すとエラーになります。 |
+| `coroutine.status(co)` | コルーチン`co`の状態を返します。`"suspended"`、`"running"`、`"dead"`のいずれかです。 |
+| `coroutine.wrap(f)` | 関数`f`からコルーチンを作成し、それをラップした関数を返します。この関数を呼び出すと、コルーチンが再開されます。 |
+
+### 使用例
+
+```lua
+-- 基本的な使用例
+function counter()
+    local i = 0
+    while i < 3 do
+        i = i + 1
+        coroutine.yield(i)
+    end
+    return i
+end
+
+local co = coroutine.create(counter)
+local ok1, val1 = coroutine.resume(co)  -- ok1 = true, val1 = 1
+local ok2, val2 = coroutine.resume(co)  -- ok2 = true, val2 = 2
+local ok3, val3 = coroutine.resume(co)  -- ok3 = true, val3 = 3
+local ok4, val4 = coroutine.resume(co)  -- ok4 = true, val4 = 3 (return value)
+
+-- coroutine.wrapの使用例
+local wrapped = coroutine.wrap(counter)
+local val1 = wrapped()  -- 1
+local val2 = wrapped()  -- 2
+local val3 = wrapped()  -- 3
+local val4 = wrapped()  -- 3 (return value)
+```
+
+### 実装の制限
+
+- **ネストしたコルーチン呼び出し**: サポートされていますが、複雑なネストは推奨されません。
+- **ループ内でのyield**: サポートされていますが、一部の複雑なループ構造では動作しない可能性があります。
+- **パフォーマンス**: 状態の保存・復元にオーバーヘッドがあります。
+- **メモリ使用量**: コルーチンごとにスコープスタックのコピーが必要なため、メモリ使用量が増加します。
 
 ---
 
