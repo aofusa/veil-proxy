@@ -5,7 +5,7 @@ edition = "2021"
 description = "Custom Lua interpreter Proxy-Wasm filter (pure Rust, no external Lua libraries)"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 proxy-wasm = "0.2"

@@ -160,6 +160,10 @@ impl LuaValue {
         }
     }
 
+    pub fn is_nil(&self) -> bool {
+        matches!(self, LuaValue::Nil)
+    }
+
     pub fn type_name(&self) -> &'static str {
         match self {
             LuaValue::Nil => "nil",

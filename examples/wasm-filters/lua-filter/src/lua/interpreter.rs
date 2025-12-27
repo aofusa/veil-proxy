@@ -101,6 +101,9 @@ pub struct Interpreter {
     /// Goto target label (for goto statement)
     goto_target: Option<String>,
     
+    /// Label positions in current function (for goto support)
+    function_labels: HashMap<String, usize>,
+    
     /// Random number generator state
     random_state: u64,
     
@@ -150,6 +153,7 @@ impl Interpreter {
             "abs", "ceil", "floor", "max", "min", "sin", "cos", "tan",
             "asin", "acos", "atan", "sqrt", "log", "exp", "pow",
             "random", "randomseed", "deg", "rad", "modf", "fmod",
+            "ult", "tointeger",
         ] {
             math_table.set(
                 name.to_string(),
@@ -164,7 +168,7 @@ impl Interpreter {
 
         // Register table library
         let mut table_lib = LuaTable::new();
-        for name in &["insert", "remove", "concat", "sort", "pack", "unpack"] {
+        for name in &["insert", "remove", "concat", "sort", "pack", "unpack", "move"] {
             table_lib.set(
                 name.to_string(),
                 LuaValue::NativeFunction(format!("table.{}", name)),
@@ -213,6 +217,7 @@ impl Interpreter {
             return_values: None,
             varargs: Vec::new(),
             goto_target: None,
+            function_labels: HashMap::new(),
             random_state: 0,
             modules: HashMap::new(),
         }
@@ -227,14 +232,22 @@ impl Interpreter {
     pub fn execute(&mut self, program: &Program) -> Result<LuaValue, String> {
         self.return_values = None;
         self.break_flag = false;
+        self.goto_target = None;
+        
+        // Collect all labels in the program
+        self.function_labels = program.statements.iter()
+            .enumerate()
+            .filter_map(|(i, stmt)| {
+                if let Stmt::Label(name) = stmt {
+                    Some((name.clone(), i))
+                } else {
+                    None
+                }
+            })
+            .collect();
 
-        for stmt in &program.statements {
-            self.execute_statement(stmt)?;
-
-            if self.return_values.is_some() {
-                break;
-            }
-        }
+        // Use execute_block to support goto/labels
+        self.execute_block_with_labels(&program.statements, 0)?;
 
         Ok(self.return_values.take()
             .and_then(|v| v.into_iter().next())
@@ -302,13 +315,13 @@ impl Interpreter {
                 let cond = self.evaluate(condition)?;
 
                 if cond.is_truthy() {
-                    self.execute_block(then_block)?;
+                    self.execute_block_with_labels(then_block, 0)?;
                 } else {
                     let mut executed = false;
                     for (elseif_cond, elseif_body) in elseif_blocks {
                         let c = self.evaluate(elseif_cond)?;
                         if c.is_truthy() {
-                            self.execute_block(elseif_body)?;
+                            self.execute_block_with_labels(elseif_body, 0)?;
                             executed = true;
                             break;
                         }
@@ -316,7 +329,7 @@ impl Interpreter {
 
                     if !executed {
                         if let Some(else_body) = else_block {
-                            self.execute_block(else_body)?;
+                            self.execute_block_with_labels(else_body, 0)?;
                         }
                     }
                 }
@@ -331,7 +344,7 @@ impl Interpreter {
                         break;
                     }
 
-                    self.execute_block(body)?;
+                    self.execute_block_with_labels(body, 0)?;
 
                     if self.return_values.is_some() {
                         break;
@@ -345,7 +358,7 @@ impl Interpreter {
                 self.break_flag = false;
 
                 loop {
-                    self.execute_block(body)?;
+                    self.execute_block_with_labels(body, 0)?;
 
                     if self.break_flag || self.return_values.is_some() {
                         break;
@@ -499,28 +512,37 @@ impl Interpreter {
     }
 
     fn execute_block(&mut self, statements: &[Stmt]) -> Result<(), String> {
+        self.execute_block_with_labels(statements, 0)
+    }
+    
+    fn execute_block_with_labels(&mut self, statements: &[Stmt], _start_offset: usize) -> Result<(), String> {
         self.push_scope();
-
-        // Collect labels first
-        let labels: HashMap<String, usize> = statements.iter()
-            .enumerate()
-            .filter_map(|(i, stmt)| {
-                if let Stmt::Label(name) = stmt {
-                    Some((name.clone(), i))
-                } else {
-                    None
-                }
-            })
-            .collect();
 
         // Execute statements with goto support
         let mut i = 0;
         while i < statements.len() {
-            // Check for goto target
+            // Check for goto target (search in function_labels)
             if let Some(ref target) = self.goto_target {
-                if let Some(&target_idx) = labels.get(target) {
-                    i = target_idx;
-                    self.goto_target = None;
+                // Check if label exists in function_labels
+                if self.function_labels.contains_key(target) {
+                    // Label exists, but we need to check if it's in the current block
+                    // For simplicity, we'll search in the current statements first
+                    let mut found = false;
+                    for (j, stmt) in statements.iter().enumerate() {
+                        if let Stmt::Label(name) = stmt {
+                            if name == target {
+                                i = j;
+                                self.goto_target = None;
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !found {
+                        // Label is outside this block, propagate goto by returning
+                        self.pop_scope();
+                        return Ok(());
+                    }
                 } else {
                     return Err(format!("Label '{}' not found in current scope", target));
                 }
@@ -723,8 +745,26 @@ impl Interpreter {
             }
 
             LuaValue::NativeFunction(name) => {
-                // Native functions return single value, wrap in Vec
-                self.call_native(name, args).map(|v| vec![v])
+                // Special handling for functions that return multiple values
+                if name == "load" || name == "pcall" {
+                    // These functions return tables that represent multiple values
+                    let result = self.call_native(name, args)?;
+                    if let LuaValue::Table(t) = result {
+                        // Extract multiple return values from table
+                        let mut values = Vec::new();
+                        let mut i = 1;
+                        while let Some(val) = t.get(&i.to_string()) {
+                            values.push(val.clone());
+                            i += 1;
+                        }
+                        Ok(values)
+                    } else {
+                        Ok(vec![result])
+                    }
+                } else {
+                    // Native functions return single value, wrap in Vec
+                    self.call_native(name, args).map(|v| vec![v])
+                }
             },
             
             LuaValue::Table(t) => {
@@ -2412,11 +2452,51 @@ impl Interpreter {
                     if value_idx >= values.len() {
                         return Err("string.pack: not enough values".to_string());
                     }
+                    // Read optional size (e.g., 'i4' means 4-byte integer)
+                    let mut size = 4; // Default size
+                    let mut j = i + 1;
+                    if j < chars.len() && chars[j].is_ascii_digit() {
+                        let mut n = 0;
+                        while j < chars.len() && chars[j].is_ascii_digit() {
+                            n = n * 10 + chars[j].to_digit(10).unwrap_or(0) as usize;
+                            j += 1;
+                        }
+                        size = n;
+                        i = j - 1; // Will be incremented at end of loop
+                    }
+                    
                     let val = values[value_idx].to_number()
-                        .ok_or_else(|| format!("string.pack: value {} must be a number", value_idx + 1))? as u32;
-                    let bytes = match endian {
-                        Endian::Big => val.to_be_bytes(),
-                        Endian::Little | Endian::Native => val.to_le_bytes(),
+                        .ok_or_else(|| format!("string.pack: value {} must be a number", value_idx + 1))?;
+                    let bytes = match size {
+                        1 => {
+                            if chars[i] == 'i' {
+                                vec![val as i8 as u8]
+                            } else {
+                                vec![val as u8]
+                            }
+                        }
+                        2 => {
+                            let v = val as u16;
+                            match endian {
+                                Endian::Big => v.to_be_bytes().to_vec(),
+                                Endian::Little | Endian::Native => v.to_le_bytes().to_vec(),
+                            }
+                        }
+                        4 => {
+                            let v = val as u32;
+                            match endian {
+                                Endian::Big => v.to_be_bytes().to_vec(),
+                                Endian::Little | Endian::Native => v.to_le_bytes().to_vec(),
+                            }
+                        }
+                        8 => {
+                            let v = val as u64;
+                            match endian {
+                                Endian::Big => v.to_be_bytes().to_vec(),
+                                Endian::Little | Endian::Native => v.to_le_bytes().to_vec(),
+                            }
+                        }
+                        _ => return Err(format!("string.pack: unsupported integer size {}", size)),
                     };
                     result.extend_from_slice(&bytes);
                     value_idx += 1;

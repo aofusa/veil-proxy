@@ -76,7 +76,7 @@ fn test_pcall_error() {
 fn test_table_operations() {
     let mut interpreter = create_interpreter();
     let tokens = lexer::tokenize(
-        "local t = {}; t.key = 'value'; return t.key"
+        "local t = {}; t['key'] = 'value'; return t['key']"
     ).unwrap();
     let program = parser::parse(&tokens).unwrap();
     let result = interpreter.execute(&program).unwrap();
@@ -142,7 +142,7 @@ fn test_math_tointeger() {
 fn test_table_move() {
     let mut interpreter = create_interpreter();
     let tokens = lexer::tokenize(
-        "local t1 = {10, 20, 30}; local t2 = {}; table.move(t1, 1, 3, 1, t2); return t2[1] + t2[2] + t2[3]"
+        "local t1 = {10, 20, 30}; local t2 = {}; t2 = table.move(t1, 1, 3, 1, t2); return t2[1] + t2[2] + t2[3]"
     ).unwrap();
     let program = parser::parse(&tokens).unwrap();
     let result = interpreter.execute(&program).unwrap();
