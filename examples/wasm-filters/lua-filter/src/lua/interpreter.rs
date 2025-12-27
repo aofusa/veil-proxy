@@ -112,9 +112,6 @@ pub struct Interpreter {
     
     /// Call depth counter for preventing stack overflow
     call_depth: usize,
-    
-    /// Maximum call depth before switching to iterative execution
-    max_call_depth: usize,
 }
 
 impl Interpreter {
@@ -233,7 +230,6 @@ impl Interpreter {
             random_state: 0,
             modules: HashMap::new(),
             call_depth: 0,
-            max_call_depth: 1000,
         }
     }
     
@@ -2718,33 +2714,6 @@ impl Interpreter {
                 let n = val.to_number().ok_or("cannot bitwise not non-number")? as i64;
                 Ok(LuaValue::Number((!n) as f64))
             }
-        }
-    }
-
-    /// Extract function call from expression if it's a simple tail call pattern
-    /// This handles cases like `return count(n - 1) + 1` where the call is in a BinaryOp
-    fn extract_tail_call<'a>(&self, expr: &'a Expr) -> Option<(&'a Expr, Vec<&'a Expr>)> {
-        match expr {
-            Expr::Call { func, args } => {
-                Some((func, args.iter().collect()))
-            }
-            Expr::BinaryOp { left, op: _, right } => {
-                // Check if left side is a function call and right is a literal
-                // This handles cases like `return count(n - 1) + 1`
-                if let Expr::Call { func, args } = left.as_ref() {
-                    // Only optimize if the operation is simple (add, sub, etc.)
-                    // and right side is a literal
-                    match right.as_ref() {
-                        Expr::LiteralNumber(_) | Expr::LiteralString(_) | Expr::LiteralBool(_) | Expr::LiteralNil => {
-                            Some((func, args.iter().collect()))
-                        }
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            }
-            _ => None,
         }
     }
 
