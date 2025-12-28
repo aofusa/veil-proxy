@@ -3978,6 +3978,65 @@ struct PerformanceConfigSection {
     /// - コンテナ環境では追加設定が必要な場合あり
     #[serde(default)]
     huge_pages_enabled: bool,
+    
+    // ====================
+    // Viaヘッダー設定
+    // ====================
+    
+    /// Viaヘッダーを追加するかどうか
+    /// 
+    /// RFC 7230 Section 5.7.1 に従い、プロキシ経由のリクエスト/レスポンスに
+    /// Via ヘッダーを追加します。
+    /// 
+    /// 形式: Via: 1.1 <hostname>
+    /// 
+    /// - true: Viaヘッダーを追加
+    /// - false: Viaヘッダーを追加しない（デフォルト）
+    #[serde(default)]
+    via_header_enabled: bool,
+    
+    /// Viaヘッダーに使用するホスト名
+    /// 
+    /// via_header_enabled = true 時に使用します。
+    /// 未指定の場合はシステムホスト名または "veil" を使用します。
+    #[serde(default)]
+    via_header_hostname: Option<String>,
+    
+    // ====================
+    // sendfile/splice チャンクサイズ設定
+    // ====================
+    
+    /// チャンクサイズ調整モード
+    /// 
+    /// - "dynamic": ファイルサイズに応じて動的にチャンクサイズを決定（デフォルト）
+    ///   - 0-64KB: 64KB
+    ///   - 64KB-1MB: 256KB
+    ///   - 1MB超: 1MB
+    /// - "manual": 固定チャンクサイズを使用
+    #[serde(default = "default_chunk_size_mode")]
+    chunk_size_mode: ChunkSizeMode,
+    
+    /// 手動チャンクサイズ（バイト）
+    /// 
+    /// chunk_size_mode = "manual" 時に使用します。
+    /// デフォルト: 1048576 (1MB)
+    #[serde(default = "default_manual_chunk_size")]
+    manual_chunk_size: usize,
+    
+    // ====================
+    // パイプ割当設定
+    // ====================
+    
+    /// ストリーム毎にパイプを割り当てるかどうか
+    /// 
+    /// kTLS splice 使用時のパイプバッファ管理方式を設定します。
+    /// 
+    /// - false: スレッドローカルパイプを再利用（デフォルト、メモリ効率重視）
+    /// - true: ストリーム毎にパイプを割り当て（高並行性環境向け）
+    /// 
+    /// 高並行性環境（同時接続数1000+）ではtrueを推奨します。
+    #[serde(default)]
+    per_stream_pipe_enabled: bool,
 }
 
 // ====================
@@ -4142,6 +4201,58 @@ impl<'de> serde::Deserialize<'de> for ReuseportBalancing {
                 other
             ))),
         }
+    }
+}
+
+/// sendfile/splice チャンクサイズ調整モード
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+enum ChunkSizeMode {
+    /// ファイルサイズに応じて動的にチャンクサイズを決定
+    /// - 0-64KB: 64KB
+    /// - 64KB-1MB: 256KB
+    /// - 1MB超: 1MB
+    #[default]
+    Dynamic,
+    /// 固定チャンクサイズを使用（manual_chunk_sizeで指定）
+    Manual,
+}
+
+impl<'de> serde::Deserialize<'de> for ChunkSizeMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "dynamic" | "Dynamic" => Ok(ChunkSizeMode::Dynamic),
+            "manual" | "Manual" => Ok(ChunkSizeMode::Manual),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown chunk_size_mode value: '{}', expected 'dynamic' or 'manual'",
+                other
+            ))),
+        }
+    }
+}
+
+/// チャンクサイズモードのデフォルト値（動的調整）
+fn default_chunk_size_mode() -> ChunkSizeMode {
+    ChunkSizeMode::Dynamic
+}
+
+/// 手動チャンクサイズのデフォルト値（1MB）
+fn default_manual_chunk_size() -> usize {
+    1048576  // 1MB
+}
+
+/// ファイルサイズに応じた最適なチャンクサイズを計算
+/// 
+/// 動的調整モード時に使用されます。
+#[allow(dead_code)]
+fn calculate_optimal_chunk_size(file_size: u64) -> usize {
+    match file_size {
+        0..=65_536 => 65_536,           // 64KB以下: 64KB
+        65_537..=1_048_576 => 262_144,  // 1MB以下: 256KB
+        _ => 1_048_576,                  // 1MB超: 1MB
     }
 }
 

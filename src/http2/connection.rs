@@ -43,6 +43,8 @@ pub struct Http2Connection<S> {
     goaway_sent: bool,
     /// GOAWAY 受信済みフラグ
     goaway_received: bool,
+    /// GOAWAY で受信した last_stream_id (RFC 7540 Section 6.8)
+    goaway_last_stream_id: Option<u32>,
     /// SETTINGS ACK 待ち
     settings_ack_pending: bool,
     /// 読み込みバッファ
@@ -87,6 +89,7 @@ where
             conn_recv_window: conn_window,
             goaway_sent: false,
             goaway_received: false,
+            goaway_last_stream_id: None,
             settings_ack_pending: false,
             read_buf: vec![0u8; 65536],
             buf_start: 0,
@@ -231,16 +234,23 @@ where
     }
 
     /// データを送信
+    /// 
+    /// monoio の write_all は成功時に全データ書き込みを保証するため、
+    /// 成功時はループを抜ける実装が正しい。
     async fn write_all(&mut self, data: &[u8]) -> Http2Result<()> {
-        let written = 0;
-        while written < data.len() {
-            let buf = data[written..].to_vec();
+        let mut offset = 0;
+        while offset < data.len() {
+            let buf = data[offset..].to_vec();
+            let buf_len = buf.len();
             let (result, _) = self.stream.write_all(buf).await;
-        match result {
-            Ok(_) => break,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-            Err(e) => return Err(Http2Error::Io(e)),
-        }
+            match result {
+                Ok(_) => {
+                    // monoio の write_all は成功時に全データ書き込みを保証
+                    offset += buf_len;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Err(Http2Error::Io(e)),
+            }
         }
         Ok(())
     }
@@ -557,9 +567,33 @@ where
         Ok(())
     }
 
-    /// GOAWAY を処理
-    fn handle_goaway(&mut self, _last_stream_id: u32, _error_code: u32, _debug_data: &[u8]) -> Http2Result<()> {
+    /// GOAWAY を処理 (RFC 7540 Section 6.8)
+    /// 
+    /// GOAWAY 受信後は last_stream_id より大きい ID のストリームを
+    /// 開始してはならない。
+    fn handle_goaway(&mut self, last_stream_id: u32, error_code: u32, debug_data: &[u8]) -> Http2Result<()> {
         self.goaway_received = true;
+        self.goaway_last_stream_id = Some(last_stream_id);
+        
+        // ストリームマネージャーにも GOAWAY 状態を伝播
+        self.streams.set_goaway_last_stream_id(last_stream_id);
+        
+        // エラーコードが 0 以外の場合はログを出力
+        if error_code != 0 {
+            let debug_str = String::from_utf8_lossy(debug_data);
+            ftlog::warn!(
+                "HTTP/2 GOAWAY received: error_code={}, last_stream_id={}, debug={}",
+                error_code,
+                last_stream_id,
+                debug_str
+            );
+        } else {
+            ftlog::debug!(
+                "HTTP/2 GOAWAY received: last_stream_id={}",
+                last_stream_id
+            );
+        }
+        
         Ok(())
     }
 

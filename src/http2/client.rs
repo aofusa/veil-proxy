@@ -416,13 +416,20 @@ where
     }
 
     /// データを送信
+    /// 
+    /// monoio の write_all は成功時に全データ書き込みを保証するため、
+    /// 成功時はループを抜ける実装が正しい。
     async fn write_all(&mut self, data: &[u8]) -> Http2Result<()> {
-        let written = 0;
-        while written < data.len() {
-            let buf = data[written..].to_vec();
+        let mut offset = 0;
+        while offset < data.len() {
+            let buf = data[offset..].to_vec();
+            let buf_len = buf.len();
             let (result, _) = self.stream.write_all(buf).await;
             match result {
-                Ok(_) => break,
+                Ok(_) => {
+                    // monoio の write_all は成功時に全データ書き込みを保証
+                    offset += buf_len;
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
                 Err(e) => return Err(Http2Error::Io(e)),
             }

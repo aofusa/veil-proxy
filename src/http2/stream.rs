@@ -360,6 +360,8 @@ pub struct StreamManager {
     initial_window_size: i32,
     /// ヘッダー受信中のストリーム ID (CONTINUATION 用)
     receiving_headers_stream: Option<u32>,
+    /// GOAWAY で受信した last_stream_id (RFC 7540 Section 6.8)
+    goaway_last_stream_id: Option<u32>,
 }
 
 impl StreamManager {
@@ -372,14 +374,28 @@ impl StreamManager {
             max_concurrent_streams: max_concurrent,
             initial_window_size: initial_window,
             receiving_headers_stream: None,
+            goaway_last_stream_id: None,
         }
     }
 
     /// クライアントストリームを取得または作成
+    /// 
+    /// RFC 7540 Section 6.8: GOAWAY 受信後は、last_stream_id より大きい
+    /// ストリーム ID の開始を拒否する。
     pub fn get_or_create_client_stream(&mut self, id: u32) -> Result<&mut Stream, Http2Error> {
         // クライアントストリームは奇数
         if id % 2 == 0 {
             return Err(Http2Error::protocol_error("Client stream ID must be odd"));
+        }
+
+        // GOAWAY 受信後のストリーム ID 制限チェック
+        if let Some(goaway_id) = self.goaway_last_stream_id {
+            if id > goaway_id {
+                return Err(Http2Error::connection_error(
+                    Http2ErrorCode::RefusedStream,
+                    "Stream ID exceeds GOAWAY last_stream_id",
+                ));
+            }
         }
 
         // ストリーム ID は単調増加
@@ -480,6 +496,67 @@ impl StreamManager {
     pub fn max_client_stream_id(&self) -> u32 {
         self.max_client_stream_id
     }
+
+    /// GOAWAY の last_stream_id を設定
+    /// 
+    /// RFC 7540 Section 6.8: GOAWAY 受信時に呼び出し、
+    /// 以降のストリーム作成を制限する。
+    pub fn set_goaway_last_stream_id(&mut self, last_stream_id: u32) {
+        self.goaway_last_stream_id = Some(last_stream_id);
+    }
+
+    /// 優先度に基づいてストリームIDをソートして返す
+    /// 
+    /// RFC 7540 Section 5.3: 優先度に基づくスケジューリング
+    /// 重みが大きいほど高優先度（より多くのリソースを割り当て）
+    /// 
+    /// 戻り値:
+    /// - ストリームIDのVec（優先度順、重みが大きい順）
+    pub fn get_streams_by_priority(&self) -> Vec<u32> {
+        let mut streams: Vec<_> = self.streams.iter()
+            .filter(|(_, s)| s.state == StreamState::Open || s.state == StreamState::HalfClosedRemote)
+            .collect();
+        
+        // 重みが大きい順にソート（同じ重みなら依存先ストリームIDが小さい順）
+        streams.sort_by(|a, b| {
+            match b.1.weight.cmp(&a.1.weight) {
+                std::cmp::Ordering::Equal => a.1.dependency.cmp(&b.1.dependency),
+                other => other,
+            }
+        });
+        
+        streams.into_iter().map(|(id, _)| *id).collect()
+    }
+
+    /// 指定した依存先を持つストリームのIDリストを取得
+    /// 
+    /// RFC 7540 Section 5.3.1: 依存関係の処理
+    #[allow(dead_code)]
+    pub fn get_dependent_streams(&self, parent_id: u32) -> Vec<u32> {
+        self.streams.iter()
+            .filter(|(_, s)| s.dependency == parent_id)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// ストリームの優先度情報を更新
+    /// 
+    /// RFC 7540 Section 5.3.3: 優先度の再設定
+    pub fn update_priority(&mut self, stream_id: u32, dependency: u32, weight: u8, exclusive: bool) -> Result<(), Http2Error> {
+        // 自己依存チェック
+        if stream_id == dependency {
+            return Err(Http2Error::protocol_error("Stream cannot depend on itself"));
+        }
+
+        if let Some(stream) = self.streams.get_mut(&stream_id) {
+            stream.dependency = dependency;
+            stream.weight = weight;
+            stream.exclusive = exclusive;
+            Ok(())
+        } else {
+            Err(Http2Error::stream_error(stream_id, Http2ErrorCode::StreamClosed, "Stream not found"))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -554,5 +631,36 @@ mod tests {
         // ウィンドウ超過
         let result = stream.recv_data(&[0u8; 100], false);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_goaway_stream_rejection() {
+        let mut manager = StreamManager::new(100, 65535);
+
+        // ストリーム1, 3を作成（GOAWAY前）
+        manager.get_or_create_client_stream(1).unwrap().recv_headers(false).unwrap();
+        manager.get_or_create_client_stream(3).unwrap().recv_headers(false).unwrap();
+
+        // GOAWAY last_stream_id=3 を設定
+        manager.set_goaway_last_stream_id(3);
+
+        // ストリーム1は既存で last_stream_id 以下なのでOK
+        assert!(manager.get_or_create_client_stream(1).is_ok());
+
+        // ストリーム3は last_stream_id と同じなのでOK
+        assert!(manager.get_or_create_client_stream(3).is_ok());
+
+        // ストリーム5は last_stream_id を超えるので拒否
+        let result = manager.get_or_create_client_stream(5);
+        assert!(result.is_err());
+        
+        // ストリーム7も拒否
+        let result = manager.get_or_create_client_stream(7);
+        assert!(result.is_err());
+        
+        // エラーメッセージを確認
+        if let Err(e) = result {
+            assert!(e.to_string().contains("GOAWAY"));
+        }
     }
 }

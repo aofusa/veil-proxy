@@ -1410,6 +1410,75 @@ pub async fn proxy_to_backend_async(
 }
 
 /// TLSバックエンドへの非同期プロキシ処理
+#[cfg(feature = "ktls")]
+async fn proxy_to_tls_backend_async(
+    target: &ProxyTarget,
+    request: Vec<u8>,
+    tcp_stream: monoio::net::TcpStream,
+    timeout_secs: u64,
+) -> io::Result<BackendProxyResult> {
+    use rustls::ClientConfig;
+    use std::sync::Arc;
+    
+    let root_store = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    
+    let config = Arc::new(ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth());
+    
+    let sni_name = target.sni_name.as_deref().unwrap_or(&target.host);
+    let server_name = match rustls::pki_types::ServerName::try_from(sni_name.to_string()) {
+        Ok(name) => name,
+        Err(e) => {
+            warn!("[HTTP/3] Invalid SNI name: {}", e);
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid SNI name"));
+        }
+    };
+    
+    // kTLS 使用時は ktls_rustls::connect を使用
+    // (enable_ktls=true, allow_fallback=true, tcp_cork_enabled=true)
+    let tls_stream = crate::ktls_rustls::connect(tcp_stream, config, server_name, true, true, true).await?;
+    let fd = tls_stream.as_raw_fd();
+    
+    let mut written = 0;
+    while written < request.len() {
+        match write_nonblocking(fd, &request[written..]) {
+            Ok(n) if n > 0 => written += n,
+            Ok(_) | Err(_) => {
+                tls_stream.get_ref().writable(false).await?;
+            }
+        }
+    }
+    
+    let mut response = Vec::with_capacity(16384);
+    let mut buf = vec![0u8; 8192];
+    let read_timeout = Duration::from_secs(timeout_secs);
+    let start_time = std::time::Instant::now();
+    
+    loop {
+        if start_time.elapsed() > read_timeout { break; }
+        match read_nonblocking(fd, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                let remaining = read_timeout.saturating_sub(start_time.elapsed());
+                if remaining.is_zero() { break; }
+                match monoio::time::timeout(remaining, tls_stream.get_ref().readable(false)).await {
+                    Ok(Ok(())) => continue,
+                    _ => break,
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    
+    parse_http_response(&response)
+}
+
+/// TLSバックエンドへの非同期プロキシ処理
+#[cfg(not(feature = "ktls"))]
 async fn proxy_to_tls_backend_async(
     target: &ProxyTarget,
     request: Vec<u8>,
