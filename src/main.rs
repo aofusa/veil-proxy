@@ -127,6 +127,13 @@ pub mod http2;
 #[cfg(feature = "http3")]
 pub mod http3_server;
 
+/// QUIC 用 UDP ソケット (GSO/GRO 対応)
+/// - sendmsg/recvmsg を使用した GSO/GRO 実装
+/// - EAGAIN 対応の非同期送受信
+/// - SO_REUSEPORT でマルチスレッド対応
+#[cfg(feature = "http3")]
+pub mod udp;
+
 /// セキュリティ強化モジュール
 /// - io_uring操作制限（IORING_REGISTER_RESTRICTIONS）
 /// - seccompシステムコール制限

@@ -77,6 +77,121 @@ impl QuicUdpSocket {
         Ok(instance)
     }
 
+    /// SO_REUSEPORT を設定してバインド（HTTP/3 マルチスレッド対応）
+    /// 
+    /// 複数ワーカースレッドが同じポートでリッスンし、
+    /// カーネルがフローに基づいてパケットを分散します。
+    /// GSO/GRO も同時に設定されます。
+    #[cfg(target_os = "linux")]
+    pub fn bind_reuseport(addr: SocketAddr) -> io::Result<Self> {
+        use std::os::unix::io::FromRawFd;
+        
+        // ソケットを作成
+        let domain = if addr.is_ipv4() {
+            libc::AF_INET
+        } else {
+            libc::AF_INET6
+        };
+        
+        let fd = unsafe { 
+            libc::socket(domain, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0) 
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        
+        // SO_REUSEADDR を設定
+        let optval: libc::c_int = 1;
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
+                &optval as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if ret < 0 {
+            unsafe { libc::close(fd) };
+            return Err(io::Error::last_os_error());
+        }
+        
+        // SO_REUSEPORT を設定
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEPORT,
+                &optval as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if ret < 0 {
+            unsafe { libc::close(fd) };
+            return Err(io::Error::last_os_error());
+        }
+        
+        // アドレスをバインド
+        let ret = match addr {
+            SocketAddr::V4(v4) => {
+                let sin = libc::sockaddr_in {
+                    sin_family: libc::AF_INET as libc::sa_family_t,
+                    sin_port: v4.port().to_be(),
+                    sin_addr: libc::in_addr {
+                        s_addr: u32::from_ne_bytes(v4.ip().octets()),
+                    },
+                    sin_zero: [0; 8],
+                };
+                unsafe {
+                    libc::bind(
+                        fd,
+                        &sin as *const _ as *const libc::sockaddr,
+                        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                    )
+                }
+            }
+            SocketAddr::V6(v6) => {
+                let sin6 = libc::sockaddr_in6 {
+                    sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                    sin6_port: v6.port().to_be(),
+                    sin6_flowinfo: v6.flowinfo(),
+                    sin6_addr: libc::in6_addr {
+                        s6_addr: v6.ip().octets(),
+                    },
+                    sin6_scope_id: v6.scope_id(),
+                };
+                unsafe {
+                    libc::bind(
+                        fd,
+                        &sin6 as *const _ as *const libc::sockaddr,
+                        std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                    )
+                }
+            }
+        };
+        if ret < 0 {
+            unsafe { libc::close(fd) };
+            return Err(io::Error::last_os_error());
+        }
+        
+        // std::net::UdpSocket を作成し、monoio の UdpSocket に変換
+        let std_socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
+        let socket = UdpSocket::from_std(std_socket)?;
+        let local_addr = socket.local_addr()?;
+        
+        let mut instance = Self {
+            socket,
+            gso_enabled: false,
+            gro_enabled: false,
+            local_addr,
+        };
+        
+        // GSO/GRO を設定
+        instance.configure_gso_gro()?;
+        
+        Ok(instance)
+    }
+
     /// GSO/GRO を設定
     fn configure_gso_gro(&mut self) -> io::Result<()> {
         #[cfg(target_os = "linux")]
@@ -300,7 +415,11 @@ impl QuicUdpSocket {
     /// 
     /// monoio は sendmsg を直接サポートしていないため、
     /// 非ブロッキングソケットで同期 API を使用します。
+    /// 
+    /// **非推奨**: `send_gso_async()` を使用してください。
+    /// この関数は EAGAIN を適切に処理しません。
     #[cfg(target_os = "linux")]
+    #[deprecated(since = "0.4.0", note = "Use send_gso_async() instead - this function does not handle EAGAIN properly")]
     pub async fn send_gso(&self, packets: &[&[u8]], target: SocketAddr) -> io::Result<usize> {
         if !self.gso_enabled || packets.is_empty() {
             // GSO 無効または空の場合は個別送信
@@ -323,6 +442,87 @@ impl QuicUdpSocket {
         // GSO 付き送信
         let result = self.send_with_gso_sync(&combined, segment_size, target)?;
         Ok(result.bytes_sent)
+    }
+
+    /// GSO を使用した非同期送信（EAGAIN 対応）
+    /// 
+    /// monoio は sendmsg を直接サポートしていないため、
+    /// 非ブロッキングソケットで同期 API を使用し、
+    /// EAGAIN/EWOULDBLOCK 時は writable().await で待機します。
+    /// 
+    /// # 引数
+    /// - `packets`: 送信するパケットのスライス
+    /// - `target`: 送信先アドレス
+    /// 
+    /// # 戻り値
+    /// - 送信されたバイト数
+    #[cfg(target_os = "linux")]
+    pub async fn send_gso_async(&self, packets: &[&[u8]], target: SocketAddr) -> io::Result<usize> {
+        if !self.gso_enabled || packets.is_empty() {
+            // GSO 無効または空の場合は個別送信
+            return self.send_packets_individually(packets, target).await;
+        }
+
+        // パケットを結合
+        let segment_size = packets.first().map(|p| p.len()).unwrap_or(GSO_SEGMENT_SIZE) as u16;
+        let combined = Self::combine_packets(packets);
+
+        // EAGAIN 対応ループ
+        loop {
+            match self.send_with_gso_sync(&combined, segment_size, target) {
+                Ok(result) => return Ok(result.bytes_sent),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // ソケットが書き込み可能になるまで待機
+                    self.socket.writable(false).await?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// GRO を使用した非同期受信（EAGAIN 対応）
+    /// 
+    /// 非ブロッキングソケットで recvmsg を使用し、
+    /// EAGAIN/EWOULDBLOCK 時は readable().await で待機します。
+    /// 
+    /// # 引数
+    /// - `buf`: 受信バッファ
+    /// 
+    /// # 戻り値
+    /// - 受信結果（バイト数、送信元アドレス、GRO セグメントサイズ）
+    #[cfg(target_os = "linux")]
+    pub async fn recv_gro_async(&self, buf: &mut [u8]) -> io::Result<GroRecvResult> {
+        loop {
+            match self.recv_with_gro_sync(buf) {
+                Ok(result) => return Ok(result),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // ソケットが読み込み可能になるまで待機
+                    self.socket.readable(false).await?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// パケットを個別に送信（GSO 無効時のフォールバック）
+    async fn send_packets_individually(&self, packets: &[&[u8]], target: SocketAddr) -> io::Result<usize> {
+        let mut total = 0;
+        for packet in packets {
+            let buf = packet.to_vec();
+            let (result, _) = self.socket.send_to(buf, target).await;
+            total += result?;
+        }
+        Ok(total)
+    }
+
+    /// パケットを結合
+    fn combine_packets(packets: &[&[u8]]) -> Vec<u8> {
+        let total_len: usize = packets.iter().map(|p| p.len()).sum();
+        let mut combined = Vec::with_capacity(total_len);
+        for packet in packets {
+            combined.extend_from_slice(packet);
+        }
+        combined
     }
 
     /// GSO が有効かどうか

@@ -30,6 +30,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use monoio::net::udp::UdpSocket;
+use crate::udp::QuicUdpSocket;
 use quiche::{h3, Config, ConnectionId};
 use quiche::h3::NameValue;
 use ring::rand::*;
@@ -1257,6 +1258,47 @@ impl Http3Handler {
 
         Ok(())
     }
+
+    /// 書き込み可能なストリームを処理（quiche パターン）
+    /// 
+    /// conn.writable() で書き込み可能になったストリームに対して、
+    /// 保留中の部分レスポンスを再送します。
+    fn handle_writable_streams(&mut self) -> io::Result<()> {
+        let h3_conn = match &mut self.h3_conn {
+            Some(h3) => h3,
+            None => return Ok(()),
+        };
+
+        // 書き込み可能なストリームを収集
+        let writable_streams: Vec<u64> = self.conn.writable().collect();
+        
+        for stream_id in writable_streams {
+            // 部分レスポンスがあるかチェック
+            if let Some((body, written)) = self.partial_responses.get_mut(&stream_id) {
+                if *written < body.len() {
+                    match h3_conn.send_body(&mut self.conn, stream_id, &body[*written..], true) {
+                        Ok(sent) => {
+                            debug!("[HTTP/3] Writable stream {}: sent {} more bytes ({}/{})", 
+                                stream_id, sent, *written + sent, body.len());
+                            *written += sent;
+                        }
+                        Err(h3::Error::Done) => {
+                            // まだブロックされている
+                            debug!("[HTTP/3] Stream {} still blocked", stream_id);
+                        }
+                        Err(e) => {
+                            warn!("[HTTP/3] send_body error on writable stream {}: {}", stream_id, e);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 完了したストリームを削除
+        self.partial_responses.retain(|_, (body, written)| *written < body.len());
+
+        Ok(())
+    }
 }
 
 // ====================
@@ -1477,6 +1519,10 @@ type ConnectionMap = Rc<RefCell<HashMap<ConnectionId<'static>, Http3Handler>>>;
 /// 
 /// 複数ワーカースレッドが同じポートでリッスンし、
 /// カーネルがフローに基づいてパケットを分散します。
+/// 
+/// **非推奨**: `QuicUdpSocket::bind_reuseport()` を使用してください。
+/// この関数は GSO/GRO を設定しません。
+#[allow(dead_code)]
 fn create_reuseport_udp_socket(bind_addr: SocketAddr) -> io::Result<UdpSocket> {
     use std::os::unix::io::FromRawFd;
     
@@ -1672,7 +1718,9 @@ pub async fn run_http3_server_async(
 
     // UDP ソケットを作成（monoio io_uring ベース）
     // SO_REUSEPORT を設定して複数ワーカーで並列処理を可能に
-    let socket = create_reuseport_udp_socket(bind_addr)?;
+    // QuicUdpSocket は GSO/GRO も自動設定
+    let socket = QuicUdpSocket::bind_reuseport(bind_addr)?;
+    info!("[HTTP/3] GSO enabled: {}, GRO enabled: {}", socket.gso_enabled(), socket.gro_enabled());
     let socket = Rc::new(socket);
     let local_addr = bind_addr;
 
@@ -1708,6 +1756,7 @@ pub async fn run_http3_server_async(
         };
 
         // タイムアウト付きでパケット受信
+        // QuicUdpSocket の recv_from メソッドを直接使用
         let recv_buf = vec![0u8; 65536];
         let recv_result = monoio::time::timeout(timeout_duration, socket.recv_from(recv_buf)).await;
 
@@ -1836,6 +1885,14 @@ pub async fn run_http3_server_async(
                         warn!("[HTTP/3] init_h3 error: {}", e);
                     }
 
+                    // 書き込み可能なストリームを処理（quiche パターン）
+                    // 部分レスポンスを再送する
+                    if handler.h3_conn.is_some() {
+                        if let Err(e) = handler.handle_writable_streams() {
+                            warn!("[HTTP/3] handle_writable_streams error: {}", e);
+                        }
+                    }
+
                     // HTTP/3 イベント処理
                     if handler.h3_conn.is_some() {
                         if let Err(e) = handler.process_h3_events() {
@@ -1857,7 +1914,7 @@ pub async fn run_http3_server_async(
 /// ACKやレスポンスパケットを送信します。
 async fn send_pending_packets(
     connections: &ConnectionMap,
-    socket: &Rc<UdpSocket>,
+    socket: &Rc<QuicUdpSocket>,
     _local_addr: SocketAddr,
 ) {
     let mut conns = connections.borrow_mut();
@@ -1882,14 +1939,20 @@ async fn send_pending_packets(
                 }
             };
 
+            debug!("[HTTP/3] Sending {} byte packet to {}", write, send_info.to);
             let send_data = send_buf[..write].to_vec();
             let socket_clone = socket.clone();
             let target = send_info.to;
             
             // 非同期送信（spawn しない、直接 await）
-            // monoio の UdpSocket は send_to が async
-            if let (Err(e), _) = socket_clone.send_to(send_data, target).await {
-                warn!("[HTTP/3] send_to error: {}", e);
+            // QuicUdpSocket の send_to メソッドを直接使用
+            match socket_clone.send_to(send_data, target).await {
+                (Ok(sent), _) => {
+                    debug!("[HTTP/3] Successfully sent {} bytes to {}", sent, target);
+                }
+                (Err(e), _) => {
+                    warn!("[HTTP/3] send_to error: {}", e);
+                }
             }
         }
 
