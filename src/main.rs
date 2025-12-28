@@ -3087,6 +3087,65 @@ const LARGE_REQUEST_BUF_SIZE: usize = 4096;
 /// パス文字列用バッファサイズ
 const PATH_STRING_SIZE: usize = 256;
 
+// ====================
+// バッファプール設定（config.toml対応）
+// ====================
+
+/// バッファプール設定
+/// 
+/// スレッドローカルバッファプールの設定。
+/// 起動時に事前確保され、リクエスト処理中のメモリ割り当てを削減します。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct BufferPoolConfig {
+    /// 読み込みバッファサイズ（バイト）
+    /// デフォルト: 65536 (64KB)
+    pub read_buffer_size: usize,
+    
+    /// 読み込みバッファ初期プール数
+    /// デフォルト: 32
+    pub initial_read_buffers: usize,
+    
+    /// 読み込みバッファ最大プール数
+    /// デフォルト: 128
+    pub max_read_buffers: usize,
+    
+    /// リクエスト構築バッファサイズ（バイト）
+    /// デフォルト: 1024 (1KB)
+    pub request_buffer_size: usize,
+    
+    /// リクエスト構築バッファ初期プール数
+    /// デフォルト: 16
+    pub initial_request_buffers: usize,
+    
+    /// 大容量リクエストバッファサイズ（バイト）
+    /// デフォルト: 4096 (4KB)
+    pub large_request_buffer_size: usize,
+    
+    /// パス文字列バッファサイズ（バイト）
+    /// デフォルト: 256
+    pub path_string_size: usize,
+    
+    /// レスポンスヘッダーバッファサイズ（バイト）
+    /// デフォルト: 512
+    pub response_header_buffer_size: usize,
+}
+
+impl Default for BufferPoolConfig {
+    fn default() -> Self {
+        Self {
+            read_buffer_size: BUF_SIZE,
+            initial_read_buffers: 32,
+            max_read_buffers: 128,
+            request_buffer_size: REQUEST_BUF_SIZE,
+            initial_request_buffers: 16,
+            large_request_buffer_size: LARGE_REQUEST_BUF_SIZE,
+            path_string_size: PATH_STRING_SIZE,
+            response_header_buffer_size: 512,
+        }
+    }
+}
+
 thread_local! {
     /// リクエスト構築用バッファプール（1KB × 16）
     static REQUEST_BUF_POOL: RefCell<Vec<Vec<u8>>> = RefCell::new(
@@ -3179,6 +3238,83 @@ fn response_header_buf_put(mut buf: Vec<u8>) {
             if pool.len() < 32 { pool.push(buf); }
         });
     }
+}
+
+// ====================
+// Serverヘッダー設定（ゼロアロケーション設計）
+// ====================
+//
+// Serverヘッダーの値を起動時/リロード時に設定し、
+// リクエスト処理中はゼロアロケーションで参照します。
+// Guard方式により、リロード中も安全に値を参照できます。
+// ====================
+
+/// Serverヘッダー値（起動時/リロード時に更新）
+/// Vec<u8>を使用（ArcSwapはSized型が必要）
+static SERVER_HEADER_VALUE: Lazy<arc_swap::ArcSwap<Vec<u8>>> = Lazy::new(|| {
+    arc_swap::ArcSwap::from(Arc::new(Vec::new()))
+});
+
+/// Serverヘッダー有効フラグ
+static SERVER_HEADER_ENABLED: std::sync::atomic::AtomicBool = 
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Serverヘッダー設定を安全に取得
+/// 
+/// Guardを返すことで、値がリクエスト処理中に無効化されないことを保証。
+/// Guardはスコープを抜けるまでArcを保持し続ける。
+#[inline]
+pub fn get_server_header_guard() -> Option<ServerHeaderGuard> {
+    if SERVER_HEADER_ENABLED.load(std::sync::atomic::Ordering::Acquire) {
+        let guard = SERVER_HEADER_VALUE.load();
+        if !guard.is_empty() {
+            Some(ServerHeaderGuard { guard })
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+/// Serverヘッダー値を保持するGuard
+/// 
+/// このGuardがスコープ内にある限り、ヘッダー値は有効。
+pub struct ServerHeaderGuard {
+    guard: arc_swap::Guard<Arc<Vec<u8>>>,
+}
+
+impl ServerHeaderGuard {
+    /// ヘッダータプルとして取得（ゼロコピー）
+    #[inline]
+    pub fn as_header(&self) -> (&'static [u8], &[u8]) {
+        (b"server", self.guard.as_slice())
+    }
+    
+    /// 値のスライスとして取得
+    #[inline]
+    #[allow(dead_code)]
+    pub fn value(&self) -> &[u8] {
+        self.guard.as_slice()
+    }
+}
+
+/// Serverヘッダー設定を初期化
+fn init_server_header(enabled: bool, value: &str) {
+    // 値を先に設定（順序重要: リロード時の競争状態防止）
+    if !value.is_empty() {
+        let value_bytes = Arc::new(value.as_bytes().to_vec());
+        SERVER_HEADER_VALUE.store(value_bytes);
+    }
+    
+    // 有効フラグを最後に設定（Release/Acquire順序で同期）
+    SERVER_HEADER_ENABLED.store(enabled, std::sync::atomic::Ordering::Release);
+    
+    info!(
+        "Server header: {} (value: {:?})",
+        if enabled { "enabled" } else { "disabled" },
+        if enabled { value } else { "" }
+    );
 }
 
 // ====================
@@ -3339,6 +3475,9 @@ struct Config {
     /// Prometheusメトリクス設定
     #[serde(default)]
     prometheus: PrometheusConfig,
+    /// バッファプール設定（メモリ最適化）
+    #[serde(default)]
+    buffer_pool: BufferPoolConfig,
     /// HTTP/2 設定セクション
     #[serde(default)]
     #[cfg_attr(not(feature = "http2"), allow(dead_code))]
@@ -3633,6 +3772,26 @@ struct ServerConfigSection {
     threads: Option<usize>,
     
     // ====================
+    // Serverヘッダー設定
+    // ====================
+    
+    /// Serverヘッダーを有効化（デフォルト: false）
+    /// 
+    /// セキュリティ考慮事項:
+    /// - Serverヘッダーはサーバーソフトウェア情報を公開します
+    /// - 攻撃者がバージョン別の脆弱性を狙う手がかりになり得ます
+    /// - 本番環境では無効化を推奨
+    #[serde(default)]
+    server_header_enabled: bool,
+    
+    /// Serverヘッダーの値（server_header_enabled = true時のみ有効）
+    /// 
+    /// デフォルト: "veil"
+    /// 空文字の場合: ヘッダー自体を送信しない
+    #[serde(default = "default_server_header_value")]
+    server_header_value: String,
+    
+    // ====================
     // HTTP/2・HTTP/3 設定
     // ====================
     
@@ -3668,6 +3827,11 @@ struct ServerConfigSection {
     #[serde(default)]
     #[cfg_attr(not(feature = "http3"), allow(dead_code))]
     http3_enabled: bool,
+}
+
+/// Serverヘッダーのデフォルト値
+fn default_server_header_value() -> String {
+    "veil".to_string()
 }
 
 #[derive(Deserialize)]
@@ -5215,6 +5379,12 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
     #[cfg(feature = "http3")]
     let http3_config = config.http3.clone();
 
+    // Serverヘッダー設定を更新（リロード対応）
+    init_server_header(
+        config.server.server_header_enabled,
+        &config.server.server_header_value,
+    );
+
     // Upstream グループを構築（ロードバランシング用）
     let mut upstream_groups: HashMap<String, Arc<UpstreamGroup>> = HashMap::new();
     if let Some(upstreams) = &config.upstreams {
@@ -5302,6 +5472,12 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     let http3_config = config.http3.clone();
     #[cfg(feature = "http3")]
     let http3_listen = http3_config.listen.clone();
+    
+    // Serverヘッダー設定を初期化
+    init_server_header(
+        config.server.server_header_enabled,
+        &config.server.server_header_value,
+    );
     
     // TLS設定（kTLS有効時はシークレット抽出を有効化、HTTP/2有効時はALPN設定）
     #[cfg(feature = "http2")]
@@ -7698,17 +7874,23 @@ where
         {
             // IPアドレス制限チェック
             if !prom_config.is_ip_allowed(client_ip) {
-                let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
-                let _ = conn.send_response(stream_id, 403, headers, Some(b"Forbidden")).await;
+                let server_guard = get_server_header_guard();
+                let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+                if let Some(ref g) = server_guard {
+                    headers.push(g.as_header());
+                }
+                let _ = conn.send_response(stream_id, 403, &headers, Some(b"Forbidden")).await;
                 return Some((403, 9));
             }
             
             let body = encode_prometheus_metrics();
-            let headers: &[(&[u8], &[u8])] = &[
-                (b"content-type", b"text/plain; version=0.0.4; charset=utf-8"),
-                (b"server", b"veil/http2"),
-            ];
-            if let Err(e) = conn.send_response(stream_id, 200, headers, Some(&body)).await {
+            let server_guard = get_server_header_guard();
+            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(3);
+            headers.push((b"content-type", b"text/plain; version=0.0.4; charset=utf-8"));
+            if let Some(ref g) = server_guard {
+                headers.push(g.as_header());
+            }
+            if let Err(e) = conn.send_response(stream_id, 200, &headers, Some(&body)).await {
                 warn!("[HTTP/2] Metrics response error: {}", e);
                 return None;
             }
@@ -7738,8 +7920,12 @@ where
                 String::from_utf8_lossy(authority),
                 String::from_utf8_lossy(path)
             );
-            let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
-            let _ = conn.send_response(stream_id, 400, headers, Some(b"Bad Request")).await;
+            let server_guard = get_server_header_guard();
+            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+            if let Some(ref g) = server_guard {
+                headers.push(g.as_header());
+            }
+            let _ = conn.send_response(stream_id, 400, &headers, Some(b"Bad Request")).await;
             return Some((400, 11));
         }
     };
@@ -7751,8 +7937,12 @@ where
     if check_result != SecurityCheckResult::Allowed {
         let status = check_result.status_code();
         let msg = check_result.message();
-        let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
-        let _ = conn.send_response(stream_id, status, headers, Some(msg)).await;
+        let server_guard = get_server_header_guard();
+        let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+        if let Some(ref g) = server_guard {
+            headers.push(g.as_header());
+        }
+        let _ = conn.send_response(stream_id, status, &headers, Some(msg)).await;
         return Some((status, msg.len() as u64));
     }
     
@@ -7798,10 +7988,13 @@ where
                 match wasm_result {
                     crate::wasm::FilterResult::LocalResponse(resp) => {
                         // ローカルレスポンスを返送
+                        let server_guard = get_server_header_guard();
                         let mut headers: Vec<(&[u8], &[u8])> = resp.headers.iter()
                             .map(|(k, v)| (k.as_bytes(), v.as_bytes()))
                             .collect();
-                        headers.push((b"server", b"veil/http2"));
+                        if let Some(ref g) = server_guard {
+                            headers.push(g.as_header());
+                        }
                         
                         let _ = conn.send_response(stream_id, resp.status_code, &headers, Some(&resp.body)).await;
                         return Some((resp.status_code, resp.body.len() as u64));
@@ -7846,15 +8039,21 @@ where
             
             let clean_remainder = remainder.trim_matches('/');
             if !clean_remainder.is_empty() {
-                let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
-                let _ = conn.send_response(stream_id, 404, headers, Some(b"Not Found")).await;
+                let server_guard = get_server_header_guard();
+                let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+                if let Some(ref g) = server_guard {
+                    headers.push(g.as_header());
+                }
+                let _ = conn.send_response(stream_id, 404, &headers, Some(b"Not Found")).await;
                 return Some((404, 9));
             }
             
-            let mut headers: Vec<(&[u8], &[u8])> = vec![
-                (b"content-type", mime_type.as_bytes()),
-                (b"server", b"veil/http2"),
-            ];
+            let server_guard = get_server_header_guard();
+            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(4);
+            headers.push((b"content-type", mime_type.as_bytes()));
+            if let Some(ref g) = server_guard {
+                headers.push(g.as_header());
+            }
             
             // セキュリティヘッダー追加
             let security_headers: Vec<(Vec<u8>, Vec<u8>)> = security.add_response_headers.iter()
@@ -7900,8 +8099,12 @@ where
     let server = match upstream_group.select(client_ip) {
         Some(s) => s,
         None => {
-            let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
-            let _ = conn.send_response(stream_id, 502, headers, Some(b"Bad Gateway")).await;
+            let server_guard = get_server_header_guard();
+            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+            if let Some(ref g) = server_guard {
+                headers.push(g.as_header());
+            }
+            let _ = conn.send_response(stream_id, 502, &headers, Some(b"Bad Gateway")).await;
             return Some((502, 11));
         }
     };
@@ -8022,13 +8225,21 @@ where
         }
         Ok(Err(e)) => {
             warn!("[HTTP/2] Backend connect error: {}", e);
-            let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
-            let _ = conn.send_response(stream_id, 502, headers, Some(b"Bad Gateway")).await;
+            let server_guard = get_server_header_guard();
+            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+            if let Some(ref g) = server_guard {
+                headers.push(g.as_header());
+            }
+            let _ = conn.send_response(stream_id, 502, &headers, Some(b"Bad Gateway")).await;
             return Some((502, 11));
         }
         Err(_) => {
-            let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
-            let _ = conn.send_response(stream_id, 504, headers, Some(b"Gateway Timeout")).await;
+            let server_guard = get_server_header_guard();
+            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+            if let Some(ref g) = server_guard {
+                headers.push(g.as_header());
+            }
+            let _ = conn.send_response(stream_id, 504, &headers, Some(b"Gateway Timeout")).await;
             return Some((504, 15));
         }
     };
@@ -8036,8 +8247,12 @@ where
     // リクエスト送信
     let (write_res, _) = backend.write_all(request).await;
     if write_res.is_err() {
-        let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
-        let _ = conn.send_response(stream_id, 502, headers, Some(b"Bad Gateway")).await;
+        let server_guard = get_server_header_guard();
+        let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+        if let Some(ref g) = server_guard {
+            headers.push(g.as_header());
+        }
+        let _ = conn.send_response(stream_id, 502, &headers, Some(b"Bad Gateway")).await;
         return Some((502, 11));
     }
     
@@ -8051,8 +8266,12 @@ where
         let (res, mut returned_buf) = match read_result {
             Ok(r) => r,
             Err(_) => {
-                let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
-                let _ = conn.send_response(stream_id, 504, headers, Some(b"Gateway Timeout")).await;
+                let server_guard = get_server_header_guard();
+                let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+                if let Some(ref g) = server_guard {
+                    headers.push(g.as_header());
+                }
+                let _ = conn.send_response(stream_id, 504, &headers, Some(b"Gateway Timeout")).await;
                 return Some((504, 15));
             }
         };
@@ -8065,8 +8284,12 @@ where
             Ok(n) => n,
             Err(_) => {
                 buf_put(returned_buf);
-                let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
-                let _ = conn.send_response(stream_id, 502, headers, Some(b"Bad Gateway")).await;
+                let server_guard = get_server_header_guard();
+                let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+                if let Some(ref g) = server_guard {
+                    headers.push(g.as_header());
+                }
+                let _ = conn.send_response(stream_id, 502, &headers, Some(b"Bad Gateway")).await;
                 return Some((502, 11));
             }
         };
@@ -8158,8 +8381,11 @@ where
             );
             
             // HTTP/2用のヘッダーを構築（ホップバイホップヘッダー除外）
+            let server_guard = get_server_header_guard();
             let mut h2_headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(16);
-            h2_headers.push((b"server", b"veil/http2"));
+            if let Some(ref g) = server_guard {
+                h2_headers.push(g.as_header());
+            }
             
             // 圧縮が有効な場合は Content-Encoding を追加
             let encoding_value: Vec<u8>;
@@ -8216,15 +8442,23 @@ where
         
         // ヘッダーが大きすぎる
         if response_buf.len() > MAX_HEADER_SIZE {
-            let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
-            let _ = conn.send_response(stream_id, 502, headers, Some(b"Bad Gateway")).await;
+            let server_guard = get_server_header_guard();
+            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+            if let Some(ref g) = server_guard {
+                headers.push(g.as_header());
+            }
+            let _ = conn.send_response(stream_id, 502, &headers, Some(b"Bad Gateway")).await;
             return Some((502, 11));
         }
     }
     
     // ストリーム終了（空レスポンス）
-    let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
-    let _ = conn.send_response(stream_id, 502, headers, Some(b"Bad Gateway")).await;
+    let server_guard = get_server_header_guard();
+    let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+    if let Some(ref g) = server_guard {
+        headers.push(g.as_header());
+    }
+    let _ = conn.send_response(stream_id, 502, &headers, Some(b"Bad Gateway")).await;
     Some((502, 11))
 }
 
@@ -8252,13 +8486,21 @@ where
         }
         Ok(Err(e)) => {
             warn!("[HTTP/2] Backend connect error: {}", e);
-            let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
-            let _ = conn.send_response(stream_id, 502, headers, Some(b"Bad Gateway")).await;
+            let server_guard = get_server_header_guard();
+            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+            if let Some(ref g) = server_guard {
+                headers.push(g.as_header());
+            }
+            let _ = conn.send_response(stream_id, 502, &headers, Some(b"Bad Gateway")).await;
             return Some((502, 11));
         }
         Err(_) => {
-            let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
-            let _ = conn.send_response(stream_id, 504, headers, Some(b"Gateway Timeout")).await;
+            let server_guard = get_server_header_guard();
+            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+            if let Some(ref g) = server_guard {
+                headers.push(g.as_header());
+            }
+            let _ = conn.send_response(stream_id, 504, &headers, Some(b"Gateway Timeout")).await;
             return Some((504, 15));
         }
     };
@@ -8271,13 +8513,21 @@ where
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => {
             warn!("[HTTP/2] TLS handshake error: {}", e);
-            let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
-            let _ = conn.send_response(stream_id, 502, headers, Some(b"Bad Gateway")).await;
+            let server_guard = get_server_header_guard();
+            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+            if let Some(ref g) = server_guard {
+                headers.push(g.as_header());
+            }
+            let _ = conn.send_response(stream_id, 502, &headers, Some(b"Bad Gateway")).await;
             return Some((502, 11));
         }
         Err(_) => {
-            let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
-            let _ = conn.send_response(stream_id, 504, headers, Some(b"Gateway Timeout")).await;
+            let server_guard = get_server_header_guard();
+            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+            if let Some(ref g) = server_guard {
+                headers.push(g.as_header());
+            }
+            let _ = conn.send_response(stream_id, 504, &headers, Some(b"Gateway Timeout")).await;
             return Some((504, 15));
         }
     };
@@ -8285,8 +8535,12 @@ where
     // リクエスト送信
     let (write_res, _) = backend.write_all(request).await;
     if write_res.is_err() {
-        let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
-        let _ = conn.send_response(stream_id, 502, headers, Some(b"Bad Gateway")).await;
+        let server_guard = get_server_header_guard();
+        let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+        if let Some(ref g) = server_guard {
+            headers.push(g.as_header());
+        }
+        let _ = conn.send_response(stream_id, 502, &headers, Some(b"Bad Gateway")).await;
         return Some((502, 11));
     }
     
@@ -8300,8 +8554,12 @@ where
         let (res, mut returned_buf) = match read_result {
             Ok(r) => r,
             Err(_) => {
-                let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
-                let _ = conn.send_response(stream_id, 504, headers, Some(b"Gateway Timeout")).await;
+                let server_guard = get_server_header_guard();
+                let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+                if let Some(ref g) = server_guard {
+                    headers.push(g.as_header());
+                }
+                let _ = conn.send_response(stream_id, 504, &headers, Some(b"Gateway Timeout")).await;
                 return Some((504, 15));
             }
         };
@@ -8403,8 +8661,11 @@ where
             );
             
             // HTTP/2用のヘッダーを構築
+            let server_guard = get_server_header_guard();
             let mut h2_headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(16);
-            h2_headers.push((b"server", b"veil/http2"));
+            if let Some(ref g) = server_guard {
+                h2_headers.push(g.as_header());
+            }
             
             // 圧縮が有効な場合は Content-Encoding を追加
             let encoding_value: Vec<u8>;
@@ -8462,8 +8723,12 @@ where
         }
     }
     
-    let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
-    let _ = conn.send_response(stream_id, 502, headers, Some(b"Bad Gateway")).await;
+    let server_guard = get_server_header_guard();
+    let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+    if let Some(ref g) = server_guard {
+        headers.push(g.as_header());
+    }
+    let _ = conn.send_response(stream_id, 502, &headers, Some(b"Bad Gateway")).await;
     Some((502, 11))
 }
 
@@ -8605,8 +8870,12 @@ where
     
     // パストラバーサル防止
     if clean_sub.contains("..") {
-        let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
-        let _ = conn.send_response(stream_id, 403, headers, Some(b"Forbidden")).await;
+        let server_guard = get_server_header_guard();
+        let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+        if let Some(ref g) = server_guard {
+            headers.push(g.as_header());
+        }
+        let _ = conn.send_response(stream_id, 403, &headers, Some(b"Forbidden")).await;
         return Some((403, 9));
     }
     
@@ -8624,8 +8893,12 @@ where
         p
     } else {
         if !clean_sub.is_empty() {
-            let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
-            let _ = conn.send_response(stream_id, 404, headers, Some(b"Not Found")).await;
+            let server_guard = get_server_header_guard();
+            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+            if let Some(ref g) = server_guard {
+                headers.push(g.as_header());
+            }
+            let _ = conn.send_response(stream_id, 404, &headers, Some(b"Not Found")).await;
             return Some((404, 9));
         }
         base_path.clone()
@@ -8635,8 +8908,12 @@ where
     let data = match std::fs::read(&file_path) {
         Ok(d) => d,
         Err(_) => {
-            let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
-            let _ = conn.send_response(stream_id, 404, headers, Some(b"Not Found")).await;
+            let server_guard = get_server_header_guard();
+            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+            if let Some(ref g) = server_guard {
+                headers.push(g.as_header());
+            }
+            let _ = conn.send_response(stream_id, 404, &headers, Some(b"Not Found")).await;
             return Some((404, 9));
         }
     };
@@ -8644,10 +8921,12 @@ where
     let mime_type = mime_guess::from_path(&file_path).first_or_octet_stream();
     let mime_str = mime_type.as_ref();
     
-    let mut headers: Vec<(&[u8], &[u8])> = vec![
-        (b"content-type", mime_str.as_bytes()),
-        (b"server", b"veil/http2"),
-    ];
+    let server_guard = get_server_header_guard();
+    let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(4);
+    headers.push((b"content-type", mime_str.as_bytes()));
+    if let Some(ref g) = server_guard {
+        headers.push(g.as_header());
+    }
     
     // セキュリティヘッダー追加
     let security_headers: Vec<(Vec<u8>, Vec<u8>)> = security.add_response_headers.iter()
@@ -8706,12 +8985,14 @@ where
         }
     }
     
-    let headers: &[(&[u8], &[u8])] = &[
-        (b"location", final_url.as_bytes()),
-        (b"server", b"veil/http2"),
-    ];
+    let server_guard = get_server_header_guard();
+    let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(3);
+    headers.push((b"location", final_url.as_bytes()));
+    if let Some(ref g) = server_guard {
+        headers.push(g.as_header());
+    }
     
-    if let Err(e) = conn.send_response(stream_id, status_code, headers, None).await {
+    if let Err(e) = conn.send_response(stream_id, status_code, &headers, None).await {
         warn!("[HTTP/2] Redirect response error: {}", e);
         return None;
     }
