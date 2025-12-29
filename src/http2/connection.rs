@@ -452,6 +452,9 @@ where
         let headers = self.hpack_decoder.decode(&header_block)
             .map_err(|e| Http2Error::compression_error(e.to_string()))?;
 
+        // ヘッダーを検証 (RFC 7540 Section 8.1.2)
+        Self::validate_request_headers(&headers, stream_id, false)?;
+
         let stream = self.streams.get(stream_id).unwrap();
         stream.request_headers = headers;
 
@@ -459,6 +462,165 @@ where
         if let Some(cl) = stream.request_headers.iter().find(|h| h.name == b"content-length") {
             if let Some(len) = std::str::from_utf8(&cl.value).ok().and_then(|s| s.parse::<u64>().ok()) {
                 stream.content_length = Some(len);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// リクエストヘッダーを検証 (RFC 7540 Section 8.1.2)
+    ///
+    /// バリデーション項目:
+    /// - ヘッダー名の大文字チェック (8.1.2)
+    /// - 擬似ヘッダーの順序 (8.1.2.1)
+    /// - 必須擬似ヘッダーの存在確認 (8.1.2.3)
+    /// - 擬似ヘッダーの重複チェック (8.1.2.3)
+    /// - 接続固有ヘッダーの禁止 (8.1.2.2)
+    /// - TE ヘッダーの値チェック (8.1.2.2)
+    fn validate_request_headers(
+        headers: &[crate::http2::hpack::HeaderField],
+        stream_id: u32,
+        is_trailer: bool,
+    ) -> Http2Result<()> {
+        let mut seen_regular = false;
+        let mut method_count = 0u8;
+        let mut scheme_count = 0u8;
+        let mut path_count = 0u8;
+        let mut authority_count = 0u8;
+
+        for header in headers {
+            let name = &header.name;
+
+            // ヘッダー名に大文字が含まれていないことを確認 (RFC 7540 8.1.2)
+            if name.iter().any(|&b| b.is_ascii_uppercase()) {
+                return Err(Http2Error::stream_error(
+                    stream_id,
+                    Http2ErrorCode::ProtocolError,
+                    "Header name contains uppercase characters",
+                ));
+            }
+
+            if name.starts_with(b":") {
+                // 擬似ヘッダーの処理
+
+                // トレーラーに擬似ヘッダーは禁止 (RFC 7540 8.1.2.1)
+                if is_trailer {
+                    return Err(Http2Error::stream_error(
+                        stream_id,
+                        Http2ErrorCode::ProtocolError,
+                        "Pseudo-header in trailer",
+                    ));
+                }
+
+                // 通常ヘッダーの後に擬似ヘッダーは禁止 (RFC 7540 8.1.2.1)
+                if seen_regular {
+                    return Err(Http2Error::stream_error(
+                        stream_id,
+                        Http2ErrorCode::ProtocolError,
+                        "Pseudo-header after regular header",
+                    ));
+                }
+
+                match name.as_slice() {
+                    b":method" => {
+                        method_count += 1;
+                    }
+                    b":scheme" => {
+                        scheme_count += 1;
+                    }
+                    b":path" => {
+                        path_count += 1;
+                        // 空の :path は禁止 (RFC 7540 8.1.2.3)
+                        if header.value.is_empty() {
+                            return Err(Http2Error::stream_error(
+                                stream_id,
+                                Http2ErrorCode::ProtocolError,
+                                "Empty :path pseudo-header",
+                            ));
+                        }
+                    }
+                    b":authority" => {
+                        authority_count += 1;
+                    }
+                    b":status" => {
+                        // リクエストにレスポンス用擬似ヘッダーは禁止 (RFC 7540 8.1.2.1)
+                        return Err(Http2Error::stream_error(
+                            stream_id,
+                            Http2ErrorCode::ProtocolError,
+                            "Response pseudo-header :status in request",
+                        ));
+                    }
+                    _ => {
+                        // 未知の擬似ヘッダーは禁止 (RFC 7540 8.1.2.1)
+                        return Err(Http2Error::stream_error(
+                            stream_id,
+                            Http2ErrorCode::ProtocolError,
+                            "Unknown pseudo-header",
+                        ));
+                    }
+                }
+            } else {
+                // 通常ヘッダーの処理
+                seen_regular = true;
+
+                // 接続固有ヘッダーの禁止 (RFC 7540 8.1.2.2)
+                let lower = name.to_ascii_lowercase();
+                match lower.as_slice() {
+                    b"connection" | b"keep-alive" | b"proxy-connection" 
+                    | b"transfer-encoding" | b"upgrade" => {
+                        return Err(Http2Error::stream_error(
+                            stream_id,
+                            Http2ErrorCode::ProtocolError,
+                            "Connection-specific header field",
+                        ));
+                    }
+                    b"te" => {
+                        // TE ヘッダーは "trailers" 以外禁止 (RFC 7540 8.1.2.2)
+                        if header.value.to_ascii_lowercase() != b"trailers" {
+                            return Err(Http2Error::stream_error(
+                                stream_id,
+                                Http2ErrorCode::ProtocolError,
+                                "TE header with value other than 'trailers'",
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // 必須擬似ヘッダーの確認 (RFC 7540 8.1.2.3)
+        // トレーラーでは擬似ヘッダーは不要
+        if !is_trailer {
+            // :method, :scheme, :path は必須かつ1つのみ
+            if method_count != 1 {
+                return Err(Http2Error::stream_error(
+                    stream_id,
+                    Http2ErrorCode::ProtocolError,
+                    if method_count == 0 { "Missing :method pseudo-header" } else { "Duplicate :method pseudo-header" },
+                ));
+            }
+            if scheme_count != 1 {
+                return Err(Http2Error::stream_error(
+                    stream_id,
+                    Http2ErrorCode::ProtocolError,
+                    if scheme_count == 0 { "Missing :scheme pseudo-header" } else { "Duplicate :scheme pseudo-header" },
+                ));
+            }
+            if path_count != 1 {
+                return Err(Http2Error::stream_error(
+                    stream_id,
+                    Http2ErrorCode::ProtocolError,
+                    if path_count == 0 { "Missing :path pseudo-header" } else { "Duplicate :path pseudo-header" },
+                ));
+            }
+            // :authority は任意だが複数は禁止
+            if authority_count > 1 {
+                return Err(Http2Error::stream_error(
+                    stream_id,
+                    Http2ErrorCode::ProtocolError,
+                    "Duplicate :authority pseudo-header",
+                ));
             }
         }
 
