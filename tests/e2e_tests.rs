@@ -134,7 +134,7 @@ fn is_e2e_environment_ready() -> bool {
 fn init_crypto_provider() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
-        CryptoProvider::install_default(rustls::crypto::ring::default_provider())
+        CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
             .expect("Failed to install rustls crypto provider");
     });
 }
@@ -174,7 +174,7 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
+        rustls::crypto::aws_lc_rs::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
             .to_vec()

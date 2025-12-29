@@ -296,7 +296,7 @@ pub fn set_tcp_cork(fd: RawFd, enable: bool) -> io::Result<()> {
 /// # 注意
 /// ChaCha20-Poly1305 は Linux 5.11+ が必要なため含まれていません。
 pub fn ktls_compatible_cipher_suites() -> Vec<rustls::SupportedCipherSuite> {
-    use rustls::crypto::ring::cipher_suite;
+    use rustls::crypto::aws_lc_rs::cipher_suite;
     vec![
         // TLS 1.3 AES-GCM
         cipher_suite::TLS13_AES_128_GCM_SHA256,

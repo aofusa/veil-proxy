@@ -5432,7 +5432,7 @@ fn load_tls_config(
             info!("kTLS enabled: using only compatible cipher suites (AES-GCM)");
             
             ServerConfig::builder_with_provider(
-                rustls::crypto::ring::default_provider().into()
+                rustls::crypto::aws_lc_rs::default_provider().into()
             )
             .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("TLS version error: {}", e)))?
@@ -6558,8 +6558,8 @@ fn main() {
         }
     }
     
-    // プロセスレベルで暗号プロバイダーをインストール（ring使用）
-    CryptoProvider::install_default(rustls::crypto::ring::default_provider())
+    // プロセスレベルで暗号プロバイダーをインストール（aws-lc-rs使用）
+    CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
         .expect("Failed to install rustls crypto provider");
     
     // ログ設定を先に読み込む（ログ初期化前）
