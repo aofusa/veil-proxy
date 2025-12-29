@@ -4256,6 +4256,118 @@ fn calculate_optimal_chunk_size(file_size: u64) -> usize {
     }
 }
 
+// ====================
+// HTTP/1.1 RFC準拠ヘルパー関数
+// ====================
+
+/// HTTP/1.1 100 Continue レスポンス
+const HTTP_100_CONTINUE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
+
+/// Via ヘッダーを追加 (RFC 7230 Section 5.7.1)
+/// 
+/// プロキシ経由のリクエスト/レスポンスにViaヘッダーを追加します。
+/// 既存のViaヘッダーがある場合は値を追加します。
+/// 
+/// # Arguments
+/// * `headers` - ヘッダーのリスト (name, value) ペア
+/// * `hostname` - プロキシのホスト名
+/// 
+/// # 形式
+/// `Via: 1.1 <hostname>`
+#[allow(dead_code)]
+fn add_via_header(headers: &mut Vec<(Vec<u8>, Vec<u8>)>, hostname: &str) {
+    let via_value = format!("1.1 {}", hostname).into_bytes();
+    
+    // 既存のViaヘッダーを検索
+    if let Some(pos) = headers.iter().position(|(n, _)| n.eq_ignore_ascii_case(b"via")) {
+        // 既存のViaヘッダーに追加
+        let existing = &headers[pos].1;
+        let combined = format!("{}, 1.1 {}", 
+            String::from_utf8_lossy(existing), hostname);
+        headers[pos].1 = combined.into_bytes();
+    } else {
+        // 新規Viaヘッダーを追加
+        headers.push((b"via".to_vec(), via_value));
+    }
+}
+
+/// HTTP/1.1 ヘッダー検証 (RFC 7230 Section 3.3.3)
+/// 
+/// Content-Length と Transfer-Encoding の競合をチェックします。
+/// 両方が存在する場合はプロトコルエラーです。
+/// 
+/// # Returns
+/// * `Ok(())` - ヘッダーが有効
+/// * `Err(String)` - エラーメッセージ
+#[allow(dead_code)]
+fn validate_http_headers(headers: &[(impl AsRef<[u8]>, impl AsRef<[u8]>)]) -> Result<(), String> {
+    let mut has_content_length = false;
+    let mut has_transfer_encoding = false;
+    
+    for (name, _value) in headers {
+        let name = name.as_ref();
+        if name.eq_ignore_ascii_case(b"content-length") {
+            has_content_length = true;
+        } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
+            has_transfer_encoding = true;
+        }
+    }
+    
+    // RFC 7230 Section 3.3.3: 
+    // Content-Length と Transfer-Encoding が両方存在する場合はエラー
+    if has_content_length && has_transfer_encoding {
+        return Err("Both Content-Length and Transfer-Encoding headers present".to_string());
+    }
+    
+    Ok(())
+}
+
+/// Expect: 100-continue ヘッダーをチェック (RFC 7231 Section 5.1.1)
+/// 
+/// # Returns
+/// * `true` - 100 Continue レスポンスを送信すべき
+/// * `false` - 通常のリクエスト処理を継続
+#[allow(dead_code)]
+fn check_expect_continue(headers: &[(impl AsRef<[u8]>, impl AsRef<[u8]>)]) -> bool {
+    for (name, value) in headers {
+        let name = name.as_ref();
+        let value = value.as_ref();
+        if name.eq_ignore_ascii_case(b"expect") && value.eq_ignore_ascii_case(b"100-continue") {
+            return true;
+        }
+    }
+    false
+}
+
+/// ヘッダー数の上限をチェックし、必要に応じて拡張
+/// 
+/// HTTP/1.1ではヘッダー数に明確な制限はありませんが、
+/// DoS対策として上限を設けつつ、動的に拡張可能にします。
+/// 
+/// # Arguments
+/// * `current_count` - 現在のヘッダー数
+/// * `max_headers` - 最大ヘッダー数
+/// 
+/// # Returns
+/// * `Ok(new_max)` - 拡張後の最大ヘッダー数
+/// * `Err(String)` - 上限超過エラー
+#[allow(dead_code)]
+fn check_header_count(current_count: usize, max_headers: usize) -> Result<usize, String> {
+    const ABSOLUTE_MAX: usize = 1024;
+    
+    if current_count < max_headers {
+        return Ok(max_headers);
+    }
+    
+    // 上限に達した場合、倍に拡張（最大1024まで）
+    let new_max = std::cmp::min(max_headers * 2, ABSOLUTE_MAX);
+    if new_max > max_headers {
+        Ok(new_max)
+    } else {
+        Err(format!("Header count exceeds maximum limit of {}", ABSOLUTE_MAX))
+    }
+}
+
 #[derive(Clone)]
 enum BackendConfig {
     /// 単一URLプロキシ（後方互換性のため維持）
@@ -16260,4 +16372,95 @@ mod tests {
             assert!(!config.healthy_statuses.contains(&204));
         }
     }
+
+    // ====================
+    // HTTP/1.1 RFC準拠ヘルパー関数テスト
+    // ====================
+    
+    mod http11_tests {
+        use super::*;
+
+        #[test]
+        fn test_add_via_header_new() {
+            let mut headers: Vec<(Vec<u8>, Vec<u8>)> = vec![
+                (b"host".to_vec(), b"example.com".to_vec()),
+            ];
+            add_via_header(&mut headers, "proxy.example.com");
+            
+            assert_eq!(headers.len(), 2);
+            assert_eq!(headers[1].0, b"via".to_vec());
+            assert_eq!(headers[1].1, b"1.1 proxy.example.com".to_vec());
+        }
+
+        #[test]
+        fn test_add_via_header_existing() {
+            let mut headers: Vec<(Vec<u8>, Vec<u8>)> = vec![
+                (b"via".to_vec(), b"1.1 first-proxy".to_vec()),
+            ];
+            add_via_header(&mut headers, "second-proxy");
+            
+            assert_eq!(headers.len(), 1);
+            assert_eq!(headers[0].1, b"1.1 first-proxy, 1.1 second-proxy".to_vec());
+        }
+
+        #[test]
+        fn test_validate_http_headers_valid() {
+            let headers: Vec<(Vec<u8>, Vec<u8>)> = vec![
+                (b"content-length".to_vec(), b"100".to_vec()),
+            ];
+            assert!(validate_http_headers(&headers).is_ok());
+        }
+
+        #[test]
+        fn test_validate_http_headers_valid_transfer_encoding() {
+            let headers: Vec<(Vec<u8>, Vec<u8>)> = vec![
+                (b"transfer-encoding".to_vec(), b"chunked".to_vec()),
+            ];
+            assert!(validate_http_headers(&headers).is_ok());
+        }
+
+        #[test]
+        fn test_validate_http_headers_conflict() {
+            let headers: Vec<(Vec<u8>, Vec<u8>)> = vec![
+                (b"content-length".to_vec(), b"100".to_vec()),
+                (b"transfer-encoding".to_vec(), b"chunked".to_vec()),
+            ];
+            assert!(validate_http_headers(&headers).is_err());
+        }
+
+        #[test]
+        fn test_check_expect_continue_true() {
+            let headers: Vec<(Vec<u8>, Vec<u8>)> = vec![
+                (b"expect".to_vec(), b"100-continue".to_vec()),
+            ];
+            assert!(check_expect_continue(&headers));
+        }
+
+        #[test]
+        fn test_check_expect_continue_false() {
+            let headers: Vec<(Vec<u8>, Vec<u8>)> = vec![
+                (b"host".to_vec(), b"example.com".to_vec()),
+            ];
+            assert!(!check_expect_continue(&headers));
+        }
+
+        #[test]
+        fn test_check_header_count_within_limit() {
+            assert!(check_header_count(50, 64).is_ok());
+        }
+
+        #[test]
+        fn test_check_header_count_expansion() {
+            let result = check_header_count(64, 64);
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), 128);
+        }
+
+        #[test]
+        fn test_check_header_count_max_limit() {
+            let result = check_header_count(1024, 1024);
+            assert!(result.is_err());
+        }
+    }
 }
+
