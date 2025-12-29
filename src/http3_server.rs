@@ -283,7 +283,7 @@ impl Http3Handler {
     }
 
     /// HTTP/3 イベントを処理
-    fn process_h3_events(&mut self) -> io::Result<()> {
+    async fn process_h3_events(&mut self) -> io::Result<()> {
         // 処理するリクエストを収集（ストリームID → (ヘッダー, ボディ)）
         let mut pending_requests: Vec<(u64, Vec<h3::Header>, Vec<u8>)> = Vec::new();
         // ストリームごとのボディバッファ
@@ -341,7 +341,7 @@ impl Http3Handler {
 
         // リクエストを処理
         for (stream_id, headers, body) in pending_requests {
-            self.handle_request(stream_id, &headers, &body)?;
+            self.handle_request(stream_id, &headers, &body).await?;
         }
 
         // 部分的なレスポンスを送信
@@ -353,7 +353,7 @@ impl Http3Handler {
     /// HTTP/3 リクエストを処理（完全版）
     /// 
     /// HTTP/1.1と同等のルーティング・セキュリティ・プロキシ機能をサポート。
-    fn handle_request(&mut self, stream_id: u64, headers: &[h3::Header], request_body: &[u8]) -> io::Result<()> {
+    async fn handle_request(&mut self, stream_id: u64, headers: &[h3::Header], request_body: &[u8]) -> io::Result<()> {
         // HTTP/3コネクションが確立されていなければ何もしない
         if self.h3_conn.is_none() {
             return Ok(());
@@ -543,7 +543,7 @@ impl Http3Handler {
                     &config.http3_config,
                 );
                 
-                let result = self.handle_proxy(stream_id, &upstream_group, &effective_compression, client_encoding, &method, &path, &prefix, headers, request_body)
+                let result = self.handle_proxy(stream_id, &upstream_group, &effective_compression, client_encoding, &method, &path, &prefix, headers, request_body).await
                     .unwrap_or((502, 11));
                 debug!("[HTTP/3] Proxy request completed: status={}, size={}", result.0, result.1);
                 result
@@ -707,7 +707,7 @@ impl Http3Handler {
     /// 
     /// HTTP/3からのリクエストをバックエンドに転送します。
     /// バックエンドがHTTP/3に対応していない場合は、HTTP/2またはHTTP/1.1にフォールバックします。
-    fn handle_proxy(
+    async fn handle_proxy(
         &mut self,
         stream_id: u64,
         upstream_group: &Arc<UpstreamGroup>,
@@ -797,290 +797,45 @@ impl Http3Handler {
         request.extend_from_slice(b"Connection: close\r\n\r\n");
         request.extend_from_slice(request_body);
         
-        // 同期的なブロッキングI/Oでバックエンドに接続
-        // monoioはthread-per-coreモデルなので、同期I/Oも許容される
-        // ただし、本番環境では非同期版が推奨
-        let result = self.proxy_to_backend_sync(stream_id, target, request, compression, client_encoding);
+        // 非同期プロキシ処理（monoio TcpStream使用）
+        // io_uringベースの非同期I/Oでバックエンド通信を行う
+        let timeout_secs = 30;
+        let proxy_result = proxy_to_backend_async(target, request, timeout_secs).await;
         
         server.release();
-        result
-    }
-    
-    /// バックエンドへの同期プロキシ処理
-    /// 
-    /// HTTP/3コネクションはUDPベースですが、バックエンドへの接続はTCPを使用します。
-    /// std::net::TcpStreamを使用して同期的に接続し、レスポンスを受信します。
-    fn proxy_to_backend_sync(
-        &mut self,
-        stream_id: u64,
-        target: &ProxyTarget,
-        request: Vec<u8>,
-        compression: &CompressionConfig,
-        client_encoding: AcceptedEncoding,
-    ) -> io::Result<(u16, usize)> {
-        use std::io::{Read, Write};
-        use std::net::TcpStream;
         
-        debug!("[HTTP/3] Connecting to backend {}:{} (TLS: {})", target.host, target.port, target.use_tls);
-        
-        // バックエンドに接続（同期）
-        // DNS解決を行い、タイムアウト付きで接続
-        let addr = format!("{}:{}", target.host, target.port);
-        
-        // DNS解決（ToSocketAddrs を使用）
-        use std::net::ToSocketAddrs;
-        let socket_addr = match addr.to_socket_addrs() {
-            Ok(mut addrs) => match addrs.next() {
-                Some(a) => a,
-                None => {
-                    warn!("[HTTP/3] No addresses found for {}", addr);
-                    self.send_error_response(stream_id, 502, b"Bad Gateway")?;
-                    return Ok((502, 11));
-                }
-            },
-            Err(e) => {
-                warn!("[HTTP/3] DNS resolution error for {}: {}", addr, e);
-                self.send_error_response(stream_id, 502, b"Bad Gateway")?;
-                return Ok((502, 11));
-            }
-        };
-        
-        debug!("[HTTP/3] Resolved {} to {}", addr, socket_addr);
-        
-        let mut backend = match TcpStream::connect_timeout(
-            &socket_addr,
-            Duration::from_secs(10),
-        ) {
-            Ok(stream) => {
-                let _ = stream.set_nodelay(true);
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-                let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
-                debug!("[HTTP/3] Connected to backend {}", socket_addr);
-                stream
-            }
-            Err(e) => {
-                warn!("[HTTP/3] Backend connect error to {}: {}", addr, e);
-                self.send_error_response(stream_id, 502, b"Bad Gateway")?;
-                return Ok((502, 11));
-            }
-        };
-        
-        // TLSバックエンドの場合
-        if target.use_tls {
-            // rustlsを使用したTLS接続
-            let result = self.proxy_to_tls_backend_sync(stream_id, target, request, backend, compression, client_encoding);
-            return result;
-        }
-        
-        // リクエスト送信
-        if let Err(e) = backend.write_all(&request) {
-            warn!("[HTTP/3] Backend write error: {}", e);
-            self.send_error_response(stream_id, 502, b"Bad Gateway")?;
-            return Ok((502, 11));
-        }
-        
-        // レスポンス受信
-        let mut response = Vec::with_capacity(16384);
-        let mut buf = [0u8; 8192];
-        
-        loop {
-            match backend.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => response.extend_from_slice(&buf[..n]),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(e) if e.kind() == io::ErrorKind::TimedOut => break,
-                Err(e) => {
-                    warn!("[HTTP/3] Backend read error: {}", e);
-                    if response.is_empty() {
-                        self.send_error_response(stream_id, 502, b"Bad Gateway")?;
-                        return Ok((502, 11));
-                    }
-                    break;
-                }
-            }
-        }
-        
-        // HTTPレスポンスをパース
-        self.parse_and_send_response(stream_id, &response, compression, client_encoding)
-    }
-    
-    /// TLSバックエンドへの同期プロキシ処理
-    fn proxy_to_tls_backend_sync(
-        &mut self,
-        stream_id: u64,
-        target: &ProxyTarget,
-        request: Vec<u8>,
-        mut tcp_stream: std::net::TcpStream,
-        compression: &CompressionConfig,
-        client_encoding: AcceptedEncoding,
-    ) -> io::Result<(u16, usize)> {
-        use std::io::{Read, Write};
-        use rustls::ClientConfig;
-        use std::sync::Arc;
-        
-        // rustls クライアント設定
-        let root_store = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
-        
-        let config = ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        
-        let config = Arc::new(config);
-        
-        // SNI名を決定
-        let sni_name = target.sni_name.as_deref().unwrap_or(&target.host);
-        let server_name = match rustls::pki_types::ServerName::try_from(sni_name.to_string()) {
-            Ok(name) => name,
-            Err(e) => {
-                warn!("[HTTP/3] Invalid SNI name: {}", e);
-                self.send_error_response(stream_id, 502, b"Bad Gateway")?;
-                return Ok((502, 11));
-            }
-        };
-        
-        let mut tls_conn = match rustls::ClientConnection::new(config, server_name) {
-            Ok(conn) => conn,
-            Err(e) => {
-                warn!("[HTTP/3] TLS connection error: {}", e);
-                self.send_error_response(stream_id, 502, b"Bad Gateway")?;
-                return Ok((502, 11));
-            }
-        };
-        
-        let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp_stream);
-        
-        // リクエスト送信
-        if let Err(e) = stream.write_all(&request) {
-            warn!("[HTTP/3] TLS backend write error: {}", e);
-            self.send_error_response(stream_id, 502, b"Bad Gateway")?;
-            return Ok((502, 11));
-        }
-        
-        // レスポンス受信
-        let mut response = Vec::with_capacity(16384);
-        let mut buf = [0u8; 8192];
-        
-        loop {
-            match stream.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => response.extend_from_slice(&buf[..n]),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(e) => {
-                    if response.is_empty() {
-                        warn!("[HTTP/3] TLS backend read error: {}", e);
-                        self.send_error_response(stream_id, 502, b"Bad Gateway")?;
-                        return Ok((502, 11));
-                    }
-                    break;
-                }
-            }
-        }
-        
-        // HTTPレスポンスをパース
-        self.parse_and_send_response(stream_id, &response, compression, client_encoding)
-    }
-    
-    /// HTTPレスポンスをパースしてHTTP/3レスポンスとして送信
-    fn parse_and_send_response(
-        &mut self,
-        stream_id: u64,
-        response: &[u8],
-        compression: &CompressionConfig,
-        client_encoding: AcceptedEncoding,
-    ) -> io::Result<(u16, usize)> {
-        // ヘッダー終端を探す
-        let header_end = match find_header_end(response) {
-            Some(pos) => pos,
-            None => {
-                warn!("[HTTP/3] Invalid response from backend");
-                self.send_error_response(stream_id, 502, b"Bad Gateway")?;
-                return Ok((502, 11));
-            }
-        };
-        
-        // ステータス行をパース
-        let header_bytes = &response[..header_end];
-        let body_bytes = &response[header_end + 4..]; // \r\n\r\n の後
-        
-        // ステータスコードを取得
-        let status_code = parse_status_code(header_bytes).unwrap_or(502);
-        
-        // Content-Type と Content-Encoding を取得
-        let mut content_type: Option<&[u8]> = None;
-        let mut existing_encoding: Option<&[u8]> = None;
-        
-        if let Some(first_crlf) = memchr::memchr(b'\n', header_bytes) {
-            let headers_section = &header_bytes[first_crlf + 1..];
-            for line in headers_section.split(|&b| b == b'\n') {
-                let line = line.strip_suffix(&[b'\r']).unwrap_or(line);
-                if line.is_empty() {
-                    continue;
-                }
-                if let Some(colon_pos) = memchr::memchr(b':', line) {
-                    let name = &line[..colon_pos];
-                    let value = &line[colon_pos + 1..];
-                    let value = value.strip_prefix(&[b' ']).unwrap_or(value);
-                    
+        match proxy_result {
+            Ok(backend_result) => {
+                // バックエンド結果からHTTP/3レスポンスを構築
+                let status_code = backend_result.status_code;
+                
+                // 圧縮判定
+                let mut content_type: Option<&[u8]> = None;
+                let mut existing_encoding: Option<&[u8]> = None;
+                for (name, value) in &backend_result.headers {
                     if name.eq_ignore_ascii_case(b"content-type") {
-                        content_type = Some(value);
+                        content_type = Some(value.as_slice());
                     } else if name.eq_ignore_ascii_case(b"content-encoding") {
-                        existing_encoding = Some(value);
+                        existing_encoding = Some(value.as_slice());
                     }
                 }
-            }
-        }
-        
-        // 圧縮すべきか判定
-        let should_compress = compression.should_compress(
-            client_encoding,
-            content_type,
-            Some(body_bytes.len()),
-            existing_encoding,
-        );
-        
-        // ヘッダーをパース
-        let mut resp_headers: Vec<(&[u8], &[u8])> = Vec::new();
-        resp_headers.push((b"server", b"veil/http3"));
-        
-        // 圧縮が有効な場合は Content-Encoding を追加
-        let encoding_value: Vec<u8>;
-        if let Some(enc) = should_compress {
-            encoding_value = match enc {
-                AcceptedEncoding::Zstd => b"zstd".to_vec(),
-                AcceptedEncoding::Brotli => b"br".to_vec(),
-                AcceptedEncoding::Gzip => b"gzip".to_vec(),
-                AcceptedEncoding::Deflate => b"deflate".to_vec(),
-                AcceptedEncoding::Identity => Vec::new(),
-            };
-            if !encoding_value.is_empty() {
-                resp_headers.push((b"content-encoding", &encoding_value));
-                resp_headers.push((b"vary", b"Accept-Encoding"));
-            }
-        }
-        
-        // レスポンスヘッダーを抽出（ステータス行をスキップ）
-        if let Some(first_crlf) = memchr::memchr(b'\n', header_bytes) {
-            let headers_section = &header_bytes[first_crlf + 1..];
-            for line in headers_section.split(|&b| b == b'\n') {
-                let line = line.strip_suffix(&[b'\r']).unwrap_or(line);
-                if line.is_empty() {
-                    continue;
-                }
-                if let Some(colon_pos) = memchr::memchr(b':', line) {
-                    let name = &line[..colon_pos];
-                    let value = &line[colon_pos + 1..];
-                    let value = value.strip_prefix(&[b' ']).unwrap_or(value);
-                    
-                    // ホップバイホップヘッダーはスキップ
+                
+                let should_compress = compression.should_compress(
+                    client_encoding,
+                    content_type,
+                    Some(backend_result.body.len()),
+                    existing_encoding,
+                );
+                
+                // レスポンスヘッダーを構築（ホップバイホップヘッダーをスキップ）
+                let mut resp_headers: Vec<(&[u8], &[u8])> = Vec::new();
+                for (name, value) in &backend_result.headers {
                     if name.eq_ignore_ascii_case(b"connection")
                         || name.eq_ignore_ascii_case(b"transfer-encoding")
                         || name.eq_ignore_ascii_case(b"keep-alive")
                     {
                         continue;
                     }
-                    
                     // 圧縮時は Content-Length と Content-Encoding をスキップ
                     if should_compress.is_some() && (
                         name.eq_ignore_ascii_case(b"content-length") ||
@@ -1088,21 +843,25 @@ impl Http3Handler {
                     ) {
                         continue;
                     }
-                    
-                    resp_headers.push((name, value));
+                    resp_headers.push((name.as_slice(), value.as_slice()));
                 }
+                
+                // 圧縮処理
+                let response_body = if let Some(enc) = should_compress {
+                    compress_body_h3(&backend_result.body, enc, compression)
+                } else {
+                    backend_result.body.clone()
+                };
+                
+                self.send_response(stream_id, status_code, &resp_headers, Some(&response_body))?;
+                Ok((status_code, response_body.len()))
+            }
+            Err(e) => {
+                warn!("[HTTP/3] Async backend proxy error: {}", e);
+                self.send_error_response(stream_id, 502, b"Bad Gateway")?;
+                Ok((502, 11))
             }
         }
-        
-        // 圧縮処理
-        let response_body = if let Some(enc) = should_compress {
-            compress_body_h3(body_bytes, enc, compression)
-        } else {
-            body_bytes.to_vec()
-        };
-        
-        self.send_response(stream_id, status_code, &resp_headers, Some(&response_body))?;
-        Ok((status_code, response_body.len()))
     }
     
     /// ファイル配信
@@ -1322,7 +1081,7 @@ pub struct BackendProxyResult {
 /// 
 /// monoio::net::TcpStream を使用して非同期にバックエンドへ接続します。
 /// HTTP/3 コネクションをブロックせずにバックエンド通信を行えます。
-pub async fn proxy_to_backend_async(
+pub(crate) async fn proxy_to_backend_async(
     target: &ProxyTarget,
     request: Vec<u8>,
     timeout_secs: u64,
@@ -1968,7 +1727,7 @@ pub async fn run_http3_server_async(
 
                     // HTTP/3 イベント処理
                     if handler.h3_conn.is_some() {
-                        if let Err(e) = handler.process_h3_events() {
+                        if let Err(e) = handler.process_h3_events().await {
                             warn!("[HTTP/3] process_h3_events error: {}", e);
                         }
                     }
