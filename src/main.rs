@@ -4014,6 +4014,7 @@ struct PerformanceConfigSection {
     ///   - 1MB超: 1MB
     /// - "manual": 固定チャンクサイズを使用
     #[serde(default = "default_chunk_size_mode")]
+    #[cfg_attr(not(feature = "ktls"), allow(dead_code))]
     chunk_size_mode: ChunkSizeMode,
     
     /// 手動チャンクサイズ（バイト）
@@ -4021,6 +4022,7 @@ struct PerformanceConfigSection {
     /// chunk_size_mode = "manual" 時に使用します。
     /// デフォルト: 1048576 (1MB)
     #[serde(default = "default_manual_chunk_size")]
+    #[cfg_attr(not(feature = "ktls"), allow(dead_code))]
     manual_chunk_size: usize,
     
     // ====================
@@ -4036,6 +4038,7 @@ struct PerformanceConfigSection {
     /// 
     /// 高並行性環境（同時接続数1000+）ではtrueを推奨します。
     #[serde(default)]
+    #[cfg_attr(not(feature = "ktls"), allow(dead_code))]
     per_stream_pipe_enabled: bool,
 }
 
