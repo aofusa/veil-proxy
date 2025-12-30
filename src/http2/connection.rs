@@ -394,7 +394,9 @@ where
             match id {
                 0x1 => {
                     // HEADER_TABLE_SIZE
+                    // RFC 7540 Section 6.5.2: Both encoder and decoder must update their table size
                     self.hpack_encoder.set_max_table_size(value as usize);
+                    self.hpack_decoder.set_max_table_size(value as usize);
                 }
                 0x2 => {
                     // ENABLE_PUSH - RFC 7540 Section 6.5.2: 0 または 1 のみ有効
@@ -427,6 +429,7 @@ where
                         return Err(Http2Error::protocol_error("Invalid MAX_FRAME_SIZE"));
                     }
                     self.frame_encoder.set_max_frame_size(value);
+                    self.frame_decoder.set_max_frame_size(value);
                     self.remote_settings.max_frame_size = value;
                 }
                 0x6 => {
