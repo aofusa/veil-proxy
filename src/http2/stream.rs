@@ -147,6 +147,23 @@ impl Stream {
                 };
                 Ok(())
             }
+            StreamState::Open => {
+                // Allow receiving HEADERS on Open stream for:
+                // 1. Trailers (second HEADERS with END_STREAM)
+                // 2. Re-entry during CONTINUATION (when recv_headers was already called)
+                if end_stream {
+                    self.state = StreamState::HalfClosedRemote;
+                }
+                // If not end_stream, stay in Open (re-entry case)
+                Ok(())
+            }
+            StreamState::HalfClosedLocal => {
+                // Allow trailers when we've already sent our response but still receiving
+                if end_stream {
+                    self.state = StreamState::Closed;
+                }
+                Ok(())
+            }
             _ => Err(Http2Error::stream_error(
                 self.id,
                 Http2ErrorCode::StreamClosed,
