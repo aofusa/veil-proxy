@@ -65,9 +65,9 @@ where
     /// 新しいコネクションを作成
     pub fn new(stream: S, settings: Http2Settings) -> Self {
         let hpack_decoder = HpackDecoder::new(settings.header_table_size as usize);
-        let hpack_encoder = HpackEncoder::new(defaults::HEADER_TABLE_SIZE as usize);
+        let hpack_encoder = HpackEncoder::new(settings.header_table_size as usize);
         let frame_encoder = FrameEncoder::new(settings.max_frame_size);
-        let frame_decoder = FrameDecoder::new(defaults::MAX_FRAME_SIZE);
+        let frame_decoder = FrameDecoder::new(settings.max_frame_size);
         let streams = StreamManager::new(
             settings.max_concurrent_streams,
             settings.initial_window_size as i32,
