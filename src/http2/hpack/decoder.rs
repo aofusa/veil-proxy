@@ -12,6 +12,8 @@ pub struct HpackDecoder {
     dynamic_table: DynamicTable,
     /// 最大ヘッダーリストサイズ
     max_header_list_size: usize,
+    /// SETTINGS_HEADER_TABLE_SIZE で許可された最大テーブルサイズ
+    max_allowed_table_size: usize,
 }
 
 impl HpackDecoder {
@@ -20,6 +22,7 @@ impl HpackDecoder {
         Self {
             dynamic_table: DynamicTable::new(max_table_size),
             max_header_list_size: 16384, // 16KB デフォルト
+            max_allowed_table_size: max_table_size,
         }
     }
 
@@ -30,6 +33,7 @@ impl HpackDecoder {
 
     /// 動的テーブルの最大サイズを更新
     pub fn set_max_table_size(&mut self, size: usize) {
+        self.max_allowed_table_size = size;
         self.dynamic_table.set_max_size(size);
     }
 
@@ -51,25 +55,35 @@ impl HpackDecoder {
         let mut headers = Vec::new();
         let mut pos = 0;
         let mut total_size = 0usize;
+        // RFC 7541 §4.2: Dynamic table size updates MUST occur at the beginning of the header block
+        let mut seen_header = false;
 
         while pos < buf.len() {
             let first_byte = buf[pos];
 
             let field = if first_byte & 0x80 != 0 {
                 // Indexed Header Field (Section 6.1)
+                seen_header = true;
                 self.decode_indexed(&buf[pos..], &mut pos)?
             } else if first_byte & 0x40 != 0 {
                 // Literal Header Field with Incremental Indexing (Section 6.2.1)
+                seen_header = true;
                 self.decode_literal_indexed(&buf[pos..], &mut pos)?
             } else if first_byte & 0x20 != 0 {
                 // Dynamic Table Size Update (Section 6.3)
+                // RFC 7541 §4.2: MUST occur at the beginning of the header block
+                if seen_header {
+                    return Err(HpackError::TableSizeUpdateAfterHeader);
+                }
                 self.decode_table_size_update(&buf[pos..], &mut pos)?;
                 continue;
             } else if first_byte & 0x10 != 0 {
                 // Literal Header Field Never Indexed (Section 6.2.3)
+                seen_header = true;
                 self.decode_literal_never_indexed(&buf[pos..], &mut pos)?
             } else {
                 // Literal Header Field without Indexing (Section 6.2.2)
+                seen_header = true;
                 self.decode_literal_without_indexing(&buf[pos..], &mut pos)?
             };
 
@@ -173,6 +187,12 @@ impl HpackDecoder {
     fn decode_table_size_update(&mut self, buf: &[u8], pos: &mut usize) -> HpackResult<()> {
         let (size, consumed) = decode_integer(buf, 5)?;
         *pos += consumed;
+
+        // RFC 7541 §6.3: The new maximum size MUST be lower than or equal to
+        // the limit determined by the protocol using HPACK
+        if size > self.max_allowed_table_size {
+            return Err(HpackError::TableSizeExceeded);
+        }
 
         self.dynamic_table.set_max_size(size);
 

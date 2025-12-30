@@ -35,6 +35,8 @@ pub enum HpackError {
     BufferTooShort,
     /// 動的テーブルサイズ超過
     TableSizeExceeded,
+    /// テーブルサイズ更新がヘッダーの後に出現
+    TableSizeUpdateAfterHeader,
     /// 無効なエンコーディング
     InvalidEncoding(String),
 }
@@ -48,6 +50,7 @@ impl std::fmt::Display for HpackError {
             Self::InvalidString => write!(f, "Invalid HPACK string"),
             Self::BufferTooShort => write!(f, "Buffer too short for HPACK"),
             Self::TableSizeExceeded => write!(f, "Dynamic table size exceeded"),
+            Self::TableSizeUpdateAfterHeader => write!(f, "Dynamic table size update after header"),
             Self::InvalidEncoding(s) => write!(f, "Invalid HPACK encoding: {}", s),
         }
     }

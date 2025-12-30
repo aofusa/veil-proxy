@@ -448,6 +448,30 @@ where
             }
         }
 
+        // Check if this is a trailer (second HEADERS on existing stream)
+        // Trailers MUST have END_STREAM set (RFC 7540 §8.1)
+        let is_trailer = if let Some(stream) = self.streams.get_ref(stream_id) {
+            // Stream exists - this is a trailer if:
+            // 1. Stream is in Open or HalfClosedLocal state (headers already received)
+            // 2. And this HEADERS has END_STREAM set
+            matches!(stream.state, StreamState::Open | StreamState::HalfClosedLocal) && end_stream
+        } else {
+            false
+        };
+
+        // RFC 7540 §8.1: A second HEADERS frame without END_STREAM is a protocol error
+        // (except for trailers which must have END_STREAM)
+        if let Some(stream) = self.streams.get_ref(stream_id) {
+            if matches!(stream.state, StreamState::Open | StreamState::HalfClosedLocal) && !end_stream {
+                // Second HEADERS without END_STREAM - must be a protocol error
+                return Err(Http2Error::stream_error(
+                    stream_id,
+                    Http2ErrorCode::ProtocolError,
+                    "Second HEADERS frame without END_STREAM",
+                ));
+            }
+        }
+
         // ストリームを取得または作成
         let stream = self.streams.get_or_create_client_stream(stream_id)?;
 
@@ -466,7 +490,7 @@ where
 
         if end_headers {
             self.streams.set_receiving_headers(None);
-            self.decode_and_set_headers(stream_id)?;
+            self.decode_and_set_headers(stream_id, is_trailer)?;
 
             // リクエストが完了したかチェック
             if end_stream {
@@ -498,12 +522,16 @@ where
             .ok_or_else(|| Http2Error::stream_error(stream_id, Http2ErrorCode::StreamClosed, "Stream not found"))?;
 
         let end_stream = matches!(stream.state, StreamState::HalfClosedRemote);
+        
+        // Trailers: CONTINUATION for a stream that was already open (second HEADERS)
+        // If state is HalfClosedRemote, it means this was a trailer HEADERS with END_STREAM
+        let is_trailer = matches!(stream.state, StreamState::HalfClosedRemote);
 
         stream.append_header_fragment(header_block, end_headers);
 
         if end_headers {
             self.streams.set_receiving_headers(None);
-            self.decode_and_set_headers(stream_id)?;
+            self.decode_and_set_headers(stream_id, is_trailer)?;
 
             if end_stream {
                 return Ok(Some(ProcessedRequest { stream_id }));
@@ -514,7 +542,7 @@ where
     }
 
     /// ヘッダーブロックをデコードしてストリームに設定
-    fn decode_and_set_headers(&mut self, stream_id: u32) -> Http2Result<()> {
+    fn decode_and_set_headers(&mut self, stream_id: u32, is_trailer: bool) -> Http2Result<()> {
         let stream = self.streams.get(stream_id)
             .ok_or_else(|| Http2Error::stream_error(stream_id, Http2ErrorCode::StreamClosed, "Stream not found"))?;
 
@@ -523,15 +551,20 @@ where
             .map_err(|e| Http2Error::compression_error(e.to_string()))?;
 
         // ヘッダーを検証 (RFC 7540 Section 8.1.2)
-        Self::validate_request_headers(&headers, stream_id, false)?;
+        Self::validate_request_headers(&headers, stream_id, is_trailer)?;
 
         let stream = self.streams.get(stream_id).unwrap();
-        stream.request_headers = headers;
+        
+        // For trailers, we don't overwrite request_headers but could store them separately
+        // For now, trailers just need to pass validation
+        if !is_trailer {
+            stream.request_headers = headers;
 
-        // Content-Length を解析
-        if let Some(cl) = stream.request_headers.iter().find(|h| h.name == b"content-length") {
-            if let Some(len) = std::str::from_utf8(&cl.value).ok().and_then(|s| s.parse::<u64>().ok()) {
-                stream.content_length = Some(len);
+            // Content-Length を解析
+            if let Some(cl) = stream.request_headers.iter().find(|h| h.name == b"content-length") {
+                if let Some(len) = std::str::from_utf8(&cl.value).ok().and_then(|s| s.parse::<u64>().ok()) {
+                    stream.content_length = Some(len);
+                }
             }
         }
 

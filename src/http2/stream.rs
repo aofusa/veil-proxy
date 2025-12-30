@@ -212,6 +212,21 @@ impl Stream {
                 self.received_body_size += data.len() as u64;
 
                 if end_stream {
+                    // RFC 7540 §8.1.2.6: Content-Length validation
+                    // If there is a content-length header, verify the body size matches
+                    if let Some(expected_length) = self.content_length {
+                        if expected_length != self.received_body_size {
+                            return Err(Http2Error::stream_error(
+                                self.id,
+                                Http2ErrorCode::ProtocolError,
+                                format!(
+                                    "Content-Length mismatch: expected {}, received {}",
+                                    expected_length, self.received_body_size
+                                ),
+                            ));
+                        }
+                    }
+
                     self.state = match self.state {
                         StreamState::Open => StreamState::HalfClosedRemote,
                         StreamState::HalfClosedLocal => StreamState::Closed,
