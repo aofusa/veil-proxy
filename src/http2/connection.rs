@@ -213,10 +213,13 @@ where
             if self.buf_start > 0 {
                 self.compact_buffer();
             } else {
-                // バッファを拡張
-                self.read_buf.resize(self.read_buf.len() * 2, 0);
+                // バッファを拡張 - 最大フレームサイズ + ヘッダー + マージンを確保
+                let min_capacity = self.frame_decoder.max_frame_size() as usize + FrameHeader::SIZE + 1024;
+                let new_capacity = std::cmp::max(self.read_buf.len() * 2, min_capacity);
+                self.read_buf.resize(new_capacity, 0);
             }
         }
+
 
         // 読み込み用のスライスを準備
         let read_slice = std::mem::take(&mut self.read_buf);
@@ -324,8 +327,19 @@ where
                 Ok(None)
             }
             Frame::RstStream { stream_id, error_code } => {
+                // RFC 7540 Section 6.4: RST_STREAM on stream 0 is connection error
+                if stream_id == 0 {
+                    return Err(Http2Error::protocol_error("RST_STREAM with stream ID 0"));
+                }
                 // RFC 7540 Section 5.1: RST_STREAM on idle stream = connection error
-                self.validate_stream_not_idle(stream_id, "RST_STREAM")?;
+                // A stream is truly idle if it has never been opened (stream_id > max seen)
+                // We accept RST_STREAM on previously opened streams even if cleaned up
+                if self.streams.get_ref(stream_id).is_none() && stream_id > self.streams.max_client_stream_id() {
+                    return Err(Http2Error::connection_error(
+                        Http2ErrorCode::ProtocolError,
+                        format!("RST_STREAM on idle stream {}", stream_id),
+                    ));
+                }
                 self.handle_rst_stream(stream_id, error_code)?;
                 Ok(None)
             }

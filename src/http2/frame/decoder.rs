@@ -20,6 +20,11 @@ impl FrameDecoder {
         self.max_frame_size = size;
     }
 
+    /// 最大フレームサイズを取得
+    pub fn max_frame_size(&self) -> u32 {
+        self.max_frame_size
+    }
+
     /// フレームヘッダーをデコード
     pub fn decode_header(&self, buf: &[u8]) -> Http2Result<FrameHeader> {
         if buf.len() < FrameHeader::SIZE {
