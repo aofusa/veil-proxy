@@ -217,6 +217,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     257, // openat
     262, // newfstatat
     275, // splice (kTLS ゼロコピー転送)
+    332, // statx (monoio 非同期ファイルI/Oで使用)
     
     // ============================================
     // DNS名前解決 (getaddrinfo)
@@ -374,6 +375,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     78,  // readlinkat (canonicalize() で使用)
     79,  // fstatat
     80,  // fstat
+    291, // statx (monoio 非同期ファイルI/Oで使用)
     199, // socketpair (NSS内部通信)
 
     // ============================================
