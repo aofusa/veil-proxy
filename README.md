@@ -1233,6 +1233,9 @@ Cache keys are generated from:
 - Cache respects `Cache-Control: no-cache`, `no-store`, `private` headers
 - `Vary: *` responses are not cached when `respect_vary = true`
 
+> [!CAUTION]
+> **stale_if_error**: When enabled, veil-proxy may serve outdated cached content (up to 1 hour old) when the backend returns 502/504 errors. This improves availability but may cause **data consistency issues** for applications where real-time accuracy is critical (e.g., financial data, medical records, inventory systems). Evaluate your use case carefully before enabling this feature.
+
 ## Buffering Control
 
 Controls response buffering to prevent slow clients from blocking backend connections.

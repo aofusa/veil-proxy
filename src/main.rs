@@ -7739,6 +7739,11 @@ fn spawn_reload_thread() {
 /// 
 /// staleキャッシュを返した後、バックグラウンドでバックエンドに再リクエストし、
 /// レスポンスでキャッシュを更新します。
+/// 
+/// ## Request Collapsing
+/// 
+/// 同一キャッシュキーに対して既に更新が進行中の場合、
+/// 重複したリクエストをスキップしてバックエンド過負荷を防ぎます。
 fn spawn_background_revalidation(
     cache_key: cache::CacheKey,
     upstream_group: UpstreamGroup,
@@ -7748,9 +7753,27 @@ fn spawn_background_revalidation(
     prefix: Vec<u8>,
     headers: Vec<(Box<[u8]>, Box<[u8]>)>,
 ) {
+    let hash = cache_key.hash_value();
+    
+    // Request Collapsing: 同一キーに対して既に更新中であればスキップ
+    if !cache::try_start_revalidation(hash) {
+        debug!("Background revalidation skipped (already in progress) for {:?}", cache_key.path());
+        return;
+    }
+    
     // パニック耐性のあるspawn (stale-while-revalidate のバックグラウンドタスク)
     spawn_with_panic_catch(async move {
         debug!("Background revalidation started for {:?}", cache_key.path());
+        
+        // 完了時に必ず更新フラグをクリアするためのスコープガード
+        // このクロージャはパニック時でも実行される（Drop trait）
+        struct RevalidationGuard(u64);
+        impl Drop for RevalidationGuard {
+            fn drop(&mut self) {
+                cache::finish_revalidation(self.0);
+            }
+        }
+        let _guard = RevalidationGuard(hash);
         
         // サーバーを選択
         let server = match upstream_group.select("revalidation") {
@@ -7779,16 +7802,16 @@ fn spawn_background_revalidation(
             }
         };
         
-        // リクエストを構築
+        // リクエストを構築（Cow<str>で借用優先）
         let path_str = std::str::from_utf8(&req_path).unwrap_or("/");
-        let sub_path = if prefix.is_empty() {
-            path_str.to_string()
+        let sub_path: std::borrow::Cow<'_, str> = if prefix.is_empty() {
+            std::borrow::Cow::Borrowed(path_str)
         } else {
             let prefix_str = std::str::from_utf8(&prefix).unwrap_or("");
             if path_str.starts_with(prefix_str) {
-                path_str[prefix_str.len()..].to_string()
+                std::borrow::Cow::Borrowed(&path_str[prefix_str.len()..])
             } else {
-                path_str.to_string()
+                std::borrow::Cow::Borrowed(path_str)
             }
         };
         
@@ -7927,6 +7950,7 @@ fn spawn_background_revalidation(
         }
         
         debug!("Background revalidation completed (status={})", status_code);
+        // _guard がドロップされて finish_revalidation(hash) が呼ばれる
     });
 }
 
@@ -15256,11 +15280,12 @@ async fn handle_sendfile(
     //    - リクエスト "/static/css/style.css" → "./www/assets/css/style.css"
     //    - リクエスト "/static/" → "./www/assets/{index_filename}" (デフォルト: index.html)
     
+    // Cow<str>を使用してパス処理のアロケーションを最小化
     let path_str = std::str::from_utf8(req_path).unwrap_or("/");
     let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
     
-    // プレフィックスを除去して「残りパス」を取得
-    let remainder = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
+    // プレフィックスを除去して「残りパス」を取得（借用のみ、アロケーションなし）
+    let remainder: &str = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
         &path_str[prefix_str.len()..]
     } else {
         path_str
@@ -15300,62 +15325,64 @@ async fn handle_sendfile(
         base_path.to_path_buf()
     };
 
-    let full_path_canonical = match full_path.canonicalize() {
-        Ok(p) => p,
-        Err(_) => {
+    // OpenFileCacheを使用してファイル情報を取得（キャッシュ優先）
+    // これにより、canonicalize、metadata、mime_guessのシステムコールをキャッシュ
+    let file_info = match cache::get_file_info(&full_path) {
+        Some(info) => info,
+        None => {
             let err_buf = ERR_MSG_NOT_FOUND.to_vec();
             let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
-            return Some((tls_stream, 404, 0, true));  // エラー時は接続を閉じる
+            return Some((tls_stream, 404, 0, true));
         }
     };
 
+    // ディレクトリの場合はセキュリティチェック
     if is_dir {
-        if let Ok(base) = base_path.canonicalize() {
-            if !full_path_canonical.starts_with(&base) {
+        // ベースパスのキャッシュ情報も取得（頻繁にアクセスされるため）
+        if let Some(base_info) = cache::get_file_info(base_path) {
+            if !file_info.canonical_path.starts_with(&base_info.canonical_path) {
                 let err_buf = ERR_MSG_FORBIDDEN.to_vec();
                 let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
-                return Some((tls_stream, 403, 0, true));  // エラー時は接続を閉じる
+                return Some((tls_stream, 403, 0, true));
             }
         }
     }
 
     // ディレクトリの場合はインデックスファイルを試す
-    // 設定されたファイル名、なければデフォルトの "index.html" を使用
-    let final_path = if full_path_canonical.is_dir() {
+    let (final_path, file_size, mime_type) = if !file_info.is_file {
         let filename = index_filename.unwrap_or("index.html");
-        let index_path = full_path_canonical.join(filename);
-        if index_path.exists() {
-            index_path
-        } else {
-            // インデックスファイルが存在しない場合は403 Forbidden（ディレクトリリスティング禁止）
-            let err_buf = ERR_MSG_FORBIDDEN.to_vec();
-            let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
-            return Some((tls_stream, 403, 0, true));
+        let index_path = file_info.canonical_path.join(filename);
+        
+        // インデックスファイルの情報をキャッシュから取得
+        match cache::get_file_info(&index_path) {
+            Some(idx_info) if idx_info.is_file => {
+                (idx_info.canonical_path.clone(), idx_info.file_size, idx_info.mime_type.clone())
+            }
+            _ => {
+                // インデックスファイルが存在しない場合は403 Forbidden
+                let err_buf = ERR_MSG_FORBIDDEN.to_vec();
+                let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+                return Some((tls_stream, 403, 0, true));
+            }
         }
     } else {
-        full_path_canonical
+        (file_info.canonical_path.clone(), file_info.file_size, file_info.mime_type.clone())
     };
 
+    // ファイルを開く（非同期、実際のI/Oが必要）
     let file = match OpenOptions::new().read(true).open(&final_path).await {
         Ok(f) => f,
         Err(_) => {
+            // ファイルが開けない場合はキャッシュを無効化
+            cache::invalidate_file_cache(&full_path);
             let err_buf = ERR_MSG_NOT_FOUND.to_vec();
             let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
-            return Some((tls_stream, 404, 0, true));  // エラー時は接続を閉じる
+            return Some((tls_stream, 404, 0, true));
         }
     };
 
-    let metadata = match file.metadata().await {
-        Ok(m) => m,
-        Err(_) => {
-            let err_buf = ERR_MSG_NOT_FOUND.to_vec();
-            let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
-            return Some((tls_stream, 404, 0, true));  // エラー時は接続を閉じる
-        }
-    };
-
-    let file_size = metadata.len();
-    let mime_type = mime_guess::from_path(&final_path).first_or_octet_stream();
+    // キャッシュから取得したサイズとMIMEタイプを使用
+    // （file.metadata()の呼び出しを省略）
     
     // RFC 7233 Range リクエスト処理
     let range_info: Option<(u64, u64)> = if let Some(range_bytes) = range_header {
@@ -15387,7 +15414,7 @@ async fn handle_sendfile(
     let (response_status, _response_content_length) = if let Some((start, end)) = range_info {
         let content_length = end - start + 1;
         header_buf.extend_from_slice(b"HTTP/1.1 206 Partial Content\r\nContent-Type: ");
-        header_buf.extend_from_slice(mime_type.as_ref().as_bytes());
+        header_buf.extend_from_slice(mime_type.as_bytes());
         header_buf.extend_from_slice(b"\r\nAccept-Ranges: bytes\r\nContent-Range: bytes ");
         header_buf.extend_from_slice(start.to_string().as_bytes());
         header_buf.extend_from_slice(b"-");
@@ -15401,7 +15428,7 @@ async fn handle_sendfile(
     } else {
         // 通常のレスポンス
         header_buf.extend_from_slice(HTTP_200_PREFIX);
-        header_buf.extend_from_slice(mime_type.as_ref().as_bytes());
+        header_buf.extend_from_slice(mime_type.as_bytes());
         header_buf.extend_from_slice(b"\r\nAccept-Ranges: bytes");  // Range サポートを通知
         header_buf.extend_from_slice(CONTENT_LENGTH_HEADER);
         let mut num_buf = itoa::Buffer::new();
@@ -15455,7 +15482,7 @@ async fn handle_sendfile(
                         // WASMから修正されたヘッダーで再構築
                         let mut new_header = Vec::with_capacity(HEADER_BUF_CAPACITY);
                         new_header.extend_from_slice(HTTP_200_PREFIX);
-                        new_header.extend_from_slice(mime_type.as_ref().as_bytes());
+                        new_header.extend_from_slice(mime_type.as_bytes());
                         new_header.extend_from_slice(CONTENT_LENGTH_HEADER);
                         let mut num_buf = itoa::Buffer::new();
                         new_header.extend_from_slice(num_buf.format(file_size).as_bytes());

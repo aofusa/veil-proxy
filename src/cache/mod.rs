@@ -40,6 +40,8 @@ mod memory;
 mod disk;
 mod manager;
 mod policy;
+mod revalidation;
+mod file_cache;
 
 pub use config::CacheConfig;
 pub use key::CacheKey;
@@ -49,4 +51,6 @@ pub use memory::MemoryCache;
 pub use disk::DiskCache;
 pub use manager::{CacheManager, CacheStats, init_global_cache, get_global_cache};
 pub use policy::{CachePolicy, CacheControl, VaryResult};
+pub use revalidation::{try_start_revalidation, finish_revalidation, active_revalidations, collapsed_request_count};
+pub use file_cache::{get_file_cache, get_file_info, invalidate_file_cache, CachedFileInfo, OpenFileCache};
 
