@@ -307,7 +307,7 @@ mod types_tests {
         let config = WasmConfig::default();
         assert!(!config.enabled);
         assert!(config.modules.is_empty());
-        assert!(config.routes.is_empty());
+        // routesフィールドは削除されました（ルートレベルのmodulesフィールドを使用）
     }
 
     #[test]

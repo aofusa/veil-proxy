@@ -52,6 +52,7 @@ impl FilterEngine {
     }
 
     /// Execute on_request_headers for specified modules (internal helper)
+    #[allow(dead_code)]
     fn execute_on_request_headers_for_modules(
         &self,
         modules: &[Arc<LoadedModule>],
@@ -299,53 +300,19 @@ impl FilterEngine {
     }
 
     /// Execute on_response_headers callback for all modules (reverse order)
+    /// 
+    /// Note: This method is deprecated. Use `on_response_headers_with_modules` instead.
+    /// This method always returns Continue without applying any modules.
     pub fn on_response_headers(
         &self,
-        path: &str,
-        status: u16,
+        _path: &str,
+        _status: u16,
         headers: &[(String, String)],
-        end_of_stream: bool,
+        _end_of_stream: bool,
     ) -> FilterResult {
-        let modules = self.get_modules_for_path(path);
-
-        if modules.is_empty() {
-            return FilterResult::Continue {
-                headers: headers.to_vec(),
-                body: None,
-            };
-        }
-
-        let mut current_headers = headers.to_vec();
-
-        // Execute in reverse order for response
-        for module in modules.iter().rev() {
-            let result =
-                self.execute_on_response_headers(module, status, &current_headers, end_of_stream);
-
-            match result {
-                Ok(ModuleResult::Continue { modified_headers }) => {
-                    if let Some(h) = modified_headers {
-                        current_headers = h;
-                    }
-                }
-                Ok(ModuleResult::Pause) => {
-                    return FilterResult::Pause;
-                }
-                Ok(ModuleResult::LocalResponse(resp)) => {
-                    return FilterResult::LocalResponse(resp);
-                }
-                Err(e) => {
-                    ftlog::error!(
-                        "[wasm:{}] on_response_headers error: {}",
-                        module.name,
-                        e
-                    );
-                }
-            }
-        }
-
+        // ルートレベルのmodulesフィールドを使用するため、このメソッドは使用しない
         FilterResult::Continue {
-            headers: current_headers,
+            headers: headers.to_vec(),
             body: None,
         }
     }
