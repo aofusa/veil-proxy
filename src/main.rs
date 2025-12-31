@@ -8588,7 +8588,7 @@ async fn handle_http2_connection<S>(
         return;
     }
     
-    info!("[HTTP/2] Connection established from {}", client_ip);
+    debug!("[HTTP/2] Connection established from {}", client_ip);
     
     // アクティブ接続メトリクスの自動管理（Dropで自動デクリメント）
     let mut connection_metric = ActiveConnectionMetric::new(true);
@@ -8600,7 +8600,7 @@ async fn handle_http2_connection<S>(
         warn!("[HTTP/2] Connection error: {}", e);
     }
     
-    info!("[HTTP/2] Connection closed from {}", client_ip);
+    debug!("[HTTP/2] Connection closed from {}", client_ip);
 }
 
 /// HTTP/2 メインループ（カスタムリクエスト処理）
@@ -8630,7 +8630,7 @@ where
                 // サーバー側の問題ではありません。リクエスト処理は正常に完了しています。
                 // HTTP/2では、クライアントがレスポンス受信後にGOAWAYを送信せずに
                 // 接続を閉じることがあり、その場合に次のフレーム読み込みでこのエラーが発生します。
-                warn!(
+                debug!(
                     "[HTTP/2] Connection closed by client (expected behavior): {} (client: {})",
                     e, client_ip
                 );
@@ -8692,13 +8692,19 @@ where
                     client_ip,
                 ).await;
                 
-                // メトリクス記録
-                let duration = start_instant.elapsed().as_secs_f64();
-                let (status, resp_size) = result.unwrap_or((500, 0));
+                // User-Agentを取得
+                let user_agent: Box<[u8]> = if let Some(stream) = conn.get_stream(stream_id) {
+                    stream.request_headers.iter()
+                        .find(|h| h.name.eq_ignore_ascii_case(b"user-agent"))
+                        .map(|h| Box::from(h.value.clone()))
+                        .unwrap_or_else(|| Box::from([] as [u8; 0]))
+                } else {
+                    Box::from([] as [u8; 0])
+                };
                 
-                let method_str = std::str::from_utf8(&method).unwrap_or("UNKNOWN");
-                let host_str = std::str::from_utf8(&authority).unwrap_or("-");
-                record_request_metrics(method_str, host_str, status, body_len as u64, resp_size, duration);
+                // アクセスログ出力（log_access内でrecord_request_metricsも呼ばれるため、個別の呼び出しは不要）
+                let (status, resp_size) = result.unwrap_or((500, 0));
+                log_access(&method, &authority, &path, &user_agent, body_len as u64, status, resp_size, start_instant);
             }
             Ok(None) => {
                 // フレーム処理完了、次のフレームへ
@@ -10456,7 +10462,7 @@ async fn handle_requests(
                 if is_websocket {
                     // WebSocket はプロキシバックエンドでのみサポート
                     if let Backend::Proxy(ref upstream_group, ref security, _, _, _, _) = backend {
-                        info!("WebSocket upgrade request detected for path: {}", 
+                        debug!("WebSocket upgrade request detected for path: {}", 
                               std::str::from_utf8(&path_bytes).unwrap_or("-"));
                         
                         // UpstreamGroup からサーバーを選択
@@ -11894,7 +11900,7 @@ async fn handle_websocket_proxy_http(
             
             // 101 Switching Protocols の場合は双方向転送開始
             if status_code == 101 {
-                info!("WebSocket upgrade successful, starting bidirectional transfer");
+                debug!("WebSocket upgrade successful, starting bidirectional transfer");
                 let total = websocket_bidirectional_transfer(&mut client_stream, &mut backend_stream, poll_config).await;
                 return Some((101, total));
             } else {
@@ -12011,7 +12017,7 @@ async fn handle_websocket_proxy_https(
             
             // 101 Switching Protocols の場合は双方向転送開始
             if status_code == 101 {
-                info!("WebSocket upgrade successful (TLS), starting bidirectional transfer");
+                debug!("WebSocket upgrade successful (TLS), starting bidirectional transfer");
                 let total = websocket_bidirectional_transfer_tls(&mut client_stream, &mut backend_stream, poll_config).await;
                 return Some((101, total));
             } else {

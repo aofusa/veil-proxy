@@ -40,7 +40,7 @@ use ftlog::{info, warn, error, debug};
 use crate::{
     Backend, SecurityConfig, UpstreamGroup, ProxyTarget,
     find_backend_unified, check_security, SecurityCheckResult,
-    encode_prometheus_metrics, record_request_metrics,
+    encode_prometheus_metrics, log_access,
     AcceptedEncoding, CompressionConfig, resolve_http3_compression_config,
     CURRENT_CONFIG, SHUTDOWN_FLAG,
 };
@@ -269,7 +269,7 @@ impl Http3Handler {
             let h3 = h3::Connection::with_transport(&mut self.conn, &h3_config)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             self.h3_conn = Some(h3);
-            info!("[HTTP/3] HTTP/3 connection established from {}", self.peer_addr);
+            debug!("[HTTP/3] HTTP/3 connection established from {}", self.peer_addr);
         }
         Ok(())
     }
@@ -357,6 +357,7 @@ impl Http3Handler {
         let mut authority = None;
         let mut content_length: usize = 0;
         let mut accept_encoding: Option<Vec<u8>> = None;
+        let mut user_agent: Vec<u8> = Vec::new();
 
         for header in headers {
             match header.name() {
@@ -370,6 +371,9 @@ impl Http3Handler {
                 }
                 name if name.eq_ignore_ascii_case(b"accept-encoding") => {
                     accept_encoding = Some(header.value().to_vec());
+                }
+                name if name.eq_ignore_ascii_case(b"user-agent") => {
+                    user_agent = header.value().to_vec();
                 }
                 _ => {}
             }
@@ -408,7 +412,8 @@ impl Http3Handler {
                 // IPアドレス制限チェック
                 if !prom_config.is_ip_allowed(&self.client_ip) {
                     self.send_error_response(stream_id, 403, b"Forbidden")?;
-                    self.record_metrics(&method, &authority, 403, request_body.len(), 9, start_time);
+                    let user_agent_slice: &[u8] = if user_agent.is_empty() { &[] } else { &user_agent };
+                    log_access(&method, &authority, &path, user_agent_slice, request_body.len() as u64, 403, 9, start_time);
                     return Ok(());
                 }
                 
@@ -419,7 +424,8 @@ impl Http3Handler {
                     (b"server", b"veil/http3"),
                 ], Some(&body))?;
                 
-                self.record_metrics(&method, &authority, 200, request_body.len(), body.len(), start_time);
+                let user_agent_slice: &[u8] = if user_agent.is_empty() { &[] } else { &user_agent };
+                log_access(&method, &authority, &path, user_agent_slice, request_body.len() as u64, 200, body.len() as u64, start_time);
                 return Ok(());
             }
         }
@@ -505,7 +511,8 @@ impl Http3Handler {
                     String::from_utf8_lossy(&path)
                 );
                 self.send_error_response(stream_id, 404, b"Not Found")?;
-                self.record_metrics(&method, &authority, 404, request_body.len(), 9, start_time);
+                let user_agent_slice: &[u8] = if user_agent.is_empty() { &[] } else { &user_agent };
+                log_access(&method, &authority, &path, user_agent_slice, request_body.len() as u64, 404, 9, start_time);
                 return Ok(());
             }
         };
@@ -518,7 +525,8 @@ impl Http3Handler {
             let status = check_result.status_code();
             let msg = check_result.message();
             self.send_error_response(stream_id, status, msg)?;
-            self.record_metrics(&method, &authority, status, request_body.len(), msg.len(), start_time);
+            let user_agent_slice: &[u8] = if user_agent.is_empty() { &[] } else { &user_agent };
+            log_access(&method, &authority, &path, user_agent_slice, request_body.len() as u64, status, msg.len() as u64, start_time);
             return Ok(());
         }
 
@@ -564,7 +572,8 @@ impl Http3Handler {
                             self.send_response(stream_id, resp.status_code, &resp.headers.iter()
                                 .map(|(k, v)| (k.as_bytes(), v.as_bytes()))
                                 .collect::<Vec<_>>(), Some(&resp.body))?;
-                            self.record_metrics(&method, &authority, resp.status_code, request_body.len(), resp.body.len(), start_time);
+                            let user_agent_slice: &[u8] = if user_agent.is_empty() { &[] } else { &user_agent };
+                            log_access(&method, &authority, &path, user_agent_slice, request_body.len() as u64, resp.status_code, resp.body.len() as u64, start_time);
                             return Ok(());
                         }
                         crate::wasm::FilterResult::Pause => {
@@ -641,7 +650,8 @@ impl Http3Handler {
             }
         };
 
-        self.record_metrics(&method, &authority, status, request_body.len(), resp_size, start_time);
+        let user_agent_slice: &[u8] = if user_agent.is_empty() { &[] } else { &user_agent };
+        log_access(&method, &authority, &path, user_agent_slice, request_body.len() as u64, status, resp_size as u64, start_time);
         Ok(())
     }
     
@@ -742,14 +752,6 @@ impl Http3Handler {
         ], Some(body));
         debug!("[HTTP/3] Error response send result: {:?}", result.is_ok());
         result
-    }
-    
-    /// メトリクス記録
-    fn record_metrics(&self, method: &[u8], authority: &[u8], status: u16, req_size: usize, resp_size: usize, start_time: Instant) {
-        let duration = start_time.elapsed().as_secs_f64();
-        let method_str = std::str::from_utf8(method).unwrap_or("UNKNOWN");
-        let host_str = std::str::from_utf8(authority).unwrap_or("-");
-        record_request_metrics(method_str, host_str, status, req_size as u64, resp_size as u64, duration);
     }
     
     /// プロキシ処理（HTTP/1.1またはHTTP/2バックエンドへの変換）
@@ -1656,7 +1658,7 @@ pub async fn run_http3_server_async(
                 }
             }
             for cid in closed {
-                info!("[HTTP/3] Connection closed (timeout)");
+                debug!("[HTTP/3] Connection closed (timeout)");
                 conns.remove(&cid);
             }
         }
@@ -1720,7 +1722,7 @@ pub async fn run_http3_server_async(
                     )
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
-                    info!("[HTTP/3] New connection from {}", from);
+                    debug!("[HTTP/3] New connection from {}", from);
 
                     // 最新のルーティング設定を取得
                     let handler = Http3Handler::new(conn, from);
@@ -1841,7 +1843,7 @@ async fn send_pending_packets(
         }
 
         if handler.conn.is_closed() {
-            info!("[HTTP/3] Connection closed from {}", handler.peer_addr);
+            debug!("[HTTP/3] Connection closed from {}", handler.peer_addr);
             closed.push(cid.clone());
         }
     }
