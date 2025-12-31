@@ -5013,30 +5013,18 @@ pub enum BackendConfig {
     /// 単一URLプロキシ（後方互換性のため維持）
     /// - sni_name: TLS接続時のSNI名（IP直打ち時にドメイン名を指定可能）
     /// - use_h2c: H2C (HTTP/2 over cleartext) を使用するかどうか
-    /// - compression: 圧縮設定（オプション）
-    /// - buffering: バッファリング設定（オプション）
-    /// - cache: キャッシュ設定（オプション）
+    /// 注意: security, compression, buffering, cache は route 直下で設定
     Proxy { 
         url: String, 
         sni_name: Option<String>, 
         use_h2c: bool, 
-        security: SecurityConfig, 
-        compression: CompressionConfig,
-        buffering: buffering::BufferingConfig,
-        cache: cache::CacheConfig,
         /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
         modules: Option<Vec<String>>,
     },
     /// Upstream グループ参照（ロードバランシング用）
-    /// - compression: 圧縮設定（オプション）
-    /// - buffering: バッファリング設定（オプション）
-    /// - cache: キャッシュ設定（オプション）
+    /// 注意: security, compression, buffering, cache は route 直下で設定
     ProxyUpstream { 
         upstream: String, 
-        security: SecurityConfig, 
-        compression: CompressionConfig,
-        buffering: buffering::BufferingConfig,
-        cache: cache::CacheConfig,
         /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
         modules: Option<Vec<String>>,
     },
@@ -5044,16 +5032,11 @@ pub enum BackendConfig {
     /// - path: ファイルまたはディレクトリのパス
     /// - mode: "sendfile" または "memory"
     /// - index: ディレクトリアクセス時に返すファイル名（デフォルト: "index.html"）
-    /// - security: ルートごとのセキュリティ設定
-    /// - cache: キャッシュ設定（オプション、静的ファイルのキャッシュ用）
-    /// - open_file_cache: OpenFileCache設定（ルーティングごと、グローバル設定を上書き可能）
+    /// 注意: security, cache, open_file_cache は route 直下で設定
     File { 
         path: String, 
         mode: String, 
         index: Option<String>, 
-        security: SecurityConfig,
-        cache: cache::CacheConfig,
-        open_file_cache: Option<cache::OpenFileCacheConfig>,
         /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
         modules: Option<Vec<String>>,
     },
@@ -5096,7 +5079,6 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                 let mut path: Option<String> = None;
                 let mut mode: Option<String> = None;
                 let mut index: Option<String> = None;
-                let mut security: Option<SecurityConfig> = None;
                 // Redirect 用フィールド
                 let mut redirect_url: Option<String> = None;
                 let mut redirect_status: Option<u16> = None;
@@ -5105,14 +5087,6 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                 let mut sni_name: Option<String> = None;
                 // H2C 用フィールド（Proxy用）
                 let mut use_h2c: Option<bool> = None;
-                // 圧縮設定（Proxy用）
-                let mut compression: Option<CompressionConfig> = None;
-                // バッファリング設定（Proxy用）
-                let mut buffering_config: Option<buffering::BufferingConfig> = None;
-                // キャッシュ設定（Proxy/File用）
-                let mut cache_config: Option<cache::CacheConfig> = None;
-                // OpenFileCache設定（File用）
-                let mut open_file_cache_config: Option<cache::OpenFileCacheConfig> = None;
                 // WASMモジュール名のリスト
                 let mut modules: Option<Vec<String>> = None;
                 
@@ -5124,11 +5098,10 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                         "path" => path = Some(map.next_value()?),
                         "mode" => mode = Some(map.next_value()?),
                         "index" => index = Some(map.next_value()?),
-                        "security" => security = Some(map.next_value()?),
-                        "compression" => compression = Some(map.next_value()?),
-                        "buffering" => buffering_config = Some(map.next_value()?),
-                        "cache" => cache_config = Some(map.next_value()?),
-                        "open_file_cache" => open_file_cache_config = Some(map.next_value()?),
+                        // security, compression, buffering, cache, open_file_cache は route 直下で設定されるため、ここでは無視
+                        "security" | "compression" | "buffering" | "cache" | "open_file_cache" => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
                         "redirect_url" => redirect_url = Some(map.next_value()?),
                         "redirect_status" => redirect_status = Some(map.next_value()?),
                         "preserve_path" => preserve_path = Some(map.next_value()?),
@@ -5140,10 +5113,6 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                 }
                 
                 let backend_type = backend_type.unwrap_or_else(|| "File".to_string());
-                let security = security.unwrap_or_default();
-                let compression = compression.unwrap_or_default();
-                let buffering = buffering_config.unwrap_or_default();
-                let cache = cache_config.unwrap_or_default();
                 
                 match backend_type.as_str() {
                     "Proxy" => {
@@ -5151,10 +5120,6 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                         if let Some(upstream_name) = upstream {
                             Ok(BackendConfig::ProxyUpstream { 
                                 upstream: upstream_name, 
-                                security, 
-                                compression,
-                                buffering,
-                                cache,
                                 modules,
                             })
                         } else {
@@ -5164,10 +5129,6 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                                 url, 
                                 sni_name, 
                                 use_h2c, 
-                                security, 
-                                compression,
-                                buffering,
-                                cache,
                                 modules,
                             })
                         }
@@ -5197,9 +5158,6 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                             path, 
                             mode, 
                             index, 
-                            security, 
-                            cache,
-                            open_file_cache: open_file_cache_config,
                             modules,
                         })
                     }
@@ -6738,20 +6696,14 @@ fn load_backend(
     route: &Route,
     upstream_groups: &HashMap<String, Arc<UpstreamGroup>>,
 ) -> io::Result<Backend> {
-    // Routeレベルの設定を取得（存在する場合はactionの設定をオーバーライド）
-    let route_security = route.security.as_ref();
-    let route_compression = route.compression.as_ref();
-    let route_buffering = route.buffering.as_ref();
-    let route_cache = route.cache.as_ref();
-    let route_open_file_cache = route.open_file_cache.as_ref();
+    // Routeレベルの設定を取得（route直下の設定のみを使用）
+    let security = route.security.as_ref().map(|s| s.clone()).unwrap_or_default();
+    let compression = route.compression.as_ref().map(|c| c.clone()).unwrap_or_default();
+    let buffering = route.buffering.as_ref().map(|b| b.clone()).unwrap_or_default();
+    let cache = route.cache.as_ref().map(|c| c.clone()).unwrap_or_default();
     
     match &route.action {
-        BackendConfig::Proxy { url, sni_name, use_h2c, security, compression, buffering, cache, modules } => {
-            // Routeレベルの設定があればそれを使用、なければactionの設定を使用
-            let security = route_security.unwrap_or(security);
-            let compression = route_compression.unwrap_or(compression);
-            let buffering = route_buffering.unwrap_or(buffering);
-            let cache = route_cache.unwrap_or(cache);
+        BackendConfig::Proxy { url, sni_name, use_h2c, modules } => {
             // 単一URLの場合は UpstreamGroup::single で単一サーバーのグループを作成
             let target = ProxyTarget::parse(url)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid proxy URL"))?
@@ -6791,12 +6743,7 @@ fn load_backend(
                 modules_arc,
             ))
         }
-        BackendConfig::ProxyUpstream { upstream, security, compression, buffering, cache, modules } => {
-            // Routeレベルの設定があればそれを使用、なければactionの設定を使用
-            let security = route_security.unwrap_or(security);
-            let compression = route_compression.unwrap_or(compression);
-            let buffering = route_buffering.unwrap_or(buffering);
-            let cache = route_cache.unwrap_or(cache);
+        BackendConfig::ProxyUpstream { upstream, modules } => {
             // Upstream グループ参照
             let group = upstream_groups.get(upstream)
                 .ok_or_else(|| io::Error::new(
@@ -6832,11 +6779,10 @@ fn load_backend(
                 modules_arc,
             ))
         }
-        BackendConfig::File { path, mode, index, security, cache, open_file_cache, modules } => {
-            // Routeレベルの設定があればそれを使用、なければactionの設定を使用
-            let security = route_security.unwrap_or(security);
-            let cache = route_cache.unwrap_or(cache);
-            let open_file_cache = route_open_file_cache.or(open_file_cache.as_ref());
+        BackendConfig::File { path, mode, index, modules } => {
+            // Routeレベルの設定のみを使用
+            let security = route.security.as_ref().map(|s| s.clone()).unwrap_or_default();
+            let cache = route.cache.as_ref().map(|c| c.clone()).unwrap_or_default();
             let metadata = fs::metadata(path)
                 .map_err(|e| {
                     let error_msg = format!(
@@ -6852,7 +6798,7 @@ fn load_backend(
             let index_file: Option<Arc<str>> = index.as_ref().map(|s| Arc::from(s.as_str()));
             let security = Arc::new(security.clone());
             let cache = Arc::new(cache.clone());
-            let open_file_cache_arc = open_file_cache.map(|c| Arc::new(c.clone()));
+            let open_file_cache_arc = route.open_file_cache.as_ref().map(|c| Arc::new(c.clone()));
             
             // キャッシュ設定のログ出力
             if cache.enabled {
