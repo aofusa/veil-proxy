@@ -151,6 +151,13 @@ pub mod buffering;
 /// - Cache-Control / Vary ヘッダー対応
 pub mod cache;
 
+/// ルーティング最適化モジュール
+/// - Phase 1: Host-based グループ化（O(1)ルックアップ）
+/// - Phase 2: Path Radix Tree（matchit crate）
+/// - Phase 3: CIDR Tree最適化
+/// - Phase 4: LRUキャッシュ
+pub mod routing;
+
 /// WASM拡張モジュール（Proxy-Wasm v0.2.1互換）
 #[cfg(feature = "wasm")]
 pub mod wasm;
@@ -5942,6 +5949,8 @@ struct LoadedConfig {
     tls_key_pem: Arc<Vec<u8>>,
     /// 統合ルーティング（唯一のルーティング方式）
     route: Arc<Vec<Route>>,
+    /// 最適化ルーター（Phase 1-4最適化適用）
+    optimized_router: Arc<routing::OptimizedRouter>,
     ktls_config: KtlsConfig,
     reuseport_balancing: ReuseportBalancing,
     num_threads: usize,
@@ -6005,6 +6014,8 @@ struct LoadedConfig {
 struct RuntimeConfig {
     /// 統合ルーティング（唯一のルーティング方式）
     route: Arc<Vec<Route>>,
+    /// 最適化ルーター（Phase 1-4最適化適用）
+    optimized_router: Arc<routing::OptimizedRouter>,
     /// TLS設定（ホットリロード時の参照用）
     #[allow(dead_code)]
     tls_config: Option<Arc<ServerConfig>>,
@@ -6038,6 +6049,7 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             route: Arc::new(Vec::new()),
+            optimized_router: Arc::new(routing::OptimizedRouter::new()),
             tls_config: None,
             ktls_config: Arc::new(KtlsConfig::default()),
             global_security: Arc::new(GlobalSecurityConfig::default()),
@@ -6095,8 +6107,12 @@ fn reload_config(path: &Path) -> io::Result<()> {
     // 現在のTLS設定を維持（ホットリロード対象外）
     let current = CURRENT_CONFIG.load();
     
+    // キャッシュをクリア（設定変更時）
+    loaded.optimized_router.clear_cache();
+    
     let runtime_config = RuntimeConfig {
         route: loaded.route,
+        optimized_router: loaded.optimized_router,
         // TLS設定は起動時のものを維持（セキュリティ上の理由）
         tls_config: current.tls_config.clone(),
         ktls_config: current.ktls_config.clone(),
@@ -6128,6 +6144,8 @@ fn reload_config(path: &Path) -> io::Result<()> {
 struct LoadedConfigWithoutTls {
     /// 統合ルーティング（唯一のルーティング方式）
     route: Arc<Vec<Route>>,
+    /// 最適化ルーター（Phase 1-4最適化適用）
+    optimized_router: Arc<routing::OptimizedRouter>,
     global_security: GlobalSecurityConfig,
     prometheus_config: PrometheusConfig,
     upstream_groups: Arc<HashMap<String, Arc<UpstreamGroup>>>,
@@ -6197,6 +6215,9 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
         Arc::new(Vec::new())
     };
 
+    // OptimizedRouter を構築（Phase 1-4 最適化）
+    let optimized_router = build_optimized_router(&routes);
+
     // グローバルOpenFileCache設定を適用
     let performance_config = &config.performance;
     cache::configure_global_open_file_cache(
@@ -6207,6 +6228,7 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
 
     Ok(LoadedConfigWithoutTls {
         route: routes,
+        optimized_router,
         global_security: config.security,
         prometheus_config: config.prometheus,
         upstream_groups: Arc::new(upstream_groups),
@@ -6218,6 +6240,42 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
         http3_config,
         performance: config.performance.clone(),
     })
+}
+
+/// ルート配列から OptimizedRouter を構築
+/// 
+/// Phase 1: Host-based グループ化
+/// Phase 2: Path Radix Tree (matchit)
+/// Phase 3: CIDR Tree 最適化
+/// Phase 4: LRU キャッシュ（構築時に初期化）
+fn build_optimized_router(routes: &[Route]) -> Arc<routing::OptimizedRouter> {
+    let mut router = routing::OptimizedRouter::with_cache_capacity(10000);
+    
+    for (idx, route) in routes.iter().enumerate() {
+        let conditions = &route.conditions;
+        
+        // host条件
+        let host = conditions.host.as_deref();
+        // path条件
+        let path = conditions.path.as_deref();
+        // source_ip条件
+        let source_ip = conditions.source_ip.as_deref();
+        
+        router.add_route(idx, host, path, source_ip);
+    }
+    
+    // CIDRマッチャーを最適化（ソート）
+    router.finalize();
+    
+    info!(
+        "Built OptimizedRouter: {} routes indexed (host groups: {} exact + {} wildcard, path patterns: {})",
+        routes.len(),
+        router.host_router.exact_count(),
+        router.host_router.wildcard_count(),
+        router.path_router.patterns_count()
+    );
+    
+    Arc::new(router)
 }
 
 fn load_config(path: &Path) -> io::Result<LoadedConfig> {
@@ -6298,6 +6356,9 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     } else {
         Arc::new(Vec::new())
     };
+
+    // OptimizedRouter を構築（Phase 1-4 最適化）
+    let optimized_router = build_optimized_router(&routes);
 
     // グローバルOpenFileCache設定を適用
     let performance_config = &config.performance;
@@ -6387,6 +6448,7 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         tls_cert_pem: Arc::new(tls_cert_pem),
         tls_key_pem: Arc::new(tls_key_pem),
         route: routes,
+        optimized_router,
         ktls_config,
         reuseport_balancing: config.performance.reuseport_balancing,
         num_threads,
@@ -7053,6 +7115,7 @@ fn main() {
     // ワーカースレッドは CURRENT_CONFIG.load() を使用して最新の設定を取得
     let runtime_config = RuntimeConfig {
         route: loaded_config.route.clone(),
+        optimized_router: loaded_config.optimized_router.clone(),
         tls_config: Some(loaded_config.tls_config.clone()),
         ktls_config: ktls_config.clone(),
         global_security: Arc::new(loaded_config.global_security.clone()),
@@ -10801,9 +10864,15 @@ fn matches_conditions(
     true
 }
 
-/// 統合ルーティング評価関数（唯一の評価方式）
+/// 統合ルーティング評価関数（最適化版）
 /// 
-/// 配列の順序で評価（first-match方式）
+/// Phase 1-4最適化を適用:
+/// - Phase 1: Host-based グループ化 (O(1) HashMap lookup)
+/// - Phase 2: Path Radix Tree (matchit)
+/// - Phase 3: CIDR Tree 最適化
+/// - Phase 4: LRU キャッシュ
+/// 
+/// 候補ルートのみを評価することで、線形O(n)から大幅に削減
 pub fn find_backend_unified(
     host: &[u8],
     path: &[u8],
@@ -10813,6 +10882,178 @@ pub fn find_backend_unified(
     source_ip: &SocketAddr,
     routes: &[Route],
     upstream_groups: &Arc<HashMap<String, Arc<UpstreamGroup>>>,
+) -> Option<(Box<[u8]>, Backend)> {
+    // CURRENT_CONFIG から OptimizedRouter を取得
+    let config = CURRENT_CONFIG.load();
+    let optimized_router = &config.optimized_router;
+    
+    // Phase 4: キャッシュチェック
+    let cache_key = routing::RouteCacheKey::new(host, path, method, source_ip);
+    if let Some(cached_result) = optimized_router.try_cache(&cache_key) {
+        match cached_result {
+            Some(route_idx) => {
+                // キャッシュヒット: ルートが見つかっている
+                if let Some(route) = routes.get(route_idx) {
+                    // 条件が変わっていないか確認（header/query/methodは動的）
+                    if matches_conditions(
+                        &route.conditions,
+                        host,
+                        path,
+                        method,
+                        headers,
+                        query,
+                        source_ip,
+                    ) {
+                        if let Ok(backend) = load_backend(route, upstream_groups) {
+                            let prefix = extract_path_prefix(route);
+                            return Some((prefix, backend));
+                        }
+                    }
+                }
+            }
+            None => {
+                // キャッシュヒット: マッチなし
+                return None;
+            }
+        }
+    }
+    
+    // キャッシュミス: OptimizedRouter を使用して候補を取得
+    let host_str = String::from_utf8_lossy(host);
+    let path_str = String::from_utf8_lossy(path);
+    
+    // Phase 1-3: 候補ルートを取得
+    let candidates = optimized_router.get_candidates(&host_str, &path_str, source_ip);
+    
+    if candidates.is_empty() {
+        // 候補がない場合はフォールバック（全ルート走査）
+        // これはOptimizedRouterの構築が不完全な場合のセーフティネット
+        return find_backend_linear(
+            host, path, method, headers, query, source_ip,
+            routes, upstream_groups, &cache_key, optimized_router
+        );
+    }
+    
+    // 候補ルートのみを評価（first-match）
+    // 候補は既にソート済み（インデックス順）
+    for &route_idx in &candidates {
+        if let Some(route) = routes.get(route_idx) {
+            // 残りの条件（header, method, query）を評価
+            let matched = matches_remaining_conditions(
+                &route.conditions,
+                method,
+                headers,
+                query,
+            );
+            
+            if matched {
+                debug!(
+                    "Route[{}] matched (optimized): host={:?} path={:?} method={:?}",
+                    route_idx,
+                    route.conditions.host,
+                    route.conditions.path,
+                    route.conditions.method
+                );
+                match load_backend(route, upstream_groups) {
+                    Ok(backend) => {
+                        let prefix = extract_path_prefix(route);
+                        // キャッシュに保存
+                        optimized_router.cache_result(cache_key, Some(route_idx));
+                        return Some((prefix, backend));
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Route[{}] load_backend failed: {} (action={:?})",
+                            route_idx, e, route.action
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+    
+    // 候補内でマッチしなかった場合
+    debug!(
+        "No route matched in {} candidates: host='{}' path='{}' method='{}'",
+        candidates.len(),
+        host_str,
+        path_str,
+        String::from_utf8_lossy(method),
+    );
+    
+    // キャッシュにマッチなしを保存
+    optimized_router.cache_result(cache_key, None);
+    None
+}
+
+/// パスプレフィックスを抽出
+#[inline]
+fn extract_path_prefix(route: &Route) -> Box<[u8]> {
+    if let Some(ref path_pattern) = route.conditions.path {
+        if let Some(prefix_str) = path_pattern.strip_suffix("/*") {
+            prefix_str.as_bytes().into()
+        } else {
+            path_pattern.as_bytes().into()
+        }
+    } else {
+        Box::new([])
+    }
+}
+
+/// 残りの条件（host/path/source_ip以外）のみをチェック
+/// 
+/// OptimizedRouterで既にhost/path/source_ipはフィルタ済み
+#[inline]
+fn matches_remaining_conditions(
+    conditions: &RouteConditions,
+    method: &[u8],
+    headers: &HashMap<String, String>,
+    query: &HashMap<String, String>,
+) -> bool {
+    // header条件のチェック
+    if let Some(ref header_map) = conditions.header {
+        for (key, value_pattern) in header_map {
+            let header_value = headers.get(key).map(|s| s.as_str()).unwrap_or("");
+            if !matches_wildcard(value_pattern, header_value) {
+                return false;
+            }
+        }
+    }
+    
+    // method条件のチェック
+    if let Some(ref methods) = conditions.method {
+        let method_str = std::str::from_utf8(method).unwrap_or("");
+        if !methods.iter().any(|m| m.eq_ignore_ascii_case(method_str)) {
+            return false;
+        }
+    }
+    
+    // query条件のチェック
+    if let Some(ref query_map) = conditions.query {
+        for (key, value_pattern) in query_map {
+            let query_value = query.get(key).map(|s| s.as_str()).unwrap_or("");
+            if !matches_wildcard(value_pattern, query_value) {
+                return false;
+            }
+        }
+    }
+    
+    true
+}
+
+/// フォールバック用線形探索（セーフティネット）
+fn find_backend_linear(
+    host: &[u8],
+    path: &[u8],
+    method: &[u8],
+    headers: &HashMap<String, String>,
+    query: &HashMap<String, String>,
+    source_ip: &SocketAddr,
+    routes: &[Route],
+    upstream_groups: &Arc<HashMap<String, Arc<UpstreamGroup>>>,
+    cache_key: &routing::RouteCacheKey,
+    optimized_router: &routing::OptimizedRouter,
 ) -> Option<(Box<[u8]>, Backend)> {
     // 配列の順序で評価（first-match）
     for (i, route) in routes.iter().enumerate() {
@@ -10828,7 +11069,7 @@ pub fn find_backend_unified(
         
         if matched {
             debug!(
-                "Route[{}] matched: host={:?} path={:?} method={:?}",
+                "Route[{}] matched (linear fallback): host={:?} path={:?} method={:?}",
                 i,
                 route.conditions.host,
                 route.conditions.path,
@@ -10836,18 +11077,9 @@ pub fn find_backend_unified(
             );
             match load_backend(route, upstream_groups) {
                 Ok(backend) => {
-                    // マッチしたルートのpath条件をprefixとして返す
-                    // path条件がない場合は空のprefixを返す
-                    let prefix: Box<[u8]> = if let Some(ref path_pattern) = route.conditions.path {
-                        // ワイルドカードパターン（/*で終わる）の場合は、/*を除去
-                        if let Some(prefix_str) = path_pattern.strip_suffix("/*") {
-                            prefix_str.as_bytes().into()
-                        } else {
-                            path_pattern.as_bytes().into()
-                        }
-                    } else {
-                        Box::new([])
-                    };
+                    let prefix = extract_path_prefix(route);
+                    // キャッシュに保存
+                    optimized_router.cache_result(cache_key.clone(), Some(i));
                     return Some((prefix, backend));
                 }
                 Err(e) => {
@@ -10855,7 +11087,6 @@ pub fn find_backend_unified(
                         "Route[{}] load_backend failed: {} (action={:?})",
                         i, e, route.action
                     );
-                    // エラーが発生しても次のルートを試す
                     continue;
                 }
             }
@@ -10863,12 +11094,15 @@ pub fn find_backend_unified(
     }
     
     debug!(
-        "No route matched: host='{}' path='{}' method='{}' routes_count={}",
+        "No route matched (linear fallback): host='{}' path='{}' method='{}' routes_count={}",
         String::from_utf8_lossy(host),
         String::from_utf8_lossy(path),
         String::from_utf8_lossy(method),
         routes.len()
     );
+    
+    // キャッシュにマッチなしを保存
+    optimized_router.cache_result(cache_key.clone(), None);
     None
 }
 

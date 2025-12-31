@@ -210,3 +210,7 @@ harness = false
 [[bench]]
 name = "memory"
 harness = false
+
+[[bench]]
+name = "routing"
+harness = false
