@@ -32,22 +32,35 @@ impl FilterEngine {
         })
     }
 
-    /// Get modules for a path
-    pub fn get_modules_for_path(&self, path: &str) -> Vec<Arc<LoadedModule>> {
-        self.registry.get_modules_for_route(path)
-    }
-
     /// Execute on_request_headers callback for all modules
+    /// 
+    /// Note: This method is deprecated. Use `on_request_headers_with_modules` instead.
+    /// This method always returns Continue without applying any modules.
     pub fn on_request_headers(
         &self,
+        _path: &str,
+        _method: &str,
+        headers: &[(String, String)],
+        _client_ip: &str,
+        _end_of_stream: bool,
+    ) -> FilterResult {
+        // ルートレベルのmodulesフィールドを使用するため、このメソッドは使用しない
+        FilterResult::Continue {
+            headers: headers.to_vec(),
+            body: None,
+        }
+    }
+
+    /// Execute on_request_headers for specified modules (internal helper)
+    fn execute_on_request_headers_for_modules(
+        &self,
+        modules: &[Arc<LoadedModule>],
         path: &str,
         method: &str,
         headers: &[(String, String)],
         client_ip: &str,
         end_of_stream: bool,
     ) -> FilterResult {
-        let modules = self.get_modules_for_path(path);
-
         if modules.is_empty() {
             return FilterResult::Continue {
                 headers: headers.to_vec(),
@@ -57,7 +70,7 @@ impl FilterEngine {
 
         let mut current_headers = headers.to_vec();
 
-        for module in &modules {
+        for module in modules {
             let result = self.execute_on_request_headers(
                 module,
                 path,

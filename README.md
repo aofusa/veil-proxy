@@ -3179,11 +3179,9 @@ allow_request_headers_write = true
 allow_send_local_response = true
 allow_http_calls = true
 allowed_upstreams = ["webdis"]  # Allowed HTTP call destinations
-
-# Route configuration
-[wasm.routes."/api/"]
-modules = ["my_filter"]
 ```
+
+**Note**: To apply WASM modules to specific routes, use the `modules` field in the route configuration (see Routing section).
 
 ### Default Settings
 

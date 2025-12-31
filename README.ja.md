@@ -3179,11 +3179,9 @@ allow_request_headers_write = true
 allow_send_local_response = true
 allow_http_calls = true
 allowed_upstreams = ["webdis"]  # HTTP呼び出し許可先
-
-# ルート設定
-[wasm.routes."/api/"]
-modules = ["my_filter"]
 ```
+
+**注意**: 特定のルートにWASMモジュールを適用するには、ルート設定の`modules`フィールドを使用してください（ルーティングセクションを参照）。
 
 ### デフォルト設定
 

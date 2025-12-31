@@ -1,7 +1,6 @@
 //! Types for WASM Extension System
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 use super::capabilities::ModuleCapabilities;
 
@@ -19,10 +18,6 @@ pub struct WasmConfig {
     /// Module definitions
     #[serde(default)]
     pub modules: Vec<ModuleConfig>,
-
-    /// Route-to-module mappings
-    #[serde(default)]
-    pub routes: HashMap<String, RouteModules>,
 }
 
 impl Default for WasmConfig {
@@ -31,7 +26,6 @@ impl Default for WasmConfig {
             enabled: false,
             defaults: WasmDefaults::default(),
             modules: Vec::new(),
-            routes: HashMap::new(),
         }
     }
 }
@@ -115,14 +109,6 @@ pub struct ModuleConfig {
     pub capabilities: ModuleCapabilities,
 }
 
-/// Route-to-module mapping
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct RouteModules {
-    /// List of module names to apply to this route
-    #[serde(default)]
-    pub modules: Vec<String>,
-}
-
 /// Filter action returned by callbacks
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterAction {
@@ -192,19 +178,6 @@ impl WasmConfig {
         for module in &self.modules {
             if !module_names.insert(&module.name) {
                 anyhow::bail!("Duplicate module name: {}", module.name);
-            }
-        }
-
-        // ルートで参照されているモジュールが存在するかチェック
-        for (route, route_modules) in &self.routes {
-            for module_name in &route_modules.modules {
-                if !self.modules.iter().any(|m| &m.name == module_name) {
-                    anyhow::bail!(
-                        "Route '{}' references unknown module: {}",
-                        route,
-                        module_name
-                    );
-                }
             }
         }
 

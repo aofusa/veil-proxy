@@ -2,7 +2,6 @@
 //!
 //! Manages loading and caching of WASM modules.
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -30,9 +29,7 @@ pub struct ModuleRegistry {
     /// Wasmtime engine
     engine: Engine,
     /// Loaded modules
-    modules: HashMap<String, Arc<LoadedModule>>,
-    /// Route to module mapping
-    routes: HashMap<String, Vec<String>>,
+    modules: std::collections::HashMap<String, Arc<LoadedModule>>,
 }
 
 impl ModuleRegistry {
@@ -43,20 +40,12 @@ impl ModuleRegistry {
 
         let mut registry = Self {
             engine,
-            modules: HashMap::new(),
-            routes: HashMap::new(),
+            modules: std::collections::HashMap::new(),
         };
 
         // Load all modules
         for module_config in &config.modules {
             registry.load_module(module_config)?;
-        }
-
-        // Setup routes
-        for (route, route_modules) in &config.routes {
-            registry
-                .routes
-                .insert(route.clone(), route_modules.modules.clone());
         }
 
         Ok(registry)
@@ -138,43 +127,6 @@ impl ModuleRegistry {
     /// Get a loaded module by name
     pub fn get_module(&self, name: &str) -> Option<Arc<LoadedModule>> {
         self.modules.get(name).cloned()
-    }
-
-    /// Get modules for a route
-    pub fn get_modules_for_route(&self, path: &str) -> Vec<Arc<LoadedModule>> {
-        // Try exact match first
-        if let Some(module_names) = self.routes.get(path) {
-            return module_names
-                .iter()
-                .filter_map(|name| self.get_module(name))
-                .collect();
-        }
-
-        // Try prefix match
-        let mut best_match: Option<(&str, &Vec<String>)> = None;
-
-        for (route, modules) in &self.routes {
-            if route == "*" {
-                if best_match.is_none() {
-                    best_match = Some((route, modules));
-                }
-            } else if path.starts_with(route.as_str()) {
-                if best_match.is_none()
-                    || route.len() > best_match.as_ref().map(|(r, _)| r.len()).unwrap_or(0)
-                {
-                    best_match = Some((route, modules));
-                }
-            }
-        }
-
-        best_match
-            .map(|(_, modules)| {
-                modules
-                    .iter()
-                    .filter_map(|name| self.get_module(name))
-                    .collect()
-            })
-            .unwrap_or_default()
     }
 
     /// Get the Wasmtime engine

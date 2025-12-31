@@ -1029,10 +1029,6 @@ connection_window_size = 16777216
 #   # 注意: 以下のcapabilityは存在しません:
 #   # - allow_grpc_calls (現在未実装)
 #
-# ルートごとのモジュール適用
-# [wasm.routes."api.example.com"]
-# modules = ["auth_filter"]  # 適用するモジュール名のリスト
-
 # ==========================================
 # Prometheusメトリクス
 # ==========================================

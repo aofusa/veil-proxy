@@ -541,10 +541,8 @@ impl Http3Handler {
                 let modules_to_apply = if let Some(backend_modules) = backend.modules() {
                     backend_modules.to_vec()
                 } else {
-                    wasm_engine.get_modules_for_path(path_str)
-                        .iter()
-                        .map(|m| m.name.clone())
-                        .collect()
+                    // ルートレベルのmodulesが指定されていない場合は、WASMモジュールを適用しない
+                    Vec::new()
                 };
                 
                 if !modules_to_apply.is_empty() {

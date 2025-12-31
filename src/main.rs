@@ -8912,14 +8912,12 @@ where
             let path_str = std::str::from_utf8(path).unwrap_or("/");
             let method_str = std::str::from_utf8(method).unwrap_or("GET");
             
-            let modules_to_apply = if let Some(backend_modules) = backend.modules() {
-                backend_modules.to_vec()
-            } else {
-                wasm_engine.get_modules_for_path(path_str)
-                    .iter()
-                    .map(|m| m.name.clone())
-                    .collect()
-            };
+                let modules_to_apply = if let Some(backend_modules) = backend.modules() {
+                    backend_modules.to_vec()
+                } else {
+                    // ルートレベルのmodulesが指定されていない場合は、WASMモジュールを適用しない
+                    Vec::new()
+                };
             
             if !modules_to_apply.is_empty() {
                 // HTTP/2のヘッダーを取得
@@ -10378,11 +10376,8 @@ async fn handle_requests(
                             // バックエンドにmodulesが指定されている場合はそれを使用
                             backend_modules.to_vec()
                         } else {
-                            // 指定されていない場合は、従来通り[wasm.routes]から取得
-                            wasm_engine.get_modules_for_path(path_str)
-                                .iter()
-                                .map(|m| m.name.clone())
-                                .collect()
+                            // ルートレベルのmodulesが指定されていない場合は、WASMモジュールを適用しない
+                            Vec::new()
                         };
                         
                         // レスポンス処理用にモジュールリストを保存
