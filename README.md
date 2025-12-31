@@ -352,69 +352,104 @@ ktls_enabled = true         # Enable kTLS (Linux 5.15+, requires feature flag)
 ktls_fallback_enabled = true # Fallback to rustls on kTLS failure (default: true)
 tcp_cork_enabled = true     # Use TCP_CORK during kTLS setup (default: true)
 
-# Host-based routing
-[host_routes."example.com"]
+# Unified routing (AWS ALB-compliant)
+# Routes are evaluated in array order (first-match)
+
+[[routes]]
+[routes.conditions]
+host = "example.com"
+[routes.action]
 type = "File"
 path = "/var/www/example"
 mode = "sendfile"
 
-[host_routes."api.example.com"]
+[[routes]]
+[routes.conditions]
+host = "api.example.com"
+[routes.action]
 type = "Proxy"
 url = "http://localhost:8080"
 
-# Path-based routing
-
 # Static file (exact match)
-[path_routes."example.com"."/robots.txt"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/robots.txt"
+[routes.action]
 type = "File"
 path = "/var/www/robots.txt"
 
 # Directory serving (with trailing slash)
-[path_routes."example.com"."/static/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/static/*"
+[routes.action]
 type = "File"
 path = "/var/www/assets/"
 mode = "sendfile"
-
 # OpenFileCache configuration (route-specific, overrides global setting)
 # This enables file metadata caching for this route, reducing system calls
-[path_routes."example.com"."/static/".open_file_cache]
+[routes.action.open_file_cache]
 enabled = true
 valid_duration_secs = 300  # 5 minutes (static files change infrequently)
 max_entries = 50000
 
 # Directory serving (without trailing slash - same behavior, no redirect)
-[path_routes."example.com"."/docs"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/docs"
+[routes.action]
 type = "File"
 path = "/var/www/docs/"
 
 # Custom index file
-[path_routes."example.com"."/user/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/user/*"
+[routes.action]
 type = "File"
 path = "/var/www/user/"
 index = "profile.html"
 
 # Proxy (with trailing slash)
-[path_routes."example.com"."/api/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/api/*"
+[routes.action]
 type = "Proxy"
 url = "http://localhost:8080/app/"
 
 # Proxy (without trailing slash - same behavior)
-[path_routes."example.com"."/backend"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/backend"
+[routes.action]
 type = "Proxy"
 url = "http://localhost:3000"
 
 # Root
-[path_routes."example.com"."/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/"
+[routes.action]
 type = "File"
 path = "/var/www/index.html"
 ```
 
 ## Routing
 
-### Routing Priority
+### Unified Routing (AWS ALB-compliant)
 
-1. **Host-based routing** (`[host_routes]`): Exact match on Host header
-2. **Path-based routing** (`[path_routes."hostname"]`): Longest path match (Radix Tree)
+Routes are evaluated in array order (first-match). All routes use the unified `[[routes]]` structure with `conditions` and `action` fields.
+
+1. **Route conditions** (`[routes.conditions]`): Match on host, path, headers, method, query parameters, or source IP
+2. **Route action** (`[routes.action]`): Backend action (File, Proxy, Redirect, etc.)
 
 ### Backend Types
 
@@ -437,7 +472,11 @@ If `path` in the configuration is a file, the file is returned only when the req
 ```toml
 # /robots.txt → returns /var/www/robots.txt
 # /robots.txt/extra → 404 Not Found (cannot traverse below a file)
-[path_routes."example.com"."/robots.txt"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/robots.txt"
+[routes.action]
 type = "File"
 path = "/var/www/robots.txt"
 ```
@@ -449,12 +488,20 @@ If `path` in the configuration is a directory, the remaining path after removing
 
 ```toml
 # With trailing slash (traditional style)
-[path_routes."example.com"."/static/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/static/*"
+[routes.action]
 type = "File"
 path = "/var/www/assets/"
 
 # Without trailing slash (same behavior, no 301 redirect)
-[path_routes."example.com"."/docs"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/docs"
+[routes.action]
 type = "File"
 path = "/var/www/docs/"
 ```
@@ -474,13 +521,21 @@ Defaults to `index.html` if not specified.
 
 ```toml
 # /user/ → returns /var/www/user/profile.html
-[path_routes."example.com"."/user/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/user/*"
+[routes.action]
 type = "File"
 path = "/var/www/user/"
 index = "profile.html"
 
 # /app/ → returns /var/www/app/dashboard.html
-[path_routes."example.com"."/app/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/app/*"
+[routes.action]
 type = "File"
 path = "/var/www/app/"
 index = "dashboard.html"
@@ -493,12 +548,20 @@ The remaining path after removing the prefix is joined to the backend URL.
 
 ```toml
 # With trailing slash
-[path_routes."example.com"."/api/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/api/*"
+[routes.action]
 type = "Proxy"
 url = "http://localhost:8080/app/"
 
 # Without trailing slash (same behavior)
-[path_routes."example.com"."/backend"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/backend"
+[routes.action]
 type = "Proxy"
 url = "http://localhost:3000"
 ```
@@ -518,19 +581,31 @@ url = "http://localhost:3000"
 
 ```toml
 # Directory serving (sendfile mode)
-[path_routes."example.com"."/static/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/static/*"
+[routes.action]
 type = "File"
 path = "/var/www/static"
 mode = "sendfile"
 
 # Single file serving (memory mode)
-[path_routes."example.com"."/favicon.ico"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/favicon.ico"
+[routes.action]
 type = "File"
 path = "/var/www/favicon.ico"
 mode = "memory"
 
 # Default when type and mode are omitted (type = "File", mode = "sendfile")
-[path_routes."example.com"."/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/"
+[routes.action]
 path = "/var/www/html"
 ```
 
@@ -540,12 +615,20 @@ Supports proxying to HTTP and HTTPS backends:
 
 ```toml
 # HTTP backend
-[path_routes."example.com"."/api/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/api/*"
+[routes.action]
 type = "Proxy"
 url = "http://localhost:8080"
 
 # HTTPS backend (TLS client connection)
-[path_routes."example.com"."/secure/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/secure/*"
+[routes.action]
 type = "Proxy"
 url = "https://backend.example.com"
 ```
@@ -556,7 +639,11 @@ When the backend supports H2C (HTTP/2 without TLS), specify `use_h2c = true` to 
 
 ```toml
 # H2C connection to gRPC backend
-[path_routes."example.com"."/grpc/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/grpc/*"
+[routes.action]
 type = "Proxy"
 url = "http://localhost:50051"
 use_h2c = true
@@ -580,7 +667,11 @@ This allows obtaining the correct certificate even from servers with virtual hos
 
 ```toml
 # IP address specification + SNI name
-[path_routes."example.com"."/internal-api/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/internal-api/*"
+[routes.action]
 type = "Proxy"
 url = "https://192.168.1.100:443"
 sni_name = "api.internal.example.com"
@@ -616,7 +707,11 @@ servers = [
   healthy_threshold = 2
 
 # Route referencing upstream
-[path_routes."example.com"."/api/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/api/*"
+[routes.action]
 type = "Proxy"
 upstream = "api-pool"
 ```
@@ -639,7 +734,11 @@ servers = [
 ]
 
 # Route referencing upstream
-[path_routes."example.com"."/api/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/api/*"
+[routes.action]
 type = "Proxy"
 upstream = "https-pool"
 ```
@@ -654,12 +753,20 @@ WebSocket is automatically supported with regular Proxy. Polling behavior during
 
 ```toml
 # WebSocket application
-[path_routes."example.com"."/ws/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/ws/*"
+[routes.action]
 type = "Proxy"
 url = "http://localhost:3000"
 
 # WebSocket with load balancing
-[path_routes."example.com"."/ws-lb/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/ws-lb/*"
+[routes.action]
 type = "Proxy"
 upstream = "websocket-pool"
 ```
@@ -698,31 +805,43 @@ Example: initial=1ms, max=100ms, multiplier=2.0
 
 ```toml
 # Real-time game (low latency priority)
-[path_routes."game.example.com"."/ws/"]
+[[routes]]
+[routes.conditions]
+host = "game.example.com"
+path = "/ws/*"
+[routes.action]
 type = "Proxy"
 url = "http://localhost:3000"
 
-  [path_routes."game.example.com"."/ws/".security]
+[routes.action.security]
   websocket_poll_mode = "fixed"
   websocket_poll_timeout_ms = 1
 
 # Chat application (balance focused)
-[path_routes."chat.example.com"."/ws/"]
+[[routes]]
+[routes.conditions]
+host = "chat.example.com"
+path = "/ws/*"
+[routes.action]
 type = "Proxy"
 url = "http://localhost:3001"
 
-  [path_routes."chat.example.com"."/ws/".security]
+[routes.action.security]
   websocket_poll_mode = "adaptive"
   websocket_poll_timeout_ms = 1
   websocket_poll_max_timeout_ms = 50
   websocket_poll_backoff_multiplier = 2.0
 
 # Monitoring dashboard (CPU efficiency priority)
-[path_routes."monitor.example.com"."/ws/"]
+[[routes]]
+[routes.conditions]
+host = "monitor.example.com"
+path = "/ws/*"
+[routes.action]
 type = "Proxy"
 url = "http://localhost:3002"
 
-  [path_routes."monitor.example.com"."/ws/".security]
+[routes.action.security]
   websocket_poll_mode = "adaptive"
   websocket_poll_timeout_ms = 10
   websocket_poll_max_timeout_ms = 200
@@ -866,22 +985,30 @@ Add a `security` subsection to each route for fine-grained security settings.
 
 ```toml
 # Security settings for API
-[path_routes."example.com"."/api/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/api/*"
+[routes.action]
 type = "Proxy"
 url = "http://localhost:8080/app/"
 
-  [path_routes."example.com"."/api/".security]
+[routes.action.security]
   allowed_methods = ["GET", "POST", "PUT"]
   max_request_body_size = 5_242_880  # 5MB
   backend_connect_timeout_secs = 5
   rate_limit_requests_per_min = 60
 
 # Admin API with IP restriction
-[path_routes."example.com"."/admin/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/admin/*"
+[routes.action]
 type = "Proxy"
 url = "http://localhost:9000/"
 
-  [path_routes."example.com"."/admin/".security]
+[routes.action.security]
   allowed_ips = [
     "192.168.0.0/16",
     "10.0.0.0/8",
@@ -943,11 +1070,15 @@ Add or remove headers before sending to the client. Also applies to static file 
 
 ```toml
 # Proxy with security headers
-[path_routes."example.com"."/api/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/api/*"
+[routes.action]
 type = "Proxy"
 url = "http://localhost:8080"
 
-  [path_routes."example.com"."/api/".security]
+[routes.action.security]
   # Add before forwarding to backend
   add_request_headers = { "X-Real-IP" = "$client_ip", "X-Forwarded-Proto" = "https" }
   # Remove before forwarding to backend
@@ -1026,13 +1157,21 @@ Configure HTTP redirects (301/302/303/307/308). Use for non-WWW handling, HTTPS 
 
 ```toml
 # Redirect to WWW
-[path_routes."example.com"."/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/"
+[routes.action]
 type = "Redirect"
 redirect_url = "https://www.example.com/"
 redirect_status = 301
 
 # Legacy URL to new URL migration (preserve path)
-[path_routes."example.com"."/legacy/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/legacy/*"
+[routes.action]
 type = "Redirect"
 redirect_url = "https://example.com/v2"
 redirect_status = 301
@@ -1041,7 +1180,11 @@ preserve_path = true
 # /legacy/api/data → https://example.com/v2/api/data
 
 # Force HTTP to HTTPS redirect (configured on different host)
-[path_routes."http.example.com"."/"]
+[[routes]]
+[routes.conditions]
+host = "http.example.com"
+path = "/"
+[routes.action]
 type = "Redirect"
 redirect_url = "https://example.com$request_uri"
 redirect_status = 301
@@ -1075,11 +1218,15 @@ Compression is **disabled by default** to maintain kTLS optimization (zero-copy 
 Enable per-route using the `compression` section:
 
 ```toml
-[path_routes."example.com"."/api/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/api/*"
+[routes.action]
 type = "Proxy"
 url = "http://localhost:8080"
 
-  [path_routes."example.com"."/api/".compression]
+[routes.action.compression]
   enabled = true
 ```
 
@@ -1114,11 +1261,15 @@ url = "http://localhost:8080"
 
 ```toml
 # API compression (fast, balanced)
-[path_routes."example.com"."/api/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/api/*"
+[routes.action]
 type = "Proxy"
 url = "http://localhost:8080"
 
-  [path_routes."example.com"."/api/".compression]
+[routes.action.compression]
   enabled = true
   preferred_encodings = ["zstd", "br", "gzip"]
   zstd_level = 3
@@ -1127,11 +1278,15 @@ url = "http://localhost:8080"
   min_size = 1024
 
 # Static assets (high compression)
-[path_routes."example.com"."/static/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/static/*"
+[routes.action]
 type = "File"
 path = "/var/www/static"
 
-  [path_routes."example.com"."/static/".compression]
+[routes.action.compression]
   enabled = true
   preferred_encodings = ["br", "gzip"]
   brotli_level = 6
@@ -1204,11 +1359,15 @@ Supports caching backend responses to reduce backend load and improve response t
 Cache is **disabled by default**. Enable per-route using the `cache` section:
 
 ```toml
-[path_routes."example.com"."/api/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/api/*"
+[routes.action]
 type = "Proxy"
 url = "http://localhost:8080"
 
-  [path_routes."example.com"."/api/".cache]
+[routes.action.cache]
   enabled = true
 ```
 
@@ -1235,11 +1394,15 @@ url = "http://localhost:8080"
 ### Configuration Example
 
 ```toml
-[path_routes."example.com"."/cached-api/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/cached-api/*"
+[routes.action]
 type = "Proxy"
 url = "http://localhost:8080"
 
-  [path_routes."example.com"."/cached-api/".cache]
+[routes.action.cache]
   enabled = true
   max_memory_size = 104857600  # 100MB
   disk_path = "/var/cache/veil/api"
@@ -1300,11 +1463,15 @@ Controls response buffering to prevent slow clients from blocking backend connec
 Buffering is **streaming (pass-through) by default**. Configure per-route using the `buffering` section:
 
 ```toml
-[path_routes."example.com"."/api/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/api/*"
+[routes.action]
 type = "Proxy"
 url = "http://localhost:8080"
 
-  [path_routes."example.com"."/api/".buffering]
+[routes.action.buffering]
   mode = "adaptive"
 ```
 
@@ -1323,11 +1490,15 @@ url = "http://localhost:8080"
 ### Configuration Example
 
 ```toml
-[path_routes."example.com"."/buffered-api/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/buffered-api/*"
+[routes.action]
 type = "Proxy"
 url = "http://localhost:8080"
 
-  [path_routes."example.com"."/buffered-api/".buffering]
+[routes.action.buffering]
   mode = "adaptive"
   adaptive_threshold = 1048576   # 1MB
   max_memory_buffer = 10485760   # 10MB
@@ -2167,16 +2338,24 @@ WebSocket is automatically supported with regular Proxy backends:
 
 ```toml
 # WebSocket application (default settings)
-[path_routes."example.com"."/ws/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/ws/*"
+[routes.action]
 type = "Proxy"
 url = "http://localhost:3000"
 
 # Low latency configuration (for real-time games)
-[path_routes."game.example.com"."/ws/"]
+[[routes]]
+[routes.conditions]
+host = "game.example.com"
+path = "/ws/*"
+[routes.action]
 type = "Proxy"
 url = "http://localhost:3001"
 
-  [path_routes."game.example.com"."/ws/".security]
+[routes.action.security]
   websocket_poll_mode = "fixed"
   websocket_poll_timeout_ms = 1
 ```
@@ -2213,7 +2392,11 @@ servers = [
 ]
 
 # Reference upstream in route
-[path_routes."example.com"."/api/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/api/*"
+[routes.action]
 type = "Proxy"
 upstream = "backend-pool"  # Specify upstream instead of URL
 ```
@@ -2241,7 +2424,11 @@ The traditional `url` specification continues to work:
 
 ```toml
 # Traditional single backend specification
-[path_routes."example.com"."/simple/"]
+[[routes]]
+[routes.conditions]
+host = "example.com"
+path = "/simple/*"
+[routes.action]
 type = "Proxy"
 url = "http://localhost:8080"
 ```

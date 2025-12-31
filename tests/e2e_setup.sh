@@ -152,20 +152,26 @@ key_path = "${FIXTURES_DIR}/key.pem"
 [logging]
 level = "warn"
 
-[path_routes."localhost"."/"]
+[[routes]]
+[routes.conditions]
+host = "localhost"
+path = "/"
+[routes.action]
 type = "File"
 path = "${FIXTURES_DIR}/backend1"
 index = "index.html"
-
-[path_routes."localhost"."/".security]
+[routes.action.security]
 add_response_headers = { "X-Server-Id" = "backend1" }
 
-[path_routes."127.0.0.1"."/"]
+[[routes]]
+[routes.conditions]
+host = "127.0.0.1"
+path = "/"
+[routes.action]
 type = "File"
 path = "${FIXTURES_DIR}/backend1"
 index = "index.html"
-
-[path_routes."127.0.0.1"."/".security]
+[routes.action.security]
 add_response_headers = { "X-Server-Id" = "backend1" }
 EOF
 
@@ -182,20 +188,26 @@ key_path = "${FIXTURES_DIR}/key.pem"
 [logging]
 level = "warn"
 
-[path_routes."localhost"."/"]
+[[routes]]
+[routes.conditions]
+host = "localhost"
+path = "/"
+[routes.action]
 type = "File"
 path = "${FIXTURES_DIR}/backend2"
 index = "index.html"
-
-[path_routes."localhost"."/".security]
+[routes.action.security]
 add_response_headers = { "X-Server-Id" = "backend2" }
 
-[path_routes."127.0.0.1"."/"]
+[[routes]]
+[routes.conditions]
+host = "127.0.0.1"
+path = "/"
+[routes.action]
 type = "File"
 path = "${FIXTURES_DIR}/backend2"
 index = "index.html"
-
-[path_routes."127.0.0.1"."/".security]
+[routes.action.security]
 add_response_headers = { "X-Server-Id" = "backend2" }
 EOF
 
@@ -226,24 +238,29 @@ servers = [
 ]
 tls_insecure = true
 
-[path_routes."localhost"."/"]
+[[routes]]
+[routes.conditions]
+host = "localhost"
+path = "/"
+[routes.action]
 type = "Proxy"
 upstream = "backend-pool"
-
-[path_routes."localhost"."/".security]
+[routes.action.security]
 add_response_headers = { "X-Proxied-By" = "veil", "X-Test-Header" = "e2e-test" }
 remove_response_headers = ["Server"]
-
-[path_routes."localhost"."/".compression]
+[routes.action.compression]
 enabled = true
 preferred_encodings = ["zstd", "br", "gzip"]
 min_size = 1024
 
-[path_routes."127.0.0.1"."/"]
+[[routes]]
+[routes.conditions]
+host = "127.0.0.1"
+path = "/"
+[routes.action]
 type = "Proxy"
 upstream = "backend-pool"
-
-[path_routes."127.0.0.1"."/".security]
+[routes.action.security]
 add_response_headers = { "X-Proxied-By" = "veil" }
 EOF
 
