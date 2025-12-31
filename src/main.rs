@@ -9929,11 +9929,12 @@ async fn handle_connection(
     acceptor: RustlsAcceptor,
     peer_addr: SocketAddr,
 ) {
-    // CURRENT_CONFIG から最新の設定を取得（ホットリロード対応）
-    // ArcSwap::load() はロックフリーで数ナノ秒
-    let config = CURRENT_CONFIG.load();
+    // HTTP/2 が有効な場合のみ設定を読み込む
     #[cfg(feature = "http2")]
-    let http2_enabled = config.http2_enabled;
+    let http2_enabled = {
+        let config = CURRENT_CONFIG.load();
+        config.http2_enabled
+    };
     
     // TLSハンドシェイクにタイムアウトを設定
     // rustls でハンドシェイク後、ktls2 で kTLS を有効化
@@ -9972,11 +9973,12 @@ async fn handle_connection(
     acceptor: simple_tls::SimpleTlsAcceptor,
     peer_addr: SocketAddr,
 ) {
-    // CURRENT_CONFIG から最新の設定を取得（ホットリロード対応）
-    // ArcSwap::load() はロックフリーで数ナノ秒
-    let config = CURRENT_CONFIG.load();
+    // HTTP/2 が有効な場合のみ設定を読み込む
     #[cfg(feature = "http2")]
-    let http2_enabled = config.http2_enabled;
+    let http2_enabled = {
+        let config = CURRENT_CONFIG.load();
+        config.http2_enabled
+    };
     
     // TLSハンドシェイクにタイムアウトを設定
     let tls_result = timeout(CONNECT_TIMEOUT, acceptor.accept(stream)).await;
