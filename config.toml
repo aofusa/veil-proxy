@@ -994,11 +994,11 @@ connection_window_size = 16777216
 # ------------------------------------------
 # リクエスト: /robots.txt → /var/www/robots.txt を返す
 # リクエスト: /robots.txt/hoge → 404 Not Found
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/robots.txt"
-[routes.action]
+[route.action]
 type = "File"
 path = "/var/www/robots.txt"
 
@@ -1007,48 +1007,48 @@ path = "/var/www/robots.txt"
 # ------------------------------------------
 
 # デフォルトインデックス (index.html)
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/static/*"
-[routes.action]
+[route.action]
 type = "File"
 path = "/var/www/assets/"
 mode = "sendfile"
 # OpenFileCache設定（ルーティングごと、グローバル設定を上書き）
 # この設定により、ファイルメタデータ（canonicalize、metadata、mime_guess）がキャッシュされ、
 # システムコールが60〜67%削減されます（キャッシュヒット時）
-[routes.action.open_file_cache]
+[route.open_file_cache]
 enabled = true
 valid_duration_secs = 300  # 5分（静的ファイルは変更頻度が低い）
 max_entries = 50000
 
 # カスタムインデックス (profile.html)
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/user/*"
-[routes.action]
+[route.action]
 type = "File"
 path = "/var/www/user/"
 index = "profile.html"
 
 # カスタムインデックス (dashboard.html)
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/app/*"
-[routes.action]
+[route.action]
 type = "File"
 path = "/var/www/app/"
 index = "dashboard.html"
 
 # 末尾スラッシュなし（301リダイレクトなし）
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/docs"
-[routes.action]
+[route.action]
 type = "File"
 path = "/var/www/docs/"
 
@@ -1057,11 +1057,11 @@ path = "/var/www/docs/"
 # ------------------------------------------
 
 # シンプルなプロキシ
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/backend"
-[routes.action]
+[route.action]
 type = "Proxy"
 url = "http://localhost:3000"
 
@@ -1071,7 +1071,7 @@ url = "http://localhost:3000"
 # バックエンドがIPアドレス指定の場合、SNIにドメイン名を指定可能
 # これにより、仮想ホスト構成のサーバーでも正しい証明書を取得できます
 #
-# [routes.action]
+# [route.action]
 # type = "Proxy"
 # url = "https://192.168.1.100:443"
 # sni_name = "api.internal.example.com"
@@ -1081,14 +1081,14 @@ url = "http://localhost:3000"
 # - ボディサイズ制限: 5MB
 # - バックエンド接続タイムアウト: 5秒
 # - レートリミット: 60リクエスト/分
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/api/*"
-[routes.action]
+[route.action]
 type = "Proxy"
 url = "http://localhost:8080/app/"
-[routes.action.security]
+[route.security]
 allowed_methods = ["GET", "POST", "PUT"]
 max_request_body_size = 5_242_880
 backend_connect_timeout_secs = 5
@@ -1104,11 +1104,11 @@ rate_limit_requests_per_min = 60
 #   - 有効にするとkTLSのゼロコピー最適化は迂回されます
 #   - 帯域節約が重要なAPIエンドポイントでの使用を推奨
 #
-# [routes.action]
+# [route.action]
 # type = "Proxy"
 # url = "http://localhost:8080"
 #
-#   [routes.action.compression]
+#   [route.compression]
 #   # 圧縮を有効化（デフォルト: false）
 #   enabled = true
 #   
@@ -1151,11 +1151,11 @@ rate_limit_requests_per_min = 60
 # 大量のJSONレスポンスを返すAPIエンドポイント
 # 帯域節約のため圧縮を有効化、速度優先で低レベル圧縮
 #
-# [routes.action]
+# [route.action]
 # type = "Proxy"
 # url = "http://backend-api:8080"
 #
-#   [routes.action.compression]
+#   [route.compression]
 #   enabled = true
 #   min_size = 512              # 小さいレスポンスも圧縮
 #   gzip_level = 1              # 速度優先
@@ -1167,11 +1167,11 @@ rate_limit_requests_per_min = 60
 # 低レイテンシが重要なエンドポイント
 # kTLS最適化を維持するため圧縮無効（デフォルト動作）
 #
-# [routes.action]
+# [route.action]
 # type = "Proxy"
 # url = "http://realtime-backend:8080"
 #
-#   [routes.action.compression]
+#   [route.compression]
 #   enabled = false  # 明示的に無効化（デフォルト値と同じ）
 
 # ------------------------------------------
@@ -1180,7 +1180,7 @@ rate_limit_requests_per_min = 60
 # 大きなデータセットを返す分析API
 # レイテンシより帯域節約を優先
 #
-# [routes.action]
+# [route.action]
 # type = "Proxy"
 # url = "http://analytics-backend:8080"
 #
@@ -1197,14 +1197,14 @@ rate_limit_requests_per_min = 60
 # 内部ネットワークからのみアクセス許可
 # - 許可: 192.168.0.0/16, 10.0.0.0/8, 127.0.0.1
 # - 拒否: 192.168.1.100（特定のホストを除外）
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/admin/*"
-[routes.action]
+[route.action]
 type = "Proxy"
 url = "http://localhost:9000/"
-[routes.action.security]
+[route.security]
 allowed_ips = [
   "192.168.0.0/16",
   "10.0.0.0/8",
@@ -1219,12 +1219,12 @@ allowed_methods = ["GET", "POST"]
 # バックエンドからのレスポンスをキャッシュし、
 # 同じリクエストへの応答時間を短縮します。
 #
-# [routes.action]
+# [route.action]
 # type = "Proxy"
 # url = "http://localhost:8080"
 #
 #   # キャッシュ設定
-#   [routes.action.cache]
+#   [route.cache]
 #   # キャッシュを有効化
 #   enabled = true
 #   
@@ -1289,12 +1289,12 @@ allowed_methods = ["GET", "POST"]
 # 低速クライアントによるバックエンド占有を防止するため、
 # レスポンスをバッファリングしてからクライアントに送信します。
 #
-# [routes.action]
+# [route.action]
 # type = "Proxy"
 # url = "http://localhost:8080"
 #
 #   # バッファリング設定
-#   [routes.action.buffering]
+#   [route.buffering]
 #   # バッファリングモード: "streaming", "full", "adaptive"
 #   # - streaming: ストリーミング転送（従来の動作、デフォルト）
 #   # - full: フルバッファリング（全レスポンスをバッファ後に転送）
@@ -1332,7 +1332,7 @@ allowed_methods = ["GET", "POST"]
 # Connection: Upgrade と Upgrade: websocket ヘッダーを自動検出
 # 101 Switching Protocols 後は双方向バイパス転送
 # 
-# [routes.action]
+# [route.action]
 # type = "Proxy"
 # url = "http://localhost:3000"
 
@@ -1351,7 +1351,7 @@ allowed_methods = ["GET", "POST"]
 #   - HTTPS バックエンド（use_tls=true）では use_h2c は無効です
 #   - Prior Knowledge モードを使用（Upgrade経由ではない）
 #
-# [routes.action]
+# [route.action]
 # type = "Proxy"
 # url = "http://localhost:50051"
 # use_h2c = true
@@ -1362,11 +1362,11 @@ allowed_methods = ["GET", "POST"]
 # X-Real-IP, X-Forwarded-Proto などを追加し、
 # セキュリティヘッダーをレスポンスに付与
 #
-# [routes.action]
+# [route.action]
 # type = "Proxy"
 # url = "http://localhost:8080"
 #
-#   [routes.action.security]
+#   [route.security]
 #   # バックエンドに転送前にヘッダーを追加
 #   add_request_headers = { "X-Real-IP" = "$client_ip", "X-Forwarded-Proto" = "https" }
 #   # バックエンドに転送前にヘッダーを削除
@@ -1381,14 +1381,14 @@ allowed_methods = ["GET", "POST"]
 # WWW非対応やHTTPS強制、旧URL移行などに使用
 #
 # 例1: WWWへリダイレクト
-# [routes.action]
+# [route.action]
 # type = "Redirect"
 # redirect_url = "https://www.example.com/new-path/"
 # redirect_status = 301
 # preserve_path = false
 #
 # 例2: パスを保持してリダイレクト
-# [routes.action]
+# [route.action]
 # type = "Redirect"
 # redirect_url = "https://example.com/v2"
 # redirect_status = 301
@@ -1401,11 +1401,11 @@ allowed_methods = ["GET", "POST"]
 # upstreams セクションで定義したグループを参照
 # url の代わりに upstream を指定
 #
-# [routes.action]
+# [route.action]
 # type = "Proxy"
 # upstream = "backend-pool"
 #
-#   [routes.action.security]
+#   [route.security]
 #   rate_limit_requests_per_min = 100
 
 # ------------------------------------------
@@ -1413,12 +1413,12 @@ allowed_methods = ["GET", "POST"]
 # ------------------------------------------
 # "/" は完全一致（/へのリクエストのみマッチ）
 # catch-all動作はなし: マッチしないパスは404
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/"
-[routes.action]
+[route.action]
 type = "File"
 path = "/var/www/index.html"
-[routes.action.security]
+[route.security]
 allowed_methods = ["GET"]

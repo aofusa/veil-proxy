@@ -44,8 +44,11 @@ cargo build --target wasm32-wasip1 --release
 ### veil-proxy設定（config.toml）
 
 ```toml
-[[routes]]
+[[route]]
+[route.conditions]
 path = "/api/*"
+[route.action]
+type = "Proxy"
 upstream = "backend"
 
 [[routes.wasm_filters]]

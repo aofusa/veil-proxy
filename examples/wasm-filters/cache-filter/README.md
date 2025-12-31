@@ -140,8 +140,11 @@ WebdisはRedisコマンドをHTTP APIとして提供します。
 ### veil-proxy設定（config.toml）
 
 ```toml
-[[routes]]
+[[route]]
+[route.conditions]
 path = "/api/*"
+[route.action]
+type = "Proxy"
 upstream = "backend"
 
 [[routes.wasm_filters]]

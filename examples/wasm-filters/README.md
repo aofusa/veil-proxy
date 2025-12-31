@@ -59,8 +59,11 @@ target/wasm32-wasip1/release/
 
 ```toml
 # WASMフィルタを有効化
-[[routes]]
+[[route]]
+[route.conditions]
 path = "/api/*"
+[route.action]
+type = "Proxy"
 upstream = "backend"
 
 [[routes.wasm_filters]]

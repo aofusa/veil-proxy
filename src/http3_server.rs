@@ -471,7 +471,7 @@ impl Http3Handler {
             &headers_map,
             &query_map,
             &self.peer_addr,
-            &config.routes,
+            config.route.as_slice(),
             &config.upstream_groups,
         )
         .or_else(|| {
@@ -488,7 +488,7 @@ impl Http3Handler {
                     &headers_map,
                     &query_map,
                     &self.peer_addr,
-                    &config.routes,
+                    config.route.as_slice(),
                     &config.upstream_groups,
                 )
             } else {

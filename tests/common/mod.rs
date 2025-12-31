@@ -230,22 +230,22 @@ level = "debug"
 algorithm = "round_robin"
 servers = [{backends}]
 
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "localhost"
 path = "/"
-[routes.action]
+[route.action]
 type = "Upstream"
 upstream = "backend"
-[routes.action.security]
+[route.security]
 add_response_headers = {{ "X-Test-Header" = "test-value", "X-Proxied-By" = "veil" }}
 remove_response_headers = ["Server"]
 
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "127.0.0.1"
 path = "/"
-[routes.action]
+[route.action]
 type = "Upstream"
 upstream = "backend"
 "#,

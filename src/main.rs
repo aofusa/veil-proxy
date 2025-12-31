@@ -3676,6 +3676,26 @@ pub struct Route {
     
     /// バックエンドアクション
     pub action: BackendConfig,
+    
+    /// ルートレベルのセキュリティ設定（actionの設定をオーバーライド）
+    #[serde(default)]
+    pub security: Option<SecurityConfig>,
+    
+    /// ルートレベルの圧縮設定（actionの設定をオーバーライド）
+    #[serde(default)]
+    pub compression: Option<CompressionConfig>,
+    
+    /// ルートレベルのバッファリング設定（actionの設定をオーバーライド）
+    #[serde(default)]
+    pub buffering: Option<buffering::BufferingConfig>,
+    
+    /// ルートレベルのキャッシュ設定（actionの設定をオーバーライド）
+    #[serde(default)]
+    pub cache: Option<cache::CacheConfig>,
+    
+    /// ルートレベルのOpenFileCache設定（actionの設定をオーバーライド、Fileバックエンドのみ）
+    #[serde(default)]
+    pub open_file_cache: Option<cache::OpenFileCacheConfig>,
 }
 
 #[derive(Deserialize)]
@@ -3710,7 +3730,7 @@ struct Config {
     /// 統合ルーティング（唯一のルーティング方式）
     /// 配列の順序で評価（first-match方式）
     #[serde(default)]
-    routes: Option<Vec<Route>>,
+    route: Option<Vec<Route>>,
     /// WASM拡張設定（feature flagで条件付きコンパイル）
     #[cfg(feature = "wasm")]
     #[serde(default)]
@@ -4279,7 +4299,7 @@ struct PerformanceConfigSection {
     ///   - 静的ファイル配信に最適（動的に変更されるファイルには不向き）
     /// 
     /// ルーティングごとの設定:
-    ///   - 各ルーティング（[[routes]]）で`open_file_cache`セクションを指定可能
+    ///   - 各ルーティング（[[route]]）で`open_file_cache`セクションを指定可能
     ///   - ルーティング設定がない場合は、このグローバル設定が使用される
     /// 
     /// デフォルト: false（無効）
@@ -5404,7 +5424,7 @@ impl ProxyTarget {
 // algorithm = "round_robin"
 // servers = ["http://localhost:8080", "http://localhost:8081"]
 //
-// [[routes]]
+// [[route]]
 // conditions = { host = "example.com", path = "/api/*" }
 // type = "Proxy"
 // upstream = "backend-pool"
@@ -5769,10 +5789,10 @@ fn validate_config(config: &Config) -> io::Result<()> {
         }
     }
     
-    // 統合ルーティング（[[routes]]）の妥当性チェック
-    if let Some(ref routes) = config.routes {
+    // 統合ルーティング（[[route]]）の妥当性チェック
+    if let Some(ref routes) = config.route {
         for (i, route) in routes.iter().enumerate() {
-            let route_name = format!("routes[{}]", i);
+            let route_name = format!("route[{}]", i);
             validate_backend_config(
                 &route.action, 
                 &route_name,
@@ -5985,7 +6005,7 @@ struct LoadedConfig {
     #[cfg_attr(not(feature = "http3"), allow(dead_code))]
     tls_key_pem: Arc<Vec<u8>>,
     /// 統合ルーティング（唯一のルーティング方式）
-    routes: Arc<Vec<Route>>,
+    route: Arc<Vec<Route>>,
     ktls_config: KtlsConfig,
     reuseport_balancing: ReuseportBalancing,
     num_threads: usize,
@@ -6048,7 +6068,7 @@ struct LoadedConfig {
 /// 現在は読み取られていない（将来的にTLS再設定などで使用予定）
 struct RuntimeConfig {
     /// 統合ルーティング（唯一のルーティング方式）
-    routes: Arc<Vec<Route>>,
+    route: Arc<Vec<Route>>,
     /// TLS設定（ホットリロード時の参照用）
     #[allow(dead_code)]
     tls_config: Option<Arc<ServerConfig>>,
@@ -6081,7 +6101,7 @@ struct RuntimeConfig {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            routes: Arc::new(Vec::new()),
+            route: Arc::new(Vec::new()),
             tls_config: None,
             ktls_config: Arc::new(KtlsConfig::default()),
             global_security: Arc::new(GlobalSecurityConfig::default()),
@@ -6140,7 +6160,7 @@ fn reload_config(path: &Path) -> io::Result<()> {
     let current = CURRENT_CONFIG.load();
     
     let runtime_config = RuntimeConfig {
-        routes: loaded.routes,
+        route: loaded.route,
         // TLS設定は起動時のものを維持（セキュリティ上の理由）
         tls_config: current.tls_config.clone(),
         ktls_config: current.ktls_config.clone(),
@@ -6171,7 +6191,7 @@ fn reload_config(path: &Path) -> io::Result<()> {
 /// ホットリロード時はルーティング設定等のみを更新します。
 struct LoadedConfigWithoutTls {
     /// 統合ルーティング（唯一のルーティング方式）
-    routes: Arc<Vec<Route>>,
+    route: Arc<Vec<Route>>,
     global_security: GlobalSecurityConfig,
     prometheus_config: PrometheusConfig,
     upstream_groups: Arc<HashMap<String, Arc<UpstreamGroup>>>,
@@ -6230,8 +6250,8 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
         }
     }
 
-    // 統合ルーティング（[[routes]]）の読み込み
-    let routes = if let Some(routes_config) = config.routes {
+    // 統合ルーティング（[[route]]）の読み込み
+    let routes = if let Some(routes_config) = config.route {
         let mut routes_vec = Vec::with_capacity(routes_config.len());
         for route in routes_config {
             routes_vec.push(route);
@@ -6250,7 +6270,7 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
     );
 
     Ok(LoadedConfigWithoutTls {
-        routes,
+        route: routes,
         global_security: config.security,
         prometheus_config: config.prometheus,
         upstream_groups: Arc::new(upstream_groups),
@@ -6332,8 +6352,8 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         }
     }
 
-    // 統合ルーティング（[[routes]]）の読み込み
-    let routes = if let Some(routes_config) = config.routes {
+    // 統合ルーティング（[[route]]）の読み込み
+    let routes = if let Some(routes_config) = config.route {
         let mut routes_vec = Vec::with_capacity(routes_config.len());
         for route in routes_config {
             routes_vec.push(route);
@@ -6430,7 +6450,7 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         tls_key_path: config.tls.key_path.clone(),
         tls_cert_pem: Arc::new(tls_cert_pem),
         tls_key_pem: Arc::new(tls_key_pem),
-        routes,
+        route: routes,
         ktls_config,
         reuseport_balancing: config.performance.reuseport_balancing,
         num_threads,
@@ -6715,11 +6735,23 @@ fn init_logging(config: &LoggingConfigSection) -> ftlog::LoggerGuard {
 }
 
 fn load_backend(
-    config: &BackendConfig,
+    route: &Route,
     upstream_groups: &HashMap<String, Arc<UpstreamGroup>>,
 ) -> io::Result<Backend> {
-    match config {
+    // Routeレベルの設定を取得（存在する場合はactionの設定をオーバーライド）
+    let route_security = route.security.as_ref();
+    let route_compression = route.compression.as_ref();
+    let route_buffering = route.buffering.as_ref();
+    let route_cache = route.cache.as_ref();
+    let route_open_file_cache = route.open_file_cache.as_ref();
+    
+    match &route.action {
         BackendConfig::Proxy { url, sni_name, use_h2c, security, compression, buffering, cache, modules } => {
+            // Routeレベルの設定があればそれを使用、なければactionの設定を使用
+            let security = route_security.unwrap_or(security);
+            let compression = route_compression.unwrap_or(compression);
+            let buffering = route_buffering.unwrap_or(buffering);
+            let cache = route_cache.unwrap_or(cache);
             // 単一URLの場合は UpstreamGroup::single で単一サーバーのグループを作成
             let target = ProxyTarget::parse(url)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid proxy URL"))?
@@ -6760,6 +6792,11 @@ fn load_backend(
             ))
         }
         BackendConfig::ProxyUpstream { upstream, security, compression, buffering, cache, modules } => {
+            // Routeレベルの設定があればそれを使用、なければactionの設定を使用
+            let security = route_security.unwrap_or(security);
+            let compression = route_compression.unwrap_or(compression);
+            let buffering = route_buffering.unwrap_or(buffering);
+            let cache = route_cache.unwrap_or(cache);
             // Upstream グループ参照
             let group = upstream_groups.get(upstream)
                 .ok_or_else(|| io::Error::new(
@@ -6796,6 +6833,10 @@ fn load_backend(
             ))
         }
         BackendConfig::File { path, mode, index, security, cache, open_file_cache, modules } => {
+            // Routeレベルの設定があればそれを使用、なければactionの設定を使用
+            let security = route_security.unwrap_or(security);
+            let cache = route_cache.unwrap_or(cache);
+            let open_file_cache = route_open_file_cache.or(open_file_cache.as_ref());
             let metadata = fs::metadata(path)
                 .map_err(|e| {
                     let error_msg = format!(
@@ -6811,7 +6852,7 @@ fn load_backend(
             let index_file: Option<Arc<str>> = index.as_ref().map(|s| Arc::from(s.as_str()));
             let security = Arc::new(security.clone());
             let cache = Arc::new(cache.clone());
-            let open_file_cache_arc = open_file_cache.as_ref().map(|c| Arc::new(c.clone()));
+            let open_file_cache_arc = open_file_cache.map(|c| Arc::new(c.clone()));
             
             // キャッシュ設定のログ出力
             if cache.enabled {
@@ -7091,7 +7132,7 @@ fn main() {
     // CURRENT_CONFIG を初期化（ホットリロード対応）
     // ワーカースレッドは CURRENT_CONFIG.load() を使用して最新の設定を取得
     let runtime_config = RuntimeConfig {
-        routes: loaded_config.routes.clone(),
+        route: loaded_config.route.clone(),
         tls_config: Some(loaded_config.tls_config.clone()),
         ktls_config: ktls_config.clone(),
         global_security: Arc::new(loaded_config.global_security.clone()),
@@ -8809,14 +8850,14 @@ where
         &headers_map,
         &query_map,
         &client_socket_addr,
-        &config.routes,
+        config.route.as_slice(),
         &config.upstream_groups,
     )
     .or_else(|| {
         // authority が空でない場合、デフォルトルートを検索
         if !authority.is_empty() {
             debug!("[HTTP/2] No route found for authority '{}', trying default routes", 
-                String::from_utf8_lossy(authority));
+                   String::from_utf8_lossy(authority));
             find_backend_unified(
                 b"",
                 path_without_query,
@@ -8824,7 +8865,7 @@ where
                 &headers_map,
                 &query_map,
                 &client_socket_addr,
-                &config.routes,
+                config.route.as_slice(),
                 &config.upstream_groups,
             )
         } else {
@@ -10268,7 +10309,7 @@ async fn handle_requests(
                     &headers_map,
                     &query_map,
                     &client_socket_addr,
-                    &config.routes,
+                    config.route.as_slice(),
                     &config.upstream_groups,
                 );
 
@@ -10873,7 +10914,7 @@ pub fn find_backend_unified(
                 route.conditions.path,
                 route.conditions.method
             );
-            match load_backend(&route.action, upstream_groups) {
+            match load_backend(route, upstream_groups) {
                 Ok(backend) => {
                     // マッチしたルートのpath条件をprefixとして返す
                     // path条件がない場合は空のprefixを返す

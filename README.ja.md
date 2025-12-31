@@ -356,88 +356,88 @@ tcp_cork_enabled = true     # kTLS設定時にTCP_CORKを使用（デフォル�
 # 統合ルーティング（AWS ALB準拠）
 # 配列の順序で評価（first-match方式）
 
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
-[routes.action]
+[route.action]
 type = "File"
 path = "/var/www/example"
 mode = "sendfile"
 
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "api.example.com"
-[routes.action]
+[route.action]
 type = "Proxy"
 url = "http://localhost:8080"
 
 # 静的ファイル（完全一致）
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/robots.txt"
-[routes.action]
+[route.action]
 type = "File"
 path = "/var/www/robots.txt"
 
 # ディレクトリ配信（末尾スラッシュあり）
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/static/*"
-[routes.action]
+[route.action]
 type = "File"
 path = "/var/www/assets/"
 mode = "sendfile"
 # OpenFileCache設定（ルーティングごと、グローバル設定を上書き）
-[routes.action.open_file_cache]
+[route.open_file_cache]
 enabled = true
 valid_duration_secs = 300  # 5分（静的ファイルは変更頻度が低い）
 max_entries = 50000
 
 # ディレクトリ配信（末尾スラッシュなし - 同じ動作、リダイレクトなし）
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/docs"
-[routes.action]
+[route.action]
 type = "File"
 path = "/var/www/docs/"
 
 # カスタムインデックスファイル
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/user/*"
-[routes.action]
+[route.action]
 type = "File"
 path = "/var/www/user/"
 index = "profile.html"
 
 # プロキシ（末尾スラッシュあり）
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/api/*"
-[routes.action]
+[route.action]
 type = "Proxy"
 url = "http://localhost:8080/app/"
 
 # プロキシ（末尾スラッシュなし - 同じ動作）
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/backend"
-[routes.action]
+[route.action]
 type = "Proxy"
 url = "http://localhost:3000"
 
 # ルート
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/"
-[routes.action]
+[route.action]
 type = "File"
 path = "/var/www/index.html"
 ```
@@ -446,10 +446,11 @@ path = "/var/www/index.html"
 
 ### 統合ルーティング（AWS ALB準拠）
 
-配列の順序で評価（first-match方式）。すべてのルートは統合された `[[routes]]` 構造を使用し、`conditions` と `action` フィールドを持ちます。
+配列の順序で評価（first-match方式）。すべてのルートは統合された `[[route]]` 構造を使用し、`conditions` と `action` フィールドを持ちます。
 
-1. **ルート条件** (`[routes.conditions]`): ホスト、パス、ヘッダー、メソッド、クエリパラメータ、またはソースIPでマッチ
-2. **ルートアクション** (`[routes.action]`): バックエンドアクション（File、Proxy、Redirectなど）
+1. **ルート条件** (`[route.conditions]`): ホスト、パス、ヘッダー、メソッド、クエリパラメータ、またはソースIPでマッチ
+2. **ルートアクション** (`[route.action]`): バックエンドアクション（File、Proxy、Redirectなど）
+3. **ルートレベルの設定** (`[route.security]`, `[route.cache]`, `[route.compression]`, `[route.buffering]`, `[route.open_file_cache]`): actionレベルの設定をオーバーライド
 
 ### バックエンドタイプ
 
@@ -472,11 +473,11 @@ path = "/var/www/index.html"
 ```toml
 # /robots.txt → /var/www/robots.txt を返す
 # /robots.txt/extra → 404 Not Found（ファイルの下は掘れない）
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/robots.txt"
-[routes.action]
+[route.action]
 type = "File"
 path = "/var/www/robots.txt"
 ```
@@ -488,20 +489,20 @@ path = "/var/www/robots.txt"
 
 ```toml
 # 末尾スラッシュあり（従来の書き方）
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/static/*"
-[routes.action]
+[route.action]
 type = "File"
 path = "/var/www/assets/"
 
 # 末尾スラッシュなし（同じ動作、301リダイレクトなし）
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/docs"
-[routes.action]
+[route.action]
 type = "File"
 path = "/var/www/docs/"
 ```
@@ -521,21 +522,21 @@ path = "/var/www/docs/"
 
 ```toml
 # /user/ → /var/www/user/profile.html を返す
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/user/*"
-[routes.action]
+[route.action]
 type = "File"
 path = "/var/www/user/"
 index = "profile.html"
 
 # /app/ → /var/www/app/dashboard.html を返す
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/app/*"
-[routes.action]
+[route.action]
 type = "File"
 path = "/var/www/app/"
 index = "dashboard.html"
@@ -548,20 +549,20 @@ index = "dashboard.html"
 
 ```toml
 # 末尾スラッシュあり
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/api/*"
-[routes.action]
+[route.action]
 type = "Proxy"
 url = "http://localhost:8080/app/"
 
 # 末尾スラッシュなし（同じ動作）
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/backend"
-[routes.action]
+[route.action]
 type = "Proxy"
 url = "http://localhost:3000"
 ```
@@ -581,31 +582,31 @@ url = "http://localhost:3000"
 
 ```toml
 # ディレクトリ配信（sendfileモード）
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/static/*"
-[routes.action]
+[route.action]
 type = "File"
 path = "/var/www/static"
 mode = "sendfile"
 
 # 単一ファイル配信（memoryモード）
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/favicon.ico"
-[routes.action]
+[route.action]
 type = "File"
 path = "/var/www/favicon.ico"
 mode = "memory"
 
 # typeとmodeを省略した場合のデフォルト（type = "File", mode = "sendfile"）
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/"
-[routes.action]
+[route.action]
 path = "/var/www/html"
 ```
 
@@ -615,20 +616,20 @@ HTTPおよびHTTPSバックエンドへのプロキシに対応：
 
 ```toml
 # HTTPバックエンド
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/api/*"
-[routes.action]
+[route.action]
 type = "Proxy"
 url = "http://localhost:8080"
 
 # HTTPSバックエンド（TLSクライアント接続）
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/secure/*"
-[routes.action]
+[route.action]
 type = "Proxy"
 url = "https://backend.example.com"
 ```
@@ -639,11 +640,11 @@ url = "https://backend.example.com"
 
 ```toml
 # gRPCバックエンドへのH2C接続
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/grpc/*"
-[routes.action]
+[route.action]
 type = "Proxy"
 url = "http://localhost:50051"
 use_h2c = true
@@ -667,11 +668,11 @@ HTTPSバックエンドへの接続時、バックエンドがIPアドレス指�
 
 ```toml
 # IPアドレス指定 + SNI名指定
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/internal-api/*"
-[routes.action]
+[route.action]
 type = "Proxy"
 url = "https://192.168.1.100:443"
 sni_name = "api.internal.example.com"
@@ -707,11 +708,11 @@ servers = [
   healthy_threshold = 2
 
 # Upstreamを参照するルート
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/api/*"
-[routes.action]
+[route.action]
 type = "Proxy"
 upstream = "api-pool"
 ```
@@ -734,11 +735,11 @@ servers = [
 ]
 
 # ルートでUpstreamを参照
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/api/*"
-[routes.action]
+[route.action]
 type = "Proxy"
 upstream = "https-pool"
 ```
@@ -753,20 +754,20 @@ WebSocketは通常のProxyで自動サポートされます。双方向転送時
 
 ```toml
 # WebSocketアプリケーション
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/ws/*"
-[routes.action]
+[route.action]
 type = "Proxy"
 url = "http://localhost:3000"
 
 # ロードバランシング付きWebSocket
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/ws-lb/*"
-[routes.action]
+[route.action]
 type = "Proxy"
 upstream = "websocket-pool"
 ```
@@ -805,43 +806,43 @@ WebSocket双方向転送時のポーリング動作を制御します。
 
 ```toml
 # リアルタイムゲーム（低レイテンシ最優先）
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "game.example.com"
 path = "/ws/*"
-[routes.action]
+[route.action]
 type = "Proxy"
 url = "http://localhost:3000"
 
-[routes.action.security]
+[route.security]
   websocket_poll_mode = "fixed"
   websocket_poll_timeout_ms = 1
 
 # チャットアプリ（バランス重視）
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "chat.example.com"
 path = "/ws/*"
-[routes.action]
+[route.action]
 type = "Proxy"
 url = "http://localhost:3001"
 
-[routes.action.security]
+[route.security]
   websocket_poll_mode = "adaptive"
   websocket_poll_timeout_ms = 1
   websocket_poll_max_timeout_ms = 50
   websocket_poll_backoff_multiplier = 2.0
 
 # 監視ダッシュボード（CPU効率優先）
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "monitor.example.com"
 path = "/ws/*"
-[routes.action]
+[route.action]
 type = "Proxy"
 url = "http://localhost:3002"
 
-[routes.action.security]
+[route.security]
   websocket_poll_mode = "adaptive"
   websocket_poll_timeout_ms = 10
   websocket_poll_max_timeout_ms = 200
@@ -985,30 +986,30 @@ sandbox_tmpfs_mounts = ["/tmp"]
 
 ```toml
 # API用セキュリティ設定
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/api/*"
-[routes.action]
+[route.action]
 type = "Proxy"
 url = "http://localhost:8080/app/"
 
-[routes.action.security]
+[route.security]
   allowed_methods = ["GET", "POST", "PUT"]
   max_request_body_size = 5_242_880  # 5MB
   backend_connect_timeout_secs = 5
   rate_limit_requests_per_min = 60
 
 # IP制限付き管理API
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/admin/*"
-[routes.action]
+[route.action]
 type = "Proxy"
 url = "http://localhost:9000/"
 
-[routes.action.security]
+[route.security]
   allowed_ips = [
     "192.168.0.0/16",
     "10.0.0.0/8",
@@ -1070,15 +1071,15 @@ IP制限は **deny → allow** の順で評価されます（denyが優先）。
 
 ```toml
 # セキュリティヘッダー付きプロキシ
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/api/*"
-[routes.action]
+[route.action]
 type = "Proxy"
 url = "http://localhost:8080"
 
-[routes.action.security]
+[route.security]
   # バックエンドに転送前に追加
   add_request_headers = { "X-Real-IP" = "$client_ip", "X-Forwarded-Proto" = "https" }
   # バックエンドに転送前に削除
@@ -1157,21 +1158,21 @@ HTTPリダイレクト（301/302/303/307/308）を設定できます。WWW非対
 
 ```toml
 # WWWへのリダイレクト
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/"
-[routes.action]
+[route.action]
 type = "Redirect"
 redirect_url = "https://www.example.com/"
 redirect_status = 301
 
 # 旧URLから新URLへの移行（パス保持）
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/legacy/*"
-[routes.action]
+[route.action]
 type = "Redirect"
 redirect_url = "https://example.com/v2"
 redirect_status = 301
@@ -1180,11 +1181,11 @@ preserve_path = true
 # /legacy/api/data → https://example.com/v2/api/data
 
 # HTTPからHTTPSへの強制リダイレクト（別のhostで設定）
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "http.example.com"
 path = "/"
-[routes.action]
+[route.action]
 type = "Redirect"
 redirect_url = "https://example.com$request_uri"
 redirect_status = 301
@@ -1218,15 +1219,15 @@ redirect_status = 301
 ルートごとに `compression` セクションで有効化します：
 
 ```toml
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/api/*"
-[routes.action]
+[route.action]
 type = "Proxy"
 url = "http://localhost:8080"
 
-[routes.action.compression]
+[route.compression]
   enabled = true
 ```
 
@@ -1261,15 +1262,15 @@ url = "http://localhost:8080"
 
 ```toml
 # API圧縮（高速、バランス重視）
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/api/*"
-[routes.action]
+[route.action]
 type = "Proxy"
 url = "http://localhost:8080"
 
-[routes.action.compression]
+[route.compression]
   enabled = true
   preferred_encodings = ["zstd", "br", "gzip"]
   zstd_level = 3
@@ -1278,15 +1279,15 @@ url = "http://localhost:8080"
   min_size = 1024
 
 # 静的アセット（高圧縮率）
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/static/*"
-[routes.action]
+[route.action]
 type = "File"
 path = "/var/www/static"
 
-[routes.action.compression]
+[route.compression]
   enabled = true
   preferred_encodings = ["br", "gzip"]
   brotli_level = 6
@@ -1359,15 +1360,15 @@ compression_enabled = true
 キャッシュはデフォルトで**無効**です。ルートごとに `cache` セクションで有効化します：
 
 ```toml
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/api/*"
-[routes.action]
+[route.action]
 type = "Proxy"
 url = "http://localhost:8080"
 
-[routes.action.cache]
+[route.cache]
   enabled = true
 ```
 
@@ -1394,15 +1395,15 @@ url = "http://localhost:8080"
 ### 設定例
 
 ```toml
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/cached-api/*"
-[routes.action]
+[route.action]
 type = "Proxy"
 url = "http://localhost:8080"
 
-[routes.action.cache]
+[route.cache]
   enabled = true
   max_memory_size = 104857600  # 100MB
   disk_path = "/var/cache/veil/api"
@@ -1463,15 +1464,15 @@ url = "http://localhost:8080"
 バッファリングはデフォルトで **streaming（パススルー）** です。ルートごとに `buffering` セクションで設定します：
 
 ```toml
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/api/*"
-[routes.action]
+[route.action]
 type = "Proxy"
 url = "http://localhost:8080"
 
-[routes.action.buffering]
+[route.buffering]
   mode = "adaptive"
 ```
 
@@ -1490,15 +1491,15 @@ url = "http://localhost:8080"
 ### 設定例
 
 ```toml
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/buffered-api/*"
-[routes.action]
+[route.action]
 type = "Proxy"
 url = "http://localhost:8080"
 
-[routes.action.buffering]
+[route.buffering]
   mode = "adaptive"
   adaptive_threshold = 1048576   # 1MB
   max_memory_buffer = 10485760   # 10MB
@@ -2338,24 +2339,24 @@ WebSocketは通常のProxyバックエンドで自動的にサポートされま
 
 ```toml
 # WebSocketアプリケーション（デフォルト設定）
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/ws/*"
-[routes.action]
+[route.action]
 type = "Proxy"
 url = "http://localhost:3000"
 
 # 低レイテンシ設定（リアルタイムゲーム向け）
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "game.example.com"
 path = "/ws/*"
-[routes.action]
+[route.action]
 type = "Proxy"
 url = "http://localhost:3001"
 
-[routes.action.security]
+[route.security]
   websocket_poll_mode = "fixed"
   websocket_poll_timeout_ms = 1
 ```
@@ -2392,11 +2393,11 @@ servers = [
 ]
 
 # ルートでUpstreamを参照
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/api/*"
-[routes.action]
+[route.action]
 type = "Proxy"
 upstream = "backend-pool"  # URLの代わりにupstreamを指定
 ```
@@ -2424,11 +2425,11 @@ servers = [
 
 ```toml
 # 従来の単一バックエンド指定
-[[routes]]
-[routes.conditions]
+[[route]]
+[route.conditions]
 host = "example.com"
 path = "/simple/*"
-[routes.action]
+[route.action]
 type = "Proxy"
 url = "http://localhost:8080"
 ```

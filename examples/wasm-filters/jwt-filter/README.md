@@ -228,8 +228,11 @@ https://auth.example.com/.well-known/jwks.json
 ### veil-proxy設定（config.toml）
 
 ```toml
-[[routes]]
+[[route]]
+[route.conditions]
 path = "/api/*"
+[route.action]
+type = "Proxy"
 upstream = "backend"
 
 [[routes.wasm_filters]]

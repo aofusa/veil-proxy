@@ -184,8 +184,11 @@ Level 2に加えて、高度な攻撃手法を検出します。
 ### veil-proxy設定（config.toml）
 
 ```toml
-[[routes]]
+[[route]]
+[route.conditions]
 path = "/api/*"
+[route.action]
+type = "Proxy"
 upstream = "backend"
 
 [[routes.wasm_filters]]
