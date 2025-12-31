@@ -38,8 +38,8 @@ use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use ftlog::{info, warn, error, debug};
 
 use crate::{
-    Backend, PathRouter, SecurityConfig, UpstreamGroup, ProxyTarget,
-    find_backend, check_security, SecurityCheckResult,
+    Backend, SecurityConfig, UpstreamGroup, ProxyTarget,
+    find_backend_unified, check_security, SecurityCheckResult,
     encode_prometheus_metrics, record_request_metrics,
     AcceptedEncoding, CompressionConfig, resolve_http3_compression_config,
     CURRENT_CONFIG, SHUTDOWN_FLAG,
@@ -244,10 +244,6 @@ struct Http3Handler {
     partial_responses: HashMap<u64, (Vec<u8>, usize)>,
     /// クライアントIPアドレス（文字列）
     client_ip: String,
-    /// ホストルーティング設定
-    host_routes: Arc<HashMap<Box<[u8]>, Backend>>,
-    /// パスルーティング設定
-    path_routes: Arc<HashMap<Box<[u8]>, PathRouter>>,
 }
 
 impl Http3Handler {
@@ -255,8 +251,6 @@ impl Http3Handler {
     fn new(
         conn: quiche::Connection,
         peer_addr: SocketAddr,
-        host_routes: Arc<HashMap<Box<[u8]>, Backend>>,
-        path_routes: Arc<HashMap<Box<[u8]>, PathRouter>>,
     ) -> Self {
         Self {
             conn,
@@ -264,8 +258,6 @@ impl Http3Handler {
             client_ip: peer_addr.ip().to_string(),
             peer_addr,
             partial_responses: HashMap::new(),
-            host_routes,
-            path_routes,
         }
     }
 
@@ -432,20 +424,77 @@ impl Http3Handler {
             }
         }
 
-        // バックエンド選択（デフォルトルートへのフォールバック付き）
-        let backend_result = find_backend(&authority, &path, &self.host_routes, &self.path_routes)
-            .or_else(|| {
-                // authority が空でない場合、デフォルトルートを検索
-                if !authority.is_empty() {
-                    debug!(
-                        "[HTTP/3] No route found for authority '{}', trying default routes",
-                        String::from_utf8_lossy(&authority)
-                    );
-                    find_backend(b"", &path, &self.host_routes, &self.path_routes)
-                } else {
-                    None
-                }
-            });
+        // バックエンド選択（統合ルーティング）
+        let config = CURRENT_CONFIG.load();
+        // ヘッダーをHashMapに変換
+        let headers_map: HashMap<String, String> = headers.iter()
+            .filter(|h| !h.name().starts_with(b":")) // 疑似ヘッダーを除外
+            .map(|h| (
+                String::from_utf8_lossy(h.name()).to_lowercase(),
+                String::from_utf8_lossy(h.value()).to_string()
+            ))
+            .collect();
+        
+        // クエリパラメータを抽出
+        let query_map: HashMap<String, String> = {
+            let path_str = std::str::from_utf8(&path).unwrap_or("/");
+            if let Some(query_start) = path_str.find('?') {
+                let query_str = &path_str[query_start + 1..];
+                query_str.split('&')
+                    .filter_map(|pair| {
+                        if let Some(eq_pos) = pair.find('=') {
+                            let key = crate::url_decode(&pair[..eq_pos]);
+                            let value = crate::url_decode(&pair[eq_pos + 1..]);
+                            Some((key, value))
+                        } else {
+                            let key = crate::url_decode(pair);
+                            Some((key, String::new()))
+                        }
+                    })
+                    .collect()
+            } else {
+                HashMap::new()
+            }
+        };
+        
+        // パスからクエリ部分を除去
+        let path_without_query = if let Some(query_start) = path.iter().position(|&b| b == b'?') {
+            &path[..query_start]
+        } else {
+            &path
+        };
+        
+        let backend_result = find_backend_unified(
+            &authority,
+            path_without_query,
+            &method,
+            &headers_map,
+            &query_map,
+            &self.peer_addr,
+            &config.routes,
+            &config.upstream_groups,
+        )
+        .or_else(|| {
+            // authority が空でない場合、デフォルトルートを検索
+            if !authority.is_empty() {
+                debug!(
+                    "[HTTP/3] No route found for authority '{}', trying default routes",
+                    String::from_utf8_lossy(&authority)
+                );
+                find_backend_unified(
+                    b"",
+                    path_without_query,
+                    &method,
+                    &headers_map,
+                    &query_map,
+                    &self.peer_addr,
+                    &config.routes,
+                    &config.upstream_groups,
+                )
+            } else {
+                None
+            }
+        });
         
         let (prefix, backend) = match backend_result {
             Some(b) => b,
@@ -582,7 +631,7 @@ impl Http3Handler {
                     (200, data.len())
                 }
             }
-            Backend::SendFile(base_path, is_dir, index_file, security, _cache, _) => {
+            Backend::SendFile(base_path, is_dir, index_file, security, _cache, _, _) => {
                 self.handle_sendfile(stream_id, &base_path, is_dir, index_file.as_deref(), &path, &prefix, &security)
                     .unwrap_or((404, 9))
             }
@@ -1565,10 +1614,6 @@ pub async fn run_http3_server_async(
     let rng = SystemRandom::new();
     
     // ルーティング設定を CURRENT_CONFIG から取得（ホットリロード対応）
-    let get_routes = || {
-        let config = CURRENT_CONFIG.load();
-        (config.host_routes.clone(), config.path_routes.clone())
-    };
 
     // メインループ: パケット受信とディスパッチ
     loop {
@@ -1670,8 +1715,7 @@ pub async fn run_http3_server_async(
                     info!("[HTTP/3] New connection from {}", from);
 
                     // 最新のルーティング設定を取得
-                    let (host_routes, path_routes) = get_routes();
-                    let handler = Http3Handler::new(conn, from, host_routes, path_routes);
+                    let handler = Http3Handler::new(conn, from);
                     conns.insert(scid.clone(), handler);
 
                     scid

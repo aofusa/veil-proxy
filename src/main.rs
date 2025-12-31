@@ -3611,6 +3611,73 @@ impl Default for HealthCheckConfig {
     }
 }
 
+// ====================
+// 統合ルーティング（AWS ALB準拠）
+// ====================
+
+/// ルーティング条件（AWS ALB準拠）
+/// 
+/// すべての条件はANDで結合されます。
+/// 条件が指定されていない場合は、すべてのリクエストにマッチします（デフォルトルート）。
+#[derive(Clone, Debug, Deserialize)]
+pub struct RouteConditions {
+    /// host-header: ホスト名マッチ（ワイルドカード対応）
+    /// 例: "api.example.com", "*.example.com"
+    #[serde(default)]
+    pub host: Option<String>,
+    
+    /// path-pattern: パスマッチ（ワイルドカード対応）
+    /// 例: "/api/*", "/static/*", "/api/v2/*"
+    #[serde(default)]
+    pub path: Option<String>,
+    
+    /// http-header: HTTPヘッダーマッチ（複数指定可能）
+    /// 例: { "X-Version" = "v2" }
+    #[serde(default)]
+    pub header: Option<HashMap<String, String>>,
+    
+    /// http-request-method: HTTPメソッドマッチ（配列対応）
+    /// 例: ["GET", "POST"]
+    #[serde(default)]
+    pub method: Option<Vec<String>>,
+    
+    /// query-string: クエリパラメータマッチ（複数指定可能）
+    /// 例: { "key" = "value" }
+    #[serde(default)]
+    pub query: Option<HashMap<String, String>>,
+    
+    /// source-ip: ソースIPマッチ（CIDR表記）
+    /// 例: ["192.168.0.0/16", "10.0.0.0/8"]
+    #[serde(default)]
+    pub source_ip: Option<Vec<String>>,
+}
+
+impl Default for RouteConditions {
+    fn default() -> Self {
+        Self {
+            host: None,
+            path: None,
+            header: None,
+            method: None,
+            query: None,
+            source_ip: None,
+        }
+    }
+}
+
+/// ルーティングルール
+/// 
+/// 条件に一致するリクエストに対して、指定されたバックエンドアクションを実行します。
+#[derive(Clone, Debug, Deserialize)]
+pub struct Route {
+    /// ルーティング条件（空の場合はデフォルトルート）
+    #[serde(default)]
+    pub conditions: RouteConditions,
+    
+    /// バックエンドアクション
+    pub action: BackendConfig,
+}
+
 #[derive(Deserialize)]
 struct Config {
     server: ServerConfigSection,
@@ -3640,8 +3707,10 @@ struct Config {
     /// Upstream グループ定義（ロードバランシング用）
     #[serde(default)]
     upstreams: Option<HashMap<String, UpstreamConfig>>,
-    host_routes: Option<HashMap<String, BackendConfig>>,
-    path_routes: Option<HashMap<String, HashMap<String, BackendConfig>>>,
+    /// 統合ルーティング（唯一のルーティング方式）
+    /// 配列の順序で評価（first-match方式）
+    #[serde(default)]
+    routes: Option<Vec<Route>>,
     /// WASM拡張設定（feature flagで条件付きコンパイル）
     #[cfg(feature = "wasm")]
     #[serde(default)]
@@ -4210,7 +4279,7 @@ struct PerformanceConfigSection {
     ///   - 静的ファイル配信に最適（動的に変更されるファイルには不向き）
     /// 
     /// ルーティングごとの設定:
-    ///   - 各ルーティング（[path_routes]や[host_routes]）で`open_file_cache`セクションを指定可能
+    ///   - 各ルーティング（[[routes]]）で`open_file_cache`セクションを指定可能
     ///   - ルーティング設定がない場合は、このグローバル設定が使用される
     /// 
     /// デフォルト: false（無効）
@@ -4919,6 +4988,7 @@ fn should_advertise_accept_ranges(method: &[u8]) -> bool {
 }
 
 #[derive(Clone)]
+#[derive(Debug)]
 enum BackendConfig {
     /// 単一URLプロキシ（後方互換性のため維持）
     /// - sni_name: TLS接続時のSNI名（IP直打ち時にドメイン名を指定可能）
@@ -5334,7 +5404,8 @@ impl ProxyTarget {
 // algorithm = "round_robin"
 // servers = ["http://localhost:8080", "http://localhost:8081"]
 //
-// [path_routes."example.com"."/api/"]
+// [[routes]]
+// conditions = { host = "example.com", path = "/api/*" }
 // type = "Proxy"
 // upstream = "backend-pool"
 // ```
@@ -5826,29 +5897,16 @@ fn validate_config(config: &Config) -> io::Result<()> {
         }
     }
     
-    // ホストルートの妥当性チェック
-    if let Some(ref host_routes) = config.host_routes {
-        for (host, backend) in host_routes {
+    // 統合ルーティング（[[routes]]）の妥当性チェック
+    if let Some(ref routes) = config.routes {
+        for (i, route) in routes.iter().enumerate() {
+            let route_name = format!("routes[{}]", i);
             validate_backend_config(
-                backend, 
-                host,
+                &route.action, 
+                &route_name,
                 #[cfg(feature = "wasm")]
                 config.wasm.as_ref(),
             )?;
-        }
-    }
-    
-    // パスルートの妥当性チェック
-    if let Some(ref path_routes) = config.path_routes {
-        for (host, paths) in path_routes {
-            for (path, backend) in paths {
-                validate_backend_config(
-                    backend, 
-                    &format!("{}:{}", host, path),
-                    #[cfg(feature = "wasm")]
-                    config.wasm.as_ref(),
-                )?;
-            }
         }
     }
     
@@ -6054,8 +6112,8 @@ struct LoadedConfig {
     /// HTTP/3ではmemfd経由でquicheに渡す。
     #[cfg_attr(not(feature = "http3"), allow(dead_code))]
     tls_key_pem: Arc<Vec<u8>>,
-    host_routes: Arc<HashMap<Box<[u8]>, Backend>>,
-    path_routes: Arc<HashMap<Box<[u8]>, PathRouter>>,
+    /// 統合ルーティング（唯一のルーティング方式）
+    routes: Arc<Vec<Route>>,
     ktls_config: KtlsConfig,
     reuseport_balancing: ReuseportBalancing,
     num_threads: usize,
@@ -6117,10 +6175,8 @@ struct LoadedConfig {
 /// 一部のフィールドはホットリロード機能のために保持されているが、
 /// 現在は読み取られていない（将来的にTLS再設定などで使用予定）
 struct RuntimeConfig {
-    /// ホストベースのルーティング（O(1) HashMap）
-    host_routes: Arc<HashMap<Box<[u8]>, Backend>>,
-    /// パスベースのルーティング（O(log n) Radix Tree）
-    path_routes: Arc<HashMap<Box<[u8]>, PathRouter>>,
+    /// 統合ルーティング（唯一のルーティング方式）
+    routes: Arc<Vec<Route>>,
     /// TLS設定（ホットリロード時の参照用）
     #[allow(dead_code)]
     tls_config: Option<Arc<ServerConfig>>,
@@ -6153,8 +6209,7 @@ struct RuntimeConfig {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            host_routes: Arc::new(HashMap::new()),
-            path_routes: Arc::new(HashMap::new()),
+            routes: Arc::new(Vec::new()),
             tls_config: None,
             ktls_config: Arc::new(KtlsConfig::default()),
             global_security: Arc::new(GlobalSecurityConfig::default()),
@@ -6213,8 +6268,7 @@ fn reload_config(path: &Path) -> io::Result<()> {
     let current = CURRENT_CONFIG.load();
     
     let runtime_config = RuntimeConfig {
-        host_routes: loaded.host_routes,
-        path_routes: loaded.path_routes,
+        routes: loaded.routes,
         // TLS設定は起動時のものを維持（セキュリティ上の理由）
         tls_config: current.tls_config.clone(),
         ktls_config: current.ktls_config.clone(),
@@ -6244,8 +6298,8 @@ fn reload_config(path: &Path) -> io::Result<()> {
 /// Landlock適用後はTLS証明書ファイルへのアクセスが制限されるため、
 /// ホットリロード時はルーティング設定等のみを更新します。
 struct LoadedConfigWithoutTls {
-    host_routes: Arc<HashMap<Box<[u8]>, Backend>>,
-    path_routes: Arc<HashMap<Box<[u8]>, PathRouter>>,
+    /// 統合ルーティング（唯一のルーティング方式）
+    routes: Arc<Vec<Route>>,
     global_security: GlobalSecurityConfig,
     prometheus_config: PrometheusConfig,
     upstream_groups: Arc<HashMap<String, Arc<UpstreamGroup>>>,
@@ -6304,29 +6358,16 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
         }
     }
 
-    let mut host_routes_bytes: HashMap<Box<[u8]>, Backend> = HashMap::new();
-    if let Some(host_routes) = config.host_routes {
-        for (k, v) in host_routes {
-            let backend = load_backend(&v, &upstream_groups)?;
-            host_routes_bytes.insert(k.into_bytes().into_boxed_slice(), backend);
+    // 統合ルーティング（[[routes]]）の読み込み
+    let routes = if let Some(routes_config) = config.routes {
+        let mut routes_vec = Vec::with_capacity(routes_config.len());
+        for route in routes_config {
+            routes_vec.push(route);
         }
-    }
-
-    let mut path_routes_bytes: HashMap<Box<[u8]>, PathRouter> = HashMap::new();
-    if let Some(path_routes) = config.path_routes {
-        for (host, path_map) in path_routes {
-            let mut entries: Vec<(String, Backend)> = Vec::with_capacity(path_map.len());
-            for (k, v) in path_map {
-                entries.push((k, load_backend(&v, &upstream_groups)?));
-            }
-            entries.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
-            let router = PathRouter::new(entries)?;
-            path_routes_bytes.insert(
-                host.into_bytes().into_boxed_slice(),
-                router
-            );
-        }
-    }
+        Arc::new(routes_vec)
+    } else {
+        Arc::new(Vec::new())
+    };
 
     // グローバルOpenFileCache設定を適用
     let performance_config = &config.performance;
@@ -6337,8 +6378,7 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
     );
 
     Ok(LoadedConfigWithoutTls {
-        host_routes: Arc::new(host_routes_bytes),
-        path_routes: Arc::new(path_routes_bytes),
+        routes,
         global_security: config.security,
         prometheus_config: config.prometheus,
         upstream_groups: Arc::new(upstream_groups),
@@ -6420,34 +6460,16 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         }
     }
 
-    let mut host_routes_bytes: HashMap<Box<[u8]>, Backend> = HashMap::new();
-    if let Some(host_routes) = config.host_routes {
-        for (k, v) in host_routes {
-            let backend = load_backend(&v, &upstream_groups)?;
-            host_routes_bytes.insert(k.into_bytes().into_boxed_slice(), backend);
+    // 統合ルーティング（[[routes]]）の読み込み
+    let routes = if let Some(routes_config) = config.routes {
+        let mut routes_vec = Vec::with_capacity(routes_config.len());
+        for route in routes_config {
+            routes_vec.push(route);
         }
-    }
-
-    let mut path_routes_bytes: HashMap<Box<[u8]>, PathRouter> = HashMap::new();
-    if let Some(path_routes) = config.path_routes {
-        for (host, path_map) in path_routes {
-            let mut entries: Vec<(String, Backend)> = Vec::with_capacity(path_map.len());
-            for (k, v) in path_map {
-                entries.push((k, load_backend(&v, &upstream_groups)?));
-            }
-            // 長さ降順でソート（最長一致の優先順位を維持）
-            // PathRouter内部でRadix Treeに登録する際に使用
-            entries.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
-            
-            // PathRouter（Radix Treeベース）を構築
-            let router = PathRouter::new(entries)?;
-            
-            path_routes_bytes.insert(
-                host.into_bytes().into_boxed_slice(),
-                router
-            );
-        }
-    }
+        Arc::new(routes_vec)
+    } else {
+        Arc::new(Vec::new())
+    };
 
     // グローバルOpenFileCache設定を適用
     let performance_config = &config.performance;
@@ -6536,8 +6558,7 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         tls_key_path: config.tls.key_path.clone(),
         tls_cert_pem: Arc::new(tls_cert_pem),
         tls_key_pem: Arc::new(tls_key_pem),
-        host_routes: Arc::new(host_routes_bytes),
-        path_routes: Arc::new(path_routes_bytes),
+        routes,
         ktls_config,
         reuseport_balancing: config.performance.reuseport_balancing,
         num_threads,
@@ -6903,7 +6924,16 @@ fn load_backend(
             ))
         }
         BackendConfig::File { path, mode, index, security, cache, open_file_cache, modules } => {
-            let metadata = fs::metadata(path)?;
+            let metadata = fs::metadata(path)
+                .map_err(|e| {
+                    let error_msg = format!(
+                        "Failed to access file '{}': {} (error code: {})",
+                        path,
+                        e,
+                        e.raw_os_error().unwrap_or(-1)
+                    );
+                    io::Error::new(e.kind(), error_msg)
+                })?;
             let is_dir = metadata.is_dir();
             // インデックスファイル名を Arc<str> に変換（None = デフォルトで "index.html"）
             let index_file: Option<Arc<str>> = index.as_ref().map(|s| Arc::from(s.as_str()));
@@ -7189,8 +7219,7 @@ fn main() {
     // CURRENT_CONFIG を初期化（ホットリロード対応）
     // ワーカースレッドは CURRENT_CONFIG.load() を使用して最新の設定を取得
     let runtime_config = RuntimeConfig {
-        host_routes: loaded_config.host_routes.clone(),
-        path_routes: loaded_config.path_routes.clone(),
+        routes: loaded_config.routes.clone(),
         tls_config: Some(loaded_config.tls_config.clone()),
         ktls_config: ktls_config.clone(),
         global_security: Arc::new(loaded_config.global_security.clone()),
@@ -8644,8 +8673,6 @@ fn is_connection_closed_error(e: &std::io::Error) -> bool {
 #[cfg(feature = "http2")]
 async fn handle_http2_connection<S>(
     tls_stream: S,
-    host_routes: &Arc<HashMap<Box<[u8]>, Backend>>,
-    path_routes: &Arc<HashMap<Box<[u8]>, PathRouter>>,
     client_ip: &str,
 ) where
     S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRentExt + Unpin,
@@ -8671,7 +8698,7 @@ async fn handle_http2_connection<S>(
     let mut connection_metric = ActiveConnectionMetric::new(true);
     
     // カスタムリクエストハンドラーを使用してメインループ実行
-    let result = handle_http2_requests(&mut conn, host_routes, path_routes, client_ip, &mut connection_metric).await;
+    let result = handle_http2_requests(&mut conn, client_ip, &mut connection_metric).await;
     
     if let Err(e) = result {
         warn!("[HTTP/2] Connection error: {}", e);
@@ -8684,8 +8711,6 @@ async fn handle_http2_connection<S>(
 #[cfg(feature = "http2")]
 async fn handle_http2_requests<S>(
     conn: &mut http2::Http2Connection<S>,
-    host_routes: &Arc<HashMap<Box<[u8]>, Backend>>,
-    path_routes: &Arc<HashMap<Box<[u8]>, PathRouter>>,
     client_ip: &str,
     connection_metric: &mut ActiveConnectionMetric,
 ) -> Result<(), http2::Http2Error>
@@ -8768,8 +8793,6 @@ where
                     &path,
                     &authority,
                     body_len,
-                    host_routes,
-                    path_routes,
                     client_ip,
                 ).await;
                 
@@ -8810,8 +8833,6 @@ async fn handle_http2_single_request<S>(
     path: &[u8],
     authority: &[u8],
     body_len: usize,
-    host_routes: &Arc<HashMap<Box<[u8]>, Backend>>,
-    path_routes: &Arc<HashMap<Box<[u8]>, PathRouter>>,
     client_ip: &str,
 ) -> Option<(u16, u64)>
 where
@@ -8853,19 +8874,91 @@ where
         }
     }
     
-    // Backend選択（HTTP/1.1と同じロジック）
-    // まず authority でルート検索、見つからない場合は空の authority でデフォルトルートを検索
-    let backend_result = find_backend(authority, path, host_routes, path_routes)
-        .or_else(|| {
-            // authority が空でない場合、デフォルトルートを検索
-            if !authority.is_empty() {
-                debug!("[HTTP/2] No route found for authority '{}', trying default routes", 
-                    String::from_utf8_lossy(authority));
-                find_backend(b"", path, host_routes, path_routes)
-            } else {
-                None
-            }
-        });
+    // Backend選択（統合ルーティング）
+    let config = CURRENT_CONFIG.load();
+    // ストリームからヘッダーを取得
+    let headers_map: HashMap<String, String> = if let Some(stream) = conn.get_stream(stream_id) {
+        stream.request_headers.iter()
+            .map(|h| (
+                String::from_utf8_lossy(&h.name).to_lowercase(),
+                String::from_utf8_lossy(&h.value).to_string()
+            ))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+    
+    // クエリパラメータを抽出
+    let query_map: HashMap<String, String> = {
+        let path_str = std::str::from_utf8(path).unwrap_or("/");
+        if let Some(query_start) = path_str.find('?') {
+            let query_str = &path_str[query_start + 1..];
+            query_str.split('&')
+                .filter_map(|pair| {
+                    if let Some(eq_pos) = pair.find('=') {
+                        let key = url_decode(&pair[..eq_pos]);
+                        let value = url_decode(&pair[eq_pos + 1..]);
+                        Some((key, value))
+                    } else {
+                        let key = url_decode(pair);
+                        Some((key, String::new()))
+                    }
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        }
+    };
+    
+    // パスからクエリ部分を除去
+    let path_without_query = if let Some(query_start) = path.iter().position(|&b| b == b'?') {
+        &path[..query_start]
+    } else {
+        path
+    };
+    
+    // クライアントIPをSocketAddrに変換
+    let client_socket_addr = if let Ok(addr) = client_ip.parse::<SocketAddr>() {
+        addr
+    } else {
+        // IPアドレスのみの場合、ポート80を仮定
+        if let Ok(ip) = client_ip.parse::<std::net::IpAddr>() {
+            SocketAddr::new(ip, 80)
+        } else {
+            // パースに失敗した場合はデフォルト
+            SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 0)
+        }
+    };
+    
+    let backend_result = find_backend_unified(
+        authority,
+        path_without_query,
+        method,
+        &headers_map,
+        &query_map,
+        &client_socket_addr,
+        &config.routes,
+        &config.upstream_groups,
+    )
+    .or_else(|| {
+        // authority が空でない場合、デフォルトルートを検索
+        if !authority.is_empty() {
+            debug!("[HTTP/2] No route found for authority '{}', trying default routes", 
+                String::from_utf8_lossy(authority));
+            find_backend_unified(
+                b"",
+                path_without_query,
+                method,
+                &headers_map,
+                &query_map,
+                &client_socket_addr,
+                &config.routes,
+                &config.upstream_groups,
+            )
+        } else {
+            None
+        }
+    });
     
     let (prefix, backend) = match backend_result {
         Some(b) => b,
@@ -9967,8 +10060,6 @@ async fn handle_connection(
     // CURRENT_CONFIG から最新の設定を取得（ホットリロード対応）
     // ArcSwap::load() はロックフリーで数ナノ秒
     let config = CURRENT_CONFIG.load();
-    let host_routes = config.host_routes.clone();
-    let path_routes = config.path_routes.clone();
     #[cfg(feature = "http2")]
     let http2_enabled = config.http2_enabled;
     
@@ -9994,12 +10085,12 @@ async fn handle_connection(
     // HTTP/2 が有効かつネゴシエートされた場合は HTTP/2 ハンドラーを使用
     #[cfg(feature = "http2")]
     if http2_enabled && tls_stream.is_http2() {
-        handle_http2_connection(tls_stream, &host_routes, &path_routes, &client_ip).await;
+        handle_http2_connection(tls_stream, &client_ip).await;
         return;
     }
 
     // HTTP/1.1 ハンドラー
-    handle_requests(tls_stream, &host_routes, &path_routes, &client_ip).await;
+    handle_requests(tls_stream, &client_ip, peer_addr).await;
 }
 
 // kTLS 無効時の接続処理（rustls のみ）
@@ -10012,8 +10103,6 @@ async fn handle_connection(
     // CURRENT_CONFIG から最新の設定を取得（ホットリロード対応）
     // ArcSwap::load() はロックフリーで数ナノ秒
     let config = CURRENT_CONFIG.load();
-    let host_routes = config.host_routes.clone();
-    let path_routes = config.path_routes.clone();
     #[cfg(feature = "http2")]
     let http2_enabled = config.http2_enabled;
     
@@ -10038,12 +10127,12 @@ async fn handle_connection(
     // HTTP/2 が有効かつネゴシエートされた場合は HTTP/2 ハンドラーを使用
     #[cfg(feature = "http2")]
     if http2_enabled && tls_stream.is_http2() {
-        handle_http2_connection(tls_stream, &host_routes, &path_routes, &client_ip).await;
+        handle_http2_connection(tls_stream, &client_ip).await;
         return;
     }
 
     // HTTP/1.1 ハンドラー
-    handle_requests(tls_stream, &host_routes, &path_routes, &client_ip).await;
+    handle_requests(tls_stream, &client_ip, peer_addr).await;
 }
 
 // ====================
@@ -10053,9 +10142,8 @@ async fn handle_connection(
 // 統一されたリクエスト処理ループ（型エイリアスを使用）
 async fn handle_requests(
     mut tls_stream: ServerTls,
-    host_routes: &Arc<HashMap<Box<[u8]>, Backend>>,
-    path_routes: &Arc<HashMap<Box<[u8]>, PathRouter>>,
     client_ip: &str,
+    peer_addr: SocketAddr,
 ) {
     let mut accumulated = Vec::with_capacity(BUF_SIZE);
     
@@ -10193,8 +10281,6 @@ async fn handle_requests(
                     return;
                 }
                 
-                drop(req);
-                
                 // HTTP/1.1 100 Continue レスポンス (RFC 7231 Section 5.1.1)
                 // Expect: 100-continue ヘッダーがある場合、ボディ送信前に 100 Continue を返す
                 if content_length > 0 && check_expect_continue(&headers_for_proxy) {
@@ -10246,12 +10332,70 @@ async fn handle_requests(
                     }
                 }
 
-                // Backend選択
-                let backend_result = find_backend(
+                // Backend選択（統合ルーティング対応）
+                // ヘッダーをHashMapに変換（reqをdropする前に取得）
+                let headers_map: HashMap<String, String> = req.headers.iter()
+                    .map(|h| (
+                        h.name.to_lowercase(),
+                        String::from_utf8_lossy(h.value).to_string()
+                    ))
+                    .collect();
+                
+                // クエリパラメータを抽出
+                let query_map: HashMap<String, String> = {
+                    let path_str = std::str::from_utf8(&path_bytes).unwrap_or("/");
+                    if let Some(query_start) = path_str.find('?') {
+                        let query_str = &path_str[query_start + 1..];
+                        query_str.split('&')
+                            .filter_map(|pair| {
+                                if let Some(eq_pos) = pair.find('=') {
+                                    let key = url_decode(&pair[..eq_pos]);
+                                    let value = url_decode(&pair[eq_pos + 1..]);
+                                    Some((key, value))
+                                } else {
+                                    let key = url_decode(pair);
+                                    Some((key, String::new()))
+                                }
+                            })
+                            .collect()
+                    } else {
+                        HashMap::new()
+                    }
+                };
+                
+                // パスからクエリ部分を除去
+                let path_without_query = if let Some(query_start) = path_bytes.iter().position(|&b| b == b'?') {
+                    &path_bytes[..query_start]
+                } else {
+                    &path_bytes
+                };
+                
+                // reqをdropする前に必要な情報を取得済み
+                drop(req);
+                
+                let config = CURRENT_CONFIG.load();
+                // client_ipをSocketAddrに変換
+                let client_socket_addr = if let Ok(addr) = client_ip.parse::<SocketAddr>() {
+                    addr
+                } else {
+                    // IPアドレスのみの場合、ポート80を仮定
+                    if let Ok(ip) = client_ip.parse::<std::net::IpAddr>() {
+                        SocketAddr::new(ip, 80)
+                    } else {
+                        // パースに失敗した場合はデフォルト（peer_addrを使用）
+                        peer_addr
+                    }
+                };
+                
+                let backend_result = find_backend_unified(
                     &host_bytes,
-                    &path_bytes,
-                    host_routes,
-                    path_routes,
+                    path_without_query,
+                    &method_bytes,
+                    &headers_map,
+                    &query_map,
+                    &client_socket_addr,
+                    &config.routes,
+                    &config.upstream_groups,
                 );
 
                 let (prefix, backend) = match backend_result {
@@ -10314,7 +10458,7 @@ async fn handle_requests(
                 let headers_for_proxy = {
                     let config = CURRENT_CONFIG.load();
                     if let Some(ref wasm_engine) = config.wasm_filter_engine {
-                        // path_routes内で指定されたmodulesを優先
+                        // routes内で指定されたmodulesを優先
                         let path_str = std::str::from_utf8(&path_bytes).unwrap_or("/");
                         let method_str = std::str::from_utf8(&method_bytes).unwrap_or("GET");
                         
@@ -10600,45 +10744,299 @@ fn is_chunked_encoding(value: &[u8]) -> bool {
 // Backend選択
 // ====================
 
-fn find_backend(
-    host: &[u8],
-    path: &[u8],
-    host_routes: &Arc<HashMap<Box<[u8]>, Backend>>,
-    path_routes: &Arc<HashMap<Box<[u8]>, PathRouter>>,
-) -> Option<(Box<[u8]>, Backend)> {
-    // ホスト名からポート番号を除去（例: "127.0.0.1:8443" -> "127.0.0.1"）
-    let host_without_port = if let Some(colon_pos) = host.iter().position(|&b| b == b':') {
-        &host[..colon_pos]
-    } else {
-        host
+/// URLデコード（シンプルな実装）
+/// 
+/// %XX形式のエンコードされた文字をデコードします。
+pub fn url_decode(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    
+    while let Some(ch) = chars.next() {
+        if ch == '%' {
+            if let (Some(d1), Some(d2)) = (chars.next(), chars.next()) {
+                if let (Some(n1), Some(n2)) = (d1.to_digit(16), d2.to_digit(16)) {
+                    let byte = (n1 << 4 | n2) as u8;
+                    result.push(byte as char);
+                    continue;
+                }
+            }
+            result.push(ch);
+            if let Some(d1) = chars.next() {
+                result.push(d1);
+            }
+            if let Some(d2) = chars.next() {
+                result.push(d2);
+            }
+        } else if ch == '+' {
+            result.push(' ');
+        } else {
+            result.push(ch);
+        }
+    }
+    
+    result
+}
+
+/// ワイルドカードパターンマッチング（シンプルな実装）
+/// 
+/// パターン例:
+/// - "example.com" → 完全一致
+/// - "*.example.com" → サブドメインにマッチ（例: "api.example.com", "www.example.com"）
+/// - "api.*.com" → サポートしない（先頭または末尾のみ）
+fn matches_wildcard(pattern: &str, text: &str) -> bool {
+    if pattern == text {
+        return true;
+    }
+    
+    // 先頭ワイルドカード: "*.example.com"
+    if let Some(rest) = pattern.strip_prefix("*.") {
+        if text.ends_with(rest) {
+            // サブドメインのチェック（少なくとも1つのドットが必要）
+            let subdomain = &text[..text.len() - rest.len()];
+            return !subdomain.is_empty() && !subdomain.contains('.');
+        }
+    }
+    
+    // 末尾ワイルドカード: "api.*"
+    if let Some(rest) = pattern.strip_suffix(".*") {
+        if text.starts_with(rest) {
+            // ドメイン部分のチェック
+            let domain = &text[rest.len()..];
+            return !domain.is_empty() && domain.starts_with('.');
+        }
+    }
+    
+    false
+}
+
+/// パスパターンマッチング（ワイルドカード対応）
+/// 
+/// パターン例:
+/// - "/api" → 完全一致
+/// - "/api/*" → "/api/" で始まるすべてのパスにマッチ
+/// - "/api/v2/*" → "/api/v2/" で始まるすべてのパスにマッチ
+fn matches_path_pattern(pattern: &str, path: &[u8]) -> bool {
+    let path_str = match std::str::from_utf8(path) {
+        Ok(s) => s,
+        Err(_) => return false,
     };
     
-    // まず完全一致で検索
-    if let Some(backend) = host_routes.get(host_without_port) {
-        return Some((Box::new([]), backend.clone()));
+    // 完全一致
+    if pattern == path_str {
+        return true;
     }
     
-    // ポート番号付きでも試す（後方互換性のため）
-    if let Some(backend) = host_routes.get(host) {
-        return Some((Box::new([]), backend.clone()));
+    // ワイルドカードパターン: "/api/*"
+    if let Some(prefix) = pattern.strip_suffix("/*") {
+        return path_str.starts_with(prefix) && 
+               (path_str.len() == prefix.len() || path_str.as_bytes()[prefix.len()] == b'/');
     }
     
-    // path_routesで検索（ポート番号なし）
-    if let Some(sorted_map) = path_routes.get(host_without_port) {
-        if let Some((prefix, backend)) = sorted_map.find_longest(path) {
-            return Some((prefix.into(), backend.clone()));
+    // プレフィックス一致（末尾スラッシュなしでもマッチ）
+    if path_str.starts_with(pattern) {
+        // パターンが完全一致、または次の文字がスラッシュ
+        let remaining = &path_str[pattern.len()..];
+        return remaining.is_empty() || remaining.starts_with('/');
+    }
+    
+    false
+}
+
+/// ソースIPがCIDR範囲に含まれるかチェック
+fn matches_cidr(ip: &SocketAddr, cidr_ranges: &[String]) -> bool {
+    use std::net::IpAddr;
+    
+    let ip_addr = ip.ip();
+    
+    for cidr in cidr_ranges {
+        // シンプルなCIDRマッチング（IPv4のみ対応）
+        if let Some((network_str, prefix_len_str)) = cidr.split_once('/') {
+            if let (Ok(network), Ok(prefix_len)) = (
+                network_str.parse::<IpAddr>(),
+                prefix_len_str.parse::<u8>()
+            ) {
+                if let (IpAddr::V4(network_v4), IpAddr::V4(ip_v4)) = (network, ip_addr) {
+                    let mask = !((1u32 << (32 - prefix_len)) - 1);
+                    let network_u32 = u32::from_be_bytes(network_v4.octets());
+                    let ip_u32 = u32::from_be_bytes(ip_v4.octets());
+                    if (network_u32 & mask) == (ip_u32 & mask) {
+                        return true;
+                    }
+                }
+            }
+        } else {
+            // CIDR表記なし（完全一致）
+            if let Ok(parsed_ip) = cidr.parse::<IpAddr>() {
+                if parsed_ip == ip_addr {
+                    return true;
+                }
+            }
         }
     }
     
-    // path_routesで検索（ポート番号付き、後方互換性のため）
-    if let Some(sorted_map) = path_routes.get(host) {
-        if let Some((prefix, backend)) = sorted_map.find_longest(path) {
-            return Some((prefix.into(), backend.clone()));
+    false
+}
+
+/// 条件マッチング関数
+/// 
+/// すべての条件をANDで結合して評価します。
+fn matches_conditions(
+    conditions: &RouteConditions,
+    host: &[u8],
+    path: &[u8],
+    method: &[u8],
+    headers: &HashMap<String, String>,
+    query: &HashMap<String, String>,
+    source_ip: &SocketAddr,
+) -> bool {
+    // host条件のチェック
+    // 条件が指定されていない場合は、すべてのホストにマッチ（デフォルト）
+    if let Some(ref host_pattern) = conditions.host {
+        let host_str = match std::str::from_utf8(host) {
+            Ok(s) => {
+                // ポート番号を除去
+                if let Some(colon_pos) = s.find(':') {
+                    &s[..colon_pos]
+                } else {
+                    s
+                }
+            },
+            Err(_) => return false,
+        };
+        
+        if !matches_wildcard(host_pattern, host_str) {
+            return false;
+        }
+    }
+    // host条件がNoneの場合は、すべてのホストにマッチ（デフォルト動作）
+    
+    // path条件のチェック
+    // 条件が指定されていない場合は、すべてのパスにマッチ（デフォルト）
+    if let Some(ref path_pattern) = conditions.path {
+        if !matches_path_pattern(path_pattern, path) {
+            return false;
+        }
+    }
+    // path条件がNoneの場合は、すべてのパスにマッチ（デフォルト動作）
+    
+    // header条件のチェック
+    // 条件が指定されていない場合は、すべてのヘッダーにマッチ（デフォルト）
+    if let Some(ref header_map) = conditions.header {
+        for (key, value_pattern) in header_map {
+            let header_value = headers.get(key).map(|s| s.as_str()).unwrap_or("");
+            if !matches_wildcard(value_pattern, header_value) {
+                return false;
+            }
+        }
+    }
+    // header条件がNoneの場合は、すべてのヘッダーにマッチ（デフォルト動作）
+    
+    // method条件のチェック
+    // 条件が指定されていない場合は、すべてのメソッドにマッチ（デフォルト）
+    if let Some(ref methods) = conditions.method {
+        let method_str = std::str::from_utf8(method).unwrap_or("");
+        if !methods.iter().any(|m| m.eq_ignore_ascii_case(method_str)) {
+            return false;
+        }
+    }
+    // method条件がNoneの場合は、すべてのメソッドにマッチ（デフォルト動作）
+    
+    // query条件のチェック
+    // 条件が指定されていない場合は、すべてのクエリパラメータにマッチ（デフォルト）
+    if let Some(ref query_map) = conditions.query {
+        for (key, value_pattern) in query_map {
+            let query_value = query.get(key).map(|s| s.as_str()).unwrap_or("");
+            if !matches_wildcard(value_pattern, query_value) {
+                return false;
+            }
+        }
+    }
+    // query条件がNoneの場合は、すべてのクエリパラメータにマッチ（デフォルト動作）
+    
+    // source_ip条件のチェック
+    // 条件が指定されていない場合は、すべてのIPアドレスにマッチ（デフォルト）
+    if let Some(ref ip_ranges) = conditions.source_ip {
+        if !matches_cidr(source_ip, ip_ranges) {
+            return false;
+        }
+    }
+    // source_ip条件がNoneの場合は、すべてのIPアドレスにマッチ（デフォルト動作）
+    
+    // すべての条件がマッチした、または条件が指定されていない場合はtrue
+    true
+}
+
+/// 統合ルーティング評価関数（唯一の評価方式）
+/// 
+/// 配列の順序で評価（first-match方式）
+pub fn find_backend_unified(
+    host: &[u8],
+    path: &[u8],
+    method: &[u8],
+    headers: &HashMap<String, String>,
+    query: &HashMap<String, String>,
+    source_ip: &SocketAddr,
+    routes: &[Route],
+    upstream_groups: &Arc<HashMap<String, Arc<UpstreamGroup>>>,
+) -> Option<(Box<[u8]>, Backend)> {
+    // 配列の順序で評価（first-match）
+    for (i, route) in routes.iter().enumerate() {
+        let matched = matches_conditions(
+            &route.conditions,
+            host,
+            path,
+            method,
+            headers,
+            query,
+            source_ip,
+        );
+        
+        if matched {
+            debug!(
+                "Route[{}] matched: host={:?} path={:?} method={:?}",
+                i,
+                route.conditions.host,
+                route.conditions.path,
+                route.conditions.method
+            );
+            match load_backend(&route.action, upstream_groups) {
+                Ok(backend) => {
+                    // マッチしたルートのpath条件をprefixとして返す
+                    // path条件がない場合は空のprefixを返す
+                    let prefix: Box<[u8]> = if let Some(ref path_pattern) = route.conditions.path {
+                        // ワイルドカードパターン（/*で終わる）の場合は、/*を除去
+                        if let Some(prefix_str) = path_pattern.strip_suffix("/*") {
+                            prefix_str.as_bytes().into()
+                        } else {
+                            path_pattern.as_bytes().into()
+                        }
+                    } else {
+                        Box::new([])
+                    };
+                    return Some((prefix, backend));
+                }
+                Err(e) => {
+                    warn!(
+                        "Route[{}] load_backend failed: {} (action={:?})",
+                        i, e, route.action
+                    );
+                    // エラーが発生しても次のルートを試す
+                    continue;
+                }
+            }
         }
     }
     
+    debug!(
+        "No route matched: host='{}' path='{}' method='{}' routes_count={}",
+        String::from_utf8_lossy(host),
+        String::from_utf8_lossy(path),
+        String::from_utf8_lossy(method),
+        routes.len()
+    );
     None
 }
+
 
 // ====================
 // Backend処理
