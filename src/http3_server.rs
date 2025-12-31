@@ -1232,9 +1232,17 @@ async fn proxy_to_tls_backend_async(
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
     
-    let config = Arc::new(ClientConfig::builder()
+    // ClientConfigを作成（Arcにラップする前）
+    let mut config = ClientConfig::builder()
         .with_root_certificates(root_store)
-        .with_no_client_auth());
+        .with_no_client_auth();
+    
+    // kTLS用にシークレット抽出を有効化
+    // これにより dangerous_extract_secrets() が使用可能になる
+    config.enable_secret_extraction = true;
+    
+    // Arcにラップ
+    let config = Arc::new(config);
     
     let sni_name = target.sni_name.as_deref().unwrap_or(&target.host);
     let server_name = match rustls::pki_types::ServerName::try_from(sni_name.to_string()) {
