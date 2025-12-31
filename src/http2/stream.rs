@@ -106,6 +106,12 @@ pub struct Stream {
     pub received_body_size: u64,
     /// 最終アクティビティ時刻 (Slow Loris 対策)
     pub last_activity: std::time::Instant,
+    /// gRPC モード（content-type: application/grpc 検出時に true）
+    #[cfg(feature = "grpc")]
+    pub grpc_mode: bool,
+    /// gRPC ストリーム状態（gRPC モード時のみ使用）
+    #[cfg(feature = "grpc")]
+    pub grpc_stream_state: Option<crate::grpc::stream::GrpcStreamState>,
 }
 
 impl Stream {
@@ -128,6 +134,10 @@ impl Stream {
             content_length: None,
             received_body_size: 0,
             last_activity: std::time::Instant::now(),
+            #[cfg(feature = "grpc")]
+            grpc_mode: false,
+            #[cfg(feature = "grpc")]
+            grpc_stream_state: None,
         }
     }
 
@@ -395,6 +405,51 @@ impl Stream {
             .iter()
             .find(|h| h.name == b":scheme")
             .map(|h| h.value.as_slice())
+    }
+
+    /// Content-Type ヘッダーを取得
+    pub fn content_type(&self) -> Option<&[u8]> {
+        self.request_headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case(b"content-type"))
+            .map(|h| h.value.as_slice())
+    }
+
+    /// gRPC モードを設定
+    #[cfg(feature = "grpc")]
+    pub fn set_grpc_mode(&mut self, enabled: bool) {
+        self.grpc_mode = enabled;
+        if enabled && self.grpc_stream_state.is_none() {
+            self.grpc_stream_state = Some(crate::grpc::stream::GrpcStreamState::new(self.id));
+        }
+    }
+
+    /// gRPC リクエストかどうか判定
+    #[cfg(feature = "grpc")]
+    pub fn is_grpc(&self) -> bool {
+        self.grpc_mode
+    }
+
+    /// gRPC リクエストかどうか判定（feature 無効時は常に false）
+    #[cfg(not(feature = "grpc"))]
+    pub fn is_grpc(&self) -> bool {
+        false
+    }
+
+    /// gRPC ストリーム状態を取得（可変参照）
+    #[cfg(feature = "grpc")]
+    pub fn grpc_state_mut(&mut self) -> Option<&mut crate::grpc::stream::GrpcStreamState> {
+        self.grpc_stream_state.as_mut()
+    }
+
+    /// リクエストヘッダーから gRPC を検出して自動設定
+    #[cfg(feature = "grpc")]
+    pub fn detect_grpc_from_headers(&mut self) {
+        if let Some(ct) = self.content_type() {
+            if crate::grpc::headers::is_grpc_content_type(ct) {
+                self.set_grpc_mode(true);
+            }
+        }
     }
 }
 

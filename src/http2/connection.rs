@@ -1171,7 +1171,116 @@ where
         Ok(())
     }
 
-    /// DATA フレームを送信
+    /// gRPC レスポンスを送信 (トレイラー付き)
+    ///
+    /// gRPC プロトコルでは、レスポンス終了時に grpc-status と grpc-message を
+    /// HTTP/2 トレイラーとして送信する必要があります。
+    ///
+    /// # 引数
+    /// * `stream_id` - ストリーム ID
+    /// * `headers` - レスポンスヘッダー (content-type 等)
+    /// * `body` - レスポンスボディ (gRPC フレーム済み)
+    /// * `grpc_status` - gRPC ステータスコード (0 = OK)
+    /// * `grpc_message` - gRPC エラーメッセージ (オプション)
+    #[cfg(feature = "grpc")]
+    pub async fn send_grpc_response(
+        &mut self,
+        stream_id: u32,
+        headers: &[(&[u8], &[u8])],
+        body: Option<&[u8]>,
+        grpc_status: u32,
+        grpc_message: Option<&str>,
+    ) -> Http2Result<()> {
+        // 1. HEADERS フレーム送信 (200 OK + content-type: application/grpc)
+        let mut header_list: Vec<(&[u8], &[u8], bool)> = Vec::with_capacity(headers.len() + 2);
+        header_list.push((b":status", b"200", false));
+        header_list.push((b"content-type", b"application/grpc+proto", false));
+        
+        for &(name, value) in headers {
+            header_list.push((name, value, false));
+        }
+
+        let header_block = self.hpack_encoder.encode(&header_list)
+            .map_err(|e| Http2Error::HpackEncode(e.to_string()))?;
+
+        // HEADERS with end_stream=false (body + trailers follow)
+        let headers_frame = self.frame_encoder.encode_headers(
+            stream_id,
+            &header_block,
+            false, // end_stream
+            true,  // end_headers
+            None,
+        );
+        self.write_all(&headers_frame).await?;
+
+        // ストリーム状態を更新
+        if let Some(stream) = self.streams.get(stream_id) {
+            stream.send_headers(false)?;
+        }
+
+        // 2. DATA フレーム送信
+        if let Some(body) = body {
+            if !body.is_empty() {
+                self.send_data(stream_id, body, false).await?;
+            }
+        }
+
+        // 3. TRAILERS フレーム送信 (grpc-status, grpc-message)
+        self.send_grpc_trailers(stream_id, grpc_status, grpc_message).await
+    }
+
+    /// gRPC トレイラーを送信
+    ///
+    /// grpc-status と grpc-message をトレイラーとして送信し、
+    /// ストリームを END_STREAM でクローズします。
+    #[cfg(feature = "grpc")]
+    pub async fn send_grpc_trailers(
+        &mut self,
+        stream_id: u32,
+        grpc_status: u32,
+        grpc_message: Option<&str>,
+    ) -> Http2Result<()> {
+        use crate::grpc::status::{GrpcStatus, GrpcStatusCode};
+
+        let code = GrpcStatusCode::from_u8(grpc_status as u8)
+            .unwrap_or(GrpcStatusCode::Unknown);
+        
+        let status = if let Some(msg) = grpc_message {
+            GrpcStatus::error(code, msg)
+        } else {
+            GrpcStatus::from_code(code)
+        };
+        let trailers = status.to_trailers();
+
+        // トレイラーをエンコード
+        let trailer_list: Vec<(&[u8], &[u8], bool)> = trailers
+            .iter()
+            .map(|(n, v)| (n.as_slice(), v.as_slice(), false))
+            .collect();
+
+        let trailer_block = self.hpack_encoder.encode(&trailer_list)
+            .map_err(|e| Http2Error::HpackEncode(e.to_string()))?;
+
+        // HEADERS (as trailers) with end_stream=true
+        let trailer_frame = self.frame_encoder.encode_headers(
+            stream_id,
+            &trailer_block,
+            true,  // end_stream
+            true,  // end_headers
+            None,
+        );
+        self.write_all(&trailer_frame).await?;
+
+        // ストリーム状態を更新
+        if let Some(stream) = self.streams.get(stream_id) {
+            stream.send_headers(true)?;
+            if let Some(grpc_state) = stream.grpc_state_mut() {
+                grpc_state.on_trailers_sent();
+            }
+        }
+
+        Ok(())
+    }
     /// 
     /// フロー制御ウィンドウを考慮してデータを分割送信します。
     /// ウィンドウが不足した場合は WINDOW_UPDATE を待機します。
