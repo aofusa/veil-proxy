@@ -720,6 +720,101 @@ connection_window_size = 16777216
 
 
 # ==========================================
+# gRPC 設定 (--features 'grpc')
+# ==========================================
+#
+# gRPC-over-HTTP/2 のサポートを有効化できます。
+# HTTP/3 上の gRPC は --features 'grpc-full' または
+# --features 'grpc,http3' でビルドする必要があります。
+#
+# ビルド方法:
+#   gRPC基本:     cargo build --features grpc
+#   gRPC-Web:     cargo build --features grpc-web
+#   gRPC全機能:   cargo build --features grpc-full
+#
+[grpc]
+# gRPC サポートを有効化（デフォルト: false）
+# enabled = true
+
+# デフォルトタイムアウト（ミリ秒）
+# grpc-timeout ヘッダーが指定されていない場合に使用
+# timeout_ms = 30000
+
+# 最大メッセージサイズ（バイト）
+# gRPC メッセージの最大サイズ制限
+# max_message_size = 4194304  # 4MB
+
+# 許可する圧縮エンコーディング
+# identity, gzip, deflate から選択
+# encodings = ["identity", "gzip"]
+
+# 圧縮レベル（1-9、高いほど圧縮率高・速度遅）
+# compression_level = 6
+
+# 圧縮を適用する最小メッセージサイズ
+# これより小さいメッセージは圧縮しない（オーバーヘッド削減）
+# min_compression_size = 1024
+
+# ------------------------------------------
+# gRPC-Web 設定 (--features 'grpc-web')
+# ------------------------------------------
+#
+# ブラウザ互換の gRPC-Web プロトコル変換を有効化します。
+# CORS 設定はルートごとに個別に設定できます。
+#
+# gRPC-Web とは:
+#   - ブラウザから gRPC サーバーにアクセスするためのプロトコル
+#   - HTTP/1.1 / HTTP/2 で動作
+#   - application/grpc-web Content-Type を使用
+#   - トレイラーをボディにエンコード
+#
+# [grpc.grpc_web]
+# # gRPC-Web サポートを有効化
+# enabled = true
+
+# ------------------------------------------
+# gRPC-Web CORS 設定（ルートごとの設定例）
+# ------------------------------------------
+#
+# 各ルートで grpc_web_cors セクションを使用して
+# CORS ポリシーを個別に設定できます。
+#
+# [routes.action.grpc_web_cors]
+# # 許可するオリジン（"*" で全オリジン）
+# allowed_origins = ["https://app.example.com", "https://admin.example.com"]
+#
+# # 許可するヘッダー
+# allowed_headers = ["content-type", "x-grpc-web", "grpc-timeout"]
+#
+# # ブラウザがアクセスできるヘッダー
+# exposed_headers = ["grpc-status", "grpc-message"]
+#
+# # クレデンシャル（Cookie等）を許可
+# allow_credentials = true
+#
+# # プリフライトキャッシュ時間（秒）
+# max_age_secs = 86400
+
+# ------------------------------------------
+# gRPC バックエンド接続設定例
+# ------------------------------------------
+#
+# gRPC バックエンドへの接続は use_h2c = true で
+# HTTP/2 Cleartext（H2C）を使用します。
+#
+# [routes.action]
+# type = "Proxy"
+# url = "http://grpc-backend:50051"
+# use_h2c = true  # gRPC は H2C が必要
+#
+# # gRPC-Web CORS 設定（このルート専用）
+#   [routes.action.grpc_web_cors]
+#   allowed_origins = ["*"]
+#   allowed_headers = ["content-type", "x-grpc-web", "grpc-timeout"]
+
+
+
+# ==========================================
 # Upstream グループ定義（ロードバランシング）
 # ==========================================
 # 複数のバックエンドサーバーを定義し、リクエストを分散できます。

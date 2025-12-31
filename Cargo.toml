@@ -39,6 +39,21 @@ wasm = ["wasmtime"]
 # 全プロトコルサポート
 all-protocols = ["http2", "http3"]
 
+# gRPC サポート (HTTP/2 ベース)
+# gRPC ワイヤプロトコル（framing, headers, trailers）を実装
+# Protobuf 解析には prost を使用（オプション）
+# ビルド方法: cargo build --features grpc
+grpc = ["prost"]
+
+# gRPC-Web サポート
+# ブラウザ互換の gRPC-Web プロトコル変換
+# CORS 設定は config.toml でルート毎に設定可能
+grpc-web = ["grpc"]
+
+# gRPC 全機能サポート
+# HTTP/3 上の gRPC は http3 feature に依存
+grpc-full = ["grpc", "grpc-web", "http3"]
+
 [dependencies]
 monoio = { version = "0.2.4" }
 # rustls を直接使用（ハンドシェイク後に kTLS へオフロード）
@@ -96,6 +111,10 @@ quiche = { version = "0.24.6", optional = true }
 # - cranelift: AOT コンパイル
 # - component-model: WASI対応
 wasmtime = { version = "40.0.0", optional = true, features = ["pooling-allocator", "cranelift"] }
+
+# Protobuf: gRPC メッセージのシリアライズ/デシリアライズ
+# prost は gRPC feature 有効時のみ使用
+prost = { version = "0.13", optional = true }
 
 # nix: Unix システムコール用のRustラッパー
 # - uname() でカーネルバージョン取得

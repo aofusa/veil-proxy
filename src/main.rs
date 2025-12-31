@@ -162,6 +162,14 @@ pub mod routing;
 #[cfg(feature = "wasm")]
 pub mod wasm;
 
+/// gRPC プロトコルサポート
+/// - gRPC ワイヤプロトコル（5-byte framing）
+/// - gRPC ヘッダー/トレイラー処理
+/// - gRPC-Web 変換（grpc-web feature）
+/// - 圧縮サポート（gzip/deflate）
+#[cfg(feature = "grpc")]
+pub mod grpc;
+
 use httparse::{Request, Status};
 use monoio::fs::OpenOptions;
 use monoio::buf::{IoBuf, IoBufMut};
