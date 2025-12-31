@@ -459,7 +459,7 @@ huge_pages_enabled = true
 #   - 静的ファイル配信に最適（動的に変更されるファイルには不向き）
 #
 # ルーティングごとの設定:
-#   - 各ルーティング（[path_routes]や[host_routes]）で`open_file_cache`セクションを指定可能
+#   - 各ルーティングで`open_file_cache`セクションを指定可能
 #   - ルーティング設定がない場合は、このグローバル設定が使用される
 #
 # デフォルト: false（無効）
@@ -787,7 +787,7 @@ connection_window_size = 16777216
 # 各ルートで grpc_web_cors セクションを使用して
 # CORS ポリシーを個別に設定できます。
 #
-# [routes.action.grpc_web_cors]
+# [route.grpc_web_cors]
 # # 許可するオリジン（"*" で全オリジン）
 # allowed_origins = ["https://app.example.com", "https://admin.example.com"]
 #
@@ -810,13 +810,13 @@ connection_window_size = 16777216
 # gRPC バックエンドへの接続は use_h2c = true で
 # HTTP/2 Cleartext（H2C）を使用します。
 #
-# [routes.action]
+# [route.action]
 # type = "Proxy"
 # url = "http://grpc-backend:50051"
 # use_h2c = true  # gRPC は H2C が必要
 #
 # # gRPC-Web CORS 設定（このルート専用）
-#   [routes.action.grpc_web_cors]
+#   [route.grpc_web_cors]
 #   allowed_origins = ["*"]
 #   allowed_headers = ["content-type", "x-grpc-web", "grpc-timeout"]
 
@@ -1317,7 +1317,7 @@ modules = ["header_filter", "waf_filter"]
 # type = "Proxy"
 # url = "http://analytics-backend:8080"
 #
-#   [path_routes.action.compression]
+#   [route.compression]
 #   enabled = true
 #   min_size = 256
 #   gzip_level = 6              # 圧縮率優先
