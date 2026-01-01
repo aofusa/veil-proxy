@@ -222,14 +222,13 @@ add_response_headers = { "X-Server-Id" = "backend2" }
 EOF
 
     # H2Cバックエンド設定（HTTP/2 over cleartext、静的ファイル配信）
-    # 注意: veil-proxyは現在H2Cサーバーとして動作しない可能性があるため、
-    # この設定はHTTP/1.1サーバーとして動作します
-    # H2Cテストでは、プロキシがH2C接続を試みることを確認します
-    # TLSセクションは必須ですが、実際にはHTTP/1.1サーバーとして動作します
+    # HTTP（平文）サーバーとして動作させ、H2C接続を受け入れる
+    # 注意: TLSセクションは必須だが、listenをHTTPポートに設定することでHTTPで動作可能
     cat > "${FIXTURES_DIR}/backend_h2c.toml" << EOF
 [server]
 listen = "127.0.0.1:${BACKEND_H2C_PORT}"
 threads = 1
+# http設定は不要（HTTP（平文）サーバーとして動作）
 
 [tls]
 cert_path = "${FIXTURES_DIR}/cert.pem"
@@ -485,11 +484,10 @@ start_servers() {
         log_warn "Backend 2 may not be fully ready, continuing..."
     fi
     
-    # H2CバックエンドはHTTPSサーバーとして動作（H2CテストではプロキシがH2C接続を試みる）
-    # 注意: バックエンドサーバーはHTTPSとして動作するが、プロキシ設定でuse_h2c=trueを指定しているため、
-    # プロキシはH2C（平文HTTP/2）接続を試みる。これはエラーハンドリングのテストとして機能する。
-    if wait_for_server "https://127.0.0.1:${BACKEND_H2C_PORT}/health" "H2C Backend" 15; then
-        log_info "H2C Backend is ready (HTTPS mode, H2C connection will be attempted by proxy)"
+    # H2CバックエンドはHTTP（平文）サーバーとして動作
+    # listenをHTTPポートに設定することで、HTTP（平文）で動作可能
+    if wait_for_h2c_server "http://127.0.0.1:${BACKEND_H2C_PORT}/health" "H2C Backend" 15; then
+        log_info "H2C Backend is ready (HTTP plaintext mode)"
     else
         log_warn "H2C Backend may not be fully ready, continuing..."
     fi
@@ -629,6 +627,27 @@ wait_for_server() {
     return 1
 }
 
+# H2Cサーバーの起動を待機（HTTP平文、リトライ付き）
+wait_for_h2c_server() {
+    local url=$1
+    local name=$2
+    local max_attempts=${3:-30}  # デフォルト30回
+    local attempt=0
+    
+    # HTTP（平文）の場合は-kオプションは不要（TLS証明書検証をスキップする必要がない）
+    # -sオプションのみ使用（サイレントモード）
+    while [ $attempt -lt $max_attempts ]; do
+        if curl -s --http2-prior-knowledge "$url" > /dev/null 2>&1; then
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        sleep 0.2
+    done
+    
+    log_error "$name failed to start after $max_attempts attempts"
+    return 1
+}
+
 # ヘルスチェック（リトライ付き）
 health_check() {
     log_info "Checking server health..."
@@ -649,8 +668,8 @@ health_check() {
         return 1
     fi
     
-    # H2Cバックエンド (HTTPS - H2Cテスト用)
-    if wait_for_server "https://127.0.0.1:${BACKEND_H2C_PORT}/health" "H2C Backend" 30; then
+    # H2Cバックエンド (HTTP - H2Cテスト用)
+    if wait_for_h2c_server "http://127.0.0.1:${BACKEND_H2C_PORT}/health" "H2C Backend" 30; then
         log_info "H2C Backend: OK"
     else
         log_error "H2C Backend: FAILED"
