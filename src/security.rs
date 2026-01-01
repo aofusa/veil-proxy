@@ -665,7 +665,7 @@ impl std::fmt::Display for KernelVersion {
 /// # エラー
 ///
 /// 制限の適用に失敗した場合はエラーを返します。
-/// ただし、機能がサポートされていない場合は警告を出力して続行します。
+/// カーネルバージョンが要件を満たさない場合もエラーを返します。
 pub fn apply_security_restrictions(config: &SecurityConfig) -> io::Result<()> {
     let kernel = KernelVersion::current()?;
     info!("Kernel version: {} - Checking security feature support", kernel);
@@ -684,24 +684,26 @@ pub fn apply_security_restrictions(config: &SecurityConfig) -> io::Result<()> {
     // 2. Landlock
     if config.enable_landlock {
         if kernel.supports_landlock() {
-            match apply_landlock(config) {
-                Ok(()) => info!("Landlock filesystem restrictions applied"),
-                Err(e) => {
-                    warn!("Failed to apply Landlock: {} - continuing without it", e);
-                }
-            }
+            apply_landlock(config)?;  // エラーを返すように変更
+            info!("Landlock filesystem restrictions applied");
         } else {
-            warn!("Landlock requires Linux 5.13+ (current: {})", kernel);
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("Landlock requires Linux 5.13+ (current: {})", kernel)
+            ));
         }
     }
 
     // 3. seccomp（最後に適用 - 不可逆）
     if config.enable_seccomp && config.seccomp_mode != SeccompMode::Disabled {
         if kernel.supports_seccomp() {
-            apply_seccomp(config)?;
+            apply_seccomp(config)?;  // 既にエラーを返している
             info!("seccomp filter applied (mode: {:?})", config.seccomp_mode);
         } else {
-            warn!("seccomp requires Linux 3.17+ (current: {})", kernel);
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("seccomp requires Linux 3.17+ (current: {})", kernel)
+            ));
         }
     }
 

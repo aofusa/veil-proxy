@@ -2218,6 +2218,16 @@ pub struct GlobalSecurityConfig {
     /// PR_SET_NO_NEW_PRIVSを設定するかどうか
     #[serde(default = "default_true")]
     pub sandbox_no_new_privs: bool,
+    
+    /// セキュリティ機能の有効化に失敗した場合の動作
+    /// false: 失敗時に起動を中止（デフォルト、推奨）
+    /// true: 失敗時も警告を出して起動を続行（開発・デバッグ用）
+    #[serde(default = "default_allow_security_failures")]
+    pub allow_security_failures: bool,
+}
+
+fn default_allow_security_failures() -> bool {
+    false  // デフォルトはfalse（失敗時に起動失敗）
 }
 
 fn default_sandbox_unshare_mount() -> bool { true }
@@ -7281,10 +7291,15 @@ fn main() {
                 }
             }
             Err(e) => {
-                // サンドボックス適用失敗は警告として扱い、続行する
-                // 本番環境ではエラー扱いにすることも検討
-                warn!("Failed to apply sandbox restrictions: {} - continuing without sandbox", e);
-                warn!("Hint: Sandbox may require root privileges or CAP_SYS_ADMIN");
+                if loaded_config.global_security.allow_security_failures {
+                    warn!("Failed to apply sandbox restrictions: {} - continuing without sandbox", e);
+                    warn!("Hint: Sandbox may require root privileges or CAP_SYS_ADMIN");
+                } else {
+                    error!("Failed to apply sandbox restrictions: {}", e);
+                    error!("Server startup aborted. To allow failures, set allow_security_failures = true in config.toml");
+                    error!("Hint: Sandbox may require root privileges or CAP_SYS_ADMIN");
+                    return;
+                }
             }
         }
     }
@@ -7337,9 +7352,24 @@ fn main() {
                 }
             }
             Err(e) => {
-                // セキュリティ制限の適用失敗は警告として扱い、続行する
-                // 本番環境ではエラー扱いにすることも検討
-                warn!("Failed to apply security restrictions: {} - continuing without them", e);
+                if loaded_config.global_security.allow_security_failures {
+                    warn!("Failed to apply security restrictions: {} - continuing without them", e);
+                } else {
+                    error!("Failed to apply security restrictions: {}", e);
+                    error!("Server startup aborted. To allow failures, set allow_security_failures = true in config.toml");
+                    
+                    // より詳細なエラーメッセージ
+                    if security_config.enable_seccomp {
+                        error!("seccomp was enabled but failed to apply");
+                    }
+                    if security_config.enable_landlock {
+                        error!("Landlock was enabled but failed to apply");
+                    }
+                    error!("Hint: Check kernel version requirements (seccomp: Linux 3.17+, Landlock: Linux 5.13+)");
+                    error!("Hint: Ensure required privileges are available");
+                    
+                    return;
+                }
             }
         }
     }
