@@ -21,6 +21,7 @@ mod context;
 mod engine;
 pub mod grpc_integration;
 mod host;
+pub mod http_executor;
 pub mod integration;
 pub mod persistent_context;
 pub mod queue_notify;

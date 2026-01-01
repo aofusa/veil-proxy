@@ -5504,6 +5504,21 @@ impl UpstreamServer {
             warn!("Upstream {}:{} is now unhealthy", self.target.host, self.target.port);
         }
     }
+    
+    /// Get the host address
+    pub fn host(&self) -> &str {
+        &self.target.host
+    }
+    
+    /// Get the port number
+    pub fn port(&self) -> u16 {
+        self.target.port
+    }
+    
+    /// Check if TLS is enabled
+    pub fn use_tls(&self) -> bool {
+        self.target.use_tls
+    }
 }
 
 /// Upstream グループ（複数バックエンドのロードバランシング）
@@ -8120,34 +8135,63 @@ fn spawn_wasm_tick_thread() {
                 crate::wasm::process_pending_notifications(wasm_engine);
                 
                 // P3: Pending HTTP call processing
-                // Take all globally registered pending calls and log them
-                // Note: Full async execution would require HTTP client integration
+                // Take all globally registered pending calls and execute them
                 let pending_calls = crate::wasm::take_global_pending_calls();
                 for pending in pending_calls {
+                    let upstream_name = &pending.call.upstream;
+                    
                     debug!(
                         "[wasm:http_call] Processing pending call: module='{}' token={} upstream='{}' timeout={}ms",
                         pending.module_name,
                         pending.token,
-                        pending.call.upstream,
+                        upstream_name,
                         pending.call.timeout_ms
                     );
                     
-                    // TODO: Execute HTTP call asynchronously using upstream_groups
-                    // For now, we log and simulate a timeout response
-                    // In a full implementation, this would:
-                    // 1. Look up the upstream in config.upstream_groups
-                    // 2. Make async HTTP request to backend
-                    // 3. Call wasm_engine.on_http_call_response() with result
-                    
-                    // Simulate response (for testing - remove in production)
-                    let response = crate::wasm::HttpCallResponse {
-                        status_code: 504,
-                        headers: vec![],
-                        body: b"HTTP call async execution not fully implemented".to_vec(),
-                        trailers: vec![],
+                    // Look up the upstream in config.upstream_groups
+                    let upstream_groups = &config.upstream_groups;
+                    let response = if let Some(group) = upstream_groups.get(upstream_name) {
+                        // Select a backend server
+                        if let Some(server) = group.select("0.0.0.0") {
+                            // Get connection info
+                            let host = server.host();
+                            let port = server.port();
+                            let use_tls = server.use_tls();
+                            
+                            debug!(
+                                "[wasm:http_call] Connecting to upstream: {}:{} (tls={})",
+                                host, port, use_tls
+                            );
+                            
+                            // Execute HTTP call using http_executor
+                            crate::wasm::http_executor::execute_http_call_safe(
+                                &pending,
+                                host,
+                                port,
+                                use_tls,
+                            )
+                        } else {
+                            warn!("[wasm:http_call] No healthy servers in upstream '{}' for module '{}'",
+                                upstream_name, pending.module_name);
+                            crate::wasm::HttpCallResponse {
+                                status_code: 503,
+                                headers: vec![("x-wasm-error".to_string(), "no_healthy_servers".to_string())],
+                                body: b"No healthy upstream servers available".to_vec(),
+                                trailers: vec![],
+                            }
+                        }
+                    } else {
+                        warn!("[wasm:http_call] Upstream '{}' not found for module '{}'",
+                            upstream_name, pending.module_name);
+                        crate::wasm::HttpCallResponse {
+                            status_code: 502,
+                            headers: vec![("x-wasm-error".to_string(), "upstream_not_found".to_string())],
+                            body: format!("Upstream '{}' not found", upstream_name).into_bytes(),
+                            trailers: vec![],
+                        }
                     };
                     
-                    // Deliver simulated response
+                    // Deliver response to WASM module
                     let _ = wasm_engine.on_http_call_response(
                         &pending.module_name,
                         pending.token,
