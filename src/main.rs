@@ -8913,8 +8913,8 @@ where
             if let Some(ref g) = server_guard {
                 headers.push(g.as_header());
             }
-            let _ = conn.send_response(stream_id, 400, &headers, Some(b"Bad Request")).await;
-            return Some((400, 11));
+            let _ = conn.send_response(stream_id, 404, &headers, Some(b"Not Found")).await;
+            return Some((404, 9));
         }
     };
     
@@ -10341,7 +10341,7 @@ async fn handle_requests(
                 let (prefix, backend) = match backend_result {
                     Some(b) => b,
                     None => {
-                        let err_buf = ERR_MSG_BAD_REQUEST.to_vec();
+                        let err_buf = ERR_MSG_NOT_FOUND.to_vec();
                         let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
                         return;
                     }

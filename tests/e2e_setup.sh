@@ -155,7 +155,7 @@ level = "warn"
 [[route]]
 [route.conditions]
 host = "localhost"
-path = "/"
+path = "/*"
 [route.action]
 type = "File"
 path = "${FIXTURES_DIR}/backend1"
@@ -166,7 +166,7 @@ add_response_headers = { "X-Server-Id" = "backend1" }
 [[route]]
 [route.conditions]
 host = "127.0.0.1"
-path = "/"
+path = "/*"
 [route.action]
 type = "File"
 path = "${FIXTURES_DIR}/backend1"
@@ -191,7 +191,7 @@ level = "warn"
 [[route]]
 [route.conditions]
 host = "localhost"
-path = "/"
+path = "/*"
 [route.action]
 type = "File"
 path = "${FIXTURES_DIR}/backend2"
@@ -202,7 +202,7 @@ add_response_headers = { "X-Server-Id" = "backend2" }
 [[route]]
 [route.conditions]
 host = "127.0.0.1"
-path = "/"
+path = "/*"
 [route.action]
 type = "File"
 path = "${FIXTURES_DIR}/backend2"
@@ -241,7 +241,7 @@ tls_insecure = true
 [[route]]
 [route.conditions]
 host = "localhost"
-path = "/"
+path = "/*"
 [route.action]
 type = "Proxy"
 upstream = "backend-pool"
@@ -256,7 +256,7 @@ min_size = 1024
 [[route]]
 [route.conditions]
 host = "127.0.0.1"
-path = "/"
+path = "/*"
 [route.action]
 type = "Proxy"
 upstream = "backend-pool"
