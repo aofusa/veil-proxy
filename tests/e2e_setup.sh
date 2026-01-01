@@ -308,6 +308,15 @@ adaptive_threshold = 1048576
 EOF
     fi
     
+    # セキュリティ設定を追加（レート制限、IP制限）
+    if [ "$config_type" = "security" ]; then
+        cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
+[route.security]
+rate_limit_requests_per_min = 30
+allowed_ips = ["127.0.0.1", "::1"]
+EOF
+    fi
+    
     # 2つ目のルート設定
     cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
 
@@ -615,6 +624,7 @@ case "${1:-}" in
         echo "  healthcheck  - Enable health checks"
         echo "  least_conn   - Use least connections algorithm"
         echo "  ip_hash      - Use IP hash algorithm"
+        echo "  security     - Enable security features (rate limiting, IP restriction)"
         exit 1
         ;;
 esac

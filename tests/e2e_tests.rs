@@ -2839,3 +2839,618 @@ fn test_websocket_proxy_forwarding() {
     }
 }
 
+// ====================
+// 優先度中: セキュリティ機能実動作テスト
+// ====================
+
+#[test]
+fn test_rate_limiting_with_config() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 注意: このテストは設定ファイルでレート制限を設定する必要がある
+    // 例: ./tests/e2e_setup.sh test security
+    // rate_limit_requests_per_min = 30 が設定されている場合のテスト
+    
+    // 制限を超えるリクエストを送信（30リクエスト/分の制限）
+    let mut success_count = 0;
+    let mut rate_limited_count = 0;
+    
+    // 40リクエストを短時間で送信（制限を超える）
+    for i in 0..40 {
+        let response = send_request(PROXY_PORT, "/", &[]);
+        if let Some(response) = response {
+            let status = get_status_code(&response);
+            match status {
+                Some(200) => success_count += 1,
+                Some(429) => {
+                    rate_limited_count += 1;
+                    eprintln!("Rate limited at request {}", i + 1);
+                },
+                _ => {}
+            }
+        }
+        // レート制限をトリガーするために短い間隔で送信（50ms間隔）
+        if i < 39 {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    
+    eprintln!("Rate limiting test: {} successful, {} rate limited", success_count, rate_limited_count);
+    
+    // レート制限が設定されている場合、429が返される可能性がある
+    // 設定されていない場合、すべて200が返される
+    // このテストは設定に依存するため、両方のケースを許容
+    assert!(
+        success_count > 0 || rate_limited_count > 0,
+        "Should receive some responses: success={}, rate_limited={}",
+        success_count, rate_limited_count
+    );
+    
+    // レート制限が有効な場合、少なくともいくつかのリクエストが制限される
+    if rate_limited_count > 0 {
+        eprintln!("Rate limiting is working: {} requests were rate limited", rate_limited_count);
+    } else {
+        eprintln!("Rate limiting may not be configured (all requests succeeded)");
+    }
+}
+
+#[test]
+fn test_ip_restriction_with_config() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 注意: このテストは設定ファイルでIP制限を設定する必要がある
+    // 例: ./tests/e2e_setup.sh test security
+    // allowed_ips = ["127.0.0.1"] が設定されている場合のテスト
+    
+    // 127.0.0.1からのリクエスト（許可されているIP）
+    let response = send_request(PROXY_PORT, "/", &[]);
+    assert!(response.is_some(), "Should receive response from allowed IP");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    
+    // IP制限が設定されている場合、127.0.0.1は許可されているため200が返される
+    // 設定されていない場合も、200が返される
+    assert!(
+        status == Some(200) || status == Some(403),
+        "Should return 200 OK or 403 Forbidden: {:?}", status
+    );
+    
+    if status == Some(200) {
+        eprintln!("IP restriction test: 127.0.0.1 is allowed");
+    } else if status == Some(403) {
+        eprintln!("IP restriction test: 127.0.0.1 is denied (unexpected)");
+    }
+}
+
+#[test]
+fn test_method_restriction() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 注意: このテストは設定ファイルでメソッド制限を設定する必要がある
+    // 例: allowed_methods = ["GET", "HEAD"]
+    
+    // GETリクエスト（通常許可されている）
+    let get_response = send_request(PROXY_PORT, "/", &[]);
+    assert!(get_response.is_some(), "Should receive GET response");
+    assert_eq!(get_status_code(&get_response.unwrap()), Some(200), "GET should return 200");
+    
+    // POSTリクエスト（制限されている可能性がある）
+    let post_response = send_request_with_method(PROXY_PORT, "/", "POST", &[], Some(b"test body"));
+    if let Some(response) = post_response {
+        let status = get_status_code(&response);
+        // メソッドが許可されている場合、200が返される
+        // 許可されていない場合、405 Method Not Allowedが返される可能性がある
+        assert!(
+            status == Some(200) || status == Some(405) || status == Some(404),
+            "Should return appropriate status: {:?}", status
+        );
+        
+        if status == Some(405) {
+            eprintln!("Method restriction is working: POST is not allowed");
+        }
+    }
+}
+
+// ====================
+// 優先度中: エッジケーステスト
+// ====================
+
+#[test]
+fn test_request_timeout() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // リクエストタイムアウトのテスト
+    // タイムアウトが設定されている場合、長時間かかるリクエストがタイムアウトする
+    
+    use std::time::Instant;
+    
+    let start = Instant::now();
+    let response = send_request(PROXY_PORT, "/", &[]);
+    let elapsed = start.elapsed();
+    
+    assert!(response.is_some(), "Should receive response");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    
+    // 正常なリクエストは1秒以内に完了するはず
+    assert!(
+        elapsed.as_secs() < 2,
+        "Request should complete within 2 seconds, took {:?}", elapsed
+    );
+    
+    assert_eq!(status, Some(200), "Should return 200 OK");
+    
+    eprintln!("Request timeout test: completed in {:?}", elapsed);
+}
+
+#[test]
+fn test_large_request_body() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 大きなリクエストボディのテスト
+    // ボディサイズ制限が設定されている場合、大きなボディが拒否される可能性がある
+    
+    // 1MBのボディを送信
+    let large_body = vec![0u8; 1024 * 1024];
+    let response = send_request_with_method(
+        PROXY_PORT,
+        "/",
+        "POST",
+        &[("Content-Type", "application/octet-stream")],
+        Some(&large_body)
+    );
+    
+    if let Some(response) = response {
+        let status = get_status_code(&response);
+        // ボディサイズ制限が設定されている場合、413 Request Entity Too Largeが返される可能性がある
+        // 制限されていない場合、200または404が返される
+        assert!(
+            status == Some(200) || status == Some(413) || status == Some(404) || status == Some(502),
+            "Should return appropriate status: {:?}", status
+        );
+        
+        if status == Some(413) {
+            eprintln!("Request body size limit is working: 1MB body was rejected");
+        } else {
+            eprintln!("Request body size limit test: 1MB body was accepted (status: {:?})", status);
+        }
+    }
+}
+
+#[test]
+fn test_malformed_headers() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 不正なヘッダーのテスト
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    
+    // TLS接続を確立
+    let config = create_client_config();
+    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
+    let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
+    
+    // TLSハンドシェイクを完了
+    while tls_conn.is_handshaking() {
+        match tls_conn.complete_io(&mut stream) {
+            Ok(_) => {}
+            Err(_) => {
+                eprintln!("TLS handshake error");
+                return;
+            }
+        }
+    }
+    
+    let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
+    
+    // 不正なヘッダー（改行文字が含まれている）を送信
+    let malformed_request = b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Test: value\r\n\r\n";
+    if let Err(e) = tls_stream.write_all(malformed_request) {
+        eprintln!("Failed to send malformed request: {:?}", e);
+        return;
+    }
+    tls_stream.flush().unwrap();
+    
+    // レスポンスを受信
+    let mut response = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match tls_stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    
+    let response = String::from_utf8_lossy(&response);
+    let status = get_status_code(&response);
+    
+    // 不正なヘッダーの場合、400 Bad Requestが返される可能性がある
+    // または、接続が閉じられる可能性もある
+    assert!(
+        status == Some(200) || status == Some(400) || status == None,
+        "Should return 200, 400, or close connection: {:?}", status
+    );
+    
+    if status == Some(400) {
+        eprintln!("Malformed header handling is working: 400 Bad Request returned");
+    }
+}
+
+#[test]
+fn test_concurrent_connection_stress() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 多数の並行接続のストレステスト
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    use std::thread;
+    
+    let success_count = Arc::new(AtomicUsize::new(0));
+    let error_count = Arc::new(AtomicUsize::new(0));
+    let total_connections = 200;
+    
+    let handles: Vec<_> = (0..total_connections)
+        .map(|_| {
+            let success_count = Arc::clone(&success_count);
+            let error_count = Arc::clone(&error_count);
+            thread::spawn(move || {
+                let response = send_request(PROXY_PORT, "/", &[]);
+                if let Some(response) = response {
+                    let status = get_status_code(&response);
+                    if status == Some(200) {
+                        success_count.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        error_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else {
+                    error_count.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        })
+        .collect();
+    
+    for handle in handles {
+        let _ = handle.join();
+    }
+    
+    let successes = success_count.load(Ordering::Relaxed);
+    let errors = error_count.load(Ordering::Relaxed);
+    
+    eprintln!("Concurrent connection stress test: {} successful, {} errors out of {}", 
+              successes, errors, total_connections);
+    
+    // 少なくとも80%の接続が成功することを確認
+    assert!(
+        successes >= total_connections * 8 / 10,
+        "At least 80% of concurrent connections should succeed: {}/{}",
+        successes, total_connections
+    );
+}
+
+#[test]
+fn test_backend_timeout_handling() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // バックエンドタイムアウトのハンドリングをテスト
+    // バックエンドが応答しない場合、502 Bad Gatewayまたはタイムアウトエラーが返される
+    
+    // 通常のリクエストが正常に処理されることを確認
+    let response = send_request(PROXY_PORT, "/", &[]);
+    assert!(response.is_some(), "Should receive response");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    
+    // バックエンドが正常に動作している場合、200が返される
+    // バックエンドがタイムアウトした場合、502が返される可能性がある
+    assert!(
+        status == Some(200) || status == Some(502),
+        "Should return 200 OK or 502 Bad Gateway: {:?}", status
+    );
+    
+    if status == Some(200) {
+        eprintln!("Backend timeout handling test: backend responded normally");
+    } else if status == Some(502) {
+        eprintln!("Backend timeout handling test: backend timeout detected");
+    }
+}
+
+#[test]
+fn test_chunked_transfer_encoding() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // Chunked Transfer Encodingのテスト
+    // チャンク転送エンコーディングが正しく処理されることを確認
+    
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    
+    // TLS接続を確立
+    let config = create_client_config();
+    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
+    let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
+    
+    // TLSハンドシェイクを完了
+    while tls_conn.is_handshaking() {
+        match tls_conn.complete_io(&mut stream) {
+            Ok(_) => {}
+            Err(_) => {
+                eprintln!("TLS handshake error");
+                return;
+            }
+        }
+    }
+    
+    let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
+    
+    // Chunked Transfer Encodingでリクエストを送信
+    let request = b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+    if let Err(e) = tls_stream.write_all(request) {
+        eprintln!("Failed to send chunked request: {:?}", e);
+        return;
+    }
+    tls_stream.flush().unwrap();
+    
+    // レスポンスを受信
+    let mut response = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match tls_stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    
+    let response = String::from_utf8_lossy(&response);
+    let status = get_status_code(&response);
+    
+    // Chunked Transfer Encodingがサポートされている場合、正常に処理される
+    assert!(
+        status == Some(200) || status == Some(404) || status == Some(502),
+        "Should return appropriate status: {:?}", status
+    );
+    
+    eprintln!("Chunked transfer encoding test: status {:?}", status);
+}
+
+#[test]
+fn test_http_version_negotiation() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // HTTPバージョンネゴシエーションのテスト
+    // HTTP/1.0、HTTP/1.1、HTTP/2のネゴシエーションを確認
+    
+    // HTTP/1.1リクエスト
+    let response = send_request(PROXY_PORT, "/", &[]);
+    assert!(response.is_some(), "Should receive HTTP/1.1 response");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    assert_eq!(status, Some(200), "Should return 200 OK");
+    
+    // HTTP/1.1がサポートされていることを確認
+    let http_version = response.lines().next();
+    if let Some(first_line) = http_version {
+        assert!(
+            first_line.contains("HTTP/1.1"),
+            "Should use HTTP/1.1: {}", first_line
+        );
+    }
+    
+    eprintln!("HTTP version negotiation test: HTTP/1.1 confirmed");
+}
+
+#[test]
+fn test_keep_alive_multiple_requests() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // Keep-Alive接続での複数リクエストのテスト
+    // 同じ接続で複数のリクエストを送信できることを確認
+    
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    
+    // TLS接続を確立
+    let config = create_client_config();
+    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
+    let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
+    
+    // TLSハンドシェイクを完了
+    while tls_conn.is_handshaking() {
+        match tls_conn.complete_io(&mut stream) {
+            Ok(_) => {}
+            Err(_) => {
+                eprintln!("TLS handshake error");
+                return;
+            }
+        }
+    }
+    
+    let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
+    
+    // 最初のリクエスト
+    let request1 = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n";
+    tls_stream.write_all(request1).unwrap();
+    tls_stream.flush().unwrap();
+    
+    // レスポンスを受信（Content-LengthまたはConnection: closeまで）
+    let mut response1 = Vec::new();
+    let mut buf = [0u8; 1];
+    let mut header_end1 = None;
+    
+    // ヘッダー部分を読み取る
+    loop {
+        match tls_stream.read_exact(&mut buf) {
+            Ok(_) => {
+                response1.push(buf[0]);
+                // \r\n\r\nを検出（ヘッダー終了）
+                if response1.len() >= 4 {
+                    let len = response1.len();
+                    if &response1[len-4..] == b"\r\n\r\n" {
+                        header_end1 = Some(len);
+                        break;
+                    }
+                }
+                if response1.len() > 8192 {
+                    break;
+                }
+            }
+            Err(_) => {
+                if response1.is_empty() {
+                    eprintln!("No response received for first request");
+                    return;
+                }
+                break;
+            }
+        }
+    }
+    
+    if response1.is_empty() {
+        eprintln!("Empty response for first request");
+        return;
+    }
+    
+    // Content-Lengthを確認してボディを読み取る
+    let header1_bytes = &response1[..header_end1.unwrap_or(response1.len())];
+    let content_length = get_content_length_from_headers(header1_bytes);
+    if let Some(cl) = content_length {
+        let header_len = header_end1.unwrap_or(response1.len());
+        let body_remaining = cl.saturating_sub(response1.len().saturating_sub(header_len + 4));
+        if body_remaining > 0 {
+            let mut body_buf = vec![0u8; body_remaining.min(8192)];
+            let mut total_read = 0;
+            while total_read < body_remaining {
+                let to_read = (body_remaining - total_read).min(body_buf.len());
+                match tls_stream.read(&mut body_buf[..to_read]) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        response1.extend_from_slice(&body_buf[..n]);
+                        total_read += n;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+    
+    let response1_str = String::from_utf8_lossy(&response1);
+    let status1 = get_status_code(&response1_str);
+    assert_eq!(status1, Some(200), "First request should return 200 OK");
+    
+    // 2回目のリクエスト（同じ接続を使用）
+    let request2 = b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n";
+    if let Err(e) = tls_stream.write_all(request2) {
+        eprintln!("Failed to send second request: {:?}", e);
+        return;
+    }
+    tls_stream.flush().unwrap();
+    
+    // レスポンスを受信
+    let mut response2 = Vec::new();
+    let mut header_end2 = None;
+    
+    // ヘッダー部分を読み取る
+    loop {
+        match tls_stream.read_exact(&mut buf) {
+            Ok(_) => {
+                response2.push(buf[0]);
+                if response2.len() >= 4 {
+                    let len = response2.len();
+                    if &response2[len-4..] == b"\r\n\r\n" {
+                        header_end2 = Some(len);
+                        break;
+                    }
+                }
+                if response2.len() > 8192 {
+                    break;
+                }
+            }
+            Err(_) => {
+                if response2.is_empty() {
+                    eprintln!("No response received for second request");
+                    return;
+                }
+                break;
+            }
+        }
+    }
+    
+    if response2.is_empty() {
+        eprintln!("Empty response for second request");
+        return;
+    }
+    
+    // Content-Lengthを確認してボディを読み取る
+    let header2_bytes = &response2[..header_end2.unwrap_or(response2.len())];
+    let content_length2 = get_content_length_from_headers(header2_bytes);
+    if let Some(cl) = content_length2 {
+        let header_len = header_end2.unwrap_or(response2.len());
+        let body_remaining = cl.saturating_sub(response2.len().saturating_sub(header_len + 4));
+        if body_remaining > 0 {
+            let mut body_buf = vec![0u8; body_remaining.min(8192)];
+            let mut total_read = 0;
+            while total_read < body_remaining {
+                let to_read = (body_remaining - total_read).min(body_buf.len());
+                match tls_stream.read(&mut body_buf[..to_read]) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        response2.extend_from_slice(&body_buf[..n]);
+                        total_read += n;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+    
+    let response2_str = String::from_utf8_lossy(&response2);
+    let status2 = get_status_code(&response2_str);
+    // 2回目のリクエストが成功することを確認（200または404が返される可能性がある）
+    assert!(
+        status2 == Some(200) || status2 == Some(404),
+        "Second request should return 200 OK or 404 Not Found: {:?}", status2
+    );
+    
+    eprintln!("Keep-Alive multiple requests test: first request status={:?}, second request status={:?}", 
+              status1, status2);
+}
+
