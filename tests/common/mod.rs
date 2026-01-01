@@ -2,6 +2,12 @@
 //!
 //! 統合テストおよびE2Eテストで使用する共通のユーティリティを提供します。
 
+#[cfg(feature = "http3")]
+pub mod http3_client;
+
+#[cfg(feature = "grpc")]
+pub mod grpc_client;
+
 use std::net::{TcpListener, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;

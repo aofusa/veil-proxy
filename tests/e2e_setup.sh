@@ -232,6 +232,7 @@ listen = "127.0.0.1:${PROXY_HTTPS_PORT}"
 http = "127.0.0.1:${PROXY_HTTP_PORT}"
 redirect_http_to_https = false
 threads = 1
+http3_enabled = true
 
 [tls]
 cert_path = "${FIXTURES_DIR}/cert.pem"
@@ -243,6 +244,10 @@ level = "debug"
 [prometheus]
 enabled = true
 path = "/__metrics"
+
+[http3]
+listen = "127.0.0.1:${PROXY_HTTPS_PORT}"
+compression_enabled = true
 
 [upstreams."backend-pool"]
 algorithm = "${algorithm}"

@@ -186,6 +186,10 @@ sysinfo = "0.37.2"
 # ベンチマーク用依存関係
 base64 = "0.22.1"
 
+# HTTP/3 E2Eテスト用（quicheクライアント）
+# 注意: quicheは既にメインの依存関係にoptionalとして追加されているため、
+# dev-dependenciesでは通常の依存関係として追加（http3 featureが有効な場合のみ使用）
+
 [[bench]]
 name = "throughput"
 harness = false

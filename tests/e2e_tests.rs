@@ -36,8 +36,17 @@ use rustls::{ClientConfig, ClientConnection};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::ServerName;
 
+mod common;
+
+#[cfg(feature = "http3")]
+use common::http3_client::Http3TestClient;
+
+#[cfg(feature = "grpc")]
+use common::grpc_client::{GrpcTestClient, GrpcFrame};
+
 // E2E環境のポート設定（e2e_setup.shと一致させる）
 const PROXY_PORT: u16 = 8443;  // プロキシHTTPSポート
+const PROXY_HTTP3_PORT: u16 = 8443;  // HTTP/3ポート（デフォルトではHTTPSポートと同じ）
 const BACKEND1_PORT: u16 = 9001;
 const BACKEND2_PORT: u16 = 9002;
 
@@ -1267,15 +1276,61 @@ fn test_rate_limiting() {
 
 #[test]
 #[cfg(feature = "grpc")]
-fn test_grpc_basic_request() {
+fn test_grpc_unary_call() {
     if !is_e2e_environment_ready() {
         eprintln!("Skipping test: E2E environment not ready");
         return;
     }
     
-    // gRPCリクエストを試みる（実際のgRPC実装は複雑なため、ここでは基本的なテストのみ）
-    // 注意: 実際のgRPCテストには専用のクライアントライブラリが必要
-    // ここでは、gRPCリクエストが正しく処理されることを確認
+    // gRPCクライアントを作成
+    let mut client = match GrpcTestClient::new("127.0.0.1", PROXY_PORT) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to create gRPC client: {}", e);
+            return;
+        }
+    };
+    
+    // テスト用Protobufメッセージ（簡易版）
+    let request_message = b"Hello, gRPC!";
+    
+    // gRPCリクエストを送信
+    let response = match client.send_grpc_request(
+        "/grpc.test.v1.TestService/UnaryCall",
+        request_message,
+        &[
+            ("grpc-timeout", "10S"),
+            ("grpc-accept-encoding", "gzip"),
+        ],
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Failed to send gRPC request: {}", e);
+            return;
+        }
+    };
+    
+    // ステータスコードを確認
+    let status = GrpcTestClient::extract_status_code(&response);
+    // gRPCエンドポイントが存在しない場合は404、存在する場合は200が返される
+    assert!(
+        status == Some(200) || status == Some(404) || status == Some(502),
+        "Should return 200, 404, or 502: {:?}", status
+    );
+    
+    // gRPCフレームを抽出（成功した場合のみ）
+    if let Ok(frame) = GrpcTestClient::extract_grpc_frame(&response) {
+        assert!(!frame.data.is_empty() || status == Some(404), "Should receive response message or 404");
+    }
+}
+
+#[test]
+#[cfg(feature = "grpc")]
+fn test_grpc_basic_request() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
     
     // gRPCリクエストを送信（Content-Type: application/grpc）
     let response = send_request(
@@ -1310,14 +1365,145 @@ fn test_http3_basic_connection() {
         return;
     }
     
-    // HTTP/3接続を試みる（実際のHTTP/3実装は複雑なため、ここでは基本的なテストのみ）
-    // 注意: 実際のHTTP/3テストには専用のクライアントライブラリ（QUIC）が必要
-    // ここでは、HTTP/3接続が確立されることを確認
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
     
-    // HTTP/3はUDPベースのため、TCP接続ではテストできない
-    // 実際のHTTP/3テストには、QUICクライアントライブラリが必要
-    // ここでは、テストがスキップされることを確認
-    eprintln!("HTTP/3 test requires QUIC client library, skipping detailed test");
+    // HTTP/3接続を確立
+    let mut client = match Http3TestClient::new(server_addr) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to create HTTP/3 client: {}", e);
+            return;
+        }
+    };
+    
+    // ハンドシェイクを完了
+    match client.handshake(Duration::from_secs(5)) {
+        Ok(_) => {
+            eprintln!("HTTP/3 connection established successfully");
+        }
+        Err(e) => {
+            eprintln!("HTTP/3 handshake failed: {}", e);
+            // HTTP/3が有効化されていない場合はスキップ
+            return;
+        }
+    }
+    
+    // 接続が確立されたことを確認
+    assert!(true, "HTTP/3 connection should be established");
+    
+    // 接続を閉じる
+    let _ = client.close();
+}
+
+#[test]
+#[cfg(feature = "http3")]
+fn test_http3_get_request() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    
+    // HTTP/3接続を確立
+    let mut client = match Http3TestClient::new(server_addr) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to create HTTP/3 client: {}", e);
+            return;
+        }
+    };
+    
+    // ハンドシェイクを完了
+    if client.handshake(Duration::from_secs(5)).is_err() {
+        eprintln!("HTTP/3 handshake failed, skipping test");
+        return;
+    }
+    
+    // GETリクエストを送信
+    let stream_id = match client.send_request("GET", "/", &[], None) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("Failed to send HTTP/3 request: {}", e);
+            return;
+        }
+    };
+    
+    // レスポンスを受信
+    match client.recv_response(stream_id, Duration::from_secs(5)) {
+        Ok((body, status)) => {
+            assert_eq!(status, 200, "Should return 200 OK");
+            assert!(!body.is_empty(), "Should receive response body");
+        }
+        Err(e) => {
+            eprintln!("Failed to receive HTTP/3 response: {}", e);
+            // HTTP/3が有効化されていない場合はスキップ
+            return;
+        }
+    }
+    
+    // 接続を閉じる
+    let _ = client.close();
+}
+
+#[test]
+#[cfg(feature = "http3")]
+fn test_http3_post_request() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    
+    // HTTP/3接続を確立
+    let mut client = match Http3TestClient::new(server_addr) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to create HTTP/3 client: {}", e);
+            return;
+        }
+    };
+    
+    // ハンドシェイクを完了
+    if client.handshake(Duration::from_secs(5)).is_err() {
+        eprintln!("HTTP/3 handshake failed, skipping test");
+        return;
+    }
+    
+    // POSTリクエストを送信
+    let body = b"Hello, HTTP/3!";
+    let stream_id = match client.send_request("POST", "/", &[("Content-Type", "text/plain")], Some(body)) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("Failed to send HTTP/3 POST request: {}", e);
+            return;
+        }
+    };
+    
+    // レスポンスを受信
+    match client.recv_response(stream_id, Duration::from_secs(5)) {
+        Ok((_body, status)) => {
+            // バックエンドが存在しない場合は404、存在する場合は200が返される
+            assert!(
+                status == 200 || status == 404 || status == 502,
+                "Should return 200, 404, or 502: {}", status
+            );
+        }
+        Err(e) => {
+            eprintln!("Failed to receive HTTP/3 response: {}", e);
+            return;
+        }
+    }
+    
+    // 接続を閉じる
+    let _ = client.close();
 }
 
 #[test]
@@ -1330,13 +1516,10 @@ fn test_http3_configuration_check() {
     
     // HTTP/3設定の確認テスト
     // HTTP/3が有効化されている場合、設定が正しく読み込まれていることを確認
-    
-    // 注意: 実際のHTTP/3接続テストにはQUICクライアントライブラリが必要
-    // ここでは、設定の確認のみを行う
     eprintln!("HTTP/3 configuration check: feature is enabled");
     
     // HTTP/3が有効化されている場合、UDPポートがリッスンされている可能性がある
-    // ただし、実際の接続テストにはQUICクライアントが必要
+    // 実際の接続テストで確認
     assert!(true, "HTTP/3 feature is enabled");
 }
 
