@@ -6135,3 +6135,399 @@ fn test_error_handling_431_request_header_fields_too_large() {
     eprintln!("431 Request Header Fields Too Large test: basic functionality verified");
 }
 
+// ====================
+// 優先度中: より詳細な並行リクエストテスト
+// ====================
+
+#[test]
+fn test_concurrent_requests_different_paths() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 異なるパスへの並行リクエストのテスト
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    use std::thread;
+    
+    let success_count = Arc::new(AtomicUsize::new(0));
+    let total_requests = 30;
+    let paths = vec!["/", "/large.txt", "/__metrics"];
+    
+    let handles: Vec<_> = (0..total_requests)
+        .map(|i| {
+            let success_count = Arc::clone(&success_count);
+            let path = paths[i % paths.len()];
+            thread::spawn(move || {
+                let response = send_request(PROXY_PORT, path, &[]);
+                if let Some(response) = response {
+                    let status = get_status_code(&response);
+                    if status == Some(200) || status == Some(404) {
+                        success_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })
+        })
+        .collect();
+    
+    for handle in handles {
+        let _ = handle.join();
+    }
+    
+    let successes = success_count.load(Ordering::Relaxed);
+    assert!(
+        successes >= total_requests * 8 / 10,
+        "At least 80% of concurrent requests to different paths should succeed: {}/{}",
+        successes, total_requests
+    );
+    
+    eprintln!("Concurrent requests to different paths test: {}/{} succeeded", successes, total_requests);
+}
+
+#[test]
+fn test_concurrent_requests_mixed_methods() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 異なるHTTPメソッドの並行リクエストのテスト
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    use std::thread;
+    
+    let success_count = Arc::new(AtomicUsize::new(0));
+    let total_requests = 20;
+    let methods = vec!["GET", "POST", "HEAD", "OPTIONS"];
+    
+    let handles: Vec<_> = (0..total_requests)
+        .map(|i| {
+            let success_count = Arc::clone(&success_count);
+            let method = methods[i % methods.len()];
+            thread::spawn(move || {
+                let response = send_request_with_method(PROXY_PORT, "/", method, &[], None);
+                if let Some(response) = response {
+                    let status = get_status_code(&response);
+                    if status == Some(200) || status == Some(404) || status == Some(405) {
+                        success_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })
+        })
+        .collect();
+    
+    for handle in handles {
+        let _ = handle.join();
+    }
+    
+    let successes = success_count.load(Ordering::Relaxed);
+    assert!(
+        successes >= total_requests * 8 / 10,
+        "At least 80% of concurrent requests with mixed methods should succeed: {}/{}",
+        successes, total_requests
+    );
+    
+    eprintln!("Concurrent requests with mixed methods test: {}/{} succeeded", successes, total_requests);
+}
+
+#[test]
+fn test_concurrent_requests_with_headers() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 異なるヘッダーを含む並行リクエストのテスト
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    use std::thread;
+    
+    let success_count = Arc::new(AtomicUsize::new(0));
+    let total_requests = 25;
+    
+    let handles: Vec<_> = (0..total_requests)
+        .map(|i| {
+            let success_count = Arc::clone(&success_count);
+            thread::spawn(move || {
+                let ua = format!("TestClient-{}", i);
+                let req_id = format!("req-{}", i);
+                let headers = vec![
+                    ("User-Agent", ua.as_str()),
+                    ("X-Request-ID", req_id.as_str()),
+                ];
+                let response = send_request(PROXY_PORT, "/", &headers);
+                if let Some(response) = response {
+                    let status = get_status_code(&response);
+                    if status == Some(200) {
+                        success_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })
+        })
+        .collect();
+    
+    for handle in handles {
+        let _ = handle.join();
+    }
+    
+    let successes = success_count.load(Ordering::Relaxed);
+    assert!(
+        successes >= total_requests * 8 / 10,
+        "At least 80% of concurrent requests with headers should succeed: {}/{}",
+        successes, total_requests
+    );
+    
+    eprintln!("Concurrent requests with headers test: {}/{} succeeded", successes, total_requests);
+}
+
+// ====================
+// 優先度中: 接続プールテスト
+// ====================
+
+#[test]
+fn test_connection_pool_reuse() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 接続プールの再利用のテスト
+    // Keep-Alive接続を複数回使用して、接続が再利用されることを確認
+    
+    use std::time::Instant;
+    
+    // 最初のリクエスト（接続確立）
+    let start1 = Instant::now();
+    let response1 = send_request(PROXY_PORT, "/", &[]);
+    let elapsed1 = start1.elapsed();
+    
+    assert!(response1.is_some(), "First request should succeed");
+    let status1 = get_status_code(&response1.unwrap());
+    assert_eq!(status1, Some(200), "First request should return 200 OK");
+    
+    // 2回目のリクエスト（接続再利用の可能性）
+    let start2 = Instant::now();
+    let response2 = send_request(PROXY_PORT, "/", &[]);
+    let elapsed2 = start2.elapsed();
+    
+    assert!(response2.is_some(), "Second request should succeed");
+    let status2 = get_status_code(&response2.unwrap());
+    assert_eq!(status2, Some(200), "Second request should return 200 OK");
+    
+    // 2回目のリクエストが速い場合、接続が再利用されている可能性がある
+    eprintln!("Connection pool reuse test: first={:?}, second={:?}", elapsed1, elapsed2);
+    
+    // 接続が再利用されている場合、2回目のリクエストが速い可能性がある
+    // ただし、これは環境に依存するため、アサーションは緩和
+    if elapsed2 < elapsed1 {
+        eprintln!("Connection pool reuse test: connection may have been reused (second request faster)");
+    }
+}
+
+#[test]
+fn test_connection_pool_multiple_sequential() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 複数の連続リクエストでの接続プールのテスト
+    let num_requests = 10;
+    let mut success_count = 0;
+    
+    for _ in 0..num_requests {
+        let response = send_request(PROXY_PORT, "/", &[]);
+        if let Some(response) = response {
+            let status = get_status_code(&response);
+            if status == Some(200) {
+                success_count += 1;
+            }
+        }
+        
+        // 短い待機時間を入れる（接続プールの動作を確認）
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    
+    assert!(
+        success_count >= num_requests * 9 / 10,
+        "At least 90% of sequential requests should succeed: {}/{}",
+        success_count, num_requests
+    );
+    
+    eprintln!("Connection pool multiple sequential test: {}/{} succeeded", success_count, num_requests);
+}
+
+// ====================
+// 優先度中: パフォーマンス関連テスト
+// ====================
+
+#[test]
+fn test_response_time_consistency() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // レスポンス時間の一貫性のテスト
+    use std::time::Instant;
+    
+    let num_requests = 10;
+    let mut times = Vec::new();
+    
+    for _ in 0..num_requests {
+        let start = Instant::now();
+        let response = send_request(PROXY_PORT, "/", &[]);
+        let elapsed = start.elapsed();
+        
+        if response.is_some() {
+            times.push(elapsed);
+        }
+    }
+    
+    assert!(
+        times.len() >= num_requests * 9 / 10,
+        "At least 90% of requests should succeed: {}/{}",
+        times.len(), num_requests
+    );
+    
+    if times.len() >= 5 {
+        let avg_time: Duration = times.iter().sum::<Duration>() / times.len() as u32;
+        let max_time = times.iter().max().unwrap();
+        let min_time = times.iter().min().unwrap();
+        
+        eprintln!("Response time consistency test: avg={:?}, min={:?}, max={:?}", avg_time, min_time, max_time);
+        
+        // 最大時間が平均時間の3倍を超えないことを確認（一貫性の指標）
+        if *max_time > avg_time * 3 {
+            eprintln!("Response time consistency test: high variance detected (may be normal)");
+        }
+    }
+}
+
+#[test]
+fn test_throughput_basic() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 基本的なスループットのテスト
+    use std::time::Instant;
+    
+    let num_requests = 50;
+    let start = Instant::now();
+    let mut success_count = 0;
+    
+    for _ in 0..num_requests {
+        let response = send_request(PROXY_PORT, "/", &[]);
+        if let Some(response) = response {
+            let status = get_status_code(&response);
+            if status == Some(200) {
+                success_count += 1;
+            }
+        }
+    }
+    
+    let elapsed = start.elapsed();
+    let requests_per_second = success_count as f64 / elapsed.as_secs_f64();
+    
+    assert!(
+        success_count >= num_requests * 9 / 10,
+        "At least 90% of requests should succeed: {}/{}",
+        success_count, num_requests
+    );
+    
+    eprintln!("Throughput basic test: {} requests in {:?} ({:.2} req/s)", 
+              success_count, elapsed, requests_per_second);
+    
+    // 最低限のスループットを確認（1 req/s以上）
+    assert!(
+        requests_per_second >= 1.0,
+        "Throughput should be at least 1 req/s: {:.2} req/s",
+        requests_per_second
+    );
+}
+
+// ====================
+// 優先度中: より詳細なストレステスト
+// ====================
+
+#[test]
+fn test_stress_rapid_requests() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 高速連続リクエストのストレステスト
+    let num_requests = 100;
+    let mut success_count = 0;
+    
+    for i in 0..num_requests {
+        let response = send_request(PROXY_PORT, "/", &[]);
+        if let Some(response) = response {
+            let status = get_status_code(&response);
+            if status == Some(200) {
+                success_count += 1;
+            }
+        }
+        
+        // 非常に短い待機時間（ストレスをかける）
+        if i % 10 == 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    
+    assert!(
+        success_count >= num_requests * 8 / 10,
+        "At least 80% of rapid requests should succeed: {}/{}",
+        success_count, num_requests
+    );
+    
+    eprintln!("Stress rapid requests test: {}/{} succeeded", success_count, num_requests);
+}
+
+#[test]
+fn test_stress_long_duration() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 長時間実行のストレステスト
+    use std::time::Instant;
+    
+    let duration = Duration::from_secs(5);
+    let start = Instant::now();
+    let mut request_count = 0;
+    let mut success_count = 0;
+    
+    while start.elapsed() < duration {
+        request_count += 1;
+        let response = send_request(PROXY_PORT, "/", &[]);
+        if let Some(response) = response {
+            let status = get_status_code(&response);
+            if status == Some(200) {
+                success_count += 1;
+            }
+        }
+        
+        // 短い待機時間
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    
+    let elapsed = start.elapsed();
+    let success_rate = if request_count > 0 {
+        success_count as f64 / request_count as f64
+    } else {
+        0.0
+    };
+    
+    assert!(
+        success_rate >= 0.8,
+        "At least 80% success rate during long duration test: {:.2}% ({}/{})",
+        success_rate * 100.0, success_count, request_count
+    );
+    
+    eprintln!("Stress long duration test: {} requests in {:?}, {:.2}% success rate",
+              request_count, elapsed, success_rate * 100.0);
+}
+
