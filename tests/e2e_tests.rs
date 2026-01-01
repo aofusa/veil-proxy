@@ -1327,18 +1327,41 @@ fn test_least_connections_distribution() {
     }
     
     // 注意: このテストは設定ファイルでleast_connアルゴリズムを設定する必要がある
-    // 現在の設定はround_robinのため、このテストは設定変更が必要
-    // ここでは、least_connが設定されている場合の動作を確認するテストとして記述
+    // 例: ./tests/e2e_setup.sh test least_conn
     
     // 複数の接続を確立して、接続数が少ないサーバーが選ばれることを確認
-    // 実際のテストには、設定ファイルの変更と複数の接続の確立が必要
-    let response = send_request(PROXY_PORT, "/", &[]);
-    assert!(response.is_some(), "Should receive response");
+    // Least Connectionsアルゴリズムでは、接続数が少ないサーバーが優先される
+    // ただし、接続の再利用により、完全に均等にならない可能性がある
     
-    // 基本的な動作確認（詳細なテストは設定変更が必要）
-    let response = response.unwrap();
-    let status = get_status_code(&response);
-    assert_eq!(status, Some(200), "Should return 200 OK");
+    let mut backend1_count = 0;
+    let mut backend2_count = 0;
+    
+    // 10回リクエストを送信
+    for _ in 0..10 {
+        let response = send_request(PROXY_PORT, "/", &[]);
+        if let Some(response) = response {
+            if let Some(server_id) = get_header_value(&response, "X-Server-Id") {
+                match server_id.as_str() {
+                    "backend1" => backend1_count += 1,
+                    "backend2" => backend2_count += 1,
+                    _ => {}
+                }
+            }
+        }
+        // 接続を確立するために短い待機
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    
+    // 両方のバックエンドが使用されていることを確認
+    assert!(backend1_count > 0, "Backend 1 should receive some requests");
+    assert!(backend2_count > 0, "Backend 2 should receive some requests");
+    
+    eprintln!("Least Connections distribution: backend1={}, backend2={}", 
+              backend1_count, backend2_count);
+    
+    // Least Connectionsでは、接続数が少ないサーバーが選ばれるため、
+    // 完全に均等にならない可能性がある
+    // ただし、両方のサーバーが使用されることを確認
 }
 
 #[test]
@@ -1349,6 +1372,7 @@ fn test_ip_hash_consistency() {
     }
     
     // 注意: このテストは設定ファイルでip_hashアルゴリズムを設定する必要がある
+    // 例: ./tests/e2e_setup.sh test ip_hash
     // 同じIPから複数回リクエストを送信し、同じバックエンドが選ばれることを確認
     
     // 同じIPから10回リクエストを送信
@@ -1362,9 +1386,22 @@ fn test_ip_hash_consistency() {
         }
     }
     
-    // IP Hashの場合、同じIPからは同じサーバーが選ばれるべき
-    // ただし、現在の設定はround_robinのため、このテストは設定変更が必要
     assert!(!server_ids.is_empty(), "Should receive responses with server IDs");
+    
+    // IP Hashの場合、同じIPからは同じサーバーが選ばれるべき
+    // すべてのリクエストが同じサーバーにルーティングされることを確認
+    if server_ids.len() > 1 {
+        let first_server = &server_ids[0];
+        let all_same = server_ids.iter().all(|id| id == first_server);
+        
+        if all_same {
+            eprintln!("IP Hash consistency confirmed: all {} requests went to {}", 
+                      server_ids.len(), first_server);
+        } else {
+            eprintln!("IP Hash may not be configured: requests distributed across servers");
+            eprintln!("Server IDs: {:?}", server_ids);
+        }
+    }
 }
 
 // ====================
@@ -1378,21 +1415,40 @@ fn test_health_check_failover() {
         return;
     }
     
-    // 注意: このテストは実際のバックエンド障害をシミュレートする必要がある
-    // バックエンド1を停止し、バックエンド2に自動的に切り替わることを確認
+    // 注意: このテストは設定ファイルでヘルスチェックを有効化する必要がある
+    // 例: ./tests/e2e_setup.sh test healthcheck
+    // 実際のバックエンド障害をシミュレートする必要がある
     
-    // 現在の実装では、バックエンドを停止する機能がないため、
-    // メトリクスエンドポイントから健康状態を確認する
-    let response = send_request(PROXY_PORT, "/__metrics", &[]);
-    assert!(response.is_some(), "Should receive metrics response");
+    // まず、両方のバックエンドが正常であることを確認
+    let initial_response = send_request(PROXY_PORT, "/", &[]);
+    assert!(initial_response.is_some(), "Should receive initial response");
     
-    let response = response.unwrap();
+    // メトリクスエンドポイントから健康状態を確認
+    let metrics_response = send_request(PROXY_PORT, "/__metrics", &[]);
+    assert!(metrics_response.is_some(), "Should receive metrics response");
+    
+    let metrics_response = metrics_response.unwrap();
+    
     // ヘルスチェックメトリクスが含まれるか確認
-    // 実際のフェイルオーバーテストには、バックエンドの動的な停止/起動が必要
-    assert!(
-        response.contains("veil_proxy") || response.contains("# HELP"),
-        "Should contain Prometheus metrics"
-    );
+    if metrics_response.contains("http_upstream_health") || 
+       metrics_response.contains("veil_proxy_http_upstream_health") {
+        eprintln!("Health check metrics detected");
+        
+        // メトリクスから健康状態を確認
+        // 実際のフェイルオーバーテストには、バックエンドの動的な停止/起動が必要
+        // ここでは、メトリクスが存在することを確認
+        assert!(
+            metrics_response.contains("veil_proxy") || metrics_response.contains("# HELP"),
+            "Should contain Prometheus metrics"
+        );
+    } else {
+        eprintln!("Health check not configured, skipping failover test");
+        // ヘルスチェックが設定されていない場合でも、基本的な動作確認
+        assert!(
+            metrics_response.contains("veil_proxy") || metrics_response.contains("# HELP"),
+            "Should contain Prometheus metrics"
+        );
+    }
 }
 
 #[test]
@@ -1402,17 +1458,35 @@ fn test_health_check_recovery() {
         return;
     }
     
-    // 注意: このテストは実際のバックエンド回復をシミュレートする必要がある
-    // 停止したバックエンドが回復した際に、自動的にプールに復帰することを確認
+    // 注意: このテストは設定ファイルでヘルスチェックを有効化する必要がある
+    // 例: ./tests/e2e_setup.sh test healthcheck
+    // 実際のバックエンド回復をシミュレートする必要がある
     
     // 現在の実装では、バックエンドの動的な停止/起動機能がないため、
-    // 基本的な動作確認のみ
+    // 基本的な動作確認とメトリクス確認を行う
+    
+    // リクエストが正常に処理されることを確認
     let response = send_request(PROXY_PORT, "/", &[]);
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
     let status = get_status_code(&response);
     assert_eq!(status, Some(200), "Should return 200 OK");
+    
+    // メトリクスエンドポイントから健康状態を確認
+    let metrics_response = send_request(PROXY_PORT, "/__metrics", &[]);
+    if let Some(metrics) = metrics_response {
+        if metrics.contains("http_upstream_health") || 
+           metrics.contains("veil_proxy_http_upstream_health") {
+            eprintln!("Health check metrics detected - recovery test would verify automatic re-addition");
+        }
+    }
+    
+    // 実際の回復テストには、以下の手順が必要:
+    // 1. バックエンドを停止
+    // 2. ヘルスチェックが失敗することを確認
+    // 3. バックエンドを再起動
+    // 4. ヘルスチェックが成功し、プールに復帰することを確認
 }
 
 // ====================
@@ -1538,18 +1612,23 @@ fn test_cache_hit() {
     }
     
     // 注意: このテストは設定ファイルでキャッシュを有効化する必要がある
-    // 例: [route.cache] enabled = true
+    // 例: ./tests/e2e_setup.sh test cache
+    
+    use std::time::Instant;
     
     // 最初のリクエスト（キャッシュミス）
+    let start1 = Instant::now();
     let response1 = send_request(PROXY_PORT, "/", &[]);
+    let elapsed1 = start1.elapsed();
     assert!(response1.is_some(), "Should receive first response");
     
-    // 2回目のリクエスト（キャッシュヒットの可能性）
+    // 少し待機してから2回目のリクエスト（キャッシュヒットの可能性）
+    std::thread::sleep(Duration::from_millis(100));
+    let start2 = Instant::now();
     let response2 = send_request(PROXY_PORT, "/", &[]);
+    let elapsed2 = start2.elapsed();
     assert!(response2.is_some(), "Should receive second response");
     
-    // キャッシュが有効な場合、レスポンス時間が短縮される可能性がある
-    // または、X-Cacheヘッダーが追加される可能性がある
     let response1 = response1.unwrap();
     let response2 = response2.unwrap();
     
@@ -1559,6 +1638,20 @@ fn test_cache_hit() {
         get_status_code(&response2),
         "Both responses should have same status"
     );
+    
+    // キャッシュが有効な場合、2回目のリクエストが速い可能性がある
+    // ただし、キャッシュが無効な場合でも正常に動作することを確認
+    if elapsed2 < elapsed1 {
+        eprintln!("Cache may be working: second request was faster ({}ms vs {}ms)", 
+                  elapsed2.as_millis(), elapsed1.as_millis());
+    }
+    
+    // X-CacheヘッダーまたはAgeヘッダーを確認（キャッシュが有効な場合）
+    let cache_header = get_header_value(&response2, "X-Cache");
+    let age_header = get_header_value(&response2, "Age");
+    if cache_header.is_some() || age_header.is_some() {
+        eprintln!("Cache headers detected: X-Cache={:?}, Age={:?}", cache_header, age_header);
+    }
 }
 
 #[test]
@@ -1596,6 +1689,7 @@ fn test_etag_304() {
     }
     
     // 注意: このテストは設定ファイルでETagを有効化する必要がある
+    // 例: ./tests/e2e_setup.sh test cache
     
     // 最初のリクエストでETagを取得
     let response1 = send_request(PROXY_PORT, "/", &[]);
@@ -1605,6 +1699,8 @@ fn test_etag_304() {
     let etag = get_header_value(&response1, "ETag");
     
     if let Some(etag_value) = etag {
+        eprintln!("ETag found: {}", etag_value);
+        
         // If-None-Matchヘッダーで2回目のリクエスト
         let response2 = send_request(
             PROXY_PORT,
@@ -1617,8 +1713,17 @@ fn test_etag_304() {
             // ETagが一致する場合、304 Not Modifiedが返される可能性がある
             assert!(
                 status == Some(200) || status == Some(304),
-                "Should return 200 OK or 304 Not Modified"
+                "Should return 200 OK or 304 Not Modified, got {:?}", status
             );
+            
+            if status == Some(304) {
+                eprintln!("304 Not Modified received - ETag validation working");
+                // 304レスポンスにはContent-Lengthが0または小さいはず
+                let content_length = get_header_value(&response2, "Content-Length");
+                if let Some(cl) = content_length {
+                    eprintln!("Content-Length in 304 response: {}", cl);
+                }
+            }
         }
     } else {
         // ETagが設定されていない場合、このテストはスキップ
@@ -1882,10 +1987,16 @@ fn test_buffering_streaming_mode() {
     }
     
     // 注意: このテストは設定ファイルでバッファリングモードを設定する必要がある
-    // 例: [route.buffering] mode = "streaming"
+    // 例: ./tests/e2e_setup.sh test buffering
+    // デフォルトではStreamingモードが使用される
+    
+    use std::time::Instant;
     
     // 大きなレスポンスをリクエスト
+    let start = Instant::now();
     let response = send_request(PROXY_PORT, "/large.txt", &[]);
+    let elapsed = start.elapsed();
+    
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -1893,7 +2004,12 @@ fn test_buffering_streaming_mode() {
     assert_eq!(status, Some(200), "Should return 200 OK");
     
     // Streamingモードの場合、レスポンスが段階的に返される可能性がある
-    // 実際のテストには、ストリーミングの動作を確認する必要がある
+    // 大きなファイルなので、レスポンス時間を確認
+    eprintln!("Streaming mode test: response time {:?}, size {}", 
+              elapsed, response.len());
+    
+    // レスポンスが正常に受信されたことを確認
+    assert!(response.len() > 1000, "Large file should be > 1000 bytes");
 }
 
 #[test]
@@ -1904,15 +2020,28 @@ fn test_buffering_full_mode() {
     }
     
     // 注意: このテストは設定ファイルでバッファリングモードを設定する必要がある
-    // 例: [route.buffering] mode = "full"
+    // 例: ./tests/e2e_setup.sh test buffering
+    // Fullモードの場合、レスポンス全体がバッファリングされる
+    
+    use std::time::Instant;
     
     // Fullモードの場合、レスポンス全体がバッファリングされる
+    let start = Instant::now();
     let response = send_request(PROXY_PORT, "/large.txt", &[]);
+    let elapsed = start.elapsed();
+    
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
     let status = get_status_code(&response);
     assert_eq!(status, Some(200), "Should return 200 OK");
+    
+    // Fullモードでは、バックエンド接続が早期に解放される可能性がある
+    eprintln!("Full mode test: response time {:?}, size {}", 
+              elapsed, response.len());
+    
+    // レスポンスが正常に受信されたことを確認
+    assert!(response.len() > 1000, "Large file should be > 1000 bytes");
 }
 
 #[test]
@@ -1923,15 +2052,35 @@ fn test_buffering_adaptive_mode() {
     }
     
     // 注意: このテストは設定ファイルでバッファリングモードを設定する必要がある
-    // 例: [route.buffering] mode = "adaptive"
-    
+    // 例: ./tests/e2e_setup.sh test buffering
     // Adaptiveモードの場合、条件に応じてストリーミングまたはフルバッファリングが選択される
-    let response = send_request(PROXY_PORT, "/large.txt", &[]);
-    assert!(response.is_some(), "Should receive response");
     
-    let response = response.unwrap();
-    let status = get_status_code(&response);
-    assert_eq!(status, Some(200), "Should return 200 OK");
+    use std::time::Instant;
+    
+    // 小さいレスポンス（Fullバッファリング）
+    let start1 = Instant::now();
+    let response1 = send_request(PROXY_PORT, "/", &[]);
+    let elapsed1 = start1.elapsed();
+    
+    assert!(response1.is_some(), "Should receive small response");
+    let response1 = response1.unwrap();
+    assert_eq!(get_status_code(&response1), Some(200), "Should return 200 OK");
+    
+    // 大きいレスポンス（Streaming）
+    let start2 = Instant::now();
+    let response2 = send_request(PROXY_PORT, "/large.txt", &[]);
+    let elapsed2 = start2.elapsed();
+    
+    assert!(response2.is_some(), "Should receive large response");
+    let response2 = response2.unwrap();
+    assert_eq!(get_status_code(&response2), Some(200), "Should return 200 OK");
+    
+    eprintln!("Adaptive mode test: small response {:?} ({} bytes), large response {:?} ({} bytes)",
+              elapsed1, response1.len(), elapsed2, response2.len());
+    
+    // Adaptiveモードでは、サイズに応じてモードが切り替わる
+    // 小さいレスポンスはFullバッファリング、大きいレスポンスはStreaming
+    assert!(response1.len() < response2.len(), "Small response should be smaller");
 }
 
 // ====================

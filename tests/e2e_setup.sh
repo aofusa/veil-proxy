@@ -138,7 +138,10 @@ prepare_fixtures() {
 }
 
 # 設定ファイルを生成
+# 引数: 設定タイプ (default|cache|buffering|healthcheck|least_conn|ip_hash)
 generate_configs() {
+    local config_type="${1:-default}"
+    
     # バックエンド1設定（静的ファイル配信）
     cat > "${FIXTURES_DIR}/backend1.toml" << EOF
 [server]
@@ -211,7 +214,18 @@ index = "index.html"
 add_response_headers = { "X-Server-Id" = "backend2" }
 EOF
 
-    # プロキシ設定（ロードバランシング）
+    # プロキシ設定（設定タイプに応じて生成）
+    local algorithm="round_robin"
+    case "$config_type" in
+        least_conn)
+            algorithm="least_conn"
+            ;;
+        ip_hash)
+            algorithm="ip_hash"
+            ;;
+    esac
+    
+    # 基本設定
     cat > "${FIXTURES_DIR}/proxy.toml" << EOF
 [server]
 listen = "127.0.0.1:${PROXY_HTTPS_PORT}"
@@ -231,12 +245,30 @@ enabled = true
 path = "/__metrics"
 
 [upstreams."backend-pool"]
-algorithm = "round_robin"
+algorithm = "${algorithm}"
 servers = [
     "https://127.0.0.1:${BACKEND1_PORT}",
     "https://127.0.0.1:${BACKEND2_PORT}"
 ]
 tls_insecure = true
+EOF
+
+    # ヘルスチェック設定を追加
+    if [ "$config_type" = "healthcheck" ]; then
+        cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
+
+[upstreams."backend-pool".health_check]
+enabled = true
+path = "/health"
+interval_secs = 5
+timeout_secs = 2
+healthy_threshold = 2
+unhealthy_threshold = 3
+EOF
+    fi
+    
+    # ルート設定
+    cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
 
 [[route]]
 [route.conditions]
@@ -252,6 +284,32 @@ remove_response_headers = ["Server"]
 enabled = true
 preferred_encodings = ["zstd", "br", "gzip"]
 min_size = 1024
+EOF
+
+    # キャッシュ設定を追加
+    if [ "$config_type" = "cache" ]; then
+        cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
+[route.cache]
+enabled = true
+max_memory_size = 10485760
+default_ttl_secs = 60
+methods = ["GET", "HEAD"]
+cacheable_statuses = [200, 301, 302, 304]
+EOF
+    fi
+    
+    # バッファリング設定を追加
+    if [ "$config_type" = "buffering" ]; then
+        cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
+[route.buffering]
+mode = "adaptive"
+max_memory_buffer = 10485760
+adaptive_threshold = 1048576
+EOF
+    fi
+    
+    # 2つ目のルート設定
+    cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
 
 [[route]]
 [route.conditions]
@@ -264,7 +322,7 @@ upstream = "backend-pool"
 add_response_headers = { "X-Proxied-By" = "veil" }
 EOF
 
-    log_info "Configuration files generated"
+    log_info "Configuration files generated (type: ${config_type})"
 }
 
 # サーバーを起動
@@ -485,12 +543,14 @@ cleanup() {
 }
 
 # メイン処理
+CONFIG_TYPE="${2:-default}"  # 設定タイプ（default|cache|buffering|healthcheck|least_conn|ip_hash）
+
 case "${1:-}" in
     start)
         ensure_veil_binary
         check_port_conflicts || exit 1
         prepare_fixtures
-        generate_configs
+        generate_configs "$CONFIG_TYPE"
         start_servers
         health_check
         ;;
@@ -503,7 +563,7 @@ case "${1:-}" in
         ensure_veil_binary
         check_port_conflicts || exit 1
         prepare_fixtures
-        generate_configs
+        generate_configs "$CONFIG_TYPE"
         start_servers
         health_check
         ;;
@@ -517,7 +577,7 @@ case "${1:-}" in
         ensure_veil_binary
         check_port_conflicts || exit 1
         prepare_fixtures
-        generate_configs
+        generate_configs "$CONFIG_TYPE"
         start_servers
         
         if ! health_check; then
@@ -538,7 +598,7 @@ case "${1:-}" in
         cleanup
         ;;
     *)
-        echo "Usage: $0 {start|stop|restart|health|test|clean}"
+        echo "Usage: $0 {start|stop|restart|health|test|clean} [config_type]"
         echo ""
         echo "Commands:"
         echo "  start   - Start all servers"
@@ -547,6 +607,14 @@ case "${1:-}" in
         echo "  health  - Check server health"
         echo "  test    - Run E2E tests"
         echo "  clean   - Clean up fixtures"
+        echo ""
+        echo "Config Types (optional, default: default):"
+        echo "  default      - Default configuration (round_robin, compression)"
+        echo "  cache        - Enable proxy cache"
+        echo "  buffering    - Enable adaptive buffering"
+        echo "  healthcheck  - Enable health checks"
+        echo "  least_conn   - Use least connections algorithm"
+        echo "  ip_hash      - Use IP hash algorithm"
         exit 1
         ;;
 esac
