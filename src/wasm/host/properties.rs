@@ -192,14 +192,65 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     linker.func_wrap(
         "env",
         "proxy_set_property",
-        |_caller: Caller<'_, HostState>,
-         _path_ptr: i32,
-         _path_size: i32,
-         _value_ptr: i32,
-         _value_size: i32|
+        |mut caller: Caller<'_, HostState>,
+         path_ptr: i32,
+         path_size: i32,
+         value_ptr: i32,
+         value_size: i32|
          -> i32 {
-            // Property setting is not supported in this implementation
-            PROXY_RESULT_UNIMPLEMENTED
+            // Read path from WASM memory
+            let path_data = match read_bytes(&mut caller, path_ptr, path_size) {
+                Some(d) => d,
+                None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
+            };
+
+            let path = match parse_path(&path_data) {
+                Some(p) => p,
+                None => return PROXY_RESULT_PARSE_FAILURE,
+            };
+
+            // Read value from WASM memory
+            let value = if value_size > 0 {
+                match read_bytes(&mut caller, value_ptr, value_size) {
+                    Some(v) => v,
+                    None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
+                }
+            } else {
+                Vec::new()
+            };
+
+            // Check capability
+            let state = caller.data();
+            if !state.http_ctx.capabilities.allow_property_write {
+                ftlog::debug!("WASM: proxy_set_property - property write not allowed");
+                return PROXY_RESULT_NOT_ALLOWED;
+            }
+
+            // Set the property
+            let state = caller.data_mut();
+            match path.as_str() {
+                // Allow setting some request properties
+                "request.path" => {
+                    if let Ok(s) = String::from_utf8(value) {
+                        state.http_ctx.request_path = s;
+                        return PROXY_RESULT_OK;
+                    }
+                    return PROXY_RESULT_PARSE_FAILURE;
+                }
+                "request.method" => {
+                    if let Ok(s) = String::from_utf8(value) {
+                        state.http_ctx.request_method = s;
+                        return PROXY_RESULT_OK;
+                    }
+                    return PROXY_RESULT_PARSE_FAILURE;
+                }
+                // For all other properties, store in custom_properties
+                _ => {
+                    state.http_ctx.custom_properties.insert(path.clone(), value);
+                    ftlog::debug!("WASM: proxy_set_property '{}' set", path);
+                    PROXY_RESULT_OK
+                }
+            }
         },
     )?;
 

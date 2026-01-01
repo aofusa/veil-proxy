@@ -82,6 +82,10 @@ pub struct ModuleCapabilities {
     #[serde(default)]
     pub allowed_properties: Vec<String>,
 
+    /// Allow writing custom properties via proxy_set_property
+    #[serde(default)]
+    pub allow_property_write: bool,
+
     // === Resource Limits ===
     /// Maximum shared data size in bytes
     #[serde(default = "default_max_shared_data_size")]
@@ -124,6 +128,7 @@ impl Default for ModuleCapabilities {
             allowed_upstreams: Vec::new(),
             max_http_calls: default_max_http_calls(),
             allowed_properties: Vec::new(),
+            allow_property_write: false,
             max_shared_data_size: default_max_shared_data_size(),
             max_execution_time_ms: default_max_execution_time(),
         }

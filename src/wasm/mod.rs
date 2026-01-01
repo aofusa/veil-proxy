@@ -29,7 +29,7 @@ mod tests;
 pub use capabilities::{CapabilityPreset, ModuleCapabilities};
 pub use constants::*;
 pub use context::HttpContext;
-pub use engine::{FilterEngine, FilterResult};
+pub use engine::{BodyFilterResult, FilterEngine, FilterResult};
 pub use registry::ModuleRegistry;
 pub use types::*;
 

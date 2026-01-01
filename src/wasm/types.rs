@@ -135,16 +135,22 @@ pub struct LocalResponse {
     pub body: Vec<u8>,
 }
 
-/// Pending HTTP call
-#[derive(Debug)]
+/// Pending HTTP call with full request data
+#[derive(Debug, Clone)]
 pub struct PendingHttpCall {
     pub token: u32,
     pub upstream: String,
     pub timeout_ms: u32,
+    /// Request headers (serialized)
+    pub headers: Vec<(String, String)>,
+    /// Request body
+    pub body: Vec<u8>,
+    /// Request trailers (serialized)
+    pub trailers: Vec<(String, String)>,
 }
 
 /// HTTP call response
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct HttpCallResponse {
     pub status_code: u16,
     pub headers: Vec<(String, String)>,

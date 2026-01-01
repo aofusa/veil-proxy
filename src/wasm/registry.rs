@@ -66,14 +66,14 @@ impl ModuleRegistry {
 
         config.allocation_strategy(wasmtime::InstanceAllocationStrategy::Pooling(pooling_config));
 
-        // Enable fuel for execution limits
+        // Enable fuel for execution limits (primary protection)
         config.consume_fuel(true);
 
-        // Note: epoch_interruption requires calling store.set_epoch_deadline() before execution
-        // and incrementing engine.increment_epoch() periodically for timeout enforcement.
-        // Currently disabled as it causes immediate traps without proper epoch management.
-        // TODO: Implement proper epoch-based timeout with background thread
-        // config.epoch_interruption(true);
+        // Enable epoch interruption for timeout enforcement (secondary protection)
+        // The engine's epoch must be periodically incremented, and each Store
+        // should have a deadline set via store.set_epoch_deadline().
+        // When engine.epoch >= store.epoch_deadline, execution is interrupted.
+        config.epoch_interruption(true);
 
         Engine::new(&config)
     }

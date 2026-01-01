@@ -637,6 +637,9 @@ mod host_function_tests {
             token,
             upstream: "backend".to_string(),
             timeout_ms: 5000,
+            headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+            body: b"test body".to_vec(),
+            trailers: vec![],
         });
         
         assert!(ctx.pending_http_calls.contains_key(&token));

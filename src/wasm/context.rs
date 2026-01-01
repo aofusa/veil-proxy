@@ -90,6 +90,10 @@ pub struct HttpContext {
     /// Next CAS value
     pub shared_data_cas: u32,
 
+    // === Custom Properties ===
+    /// User-defined properties (set via proxy_set_property)
+    pub custom_properties: HashMap<String, Vec<u8>>,
+
     // === Capabilities ===
     /// Module capabilities
     pub capabilities: ModuleCapabilities,
@@ -108,6 +112,46 @@ pub struct HttpContext {
     /// Cancelled gRPC call IDs
     #[cfg(feature = "grpc")]
     pub cancelled_grpc_calls: std::collections::HashSet<u32>,
+
+    // === gRPC Streams (feature = "grpc") ===
+    /// Active gRPC streams (stream_id -> GrpcStream)
+    #[cfg(feature = "grpc")]
+    pub pending_grpc_streams: HashMap<u32, GrpcStream>,
+    /// Next gRPC stream ID
+    #[cfg(feature = "grpc")]
+    pub next_grpc_stream_id: u32,
+}
+
+/// gRPC stream state
+#[cfg(feature = "grpc")]
+#[derive(Debug, Clone)]
+pub struct GrpcStream {
+    /// Stream ID
+    pub stream_id: u32,
+    /// Upstream service name
+    pub upstream: String,
+    /// gRPC service name
+    pub service: String,
+    /// gRPC method name
+    pub method: String,
+    /// Stream state
+    pub state: GrpcStreamState,
+    /// Pending messages to send
+    pub pending_messages: Vec<Vec<u8>>,
+    /// Initial metadata
+    pub initial_metadata: Vec<(String, String)>,
+}
+
+/// gRPC stream state
+#[cfg(feature = "grpc")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrpcStreamState {
+    /// Stream is open for bidirectional communication
+    Open,
+    /// Client has closed their send side (half-closed)
+    HalfClosed,
+    /// Stream is fully closed
+    Closed,
 }
 
 impl HttpContext {
@@ -145,6 +189,7 @@ impl HttpContext {
             next_metric_id: 1,
             shared_data: Arc::new(RwLock::new(HashMap::new())),
             shared_data_cas: 1,
+            custom_properties: HashMap::new(),
             capabilities,
             tick_period_ms: 0,
             #[cfg(feature = "grpc")]
@@ -153,6 +198,10 @@ impl HttpContext {
             next_grpc_call_id: 1,
             #[cfg(feature = "grpc")]
             cancelled_grpc_calls: std::collections::HashSet::new(),
+            #[cfg(feature = "grpc")]
+            pending_grpc_streams: HashMap::new(),
+            #[cfg(feature = "grpc")]
+            next_grpc_stream_id: 1,
         }
     }
 
@@ -245,6 +294,16 @@ impl HttpContext {
         } else {
             false
         }
+    }
+
+    /// Take pending HTTP calls for execution
+    pub fn take_pending_http_calls(&mut self) -> HashMap<u32, crate::wasm::types::PendingHttpCall> {
+        std::mem::take(&mut self.pending_http_calls)
+    }
+
+    /// Check if there are pending HTTP calls
+    pub fn has_pending_http_calls(&self) -> bool {
+        !self.pending_http_calls.is_empty()
     }
 
     /// Take pending gRPC calls for execution

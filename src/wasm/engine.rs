@@ -16,6 +16,11 @@ pub struct FilterEngine {
     registry: ModuleRegistry,
     /// Default execution time limit (fuel)
     fuel_limit: u64,
+    /// Epoch deadline for timeout enforcement
+    /// When epoch interruption is enabled, each store gets a deadline of
+    /// current_epoch + 1, and the engine's epoch is incremented after setting up the store.
+    /// This provides a simple per-execution timeout mechanism.
+    epoch_deadline: u64,
 }
 
 impl FilterEngine {
@@ -26,9 +31,14 @@ impl FilterEngine {
         // Calculate fuel limit (roughly 1M instructions per ms)
         let fuel_limit = config.defaults.max_execution_time_ms * 1_000_000;
 
+        // Epoch deadline: number of epochs to allow before timeout
+        // Since we increment epoch after start, deadline of 1 means "this execution only"
+        let epoch_deadline = 1;
+
         Ok(Self {
             registry,
             fuel_limit,
+            epoch_deadline,
         })
     }
 
@@ -194,6 +204,10 @@ impl FilterEngine {
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
         store.set_fuel(self.fuel_limit)?;
+        store.set_epoch_deadline(self.epoch_deadline);
+
+        // Increment engine epoch to invalidate previous executions' deadlines
+        self.registry.engine().increment_epoch();
 
         // Instantiate module
         let instance = module.instance_pre.instantiate(&mut store)?;
@@ -390,6 +404,8 @@ impl FilterEngine {
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
         store.set_fuel(self.fuel_limit)?;
+        store.set_epoch_deadline(self.epoch_deadline);
+        self.registry.engine().increment_epoch();
 
         // Instantiate module
         let instance = module.instance_pre.instantiate(&mut store)?;
@@ -457,6 +473,429 @@ impl FilterEngine {
             FilterAction::Pause => Ok(ModuleResult::Pause),
         }
     }
+
+    /// Get a loaded module by name
+    pub fn get_module(&self, name: &str) -> Option<Arc<LoadedModule>> {
+        self.registry.get_module(name)
+    }
+
+    /// Execute proxy_on_http_call_response callback for a module
+    ///
+    /// This should be called after an HTTP call completes to deliver the response
+    /// back to the WASM module.
+    pub fn on_http_call_response(
+        &self,
+        module_name: &str,
+        token: u32,
+        response: super::types::HttpCallResponse,
+    ) -> FilterResult {
+        let module = match self.registry.get_module(module_name) {
+            Some(m) => m,
+            None => {
+                ftlog::warn!("[wasm] Module '{}' not found for HTTP call response", module_name);
+                return FilterResult::Continue {
+                    headers: Vec::new(),
+                    body: None,
+                };
+            }
+        };
+
+        match self.execute_on_http_call_response(&module, token, response) {
+            Ok(result) => match result {
+                ModuleResult::Continue { modified_headers } => FilterResult::Continue {
+                    headers: modified_headers.unwrap_or_default(),
+                    body: None,
+                },
+                ModuleResult::Pause => FilterResult::Pause,
+                ModuleResult::LocalResponse(resp) => FilterResult::LocalResponse(resp),
+            },
+            Err(e) => {
+                ftlog::error!("[wasm:{}] on_http_call_response error: {}", module_name, e);
+                FilterResult::Continue {
+                    headers: Vec::new(),
+                    body: None,
+                }
+            }
+        }
+    }
+
+    /// Execute on_http_call_response for a single module
+    fn execute_on_http_call_response(
+        &self,
+        module: &LoadedModule,
+        token: u32,
+        response: super::types::HttpCallResponse,
+    ) -> anyhow::Result<ModuleResult> {
+        // Create context with HTTP call response
+        let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
+        http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_configuration = module.configuration.clone();
+        
+        // Store the response in context
+        http_ctx.http_call_responses.insert(token, response.clone());
+        http_ctx.current_http_call_token = Some(token);
+
+        // Create store with fuel limit
+        let host_state = HostState::new(http_ctx);
+        let mut store = Store::new(self.registry.engine(), host_state);
+        store.set_fuel(self.fuel_limit)?;
+        store.set_epoch_deadline(self.epoch_deadline);
+        self.registry.engine().increment_epoch();
+
+        // Instantiate module
+        let instance = module.instance_pre.instantiate(&mut store)?;
+
+        // === Proxy-Wasm SDK Lifecycle ===
+        // Step 0: Call _start
+        if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
+            let _ = func.call(&mut store, ());
+        } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
+            let _ = func.call(&mut store, ());
+        }
+
+        let root_context_id = 1i32;
+        let http_context_id = 2i32;
+        let config_size = module.configuration.len() as i32;
+
+        // Step 1: Create ROOT context
+        if let Ok(func) = instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create") {
+            let _ = func.call(&mut store, (root_context_id, 0));
+        }
+
+        // Step 2: Call proxy_on_vm_start
+        if let Ok(func) = instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start") {
+            let _ = func.call(&mut store, (root_context_id, config_size));
+        }
+
+        // Step 3: Call proxy_on_configure
+        if let Ok(func) = instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure") {
+            let _ = func.call(&mut store, (root_context_id, config_size));
+        }
+
+        // Step 4: Create HTTP context with root as parent
+        if let Ok(func) = instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create") {
+            let _ = func.call(&mut store, (http_context_id, root_context_id));
+        }
+
+        // Call proxy_on_http_call_response
+        // Signature: (context_id, token, num_headers, body_size, num_trailers) -> void
+        let callback = instance
+            .get_typed_func::<(i32, i32, i32, i32, i32), ()>(&mut store, "proxy_on_http_call_response");
+
+        match callback {
+            Ok(func) => {
+                let num_headers = response.headers.len() as i32;
+                let body_size = response.body.len() as i32;
+                let num_trailers = response.trailers.len() as i32;
+                
+                if let Err(e) = func.call(&mut store, (http_context_id, token as i32, num_headers, body_size, num_trailers)) {
+                    ftlog::debug!("[wasm:{}] proxy_on_http_call_response returned: {}", module.name, e);
+                }
+            }
+            Err(_) => {
+                ftlog::debug!("[wasm:{}] proxy_on_http_call_response not exported", module.name);
+            }
+        }
+
+        // Check for local response
+        let state = store.data();
+        if let Some(local_response) = &state.http_ctx.local_response {
+            return Ok(ModuleResult::LocalResponse(local_response.clone()));
+        }
+
+        // Check for modifications
+        let modified_headers = if state.http_ctx.request_headers_modified {
+            Some(state.http_ctx.request_headers.clone())
+        } else {
+            None
+        };
+
+        Ok(ModuleResult::Continue { modified_headers })
+    }
+
+    /// Execute on_request_body callback for specified modules
+    ///
+    /// Processes request body chunks through WASM modules.
+    /// Returns potentially modified body data.
+    pub fn on_request_body_with_modules(
+        &self,
+        module_names: &[String],
+        body: &[u8],
+        end_of_stream: bool,
+    ) -> BodyFilterResult {
+        let modules: Vec<Arc<LoadedModule>> = module_names
+            .iter()
+            .filter_map(|name| self.registry.get_module(name))
+            .collect();
+
+        if modules.is_empty() {
+            return BodyFilterResult::Continue {
+                body: body.to_vec(),
+            };
+        }
+
+        let mut current_body = body.to_vec();
+
+        for module in &modules {
+            let result = self.execute_on_request_body(module, &current_body, end_of_stream);
+
+            match result {
+                Ok(BodyModuleResult::Continue { modified_body }) => {
+                    if let Some(b) = modified_body {
+                        current_body = b;
+                    }
+                }
+                Ok(BodyModuleResult::Pause) => {
+                    return BodyFilterResult::Pause;
+                }
+                Ok(BodyModuleResult::LocalResponse(resp)) => {
+                    return BodyFilterResult::LocalResponse(resp);
+                }
+                Err(e) => {
+                    ftlog::error!(
+                        "[wasm:{}] on_request_body error: {}",
+                        module.name,
+                        e
+                    );
+                    // Continue on error
+                }
+            }
+        }
+
+        BodyFilterResult::Continue {
+            body: current_body,
+        }
+    }
+
+    /// Execute on_request_body for a single module
+    fn execute_on_request_body(
+        &self,
+        module: &LoadedModule,
+        body: &[u8],
+        end_of_stream: bool,
+    ) -> anyhow::Result<BodyModuleResult> {
+        // Check capability
+        if !module.capabilities.allow_request_body_read {
+            return Ok(BodyModuleResult::Continue { modified_body: None });
+        }
+
+        // Create context
+        let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
+        http_ctx.set_request_body(body.to_vec(), end_of_stream);
+        http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_configuration = module.configuration.clone();
+
+        // Create store with fuel limit
+        let host_state = HostState::new(http_ctx);
+        let mut store = Store::new(self.registry.engine(), host_state);
+        store.set_fuel(self.fuel_limit)?;
+        store.set_epoch_deadline(self.epoch_deadline);
+        self.registry.engine().increment_epoch();
+
+        // Instantiate module
+        let instance = module.instance_pre.instantiate(&mut store)?;
+
+        // Proxy-Wasm SDK Lifecycle
+        if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
+            let _ = func.call(&mut store, ());
+        } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
+            let _ = func.call(&mut store, ());
+        }
+
+        let root_context_id = 1i32;
+        let http_context_id = 2i32;
+        let config_size = module.configuration.len() as i32;
+
+        if let Ok(func) = instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create") {
+            let _ = func.call(&mut store, (root_context_id, 0));
+        }
+
+        if let Ok(func) = instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start") {
+            let _ = func.call(&mut store, (root_context_id, config_size));
+        }
+
+        if let Ok(func) = instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure") {
+            let _ = func.call(&mut store, (root_context_id, config_size));
+        }
+
+        if let Ok(func) = instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create") {
+            let _ = func.call(&mut store, (http_context_id, root_context_id));
+        }
+
+        // Call proxy_on_request_body
+        // Signature: (context_id, body_size, end_of_stream) -> action
+        let callback = instance
+            .get_typed_func::<(i32, i32, i32), i32>(&mut store, "proxy_on_request_body");
+
+        let action = match callback {
+            Ok(func) => {
+                let body_size = body.len() as i32;
+                let eos = if end_of_stream { 1 } else { 0 };
+                func.call(&mut store, (http_context_id, body_size, eos))?
+            }
+            Err(_) => 0, // Continue if not exported
+        };
+
+        // Check for local response
+        let state = store.data();
+        if let Some(local_response) = &state.http_ctx.local_response {
+            return Ok(BodyModuleResult::LocalResponse(local_response.clone()));
+        }
+
+        // Check for modifications
+        let modified_body = if state.http_ctx.request_body_modified {
+            Some(state.http_ctx.request_body.clone())
+        } else {
+            None
+        };
+
+        match FilterAction::from(action) {
+            FilterAction::Continue => Ok(BodyModuleResult::Continue { modified_body }),
+            FilterAction::Pause => Ok(BodyModuleResult::Pause),
+        }
+    }
+
+    /// Execute on_response_body callback for specified modules
+    ///
+    /// Processes response body chunks through WASM modules (in reverse order).
+    /// Returns potentially modified body data.
+    pub fn on_response_body_with_modules(
+        &self,
+        module_names: &[String],
+        body: &[u8],
+        end_of_stream: bool,
+    ) -> BodyFilterResult {
+        let modules: Vec<Arc<LoadedModule>> = module_names
+            .iter()
+            .filter_map(|name| self.registry.get_module(name))
+            .collect();
+
+        if modules.is_empty() {
+            return BodyFilterResult::Continue {
+                body: body.to_vec(),
+            };
+        }
+
+        let mut current_body = body.to_vec();
+
+        // Execute in reverse order for response
+        for module in modules.iter().rev() {
+            let result = self.execute_on_response_body(module, &current_body, end_of_stream);
+
+            match result {
+                Ok(BodyModuleResult::Continue { modified_body }) => {
+                    if let Some(b) = modified_body {
+                        current_body = b;
+                    }
+                }
+                Ok(BodyModuleResult::Pause) => {
+                    return BodyFilterResult::Pause;
+                }
+                Ok(BodyModuleResult::LocalResponse(resp)) => {
+                    return BodyFilterResult::LocalResponse(resp);
+                }
+                Err(e) => {
+                    ftlog::error!(
+                        "[wasm:{}] on_response_body error: {}",
+                        module.name,
+                        e
+                    );
+                }
+            }
+        }
+
+        BodyFilterResult::Continue {
+            body: current_body,
+        }
+    }
+
+    /// Execute on_response_body for a single module
+    fn execute_on_response_body(
+        &self,
+        module: &LoadedModule,
+        body: &[u8],
+        end_of_stream: bool,
+    ) -> anyhow::Result<BodyModuleResult> {
+        // Check capability
+        if !module.capabilities.allow_response_body_read {
+            return Ok(BodyModuleResult::Continue { modified_body: None });
+        }
+
+        // Create context
+        let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
+        http_ctx.set_response_body(body.to_vec(), end_of_stream);
+        http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_configuration = module.configuration.clone();
+
+        // Create store with fuel limit
+        let host_state = HostState::new(http_ctx);
+        let mut store = Store::new(self.registry.engine(), host_state);
+        store.set_fuel(self.fuel_limit)?;
+        store.set_epoch_deadline(self.epoch_deadline);
+        self.registry.engine().increment_epoch();
+
+        // Instantiate module
+        let instance = module.instance_pre.instantiate(&mut store)?;
+
+        // Proxy-Wasm SDK Lifecycle
+        if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
+            let _ = func.call(&mut store, ());
+        } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
+            let _ = func.call(&mut store, ());
+        }
+
+        let root_context_id = 1i32;
+        let http_context_id = 2i32;
+        let config_size = module.configuration.len() as i32;
+
+        if let Ok(func) = instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create") {
+            let _ = func.call(&mut store, (root_context_id, 0));
+        }
+
+        if let Ok(func) = instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start") {
+            let _ = func.call(&mut store, (root_context_id, config_size));
+        }
+
+        if let Ok(func) = instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure") {
+            let _ = func.call(&mut store, (root_context_id, config_size));
+        }
+
+        if let Ok(func) = instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create") {
+            let _ = func.call(&mut store, (http_context_id, root_context_id));
+        }
+
+        // Call proxy_on_response_body
+        // Signature: (context_id, body_size, end_of_stream) -> action
+        let callback = instance
+            .get_typed_func::<(i32, i32, i32), i32>(&mut store, "proxy_on_response_body");
+
+        let action = match callback {
+            Ok(func) => {
+                let body_size = body.len() as i32;
+                let eos = if end_of_stream { 1 } else { 0 };
+                func.call(&mut store, (http_context_id, body_size, eos))?
+            }
+            Err(_) => 0, // Continue if not exported
+        };
+
+        // Check for local response
+        let state = store.data();
+        if let Some(local_response) = &state.http_ctx.local_response {
+            return Ok(BodyModuleResult::LocalResponse(local_response.clone()));
+        }
+
+        // Check for modifications
+        let modified_body = if state.http_ctx.response_body_modified {
+            Some(state.http_ctx.response_body.clone())
+        } else {
+            None
+        };
+
+        match FilterAction::from(action) {
+            FilterAction::Continue => Ok(BodyModuleResult::Continue { modified_body }),
+            FilterAction::Pause => Ok(BodyModuleResult::Pause),
+        }
+    }
 }
 
 /// Result from a single module execution
@@ -474,6 +913,27 @@ pub enum FilterResult {
     Continue {
         headers: Vec<(String, String)>,
         body: Option<Vec<u8>>,
+    },
+    /// Pause processing (async operation pending)
+    Pause,
+    /// Send a local response instead of proxying
+    LocalResponse(LocalResponse),
+}
+
+/// Result from body module execution (internal)
+enum BodyModuleResult {
+    Continue {
+        modified_body: Option<Vec<u8>>,
+    },
+    Pause,
+    LocalResponse(LocalResponse),
+}
+
+/// Result from body filter chain execution
+pub enum BodyFilterResult {
+    /// Continue with potentially modified body
+    Continue {
+        body: Vec<u8>,
     },
     /// Pause processing (async operation pending)
     Pause,
