@@ -10,6 +10,8 @@ tests/fixtures/backend1/*
 !tests/fixtures/backend1/.gitkeep
 tests/fixtures/backend2/*
 !tests/fixtures/backend2/.gitkeep
+tests/fixtures/backend_h2c/*
+!tests/fixtures/backend_h2c/.gitkeep
 
 # WASM ビルドアーティファクト
 # サンプルフィルタのビルド成果物

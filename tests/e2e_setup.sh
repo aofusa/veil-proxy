@@ -34,6 +34,7 @@ PROXY_HTTPS_PORT=8443
 PROXY_HTTP_PORT=8080
 BACKEND1_PORT=9001
 BACKEND2_PORT=9002
+BACKEND_H2C_PORT=9003
 
 # 色付き出力
 RED='\033[0;31m'
@@ -135,6 +136,12 @@ prepare_fixtures() {
     echo "Hello from Backend 2" > "${FIXTURES_DIR}/backend2/index.html"
     echo '{"server": "backend2", "status": "ok"}' > "${FIXTURES_DIR}/backend2/health"
     echo "Large content from backend2: $(head -c 10000 /dev/urandom | base64)" > "${FIXTURES_DIR}/backend2/large.txt"
+    
+    # H2Cバックエンド用テストファイル
+    mkdir -p "${FIXTURES_DIR}/backend_h2c"
+    echo "Hello from H2C Backend" > "${FIXTURES_DIR}/backend_h2c/index.html"
+    echo '{"server": "backend_h2c", "status": "ok"}' > "${FIXTURES_DIR}/backend_h2c/health"
+    echo "H2C test content" > "${FIXTURES_DIR}/backend_h2c/test.txt"
 }
 
 # 設定ファイルを生成
@@ -212,6 +219,46 @@ path = "${FIXTURES_DIR}/backend2"
 index = "index.html"
 [route.security]
 add_response_headers = { "X-Server-Id" = "backend2" }
+EOF
+
+    # H2Cバックエンド設定（HTTP/2 over cleartext、静的ファイル配信）
+    # 注意: veil-proxyは現在H2Cサーバーとして動作しない可能性があるため、
+    # この設定はHTTP/1.1サーバーとして動作します
+    # H2Cテストでは、プロキシがH2C接続を試みることを確認します
+    # TLSセクションは必須ですが、実際にはHTTP/1.1サーバーとして動作します
+    cat > "${FIXTURES_DIR}/backend_h2c.toml" << EOF
+[server]
+listen = "127.0.0.1:${BACKEND_H2C_PORT}"
+threads = 1
+
+[tls]
+cert_path = "${FIXTURES_DIR}/cert.pem"
+key_path = "${FIXTURES_DIR}/key.pem"
+
+[logging]
+level = "warn"
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/*"
+[route.action]
+type = "File"
+path = "${FIXTURES_DIR}/backend_h2c"
+index = "index.html"
+[route.security]
+add_response_headers = { "X-Server-Id" = "backend_h2c" }
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/*"
+[route.action]
+type = "File"
+path = "${FIXTURES_DIR}/backend_h2c"
+index = "index.html"
+[route.security]
+add_response_headers = { "X-Server-Id" = "backend_h2c" }
 EOF
 
     # プロキシ設定（設定タイプに応じて生成）
@@ -377,6 +424,29 @@ type = "Proxy"
 upstream = "backend-pool"
 [route.security]
 add_response_headers = { "X-Proxied-By" = "veil" }
+
+# H2Cルート設定
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/h2c/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:${BACKEND_H2C_PORT}"
+use_h2c = true
+[route.security]
+add_response_headers = { "X-Proxied-By" = "veil", "X-H2C-Test" = "true" }
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/h2c/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:${BACKEND_H2C_PORT}"
+use_h2c = true
+[route.security]
+add_response_headers = { "X-Proxied-By" = "veil", "X-H2C-Test" = "true" }
 EOF
 
     log_info "Configuration files generated (type: ${config_type})"
@@ -396,6 +466,11 @@ start_servers() {
     echo $! >> "$PIDS_FILE"
     log_info "Backend 2 started on port ${BACKEND2_PORT} (PID: $!)"
     
+    # H2Cバックエンド起動（HTTP/1.1サーバーとして動作、H2Cテスト用）
+    "$VEIL_BIN" -c "${FIXTURES_DIR}/backend_h2c.toml" &
+    echo $! >> "$PIDS_FILE"
+    log_info "H2C Backend started on port ${BACKEND_H2C_PORT} (PID: $!)"
+    
     # バックエンド起動待機（動的）
     log_info "Waiting for backends to be ready..."
     if wait_for_server "https://127.0.0.1:${BACKEND1_PORT}/health" "Backend 1" 15; then
@@ -408,6 +483,15 @@ start_servers() {
         log_info "Backend 2 is ready"
     else
         log_warn "Backend 2 may not be fully ready, continuing..."
+    fi
+    
+    # H2CバックエンドはHTTPSサーバーとして動作（H2CテストではプロキシがH2C接続を試みる）
+    # 注意: バックエンドサーバーはHTTPSとして動作するが、プロキシ設定でuse_h2c=trueを指定しているため、
+    # プロキシはH2C（平文HTTP/2）接続を試みる。これはエラーハンドリングのテストとして機能する。
+    if wait_for_server "https://127.0.0.1:${BACKEND_H2C_PORT}/health" "H2C Backend" 15; then
+        log_info "H2C Backend is ready (HTTPS mode, H2C connection will be attempted by proxy)"
+    else
+        log_warn "H2C Backend may not be fully ready, continuing..."
     fi
     
     log_info "Starting proxy server..."
@@ -510,7 +594,7 @@ check_port_conflicts() {
     log_info "Checking for port conflicts..."
     local conflicts=0
     
-    for port in $PROXY_HTTPS_PORT $PROXY_HTTP_PORT $BACKEND1_PORT $BACKEND2_PORT; do
+    for port in $PROXY_HTTPS_PORT $PROXY_HTTP_PORT $BACKEND1_PORT $BACKEND2_PORT $BACKEND_H2C_PORT; do
         if check_port_in_use "$port"; then
             log_error "Port $port is already in use"
             conflicts=$((conflicts + 1))
