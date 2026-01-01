@@ -753,7 +753,11 @@ impl Http3Handler {
     }
 
     /// gRPC リクエストかどうかを判定
+    ///
+    /// 将来のgRPCリクエスト処理用に準備されたAPI。
+    /// handle_request内でgRPCリクエストを検出し、専用処理に分岐する際に使用予定。
     #[cfg(feature = "grpc")]
+    #[allow(dead_code)]
     fn is_grpc_request(headers: &[h3::Header]) -> bool {
         for header in headers {
             if header.name().eq_ignore_ascii_case(b"content-type") {
@@ -767,7 +771,10 @@ impl Http3Handler {
     ///
     /// HTTP/3 では QPACK を使用してトレイラーを送信します。
     /// ボディ送信後に grpc-status と grpc-message をトレイラーとして送信。
+    ///
+    /// 将来のgRPCレスポンス処理用に準備されたAPI。
     #[cfg(feature = "grpc")]
+    #[allow(dead_code)]
     fn send_grpc_response(
         &mut self,
         stream_id: u64,
@@ -776,8 +783,6 @@ impl Http3Handler {
         grpc_status: u32,
         grpc_message: Option<&str>,
     ) -> io::Result<()> {
-        use crate::grpc::status::{GrpcStatus, GrpcStatusCode};
-
         let h3_conn = match &mut self.h3_conn {
             Some(h3) => h3,
             None => return Ok(()),
@@ -795,8 +800,6 @@ impl Http3Handler {
             }
         }
 
-        let has_body = body.is_some() && body.map_or(false, |b| !b.is_empty());
-        
         if let Err(e) = h3_conn.send_response(&mut self.conn, stream_id, &h3_headers, false) {
             warn!("[HTTP/3] gRPC send_response error: {}", e);
             return Ok(());
@@ -816,7 +819,10 @@ impl Http3Handler {
     }
 
     /// gRPC トレイラーを送信（内部ヘルパー）
+    ///
+    /// 将来のgRPCレスポンス処理用に準備されたAPI。
     #[cfg(feature = "grpc")]
+    #[allow(dead_code)]
     fn send_grpc_trailers_internal(
         &mut self,
         stream_id: u64,
