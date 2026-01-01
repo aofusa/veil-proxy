@@ -125,6 +125,40 @@ pub fn resolve_queue_name(queue_name: &str) -> Option<u32> {
     registry.name_to_id.get(queue_name).copied()
 }
 
+/// Pending queue notifications tracking
+static PENDING_QUEUE_NOTIFICATIONS: Lazy<RwLock<HashSet<u32>>> =
+    Lazy::new(|| RwLock::new(HashSet::new()));
+
+/// Mark a queue as having pending notifications
+/// 
+/// This should be called after proxy_enqueue_shared_queue adds data to a queue.
+/// The notification will be processed later when process_pending_notifications is called.
+pub fn queue_enqueued(queue_id: u32) {
+    if let Ok(mut pending) = PENDING_QUEUE_NOTIFICATIONS.write() {
+        pending.insert(queue_id);
+        ftlog::debug!("[wasm:queue] Queue {} marked as having pending notifications", queue_id);
+    }
+}
+
+/// Process all pending queue notifications
+/// 
+/// This should be called periodically (e.g., in the tick loop) to deliver
+/// queue notifications to subscribed modules.
+pub fn process_pending_notifications(engine: &Arc<FilterEngine>) {
+    // Take all pending notifications
+    let pending: Vec<u32> = {
+        match PENDING_QUEUE_NOTIFICATIONS.write() {
+            Ok(mut p) => std::mem::take(&mut *p).into_iter().collect(),
+            Err(_) => return,
+        }
+    };
+    
+    // Notify subscribers for each queue
+    for queue_id in pending {
+        notify_queue_subscribers(engine, queue_id);
+    }
+}
+
 /// Get statistics about queue subscriptions
 pub fn get_queue_stats() -> QueueStats {
     let registry = match QUEUE_SUBSCRIPTIONS.read() {

@@ -77,6 +77,28 @@ pub fn on_http_call_complete(
     );
 }
 
+/// Information about a pending HTTP call for async execution
+/// 
+/// This struct is used to extract pending HTTP call information
+/// for async execution outside the WASM context.
+#[derive(Debug, Clone)]
+pub struct PendingHttpCallInfo {
+    /// Module name that initiated the call
+    pub module_name: String,
+    /// Call token
+    pub token: u32,
+    /// Upstream service name (maps to upstream_groups)
+    pub upstream: String,
+    /// Timeout in milliseconds
+    pub timeout_ms: u32,
+    /// Request headers
+    pub headers: Vec<(String, String)>,
+    /// Request body
+    pub body: Vec<u8>,
+    /// Request trailers
+    pub trailers: Vec<(String, String)>,
+}
+
 /// Tick timer configuration for a module
 #[derive(Debug, Clone)]
 pub struct TickConfig {

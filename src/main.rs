@@ -8115,6 +8115,9 @@ fn spawn_wasm_tick_thread() {
             let config = CURRENT_CONFIG.load();
             if let Some(ref wasm_engine) = config.wasm_filter_engine {
                 crate::wasm::process_ticks(wasm_engine);
+                
+                // キュー通知処理（P4: Queue Notification Integration）
+                crate::wasm::process_pending_notifications(wasm_engine);
             }
         }
     });

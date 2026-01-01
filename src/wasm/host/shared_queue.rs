@@ -186,6 +186,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
 
             if success {
                 ftlog::debug!("WASM: proxy_enqueue_shared_queue id={} size={}", queue_id, data_size);
+                // Mark queue for pending notification (will be processed in tick loop)
+                crate::wasm::queue_notify::queue_enqueued(queue_id as u32);
                 PROXY_RESULT_OK
             } else {
                 ftlog::debug!("WASM: proxy_enqueue_shared_queue id={} failed (queue full or not found)", queue_id);
