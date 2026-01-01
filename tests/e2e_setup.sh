@@ -281,8 +281,19 @@ start_servers() {
     echo $! >> "$PIDS_FILE"
     log_info "Backend 2 started on port ${BACKEND2_PORT} (PID: $!)"
     
-    # バックエンド起動待機
-    sleep 1
+    # バックエンド起動待機（動的）
+    log_info "Waiting for backends to be ready..."
+    if wait_for_server "https://127.0.0.1:${BACKEND1_PORT}/health" "Backend 1" 15; then
+        log_info "Backend 1 is ready"
+    else
+        log_warn "Backend 1 may not be fully ready, continuing..."
+    fi
+    
+    if wait_for_server "https://127.0.0.1:${BACKEND2_PORT}/health" "Backend 2" 15; then
+        log_info "Backend 2 is ready"
+    else
+        log_warn "Backend 2 may not be fully ready, continuing..."
+    fi
     
     log_info "Starting proxy server..."
     
@@ -291,8 +302,17 @@ start_servers() {
     echo $! >> "$PIDS_FILE"
     log_info "Proxy started on ports ${PROXY_HTTPS_PORT}/${PROXY_HTTP_PORT} (PID: $!)"
     
-    # 起動完了待機
-    sleep 2
+    # プロキシ起動待機（動的）
+    log_info "Waiting for proxy to be ready..."
+    if wait_for_server "http://127.0.0.1:${PROXY_HTTP_PORT}/__metrics" "Proxy" 15; then
+        log_info "Proxy is ready"
+    else
+        if wait_for_server "https://127.0.0.1:${PROXY_HTTPS_PORT}/__metrics" "Proxy HTTPS" 15; then
+            log_info "Proxy HTTPS is ready"
+        else
+            log_warn "Proxy may not be fully ready, continuing..."
+        fi
+    fi
     
     log_info "All servers started"
 }
@@ -351,12 +371,71 @@ stop_servers() {
     sleep 1
 }
 
-# ヘルスチェック
+# ポートが使用中かチェック
+check_port_in_use() {
+    local port=$1
+    if command -v lsof > /dev/null 2>&1; then
+        if lsof -i ":$port" > /dev/null 2>&1; then
+            return 0  # 使用中
+        fi
+    elif command -v netstat > /dev/null 2>&1; then
+        if netstat -an 2>/dev/null | grep -q ":$port.*LISTEN"; then
+            return 0  # 使用中
+        fi
+    elif command -v ss > /dev/null 2>&1; then
+        if ss -ln 2>/dev/null | grep -q ":$port"; then
+            return 0  # 使用中
+        fi
+    fi
+    return 1  # 未使用
+}
+
+# ポート競合チェック
+check_port_conflicts() {
+    log_info "Checking for port conflicts..."
+    local conflicts=0
+    
+    for port in $PROXY_HTTPS_PORT $PROXY_HTTP_PORT $BACKEND1_PORT $BACKEND2_PORT; do
+        if check_port_in_use "$port"; then
+            log_error "Port $port is already in use"
+            conflicts=$((conflicts + 1))
+        fi
+    done
+    
+    if [ $conflicts -gt 0 ]; then
+        log_error "Found $conflicts port conflict(s). Please free the ports or stop conflicting processes."
+        return 1
+    fi
+    
+    log_info "No port conflicts detected"
+    return 0
+}
+
+# サーバーの起動を待機（リトライ付き）
+wait_for_server() {
+    local url=$1
+    local name=$2
+    local max_attempts=${3:-30}  # デフォルト30回
+    local attempt=0
+    
+    while [ $attempt -lt $max_attempts ]; do
+        if curl -ks "$url" > /dev/null 2>&1; then
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        sleep 0.2
+    done
+    
+    log_error "$name failed to start after $max_attempts attempts"
+    return 1
+}
+
+# ヘルスチェック（リトライ付き）
 health_check() {
     log_info "Checking server health..."
     
     # バックエンド1 (HTTPS - 自己署名証明書なので-k)
-    if curl -ks "https://127.0.0.1:${BACKEND1_PORT}/health" > /dev/null 2>&1; then
+    if wait_for_server "https://127.0.0.1:${BACKEND1_PORT}/health" "Backend 1" 30; then
         log_info "Backend 1: OK"
     else
         log_error "Backend 1: FAILED"
@@ -364,7 +443,7 @@ health_check() {
     fi
     
     # バックエンド2 (HTTPS)
-    if curl -ks "https://127.0.0.1:${BACKEND2_PORT}/health" > /dev/null 2>&1; then
+    if wait_for_server "https://127.0.0.1:${BACKEND2_PORT}/health" "Backend 2" 30; then
         log_info "Backend 2: OK"
     else
         log_error "Backend 2: FAILED"
@@ -372,11 +451,11 @@ health_check() {
     fi
     
     # プロキシ（HTTPポート - リダイレクト無効なのでHTTPで接続可能）
-    if curl -s "http://127.0.0.1:${PROXY_HTTP_PORT}/__metrics" > /dev/null 2>&1; then
+    if wait_for_server "http://127.0.0.1:${PROXY_HTTP_PORT}/__metrics" "Proxy HTTP" 30; then
         log_info "Proxy HTTP: OK"
     else
         # HTTPSでも確認
-        if curl -ks "https://127.0.0.1:${PROXY_HTTPS_PORT}/__metrics" > /dev/null 2>&1; then
+        if wait_for_server "https://127.0.0.1:${PROXY_HTTPS_PORT}/__metrics" "Proxy HTTPS" 30; then
             log_info "Proxy HTTPS: OK"
         else
             log_error "Proxy: FAILED"
@@ -409,6 +488,7 @@ cleanup() {
 case "${1:-}" in
     start)
         ensure_veil_binary
+        check_port_conflicts || exit 1
         prepare_fixtures
         generate_configs
         start_servers
@@ -421,6 +501,7 @@ case "${1:-}" in
         stop_servers
         sleep 1
         ensure_veil_binary
+        check_port_conflicts || exit 1
         prepare_fixtures
         generate_configs
         start_servers
@@ -434,10 +515,10 @@ case "${1:-}" in
         trap 'stop_servers' EXIT
         
         ensure_veil_binary
+        check_port_conflicts || exit 1
         prepare_fixtures
         generate_configs
         start_servers
-        sleep 2
         
         if ! health_check; then
             log_error "Health check failed, stopping servers"
