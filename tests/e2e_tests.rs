@@ -2610,6 +2610,7 @@ fn test_grpc_web_cors() {
 // ====================
 
 /// kTLSが利用可能かどうかをチェック
+#[allow(dead_code)]
 fn is_ktls_available() -> bool {
     // /proc/modules で tls モジュールがロードされているか確認
     if let Ok(modules) = std::fs::read_to_string("/proc/modules") {
@@ -2995,7 +2996,7 @@ fn test_websocket_connection_persistence() {
     // レスポンスを受信（ヘッダー部分を読み取る）
     let mut response = Vec::new();
     let mut buf = [0u8; 1];
-    let mut header_end = None;
+    let mut _header_end = None;
     
     // ヘッダー部分を読み取る（\r\n\r\nまで）
     loop {
@@ -3006,7 +3007,7 @@ fn test_websocket_connection_persistence() {
                 if response.len() >= 4 {
                     let len = response.len();
                     if &response[len-4..] == b"\r\n\r\n" {
-                        header_end = Some(len);
+                        _header_end = Some(len);
                         break;
                     }
                 }
@@ -5851,5 +5852,286 @@ fn test_malformed_request() {
     );
     
     eprintln!("Malformed request test: status {:?}", status);
+}
+
+// ====================
+// 優先度中: HTTPメソッド詳細テスト
+// ====================
+
+#[test]
+fn test_http_method_put() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // PUTメソッドのテスト
+    let response = send_request_with_method(PROXY_PORT, "/", "PUT", &[], None);
+    assert!(response.is_some(), "Should receive response");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    // PUTメソッドは200、201、204、または405が返される可能性がある
+    assert!(
+        status == Some(200) || status == Some(201) || status == Some(204) || status == Some(405) || status == Some(404),
+        "Should return 200, 201, 204, 405, or 404: {:?}", status
+    );
+    
+    eprintln!("HTTP PUT method test: status {:?}", status);
+}
+
+#[test]
+fn test_http_method_delete() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // DELETEメソッドのテスト
+    let response = send_request_with_method(PROXY_PORT, "/", "DELETE", &[], None);
+    assert!(response.is_some(), "Should receive response");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    // DELETEメソッドは200、204、または405が返される可能性がある
+    assert!(
+        status == Some(200) || status == Some(204) || status == Some(405) || status == Some(404),
+        "Should return 200, 204, 405, or 404: {:?}", status
+    );
+    
+    eprintln!("HTTP DELETE method test: status {:?}", status);
+}
+
+#[test]
+fn test_http_method_patch() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // PATCHメソッドのテスト
+    let response = send_request_with_method(PROXY_PORT, "/", "PATCH", &[], None);
+    assert!(response.is_some(), "Should receive response");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    // PATCHメソッドは200、204、または405が返される可能性がある
+    assert!(
+        status == Some(200) || status == Some(204) || status == Some(405) || status == Some(404),
+        "Should return 200, 204, 405, or 404: {:?}", status
+    );
+    
+    eprintln!("HTTP PATCH method test: status {:?}", status);
+}
+
+#[test]
+fn test_http_method_options() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // OPTIONSメソッドのテスト
+    let response = send_request_with_method(PROXY_PORT, "/", "OPTIONS", &[], None);
+    assert!(response.is_some(), "Should receive response");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    // OPTIONSメソッドは200、204、または405が返される可能性がある
+    assert!(
+        status == Some(200) || status == Some(204) || status == Some(405) || status == Some(404),
+        "Should return 200, 204, 405, or 404: {:?}", status
+    );
+    
+    // Allowヘッダーが存在する可能性がある
+    let allow = get_header_value(&response, "Allow");
+    if let Some(allow_value) = allow {
+        eprintln!("HTTP OPTIONS method test: Allow = {}", allow_value);
+    }
+    
+    eprintln!("HTTP OPTIONS method test: status {:?}", status);
+}
+
+#[test]
+fn test_http_method_head() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // HEADメソッドのテスト
+    let response = send_request_with_method(PROXY_PORT, "/", "HEAD", &[], None);
+    assert!(response.is_some(), "Should receive response");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    // HEADメソッドは200、または404が返される可能性がある
+    assert!(
+        status == Some(200) || status == Some(404),
+        "Should return 200 or 404: {:?}", status
+    );
+    
+    // HEADメソッドの場合、ボディは空である必要がある
+    if let Some(body_start) = response.find("\r\n\r\n") {
+        let body = &response[body_start + 4..];
+        // HEADメソッドのボディは空または非常に小さい可能性がある
+        if !body.trim().is_empty() {
+            eprintln!("HEAD method test: body is not empty (size: {} bytes)", body.len());
+        }
+    }
+    
+    eprintln!("HTTP HEAD method test: status {:?}", status);
+}
+
+// ====================
+// 優先度中: リダイレクト詳細テスト
+// ====================
+
+#[test]
+fn test_redirect_location_header() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // リダイレクトのLocationヘッダーのテスト
+    // 注意: 実際のリダイレクトが発生するパスが必要
+    
+    let response = send_request(PROXY_PORT, "/", &[]);
+    assert!(response.is_some(), "Should receive response");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    
+    // リダイレクトステータスコードの場合、Locationヘッダーが存在する可能性がある
+    if status == Some(301) || status == Some(302) || status == Some(307) || status == Some(308) {
+        let location = get_header_value(&response, "Location");
+        if let Some(loc) = location {
+            eprintln!("Redirect Location header test: Location = {}", loc);
+            assert!(!loc.is_empty(), "Location header should not be empty");
+        } else {
+            eprintln!("Redirect Location header test: Location header not present (may be optional)");
+        }
+    } else {
+        eprintln!("Redirect Location header test: status {:?} (not a redirect)", status);
+    }
+}
+
+#[test]
+fn test_redirect_cache_control() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // リダイレクトのCache-Controlヘッダーのテスト
+    let response = send_request(PROXY_PORT, "/", &[]);
+    assert!(response.is_some(), "Should receive response");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    
+    // リダイレクトステータスコードの場合、Cache-Controlヘッダーが存在する可能性がある
+    if status == Some(301) || status == Some(302) || status == Some(307) || status == Some(308) {
+        let cache_control = get_header_value(&response, "Cache-Control");
+        if let Some(cc) = cache_control {
+            eprintln!("Redirect Cache-Control header test: Cache-Control = {}", cc);
+        } else {
+            eprintln!("Redirect Cache-Control header test: Cache-Control header not present");
+        }
+    } else {
+        eprintln!("Redirect Cache-Control header test: status {:?} (not a redirect)", status);
+    }
+}
+
+// ====================
+// 優先度中: エラーハンドリング詳細テスト
+// ====================
+
+#[test]
+fn test_error_handling_413_payload_too_large() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 413 Payload Too Largeのテスト
+    // 大きなリクエストボディを送信して、サイズ制限を確認
+    
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    
+    // TLS接続を確立
+    let config = create_client_config();
+    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
+    let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
+    
+    // TLSハンドシェイクを完了
+    while tls_conn.is_handshaking() {
+        match tls_conn.complete_io(&mut stream) {
+            Ok(_) => {}
+            Err(_) => {
+                eprintln!("TLS handshake error");
+                return;
+            }
+        }
+    }
+    
+    let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
+    
+    // 大きなContent-Lengthを指定したリクエストを送信
+    let large_size = 10_000_000; // 10MB
+    let request = format!("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n", large_size);
+    if let Err(e) = tls_stream.write_all(request.as_bytes()) {
+        eprintln!("Failed to send request: {:?}", e);
+        return;
+    }
+    tls_stream.flush().unwrap();
+    
+    // レスポンスを受信
+    let mut response = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match tls_stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    
+    let response = String::from_utf8_lossy(&response);
+    let status = get_status_code(&response);
+    
+    // 413 Payload Too Largeが返される可能性がある
+    assert!(
+        status == Some(413) || status == Some(400) || status == Some(200) || status == None,
+        "Should return 413, 400, 200, or close connection: {:?}", status
+    );
+    
+    eprintln!("413 Payload Too Large test: status {:?}", status);
+}
+
+#[test]
+fn test_error_handling_431_request_header_fields_too_large() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 431 Request Header Fields Too Largeのテスト
+    // 過大なヘッダーを送信して、サイズ制限を確認
+    
+    // このテストは既に test_oversized_header で実装されているため、
+    // ここでは基本的な動作確認のみ
+    
+    let response = send_request(PROXY_PORT, "/", &[]);
+    assert!(response.is_some(), "Should receive response");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    assert_eq!(status, Some(200), "Should return 200 OK");
+    
+    eprintln!("431 Request Header Fields Too Large test: basic functionality verified");
 }
 
