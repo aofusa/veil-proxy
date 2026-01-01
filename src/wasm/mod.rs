@@ -48,6 +48,8 @@ pub use persistent_context::{
     take_all_pending_http_calls, take_pending_http_calls_for_module,
     deliver_http_call_response, get_context_stats, cleanup_old_contexts,
     PendingHttpCallWithContext, ContextStats,
+    // Global pending calls (for tick thread processing)
+    register_global_pending_call, take_global_pending_calls, get_global_pending_call_count, GlobalPendingCall,
 };
 
 

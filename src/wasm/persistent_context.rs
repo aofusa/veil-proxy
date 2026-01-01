@@ -262,6 +262,73 @@ pub struct ContextStats {
     pub contexts_with_pending_calls: usize,
 }
 
+// ============================================================================
+// Global Pending HTTP Call Registry
+// ============================================================================
+
+/// Global registry for pending HTTP calls (independent of context storage)
+/// This allows tick thread to pick up and execute pending calls
+static GLOBAL_PENDING_CALLS: Lazy<RwLock<Vec<GlobalPendingCall>>> =
+    Lazy::new(|| RwLock::new(Vec::new()));
+
+/// A globally registered pending HTTP call
+#[derive(Debug, Clone)]
+pub struct GlobalPendingCall {
+    /// Module name that initiated the call
+    pub module_name: String,
+    /// Call token
+    pub token: u32,
+    /// The pending call data
+    pub call: PendingHttpCall,
+}
+
+/// Register a pending HTTP call in the global registry
+/// 
+/// This is called from the host function when proxy_http_call is invoked.
+/// The call can then be picked up by the tick thread for async execution.
+pub fn register_global_pending_call(
+    module_name: &str,
+    token: u32,
+    call: PendingHttpCall,
+) {
+    if let Ok(mut registry) = GLOBAL_PENDING_CALLS.write() {
+        registry.push(GlobalPendingCall {
+            module_name: module_name.to_string(),
+            token,
+            call,
+        });
+        ftlog::debug!(
+            "[wasm:pending] Registered global pending call for '{}' token {}",
+            module_name,
+            token
+        );
+    }
+}
+
+/// Take all globally registered pending HTTP calls
+/// 
+/// Returns all pending calls and clears the global registry.
+pub fn take_global_pending_calls() -> Vec<GlobalPendingCall> {
+    if let Ok(mut registry) = GLOBAL_PENDING_CALLS.write() {
+        let calls = std::mem::take(&mut *registry);
+        if !calls.is_empty() {
+            ftlog::debug!("[wasm:pending] Took {} global pending calls", calls.len());
+        }
+        calls
+    } else {
+        Vec::new()
+    }
+}
+
+/// Get the number of pending HTTP calls in the global registry
+pub fn get_global_pending_call_count() -> usize {
+    if let Ok(registry) = GLOBAL_PENDING_CALLS.read() {
+        registry.len()
+    } else {
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

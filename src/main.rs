@@ -8118,6 +8118,42 @@ fn spawn_wasm_tick_thread() {
                 
                 // キュー通知処理（P4: Queue Notification Integration）
                 crate::wasm::process_pending_notifications(wasm_engine);
+                
+                // P3: Pending HTTP call processing
+                // Take all globally registered pending calls and log them
+                // Note: Full async execution would require HTTP client integration
+                let pending_calls = crate::wasm::take_global_pending_calls();
+                for pending in pending_calls {
+                    debug!(
+                        "[wasm:http_call] Processing pending call: module='{}' token={} upstream='{}' timeout={}ms",
+                        pending.module_name,
+                        pending.token,
+                        pending.call.upstream,
+                        pending.call.timeout_ms
+                    );
+                    
+                    // TODO: Execute HTTP call asynchronously using upstream_groups
+                    // For now, we log and simulate a timeout response
+                    // In a full implementation, this would:
+                    // 1. Look up the upstream in config.upstream_groups
+                    // 2. Make async HTTP request to backend
+                    // 3. Call wasm_engine.on_http_call_response() with result
+                    
+                    // Simulate response (for testing - remove in production)
+                    let response = crate::wasm::HttpCallResponse {
+                        status_code: 504,
+                        headers: vec![],
+                        body: b"HTTP call async execution not fully implemented".to_vec(),
+                        trailers: vec![],
+                    };
+                    
+                    // Deliver simulated response
+                    let _ = wasm_engine.on_http_call_response(
+                        &pending.module_name,
+                        pending.token,
+                        response,
+                    );
+                }
             }
         }
     });

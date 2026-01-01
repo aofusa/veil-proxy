@@ -180,23 +180,32 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             // Allocate token
             let state = caller.data_mut();
             let token = state.http_ctx.allocate_http_call_token();
+            let module_name = state.http_ctx.plugin_name.clone();
 
-            // Store pending call with full request data
-            state.http_ctx.pending_http_calls.insert(
+            // Create pending call
+            let pending_call = PendingHttpCall {
                 token,
-                PendingHttpCall {
-                    token,
-                    upstream: upstream.clone(),
-                    timeout_ms: timeout_ms as u32,
-                    headers: headers_data,
-                    body: body_data,
-                    trailers: trailers_data,
-                },
+                upstream: upstream.clone(),
+                timeout_ms: timeout_ms as u32,
+                headers: headers_data.clone(),
+                body: body_data.clone(),
+                trailers: trailers_data.clone(),
+            };
+
+            // Store pending call in local context
+            state.http_ctx.pending_http_calls.insert(token, pending_call.clone());
+            
+            // Also register in global registry for async processing
+            // This allows the tick thread to pick up and execute pending calls
+            crate::wasm::persistent_context::register_global_pending_call(
+                &module_name,
+                token,
+                pending_call,
             );
 
             ftlog::debug!(
-                "[wasm:{}] HTTP call dispatched to '{}' with token {}",
-                state.http_ctx.plugin_name,
+                "[wasm:{}] HTTP call dispatched to '{}' with token {} (registered globally)",
+                module_name,
                 upstream,
                 token
             );
