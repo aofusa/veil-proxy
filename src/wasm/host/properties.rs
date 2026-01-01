@@ -50,9 +50,11 @@ fn get_property_value(state: &HostState, path: &str) -> Option<Vec<u8>> {
         "plugin_name" => Some(state.http_ctx.plugin_name.as_bytes().to_vec()),
         "plugin_root_id" => Some(state.http_ctx.root_context_id.to_string().into_bytes()),
 
-        _ => None,
+        // Check custom_properties for user-defined properties
+        _ => state.http_ctx.custom_properties.get(path).cloned(),
     }
 }
+
 
 /// Helper to allocate memory in WASM
 fn allocate_wasm_memory(caller: &mut Caller<'_, HostState>, size: usize) -> Option<i32> {

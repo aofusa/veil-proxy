@@ -707,7 +707,47 @@ mod host_function_tests {
         assert!(caps.is_upstream_allowed("auth"));
         assert!(!caps.is_upstream_allowed("other_backend"));
     }
+
+    /// Test custom properties storage and retrieval
+    #[test]
+    fn test_custom_properties() {
+        let caps = ModuleCapabilities {
+            allow_property_write: true,
+            ..Default::default()
+        };
+        let mut ctx = HttpContext::new(1, caps);
+        
+        // Initially empty
+        assert!(ctx.custom_properties.is_empty());
+        
+        // Add a custom property
+        ctx.custom_properties.insert("my.custom.property".to_string(), b"test_value".to_vec());
+        
+        // Verify it's stored
+        assert_eq!(ctx.custom_properties.len(), 1);
+        assert_eq!(
+            ctx.custom_properties.get("my.custom.property"),
+            Some(&b"test_value".to_vec())
+        );
+    }
+    
+    /// Test multiple custom properties
+    #[test]
+    fn test_multiple_custom_properties() {
+        let caps = ModuleCapabilities {
+            allow_property_write: true,
+            ..Default::default()
+        };
+        let mut ctx = HttpContext::new(1, caps);
+        
+        ctx.custom_properties.insert("filter.state.key1".to_string(), b"value1".to_vec());
+        ctx.custom_properties.insert("filter.state.key2".to_string(), b"value2".to_vec());
+        ctx.custom_properties.insert("metadata.key3".to_string(), b"value3".to_vec());
+        
+        assert_eq!(ctx.custom_properties.len(), 3);
+    }
 }
+
 
 // P1: Lifecycle callback tests
 mod lifecycle_callback_tests {
