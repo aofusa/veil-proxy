@@ -140,6 +140,85 @@ pub fn on_queue_ready(
     engine.on_queue_ready(module_name, queue_id);
 }
 
+/// Process all pending HTTP calls from stored contexts
+/// 
+/// This function takes pending HTTP calls from the persistent context registry,
+/// executes them, and delivers the results back to the originating contexts.
+/// 
+/// # Arguments
+/// * `engine` - The WASM filter engine
+/// * `http_executor` - Function to execute HTTP requests
+/// 
+/// # Returns
+/// Number of HTTP calls processed
+pub fn process_pending_http_calls<F>(
+    engine: &Arc<FilterEngine>,
+    http_executor: F,
+) -> usize
+where
+    F: Fn(&super::persistent_context::PendingHttpCallWithContext) -> Option<HttpCallResponse>,
+{
+    use super::persistent_context::{take_all_pending_http_calls, deliver_http_call_response, take_context};
+    
+    let pending_calls = take_all_pending_http_calls();
+    let count = pending_calls.len();
+    
+    for pending in pending_calls {
+        // Execute the HTTP call
+        if let Some(response) = http_executor(&pending) {
+            // Deliver response to context
+            deliver_http_call_response(pending.context_id, pending.token, response.clone());
+            
+            // Take the context and call on_http_call_response
+            if let Some(stored) = take_context(pending.context_id) {
+                engine.on_http_call_response(
+                    &pending.module_name,
+                    pending.token,
+                    response,
+                );
+            }
+        }
+    }
+    
+    count
+}
+
+/// Resume a context after HTTP call completes
+/// 
+/// This should be called after an async HTTP call completes to resume
+/// the WASM module's execution.
+/// 
+/// # Arguments
+/// * `engine` - The WASM filter engine
+/// * `context_id` - The stored context ID
+/// * `token` - The HTTP call token
+/// * `response` - The HTTP call response
+pub fn resume_after_http_call(
+    engine: &Arc<FilterEngine>,
+    context_id: u64,
+    token: u32,
+    response: HttpCallResponse,
+) -> bool {
+    use super::persistent_context::{deliver_http_call_response, take_context};
+    
+    // First deliver the response to the context
+    if !deliver_http_call_response(context_id, token, response.clone()) {
+        return false;
+    }
+    
+    // Then take the context and invoke the callback
+    if let Some(stored) = take_context(context_id) {
+        engine.on_http_call_response(
+            &stored.module_name,
+            token,
+            response,
+        );
+        true
+    } else {
+        false
+    }
+}
+
 #[cfg(test)]
 mod integration_tests {
     use super::*;
