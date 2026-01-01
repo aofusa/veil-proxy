@@ -649,6 +649,14 @@ health_check() {
         return 1
     fi
     
+    # H2Cバックエンド (HTTPS - H2Cテスト用)
+    if wait_for_server "https://127.0.0.1:${BACKEND_H2C_PORT}/health" "H2C Backend" 30; then
+        log_info "H2C Backend: OK"
+    else
+        log_error "H2C Backend: FAILED"
+        return 1
+    fi
+    
     # プロキシ（HTTPポート - リダイレクト無効なのでHTTPで接続可能）
     if wait_for_server "http://127.0.0.1:${PROXY_HTTP_PORT}/__metrics" "Proxy HTTP" 30; then
         log_info "Proxy HTTP: OK"
