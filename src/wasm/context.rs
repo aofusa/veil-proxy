@@ -97,6 +97,17 @@ pub struct HttpContext {
     // === Timer ===
     /// Tick period in milliseconds (0 = disabled)
     pub tick_period_ms: u32,
+
+    // === gRPC Calls (feature = "grpc") ===
+    /// Pending gRPC calls (call_id -> (path, message, timeout_ms))
+    #[cfg(feature = "grpc")]
+    pub pending_grpc_calls: HashMap<u32, (String, Vec<u8>, u32)>,
+    /// Next gRPC call ID
+    #[cfg(feature = "grpc")]
+    pub next_grpc_call_id: u32,
+    /// Cancelled gRPC call IDs
+    #[cfg(feature = "grpc")]
+    pub cancelled_grpc_calls: std::collections::HashSet<u32>,
 }
 
 impl HttpContext {
@@ -136,6 +147,12 @@ impl HttpContext {
             shared_data_cas: 1,
             capabilities,
             tick_period_ms: 0,
+            #[cfg(feature = "grpc")]
+            pending_grpc_calls: HashMap::new(),
+            #[cfg(feature = "grpc")]
+            next_grpc_call_id: 1,
+            #[cfg(feature = "grpc")]
+            cancelled_grpc_calls: std::collections::HashSet::new(),
         }
     }
 
@@ -203,6 +220,37 @@ impl HttpContext {
     /// Check if local response should be sent
     pub fn should_send_local_response(&self) -> bool {
         self.local_response.is_some()
+    }
+
+    /// Get next gRPC call ID
+    #[cfg(feature = "grpc")]
+    pub fn next_grpc_call_id(&mut self) -> u32 {
+        let id = self.next_grpc_call_id;
+        self.next_grpc_call_id += 1;
+        id
+    }
+
+    /// Register a pending gRPC call
+    #[cfg(feature = "grpc")]
+    pub fn register_grpc_call(&mut self, call_id: u32, path: String, message: Vec<u8>, timeout_ms: u32) {
+        self.pending_grpc_calls.insert(call_id, (path, message, timeout_ms));
+    }
+
+    /// Cancel a gRPC call
+    #[cfg(feature = "grpc")]
+    pub fn cancel_grpc_call(&mut self, call_id: u32) -> bool {
+        if self.pending_grpc_calls.remove(&call_id).is_some() {
+            self.cancelled_grpc_calls.insert(call_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Take pending gRPC calls for execution
+    #[cfg(feature = "grpc")]
+    pub fn take_pending_grpc_calls(&mut self) -> HashMap<u32, (String, Vec<u8>, u32)> {
+        std::mem::take(&mut self.pending_grpc_calls)
     }
 }
 

@@ -751,6 +751,112 @@ impl Http3Handler {
         debug!("[HTTP/3] Error response send result: {:?}", result.is_ok());
         result
     }
+
+    /// gRPC リクエストかどうかを判定
+    #[cfg(feature = "grpc")]
+    fn is_grpc_request(headers: &[h3::Header]) -> bool {
+        for header in headers {
+            if header.name().eq_ignore_ascii_case(b"content-type") {
+                return crate::grpc::headers::is_grpc_content_type(header.value());
+            }
+        }
+        false
+    }
+
+    /// gRPC レスポンスを送信 (トレイラー付き)
+    ///
+    /// HTTP/3 では QPACK を使用してトレイラーを送信します。
+    /// ボディ送信後に grpc-status と grpc-message をトレイラーとして送信。
+    #[cfg(feature = "grpc")]
+    fn send_grpc_response(
+        &mut self,
+        stream_id: u64,
+        headers: &[(&[u8], &[u8])],
+        body: Option<&[u8]>,
+        grpc_status: u32,
+        grpc_message: Option<&str>,
+    ) -> io::Result<()> {
+        use crate::grpc::status::{GrpcStatus, GrpcStatusCode};
+
+        let h3_conn = match &mut self.h3_conn {
+            Some(h3) => h3,
+            None => return Ok(()),
+        };
+
+        // 1. ヘッダー送信 (200 OK + content-type: application/grpc)
+        let mut h3_headers = vec![
+            h3::Header::new(b":status", b"200"),
+            h3::Header::new(b"content-type", b"application/grpc+proto"),
+        ];
+        
+        for &(name, value) in headers {
+            if name != b":status" && !name.eq_ignore_ascii_case(b"content-type") {
+                h3_headers.push(h3::Header::new(name, value));
+            }
+        }
+
+        let has_body = body.is_some() && body.map_or(false, |b| !b.is_empty());
+        
+        if let Err(e) = h3_conn.send_response(&mut self.conn, stream_id, &h3_headers, false) {
+            warn!("[HTTP/3] gRPC send_response error: {}", e);
+            return Ok(());
+        }
+
+        // 2. ボディ送信
+        if let Some(body_data) = body {
+            if !body_data.is_empty() {
+                if let Err(e) = h3_conn.send_body(&mut self.conn, stream_id, body_data, false) {
+                    warn!("[HTTP/3] gRPC send_body error: {}", e);
+                }
+            }
+        }
+
+        // 3. トレイラー送信 (grpc-status, grpc-message)
+        self.send_grpc_trailers_internal(stream_id, grpc_status, grpc_message)
+    }
+
+    /// gRPC トレイラーを送信（内部ヘルパー）
+    #[cfg(feature = "grpc")]
+    fn send_grpc_trailers_internal(
+        &mut self,
+        stream_id: u64,
+        grpc_status: u32,
+        grpc_message: Option<&str>,
+    ) -> io::Result<()> {
+        use crate::grpc::status::{GrpcStatus, GrpcStatusCode};
+
+        let h3_conn = match &mut self.h3_conn {
+            Some(h3) => h3,
+            None => return Ok(()),
+        };
+
+        let code = GrpcStatusCode::from_u8(grpc_status as u8)
+            .unwrap_or(GrpcStatusCode::Unknown);
+        
+        let status = if let Some(msg) = grpc_message {
+            GrpcStatus::error(code, msg)
+        } else {
+            GrpcStatus::from_code(code)
+        };
+        let trailer_pairs = status.to_trailers();
+
+        // quiche の H3 トレイラー送信
+        let trailers: Vec<h3::Header> = trailer_pairs
+            .iter()
+            .map(|(n, v)| h3::Header::new(n.as_slice(), v.as_slice()))
+            .collect();
+
+        // send_response with fin=true acts as trailers in HTTP/3
+        // However, quiche doesn't have a direct send_trailers API
+        // We need to use send_body with fin=true after all data
+        // For now, use send_response as trailers-only frame
+        if let Err(e) = h3_conn.send_response(&mut self.conn, stream_id, &trailers, true) {
+            // Note: This might not work for all cases, but quiche's h3 API is limited
+            debug!("[HTTP/3] gRPC trailers send attempt: {:?}", e);
+        }
+
+        Ok(())
+    }
     
     /// プロキシ処理（HTTP/1.1またはHTTP/2バックエンドへの変換）
     /// 

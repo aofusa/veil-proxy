@@ -447,3 +447,198 @@ pub struct H2cResponse {
     /// レスポンスボディ
     pub body: Vec<u8>,
 }
+
+/// H2C gRPC レスポンス
+#[cfg(feature = "grpc")]
+pub struct H2cGrpcResponse {
+    /// HTTP ステータスコード (通常 200)
+    pub http_status: u16,
+    /// gRPC ステータスコード (from grpc-status trailer)
+    pub grpc_status: u32,
+    /// gRPC エラーメッセージ (from grpc-message trailer)
+    pub grpc_message: Option<String>,
+    /// レスポンスヘッダー
+    pub headers: Vec<(Vec<u8>, Vec<u8>)>,
+    /// レスポンスボディ (gRPC framed)
+    pub body: Vec<u8>,
+    /// トレイラー
+    pub trailers: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+#[cfg(feature = "grpc")]
+impl<S> H2cClient<S>
+where
+    S: AsyncReadRent + AsyncWriteRentExt + Unpin,
+{
+    /// gRPC リクエストを送信してレスポンスを受信
+    ///
+    /// # 引数
+    /// * `service_method` - gRPC サービス/メソッドパス (e.g., "/package.Service/Method")
+    /// * `authority` - ホスト名
+    /// * `message` - gRPC メッセージ（未フレーム化）
+    /// * `timeout` - タイムアウト（オプション）
+    pub async fn send_grpc_request(
+        &mut self,
+        service_method: &[u8],
+        authority: &[u8],
+        message: &[u8],
+        timeout: Option<std::time::Duration>,
+    ) -> Http2Result<H2cGrpcResponse> {
+        use crate::grpc::framing::GrpcFrame;
+        use crate::grpc::headers::format_grpc_timeout;
+
+
+        let stream_id = self.next_stream_id;
+        self.next_stream_id += 2;
+
+        // gRPC メッセージをフレーム化 (5-byte header + message)
+        let framed_message = GrpcFrame::new(message.to_vec()).encode();
+
+        // ヘッダーリストを構築
+        let mut header_list: Vec<(&[u8], &[u8], bool)> = Vec::with_capacity(8);
+        header_list.push((b":method", b"POST", false));
+        header_list.push((b":path", service_method, false));
+        header_list.push((b":scheme", b"http", false));
+        header_list.push((b":authority", authority, false));
+        header_list.push((b"content-type", b"application/grpc+proto", false));
+        header_list.push((b"te", b"trailers", false));
+
+        // タイムアウトヘッダー
+        let timeout_str;
+        if let Some(t) = timeout {
+            timeout_str = format_grpc_timeout(t);
+            header_list.push((b"grpc-timeout", timeout_str.as_bytes(), false));
+        }
+
+        let header_block = self.hpack_encoder.encode(&header_list)
+            .map_err(|e| Http2Error::HpackEncode(e.to_string()))?;
+
+        // HEADERS フレームを送信 (end_stream=false, body follows)
+        let headers_frame = self.frame_encoder.encode_headers(
+            stream_id,
+            &header_block,
+            false,
+            true,
+            None,
+        );
+        self.write_all(&headers_frame).await?;
+
+        // DATA フレームを送信 (end_stream=true)
+        self.send_data(stream_id, &framed_message, true).await?;
+
+        // gRPC レスポンスを受信
+        self.receive_grpc_response(stream_id).await
+    }
+
+    /// gRPC レスポンスを受信
+    async fn receive_grpc_response(&mut self, stream_id: u32) -> Http2Result<H2cGrpcResponse> {
+        use crate::grpc::status::GrpcStatus;
+
+        let mut response = H2cGrpcResponse {
+            http_status: 0,
+            grpc_status: 0,
+            grpc_message: None,
+            headers: Vec::new(),
+            body: Vec::new(),
+            trailers: Vec::new(),
+        };
+
+        let mut headers_received = false;
+
+        loop {
+            let frame = self.read_frame().await?;
+
+            match frame {
+                Frame::Headers { stream_id: sid, end_stream, end_headers: _, header_block, .. } => {
+                    if sid != stream_id {
+                        continue;
+                    }
+
+                    let headers = self.hpack_decoder.decode(&header_block)
+                        .map_err(|e| Http2Error::compression_error(e.to_string()))?;
+
+                    if !headers_received {
+                        // Initial headers
+                        headers_received = true;
+                        for header in headers {
+                            if header.name == b":status" {
+                                if let Ok(s) = std::str::from_utf8(&header.value) {
+                                    response.http_status = s.parse().unwrap_or(0);
+                                }
+                            } else if !header.name.starts_with(b":") {
+                                response.headers.push((header.name, header.value));
+                            }
+                        }
+                    } else {
+                        // Trailers (second HEADERS frame)
+                        for header in headers {
+                            if header.name == b"grpc-status" {
+                                if let Ok(s) = std::str::from_utf8(&header.value) {
+                                    response.grpc_status = s.parse().unwrap_or(2); // Unknown
+                                }
+                            } else if header.name == b"grpc-message" {
+                                response.grpc_message = GrpcStatus::decode_message(&header.value);
+                            } else {
+                                response.trailers.push((header.name, header.value));
+                            }
+                        }
+                    }
+
+                    if end_stream {
+                        return Ok(response);
+                    }
+                }
+                Frame::Data { stream_id: sid, end_stream, data } => {
+                    if sid != stream_id {
+                        continue;
+                    }
+
+                    response.body.extend_from_slice(&data);
+
+                    // フロー制御
+                    let data_len = data.len() as i32;
+                    self.conn_recv_window -= data_len;
+
+                    if self.conn_recv_window < (defaults::CONNECTION_WINDOW_SIZE as i32 / 2) {
+                        let increment = defaults::CONNECTION_WINDOW_SIZE as i32 - self.conn_recv_window;
+                        let wu_frame = self.frame_encoder.encode_window_update(0, increment as u32);
+                        self.write_all(&wu_frame).await?;
+                        self.conn_recv_window += increment;
+
+                        let wu_stream = self.frame_encoder.encode_window_update(stream_id, increment as u32);
+                        self.write_all(&wu_stream).await?;
+                    }
+
+                    if end_stream {
+                        return Ok(response);
+                    }
+                }
+                Frame::WindowUpdate { .. } => {}
+                Frame::Ping { ack: false, data } => {
+                    let ping_ack = self.frame_encoder.encode_ping(&data, true);
+                    self.write_all(&ping_ack).await?;
+                }
+                Frame::Settings { ack: false, settings } => {
+                    for &(id, value) in &settings {
+                        match id {
+                            0x4 => self.remote_settings.initial_window_size = value,
+                            0x5 => self.remote_settings.max_frame_size = value,
+                            _ => {}
+                        }
+                    }
+                    let ack_frame = self.frame_encoder.encode_settings_ack();
+                    self.write_all(&ack_frame).await?;
+                }
+                Frame::GoAway { .. } => {
+                    return Err(Http2Error::ConnectionClosed);
+                }
+                Frame::RstStream { stream_id: sid, error_code } => {
+                    if sid == stream_id {
+                        return Err(Http2Error::stream_closed(stream_id, error_code));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
