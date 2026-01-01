@@ -233,7 +233,7 @@ servers = [{backends}]
 [[route]]
 [route.conditions]
 host = "localhost"
-path = "/"
+path = "/*"
 [route.action]
 type = "Upstream"
 upstream = "backend"
@@ -244,7 +244,7 @@ remove_response_headers = ["Server"]
 [[route]]
 [route.conditions]
 host = "127.0.0.1"
-path = "/"
+path = "/*"
 [route.action]
 type = "Upstream"
 upstream = "backend"
