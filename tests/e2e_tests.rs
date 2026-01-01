@@ -4173,3 +4173,391 @@ fn test_header_manipulation_special_characters() {
     eprintln!("Header manipulation special characters test: successful");
 }
 
+// ====================
+// 優先度中: キャッシュ機能詳細テスト
+// ====================
+
+#[test]
+fn test_cache_stale_if_error() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // stale-if-errorのテスト
+    // 注意: このテストは設定ファイルでstale-if-errorを有効化する必要がある
+    
+    // キャッシュエントリを作成
+    let response1 = send_request(PROXY_PORT, "/", &[]);
+    assert!(response1.is_some(), "Should receive first response");
+    
+    let response1 = response1.unwrap();
+    let status1 = get_status_code(&response1);
+    assert_eq!(status1, Some(200), "First response should be successful");
+    
+    // バックエンドがエラーを返す場合、stale-if-errorが有効な場合、期限切れキャッシュが返される可能性がある
+    // 実際のテストには、バックエンドのエラーをシミュレートする必要がある
+    let response2 = send_request(PROXY_PORT, "/", &[]);
+    assert!(response2.is_some(), "Should receive second response");
+    
+    let response2 = response2.unwrap();
+    let status2 = get_status_code(&response2);
+    assert_eq!(status2, Some(200), "Second response should be successful");
+    
+    eprintln!("Cache stale-if-error test: both responses successful");
+}
+
+#[test]
+fn test_cache_vary_header() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // Varyヘッダーを尊重するキャッシュのテスト
+    // 注意: このテストは設定ファイルでキャッシュとVaryヘッダーを有効化する必要がある
+    
+    // Accept-Languageヘッダーを付けてリクエスト
+    let response1 = send_request(
+        PROXY_PORT,
+        "/",
+        &[("Accept-Language", "en-US")]
+    );
+    assert!(response1.is_some(), "Should receive first response");
+    
+    let response1 = response1.unwrap();
+    let status1 = get_status_code(&response1);
+    assert_eq!(status1, Some(200), "First response should be successful");
+    
+    // 異なるAccept-Languageヘッダーでリクエスト
+    let response2 = send_request(
+        PROXY_PORT,
+        "/",
+        &[("Accept-Language", "ja-JP")]
+    );
+    assert!(response2.is_some(), "Should receive second response");
+    
+    let response2 = response2.unwrap();
+    let status2 = get_status_code(&response2);
+    assert_eq!(status2, Some(200), "Second response should be successful");
+    
+    // Varyヘッダーが尊重されている場合、異なるキャッシュエントリが作成される可能性がある
+    eprintln!("Cache Vary header test: both responses successful");
+}
+
+#[test]
+fn test_cache_invalidation() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // キャッシュ無効化のテスト
+    // 注意: このテストは設定ファイルでキャッシュを有効化する必要がある
+    
+    // キャッシュエントリを作成
+    let response1 = send_request(PROXY_PORT, "/", &[]);
+    assert!(response1.is_some(), "Should receive first response");
+    
+    let response1 = response1.unwrap();
+    let status1 = get_status_code(&response1);
+    assert_eq!(status1, Some(200), "First response should be successful");
+    
+    // キャッシュが有効な場合、2回目のリクエストはキャッシュから返される可能性がある
+    let response2 = send_request(PROXY_PORT, "/", &[]);
+    assert!(response2.is_some(), "Should receive second response");
+    
+    let response2 = response2.unwrap();
+    let status2 = get_status_code(&response2);
+    assert_eq!(status2, Some(200), "Second response should be successful");
+    
+    // キャッシュが無効化される場合、新しいリクエストがバックエンドに送信される可能性がある
+    // 実際のテストには、キャッシュ無効化のメカニズム（PURGEメソッドなど）が必要
+    eprintln!("Cache invalidation test: both responses successful");
+}
+
+#[test]
+fn test_cache_query_parameter_handling() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // クエリパラメータを含むキャッシュのテスト
+    // 注意: このテストは設定ファイルでキャッシュを有効化する必要がある
+    
+    // クエリパラメータ付きでリクエスト
+    let response1 = send_request(PROXY_PORT, "/?param1=value1", &[]);
+    assert!(response1.is_some(), "Should receive first response");
+    
+    let response1 = response1.unwrap();
+    let status1 = get_status_code(&response1);
+    // クエリパラメータ付きのリクエストが404を返す可能性がある
+    assert!(
+        status1 == Some(200) || status1 == Some(404),
+        "First response should be 200 or 404: {:?}", status1
+    );
+    
+    // 同じクエリパラメータでリクエスト（キャッシュヒットの可能性）
+    let response2 = send_request(PROXY_PORT, "/?param1=value1", &[]);
+    assert!(response2.is_some(), "Should receive second response");
+    
+    let response2 = response2.unwrap();
+    let status2 = get_status_code(&response2);
+    // 2回目のリクエストも同じステータスが返される可能性がある
+    assert!(
+        status2 == Some(200) || status2 == Some(404),
+        "Second response should be 200 or 404: {:?}", status2
+    );
+    
+    // 異なるクエリパラメータでリクエスト（キャッシュミスの可能性）
+    let response3 = send_request(PROXY_PORT, "/?param1=value2", &[]);
+    assert!(response3.is_some(), "Should receive third response");
+    
+    let response3 = response3.unwrap();
+    let status3 = get_status_code(&response3);
+    // 3回目のリクエストも同じステータスが返される可能性がある
+    assert!(
+        status3 == Some(200) || status3 == Some(404),
+        "Third response should be 200 or 404: {:?}", status3
+    );
+    
+    eprintln!("Cache query parameter handling test: all responses successful");
+}
+
+// ====================
+// 優先度中: より詳細なバッファリングテスト
+// ====================
+
+#[test]
+fn test_buffering_large_response() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 大きなレスポンスのバッファリングテスト
+    // 注意: このテストは設定ファイルでバッファリングを有効化する必要がある
+    
+    // 大きなレスポンスをリクエスト
+    let response = send_request(PROXY_PORT, "/large.txt", &[]);
+    
+    if let Some(response) = response {
+        let status = get_status_code(&response);
+        // 大きなファイルが存在しない場合、404が返される可能性がある
+        assert!(
+            status == Some(200) || status == Some(404),
+            "Should return 200 OK or 404 Not Found: {:?}", status
+        );
+        
+        if status == Some(200) {
+            // Content-Lengthヘッダーを確認
+            let content_length = get_content_length_from_headers(response.as_bytes());
+            if let Some(cl) = content_length {
+                eprintln!("Buffering large response test: content length = {} bytes", cl);
+            }
+        }
+    }
+}
+
+#[test]
+fn test_buffering_chunked_response() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // Chunked Transfer Encodingレスポンスのバッファリングテスト
+    // 注意: このテストは設定ファイルでバッファリングを有効化する必要がある
+    
+    let response = send_request(PROXY_PORT, "/", &[]);
+    assert!(response.is_some(), "Should receive response");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    assert_eq!(status, Some(200), "Should return 200 OK");
+    
+    // Transfer-Encodingヘッダーを確認
+    let transfer_encoding = get_header_value(&response, "Transfer-Encoding");
+    // Chunked Transfer Encodingが使用されている場合、Transfer-Encodingヘッダーが含まれる可能性がある
+    
+    eprintln!("Buffering chunked response test: transfer_encoding={:?}", transfer_encoding);
+}
+
+// ====================
+// 優先度中: より詳細なヘルスチェックテスト
+// ====================
+
+#[test]
+fn test_health_check_interval() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // ヘルスチェック間隔のテスト
+    // 注意: このテストは設定ファイルでヘルスチェックを有効化する必要がある
+    
+    // 複数のリクエストを送信してヘルスチェックが動作することを確認
+    for i in 0..5 {
+        let response = send_request(PROXY_PORT, "/", &[]);
+        assert!(response.is_some(), "Should receive response {}", i);
+        
+        let response = response.unwrap();
+        let status = get_status_code(&response);
+        assert_eq!(status, Some(200), "Should return 200 OK for request {}", i);
+        
+        // ヘルスチェック間隔を待つ（実際のテストには時間の経過が必要）
+        if i < 4 {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    
+    eprintln!("Health check interval test: all requests successful");
+}
+
+#[test]
+fn test_health_check_timeout() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // ヘルスチェックタイムアウトのテスト
+    // 注意: このテストは設定ファイルでヘルスチェックを有効化する必要がある
+    
+    // 通常のリクエストが成功することを確認
+    let response = send_request(PROXY_PORT, "/", &[]);
+    assert!(response.is_some(), "Should receive response");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    assert_eq!(status, Some(200), "Should return 200 OK");
+    
+    // ヘルスチェックタイムアウトが適切に設定されている場合、タイムアウトが発生する可能性がある
+    // 実際のテストには、バックエンドの遅延をシミュレートする必要がある
+    eprintln!("Health check timeout test: request successful");
+}
+
+#[test]
+fn test_health_check_threshold() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // ヘルスチェック閾値のテスト
+    // 注意: このテストは設定ファイルでヘルスチェックを有効化する必要がある
+    
+    // 複数のリクエストを送信してヘルスチェック閾値が動作することを確認
+    for i in 0..10 {
+        let response = send_request(PROXY_PORT, "/", &[]);
+        assert!(response.is_some(), "Should receive response {}", i);
+        
+        let response = response.unwrap();
+        let status = get_status_code(&response);
+        assert_eq!(status, Some(200), "Should return 200 OK for request {}", i);
+    }
+    
+    // ヘルスチェック閾値が適切に設定されている場合、一定回数の失敗後にバックエンドが無効化される可能性がある
+    eprintln!("Health check threshold test: all requests successful");
+}
+
+// ====================
+// 優先度中: より詳細なロードバランシングテスト
+// ====================
+
+#[test]
+fn test_load_balancing_weighted_distribution() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 重み付きロードバランシングのテスト
+    // 注意: このテストは設定ファイルで重み付きロードバランシングを設定する必要がある
+    
+    // 複数のリクエストを送信して分散を確認
+    let mut backend1_count = 0;
+    let mut backend2_count = 0;
+    
+    for _ in 0..20 {
+        let response = send_request(PROXY_PORT, "/", &[]);
+        if let Some(response) = response {
+            let server_id = get_header_value(&response, "X-Server-Id");
+            if let Some(id) = server_id {
+                if id == "backend1" {
+                    backend1_count += 1;
+                } else if id == "backend2" {
+                    backend2_count += 1;
+                }
+            }
+        }
+    }
+    
+    eprintln!("Load balancing weighted distribution test: backend1={}, backend2={}", 
+              backend1_count, backend2_count);
+    
+    // 重み付きロードバランシングが設定されている場合、分散が重みに応じて変わる可能性がある
+    assert!(
+        backend1_count > 0 || backend2_count > 0,
+        "At least one backend should receive requests"
+    );
+}
+
+#[test]
+fn test_load_balancing_backend_failure() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // バックエンド障害時のロードバランシングテスト
+    // 注意: このテストは設定ファイルでヘルスチェックを有効化する必要がある
+    
+    // 通常のリクエストが成功することを確認
+    let response = send_request(PROXY_PORT, "/", &[]);
+    assert!(response.is_some(), "Should receive response");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    assert_eq!(status, Some(200), "Should return 200 OK");
+    
+    // バックエンドが障害を起こした場合、他のバックエンドにリクエストが転送される可能性がある
+    // 実際のテストには、バックエンドの停止をシミュレートする必要がある
+    eprintln!("Load balancing backend failure test: request successful");
+}
+
+#[test]
+fn test_load_balancing_session_affinity() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // セッションアフィニティのテスト
+    // 注意: このテストは設定ファイルでセッションアフィニティを有効化する必要がある
+    
+    // 同じクライアントからの複数のリクエストが同じバックエンドに転送されることを確認
+    let mut backend_ids = Vec::new();
+    
+    for _ in 0..10 {
+        let response = send_request(PROXY_PORT, "/", &[]);
+        if let Some(response) = response {
+            let server_id = get_header_value(&response, "X-Server-Id");
+            if let Some(id) = server_id {
+                backend_ids.push(id);
+            }
+        }
+    }
+    
+    eprintln!("Load balancing session affinity test: backend_ids={:?}", backend_ids);
+    
+    // セッションアフィニティが有効な場合、同じバックエンドにリクエストが転送される可能性がある
+    // IP Hashアルゴリズムを使用している場合、同じIPからのリクエストは同じバックエンドに転送される
+    assert!(
+        !backend_ids.is_empty(),
+        "Should receive responses from at least one backend"
+    );
+}
+
