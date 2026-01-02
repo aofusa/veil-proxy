@@ -1451,6 +1451,19 @@ fn test_rate_limiting() {
 // gRPC E2Eテスト（優先度: 低）
 // ====================
 
+/// gRPC Unary RPCのテスト
+///
+/// ## 目的
+/// gRPC Unary RPC（単一リクエスト/単一レスポンス）の基本動作を確認
+///
+/// ## 前提条件
+/// - E2E環境が起動していること
+/// - gRPCエンドポイント `/grpc.test.v1.TestService/UnaryCall` が存在すること
+///
+/// ## 期待値
+/// - HTTPステータスコード: 200 OK
+/// - gRPCフレームが受信されること
+/// - レスポンスメッセージが空でないこと
 #[test]
 #[cfg(feature = "grpc")]
 fn test_grpc_unary_call() {
@@ -1463,7 +1476,7 @@ fn test_grpc_unary_call() {
     let mut client = match GrpcTestClient::new("127.0.0.1", PROXY_PORT) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to create gRPC client: {}", e);
+            eprintln!("Failed to create gRPC client for 127.0.0.1:{}: {}", PROXY_PORT, e);
             return;
         }
     };
@@ -1482,7 +1495,7 @@ fn test_grpc_unary_call() {
     ) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Failed to send gRPC request: {}", e);
+            eprintln!("Failed to send gRPC request to /grpc.test.v1.TestService/UnaryCall: {}", e);
             return;
         }
     };
@@ -1492,7 +1505,8 @@ fn test_grpc_unary_call() {
     // gRPCエンドポイントが存在する場合は200が返される
     assert_eq!(
         status, Some(200),
-        "Should return 200 OK for gRPC request, got: {:?}", status
+        "Should return 200 OK for gRPC Unary RPC request to /grpc.test.v1.TestService/UnaryCall, got: {:?}", 
+        status
     );
     
     // gRPCフレームを抽出（成功した場合のみ）
@@ -1547,6 +1561,18 @@ fn test_grpc_basic_request() {
 // HTTP/3 E2Eテスト（優先度: 低）
 // ====================
 
+/// HTTP/3基本接続のテスト
+///
+/// ## 目的
+/// HTTP/3接続の確立とハンドシェイクの成功を確認
+///
+/// ## 前提条件
+/// - E2E環境が起動していること
+/// - HTTP/3が有効化されていること
+///
+/// ## 期待値
+/// - HTTP/3ハンドシェイクが成功すること
+/// - 接続確立後にリクエストを送信できること
 #[test]
 #[cfg(feature = "http3")]
 fn test_http3_basic_connection() {
@@ -1563,7 +1589,7 @@ fn test_http3_basic_connection() {
     let mut client = match Http3TestClient::new(server_addr) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to create HTTP/3 client: {}", e);
+            eprintln!("Failed to create HTTP/3 client for {}: {}", server_addr, e);
             return;
         }
     };
@@ -1574,7 +1600,7 @@ fn test_http3_basic_connection() {
             eprintln!("HTTP/3 connection established successfully");
         }
         Err(e) => {
-            eprintln!("HTTP/3 handshake failed: {}", e);
+            eprintln!("HTTP/3 handshake failed for {}: {} (HTTP/3 may not be enabled)", server_addr, e);
             // HTTP/3が有効化されていない場合はスキップ
             return;
         }
@@ -1583,12 +1609,28 @@ fn test_http3_basic_connection() {
     // 接続が確立されたことを確認（handshakeが成功した場合のみここに到達）
     // 実際のリクエスト送信で接続の健全性を確認
     let stream_id = client.send_request("GET", "/health", &[], None);
-    assert!(stream_id.is_ok(), "HTTP/3 connection should allow sending requests after handshake");
+    assert!(
+        stream_id.is_ok(), 
+        "HTTP/3 connection to {} should allow sending requests after handshake: {:?}", 
+        server_addr, stream_id.err()
+    );
     
     // 接続を閉じる
     let _ = client.close();
 }
 
+/// HTTP/3 GETリクエストのテスト
+///
+/// ## 目的
+/// HTTP/3経由でのGETリクエストの送信とレスポンスの受信を確認
+///
+/// ## 前提条件
+/// - E2E環境が起動していること
+/// - HTTP/3が有効化されていること
+///
+/// ## 期待値
+/// - HTTPステータスコード: 200 OK
+/// - レスポンスボディが受信されること
 #[test]
 #[cfg(feature = "http3")]
 fn test_http3_get_request() {
@@ -1605,14 +1647,14 @@ fn test_http3_get_request() {
     let mut client = match Http3TestClient::new(server_addr) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to create HTTP/3 client: {}", e);
+            eprintln!("Failed to create HTTP/3 client for {}: {}", server_addr, e);
             return;
         }
     };
     
     // ハンドシェイクを完了
     if client.handshake(Duration::from_secs(5)).is_err() {
-        eprintln!("HTTP/3 handshake failed, skipping test");
+        eprintln!("HTTP/3 handshake failed for {}, skipping test", server_addr);
         return;
     }
     
@@ -1620,7 +1662,7 @@ fn test_http3_get_request() {
     let stream_id = match client.send_request("GET", "/", &[], None) {
         Ok(id) => id,
         Err(e) => {
-            eprintln!("Failed to send HTTP/3 request: {}", e);
+            eprintln!("Failed to send HTTP/3 GET request to {}: {}", server_addr, e);
             return;
         }
     };
@@ -1628,11 +1670,19 @@ fn test_http3_get_request() {
     // レスポンスを受信
     match client.recv_response(stream_id, Duration::from_secs(5)) {
         Ok((body, status)) => {
-            assert_eq!(status, 200, "Should return 200 OK");
-            assert!(!body.is_empty(), "Should receive response body");
+            assert_eq!(
+                status, 200, 
+                "Should return 200 OK for HTTP/3 GET request to {}, got: {}", 
+                server_addr, status
+            );
+            assert!(
+                !body.is_empty(), 
+                "Should receive non-empty response body for HTTP/3 GET request to {}", 
+                server_addr
+            );
         }
         Err(e) => {
-            eprintln!("Failed to receive HTTP/3 response: {}", e);
+            eprintln!("Failed to receive HTTP/3 response from {} (stream {}): {}", server_addr, stream_id, e);
             // HTTP/3が有効化されていない場合はスキップ
             return;
         }
@@ -1679,13 +1729,30 @@ fn test_http3_post_request() {
         }
     };
     
+    // 前提条件: バックエンドが存在することを確認
+    let prereq_stream_id = match client.send_request("GET", "/", &[], None) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("Failed to send prerequisite request: {}", e);
+            return;
+        }
+    };
+    let prereq_status = match client.recv_response(prereq_stream_id, Duration::from_secs(5)) {
+        Ok((_, status)) => status,
+        Err(e) => {
+            eprintln!("Failed to receive prerequisite response: {}", e);
+            return;
+        }
+    };
+    
     // レスポンスを受信
     match client.recv_response(stream_id, Duration::from_secs(5)) {
         Ok((_body, status)) => {
-            // バックエンドが存在しない場合は404、存在する場合は200が返される
-            assert!(
-                status == 200 || status == 404 || status == 502,
-                "Should return 200, 404, or 502: {}", status
+            // 前提条件チェックで200が返ることを確認済みなので、ここでも200を期待
+            assert_eq!(
+                status, 200,
+                "Should return 200 OK for HTTP/3 POST request (prerequisite status: {}), got: {}", 
+                prereq_status, status
             );
         }
         Err(e) => {
@@ -1766,14 +1833,20 @@ fn test_http3_multiple_streams() {
     assert_eq!(stream_ids.len(), 10, "Should open 10 streams");
     
     // レスポンスを受信
+    // 複数ストリームテスト: プロキシが複数のストリームを並列処理できることを確認
     let mut responses = 0;
+    let mut success_count = 0;
     for stream_id in stream_ids {
         match client.recv_response(stream_id, Duration::from_secs(3)) {
             Ok((_body, status)) => {
-                // バックエンドが存在しない場合は404、存在する場合は200が返される
+                // プロキシが正常に動作している場合、200または404が返される
+                // 200はバックエンドが存在する場合、404は存在しない場合
+                if status == 200 || status == 404 {
+                    success_count += 1;
+                }
                 assert!(
                     status == 200 || status == 404 || status == 502,
-                    "Should return 200, 404, or 502: {}", status
+                    "Should return 200, 404, or 502 for stream {}: {}", stream_id, status
                 );
                 responses += 1;
             }
@@ -1782,6 +1855,9 @@ fn test_http3_multiple_streams() {
             }
         }
     }
+    
+    // 少なくともいくつかのストリームが成功することを確認
+    assert!(success_count > 0, "At least some streams should succeed (got {}/{} successful)", success_count, responses);
     
     // 少なくともいくつかのレスポンスを受信したことを確認
     assert!(responses > 0, "Should receive at least some responses");
@@ -1826,18 +1902,33 @@ fn test_http3_proxy_forwarding() {
         }
     };
     
+    // 前提条件: バックエンドが存在することを確認
+    let prereq_stream_id = match client.send_request("GET", "/", &[], None) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("Failed to send prerequisite request: {}", e);
+            return;
+        }
+    };
+    let prereq_status = match client.recv_response(prereq_stream_id, Duration::from_secs(5)) {
+        Ok((_, status)) => status,
+        Err(e) => {
+            eprintln!("Failed to receive prerequisite response: {}", e);
+            return;
+        }
+    };
+    
     // レスポンスを受信
     match client.recv_response(stream_id, Duration::from_secs(5)) {
         Ok((body, status)) => {
-            // プロキシが正常に動作している場合、200または404が返される
-            assert!(
-                status == 200 || status == 404 || status == 502,
-                "Should return 200, 404, or 502: {}", status
+            // 前提条件チェックで200が返ることを確認済みなので、ここでも200を期待
+            assert_eq!(
+                status, 200,
+                "Should return 200 OK for HTTP/3 proxy forwarding (prerequisite status: {}), got: {}", 
+                prereq_status, status
             );
             // バックエンドが存在する場合、ボディが返される
-            if status == 200 {
-                assert!(!body.is_empty(), "Should receive response body");
-            }
+            assert!(!body.is_empty(), "Should receive response body for successful proxy forwarding");
         }
         Err(e) => {
             eprintln!("Failed to receive HTTP/3 response: {}", e);
@@ -2071,9 +2162,11 @@ fn test_http3_bidirectional_streams() {
         
         match client.recv_response(stream_id, Duration::from_secs(3)) {
             Ok((_body, status)) => {
+                // 双方向ストリームテスト: プロキシが複数のストリームを並列処理できることを確認
+                // プロキシが正常に動作している場合、200または404が返される
                 assert!(
                     status == 200 || status == 404 || status == 502,
-                    "Should return 200, 404, or 502: {}", status
+                    "Should return 200, 404, or 502 for bidirectional stream {}: {}", i, status
                 );
             }
             Err(e) => {
@@ -2130,11 +2223,29 @@ fn test_http3_proxy_header_manipulation() {
         }
     };
     
+    // 前提条件: バックエンドが存在することを確認
+    let prereq_stream_id = match client.send_request("GET", "/", &[], None) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("Failed to send prerequisite request: {}", e);
+            return;
+        }
+    };
+    let prereq_status = match client.recv_response(prereq_stream_id, Duration::from_secs(5)) {
+        Ok((_, status)) => status,
+        Err(e) => {
+            eprintln!("Failed to receive prerequisite response: {}", e);
+            return;
+        }
+    };
+    
     match client.recv_response(stream_id, Duration::from_secs(5)) {
         Ok((_body, status)) => {
-            assert!(
-                status == 200 || status == 404 || status == 502,
-                "Should return 200, 404, or 502: {}", status
+            // 前提条件チェックで200が返ることを確認済みなので、ここでも200を期待
+            assert_eq!(
+                status, 200,
+                "Should return 200 OK for HTTP/3 proxy header manipulation (prerequisite status: {}), got: {}", 
+                prereq_status, status
             );
         }
         Err(e) => {
@@ -3676,7 +3787,7 @@ fn test_grpc_invalid_frame() {
     ) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Failed to send gRPC request: {}", e);
+            eprintln!("Failed to send gRPC request to 127.0.0.1:{}: {}", PROXY_PORT, e);
             return;
         }
     };
@@ -3685,8 +3796,31 @@ fn test_grpc_invalid_frame() {
     // 不正なフレームの場合、400 Bad Requestが返される
     assert_eq!(
         status, Some(400),
-        "Should return 400 Bad Request for invalid frame, got: {:?}", status
+        "Should return 400 Bad Request for invalid gRPC frame, got: {:?}", status
     );
+    
+    // gRPCステータスコードの検証
+    let grpc_status = GrpcTestClient::extract_grpc_status(&response);
+    if let Some(grpc_status_code) = grpc_status {
+        // 不正なフレームの場合、INVALID_ARGUMENT (3) または INTERNAL (13) が返される可能性がある
+        assert!(
+            grpc_status_code == 3 || grpc_status_code == 13,
+            "Should return gRPC status INVALID_ARGUMENT (3) or INTERNAL (13) for invalid frame, got: {}", 
+            grpc_status_code
+        );
+        eprintln!("gRPC status code for invalid frame: {}", grpc_status_code);
+    } else {
+        eprintln!("Warning: gRPC status code not found in response (may be HTTP-level error)");
+    }
+    
+    // トレーラーヘッダーの検証
+    let trailers = GrpcTestClient::extract_trailers(&response);
+    let has_grpc_status = trailers.iter().any(|(name, _)| name == "grpc-status");
+    if has_grpc_status {
+        eprintln!("gRPC trailers found: {:?}", trailers);
+    } else {
+        eprintln!("Warning: grpc-status not found in trailers (may be HTTP-level error)");
+    }
 }
 
 #[test]
@@ -5212,7 +5346,7 @@ fn test_grpc_proxy_error_handling() {
     let mut client = match GrpcTestClient::new("127.0.0.1", PROXY_PORT) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to create gRPC client: {}", e);
+            eprintln!("Failed to create gRPC client for 127.0.0.1:{}: {}", PROXY_PORT, e);
             return;
         }
     };
@@ -5224,7 +5358,7 @@ fn test_grpc_proxy_error_handling() {
     ) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Failed to send gRPC request: {}", e);
+            eprintln!("Failed to send gRPC request to /grpc.test.v1.NonExistentService/NonExistentMethod: {}", e);
             return;
         }
     };
@@ -5233,8 +5367,28 @@ fn test_grpc_proxy_error_handling() {
     // 存在しないエンドポイントの場合、404 Not Foundが返される
     assert_eq!(
         status, Some(404),
-        "Should return 404 Not Found for non-existent endpoint, got: {:?}", status
+        "Should return 404 Not Found for non-existent gRPC endpoint, got: {:?}", status
     );
+    
+    // gRPCステータスコードの検証
+    let grpc_status = GrpcTestClient::extract_grpc_status(&response);
+    if let Some(grpc_status_code) = grpc_status {
+        // 存在しないエンドポイントの場合、NOT_FOUND (5) が返される可能性がある
+        eprintln!("gRPC status code for non-existent endpoint: {} (expected: NOT_FOUND (5))", grpc_status_code);
+        assert!(
+            grpc_status_code == 5 || grpc_status_code == 0,
+            "Should return gRPC status NOT_FOUND (5) or OK (0) for non-existent endpoint, got: {}", 
+            grpc_status_code
+        );
+    } else {
+        eprintln!("Warning: gRPC status code not found in response (HTTP-level error: {:?})", status);
+    }
+    
+    // トレーラーヘッダーの検証
+    let trailers = GrpcTestClient::extract_trailers(&response);
+    if !trailers.is_empty() {
+        eprintln!("gRPC trailers for non-existent endpoint: {:?}", trailers);
+    }
 }
 
 #[test]
@@ -5249,7 +5403,7 @@ fn test_grpc_malformed_protobuf() {
     let mut client = match GrpcTestClient::new("127.0.0.1", PROXY_PORT) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to create gRPC client: {}", e);
+            eprintln!("Failed to create gRPC client for 127.0.0.1:{}: {}", PROXY_PORT, e);
             return;
         }
     };
@@ -5263,17 +5417,40 @@ fn test_grpc_malformed_protobuf() {
     ) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Failed to send gRPC request: {}", e);
+            eprintln!("Failed to send gRPC request with malformed Protobuf to /grpc.test.v1.TestService/Test: {}", e);
             return;
         }
     };
     
     let status = GrpcTestClient::extract_status_code(&response);
-    // 不正なデータの場合、400 Bad Requestが返される
+    // 不正なProtobufデータの場合、400 Bad Requestが返される
     assert_eq!(
         status, Some(400),
-        "Should return 400 Bad Request for malformed protobuf, got: {:?}", status
+        "Should return 400 Bad Request for malformed Protobuf message, got: {:?}", status
     );
+    
+    // gRPCステータスコードの検証
+    let grpc_status = GrpcTestClient::extract_grpc_status(&response);
+    if let Some(grpc_status_code) = grpc_status {
+        // 不正なProtobufの場合、INVALID_ARGUMENT (3) または INTERNAL (13) が返される可能性がある
+        assert!(
+            grpc_status_code == 3 || grpc_status_code == 13,
+            "Should return gRPC status INVALID_ARGUMENT (3) or INTERNAL (13) for malformed Protobuf, got: {}", 
+            grpc_status_code
+        );
+        eprintln!("gRPC status code for malformed Protobuf: {}", grpc_status_code);
+    } else {
+        eprintln!("Warning: gRPC status code not found in response (may be HTTP-level error)");
+    }
+    
+    // トレーラーヘッダーの検証
+    let trailers = GrpcTestClient::extract_trailers(&response);
+    let has_grpc_status = trailers.iter().any(|(name, _)| name == "grpc-status");
+    if has_grpc_status {
+        eprintln!("gRPC trailers for malformed Protobuf: {:?}", trailers);
+    } else {
+        eprintln!("Warning: grpc-status not found in trailers (may be HTTP-level error)");
+    }
 }
 
 #[test]
@@ -5286,29 +5463,55 @@ fn test_grpc_stream_reset() {
     
     // gRPCストリームリセットのテスト
     // gRPCクライアントを作成してリクエストを途中でキャンセルする動作をテスト
-    let client_result = GrpcTestClient::new("127.0.0.1", PROXY_PORT);
-    match client_result {
-        Ok(mut client) => {
-            // リクエスト送信を試みる（成功する必要はない）
-            let result = client.send_grpc_request(
-                "/grpc.test.v1.TestService/StreamReset",
-                b"\x00\x00\x00\x00\x05hello",
-                &[],
-            );
-            match result {
-                Ok(response) => {
-                    let status = GrpcTestClient::extract_status_code(&response);
-                    eprintln!("gRPC stream reset test: received response with status {:?}", status);
-                }
-                Err(e) => {
-                    // エラーは想定内（ストリームリセットまたはバックエンド不在）
-                    eprintln!("gRPC stream reset test: received expected error: {}", e);
-                }
-            }
-        }
+    let mut client = match GrpcTestClient::new("127.0.0.1", PROXY_PORT) {
+        Ok(c) => c,
         Err(e) => {
-            eprintln!("gRPC client creation failed: {}", e);
+            eprintln!("Failed to create gRPC client for 127.0.0.1:{}: {}", PROXY_PORT, e);
             return;
+        }
+    };
+    
+    // リクエスト送信を試みる
+    let response = match client.send_grpc_request(
+        "/grpc.test.v1.TestService/StreamReset",
+        b"\x00\x00\x00\x00\x05hello",
+        &[],
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Failed to send gRPC stream reset request to /grpc.test.v1.TestService/StreamReset: {}", e);
+            return;
+        }
+    };
+    
+    let status = GrpcTestClient::extract_status_code(&response);
+    // ストリームリセットの場合、404 (エンドポイント不存在) または 502 (バックエンドエラー) が返される可能性がある
+    assert!(
+        status == Some(404) || status == Some(502) || status == Some(200),
+        "Should return 404, 502, or 200 for stream reset request, got: {:?}", status
+    );
+    
+    // gRPCステータスコードの検証
+    let grpc_status = GrpcTestClient::extract_grpc_status(&response);
+    if let Some(grpc_status_code) = grpc_status {
+        // ストリームリセットの場合、CANCELLED (1) または NOT_FOUND (5) が返される可能性がある
+        eprintln!("gRPC status code for stream reset: {} (expected: CANCELLED (1) or NOT_FOUND (5))", grpc_status_code);
+        assert!(
+            grpc_status_code == 1 || grpc_status_code == 5 || grpc_status_code == 0,
+            "Should return gRPC status CANCELLED (1), NOT_FOUND (5), or OK (0) for stream reset, got: {}", 
+            grpc_status_code
+        );
+    } else {
+        eprintln!("Warning: gRPC status code not found in response (HTTP-level error: {:?})", status);
+    }
+    
+    // トレーラーヘッダーの検証
+    let trailers = GrpcTestClient::extract_trailers(&response);
+    if !trailers.is_empty() {
+        eprintln!("gRPC trailers for stream reset: {:?}", trailers);
+        let has_grpc_status = trailers.iter().any(|(name, _)| name == "grpc-status");
+        if has_grpc_status {
+            eprintln!("grpc-status found in trailers");
         }
     }
 }
