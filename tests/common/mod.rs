@@ -8,6 +8,18 @@ pub mod http3_client;
 #[cfg(feature = "grpc")]
 pub mod grpc_client;
 
+// 新しいHTTP/2テストクライアント（h2ライブラリを使用）
+// http2 featureフラグなしで有効
+pub mod http2_client;
+
+// 新しいHTTP/3テストクライアント（h3+quinn版）
+// http3 featureフラグなしで有効
+pub mod http3_client_v2;
+
+// 新しいgRPCテストクライアント（tonic版）
+// grpc featureフラグなしで有効
+pub mod grpc_client_v2;
+
 use std::net::{TcpListener, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
