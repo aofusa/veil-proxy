@@ -81,6 +81,14 @@ where
 {
     /// 新しいコネクションを作成
     pub fn new(stream: S, settings: Http2Settings) -> Self {
+        Self::new_with_initial_buffer(stream, settings, Vec::new())
+    }
+    
+    /// 初期バッファデータ付きでコネクションを作成
+    /// 
+    /// プロトコル検出で既に読み込んだデータがある場合に使用します。
+    /// これにより、不要な再読み込みを回避できます。
+    pub fn new_with_initial_buffer(stream: S, settings: Http2Settings, initial_data: Vec<u8>) -> Self {
         let hpack_decoder = HpackDecoder::new(settings.header_table_size as usize);
         let hpack_encoder = HpackEncoder::new(settings.header_table_size as usize);
         let frame_encoder = FrameEncoder::new(settings.max_frame_size);
@@ -95,6 +103,16 @@ where
         
         // DoS 対策用のタイムスタンプを初期化
         let now = std::time::Instant::now();
+        
+        // 初期バッファを準備（既に読み込んだデータがある場合は使用）
+        let mut read_buf = vec![0u8; 65536];
+        let buf_end = if !initial_data.is_empty() {
+            let len = initial_data.len().min(65536);
+            read_buf[..len].copy_from_slice(&initial_data[..len]);
+            len
+        } else {
+            0
+        };
 
         Self {
             stream,
@@ -111,9 +129,9 @@ where
             goaway_received: false,
             goaway_last_stream_id: None,
             settings_ack_pending: false,
-            read_buf: vec![0u8; 65536],
+            read_buf,
             buf_start: 0,
-            buf_end: 0,
+            buf_end,
             send_queue: VecDeque::new(),
             // DoS 対策
             rst_stream_count: 0,
@@ -154,7 +172,7 @@ where
     async fn expect_preface(&mut self) -> Http2Result<()> {
         let preface_len = CONNECTION_PREFACE.len();
         
-        // プリフェースを読み込む
+        // プリフェースを読み込む（初期バッファに既にある場合は再読み込み不要）
         while self.buf_end - self.buf_start < preface_len {
             self.read_more().await?;
         }

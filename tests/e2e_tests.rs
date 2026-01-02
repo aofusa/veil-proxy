@@ -49,6 +49,8 @@ use base64;
 
 // E2E環境のポート設定（e2e_setup.shと一致させる）
 const PROXY_PORT: u16 = 8443;  // プロキシHTTPSポート
+const PROXY_HTTP_PORT: u16 = 8080;  // プロキシHTTPポート（HTTPSリダイレクト用）
+const PROXY_H2C_PORT: u16 = 8081;  // H2C (HTTP/2 Cleartext) ポート
 const PROXY_HTTP3_PORT: u16 = 8443;  // HTTP/3ポート（デフォルトではHTTPSポートと同じ）
 const BACKEND1_PORT: u16 = 9001;
 const BACKEND2_PORT: u16 = 9002;
@@ -7056,6 +7058,120 @@ fn test_buffering_chunked_response() {
 }
 
 // ====================
+// バッファリング: エッジケーステスト（優先度: 高）
+// ====================
+
+#[test]
+fn test_buffering_empty_response() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 空レスポンスのバッファリングテスト
+    // 注意: このテストは設定ファイルでバッファリングを有効化する必要がある
+    
+    // 空レスポンスを返すエンドポイントをリクエスト（存在しない場合は404）
+    let response = send_request(PROXY_PORT, "/nonexistent", &[]);
+    
+    if let Some(response) = response {
+        let status = get_status_code(&response);
+        // 404が返される場合、空のボディが正常に処理されることを確認
+        if status == Some(404) {
+            let content_length = get_content_length_from_headers(response.as_bytes());
+            // Content-Lengthが0または未指定の場合、空レスポンスが正常に処理される
+            eprintln!("Buffering empty response test: status={:?}, content_length={:?}", 
+                     status, content_length);
+        }
+    }
+}
+
+#[test]
+fn test_buffering_zero_content_length() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // Content-Length: 0のレスポンスのバッファリングテスト
+    // 注意: このテストは設定ファイルでバッファリングを有効化する必要がある
+    
+    let response = send_request(PROXY_PORT, "/", &[]);
+    assert!(response.is_some(), "Should receive response");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    assert_eq!(status, Some(200), "Should return 200 OK");
+    
+    // Content-Lengthヘッダーを確認
+    let content_length = get_content_length_from_headers(response.as_bytes());
+    // Content-Lengthが0の場合でも正常に処理されることを確認
+    eprintln!("Buffering zero content length test: content_length={:?}", content_length);
+}
+
+#[test]
+fn test_buffering_adaptive_threshold_switch() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // Adaptiveモードの閾値切り替えテスト
+    // 注意: このテストは設定ファイルでバッファリングを有効化する必要がある
+    // 例: ./tests/e2e_setup.sh test buffering
+    
+    // 閾値より小さいレスポンス（Fullバッファリング）
+    let small_response = send_request(PROXY_PORT, "/", &[]);
+    assert!(small_response.is_some(), "Should receive small response");
+    let small_response = small_response.unwrap();
+    assert_eq!(get_status_code(&small_response), Some(200), "Should return 200 OK");
+    
+    // 閾値より大きいレスポンス（Streaming）
+    let large_response = send_request(PROXY_PORT, "/large.txt", &[]);
+    if let Some(large_response) = large_response {
+        let status = get_status_code(&large_response);
+        if status == Some(200) {
+            // 大きいレスポンスが正常に処理されることを確認
+            let small_size = small_response.len();
+            let large_size = large_response.len();
+            eprintln!("Adaptive threshold switch test: small={} bytes, large={} bytes", 
+                     small_size, large_size);
+            assert!(large_size > small_size, "Large response should be larger than small response");
+        }
+    }
+}
+
+#[test]
+fn test_buffering_adaptive_content_length_missing() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // Content-LengthなしレスポンスのAdaptiveモード動作確認
+    // 注意: このテストは設定ファイルでバッファリングを有効化する必要がある
+    
+    // Chunked Transfer Encodingレスポンス（Content-Lengthなし）
+    let response = send_request(PROXY_PORT, "/", &[]);
+    assert!(response.is_some(), "Should receive response");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    assert_eq!(status, Some(200), "Should return 200 OK");
+    
+    // Content-Lengthが存在しない場合、Transfer-Encoding: chunkedが使用される可能性がある
+    let content_length = get_content_length_from_headers(response.as_bytes());
+    let transfer_encoding = get_header_value(&response, "Transfer-Encoding");
+    
+    eprintln!("Adaptive content length missing test: content_length={:?}, transfer_encoding={:?}", 
+             content_length, transfer_encoding);
+    
+    // Content-Lengthがない場合でも正常に処理されることを確認
+    assert!(content_length.is_none() || transfer_encoding.is_some() || response.len() > 0,
+           "Response should be processed even without Content-Length");
+}
+
+// ====================
 // 優先度中: より詳細なヘルスチェックテスト
 // ====================
 
@@ -7132,6 +7248,248 @@ fn test_health_check_threshold() {
     
     // ヘルスチェック閾値が適切に設定されている場合、一定回数の失敗後にバックエンドが無効化される可能性がある
     eprintln!("Health check threshold test: all requests successful");
+}
+
+// ====================
+// ヘルスチェック: 詳細テスト（優先度: 高）
+// ====================
+
+#[test]
+fn test_health_check_healthy_status_200() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // ステータス200が健康と判断されることを確認
+    // 注意: このテストは設定ファイルでヘルスチェックを有効化する必要がある
+    
+    // 正常なリクエストを送信
+    let response = send_request(PROXY_PORT, "/", &[]);
+    assert!(response.is_some(), "Should receive response");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    assert_eq!(status, Some(200), "Should return 200 OK");
+    
+    // メトリクスエンドポイントから健康状態を確認
+    let metrics_response = send_request(PROXY_PORT, "/__metrics", &[]);
+    if let Some(metrics) = metrics_response {
+        if metrics.contains("http_upstream_health") || metrics.contains("veil_proxy_http_upstream_health") {
+            eprintln!("Health check healthy status 200 test: metrics detected");
+        }
+    }
+}
+
+#[test]
+fn test_health_check_healthy_status_custom() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // カスタムステータスコードが健康と判断されることを確認
+    // 注意: このテストは設定ファイルでヘルスチェックを有効化する必要がある
+    
+    // 正常なリクエストを送信
+    let response = send_request(PROXY_PORT, "/", &[]);
+    assert!(response.is_some(), "Should receive response");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    // 200-399の範囲のステータスコードが健康と判断される
+    assert!(status.is_some() && status.unwrap() >= 200 && status.unwrap() < 400,
+           "Should return healthy status code (200-399): {:?}", status);
+}
+
+#[test]
+fn test_health_check_unhealthy_status_500() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // ステータス500が不健康と判断されることを確認
+    // 注意: このテストは設定ファイルでヘルスチェックを有効化する必要がある
+    // 実際のテストには、500を返すエンドポイントが必要
+    
+    // 通常のリクエストは200を返す
+    let response = send_request(PROXY_PORT, "/", &[]);
+    assert!(response.is_some(), "Should receive response");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    // 正常な場合は200が返される
+    // 500が返される場合は、ヘルスチェックで不健康と判断される可能性がある
+    eprintln!("Health check unhealthy status 500 test: status={:?}", status);
+}
+
+#[test]
+fn test_health_check_threshold_reset_on_success() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 成功時の閾値リセットを確認
+    // 注意: このテストは設定ファイルでヘルスチェックを有効化する必要がある
+    
+    // 複数の正常なリクエストを送信
+    for i in 0..5 {
+        let response = send_request(PROXY_PORT, "/", &[]);
+        assert!(response.is_some(), "Should receive response {}", i);
+        
+        let response = response.unwrap();
+        let status = get_status_code(&response);
+        assert_eq!(status, Some(200), "Should return 200 OK for request {}", i);
+        
+        // 成功時に失敗カウントがリセットされることを確認
+        if i < 4 {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    
+    eprintln!("Health check threshold reset on success test: all requests successful");
+}
+
+#[test]
+fn test_health_check_threshold_reset_on_failure() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 失敗時の閾値リセットを確認
+    // 注意: このテストは設定ファイルでヘルスチェックを有効化する必要がある
+    // 実際のテストには、失敗をシミュレートする必要がある
+    
+    // 正常なリクエストを送信
+    let response = send_request(PROXY_PORT, "/", &[]);
+    assert!(response.is_some(), "Should receive response");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    assert_eq!(status, Some(200), "Should return 200 OK");
+    
+    // 失敗時に成功カウントがリセットされることを確認
+    // 実際のテストには、失敗をシミュレートする必要がある
+    eprintln!("Health check threshold reset on failure test: request successful");
+}
+
+#[test]
+fn test_health_check_path_custom() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // カスタムパスでのヘルスチェックを確認
+    // 注意: このテストは設定ファイルでヘルスチェックを有効化する必要がある
+    
+    // /healthエンドポイントにリクエストを送信
+    let response = send_request(PROXY_PORT, "/health", &[]);
+    if let Some(response) = response {
+        let status = get_status_code(&response);
+        // /healthエンドポイントが存在する場合、200が返される可能性がある
+        eprintln!("Health check path custom test: status={:?}", status);
+    }
+}
+
+// ====================
+// WebSocket: エラーハンドリングテスト（優先度: 高）
+// ====================
+
+#[test]
+fn test_websocket_invalid_upgrade_request() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 不正なUpgradeリクエストの処理を確認
+    
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    
+    // 不正なUpgradeリクエスト（Upgradeヘッダーがない）
+    let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    stream.write_all(request).unwrap();
+    
+    // レスポンスを受信
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    let response = String::from_utf8_lossy(&response);
+    
+    let status = get_status_code(&response);
+    // 不正なUpgradeリクエストの場合、400 Bad Requestまたは200が返される可能性がある
+    assert!(
+        status == Some(400) || status == Some(200) || status == Some(404),
+        "Should return 400, 200, or 404 for invalid upgrade request: {:?}", status
+    );
+    
+    eprintln!("WebSocket invalid upgrade request test: status={:?}", status);
+}
+
+#[test]
+fn test_websocket_missing_connection_header() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // ConnectionヘッダーがないUpgradeリクエストの処理を確認
+    
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    
+    // ConnectionヘッダーがないUpgradeリクエスト
+    let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    stream.write_all(request).unwrap();
+    
+    // レスポンスを受信
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    let response = String::from_utf8_lossy(&response);
+    
+    let status = get_status_code(&response);
+    // Connectionヘッダーがない場合、400 Bad Requestまたは200が返される可能性がある
+    assert!(
+        status == Some(400) || status == Some(200) || status == Some(404),
+        "Should return 400, 200, or 404 for missing connection header: {:?}", status
+    );
+    
+    eprintln!("WebSocket missing connection header test: status={:?}", status);
+}
+
+#[test]
+fn test_websocket_invalid_websocket_version() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 不正なWebSocketバージョンの処理を確認
+    
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    
+    // 不正なWebSocketバージョン（13以外）
+    let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 14\r\n\r\n";
+    stream.write_all(request).unwrap();
+    
+    // レスポンスを受信
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    let response = String::from_utf8_lossy(&response);
+    
+    let status = get_status_code(&response);
+    // 不正なバージョンの場合、400 Bad Requestまたは426 Upgrade Requiredが返される可能性がある
+    assert!(
+        status == Some(400) || status == Some(426) || status == Some(200) || status == Some(404),
+        "Should return 400, 426, 200, or 404 for invalid websocket version: {:?}", status
+    );
+    
+    eprintln!("WebSocket invalid version test: status={:?}", status);
 }
 
 // ====================

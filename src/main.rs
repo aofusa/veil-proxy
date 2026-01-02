@@ -4171,6 +4171,42 @@ struct ServerConfigSection {
     #[serde(default)]
     #[cfg_attr(not(feature = "http3"), allow(dead_code))]
     http3_enabled: bool,
+    
+    // ====================
+    // H2C (HTTP/2 Cleartext) 設定
+    // ====================
+    
+    /// H2C (HTTP/2 Cleartext) サーバーを有効化するかどうか
+    /// 
+    /// TLSなしでHTTP/2を使用するプロトコルです（RFC 7540 Section 3.4）。
+    /// Prior Knowledgeモードをサポートします。
+    /// 
+    /// 効果:
+    /// - ストリーム多重化によるレイテンシ削減
+    /// - HPACK ヘッダー圧縮によるオーバーヘッド削減
+    /// - gRPC バックエンドへの接続に適している
+    /// 
+    /// セキュリティ考慮事項:
+    /// - H2Cは平文通信のため、本番環境では内部ネットワークでのみ使用を推奨
+    /// - 外部公開時はTLS必須
+    /// - デフォルトで無効（明示的に有効化が必要）
+    /// 
+    /// 注意: `--features http2` でビルドする必要があります
+    #[serde(default)]
+    #[cfg_attr(not(feature = "http2"), allow(dead_code))]
+    h2c_enabled: bool,
+    
+    /// H2C リスニングアドレス（オプション）
+    /// 
+    /// 指定した場合、H2C専用のリスナーを起動します。
+    /// 未指定の場合は、TLSリスナーと同じアドレスでプロトコル検出を行います。
+    /// 
+    /// 例: "0.0.0.0:8080"
+    /// 
+    /// 注意: 同じポートでTLSとH2Cの両方を処理する場合は未指定にしてください。
+    #[serde(default)]
+    #[cfg_attr(not(feature = "http2"), allow(dead_code))]
+    h2c_listen: Option<String>,
 }
 
 /// Serverヘッダーのデフォルト値
@@ -6012,6 +6048,12 @@ struct LoadedConfig {
     /// HTTP/3 設定（詳細設定）
     #[cfg(feature = "http3")]
     http3_config: Http3ConfigSection,
+    /// H2C (HTTP/2 Cleartext) を有効化するかどうか
+    #[cfg(feature = "http2")]
+    h2c_enabled: bool,
+    /// H2C リスニングアドレス（オプション）
+    #[cfg(feature = "http2")]
+    h2c_listen: Option<String>,
     /// WASM Filter Engine（WASM機能が有効な場合）
     #[cfg(feature = "wasm")]
     wasm_filter_engine: Option<Arc<crate::wasm::FilterEngine>>,
@@ -6071,6 +6113,14 @@ struct RuntimeConfig {
     /// HTTP/3 設定（圧縮設定の解決に使用）
     #[cfg(feature = "http3")]
     http3_config: Http3ConfigSection,
+    /// H2C (HTTP/2 Cleartext) を有効化するかどうか
+    #[cfg(feature = "http2")]
+    h2c_enabled: bool,
+    /// H2C リスニングアドレス（オプション）
+    /// ホットリロード時の参照用（現在は起動時のみ使用）
+    #[cfg(feature = "http2")]
+    #[allow(dead_code)]
+    h2c_listen: Option<String>,
     /// WASM Filter Engine（WASM機能が有効な場合）
     #[cfg(feature = "wasm")]
     wasm_filter_engine: Option<Arc<crate::wasm::FilterEngine>>,
@@ -6094,6 +6144,10 @@ impl Default for RuntimeConfig {
             http2_config: Http2ConfigSection::default(),
             #[cfg(feature = "http3")]
             http3_config: Http3ConfigSection::default(),
+            #[cfg(feature = "http2")]
+            h2c_enabled: false,
+            #[cfg(feature = "http2")]
+            h2c_listen: None,
             #[cfg(feature = "wasm")]
             wasm_filter_engine: None,
             performance: PerformanceConfigSection::default(),
@@ -6158,6 +6212,10 @@ fn reload_config(path: &Path) -> io::Result<()> {
         http2_config: loaded.http2_config,
         #[cfg(feature = "http3")]
         http3_config: loaded.http3_config,
+        #[cfg(feature = "http2")]
+        h2c_enabled: loaded.h2c_enabled,
+        #[cfg(feature = "http2")]
+        h2c_listen: loaded.h2c_listen.clone(),
         #[cfg(feature = "wasm")]
         wasm_filter_engine: current.wasm_filter_engine.clone(),
         performance: loaded.performance.clone(),
@@ -6188,6 +6246,10 @@ struct LoadedConfigWithoutTls {
     http2_config: Http2ConfigSection,
     #[cfg(feature = "http3")]
     http3_config: Http3ConfigSection,
+    #[cfg(feature = "http2")]
+    h2c_enabled: bool,
+    #[cfg(feature = "http2")]
+    h2c_listen: Option<String>,
     performance: PerformanceConfigSection,
 }
 
@@ -6203,13 +6265,17 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
     // 設定ファイルのバリデーション
     validate_config(&config)?;
 
-    // HTTP/2・HTTP/3 設定を読み込み
+    // HTTP/2・HTTP/3・H2C 設定を読み込み
     #[cfg(feature = "http2")]
     let http2_enabled = config.server.http2_enabled;
     #[cfg(feature = "http2")]
     let http2_config = config.http2.clone();
     #[cfg(feature = "http3")]
     let http3_config = config.http3.clone();
+    #[cfg(feature = "http2")]
+    let h2c_enabled = config.server.h2c_enabled;
+    #[cfg(feature = "http2")]
+    let h2c_listen = config.server.h2c_listen.clone();
 
     // Serverヘッダー設定を更新（リロード対応）
     init_server_header(
@@ -6271,6 +6337,10 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
         http2_config,
         #[cfg(feature = "http3")]
         http3_config,
+        #[cfg(feature = "http2")]
+        h2c_enabled,
+        #[cfg(feature = "http2")]
+        h2c_listen,
         performance: config.performance.clone(),
     })
 }
@@ -6328,7 +6398,7 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         tcp_cork_enabled: config.tls.tcp_cork_enabled,
     };
 
-    // HTTP/2・HTTP/3 設定を読み込み
+    // HTTP/2・HTTP/3・H2C 設定を読み込み
     // 有効化フラグは server セクションで管理、詳細設定は [http2]/[http3] セクション
     #[cfg(feature = "http2")]
     let http2_enabled = config.server.http2_enabled;
@@ -6340,6 +6410,10 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     let http3_config = config.http3.clone();
     #[cfg(feature = "http3")]
     let http3_listen = http3_config.listen.clone();
+    #[cfg(feature = "http2")]
+    let h2c_enabled = config.server.h2c_enabled;
+    #[cfg(feature = "http2")]
+    let h2c_listen = config.server.h2c_listen.clone();
     
     // Serverヘッダー設定を初期化
     init_server_header(
@@ -6500,6 +6574,10 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         http2_config,
         #[cfg(feature = "http3")]
         http3_config,
+        #[cfg(feature = "http2")]
+        h2c_enabled,
+        #[cfg(feature = "http2")]
+        h2c_listen,
         #[cfg(feature = "wasm")]
         wasm_filter_engine,
         performance: config.performance.clone(),
@@ -7160,6 +7238,10 @@ fn main() {
         http2_config: loaded_config.http2_config.clone(),
         #[cfg(feature = "http3")]
         http3_config: loaded_config.http3_config.clone(),
+        #[cfg(feature = "http2")]
+        h2c_enabled: loaded_config.h2c_enabled,
+        #[cfg(feature = "http2")]
+        h2c_listen: loaded_config.h2c_listen.clone(),
         #[cfg(feature = "wasm")]
         wasm_filter_engine: loaded_config.wasm_filter_engine.clone(),
         performance: loaded_config.performance.clone(),
@@ -7188,10 +7270,15 @@ fn main() {
         }
     }
     
-    // HTTP/2・HTTP/3 の設定ログ
+    // HTTP/2・HTTP/3・H2C の設定ログ
     #[cfg(feature = "http2")]
     if loaded_config.http2_enabled {
         info!("HTTP/2 enabled via ALPN negotiation");
+    }
+    #[cfg(feature = "http2")]
+    if loaded_config.h2c_enabled {
+        let h2c_addr = loaded_config.h2c_listen.as_deref().unwrap_or(&loaded_config.listen_addr);
+        info!("H2C (HTTP/2 Cleartext) enabled (listener: {})", h2c_addr);
     }
     #[cfg(feature = "http3")]
     if loaded_config.http3_enabled {
@@ -7655,6 +7742,118 @@ fn main() {
         // ローカル変数の Arc をドロップ（参照カウントを減らす）
         drop(tls_cert_pem);
         drop(tls_key_pem);
+    }
+    
+    // H2C (HTTP/2 Cleartext) サーバー（設定されている場合のみ）
+    #[cfg(feature = "http2")]
+    if loaded_config.h2c_enabled {
+        let h2c_addr_str = loaded_config.h2c_listen
+            .clone()
+            .unwrap_or_else(|| loaded_config.listen_addr.clone());
+        
+        let h2c_addr: SocketAddr = match h2c_addr_str.parse() {
+            Ok(addr) => addr,
+            Err(e) => {
+                error!("Invalid H2C listen address '{}': {}", h2c_addr_str, e);
+                return;
+            }
+        };
+        
+        info!("============================================");
+        info!("H2C (HTTP/2 Cleartext) Server");
+        info!("H2C Listen Address: {}", h2c_addr);
+        info!("H2C Workers: {} (SO_REUSEPORT enabled)", num_threads);
+        info!("============================================");
+        
+        // 各ワーカースレッドでH2Cリスナーを起動
+        let core_ids = core_ids.clone();
+        for thread_id in 0..num_threads {
+            let h2c_addr = h2c_addr;
+            let balancing = loaded_config.reuseport_balancing;
+            let max_conn = loaded_config.global_security.max_concurrent_connections;
+            
+            // このスレッドに割り当てるコアIDを決定
+            let assigned_core = core_ids.as_ref().map(|ids| {
+                let core_index = thread_id % ids.len();
+                ids[core_index]
+            });
+            
+            let h2c_handle = thread::spawn(move || {
+                // スレッド開始直後にCPUアフィニティを設定
+                if let Some(core_id) = assigned_core {
+                    if core_affinity::set_for_current(core_id) {
+                        info!("[H2C Worker {}] Pinned to CPU core {:?}", thread_id, core_id);
+                    } else {
+                        warn!("[H2C Worker {}] Failed to pin to CPU core {:?}", thread_id, core_id);
+                    }
+                }
+                
+                let mut rt = RuntimeBuilder::<monoio::IoUringDriver>::new()
+                    .enable_timer()
+                    .build()
+                    .expect("Failed to create H2C runtime");
+                
+                rt.block_on(async move {
+                    let listener = match create_listener(h2c_addr, balancing, num_threads, thread_id) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            error!("[H2C Worker {}] Bind error: {}", thread_id, e);
+                            return;
+                        }
+                    };
+                    
+                    info!("[H2C Worker {}] Started", thread_id);
+                    
+                    loop {
+                        // Shutdown チェック
+                        if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
+                            info!("[H2C Worker {}] Shutting down...", thread_id);
+                            break;
+                        }
+                        
+                        // タイムアウト付きaccept
+                        let accept_result = timeout(Duration::from_secs(1), listener.accept()).await;
+                        
+                        let (stream, peer_addr) = match accept_result {
+                            Ok(Ok(s)) => s,
+                            Ok(Err(e)) => {
+                                error!("[H2C Worker {}] Accept error: {}", thread_id, e);
+                                continue;
+                            }
+                            Err(_) => {
+                                // タイムアウト - ループを継続してshutdownチェック
+                                continue;
+                            }
+                        };
+                        
+                        // 同時接続数制限チェック
+                        if max_conn > 0 {
+                            let current = CURRENT_CONNECTIONS.load(Ordering::Relaxed);
+                            if current >= max_conn {
+                                warn!("[H2C Worker {}] Connection limit reached ({}/{}), rejecting connection from {}", 
+                                      thread_id, current, max_conn, peer_addr);
+                                drop(stream);
+                                continue;
+                            }
+                        }
+                        
+                        let _ = stream.set_nodelay(true);
+                        
+                        // H2C接続処理をspawn（パニック耐性あり）
+                        spawn_with_panic_catch(async move {
+                            let _guard = ConnectionGuard::new();
+                            // H2C専用リスナーのため、プロトコル検出は不要
+                            // 直接H2C接続処理を呼び出す
+                            // 注意: プロトコル検出で既に読み込んだデータがないため、空の初期データを渡す
+                            handle_h2c_connection(stream, &peer_addr.ip().to_string(), Vec::new()).await;
+                        });
+                    }
+                    
+                    info!("[H2C Worker {}] Stopped", thread_id);
+                });
+            });
+            handles.push(h2c_handle);
+        }
     }
     
     // HTTP/3 ワーカーが証明書データをクローンするまで短時間待機
@@ -10135,13 +10334,187 @@ where
     Some((status_code, 0))
 }
 
+// ====================
+// プロトコル検出機能（H2C対応）
+// ====================
+
+/// プロトコルタイプ
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtocolType {
+    H2C,      // HTTP/2 Cleartext (Prior Knowledge)
+    TLS,      // TLS (HTTPS)
+    Http11,   // HTTP/1.1
+    Unknown,  // 不明
+}
+
+/// プロトコル検出とバッファ管理
+/// 
+/// 最初の数バイトを読み込んでプロトコルを判別します。
+/// 読み込んだデータはバッファに保持し、後続の処理で再利用します。
+/// 
+/// 検出順序:
+/// 1. HTTP/2プリフェース（24バイト固定）
+/// 2. TLS ClientHello（最初の5バイト）
+/// 3. HTTP/1.1リクエスト（最初の3バイトでメソッド検出）
+/// 
+/// エラーハンドリング:
+/// - 読み込みエラー: Unknownを返し、空のバッファを返す
+/// - タイムアウト: 短いタイムアウトを設定して再試行（将来の改善）
+async fn detect_protocol_with_buffer(
+    stream: &mut TcpStream,
+) -> (ProtocolType, Vec<u8>) {
+    use monoio::io::AsyncReadRent;
+    
+    // 最大24バイト（HTTP/2プリフェース長）を読み込む
+    // タイムアウトを設定して、無応答接続を検出
+    let peek_buf = vec![0u8; 24];
+    let read_result = timeout(Duration::from_millis(1000), stream.read(peek_buf)).await;
+    
+    let (result, returned_buf) = match read_result {
+        Ok(r) => r,
+        Err(_) => {
+            // タイムアウト: プロトコル検出に失敗
+            debug!("[Protocol Detection] Timeout while reading initial bytes");
+            return (ProtocolType::Unknown, Vec::new());
+        }
+    };
+    
+    let (n, data) = match result {
+        Ok(n) if n > 0 => {
+            let data = returned_buf[..n].to_vec();
+            (n, data)
+        }
+        Ok(0) => {
+            // 接続が閉じられた
+            debug!("[Protocol Detection] Connection closed before protocol detection");
+            return (ProtocolType::Unknown, Vec::new());
+        }
+        Err(e) => {
+            // 読み込みエラー
+            debug!("[Protocol Detection] Read error: {}", e);
+            return (ProtocolType::Unknown, Vec::new());
+        }
+        _ => return (ProtocolType::Unknown, Vec::new()),
+    };
+    
+    // HTTP/2プリフェース検出（24バイト固定）
+    if n >= 24 {
+        if &data[..24] == b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" {
+            debug!("[Protocol Detection] H2C (HTTP/2 Cleartext) detected");
+            return (ProtocolType::H2C, data);
+        }
+    }
+    
+    // TLS ClientHello検出
+    // TLSレコード: [ContentType(1)][Version(2)][Length(2)][Handshake...]
+    // ContentType = Handshake (0x16)
+    // Version = TLS 1.0-1.3 (0x03XX)
+    if n >= 5 {
+        if data[0] == 0x16 && data[1] == 0x03 && (data[2] >= 0x01 && data[2] <= 0x03) {
+            debug!("[Protocol Detection] TLS detected");
+            return (ProtocolType::TLS, data);
+        }
+    }
+    
+    // HTTP/1.1リクエスト検出
+    // GET, POST, PUT, DELETE, HEAD, OPTIONS, PATCH
+    if n >= 3 {
+        let method = &data[..3.min(n)];
+        if method == b"GET" || method == b"POS" || method == b"PUT" 
+            || method == b"DEL" || method == b"HEA" || method == b"OPT" 
+            || method == b"PAT" {
+            debug!("[Protocol Detection] HTTP/1.1 detected (method: {:?})", method);
+            return (ProtocolType::Http11, data);
+        }
+    }
+    
+    // 不明なプロトコル
+    debug!("[Protocol Detection] Unknown protocol (first {} bytes: {:?})", n, 
+           if n <= 10 { format!("{:?}", &data[..n]) } else { format!("{:?}...", &data[..10]) });
+    (ProtocolType::Unknown, data)
+}
+
+/// H2Cサーバー接続処理
+/// 
+/// TLSなしでHTTP/2コネクションを確立し、リクエストを処理します。
+#[cfg(feature = "http2")]
+async fn handle_h2c_connection(
+    stream: TcpStream,
+    client_ip: &str,
+    initial_data: Vec<u8>,
+) {
+    use http2::Http2Connection;
+    
+    // HTTP/2設定を取得
+    let config = CURRENT_CONFIG.load();
+    let settings = config.http2_config.to_http2_settings();
+    
+    // Http2ConnectionはTcpStreamでも動作可能
+    // 既に読み込んだデータ（プリフェース）を初期バッファとして渡す
+    // これにより、不要な再読み込みを回避できる
+    let mut conn = Http2Connection::new_with_initial_buffer(stream, settings, initial_data);
+    
+    // ハンドシェイク（プリフェース確認 + SETTINGS 交換）
+    // expect_preface()は初期バッファからプリフェースを読み取る
+    if let Err(e) = conn.handshake().await {
+        warn!("[H2C] Handshake error: {}", e);
+        return;
+    }
+    
+    debug!("[H2C] Connection established from {}", client_ip);
+    
+    // アクティブ接続メトリクスの自動管理（Dropで自動デクリメント）
+    let mut connection_metric = ActiveConnectionMetric::new(true);
+    
+    // 既存のHTTP/2リクエスト処理を使用
+    let result = handle_http2_requests(&mut conn, client_ip, &mut connection_metric).await;
+    
+    if let Err(e) = result {
+        warn!("[H2C] Connection error: {}", e);
+    }
+    
+    debug!("[H2C] Connection closed from {}", client_ip);
+}
+
 // kTLS 有効時の接続処理（rustls + ktls2）
 #[cfg(feature = "ktls")]
 async fn handle_connection(
-    stream: TcpStream,
+    mut stream: TcpStream,
     acceptor: RustlsAcceptor,
     peer_addr: SocketAddr,
 ) {
+    // H2Cが有効な場合、プロトコル検出を実行
+    #[cfg(feature = "http2")]
+    {
+        let config = CURRENT_CONFIG.load();
+        if config.h2c_enabled {
+            let (protocol_type, initial_data) = detect_protocol_with_buffer(&mut stream).await;
+            
+            match protocol_type {
+                ProtocolType::H2C => {
+                    // H2Cサーバーハンドラー
+                    handle_h2c_connection(stream, &peer_addr.ip().to_string(), initial_data).await;
+                    return;
+                }
+                ProtocolType::TLS => {
+                    // TLSハンドシェイク（既存処理）
+                    // streamは既に読み込まれているため、そのまま使用
+                }
+                ProtocolType::Http11 => {
+                    // HTTP/1.1ハンドラー（平文接続）
+                    // 注意: 現在の実装はTLS前提のため、平文HTTP/1.1は未対応
+                    // 将来的に実装が必要
+                    warn!("[H2C] Plain HTTP/1.1 not supported, closing connection");
+                    return;
+                }
+                ProtocolType::Unknown => {
+                    warn!("[H2C] Unknown protocol from {}, closing connection", peer_addr);
+                    return;
+                }
+            }
+        }
+    }
+    
     // HTTP/2 が有効な場合のみ設定を読み込む
     #[cfg(feature = "http2")]
     let http2_enabled = {
@@ -10182,10 +10555,42 @@ async fn handle_connection(
 // kTLS 無効時の接続処理（rustls のみ）
 #[cfg(not(feature = "ktls"))]
 async fn handle_connection(
-    stream: TcpStream,
+    mut stream: TcpStream,
     acceptor: simple_tls::SimpleTlsAcceptor,
     peer_addr: SocketAddr,
 ) {
+    // H2Cが有効な場合、プロトコル検出を実行
+    #[cfg(feature = "http2")]
+    {
+        let config = CURRENT_CONFIG.load();
+        if config.h2c_enabled {
+            let (protocol_type, initial_data) = detect_protocol_with_buffer(&mut stream).await;
+            
+            match protocol_type {
+                ProtocolType::H2C => {
+                    // H2Cサーバーハンドラー
+                    handle_h2c_connection(stream, &peer_addr.ip().to_string(), initial_data).await;
+                    return;
+                }
+                ProtocolType::TLS => {
+                    // TLSハンドシェイク（既存処理）
+                    // streamは既に読み込まれているため、そのまま使用
+                }
+                ProtocolType::Http11 => {
+                    // HTTP/1.1ハンドラー（平文接続）
+                    // 注意: 現在の実装はTLS前提のため、平文HTTP/1.1は未対応
+                    // 将来的に実装が必要
+                    warn!("[H2C] Plain HTTP/1.1 not supported, closing connection");
+                    return;
+                }
+                ProtocolType::Unknown => {
+                    warn!("[H2C] Unknown protocol from {}, closing connection", peer_addr);
+                    return;
+                }
+            }
+        }
+    }
+    
     // HTTP/2 が有効な場合のみ設定を読み込む
     #[cfg(feature = "http2")]
     let http2_enabled = {

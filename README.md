@@ -17,6 +17,7 @@ A high-performance reverse proxy server using io_uring (monoio) and rustls.
 - **TLS**: Memory-safe pure Rust TLS implementation with rustls
 - **kTLS**: Kernel TLS offload support via rustls + ktls2 (Linux 5.15+)
 - **HTTP/2**: HTTP/2 support via TLS ALPN negotiation (stream multiplexing, HPACK compression)
+- **H2C Server**: HTTP/2 Cleartext (H2C) server support without TLS (Prior Knowledge mode, RFC 7540 Section 3.4)
 - **HTTP/3**: QUIC/UDP-based HTTP/3 support using quiche (0-RTT connection establishment)
 - **Fast Allocator**: High-speed memory allocation with mimalloc + Huge Pages support
 - **Fast Routing**: O(log n) path matching with Radix Tree (matchit)
@@ -28,7 +29,8 @@ A high-performance reverse proxy server using io_uring (monoio) and rustls.
 - **Proxy Cache**: Memory and disk-based response caching (ETag/304, stale-while-revalidate, stale-if-error)
 - **Buffering Control**: Response buffering to prevent slow clients from blocking backends (Streaming/Full/Adaptive modes)
 - **WebSocket Support**: Bidirectional proxy with Upgrade header detection (Fixed/Adaptive polling modes)
-- **H2C (HTTP/2 over cleartext)**: HTTP/2 backend connection without TLS (gRPC support)
+- **H2C Client**: HTTP/2 backend connection without TLS (gRPC support)
+- **H2C Server**: HTTP/2 Cleartext server support (Prior Knowledge mode, for internal networks)
 - **Header Manipulation**: Add/remove request/response headers (X-Real-IP, HSTS, etc.)
 - **Redirect**: 301/302/307/308 HTTP redirects (with path preservation option)
 - **SNI Configuration**: Specify SNI name when connecting to HTTPS backends via IP (virtual host support)
