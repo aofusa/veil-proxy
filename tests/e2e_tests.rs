@@ -219,6 +219,22 @@ fn send_request(port: u16, path: &str, headers: &[(&str, &str)]) -> Option<Strin
     send_request_with_method(port, path, "GET", headers, None)
 }
 
+/// リトライロジック付きでリクエストを送信（並列実行時の接続エラー対策）
+fn send_request_with_retry(port: u16, path: &str, headers: &[(&str, &str)], max_retries: usize) -> Option<String> {
+    for attempt in 0..max_retries {
+        if let Some(response) = send_request(port, path, headers) {
+            return Some(response);
+        }
+        
+        // 最後の試行でない場合、待機してからリトライ
+        if attempt < max_retries - 1 {
+            let backoff = Duration::from_millis(100 * (attempt + 1) as u64);
+            std::thread::sleep(backoff);
+        }
+    }
+    None
+}
+
 /// HTTPS POSTリクエストを送信してレスポンスを取得
 fn send_post_request(port: u16, path: &str, headers: &[(&str, &str)], body: &[u8]) -> Option<String> {
     send_request_with_method(port, path, "POST", headers, Some(body))
@@ -630,8 +646,9 @@ fn test_backend_server_id_header() {
         return;
     }
     
-    let response = send_request(PROXY_PORT, "/", &[]);
-    assert!(response.is_some(), "Should receive response");
+    // 並列実行時のタイムアウト対策としてリトライロジックを追加
+    let response = send_request_with_retry(PROXY_PORT, "/", &[], 3);
+    assert!(response.is_some(), "Should receive response after retries");
     
     let response = response.unwrap();
     
@@ -734,6 +751,18 @@ fn test_compression_gzip() {
         return;
     }
     
+    // 前提条件: /large.txt が存在することを確認
+    let prereq = send_request(PROXY_PORT, "/large.txt", &[]);
+    if prereq.is_none() {
+        eprintln!("Prerequisite check failed: no response");
+        return;
+    }
+    let prereq_status = get_status_code(&prereq.as_ref().unwrap());
+    if prereq_status != Some(200) {
+        eprintln!("Prerequisite failed: /large.txt not found (status: {:?}), skipping test", prereq_status);
+        return;
+    }
+    
     // Gzip圧縮をリクエスト
     let response = send_request(
         PROXY_PORT, 
@@ -744,23 +773,18 @@ fn test_compression_gzip() {
     
     let response = response.unwrap();
     let status = get_status_code(&response);
-    // 404が返される可能性もあるが、通常は200が返される
-    // 400 Bad Requestが返される場合もある（リクエストの問題）
-    assert!(
-        status == Some(200) || status == Some(404) || status == Some(400),
-        "Should return 200, 404, or 400: {:?}", status
-    );
+    // 前提条件チェックで200が返ることを確認済みなので、ここでも200を期待
+    assert_eq!(status, Some(200), "Compression request should return 200 OK, got: {:?}", status);
     
     // 圧縮が有効な場合、Content-Encodingヘッダーがある
-    // （サイズがmin_size未満の場合は圧縮されない可能性がある）
+    // min_size (1024) 以上のファイルなので圧縮されるはず
     let content_encoding = get_header_value(&response, "Content-Encoding");
-    if let Some(encoding) = content_encoding {
-        assert!(
-            encoding.contains("gzip") || encoding.contains("br") || encoding.contains("zstd"),
-            "Should use compression: {}", encoding
-        );
-    }
+    assert!(
+        content_encoding.as_ref().map(|e| e.contains("gzip") || e.contains("br") || e.contains("zstd")).unwrap_or(false),
+        "Large file should be compressed, got Content-Encoding: {:?}", content_encoding
+    );
 }
+
 
 #[test]
 fn test_compression_brotli() {
@@ -852,8 +876,9 @@ fn test_404_not_found() {
         return;
     }
     
-    let response = send_request(PROXY_PORT, "/nonexistent-path-12345", &[]);
-    assert!(response.is_some(), "Should receive response");
+    // 並列実行時の接続エラー対策としてリトライロジックを追加
+    let response = send_request_with_retry(PROXY_PORT, "/nonexistent-path-12345", &[], 3);
+    assert!(response.is_some(), "Should receive response after retries");
     
     let response = response.unwrap();
     let status = get_status_code(&response);
@@ -990,14 +1015,22 @@ fn test_json_content_type() {
     
     // health endpointはJSONを返す想定
     if status == Some(200) {
+        // Content-Typeがapplication/jsonまたはtext/plainであることを確認
+        let content_type = get_header_value(&response, "Content-Type");
+        assert!(
+            content_type.as_ref().map(|ct| ct.contains("application/json") || ct.contains("text/plain")).unwrap_or(true),
+            "Health endpoint should return JSON or text content type, got: {:?}", content_type
+        );
+        
         // ボディがJSON形式であることを確認
         let body = response.split("\r\n\r\n").nth(1).unwrap_or("");
-        if body.contains("{") && body.contains("}") {
-            // JSONっぽいレスポンス
-            assert!(true, "Response appears to be JSON");
-        }
+        assert!(
+            body.contains("{") && body.contains("}"),
+            "Health endpoint should return JSON body containing braces, got: {}", body
+        );
     }
 }
+
 
 // ====================
 // Keep-Aliveテスト
@@ -1253,19 +1286,27 @@ fn test_backend_connection_failure() {
     }
     
     // 存在しないパスにリクエストを送信（404を期待）
-    // 実際のバックエンド接続失敗をテストするには、設定を変更する必要があるため、
-    // ここでは404エラーをテスト
-    let response = send_request(PROXY_PORT, "/nonexistent", &[]);
-    assert!(response.is_some(), "Should receive response");
+    // 並列実行時の接続エラー対策としてリトライロジックを追加
+    let response = send_request_with_retry(PROXY_PORT, "/nonexistent", &[], 3);
+    assert!(response.is_some(), "Should receive response after retries");
     
     let response = response.unwrap();
     let status = get_status_code(&response);
-    // 404または502が返される可能性がある
-    assert!(
-        status == Some(404) || status == Some(502),
-        "Should return 404 Not Found or 502 Bad Gateway for nonexistent path"
-    );
+    // 静的ファイルルーティングでは存在しないファイル → 404
+    // プロキシエラーの場合 → 502
+    match status {
+        Some(404) => {
+            eprintln!("Backend returned 404 for nonexistent path - expected behavior");
+        }
+        Some(502) => {
+            eprintln!("Backend connection failure resulted in 502 - this indicates backend issue");
+        }
+        _ => {
+            panic!("Unexpected status for nonexistent path: {:?}. Expected 404 or 502", status);
+        }
+    }
 }
+
 
 // ====================
 // WebSocket E2Eテスト（優先度: 中）
@@ -1281,7 +1322,7 @@ fn test_websocket_basic_connection() {
     
     // WebSocket接続を試みる（実際のWebSocket実装は複雑なため、ここでは基本的なテストのみ）
     // 注意: 実際のWebSocketテストには専用のクライアントライブラリが必要
-    // ここでは、WebSocketアップグレードリクエストを送信し、101レスポンスを確認
+    // ここでは、WebSocketアップグレードリクエストを送信し、レスポンスを確認
     
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
     stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -1295,13 +1336,24 @@ fn test_websocket_basic_connection() {
     let _ = stream.read_to_end(&mut response);
     let response = String::from_utf8_lossy(&response);
     
-    // WebSocketがサポートされている場合、101 Switching Protocolsが返される可能性がある
-    // または、WebSocketエンドポイントが存在しない場合は404が返される
     let status = get_status_code(&response);
-    assert!(
-        status == Some(101) || status == Some(404) || status == Some(502),
-        "Should return 101 Switching Protocols, 404, or 502 for WebSocket request: {:?}", status
-    );
+    // WebSocketエンドポイント/wsが設定されていない場合は404
+    // 設定されている場合は101 Switching Protocols
+    match status {
+        Some(101) => {
+            eprintln!("WebSocket upgrade successful: 101 Switching Protocols");
+            // 追加機能：Upgradeヘッダーの確認
+            assert!(response.contains("Upgrade:") || response.contains("upgrade:"),
+                "101 response should contain Upgrade header");
+        }
+        Some(404) => {
+            eprintln!("WebSocket endpoint /ws not configured (404) - this is expected if no WebSocket route is defined");
+        }
+        _ => {
+            // 502および他のステータスは予期しない
+            panic!("Unexpected status for WebSocket request: {:?}. Expected 101 (if configured) or 404 (if not configured)", status);
+        }
+    }
 }
 
 // ====================
@@ -1467,14 +1519,27 @@ fn test_grpc_basic_request() {
         ]
     );
     
-    // レスポンスを受信（gRPCエンドポイントが存在しない場合は404が返される可能性がある）
-    if let Some(response) = response {
-        let status = get_status_code(&response);
-        // gRPCエンドポイントが存在しない場合は404、存在する場合は200が返される
-        assert!(
-            status == Some(200) || status == Some(404) || status == Some(502),
-            "Should return 200, 404, or 502 for gRPC request: {:?}", status
-        );
+    // レスポンスを受信
+    match response {
+        Some(response) => {
+            let status = get_status_code(&response);
+            // gRPCエンドポイントが設定されていない場合は404、設定されている場合は200
+            match status {
+                Some(200) => {
+                    eprintln!("gRPC endpoint found and responding");
+                }
+                Some(404) => {
+                    eprintln!("gRPC endpoint not configured at / - this is expected for basic proxy setup");
+                }
+                _ => {
+                    // 502および他のステータスはバックエンドの問題
+                    panic!("Unexpected status for gRPC request: {:?}. Expected 200 (if configured) or 404 (if not configured)", status);
+                }
+            }
+        }
+        None => {
+            panic!("No response received for gRPC request");
+        }
     }
 }
 
@@ -1515,8 +1580,10 @@ fn test_http3_basic_connection() {
         }
     }
     
-    // 接続が確立されたことを確認
-    assert!(true, "HTTP/3 connection should be established");
+    // 接続が確立されたことを確認（handshakeが成功した場合のみここに到達）
+    // 実際のリクエスト送信で接続の健全性を確認
+    let stream_id = client.send_request("GET", "/health", &[], None);
+    assert!(stream_id.is_ok(), "HTTP/3 connection should allow sending requests after handshake");
     
     // 接続を閉じる
     let _ = client.close();
@@ -1640,12 +1707,16 @@ fn test_http3_configuration_check() {
     }
     
     // HTTP/3設定の確認テスト
-    // HTTP/3が有効化されている場合、設定が正しく読み込まれていることを確認
-    eprintln!("HTTP/3 configuration check: feature is enabled");
+    // HTTP/3が有効化されている場合、UDPソケットへの接続を試みる
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
     
-    // HTTP/3が有効化されている場合、UDPポートがリッスンされている可能性がある
-    // 実際の接続テストで確認
-    assert!(true, "HTTP/3 feature is enabled");
+    // HTTP/3クライアント作成を試みることで設定が有効か確認
+    let client_result = Http3TestClient::new(server_addr);
+    assert!(client_result.is_ok(), 
+        "HTTP/3 should be configured and client should be creatable: {:?}", 
+        client_result.err());
 }
 
 // ====================
@@ -1847,9 +1918,26 @@ fn test_http3_connection_timeout() {
     }
     
     // 接続タイムアウトのテストは、実際のタイムアウトを待つ必要があるため、
-    // ここでは基本的な確認のみを行う
-    eprintln!("HTTP/3 connection timeout test: feature is enabled");
-    assert!(true, "HTTP/3 feature is enabled");
+    // 短いタイムアウトでハンドシェイクを試みて動作を確認
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    
+    let mut client = match Http3TestClient::new(server_addr) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to create HTTP/3 client: {}", e);
+            return;
+        }
+    };
+    
+    // 非常に短いタイムアウトでハンドシェイク
+    let result = client.handshake(Duration::from_millis(100));
+    eprintln!("HTTP/3 connection timeout test: result = {:?}", result.is_ok());
+    
+    // タイムアウトが発生するか、成功するかのいずれか（どちらも有効な結果）
+    // 重要なのはパニックしないこと
+    let _ = client.close();
 }
 
 #[test]
@@ -1915,10 +2003,32 @@ fn test_http3_stream_cancellation() {
     }
     
     // ストリームキャンセルのテスト
-    // 実際のキャンセルはquicheのAPIで行う必要があるため、
-    // ここでは基本的な確認のみを行う
-    eprintln!("HTTP/3 stream cancellation test: feature is enabled");
-    assert!(true, "HTTP/3 feature is enabled");
+    // 接続を確立してストリームを開始した後、接続を閉じることでキャンセル動作を確認
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    
+    let mut client = match Http3TestClient::new(server_addr) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to create HTTP/3 client: {}", e);
+            return;
+        }
+    };
+    
+    if client.handshake(Duration::from_secs(5)).is_err() {
+        eprintln!("HTTP/3 handshake failed, skipping test");
+        return;
+    }
+    
+    // リクエストを送信（レスポンスを待たずに接続を閉じる）
+    let stream_result = client.send_request("GET", "/large.txt", &[], None);
+    eprintln!("HTTP/3 stream cancellation: request sent = {:?}", stream_result.is_ok());
+    
+    // 即座に接続を閉じる（ストリームキャンセル）
+    let close_result = client.close();
+    assert!(close_result.is_ok() || close_result.is_err(), 
+        "Stream cancellation should complete without panic");
 }
 
 #[test]
@@ -2101,9 +2211,38 @@ fn test_http3_stream_timeout() {
     }
     
     // ストリームタイムアウトのテスト
-    // 実際のタイムアウトを待つ必要があるため、ここでは基本的な確認のみを行う
-    eprintln!("HTTP/3 stream timeout test: feature is enabled");
-    assert!(true, "HTTP/3 feature is enabled");
+    // 短いタイムアウトでレスポンス受信を試みる
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    
+    let mut client = match Http3TestClient::new(server_addr) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to create HTTP/3 client: {}", e);
+            return;
+        }
+    };
+    
+    if client.handshake(Duration::from_secs(5)).is_err() {
+        eprintln!("HTTP/3 handshake failed, skipping test");
+        return;
+    }
+    
+    // リクエストを送信
+    let stream_id = match client.send_request("GET", "/", &[], None) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("Failed to send request: {}", e);
+            return;
+        }
+    };
+    
+    // 非常に短いタイムアウトでレスポンス受信を試みる
+    let result = client.recv_response(stream_id, Duration::from_millis(1));
+    eprintln!("HTTP/3 stream timeout test: result = {:?}", result.is_ok());
+    
+    let _ = client.close();
 }
 
 #[test]
@@ -2115,10 +2254,29 @@ fn test_http3_invalid_frame() {
     }
     
     // 不正フレームのテスト
-    // QUICレベルでの不正フレームテストは複雑なため、
-    // ここでは基本的な確認のみを行う
-    eprintln!("HTTP/3 invalid frame test: feature is enabled");
-    assert!(true, "HTTP/3 feature is enabled");
+    // HTTP/3クライアントを作成して正常な接続後、不正なリクエストを送信
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    
+    let mut client = match Http3TestClient::new(server_addr) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to create HTTP/3 client: {}", e);
+            return;
+        }
+    };
+    
+    if client.handshake(Duration::from_secs(5)).is_err() {
+        eprintln!("HTTP/3 handshake failed, skipping test");
+        return;
+    }
+    
+    // 不正なパスでリクエストを送信（これはHTTP/3レベルでは有効だがアプリレベルでエラー）
+    let result = client.send_request("GET", "/\x00invalid", &[], None);
+    eprintln!("HTTP/3 invalid frame test: send result = {:?}", result.is_ok());
+    
+    let _ = client.close();
 }
 
 #[test]
@@ -2200,8 +2358,11 @@ fn test_http3_tls_handshake() {
     match client.handshake(Duration::from_secs(5)) {
         Ok(_) => {
             eprintln!("TLS 1.3 handshake completed successfully");
-            // 接続が確立されたことを確認（TLSハンドシェイクが完了している）
-            assert!(true, "TLS 1.3 handshake should complete");
+            // handshakeの成功は、TLS 1.3ハンドシェイクが完了したことを意味する
+            // 実際のリクエスト送信で接続の健全性を確認
+            let request_result = client.send_request("GET", "/health", &[], None);
+            assert!(request_result.is_ok(), 
+                "TLS 1.3 connection should allow sending requests: {:?}", request_result.err());
         }
         Err(e) => {
             eprintln!("TLS 1.3 handshake failed: {}", e);
@@ -2257,7 +2418,11 @@ fn test_http3_0rtt_connection() {
     match client2.handshake(Duration::from_secs(5)) {
         Ok(_) => {
             eprintln!("Second connection established (may use 0-RTT)");
-            assert!(true, "Second connection should be established");
+            // 2回目の接続が成立したことを実際のリクエストで確認
+            let request_result = client2.send_request("GET", "/health", &[], None);
+            assert!(request_result.is_ok(), 
+                "Second connection should allow sending requests (0-RTT test): {:?}", 
+                request_result.err());
         }
         Err(e) => {
             eprintln!("Second HTTP/3 handshake failed: {}", e);
@@ -2312,11 +2477,11 @@ fn test_http3_connection_close() {
     match client.close() {
         Ok(_) => {
             eprintln!("Connection closed successfully");
-            assert!(true, "Connection should be closed successfully");
+            // close()が成功した場合、接続が正常にクローズされた
         }
         Err(e) => {
-            eprintln!("Failed to close connection: {}", e);
             // エラーでもテストは続行（接続は閉じられている可能性がある）
+            eprintln!("Connection close returned error (may still be closed): {}", e);
         }
     }
 }
@@ -4043,19 +4208,28 @@ fn test_ip_restriction_enforcement() {
     
     // 注意: このテストは設定ファイルでIP制限を設定する必要がある
     // 例: allowed_ips = ["127.0.0.1"]
+    // e2e_setup.shでは127.0.0.1が許可されているので200が期待される
     
-    // 現在の実装では、IP制限の設定がないため、基本的な動作確認のみ
     let response = send_request(PROXY_PORT, "/", &[]);
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
     let status = get_status_code(&response);
-    // IP制限が設定されている場合、403が返される可能性がある
-    // 設定されていない場合、200が返される
-    assert!(
-        status == Some(200) || status == Some(403),
-        "Should return 200 OK or 403 Forbidden"
-    );
+    
+    // 127.0.0.1からのアクセスは許可されているので200が期待される
+    // もし403が返された場合、IP制限設定に問題がある
+    match status {
+        Some(200) => {
+            eprintln!("IP restriction test: 127.0.0.1 is allowed as expected");
+        }
+        Some(403) => {
+            // 127.0.0.1がブロックされている場合、設定が間違っている
+            panic!("IP restriction blocking 127.0.0.1 - check allowed_ips configuration includes 127.0.0.1");
+        }
+        _ => {
+            panic!("Unexpected status: {:?}", status);
+        }
+    }
 }
 
 #[test]
@@ -4938,7 +5112,13 @@ fn test_grpc_web_cors_headers() {
         
         // CORSヘッダーが含まれているか確認（レスポンスに含まれる場合）
         if response.contains("Access-Control-Allow-Origin") {
-            assert!(true, "CORS headers should be present");
+            // CORSヘッダーが存在することを確認
+            let cors_header = get_header_value(&response, "Access-Control-Allow-Origin");
+            assert!(cors_header.is_some(), 
+                "CORS Access-Control-Allow-Origin header should be present when CORS is enabled");
+            eprintln!("CORS header found: {:?}", cors_header);
+        } else {
+            eprintln!("CORS headers not present in response (CORS may not be configured)");
         }
     }
 }
@@ -5109,10 +5289,32 @@ fn test_grpc_stream_reset() {
     }
     
     // gRPCストリームリセットのテスト
-    // 実際のストリームリセットテストはHTTP/2レベルで行う必要があるため、
-    // ここでは基本的な確認のみを行う
-    eprintln!("gRPC stream reset test: feature is enabled");
-    assert!(true, "gRPC feature is enabled");
+    // gRPCクライアントを作成してリクエストを途中でキャンセルする動作をテスト
+    let client_result = GrpcTestClient::new("127.0.0.1", PROXY_PORT);
+    match client_result {
+        Ok(mut client) => {
+            // リクエスト送信を試みる（成功する必要はない）
+            let result = client.send_grpc_request(
+                "/grpc.test.v1.TestService/StreamReset",
+                b"\x00\x00\x00\x00\x05hello",
+                &[],
+            );
+            match result {
+                Ok(response) => {
+                    let status = GrpcTestClient::extract_status_code(&response);
+                    eprintln!("gRPC stream reset test: received response with status {:?}", status);
+                }
+                Err(e) => {
+                    // エラーは想定内（ストリームリセットまたはバックエンド不在）
+                    eprintln!("gRPC stream reset test: received expected error: {}", e);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("gRPC client creation failed: {}", e);
+            return;
+        }
+    }
 }
 
 #[test]
@@ -6120,8 +6322,9 @@ fn test_backend_timeout_handling() {
     // バックエンドが応答しない場合、502 Bad Gatewayまたはタイムアウトエラーが返される
     
     // 通常のリクエストが正常に処理されることを確認
-    let response = send_request(PROXY_PORT, "/", &[]);
-    assert!(response.is_some(), "Should receive response");
+    // 並列実行時のタイムアウト対策としてリトライロジックを追加
+    let response = send_request_with_retry(PROXY_PORT, "/", &[], 3);
+    assert!(response.is_some(), "Should receive response after retries");
     
     let response = response.unwrap();
     let status = get_status_code(&response);
@@ -7159,8 +7362,9 @@ fn test_buffering_adaptive_content_length_missing() {
     // 注意: このテストは設定ファイルでバッファリングを有効化する必要がある
     
     // Chunked Transfer Encodingレスポンス（Content-Lengthなし）
-    let response = send_request(PROXY_PORT, "/", &[]);
-    assert!(response.is_some(), "Should receive response");
+    // 並列実行時のTLSハンドシェイクタイムアウト対策としてリトライロジックを追加
+    let response = send_request_with_retry(PROXY_PORT, "/", &[], 3);
+    assert!(response.is_some(), "Should receive response after retries");
     
     let response = response.unwrap();
     let status = get_status_code(&response);
@@ -13961,22 +14165,27 @@ fn test_backend_rolling_update() {
     // バックエンドサーバーを順次更新しても、サービスが継続されることを確認
     
     // 複数のリクエストを送信して、サービスが継続されることを確認
+    // 並列実行時のTLSハンドシェイクタイムアウト対策としてリトライロジックを追加
     let mut success_count = 0;
-    for _ in 0..10 {
-        let response = send_request(PROXY_PORT, "/", &[]);
+    for i in 0..10 {
+        // 各リクエストにリトライロジックを適用
+        let response = send_request_with_retry(PROXY_PORT, "/", &[], 3);
         if let Some(resp) = response {
             let status = get_status_code(&resp);
             if status == Some(200) {
                 success_count += 1;
             }
         }
-        std::thread::sleep(Duration::from_millis(100));
+        // リクエスト間の待機時間を追加（並列実行時の負荷軽減）
+        if i < 9 {
+            std::thread::sleep(Duration::from_millis(150));
+        }
     }
     
-    // サービスが継続されることを確認
+    // サービスが継続されることを確認（並列実行時は一部失敗を許容）
     assert!(
-        success_count > 0,
-        "Service should continue during rolling update: {}/10", success_count
+        success_count >= 3,
+        "Service should continue during rolling update: {}/10 (at least 3 should succeed)", success_count
     );
 }
 
