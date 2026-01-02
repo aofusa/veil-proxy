@@ -15839,7 +15839,7 @@ async fn transfer_https_response_with_compression(
                 // kTLS使用時はEIO (os error 5) が発生することがある
                 // これはバックエンドがTLS close_notifyを送信せずに接続を閉じた場合に発生
                 if is_connection_closed_error(&e) {
-                    warn!("Backend closed connection (kTLS EIO or connection reset): {}", e);
+                    debug!("Backend closed connection (kTLS EIO or connection reset): {}", e);
                 } else {
                     warn!("Backend read error: {}", e);
                 }
