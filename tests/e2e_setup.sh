@@ -773,9 +773,18 @@ run_tests() {
         fi
     fi
     
+    # デバッグ: 変数の値を確認
+    log_info "TEST_THREADS variable: ${TEST_THREADS}"
     log_info "Running tests with ${TEST_THREADS} parallel threads"
     
-    cargo test --test e2e_tests -- --test-threads="${TEST_THREADS}"
+    # 環境変数を明示的に設定して並列実行を確実にする
+    export RUST_TEST_THREADS="${TEST_THREADS}"
+    
+    # デバッグ: 実際に実行されるコマンドを確認
+    log_info "Command: cargo test --test e2e_tests -- --test-threads=${TEST_THREADS}"
+    
+    # テスト実行
+    cargo test --test e2e_tests -- --test-threads=${TEST_THREADS}
     
     log_info "E2E tests completed"
 }
@@ -831,10 +840,21 @@ case "${1:-}" in
             exit 1
         fi
         
-        # サーバー起動後の安定化待機（30秒）
+        # サーバー起動後の安定化待機（環境変数で制御可能、デフォルト: 30秒）
         # サーバー起動直後は初期化処理に時間がかかるため、テスト開始前に待機
-        log_info "Waiting 30 seconds for servers to stabilize before running tests..."
-        sleep 30
+        STABILIZATION_WAIT="${STABILIZATION_WAIT:-30}"
+        log_info "Waiting ${STABILIZATION_WAIT} seconds for servers to stabilize before running tests..."
+        
+        # set -eを一時的に無効化して、sleepが確実に実行されるようにする
+        set +e
+        # カウントダウン表示で待機時間を視覚的に確認
+        for i in $(seq "${STABILIZATION_WAIT}" -1 1); do
+            echo -ne "\r${GREEN}[INFO]${NC} Waiting ${i} seconds... "
+            sleep 1
+        done
+        echo -ne "\r${GREEN}[INFO]${NC} Waiting complete.                           \n"
+        set -e
+        
         log_info "Starting tests..."
         
         # テスト実行（失敗してもtrapでクリーンアップ）
