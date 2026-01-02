@@ -142,6 +142,15 @@ prepare_fixtures() {
     echo "Hello from H2C Backend" > "${FIXTURES_DIR}/backend_h2c/index.html"
     echo '{"server": "backend_h2c", "status": "ok"}' > "${FIXTURES_DIR}/backend_h2c/health"
     echo "H2C test content" > "${FIXTURES_DIR}/backend_h2c/test.txt"
+    
+    # WASMモジュールの準備
+    mkdir -p "${FIXTURES_DIR}/wasm"
+    if [ -f "${SCRIPT_DIR}/wasm/header_filter.wasm" ]; then
+        cp "${SCRIPT_DIR}/wasm/header_filter.wasm" "${FIXTURES_DIR}/wasm/header_filter.wasm"
+        log_info "WASM module header_filter.wasm copied"
+    else
+        log_warn "WASM module header_filter.wasm not found at ${SCRIPT_DIR}/wasm/header_filter.wasm"
+    fi
 }
 
 # 設定ファイルを生成
@@ -450,6 +459,45 @@ use_h2c = true
 add_response_headers = { "X-Proxied-By" = "veil", "X-H2C-Test" = "true" }
 EOF
 
+    # WASM設定を追加（wasm設定タイプの時のみ有効化）
+    if [ "$config_type" = "wasm" ] || [ "$config_type" = "default" ]; then
+        if [ -f "${FIXTURES_DIR}/wasm/header_filter.wasm" ]; then
+            cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
+
+[wasm]
+enabled = true
+
+[[wasm.modules]]
+name = "header_filter"
+path = "${FIXTURES_DIR}/wasm/header_filter.wasm"
+configuration = '{"add_header": "X-Wasm-Processed", "add_value": "true"}'
+
+[wasm.modules.capabilities]
+allow_logging = true
+allow_request_headers_read = true
+allow_request_headers_write = true
+allow_response_headers_read = true
+allow_response_headers_write = true
+allow_send_local_response = true
+EOF
+            
+            # WASMモジュールを適用するルートを追加
+            cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/wasm/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+modules = ["header_filter"]
+[route.security]
+add_response_headers = { "X-Proxied-By" = "veil" }
+EOF
+        fi
+    fi
+    
     log_info "Configuration files generated (type: ${config_type})"
 }
 
