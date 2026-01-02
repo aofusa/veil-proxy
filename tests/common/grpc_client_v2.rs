@@ -2,12 +2,15 @@
 //!
 //! tonicライブラリを使用したgRPC over HTTP/2クライアント実装
 //! tokioランタイム上で動作し、非同期API
+//!
+//! 既存のテストロジックとの互換性のため、HTTP/1.1経由のgRPCリクエストもサポート
 
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tonic::{Request, Response, Status};
 use http::uri::Uri;
 use bytes::Bytes;
 use std::sync::Arc;
+use super::http1_client::Http1TestClient;
 
 /// gRPCテストクライアント
 /// tonicを使用したHTTP/2ベースのgRPCクライアント
@@ -88,6 +91,196 @@ impl GrpcTestClientV2 {
         
         Err(GrpcError::NotImplemented("Use generated tonic client instead".to_string()))
     }
+    
+    /// HTTP/1.1経由でgRPCリクエストを送信（既存のGrpcTestClientと互換性のあるAPI）
+    /// 既存のテストロジックを維持するため、HTTP/1.1経由のgRPCリクエストをサポート
+    pub async fn send_grpc_request(
+        server_addr: &str,
+        port: u16,
+        path: &str,
+        message: &[u8],
+        metadata: &[(&str, &str)],
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        // gRPCフレームを構築（tests/common/grpc_client.rsのGrpcFrameを使用）
+        #[cfg(feature = "grpc")]
+        use super::grpc_client::GrpcFrame;
+        #[cfg(not(feature = "grpc"))]
+        // grpc featureがない場合のフォールバック
+        struct GrpcFrame {
+            compressed: bool,
+            data: Vec<u8>,
+        }
+        #[cfg(not(feature = "grpc"))]
+        impl GrpcFrame {
+            fn new(data: Vec<u8>) -> Self {
+                Self { compressed: false, data }
+            }
+            fn encode(&self) -> Vec<u8> {
+                let mut buf = Vec::with_capacity(5 + self.data.len());
+                buf.push(if self.compressed { 1 } else { 0 });
+                buf.extend_from_slice(&(self.data.len() as u32).to_be_bytes());
+                buf.extend_from_slice(&self.data);
+                buf
+            }
+        }
+        let frame = GrpcFrame::new(message.to_vec());
+        let frame_bytes = frame.encode();
+        
+        // HTTP/1.1クライアントを作成
+        let client = Http1TestClient::new_https(server_addr, port)?;
+        
+        // メタデータをヘッダーに変換
+        let mut headers = vec![
+            ("Content-Type", "application/grpc"),
+            ("Accept", "application/grpc"),
+        ];
+        for (name, value) in metadata {
+            headers.push((name, value));
+        }
+        
+        // POSTリクエストを送信
+        let (status, body) = client.post_with_headers(path, &headers, &frame_bytes).await?;
+        
+        // HTTPレスポンスを構築（既存のGrpcTestClientと互換性のため）
+        let status_line = format!("HTTP/1.1 {} OK\r\n", status);
+        let mut response = status_line.into_bytes();
+        response.extend_from_slice(b"\r\n");
+        response.extend_from_slice(&body);
+        
+        Ok(response)
+    }
+    
+    /// レスポンスからgRPCフレームを抽出（既存のGrpcTestClientと互換性のあるAPI）
+    pub fn extract_grpc_frame(response: &[u8]) -> Result<super::grpc_client::GrpcFrame, Box<dyn std::error::Error + Send + Sync>> {
+        #[cfg(feature = "grpc")]
+        use super::grpc_client::GrpcFrame;
+        #[cfg(not(feature = "grpc"))]
+        // grpc featureがない場合のフォールバック
+        struct GrpcFrame {
+            compressed: bool,
+            data: Vec<u8>,
+        }
+        
+        // HTTPレスポンスからボディを抽出
+        let body_start = response.windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .ok_or("No HTTP body separator found")? + 4;
+        
+        let body = &response[body_start..];
+        
+        // gRPCフレームをデコード（GrpcFrame::decodeを使用）
+        #[cfg(feature = "grpc")]
+        {
+            let (frame, _) = GrpcFrame::decode(body)?;
+            Ok(frame)
+        }
+        #[cfg(not(feature = "grpc"))]
+        {
+            // grpc featureがない場合の簡易実装
+            if body.len() < 5 {
+                return Err("Insufficient data for gRPC frame header".into());
+            }
+            let compressed = (body[0] & 1) != 0;
+            let length = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
+            if body.len() < 5 + length {
+                return Err(format!("Insufficient data: need {} bytes, have {}", 5 + length, body.len()).into());
+            }
+            let message = body[5..5 + length].to_vec();
+            Ok(GrpcFrame { compressed, data: message })
+        }
+    }
+    
+    /// レスポンスからステータスコードを取得（既存のGrpcTestClientと互換性のあるAPI）
+    pub fn extract_status_code(response: &[u8]) -> Option<u16> {
+        let response_str = std::str::from_utf8(response).ok()?;
+        let status_line = response_str.lines().next()?;
+        let parts: Vec<&str> = status_line.split_whitespace().collect();
+        if parts.len() >= 2 {
+            parts[1].parse().ok()
+        } else {
+            None
+        }
+    }
+    
+    /// レスポンスからgRPCステータスを取得（既存のGrpcTestClientと互換性のあるAPI）
+    pub fn extract_grpc_status(response: &[u8]) -> Option<u32> {
+        let response_str = std::str::from_utf8(response).ok()?;
+        for line in response_str.lines() {
+            if line.starts_with("grpc-status:") {
+                let parts: Vec<&str> = line.split(':').collect();
+                if parts.len() >= 2 {
+                    return parts[1].trim().parse().ok();
+                }
+            }
+        }
+        None
+    }
+    
+    /// レスポンスからgRPCメッセージを取得（既存のGrpcTestClientと互換性のあるAPI）
+    pub fn extract_grpc_message(response: &[u8]) -> Option<String> {
+        let response_str = std::str::from_utf8(response).ok()?;
+        for line in response_str.lines() {
+            if line.starts_with("grpc-message:") {
+                let parts: Vec<&str> = line.split(':').collect();
+                if parts.len() >= 2 {
+                    let message = parts[1].trim();
+                    // URLデコード
+                    return Some(url_decode(message));
+                }
+            }
+        }
+        None
+    }
+    
+    /// レスポンスからすべてのトレーラーヘッダーを取得（既存のGrpcTestClientと互換性のあるAPI）
+    pub fn extract_trailers(response: &[u8]) -> Vec<(String, String)> {
+        let mut trailers = Vec::new();
+        let response_str = match std::str::from_utf8(response) {
+            Ok(s) => s,
+            Err(_) => return trailers,
+        };
+        
+        // ヘッダーセクションとボディセクションを分離
+        let header_end = response_str.find("\r\n\r\n").unwrap_or(0);
+        let trailer_section = &response_str[header_end + 4..];
+        
+        // grpc-で始まるヘッダーを探す
+        for line in trailer_section.lines() {
+            if line.starts_with("grpc-") {
+                if let Some(colon_idx) = line.find(':') {
+                    let name = line[..colon_idx].trim().to_string();
+                    let value = line[colon_idx + 1..].trim().to_string();
+                    trailers.push((name, value));
+                }
+            }
+        }
+        
+        trailers
+    }
+}
+
+/// URLデコード（簡易実装）
+fn url_decode(encoded: &str) -> String {
+    let mut result = String::new();
+    let mut chars = encoded.chars().peekable();
+    
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let hex: String = chars.by_ref().take(2).collect();
+            if hex.len() == 2 {
+                if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                    result.push(byte as char);
+                    continue;
+                }
+            }
+            result.push('%');
+            result.push_str(&hex);
+        } else {
+            result.push(c);
+        }
+    }
+    
+    result
 }
 
 /// gRPCエラー
