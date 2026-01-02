@@ -17,6 +17,7 @@ io_uring (monoio) と rustls を使用した高性能リバースプロキシサ
 - **TLS**: rustls によるメモリ安全な Pure Rust TLS実装
 - **kTLS**: rustls + ktls2 によるカーネルTLSオフロード対応（Linux 5.15+）
 - **HTTP/2**: TLS ALPNネゴシエーションによるHTTP/2サポート（ストリーム多重化、HPACK圧縮）
+- **H2Cサーバー**: TLSなしのHTTP/2 Cleartext (H2C) サーバーサポート（Prior Knowledgeモード、RFC 7540 Section 3.4）
 - **HTTP/3**: QUIC/UDPベースのHTTP/3サポート（quiche使用、0-RTT接続確立）
 - **高速アロケータ**: mimalloc による高速メモリ割り当て + Huge Pages対応
 - **高速ルーティング**: Radix Tree (matchit) によるO(log n)パスマッチング
@@ -29,6 +30,7 @@ io_uring (monoio) と rustls を使用した高性能リバースプロキシサ
 - **バッファリング制御**: 低速クライアントによるバックエンド占有防止のためのレスポンスバッファリング（Streaming/Full/Adaptiveモード）
 - **WebSocketサポート**: Upgradeヘッダー検知による双方向プロキシ（Fixed/Adaptiveポーリングモード）
 - **H2C (HTTP/2 over cleartext)**: TLSなしのHTTP/2バックエンド接続（gRPC対応）
+- **H2Cサーバー**: HTTP/2 Cleartextサーバーサポート（Prior Knowledgeモード、内部ネットワーク向け）
 - **ヘッダー操作**: リクエスト/レスポンスヘッダーの追加・削除（X-Real-IP, HSTS等）
 - **リダイレクト**: 301/302/307/308 HTTPリダイレクト（パス保持オプション付き）
 - **SNI設定**: HTTPSバックエンドへのIP直打ち時にSNI名を指定可能（仮想ホスト対応）
@@ -1968,6 +1970,49 @@ stream_idle_timeout_secs = 60
 ### HTTP/1.1フォールバック
 
 HTTP/2をサポートしないクライアントは自動的にHTTP/1.1にフォールバックします。
+
+### H2C (HTTP/2 Cleartext) サーバー
+
+VeilはH2C（HTTP/2 Cleartext、Prior Knowledgeモード）サーバーとしても動作できます。TLSなしでHTTP/2接続を受け付けます。
+
+#### 特徴
+
+- **Prior Knowledgeモード**: RFC 7540 Section 3.4に準拠したH2C接続
+- **プロトコル自動検出**: 同一ポートでTLS、H2C、HTTP/1.1を自動判別
+- **専用リスナー**: H2C専用ポートでのリッスンも可能
+- **内部ネットワーク向け**: 平文通信のため、本番環境では内部ネットワークでのみ使用を推奨
+
+#### 有効化
+
+```bash
+# HTTP/2フィーチャー付きでビルド
+cargo build --release --features http2
+```
+
+```toml
+# config.toml
+[server]
+# H2Cサーバーを有効化
+h2c_enabled = true
+
+# H2C専用リッスンアドレス（オプション）
+# 未指定の場合は server.listen と同じアドレスを使用
+h2c_listen = "0.0.0.0:8080"
+```
+
+#### 使用方法
+
+```bash
+# curlでH2C接続をテスト
+curl --http2-prior-knowledge http://localhost:8080/
+```
+
+#### 注意事項
+
+- `--features http2` でビルドする必要があります
+- 平文通信のため、本番環境では内部ネットワークでのみ使用を推奨
+- ALPNネゴシエーションは行われません（Prior Knowledgeモード）
+- プロトコル検出は接続開始時の最初の数バイトを確認して行われます
 
 ## HTTP/3サポート
 
