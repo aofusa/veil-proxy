@@ -190,7 +190,7 @@ use std::net::SocketAddr;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(target_os = "linux")]
 use std::sync::atomic::AtomicUsize;
 use std::thread;
@@ -654,6 +654,54 @@ where
     F: std::future::Future<Output = ()> + 'static,
 {
     monoio::spawn(CatchUnwindFuture::new(future));
+}
+
+/// グレースフルシャットダウン時に既存接続の完了を待機
+/// 
+/// CURRENT_CONNECTIONSが0になるか、タイムアウトに達するまで待機します。
+/// 設定されたタイムアウト（GRACEFUL_SHUTDOWN_TIMEOUT_SECS）を使用。
+/// 
+/// # Arguments
+/// * `worker_type` - ワーカーの種類（ログ表示用）
+/// * `thread_id` - スレッドID（ログ表示用）
+async fn drain_connections(worker_type: &str, thread_id: usize) {
+    let timeout_secs = GRACEFUL_SHUTDOWN_TIMEOUT_SECS.load(Ordering::Relaxed);
+    
+    if timeout_secs == 0 {
+        // タイムアウト0の場合は即座に終了（既存の動作）
+        return;
+    }
+    
+    let start = std::time::Instant::now();
+    let drain_timeout = Duration::from_secs(timeout_secs);
+    
+    // 初期接続数を確認
+    let initial_connections = CURRENT_CONNECTIONS.load(Ordering::Relaxed);
+    if initial_connections == 0 {
+        info!("[{} {}] No active connections, proceeding with shutdown", worker_type, thread_id);
+        return;
+    }
+    
+    info!("[{} {}] Draining {} active connections (timeout: {}s)...", 
+          worker_type, thread_id, initial_connections, timeout_secs);
+    
+    // 接続数が0になるかタイムアウトするまで待機
+    while CURRENT_CONNECTIONS.load(Ordering::Relaxed) > 0 {
+        if start.elapsed() > drain_timeout {
+            let remaining = CURRENT_CONNECTIONS.load(Ordering::Relaxed);
+            warn!("[{} {}] Drain timeout after {}s, {} connections still active (forcing shutdown)", 
+                  worker_type, thread_id, timeout_secs, remaining);
+            break;
+        }
+        monoio::time::sleep(Duration::from_millis(100)).await;
+    }
+    
+    let elapsed = start.elapsed();
+    let remaining = CURRENT_CONNECTIONS.load(Ordering::Relaxed);
+    if remaining == 0 {
+        info!("[{} {}] All connections drained in {:.1}s", 
+              worker_type, thread_id, elapsed.as_secs_f64());
+    }
 }
 
 /// アップストリーム健康状態ゲージ（upstream, server ラベル付き）
@@ -2588,6 +2636,10 @@ pub static SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
 /// Arc<AtomicBool> として初期化（signal-hook の要件）
 static RELOAD_FLAG: Lazy<Arc<AtomicBool>> = Lazy::new(|| Arc::new(AtomicBool::new(false)));
 
+/// グレースフルシャットダウンタイムアウト（秒）
+/// 起動時に設定ファイルから読み込まれ、ワーカースレッドがドレイン待機時に参照
+static GRACEFUL_SHUTDOWN_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(30);
+
 // ====================
 // セキュアなメモリ操作
 // ====================
@@ -4207,6 +4259,25 @@ struct ServerConfigSection {
     #[serde(default)]
     #[cfg_attr(not(feature = "http2"), allow(dead_code))]
     h2c_listen: Option<String>,
+    
+    // ====================
+    // グレースフルシャットダウン設定
+    // ====================
+    
+    /// グレースフルシャットダウンのドレインタイムアウト（秒）
+    /// 
+    /// SIGTERMまたはSIGINT受信時に、既存の接続が完了するまで待機する最大時間。
+    /// タイムアウト後は残りの接続を強制終了します。
+    /// 
+    /// デフォルト: 30秒
+    /// 0: 待機せずに即座に終了（既存の動作）
+    #[serde(default = "default_graceful_shutdown_timeout")]
+    graceful_shutdown_timeout_secs: u64,
+}
+
+/// グレースフルシャットダウンタイムアウトのデフォルト値（30秒）
+fn default_graceful_shutdown_timeout() -> u64 {
+    30
 }
 
 /// Serverヘッダーのデフォルト値
@@ -6059,6 +6130,8 @@ struct LoadedConfig {
     wasm_filter_engine: Option<Arc<crate::wasm::FilterEngine>>,
     /// パフォーマンス設定
     performance: PerformanceConfigSection,
+    /// グレースフルシャットダウンタイムアウト（秒）
+    graceful_shutdown_timeout_secs: u64,
 }
 
 // ====================
@@ -6581,6 +6654,7 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         #[cfg(feature = "wasm")]
         wasm_filter_engine,
         performance: config.performance.clone(),
+        graceful_shutdown_timeout_secs: config.server.graceful_shutdown_timeout_secs,
     })
 }
 
@@ -7203,6 +7277,14 @@ fn main() {
     //     この設定は以降の新規割り当てに影響する
     configure_huge_pages(loaded_config.huge_pages_enabled);
     
+    // グレースフルシャットダウンタイムアウトを設定
+    GRACEFUL_SHUTDOWN_TIMEOUT_SECS.store(loaded_config.graceful_shutdown_timeout_secs, Ordering::Relaxed);
+    if loaded_config.graceful_shutdown_timeout_secs > 0 {
+        info!("Graceful shutdown timeout: {} seconds", loaded_config.graceful_shutdown_timeout_secs);
+    } else {
+        info!("Graceful shutdown timeout: disabled (immediate shutdown)");
+    }
+    
     // TLS アクセプターを作成
     #[cfg(feature = "ktls")]
     let acceptor = RustlsAcceptor::new(loaded_config.tls_config.clone())
@@ -7574,6 +7656,9 @@ fn main() {
                     });
                 }
                 
+                // グレースフルシャットダウン: 既存接続の完了を待機
+                drain_connections("Thread", thread_id).await;
+                
                 info!("[Thread {}] Worker stopped", thread_id);
             });
         });
@@ -7634,6 +7719,14 @@ fn main() {
                     spawn_with_panic_catch(async move {
                         handle_http_redirect(stream).await;
                     });
+                }
+                
+                // グレースフルシャットダウン: 既存接続の完了を待機
+                // HTTPリダイレクトワーカーはConnectionGuardを使用していないため、
+                // 単純にスリープで待機（リダイレクト処理は高速なため問題なし）
+                let timeout_secs = GRACEFUL_SHUTDOWN_TIMEOUT_SECS.load(Ordering::Relaxed);
+                if timeout_secs > 0 {
+                    monoio::time::sleep(Duration::from_millis(500)).await;
                 }
                 
                 info!("[HTTP] Redirect worker stopped");
@@ -7848,6 +7941,9 @@ fn main() {
                             handle_h2c_connection(stream, &peer_addr.ip().to_string(), Vec::new()).await;
                         });
                     }
+                    
+                    // グレースフルシャットダウン: 既存接続の完了を待機
+                    drain_connections("H2C Worker", thread_id).await;
                     
                     info!("[H2C Worker {}] Stopped", thread_id);
                 });

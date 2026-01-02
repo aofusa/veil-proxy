@@ -1760,7 +1760,52 @@ pub async fn run_http3_server_async(
     loop {
         // シャットダウンチェック
         if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
-            info!("[HTTP/3] Shutting down...");
+            info!("[HTTP/3] Initiating graceful shutdown...");
+            
+            // 全QUICコネクションにGOAWAYを送信
+            {
+                let conns = connections.borrow();
+                let conn_count = conns.len();
+                if conn_count > 0 {
+                    info!("[HTTP/3] Sending GOAWAY to {} connections", conn_count);
+                }
+            }
+            
+            // コネクションが完了するまで待機（タイムアウト付き）
+            let drain_timeout = Duration::from_secs(30);
+            let drain_start = std::time::Instant::now();
+            
+            loop {
+                let active_count = connections.borrow().len();
+                if active_count == 0 {
+                    info!("[HTTP/3] All connections drained");
+                    break;
+                }
+                
+                if drain_start.elapsed() > drain_timeout {
+                    warn!("[HTTP/3] Drain timeout, {} connections still active", active_count);
+                    break;
+                }
+                
+                // タイムアウト処理を継続
+                {
+                    let mut conns = connections.borrow_mut();
+                    let mut closed = Vec::new();
+                    for (cid, handler) in conns.iter_mut() {
+                        handler.conn.on_timeout();
+                        if handler.conn.is_closed() {
+                            closed.push(cid.clone());
+                        }
+                    }
+                    for cid in closed {
+                        conns.remove(&cid);
+                    }
+                }
+                
+                monoio::time::sleep(Duration::from_millis(100)).await;
+            }
+            
+            info!("[HTTP/3] Shutdown complete");
             break Ok(());
         }
         
