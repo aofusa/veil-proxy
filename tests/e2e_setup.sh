@@ -677,6 +677,36 @@ wait_for_server() {
     return 1
 }
 
+# サーバーの安定性を確認（複数回の連続成功を要求）
+# サーバーが完全に初期化され、安定した状態であることを確認する
+verify_server_stability() {
+    local url=$1
+    local name=$2
+    local required_successes=${3:-5}  # デフォルト5回連続成功
+    local max_attempts=${4:-50}  # 最大試行回数（デフォルト50回 = 25秒）
+    local attempt=0
+    local success_count=0
+    
+    log_info "Verifying ${name} stability (requires ${required_successes} consecutive successes)..."
+    
+    while [ $attempt -lt $max_attempts ]; do
+        if curl -ks "$url" > /dev/null 2>&1; then
+            success_count=$((success_count + 1))
+            if [ $success_count -ge $required_successes ]; then
+                log_info "${name} is stable (${success_count} consecutive successes)"
+                return 0
+            fi
+        else
+            success_count=0  # 失敗したらカウントをリセット
+        fi
+        attempt=$((attempt + 1))
+        sleep 0.5
+    done
+    
+    log_error "${name} failed to stabilize after ${max_attempts} attempts (max successes: ${success_count})"
+    return 1
+}
+
 # H2Cサーバーの起動を待機（HTTP平文、リトライ付き）
 wait_for_h2c_server() {
     local url=$1
@@ -699,6 +729,7 @@ wait_for_h2c_server() {
 }
 
 # ヘルスチェック（リトライ付き）
+# サーバーが起動していることを確認（最初の応答を待つ）
 health_check() {
     log_info "Checking server health..."
     
@@ -740,6 +771,72 @@ health_check() {
     fi
     
     log_info "All servers healthy"
+}
+
+# サーバーの安定性を確認（複数回の連続成功を要求）
+# サーバーが完全に初期化され、安定した状態であることを確認する
+verify_server_stability_check() {
+    log_info "Verifying server stability..."
+    
+    # バックエンド1の安定性を確認
+    if verify_server_stability "https://127.0.0.1:${BACKEND1_PORT}/health" "Backend 1" 5 50; then
+        log_info "Backend 1: Stable"
+    else
+        log_error "Backend 1: Not stable"
+        return 1
+    fi
+    
+    # バックエンド2の安定性を確認
+    if verify_server_stability "https://127.0.0.1:${BACKEND2_PORT}/health" "Backend 2" 5 50; then
+        log_info "Backend 2: Stable"
+    else
+        log_error "Backend 2: Not stable"
+        return 1
+    fi
+    
+    # H2Cバックエンドの安定性を確認（HTTP平文）
+    local h2c_success_count=0
+    local h2c_attempt=0
+    local h2c_max_attempts=50
+    log_info "Verifying H2C Backend stability (requires 5 consecutive successes)..."
+    while [ $h2c_attempt -lt $h2c_max_attempts ]; do
+        if curl -s --http2-prior-knowledge "http://127.0.0.1:${BACKEND_H2C_PORT}/health" > /dev/null 2>&1; then
+            h2c_success_count=$((h2c_success_count + 1))
+            if [ $h2c_success_count -ge 5 ]; then
+                log_info "H2C Backend is stable (${h2c_success_count} consecutive successes)"
+                break
+            fi
+        else
+            h2c_success_count=0
+        fi
+        h2c_attempt=$((h2c_attempt + 1))
+        sleep 0.5
+    done
+    if [ $h2c_success_count -lt 5 ]; then
+        log_error "H2C Backend failed to stabilize after ${h2c_max_attempts} attempts"
+        return 1
+    fi
+    
+    # プロキシの安定性を確認
+    local proxy_url=""
+    if curl -ks "http://127.0.0.1:${PROXY_HTTP_PORT}/__metrics" > /dev/null 2>&1; then
+        proxy_url="http://127.0.0.1:${PROXY_HTTP_PORT}/__metrics"
+    elif curl -ks "https://127.0.0.1:${PROXY_HTTPS_PORT}/__metrics" > /dev/null 2>&1; then
+        proxy_url="https://127.0.0.1:${PROXY_HTTPS_PORT}/__metrics"
+    else
+        log_error "Proxy is not accessible"
+        return 1
+    fi
+    
+    if verify_server_stability "$proxy_url" "Proxy" 5 50; then
+        log_info "Proxy: Stable"
+    else
+        log_error "Proxy: Not stable"
+        return 1
+    fi
+    
+    log_info "All servers are stable and ready"
+    return 0
 }
 
 # テスト実行
@@ -840,10 +937,17 @@ case "${1:-}" in
             exit 1
         fi
         
-        # サーバー起動後の安定化待機（環境変数で制御可能、デフォルト: 30秒）
-        # サーバー起動直後は初期化処理に時間がかかるため、テスト開始前に待機
-        STABILIZATION_WAIT="${STABILIZATION_WAIT:-30}"
-        log_info "Waiting ${STABILIZATION_WAIT} seconds for servers to stabilize before running tests..."
+        # サーバーの安定性を確認（複数回の連続成功を要求）
+        # サーバーが完全に初期化され、安定した状態であることを確認する
+        if ! verify_server_stability_check; then
+            log_error "Server stability check failed, stopping servers"
+            exit 1
+        fi
+        
+        # サーバー起動後の最終安定化待機（環境変数で制御可能、デフォルト: 5秒）
+        # verify_server_stability_checkで安定性を確認しているため、追加の待機時間は短縮可能
+        STABILIZATION_WAIT="${STABILIZATION_WAIT:-5}"
+        log_info "Waiting ${STABILIZATION_WAIT} seconds for final stabilization before running tests..."
         
         # set -eを一時的に無効化して、sleepが確実に実行されるようにする
         set +e
