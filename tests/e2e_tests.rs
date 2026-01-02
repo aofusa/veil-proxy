@@ -9,13 +9,17 @@
 //! ./tests/e2e_setup.sh test
 //! ```
 //! 
+//! 並列化による高速化（Phase 1実装済み）:
+//! - デフォルト: CPUコア数または4（小さい方）で並列実行
+//! - カスタム並列数: `PARALLEL_JOBS=8 ./tests/e2e_setup.sh test`
+//! 
 //! ### 方法2: 手動で環境を準備
 //! ```bash
 //! # 1. 環境を起動
 //! ./tests/e2e_setup.sh start
 //! 
-//! # 2. テストを実行
-//! cargo test --test e2e_tests -- --test-threads=1
+//! # 2. テストを実行（並列実行）
+//! cargo test --test e2e_tests -- --test-threads=4
 //! 
 //! # 3. 環境を停止
 //! ./tests/e2e_setup.sh stop
@@ -12666,6 +12670,162 @@ mod wasm_tests {
         if normal_processed.is_some() {
             eprintln!("Note: Normal route also has X-Veil-Processed header (may be configured globally)");
         }
+    }
+
+    // ====================
+    // 追加テスト: ボディ処理
+    // ====================
+
+    #[test]
+    fn test_wasm_on_request_body() {
+        if !is_e2e_environment_ready() {
+            eprintln!("Skipping test: E2E environment not ready");
+            return;
+        }
+        
+        // on_request_bodyコールバックの動作を確認
+        // 注意: header_filter.wasmはボディ処理を行わないため、基本的な動作確認のみ
+        let body = b"test request body";
+        let response = send_post_request(PROXY_PORT, "/wasm/", &[], body);
+        assert!(response.is_some(), "Should receive response");
+        
+        let response = response.unwrap();
+        let status = get_status_code(&response);
+        assert_eq!(status, Some(200), "Should return 200 OK");
+        
+        // WASMモジュールが正常に動作していることを確認
+        let processed = get_header_value(&response, "X-Veil-Processed");
+        assert_eq!(processed, Some("true".to_string()), 
+                   "Should have X-Veil-Processed header indicating WASM module executed");
+    }
+
+    #[test]
+    fn test_wasm_on_response_body() {
+        if !is_e2e_environment_ready() {
+            eprintln!("Skipping test: E2E environment not ready");
+            return;
+        }
+        
+        // on_response_bodyコールバックの動作を確認
+        // 注意: header_filter.wasmはボディ処理を行わないため、基本的な動作確認のみ
+        let response = send_request(PROXY_PORT, "/wasm/", &[]);
+        assert!(response.is_some(), "Should receive response");
+        
+        let response = response.unwrap();
+        let status = get_status_code(&response);
+        assert_eq!(status, Some(200), "Should return 200 OK");
+        
+        // WASMモジュールが正常に動作していることを確認
+        let processed = get_header_value(&response, "X-Veil-Processed");
+        assert_eq!(processed, Some("true".to_string()), 
+                   "Should have X-Veil-Processed header indicating WASM module executed");
+        
+        // レスポンスボディが存在することを確認
+        // レスポンスボディはヘッダー部分の後に存在
+        let body_start = response.find("\r\n\r\n");
+        if let Some(start) = body_start {
+            let body = &response[start + 4..];
+            assert!(!body.is_empty(), "Should have response body");
+        }
+    }
+
+    // ====================
+    // 追加テスト: ケーパビリティ制御
+    // ====================
+
+    #[test]
+    fn test_wasm_capability_logging() {
+        if !is_e2e_environment_ready() {
+            eprintln!("Skipping test: E2E environment not ready");
+            return;
+        }
+        
+        // ログ権限のテスト
+        // header_filter.wasmはログ権限が有効になっているため、正常に動作することを確認
+        let response = send_request(PROXY_PORT, "/wasm/", &[]);
+        assert!(response.is_some(), "Should receive response");
+        
+        let response = response.unwrap();
+        let status = get_status_code(&response);
+        assert_eq!(status, Some(200), "Should return 200 OK");
+        
+        // ログ権限が有効な場合、WASMモジュールが正常に動作することを確認
+        // (ログ出力は直接確認できないため、動作確認のみ)
+        let processed = get_header_value(&response, "X-Veil-Processed");
+        assert_eq!(processed, Some("true".to_string()), 
+                   "Should have X-Veil-Processed header when logging capability is enabled");
+    }
+
+    #[test]
+    fn test_wasm_capability_http_calls() {
+        if !is_e2e_environment_ready() {
+            eprintln!("Skipping test: E2E environment not ready");
+            return;
+        }
+        
+        // HTTP呼び出し権限のテスト
+        // 注意: header_filter.wasmはHTTP呼び出しを行わないため、基本的な動作確認のみ
+        // 実際のHTTP呼び出しテストには、HTTP呼び出しを行うWASMモジュールが必要
+        let response = send_request(PROXY_PORT, "/wasm/", &[]);
+        assert!(response.is_some(), "Should receive response");
+        
+        let response = response.unwrap();
+        let status = get_status_code(&response);
+        assert_eq!(status, Some(200), "Should return 200 OK");
+        
+        // WASMモジュールが正常に動作していることを確認
+        let processed = get_header_value(&response, "X-Veil-Processed");
+        assert_eq!(processed, Some("true".to_string()), 
+                   "Should have X-Veil-Processed header");
+    }
+
+    // ====================
+    // 追加テスト: タイムアウト・エラーハンドリング
+    // ====================
+
+    #[test]
+    fn test_wasm_timeout() {
+        if !is_e2e_environment_ready() {
+            eprintln!("Skipping test: E2E environment not ready");
+            return;
+        }
+        
+        // タイムアウト処理のテスト
+        // 注意: 実際のタイムアウトテストには、長時間実行するWASMモジュールが必要
+        // 現在は基本的な動作確認のみ
+        let response = send_request(PROXY_PORT, "/wasm/", &[]);
+        assert!(response.is_some(), "Should receive response");
+        
+        let response = response.unwrap();
+        let status = get_status_code(&response);
+        assert_eq!(status, Some(200), "Should return 200 OK");
+        
+        // タイムアウトが発生しないことを確認（正常に処理される）
+        let processed = get_header_value(&response, "X-Veil-Processed");
+        assert_eq!(processed, Some("true".to_string()), 
+                   "Should have X-Veil-Processed header indicating WASM module executed without timeout");
+    }
+
+    #[test]
+    fn test_wasm_error_handling() {
+        if !is_e2e_environment_ready() {
+            eprintln!("Skipping test: E2E environment not ready");
+            return;
+        }
+        
+        // エラーハンドリングのテスト
+        // 正常なリクエストがエラーなく処理されることを確認
+        let response = send_request(PROXY_PORT, "/wasm/", &[]);
+        assert!(response.is_some(), "Should receive response");
+        
+        let response = response.unwrap();
+        let status = get_status_code(&response);
+        assert_eq!(status, Some(200), "Should return 200 OK");
+        
+        // WASMモジュールがエラーなく動作することを確認
+        let processed = get_header_value(&response, "X-Veil-Processed");
+        assert_eq!(processed, Some("true".to_string()), 
+                   "Should have X-Veil-Processed header indicating WASM module executed without error");
     }
 }
 
