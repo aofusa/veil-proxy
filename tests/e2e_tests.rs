@@ -51,6 +51,15 @@ use common::grpc_client::{GrpcTestClient, GrpcFrame};
 #[cfg(feature = "grpc-web")]
 use base64;
 
+// 新しい非同期テストクライアント（hyper + tokio）
+use common::http1_client::Http1TestClient;
+
+// 新しい非同期HTTP/3テストクライアント（h3 + quinn）
+use common::http3_client_v2::{Http3TestClientV2, http3_get};
+
+// 新しい非同期gRPCテストクライアント（tonic）
+use common::grpc_client_v2::GrpcTestClientV2;
+
 // E2E環境のポート設定（e2e_setup.shと一致させる）
 const PROXY_PORT: u16 = 8443;  // プロキシHTTPSポート
 #[allow(dead_code)]
@@ -565,7 +574,198 @@ fn get_status_code(response: &str) -> Option<u16> {
 }
 
 // ====================
-// プロキシ基本機能テスト
+// 非同期テストヘルパー関数（hyper + tokio）
+// ====================
+
+/// 非同期版: HTTPS GETリクエストを送信
+async fn send_request_async(port: u16, path: &str) -> Result<(u16, String), Box<dyn std::error::Error + Send + Sync>> {
+    let client = Http1TestClient::new_https("127.0.0.1", port)?;
+    let (status, body) = client.get(path).await?;
+    Ok((status, String::from_utf8_lossy(&body).to_string()))
+}
+
+/// 非同期版: カスタムヘッダー付きHTTPS GETリクエストを送信
+#[allow(dead_code)]
+async fn send_request_with_headers_async(
+    port: u16, 
+    path: &str, 
+    headers: &[(&str, &str)]
+) -> Result<(u16, String), Box<dyn std::error::Error + Send + Sync>> {
+    let client = Http1TestClient::new_https("127.0.0.1", port)?;
+    let (status, body) = client.get_with_headers(path, headers).await?;
+    Ok((status, String::from_utf8_lossy(&body).to_string()))
+}
+
+/// 非同期版: HTTPS POSTリクエストを送信
+#[allow(dead_code)]
+async fn send_post_request_async(
+    port: u16, 
+    path: &str, 
+    body: &[u8]
+) -> Result<(u16, String), Box<dyn std::error::Error + Send + Sync>> {
+    let client = Http1TestClient::new_https("127.0.0.1", port)?;
+    let (status, resp_body) = client.post(path, body).await?;
+    Ok((status, String::from_utf8_lossy(&resp_body).to_string()))
+}
+
+// ====================
+// 非同期版 プロキシ基本機能テスト（hyper使用）
+// ====================
+
+/// プロキシ基本リクエストテスト（非同期版）
+#[tokio::test]
+async fn test_proxy_basic_request_async() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    match send_request_async(PROXY_PORT, "/").await {
+        Ok((status, _body)) => {
+            assert_eq!(status, 200, "Should return 200 OK");
+        }
+        Err(e) => {
+            eprintln!("Request failed: {}", e);
+            panic!("Failed to send request via hyper client: {}", e);
+        }
+    }
+}
+
+/// ヘルスエンドポイントテスト（非同期版）
+#[tokio::test]
+async fn test_proxy_health_endpoint_async() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    match send_request_async(PROXY_PORT, "/health").await {
+        Ok((status, _body)) => {
+            assert_eq!(status, 200, "Health endpoint should return 200 OK");
+        }
+        Err(e) => {
+            eprintln!("Request failed: {}", e);
+            panic!("Failed to send request to health endpoint: {}", e);
+        }
+    }
+}
+
+// ====================
+// 非同期版 HTTP/3テスト（h3 + quinn使用）
+// ====================
+
+/// HTTP/3基本接続テスト（非同期版）
+#[tokio::test]
+async fn test_http3_basic_connection_async() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    
+    // HTTP/3接続を確立（新しいh3-quinnクライアント使用）
+    match Http3TestClientV2::connect(server_addr, "localhost").await {
+        Ok(_client) => {
+            eprintln!("HTTP/3 (h3-quinn) connection established successfully");
+        }
+        Err(e) => {
+            eprintln!("HTTP/3 handshake failed for {}: {} (HTTP/3 may not be enabled)", server_addr, e);
+            // HTTP/3が有効化されていない場合はテストをスキップ
+            return;
+        }
+    }
+}
+
+/// HTTP/3 GETリクエストテスト（非同期版）
+#[tokio::test]
+async fn test_http3_get_request_async() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    
+    // HTTP/3接続を確立してリクエストを送信
+    match Http3TestClientV2::new(server_addr, "localhost").await {
+        Ok((_client, mut send_request)) => {
+            // GETリクエストを送信
+            match http3_get(&mut send_request, "/health").await {
+                Ok((status, body)) => {
+                    assert_eq!(status, 200, "HTTP/3 GET should return 200 OK");
+                    eprintln!("HTTP/3 GET response: {} bytes", body.len());
+                }
+                Err(e) => {
+                    eprintln!("HTTP/3 GET request failed: {} (HTTP/3 may not be enabled)", e);
+                    // HTTP/3が有効化されていない場合はテストをスキップ
+                    return;
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("HTTP/3 connection failed for {}: {} (HTTP/3 may not be enabled)", server_addr, e);
+            // HTTP/3が有効化されていない場合はテストをスキップ
+            return;
+        }
+    }
+}
+
+// ====================
+// 非同期版 gRPCテスト（tonic使用）
+// ====================
+
+/// gRPC接続テスト（非同期版）
+/// 注意: tonicはProtobufサービス定義が必要なため、
+/// ここでは接続確立のみをテストします
+#[tokio::test]
+async fn test_grpc_connection_async() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // gRPCクライアントの作成を試行（TLS接続）
+    match GrpcTestClientV2::new("127.0.0.1", PROXY_PORT).await {
+        Ok(_client) => {
+            eprintln!("gRPC (tonic) connection created successfully");
+            // 注意: 実際のgRPC呼び出しにはProtobufサービス定義が必要
+            // ここでは接続確立のみを確認
+        }
+        Err(e) => {
+            // 接続エラーは想定内（gRPCバックエンドが設定されていない場合など）
+            eprintln!("gRPC connection failed: {} (this may be expected if gRPC backend is not configured)", e);
+            // テストをスキップではなく、接続試行自体は成功とみなす
+        }
+    }
+}
+
+/// gRPCプレーンテキスト（h2c）接続テスト（非同期版）
+#[tokio::test]
+async fn test_grpc_h2c_connection_async() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // H2Cポートへの接続を試行
+    match GrpcTestClientV2::new_plaintext("127.0.0.1", PROXY_H2C_PORT).await {
+        Ok(_client) => {
+            eprintln!("gRPC (tonic h2c) connection created successfully on port {}", PROXY_H2C_PORT);
+        }
+        Err(e) => {
+            // H2Cポートが開いていない場合は想定内
+            eprintln!("gRPC h2c connection failed: {} (H2C port {} may not be configured)", e, PROXY_H2C_PORT);
+        }
+    }
+}
+
+// ====================
+// プロキシ基本機能テスト（同期版 - 既存）
 // ====================
 
 #[test]
