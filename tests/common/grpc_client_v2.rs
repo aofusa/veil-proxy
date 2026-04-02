@@ -171,7 +171,7 @@ impl GrpcTestClientV2 {
         // gRPCフレームをデコード（GrpcFrame::decodeを使用）
         #[cfg(feature = "grpc")]
         {
-            let (frame, _) = GrpcFrame::decode(body)?;
+            let (frame, _) = GrpcFrame::decode(body).map_err(|e| e.to_string())?;
             Ok(frame)
         }
         #[cfg(not(feature = "grpc"))]

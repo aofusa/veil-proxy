@@ -484,7 +484,7 @@ async fn test_proxy_basic_request() {
         return;
     }
     
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response from proxy");
     
     let response = response.unwrap();
@@ -499,7 +499,7 @@ async fn test_proxy_health_endpoint() {
         return;
     }
     
-    let response = send_request(PROXY_PORT, "/health", &[]);
+    let response = send_request(PROXY_PORT, "/health", &[]).await;
     assert!(response.is_some(), "Should receive response from health endpoint");
     
     let response = response.unwrap();
@@ -518,7 +518,7 @@ async fn test_response_header_added() {
         return;
     }
     
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -538,7 +538,7 @@ async fn test_server_header_removed() {
         return;
     }
     
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -556,7 +556,7 @@ async fn test_backend_server_id_header() {
     }
     
     // 並列実行時のタイムアウト対策としてリトライロジックを追加
-    let response = send_request_with_retry(PROXY_PORT, "/", &[], 3);
+    let response = send_request_with_retry(PROXY_PORT, "/", &[], 3).await;
     assert!(response.is_some(), "Should receive response after retries");
     
     let response = response.unwrap();
@@ -585,7 +585,7 @@ async fn test_round_robin_distribution() {
     
     // 10回リクエストを送信
     for _ in 0..10 {
-        let response = send_request(PROXY_PORT, "/", &[]);
+        let response = send_request(PROXY_PORT, "/", &[]).await;
         if let Some(response) = response {
             if let Some(server_id) = get_header_value(&response, "X-Server-Id") {
                 match server_id.as_str() {
@@ -619,7 +619,7 @@ async fn test_static_file_index() {
         return;
     }
     
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -638,7 +638,7 @@ async fn test_static_file_large() {
         return;
     }
     
-    let response = send_request(PROXY_PORT, "/large.txt", &[]);
+    let response = send_request(PROXY_PORT, "/large.txt", &[]).await;
     assert!(response.is_some(), "Should receive large file response");
     
     let response = response.unwrap();
@@ -661,7 +661,7 @@ async fn test_compression_gzip() {
     }
     
     // 前提条件: /large.txt が存在することを確認
-    let prereq = send_request(PROXY_PORT, "/large.txt", &[]);
+    let prereq = send_request(PROXY_PORT, "/large.txt", &[]).await;
     if prereq.is_none() {
         panic!("Prerequisite check failed: no response from /large.txt");
     }
@@ -675,7 +675,7 @@ async fn test_compression_gzip() {
         PROXY_PORT, 
         "/large.txt", 
         &[("Accept-Encoding", "gzip")]
-    );
+    ).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -705,7 +705,7 @@ async fn test_compression_brotli() {
         PROXY_PORT, 
         "/large.txt", 
         &[("Accept-Encoding", "br")]
-    );
+    ).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -724,7 +724,7 @@ async fn test_backend1_direct() {
         return;
     }
     
-    let response = send_request(BACKEND1_PORT, "/", &[]);
+    let response = send_request(BACKEND1_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response from backend 1");
     
     let response = response.unwrap();
@@ -739,7 +739,7 @@ async fn test_backend2_direct() {
         return;
     }
     
-    let response = send_request(BACKEND2_PORT, "/", &[]);
+    let response = send_request(BACKEND2_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response from backend 2");
     
     let response = response.unwrap();
@@ -758,7 +758,7 @@ async fn test_prometheus_metrics() {
         return;
     }
     
-    let response = send_request(PROXY_PORT, "/__metrics", &[]);
+    let response = send_request(PROXY_PORT, "/__metrics", &[]).await;
     assert!(response.is_some(), "Should receive metrics response");
     
     let response = response.unwrap();
@@ -784,7 +784,7 @@ async fn test_404_not_found() {
     }
     
     // 並列実行時の接続エラー対策としてリトライロジックを追加
-    let response = send_request_with_retry(PROXY_PORT, "/nonexistent-path-12345", &[], 3);
+    let response = send_request_with_retry(PROXY_PORT, "/nonexistent-path-12345", &[], 3).await;
     assert!(response.is_some(), "Should receive response after retries");
     
     let response = response.unwrap();
@@ -804,7 +804,7 @@ async fn test_https_connection() {
     }
     
     // HTTPSポートに接続
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     
     assert!(response.is_some(), "Should receive response from HTTPS port");
     let response = response.unwrap();
@@ -832,8 +832,8 @@ async fn test_concurrent_requests() {
     let handles: Vec<_> = (0..total_requests)
         .map(|_| {
             let success_count = Arc::clone(&success_count);
-            thread::spawn(move || {
-                let response = send_request(PROXY_PORT, "/", &[]);
+            tokio::spawn(async move {
+                let response = send_request(PROXY_PORT, "/", &[]).await;
                 if let Some(response) = response {
                     if get_status_code(&response) == Some(200) {
                         success_count.fetch_add(1, Ordering::Relaxed);
@@ -844,7 +844,7 @@ async fn test_concurrent_requests() {
         .collect();
     
     for handle in handles {
-        let _ = handle.join();
+        let _ = handle.await;
     }
     
     let successes = success_count.load(Ordering::Relaxed);
@@ -869,7 +869,7 @@ async fn test_response_time() {
     use std::time::Instant;
     
     let start = Instant::now();
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     let elapsed = start.elapsed();
     
     assert!(response.is_some(), "Should receive response");
@@ -892,7 +892,7 @@ async fn test_html_content_type() {
         return;
     }
     
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -914,7 +914,7 @@ async fn test_json_content_type() {
         return;
     }
     
-    let response = send_request(PROXY_PORT, "/health", &[]);
+    let response = send_request(PROXY_PORT, "/health", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -955,7 +955,7 @@ async fn test_keep_alive_connection() {
         PROXY_PORT, 
         "/", 
         &[("Connection", "keep-alive")]
-    );
+    ).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -978,7 +978,7 @@ async fn test_custom_user_agent() {
         PROXY_PORT, 
         "/", 
         &[("User-Agent", "VeilE2ETest/1.0")]
-    );
+    ).await;
     assert!(response.is_some(), "Should receive response with custom User-Agent");
     
     let response = response.unwrap();
@@ -998,11 +998,11 @@ async fn test_different_host_headers() {
     }
     
     // localhost
-    let response1 = send_request(PROXY_PORT, "/", &[]);
+    let response1 = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response1.is_some(), "localhost should work");
     
     // 127.0.0.1 のHost（TLS接続を使用）
-    let response2 = send_request(PROXY_PORT, "/", &[("Host", "127.0.0.1")]);
+    let response2 = send_request(PROXY_PORT, "/", &[("Host", "127.0.0.1")]).await;
     assert!(response2.is_some(), "127.0.0.1 Host should work");
     
     let response2 = response2.unwrap();
@@ -1025,7 +1025,7 @@ async fn test_multiple_sequential_requests() {
     let total_requests = 50;
     
     for _ in 0..total_requests {
-        let response = send_request(PROXY_PORT, "/", &[]);
+        let response = send_request(PROXY_PORT, "/", &[]).await;
         if let Some(response) = response {
             if get_status_code(&response) == Some(200) {
                 success_count += 1;
@@ -1057,7 +1057,7 @@ async fn test_compression_priority() {
         PROXY_PORT, 
         "/large.txt", 
         &[("Accept-Encoding", "gzip, br, zstd")]
-    );
+    ).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -1087,7 +1087,7 @@ async fn test_active_connections_metric() {
     }
     
     // メトリクスエンドポイントからアクティブ接続数を取得
-    let response = send_request(PROXY_PORT, "/__metrics", &[]);
+    let response = send_request(PROXY_PORT, "/__metrics", &[]).await;
     assert!(response.is_some(), "Should receive metrics response");
     
     let response = response.unwrap();
@@ -1109,7 +1109,7 @@ async fn test_upstream_health_metric() {
     }
     
     // メトリクスエンドポイントからアップストリーム健康状態を取得
-    let response = send_request(PROXY_PORT, "/__metrics", &[]);
+    let response = send_request(PROXY_PORT, "/__metrics", &[]).await;
     assert!(response.is_some(), "Should receive metrics response");
     
     let response = response.unwrap();
@@ -1135,7 +1135,7 @@ async fn test_tls_health_check() {
     // 実際のテストは、TLSバックエンドが設定されている場合にのみ有効
     // ここでは、メトリクスエンドポイントから健康状態を確認
     
-    let response = send_request(PROXY_PORT, "/__metrics", &[]);
+    let response = send_request(PROXY_PORT, "/__metrics", &[]).await;
     assert!(response.is_some(), "Should receive metrics response");
     
     // メトリクスが正常に取得できることを確認
@@ -1186,7 +1186,7 @@ async fn test_backend_connection_failure() {
     
     // 存在しないパスにリクエストを送信（404を期待）
     // 並列実行時の接続エラー対策としてリトライロジックを追加
-    let response = send_request_with_retry(PROXY_PORT, "/nonexistent", &[], 3);
+    let response = send_request_with_retry(PROXY_PORT, "/nonexistent", &[], 3).await;
     assert!(response.is_some(), "Should receive response after retries");
     
     let response = response.unwrap();
@@ -1293,7 +1293,7 @@ async fn test_ip_restriction() {
     // 実際のIP制限テストには、設定ファイルの変更が必要
     
     // 通常のリクエストが成功することを確認
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -1313,7 +1313,7 @@ async fn test_rate_limiting() {
     // 実際のレート制限テストには、設定ファイルの変更が必要
     
     // 通常のリクエストが成功することを確認
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -1360,7 +1360,7 @@ async fn test_grpc_unary_call() {
             ("grpc-timeout", "10S"),
             ("grpc-accept-encoding", "gzip"),
         ],
-    ) {
+    ).await {
         Ok(r) => r,
         Err(e) => {
             panic!("Failed to send gRPC request to /grpc.test.v1.TestService/UnaryCall: {}", e);
@@ -1399,7 +1399,7 @@ async fn test_grpc_basic_request() {
             ("Content-Type", "application/grpc"),
             ("Accept", "application/grpc"),
         ]
-    );
+    ).await;
     
     let response = response.expect("Should receive response for gRPC request");
     let status = get_status_code(&response);
@@ -1435,7 +1435,7 @@ async fn test_http3_basic_connection() {
         .expect("Invalid server address");
     
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
+    let (mut client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!("Failed to create HTTP/3 client for {}: {} (HTTP/3 may not be enabled)", server_addr, e);
@@ -1484,7 +1484,7 @@ async fn test_http3_get_request() {
         .expect("Invalid server address");
     
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
+    let (mut client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!("Failed to create HTTP/3 client for {}: {} (HTTP/3 may not be enabled)", server_addr, e);
@@ -1525,7 +1525,7 @@ async fn test_http3_post_request() {
         .expect("Invalid server address");
     
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
+    let (mut client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
@@ -1597,7 +1597,7 @@ async fn test_http3_multiple_streams() {
         .expect("Invalid server address");
     
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
+    let (mut client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
@@ -1650,7 +1650,7 @@ async fn test_http3_proxy_forwarding() {
         .expect("Invalid server address");
     
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
+    let (mut client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
@@ -1698,7 +1698,7 @@ async fn test_http3_proxy_compression() {
         .expect("Invalid server address");
     
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
+    let (mut client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
@@ -1763,7 +1763,7 @@ async fn test_http3_stream_priority() {
         .expect("Invalid server address");
     
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
+    let (mut client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
@@ -1802,7 +1802,7 @@ async fn test_http3_stream_cancellation() {
         .expect("Invalid server address");
     
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
+    let (mut client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
@@ -1836,7 +1836,7 @@ async fn test_http3_bidirectional_streams() {
         .expect("Invalid server address");
     
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
+    let (mut client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
@@ -1877,7 +1877,7 @@ async fn test_http3_proxy_header_manipulation() {
         .expect("Invalid server address");
     
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
+    let (mut client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
@@ -1932,7 +1932,7 @@ async fn test_http3_proxy_load_balancing() {
         .expect("Invalid server address");
     
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
+    let (mut client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
@@ -1973,7 +1973,7 @@ async fn test_http3_stream_timeout() {
         .expect("Invalid server address");
     
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
+    let (mut client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
@@ -2003,7 +2003,7 @@ async fn test_http3_invalid_frame() {
         .expect("Invalid server address");
     
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
+    let (mut client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
@@ -2030,7 +2030,7 @@ async fn test_http3_backend_failure() {
         .expect("Invalid server address");
     
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
+    let (mut client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
@@ -2067,7 +2067,7 @@ async fn test_http3_tls_handshake() {
         .expect("Invalid server address");
     
     // HTTP/3接続を確立（非同期版、TLS 1.3ハンドシェイクを含む）
-    let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
+    let (mut client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => {
             eprintln!("TLS 1.3 handshake completed successfully");
             c
@@ -2141,7 +2141,7 @@ async fn test_http3_connection_close() {
         .expect("Invalid server address");
     
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
+    let (mut client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
@@ -2170,7 +2170,7 @@ async fn test_http3_large_request_body() {
         .expect("Invalid server address");
     
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
+    let (mut client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
@@ -2210,7 +2210,7 @@ async fn test_http3_large_response_body() {
         .expect("Invalid server address");
     
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
+    let (mut client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
@@ -2249,7 +2249,7 @@ async fn test_http3_chunked_response() {
         .expect("Invalid server address");
     
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
+    let (mut client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
@@ -2285,7 +2285,7 @@ async fn test_http3_throughput() {
         .expect("Invalid server address");
     
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
+    let (mut client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
@@ -2322,7 +2322,7 @@ async fn test_http3_throughput() {
     assert!(successful_requests > 0, "Should have at least one successful request");
     
     // 接続を閉じる
-    let _ = client.close();
+    // let _ = client.close();
 }
 
 #[tokio::test]
@@ -2338,7 +2338,7 @@ async fn test_http3_latency() {
         .expect("Invalid server address");
     
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
+    let (mut client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
@@ -2593,7 +2593,7 @@ async fn test_http3_qpack_compression() {
         .expect("Invalid server address");
     
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
+    let (mut client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
@@ -3010,7 +3010,7 @@ async fn test_grpc_web_binary_format() {
             ("Accept", "application/grpc-web"),
         ],
         Some(base64_encoded.as_bytes()),
-    );
+    ).await;
     
     if let Some(response) = response {
         let status = get_status_code(&response);
@@ -3406,7 +3406,7 @@ async fn test_least_connections_distribution() {
     
     // 10回リクエストを送信
     for _ in 0..10 {
-        let response = send_request(PROXY_PORT, "/", &[]);
+        let response = send_request(PROXY_PORT, "/", &[]).await;
         if let Some(response) = response {
             if let Some(server_id) = get_header_value(&response, "X-Server-Id") {
                 match server_id.as_str() {
@@ -3446,7 +3446,7 @@ async fn test_ip_hash_consistency() {
     // 同じIPから10回リクエストを送信
     let mut server_ids = Vec::new();
     for _ in 0..10 {
-        let response = send_request(PROXY_PORT, "/", &[]);
+        let response = send_request(PROXY_PORT, "/", &[]).await;
         if let Some(response) = response {
             if let Some(server_id) = get_header_value(&response, "X-Server-Id") {
                 server_ids.push(server_id);
@@ -3488,11 +3488,11 @@ async fn test_health_check_failover() {
     // 実際のバックエンド障害をシミュレートする必要がある
     
     // まず、両方のバックエンドが正常であることを確認
-    let initial_response = send_request(PROXY_PORT, "/", &[]);
+    let initial_response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(initial_response.is_some(), "Should receive initial response");
     
     // メトリクスエンドポイントから健康状態を確認
-    let metrics_response = send_request(PROXY_PORT, "/__metrics", &[]);
+    let metrics_response = send_request(PROXY_PORT, "/__metrics", &[]).await;
     assert!(metrics_response.is_some(), "Should receive metrics response");
     
     let metrics_response = metrics_response.unwrap();
@@ -3534,7 +3534,7 @@ async fn test_health_check_recovery() {
     // 基本的な動作確認とメトリクス確認を行う
     
     // リクエストが正常に処理されることを確認
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -3542,7 +3542,7 @@ async fn test_health_check_recovery() {
     assert_eq!(status, Some(200), "Should return 200 OK");
     
     // メトリクスエンドポイントから健康状態を確認
-    let metrics_response = send_request(PROXY_PORT, "/__metrics", &[]);
+    let metrics_response = send_request(PROXY_PORT, "/__metrics", &[]).await;
     if let Some(metrics) = metrics_response {
         if metrics.contains("http_upstream_health") || 
            metrics.contains("veil_proxy_http_upstream_health") {
@@ -3576,7 +3576,7 @@ async fn test_rate_limiting_enforcement() {
     let mut rate_limited_count = 0;
     
     for i in 0..20 {
-        let response = send_request(PROXY_PORT, "/", &[]);
+        let response = send_request(PROXY_PORT, "/", &[]).await;
         if let Some(response) = response {
             let status = get_status_code(&response);
             match status {
@@ -3611,7 +3611,7 @@ async fn test_ip_restriction_enforcement() {
     // 例: allowed_ips = ["127.0.0.1"]
     // e2e_setup.shでは127.0.0.1が許可されているので200が期待される
     
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -3652,8 +3652,8 @@ async fn test_connection_limit_enforcement() {
     let handles: Vec<_> = (0..total_connections)
         .map(|_| {
             let success_count = Arc::clone(&success_count);
-            thread::spawn(move || {
-                let response = send_request(PROXY_PORT, "/", &[]);
+            tokio::spawn(async move {
+                let response = send_request(PROXY_PORT, "/", &[]).await;
                 if let Some(response) = response {
                     if get_status_code(&response) == Some(200) {
                         success_count.fetch_add(1, Ordering::Relaxed);
@@ -3664,7 +3664,7 @@ async fn test_connection_limit_enforcement() {
         .collect();
     
     for handle in handles {
-        let _ = handle.join();
+        let _ = handle.await;
     }
     
     let successes = success_count.load(Ordering::Relaxed);
@@ -3695,14 +3695,14 @@ async fn test_cache_hit() {
     
     // 最初のリクエスト（キャッシュミス）
     let start1 = Instant::now();
-    let response1 = send_request(PROXY_PORT, "/", &[]);
+    let response1 = send_request(PROXY_PORT, "/", &[]).await;
     let elapsed1 = start1.elapsed();
     assert!(response1.is_some(), "Should receive first response");
     
     // 少し待機してから2回目のリクエスト（キャッシュヒットの可能性）
     std::thread::sleep(Duration::from_millis(100));
     let start2 = Instant::now();
-    let response2 = send_request(PROXY_PORT, "/", &[]);
+    let response2 = send_request(PROXY_PORT, "/", &[]).await;
     let elapsed2 = start2.elapsed();
     assert!(response2.is_some(), "Should receive second response");
     
@@ -3741,8 +3741,8 @@ async fn test_cache_miss() {
     // 注意: このテストは設定ファイルでキャッシュを有効化する必要がある
     
     // 異なるパスにリクエストを送信（キャッシュミス）
-    let response1 = send_request(PROXY_PORT, "/", &[]);
-    let response2 = send_request(PROXY_PORT, "/health", &[]);
+    let response1 = send_request(PROXY_PORT, "/", &[]).await;
+    let response2 = send_request(PROXY_PORT, "/health", &[]).await;
     
     assert!(response1.is_some(), "Should receive first response");
     assert!(response2.is_some(), "Should receive second response");
@@ -3769,7 +3769,7 @@ async fn test_etag_304() {
     // 例: ./tests/e2e_setup.sh test cache
     
     // 最初のリクエストでETagを取得
-    let response1 = send_request(PROXY_PORT, "/", &[]);
+    let response1 = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response1.is_some(), "Should receive first response");
     
     let response1 = response1.unwrap();
@@ -3783,7 +3783,7 @@ async fn test_etag_304() {
             PROXY_PORT,
             "/",
             &[("If-None-Match", &etag_value)]
-        );
+        ).await;
         
         if let Some(response2) = response2 {
             let status = get_status_code(&response2);
@@ -3818,12 +3818,12 @@ async fn test_stale_while_revalidate() {
     // 注意: このテストは設定ファイルでstale-while-revalidateを有効化する必要がある
     
     // キャッシュエントリを作成
-    let response1 = send_request(PROXY_PORT, "/", &[]);
+    let response1 = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response1.is_some(), "Should receive first response");
     
     // キャッシュが期限切れになった後、stale-while-revalidateが動作することを確認
     // 実際のテストには、時間の経過をシミュレートする必要がある
-    let response2 = send_request(PROXY_PORT, "/", &[]);
+    let response2 = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response2.is_some(), "Should receive second response");
     
     // 基本的な動作確認
@@ -3956,7 +3956,7 @@ async fn test_redirect_302() {
     // 注意: このテストは設定ファイルで302リダイレクトを設定する必要がある
     
     // リダイレクトアクションが設定されている場合のテスト
-    let response = send_request(PROXY_PORT, "/redirect-test", &[]);
+    let response = send_request(PROXY_PORT, "/redirect-test", &[]).await;
     
     if let Some(response) = response {
         let status = get_status_code(&response);
@@ -3978,7 +3978,7 @@ async fn test_redirect_path_preservation() {
     // リダイレクト時にパスが保持されることを確認
     // 注意: このテストは設定ファイルでリダイレクトを設定する必要がある
     
-    let response = send_request(PROXY_PORT, "/api/v1/users", &[]);
+    let response = send_request(PROXY_PORT, "/api/v1/users", &[]).await;
     
     if let Some(response) = response {
         let location = get_header_value(&response, "Location");
@@ -4008,7 +4008,7 @@ async fn test_range_request_single() {
         PROXY_PORT,
         "/large.txt",
         &[("Range", "bytes=0-999")]
-    );
+    ).await;
     
     assert!(response.is_some(), "Should receive response");
     
@@ -4035,7 +4035,7 @@ async fn test_range_request_206() {
         PROXY_PORT,
         "/large.txt",
         &[("Range", "bytes=0-1023")]
-    );
+    ).await;
     
     if let Some(response) = response {
         let status = get_status_code(&response);
@@ -4069,7 +4069,7 @@ async fn test_buffering_streaming_mode() {
     
     // 大きなレスポンスをリクエスト
     let start = Instant::now();
-    let response = send_request(PROXY_PORT, "/large.txt", &[]);
+    let response = send_request(PROXY_PORT, "/large.txt", &[]).await;
     let elapsed = start.elapsed();
     
     assert!(response.is_some(), "Should receive response");
@@ -4102,7 +4102,7 @@ async fn test_buffering_full_mode() {
     
     // Fullモードの場合、レスポンス全体がバッファリングされる
     let start = Instant::now();
-    let response = send_request(PROXY_PORT, "/large.txt", &[]);
+    let response = send_request(PROXY_PORT, "/large.txt", &[]).await;
     let elapsed = start.elapsed();
     
     assert!(response.is_some(), "Should receive response");
@@ -4134,7 +4134,7 @@ async fn test_buffering_adaptive_mode() {
     
     // 小さいレスポンス（Fullバッファリング）
     let start1 = Instant::now();
-    let response1 = send_request(PROXY_PORT, "/", &[]);
+    let response1 = send_request(PROXY_PORT, "/", &[]).await;
     let elapsed1 = start1.elapsed();
     
     assert!(response1.is_some(), "Should receive small response");
@@ -4143,7 +4143,7 @@ async fn test_buffering_adaptive_mode() {
     
     // 大きいレスポンス（Streaming）
     let start2 = Instant::now();
-    let response2 = send_request(PROXY_PORT, "/large.txt", &[]);
+    let response2 = send_request(PROXY_PORT, "/large.txt", &[]).await;
     let elapsed2 = start2.elapsed();
     
     assert!(response2.is_some(), "Should receive large response");
@@ -4177,7 +4177,7 @@ async fn test_routing_header_condition() {
         PROXY_PORT,
         "/",
         &[("X-Version", "v2")]
-    );
+    ).await;
     
     assert!(response.is_some(), "Should receive response");
     let response = response.unwrap();
@@ -4202,7 +4202,7 @@ async fn test_routing_method_condition() {
         "POST",
         &[],
         Some(b"test body")
-    );
+    ).await;
     
     if let Some(response) = response {
         let status = get_status_code(&response);
@@ -4230,13 +4230,13 @@ async fn test_routing_query_condition() {
     // バックエンドが404を返す可能性がある
     
     // クエリパラメータなしでリクエストを送信（基本動作確認）
-    let response1 = send_request(PROXY_PORT, "/", &[]);
+    let response1 = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response1.is_some(), "Should receive response");
     let status1 = get_status_code(&response1.unwrap());
     assert_eq!(status1, Some(200), "Should return 200 OK");
     
     // クエリパラメータ付きリクエスト（クエリ条件が設定されていない場合の動作確認）
-    let response2 = send_request(PROXY_PORT, "/?token=secret", &[]);
+    let response2 = send_request(PROXY_PORT, "/?token=secret", &[]).await;
     assert!(response2.is_some(), "Should receive response");
     let response2 = response2.unwrap();
     let status2 = get_status_code(&response2);
@@ -4262,7 +4262,7 @@ async fn test_routing_source_ip_condition() {
     // 127.0.0.1からのリクエスト（リトライ付き）
     let mut response = None;
     for _ in 0..3 {
-        response = send_request(PROXY_PORT, "/", &[]);
+        response = send_request(PROXY_PORT, "/", &[]).await;
         if let Some(ref resp) = response {
             let status = get_status_code(resp);
             if status == Some(200) || status == Some(403) {
@@ -4297,7 +4297,7 @@ async fn test_graceful_reload() {
     // テスト環境では、プロセスIDの取得とシグナル送信が必要
     
     // 基本的な動作確認
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     // 実際のリロードテストには、設定ファイルの変更とSIGHUP送信が必要
@@ -4318,7 +4318,7 @@ async fn test_config_validation() {
     // 実際のテストには、不正な設定ファイルでの起動試行が必要
     
     // 基本的な動作確認
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     // 設定が有効な場合、正常に動作することを確認
@@ -4352,7 +4352,7 @@ async fn test_grpc_wire_protocol() {
             ("Accept", "application/grpc"),
         ],
         Some(b"\x00\x00\x00\x00\x00")  // gRPCフレームヘッダー
-    );
+    ).await;
     
     if let Some(response) = response {
         let status = get_status_code(&response);
@@ -4424,7 +4424,7 @@ async fn test_grpc_web_cors() {
             ("Access-Control-Request-Headers", "content-type,x-grpc-web"),
         ],
         None
-    );
+    ).await;
     
     if let Some(response) = response {
         let status = get_status_code(&response);
@@ -4460,7 +4460,7 @@ async fn test_grpc_web_text_format() {
             ("Accept", "application/grpc-web-text"),
         ],
         Some(base64_encoded.as_bytes()),
-    );
+    ).await;
     
     if let Some(response) = response {
         let status = get_status_code(&response);
@@ -4490,7 +4490,7 @@ async fn test_grpc_web_cors_headers() {
             ("Origin", "https://example.com"),
         ],
         Some(b"test"),
-    );
+    ).await;
     
     if let Some(response) = response {
         let status = get_status_code(&response);
@@ -4598,7 +4598,7 @@ async fn test_grpc_proxy_error_handling() {
         "/grpc.test.v1.NonExistentService/NonExistentMethod",
         b"test",
         &[],
-    ) {
+    ).await {
         Ok(r) => r,
         Err(e) => {
             panic!("Failed to send gRPC request to /grpc.test.v1.NonExistentService/NonExistentMethod: {}", e);
@@ -4650,7 +4650,7 @@ async fn test_grpc_malformed_protobuf() {
         "/grpc.test.v1.TestService/Test",
         malformed_data,
         &[],
-    ) {
+    ).await {
         Ok(r) => r,
         Err(e) => {
             panic!("Failed to send gRPC request with malformed Protobuf to /grpc.test.v1.TestService/Test: {}", e);
@@ -4705,7 +4705,7 @@ async fn test_grpc_stream_reset() {
         "/grpc.test.v1.TestService/StreamReset",
         b"\x00\x00\x00\x00\x05hello",
         &[],
-    ) {
+    ).await {
         Ok(r) => r,
         Err(e) => {
             panic!("Failed to send gRPC stream reset request to /grpc.test.v1.TestService/StreamReset: {}", e);
@@ -4760,7 +4760,7 @@ async fn test_grpc_deflate_compression() {
         "/grpc.test.v1.TestService/Test",
         b"test message",
         &[("grpc-encoding", "deflate"), ("grpc-accept-encoding", "deflate")],
-    ) {
+    ).await {
         Ok(r) => r,
         Err(e) => {
             panic!("Failed to send gRPC request: {}", e);
@@ -4790,7 +4790,7 @@ async fn test_grpc_compression_negotiation() {
         "/grpc.test.v1.TestService/Test",
         b"test",
         &[("grpc-accept-encoding", "gzip, deflate, identity")],
-    ) {
+    ).await {
         Ok(r) => r,
         Err(e) => {
             panic!("Failed to send gRPC request: {}", e);
@@ -4826,7 +4826,7 @@ async fn test_grpc_trailer_detailed() {
         "/grpc.test.v1.TestService/Test",
         b"test message",
         &[],
-    ) {
+    ).await {
         Ok(r) => r,
         Err(e) => {
             panic!("Failed to send gRPC request: {}", e);
@@ -4934,7 +4934,7 @@ async fn test_ktls_availability() {
     }
     
     // kTLSが利用可能な場合、TLS接続が正常に動作することを確認
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response even if kTLS is not available");
     
     let response = response.unwrap();
@@ -4954,7 +4954,7 @@ async fn test_ktls_tls_handshake() {
     use std::time::Instant;
     
     let start = Instant::now();
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     let elapsed = start.elapsed();
     
     assert!(response.is_some(), "Should receive response");
@@ -4990,8 +4990,8 @@ async fn test_ktls_multiple_connections() {
     let handles: Vec<_> = (0..total_connections)
         .map(|_| {
             let success_count = Arc::clone(&success_count);
-            thread::spawn(move || {
-                let response = send_request(PROXY_PORT, "/", &[]);
+            tokio::spawn(async move {
+                let response = send_request(PROXY_PORT, "/", &[]).await;
                 if let Some(response) = response {
                     if get_status_code(&response) == Some(200) {
                         success_count.fetch_add(1, Ordering::Relaxed);
@@ -5002,7 +5002,7 @@ async fn test_ktls_multiple_connections() {
         .collect();
     
     for handle in handles {
-        let _ = handle.join();
+        let _ = handle.await;
     }
     
     let successes = success_count.load(Ordering::Relaxed);
@@ -5106,7 +5106,7 @@ async fn test_http2_connection_reuse() {
     }
     
     // 基本的な動作確認
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     assert_eq!(get_status_code(&response.unwrap()), Some(200), "Should return 200 OK");
 }
@@ -5151,7 +5151,7 @@ async fn test_http2_header_compression() {
     }
     
     // 基本的な動作確認
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     assert_eq!(get_status_code(&response.unwrap()), Some(200), "Should return 200 OK");
 }
@@ -5412,7 +5412,7 @@ async fn test_rate_limiting_with_config() {
     
     // 40リクエストを短時間で送信（制限を超える）
     for i in 0..40 {
-        let response = send_request(PROXY_PORT, "/", &[]);
+        let response = send_request(PROXY_PORT, "/", &[]).await;
         if let Some(response) = response {
             let status = get_status_code(&response);
             match status {
@@ -5461,7 +5461,7 @@ async fn test_ip_restriction_with_config() {
     // allowed_ips = ["127.0.0.1"] が設定されている場合のテスト
     
     // 127.0.0.1からのリクエスト（許可されているIP）
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response from allowed IP");
     
     let response = response.unwrap();
@@ -5491,12 +5491,12 @@ async fn test_method_restriction() {
     // 例: allowed_methods = ["GET", "HEAD"]
     
     // GETリクエスト（通常許可されている）
-    let get_response = send_request(PROXY_PORT, "/", &[]);
+    let get_response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(get_response.is_some(), "Should receive GET response");
     assert_eq!(get_status_code(&get_response.unwrap()), Some(200), "GET should return 200");
     
     // POSTリクエスト（制限されている可能性がある）
-    let post_response = send_request_with_method(PROXY_PORT, "/", "POST", &[], Some(b"test body"));
+    let post_response = send_request_with_method(PROXY_PORT, "/", "POST", &[], Some(b"test body")).await;
     if let Some(response) = post_response {
         let status = get_status_code(&response);
         // メソッドが許可されていない場合、405 Method Not Allowedが返される
@@ -5528,7 +5528,7 @@ async fn test_request_timeout() {
     use std::time::Instant;
     
     let start = Instant::now();
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     let elapsed = start.elapsed();
     
     assert!(response.is_some(), "Should receive response");
@@ -5567,7 +5567,7 @@ async fn test_large_request_body() {
         "POST",
         &[("Content-Type", "application/octet-stream")],
         Some(&large_body)
-    );
+    ).await;
     
     if let Some(response) = response {
         let status = get_status_code(&response);
@@ -5666,8 +5666,8 @@ async fn test_concurrent_connection_stress() {
         .map(|_| {
             let success_count = Arc::clone(&success_count);
             let error_count = Arc::clone(&error_count);
-            thread::spawn(move || {
-                let response = send_request(PROXY_PORT, "/", &[]);
+            tokio::spawn(async move {
+                let response = send_request(PROXY_PORT, "/", &[]).await;
                 if let Some(response) = response {
                     let status = get_status_code(&response);
                     if status == Some(200) {
@@ -5683,7 +5683,7 @@ async fn test_concurrent_connection_stress() {
         .collect();
     
     for handle in handles {
-        let _ = handle.join();
+        let _ = handle.await;
     }
     
     let successes = success_count.load(Ordering::Relaxed);
@@ -5712,7 +5712,7 @@ async fn test_backend_timeout_handling() {
     
     // 通常のリクエストが正常に処理されることを確認
     // 並列実行時のタイムアウト対策としてリトライロジックを追加
-    let response = send_request_with_retry(PROXY_PORT, "/", &[], 3);
+    let response = send_request_with_retry(PROXY_PORT, "/", &[], 3).await;
     assert!(response.is_some(), "Should receive response after retries");
     
     let response = response.unwrap();
@@ -5803,7 +5803,7 @@ async fn test_http_version_negotiation() {
     // HTTP/1.0、HTTP/1.1、HTTP/2のネゴシエーションを確認
     
     // HTTP/1.1リクエスト
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive HTTP/1.1 response");
     
     let response = response.unwrap();
@@ -6134,7 +6134,7 @@ async fn test_redirect_307() {
     // 307 Temporary Redirectのテスト
     // 注意: このテストは設定ファイルで307リダイレクトを設定する必要がある
     
-    let response = send_request(PROXY_PORT, "/redirect-307", &[]);
+    let response = send_request(PROXY_PORT, "/redirect-307", &[]).await;
     
     if let Some(response) = response {
         let status = get_status_code(&response);
@@ -6163,7 +6163,7 @@ async fn test_redirect_308() {
     // 308 Permanent Redirectのテスト
     // 注意: このテストは設定ファイルで308リダイレクトを設定する必要がある
     
-    let response = send_request(PROXY_PORT, "/redirect-308", &[]);
+    let response = send_request(PROXY_PORT, "/redirect-308", &[]).await;
     
     if let Some(response) = response {
         let status = get_status_code(&response);
@@ -6259,15 +6259,15 @@ async fn test_prometheus_metrics_detailed() {
     // 複数のリクエストを送信してメトリクスが更新されることを確認
     
     // 最初のリクエスト
-    let response1 = send_request(PROXY_PORT, "/", &[]);
+    let response1 = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response1.is_some(), "Should receive first response");
     
     // 2回目のリクエスト
-    let response2 = send_request(PROXY_PORT, "/", &[]);
+    let response2 = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response2.is_some(), "Should receive second response");
     
     // メトリクスエンドポイントにアクセス
-    let metrics_response = send_request(PROXY_PORT, "/__metrics", &[]);
+    let metrics_response = send_request(PROXY_PORT, "/__metrics", &[]).await;
     assert!(metrics_response.is_some(), "Should receive metrics response");
     
     let metrics_response = metrics_response.unwrap();
@@ -6296,7 +6296,7 @@ async fn test_prometheus_metrics_after_errors() {
     
     // エラーが発生した後のメトリクスを確認
     // 404エラーを発生させる
-    let error_response = send_request(PROXY_PORT, "/nonexistent-page-12345", &[]);
+    let error_response = send_request(PROXY_PORT, "/nonexistent-page-12345", &[]).await;
     assert!(error_response.is_some(), "Should receive error response");
     
     let error_response = error_response.unwrap();
@@ -6304,7 +6304,7 @@ async fn test_prometheus_metrics_after_errors() {
     assert_eq!(status, Some(404), "Should return 404 Not Found");
     
     // メトリクスエンドポイントにアクセス
-    let metrics_response = send_request(PROXY_PORT, "/__metrics", &[]);
+    let metrics_response = send_request(PROXY_PORT, "/__metrics", &[]).await;
     assert!(metrics_response.is_some(), "Should receive metrics response");
     
     let metrics_response = metrics_response.unwrap();
@@ -6346,7 +6346,7 @@ async fn test_header_manipulation_multiple_headers() {
             ("X-Custom-Header-2", "value2"),
             ("User-Agent", "test-agent"),
         ]
-    );
+    ).await;
     
     assert!(response.is_some(), "Should receive response");
     
@@ -6385,7 +6385,7 @@ async fn test_header_manipulation_case_insensitive() {
             ("X-Custom-Header", "value2"),
             ("X-CUSTOM-HEADER", "value3"),
         ]
-    );
+    ).await;
     
     assert!(response.is_some(), "Should receive response");
     
@@ -6418,7 +6418,7 @@ async fn test_header_manipulation_special_characters() {
             ("X-Test-Header-2", "value-with-dashes"),
             ("X-Test-Header-3", "value_with_underscores"),
         ]
-    );
+    ).await;
     
     assert!(response.is_some(), "Should receive response");
     
@@ -6444,7 +6444,7 @@ async fn test_cache_stale_if_error() {
     // 注意: このテストは設定ファイルでstale-if-errorを有効化する必要がある
     
     // キャッシュエントリを作成
-    let response1 = send_request(PROXY_PORT, "/", &[]);
+    let response1 = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response1.is_some(), "Should receive first response");
     
     let response1 = response1.unwrap();
@@ -6453,7 +6453,7 @@ async fn test_cache_stale_if_error() {
     
     // バックエンドがエラーを返す場合、stale-if-errorが有効な場合、期限切れキャッシュが返される可能性がある
     // 実際のテストには、バックエンドのエラーをシミュレートする必要がある
-    let response2 = send_request(PROXY_PORT, "/", &[]);
+    let response2 = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response2.is_some(), "Should receive second response");
     
     let response2 = response2.unwrap();
@@ -6478,7 +6478,7 @@ async fn test_cache_vary_header() {
         PROXY_PORT,
         "/",
         &[("Accept-Language", "en-US")]
-    );
+    ).await;
     assert!(response1.is_some(), "Should receive first response");
     
     let response1 = response1.unwrap();
@@ -6490,7 +6490,7 @@ async fn test_cache_vary_header() {
         PROXY_PORT,
         "/",
         &[("Accept-Language", "ja-JP")]
-    );
+    ).await;
     assert!(response2.is_some(), "Should receive second response");
     
     let response2 = response2.unwrap();
@@ -6512,7 +6512,7 @@ async fn test_cache_invalidation() {
     // 注意: このテストは設定ファイルでキャッシュを有効化する必要がある
     
     // キャッシュエントリを作成
-    let response1 = send_request(PROXY_PORT, "/", &[]);
+    let response1 = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response1.is_some(), "Should receive first response");
     
     let response1 = response1.unwrap();
@@ -6520,7 +6520,7 @@ async fn test_cache_invalidation() {
     assert_eq!(status1, Some(200), "First response should be successful");
     
     // キャッシュが有効な場合、2回目のリクエストはキャッシュから返される可能性がある
-    let response2 = send_request(PROXY_PORT, "/", &[]);
+    let response2 = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response2.is_some(), "Should receive second response");
     
     let response2 = response2.unwrap();
@@ -6543,7 +6543,7 @@ async fn test_cache_query_parameter_handling() {
     // 注意: このテストは設定ファイルでキャッシュを有効化する必要がある
     
     // クエリパラメータ付きでリクエスト
-    let response1 = send_request(PROXY_PORT, "/?param1=value1", &[]);
+    let response1 = send_request(PROXY_PORT, "/?param1=value1", &[]).await;
     assert!(response1.is_some(), "Should receive first response");
     
     let response1 = response1.unwrap();
@@ -6555,7 +6555,7 @@ async fn test_cache_query_parameter_handling() {
     );
     
     // 同じクエリパラメータでリクエスト（キャッシュヒットの可能性）
-    let response2 = send_request(PROXY_PORT, "/?param1=value1", &[]);
+    let response2 = send_request(PROXY_PORT, "/?param1=value1", &[]).await;
     assert!(response2.is_some(), "Should receive second response");
     
     let response2 = response2.unwrap();
@@ -6567,7 +6567,7 @@ async fn test_cache_query_parameter_handling() {
     );
     
     // 異なるクエリパラメータでリクエスト（キャッシュミスの可能性）
-    let response3 = send_request(PROXY_PORT, "/?param1=value2", &[]);
+    let response3 = send_request(PROXY_PORT, "/?param1=value2", &[]).await;
     assert!(response3.is_some(), "Should receive third response");
     
     let response3 = response3.unwrap();
@@ -6596,7 +6596,7 @@ async fn test_buffering_large_response() {
     // 注意: このテストは設定ファイルでバッファリングを有効化する必要がある
     
     // 大きなレスポンスをリクエスト
-    let response = send_request(PROXY_PORT, "/large.txt", &[]);
+    let response = send_request(PROXY_PORT, "/large.txt", &[]).await;
     
     if let Some(response) = response {
         let status = get_status_code(&response);
@@ -6626,7 +6626,7 @@ async fn test_buffering_chunked_response() {
     // Chunked Transfer Encodingレスポンスのバッファリングテスト
     // 注意: このテストは設定ファイルでバッファリングを有効化する必要がある
     
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -6655,7 +6655,7 @@ async fn test_buffering_empty_response() {
     // 注意: このテストは設定ファイルでバッファリングを有効化する必要がある
     
     // 空レスポンスを返すエンドポイントをリクエスト（存在しない場合は404）
-    let response = send_request(PROXY_PORT, "/nonexistent", &[]);
+    let response = send_request(PROXY_PORT, "/nonexistent", &[]).await;
     
     if let Some(response) = response {
         let status = get_status_code(&response);
@@ -6679,7 +6679,7 @@ async fn test_buffering_zero_content_length() {
     // Content-Length: 0のレスポンスのバッファリングテスト
     // 注意: このテストは設定ファイルでバッファリングを有効化する必要がある
     
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -6704,13 +6704,13 @@ async fn test_buffering_adaptive_threshold_switch() {
     // 例: ./tests/e2e_setup.sh test buffering
     
     // 閾値より小さいレスポンス（Fullバッファリング）
-    let small_response = send_request(PROXY_PORT, "/", &[]);
+    let small_response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(small_response.is_some(), "Should receive small response");
     let small_response = small_response.unwrap();
     assert_eq!(get_status_code(&small_response), Some(200), "Should return 200 OK");
     
     // 閾値より大きいレスポンス（Streaming）
-    let large_response = send_request(PROXY_PORT, "/large.txt", &[]);
+    let large_response = send_request(PROXY_PORT, "/large.txt", &[]).await;
     if let Some(large_response) = large_response {
         let status = get_status_code(&large_response);
         if status == Some(200) {
@@ -6736,7 +6736,7 @@ async fn test_buffering_adaptive_content_length_missing() {
     
     // Chunked Transfer Encodingレスポンス（Content-Lengthなし）
     // 並列実行時のTLSハンドシェイクタイムアウト対策としてリトライロジックを追加
-    let response = send_request_with_retry(PROXY_PORT, "/", &[], 3);
+    let response = send_request_with_retry(PROXY_PORT, "/", &[], 3).await;
     assert!(response.is_some(), "Should receive response after retries");
     
     let response = response.unwrap();
@@ -6766,7 +6766,7 @@ async fn test_buffering_max_memory_buffer_within_limit() {
     // 注意: このテストは設定ファイルでバッファリングを有効化する必要がある
     
     // 通常のサイズのレスポンスをリクエスト
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -6793,7 +6793,7 @@ async fn test_buffering_invalid_content_length() {
     // 注意: このテストは設定ファイルでバッファリングを有効化する必要がある
     
     // 通常のリクエストを送信（バックエンドが不正なContent-Lengthを返す場合は別途テストが必要）
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -6822,7 +6822,7 @@ async fn test_health_check_interval() {
     
     // 複数のリクエストを送信してヘルスチェックが動作することを確認
     for i in 0..5 {
-        let response = send_request(PROXY_PORT, "/", &[]);
+        let response = send_request(PROXY_PORT, "/", &[]).await;
         assert!(response.is_some(), "Should receive response {}", i);
         
         let response = response.unwrap();
@@ -6849,7 +6849,7 @@ async fn test_health_check_timeout() {
     // 注意: このテストは設定ファイルでヘルスチェックを有効化する必要がある
     
     // 通常のリクエストが成功することを確認
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -6873,7 +6873,7 @@ async fn test_health_check_threshold() {
     
     // 複数のリクエストを送信してヘルスチェック閾値が動作することを確認
     for i in 0..10 {
-        let response = send_request(PROXY_PORT, "/", &[]);
+        let response = send_request(PROXY_PORT, "/", &[]).await;
         assert!(response.is_some(), "Should receive response {}", i);
         
         let response = response.unwrap();
@@ -6900,7 +6900,7 @@ async fn test_health_check_healthy_status_200() {
     // 注意: このテストは設定ファイルでヘルスチェックを有効化する必要がある
     
     // 正常なリクエストを送信
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -6908,7 +6908,7 @@ async fn test_health_check_healthy_status_200() {
     assert_eq!(status, Some(200), "Should return 200 OK");
     
     // メトリクスエンドポイントから健康状態を確認
-    let metrics_response = send_request(PROXY_PORT, "/__metrics", &[]);
+    let metrics_response = send_request(PROXY_PORT, "/__metrics", &[]).await;
     if let Some(metrics) = metrics_response {
         if metrics.contains("http_upstream_health") || metrics.contains("veil_proxy_http_upstream_health") {
             eprintln!("Health check healthy status 200 test: metrics detected");
@@ -6927,7 +6927,7 @@ async fn test_health_check_healthy_status_custom() {
     // 注意: このテストは設定ファイルでヘルスチェックを有効化する必要がある
     
     // 正常なリクエストを送信
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -6949,7 +6949,7 @@ async fn test_health_check_unhealthy_status_500() {
     // 実際のテストには、500を返すエンドポイントが必要
     
     // 通常のリクエストは200を返す
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -6971,7 +6971,7 @@ async fn test_health_check_threshold_reset_on_success() {
     
     // 複数の正常なリクエストを送信
     for i in 0..5 {
-        let response = send_request(PROXY_PORT, "/", &[]);
+        let response = send_request(PROXY_PORT, "/", &[]).await;
         assert!(response.is_some(), "Should receive response {}", i);
         
         let response = response.unwrap();
@@ -6999,7 +6999,7 @@ async fn test_health_check_threshold_reset_on_failure() {
     // 実際のテストには、失敗をシミュレートする必要がある
     
     // 正常なリクエストを送信
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -7022,7 +7022,7 @@ async fn test_health_check_path_custom() {
     // 注意: このテストは設定ファイルでヘルスチェックを有効化する必要がある
     
     // /healthエンドポイントにリクエストを送信
-    let response = send_request(PROXY_PORT, "/health", &[]);
+    let response = send_request(PROXY_PORT, "/health", &[]).await;
     if let Some(response) = response {
         let status = get_status_code(&response);
         // /healthエンドポイントが存在する場合、200が返される可能性がある
@@ -7044,12 +7044,12 @@ async fn test_health_check_interval_accuracy() {
     
     // メトリクスエンドポイントから初期状態を取得
     let start = Instant::now();
-    let metrics1 = send_request(PROXY_PORT, "/__metrics", &[]);
+    let metrics1 = send_request(PROXY_PORT, "/__metrics", &[]).await;
     
     // ヘルスチェック間隔（デフォルト1秒）を待つ
     std::thread::sleep(Duration::from_secs(2));
     
-    let metrics2 = send_request(PROXY_PORT, "/__metrics", &[]);
+    let metrics2 = send_request(PROXY_PORT, "/__metrics", &[]).await;
     let elapsed = start.elapsed();
     
     // メトリクスが更新されていることを確認（間隔が経過している）
@@ -7074,7 +7074,7 @@ async fn test_health_check_timeout_enforcement() {
     // 実際のテストには、バックエンドの遅延をシミュレートする必要がある
     
     // 通常のリクエストが成功することを確認
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -7366,7 +7366,7 @@ async fn test_load_balancing_weighted_distribution() {
     let mut backend2_count = 0;
     
     for _ in 0..20 {
-        let response = send_request(PROXY_PORT, "/", &[]);
+        let response = send_request(PROXY_PORT, "/", &[]).await;
         if let Some(response) = response {
             let server_id = get_header_value(&response, "X-Server-Id");
             if let Some(id) = server_id {
@@ -7400,7 +7400,7 @@ async fn test_load_balancing_backend_failure() {
     // 注意: このテストは設定ファイルでヘルスチェックを有効化する必要がある
     
     // 通常のリクエストが成功することを確認
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -7426,7 +7426,7 @@ async fn test_load_balancing_session_affinity() {
     let mut backend_ids = Vec::new();
     
     for _ in 0..10 {
-        let response = send_request(PROXY_PORT, "/", &[]);
+        let response = send_request(PROXY_PORT, "/", &[]).await;
         if let Some(response) = response {
             let server_id = get_header_value(&response, "X-Server-Id");
             if let Some(id) = server_id {
@@ -7459,7 +7459,7 @@ async fn test_via_header() {
     // Viaヘッダーのテスト（RFC 7230 Section 5.7.1）
     // プロキシはViaヘッダーを追加する必要がある
     
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -7927,7 +7927,7 @@ async fn test_range_request_multiple_ranges() {
         PROXY_PORT,
         "/large.txt",
         &[("Range", "bytes=0-99,200-299")]
-    );
+    ).await;
     
     assert!(response.is_some(), "Should receive response");
     
@@ -7957,7 +7957,7 @@ async fn test_range_request_not_satisfiable() {
         PROXY_PORT,
         "/",
         &[("Range", "bytes=1000000-2000000")]
-    );
+    ).await;
     
     if let Some(response) = response {
         let status = get_status_code(&response);
@@ -7996,7 +7996,7 @@ async fn test_range_request_suffix() {
         PROXY_PORT,
         "/large.txt",
         &[("Range", "bytes=-500")]
-    );
+    ).await;
     
     assert!(response.is_some(), "Should receive response");
     
@@ -8031,7 +8031,7 @@ async fn test_range_request_open_ended() {
         PROXY_PORT,
         "/large.txt",
         &[("Range", "bytes=500-")]
-    );
+    ).await;
     
     assert!(response.is_some(), "Should receive response");
     
@@ -8070,7 +8070,7 @@ async fn test_te_header_trailers() {
         PROXY_PORT,
         "/",
         &[("TE", "trailers")]
-    );
+    ).await;
     
     assert!(response.is_some(), "Should receive response");
     
@@ -8097,7 +8097,7 @@ async fn test_te_header_encodings() {
         PROXY_PORT,
         "/",
         &[("TE", "gzip, deflate")]
-    );
+    ).await;
     
     assert!(response.is_some(), "Should receive response");
     
@@ -8314,7 +8314,7 @@ async fn test_static_file_mime_type() {
     // 静的ファイルのMIMEタイプのテスト
     // プロキシが正しいContent-Typeヘッダーを返すことを確認
     
-    let response = send_request(PROXY_PORT, "/large.txt", &[]);
+    let response = send_request(PROXY_PORT, "/large.txt", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -8345,7 +8345,7 @@ async fn test_static_file_content_length() {
     // 静的ファイルのContent-Lengthのテスト
     // プロキシが正しいContent-Lengthヘッダーを返すことを確認
     
-    let response = send_request(PROXY_PORT, "/large.txt", &[]);
+    let response = send_request(PROXY_PORT, "/large.txt", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -8376,7 +8376,7 @@ async fn test_static_file_etag() {
     // 静的ファイルのETagのテスト
     // プロキシがETagヘッダーを返すことを確認
     
-    let response = send_request(PROXY_PORT, "/large.txt", &[]);
+    let response = send_request(PROXY_PORT, "/large.txt", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -8407,7 +8407,7 @@ async fn test_static_file_last_modified() {
     // 静的ファイルのLast-Modifiedのテスト
     // プロキシがLast-Modifiedヘッダーを返すことを確認
     
-    let response = send_request(PROXY_PORT, "/large.txt", &[]);
+    let response = send_request(PROXY_PORT, "/large.txt", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -8442,7 +8442,7 @@ async fn test_chunked_transfer_encoding_size() {
     // Chunked Transfer Encodingのサイズのテスト
     // チャンクサイズが正しく処理されることを確認
     
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -8473,7 +8473,7 @@ async fn test_chunked_transfer_encoding_trailer() {
     // Chunked Transfer Encodingのトレーラーのテスト
     // トレーラーヘッダーが正しく処理されることを確認
     
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -8511,7 +8511,7 @@ async fn test_connection_timeout_handling() {
     // 注意: 実際のタイムアウトテストは時間がかかるため、
     // ここでは基本的な動作確認のみ
     
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -8722,7 +8722,7 @@ async fn test_http_method_put() {
     }
     
     // PUTメソッドのテスト
-    let response = send_request_with_method(PROXY_PORT, "/", "PUT", &[], None);
+    let response = send_request_with_method(PROXY_PORT, "/", "PUT", &[], None).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -8744,7 +8744,7 @@ async fn test_http_method_delete() {
     }
     
     // DELETEメソッドのテスト
-    let response = send_request_with_method(PROXY_PORT, "/", "DELETE", &[], None);
+    let response = send_request_with_method(PROXY_PORT, "/", "DELETE", &[], None).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -8766,7 +8766,7 @@ async fn test_http_method_patch() {
     }
     
     // PATCHメソッドのテスト
-    let response = send_request_with_method(PROXY_PORT, "/", "PATCH", &[], None);
+    let response = send_request_with_method(PROXY_PORT, "/", "PATCH", &[], None).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -8788,7 +8788,7 @@ async fn test_http_method_options() {
     }
     
     // OPTIONSメソッドのテスト
-    let response = send_request_with_method(PROXY_PORT, "/", "OPTIONS", &[], None);
+    let response = send_request_with_method(PROXY_PORT, "/", "OPTIONS", &[], None).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -8816,7 +8816,7 @@ async fn test_http_method_head() {
     }
     
     // HEADメソッドのテスト
-    let response = send_request_with_method(PROXY_PORT, "/", "HEAD", &[], None);
+    let response = send_request_with_method(PROXY_PORT, "/", "HEAD", &[], None).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -8853,7 +8853,7 @@ async fn test_redirect_location_header() {
     // リダイレクトのLocationヘッダーのテスト
     // 注意: 実際のリダイレクトが発生するパスが必要
     
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -8881,7 +8881,7 @@ async fn test_redirect_cache_control() {
     }
     
     // リダイレクトのCache-Controlヘッダーのテスト
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -8979,7 +8979,7 @@ async fn test_error_handling_431_request_header_fields_too_large() {
     // このテストは既に test_oversized_header で実装されているため、
     // ここでは基本的な動作確認のみ
     
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -9012,8 +9012,8 @@ async fn test_concurrent_requests_different_paths() {
         .map(|i| {
             let success_count = Arc::clone(&success_count);
             let path = paths[i % paths.len()];
-            thread::spawn(move || {
-                let response = send_request(PROXY_PORT, path, &[]);
+            tokio::spawn(async move {
+                let response = send_request(PROXY_PORT, path, &[]).await;
                 if let Some(response) = response {
                     let status = get_status_code(&response);
                     // 並列リクエストテスト: プロキシが並列リクエストを処理できることを確認
@@ -9027,7 +9027,7 @@ async fn test_concurrent_requests_different_paths() {
         .collect();
     
     for handle in handles {
-        let _ = handle.join();
+        let _ = handle.await;
     }
     
     let successes = success_count.load(Ordering::Relaxed);
@@ -9059,8 +9059,8 @@ async fn test_concurrent_requests_mixed_methods() {
         .map(|i| {
             let success_count = Arc::clone(&success_count);
             let method = methods[i % methods.len()];
-            thread::spawn(move || {
-                let response = send_request_with_method(PROXY_PORT, "/", method, &[], None);
+            tokio::spawn(async move {
+                let response = send_request_with_method(PROXY_PORT, "/", method, &[], None).await;
                 if let Some(response) = response {
                     let status = get_status_code(&response);
                     // 並列メソッドテスト: プロキシが並列リクエストを処理できることを確認
@@ -9075,7 +9075,7 @@ async fn test_concurrent_requests_mixed_methods() {
         .collect();
     
     for handle in handles {
-        let _ = handle.join();
+        let _ = handle.await;
     }
     
     let successes = success_count.load(Ordering::Relaxed);
@@ -9105,14 +9105,14 @@ async fn test_concurrent_requests_with_headers() {
     let handles: Vec<_> = (0..total_requests)
         .map(|i| {
             let success_count = Arc::clone(&success_count);
-            thread::spawn(move || {
+            tokio::spawn(async move {
                 let ua = format!("TestClient-{}", i);
                 let req_id = format!("req-{}", i);
                 let headers = vec![
                     ("User-Agent", ua.as_str()),
                     ("X-Request-ID", req_id.as_str()),
                 ];
-                let response = send_request(PROXY_PORT, "/", &headers);
+                let response = send_request(PROXY_PORT, "/", &headers).await;
                 if let Some(response) = response {
                     let status = get_status_code(&response);
                     if status == Some(200) {
@@ -9124,7 +9124,7 @@ async fn test_concurrent_requests_with_headers() {
         .collect();
     
     for handle in handles {
-        let _ = handle.join();
+        let _ = handle.await;
     }
     
     let successes = success_count.load(Ordering::Relaxed);
@@ -9155,7 +9155,7 @@ async fn test_connection_pool_reuse() {
     
     // 最初のリクエスト（接続確立）
     let start1 = Instant::now();
-    let response1 = send_request(PROXY_PORT, "/", &[]);
+    let response1 = send_request(PROXY_PORT, "/", &[]).await;
     let elapsed1 = start1.elapsed();
     
     assert!(response1.is_some(), "First request should succeed");
@@ -9164,7 +9164,7 @@ async fn test_connection_pool_reuse() {
     
     // 2回目のリクエスト（接続再利用の可能性）
     let start2 = Instant::now();
-    let response2 = send_request(PROXY_PORT, "/", &[]);
+    let response2 = send_request(PROXY_PORT, "/", &[]).await;
     let elapsed2 = start2.elapsed();
     
     assert!(response2.is_some(), "Second request should succeed");
@@ -9193,7 +9193,7 @@ async fn test_connection_pool_multiple_sequential() {
     let mut success_count = 0;
     
     for _ in 0..num_requests {
-        let response = send_request(PROXY_PORT, "/", &[]);
+        let response = send_request(PROXY_PORT, "/", &[]).await;
         if let Some(response) = response {
             let status = get_status_code(&response);
             if status == Some(200) {
@@ -9233,7 +9233,7 @@ async fn test_response_time_consistency() {
     
     for _ in 0..num_requests {
         let start = Instant::now();
-        let response = send_request(PROXY_PORT, "/", &[]);
+        let response = send_request(PROXY_PORT, "/", &[]).await;
         let elapsed = start.elapsed();
         
         if response.is_some() {
@@ -9276,7 +9276,7 @@ async fn test_throughput_basic() {
     let mut success_count = 0;
     
     for _ in 0..num_requests {
-        let response = send_request(PROXY_PORT, "/", &[]);
+        let response = send_request(PROXY_PORT, "/", &[]).await;
         if let Some(response) = response {
             let status = get_status_code(&response);
             if status == Some(200) {
@@ -9321,7 +9321,7 @@ async fn test_stress_rapid_requests() {
     let mut success_count = 0;
     
     for i in 0..num_requests {
-        let response = send_request(PROXY_PORT, "/", &[]);
+        let response = send_request(PROXY_PORT, "/", &[]).await;
         if let Some(response) = response {
             let status = get_status_code(&response);
             if status == Some(200) {
@@ -9361,7 +9361,7 @@ async fn test_stress_long_duration() {
     
     while start.elapsed() < duration {
         request_count += 1;
-        let response = send_request(PROXY_PORT, "/", &[]);
+        let response = send_request(PROXY_PORT, "/", &[]).await;
         if let Some(response) = response {
             let status = get_status_code(&response);
             if status == Some(200) {
@@ -9568,7 +9568,7 @@ async fn test_prometheus_metrics_request_count() {
     }
     
     // Prometheusメトリクスのリクエストカウントのテスト
-    let response = send_request(PROXY_PORT, "/__metrics", &[]);
+    let response = send_request(PROXY_PORT, "/__metrics", &[]).await;
     assert!(response.is_some(), "Should receive metrics response");
     
     let response = response.unwrap();
@@ -9592,7 +9592,7 @@ async fn test_prometheus_metrics_latency() {
     }
     
     // Prometheusメトリクスのレイテンシのテスト
-    let response = send_request(PROXY_PORT, "/__metrics", &[]);
+    let response = send_request(PROXY_PORT, "/__metrics", &[]).await;
     assert!(response.is_some(), "Should receive metrics response");
     
     let response = response.unwrap();
@@ -9616,7 +9616,7 @@ async fn test_prometheus_metrics_connections() {
     }
     
     // Prometheusメトリクスの接続数のテスト
-    let response = send_request(PROXY_PORT, "/__metrics", &[]);
+    let response = send_request(PROXY_PORT, "/__metrics", &[]).await;
     assert!(response.is_some(), "Should receive metrics response");
     
     let response = response.unwrap();
@@ -9644,11 +9644,11 @@ async fn test_prometheus_metrics_after_requests() {
     
     // リクエストを送信
     for _ in 0..5 {
-        let _ = send_request(PROXY_PORT, "/", &[]);
+        let _ = send_request(PROXY_PORT, "/", &[]).await;
     }
     
     // メトリクスを取得
-    let response = send_request(PROXY_PORT, "/__metrics", &[]);
+    let response = send_request(PROXY_PORT, "/__metrics", &[]).await;
     assert!(response.is_some(), "Should receive metrics response");
     
     let response = response.unwrap();
@@ -9673,7 +9673,7 @@ async fn test_security_x_forwarded_for() {
     // X-Forwarded-Forヘッダーのテスト
     // プロキシがX-Forwarded-Forヘッダーを追加することを確認
     
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -9695,7 +9695,7 @@ async fn test_security_x_real_ip() {
     // X-Real-IPヘッダーのテスト
     // プロキシがX-Real-IPヘッダーを追加することを確認
     
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -9717,7 +9717,7 @@ async fn test_security_strict_transport_security() {
     // Strict-Transport-Securityヘッダーのテスト
     // HTTPS接続でStrict-Transport-Securityヘッダーが返される可能性を確認
     
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -9754,7 +9754,7 @@ async fn test_error_handling_500_internal_server_error() {
     // 注意: 実際の500エラーを発生させるのは難しいため、
     // ここでは基本的な動作確認のみ
     
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -9781,7 +9781,7 @@ async fn test_error_handling_503_service_unavailable() {
     // 注意: 実際の503エラーを発生させるのは難しいため、
     // ここでは基本的な動作確認のみ
     
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -9811,7 +9811,7 @@ async fn test_error_handling_timeout() {
     use std::time::Instant;
     
     let start = Instant::now();
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     let elapsed = start.elapsed();
     
     assert!(response.is_some(), "Should receive response");
@@ -9843,7 +9843,7 @@ async fn test_compression_zstd() {
     
     // Zstd圧縮のテスト
     // 前提条件: /large.txt が存在することを確認
-    let prereq = send_request(PROXY_PORT, "/large.txt", &[]);
+    let prereq = send_request(PROXY_PORT, "/large.txt", &[]).await;
     if prereq.is_none() {
         panic!("Prerequisite check failed: no response from /large.txt");
     }
@@ -9857,7 +9857,7 @@ async fn test_compression_zstd() {
         PROXY_PORT, 
         "/large.txt", 
         &[("Accept-Encoding", "zstd")]
-    );
+    ).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -9889,7 +9889,7 @@ async fn test_compression_multiple_encodings() {
     }
     
     // 前提条件: /large.txt が存在することを確認
-    let prereq = send_request(PROXY_PORT, "/large.txt", &[]);
+    let prereq = send_request(PROXY_PORT, "/large.txt", &[]).await;
     if prereq.is_none() {
         panic!("Prerequisite check failed: no response from /large.txt");
     }
@@ -9903,7 +9903,7 @@ async fn test_compression_multiple_encodings() {
         PROXY_PORT, 
         "/large.txt", 
         &[("Accept-Encoding", "gzip, br, zstd;q=0.8, deflate")]
-    );
+    ).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -9932,7 +9932,7 @@ async fn test_compression_no_encoding() {
     }
     
     // 前提条件: /large.txt が存在することを確認
-    let prereq = send_request(PROXY_PORT, "/large.txt", &[]);
+    let prereq = send_request(PROXY_PORT, "/large.txt", &[]).await;
     if prereq.is_none() {
         panic!("Prerequisite check failed: no response from /large.txt");
     }
@@ -9946,7 +9946,7 @@ async fn test_compression_no_encoding() {
         PROXY_PORT, 
         "/large.txt", 
         &[("Accept-Encoding", "identity")]
-    );
+    ).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -9985,7 +9985,7 @@ async fn test_load_balancing_round_robin_distribution() {
     let mut backend2_count = 0;
     
     for _ in 0..num_requests {
-        let response = send_request(PROXY_PORT, "/", &[]);
+        let response = send_request(PROXY_PORT, "/", &[]).await;
         if let Some(response) = response {
             let server_id = get_header_value(&response, "X-Server-Id");
             if let Some(id) = server_id {
@@ -10019,7 +10019,7 @@ async fn test_load_balancing_backend_identification() {
     // バックエンド識別のテスト
     // X-Server-Idヘッダーでバックエンドを識別できることを確認
     
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -10055,7 +10055,7 @@ async fn test_cache_age_header() {
     // キャッシュされたレスポンスにAgeヘッダーが含まれることを確認
     
     // 最初のリクエスト（キャッシュミス）
-    let response1 = send_request(PROXY_PORT, "/", &[]);
+    let response1 = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response1.is_some(), "Should receive response");
     
     let response1 = response1.unwrap();
@@ -10066,7 +10066,7 @@ async fn test_cache_age_header() {
     std::thread::sleep(Duration::from_millis(100));
     
     // 2回目のリクエスト（キャッシュヒットの可能性）
-    let response2 = send_request(PROXY_PORT, "/", &[]);
+    let response2 = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response2.is_some(), "Should receive response");
     
     let response2 = response2.unwrap();
@@ -10098,7 +10098,7 @@ async fn test_cache_vary_header_handling() {
     // Varyヘッダーが存在する場合、キャッシュキーに含まれることを確認
     
     // Accept-Encodingヘッダーを含むリクエスト
-    let response1 = send_request(PROXY_PORT, "/", &[("Accept-Encoding", "gzip")]);
+    let response1 = send_request(PROXY_PORT, "/", &[("Accept-Encoding", "gzip")]).await;
     assert!(response1.is_some(), "Should receive response");
     
     let response1 = response1.unwrap();
@@ -10112,7 +10112,7 @@ async fn test_cache_vary_header_handling() {
     }
     
     // 異なるAccept-Encodingヘッダーを含むリクエスト
-    let response2 = send_request(PROXY_PORT, "/", &[("Accept-Encoding", "br")]);
+    let response2 = send_request(PROXY_PORT, "/", &[("Accept-Encoding", "br")]).await;
     assert!(response2.is_some(), "Should receive response");
     
     let response2 = response2.unwrap();
@@ -10130,7 +10130,7 @@ async fn test_cache_max_age_header() {
     }
     
     // キャッシュのCache-Control: max-ageヘッダーのテスト
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -10168,7 +10168,7 @@ async fn test_buffering_adaptive_threshold() {
     
     // 小さなレスポンス（Streamingモードの可能性）
     let start1 = Instant::now();
-    let response1 = send_request(PROXY_PORT, "/", &[]);
+    let response1 = send_request(PROXY_PORT, "/", &[]).await;
     let elapsed1 = start1.elapsed();
     
     assert!(response1.is_some(), "Should receive response");
@@ -10178,7 +10178,7 @@ async fn test_buffering_adaptive_threshold() {
     
     // 大きなレスポンス（FullまたはAdaptiveモードの可能性）
     let start2 = Instant::now();
-    let response2 = send_request(PROXY_PORT, "/large.txt", &[]);
+    let response2 = send_request(PROXY_PORT, "/large.txt", &[]).await;
     let elapsed2 = start2.elapsed();
     
     if let Some(response2) = response2 {
@@ -10201,7 +10201,7 @@ async fn test_buffering_memory_limit() {
     // メモリ制限を超えた場合の動作を確認
     
     // 前提条件: /large.txt が存在することを確認
-    let prereq = send_request(PROXY_PORT, "/large.txt", &[]);
+    let prereq = send_request(PROXY_PORT, "/large.txt", &[]).await;
     if prereq.is_none() {
         panic!("Prerequisite check failed: no response from /large.txt");
     }
@@ -10211,7 +10211,7 @@ async fn test_buffering_memory_limit() {
     }
     
     // 大きなレスポンスをリクエスト
-    let response = send_request(PROXY_PORT, "/large.txt", &[]);
+    let response = send_request(PROXY_PORT, "/large.txt", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -10235,7 +10235,7 @@ async fn test_buffering_chunked_vs_full() {
     // Chunked転送とFullバッファリングの比較テスト
     // レスポンスの転送方法を確認
     
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -10269,7 +10269,7 @@ async fn test_h2c_proxy_forwarding() {
     
     // HTTP/1.1でプロキシにリクエスト送信
     // プロキシがH2Cでバックエンドに接続し、正常に動作することを確認
-    let response = send_request(PROXY_PORT, "/h2c/", &[]);
+    let response = send_request(PROXY_PORT, "/h2c/", &[]).await;
     assert!(response.is_some(), "Should receive response from proxy");
     
     let response = response.unwrap();
@@ -10299,7 +10299,7 @@ async fn test_h2c_get_request() {
     }
     
     // GETリクエストをH2Cルート経由で送信
-    let response = send_request(PROXY_PORT, "/h2c/index.html", &[]);
+    let response = send_request(PROXY_PORT, "/h2c/index.html", &[]).await;
     assert!(response.is_some(), "Should receive response from proxy");
     
     let response = response.unwrap();
@@ -10335,7 +10335,7 @@ async fn test_h2c_post_request() {
         ("Content-Length", &content_length_str),
     ];
     
-    let response = send_post_request(PROXY_PORT, "/h2c/test.txt", &headers, body);
+    let response = send_post_request(PROXY_PORT, "/h2c/test.txt", &headers, body).await;
     assert!(response.is_some(), "Should receive response from proxy");
     
     let response = response.unwrap();
@@ -10357,7 +10357,7 @@ async fn test_h2c_header_manipulation() {
     }
     
     // カスタムヘッダーを含むリクエストを送信
-    let response = send_request(PROXY_PORT, "/h2c/", &[]);
+    let response = send_request(PROXY_PORT, "/h2c/", &[]).await;
     assert!(response.is_some(), "Should receive response from proxy");
     
     let response = response.unwrap();
@@ -10392,7 +10392,7 @@ async fn test_h2c_connection_timeout() {
     
     // 実際のタイムアウトテストには、遅延応答するバックエンドが必要
     // ここでは、基本的な動作確認のみ実施
-    let response = send_request(PROXY_PORT, "/h2c/", &[]);
+    let response = send_request(PROXY_PORT, "/h2c/", &[]).await;
     assert!(response.is_some(), "Should receive response from proxy");
     
     let response = response.unwrap();
@@ -10413,7 +10413,7 @@ async fn test_h2c_backend_unavailable() {
     }
     
     // 存在しないパスへのリクエストの場合、404 Not Foundが返される
-    let response = send_request(PROXY_PORT, "/h2c/nonexistent", &[]);
+    let response = send_request(PROXY_PORT, "/h2c/nonexistent", &[]).await;
     assert!(response.is_some(), "Should receive response from proxy");
     
     let response = response.unwrap();
@@ -10441,7 +10441,7 @@ async fn test_h2c_basic_connection() {
     
     // H2Cルート経由で基本的な接続を確認
     // プロキシがH2Cでバックエンドに接続し、正常に動作することを確認
-    let response = send_request(PROXY_PORT, "/h2c/", &[]);
+    let response = send_request(PROXY_PORT, "/h2c/", &[]).await;
     assert!(response.is_some(), "Should receive response from proxy");
     
     let response = response.unwrap();
@@ -10472,13 +10472,13 @@ async fn test_h2c_connection_reuse() {
     
     // 同一接続での複数リクエストを確認
     // プロキシがH2C接続を再利用することを確認
-    let response1 = send_request(PROXY_PORT, "/h2c/", &[]);
+    let response1 = send_request(PROXY_PORT, "/h2c/", &[]).await;
     assert!(response1.is_some(), "Should receive first response from proxy");
     
     // 短い待機時間後に2回目のリクエストを送信
     std::thread::sleep(Duration::from_millis(100));
     
-    let response2 = send_request(PROXY_PORT, "/h2c/index.html", &[]);
+    let response2 = send_request(PROXY_PORT, "/h2c/index.html", &[]).await;
     assert!(response2.is_some(), "Should receive second response from proxy");
     
     // 両方のリクエストがレスポンスを受信することを確認
@@ -10506,7 +10506,7 @@ async fn test_h2c_connection_close() {
     // 接続の正常終了を確認
     // Connection: closeヘッダーを含むリクエストを送信
     let headers = vec![("Connection", "close")];
-    let response = send_request(PROXY_PORT, "/h2c/", &headers);
+    let response = send_request(PROXY_PORT, "/h2c/", &headers).await;
     assert!(response.is_some(), "Should receive response from proxy");
     
     let response = response.unwrap();
@@ -10530,7 +10530,7 @@ async fn test_h2c_handshake_success() {
     
     // H2Cハンドシェイクの成功を確認
     // プロキシがH2Cでバックエンドに接続し、ハンドシェイクが成功することを確認
-    let response = send_request(PROXY_PORT, "/h2c/", &[]);
+    let response = send_request(PROXY_PORT, "/h2c/", &[]).await;
     assert!(response.is_some(), "Should receive response from proxy");
     
     let response = response.unwrap();
@@ -10560,7 +10560,7 @@ async fn test_h2c_settings_negotiation() {
     
     // SETTINGSネゴシエーションを確認
     // プロキシがH2Cでバックエンドに接続し、SETTINGSフレームが交換されることを確認
-    let response = send_request(PROXY_PORT, "/h2c/", &[]);
+    let response = send_request(PROXY_PORT, "/h2c/", &[]).await;
     assert!(response.is_some(), "Should receive response from proxy");
     
     let response = response.unwrap();
@@ -10582,7 +10582,7 @@ async fn test_h2c_handshake_failure() {
     
     // H2Cハンドシェイクの失敗を確認
     // 存在しないパスへのリクエストを送信して、ハンドシェイクが失敗する場合のエラーハンドリングを確認
-    let response = send_request(PROXY_PORT, "/h2c/invalid-path-that-should-fail", &[]);
+    let response = send_request(PROXY_PORT, "/h2c/invalid-path-that-should-fail", &[]).await;
     assert!(response.is_some(), "Should receive response from proxy");
     
     let response = response.unwrap();
@@ -10613,7 +10613,7 @@ async fn test_h2c_large_request_body() {
         ("Content-Length", &content_length_str),
     ];
     
-    let response = send_post_request(PROXY_PORT, "/h2c/test.txt", &headers, &large_body);
+    let response = send_post_request(PROXY_PORT, "/h2c/test.txt", &headers, &large_body).await;
     assert!(response.is_some(), "Should receive response from proxy");
     
     let response = response.unwrap();
@@ -10635,7 +10635,7 @@ async fn test_h2c_large_response_body() {
     
     // 大きなレスポンスボディの受信を確認
     // フロー制御が正しく動作することを確認
-    let response = send_request(PROXY_PORT, "/h2c/large.txt", &[]);
+    let response = send_request(PROXY_PORT, "/h2c/large.txt", &[]).await;
     assert!(response.is_some(), "Should receive response from proxy");
     
     let response = response.unwrap();
@@ -10673,7 +10673,7 @@ async fn test_h2c_header_compression() {
         ("Connection", "keep-alive"),
     ];
     
-    let response = send_request(PROXY_PORT, "/h2c/", &headers);
+    let response = send_request(PROXY_PORT, "/h2c/", &headers).await;
     assert!(response.is_some(), "Should receive response from proxy");
     
     let response = response.unwrap();
@@ -10700,9 +10700,9 @@ async fn test_h2c_multiple_streams() {
     let mut handles = Vec::new();
     
     for i in 0..3 {
-        let handle = std::thread::spawn(move || {
+        let handle = tokio::spawn(async move {
             let path = format!("/h2c/test{}.txt", i);
-            send_request(PROXY_PORT, &path, &[])
+            send_request(PROXY_PORT, &path, &[]).await
         });
         handles.push(handle);
     }
@@ -10710,7 +10710,7 @@ async fn test_h2c_multiple_streams() {
     // すべてのリクエストが完了するまで待機
     let mut responses = Vec::new();
     for handle in handles {
-        if let Ok(response) = handle.join() {
+        if let Ok(response) = handle.await {
             responses.push(response);
         }
     }
@@ -10744,7 +10744,7 @@ async fn test_h2c_stream_priority() {
         ("Priority", "u=0, i"),
     ];
     
-    let response = send_request(PROXY_PORT, "/h2c/", &headers);
+    let response = send_request(PROXY_PORT, "/h2c/", &headers).await;
     assert!(response.is_some(), "Should receive response from proxy");
     
     let response = response.unwrap();
@@ -10767,7 +10767,7 @@ async fn test_h2c_stream_cancellation() {
     // ストリームキャンセルを確認
     // 接続を早期に切断して、ストリームがキャンセルされることを確認
     // 注意: 実際のRST_STREAMフレームのテストには、より低レベルな実装が必要
-    let response = send_request(PROXY_PORT, "/h2c/", &[]);
+    let response = send_request(PROXY_PORT, "/h2c/", &[]).await;
     assert!(response.is_some(), "Should receive response from proxy");
     
     let response = response.unwrap();
@@ -10792,7 +10792,7 @@ async fn test_h2c_invalid_frame() {
     // 不正フレームの処理を確認
     // プロキシ経由では直接的な不正フレームの送信は困難なため、
     // 不正なリクエストパスを送信してエラーハンドリングを確認
-    let response = send_request(PROXY_PORT, "/h2c/\x00\x01\x02\x03", &[]);
+    let response = send_request(PROXY_PORT, "/h2c/\x00\x01\x02\x03", &[]).await;
     assert!(response.is_some(), "Should receive response from proxy");
     
     let response = response.unwrap();
@@ -10822,7 +10822,7 @@ async fn test_h2c_proxy_load_balancing() {
     let mut responses = Vec::new();
     
     for _ in 0..5 {
-        let response = send_request(PROXY_PORT, "/h2c/", &[]);
+        let response = send_request(PROXY_PORT, "/h2c/", &[]).await;
         responses.push(response);
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -10892,7 +10892,7 @@ async fn test_h2c_grpc_streaming() {
         "/h2c/grpc.test.v1.TestService/ServerStreaming",
         message,
         &[],
-    ) {
+    ).await {
         Ok(r) => r,
         Err(e) => {
             panic!("Failed to send gRPC streaming request: {}", e);
@@ -10923,7 +10923,7 @@ async fn test_h2c_throughput() {
     let request_count = 10;
     
     for _ in 0..request_count {
-        let response = send_request(PROXY_PORT, "/h2c/", &[]);
+        let response = send_request(PROXY_PORT, "/h2c/", &[]).await;
         if let Some(resp) = response {
             let status = get_status_code(&resp);
             // H2C接続が正常に確立された場合、200 OKが返される
@@ -10958,7 +10958,7 @@ async fn test_h2c_latency() {
     
     for _ in 0..request_count {
         let start = std::time::Instant::now();
-        let response = send_request(PROXY_PORT, "/h2c/", &[]);
+        let response = send_request(PROXY_PORT, "/h2c/", &[]).await;
         let elapsed = start.elapsed();
         
         if response.is_some() {
@@ -10997,7 +10997,7 @@ async fn test_buffering_disk_spillover_enabled() {
     
     // メモリバッファ上限（デフォルト10MB）を超える大きなレスポンスをリクエスト
     // 実際のテストでは、20MB以上のレスポンスを生成する必要がある
-    let response = send_request(PROXY_PORT, "/large.txt", &[]);
+    let response = send_request(PROXY_PORT, "/large.txt", &[]).await;
     
     if let Some(response) = response {
         let status = get_status_code(&response);
@@ -11033,7 +11033,7 @@ async fn test_buffering_disk_spillover_disabled() {
     // disk_buffer_pathが設定されていない場合、メモリ上限超過時にエラーが返される可能性がある
     
     // メモリバッファ上限を超える大きなレスポンスをリクエスト
-    let response = send_request(PROXY_PORT, "/large.txt", &[]);
+    let response = send_request(PROXY_PORT, "/large.txt", &[]).await;
     
     if let Some(response) = response {
         let status = get_status_code(&response);
@@ -11061,7 +11061,7 @@ async fn test_buffering_client_write_timeout() {
     // 通常のリクエストを送信（リトライ付き）
     let mut response = None;
     for _retry in 0..3 {
-        response = send_request(PROXY_PORT, "/", &[]);
+        response = send_request(PROXY_PORT, "/", &[]).await;
         if response.is_some() {
             break;
         }
@@ -11093,7 +11093,7 @@ async fn test_buffering_slow_client_detection() {
     // 通常のリクエストを送信（リトライ付き）
     let mut response = None;
     for _retry in 0..3 {
-        response = send_request(PROXY_PORT, "/", &[]);
+        response = send_request(PROXY_PORT, "/", &[]).await;
         if response.is_some() {
             break;
         }
@@ -11129,7 +11129,7 @@ async fn test_buffering_full_backend_connection_early_release() {
     let start = Instant::now();
     let mut response = None;
     for _retry in 0..3 {
-        response = send_request(PROXY_PORT, "/", &[]);
+        response = send_request(PROXY_PORT, "/", &[]).await;
         if response.is_some() {
             break;
         }
@@ -11164,7 +11164,7 @@ async fn test_buffering_streaming_backend_connection_release() {
     let start = Instant::now();
     let mut response = None;
     for _retry in 0..3 {
-        response = send_request(PROXY_PORT, "/large.txt", &[]);
+        response = send_request(PROXY_PORT, "/large.txt", &[]).await;
         if response.is_some() {
             break;
         }
@@ -11198,7 +11198,7 @@ async fn test_buffering_adaptive_threshold_exact() {
     // 閾値より小さいレスポンス（Fullバッファリング）
     let mut small_response = None;
     for _retry in 0..3 {
-        small_response = send_request(PROXY_PORT, "/", &[]);
+        small_response = send_request(PROXY_PORT, "/", &[]).await;
         if small_response.is_some() {
             break;
         }
@@ -11211,7 +11211,7 @@ async fn test_buffering_adaptive_threshold_exact() {
         // 閾値より大きいレスポンス（Streaming）
         let mut large_response = None;
         for _retry in 0..3 {
-            large_response = send_request(PROXY_PORT, "/large.txt", &[]);
+            large_response = send_request(PROXY_PORT, "/large.txt", &[]).await;
             if large_response.is_some() {
                 break;
             }
@@ -11463,14 +11463,14 @@ async fn test_health_check_unhealthy_threshold_exact() {
     // 実際のテストには、バックエンドの動的な障害をシミュレートする必要がある
     
     // メトリクスエンドポイントから初期状態を取得
-    let initial_metrics = send_request(PROXY_PORT, "/__metrics", &[]);
+    let initial_metrics = send_request(PROXY_PORT, "/__metrics", &[]).await;
     
     // 複数のリクエストを送信してヘルスチェックが動作することを確認
     for i in 0..10 {
         // リトライロジックを追加
         let mut response = None;
         for _retry in 0..3 {
-            response = send_request(PROXY_PORT, "/", &[]);
+            response = send_request(PROXY_PORT, "/", &[]).await;
             if response.is_some() {
                 break;
             }
@@ -11491,7 +11491,7 @@ async fn test_health_check_unhealthy_threshold_exact() {
     }
     
     // メトリクスエンドポイントから最終状態を取得
-    let final_metrics = send_request(PROXY_PORT, "/__metrics", &[]);
+    let final_metrics = send_request(PROXY_PORT, "/__metrics", &[]).await;
     
     // メトリクスが更新されていることを確認
     if let (Some(initial), Some(final_state)) = (initial_metrics, final_metrics) {
@@ -11516,14 +11516,14 @@ async fn test_health_check_healthy_threshold_exact() {
     // 実際のテストには、バックエンドの動的な回復をシミュレートする必要がある
     
     // メトリクスエンドポイントから初期状態を取得
-    let initial_metrics = send_request(PROXY_PORT, "/__metrics", &[]);
+    let initial_metrics = send_request(PROXY_PORT, "/__metrics", &[]).await;
     
     // 複数のリクエストを送信してヘルスチェックが動作することを確認
     for i in 0..10 {
         // リトライロジックを追加
         let mut response = None;
         for _retry in 0..3 {
-            response = send_request(PROXY_PORT, "/", &[]);
+            response = send_request(PROXY_PORT, "/", &[]).await;
             if response.is_some() {
                 break;
             }
@@ -11544,7 +11544,7 @@ async fn test_health_check_healthy_threshold_exact() {
     }
     
     // メトリクスエンドポイントから最終状態を取得
-    let final_metrics = send_request(PROXY_PORT, "/__metrics", &[]);
+    let final_metrics = send_request(PROXY_PORT, "/__metrics", &[]).await;
     
     // メトリクスが更新されていることを確認
     if let (Some(initial), Some(final_state)) = (initial_metrics, final_metrics) {
@@ -11569,7 +11569,7 @@ async fn test_health_check_tls_cert_verification_enabled() {
     // use_tls = true, verify_cert = true が設定されている場合のテスト
     
     // メトリクスエンドポイントから健康状態を確認
-    let metrics_response = send_request(PROXY_PORT, "/__metrics", &[]);
+    let metrics_response = send_request(PROXY_PORT, "/__metrics", &[]).await;
     
     if let Some(metrics) = metrics_response {
         if metrics.contains("http_upstream_health") || metrics.contains("veil_proxy_http_upstream_health") {
@@ -11593,7 +11593,7 @@ async fn test_health_check_tls_cert_verification_disabled() {
     // use_tls = true, verify_cert = false が設定されている場合のテスト
     
     // メトリクスエンドポイントから健康状態を確認
-    let metrics_response = send_request(PROXY_PORT, "/__metrics", &[]);
+    let metrics_response = send_request(PROXY_PORT, "/__metrics", &[]).await;
     
     if let Some(metrics) = metrics_response {
         if metrics.contains("http_upstream_health") || metrics.contains("veil_proxy_http_upstream_health") {
@@ -11619,7 +11619,7 @@ async fn test_health_check_backend_slow_response() {
     // 通常のリクエストを送信（リトライ付き）
     let mut response = None;
     for _retry in 0..3 {
-        response = send_request(PROXY_PORT, "/", &[]);
+        response = send_request(PROXY_PORT, "/", &[]).await;
         if response.is_some() {
             break;
         }
@@ -11651,11 +11651,11 @@ async fn test_health_check_backend_intermittent_failure() {
     // 実際のテストには、間欠的に失敗するバックエンドをシミュレートする必要がある
     
     // メトリクスエンドポイントから初期状態を取得
-    let initial_metrics = send_request(PROXY_PORT, "/__metrics", &[]);
+    let initial_metrics = send_request(PROXY_PORT, "/__metrics", &[]).await;
     
     // 複数のリクエストを送信
     for _ in 0..20 {
-        let response = send_request(PROXY_PORT, "/", &[]);
+        let response = send_request(PROXY_PORT, "/", &[]).await;
         if let Some(response) = response {
             let status = get_status_code(&response);
             // 間欠的な障害が適切に検出されることを確認
@@ -11670,7 +11670,7 @@ async fn test_health_check_backend_intermittent_failure() {
     }
     
     // メトリクスエンドポイントから最終状態を取得
-    let final_metrics = send_request(PROXY_PORT, "/__metrics", &[]);
+    let final_metrics = send_request(PROXY_PORT, "/__metrics", &[]).await;
     
     // メトリクスが更新されていることを確認
     if let (Some(initial), Some(final_state)) = (initial_metrics, final_metrics) {
@@ -11694,7 +11694,7 @@ async fn test_buffering_disk_spillover_max_size() {
     
     // ディスクバッファ上限（デフォルト100MB）を超える非常に大きなレスポンスをリクエスト
     // 実際のテストでは、200MB以上のレスポンスを生成する必要がある
-    let response = send_request(PROXY_PORT, "/large.txt", &[]);
+    let response = send_request(PROXY_PORT, "/large.txt", &[]).await;
     
     if let Some(response) = response {
         let status = get_status_code(&response);
@@ -11723,12 +11723,12 @@ async fn test_buffering_performance_streaming_vs_full() {
     
     // Streamingモードでのパフォーマンス測定
     let start_streaming = Instant::now();
-    let response_streaming = send_request(PROXY_PORT, "/large.txt", &[]);
+    let response_streaming = send_request(PROXY_PORT, "/large.txt", &[]).await;
     let elapsed_streaming = start_streaming.elapsed();
     
     // Fullモードでのパフォーマンス測定
     let start_full = Instant::now();
-    let response_full = send_request(PROXY_PORT, "/large.txt", &[]);
+    let response_full = send_request(PROXY_PORT, "/large.txt", &[]).await;
     let elapsed_full = start_full.elapsed();
     
     if let (Some(resp_s), Some(resp_f)) = (response_streaming, response_full) {
@@ -11884,14 +11884,14 @@ async fn test_health_check_threshold_counting() {
     // 例: ./tests/e2e_setup.sh test healthcheck
     
     // メトリクスエンドポイントから初期状態を取得
-    let initial_metrics = send_request(PROXY_PORT, "/__metrics", &[]);
+    let initial_metrics = send_request(PROXY_PORT, "/__metrics", &[]).await;
     
     // 複数のリクエストを送信してヘルスチェックが動作することを確認
     for i in 0..10 {
         // リトライロジックを追加
         let mut response = None;
         for _retry in 0..3 {
-            response = send_request(PROXY_PORT, "/", &[]);
+            response = send_request(PROXY_PORT, "/", &[]).await;
             if response.is_some() {
                 break;
             }
@@ -11912,7 +11912,7 @@ async fn test_health_check_threshold_counting() {
         
         // 中間状態のメトリクスを取得
         if i % 5 == 0 {
-            let metrics = send_request(PROXY_PORT, "/__metrics", &[]);
+            let metrics = send_request(PROXY_PORT, "/__metrics", &[]).await;
             if let Some(metrics) = metrics {
                 if metrics.contains("http_upstream_health") || metrics.contains("veil_proxy_http_upstream_health") {
                     eprintln!("Health check threshold counting test: intermediate metrics at request {}", i);
@@ -11922,7 +11922,7 @@ async fn test_health_check_threshold_counting() {
     }
     
     // メトリクスエンドポイントから最終状態を取得
-    let final_metrics = send_request(PROXY_PORT, "/__metrics", &[]);
+    let final_metrics = send_request(PROXY_PORT, "/__metrics", &[]).await;
     
     // メトリクスが更新されていることを確認
     if let (Some(initial), Some(final_state)) = (initial_metrics, final_metrics) {
@@ -11947,7 +11947,7 @@ async fn test_health_check_tls_invalid_cert() {
     // use_tls = true が設定されている場合のテスト
     
     // メトリクスエンドポイントから健康状態を確認
-    let metrics_response = send_request(PROXY_PORT, "/__metrics", &[]);
+    let metrics_response = send_request(PROXY_PORT, "/__metrics", &[]).await;
     
     if let Some(metrics) = metrics_response {
         if metrics.contains("http_upstream_health") || metrics.contains("veil_proxy_http_upstream_health") {
@@ -11972,8 +11972,8 @@ mod wasm_tests {
     // 基本機能テスト
     // ====================
 
-    #[test]
-    fn test_wasm_module_load() {
+    #[tokio::test]
+    async fn test_wasm_module_load() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
             return;
@@ -11981,7 +11981,7 @@ mod wasm_tests {
         
         // WASMモジュールがロードされていることを確認
         // 実際のロード確認は難しいため、WASMモジュールが適用されたルートへのリクエストで確認
-        let response = send_request(PROXY_PORT, "/wasm/", &[]);
+        let response = send_request(PROXY_PORT, "/wasm/", &[]).await;
         assert!(response.is_some(), "Should receive response from WASM-enabled route");
         
         let response = response.unwrap();
@@ -11994,8 +11994,8 @@ mod wasm_tests {
                    "Should have X-Veil-Processed header added by WASM module");
     }
 
-    #[test]
-    fn test_wasm_module_configuration() {
+    #[tokio::test]
+    async fn test_wasm_module_configuration() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
             return;
@@ -12003,7 +12003,7 @@ mod wasm_tests {
         
         // WASMモジュールの設定が読み込まれていることを確認
         // header_filterモジュールは設定に基づいてヘッダーを追加する
-        let response = send_request(PROXY_PORT, "/wasm/", &[]);
+        let response = send_request(PROXY_PORT, "/wasm/", &[]).await;
         assert!(response.is_some(), "Should receive response");
         
         let response = response.unwrap();
@@ -12014,8 +12014,8 @@ mod wasm_tests {
                    "Should have X-Veil-Filter-Version header from WASM module");
     }
 
-    #[test]
-    fn test_wasm_context_lifecycle() {
+    #[tokio::test]
+    async fn test_wasm_context_lifecycle() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
             return;
@@ -12023,8 +12023,8 @@ mod wasm_tests {
         
         // WASMコンテキストのライフサイクルを確認
         // 複数のリクエストを送信して、コンテキストIDが異なることを確認
-        let response1 = send_request(PROXY_PORT, "/wasm/", &[]);
-        let response2 = send_request(PROXY_PORT, "/wasm/", &[]);
+        let response1 = send_request(PROXY_PORT, "/wasm/", &[]).await;
+        let response2 = send_request(PROXY_PORT, "/wasm/", &[]).await;
         
         assert!(response1.is_some(), "Should receive first response");
         assert!(response2.is_some(), "Should receive second response");
@@ -12044,15 +12044,15 @@ mod wasm_tests {
     // コールバック関数テスト
     // ====================
 
-    #[test]
-    fn test_wasm_on_request_headers() {
+    #[tokio::test]
+    async fn test_wasm_on_request_headers() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
             return;
         }
         
         // on_request_headersコールバックの動作を確認
-        let response = send_request(PROXY_PORT, "/wasm/", &[]);
+        let response = send_request(PROXY_PORT, "/wasm/", &[]).await;
         assert!(response.is_some(), "Should receive response");
         
         let response = response.unwrap();
@@ -12067,15 +12067,15 @@ mod wasm_tests {
                    "Should have X-Veil-Processed header from WASM on_response_headers");
     }
 
-    #[test]
-    fn test_wasm_on_response_headers() {
+    #[tokio::test]
+    async fn test_wasm_on_response_headers() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
             return;
         }
         
         // on_response_headersコールバックの動作を確認
-        let response = send_request(PROXY_PORT, "/wasm/", &[]);
+        let response = send_request(PROXY_PORT, "/wasm/", &[]).await;
         assert!(response.is_some(), "Should receive response");
         
         let response = response.unwrap();
@@ -12090,8 +12090,8 @@ mod wasm_tests {
                    "Should have X-Veil-Filter-Version header from WASM module");
     }
 
-    #[test]
-    fn test_wasm_on_log() {
+    #[tokio::test]
+    async fn test_wasm_on_log() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
             return;
@@ -12099,7 +12099,7 @@ mod wasm_tests {
         
         // on_logコールバックの動作を確認
         // ログ出力は直接確認できないため、リクエストが正常に処理されることを確認
-        let response = send_request(PROXY_PORT, "/wasm/", &[]);
+        let response = send_request(PROXY_PORT, "/wasm/", &[]).await;
         assert!(response.is_some(), "Should receive response");
         
         let response = response.unwrap();
@@ -12116,8 +12116,8 @@ mod wasm_tests {
     // ホスト関数テスト
     // ====================
 
-    #[test]
-    fn test_wasm_header_operations() {
+    #[tokio::test]
+    async fn test_wasm_header_operations() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
             return;
@@ -12125,7 +12125,7 @@ mod wasm_tests {
         
         // ヘッダー操作のテスト
         // header_filterモジュールはヘッダーの追加を行う
-        let response = send_request(PROXY_PORT, "/wasm/", &[]);
+        let response = send_request(PROXY_PORT, "/wasm/", &[]).await;
         assert!(response.is_some(), "Should receive response");
         
         let response = response.unwrap();
@@ -12145,8 +12145,8 @@ mod wasm_tests {
     // ケーパビリティ制御テスト
     // ====================
 
-    #[test]
-    fn test_wasm_capability_headers() {
+    #[tokio::test]
+    async fn test_wasm_capability_headers() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
             return;
@@ -12154,7 +12154,7 @@ mod wasm_tests {
         
         // ヘッダー読み取り・書き込み権限のテスト
         // header_filterモジュールはヘッダー読み取り・書き込み権限が必要
-        let response = send_request(PROXY_PORT, "/wasm/", &[]);
+        let response = send_request(PROXY_PORT, "/wasm/", &[]).await;
         assert!(response.is_some(), "Should receive response");
         
         let response = response.unwrap();
@@ -12169,15 +12169,15 @@ mod wasm_tests {
     // 統合テスト
     // ====================
 
-    #[test]
-    fn test_wasm_header_modification_filter() {
+    #[tokio::test]
+    async fn test_wasm_header_modification_filter() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
             return;
         }
         
         // ヘッダー変更フィルタの動作を確認
-        let response = send_request(PROXY_PORT, "/wasm/", &[]);
+        let response = send_request(PROXY_PORT, "/wasm/", &[]).await;
         assert!(response.is_some(), "Should receive response");
         
         let response = response.unwrap();
@@ -12197,8 +12197,8 @@ mod wasm_tests {
         assert!(context_id.is_some(), "Should have X-Veil-Context-Id header");
     }
 
-    #[test]
-    fn test_wasm_route_specific_modules() {
+    #[tokio::test]
+    async fn test_wasm_route_specific_modules() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
             return;
@@ -12206,7 +12206,7 @@ mod wasm_tests {
         
         // ルート固有のモジュール適用を確認
         // /wasm/* パスにはWASMモジュールが適用される
-        let wasm_response = send_request(PROXY_PORT, "/wasm/", &[]);
+        let wasm_response = send_request(PROXY_PORT, "/wasm/", &[]).await;
         assert!(wasm_response.is_some(), "Should receive response from WASM route");
         
         let wasm_response = wasm_response.unwrap();
@@ -12215,7 +12215,7 @@ mod wasm_tests {
                    "WASM route should have X-Veil-Processed header");
         
         // 通常のルートにはWASMモジュールが適用されない
-        let normal_response = send_request(PROXY_PORT, "/", &[]);
+        let normal_response = send_request(PROXY_PORT, "/", &[]).await;
         assert!(normal_response.is_some(), "Should receive response from normal route");
         
         let normal_response = normal_response.unwrap();
@@ -12232,8 +12232,8 @@ mod wasm_tests {
     // 追加テスト: ボディ処理
     // ====================
 
-    #[test]
-    fn test_wasm_on_request_body() {
+    #[tokio::test]
+    async fn test_wasm_on_request_body() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
             return;
@@ -12242,7 +12242,7 @@ mod wasm_tests {
         // on_request_bodyコールバックの動作を確認
         // 注意: header_filter.wasmはボディ処理を行わないため、基本的な動作確認のみ
         let body = b"test request body";
-        let response = send_post_request(PROXY_PORT, "/wasm/", &[], body);
+        let response = send_post_request(PROXY_PORT, "/wasm/", &[], body).await;
         assert!(response.is_some(), "Should receive response");
         
         let response = response.unwrap();
@@ -12255,8 +12255,8 @@ mod wasm_tests {
                    "Should have X-Veil-Processed header indicating WASM module executed");
     }
 
-    #[test]
-    fn test_wasm_on_response_body() {
+    #[tokio::test]
+    async fn test_wasm_on_response_body() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
             return;
@@ -12264,7 +12264,7 @@ mod wasm_tests {
         
         // on_response_bodyコールバックの動作を確認
         // 注意: header_filter.wasmはボディ処理を行わないため、基本的な動作確認のみ
-        let response = send_request(PROXY_PORT, "/wasm/", &[]);
+        let response = send_request(PROXY_PORT, "/wasm/", &[]).await;
         assert!(response.is_some(), "Should receive response");
         
         let response = response.unwrap();
@@ -12289,8 +12289,8 @@ mod wasm_tests {
     // 追加テスト: ケーパビリティ制御
     // ====================
 
-    #[test]
-    fn test_wasm_capability_logging() {
+    #[tokio::test]
+    async fn test_wasm_capability_logging() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
             return;
@@ -12298,7 +12298,7 @@ mod wasm_tests {
         
         // ログ権限のテスト
         // header_filter.wasmはログ権限が有効になっているため、正常に動作することを確認
-        let response = send_request(PROXY_PORT, "/wasm/", &[]);
+        let response = send_request(PROXY_PORT, "/wasm/", &[]).await;
         assert!(response.is_some(), "Should receive response");
         
         let response = response.unwrap();
@@ -12312,8 +12312,8 @@ mod wasm_tests {
                    "Should have X-Veil-Processed header when logging capability is enabled");
     }
 
-    #[test]
-    fn test_wasm_capability_http_calls() {
+    #[tokio::test]
+    async fn test_wasm_capability_http_calls() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
             return;
@@ -12322,7 +12322,7 @@ mod wasm_tests {
         // HTTP呼び出し権限のテスト
         // 注意: header_filter.wasmはHTTP呼び出しを行わないため、基本的な動作確認のみ
         // 実際のHTTP呼び出しテストには、HTTP呼び出しを行うWASMモジュールが必要
-        let response = send_request(PROXY_PORT, "/wasm/", &[]);
+        let response = send_request(PROXY_PORT, "/wasm/", &[]).await;
         assert!(response.is_some(), "Should receive response");
         
         let response = response.unwrap();
@@ -12339,8 +12339,8 @@ mod wasm_tests {
     // 追加テスト: タイムアウト・エラーハンドリング
     // ====================
 
-    #[test]
-    fn test_wasm_timeout() {
+    #[tokio::test]
+    async fn test_wasm_timeout() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
             return;
@@ -12349,7 +12349,7 @@ mod wasm_tests {
         // タイムアウト処理のテスト
         // 注意: 実際のタイムアウトテストには、長時間実行するWASMモジュールが必要
         // 現在は基本的な動作確認のみ
-        let response = send_request(PROXY_PORT, "/wasm/", &[]);
+        let response = send_request(PROXY_PORT, "/wasm/", &[]).await;
         assert!(response.is_some(), "Should receive response");
         
         let response = response.unwrap();
@@ -12362,8 +12362,8 @@ mod wasm_tests {
                    "Should have X-Veil-Processed header indicating WASM module executed without timeout");
     }
 
-    #[test]
-    fn test_wasm_error_handling() {
+    #[tokio::test]
+    async fn test_wasm_error_handling() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
             return;
@@ -12371,7 +12371,7 @@ mod wasm_tests {
         
         // エラーハンドリングのテスト
         // 正常なリクエストがエラーなく処理されることを確認
-        let response = send_request(PROXY_PORT, "/wasm/", &[]);
+        let response = send_request(PROXY_PORT, "/wasm/", &[]).await;
         assert!(response.is_some(), "Should receive response");
         
         let response = response.unwrap();
@@ -12388,8 +12388,8 @@ mod wasm_tests {
     // 追加テスト: 複数モジュール・同時実行
     // ====================
 
-    #[test]
-    fn test_wasm_multiple_modules() {
+    #[tokio::test]
+    async fn test_wasm_multiple_modules() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
             return;
@@ -12398,7 +12398,7 @@ mod wasm_tests {
         // 複数モジュールの適用を確認
         // 注意: 現在はheader_filter.wasmのみなので、同じモジュールが複数回適用されることを確認
         // 実際の複数モジュールテストには、異なるWASMモジュールが必要
-        let response = send_request(PROXY_PORT, "/wasm/", &[]);
+        let response = send_request(PROXY_PORT, "/wasm/", &[]).await;
         assert!(response.is_some(), "Should receive response");
         
         let response = response.unwrap();
@@ -12416,8 +12416,8 @@ mod wasm_tests {
                    "Should have X-Veil-Filter-Version header");
     }
 
-    #[test]
-    fn test_wasm_concurrent_execution() {
+    #[tokio::test]
+    async fn test_wasm_concurrent_execution() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
             return;
@@ -12431,8 +12431,8 @@ mod wasm_tests {
         let num_requests = 10;
         
         for i in 0..num_requests {
-            let handle = thread::spawn(move || {
-                let response = send_request(PROXY_PORT, "/wasm/", &[]);
+            let handle = tokio::spawn(async move {
+                let response = send_request(PROXY_PORT, "/wasm/", &[]).await;
                 (i, response)
             });
             handles.push(handle);
@@ -12440,7 +12440,7 @@ mod wasm_tests {
         
         let mut success_count = 0;
         for handle in handles {
-            match handle.join() {
+            match handle.await {
                 Ok((_i, Some(response))) => {
                     let status = get_status_code(&response);
                     if status == Some(200) {
@@ -12464,8 +12464,8 @@ mod wasm_tests {
         eprintln!("Concurrent execution test: {}/{} requests succeeded", success_count, num_requests);
     }
 
-    #[test]
-    fn test_wasm_invalid_module() {
+    #[tokio::test]
+    async fn test_wasm_invalid_module() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
             return;
@@ -12477,7 +12477,7 @@ mod wasm_tests {
         // 無効なモジュールのテストは、設定ファイルの変更が必要なため、基本的な動作確認のみ
         
         // 有効なWASMモジュールが正常に動作することを確認（無効なモジュールがないことを前提）
-        let response = send_request(PROXY_PORT, "/wasm/", &[]);
+        let response = send_request(PROXY_PORT, "/wasm/", &[]).await;
         assert!(response.is_some(), "Should receive response");
         
         let response = response.unwrap();
@@ -12496,8 +12496,8 @@ mod wasm_tests {
     // 追加テスト: より詳細な検証
     // ====================
 
-    #[test]
-    fn test_wasm_request_header_read() {
+    #[tokio::test]
+    async fn test_wasm_request_header_read() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
             return;
@@ -12508,7 +12508,7 @@ mod wasm_tests {
         let response = send_request(PROXY_PORT, "/wasm/", &[
             ("X-Custom-Header", "test-value"),
             ("User-Agent", "wasm-test-client"),
-        ]);
+        ]).await;
         assert!(response.is_some(), "Should receive response");
         
         let response = response.unwrap();
@@ -12521,15 +12521,15 @@ mod wasm_tests {
                    "Should have X-Veil-Processed header indicating WASM module executed");
     }
 
-    #[test]
-    fn test_wasm_response_header_modification() {
+    #[tokio::test]
+    async fn test_wasm_response_header_modification() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
             return;
         }
         
         // レスポンスヘッダーの変更を確認
-        let response = send_request(PROXY_PORT, "/wasm/", &[]);
+        let response = send_request(PROXY_PORT, "/wasm/", &[]).await;
         assert!(response.is_some(), "Should receive response");
         
         let response = response.unwrap();
@@ -12558,8 +12558,8 @@ mod wasm_tests {
     // 追加テスト: ケーパビリティ制御（ローカルレスポンス）
     // ====================
 
-    #[test]
-    fn test_wasm_capability_local_response() {
+    #[tokio::test]
+    async fn test_wasm_capability_local_response() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
             return;
@@ -12568,7 +12568,7 @@ mod wasm_tests {
         // ローカルレスポンス送信権限のテスト
         // 注意: header_filter.wasmはローカルレスポンスを送信しないため、基本的な動作確認のみ
         // 実際のローカルレスポンステストには、ローカルレスポンスを送信するWASMモジュールが必要
-        let response = send_request(PROXY_PORT, "/wasm/", &[]);
+        let response = send_request(PROXY_PORT, "/wasm/", &[]).await;
         assert!(response.is_some(), "Should receive response");
         
         let response = response.unwrap();
@@ -12586,8 +12586,8 @@ mod wasm_tests {
     // 追加テスト: パフォーマンス
     // ====================
 
-    #[test]
-    fn test_wasm_performance() {
+    #[tokio::test]
+    async fn test_wasm_performance() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
             return;
@@ -12603,7 +12603,7 @@ mod wasm_tests {
         
         for _ in 0..num_requests {
             let start = Instant::now();
-            let response = send_request(PROXY_PORT, "/wasm/", &[]);
+            let response = send_request(PROXY_PORT, "/wasm/", &[]).await;
             let elapsed = start.elapsed();
             total_time += elapsed;
             
@@ -12656,7 +12656,7 @@ async fn test_routing_combined_conditions() {
             ("X-API-Key", "secret"),
         ],
         None
-    );
+    ).await;
     
     assert!(response.is_some(), "Should receive response");
     let response = response.unwrap();
@@ -12680,12 +12680,12 @@ async fn test_routing_condition_priority() {
     // より具体的なルート（先に定義）が優先されることを確認
     
     // より具体的なパスにリクエストを送信
-    let response1 = send_request(PROXY_PORT, "/api/v2/test", &[]);
+    let response1 = send_request(PROXY_PORT, "/api/v2/test", &[]).await;
     assert!(response1.is_some(), "Should receive response");
     let status1 = get_status_code(&response1.unwrap());
     
     // より一般的なパスにリクエストを送信
-    let response2 = send_request(PROXY_PORT, "/api/v1/test", &[]);
+    let response2 = send_request(PROXY_PORT, "/api/v1/test", &[]).await;
     assert!(response2.is_some(), "Should receive response");
     let status2 = get_status_code(&response2.unwrap());
     
@@ -12711,11 +12711,11 @@ async fn test_routing_wildcard_host() {
     // 例: host = "*.example.com"
     
     // ワイルドカードパターンにマッチするホストでリクエストを送信
-    let response1 = send_request(PROXY_PORT, "/", &[("Host", "api.example.com")]);
+    let response1 = send_request(PROXY_PORT, "/", &[("Host", "api.example.com")]).await;
     assert!(response1.is_some(), "Should receive response");
     let status1 = get_status_code(&response1.unwrap());
     
-    let response2 = send_request(PROXY_PORT, "/", &[("Host", "www.example.com")]);
+    let response2 = send_request(PROXY_PORT, "/", &[("Host", "www.example.com")]).await;
     assert!(response2.is_some(), "Should receive response");
     let status2 = get_status_code(&response2.unwrap());
     
@@ -12741,11 +12741,11 @@ async fn test_routing_wildcard_path() {
     // 例: path = "/api/*"
     
     // ワイルドカードパスにマッチするリクエストを送信
-    let response1 = send_request(PROXY_PORT, "/api/v1/test", &[]);
+    let response1 = send_request(PROXY_PORT, "/api/v1/test", &[]).await;
     assert!(response1.is_some(), "Should receive response");
     let status1 = get_status_code(&response1.unwrap());
     
-    let response2 = send_request(PROXY_PORT, "/api/v2/test", &[]);
+    let response2 = send_request(PROXY_PORT, "/api/v2/test", &[]).await;
     assert!(response2.is_some(), "Should receive response");
     let status2 = get_status_code(&response2.unwrap());
     
@@ -12774,7 +12774,7 @@ async fn test_routing_header_multiple() {
     let response1 = send_request(PROXY_PORT, "/", &[
         ("X-Version", "v2"),
         ("X-API-Key", "secret"),
-    ]);
+    ]).await;
     assert!(response1.is_some(), "Should receive response");
     let status1 = get_status_code(&response1.unwrap());
     
@@ -12782,7 +12782,7 @@ async fn test_routing_header_multiple() {
     let response2 = send_request(PROXY_PORT, "/", &[
         ("X-Version", "v1"),  // 条件を満たさない
         ("X-API-Key", "secret"),
-    ]);
+    ]).await;
     assert!(response2.is_some(), "Should receive response");
     let status2 = get_status_code(&response2.unwrap());
     
@@ -12809,12 +12809,12 @@ async fn test_routing_query_multiple() {
     // 例: query = { "format" = "json", "version" = "1" }
     
     // すべてのクエリパラメータ条件を満たすリクエストを送信
-    let response1 = send_request(PROXY_PORT, "/?format=json&version=1", &[]);
+    let response1 = send_request(PROXY_PORT, "/?format=json&version=1", &[]).await;
     assert!(response1.is_some(), "Should receive response");
     let status1 = get_status_code(&response1.unwrap());
     
     // 1つ以上のクエリパラメータ条件を満たさないリクエストを送信
-    let response2 = send_request(PROXY_PORT, "/?format=xml&version=1", &[]);
+    let response2 = send_request(PROXY_PORT, "/?format=xml&version=1", &[]).await;
     assert!(response2.is_some(), "Should receive response");
     let status2 = get_status_code(&response2.unwrap());
     
@@ -12841,7 +12841,7 @@ async fn test_routing_source_ip_cidr() {
     // 例: source_ip = ["127.0.0.0/8", "192.168.0.0/16"]
     
     // 127.0.0.1からのリクエスト（127.0.0.0/8に含まれる）
-    let response1 = send_request(PROXY_PORT, "/", &[]);
+    let response1 = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response1.is_some(), "Should receive response");
     let status1 = get_status_code(&response1.unwrap());
     
@@ -12872,7 +12872,7 @@ async fn test_routing_condition_and_logic() {
             ("X-Version", "v2"),
         ],
         None
-    );
+    ).await;
     assert!(response1.is_some(), "Should receive response");
     let status1 = get_status_code(&response1.unwrap());
     
@@ -12885,7 +12885,7 @@ async fn test_routing_condition_and_logic() {
             ("X-Version", "v2"),
         ],
         None
-    );
+    ).await;
     assert!(response2.is_some(), "Should receive response");
     let status2 = get_status_code(&response2.unwrap());
     
@@ -12909,11 +12909,11 @@ async fn test_routing_case_insensitive_host() {
     }
     
     // ホスト名の大文字小文字が正しく処理されることを確認
-    let response1 = send_request(PROXY_PORT, "/", &[("Host", "localhost")]);
+    let response1 = send_request(PROXY_PORT, "/", &[("Host", "localhost")]).await;
     assert!(response1.is_some(), "Should receive response");
     let status1 = get_status_code(&response1.unwrap());
     
-    let response2 = send_request(PROXY_PORT, "/", &[("Host", "LOCALHOST")]);
+    let response2 = send_request(PROXY_PORT, "/", &[("Host", "LOCALHOST")]).await;
     assert!(response2.is_some(), "Should receive response");
     let status2 = get_status_code(&response2.unwrap());
     
@@ -12936,11 +12936,11 @@ async fn test_routing_case_insensitive_header() {
     }
     
     // ヘッダー名の大文字小文字が正しく処理されることを確認
-    let response1 = send_request(PROXY_PORT, "/", &[("X-Version", "v2")]);
+    let response1 = send_request(PROXY_PORT, "/", &[("X-Version", "v2")]).await;
     assert!(response1.is_some(), "Should receive response");
     let status1 = get_status_code(&response1.unwrap());
     
-    let response2 = send_request(PROXY_PORT, "/", &[("x-version", "v2")]);
+    let response2 = send_request(PROXY_PORT, "/", &[("x-version", "v2")]).await;
     assert!(response2.is_some(), "Should receive response");
     let status2 = get_status_code(&response2.unwrap());
     
@@ -12963,7 +12963,7 @@ async fn test_routing_empty_path() {
     }
     
     // 空パス（/）のルーティングが正しく動作することを確認
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     let status = get_status_code(&response.unwrap());
     
@@ -12982,11 +12982,11 @@ async fn test_routing_trailing_slash() {
     }
     
     // 末尾スラッシュの有無が正しく処理されることを確認
-    let response1 = send_request(PROXY_PORT, "/api", &[]);
+    let response1 = send_request(PROXY_PORT, "/api", &[]).await;
     assert!(response1.is_some(), "Should receive response");
     let status1 = get_status_code(&response1.unwrap());
     
-    let response2 = send_request(PROXY_PORT, "/api/", &[]);
+    let response2 = send_request(PROXY_PORT, "/api/", &[]).await;
     assert!(response2.is_some(), "Should receive response");
     let status2 = get_status_code(&response2.unwrap());
     
@@ -13011,7 +13011,7 @@ async fn test_routing_query_parameter_encoding() {
     
     // URLエンコードされたクエリパラメータが正しく処理されることを確認
     let encoded_path = "/?token=secret%20value&format=json";
-    let response = send_request(PROXY_PORT, encoded_path, &[]);
+    let response = send_request(PROXY_PORT, encoded_path, &[]).await;
     assert!(response.is_some(), "Should receive response");
     let status = get_status_code(&response.unwrap());
     
@@ -13034,7 +13034,7 @@ async fn test_routing_source_ip_ipv6() {
     
     // IPv6アドレスからのリクエスト（実際にはIPv4で接続するため、テストは制限的）
     // ここでは、基本的な動作確認のみ
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     let status = get_status_code(&response.unwrap());
     
@@ -13064,7 +13064,7 @@ async fn test_h2c_server_prior_knowledge() {
     // H2Cバックエンドに直接接続（HTTP/2 Prior Knowledge）
     // 実際の実装にはHTTP/2クライアントライブラリが必要
     // ここでは、プロキシ経由でH2C接続を確認
-    let response = send_request(PROXY_PORT, "/h2c/", &[]);
+    let response = send_request(PROXY_PORT, "/h2c/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     let status = get_status_code(&response.unwrap());
     
@@ -13088,7 +13088,7 @@ async fn test_h2c_server_multiple_connections() {
     let num_connections = 5;
     
     for _ in 0..num_connections {
-        let response = send_request(PROXY_PORT, "/h2c/", &[]);
+        let response = send_request(PROXY_PORT, "/h2c/", &[]).await;
         if let Some(resp) = response {
             let status = get_status_code(&resp);
             if status == Some(200) {
@@ -13114,7 +13114,7 @@ async fn test_h2c_server_connection_close() {
     }
     
     // H2Cサーバーの接続終了を確認
-    let response = send_request(PROXY_PORT, "/h2c/", &[]);
+    let response = send_request(PROXY_PORT, "/h2c/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     let status = get_status_code(&response.unwrap());
     
@@ -13143,7 +13143,7 @@ async fn test_h2c_large_header_block() {
         headers.push(("X-Custom-Header", value.as_str()));
     }
     
-    let response = send_request(PROXY_PORT, "/h2c/", &headers);
+    let response = send_request(PROXY_PORT, "/h2c/", &headers).await;
     assert!(response.is_some(), "Should receive response");
     let status = get_status_code(&response.unwrap());
     
@@ -13172,7 +13172,7 @@ async fn test_h2c_flow_control() {
         "POST",
         &[("Content-Type", "application/octet-stream")],
         Some(&large_body)
-    );
+    ).await;
     
     assert!(response.is_some(), "Should receive response");
     let status = get_status_code(&response.unwrap());
@@ -13199,7 +13199,7 @@ async fn test_graceful_reload_complete() {
     // プロセスIDの取得とシグナル送信が必要
     
     // 既存の接続を確立
-    let response1 = send_request(PROXY_PORT, "/", &[]);
+    let response1 = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response1.is_some(), "Should receive response before reload");
     let status1 = get_status_code(&response1.unwrap());
     assert_eq!(status1, Some(200), "Should return 200 OK before reload");
@@ -13227,7 +13227,7 @@ async fn test_graceful_reload_invalid_config() {
     // 実際の実装には、設定ファイルの変更とSIGHUP送信が必要
     
     // 基本的な動作確認
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     let status = get_status_code(&response.unwrap());
     assert_eq!(status, Some(200), "Should return 200 OK");
@@ -13251,7 +13251,7 @@ async fn test_graceful_reload_route_changes() {
     // 実際の実装には、設定ファイルの変更とSIGHUP送信が必要
     
     // 基本的な動作確認
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     let status = get_status_code(&response.unwrap());
     assert_eq!(status, Some(200), "Should return 200 OK");
@@ -13275,7 +13275,7 @@ async fn test_graceful_reload_upstream_changes() {
     // 実際の実装には、設定ファイルの変更とSIGHUP送信が必要
     
     // 基本的な動作確認
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     let status = get_status_code(&response.unwrap());
     assert_eq!(status, Some(200), "Should return 200 OK");
@@ -13299,7 +13299,7 @@ async fn test_graceful_shutdown() {
     // プロセスIDの取得とシグナル送信が必要
     
     // 基本的な動作確認
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     let status = get_status_code(&response.unwrap());
     assert_eq!(status, Some(200), "Should return 200 OK");
@@ -13325,7 +13325,7 @@ async fn test_config_validation_complete() {
     // 実際の実装には、別プロセスでの起動試行が必要
     
     // 基本的な動作確認（有効な設定ファイル）
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     let status = get_status_code(&response.unwrap());
     assert_eq!(status, Some(200), "Should return 200 OK");
@@ -13350,7 +13350,7 @@ async fn test_log_level_trace() {
     // 実際の実装には、ログファイルの読み取りと解析が必要
     
     // 基本的な動作確認
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     let status = get_status_code(&response.unwrap());
     assert_eq!(status, Some(200), "Should return 200 OK");
@@ -13372,7 +13372,7 @@ async fn test_log_level_debug() {
     }
     
     // 注意: このテストはログファイルを確認する必要がある
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     let status = get_status_code(&response.unwrap());
     assert_eq!(status, Some(200), "Should return 200 OK");
@@ -13388,7 +13388,7 @@ async fn test_log_level_info() {
     }
     
     // 注意: このテストはログファイルを確認する必要がある
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     let status = get_status_code(&response.unwrap());
     assert_eq!(status, Some(200), "Should return 200 OK");
@@ -13404,7 +13404,7 @@ async fn test_log_level_warn() {
     }
     
     // 注意: このテストはログファイルを確認する必要がある
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     let status = get_status_code(&response.unwrap());
     assert_eq!(status, Some(200), "Should return 200 OK");
@@ -13421,7 +13421,7 @@ async fn test_log_level_error() {
     
     // 注意: このテストはログファイルを確認する必要がある
     // エラーを発生させるリクエストを送信
-    let response = send_request(PROXY_PORT, "/nonexistent", &[]);
+    let response = send_request(PROXY_PORT, "/nonexistent", &[]).await;
     assert!(response.is_some(), "Should receive response");
     let status = get_status_code(&response.unwrap());
     assert_eq!(
@@ -13440,7 +13440,7 @@ async fn test_log_format_text() {
     }
     
     // 注意: このテストはログファイルを確認する必要がある
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     let status = get_status_code(&response.unwrap());
     assert_eq!(status, Some(200), "Should return 200 OK");
@@ -13456,7 +13456,7 @@ async fn test_log_format_json() {
     }
     
     // 注意: このテストはログファイルを確認する必要がある
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     let status = get_status_code(&response.unwrap());
     assert_eq!(status, Some(200), "Should return 200 OK");
@@ -13475,7 +13475,7 @@ async fn test_log_rotation() {
     // 実際の実装には、大量のログを生成してローテーションをトリガーする必要がある
     
     // 基本的な動作確認
-    let response = send_request(PROXY_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     let status = get_status_code(&response.unwrap());
     assert_eq!(status, Some(200), "Should return 200 OK");
@@ -13494,7 +13494,7 @@ async fn test_zero_downtime_reload() {
     // リロード中もリクエストが正常に処理されることを確認
     
     // リロード前のリクエスト
-    let response1 = send_request(PROXY_PORT, "/", &[]);
+    let response1 = send_request(PROXY_PORT, "/", &[]).await;
     assert!(response1.is_some(), "Should receive response before reload");
     let status1 = get_status_code(&response1.unwrap());
     assert_eq!(status1, Some(200), "Should return 200 OK before reload");
@@ -13522,7 +13522,7 @@ async fn test_backend_rolling_update() {
     let mut success_count = 0;
     for i in 0..10 {
         // 各リクエストにリトライロジックを適用
-        let response = send_request_with_retry(PROXY_PORT, "/", &[], 3);
+        let response = send_request_with_retry(PROXY_PORT, "/", &[], 3).await;
         if let Some(resp) = response {
             let status = get_status_code(&resp);
             if status == Some(200) {
@@ -13558,7 +13558,7 @@ async fn test_health_check_gradual_degradation() {
     // 複数のリクエストを送信
     let mut success_count = 0;
     for _ in 0..10 {
-        let response = send_request(PROXY_PORT, "/", &[]);
+        let response = send_request(PROXY_PORT, "/", &[]).await;
         if let Some(resp) = response {
             let status = get_status_code(&resp);
             if status == Some(200) {
@@ -13589,12 +13589,12 @@ async fn test_metrics_aggregation() {
     
     // 複数のリクエストを送信
     for _ in 0..5 {
-        let _ = send_request(PROXY_PORT, "/", &[]);
+        let _ = send_request(PROXY_PORT, "/", &[]).await;
         std::thread::sleep(Duration::from_millis(50));
     }
     
     // メトリクスエンドポイントからメトリクスを取得
-    let response = send_request(PROXY_PORT, "/__metrics", &[]);
+    let response = send_request(PROXY_PORT, "/__metrics", &[]).await;
     assert!(response.is_some(), "Should receive metrics response");
     
     let response = response.unwrap();
