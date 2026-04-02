@@ -1617,7 +1617,7 @@ async fn test_http3_multiple_streams() {
                 responses += 1;
             }
             Err(e) => {
-                eprintln!("Failed to send/receive request {}: {}", i, e);
+                panic!("Failed to send/receive request {}: {}", i, e);
             }
         }
     }
@@ -1850,7 +1850,7 @@ async fn test_http3_bidirectional_streams() {
                 );
             }
             Err(e) => {
-                eprintln!("Failed to send/receive HTTP/3 request {}: {}", i, e);
+                panic!("Failed to send/receive HTTP/3 request {}: {}", i, e);
             }
         }
     }
@@ -2299,7 +2299,7 @@ async fn test_http3_throughput() {
                 }
             }
             Err(e) => {
-                eprintln!("Failed to send/receive HTTP/3 request {}: {}", i, e);
+                panic!("Failed to send/receive HTTP/3 request {}: {}", i, e);
             }
         }
     }
@@ -2355,7 +2355,7 @@ async fn test_http3_latency() {
                 }
             }
             Err(e) => {
-                eprintln!("Failed to send/receive HTTP/3 request {}: {}", i, e);
+                panic!("Failed to send/receive HTTP/3 request {}: {}", i, e);
             }
         }
     }
@@ -2609,7 +2609,7 @@ async fn test_http3_qpack_compression() {
                 eprintln!("Request {} completed with status: {}", i, status);
             }
             Err(e) => {
-                eprintln!("Failed to send/receive HTTP/3 request {}: {}", i, e);
+                panic!("Failed to send/receive HTTP/3 request {}: {}", i, e);
             }
         }
     }
