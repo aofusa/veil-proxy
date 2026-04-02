@@ -19,13 +19,56 @@ pub struct GrpcTestClientV2 {
     channel: Channel,
 }
 
-#[cfg(feature = "grpc")]
-use super::grpc_client::GrpcFrame;
-#[cfg(not(feature = "grpc"))]
-// grpc featureがない場合のフォールバック
 pub struct GrpcFrame {
-    compressed: bool,
-    data: Vec<u8>,
+    pub compressed: bool,
+    pub data: Vec<u8>,
+}
+
+#[allow(dead_code)]
+impl GrpcFrame {
+    /// 新しいgRPCフレームを作成
+    pub fn new(data: Vec<u8>) -> Self {
+        Self {
+            compressed: false,
+            data,
+        }
+    }
+    
+    /// gRPCフレームをエンコード
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(5 + self.data.len());
+        // 1 byte: flags (compressed bit)
+        buf.push(if self.compressed { 1 } else { 0 });
+        // 4 bytes: length (big-endian)
+        buf.extend_from_slice(&(self.data.len() as u32).to_be_bytes());
+        // N bytes: message
+        buf.extend_from_slice(&self.data);
+        buf
+    }
+    
+    /// gRPCフレームをデコード
+    pub fn decode(data: &[u8]) -> Result<(Self, usize), Box<dyn std::error::Error>> {
+        if data.len() < 5 {
+            return Err("Insufficient data for gRPC frame header".into());
+        }
+        
+        let compressed = (data[0] & 1) != 0;
+        let length = u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
+        
+        if data.len() < 5 + length {
+            return Err(format!("Insufficient data: need {} bytes, have {}", 5 + length, data.len()).into());
+        }
+        
+        let message = data[5..5 + length].to_vec();
+        
+        Ok((
+            Self {
+                compressed,
+                data: message,
+            },
+            5 + length,
+        ))
+    }
 }
 
 #[allow(dead_code)]
