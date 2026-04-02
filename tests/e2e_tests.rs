@@ -391,9 +391,8 @@ async fn test_http3_basic_connection_async() {
             eprintln!("HTTP/3 (h3-quinn) connection established successfully");
         }
         Err(e) => {
-            eprintln!("HTTP/3 handshake failed for {}: {} (HTTP/3 may not be enabled)", server_addr, e);
+            panic!("HTTP/3 handshake failed for {}: {} (HTTP/3 may not be enabled)", server_addr, e);
             // HTTP/3が有効化されていない場合はテストをスキップ
-            return;
         }
     }
 }
@@ -420,16 +419,14 @@ async fn test_http3_get_request_async() {
                     eprintln!("HTTP/3 GET response: {} bytes", body.len());
                 }
                 Err(e) => {
-                    eprintln!("HTTP/3 GET request failed: {} (HTTP/3 may not be enabled)", e);
+                    panic!("HTTP/3 GET request failed: {} (HTTP/3 may not be enabled)", e);
                     // HTTP/3が有効化されていない場合はテストをスキップ
-                    return;
                 }
             }
         }
         Err(e) => {
-            eprintln!("HTTP/3 connection failed for {}: {} (HTTP/3 may not be enabled)", server_addr, e);
+            panic!("HTTP/3 connection failed for {}: {} (HTTP/3 may not be enabled)", server_addr, e);
             // HTTP/3が有効化されていない場合はテストをスキップ
-            return;
         }
     }
 }
@@ -449,18 +446,9 @@ async fn test_grpc_connection_async() {
     }
     
     // gRPCクライアントの作成を試行（TLS接続）
-    match GrpcTestClientV2::new("127.0.0.1", PROXY_PORT).await {
-        Ok(_client) => {
-            eprintln!("gRPC (tonic) connection created successfully");
-            // 注意: 実際のgRPC呼び出しにはProtobufサービス定義が必要
-            // ここでは接続確立のみを確認
-        }
-        Err(e) => {
-            // 接続エラーは想定内（gRPCバックエンドが設定されていない場合など）
-            eprintln!("gRPC connection failed: {} (this may be expected if gRPC backend is not configured)", e);
-            // テストをスキップではなく、接続試行自体は成功とみなす
-        }
-    }
+    let _client = GrpcTestClientV2::new("127.0.0.1", PROXY_PORT).await
+        .expect("gRPC (tonic) TLS connection should succeed");
+    eprintln!("gRPC (tonic) connection created successfully");
 }
 
 /// gRPCプレーンテキスト（h2c）接続テスト（非同期版）
@@ -472,15 +460,9 @@ async fn test_grpc_h2c_connection_async() {
     }
     
     // H2Cポートへの接続を試行
-    match GrpcTestClientV2::new_plaintext("127.0.0.1", PROXY_H2C_PORT).await {
-        Ok(_client) => {
-            eprintln!("gRPC (tonic h2c) connection created successfully on port {}", PROXY_H2C_PORT);
-        }
-        Err(e) => {
-            // H2Cポートが開いていない場合は想定内
-            eprintln!("gRPC h2c connection failed: {} (H2C port {} may not be configured)", e, PROXY_H2C_PORT);
-        }
-    }
+    let _client = GrpcTestClientV2::new_plaintext("127.0.0.1", PROXY_H2C_PORT).await
+        .unwrap_or_else(|e| panic!("gRPC h2c connection to port {} should succeed: {}", PROXY_H2C_PORT, e));
+    eprintln!("gRPC (tonic h2c) connection created successfully on port {}", PROXY_H2C_PORT);
 }
 
 // ====================
@@ -673,13 +655,11 @@ async fn test_compression_gzip() {
     // 前提条件: /large.txt が存在することを確認
     let prereq = send_request(PROXY_PORT, "/large.txt", &[]);
     if prereq.is_none() {
-        eprintln!("Prerequisite check failed: no response");
-        return;
+        panic!("Prerequisite check failed: no response from /large.txt");
     }
     let prereq_status = get_status_code(&prereq.as_ref().unwrap());
     if prereq_status != Some(200) {
-        eprintln!("Prerequisite failed: /large.txt not found (status: {:?}), skipping test", prereq_status);
-        return;
+        panic!("Prerequisite failed: /large.txt not found (status: {:?})", prereq_status);
     }
     
     // Gzip圧縮をリクエスト
@@ -1113,6 +1093,7 @@ async fn test_active_connections_metric() {
 }
 
 #[tokio::test]
+#[ignore = "Health check is not configured in default E2E setup. Enable with 'healthcheck' config type."]
 async fn test_upstream_health_metric() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -1125,16 +1106,7 @@ async fn test_upstream_health_metric() {
     
     let response = response.unwrap();
     
-    // HTTP_UPSTREAM_HEALTHメトリクスが含まれるか確認
-    // 注意: ヘルスチェックが設定されている場合のみ値が存在する
-    // テスト環境ではヘルスチェックが設定されていない可能性があるため、メトリクスが存在しない場合はスキップ
-    if !response.contains("http_upstream_health") && !response.contains("veil_proxy_http_upstream_health") {
-        // ヘルスチェックが設定されていない場合は、メトリクスが存在しないことを確認
-        // これは正常な動作なので、テストをスキップ
-        eprintln!("Skipping: Health check not configured, upstream health metric not available");
-        return;
-    }
-    
+    // HTTP_UPSTREAM_HEALTHメトリクスが含まれることを確認
     assert!(
         response.contains("http_upstream_health") || response.contains("veil_proxy_http_upstream_health"),
         "Should contain upstream health metric"
@@ -1212,18 +1184,7 @@ async fn test_backend_connection_failure() {
     let response = response.unwrap();
     let status = get_status_code(&response);
     // 静的ファイルルーティングでは存在しないファイル → 404
-    // プロキシエラーの場合 → 502
-    match status {
-        Some(404) => {
-            eprintln!("Backend returned 404 for nonexistent path - expected behavior");
-        }
-        Some(502) => {
-            eprintln!("Backend connection failure resulted in 502 - this indicates backend issue");
-        }
-        _ => {
-            panic!("Unexpected status for nonexistent path: {:?}. Expected 404 or 502", status);
-        }
-    }
+    assert_eq!(status, Some(404), "Nonexistent path should return 404, got: {:?}", status);
 }
 
 
@@ -1233,15 +1194,15 @@ async fn test_backend_connection_failure() {
 
 #[tokio::test]
 #[cfg(feature = "http2")]
+#[ignore = "WebSocket route (/ws) is not configured in E2E setup. Enable when WebSocket routing is added to e2e_setup.sh."]
 async fn test_websocket_basic_connection() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
         return;
     }
     
-    // WebSocket接続を試みる（実際のWebSocket実装は複雑なため、ここでは基本的なテストのみ）
-    // 注意: 実際のWebSocketテストには専用のクライアントライブラリが必要
-    // ここでは、WebSocketアップグレードリクエストを送信し、レスポンスを確認
+    // WebSocket接続を試みる
+    // 注意: このテストはWebSocketルートが設定されている場合にのみ有効
     
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
     stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -1256,23 +1217,10 @@ async fn test_websocket_basic_connection() {
     let response = String::from_utf8_lossy(&response);
     
     let status = get_status_code(&response);
-    // WebSocketエンドポイント/wsが設定されていない場合は404
-    // 設定されている場合は101 Switching Protocols
-    match status {
-        Some(101) => {
-            eprintln!("WebSocket upgrade successful: 101 Switching Protocols");
-            // 追加機能：Upgradeヘッダーの確認
-            assert!(response.contains("Upgrade:") || response.contains("upgrade:"),
-                "101 response should contain Upgrade header");
-        }
-        Some(404) => {
-            eprintln!("WebSocket endpoint /ws not configured (404) - this is expected if no WebSocket route is defined");
-        }
-        _ => {
-            // 502および他のステータスは予期しない
-            panic!("Unexpected status for WebSocket request: {:?}. Expected 101 (if configured) or 404 (if not configured)", status);
-        }
-    }
+    // WebSocketルートが正しく設定されている場合は 101 Switching Protocols を期待
+    assert_eq!(status, Some(101), "WebSocket upgrade should return 101 Switching Protocols, got: {:?}", status);
+    assert!(response.contains("Upgrade:") || response.contains("upgrade:"),
+        "101 response should contain Upgrade header");
 }
 
 // ====================
@@ -1304,8 +1252,7 @@ async fn test_http2_stream_multiplexing() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(e) => {
-                eprintln!("TLS handshake error: {:?}", e);
-                return;
+                panic!("TLS handshake error: {:?}", e);
             }
         }
     }
@@ -1408,8 +1355,7 @@ async fn test_grpc_unary_call() {
     ) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Failed to send gRPC request to /grpc.test.v1.TestService/UnaryCall: {}", e);
-            return;
+            panic!("Failed to send gRPC request to /grpc.test.v1.TestService/UnaryCall: {}", e);
         }
     };
     
@@ -1437,6 +1383,7 @@ async fn test_grpc_basic_request() {
     }
     
     // gRPCリクエストを送信（Content-Type: application/grpc）
+    // E2E環境ではプロキシ経由でバックエンドに転送されるため、200を期待
     let response = send_request(
         PROXY_PORT,
         "/",
@@ -1446,28 +1393,9 @@ async fn test_grpc_basic_request() {
         ]
     );
     
-    // レスポンスを受信
-    match response {
-        Some(response) => {
-            let status = get_status_code(&response);
-            // gRPCエンドポイントが設定されていない場合は404、設定されている場合は200
-            match status {
-                Some(200) => {
-                    eprintln!("gRPC endpoint found and responding");
-                }
-                Some(404) => {
-                    eprintln!("gRPC endpoint not configured at / - this is expected for basic proxy setup");
-                }
-                _ => {
-                    // 502および他のステータスはバックエンドの問題
-                    panic!("Unexpected status for gRPC request: {:?}. Expected 200 (if configured) or 404 (if not configured)", status);
-                }
-            }
-        }
-        None => {
-            panic!("No response received for gRPC request");
-        }
-    }
+    let response = response.expect("Should receive response for gRPC request");
+    let status = get_status_code(&response);
+    assert_eq!(status, Some(200), "gRPC request should return 200 OK, got: {:?}", status);
 }
 
 // ====================
@@ -1502,8 +1430,7 @@ async fn test_http3_basic_connection() {
     let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to create HTTP/3 client for {}: {} (HTTP/3 may not be enabled)", server_addr, e);
-            return;
+            panic!("Failed to create HTTP/3 client for {}: {} (HTTP/3 may not be enabled)", server_addr, e);
         }
     };
     
@@ -1512,15 +1439,14 @@ async fn test_http3_basic_connection() {
     match send_http3_request(&mut send_request, "GET", "/health", &[], None).await {
         Ok((status, _body)) => {
             eprintln!("HTTP/3 connection established successfully, status: {}", status);
-            assert!(
-                status == 200 || status == 404 || status == 502,
-                "HTTP/3 connection to {} should allow sending requests, got status: {}", 
+            assert_eq!(
+                status, 200,
+                "HTTP/3 connection to {} should return 200 OK, got status: {}", 
                 server_addr, status
             );
         }
         Err(e) => {
-            eprintln!("HTTP/3 request failed for {}: {}", server_addr, e);
-            return;
+            panic!("HTTP/3 request failed for {}: {}", server_addr, e);
         }
     }
 }
@@ -1553,8 +1479,7 @@ async fn test_http3_get_request() {
     let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to create HTTP/3 client for {}: {} (HTTP/3 may not be enabled)", server_addr, e);
-            return;
+            panic!("Failed to create HTTP/3 client for {}: {} (HTTP/3 may not be enabled)", server_addr, e);
         }
     };
     
@@ -1574,8 +1499,7 @@ async fn test_http3_get_request() {
             );
         }
         Err(e) => {
-            eprintln!("Failed to send/receive HTTP/3 request to {}: {} (HTTP/3 may not be enabled)", server_addr, e);
-            return;
+            panic!("Failed to send/receive HTTP/3 request to {}: {} (HTTP/3 may not be enabled)", server_addr, e);
         }
     }
 }
@@ -1596,8 +1520,7 @@ async fn test_http3_post_request() {
     let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
-            return;
+            panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
         }
     };
     
@@ -1607,8 +1530,7 @@ async fn test_http3_post_request() {
     let prereq_status = match send_http3_request(&mut send_request, "GET", "/", &[], None).await {
         Ok((status, _)) => status,
         Err(e) => {
-            eprintln!("Failed to send prerequisite request: {}", e);
-            return;
+            panic!("Failed to send prerequisite request: {}", e);
         }
     };
     
@@ -1624,8 +1546,7 @@ async fn test_http3_post_request() {
             );
         }
         Err(e) => {
-            eprintln!("Failed to send/receive HTTP/3 POST request: {}", e);
-            return;
+            panic!("Failed to send/receive HTTP/3 POST request: {}", e);
         }
     }
 }
@@ -1671,8 +1592,7 @@ async fn test_http3_multiple_streams() {
     let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
-            return;
+            panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
         }
     };
     
@@ -1725,8 +1645,7 @@ async fn test_http3_proxy_forwarding() {
     let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
-            return;
+            panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
         }
     };
     
@@ -1736,8 +1655,7 @@ async fn test_http3_proxy_forwarding() {
     let prereq_status = match send_http3_request(&mut send_request, "GET", "/", &[], None).await {
         Ok((status, _)) => status,
         Err(e) => {
-            eprintln!("Failed to send prerequisite request: {}", e);
-            return;
+            panic!("Failed to send prerequisite request: {}", e);
         }
     };
     
@@ -1754,8 +1672,7 @@ async fn test_http3_proxy_forwarding() {
             assert!(!body.is_empty(), "Should receive response body for successful proxy forwarding");
         }
         Err(e) => {
-            eprintln!("Failed to send/receive HTTP/3 request: {}", e);
-            return;
+            panic!("Failed to send/receive HTTP/3 request: {}", e);
         }
     }
 }
@@ -1776,8 +1693,7 @@ async fn test_http3_proxy_compression() {
     let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
-            return;
+            panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
         }
     };
     
@@ -1799,8 +1715,7 @@ async fn test_http3_proxy_compression() {
             );
         }
         Err(e) => {
-            eprintln!("Failed to send/receive HTTP/3 request: {}", e);
-            return;
+            panic!("Failed to send/receive HTTP/3 request: {}", e);
         }
     }
 }
@@ -1843,8 +1758,7 @@ async fn test_http3_stream_priority() {
     let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
-            return;
+            panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
         }
     };
     
@@ -1860,8 +1774,7 @@ async fn test_http3_stream_priority() {
             );
         }
         Err(e) => {
-            eprintln!("Failed to send/receive HTTP/3 request: {}", e);
-            return;
+            panic!("Failed to send/receive HTTP/3 request: {}", e);
         }
     }
 }
@@ -1884,8 +1797,7 @@ async fn test_http3_stream_cancellation() {
     let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
-            return;
+            panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
         }
     };
     
@@ -1919,8 +1831,7 @@ async fn test_http3_bidirectional_streams() {
     let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
-            return;
+            panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
         }
     };
     
@@ -1961,8 +1872,7 @@ async fn test_http3_proxy_header_manipulation() {
     let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
-            return;
+            panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
         }
     };
     
@@ -1972,8 +1882,7 @@ async fn test_http3_proxy_header_manipulation() {
     let prereq_status = match send_http3_request(&mut send_request, "GET", "/", &[], None).await {
         Ok((status, _)) => status,
         Err(e) => {
-            eprintln!("Failed to send prerequisite request: {}", e);
-            return;
+            panic!("Failed to send prerequisite request: {}", e);
         }
     };
     
@@ -1997,8 +1906,7 @@ async fn test_http3_proxy_header_manipulation() {
             );
         }
         Err(e) => {
-            eprintln!("Failed to send/receive HTTP/3 request: {}", e);
-            return;
+            panic!("Failed to send/receive HTTP/3 request: {}", e);
         }
     }
 }
@@ -2019,8 +1927,7 @@ async fn test_http3_proxy_load_balancing() {
     let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
-            return;
+            panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
         }
     };
     
@@ -2034,7 +1941,7 @@ async fn test_http3_proxy_load_balancing() {
                 responses.push(status);
             }
             Err(e) => {
-                eprintln!("Failed to send/receive HTTP/3 request: {}", e);
+                panic!("Failed to send/receive HTTP/3 request: {}", e);
             }
         }
     }
@@ -2061,8 +1968,7 @@ async fn test_http3_stream_timeout() {
     let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
-            return;
+            panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
         }
     };
     
@@ -2092,8 +1998,7 @@ async fn test_http3_invalid_frame() {
     let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
-            return;
+            panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
         }
     };
     
@@ -2120,8 +2025,7 @@ async fn test_http3_backend_failure() {
     let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
-            return;
+            panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
         }
     };
     
@@ -2137,8 +2041,7 @@ async fn test_http3_backend_failure() {
             );
         }
         Err(e) => {
-            eprintln!("Failed to send/receive HTTP/3 request: {}", e);
-            return;
+            panic!("Failed to send/receive HTTP/3 request: {}", e);
         }
     }
 }
@@ -2162,8 +2065,7 @@ async fn test_http3_tls_handshake() {
             c
         }
         Err(e) => {
-            eprintln!("TLS 1.3 handshake failed: {} (HTTP/3 may not be enabled)", e);
-            return;
+            panic!("TLS 1.3 handshake failed: {} (HTTP/3 may not be enabled)", e);
         }
     };
     
@@ -2191,8 +2093,7 @@ async fn test_http3_0rtt_connection() {
     let (_client1, mut send_request1) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
-            return;
+            panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
         }
     };
     
@@ -2208,8 +2109,7 @@ async fn test_http3_0rtt_connection() {
             c
         }
         Err(e) => {
-            eprintln!("Second HTTP/3 handshake failed: {} (HTTP/3 may not be enabled)", e);
-            return;
+            panic!("Second HTTP/3 handshake failed: {} (HTTP/3 may not be enabled)", e);
         }
     };
     
@@ -2236,8 +2136,7 @@ async fn test_http3_connection_close() {
     let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
-            return;
+            panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
         }
     };
     
@@ -2266,8 +2165,7 @@ async fn test_http3_large_request_body() {
     let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
-            return;
+            panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
         }
     };
     
@@ -2286,8 +2184,7 @@ async fn test_http3_large_request_body() {
             );
         }
         Err(e) => {
-            eprintln!("Failed to send/receive HTTP/3 request with large body: {}", e);
-            return;
+            panic!("Failed to send/receive HTTP/3 request with large body: {}", e);
         }
     }
 }
@@ -2308,8 +2205,7 @@ async fn test_http3_large_response_body() {
     let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
-            return;
+            panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
         }
     };
     
@@ -2325,8 +2221,7 @@ async fn test_http3_large_response_body() {
             eprintln!("Received response body size: {} bytes", body.len());
         }
         Err(e) => {
-            eprintln!("Failed to send/receive HTTP/3 request: {}", e);
-            return;
+            panic!("Failed to send/receive HTTP/3 request: {}", e);
         }
     }
 }
@@ -2349,8 +2244,7 @@ async fn test_http3_chunked_response() {
     let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
-            return;
+            panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
         }
     };
     
@@ -2365,8 +2259,7 @@ async fn test_http3_chunked_response() {
             eprintln!("Received streamed response body size: {} bytes", body.len());
         }
         Err(e) => {
-            eprintln!("Failed to send/receive HTTP/3 response: {}", e);
-            return;
+            panic!("Failed to send/receive HTTP/3 response: {}", e);
         }
     }
 }
@@ -2387,8 +2280,7 @@ async fn test_http3_throughput() {
     let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
-            return;
+            panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
         }
     };
     
@@ -2441,8 +2333,7 @@ async fn test_http3_latency() {
     let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
-            return;
+            panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
         }
     };
     
@@ -2507,8 +2398,7 @@ async fn test_grpc_http2_framing() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(e) => {
-                eprintln!("TLS handshake error: {:?}", e);
-                return;
+                panic!("TLS handshake error: {:?}", e);
             }
         }
     }
@@ -2537,8 +2427,7 @@ async fn test_grpc_http2_framing() {
     ).await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Failed to send gRPC request: {}", e);
-            return;
+            panic!("Failed to send gRPC request: {}", e);
         }
     };
     
@@ -2603,8 +2492,7 @@ async fn test_grpc_streaming_detailed() {
     ).await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Failed to send Server Streaming request: {}", e);
-            return;
+            panic!("Failed to send Server Streaming request: {}", e);
         }
     };
     
@@ -2629,8 +2517,7 @@ async fn test_grpc_streaming_detailed() {
         ).await {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("Failed to send Client Streaming request {}: {}", i, e);
-                return;
+                panic!("Failed to send Client Streaming request {}: {}", i, e);
             }
         };
         
@@ -2656,8 +2543,7 @@ async fn test_grpc_streaming_detailed() {
         ).await {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("Failed to send Bidirectional Streaming request {}: {}", i, e);
-                return;
+                panic!("Failed to send Bidirectional Streaming request {}: {}", i, e);
             }
         };
         
@@ -2702,8 +2588,7 @@ async fn test_http3_qpack_compression() {
     let (_client, mut send_request) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
-            return;
+            panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
         }
     };
     
@@ -2759,8 +2644,7 @@ async fn test_http3_connection_migration() {
     let (_client1, mut send_request1) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
-            return;
+            panic!("Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
         }
     };
     
@@ -2772,8 +2656,7 @@ async fn test_http3_connection_migration() {
             assert_eq!(status, 200, "Should return 200 OK before migration");
         }
         Err(e) => {
-            eprintln!("Failed to send/receive HTTP/3 request: {}", e);
-            return;
+            panic!("Failed to send/receive HTTP/3 request: {}", e);
         }
     }
     
@@ -2783,8 +2666,7 @@ async fn test_http3_connection_migration() {
     let (_client2, mut send_request2) = match Http3TestClientV2::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to create second HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
-            return;
+            panic!("Failed to create second HTTP/3 client: {} (HTTP/3 may not be enabled)", e);
         }
     };
     
@@ -2794,8 +2676,7 @@ async fn test_http3_connection_migration() {
             assert_eq!(status, 200, "Should return 200 OK after migration simulation");
         }
         Err(e) => {
-            eprintln!("Failed to send/receive HTTP/3 request: {}", e);
-            return;
+            panic!("Failed to send/receive HTTP/3 request: {}", e);
         }
     }
     
@@ -2829,7 +2710,7 @@ async fn test_http3_concurrent_connections() {
                 let _ = send_http3_request(&mut send_request, "GET", "/", &[], None).await;
             }
             Err(e) => {
-                eprintln!("HTTP/3 connection failed for connection {}: {} (HTTP/3 may not be enabled)", i, e);
+                panic!("HTTP/3 connection failed for connection {}: {}", i, e);
             }
         }
     }
@@ -2866,8 +2747,7 @@ async fn test_grpc_client_streaming() {
         ).await {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("Failed to send gRPC request {}: {}", i, e);
-                return;
+                panic!("Failed to send gRPC request {}: {}", i, e);
             }
         };
         
@@ -2900,8 +2780,7 @@ async fn test_grpc_server_streaming() {
     ).await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Failed to send gRPC request: {}", e);
-            return;
+            panic!("Failed to send gRPC request: {}", e);
         }
     };
     
@@ -2935,8 +2814,7 @@ async fn test_grpc_bidirectional_streaming() {
         ).await {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("Failed to send gRPC request {}: {}", i, e);
-                return;
+                panic!("Failed to send gRPC request {}: {}", i, e);
             }
         };
         
@@ -2966,8 +2844,7 @@ async fn test_grpc_timeout_header() {
     ).await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Failed to send gRPC request: {}", e);
-            return;
+            panic!("Failed to send gRPC request: {}", e);
         }
     };
     
@@ -2996,8 +2873,7 @@ async fn test_grpc_encoding_header() {
     ).await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Failed to send gRPC request: {}", e);
-            return;
+            panic!("Failed to send gRPC request: {}", e);
         }
     };
     
@@ -3026,8 +2902,7 @@ async fn test_grpc_accept_encoding_header() {
     ).await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Failed to send gRPC request: {}", e);
-            return;
+            panic!("Failed to send gRPC request: {}", e);
         }
     };
     
@@ -3059,8 +2934,7 @@ async fn test_grpc_metadata() {
     ).await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Failed to send gRPC request: {}", e);
-            return;
+            panic!("Failed to send gRPC request: {}", e);
         }
     };
     
@@ -3091,8 +2965,7 @@ async fn test_grpc_gzip_compression() {
     ).await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Failed to send gRPC request: {}", e);
-            return;
+            panic!("Failed to send gRPC request: {}", e);
         }
     };
     
@@ -3158,8 +3031,7 @@ async fn test_grpc_proxy_forwarding() {
     ).await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Failed to send gRPC request: {}", e);
-            return;
+            panic!("Failed to send gRPC request: {}", e);
         }
     };
     
@@ -3191,8 +3063,7 @@ async fn test_grpc_invalid_frame() {
     ).await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Failed to send gRPC request to 127.0.0.1:{}: {}", PROXY_PORT, e);
-            return;
+            panic!("Failed to send gRPC request to 127.0.0.1:{}: {}", PROXY_PORT, e);
         }
     };
     
@@ -3247,8 +3118,7 @@ async fn test_grpc_oversized_message() {
     ).await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Failed to send gRPC request: {}", e);
-            return;
+            panic!("Failed to send gRPC request: {}", e);
         }
     };
     
@@ -3286,8 +3156,7 @@ async fn test_error_handling_invalid_method() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -3297,8 +3166,7 @@ async fn test_error_handling_invalid_method() {
     // 不正なHTTPメソッドを送信
     let invalid_request = b"INVALID / HTTP/1.1\r\nHost: localhost\r\n\r\n";
     if let Err(e) = tls_stream.write_all(invalid_request) {
-        eprintln!("Failed to send invalid method request: {:?}", e);
-        return;
+        panic!("Failed to send invalid method request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -3347,8 +3215,7 @@ async fn test_error_handling_missing_host() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -3358,8 +3225,7 @@ async fn test_error_handling_missing_host() {
     // Hostヘッダーが欠落しているリクエストを送信
     let missing_host_request = b"GET / HTTP/1.1\r\n\r\n";
     if let Err(e) = tls_stream.write_all(missing_host_request) {
-        eprintln!("Failed to send missing host request: {:?}", e);
-        return;
+        panic!("Failed to send missing host request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -3408,8 +3274,7 @@ async fn test_error_handling_oversized_header() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -3424,8 +3289,7 @@ async fn test_error_handling_oversized_header() {
     );
     
     if let Err(e) = tls_stream.write_all(oversized_request.as_bytes()) {
-        eprintln!("Failed to send oversized header request: {:?}", e);
-        return;
+        panic!("Failed to send oversized header request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -3474,8 +3338,7 @@ async fn test_error_handling_invalid_path() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -3485,8 +3348,7 @@ async fn test_error_handling_invalid_path() {
     // 不正なパスを含むリクエストを送信（NULL文字を含む）
     let invalid_path_request = b"GET /\x00invalid HTTP/1.1\r\nHost: localhost\r\n\r\n";
     if let Err(e) = tls_stream.write_all(invalid_path_request) {
-        eprintln!("Failed to send invalid path request: {:?}", e);
-        return;
+        panic!("Failed to send invalid path request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -3993,8 +3855,7 @@ async fn test_http2_hpack_compression() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -4513,8 +4374,7 @@ async fn test_grpc_status_code() {
     ).await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Failed to send gRPC request: {}", e);
-            return;
+            panic!("Failed to send gRPC request: {}", e);
         }
     };
     
@@ -4666,8 +4526,7 @@ async fn test_grpc_proxy_load_balancing() {
         ).await {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("Failed to send gRPC request: {}", e);
-                return;
+                panic!("Failed to send gRPC request: {}", e);
             }
         };
         
@@ -4702,8 +4561,7 @@ async fn test_grpc_proxy_timeout() {
     ).await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Failed to send gRPC request: {}", e);
-            return;
+            panic!("Failed to send gRPC request: {}", e);
         }
     };
     
@@ -4735,8 +4593,7 @@ async fn test_grpc_proxy_error_handling() {
     ) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Failed to send gRPC request to /grpc.test.v1.NonExistentService/NonExistentMethod: {}", e);
-            return;
+            panic!("Failed to send gRPC request to /grpc.test.v1.NonExistentService/NonExistentMethod: {}", e);
         }
     };
     
@@ -4788,8 +4645,7 @@ async fn test_grpc_malformed_protobuf() {
     ) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Failed to send gRPC request with malformed Protobuf to /grpc.test.v1.TestService/Test: {}", e);
-            return;
+            panic!("Failed to send gRPC request with malformed Protobuf to /grpc.test.v1.TestService/Test: {}", e);
         }
     };
     
@@ -4844,8 +4700,7 @@ async fn test_grpc_stream_reset() {
     ) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Failed to send gRPC stream reset request to /grpc.test.v1.TestService/StreamReset: {}", e);
-            return;
+            panic!("Failed to send gRPC stream reset request to /grpc.test.v1.TestService/StreamReset: {}", e);
         }
     };
     
@@ -4900,8 +4755,7 @@ async fn test_grpc_deflate_compression() {
     ) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Failed to send gRPC request: {}", e);
-            return;
+            panic!("Failed to send gRPC request: {}", e);
         }
     };
     
@@ -4931,8 +4785,7 @@ async fn test_grpc_compression_negotiation() {
     ) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Failed to send gRPC request: {}", e);
-            return;
+            panic!("Failed to send gRPC request: {}", e);
         }
     };
     
@@ -4968,8 +4821,7 @@ async fn test_grpc_trailer_detailed() {
     ) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Failed to send gRPC request: {}", e);
-            return;
+            panic!("Failed to send gRPC request: {}", e);
         }
     };
     
@@ -5182,8 +5034,7 @@ async fn test_http2_alpn_negotiation() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(e) => {
-                eprintln!("TLS handshake error: {:?}", e);
-                return;
+                panic!("TLS handshake error: {:?}", e);
             }
         }
     }
@@ -5231,8 +5082,7 @@ async fn test_http2_connection_reuse() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -5277,8 +5127,7 @@ async fn test_http2_header_compression() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -5326,8 +5175,7 @@ async fn test_websocket_upgrade_request() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -5338,8 +5186,7 @@ async fn test_websocket_upgrade_request() {
     // WebSocketアップグレードリクエストを送信
     let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
     if let Err(e) = tls_stream.write_all(request) {
-        eprintln!("Failed to send WebSocket upgrade request: {:?}", e);
-        return;
+        panic!("Failed to send WebSocket upgrade request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -5399,8 +5246,7 @@ async fn test_websocket_connection_persistence() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -5411,8 +5257,7 @@ async fn test_websocket_connection_persistence() {
     // WebSocketアップグレードリクエストを送信
     let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
     if let Err(e) = tls_stream.write_all(request) {
-        eprintln!("Failed to send WebSocket upgrade request: {:?}", e);
-        return;
+        panic!("Failed to send WebSocket upgrade request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -5442,8 +5287,7 @@ async fn test_websocket_connection_persistence() {
             Err(_) => {
                 // エラーまたはEOF
                 if response.is_empty() {
-                    eprintln!("No response received");
-                    return;
+                    panic!("No response received");
                 }
                 break;
             }
@@ -5451,8 +5295,7 @@ async fn test_websocket_connection_persistence() {
     }
     
     if response.is_empty() {
-        eprintln!("Empty response received");
-        return;
+        panic!("Empty response received");
     }
     
     let response = String::from_utf8_lossy(&response);
@@ -5497,8 +5340,7 @@ async fn test_websocket_proxy_forwarding() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -5509,8 +5351,7 @@ async fn test_websocket_proxy_forwarding() {
     // WebSocketアップグレードリクエストを送信
     let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
     if let Err(e) = tls_stream.write_all(request) {
-        eprintln!("Failed to send WebSocket upgrade request: {:?}", e);
-        return;
+        panic!("Failed to send WebSocket upgrade request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -5758,8 +5599,7 @@ async fn test_malformed_headers() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -5769,8 +5609,7 @@ async fn test_malformed_headers() {
     // 不正なヘッダー（改行文字が含まれている）を送信
     let malformed_request = b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Test: value\r\n\r\n";
     if let Err(e) = tls_stream.write_all(malformed_request) {
-        eprintln!("Failed to send malformed request: {:?}", e);
-        return;
+        panic!("Failed to send malformed request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -5908,8 +5747,7 @@ async fn test_chunked_transfer_encoding() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -5919,8 +5757,7 @@ async fn test_chunked_transfer_encoding() {
     // Chunked Transfer Encodingでリクエストを送信
     let request = b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
     if let Err(e) = tls_stream.write_all(request) {
-        eprintln!("Failed to send chunked request: {:?}", e);
-        return;
+        panic!("Failed to send chunked request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -6001,8 +5838,7 @@ async fn test_keep_alive_multiple_requests() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -6038,8 +5874,7 @@ async fn test_keep_alive_multiple_requests() {
             }
             Err(_) => {
                 if response1.is_empty() {
-                    eprintln!("No response received for first request");
-                    return;
+                    panic!("No response received for first request");
                 }
                 break;
             }
@@ -6047,8 +5882,7 @@ async fn test_keep_alive_multiple_requests() {
     }
     
     if response1.is_empty() {
-        eprintln!("Empty response for first request");
-        return;
+        panic!("Empty response for first request");
     }
     
     // Content-Lengthを確認してボディを読み取る
@@ -6081,8 +5915,7 @@ async fn test_keep_alive_multiple_requests() {
     // 2回目のリクエスト（同じ接続を使用）
     let request2 = b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n";
     if let Err(e) = tls_stream.write_all(request2) {
-        eprintln!("Failed to send second request: {:?}", e);
-        return;
+        panic!("Failed to send second request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -6108,8 +5941,7 @@ async fn test_keep_alive_multiple_requests() {
             }
             Err(_) => {
                 if response2.is_empty() {
-                    eprintln!("No response received for second request");
-                    return;
+                    panic!("No response received for second request");
                 }
                 break;
             }
@@ -6117,8 +5949,7 @@ async fn test_keep_alive_multiple_requests() {
     }
     
     if response2.is_empty() {
-        eprintln!("Empty response for second request");
-        return;
+        panic!("Empty response for second request");
     }
     
     // Content-Lengthを確認してボディを読み取る
@@ -6184,8 +6015,7 @@ async fn test_sni_hostname_negotiation() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(e) => {
-                eprintln!("TLS handshake error: {:?}", e);
-                return;
+                panic!("TLS handshake error: {:?}", e);
             }
         }
     }
@@ -6196,8 +6026,7 @@ async fn test_sni_hostname_negotiation() {
     // リクエストを送信
     let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     if let Err(e) = tls_stream.write_all(request) {
-        eprintln!("Failed to send request: {:?}", e);
-        return;
+        panic!("Failed to send request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -6245,9 +6074,8 @@ async fn test_sni_different_hostname() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(e) => {
-                eprintln!("TLS handshake error with 127.0.0.1: {:?}", e);
+                panic!("TLS handshake error with 127.0.0.1: {:?}", e);
                 // 証明書が127.0.0.1に対応していない場合、エラーが発生する可能性がある
-                return;
             }
         }
     }
@@ -6257,8 +6085,7 @@ async fn test_sni_different_hostname() {
     // リクエストを送信
     let request = b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
     if let Err(e) = tls_stream.write_all(request) {
-        eprintln!("Failed to send request: {:?}", e);
-        return;
+        panic!("Failed to send request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -6371,8 +6198,7 @@ async fn test_redirect_method_preservation() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -6382,8 +6208,7 @@ async fn test_redirect_method_preservation() {
     // POSTリクエストを送信（リダイレクトされる可能性がある）
     let request = b"POST /redirect-test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     if let Err(e) = tls_stream.write_all(request) {
-        eprintln!("Failed to send POST request: {:?}", e);
-        return;
+        panic!("Failed to send POST request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -7373,8 +7198,7 @@ async fn test_websocket_connection_close() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -7385,8 +7209,7 @@ async fn test_websocket_connection_close() {
     // WebSocketアップグレードリクエストを送信
     let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
     if let Err(e) = tls_stream.write_all(request) {
-        eprintln!("Failed to send WebSocket upgrade request: {:?}", e);
-        return;
+        panic!("Failed to send WebSocket upgrade request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -7413,8 +7236,7 @@ async fn test_websocket_connection_close() {
             }
             Err(_) => {
                 if response.is_empty() {
-                    eprintln!("No response received");
-                    return;
+                    panic!("No response received");
                 }
                 break;
             }
@@ -7422,8 +7244,7 @@ async fn test_websocket_connection_close() {
     }
     
     if response.is_empty() {
-        eprintln!("Empty response received");
-        return;
+        panic!("Empty response received");
     }
     
     let response = String::from_utf8_lossy(&response);
@@ -7466,8 +7287,7 @@ async fn test_websocket_unexpected_close() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -7478,8 +7298,7 @@ async fn test_websocket_unexpected_close() {
     // WebSocketアップグレードリクエストを送信
     let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
     if let Err(e) = tls_stream.write_all(request) {
-        eprintln!("Failed to send WebSocket upgrade request: {:?}", e);
-        return;
+        panic!("Failed to send WebSocket upgrade request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -7673,8 +7492,7 @@ async fn test_100_continue() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -7684,8 +7502,7 @@ async fn test_100_continue() {
     // Expect: 100-continueヘッダーを含むリクエストを送信
     let request = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\nExpect: 100-continue\r\n\r\n";
     if let Err(e) = tls_stream.write_all(request) {
-        eprintln!("Failed to send request: {:?}", e);
-        return;
+        panic!("Failed to send request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -7740,8 +7557,7 @@ async fn test_hop_by_hop_headers() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -7751,8 +7567,7 @@ async fn test_hop_by_hop_headers() {
     // Hop-by-hopヘッダーを含むリクエストを送信
     let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nKeep-Alive: timeout=5\r\nTE: trailers\r\n\r\n";
     if let Err(e) = tls_stream.write_all(request) {
-        eprintln!("Failed to send request: {:?}", e);
-        return;
+        panic!("Failed to send request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -7800,8 +7615,7 @@ async fn test_host_validation() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -7811,8 +7625,7 @@ async fn test_host_validation() {
     // Hostヘッダーなしのリクエストを送信（HTTP/1.1では必須）
     let request = b"GET / HTTP/1.1\r\n\r\n";
     if let Err(e) = tls_stream.write_all(request) {
-        eprintln!("Failed to send request: {:?}", e);
-        return;
+        panic!("Failed to send request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -7867,8 +7680,7 @@ async fn test_connection_close_header() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -7878,8 +7690,7 @@ async fn test_connection_close_header() {
     // Connection: closeヘッダーを含むリクエストを送信
     let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     if let Err(e) = tls_stream.write_all(request) {
-        eprintln!("Failed to send request: {:?}", e);
-        return;
+        panic!("Failed to send request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -7941,8 +7752,7 @@ async fn test_connection_abort() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -7952,8 +7762,7 @@ async fn test_connection_abort() {
     // リクエストの一部を送信してから接続を切断
     let partial_request = b"GET / HTTP/1.1\r\nHost: localhost\r\n";
     if let Err(e) = tls_stream.write_all(partial_request) {
-        eprintln!("Failed to send partial request: {:?}", e);
-        return;
+        panic!("Failed to send partial request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -7990,8 +7799,7 @@ async fn test_empty_request() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -8001,8 +7809,7 @@ async fn test_empty_request() {
     // 空のリクエストを送信
     let empty_request = b"\r\n";
     if let Err(e) = tls_stream.write_all(empty_request) {
-        eprintln!("Failed to send empty request: {:?}", e);
-        return;
+        panic!("Failed to send empty request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -8057,8 +7864,7 @@ async fn test_incomplete_request_line() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -8068,8 +7874,7 @@ async fn test_incomplete_request_line() {
     // 不完全なリクエスト行を送信
     let incomplete_request = b"GET /\r\nHost: localhost\r\n\r\n";
     if let Err(e) = tls_stream.write_all(incomplete_request) {
-        eprintln!("Failed to send incomplete request: {:?}", e);
-        return;
+        panic!("Failed to send incomplete request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -8324,8 +8129,7 @@ async fn test_content_length_transfer_encoding_conflict() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -8335,8 +8139,7 @@ async fn test_content_length_transfer_encoding_conflict() {
     // Content-LengthとTransfer-Encodingの両方を含むリクエストを送信
     let request = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\nTransfer-Encoding: chunked\r\n\r\n";
     if let Err(e) = tls_stream.write_all(request) {
-        eprintln!("Failed to send request: {:?}", e);
-        return;
+        panic!("Failed to send request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -8391,8 +8194,7 @@ async fn test_invalid_content_length() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -8402,8 +8204,7 @@ async fn test_invalid_content_length() {
     // 不正なContent-Lengthを含むリクエストを送信
     let request = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: invalid\r\n\r\n";
     if let Err(e) = tls_stream.write_all(request) {
-        eprintln!("Failed to send request: {:?}", e);
-        return;
+        panic!("Failed to send request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -8454,8 +8255,7 @@ async fn test_multiple_content_length() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -8465,8 +8265,7 @@ async fn test_multiple_content_length() {
     // 複数のContent-Lengthヘッダーを含むリクエストを送信
     let request = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\nContent-Length: 200\r\n\r\n";
     if let Err(e) = tls_stream.write_all(request) {
-        eprintln!("Failed to send request: {:?}", e);
-        return;
+        panic!("Failed to send request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -8742,8 +8541,7 @@ async fn test_oversized_request_line() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -8754,8 +8552,7 @@ async fn test_oversized_request_line() {
     let oversized_path = "a".repeat(9000);
     let request = format!("GET /{} HTTP/1.1\r\nHost: localhost\r\n\r\n", oversized_path);
     if let Err(e) = tls_stream.write_all(request.as_bytes()) {
-        eprintln!("Failed to send oversized request: {:?}", e);
-        return;
+        panic!("Failed to send oversized request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -8806,8 +8603,7 @@ async fn test_oversized_header() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -8818,8 +8614,7 @@ async fn test_oversized_header() {
     let oversized_value = "a".repeat(9000);
     let request = format!("GET / HTTP/1.1\r\nHost: localhost\r\nX-Custom-Header: {}\r\n\r\n", oversized_value);
     if let Err(e) = tls_stream.write_all(request.as_bytes()) {
-        eprintln!("Failed to send oversized header: {:?}", e);
-        return;
+        panic!("Failed to send oversized header: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -8870,8 +8665,7 @@ async fn test_malformed_request() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -8881,8 +8675,7 @@ async fn test_malformed_request() {
     // 不正な形式のリクエストを送信（CRLFが欠落）
     let malformed_request = b"GET / HTTP/1.1 Host: localhost\r\n\r\n";
     if let Err(e) = tls_stream.write_all(malformed_request) {
-        eprintln!("Failed to send malformed request: {:?}", e);
-        return;
+        panic!("Failed to send malformed request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -9127,8 +8920,7 @@ async fn test_error_handling_413_payload_too_large() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -9139,8 +8931,7 @@ async fn test_error_handling_413_payload_too_large() {
     let large_size = 10_000_000; // 10MB
     let request = format!("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n", large_size);
     if let Err(e) = tls_stream.write_all(request.as_bytes()) {
-        eprintln!("Failed to send request: {:?}", e);
-        return;
+        panic!("Failed to send request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -9619,8 +9410,7 @@ async fn test_keep_alive_timeout() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -9630,8 +9420,7 @@ async fn test_keep_alive_timeout() {
     // 最初のリクエスト（Keep-Alive接続を確立）
     let request1 = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n";
     if let Err(e) = tls_stream.write_all(request1) {
-        eprintln!("Failed to send first request: {:?}", e);
-        return;
+        panic!("Failed to send first request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -9661,8 +9450,7 @@ async fn test_keep_alive_timeout() {
     
     let request2 = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n";
     if let Err(e) = tls_stream.write_all(request2) {
-        eprintln!("Keep-Alive timeout test: connection may have timed out: {:?}", e);
-        return;
+        panic!("Keep-Alive timeout test: connection may have timed out: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -9710,8 +9498,7 @@ async fn test_keep_alive_max_requests() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -10050,13 +9837,11 @@ async fn test_compression_zstd() {
     // 前提条件: /large.txt が存在することを確認
     let prereq = send_request(PROXY_PORT, "/large.txt", &[]);
     if prereq.is_none() {
-        eprintln!("Prerequisite check failed: no response");
-        return;
+        panic!("Prerequisite check failed: no response from /large.txt");
     }
     let prereq_status = get_status_code(&prereq.as_ref().unwrap());
     if prereq_status != Some(200) {
-        eprintln!("Prerequisite failed: /large.txt not found (status: {:?}), skipping test", prereq_status);
-        return;
+        panic!("Prerequisite failed: /large.txt not found (status: {:?})", prereq_status);
     }
     
     // zstd圧縮をリクエスト
@@ -10098,13 +9883,11 @@ async fn test_compression_multiple_encodings() {
     // 前提条件: /large.txt が存在することを確認
     let prereq = send_request(PROXY_PORT, "/large.txt", &[]);
     if prereq.is_none() {
-        eprintln!("Prerequisite check failed: no response");
-        return;
+        panic!("Prerequisite check failed: no response from /large.txt");
     }
     let prereq_status = get_status_code(&prereq.as_ref().unwrap());
     if prereq_status != Some(200) {
-        eprintln!("Prerequisite failed: /large.txt not found (status: {:?}), skipping test", prereq_status);
-        return;
+        panic!("Prerequisite failed: /large.txt not found (status: {:?})", prereq_status);
     }
     
     // 複数の圧縮エンコーディングの優先順位のテスト
@@ -10143,13 +9926,11 @@ async fn test_compression_no_encoding() {
     // 前提条件: /large.txt が存在することを確認
     let prereq = send_request(PROXY_PORT, "/large.txt", &[]);
     if prereq.is_none() {
-        eprintln!("Prerequisite check failed: no response");
-        return;
+        panic!("Prerequisite check failed: no response from /large.txt");
     }
     let prereq_status = get_status_code(&prereq.as_ref().unwrap());
     if prereq_status != Some(200) {
-        eprintln!("Prerequisite failed: /large.txt not found (status: {:?}), skipping test", prereq_status);
-        return;
+        panic!("Prerequisite failed: /large.txt not found (status: {:?})", prereq_status);
     }
     
     // 圧縮を要求しない場合のテスト
@@ -10414,13 +10195,11 @@ async fn test_buffering_memory_limit() {
     // 前提条件: /large.txt が存在することを確認
     let prereq = send_request(PROXY_PORT, "/large.txt", &[]);
     if prereq.is_none() {
-        eprintln!("Prerequisite check failed: no response");
-        return;
+        panic!("Prerequisite check failed: no response from /large.txt");
     }
     let prereq_status = get_status_code(&prereq.as_ref().unwrap());
     if prereq_status != Some(200) {
-        eprintln!("Prerequisite failed: /large.txt not found (status: {:?}), skipping test", prereq_status);
-        return;
+        panic!("Prerequisite failed: /large.txt not found (status: {:?})", prereq_status);
     }
     
     // 大きなレスポンスをリクエスト
@@ -11075,8 +10854,7 @@ async fn test_h2c_grpc_unary_call() {
     ).await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Failed to send gRPC request: {}", e);
-            return;
+            panic!("Failed to send gRPC request: {}", e);
         }
     };
     
@@ -11109,8 +10887,7 @@ async fn test_h2c_grpc_streaming() {
     ) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Failed to send gRPC streaming request: {}", e);
-            return;
+            panic!("Failed to send gRPC streaming request: {}", e);
         }
     };
     
@@ -11497,8 +11274,7 @@ async fn test_websocket_poll_mode_fixed() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -11508,8 +11284,7 @@ async fn test_websocket_poll_mode_fixed() {
     // WebSocketアップグレードリクエストを送信
     let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
     if let Err(e) = tls_stream.write_all(request) {
-        eprintln!("Failed to send WebSocket upgrade request: {:?}", e);
-        return;
+        panic!("Failed to send WebSocket upgrade request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -11562,8 +11337,7 @@ async fn test_websocket_poll_mode_adaptive_active() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -11573,8 +11347,7 @@ async fn test_websocket_poll_mode_adaptive_active() {
     // WebSocketアップグレードリクエストを送信
     let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
     if let Err(e) = tls_stream.write_all(request) {
-        eprintln!("Failed to send WebSocket upgrade request: {:?}", e);
-        return;
+        panic!("Failed to send WebSocket upgrade request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -11627,8 +11400,7 @@ async fn test_websocket_long_connection() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -11638,8 +11410,7 @@ async fn test_websocket_long_connection() {
     // WebSocketアップグレードリクエストを送信
     let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
     if let Err(e) = tls_stream.write_all(request) {
-        eprintln!("Failed to send WebSocket upgrade request: {:?}", e);
-        return;
+        panic!("Failed to send WebSocket upgrade request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -11992,8 +11763,7 @@ async fn test_websocket_poll_mode_adaptive_idle() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -12003,8 +11773,7 @@ async fn test_websocket_poll_mode_adaptive_idle() {
     // WebSocketアップグレードリクエストを送信
     let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
     if let Err(e) = tls_stream.write_all(request) {
-        eprintln!("Failed to send WebSocket upgrade request: {:?}", e);
-        return;
+        panic!("Failed to send WebSocket upgrade request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
@@ -12057,8 +11826,7 @@ async fn test_websocket_idle_connection_timeout() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
             Err(_) => {
-                eprintln!("TLS handshake error");
-                return;
+                panic!("TLS handshake error");
             }
         }
     }
@@ -12068,8 +11836,7 @@ async fn test_websocket_idle_connection_timeout() {
     // WebSocketアップグレードリクエストを送信
     let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
     if let Err(e) = tls_stream.write_all(request) {
-        eprintln!("Failed to send WebSocket upgrade request: {:?}", e);
-        return;
+        panic!("Failed to send WebSocket upgrade request: {:?}", e);
     }
     tls_stream.flush().unwrap();
     
