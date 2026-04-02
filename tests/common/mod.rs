@@ -2,7 +2,8 @@
 //!
 //! 統合テストおよびE2Eテストで使用する共通のユーティリティを提供します。
 
-#[cfg(feature = "http3")]
+// 新しいHTTP/3テストクライアント（h3+quinn版）
+// http3 featureフラグなしで有効
 pub mod http3_client;
 
 pub mod grpc_client;
@@ -13,10 +14,6 @@ pub mod http2_client;
 
 // 新しいHTTP/1.1テストクライアント（hyper+rustls）
 pub mod http1_client;
-
-// 新しいHTTP/3テストクライアント（h3+quinn版）
-// http3 featureフラグなしで有効
-pub mod http3_client_v2;
 
 
 
