@@ -1237,7 +1237,6 @@ async fn test_backend_connection_failure() {
 #[tokio::test]
 #[ntest::timeout(1000)]
 #[cfg(feature = "http2")]
-#[ntest::timeout(1000)]
 async fn test_websocket_basic_connection() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
