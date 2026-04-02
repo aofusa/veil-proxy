@@ -34,8 +34,16 @@
 
 use std::time::Duration;
 use std::sync::Arc;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 
 mod common;
+
+use rustls::{ClientConfig, ClientConnection};
+use rustls::pki_types::ServerName;
+use rustls::crypto::CryptoProvider;
+
+use common::grpc_client::GrpcFrame;
 
 #[cfg(feature = "grpc-web")]
 use base64;
