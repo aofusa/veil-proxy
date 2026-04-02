@@ -19,6 +19,15 @@ pub struct GrpcTestClientV2 {
     channel: Channel,
 }
 
+#[cfg(feature = "grpc")]
+use super::grpc_client::GrpcFrame;
+#[cfg(not(feature = "grpc"))]
+// grpc featureがない場合のフォールバック
+pub struct GrpcFrame {
+    compressed: bool,
+    data: Vec<u8>,
+}
+
 #[allow(dead_code)]
 impl GrpcTestClientV2 {
     /// 新しいgRPCクライアントを作成（TLS使用）
@@ -151,15 +160,7 @@ impl GrpcTestClientV2 {
     }
     
     /// レスポンスからgRPCフレームを抽出（既存のGrpcTestClientと互換性のあるAPI）
-    pub fn extract_grpc_frame(response: &[u8]) -> Result<super::grpc_client::GrpcFrame, Box<dyn std::error::Error + Send + Sync>> {
-        #[cfg(feature = "grpc")]
-        use super::grpc_client::GrpcFrame;
-        #[cfg(not(feature = "grpc"))]
-        // grpc featureがない場合のフォールバック
-        struct GrpcFrame {
-            compressed: bool,
-            data: Vec<u8>,
-        }
+    pub fn extract_grpc_frame(response: &[u8]) -> Result<GrpcFrame, Box<dyn std::error::Error + Send + Sync>> {
         
         // HTTPレスポンスからボディを抽出
         let body_start = response.windows(4)

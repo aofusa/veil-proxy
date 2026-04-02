@@ -43,7 +43,7 @@ use rustls::{ClientConfig, ClientConnection};
 use rustls::pki_types::ServerName;
 use rustls::crypto::CryptoProvider;
 
-use common::grpc_client::GrpcFrame;
+use common::grpc_client_v2::GrpcFrame;
 
 #[cfg(feature = "grpc-web")]
 use base64;
