@@ -43,7 +43,7 @@ use rustls::{ClientConfig, ClientConnection};
 use rustls::pki_types::ServerName;
 use rustls::crypto::CryptoProvider;
 
-use common::grpc_client_v2::GrpcFrame;
+use common::grpc_client::GrpcFrame;
 
 #[cfg(feature = "grpc-web")]
 use base64;
@@ -55,7 +55,7 @@ use common::http1_client::Http1TestClient;
 use common::http3_client_v2::{Http3TestClientV2, http3_get};
 
 // 新しい非同期gRPCテストクライアント（tonic）
-use common::grpc_client_v2::GrpcTestClientV2;
+use common::grpc_client::GrpcTestClient;
 
 // E2E環境のポート設定（e2e_setup.shと一致させる）
 const PROXY_PORT: u16 = 8443;  // プロキシHTTPSポート
@@ -454,7 +454,7 @@ async fn test_grpc_connection_async() {
     }
     
     // gRPCクライアントの作成を試行（TLS接続）
-    let _client = GrpcTestClientV2::new("127.0.0.1", PROXY_PORT).await
+    let _client = GrpcTestClient::new("127.0.0.1", PROXY_PORT).await
         .expect("gRPC (tonic) TLS connection should succeed");
     eprintln!("gRPC (tonic) connection created successfully");
 }
@@ -468,7 +468,7 @@ async fn test_grpc_h2c_connection_async() {
     }
     
     // H2Cポートへの接続を試行
-    let _client = GrpcTestClientV2::new_plaintext("127.0.0.1", PROXY_H2C_PORT).await
+    let _client = GrpcTestClient::new_plaintext("127.0.0.1", PROXY_H2C_PORT).await
         .unwrap_or_else(|e| panic!("gRPC h2c connection to port {} should succeed: {}", PROXY_H2C_PORT, e));
     eprintln!("gRPC (tonic h2c) connection created successfully on port {}", PROXY_H2C_PORT);
 }
@@ -1351,7 +1351,7 @@ async fn test_grpc_unary_call() {
     let request_message = b"Hello, gRPC!";
     
     // gRPCリクエストを送信（非同期版）
-    let response = match GrpcTestClientV2::send_grpc_request(
+    let response = match GrpcTestClient::send_grpc_request(
         "127.0.0.1",
         PROXY_PORT,
         "/grpc.test.v1.TestService/UnaryCall",
@@ -1368,7 +1368,7 @@ async fn test_grpc_unary_call() {
     };
     
     // ステータスコードを確認
-    let status = GrpcTestClientV2::extract_status_code(&response);
+    let status = GrpcTestClient::extract_status_code(&response);
     // gRPCエンドポイントが存在する場合は200が返される
     assert_eq!(
         status, Some(200),
@@ -1377,7 +1377,7 @@ async fn test_grpc_unary_call() {
     );
     
     // gRPCフレームを抽出（成功した場合のみ）
-    if let Ok(frame) = GrpcTestClientV2::extract_grpc_frame(&response) {
+    if let Ok(frame) = GrpcTestClient::extract_grpc_frame(&response) {
         assert!(!frame.data.is_empty(), "Should receive non-empty response message");
     }
 }
@@ -2424,9 +2424,9 @@ async fn test_grpc_http2_framing() {
     
     // gRPCリクエストを送信（HTTP/2経由）
     // 注意: 実際のHTTP/2フレーム解析には専用のクライアントライブラリが必要
-    // ここでは、非同期版のGrpcTestClientV2を使用して基本的な動作確認を行う
+    // ここでは、非同期版のGrpcTestClientを使用して基本的な動作確認を行う
     // gRPCリクエストを送信（非同期版）
-    let response = match GrpcTestClientV2::send_grpc_request(
+    let response = match GrpcTestClient::send_grpc_request(
         "127.0.0.1",
         PROXY_PORT,
         "/grpc.test.v1.TestService/Test",
@@ -2440,14 +2440,14 @@ async fn test_grpc_http2_framing() {
     };
     
     // HTTPステータスコードを確認
-    let http_status = GrpcTestClientV2::extract_status_code(&response);
+    let http_status = GrpcTestClient::extract_status_code(&response);
     assert!(
         http_status == Some(200) || http_status == Some(404) || http_status == Some(502),
         "Should return 200, 404, or 502: {:?}", http_status
     );
     
     // gRPCフレームを抽出
-    if let Ok(frame) = GrpcTestClientV2::extract_grpc_frame(&response) {
+    if let Ok(frame) = GrpcTestClient::extract_grpc_frame(&response) {
         // gRPCフレームの構造を確認
         // 5-byteヘッダー（1 byte flags + 4 bytes length）+ メッセージ
         assert!(!frame.data.is_empty() || http_status == Some(404), 
@@ -2458,7 +2458,7 @@ async fn test_grpc_http2_framing() {
     }
     
     // トレーラーを確認
-    let trailers = GrpcTestClientV2::extract_trailers(&response);
+    let trailers = GrpcTestClient::extract_trailers(&response);
     eprintln!("gRPC trailers: {:?}", trailers);
     
     // HTTP/2ベースのgRPCでは、以下のフレーム構造が期待される:
@@ -2491,7 +2491,7 @@ async fn test_grpc_streaming_detailed() {
     // Server Streamingリクエストを送信（非同期版、静的メソッド）
     // 注意: 実際のストリーミングにはHTTP/2のストリーム機能が必要
     // ここでは、基本的な動作確認を行う
-    let response1 = match GrpcTestClientV2::send_grpc_request(
+    let response1 = match GrpcTestClient::send_grpc_request(
         "127.0.0.1",
         PROXY_PORT,
         "/grpc.test.v1.TestService/ServerStreaming",
@@ -2504,7 +2504,7 @@ async fn test_grpc_streaming_detailed() {
         }
     };
     
-    let status1 = GrpcTestClientV2::extract_status_code(&response1);
+    let status1 = GrpcTestClient::extract_status_code(&response1);
     assert!(
         status1 == Some(200) || status1 == Some(404) || status1 == Some(502),
         "Should return 200, 404, or 502: {:?}", status1
@@ -2516,7 +2516,7 @@ async fn test_grpc_streaming_detailed() {
     // 複数のメッセージを送信（Client Streamingのシミュレーション、非同期版）
     for i in 0..3 {
         let message = format!("Client streaming message {}", i).into_bytes();
-        let response = match GrpcTestClientV2::send_grpc_request(
+        let response = match GrpcTestClient::send_grpc_request(
             "127.0.0.1",
             PROXY_PORT,
             "/grpc.test.v1.TestService/ClientStreaming",
@@ -2529,7 +2529,7 @@ async fn test_grpc_streaming_detailed() {
             }
         };
         
-        let status = GrpcTestClientV2::extract_status_code(&response);
+        let status = GrpcTestClient::extract_status_code(&response);
         assert_eq!(
             status, Some(200),
             "Should return 200 OK for gRPC request, got: {:?}", status
@@ -2542,7 +2542,7 @@ async fn test_grpc_streaming_detailed() {
     // 複数のメッセージを送受信（Bidirectional Streamingのシミュレーション、非同期版）
     for i in 0..3 {
         let message = format!("Bidirectional streaming message {}", i).into_bytes();
-        let response = match GrpcTestClientV2::send_grpc_request(
+        let response = match GrpcTestClient::send_grpc_request(
             "127.0.0.1",
             PROXY_PORT,
             "/grpc.test.v1.TestService/BidirectionalStreaming",
@@ -2555,14 +2555,14 @@ async fn test_grpc_streaming_detailed() {
             }
         };
         
-        let status = GrpcTestClientV2::extract_status_code(&response);
+        let status = GrpcTestClient::extract_status_code(&response);
         assert_eq!(
             status, Some(200),
             "Should return 200 OK for gRPC request, got: {:?}", status
         );
         
         // gRPCフレームを抽出
-        if let Ok(frame) = GrpcTestClientV2::extract_grpc_frame(&response) {
+        if let Ok(frame) = GrpcTestClient::extract_grpc_frame(&response) {
             eprintln!("Received gRPC frame {}: data_len={}", i, frame.data.len());
         }
     }
@@ -2746,7 +2746,7 @@ async fn test_grpc_client_streaming() {
     // 複数のメッセージを送信（簡易実装、非同期版）
     for i in 0..3 {
         let message = format!("Message {}", i).into_bytes();
-        let response = match GrpcTestClientV2::send_grpc_request(
+        let response = match GrpcTestClient::send_grpc_request(
             "127.0.0.1",
             PROXY_PORT,
             "/grpc.test.v1.TestService/ClientStreaming",
@@ -2759,7 +2759,7 @@ async fn test_grpc_client_streaming() {
             }
         };
         
-        let status = GrpcTestClientV2::extract_status_code(&response);
+        let status = GrpcTestClient::extract_status_code(&response);
         // gRPCエンドポイントが存在する場合は200が返される
         assert_eq!(
             status, Some(200),
@@ -2779,7 +2779,7 @@ async fn test_grpc_server_streaming() {
     // Server Streaming RPCのテスト
     // 単一のリクエストメッセージを送信し、複数のレスポンスメッセージを受信
     let request_message = b"Start streaming";
-    let response = match GrpcTestClientV2::send_grpc_request(
+    let response = match GrpcTestClient::send_grpc_request(
         "127.0.0.1",
         PROXY_PORT,
         "/grpc.test.v1.TestService/ServerStreaming",
@@ -2792,7 +2792,7 @@ async fn test_grpc_server_streaming() {
         }
     };
     
-    let status = GrpcTestClientV2::extract_status_code(&response);
+    let status = GrpcTestClient::extract_status_code(&response);
     // gRPCエンドポイントが存在する場合は200が返される
     assert_eq!(
         status, Some(200),
@@ -2813,7 +2813,7 @@ async fn test_grpc_bidirectional_streaming() {
     // 複数のメッセージを送信（非同期版）
     for i in 0..3 {
         let message = format!("Bidirectional message {}", i).into_bytes();
-        let response = match GrpcTestClientV2::send_grpc_request(
+        let response = match GrpcTestClient::send_grpc_request(
             "127.0.0.1",
             PROXY_PORT,
             "/grpc.test.v1.TestService/BidirectionalStreaming",
@@ -2826,7 +2826,7 @@ async fn test_grpc_bidirectional_streaming() {
             }
         };
         
-        let status = GrpcTestClientV2::extract_status_code(&response);
+        let status = GrpcTestClient::extract_status_code(&response);
         assert_eq!(
             status, Some(200),
             "Should return 200 OK for gRPC request, got: {:?}", status
@@ -2843,7 +2843,7 @@ async fn test_grpc_timeout_header() {
     }
     
     // grpc-timeoutヘッダーを指定してリクエストを送信（非同期版）
-    let response = match GrpcTestClientV2::send_grpc_request(
+    let response = match GrpcTestClient::send_grpc_request(
         "127.0.0.1",
         PROXY_PORT,
         "/grpc.test.v1.TestService/Test",
@@ -2856,7 +2856,7 @@ async fn test_grpc_timeout_header() {
         }
     };
     
-        let status = GrpcTestClientV2::extract_status_code(&response);
+        let status = GrpcTestClient::extract_status_code(&response);
         assert_eq!(
             status, Some(200),
             "Should return 200 OK for gRPC request, got: {:?}", status
@@ -2872,7 +2872,7 @@ async fn test_grpc_encoding_header() {
     }
     
     // grpc-encodingヘッダーを指定してリクエストを送信（非同期版）
-    let response = match GrpcTestClientV2::send_grpc_request(
+    let response = match GrpcTestClient::send_grpc_request(
         "127.0.0.1",
         PROXY_PORT,
         "/grpc.test.v1.TestService/Test",
@@ -2885,7 +2885,7 @@ async fn test_grpc_encoding_header() {
         }
     };
     
-        let status = GrpcTestClientV2::extract_status_code(&response);
+        let status = GrpcTestClient::extract_status_code(&response);
         assert_eq!(
             status, Some(200),
             "Should return 200 OK for gRPC request, got: {:?}", status
@@ -2901,7 +2901,7 @@ async fn test_grpc_accept_encoding_header() {
     }
     
     // grpc-accept-encodingヘッダーを指定してリクエストを送信（非同期版）
-    let response = match GrpcTestClientV2::send_grpc_request(
+    let response = match GrpcTestClient::send_grpc_request(
         "127.0.0.1",
         PROXY_PORT,
         "/grpc.test.v1.TestService/Test",
@@ -2914,7 +2914,7 @@ async fn test_grpc_accept_encoding_header() {
         }
     };
     
-        let status = GrpcTestClientV2::extract_status_code(&response);
+        let status = GrpcTestClient::extract_status_code(&response);
         assert_eq!(
             status, Some(200),
             "Should return 200 OK for gRPC request, got: {:?}", status
@@ -2930,7 +2930,7 @@ async fn test_grpc_metadata() {
     }
     
     // カスタムメタデータを指定してリクエストを送信（非同期版）
-    let response = match GrpcTestClientV2::send_grpc_request(
+    let response = match GrpcTestClient::send_grpc_request(
         "127.0.0.1",
         PROXY_PORT,
         "/grpc.test.v1.TestService/Test",
@@ -2946,7 +2946,7 @@ async fn test_grpc_metadata() {
         }
     };
     
-        let status = GrpcTestClientV2::extract_status_code(&response);
+        let status = GrpcTestClient::extract_status_code(&response);
         assert_eq!(
             status, Some(200),
             "Should return 200 OK for gRPC request, got: {:?}", status
@@ -2964,7 +2964,7 @@ async fn test_grpc_gzip_compression() {
     // gzip圧縮のテスト（簡易実装、非同期版）
     // 実際の圧縮テストには、gzip圧縮されたメッセージの送受信が必要
     // grpc-encodingヘッダーでgzipを指定
-    let response = match GrpcTestClientV2::send_grpc_request(
+    let response = match GrpcTestClient::send_grpc_request(
         "127.0.0.1",
         PROXY_PORT,
         "/grpc.test.v1.TestService/Test",
@@ -2977,7 +2977,7 @@ async fn test_grpc_gzip_compression() {
         }
     };
     
-        let status = GrpcTestClientV2::extract_status_code(&response);
+        let status = GrpcTestClient::extract_status_code(&response);
         assert_eq!(
             status, Some(200),
             "Should return 200 OK for gRPC request, got: {:?}", status
@@ -3030,7 +3030,7 @@ async fn test_grpc_proxy_forwarding() {
     }
     
     // gRPCプロキシ転送のテスト（非同期版）
-    let response = match GrpcTestClientV2::send_grpc_request(
+    let response = match GrpcTestClient::send_grpc_request(
         "127.0.0.1",
         PROXY_PORT,
         "/grpc.test.v1.TestService/Test",
@@ -3043,7 +3043,7 @@ async fn test_grpc_proxy_forwarding() {
         }
     };
     
-    let status = GrpcTestClientV2::extract_status_code(&response);
+    let status = GrpcTestClient::extract_status_code(&response);
     // プロキシが正常に動作している場合、200が返される
     assert_eq!(
         status, Some(200),
@@ -3062,7 +3062,7 @@ async fn test_grpc_invalid_frame() {
     // 不正なgRPCフレームのテスト（非同期版）
     // 不正なフレームヘッダーを送信
     let invalid_frame = b"\xFF\xFF\xFF\xFF\xFF";
-    let response = match GrpcTestClientV2::send_grpc_request(
+    let response = match GrpcTestClient::send_grpc_request(
         "127.0.0.1",
         PROXY_PORT,
         "/grpc.test.v1.TestService/Test",
@@ -3075,7 +3075,7 @@ async fn test_grpc_invalid_frame() {
         }
     };
     
-    let status = GrpcTestClientV2::extract_status_code(&response);
+    let status = GrpcTestClient::extract_status_code(&response);
     // 不正なフレームの場合、400 Bad Requestが返される
     assert_eq!(
         status, Some(400),
@@ -3083,7 +3083,7 @@ async fn test_grpc_invalid_frame() {
     );
     
     // gRPCステータスコードの検証
-    let grpc_status = GrpcTestClientV2::extract_grpc_status(&response);
+    let grpc_status = GrpcTestClient::extract_grpc_status(&response);
     if let Some(grpc_status_code) = grpc_status {
         // 不正なフレームの場合、INVALID_ARGUMENT (3) または INTERNAL (13) が返される可能性がある
         assert!(
@@ -3097,7 +3097,7 @@ async fn test_grpc_invalid_frame() {
     }
     
     // トレーラーヘッダーの検証
-    let trailers = GrpcTestClientV2::extract_trailers(&response);
+    let trailers = GrpcTestClient::extract_trailers(&response);
     let has_grpc_status = trailers.iter().any(|(name, _)| name == "grpc-status");
     if has_grpc_status {
         eprintln!("gRPC trailers found: {:?}", trailers);
@@ -3117,7 +3117,7 @@ async fn test_grpc_oversized_message() {
     // メッセージサイズ超過のテスト（非同期版）
     // 4MBを超えるメッセージを送信（簡易実装では1MB程度）
     let large_message = vec![0u8; 1024 * 1024]; // 1MB
-    let response = match GrpcTestClientV2::send_grpc_request(
+    let response = match GrpcTestClient::send_grpc_request(
         "127.0.0.1",
         PROXY_PORT,
         "/grpc.test.v1.TestService/Test",
@@ -3130,7 +3130,7 @@ async fn test_grpc_oversized_message() {
         }
     };
     
-    let status = GrpcTestClientV2::extract_status_code(&response);
+    let status = GrpcTestClient::extract_status_code(&response);
     // メッセージサイズ超過の場合、413 Payload Too Largeが返される
     assert_eq!(
         status, Some(413),
@@ -4373,7 +4373,7 @@ async fn test_grpc_status_code() {
     }
     
     // gRPCリクエストを送信（非同期版）
-    let response = match GrpcTestClientV2::send_grpc_request(
+    let response = match GrpcTestClient::send_grpc_request(
         "127.0.0.1",
         PROXY_PORT,
         "/grpc.test.v1.TestService/Test",
@@ -4387,7 +4387,7 @@ async fn test_grpc_status_code() {
     };
     
     // gRPCステータスを取得
-    let grpc_status = GrpcTestClientV2::extract_grpc_status(&response);
+    let grpc_status = GrpcTestClient::extract_grpc_status(&response);
     // gRPCステータスは存在しない場合もある（エンドポイントが存在しない場合）
     if grpc_status.is_some() {
         // gRPCステータスコードは0（OK）またはエラーコード
@@ -4395,7 +4395,7 @@ async fn test_grpc_status_code() {
     }
     
     // HTTPステータスコードも確認
-    let http_status = GrpcTestClientV2::extract_status_code(&response);
+    let http_status = GrpcTestClient::extract_status_code(&response);
     assert!(
         http_status == Some(200) || http_status == Some(404) || http_status == Some(502),
         "Should return 200, 404, or 502: {:?}", http_status
@@ -4525,7 +4525,7 @@ async fn test_grpc_proxy_load_balancing() {
     let mut responses = Vec::new();
     for _ in 0..10 {
         // gRPCリクエストを送信（非同期版）
-        let response = match GrpcTestClientV2::send_grpc_request(
+        let response = match GrpcTestClient::send_grpc_request(
             "127.0.0.1",
             PROXY_PORT,
             "/grpc.test.v1.TestService/Test",
@@ -4538,7 +4538,7 @@ async fn test_grpc_proxy_load_balancing() {
             }
         };
         
-        let status = GrpcTestClientV2::extract_status_code(&response);
+        let status = GrpcTestClient::extract_status_code(&response);
         responses.push(status);
     }
     
@@ -4560,7 +4560,7 @@ async fn test_grpc_proxy_timeout() {
     // gRPCプロキシタイムアウトのテスト
     // タイムアウト設定を短くしてリクエストを送信
     // gRPCリクエストを送信（非同期版、タイムアウト付き）
-    let response = match GrpcTestClientV2::send_grpc_request(
+    let response = match GrpcTestClient::send_grpc_request(
         "127.0.0.1",
         PROXY_PORT,
         "/grpc.test.v1.TestService/Test",
@@ -4573,7 +4573,7 @@ async fn test_grpc_proxy_timeout() {
         }
     };
     
-    let status = GrpcTestClientV2::extract_status_code(&response);
+    let status = GrpcTestClient::extract_status_code(&response);
     // タイムアウトが発生した場合、504 Gateway Timeoutが返される
     assert_eq!(
         status, Some(504),
@@ -4592,7 +4592,7 @@ async fn test_grpc_proxy_error_handling() {
     // gRPCプロキシエラーハンドリングのテスト
     // 存在しないエンドポイントにリクエストを送信
     // gRPCリクエストを送信（非同期版）
-    let response = match GrpcTestClientV2::send_grpc_request(
+    let response = match GrpcTestClient::send_grpc_request(
         "127.0.0.1",
         PROXY_PORT,
         "/grpc.test.v1.NonExistentService/NonExistentMethod",
@@ -4605,7 +4605,7 @@ async fn test_grpc_proxy_error_handling() {
         }
     };
     
-    let status = GrpcTestClientV2::extract_status_code(&response);
+    let status = GrpcTestClient::extract_status_code(&response);
     // 存在しないエンドポイントの場合、404 Not Foundが返される
     assert_eq!(
         status, Some(404),
@@ -4613,7 +4613,7 @@ async fn test_grpc_proxy_error_handling() {
     );
     
     // gRPCステータスコードの検証
-    let grpc_status = GrpcTestClientV2::extract_grpc_status(&response);
+    let grpc_status = GrpcTestClient::extract_grpc_status(&response);
     if let Some(grpc_status_code) = grpc_status {
         // 存在しないエンドポイントの場合、NOT_FOUND (5) が返される可能性がある
         eprintln!("gRPC status code for non-existent endpoint: {} (expected: NOT_FOUND (5))", grpc_status_code);
@@ -4627,7 +4627,7 @@ async fn test_grpc_proxy_error_handling() {
     }
     
     // トレーラーヘッダーの検証
-    let trailers = GrpcTestClientV2::extract_trailers(&response);
+    let trailers = GrpcTestClient::extract_trailers(&response);
     if !trailers.is_empty() {
         eprintln!("gRPC trailers for non-existent endpoint: {:?}", trailers);
     }
@@ -4644,7 +4644,7 @@ async fn test_grpc_malformed_protobuf() {
     // 不正なProtobufメッセージのテスト
     // 不正なProtobufデータを送信（非同期版）
     let malformed_data = b"\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF";
-    let response = match GrpcTestClientV2::send_grpc_request(
+    let response = match GrpcTestClient::send_grpc_request(
         "127.0.0.1",
         PROXY_PORT,
         "/grpc.test.v1.TestService/Test",
@@ -4657,7 +4657,7 @@ async fn test_grpc_malformed_protobuf() {
         }
     };
     
-    let status = GrpcTestClientV2::extract_status_code(&response);
+    let status = GrpcTestClient::extract_status_code(&response);
     // 不正なProtobufデータの場合、400 Bad Requestが返される
     assert_eq!(
         status, Some(400),
@@ -4665,7 +4665,7 @@ async fn test_grpc_malformed_protobuf() {
     );
     
     // gRPCステータスコードの検証
-    let grpc_status = GrpcTestClientV2::extract_grpc_status(&response);
+    let grpc_status = GrpcTestClient::extract_grpc_status(&response);
     if let Some(grpc_status_code) = grpc_status {
         // 不正なProtobufの場合、INVALID_ARGUMENT (3) または INTERNAL (13) が返される可能性がある
         assert!(
@@ -4679,7 +4679,7 @@ async fn test_grpc_malformed_protobuf() {
     }
     
     // トレーラーヘッダーの検証
-    let trailers = GrpcTestClientV2::extract_trailers(&response);
+    let trailers = GrpcTestClient::extract_trailers(&response);
     let has_grpc_status = trailers.iter().any(|(name, _)| name == "grpc-status");
     if has_grpc_status {
         eprintln!("gRPC trailers for malformed Protobuf: {:?}", trailers);
@@ -4699,7 +4699,7 @@ async fn test_grpc_stream_reset() {
     // gRPCストリームリセットのテスト
     // gRPCクライアントを作成してリクエストを途中でキャンセルする動作をテスト
     // リクエスト送信を試みる（非同期版）
-    let response = match GrpcTestClientV2::send_grpc_request(
+    let response = match GrpcTestClient::send_grpc_request(
         "127.0.0.1",
         PROXY_PORT,
         "/grpc.test.v1.TestService/StreamReset",
@@ -4712,7 +4712,7 @@ async fn test_grpc_stream_reset() {
         }
     };
     
-    let status = GrpcTestClientV2::extract_status_code(&response);
+    let status = GrpcTestClient::extract_status_code(&response);
     // ストリームリセットの場合、404 (エンドポイント不存在) または 502 (バックエンドエラー) が返される可能性がある
     assert!(
         status == Some(404) || status == Some(502) || status == Some(200),
@@ -4720,7 +4720,7 @@ async fn test_grpc_stream_reset() {
     );
     
     // gRPCステータスコードの検証
-    let grpc_status = GrpcTestClientV2::extract_grpc_status(&response);
+    let grpc_status = GrpcTestClient::extract_grpc_status(&response);
     if let Some(grpc_status_code) = grpc_status {
         // ストリームリセットの場合、CANCELLED (1) または NOT_FOUND (5) が返される可能性がある
         eprintln!("gRPC status code for stream reset: {} (expected: CANCELLED (1) or NOT_FOUND (5))", grpc_status_code);
@@ -4734,7 +4734,7 @@ async fn test_grpc_stream_reset() {
     }
     
     // トレーラーヘッダーの検証
-    let trailers = GrpcTestClientV2::extract_trailers(&response);
+    let trailers = GrpcTestClient::extract_trailers(&response);
     if !trailers.is_empty() {
         eprintln!("gRPC trailers for stream reset: {:?}", trailers);
         let has_grpc_status = trailers.iter().any(|(name, _)| name == "grpc-status");
@@ -4754,7 +4754,7 @@ async fn test_grpc_deflate_compression() {
     
     // deflate圧縮のテスト（簡易実装）
     // grpc-encodingヘッダーでdeflateを指定（非同期版）
-    let response = match GrpcTestClientV2::send_grpc_request(
+    let response = match GrpcTestClient::send_grpc_request(
         "127.0.0.1",
         PROXY_PORT,
         "/grpc.test.v1.TestService/Test",
@@ -4767,7 +4767,7 @@ async fn test_grpc_deflate_compression() {
         }
     };
     
-        let status = GrpcTestClientV2::extract_status_code(&response);
+        let status = GrpcTestClient::extract_status_code(&response);
         assert_eq!(
             status, Some(200),
             "Should return 200 OK for gRPC request, got: {:?}", status
@@ -4784,7 +4784,7 @@ async fn test_grpc_compression_negotiation() {
     
     // 圧縮方式のネゴシエーションテスト
     // 複数の圧縮方式をサポートすることを通知（非同期版）
-    let response = match GrpcTestClientV2::send_grpc_request(
+    let response = match GrpcTestClient::send_grpc_request(
         "127.0.0.1",
         PROXY_PORT,
         "/grpc.test.v1.TestService/Test",
@@ -4797,7 +4797,7 @@ async fn test_grpc_compression_negotiation() {
         }
     };
     
-        let status = GrpcTestClientV2::extract_status_code(&response);
+        let status = GrpcTestClient::extract_status_code(&response);
         assert_eq!(
             status, Some(200),
             "Should return 200 OK for gRPC request, got: {:?}", status
@@ -4820,7 +4820,7 @@ async fn test_grpc_trailer_detailed() {
     // 様々なgRPCステータスコードとエラーメッセージの処理を検証
     
     // gRPCリクエストを送信（非同期版）
-    let response = match GrpcTestClientV2::send_grpc_request(
+    let response = match GrpcTestClient::send_grpc_request(
         "127.0.0.1",
         PROXY_PORT,
         "/grpc.test.v1.TestService/Test",
@@ -4834,17 +4834,17 @@ async fn test_grpc_trailer_detailed() {
     };
     
     // HTTPステータスコードを確認
-    let http_status = GrpcTestClientV2::extract_status_code(&response);
+    let http_status = GrpcTestClient::extract_status_code(&response);
     assert!(
         http_status == Some(200) || http_status == Some(404) || http_status == Some(502),
         "Should return 200, 404, or 502: {:?}", http_status
     );
     
     // トレーラーを抽出
-    let trailers = GrpcTestClientV2::extract_trailers(&response);
+    let trailers = GrpcTestClient::extract_trailers(&response);
     
     // grpc-statusの存在を確認（エンドポイントが存在する場合）
-    let grpc_status = GrpcTestClientV2::extract_grpc_status(&response);
+    let grpc_status = GrpcTestClient::extract_grpc_status(&response);
     if grpc_status.is_some() {
         let status_code = grpc_status.unwrap();
         
@@ -4861,7 +4861,7 @@ async fn test_grpc_trailer_detailed() {
         
         // grpc-messageの存在を確認（エラーの場合）
         if status_code != 0 {
-            let grpc_message = GrpcTestClientV2::extract_grpc_message(&response);
+            let grpc_message = GrpcTestClient::extract_grpc_message(&response);
             // エラーの場合、grpc-messageが存在する可能性がある
             if grpc_message.is_some() {
                 let message = grpc_message.unwrap();
@@ -10853,7 +10853,7 @@ async fn test_h2c_grpc_unary_call() {
     // gRPCリクエストをH2Cルート経由で送信
     // gRPCリクエストを送信（H2C経由、非同期版）
     let message = b"test message";
-    let response = match GrpcTestClientV2::send_grpc_request(
+    let response = match GrpcTestClient::send_grpc_request(
         "127.0.0.1",
         PROXY_PORT,
         "/h2c/grpc.test.v1.TestService/UnaryCall",
@@ -10866,7 +10866,7 @@ async fn test_h2c_grpc_unary_call() {
         }
     };
     
-    let status = GrpcTestClientV2::extract_status_code(&response);
+    let status = GrpcTestClient::extract_status_code(&response);
     // gRPCリクエストが正常に処理された場合、200 OKが返される
     assert_eq!(
         status, Some(200),
@@ -10886,7 +10886,7 @@ async fn test_h2c_grpc_streaming() {
     // gRPCストリーミングリクエストをH2Cルート経由で送信
     // gRPCストリーミングリクエストを送信（H2C経由、非同期版）
     let message = b"start streaming";
-    let response = match GrpcTestClientV2::send_grpc_request(
+    let response = match GrpcTestClient::send_grpc_request(
         "127.0.0.1",
         PROXY_PORT,
         "/h2c/grpc.test.v1.TestService/ServerStreaming",
@@ -10899,7 +10899,7 @@ async fn test_h2c_grpc_streaming() {
         }
     };
     
-    let status = GrpcTestClientV2::extract_status_code(&response);
+    let status = GrpcTestClient::extract_status_code(&response);
     // gRPCストリーミングが正しく処理された場合、200 OKが返される
     assert_eq!(
         status, Some(200),
