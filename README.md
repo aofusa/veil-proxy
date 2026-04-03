@@ -10,6 +10,10 @@
 
 A high-performance reverse proxy server using io_uring (monoio) and rustls.
 
+## Documentation
+
+- [AGENTS.md](AGENTS.md) — Contributor and AI agent quick reference (workflow, design philosophy, constraints, pointers).
+
 ## Features
 
 ### Core Features
