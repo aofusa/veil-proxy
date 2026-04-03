@@ -865,10 +865,10 @@ run_tests() {
     export RUST_TEST_THREADS="${TEST_THREADS}"
     
     # デバッグ: 実際に実行されるコマンドを確認
-    log_info "Command: cargo test --test e2e_tests -- --test-threads=${TEST_THREADS}"
+    log_info "Command: cargo test --test e2e_tests --features 'ktls,http2,http3,grpc-full,wasm' -- --test-threads=${TEST_THREADS}"
     
     # テスト実行
-    cargo test --test e2e_tests -- --test-threads=${TEST_THREADS}
+    cargo test --test e2e_tests --features 'ktls,http2,http3,grpc-full,wasm' -- --test-threads=${TEST_THREADS}
     
     log_info "E2E tests completed"
 }
