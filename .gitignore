@@ -1,6 +1,10 @@
 /target
 /credential
 
+# ドキュメント用アーティファクト（生成物は追跡しない、ディレクトリ維持用のみ）
+docs/artifacts/*
+!docs/artifacts/.gitkeep
+
 # テスト実行時に作成される一時ファイル
 # E2Eテスト・ベンチマークテスト用の一時ファイル
 tests/fixtures/*.pem
