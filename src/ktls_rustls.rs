@@ -234,11 +234,23 @@ fn raw_write(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
 async fn do_server_handshake(
     stream: &TcpStream,
     conn: &mut ServerConnection,
+    initial_data: &mut Option<Vec<u8>>,
 ) -> io::Result<()> {
     let fd = stream.as_raw_fd();
     let mut read_buf = vec![0u8; 16384];
 
     while conn.is_handshaking() {
+        // 先行読み取りデータがあれば先に処理
+        if let Some(data) = initial_data.take() {
+            if !data.is_empty() {
+                conn.read_tls(&mut &data[..])?;
+                conn.process_new_packets()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                // データの処理後にハンドシェイクが終わる可能性があるため、ループの先頭に戻る
+                continue;
+            }
+        }
+
         // 書き込みが必要な場合
         while conn.wants_write() {
             let mut write_buf = Vec::new();
@@ -589,12 +601,13 @@ pub async fn accept(
     enable_ktls: bool,
     allow_fallback: bool,
     tcp_cork_enabled: bool,
+    mut initial_data: Option<Vec<u8>>,
 ) -> io::Result<KtlsServerStream> {
     let mut conn = ServerConnection::new(config)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     // ハンドシェイクを実行
-    do_server_handshake(&stream, &mut conn).await?;
+    do_server_handshake(&stream, &mut conn, &mut initial_data).await?;
     
     // ALPN 情報をキャッシュ（kTLS 有効化後も参照できるように）
     let alpn_protocol = conn.alpn_protocol().map(|p| p.to_vec());
@@ -1316,8 +1329,8 @@ impl RustlsAcceptor {
     }
 
     /// TLS ハンドシェイクを実行
-    pub async fn accept(&self, stream: TcpStream) -> io::Result<KtlsServerStream> {
-        accept(stream, self.config.clone(), self.enable_ktls, self.allow_fallback, self.tcp_cork_enabled).await
+    pub async fn accept(&self, stream: TcpStream, initial_data: Option<Vec<u8>>) -> io::Result<KtlsServerStream> {
+        accept(stream, self.config.clone(), self.enable_ktls, self.allow_fallback, self.tcp_cork_enabled, initial_data).await
     }
 }
 

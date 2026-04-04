@@ -172,7 +172,7 @@ pub mod grpc;
 
 use httparse::{Request, Status};
 use monoio::fs::OpenOptions;
-use monoio::buf::{IoBuf, IoBufMut};
+use monoio::buf::{IoBuf, IoBufMut, IoVecBuf, IoVecBufMut};
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::{TcpListener, TcpStream};
 use monoio::RuntimeBuilder;
@@ -187,7 +187,7 @@ use std::io;
 use std::io::BufReader;
 use std::net::SocketAddr;
 #[cfg(target_os = "linux")]
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -10488,6 +10488,87 @@ enum ProtocolType {
     Unknown,  // 不明
 }
 
+/// プロトコル判別で読み取った初期データを保持し、
+/// 以降の読み取りでそのデータを優先して返すラッパーストリーム。
+/// これにより、TLSハンドシェイク等の後続処理でデータ欠落を防ぐ。
+pub struct BufferedStream<S> {
+    inner: S,
+    buffer: Option<Vec<u8>>,
+    pos: usize,
+}
+
+impl<S> BufferedStream<S> {
+    pub fn new(inner: S, initial_data: Vec<u8>) -> Self {
+        let buffer = if initial_data.is_empty() {
+            None
+        } else {
+            Some(initial_data)
+        };
+        BufferedStream {
+            inner,
+            buffer,
+            pos: 0,
+        }
+    }
+}
+
+impl<S: AsRawFd> AsRawFd for BufferedStream<S> {
+    fn as_raw_fd(&self) -> RawFd {
+        self.inner.as_raw_fd()
+    }
+}
+
+impl<S: AsyncReadRent + Unpin> AsyncReadRent for BufferedStream<S> {
+    async fn read<T: IoBufMut>(&mut self, mut buf: T) -> monoio::BufResult<usize, T> {
+        if let Some(ref b) = self.buffer {
+            let remaining = b.len() - self.pos;
+            let to_copy = std::cmp::min(remaining, buf.bytes_total());
+            
+            unsafe {
+                let slice = std::slice::from_raw_parts_mut(buf.write_ptr(), buf.bytes_total());
+                slice[..to_copy].copy_from_slice(&b[self.pos..self.pos + to_copy]);
+                buf.set_init(to_copy);
+            }
+            
+            self.pos += to_copy;
+            if self.pos >= b.len() {
+                self.buffer = None;
+            }
+            
+            return (Ok(to_copy), buf);
+        }
+        
+        self.inner.read(buf).await
+    }
+
+    async fn readv<T: IoVecBufMut>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
+        // 現在の実装では readv は使用しないため、バッファがある場合は未サポート
+        if self.buffer.is_some() {
+            return (Err(io::Error::new(io::ErrorKind::Other, "readv not supported for BufferedStream with data")), buf);
+        }
+        self.inner.readv(buf).await
+    }
+}
+
+impl<S: monoio::io::AsyncWriteRent + Unpin> monoio::io::AsyncWriteRent for BufferedStream<S> {
+    async fn write<T: IoBuf>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
+        self.inner.write(buf).await
+    }
+
+    async fn writev<T: IoVecBuf>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
+        self.inner.writev(buf).await
+    }
+
+    async fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush().await
+    }
+
+    async fn shutdown(&mut self) -> io::Result<()> {
+        self.inner.shutdown().await
+    }
+}
+
+
 /// プロトコル検出とバッファ管理
 /// 
 /// 最初の数バイトを読み込んでプロトコルを判別します。
@@ -10635,17 +10716,21 @@ async fn handle_connection(
     acceptor: RustlsAcceptor,
     peer_addr: SocketAddr,
 ) {
+    let mut initial_buffer = None;
+
     // H2Cが有効な場合、プロトコル検出を実行
     #[cfg(feature = "http2")]
     {
         let config = CURRENT_CONFIG.load();
         if config.h2c_enabled {
             let (protocol_type, initial_data) = detect_protocol_with_buffer(&mut stream).await;
+            initial_buffer = Some(initial_data);
+
             
             match protocol_type {
                 ProtocolType::H2C => {
                     // H2Cサーバーハンドラー
-                    handle_h2c_connection(stream, &peer_addr.ip().to_string(), initial_data).await;
+                    handle_h2c_connection(stream, &peer_addr.ip().to_string(), initial_buffer.take().unwrap()).await;
                     return;
                 }
                 ProtocolType::TLS => {
@@ -10676,7 +10761,7 @@ async fn handle_connection(
     
     // TLSハンドシェイクにタイムアウトを設定
     // rustls でハンドシェイク後、ktls2 で kTLS を有効化
-    let tls_result = timeout(CONNECT_TIMEOUT, acceptor.accept(stream)).await;
+    let tls_result = timeout(CONNECT_TIMEOUT, acceptor.accept(stream, initial_buffer)).await;
     
     let tls_stream = match tls_result {
         Ok(Ok(tls)) => tls,
@@ -10711,17 +10796,21 @@ async fn handle_connection(
     acceptor: simple_tls::SimpleTlsAcceptor,
     peer_addr: SocketAddr,
 ) {
+    let mut initial_buffer = None;
+
     // H2Cが有効な場合、プロトコル検出を実行
     #[cfg(feature = "http2")]
     {
         let config = CURRENT_CONFIG.load();
         if config.h2c_enabled {
             let (protocol_type, initial_data) = detect_protocol_with_buffer(&mut stream).await;
+            initial_buffer = Some(initial_data);
+
             
             match protocol_type {
                 ProtocolType::H2C => {
                     // H2Cサーバーハンドラー
-                    handle_h2c_connection(stream, &peer_addr.ip().to_string(), initial_data).await;
+                    handle_h2c_connection(stream, &peer_addr.ip().to_string(), initial_buffer.take().unwrap()).await;
                     return;
                 }
                 ProtocolType::TLS => {
@@ -10751,7 +10840,7 @@ async fn handle_connection(
     };
     
     // TLSハンドシェイクにタイムアウトを設定
-    let tls_result = timeout(CONNECT_TIMEOUT, acceptor.accept(stream)).await;
+    let tls_result = timeout(CONNECT_TIMEOUT, acceptor.accept(stream, initial_buffer)).await;
     
     let tls_stream = match tls_result {
         Ok(Ok(tls)) => tls,
