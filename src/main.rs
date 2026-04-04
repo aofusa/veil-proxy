@@ -2834,16 +2834,19 @@ fn check_rate_limit(client_ip: &str, limit: u64) -> bool {
 #[cfg(feature = "ktls")]
 thread_local! {
     static TLS_CONNECTOR: RustlsConnector = {
-        // kTLSフィーチャーが有効な場合はシークレット抽出を有効化
-        // 設定ファイルの ktls_fallback_enabled, tcp_cork_enabled を読み込み
+        // 設定ファイルから kTLS 有効化、ktls_fallback_enabled, tcp_cork_enabled を読み込み
         let config_guard = CURRENT_CONFIG.load();
+        let ktls_enabled = config_guard.ktls_config.enabled;
         let fallback_enabled = config_guard.ktls_config.fallback_enabled;
         let tcp_cork_enabled = config_guard.ktls_config.tcp_cork_enabled;
-        let config = ktls_rustls::client_config(true);
+        
+        // kTLS が有効な場合のみシークレット抽出を有効化した設定を使用
+        let config = ktls_rustls::client_config(ktls_enabled);
+        
         RustlsConnector::new(config)
-            .with_ktls(true)        // kTLSを有効化
-            .with_fallback(fallback_enabled)    // kTLS失敗時のフォールバック設定
-            .with_tcp_cork(tcp_cork_enabled)    // TCP_CORK設定
+            .with_ktls(ktls_enabled)        // 設定に基づいて kTLS を有効化
+            .with_fallback(fallback_enabled)    // kTLS 失敗時のフォールバック設定
+            .with_tcp_cork(tcp_cork_enabled)    // TCP_CORK 設定
     };
 }
 
@@ -2852,13 +2855,16 @@ thread_local! {
 thread_local! {
     static TLS_CONNECTOR_INSECURE: RustlsConnector = {
         // 証明書検証をスキップするクライアント設定
-        // 設定ファイルの ktls_fallback_enabled, tcp_cork_enabled を読み込み
+        // 設定ファイルから kTLS 有効化、ktls_fallback_enabled, tcp_cork_enabled を読み込み
         let config_guard = CURRENT_CONFIG.load();
+        let ktls_enabled = config_guard.ktls_config.enabled;
         let fallback_enabled = config_guard.ktls_config.fallback_enabled;
         let tcp_cork_enabled = config_guard.ktls_config.tcp_cork_enabled;
+        
         let config = ktls_rustls::insecure_client_config();
+        
         RustlsConnector::new(config)
-            .with_ktls(true)
+            .with_ktls(ktls_enabled)
             .with_fallback(fallback_enabled)
             .with_tcp_cork(tcp_cork_enabled)
     };
@@ -10502,71 +10508,82 @@ async fn detect_protocol_with_buffer(
     
     // 最大24バイト（HTTP/2プリフェース長）を読み込む
     // タイムアウトを設定して、無応答接続を検出
-    let peek_buf = vec![0u8; 24];
-    let read_result = timeout(Duration::from_millis(1000), stream.read(peek_buf)).await;
+    let mut accumulated = Vec::with_capacity(24);
+    let start_time = std::time::Instant::now();
+    let timeout_duration = Duration::from_millis(1000);
     
-    let (result, returned_buf) = match read_result {
-        Ok(r) => r,
-        Err(_) => {
-            // タイムアウト: プロトコル検出に失敗
-            debug!("[Protocol Detection] Timeout while reading initial bytes");
-            return (ProtocolType::Unknown, Vec::new());
+    while accumulated.len() < 24 {
+        let remaining_timeout = match timeout_duration.checked_sub(start_time.elapsed()) {
+            Some(d) if d.as_millis() > 0 => d,
+            _ => break,
+        };
+        
+        let peek_buf = vec![0u8; 24 - accumulated.len()];
+        let read_result = timeout(remaining_timeout, stream.read(peek_buf)).await;
+        
+        let (result, returned_buf) = match read_result {
+            Ok(r) => r,
+            Err(_) => break, // タイムアウト
+        };
+        
+        match result {
+            Ok(0) => break, // 接続終了
+            Ok(n) => {
+                accumulated.extend_from_slice(&returned_buf[..n]);
+            }
+            Err(_) => break, // エラー
         }
-    };
+        
+        // TLS 検出に必要な 5 バイトが溜まった時点でチェック（早期脱出）
+        if accumulated.len() >= 5 {
+            if accumulated[0] == 0x16 && accumulated[1] == 0x03 && (accumulated[2] >= 0x01 && accumulated[2] <= 0x03) {
+                return (ProtocolType::TLS, accumulated);
+            }
+        }
+        
+        // HTTP/1.1 検出に必要な最低限のバイト数が溜まった時点でチェック（早期脱出）
+        // GET / (5 bytes), POST (5 bytes) 等
+        if accumulated.len() >= 5 {
+            let methods = [b"GET ", b"POST", b"PUT ", b"DELE", b"HEAD", b"OPTI", b"CONN", b"TRAC", b"PATC"];
+            for method in &methods {
+                if accumulated.starts_with(*method) {
+                    return (ProtocolType::Http11, accumulated);
+                }
+            }
+        }
+    }
     
-    let (n, data) = match result {
-        Ok(n) if n > 0 => {
-            let data = returned_buf[..n].to_vec();
-            (n, data)
-        }
-        Ok(0) => {
-            // 接続が閉じられた
-            debug!("[Protocol Detection] Connection closed before protocol detection");
-            return (ProtocolType::Unknown, Vec::new());
-        }
-        Err(e) => {
-            // 読み込みエラー
-            debug!("[Protocol Detection] Read error: {}", e);
-            return (ProtocolType::Unknown, Vec::new());
-        }
-        _ => return (ProtocolType::Unknown, Vec::new()),
-    };
+    let n = accumulated.len();
     
     // HTTP/2プリフェース検出（24バイト固定）
     if n >= 24 {
-        if &data[..24] == b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" {
+        if &accumulated[..24] == b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" {
             debug!("[Protocol Detection] H2C (HTTP/2 Cleartext) detected");
-            return (ProtocolType::H2C, data);
+            return (ProtocolType::H2C, accumulated);
         }
     }
     
-    // TLS ClientHello検出
-    // TLSレコード: [ContentType(1)][Version(2)][Length(2)][Handshake...]
-    // ContentType = Handshake (0x16)
-    // Version = TLS 1.0-1.3 (0x03XX)
+    // 溜まったデータで再度チェック（TLS/HTTP1.1 も念のため）
     if n >= 5 {
-        if data[0] == 0x16 && data[1] == 0x03 && (data[2] >= 0x01 && data[2] <= 0x03) {
+        if accumulated[0] == 0x16 && accumulated[1] == 0x03 && (accumulated[2] >= 0x01 && accumulated[2] <= 0x03) {
             debug!("[Protocol Detection] TLS detected");
-            return (ProtocolType::TLS, data);
+            return (ProtocolType::TLS, accumulated);
+        }
+        
+        let methods = [b"GET ", b"POST", b"PUT ", b"DELE", b"HEAD", b"OPTI", b"CONN", b"TRAC", b"PATC"];
+        for method in &methods {
+            if accumulated.starts_with(*method) {
+                debug!("[Protocol Detection] HTTP/1.1 detected");
+                return (ProtocolType::Http11, accumulated);
+            }
         }
     }
     
-    // HTTP/1.1リクエスト検出
-    // GET, POST, PUT, DELETE, HEAD, OPTIONS, PATCH
-    if n >= 3 {
-        let method = &data[..3.min(n)];
-        if method == b"GET" || method == b"POS" || method == b"PUT" 
-            || method == b"DEL" || method == b"HEA" || method == b"OPT" 
-            || method == b"PAT" {
-            debug!("[Protocol Detection] HTTP/1.1 detected (method: {:?})", method);
-            return (ProtocolType::Http11, data);
-        }
+    if n > 0 {
+        debug!("[Protocol Detection] Unknown protocol ({} bytes): {:?}", n, String::from_utf8_lossy(&accumulated));
     }
     
-    // 不明なプロトコル
-    debug!("[Protocol Detection] Unknown protocol (first {} bytes: {:?})", n, 
-           if n <= 10 { format!("{:?}", &data[..n]) } else { format!("{:?}...", &data[..10]) });
-    (ProtocolType::Unknown, data)
+    (ProtocolType::Unknown, accumulated)
 }
 
 /// H2Cサーバー接続処理

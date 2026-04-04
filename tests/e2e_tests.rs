@@ -105,8 +105,7 @@ async fn is_e2e_environment_ready() -> bool {
 fn init_crypto_provider() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
-        CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
-            .expect("Failed to install rustls crypto provider");
+        let _ = CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider());
     });
 }
 
@@ -211,45 +210,39 @@ async fn send_request_with_method(
         }
     };
     
-    // メソッドに応じてリクエストを送信
-    let (status, body_bytes) = match method {
-        "GET" => match client.get_with_headers(path, headers).await {
-            Ok(result) => result,
-            Err(e) => {
-                eprintln!("[send_request] GET request failed: {}", e);
-                return None;
-            }
-        },
-        "POST" => match client.post_with_headers(path, headers, body.unwrap_or(&[])).await {
-            Ok(result) => result,
-            Err(e) => {
-                eprintln!("[send_request] POST request failed: {}", e);
-                return None;
-            }
-        },
-        _ => {
-            let method_enum = match Method::from_bytes(method.as_bytes()) {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("[send_request] Invalid HTTP method: {}", e);
-                    return None;
-                }
-            };
-            match client.send_request(method_enum, path, headers, body).await {
-                Ok(result) => result,
-                Err(e) => {
-                    eprintln!("[send_request] Request failed: {}", e);
-                    return None;
-                }
-            }
+    // メソッドの変換
+    let method_enum = match Method::from_bytes(method.as_bytes()) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("[send_request] Invalid HTTP method: {}", e);
+            return None;
         }
     };
     
-    // レスポンスを文字列に変換
-    let response_body = String::from_utf8_lossy(&body_bytes).to_string();
-    
-    // HTTPステータス行を追加（既存のテストロジックとの互換性のため）
-    Some(format!("HTTP/1.1 {} OK\r\n\r\n{}", status, response_body))
+    // レスポンスヘッダーも含めて取得するように修正
+    match client.send_request_with_response_headers(method_enum, path, headers, body).await {
+        Ok((status, resp_headers, body_bytes)) => {
+            let response_body = String::from_utf8_lossy(&body_bytes).to_string();
+            
+            // ステータス行
+            let mut full_response = format!("HTTP/1.1 {} OK\r\n", status);
+            
+            // ヘッダーを追加
+            for (name, value) in resp_headers {
+                full_response.push_str(&format!("{}: {}\r\n", name, value));
+            }
+            
+            // ヘッダーとボディの間の空行
+            full_response.push_str("\r\n");
+            full_response.push_str(&response_body);
+            
+            Some(full_response)
+        }
+        Err(e) => {
+            eprintln!("[send_request] Request failed: {}", e);
+            None
+        }
+    }
 }
     
 
