@@ -2000,6 +2000,7 @@ impl CompressionConfig {
         // 4. Content-Type確認
         if let Some(ct) = content_type {
             let ct_str = std::str::from_utf8(ct).unwrap_or("");
+            info!("[Compression] Checking Content-Type: '{}'", ct_str);
             
             // スキップ対象をチェック
             for skip in &self.skip_types {
@@ -2022,9 +2023,13 @@ impl CompressionConfig {
         
         // 5. サイズ確認
         if let Some(len) = content_length {
+            info!("[Compression] Checking Content-Length: {} (min_size: {})", len, self.min_size);
             if len < self.min_size {
+                info!("[Compression] Content-Length is too small, skipping");
                 return None;
             }
+        } else {
+            info!("[Compression] Content-Length is missing, proceeding anyway");
         }
         
         // 6. クライアントがサポートし、かつ設定で許可されている圧縮方式を選択
@@ -11212,13 +11217,13 @@ async fn handle_requests(
                     return;
                 }
                 
-                // HTTP/1.1 100 Continue レスポンス (RFC 7231 Section 5.1.1)
+                let path_str = std::str::from_utf8(&path_bytes).unwrap_or("/");
+                
                 // Expect: 100-continue ヘッダーがある場合、ボディ送信前に 100 Continue を返す
                 if content_length > 0 && check_expect_continue(&headers_for_proxy) {
                     // ボディサイズが制限内であることを確認済みなので 100 Continue を送信
                     let write_result = timeout(WRITE_TIMEOUT, tls_stream.write_all(HTTP_100_CONTINUE.to_vec())).await;
                     if let Err(_) | Ok((Err(_), _)) = write_result {
-                        // 100 Continue 送信に失敗した場合は接続を閉じる
                         return;
                     }
                 }
@@ -11230,7 +11235,6 @@ async fn handle_requests(
                     let prom_config = &config.prometheus_config;
                     
                     // パスとメソッドをチェック
-                    let path_str = std::str::from_utf8(&path_bytes).unwrap_or("/");
                     if prom_config.enabled 
                         && path_str == prom_config.path 
                         && method_bytes.as_ref() == b"GET" 
@@ -11953,7 +11957,10 @@ pub fn find_backend_unified(
     // CURRENT_CONFIG から OptimizedRouter を取得
     let config = CURRENT_CONFIG.load();
     let optimized_router = &config.optimized_router;
-    
+    let host_str = std::str::from_utf8(host).unwrap_or("");
+    let path_str = std::str::from_utf8(path).unwrap_or("");
+    info!("[Routing] Finding backend for host='{}' path='{}'", host_str, path_str);
+
     // Phase 4: キャッシュチェック
     let cache_key = routing::RouteCacheKey::new(host, path, method, source_ip);
     if let Some(cached_result) = optimized_router.try_cache(&cache_key) {
@@ -15035,6 +15042,7 @@ async fn transfer_response_with_compression(
             if let Some(encoding) = should_compress {
                 // 圧縮有効: ヘッダーを書き換えて圧縮転送
                 // 注意: 圧縮時はキャッシュ保存をスキップ（圧縮後のデータをキャッシュするには追加実装が必要）
+                info!("[Compression] Initializing compressed transfer with {:?}", encoding);
                 let result = transfer_compressed_response(
                     client_stream,
                     backend_stream,

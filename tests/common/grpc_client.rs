@@ -11,6 +11,10 @@ use http::uri::Uri;
 use bytes::Bytes;
 use std::sync::Arc;
 use super::http1_client::Http1TestClient;
+use rustls::client::danger::{ServerCertVerifier, ServerCertVerified, HandshakeSignatureValid};
+use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+use rustls::crypto::CryptoProvider;
+use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 
 /// gRPCテストクライアント
 /// tonicを使用したHTTP/2ベースのgRPCクライアント
@@ -80,9 +84,72 @@ impl GrpcTestClient {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let uri: Uri = format!("https://{}:{}", server_addr, port).parse()?;
         
-        // TLS設定（証明書検証なし - テスト用）
-        let tls_config = ClientTlsConfig::new()
-            .domain_name(server_addr);
+        // CryptoProviderの初期化
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let _ = CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider());
+        });
+
+        // 証明書検証をスキップするカスタム検証器
+        #[derive(Debug)]
+        struct SkipServerVerification;
+
+        impl ServerCertVerifier for SkipServerVerification {
+            fn verify_server_cert(
+                &self,
+                _end_entity: &CertificateDer<'_>,
+                _intermediates: &[CertificateDer<'_>],
+                _server_name: &ServerName<'_>,
+                _ocsp: &[u8],
+                _now: UnixTime,
+            ) -> Result<ServerCertVerified, rustls::Error> {
+                Ok(ServerCertVerified::assertion())
+            }
+
+            fn verify_tls12_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, rustls::Error> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+
+            fn verify_tls13_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, rustls::Error> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+
+            fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+                rustls::crypto::aws_lc_rs::default_provider()
+                    .signature_verification_algorithms
+                    .supported_schemes()
+                    .to_vec()
+            }
+        }
+
+        let rustls_config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+            .with_no_client_auth();
+
+        // TLS設定（テスト用証明書を使用）
+        let cert_path = std::path::Path::new("tests/fixtures/cert.pem");
+        let tls_config = if cert_path.exists() {
+            let pem = std::fs::read_to_string(cert_path)?;
+            let cert = tonic::transport::Certificate::from_pem(pem);
+            ClientTlsConfig::new()
+                .ca_certificate(cert)
+                .domain_name(server_addr)
+        } else {
+            // 証明書がない場合はデフォルト（検証失敗する可能性あり）
+            ClientTlsConfig::new()
+                .domain_name(server_addr)
+        };
         
         let endpoint = Endpoint::from(uri)
             .tls_config(tls_config)?

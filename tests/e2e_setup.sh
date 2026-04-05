@@ -286,7 +286,7 @@ key_path = "${FIXTURES_DIR}/key.pem"
 ktls_enabled = false
 
 [logging]
-level = "debug"
+level = "trace"
 
 [prometheus]
 enabled = true
@@ -325,50 +325,10 @@ unhealthy_threshold = 3
 EOF
     fi
     
-    # ルート設定
-    cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
+    # (Generic /* moved to the end)
 
-[[route]]
-[route.conditions]
-host = "localhost"
-path = "/*"
-[route.action]
-type = "Proxy"
-upstream = "backend-pool"
-[route.security]
-add_response_headers = { "X-Proxied-By" = "veil", "X-Test-Header" = "e2e-test" }
-remove_response_headers = ["Server"]
-[route.compression]
-enabled = true
-preferred_encodings = ["zstd", "br", "gzip"]
-min_size = 1024
-EOF
-
-    # キャッシュ設定を追加（デフォルトでも有効化、cacheタイプの場合は詳細設定）
-    if [ "$config_type" = "cache" ] || [ "$config_type" = "default" ]; then
-        cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
-[route.cache]
-enabled = true
-max_memory_size = 10485760
-default_ttl_secs = 60
-methods = ["GET", "HEAD"]
-cacheable_statuses = [200, 301, 302, 304]
-stale_while_revalidate = true
-stale_if_error = true
-respect_vary = true
-enable_etag = true
-EOF
-    fi
-    
-    # バッファリング設定を追加（デフォルトでも有効化、bufferingタイプの場合は詳細設定）
-    if [ "$config_type" = "buffering" ] || [ "$config_type" = "default" ]; then
-        cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
-[route.buffering]
-mode = "adaptive"
-max_memory_buffer = 10485760
-adaptive_threshold = 1048576
-EOF
-    fi
+    # NOTE: Global [route.cache] and [route.buffering] are removed to avoid TOML duplicate key error.
+    # Specific route settings below will handle them.
     
     # バッファリングモード別のルート設定（streaming, full, adaptive）
     if [ "$config_type" = "buffering" ] || [ "$config_type" = "default" ]; then
@@ -409,15 +369,7 @@ cacheable_statuses = [200]
 EOF
     fi
     
-    # セキュリティ設定を追加（レート制限、IP制限）
-    if [ "$config_type" = "security" ]; then
-        cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
-[route.security]
-rate_limit_requests_per_min = 30
-allowed_ips = ["127.0.0.1", "::1"]
-EOF
-    fi
-    
+
     # gRPC/H2C ルート設定 (優先順位を上げるため先に定義)
     cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
 
@@ -444,7 +396,31 @@ use_h2c = true
 [route.security]
 add_response_headers = { "X-Proxied-By" = "veil", "X-H2C-Test" = "true" }
 
-# gRPCルート設定
+# タイムアウトテスト用ルート (存在しないポートへ転送)
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/slow/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:1"
+
+# ディスク溢れテスト用ルート (極めて小さいバッファ制限)
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/disk-spillover/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+[route.buffering]
+mode = "full"
+max_memory_buffer = 1024
+max_disk_buffer = 10
+EOF
+
+    # gRPCルート設定
+    cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
 [[route]]
 [route.conditions]
 host = "localhost"
@@ -466,16 +442,6 @@ upstream = "grpc-pool"
 use_h2c = true
 [route.security]
 add_response_headers = { "X-Proxied-By" = "veil", "X-GRPC-Test" = "true" }
-
-[[route]]
-[route.conditions]
-host = "127.0.0.1"
-path = "/*"
-[route.action]
-type = "Proxy"
-upstream = "backend-pool"
-[route.security]
-add_response_headers = { "X-Proxied-By" = "veil", "X-Test-Header" = "e2e-test" }
 EOF
 
     # WASM設定を追加（wasm設定タイプの時のみ有効化）
@@ -516,6 +482,39 @@ add_response_headers = { "X-Proxied-By" = "veil" }
 EOF
         fi
     fi
+
+    # 汎用ルート (最後に定義して優先順位を下げる)
+    cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+[route.security]
+add_response_headers = { "X-Proxied-By" = "veil", "X-Test-Header" = "e2e-test" }
+remove_response_headers = ["Server"]
+[route.compression]
+enabled = true
+preferred_encodings = ["zstd", "br", "gzip"]
+min_size = 1024
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+[route.security]
+add_response_headers = { "X-Proxied-By" = "veil", "X-Test-Header" = "e2e-test" }
+[route.compression]
+enabled = true
+preferred_encodings = ["zstd", "br", "gzip"]
+min_size = 1024
+EOF
     
     log_info "Configuration files generated (type: ${config_type})"
 }
