@@ -162,12 +162,11 @@ impl Default for HostRouter {
 /// Provides O(k) path matching where k is the path length
 #[derive(Debug)]
 pub struct PathRouter {
-    /// Radix tree router: path pattern -> route indices
     router: matchit::Router<Vec<usize>>,
-    /// Routes without path condition (matches all paths)
-    any_path: Vec<usize>,
-    /// Original patterns for fallback matching
+    /// Fallback patterns for complex matching
     patterns: Vec<(String, usize)>,
+    /// Routes that match any path (empty path or /)
+    any_path: Vec<usize>,
 }
 
 impl PathRouter {
@@ -175,39 +174,28 @@ impl PathRouter {
     pub fn new() -> Self {
         Self {
             router: matchit::Router::new(),
-            any_path: Vec::new(),
             patterns: Vec::new(),
+            any_path: Vec::new(),
         }
     }
 
     /// Add a route with its path condition
+    /// Add a route to the path router
     pub fn add_route(&mut self, route_idx: usize, path_condition: Option<&str>) {
-        match path_condition {
-            None => {
-                // No path condition - matches all paths
-                self.any_path.push(route_idx);
-            }
-            Some(pattern) => {
-                // Store original pattern for fallback
+        if path_condition.is_none() || path_condition == Some("/") {
+            self.any_path.push(route_idx);
+            return;
+        }
+
+        let pattern = path_condition.unwrap();
+        // Skip paths with variable parameters for now in matchit, use fallback
+        if pattern.contains(':') || pattern.contains('{') {
+            self.patterns.push((pattern.to_string(), route_idx));
+        } else {
+            let matchit_pattern = self.convert_pattern(pattern);
+            
+            if let Err(_) = self.router.insert(matchit_pattern.clone(), vec![route_idx]) {
                 self.patterns.push((pattern.to_string(), route_idx));
-                
-                // Convert pattern to matchit format
-                let matchit_pattern = self.convert_pattern(pattern);
-                
-                // Try to insert into router
-                match self.router.at_mut(&matchit_pattern) {
-                    Ok(matched) => {
-                        // Pattern already exists, add to list
-                        matched.value.push(route_idx);
-                    }
-                    Err(_) => {
-                        // New pattern, insert
-                        if self.router.insert(matchit_pattern.clone(), vec![route_idx]).is_err() {
-                            // If insert fails (conflicting patterns), use fallback
-                            // The pattern is already stored in self.patterns
-                        }
-                    }
-                }
             }
         }
     }

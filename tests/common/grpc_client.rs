@@ -163,6 +163,7 @@ impl GrpcTestClient {
         let mut headers = vec![
             ("Content-Type", "application/grpc"),
             ("Accept", "application/grpc"),
+            ("TE", "trailers"),
         ];
         for (name, value) in metadata {
             headers.push((name, value));

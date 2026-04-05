@@ -3565,6 +3565,7 @@ fn init_server_header(enabled: bool, value: &str) {
 struct UpstreamServerEntry {
     url: String,
     sni_name: Option<String>,
+    use_h2c: bool,
 }
 
 impl<'de> serde::Deserialize<'de> for UpstreamServerEntry {
@@ -3591,6 +3592,7 @@ impl<'de> serde::Deserialize<'de> for UpstreamServerEntry {
                 Ok(UpstreamServerEntry {
                     url: v.to_string(),
                     sni_name: None,
+                    use_h2c: false,
                 })
             }
             
@@ -3601,17 +3603,20 @@ impl<'de> serde::Deserialize<'de> for UpstreamServerEntry {
             {
                 let mut url: Option<String> = None;
                 let mut sni_name: Option<String> = None;
+                let mut use_h2c: Option<bool> = None;
                 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
                         "url" => url = Some(map.next_value()?),
                         "sni_name" => sni_name = Some(map.next_value()?),
+                        "use_h2c" | "h2c" => use_h2c = Some(map.next_value()?),
                         _ => { let _: serde::de::IgnoredAny = map.next_value()?; }
                     }
                 }
                 
                 let url = url.ok_or_else(|| serde::de::Error::missing_field("url"))?;
-                Ok(UpstreamServerEntry { url, sni_name })
+                let use_h2c = use_h2c.unwrap_or(false);
+                Ok(UpstreamServerEntry { url, sni_name, use_h2c })
             }
         }
         
@@ -5166,6 +5171,7 @@ pub enum BackendConfig {
     /// 注意: security, compression, buffering, cache, modules は route 直下で設定
     ProxyUpstream { 
         upstream: String, 
+        use_h2c: bool,
     },
     /// File バックエンド設定
     /// - path: ファイルまたはディレクトリのパス
@@ -5251,8 +5257,10 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                     "Proxy" => {
                         // upstream が指定されている場合はロードバランシング用
                         if let Some(upstream_name) = upstream {
+                            let use_h2c = use_h2c.unwrap_or(false);
                             Ok(BackendConfig::ProxyUpstream { 
                                 upstream: upstream_name, 
+                                use_h2c,
                             })
                         } else {
                             let url = url.ok_or_else(|| serde::de::Error::missing_field("url or upstream"))?;
@@ -5650,6 +5658,8 @@ pub struct UpstreamGroup {
     health_check: Option<HealthCheckConfig>,
     /// TLS証明書検証を無効化（自己署名証明書を許可）
     tls_insecure: bool,
+    /// H2C (HTTP/2 over cleartext) を強制するかどうか
+    use_h2c: bool,
 }
 
 impl UpstreamGroup {
@@ -5659,6 +5669,7 @@ impl UpstreamGroup {
             .filter_map(|entry| {
                 ProxyTarget::parse(&entry.url)
                     .map(|target| target.with_sni_name(entry.sni_name.clone()))
+                    .map(|target| target.with_h2c(entry.use_h2c))
                     .map(UpstreamServer::new)
             })
             .collect();
@@ -5674,6 +5685,7 @@ impl UpstreamGroup {
             rr_counter: Arc::new(AtomicUsize::new(0)),
             health_check,
             tls_insecure,
+            use_h2c: false, // デフォルトでは各サーバーの設定に従う
         })
     }
     
@@ -5686,7 +5698,15 @@ impl UpstreamGroup {
             rr_counter: Arc::new(AtomicUsize::new(0)),
             health_check: None, // 単一サーバーでは健康チェックなし
             tls_insecure: false, // 単一サーバーではデフォルトで証明書検証を有効
+            use_h2c: false,
         }
+    }
+    
+    /// H2C設定を変更したコピーを作成
+    fn with_h2c(&self, use_h2c: bool) -> Self {
+        let mut new_group = self.clone();
+        new_group.use_h2c = use_h2c;
+        new_group
     }
     
     /// 次のバックエンドサーバーを選択
@@ -5740,6 +5760,11 @@ impl UpstreamGroup {
     /// TLS証明書検証を無効化するかどうかを取得
     fn tls_insecure(&self) -> bool {
         self.tls_insecure
+    }
+    
+    /// H2C (HTTP/2 over cleartext) を強制するかどうかを取得
+    fn use_h2c(&self) -> bool {
+        self.use_h2c
     }
 }
 
@@ -6974,13 +6999,20 @@ fn load_backend(
                 modules_arc.clone(),
             ))
         }
-        BackendConfig::ProxyUpstream { upstream } => {
+        BackendConfig::ProxyUpstream { upstream, use_h2c } => {
             // Upstream グループ参照
             let group = upstream_groups.get(upstream)
                 .ok_or_else(|| io::Error::new(
                     io::ErrorKind::InvalidInput, 
                     format!("Upstream '{}' not found", upstream)
                 ))?;
+            
+            // ルート設定で use_h2c が指定されている場合はオーバーライド
+            let group = if *use_h2c {
+                Arc::new(group.with_h2c(true))
+            } else {
+                group.clone()
+            };
             
             // 圧縮設定のログ出力
             if compression.enabled {
@@ -9665,14 +9697,168 @@ where
     
     // バックエンドに接続して転送
     let addr = format!("{}:{}", target.host, target.port);
-    let result = if target.use_tls {
+    
+    let result = if target.use_h2c {
+        // H2C (Prior Knowledge) プロキシ
+        handle_http2_proxy_h2c(conn, stream_id, &addr, target, request_body, method, final_path.as_bytes()).await
+    } else if target.use_tls {
+        // HTTP/2 → HTTPS (HTTP/1.1)
         handle_http2_proxy_https(conn, stream_id, &addr, target.sni(), request, compression, client_encoding).await
     } else {
+        // HTTP/2 → HTTP (HTTP/1.1)
         handle_http2_proxy_http(conn, stream_id, &addr, request, compression, client_encoding).await
     };
     
     server.release();
     result
+}
+
+/// HTTP/2 → HTTP/2 プロキシ (H2C)
+#[cfg(feature = "http2")]
+async fn handle_http2_proxy_h2c<S>(
+    conn: &mut http2::Http2Connection<S>,
+    stream_id: u32,
+    addr: &str,
+    target: &ProxyTarget,
+    request_body: Vec<u8>,
+    method: &[u8],
+    path: &[u8],
+) -> Option<(u16, u64)>
+where
+    S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRentExt + Unpin,
+{
+    // バックエンドに接続
+    let connect_result = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await;
+    
+    let backend_stream = match connect_result {
+        Ok(Ok(stream)) => {
+            let _ = stream.set_nodelay(true);
+            stream
+        }
+        Ok(Err(e)) => {
+            warn!("[HTTP/2] H2C backend connect error ({}): {}", addr, e);
+            let server_guard = get_server_header_guard();
+            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+            if let Some(ref g) = server_guard {
+                headers.push(g.as_header());
+            }
+            let _ = conn.send_response(stream_id, 502, &headers, Some(b"Bad Gateway")).await;
+            return Some((502, 11));
+        }
+        Err(_) => {
+            let server_guard = get_server_header_guard();
+            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+            if let Some(ref g) = server_guard {
+                headers.push(g.as_header());
+            }
+            let _ = conn.send_response(stream_id, 504, &headers, Some(b"Gateway Timeout")).await;
+            return Some((504, 15));
+        }
+    };
+
+    // H2Cクライアント作成
+    let settings = http2::Http2Settings::default();
+    let mut h2c_client = http2::H2cClient::new(backend_stream, settings);
+
+    // H2Cハンドシェイク
+    if let Err(e) = h2c_client.handshake().await {
+        warn!("[HTTP/2] H2C handshake error ({}): {}", addr, e);
+        let server_guard = get_server_header_guard();
+        let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+        if let Some(ref g) = server_guard {
+            headers.push(g.as_header());
+        }
+        let _ = conn.send_response(stream_id, 502, &headers, Some(b"Bad Gateway")).await;
+        return Some((502, 11));
+    }
+
+    // ヘッダーを抽出
+    let headers_vec: Vec<(&[u8], &[u8])> = if let Some(stream) = conn.get_stream(stream_id) {
+        stream.request_headers.iter()
+            .filter(|h| !h.name.starts_with(b":")) // 疑似ヘッダーを除外
+            .filter(|h| {
+                // ホップバイホップヘッダーを除外
+                !h.name.eq_ignore_ascii_case(b"connection") &&
+                !h.name.eq_ignore_ascii_case(b"keep-alive") &&
+                !h.name.eq_ignore_ascii_case(b"proxy-connection") &&
+                !h.name.eq_ignore_ascii_case(b"transfer-encoding") &&
+                !h.name.eq_ignore_ascii_case(b"te") &&
+                !h.name.eq_ignore_ascii_case(b"upgrade")
+            })
+            .map(|h| (h.name.as_ref(), h.value.as_ref()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // リクエスト送信
+    let body = if request_body.is_empty() { None } else { Some(request_body.as_slice()) };
+    let authority = target.host.as_bytes();
+    
+    match h2c_client.send_request(method, path, authority, &headers_vec, body).await {
+        Ok(h2c_resp) => {
+            // レスポンスをクライアントに中継
+            let mut headers: Vec<(&[u8], &[u8])> = h2c_resp.headers.iter()
+                .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                .collect();
+            
+            let server_guard = get_server_header_guard();
+            if let Some(ref g) = server_guard {
+                headers.push(g.as_header());
+            }
+            
+            let has_body = !h2c_resp.body.is_empty();
+            let has_trailers = !h2c_resp.trailers.is_empty();
+            
+            // ヘッダーを送信
+            if let Err(e) = conn.send_headers(stream_id, h2c_resp.status, &headers, !has_body && !has_trailers).await {
+                warn!("[HTTP/2] H2C send headers error (stream_id={}): {}", stream_id, e);
+                return None;
+            }
+            
+            // ボディを送信
+            if has_body {
+                if let Err(e) = conn.send_data(stream_id, &h2c_resp.body, !has_trailers).await {
+                    warn!("[HTTP/2] H2C send data error (stream_id={}): {}", stream_id, e);
+                    return None;
+                }
+            }
+            
+            // トレイラーを送信
+            if has_trailers {
+                // 特別に gRPC トレイラーを送信
+                let mut grpc_status = 0;
+                let mut grpc_message = None;
+                
+                for (name, value) in &h2c_resp.trailers {
+                    if name == b"grpc-status" {
+                        if let Ok(status_str) = std::str::from_utf8(value) {
+                            grpc_status = status_str.parse().unwrap_or(0);
+                        }
+                    } else if name == b"grpc-message" {
+                        grpc_message = std::str::from_utf8(value).ok();
+                    }
+                }
+                
+                if let Err(e) = conn.send_grpc_trailers(stream_id, grpc_status, grpc_message).await {
+                    warn!("[HTTP/2] H2C send trailers error (stream_id={}): {}", stream_id, e);
+                    return None;
+                }
+            }
+            
+            Some((h2c_resp.status, h2c_resp.body.len() as u64))
+        }
+        Err(e) => {
+            warn!("[HTTP/2] H2C request error ({}): {}", addr, e);
+            let server_guard = get_server_header_guard();
+            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+            if let Some(ref g) = server_guard {
+                headers.push(g.as_header());
+            }
+            let _ = conn.send_response(stream_id, 502, &headers, Some(b"Bad Gateway")).await;
+            Some((502, 11))
+        }
+    }
 }
 
 /// HTTP/2 → HTTP/1.1 プロキシ（HTTPバックエンド）
@@ -10591,7 +10777,7 @@ async fn detect_protocol_with_buffer(
     // タイムアウトを設定して、無応答接続を検出
     let mut accumulated = Vec::with_capacity(24);
     let start_time = std::time::Instant::now();
-    let timeout_duration = Duration::from_millis(1000);
+    let timeout_duration = Duration::from_millis(50);
     
     while accumulated.len() < 24 {
         let remaining_timeout = match timeout_duration.checked_sub(start_time.elapsed()) {
@@ -10733,20 +10919,26 @@ async fn handle_connection(
                     handle_h2c_connection(stream, &peer_addr.ip().to_string(), initial_buffer.take().unwrap()).await;
                     return;
                 }
-                ProtocolType::TLS => {
-                    // TLSハンドシェイク（既存処理）
-                    // streamは既に読み込まれているため、そのまま使用
-                }
                 ProtocolType::Http11 => {
                     // HTTP/1.1ハンドラー（平文接続）
-                    // 注意: 現在の実装はTLS前提のため、平文HTTP/1.1は未対応
-                    // 将来的に実装が必要
-                    warn!("[H2C] Plain HTTP/1.1 not supported, closing connection");
+                    // TLSハンドシェイクをスキップして、平文ストリームとして処理
+                    let plain_stream = match acceptor.accept_plain(stream, initial_buffer.take()).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!("Failed to create plain stream: {}", e);
+                            return;
+                        }
+                    };
+                    let client_ip = peer_addr.ip().to_string();
+                    handle_requests(plain_stream, &client_ip, peer_addr).await;
                     return;
                 }
+                ProtocolType::TLS => {
+                    // TLSハンドシェイク（既存処理へ）
+                }
                 ProtocolType::Unknown => {
-                    warn!("[H2C] Unknown protocol from {}, closing connection", peer_addr);
-                    return;
+                    warn!("[H2C] Unknown protocol from {}, falling back to TLS", peer_addr);
+                    // 初期データは保持したままTLSハンドシェイクへ
                 }
             }
         }
@@ -10813,20 +11005,26 @@ async fn handle_connection(
                     handle_h2c_connection(stream, &peer_addr.ip().to_string(), initial_buffer.take().unwrap()).await;
                     return;
                 }
-                ProtocolType::TLS => {
-                    // TLSハンドシェイク（既存処理）
-                    // streamは既に読み込まれているため、そのまま使用
-                }
                 ProtocolType::Http11 => {
                     // HTTP/1.1ハンドラー（平文接続）
-                    // 注意: 現在の実装はTLS前提のため、平文HTTP/1.1は未対応
-                    // 将来的に実装が必要
-                    warn!("[H2C] Plain HTTP/1.1 not supported, closing connection");
+                    // TLSハンドシェイクをスキップして、平文ストリームとして処理
+                    let plain_stream = match acceptor.accept_plain(stream, initial_buffer.take()).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!("Failed to create plain stream: {}", e);
+                            return;
+                        }
+                    };
+                    let client_ip = peer_addr.ip().to_string();
+                    handle_requests(plain_stream, &client_ip, peer_addr).await;
                     return;
                 }
+                ProtocolType::TLS => {
+                    // TLSハンドシェイク（既存処理へ）
+                }
                 ProtocolType::Unknown => {
-                    warn!("[H2C] Unknown protocol from {}, closing connection", peer_addr);
-                    return;
+                    warn!("[H2C] Unknown protocol from {}, falling back to TLS", peer_addr);
+                    // 初期データは保持したままTLSハンドシェイクへ
                 }
             }
         }
@@ -11805,6 +12003,7 @@ pub fn find_backend_unified(
     
     // 候補ルートのみを評価（first-match）
     // 候補は既にソート済み（インデックス順）
+    info!("[Routing] Candidates for host='{}' path='{}': {:?}", host_str, path_str, candidates);
     for &route_idx in &candidates {
         if let Some(route) = routes.get(route_idx) {
             // 残りの条件（header, method, query）を評価
@@ -11816,12 +12015,11 @@ pub fn find_backend_unified(
             );
             
             if matched {
-                debug!(
-                    "Route[{}] matched (optimized): host={:?} path={:?} method={:?}",
+                info!(
+                    "[Routing] Matched route index: {} (path={:?} action={:?})",
                     route_idx,
-                    route.conditions.host,
                     route.conditions.path,
-                    route.conditions.method
+                    route.action
                 );
                 match load_backend(route, upstream_groups) {
                     Ok(backend) => {
@@ -11843,7 +12041,7 @@ pub fn find_backend_unified(
     }
     
     // 候補内でマッチしなかった場合
-    debug!(
+    info!(
         "No route matched in {} candidates: host='{}' path='{}' method='{}'",
         candidates.len(),
         host_str,
@@ -13496,7 +13694,7 @@ async fn handle_proxy(
         let tls_insecure = upstream_group.tls_insecure() 
             || std::env::var("VEIL_TLS_INSECURE").map(|v| v == "1" || v == "true").unwrap_or(false);
         proxy_https_pooled(client_stream, target, security, compression, client_encoding, &pool_key, request, content_length, is_chunked, initial_body, client_wants_close, tls_insecure).await
-    } else if target.use_h2c {
+    } else if target.use_h2c || upstream_group.use_h2c() {
         // H2C (HTTP/2 over cleartext) 接続
         #[cfg(feature = "http2")]
         {

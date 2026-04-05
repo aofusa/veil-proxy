@@ -15,6 +15,18 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection};
 
 // ====================
+// TLS ストリーム状態
+// ====================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsMode {
+    /// rustls によるユーザーランド TLS
+    Rustls,
+    /// 平文 HTTP/1.1（TLSなし）
+    Plain,
+}
+
+// ====================
 // libc ヘルパー
 // ====================
 
@@ -44,7 +56,9 @@ fn raw_write(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
 
 pub struct SimpleTlsServerStream {
     inner: TcpStream,
-    conn: ServerConnection,
+    conn: Option<ServerConnection>,
+    mode: TlsMode,
+    drained_buffer: Vec<u8>,
 }
 
 impl SimpleTlsServerStream {
@@ -77,7 +91,7 @@ impl SimpleTlsServerStream {
     /// - `Some(b"http/1.1")`: HTTP/1.1 がネゴシエートされた
     /// - `None`: ALPN 未設定または未ネゴシエート
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
-        self.conn.alpn_protocol()
+        self.conn.as_ref().and_then(|c| c.alpn_protocol())
     }
     
     /// HTTP/2 がネゴシエートされたかどうか
@@ -315,7 +329,25 @@ pub async fn accept(
 
     do_server_handshake(&stream, &mut conn, &mut initial_data).await?;
 
-    Ok(SimpleTlsServerStream { inner: stream, conn })
+    Ok(SimpleTlsServerStream {
+        inner: stream,
+        conn: Some(conn),
+        mode: TlsMode::Rustls,
+        drained_buffer: Vec::new(),
+    })
+}
+
+/// 平文（TLSなし）接続をアクセプト（H2C対応用）
+pub async fn accept_plain(
+    stream: TcpStream,
+    initial_data: Option<Vec<u8>>,
+) -> io::Result<SimpleTlsServerStream> {
+    Ok(SimpleTlsServerStream {
+        inner: stream,
+        conn: None,
+        mode: TlsMode::Plain,
+        drained_buffer: initial_data.unwrap_or_default(),
+    })
 }
 
 pub async fn connect(
@@ -337,6 +369,31 @@ pub async fn connect(
 
 impl monoio::io::AsyncReadRent for SimpleTlsServerStream {
     async fn read<T: IoBufMut>(&mut self, mut buf: T) -> monoio::BufResult<usize, T> {
+        // ドレインバッファがあれば優先的に返す
+        if !self.drained_buffer.is_empty() {
+            let len = std::cmp::min(self.drained_buffer.len(), buf.bytes_total());
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.drained_buffer.as_ptr(),
+                    buf.write_ptr(),
+                    len,
+                );
+                buf.set_init(len);
+            }
+            self.drained_buffer.drain(..len);
+            return (Ok(len), buf);
+        }
+
+        // 平文モードの場合は直接読み取る
+        if self.mode == TlsMode::Plain {
+            return self.inner.read(buf).await;
+        }
+
+        let conn = match self.conn.as_mut() {
+            Some(c) => c,
+            None => return (Err(io::Error::new(io::ErrorKind::Other, "TLS connection closed")), buf),
+        };
+
         let fd = self.inner.as_raw_fd();
         let mut read_buf = vec![0u8; 16384];
 
@@ -344,13 +401,13 @@ impl monoio::io::AsyncReadRent for SimpleTlsServerStream {
             let slice =
                 unsafe { std::slice::from_raw_parts_mut(buf.write_ptr(), buf.bytes_total()) };
 
-            let mut rd = self.conn.reader();
+            let mut rd = conn.reader();
             match std::io::Read::read(&mut rd, slice) {
                 Ok(n) if n > 0 => {
                     unsafe { buf.set_init(n) };
                     return (Ok(n), buf);
                 }
-                Ok(0) if !self.conn.wants_read() => {
+                Ok(0) if !conn.wants_read() => {
                     return (Ok(0), buf);
                 }
                 Ok(_) => {}  // Not EOF yet, need more TLS data
@@ -366,13 +423,13 @@ impl monoio::io::AsyncReadRent for SimpleTlsServerStream {
                         let mut consumed = 0;
                         while consumed < n {
                             let remaining = &read_buf[consumed..n];
-                            let tls_read = match self.conn.read_tls(&mut &*remaining) {
+                            let tls_read = match conn.read_tls(&mut &*remaining) {
                                 Ok(0) => break,
                                 Ok(r) => r,
                                 Err(e) => return (Err(e), buf),
                             };
                             consumed += tls_read;
-                            if let Err(e) = self.conn.process_new_packets() {
+                            if let Err(e) = conn.process_new_packets() {
                                 return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
                             }
                         }
@@ -405,16 +462,21 @@ impl monoio::io::AsyncReadRent for SimpleTlsServerStream {
             std::slice::from_raw_parts_mut(iov.iov_base as *mut u8, iov.iov_len)
         };
 
+        let conn = match self.conn.as_mut() {
+            Some(c) => c,
+            None => return (Err(io::Error::new(io::ErrorKind::Other, "TLS connection closed")), buf),
+        };
+
         let fd = self.inner.as_raw_fd();
         let mut read_buf = vec![0u8; 16384];
 
         loop {
-            let mut rd = self.conn.reader();
+            let mut rd = conn.reader();
             match std::io::Read::read(&mut rd, slice) {
                 Ok(n) if n > 0 => {
                     return (Ok(n), buf);
                 }
-                Ok(0) if !self.conn.wants_read() => {
+                Ok(0) if !conn.wants_read() => {
                     return (Ok(0), buf);
                 }
                 Ok(_) => {}  // Not EOF yet, need more TLS data
@@ -430,13 +492,13 @@ impl monoio::io::AsyncReadRent for SimpleTlsServerStream {
                         let mut consumed = 0;
                         while consumed < n {
                             let remaining = &read_buf[consumed..n];
-                            let tls_read = match self.conn.read_tls(&mut &*remaining) {
+                            let tls_read = match conn.read_tls(&mut &*remaining) {
                                 Ok(0) => break,
                                 Ok(r) => r,
                                 Err(e) => return (Err(e), buf),
                             };
                             consumed += tls_read;
-                            if let Err(e) = self.conn.process_new_packets() {
+                            if let Err(e) = conn.process_new_packets() {
                                 return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
                             }
                         }
@@ -456,17 +518,25 @@ impl monoio::io::AsyncReadRent for SimpleTlsServerStream {
 
 impl monoio::io::AsyncWriteRent for SimpleTlsServerStream {
     async fn write<T: IoBuf>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
-        let slice = unsafe { std::slice::from_raw_parts(buf.read_ptr(), buf.bytes_init()) };
+        if self.mode == TlsMode::Plain {
+            return self.inner.write(buf).await;
+        }
 
-        let mut wr = self.conn.writer();
+        let slice = unsafe { std::slice::from_raw_parts(buf.read_ptr(), buf.bytes_init()) };
+        let conn = match self.conn.as_mut() {
+            Some(c) => c,
+            None => return (Err(io::Error::new(io::ErrorKind::Other, "TLS connection closed")), buf),
+        };
+
+        let mut wr = conn.writer();
         if let Err(e) = std::io::Write::write_all(&mut wr, slice) {
             return (Err(e), buf);
         }
 
         let fd = self.inner.as_raw_fd();
-        while self.conn.wants_write() {
+        while conn.wants_write() {
             let mut write_buf = Vec::new();
-            if let Err(e) = self.conn.write_tls(&mut write_buf) {
+            if let Err(e) = conn.write_tls(&mut write_buf) {
                 return (Err(e), buf);
             }
 
@@ -494,6 +564,10 @@ impl monoio::io::AsyncWriteRent for SimpleTlsServerStream {
     }
 
     async fn writev<T: IoVecBuf>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
+        if self.mode == TlsMode::Plain {
+            return self.inner.writev(buf).await;
+        }
+
         let iovec_ptr = buf.read_iovec_ptr();
         let iovec_len = buf.read_iovec_len();
 
@@ -509,15 +583,20 @@ impl monoio::io::AsyncWriteRent for SimpleTlsServerStream {
             std::slice::from_raw_parts(iov.iov_base as *const u8, iov.iov_len)
         };
 
-        let mut wr = self.conn.writer();
+        let conn = match self.conn.as_mut() {
+            Some(c) => c,
+            None => return (Err(io::Error::new(io::ErrorKind::Other, "TLS connection closed")), buf),
+        };
+
+        let mut wr = conn.writer();
         if let Err(e) = std::io::Write::write_all(&mut wr, slice) {
             return (Err(e), buf);
         }
 
         let fd = self.inner.as_raw_fd();
-        while self.conn.wants_write() {
+        while conn.wants_write() {
             let mut write_buf = Vec::new();
-            if let Err(e) = self.conn.write_tls(&mut write_buf) {
+            if let Err(e) = conn.write_tls(&mut write_buf) {
                 return (Err(e), buf);
             }
 
@@ -804,6 +883,11 @@ impl SimpleTlsAcceptor {
 
     pub async fn accept(&self, stream: TcpStream, initial_data: Option<Vec<u8>>) -> io::Result<SimpleTlsServerStream> {
         accept(stream, self.config.clone(), initial_data).await
+    }
+
+    /// 平文（TLSなし）接続をアクセプト（H2C対応用）
+    pub async fn accept_plain(&self, stream: TcpStream, initial_data: Option<Vec<u8>>) -> io::Result<SimpleTlsServerStream> {
+        accept_plain(stream, initial_data).await
     }
 }
 

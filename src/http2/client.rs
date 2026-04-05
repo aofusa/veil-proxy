@@ -53,7 +53,7 @@ where
     /// 新しいH2Cクライアントを作成
     pub fn new(stream: S, settings: Http2Settings) -> Self {
         let hpack_encoder = HpackEncoder::new(settings.header_table_size as usize);
-        let hpack_decoder = HpackDecoder::new(defaults::HEADER_TABLE_SIZE as usize);
+        let hpack_decoder = HpackDecoder::new(settings.header_table_size as usize);
         let frame_encoder = FrameEncoder::new(settings.max_frame_size);
         let frame_decoder = FrameDecoder::new(defaults::MAX_FRAME_SIZE);
 
@@ -255,13 +255,16 @@ where
             status: 0,
             headers: Vec::new(),
             body: Vec::new(),
+            trailers: Vec::new(),
         };
+
+        let mut headers_received = false;
 
         loop {
             let frame = self.read_frame().await?;
 
             match frame {
-                Frame::Headers { stream_id: sid, end_stream, end_headers, header_block, .. } => {
+                Frame::Headers { stream_id: sid, end_stream, end_headers: _, header_block, .. } => {
                     if sid != stream_id {
                         continue;
                     }
@@ -270,23 +273,27 @@ where
                     let headers = self.hpack_decoder.decode(&header_block)
                         .map_err(|e| Http2Error::compression_error(e.to_string()))?;
 
-                    for header in headers {
-                        if header.name == b":status" {
-                            if let Ok(s) = std::str::from_utf8(&header.value) {
-                                response.status = s.parse().unwrap_or(0);
+                    if !headers_received {
+                        // 初回ヘッダー
+                        headers_received = true;
+                        for header in headers {
+                            if header.name == b":status" {
+                                if let Ok(s) = std::str::from_utf8(&header.value) {
+                                    response.status = s.parse().unwrap_or(0);
+                                }
+                            } else if !header.name.starts_with(b":") {
+                                response.headers.push((header.name, header.value));
                             }
-                        } else if !header.name.starts_with(b":") {
-                            response.headers.push((header.name, header.value));
+                        }
+                    } else {
+                        // トレイラー (2回目以降の HEADERS フレーム)
+                        for header in headers {
+                            response.trailers.push((header.name, header.value));
                         }
                     }
 
                     if end_stream {
                         return Ok(response);
-                    }
-                    
-                    if !end_headers {
-                        // CONTINUATION を待つ
-                        // 簡略化のため、end_headers = true を前提
                     }
                 }
                 Frame::Data { stream_id: sid, end_stream, data } => {
@@ -328,6 +335,7 @@ where
                     // SETTINGS ACK を送信
                     for &(id, value) in &settings {
                         match id {
+                            0x1 => self.hpack_encoder.set_max_table_size(value as usize),
                             0x4 => self.remote_settings.initial_window_size = value,
                             0x5 => self.remote_settings.max_frame_size = value,
                             _ => {}
@@ -446,6 +454,8 @@ pub struct H2cResponse {
     pub headers: Vec<(Vec<u8>, Vec<u8>)>,
     /// レスポンスボディ
     pub body: Vec<u8>,
+    /// レスポンストレイラー (gRPC用)
+    pub trailers: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 /// H2C gRPC レスポンス
@@ -618,17 +628,18 @@ where
                     let ping_ack = self.frame_encoder.encode_ping(&data, true);
                     self.write_all(&ping_ack).await?;
                 }
-                Frame::Settings { ack: false, settings } => {
-                    for &(id, value) in &settings {
-                        match id {
-                            0x4 => self.remote_settings.initial_window_size = value,
-                            0x5 => self.remote_settings.max_frame_size = value,
-                            _ => {}
+                    Frame::Settings { ack: false, settings } => {
+                        for &(id, value) in &settings {
+                            match id {
+                                0x1 => self.hpack_encoder.set_max_table_size(value as usize),
+                                0x4 => self.remote_settings.initial_window_size = value,
+                                0x5 => self.remote_settings.max_frame_size = value,
+                                _ => {}
+                            }
                         }
+                        let ack_frame = self.frame_encoder.encode_settings_ack();
+                        self.write_all(&ack_frame).await?;
                     }
-                    let ack_frame = self.frame_encoder.encode_settings_ack();
-                    self.write_all(&ack_frame).await?;
-                }
                 Frame::GoAway { .. } => {
                     return Err(Http2Error::ConnectionClosed);
                 }

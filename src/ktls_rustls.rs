@@ -52,6 +52,8 @@ pub enum TlsMode {
     KtlsTxOnly,
     /// kTLS によるカーネルオフロード（送受信両方）
     KtlsFull,
+    /// 平文 HTTP/1.1（TLSなし）
+    Plain,
 }
 
 // ====================
@@ -587,6 +589,20 @@ fn setup_ulp(fd: RawFd) -> io::Result<()> {
 // ====================
 // サーバー accept
 // ====================
+
+/// 平文 HTTP/1.1 接続をアクセプト（ハンドシェイクなし）
+pub async fn accept_plain(
+    stream: TcpStream,
+    initial_data: Option<Vec<u8>>,
+) -> io::Result<KtlsServerStream> {
+    Ok(KtlsServerStream {
+        inner: stream,
+        conn: None,
+        mode: TlsMode::Plain,
+        alpn_protocol: None,
+        drained_buffer: initial_data.unwrap_or_default(),
+    })
+}
 
 /// TLS ハンドシェイクを実行しサーバー TLS ストリームを作成
 /// 
@@ -1331,6 +1347,11 @@ impl RustlsAcceptor {
     /// TLS ハンドシェイクを実行
     pub async fn accept(&self, stream: TcpStream, initial_data: Option<Vec<u8>>) -> io::Result<KtlsServerStream> {
         accept(stream, self.config.clone(), self.enable_ktls, self.allow_fallback, self.tcp_cork_enabled, initial_data).await
+    }
+
+    /// 平文（TLSなし）接続をアクセプト（H2C対応用）
+    pub async fn accept_plain(&self, stream: TcpStream, initial_data: Option<Vec<u8>>) -> io::Result<KtlsServerStream> {
+        accept_plain(stream, initial_data).await
     }
 }
 

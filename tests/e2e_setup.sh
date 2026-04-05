@@ -36,6 +36,7 @@ BACKEND1_PORT=9001
 BACKEND2_PORT=9002
 BACKEND_H2C_TLS_PORT=9013
 BACKEND_H2C_PORT=9003
+BACKEND_GRPC_PORT=9004
 
 # 色付き出力
 RED='\033[0;31m'
@@ -302,6 +303,12 @@ servers = [
     "https://127.0.0.1:${BACKEND2_PORT}"
 ]
 tls_insecure = true
+
+[upstreams."grpc-pool"]
+algorithm = "round_robin"
+servers = [
+    "http://127.0.0.1:${BACKEND_GRPC_PORT}"
+]
 EOF
 
     # ヘルスチェック設定を追加（healthcheckタイプの時のみ有効化）
@@ -411,18 +418,8 @@ allowed_ips = ["127.0.0.1", "::1"]
 EOF
     fi
     
-    # 2つ目のルート設定
+    # gRPC/H2C ルート設定 (優先順位を上げるため先に定義)
     cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
-
-[[route]]
-[route.conditions]
-host = "127.0.0.1"
-path = "/*"
-[route.action]
-type = "Proxy"
-upstream = "backend-pool"
-[route.security]
-add_response_headers = { "X-Proxied-By" = "veil", "X-Test-Header" = "e2e-test" }
 
 # H2Cルート設定
 [[route]]
@@ -446,6 +443,39 @@ url = "http://127.0.0.1:${BACKEND_H2C_PORT}"
 use_h2c = true
 [route.security]
 add_response_headers = { "X-Proxied-By" = "veil", "X-H2C-Test" = "true" }
+
+# gRPCルート設定
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/grpc.test.v1.TestService/*"
+[route.action]
+type = "Proxy"
+upstream = "grpc-pool"
+use_h2c = true
+[route.security]
+add_response_headers = { "X-Proxied-By" = "veil", "X-GRPC-Test" = "true" }
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/grpc.test.v1.TestService/*"
+[route.action]
+type = "Proxy"
+upstream = "grpc-pool"
+use_h2c = true
+[route.security]
+add_response_headers = { "X-Proxied-By" = "veil", "X-GRPC-Test" = "true" }
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+[route.security]
+add_response_headers = { "X-Proxied-By" = "veil", "X-Test-Header" = "e2e-test" }
 EOF
 
     # WASM設定を追加（wasm設定タイプの時のみ有効化）
@@ -508,6 +538,13 @@ start_servers() {
     "$VEIL_BIN" -c "${FIXTURES_DIR}/backend_h2c.toml" &
     echo $! >> "$PIDS_FILE"
     log_info "H2C Backend started on port ${BACKEND_H2C_PORT} (PID: $!)"
+
+    # gRPCバックエンド起動（スタンドアロンEchoサーバー）
+    log_info "Building and starting gRPC Echo Backend..."
+    (cd "${SCRIPT_DIR}/grpc_server" && cargo build --quiet)
+    RUST_LOG=debug "${SCRIPT_DIR}/grpc_server/target/debug/grpc-server" > /tmp/grpc_server.log 2>&1 &
+    echo $! >> "$PIDS_FILE"
+    log_info "gRPC Echo Backend started on port ${BACKEND_GRPC_PORT} (PID: $!, logs: /tmp/grpc_server.log)"
     
     # バックエンド起動待機（動的）
     log_info "Waiting for backends to be ready..."
@@ -530,11 +567,27 @@ start_servers() {
     else
         log_warn "H2C Backend may not be fully ready, continuing..."
     fi
+
+    # gRPCバックエンド起動待機
+    log_info "Waiting for gRPC Echo Backend to be ready..."
+    local grpc_wait_count=0
+    while [ $grpc_wait_count -lt 30 ]; do
+        if check_port_in_use "$BACKEND_GRPC_PORT"; then
+            log_info "gRPC Echo Backend is ready (port ${BACKEND_GRPC_PORT} is listening)"
+            break
+        fi
+        grpc_wait_count=$((grpc_wait_count + 1))
+        sleep 0.2
+    done
+    if [ $grpc_wait_count -ge 30 ]; then
+        log_warn "gRPC Echo Backend may not be fully ready, continuing..."
+    fi
     
     log_info "Starting proxy server..."
     
     # プロキシ起動（自己署名証明書を許可するためVEIL_TLS_INSECURE=1を設定）
-    VEIL_TLS_INSECURE=1 "$VEIL_BIN" -c "${FIXTURES_DIR}/proxy.toml" &
+    log_info "Starting veil proxy..."
+    VEIL_TLS_INSECURE=1 "${VEIL_BIN}" --config "${FIXTURES_DIR}/proxy.toml" > /tmp/proxy.log 2>&1 &
     echo $! >> "$PIDS_FILE"
     log_info "Proxy started on ports ${PROXY_HTTPS_PORT}/${PROXY_HTTP_PORT} (PID: $!)"
     
@@ -631,7 +684,7 @@ check_port_conflicts() {
     log_info "Checking for port conflicts..."
     local conflicts=0
     
-    for port in $PROXY_HTTPS_PORT $PROXY_HTTP_PORT $BACKEND1_PORT $BACKEND2_PORT $BACKEND_H2C_PORT; do
+    for port in $PROXY_HTTPS_PORT $PROXY_HTTP_PORT $BACKEND1_PORT $BACKEND2_PORT $BACKEND_H2C_PORT $BACKEND_GRPC_PORT; do
         if check_port_in_use "$port"; then
             log_error "Port $port is already in use"
             conflicts=$((conflicts + 1))
