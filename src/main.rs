@@ -10782,7 +10782,7 @@ async fn detect_protocol_with_buffer(
     // タイムアウトを設定して、無応答接続を検出
     let mut accumulated = Vec::with_capacity(24);
     let start_time = std::time::Instant::now();
-    let timeout_duration = Duration::from_millis(50);
+    let timeout_duration = Duration::from_millis(200);
     
     while accumulated.len() < 24 {
         let remaining_timeout = match timeout_duration.checked_sub(start_time.elapsed()) {
@@ -11959,7 +11959,8 @@ pub fn find_backend_unified(
     let optimized_router = &config.optimized_router;
     let host_str = std::str::from_utf8(host).unwrap_or("");
     let path_str = std::str::from_utf8(path).unwrap_or("");
-    info!("[Routing] Finding backend for host='{}' path='{}'", host_str, path_str);
+    debug!("[Routing] find_backend_unified: host='{}', path='{}', method='{}'", 
+           host_str, path_str, std::str::from_utf8(method).unwrap_or(""));
 
     // Phase 4: キャッシュチェック
     let cache_key = routing::RouteCacheKey::new(host, path, method, source_ip);
@@ -12057,6 +12058,7 @@ pub fn find_backend_unified(
     );
     
     // キャッシュにマッチなしを保存
+    debug!("[Routing] No match found for host='{}' path='{}'", host_str, path_str);
     optimized_router.cache_result(cache_key, None);
     None
 }

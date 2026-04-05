@@ -127,8 +127,9 @@ prepare_fixtures() {
     echo "OK" > "${FIXTURES_DIR}/backend2/health"
     echo "OK" > "${FIXTURES_DIR}/backend_h2c/health"
     
-    # WASMモジュールの準備
+    # 必要なディレクトリの作成
     mkdir -p "${FIXTURES_DIR}/wasm"
+    mkdir -p "/tmp/veil_buffer"
     if [ -f "${SCRIPT_DIR}/wasm/header_filter.wasm" ]; then
         cp "${SCRIPT_DIR}/wasm/header_filter.wasm" "${FIXTURES_DIR}/wasm/header_filter.wasm"
         log_info "WASM module header_filter.wasm copied"
@@ -286,7 +287,7 @@ key_path = "${FIXTURES_DIR}/key.pem"
 ktls_enabled = false
 
 [logging]
-level = "trace"
+level = "debug"
 
 [prometheus]
 enabled = true
@@ -405,6 +406,14 @@ path = "/slow/*"
 type = "Proxy"
 url = "http://127.0.0.1:1"
 
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/slow/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:1"
+
 # ディスク溢れテスト用ルート (極めて小さいバッファ制限)
 [[route]]
 [route.conditions]
@@ -415,8 +424,22 @@ type = "Proxy"
 upstream = "backend-pool"
 [route.buffering]
 mode = "full"
-max_memory_buffer = 1024
-max_disk_buffer = 10
+max_memory_buffer = 100
+max_disk_buffer = 100
+disk_buffer_path = "/tmp/veil_buffer"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/disk-spillover/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+[route.buffering]
+mode = "full"
+max_memory_buffer = 100
+max_disk_buffer = 100
+disk_buffer_path = "/tmp/veil_buffer"
 EOF
 
     # gRPCルート設定
@@ -430,7 +453,7 @@ type = "Proxy"
 upstream = "grpc-pool"
 use_h2c = true
 [route.security]
-add_response_headers = { "X-Proxied-By" = "veil", "X-GRPC-Test" = "true" }
+add_response_headers = { "X-Proxied-By" = "veil", "X-GRPC-Test" = "true", "X-Fixed-Routing" = "true" }
 
 [[route]]
 [route.conditions]
@@ -472,6 +495,17 @@ EOF
 [[route]]
 [route.conditions]
 host = "localhost"
+path = "/wasm/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+modules = ["header_filter"]
+[route.security]
+add_response_headers = { "X-Proxied-By" = "veil" }
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
 path = "/wasm/*"
 [route.action]
 type = "Proxy"
@@ -524,17 +558,17 @@ start_servers() {
     log_info "Starting backend servers..."
     
     # バックエンド1起動
-    "$VEIL_BIN" -c "${FIXTURES_DIR}/backend1.toml" &
+    "$VEIL_BIN" -c "${FIXTURES_DIR}/backend1.toml" > /tmp/backend1.log 2>&1 &
     echo $! >> "$PIDS_FILE"
     log_info "Backend 1 started on port ${BACKEND1_PORT} (PID: $!)"
     
     # バックエンド2起動
-    "$VEIL_BIN" -c "${FIXTURES_DIR}/backend2.toml" &
+    "$VEIL_BIN" -c "${FIXTURES_DIR}/backend2.toml" > /tmp/backend2.log 2>&1 &
     echo $! >> "$PIDS_FILE"
     log_info "Backend 2 started on port ${BACKEND2_PORT} (PID: $!)"
     
     # H2Cバックエンド起動（HTTP/2 over cleartextサーバーとして動作、H2Cテスト用）
-    "$VEIL_BIN" -c "${FIXTURES_DIR}/backend_h2c.toml" &
+    "$VEIL_BIN" -c "${FIXTURES_DIR}/backend_h2c.toml" > /tmp/backend_h2c.log 2>&1 &
     echo $! >> "$PIDS_FILE"
     log_info "H2C Backend started on port ${BACKEND_H2C_PORT} (PID: $!)"
 
@@ -573,6 +607,8 @@ start_servers() {
     while [ $grpc_wait_count -lt 30 ]; do
         if check_port_in_use "$BACKEND_GRPC_PORT"; then
             log_info "gRPC Echo Backend is ready (port ${BACKEND_GRPC_PORT} is listening)"
+            # ポートが空いた後、さらに短い待機時間を入れて初期化を完了させる
+            sleep 0.5
             break
         fi
         grpc_wait_count=$((grpc_wait_count + 1))

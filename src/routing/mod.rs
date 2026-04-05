@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use lru::LruCache;
 use std::num::NonZeroUsize;
+use ftlog::debug;
 
 // ====================
 // Phase 1: Host-based Grouping
@@ -99,9 +100,23 @@ impl HostRouter {
         
         let mut candidates = Vec::new();
         
+        // Host normalization for testing (localhost <-> 127.0.0.1)
+        let alt_host = if host_only == "localhost" {
+            Some("127.0.0.1")
+        } else if host_only == "127.0.0.1" {
+            Some("localhost")
+        } else {
+            None
+        };
+        
         // 1. Exact match (highest priority)
         if let Some(indices) = self.exact.get(host_only) {
             candidates.extend(indices.iter().copied());
+        }
+        if let Some(alt) = alt_host {
+            if let Some(indices) = self.exact.get(alt) {
+                candidates.extend(indices.iter().copied());
+            }
         }
         
         // 2. Wildcard matches
@@ -616,6 +631,17 @@ impl OptimizedRouter {
             if path_candidates.contains(idx) && ip_candidates.contains(idx) {
                 final_candidates.push(*idx);
             }
+        }
+        
+        if final_candidates.is_empty() {
+             // Only log at debug to avoid flooding, but this helps find why a route didn't match
+             const LOG_EVERY_N: u64 = 100;
+             static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+             let c = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+             if c % LOG_EVERY_N == 0 {
+                 debug!("[Routing] get_candidates: host_cand={:?} path_cand={:?} ip_cand_len={}", 
+                    host_candidates, path_candidates, ip_candidates.len());
+             }
         }
         
         // Sort by index to maintain original priority order
