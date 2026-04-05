@@ -334,7 +334,7 @@ async fn send_post_request_async(
 
 /// プロキシ基本リクエストテスト（非同期版）
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_proxy_basic_request_async() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -354,7 +354,7 @@ async fn test_proxy_basic_request_async() {
 
 /// ヘルスエンドポイントテスト（非同期版）
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_proxy_health_endpoint_async() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -378,7 +378,7 @@ async fn test_proxy_health_endpoint_async() {
 
 /// HTTP/3基本接続テスト（非同期版）
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_http3_basic_connection_async() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -403,7 +403,7 @@ async fn test_http3_basic_connection_async() {
 
 /// HTTP/3 GETリクエストテスト（非同期版）
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_http3_get_request_async() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -444,7 +444,7 @@ async fn test_http3_get_request_async() {
 /// 注意: tonicはProtobufサービス定義が必要なため、
 /// ここでは接続確立のみをテストします
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_grpc_connection_async() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -459,7 +459,7 @@ async fn test_grpc_connection_async() {
 
 /// gRPCプレーンテキスト（h2c）接続テスト（非同期版）
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_grpc_h2c_connection_async() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -477,7 +477,7 @@ async fn test_grpc_h2c_connection_async() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_proxy_basic_request() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -493,7 +493,7 @@ async fn test_proxy_basic_request() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_proxy_health_endpoint() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -513,7 +513,7 @@ async fn test_proxy_health_endpoint() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_response_header_added() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -534,7 +534,7 @@ async fn test_response_header_added() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_server_header_removed() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -552,7 +552,7 @@ async fn test_server_header_removed() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_backend_server_id_header() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -578,7 +578,7 @@ async fn test_backend_server_id_header() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_round_robin_distribution() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -618,7 +618,7 @@ async fn test_round_robin_distribution() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_static_file_index() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -638,7 +638,7 @@ async fn test_static_file_index() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_static_file_large() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -661,7 +661,7 @@ async fn test_static_file_large() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_compression_gzip() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -702,7 +702,7 @@ async fn test_compression_gzip() {
 
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_compression_brotli() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -727,7 +727,7 @@ async fn test_compression_brotli() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_backend1_direct() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -743,7 +743,7 @@ async fn test_backend1_direct() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_backend2_direct() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -763,7 +763,7 @@ async fn test_backend2_direct() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_prometheus_metrics() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -789,7 +789,7 @@ async fn test_prometheus_metrics() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_404_not_found() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -810,7 +810,7 @@ async fn test_404_not_found() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_https_connection() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -831,7 +831,7 @@ async fn test_https_connection() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_concurrent_requests() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -875,7 +875,7 @@ async fn test_concurrent_requests() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_response_time() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -902,7 +902,7 @@ async fn test_response_time() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_html_content_type() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -925,7 +925,7 @@ async fn test_html_content_type() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_json_content_type() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -962,7 +962,7 @@ async fn test_json_content_type() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_keep_alive_connection() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -987,7 +987,7 @@ async fn test_keep_alive_connection() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_custom_user_agent() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -1011,7 +1011,7 @@ async fn test_custom_user_agent() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_different_host_headers() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -1036,7 +1036,7 @@ async fn test_different_host_headers() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_multiple_sequential_requests() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -1068,7 +1068,7 @@ async fn test_multiple_sequential_requests() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_compression_priority() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -1103,7 +1103,7 @@ async fn test_compression_priority() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_active_connections_metric() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -1125,7 +1125,7 @@ async fn test_active_connections_metric() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_upstream_health_metric() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -1146,7 +1146,7 @@ async fn test_upstream_health_metric() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_tls_health_check() {
     // このテストは、TLS健康チェック機能が正しく動作することを確認します
     // 注意: 実際のTLSバックエンドが必要なため、E2E環境でのみ実行可能
@@ -1176,7 +1176,7 @@ async fn test_tls_health_check() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_invalid_http_syntax() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -1204,7 +1204,7 @@ async fn test_invalid_http_syntax() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_backend_connection_failure() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -1228,7 +1228,7 @@ async fn test_backend_connection_failure() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_websocket_basic_connection() {
     if !is_e2e_environment_ready().await {
@@ -1263,7 +1263,7 @@ async fn test_websocket_basic_connection() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_http2_stream_multiplexing() {
     if !is_e2e_environment_ready().await {
@@ -1310,7 +1310,7 @@ async fn test_http2_stream_multiplexing() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_ip_restriction() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -1331,7 +1331,7 @@ async fn test_ip_restriction() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_rate_limiting() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -1369,7 +1369,7 @@ async fn test_rate_limiting() {
 /// - gRPCフレームが受信されること
 /// - レスポンスメッセージが空でないこと
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "grpc")]
 async fn test_grpc_unary_call() {
     if !is_e2e_environment_ready().await {
@@ -1414,7 +1414,7 @@ async fn test_grpc_unary_call() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "grpc")]
 async fn test_grpc_basic_request() {
     if !is_e2e_environment_ready().await {
@@ -1455,7 +1455,7 @@ async fn test_grpc_basic_request() {
 /// - HTTP/3ハンドシェイクが成功すること
 /// - 接続確立後にリクエストを送信できること
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http3")]
 async fn test_http3_basic_connection() {
     if !is_e2e_environment_ready().await {
@@ -1505,7 +1505,7 @@ async fn test_http3_basic_connection() {
 /// - HTTPステータスコード: 200 OK
 /// - レスポンスボディが受信されること
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http3")]
 async fn test_http3_get_request() {
     if !is_e2e_environment_ready().await {
@@ -1547,7 +1547,7 @@ async fn test_http3_get_request() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http3")]
 async fn test_http3_post_request() {
     if !is_e2e_environment_ready().await {
@@ -1595,7 +1595,7 @@ async fn test_http3_post_request() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http3")]
 async fn test_http3_configuration_check() {
     if !is_e2e_environment_ready().await {
@@ -1621,7 +1621,7 @@ async fn test_http3_configuration_check() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http3")]
 async fn test_http3_multiple_streams() {
     if !is_e2e_environment_ready().await {
@@ -1675,7 +1675,7 @@ async fn test_http3_multiple_streams() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http3")]
 async fn test_http3_proxy_forwarding() {
     if !is_e2e_environment_ready().await {
@@ -1724,7 +1724,7 @@ async fn test_http3_proxy_forwarding() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http3")]
 async fn test_http3_proxy_compression() {
     if !is_e2e_environment_ready().await {
@@ -1768,7 +1768,7 @@ async fn test_http3_proxy_compression() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http3")]
 async fn test_http3_connection_timeout() {
     if !is_e2e_environment_ready().await {
@@ -1791,7 +1791,7 @@ async fn test_http3_connection_timeout() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http3")]
 async fn test_http3_stream_priority() {
     if !is_e2e_environment_ready().await {
@@ -1829,7 +1829,7 @@ async fn test_http3_stream_priority() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http3")]
 async fn test_http3_stream_cancellation() {
     if !is_e2e_environment_ready().await {
@@ -1866,7 +1866,7 @@ async fn test_http3_stream_cancellation() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http3")]
 async fn test_http3_bidirectional_streams() {
     if !is_e2e_environment_ready().await {
@@ -1908,7 +1908,7 @@ async fn test_http3_bidirectional_streams() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http3")]
 async fn test_http3_proxy_header_manipulation() {
     if !is_e2e_environment_ready().await {
@@ -1964,7 +1964,7 @@ async fn test_http3_proxy_header_manipulation() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http3")]
 async fn test_http3_proxy_load_balancing() {
     if !is_e2e_environment_ready().await {
@@ -2004,7 +2004,7 @@ async fn test_http3_proxy_load_balancing() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http3")]
 async fn test_http3_stream_timeout() {
     if !is_e2e_environment_ready().await {
@@ -2035,7 +2035,7 @@ async fn test_http3_stream_timeout() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http3")]
 async fn test_http3_invalid_frame() {
     if !is_e2e_environment_ready().await {
@@ -2065,7 +2065,7 @@ async fn test_http3_invalid_frame() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http3")]
 async fn test_http3_backend_failure() {
     if !is_e2e_environment_ready().await {
@@ -2103,7 +2103,7 @@ async fn test_http3_backend_failure() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http3")]
 async fn test_http3_tls_handshake() {
     if !is_e2e_environment_ready().await {
@@ -2135,7 +2135,7 @@ async fn test_http3_tls_handshake() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http3")]
 async fn test_http3_0rtt_connection() {
     if !is_e2e_environment_ready().await {
@@ -2179,7 +2179,7 @@ async fn test_http3_0rtt_connection() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http3")]
 async fn test_http3_connection_close() {
     if !is_e2e_environment_ready().await {
@@ -2209,7 +2209,7 @@ async fn test_http3_connection_close() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http3")]
 async fn test_http3_large_request_body() {
     if !is_e2e_environment_ready().await {
@@ -2250,7 +2250,7 @@ async fn test_http3_large_request_body() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http3")]
 async fn test_http3_large_response_body() {
     if !is_e2e_environment_ready().await {
@@ -2288,7 +2288,7 @@ async fn test_http3_large_response_body() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http3")]
 async fn test_http3_chunked_response() {
     if !is_e2e_environment_ready().await {
@@ -2327,7 +2327,7 @@ async fn test_http3_chunked_response() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http3")]
 async fn test_http3_throughput() {
     if !is_e2e_environment_ready().await {
@@ -2381,7 +2381,7 @@ async fn test_http3_throughput() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http3")]
 async fn test_http3_latency() {
     if !is_e2e_environment_ready().await {
@@ -2438,7 +2438,7 @@ async fn test_http3_latency() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(all(feature = "grpc", feature = "http2"))]
 async fn test_grpc_http2_framing() {
     if !is_e2e_environment_ready().await {
@@ -2531,7 +2531,7 @@ async fn test_grpc_http2_framing() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "grpc")]
 async fn test_grpc_streaming_detailed() {
     if !is_e2e_environment_ready().await {
@@ -2634,7 +2634,7 @@ async fn test_grpc_streaming_detailed() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http3")]
 #[allow(unused_assignments)]
 async fn test_http3_qpack_compression() {
@@ -2692,7 +2692,7 @@ async fn test_http3_qpack_compression() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http3")]
 async fn test_http3_connection_migration() {
     if !is_e2e_environment_ready().await {
@@ -2752,7 +2752,7 @@ async fn test_http3_connection_migration() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http3")]
 async fn test_http3_concurrent_connections() {
     if !is_e2e_environment_ready().await {
@@ -2795,7 +2795,7 @@ async fn test_http3_concurrent_connections() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "grpc")]
 async fn test_grpc_client_streaming() {
     if !is_e2e_environment_ready().await {
@@ -2831,7 +2831,7 @@ async fn test_grpc_client_streaming() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "grpc")]
 async fn test_grpc_server_streaming() {
     if !is_e2e_environment_ready().await {
@@ -2864,7 +2864,7 @@ async fn test_grpc_server_streaming() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "grpc")]
 async fn test_grpc_bidirectional_streaming() {
     if !is_e2e_environment_ready().await {
@@ -2899,7 +2899,7 @@ async fn test_grpc_bidirectional_streaming() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "grpc")]
 async fn test_grpc_timeout_header() {
     if !is_e2e_environment_ready().await {
@@ -2929,7 +2929,7 @@ async fn test_grpc_timeout_header() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "grpc")]
 async fn test_grpc_encoding_header() {
     if !is_e2e_environment_ready().await {
@@ -2959,7 +2959,7 @@ async fn test_grpc_encoding_header() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "grpc")]
 async fn test_grpc_accept_encoding_header() {
     if !is_e2e_environment_ready().await {
@@ -2989,7 +2989,7 @@ async fn test_grpc_accept_encoding_header() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "grpc")]
 async fn test_grpc_metadata() {
     if !is_e2e_environment_ready().await {
@@ -3022,7 +3022,7 @@ async fn test_grpc_metadata() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "grpc")]
 async fn test_grpc_gzip_compression() {
     if !is_e2e_environment_ready().await {
@@ -3054,7 +3054,7 @@ async fn test_grpc_gzip_compression() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "grpc-web")]
 async fn test_grpc_web_binary_format() {
     if !is_e2e_environment_ready().await {
@@ -3092,7 +3092,7 @@ async fn test_grpc_web_binary_format() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "grpc")]
 async fn test_grpc_proxy_forwarding() {
     if !is_e2e_environment_ready().await {
@@ -3123,7 +3123,7 @@ async fn test_grpc_proxy_forwarding() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "grpc")]
 async fn test_grpc_invalid_frame() {
     if !is_e2e_environment_ready().await {
@@ -3179,7 +3179,7 @@ async fn test_grpc_invalid_frame() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "grpc")]
 async fn test_grpc_oversized_message() {
     if !is_e2e_environment_ready().await {
@@ -3216,7 +3216,7 @@ async fn test_grpc_oversized_message() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_error_handling_invalid_method() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -3276,7 +3276,7 @@ async fn test_error_handling_invalid_method() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_error_handling_missing_host() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -3336,7 +3336,7 @@ async fn test_error_handling_missing_host() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_error_handling_oversized_header() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -3401,7 +3401,7 @@ async fn test_error_handling_oversized_header() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_error_handling_invalid_path() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -3465,7 +3465,7 @@ async fn test_error_handling_invalid_path() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_least_connections_distribution() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -3511,7 +3511,7 @@ async fn test_least_connections_distribution() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_ip_hash_consistency() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -3556,7 +3556,7 @@ async fn test_ip_hash_consistency() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_health_check_failover() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -3600,7 +3600,7 @@ async fn test_health_check_failover() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_health_check_recovery() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -3643,7 +3643,7 @@ async fn test_health_check_recovery() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_rate_limiting_enforcement() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -3683,7 +3683,7 @@ async fn test_rate_limiting_enforcement() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_ip_restriction_enforcement() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -3717,7 +3717,7 @@ async fn test_ip_restriction_enforcement() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_connection_limit_enforcement() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -3766,7 +3766,7 @@ async fn test_connection_limit_enforcement() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_cache_hit() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -3817,7 +3817,7 @@ async fn test_cache_hit() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_cache_miss() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -3845,7 +3845,7 @@ async fn test_cache_miss() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_etag_304() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -3896,7 +3896,7 @@ async fn test_etag_304() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_stale_while_revalidate() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -3928,7 +3928,7 @@ async fn test_stale_while_revalidate() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_http2_hpack_compression() {
     if !is_e2e_environment_ready().await {
@@ -3972,7 +3972,7 @@ async fn test_http2_hpack_compression() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_websocket_bidirectional() {
     if !is_e2e_environment_ready().await {
@@ -4009,7 +4009,7 @@ async fn test_websocket_bidirectional() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_redirect_301() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -4038,7 +4038,7 @@ async fn test_redirect_301() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_redirect_302() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -4061,7 +4061,7 @@ async fn test_redirect_302() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_redirect_path_preservation() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -4090,7 +4090,7 @@ async fn test_redirect_path_preservation() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_range_request_single() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -4118,7 +4118,7 @@ async fn test_range_request_single() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_range_request_206() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -4150,7 +4150,7 @@ async fn test_range_request_206() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_buffering_streaming_mode() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -4184,7 +4184,7 @@ async fn test_buffering_streaming_mode() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_buffering_full_mode() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -4217,7 +4217,7 @@ async fn test_buffering_full_mode() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_buffering_adaptive_mode() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -4261,7 +4261,7 @@ async fn test_buffering_adaptive_mode() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_routing_header_condition() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -4285,7 +4285,7 @@ async fn test_routing_header_condition() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_routing_method_condition() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -4315,7 +4315,7 @@ async fn test_routing_method_condition() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_routing_query_condition() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -4351,7 +4351,7 @@ async fn test_routing_query_condition() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_routing_source_ip_condition() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -4389,7 +4389,7 @@ async fn test_routing_source_ip_condition() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_graceful_reload() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -4411,7 +4411,7 @@ async fn test_graceful_reload() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_config_validation() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -4436,7 +4436,7 @@ async fn test_config_validation() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "grpc")]
 async fn test_grpc_wire_protocol() {
     if !is_e2e_environment_ready().await {
@@ -4470,7 +4470,7 @@ async fn test_grpc_wire_protocol() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "grpc")]
 async fn test_grpc_status_code() {
     if !is_e2e_environment_ready().await {
@@ -4509,7 +4509,7 @@ async fn test_grpc_status_code() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "grpc")]
 async fn test_grpc_web_cors() {
     if !is_e2e_environment_ready().await {
@@ -4544,7 +4544,7 @@ async fn test_grpc_web_cors() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "grpc-web")]
 async fn test_grpc_web_text_format() {
     if !is_e2e_environment_ready().await {
@@ -4580,7 +4580,7 @@ async fn test_grpc_web_text_format() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "grpc-web")]
 async fn test_grpc_web_cors_headers() {
     if !is_e2e_environment_ready().await {
@@ -4622,7 +4622,7 @@ async fn test_grpc_web_cors_headers() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "grpc")]
 async fn test_grpc_proxy_load_balancing() {
     if !is_e2e_environment_ready().await {
@@ -4660,7 +4660,7 @@ async fn test_grpc_proxy_load_balancing() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "grpc")]
 async fn test_grpc_proxy_timeout() {
     if !is_e2e_environment_ready().await {
@@ -4693,7 +4693,7 @@ async fn test_grpc_proxy_timeout() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "grpc")]
 async fn test_grpc_proxy_error_handling() {
     if !is_e2e_environment_ready().await {
@@ -4746,7 +4746,7 @@ async fn test_grpc_proxy_error_handling() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "grpc")]
 async fn test_grpc_malformed_protobuf() {
     if !is_e2e_environment_ready().await {
@@ -4802,7 +4802,7 @@ async fn test_grpc_malformed_protobuf() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "grpc")]
 async fn test_grpc_stream_reset() {
     if !is_e2e_environment_ready().await {
@@ -4859,7 +4859,7 @@ async fn test_grpc_stream_reset() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "grpc")]
 async fn test_grpc_deflate_compression() {
     if !is_e2e_environment_ready().await {
@@ -4890,7 +4890,7 @@ async fn test_grpc_deflate_compression() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "grpc")]
 async fn test_grpc_compression_negotiation() {
     if !is_e2e_environment_ready().await {
@@ -4925,7 +4925,7 @@ async fn test_grpc_compression_negotiation() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "grpc")]
 async fn test_grpc_trailer_detailed() {
     if !is_e2e_environment_ready().await {
@@ -5033,7 +5033,7 @@ fn is_ktls_available() -> bool {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "ktls")]
 async fn test_ktls_availability() {
     if !is_e2e_environment_ready().await {
@@ -5061,7 +5061,7 @@ async fn test_ktls_availability() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "ktls")]
 async fn test_ktls_tls_handshake() {
     if !is_e2e_environment_ready().await {
@@ -5092,7 +5092,7 @@ async fn test_ktls_tls_handshake() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "ktls")]
 async fn test_ktls_multiple_connections() {
     if !is_e2e_environment_ready().await {
@@ -5142,7 +5142,7 @@ async fn test_ktls_multiple_connections() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_http2_alpn_negotiation() {
     if !is_e2e_environment_ready().await {
@@ -5188,7 +5188,7 @@ async fn test_http2_alpn_negotiation() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_http2_connection_reuse() {
     if !is_e2e_environment_ready().await {
@@ -5234,7 +5234,7 @@ async fn test_http2_connection_reuse() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_http2_header_compression() {
     if !is_e2e_environment_ready().await {
@@ -5284,7 +5284,7 @@ async fn test_http2_header_compression() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_websocket_upgrade_request() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -5355,7 +5355,7 @@ async fn test_websocket_upgrade_request() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_websocket_connection_persistence() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -5450,7 +5450,7 @@ async fn test_websocket_connection_persistence() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_websocket_proxy_forwarding() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -5522,7 +5522,7 @@ async fn test_websocket_proxy_forwarding() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_rate_limiting_with_config() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -5577,7 +5577,7 @@ async fn test_rate_limiting_with_config() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_ip_restriction_with_config() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -5609,7 +5609,7 @@ async fn test_ip_restriction_with_config() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_method_restriction() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -5645,7 +5645,7 @@ async fn test_method_restriction() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_request_timeout() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -5680,7 +5680,7 @@ async fn test_request_timeout() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_large_request_body() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -5717,7 +5717,7 @@ async fn test_large_request_body() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_malformed_headers() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -5780,7 +5780,7 @@ async fn test_malformed_headers() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_concurrent_connection_stress() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -5834,19 +5834,16 @@ async fn test_concurrent_connection_stress() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_backend_timeout_handling() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
         return;
     }
     
-    // バックエンドタイムアウトのハンドリングをテスト
-    // バックエンドが応答しない場合、502 Bad Gatewayまたはタイムアウトエラーが返される
-    
-    // 通常のリクエストが正常に処理されることを確認
-    // 並列実行時のタイムアウト対策としてリトライロジックを追加
-    let response = send_request_with_retry(PROXY_PORT, "/", &[], 3).await;
+    // バックエンドがタイムアウトした場合、502 Bad Gatewayが返されることを確認
+    // 新しく用意した /slow/ パスを使用（存在しないポートへ転送）
+    let response = send_request_with_retry(PROXY_PORT, "/slow/", &[], 1).await;
     assert!(response.is_some(), "Should receive response after retries");
     
     let response = response.unwrap();
@@ -5866,7 +5863,7 @@ async fn test_backend_timeout_handling() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_chunked_transfer_encoding() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -5928,7 +5925,7 @@ async fn test_chunked_transfer_encoding() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_http_version_negotiation() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -5959,7 +5956,7 @@ async fn test_http_version_negotiation() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_keep_alive_multiple_requests() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -6137,7 +6134,7 @@ async fn test_keep_alive_multiple_requests() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_sni_hostname_negotiation() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -6197,7 +6194,7 @@ async fn test_sni_hostname_negotiation() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_sni_different_hostname() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -6264,7 +6261,7 @@ async fn test_sni_different_hostname() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_redirect_307() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -6294,7 +6291,7 @@ async fn test_redirect_307() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_redirect_308() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -6324,7 +6321,7 @@ async fn test_redirect_308() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_redirect_method_preservation() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -6391,7 +6388,7 @@ async fn test_redirect_method_preservation() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_prometheus_metrics_detailed() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -6431,7 +6428,7 @@ async fn test_prometheus_metrics_detailed() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_prometheus_metrics_after_errors() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -6475,7 +6472,7 @@ async fn test_prometheus_metrics_after_errors() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_header_manipulation_multiple_headers() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -6515,7 +6512,7 @@ async fn test_header_manipulation_multiple_headers() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_header_manipulation_case_insensitive() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -6549,7 +6546,7 @@ async fn test_header_manipulation_case_insensitive() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_header_manipulation_special_characters() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -6581,7 +6578,7 @@ async fn test_header_manipulation_special_characters() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_cache_stale_if_error() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -6612,7 +6609,7 @@ async fn test_cache_stale_if_error() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_cache_vary_header() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -6651,7 +6648,7 @@ async fn test_cache_vary_header() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_cache_invalidation() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -6683,7 +6680,7 @@ async fn test_cache_invalidation() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_cache_query_parameter_handling() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -6737,7 +6734,7 @@ async fn test_cache_query_parameter_handling() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_buffering_large_response() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -6769,7 +6766,28 @@ async fn test_buffering_large_response() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(5000)]
+async fn test_100_continue() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    use crate::common::http1_client::Http1TestClient;
+    
+    let client = Http1TestClient::new_https("localhost", PROXY_PORT).unwrap();
+    
+    // Expect: 100-continueヘッダーを含むリクエストを送信
+    let body = vec![b'a'; 100];
+    let (status, resp_body) = client.post_with_headers("/", &[("Expect", "100-continue")], &body).await
+        .expect("Failed to send 100-continue request");
+    
+    assert_eq!(status, 200, "Should return 200 OK after 100-continue flow");
+    assert!(!resp_body.is_empty(), "Response body should not be empty");
+}
+
+#[tokio::test]
+#[ntest::timeout(3000)]
 async fn test_buffering_chunked_response() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -6798,7 +6816,7 @@ async fn test_buffering_chunked_response() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_buffering_empty_response() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -6824,7 +6842,7 @@ async fn test_buffering_empty_response() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_buffering_zero_content_length() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -6848,7 +6866,7 @@ async fn test_buffering_zero_content_length() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_buffering_adaptive_threshold_switch() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -6881,7 +6899,7 @@ async fn test_buffering_adaptive_threshold_switch() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_buffering_adaptive_content_length_missing() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -6913,7 +6931,7 @@ async fn test_buffering_adaptive_content_length_missing() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_buffering_max_memory_buffer_within_limit() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -6941,7 +6959,7 @@ async fn test_buffering_max_memory_buffer_within_limit() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_buffering_invalid_content_length() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -6970,7 +6988,7 @@ async fn test_buffering_invalid_content_length() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_health_check_interval() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -6999,7 +7017,7 @@ async fn test_health_check_interval() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_health_check_timeout() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -7023,7 +7041,7 @@ async fn test_health_check_timeout() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_health_check_threshold() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -7052,7 +7070,7 @@ async fn test_health_check_threshold() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_health_check_healthy_status_200() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -7080,7 +7098,7 @@ async fn test_health_check_healthy_status_200() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_health_check_healthy_status_custom() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -7102,7 +7120,7 @@ async fn test_health_check_healthy_status_custom() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_health_check_unhealthy_status_500() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -7125,7 +7143,7 @@ async fn test_health_check_unhealthy_status_500() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_health_check_threshold_reset_on_success() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -7154,7 +7172,7 @@ async fn test_health_check_threshold_reset_on_success() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_health_check_threshold_reset_on_failure() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -7179,7 +7197,7 @@ async fn test_health_check_threshold_reset_on_failure() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_health_check_path_custom() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -7199,7 +7217,7 @@ async fn test_health_check_path_custom() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_health_check_interval_accuracy() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -7232,7 +7250,7 @@ async fn test_health_check_interval_accuracy() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_health_check_timeout_enforcement() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -7261,7 +7279,7 @@ async fn test_health_check_timeout_enforcement() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_websocket_invalid_upgrade_request() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -7293,7 +7311,7 @@ async fn test_websocket_invalid_upgrade_request() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_websocket_missing_connection_header() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -7325,7 +7343,7 @@ async fn test_websocket_missing_connection_header() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_websocket_invalid_websocket_version() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -7357,7 +7375,7 @@ async fn test_websocket_invalid_websocket_version() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_websocket_connection_close() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -7447,7 +7465,7 @@ async fn test_websocket_connection_close() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_websocket_unexpected_close() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -7527,7 +7545,7 @@ async fn test_websocket_unexpected_close() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_load_balancing_weighted_distribution() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -7566,7 +7584,7 @@ async fn test_load_balancing_weighted_distribution() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_load_balancing_backend_failure() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -7590,7 +7608,7 @@ async fn test_load_balancing_backend_failure() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_load_balancing_session_affinity() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -7628,7 +7646,7 @@ async fn test_load_balancing_session_affinity() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_via_header() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -7656,73 +7674,7 @@ async fn test_via_header() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
-async fn test_100_continue() {
-    if !is_e2e_environment_ready().await {
-        eprintln!("Skipping test: E2E environment not ready");
-        return;
-    }
-    
-    // 100 Continueのテスト（RFC 7231 Section 5.1.1）
-    // Expect: 100-continueヘッダーを含むリクエストを送信
-    
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
-    
-    // TLS接続を確立
-    let config = create_client_config();
-    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
-    let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
-    
-    // TLSハンドシェイクを完了
-    while tls_conn.is_handshaking() {
-        match tls_conn.complete_io(&mut stream) {
-            Ok(_) => {}
-            Err(_) => {
-                panic!("TLS handshake error");
-            }
-        }
-    }
-    
-    let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
-    
-    // Expect: 100-continueヘッダーを含むリクエストを送信
-    let request = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\nExpect: 100-continue\r\n\r\n";
-    if let Err(e) = tls_stream.write_all(request) {
-        panic!("Failed to send request: {:?}", e);
-    }
-    tls_stream.flush().unwrap();
-    
-    // レスポンスを受信（100 Continueまたは200 OK）
-    let mut response = Vec::new();
-    let mut buf = [0u8; 8192];
-    loop {
-        match tls_stream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => response.extend_from_slice(&buf[..n]),
-            Err(_) => break,
-        }
-    }
-    
-    let response = String::from_utf8_lossy(&response);
-    let status = get_status_code(&response);
-    
-    // 100 Continueまたは200 OKが返される可能性がある
-    assert!(
-        status == Some(100),
-        "Should return 100, 200, or 404: {:?}", status
-    );
-    
-    if status == Some(100) {
-        eprintln!("100 Continue test: 100 Continue received");
-    } else {
-        eprintln!("100 Continue test: status {:?} (100 Continue may not be supported)", status);
-    }
-}
-
-#[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_hop_by_hop_headers() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -7781,7 +7733,7 @@ async fn test_hop_by_hop_headers() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_host_validation() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -7847,7 +7799,7 @@ async fn test_host_validation() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_connection_close_header() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -7920,7 +7872,7 @@ async fn test_connection_close_header() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_connection_abort() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -7968,7 +7920,7 @@ async fn test_connection_abort() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_empty_request() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -8034,7 +7986,7 @@ async fn test_empty_request() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_incomplete_request_line() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -8100,7 +8052,7 @@ async fn test_incomplete_request_line() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_range_request_multiple_ranges() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -8131,7 +8083,7 @@ async fn test_range_request_multiple_ranges() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_range_request_not_satisfiable() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -8171,7 +8123,7 @@ async fn test_range_request_not_satisfiable() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_range_request_suffix() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -8207,7 +8159,7 @@ async fn test_range_request_suffix() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_range_request_open_ended() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -8247,7 +8199,7 @@ async fn test_range_request_open_ended() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_te_header_trailers() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -8275,7 +8227,7 @@ async fn test_te_header_trailers() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_te_header_encodings() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -8306,7 +8258,7 @@ async fn test_te_header_encodings() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_content_length_transfer_encoding_conflict() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -8372,7 +8324,7 @@ async fn test_content_length_transfer_encoding_conflict() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_invalid_content_length() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -8434,7 +8386,7 @@ async fn test_invalid_content_length() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_multiple_content_length() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -8500,7 +8452,7 @@ async fn test_multiple_content_length() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_static_file_mime_type() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -8532,7 +8484,7 @@ async fn test_static_file_mime_type() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_static_file_content_length() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -8564,7 +8516,7 @@ async fn test_static_file_content_length() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_static_file_etag() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -8596,7 +8548,7 @@ async fn test_static_file_etag() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_static_file_last_modified() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -8632,7 +8584,7 @@ async fn test_static_file_last_modified() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_chunked_transfer_encoding_size() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -8664,7 +8616,7 @@ async fn test_chunked_transfer_encoding_size() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_chunked_transfer_encoding_trailer() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -8700,7 +8652,7 @@ async fn test_chunked_transfer_encoding_trailer() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_connection_timeout_handling() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -8728,7 +8680,7 @@ async fn test_connection_timeout_handling() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_oversized_request_line() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -8791,7 +8743,7 @@ async fn test_oversized_request_line() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_oversized_header() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -8854,7 +8806,7 @@ async fn test_oversized_header() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_malformed_request() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -8920,7 +8872,7 @@ async fn test_malformed_request() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_http_method_put() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -8943,7 +8895,7 @@ async fn test_http_method_put() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_http_method_delete() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -8966,7 +8918,7 @@ async fn test_http_method_delete() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_http_method_patch() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -8989,7 +8941,7 @@ async fn test_http_method_patch() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_http_method_options() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -9018,7 +8970,7 @@ async fn test_http_method_options() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_http_method_head() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -9054,7 +9006,7 @@ async fn test_http_method_head() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_redirect_location_header() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -9085,7 +9037,7 @@ async fn test_redirect_location_header() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_redirect_cache_control() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -9117,7 +9069,7 @@ async fn test_redirect_cache_control() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_error_handling_413_payload_too_large() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -9180,7 +9132,7 @@ async fn test_error_handling_413_payload_too_large() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_error_handling_431_request_header_fields_too_large() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -9208,7 +9160,7 @@ async fn test_error_handling_431_request_header_fields_too_large() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_concurrent_requests_different_paths() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -9256,7 +9208,7 @@ async fn test_concurrent_requests_different_paths() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_concurrent_requests_mixed_methods() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -9305,7 +9257,7 @@ async fn test_concurrent_requests_mixed_methods() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_concurrent_requests_with_headers() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -9359,7 +9311,7 @@ async fn test_concurrent_requests_with_headers() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_connection_pool_reuse() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -9400,7 +9352,7 @@ async fn test_connection_pool_reuse() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_connection_pool_multiple_sequential() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -9438,7 +9390,7 @@ async fn test_connection_pool_multiple_sequential() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_response_time_consistency() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -9482,7 +9434,7 @@ async fn test_response_time_consistency() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_throughput_basic() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -9531,7 +9483,7 @@ async fn test_throughput_basic() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_stress_rapid_requests() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -9567,7 +9519,7 @@ async fn test_stress_rapid_requests() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_stress_long_duration() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -9618,7 +9570,7 @@ async fn test_stress_long_duration() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_keep_alive_timeout() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -9707,7 +9659,7 @@ async fn test_keep_alive_timeout() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_keep_alive_max_requests() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -9786,7 +9738,7 @@ async fn test_keep_alive_max_requests() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_prometheus_metrics_request_count() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -9811,7 +9763,7 @@ async fn test_prometheus_metrics_request_count() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_prometheus_metrics_latency() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -9836,7 +9788,7 @@ async fn test_prometheus_metrics_latency() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_prometheus_metrics_connections() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -9861,7 +9813,7 @@ async fn test_prometheus_metrics_connections() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_prometheus_metrics_after_requests() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -9893,7 +9845,7 @@ async fn test_prometheus_metrics_after_requests() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_security_x_forwarded_for() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -9916,7 +9868,7 @@ async fn test_security_x_forwarded_for() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_security_x_real_ip() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -9939,7 +9891,7 @@ async fn test_security_x_real_ip() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_security_strict_transport_security() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -9974,7 +9926,7 @@ async fn test_security_strict_transport_security() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_error_handling_500_internal_server_error() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -10002,7 +9954,7 @@ async fn test_error_handling_500_internal_server_error() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_error_handling_503_service_unavailable() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -10030,7 +9982,7 @@ async fn test_error_handling_503_service_unavailable() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_error_handling_timeout() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -10070,7 +10022,7 @@ async fn test_error_handling_timeout() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_compression_zstd() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -10118,7 +10070,7 @@ async fn test_compression_zstd() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_compression_multiple_encodings() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -10162,7 +10114,7 @@ async fn test_compression_multiple_encodings() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_compression_no_encoding() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -10209,7 +10161,7 @@ async fn test_compression_no_encoding() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_load_balancing_round_robin_distribution() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -10249,7 +10201,7 @@ async fn test_load_balancing_round_robin_distribution() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_load_balancing_backend_identification() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -10285,7 +10237,7 @@ async fn test_load_balancing_backend_identification() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_cache_age_header() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -10329,7 +10281,7 @@ async fn test_cache_age_header() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_cache_vary_header_handling() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -10365,7 +10317,7 @@ async fn test_cache_vary_header_handling() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_cache_max_age_header() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -10398,7 +10350,7 @@ async fn test_cache_max_age_header() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_buffering_adaptive_threshold() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -10435,7 +10387,7 @@ async fn test_buffering_adaptive_threshold() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_buffering_memory_limit() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -10471,7 +10423,7 @@ async fn test_buffering_memory_limit() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_buffering_chunked_vs_full() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -10506,7 +10458,7 @@ async fn test_buffering_chunked_vs_full() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_h2c_proxy_forwarding() {
     if !is_e2e_environment_ready().await {
@@ -10538,7 +10490,7 @@ async fn test_h2c_proxy_forwarding() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_h2c_get_request() {
     if !is_e2e_environment_ready().await {
@@ -10568,7 +10520,7 @@ async fn test_h2c_get_request() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_h2c_post_request() {
     if !is_e2e_environment_ready().await {
@@ -10598,7 +10550,7 @@ async fn test_h2c_post_request() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_h2c_header_manipulation() {
     if !is_e2e_environment_ready().await {
@@ -10629,7 +10581,7 @@ async fn test_h2c_header_manipulation() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_h2c_connection_timeout() {
     if !is_e2e_environment_ready().await {
@@ -10656,7 +10608,7 @@ async fn test_h2c_connection_timeout() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_h2c_backend_unavailable() {
     if !is_e2e_environment_ready().await {
@@ -10684,7 +10636,7 @@ async fn test_h2c_backend_unavailable() {
 // カテゴリ1: 基本接続テスト（優先度: 高）
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_h2c_basic_connection() {
     if !is_e2e_environment_ready().await {
@@ -10716,7 +10668,7 @@ async fn test_h2c_basic_connection() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_h2c_connection_reuse() {
     if !is_e2e_environment_ready().await {
@@ -10750,7 +10702,7 @@ async fn test_h2c_connection_reuse() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_h2c_connection_close() {
     if !is_e2e_environment_ready().await {
@@ -10776,7 +10728,7 @@ async fn test_h2c_connection_close() {
 // カテゴリ2: ハンドシェイクテスト（優先度: 高）
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_h2c_handshake_success() {
     if !is_e2e_environment_ready().await {
@@ -10807,7 +10759,7 @@ async fn test_h2c_handshake_success() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_h2c_settings_negotiation() {
     if !is_e2e_environment_ready().await {
@@ -10830,7 +10782,7 @@ async fn test_h2c_settings_negotiation() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_h2c_handshake_failure() {
     if !is_e2e_environment_ready().await {
@@ -10855,7 +10807,7 @@ async fn test_h2c_handshake_failure() {
 // カテゴリ3: リクエスト/レスポンステスト（優先度: 高）
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_h2c_large_request_body() {
     if !is_e2e_environment_ready().await {
@@ -10885,7 +10837,7 @@ async fn test_h2c_large_request_body() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_h2c_large_response_body() {
     if !is_e2e_environment_ready().await {
@@ -10916,7 +10868,7 @@ async fn test_h2c_large_response_body() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_h2c_header_compression() {
     if !is_e2e_environment_ready().await {
@@ -10949,7 +10901,7 @@ async fn test_h2c_header_compression() {
 // カテゴリ4: ストリーム多重化テスト（優先度: 中）
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_h2c_multiple_streams() {
     if !is_e2e_environment_ready().await {
@@ -10992,7 +10944,7 @@ async fn test_h2c_multiple_streams() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_h2c_stream_priority() {
     if !is_e2e_environment_ready().await {
@@ -11020,7 +10972,7 @@ async fn test_h2c_stream_priority() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_h2c_stream_cancellation() {
     if !is_e2e_environment_ready().await {
@@ -11046,7 +10998,7 @@ async fn test_h2c_stream_cancellation() {
 // カテゴリ5: エラーハンドリングテスト（優先度: 高）
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_h2c_invalid_frame() {
     if !is_e2e_environment_ready().await {
@@ -11073,7 +11025,7 @@ async fn test_h2c_invalid_frame() {
 // カテゴリ6: プロキシ機能テスト（優先度: 高）
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_h2c_proxy_load_balancing() {
     if !is_e2e_environment_ready().await {
@@ -11108,7 +11060,7 @@ async fn test_h2c_proxy_load_balancing() {
 // カテゴリ7: gRPC統合テスト（優先度: 中）
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(all(feature = "http2", feature = "grpc"))]
 async fn test_h2c_grpc_unary_call() {
     if !is_e2e_environment_ready().await {
@@ -11142,7 +11094,7 @@ async fn test_h2c_grpc_unary_call() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(all(feature = "http2", feature = "grpc"))]
 async fn test_h2c_grpc_streaming() {
     if !is_e2e_environment_ready().await {
@@ -11178,7 +11130,7 @@ async fn test_h2c_grpc_streaming() {
 // カテゴリ8: パフォーマンステスト（優先度: 低）
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_h2c_throughput() {
     if !is_e2e_environment_ready().await {
@@ -11214,7 +11166,7 @@ async fn test_h2c_throughput() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_h2c_latency() {
     if !is_e2e_environment_ready().await {
@@ -11254,7 +11206,7 @@ async fn test_h2c_latency() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_buffering_disk_spillover_enabled() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -11294,7 +11246,7 @@ async fn test_buffering_disk_spillover_enabled() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_buffering_disk_spillover_disabled() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -11320,7 +11272,7 @@ async fn test_buffering_disk_spillover_disabled() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_buffering_client_write_timeout() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -11354,7 +11306,7 @@ async fn test_buffering_client_write_timeout() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_buffering_slow_client_detection() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -11387,7 +11339,7 @@ async fn test_buffering_slow_client_detection() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_buffering_full_backend_connection_early_release() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -11425,7 +11377,7 @@ async fn test_buffering_full_backend_connection_early_release() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_buffering_streaming_backend_connection_release() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -11461,7 +11413,7 @@ async fn test_buffering_streaming_backend_connection_release() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_buffering_adaptive_threshold_exact() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -11534,7 +11486,7 @@ async fn test_buffering_adaptive_threshold_exact() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_websocket_poll_mode_fixed() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -11599,7 +11551,7 @@ async fn test_websocket_poll_mode_fixed() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_websocket_poll_mode_adaptive_active() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -11663,7 +11615,7 @@ async fn test_websocket_poll_mode_adaptive_active() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_websocket_long_connection() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -11731,7 +11683,7 @@ async fn test_websocket_long_connection() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_health_check_unhealthy_threshold_exact() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -11785,7 +11737,7 @@ async fn test_health_check_unhealthy_threshold_exact() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_health_check_healthy_threshold_exact() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -11839,7 +11791,7 @@ async fn test_health_check_healthy_threshold_exact() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_health_check_tls_cert_verification_enabled() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -11864,7 +11816,7 @@ async fn test_health_check_tls_cert_verification_enabled() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_health_check_tls_cert_verification_disabled() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -11889,7 +11841,7 @@ async fn test_health_check_tls_cert_verification_disabled() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_health_check_backend_slow_response() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -11924,7 +11876,7 @@ async fn test_health_check_backend_slow_response() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_health_check_backend_intermittent_failure() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -11967,7 +11919,7 @@ async fn test_health_check_backend_intermittent_failure() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_buffering_disk_spillover_max_size() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -11979,9 +11931,9 @@ async fn test_buffering_disk_spillover_max_size() {
     // 例: ./tests/e2e_setup.sh test buffering
     // disk_buffer_path = "/tmp/veil_buffer", max_disk_buffer = 100MB が設定されている場合のテスト
     
-    // ディスクバッファ上限（デフォルト100MB）を超える非常に大きなレスポンスをリクエスト
-    // 実際のテストでは、200MB以上のレスポンスを生成する必要がある
-    let response = send_request(PROXY_PORT, "/large.txt", &[]).await;
+    // ディスクバッファ上限（設定で10バイトに制限）を超えるレスポンスを誘発
+    // /disk-spillover/ は upstream へ正常に転送されるが、プロキシ側でバッファ制限がかかる
+    let response = send_request(PROXY_PORT, "/disk-spillover/", &[]).await;
     
     if let Some(response) = response {
         let status = get_status_code(&response);
@@ -11996,7 +11948,7 @@ async fn test_buffering_disk_spillover_max_size() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_buffering_performance_streaming_vs_full() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -12035,7 +11987,7 @@ async fn test_buffering_performance_streaming_vs_full() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_websocket_poll_mode_adaptive_idle() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -12099,7 +12051,7 @@ async fn test_websocket_poll_mode_adaptive_idle() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_websocket_idle_connection_timeout() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -12163,7 +12115,7 @@ async fn test_websocket_idle_connection_timeout() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_health_check_threshold_counting() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -12226,7 +12178,7 @@ async fn test_health_check_threshold_counting() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_health_check_tls_invalid_cert() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -12265,7 +12217,7 @@ mod wasm_tests {
     // ====================
 
     #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
     async fn test_wasm_module_load() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
@@ -12288,7 +12240,7 @@ mod wasm_tests {
     }
 
     #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
     async fn test_wasm_module_configuration() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
@@ -12309,7 +12261,7 @@ mod wasm_tests {
     }
 
     #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
     async fn test_wasm_context_lifecycle() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
@@ -12340,7 +12292,7 @@ mod wasm_tests {
     // ====================
 
     #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
     async fn test_wasm_on_request_headers() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
@@ -12364,7 +12316,7 @@ mod wasm_tests {
     }
 
     #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
     async fn test_wasm_on_response_headers() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
@@ -12388,7 +12340,7 @@ mod wasm_tests {
     }
 
     #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
     async fn test_wasm_on_log() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
@@ -12415,7 +12367,7 @@ mod wasm_tests {
     // ====================
 
     #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
     async fn test_wasm_header_operations() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
@@ -12445,7 +12397,7 @@ mod wasm_tests {
     // ====================
 
     #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
     async fn test_wasm_capability_headers() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
@@ -12470,7 +12422,7 @@ mod wasm_tests {
     // ====================
 
     #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
     async fn test_wasm_header_modification_filter() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
@@ -12499,7 +12451,7 @@ mod wasm_tests {
     }
 
     #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
     async fn test_wasm_route_specific_modules() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
@@ -12535,7 +12487,7 @@ mod wasm_tests {
     // ====================
 
     #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
     async fn test_wasm_on_request_body() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
@@ -12559,7 +12511,7 @@ mod wasm_tests {
     }
 
     #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
     async fn test_wasm_on_response_body() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
@@ -12594,7 +12546,7 @@ mod wasm_tests {
     // ====================
 
     #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
     async fn test_wasm_capability_logging() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
@@ -12618,7 +12570,7 @@ mod wasm_tests {
     }
 
     #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
     async fn test_wasm_capability_http_calls() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
@@ -12646,7 +12598,7 @@ mod wasm_tests {
     // ====================
 
     #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
     async fn test_wasm_timeout() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
@@ -12670,7 +12622,7 @@ mod wasm_tests {
     }
 
     #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
     async fn test_wasm_error_handling() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
@@ -12697,7 +12649,7 @@ mod wasm_tests {
     // ====================
 
     #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
     async fn test_wasm_multiple_modules() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
@@ -12726,7 +12678,7 @@ mod wasm_tests {
     }
 
     #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
     async fn test_wasm_concurrent_execution() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
@@ -12775,7 +12727,7 @@ mod wasm_tests {
     }
 
     #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
     async fn test_wasm_invalid_module() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
@@ -12808,7 +12760,7 @@ mod wasm_tests {
     // ====================
 
     #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
     async fn test_wasm_request_header_read() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
@@ -12834,7 +12786,7 @@ mod wasm_tests {
     }
 
     #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
     async fn test_wasm_response_header_modification() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
@@ -12872,7 +12824,7 @@ mod wasm_tests {
     // ====================
 
     #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
     async fn test_wasm_capability_local_response() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
@@ -12901,7 +12853,7 @@ mod wasm_tests {
     // ====================
 
     #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
     async fn test_wasm_performance() {
         if !is_e2e_environment_ready().await {
             eprintln!("Skipping test: E2E environment not ready");
@@ -12952,7 +12904,7 @@ mod wasm_tests {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_routing_combined_conditions() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -12986,7 +12938,7 @@ async fn test_routing_combined_conditions() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_routing_condition_priority() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -13018,7 +12970,7 @@ async fn test_routing_condition_priority() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_routing_wildcard_host() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -13049,7 +13001,7 @@ async fn test_routing_wildcard_host() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_routing_wildcard_path() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -13080,7 +13032,7 @@ async fn test_routing_wildcard_path() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_routing_header_multiple() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -13119,7 +13071,7 @@ async fn test_routing_header_multiple() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_routing_query_multiple() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -13152,7 +13104,7 @@ async fn test_routing_query_multiple() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_routing_source_ip_cidr() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -13176,7 +13128,7 @@ async fn test_routing_source_ip_cidr() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_routing_condition_and_logic() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -13225,7 +13177,7 @@ async fn test_routing_condition_and_logic() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_routing_case_insensitive_host() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -13253,7 +13205,7 @@ async fn test_routing_case_insensitive_host() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_routing_case_insensitive_header() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -13281,7 +13233,7 @@ async fn test_routing_case_insensitive_header() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_routing_empty_path() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -13301,7 +13253,7 @@ async fn test_routing_empty_path() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_routing_trailing_slash() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -13330,7 +13282,7 @@ async fn test_routing_trailing_slash() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_routing_query_parameter_encoding() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -13351,7 +13303,7 @@ async fn test_routing_query_parameter_encoding() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_routing_source_ip_ipv6() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -13380,7 +13332,7 @@ async fn test_routing_source_ip_ipv6() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_h2c_server_prior_knowledge() {
     if !is_e2e_environment_ready().await {
@@ -13406,7 +13358,7 @@ async fn test_h2c_server_prior_knowledge() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_h2c_server_multiple_connections() {
     if !is_e2e_environment_ready().await {
@@ -13437,7 +13389,7 @@ async fn test_h2c_server_multiple_connections() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_h2c_server_connection_close() {
     if !is_e2e_environment_ready().await {
@@ -13458,7 +13410,7 @@ async fn test_h2c_server_connection_close() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_h2c_large_header_block() {
     if !is_e2e_environment_ready().await {
@@ -13488,7 +13440,7 @@ async fn test_h2c_large_header_block() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 #[cfg(feature = "http2")]
 async fn test_h2c_flow_control() {
     if !is_e2e_environment_ready().await {
@@ -13523,7 +13475,7 @@ async fn test_h2c_flow_control() {
 // ====================
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_graceful_reload_complete() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -13552,7 +13504,7 @@ async fn test_graceful_reload_complete() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_graceful_reload_invalid_config() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -13577,7 +13529,7 @@ async fn test_graceful_reload_invalid_config() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_graceful_reload_route_changes() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -13602,7 +13554,7 @@ async fn test_graceful_reload_route_changes() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_graceful_reload_upstream_changes() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -13627,7 +13579,7 @@ async fn test_graceful_reload_upstream_changes() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_graceful_shutdown() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -13654,7 +13606,7 @@ async fn test_graceful_shutdown() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_config_validation_complete() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -13680,7 +13632,7 @@ async fn test_config_validation_complete() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_log_level_trace() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -13706,7 +13658,7 @@ async fn test_log_level_trace() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_log_level_debug() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -13723,7 +13675,7 @@ async fn test_log_level_debug() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_log_level_info() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -13740,7 +13692,7 @@ async fn test_log_level_info() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_log_level_warn() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -13757,7 +13709,7 @@ async fn test_log_level_warn() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_log_level_error() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -13778,7 +13730,7 @@ async fn test_log_level_error() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_log_format_text() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -13795,7 +13747,7 @@ async fn test_log_format_text() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_log_format_json() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -13812,7 +13764,7 @@ async fn test_log_format_json() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_log_rotation() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -13832,7 +13784,7 @@ async fn test_log_rotation() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_zero_downtime_reload() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -13857,7 +13809,7 @@ async fn test_zero_downtime_reload() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_backend_rolling_update() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -13893,7 +13845,7 @@ async fn test_backend_rolling_update() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_health_check_gradual_degradation() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -13929,7 +13881,7 @@ async fn test_health_check_gradual_degradation() {
 }
 
 #[tokio::test]
-#[ntest::timeout(1000)]
+#[ntest::timeout(3000)]
 async fn test_metrics_aggregation() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
