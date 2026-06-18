@@ -5653,30 +5653,17 @@ async fn test_request_timeout() {
     }
     
     // リクエストタイムアウトのテスト
-    // タイムアウトが設定されている場合、長時間かかるリクエストがタイムアウトする
     
-    use std::time::Instant;
-    
-    let start = Instant::now();
-    let response = send_request(PROXY_PORT, "/", &[]).await;
-    let elapsed = start.elapsed();
-    
+    let response = send_request(PROXY_PORT, "/slow/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
     let status = get_status_code(&response);
     
-    // 正常なリクエストは通常2秒以内に完了するはずだが、
-    // テスト実行時の負荷によっては遅くなることがある
-    // タイムアウトテストとして、10秒以内に完了することを確認
     assert!(
-        elapsed.as_secs() < 10,
-        "Request should complete within 10 seconds, took {:?}", elapsed
+        status == Some(502) || status == Some(504),
+        "Should return 502 or 504 for request timeout, got: {:?}", status
     );
-    
-    assert_eq!(status, Some(200), "Should return 200 OK");
-    
-    eprintln!("Request timeout test: completed in {:?}", elapsed);
 }
 
 #[tokio::test]
@@ -6967,20 +6954,46 @@ async fn test_buffering_invalid_content_length() {
     }
     
     // 不正なContent-Lengthヘッダーの動作確認
-    // 注意: このテストは設定ファイルでバッファリングを有効化する必要がある
     
-    // 通常のリクエストを送信（バックエンドが不正なContent-Lengthを返す場合は別途テストが必要）
-    let response = send_request(PROXY_PORT, "/", &[]).await;
-    assert!(response.is_some(), "Should receive response");
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
     
-    let response = response.unwrap();
+    let config = create_client_config();
+    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
+    let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
+    
+    while tls_conn.is_handshaking() {
+        if let Err(_) = tls_conn.complete_io(&mut stream) {
+            panic!("TLS handshake error");
+        }
+    }
+    
+    let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
+    
+    let request = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: invalid\r\n\r\n";
+    if let Err(e) = tls_stream.write_all(request) {
+        panic!("Failed to send request: {:?}", e);
+    }
+    tls_stream.flush().unwrap();
+    
+    let mut response = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match tls_stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    
+    let response = String::from_utf8_lossy(&response);
     let status = get_status_code(&response);
-    assert_eq!(status, Some(200), "Should return 200 OK");
     
-    // Content-Lengthヘッダーを確認
-    let content_length = get_content_length_from_headers(response.as_bytes());
-    // 不正なContent-Lengthが存在する場合でも、プロキシが適切に処理することを確認
-    eprintln!("Buffering invalid content length test: content_length={:?}", content_length);
+    assert!(
+        status == Some(400),
+        "Should return 400 Bad Request for invalid content length, got: {:?}", status
+    );
 }
 
 // ====================
@@ -7024,20 +7037,9 @@ async fn test_health_check_timeout() {
         return;
     }
     
-    // ヘルスチェックタイムアウトのテスト
-    // 注意: このテストは設定ファイルでヘルスチェックを有効化する必要がある
-    
-    // 通常のリクエストが成功することを確認
-    let response = send_request(PROXY_PORT, "/", &[]).await;
-    assert!(response.is_some(), "Should receive response");
-    
-    let response = response.unwrap();
-    let status = get_status_code(&response);
-    assert_eq!(status, Some(200), "Should return 200 OK");
-    
-    // ヘルスチェックタイムアウトが適切に設定されている場合、タイムアウトが発生する可能性がある
-    // 実際のテストには、バックエンドの遅延をシミュレートする必要がある
-    eprintln!("Health check timeout test: request successful");
+    // 意味のないテストだったため、明示的に失敗するように修正
+    // 実際のヘルスチェックタイムアウトをテストするには、バックエンドの挙動をモック化する必要がある
+    assert!(false, "This test requires a mock backend to simulate health check timeout and is intentionally failing to flag it as meaningless.");
 }
 
 #[tokio::test]
@@ -7257,21 +7259,8 @@ async fn test_health_check_timeout_enforcement() {
         return;
     }
     
-    // タイムアウトの強制を確認
-    // 注意: このテストは設定ファイルでヘルスチェックを有効化する必要がある
-    // 実際のテストには、バックエンドの遅延をシミュレートする必要がある
-    
-    // 通常のリクエストが成功することを確認
-    let response = send_request(PROXY_PORT, "/", &[]).await;
-    assert!(response.is_some(), "Should receive response");
-    
-    let response = response.unwrap();
-    let status = get_status_code(&response);
-    assert_eq!(status, Some(200), "Should return 200 OK");
-    
-    // タイムアウトが適切に設定されている場合、タイムアウト時間経過後にリクエストがキャンセルされる
-    // 実際のテストには、バックエンドの遅延をシミュレートする必要がある
-    eprintln!("Health check timeout enforcement test: request successful");
+    // 意味のないテストだったため、明示的に失敗するように修正
+    assert!(false, "This test requires a mock backend to simulate health check timeout enforcement and is intentionally failing to flag it as meaningless.");
 }
 
 // ====================
@@ -8660,19 +8649,18 @@ async fn test_connection_timeout_handling() {
     }
     
     // 接続タイムアウトのテスト
-    // 接続タイムアウトが正しく処理されることを確認
+    // 存在しないバックエンドへの接続を試みる
     
-    // 注意: 実際のタイムアウトテストは時間がかかるため、
-    // ここでは基本的な動作確認のみ
-    
-    let response = send_request(PROXY_PORT, "/", &[]).await;
+    let response = send_request(PROXY_PORT, "/slow/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
     let status = get_status_code(&response);
-    assert_eq!(status, Some(200), "Should return 200 OK");
     
-    eprintln!("Connection timeout test: connection established successfully (timeout handling verified)");
+    assert!(
+        status == Some(502) || status == Some(504),
+        "Should return 502 or 504 for connection timeout, got: {:?}", status
+    );
 }
 
 // ====================
@@ -9139,20 +9127,51 @@ async fn test_error_handling_431_request_header_fields_too_large() {
         return;
     }
     
-    // 431 Request Header Fields Too Largeのテスト
     // 過大なヘッダーを送信して、サイズ制限を確認
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
     
-    // このテストは既に test_oversized_header で実装されているため、
-    // ここでは基本的な動作確認のみ
+    let config = create_client_config();
+    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
+    let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
     
-    let response = send_request(PROXY_PORT, "/", &[]).await;
-    assert!(response.is_some(), "Should receive response");
+    while tls_conn.is_handshaking() {
+        if let Err(_) = tls_conn.complete_io(&mut stream) {
+            panic!("TLS handshake error");
+        }
+    }
     
-    let response = response.unwrap();
+    let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
+    
+    let large_header_value = "x".repeat(100000);
+    let oversized_request = format!(
+        "GET / HTTP/1.1\r\nHost: localhost\r\nX-Large-Header: {}\r\n\r\n",
+        large_header_value
+    );
+    
+    if let Err(e) = tls_stream.write_all(oversized_request.as_bytes()) {
+        panic!("Failed to send oversized header request: {:?}", e);
+    }
+    tls_stream.flush().unwrap();
+    
+    let mut response = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match tls_stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    
+    let response = String::from_utf8_lossy(&response);
     let status = get_status_code(&response);
-    assert_eq!(status, Some(200), "Should return 200 OK");
     
-    eprintln!("431 Request Header Fields Too Large test: basic functionality verified");
+    assert_eq!(
+        status, Some(431),
+        "Should return 431 Request Header Fields Too Large for oversized header, got: {:?}", status
+    );
 }
 
 // ====================
@@ -9934,23 +9953,9 @@ async fn test_error_handling_500_internal_server_error() {
     }
     
     // 500 Internal Server Errorのテスト
-    // バックエンドが500を返す場合の動作を確認
-    
-    // 注意: 実際の500エラーを発生させるのは難しいため、
-    // ここでは基本的な動作確認のみ
-    
-    let response = send_request(PROXY_PORT, "/", &[]).await;
-    assert!(response.is_some(), "Should receive response");
-    
-    let response = response.unwrap();
-    let status = get_status_code(&response);
-    // 正常なレスポンスが返されることを確認
-    assert!(
-        status == Some(500),
-        "Should return 200, 404, or 500: {:?}", status
-    );
-    
-    eprintln!("Error handling 500 Internal Server Error test: status {:?}", status);
+    // 意味のないテストだったため修正: バックエンドが500を返すようにシミュレートするのは困難なため、
+    // 明示的にテストできない旨を含めてpanicさせるか、あるいは別エラーをテストします。
+    assert!(false, "This test requires a mock backend that returns 500 and is intentionally failing to flag it as meaningless.");
 }
 
 #[tokio::test]
@@ -9962,23 +9967,18 @@ async fn test_error_handling_503_service_unavailable() {
     }
     
     // 503 Service Unavailableのテスト
-    // バックエンドが利用できない場合の動作を確認
-    
-    // 注意: 実際の503エラーを発生させるのは難しいため、
-    // ここでは基本的な動作確認のみ
-    
-    let response = send_request(PROXY_PORT, "/", &[]).await;
+    // バックエンドが利用できない場合（ダウン中など）の動作を確認
+    // 存在しないポート（/slow/ルートなど）へアクセスし、502または503が返ることを確認する
+    let response = send_request(PROXY_PORT, "/slow/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
     let status = get_status_code(&response);
-    // 正常なレスポンスが返されることを確認
-    assert!(
-        status == Some(503),
-        "Should return 200, 404, or 503: {:?}", status
-    );
     
-    eprintln!("Error handling 503 Service Unavailable test: status {:?}", status);
+    assert!(
+        status == Some(503) || status == Some(502) || status == Some(504),
+        "Should return 503, 502 or 504 for unavailable backend, got: {:?}", status
+    );
 }
 
 #[tokio::test]
@@ -9990,31 +9990,19 @@ async fn test_error_handling_timeout() {
     }
     
     // タイムアウトエラーのテスト
-    // リクエストがタイムアウトする場合の動作を確認
+    // 存在しないバックエンド（/slow/）にアクセスしてタイムアウトまたは502を確認
     
-    // 注意: 実際のタイムアウトを発生させるのは難しいため、
-    // ここでは基本的な動作確認のみ
-    
-    use std::time::Instant;
-    
-    let start = Instant::now();
-    let response = send_request(PROXY_PORT, "/", &[]).await;
-    let elapsed = start.elapsed();
-    
+    let response = send_request(PROXY_PORT, "/slow/", &[]).await;
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
     let status = get_status_code(&response);
-    assert_eq!(status, Some(200), "Should return 200 OK");
     
-    // レスポンスが適切な時間内に返されることを確認
+    // バックエンドに接続できないため、502 Bad Gatewayまたは504 Gateway Timeoutになるべき
     assert!(
-        elapsed < Duration::from_secs(5),
-        "Response should be received within 5 seconds: {:?}",
-        elapsed
+        status == Some(502) || status == Some(504),
+        "Should return 502 or 504 for timeout, got: {:?}", status
     );
-    
-    eprintln!("Error handling timeout test: response received in {:?}", elapsed);
 }
 
 // ====================
@@ -11280,29 +11268,51 @@ async fn test_buffering_client_write_timeout() {
     }
     
     // クライアント書き込みタイムアウトの動作確認
-    // 注意: このテストは低速クライアントをシミュレートする必要がある
-    // 実際のテストでは、クライアントが書き込みを遅延させる必要がある
     
-    // 通常のリクエストを送信（リトライ付き）
-    let mut response = None;
-    for _retry in 0..3 {
-        response = send_request(PROXY_PORT, "/", &[]).await;
-        if response.is_some() {
-            break;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    stream.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+    
+    let config = create_client_config();
+    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
+    let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
+    
+    while tls_conn.is_handshaking() {
+        if let Err(_) = tls_conn.complete_io(&mut stream) {
+            panic!("TLS handshake error");
         }
-        std::thread::sleep(Duration::from_millis(100));
     }
     
-    if let Some(resp) = response {
-        let status = get_status_code(&resp);
-        assert_eq!(status, Some(200), "Should return 200 OK");
-        
-        // タイムアウトが適切に設定されている場合、低速クライアントでタイムアウトが発生する可能性がある
-        // 実際のテストには、低速クライアントのシミュレーションが必要
-        eprintln!("Buffering client write timeout test: status={:?}", status);
-    } else {
-        eprintln!("Buffering client write timeout test: failed to receive response (environment may not be ready)");
+    let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
+    
+    // 部分的なリクエストを送信して放置する
+    let request_part = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1000\r\n\r\npartial data";
+    if let Err(e) = tls_stream.write_all(request_part) {
+        panic!("Failed to send partial request: {:?}", e);
     }
+    tls_stream.flush().unwrap();
+    
+    // タイムアウトを待つ（サーバー側のタイムアウト設定によるが、ここでは数秒待機）
+    std::thread::sleep(Duration::from_secs(6));
+    
+    let mut response = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match tls_stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    
+    let response = String::from_utf8_lossy(&response);
+    let status = get_status_code(&response);
+    
+    // タイムアウトにより切断されるか、408 Request Timeoutが返るはず
+    assert!(
+        status == Some(408) || status.is_none() || status == Some(400),
+        "Should return 408 Request Timeout or close connection for slow client write, got: {:?}", status
+    );
 }
 
 #[tokio::test]
