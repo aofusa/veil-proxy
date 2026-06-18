@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use wasmtime::Store;
+use futures::channel::oneshot;
 
 use super::context::{HostState, HttpContext};
 use super::registry::{LoadedModule, ModuleRegistry};
@@ -130,7 +131,7 @@ impl FilterEngine {
         client_ip: &str,
         end_of_stream: bool,
     ) -> FilterResult {
-        // 指定されたモジュール名からLoadedModuleを取得
+        // 同期実行（互換性のため維持、ただしメインループからは非推奨）
         let modules: Vec<Arc<LoadedModule>> = module_names
             .iter()
             .filter_map(|name| self.registry.get_module(name))
@@ -181,6 +182,44 @@ impl FilterEngine {
         FilterResult::Continue {
             headers: current_headers,
             body: None,
+        }
+    }
+
+    /// Execute on_request_headers for specified modules ASYNCHRONOUSLY
+    /// 
+    /// This method offloads the WASM execution to a rayon thread pool
+    /// to avoid blocking the async event loop.
+    pub async fn on_request_headers_with_modules_async(
+        self: Arc<Self>,
+        module_names: Vec<String>,
+        path: String,
+        method: String,
+        headers: Vec<(String, String)>,
+        client_ip: String,
+        end_of_stream: bool,
+    ) -> FilterResult {
+        let (tx, rx) = oneshot::channel();
+        
+        let engine = self.clone();
+        let headers_clone = headers.clone();
+        rayon::spawn(move || {
+            let res = engine.on_request_headers_with_modules(
+                &module_names,
+                &path,
+                &method,
+                &headers_clone,
+                &client_ip,
+                end_of_stream,
+            );
+            let _ = tx.send(res);
+        });
+        
+        match rx.await {
+            Ok(res) => res,
+            Err(_) => FilterResult::Continue {
+                headers,
+                body: None,
+            },
         }
     }
 
@@ -332,6 +371,7 @@ impl FilterEngine {
     }
 
     /// Execute on_response_headers for specified modules
+    /// Execute on_response_headers for specified modules
     pub fn on_response_headers_with_modules(
         &self,
         module_names: &[String],
@@ -384,6 +424,37 @@ impl FilterEngine {
         FilterResult::Continue {
             headers: current_headers,
             body: None,
+        }
+    }
+
+    /// Execute on_response_headers for specified modules ASYNCHRONOUSLY
+    pub async fn on_response_headers_with_modules_async(
+        self: Arc<Self>,
+        module_names: Vec<String>,
+        status: u16,
+        headers: Vec<(String, String)>,
+        end_of_stream: bool,
+    ) -> FilterResult {
+        let (tx, rx) = oneshot::channel();
+        
+        let engine = self.clone();
+        let headers_clone = headers.clone();
+        rayon::spawn(move || {
+            let res = engine.on_response_headers_with_modules(
+                &module_names,
+                status,
+                &headers_clone,
+                end_of_stream,
+            );
+            let _ = tx.send(res);
+        });
+        
+        match rx.await {
+            Ok(res) => res,
+            Err(_) => FilterResult::Continue {
+                headers,
+                body: None,
+            },
         }
     }
 
@@ -667,6 +738,37 @@ impl FilterEngine {
         }
     }
 
+    /// Execute on_request_body for specified modules ASYNCHRONOUSLY
+    /// 
+    /// This method offloads the WASM execution to a rayon thread pool
+    /// to avoid blocking the async event loop.
+    pub async fn on_request_body_with_modules_async(
+        self: Arc<Self>,
+        module_names: Vec<String>,
+        body: Vec<u8>,
+        end_of_stream: bool,
+    ) -> BodyFilterResult {
+        let (tx, rx) = oneshot::channel();
+        
+        let engine = self.clone();
+        let body_clone = body.clone();
+        rayon::spawn(move || {
+            let res = engine.on_request_body_with_modules(
+                &module_names,
+                &body_clone,
+                end_of_stream,
+            );
+            let _ = tx.send(res);
+        });
+        
+        match rx.await {
+            Ok(res) => res,
+            Err(_) => BodyFilterResult::Continue {
+                body,
+            },
+        }
+    }
+
     /// Execute on_request_body for a single module
     fn execute_on_request_body(
         &self,
@@ -809,6 +911,37 @@ impl FilterEngine {
         }
     }
 
+    /// Execute on_response_body for specified modules ASYNCHRONOUSLY
+    /// 
+    /// This method offloads the WASM execution to a rayon thread pool
+    /// to avoid blocking the async event loop.
+    pub async fn on_response_body_with_modules_async(
+        self: Arc<Self>,
+        module_names: Vec<String>,
+        body: Vec<u8>,
+        end_of_stream: bool,
+    ) -> BodyFilterResult {
+        let (tx, rx) = oneshot::channel();
+        
+        let engine = self.clone();
+        let body_clone = body.clone();
+        rayon::spawn(move || {
+            let res = engine.on_response_body_with_modules(
+                &module_names,
+                &body_clone,
+                end_of_stream,
+            );
+            let _ = tx.send(res);
+        });
+        
+        match rx.await {
+            Ok(res) => res,
+            Err(_) => BodyFilterResult::Continue {
+                body,
+            },
+        }
+    }
+
     /// Execute on_response_body for a single module
     fn execute_on_response_body(
         &self,
@@ -912,6 +1045,25 @@ impl FilterEngine {
                 ftlog::error!("[wasm:{}] on_log error: {}", module.name, e);
             }
         }
+    }
+
+    /// Execute on_log for specified modules ASYNCHRONOUSLY
+    /// 
+    /// This method offloads the WASM execution to a rayon thread pool
+    /// to avoid blocking the async event loop.
+    pub async fn on_log_with_modules_async(
+        self: Arc<Self>,
+        module_names: Vec<String>,
+    ) {
+        let (tx, rx) = oneshot::channel();
+        
+        let engine = self.clone();
+        rayon::spawn(move || {
+            engine.on_log_with_modules(&module_names);
+            let _ = tx.send(());
+        });
+        
+        let _ = rx.await;
     }
 
     /// Execute on_log for a single module

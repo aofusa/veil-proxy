@@ -39,7 +39,7 @@ pub use engine::{BodyFilterResult, FilterEngine, FilterResult};
 pub use grpc_integration::{on_grpc_initial_metadata, on_grpc_message, on_grpc_trailing_metadata, on_grpc_close};
 #[cfg(feature = "grpc")]
 pub use grpc_integration::{GrpcCallResponse, process_grpc_response, status as grpc_status};
-pub use integration::{on_request_complete, on_context_destroy, on_http_call_complete, on_tick, on_queue_ready, WasmHttpCallResult, TickConfig, PendingHttpCallInfo, process_pending_http_calls, resume_after_http_call};
+pub use integration::{on_request_complete, on_request_complete_async, on_context_destroy, on_http_call_complete, on_tick, on_queue_ready, WasmHttpCallResult, TickConfig, PendingHttpCallInfo, process_pending_http_calls, resume_after_http_call};
 pub use queue_notify::{subscribe_to_queue, unsubscribe_from_queue, notify_queue_subscribers, get_queue_stats, queue_enqueued, process_pending_notifications, QueueStats};
 pub use tick_manager::{register_tick, process_ticks, get_min_tick_period, get_tick_stats, TickStats};
 pub use registry::ModuleRegistry;

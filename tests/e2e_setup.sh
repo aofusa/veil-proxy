@@ -279,6 +279,7 @@ listen = "127.0.0.1:${PROXY_HTTPS_PORT}"
 http = "127.0.0.1:${PROXY_HTTP_PORT}"
 redirect_http_to_https = false
 threads = 1
+http2_enabled = true
 http3_enabled = true
 
 [tls]
@@ -957,10 +958,18 @@ run_tests() {
     export RUST_TEST_THREADS="${TEST_THREADS}"
     
     # デバッグ: 実際に実行されるコマンドを確認
-    log_info "Command: cargo test --test e2e_tests --features 'ktls,http2,http3,grpc-full,wasm' -- --test-threads=${TEST_THREADS}"
-    
-    # テスト実行
-    cargo test --test e2e_tests --features 'ktls,http2,http3,grpc-full,wasm' -- --test-threads=${TEST_THREADS}
+    if [ -n "${TEST_FILTER:-}" ]; then
+        log_info "Running filtered tests: ${TEST_FILTER}"
+        log_info "Command: cargo test --test e2e_tests --features 'ktls,http2,http3,grpc-full,wasm' -- ${TEST_FILTER} --test-threads=${TEST_THREADS} --nocapture"
+        
+        # テスト実行
+        cargo test --test e2e_tests --features 'ktls,http2,http3,grpc-full,wasm' -- "${TEST_FILTER}" --test-threads=${TEST_THREADS} --nocapture
+    else
+        log_info "Command: cargo test --test e2e_tests --features 'ktls,http2,http3,grpc-full,wasm' -- --test-threads=${TEST_THREADS}"
+        
+        # テスト実行
+        cargo test --test e2e_tests --features 'ktls,http2,http3,grpc-full,wasm' -- --test-threads=${TEST_THREADS}
+    fi
     
     log_info "E2E tests completed"
 }

@@ -36,7 +36,7 @@ AI エージェントおよびコントリビュータ向けの **最小指針**
 ## 行動指針
 
 1. 上記 **設計哲学・設計制約** に整合するか確認する。
-2. 変更前に、触るコードの `cfg(feature)`、エラーハンドリング、ftlog、serde 設定型を読む。
+2. 変更前に、触るコードの `cfg(feature)`、エラーハンドリング、ftlog、serde設定型を読む。
 3. 外部契約（設定キー、CLI、メトリクス名、プロトコル範囲）を変えたら **同じ PR で README（必要なら .ja）を更新**する。`specs/` 等を使う場合も矛盾を残さない。
 4. 大きなロジックは **専用モジュール**へ。`main.rs` は配線中心に保つ。
 5. 挙動変更には **単体 / 統合 / E2E** のいずれかを追加または更新し、**`cargo test` で実証**する。
@@ -84,12 +84,21 @@ AI エージェントおよびコントリビュータ向けの **最小指針**
 
 詳細・feature 組み合わせ・E2E・ベンチは **README の Build / Testing 節**を参照。
 
+### 注意事項
+- **コンパイル時の依存関係**: `main.rs` は `http2` や `grpc`（もしくは `grpc-full`）feature が有効でないと、`send_grpc_trailers` の呼び出し箇所等でコンパイルエラーが発生します。そのため、ビルドやテストの際は必ず十分な feature（例：`--features "http2,grpc-full"` またはフルフィーチャー）を指定して実行してください。
+- **E2Eテスト**: E2Eテストは専用のバックエンド環境を起動する必要があります。手動で直接 `cargo test` を叩くとバックエンドへの接続ができずタイムアウトするため、必ず `./tests/e2e_setup.sh test` を使用して自動セットアップ・実行・クリーンアップを行ってください。また、ポート競合エラーが発生した場合は、`pkill -f veil` 等で残存プロセスを終了させてから再実行してください。
+
+### 実行コマンド例
+
 ```bash
+# フル機能でのビルド
 cargo build --features "ktls,http2,http3,grpc-full,wasm"
 
-./tests/e2e_setup.sh start
-cargo test --features "ktls,http2,http3,grpc-full,wasm"
-./tests/e2e_setup.sh stop
+# E2Eテストの実行（自動セットアップ・クリーンアップ付き）
+./tests/e2e_setup.sh test
+
+# ユニットテストや統合テストの実行（features指定必須）
+cargo test --lib --bins --test integration_tests --features "http2,grpc-full"
 ```
 
 ---
@@ -114,3 +123,4 @@ cargo test --features "ktls,http2,http3,grpc-full,wasm"
 詳細な変更履歴は Git を参照。
 
 - 設計哲学・こだわりポイントを本文に集約し、`docs/philosophy.md` を廃止。
+- テスト実行・ビルド時の feature 依存関係および E2E テストの注意事項を「ビルド・テスト（入り口）」へ追記。

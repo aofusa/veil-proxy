@@ -8,7 +8,7 @@
 //! - `h2`: HTTP/2 over TLS (RFC 7540)
 //! - `http/1.1`: HTTP/1.1 over TLS (フォールバック)
 
-use rustls::ServerConfig;
+use rustls::{ServerConfig, ClientConfig};
 
 /// サポートする HTTP プロトコル
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +51,21 @@ pub const ALPN_H2_ONLY: &[&[u8]] = &[
 ///
 /// ALPN が設定された ServerConfig
 pub fn configure_alpn_h2(mut config: ServerConfig, http2_only: bool) -> ServerConfig {
+    let protocols = if http2_only {
+        ALPN_H2_ONLY
+    } else {
+        ALPN_H2_HTTP11
+    };
+    
+    config.alpn_protocols = protocols.iter()
+        .map(|p| p.to_vec())
+        .collect();
+    
+    config
+}
+
+/// rustls ClientConfig に HTTP/2 対応の ALPN を設定
+pub fn configure_alpn_h2_client(mut config: ClientConfig, http2_only: bool) -> ClientConfig {
     let protocols = if http2_only {
         ALPN_H2_ONLY
     } else {

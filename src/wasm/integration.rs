@@ -28,6 +28,18 @@ pub fn on_request_complete(
     engine.on_log_with_modules(modules);
 }
 
+/// Execute on_log callback for WASM modules at the end of request processing ASYNCHRONOUSLY
+pub async fn on_request_complete_async(
+    engine: Arc<FilterEngine>,
+    modules: Vec<String>,
+) {
+    if modules.is_empty() {
+        return;
+    }
+    
+    engine.on_log_with_modules_async(modules).await;
+}
+
 /// Execute on_done callback for WASM modules when request context is destroyed
 /// 
 /// This should be called after all request processing is complete.

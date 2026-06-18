@@ -991,6 +991,7 @@ static ERR_MSG_NOT_FOUND: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\
 static ERR_MSG_METHOD_NOT_ALLOWED: &[u8] = b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 static ERR_MSG_TOO_MANY_REQUESTS: &[u8] = b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 static ERR_MSG_BAD_GATEWAY: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+static ERR_MSG_INSUFFICIENT_STORAGE: &[u8] = b"HTTP/1.1 507 Insufficient Storage\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 static ERR_MSG_REQUEST_TOO_LARGE: &[u8] = b"HTTP/1.1 413 Request Entity Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 static ERR_MSG_GATEWAY_TIMEOUT: &[u8] = b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
@@ -2846,9 +2847,10 @@ thread_local! {
         let tcp_cork_enabled = config_guard.ktls_config.tcp_cork_enabled;
         
         // kTLS が有効な場合のみシークレット抽出を有効化した設定を使用
-        let config = ktls_rustls::client_config(ktls_enabled);
+        let config = (*ktls_rustls::client_config(ktls_enabled)).clone();
+        let config = protocol::configure_alpn_h2_client(config, false);
         
-        RustlsConnector::new(config)
+        RustlsConnector::new(Arc::new(config))
             .with_ktls(ktls_enabled)        // 設定に基づいて kTLS を有効化
             .with_fallback(fallback_enabled)    // kTLS 失敗時のフォールバック設定
             .with_tcp_cork(tcp_cork_enabled)    // TCP_CORK 設定
@@ -2866,9 +2868,10 @@ thread_local! {
         let fallback_enabled = config_guard.ktls_config.fallback_enabled;
         let tcp_cork_enabled = config_guard.ktls_config.tcp_cork_enabled;
         
-        let config = ktls_rustls::insecure_client_config();
+        let config = (*ktls_rustls::insecure_client_config()).clone();
+        let config = protocol::configure_alpn_h2_client(config, false);
         
-        RustlsConnector::new(config)
+        RustlsConnector::new(Arc::new(config))
             .with_ktls(ktls_enabled)
             .with_fallback(fallback_enabled)
             .with_tcp_cork(tcp_cork_enabled)
@@ -2879,8 +2882,9 @@ thread_local! {
 #[cfg(not(feature = "ktls"))]
 thread_local! {
     static TLS_CONNECTOR: simple_tls::SimpleTlsConnector = {
-        let config = simple_tls::default_client_config();
-        simple_tls::SimpleTlsConnector::new(config)
+        let config = (*simple_tls::default_client_config()).clone();
+        let config = protocol::configure_alpn_h2_client(config, false);
+        simple_tls::SimpleTlsConnector::new(Arc::new(config))
     };
 }
 
@@ -2888,8 +2892,9 @@ thread_local! {
 #[cfg(not(feature = "ktls"))]
 thread_local! {
     static TLS_CONNECTOR_INSECURE: simple_tls::SimpleTlsConnector = {
-        let config = simple_tls::insecure_client_config();
-        simple_tls::SimpleTlsConnector::new(config)
+        let config = (*simple_tls::insecure_client_config()).clone();
+        let config = protocol::configure_alpn_h2_client(config, false);
+        simple_tls::SimpleTlsConnector::new(Arc::new(config))
     };
 }
 
@@ -9467,14 +9472,14 @@ where
                     Vec::new()
                 };
                 
-                let wasm_result = wasm_engine.on_request_headers_with_modules(
-                    &modules_to_apply,
-                    path_str,
-                    method_str,
-                    &headers_vec,
-                    client_ip,
+                let wasm_result = wasm_engine.clone().on_request_headers_with_modules_async(
+                    modules_to_apply.clone(),
+                    path_str.to_string(),
+                    method_str.to_string(),
+                    headers_vec,
+                    client_ip.to_string(),
                     body_len == 0, // end_of_stream
-                );
+                ).await;
                 
                 match wasm_result {
                     crate::wasm::FilterResult::LocalResponse(resp) => {
@@ -9489,7 +9494,7 @@ where
                         
                         let _ = conn.send_response(stream_id, resp.status_code, &headers, Some(&resp.body)).await;
                         // ライフサイクルコールバック: リクエスト完了
-                        crate::wasm::on_request_complete(wasm_engine, &modules_to_apply);
+                        crate::wasm::on_request_complete_async(wasm_engine.clone(), modules_to_apply.to_vec()).await;
                         return Some((resp.status_code, resp.body.len() as u64));
                     }
                     crate::wasm::FilterResult::Pause => {
@@ -11418,14 +11423,14 @@ async fn handle_requests(
                         
                         // モジュールを実行
                         if !modules_to_apply.is_empty() {
-                            let wasm_result = wasm_engine.on_request_headers_with_modules(
-                                &modules_to_apply,
-                                path_str,
-                                method_str,
-                                &headers_vec,
-                                client_ip,
+                            let wasm_result = wasm_engine.clone().on_request_headers_with_modules_async(
+                                modules_to_apply.clone(),
+                                path_str.to_string(),
+                                method_str.to_string(),
+                                headers_vec,
+                                client_ip.to_string(),
                                 initial_body.is_empty() && !is_chunked, // end_of_stream
-                            );
+                            ).await;
                             
                             match wasm_result {
                                 crate::wasm::FilterResult::Continue { headers: modified_headers, .. } => {
@@ -11461,7 +11466,7 @@ async fn handle_requests(
                                         Ok((Ok(_), _)) => {
                                             log_access(&method_bytes, &host_bytes, &path_bytes, &user_agent, 0, resp.status_code, resp_size, start_instant);
                                             // WASMライフサイクルコールバック: リクエスト完了
-                                            crate::wasm::on_request_complete(wasm_engine, &modules_to_apply);
+                                            crate::wasm::on_request_complete_async(wasm_engine.clone(), modules_to_apply.to_vec()).await;
                                         }
                                         _ => {}
                                     }
@@ -11534,7 +11539,7 @@ async fn handle_requests(
                                     if !wasm_modules.is_empty() {
                                         let config = CURRENT_CONFIG.load();
                                         if let Some(ref wasm_engine) = config.wasm_filter_engine {
-                                            crate::wasm::on_request_complete(wasm_engine, &wasm_modules);
+                                            crate::wasm::on_request_complete_async(wasm_engine.clone(), wasm_modules.to_vec()).await;
                                         }
                                     }
                                     clear_wasm_response_modules();
@@ -11581,7 +11586,7 @@ async fn handle_requests(
                             if !wasm_modules.is_empty() {
                                 let config = CURRENT_CONFIG.load();
                                 if let Some(ref wasm_engine) = config.wasm_filter_engine {
-                                    crate::wasm::on_request_complete(wasm_engine, &wasm_modules);
+                                    crate::wasm::on_request_complete_async(wasm_engine.clone(), wasm_modules.to_vec()).await;
                                 }
                             }
                             clear_wasm_response_modules();
@@ -12284,12 +12289,12 @@ async fn handle_backend(
                             .collect();
                         
                         // WASMフィルタを実行（レスポンスヘッダー処理）
-                        let wasm_result = wasm_engine.on_response_headers_with_modules(
-                            &wasm_modules,
+                        let wasm_result = wasm_engine.clone().on_response_headers_with_modules_async(
+                            wasm_modules.clone(),
                             200,
-                            &current_headers,
+                            current_headers,
                             true, // end_of_stream
-                        );
+                        ).await;
                         
                         match wasm_result {
                             crate::wasm::FilterResult::Continue { headers: modified_headers, .. } => {
@@ -13702,7 +13707,7 @@ async fn handle_proxy(
         // 設定ファイルの tls_insecure、または環境変数 VEIL_TLS_INSECURE で証明書検証スキップを制御
         let tls_insecure = upstream_group.tls_insecure() 
             || std::env::var("VEIL_TLS_INSECURE").map(|v| v == "1" || v == "true").unwrap_or(false);
-        proxy_https_pooled(client_stream, target, security, compression, client_encoding, &pool_key, request, content_length, is_chunked, initial_body, client_wants_close, tls_insecure).await
+        proxy_https_pooled(client_stream, target, security, compression, buffering_config, client_encoding, &pool_key, request, content_length, is_chunked, initial_body, client_wants_close, tls_insecure).await
     } else if target.use_h2c || upstream_group.use_h2c() {
         // H2C (HTTP/2 over cleartext) 接続
         #[cfg(feature = "http2")]
@@ -13885,9 +13890,9 @@ async fn proxy_http_pooled(
             }
         } else if buffering_enabled && !compression_enabled {
             // バッファリング有効時（圧縮無効の場合のみ）
-            // 圧縮が有効な場合は、通常版で圧縮後にバッファリングするか検討が必要
+            debug!("Calling proxy_request_buffered for {} {}", target.host, target.port);
             record_buffering_used(&host_str_for_metrics);
-            proxy_http_request_buffered(
+            proxy_request_buffered(
                 &mut client_stream,
                 &mut backend_stream,
                 request,
@@ -13899,6 +13904,8 @@ async fn proxy_http_pooled(
                 cache_ctx,
             ).await
         } else {
+            debug!("Calling proxy_http_request_with_compression for {} {} (buffering_enabled={}, compression_enabled={})", 
+                   target.host, target.port, buffering_enabled, compression_enabled);
             // kTLS が無効、Chunked、圧縮有効、キャッシュ保存が必要、またはバッファリング無効の場合は通常版を使用
             proxy_http_request_with_compression(
                 &mut client_stream,
@@ -13920,7 +13927,7 @@ async fn proxy_http_pooled(
     let result = if buffering_enabled && !compression_enabled {
         // バッファリング有効時（圧縮無効の場合のみ）
         record_buffering_used(&host_str_for_metrics);
-        proxy_http_request_buffered(
+        proxy_request_buffered(
             &mut client_stream,
             &mut backend_stream,
             request,
@@ -14331,6 +14338,8 @@ enum BufferedBodyResult {
         path: std::path::PathBuf,
         size: u64,
     },
+    /// バッファサイズ制限超過 (507 Insufficient Storage)
+    LimitExceeded,
     /// バッファリング失敗（ストリーミングにフォールバック）
     Failed,
 }
@@ -14342,6 +14351,7 @@ impl BufferedBodyResult {
         match self {
             BufferedBodyResult::Memory(data) => data.len() as u64,
             BufferedBodyResult::Disk { size, .. } => *size,
+            BufferedBodyResult::LimitExceeded => 0,
             BufferedBodyResult::Failed => 0,
         }
     }
@@ -14363,9 +14373,10 @@ impl BufferedBodyResult {
 /// バックエンド接続を解放してからクライアントへ送信します。
 /// 
 /// 戻り値: Option<(status_code, response_size, backend_wants_keep_alive)>
-async fn proxy_http_request_buffered(
+/// バッファリング転送でリクエストを処理
+async fn proxy_request_buffered<R>(
     client_stream: &mut ServerTls,
-    backend_stream: &mut TcpStream,
+    backend_stream: &mut R,
     request: Vec<u8>,
     content_length: usize,
     is_chunked: bool,
@@ -14373,7 +14384,8 @@ async fn proxy_http_request_buffered(
     max_chunked_body_size: u64,
     buffering_config: &buffering::BufferingConfig,
     cache_ctx: Option<&mut CacheSaveContext>,
-) -> Option<(u16, u64, bool)> {
+) -> Option<(u16, u64, bool)> 
+where R: AsyncReader + AsyncWriter + Unpin + monoio::io::AsyncReadRent + monoio::io::AsyncWriteRentExt {
     // 1. リクエストヘッダー送信
     let write_result = timeout(WRITE_TIMEOUT, backend_stream.write_all(request)).await;
     if !matches!(write_result, Ok((Ok(_), _))) {
@@ -14470,6 +14482,16 @@ async fn proxy_http_request_buffered(
                         }
                         return Some((status_code, total, false));
                     }
+                    BufferedBodyResult::LimitExceeded => {
+                        // 507 Insufficient Storage を送信
+                        let err_buf = ERR_MSG_INSUFFICIENT_STORAGE.to_vec();
+                        let _ = timeout(
+                            Duration::from_secs(buffering_config.client_write_timeout_secs),
+                            client_stream.write_all(err_buf)
+                        ).await;
+                        // 507 エラー時は接続を閉じる (should_close = true, backend keep-alive = false)
+                        return Some((507, 0, false));
+                    }
                 }
             } else {
                 // buffer_headers = false: ヘッダーを先に送信し、ボディは別途送信
@@ -14521,6 +14543,10 @@ async fn proxy_http_request_buffered(
                     BufferedBodyResult::Failed => {
                         return Some((status_code, total, false));
                     }
+                    BufferedBodyResult::LimitExceeded => {
+                        // すでにヘッダー送信済みのため、507を返すことはできないので接続を閉じる
+                        return Some((status_code, total, true));
+                    }
                 }
             }
             
@@ -14533,11 +14559,12 @@ async fn proxy_http_request_buffered(
 /// バックエンドからレスポンスを受信してバッファリング
 /// 
 /// 戻り値: Option<(status_code, headers_data, body_result, backend_wants_keep_alive)>
-async fn receive_and_buffer_response(
-    backend_stream: &mut TcpStream,
+async fn receive_and_buffer_response<R>(
+    backend_stream: &mut R,
     buffering_config: &buffering::BufferingConfig,
     mut cache_ctx: Option<&mut CacheSaveContext>,
-) -> Option<(u16, Vec<u8>, BufferedBodyResult, bool)> {
+) -> Option<(u16, Vec<u8>, BufferedBodyResult, bool)> 
+where R: AsyncReadRent + Unpin {
     let mut accumulated = Vec::with_capacity(BUF_SIZE);
     
     // ヘッダー読み取り
@@ -14646,15 +14673,19 @@ async fn send_disk_buffer_to_client(
 }
 
 /// レスポンスボディをバッファリング（ディスクスピルオーバー対応）
-async fn buffer_response_body_with_spillover(
-    backend_stream: &mut TcpStream,
+async fn buffer_response_body_with_spillover<R>(
+    backend_stream: &mut R,
     content_length: Option<usize>,
     is_chunked: bool,
     initial_body: Vec<u8>,
     buffering_config: &buffering::BufferingConfig,
     mut cache_ctx: Option<&mut CacheSaveContext>,
-) -> BufferedBodyResult {
+) -> BufferedBodyResult 
+where R: AsyncReadRent + Unpin {
     let mut body = initial_body;
+    
+    debug!("buffer_response_body_with_spillover: content_length={:?}, is_chunked={}, initial_body_len={}, max_mem={}, max_disk={}", 
+          content_length, is_chunked, body.len(), buffering_config.max_memory_buffer, buffering_config.max_disk_buffer);
     
     // キャッシュコンテキストに初期ボディをキャプチャ
     if let Some(ref mut ctx) = cache_ctx {
@@ -14663,51 +14694,59 @@ async fn buffer_response_body_with_spillover(
     
     if let Some(cl) = content_length {
         // Content-Length 転送
+        let cl_usize = cl as usize;
         let remaining = cl.saturating_sub(body.len());
-        if remaining > 0 {
-            // バッファサイズ制限チェック
-            if body.len() + remaining > buffering_config.max_memory_buffer {
-                // ディスクスピルオーバー
-                if let Some(ref disk_path) = buffering_config.disk_buffer_path {
-                    // max_disk_buffer 制限チェック
-                    if cl > buffering_config.max_disk_buffer {
-                        warn!("Response size {} exceeds max_disk_buffer {}, aborting buffer", 
-                              cl, buffering_config.max_disk_buffer);
-                        return BufferedBodyResult::Failed;
-                    }
-                    
-                    debug!("Response size exceeds memory limit, spilling to disk");
-                    
-                    // まず残りのデータをメモリに読み込み
+        
+        // バッファサイズ制限チェック (メモリ)
+        if cl_usize > buffering_config.max_memory_buffer {
+            // ディスクスピルオーバー
+            if let Some(ref disk_path) = buffering_config.disk_buffer_path {
+                // max_disk_buffer 制限チェック
+                if cl > buffering_config.max_disk_buffer {
+                    ftlog::warn!("Response size {} exceeds max_disk_buffer {}, aborting buffer", 
+                           cl, buffering_config.max_disk_buffer);
+                    return BufferedBodyResult::LimitExceeded;
+                }
+                
+                debug!("Response size {} exceeds memory limit {}, spilling to disk (max_disk={})", 
+                      cl, buffering_config.max_memory_buffer, buffering_config.max_disk_buffer);
+                
+                // まず残りのデータをメモリに読み込み
+                if remaining > 0 {
                     let additional = buffer_exact_bytes(backend_stream, remaining, &mut cache_ctx).await;
                     body.extend(additional);
-                    
-                    // ディスクに書き込み
-                    let key = format!("buffer_{}", std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos());
-                    
-                    match buffering::disk_buffer::write_to_disk(disk_path, key.as_bytes(), body).await {
-                        Ok(path) => {
-                            let size = cl as u64;
-                            return BufferedBodyResult::Disk { path, size };
-                        }
-                        Err(e) => {
-                            error!("Failed to write disk buffer: {}", e);
-                            return BufferedBodyResult::Failed;
-                        }
+                }
+                
+                // ディスクに書き込み
+                let key = format!("buffer_{}", std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos());
+                
+                match buffering::disk_buffer::write_to_disk(disk_path, key.as_bytes(), body).await {
+                    Ok(path) => {
+                        let size = cl as u64;
+                        return BufferedBodyResult::Disk { path, size };
                     }
-                } else {
-                    // ディスクなし: 可能な範囲でメモリにバッファリング
+                    Err(e) => {
+                        error!("Failed to write disk buffer: {}", e);
+                        return BufferedBodyResult::Failed;
+                    }
+                }
+            } else {
+                // ディスクなし: 可能な範囲でメモリにバッファリング
+                if remaining > 0 {
                     let max_additional = buffering_config.max_memory_buffer.saturating_sub(body.len());
                     if max_additional > 0 {
                         let additional = buffer_exact_bytes(backend_stream, max_additional, &mut cache_ctx).await;
                         body.extend(additional);
                     }
-                    warn!("Response truncated: memory limit exceeded and no disk buffer configured");
                 }
-            } else {
+                warn!("Response truncated: memory limit exceeded and no disk buffer configured");
+            }
+        } else {
+            // メモリ制限内
+            if remaining > 0 {
                 let additional = buffer_exact_bytes(backend_stream, remaining, &mut cache_ctx).await;
                 body.extend(additional);
             }
@@ -14739,8 +14778,8 @@ async fn buffer_response_body_with_spillover(
                     
                     loop {
                         // max_disk_buffer 制限チェック
-                        if total_size > max_disk {
-                            warn!("Chunked response exceeds max_disk_buffer {}, aborting buffer", max_disk);
+                        if total_size as u64 > max_disk as u64 {
+                            ftlog::warn!("Chunked response exceeds max_disk_buffer {}, aborting buffer", max_disk);
                             size_exceeded = true;
                             break;
                         }
@@ -14783,7 +14822,7 @@ async fn buffer_response_body_with_spillover(
                     }
                     
                     if size_exceeded {
-                        return BufferedBodyResult::Failed;
+                        return BufferedBodyResult::LimitExceeded;
                     }
                     
                     // 全体をディスクに書き込み
@@ -14845,6 +14884,95 @@ async fn buffer_response_body_with_spillover(
                 break;
             }
         }
+    } else {
+        // Content-Length も Chunked もない場合: EOF まで読み取り（ブラインドバッファリング）
+        loop {
+            // メモリサイズ制限チェック
+            if body.len() >= buffering_config.max_memory_buffer {
+                // ディスクスピルオーバー（ブラインド）
+                if let Some(ref disk_path) = buffering_config.disk_buffer_path {
+                    let mut overflow = Vec::new();
+                    let max_disk = buffering_config.max_disk_buffer;
+                    let mut total_size = body.len();
+                    let mut size_exceeded = false;
+                    
+                    loop {
+                        if total_size as u64 > max_disk as u64 {
+                            ftlog::warn!("Blind response exceeds max_disk_buffer {}, aborting buffer", max_disk);
+                            size_exceeded = true;
+                            break;
+                        }
+                        
+                        let read_buf = buf_get();
+                        let read_result = timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
+                        let (res, mut returned_buf) = match read_result {
+                            Ok(result) => result,
+                            Err(_) => break,
+                        };
+                        
+                        let n = match res {
+                            Ok(0) => { buf_put(returned_buf); break; }
+                            Ok(n) => n,
+                            Err(_) => { buf_put(returned_buf); break; }
+                        };
+                        
+                        returned_buf.set_valid_len(n);
+                        let chunk = returned_buf.as_valid_slice();
+                        if let Some(ref mut ctx) = cache_ctx {
+                            ctx.append_body(chunk);
+                        }
+                        overflow.extend_from_slice(chunk);
+                        total_size += n;
+                        buf_put(returned_buf);
+                    }
+                    
+                    if size_exceeded {
+                        return BufferedBodyResult::LimitExceeded;
+                    }
+                    
+                    body.extend(overflow);
+                    let key = format!("buffer_blind_{}", std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos());
+                    let size = body.len() as u64;
+                    match buffering::disk_buffer::write_to_disk(disk_path, key.as_bytes(), body).await {
+                        Ok(path) => {
+                            if let Some(ctx) = cache_ctx {
+                                ctx.save_to_cache();
+                            }
+                            return BufferedBodyResult::Disk { path, size };
+                        }
+                        Err(e) => {
+                            error!("Failed to write blind disk buffer: {}", e);
+                            return BufferedBodyResult::Failed;
+                        }
+                    }
+                }
+                break;
+            }
+            
+            let read_buf = buf_get();
+            let read_result = timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
+            let (res, mut returned_buf) = match read_result {
+                Ok(result) => result,
+                Err(_) => break,
+            };
+            
+            let n = match res {
+                Ok(0) => { buf_put(returned_buf); break; }
+                Ok(n) => n,
+                Err(_) => { buf_put(returned_buf); break; }
+            };
+            
+            returned_buf.set_valid_len(n);
+            let chunk = returned_buf.as_valid_slice();
+            if let Some(ref mut ctx) = cache_ctx {
+                ctx.append_body(chunk);
+            }
+            body.extend_from_slice(chunk);
+            buf_put(returned_buf);
+        }
     }
     
     // キャッシュに保存
@@ -14856,11 +14984,12 @@ async fn buffer_response_body_with_spillover(
 }
 
 /// バックエンドから正確なバイト数を読み取りバッファに格納
-async fn buffer_exact_bytes(
-    backend_stream: &mut TcpStream,
+async fn buffer_exact_bytes<R>(
+    backend_stream: &mut R,
     mut remaining: usize,
     cache_ctx: &mut Option<&mut CacheSaveContext>,
-) -> Vec<u8> {
+) -> Vec<u8> 
+where R: AsyncReadRent + Unpin {
     let mut result = Vec::with_capacity(remaining);
     
     while remaining > 0 {
@@ -15136,12 +15265,12 @@ async fn transfer_response_with_compression(
                                     .collect();
                                 
                                 // WASMフィルタを実行（レスポンスヘッダー処理）
-                                let wasm_result = wasm_engine.on_response_headers_with_modules(
-                                    &wasm_modules,
+                                let wasm_result = wasm_engine.clone().on_response_headers_with_modules_async(
+                                    wasm_modules.clone(),
                                     status_code,
-                                    &current_headers,
+                                    current_headers,
                                     true, // end_of_stream
-                                );
+                                ).await;
                                 
                                 match wasm_result {
                                     crate::wasm::FilterResult::Continue { headers: modified_headers, .. } => {
@@ -16089,6 +16218,7 @@ async fn proxy_https_pooled(
     target: &ProxyTarget,
     security: &SecurityConfig,
     compression: &CompressionConfig,
+    buffering_config: &buffering::BufferingConfig,
     client_encoding: AcceptedEncoding,
     pool_key: &str,
     request: Vec<u8>,
@@ -16161,19 +16291,38 @@ async fn proxy_https_pooled(
     // セキュリティ設定からchunked最大サイズを取得
     let max_chunked = security.max_chunked_body_size as u64;
     
-    // リクエスト送信とレスポンス受信（圧縮対応）
-    let result = proxy_https_request_with_compression(
-        &mut client_stream,
-        &mut backend_stream,
-        request,
-        content_length,
-        is_chunked,
-        initial_body,
-        max_chunked,
-        compression,
-        client_encoding,
-        security,
-    ).await;
+    // バッファリングが有効かどうか判定
+    let buffering_enabled = buffering_config.is_enabled() && buffering_config.should_buffer(Some(content_length));
+    
+    let result = if buffering_enabled && (!compression.enabled || client_encoding == AcceptedEncoding::Identity) {
+        let host_str_for_metrics = &target.host;
+        record_buffering_used(&host_str_for_metrics);
+        proxy_request_buffered(
+            &mut client_stream,
+            &mut backend_stream,
+            request,
+            content_length,
+            is_chunked,
+            initial_body,
+            max_chunked,
+            buffering_config,
+            None,
+        ).await
+    } else {
+        // リクエスト送信とレスポンス受信（圧縮対応）
+        proxy_https_request_with_compression(
+            &mut client_stream,
+            &mut backend_stream,
+            request,
+            content_length,
+            is_chunked,
+            initial_body,
+            max_chunked,
+            compression,
+            client_encoding,
+            security,
+        ).await
+    };
 
     match result {
         Some((status_code, total, backend_wants_keep_alive)) => {
@@ -17085,12 +17234,12 @@ async fn handle_sendfile(
                     .collect();
                 
                 // WASMフィルタを実行（レスポンスヘッダー処理）
-                let wasm_result = wasm_engine.on_response_headers_with_modules(
-                    &wasm_modules,
+                let wasm_result = wasm_engine.clone().on_response_headers_with_modules_async(
+                    wasm_modules.clone(),
                     200,
-                    &current_headers,
+                    current_headers,
                     true, // end_of_stream
-                );
+                ).await;
                 
                 match wasm_result {
                     crate::wasm::FilterResult::Continue { headers: modified_headers, .. } => {
@@ -18338,15 +18487,18 @@ mod tests {
             vec![
                 UpstreamServerEntry { 
                     url: "http://server1:8080".into(), 
-                    sni_name: None 
+                    sni_name: None,
+                    use_h2c: false,
                 },
                 UpstreamServerEntry { 
                     url: "http://server2:8080".into(), 
-                    sni_name: None 
+                    sni_name: None,
+                    use_h2c: false,
                 },
                 UpstreamServerEntry { 
                     url: "http://server3:8080".into(), 
-                    sni_name: None 
+                    sni_name: None,
+                    use_h2c: false,
                 },
             ]
         }
@@ -18385,7 +18537,8 @@ mod tests {
             let servers = vec![
                 UpstreamServerEntry { 
                     url: "invalid-url".into(), 
-                    sni_name: None 
+                    sni_name: None,
+                    use_h2c: false,
                 },
             ];
             let group = UpstreamGroup::new(
@@ -18580,11 +18733,13 @@ mod tests {
             let servers = vec![
                 UpstreamServerEntry { 
                     url: "http://healthy:8080".into(), 
-                    sni_name: None 
+                    sni_name: None,
+                    use_h2c: false,
                 },
                 UpstreamServerEntry { 
                     url: "http://unhealthy:8080".into(), 
-                    sni_name: None 
+                    sni_name: None,
+                    use_h2c: false,
                 },
             ];
             let group = UpstreamGroup::new(
@@ -18613,11 +18768,13 @@ mod tests {
             let servers = vec![
                 UpstreamServerEntry { 
                     url: "http://server1:8080".into(), 
-                    sni_name: None 
+                    sni_name: None,
+                    use_h2c: false,
                 },
                 UpstreamServerEntry { 
                     url: "http://server2:8080".into(), 
-                    sni_name: None 
+                    sni_name: None,
+                    use_h2c: false,
                 },
             ];
             let group = UpstreamGroup::new(
