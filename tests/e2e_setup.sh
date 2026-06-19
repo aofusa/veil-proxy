@@ -72,12 +72,10 @@ check_ktls_available() {
 # E2Eテストではすべてのfeaturesを有効化してビルドします
 # features: ktls,http2,http3,grpc-full,wasm
 ensure_veil_binary() {
-    if [ ! -f "$VEIL_BIN" ]; then
         log_info "Building veil with all features enabled (ktls,http2,http3,grpc-full,wasm)..."
         cd "$PROJECT_DIR"
         cargo build --features 'ktls,http2,http3,grpc-full,wasm'
         cd - > /dev/null
-    fi
     
     if [ ! -f "$VEIL_BIN" ]; then
         log_error "Failed to build veil binary"
