@@ -111,16 +111,5 @@ cargo test --lib --bins --test integration_tests --features "http2,grpc-full"
 | `tests/`、`benches/` | 統合・E2E・ベンチ |
 | `docs/artifacts/` | AI 成果物・一時ファイル |
 | `docs/backlog/` | 機能・バグチケット（親は `backlog.md`） |
-| `docs/specs/` | 企画書・仕様書 |
-| `docs/instructions/` | AI指示書 |
 
 細かいモジュール対応は `src/main.rs` の `mod` と README の構成を参照。
-
----
-
-## 更新履歴
-
-詳細な変更履歴は Git を参照。
-
-- 設計哲学・こだわりポイントを本文に集約し、`docs/philosophy.md` を廃止。
-- テスト実行・ビルド時の feature 依存関係および E2E テストの注意事項を「ビルド・テスト（入り口）」へ追記。
