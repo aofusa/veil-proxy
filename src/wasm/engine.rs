@@ -5,7 +5,6 @@
 use std::sync::Arc;
 
 use wasmtime::Store;
-use futures::channel::oneshot;
 
 use super::context::{HostState, HttpContext};
 use super::registry::{LoadedModule, ModuleRegistry};
@@ -32,9 +31,10 @@ impl FilterEngine {
         // Calculate fuel limit (roughly 1M instructions per ms)
         let fuel_limit = config.defaults.max_execution_time_ms * 1_000_000;
 
-        // Epoch deadline: number of epochs to allow before timeout
-        // Since we increment epoch after start, deadline of 1 means "this execution only"
-        let epoch_deadline = 1;
+        // Epoch deadline: ticks after the current engine epoch before timeout.
+        // The tick thread increments the epoch every ~100ms, so deadline=10 allows ~1s.
+        // Fuel consumption is the primary timeout mechanism for CPU-bound limits.
+        let epoch_deadline = 10;
 
         Ok(Self {
             registry,
@@ -187,8 +187,8 @@ impl FilterEngine {
 
     /// Execute on_request_headers for specified modules ASYNCHRONOUSLY
     /// 
-    /// This method offloads the WASM execution to a rayon thread pool
-    /// to avoid blocking the async event loop.
+    /// This method executes the WASM modules synchronously.
+    /// Note: runs inline in the current async task to avoid cross-thread waker issues with monoio.
     pub async fn on_request_headers_with_modules_async(
         self: Arc<Self>,
         module_names: Vec<String>,
@@ -198,29 +198,14 @@ impl FilterEngine {
         client_ip: String,
         end_of_stream: bool,
     ) -> FilterResult {
-        let (tx, rx) = oneshot::channel();
-        
-        let engine = self.clone();
-        let headers_clone = headers.clone();
-        rayon::spawn(move || {
-            let res = engine.on_request_headers_with_modules(
-                &module_names,
-                &path,
-                &method,
-                &headers_clone,
-                &client_ip,
-                end_of_stream,
-            );
-            let _ = tx.send(res);
-        });
-        
-        match rx.await {
-            Ok(res) => res,
-            Err(_) => FilterResult::Continue {
-                headers,
-                body: None,
-            },
-        }
+        self.on_request_headers_with_modules(
+            &module_names,
+            &path,
+            &method,
+            &headers,
+            &client_ip,
+            end_of_stream,
+        )
     }
 
     /// Execute on_request_headers for a single module
@@ -244,9 +229,6 @@ impl FilterEngine {
         let mut store = Store::new(self.registry.engine(), host_state);
         store.set_fuel(self.fuel_limit)?;
         store.set_epoch_deadline(self.epoch_deadline);
-
-        // Increment engine epoch to invalidate previous executions' deadlines
-        self.registry.engine().increment_epoch();
 
         // Instantiate module
         let instance = module.instance_pre.instantiate(&mut store)?;
@@ -428,6 +410,7 @@ impl FilterEngine {
     }
 
     /// Execute on_response_headers for specified modules ASYNCHRONOUSLY
+    /// Note: runs inline in the current async task to avoid cross-thread waker issues with monoio.
     pub async fn on_response_headers_with_modules_async(
         self: Arc<Self>,
         module_names: Vec<String>,
@@ -435,27 +418,12 @@ impl FilterEngine {
         headers: Vec<(String, String)>,
         end_of_stream: bool,
     ) -> FilterResult {
-        let (tx, rx) = oneshot::channel();
-        
-        let engine = self.clone();
-        let headers_clone = headers.clone();
-        rayon::spawn(move || {
-            let res = engine.on_response_headers_with_modules(
-                &module_names,
-                status,
-                &headers_clone,
-                end_of_stream,
-            );
-            let _ = tx.send(res);
-        });
-        
-        match rx.await {
-            Ok(res) => res,
-            Err(_) => FilterResult::Continue {
-                headers,
-                body: None,
-            },
-        }
+        self.on_response_headers_with_modules(
+            &module_names,
+            status,
+            &headers,
+            end_of_stream,
+        )
     }
 
     /// Execute on_response_headers for a single module
@@ -739,34 +707,14 @@ impl FilterEngine {
     }
 
     /// Execute on_request_body for specified modules ASYNCHRONOUSLY
-    /// 
-    /// This method offloads the WASM execution to a rayon thread pool
-    /// to avoid blocking the async event loop.
+    /// Note: runs inline in the current async task to avoid cross-thread waker issues with monoio.
     pub async fn on_request_body_with_modules_async(
         self: Arc<Self>,
         module_names: Vec<String>,
         body: Vec<u8>,
         end_of_stream: bool,
     ) -> BodyFilterResult {
-        let (tx, rx) = oneshot::channel();
-        
-        let engine = self.clone();
-        let body_clone = body.clone();
-        rayon::spawn(move || {
-            let res = engine.on_request_body_with_modules(
-                &module_names,
-                &body_clone,
-                end_of_stream,
-            );
-            let _ = tx.send(res);
-        });
-        
-        match rx.await {
-            Ok(res) => res,
-            Err(_) => BodyFilterResult::Continue {
-                body,
-            },
-        }
+        self.on_request_body_with_modules(&module_names, &body, end_of_stream)
     }
 
     /// Execute on_request_body for a single module
@@ -912,34 +860,14 @@ impl FilterEngine {
     }
 
     /// Execute on_response_body for specified modules ASYNCHRONOUSLY
-    /// 
-    /// This method offloads the WASM execution to a rayon thread pool
-    /// to avoid blocking the async event loop.
+    /// Note: runs inline in the current async task to avoid cross-thread waker issues with monoio.
     pub async fn on_response_body_with_modules_async(
         self: Arc<Self>,
         module_names: Vec<String>,
         body: Vec<u8>,
         end_of_stream: bool,
     ) -> BodyFilterResult {
-        let (tx, rx) = oneshot::channel();
-        
-        let engine = self.clone();
-        let body_clone = body.clone();
-        rayon::spawn(move || {
-            let res = engine.on_response_body_with_modules(
-                &module_names,
-                &body_clone,
-                end_of_stream,
-            );
-            let _ = tx.send(res);
-        });
-        
-        match rx.await {
-            Ok(res) => res,
-            Err(_) => BodyFilterResult::Continue {
-                body,
-            },
-        }
+        self.on_response_body_with_modules(&module_names, &body, end_of_stream)
     }
 
     /// Execute on_response_body for a single module
@@ -1048,22 +976,12 @@ impl FilterEngine {
     }
 
     /// Execute on_log for specified modules ASYNCHRONOUSLY
-    /// 
-    /// This method offloads the WASM execution to a rayon thread pool
-    /// to avoid blocking the async event loop.
+    /// Note: runs inline in the current async task to avoid cross-thread waker issues with monoio.
     pub async fn on_log_with_modules_async(
         self: Arc<Self>,
         module_names: Vec<String>,
     ) {
-        let (tx, rx) = oneshot::channel();
-        
-        let engine = self.clone();
-        rayon::spawn(move || {
-            engine.on_log_with_modules(&module_names);
-            let _ = tx.send(());
-        });
-        
-        let _ = rx.await;
+        self.on_log_with_modules(&module_names);
     }
 
     /// Execute on_log for a single module

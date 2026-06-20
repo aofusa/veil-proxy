@@ -43,7 +43,7 @@
 
 | ID | 優先度 | 対応状況 | ドキュメント | 概要 |
 |----|--------|----------|--------------|------|
-| F-02 | P1 | 進行中 | [features/e2e-test-hardening.md](features/e2e-test-hardening.md) | E2E の網羅・実装乖離の解消 |
+| F-02 | P1 | 進行中 | [features/e2e-test-hardening.md](features/e2e-test-hardening.md) | E2E の網羅・実装乖離の解消（371 テスト中 346+ 通過、HTTP/3 の 21 テストのみ残存） |
 | F-03 | P1 | 未着手 | [features/tls-cert-zero-downtime.md](features/tls-cert-zero-downtime.md) | 0 ダウンタイム TLS 証明書更新 |
 | F-04 | P1 | 未着手 | [features/vds-xds-dynamic-config.md](features/vds-xds-dynamic-config.md) | 動的設定配信 API（VDS / xDS 相当） |
 | F-06 | P1 | 未着手 | [features/resilience-outlier-detection.md](features/resilience-outlier-detection.md) | サーキットブレーカー・リトライ・異常検知 |
@@ -81,6 +81,10 @@
 |----|--------|----------|--------------|------|
 | B-01 | P1 | 完了 | [bugs/B-01-iouring-accept-nonblock.md](bugs/B-01-iouring-accept-nonblock.md) | io_uring accept が O_NONBLOCK を設定せず body timeout が発火しない |
 | B-02 | P1 | 完了 | [bugs/B-02-408-connection-not-closed.md](bugs/B-02-408-connection-not-closed.md) | 408 送信後も接続を閉じず、クライアントが read タイムアウトまでブロック |
+| B-03 | P1 | 完了 | [bugs/B-03-header-size-check-includes-body.md](bugs/B-03-header-size-check-includes-body.md) | ヘッダーサイズチェックにボディバイトが含まれ、正常リクエストが 431 で誤拒否される |
+| B-04 | P1 | 完了 | [bugs/B-04-wasm-filter-missing-https-path.md](bugs/B-04-wasm-filter-missing-https-path.md) | WASM レスポンスフィルタが HTTPS バックエンドパスに未適用 |
+| B-05 | P1 | 完了 | [bugs/B-05-wasm-modules-thread-local-race.md](bugs/B-05-wasm-modules-thread-local-race.md) | WASM モジュールリストの thread_local 競合により並行リクエストでフィルタが未適用になる |
+| B-06 | P2 | 完了 | [bugs/B-06-grpc-h2c-trailer-not-forwarded.md](bugs/B-06-grpc-h2c-trailer-not-forwarded.md) | gRPC H2C レスポンストレーラーが HTTP/1.1 クライアントに転送されない |
 
 ---
 

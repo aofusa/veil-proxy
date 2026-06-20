@@ -32,11 +32,13 @@ PIDS_FILE="${FIXTURES_DIR}/pids.txt"
 # ポート設定
 PROXY_HTTPS_PORT=8443
 PROXY_HTTP_PORT=8080
+PROXY_H2C_PORT=8081
 BACKEND1_PORT=9001
 BACKEND2_PORT=9002
 BACKEND_H2C_TLS_PORT=9013
 BACKEND_H2C_PORT=9003
 BACKEND_GRPC_PORT=9004
+BACKEND_WS_PORT=9005
 
 # 色付き出力
 RED='\033[0;31m'
@@ -307,6 +309,8 @@ EOF
 [server]
 listen = "127.0.0.1:${PROXY_HTTPS_PORT}"
 http = "127.0.0.1:${PROXY_HTTP_PORT}"
+h2c_listen = "127.0.0.1:${PROXY_H2C_PORT}"
+h2c_enabled = true
 redirect_http_to_https = false
 threads = 1
 http2_enabled = true
@@ -483,6 +487,32 @@ max_disk_buffer = 100
 disk_buffer_path = "/tmp/veil_buffer"
 EOF
 
+    # WebSocketルート設定
+    cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
+[upstreams."ws-pool"]
+algorithm = "round_robin"
+servers = [
+    "http://127.0.0.1:${BACKEND_WS_PORT}"
+]
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/ws/*"
+[route.action]
+type = "Proxy"
+upstream = "ws-pool"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/ws/*"
+[route.action]
+type = "Proxy"
+upstream = "ws-pool"
+
+EOF
+
     # gRPCルート設定
     cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
 [[route]]
@@ -531,27 +561,28 @@ allow_send_local_response = true
 EOF
             
             # WASMモジュールを適用するルートを追加
+            # 注意: modulesはroute直下（[route.action]配下ではなく）に設定する必要がある
             cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
 
 [[route]]
+modules = ["header_filter"]
 [route.conditions]
 host = "localhost"
 path = "/wasm/*"
 [route.action]
 type = "Proxy"
 upstream = "backend-pool"
-modules = ["header_filter"]
 [route.security]
 add_response_headers = { "X-Proxied-By" = "veil" }
 
 [[route]]
+modules = ["header_filter"]
 [route.conditions]
 host = "127.0.0.1"
 path = "/wasm/*"
 [route.action]
 type = "Proxy"
 upstream = "backend-pool"
-modules = ["header_filter"]
 [route.security]
 add_response_headers = { "X-Proxied-By" = "veil" }
 EOF
@@ -838,6 +869,28 @@ start_servers() {
     RUST_LOG=debug "${SCRIPT_DIR}/grpc_server/target/debug/grpc-server" > /tmp/grpc_server.log 2>&1 &
     echo $! >> "$PIDS_FILE"
     log_info "gRPC Echo Backend started on port ${BACKEND_GRPC_PORT} (PID: $!, logs: /tmp/grpc_server.log)"
+
+    # WebSocket Echoバックエンド起動（Python）
+    log_info "Starting WebSocket Echo Backend on port ${BACKEND_WS_PORT}..."
+    python3 - <<PYEOF > /tmp/websocket_backend.log 2>&1 &
+import asyncio
+import websockets
+
+async def echo(websocket):
+    try:
+        async for message in websocket:
+            await websocket.send(message)
+    except Exception:
+        pass
+
+async def main():
+    async with websockets.serve(echo, "127.0.0.1", ${BACKEND_WS_PORT}):
+        await asyncio.Future()
+
+asyncio.run(main())
+PYEOF
+    echo $! >> "$PIDS_FILE"
+    log_info "WebSocket Echo Backend started on port ${BACKEND_WS_PORT} (PID: $!, logs: /tmp/websocket_backend.log)"
     
     # バックエンド起動待機（動的）
     log_info "Waiting for backends to be ready..."
@@ -979,7 +1032,7 @@ check_port_conflicts() {
     log_info "Checking for port conflicts..."
     local conflicts=0
     
-    for port in $PROXY_HTTPS_PORT $PROXY_HTTP_PORT $BACKEND1_PORT $BACKEND2_PORT $BACKEND_H2C_PORT $BACKEND_GRPC_PORT; do
+    for port in $PROXY_HTTPS_PORT $PROXY_HTTP_PORT $PROXY_H2C_PORT $BACKEND1_PORT $BACKEND2_PORT $BACKEND_H2C_PORT $BACKEND_GRPC_PORT $BACKEND_WS_PORT; do
         if check_port_in_use "$port"; then
             log_error "Port $port is already in use"
             conflicts=$((conflicts + 1))

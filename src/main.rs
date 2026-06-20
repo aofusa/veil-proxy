@@ -1203,6 +1203,7 @@ unsafe impl IoBufMut for SafeReadBuffer {
 // セキュリティ制限
 const MAX_HEADER_SIZE: usize = 8192;     // 8KB - ヘッダーサイズ上限
 const MAX_BODY_SIZE: usize = 10485760;   // 10MB - ボディサイズ上限
+const MAX_GRPC_BODY_SIZE: usize = 1_048_576; // 1MB - gRPCメッセージサイズ上限
 
 // タイムアウト設定
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -11161,8 +11162,12 @@ async fn handle_requests(
 
 
         // ヘッダーサイズ制限チェック（RFC 6585: 431 Request Header Fields Too Large）
+        // ヘッダー終端 \r\n\r\n が見つかった場合はヘッダー部分のみをチェック。
+        // まだヘッダーが完全でない場合は蓄積サイズで判定する。
         // URIが長すぎる場合は414 URI Too Long、それ以外のヘッダー超過は431
-        if accumulated.len() > MAX_HEADER_SIZE {
+        let header_section_end = accumulated.windows(4).position(|w| w == b"\r\n\r\n");
+        let header_check_size = header_section_end.map_or(accumulated.len(), |end| end + 4);
+        if header_check_size > MAX_HEADER_SIZE {
             // リクエストラインの終端を探してURIサイズを確認
             let response_code = if let Some(line_end) = accumulated.windows(2).position(|w| w == b"\r\n") {
                 // リクエストラインが完全に含まれている場合、URIサイズを確認
@@ -11174,12 +11179,10 @@ async fn handle_requests(
                         let after_method = &request_line[method_end + 1..];
                         after_method.iter()
                             .rposition(|&b| b == b' ')
-                            // rposition が返す値は最後のスペースの位置（0-indexed）
-                            // それがそのまま URI 部分のバイト数となる
                             .map(|uri_end| uri_end)
                     })
                     .map_or(false, |uri_len| uri_len > MAX_HEADER_SIZE);
-                
+
                 if uri_too_long {
                     ERR_MSG_URI_TOO_LONG
                 } else {
@@ -11503,6 +11506,14 @@ async fn handle_requests(
                 };
 
                 // WASMモジュールの適用
+                // モジュールリストをローカル変数として保持（スレッドローカルを使わない、並行タスク間の干渉を防ぐ）
+                #[cfg(feature = "wasm")]
+                let modules_to_apply: Vec<String> = if let Some(backend_modules) = backend.modules() {
+                    backend_modules.to_vec()
+                } else {
+                    Vec::new()
+                };
+
                 #[cfg(feature = "wasm")]
                 let headers_for_proxy = {
                     let config = CURRENT_CONFIG.load();
@@ -11510,18 +11521,7 @@ async fn handle_requests(
                         // routes内で指定されたmodulesを優先
                         let path_str = std::str::from_utf8(&path_bytes).unwrap_or("/");
                         let method_str = std::str::from_utf8(&method_bytes).unwrap_or("GET");
-                        
-                        let modules_to_apply = if let Some(backend_modules) = backend.modules() {
-                            // バックエンドにmodulesが指定されている場合はそれを使用
-                            backend_modules.to_vec()
-                        } else {
-                            // ルートレベルのmodulesが指定されていない場合は、WASMモジュールを適用しない
-                            Vec::new()
-                        };
-                        
-                        // レスポンス処理用にモジュールリストを保存
-                        set_wasm_response_modules(modules_to_apply.clone());
-                        
+
                         // ヘッダーをString形式に変換
                         let headers_vec: Vec<(String, String)> = headers_for_proxy.iter()
                             .map(|(k, v)| (
@@ -11529,7 +11529,7 @@ async fn handle_requests(
                                 String::from_utf8_lossy(v).to_string()
                             ))
                             .collect();
-                        
+
                         // モジュールを実行
                         if !modules_to_apply.is_empty() {
                             let wasm_result = wasm_engine.clone().on_request_headers_with_modules_async(
@@ -11540,7 +11540,7 @@ async fn handle_requests(
                                 client_ip.to_string(),
                                 initial_body.is_empty() && !is_chunked, // end_of_stream
                             ).await;
-                            
+
                             match wasm_result {
                                 crate::wasm::FilterResult::Continue { headers: modified_headers, .. } => {
                                     // 修正されたヘッダーを使用
@@ -11553,7 +11553,7 @@ async fn handle_requests(
                                 }
                                 crate::wasm::FilterResult::LocalResponse(resp) => {
                                     // ローカルレスポンスを返送
-                                    let status_line = format!("HTTP/1.1 {} {}\r\n", resp.status_code, 
+                                    let status_line = format!("HTTP/1.1 {} {}\r\n", resp.status_code,
                                         match resp.status_code {
                                             200 => "OK",
                                             404 => "Not Found",
@@ -11567,7 +11567,7 @@ async fn handle_requests(
                                     }
                                     response.extend_from_slice(b"\r\n");
                                     response.extend_from_slice(&resp.body);
-                                    
+
                                     let start_instant = Instant::now();
                                     let resp_size = response.len() as u64;
                                     let write_result = timeout(WRITE_TIMEOUT, tls_stream.write_all(response)).await;
@@ -11575,11 +11575,10 @@ async fn handle_requests(
                                         Ok((Ok(_), _)) => {
                                             log_access(&method_bytes, &host_bytes, &path_bytes, &user_agent, 0, resp.status_code, resp_size, start_instant);
                                             // WASMライフサイクルコールバック: リクエスト完了
-                                            crate::wasm::on_request_complete_async(wasm_engine.clone(), modules_to_apply.to_vec()).await;
+                                            crate::wasm::on_request_complete_async(wasm_engine.clone(), modules_to_apply.clone()).await;
                                         }
                                         _ => {}
                                     }
-                                    clear_wasm_response_modules();
                                     accumulated.clear();
                                     return;
                                 }
@@ -11644,20 +11643,15 @@ async fn handle_requests(
                                 // WASMライフサイクルコールバック: リクエスト完了
                                 #[cfg(feature = "wasm")]
                                 {
-                                    let wasm_modules = get_wasm_response_modules();
-                                    if !wasm_modules.is_empty() {
+                                    if !modules_to_apply.is_empty() {
                                         let config = CURRENT_CONFIG.load();
                                         if let Some(ref wasm_engine) = config.wasm_filter_engine {
-                                            crate::wasm::on_request_complete_async(wasm_engine.clone(), wasm_modules.to_vec()).await;
+                                            crate::wasm::on_request_complete_async(wasm_engine.clone(), modules_to_apply.clone()).await;
                                         }
                                     }
-                                    clear_wasm_response_modules();
                                 }
                             }
-                            None => {
-                                #[cfg(feature = "wasm")]
-                                clear_wasm_response_modules();
-                            }
+                            None => {}
                         }
                         // WebSocket 接続終了後は HTTP 接続も終了
                         return;
@@ -11681,28 +11675,32 @@ async fn handle_requests(
                     &headers_for_proxy,
                     &initial_body,
                     client_wants_close,
+                    {
+                        #[cfg(feature = "wasm")]
+                        { modules_to_apply.clone() }
+                        #[cfg(not(feature = "wasm"))]
+                        { Vec::new() }
+                    },
                     client_ip,
                 ).await;
 
                 match result {
                     Some((stream_back, status, resp_size, should_close)) => {
                         log_access(&method_bytes, &host_bytes, &path_bytes, &user_agent, content_length as u64, status, resp_size, start_instant);
-                        
+
                         // WASMライフサイクルコールバック: リクエスト完了
                         #[cfg(feature = "wasm")]
                         {
-                            let wasm_modules = get_wasm_response_modules();
-                            if !wasm_modules.is_empty() {
+                            if !modules_to_apply.is_empty() {
                                 let config = CURRENT_CONFIG.load();
                                 if let Some(ref wasm_engine) = config.wasm_filter_engine {
-                                    crate::wasm::on_request_complete_async(wasm_engine.clone(), wasm_modules.to_vec()).await;
+                                    crate::wasm::on_request_complete_async(wasm_engine.clone(), modules_to_apply.clone()).await;
                                 }
                             }
-                            clear_wasm_response_modules();
                         }
-                        
+
                         tls_stream = stream_back;
-                        
+
                         // Connection: close が要求された場合、またはエラー時は接続を閉じる
                         if should_close {
                             return;
@@ -11710,10 +11708,6 @@ async fn handle_requests(
                         // Keep-Alive: ループを継続して次のリクエストを待機
                     }
                     None => {
-                        // WASMモジュールリストをクリア
-                        #[cfg(feature = "wasm")]
-                        clear_wasm_response_modules();
-                        
                         return;
                     }
                 }
@@ -12315,25 +12309,27 @@ async fn handle_backend(
     headers: &[(Box<[u8]>, Box<[u8]>)],
     initial_body: &[u8],
     client_wants_close: bool,
+    wasm_modules: Vec<String>,
     client_ip: &str,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     match backend {
         Backend::Proxy(upstream_group, security, compression, buffering, cache, _) => {
             handle_proxy(
-                tls_stream, 
-                &upstream_group, 
-                &security, 
+                tls_stream,
+                &upstream_group,
+                &security,
                 &compression,
                 &buffering,
                 &cache,
-                method, 
-                req_path, 
-                &prefix, 
-                content_length, 
-                is_chunked, 
-                headers, 
-                initial_body, 
-                client_wants_close, 
+                method,
+                req_path,
+                &prefix,
+                content_length,
+                is_chunked,
+                headers,
+                initial_body,
+                client_wants_close,
+                wasm_modules,
                 client_ip
             ).await
         }
@@ -12377,7 +12373,6 @@ async fn handle_backend(
             // WASMレスポンスヘッダーフィルタを適用
             #[cfg(feature = "wasm")]
             let header = {
-                let wasm_modules = get_wasm_response_modules();
                 ftlog::debug!("[WASM Response] MemoryFile: wasm_modules count = {}", wasm_modules.len());
                 if !wasm_modules.is_empty() {
                     let config = CURRENT_CONFIG.load();
@@ -12436,10 +12431,7 @@ async fn handle_backend(
                     header
                 }
             };
-            // モジュールリストをクリア
-            #[cfg(feature = "wasm")]
-            clear_wasm_response_modules();
-            
+
             // Connection header を追加（headerをmutableにする）
             let mut header = header;
             if client_wants_close {
@@ -12471,7 +12463,7 @@ async fn handle_backend(
             let range_header = headers.iter()
                 .find(|(n, _)| n.eq_ignore_ascii_case(b"range"))
                 .map(|(_, v)| v.as_ref());
-            handle_sendfile(tls_stream, &base_path, is_dir, index_file.as_deref(), req_path, &prefix, client_wants_close, &security, range_header, open_file_cache_config.as_deref()).await
+            handle_sendfile(tls_stream, &base_path, is_dir, index_file.as_deref(), req_path, &prefix, client_wants_close, &security, range_header, open_file_cache_config.as_deref(), wasm_modules).await
         }
         Backend::Redirect(redirect_url, status_code, preserve_path, _) => {
             handle_redirect(tls_stream, &redirect_url, status_code, preserve_path, req_path, &prefix, client_wants_close).await
@@ -13443,6 +13435,7 @@ async fn handle_proxy(
     headers: &[(Box<[u8]>, Box<[u8]>)],
     initial_body: &[u8],
     client_wants_close: bool,
+    wasm_modules: Vec<String>,
     client_ip: &str,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // クライアントの Accept-Encoding を解析
@@ -13818,31 +13811,41 @@ async fn handle_proxy(
         // 設定ファイルの tls_insecure、または環境変数 VEIL_TLS_INSECURE で証明書検証スキップを制御
         let tls_insecure = upstream_group.tls_insecure() 
             || std::env::var("VEIL_TLS_INSECURE").map(|v| v == "1" || v == "true").unwrap_or(false);
-        proxy_https_pooled(client_stream, target, security, compression, buffering_config, client_encoding, &pool_key, request, content_length, is_chunked, initial_body, client_wants_close, tls_insecure).await
+        proxy_https_pooled(client_stream, target, security, compression, buffering_config, client_encoding, &pool_key, request, content_length, is_chunked, initial_body, client_wants_close, tls_insecure, wasm_modules).await
     } else if target.use_h2c || upstream_group.use_h2c() {
         // H2C (HTTP/2 over cleartext) 接続
         #[cfg(feature = "http2")]
         {
-            proxy_h2c(
-                client_stream, 
-                target, 
-                security,
-                method, 
-                final_path.as_bytes(), 
-                headers, 
-                initial_body,
-                client_wants_close
-            ).await
+            // gRPCメッセージサイズ制限チェック
+            let is_grpc = headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case(b"content-type") && value.starts_with(b"application/grpc")
+            });
+            if is_grpc && content_length > MAX_GRPC_BODY_SIZE {
+                let err_buf = ERR_MSG_REQUEST_TOO_LARGE.to_vec();
+                let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
+                Some((client_stream, 413, 0, true))
+            } else {
+                proxy_h2c(
+                    client_stream,
+                    target,
+                    security,
+                    method,
+                    final_path.as_bytes(),
+                    headers,
+                    initial_body,
+                    client_wants_close
+                ).await
+            }
         }
         #[cfg(not(feature = "http2"))]
         {
             // HTTP/2 feature が無効な場合はHTTP/1.1にフォールバック
             warn!("H2C requested but http2 feature not enabled, falling back to HTTP/1.1");
-            proxy_http_pooled(client_stream, target, security, compression, buffering_config, client_encoding, &pool_key, request, content_length, is_chunked, initial_body, client_wants_close, cache_save_ctx.as_mut()).await
+            proxy_http_pooled(client_stream, target, security, compression, buffering_config, client_encoding, &pool_key, request, content_length, is_chunked, initial_body, client_wants_close, cache_save_ctx.as_mut(), wasm_modules.clone()).await
         }
     } else {
         // HTTP接続（キャッシュ保存・バッファリング対応）
-        proxy_http_pooled(client_stream, target, security, compression, buffering_config, client_encoding, &pool_key, request, content_length, is_chunked, initial_body, client_wants_close, cache_save_ctx.as_mut()).await
+        proxy_http_pooled(client_stream, target, security, compression, buffering_config, client_encoding, &pool_key, request, content_length, is_chunked, initial_body, client_wants_close, cache_save_ctx.as_mut(), wasm_modules).await
     };
     
     // 接続カウンターを減少（Least Connections 用）
@@ -13910,6 +13913,7 @@ async fn proxy_http_pooled(
     initial_body: &[u8],
     client_wants_close: bool,
     cache_ctx: Option<&mut CacheSaveContext>,
+    wasm_modules: Vec<String>,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // セキュリティ設定からタイムアウトを取得
     let connect_timeout = Duration::from_secs(security.backend_connect_timeout_secs);
@@ -13971,7 +13975,12 @@ async fn proxy_http_pooled(
         // - 圧縮無効
         // - キャッシュ保存不要
         // - バッファリング無効
-        if client_stream.is_ktls_enabled() && !is_chunked && !compression_enabled && !cache_save_needed && !buffering_enabled {
+        // - WASMモジュール未設定（WASM有効時はユーザー空間でレスポンスヘッダーを操作する必要がある）
+        #[cfg(feature = "wasm")]
+        let wasm_modules_active = !wasm_modules.is_empty();
+        #[cfg(not(feature = "wasm"))]
+        let wasm_modules_active = false;
+        if client_stream.is_ktls_enabled() && !is_chunked && !compression_enabled && !cache_save_needed && !buffering_enabled && !wasm_modules_active {
             let splice_result = proxy_http_request_splice(
                 &client_stream,
                 &backend_stream,
@@ -13997,6 +14006,7 @@ async fn proxy_http_pooled(
                     client_encoding,
                     cache_ctx,
                     security,
+                    wasm_modules,
                 ).await
             }
         } else if buffering_enabled && !compression_enabled {
@@ -14016,7 +14026,7 @@ async fn proxy_http_pooled(
                 security,
             ).await
         } else {
-            debug!("Calling proxy_http_request_with_compression for {} {} (buffering_enabled={}, compression_enabled={})", 
+            debug!("Calling proxy_http_request_with_compression for {} {} (buffering_enabled={}, compression_enabled={})",
                    target.host, target.port, buffering_enabled, compression_enabled);
             // kTLS が無効、Chunked、圧縮有効、キャッシュ保存が必要、またはバッファリング無効の場合は通常版を使用
             proxy_http_request_with_compression(
@@ -14031,6 +14041,7 @@ async fn proxy_http_pooled(
                 client_encoding,
                 cache_ctx,
                 security,
+                wasm_modules,
             ).await
         }
     };
@@ -14064,6 +14075,7 @@ async fn proxy_http_pooled(
                     client_encoding,
                     cache_ctx,
                     security,
+                    wasm_modules,
                 ).await
     };
 
@@ -14182,12 +14194,20 @@ async fn proxy_h2c(
     // レスポンスヘッダー
     for (name, value) in &response.headers {
         // ホップバイホップヘッダーはスキップ
-        if name.eq_ignore_ascii_case(b"connection") 
+        if name.eq_ignore_ascii_case(b"connection")
             || name.eq_ignore_ascii_case(b"transfer-encoding")
             || name.eq_ignore_ascii_case(b"keep-alive")
         {
             continue;
         }
+        http11_response.extend_from_slice(name);
+        http11_response.extend_from_slice(b": ");
+        http11_response.extend_from_slice(value);
+        http11_response.extend_from_slice(b"\r\n");
+    }
+
+    // トレーラーヘッダー（gRPC-status など）をレスポンスヘッダーとして転送
+    for (name, value) in &response.trailers {
         http11_response.extend_from_slice(name);
         http11_response.extend_from_slice(b": ");
         http11_response.extend_from_slice(value);
@@ -15179,6 +15199,7 @@ async fn proxy_http_request_with_compression(
     client_encoding: AcceptedEncoding,
     cache_ctx: Option<&mut CacheSaveContext>,
     security: &SecurityConfig,
+    wasm_modules: Vec<String>,
 ) -> Option<(u16, u64, bool)> {
     // 1. リクエストヘッダー送信（タイムアウト付き）
     let write_result = timeout(WRITE_TIMEOUT, backend_stream.write_all(request)).await;
@@ -15223,7 +15244,7 @@ async fn proxy_http_request_with_compression(
 
     // 4. レスポンスを受信して転送（圧縮対応、キャッシュ保存対応）
     let (total, status_code, backend_wants_keep_alive) =
-        transfer_response_with_compression(backend_stream, client_stream, compression, client_encoding, cache_ctx, security).await;
+        transfer_response_with_compression(backend_stream, client_stream, compression, client_encoding, cache_ctx, security, wasm_modules).await;
 
     Some((status_code, total, backend_wants_keep_alive))
 }
@@ -15241,6 +15262,7 @@ async fn transfer_response_with_compression(
     client_encoding: AcceptedEncoding,
     mut cache_ctx: Option<&mut CacheSaveContext>,
     security: &SecurityConfig,
+    wasm_modules: Vec<String>,
 ) -> (u64, u16, bool) {
     let mut accumulated = Vec::with_capacity(BUF_SIZE);
     let mut total = 0u64;
@@ -15370,7 +15392,6 @@ async fn transfer_response_with_compression(
                     // WASMレスポンスヘッダーフィルタを適用
                     #[cfg(feature = "wasm")]
                     {
-                        let wasm_modules = get_wasm_response_modules();
                         if !wasm_modules.is_empty() {
                             let config = CURRENT_CONFIG.load();
                             if let Some(ref wasm_engine) = config.wasm_filter_engine {
@@ -15389,7 +15410,7 @@ async fn transfer_response_with_compression(
                                         Some((name, value))
                                     })
                                     .collect();
-                                
+
                                 // WASMフィルタを実行（レスポンスヘッダー処理）
                                 let wasm_result = wasm_engine.clone().on_response_headers_with_modules_async(
                                     wasm_modules.clone(),
@@ -15397,18 +15418,18 @@ async fn transfer_response_with_compression(
                                     current_headers,
                                     true, // end_of_stream
                                 ).await;
-                                
+
                                 match wasm_result {
                                     crate::wasm::FilterResult::Continue { headers: modified_headers, .. } => {
                                         // WASMから修正されたヘッダーで置き換え
                                         new_header_lines.clear();
-                                        
+
                                         // ステータス行を再追加
-                                        let status_line = format!("HTTP/1.1 {} {}\r\n", 
-                                            status_code, 
+                                        let status_line = format!("HTTP/1.1 {} {}\r\n",
+                                            status_code,
                                             status_code_to_reason(status_code));
                                         new_header_lines.push(status_line.into_bytes());
-                                        
+
                                         // WASMから返されたヘッダーを追加
                                         for (name, value) in modified_headers {
                                             new_header_lines.push(format!("{}: {}\r\n", name, value).into_bytes());
@@ -15424,8 +15445,6 @@ async fn transfer_response_with_compression(
                                 }
                             }
                         }
-                        // モジュールリストをクリア
-                        clear_wasm_response_modules();
                     }
                     
                     // ヘッダー終了マーカーを追加
@@ -16353,6 +16372,7 @@ async fn proxy_https_pooled(
     initial_body: &[u8],
     client_wants_close: bool,
     tls_insecure: bool,
+    wasm_modules: Vec<String>,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // セキュリティ設定からタイムアウトを取得
     let connect_timeout = Duration::from_secs(security.backend_connect_timeout_secs);
@@ -16448,6 +16468,7 @@ async fn proxy_https_pooled(
             compression,
             client_encoding,
             security,
+            wasm_modules,
         ).await
     };
 
@@ -16485,6 +16506,7 @@ async fn proxy_https_request_with_compression(
     compression: &CompressionConfig,
     client_encoding: AcceptedEncoding,
     security: &SecurityConfig,
+    wasm_modules: Vec<String>,
 ) -> Option<(u16, u64, bool)> {
     // 1. リクエストヘッダー送信
     let write_result = timeout(WRITE_TIMEOUT, backend_stream.write_all(request)).await;
@@ -16532,7 +16554,7 @@ async fn proxy_https_request_with_compression(
 
     // 4. レスポンスを受信して転送（圧縮対応）
     let (total, status_code, backend_wants_keep_alive) =
-        transfer_https_response_with_compression(backend_stream, client_stream, compression, client_encoding, security).await;
+        transfer_https_response_with_compression(backend_stream, client_stream, compression, client_encoding, security, wasm_modules).await;
 
     Some((status_code, total, backend_wants_keep_alive))
 }
@@ -16544,6 +16566,7 @@ async fn transfer_https_response_with_compression(
     compression: &CompressionConfig,
     client_encoding: AcceptedEncoding,
     security: &SecurityConfig,
+    wasm_modules: Vec<String>,
 ) -> (u64, u16, bool) {
     let mut accumulated = Vec::with_capacity(BUF_SIZE);
     let mut total = 0u64;
@@ -16658,20 +16681,63 @@ async fn transfer_https_response_with_compression(
                     for (header_name, header_value) in &security.add_response_headers {
                         new_header_lines.push(format!("{}: {}\r\n", header_name, header_value).into_bytes());
                     }
-                    
+
+                    // WASMレスポンスヘッダーフィルタを適用
+                    #[cfg(feature = "wasm")]
+                    {
+                        if !wasm_modules.is_empty() {
+                            let config = CURRENT_CONFIG.load();
+                            if let Some(ref wasm_engine) = config.wasm_filter_engine {
+                                let current_headers: Vec<(String, String)> = new_header_lines.iter()
+                                    .skip(1)
+                                    .filter_map(|line| {
+                                        let line_str = std::str::from_utf8(line).ok()?;
+                                        let line_trimmed = line_str.trim_end_matches("\r\n");
+                                        if line_trimmed.is_empty() { return None; }
+                                        let colon_pos = line_trimmed.find(':')?;
+                                        let name = line_trimmed[..colon_pos].to_string();
+                                        let value = line_trimmed[colon_pos+1..].trim_start().to_string();
+                                        Some((name, value))
+                                    })
+                                    .collect();
+
+                                let wasm_result = wasm_engine.clone().on_response_headers_with_modules_async(
+                                    wasm_modules.clone(),
+                                    status_code,
+                                    current_headers,
+                                    true,
+                                ).await;
+
+                                match wasm_result {
+                                    crate::wasm::FilterResult::Continue { headers: modified_headers_wasm, .. } => {
+                                        new_header_lines.clear();
+                                        let status_line = format!("HTTP/1.1 {} {}\r\n",
+                                            status_code,
+                                            status_code_to_reason(status_code));
+                                        new_header_lines.push(status_line.into_bytes());
+                                        for (name, value) in modified_headers_wasm {
+                                            new_header_lines.push(format!("{}: {}\r\n", name, value).into_bytes());
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+
                     // ヘッダー終了マーカーを追加
                     new_header_lines.push(b"\r\n".to_vec());
-                    
+
                     // 結合
                     modified_headers = new_header_lines.into_iter().flatten().collect();
                 }
-                
+
                 let write_result = timeout(WRITE_TIMEOUT, client_stream.write_all(modified_headers)).await;
                 if !matches!(write_result, Ok((Ok(_), _))) {
                     return (total, status_code, false);
                 }
                 total += header_len as u64;
-                
+
                 if !body_start.is_empty() {
                     let body_data = body_start.to_vec();
                     let write_result = timeout(WRITE_TIMEOUT, client_stream.write_all(body_data)).await;
@@ -17169,6 +17235,7 @@ async fn handle_sendfile(
     security: &SecurityConfig,
     range_header: Option<&[u8]>,  // RFC 7233 Range header support
     open_file_cache_config: Option<&cache::OpenFileCacheConfig>,  // OpenFileCache設定（ルーティングごと）
+    wasm_modules: Vec<String>,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // --- パス解決ロジック（Nginx風） ---
     // 
@@ -17353,7 +17420,6 @@ async fn handle_sendfile(
     // WASMレスポンスヘッダーフィルタを適用
     #[cfg(feature = "wasm")]
     let header_buf = {
-        let wasm_modules = get_wasm_response_modules();
         ftlog::info!("[WASM Response] SendFile: wasm_modules count = {}", wasm_modules.len());
         if !wasm_modules.is_empty() {
             let config = CURRENT_CONFIG.load();
@@ -17411,10 +17477,7 @@ async fn handle_sendfile(
             header_buf
         }
     };
-    // モジュールリストをクリア
-    #[cfg(feature = "wasm")]
-    clear_wasm_response_modules();
-    
+
     // Connection ヘッダーを追加（headerをmutableにする）
     let mut header_buf = header_buf;
     if client_wants_close {
