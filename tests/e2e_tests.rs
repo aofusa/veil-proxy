@@ -4292,18 +4292,18 @@ async fn test_routing_method_condition() {
         return;
     }
     
-    // 注意: このテストは設定ファイルでメソッド条件ルーティングを設定する必要がある
-    // 例: [route.conditions] method = ["GET", "POST"]
-    
-    // POSTリクエスト
+    // /api/get-only/* パスに allowed_methods = ["GET", "HEAD"] を設定済み
+    // POSTリクエストを送信すると 405 Method Not Allowed が返される
+
+    // POSTリクエスト（許可されていないメソッド）
     let response = send_request_with_method(
         PROXY_PORT,
-        "/",
+        "/api/get-only/",
         "POST",
         &[],
         Some(b"test body")
     ).await;
-    
+
     if let Some(response) = response {
         let status = get_status_code(&response);
         // メソッドが許可されていない場合、405 Method Not Allowedが返される
@@ -4358,22 +4358,12 @@ async fn test_routing_source_ip_condition() {
         return;
     }
     
-    // 注意: このテストは設定ファイルでソースIP条件ルーティングを設定する必要がある
-    // 例: [route.conditions] source_ip = ["127.0.0.1/32"]
-    
-    // 127.0.0.1からのリクエスト（リトライ付き）
-    let mut response = None;
-    for _ in 0..3 {
-        response = send_request(PROXY_PORT, "/", &[]).await;
-        if let Some(ref resp) = response {
-            let status = get_status_code(resp);
-            if status == Some(200) || status == Some(403) {
-                break;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    
+    // /api/ip-restricted/* パスに denied_ips = ["127.0.0.0/8"] を設定済み
+    // テストクライアントは 127.0.0.1 から接続するため 403 Forbidden が返される
+
+    // 127.0.0.1からのリクエスト
+    let response = send_request(PROXY_PORT, "/api/ip-restricted/", &[]).await;
+
     assert!(response.is_some(), "Should receive response");
     let response = response.unwrap();
     let status = get_status_code(&response);
@@ -5616,16 +5606,15 @@ async fn test_method_restriction() {
         return;
     }
     
-    // 注意: このテストは設定ファイルでメソッド制限を設定する必要がある
-    // 例: allowed_methods = ["GET", "HEAD"]
-    
-    // GETリクエスト（通常許可されている）
-    let get_response = send_request(PROXY_PORT, "/", &[]).await;
+    // /api/get-only/* パスに allowed_methods = ["GET", "HEAD"] を設定済み
+
+    // GETリクエスト（許可されているメソッド）
+    let get_response = send_request(PROXY_PORT, "/api/get-only/", &[]).await;
     assert!(get_response.is_some(), "Should receive GET response");
     assert_eq!(get_status_code(&get_response.unwrap()), Some(200), "GET should return 200");
-    
-    // POSTリクエスト（制限されている可能性がある）
-    let post_response = send_request_with_method(PROXY_PORT, "/", "POST", &[], Some(b"test body")).await;
+
+    // POSTリクエスト（制限されているメソッド）
+    let post_response = send_request_with_method(PROXY_PORT, "/api/get-only/", "POST", &[], Some(b"test body")).await;
     if let Some(response) = post_response {
         let status = get_status_code(&response);
         // メソッドが許可されていない場合、405 Method Not Allowedが返される
@@ -5633,7 +5622,7 @@ async fn test_method_restriction() {
             status, Some(405),
             "Should return 405 Method Not Allowed for restricted method, got: {:?}", status
         );
-        
+
         if status == Some(405) {
             eprintln!("Method restriction is working: POST is not allowed");
         }
@@ -5733,8 +5722,9 @@ async fn test_malformed_headers() {
     
     let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
     
-    // 不正なヘッダー（改行文字が含まれている）を送信
-    let malformed_request = b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Test: value\r\n\r\n";
+    // 不正なヘッダー（無効な Content-Length 値を含む）を送信
+    // Content-Length に数値以外の文字列を指定することで 400 Bad Request が返される
+    let malformed_request = b"GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: invalid\r\n\r\n";
     if let Err(e) = tls_stream.write_all(malformed_request) {
         panic!("Failed to send malformed request: {:?}", e);
     }
@@ -9088,8 +9078,8 @@ async fn test_error_handling_413_payload_too_large() {
     
     let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
     
-    // 大きなContent-Lengthを指定したリクエストを送信
-    let large_size = 10_000_000; // 10MB
+    // 大きなContent-Lengthを指定したリクエストを送信 (MAX_BODY_SIZE=10MiB より大きい値)
+    let large_size = 11_000_000; // 11MB > proxy's 10MiB limit
     let request = format!("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n", large_size);
     if let Err(e) = tls_stream.write_all(request.as_bytes()) {
         panic!("Failed to send request: {:?}", e);
@@ -9688,16 +9678,21 @@ async fn test_keep_alive_max_requests() {
     // Keep-Alive接続での最大リクエスト数のテスト
     // 同じ接続で複数のリクエストを送信
     
+    let num_requests = 5;
+    let mut success_count = 0;
+
+    // Keep-Alive では同一接続上で複数リクエストを送信する
+    // ただし keep-alive でサーバーは接続を閉じないため、短い read timeout で
+    // 「データなし」を検出して次のリクエストへ進む
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    // 500ms でデータ待ちを打ち切る（keep-alive: サーバーは閉じない）
+    stream.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
     stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
-    
-    // TLS接続を確立
+
     let config = create_client_config();
     let server_name = ServerName::try_from("localhost".to_string()).unwrap();
     let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
-    
-    // TLSハンドシェイクを完了
+
     while tls_conn.is_handshaking() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
@@ -9706,31 +9701,34 @@ async fn test_keep_alive_max_requests() {
             }
         }
     }
-    
+
     let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
-    
-    let num_requests = 5;
-    let mut success_count = 0;
-    
+
     for i in 0..num_requests {
         let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n";
         if let Err(e) = tls_stream.write_all(request) {
             eprintln!("Failed to send request {}: {:?}", i, e);
             break;
         }
-        tls_stream.flush().unwrap();
-        
-        // レスポンスを受信
+        if tls_stream.flush().is_err() {
+            break;
+        }
+
+        // レスポンスを受信（500ms read timeout で keep-alive 後の無音を検出して終了）
+        // \r\n\r\n で止めるとボディ残留バイトが次のリクエストに混入するため、
+        // タイムアウトまで読み切ってバッファを空にする
         let mut response = Vec::new();
         let mut buf = [0u8; 8192];
         loop {
             match tls_stream.read(&mut buf) {
                 Ok(0) => break,
-                Ok(n) => response.extend_from_slice(&buf[..n]),
-                Err(_) => break,
+                Ok(n) => {
+                    response.extend_from_slice(&buf[..n]);
+                }
+                Err(_) => break, // timeout → TLS バッファが空になった
             }
         }
-        
+
         if !response.is_empty() {
             let response = String::from_utf8_lossy(&response);
             let status = get_status_code(&response);
@@ -9738,17 +9736,14 @@ async fn test_keep_alive_max_requests() {
                 success_count += 1;
             }
         }
-        
-        // 短い待機時間
-        std::thread::sleep(Duration::from_millis(10));
     }
-    
+
     assert!(
         success_count >= num_requests * 8 / 10,
         "At least 80% of Keep-Alive requests should succeed: {}/{}",
         success_count, num_requests
     );
-    
+
     eprintln!("Keep-Alive max requests test: {}/{} succeeded", success_count, num_requests);
 }
 
@@ -12922,12 +12917,12 @@ async fn test_routing_combined_conditions() {
     }
     
     // 注意: このテストは設定ファイルで複数条件を持つルートを設定する必要がある
-    // 例: host + path + header + method + query + source_ip の組み合わせ
-    
+    // /api/combined/* パスに query={format=json} かつ header={X-Version=v2, X-API-Key=secret} を設定
+
     // すべての条件を満たすリクエストを送信
     let response = send_request_with_method(
         PROXY_PORT,
-        "/?format=json",
+        "/api/combined/?format=json",
         "GET",
         &[
             ("X-Version", "v2"),
@@ -13050,18 +13045,18 @@ async fn test_routing_header_multiple() {
     }
     
     // 注意: このテストは設定ファイルで複数ヘッダー条件を持つルートを設定する必要がある
-    // 例: header = { "X-Version" = "v2", "X-API-Key" = "secret" }
-    
+    // /api/header-filter/* パスに header = { "X-Version" = "v2", "X-API-Key" = "secret" } 条件を設定
+
     // すべてのヘッダー条件を満たすリクエストを送信
-    let response1 = send_request(PROXY_PORT, "/", &[
+    let response1 = send_request(PROXY_PORT, "/api/header-filter/", &[
         ("X-Version", "v2"),
         ("X-API-Key", "secret"),
     ]).await;
     assert!(response1.is_some(), "Should receive response");
     let status1 = get_status_code(&response1.unwrap());
-    
+
     // 1つ以上のヘッダー条件を満たさないリクエストを送信
-    let response2 = send_request(PROXY_PORT, "/", &[
+    let response2 = send_request(PROXY_PORT, "/api/header-filter/", &[
         ("X-Version", "v1"),  // 条件を満たさない
         ("X-API-Key", "secret"),
     ]).await;
@@ -13089,18 +13084,18 @@ async fn test_routing_query_multiple() {
     }
     
     // 注意: このテストは設定ファイルで複数クエリパラメータ条件を持つルートを設定する必要がある
-    // 例: query = { "format" = "json", "version" = "1" }
-    
+    // /api/query-filter/* パスに query = { "format" = "json", "version" = "1" } 条件を設定
+
     // すべてのクエリパラメータ条件を満たすリクエストを送信
-    let response1 = send_request(PROXY_PORT, "/?format=json&version=1", &[]).await;
+    let response1 = send_request(PROXY_PORT, "/api/query-filter/?format=json&version=1", &[]).await;
     assert!(response1.is_some(), "Should receive response");
     let status1 = get_status_code(&response1.unwrap());
-    
+
     // 1つ以上のクエリパラメータ条件を満たさないリクエストを送信
-    let response2 = send_request(PROXY_PORT, "/?format=xml&version=1", &[]).await;
+    let response2 = send_request(PROXY_PORT, "/api/query-filter/?format=xml&version=1", &[]).await;
     assert!(response2.is_some(), "Should receive response");
     let status2 = get_status_code(&response2.unwrap());
-    
+
     // すべての条件を満たす場合、200が返される
     assert_eq!(
         status1, Some(200),
@@ -13146,12 +13141,12 @@ async fn test_routing_condition_and_logic() {
     }
     
     // 注意: このテストは設定ファイルで複数条件を持つルートを設定する必要がある
-    // すべての条件がANDで結合されることを確認
-    
+    // /api/condition-and/* パスに query={format=json} かつ header={X-Version=v2} を設定
+
     // すべての条件を満たすリクエスト
     let response1 = send_request_with_method(
         PROXY_PORT,
-        "/?format=json",
+        "/api/condition-and/?format=json",
         "GET",
         &[
             ("X-Version", "v2"),
@@ -13160,11 +13155,11 @@ async fn test_routing_condition_and_logic() {
     ).await;
     assert!(response1.is_some(), "Should receive response");
     let status1 = get_status_code(&response1.unwrap());
-    
-    // 1つ以上の条件を満たさないリクエスト
+
+    // 1つ以上の条件を満たさないリクエスト（クエリパラメータが不一致）
     let response2 = send_request_with_method(
         PROXY_PORT,
-        "/?format=xml",  // 条件を満たさない
+        "/api/condition-and/?format=xml",  // 条件を満たさない
         "GET",
         &[
             ("X-Version", "v2"),
@@ -13173,7 +13168,7 @@ async fn test_routing_condition_and_logic() {
     ).await;
     assert!(response2.is_some(), "Should receive response");
     let status2 = get_status_code(&response2.unwrap());
-    
+
     // すべての条件を満たす場合、200が返される
     assert_eq!(
         status1, Some(200),
@@ -13271,10 +13266,11 @@ async fn test_routing_trailing_slash() {
     }
     
     // 末尾スラッシュの有無が正しく処理されることを確認
+    // /api/ ディレクトリには index.html が存在するため両方 200 が返される
     let response1 = send_request(PROXY_PORT, "/api", &[]).await;
     assert!(response1.is_some(), "Should receive response");
     let status1 = get_status_code(&response1.unwrap());
-    
+
     let response2 = send_request(PROXY_PORT, "/api/", &[]).await;
     assert!(response2.is_some(), "Should receive response");
     let status2 = get_status_code(&response2.unwrap());

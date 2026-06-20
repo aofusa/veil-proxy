@@ -128,6 +128,35 @@ prepare_fixtures() {
     python3 -c "print('A' * 10000)" > "${FIXTURES_DIR}/backend2/large.txt"
     python3 -c "print('A' * 10000)" > "${FIXTURES_DIR}/backend_h2c/large.txt"
     
+    # /healthエンドポイント用JSONファイル（プロキシが直接サービスする）
+    echo '{"status":"ok","proxy":"veil"}' > "${FIXTURES_DIR}/proxy_health.json"
+
+    # ルーティングテスト用フィクスチャ（各テストが使用するサブパス）
+    for backend in backend1 backend2; do
+        mkdir -p "${FIXTURES_DIR}/${backend}/api/v1"
+        mkdir -p "${FIXTURES_DIR}/${backend}/api/v2"
+        mkdir -p "${FIXTURES_DIR}/${backend}/api/header-filter"
+        mkdir -p "${FIXTURES_DIR}/${backend}/api/query-filter"
+        mkdir -p "${FIXTURES_DIR}/${backend}/api/condition-and"
+        mkdir -p "${FIXTURES_DIR}/${backend}/api/combined"
+        mkdir -p "${FIXTURES_DIR}/${backend}/api/ip-restricted"
+        mkdir -p "${FIXTURES_DIR}/${backend}/api/get-only"
+        echo "<h1>API Index</h1>" > "${FIXTURES_DIR}/${backend}/api/index.html"
+        echo "v1 test" > "${FIXTURES_DIR}/${backend}/api/v1/test"
+        echo "v2 test" > "${FIXTURES_DIR}/${backend}/api/v2/test"
+        echo "<h1>Header Filter OK</h1>" > "${FIXTURES_DIR}/${backend}/api/header-filter/index.html"
+        echo "<h1>Query Filter OK</h1>" > "${FIXTURES_DIR}/${backend}/api/query-filter/index.html"
+        echo "<h1>Condition AND OK</h1>" > "${FIXTURES_DIR}/${backend}/api/condition-and/index.html"
+        echo "<h1>Combined OK</h1>" > "${FIXTURES_DIR}/${backend}/api/combined/index.html"
+        echo "<h1>IP Restricted OK</h1>" > "${FIXTURES_DIR}/${backend}/api/ip-restricted/index.html"
+        echo "<h1>GET Only OK</h1>" > "${FIXTURES_DIR}/${backend}/api/get-only/index.html"
+        # prefix-strippedパス（/api/* ルートが /api プレフィックスを除去した後）
+        mkdir -p "${FIXTURES_DIR}/${backend}/v1"
+        mkdir -p "${FIXTURES_DIR}/${backend}/v2"
+        echo "v1 test" > "${FIXTURES_DIR}/${backend}/v1/test"
+        echo "v2 test" > "${FIXTURES_DIR}/${backend}/v2/test"
+    done
+
     # 必要なディレクトリの作成
     mkdir -p "${FIXTURES_DIR}/wasm"
     mkdir -p "/tmp/veil_buffer"
@@ -306,6 +335,16 @@ servers = [
     "https://127.0.0.1:${BACKEND2_PORT}"
 ]
 tls_insecure = true
+
+[upstreams."backend-pool".health_check]
+enabled = true
+path = "/health"
+interval_secs = 5
+timeout_secs = 3
+healthy_threshold = 1
+unhealthy_threshold = 10000
+use_tls = true
+verify_cert = false
 
 [upstreams."grpc-pool"]
 algorithm = "round_robin"
@@ -518,6 +557,223 @@ add_response_headers = { "X-Proxied-By" = "veil" }
 EOF
         fi
     fi
+
+    # /healthエンドポイント（プロキシが直接JSONファイルを返す）
+    cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/health"
+[route.action]
+type = "File"
+path = "${FIXTURES_DIR}/proxy_health.json"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/health"
+[route.action]
+type = "File"
+path = "${FIXTURES_DIR}/proxy_health.json"
+EOF
+
+    # リダイレクトルート（302/307/308テスト用）
+    cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/redirect-test"
+[route.action]
+type = "Redirect"
+redirect_url = "https://localhost:${PROXY_HTTPS_PORT}/"
+redirect_status = 302
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/redirect-test"
+[route.action]
+type = "Redirect"
+redirect_url = "https://127.0.0.1:${PROXY_HTTPS_PORT}/"
+redirect_status = 302
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/redirect-307"
+[route.action]
+type = "Redirect"
+redirect_url = "https://localhost:${PROXY_HTTPS_PORT}/"
+redirect_status = 307
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/redirect-307"
+[route.action]
+type = "Redirect"
+redirect_url = "https://127.0.0.1:${PROXY_HTTPS_PORT}/"
+redirect_status = 307
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/redirect-308"
+[route.action]
+type = "Redirect"
+redirect_url = "https://localhost:${PROXY_HTTPS_PORT}/"
+redirect_status = 308
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/redirect-308"
+[route.action]
+type = "Redirect"
+redirect_url = "https://127.0.0.1:${PROXY_HTTPS_PORT}/"
+redirect_status = 308
+
+# ヘッダー条件ルーティングテスト（X-Version=v2 かつ X-API-Key=secret が必要）
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/api/header-filter/*"
+header = { "X-Version" = "v2", "X-API-Key" = "secret" }
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/api/header-filter/*"
+header = { "X-Version" = "v2", "X-API-Key" = "secret" }
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+
+# クエリパラメータ条件ルーティングテスト（format=json かつ version=1 が必要）
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/api/query-filter/*"
+query = { "format" = "json", "version" = "1" }
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/api/query-filter/*"
+query = { "format" = "json", "version" = "1" }
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+
+# AND条件ルーティングテスト（query=format:json かつ header=X-Version:v2 が必要）
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/api/condition-and/*"
+query = { "format" = "json" }
+header = { "X-Version" = "v2" }
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/api/condition-and/*"
+query = { "format" = "json" }
+header = { "X-Version" = "v2" }
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+
+# 複合条件ルーティングテスト（format=json かつ X-Version=v2 かつ X-API-Key=secret が必要）
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/api/combined/*"
+query = { "format" = "json" }
+header = { "X-Version" = "v2", "X-API-Key" = "secret" }
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/api/combined/*"
+query = { "format" = "json" }
+header = { "X-Version" = "v2", "X-API-Key" = "secret" }
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+
+# IP制限テスト（127.0.0.1を拒否）
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/api/ip-restricted/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+[route.security]
+denied_ips = ["127.0.0.0/8"]
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/api/ip-restricted/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+[route.security]
+denied_ips = ["127.0.0.0/8"]
+
+# メソッド制限テスト（GETのみ許可）
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/api/get-only/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+[route.security]
+allowed_methods = ["GET", "HEAD"]
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/api/get-only/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+[route.security]
+allowed_methods = ["GET", "HEAD"]
+
+# ワイルドカードパス・末尾スラッシュテスト用（/api/* を汎用的にバックエンドへ転送）
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/api/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/api/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+EOF
 
     # 汎用ルート (最後に定義して優先順位を下げる)
     cat >> "${FIXTURES_DIR}/proxy.toml" << EOF

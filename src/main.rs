@@ -8701,21 +8701,50 @@ fn perform_health_check(
     // TLS接続の場合
     if use_tls {
         // rustls クライアント設定
-        let root_store = if verify_cert {
+        let config: Arc<ClientConfig> = if verify_cert {
             // 証明書検証を有効化（デフォルトのルート証明書ストアを使用）
             let mut root_store = RootCertStore::empty();
             root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            root_store
+            Arc::new(ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth())
         } else {
-            // 証明書検証を無効化（自己署名証明書を許可）
-            RootCertStore::empty()
+            // 証明書検証を完全に無効化（自己署名証明書を許可）
+            use rustls::client::danger::{ServerCertVerifier, HandshakeSignatureValid, ServerCertVerified};
+            use rustls::pki_types::{CertificateDer, UnixTime};
+            use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
+
+            #[derive(Debug)]
+            struct NoVerify;
+
+            impl ServerCertVerifier for NoVerify {
+                fn verify_server_cert(
+                    &self, _: &CertificateDer, _: &[CertificateDer],
+                    _: &rustls::pki_types::ServerName, _: &[u8], _: UnixTime,
+                ) -> Result<ServerCertVerified, TlsError> {
+                    Ok(ServerCertVerified::assertion())
+                }
+                fn verify_tls12_signature(&self, _: &[u8], _: &CertificateDer, _: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, TlsError> {
+                    Ok(HandshakeSignatureValid::assertion())
+                }
+                fn verify_tls13_signature(&self, _: &[u8], _: &CertificateDer, _: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, TlsError> {
+                    Ok(HandshakeSignatureValid::assertion())
+                }
+                fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+                    vec![
+                        SignatureScheme::RSA_PKCS1_SHA256, SignatureScheme::RSA_PKCS1_SHA384,
+                        SignatureScheme::RSA_PKCS1_SHA512, SignatureScheme::ECDSA_NISTP256_SHA256,
+                        SignatureScheme::ECDSA_NISTP384_SHA384, SignatureScheme::RSA_PSS_SHA256,
+                        SignatureScheme::RSA_PSS_SHA384, SignatureScheme::RSA_PSS_SHA512,
+                    ]
+                }
+            }
+
+            Arc::new(ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerify))
+                .with_no_client_auth())
         };
-        
-        let config = ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        
-        let config = Arc::new(config);
         
         // SNI名を決定
         let server_name = match ServerName::try_from(host.to_string()) {
@@ -11176,7 +11205,19 @@ async fn handle_requests(
                 let method_bytes: Box<[u8]> = req.method
                     .map(|m| m.as_bytes().into())
                     .unwrap_or_else(|| Box::from(b"GET" as &[u8]));
-                
+
+                // 有効なHTTPメソッドのみ受け付ける（RFC 7231）
+                const VALID_HTTP_METHODS: &[&[u8]] = &[
+                    b"GET", b"HEAD", b"POST", b"PUT", b"DELETE",
+                    b"CONNECT", b"OPTIONS", b"TRACE", b"PATCH",
+                ];
+                if !VALID_HTTP_METHODS.iter().any(|m| method_bytes.as_ref().eq_ignore_ascii_case(m)) {
+                    drop(req);
+                    let err_buf = ERR_MSG_METHOD_NOT_ALLOWED.to_vec();
+                    let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+                    return;
+                }
+
                 // ヘッダー情報抽出
                 let host_bytes: Box<[u8]> = req.headers.iter()
                     .find(|h| h.name.eq_ignore_ascii_case("host"))
@@ -11200,10 +11241,19 @@ async fn handle_requests(
                     .unwrap_or_else(|| Box::from([] as [u8; 0]));
                 
                 // Content-Length ヘッダーの値を取得し、不正な値の場合は400 Bad Requestを返す
-                let content_length_header = req.headers.iter()
-                    .find(|h| h.name.eq_ignore_ascii_case("content-length"));
-                
-                let content_length: usize = if let Some(cl_header) = content_length_header {
+                // 複数の Content-Length ヘッダーは RFC 7230 Section 3.3.2 違反 → 400
+                let cl_headers: Vec<_> = req.headers.iter()
+                    .filter(|h| h.name.eq_ignore_ascii_case("content-length"))
+                    .collect();
+
+                if cl_headers.len() > 1 {
+                    drop(req);
+                    let err_buf = ERR_MSG_BAD_REQUEST.to_vec();
+                    let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+                    return;
+                }
+
+                let content_length: usize = if let Some(cl_header) = cl_headers.first() {
                     match std::str::from_utf8(cl_header.value).ok().and_then(|s| s.trim().parse::<usize>().ok()) {
                         Some(len) => len,
                         None => {
@@ -11217,12 +11267,20 @@ async fn handle_requests(
                 } else {
                     0
                 };
-                
+
                 // Transfer-Encoding: chunked チェック（改善版）
                 let is_chunked: bool = req.headers.iter()
                     .find(|h| h.name.eq_ignore_ascii_case("transfer-encoding"))
                     .map(|h| is_chunked_encoding(h.value))
                     .unwrap_or(false);
+
+                // Content-Length と Transfer-Encoding の競合は RFC 7230 Section 3.3.3 違反 → 400
+                if content_length > 0 && is_chunked {
+                    drop(req);
+                    let err_buf = ERR_MSG_BAD_REQUEST.to_vec();
+                    let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+                    return;
+                }
                 
                 // Connection ヘッダーチェック（Keep-Alive / Upgrade対応）
                 let connection_header: Option<&[u8]> = req.headers.iter()
@@ -11948,7 +12006,8 @@ fn matches_conditions(
     // 条件が指定されていない場合は、すべてのヘッダーにマッチ（デフォルト）
     if let Some(ref header_map) = conditions.header {
         for (key, value_pattern) in header_map {
-            let header_value = headers.get(key).map(|s| s.as_str()).unwrap_or("");
+            let key_lower = key.to_lowercase();
+            let header_value = headers.get(&key_lower).map(|s| s.as_str()).unwrap_or("");
             if !matches_wildcard(value_pattern, header_value) {
                 return false;
             }
@@ -12043,8 +12102,8 @@ pub fn find_backend_unified(
                 }
             }
             None => {
-                // キャッシュヒット: マッチなし
-                return None;
+                // キャッシュが「マッチなし」を示しているが、header/query条件は動的なため
+                // フォールスルーして全ルートを再評価する
             }
         }
     }
@@ -12146,7 +12205,8 @@ fn matches_remaining_conditions(
     // header条件のチェック
     if let Some(ref header_map) = conditions.header {
         for (key, value_pattern) in header_map {
-            let header_value = headers.get(key).map(|s| s.as_str()).unwrap_or("");
+            let key_lower = key.to_lowercase();
+            let header_value = headers.get(&key_lower).map(|s| s.as_str()).unwrap_or("");
             if !matches_wildcard(value_pattern, header_value) {
                 return false;
             }
