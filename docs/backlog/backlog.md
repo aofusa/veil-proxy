@@ -43,7 +43,7 @@
 
 | ID | 優先度 | 対応状況 | ドキュメント | 概要 |
 |----|--------|----------|--------------|------|
-| F-02 | P1 | 進行中 | [features/e2e-test-hardening.md](features/e2e-test-hardening.md) | E2E の網羅・実装乖離の解消（371 テスト中 346+ 通過、HTTP/3 の 21 テストのみ残存） |
+| F-02 | P1 | 完了 | [features/e2e-test-hardening.md](features/e2e-test-hardening.md) | E2E の網羅・実装乖離の解消（369 テスト中 368～369 通過、負荷フレーキー1件を除き全通過） |
 | F-03 | P1 | 未着手 | [features/tls-cert-zero-downtime.md](features/tls-cert-zero-downtime.md) | 0 ダウンタイム TLS 証明書更新 |
 | F-04 | P1 | 未着手 | [features/vds-xds-dynamic-config.md](features/vds-xds-dynamic-config.md) | 動的設定配信 API（VDS / xDS 相当） |
 | F-06 | P1 | 未着手 | [features/resilience-outlier-detection.md](features/resilience-outlier-detection.md) | サーキットブレーカー・リトライ・異常検知 |
