@@ -39,6 +39,7 @@ BACKEND_H2C_TLS_PORT=9013
 BACKEND_H2C_PORT=9003
 BACKEND_GRPC_PORT=9004
 BACKEND_WS_PORT=9005
+BACKEND_ERROR_PORT=9006
 
 # 色付き出力
 RED='\033[0;31m'
@@ -487,6 +488,32 @@ max_disk_buffer = 100
 disk_buffer_path = "/tmp/veil_buffer"
 EOF
 
+    # HTTP 500 エラーバックエンドのルート設定
+    cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
+
+[upstreams."error-pool"]
+algorithm = "round_robin"
+servers = [
+    "http://127.0.0.1:${BACKEND_ERROR_PORT}"
+]
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/error-500/*"
+[route.action]
+type = "Proxy"
+upstream = "error-pool"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/error-500/*"
+[route.action]
+type = "Proxy"
+upstream = "error-pool"
+EOF
+
     # WebSocketルート設定
     cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
 [upstreams."ws-pool"]
@@ -891,7 +918,27 @@ asyncio.run(main())
 PYEOF
     echo $! >> "$PIDS_FILE"
     log_info "WebSocket Echo Backend started on port ${BACKEND_WS_PORT} (PID: $!, logs: /tmp/websocket_backend.log)"
-    
+
+    # HTTP 500 エラーバックエンド起動（Python）
+    log_info "Starting HTTP 500 Error Backend on port ${BACKEND_ERROR_PORT}..."
+    python3 - <<PYEOF > /tmp/error_backend.log 2>&1 &
+from http.server import HTTPServer, BaseHTTPRequestHandler
+class ErrorHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+    def do_GET(self):
+        self.send_response(500)
+        self.send_header('Content-Type', 'text/plain')
+        self.send_header('Content-Length', '21')
+        self.end_headers()
+        self.wfile.write(b'Internal Server Error')
+    def do_POST(self):
+        self.do_GET()
+HTTPServer(('127.0.0.1', ${BACKEND_ERROR_PORT}), ErrorHandler).serve_forever()
+PYEOF
+    echo $! >> "$PIDS_FILE"
+    log_info "HTTP 500 Error Backend started on port ${BACKEND_ERROR_PORT} (PID: $!)"
+
     # バックエンド起動待機（動的）
     log_info "Waiting for backends to be ready..."
     if wait_for_server "https://127.0.0.1:${BACKEND1_PORT}/health" "Backend 1" 15; then
@@ -1032,7 +1079,7 @@ check_port_conflicts() {
     log_info "Checking for port conflicts..."
     local conflicts=0
     
-    for port in $PROXY_HTTPS_PORT $PROXY_HTTP_PORT $PROXY_H2C_PORT $BACKEND1_PORT $BACKEND2_PORT $BACKEND_H2C_PORT $BACKEND_GRPC_PORT $BACKEND_WS_PORT; do
+    for port in $PROXY_HTTPS_PORT $PROXY_HTTP_PORT $PROXY_H2C_PORT $BACKEND1_PORT $BACKEND2_PORT $BACKEND_H2C_PORT $BACKEND_GRPC_PORT $BACKEND_WS_PORT $BACKEND_ERROR_PORT; do
         if check_port_in_use "$port"; then
             log_error "Port $port is already in use"
             conflicts=$((conflicts + 1))

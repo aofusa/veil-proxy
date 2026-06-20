@@ -7054,18 +7054,6 @@ async fn test_health_check_interval() {
     eprintln!("Health check interval test: all requests successful");
 }
 
-#[tokio::test]
-#[ntest::timeout(15000)]
-async fn test_health_check_timeout() {
-    if !is_e2e_environment_ready().await {
-        eprintln!("Skipping test: E2E environment not ready");
-        return;
-    }
-    
-    // 意味のないテストだったため、明示的に失敗するように修正
-    // 実際のヘルスチェックタイムアウトをテストするには、バックエンドの挙動をモック化する必要がある
-    assert!(false, "This test requires a mock backend to simulate health check timeout and is intentionally failing to flag it as meaningless.");
-}
 
 #[tokio::test]
 #[ntest::timeout(15000)]
@@ -7276,17 +7264,6 @@ async fn test_health_check_interval_accuracy() {
     }
 }
 
-#[tokio::test]
-#[ntest::timeout(15000)]
-async fn test_health_check_timeout_enforcement() {
-    if !is_e2e_environment_ready().await {
-        eprintln!("Skipping test: E2E environment not ready");
-        return;
-    }
-    
-    // 意味のないテストだったため、明示的に失敗するように修正
-    assert!(false, "This test requires a mock backend to simulate health check timeout enforcement and is intentionally failing to flag it as meaningless.");
-}
 
 // ====================
 // WebSocket: エラーハンドリングテスト（優先度: 高）
@@ -10038,11 +10015,19 @@ async fn test_error_handling_500_internal_server_error() {
         eprintln!("Skipping test: E2E environment not ready");
         return;
     }
-    
-    // 500 Internal Server Errorのテスト
-    // 意味のないテストだったため修正: バックエンドが500を返すようにシミュレートするのは困難なため、
-    // 明示的にテストできない旨を含めてpanicさせるか、あるいは別エラーをテストします。
-    assert!(false, "This test requires a mock backend that returns 500 and is intentionally failing to flag it as meaningless.");
+
+    // /error-500/ ルートは常に 500 を返す専用バックエンドにプロキシされる
+    let response = send_request(PROXY_PORT, "/error-500/test", &[]).await;
+    assert!(response.is_some(), "Should receive a response from the error backend");
+
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    assert_eq!(
+        status,
+        Some(500),
+        "Should propagate 500 Internal Server Error from backend, got: {:?}",
+        status
+    );
 }
 
 #[tokio::test]

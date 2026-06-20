@@ -76,10 +76,17 @@ pub async fn send_http3_request(
     headers: &[(&str, &str)],
     body: Option<&[u8]>,
 ) -> Result<(u16, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+    // HTTP/3では:authority擬似ヘッダーが必須なので完全なURIを使用
+    let uri = if path.starts_with("http://") || path.starts_with("https://") {
+        path.to_string()
+    } else {
+        format!("https://localhost{}", path)
+    };
+
     // リクエストを構築
     let mut builder = Request::builder()
         .method(method)
-        .uri(path);
+        .uri(uri);
     
     // カスタムヘッダーを追加
     for (name, value) in headers {

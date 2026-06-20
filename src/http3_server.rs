@@ -982,7 +982,9 @@ impl Http3Handler {
         // 非同期プロキシ処理（monoio TcpStream使用）
         // io_uringベースの非同期I/Oでバックエンド通信を行う
         let timeout_secs = 30;
-        let proxy_result = proxy_to_backend_async(target, request, timeout_secs).await;
+        let tls_insecure = upstream_group.tls_insecure()
+            || std::env::var("VEIL_TLS_INSECURE").map_or(false, |v| v == "1");
+        let proxy_result = proxy_to_backend_async_with_tls(target, request, timeout_secs, tls_insecure).await;
         
         server.release();
         
@@ -1268,6 +1270,15 @@ pub(crate) async fn proxy_to_backend_async(
     request: Vec<u8>,
     timeout_secs: u64,
 ) -> io::Result<BackendProxyResult> {
+    proxy_to_backend_async_with_tls(target, request, timeout_secs, false).await
+}
+
+pub(crate) async fn proxy_to_backend_async_with_tls(
+    target: &ProxyTarget,
+    request: Vec<u8>,
+    timeout_secs: u64,
+    tls_insecure: bool,
+) -> io::Result<BackendProxyResult> {
     use monoio::net::TcpStream;
     use std::os::unix::io::AsRawFd;
     
@@ -1296,7 +1307,7 @@ pub(crate) async fn proxy_to_backend_async(
     
     // TLSバックエンドの場合
     if target.use_tls {
-        return proxy_to_tls_backend_async(target, request, backend, timeout_secs).await;
+        return proxy_to_tls_backend_async(target, request, backend, timeout_secs, tls_insecure).await;
     }
     
     let fd = backend.as_raw_fd();
@@ -1350,146 +1361,165 @@ pub(crate) async fn proxy_to_backend_async(
     parse_http_response(&response)
 }
 
-/// TLSバックエンドへの非同期プロキシ処理
+/// TLSバックエンドへの非同期プロキシ処理（kTLS版）
+/// kTLS/rustlsフォールバック問題を回避するため spawn_blocking で std TLS 接続を使用
 #[cfg(feature = "ktls")]
 async fn proxy_to_tls_backend_async(
     target: &ProxyTarget,
     request: Vec<u8>,
     tcp_stream: monoio::net::TcpStream,
     timeout_secs: u64,
+    tls_insecure: bool,
 ) -> io::Result<BackendProxyResult> {
+    // monoio TcpStream は不要（別スレッドで std::net::TcpStream を使うため）
+    drop(tcp_stream);
+
+    let skip_verify = tls_insecure || std::env::var("VEIL_TLS_INSECURE").map_or(false, |v| v == "1");
+    let addr = format!("{}:{}", target.host, target.port);
+    let sni_name = target.sni_name.as_deref().unwrap_or(&target.host).to_string();
+
     use rustls::ClientConfig;
     use std::sync::Arc;
-    
-    let root_store = rustls::RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-    };
-    
-    // ClientConfigを作成（Arcにラップする前）
-    let mut config = ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-    
-    // kTLS用にシークレット抽出を有効化
-    // これにより dangerous_extract_secrets() が使用可能になる
-    config.enable_secret_extraction = true;
-    
-    // Arcにラップ
-    let config = Arc::new(config);
-    
-    let sni_name = target.sni_name.as_deref().unwrap_or(&target.host);
-    let server_name = match rustls::pki_types::ServerName::try_from(sni_name.to_string()) {
-        Ok(name) => name,
-        Err(e) => {
-            warn!("[HTTP/3] Invalid SNI name: {}", e);
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid SNI name"));
+
+    let config: Arc<ClientConfig> = if skip_verify {
+        #[derive(Debug)]
+        struct NoVerify;
+        impl rustls::client::danger::ServerCertVerifier for NoVerify {
+            fn verify_server_cert(&self, _: &rustls::pki_types::CertificateDer<'_>, _: &[rustls::pki_types::CertificateDer<'_>], _: &rustls::pki_types::ServerName<'_>, _: &[u8], _: rustls::pki_types::UnixTime) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> { Ok(rustls::client::danger::ServerCertVerified::assertion()) }
+            fn verify_tls12_signature(&self, _: &[u8], _: &rustls::pki_types::CertificateDer<'_>, _: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> { Ok(rustls::client::danger::HandshakeSignatureValid::assertion()) }
+            fn verify_tls13_signature(&self, _: &[u8], _: &rustls::pki_types::CertificateDer<'_>, _: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> { Ok(rustls::client::danger::HandshakeSignatureValid::assertion()) }
+            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> { rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms.supported_schemes().to_vec() }
         }
+        Arc::new(ClientConfig::builder().dangerous().with_custom_certificate_verifier(Arc::new(NoVerify)).with_no_client_auth())
+    } else {
+        let root_store = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+        Arc::new(ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth())
     };
-    
-    // kTLS 使用時は ktls_rustls::connect を使用
-    // (enable_ktls=true, allow_fallback=true, tcp_cork_enabled=true)
-    let tls_stream = crate::ktls_rustls::connect(tcp_stream, config, server_name, true, true, true).await?;
-    let fd = tls_stream.as_raw_fd();
-    
-    let mut written = 0;
-    while written < request.len() {
-        match write_nonblocking(fd, &request[written..]) {
-            Ok(n) if n > 0 => written += n,
-            Ok(_) | Err(_) => {
-                tls_stream.get_ref().writable(false).await?;
-            }
-        }
-    }
-    
-    let mut response = Vec::with_capacity(16384);
-    let mut buf = vec![0u8; 8192];
-    let read_timeout = Duration::from_secs(timeout_secs);
-    let start_time = std::time::Instant::now();
-    
-    loop {
-        if start_time.elapsed() > read_timeout { break; }
-        match read_nonblocking(fd, &mut buf) {
-            Ok(0) => break,
-            Ok(n) => response.extend_from_slice(&buf[..n]),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                let remaining = read_timeout.saturating_sub(start_time.elapsed());
-                if remaining.is_zero() { break; }
-                match monoio::time::timeout(remaining, tls_stream.get_ref().readable(false)).await {
-                    Ok(Ok(())) => continue,
-                    _ => break,
+
+    // 別スレッドでブロッキング TLS 通信を実行し、mpsc channel 経由で結果を受け取る
+    let (tx, rx) = std::sync::mpsc::sync_channel::<io::Result<BackendProxyResult>>(1);
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let result = (|| -> io::Result<BackendProxyResult> {
+            let timeout = Duration::from_secs(timeout_secs);
+            let mut std_stream = std::net::TcpStream::connect(&addr)
+                .map_err(|e| { warn!("[HTTP/3] std backend connect error: {}", e); e })?;
+            std_stream.set_read_timeout(Some(timeout))?;
+            std_stream.set_write_timeout(Some(timeout))?;
+            let server_name = rustls::pki_types::ServerName::try_from(sni_name)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+            let mut conn = rustls::ClientConnection::new(config, server_name)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            let mut tls = rustls::Stream::new(&mut conn, &mut std_stream);
+            tls.write_all(&request)?;
+            let mut response = Vec::with_capacity(16384);
+            let mut buf = [0u8; 8192];
+            // UnexpectedEof は TLS close_notify なしの正常な接続終了（HTTP/1.1 バックエンドで一般的）
+            loop {
+                match std::io::Read::read(&mut tls, &mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => response.extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(e),
                 }
             }
-            Err(_) => break,
+            parse_http_response(&response)
+        })();
+        let _ = tx.send(result);
+    });
+
+    // try_recv でポーリング（バックエンドが同一ホスト上のため数 ms で完了）
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        match rx.try_recv() {
+            Ok(result) => return result,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return Err(io::Error::new(io::ErrorKind::Other, "backend thread died"));
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "backend TLS timeout"));
+                }
+                monoio::time::sleep(Duration::from_millis(5)).await;
+            }
         }
     }
-    
-    parse_http_response(&response)
 }
 
-/// TLSバックエンドへの非同期プロキシ処理
+/// TLSバックエンドへの非同期プロキシ処理（non-kTLS）
+/// 別スレッドでブロッキング TLS 通信を行う
 #[cfg(not(feature = "ktls"))]
 async fn proxy_to_tls_backend_async(
     target: &ProxyTarget,
     request: Vec<u8>,
     tcp_stream: monoio::net::TcpStream,
     timeout_secs: u64,
+    tls_insecure: bool,
 ) -> io::Result<BackendProxyResult> {
     use rustls::ClientConfig;
     use std::sync::Arc;
-    
-    let root_store = rustls::RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-    };
-    
-    let config = Arc::new(ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth());
-    
-    let sni_name = target.sni_name.as_deref().unwrap_or(&target.host);
-    let server_name = match rustls::pki_types::ServerName::try_from(sni_name.to_string()) {
-        Ok(name) => name,
-        Err(e) => {
-            warn!("[HTTP/3] Invalid SNI name: {}", e);
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid SNI name"));
+
+    // monoio TcpStream は不要（別スレッドで std::net::TcpStream を使うため）
+    drop(tcp_stream);
+
+    let skip_verify = tls_insecure || std::env::var("VEIL_TLS_INSECURE").map_or(false, |v| v == "1");
+    let addr = format!("{}:{}", target.host, target.port);
+    let sni_name = target.sni_name.as_deref().unwrap_or(&target.host).to_string();
+
+    let config: Arc<ClientConfig> = if skip_verify {
+        #[derive(Debug)]
+        struct NoVerify;
+        impl rustls::client::danger::ServerCertVerifier for NoVerify {
+            fn verify_server_cert(&self, _: &rustls::pki_types::CertificateDer<'_>, _: &[rustls::pki_types::CertificateDer<'_>], _: &rustls::pki_types::ServerName<'_>, _: &[u8], _: rustls::pki_types::UnixTime) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> { Ok(rustls::client::danger::ServerCertVerified::assertion()) }
+            fn verify_tls12_signature(&self, _: &[u8], _: &rustls::pki_types::CertificateDer<'_>, _: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> { Ok(rustls::client::danger::HandshakeSignatureValid::assertion()) }
+            fn verify_tls13_signature(&self, _: &[u8], _: &rustls::pki_types::CertificateDer<'_>, _: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> { Ok(rustls::client::danger::HandshakeSignatureValid::assertion()) }
+            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> { rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms.supported_schemes().to_vec() }
         }
+        Arc::new(ClientConfig::builder().dangerous().with_custom_certificate_verifier(Arc::new(NoVerify)).with_no_client_auth())
+    } else {
+        let root_store = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+        Arc::new(ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth())
     };
-    
-    let tls_stream = crate::simple_tls::connect(tcp_stream, config, server_name).await?;
-    let fd = tls_stream.as_raw_fd();
-    
-    let mut written = 0;
-    while written < request.len() {
-        match write_nonblocking(fd, &request[written..]) {
-            Ok(n) if n > 0 => written += n,
-            Ok(_) | Err(_) => {
-                tls_stream.get_ref().writable(false).await?;
-            }
-        }
-    }
-    
-    let mut response = Vec::with_capacity(16384);
-    let mut buf = vec![0u8; 8192];
-    let read_timeout = Duration::from_secs(timeout_secs);
-    let start_time = std::time::Instant::now();
-    
+
+    // 別スレッドでブロッキング TLS 通信を実行し、mpsc channel 経由で結果を受け取る
+    let (tx, rx) = std::sync::mpsc::sync_channel::<io::Result<BackendProxyResult>>(1);
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let result = (|| -> io::Result<BackendProxyResult> {
+            let timeout = Duration::from_secs(timeout_secs);
+            let mut std_stream = std::net::TcpStream::connect(&addr)
+                .map_err(|e| { warn!("[HTTP/3] std backend connect error: {}", e); e })?;
+            std_stream.set_read_timeout(Some(timeout))?;
+            std_stream.set_write_timeout(Some(timeout))?;
+            let server_name = rustls::pki_types::ServerName::try_from(sni_name.as_str())
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+            let mut conn = rustls::ClientConnection::new(config, server_name)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            let mut tls = rustls::Stream::new(&mut conn, &mut std_stream);
+            tls.write_all(&request)?;
+            let mut response = Vec::with_capacity(16384);
+            tls.read_to_end(&mut response)?;
+            parse_http_response(&response)
+        })();
+        let _ = tx.send(result);
+    });
+
+    // try_recv でポーリング（バックエンドが同一ホスト上のため数 ms で完了）
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
     loop {
-        if start_time.elapsed() > read_timeout { break; }
-        match read_nonblocking(fd, &mut buf) {
-            Ok(0) => break,
-            Ok(n) => response.extend_from_slice(&buf[..n]),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                let remaining = read_timeout.saturating_sub(start_time.elapsed());
-                if remaining.is_zero() { break; }
-                match monoio::time::timeout(remaining, tls_stream.get_ref().readable(false)).await {
-                    Ok(Ok(())) => continue,
-                    _ => break,
-                }
+        match rx.try_recv() {
+            Ok(result) => return result,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return Err(io::Error::new(io::ErrorKind::Other, "backend thread died"));
             }
-            Err(_) => break,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "backend TLS timeout"));
+                }
+                monoio::time::sleep(Duration::from_millis(5)).await;
+            }
         }
     }
-    
-    parse_http_response(&response)
 }
 
 #[inline]
