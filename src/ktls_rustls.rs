@@ -619,6 +619,16 @@ pub async fn accept(
     tcp_cork_enabled: bool,
     mut initial_data: Option<Vec<u8>>,
 ) -> io::Result<KtlsServerStream> {
+    // io_uring's IORING_OP_ACCEPT does not set SOCK_NONBLOCK unlike accept4(2).
+    // We use raw_read/raw_write on this fd, so we must ensure O_NONBLOCK is set.
+    {
+        let fd = stream.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
+        if flags >= 0 && (flags & libc::O_NONBLOCK) == 0 {
+            unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        }
+    }
+
     let mut conn = ServerConnection::new(config)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
@@ -695,6 +705,16 @@ pub async fn connect(
     allow_fallback: bool,
     tcp_cork_enabled: bool,
 ) -> io::Result<KtlsClientStream> {
+    // io_uring's IORING_OP_CONNECT does not guarantee O_NONBLOCK on the stream.
+    // Ensure O_NONBLOCK is set before using raw_read/raw_write.
+    {
+        let fd = stream.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
+        if flags >= 0 && (flags & libc::O_NONBLOCK) == 0 {
+            unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        }
+    }
+
     let mut conn = ClientConnection::new(config, server_name)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
@@ -792,7 +812,7 @@ impl monoio::io::AsyncReadRent for KtlsServerStream {
             let slice = unsafe {
                 std::slice::from_raw_parts_mut(buf.write_ptr(), buf.bytes_total())
             };
-            
+
             let mut rd = conn.reader();
             match std::io::Read::read(&mut rd, slice) {
                 Ok(n) if n > 0 => {
@@ -800,18 +820,17 @@ impl monoio::io::AsyncReadRent for KtlsServerStream {
                     return (Ok(n), buf);
                 }
                 Ok(0) if !conn.wants_read() => {
-                    // EOF
                     return (Ok(0), buf);
                 }
-                Ok(_) => {}  // Not EOF yet, need more TLS data
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}  // Need more TLS data
-                Err(e) => return (Err(e), buf),  // Return actual errors
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return (Err(e), buf),
             }
 
             // TLS データを読み込む
             loop {
                 match raw_read(fd, &mut read_buf) {
-                    Ok(0) => return (Ok(0), buf),
+                    Ok(0) => { return (Ok(0), buf); }
                     Ok(n) => {
                         // read_tls が全てのデータを消費するまでループ
                         let mut consumed = 0;

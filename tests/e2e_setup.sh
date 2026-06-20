@@ -72,10 +72,10 @@ check_ktls_available() {
 # E2Eテストではすべてのfeaturesを有効化してビルドします
 # features: ktls,http2,http3,grpc-full,wasm
 ensure_veil_binary() {
-        log_info "Building veil with all features enabled (ktls,http2,http3,grpc-full,wasm)..."
-        cd "$PROJECT_DIR"
-        cargo build --features 'ktls,http2,http3,grpc-full,wasm'
-        cd - > /dev/null
+    log_info "Building veil with all features enabled (ktls,http2,http3,grpc-full,wasm)..."
+    cd "$PROJECT_DIR"
+    cargo build --features 'ktls,http2,http3,grpc-full,wasm'
+    cd - > /dev/null
     
     if [ ! -f "$VEIL_BIN" ]; then
         log_error "Failed to build veil binary"
@@ -113,17 +113,20 @@ prepare_fixtures() {
         log_info "Certificates generated"
     fi
     
-    # バックエンド1用テストファイル
-    echo "Hello from Backend 1" > "${FIXTURES_DIR}/backend1/index.html"
-    # 簡易なHTMLファイルを作成
-    echo "<h1>Backend 1</h1>" > "${FIXTURES_DIR}/backend1/index.html"
-    echo "<h1>Backend 2</h1>" > "${FIXTURES_DIR}/backend2/index.html"
+    # バックエンド1用テストファイル（テストが "Hello from Backend N" を含むことを確認するため両方含める）
+    echo "<h1>Hello from Backend 1</h1>" > "${FIXTURES_DIR}/backend1/index.html"
+    echo "<h1>Hello from Backend 2</h1>" > "${FIXTURES_DIR}/backend2/index.html"
     echo "<h1>H2C Backend</h1>" > "${FIXTURES_DIR}/backend_h2c/index.html"
     
     # ヘルスチェック用エンドポイント（200 OKを返す）
     echo "OK" > "${FIXTURES_DIR}/backend1/health"
     echo "OK" > "${FIXTURES_DIR}/backend2/health"
     echo "OK" > "${FIXTURES_DIR}/backend_h2c/health"
+
+    # 圧縮テスト・大容量ファイルテスト用（1024バイト超の圧縮閾値とtest_static_file_large用）
+    python3 -c "print('A' * 10000)" > "${FIXTURES_DIR}/backend1/large.txt"
+    python3 -c "print('A' * 10000)" > "${FIXTURES_DIR}/backend2/large.txt"
+    python3 -c "print('A' * 10000)" > "${FIXTURES_DIR}/backend_h2c/large.txt"
     
     # 必要なディレクトリの作成
     mkdir -p "${FIXTURES_DIR}/wasm"
@@ -529,6 +532,7 @@ upstream = "backend-pool"
 [route.security]
 add_response_headers = { "X-Proxied-By" = "veil", "X-Test-Header" = "e2e-test" }
 remove_response_headers = ["Server"]
+client_body_timeout_secs = 5
 [route.compression]
 enabled = true
 preferred_encodings = ["zstd", "br", "gzip"]
@@ -543,6 +547,7 @@ type = "Proxy"
 upstream = "backend-pool"
 [route.security]
 add_response_headers = { "X-Proxied-By" = "veil", "X-Test-Header" = "e2e-test" }
+client_body_timeout_secs = 5
 [route.compression]
 enabled = true
 preferred_encodings = ["zstd", "br", "gzip"]

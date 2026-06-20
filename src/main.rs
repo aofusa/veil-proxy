@@ -993,7 +993,14 @@ static ERR_MSG_TOO_MANY_REQUESTS: &[u8] = b"HTTP/1.1 429 Too Many Requests\r\nCo
 static ERR_MSG_BAD_GATEWAY: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 static ERR_MSG_INSUFFICIENT_STORAGE: &[u8] = b"HTTP/1.1 507 Insufficient Storage\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 static ERR_MSG_REQUEST_TOO_LARGE: &[u8] = b"HTTP/1.1 413 Request Entity Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+/// RFC 7231: リクエスト URI が長すぎる場合
+static ERR_MSG_URI_TOO_LONG: &[u8] = b"HTTP/1.1 414 URI Too Long\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+/// RFC 6585: リクエストヘッダーが大きすぎる場合
+static ERR_MSG_REQUEST_HEADER_TOO_LARGE: &[u8] = b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+/// RFC 7231: クライアントがリクエストボディを時間内に送信しなかった場合
+static ERR_MSG_REQUEST_TIMEOUT: &[u8] = b"HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 static ERR_MSG_GATEWAY_TIMEOUT: &[u8] = b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
 
 // HTTP ヘッダー部品（事前計算）
 static HTTP_200_PREFIX: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: ";
@@ -10527,9 +10534,11 @@ async fn handle_http2_sendfile<S>(
 where
     S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRentExt + Unpin,
 {
-    let path_str = std::str::from_utf8(req_path).unwrap_or("/");
+    let path_str_raw = std::str::from_utf8(req_path).unwrap_or("/");
+    // クエリ文字列を除去してファイルパス解決に使用するパスのみを取り出す
+    let path_str = if let Some(qpos) = path_str_raw.find('?') { &path_str_raw[..qpos] } else { path_str_raw };
     let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
-    
+
     // プレフィックス除去後のサブパス
     let sub_path = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
         &path_str[prefix_str.len()..]
@@ -11121,12 +11130,41 @@ async fn handle_requests(
         accumulated.extend_from_slice(returned_buf.as_valid_slice());
         buf_put(returned_buf);
 
-        // ヘッダーサイズ制限チェック
+
+        // ヘッダーサイズ制限チェック（RFC 6585: 431 Request Header Fields Too Large）
+        // URIが長すぎる場合は414 URI Too Long、それ以外のヘッダー超過は431
         if accumulated.len() > MAX_HEADER_SIZE {
-            let err_buf = ERR_MSG_REQUEST_TOO_LARGE.to_vec();
+            // リクエストラインの終端を探してURIサイズを確認
+            let response_code = if let Some(line_end) = accumulated.windows(2).position(|w| w == b"\r\n") {
+                // リクエストラインが完全に含まれている場合、URIサイズを確認
+                let request_line = &accumulated[..line_end];
+                // "GET /path HTTP/1.1" 形式から URI 部分を抽出
+                let uri_too_long = request_line.iter()
+                    .position(|&b| b == b' ')
+                    .and_then(|method_end| {
+                        let after_method = &request_line[method_end + 1..];
+                        after_method.iter()
+                            .rposition(|&b| b == b' ')
+                            // rposition が返す値は最後のスペースの位置（0-indexed）
+                            // それがそのまま URI 部分のバイト数となる
+                            .map(|uri_end| uri_end)
+                    })
+                    .map_or(false, |uri_len| uri_len > MAX_HEADER_SIZE);
+                
+                if uri_too_long {
+                    ERR_MSG_URI_TOO_LONG
+                } else {
+                    ERR_MSG_REQUEST_HEADER_TOO_LARGE
+                }
+            } else {
+                // リクエストラインがまだ完全でない場合は431
+                ERR_MSG_REQUEST_HEADER_TOO_LARGE
+            };
+            let err_buf = response_code.to_vec();
             let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
             return;
         }
+
 
         // HTTPリクエストをパース
         let mut headers_storage = [httparse::EMPTY_HEADER; 64];
@@ -11161,11 +11199,24 @@ async fn handle_requests(
                     .map(|h| Box::from(h.value))
                     .unwrap_or_else(|| Box::from([] as [u8; 0]));
                 
-                let content_length: usize = req.headers.iter()
-                    .find(|h| h.name.eq_ignore_ascii_case("content-length"))
-                    .and_then(|h| std::str::from_utf8(h.value).ok())
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
+                // Content-Length ヘッダーの値を取得し、不正な値の場合は400 Bad Requestを返す
+                let content_length_header = req.headers.iter()
+                    .find(|h| h.name.eq_ignore_ascii_case("content-length"));
+                
+                let content_length: usize = if let Some(cl_header) = content_length_header {
+                    match std::str::from_utf8(cl_header.value).ok().and_then(|s| s.trim().parse::<usize>().ok()) {
+                        Some(len) => len,
+                        None => {
+                            // 不正な Content-Length 値 → 400 Bad Request
+                            drop(req);
+                            let err_buf = ERR_MSG_BAD_REQUEST.to_vec();
+                            let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+                            return;
+                        }
+                    }
+                } else {
+                    0
+                };
                 
                 // Transfer-Encoding: chunked チェック（改善版）
                 let is_chunked: bool = req.headers.iter()
@@ -13902,6 +13953,7 @@ async fn proxy_http_pooled(
                 max_chunked,
                 buffering_config,
                 cache_ctx,
+                security,
             ).await
         } else {
             debug!("Calling proxy_http_request_with_compression for {} {} (buffering_enabled={}, compression_enabled={})", 
@@ -13937,6 +13989,7 @@ async fn proxy_http_pooled(
             max_chunked,
             buffering_config,
             cache_ctx,
+            security,
         ).await
     } else {
                 proxy_http_request_with_compression(
@@ -13962,7 +14015,9 @@ async fn proxy_http_pooled(
                 let idle_timeout = security.idle_connection_timeout_secs;
                 HTTP_POOL.with(|p| p.borrow_mut().put(pool_key.to_string(), backend_stream, max_idle, idle_timeout));
             }
-            Some((client_stream, status_code, total, client_wants_close))
+            // 408 (body timeout) sends Connection: close — must actually close
+            let should_close = client_wants_close || status_code == 408;
+            Some((client_stream, status_code, total, should_close))
         }
         None => {
             // エラー発生時は接続を破棄
@@ -14384,7 +14439,8 @@ async fn proxy_request_buffered<R>(
     max_chunked_body_size: u64,
     buffering_config: &buffering::BufferingConfig,
     cache_ctx: Option<&mut CacheSaveContext>,
-) -> Option<(u16, u64, bool)> 
+    security: &SecurityConfig,
+) -> Option<(u16, u64, bool)>
 where R: AsyncReader + AsyncWriter + Unpin + monoio::io::AsyncReadRent + monoio::io::AsyncWriteRentExt {
     // 1. リクエストヘッダー送信
     let write_result = timeout(WRITE_TIMEOUT, backend_stream.write_all(request)).await;
@@ -14411,9 +14467,14 @@ where R: AsyncReader + AsyncWriter + Unpin + monoio::io::AsyncReadRent + monoio:
     } else {
         let remaining = content_length.saturating_sub(initial_body.len());
         if remaining > 0 {
-            let transferred = transfer_exact_bytes(client_stream, backend_stream, remaining).await;
-            if transferred < remaining as u64 {
-                return None;
+            let body_timeout = Duration::from_secs(security.client_body_timeout_secs);
+            match timeout(body_timeout, transfer_exact_bytes(client_stream, backend_stream, remaining)).await {
+                Ok(transferred) if transferred >= remaining as u64 => {}
+                Ok(_) => return None,
+                Err(_) => {
+                    let _ = client_stream.write_all(ERR_MSG_REQUEST_TIMEOUT.to_vec()).await;
+                    return Some((408, 0, false));
+                }
             }
         }
     }
@@ -15088,15 +15149,20 @@ async fn proxy_http_request_with_compression(
         // Content-Length転送の場合
         let remaining = content_length.saturating_sub(initial_body.len());
         if remaining > 0 {
-            let transferred = transfer_exact_bytes(client_stream, backend_stream, remaining).await;
-            if transferred < remaining as u64 {
-                return None;
+            let body_timeout = Duration::from_secs(security.client_body_timeout_secs);
+            match timeout(body_timeout, transfer_exact_bytes(client_stream, backend_stream, remaining)).await {
+                Ok(transferred) if transferred >= remaining as u64 => {}
+                Ok(_) => return None,
+                Err(_) => {
+                    let _ = client_stream.write_all(ERR_MSG_REQUEST_TIMEOUT.to_vec()).await;
+                    return Some((408, 0, false));
+                }
             }
         }
     }
 
     // 4. レスポンスを受信して転送（圧縮対応、キャッシュ保存対応）
-    let (total, status_code, backend_wants_keep_alive) = 
+    let (total, status_code, backend_wants_keep_alive) =
         transfer_response_with_compression(backend_stream, client_stream, compression, client_encoding, cache_ctx, security).await;
 
     Some((status_code, total, backend_wants_keep_alive))
@@ -16307,6 +16373,7 @@ async fn proxy_https_pooled(
             max_chunked,
             buffering_config,
             None,
+            security,
         ).await
     } else {
         // リクエスト送信とレスポンス受信（圧縮対応）
@@ -16332,7 +16399,9 @@ async fn proxy_https_pooled(
                 let idle_timeout = security.idle_connection_timeout_secs;
                 HTTPS_POOL.with(|p| p.borrow_mut().put(pool_key.to_string(), backend_stream, max_idle, idle_timeout));
             }
-            Some((client_stream, status_code, total, client_wants_close))
+            // 408 (body timeout) sends Connection: close — must actually close
+            let should_close = client_wants_close || status_code == 408;
+            Some((client_stream, status_code, total, should_close))
         }
         None => {
             // エラー発生時は接続を破棄
@@ -16384,15 +16453,25 @@ async fn proxy_https_request_with_compression(
     } else {
         let remaining = content_length.saturating_sub(initial_body.len());
         if remaining > 0 {
-            let transferred = transfer_exact_bytes(client_stream, backend_stream, remaining).await;
-            if transferred < remaining as u64 {
-                return None;
+            let body_timeout = Duration::from_secs(security.client_body_timeout_secs);
+            let timed_out = monoio::select! {
+                _ = monoio::time::sleep(body_timeout) => {
+                    true
+                }
+                transferred = transfer_exact_bytes(client_stream, backend_stream, remaining) => {
+                    if transferred < remaining as u64 { return None; }
+                    false
+                }
+            };
+            if timed_out {
+                let _ = client_stream.write_all(ERR_MSG_REQUEST_TIMEOUT.to_vec()).await;
+                return Some((408, 0, false));
             }
         }
     }
 
     // 4. レスポンスを受信して転送（圧縮対応）
-    let (total, status_code, backend_wants_keep_alive) = 
+    let (total, status_code, backend_wants_keep_alive) =
         transfer_https_response_with_compression(backend_stream, client_stream, compression, client_encoding, security).await;
 
     Some((status_code, total, backend_wants_keep_alive))
@@ -16814,7 +16893,7 @@ async fn transfer_exact_bytes<R: AsyncReader, W: AsyncWriter>(
     mut remaining: usize,
 ) -> u64 {
     let mut total = 0u64;
-    
+
     while remaining > 0 {
         let buf = buf_get();
         let read_result = timeout(READ_TIMEOUT, reader.read_buf(buf)).await;
@@ -17044,9 +17123,11 @@ async fn handle_sendfile(
     //    - リクエスト "/static/" → "./www/assets/{index_filename}" (デフォルト: index.html)
     
     // Cow<str>を使用してパス処理のアロケーションを最小化
-    let path_str = std::str::from_utf8(req_path).unwrap_or("/");
+    let path_str_raw = std::str::from_utf8(req_path).unwrap_or("/");
+    // クエリ文字列を除去してファイルパス解決に使用するパスのみを取り出す
+    let path_str = if let Some(qpos) = path_str_raw.find('?') { &path_str_raw[..qpos] } else { path_str_raw };
     let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
-    
+
     // プレフィックスを除去して「残りパス」を取得（借用のみ、アロケーションなし）
     let remainder: &str = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
         &path_str[prefix_str.len()..]
