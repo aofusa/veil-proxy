@@ -49,8 +49,8 @@ pub mod disk_buffer {
         let dir_path = base_path.join(&dir1).join(&dir2);
         let file_path = dir_path.join(&filename);
         
-        // ディレクトリ作成（同期だが頻度は低い）
-        std::fs::create_dir_all(&dir_path)?;
+        // ディレクトリ作成（io_uring 経由の非同期操作）
+        monoio::fs::create_dir_all(&dir_path).await?;
         
         // io_uring による非同期書き込み
         let file = File::create(&file_path).await?;
@@ -66,9 +66,9 @@ pub mod disk_buffer {
     /// ディスクバッファからの非同期読み込み
     pub async fn read_from_disk(path: &Path) -> io::Result<Vec<u8>> {
         let file = File::open(path).await?;
-        
-        // ファイルサイズ取得
-        let metadata = std::fs::metadata(path)?;
+
+        // ファイルサイズ取得（io_uring 経由の非同期 statx でブロックしない）
+        let metadata = file.metadata().await?;
         let size = metadata.len() as usize;
         
         let mut buf = Vec::with_capacity(size);

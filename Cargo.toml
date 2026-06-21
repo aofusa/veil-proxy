@@ -123,7 +123,7 @@ full = [
 ]
 
 [dependencies]
-monoio = { version = "0.2.4" }
+monoio = { version = "0.2.4", features = ["mkdirat", "unlinkat"] }
 # rustls を直接使用（ハンドシェイク後に kTLS へオフロード）
 rustls = { version = "0.23.35", features = ["tls12", "aws_lc_rs"] }
 aws-lc-rs = "1.15.2"

@@ -1628,8 +1628,8 @@ where
         base_path.clone()
     };
     
-    // ファイル読み込み
-    let data = match std::fs::read(&file_path) {
+    // ファイル読み込み（io_uring による非同期I/O でワーカースレッドをブロックしない）
+    let data = match monoio::fs::read(&file_path).await {
         Ok(d) => d,
         Err(_) => {
             let server_guard = get_server_header_guard();
@@ -1641,7 +1641,7 @@ where
             return Some((404, 9));
         }
     };
-    
+
     let mime_type = mime_guess::from_path(&file_path).first_or_octet_stream();
     let mime_str = mime_type.as_ref();
     
@@ -4655,23 +4655,23 @@ where R: AsyncReader + AsyncWriter + Unpin + monoio::io::AsyncReadRent + monoio:
                         ).await;
                         
                         if !matches!(write_result, Ok((Ok(_), _))) {
-                            let _ = std::fs::remove_file(&path);
+                            let _ = monoio::fs::remove_file(&path).await;
                             return Some((status_code, 0, false));
                         }
-                        
+
                         total = headers_data.len() as u64;
-                        
+
                         // ディスクから読み込んでクライアントに送信
                         match send_disk_buffer_to_client(client_stream, &path, size, buffering_config.client_write_timeout_secs).await {
                             Some(sent) => {
                                 total += sent;
                             }
                             None => {
-                                let _ = std::fs::remove_file(&path);
+                                let _ = monoio::fs::remove_file(&path).await;
                                 return Some((status_code, total, false));
                             }
                         }
-                        let _ = std::fs::remove_file(&path);
+                        let _ = monoio::fs::remove_file(&path).await;
                     }
                     BufferedBodyResult::Failed => {
                         // ヘッダーのみ送信
@@ -4704,15 +4704,15 @@ where R: AsyncReader + AsyncWriter + Unpin + monoio::io::AsyncReadRent + monoio:
                 ).await;
                 
                 if !matches!(write_result, Ok((Ok(_), _))) {
-                    // ディスクファイルがあればクリーンアップ
+                    // ディスクファイルがあればクリーンアップ（非同期削除）
                     if let BufferedBodyResult::Disk { ref path, .. } = body_result {
-                        let _ = std::fs::remove_file(path);
+                        let _ = monoio::fs::remove_file(path).await;
                     }
                     return Some((status_code, 0, false));
                 }
-                
+
                 total = headers_data.len() as u64;
-                
+
                 // ボディ送信（メモリまたはディスクから）
                 match body_result {
                     BufferedBodyResult::Memory(body_data) => {
@@ -4721,11 +4721,11 @@ where R: AsyncReader + AsyncWriter + Unpin + monoio::io::AsyncReadRent + monoio:
                                 Duration::from_secs(buffering_config.client_write_timeout_secs),
                                 client_stream.write_all(body_data.clone())
                             ).await;
-                            
+
                             if !matches!(write_result, Ok((Ok(_), _))) {
                                 return Some((status_code, total, false));
                             }
-                            
+
                             total += body_data.len() as u64;
                         }
                     }
@@ -4736,11 +4736,11 @@ where R: AsyncReader + AsyncWriter + Unpin + monoio::io::AsyncReadRent + monoio:
                                 total += sent;
                             }
                             None => {
-                                let _ = std::fs::remove_file(&path);
+                                let _ = monoio::fs::remove_file(&path).await;
                                 return Some((status_code, total, false));
                             }
                         }
-                        let _ = std::fs::remove_file(&path);
+                        let _ = monoio::fs::remove_file(&path).await;
                     }
                     BufferedBodyResult::Failed => {
                         return Some((status_code, total, false));
