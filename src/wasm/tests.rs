@@ -196,11 +196,11 @@ mod context_tests {
         let mut ctx = HttpContext::new(1, caps);
 
         let headers = vec![
-            ("Host".to_string(), "example.com".to_string()),
-            ("Content-Type".to_string(), "application/json".to_string()),
+            (b"Host".to_vec(), b"example.com".to_vec()),
+            (b"Content-Type".to_vec(), b"application/json".to_vec()),
         ];
 
-        ctx.set_request("GET", "/api/users?page=1", headers.clone(), "192.168.1.1");
+        ctx.set_request("GET", "/api/users?page=1", headers, "192.168.1.1");
 
         assert_eq!(ctx.request_method, "GET");
         assert_eq!(ctx.request_path, "/api/users?page=1");
@@ -216,6 +216,7 @@ mod context_tests {
 
         ctx.set_request("POST", "/api/users", vec![], "10.0.0.1");
 
+
         assert_eq!(ctx.request_path, "/api/users");
         assert_eq!(ctx.request_query, "");
     }
@@ -225,7 +226,7 @@ mod context_tests {
         let caps = ModuleCapabilities::default();
         let mut ctx = HttpContext::new(1, caps);
 
-        let headers = vec![("Content-Type".to_string(), "text/html".to_string())];
+        let headers = vec![(b"Content-Type".to_vec(), b"text/html".to_vec())];
 
         ctx.set_response(200, headers);
 
@@ -353,14 +354,14 @@ mod host_function_tests {
         let mut ctx = HttpContext::new(1, caps);
         ctx.plugin_name = "test_plugin".to_string();
         ctx.request_headers = vec![
-            (":method".to_string(), "GET".to_string()),
-            (":path".to_string(), "/api/test".to_string()),
-            ("host".to_string(), "example.com".to_string()),
-            ("user-agent".to_string(), "test-agent/1.0".to_string()),
+            (b":method".to_vec(), b"GET".to_vec()),
+            (b":path".to_vec(), b"/api/test".to_vec()),
+            (b"host".to_vec(), b"example.com".to_vec()),
+            (b"user-agent".to_vec(), b"test-agent/1.0".to_vec()),
         ];
         ctx.response_headers = vec![
-            (":status".to_string(), "200".to_string()),
-            ("content-type".to_string(), "application/json".to_string()),
+            (b":status".to_vec(), b"200".to_vec()),
+            (b"content-type".to_vec(), b"application/json".to_vec()),
         ];
         ctx.request_body = b"request body content".to_vec();
         ctx.response_body = b"response body content".to_vec();
@@ -381,9 +382,9 @@ mod host_function_tests {
         
         // Find :path header
         let header = ctx.request_headers.iter()
-            .find(|(k, _)| k == ":path")
-            .map(|(_, v)| v.as_str());
-        
+            .find(|(k, _)| k.as_slice() == b":path")
+            .and_then(|(_, v)| std::str::from_utf8(v).ok());
+
         assert_eq!(header, Some("/api/test"));
     }
 
@@ -393,9 +394,9 @@ mod host_function_tests {
         
         // Find content-type header
         let header = ctx.response_headers.iter()
-            .find(|(k, _)| k == "content-type")
-            .map(|(_, v)| v.as_str());
-        
+            .find(|(k, _)| k.as_slice() == b"content-type")
+            .and_then(|(_, v)| std::str::from_utf8(v).ok());
+
         assert_eq!(header, Some("application/json"));
     }
 
@@ -404,7 +405,7 @@ mod host_function_tests {
         let mut ctx = create_test_context();
         
         // Add a new header
-        ctx.request_headers.push(("x-custom".to_string(), "value".to_string()));
+        ctx.request_headers.push((b"x-custom".to_vec(), b"value".to_vec()));
         ctx.request_headers_modified = true;
         
         assert!(ctx.has_request_modifications());
@@ -417,7 +418,7 @@ mod host_function_tests {
         let original_len = ctx.request_headers.len();
         
         // Remove user-agent header
-        ctx.request_headers.retain(|(k, _)| k != "user-agent");
+        ctx.request_headers.retain(|(k, _)| k.as_slice() != b"user-agent");
         ctx.request_headers_modified = true;
         
         assert!(ctx.has_request_modifications());
@@ -588,7 +589,7 @@ mod host_function_tests {
         
         ctx.local_response = Some(crate::wasm::types::LocalResponse {
             status_code: 403,
-            headers: vec![("x-blocked".to_string(), "true".to_string())],
+            headers: vec![(b"x-blocked".to_vec(), b"true".to_vec())],
             body: b"Forbidden".to_vec(),
         });
         
@@ -637,7 +638,7 @@ mod host_function_tests {
             token,
             upstream: "backend".to_string(),
             timeout_ms: 5000,
-            headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+            headers: vec![(b"Content-Type".to_vec(), b"application/json".to_vec())],
             body: b"test body".to_vec(),
             trailers: vec![],
         });
@@ -653,7 +654,7 @@ mod host_function_tests {
         let token = ctx.allocate_http_call_token();
         ctx.http_call_responses.insert(token, crate::wasm::types::HttpCallResponse {
             status_code: 200,
-            headers: vec![("content-type".to_string(), "text/plain".to_string())],
+            headers: vec![(b"content-type".to_vec(), b"text/plain".to_vec())],
             body: b"OK".to_vec(),
             trailers: vec![],
         });
@@ -774,12 +775,12 @@ mod lifecycle_callback_tests {
         
         // Set up request/response data that would be available during log phase
         ctx.set_request("GET", "/api/test", vec![
-            (":method".to_string(), "GET".to_string()),
-            (":path".to_string(), "/api/test".to_string()),
+            (b":method".to_vec(), b"GET".to_vec()),
+            (b":path".to_vec(), b"/api/test".to_vec()),
         ], "192.168.1.1");
         ctx.set_response(200, vec![
-            (":status".to_string(), "200".to_string()),
-            ("content-type".to_string(), "application/json".to_string()),
+            (b":status".to_vec(), b"200".to_vec()),
+            (b"content-type".to_vec(), b"application/json".to_vec()),
         ]);
         
         // Verify data is accessible (would be used by proxy_on_log)
@@ -891,12 +892,12 @@ mod p2_callback_tests {
         
         // Set trailers
         ctx.request_trailers = vec![
-            ("grpc-status".to_string(), "0".to_string()),
-            ("grpc-message".to_string(), "ok".to_string()),
+            (b"grpc-status".to_vec(), b"0".to_vec()),
+            (b"grpc-message".to_vec(), b"ok".to_vec()),
         ];
-        
+
         assert_eq!(ctx.request_trailers.len(), 2);
-        assert_eq!(ctx.request_trailers[0].0, "grpc-status");
+        assert_eq!(ctx.request_trailers[0].0, b"grpc-status");
     }
 
     /// Test response trailers context
@@ -910,13 +911,13 @@ mod p2_callback_tests {
         
         // Set trailers
         ctx.response_trailers = vec![
-            ("grpc-status".to_string(), "0".to_string()),
-            ("grpc-message".to_string(), "success".to_string()),
-            ("custom-trailer".to_string(), "value".to_string()),
+            (b"grpc-status".to_vec(), b"0".to_vec()),
+            (b"grpc-message".to_vec(), b"success".to_vec()),
+            (b"custom-trailer".to_vec(), b"value".to_vec()),
         ];
-        
+
         assert_eq!(ctx.response_trailers.len(), 3);
-        assert_eq!(ctx.response_trailers[2].0, "custom-trailer");
+        assert_eq!(ctx.response_trailers[2].0, b"custom-trailer");
     }
 
     /// Test queue operations context

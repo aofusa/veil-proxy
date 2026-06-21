@@ -24,7 +24,7 @@ fn read_string(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option
 
 /// Deserialize headers from Proxy-Wasm format
 /// Format: [num_pairs:4][key1_len:4][key1][val1_len:4][val1]...
-fn deserialize_headers(data: &[u8]) -> Option<Vec<(String, String)>> {
+fn deserialize_headers(data: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
     if data.len() < 4 {
         return Some(Vec::new());
     }
@@ -44,7 +44,7 @@ fn deserialize_headers(data: &[u8]) -> Option<Vec<(String, String)>> {
         if pos + key_len > data.len() {
             return None;
         }
-        let key = String::from_utf8_lossy(&data[pos..pos + key_len]).to_string();
+        let key = data[pos..pos + key_len].to_vec();
         pos += key_len;
 
         if pos + 4 > data.len() {
@@ -57,7 +57,7 @@ fn deserialize_headers(data: &[u8]) -> Option<Vec<(String, String)>> {
         if pos + val_len > data.len() {
             return None;
         }
-        let value = String::from_utf8_lossy(&data[pos..pos + val_len]).to_string();
+        let value = data[pos..pos + val_len].to_vec();
         pos += val_len;
 
         headers.push((key, value));

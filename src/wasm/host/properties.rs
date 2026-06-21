@@ -20,8 +20,8 @@ fn get_property_value(state: &HostState, path: &str) -> Option<Vec<u8>> {
             .http_ctx
             .request_headers
             .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("host"))
-            .map(|(_, v)| v.as_bytes().to_vec()),
+            .find(|(k, _)| k.eq_ignore_ascii_case(b"host"))
+            .map(|(_, v)| v.clone()),
         "request.method" => Some(state.http_ctx.request_method.as_bytes().to_vec()),
         "request.scheme" => Some(b"https".to_vec()),
         "request.protocol" => Some(b"HTTP/1.1".to_vec()),

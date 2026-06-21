@@ -250,7 +250,7 @@ mod integration_tests {
             token: 1,
             response: HttpCallResponse {
                 status_code: 200,
-                headers: vec![("content-type".to_string(), "application/json".to_string())],
+                headers: vec![(b"content-type".to_vec(), b"application/json".to_vec())],
                 body: b"{\"ok\":true}".to_vec(),
                 trailers: vec![],
             },

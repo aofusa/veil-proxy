@@ -17,12 +17,12 @@ pub struct HttpContext {
     pub root_context_id: i32,
 
     // === Request ===
-    /// Request headers
-    pub request_headers: Vec<(String, String)>,
+    /// Request headers (binary)
+    pub request_headers: Vec<(Vec<u8>, Vec<u8>)>,
     /// Request body
     pub request_body: Vec<u8>,
-    /// Request trailers
-    pub request_trailers: Vec<(String, String)>,
+    /// Request trailers (binary)
+    pub request_trailers: Vec<(Vec<u8>, Vec<u8>)>,
     /// Request path
     pub request_path: String,
     /// Request method
@@ -35,12 +35,12 @@ pub struct HttpContext {
     // === Response ===
     /// Response status code
     pub response_status: u16,
-    /// Response headers
-    pub response_headers: Vec<(String, String)>,
+    /// Response headers (binary)
+    pub response_headers: Vec<(Vec<u8>, Vec<u8>)>,
     /// Response body
     pub response_body: Vec<u8>,
-    /// Response trailers
-    pub response_trailers: Vec<(String, String)>,
+    /// Response trailers (binary)
+    pub response_trailers: Vec<(Vec<u8>, Vec<u8>)>,
     /// Is response body complete
     pub response_body_complete: bool,
 
@@ -210,7 +210,7 @@ impl HttpContext {
         &mut self,
         method: &str,
         path: &str,
-        headers: Vec<(String, String)>,
+        headers: Vec<(Vec<u8>, Vec<u8>)>,
         client_ip: &str,
     ) {
         self.request_method = method.to_string();
@@ -231,7 +231,7 @@ impl HttpContext {
     }
 
     /// Set response data
-    pub fn set_response(&mut self, status: u16, headers: Vec<(String, String)>) {
+    pub fn set_response(&mut self, status: u16, headers: Vec<(Vec<u8>, Vec<u8>)>) {
         self.response_status = status;
         self.response_headers = headers;
     }

@@ -7,7 +7,7 @@ use crate::wasm::context::HostState;
 
 /// Serialize headers to Proxy-Wasm format
 /// Format: [num_pairs:4][key1_len:4][key1][val1_len:4][val1]...
-fn serialize_headers(headers: &[(String, String)]) -> Vec<u8> {
+fn serialize_headers(headers: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
     let mut buf = Vec::new();
 
     // Number of pairs
@@ -15,16 +15,16 @@ fn serialize_headers(headers: &[(String, String)]) -> Vec<u8> {
 
     for (key, value) in headers {
         buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
-        buf.extend_from_slice(key.as_bytes());
+        buf.extend_from_slice(key);
         buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
-        buf.extend_from_slice(value.as_bytes());
+        buf.extend_from_slice(value);
     }
 
     buf
 }
 
 /// Deserialize headers from Proxy-Wasm format
-fn deserialize_headers(data: &[u8]) -> Option<Vec<(String, String)>> {
+fn deserialize_headers(data: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
     if data.len() < 4 {
         return None;
     }
@@ -44,7 +44,7 @@ fn deserialize_headers(data: &[u8]) -> Option<Vec<(String, String)>> {
         if pos + key_len > data.len() {
             return None;
         }
-        let key = String::from_utf8_lossy(&data[pos..pos + key_len]).to_string();
+        let key = data[pos..pos + key_len].to_vec();
         pos += key_len;
 
         if pos + 4 > data.len() {
@@ -57,7 +57,7 @@ fn deserialize_headers(data: &[u8]) -> Option<Vec<(String, String)>> {
         if pos + val_len > data.len() {
             return None;
         }
-        let value = String::from_utf8_lossy(&data[pos..pos + val_len]).to_string();
+        let value = data[pos..pos + val_len].to_vec();
         pos += val_len;
 
         headers.push((key, value));
@@ -67,7 +67,7 @@ fn deserialize_headers(data: &[u8]) -> Option<Vec<(String, String)>> {
 }
 
 /// Get headers by map type
-fn get_headers<'a>(state: &'a HostState, map_type: i32) -> Option<&'a Vec<(String, String)>> {
+fn get_headers<'a>(state: &'a HostState, map_type: i32) -> Option<&'a Vec<(Vec<u8>, Vec<u8>)>> {
     match map_type {
         HTTP_REQUEST_HEADERS => Some(&state.http_ctx.request_headers),
         HTTP_REQUEST_TRAILERS => Some(&state.http_ctx.request_trailers),
@@ -103,7 +103,7 @@ fn get_headers<'a>(state: &'a HostState, map_type: i32) -> Option<&'a Vec<(Strin
 fn get_headers_mut<'a>(
     state: &'a mut HostState,
     map_type: i32,
-) -> Option<&'a mut Vec<(String, String)>> {
+) -> Option<&'a mut Vec<(Vec<u8>, Vec<u8>)>> {
     match map_type {
         HTTP_REQUEST_HEADERS => Some(&mut state.http_ctx.request_headers),
         HTTP_REQUEST_TRAILERS => Some(&mut state.http_ctx.request_trailers),
@@ -330,7 +330,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             // Find header value (case-insensitive)
             let value = headers
                 .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(&key))
+                .find(|(k, _)| k.eq_ignore_ascii_case(key.as_bytes()))
                 .map(|(_, v)| v.clone());
 
             let value = match value {
@@ -344,7 +344,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 None => return PROXY_RESULT_INTERNAL_FAILURE,
             };
 
-            if !write_to_wasm(&mut caller, ptr, value.as_bytes()) {
+            if !write_to_wasm(&mut caller, ptr, &value) {
                 return PROXY_RESULT_INVALID_MEMORY_ACCESS;
             }
 
@@ -372,6 +372,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     )?;
 
     // proxy_add_header_map_value
+
     linker.func_wrap(
         "env",
         "proxy_add_header_map_value",
@@ -406,7 +407,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 None => return PROXY_RESULT_BAD_ARGUMENT,
             };
 
-            headers.push((key, value));
+            headers.push((key.into_bytes(), value.into_bytes()));
 
             // Mark as modified
             match map_type {
@@ -459,8 +460,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             };
 
             // Remove existing and add new
-            headers.retain(|(k, _)| !k.eq_ignore_ascii_case(&key));
-            headers.push((key, value));
+            headers.retain(|(k, _)| !k.eq_ignore_ascii_case(key.as_bytes()));
+            headers.push((key.into_bytes(), value.into_bytes()));
 
             // Mark as modified
             match map_type {
@@ -505,7 +506,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 None => return PROXY_RESULT_BAD_ARGUMENT,
             };
 
-            headers.retain(|(k, _)| !k.eq_ignore_ascii_case(&key));
+            headers.retain(|(k, _)| !k.eq_ignore_ascii_case(key.as_bytes()));
 
             // Mark as modified
             match map_type {
