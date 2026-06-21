@@ -19,7 +19,7 @@ A high-performance reverse proxy server using io_uring (monoio) and rustls.
 ### Core Features
 - **Asynchronous I/O**: Efficient I/O processing with monoio (io_uring)
 - **TLS**: Memory-safe pure Rust TLS implementation with rustls
-- **kTLS**: Kernel TLS offload support via rustls + ktls2 (Linux 5.15+)
+- **kTLS**: Kernel TLS offload support via rustls + custom kTLS module (Linux 5.15+)
 - **HTTP/2**: HTTP/2 support via TLS ALPN negotiation (stream multiplexing, HPACK compression)
 - **H2C Server**: HTTP/2 Cleartext (H2C) server support without TLS (Prior Knowledge mode, RFC 7540 Section 3.4)
 - **HTTP/3**: QUIC/UDP-based HTTP/3 support using quiche (0-RTT connection establishment)
@@ -80,7 +80,7 @@ A high-performance reverse proxy server using io_uring (monoio) and rustls.
 # Standard build (using rustls, HTTP/1.1 only)
 cargo build --release
 
-# Build with kTLS support (rustls + ktls2)
+# Build with kTLS support (rustls + custom kTLS module)
 cargo build --release --features ktls
 
 # Build with HTTP/2 support
@@ -101,8 +101,14 @@ cargo build --release --features "ktls,all-protocols"
 # Build with WASM extension support (Proxy-Wasm v0.2.1)
 cargo build --release --features wasm
 
-# Full featured build (kTLS + HTTP/2 + WASM)
-cargo build --release --features "ktls,http2,wasm"
+# Build with gRPC support (HTTP/2 based)
+cargo build --release --features "http2,grpc"
+
+# Full gRPC support (gRPC + gRPC-Web + HTTP/3)
+cargo build --release --features "grpc-full"
+
+# Full featured build (kTLS + HTTP/2 + HTTP/3 + gRPC + WASM)
+cargo build --release --features "ktle,http2,http3,grpc-full,wasm"
 ```
 
 After building, the binary is generated at `target/release/veil`.
@@ -116,6 +122,9 @@ After building, the binary is generated at `target/release/veil`.
 | `http3` | HTTP/3 (QUIC) | UDP/QUIC based, uses quiche |
 | `wasm` | WASM Extension (Proxy-Wasm v0.2.1) | Uses Wasmtime, Nginx/Envoy compatible |
 | `all-protocols` | http2 + http3 | Enable all protocols |
+| `grpc` | gRPC (HTTP/2 based) | gRPC wire protocol (framing, headers, trailers), uses prost |
+| `grpc-web` | gRPC-Web | Browser-compatible gRPC-Web protocol translation (CORS support) |
+| `grpc-full` | grpc + grpc-web + http3 | Full gRPC support including HTTP/3 |
 
 > **Note**: HTTP/3 is UDP-based, so it cannot be used with kTLS (HTTP/3 does not use TCP/TLS).
 
@@ -241,10 +250,10 @@ key_path = "./server.key"
 - No additional dependencies
 - Default when not using kTLS
 
-### rustls + ktls2 (`--features ktls`)
+### rustls + custom kTLS module (`--features ktls`)
 
 - Performs TLS handshake with rustls
-- After handshake completion, offloads to kTLS via ktls2
+- After handshake completion, offloads to kTLS via the custom kernel TLS module (`src/ktls.rs`, `src/ktls_rustls.rs`)
 - No additional external dependencies (pure Rust implementation)
 
 ```bash
@@ -2064,7 +2073,7 @@ gso_gro_enabled = false
 ### Overview
 
 kTLS is a Linux kernel feature that performs TLS data transfer phase encryption/decryption at the kernel level.
-This project supports kTLS using rustls + ktls2.
+This project supports kTLS using rustls and a custom kernel TLS module (`src/ktls.rs`, `src/ktls_rustls.rs`).
 
 ### Performance Improvements
 
@@ -2338,7 +2347,7 @@ cargo build --release
 ./veil -c ./config.toml &
 wrk -t4 -c100 -d30s https://localhost/
 
-# 2. kTLS enabled (using rustls + ktls2)
+# 2. kTLS enabled (using rustls + custom kTLS module)
 cargo build --release --features ktls
 # Set ktls_enabled = true in config.toml
 ./veil -c ./config.toml &
@@ -2356,7 +2365,7 @@ Veil includes comprehensive test suites covering unit tests, integration tests, 
 | **Unit Tests** | 251 | ✅ All passing |
 | **Integration Tests** | 13 | ✅ All passing |
 | **E2E Tests** | 24 | ✅ All passing |
-| **Benchmarks** | 2 files | ✅ Ready |
+| **Benchmarks** | 12 files | ✅ Ready |
 
 **Total: 288 tests - All passing ✅**
 
@@ -2492,8 +2501,18 @@ veil-proxy/
 │   └── common/
 │       └── mod.rs            # Test utilities
 └── benches/
-    ├── throughput.rs    # Throughput benchmarks
-    └── latency.rs       # Latency benchmarks
+    ├── throughput.rs      # Throughput benchmarks
+    ├── latency.rs         # Latency benchmarks
+    ├── http2.rs           # HTTP/2 benchmarks
+    ├── http3.rs           # HTTP/3 benchmarks
+    ├── tls.rs             # TLS benchmarks
+    ├── compression.rs     # Compression benchmarks
+    ├── connection_pool.rs # Connection pool benchmarks
+    ├── cache.rs           # Cache benchmarks
+    ├── load_balancing.rs  # Load balancing benchmarks
+    ├── websocket.rs       # WebSocket benchmarks
+    ├── memory.rs          # Memory usage benchmarks
+    └── routing.rs         # Routing benchmarks
 ```
 
 ### Continuous Integration
@@ -3134,7 +3153,7 @@ In this configuration, systemd creates the outer "container" and bubblewrap prov
 
 - [monoio](https://github.com/bytedance/monoio): io_uring-based async runtime
 - [rustls](https://github.com/rustls/rustls): Pure Rust TLS implementation
-- [ktls2](https://crates.io/crates/ktls2): kTLS integration crate for rustls
+- [kTLS (custom)](https://docs.kernel.org/networking/tls.html): Custom kernel TLS module implemented in `src/ktls.rs` and `src/ktls_rustls.rs`
 - [httparse](https://crates.io/crates/httparse): Fast HTTP parser
 - [quiche](https://github.com/cloudflare/quiche): Cloudflare's QUIC/HTTP/3 implementation
 
