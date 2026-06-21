@@ -3927,27 +3927,22 @@ async fn handle_proxy(
     
     request.extend_from_slice(HEADER_CRLF);
     
-    // ヘッダー削除リストを小文字で保持（高速比較用）
-    let remove_headers_lower: Vec<Vec<u8>> = security.remove_request_headers.iter()
-        .map(|h| h.to_ascii_lowercase().into_bytes())
-        .collect();
-    
     for (name, value) in headers {
         // host と connection ヘッダーは別途処理済みのためスキップ
         if name.eq_ignore_ascii_case(b"host") || name.eq_ignore_ascii_case(b"connection") {
             continue;
         }
-        
+
         // RFC 7230 Section 6.1: Hop-by-hopヘッダーを削除
         // Connection, Keep-Alive, Proxy-Connection, TE, Trailer, Transfer-Encoding, Upgrade
         // これらのヘッダーはプロキシで終端され、バックエンドに転送してはならない
         if is_hop_by_hop_header(name) {
             continue;
         }
-        
+
         // 設定で削除が指定されているヘッダーをスキップ
-        let name_lower: Vec<u8> = name.iter().map(|b| b.to_ascii_lowercase()).collect();
-        if remove_headers_lower.iter().any(|h| h == &name_lower) {
+        // eq_ignore_ascii_case でアロケーションなしに大文字小文字無視比較
+        if security.remove_request_headers.iter().any(|h| name.eq_ignore_ascii_case(h.as_bytes())) {
             continue;
         }
         
@@ -5416,15 +5411,13 @@ async fn transfer_response_with_compression(
                     new_header_lines.push(status_line.into_bytes());
                     
                     // 既存のヘッダーを追加（削除対象を除外）
-                    let remove_headers_lower: Vec<String> = security.remove_response_headers.iter()
-                        .map(|h| h.to_lowercase())
-                        .collect();
-                    
+                    // eq_ignore_ascii_case でアロケーションなしに比較
                     for header in response.headers.iter() {
-                        let header_name_lower = header.name.to_lowercase();
-                        if !remove_headers_lower.iter().any(|h| h == &header_name_lower) {
-                            new_header_lines.push(format!("{}: {}\r\n", 
-                                header.name, 
+                        if !security.remove_response_headers.iter()
+                            .any(|h| header.name.as_bytes().eq_ignore_ascii_case(h.as_bytes()))
+                        {
+                            new_header_lines.push(format!("{}: {}\r\n",
+                                header.name,
                                 std::str::from_utf8(header.value).unwrap_or("")).into_bytes());
                         }
                     }
@@ -5814,16 +5807,14 @@ fn build_compressed_headers(
     
     // 元のヘッダーをコピー（Content-Length, Content-Encoding, Transfer-Encoding を除く）
     // 削除対象のヘッダーも除外
-    let remove_headers_lower: Vec<String> = security.remove_response_headers.iter()
-        .map(|h| h.to_lowercase())
-        .collect();
-    
+    // アロケーションなしで大文字小文字無視ヘッダー比較
     for header in response.headers.iter() {
-        let name_lower = header.name.to_ascii_lowercase();
-        if name_lower == "content-length" 
-            || name_lower == "content-encoding"
-            || name_lower == "transfer-encoding"
-            || remove_headers_lower.iter().any(|h| h == &name_lower) {
+        let n = header.name.as_bytes();
+        if n.eq_ignore_ascii_case(b"content-length")
+            || n.eq_ignore_ascii_case(b"content-encoding")
+            || n.eq_ignore_ascii_case(b"transfer-encoding")
+            || security.remove_response_headers.iter().any(|h| n.eq_ignore_ascii_case(h.as_bytes()))
+        {
             continue;
         }
         new_headers.extend_from_slice(header.name.as_bytes());
@@ -6709,15 +6700,13 @@ async fn transfer_https_response_with_compression(
                     new_header_lines.push(status_line.into_bytes());
                     
                     // 既存のヘッダーを追加（削除対象を除外）
-                    let remove_headers_lower: Vec<String> = security.remove_response_headers.iter()
-                        .map(|h| h.to_lowercase())
-                        .collect();
-                    
+                    // eq_ignore_ascii_case でアロケーションなしに比較
                     for header in response.headers.iter() {
-                        let header_name_lower = header.name.to_lowercase();
-                        if !remove_headers_lower.iter().any(|h| h == &header_name_lower) {
-                            new_header_lines.push(format!("{}: {}\r\n", 
-                                header.name, 
+                        if !security.remove_response_headers.iter()
+                            .any(|h| header.name.as_bytes().eq_ignore_ascii_case(h.as_bytes()))
+                        {
+                            new_header_lines.push(format!("{}: {}\r\n",
+                                header.name,
                                 std::str::from_utf8(header.value).unwrap_or("")).into_bytes());
                         }
                     }

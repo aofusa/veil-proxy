@@ -16,13 +16,16 @@
 //! let route_idx = router.find_route(host, path, method, headers, query, source_ip);
 //! ```
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use lru::LruCache;
 use std::num::NonZeroUsize;
 use ftlog::debug;
+use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 // ====================
 // Phase 1: Host-based Grouping
@@ -449,86 +452,126 @@ impl Default for CidrMatcher {
 // Phase 4: LRU Cache
 // ====================
 
-/// Cache key for route matching results
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// キャッシュキー（ゼロコピー最適化版）
+///
+/// String生成を排除し、&[u8]から直接xxhashで64ビットハッシュを計算。
+/// リクエストごとのヒープアロケーションをゼロに削減。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RouteCacheKey {
-    /// Host header value
-    pub host: String,
-    /// Request path
-    pub path: String,
-    /// HTTP method
-    pub method: String,
-    /// Source IP (as string for simplicity)
-    pub source_ip: String,
+    /// xxh3_64 hash of host+path+method+source_ip
+    hash: u64,
 }
 
 impl RouteCacheKey {
-    /// Create a new cache key
+    /// ゼロアロケーションでキャッシュキーを生成
+    ///
+    /// &[u8] から直接ハッシュを計算するため String 生成なし。
+    #[inline]
     pub fn new(host: &[u8], path: &[u8], method: &[u8], source_ip: &SocketAddr) -> Self {
-        Self {
-            host: String::from_utf8_lossy(host).to_string(),
-            path: String::from_utf8_lossy(path).to_string(),
-            method: String::from_utf8_lossy(method).to_string(),
-            source_ip: source_ip.ip().to_string(),
-        }
+        let h1 = xxh3_64_with_seed(host, 0xdead_beef_cafe_0000);
+        let h2 = xxh3_64_with_seed(path, h1);
+        let h3 = xxh3_64_with_seed(method, h2);
+        let hash = match source_ip.ip() {
+            IpAddr::V4(v4) => xxh3_64_with_seed(&v4.octets(), h3),
+            IpAddr::V6(v6) => xxh3_64_with_seed(&v6.octets(), h3),
+        };
+        Self { hash }
     }
 }
 
-/// LRU cache for route matching results
-/// 
-/// Caches the index of matched routes for repeated requests
+// ====================
+// スレッドローカルキャッシュ（ロックフリー）
+// ====================
+//
+// monoio は Thread-per-Core モデルのため、各ワーカースレッドが
+// 独自の LRU キャッシュを持つことで Mutex 競合を完全に排除する。
+//
+// キャッシュ無効化: AtomicU64 の世代カウンターを bump すると
+// 各スレッドが次回アクセス時に自動でキャッシュをクリアする。
+
+/// キャッシュ世代カウンター（コンフィグリロード時にインクリメント）
+static CACHE_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// キャッシュ容量（設定値から反映）
+static CACHE_CAPACITY: AtomicUsize = AtomicUsize::new(10000);
+
+thread_local! {
+    /// スレッドローカル LRU キャッシュ: (世代, キャッシュ本体)
+    static TL_ROUTE_CACHE: RefCell<(u64, LruCache<RouteCacheKey, Option<usize>>)> = {
+        let cap = NonZeroUsize::new(CACHE_CAPACITY.load(Ordering::Relaxed))
+            .unwrap_or(NonZeroUsize::new(10000).unwrap());
+        RefCell::new((0, LruCache::new(cap)))
+    };
+}
+
+/// LRUキャッシュのファサード（グローバル統計のみ保持）
+///
+/// 実際のキャッシュデータはスレッドローカルに格納されるため
+/// ロック競合が発生しない。
 pub struct RouteCache {
-    /// LRU cache: key -> route index
-    cache: std::sync::Mutex<LruCache<RouteCacheKey, Option<usize>>>,
-    /// Cache hit counter
-    hits: std::sync::atomic::AtomicU64,
-    /// Cache miss counter
-    misses: std::sync::atomic::AtomicU64,
+    /// キャッシュヒット数（Atomic、全スレッド合算）
+    hits: AtomicU64,
+    /// キャッシュミス数（Atomic、全スレッド合算）
+    misses: AtomicU64,
 }
 
 impl RouteCache {
-    /// Create a new RouteCache with specified capacity
+    /// 新しい RouteCache を作成（容量をグローバルに設定）
     pub fn new(capacity: usize) -> Self {
-        let cap = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::new(1000).unwrap());
+        CACHE_CAPACITY.store(capacity.max(1), Ordering::Relaxed);
         Self {
-            cache: std::sync::Mutex::new(LruCache::new(cap)),
-            hits: std::sync::atomic::AtomicU64::new(0),
-            misses: std::sync::atomic::AtomicU64::new(0),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         }
     }
 
-    /// Try to get a cached route index
+    /// キャッシュからルートインデックスを取得（ロックフリー）
     pub fn get(&self, key: &RouteCacheKey) -> Option<Option<usize>> {
-        if let Ok(mut cache) = self.cache.lock() {
-            if let Some(result) = cache.get(key) {
-                self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Some(*result);
+        let gen = CACHE_GENERATION.load(Ordering::Relaxed);
+        TL_ROUTE_CACHE.with(|cell| {
+            let mut borrow = cell.borrow_mut();
+            // 世代が変わっていたらキャッシュをクリア
+            if borrow.0 != gen {
+                let cap = NonZeroUsize::new(CACHE_CAPACITY.load(Ordering::Relaxed))
+                    .unwrap_or(NonZeroUsize::new(10000).unwrap());
+                borrow.1 = LruCache::new(cap);
+                borrow.0 = gen;
             }
-        }
-        self.misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        None
+            if let Some(&result) = borrow.1.get(key) {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                Some(result)
+            } else {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        })
     }
 
-    /// Cache a route matching result
+    /// ルートマッチング結果をキャッシュに格納（ロックフリー）
     pub fn put(&self, key: RouteCacheKey, route_idx: Option<usize>) {
-        if let Ok(mut cache) = self.cache.lock() {
-            cache.put(key, route_idx);
-        }
+        let gen = CACHE_GENERATION.load(Ordering::Relaxed);
+        TL_ROUTE_CACHE.with(|cell| {
+            let mut borrow = cell.borrow_mut();
+            if borrow.0 != gen {
+                let cap = NonZeroUsize::new(CACHE_CAPACITY.load(Ordering::Relaxed))
+                    .unwrap_or(NonZeroUsize::new(10000).unwrap());
+                borrow.1 = LruCache::new(cap);
+                borrow.0 = gen;
+            }
+            borrow.1.put(key, route_idx);
+        });
     }
 
-    /// Get cache statistics
+    /// キャッシュ統計を取得
     pub fn stats(&self) -> (u64, u64) {
         (
-            self.hits.load(std::sync::atomic::Ordering::Relaxed),
-            self.misses.load(std::sync::atomic::Ordering::Relaxed),
+            self.hits.load(Ordering::Relaxed),
+            self.misses.load(Ordering::Relaxed),
         )
     }
 
-    /// Clear the cache
+    /// 全スレッドのキャッシュを無効化（世代カウンターをインクリメント）
     pub fn clear(&self) {
-        if let Ok(mut cache) = self.cache.lock() {
-            cache.clear();
-        }
+        CACHE_GENERATION.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -624,26 +667,30 @@ impl OptimizedRouter {
             (0..self.route_count).collect()
         };
 
-        // Intersect candidates (route must match all conditions)
+        // O(N log N) 交差判定：ソート済みバイナリサーチで O(N^2) の Vec::contains を回避
+        let mut path_sorted = path_candidates;
+        path_sorted.sort_unstable();
+        let mut ip_sorted = ip_candidates;
+        ip_sorted.sort_unstable();
+
         let mut final_candidates = Vec::new();
-        
         for idx in &host_candidates {
-            if path_candidates.contains(idx) && ip_candidates.contains(idx) {
+            if path_sorted.binary_search(idx).is_ok() && ip_sorted.binary_search(idx).is_ok() {
                 final_candidates.push(*idx);
             }
         }
-        
+
         if final_candidates.is_empty() {
              // Only log at debug to avoid flooding, but this helps find why a route didn't match
              const LOG_EVERY_N: u64 = 100;
-             static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-             let c = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+             static COUNT: AtomicU64 = AtomicU64::new(0);
+             let c = COUNT.fetch_add(1, Ordering::Relaxed);
              if c % LOG_EVERY_N == 0 {
-                 debug!("[Routing] get_candidates: host_cand={:?} path_cand={:?} ip_cand_len={}", 
-                    host_candidates, path_candidates, ip_candidates.len());
+                 debug!("[Routing] get_candidates: host_cand={:?} path_cand_len={} ip_cand_len={}",
+                    host_candidates, path_sorted.len(), ip_sorted.len());
              }
         }
-        
+
         // Sort by index to maintain original priority order
         final_candidates.sort_unstable();
         final_candidates.dedup();
@@ -768,12 +815,8 @@ mod tests {
     #[test]
     fn test_route_cache() {
         let cache = RouteCache::new(100);
-        let key = RouteCacheKey {
-            host: "example.com".to_string(),
-            path: "/api".to_string(),
-            method: "GET".to_string(),
-            source_ip: "127.0.0.1".to_string(),
-        };
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let key = RouteCacheKey::new(b"example.com", b"/api", b"GET", &addr);
 
         // Cache miss
         assert!(cache.get(&key).is_none());
@@ -782,7 +825,7 @@ mod tests {
         assert_eq!(misses, 1);
 
         // Add to cache
-        cache.put(key.clone(), Some(5));
+        cache.put(key, Some(5));
 
         // Cache hit
         assert_eq!(cache.get(&key), Some(Some(5)));
