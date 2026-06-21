@@ -92,13 +92,13 @@ AI エージェントおよびコントリビュータ向けの **最小指針**
 
 ```bash
 # フル機能でのビルド
-cargo build --features "ktls,http2,http3,grpc-full,wasm"
+cargo build --features "full"
 
 # E2Eテストの実行（自動セットアップ・クリーンアップ付き）
 ./tests/e2e_setup.sh test
 
 # ユニットテストや統合テストの実行（features指定必須）
-cargo test --lib --bins --test integration_tests --features "http2,grpc-full"
+cargo test --bins --test integration_tests --features "full"
 ```
 
 ---

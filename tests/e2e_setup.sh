@@ -7,7 +7,7 @@
 #   - バックエンド2: veil (ポート9002、静的ファイル配信)
 #
 # ビルド設定:
-#   - すべてのfeaturesを有効化: ktls,http2,http3,grpc-full,wasm
+#   - すべてのfeaturesを有効化: full
 #   - E2Eテストでは全機能をテストするため、すべてのfeaturesを有効化してビルドします
 #
 # 使用方法:
@@ -73,11 +73,11 @@ check_ktls_available() {
 
 # veilバイナリの存在確認・ビルド
 # E2Eテストではすべてのfeaturesを有効化してビルドします
-# features: ktls,http2,http3,grpc-full,wasm
+# features: full（全機能有効）
 ensure_veil_binary() {
-    log_info "Building veil with all features enabled (ktls,http2,http3,grpc-full,wasm)..."
+    log_info "Building veil with all features enabled (full)..."
     cd "$PROJECT_DIR"
-    cargo build --features 'ktls,http2,http3,grpc-full,wasm'
+    cargo build --features 'full'
     cd - > /dev/null
     
     if [ ! -f "$VEIL_BIN" ]; then
@@ -1301,15 +1301,15 @@ run_tests() {
     # デバッグ: 実際に実行されるコマンドを確認
     if [ -n "${TEST_FILTER:-}" ]; then
         log_info "Running filtered tests: ${TEST_FILTER}"
-        log_info "Command: cargo test --test e2e_tests --features 'ktls,http2,http3,grpc-full,wasm' -- ${TEST_FILTER} --test-threads=${TEST_THREADS} --nocapture"
+        log_info "Command: cargo test --test e2e_tests --features 'full' -- ${TEST_FILTER} --test-threads=${TEST_THREADS} --nocapture"
         
         # テスト実行
-        cargo test --test e2e_tests --features 'ktls,http2,http3,grpc-full,wasm' -- "${TEST_FILTER}" --test-threads=${TEST_THREADS} --nocapture
+        cargo test --test e2e_tests --features 'full' -- "${TEST_FILTER}" --test-threads=${TEST_THREADS} --nocapture
     else
-        log_info "Command: cargo test --test e2e_tests --features 'ktls,http2,http3,grpc-full,wasm' -- --test-threads=${TEST_THREADS}"
+        log_info "Command: cargo test --test e2e_tests --features 'full' -- --test-threads=${TEST_THREADS}"
         
         # テスト実行
-        cargo test --test e2e_tests --features 'ktls,http2,http3,grpc-full,wasm' -- --test-threads=${TEST_THREADS}
+        cargo test --test e2e_tests --features 'full' -- --test-threads=${TEST_THREADS}
     fi
     
     log_info "E2E tests completed"

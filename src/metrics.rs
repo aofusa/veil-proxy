@@ -34,8 +34,6 @@ use prometheus::{
     Opts, Registry, TextEncoder, Encoder,
 };
 
-#[cfg(all(feature = "metrics", feature = "cache"))]
-use crate::cache;
 
 #[cfg(feature = "metrics")]
 /// Prometheusメトリクスレジストリ（グローバル）
