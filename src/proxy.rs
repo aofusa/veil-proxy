@@ -1137,18 +1137,17 @@ where
                 h2_headers.push(g.as_header());
             }
             
-            // 圧縮が有効な場合は Content-Encoding を追加
-            let encoding_value: Vec<u8>;
+            // 圧縮が有効な場合は Content-Encoding を追加（静的スライス、ゼロアロケーション）
             if let Some(enc) = should_compress {
-                encoding_value = match enc {
-                    AcceptedEncoding::Zstd => b"zstd".to_vec(),
-                    AcceptedEncoding::Brotli => b"br".to_vec(),
-                    AcceptedEncoding::Gzip => b"gzip".to_vec(),
-                    AcceptedEncoding::Deflate => b"deflate".to_vec(),
-                    AcceptedEncoding::Identity => Vec::new(),
+                let encoding_name: &'static [u8] = match enc {
+                    AcceptedEncoding::Zstd => b"zstd",
+                    AcceptedEncoding::Brotli => b"br",
+                    AcceptedEncoding::Gzip => b"gzip",
+                    AcceptedEncoding::Deflate => b"deflate",
+                    AcceptedEncoding::Identity => b"",
                 };
-                if !encoding_value.is_empty() {
-                    h2_headers.push((b"content-encoding", &encoding_value));
+                if !encoding_name.is_empty() {
+                    h2_headers.push((b"content-encoding", encoding_name));
                     h2_headers.push((b"vary", b"Accept-Encoding"));
                 }
             }
@@ -1418,22 +1417,21 @@ where
                 h2_headers.push(g.as_header());
             }
             
-            // 圧縮が有効な場合は Content-Encoding を追加
-            let encoding_value: Vec<u8>;
+            // 圧縮が有効な場合は Content-Encoding を追加（静的スライス、ゼロアロケーション）
             if let Some(enc) = should_compress {
-                encoding_value = match enc {
-                    AcceptedEncoding::Zstd => b"zstd".to_vec(),
-                    AcceptedEncoding::Brotli => b"br".to_vec(),
-                    AcceptedEncoding::Gzip => b"gzip".to_vec(),
-                    AcceptedEncoding::Deflate => b"deflate".to_vec(),
-                    AcceptedEncoding::Identity => Vec::new(),
+                let encoding_name: &'static [u8] = match enc {
+                    AcceptedEncoding::Zstd => b"zstd",
+                    AcceptedEncoding::Brotli => b"br",
+                    AcceptedEncoding::Gzip => b"gzip",
+                    AcceptedEncoding::Deflate => b"deflate",
+                    AcceptedEncoding::Identity => b"",
                 };
-                if !encoding_value.is_empty() {
-                    h2_headers.push((b"content-encoding", &encoding_value));
+                if !encoding_name.is_empty() {
+                    h2_headers.push((b"content-encoding", encoding_name));
                     h2_headers.push((b"vary", b"Accept-Encoding"));
                 }
             }
-            
+
             for header in resp.headers.iter() {
                 if header.name.is_empty() {
                     continue;
@@ -4591,32 +4589,34 @@ where R: AsyncReader + AsyncWriter + Unpin + monoio::io::AsyncReadRent + monoio:
                 // これにより、クライアントへの書き込み回数を削減
                 match body_result {
                     BufferedBodyResult::Memory(body_data) => {
-                        // ヘッダーとボディを結合
-                        let mut combined = headers_data.clone();
+                        // ヘッダーとボディを結合（headers_data を move してコピー回数を削減）
+                        let mut combined = headers_data;
                         combined.extend_from_slice(&body_data);
-                        
+                        let combined_len = combined.len();
+
                         let write_result = timeout(
                             Duration::from_secs(buffering_config.client_write_timeout_secs),
-                            client_stream.write_all(combined.clone())
+                            client_stream.write_all(combined)
                         ).await;
-                        
+
                         if matches!(write_result, Ok((Ok(_), _))) {
-                            total = combined.len() as u64;
+                            total = combined_len as u64;
                         }
                     }
                     BufferedBodyResult::Disk { path, size } => {
-                        // ヘッダーを先に送信
+                        // ヘッダーを先に送信（所有権を移動、clone 不要）
+                        let headers_len = headers_data.len();
                         let write_result = timeout(
                             Duration::from_secs(buffering_config.client_write_timeout_secs),
-                            client_stream.write_all(headers_data.clone())
+                            client_stream.write_all(headers_data)
                         ).await;
-                        
+
                         if !matches!(write_result, Ok((Ok(_), _))) {
                             let _ = monoio::fs::remove_file(&path).await;
                             return Some((status_code, 0, false));
                         }
 
-                        total = headers_data.len() as u64;
+                        total = headers_len as u64;
 
                         // ディスクから読み込んでクライアントに送信
                         match send_disk_buffer_to_client(client_stream, &path, size, buffering_config.client_write_timeout_secs).await {
@@ -4631,13 +4631,14 @@ where R: AsyncReader + AsyncWriter + Unpin + monoio::io::AsyncReadRent + monoio:
                         let _ = monoio::fs::remove_file(&path).await;
                     }
                     BufferedBodyResult::Failed => {
-                        // ヘッダーのみ送信
+                        // ヘッダーのみ送信（所有権を移動、clone 不要）
+                        let headers_len = headers_data.len();
                         let write_result = timeout(
                             Duration::from_secs(buffering_config.client_write_timeout_secs),
-                            client_stream.write_all(headers_data.clone())
+                            client_stream.write_all(headers_data)
                         ).await;
                         if matches!(write_result, Ok((Ok(_), _))) {
-                            total = headers_data.len() as u64;
+                            total = headers_len as u64;
                         }
                         return Some((status_code, total, false));
                     }
@@ -4654,12 +4655,13 @@ where R: AsyncReader + AsyncWriter + Unpin + monoio::io::AsyncReadRent + monoio:
                 }
             } else {
                 // buffer_headers = false: ヘッダーを先に送信し、ボディは別途送信
-                // ヘッダー送信
+                // ヘッダー送信（所有権を移動、clone 不要）
+                let headers_len = headers_data.len();
                 let write_result = timeout(
                     Duration::from_secs(buffering_config.client_write_timeout_secs),
-                    client_stream.write_all(headers_data.clone())
+                    client_stream.write_all(headers_data)
                 ).await;
-                
+
                 if !matches!(write_result, Ok((Ok(_), _))) {
                     // ディスクファイルがあればクリーンアップ（非同期削除）
                     if let BufferedBodyResult::Disk { ref path, .. } = body_result {
@@ -4668,22 +4670,23 @@ where R: AsyncReader + AsyncWriter + Unpin + monoio::io::AsyncReadRent + monoio:
                     return Some((status_code, 0, false));
                 }
 
-                total = headers_data.len() as u64;
+                total = headers_len as u64;
 
                 // ボディ送信（メモリまたはディスクから）
                 match body_result {
                     BufferedBodyResult::Memory(body_data) => {
                         if !body_data.is_empty() {
+                            let body_len = body_data.len();
                             let write_result = timeout(
                                 Duration::from_secs(buffering_config.client_write_timeout_secs),
-                                client_stream.write_all(body_data.clone())
+                                client_stream.write_all(body_data)
                             ).await;
 
                             if !matches!(write_result, Ok((Ok(_), _))) {
                                 return Some((status_code, total, false));
                             }
 
-                            total += body_data.len() as u64;
+                            total += body_len as u64;
                         }
                     }
                     BufferedBodyResult::Disk { path, size } => {
@@ -5700,10 +5703,10 @@ async fn transfer_compressed_response(
         }
         AcceptedEncoding::Identity => {
             // 圧縮なし（ここには来ないはず）
-            body_data.clone()
+            body_data
         }
     };
-    
+
     // 3. 新しいヘッダーを構築
     let new_headers = build_compressed_headers(
         original_headers,
@@ -5712,19 +5715,21 @@ async fn transfer_compressed_response(
         security,
     );
     
-    // 4. ヘッダー送信
-    let write_result = timeout(WRITE_TIMEOUT, client_stream.write_all(new_headers.clone())).await;
+    // 4. ヘッダー送信（所有権を移動、clone 不要）
+    let new_headers_len = new_headers.len();
+    let write_result = timeout(WRITE_TIMEOUT, client_stream.write_all(new_headers)).await;
     if !matches!(write_result, Ok((Ok(_), _))) {
         return (total, false);
     }
-    total += new_headers.len() as u64;
-    
-    // 5. 圧縮済みボディ送信
-    let write_result = timeout(WRITE_TIMEOUT, client_stream.write_all(compressed_body.clone())).await;
+    total += new_headers_len as u64;
+
+    // 5. 圧縮済みボディ送信（所有権を移動、clone 不要）
+    let compressed_len = compressed_body.len();
+    let write_result = timeout(WRITE_TIMEOUT, client_stream.write_all(compressed_body)).await;
     if !matches!(write_result, Ok((Ok(_), _))) {
         return (total, false);
     }
-    total += compressed_body.len() as u64;
+    total += compressed_len as u64;
 
     (total, backend_wants_keep_alive)
 }
@@ -5753,23 +5758,23 @@ async fn transfer_uncompressed_fallback(
     body_data: &[u8],
 ) -> (u64, bool) {
     let mut total = 0u64;
-    
-    // ヘッダー送信
-    let headers = original_headers.to_vec();
-    let write_result = timeout(WRITE_TIMEOUT, client_stream.write_all(headers.clone())).await;
+
+    // ヘッダー送信（monoio は所有権を要求するため to_vec、clone は不要）
+    let headers_len = original_headers.len();
+    let write_result = timeout(WRITE_TIMEOUT, client_stream.write_all(original_headers.to_vec())).await;
     if !matches!(write_result, Ok((Ok(_), _))) {
         return (total, false);
     }
-    total += headers.len() as u64;
-    
+    total += headers_len as u64;
+
     // ボディ送信
-    let body = body_data.to_vec();
-    let write_result = timeout(WRITE_TIMEOUT, client_stream.write_all(body.clone())).await;
+    let body_len = body_data.len();
+    let write_result = timeout(WRITE_TIMEOUT, client_stream.write_all(body_data.to_vec())).await;
     if !matches!(write_result, Ok((Ok(_), _))) {
         return (total, false);
     }
-    total += body.len() as u64;
-    
+    total += body_len as u64;
+
     (total, true)
 }
 
@@ -6952,26 +6957,28 @@ async fn transfer_compressed_https_response(
             }
         }
         AcceptedEncoding::Identity => {
-            body_data.clone()
+            body_data
         }
     };
-    
+
     // 3. 新しいヘッダーを構築
     let new_headers = build_compressed_headers(original_headers, encoding, compressed_body.len(), security);
-    
-    // 4. ヘッダー送信
-    let write_result = timeout(WRITE_TIMEOUT, client_stream.write_all(new_headers.clone())).await;
+
+    // 4. ヘッダー送信（所有権を移動、clone 不要）
+    let new_headers_len = new_headers.len();
+    let write_result = timeout(WRITE_TIMEOUT, client_stream.write_all(new_headers)).await;
     if !matches!(write_result, Ok((Ok(_), _))) {
         return (total, false);
     }
-    total += new_headers.len() as u64;
-    
-    // 5. 圧縮済みボディ送信
-    let write_result = timeout(WRITE_TIMEOUT, client_stream.write_all(compressed_body.clone())).await;
+    total += new_headers_len as u64;
+
+    // 5. 圧縮済みボディ送信（所有権を移動、clone 不要）
+    let compressed_len = compressed_body.len();
+    let write_result = timeout(WRITE_TIMEOUT, client_stream.write_all(compressed_body)).await;
     if !matches!(write_result, Ok((Ok(_), _))) {
         return (total, false);
     }
-    total += compressed_body.len() as u64;
+    total += compressed_len as u64;
 
     (total, backend_wants_keep_alive)
 }
