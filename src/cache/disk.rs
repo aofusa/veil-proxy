@@ -294,12 +294,12 @@ impl DiskCache {
     pub async fn write_async(&self, key: &CacheKey, data: Vec<u8>) -> io::Result<PathBuf> {
         let path = self.key_to_path(key);
         let data_len = data.len() as u64;
-        
-        // 親ディレクトリを作成（同期だが頻度は低い）
+
+        // 親ディレクトリを作成（io_uring 非同期版）
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            monoio::fs::create_dir_all(parent).await?;
         }
-        
+
         async_io::write_file(&path, data).await?;
         
         self.writes.fetch_add(1, Ordering::Relaxed);
@@ -364,9 +364,9 @@ pub mod async_io {
     /// 非同期ファイル読み込み
     pub async fn read_file(path: &Path) -> io::Result<Vec<u8>> {
         let file = File::open(path).await?;
-        
-        // ファイルサイズ取得（同期だが頻度は低い）
-        let metadata = std::fs::metadata(path)?;
+
+        // ファイルサイズ取得（io_uring 経由の非同期 statx でブロックしない）
+        let metadata = file.metadata().await?;
         let size = metadata.len() as usize;
         
         let mut buf = Vec::with_capacity(size);
@@ -382,9 +382,9 @@ pub mod async_io {
     
     /// 非同期ファイル書き込み
     pub async fn write_file(path: &Path, data: Vec<u8>) -> io::Result<()> {
-        // 親ディレクトリを作成（同期だが頻度は低い）
+        // 親ディレクトリを作成（io_uring 非同期版）
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            monoio::fs::create_dir_all(parent).await?;
         }
         
         // io_uring による非同期書き込み
@@ -398,14 +398,10 @@ pub mod async_io {
         Ok(())
     }
     
-    /// 非同期ファイル削除
-    /// 
-    /// 注意: monoio::fsにはremoveがないため同期操作
-    /// 
-    /// 将来の使用に備えた関数。非同期削除の実装が追加される可能性がある。
+    /// 非同期ファイル削除（io_uring unlinkat 使用）
     #[allow(dead_code)]
-    pub fn remove_file(path: &Path) -> io::Result<()> {
-        std::fs::remove_file(path)
+    pub async fn remove_file(path: &Path) -> io::Result<()> {
+        monoio::fs::remove_file(path).await
     }
 }
 
