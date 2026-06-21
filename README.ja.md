@@ -77,110 +77,24 @@ io_uring (monoio) と rustls を使用した高性能リバースプロキシサ
 ## ビルド
 
 ```bash
-# 通常ビルド（rustls使用、HTTP/1.1のみ）
+# デフォルトビルド — kTLS + HTTP/2 + mimalloc（推奨）
 cargo build --release
 
-# kTLSサポート付きビルド（rustls + 独自kTLSモジュール）
-cargo build --release --features ktls
-
-# HTTP/2サポート付きビルド
-cargo build --release --features http2
-
-# HTTP/3サポート付きビルド（quiche使用）
-cargo build --release --features http3
-
-# 全プロトコルサポート（HTTP/2 + HTTP/3）
-cargo build --release --features all-protocols
-
-# kTLS + HTTP/2（推奨構成）
-cargo build --release --features "ktls,http2"
-
-# フルビルド（kTLS + 全プロトコル）
-cargo build --release --features "ktls,all-protocols"
-
-# WASM拡張サポート付きビルド（Proxy-Wasm v0.2.1）
-cargo build --release --features wasm
-
-# gRPCサポート付きビルド（HTTP/2ベース）
-cargo build --release --features "http2,grpc"
-
-# gRPC全機能ビルド（gRPC + gRPC-Web + HTTP/3）
-cargo build --release --features "grpc-full"
-
-# 全機能ビルド（全フィーチャー有効）
+# 全機能ビルド — 全オプションフィーチャー有効
 cargo build --release --features full
+
+# 最小ビルド — オプションフィーチャーなし
+cargo build --release --no-default-features
 ```
 
 ビルド後のバイナリは `target/release/veil` に生成されます。
 
-### フィーチャーフラグ一覧
-
-#### デフォルトフィーチャー
-
-デフォルトビルドは `ktls`、`http2`、`mimalloc` を含みます：
-
-```sh
-cargo build --release  # --features "ktls,http2,mimalloc" 相当
-```
-
-#### プロトコル系フィーチャー
-
-| フィーチャー | 説明 | 備考 |
-|-------------|------|------|
-| `ktls` | kTLSカーネルTLSオフロード | Linux 5.15+、要`modprobe tls` |
-| `http2` | HTTP/2 (ALPN h2) | TLS接続でのHTTP/2サポート |
-| `http3` | HTTP/3 (QUIC) | UDP/QUICベース、quiche使用 |
-| `wasm` | WASM拡張（Proxy-Wasm v0.2.1） | Wasmtime使用、Nginx/Envoy互換 |
-| `grpc` | gRPC（HTTP/2ベース） | gRPCワイヤプロトコル（framing、headers、trailers）、prost使用 |
-| `grpc-web` | gRPC-Web | ブラウザ互換のgRPC-Webプロトコル変換（CORS対応） |
-| `grpc-full` | grpc + grpc-web + http3 | HTTP/3上のgRPCを含む全機能 |
-
-#### メモリアロケータ（排他的選択）
-
-| フィーチャー | 説明 | 備考 |
-|-------------|------|------|
-| `mimalloc` | mimallocアロケータ（デフォルト） | 高速、Huge Pagesサポート |
-| `jemalloc` | jemallocアロケータ | 代替高性能アロケータ |
-| `system-allocator` | システムアロケータ | フィーチャー未指定時のデフォルト |
-
-#### オプション機能フィーチャー
-
-| フィーチャー | 説明 | 備考 |
-|-------------|------|------|
-| `compression` | Gzip/Brotli/Zstd レスポンス圧縮 | flate2、brotli、zstd 使用 |
-| `cache` | インメモリ＋ディスクプロキシキャッシュ | dashmap、glob 使用 |
-| `metrics` | Prometheusメトリクスエクスポート | prometheus クレート使用 |
-| `websocket` | WebSocketプロキシサポート | 双方向WebSocketプロキシ |
-| `rate-limit` | レートリミット・接続制限 | スライディングウィンドウ方式 |
-| `buffering` | 高度なレスポンスバッファリング | 低速クライアントのバックエンド占有防止 |
-
-#### 複合フィーチャー
-
-| フィーチャー | 説明 |
-|-------------|------|
-| `full` | 全フィーチャー有効（ktls + http2 + http3 + grpc-full + wasm + compression + cache + metrics + websocket + rate-limit + buffering + mimalloc） |
-
-#### ビルドコマンド例
-
-```sh
-# デフォルト（kTLS + HTTP/2 + mimalloc）
-cargo build --release
-
-# 圧縮とキャッシュ付き
-cargo build --release --features "compression,cache"
-
-# 全機能ビルド
-cargo build --release --features full
-
-# 最小ビルド（フィーチャーなし）
-cargo build --release --no-default-features
-
-# jemallocを使用する場合
-cargo build --release --no-default-features --features "ktls,http2,jemalloc"
-```
-
-> **Note**: HTTP/3はUDPベースのため、kTLSとの併用はできません（HTTP/3はTCP/TLSを使用しないため）。
-> **Note**: アロケータフィーチャー（`mimalloc`、`jemalloc`、`system-allocator`）は同時に複数を有効化しないでください。
+> **Cargo フィーチャー**: 利用可能なフィーチャーフラグの一覧は [`Cargo.toml` の `[features]` セクション](Cargo.toml) を参照してください。
+> 主な注意点：
+> - **デフォルトフィーチャー**: `ktls`、`http2`、`mimalloc`
+> - **`full`**: 全フィーチャーを有効化（`ktls`、`http2`、`http3`、`grpc-full`、`wasm`、`compression`、`cache`、`metrics`、`websocket`、`rate-limit`、`buffering`、`mimalloc`）
+> - **アロケータフィーチャー**（`mimalloc`、`jemalloc`、`system-allocator`）は排他的 — 複数同時有効化不可
+> - HTTP/3 は UDP ベースのため kTLS と併用不可
 
 
 ## 起動

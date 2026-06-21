@@ -77,110 +77,24 @@ A high-performance reverse proxy server using io_uring (monoio) and rustls.
 ## Build
 
 ```bash
-# Standard build (using rustls, HTTP/1.1 only)
+# Default build — kTLS + HTTP/2 + mimalloc (recommended)
 cargo build --release
 
-# Build with kTLS support (rustls + custom kTLS module)
-cargo build --release --features ktls
-
-# Build with HTTP/2 support
-cargo build --release --features http2
-
-# Build with HTTP/3 support (using quiche)
-cargo build --release --features http3
-
-# All protocols support (HTTP/2 + HTTP/3)
-cargo build --release --features all-protocols
-
-# kTLS + HTTP/2 (recommended configuration)
-cargo build --release --features "ktls,http2"
-
-# Full build (kTLS + all protocols)
-cargo build --release --features "ktls,all-protocols"
-
-# Build with WASM extension support (Proxy-Wasm v0.2.1)
-cargo build --release --features wasm
-
-# Build with gRPC support (HTTP/2 based)
-cargo build --release --features "http2,grpc"
-
-# Full gRPC support (gRPC + gRPC-Web + HTTP/3)
-cargo build --release --features "grpc-full"
-
-# Full featured build (all features enabled)
-cargo build --release --features full
-```
-
-After building, the binary is generated at `target/release/veil`.
-
-### Feature Flags
-
-#### Default Features
-
-The default build includes `ktls`, `http2`, and `mimalloc`:
-
-```sh
-cargo build --release  # equivalent to --features "ktls,http2,mimalloc"
-```
-
-#### Protocol Features
-
-| Feature | Description | Notes |
-|---------|-------------|-------|
-| `ktls` | kTLS kernel TLS offload | Linux 5.15+, requires `modprobe tls` |
-| `http2` | HTTP/2 (ALPN h2) | HTTP/2 support for TLS connections |
-| `http3` | HTTP/3 (QUIC) | UDP/QUIC based, uses quiche |
-| `wasm` | WASM Extension (Proxy-Wasm v0.2.1) | Uses Wasmtime, Nginx/Envoy compatible |
-| `grpc` | gRPC (HTTP/2 based) | gRPC wire protocol (framing, headers, trailers), uses prost |
-| `grpc-web` | gRPC-Web | Browser-compatible gRPC-Web protocol translation (CORS support) |
-| `grpc-full` | grpc + grpc-web + http3 | Full gRPC support including HTTP/3 |
-
-#### Allocator Features (mutually exclusive)
-
-| Feature | Description | Notes |
-|---------|-------------|-------|
-| `mimalloc` | mimalloc allocator (default) | High-performance, Huge Pages support |
-| `jemalloc` | jemalloc allocator | Alternative high-performance allocator |
-| `system-allocator` | System allocator | Use when no allocator feature is specified |
-
-#### Optional Feature Flags
-
-| Feature | Description | Notes |
-|---------|-------------|-------|
-| `compression` | Gzip/Brotli/Zstd response compression | Requires flate2, brotli, zstd |
-| `cache` | In-memory + disk proxy cache | Requires dashmap, glob |
-| `metrics` | Prometheus metrics export | Requires prometheus crate |
-| `websocket` | WebSocket proxy support | Bidirectional WebSocket proxying |
-| `rate-limit` | Rate limiting and connection limits | Sliding window rate limiting |
-| `buffering` | Advanced response buffering | Prevents slow-client backend starvation |
-
-#### Composite Features
-
-| Feature | Description |
-|---------|-------------|
-| `full` | All features enabled (ktls + http2 + http3 + grpc-full + wasm + compression + cache + metrics + websocket + rate-limit + buffering + mimalloc) |
-
-#### Example Build Commands
-
-```sh
-# Default (kTLS + HTTP/2 + mimalloc)
-cargo build --release
-
-# With compression and cache
-cargo build --release --features "compression,cache"
-
-# With all optional features
+# Full featured build — all optional features enabled
 cargo build --release --features full
 
-# Minimal build (no features)
+# Minimal build — no optional features
 cargo build --release --no-default-features
-
-# With jemalloc instead of mimalloc
-cargo build --release --no-default-features --features "ktls,http2,jemalloc"
 ```
 
-> **Note**: HTTP/3 is UDP-based, so it cannot be used with kTLS (HTTP/3 does not use TCP/TLS).
-> **Note**: Do not enable multiple allocator features (`mimalloc`, `jemalloc`, `system-allocator`) simultaneously.
+The binary is generated at `target/release/veil`.
+
+> **Cargo features**: The complete list of available feature flags is defined in the [`[features]` section of `Cargo.toml`](Cargo.toml).
+> Key notes:
+> - **Default features**: `ktls`, `http2`, `mimalloc`
+> - **`full`**: enables everything (`ktls`, `http2`, `http3`, `grpc-full`, `wasm`, `compression`, `cache`, `metrics`, `websocket`, `rate-limit`, `buffering`, `mimalloc`)
+> - **Allocator features** (`mimalloc`, `jemalloc`, `system-allocator`) are mutually exclusive — enable at most one
+> - HTTP/3 is UDP-based and cannot be combined with kTLS
 
 ## Startup
 
