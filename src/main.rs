@@ -10834,14 +10834,24 @@ async fn detect_protocol_with_buffer(
             _ => break,
         };
         
+        // 重要: monoio (io_uring) の read を timeout() で直接ラップしてキャンセルすると、
+        // カーネルが既に読み取りバッファへコピー済みのバイトが失われる。これにより後続の
+        // TLS ハンドシェイクがストリーム不整合（received corrupt message / InvalidContentType）で
+        // 失敗する（負荷時にスレッドがビジーで 200ms タイムアウトが発火すると顕在化）。
+        //
+        // これを避けるため、まず「読み取り可能になる」のを待つ（データを消費しないため
+        // キャンセルしても安全）。読み取り可能になってから timeout なしで read する。read は
+        // 即座に完了するためキャンセルされず、ソケットからバイトを取りこぼさない。
+        // readable がタイムアウトした場合は何も消費していないため、accumulated のまま
+        // 安全にフォールバックできる（空バッファなら TLS ハンドシェイクが新規に読み直す）。
+        match timeout(remaining_timeout, stream.readable(false)).await {
+            Ok(Ok(())) => {}
+            _ => break, // タイムアウト or エラー（消費済みバイト無し）
+        }
+
         let peek_buf = vec![0u8; 24 - accumulated.len()];
-        let read_result = timeout(remaining_timeout, stream.read(peek_buf)).await;
-        
-        let (result, returned_buf) = match read_result {
-            Ok(r) => r,
-            Err(_) => break, // タイムアウト
-        };
-        
+        let (result, returned_buf) = stream.read(peek_buf).await;
+
         match result {
             Ok(0) => break, // 接続終了
             Ok(n) => {
@@ -11119,6 +11129,36 @@ async fn handle_connection(
 // リクエスト処理ループ
 // ====================
 
+/// Lingering close: クライアントが送信途中のデータを一定時間読み捨ててからクローズする。
+///
+/// エラーレスポンス（431/414/413 等）を書き込んだ直後にクローズすると、ソケットの受信
+/// バッファにクライアントが送信中のデータ（巨大ヘッダ/ボディ）が残っている場合、OS が
+/// FIN ではなく RST を送出し、直前に書いたレスポンスがクライアントに届かないことがある
+/// （負荷時に顕在化する「過大ヘッダで応答が空になる」フレーキーの原因）。受信データを
+/// ドレインしてからクローズすることで RST を防ぎ、エラーレスポンスを確実に届ける。
+/// nginx の lingering_close と同じ目的。
+async fn lingering_drain_before_close(stream: &mut ServerTls) {
+    // 全体上限はやや長めに取る。単一スレッドが高負荷でスケジュールされにくい状況でも、
+    // クライアントが送信中の本文（最大 ~数百KB）を読み切ってからクローズできるようにする。
+    // 上限途中でも「一定時間データが来ない＝受信バッファが空」になった時点で抜ける。
+    let overall = Duration::from_millis(2000);
+    let start = std::time::Instant::now();
+    while start.elapsed() < overall {
+        let buf = buf_get();
+        match timeout(Duration::from_millis(200), stream.read(buf)).await {
+            Ok((res, b)) => {
+                buf_put(b);
+                match res {
+                    Ok(0) => break,   // EOF: クライアントが書き込みをクローズ
+                    Ok(_) => {}       // 読み捨てて継続（データがある間は読み続ける）
+                    Err(_) => break,  // 読み取りエラー
+                }
+            }
+            Err(_) => break, // 200ms データ無し＝受信バッファは空。安全にクローズ可能
+        }
+    }
+}
+
 // 統一されたリクエスト処理ループ（型エイリアスを使用）
 async fn handle_requests(
     mut tls_stream: ServerTls,
@@ -11194,6 +11234,9 @@ async fn handle_requests(
             };
             let err_buf = response_code.to_vec();
             let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+            // クライアントは巨大ヘッダを送信中のため、ドレインしてからクローズして
+            // RST による 431/414 レスポンスの消失を防ぐ（lingering close）。
+            lingering_drain_before_close(&mut tls_stream).await;
             return;
         }
 
@@ -12298,6 +12341,65 @@ fn find_backend_linear(
 // ====================
 
 // 統一された Backend 処理（型エイリアスを使用）
+/// ローカル応答系バックエンド（File/Memory/Redirect 等）向けに、消費されない
+/// リクエストボディをソケットから読み捨てる。
+///
+/// これらのバックエンドはリクエストボディを読まずにレスポンスを返す。keep-alive 接続で
+/// ボディを読み捨てずに次のリクエストへ進むと、ソケットに残ったボディ（Content-Length
+/// 本文や chunked の `5\r\nhello\r\n0\r\n\r\n` 等）が次のリクエストとして解釈され、
+/// `400 Bad Request` を引き起こす（負荷時に顕在化する keep-alive desync の原因）。
+///
+/// `initial_body` は既にヘッダ読み取り時にソケットから消費済みの先頭バイト。残りを
+/// ソケットから読み切る。完全にドレインできた場合のみ `true` を返す（接続再利用が安全）。
+/// ドレインに失敗した場合は `false`（呼び出し側は接続を閉じる）。
+async fn drain_request_body(
+    stream: &mut ServerTls,
+    content_length: usize,
+    is_chunked: bool,
+    initial_body: &[u8],
+) -> bool {
+    if is_chunked {
+        // DoS 対策の上限は MAX_BODY_SIZE を流用（リクエスト本文の上限）。
+        let mut decoder = ChunkedDecoder::new(MAX_BODY_SIZE as u64);
+        match decoder.feed(initial_body) {
+            ChunkedFeedResult::Complete => return true,
+            ChunkedFeedResult::SizeLimitExceeded => return false,
+            ChunkedFeedResult::Continue => {}
+        }
+        loop {
+            let buf = buf_get();
+            match timeout(READ_TIMEOUT, stream.read(buf)).await {
+                Ok((Ok(0), b)) => { buf_put(b); return false; } // EOF: 不完全
+                Ok((Ok(n), mut b)) => {
+                    b.set_valid_len(n);
+                    let res = decoder.feed(b.as_valid_slice());
+                    buf_put(b);
+                    match res {
+                        ChunkedFeedResult::Complete => return true,
+                        ChunkedFeedResult::SizeLimitExceeded => return false,
+                        ChunkedFeedResult::Continue => {}
+                    }
+                }
+                _ => return false, // 読み取りエラー or タイムアウト
+            }
+        }
+    } else {
+        let mut remaining = content_length.saturating_sub(initial_body.len());
+        while remaining > 0 {
+            let buf = buf_get();
+            match timeout(READ_TIMEOUT, stream.read(buf)).await {
+                Ok((Ok(0), b)) => { buf_put(b); return false; } // EOF: 不完全
+                Ok((Ok(n), b)) => {
+                    buf_put(b);
+                    remaining = remaining.saturating_sub(n);
+                }
+                _ => return false, // 読み取りエラー or タイムアウト
+            }
+        }
+        true
+    }
+}
+
 async fn handle_backend(
     mut tls_stream: ServerTls,
     backend: Backend,
@@ -12312,6 +12414,15 @@ async fn handle_backend(
     wasm_modules: Vec<String>,
     client_ip: &str,
 ) -> Option<(ServerTls, u16, u64, bool)> {
+    // Proxy バックエンドはリクエストボディを上流へ転送して消費する。それ以外（File/Memory/
+    // Redirect 等のローカル応答）はボディを読まないため、keep-alive 接続でボディが次の
+    // リクエストに混入して 400 desync を起こす。ローカル応答の前に残りのボディを読み捨てる。
+    if !matches!(backend, Backend::Proxy(..)) && (is_chunked || content_length > initial_body.len()) {
+        if !drain_request_body(&mut tls_stream, content_length, is_chunked, initial_body).await {
+            // ドレイン失敗（接続が汚染されている可能性）→ 接続を閉じる
+            return Some((tls_stream, 400, 0, true));
+        }
+    }
     match backend {
         Backend::Proxy(upstream_group, security, compression, buffering, cache, _) => {
             handle_proxy(
@@ -13803,6 +13914,16 @@ async fn handle_proxy(
         }
     }
     
+    // chunked リクエストはボディを chunked フレームのままバックエンドへ転送する。
+    // 上のループで Transfer-Encoding を hop-by-hop ヘッダとして除去しているため、
+    // chunked の場合はここで再付与しないと、バックエンドはボディ長を判別できず本文を
+    // 読まないまま応答する。その結果、残った chunked フレーム
+    // （例: `5\r\nhello\r\n0\r\n\r\n`）が keep-alive 接続上で次のリクエストとして
+    // 解釈され、`400 Bad Request` の desync を引き起こす（負荷時に顕在化）。
+    if is_chunked {
+        request.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+    }
+
     // バックエンドにはKeep-Aliveを要求
     request.extend_from_slice(HEADER_CONNECTION_KEEPALIVE_END);
 
@@ -16358,6 +16479,57 @@ async fn splice_transfer_response_ktls(
 // HTTPS プロキシ（コネクションプール対応）
 // ====================
 
+/// バックエンドへの新規 HTTPS（TCP+TLS）接続を確立する。
+///
+/// 成功時は確立済みの `ClientTls` を返す。失敗時は `(ステータスコード, クライアントへ
+/// 返すエラーメッセージ)` を返す（接続エラー=502 / タイムアウト=504）。クライアントへの
+/// 書き込みは呼び出し側が行う。
+async fn connect_https_backend_fresh(
+    target: &ProxyTarget,
+    connect_timeout: Duration,
+    tls_insecure: bool,
+) -> Result<ClientTls, (u16, &'static [u8])> {
+    let addr = format!("{}:{}", target.host, target.port);
+    let backend_tcp = match timeout(connect_timeout, TcpStream::connect(&addr)).await {
+        Ok(Ok(stream)) => {
+            let _ = stream.set_nodelay(true);
+            stream
+        }
+        Ok(Err(e)) => {
+            error!("Proxy connect error to {}: {}", addr, e);
+            return Err((502, ERR_MSG_BAD_GATEWAY));
+        }
+        Err(_) => {
+            error!("Proxy connect timeout to {}", addr);
+            return Err((504, ERR_MSG_GATEWAY_TIMEOUT));
+        }
+    };
+
+    // TLS接続（タイムアウト付き）
+    // SNI名を使用（sni_nameが設定されていればそれを使用、なければhostを使用）
+    // tls_insecure が true の場合、証明書検証をスキップ
+    let sni = target.sni();
+    let tls_result = if tls_insecure {
+        let connector = TLS_CONNECTOR_INSECURE.with(|c| c.clone());
+        timeout(connect_timeout, connector.connect(backend_tcp, sni)).await
+    } else {
+        let connector = TLS_CONNECTOR.with(|c| c.clone());
+        timeout(connect_timeout, connector.connect(backend_tcp, sni)).await
+    };
+
+    match tls_result {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(e)) => {
+            error!("TLS connect error to {} (SNI: {}): {}", target.host, sni, e);
+            Err((502, ERR_MSG_BAD_GATEWAY))
+        }
+        Err(_) => {
+            error!("TLS connect timeout to {} (SNI: {})", target.host, sni);
+            Err((504, ERR_MSG_GATEWAY_TIMEOUT))
+        }
+    }
+}
+
 async fn proxy_https_pooled(
     mut client_stream: ServerTls,
     target: &ProxyTarget,
@@ -16376,119 +16548,113 @@ async fn proxy_https_pooled(
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // セキュリティ設定からタイムアウトを取得
     let connect_timeout = Duration::from_secs(security.backend_connect_timeout_secs);
-    
-    // プールから接続を取得、または新規作成
-    let mut backend_stream = match HTTPS_POOL.with(|p| p.borrow_mut().get(pool_key)) {
-        Some(stream) => stream,
-        None => {
-            // 新規TCP接続を作成
-            let addr = format!("{}:{}", target.host, target.port);
-            let connect_result = timeout(connect_timeout, TcpStream::connect(&addr)).await;
-            
-            let backend_tcp = match connect_result {
-                Ok(Ok(stream)) => {
-                    let _ = stream.set_nodelay(true);
-                    stream
-                }
-                Ok(Err(e)) => {
-                    error!("Proxy connect error to {}: {}", addr, e);
-                    let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
-                    let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
-                    return Some((client_stream, 502, 0, true));
-                }
-                Err(_) => {
-                    error!("Proxy connect timeout to {}", addr);
-                    let err_buf = ERR_MSG_GATEWAY_TIMEOUT.to_vec();
-                    let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
-                    return Some((client_stream, 504, 0, true));
-                }
-            };
-            
-            // TLS接続（タイムアウト付き）
-            // SNI名を使用（sni_nameが設定されていればそれを使用、なければhostを使用）
-            // tls_insecure が true の場合、証明書検証をスキップ
-            let sni = target.sni();
-            let tls_result = if tls_insecure {
-                let connector = TLS_CONNECTOR_INSECURE.with(|c| c.clone());
-                timeout(connect_timeout, connector.connect(backend_tcp, sni)).await
-            } else {
-                let connector = TLS_CONNECTOR.with(|c| c.clone());
-                timeout(connect_timeout, connector.connect(backend_tcp, sni)).await
-            };
-            
-            match tls_result {
-                Ok(Ok(stream)) => stream,
-                Ok(Err(e)) => {
-                    error!("TLS connect error to {} (SNI: {}): {}", target.host, sni, e);
-                    let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
-                    let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
-                    return Some((client_stream, 502, 0, true));
-                }
-                Err(_) => {
-                    error!("TLS connect timeout to {} (SNI: {})", target.host, sni);
-                    let err_buf = ERR_MSG_GATEWAY_TIMEOUT.to_vec();
-                    let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
-                    return Some((client_stream, 504, 0, true));
-                }
-            }
-        }
-    };
-
     // セキュリティ設定からchunked最大サイズを取得
     let max_chunked = security.max_chunked_body_size as u64;
-    
     // バッファリングが有効かどうか判定
     let buffering_enabled = buffering_config.is_enabled() && buffering_config.should_buffer(Some(content_length));
-    
-    let result = if buffering_enabled && (!compression.enabled || client_encoding == AcceptedEncoding::Identity) {
-        let host_str_for_metrics = &target.host;
-        record_buffering_used(&host_str_for_metrics);
-        proxy_request_buffered(
-            &mut client_stream,
-            &mut backend_stream,
-            request,
-            content_length,
-            is_chunked,
-            initial_body,
-            max_chunked,
-            buffering_config,
-            None,
-            security,
-        ).await
-    } else {
-        // リクエスト送信とレスポンス受信（圧縮対応）
-        proxy_https_request_with_compression(
-            &mut client_stream,
-            &mut backend_stream,
-            request,
-            content_length,
-            is_chunked,
-            initial_body,
-            max_chunked,
-            compression,
-            client_encoding,
-            security,
-            wasm_modules,
-        ).await
-    };
 
-    match result {
-        Some((status_code, total, backend_wants_keep_alive)) => {
-            // バックエンドがKeep-Aliveを許可している場合、プールに返却
-            if backend_wants_keep_alive {
-                let max_idle = security.max_idle_connections_per_host;
-                let idle_timeout = security.idle_connection_timeout_secs;
-                HTTPS_POOL.with(|p| p.borrow_mut().put(pool_key.to_string(), backend_stream, max_idle, idle_timeout));
+    // プールから取り出した keep-alive 接続は、バックエンド側の idle タイムアウト等で
+    // 既に閉じられていることがある。その場合バックエンドからの最初の read が即座に EOF を
+    // 返し、クライアントへ何も送信されないまま 502 相当で終わってしまう（負荷時に顕在化する
+    // 「応答が空になる」フレーキーの原因）。クライアントへ未送信であれば、新規接続で透過的に
+    // 一度だけリトライする。
+    //
+    // リトライが安全なのは「リクエストボディがクライアントストリームから未読でない」場合に
+    // 限る（ボディ全体が initial_body 内にあり、chunked でない）。ボディをストリーム転送する
+    // リクエストは再送できないためリトライしない。
+    let replayable = !is_chunked && content_length <= initial_body.len();
+    // request / wasm_modules はリトライ時に再利用するため、リトライ可能な場合のみ複製を保持する。
+    // （非リトライ要求では複製せず move するためホットパスに余分な割り当てを足さない）
+    let mut request_holder = Some(request);
+
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        // 接続取得: 初回はプール優先。リトライ時は必ず新規接続。
+        let pooled = if attempt == 1 {
+            HTTPS_POOL.with(|p| p.borrow_mut().get(pool_key))
+        } else {
+            None
+        };
+        let (mut backend_stream, from_pool) = match pooled {
+            Some(stream) => (stream, true),
+            None => match connect_https_backend_fresh(target, connect_timeout, tls_insecure).await {
+                Ok(stream) => (stream, false),
+                Err((code, msg)) => {
+                    let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(msg.to_vec())).await;
+                    return Some((client_stream, code, 0, true));
+                }
+            },
+        };
+
+        // リトライ可能要求は複製を渡し（次の試行のため原本を保持）、それ以外は move する。
+        let req = if replayable {
+            request_holder.as_ref().map(|r| r.clone()).unwrap_or_default()
+        } else {
+            request_holder.take().unwrap_or_default()
+        };
+        // wasm_modules は通常空（割り当てなし）のため毎試行クローンしても実質コストは無い。
+        let wasm_mods = wasm_modules.clone();
+
+        let result = if buffering_enabled && (!compression.enabled || client_encoding == AcceptedEncoding::Identity) {
+            let host_str_for_metrics = &target.host;
+            record_buffering_used(&host_str_for_metrics);
+            proxy_request_buffered(
+                &mut client_stream,
+                &mut backend_stream,
+                req,
+                content_length,
+                is_chunked,
+                initial_body,
+                max_chunked,
+                buffering_config,
+                None,
+                security,
+            ).await
+        } else {
+            // リクエスト送信とレスポンス受信（圧縮対応）
+            proxy_https_request_with_compression(
+                &mut client_stream,
+                &mut backend_stream,
+                req,
+                content_length,
+                is_chunked,
+                initial_body,
+                max_chunked,
+                compression,
+                client_encoding,
+                security,
+                wasm_mods,
+            ).await
+        };
+
+        match result {
+            Some((status_code, total, backend_wants_keep_alive)) => {
+                // プールから取り出した接続が応答前に死んでいた（total==0 かつ status は初期値 502 = レスポンス未受信）。
+                // クライアントへ未送信のため、新規接続で一度だけ透過リトライ。死んだ接続はプールに戻さない。
+                if from_pool && total == 0 && status_code == 502 && replayable && attempt < 2 {
+                    continue;
+                }
+                // バックエンドがKeep-Aliveを許可している場合、プールに返却
+                if backend_wants_keep_alive {
+                    let max_idle = security.max_idle_connections_per_host;
+                    let idle_timeout = security.idle_connection_timeout_secs;
+                    HTTPS_POOL.with(|p| p.borrow_mut().put(pool_key.to_string(), backend_stream, max_idle, idle_timeout));
+                }
+                // 408 (body timeout) sends Connection: close — must actually close
+                let should_close = client_wants_close || status_code == 408;
+                return Some((client_stream, status_code, total, should_close));
             }
-            // 408 (body timeout) sends Connection: close — must actually close
-            let should_close = client_wants_close || status_code == 408;
-            Some((client_stream, status_code, total, should_close))
-        }
-        None => {
-            // エラー発生時は接続を破棄
-            let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
-            let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
-            Some((client_stream, 502, 0, true))
+            None => {
+                // プール接続でのエラーかつクライアントへ未送信なら新規接続でリトライ
+                if from_pool && replayable && attempt < 2 {
+                    continue;
+                }
+                // エラー発生時は接続を破棄
+                let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
+                let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
+                return Some((client_stream, 502, 0, true));
+            }
         }
     }
 }

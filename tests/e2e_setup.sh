@@ -127,9 +127,9 @@ prepare_fixtures() {
     echo "OK" > "${FIXTURES_DIR}/backend_h2c/health"
 
     # 圧縮テスト・大容量ファイルテスト用（1024バイト超の圧縮閾値とtest_static_file_large用）
-    python3 -c "print('A' * 10000)" > "${FIXTURES_DIR}/backend1/large.txt"
-    python3 -c "print('A' * 10000)" > "${FIXTURES_DIR}/backend2/large.txt"
-    python3 -c "print('A' * 10000)" > "${FIXTURES_DIR}/backend_h2c/large.txt"
+    head -c 10000 /dev/zero | tr '\0' 'A' > "${FIXTURES_DIR}/backend1/large.txt"
+    head -c 10000 /dev/zero | tr '\0' 'A' > "${FIXTURES_DIR}/backend2/large.txt"
+    head -c 10000 /dev/zero | tr '\0' 'A' > "${FIXTURES_DIR}/backend_h2c/large.txt"
     
     # /healthエンドポイント用JSONファイル（プロキシが直接サービスする）
     echo '{"status":"ok","proxy":"veil"}' > "${FIXTURES_DIR}/proxy_health.json"
@@ -342,9 +342,9 @@ servers = [
 tls_insecure = true
 
 [upstreams."backend-pool".health_check]
-enabled = true
+enabled = false
 path = "/health"
-interval_secs = 5
+interval_secs = 60
 timeout_secs = 3
 healthy_threshold = 1
 unhealthy_threshold = 10000
@@ -897,47 +897,29 @@ start_servers() {
     echo $! >> "$PIDS_FILE"
     log_info "gRPC Echo Backend started on port ${BACKEND_GRPC_PORT} (PID: $!, logs: /tmp/grpc_server.log)"
 
-    # WebSocket Echoバックエンド起動（Python）
-    log_info "Starting WebSocket Echo Backend on port ${BACKEND_WS_PORT}..."
-    python3 - <<PYEOF > /tmp/websocket_backend.log 2>&1 &
-import asyncio
-import websockets
-
-async def echo(websocket):
-    try:
-        async for message in websocket:
-            await websocket.send(message)
-    except Exception:
-        pass
-
-async def main():
-    async with websockets.serve(echo, "127.0.0.1", ${BACKEND_WS_PORT}):
-        await asyncio.Future()
-
-asyncio.run(main())
-PYEOF
+    # テストバックエンド起動（WebSocket Echo + HTTP 500エラー）
+    # Rustバイナリ: tests/test_backends/
+    log_info "Building and starting Rust test backends (WS echo + HTTP error)..."
+    (cd "${SCRIPT_DIR}/test_backends" && cargo build --quiet)
+    WS_PORT="${BACKEND_WS_PORT}" ERROR_PORT="${BACKEND_ERROR_PORT}" \
+        RUST_LOG=info "${SCRIPT_DIR}/test_backends/target/debug/test-backends" \
+        > /tmp/test_backends.log 2>&1 &
     echo $! >> "$PIDS_FILE"
-    log_info "WebSocket Echo Backend started on port ${BACKEND_WS_PORT} (PID: $!, logs: /tmp/websocket_backend.log)"
+    log_info "Test backends started (WS: ${BACKEND_WS_PORT}, error: ${BACKEND_ERROR_PORT}, PID: $!, logs: /tmp/test_backends.log)"
 
-    # HTTP 500 エラーバックエンド起動（Python）
-    log_info "Starting HTTP 500 Error Backend on port ${BACKEND_ERROR_PORT}..."
-    python3 - <<PYEOF > /tmp/error_backend.log 2>&1 &
-from http.server import HTTPServer, BaseHTTPRequestHandler
-class ErrorHandler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        pass
-    def do_GET(self):
-        self.send_response(500)
-        self.send_header('Content-Type', 'text/plain')
-        self.send_header('Content-Length', '21')
-        self.end_headers()
-        self.wfile.write(b'Internal Server Error')
-    def do_POST(self):
-        self.do_GET()
-HTTPServer(('127.0.0.1', ${BACKEND_ERROR_PORT}), ErrorHandler).serve_forever()
-PYEOF
-    echo $! >> "$PIDS_FILE"
-    log_info "HTTP 500 Error Backend started on port ${BACKEND_ERROR_PORT} (PID: $!)"
+    # test_backendsの起動待機（両ポートがリッスン状態になるまで）
+    local tb_wait=0
+    while [ $tb_wait -lt 30 ]; do
+        if check_port_in_use "$BACKEND_WS_PORT" && check_port_in_use "$BACKEND_ERROR_PORT"; then
+            sleep 0.2
+            break
+        fi
+        tb_wait=$((tb_wait + 1))
+        sleep 0.2
+    done
+    if [ $tb_wait -ge 30 ]; then
+        log_warn "Test backends may not be fully ready, continuing..."
+    fi
 
     # バックエンド起動待機（動的）
     log_info "Waiting for backends to be ready..."
