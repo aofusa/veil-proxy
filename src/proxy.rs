@@ -5,7 +5,6 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -420,46 +419,25 @@ where
     
     // Backend選択（統合ルーティング）
     let config = CURRENT_CONFIG.load();
-    // ストリームからヘッダーを取得
-    let headers_map: HashMap<String, String> = if let Some(stream) = conn.get_stream(stream_id) {
+
+    // HTTP/2 ヘッダーをバイト列ペアとして収集
+    // conn の borrow 解放のため Vec<u8> にコピー（String アロケーション・HashMap 不要）
+    let h2_headers_store: Vec<(Vec<u8>, Vec<u8>)> = if let Some(stream) = conn.get_stream(stream_id) {
         stream.request_headers.iter()
-            .map(|h| (
-                String::from_utf8_lossy(&h.name).to_lowercase(),
-                String::from_utf8_lossy(&h.value).to_string()
-            ))
+            .map(|h| (h.name.clone(), h.value.clone()))
             .collect()
     } else {
-        HashMap::new()
+        Vec::new()
     };
-    
-    // クエリパラメータを抽出
-    let query_map: HashMap<String, String> = {
-        let path_str = std::str::from_utf8(path).unwrap_or("/");
-        if let Some(query_start) = path_str.find('?') {
-            let query_str = &path_str[query_start + 1..];
-            query_str.split('&')
-                .filter_map(|pair| {
-                    if let Some(eq_pos) = pair.find('=') {
-                        let key = url_decode(&pair[..eq_pos]);
-                        let value = url_decode(&pair[eq_pos + 1..]);
-                        Some((key, value))
-                    } else {
-                        let key = url_decode(pair);
-                        Some((key, String::new()))
-                    }
-                })
-                .collect()
-        } else {
-            HashMap::new()
-        }
-    };
-    
+    let headers_raw: Vec<(&[u8], &[u8])> = h2_headers_store.iter()
+        .map(|(k, v)| (k.as_slice(), v.as_slice()))
+        .collect();
+
+    // パス/クエリ分離（スキャンを1回に統一）
+    let query_start_pos = path.iter().position(|&b| b == b'?');
+    let raw_query: &[u8] = query_start_pos.map(|i| &path[i + 1..]).unwrap_or(b"");
     // パスからクエリ部分を除去
-    let path_without_query = if let Some(query_start) = path.iter().position(|&b| b == b'?') {
-        &path[..query_start]
-    } else {
-        path
-    };
+    let path_without_query = query_start_pos.map(|i| &path[..i]).unwrap_or(path);
     
     // クライアントIPをSocketAddrに変換
     let client_socket_addr = if let Ok(addr) = client_ip.parse::<SocketAddr>() {
@@ -478,8 +456,8 @@ where
         authority,
         path_without_query,
         method,
-        &headers_map,
-        &query_map,
+        &headers_raw,
+        raw_query,
         &client_socket_addr,
         config.route.as_slice(),
         &config.upstream_groups,
@@ -487,14 +465,14 @@ where
     .or_else(|| {
         // authority が空でない場合、デフォルトルートを検索
         if !authority.is_empty() {
-            debug!("[HTTP/2] No route found for authority '{}', trying default routes", 
+            debug!("[HTTP/2] No route found for authority '{}', trying default routes",
                    String::from_utf8_lossy(authority));
             find_backend_unified(
                 b"",
                 path_without_query,
                 method,
-                &headers_map,
-                &query_map,
+                &headers_raw,
+                raw_query,
                 &client_socket_addr,
                 config.route.as_slice(),
                 &config.upstream_groups,
@@ -2442,70 +2420,49 @@ async fn handle_requests(
                 }
 
                 // Backend選択（統合ルーティング対応）
-                // ヘッダーをHashMapに変換（reqをdropする前に取得）
-                let headers_map: HashMap<String, String> = req.headers.iter()
-                    .map(|h| (
-                        h.name.to_lowercase(),
-                        String::from_utf8_lossy(h.value).to_string()
-                    ))
-                    .collect();
-                
-                // クエリパラメータを抽出
-                let query_map: HashMap<String, String> = {
-                    let path_str = std::str::from_utf8(&path_bytes).unwrap_or("/");
-                    if let Some(query_start) = path_str.find('?') {
-                        let query_str = &path_str[query_start + 1..];
-                        query_str.split('&')
-                            .filter_map(|pair| {
-                                if let Some(eq_pos) = pair.find('=') {
-                                    let key = url_decode(&pair[..eq_pos]);
-                                    let value = url_decode(&pair[eq_pos + 1..]);
-                                    Some((key, value))
-                                } else {
-                                    let key = url_decode(pair);
-                                    Some((key, String::new()))
-                                }
-                            })
-                            .collect()
-                    } else {
-                        HashMap::new()
-                    }
-                };
-                
-                // パスからクエリ部分を除去
-                let path_without_query = if let Some(query_start) = path_bytes.iter().position(|&b| b == b'?') {
-                    &path_bytes[..query_start]
-                } else {
-                    &path_bytes
-                };
-                
-                // reqをdropする前に必要な情報を取得済み
-                drop(req);
-                
+                // パス/クエリ分離（スキャンを1回に統一）
+                let query_start_pos = path_bytes.iter().position(|&b| b == b'?');
+                let path_without_query = query_start_pos
+                    .map(|i| &path_bytes[..i])
+                    .unwrap_or(&path_bytes);
+
                 let config = CURRENT_CONFIG.load();
                 // client_ipをSocketAddrに変換
                 let client_socket_addr = if let Ok(addr) = client_ip.parse::<SocketAddr>() {
                     addr
                 } else {
-                    // IPアドレスのみの場合、ポート80を仮定
                     if let Ok(ip) = client_ip.parse::<std::net::IpAddr>() {
                         SocketAddr::new(ip, 80)
                     } else {
-                        // パースに失敗した場合はデフォルト（peer_addrを使用）
                         peer_addr
                     }
                 };
-                
-                let backend_result = find_backend_unified(
-                    &host_bytes,
-                    path_without_query,
-                    &method_bytes,
-                    &headers_map,
-                    &query_map,
-                    &client_socket_addr,
-                    config.route.as_slice(),
-                    &config.upstream_groups,
-                );
+
+                // ヘッダーをゼロコピーのバイト列スライスとして参照し、
+                // クエリ文字列は生バイトのまま渡す（HashMap 割り当て不要）
+                // req のドロップはルーティング完了後に行う
+                let backend_result = {
+                    let headers_raw: Vec<(&[u8], &[u8])> = req.headers.iter()
+                        .filter(|h| !h.name.is_empty())
+                        .map(|h| (h.name.as_bytes(), h.value))
+                        .collect();
+                    let raw_query: &[u8] = query_start_pos
+                        .map(|i| &path_bytes[i + 1..])
+                        .unwrap_or(b"");
+
+                    find_backend_unified(
+                        &host_bytes,
+                        path_without_query,
+                        &method_bytes,
+                        &headers_raw,
+                        raw_query,
+                        &client_socket_addr,
+                        config.route.as_slice(),
+                        &config.upstream_groups,
+                    )
+                };
+                // ルーティング完了後に req をドロップ（accumulated の borrow を解放）
+                drop(req);
 
                 let (prefix, backend) = match backend_result {
                     Some(b) => b,

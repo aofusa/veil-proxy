@@ -192,24 +192,48 @@ pub(crate) fn perform_health_check(
 // Backend選択
 // ====================
 
+/// ヘッダー名でゼロコピー検索（大文字小文字区別なし）
+#[inline]
+fn find_header_value<'a>(headers: &[(&'a [u8], &'a [u8])], name: &str) -> &'a str {
+    headers.iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name.as_bytes()))
+        .and_then(|(_, v)| std::str::from_utf8(v).ok())
+        .unwrap_or("")
+}
+
+/// クエリパラメータをオンデマンドで検索（URL デコードを必要時のみ実施）
+fn find_query_value(raw_query: &[u8], key: &str) -> String {
+    let query_str = std::str::from_utf8(raw_query).unwrap_or("");
+    for pair in query_str.split('&').filter(|p| !p.is_empty()) {
+        if let Some(eq_pos) = pair.find('=') {
+            if pair[..eq_pos].eq_ignore_ascii_case(key) {
+                return crate::http_utils::url_decode(&pair[eq_pos + 1..]);
+            }
+        } else if pair.eq_ignore_ascii_case(key) {
+            return String::new();
+        }
+    }
+    String::new()
+}
+
 /// 条件マッチング関数
-/// 
+///
 /// すべての条件をANDで結合して評価します。
+/// headers は生のバイト列ペア、raw_query はクエリ文字列バイト列を受け取り、
+/// HashMap アロケーションなしで照合します。
 pub(crate) fn matches_conditions(
     conditions: &RouteConditions,
     host: &[u8],
     path: &[u8],
     method: &[u8],
-    headers: &HashMap<String, String>,
-    query: &HashMap<String, String>,
+    headers: &[(&[u8], &[u8])],
+    raw_query: &[u8],
     source_ip: &SocketAddr,
 ) -> bool {
     // host条件のチェック
-    // 条件が指定されていない場合は、すべてのホストにマッチ（デフォルト）
     if let Some(ref host_pattern) = conditions.host {
         let host_str = match std::str::from_utf8(host) {
             Ok(s) => {
-                // ポート番号を除去
                 if let Some(colon_pos) = s.find(':') {
                     &s[..colon_pos]
                 } else {
@@ -218,67 +242,53 @@ pub(crate) fn matches_conditions(
             },
             Err(_) => return false,
         };
-        
         if !matches_wildcard(host_pattern, host_str) {
             return false;
         }
     }
-    // host条件がNoneの場合は、すべてのホストにマッチ（デフォルト動作）
-    
+
     // path条件のチェック
-    // 条件が指定されていない場合は、すべてのパスにマッチ（デフォルト）
     if let Some(ref path_pattern) = conditions.path {
         if !matches_path_pattern(path_pattern, path) {
             return false;
         }
     }
-    // path条件がNoneの場合は、すべてのパスにマッチ（デフォルト動作）
-    
-    // header条件のチェック
-    // 条件が指定されていない場合は、すべてのヘッダーにマッチ（デフォルト）
-    if let Some(ref header_map) = conditions.header {
-        for (key, value_pattern) in header_map {
-            let key_lower = key.to_lowercase();
-            let header_value = headers.get(&key_lower).map(|s| s.as_str()).unwrap_or("");
+
+    // header条件のチェック（条件がある場合のみ線形探索）
+    if let Some(ref header_conds) = conditions.header {
+        for (key, value_pattern) in header_conds {
+            let header_value = find_header_value(headers, key);
             if !matches_wildcard(value_pattern, header_value) {
                 return false;
             }
         }
     }
-    // header条件がNoneの場合は、すべてのヘッダーにマッチ（デフォルト動作）
-    
+
     // method条件のチェック
-    // 条件が指定されていない場合は、すべてのメソッドにマッチ（デフォルト）
     if let Some(ref methods) = conditions.method {
         let method_str = std::str::from_utf8(method).unwrap_or("");
         if !methods.iter().any(|m| m.eq_ignore_ascii_case(method_str)) {
             return false;
         }
     }
-    // method条件がNoneの場合は、すべてのメソッドにマッチ（デフォルト動作）
-    
-    // query条件のチェック
-    // 条件が指定されていない場合は、すべてのクエリパラメータにマッチ（デフォルト）
-    if let Some(ref query_map) = conditions.query {
-        for (key, value_pattern) in query_map {
-            let query_value = query.get(key).map(|s| s.as_str()).unwrap_or("");
-            if !matches_wildcard(value_pattern, query_value) {
+
+    // query条件のチェック（条件がある場合のみオンデマンドパース）
+    if let Some(ref query_conds) = conditions.query {
+        for (key, value_pattern) in query_conds {
+            let query_value = find_query_value(raw_query, key);
+            if !matches_wildcard(value_pattern, &query_value) {
                 return false;
             }
         }
     }
-    // query条件がNoneの場合は、すべてのクエリパラメータにマッチ（デフォルト動作）
-    
+
     // source_ip条件のチェック
-    // 条件が指定されていない場合は、すべてのIPアドレスにマッチ（デフォルト）
     if let Some(ref ip_ranges) = conditions.source_ip {
         if !matches_cidr(source_ip, ip_ranges) {
             return false;
         }
     }
-    // source_ip条件がNoneの場合は、すべてのIPアドレスにマッチ（デフォルト動作）
-    
-    // すべての条件がマッチした、または条件が指定されていない場合はtrue
+
     true
 }
 
@@ -295,8 +305,8 @@ pub fn find_backend_unified(
     host: &[u8],
     path: &[u8],
     method: &[u8],
-    headers: &HashMap<String, String>,
-    query: &HashMap<String, String>,
+    headers: &[(&[u8], &[u8])],
+    raw_query: &[u8],
     source_ip: &SocketAddr,
     routes: &[Route],
     upstream_groups: &Arc<HashMap<String, Arc<UpstreamGroup>>>,
@@ -323,7 +333,7 @@ pub fn find_backend_unified(
                         path,
                         method,
                         headers,
-                        query,
+                        raw_query,
                         source_ip,
                     ) {
                         if let Ok(backend) = load_backend(route, upstream_groups) {
@@ -351,7 +361,7 @@ pub fn find_backend_unified(
         // 候補がない場合はフォールバック（全ルート走査）
         // これはOptimizedRouterの構築が不完全な場合のセーフティネット
         return find_backend_linear(
-            host, path, method, headers, query, source_ip,
+            host, path, method, headers, raw_query, source_ip,
             routes, upstream_groups, &cache_key, optimized_router
         );
     }
@@ -366,7 +376,7 @@ pub fn find_backend_unified(
                 &route.conditions,
                 method,
                 headers,
-                query,
+                raw_query,
             );
 
             if matched {
@@ -425,26 +435,26 @@ pub(crate) fn extract_path_prefix(route: &Route) -> Box<[u8]> {
 }
 
 /// 残りの条件（host/path/source_ip以外）のみをチェック
-/// 
-/// OptimizedRouterで既にhost/path/source_ipはフィルタ済み
+///
+/// OptimizedRouter で既に host/path/source_ip はフィルタ済み。
+/// HashMap を使わずバイト列を直接照合することでアロケーションゼロ。
 #[inline]
 pub(crate) fn matches_remaining_conditions(
     conditions: &RouteConditions,
     method: &[u8],
-    headers: &HashMap<String, String>,
-    query: &HashMap<String, String>,
+    headers: &[(&[u8], &[u8])],
+    raw_query: &[u8],
 ) -> bool {
-    // header条件のチェック
-    if let Some(ref header_map) = conditions.header {
-        for (key, value_pattern) in header_map {
-            let key_lower = key.to_lowercase();
-            let header_value = headers.get(&key_lower).map(|s| s.as_str()).unwrap_or("");
+    // header条件のチェック（条件がある場合のみ線形探索）
+    if let Some(ref header_conds) = conditions.header {
+        for (key, value_pattern) in header_conds {
+            let header_value = find_header_value(headers, key);
             if !matches_wildcard(value_pattern, header_value) {
                 return false;
             }
         }
     }
-    
+
     // method条件のチェック
     if let Some(ref methods) = conditions.method {
         let method_str = std::str::from_utf8(method).unwrap_or("");
@@ -452,17 +462,17 @@ pub(crate) fn matches_remaining_conditions(
             return false;
         }
     }
-    
-    // query条件のチェック
-    if let Some(ref query_map) = conditions.query {
-        for (key, value_pattern) in query_map {
-            let query_value = query.get(key).map(|s| s.as_str()).unwrap_or("");
-            if !matches_wildcard(value_pattern, query_value) {
+
+    // query条件のチェック（条件がある場合のみオンデマンドパース）
+    if let Some(ref query_conds) = conditions.query {
+        for (key, value_pattern) in query_conds {
+            let query_value = find_query_value(raw_query, key);
+            if !matches_wildcard(value_pattern, &query_value) {
                 return false;
             }
         }
     }
-    
+
     true
 }
 
@@ -471,8 +481,8 @@ pub(crate) fn find_backend_linear(
     host: &[u8],
     path: &[u8],
     method: &[u8],
-    headers: &HashMap<String, String>,
-    query: &HashMap<String, String>,
+    headers: &[(&[u8], &[u8])],
+    raw_query: &[u8],
     source_ip: &SocketAddr,
     routes: &[Route],
     upstream_groups: &Arc<HashMap<String, Arc<UpstreamGroup>>>,
@@ -487,7 +497,7 @@ pub(crate) fn find_backend_linear(
             path,
             method,
             headers,
-            query,
+            raw_query,
             source_ip,
         );
         
