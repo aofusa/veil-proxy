@@ -184,43 +184,6 @@ veil: TLS certificate not found: /path/to/cert.pem
 
 **注意**: SIGHUPによる設定リロード時、新しい設定が不正な場合はリロードが拒否され、サーバーは以前の有効な設定で動作を継続します。
 
-## HTTP to HTTPS リダイレクト
-
-HTTPアクセスを自動的にHTTPSにリダイレクトする機能です。
-
-### 設定
-
-```toml
-[server]
-listen = "0.0.0.0:443"
-http = "0.0.0.0:80"  # HTTPリダイレクトを有効化
-```
-
-### 動作
-
-- `http://example.com/path` へのアクセスは `https://example.com/path` に301リダイレクト
-- Hostヘッダーからドメイン名を取得し、リダイレクト先URLを構築
-- **ポートの動作**: リダイレクト先URLは `[server].listen` 設定のポートを使用
-  - listenポートが443の場合（デフォルト）: `https://example.com/path`（ポート省略）
-  - listenポートが8443の場合: `https://example.com:8443/path`（ポート包含）
-
-### セキュリティ考慮事項
-
-- **リダイレクト専用**: HTTPではリダイレクトのみを行い、コンテンツは一切配信しません
-- **301 Moved Permanently**: ブラウザがリダイレクト先をキャッシュするため、2回目以降は直接HTTPSにアクセスします
-- **初回アクセス**: 初回HTTPアクセス時のみ平文通信が発生しますが、コンテンツは含まれません
-
-### 注意事項
-
-- 特権ポート（80番）を使用するため、以下のいずれかが必要です：
-  1. rootで起動（権限降格機能と併用を推奨）
-  2. `CAP_NET_BIND_SERVICE`ケイパビリティを付与
-
-```bash
-# ケイパビリティを付与する場合
-sudo setcap 'cap_net_bind_service=+ep' ./target/release/veil
-```
-
 ## TLS証明書の生成
 
 開発・テスト用の自己署名証明書を生成するには、以下のコマンドを実行します：
@@ -260,6 +223,43 @@ key_path = "./server.key"
 ```bash
 # ビルド
 cargo build --release --features ktls
+```
+
+## HTTP to HTTPS リダイレクト
+
+HTTPアクセスを自動的にHTTPSにリダイレクトする機能です。
+
+### 設定
+
+```toml
+[server]
+listen = "0.0.0.0:443"
+http = "0.0.0.0:80"  # HTTPリダイレクトを有効化
+```
+
+### 動作
+
+- `http://example.com/path` へのアクセスは `https://example.com/path` に301リダイレクト
+- Hostヘッダーからドメイン名を取得し、リダイレクト先URLを構築
+- **ポートの動作**: リダイレクト先URLは `[server].listen` 設定のポートを使用
+  - listenポートが443の場合（デフォルト）: `https://example.com/path`（ポート省略）
+  - listenポートが8443の場合: `https://example.com:8443/path`（ポート包含）
+
+### セキュリティ考慮事項
+
+- **リダイレクト専用**: HTTPではリダイレクトのみを行い、コンテンツは一切配信しません
+- **301 Moved Permanently**: ブラウザがリダイレクト先をキャッシュするため、2回目以降は直接HTTPSにアクセスします
+- **初回アクセス**: 初回HTTPアクセス時のみ平文通信が発生しますが、コンテンツは含まれません
+
+### 注意事項
+
+- 特権ポート（80番）を使用するため、以下のいずれかが必要です：
+  1. rootで起動（権限降格機能と併用を推奨）
+  2. `CAP_NET_BIND_SERVICE`ケイパビリティを付与
+
+```bash
+# ケイパビリティを付与する場合
+sudo setcap 'cap_net_bind_service=+ep' ./target/release/veil
 ```
 
 ## 設定
@@ -1290,6 +1290,223 @@ IP制限は **deny → allow** の順で評価されます（denyが優先）。
 | 単一IPv6 | `::1` |
 | IPv6 CIDR | `2001:db8::/32` |
 
+## ロードバランシング
+
+複数のバックエンドサーバーへのリクエスト分散に対応しています。
+
+### アルゴリズム
+
+| アルゴリズム | 説明 | 用途 |
+|-------------|------|------|
+| `round_robin` | 順番に振り分け（デフォルト） | 汎用 |
+| `least_conn` | 接続数が最小のサーバーを選択 | 長時間接続 |
+| `ip_hash` | クライアントIPでハッシュ | セッション維持 |
+
+### 設定例
+
+```toml
+# Upstreamグループの定義（文字列形式）
+[upstreams."backend-pool"]
+algorithm = "round_robin"
+servers = [
+  "http://localhost:8080",
+  "http://localhost:8081",
+  "http://localhost:8082"
+]
+
+# ルートでUpstreamを参照
+[[route]]
+[route.conditions]
+host = "example.com"
+path = "/api/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"  # URLの代わりにupstreamを指定
+```
+
+#### SNI名付きHTTPSバックエンド
+
+IPアドレス指定のHTTPSバックエンドに対してSNI名を指定できます：
+
+```toml
+# HTTPSバックエンドプール（構造体形式と文字列形式の混在）
+[upstreams."https-api-pool"]
+algorithm = "least_conn"
+servers = [
+  # 構造体形式: IPアドレス + SNI名指定
+  { url = "https://192.168.1.100:443", sni_name = "api.internal.example.com" },
+  { url = "https://192.168.1.101:443", sni_name = "api.internal.example.com" },
+  # 文字列形式: ドメイン名指定（SNI名は自動的にURLのホスト名）
+  "https://api.example.com:443"
+]
+```
+
+### 単一バックエンドとの互換性
+
+従来の `url` 指定も引き続き使用可能です：
+
+```toml
+# 従来の単一バックエンド指定
+[[route]]
+[route.conditions]
+host = "example.com"
+path = "/simple/*"
+[route.action]
+type = "Proxy"
+url = "http://localhost:8080"
+```
+
+## ヘルスチェック（Health Check）
+
+バックエンドサーバーの健康状態を監視し、異常なサーバーを自動的に除外します。
+
+### 動作
+
+1. バックグラウンドスレッドで定期的にHTTPリクエストを送信
+2. レスポンスのステータスコードをチェック
+3. 連続失敗回数が閾値に達したらサーバーを除外
+4. 連続成功回数が閾値に達したらサーバーを復帰
+
+### 設定オプション
+
+| オプション | 説明 | デフォルト |
+|-----------|------|-----------|
+| `interval_secs` | チェック間隔（秒） | 10 |
+| `path` | チェック対象パス | `/` |
+| `timeout_secs` | タイムアウト（秒） | 5 |
+| `healthy_statuses` | 成功と判断するステータスコード | [200, 201, 202, 204, 301, 302, 304] |
+| `unhealthy_threshold` | unhealthyにする連続失敗回数 | 3 |
+| `healthy_threshold` | healthyに戻す連続成功回数 | 2 |
+| `use_tls` | TLS接続を使用したヘルスチェック | **false** |
+| `verify_cert` | TLS証明書の検証（use_tls=true時のみ有効） | **true** |
+
+### 設定例
+
+```toml
+[upstreams."api-servers"]
+algorithm = "least_conn"
+servers = [
+  "http://api1.internal:8080",
+  "http://api2.internal:8080",
+  "http://api3.internal:8080"
+]
+
+  [upstreams."api-servers".health_check]
+  interval_secs = 10
+  path = "/health"
+  timeout_secs = 5
+  healthy_statuses = [200]
+  unhealthy_threshold = 3
+  healthy_threshold = 2
+  # TLSヘルスチェック（HTTPSバックエンド用）
+  use_tls = false
+  verify_cert = true
+```
+
+### TLSヘルスチェック
+
+`use_tls = true` を設定すると、プレーンHTTPではなくTLS接続を使用してヘルスチェックを実行します。HTTPSバックエンドの監視に有用です。
+
+**TLSヘルスチェックの設定例:**
+
+```toml
+[upstreams."api-servers"]
+algorithm = "least_conn"
+servers = [
+  "https://api1.internal:8443",
+  "https://api2.internal:8443"
+]
+
+  [upstreams."api-servers".health_check]
+  interval_secs = 10
+  path = "/health"
+  timeout_secs = 5
+  healthy_statuses = [200]
+  # TLSヘルスチェックを有効化
+  use_tls = true
+  # 証明書検証（自己署名証明書の場合はfalseに設定）
+  verify_cert = true
+```
+
+> **Note**: `verify_cert = false` に設定すると、自己署名証明書が許可されます。開発環境では有用ですが、本番環境では推奨されません。
+
+### ログ出力
+
+健康状態の変化はログに出力されます：
+
+```
+[INFO] Upstream api1.internal:8080 is now unhealthy
+[INFO] Upstream api1.internal:8080 is now healthy
+```
+
+## リダイレクト
+
+HTTPリダイレクト（301/302/303/307/308）を設定できます。WWW非対応、HTTPS強制、旧URL移行などに使用します。
+
+### 設定オプション
+
+| オプション | 説明 | デフォルト |
+|-----------|------|-----------|
+| `redirect_url` | リダイレクト先URL（必須） | - |
+| `redirect_status` | ステータスコード（301, 302, 303, 307, 308） | 301 |
+| `preserve_path` | 元のパスをリダイレクト先に追加するか | false |
+
+### ステータスコードの使い分け
+
+| コード | 説明 | 用途 |
+|--------|------|------|
+| 301 | Moved Permanently | 永続的な移転（SEO引き継ぎ） |
+| 302 | Found | 一時的なリダイレクト |
+| 303 | See Other | POSTからGETへのリダイレクト |
+| 307 | Temporary Redirect | 一時的（メソッド維持） |
+| 308 | Permanent Redirect | 永続的（メソッド維持） |
+
+### 設定例
+
+```toml
+# WWWへのリダイレクト
+[[route]]
+[route.conditions]
+host = "example.com"
+path = "/"
+[route.action]
+type = "Redirect"
+redirect_url = "https://www.example.com/"
+redirect_status = 301
+
+# 旧URLから新URLへの移行（パス保持）
+[[route]]
+[route.conditions]
+host = "example.com"
+path = "/legacy/*"
+[route.action]
+type = "Redirect"
+redirect_url = "https://example.com/v2"
+redirect_status = 301
+preserve_path = true
+# /legacy/users → https://example.com/v2/users
+# /legacy/api/data → https://example.com/v2/api/data
+
+# HTTPからHTTPSへの強制リダイレクト（別のhostで設定）
+[[route]]
+[route.conditions]
+host = "http.example.com"
+path = "/"
+[route.action]
+type = "Redirect"
+redirect_url = "https://example.com$request_uri"
+redirect_status = 301
+```
+
+### 特殊変数
+
+`redirect_url` では以下の変数を使用できます：
+
+| 変数 | 説明 |
+|------|------|
+| `$request_uri` | 元のリクエストURI |
+| `$path` | prefix除去後のパス部分 |
+
 ## ヘッダー操作
 
 リクエスト/レスポンスヘッダーの追加・削除が可能です。X-Real-IP、X-Forwarded-Proto、HSTSなどのセキュリティヘッダーを設定できます。
@@ -1386,74 +1603,6 @@ server_header_value = "MyServer/1.0"
 - **開発/テスト**: どのサーバーが応答しているかを識別するために有効化
 - **本番環境**: サーバー情報を隠すために無効化（セキュリティベストプラクティス）
 - **カスタムブランディング**: Serverヘッダーが必要な場合にカスタム値を設定
-
-## リダイレクト
-
-HTTPリダイレクト（301/302/303/307/308）を設定できます。WWW非対応、HTTPS強制、旧URL移行などに使用します。
-
-### 設定オプション
-
-| オプション | 説明 | デフォルト |
-|-----------|------|-----------|
-| `redirect_url` | リダイレクト先URL（必須） | - |
-| `redirect_status` | ステータスコード（301, 302, 303, 307, 308） | 301 |
-| `preserve_path` | 元のパスをリダイレクト先に追加するか | false |
-
-### ステータスコードの使い分け
-
-| コード | 説明 | 用途 |
-|--------|------|------|
-| 301 | Moved Permanently | 永続的な移転（SEO引き継ぎ） |
-| 302 | Found | 一時的なリダイレクト |
-| 303 | See Other | POSTからGETへのリダイレクト |
-| 307 | Temporary Redirect | 一時的（メソッド維持） |
-| 308 | Permanent Redirect | 永続的（メソッド維持） |
-
-### 設定例
-
-```toml
-# WWWへのリダイレクト
-[[route]]
-[route.conditions]
-host = "example.com"
-path = "/"
-[route.action]
-type = "Redirect"
-redirect_url = "https://www.example.com/"
-redirect_status = 301
-
-# 旧URLから新URLへの移行（パス保持）
-[[route]]
-[route.conditions]
-host = "example.com"
-path = "/legacy/*"
-[route.action]
-type = "Redirect"
-redirect_url = "https://example.com/v2"
-redirect_status = 301
-preserve_path = true
-# /legacy/users → https://example.com/v2/users
-# /legacy/api/data → https://example.com/v2/api/data
-
-# HTTPからHTTPSへの強制リダイレクト（別のhostで設定）
-[[route]]
-[route.conditions]
-host = "http.example.com"
-path = "/"
-[route.action]
-type = "Redirect"
-redirect_url = "https://example.com$request_uri"
-redirect_status = 301
-```
-
-### 特殊変数
-
-`redirect_url` では以下の変数を使用できます：
-
-| 変数 | 説明 |
-|------|------|
-| `$request_uri` | 元のリクエストURI |
-| `$path` | prefix除去後のパス部分 |
 
 ## レスポンス圧縮
 
@@ -1779,117 +1928,65 @@ Content-Length 不明（chunked）       → ストリーミング
 
 > **Note**: kTLSで最大パフォーマンスを得るには、低レイテンシが重要なルートで `streaming` モードを使用してください。
 
-## Prometheusメトリクス
+## WebSocketサポート
 
-リクエスト数、レイテンシ、ボディサイズなどのメトリクスをPrometheus形式でエクスポートします。
+WebSocket（RFC 6455）のプロキシに対応しています。
+`Connection: Upgrade` と `Upgrade: websocket` ヘッダーを自動検出し、
+双方向のデータ転送を行います。
 
-### 有効化
+### 動作
 
-Prometheusメトリクスはデフォルトで**無効**です。`[prometheus]` セクションで明示的に有効化する必要があります。
+1. クライアントからの Upgrade リクエストを検出
+2. バックエンドに Upgrade リクエストを転送
+3. 101 Switching Protocols を受信
+4. 双方向のバイパス転送を開始（設定されたポーリングモードで動作）
+5. どちらかの接続が閉じるまで継続
 
-```toml
-[prometheus]
-enabled = true
-```
+### ポーリングモード
 
-> **Note**: `[prometheus]` セクション自体が存在しない場合も、メトリクスは無効です。
+WebSocket双方向転送時のポーリング動作を設定で制御できます。
 
-### 設定オプション
+| モード | 説明 | 用途 |
+|--------|------|------|
+| `adaptive`（デフォルト） | データ転送時は短く、アイドル時は長くなる | 汎用、CPU効率重視 |
+| `fixed` | 常に固定のタイムアウトを使用 | リアルタイムゲーム、低レイテンシ最優先 |
 
-| オプション | 説明 | デフォルト |
-|-----------|------|-----------|
-| `enabled` | メトリクスエンドポイントを有効化 | **false** |
-| `path` | メトリクスエンドポイントのパス | `/__metrics` |
-| `allowed_ips` | アクセスを許可するIP/CIDR（配列） | []（すべて許可） |
+詳細な設定オプションは「[WebSocket設定](#websocket設定)」セクションを参照してください。
 
-### エンドポイント
+### 設定例
 
-```
-GET /__metrics
-```
-
-`path` オプションでエンドポイントのパスを変更できます。
-
-### 利用可能なメトリクス
-
-| メトリクス | タイプ | ラベル | 説明 |
-|-----------|--------|--------|------|
-| `veil_proxy_http_requests_total` | Counter | method, status, host | リクエスト総数 |
-| `veil_proxy_http_request_duration_seconds` | Histogram | method, host | リクエスト処理時間（秒） |
-| `veil_proxy_http_request_size_bytes` | Histogram | - | リクエストボディサイズ |
-| `veil_proxy_http_response_size_bytes` | Histogram | - | レスポンスボディサイズ |
-| `veil_proxy_http_active_connections` | Gauge | host | アクティブな接続数 |
-| `veil_proxy_http_upstream_health` | Gauge | upstream, server | アップストリーム健康状態（1=healthy, 0=unhealthy） |
-| `veil_proxy_cache_hits_total` | Counter | host | キャッシュヒット総数 |
-| `veil_proxy_cache_misses_total` | Counter | host | キャッシュミス総数 |
-| `veil_proxy_cache_stores_total` | Counter | host, storage | キャッシュ保存操作総数 |
-| `veil_proxy_cache_size_bytes` | Gauge | storage | 現在のキャッシュサイズ（バイト） |
-| `veil_proxy_cache_entries` | Gauge | storage | 現在のキャッシュエントリ数 |
-| `veil_proxy_buffering_used_total` | Counter | host | バッファリング使用リクエスト総数 |
-
-### Grafanaダッシュボード例
-
-```promql
-# リクエストレート（リクエスト/秒）
-rate(veil_proxy_http_requests_total[5m])
-
-# エラー率（4xx + 5xx）
-sum(rate(veil_proxy_http_requests_total{status=~"4..|5.."}[5m])) 
-  / sum(rate(veil_proxy_http_requests_total[5m]))
-
-# レイテンシP95
-histogram_quantile(0.95, rate(veil_proxy_http_request_duration_seconds_bucket[5m]))
-
-# ホスト別リクエストレート
-sum by (host) (rate(veil_proxy_http_requests_total[5m]))
-```
-
-### 設定例（config.toml）
+WebSocketは通常のProxyバックエンドで自動的にサポートされます：
 
 ```toml
-# 基本設定（全IPからアクセス可能）
-[prometheus]
-enabled = true
-path = "/__metrics"
+# WebSocketアプリケーション（デフォルト設定）
+[[route]]
+[route.conditions]
+host = "example.com"
+path = "/ws/*"
+[route.action]
+type = "Proxy"
+url = "http://localhost:3000"
 
-# セキュリティ強化版（内部ネットワークのみ許可）
-[prometheus]
-enabled = true
-path = "/metrics"
-allowed_ips = [
-  "127.0.0.1",
-  "::1",
-  "10.0.0.0/8",
-  "172.16.0.0/12",
-  "192.168.0.0/16"
-]
+# 低レイテンシ設定（リアルタイムゲーム向け）
+[[route]]
+[route.conditions]
+host = "game.example.com"
+path = "/ws/*"
+[route.action]
+type = "Proxy"
+url = "http://localhost:3001"
+
+[route.security]
+  websocket_poll_mode = "fixed"
+  websocket_poll_timeout_ms = 1
 ```
 
-### アクセス制御
+### 対応バックエンド
 
-`allowed_ips` を設定すると、指定したIPアドレス/CIDRからのみメトリクスエンドポイントにアクセス可能になります。
-空の場合（デフォルト）は全てのIPからアクセス可能です。
-
-| 形式 | 例 |
-|------|-----|
-| 単一IPv4 | `127.0.0.1` |
-| IPv4 CIDR | `10.0.0.0/8` |
-| 単一IPv6 | `::1` |
-| IPv6 CIDR | `2001:db8::/32` |
-
-### Prometheus設定例
-
-```yaml
-# prometheus.yml
-scrape_configs:
-  - job_name: 'veil-proxy'
-    static_configs:
-      - targets: ['your-proxy-server:443']
-    scheme: https
-    tls_config:
-      insecure_skip_verify: true  # 自己署名証明書の場合
-    metrics_path: /__metrics
-```
+| プロトコル | サポート |
+|-----------|---------|
+| HTTP → WS | ✅ |
+| HTTPS → WSS | ✅ |
 
 ## HTTP/2サポート
 
@@ -2196,6 +2293,347 @@ ktls_fallback_enabled = false  # kTLS必須モード
 | カーネルバグ | カーネルバージョン固定、定期的なパッチ適用 |
 | セッションキー露出 | TLSハンドシェイクはユーザースペース（rustls）で実行（PFS維持） |
 | DoS攻撃 | カーネルリソース監視、レート制限 |
+
+## WASM拡張機能
+
+VeilはProxy-Wasm ABI v0.2.1に完全準拠したWASM拡張システムを提供します。Nginx/Envoy向けに作成されたProxy-WasmモジュールをそのままVeilで使用できます。
+
+### 特徴
+
+- **Proxy-Wasm v0.2.1準拠**: Nginx/Envoyと100%互換
+- **AOTコンパイル**: `.cwasm`ファイルによる高速起動
+- **Pooling Allocator**: 高速なインスタンス化
+- **Capability制限**: モジュールごとの細かい権限制御（デフォルト全て無効）
+
+### ビルド
+
+```bash
+cargo build --release --features wasm
+```
+
+### 設定
+
+```toml
+[wasm]
+enabled = true
+
+# デフォルト設定（オプション）
+[wasm.defaults]
+# 最大実行時間（ミリ秒、デフォルト: 100）
+max_execution_time_ms = 100
+
+  # Poolingアロケータ設定
+  [wasm.defaults.pooling]
+  # メモリプール総数（デフォルト: 128）
+  total_memories = 128
+  # テーブルプール総数（デフォルト: 128）
+  total_tables = 128
+  # インスタンスごとの最大メモリサイズ（デフォルト: 10MB）
+  max_memory_size = 10485760
+
+# モジュール定義
+[[wasm.modules]]
+name = "my_filter"
+path = "/etc/veil/wasm/my_filter.wasm"
+configuration = '{"key": "value"}'
+
+[wasm.modules.capabilities]
+# 全てデフォルトfalse、必要な権限のみ有効化
+allow_logging = true
+allow_request_headers_read = true
+allow_request_headers_write = true
+allow_send_local_response = true
+allow_http_calls = true
+allowed_upstreams = ["webdis"]  # HTTP呼び出し許可先
+```
+
+**注意**: 特定のルートにWASMモジュールを適用するには、ルート設定の`modules`フィールドを使用してください（ルーティングセクションを参照）。
+
+### デフォルト設定
+
+`[wasm.defaults]` セクションでは、WASMランタイムのグローバル設定を行えます：
+
+| オプション | 説明 | デフォルト |
+|-----------|------|-----------|
+| `max_execution_time_ms` | WASM呼び出しごとの最大実行時間（ミリ秒） | 100 |
+
+#### Poolingアロケータ設定
+
+`[wasm.defaults.pooling]` セクションでは、高速インスタンス化のためのPoolingアロケータを設定します：
+
+| オプション | 説明 | デフォルト |
+|-----------|------|-----------|
+| `total_memories` | メモリプール総数 | 128 |
+| `total_tables` | テーブルプール総数 | 128 |
+| `max_memory_size` | インスタンスごとの最大メモリサイズ（バイト） | 10MB (10485760) |
+
+### Capability一覧
+
+| Capability | 説明 | デフォルト |
+|-----------|------|----------|
+| `allow_logging` | ログ出力 | false |
+| `allow_metrics` | メトリクス操作 | false |
+| `allow_shared_data` | 共有データ | false |
+| `allow_request_headers_read` | リクエストヘッダー読み取り | false |
+| `allow_request_headers_write` | リクエストヘッダー書き換え | false |
+| `allow_request_body_read` | リクエストボディ読み取り | false |
+| `allow_request_body_write` | リクエストボディ書き換え | false |
+| `allow_response_headers_read` | レスポンスヘッダー読み取り | false |
+| `allow_response_headers_write` | レスポンスヘッダー書き換え | false |
+| `allow_response_body_read` | レスポンスボディ読み取り | false |
+| `allow_response_body_write` | レスポンスボディ書き換え | false |
+| `allow_send_local_response` | ローカルレスポンス送信 | false |
+| `allow_http_calls` | HTTP外部呼び出し | false |
+| `allowed_upstreams` | 許可upstream | [] |
+
+### Rustによる拡張機能開発
+
+#### 1. プロジェクト作成
+
+```bash
+cargo new --lib my-filter
+cd my-filter
+```
+
+#### 2. Cargo.toml
+
+```toml
+[package]
+name = "my-filter"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+proxy-wasm = "0.2"
+log = "0.4"
+
+[profile.release]
+lto = true
+opt-level = "s"
+
+[workspace]
+```
+
+#### 3. src/lib.rs
+
+```rust
+use proxy_wasm::traits::*;
+use proxy_wasm::types::*;
+
+proxy_wasm::main! {{
+    proxy_wasm::set_log_level(LogLevel::Debug);
+    proxy_wasm::set_root_context(|_| -> Box<dyn RootContext> {
+        Box::new(MyFilterRoot)
+    });
+}}
+
+struct MyFilterRoot;
+
+impl Context for MyFilterRoot {}
+
+impl RootContext for MyFilterRoot {
+    fn get_type(&self) -> Option<ContextType> {
+        Some(ContextType::HttpContext)
+    }
+
+    fn create_http_context(&self, context_id: u32) -> Option<Box<dyn HttpContext>> {
+        Some(Box::new(MyFilter { context_id }))
+    }
+}
+
+struct MyFilter {
+    context_id: u32,
+}
+
+impl Context for MyFilter {}
+
+impl HttpContext for MyFilter {
+    fn on_http_request_headers(&mut self, _: usize, _: bool) -> Action {
+        // リクエストヘッダーにカスタムヘッダーを追加
+        self.add_http_request_header("X-My-Filter", "enabled");
+        
+        // ヘッダー値を取得
+        if let Some(path) = self.get_http_request_header(":path") {
+            log::info!("Request path: {}", path);
+        }
+        
+        Action::Continue
+    }
+
+    fn on_http_response_headers(&mut self, _: usize, _: bool) -> Action {
+        // レスポンスヘッダーを追加
+        self.add_http_response_header("X-Processed-By", "my-filter");
+        Action::Continue
+    }
+}
+```
+
+#### 4. ビルド
+
+```bash
+# WASIターゲットを追加
+rustup target add wasm32-wasip1
+
+# ビルド
+cargo build --target wasm32-wasip1 --release
+
+# 出力: target/wasm32-wasip1/release/my_filter.wasm
+```
+
+#### 5. 配置と設定
+
+```bash
+# WASMモジュールを配置
+cp target/wasm32-wasip1/release/my_filter.wasm /etc/veil/wasm/
+
+# config.tomlに設定を追加
+```
+
+### 外部サービス連携（HTTP呼び出し）
+
+Proxy-Wasmの`dispatch_http_call`を使用して外部HTTPサービス（Redis用Webdis等）を呼び出せます：
+
+```rust
+fn on_http_request_headers(&mut self, _: usize, _: bool) -> Action {
+    // Webdis経由でRedisにアクセス
+    self.dispatch_http_call(
+        "webdis",  // upstream名（config.tomlで定義）
+        vec![
+            (":method", "GET"),
+            (":path", "/GET/my_key"),
+            (":authority", "webdis"),
+        ],
+        None,
+        vec![],
+        Duration::from_millis(50),
+    ).unwrap();
+    
+    Action::Pause  // レスポンス待ち
+}
+
+fn on_http_call_response(&mut self, _: u32, _: usize, body_size: usize, _: usize) {
+    if let Some(body) = self.get_http_call_response_body(0, body_size) {
+        // Redisからの値を処理
+        log::info!("Redis response: {:?}", body);
+    }
+    self.resume_http_request();
+}
+```
+
+## Prometheusメトリクス
+
+リクエスト数、レイテンシ、ボディサイズなどのメトリクスをPrometheus形式でエクスポートします。
+
+### 有効化
+
+Prometheusメトリクスはデフォルトで**無効**です。`[prometheus]` セクションで明示的に有効化する必要があります。
+
+```toml
+[prometheus]
+enabled = true
+```
+
+> **Note**: `[prometheus]` セクション自体が存在しない場合も、メトリクスは無効です。
+
+### 設定オプション
+
+| オプション | 説明 | デフォルト |
+|-----------|------|-----------|
+| `enabled` | メトリクスエンドポイントを有効化 | **false** |
+| `path` | メトリクスエンドポイントのパス | `/__metrics` |
+| `allowed_ips` | アクセスを許可するIP/CIDR（配列） | []（すべて許可） |
+
+### エンドポイント
+
+```
+GET /__metrics
+```
+
+`path` オプションでエンドポイントのパスを変更できます。
+
+### 利用可能なメトリクス
+
+| メトリクス | タイプ | ラベル | 説明 |
+|-----------|--------|--------|------|
+| `veil_proxy_http_requests_total` | Counter | method, status, host | リクエスト総数 |
+| `veil_proxy_http_request_duration_seconds` | Histogram | method, host | リクエスト処理時間（秒） |
+| `veil_proxy_http_request_size_bytes` | Histogram | - | リクエストボディサイズ |
+| `veil_proxy_http_response_size_bytes` | Histogram | - | レスポンスボディサイズ |
+| `veil_proxy_http_active_connections` | Gauge | host | アクティブな接続数 |
+| `veil_proxy_http_upstream_health` | Gauge | upstream, server | アップストリーム健康状態（1=healthy, 0=unhealthy） |
+| `veil_proxy_cache_hits_total` | Counter | host | キャッシュヒット総数 |
+| `veil_proxy_cache_misses_total` | Counter | host | キャッシュミス総数 |
+| `veil_proxy_cache_stores_total` | Counter | host, storage | キャッシュ保存操作総数 |
+| `veil_proxy_cache_size_bytes` | Gauge | storage | 現在のキャッシュサイズ（バイト） |
+| `veil_proxy_cache_entries` | Gauge | storage | 現在のキャッシュエントリ数 |
+| `veil_proxy_buffering_used_total` | Counter | host | バッファリング使用リクエスト総数 |
+
+### Grafanaダッシュボード例
+
+```promql
+# リクエストレート（リクエスト/秒）
+rate(veil_proxy_http_requests_total[5m])
+
+# エラー率（4xx + 5xx）
+sum(rate(veil_proxy_http_requests_total{status=~"4..|5.."}[5m])) 
+  / sum(rate(veil_proxy_http_requests_total[5m]))
+
+# レイテンシP95
+histogram_quantile(0.95, rate(veil_proxy_http_request_duration_seconds_bucket[5m]))
+
+# ホスト別リクエストレート
+sum by (host) (rate(veil_proxy_http_requests_total[5m]))
+```
+
+### 設定例（config.toml）
+
+```toml
+# 基本設定（全IPからアクセス可能）
+[prometheus]
+enabled = true
+path = "/__metrics"
+
+# セキュリティ強化版（内部ネットワークのみ許可）
+[prometheus]
+enabled = true
+path = "/metrics"
+allowed_ips = [
+  "127.0.0.1",
+  "::1",
+  "10.0.0.0/8",
+  "172.16.0.0/12",
+  "192.168.0.0/16"
+]
+```
+
+### アクセス制御
+
+`allowed_ips` を設定すると、指定したIPアドレス/CIDRからのみメトリクスエンドポイントにアクセス可能になります。
+空の場合（デフォルト）は全てのIPからアクセス可能です。
+
+| 形式 | 例 |
+|------|-----|
+| 単一IPv4 | `127.0.0.1` |
+| IPv4 CIDR | `10.0.0.0/8` |
+| 単一IPv6 | `::1` |
+| IPv6 CIDR | `2001:db8::/32` |
+
+### Prometheus設定例
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: 'veil-proxy'
+    static_configs:
+      - targets: ['your-proxy-server:443']
+    scheme: https
+    tls_config:
+      insecure_skip_verify: true  # 自己署名証明書の場合
+    metrics_path: /__metrics
+```
 
 ## パフォーマンスチューニング
 
@@ -2625,215 +3063,6 @@ kill -SIGHUP $(pgrep veil)
 | リッスンアドレス | ❌（再起動が必要） |
 | ワーカースレッド数 | ❌（再起動が必要） |
 
-## WebSocketサポート
-
-WebSocket（RFC 6455）のプロキシに対応しています。
-`Connection: Upgrade` と `Upgrade: websocket` ヘッダーを自動検出し、
-双方向のデータ転送を行います。
-
-### 動作
-
-1. クライアントからの Upgrade リクエストを検出
-2. バックエンドに Upgrade リクエストを転送
-3. 101 Switching Protocols を受信
-4. 双方向のバイパス転送を開始（設定されたポーリングモードで動作）
-5. どちらかの接続が閉じるまで継続
-
-### ポーリングモード
-
-WebSocket双方向転送時のポーリング動作を設定で制御できます。
-
-| モード | 説明 | 用途 |
-|--------|------|------|
-| `adaptive`（デフォルト） | データ転送時は短く、アイドル時は長くなる | 汎用、CPU効率重視 |
-| `fixed` | 常に固定のタイムアウトを使用 | リアルタイムゲーム、低レイテンシ最優先 |
-
-詳細な設定オプションは「[WebSocket設定](#websocket設定)」セクションを参照してください。
-
-### 設定例
-
-WebSocketは通常のProxyバックエンドで自動的にサポートされます：
-
-```toml
-# WebSocketアプリケーション（デフォルト設定）
-[[route]]
-[route.conditions]
-host = "example.com"
-path = "/ws/*"
-[route.action]
-type = "Proxy"
-url = "http://localhost:3000"
-
-# 低レイテンシ設定（リアルタイムゲーム向け）
-[[route]]
-[route.conditions]
-host = "game.example.com"
-path = "/ws/*"
-[route.action]
-type = "Proxy"
-url = "http://localhost:3001"
-
-[route.security]
-  websocket_poll_mode = "fixed"
-  websocket_poll_timeout_ms = 1
-```
-
-### 対応バックエンド
-
-| プロトコル | サポート |
-|-----------|---------|
-| HTTP → WS | ✅ |
-| HTTPS → WSS | ✅ |
-
-## ロードバランシング
-
-複数のバックエンドサーバーへのリクエスト分散に対応しています。
-
-### アルゴリズム
-
-| アルゴリズム | 説明 | 用途 |
-|-------------|------|------|
-| `round_robin` | 順番に振り分け（デフォルト） | 汎用 |
-| `least_conn` | 接続数が最小のサーバーを選択 | 長時間接続 |
-| `ip_hash` | クライアントIPでハッシュ | セッション維持 |
-
-### 設定例
-
-```toml
-# Upstreamグループの定義（文字列形式）
-[upstreams."backend-pool"]
-algorithm = "round_robin"
-servers = [
-  "http://localhost:8080",
-  "http://localhost:8081",
-  "http://localhost:8082"
-]
-
-# ルートでUpstreamを参照
-[[route]]
-[route.conditions]
-host = "example.com"
-path = "/api/*"
-[route.action]
-type = "Proxy"
-upstream = "backend-pool"  # URLの代わりにupstreamを指定
-```
-
-#### SNI名付きHTTPSバックエンド
-
-IPアドレス指定のHTTPSバックエンドに対してSNI名を指定できます：
-
-```toml
-# HTTPSバックエンドプール（構造体形式と文字列形式の混在）
-[upstreams."https-api-pool"]
-algorithm = "least_conn"
-servers = [
-  # 構造体形式: IPアドレス + SNI名指定
-  { url = "https://192.168.1.100:443", sni_name = "api.internal.example.com" },
-  { url = "https://192.168.1.101:443", sni_name = "api.internal.example.com" },
-  # 文字列形式: ドメイン名指定（SNI名は自動的にURLのホスト名）
-  "https://api.example.com:443"
-]
-```
-
-### 単一バックエンドとの互換性
-
-従来の `url` 指定も引き続き使用可能です：
-
-```toml
-# 従来の単一バックエンド指定
-[[route]]
-[route.conditions]
-host = "example.com"
-path = "/simple/*"
-[route.action]
-type = "Proxy"
-url = "http://localhost:8080"
-```
-
-## ヘルスチェック（Health Check）
-
-バックエンドサーバーの健康状態を監視し、異常なサーバーを自動的に除外します。
-
-### 動作
-
-1. バックグラウンドスレッドで定期的にHTTPリクエストを送信
-2. レスポンスのステータスコードをチェック
-3. 連続失敗回数が閾値に達したらサーバーを除外
-4. 連続成功回数が閾値に達したらサーバーを復帰
-
-### 設定オプション
-
-| オプション | 説明 | デフォルト |
-|-----------|------|-----------|
-| `interval_secs` | チェック間隔（秒） | 10 |
-| `path` | チェック対象パス | `/` |
-| `timeout_secs` | タイムアウト（秒） | 5 |
-| `healthy_statuses` | 成功と判断するステータスコード | [200, 201, 202, 204, 301, 302, 304] |
-| `unhealthy_threshold` | unhealthyにする連続失敗回数 | 3 |
-| `healthy_threshold` | healthyに戻す連続成功回数 | 2 |
-| `use_tls` | TLS接続を使用したヘルスチェック | **false** |
-| `verify_cert` | TLS証明書の検証（use_tls=true時のみ有効） | **true** |
-
-### 設定例
-
-```toml
-[upstreams."api-servers"]
-algorithm = "least_conn"
-servers = [
-  "http://api1.internal:8080",
-  "http://api2.internal:8080",
-  "http://api3.internal:8080"
-]
-
-  [upstreams."api-servers".health_check]
-  interval_secs = 10
-  path = "/health"
-  timeout_secs = 5
-  healthy_statuses = [200]
-  unhealthy_threshold = 3
-  healthy_threshold = 2
-  # TLSヘルスチェック（HTTPSバックエンド用）
-  use_tls = false
-  verify_cert = true
-```
-
-### TLSヘルスチェック
-
-`use_tls = true` を設定すると、プレーンHTTPではなくTLS接続を使用してヘルスチェックを実行します。HTTPSバックエンドの監視に有用です。
-
-**TLSヘルスチェックの設定例:**
-
-```toml
-[upstreams."api-servers"]
-algorithm = "least_conn"
-servers = [
-  "https://api1.internal:8443",
-  "https://api2.internal:8443"
-]
-
-  [upstreams."api-servers".health_check]
-  interval_secs = 10
-  path = "/health"
-  timeout_secs = 5
-  healthy_statuses = [200]
-  # TLSヘルスチェックを有効化
-  use_tls = true
-  # 証明書検証（自己署名証明書の場合はfalseに設定）
-  verify_cert = true
-```
-
-> **Note**: `verify_cert = false` に設定すると、自己署名証明書が許可されます。開発環境では有用ですが、本番環境では推奨されません。
-
-### ログ出力
-
-健康状態の変化はログに出力されます：
-
-```
-[INFO] Upstream api1.internal:8080 is now unhealthy
-[INFO] Upstream api1.internal:8080 is now healthy
-```
-
 ## 設定ファイルバリデーション
 
 起動時に設定ファイルの詳細な検証を行い、問題があれば明確なエラーメッセージを出力します。
@@ -3190,6 +3419,39 @@ ExecStart=/usr/bin/bwrap \
 
 この構成では、systemd が外側の「器」を作り、bubblewrap がさらに厳格なファイルシステムビューを提供します。
 
+## パニックリカバリー
+
+Veilは接続レベルのパニックキャッチを実装し、高可用性を確保しています。
+
+### 動作
+
+リクエスト処理中にパニックが発生した場合：
+
+| シナリオ | 影響 |
+|---------|------|
+| **パニックリカバリーなし** | ワーカースレッドがクラッシュし、そのワーカー上の全接続が終了 |
+| **Veilのパニックリカバリー** | 影響を受けた接続のみ終了、他の接続は正常に継続 |
+
+### 実装
+
+- `std::panic::catch_unwind` を使用して各接続の非同期タスクをラップ
+- パニックはポーリングレベルでキャッチされ、エラーとしてログに記録
+- `ConnectionGuard` によりパニック時も接続カウンターが正しくデクリメント
+- ワーカースレッドは生存し続け、新しい接続を受け付けを継続
+
+### ログ出力
+
+パニックがキャッチされた場合：
+```
+[ERROR] Task panicked during poll: Any { .. }
+```
+
+### 注意事項
+
+- この機能は自動的に有効化されます（設定不要）
+- `monoio::spawn` タスク内のパニックのみを保護
+- accept ループやランタイム初期化時のパニックはワーカースレッドを終了させます
+
 ## 参考資料
 
 ### コアライブラリ
@@ -3240,235 +3502,6 @@ ExecStart=/usr/bin/bwrap \
 - [Wasmtime](https://wasmtime.dev/): WebAssemblyランタイム
 - [proxy-wasm-rust-sdk](https://github.com/proxy-wasm/proxy-wasm-rust-sdk): Rust SDK
 
-## WASM拡張機能
-
-VeilはProxy-Wasm ABI v0.2.1に完全準拠したWASM拡張システムを提供します。Nginx/Envoy向けに作成されたProxy-WasmモジュールをそのままVeilで使用できます。
-
-### 特徴
-
-- **Proxy-Wasm v0.2.1準拠**: Nginx/Envoyと100%互換
-- **AOTコンパイル**: `.cwasm`ファイルによる高速起動
-- **Pooling Allocator**: 高速なインスタンス化
-- **Capability制限**: モジュールごとの細かい権限制御（デフォルト全て無効）
-
-### ビルド
-
-```bash
-cargo build --release --features wasm
-```
-
-### 設定
-
-```toml
-[wasm]
-enabled = true
-
-# デフォルト設定（オプション）
-[wasm.defaults]
-# 最大実行時間（ミリ秒、デフォルト: 100）
-max_execution_time_ms = 100
-
-  # Poolingアロケータ設定
-  [wasm.defaults.pooling]
-  # メモリプール総数（デフォルト: 128）
-  total_memories = 128
-  # テーブルプール総数（デフォルト: 128）
-  total_tables = 128
-  # インスタンスごとの最大メモリサイズ（デフォルト: 10MB）
-  max_memory_size = 10485760
-
-# モジュール定義
-[[wasm.modules]]
-name = "my_filter"
-path = "/etc/veil/wasm/my_filter.wasm"
-configuration = '{"key": "value"}'
-
-[wasm.modules.capabilities]
-# 全てデフォルトfalse、必要な権限のみ有効化
-allow_logging = true
-allow_request_headers_read = true
-allow_request_headers_write = true
-allow_send_local_response = true
-allow_http_calls = true
-allowed_upstreams = ["webdis"]  # HTTP呼び出し許可先
-```
-
-**注意**: 特定のルートにWASMモジュールを適用するには、ルート設定の`modules`フィールドを使用してください（ルーティングセクションを参照）。
-
-### デフォルト設定
-
-`[wasm.defaults]` セクションでは、WASMランタイムのグローバル設定を行えます：
-
-| オプション | 説明 | デフォルト |
-|-----------|------|-----------|
-| `max_execution_time_ms` | WASM呼び出しごとの最大実行時間（ミリ秒） | 100 |
-
-#### Poolingアロケータ設定
-
-`[wasm.defaults.pooling]` セクションでは、高速インスタンス化のためのPoolingアロケータを設定します：
-
-| オプション | 説明 | デフォルト |
-|-----------|------|-----------|
-| `total_memories` | メモリプール総数 | 128 |
-| `total_tables` | テーブルプール総数 | 128 |
-| `max_memory_size` | インスタンスごとの最大メモリサイズ（バイト） | 10MB (10485760) |
-
-### Capability一覧
-
-| Capability | 説明 | デフォルト |
-|-----------|------|----------|
-| `allow_logging` | ログ出力 | false |
-| `allow_metrics` | メトリクス操作 | false |
-| `allow_shared_data` | 共有データ | false |
-| `allow_request_headers_read` | リクエストヘッダー読み取り | false |
-| `allow_request_headers_write` | リクエストヘッダー書き換え | false |
-| `allow_request_body_read` | リクエストボディ読み取り | false |
-| `allow_request_body_write` | リクエストボディ書き換え | false |
-| `allow_response_headers_read` | レスポンスヘッダー読み取り | false |
-| `allow_response_headers_write` | レスポンスヘッダー書き換え | false |
-| `allow_response_body_read` | レスポンスボディ読み取り | false |
-| `allow_response_body_write` | レスポンスボディ書き換え | false |
-| `allow_send_local_response` | ローカルレスポンス送信 | false |
-| `allow_http_calls` | HTTP外部呼び出し | false |
-| `allowed_upstreams` | 許可upstream | [] |
-
-### Rustによる拡張機能開発
-
-#### 1. プロジェクト作成
-
-```bash
-cargo new --lib my-filter
-cd my-filter
-```
-
-#### 2. Cargo.toml
-
-```toml
-[package]
-name = "my-filter"
-version = "0.1.0"
-edition = "2021"
-
-[lib]
-crate-type = ["cdylib"]
-
-[dependencies]
-proxy-wasm = "0.2"
-log = "0.4"
-
-[profile.release]
-lto = true
-opt-level = "s"
-
-[workspace]
-```
-
-#### 3. src/lib.rs
-
-```rust
-use proxy_wasm::traits::*;
-use proxy_wasm::types::*;
-
-proxy_wasm::main! {{
-    proxy_wasm::set_log_level(LogLevel::Debug);
-    proxy_wasm::set_root_context(|_| -> Box<dyn RootContext> {
-        Box::new(MyFilterRoot)
-    });
-}}
-
-struct MyFilterRoot;
-
-impl Context for MyFilterRoot {}
-
-impl RootContext for MyFilterRoot {
-    fn get_type(&self) -> Option<ContextType> {
-        Some(ContextType::HttpContext)
-    }
-
-    fn create_http_context(&self, context_id: u32) -> Option<Box<dyn HttpContext>> {
-        Some(Box::new(MyFilter { context_id }))
-    }
-}
-
-struct MyFilter {
-    context_id: u32,
-}
-
-impl Context for MyFilter {}
-
-impl HttpContext for MyFilter {
-    fn on_http_request_headers(&mut self, _: usize, _: bool) -> Action {
-        // リクエストヘッダーにカスタムヘッダーを追加
-        self.add_http_request_header("X-My-Filter", "enabled");
-        
-        // ヘッダー値を取得
-        if let Some(path) = self.get_http_request_header(":path") {
-            log::info!("Request path: {}", path);
-        }
-        
-        Action::Continue
-    }
-
-    fn on_http_response_headers(&mut self, _: usize, _: bool) -> Action {
-        // レスポンスヘッダーを追加
-        self.add_http_response_header("X-Processed-By", "my-filter");
-        Action::Continue
-    }
-}
-```
-
-#### 4. ビルド
-
-```bash
-# WASIターゲットを追加
-rustup target add wasm32-wasip1
-
-# ビルド
-cargo build --target wasm32-wasip1 --release
-
-# 出力: target/wasm32-wasip1/release/my_filter.wasm
-```
-
-#### 5. 配置と設定
-
-```bash
-# WASMモジュールを配置
-cp target/wasm32-wasip1/release/my_filter.wasm /etc/veil/wasm/
-
-# config.tomlに設定を追加
-```
-
-### 外部サービス連携（HTTP呼び出し）
-
-Proxy-Wasmの`dispatch_http_call`を使用して外部HTTPサービス（Redis用Webdis等）を呼び出せます：
-
-```rust
-fn on_http_request_headers(&mut self, _: usize, _: bool) -> Action {
-    // Webdis経由でRedisにアクセス
-    self.dispatch_http_call(
-        "webdis",  // upstream名（config.tomlで定義）
-        vec![
-            (":method", "GET"),
-            (":path", "/GET/my_key"),
-            (":authority", "webdis"),
-        ],
-        None,
-        vec![],
-        Duration::from_millis(50),
-    ).unwrap();
-    
-    Action::Pause  // レスポンス待ち
-}
-
-fn on_http_call_response(&mut self, _: u32, _: usize, body_size: usize, _: usize) {
-    if let Some(body) = self.get_http_call_response_body(0, body_size) {
-        // Redisからの値を処理
-        log::info!("Redis response: {:?}", body);
-    }
-    self.resume_http_request();
-}
-```
-
 ## ロゴ
 
 <table align="center">
@@ -3489,39 +3522,6 @@ fn on_http_call_response(&mut self, _: u32, _: usize, body_size: usize, _: usize
     </td>
   </tr>
 </table>
-
-## パニックリカバリー
-
-Veilは接続レベルのパニックキャッチを実装し、高可用性を確保しています。
-
-### 動作
-
-リクエスト処理中にパニックが発生した場合：
-
-| シナリオ | 影響 |
-|---------|------|
-| **パニックリカバリーなし** | ワーカースレッドがクラッシュし、そのワーカー上の全接続が終了 |
-| **Veilのパニックリカバリー** | 影響を受けた接続のみ終了、他の接続は正常に継続 |
-
-### 実装
-
-- `std::panic::catch_unwind` を使用して各接続の非同期タスクをラップ
-- パニックはポーリングレベルでキャッチされ、エラーとしてログに記録
-- `ConnectionGuard` によりパニック時も接続カウンターが正しくデクリメント
-- ワーカースレッドは生存し続け、新しい接続を受け付けを継続
-
-### ログ出力
-
-パニックがキャッチされた場合：
-```
-[ERROR] Task panicked during poll: Any { .. }
-```
-
-### 注意事項
-
-- この機能は自動的に有効化されます（設定不要）
-- `monoio::spawn` タスク内のパニックのみを保護
-- accept ループやランタイム初期化時のパニックはワーカースレッドを終了させます
 
 ## ライセンス
 

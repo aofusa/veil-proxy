@@ -183,43 +183,6 @@ veil: TLS certificate not found: /path/to/cert.pem
 
 **Note**: When reloading configuration via SIGHUP, if the new configuration is invalid, the reload is rejected and the server continues running with the previous valid configuration.
 
-## HTTP to HTTPS Redirect
-
-This feature automatically redirects HTTP access to HTTPS.
-
-### Configuration
-
-```toml
-[server]
-listen = "0.0.0.0:443"
-http = "0.0.0.0:80"  # Enable HTTP redirect
-```
-
-### Behavior
-
-- Access to `http://example.com/path` is redirected to `https://example.com/path` with 301
-- Domain name is extracted from the Host header to construct the redirect URL
-- **Port handling**: The redirect URL uses the port from the `[server].listen` setting
-  - If listen port is 443 (default): `https://example.com/path` (port omitted)
-  - If listen port is 8443: `https://example.com:8443/path` (port included)
-
-### Security Considerations
-
-- **Redirect Only**: HTTP only performs redirects, no content is served
-- **301 Moved Permanently**: Browsers cache the redirect destination, subsequent requests go directly to HTTPS
-- **First Access**: Plain text communication occurs only on the first HTTP access, but no content is included
-
-### Notes
-
-- Using privileged port (80) requires one of the following:
-  1. Start as root (recommend using with privilege dropping)
-  2. Grant `CAP_NET_BIND_SERVICE` capability
-
-```bash
-# To grant capability
-sudo setcap 'cap_net_bind_service=+ep' ./target/release/veil
-```
-
 ## TLS Certificate Generation
 
 To generate a self-signed certificate for development/testing, run the following commands:
@@ -259,6 +222,43 @@ key_path = "./server.key"
 ```bash
 # Build
 cargo build --release --features ktls
+```
+
+## HTTP to HTTPS Redirect
+
+This feature automatically redirects HTTP access to HTTPS.
+
+### Configuration
+
+```toml
+[server]
+listen = "0.0.0.0:443"
+http = "0.0.0.0:80"  # Enable HTTP redirect
+```
+
+### Behavior
+
+- Access to `http://example.com/path` is redirected to `https://example.com/path` with 301
+- Domain name is extracted from the Host header to construct the redirect URL
+- **Port handling**: The redirect URL uses the port from the `[server].listen` setting
+  - If listen port is 443 (default): `https://example.com/path` (port omitted)
+  - If listen port is 8443: `https://example.com:8443/path` (port included)
+
+### Security Considerations
+
+- **Redirect Only**: HTTP only performs redirects, no content is served
+- **301 Moved Permanently**: Browsers cache the redirect destination, subsequent requests go directly to HTTPS
+- **First Access**: Plain text communication occurs only on the first HTTP access, but no content is included
+
+### Notes
+
+- Using privileged port (80) requires one of the following:
+  1. Start as root (recommend using with privilege dropping)
+  2. Grant `CAP_NET_BIND_SERVICE` capability
+
+```bash
+# To grant capability
+sudo setcap 'cap_net_bind_service=+ep' ./target/release/veil
 ```
 
 ## Configuration
@@ -1290,6 +1290,223 @@ IP restrictions are evaluated in **deny → allow** order (deny takes priority).
 | Single IPv6 | `::1` |
 | IPv6 CIDR | `2001:db8::/32` |
 
+## Load Balancing
+
+Supports request distribution to multiple backend servers.
+
+### Algorithms
+
+| Algorithm | Description | Use Case |
+|-----------|-------------|----------|
+| `round_robin` | Distribute in order (default) | General purpose |
+| `least_conn` | Select server with fewest connections | Long-lived connections |
+| `ip_hash` | Hash by client IP | Session persistence |
+
+### Configuration Examples
+
+```toml
+# Define upstream group (string format)
+[upstreams."backend-pool"]
+algorithm = "round_robin"
+servers = [
+  "http://localhost:8080",
+  "http://localhost:8081",
+  "http://localhost:8082"
+]
+
+# Reference upstream in route
+[[route]]
+[route.conditions]
+host = "example.com"
+path = "/api/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"  # Specify upstream instead of URL
+```
+
+#### HTTPS Backends with SNI Name
+
+Specify SNI name for HTTPS backends using IP addresses:
+
+```toml
+# HTTPS backend pool (mixed struct and string formats)
+[upstreams."https-api-pool"]
+algorithm = "least_conn"
+servers = [
+  # Struct format: IP address + SNI name specification
+  { url = "https://192.168.1.100:443", sni_name = "api.internal.example.com" },
+  { url = "https://192.168.1.101:443", sni_name = "api.internal.example.com" },
+  # String format: domain name specification (SNI name automatically uses URL hostname)
+  "https://api.example.com:443"
+]
+```
+
+### Compatibility with Single Backend
+
+The traditional `url` specification continues to work:
+
+```toml
+# Traditional single backend specification
+[[route]]
+[route.conditions]
+host = "example.com"
+path = "/simple/*"
+[route.action]
+type = "Proxy"
+url = "http://localhost:8080"
+```
+
+## Health Check
+
+Monitors backend server health and automatically excludes unhealthy servers.
+
+### Behavior
+
+1. Periodically sends HTTP requests in a background thread
+2. Checks response status codes
+3. Excludes server when consecutive failures reach threshold
+4. Restores server when consecutive successes reach threshold
+
+### Configuration Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `interval_secs` | Check interval (seconds) | 10 |
+| `path` | Path to check | `/` |
+| `timeout_secs` | Timeout (seconds) | 5 |
+| `healthy_statuses` | Status codes considered successful | [200, 201, 202, 204, 301, 302, 304] |
+| `unhealthy_threshold` | Consecutive failures to mark unhealthy | 3 |
+| `healthy_threshold` | Consecutive successes to mark healthy | 2 |
+| `use_tls` | Use TLS connection for health check | **false** |
+| `verify_cert` | Verify TLS certificate (use_tls=true only) | **true** |
+
+### Configuration Example
+
+```toml
+[upstreams."api-servers"]
+algorithm = "least_conn"
+servers = [
+  "http://api1.internal:8080",
+  "http://api2.internal:8080",
+  "http://api3.internal:8080"
+]
+
+  [upstreams."api-servers".health_check]
+  interval_secs = 10
+  path = "/health"
+  timeout_secs = 5
+  healthy_statuses = [200]
+  unhealthy_threshold = 3
+  healthy_threshold = 2
+  # TLS health check (for HTTPS backends)
+  use_tls = false
+  verify_cert = true
+```
+
+### TLS Health Check
+
+When `use_tls = true`, the health check uses TLS connection instead of plain HTTP. This is useful for monitoring HTTPS backends.
+
+**Configuration Example for TLS Health Check:**
+
+```toml
+[upstreams."api-servers"]
+algorithm = "least_conn"
+servers = [
+  "https://api1.internal:8443",
+  "https://api2.internal:8443"
+]
+
+  [upstreams."api-servers".health_check]
+  interval_secs = 10
+  path = "/health"
+  timeout_secs = 5
+  healthy_statuses = [200]
+  # Enable TLS health check
+  use_tls = true
+  # Verify certificate (set to false for self-signed certificates)
+  verify_cert = true
+```
+
+> **Note**: When `verify_cert = false`, self-signed certificates are accepted. This is useful for development environments, but not recommended for production.
+
+### Log Output
+
+Health status changes are logged:
+
+```
+[INFO] Upstream api1.internal:8080 is now unhealthy
+[INFO] Upstream api1.internal:8080 is now healthy
+```
+
+## Redirect
+
+Configure HTTP redirects (301/302/303/307/308). Use for non-WWW handling, HTTPS enforcement, legacy URL migration, etc.
+
+### Configuration Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `redirect_url` | Redirect destination URL (required) | - |
+| `redirect_status` | Status code (301, 302, 303, 307, 308) | 301 |
+| `preserve_path` | Append original path to redirect destination | false |
+
+### Status Code Usage
+
+| Code | Description | Use Case |
+|------|-------------|----------|
+| 301 | Moved Permanently | Permanent relocation (SEO preservation) |
+| 302 | Found | Temporary redirect |
+| 303 | See Other | POST to GET redirect |
+| 307 | Temporary Redirect | Temporary (preserves method) |
+| 308 | Permanent Redirect | Permanent (preserves method) |
+
+### Configuration Examples
+
+```toml
+# Redirect to WWW
+[[route]]
+[route.conditions]
+host = "example.com"
+path = "/"
+[route.action]
+type = "Redirect"
+redirect_url = "https://www.example.com/"
+redirect_status = 301
+
+# Legacy URL to new URL migration (preserve path)
+[[route]]
+[route.conditions]
+host = "example.com"
+path = "/legacy/*"
+[route.action]
+type = "Redirect"
+redirect_url = "https://example.com/v2"
+redirect_status = 301
+preserve_path = true
+# /legacy/users → https://example.com/v2/users
+# /legacy/api/data → https://example.com/v2/api/data
+
+# Force HTTP to HTTPS redirect (configured on different host)
+[[route]]
+[route.conditions]
+host = "http.example.com"
+path = "/"
+[route.action]
+type = "Redirect"
+redirect_url = "https://example.com$request_uri"
+redirect_status = 301
+```
+
+### Special Variables
+
+The following variables can be used in `redirect_url`:
+
+| Variable | Description |
+|----------|-------------|
+| `$request_uri` | Original request URI |
+| `$path` | Path portion after prefix removal |
+
 ## Header Manipulation
 
 Add or remove request/response headers. Configure security headers such as X-Real-IP, X-Forwarded-Proto, HSTS, etc.
@@ -1386,74 +1603,6 @@ server_header_value = "MyServer/1.0"
 - **Development/Testing**: Enable to identify which server is responding
 - **Production**: Disable to hide server information (security best practice)
 - **Custom Branding**: Set a custom value when Server header is required
-
-## Redirect
-
-Configure HTTP redirects (301/302/303/307/308). Use for non-WWW handling, HTTPS enforcement, legacy URL migration, etc.
-
-### Configuration Options
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `redirect_url` | Redirect destination URL (required) | - |
-| `redirect_status` | Status code (301, 302, 303, 307, 308) | 301 |
-| `preserve_path` | Append original path to redirect destination | false |
-
-### Status Code Usage
-
-| Code | Description | Use Case |
-|------|-------------|----------|
-| 301 | Moved Permanently | Permanent relocation (SEO preservation) |
-| 302 | Found | Temporary redirect |
-| 303 | See Other | POST to GET redirect |
-| 307 | Temporary Redirect | Temporary (preserves method) |
-| 308 | Permanent Redirect | Permanent (preserves method) |
-
-### Configuration Examples
-
-```toml
-# Redirect to WWW
-[[route]]
-[route.conditions]
-host = "example.com"
-path = "/"
-[route.action]
-type = "Redirect"
-redirect_url = "https://www.example.com/"
-redirect_status = 301
-
-# Legacy URL to new URL migration (preserve path)
-[[route]]
-[route.conditions]
-host = "example.com"
-path = "/legacy/*"
-[route.action]
-type = "Redirect"
-redirect_url = "https://example.com/v2"
-redirect_status = 301
-preserve_path = true
-# /legacy/users → https://example.com/v2/users
-# /legacy/api/data → https://example.com/v2/api/data
-
-# Force HTTP to HTTPS redirect (configured on different host)
-[[route]]
-[route.conditions]
-host = "http.example.com"
-path = "/"
-[route.action]
-type = "Redirect"
-redirect_url = "https://example.com$request_uri"
-redirect_status = 301
-```
-
-### Special Variables
-
-The following variables can be used in `redirect_url`:
-
-| Variable | Description |
-|----------|-------------|
-| `$request_uri` | Original request URI |
-| `$path` | Path portion after prefix removal |
 
 ## Response Compression
 
@@ -1779,117 +1928,65 @@ Content-Length unknown (chunked)     → Streaming
 
 > **Note**: For maximum performance with kTLS, use `streaming` mode for routes where low latency is critical.
 
-## Prometheus Metrics
+## WebSocket Support
 
-Export metrics such as request counts, latency, and body sizes in Prometheus format.
+Supports WebSocket (RFC 6455) proxying.
+Automatically detects `Connection: Upgrade` and `Upgrade: websocket` headers
+and performs bidirectional data transfer.
 
-### Enabling
+### Behavior
 
-Prometheus metrics are **disabled** by default. They must be explicitly enabled in the `[prometheus]` section.
+1. Detect Upgrade request from client
+2. Forward Upgrade request to backend
+3. Receive 101 Switching Protocols
+4. Start bidirectional bypass transfer (operates in configured polling mode)
+5. Continue until either connection closes
 
-```toml
-[prometheus]
-enabled = true
-```
+### Polling Modes
 
-> **Note**: Metrics are also disabled if the `[prometheus]` section itself does not exist.
+Control polling behavior during WebSocket bidirectional transfer via configuration.
 
-### Configuration Options
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| `adaptive` (default) | Short during data transfer, longer when idle | General purpose, CPU efficiency focused |
+| `fixed` | Always uses fixed timeout | Real-time games, low latency priority |
 
-| Option | Description | Default |
-|--------|-------------|---------|
-| `enabled` | Enable metrics endpoint | **false** |
-| `path` | Metrics endpoint path | `/__metrics` |
-| `allowed_ips` | Allowed IP/CIDR for access (array) | [] (all allowed) |
+See the "[WebSocket Configuration](#websocket-configuration)" section for detailed configuration options.
 
-### Endpoint
+### Configuration Examples
 
-```
-GET /__metrics
-```
-
-Use the `path` option to change the endpoint path.
-
-### Available Metrics
-
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `veil_proxy_http_requests_total` | Counter | method, status, host | Total request count |
-| `veil_proxy_http_request_duration_seconds` | Histogram | method, host | Request processing time (seconds) |
-| `veil_proxy_http_request_size_bytes` | Histogram | - | Request body size |
-| `veil_proxy_http_response_size_bytes` | Histogram | - | Response body size |
-| `veil_proxy_http_active_connections` | Gauge | host | Active connection count |
-| `veil_proxy_http_upstream_health` | Gauge | upstream, server | Upstream health status (1=healthy, 0=unhealthy) |
-| `veil_proxy_cache_hits_total` | Counter | host | Total cache hit count |
-| `veil_proxy_cache_misses_total` | Counter | host | Total cache miss count |
-| `veil_proxy_cache_stores_total` | Counter | host, storage | Total cache store operations |
-| `veil_proxy_cache_size_bytes` | Gauge | storage | Current cache size in bytes |
-| `veil_proxy_cache_entries` | Gauge | storage | Current number of cache entries |
-| `veil_proxy_buffering_used_total` | Counter | host | Total requests using buffering |
-
-### Grafana Dashboard Examples
-
-```promql
-# Request rate (requests/second)
-rate(veil_proxy_http_requests_total[5m])
-
-# Error rate (4xx + 5xx)
-sum(rate(veil_proxy_http_requests_total{status=~"4..|5.."}[5m])) 
-  / sum(rate(veil_proxy_http_requests_total[5m]))
-
-# Latency P95
-histogram_quantile(0.95, rate(veil_proxy_http_request_duration_seconds_bucket[5m]))
-
-# Request rate by host
-sum by (host) (rate(veil_proxy_http_requests_total[5m]))
-```
-
-### Configuration Examples (config.toml)
+WebSocket is automatically supported with regular Proxy backends:
 
 ```toml
-# Basic configuration (accessible from all IPs)
-[prometheus]
-enabled = true
-path = "/__metrics"
+# WebSocket application (default settings)
+[[route]]
+[route.conditions]
+host = "example.com"
+path = "/ws/*"
+[route.action]
+type = "Proxy"
+url = "http://localhost:3000"
 
-# Enhanced security (internal network only)
-[prometheus]
-enabled = true
-path = "/metrics"
-allowed_ips = [
-  "127.0.0.1",
-  "::1",
-  "10.0.0.0/8",
-  "172.16.0.0/12",
-  "192.168.0.0/16"
-]
+# Low latency configuration (for real-time games)
+[[route]]
+[route.conditions]
+host = "game.example.com"
+path = "/ws/*"
+[route.action]
+type = "Proxy"
+url = "http://localhost:3001"
+
+[route.security]
+  websocket_poll_mode = "fixed"
+  websocket_poll_timeout_ms = 1
 ```
 
-### Access Control
+### Supported Backends
 
-When `allowed_ips` is configured, only the specified IP addresses/CIDRs can access the metrics endpoint.
-When empty (default), all IPs can access.
-
-| Format | Example |
-|--------|---------|
-| Single IPv4 | `127.0.0.1` |
-| IPv4 CIDR | `10.0.0.0/8` |
-| Single IPv6 | `::1` |
-| IPv6 CIDR | `2001:db8::/32` |
-
-### Prometheus Configuration Example
-
-```yaml
-# prometheus.yml
-scrape_configs:
-  - job_name: 'veil-proxy'
-    static_configs:
-      - targets: ['your-proxy-server:443']
-    scheme: https
-    tls_config:
-      insecure_skip_verify: true  # For self-signed certificates
-    metrics_path: /__metrics
-```
+| Protocol | Support |
+|----------|---------|
+| HTTP → WS | ✅ |
+| HTTPS → WSS | ✅ |
 
 ## HTTP/2 Support
 
@@ -2153,6 +2250,347 @@ ktls_fallback_enabled = false  # kTLS required mode
 | Kernel Bugs | Pin kernel version, apply patches regularly |
 | Session Key Exposure | TLS handshake runs in userspace (rustls) (maintains PFS) |
 | DoS Attacks | Monitor kernel resources, rate limiting |
+
+## WASM Extension System
+
+Veil provides a WASM extension system fully compliant with Proxy-Wasm ABI v0.2.1. Proxy-Wasm modules created for Nginx/Envoy can be used with Veil without modification.
+
+### Features
+
+- **Proxy-Wasm v0.2.1 Compliant**: 100% compatible with Nginx/Envoy
+- **AOT Compilation**: Fast startup with `.cwasm` files
+- **Pooling Allocator**: High-speed instance creation
+- **Capability Restrictions**: Fine-grained per-module permission control (all disabled by default)
+
+### Build
+
+```bash
+cargo build --release --features wasm
+```
+
+### Configuration
+
+```toml
+[wasm]
+enabled = true
+
+# Default settings (optional)
+[wasm.defaults]
+# Maximum execution time (milliseconds, default: 100)
+max_execution_time_ms = 100
+
+  # Pooling allocator settings
+  [wasm.defaults.pooling]
+  # Total number of memory pools (default: 128)
+  total_memories = 128
+  # Total number of table pools (default: 128)
+  total_tables = 128
+  # Maximum memory size per instance (default: 10MB)
+  max_memory_size = 10485760
+
+# Module definition
+[[wasm.modules]]
+name = "my_filter"
+path = "/etc/veil/wasm/my_filter.wasm"
+configuration = '{"key": "value"}'
+
+[wasm.modules.capabilities]
+# All default to false, enable only required permissions
+allow_logging = true
+allow_request_headers_read = true
+allow_request_headers_write = true
+allow_send_local_response = true
+allow_http_calls = true
+allowed_upstreams = ["webdis"]  # Allowed HTTP call destinations
+```
+
+**Note**: To apply WASM modules to specific routes, use the `modules` field in the route configuration (see Routing section).
+
+### Default Settings
+
+The `[wasm.defaults]` section allows you to configure global WASM runtime settings:
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `max_execution_time_ms` | Maximum execution time per WASM call (milliseconds) | 100 |
+
+#### Pooling Allocator Settings
+
+The `[wasm.defaults.pooling]` section configures the pooling allocator for high-speed instance creation:
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `total_memories` | Total number of memory pools | 128 |
+| `total_tables` | Total number of table pools | 128 |
+| `max_memory_size` | Maximum memory size per instance (bytes) | 10MB (10485760) |
+
+### Capability List
+
+| Capability | Description | Default |
+|-----------|-------------|---------|
+| `allow_logging` | Log output | false |
+| `allow_metrics` | Metrics operations | false |
+| `allow_shared_data` | Shared data access | false |
+| `allow_request_headers_read` | Read request headers | false |
+| `allow_request_headers_write` | Modify request headers | false |
+| `allow_request_body_read` | Read request body | false |
+| `allow_request_body_write` | Modify request body | false |
+| `allow_response_headers_read` | Read response headers | false |
+| `allow_response_headers_write` | Modify response headers | false |
+| `allow_response_body_read` | Read response body | false |
+| `allow_response_body_write` | Modify response body | false |
+| `allow_send_local_response` | Send local response | false |
+| `allow_http_calls` | HTTP external calls | false |
+| `allowed_upstreams` | Allowed upstreams | [] |
+
+### Developing Extensions with Rust
+
+#### 1. Create Project
+
+```bash
+cargo new --lib my-filter
+cd my-filter
+```
+
+#### 2. Cargo.toml
+
+```toml
+[package]
+name = "my-filter"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+proxy-wasm = "0.2"
+log = "0.4"
+
+[profile.release]
+lto = true
+opt-level = "s"
+
+[workspace]
+```
+
+#### 3. src/lib.rs
+
+```rust
+use proxy_wasm::traits::*;
+use proxy_wasm::types::*;
+
+proxy_wasm::main! {{
+    proxy_wasm::set_log_level(LogLevel::Debug);
+    proxy_wasm::set_root_context(|_| -> Box<dyn RootContext> {
+        Box::new(MyFilterRoot)
+    });
+}}
+
+struct MyFilterRoot;
+
+impl Context for MyFilterRoot {}
+
+impl RootContext for MyFilterRoot {
+    fn get_type(&self) -> Option<ContextType> {
+        Some(ContextType::HttpContext)
+    }
+
+    fn create_http_context(&self, context_id: u32) -> Option<Box<dyn HttpContext>> {
+        Some(Box::new(MyFilter { context_id }))
+    }
+}
+
+struct MyFilter {
+    context_id: u32,
+}
+
+impl Context for MyFilter {}
+
+impl HttpContext for MyFilter {
+    fn on_http_request_headers(&mut self, _: usize, _: bool) -> Action {
+        // Add custom header to request
+        self.add_http_request_header("X-My-Filter", "enabled");
+        
+        // Get header value
+        if let Some(path) = self.get_http_request_header(":path") {
+            log::info!("Request path: {}", path);
+        }
+        
+        Action::Continue
+    }
+
+    fn on_http_response_headers(&mut self, _: usize, _: bool) -> Action {
+        // Add response header
+        self.add_http_response_header("X-Processed-By", "my-filter");
+        Action::Continue
+    }
+}
+```
+
+#### 4. Build
+
+```bash
+# Add WASI target
+rustup target add wasm32-wasip1
+
+# Build
+cargo build --target wasm32-wasip1 --release
+
+# Output: target/wasm32-wasip1/release/my_filter.wasm
+```
+
+#### 5. Deploy and Configure
+
+```bash
+# Deploy WASM module
+cp target/wasm32-wasip1/release/my_filter.wasm /etc/veil/wasm/
+
+# Add configuration to config.toml
+```
+
+### External Service Integration (HTTP Calls)
+
+Use Proxy-Wasm's `dispatch_http_call` to call external HTTP services (e.g., Webdis for Redis):
+
+```rust
+fn on_http_request_headers(&mut self, _: usize, _: bool) -> Action {
+    // Access Redis via Webdis
+    self.dispatch_http_call(
+        "webdis",  // upstream name (defined in config.toml)
+        vec![
+            (":method", "GET"),
+            (":path", "/GET/my_key"),
+            (":authority", "webdis"),
+        ],
+        None,
+        vec![],
+        Duration::from_millis(50),
+    ).unwrap();
+    
+    Action::Pause  // Wait for response
+}
+
+fn on_http_call_response(&mut self, _: u32, _: usize, body_size: usize, _: usize) {
+    if let Some(body) = self.get_http_call_response_body(0, body_size) {
+        // Process value from Redis
+        log::info!("Redis response: {:?}", body);
+    }
+    self.resume_http_request();
+}
+```
+
+## Prometheus Metrics
+
+Export metrics such as request counts, latency, and body sizes in Prometheus format.
+
+### Enabling
+
+Prometheus metrics are **disabled** by default. They must be explicitly enabled in the `[prometheus]` section.
+
+```toml
+[prometheus]
+enabled = true
+```
+
+> **Note**: Metrics are also disabled if the `[prometheus]` section itself does not exist.
+
+### Configuration Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `enabled` | Enable metrics endpoint | **false** |
+| `path` | Metrics endpoint path | `/__metrics` |
+| `allowed_ips` | Allowed IP/CIDR for access (array) | [] (all allowed) |
+
+### Endpoint
+
+```
+GET /__metrics
+```
+
+Use the `path` option to change the endpoint path.
+
+### Available Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `veil_proxy_http_requests_total` | Counter | method, status, host | Total request count |
+| `veil_proxy_http_request_duration_seconds` | Histogram | method, host | Request processing time (seconds) |
+| `veil_proxy_http_request_size_bytes` | Histogram | - | Request body size |
+| `veil_proxy_http_response_size_bytes` | Histogram | - | Response body size |
+| `veil_proxy_http_active_connections` | Gauge | host | Active connection count |
+| `veil_proxy_http_upstream_health` | Gauge | upstream, server | Upstream health status (1=healthy, 0=unhealthy) |
+| `veil_proxy_cache_hits_total` | Counter | host | Total cache hit count |
+| `veil_proxy_cache_misses_total` | Counter | host | Total cache miss count |
+| `veil_proxy_cache_stores_total` | Counter | host, storage | Total cache store operations |
+| `veil_proxy_cache_size_bytes` | Gauge | storage | Current cache size in bytes |
+| `veil_proxy_cache_entries` | Gauge | storage | Current number of cache entries |
+| `veil_proxy_buffering_used_total` | Counter | host | Total requests using buffering |
+
+### Grafana Dashboard Examples
+
+```promql
+# Request rate (requests/second)
+rate(veil_proxy_http_requests_total[5m])
+
+# Error rate (4xx + 5xx)
+sum(rate(veil_proxy_http_requests_total{status=~"4..|5.."}[5m])) 
+  / sum(rate(veil_proxy_http_requests_total[5m]))
+
+# Latency P95
+histogram_quantile(0.95, rate(veil_proxy_http_request_duration_seconds_bucket[5m]))
+
+# Request rate by host
+sum by (host) (rate(veil_proxy_http_requests_total[5m]))
+```
+
+### Configuration Examples (config.toml)
+
+```toml
+# Basic configuration (accessible from all IPs)
+[prometheus]
+enabled = true
+path = "/__metrics"
+
+# Enhanced security (internal network only)
+[prometheus]
+enabled = true
+path = "/metrics"
+allowed_ips = [
+  "127.0.0.1",
+  "::1",
+  "10.0.0.0/8",
+  "172.16.0.0/12",
+  "192.168.0.0/16"
+]
+```
+
+### Access Control
+
+When `allowed_ips` is configured, only the specified IP addresses/CIDRs can access the metrics endpoint.
+When empty (default), all IPs can access.
+
+| Format | Example |
+|--------|---------|
+| Single IPv4 | `127.0.0.1` |
+| IPv4 CIDR | `10.0.0.0/8` |
+| Single IPv6 | `::1` |
+| IPv6 CIDR | `2001:db8::/32` |
+
+### Prometheus Configuration Example
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: 'veil-proxy'
+    static_configs:
+      - targets: ['your-proxy-server:443']
+    scheme: https
+    tls_config:
+      insecure_skip_verify: true  # For self-signed certificates
+    metrics_path: /__metrics
+```
 
 ## Performance Tuning
 
@@ -2582,215 +3020,6 @@ kill -SIGHUP $(pgrep veil)
 | Listen address | ❌ (requires restart) |
 | Worker thread count | ❌ (requires restart) |
 
-## WebSocket Support
-
-Supports WebSocket (RFC 6455) proxying.
-Automatically detects `Connection: Upgrade` and `Upgrade: websocket` headers
-and performs bidirectional data transfer.
-
-### Behavior
-
-1. Detect Upgrade request from client
-2. Forward Upgrade request to backend
-3. Receive 101 Switching Protocols
-4. Start bidirectional bypass transfer (operates in configured polling mode)
-5. Continue until either connection closes
-
-### Polling Modes
-
-Control polling behavior during WebSocket bidirectional transfer via configuration.
-
-| Mode | Description | Use Case |
-|------|-------------|----------|
-| `adaptive` (default) | Short during data transfer, longer when idle | General purpose, CPU efficiency focused |
-| `fixed` | Always uses fixed timeout | Real-time games, low latency priority |
-
-See the "[WebSocket Configuration](#websocket-configuration)" section for detailed configuration options.
-
-### Configuration Examples
-
-WebSocket is automatically supported with regular Proxy backends:
-
-```toml
-# WebSocket application (default settings)
-[[route]]
-[route.conditions]
-host = "example.com"
-path = "/ws/*"
-[route.action]
-type = "Proxy"
-url = "http://localhost:3000"
-
-# Low latency configuration (for real-time games)
-[[route]]
-[route.conditions]
-host = "game.example.com"
-path = "/ws/*"
-[route.action]
-type = "Proxy"
-url = "http://localhost:3001"
-
-[route.security]
-  websocket_poll_mode = "fixed"
-  websocket_poll_timeout_ms = 1
-```
-
-### Supported Backends
-
-| Protocol | Support |
-|----------|---------|
-| HTTP → WS | ✅ |
-| HTTPS → WSS | ✅ |
-
-## Load Balancing
-
-Supports request distribution to multiple backend servers.
-
-### Algorithms
-
-| Algorithm | Description | Use Case |
-|-----------|-------------|----------|
-| `round_robin` | Distribute in order (default) | General purpose |
-| `least_conn` | Select server with fewest connections | Long-lived connections |
-| `ip_hash` | Hash by client IP | Session persistence |
-
-### Configuration Examples
-
-```toml
-# Define upstream group (string format)
-[upstreams."backend-pool"]
-algorithm = "round_robin"
-servers = [
-  "http://localhost:8080",
-  "http://localhost:8081",
-  "http://localhost:8082"
-]
-
-# Reference upstream in route
-[[route]]
-[route.conditions]
-host = "example.com"
-path = "/api/*"
-[route.action]
-type = "Proxy"
-upstream = "backend-pool"  # Specify upstream instead of URL
-```
-
-#### HTTPS Backends with SNI Name
-
-Specify SNI name for HTTPS backends using IP addresses:
-
-```toml
-# HTTPS backend pool (mixed struct and string formats)
-[upstreams."https-api-pool"]
-algorithm = "least_conn"
-servers = [
-  # Struct format: IP address + SNI name specification
-  { url = "https://192.168.1.100:443", sni_name = "api.internal.example.com" },
-  { url = "https://192.168.1.101:443", sni_name = "api.internal.example.com" },
-  # String format: domain name specification (SNI name automatically uses URL hostname)
-  "https://api.example.com:443"
-]
-```
-
-### Compatibility with Single Backend
-
-The traditional `url` specification continues to work:
-
-```toml
-# Traditional single backend specification
-[[route]]
-[route.conditions]
-host = "example.com"
-path = "/simple/*"
-[route.action]
-type = "Proxy"
-url = "http://localhost:8080"
-```
-
-## Health Check
-
-Monitors backend server health and automatically excludes unhealthy servers.
-
-### Behavior
-
-1. Periodically sends HTTP requests in a background thread
-2. Checks response status codes
-3. Excludes server when consecutive failures reach threshold
-4. Restores server when consecutive successes reach threshold
-
-### Configuration Options
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `interval_secs` | Check interval (seconds) | 10 |
-| `path` | Path to check | `/` |
-| `timeout_secs` | Timeout (seconds) | 5 |
-| `healthy_statuses` | Status codes considered successful | [200, 201, 202, 204, 301, 302, 304] |
-| `unhealthy_threshold` | Consecutive failures to mark unhealthy | 3 |
-| `healthy_threshold` | Consecutive successes to mark healthy | 2 |
-| `use_tls` | Use TLS connection for health check | **false** |
-| `verify_cert` | Verify TLS certificate (use_tls=true only) | **true** |
-
-### Configuration Example
-
-```toml
-[upstreams."api-servers"]
-algorithm = "least_conn"
-servers = [
-  "http://api1.internal:8080",
-  "http://api2.internal:8080",
-  "http://api3.internal:8080"
-]
-
-  [upstreams."api-servers".health_check]
-  interval_secs = 10
-  path = "/health"
-  timeout_secs = 5
-  healthy_statuses = [200]
-  unhealthy_threshold = 3
-  healthy_threshold = 2
-  # TLS health check (for HTTPS backends)
-  use_tls = false
-  verify_cert = true
-```
-
-### TLS Health Check
-
-When `use_tls = true`, the health check uses TLS connection instead of plain HTTP. This is useful for monitoring HTTPS backends.
-
-**Configuration Example for TLS Health Check:**
-
-```toml
-[upstreams."api-servers"]
-algorithm = "least_conn"
-servers = [
-  "https://api1.internal:8443",
-  "https://api2.internal:8443"
-]
-
-  [upstreams."api-servers".health_check]
-  interval_secs = 10
-  path = "/health"
-  timeout_secs = 5
-  healthy_statuses = [200]
-  # Enable TLS health check
-  use_tls = true
-  # Verify certificate (set to false for self-signed certificates)
-  verify_cert = true
-```
-
-> **Note**: When `verify_cert = false`, self-signed certificates are accepted. This is useful for development environments, but not recommended for production.
-
-### Log Output
-
-Health status changes are logged:
-
-```
-[INFO] Upstream api1.internal:8080 is now unhealthy
-[INFO] Upstream api1.internal:8080 is now healthy
-```
-
 ## Configuration File Validation
 
 Performs detailed validation of the configuration file at startup and outputs clear error messages if problems are found.
@@ -3147,6 +3376,39 @@ ExecStart=/usr/bin/bwrap \
 
 In this configuration, systemd creates the outer "container" and bubblewrap provides an even stricter filesystem view.
 
+## Panic Recovery
+
+Veil implements connection-level panic catching to ensure high availability.
+
+### Behavior
+
+When a panic occurs during request processing:
+
+| Scenario | Impact |
+|----------|--------|
+| **Without panic recovery** | Worker thread crashes, all connections on that worker are terminated |
+| **With Veil's panic recovery** | Only the affected connection terminates, other connections continue normally |
+
+### Implementation
+
+- Uses `std::panic::catch_unwind` to wrap each connection's async task
+- Panics are caught at the poll level and logged as errors
+- `ConnectionGuard` ensures the connection counter is correctly decremented even on panic
+- Worker threads remain alive and continue accepting new connections
+
+### Logged Output
+
+When a panic is caught:
+```
+[ERROR] Task panicked during poll: Any { .. }
+```
+
+### Notes
+
+- This feature is automatically enabled; no configuration required
+- Only protects against panics inside `monoio::spawn` tasks
+- Panics in the accept loop or runtime initialization still terminate the worker thread
+
 ## References
 
 ### Core Libraries
@@ -3197,235 +3459,6 @@ In this configuration, systemd creates the outer "container" and bubblewrap prov
 - [Wasmtime](https://wasmtime.dev/): WebAssembly Runtime
 - [proxy-wasm-rust-sdk](https://github.com/proxy-wasm/proxy-wasm-rust-sdk): Rust SDK
 
-## WASM Extension System
-
-Veil provides a WASM extension system fully compliant with Proxy-Wasm ABI v0.2.1. Proxy-Wasm modules created for Nginx/Envoy can be used with Veil without modification.
-
-### Features
-
-- **Proxy-Wasm v0.2.1 Compliant**: 100% compatible with Nginx/Envoy
-- **AOT Compilation**: Fast startup with `.cwasm` files
-- **Pooling Allocator**: High-speed instance creation
-- **Capability Restrictions**: Fine-grained per-module permission control (all disabled by default)
-
-### Build
-
-```bash
-cargo build --release --features wasm
-```
-
-### Configuration
-
-```toml
-[wasm]
-enabled = true
-
-# Default settings (optional)
-[wasm.defaults]
-# Maximum execution time (milliseconds, default: 100)
-max_execution_time_ms = 100
-
-  # Pooling allocator settings
-  [wasm.defaults.pooling]
-  # Total number of memory pools (default: 128)
-  total_memories = 128
-  # Total number of table pools (default: 128)
-  total_tables = 128
-  # Maximum memory size per instance (default: 10MB)
-  max_memory_size = 10485760
-
-# Module definition
-[[wasm.modules]]
-name = "my_filter"
-path = "/etc/veil/wasm/my_filter.wasm"
-configuration = '{"key": "value"}'
-
-[wasm.modules.capabilities]
-# All default to false, enable only required permissions
-allow_logging = true
-allow_request_headers_read = true
-allow_request_headers_write = true
-allow_send_local_response = true
-allow_http_calls = true
-allowed_upstreams = ["webdis"]  # Allowed HTTP call destinations
-```
-
-**Note**: To apply WASM modules to specific routes, use the `modules` field in the route configuration (see Routing section).
-
-### Default Settings
-
-The `[wasm.defaults]` section allows you to configure global WASM runtime settings:
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `max_execution_time_ms` | Maximum execution time per WASM call (milliseconds) | 100 |
-
-#### Pooling Allocator Settings
-
-The `[wasm.defaults.pooling]` section configures the pooling allocator for high-speed instance creation:
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `total_memories` | Total number of memory pools | 128 |
-| `total_tables` | Total number of table pools | 128 |
-| `max_memory_size` | Maximum memory size per instance (bytes) | 10MB (10485760) |
-
-### Capability List
-
-| Capability | Description | Default |
-|-----------|-------------|---------|
-| `allow_logging` | Log output | false |
-| `allow_metrics` | Metrics operations | false |
-| `allow_shared_data` | Shared data access | false |
-| `allow_request_headers_read` | Read request headers | false |
-| `allow_request_headers_write` | Modify request headers | false |
-| `allow_request_body_read` | Read request body | false |
-| `allow_request_body_write` | Modify request body | false |
-| `allow_response_headers_read` | Read response headers | false |
-| `allow_response_headers_write` | Modify response headers | false |
-| `allow_response_body_read` | Read response body | false |
-| `allow_response_body_write` | Modify response body | false |
-| `allow_send_local_response` | Send local response | false |
-| `allow_http_calls` | HTTP external calls | false |
-| `allowed_upstreams` | Allowed upstreams | [] |
-
-### Developing Extensions with Rust
-
-#### 1. Create Project
-
-```bash
-cargo new --lib my-filter
-cd my-filter
-```
-
-#### 2. Cargo.toml
-
-```toml
-[package]
-name = "my-filter"
-version = "0.1.0"
-edition = "2021"
-
-[lib]
-crate-type = ["cdylib"]
-
-[dependencies]
-proxy-wasm = "0.2"
-log = "0.4"
-
-[profile.release]
-lto = true
-opt-level = "s"
-
-[workspace]
-```
-
-#### 3. src/lib.rs
-
-```rust
-use proxy_wasm::traits::*;
-use proxy_wasm::types::*;
-
-proxy_wasm::main! {{
-    proxy_wasm::set_log_level(LogLevel::Debug);
-    proxy_wasm::set_root_context(|_| -> Box<dyn RootContext> {
-        Box::new(MyFilterRoot)
-    });
-}}
-
-struct MyFilterRoot;
-
-impl Context for MyFilterRoot {}
-
-impl RootContext for MyFilterRoot {
-    fn get_type(&self) -> Option<ContextType> {
-        Some(ContextType::HttpContext)
-    }
-
-    fn create_http_context(&self, context_id: u32) -> Option<Box<dyn HttpContext>> {
-        Some(Box::new(MyFilter { context_id }))
-    }
-}
-
-struct MyFilter {
-    context_id: u32,
-}
-
-impl Context for MyFilter {}
-
-impl HttpContext for MyFilter {
-    fn on_http_request_headers(&mut self, _: usize, _: bool) -> Action {
-        // Add custom header to request
-        self.add_http_request_header("X-My-Filter", "enabled");
-        
-        // Get header value
-        if let Some(path) = self.get_http_request_header(":path") {
-            log::info!("Request path: {}", path);
-        }
-        
-        Action::Continue
-    }
-
-    fn on_http_response_headers(&mut self, _: usize, _: bool) -> Action {
-        // Add response header
-        self.add_http_response_header("X-Processed-By", "my-filter");
-        Action::Continue
-    }
-}
-```
-
-#### 4. Build
-
-```bash
-# Add WASI target
-rustup target add wasm32-wasip1
-
-# Build
-cargo build --target wasm32-wasip1 --release
-
-# Output: target/wasm32-wasip1/release/my_filter.wasm
-```
-
-#### 5. Deploy and Configure
-
-```bash
-# Deploy WASM module
-cp target/wasm32-wasip1/release/my_filter.wasm /etc/veil/wasm/
-
-# Add configuration to config.toml
-```
-
-### External Service Integration (HTTP Calls)
-
-Use Proxy-Wasm's `dispatch_http_call` to call external HTTP services (e.g., Webdis for Redis):
-
-```rust
-fn on_http_request_headers(&mut self, _: usize, _: bool) -> Action {
-    // Access Redis via Webdis
-    self.dispatch_http_call(
-        "webdis",  // upstream name (defined in config.toml)
-        vec![
-            (":method", "GET"),
-            (":path", "/GET/my_key"),
-            (":authority", "webdis"),
-        ],
-        None,
-        vec![],
-        Duration::from_millis(50),
-    ).unwrap();
-    
-    Action::Pause  // Wait for response
-}
-
-fn on_http_call_response(&mut self, _: u32, _: usize, body_size: usize, _: usize) {
-    if let Some(body) = self.get_http_call_response_body(0, body_size) {
-        // Process value from Redis
-        log::info!("Redis response: {:?}", body);
-    }
-    self.resume_http_request();
-}
-```
-
 ## Logos
 
 <table align="center">
@@ -3446,39 +3479,6 @@ fn on_http_call_response(&mut self, _: u32, _: usize, body_size: usize, _: usize
     </td>
   </tr>
 </table>
-
-## Panic Recovery
-
-Veil implements connection-level panic catching to ensure high availability.
-
-### Behavior
-
-When a panic occurs during request processing:
-
-| Scenario | Impact |
-|----------|--------|
-| **Without panic recovery** | Worker thread crashes, all connections on that worker are terminated |
-| **With Veil's panic recovery** | Only the affected connection terminates, other connections continue normally |
-
-### Implementation
-
-- Uses `std::panic::catch_unwind` to wrap each connection's async task
-- Panics are caught at the poll level and logged as errors
-- `ConnectionGuard` ensures the connection counter is correctly decremented even on panic
-- Worker threads remain alive and continue accepting new connections
-
-### Logged Output
-
-When a panic is caught:
-```
-[ERROR] Task panicked during poll: Any { .. }
-```
-
-### Notes
-
-- This feature is automatically enabled; no configuration required
-- Only protects against panics inside `monoio::spawn` tasks
-- Panics in the accept loop or runtime initialization still terminate the worker thread
 
 ## License
 
