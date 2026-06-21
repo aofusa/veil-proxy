@@ -544,28 +544,25 @@ impl Http3Handler {
                 
                 if !modules_to_apply.is_empty() {
                     // HTTP/3のヘッダーを取得
-                    let headers_vec: Vec<(String, String)> = headers.iter()
+                    let headers_vec: Vec<(Vec<u8>, Vec<u8>)> = headers.iter()
                         .filter(|h| !h.name().starts_with(b":")) // 疑似ヘッダーを除外
-                        .map(|h| (
-                            String::from_utf8_lossy(h.name()).to_string(),
-                            String::from_utf8_lossy(h.value()).to_string()
-                        ))
+                        .map(|h| (h.name().to_vec(), h.value().to_vec()))
                         .collect();
-                    
+
                     let wasm_result = wasm_engine.on_request_headers_with_modules(
                         &modules_to_apply,
                         path_str,
                         method_str,
-                        &headers_vec,
+                        headers_vec,
                         &self.client_ip,
                         request_body.is_empty(), // end_of_stream
                     );
-                    
+
                     match wasm_result {
                         crate::wasm::FilterResult::LocalResponse(resp) => {
                             // ローカルレスポンスを返送
                             self.send_response(stream_id, resp.status_code, &resp.headers.iter()
-                                .map(|(k, v)| (k.as_bytes(), v.as_bytes()))
+                                .map(|(k, v)| (k.as_slice(), v.as_slice()))
                                 .collect::<Vec<_>>(), Some(&resp.body))?;
                             let user_agent_slice: &[u8] = if user_agent.is_empty() { &[] } else { &user_agent };
                             log_access(&method, &authority, &path, user_agent_slice, request_body.len() as u64, resp.status_code, resp.body.len() as u64, start_time);

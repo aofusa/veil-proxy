@@ -43,21 +43,17 @@ impl FilterEngine {
         })
     }
 
-    /// Execute on_request_headers callback for all modules
-    /// 
-    /// Note: This method is deprecated. Use `on_request_headers_with_modules` instead.
-    /// This method always returns Continue without applying any modules.
+    /// Execute on_request_headers callback for all modules (deprecated — no-op)
     pub fn on_request_headers(
         &self,
         _path: &str,
         _method: &str,
-        headers: &[(String, String)],
+        headers: Vec<(Vec<u8>, Vec<u8>)>,
         _client_ip: &str,
         _end_of_stream: bool,
     ) -> FilterResult {
-        // ルートレベルのmodulesフィールドを使用するため、このメソッドは使用しない
         FilterResult::Continue {
-            headers: headers.to_vec(),
+            headers,
             body: None,
         }
     }
@@ -69,18 +65,18 @@ impl FilterEngine {
         modules: &[Arc<LoadedModule>],
         path: &str,
         method: &str,
-        headers: &[(String, String)],
+        headers: Vec<(Vec<u8>, Vec<u8>)>,
         client_ip: &str,
         end_of_stream: bool,
     ) -> FilterResult {
         if modules.is_empty() {
             return FilterResult::Continue {
-                headers: headers.to_vec(),
+                headers,
                 body: None,
             };
         }
 
-        let mut current_headers = headers.to_vec();
+        let mut current_headers = headers;
 
         for module in modules {
             let result = self.execute_on_request_headers(
@@ -127,25 +123,24 @@ impl FilterEngine {
         module_names: &[String],
         path: &str,
         method: &str,
-        headers: &[(String, String)],
+        headers: Vec<(Vec<u8>, Vec<u8>)>,
         client_ip: &str,
         end_of_stream: bool,
     ) -> FilterResult {
-        // 同期実行（互換性のため維持、ただしメインループからは非推奨）
         let modules: Vec<Arc<LoadedModule>> = module_names
             .iter()
             .filter_map(|name| self.registry.get_module(name))
             .collect();
-        
+
         if modules.is_empty() {
             return FilterResult::Continue {
-                headers: headers.to_vec(),
+                headers,
                 body: None,
             };
         }
-        
-        let mut current_headers = headers.to_vec();
-        
+
+        let mut current_headers = headers;
+
         for module in &modules {
             let result = self.execute_on_request_headers(
                 module,
@@ -155,7 +150,7 @@ impl FilterEngine {
                 client_ip,
                 end_of_stream,
             );
-            
+
             match result {
                 Ok(ModuleResult::Continue { modified_headers }) => {
                     if let Some(h) = modified_headers {
@@ -178,7 +173,7 @@ impl FilterEngine {
                 }
             }
         }
-        
+
         FilterResult::Continue {
             headers: current_headers,
             body: None,
@@ -186,15 +181,13 @@ impl FilterEngine {
     }
 
     /// Execute on_request_headers for specified modules ASYNCHRONOUSLY
-    /// 
-    /// This method executes the WASM modules synchronously.
     /// Note: runs inline in the current async task to avoid cross-thread waker issues with monoio.
     pub async fn on_request_headers_with_modules_async(
         self: Arc<Self>,
         module_names: Vec<String>,
         path: String,
         method: String,
-        headers: Vec<(String, String)>,
+        headers: Vec<(Vec<u8>, Vec<u8>)>,
         client_ip: String,
         end_of_stream: bool,
     ) -> FilterResult {
@@ -202,7 +195,7 @@ impl FilterEngine {
             &module_names,
             &path,
             &method,
-            &headers,
+            headers,
             &client_ip,
             end_of_stream,
         )
@@ -214,7 +207,7 @@ impl FilterEngine {
         module: &LoadedModule,
         path: &str,
         method: &str,
-        headers: &[(String, String)],
+        headers: &[(Vec<u8>, Vec<u8>)],
         client_ip: &str,
         end_of_stream: bool,
     ) -> anyhow::Result<ModuleResult> {
@@ -342,45 +335,42 @@ impl FilterEngine {
         &self,
         _path: &str,
         _status: u16,
-        headers: &[(String, String)],
+        headers: Vec<(Vec<u8>, Vec<u8>)>,
         _end_of_stream: bool,
     ) -> FilterResult {
-        // ルートレベルのmodulesフィールドを使用するため、このメソッドは使用しない
         FilterResult::Continue {
-            headers: headers.to_vec(),
+            headers,
             body: None,
         }
     }
 
     /// Execute on_response_headers for specified modules
-    /// Execute on_response_headers for specified modules
     pub fn on_response_headers_with_modules(
         &self,
         module_names: &[String],
         status: u16,
-        headers: &[(String, String)],
+        headers: Vec<(Vec<u8>, Vec<u8>)>,
         end_of_stream: bool,
     ) -> FilterResult {
-        // 指定されたモジュール名からLoadedModuleを取得
         let modules: Vec<Arc<LoadedModule>> = module_names
             .iter()
             .filter_map(|name| self.registry.get_module(name))
             .collect();
-        
+
         if modules.is_empty() {
             return FilterResult::Continue {
-                headers: headers.to_vec(),
+                headers,
                 body: None,
             };
         }
-        
-        let mut current_headers = headers.to_vec();
-        
+
+        let mut current_headers = headers;
+
         // Execute in reverse order for response
         for module in modules.iter().rev() {
             let result =
                 self.execute_on_response_headers(module, status, &current_headers, end_of_stream);
-            
+
             match result {
                 Ok(ModuleResult::Continue { modified_headers }) => {
                     if let Some(h) = modified_headers {
@@ -402,7 +392,7 @@ impl FilterEngine {
                 }
             }
         }
-        
+
         FilterResult::Continue {
             headers: current_headers,
             body: None,
@@ -415,13 +405,13 @@ impl FilterEngine {
         self: Arc<Self>,
         module_names: Vec<String>,
         status: u16,
-        headers: Vec<(String, String)>,
+        headers: Vec<(Vec<u8>, Vec<u8>)>,
         end_of_stream: bool,
     ) -> FilterResult {
         self.on_response_headers_with_modules(
             &module_names,
             status,
-            &headers,
+            headers,
             end_of_stream,
         )
     }
@@ -431,7 +421,7 @@ impl FilterEngine {
         &self,
         module: &LoadedModule,
         status: u16,
-        headers: &[(String, String)],
+        headers: &[(Vec<u8>, Vec<u8>)],
         end_of_stream: bool,
     ) -> anyhow::Result<ModuleResult> {
         // Create context
@@ -1221,7 +1211,7 @@ impl FilterEngine {
     pub fn on_request_trailers_with_modules(
         &self,
         module_names: &[String],
-        trailers: &[(String, String)],
+        trailers: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> FilterResult {
         let modules: Vec<Arc<LoadedModule>> = module_names
             .iter()
@@ -1230,12 +1220,12 @@ impl FilterEngine {
 
         if modules.is_empty() {
             return FilterResult::Continue {
-                headers: trailers.to_vec(),
+                headers: trailers,
                 body: None,
             };
         }
 
-        let mut current_trailers = trailers.to_vec();
+        let mut current_trailers = trailers;
 
         for module in &modules {
             let result = self.execute_on_request_trailers(module, &current_trailers);
@@ -1272,7 +1262,7 @@ impl FilterEngine {
     fn execute_on_request_trailers(
         &self,
         module: &LoadedModule,
-        trailers: &[(String, String)],
+        trailers: &[(Vec<u8>, Vec<u8>)],
     ) -> anyhow::Result<ModuleResult> {
         // Create context
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
@@ -1363,7 +1353,7 @@ impl FilterEngine {
     pub fn on_response_trailers_with_modules(
         &self,
         module_names: &[String],
-        trailers: &[(String, String)],
+        trailers: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> FilterResult {
         let modules: Vec<Arc<LoadedModule>> = module_names
             .iter()
@@ -1372,12 +1362,12 @@ impl FilterEngine {
 
         if modules.is_empty() {
             return FilterResult::Continue {
-                headers: trailers.to_vec(),
+                headers: trailers,
                 body: None,
             };
         }
 
-        let mut current_trailers = trailers.to_vec();
+        let mut current_trailers = trailers;
 
         // Execute in reverse order for response
         for module in modules.iter().rev() {
@@ -1415,7 +1405,7 @@ impl FilterEngine {
     fn execute_on_response_trailers(
         &self,
         module: &LoadedModule,
-        trailers: &[(String, String)],
+        trailers: &[(Vec<u8>, Vec<u8>)],
     ) -> anyhow::Result<ModuleResult> {
         // Create context
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
@@ -1989,7 +1979,7 @@ impl FilterEngine {
 /// Result from a single module execution
 enum ModuleResult {
     Continue {
-        modified_headers: Option<Vec<(String, String)>>,
+        modified_headers: Option<Vec<(Vec<u8>, Vec<u8>)>>,
     },
     Pause,
     LocalResponse(LocalResponse),
@@ -1999,7 +1989,7 @@ enum ModuleResult {
 pub enum FilterResult {
     /// Continue with potentially modified headers/body
     Continue {
-        headers: Vec<(String, String)>,
+        headers: Vec<(Vec<u8>, Vec<u8>)>,
         body: Option<Vec<u8>>,
     },
     /// Pause processing (async operation pending)

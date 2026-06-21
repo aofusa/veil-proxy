@@ -131,7 +131,7 @@ impl From<i32> for FilterAction {
 #[derive(Debug, Clone)]
 pub struct LocalResponse {
     pub status_code: u16,
-    pub headers: Vec<(String, String)>,
+    pub headers: Vec<(Vec<u8>, Vec<u8>)>,
     pub body: Vec<u8>,
 }
 
@@ -141,21 +141,21 @@ pub struct PendingHttpCall {
     pub token: u32,
     pub upstream: String,
     pub timeout_ms: u32,
-    /// Request headers (serialized)
-    pub headers: Vec<(String, String)>,
+    /// Request headers (binary)
+    pub headers: Vec<(Vec<u8>, Vec<u8>)>,
     /// Request body
     pub body: Vec<u8>,
-    /// Request trailers (serialized)
-    pub trailers: Vec<(String, String)>,
+    /// Request trailers (binary)
+    pub trailers: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 /// HTTP call response
 #[derive(Debug, Clone)]
 pub struct HttpCallResponse {
     pub status_code: u16,
-    pub headers: Vec<(String, String)>,
+    pub headers: Vec<(Vec<u8>, Vec<u8>)>,
     pub body: Vec<u8>,
-    pub trailers: Vec<(String, String)>,
+    pub trailers: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 /// Metric value

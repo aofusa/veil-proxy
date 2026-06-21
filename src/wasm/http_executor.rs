@@ -137,25 +137,27 @@ fn build_http_request(host: &str, pending: &GlobalPendingCall) -> Result<String,
     
     // Determine method and path from headers
     let method = pending.call.headers.iter()
-        .find(|(k, _)| k == ":method")
-        .map(|(_, v)| v.as_str())
+        .find(|(k, _)| k.as_slice() == b":method")
+        .and_then(|(_, v)| std::str::from_utf8(v).ok())
         .unwrap_or("GET");
-    
+
     let path = pending.call.headers.iter()
-        .find(|(k, _)| k == ":path")
-        .map(|(_, v)| v.as_str())
+        .find(|(k, _)| k.as_slice() == b":path")
+        .and_then(|(_, v)| std::str::from_utf8(v).ok())
         .unwrap_or("/");
-    
+
     // Request line
     request.push_str(&format!("{} {} HTTP/1.1\r\n", method, path));
-    
+
     // Host header
     request.push_str(&format!("Host: {}\r\n", host));
-    
+
     // Add other headers (skip pseudo-headers)
     for (key, value) in &pending.call.headers {
-        if !key.starts_with(':') {
-            request.push_str(&format!("{}: {}\r\n", key, value));
+        if key.first().copied() != Some(b':') {
+            let k = std::str::from_utf8(key).unwrap_or("");
+            let v = std::str::from_utf8(value).unwrap_or("");
+            request.push_str(&format!("{}: {}\r\n", k, v));
         }
     }
     
@@ -229,8 +231,8 @@ fn parse_http_response_from_bytes(data: &[u8]) -> Result<HttpCallResponse, Strin
     let mut headers = Vec::new();
     for line in header_section.lines().skip(1) {
         if let Some(colon_pos) = line.find(':') {
-            let key = line[..colon_pos].trim().to_string();
-            let value = line[colon_pos + 1..].trim().to_string();
+            let key = line[..colon_pos].trim().as_bytes().to_vec();
+            let value = line[colon_pos + 1..].trim().as_bytes().to_vec();
             headers.push((key, value));
         }
     }
@@ -277,7 +279,7 @@ pub fn execute_http_call_safe(
             );
             HttpCallResponse {
                 status_code: 504,
-                headers: vec![("x-wasm-error".to_string(), "http_call_failed".to_string())],
+                headers: vec![(b"x-wasm-error".to_vec(), b"http_call_failed".to_vec())],
                 body: format!("HTTP call failed: {}", e).into_bytes(),
                 trailers: Vec::new(),
             }
@@ -300,9 +302,9 @@ mod tests {
                 upstream: "backend".to_string(),
                 timeout_ms: 5000,
                 headers: vec![
-                    (":method".to_string(), "GET".to_string()),
-                    (":path".to_string(), "/api/test".to_string()),
-                    ("user-agent".to_string(), "wasm-client".to_string()),
+                    (b":method".to_vec(), b"GET".to_vec()),
+                    (b":path".to_vec(), b"/api/test".to_vec()),
+                    (b"user-agent".to_vec(), b"wasm-client".to_vec()),
                 ],
                 body: vec![],
                 trailers: vec![],
@@ -324,7 +326,7 @@ mod tests {
         let response = parse_http_response_from_bytes(response_bytes).unwrap();
         
         assert_eq!(response.status_code, 200);
-        assert!(response.headers.iter().any(|(k, v)| k == "Content-Type" && v == "application/json"));
+        assert!(response.headers.iter().any(|(k, v)| k.as_slice() == b"Content-Type" && v.as_slice() == b"application/json"));
         assert!(response.body.starts_with(b"{\"ok\":"));
     }
 }

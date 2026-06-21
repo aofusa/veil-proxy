@@ -180,6 +180,39 @@ pub fn check_security(
 /// ログには警告として出力しますが、接続は正常終了として扱います。
 #[cfg_attr(not(feature = "http2"), allow(dead_code))]
 #[inline]
+fn build_sub_path(base: &str, remaining: &str) -> String {
+    if remaining.is_empty() {
+        if base.is_empty() {
+            "/".to_string()
+        } else {
+            let mut s = String::with_capacity(base.len() + 1);
+            s.push_str(base);
+            s.push('/');
+            s
+        }
+    } else if remaining.starts_with('/') {
+        if base.is_empty() {
+            remaining.to_string()
+        } else {
+            let mut s = String::with_capacity(base.len() + remaining.len());
+            s.push_str(base);
+            s.push_str(remaining);
+            s
+        }
+    } else if base.is_empty() {
+        let mut s = String::with_capacity(1 + remaining.len());
+        s.push('/');
+        s.push_str(remaining);
+        s
+    } else {
+        let mut s = String::with_capacity(base.len() + 1 + remaining.len());
+        s.push_str(base);
+        s.push('/');
+        s.push_str(remaining);
+        s
+    }
+}
+
 fn is_connection_closed_error(e: &std::io::Error) -> bool {
     use std::io::ErrorKind;
     
@@ -533,17 +566,14 @@ where
             
             if !modules_to_apply.is_empty() {
                 // HTTP/2のヘッダーを取得
-                let headers_vec: Vec<(String, String)> = if let Some(stream) = conn.get_stream(stream_id) {
+                let headers_vec: Vec<(Vec<u8>, Vec<u8>)> = if let Some(stream) = conn.get_stream(stream_id) {
                     stream.request_headers.iter()
-                        .map(|h| (
-                            String::from_utf8_lossy(&h.name).to_string(),
-                            String::from_utf8_lossy(&h.value).to_string()
-                        ))
+                        .map(|h| (h.name.clone(), h.value.clone()))
                         .collect()
                 } else {
                     Vec::new()
                 };
-                
+
                 let wasm_result = wasm_engine.clone().on_request_headers_with_modules_async(
                     modules_to_apply.clone(),
                     path_str.to_string(),
@@ -552,13 +582,13 @@ where
                     client_ip.to_string(),
                     body_len == 0, // end_of_stream
                 ).await;
-                
+
                 match wasm_result {
                     crate::wasm::FilterResult::LocalResponse(resp) => {
                         // ローカルレスポンスを返送
                         let server_guard = get_server_header_guard();
                         let mut headers: Vec<(&[u8], &[u8])> = resp.headers.iter()
-                            .map(|(k, v)| (k.as_bytes(), v.as_bytes()))
+                            .map(|(k, v)| (k.as_slice(), v.as_slice()))
                             .collect();
                         if let Some(ref g) = server_guard {
                             headers.push(g.as_header());
@@ -628,14 +658,10 @@ where
                 }
                 
                 // セキュリティヘッダー追加
-                let security_headers: Vec<(Vec<u8>, Vec<u8>)> = security.add_response_headers.iter()
-                    .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec()))
-                    .collect();
-                
-                for (k, v) in &security_headers {
-                    headers.push((k.as_slice(), v.as_slice()));
+                for (k, v) in &security.add_response_headers {
+                    headers.push((k.as_bytes(), v.as_bytes()));
                 }
-                
+
                 if let Err(e) = conn.send_response(stream_id, 200, &headers, Some(&data)).await {
                     warn!("[HTTP/2] Memory file response error: {}", e);
                     None
@@ -708,21 +734,14 @@ where
         if path_str.starts_with(prefix_str) {
             let remaining = &path_str[prefix_str.len()..];
             let base = target.path_prefix.trim_end_matches('/');
-            
-            if remaining.is_empty() {
-                if base.is_empty() { "/".to_string() } else { format!("{}/", base) }
-            } else if remaining.starts_with('/') {
-                if base.is_empty() { remaining.to_string() } else { format!("{}{}", base, remaining) }
-            } else {
-                if base.is_empty() { format!("/{}", remaining) } else { format!("{}/{}", base, remaining) }
-            }
+            build_sub_path(base, remaining)
         } else {
             path_str.to_string()
         }
     };
-    
+
     let final_path = if sub_path.is_empty() { "/" } else { &sub_path };
-    
+
     // リクエストボディを取得
     let request_body = if let Some(stream) = conn.get_stream(stream_id) {
         stream.request_body.clone()
@@ -1629,14 +1648,10 @@ where
     }
     
     // セキュリティヘッダー追加
-    let security_headers: Vec<(Vec<u8>, Vec<u8>)> = security.add_response_headers.iter()
-        .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec()))
-        .collect();
-    
-    for (k, v) in &security_headers {
-        headers.push((k.as_slice(), v.as_slice()));
+    for (k, v) in &security.add_response_headers {
+        headers.push((k.as_bytes(), v.as_bytes()));
     }
-    
+
     if let Err(e) = conn.send_response(stream_id, 200, &headers, Some(&data)).await {
         warn!("[HTTP/2] File response error: {}", e);
         return None;
@@ -2534,16 +2549,12 @@ async fn handle_requests(
                         let path_str = std::str::from_utf8(&path_bytes).unwrap_or("/");
                         let method_str = std::str::from_utf8(&method_bytes).unwrap_or("GET");
 
-                        // ヘッダーをString形式に変換
-                        let headers_vec: Vec<(String, String)> = headers_for_proxy.iter()
-                            .map(|(k, v)| (
-                                String::from_utf8_lossy(k).to_string(),
-                                String::from_utf8_lossy(v).to_string()
-                            ))
-                            .collect();
-
                         // モジュールを実行
                         if !modules_to_apply.is_empty() {
+                            let headers_vec: Vec<(Vec<u8>, Vec<u8>)> = headers_for_proxy.iter()
+                                .map(|(k, v)| (k.to_vec(), v.to_vec()))
+                                .collect();
+
                             let wasm_result = wasm_engine.clone().on_request_headers_with_modules_async(
                                 modules_to_apply.clone(),
                                 path_str.to_string(),
@@ -2558,8 +2569,8 @@ async fn handle_requests(
                                     // 修正されたヘッダーを使用
                                     modified_headers.iter()
                                         .map(|(k, v)| (
-                                            k.as_bytes().into(),
-                                            v.as_bytes().into()
+                                            k.clone().into_boxed_slice(),
+                                            v.clone().into_boxed_slice()
                                         ))
                                         .collect()
                                 }
@@ -2575,7 +2586,10 @@ async fn handle_requests(
                                         });
                                     let mut response = status_line.into_bytes();
                                     for (k, v) in &resp.headers {
-                                        response.extend_from_slice(format!("{}: {}\r\n", k, v).as_bytes());
+                                        response.extend_from_slice(k);
+                                        response.extend_from_slice(b": ");
+                                        response.extend_from_slice(v);
+                                        response.extend_from_slice(b"\r\n");
                                     }
                                     response.extend_from_slice(b"\r\n");
                                     response.extend_from_slice(&resp.body);
@@ -2888,10 +2902,9 @@ async fn handle_backend(
                 if !wasm_modules.is_empty() {
                     let config = CURRENT_CONFIG.load();
                     if let Some(ref wasm_engine) = config.wasm_filter_engine {
-                        // 現在のヘッダーをVec<(String, String)>形式に変換
-                        // ヘッダーラインを解析してヘッダーリストを作成
+                        // 現在のヘッダーをVec<(Vec<u8>, Vec<u8>)>形式に変換
                         let header_str = String::from_utf8_lossy(&header);
-                        let current_headers: Vec<(String, String)> = header_str.lines()
+                        let current_headers: Vec<(Vec<u8>, Vec<u8>)> = header_str.lines()
                             .skip(1) // ステータス行をスキップ
                             .filter_map(|line| {
                                 let line_trimmed = line.trim_end_matches("\r\n").trim_end_matches("\r");
@@ -2899,12 +2912,12 @@ async fn handle_backend(
                                     return None;
                                 }
                                 let colon_pos = line_trimmed.find(':')?;
-                                let name = line_trimmed[..colon_pos].to_string();
-                                let value = line_trimmed[colon_pos+1..].trim_start().to_string();
+                                let name = line_trimmed[..colon_pos].as_bytes().to_vec();
+                                let value = line_trimmed[colon_pos+1..].trim_start().as_bytes().to_vec();
                                 Some((name, value))
                             })
                             .collect();
-                        
+
                         // WASMフィルタを実行（レスポンスヘッダー処理）
                         let wasm_result = wasm_engine.clone().on_response_headers_with_modules_async(
                             wasm_modules.clone(),
@@ -2912,7 +2925,7 @@ async fn handle_backend(
                             current_headers,
                             true, // end_of_stream
                         ).await;
-                        
+
                         match wasm_result {
                             crate::wasm::FilterResult::Continue { headers: modified_headers, .. } => {
                                 // WASMから修正されたヘッダーで再構築
@@ -2923,12 +2936,12 @@ async fn handle_backend(
                                 let mut num_buf = itoa::Buffer::new();
                                 new_header.extend_from_slice(num_buf.format(data.len()).as_bytes());
                                 new_header.extend_from_slice(b"\r\n");
-                                
+
                                 // WASMから返されたヘッダーを追加
                                 for (name, value) in modified_headers {
-                                    new_header.extend_from_slice(name.as_bytes());
+                                    new_header.extend_from_slice(&name);
                                     new_header.extend_from_slice(b": ");
-                                    new_header.extend_from_slice(value.as_bytes());
+                                    new_header.extend_from_slice(&value);
                                     new_header.extend_from_slice(b"\r\n");
                                 }
                                 new_header
@@ -3112,21 +3125,14 @@ async fn handle_websocket_proxy(
         if path_str.starts_with(prefix_str) {
             let remaining = &path_str[prefix_str.len()..];
             let base = target.path_prefix.trim_end_matches('/');
-            
-            if remaining.is_empty() {
-                if base.is_empty() { "/".to_string() } else { format!("{}/", base) }
-            } else if remaining.starts_with('/') {
-                if base.is_empty() { remaining.to_string() } else { format!("{}{}", base, remaining) }
-            } else {
-                if base.is_empty() { format!("/{}", remaining) } else { format!("{}/{}", base, remaining) }
-            }
+            build_sub_path(base, remaining)
         } else {
             path_str.to_string()
         }
     };
-    
+
     let final_path = if sub_path.is_empty() { "/" } else { &sub_path };
-    
+
     // WebSocket アップグレードリクエスト構築（プール使用）
     // Connection: Upgrade と Upgrade: websocket を維持
     let mut request = request_buf_get(1024);
@@ -3855,31 +3861,12 @@ async fn handle_proxy(
         if path_str.starts_with(prefix_str) {
             let remaining = &path_str[prefix_str.len()..];
             let base = target.path_prefix.trim_end_matches('/');
-            
-            if remaining.is_empty() {
-                if base.is_empty() {
-                    "/".to_string()
-                } else {
-                    format!("{}/", base)
-                }
-            } else if remaining.starts_with('/') {
-                if base.is_empty() {
-                    remaining.to_string()
-                } else {
-                    format!("{}{}", base, remaining)
-                }
-            } else {
-                if base.is_empty() {
-                    format!("/{}", remaining)
-                } else {
-                    format!("{}/{}", base, remaining)
-                }
-            }
+            build_sub_path(base, remaining)
         } else {
             path_str.to_string()
         }
     };
-    
+
     let final_path = if sub_path.is_empty() { "/" } else { &sub_path };
 
     // HTTPリクエスト構築（プール使用）
@@ -5414,8 +5401,8 @@ async fn transfer_response_with_compression(
                         if !wasm_modules.is_empty() {
                             let config = CURRENT_CONFIG.load();
                             if let Some(ref wasm_engine) = config.wasm_filter_engine {
-                                // 現在のヘッダーをVec<(String, String)>形式に変換
-                                let current_headers: Vec<(String, String)> = new_header_lines.iter()
+                                // 現在のヘッダーをVec<(Vec<u8>, Vec<u8>)>形式に変換
+                                let current_headers: Vec<(Vec<u8>, Vec<u8>)> = new_header_lines.iter()
                                     .skip(1) // ステータス行をスキップ
                                     .filter_map(|line| {
                                         let line_str = std::str::from_utf8(line).ok()?;
@@ -5424,8 +5411,8 @@ async fn transfer_response_with_compression(
                                             return None;
                                         }
                                         let colon_pos = line_trimmed.find(':')?;
-                                        let name = line_trimmed[..colon_pos].to_string();
-                                        let value = line_trimmed[colon_pos+1..].trim_start().to_string();
+                                        let name = line_trimmed[..colon_pos].as_bytes().to_vec();
+                                        let value = line_trimmed[colon_pos+1..].trim_start().as_bytes().to_vec();
                                         Some((name, value))
                                     })
                                     .collect();
@@ -5451,7 +5438,12 @@ async fn transfer_response_with_compression(
 
                                         // WASMから返されたヘッダーを追加
                                         for (name, value) in modified_headers {
-                                            new_header_lines.push(format!("{}: {}\r\n", name, value).into_bytes());
+                                            let mut line = Vec::with_capacity(name.len() + value.len() + 4);
+                                            line.extend_from_slice(&name);
+                                            line.extend_from_slice(b": ");
+                                            line.extend_from_slice(&value);
+                                            line.extend_from_slice(b"\r\n");
+                                            new_header_lines.push(line);
                                         }
                                     }
                                     crate::wasm::FilterResult::LocalResponse(_) => {
@@ -6723,15 +6715,15 @@ async fn transfer_https_response_with_compression(
                         if !wasm_modules.is_empty() {
                             let config = CURRENT_CONFIG.load();
                             if let Some(ref wasm_engine) = config.wasm_filter_engine {
-                                let current_headers: Vec<(String, String)> = new_header_lines.iter()
+                                let current_headers: Vec<(Vec<u8>, Vec<u8>)> = new_header_lines.iter()
                                     .skip(1)
                                     .filter_map(|line| {
                                         let line_str = std::str::from_utf8(line).ok()?;
                                         let line_trimmed = line_str.trim_end_matches("\r\n");
                                         if line_trimmed.is_empty() { return None; }
                                         let colon_pos = line_trimmed.find(':')?;
-                                        let name = line_trimmed[..colon_pos].to_string();
-                                        let value = line_trimmed[colon_pos+1..].trim_start().to_string();
+                                        let name = line_trimmed[..colon_pos].as_bytes().to_vec();
+                                        let value = line_trimmed[colon_pos+1..].trim_start().as_bytes().to_vec();
                                         Some((name, value))
                                     })
                                     .collect();
@@ -6751,7 +6743,12 @@ async fn transfer_https_response_with_compression(
                                             status_code_to_reason(status_code));
                                         new_header_lines.push(status_line.into_bytes());
                                         for (name, value) in modified_headers_wasm {
-                                            new_header_lines.push(format!("{}: {}\r\n", name, value).into_bytes());
+                                            let mut line = Vec::with_capacity(name.len() + value.len() + 4);
+                                            line.extend_from_slice(&name);
+                                            line.extend_from_slice(b": ");
+                                            line.extend_from_slice(&value);
+                                            line.extend_from_slice(b"\r\n");
+                                            new_header_lines.push(line);
                                         }
                                     }
                                     _ => {}
@@ -7481,7 +7478,7 @@ async fn handle_sendfile(
             if let Some(ref wasm_engine) = config.wasm_filter_engine {
                 // 現在のヘッダーをVec<(String, String)>形式に変換
                 let header_str = String::from_utf8_lossy(&header_buf);
-                let current_headers: Vec<(String, String)> = header_str.lines()
+                let current_headers: Vec<(Vec<u8>, Vec<u8>)> = header_str.lines()
                     .skip(1) // ステータス行をスキップ
                     .filter_map(|line| {
                         let line_trimmed = line.trim_end_matches("\r\n").trim_end_matches("\r");
@@ -7489,12 +7486,12 @@ async fn handle_sendfile(
                             return None;
                         }
                         let colon_pos = line_trimmed.find(':')?;
-                        let name = line_trimmed[..colon_pos].to_string();
-                        let value = line_trimmed[colon_pos+1..].trim_start().to_string();
+                        let name = line_trimmed[..colon_pos].as_bytes().to_vec();
+                        let value = line_trimmed[colon_pos+1..].trim_start().as_bytes().to_vec();
                         Some((name, value))
                     })
                     .collect();
-                
+
                 // WASMフィルタを実行（レスポンスヘッダー処理）
                 let wasm_result = wasm_engine.clone().on_response_headers_with_modules_async(
                     wasm_modules.clone(),
@@ -7502,7 +7499,7 @@ async fn handle_sendfile(
                     current_headers,
                     true, // end_of_stream
                 ).await;
-                
+
                 match wasm_result {
                     crate::wasm::FilterResult::Continue { headers: modified_headers, .. } => {
                         // WASMから修正されたヘッダーで再構築
@@ -7513,12 +7510,12 @@ async fn handle_sendfile(
                         let mut num_buf = itoa::Buffer::new();
                         new_header.extend_from_slice(num_buf.format(file_size).as_bytes());
                         new_header.extend_from_slice(b"\r\n");
-                        
+
                         // WASMから返されたヘッダーを追加
                         for (name, value) in modified_headers {
-                            new_header.extend_from_slice(name.as_bytes());
+                            new_header.extend_from_slice(&name);
                             new_header.extend_from_slice(b": ");
-                            new_header.extend_from_slice(value.as_bytes());
+                            new_header.extend_from_slice(&value);
                             new_header.extend_from_slice(b"\r\n");
                         }
                         new_header

@@ -480,7 +480,7 @@ pub fn spawn_wasm_tick_thread() {
                                 upstream_name, pending.module_name);
                             crate::wasm::HttpCallResponse {
                                 status_code: 503,
-                                headers: vec![("x-wasm-error".to_string(), "no_healthy_servers".to_string())],
+                                headers: vec![(b"x-wasm-error".to_vec(), b"no_healthy_servers".to_vec())],
                                 body: b"No healthy upstream servers available".to_vec(),
                                 trailers: vec![],
                             }
@@ -490,7 +490,7 @@ pub fn spawn_wasm_tick_thread() {
                             upstream_name, pending.module_name);
                         crate::wasm::HttpCallResponse {
                             status_code: 502,
-                            headers: vec![("x-wasm-error".to_string(), "upstream_not_found".to_string())],
+                            headers: vec![(b"x-wasm-error".to_vec(), b"upstream_not_found".to_vec())],
                             body: format!("Upstream '{}' not found", upstream_name).into_bytes(),
                             trailers: vec![],
                         }
