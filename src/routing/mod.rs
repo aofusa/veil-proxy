@@ -16,6 +16,7 @@
 //! let route_idx = router.find_route(host, path, method, headers, query, source_ip);
 //! ```
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -97,7 +98,12 @@ impl HostRouter {
     /// Get candidate route indices for a given host
     /// Returns indices in priority order (exact -> wildcard -> any)
     pub fn get_candidates(&self, host: &str) -> Vec<usize> {
-        let host_lower = host.to_lowercase();
+        // 大文字が含まれる場合のみ lowercase を生成する（Cow で共通ケースのアロケーションを回避）
+        let host_lower: Cow<str> = if host.bytes().any(|b| b.is_ascii_uppercase()) {
+            Cow::Owned(host.to_ascii_lowercase())
+        } else {
+            Cow::Borrowed(host)
+        };
         // Remove port if present
         let host_only = host_lower.split(':').next().unwrap_or(&host_lower);
         
@@ -231,22 +237,23 @@ impl PathRouter {
     /// Get candidate route indices for a given path
     pub fn get_candidates(&self, path: &str) -> Vec<usize> {
         let mut candidates = Vec::new();
-        
+
         // 1. Try radix tree match
         if let Ok(matched) = self.router.at(path) {
             candidates.extend(matched.value.iter().copied());
         }
-        
+
         // 2. Fallback pattern matching for complex patterns
+        //    (Vec::contains による O(n²) を避けるため、後でまとめてdedup)
         for (pattern, idx) in &self.patterns {
-            if !candidates.contains(idx) && self.matches_pattern(pattern, path) {
+            if self.matches_pattern(pattern, path) {
                 candidates.push(*idx);
             }
         }
-        
+
         // 3. Any path matches
         candidates.extend(self.any_path.iter().copied());
-        
+
         candidates
     }
 
@@ -386,13 +393,14 @@ impl CidrMatcher {
     pub fn get_candidates(&self, addr: &SocketAddr) -> Vec<usize> {
         let ip = addr.ip();
         let mut candidates = Vec::new();
-        
+
         // 1. Check exact IP match
         if let Some(indices) = self.exact_ips.get(&ip) {
             candidates.extend(indices.iter().copied());
         }
-        
-        // 2. Check CIDR ranges
+
+        // 2. Check CIDR ranges — アロケーションなしで全インデックスを収集し最後にsort+dedupする
+        //    (O(n²) のVec::containsを回避)
         match ip {
             IpAddr::V4(v4) => {
                 let ip_u32 = u32::from_be_bytes(v4.octets());
@@ -403,11 +411,7 @@ impl CidrMatcher {
                         !((1u32 << (32 - prefix_len)) - 1)
                     };
                     if (ip_u32 & mask) == (*network & mask) {
-                        for idx in indices {
-                            if !candidates.contains(idx) {
-                                candidates.push(*idx);
-                            }
-                        }
+                        candidates.extend(indices.iter().copied());
                     }
                 }
             }
@@ -420,19 +424,19 @@ impl CidrMatcher {
                         !((1u128 << (128 - prefix_len)) - 1)
                     };
                     if (ip_u128 & mask) == (*network & mask) {
-                        for idx in indices {
-                            if !candidates.contains(idx) {
-                                candidates.push(*idx);
-                            }
-                        }
+                        candidates.extend(indices.iter().copied());
                     }
                 }
             }
         }
-        
+
         // 3. Any IP (routes without source_ip condition)
         candidates.extend(self.any_ip.iter().copied());
-        
+
+        // 重複除去 (exact+CIDR+any_ip のインデックスが重複する場合)
+        candidates.sort_unstable();
+        candidates.dedup();
+
         candidates
     }
     

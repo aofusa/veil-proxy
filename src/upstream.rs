@@ -358,7 +358,7 @@ pub fn find_backend_unified(
     
     // 候補ルートのみを評価（first-match）
     // 候補は既にソート済み（インデックス順）
-    info!("[Routing] Candidates for host='{}' path='{}': {:?}", host_str, path_str, candidates);
+    debug!("[Routing] Candidates for host='{}' path='{}': {:?}", host_str, path_str, candidates);
     for &route_idx in &candidates {
         if let Some(route) = routes.get(route_idx) {
             // 残りの条件（header, method, query）を評価
@@ -368,9 +368,9 @@ pub fn find_backend_unified(
                 headers,
                 query,
             );
-            
+
             if matched {
-                info!(
+                debug!(
                     "[Routing] Matched route index: {} (path={:?} action={:?})",
                     route_idx,
                     route.conditions.path,
@@ -396,7 +396,7 @@ pub fn find_backend_unified(
     }
     
     // 候補内でマッチしなかった場合
-    info!(
+    debug!(
         "No route matched in {} candidates: host='{}' path='{}' method='{}'",
         candidates.len(),
         host_str,
