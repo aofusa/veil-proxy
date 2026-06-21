@@ -189,35 +189,24 @@ pub(crate) fn is_hop_by_hop_header(name: &[u8]) -> bool {
 #[allow(dead_code)]
 pub(crate) fn strip_hop_by_hop_headers(headers: &mut Vec<(Vec<u8>, Vec<u8>)>) {
     // Connectionヘッダーで指定された追加ヘッダーを収集
+    // Connectionヘッダー値をトリムして収集（lowercase化は eq_ignore_ascii_case で不要）
     let connection_headers: Vec<Vec<u8>> = headers.iter()
         .filter(|(name, _)| name.eq_ignore_ascii_case(b"connection"))
         .flat_map(|(_, value)| {
             value.split(|&b| b == b',')
-                .map(|h| {
-                    // 前後の空白をトリム
-                    let mut start = 0;
-                    let mut end = h.len();
-                    while start < end && (h[start] == b' ' || h[start] == b'\t') {
-                        start += 1;
-                    }
-                    while end > start && (h[end - 1] == b' ' || h[end - 1] == b'\t') {
-                        end -= 1;
-                    }
-                    h[start..end].to_ascii_lowercase()
-                })
+                .map(|h| trim_ascii_whitespace(h).to_vec())
                 .filter(|h| !h.is_empty())
                 .collect::<Vec<_>>()
         })
         .collect();
 
     headers.retain(|(name, _)| {
-        let lower_name = name.to_ascii_lowercase();
-        // 標準Hop-by-hopヘッダーをチェック
-        if is_hop_by_hop_header(&lower_name) {
+        // 標準Hop-by-hopヘッダーをチェック（eq_ignore_ascii_caseで大文字小文字不問、アロケーションなし）
+        if is_hop_by_hop_header(name) {
             return false;
         }
-        // Connectionヘッダーで指定されたカスタムヘッダーもチェック
-        if connection_headers.iter().any(|h| lower_name == *h) {
+        // Connectionヘッダーで指定されたカスタムヘッダーもチェック（case-insensitive比較）
+        if connection_headers.iter().any(|h| name.eq_ignore_ascii_case(h)) {
             return false;
         }
         true
@@ -591,25 +580,24 @@ pub(crate) fn is_valid_header_value(value: &[u8]) -> bool {
 // Transfer-Encoding: chunked 検出（改善版）
 // ====================
 
+/// ASCIIの空白（スペース・タブ）をアロケーションなしでトリムする
+#[inline]
+fn trim_ascii_whitespace(s: &[u8]) -> &[u8] {
+    let start = s.iter().position(|&b| b != b' ' && b != b'\t').unwrap_or(s.len());
+    let s = &s[start..];
+    let end = s.iter().rposition(|&b| b != b' ' && b != b'\t').map(|i| i + 1).unwrap_or(0);
+    &s[..end]
+}
+
 /// Transfer-Encoding ヘッダー値から chunked かどうかを正確に判定
+///
+/// Vec割り当てなしでスライスベースのトリムを使用する。
 #[inline]
 pub(crate) fn is_chunked_encoding(value: &[u8]) -> bool {
     // カンマ区切りの各値をチェック
     for part in value.split(|&b| b == b',') {
-        // 空白をトリム
-        let trimmed: Vec<u8> = part.iter()
-            .skip_while(|&&b| b == b' ' || b == b'\t')
-            .copied()
-            .collect();
-        let trimmed: Vec<u8> = trimmed.iter()
-            .rev()
-            .skip_while(|&&b| b == b' ' || b == b'\t')
-            .copied()
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-
+        // アロケーションなしで空白をトリム
+        let trimmed = trim_ascii_whitespace(part);
         if trimmed.eq_ignore_ascii_case(b"chunked") {
             return true;
         }
@@ -799,13 +787,8 @@ pub(crate) fn parse_http_response(data: &[u8]) -> Option<ParsedResponse> {
             let is_connection_close = response.headers.iter()
                 .find(|h| h.name.eq_ignore_ascii_case("connection"))
                 .map(|h| {
-                    // 値をトリムして比較
-                    let value = h.value;
-                    let trimmed: Vec<u8> = value.iter()
-                        .skip_while(|&&b| b == b' ' || b == b'\t')
-                        .copied()
-                        .collect();
-                    trimmed.eq_ignore_ascii_case(b"close")
+                    // アロケーションなしでトリムして比較
+                    trim_ascii_whitespace(h.value).eq_ignore_ascii_case(b"close")
                 })
                 .unwrap_or(false);
 
