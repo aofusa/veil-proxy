@@ -444,50 +444,24 @@ impl Http3Handler {
 
         // バックエンド選択（統合ルーティング）
         let config = CURRENT_CONFIG.load();
-        // ヘッダーをHashMapに変換
-        let headers_map: HashMap<String, String> = headers.iter()
+
+        // ヘッダーをゼロコピーのバイト列スライスとして参照（HashMap 不要）
+        let headers_raw: Vec<(&[u8], &[u8])> = headers.iter()
             .filter(|h| !h.name().starts_with(b":")) // 疑似ヘッダーを除外
-            .map(|h| (
-                String::from_utf8_lossy(h.name()).to_lowercase(),
-                String::from_utf8_lossy(h.value()).to_string()
-            ))
+            .map(|h| (h.name(), h.value()))
             .collect();
-        
-        // クエリパラメータを抽出
-        let query_map: HashMap<String, String> = {
-            let path_str = std::str::from_utf8(&path).unwrap_or("/");
-            if let Some(query_start) = path_str.find('?') {
-                let query_str = &path_str[query_start + 1..];
-                query_str.split('&')
-                    .filter_map(|pair| {
-                        if let Some(eq_pos) = pair.find('=') {
-                            let key = crate::url_decode(&pair[..eq_pos]);
-                            let value = crate::url_decode(&pair[eq_pos + 1..]);
-                            Some((key, value))
-                        } else {
-                            let key = crate::url_decode(pair);
-                            Some((key, String::new()))
-                        }
-                    })
-                    .collect()
-            } else {
-                HashMap::new()
-            }
-        };
-        
-        // パスからクエリ部分を除去
-        let path_without_query = if let Some(query_start) = path.iter().position(|&b| b == b'?') {
-            &path[..query_start]
-        } else {
-            &path
-        };
-        
+
+        // パス/クエリ分離（スキャンを1回に統一）
+        let query_start_pos = path.iter().position(|&b| b == b'?');
+        let raw_query: &[u8] = query_start_pos.map(|i| &path[i + 1..]).unwrap_or(b"");
+        let path_without_query = query_start_pos.map(|i| &path[..i]).unwrap_or(&path);
+
         let backend_result = find_backend_unified(
             &authority,
             path_without_query,
             &method,
-            &headers_map,
-            &query_map,
+            &headers_raw,
+            raw_query,
             &self.peer_addr,
             config.route.as_slice(),
             &config.upstream_groups,
@@ -503,8 +477,8 @@ impl Http3Handler {
                     b"",
                     path_without_query,
                     &method,
-                    &headers_map,
-                    &query_map,
+                    &headers_raw,
+                    raw_query,
                     &self.peer_addr,
                     config.route.as_slice(),
                     &config.upstream_groups,
