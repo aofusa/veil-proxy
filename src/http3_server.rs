@@ -39,11 +39,11 @@ use ftlog::{info, warn, error, debug};
 
 use crate::{
     Backend, SecurityConfig, UpstreamGroup, ProxyTarget,
-    find_backend_unified, check_security, SecurityCheckResult,
-    encode_prometheus_metrics, log_access,
+    find_backend_unified, encode_prometheus_metrics, log_access,
     AcceptedEncoding, CompressionConfig, resolve_http3_compression_config,
     CURRENT_CONFIG, SHUTDOWN_FLAG,
 };
+use crate::proxy::{check_security, SecurityCheckResult};
 
 
 /// memfd_create システムコールのラッパー（セキュリティ強化版）
