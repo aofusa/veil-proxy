@@ -86,10 +86,24 @@
 //! - [rustls](https://github.com/rustls/rustls): Pure Rust TLS実装
 //! - [ktls2](https://crates.io/crates/ktls2): rustls用kTLS統合クレート
 
+// ====================
+// メモリアロケータ選択
+// mimalloc / jemalloc / system（デフォルト: mimalloc）
+// ====================
+
+#[cfg(feature = "mimalloc")]
 use mimalloc::MiMalloc;
 
+#[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
+
+#[cfg(feature = "jemalloc")]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
 
 // ktls モジュール（自前 kTLS 実装）
 #[cfg(feature = "ktls")]
@@ -149,6 +163,7 @@ pub mod buffering;
 /// - インメモリキャッシュ（DashMap + LRU）
 /// - ディスクキャッシュ（monoio::fs 非同期I/O）
 /// - Cache-Control / Vary ヘッダー対応
+/// - cache feature が無効の場合はスタブ実装を提供
 pub mod cache;
 
 /// ルーティング最適化モジュール
@@ -192,6 +207,7 @@ pub mod system;
 /// - キャッシュメトリクス
 /// - CacheSaveContext
 /// - record_request_metrics, build_metrics_response
+/// - metrics feature が無効の場合はスタブ実装を提供
 pub mod metrics;
 
 pub mod constants;
@@ -411,7 +427,7 @@ fn main() {
         default_ttl_secs: 300, // 5分
         ..Default::default()
     };
-    
+
     match cache::init_global_cache(global_cache_config) {
         Ok(()) => {
             info!("Global proxy cache initialized (max_memory=100MB, default_ttl=300s)");

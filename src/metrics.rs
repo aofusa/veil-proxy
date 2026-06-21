@@ -16,22 +16,34 @@
 // - http_active_connections: アクティブな接続数（ホスト別）
 // - http_upstream_health: アップストリームの健康状態
 //
+// metrics feature が無効の場合、全公開 API はノーオップスタブとして提供されます。
+//
 // ====================
 
+use std::sync::atomic::Ordering;
+
+// ====================
+// Prometheus 実装（metrics feature 有効時）
+// ====================
+#[cfg(feature = "metrics")]
 use once_cell::sync::Lazy;
+
+#[cfg(feature = "metrics")]
 use prometheus::{
     CounterVec, Histogram, HistogramOpts, HistogramVec, IntGaugeVec,
     Opts, Registry, TextEncoder, Encoder,
 };
-use std::sync::atomic::Ordering;
 
+#[cfg(all(feature = "metrics", feature = "cache"))]
 use crate::cache;
 
+#[cfg(feature = "metrics")]
 /// Prometheusメトリクスレジストリ（グローバル）
 pub(crate) static METRICS_REGISTRY: Lazy<Registry> = Lazy::new(|| {
     Registry::new()
 });
 
+#[cfg(feature = "metrics")]
 /// HTTPリクエスト総数カウンター（method, status, host ラベル付き）
 pub(crate) static HTTP_REQUESTS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     let opts = Opts::new("http_requests_total", "Total number of HTTP requests")
@@ -41,6 +53,7 @@ pub(crate) static HTTP_REQUESTS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     counter
 });
 
+#[cfg(feature = "metrics")]
 /// HTTPリクエスト処理時間ヒストグラム（method, host ラベル付き）
 pub(crate) static HTTP_REQUEST_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
     let opts = HistogramOpts::new("http_request_duration_seconds", "HTTP request duration in seconds")
@@ -51,6 +64,7 @@ pub(crate) static HTTP_REQUEST_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(
     histogram
 });
 
+#[cfg(feature = "metrics")]
 /// HTTPリクエストボディサイズヒストグラム
 pub(crate) static HTTP_REQUEST_SIZE_BYTES: Lazy<Histogram> = Lazy::new(|| {
     let opts = HistogramOpts::new("http_request_size_bytes", "HTTP request body size in bytes")
@@ -61,6 +75,7 @@ pub(crate) static HTTP_REQUEST_SIZE_BYTES: Lazy<Histogram> = Lazy::new(|| {
     histogram
 });
 
+#[cfg(feature = "metrics")]
 /// HTTPレスポンスボディサイズヒストグラム
 pub(crate) static HTTP_RESPONSE_SIZE_BYTES: Lazy<Histogram> = Lazy::new(|| {
     let opts = HistogramOpts::new("http_response_size_bytes", "HTTP response body size in bytes")
@@ -71,6 +86,7 @@ pub(crate) static HTTP_RESPONSE_SIZE_BYTES: Lazy<Histogram> = Lazy::new(|| {
     histogram
 });
 
+#[cfg(feature = "metrics")]
 /// アクティブ接続数ゲージ（ホスト別）
 pub(crate) static HTTP_ACTIVE_CONNECTIONS: Lazy<IntGaugeVec> = Lazy::new(|| {
     let opts = Opts::new("http_active_connections", "Number of active HTTP connections")
@@ -82,28 +98,34 @@ pub(crate) static HTTP_ACTIVE_CONNECTIONS: Lazy<IntGaugeVec> = Lazy::new(|| {
 
 /// アクティブ接続メトリクスの自動管理（Dropトレイトで自動デクリメント）
 pub(crate) struct ActiveConnectionMetric {
+    #[cfg(feature = "metrics")]
     host_name: Option<String>,
+    #[cfg(feature = "metrics")]
     enabled: bool,
 }
 
 impl ActiveConnectionMetric {
-    pub(crate) fn new(enabled: bool) -> Self {
+    pub(crate) fn new(_enabled: bool) -> Self {
         Self {
+            #[cfg(feature = "metrics")]
             host_name: None,
-            enabled,
+            #[cfg(feature = "metrics")]
+            enabled: _enabled,
         }
     }
 
-    pub(crate) fn set_host(&mut self, host: String) {
+    pub(crate) fn set_host(&mut self, _host: String) {
+        #[cfg(feature = "metrics")]
         if self.enabled && self.host_name.is_none() {
-            self.host_name = Some(host.clone());
-            HTTP_ACTIVE_CONNECTIONS.with_label_values(&[&host]).inc();
+            self.host_name = Some(_host.clone());
+            HTTP_ACTIVE_CONNECTIONS.with_label_values(&[&_host]).inc();
         }
     }
 }
 
 impl Drop for ActiveConnectionMetric {
     fn drop(&mut self) {
+        #[cfg(feature = "metrics")]
         if self.enabled {
             if let Some(ref host) = self.host_name {
                 HTTP_ACTIVE_CONNECTIONS.with_label_values(&[host]).dec();
@@ -132,6 +154,7 @@ impl Drop for ConnectionGuard {
     }
 }
 
+#[cfg(feature = "metrics")]
 /// アップストリーム健康状態ゲージ（upstream, server ラベル付き）
 /// 1 = healthy, 0 = unhealthy
 pub(crate) static HTTP_UPSTREAM_HEALTH: Lazy<IntGaugeVec> = Lazy::new(|| {
@@ -143,9 +166,10 @@ pub(crate) static HTTP_UPSTREAM_HEALTH: Lazy<IntGaugeVec> = Lazy::new(|| {
 });
 
 // ====================
-// キャッシュメトリクス
+// キャッシュメトリクス（metrics feature 有効時）
 // ====================
 
+#[cfg(feature = "metrics")]
 /// キャッシュヒット数カウンター（host ラベル付き）
 pub(crate) static CACHE_HITS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     let opts = Opts::new("cache_hits_total", "Total number of cache hits")
@@ -155,6 +179,7 @@ pub(crate) static CACHE_HITS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     counter
 });
 
+#[cfg(feature = "metrics")]
 /// キャッシュミス数カウンター（host ラベル付き）
 pub(crate) static CACHE_MISSES_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     let opts = Opts::new("cache_misses_total", "Total number of cache misses")
@@ -164,6 +189,7 @@ pub(crate) static CACHE_MISSES_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     counter
 });
 
+#[cfg(feature = "metrics")]
 /// キャッシュ保存数カウンター（host, storage ラベル付き）
 /// storage: "memory" or "disk"
 pub(crate) static CACHE_STORES_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
@@ -174,6 +200,7 @@ pub(crate) static CACHE_STORES_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     counter
 });
 
+#[cfg(feature = "metrics")]
 /// キャッシュ削除数カウンター（reason ラベル付き）
 /// reason: "expired", "lru", "invalidate"
 pub(crate) static CACHE_EVICTIONS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
@@ -184,6 +211,7 @@ pub(crate) static CACHE_EVICTIONS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     counter
 });
 
+#[cfg(feature = "metrics")]
 /// キャッシュサイズゲージ（storage ラベル付き）
 /// storage: "memory" or "disk"
 pub(crate) static CACHE_SIZE_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
@@ -194,6 +222,7 @@ pub(crate) static CACHE_SIZE_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
     gauge
 });
 
+#[cfg(feature = "metrics")]
 /// キャッシュエントリ数ゲージ
 pub(crate) static CACHE_ENTRIES: Lazy<IntGaugeVec> = Lazy::new(|| {
     let opts = Opts::new("cache_entries", "Current number of cache entries")
@@ -203,6 +232,7 @@ pub(crate) static CACHE_ENTRIES: Lazy<IntGaugeVec> = Lazy::new(|| {
     gauge
 });
 
+#[cfg(feature = "metrics")]
 /// バッファリング使用数カウンター（mode ラベル付き）
 /// バッファリングが使用された回数（ホストごと）
 pub(crate) static BUFFERING_USED_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
@@ -213,44 +243,58 @@ pub(crate) static BUFFERING_USED_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     counter
 });
 
+/// メトリクス: アップストリームヘルス状態を更新 (1=healthy, 0=unhealthy)
+#[inline]
+pub(crate) fn update_upstream_health(_upstream: &str, _server: &str, _healthy: bool) {
+    #[cfg(feature = "metrics")]
+    HTTP_UPSTREAM_HEALTH.with_label_values(&[_upstream, _server]).set(if _healthy { 1 } else { 0 });
+}
+
 /// メトリクス: キャッシュヒットを記録
 #[inline]
-pub(crate) fn record_cache_hit(host: &str) {
-    CACHE_HITS_TOTAL.with_label_values(&[host]).inc();
+pub(crate) fn record_cache_hit(_host: &str) {
+    #[cfg(feature = "metrics")]
+    CACHE_HITS_TOTAL.with_label_values(&[_host]).inc();
 }
 
 /// メトリクス: キャッシュミスを記録
 #[inline]
-pub(crate) fn record_cache_miss(host: &str) {
-    CACHE_MISSES_TOTAL.with_label_values(&[host]).inc();
+pub(crate) fn record_cache_miss(_host: &str) {
+    #[cfg(feature = "metrics")]
+    CACHE_MISSES_TOTAL.with_label_values(&[_host]).inc();
 }
 
 /// メトリクス: キャッシュ保存を記録
 #[inline]
-pub(crate) fn record_cache_store(host: &str, storage: &str) {
-    CACHE_STORES_TOTAL.with_label_values(&[host, storage]).inc();
+pub(crate) fn record_cache_store(_host: &str, _storage: &str) {
+    #[cfg(feature = "metrics")]
+    CACHE_STORES_TOTAL.with_label_values(&[_host, _storage]).inc();
 }
 
 /// メトリクス: キャッシュ削除を記録
 #[inline]
-pub(crate) fn record_cache_eviction(reason: &str, count: usize) {
-    CACHE_EVICTIONS_TOTAL.with_label_values(&[reason]).inc_by(count as f64);
+pub(crate) fn record_cache_eviction(_reason: &str, _count: usize) {
+    #[cfg(feature = "metrics")]
+    CACHE_EVICTIONS_TOTAL.with_label_values(&[_reason]).inc_by(_count as f64);
 }
 
 /// メトリクス: キャッシュサイズを更新
 #[inline]
-pub(crate) fn update_cache_size_metrics(stats: &cache::CacheStats) {
-    CACHE_SIZE_BYTES.with_label_values(&["memory"]).set(stats.memory_usage as i64);
-    CACHE_SIZE_BYTES.with_label_values(&["disk"]).set(stats.disk_usage as i64);
-    CACHE_ENTRIES.with_label_values(&["memory"]).set(stats.entries as i64);
-    CACHE_ENTRIES.with_label_values(&["disk"]).set(0); // ディスクエントリ数は別途追跡が必要
+pub(crate) fn update_cache_size_metrics(_stats: &crate::cache::CacheStats) {
+    #[cfg(all(feature = "metrics", feature = "cache"))]
+    {
+        CACHE_SIZE_BYTES.with_label_values(&["memory"]).set(_stats.memory_usage as i64);
+        CACHE_SIZE_BYTES.with_label_values(&["disk"]).set(_stats.disk_usage as i64);
+        CACHE_ENTRIES.with_label_values(&["memory"]).set(_stats.entries as i64);
+        CACHE_ENTRIES.with_label_values(&["disk"]).set(0);
+    }
 }
 
 /// メトリクス: バッファリング使用を記録
-/// バッファリングモード使用を記録
 #[inline]
-pub(crate) fn record_buffering_used(host: &str) {
-    BUFFERING_USED_TOTAL.with_label_values(&[host]).inc();
+pub(crate) fn record_buffering_used(_host: &str) {
+    #[cfg(feature = "metrics")]
+    BUFFERING_USED_TOTAL.with_label_values(&[_host]).inc();
 }
 
 // ====================
@@ -261,9 +305,11 @@ pub(crate) fn record_buffering_used(host: &str) {
 ///
 /// プロキシ処理中にレスポンスをキャプチャしてキャッシュに保存するために使用します。
 /// splice転送では使用できないため、このコンテキストが存在する場合は通常転送を使用します。
+/// cache feature が無効の場合はノーオップスタブとして機能します。
 pub struct CacheSaveContext {
     /// キャッシュキー
-    pub key: cache::CacheKey,
+    #[cfg(feature = "cache")]
+    pub key: crate::cache::CacheKey,
     /// ホスト名（メトリクス用）
     pub host: String,
     /// キャプチャしたレスポンスヘッダー
@@ -282,7 +328,8 @@ pub struct CacheSaveContext {
 
 impl CacheSaveContext {
     /// 新しいキャッシュ保存コンテキストを作成
-    pub fn new(key: cache::CacheKey, host: String, max_capture_size: usize) -> Self {
+    #[cfg(feature = "cache")]
+    pub fn new(key: crate::cache::CacheKey, host: String, max_capture_size: usize) -> Self {
         Self {
             key,
             host,
@@ -295,11 +342,28 @@ impl CacheSaveContext {
         }
     }
 
+    /// cache feature 無効時の new（引数は無視、常にノーオップ）
+    #[cfg(not(feature = "cache"))]
+    pub fn new(_key: crate::cache::CacheKey, host: String, _max_capture_size: usize) -> Self {
+        Self {
+            host,
+            captured_headers: Vec::new(),
+            captured_body: Vec::new(),
+            status_code: 0,
+            max_capture_size: 0,
+            capture_aborted: true,
+            vary_headers: None,
+        }
+    }
+
     /// ヘッダーを設定
     #[inline]
     pub fn set_headers(&mut self, headers: Vec<(Box<[u8]>, Box<[u8]>)>, status_code: u16) {
-        // Varyヘッダーを抽出
-        self.vary_headers = cache::CachePolicy::parse_vary(&headers);
+        #[cfg(feature = "cache")]
+        {
+            // Varyヘッダーを抽出
+            self.vary_headers = crate::cache::CachePolicy::parse_vary(&headers);
+        }
         self.captured_headers = headers;
         self.status_code = status_code;
     }
@@ -313,7 +377,6 @@ impl CacheSaveContext {
 
         let new_size = self.captured_body.len() + data.len();
         if new_size > self.max_capture_size {
-            // サイズ上限を超えた場合、キャプチャを中止
             self.capture_aborted = true;
             self.captured_body.clear();
             self.captured_headers.clear();
@@ -325,39 +388,49 @@ impl CacheSaveContext {
 
     /// キャッシュに保存（キャプチャ成功時のみ）
     pub fn save_to_cache(&self) -> bool {
-        if self.capture_aborted || self.captured_body.is_empty() {
-            return false;
-        }
-
-        if let Some(cache_manager) = cache::get_global_cache() {
-            let stored = cache_manager.store_with_vary(
-                self.key.clone(),
-                self.status_code,
-                self.captured_headers.clone(),
-                self.captured_body.clone(),
-                self.vary_headers.clone(),
-            );
-
-            if stored {
-                record_cache_store(&self.host, "memory");
-                ftlog::debug!("Cached response for {} (status={}, size={}, vary={:?})",
-                       self.host, self.status_code, self.captured_body.len(), self.vary_headers);
+        #[cfg(feature = "cache")]
+        {
+            if self.capture_aborted || self.captured_body.is_empty() {
+                return false;
             }
 
-            stored
-        } else {
-            false
+            if let Some(cache_manager) = crate::cache::get_global_cache() {
+                let stored = cache_manager.store_with_vary(
+                    self.key.clone(),
+                    self.status_code,
+                    self.captured_headers.clone(),
+                    self.captured_body.clone(),
+                    self.vary_headers.clone(),
+                );
+
+                if stored {
+                    record_cache_store(&self.host, "memory");
+                    ftlog::debug!("Cached response for {} (status={}, size={}, vary={:?})",
+                           self.host, self.status_code, self.captured_body.len(), self.vary_headers);
+                }
+
+                return stored;
+            }
         }
+        false
     }
 }
 
 /// Prometheusメトリクスをテキストフォーマットでエンコード
+#[cfg(feature = "metrics")]
 pub(crate) fn encode_prometheus_metrics() -> Vec<u8> {
     let encoder = TextEncoder::new();
     let metric_families = METRICS_REGISTRY.gather();
     let mut buffer = Vec::new();
     encoder.encode(&metric_families, &mut buffer).unwrap_or_default();
     buffer
+}
+
+/// metrics feature 無効時のスタブ
+#[cfg(not(feature = "metrics"))]
+#[inline]
+pub(crate) fn encode_prometheus_metrics() -> Vec<u8> {
+    Vec::new()
 }
 
 /// メトリクスを記録（リクエスト完了時に呼び出し）
@@ -369,41 +442,47 @@ pub(crate) fn encode_prometheus_metrics() -> Vec<u8> {
 /// これにより、高負荷時（数万RPS）でもヒープアロケーションを削減。
 #[inline]
 pub(crate) fn record_request_metrics(
-    method: &str,
-    host: &str,
-    status: u16,
-    req_body_size: u64,
-    resp_body_size: u64,
-    duration_secs: f64,
+    _method: &str,
+    _host: &str,
+    _status: u16,
+    _req_body_size: u64,
+    _resp_body_size: u64,
+    _duration_secs: f64,
 ) {
-    // ステータスコードを事前割り当てバッファで文字列化（アロケーション回避）
-    let mut status_buf = itoa::Buffer::new();
-    let status_str = status_buf.format(status);
+    #[cfg(feature = "metrics")]
+    {
+        // ステータスコードを事前割り当てバッファで文字列化（アロケーション回避）
+        let mut status_buf = itoa::Buffer::new();
+        let status_str = status_buf.format(_status);
 
-    // リクエスト総数をインクリメント
-    HTTP_REQUESTS_TOTAL
-        .with_label_values(&[method, status_str, host])
-        .inc();
+        HTTP_REQUESTS_TOTAL
+            .with_label_values(&[_method, status_str, _host])
+            .inc();
 
-    // 処理時間を記録
-    HTTP_REQUEST_DURATION_SECONDS
-        .with_label_values(&[method, host])
-        .observe(duration_secs);
+        HTTP_REQUEST_DURATION_SECONDS
+            .with_label_values(&[_method, _host])
+            .observe(_duration_secs);
 
-    // リクエスト/レスポンスサイズを記録
-    HTTP_REQUEST_SIZE_BYTES.observe(req_body_size as f64);
-    HTTP_RESPONSE_SIZE_BYTES.observe(resp_body_size as f64);
+        HTTP_REQUEST_SIZE_BYTES.observe(_req_body_size as f64);
+        HTTP_RESPONSE_SIZE_BYTES.observe(_resp_body_size as f64);
+    }
 }
 
 /// メトリクスエンドポイント用のHTTPレスポンスを生成
 pub(crate) fn build_metrics_response() -> Vec<u8> {
-    let body = encode_prometheus_metrics();
-    let mut response = Vec::with_capacity(256 + body.len());
-    response.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: ");
+    #[cfg(feature = "metrics")]
+    {
+        let body = encode_prometheus_metrics();
+        let mut response = Vec::with_capacity(256 + body.len());
+        response.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: ");
 
-    let mut num_buf = itoa::Buffer::new();
-    response.extend_from_slice(num_buf.format(body.len()).as_bytes());
-    response.extend_from_slice(b"\r\nConnection: close\r\n\r\n");
-    response.extend_from_slice(&body);
-    response
+        let mut num_buf = itoa::Buffer::new();
+        response.extend_from_slice(num_buf.format(body.len()).as_bytes());
+        response.extend_from_slice(b"\r\nConnection: close\r\n\r\n");
+        response.extend_from_slice(&body);
+        return response;
+    }
+
+    #[cfg(not(feature = "metrics"))]
+    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
 }

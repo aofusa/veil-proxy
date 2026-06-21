@@ -2,6 +2,8 @@
 
 use serde::Deserialize;
 use std::path::PathBuf;
+#[cfg(feature = "cache")]
+use glob;
 
 /// デフォルト値関数
 fn default_max_memory_size() -> usize { 100 * 1024 * 1024 } // 100MB
@@ -176,10 +178,11 @@ impl CacheConfig {
     }
     
     /// パスがバイパスパターンにマッチするかチェック
-    pub fn should_bypass(&self, path: &str) -> bool {
+    pub fn should_bypass(&self, _path: &str) -> bool {
+        #[cfg(feature = "cache")]
         for pattern in &self.bypass_patterns {
             if let Ok(glob) = glob::Pattern::new(pattern) {
-                if glob.matches(path) {
+                if glob.matches(_path) {
                     return true;
                 }
             }
@@ -231,6 +234,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cache")]
     fn test_bypass_patterns() {
         let config = CacheConfig {
             bypass_patterns: vec![
@@ -239,7 +243,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        
+
         assert!(config.should_bypass("/api/user/123"));
         assert!(config.should_bypass("/api/user/profile"));
         assert!(config.should_bypass("/api/session"));

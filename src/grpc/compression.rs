@@ -3,11 +3,16 @@
 //! Implements grpc-encoding compression for gRPC messages.
 //! Supports gzip, deflate, and identity (no compression).
 //!
-//! Uses existing flate2 dependency for gzip/deflate.
+//! Gzip/Deflate implementations require the `compression` feature.
+//! Without it, only identity (no compression) is functional.
 
+#[cfg(feature = "compression")]
 use std::io::{Read, Write};
+#[cfg(feature = "compression")]
 use flate2::read::{GzDecoder, DeflateDecoder};
+#[cfg(feature = "compression")]
 use flate2::write::{GzEncoder, DeflateEncoder};
+#[cfg(feature = "compression")]
 use flate2::Compression;
 
 use crate::grpc::framing::GrpcError;
@@ -20,7 +25,7 @@ pub enum GrpcCompression {
     Identity,
     /// Gzip compression
     Gzip,
-    /// Deflate compression  
+    /// Deflate compression
     Deflate,
 }
 
@@ -62,11 +67,15 @@ impl GrpcCompression {
     }
 
     /// Compress data with this encoding
-    pub fn compress(&self, data: &[u8], level: u32) -> Result<Vec<u8>, GrpcError> {
+    pub fn compress(&self, data: &[u8], _level: u32) -> Result<Vec<u8>, GrpcError> {
         match self {
             Self::Identity => Ok(data.to_vec()),
-            Self::Gzip => compress_gzip(data, level),
-            Self::Deflate => compress_deflate(data, level),
+            #[cfg(feature = "compression")]
+            Self::Gzip => compress_gzip(data, _level),
+            #[cfg(feature = "compression")]
+            Self::Deflate => compress_deflate(data, _level),
+            #[cfg(not(feature = "compression"))]
+            _ => Ok(data.to_vec()),
         }
     }
 
@@ -74,8 +83,12 @@ impl GrpcCompression {
     pub fn decompress(&self, data: &[u8]) -> Result<Vec<u8>, GrpcError> {
         match self {
             Self::Identity => Ok(data.to_vec()),
+            #[cfg(feature = "compression")]
             Self::Gzip => decompress_gzip(data),
+            #[cfg(feature = "compression")]
             Self::Deflate => decompress_deflate(data),
+            #[cfg(not(feature = "compression"))]
+            _ => Ok(data.to_vec()),
         }
     }
 }
@@ -149,6 +162,7 @@ impl GrpcCompressionConfig {
 }
 
 /// Compress data with gzip
+#[cfg(feature = "compression")]
 fn compress_gzip(data: &[u8], level: u32) -> Result<Vec<u8>, GrpcError> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::new(level));
     encoder
@@ -160,6 +174,7 @@ fn compress_gzip(data: &[u8], level: u32) -> Result<Vec<u8>, GrpcError> {
 }
 
 /// Decompress gzip data
+#[cfg(feature = "compression")]
 fn decompress_gzip(data: &[u8]) -> Result<Vec<u8>, GrpcError> {
     let mut decoder = GzDecoder::new(data);
     let mut result = Vec::new();
@@ -170,6 +185,7 @@ fn decompress_gzip(data: &[u8]) -> Result<Vec<u8>, GrpcError> {
 }
 
 /// Compress data with deflate
+#[cfg(feature = "compression")]
 fn compress_deflate(data: &[u8], level: u32) -> Result<Vec<u8>, GrpcError> {
     let mut encoder = DeflateEncoder::new(Vec::new(), Compression::new(level));
     encoder
@@ -181,6 +197,7 @@ fn compress_deflate(data: &[u8], level: u32) -> Result<Vec<u8>, GrpcError> {
 }
 
 /// Decompress deflate data
+#[cfg(feature = "compression")]
 fn decompress_deflate(data: &[u8]) -> Result<Vec<u8>, GrpcError> {
     let mut decoder = DeflateDecoder::new(data);
     let mut result = Vec::new();
@@ -195,34 +212,35 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "compression")]
     fn test_compression_roundtrip_gzip() {
         // Use larger, repetitive data that compresses well
         let original = b"Hello, gRPC compression! This is a test message. ".repeat(10);
-        
+
         let compressed = GrpcCompression::Gzip.compress(&original, 6).unwrap();
         let decompressed = GrpcCompression::Gzip.decompress(&compressed).unwrap();
-        
+
         assert_eq!(decompressed, original);
-        // Verify round-trip is successful (size check removed - small data may not compress well)
     }
 
     #[test]
+    #[cfg(feature = "compression")]
     fn test_compression_roundtrip_deflate() {
         let original = b"Hello, gRPC compression with deflate!";
-        
+
         let compressed = GrpcCompression::Deflate.compress(original, 6).unwrap();
         let decompressed = GrpcCompression::Deflate.decompress(&compressed).unwrap();
-        
+
         assert_eq!(decompressed, original);
     }
 
     #[test]
     fn test_identity_no_change() {
         let original = b"No compression";
-        
+
         let result = GrpcCompression::Identity.compress(original, 0).unwrap();
         assert_eq!(result, original);
-        
+
         let decompressed = GrpcCompression::Identity.decompress(original).unwrap();
         assert_eq!(decompressed, original);
     }
@@ -230,15 +248,15 @@ mod tests {
     #[test]
     fn test_config_negotiation() {
         let config = GrpcCompressionConfig::default();
-        
+
         // Preferred is gzip
         let accept = vec![GrpcCompression::Identity, GrpcCompression::Gzip];
         assert_eq!(config.negotiate(&accept), GrpcCompression::Gzip);
-        
+
         // Client only accepts identity
         let accept = vec![GrpcCompression::Identity];
         assert_eq!(config.negotiate(&accept), GrpcCompression::Identity);
-        
+
         // Empty accept list -> identity
         let accept: Vec<GrpcCompression> = vec![];
         assert_eq!(config.negotiate(&accept), GrpcCompression::Identity);

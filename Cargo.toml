@@ -3,20 +3,25 @@ name = "veil"
 version = "0.3.0"
 edition = "2021"
 description = "High-performance reverse proxy server using io_uring and rustls"
-license = "Apache-2.0"
+license = "Apache-2.0 OR MIT"
 authors = ["aofusa"]
 
 [features]
-default = []
+# デフォルトビルド（kTLS + HTTP/2 + mimalloc）
+default = ["ktls", "http2", "mimalloc"]
+
+# ====================
+# プロトコル系
+# ====================
 
 # kTLS（Kernel TLS）サポート
 # 自前実装の ktls モジュールによる kTLS カーネルオフロードサポート
-# 
+#
 # 要件:
 #   - Linux 5.15+ カーネル
 #   - `modprobe tls` でkTLSモジュールをロード済み
 #   - AES-GCM暗号スイートの使用
-# 
+#
 # ビルド方法: cargo build --features ktls
 ktls = []
 
@@ -29,21 +34,18 @@ http2 = []
 # UDP/QUIC を使用した HTTP/3 プロトコル
 # 注意: HTTP/3 は UDP ベースのため kTLS は使用不可
 # GSO/GRO による高パフォーマンス UDP 処理
-http3 = ["quiche"]
+http3 = ["dep:quiche"]
 
 # WASM Extension サポート (Proxy-Wasm v0.2.1)
 # Wasmtime ランタイムによる WebAssembly フィルタ
 # AOT コンパイル、Pooling Allocator、InstancePre 使用
-wasm = ["wasmtime"]
-
-# 全プロトコルサポート
-all-protocols = ["http2", "http3"]
+wasm = ["dep:wasmtime"]
 
 # gRPC サポート (HTTP/2 ベース)
 # gRPC ワイヤプロトコル（framing, headers, trailers）を実装
 # Protobuf 解析には prost を使用（オプション）
 # ビルド方法: cargo build --features grpc
-grpc = ["prost"]
+grpc = ["dep:prost"]
 
 # gRPC-Web サポート
 # ブラウザ互換の gRPC-Web プロトコル変換
@@ -54,6 +56,72 @@ grpc-web = ["grpc"]
 # HTTP/3 上の gRPC は http3 feature に依存
 grpc-full = ["grpc", "grpc-web", "http3"]
 
+# ====================
+# メモリアロケータ（排他的に1つを選択）
+# ====================
+
+# mimalloc 高速メモリアロケータ（デフォルト）
+# Huge Pages サポート付き
+# ビルド方法: cargo build --features mimalloc（デフォルトで有効）
+mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
+
+# jemalloc メモリアロケータ
+# mimalloc と排他的に使用（同時に有効化しないこと）
+# ビルド方法: cargo build --no-default-features --features "ktls,http2,jemalloc"
+jemalloc = ["dep:tikv-jemallocator"]
+
+# システムアロケータ（明示的指定用）
+# --no-default-features 時のデフォルト
+# ビルド方法: cargo build --no-default-features --features system-allocator
+system-allocator = []
+
+# ====================
+# 機能系（オプション）
+# ====================
+
+# レスポンス圧縮（Gzip/Brotli/Zstd）
+# ビルドサイズとセキュリティサーフェスを削減したい場合はオフに
+# ビルド方法: cargo build --features compression
+compression = ["dep:flate2", "dep:brotli", "dep:zstd"]
+
+# プロキシキャッシュ（インメモリ + ディスク）
+# dashmap/lru/glob を使用したレスポンスキャッシュ
+# ビルド方法: cargo build --features cache
+cache = ["dep:dashmap", "dep:glob"]
+
+# Prometheusメトリクス出力
+# リクエスト数、レイテンシ、エラー率などを計測・エクスポート
+# ビルド方法: cargo build --features metrics
+metrics = ["dep:prometheus"]
+
+# WebSocket プロキシサポート
+# Upgrade ヘッダー検出による双方向プロキシ
+# ビルド方法: cargo build --features websocket
+websocket = []
+
+# レートリミット・接続制限
+# スライディングウィンドウ式レートリミット
+# ビルド方法: cargo build --features rate-limit
+rate-limit = []
+
+# 高度なレスポンスバッファリング制御
+# 低速クライアントによるバックエンド占有防止
+# ビルド方法: cargo build --features buffering
+buffering = []
+
+# ====================
+# 複合フィーチャ（便利用）
+# ====================
+
+# 全機能ビルド
+full = [
+    "ktls", "http2", "http3",
+    "grpc-full", "wasm",
+    "compression", "cache", "metrics",
+    "websocket", "rate-limit", "buffering",
+    "mimalloc",
+]
+
 [dependencies]
 monoio = { version = "0.2.4" }
 # rustls を直接使用（ハンドシェイク後に kTLS へオフロード）
@@ -62,11 +130,14 @@ aws-lc-rs = "1.15.2"
 webpki-roots = "1.0.4"
 rustls-pki-types = "1.13.2"
 libc = "0.2.178"
-mimalloc = { version = "0.1.48", default-features = false }
+# mimalloc 高速メモリアロケータ（mimalloc feature で有効化）
+mimalloc = { version = "0.1.48", default-features = false, optional = true }
 # Huge Pages (Large OS Pages) 設定用
 # mimallocの低レベルAPIを使用してLarge OS Pagesを有効化
 # extendedフィーチャーでmi_option_set等のAPIを使用可能に
-libmimalloc-sys = { version = "0.1.44", features = ["extended"] }
+libmimalloc-sys = { version = "0.1.44", features = ["extended"], optional = true }
+# jemalloc メモリアロケータ（jemalloc feature で有効化）
+tikv-jemallocator = { version = "0.6", optional = true }
 toml = "0.9.8"
 serde = { version = "1.0.228", features = ["derive"] }
 httparse = "1.10.1"
@@ -97,9 +168,9 @@ arc-swap = "1.8.0"
 once_cell = "1.21.3"
 signal-hook = "0.4.1"
 
-# Prometheusメトリクス対応
+# Prometheusメトリクス対応（metrics feature で有効化）
 # リクエスト数、レイテンシ、エラー率などを計測・エクスポート
-prometheus = "0.14.0"
+prometheus = { version = "0.14.0", optional = true }
 clap = { version = "4.5.53", features = ["derive"] }
 
 # HTTP/3 用 QUIC 実装（Cloudflare quiche）
@@ -125,47 +196,49 @@ prost = { version = "0.13", optional = true }
 nix = { version = "0.30.1", features = ["uio", "process", "feature", "sched", "mount", "hostname"] }
 
 # ====================
-# レスポンス圧縮ライブラリ
+# レスポンス圧縮ライブラリ（compression feature で有効化）
 # ====================
 # Gzip圧縮（flate2）
 # - ストリーミング圧縮対応
 # - 圧縮レベル1-9をサポート
-flate2 = "1.1.5"
+flate2 = { version = "1.1.5", optional = true }
 
 # Brotli圧縮
 # - 高圧縮率（Gzipより10-20%効率的）
 # - ストリーミング圧縮対応
 # - 圧縮レベル0-11をサポート
-brotli = "8.0.2"
+brotli = { version = "8.0.2", optional = true }
 
 # Zstandard (zstd) 圧縮
 # - 高速かつ高圧縮率（Gzipより高速で高圧縮）
 # - ストリーミング圧縮対応
 # - 圧縮レベル1-22をサポート
-zstd = "0.13.3"
+zstd = { version = "0.13.3", optional = true }
 
 # ====================
 # プロキシキャッシュ・バッファリング制御
 # ====================
-# ロックフリー並行ハッシュマップ（キャッシュインデックス用）
+# ロックフリー並行ハッシュマップ（キャッシュインデックス用、cache feature で有効化）
 # - 高並行性アクセスに最適化
 # - スレッドセーフな挿入・削除・検索
-dashmap = "6.1.0"
+dashmap = { version = "6.1.0", optional = true }
 
-# LRU キャッシュ（メモリキャッシュのeviction用）
+# LRU キャッシュ（ルーティングキャッシュ・メモリキャッシュのeviction用）
 # - O(1)の挿入・検索・削除
 # - 最大容量制限とLRU eviction
+# - ルーティングキャッシュで常に使用するため常時有効
 lru = "0.16.2"
 
 # 高速ハッシュ関数（キャッシュキー生成用）
 # - xxHash3: 非常に高速なハッシュ関数
-# - キャッシュキーの生成とファイルパス変換に使用
+# - キャッシュキーの生成、ルーティングキャッシュ、バッファリングで使用
+# - ルーティングキャッシュ等で常時使用するため常時有効
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 
-# glob パターンマッチング（キャッシュバイパス設定用）
+# glob パターンマッチング（キャッシュバイパス設定用、cache feature で有効化）
 # - シンプルなワイルドカードパターン
 # - 正規表現より高速
-glob = "0.3.3"
+glob = { version = "0.3.3", optional = true }
 rayon = "1.12.0"
 futures = "0.3.31"
 

@@ -545,11 +545,7 @@ pub fn spawn_health_check_thread() {
                         );
 
                         // メトリクス: ヘルスチェック結果を更新
-                        if check_result {
-                            HTTP_UPSTREAM_HEALTH.with_label_values(&[name, &addr]).set(1);
-                        } else {
-                            HTTP_UPSTREAM_HEALTH.with_label_values(&[name, &addr]).set(0);
-                        }
+                        update_upstream_health(name, &addr, check_result);
 
                         if check_result {
                             server.record_success(hc_config.healthy_threshold);

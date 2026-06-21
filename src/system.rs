@@ -98,8 +98,8 @@ pub(crate) fn configure_huge_pages(enabled: bool) {
     let hp_info = check_huge_pages_availability();
 
     if hp_info.available {
-        // libmimalloc-sys を使用して Large OS Pages を有効化
-        #[cfg(target_os = "linux")]
+        // libmimalloc-sys を使用して Large OS Pages を有効化（mimalloc feature 有効時のみ）
+        #[cfg(all(target_os = "linux", feature = "mimalloc"))]
         {
             unsafe {
                 // mi_option_large_os_pages = 6 (2MiB large pages)

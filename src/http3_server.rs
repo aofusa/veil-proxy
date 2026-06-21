@@ -2083,14 +2083,15 @@ pub fn run_http3_server(
 // ====================
 
 /// HTTP/3 用レスポンスボディ圧縮ヘルパー関数
-/// 
+///
 /// バイト配列を受け取り、指定されたエンコーディングで圧縮して返します。
 /// 圧縮に失敗した場合は元のデータをそのまま返します。
+#[cfg(feature = "compression")]
 fn compress_body_h3(body: &[u8], encoding: AcceptedEncoding, compression: &CompressionConfig) -> Vec<u8> {
     use flate2::Compression;
     use flate2::write::GzEncoder;
     use std::io::Write;
-    
+
     match encoding {
         AcceptedEncoding::Zstd => {
             match zstd::encode_all(std::io::Cursor::new(body), compression.zstd_level) {
@@ -2129,6 +2130,13 @@ fn compress_body_h3(body: &[u8], encoding: AcceptedEncoding, compression: &Compr
         }
         AcceptedEncoding::Identity => body.to_vec(),
     }
+}
+
+/// compression feature 無効時のスタブ
+#[cfg(not(feature = "compression"))]
+#[inline]
+fn compress_body_h3(body: &[u8], _encoding: AcceptedEncoding, _compression: &CompressionConfig) -> Vec<u8> {
+    body.to_vec()
 }
 
 /// HTTPレスポンスのヘッダー終端（\r\n\r\n）を探す

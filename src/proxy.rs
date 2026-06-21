@@ -35,6 +35,8 @@ use crate::server::spawn_background_revalidation;
 #[cfg(feature = "ktls")]
 use crate::ktls_rustls::{RustlsAcceptor, KtlsServerStream, KtlsClientStream, SplicePipe};
 #[cfg(not(feature = "ktls"))]
+use crate::simple_tls;
+#[cfg(not(feature = "ktls"))]
 use crate::simple_tls::{SimpleTlsServerStream, SimpleTlsClientStream};
 #[cfg(feature = "http2")]
 use crate::http2;
@@ -929,22 +931,30 @@ where
             // トレイラーを送信
             if has_trailers {
                 // 特別に gRPC トレイラーを送信
-                let mut grpc_status = 0;
-                let mut grpc_message = None;
-                
-                for (name, value) in &h2c_resp.trailers {
-                    if name == b"grpc-status" {
-                        if let Ok(status_str) = std::str::from_utf8(value) {
-                            grpc_status = status_str.parse().unwrap_or(0);
+                #[cfg(feature = "grpc")]
+                {
+                    let mut grpc_status = 0;
+                    let mut grpc_message = None;
+
+                    for (name, value) in &h2c_resp.trailers {
+                        if name == b"grpc-status" {
+                            if let Ok(status_str) = std::str::from_utf8(value) {
+                                grpc_status = status_str.parse().unwrap_or(0);
+                            }
+                        } else if name == b"grpc-message" {
+                            grpc_message = std::str::from_utf8(value).ok();
                         }
-                    } else if name == b"grpc-message" {
-                        grpc_message = std::str::from_utf8(value).ok();
+                    }
+
+                    if let Err(e) = conn.send_grpc_trailers(stream_id, grpc_status, grpc_message).await {
+                        warn!("[HTTP/2] H2C send trailers error (stream_id={}): {}", stream_id, e);
+                        return None;
                     }
                 }
-                
-                if let Err(e) = conn.send_grpc_trailers(stream_id, grpc_status, grpc_message).await {
-                    warn!("[HTTP/2] H2C send trailers error (stream_id={}): {}", stream_id, e);
-                    return None;
+                #[cfg(not(feature = "grpc"))]
+                {
+                    // gRPC feature なしの場合、トレイラーをスキップ
+                    let _ = &h2c_resp.trailers;
                 }
             }
             
@@ -1497,15 +1507,15 @@ where
 
 
 /// HTTP/2 用レスポンスボディ圧縮ヘルパー関数
-/// 
+///
 /// バイト配列を受け取り、指定されたエンコーディングで圧縮して返します。
 /// 圧縮に失敗した場合は元のデータをそのまま返します。
-#[cfg(feature = "http2")]
+#[cfg(all(feature = "http2", feature = "compression"))]
 fn compress_body_h2(body: &[u8], encoding: AcceptedEncoding, compression: &CompressionConfig) -> Vec<u8> {
     use flate2::Compression;
     use flate2::write::GzEncoder;
     use std::io::Write;
-    
+
     match encoding {
         AcceptedEncoding::Zstd => {
             match zstd::encode_all(std::io::Cursor::new(body), compression.zstd_level) {
@@ -1544,6 +1554,13 @@ fn compress_body_h2(body: &[u8], encoding: AcceptedEncoding, compression: &Compr
         }
         AcceptedEncoding::Identity => body.to_vec(),
     }
+}
+
+/// compression feature 無効時のスタブ
+#[cfg(all(feature = "http2", not(feature = "compression")))]
+#[inline]
+fn compress_body_h2(body: &[u8], _encoding: AcceptedEncoding, _compression: &CompressionConfig) -> Vec<u8> {
+    body.to_vec()
 }
 
 /// HTTP/2 ファイル配信
@@ -4071,7 +4088,11 @@ async fn handle_proxy(
             // バックエンドエラー（502, 504）の場合
             if status_code == 502 || status_code == 504 {
                 // staleキャッシュを確認
-                if let Some(cache_key) = cache_save_ctx.as_ref().map(|c| c.key.clone()) {
+                #[cfg(feature = "cache")]
+                let _cache_key_opt = cache_save_ctx.as_ref().map(|c| c.key.clone());
+                #[cfg(not(feature = "cache"))]
+                let _cache_key_opt: Option<cache::CacheKey> = None;
+                if let Some(cache_key) = _cache_key_opt {
                     if let Some(cache_manager) = cache::get_global_cache() {
                         // 最大1時間のstaleキャッシュを許容
                         if let Some(stale_entry) = cache_manager.get_stale(&cache_key, 3600) {
@@ -5545,6 +5566,7 @@ async fn transfer_response_with_compression(
 
 /// 圧縮してレスポンスを転送
 /// 戻り値: (転送バイト数, backend_wants_keep_alive)
+#[cfg(feature = "compression")]
 async fn transfer_compressed_response(
     client_stream: &mut ServerTls,
     backend_stream: &mut TcpStream,
@@ -5746,8 +5768,25 @@ async fn transfer_compressed_response(
         return (total, false);
     }
     total += compressed_body.len() as u64;
-    
+
     (total, backend_wants_keep_alive)
+}
+
+/// compression feature 無効時のスタブ
+#[cfg(not(feature = "compression"))]
+async fn transfer_compressed_response(
+    client_stream: &mut ServerTls,
+    _backend_stream: &mut TcpStream,
+    original_headers: &[u8],
+    initial_body: &[u8],
+    _content_length: Option<usize>,
+    _is_chunked: bool,
+    _encoding: AcceptedEncoding,
+    _compression: &CompressionConfig,
+    backend_wants_keep_alive: bool,
+    _security: &SecurityConfig,
+) -> (u64, bool) {
+    transfer_uncompressed_fallback(client_stream, original_headers, initial_body).await
 }
 
 /// 圧縮失敗時のフォールバック（非圧縮で送信）
@@ -6812,6 +6851,7 @@ async fn transfer_https_response_with_compression(
 }
 
 /// 圧縮してHTTPSレスポンスを転送
+#[cfg(feature = "compression")]
 async fn transfer_compressed_https_response(
     client_stream: &mut ServerTls,
     backend_stream: &mut ClientTls,
@@ -6975,8 +7015,25 @@ async fn transfer_compressed_https_response(
         return (total, false);
     }
     total += compressed_body.len() as u64;
-    
+
     (total, backend_wants_keep_alive)
+}
+
+/// compression feature 無効時のスタブ
+#[cfg(not(feature = "compression"))]
+async fn transfer_compressed_https_response(
+    client_stream: &mut ServerTls,
+    _backend_stream: &mut ClientTls,
+    original_headers: &[u8],
+    initial_body: &[u8],
+    _content_length: Option<usize>,
+    _is_chunked: bool,
+    _encoding: AcceptedEncoding,
+    _compression: &CompressionConfig,
+    backend_wants_keep_alive: bool,
+    _security: &SecurityConfig,
+) -> (u64, bool) {
+    transfer_uncompressed_fallback(client_stream, original_headers, initial_body).await
 }
 
 /// HTTPSレスポンスボディを転送（圧縮なし）

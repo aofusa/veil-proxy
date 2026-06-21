@@ -37,6 +37,9 @@ use crate::pool::*;
 #[cfg(feature = "ktls")]
 use crate::ktls_rustls::{RustlsAcceptor, RustlsConnector, KtlsServerStream, KtlsClientStream};
 
+#[cfg(not(feature = "ktls"))]
+use crate::simple_tls;
+
 #[cfg(feature = "http2")]
 use crate::protocol;
 
@@ -1566,7 +1569,7 @@ thread_local! {
 }
 
 // rustls 用の TLS コネクター（kTLS 無効時は simple_tls を使用）
-#[cfg(not(feature = "ktls"))]
+#[cfg(all(not(feature = "ktls"), feature = "http2"))]
 thread_local! {
     static TLS_CONNECTOR: simple_tls::SimpleTlsConnector = {
         let config = (*simple_tls::default_client_config()).clone();
@@ -1575,12 +1578,30 @@ thread_local! {
     };
 }
 
+// HTTP/2 なし・kTLS なしの場合のコネクター
+#[cfg(all(not(feature = "ktls"), not(feature = "http2")))]
+thread_local! {
+    static TLS_CONNECTOR: simple_tls::SimpleTlsConnector = {
+        let config = (*simple_tls::default_client_config()).clone();
+        simple_tls::SimpleTlsConnector::new(Arc::new(config))
+    };
+}
+
 // 証明書検証をスキップする TLS コネクター（自己署名証明書用）
-#[cfg(not(feature = "ktls"))]
+#[cfg(all(not(feature = "ktls"), feature = "http2"))]
 thread_local! {
     static TLS_CONNECTOR_INSECURE: simple_tls::SimpleTlsConnector = {
         let config = (*simple_tls::insecure_client_config()).clone();
         let config = protocol::configure_alpn_h2_client(config, false);
+        simple_tls::SimpleTlsConnector::new(Arc::new(config))
+    };
+}
+
+// HTTP/2 なし・kTLS なしの場合の insecure コネクター
+#[cfg(all(not(feature = "ktls"), not(feature = "http2")))]
+thread_local! {
+    static TLS_CONNECTOR_INSECURE: simple_tls::SimpleTlsConnector = {
+        let config = (*simple_tls::insecure_client_config()).clone();
         simple_tls::SimpleTlsConnector::new(Arc::new(config))
     };
 }
