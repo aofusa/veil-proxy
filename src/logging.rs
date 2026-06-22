@@ -194,7 +194,8 @@ struct JsonLogMessage {
     target: Cow<'static, str>,
     file: Cow<'static, str>,
     line: Option<u32>,
-    args: String,
+    /// static なフォーマット文字列（引数なし）の場合は Borrowed でアロケーションなし
+    args: Cow<'static, str>,
 }
 
 impl Display for JsonLogMessage {
@@ -230,7 +231,11 @@ impl FtLogFormat for JsonLogFormat {
                 .or_else(|| record.file().map(|s| Cow::Owned(s.to_owned())))
                 .unwrap_or(Cow::Borrowed("")),
             line: record.line(),
-            args: format!("{}", record.args()),
+            // as_str() は引数なし static 文字列の場合にアロケーションなしで &'static str を返す。
+            // 動的引数がある場合のみ format!() でヒープ確保する（FtLogFormatter と同じ最適化）。
+            args: record.args().as_str()
+                .map(Cow::Borrowed)
+                .unwrap_or_else(|| Cow::Owned(format!("{}", record.args()))),
         })
     }
 }
@@ -463,6 +468,12 @@ pub(crate) fn log_ktls_status(ktls_config: &crate::KtlsConfig) {
 /// - 処理時間: `start_instant` からの経過時間を高精度で計測（Instant使用）
 /// - タイムスタンプ: Coarse Timer でキャッシュした時刻を使用（システムコール削減）
 /// - メトリクス: リクエスト数、処理時間、サイズをPrometheus形式で記録
+///
+/// # access-log feature との連携
+///
+/// access-log が有効な場合: 構造化ログ（JSON/テキスト）をログスレッドへ送信。
+///   テキスト形式の info!() は出力しない（二重出力防止）。
+/// access-log が無効な場合: ftlog 経由のテキスト形式のみ出力。
 pub(crate) fn log_access(
     method: &[u8],
     host: &[u8],
@@ -472,8 +483,8 @@ pub(crate) fn log_access(
     status: u16,
     resp_body_size: u64,
     start_instant: Instant,
-    client_ip: &str,   // F-21: クライアントIPアドレス
-    upstream: &str,    // F-21: アップストリームアドレス
+    client_ip: &str,
+    upstream: &str,
 ) {
     // 処理時間は Instant で高精度計測
     let duration = start_instant.elapsed();
@@ -481,20 +492,24 @@ pub(crate) fn log_access(
     let duration_secs = duration.as_secs_f64();
 
     // タイムスタンプは Coarse Timer を使用（システムコール削減）
+    // access-log feature が有効な場合はこの値を log_access_structured() にも渡す（二重 syscall 排除）
     let log_time = coarse_now();
     let path_str = std::str::from_utf8(path).unwrap_or("-");
     let ua_str = std::str::from_utf8(ua).unwrap_or("-");
     let method_str = std::str::from_utf8(method).unwrap_or("GET");
     let host_str = std::str::from_utf8(host).unwrap_or("-");
 
-    // アクセスログ出力
+    // access-log が無効な場合のみ ftlog 経由のテキストアクセスログを出力
+    // （access-log 有効時は構造化ログと二重出力しない）
+    #[cfg(not(feature = "access-log"))]
     info!("Access: time={} duration={}ms method={} host={} path={} ua={} req_body_size={} status={} resp_body_size={}",
         log_time, duration_ms, method_str, host_str, path_str, ua_str, req_body_size, status, resp_body_size);
 
     // Prometheusメトリクスを記録
     record_request_metrics(method_str, host_str, status, req_body_size, resp_body_size, duration_secs);
 
-    // 構造化アクセスログ出力（F-21、access-log feature が有効な場合のみ）
+    // 構造化アクセスログ出力（F-21）
+    // log_time と duration_ms を渡すことで syscall 二重発行と clone を排除
     #[cfg(feature = "access-log")]
     crate::access_log::log_access_structured(
         method_str,
@@ -504,7 +519,8 @@ pub(crate) fn log_access(
         req_body_size,
         status,
         resp_body_size,
-        start_instant,
+        log_time,
+        duration_ms,
         client_ip,
         upstream,
     );

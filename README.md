@@ -2895,7 +2895,11 @@ format = "json"                         # "json" or "text"
 file_path = "/var/log/veil/access.log"  # omit for stderr
 # Limit output fields (omit for all fields)
 fields = ["timestamp", "method", "host", "path", "status", "duration_ms", "client_ip", "upstream"]
+channel_size = 10000      # async channel capacity to the writer thread (default: 10000)
+flush_interval_ms = 1000  # BufWriter flush interval in ms (default: 1000)
 ```
+
+Access logs are written asynchronously by a dedicated writer thread. The hot path (worker thread) only pushes bytes into a bounded channel (`channel_size`). The writer thread holds the file/stderr handle exclusively, eliminating global lock contention. Log lines dropped when the channel is full are silently discarded without blocking request processing.
 
 ### Available Fields
 

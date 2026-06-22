@@ -81,6 +81,13 @@ pub fn spawn_reload_thread() {
 
                 match reload_config(&config_path) {
                     Ok(()) => {
+                        // アクセスログライタースレッドをホットリロード
+                        // ファイルパスやフォーマットが変わった場合、旧スレッドを終了して新スレッドを起動する
+                        #[cfg(feature = "access-log")]
+                        {
+                            let cfg = crate::config::CURRENT_CONFIG.load();
+                            crate::access_log::reload_access_log_writer(&cfg.access_log_config);
+                        }
                         info!("Configuration reloaded successfully");
                         info!("New requests will use updated routes");
                     }

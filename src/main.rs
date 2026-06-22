@@ -518,9 +518,17 @@ fn main() {
     
     info!("============================================");
 
+    // 構造化アクセスログライタースレッドを起動（access-log feature が有効な場合のみ）
+    // ホットパスの stderr グローバルロックを排除し、専用スレッドで非同期書き込みする
+    #[cfg(feature = "access-log")]
+    {
+        let cfg = CURRENT_CONFIG.load();
+        crate::access_log::init_access_log_writer(&cfg.access_log_config);
+    }
+
     // Graceful Shutdown用のシグナルハンドラを設定
     setup_signal_handler();
-    
+
     // 設定リロードスレッドを起動（SIGHUP で設定を動的更新）
     spawn_reload_thread();
     

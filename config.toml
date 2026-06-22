@@ -184,13 +184,15 @@ max_log_size = 104857600
 # [access_log]
 # enabled = true
 # format = "json"              # "json" または "text"
-# file_path = "/var/log/veil/access.log"  # 省略時は stderr（[logging] の出力先と同じ）
+# file_path = "/var/log/veil/access.log"  # 省略時は stderr
 # # 出力フィールドを限定する（省略時は全フィールドを出力）
 # fields = [
 #   "timestamp", "method", "host", "path", "status",
 #   "duration_ms", "client_ip", "upstream",
 #   "req_body_size", "resp_body_size", "user_agent"
 # ]
+# channel_size = 10000        # 非同期チャネルキャパシティ（デフォルト: 10000）
+# flush_interval_ms = 1000    # BufWriter フラッシュ間隔ミリ秒（デフォルト: 1000）
 
 # ログファイルパス（オプション）
 # 指定しない場合は標準エラー出力に出力
