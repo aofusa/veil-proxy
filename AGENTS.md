@@ -14,7 +14,7 @@ AI エージェントおよびコントリビュータ向けの **最小指針**
 
 ## 設計哲学・こだわりポイント
 
-**Rust の安全性を土台に、Linux カーネル（io_uring、kTLS、seccomp、Landlock、ソケット/CBPF）とユーザー空間を噛み合わせ、HTTP/1.1・2・3 のデータプレーンを tokio なしで高スループット化・ゼロコピー化。開発効率を度外視して最大限の性能を目指し、かつ運用で効く動的設定・観測・拡張（Proxy-Wasm）まで載せる。**
+**Rust の安全性を土台に、Linux カーネル（io_uring、kTLS、seccomp、Landlock、ソケット/CBPF）とユーザー空間を噛み合わせ、HTTP/1.1・2・3 のデータプレーンを tokio/monoio なしで高スループット化・ゼロコピー化。io_uring は `src/runtime/` の独自実装（libc + bytes クレートのみ使用）を通じて直接操作する。開発効率を度外視して最大限の性能を目指し、かつ運用で効く動的設定・観測・拡張（Proxy-Wasm）まで載せる。**
 
 変更やレビューでは、個別機能だけでなく **ここに反しないか** を意識する。
 
@@ -24,7 +24,7 @@ AI エージェントおよびコントリビュータ向けの **最小指針**
 
 変更時は **上記の設計哲学** および次の箇条書きに反しないか確認する。
 
-- **データプレーンは tokio に依存しない**（テスト・クライアント用途の tokio は別）。
+- **データプレーンは tokio / monoio に依存しない**（テスト・クライアント用途の tokio は別）。io_uring 非同期ランタイムは `src/runtime/` の独自実装を使用する。
 - **`cfg(feature = "...")` を壊さない** — `default = []` のまま、無効 feature でもコンパイル可能に保つ。
 - **Linux / カーネル前提**（io_uring、kTLS、seccomp、Landlock、CBPF 等）— README の前提と矛盾させない。
 - **ホットパス**でヒープ割り当て・不要なロック・コピーを増やさない。
@@ -108,6 +108,7 @@ cargo test --bins --test integration_tests --features "full"
 | パス | 役割 |
 |------|------|
 | `src/main.rs` | エントリ・mod 宣言・コア HTTP/1 など（下位モジュールは同 `src/` 配下） |
+| `src/runtime/` | 独自 io_uring ランタイム（ring.rs/executor.rs/tcp.rs/timer.rs/buf.rs/io.rs） |
 | `tests/`、`benches/` | 統合・E2E・ベンチ |
 | `docs/artifacts/` | AI 成果物・一時ファイル |
 | `docs/backlog/` | 機能・バグチケット（親は `backlog.md`） |

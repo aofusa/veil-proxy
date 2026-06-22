@@ -8,7 +8,7 @@
 
 # Veil - High-Performance Reverse Proxy Server
 
-A high-performance reverse proxy server using io_uring (monoio) and rustls.
+A high-performance reverse proxy server using io_uring (custom runtime) and rustls.
 
 ## Documentation
 
@@ -17,7 +17,7 @@ A high-performance reverse proxy server using io_uring (monoio) and rustls.
 ## Features
 
 ### Core Features
-- **Asynchronous I/O**: Efficient I/O processing with monoio (io_uring)
+- **Asynchronous I/O**: Efficient I/O processing with custom io_uring runtime (no monoio/tokio dependency in data plane)
 - **TLS**: Memory-safe pure Rust TLS implementation with rustls
 - **kTLS**: Kernel TLS offload support via rustls + custom kTLS module (Linux 5.15+)
 - **HTTP/2**: HTTP/2 support via TLS ALPN negotiation (stream multiplexing, HPACK compression)
@@ -74,7 +74,8 @@ A high-performance reverse proxy server using io_uring (monoio) and rustls.
 - **Rate Limiter**: Sliding window rate limiting
 - **IP Restriction**: IP address filtering with CIDR support
 - **Privilege Dropping**: Drop to unprivileged user after root startup
-- **seccomp Filter**: BPF-based system call restriction (optional)
+- **seccomp Filter**: BPF-based system call restriction with argument-level PROT_EXEC validation for mmap/mprotect (optional)
+- **io_uring Opcode Restrictions**: `IORING_REGISTER_RESTRICTIONS` applied at ring creation to allow only necessary opcodes (ACCEPT/RECV/SEND/CONNECT/TIMEOUT/SPLICE/POLL_ADD)
 - **Landlock Sandbox**: Filesystem access restriction (Linux 5.13+)
 - **systemd Sandbox**: Namespace isolation and system call restriction support
 

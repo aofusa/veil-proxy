@@ -8,7 +8,7 @@
 
 # Veil - High-Performance Reverse Proxy Server
 
-io_uring (monoio) と rustls を使用した高性能リバースプロキシサーバー。
+io_uring（独自実装ランタイム）と rustls を使用した高性能リバースプロキシサーバー。
 
 ## ドキュメント
 
@@ -17,7 +17,7 @@ io_uring (monoio) と rustls を使用した高性能リバースプロキシサ
 ## 特徴
 
 ### コア機能
-- **非同期I/O**: monoio (io_uring) による効率的なI/O処理
+- **非同期I/O**: 独自実装 io_uring ランタイムによる効率的なI/O処理（データプレーンで monoio/tokio に非依存）
 - **TLS**: rustls によるメモリ安全な Pure Rust TLS実装
 - **kTLS**: rustls + 独自実装のカーネルTLSモジュールによるカーネルTLSオフロード対応（Linux 5.15+）
 - **HTTP/2**: TLS ALPNネゴシエーションによるHTTP/2サポート（ストリーム多重化、HPACK圧縮）
@@ -74,7 +74,8 @@ io_uring (monoio) と rustls を使用した高性能リバースプロキシサ
 - **レートリミッター**: スライディングウィンドウ方式のレート制限
 - **IP制限**: CIDR対応のIPアドレスフィルタリング
 - **権限降格**: root起動後の非特権ユーザーへの降格
-- **seccompフィルタ**: BPFベースのシステムコール制限（オプション）
+- **seccompフィルタ**: BPFベースのシステムコール制限 + mmap/mprotect の PROT_EXEC 引数レベル検証（オプション）
+- **io_uringオペコード制限**: リング作成時に `IORING_REGISTER_RESTRICTIONS` を適用し、必要なオペコード（ACCEPT/RECV/SEND/CONNECT/TIMEOUT/SPLICE/POLL_ADD）のみ許可
 - **Landlockサンドボックス**: ファイルシステムアクセス制限（Linux 5.13+）
 - **systemdサンドボックス**: 名前空間隔離・システムコール制限対応
 
