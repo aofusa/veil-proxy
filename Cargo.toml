@@ -123,6 +123,13 @@ opentelemetry = []
 # ビルド方法: cargo build --features admin
 admin = []
 
+# 構造化アクセスログ（F-21）
+# JSON / テキスト形式でリクエスト単位のアクセスログを出力する。
+# スレッドローカルバッファによりヒープアロケーションを最小化。
+# アプリケーションログ（[logging]）とは独立したファイルに書き込める。
+# ビルド方法: cargo build --features access-log
+access-log = []
+
 # ====================
 # 複合フィーチャ（便利用）
 # ====================
@@ -136,6 +143,7 @@ full = [
     "websocket", "rate-limit", "buffering",
     "mimalloc",
     "admin",
+    "access-log",
 ]
 
 [dependencies]

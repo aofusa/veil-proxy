@@ -221,6 +221,7 @@ pub mod http_utils;
 /// 構造化アクセスログモジュール（F-21）
 /// - AccessLogConfig（JSON/テキスト形式、フィールドフィルタリング）
 /// - log_access_structured（スレッドローカルバッファによる低アロケーション実装）
+#[cfg(feature = "access-log")]
 pub mod access_log;
 use crate::pool::*;
 #[cfg(test)]
@@ -425,6 +426,7 @@ fn main() {
         prometheus_config: Arc::new(loaded_config.prometheus_config.clone()),
         #[cfg(feature = "admin")]
         admin_config: Arc::new(loaded_config.admin_config.clone()),
+        #[cfg(feature = "access-log")]
         access_log_config: Arc::new(loaded_config.access_log_config.clone()),
         upstream_groups: loaded_config.upstream_groups.clone(),
         #[cfg(feature = "http2")]

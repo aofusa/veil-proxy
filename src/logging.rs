@@ -494,7 +494,8 @@ pub(crate) fn log_access(
     // Prometheusメトリクスを記録
     record_request_metrics(method_str, host_str, status, req_body_size, resp_body_size, duration_secs);
 
-    // 構造化アクセスログ出力（F-21）
+    // 構造化アクセスログ出力（F-21、access-log feature が有効な場合のみ）
+    #[cfg(feature = "access-log")]
     crate::access_log::log_access_structured(
         method_str,
         host_str,

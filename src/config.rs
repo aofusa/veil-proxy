@@ -2259,6 +2259,7 @@ struct Config {
     #[serde(default)]
     admin: AdminConfig,
     /// 構造化アクセスログ設定（F-21）
+    #[cfg(feature = "access-log")]
     #[serde(default)]
     access_log: crate::access_log::AccessLogConfig,
     /// OpenTelemetry 設定（F-10）
@@ -4436,6 +4437,7 @@ pub struct LoadedConfig {
     #[cfg(feature = "admin")]
     pub admin_config: AdminConfig,
     /// 構造化アクセスログ設定（F-21）
+    #[cfg(feature = "access-log")]
     pub access_log_config: crate::access_log::AccessLogConfig,
     /// OpenTelemetry 設定（F-10）
     pub opentelemetry: OpenTelemetryConfig,
@@ -4516,6 +4518,7 @@ pub struct RuntimeConfig {
     #[cfg(feature = "admin")]
     pub admin_config: Arc<AdminConfig>,
     /// 構造化アクセスログ設定（F-21）
+    #[cfg(feature = "access-log")]
     pub access_log_config: Arc<crate::access_log::AccessLogConfig>,
     /// Upstream グループ（健康チェック用）
     pub upstream_groups: Arc<HashMap<String, Arc<UpstreamGroup>>>,
@@ -4554,6 +4557,7 @@ impl Default for RuntimeConfig {
             prometheus_config: Arc::new(PrometheusConfig::default()),
             #[cfg(feature = "admin")]
             admin_config: Arc::new(AdminConfig::default()),
+            #[cfg(feature = "access-log")]
             access_log_config: Arc::new(crate::access_log::AccessLogConfig::default()),
             upstream_groups: Arc::new(HashMap::new()),
             #[cfg(feature = "http2")]
@@ -4625,6 +4629,7 @@ pub fn reload_config(path: &Path) -> io::Result<()> {
         prometheus_config: Arc::new(loaded.prometheus_config),
         #[cfg(feature = "admin")]
         admin_config: Arc::new(loaded.admin_config),
+        #[cfg(feature = "access-log")]
         access_log_config: Arc::new(loaded.access_log_config),
         upstream_groups: loaded.upstream_groups,
         #[cfg(feature = "http2")]
@@ -4663,6 +4668,7 @@ pub struct LoadedConfigWithoutTls {
     #[cfg(feature = "admin")]
     pub admin_config: AdminConfig,
     /// 構造化アクセスログ設定（F-21）
+    #[cfg(feature = "access-log")]
     pub access_log_config: crate::access_log::AccessLogConfig,
     pub upstream_groups: Arc<HashMap<String, Arc<UpstreamGroup>>>,
     #[cfg(feature = "http2")]
@@ -4767,6 +4773,7 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
         prometheus_config: config.prometheus,
         #[cfg(feature = "admin")]
         admin_config,
+        #[cfg(feature = "access-log")]
         access_log_config: config.access_log,
         upstream_groups: Arc::new(upstream_groups),
         #[cfg(feature = "http2")]
@@ -5013,6 +5020,7 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
             a.compute_derived();
             a
         },
+        #[cfg(feature = "access-log")]
         access_log_config: config.access_log,
         opentelemetry: config.opentelemetry,
         upstream_groups: Arc::new(upstream_groups),
