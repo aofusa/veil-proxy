@@ -1,7 +1,11 @@
 //! Filter Engine for executing WASM modules
 //!
-//! Manages the execution of Proxy-Wasm filter chains.
+//! スレッドローカルインスタンスプールによる高性能 WASM 実行エンジン。
+//! 各ワーカースレッドが専用のモジュールキャッシュを持つことで、
+//! Arc デリファレンス・HashMap ルックアップのオーバーヘッドを削減する。
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use wasmtime::Store;
@@ -9,6 +13,32 @@ use wasmtime::Store;
 use super::context::{HostState, HttpContext};
 use super::registry::{LoadedModule, ModuleRegistry};
 use super::types::{FilterAction, LocalResponse, WasmConfig};
+
+// ====================
+// スレッドローカルインスタンスプール
+// ====================
+
+/// スレッドローカルモジュールキャッシュ
+///
+/// 各ワーカースレッドがモジュール名 → Arc<LoadedModule> のマップを保持する。
+/// これによりホットパスでの Arc クローン・HashMap ルックアップを局所化する。
+thread_local! {
+    static MODULE_CACHE: RefCell<HashMap<String, Arc<LoadedModule>>> = RefCell::new(HashMap::new());
+}
+
+/// スレッドローカルキャッシュからモジュールを取得（なければ登録）
+#[allow(dead_code)]
+fn get_cached_module(name: &str, module: &Arc<LoadedModule>) -> Arc<LoadedModule> {
+    MODULE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(m) = cache.get(name) {
+            Arc::clone(m)
+        } else {
+            cache.insert(name.to_owned(), Arc::clone(module));
+            Arc::clone(module)
+        }
+    })
+}
 
 /// Filter engine for executing WASM modules
 pub struct FilterEngine {
@@ -108,11 +138,7 @@ impl FilterEngine {
                     return FilterResult::LocalResponse(resp);
                 }
                 Err(e) => {
-                    ftlog::error!(
-                        "[wasm:{}] on_request_headers error: {}",
-                        module.name,
-                        e
-                    );
+                    ftlog::error!("[wasm:{}] on_request_headers error: {}", module.name, e);
                     // Continue on error
                 }
             }
@@ -171,11 +197,7 @@ impl FilterEngine {
                     return FilterResult::LocalResponse(resp);
                 }
                 Err(e) => {
-                    ftlog::error!(
-                        "[wasm:{}] on_request_headers error: {}",
-                        module.name,
-                        e
-                    );
+                    ftlog::error!("[wasm:{}] on_request_headers error: {}", module.name, e);
                     // Continue on error
                 }
             }
@@ -255,53 +277,99 @@ impl FilterEngine {
                 Err(e) => ftlog::error!("[wasm:{}] _initialize() failed: {}", module.name, e),
             }
         } else {
-            ftlog::warn!("[wasm:{}] Neither _start nor _initialize exported", module.name);
+            ftlog::warn!(
+                "[wasm:{}] Neither _start nor _initialize exported",
+                module.name
+            );
         }
 
-        let root_context_id = 1i32;    // Root context ID (SDK uses 1)
-        let http_context_id = 2i32;    // HTTP context ID
+        let root_context_id = 1i32; // Root context ID (SDK uses 1)
+        let http_context_id = 2i32; // HTTP context ID
         let config_size = module.configuration.len() as i32;
 
         // Step 1: Create ROOT context first (parent_context_id = 0 means root)
         // This MUST be called BEFORE proxy_on_vm_start
         // Note: proxy_on_context_create has signature (i32, i32) -> void
-        if let Ok(func) = instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create") {
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
             match func.call(&mut store, (root_context_id, 0)) {
-                Ok(()) => ftlog::debug!("[wasm:{}] proxy_on_context_create({}, 0) OK", module.name, root_context_id),
-                Err(e) => ftlog::error!("[wasm:{}] proxy_on_context_create({}, 0) failed: {}", module.name, root_context_id, e),
+                Ok(()) => ftlog::debug!(
+                    "[wasm:{}] proxy_on_context_create({}, 0) OK",
+                    module.name,
+                    root_context_id
+                ),
+                Err(e) => ftlog::error!(
+                    "[wasm:{}] proxy_on_context_create({}, 0) failed: {}",
+                    module.name,
+                    root_context_id,
+                    e
+                ),
             }
         } else {
-            ftlog::debug!("[wasm:{}] proxy_on_context_create not exported", module.name);
+            ftlog::debug!(
+                "[wasm:{}] proxy_on_context_create not exported",
+                module.name
+            );
         }
 
         // Step 2: Call proxy_on_vm_start on the root context
-        if let Ok(func) = instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start") {
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
+        {
             match func.call(&mut store, (root_context_id, config_size)) {
-                Ok(ret) => ftlog::debug!("[wasm:{}] proxy_on_vm_start({}, {}) => {}", module.name, root_context_id, config_size, ret),
+                Ok(ret) => ftlog::debug!(
+                    "[wasm:{}] proxy_on_vm_start({}, {}) => {}",
+                    module.name,
+                    root_context_id,
+                    config_size,
+                    ret
+                ),
                 Err(e) => ftlog::error!("[wasm:{}] proxy_on_vm_start failed: {}", module.name, e),
             }
         }
 
         // Step 3: Call proxy_on_configure on the root context
-        if let Ok(func) = instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure") {
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
+        {
             match func.call(&mut store, (root_context_id, config_size)) {
-                Ok(ret) => ftlog::debug!("[wasm:{}] proxy_on_configure({}, {}) => {}", module.name, root_context_id, config_size, ret),
+                Ok(ret) => ftlog::debug!(
+                    "[wasm:{}] proxy_on_configure({}, {}) => {}",
+                    module.name,
+                    root_context_id,
+                    config_size,
+                    ret
+                ),
                 Err(e) => ftlog::error!("[wasm:{}] proxy_on_configure failed: {}", module.name, e),
             }
         }
 
         // Step 4: Create HTTP context with root as parent
         // Note: proxy_on_context_create has signature (i32, i32) -> void
-        if let Ok(func) = instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create") {
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
             match func.call(&mut store, (http_context_id, root_context_id)) {
-                Ok(()) => ftlog::debug!("[wasm:{}] proxy_on_context_create({}, {}) OK", module.name, http_context_id, root_context_id),
-                Err(e) => ftlog::error!("[wasm:{}] proxy_on_context_create({}, {}) failed: {}", module.name, http_context_id, root_context_id, e),
+                Ok(()) => ftlog::debug!(
+                    "[wasm:{}] proxy_on_context_create({}, {}) OK",
+                    module.name,
+                    http_context_id,
+                    root_context_id
+                ),
+                Err(e) => ftlog::error!(
+                    "[wasm:{}] proxy_on_context_create({}, {}) failed: {}",
+                    module.name,
+                    http_context_id,
+                    root_context_id,
+                    e
+                ),
             }
         }
 
         // Now call proxy_on_request_headers
-        let callback = instance
-            .get_typed_func::<(i32, i32, i32), i32>(&mut store, "proxy_on_request_headers");
+        let callback =
+            instance.get_typed_func::<(i32, i32, i32), i32>(&mut store, "proxy_on_request_headers");
 
         let action = match callback {
             Ok(func) => {
@@ -335,7 +403,7 @@ impl FilterEngine {
     }
 
     /// Execute on_response_headers callback for all modules (reverse order)
-    /// 
+    ///
     /// Note: This method is deprecated. Use `on_response_headers_with_modules` instead.
     /// This method always returns Continue without applying any modules.
     pub fn on_response_headers(
@@ -398,11 +466,7 @@ impl FilterEngine {
                     return FilterResult::LocalResponse(resp);
                 }
                 Err(e) => {
-                    ftlog::error!(
-                        "[wasm:{}] on_response_headers error: {}",
-                        module.name,
-                        e
-                    );
+                    ftlog::error!("[wasm:{}] on_response_headers error: {}", module.name, e);
                 }
             }
         }
@@ -422,12 +486,7 @@ impl FilterEngine {
         headers: Vec<(Vec<u8>, Vec<u8>)>,
         end_of_stream: bool,
     ) -> FilterResult {
-        self.on_response_headers_with_modules(
-            &module_names,
-            status,
-            headers,
-            end_of_stream,
-        )
+        self.on_response_headers_with_modules(&module_names, status, headers, end_of_stream)
     }
 
     /// Execute on_response_headers for a single module
@@ -461,27 +520,35 @@ impl FilterEngine {
             let _ = func.call(&mut store, ());
         }
 
-        let root_context_id = 1i32;    // Root context ID
-        let http_context_id = 2i32;    // HTTP context ID
+        let root_context_id = 1i32; // Root context ID
+        let http_context_id = 2i32; // HTTP context ID
         let config_size = module.configuration.len() as i32;
 
         // Step 1: Create ROOT context first (parent=0 means root)
-        if let Ok(func) = instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create") {
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
             let _ = func.call(&mut store, (root_context_id, 0));
         }
 
         // Step 2: Call proxy_on_vm_start
-        if let Ok(func) = instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start") {
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
+        {
             let _ = func.call(&mut store, (root_context_id, config_size));
         }
 
         // Step 3: Call proxy_on_configure
-        if let Ok(func) = instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure") {
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
+        {
             let _ = func.call(&mut store, (root_context_id, config_size));
         }
 
         // Step 4: Create HTTP context with root as parent
-        if let Ok(func) = instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create") {
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
             let _ = func.call(&mut store, (http_context_id, root_context_id));
         }
 
@@ -535,7 +602,10 @@ impl FilterEngine {
         let module = match self.registry.get_module(module_name) {
             Some(m) => m,
             None => {
-                ftlog::warn!("[wasm] Module '{}' not found for HTTP call response", module_name);
+                ftlog::warn!(
+                    "[wasm] Module '{}' not found for HTTP call response",
+                    module_name
+                );
                 return FilterResult::Continue {
                     headers: Vec::new(),
                     body: None,
@@ -573,7 +643,7 @@ impl FilterEngine {
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_configuration = module.configuration.clone();
-        
+
         // Store the response in context
         http_ctx.http_call_responses.insert(token, response.clone());
         http_ctx.current_http_call_token = Some(token);
@@ -601,42 +671,68 @@ impl FilterEngine {
         let config_size = module.configuration.len() as i32;
 
         // Step 1: Create ROOT context
-        if let Ok(func) = instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create") {
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
             let _ = func.call(&mut store, (root_context_id, 0));
         }
 
         // Step 2: Call proxy_on_vm_start
-        if let Ok(func) = instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start") {
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
+        {
             let _ = func.call(&mut store, (root_context_id, config_size));
         }
 
         // Step 3: Call proxy_on_configure
-        if let Ok(func) = instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure") {
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
+        {
             let _ = func.call(&mut store, (root_context_id, config_size));
         }
 
         // Step 4: Create HTTP context with root as parent
-        if let Ok(func) = instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create") {
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
             let _ = func.call(&mut store, (http_context_id, root_context_id));
         }
 
         // Call proxy_on_http_call_response
         // Signature: (context_id, token, num_headers, body_size, num_trailers) -> void
-        let callback = instance
-            .get_typed_func::<(i32, i32, i32, i32, i32), ()>(&mut store, "proxy_on_http_call_response");
+        let callback = instance.get_typed_func::<(i32, i32, i32, i32, i32), ()>(
+            &mut store,
+            "proxy_on_http_call_response",
+        );
 
         match callback {
             Ok(func) => {
                 let num_headers = response.headers.len() as i32;
                 let body_size = response.body.len() as i32;
                 let num_trailers = response.trailers.len() as i32;
-                
-                if let Err(e) = func.call(&mut store, (http_context_id, token as i32, num_headers, body_size, num_trailers)) {
-                    ftlog::debug!("[wasm:{}] proxy_on_http_call_response returned: {}", module.name, e);
+
+                if let Err(e) = func.call(
+                    &mut store,
+                    (
+                        http_context_id,
+                        token as i32,
+                        num_headers,
+                        body_size,
+                        num_trailers,
+                    ),
+                ) {
+                    ftlog::debug!(
+                        "[wasm:{}] proxy_on_http_call_response returned: {}",
+                        module.name,
+                        e
+                    );
                 }
             }
             Err(_) => {
-                ftlog::debug!("[wasm:{}] proxy_on_http_call_response not exported", module.name);
+                ftlog::debug!(
+                    "[wasm:{}] proxy_on_http_call_response not exported",
+                    module.name
+                );
             }
         }
 
@@ -695,19 +791,13 @@ impl FilterEngine {
                     return BodyFilterResult::LocalResponse(resp);
                 }
                 Err(e) => {
-                    ftlog::error!(
-                        "[wasm:{}] on_request_body error: {}",
-                        module.name,
-                        e
-                    );
+                    ftlog::error!("[wasm:{}] on_request_body error: {}", module.name, e);
                     // Continue on error
                 }
             }
         }
 
-        BodyFilterResult::Continue {
-            body: current_body,
-        }
+        BodyFilterResult::Continue { body: current_body }
     }
 
     /// Execute on_request_body for specified modules ASYNCHRONOUSLY
@@ -730,7 +820,9 @@ impl FilterEngine {
     ) -> anyhow::Result<BodyModuleResult> {
         // Check capability
         if !module.capabilities.allow_request_body_read {
-            return Ok(BodyModuleResult::Continue { modified_body: None });
+            return Ok(BodyModuleResult::Continue {
+                modified_body: None,
+            });
         }
 
         // Create context
@@ -760,26 +852,34 @@ impl FilterEngine {
         let http_context_id = 2i32;
         let config_size = module.configuration.len() as i32;
 
-        if let Ok(func) = instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create") {
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
             let _ = func.call(&mut store, (root_context_id, 0));
         }
 
-        if let Ok(func) = instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start") {
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
+        {
             let _ = func.call(&mut store, (root_context_id, config_size));
         }
 
-        if let Ok(func) = instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure") {
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
+        {
             let _ = func.call(&mut store, (root_context_id, config_size));
         }
 
-        if let Ok(func) = instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create") {
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
             let _ = func.call(&mut store, (http_context_id, root_context_id));
         }
 
         // Call proxy_on_request_body
         // Signature: (context_id, body_size, end_of_stream) -> action
-        let callback = instance
-            .get_typed_func::<(i32, i32, i32), i32>(&mut store, "proxy_on_request_body");
+        let callback =
+            instance.get_typed_func::<(i32, i32, i32), i32>(&mut store, "proxy_on_request_body");
 
         let action = match callback {
             Ok(func) => {
@@ -849,18 +949,12 @@ impl FilterEngine {
                     return BodyFilterResult::LocalResponse(resp);
                 }
                 Err(e) => {
-                    ftlog::error!(
-                        "[wasm:{}] on_response_body error: {}",
-                        module.name,
-                        e
-                    );
+                    ftlog::error!("[wasm:{}] on_response_body error: {}", module.name, e);
                 }
             }
         }
 
-        BodyFilterResult::Continue {
-            body: current_body,
-        }
+        BodyFilterResult::Continue { body: current_body }
     }
 
     /// Execute on_response_body for specified modules ASYNCHRONOUSLY
@@ -883,7 +977,9 @@ impl FilterEngine {
     ) -> anyhow::Result<BodyModuleResult> {
         // Check capability
         if !module.capabilities.allow_response_body_read {
-            return Ok(BodyModuleResult::Continue { modified_body: None });
+            return Ok(BodyModuleResult::Continue {
+                modified_body: None,
+            });
         }
 
         // Create context
@@ -913,26 +1009,34 @@ impl FilterEngine {
         let http_context_id = 2i32;
         let config_size = module.configuration.len() as i32;
 
-        if let Ok(func) = instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create") {
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
             let _ = func.call(&mut store, (root_context_id, 0));
         }
 
-        if let Ok(func) = instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start") {
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
+        {
             let _ = func.call(&mut store, (root_context_id, config_size));
         }
 
-        if let Ok(func) = instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure") {
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
+        {
             let _ = func.call(&mut store, (root_context_id, config_size));
         }
 
-        if let Ok(func) = instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create") {
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
             let _ = func.call(&mut store, (http_context_id, root_context_id));
         }
 
         // Call proxy_on_response_body
         // Signature: (context_id, body_size, end_of_stream) -> action
-        let callback = instance
-            .get_typed_func::<(i32, i32, i32), i32>(&mut store, "proxy_on_response_body");
+        let callback =
+            instance.get_typed_func::<(i32, i32, i32), i32>(&mut store, "proxy_on_response_body");
 
         let action = match callback {
             Ok(func) => {
@@ -981,10 +1085,7 @@ impl FilterEngine {
 
     /// Execute on_log for specified modules ASYNCHRONOUSLY
     /// Note: runs inline in the current async task to avoid cross-thread waker issues with monoio.
-    pub async fn on_log_with_modules_async(
-        self: Arc<Self>,
-        module_names: Vec<String>,
-    ) {
+    pub async fn on_log_with_modules_async(self: Arc<Self>, module_names: Vec<String>) {
         self.on_log_with_modules(&module_names);
     }
 
@@ -1042,7 +1143,11 @@ impl FilterEngine {
         if let Ok(func) = instance.get_typed_func::<i32, ()>(&mut store, "proxy_on_log") {
             match func.call(&mut store, http_context_id) {
                 Ok(()) => {
-                    ftlog::debug!("[wasm:{}] proxy_on_log({}) OK", module.name, http_context_id)
+                    ftlog::debug!(
+                        "[wasm:{}] proxy_on_log({}) OK",
+                        module.name,
+                        http_context_id
+                    )
                 }
                 Err(e) => ftlog::debug!("[wasm:{}] proxy_on_log error: {}", module.name, e),
             }
@@ -1210,7 +1315,11 @@ impl FilterEngine {
         if let Ok(func) = instance.get_typed_func::<i32, ()>(&mut store, "proxy_on_tick") {
             match func.call(&mut store, root_context_id) {
                 Ok(()) => {
-                    ftlog::debug!("[wasm:{}] proxy_on_tick({}) OK", module.name, root_context_id)
+                    ftlog::debug!(
+                        "[wasm:{}] proxy_on_tick({}) OK",
+                        module.name,
+                        root_context_id
+                    )
                 }
                 Err(e) => ftlog::debug!("[wasm:{}] proxy_on_tick error: {}", module.name, e),
             }
@@ -1257,11 +1366,7 @@ impl FilterEngine {
                     return FilterResult::LocalResponse(resp);
                 }
                 Err(e) => {
-                    ftlog::error!(
-                        "[wasm:{}] on_request_trailers error: {}",
-                        module.name,
-                        e
-                    );
+                    ftlog::error!("[wasm:{}] on_request_trailers error: {}", module.name, e);
                 }
             }
         }
@@ -1331,8 +1436,8 @@ impl FilterEngine {
 
         // Call proxy_on_request_trailers
         // Signature: (context_id, num_trailers) -> action
-        let callback = instance
-            .get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_request_trailers");
+        let callback =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_request_trailers");
 
         let action = match callback {
             Ok(func) => {
@@ -1400,11 +1505,7 @@ impl FilterEngine {
                     return FilterResult::LocalResponse(resp);
                 }
                 Err(e) => {
-                    ftlog::error!(
-                        "[wasm:{}] on_response_trailers error: {}",
-                        module.name,
-                        e
-                    );
+                    ftlog::error!("[wasm:{}] on_response_trailers error: {}", module.name, e);
                 }
             }
         }
@@ -1474,8 +1575,8 @@ impl FilterEngine {
 
         // Call proxy_on_response_trailers
         // Signature: (context_id, num_trailers) -> action
-        let callback = instance
-            .get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_response_trailers");
+        let callback =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_response_trailers");
 
         let action = match callback {
             Ok(func) => {
@@ -1666,9 +1767,10 @@ impl FilterEngine {
 
         // Call proxy_on_grpc_receive_initial_metadata
         // Signature: (context_id, call_id, num_headers) -> void
-        if let Ok(func) = instance
-            .get_typed_func::<(i32, i32, i32), ()>(&mut store, "proxy_on_grpc_receive_initial_metadata")
-        {
+        if let Ok(func) = instance.get_typed_func::<(i32, i32, i32), ()>(
+            &mut store,
+            "proxy_on_grpc_receive_initial_metadata",
+        ) {
             let num_headers = headers.len() as i32;
             match func.call(&mut store, (http_context_id, call_id as i32, num_headers)) {
                 Ok(()) => {
@@ -1988,8 +2090,6 @@ impl FilterEngine {
     }
 }
 
-
-
 /// Result from a single module execution
 enum ModuleResult {
     Continue {
@@ -2014,9 +2114,7 @@ pub enum FilterResult {
 
 /// Result from body module execution (internal)
 enum BodyModuleResult {
-    Continue {
-        modified_body: Option<Vec<u8>>,
-    },
+    Continue { modified_body: Option<Vec<u8>> },
     Pause,
     LocalResponse(LocalResponse),
 }
@@ -2024,9 +2122,7 @@ enum BodyModuleResult {
 /// Result from body filter chain execution
 pub enum BodyFilterResult {
     /// Continue with potentially modified body
-    Continue {
-        body: Vec<u8>,
-    },
+    Continue { body: Vec<u8> },
     /// Pause processing (async operation pending)
     Pause,
     /// Send a local response instead of proxying

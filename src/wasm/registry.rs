@@ -64,15 +64,20 @@ impl ModuleRegistry {
         pooling_config.total_tables(pooling.total_tables);
         pooling_config.max_memory_size(pooling.max_memory_size);
 
-        config.allocation_strategy(wasmtime::InstanceAllocationStrategy::Pooling(pooling_config));
+        config.allocation_strategy(wasmtime::InstanceAllocationStrategy::Pooling(
+            pooling_config,
+        ));
 
-        // Enable fuel for execution limits (primary protection)
+        // 非同期サポートを有効化（async host functions のため）
+        // これにより Store::call_async などの非同期実行が可能になる
+        config.async_support(true);
+
+        // fuel によるCPU消費制限（主要なタイムアウト機構）
         config.consume_fuel(true);
 
-        // Enable epoch interruption for timeout enforcement (secondary protection)
-        // The engine's epoch must be periodically incremented, and each Store
-        // should have a deadline set via store.set_epoch_deadline().
-        // When engine.epoch >= store.epoch_deadline, execution is interrupted.
+        // エポック割り込みによるタイムアウト（補助的保護）
+        // エンジンのエポックを定期的にインクリメントし、
+        // Store のデッドラインと照合してタイムアウトを検出する
         config.epoch_interruption(true);
 
         Engine::new(&config)
