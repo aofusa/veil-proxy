@@ -15,7 +15,7 @@
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -25,8 +25,8 @@ use crate::runtime::executor::{
     take_op_result, with_ring,
 };
 use crate::runtime::ring::{
-    IORING_OP_ACCEPT, IORING_OP_ASYNC_CANCEL, IORING_OP_CLOSE, IORING_OP_CONNECT,
-    IORING_OP_POLL_ADD, IORING_OP_POLL_REMOVE, IORING_OP_RECV, IORING_OP_SEND,
+    IORING_OP_ACCEPT, IORING_OP_CONNECT,
+    IORING_OP_POLL_ADD, IORING_OP_RECV, IORING_OP_SEND,
 };
 
 // POLL イベントフラグ
@@ -866,5 +866,129 @@ impl<'a> Future for Writable<'a> {
                 Poll::Pending
             }
         }
+    }
+}
+
+// ====================
+// 汎用 FD 待機 Future（UDP 等、任意の FD に使用）
+// ====================
+
+/// 任意の FD が読み込み可能になるまで待つ Future
+pub struct ReadableFd {
+    fd: RawFd,
+    user_data: u64,
+    submitted: bool,
+}
+
+impl Future for ReadableFd {
+    type Output = io::Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if !self.submitted {
+            let user_data = next_user_data();
+            self.user_data = user_data;
+            register_op(user_data);
+
+            let fd = self.fd;
+            with_ring(|ring| {
+                if let Some(sqe) = ring.get_sqe() {
+                    sqe.opcode = IORING_OP_POLL_ADD;
+                    sqe.fd = fd;
+                    sqe.op_flags = POLLIN as u32;
+                    sqe.user_data = user_data;
+                }
+            });
+
+            if let Err(e) = submit_sqes() {
+                remove_op(user_data);
+                return Poll::Ready(Err(e));
+            }
+
+            self.submitted = true;
+        }
+
+        match peek_op_result(self.user_data) {
+            Some(res) => {
+                take_op_result(self.user_data);
+                if res < 0 {
+                    Poll::Ready(Err(io::Error::from_raw_os_error(-res)))
+                } else {
+                    Poll::Ready(Ok(()))
+                }
+            }
+            None => {
+                set_op_waker(self.user_data, cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+}
+
+/// 任意の FD が書き込み可能になるまで待つ Future
+pub struct WritableFd {
+    fd: RawFd,
+    user_data: u64,
+    submitted: bool,
+}
+
+impl Future for WritableFd {
+    type Output = io::Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if !self.submitted {
+            let user_data = next_user_data();
+            self.user_data = user_data;
+            register_op(user_data);
+
+            let fd = self.fd;
+            with_ring(|ring| {
+                if let Some(sqe) = ring.get_sqe() {
+                    sqe.opcode = IORING_OP_POLL_ADD;
+                    sqe.fd = fd;
+                    sqe.op_flags = POLLOUT as u32;
+                    sqe.user_data = user_data;
+                }
+            });
+
+            if let Err(e) = submit_sqes() {
+                remove_op(user_data);
+                return Poll::Ready(Err(e));
+            }
+
+            self.submitted = true;
+        }
+
+        match peek_op_result(self.user_data) {
+            Some(res) => {
+                take_op_result(self.user_data);
+                if res < 0 {
+                    Poll::Ready(Err(io::Error::from_raw_os_error(-res)))
+                } else {
+                    Poll::Ready(Ok(()))
+                }
+            }
+            None => {
+                set_op_waker(self.user_data, cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+}
+
+/// 任意の FD が読み込み可能になるまで待つ
+pub fn wait_readable_fd(fd: RawFd) -> ReadableFd {
+    ReadableFd {
+        fd,
+        user_data: 0,
+        submitted: false,
+    }
+}
+
+/// 任意の FD が書き込み可能になるまで待つ
+pub fn wait_writable_fd(fd: RawFd) -> WritableFd {
+    WritableFd {
+        fd,
+        user_data: 0,
+        submitted: false,
     }
 }

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::runtime::buf::{IoBuf, IoBufMut};
 use crate::runtime::io::OpenOptions;
 use crate::runtime::io::{
-    AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, BufResult, IoVecBuf, IoVecBufMut,
+    AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, IoVecBuf, IoVecBufMut,
 };
 use crate::runtime::tcp::TcpStream;
 use crate::runtime::time::timeout;

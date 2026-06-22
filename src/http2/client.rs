@@ -3,7 +3,7 @@
 //! HTTP/2 Prior Knowledge モードでバックエンドに接続するクライアント実装。
 //! RFC 7540 Section 3.4 に基づく実装。
 
-use crate::runtime::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
+use crate::runtime::io::{AsyncReadRent, AsyncWriteRentExt};
 use std::io;
 
 use crate::http2::error::{Http2Error, Http2Result};

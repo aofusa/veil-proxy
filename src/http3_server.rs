@@ -21,7 +21,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::io::{self, Seek, Write as IoWrite};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, UdpSocket};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -1497,10 +1497,10 @@ pub(crate) async fn proxy_to_backend_async_with_tls(
         match write_nonblocking(fd, &request[written..]) {
             Ok(n) if n > 0 => written += n,
             Ok(_) => {
-                backend.writable(false).await?;
+                backend.writable().await?;
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                backend.writable(false).await?;
+                backend.writable().await?;
             }
             Err(e) => return Err(e),
         }
@@ -1527,7 +1527,7 @@ pub(crate) async fn proxy_to_backend_async_with_tls(
                 if remaining.is_zero() {
                     break;
                 }
-                match crate::runtime::time::timeout(remaining, backend.readable(false)).await {
+                match crate::runtime::time::timeout(remaining, backend.readable()).await {
                     Ok(Ok(())) => continue,
                     Ok(Err(e)) if response.is_empty() => return Err(e),
                     _ => break,
@@ -1629,7 +1629,7 @@ async fn proxy_to_tls_backend_async(
         use std::io::Write;
         let result = (|| -> io::Result<BackendProxyResult> {
             let timeout = Duration::from_secs(timeout_secs);
-            let mut std_stream = std::net::TcpStream::connect_str(&addr).map_err(|e| {
+            let mut std_stream = std::net::TcpStream::connect(&addr as &str).map_err(|e| {
                 warn!("[HTTP/3] std backend connect error: {}", e);
                 e
             })?;
@@ -1765,7 +1765,7 @@ async fn proxy_to_tls_backend_async(
         use std::io::{Read, Write};
         let result = (|| -> io::Result<BackendProxyResult> {
             let timeout = Duration::from_secs(timeout_secs);
-            let mut std_stream = std::net::TcpStream::connect_str(&addr).map_err(|e| {
+            let mut std_stream = std::net::TcpStream::connect(&addr as &str).map_err(|e| {
                 warn!("[HTTP/3] std backend connect error: {}", e);
                 e
             })?;
@@ -1968,9 +1968,9 @@ fn create_reuseport_udp_socket(bind_addr: SocketAddr) -> io::Result<UdpSocket> {
         return Err(io::Error::last_os_error());
     }
 
-    // std::net::UdpSocket を作成し、monoio の UdpSocket に変換
+    // std::net::UdpSocket を作成（非ブロッキングモードで設定済み）
     let std_socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
-    UdpSocket::from_std(std_socket)
+    Ok(std_socket)
 }
 
 /// HTTP/3 サーバーを起動（monoio ランタイム上で実行）

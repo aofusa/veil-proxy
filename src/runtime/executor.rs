@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crate::runtime::ring::{
-    IoUring, IoUringCqe, IORING_ENTER_GETEVENTS, IORING_OP_ACCEPT, IORING_OP_ASYNC_CANCEL,
+    IoUring, IoUringCqe, IORING_OP_ACCEPT, IORING_OP_ASYNC_CANCEL,
     IORING_OP_CLOSE, IORING_OP_CONNECT, IORING_OP_NOP, IORING_OP_POLL_ADD, IORING_OP_POLL_REMOVE,
     IORING_OP_RECV, IORING_OP_SEND, IORING_OP_SPLICE, IORING_OP_TIMEOUT,
 };
@@ -148,7 +148,7 @@ thread_local! {
 
 /// スレッドローカルな io_uring リングを初期化する
 pub fn init_ring(entries: u32, flags: u32) -> std::io::Result<()> {
-    let mut ring = IoUring::new(entries, flags)?;
+    let ring = IoUring::new(entries, flags)?;
 
     // IORING_REGISTER_RESTRICTIONS でオペコードを制限
     // 制限適用に失敗しても動作は継続（カーネルバージョン依存）

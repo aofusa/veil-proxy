@@ -883,7 +883,7 @@ impl crate::runtime::io::AsyncReadRent for KtlsServerStream {
 
     async fn readv<T: IoVecBufMut>(
         &mut self,
-        mut buf: T,
+        buf: T,
     ) -> crate::runtime::io::BufResult<usize, T> {
         // IoVec stub のため未サポート
         (
@@ -1052,7 +1052,7 @@ impl crate::runtime::io::AsyncReadRent for KtlsClientStream {
 
     async fn readv<T: IoVecBufMut>(
         &mut self,
-        mut buf: T,
+        buf: T,
     ) -> crate::runtime::io::BufResult<usize, T> {
         // IoVec stub のため未サポート
         (

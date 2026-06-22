@@ -34,7 +34,6 @@ pub use tcp::{TcpListener, TcpStream};
 pub use timer::{sleep, timeout, Elapsed};
 
 use std::future::Future;
-use std::time::Duration;
 
 // ====================
 // デフォルトリングエントリ数

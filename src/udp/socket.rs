@@ -18,6 +18,7 @@ use std::os::unix::io::AsRawFd;
 // 非ブロッキング UDP ソケット（std::net::UdpSocket ラッパー）
 // monoio::net::udp::UdpSocket を削除し、std を使用する
 use std::net::UdpSocket;
+use crate::runtime::tcp::{wait_readable_fd, wait_writable_fd};
 
 /// GSO セグメントサイズ（QUIC パケットの典型的なサイズ）
 const GSO_SEGMENT_SIZE: usize = 1200;
@@ -414,14 +415,36 @@ impl QuicUdpSocket {
         Ok(())
     }
 
-    /// パケットを受信（基本版）
-    pub async fn recv_from(&self, buf: Vec<u8>) -> (io::Result<(usize, SocketAddr)>, Vec<u8>) {
-        self.socket.recv_from(buf).await
+    /// パケットを受信（基本版、io_uring POLL_ADD で非同期待機）
+    pub async fn recv_from(&self, mut buf: Vec<u8>) -> (io::Result<(usize, SocketAddr)>, Vec<u8>) {
+        let fd = self.socket.as_raw_fd();
+        loop {
+            match self.socket.recv_from(&mut buf) {
+                Ok((n, addr)) => return (Ok((n, addr)), buf),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if let Err(e) = wait_readable_fd(fd).await {
+                        return (Err(e), buf);
+                    }
+                }
+                Err(e) => return (Err(e), buf),
+            }
+        }
     }
 
-    /// パケットを送信（基本版）
+    /// パケットを送信（基本版、io_uring POLL_ADD で非同期待機）
     pub async fn send_to(&self, buf: Vec<u8>, target: SocketAddr) -> (io::Result<usize>, Vec<u8>) {
-        self.socket.send_to(buf, target).await
+        let fd = self.socket.as_raw_fd();
+        loop {
+            match self.socket.send_to(&buf, target) {
+                Ok(n) => return (Ok(n), buf),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if let Err(e) = wait_writable_fd(fd).await {
+                        return (Err(e), buf);
+                    }
+                }
+                Err(e) => return (Err(e), buf),
+            }
+        }
     }
 
     /// GSO を使用して複数パケットを効率的に送信
@@ -591,7 +614,7 @@ impl QuicUdpSocket {
             let mut total = 0;
             for packet in packets {
                 let buf = packet.to_vec();
-                let (result, _) = self.socket.send_to(buf, target).await;
+                let (result, _) = self.send_to(buf, target).await;
                 total += result?;
             }
             return Ok(total);
@@ -638,7 +661,7 @@ impl QuicUdpSocket {
                 Ok(result) => return Ok(result.bytes_sent),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     // ソケットが書き込み可能になるまで待機
-                    self.socket.writable(false).await?;
+                    wait_writable_fd(self.socket.as_raw_fd()).await?;
                 }
                 Err(e) => return Err(e),
             }
@@ -662,7 +685,7 @@ impl QuicUdpSocket {
                 Ok(result) => return Ok(result),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     // ソケットが読み込み可能になるまで待機
-                    self.socket.readable(false).await?;
+                    wait_readable_fd(self.socket.as_raw_fd()).await?;
                 }
                 Err(e) => return Err(e),
             }
@@ -678,7 +701,7 @@ impl QuicUdpSocket {
         let mut total = 0;
         for packet in packets {
             let buf = packet.to_vec();
-            let (result, _) = self.socket.send_to(buf, target).await;
+            let (result, _) = self.send_to(buf, target).await;
             total += result?;
         }
         Ok(total)

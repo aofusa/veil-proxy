@@ -3,7 +3,7 @@
 //! シグナルハンドラ、バックグラウンドスレッド、リスナーソケットの作成を担当します。
 
 use crate::config::*;
-use crate::runtime::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
+use crate::runtime::io::{AsyncReadRent, AsyncWriteRentExt};
 use crate::runtime::tcp::{TcpListener, TcpStream};
 use crate::runtime::time::timeout;
 use ftlog::{debug, error, info, warn};

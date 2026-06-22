@@ -6,7 +6,6 @@
 #![allow(dead_code)]
 
 use std::future::Future;
-use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -15,7 +14,7 @@ use crate::runtime::executor::{
     next_user_data, peek_op_result, register_op, set_op_waker, submit_sqes, take_op_result,
     with_ring,
 };
-use crate::runtime::ring::{IoUringParams, IoUringSqe, KernelTimespec, IORING_OP_TIMEOUT};
+use crate::runtime::ring::{KernelTimespec, IORING_OP_TIMEOUT};
 
 // ====================
 // Sleep Future

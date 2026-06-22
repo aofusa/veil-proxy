@@ -5,7 +5,7 @@
 use crate::constants::*;
 use crate::logging::*;
 use crate::pool::*;
-use crate::runtime::io::{AsyncWriteRent, AsyncWriteRentExt};
+use crate::runtime::io::AsyncWriteRentExt;
 use crate::runtime::tcp::TcpStream;
 use crate::runtime::time::timeout;
 use arc_swap::ArcSwap;

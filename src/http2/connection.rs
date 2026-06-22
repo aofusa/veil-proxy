@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 use std::io;
 
-use crate::runtime::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
+use crate::runtime::io::{AsyncReadRent, AsyncWriteRentExt};
 
 use crate::http2::error::{Http2Error, Http2ErrorCode, Http2Result};
 use crate::http2::frame::{Frame, FrameDecoder, FrameEncoder, FrameHeader};
