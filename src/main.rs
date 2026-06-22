@@ -423,6 +423,7 @@ fn main() {
         ktls_config: ktls_config.clone(),
         global_security: Arc::new(loaded_config.global_security.clone()),
         prometheus_config: Arc::new(loaded_config.prometheus_config.clone()),
+        #[cfg(feature = "admin")]
         admin_config: Arc::new(loaded_config.admin_config.clone()),
         access_log_config: Arc::new(loaded_config.access_log_config.clone()),
         upstream_groups: loaded_config.upstream_groups.clone(),

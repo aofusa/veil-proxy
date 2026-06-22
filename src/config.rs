@@ -1244,6 +1244,7 @@ fn default_prometheus_path() -> String { "/__metrics".to_string() }
 /// path_prefix = "/__admin"
 /// secret = "changeme"
 /// ```
+#[cfg(feature = "admin")]
 #[derive(Deserialize, Clone, Debug)]
 pub struct AdminConfig {
     /// 管理 API を有効化するかどうか
@@ -1265,6 +1266,7 @@ pub struct AdminConfig {
     pub cache_purge_prefix: String,
 }
 
+#[cfg(feature = "admin")]
 fn default_admin_path_prefix() -> String { "/__admin".to_string() }
 
 /// OpenTelemetry (OTLP/HTTP) 設定（F-10）
@@ -1310,6 +1312,7 @@ impl Default for OpenTelemetryConfig {
     }
 }
 
+#[cfg(feature = "admin")]
 impl Default for AdminConfig {
     fn default() -> Self {
         let path_prefix = default_admin_path_prefix();
@@ -1324,6 +1327,7 @@ impl Default for AdminConfig {
     }
 }
 
+#[cfg(feature = "admin")]
 impl AdminConfig {
     /// デシリアライズ後に事前計算フィールドを補完する
     pub fn compute_derived(&mut self) {
@@ -1331,6 +1335,7 @@ impl AdminConfig {
     }
 }
 
+#[cfg(feature = "admin")]
 impl AdminConfig {
     /// Authorization ヘッダー値がシークレットと一致するか検証する。
     ///
@@ -2250,6 +2255,7 @@ struct Config {
     #[serde(default)]
     prometheus: PrometheusConfig,
     /// 管理 API 設定（F-20: キャッシュ Purge 等）
+    #[cfg(feature = "admin")]
     #[serde(default)]
     admin: AdminConfig,
     /// 構造化アクセスログ設定（F-21）
@@ -4427,6 +4433,7 @@ pub struct LoadedConfig {
     /// Prometheusメトリクス設定
     pub prometheus_config: PrometheusConfig,
     /// 管理 API 設定（F-20）
+    #[cfg(feature = "admin")]
     pub admin_config: AdminConfig,
     /// 構造化アクセスログ設定（F-21）
     pub access_log_config: crate::access_log::AccessLogConfig,
@@ -4506,6 +4513,7 @@ pub struct RuntimeConfig {
     /// Prometheusメトリクス設定
     pub prometheus_config: Arc<PrometheusConfig>,
     /// 管理 API 設定（F-20）
+    #[cfg(feature = "admin")]
     pub admin_config: Arc<AdminConfig>,
     /// 構造化アクセスログ設定（F-21）
     pub access_log_config: Arc<crate::access_log::AccessLogConfig>,
@@ -4544,6 +4552,7 @@ impl Default for RuntimeConfig {
             ktls_config: Arc::new(KtlsConfig::default()),
             global_security: Arc::new(GlobalSecurityConfig::default()),
             prometheus_config: Arc::new(PrometheusConfig::default()),
+            #[cfg(feature = "admin")]
             admin_config: Arc::new(AdminConfig::default()),
             access_log_config: Arc::new(crate::access_log::AccessLogConfig::default()),
             upstream_groups: Arc::new(HashMap::new()),
@@ -4614,6 +4623,7 @@ pub fn reload_config(path: &Path) -> io::Result<()> {
         ktls_config: current.ktls_config.clone(),
         global_security: Arc::new(loaded.global_security),
         prometheus_config: Arc::new(loaded.prometheus_config),
+        #[cfg(feature = "admin")]
         admin_config: Arc::new(loaded.admin_config),
         access_log_config: Arc::new(loaded.access_log_config),
         upstream_groups: loaded.upstream_groups,
@@ -4650,6 +4660,7 @@ pub struct LoadedConfigWithoutTls {
     pub optimized_router: Arc<routing::OptimizedRouter>,
     pub global_security: GlobalSecurityConfig,
     pub prometheus_config: PrometheusConfig,
+    #[cfg(feature = "admin")]
     pub admin_config: AdminConfig,
     /// 構造化アクセスログ設定（F-21）
     pub access_log_config: crate::access_log::AccessLogConfig,
@@ -4742,14 +4753,19 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
     );
 
     // AdminConfig の事前計算フィールドを補完
-    let mut admin_config = config.admin;
-    admin_config.compute_derived();
+    #[cfg(feature = "admin")]
+    let admin_config = {
+        let mut admin = config.admin;
+        admin.compute_derived();
+        admin
+    };
 
     Ok(LoadedConfigWithoutTls {
         route: routes,
         optimized_router,
         global_security: config.security,
         prometheus_config: config.prometheus,
+        #[cfg(feature = "admin")]
         admin_config,
         access_log_config: config.access_log,
         upstream_groups: Arc::new(upstream_groups),
@@ -4991,6 +5007,7 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         global_security: config.security,
         logging: config.logging,
         prometheus_config: config.prometheus,
+        #[cfg(feature = "admin")]
         admin_config: {
             let mut a = config.admin;
             a.compute_derived();
@@ -5486,7 +5503,7 @@ mod load_balancing_tests {
 // ====================
 // 管理 API 設定のテスト（F-20）
 // ====================
-#[cfg(test)]
+#[cfg(all(test, feature = "admin"))]
 mod admin_config_tests {
     use super::*;
 

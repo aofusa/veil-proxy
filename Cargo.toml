@@ -117,6 +117,12 @@ buffering = []
 # ビルド方法: cargo build --features opentelemetry
 opentelemetry = []
 
+# 管理 Admin API（F-20: キャッシュ Purge、F-21: /config, /stats, /reload, /tls/reload）
+# /__admin エンドポイントを有効化する。Bearer 認証 + IP 制限つき。
+# キャッシュ Purge は cache feature と併用することで有効になる。
+# ビルド方法: cargo build --features admin
+admin = []
+
 # ====================
 # 複合フィーチャ（便利用）
 # ====================
@@ -129,6 +135,7 @@ full = [
     "compression", "cache", "metrics",
     "websocket", "rate-limit", "buffering",
     "mimalloc",
+    "admin",
 ]
 
 [dependencies]

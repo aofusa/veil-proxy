@@ -52,6 +52,7 @@ use crate::simple_tls::SimpleTlsServerStream as ServerTls;
 // ====================
 
 /// プロキシ起動時刻（F-21: 管理API /stats 用）
+#[cfg(feature = "admin")]
 static PROXY_START_TIME: once_cell::sync::Lazy<std::time::Instant> =
     once_cell::sync::Lazy::new(std::time::Instant::now);
 
@@ -114,6 +115,7 @@ impl SecurityCheckResult {
 /// 管理 API: 設定情報をJSON形式で返す（F-21: GET /__admin/config）
 ///
 /// secret フィールドは "***" にマスクする。
+#[cfg(feature = "admin")]
 fn build_admin_config_json(config: &crate::config::RuntimeConfig) -> String {
     let admin = &config.admin_config;
     let prom = &config.prometheus_config;
@@ -160,6 +162,7 @@ fn build_admin_config_json(config: &crate::config::RuntimeConfig) -> String {
 ///
 /// # Returns
 /// HTTP/1.1 レスポンス（バイト列）
+#[cfg(feature = "admin")]
 fn handle_cache_purge(path_with_query: &str, is_purge_method: bool) -> Vec<u8> {
     // クエリ文字列を分離
     let (path_part, query) = match path_with_query.split_once('?') {
@@ -2564,6 +2567,7 @@ async fn handle_requests(
 
                 // 管理 API エンドポイントの処理（F-20: キャッシュ Purge）
                 // PURGE メソッド、または admin.path_prefix 配下の /cache/purge を処理する
+                #[cfg(feature = "admin")]
                 {
                     let config = CURRENT_CONFIG.load();
                     let admin_config = &config.admin_config;
@@ -2612,6 +2616,7 @@ async fn handle_requests(
                 }
 
                 // 管理 API エンドポイントの処理（F-21: /config, /stats, /reload, /tls/reload）
+                #[cfg(feature = "admin")]
                 {
                     let config = CURRENT_CONFIG.load();
                     let admin_config = &config.admin_config;
