@@ -6,13 +6,13 @@
 use std::collections::VecDeque;
 use std::io;
 
-use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
+use crate::runtime::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
 
 use crate::http2::error::{Http2Error, Http2ErrorCode, Http2Result};
-use crate::http2::frame::{Frame, FrameHeader, FrameEncoder, FrameDecoder};
-use crate::http2::hpack::{HpackEncoder, HpackDecoder};
-use crate::http2::settings::{Http2Settings, defaults};
-use crate::http2::stream::{Stream, StreamState, StreamManager};
+use crate::http2::frame::{Frame, FrameDecoder, FrameEncoder, FrameHeader};
+use crate::http2::hpack::{HpackDecoder, HpackEncoder};
+use crate::http2::settings::{defaults, Http2Settings};
+use crate::http2::stream::{Stream, StreamManager, StreamState};
 
 /// HTTP/2 コネクションプリフェース
 pub const CONNECTION_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -56,21 +56,20 @@ pub struct Http2Connection<S> {
     /// 送信キュー
     #[allow(dead_code)]
     send_queue: VecDeque<Vec<u8>>,
-    
+
     // ====================
     // DoS 対策用状態
     // ====================
-    
     /// RST_STREAM カウンター (Rapid Reset 対策)
     rst_stream_count: u32,
     /// RST_STREAM ウィンドウ開始時刻
     rst_stream_window_start: std::time::Instant,
-    
+
     /// 制御フレームカウンター (Control Frame Flooding 対策)
     control_frame_count: u32,
     /// 制御フレームウィンドウ開始時刻
     control_frame_window_start: std::time::Instant,
-    
+
     /// 現在のストリームの CONTINUATION カウンター
     continuation_count: u32,
 }
@@ -83,12 +82,16 @@ where
     pub fn new(stream: S, settings: Http2Settings) -> Self {
         Self::new_with_initial_buffer(stream, settings, Vec::new())
     }
-    
+
     /// 初期バッファデータ付きでコネクションを作成
-    /// 
+    ///
     /// プロトコル検出で既に読み込んだデータがある場合に使用します。
     /// これにより、不要な再読み込みを回避できます。
-    pub fn new_with_initial_buffer(stream: S, settings: Http2Settings, initial_data: Vec<u8>) -> Self {
+    pub fn new_with_initial_buffer(
+        stream: S,
+        settings: Http2Settings,
+        initial_data: Vec<u8>,
+    ) -> Self {
         let hpack_decoder = HpackDecoder::new(settings.header_table_size as usize);
         let hpack_encoder = HpackEncoder::new(settings.header_table_size as usize);
         let frame_encoder = FrameEncoder::new(settings.max_frame_size);
@@ -97,13 +100,13 @@ where
             settings.max_concurrent_streams,
             settings.initial_window_size as i32,
         );
-        
+
         // コネクションウィンドウサイズを設定から取得
         let conn_window = settings.connection_window_size as i32;
-        
+
         // DoS 対策用のタイムスタンプを初期化
         let now = std::time::Instant::now();
-        
+
         // 初期バッファを準備（既に読み込んだデータがある場合は使用）
         let mut read_buf = vec![0u8; 65536];
         let buf_end = if !initial_data.is_empty() {
@@ -171,7 +174,7 @@ where
     /// クライアントプリフェースを確認
     async fn expect_preface(&mut self) -> Http2Result<()> {
         let preface_len = CONNECTION_PREFACE.len();
-        
+
         // プリフェースを読み込む（初期バッファに既にある場合は再読み込み不要）
         while self.buf_end - self.buf_start < preface_len {
             self.read_more().await?;
@@ -208,7 +211,7 @@ where
     }
 
     /// フレームを読み込み（外部からアクセス可能）
-    /// 
+    ///
     /// HTTP/2 フレームを1つ読み込んでデコードします。
     /// コネクションがクローズされた場合は ConnectionClosed エラーを返します。
     pub async fn read_frame(&mut self) -> Http2Result<Frame> {
@@ -218,7 +221,9 @@ where
         }
 
         // ヘッダーをデコード
-        let header = self.frame_decoder.decode_header(&self.read_buf[self.buf_start..])?;
+        let header = self
+            .frame_decoder
+            .decode_header(&self.read_buf[self.buf_start..])?;
         let total_len = FrameHeader::SIZE + header.length as usize;
 
         // ペイロードを確保
@@ -229,15 +234,16 @@ where
         // フレームをデコード (安全なスライスアクセス)
         let payload_start = self.buf_start + FrameHeader::SIZE;
         let payload_end = self.buf_start + total_len;
-        
+
         // バッファ境界チェック
         if payload_end > self.buf_end || payload_end > self.read_buf.len() {
             return Err(Http2Error::InvalidFrame(format!(
                 "Buffer underflow: expected {} bytes, available {}",
-                total_len, self.buf_end - self.buf_start
+                total_len,
+                self.buf_end - self.buf_start
             )));
         }
-        
+
         let payload = &self.read_buf[payload_start..payload_end];
         let frame = self.frame_decoder.decode(&header, payload)?;
 
@@ -259,7 +265,8 @@ where
                 self.compact_buffer();
             } else {
                 // バッファを拡張 - 最大フレームサイズ + ヘッダー + マージンを確保
-                let min_capacity = self.frame_decoder.max_frame_size() as usize + FrameHeader::SIZE + 1024;
+                let min_capacity =
+                    self.frame_decoder.max_frame_size() as usize + FrameHeader::SIZE + 1024;
                 let new_capacity = std::cmp::max(self.read_buf.len() * 2, min_capacity);
                 self.read_buf.resize(new_capacity, 0);
             }
@@ -268,18 +275,18 @@ where
         // 読み込み用のスライスを準備 (バッファの末尾に追加)
         // read_buf全体を渡すと0から上書きされてしまうため、split_offで後半を取り出す
         // しかしVecの所有権を渡す必要があるため、一度takeして分割し、戻ってきたら結合する
-        
+
         let mut full_buf = std::mem::take(&mut self.read_buf);
-        
+
         // buf_end 以降の部分を切り出す
         // 注: split_off は割り当てが発生する可能性があるが、safe rustで所有権を扱うために使用
         // より効率的な方法は unsafe または monoio::buf::Slice を使うことだが、
         // ここでは安全性を重視して Vec操作を行う
         let tail_buf = full_buf.split_off(self.buf_end);
-        
+
         // 読み込み実行
         let (result, returned_tail) = self.stream.read(tail_buf).await;
-        
+
         // バッファを結合
         full_buf.extend_from_slice(&returned_tail);
         self.read_buf = full_buf;
@@ -305,7 +312,7 @@ where
     }
 
     /// データを送信
-    /// 
+    ///
     /// monoio の write_all は成功時に全データ書き込みを保証するため、
     /// 成功時はループを抜ける実装が正しい。
     async fn write_all(&mut self, data: &[u8]) -> Http2Result<()> {
@@ -327,7 +334,7 @@ where
     }
 
     /// フレームを処理（外部からアクセス可能）
-    /// 
+    ///
     /// 受信したフレームを処理し、リクエストが完了した場合は ProcessedRequest を返します。
     pub async fn process_frame(&mut self, frame: Frame) -> Http2Result<Option<ProcessedRequest>> {
         // RFC 7540 Section 4.3: ヘッダーブロック受信中は CONTINUATION のみ許可
@@ -350,7 +357,13 @@ where
                 self.handle_settings(ack, &settings).await?;
                 Ok(None)
             }
-            Frame::Headers { stream_id, end_stream, end_headers, priority, header_block } => {
+            Frame::Headers {
+                stream_id,
+                end_stream,
+                end_headers,
+                priority,
+                header_block,
+            } => {
                 // RFC 7540 Section 5.3.1: 自己依存チェック
                 if let Some(ref p) = priority {
                     if p.dependency == stream_id {
@@ -361,14 +374,22 @@ where
                         ));
                     }
                 }
-                self.handle_headers(stream_id, end_stream, end_headers, priority, &header_block).await
+                self.handle_headers(stream_id, end_stream, end_headers, priority, &header_block)
+                    .await
             }
-            Frame::Data { stream_id, end_stream, data } => {
+            Frame::Data {
+                stream_id,
+                end_stream,
+                data,
+            } => {
                 // RFC 7540 Section 5.1: DATA on idle stream = connection error
                 self.validate_stream_not_idle(stream_id, "DATA")?;
                 self.handle_data(stream_id, end_stream, &data).await
             }
-            Frame::WindowUpdate { stream_id, increment } => {
+            Frame::WindowUpdate {
+                stream_id,
+                increment,
+            } => {
                 // RFC 7540 Section 5.1: WINDOW_UPDATE on idle stream = connection error
                 if stream_id != 0 {
                     self.validate_stream_not_idle(stream_id, "WINDOW_UPDATE")?;
@@ -380,11 +401,18 @@ where
                 self.handle_ping(ack, &data).await?;
                 Ok(None)
             }
-            Frame::GoAway { last_stream_id, error_code, debug_data } => {
+            Frame::GoAway {
+                last_stream_id,
+                error_code,
+                debug_data,
+            } => {
                 self.handle_goaway(last_stream_id, error_code, &debug_data)?;
                 Ok(None)
             }
-            Frame::RstStream { stream_id, error_code } => {
+            Frame::RstStream {
+                stream_id,
+                error_code,
+            } => {
                 // RFC 7540 Section 6.4: RST_STREAM on stream 0 is connection error
                 if stream_id == 0 {
                     return Err(Http2Error::protocol_error("RST_STREAM with stream ID 0"));
@@ -392,7 +420,9 @@ where
                 // RFC 7540 Section 5.1: RST_STREAM on idle stream = connection error
                 // A stream is truly idle if it has never been opened (stream_id > max seen)
                 // We accept RST_STREAM on previously opened streams even if cleaned up
-                if self.streams.get_ref(stream_id).is_none() && stream_id > self.streams.max_client_stream_id() {
+                if self.streams.get_ref(stream_id).is_none()
+                    && stream_id > self.streams.max_client_stream_id()
+                {
                     return Err(Http2Error::connection_error(
                         Http2ErrorCode::ProtocolError,
                         format!("RST_STREAM on idle stream {}", stream_id),
@@ -401,7 +431,10 @@ where
                 self.handle_rst_stream(stream_id, error_code)?;
                 Ok(None)
             }
-            Frame::Priority { stream_id, priority } => {
+            Frame::Priority {
+                stream_id,
+                priority,
+            } => {
                 // RFC 7540 Section 5.3.1: 自己依存チェック
                 if priority.dependency == stream_id {
                     return Err(Http2Error::stream_error(
@@ -413,8 +446,13 @@ where
                 self.handle_priority(stream_id, priority)?;
                 Ok(None)
             }
-            Frame::Continuation { stream_id, end_headers, header_block } => {
-                self.handle_continuation(stream_id, end_headers, &header_block).await
+            Frame::Continuation {
+                stream_id,
+                end_headers,
+                header_block,
+            } => {
+                self.handle_continuation(stream_id, end_headers, &header_block)
+                    .await
             }
             Frame::PushPromise { .. } => {
                 // クライアントからの PUSH_PROMISE は無効
@@ -446,7 +484,7 @@ where
             self.settings_ack_pending = false;
             return Ok(());
         }
-        
+
         // レート制限チェック (非ACK の SETTINGS フレーム)
         self.check_control_frame_rate()?;
 
@@ -486,7 +524,9 @@ where
                 }
                 0x5 => {
                     // MAX_FRAME_SIZE
-                    if value < defaults::MAX_FRAME_SIZE || value > defaults::MAX_FRAME_SIZE_UPPER_LIMIT {
+                    if value < defaults::MAX_FRAME_SIZE
+                        || value > defaults::MAX_FRAME_SIZE_UPPER_LIMIT
+                    {
                         return Err(Http2Error::protocol_error("Invalid MAX_FRAME_SIZE"));
                     }
                     self.frame_encoder.set_max_frame_size(value);
@@ -514,7 +554,7 @@ where
     }
 
     /// HEADERS フレームを処理 (CONTINUATION Flood 対策付き)
-    /// 
+    ///
     /// CVE-2024-24786 対策として、ヘッダーブロックサイズと CONTINUATION フレーム数を制限。
     async fn handle_headers(
         &mut self,
@@ -530,10 +570,10 @@ where
                 return Err(Http2Error::protocol_error("Expected CONTINUATION frame"));
             }
         }
-        
+
         // CONTINUATION カウンターをリセット (新しいヘッダーブロック開始)
         self.continuation_count = 0;
-        
+
         // ヘッダーブロックサイズチェック (HPACK Bomb 対策)
         if header_block.len() > self.local_settings.max_header_block_size {
             ftlog::warn!(
@@ -554,7 +594,10 @@ where
             // Stream exists - this is a trailer if:
             // 1. Stream is in Open or HalfClosedLocal state (headers already received)
             // 2. And this HEADERS has END_STREAM set
-            matches!(stream.state, StreamState::Open | StreamState::HalfClosedLocal) && end_stream
+            matches!(
+                stream.state,
+                StreamState::Open | StreamState::HalfClosedLocal
+            ) && end_stream
         } else {
             false
         };
@@ -562,7 +605,11 @@ where
         // RFC 7540 §8.1: A second HEADERS frame without END_STREAM is a protocol error
         // (except for trailers which must have END_STREAM)
         if let Some(stream) = self.streams.get_ref(stream_id) {
-            if matches!(stream.state, StreamState::Open | StreamState::HalfClosedLocal) && !end_stream {
+            if matches!(
+                stream.state,
+                StreamState::Open | StreamState::HalfClosedLocal
+            ) && !end_stream
+            {
                 // Second HEADERS without END_STREAM - must be a protocol error
                 return Err(Http2Error::stream_error(
                     stream_id,
@@ -575,7 +622,7 @@ where
         // ストリームを取得または作成
         // エラー発生時（例: 同時ストリーム数制限超過）はRST_STREAMを送信
         let stream_result = self.streams.get_or_create_client_stream(stream_id);
-        
+
         let stream = match stream_result {
             Ok(s) => s,
             Err(e) => {
@@ -603,7 +650,7 @@ where
 
         if end_headers {
             self.streams.set_receiving_headers(None);
-            self.continuation_count = 0;  // リセット
+            self.continuation_count = 0; // リセット
             self.decode_and_set_headers(stream_id, is_trailer)?;
 
             // リクエストが完了したかチェック
@@ -619,7 +666,7 @@ where
     }
 
     /// CONTINUATION フレームを処理 (CONTINUATION Flood 対策付き)
-    /// 
+    ///
     /// CVE-2024-24786 対策として、CONTINUATION フレーム数と累積ヘッダーブロックサイズを制限。
     async fn handle_continuation(
         &mut self,
@@ -628,13 +675,15 @@ where
         header_block: &[u8],
     ) -> Http2Result<Option<ProcessedRequest>> {
         // CONTINUATION 中でなければエラー
-        let pending_id = self.streams.receiving_headers_stream()
+        let pending_id = self
+            .streams
+            .receiving_headers_stream()
             .ok_or_else(|| Http2Error::protocol_error("Unexpected CONTINUATION"))?;
 
         if pending_id != stream_id {
             return Err(Http2Error::protocol_error("CONTINUATION for wrong stream"));
         }
-        
+
         // CONTINUATION フレーム数チェック (CONTINUATION Flood 対策)
         self.continuation_count += 1;
         if self.continuation_count > self.local_settings.max_continuation_frames {
@@ -651,9 +700,11 @@ where
 
         // ストリームを取得 - CONTINUATION中はストリームが必ず存在するはず
         // RFC 7540: ストリームが見つからない場合は接続エラー
-        let stream = self.streams.get(stream_id)
+        let stream = self
+            .streams
+            .get(stream_id)
             .ok_or_else(|| Http2Error::protocol_error("Stream not found during CONTINUATION"))?;
-        
+
         // 累積ヘッダーブロックサイズチェック (HPACK Bomb 対策)
         let current_size = stream.pending_header_len();
         let new_size = current_size + header_block.len();
@@ -671,8 +722,11 @@ where
         }
 
         // end_stream: HalfClosedRemote means END_STREAM was set on HEADERS
-        let end_stream = matches!(stream.state, StreamState::HalfClosedRemote | StreamState::Closed);
-        
+        let end_stream = matches!(
+            stream.state,
+            StreamState::HalfClosedRemote | StreamState::Closed
+        );
+
         // Trailers: A CONTINUATION is for trailers ONLY if we already have decoded request headers.
         // Just being HalfClosedRemote is NOT sufficient - that could just mean HEADERS had END_STREAM
         // but END_HEADERS will come in CONTINUATION (normal case for split headers).
@@ -682,7 +736,7 @@ where
 
         if end_headers {
             self.streams.set_receiving_headers(None);
-            self.continuation_count = 0;  // リセット
+            self.continuation_count = 0; // リセット
             self.decode_and_set_headers(stream_id, is_trailer)?;
 
             if end_stream {
@@ -695,30 +749,41 @@ where
 
     /// ヘッダーブロックをデコードしてストリームに設定
     fn decode_and_set_headers(&mut self, stream_id: u32, is_trailer: bool) -> Http2Result<()> {
-        let stream = self.streams.get(stream_id)
-            .ok_or_else(|| Http2Error::stream_error(stream_id, Http2ErrorCode::StreamClosed, "Stream not found"))?;
+        let stream = self.streams.get(stream_id).ok_or_else(|| {
+            Http2Error::stream_error(stream_id, Http2ErrorCode::StreamClosed, "Stream not found")
+        })?;
 
         let header_block = stream.take_header_block();
-        let headers = self.hpack_decoder.decode(&header_block)
-            .map_err(|e| {
-                // HPACKエラーを適切に処理
-                ftlog::warn!("[HTTP/2] HPACK decode error for stream {}: {}", stream_id, e);
-                Http2Error::compression_error(format!("HPACK decode error: {}", e))
-            })?;
+        let headers = self.hpack_decoder.decode(&header_block).map_err(|e| {
+            // HPACKエラーを適切に処理
+            ftlog::warn!(
+                "[HTTP/2] HPACK decode error for stream {}: {}",
+                stream_id,
+                e
+            );
+            Http2Error::compression_error(format!("HPACK decode error: {}", e))
+        })?;
 
         // ヘッダーを検証 (RFC 7540 Section 8.1.2)
         Self::validate_request_headers(&headers, stream_id, is_trailer)?;
 
         let stream = self.streams.get(stream_id).unwrap();
-        
+
         // For trailers, we don't overwrite request_headers but could store them separately
         // For now, trailers just need to pass validation
         if !is_trailer {
             stream.request_headers = headers;
 
             // Content-Length を解析
-            if let Some(cl) = stream.request_headers.iter().find(|h| h.name == b"content-length") {
-                if let Some(len) = std::str::from_utf8(&cl.value).ok().and_then(|s| s.parse::<u64>().ok()) {
+            if let Some(cl) = stream
+                .request_headers
+                .iter()
+                .find(|h| h.name == b"content-length")
+            {
+                if let Some(len) = std::str::from_utf8(&cl.value)
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
                     stream.content_length = Some(len);
                 }
             }
@@ -825,8 +890,8 @@ where
                 // 接続固有ヘッダーの禁止 (RFC 7540 8.1.2.2)
                 let lower = name.to_ascii_lowercase();
                 match lower.as_slice() {
-                    b"connection" | b"keep-alive" | b"proxy-connection" 
-                    | b"transfer-encoding" | b"upgrade" => {
+                    b"connection" | b"keep-alive" | b"proxy-connection" | b"transfer-encoding"
+                    | b"upgrade" => {
                         return Err(Http2Error::stream_error(
                             stream_id,
                             Http2ErrorCode::ProtocolError,
@@ -856,21 +921,33 @@ where
                 return Err(Http2Error::stream_error(
                     stream_id,
                     Http2ErrorCode::ProtocolError,
-                    if method_count == 0 { "Missing :method pseudo-header" } else { "Duplicate :method pseudo-header" },
+                    if method_count == 0 {
+                        "Missing :method pseudo-header"
+                    } else {
+                        "Duplicate :method pseudo-header"
+                    },
                 ));
             }
             if scheme_count != 1 {
                 return Err(Http2Error::stream_error(
                     stream_id,
                     Http2ErrorCode::ProtocolError,
-                    if scheme_count == 0 { "Missing :scheme pseudo-header" } else { "Duplicate :scheme pseudo-header" },
+                    if scheme_count == 0 {
+                        "Missing :scheme pseudo-header"
+                    } else {
+                        "Duplicate :scheme pseudo-header"
+                    },
                 ));
             }
             if path_count != 1 {
                 return Err(Http2Error::stream_error(
                     stream_id,
                     Http2ErrorCode::ProtocolError,
-                    if path_count == 0 { "Missing :path pseudo-header" } else { "Duplicate :path pseudo-header" },
+                    if path_count == 0 {
+                        "Missing :path pseudo-header"
+                    } else {
+                        "Duplicate :path pseudo-header"
+                    },
                 ));
             }
             // :authority は任意だが複数は禁止
@@ -904,12 +981,13 @@ where
         self.conn_recv_window -= data_len;
 
         // ストリームレベルフロー制御
-        let stream = self.streams.get(stream_id)
-            .ok_or_else(|| Http2Error::stream_error(stream_id, Http2ErrorCode::StreamClosed, "Stream not found"))?;
+        let stream = self.streams.get(stream_id).ok_or_else(|| {
+            Http2Error::stream_error(stream_id, Http2ErrorCode::StreamClosed, "Stream not found")
+        })?;
 
         // アクティビティ更新 (Slow Loris 対策)
         stream.update_activity();
-        
+
         stream.recv_data(data, end_stream)?;
 
         // WINDOW_UPDATE を送信 (必要に応じて)
@@ -927,7 +1005,9 @@ where
         // コネクションレベル
         let conn_increment = defaults::CONNECTION_WINDOW_SIZE as i32 - self.conn_recv_window;
         if conn_increment > (defaults::CONNECTION_WINDOW_SIZE as i32 / 2) {
-            let frame = self.frame_encoder.encode_window_update(0, conn_increment as u32);
+            let frame = self
+                .frame_encoder
+                .encode_window_update(0, conn_increment as u32);
             self.write_all(&frame).await?;
             self.conn_recv_window += conn_increment;
         }
@@ -943,9 +1023,11 @@ where
         } else {
             None
         };
-        
+
         if let Some(increment) = stream_increment {
-            let frame = self.frame_encoder.encode_window_update(stream_id, increment as u32);
+            let frame = self
+                .frame_encoder
+                .encode_window_update(stream_id, increment as u32);
             self.write_all(&frame).await?;
             if let Some(stream) = self.streams.get(stream_id) {
                 stream.update_recv_window(increment);
@@ -982,20 +1064,20 @@ where
     }
 
     /// PING を処理 (Control Frame Flooding 対策付き)
-    /// 
+    ///
     /// 制御フレームのレート制限を適用し、フラッド攻撃を防止。
     async fn handle_ping(&mut self, ack: bool, data: &[u8; 8]) -> Http2Result<()> {
         // レート制限チェック (ACK でない場合のみカウント)
         if !ack {
             self.check_control_frame_rate()?;
-            
+
             // PING ACK を送信
             let frame = self.frame_encoder.encode_ping(data, true);
             self.write_all(&frame).await?;
         }
         Ok(())
     }
-    
+
     pub async fn send_response(
         &mut self,
         stream_id: u32,
@@ -1007,15 +1089,22 @@ where
         for &(name, _) in headers {
             lowercase_names.push(name.to_ascii_lowercase());
         }
-        
-        self.send_headers_internal(stream_id, status, headers, &lowercase_names, body.is_none() || body.map(|b| b.is_empty()).unwrap_or(true)).await?;
-        
+
+        self.send_headers_internal(
+            stream_id,
+            status,
+            headers,
+            &lowercase_names,
+            body.is_none() || body.map(|b| b.is_empty()).unwrap_or(true),
+        )
+        .await?;
+
         if let Some(body_data) = body {
             if !body_data.is_empty() {
                 self.send_data(stream_id, body_data, true).await?;
             }
         }
-        
+
         Ok(())
     }
 
@@ -1031,8 +1120,9 @@ where
         for &(name, _) in headers {
             lowercase_names.push(name.to_ascii_lowercase());
         }
-        
-        self.send_headers_internal(stream_id, status, headers, &lowercase_names, end_stream).await
+
+        self.send_headers_internal(stream_id, status, headers, &lowercase_names, end_stream)
+            .await
     }
 
     /// ヘッダー送信の内部実装
@@ -1073,12 +1163,14 @@ where
         // ステータスとヘッダーをエンコード
         let mut header_list: Vec<(&[u8], &[u8], bool)> = Vec::with_capacity(headers.len() + 1);
         header_list.push((b":status", status_str, false));
-        
+
         for (i, &(_, value)) in headers.iter().enumerate() {
             header_list.push((&lowercase_names[i], value, false));
         }
 
-        let header_block = self.hpack_encoder.encode(&header_list)
+        let header_block = self
+            .hpack_encoder
+            .encode(&header_list)
             .map_err(|e| Http2Error::HpackEncode(e.to_string()))?;
 
         let frame = self.frame_encoder.encode_headers(
@@ -1088,7 +1180,7 @@ where
             true, // end_headers
             None,
         );
-        
+
         self.write_all(&frame).await?;
 
         // ストリーム状態を更新
@@ -1100,20 +1192,20 @@ where
     }
 
     /// 制御フレームのレート制限をチェック
-    /// 
+    ///
     /// PING, SETTINGS, WINDOW_UPDATE(stream_id=0) などの制御フレームを
     /// 対象としてレート制限を適用。
     fn check_control_frame_rate(&mut self) -> Http2Result<()> {
         let now = std::time::Instant::now();
         let elapsed = now.duration_since(self.control_frame_window_start);
-        
+
         if elapsed.as_secs() >= 1 {
             // ウィンドウをリセット
             self.control_frame_count = 1;
             self.control_frame_window_start = now;
         } else {
             self.control_frame_count += 1;
-            
+
             // 閾値超過チェック
             if self.control_frame_count > self.local_settings.max_control_frames_per_second {
                 ftlog::warn!(
@@ -1127,21 +1219,26 @@ where
                 ));
             }
         }
-        
+
         Ok(())
     }
 
     /// GOAWAY を処理 (RFC 7540 Section 6.8)
-    /// 
+    ///
     /// GOAWAY 受信後は last_stream_id より大きい ID のストリームを
     /// 開始してはならない。
-    fn handle_goaway(&mut self, last_stream_id: u32, error_code: u32, debug_data: &[u8]) -> Http2Result<()> {
+    fn handle_goaway(
+        &mut self,
+        last_stream_id: u32,
+        error_code: u32,
+        debug_data: &[u8],
+    ) -> Http2Result<()> {
         self.goaway_received = true;
         self.goaway_last_stream_id = Some(last_stream_id);
-        
+
         // ストリームマネージャーにも GOAWAY 状態を伝播
         self.streams.set_goaway_last_stream_id(last_stream_id);
-        
+
         // エラーコードが 0 以外の場合はログを出力
         if error_code != 0 {
             let debug_str = String::from_utf8_lossy(debug_data);
@@ -1152,31 +1249,28 @@ where
                 debug_str
             );
         } else {
-            ftlog::debug!(
-                "HTTP/2 GOAWAY received: last_stream_id={}",
-                last_stream_id
-            );
+            ftlog::debug!("HTTP/2 GOAWAY received: last_stream_id={}", last_stream_id);
         }
-        
+
         Ok(())
     }
 
     /// RST_STREAM を処理 (Rapid Reset 対策付き)
-    /// 
+    ///
     /// CVE-2023-44487 (Rapid Reset) 対策として、RST_STREAM のレート制限を実装。
     /// 閾値を超えた場合は ENHANCE_YOUR_CALM (0xb) エラーで接続を切断。
     fn handle_rst_stream(&mut self, stream_id: u32, error_code: u32) -> Http2Result<()> {
         // レート制限チェック (Rapid Reset 対策)
         let now = std::time::Instant::now();
         let elapsed = now.duration_since(self.rst_stream_window_start);
-        
+
         if elapsed.as_secs() >= 1 {
             // ウィンドウをリセット
             self.rst_stream_count = 1;
             self.rst_stream_window_start = now;
         } else {
             self.rst_stream_count += 1;
-            
+
             // 閾値超過チェック
             if self.rst_stream_count > self.local_settings.max_rst_stream_per_second {
                 ftlog::warn!(
@@ -1190,7 +1284,7 @@ where
                 ));
             }
         }
-        
+
         if let Some(stream) = self.streams.get(stream_id) {
             stream.recv_rst_stream(error_code);
         }
@@ -1198,7 +1292,11 @@ where
     }
 
     /// PRIORITY を処理
-    fn handle_priority(&mut self, stream_id: u32, priority: crate::http2::frame::types::PrioritySpec) -> Http2Result<()> {
+    fn handle_priority(
+        &mut self,
+        stream_id: u32,
+        priority: crate::http2::frame::types::PrioritySpec,
+    ) -> Http2Result<()> {
         if let Some(stream) = self.streams.get(stream_id) {
             stream.dependency = priority.dependency;
             stream.weight = priority.weight;
@@ -1206,7 +1304,6 @@ where
         }
         Ok(())
     }
-
 
     /// gRPC レスポンスを送信 (トレイラー付き)
     ///
@@ -1232,12 +1329,14 @@ where
         let mut header_list: Vec<(&[u8], &[u8], bool)> = Vec::with_capacity(headers.len() + 2);
         header_list.push((b":status", b"200", false));
         header_list.push((b"content-type", b"application/grpc+proto", false));
-        
+
         for &(name, value) in headers {
             header_list.push((name, value, false));
         }
 
-        let header_block = self.hpack_encoder.encode(&header_list)
+        let header_block = self
+            .hpack_encoder
+            .encode(&header_list)
             .map_err(|e| Http2Error::HpackEncode(e.to_string()))?;
 
         // HEADERS with end_stream=false (body + trailers follow)
@@ -1263,7 +1362,8 @@ where
         }
 
         // 3. TRAILERS フレーム送信 (grpc-status, grpc-message)
-        self.send_grpc_trailers(stream_id, grpc_status, grpc_message).await
+        self.send_grpc_trailers(stream_id, grpc_status, grpc_message)
+            .await
     }
 
     /// gRPC トレイラーを送信
@@ -1279,9 +1379,8 @@ where
     ) -> Http2Result<()> {
         use crate::grpc::status::{GrpcStatus, GrpcStatusCode};
 
-        let code = GrpcStatusCode::from_u8(grpc_status as u8)
-            .unwrap_or(GrpcStatusCode::Unknown);
-        
+        let code = GrpcStatusCode::from_u8(grpc_status as u8).unwrap_or(GrpcStatusCode::Unknown);
+
         let status = if let Some(msg) = grpc_message {
             GrpcStatus::error(code, msg)
         } else {
@@ -1295,15 +1394,17 @@ where
             .map(|(n, v)| (n.as_slice(), v.as_slice(), false))
             .collect();
 
-        let trailer_block = self.hpack_encoder.encode(&trailer_list)
+        let trailer_block = self
+            .hpack_encoder
+            .encode(&trailer_list)
             .map_err(|e| Http2Error::HpackEncode(e.to_string()))?;
 
         // HEADERS (as trailers) with end_stream=true
         let trailer_frame = self.frame_encoder.encode_headers(
             stream_id,
             &trailer_block,
-            true,  // end_stream
-            true,  // end_headers
+            true, // end_stream
+            true, // end_headers
             None,
         );
         self.write_all(&trailer_frame).await?;
@@ -1318,10 +1419,15 @@ where
 
         Ok(())
     }
-    /// 
+    ///
     /// フロー制御ウィンドウを考慮してデータを分割送信します。
     /// ウィンドウが不足した場合は WINDOW_UPDATE を待機します。
-    pub async fn send_data(&mut self, stream_id: u32, data: &[u8], end_stream: bool) -> Http2Result<()> {
+    pub async fn send_data(
+        &mut self,
+        stream_id: u32,
+        data: &[u8],
+        end_stream: bool,
+    ) -> Http2Result<()> {
         let max_frame_size = self.remote_settings.max_frame_size as usize;
         let mut offset = 0;
         let mut window_update_wait_count = 0;
@@ -1330,15 +1436,17 @@ where
         while offset < data.len() {
             // 送信可能な最大サイズを計算（フレームサイズとウィンドウの両方を考慮）
             let remaining = data.len() - offset;
-            
+
             // ストリームウィンドウを取得
-            let stream_window = self.streams.get_ref(stream_id)
+            let stream_window = self
+                .streams
+                .get_ref(stream_id)
                 .map(|s| s.send_window)
                 .unwrap_or(0);
-            
+
             // コネクションとストリームの両方のウィンドウを考慮
             let available_window = self.conn_send_window.min(stream_window).max(0) as usize;
-            
+
             if available_window == 0 {
                 // ウィンドウが0の場合、WINDOW_UPDATEを待つ
                 window_update_wait_count += 1;
@@ -1349,12 +1457,16 @@ where
                         "Flow control window exhausted after max waits",
                     ));
                 }
-                
+
                 // WINDOW_UPDATE フレームを読み込む
                 match self.read_frame().await {
                     Ok(frame) => {
                         // WINDOW_UPDATE の処理
-                        if let Frame::WindowUpdate { stream_id: wid, increment } = frame {
+                        if let Frame::WindowUpdate {
+                            stream_id: wid,
+                            increment,
+                        } = frame
+                        {
                             self.handle_window_update(wid, increment)?;
                         } else {
                             // 他のフレームも処理（PING、SETTINGS など）
@@ -1366,14 +1478,15 @@ where
                     }
                     Err(e) => {
                         // 読み取りエラーの場合は続行を試みる
-                        if !matches!(e, Http2Error::Io(ref io_err) if io_err.kind() == io::ErrorKind::WouldBlock) {
+                        if !matches!(e, Http2Error::Io(ref io_err) if io_err.kind() == io::ErrorKind::WouldBlock)
+                        {
                             return Err(e);
                         }
                     }
                 }
                 continue;
             }
-            
+
             // 送信可能なチャンクサイズを決定
             let chunk_len = remaining.min(max_frame_size).min(available_window);
             let is_last = offset + chunk_len >= data.len();
@@ -1386,7 +1499,9 @@ where
                 stream.send_window -= len;
             }
 
-            let frame = self.frame_encoder.encode_data(stream_id, chunk, end_stream && is_last);
+            let frame = self
+                .frame_encoder
+                .encode_data(stream_id, chunk, end_stream && is_last);
             self.write_all(&frame).await?;
 
             offset += chunk_len;
@@ -1404,13 +1519,19 @@ where
     }
 
     /// GOAWAY を送信
-    pub async fn send_goaway(&mut self, error_code: Http2ErrorCode, debug_data: &[u8]) -> Http2Result<()> {
+    pub async fn send_goaway(
+        &mut self,
+        error_code: Http2ErrorCode,
+        debug_data: &[u8],
+    ) -> Http2Result<()> {
         if self.goaway_sent {
             return Ok(());
         }
 
         let last_stream_id = self.streams.max_client_stream_id();
-        let frame = self.frame_encoder.encode_goaway(last_stream_id, error_code as u32, debug_data);
+        let frame = self
+            .frame_encoder
+            .encode_goaway(last_stream_id, error_code as u32, debug_data);
         self.write_all(&frame).await?;
         self.goaway_sent = true;
 
@@ -1418,8 +1539,14 @@ where
     }
 
     /// RST_STREAM を送信
-    pub async fn send_rst_stream(&mut self, stream_id: u32, error_code: Http2ErrorCode) -> Http2Result<()> {
-        let frame = self.frame_encoder.encode_rst_stream(stream_id, error_code as u32);
+    pub async fn send_rst_stream(
+        &mut self,
+        stream_id: u32,
+        error_code: Http2ErrorCode,
+    ) -> Http2Result<()> {
+        let frame = self
+            .frame_encoder
+            .encode_rst_stream(stream_id, error_code as u32);
         self.write_all(&frame).await?;
 
         if let Some(stream) = self.streams.get(stream_id) {
@@ -1428,33 +1555,34 @@ where
 
         Ok(())
     }
-    
+
     /// アイドルタイムアウトを超過したストリームをクリーンアップ (Slow Loris 対策)
-    /// 
+    ///
     /// リクエストが完了しないストリームを検出し、RST_STREAM(CANCEL) で閉じる。
     /// この関数は定期的に呼び出す必要がある（例: 10秒ごと）。
-    /// 
+    ///
     /// 戻り値: クリーンアップしたストリーム数
     pub async fn cleanup_idle_streams(&mut self) -> Http2Result<usize> {
         let timeout_secs = self.local_settings.stream_idle_timeout_secs;
-        
+
         // タイムアウトが0の場合は無効
         if timeout_secs == 0 {
             return Ok(0);
         }
-        
+
         let idle_streams = self.streams.get_idle_streams(timeout_secs);
         let count = idle_streams.len();
-        
+
         for stream_id in idle_streams {
             ftlog::debug!(
                 "[HTTP/2] Closing idle stream {} (timeout: {}s)",
                 stream_id,
                 timeout_secs
             );
-            self.send_rst_stream(stream_id, Http2ErrorCode::Cancel).await?;
+            self.send_rst_stream(stream_id, Http2ErrorCode::Cancel)
+                .await?;
         }
-        
+
         if count > 0 {
             ftlog::info!(
                 "[HTTP/2] Cleaned up {} idle streams (timeout: {}s)",
@@ -1462,12 +1590,12 @@ where
                 timeout_secs
             );
         }
-        
+
         Ok(count)
     }
 
     /// メインループ: フレームを読み込んで処理
-    /// 
+    ///
     /// 各リクエストに対してデフォルトのレスポンス（200 OK）を返します。
     pub async fn run_simple(&mut self) -> Http2Result<()> {
         loop {
@@ -1483,7 +1611,9 @@ where
                 Err(Http2Error::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => continue,
                 Err(e) => {
                     // エラー時は GOAWAY を送信
-                    let _ = self.send_goaway(e.error_code(), e.to_string().as_bytes()).await;
+                    let _ = self
+                        .send_goaway(e.error_code(), e.to_string().as_bytes())
+                        .await;
                     return Err(e);
                 }
             };
@@ -1492,16 +1622,19 @@ where
             match self.process_frame(frame).await {
                 Ok(Some(req)) => {
                     // リクエストが完了 - デフォルトレスポンスを送信
-                    let headers: &[(&[u8], &[u8])] = &[
-                        (b"content-type", b"text/plain"),
-                        (b"server", b"veil/http2"),
-                    ];
-                    if let Err(e) = self.send_response(req.stream_id, 200, headers, Some(b"HTTP/2 OK")).await {
+                    let headers: &[(&[u8], &[u8])] =
+                        &[(b"content-type", b"text/plain"), (b"server", b"veil/http2")];
+                    if let Err(e) = self
+                        .send_response(req.stream_id, 200, headers, Some(b"HTTP/2 OK"))
+                        .await
+                    {
                         // ストリームエラーの場合は RST_STREAM を送信
                         if let Some(id) = e.rst_stream_id() {
                             let _ = self.send_rst_stream(id, e.error_code()).await;
                         } else if e.should_goaway() {
-                            let _ = self.send_goaway(e.error_code(), e.to_string().as_bytes()).await;
+                            let _ = self
+                                .send_goaway(e.error_code(), e.to_string().as_bytes())
+                                .await;
                             return Err(e);
                         }
                     }
@@ -1511,7 +1644,9 @@ where
                 }
                 Err(e) => {
                     if e.should_goaway() {
-                        let _ = self.send_goaway(e.error_code(), e.to_string().as_bytes()).await;
+                        let _ = self
+                            .send_goaway(e.error_code(), e.to_string().as_bytes())
+                            .await;
                         return Err(e);
                     } else if let Some(id) = e.rst_stream_id() {
                         let _ = self.send_rst_stream(id, e.error_code()).await;
@@ -1540,7 +1675,7 @@ where
     pub fn get_inner(&self) -> &S {
         &self.stream
     }
-    
+
     /// クローズ済みストリームをクリーンアップ（外部からアクセス可能）
     pub fn cleanup_closed(&mut self) {
         self.streams.cleanup_closed();
@@ -1583,7 +1718,7 @@ mod tests {
         // ProcessedRequestの作成
         let req = ProcessedRequest { stream_id: 1 };
         assert_eq!(req.stream_id, 1);
-        
+
         let req2 = ProcessedRequest { stream_id: 3 };
         assert_eq!(req2.stream_id, 3);
     }
@@ -1593,7 +1728,7 @@ mod tests {
         // クライアント開始ストリームは奇数ID
         let req = ProcessedRequest { stream_id: 1 };
         assert!(req.stream_id % 2 == 1);
-        
+
         let req2 = ProcessedRequest { stream_id: 5 };
         assert!(req2.stream_id % 2 == 1);
     }
@@ -1606,7 +1741,7 @@ mod tests {
     fn test_default_settings() {
         // デフォルト設定の検証
         let settings = Http2Settings::default();
-        
+
         // RFC 7540 デフォルト値
         assert!(settings.max_concurrent_streams > 0);
         assert!(settings.initial_window_size > 0);
@@ -1619,7 +1754,7 @@ mod tests {
         // 設定のエンコード
         let settings = Http2Settings::default();
         let encoded = settings.encode();
-        
+
         // エンコード結果は6の倍数（各設定は6バイト: ID 2バイト + 値 4バイト）
         assert!(encoded.len() % 6 == 0);
     }
@@ -1631,11 +1766,11 @@ mod tests {
     #[test]
     fn test_frame_size_constraints() {
         // RFC 7540 Section 4.2: フレームサイズ制約
-        let min_frame_size = 16384u32;  // 2^14
+        let min_frame_size = 16384u32; // 2^14
         let max_frame_size = 16777215u32; // 2^24 - 1
-        
+
         let settings = Http2Settings::default();
-        
+
         assert!(settings.max_frame_size >= min_frame_size);
         assert!(settings.max_frame_size <= max_frame_size);
     }
@@ -1648,9 +1783,9 @@ mod tests {
     fn test_window_size_constraints() {
         // RFC 7540 Section 6.9.2: ウィンドウサイズ制約
         let max_window_size = 2147483647i32; // 2^31 - 1
-        
+
         let settings = Http2Settings::default();
-        
+
         assert!(settings.initial_window_size > 0);
         assert!((settings.initial_window_size as i32) <= max_window_size);
     }

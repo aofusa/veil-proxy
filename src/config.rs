@@ -1,11 +1,22 @@
 //! 設定モジュール
-//! 
+//!
 //! データ型、構造体、列挙型、静的変数、設定読み込み関数を提供します。
 
-use monoio::net::TcpStream;
-use monoio::io::AsyncWriteRentExt;
-use monoio::time::timeout;
+use crate::constants::*;
+use crate::logging::*;
+use crate::pool::*;
+use crate::runtime::io::{AsyncWriteRent, AsyncWriteRentExt};
+use crate::runtime::tcp::TcpStream;
+use crate::runtime::time::timeout;
+use arc_swap::ArcSwap;
+use clap::Parser;
+use ftlog::{info, warn};
 use httparse::{Request, Status};
+use once_cell::sync::Lazy;
+use rustls::ServerConfig;
+use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+use serde::Deserialize;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
@@ -13,25 +24,14 @@ use std::io;
 use std::io::BufReader;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(target_os = "linux")]
 use std::sync::atomic::AtomicUsize;
-use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
-use serde::Deserialize;
-use arc_swap::ArcSwap;
-use once_cell::sync::Lazy;
-use rustls::ServerConfig;
-use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
-use clap::Parser;
-use ftlog::{info, warn};
-use crate::constants::*;
-use crate::logging::*;
-use crate::pool::*;
 
 #[cfg(feature = "ktls")]
-use crate::ktls_rustls::{RustlsConnector, KtlsServerStream, KtlsClientStream};
+use crate::ktls_rustls::{KtlsClientStream, KtlsServerStream, RustlsConnector};
 
 #[cfg(not(feature = "ktls"))]
 use crate::simple_tls;
@@ -41,11 +41,11 @@ use crate::protocol;
 
 use crate::buffering;
 use crate::cache;
-use crate::routing;
 #[cfg(feature = "http2")]
 use crate::http2;
 #[cfg(feature = "http3")]
 use crate::http3_server;
+use crate::routing;
 // ====================
 // kTLS設定情報
 // ====================
@@ -72,18 +72,38 @@ pub struct KtlsConfig {
     pub tcp_cork_enabled: bool,
 }
 /// セキュリティ設定のデフォルト値関数
-fn default_max_body_size() -> usize { MAX_BODY_SIZE }
-fn default_max_header_size() -> usize { MAX_HEADER_SIZE }
-fn default_client_header_timeout() -> u64 { 30 }
-fn default_client_body_timeout() -> u64 { 30 }
-fn default_backend_connect_timeout() -> u64 { 10 }
-fn default_max_idle_connections() -> usize { BACKEND_POOL_MAX_IDLE_PER_HOST }
-fn default_idle_connection_timeout() -> u64 { BACKEND_POOL_IDLE_TIMEOUT_SECS }
+fn default_max_body_size() -> usize {
+    MAX_BODY_SIZE
+}
+fn default_max_header_size() -> usize {
+    MAX_HEADER_SIZE
+}
+fn default_client_header_timeout() -> u64 {
+    30
+}
+fn default_client_body_timeout() -> u64 {
+    30
+}
+fn default_backend_connect_timeout() -> u64 {
+    10
+}
+fn default_max_idle_connections() -> usize {
+    BACKEND_POOL_MAX_IDLE_PER_HOST
+}
+fn default_idle_connection_timeout() -> u64 {
+    BACKEND_POOL_IDLE_TIMEOUT_SECS
+}
 
 // WebSocket ポーリング設定のデフォルト値
-fn default_websocket_poll_timeout_ms() -> u64 { 1 }
-fn default_websocket_poll_max_timeout_ms() -> u64 { 100 }
-fn default_websocket_backoff_multiplier() -> f64 { 2.0 }
+fn default_websocket_poll_timeout_ms() -> u64 {
+    1
+}
+fn default_websocket_poll_max_timeout_ms() -> u64 {
+    100
+}
+fn default_websocket_backoff_multiplier() -> f64 {
+    2.0
+}
 // ====================
 // IP制限機能（CIDR対応）
 // ====================
@@ -119,7 +139,7 @@ impl CidrRange {
             // プレフィックスなし = 単一IP
             (s, 255) // 255は後で適切な値に変換
         };
-        
+
         // IPv4をパース
         if let Some(ipv4) = Self::parse_ipv4(ip_str) {
             let prefix = if prefix_len == 255 { 32 } else { prefix_len };
@@ -134,7 +154,7 @@ impl CidrRange {
                 is_ipv6: false,
             });
         }
-        
+
         // IPv6をパース
         if let Some(ipv6) = Self::parse_ipv6(ip_str) {
             let prefix = if prefix_len == 255 { 128 } else { prefix_len };
@@ -148,17 +168,17 @@ impl CidrRange {
                 is_ipv6: true,
             });
         }
-        
+
         None
     }
-    
+
     /// IPv4アドレス文字列をパース
     fn parse_ipv4(s: &str) -> Option<u32> {
         let parts: Vec<&str> = s.split('.').collect();
         if parts.len() != 4 {
             return None;
         }
-        
+
         let mut result: u32 = 0;
         for (i, part) in parts.iter().enumerate() {
             let octet: u8 = part.parse().ok()?;
@@ -166,12 +186,12 @@ impl CidrRange {
         }
         Some(result)
     }
-    
+
     /// IPv6アドレス文字列をパース（簡易実装）
     fn parse_ipv6(s: &str) -> Option<u128> {
         // :: の展開を処理
         let parts: Vec<&str> = s.split(':').collect();
-        
+
         // :: がある場合の処理
         let has_double_colon = s.contains("::");
         if has_double_colon {
@@ -179,22 +199,22 @@ impl CidrRange {
             if sides.len() > 2 {
                 return None;
             }
-            
+
             let left_parts: Vec<&str> = if sides[0].is_empty() {
                 vec![]
             } else {
                 sides[0].split(':').collect()
             };
-            
+
             let right_parts: Vec<&str> = if sides.len() < 2 || sides[1].is_empty() {
                 vec![]
             } else {
                 sides[1].split(':').collect()
             };
-            
+
             let missing = 8 - left_parts.len() - right_parts.len();
             let mut all_parts: Vec<u16> = Vec::with_capacity(8);
-            
+
             for part in &left_parts {
                 all_parts.push(u16::from_str_radix(part, 16).ok()?);
             }
@@ -204,23 +224,23 @@ impl CidrRange {
             for part in &right_parts {
                 all_parts.push(u16::from_str_radix(part, 16).ok()?);
             }
-            
+
             if all_parts.len() != 8 {
                 return None;
             }
-            
+
             let mut result: u128 = 0;
             for (i, &part) in all_parts.iter().enumerate() {
                 result |= (part as u128) << (112 - i * 16);
             }
             return Some(result);
         }
-        
+
         // :: がない場合
         if parts.len() != 8 {
             return None;
         }
-        
+
         let mut result: u128 = 0;
         for (i, part) in parts.iter().enumerate() {
             let segment: u16 = u16::from_str_radix(part, 16).ok()?;
@@ -228,7 +248,7 @@ impl CidrRange {
         }
         Some(result)
     }
-    
+
     /// IPv4用のネットマスクを生成
     #[inline]
     fn mask_v4(prefix: u8) -> u128 {
@@ -240,7 +260,7 @@ impl CidrRange {
             ((1u128 << prefix) - 1) << (32 - prefix)
         }
     }
-    
+
     /// IPv6用のネットマスクを生成
     #[inline]
     fn mask_v6(prefix: u8) -> u128 {
@@ -252,7 +272,7 @@ impl CidrRange {
             ((1u128 << prefix) - 1) << (128 - prefix)
         }
     }
-    
+
     /// IPアドレスがこのCIDR範囲に含まれるかチェック
     pub fn contains(&self, ip: &str) -> bool {
         if self.is_ipv6 {
@@ -288,15 +308,15 @@ impl IpFilter {
             .iter()
             .filter_map(|s| CidrRange::parse(s))
             .collect();
-        
+
         let denied: Vec<CidrRange> = denied_ips
             .iter()
             .filter_map(|s| CidrRange::parse(s))
             .collect();
-        
+
         Self { allowed, denied }
     }
-    
+
     /// IPアドレスが許可されているかチェック
     /// 評価順序: deny → allow（denyが優先）
     pub fn is_allowed(&self, ip: &str) -> bool {
@@ -306,23 +326,23 @@ impl IpFilter {
                 return false;
             }
         }
-        
+
         // allowリストが空なら許可
         if self.allowed.is_empty() {
             return true;
         }
-        
+
         // allowリストにマッチしたら許可
         for cidr in &self.allowed {
             if cidr.contains(ip) {
                 return true;
             }
         }
-        
+
         // どちらにもマッチしない場合は拒否
         false
     }
-    
+
     /// フィルターが設定されているか（空でないか）
     pub fn is_configured(&self) -> bool {
         !self.allowed.is_empty() || !self.denied.is_empty()
@@ -334,7 +354,7 @@ impl IpFilter {
 // ====================
 
 /// WebSocketポーリングモード
-/// 
+///
 /// - `Fixed`: 固定タイムアウト（低レイテンシ優先）
 /// - `Adaptive`: バックオフ方式による動的調整（CPU効率優先）
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -366,22 +386,22 @@ impl<'de> serde::Deserialize<'de> for WebSocketPollMode {
 }
 
 /// WebSocketポーリング設定
-/// 
+///
 /// この設定は、WebSocket双方向転送時のポーリング動作を制御します。
-/// 
+///
 /// ## モード
-/// 
+///
 /// - **Fixed**: 常に `initial_timeout_ms` でポーリング
 /// - **Adaptive**: データ転送時は `initial_timeout_ms` を使用し、
 ///   アイドル時は `max_timeout_ms` まで徐々に延長
-/// 
+///
 /// ## 設定例
-/// 
+///
 /// ```toml
 /// # リアルタイムゲーム（低レイテンシ最優先）
 /// websocket_poll_mode = "fixed"
 /// websocket_poll_timeout_ms = 1
-/// 
+///
 /// # チャットアプリ（バランス重視）
 /// websocket_poll_mode = "adaptive"
 /// websocket_poll_timeout_ms = 1
@@ -421,119 +441,117 @@ pub struct SecurityConfig {
     /// リクエストボディ最大サイズ（バイト）
     #[serde(default = "default_max_body_size")]
     pub max_request_body_size: usize,
-    
+
     /// Chunked転送時の累積最大サイズ（バイト）
     #[serde(default = "default_max_body_size")]
     pub max_chunked_body_size: usize,
-    
+
     /// クライアントヘッダー受信タイムアウト（秒）
     #[serde(default = "default_client_header_timeout")]
     pub client_header_timeout_secs: u64,
-    
+
     /// クライアントボディ受信タイムアウト（秒）
     #[serde(default = "default_client_body_timeout")]
     pub client_body_timeout_secs: u64,
-    
+
     /// 許可するHTTPメソッド（空 = すべて許可）
     #[serde(default)]
     pub allowed_methods: Vec<String>,
-    
+
     /// 分間リクエスト数上限（0 = 無制限）
     #[serde(default)]
     pub rate_limit_requests_per_min: u64,
-    
+
     /// バックエンド接続タイムアウト（秒）
     #[serde(default = "default_backend_connect_timeout")]
     pub backend_connect_timeout_secs: u64,
-    
+
     /// ホストごとの最大アイドル接続数
     #[serde(default = "default_max_idle_connections")]
     pub max_idle_connections_per_host: usize,
-    
+
     /// アイドル接続の維持時間（秒）
     #[serde(default = "default_idle_connection_timeout")]
     pub idle_connection_timeout_secs: u64,
-    
+
     /// リクエストヘッダー最大サイズ（バイト）
     #[serde(default = "default_max_header_size")]
     pub max_request_header_size: usize,
-    
+
     /// 許可するIPアドレス/CIDR（空 = すべて許可）
     /// 例: ["192.168.1.0/24", "10.0.0.1"]
     #[serde(default)]
     pub allowed_ips: Vec<String>,
-    
+
     /// 拒否するIPアドレス/CIDR（denyが優先）
     /// 例: ["192.168.1.100", "10.0.0.0/8"]
     #[serde(default)]
     pub denied_ips: Vec<String>,
-    
+
     // ====================
     // ヘッダー操作設定
     // ====================
-    
     /// リクエストに追加するヘッダー（バックエンドへ転送前）
     /// 例: { "X-Real-IP" = "$client_ip", "X-Forwarded-Proto" = "https" }
-    /// 
+    ///
     /// 特殊変数:
     /// - $client_ip: クライアントのIPアドレス
     /// - $host: リクエストのHostヘッダー
     /// - $request_uri: リクエストURI
     #[serde(default)]
     pub add_request_headers: HashMap<String, String>,
-    
+
     /// リクエストから削除するヘッダー（バックエンドへ転送前）
     /// 例: ["X-Debug", "X-Internal-Token"]
     #[serde(default)]
     pub remove_request_headers: Vec<String>,
-    
+
     /// レスポンスに追加するヘッダー（クライアントへ返送前）
     /// 例: { "X-Frame-Options" = "DENY", "Strict-Transport-Security" = "max-age=31536000" }
     #[serde(default)]
     pub add_response_headers: HashMap<String, String>,
-    
+
     /// レスポンスから削除するヘッダー（クライアントへ返送前）
     /// 例: ["Server", "X-Powered-By"]
     #[serde(default)]
     pub remove_response_headers: Vec<String>,
-    
+
     // ====================
     // WebSocket設定
     // ====================
-    
     /// WebSocketポーリングモード
-    /// 
+    ///
     /// - `"fixed"`: 固定タイムアウト（低レイテンシ優先）
     /// - `"adaptive"`: バックオフ方式による動的調整（CPU効率優先）
-    /// 
+    ///
     /// デフォルト: `"adaptive"`
     #[serde(default)]
     pub websocket_poll_mode: WebSocketPollMode,
-    
+
     /// WebSocketポーリング初期タイムアウト（ミリ秒）
-    /// 
+    ///
     /// - fixedモード: この値を固定で使用
     /// - adaptiveモード: この値から開始し、アイドル時に徐々に延長
-    /// 
+    ///
     /// デフォルト: `1`
     #[serde(default = "default_websocket_poll_timeout_ms")]
     pub websocket_poll_timeout_ms: u64,
-    
+
     /// WebSocketポーリング最大タイムアウト（ミリ秒）
-    /// 
+    ///
     /// adaptiveモードでのみ使用。
     /// タイムアウトはこの値を超えて延長されない。
-    /// 
+    ///
     /// デフォルト: `100`
     #[serde(default = "default_websocket_poll_max_timeout_ms")]
     pub websocket_poll_max_timeout_ms: u64,
-    
+
     /// WebSocketバックオフ倍率
-    /// 
+    ///
     /// adaptiveモードでタイムアウト発生時に現在値に掛ける倍率。
-    /// 
+    ///
     /// 例: `2.0` → 1ms → 2ms → 4ms → 8ms → ... → 100ms（最大値）
-    /// 
+    ///
     /// デフォルト: `2.0`
     #[serde(default = "default_websocket_backoff_multiplier")]
     pub websocket_poll_backoff_multiplier: f64,
@@ -544,37 +562,37 @@ impl SecurityConfig {
     pub fn ip_filter(&self) -> IpFilter {
         IpFilter::from_lists(&self.allowed_ips, &self.denied_ips)
     }
-    
+
     /// ヘッダー操作が設定されているかどうか
     pub fn has_header_operations(&self) -> bool {
-        !self.add_request_headers.is_empty() ||
-        !self.remove_request_headers.is_empty() ||
-        !self.add_response_headers.is_empty() ||
-        !self.remove_response_headers.is_empty()
+        !self.add_request_headers.is_empty()
+            || !self.remove_request_headers.is_empty()
+            || !self.add_response_headers.is_empty()
+            || !self.remove_response_headers.is_empty()
     }
-    
+
     /// セキュリティチェックが設定されているかどうか
-    /// 
+    ///
     /// ## パフォーマンス最適化
-    /// 
+    ///
     /// セキュリティ設定が全てデフォルト値の場合、ホットパスでの
     /// 複数のチェックを完全にスキップできます。
     /// これにより、設定がないルートでは5-10%の高速化が期待できます。
-    /// 
+    ///
     /// チェック対象:
     /// - IP制限（allowed_ips, denied_ips）
     /// - HTTPメソッド制限（allowed_methods）
     /// - レートリミット（rate_limit_requests_per_min）
     #[inline]
     pub fn has_security_checks(&self) -> bool {
-        !self.allowed_ips.is_empty() ||
-        !self.denied_ips.is_empty() ||
-        !self.allowed_methods.is_empty() ||
-        self.rate_limit_requests_per_min > 0
+        !self.allowed_ips.is_empty()
+            || !self.denied_ips.is_empty()
+            || !self.allowed_methods.is_empty()
+            || self.rate_limit_requests_per_min > 0
     }
-    
+
     /// WebSocketポーリング設定を構築
-    /// 
+    ///
     /// SecurityConfigのWebSocket関連フィールドから
     /// WebSocketPollConfig構造体を生成します。
     #[inline]
@@ -622,7 +640,7 @@ impl Default for SecurityConfig {
 //
 // ルートごとにレスポンス圧縮を設定できます。
 // デフォルトは無効で、kTLS最適化を維持します。
-// 
+//
 // 有効にすると、バックエンドからのレスポンスを動的に圧縮し、
 // クライアントへ転送します。この場合、kTLSのゼロコピー最適化は
 // 迂回されます。
@@ -645,7 +663,7 @@ pub enum AcceptedEncoding {
 
 impl AcceptedEncoding {
     /// Accept-Encodingヘッダーから最適な圧縮方式を選択
-    /// 
+    ///
     /// 優先順位: zstd > br > gzip > deflate > identity
     /// q値（品質値）も考慮します。
     pub fn parse(value: &[u8]) -> Self {
@@ -653,10 +671,10 @@ impl AcceptedEncoding {
             Ok(s) => s.to_ascii_lowercase(),
             Err(_) => return Self::Identity,
         };
-        
+
         // q値を考慮した解析
         let mut best = (Self::Identity, 0.0f32);
-        
+
         for part in value_str.split(',') {
             let part = part.trim();
             let (encoding, q) = if let Some((enc, q_part)) = part.split_once(";q=") {
@@ -664,7 +682,7 @@ impl AcceptedEncoding {
             } else {
                 (part, 1.0)
             };
-            
+
             let candidate = match encoding {
                 "zstd" => (Self::Zstd, q),
                 "br" => (Self::Brotli, q),
@@ -673,18 +691,21 @@ impl AcceptedEncoding {
                 "*" => (Self::Gzip, q * 0.9), // * は gzip として扱う
                 _ => continue,
             };
-            
+
             // q値が高いもの、または同じq値ならZstd > Brotliを優先
-            if candidate.1 > best.1 || 
-               (candidate.1 == best.1 && matches!(candidate.0, Self::Zstd)) ||
-               (candidate.1 == best.1 && matches!(candidate.0, Self::Brotli) && !matches!(best.0, Self::Zstd)) {
+            if candidate.1 > best.1
+                || (candidate.1 == best.1 && matches!(candidate.0, Self::Zstd))
+                || (candidate.1 == best.1
+                    && matches!(candidate.0, Self::Brotli)
+                    && !matches!(best.0, Self::Zstd))
+            {
                 best = candidate;
             }
         }
-        
+
         best.0
     }
-    
+
     /// Content-Encodingヘッダー値を返す
     pub fn as_header_value(&self) -> &'static [u8] {
         match self {
@@ -704,41 +725,41 @@ pub struct CompressionConfig {
     /// 圧縮を有効にするかどうか
     /// デフォルト: false（kTLS最適化を維持）
     pub enabled: bool,
-    
+
     /// 圧縮方式の優先順位
     /// サポート: "zstd", "br" (Brotli), "gzip", "deflate"
     /// デフォルト: ["zstd", "br", "gzip"]
     pub preferred_encodings: Vec<String>,
-    
+
     /// Gzip圧縮レベル (1-9)
     /// 1: 最速（圧縮率低）、9: 最遅（圧縮率高）
     /// デフォルト: 4（バランス重視）
     #[serde(default = "default_gzip_level")]
     pub gzip_level: u32,
-    
+
     /// Brotli圧縮レベル (0-11)
     /// 0: 最速、11: 最遅（圧縮率最高）
     /// デフォルト: 4（バランス重視）
     #[serde(default = "default_brotli_level")]
     pub brotli_level: u32,
-    
+
     /// Zstd圧縮レベル (1-22)
     /// 1: 最速、22: 最遅（圧縮率最高）
     /// デフォルト: 3（高速重視）
     #[serde(default = "default_zstd_level")]
     pub zstd_level: i32,
-    
+
     /// 最小圧縮サイズ（バイト）
     /// これより小さいレスポンスは圧縮オーバーヘッドの方が大きいためスキップ
     /// デフォルト: 1024 (1KB)
     #[serde(default = "default_compression_min_size")]
     pub min_size: usize,
-    
+
     /// 圧縮対象のMIMEタイプ（プレフィックスマッチ）
     /// デフォルト: ["text/", "application/json", "application/javascript", ...]
     #[serde(default = "default_compressible_types")]
     pub compressible_types: Vec<String>,
-    
+
     /// 圧縮をスキップするMIMEタイプ（プレフィックスマッチ）
     /// これらにマッチするレスポンスは圧縮対象から除外
     /// デフォルト: ["image/", "video/", "audio/", ...]
@@ -747,10 +768,18 @@ pub struct CompressionConfig {
 }
 
 // 圧縮設定のデフォルト値
-fn default_gzip_level() -> u32 { 4 }
-fn default_brotli_level() -> u32 { 4 }
-fn default_zstd_level() -> i32 { 3 }  // zstdは1-22、3が高速でバランス良好
-fn default_compression_min_size() -> usize { 1024 }
+fn default_gzip_level() -> u32 {
+    4
+}
+fn default_brotli_level() -> u32 {
+    4
+}
+fn default_zstd_level() -> i32 {
+    3
+} // zstdは1-22、3が高速でバランス良好
+fn default_compression_min_size() -> usize {
+    1024
+}
 
 fn default_compressible_types() -> Vec<String> {
     vec![
@@ -786,7 +815,7 @@ fn default_preferred_encodings() -> Vec<String> {
 impl Default for CompressionConfig {
     fn default() -> Self {
         Self {
-            enabled: false,  // デフォルト無効（kTLS最適化維持）
+            enabled: false, // デフォルト無効（kTLS最適化維持）
             preferred_encodings: default_preferred_encodings(),
             gzip_level: default_gzip_level(),
             brotli_level: default_brotli_level(),
@@ -802,13 +831,22 @@ impl CompressionConfig {
     /// 設定の妥当性を検証
     pub fn validate(&self) -> Result<(), String> {
         if self.gzip_level < 1 || self.gzip_level > 9 {
-            return Err(format!("invalid gzip_level: {} (must be 1-9)", self.gzip_level));
+            return Err(format!(
+                "invalid gzip_level: {} (must be 1-9)",
+                self.gzip_level
+            ));
         }
         if self.brotli_level > 11 {
-            return Err(format!("invalid brotli_level: {} (must be 0-11)", self.brotli_level));
+            return Err(format!(
+                "invalid brotli_level: {} (must be 0-11)",
+                self.brotli_level
+            ));
         }
         if self.zstd_level < 1 || self.zstd_level > 22 {
-            return Err(format!("invalid zstd_level: {} (must be 1-22)", self.zstd_level));
+            return Err(format!(
+                "invalid zstd_level: {} (must be 1-22)",
+                self.zstd_level
+            ));
         }
         for enc in &self.preferred_encodings {
             match enc.as_str() {
@@ -818,15 +856,15 @@ impl CompressionConfig {
         }
         Ok(())
     }
-    
+
     /// レスポンスを圧縮すべきか判定
-    /// 
+    ///
     /// # Arguments
     /// * `client_encoding` - クライアントがサポートする圧縮方式
     /// * `content_type` - レスポンスのContent-Type
     /// * `content_length` - レスポンスのContent-Length（既知の場合）
     /// * `existing_encoding` - バックエンドからのContent-Encoding
-    /// 
+    ///
     /// # Returns
     /// 圧縮すべき場合は使用する圧縮方式、それ以外はNone
     pub fn should_compress(
@@ -840,35 +878,37 @@ impl CompressionConfig {
         if !self.enabled {
             return None;
         }
-        
+
         // 2. クライアントが圧縮非対応
         if client_encoding == AcceptedEncoding::Identity {
             return None;
         }
-        
+
         // 3. バックエンドが既に圧縮済み
         if let Some(enc) = existing_encoding {
             if !enc.is_empty() && !enc.eq_ignore_ascii_case(b"identity") {
                 return None;
             }
         }
-        
+
         // 4. Content-Type確認
         if let Some(ct) = content_type {
             let ct_str = std::str::from_utf8(ct).unwrap_or("");
             info!("[Compression] Checking Content-Type: '{}'", ct_str);
-            
+
             // スキップ対象をチェック
             for skip in &self.skip_types {
                 if ct_str.starts_with(skip) {
                     return None;
                 }
             }
-            
+
             // 圧縮対象をチェック
-            let is_compressible = self.compressible_types.iter()
+            let is_compressible = self
+                .compressible_types
+                .iter()
                 .any(|t| ct_str.starts_with(t));
-            
+
             if !is_compressible {
                 return None;
             }
@@ -876,10 +916,13 @@ impl CompressionConfig {
             // Content-Typeがない場合は圧縮しない
             return None;
         }
-        
+
         // 5. サイズ確認
         if let Some(len) = content_length {
-            info!("[Compression] Checking Content-Length: {} (min_size: {})", len, self.min_size);
+            info!(
+                "[Compression] Checking Content-Length: {} (min_size: {})",
+                len, self.min_size
+            );
             if len < self.min_size {
                 info!("[Compression] Content-Length is too small, skipping");
                 return None;
@@ -887,46 +930,72 @@ impl CompressionConfig {
         } else {
             info!("[Compression] Content-Length is missing, proceeding anyway");
         }
-        
+
         // 6. クライアントがサポートし、かつ設定で許可されている圧縮方式を選択
         let client_supports = |enc: &str| -> bool {
             match (enc, client_encoding) {
                 ("zstd", AcceptedEncoding::Zstd) => true,
                 ("br", AcceptedEncoding::Brotli | AcceptedEncoding::Zstd) => true,
-                ("gzip", AcceptedEncoding::Gzip | AcceptedEncoding::Brotli | AcceptedEncoding::Zstd) => true,
-                ("deflate", AcceptedEncoding::Deflate | AcceptedEncoding::Gzip | AcceptedEncoding::Brotli | AcceptedEncoding::Zstd) => true,
+                (
+                    "gzip",
+                    AcceptedEncoding::Gzip | AcceptedEncoding::Brotli | AcceptedEncoding::Zstd,
+                ) => true,
+                (
+                    "deflate",
+                    AcceptedEncoding::Deflate
+                    | AcceptedEncoding::Gzip
+                    | AcceptedEncoding::Brotli
+                    | AcceptedEncoding::Zstd,
+                ) => true,
                 _ => false,
             }
         };
-        
+
         for enc in &self.preferred_encodings {
             if client_supports(enc) {
                 return match enc.as_str() {
-                    "zstd" if client_encoding == AcceptedEncoding::Zstd => Some(AcceptedEncoding::Zstd),
-                    "br" if matches!(client_encoding, AcceptedEncoding::Brotli | AcceptedEncoding::Zstd) => Some(AcceptedEncoding::Brotli),
-                    "gzip" if matches!(client_encoding, AcceptedEncoding::Gzip | AcceptedEncoding::Brotli | AcceptedEncoding::Zstd) => Some(AcceptedEncoding::Gzip),
+                    "zstd" if client_encoding == AcceptedEncoding::Zstd => {
+                        Some(AcceptedEncoding::Zstd)
+                    }
+                    "br" if matches!(
+                        client_encoding,
+                        AcceptedEncoding::Brotli | AcceptedEncoding::Zstd
+                    ) =>
+                    {
+                        Some(AcceptedEncoding::Brotli)
+                    }
+                    "gzip"
+                        if matches!(
+                            client_encoding,
+                            AcceptedEncoding::Gzip
+                                | AcceptedEncoding::Brotli
+                                | AcceptedEncoding::Zstd
+                        ) =>
+                    {
+                        Some(AcceptedEncoding::Gzip)
+                    }
                     "deflate" => Some(AcceptedEncoding::Deflate),
                     _ => continue,
                 };
             }
         }
-        
+
         // クライアントの圧縮方式を使用
         Some(client_encoding)
     }
 }
 
 /// HTTP/3用の圧縮設定を解決
-/// 
+///
 /// 優先順位:
 /// 1. パスごとの設定 (compression.enabled = false なら圧縮しない)
 /// 2. HTTP/3専用設定 (http3.compression_enabled + http3.compression.*)
 /// 3. パスごとのデフォルト値
-/// 
+///
 /// # 引数
 /// * `path_compression` - パスごとの圧縮設定
 /// * `http3_config` - HTTP/3セクションの設定
-/// 
+///
 /// # 戻り値
 /// 解決された圧縮設定
 pub fn resolve_http3_compression_config(
@@ -940,26 +1009,27 @@ pub fn resolve_http3_compression_config(
         let h3_comp = &http3_config.compression;
         return CompressionConfig {
             enabled: true,
-            preferred_encodings: h3_comp.preferred_encodings
+            preferred_encodings: h3_comp
+                .preferred_encodings
                 .clone()
                 .unwrap_or_else(|| path_compression.preferred_encodings.clone()),
-            gzip_level: h3_comp.gzip_level
-                .unwrap_or(path_compression.gzip_level),
-            brotli_level: h3_comp.brotli_level
+            gzip_level: h3_comp.gzip_level.unwrap_or(path_compression.gzip_level),
+            brotli_level: h3_comp
+                .brotli_level
                 .unwrap_or(path_compression.brotli_level),
-            zstd_level: h3_comp.zstd_level
-                .unwrap_or(path_compression.zstd_level),
-            min_size: h3_comp.min_size
-                .unwrap_or(path_compression.min_size),
-            compressible_types: h3_comp.compressible_types
+            zstd_level: h3_comp.zstd_level.unwrap_or(path_compression.zstd_level),
+            min_size: h3_comp.min_size.unwrap_or(path_compression.min_size),
+            compressible_types: h3_comp
+                .compressible_types
                 .clone()
                 .unwrap_or_else(|| path_compression.compressible_types.clone()),
-            skip_types: h3_comp.skip_types
+            skip_types: h3_comp
+                .skip_types
                 .clone()
                 .unwrap_or_else(|| path_compression.skip_types.clone()),
         };
     }
-    
+
     // パスごとの設定で圧縮が無効の場合
     // HTTP/3の compression_enabled をチェック
     if http3_config.compression_enabled {
@@ -967,26 +1037,27 @@ pub fn resolve_http3_compression_config(
         let h3_comp = &http3_config.compression;
         return CompressionConfig {
             enabled: true, // HTTP/3では有効
-            preferred_encodings: h3_comp.preferred_encodings
+            preferred_encodings: h3_comp
+                .preferred_encodings
                 .clone()
                 .unwrap_or_else(|| path_compression.preferred_encodings.clone()),
-            gzip_level: h3_comp.gzip_level
-                .unwrap_or(path_compression.gzip_level),
-            brotli_level: h3_comp.brotli_level
+            gzip_level: h3_comp.gzip_level.unwrap_or(path_compression.gzip_level),
+            brotli_level: h3_comp
+                .brotli_level
                 .unwrap_or(path_compression.brotli_level),
-            zstd_level: h3_comp.zstd_level
-                .unwrap_or(path_compression.zstd_level),
-            min_size: h3_comp.min_size
-                .unwrap_or(path_compression.min_size),
-            compressible_types: h3_comp.compressible_types
+            zstd_level: h3_comp.zstd_level.unwrap_or(path_compression.zstd_level),
+            min_size: h3_comp.min_size.unwrap_or(path_compression.min_size),
+            compressible_types: h3_comp
+                .compressible_types
                 .clone()
                 .unwrap_or_else(|| path_compression.compressible_types.clone()),
-            skip_types: h3_comp.skip_types
+            skip_types: h3_comp
+                .skip_types
                 .clone()
                 .unwrap_or_else(|| path_compression.skip_types.clone()),
         };
     }
-    
+
     // HTTP/3圧縮も無効の場合はパス設定をそのまま使用（圧縮無効）
     path_compression.clone()
 }
@@ -997,24 +1068,23 @@ pub struct GlobalSecurityConfig {
     /// 起動後に降格するユーザー名（非root推奨）
     #[serde(default)]
     pub drop_privileges_user: Option<String>,
-    
+
     /// 起動後に降格するグループ名
     #[serde(default)]
     pub drop_privileges_group: Option<String>,
-    
+
     /// グローバル同時接続上限（0 = 無制限）
     #[serde(default)]
     pub max_concurrent_connections: usize,
-    
+
     // ====================
     // io_uring / seccomp セキュリティ設定
     // ====================
-    
     /// seccompフィルタを有効化（Linux専用）
     /// システムコールを制限してio_uringの悪用を防止
     #[serde(default)]
     pub enable_seccomp: bool,
-    
+
     /// seccompモード
     /// - "disabled": 無効
     /// - "log": 違反をログに記録（ブロックしない）
@@ -1022,19 +1092,19 @@ pub struct GlobalSecurityConfig {
     /// - "strict": 違反したプロセスをSIGKILL
     #[serde(default = "default_seccomp_mode")]
     pub seccomp_mode: String,
-    
+
     /// Landlockファイルシステム制限を有効化（Linux 5.13+）
     #[serde(default)]
     pub enable_landlock: bool,
-    
+
     /// Landlock読み取り専用パス
     #[serde(default = "default_landlock_read_paths")]
     pub landlock_read_paths: Vec<String>,
-    
+
     /// Landlock読み書きパス
     #[serde(default = "default_landlock_write_paths")]
     pub landlock_write_paths: Vec<String>,
-    
+
     // ====================
     // サンドボックス設定（bubblewrap相当）
     // ====================
@@ -1049,85 +1119,84 @@ pub struct GlobalSecurityConfig {
     // 3. Landlock（ファイルシステム制限）
     // 4. seccomp（システムコール制限）
     //
-    
     /// サンドボックスを有効化
     /// bubblewrap相当のnamespace分離、bind mounts、capabilities制限を適用
     #[serde(default)]
     pub enable_sandbox: bool,
-    
+
     /// PID namespace分離
     /// サンドボックス内のプロセスは外部のプロセスを見ることができなくなります
     #[serde(default)]
     pub sandbox_unshare_pid: bool,
-    
+
     /// Mount namespace分離
     /// サンドボックス内で独自のマウントポイントを持ちます
     #[serde(default = "default_sandbox_unshare_mount")]
     pub sandbox_unshare_mount: bool,
-    
+
     /// UTS namespace分離
     /// サンドボックス内で独自のホスト名を持ちます
     #[serde(default = "default_sandbox_unshare_uts")]
     pub sandbox_unshare_uts: bool,
-    
+
     /// IPC namespace分離
     /// サンドボックス内で独自のIPC（共有メモリ、セマフォ等）を持ちます
     #[serde(default = "default_sandbox_unshare_ipc")]
     pub sandbox_unshare_ipc: bool,
-    
+
     /// User namespace分離
     /// 注: 複雑なケースがあるためデフォルトは無効
     #[serde(default)]
     pub sandbox_unshare_user: bool,
-    
+
     /// Network namespace分離
     /// 警告: trueにするとネットワーク通信ができなくなります
     /// サーバーでは通常false（--share-net相当）
     #[serde(default)]
     pub sandbox_unshare_net: bool,
-    
+
     /// 読み取り専用バインドマウント
     /// source:dest 形式で指定（例: "/usr:/usr"）
     #[serde(default = "default_sandbox_ro_binds")]
     pub sandbox_ro_bind_mounts: Vec<String>,
-    
+
     /// 読み書きバインドマウント
     /// source:dest 形式で指定（例: "/var/log:/var/log"）
     #[serde(default)]
     pub sandbox_rw_bind_mounts: Vec<String>,
-    
+
     /// tmpfsマウント先
     /// 指定されたパスにtmpfs（メモリファイルシステム）をマウント
     #[serde(default = "default_sandbox_tmpfs")]
     pub sandbox_tmpfs_mounts: Vec<String>,
-    
+
     /// /proc をマウントするかどうか
     #[serde(default = "default_true")]
     pub sandbox_mount_proc: bool,
-    
+
     /// /dev に最小限のデバイスノードを作成するかどうか
     #[serde(default = "default_true")]
     pub sandbox_mount_dev: bool,
-    
+
     /// ドロップするケイパビリティのリスト
     /// 例: ["CAP_SYS_ADMIN", "CAP_NET_RAW"]
     #[serde(default)]
     pub sandbox_drop_capabilities: Vec<String>,
-    
+
     /// 保持するケイパビリティのリスト（他は全てドロップ）
     /// drop_capabilitiesより優先されます
     /// 例: ["CAP_NET_BIND_SERVICE"]
     #[serde(default)]
     pub sandbox_keep_capabilities: Vec<String>,
-    
+
     /// サンドボックス内のホスト名
     #[serde(default = "default_sandbox_hostname")]
     pub sandbox_hostname: Option<String>,
-    
+
     /// PR_SET_NO_NEW_PRIVSを設定するかどうか
     #[serde(default = "default_true")]
     pub sandbox_no_new_privs: bool,
-    
+
     /// セキュリティ機能の有効化に失敗した場合の動作
     /// false: 失敗時に起動を中止（デフォルト、推奨）
     /// true: 失敗時も警告を出して起動を続行（開発・デバッグ用）
@@ -1136,13 +1205,21 @@ pub struct GlobalSecurityConfig {
 }
 
 fn default_allow_security_failures() -> bool {
-    false  // デフォルトはfalse（失敗時に起動失敗）
+    false // デフォルトはfalse（失敗時に起動失敗）
 }
 
-fn default_sandbox_unshare_mount() -> bool { true }
-fn default_sandbox_unshare_uts() -> bool { true }
-fn default_sandbox_unshare_ipc() -> bool { true }
-fn default_true() -> bool { true }
+fn default_sandbox_unshare_mount() -> bool {
+    true
+}
+fn default_sandbox_unshare_uts() -> bool {
+    true
+}
+fn default_sandbox_unshare_ipc() -> bool {
+    true
+}
+fn default_true() -> bool {
+    true
+}
 
 fn default_sandbox_ro_binds() -> Vec<String> {
     vec![
@@ -1189,10 +1266,7 @@ fn default_landlock_read_paths() -> Vec<String> {
 }
 
 fn default_landlock_write_paths() -> Vec<String> {
-    vec![
-        "/var/log".to_string(),
-        "/tmp".to_string(),
-    ]
+    vec!["/var/log".to_string(), "/tmp".to_string()]
 }
 
 // ====================
@@ -1200,9 +1274,9 @@ fn default_landlock_write_paths() -> Vec<String> {
 // ====================
 
 /// Prometheusメトリクス設定
-/// 
+///
 /// メトリクスエンドポイントの有効化、パス変更、アクセス制限を設定します。
-/// 
+///
 /// 例:
 /// ```toml
 /// [prometheus]
@@ -1216,12 +1290,12 @@ pub struct PrometheusConfig {
     /// デフォルト: true
     #[serde(default = "default_prometheus_enabled")]
     pub enabled: bool,
-    
+
     /// メトリクスエンドポイントのパス
     /// デフォルト: "/__metrics"
     #[serde(default = "default_prometheus_path")]
     pub path: String,
-    
+
     /// メトリクスエンドポイントへのアクセスを許可するIPアドレス/CIDR
     /// 空の場合はすべてのIPからアクセス可能
     /// 例: ["127.0.0.1", "10.0.0.0/8", "192.168.0.0/16"]
@@ -1229,8 +1303,12 @@ pub struct PrometheusConfig {
     pub allowed_ips: Vec<String>,
 }
 
-fn default_prometheus_enabled() -> bool { false }
-fn default_prometheus_path() -> String { "/__metrics".to_string() }
+fn default_prometheus_enabled() -> bool {
+    false
+}
+fn default_prometheus_path() -> String {
+    "/__metrics".to_string()
+}
 
 /// 管理 API 設定（F-20）
 ///
@@ -1267,7 +1345,9 @@ pub struct AdminConfig {
 }
 
 #[cfg(feature = "admin")]
-fn default_admin_path_prefix() -> String { "/__admin".to_string() }
+fn default_admin_path_prefix() -> String {
+    "/__admin".to_string()
+}
 
 /// OpenTelemetry (OTLP/HTTP) 設定（F-10）
 ///
@@ -1297,9 +1377,15 @@ pub struct OpenTelemetryConfig {
     pub batch_interval_secs: u64,
 }
 
-fn default_otel_endpoint() -> String { "http://localhost:4318".to_string() }
-fn default_otel_service_name() -> String { "veil-proxy".to_string() }
-fn default_otel_batch_interval() -> u64 { 30 }
+fn default_otel_endpoint() -> String {
+    "http://localhost:4318".to_string()
+}
+fn default_otel_service_name() -> String {
+    "veil-proxy".to_string()
+}
+fn default_otel_batch_interval() -> u64 {
+    30
+}
 
 impl Default for OpenTelemetryConfig {
     fn default() -> Self {
@@ -1370,9 +1456,10 @@ impl AdminConfig {
         for allowed in &self.allowed_ips {
             if allowed.contains('/') {
                 if let Some((network, prefix_len)) = allowed.split_once('/') {
-                    if let (Ok(network_addr), Ok(prefix)) =
-                        (network.parse::<std::net::IpAddr>(), prefix_len.parse::<u8>())
-                    {
+                    if let (Ok(network_addr), Ok(prefix)) = (
+                        network.parse::<std::net::IpAddr>(),
+                        prefix_len.parse::<u8>(),
+                    ) {
                         if PrometheusConfig::ip_in_cidr(&client_addr, &network_addr, prefix) {
                             return true;
                         }
@@ -1405,19 +1492,22 @@ impl PrometheusConfig {
         if self.allowed_ips.is_empty() {
             return true;
         }
-        
+
         // クライアントIPをパース
         let client_addr: std::net::IpAddr = match client_ip.parse() {
             Ok(addr) => addr,
             Err(_) => return false,
         };
-        
+
         for allowed in &self.allowed_ips {
             // CIDR表記かチェック
             if allowed.contains('/') {
                 // CIDR表記の場合
                 if let Some((network, prefix_len)) = allowed.split_once('/') {
-                    if let (Ok(network_addr), Ok(prefix)) = (network.parse::<std::net::IpAddr>(), prefix_len.parse::<u8>()) {
+                    if let (Ok(network_addr), Ok(prefix)) = (
+                        network.parse::<std::net::IpAddr>(),
+                        prefix_len.parse::<u8>(),
+                    ) {
                         if Self::ip_in_cidr(&client_addr, &network_addr, prefix) {
                             return true;
                         }
@@ -1432,10 +1522,10 @@ impl PrometheusConfig {
                 }
             }
         }
-        
+
         false
     }
-    
+
     /// IPアドレスがCIDRブロック内にあるかチェック
     fn ip_in_cidr(ip: &std::net::IpAddr, network: &std::net::IpAddr, prefix_len: u8) -> bool {
         match (ip, network) {
@@ -1443,7 +1533,11 @@ impl PrometheusConfig {
                 if prefix_len > 32 {
                     return false;
                 }
-                let mask = if prefix_len == 0 { 0 } else { !0u32 << (32 - prefix_len) };
+                let mask = if prefix_len == 0 {
+                    0
+                } else {
+                    !0u32 << (32 - prefix_len)
+                };
                 let ip_bits = u32::from_be_bytes(ip.octets());
                 let net_bits = u32::from_be_bytes(net.octets());
                 (ip_bits & mask) == (net_bits & mask)
@@ -1454,7 +1548,11 @@ impl PrometheusConfig {
                 }
                 let ip_bits = u128::from_be_bytes(ip.octets());
                 let net_bits = u128::from_be_bytes(net.octets());
-                let mask = if prefix_len == 0 { 0 } else { !0u128 << (128 - prefix_len) };
+                let mask = if prefix_len == 0 {
+                    0
+                } else {
+                    !0u128 << (128 - prefix_len)
+                };
                 (ip_bits & mask) == (net_bits & mask)
             }
             _ => false, // IPv4とIPv6の混在は不一致
@@ -1519,29 +1617,40 @@ pub async fn drain_connections(worker_type: &str, thread_id: usize) {
     // 初期接続数を確認
     let initial_connections = CURRENT_CONNECTIONS.load(Ordering::Relaxed);
     if initial_connections == 0 {
-        info!("[{} {}] No active connections, proceeding with shutdown", worker_type, thread_id);
+        info!(
+            "[{} {}] No active connections, proceeding with shutdown",
+            worker_type, thread_id
+        );
         return;
     }
 
-    info!("[{} {}] Draining {} active connections (timeout: {}s)...",
-          worker_type, thread_id, initial_connections, timeout_secs);
+    info!(
+        "[{} {}] Draining {} active connections (timeout: {}s)...",
+        worker_type, thread_id, initial_connections, timeout_secs
+    );
 
     // 接続数が0になるかタイムアウトするまで待機
     while CURRENT_CONNECTIONS.load(Ordering::Relaxed) > 0 {
         if start.elapsed() > drain_timeout {
             let remaining = CURRENT_CONNECTIONS.load(Ordering::Relaxed);
-            warn!("[{} {}] Drain timeout after {}s, {} connections still active (forcing shutdown)",
-                  worker_type, thread_id, timeout_secs, remaining);
+            warn!(
+                "[{} {}] Drain timeout after {}s, {} connections still active (forcing shutdown)",
+                worker_type, thread_id, timeout_secs, remaining
+            );
             break;
         }
-        monoio::time::sleep(Duration::from_millis(100)).await;
+        crate::runtime::time::sleep(Duration::from_millis(100)).await;
     }
 
     let elapsed = start.elapsed();
     let remaining = CURRENT_CONNECTIONS.load(Ordering::Relaxed);
     if remaining == 0 {
-        info!("[{} {}] All connections drained in {:.1}s",
-              worker_type, thread_id, elapsed.as_secs_f64());
+        info!(
+            "[{} {}] All connections drained in {:.1}s",
+            worker_type,
+            thread_id,
+            elapsed.as_secs_f64()
+        );
     }
 }
 
@@ -1571,7 +1680,7 @@ impl RateLimitEntry {
             current_minute,
         }
     }
-    
+
     /// リクエストを記録し、現在のレートを返す（スライディングウィンドウ方式）
     /// 返り値: 推定される分間リクエスト数
     pub fn record_request(&mut self, now_minute: u64, now_second_in_minute: u32) -> u32 {
@@ -1589,7 +1698,7 @@ impl RateLimitEntry {
         } else {
             self.current_count += 1;
         }
-        
+
         // スライディングウィンドウによる推定レート計算
         // 現在の分の経過割合に基づいて重み付け
         let weight = (60 - now_second_in_minute) as f32 / 60.0;
@@ -1613,12 +1722,12 @@ impl RateLimiter {
             last_cleanup: std::time::Instant::now(),
         }
     }
-    
+
     /// リクエストをチェックし、レート制限を超えていないか確認
     /// 戻り値: (許可されたか, 現在のレート)
-    /// 
+    ///
     /// ## パフォーマンス最適化
-    /// 
+    ///
     /// SystemTime::now()の代わりにCoarse Timerを使用してシステムコールを削減。
     /// 100ms程度の精度低下は、レートリミットの用途では許容範囲。
     fn check_and_record(&mut self, client_ip: &str, limit: u64) -> (bool, u32) {
@@ -1627,36 +1736,36 @@ impl RateLimiter {
             self.cleanup();
             self.last_cleanup = std::time::Instant::now();
         }
-        
+
         // Coarse Timerから現在時刻を取得（システムコール削減）
         // OffsetDateTime から Unix タイムスタンプを計算
         let now_time = coarse_now();
         let now_secs = now_time.unix_timestamp() as u64;
         let now_minute = now_secs / 60;
         let now_second_in_minute = (now_secs % 60) as u32;
-        
+
         let rate = if let Some(entry) = self.entries.get_mut(client_ip) {
             entry.record_request(now_minute, now_second_in_minute)
         } else {
-            self.entries.insert(client_ip.to_string(), RateLimitEntry::new(now_minute));
+            self.entries
+                .insert(client_ip.to_string(), RateLimitEntry::new(now_minute));
             1
         };
-        
+
         (rate as u64 <= limit, rate)
     }
-    
+
     /// 古いエントリをクリーンアップ
-    /// 
+    ///
     /// Coarse Timerを使用してシステムコールを削減。
     fn cleanup(&mut self) {
         // Coarse Timerから現在時刻を取得
         let now_time = coarse_now();
         let now_minute = now_time.unix_timestamp() as u64 / 60;
-        
+
         // 2分以上古いエントリを削除
-        self.entries.retain(|_, entry| {
-            now_minute.saturating_sub(entry.current_minute) < 2
-        });
+        self.entries
+            .retain(|_, entry| now_minute.saturating_sub(entry.current_minute) < 2);
     }
 }
 
@@ -1670,7 +1779,7 @@ pub fn check_rate_limit(client_ip: &str, limit: u64) -> bool {
     if limit == 0 {
         return true; // 0 = 無制限
     }
-    
+
     RATE_LIMITER.with(|limiter| {
         let (allowed, _rate) = limiter.borrow_mut().check_and_record(client_ip, limit);
         allowed
@@ -1832,9 +1941,8 @@ pub fn get_tls_connector_insecure() -> crate::simple_tls::SimpleTlsConnector {
 // 設定構造体
 // ====================
 
-
 /// Upstream サーバーエントリ（文字列または構造体）
-/// 
+///
 /// 以下の2つの形式をサポート:
 /// - 文字列形式: "http://localhost:8080"
 /// - 構造体形式: { url = "https://192.168.1.100:443", sni_name = "api.example.com" }
@@ -1853,16 +1961,16 @@ impl<'de> serde::Deserialize<'de> for UpstreamServerEntry {
         D: serde::Deserializer<'de>,
     {
         use serde::de::{MapAccess, Visitor};
-        
+
         struct UpstreamServerEntryVisitor;
-        
+
         impl<'de> Visitor<'de> for UpstreamServerEntryVisitor {
             type Value = UpstreamServerEntry;
-            
+
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
                 formatter.write_str("a string URL or an object with 'url' and optional 'sni_name'")
             }
-            
+
             // 文字列形式: "http://localhost:8080"
             fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
             where
@@ -1892,7 +2000,9 @@ impl<'de> serde::Deserialize<'de> for UpstreamServerEntry {
                         "sni_name" => sni_name = Some(map.next_value()?),
                         "use_h2c" | "h2c" => use_h2c = Some(map.next_value()?),
                         "weight" => weight = Some(map.next_value()?),
-                        _ => { let _: serde::de::IgnoredAny = map.next_value()?; }
+                        _ => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
                     }
                 }
 
@@ -1900,10 +2010,15 @@ impl<'de> serde::Deserialize<'de> for UpstreamServerEntry {
                 let use_h2c = use_h2c.unwrap_or(false);
                 // weight=0 は無効なので最低1に補正
                 let weight = weight.unwrap_or(1).max(1);
-                Ok(UpstreamServerEntry { url, sni_name, use_h2c, weight })
+                Ok(UpstreamServerEntry {
+                    url,
+                    sni_name,
+                    use_h2c,
+                    weight,
+                })
             }
         }
-        
+
         deserializer.deserialize_any(UpstreamServerEntryVisitor)
     }
 }
@@ -1983,11 +2098,21 @@ impl Default for CircuitBreakerConfig {
     }
 }
 
-fn default_cb_failure_threshold() -> u32 { 5 }
-fn default_cb_failure_window() -> u64 { 60 }
-fn default_cb_open_duration() -> u64 { 30 }
-fn default_cb_half_open_probes() -> u32 { 3 }
-fn default_cb_success_threshold() -> u32 { 2 }
+fn default_cb_failure_threshold() -> u32 {
+    5
+}
+fn default_cb_failure_window() -> u64 {
+    60
+}
+fn default_cb_open_duration() -> u64 {
+    30
+}
+fn default_cb_half_open_probes() -> u32 {
+    3
+}
+fn default_cb_success_threshold() -> u32 {
+    2
+}
 
 /// 異常検知（パッシブ Outlier Detection）設定（F-06）
 #[derive(Deserialize, Clone, Debug)]
@@ -2021,10 +2146,18 @@ impl Default for OutlierConfig {
     }
 }
 
-fn default_outlier_error_rate() -> f64 { 0.5 }
-fn default_outlier_interval() -> u64 { 10 }
-fn default_outlier_base_ejection() -> u64 { 30 }
-fn default_outlier_max_eject_percent() -> u32 { 50 }
+fn default_outlier_error_rate() -> f64 {
+    0.5
+}
+fn default_outlier_interval() -> u64 {
+    10
+}
+fn default_outlier_base_ejection() -> u64 {
+    30
+}
+fn default_outlier_max_eject_percent() -> u32 {
+    50
+}
 
 /// リトライポリシー（F-06、ルート単位）
 #[derive(Deserialize, Clone, Debug)]
@@ -2066,11 +2199,21 @@ impl Default for RetryPolicy {
     }
 }
 
-fn default_retry_max() -> u32 { 2 }
-fn default_retry_on() -> Vec<u16> { vec![502, 503, 504] }
-fn default_retry_backoff() -> u64 { 100 }
-fn default_retry_max_backoff() -> u64 { 1000 }
-fn default_retry_multiplier() -> f64 { 2.0 }
+fn default_retry_max() -> u32 {
+    2
+}
+fn default_retry_on() -> Vec<u16> {
+    vec![502, 503, 504]
+}
+fn default_retry_backoff() -> u64 {
+    100
+}
+fn default_retry_max_backoff() -> u64 {
+    1000
+}
+fn default_retry_multiplier() -> f64 {
+    2.0
+}
 
 impl RetryPolicy {
     /// 指定リトライ回数（0始まり）でのバックオフ時間を計算
@@ -2125,12 +2268,24 @@ pub struct HealthCheckConfig {
     pub verify_cert: bool,
 }
 
-fn default_health_check_interval() -> u64 { 10 }
-fn default_health_check_path() -> String { "/".to_string() }
-fn default_health_check_timeout() -> u64 { 5 }
-fn default_healthy_statuses() -> Vec<u16> { vec![200, 201, 202, 204, 301, 302, 304] }
-fn default_unhealthy_threshold() -> u32 { 3 }
-fn default_healthy_threshold() -> u32 { 2 }
+fn default_health_check_interval() -> u64 {
+    10
+}
+fn default_health_check_path() -> String {
+    "/".to_string()
+}
+fn default_health_check_timeout() -> u64 {
+    5
+}
+fn default_healthy_statuses() -> Vec<u16> {
+    vec![200, 201, 202, 204, 301, 302, 304]
+}
+fn default_unhealthy_threshold() -> u32 {
+    3
+}
+fn default_healthy_threshold() -> u32 {
+    2
+}
 
 impl Default for HealthCheckConfig {
     fn default() -> Self {
@@ -2152,7 +2307,7 @@ impl Default for HealthCheckConfig {
 // ====================
 
 /// ルーティング条件（AWS ALB準拠）
-/// 
+///
 /// すべての条件はANDで結合されます。
 /// 条件が指定されていない場合は、すべてのリクエストにマッチします（デフォルトルート）。
 #[derive(Clone, Debug, Deserialize)]
@@ -2161,27 +2316,27 @@ pub struct RouteConditions {
     /// 例: "api.example.com", "*.example.com"
     #[serde(default)]
     pub host: Option<String>,
-    
+
     /// path-pattern: パスマッチ（ワイルドカード対応）
     /// 例: "/api/*", "/static/*", "/api/v2/*"
     #[serde(default)]
     pub path: Option<String>,
-    
+
     /// http-header: HTTPヘッダーマッチ（複数指定可能）
     /// 例: { "X-Version" = "v2" }
     #[serde(default)]
     pub header: Option<HashMap<String, String>>,
-    
+
     /// http-request-method: HTTPメソッドマッチ（配列対応）
     /// 例: ["GET", "POST"]
     #[serde(default)]
     pub method: Option<Vec<String>>,
-    
+
     /// query-string: クエリパラメータマッチ（複数指定可能）
     /// 例: { "key" = "value" }
     #[serde(default)]
     pub query: Option<HashMap<String, String>>,
-    
+
     /// source-ip: ソースIPマッチ（CIDR表記）
     /// 例: ["192.168.0.0/16", "10.0.0.0/8"]
     #[serde(default)]
@@ -2202,37 +2357,37 @@ impl Default for RouteConditions {
 }
 
 /// ルーティングルール
-/// 
+///
 /// 条件に一致するリクエストに対して、指定されたバックエンドアクションを実行します。
 #[derive(Clone, Debug, Deserialize)]
 pub struct Route {
     /// ルーティング条件（空の場合はデフォルトルート）
     #[serde(default)]
     pub conditions: RouteConditions,
-    
+
     /// バックエンドアクション
     pub action: BackendConfig,
-    
+
     /// ルートレベルのセキュリティ設定（actionの設定をオーバーライド）
     #[serde(default)]
     pub security: Option<SecurityConfig>,
-    
+
     /// ルートレベルの圧縮設定（actionの設定をオーバーライド）
     #[serde(default)]
     pub compression: Option<CompressionConfig>,
-    
+
     /// ルートレベルのバッファリング設定（actionの設定をオーバーライド）
     #[serde(default)]
     pub buffering: Option<buffering::BufferingConfig>,
-    
+
     /// ルートレベルのキャッシュ設定（actionの設定をオーバーライド）
     #[serde(default)]
     pub cache: Option<cache::CacheConfig>,
-    
+
     /// ルートレベルのOpenFileCache設定（actionの設定をオーバーライド、Fileバックエンドのみ）
     #[serde(default)]
     pub open_file_cache: Option<cache::OpenFileCacheConfig>,
-    
+
     /// ルートレベルのWASMモジュール名のリスト（このルートに適用するWASMモジュール）
     /// 注意: modules は route 直下で設定（action配下の設定は削除）
     #[serde(default)]
@@ -2304,60 +2459,59 @@ pub struct Http2ConfigSection {
     /// 高パフォーマンス: 65536 (64KB)
     #[serde(default = "default_h2_header_table_size")]
     pub header_table_size: u32,
-    
+
     /// SETTINGS_MAX_CONCURRENT_STREAMS (同時ストリーム数)
     /// デフォルト: 100
     #[serde(default = "default_h2_max_concurrent_streams")]
     pub max_concurrent_streams: u32,
-    
+
     /// SETTINGS_INITIAL_WINDOW_SIZE (ストリームウィンドウサイズ)
     /// デフォルト: 65535 (64KB - 1)
     #[serde(default = "default_h2_initial_window_size")]
     pub initial_window_size: u32,
-    
+
     /// SETTINGS_MAX_FRAME_SIZE (最大フレームサイズ)
     /// デフォルト: 16384 (16KB)
     #[serde(default = "default_h2_max_frame_size")]
     pub max_frame_size: u32,
-    
+
     /// SETTINGS_MAX_HEADER_LIST_SIZE (最大ヘッダーリストサイズ)
     /// デフォルト: 16384 (16KB)
     #[serde(default = "default_h2_max_header_list_size")]
     pub max_header_list_size: u32,
-    
+
     /// コネクションウィンドウサイズ（コネクション全体のフロー制御）
     /// デフォルト: 65535 (64KB - 1)
     #[serde(default = "default_h2_connection_window_size")]
     pub connection_window_size: u32,
-    
+
     // ====================
     // DoS 対策設定
     // ====================
-    
     /// RST_STREAM レート制限 (1秒あたりの最大数)
     /// Rapid Reset 対策 (CVE-2023-44487)
     /// デフォルト: 100
     #[serde(default = "default_h2_max_rst_stream_per_second")]
     pub max_rst_stream_per_second: u32,
-    
+
     /// 制御フレームレート制限 (1秒あたりの最大数)
     /// PING/SETTINGS フラッド対策
     /// デフォルト: 500
     #[serde(default = "default_h2_max_control_frames_per_second")]
     pub max_control_frames_per_second: u32,
-    
+
     /// CONTINUATION フレーム制限 (ヘッダーブロックあたりの最大数)
     /// CONTINUATION Flood 対策 (CVE-2024-24786)
     /// デフォルト: 10
     #[serde(default = "default_h2_max_continuation_frames")]
     pub max_continuation_frames: u32,
-    
+
     /// 最大ヘッダーブロックサイズ (bytes)
     /// HPACK Bomb 対策
     /// デフォルト: 65536 (64KB)
     #[serde(default = "default_h2_max_header_block_size")]
     pub max_header_block_size: usize,
-    
+
     /// ストリームアイドルタイムアウト (秒)
     /// Slow Loris 対策
     /// デフォルト: 60
@@ -2367,19 +2521,41 @@ pub struct Http2ConfigSection {
 
 // HTTP/2 設定のデフォルト値（high_performance と同等）
 // HPACK動的テーブルサイズを大きくすることで、ヘッダー圧縮効率が向上
-fn default_h2_header_table_size() -> u32 { 65536 }      // 64KB (より多くのヘッダーをキャッシュ)
-fn default_h2_max_concurrent_streams() -> u32 { 256 }   // より多くの同時ストリーム
-fn default_h2_initial_window_size() -> u32 { 1048576 }  // 1MB (より大きなウィンドウ)
-fn default_h2_max_frame_size() -> u32 { 65536 }         // 64KB (より大きなフレーム)
-fn default_h2_max_header_list_size() -> u32 { 65536 }   // 64KB
-fn default_h2_connection_window_size() -> u32 { 1048576 } // 1MB
+fn default_h2_header_table_size() -> u32 {
+    65536
+} // 64KB (より多くのヘッダーをキャッシュ)
+fn default_h2_max_concurrent_streams() -> u32 {
+    256
+} // より多くの同時ストリーム
+fn default_h2_initial_window_size() -> u32 {
+    1048576
+} // 1MB (より大きなウィンドウ)
+fn default_h2_max_frame_size() -> u32 {
+    65536
+} // 64KB (より大きなフレーム)
+fn default_h2_max_header_list_size() -> u32 {
+    65536
+} // 64KB
+fn default_h2_connection_window_size() -> u32 {
+    1048576
+} // 1MB
 
 // DoS 対策のデフォルト値
-fn default_h2_max_rst_stream_per_second() -> u32 { 100 }
-fn default_h2_max_control_frames_per_second() -> u32 { 500 }
-fn default_h2_max_continuation_frames() -> u32 { 10 }
-fn default_h2_max_header_block_size() -> usize { 65536 }
-fn default_h2_stream_idle_timeout_secs() -> u64 { 60 }
+fn default_h2_max_rst_stream_per_second() -> u32 {
+    100
+}
+fn default_h2_max_control_frames_per_second() -> u32 {
+    500
+}
+fn default_h2_max_continuation_frames() -> u32 {
+    10
+}
+fn default_h2_max_header_block_size() -> usize {
+    65536
+}
+fn default_h2_stream_idle_timeout_secs() -> u64 {
+    60
+}
 
 impl Default for Http2ConfigSection {
     fn default() -> Self {
@@ -2427,7 +2603,7 @@ impl Http2ConfigSection {
 // ====================
 
 /// HTTP/3 専用圧縮設定
-/// 
+///
 /// HTTP/3接続時に使用する圧縮パラメータを設定します。
 /// 未設定のフィールドはパスごとの設定または全体設定を継承します。
 #[derive(Deserialize, Clone, Debug, Default)]
@@ -2437,27 +2613,27 @@ pub struct Http3CompressionConfig {
     /// サポート: "zstd", "br" (Brotli), "gzip", "deflate"
     /// 未設定時はパスごとの設定を使用
     pub preferred_encodings: Option<Vec<String>>,
-    
+
     /// Gzip圧縮レベル (1-9)
     /// 未設定時はパスごとの設定を使用
     pub gzip_level: Option<u32>,
-    
+
     /// Brotli圧縮レベル (0-11)
     /// 未設定時はパスごとの設定を使用
     pub brotli_level: Option<u32>,
-    
+
     /// Zstd圧縮レベル (1-22)
     /// 未設定時はパスごとの設定を使用
     pub zstd_level: Option<i32>,
-    
+
     /// 最小圧縮サイズ（バイト）
     /// 未設定時はパスごとの設定を使用
     pub min_size: Option<usize>,
-    
+
     /// 圧縮対象のMIMEタイプ（プレフィックスマッチ）
     /// 未設定時はパスごとの設定を使用
     pub compressible_types: Option<Vec<String>>,
-    
+
     /// 圧縮をスキップするMIMEタイプ（プレフィックスマッチ）
     /// 未設定時はパスごとの設定を使用
     pub skip_types: Option<Vec<String>>,
@@ -2468,23 +2644,35 @@ impl Http3CompressionConfig {
     pub fn validate(&self) -> Result<(), String> {
         if let Some(level) = self.gzip_level {
             if level < 1 || level > 9 {
-                return Err(format!("http3.compression.gzip_level: {} (must be 1-9)", level));
+                return Err(format!(
+                    "http3.compression.gzip_level: {} (must be 1-9)",
+                    level
+                ));
             }
         }
         if let Some(level) = self.brotli_level {
             if level > 11 {
-                return Err(format!("http3.compression.brotli_level: {} (must be 0-11)", level));
+                return Err(format!(
+                    "http3.compression.brotli_level: {} (must be 0-11)",
+                    level
+                ));
             }
         }
         if let Some(level) = self.zstd_level {
             if level < 1 || level > 22 {
-                return Err(format!("http3.compression.zstd_level: {} (must be 1-22)", level));
+                return Err(format!(
+                    "http3.compression.zstd_level: {} (must be 1-22)",
+                    level
+                ));
             }
         }
         if let Some(ref encodings) = self.preferred_encodings {
             for enc in encodings {
                 if !["zstd", "br", "gzip", "deflate"].contains(&enc.as_str()) {
-                    return Err(format!("http3.compression.preferred_encodings: unknown encoding '{}'", enc));
+                    return Err(format!(
+                        "http3.compression.preferred_encodings: unknown encoding '{}'",
+                        enc
+                    ));
                 }
             }
         }
@@ -2493,7 +2681,7 @@ impl Http3CompressionConfig {
 }
 
 /// HTTP/3 詳細設定
-/// 
+///
 /// HTTP/3 (QUIC) プロトコルのパラメータを設定します。
 /// 有効化は `server.http3_enabled` で行います。
 #[derive(Deserialize, Clone)]
@@ -2502,83 +2690,93 @@ pub struct Http3ConfigSection {
     /// 未指定の場合は server.listen と同じアドレスを使用
     #[serde(default)]
     pub listen: Option<String>,
-    
+
     /// 最大アイドルタイムアウト（ミリ秒）
     /// デフォルト: 30000 (30秒)
     #[serde(default = "default_h3_max_idle_timeout")]
     pub max_idle_timeout: u64,
-    
+
     /// 最大UDPペイロードサイズ
     /// デフォルト: 1350 (MTU考慮)
     #[serde(default = "default_h3_max_udp_payload_size")]
     pub max_udp_payload_size: u64,
-    
+
     /// 初期最大データサイズ（コネクション全体）
     /// デフォルト: 10000000 (10MB)
     #[serde(default = "default_h3_initial_max_data")]
     pub initial_max_data: u64,
-    
+
     /// 初期最大ストリームデータサイズ（双方向ローカル）
     #[serde(default = "default_h3_initial_max_stream_data")]
     pub initial_max_stream_data_bidi_local: u64,
-    
+
     /// 初期最大ストリームデータサイズ（双方向リモート）
     #[serde(default = "default_h3_initial_max_stream_data")]
     pub initial_max_stream_data_bidi_remote: u64,
-    
+
     /// 初期最大ストリームデータサイズ（単方向）
     #[serde(default = "default_h3_initial_max_stream_data")]
     pub initial_max_stream_data_uni: u64,
-    
+
     /// 初期最大双方向ストリーム数
     #[serde(default = "default_h3_max_streams")]
     pub initial_max_streams_bidi: u64,
-    
+
     /// 初期最大単方向ストリーム数
     #[serde(default = "default_h3_max_streams")]
     pub initial_max_streams_uni: u64,
-    
+
     /// HTTP/3接続時の圧縮を常に有効化
     /// デフォルト: false
-    /// 
+    ///
     /// true の場合、パスごとの設定で明示的に無効化されていない限り、
     /// すべてのHTTP/3レスポンスで圧縮を試みます。
     /// パスごとの compression.enabled = false の場合はそちらが優先されます。
     #[serde(default)]
     pub compression_enabled: bool,
-    
+
     /// HTTP/3専用の圧縮パラメータ
-    /// 
+    ///
     /// パスごとの圧縮設定より優先されます。
     /// 未設定のフィールドはパスごとの設定を継承します。
     #[serde(default)]
     pub compression: Http3CompressionConfig,
-    
+
     /// GSO/GRO を有効化するかどうか
-    /// 
+    ///
     /// GSO (Generic Segmentation Offload) / GRO (Generic Receive Offload) は
     /// カーネルレベルでUDPパケットの送受信を効率化する機能です。
-    /// 
+    ///
     /// 効果:
     /// - 複数の小さなUDPパケットを一度に送受信
     /// - システムコール回数の削減
     /// - CPU使用率の低減
-    /// 
+    ///
     /// 注意:
     /// - Linux 5.0+ でサポート
     /// - 一部の仮想環境やDockerでは期待通りに動作しない場合あり
     /// - 問題が発生した場合は false に設定してください
-    /// 
+    ///
     /// デフォルト: false
     #[serde(default)]
     pub gso_gro_enabled: bool,
 }
 
-fn default_h3_max_idle_timeout() -> u64 { 30000 }
-fn default_h3_max_udp_payload_size() -> u64 { 1350 }
-fn default_h3_initial_max_data() -> u64 { 10_000_000 }
-fn default_h3_initial_max_stream_data() -> u64 { 1_000_000 }
-fn default_h3_max_streams() -> u64 { 100 }
+fn default_h3_max_idle_timeout() -> u64 {
+    30000
+}
+fn default_h3_max_udp_payload_size() -> u64 {
+    1350
+}
+fn default_h3_initial_max_data() -> u64 {
+    10_000_000
+}
+fn default_h3_initial_max_stream_data() -> u64 {
+    1_000_000
+}
+fn default_h3_max_streams() -> u64 {
+    100
+}
 
 impl Default for Http3ConfigSection {
     fn default() -> Self {
@@ -2602,11 +2800,15 @@ impl Default for Http3ConfigSection {
 #[cfg(feature = "http3")]
 impl Http3ConfigSection {
     /// HTTP/3 設定を Http3ServerConfig に変換
-    pub fn to_http3_config(&self, cert_path: &str, key_path: &str) -> http3_server::Http3ServerConfig {
+    pub fn to_http3_config(
+        &self,
+        cert_path: &str,
+        key_path: &str,
+    ) -> http3_server::Http3ServerConfig {
         http3_server::Http3ServerConfig {
             cert_path: cert_path.to_string(),
             key_path: key_path.to_string(),
-            cert_pem: None,  // quicheはファイルパスからの読み込みのみサポート
+            cert_pem: None, // quicheはファイルパスからの読み込みのみサポート
             key_pem: None,
             max_idle_timeout: self.max_idle_timeout,
             max_udp_payload_size: self.max_udp_payload_size,
@@ -2625,10 +2827,10 @@ impl Http3ConfigSection {
 pub struct ServerConfigSection {
     pub listen: String,
     /// HTTPリスナーアドレス（オプション）
-    /// 
+    ///
     /// 指定した場合、HTTPアクセスをHTTPSにリダイレクトするリスナーを起動します。
     /// 例: "0.0.0.0:80"
-    /// 
+    ///
     /// リダイレクトのみを行い、コンテンツは配信しません（セキュリティ考慮）。
     #[serde(default)]
     pub http: Option<String>,
@@ -2636,56 +2838,54 @@ pub struct ServerConfigSection {
     /// 未指定または0の場合はCPUコア数と同じスレッド数を使用
     #[serde(default)]
     pub threads: Option<usize>,
-    
+
     // ====================
     // Serverヘッダー設定
     // ====================
-    
     /// Serverヘッダーを有効化（デフォルト: false）
-    /// 
+    ///
     /// セキュリティ考慮事項:
     /// - Serverヘッダーはサーバーソフトウェア情報を公開します
     /// - 攻撃者がバージョン別の脆弱性を狙う手がかりになり得ます
     /// - 本番環境では無効化を推奨
     #[serde(default)]
     pub server_header_enabled: bool,
-    
+
     /// Serverヘッダーの値（server_header_enabled = true時のみ有効）
-    /// 
+    ///
     /// デフォルト: "veil"
     /// 空文字の場合: ヘッダー自体を送信しない
     #[serde(default = "default_server_header_value")]
     pub server_header_value: String,
-    
+
     // ====================
     // HTTP/2・HTTP/3 設定
     // ====================
-    
     /// HTTP/2 を有効化するかどうか
-    /// 
+    ///
     /// TLS ALPN ネゴシエーションにより HTTP/2 (h2) をサポートします。
     /// HTTP/1.1 へのフォールバックも可能です。
-    /// 
+    ///
     /// 効果:
     /// - ストリーム多重化によるレイテンシ削減
     /// - HPACK ヘッダー圧縮によるオーバーヘッド削減
     /// - サーバープッシュ（無効化推奨）
-    /// 
+    ///
     /// 注意: `--features http2` でビルドする必要があります
     #[serde(default)]
     #[cfg_attr(not(feature = "http2"), allow(dead_code))]
     pub http2_enabled: bool,
-    
+
     /// HTTP/3 を有効化するかどうか
-    /// 
+    ///
     /// QUIC/UDP ベースの HTTP/3 プロトコルをサポートします。
-    /// 
+    ///
     /// 効果:
     /// - 0-RTT 接続確立
     /// - 接続マイグレーション
     /// - Head-of-Line ブロッキング解消
-    /// 
-    /// 注意: 
+    ///
+    /// 注意:
     /// - `--features http3` でビルドする必要があります
     /// - HTTP/3 は UDP ベースのため kTLS は使用不可
     /// - GSO/GRO による高パフォーマンス UDP 処理を使用
@@ -2693,52 +2893,50 @@ pub struct ServerConfigSection {
     #[serde(default)]
     #[cfg_attr(not(feature = "http3"), allow(dead_code))]
     pub http3_enabled: bool,
-    
+
     // ====================
     // H2C (HTTP/2 Cleartext) 設定
     // ====================
-    
     /// H2C (HTTP/2 Cleartext) サーバーを有効化するかどうか
-    /// 
+    ///
     /// TLSなしでHTTP/2を使用するプロトコルです（RFC 7540 Section 3.4）。
     /// Prior Knowledgeモードをサポートします。
-    /// 
+    ///
     /// 効果:
     /// - ストリーム多重化によるレイテンシ削減
     /// - HPACK ヘッダー圧縮によるオーバーヘッド削減
     /// - gRPC バックエンドへの接続に適している
-    /// 
+    ///
     /// セキュリティ考慮事項:
     /// - H2Cは平文通信のため、本番環境では内部ネットワークでのみ使用を推奨
     /// - 外部公開時はTLS必須
     /// - デフォルトで無効（明示的に有効化が必要）
-    /// 
+    ///
     /// 注意: `--features http2` でビルドする必要があります
     #[serde(default)]
     #[cfg_attr(not(feature = "http2"), allow(dead_code))]
     pub h2c_enabled: bool,
-    
+
     /// H2C リスニングアドレス（オプション）
-    /// 
+    ///
     /// 指定した場合、H2C専用のリスナーを起動します。
     /// 未指定の場合は、TLSリスナーと同じアドレスでプロトコル検出を行います。
-    /// 
+    ///
     /// 例: "0.0.0.0:8080"
-    /// 
+    ///
     /// 注意: 同じポートでTLSとH2Cの両方を処理する場合は未指定にしてください。
     #[serde(default)]
     #[cfg_attr(not(feature = "http2"), allow(dead_code))]
     pub h2c_listen: Option<String>,
-    
+
     // ====================
     // グレースフルシャットダウン設定
     // ====================
-    
     /// グレースフルシャットダウンのドレインタイムアウト（秒）
-    /// 
+    ///
     /// SIGTERMまたはSIGINT受信時に、既存の接続が完了するまで待機する最大時間。
     /// タイムアウト後は残りの接続を強制終了します。
-    /// 
+    ///
     /// デフォルト: 30秒
     /// 0: 待機せずに即座に終了（既存の動作）
     #[serde(default = "default_graceful_shutdown_timeout")]
@@ -2760,12 +2958,12 @@ pub struct TlsConfigSection {
     pub cert_path: String,
     pub key_path: String,
     /// kTLSを有効化するかどうか（Linux 5.15+、modprobe tls 必須）
-    /// 
+    ///
     /// kTLS有効化時の効果:
     /// - TLSデータ転送フェーズでカーネルオフロード
     /// - sendfileでゼロコピー送信（TLS暗号化済み）
     /// - 高負荷時にCPU 20-40%節約、スループット最大2倍
-    /// 
+    ///
     /// 注意事項:
     /// - TLSハンドシェイクはrustlsで実行（セキュリティ維持）
     /// - AES-GCM暗号スイートのみサポート
@@ -2773,10 +2971,10 @@ pub struct TlsConfigSection {
     #[serde(default)]
     pub ktls_enabled: bool,
     /// kTLS有効化失敗時にrustlsへフォールバックするかどうか
-    /// 
+    ///
     /// - false: kTLS必須モード（失敗時は接続拒否）
     /// - true: kTLS失敗時はrustlsで継続（デフォルト）
-    /// 
+    ///
     /// フォールバック無効化のメリット:
     /// - パフォーマンス予測可能性（確実にkTLSを使用）
     /// - デバッグ容易性（kTLS/rustls混在なし）
@@ -2784,10 +2982,10 @@ pub struct TlsConfigSection {
     #[serde(default = "default_ktls_fallback")]
     pub ktls_fallback_enabled: bool,
     /// kTLS有効時にTCP_CORKを使用するかどうか
-    /// 
+    ///
     /// TCP_CORKはkTLS設定中に小さなTCPパケットの送信を遅延し、
     /// パケット結合により効率的なネットワーク転送を実現します。
-    /// 
+    ///
     /// - true: TCP_CORK有効（デフォルト、推奨）
     /// - false: TCP_CORK無効（特定の低遅延要件がある場合）
     #[serde(default = "default_tcp_cork")]
@@ -2803,7 +3001,9 @@ pub struct TlsConfigSection {
 }
 
 /// 証明書リロードチェック間隔のデフォルト値（秒）
-fn default_tls_reload_interval() -> u64 { 60 }
+fn default_tls_reload_interval() -> u64 {
+    60
+}
 
 /// kTLSフォールバックのデフォルト値（true = フォールバック有効）
 fn default_ktls_fallback() -> bool {
@@ -2824,49 +3024,47 @@ pub struct PerformanceConfigSection {
     #[serde(default)]
     pub reuseport_balancing: ReuseportBalancing,
     /// Huge Pages (Large OS Pages) の使用
-    /// 
+    ///
     /// mimallocでHuge Pages（2MB）を優先使用し、TLBミスを削減します。
-    /// 
+    ///
     /// 効果:
     /// - TLB（Translation Lookaside Buffer）ミス削減
     /// - 大容量メモリ使用時のページフォルト減少
     /// - kTLS/splice時のカーネル連携で5-10%パフォーマンス向上
-    /// 
+    ///
     /// 要件（Linux）:
     /// - /proc/sys/vm/nr_hugepages に十分な値を設定
     /// - コンテナ環境では追加設定が必要な場合あり
     #[serde(default)]
     pub huge_pages_enabled: bool,
-    
+
     // ====================
     // Viaヘッダー設定
     // ====================
-    
     /// Viaヘッダーを追加するかどうか
-    /// 
+    ///
     /// RFC 7230 Section 5.7.1 に従い、プロキシ経由のリクエスト/レスポンスに
     /// Via ヘッダーを追加します。
-    /// 
+    ///
     /// 形式: Via: 1.1 <hostname>
-    /// 
+    ///
     /// - true: Viaヘッダーを追加
     /// - false: Viaヘッダーを追加しない（デフォルト）
     #[serde(default)]
     pub via_header_enabled: bool,
-    
+
     /// Viaヘッダーに使用するホスト名
-    /// 
+    ///
     /// via_header_enabled = true 時に使用します。
     /// 未指定の場合はシステムホスト名または "veil" を使用します。
     #[serde(default)]
     pub via_header_hostname: Option<String>,
-    
+
     // ====================
     // sendfile/splice チャンクサイズ設定
     // ====================
-    
     /// チャンクサイズ調整モード
-    /// 
+    ///
     /// - "dynamic": ファイルサイズに応じて動的にチャンクサイズを決定（デフォルト）
     ///   - 0-64KB: 64KB
     ///   - 64KB-1MB: 256KB
@@ -2875,61 +3073,59 @@ pub struct PerformanceConfigSection {
     #[serde(default = "default_chunk_size_mode")]
     #[cfg_attr(not(feature = "ktls"), allow(dead_code))]
     pub chunk_size_mode: ChunkSizeMode,
-    
+
     /// 手動チャンクサイズ（バイト）
-    /// 
+    ///
     /// chunk_size_mode = "manual" 時に使用します。
     /// デフォルト: 1048576 (1MB)
     #[serde(default = "default_manual_chunk_size")]
     #[cfg_attr(not(feature = "ktls"), allow(dead_code))]
     pub manual_chunk_size: usize,
-    
+
     // ====================
     // パイプ割当設定
     // ====================
-    
     /// ストリーム毎にパイプを割り当てるかどうか
-    /// 
+    ///
     /// kTLS splice 使用時のパイプバッファ管理方式を設定します。
-    /// 
+    ///
     /// - false: スレッドローカルパイプを再利用（デフォルト、メモリ効率重視）
     /// - true: ストリーム毎にパイプを割り当て（高並行性環境向け）
-    /// 
+    ///
     /// 高並行性環境（同時接続数1000+）ではtrueを推奨します。
     #[serde(default)]
     #[cfg_attr(not(feature = "ktls"), allow(dead_code))]
     pub per_stream_pipe_enabled: bool,
-    
+
     // ====================
     // OpenFileCache設定
     // ====================
-    
     /// OpenFileCache（ファイルメタデータキャッシュ）のグローバルデフォルト設定
-    /// 
+    ///
     /// 効果:
     ///   - canonicalize、metadata、mime_guessのシステムコールをキャッシュ
     ///   - 1リクエストあたり5〜6回のシステムコールを2回に削減（キャッシュヒット時）
     ///   - パフォーマンス向上: 60〜67%のシステムコール削減
-    /// 
+    ///
     /// 注意事項:
     ///   - ファイル変更の検出が最大60秒（デフォルト）遅延する可能性
     ///   - シンボリックリンク変更の検出が遅延する可能性
     ///   - 静的ファイル配信に最適（動的に変更されるファイルには不向き）
-    /// 
+    ///
     /// ルーティングごとの設定:
     ///   - 各ルーティング（[[route]]）で`open_file_cache`セクションを指定可能
     ///   - ルーティング設定がない場合は、このグローバル設定が使用される
-    /// 
+    ///
     /// デフォルト: false（無効）
     #[serde(default)]
     pub open_file_cache_enabled: bool,
-    
+
     /// OpenFileCacheの有効期間（秒、グローバルデフォルト）
     /// キャッシュされたファイル情報が有効とみなされる期間
     /// デフォルト: 60秒
     #[serde(default = "default_open_file_cache_valid_duration")]
     pub open_file_cache_valid_duration_secs: u64,
-    
+
     /// OpenFileCacheの最大エントリ数（グローバルデフォルト）
     /// キャッシュに保持する最大ファイル情報数
     /// デフォルト: 10000
@@ -2953,7 +3149,7 @@ fn default_open_file_cache_max_entries() -> usize {
 // 非同期ログライブラリです。以下の設定で最適化が可能です。
 //
 // ## grokの指摘に対する検証結果
-// 
+//
 // grokは「ftlogは同期ログ」と主張していましたが、これは不正確です。
 // ftlogは以下の非同期アーキテクチャを使用しています：
 // - ログマクロ → 内部チャネルにプッシュ（ノンブロッキング）
@@ -3037,58 +3233,53 @@ fn default_chunk_size_mode() -> ChunkSizeMode {
 
 /// 手動チャンクサイズのデフォルト値（1MB）
 fn default_manual_chunk_size() -> usize {
-    1048576  // 1MB
+    1048576 // 1MB
 }
 
 /// ファイルサイズに応じた最適なチャンクサイズを計算
-/// 
+///
 /// 動的調整モード時に使用されます。
 #[allow(dead_code)]
 pub fn calculate_optimal_chunk_size(file_size: u64) -> usize {
     match file_size {
-        0..=65_536 => 65_536,           // 64KB以下: 64KB
-        65_537..=1_048_576 => 262_144,  // 1MB以下: 256KB
-        _ => 1_048_576,                  // 1MB超: 1MB
+        0..=65_536 => 65_536,          // 64KB以下: 64KB
+        65_537..=1_048_576 => 262_144, // 1MB以下: 256KB
+        _ => 1_048_576,                // 1MB超: 1MB
     }
 }
 
-
-#[derive(Clone)]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum BackendConfig {
     /// 単一URLプロキシ（後方互換性のため維持）
     /// - sni_name: TLS接続時のSNI名（IP直打ち時にドメイン名を指定可能）
     /// - use_h2c: H2C (HTTP/2 over cleartext) を使用するかどうか
     /// 注意: security, compression, buffering, cache, modules は route 直下で設定
-    Proxy { 
-        url: String, 
-        sni_name: Option<String>, 
-        use_h2c: bool, 
+    Proxy {
+        url: String,
+        sni_name: Option<String>,
+        use_h2c: bool,
     },
     /// Upstream グループ参照（ロードバランシング用）
     /// 注意: security, compression, buffering, cache, modules は route 直下で設定
-    ProxyUpstream { 
-        upstream: String, 
-        use_h2c: bool,
-    },
+    ProxyUpstream { upstream: String, use_h2c: bool },
     /// File バックエンド設定
     /// - path: ファイルまたはディレクトリのパス
     /// - mode: "sendfile" または "memory"
     /// - index: ディレクトリアクセス時に返すファイル名（デフォルト: "index.html"）
     /// 注意: security, cache, open_file_cache, modules は route 直下で設定
-    File { 
-        path: String, 
-        mode: String, 
-        index: Option<String>, 
+    File {
+        path: String,
+        mode: String,
+        index: Option<String>,
     },
     /// Redirect バックエンド設定
     /// - redirect_url: リダイレクト先URL（$request_uri, $host, $path 変数使用可能）
     /// - redirect_status: ステータスコード（301, 302, 307, 308）
     /// - preserve_path: 元のパスをリダイレクト先に追加するか
     /// 注意: modules は route 直下で設定
-    Redirect { 
-        redirect_url: String, 
-        redirect_status: u16, 
+    Redirect {
+        redirect_url: String,
+        redirect_status: u16,
         preserve_path: bool,
     },
 }
@@ -3099,16 +3290,16 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
         D: serde::Deserializer<'de>,
     {
         use serde::de::{MapAccess, Visitor};
-        
+
         struct BackendConfigVisitor;
-        
+
         impl<'de> Visitor<'de> for BackendConfigVisitor {
             type Value = BackendConfig;
-            
+
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
                 formatter.write_str("a backend configuration object")
             }
-            
+
             fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
             where
                 M: MapAccess<'de>,
@@ -3127,7 +3318,7 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                 let mut sni_name: Option<String> = None;
                 // H2C 用フィールド（Proxy用）
                 let mut use_h2c: Option<bool> = None;
-                
+
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
                         "type" => backend_type = Some(map.next_value()?),
@@ -3137,7 +3328,8 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                         "mode" => mode = Some(map.next_value()?),
                         "index" => index = Some(map.next_value()?),
                         // security, compression, buffering, cache, open_file_cache, modules は route 直下で設定されるため、ここでは無視
-                        "security" | "compression" | "buffering" | "cache" | "open_file_cache" | "modules" => {
+                        "security" | "compression" | "buffering" | "cache" | "open_file_cache"
+                        | "modules" => {
                             let _: serde::de::IgnoredAny = map.next_value()?;
                         }
                         "redirect_url" => redirect_url = Some(map.next_value()?),
@@ -3145,33 +3337,38 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                         "preserve_path" => preserve_path = Some(map.next_value()?),
                         "sni_name" => sni_name = Some(map.next_value()?),
                         "use_h2c" | "h2c" => use_h2c = Some(map.next_value()?),
-                        _ => { let _: serde::de::IgnoredAny = map.next_value()?; }
+                        _ => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
                     }
                 }
-                
+
                 let backend_type = backend_type.unwrap_or_else(|| "File".to_string());
-                
+
                 match backend_type.as_str() {
                     "Proxy" => {
                         // upstream が指定されている場合はロードバランシング用
                         if let Some(upstream_name) = upstream {
                             let use_h2c = use_h2c.unwrap_or(false);
-                            Ok(BackendConfig::ProxyUpstream { 
-                                upstream: upstream_name, 
+                            Ok(BackendConfig::ProxyUpstream {
+                                upstream: upstream_name,
                                 use_h2c,
                             })
                         } else {
-                            let url = url.ok_or_else(|| serde::de::Error::missing_field("url or upstream"))?;
+                            let url = url.ok_or_else(|| {
+                                serde::de::Error::missing_field("url or upstream")
+                            })?;
                             let use_h2c = use_h2c.unwrap_or(false);
-                            Ok(BackendConfig::Proxy { 
-                                url, 
-                                sni_name, 
-                                use_h2c, 
+                            Ok(BackendConfig::Proxy {
+                                url,
+                                sni_name,
+                                use_h2c,
                             })
                         }
                     }
                     "Redirect" => {
-                        let redirect_url = redirect_url.ok_or_else(|| serde::de::Error::missing_field("redirect_url"))?;
+                        let redirect_url = redirect_url
+                            .ok_or_else(|| serde::de::Error::missing_field("redirect_url"))?;
                         let redirect_status = redirect_status.unwrap_or(301);
                         // ステータスコードの検証（301, 302, 303, 307, 308のみ許可）
                         if !matches!(redirect_status, 301 | 302 | 303 | 307 | 308) {
@@ -3181,25 +3378,21 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                             )));
                         }
                         let preserve_path = preserve_path.unwrap_or(false);
-                        Ok(BackendConfig::Redirect { 
-                            redirect_url, 
-                            redirect_status, 
+                        Ok(BackendConfig::Redirect {
+                            redirect_url,
+                            redirect_status,
                             preserve_path,
                         })
                     }
                     "File" | _ => {
                         let path = path.ok_or_else(|| serde::de::Error::missing_field("path"))?;
                         let mode = mode.unwrap_or_else(|| "sendfile".to_string());
-                        Ok(BackendConfig::File { 
-                            path, 
-                            mode, 
-                            index, 
-                        })
+                        Ok(BackendConfig::File { path, mode, index })
                     }
                 }
             }
         }
-        
+
         deserializer.deserialize_map(BackendConfigVisitor)
     }
 }
@@ -3217,8 +3410,8 @@ pub enum Backend {
     /// - Arc<buffering::BufferingConfig>: バッファリング設定
     /// - Arc<cache::CacheConfig>: キャッシュ設定
     Proxy(
-        Arc<UpstreamGroup>, 
-        Arc<SecurityConfig>, 
+        Arc<UpstreamGroup>,
+        Arc<SecurityConfig>,
         Arc<CompressionConfig>,
         Arc<buffering::BufferingConfig>,
         Arc<cache::CacheConfig>,
@@ -3231,8 +3424,8 @@ pub enum Backend {
     /// - Arc<str>: MIMEタイプ
     /// - Arc<SecurityConfig>: ルートごとのセキュリティ設定
     MemoryFile(
-        Arc<Vec<u8>>, 
-        Arc<str>, 
+        Arc<Vec<u8>>,
+        Arc<str>,
         Arc<SecurityConfig>,
         /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
         #[allow(dead_code)]
@@ -3246,10 +3439,10 @@ pub enum Backend {
     /// - Arc<cache::CacheConfig>: キャッシュ設定
     /// - Option<Arc<cache::OpenFileCacheConfig>>: OpenFileCache設定（ルーティングごと）
     SendFile(
-        Arc<PathBuf>, 
-        bool, 
-        Option<Arc<str>>, 
-        Arc<SecurityConfig>, 
+        Arc<PathBuf>,
+        bool,
+        Option<Arc<str>>,
+        Arc<SecurityConfig>,
         Arc<cache::CacheConfig>,
         Option<Arc<cache::OpenFileCacheConfig>>,
         /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
@@ -3261,8 +3454,8 @@ pub enum Backend {
     /// - u16: ステータスコード（301, 302, 307, 308）
     /// - bool: 元のパスを保持するか
     Redirect(
-        Arc<str>, 
-        u16, 
+        Arc<str>,
+        u16,
         bool,
         /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
         #[allow(dead_code)]
@@ -3276,7 +3469,7 @@ impl Backend {
     pub fn security(&self) -> &SecurityConfig {
         // デフォルトのセキュリティ設定（Redirect用）
         static DEFAULT_SECURITY: Lazy<SecurityConfig> = Lazy::new(SecurityConfig::default);
-        
+
         match self {
             Backend::Proxy(_, security, _, _, _, _) => security,
             Backend::MemoryFile(_, _, security, _) => security,
@@ -3284,7 +3477,7 @@ impl Backend {
             Backend::Redirect(_, _, _, _) => &DEFAULT_SECURITY,
         }
     }
-    
+
     /// このバックエンドに適用するWASMモジュール名のリストを取得
     #[inline]
     #[allow(dead_code)]
@@ -3292,11 +3485,13 @@ impl Backend {
         match self {
             Backend::Proxy(_, _, _, _, _, modules) => modules.as_deref().map(|v| v.as_slice()),
             Backend::MemoryFile(_, _, _, modules) => modules.as_deref().map(|v| v.as_slice()),
-            Backend::SendFile(_, _, _, _, _, _, modules) => modules.as_deref().map(|v| v.as_slice()),
+            Backend::SendFile(_, _, _, _, _, _, modules) => {
+                modules.as_deref().map(|v| v.as_slice())
+            }
             Backend::Redirect(_, _, _, modules) => modules.as_deref().map(|v| v.as_slice()),
         }
     }
-    
+
     /// このバックエンドのバッファリング設定を取得
     #[inline]
     #[allow(dead_code)]
@@ -3306,7 +3501,7 @@ impl Backend {
             _ => None,
         }
     }
-    
+
     /// このバックエンドのキャッシュ設定を取得
     #[inline]
     #[allow(dead_code)]
@@ -3367,13 +3562,13 @@ impl ProxyTarget {
             use_h2c: false, // デフォルトでは無効
         })
     }
-    
+
     /// SNI名を設定したコピーを作成
     pub fn with_sni_name(mut self, sni_name: Option<String>) -> Self {
         self.sni_name = sni_name;
         self
     }
-    
+
     /// H2C設定を変更したコピーを作成
     pub fn with_h2c(mut self, use_h2c: bool) -> Self {
         // H2Cは非TLSの場合のみ有効
@@ -3382,13 +3577,13 @@ impl ProxyTarget {
         }
         self
     }
-    
+
     /// TLS接続時に使用するSNI名を取得
     #[inline]
     pub fn sni(&self) -> &str {
         self.sni_name.as_deref().unwrap_or(&self.host)
     }
-    
+
     /// デフォルトポートかどうかを判定
     #[inline]
     pub fn is_default_port(&self) -> bool {
@@ -3646,61 +3841,67 @@ impl UpstreamServer {
             }
         }
     }
-    
+
     /// 接続カウンターを増加
     pub fn acquire(&self) {
         self.active_connections.fetch_add(1, Ordering::Relaxed);
     }
-    
+
     /// 接続カウンターを減少
     pub fn release(&self) {
         self.active_connections.fetch_sub(1, Ordering::Relaxed);
     }
-    
+
     /// 現在の接続数を取得
     pub fn connections(&self) -> usize {
         self.active_connections.load(Ordering::Relaxed)
     }
-    
+
     /// サーバーが健全かどうか
     pub fn is_healthy(&self) -> bool {
         self.healthy.load(Ordering::Relaxed)
     }
-    
+
     /// 健康チェック成功を記録
     pub fn record_success(&self, healthy_threshold: u32) {
         self.consecutive_failures.store(0, Ordering::Relaxed);
         let successes = self.consecutive_successes.fetch_add(1, Ordering::Relaxed) + 1;
-        
+
         // 閾値に達したら healthy に設定
         if successes >= healthy_threshold as usize && !self.is_healthy() {
             self.healthy.store(true, Ordering::SeqCst);
-            info!("Upstream {}:{} is now healthy", self.target.host, self.target.port);
+            info!(
+                "Upstream {}:{} is now healthy",
+                self.target.host, self.target.port
+            );
         }
     }
-    
+
     /// 健康チェック失敗を記録
     pub fn record_failure(&self, unhealthy_threshold: u32) {
         self.consecutive_successes.store(0, Ordering::Relaxed);
         let failures = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
-        
+
         // 閾値に達したら unhealthy に設定
         if failures >= unhealthy_threshold as usize && self.is_healthy() {
             self.healthy.store(false, Ordering::SeqCst);
-            warn!("Upstream {}:{} is now unhealthy", self.target.host, self.target.port);
+            warn!(
+                "Upstream {}:{} is now unhealthy",
+                self.target.host, self.target.port
+            );
         }
     }
-    
+
     /// Get the host address
     pub fn host(&self) -> &str {
         &self.target.host
     }
-    
+
     /// Get the port number
     pub fn port(&self) -> u16 {
         self.target.port
     }
-    
+
     /// Check if TLS is enabled
     pub fn use_tls(&self) -> bool {
         self.target.use_tls
@@ -3743,9 +3944,16 @@ pub struct UpstreamGroup {
 
 impl UpstreamGroup {
     /// 新しい Upstream グループを作成
-    pub fn new(name: String, entries: Vec<UpstreamServerEntry>, algorithm: LoadBalanceAlgorithm, health_check: Option<HealthCheckConfig>, tls_insecure: bool) -> Option<Self> {
+    pub fn new(
+        name: String,
+        entries: Vec<UpstreamServerEntry>,
+        algorithm: LoadBalanceAlgorithm,
+        health_check: Option<HealthCheckConfig>,
+        tls_insecure: bool,
+    ) -> Option<Self> {
         // 有効なエントリのみを (entry, server) として残す
-        let pairs: Vec<(UpstreamServerEntry, UpstreamServer)> = entries.iter()
+        let pairs: Vec<(UpstreamServerEntry, UpstreamServer)> = entries
+            .iter()
             .filter_map(|entry| {
                 ProxyTarget::parse(&entry.url)
                     .map(|target| target.with_sni_name(entry.sni_name.clone()))
@@ -3805,7 +4013,11 @@ impl UpstreamGroup {
     }
 
     /// サーキットブレーカー・異常検知を適用したグループを返す（設定読み込み時に使用）
-    pub fn with_resilience(mut self, cb_config: &CircuitBreakerConfig, outlier: &OutlierConfig) -> Self {
+    pub fn with_resilience(
+        mut self,
+        cb_config: &CircuitBreakerConfig,
+        outlier: &OutlierConfig,
+    ) -> Self {
         if cb_config.enabled {
             for server in &mut self.servers {
                 server.circuit_breaker =
@@ -3834,7 +4046,7 @@ impl UpstreamGroup {
             servers: vec![server],
             algorithm: LoadBalanceAlgorithm::RoundRobin,
             rr_counter: Arc::new(AtomicUsize::new(0)),
-            health_check: None, // 単一サーバーでは健康チェックなし
+            health_check: None,  // 単一サーバーでは健康チェックなし
             tls_insecure: false, // 単一サーバーではデフォルトで証明書検証を有効
             use_h2c: false,
             weighted_offsets: vec![1],
@@ -3855,7 +4067,9 @@ impl UpstreamGroup {
     ///
     /// サーキットブレーカーが Open のサーバーも除外する。
     fn candidates(&self) -> Vec<(usize, &UpstreamServer)> {
-        let avail: Vec<(usize, &UpstreamServer)> = self.servers.iter()
+        let avail: Vec<(usize, &UpstreamServer)> = self
+            .servers
+            .iter()
             .enumerate()
             .filter(|(_, s)| s.is_healthy() && !s.is_ejected())
             .filter(|(_, s)| match &s.circuit_breaker {
@@ -3867,7 +4081,8 @@ impl UpstreamGroup {
             return avail;
         }
         // 全て利用不可なら healthy なものへフォールバック（全滅回避）
-        self.servers.iter()
+        self.servers
+            .iter()
             .enumerate()
             .filter(|(_, s)| s.is_healthy())
             .collect()
@@ -3905,13 +4120,12 @@ impl UpstreamGroup {
                 let counter = self.rr_counter.fetch_add(1, Ordering::Relaxed);
                 counter % candidates.len()
             }
-            LoadBalanceAlgorithm::LeastConnections => {
-                candidates.iter()
-                    .enumerate()
-                    .min_by_key(|(_, (_, s))| s.connections())
-                    .map(|(i, _)| i)
-                    .unwrap_or(0)
-            }
+            LoadBalanceAlgorithm::LeastConnections => candidates
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (_, s))| s.connections())
+                .map(|(i, _)| i)
+                .unwrap_or(0),
             LoadBalanceAlgorithm::IpHash => {
                 let hash = Self::fnv1a(client_ip.as_bytes());
                 (hash as usize) % candidates.len()
@@ -3925,9 +4139,7 @@ impl UpstreamGroup {
                 // ハッシュ対象の値を決定
                 let key: &str = match hash_key {
                     HashKey::Ip => client_ip,
-                    HashKey::Header(_) | HashKey::Cookie(_) => {
-                        hash_value.unwrap_or(client_ip)
-                    }
+                    HashKey::Header(_) | HashKey::Cookie(_) => hash_value.unwrap_or(client_ip),
                 };
                 return self.select_consistent(key, &candidates);
             }
@@ -3984,9 +4196,16 @@ impl UpstreamGroup {
         let prev = if orig_idx == 0 {
             0
         } else {
-            self.weighted_offsets.get(orig_idx - 1).copied().unwrap_or(0)
+            self.weighted_offsets
+                .get(orig_idx - 1)
+                .copied()
+                .unwrap_or(0)
         };
-        let cur = self.weighted_offsets.get(orig_idx).copied().unwrap_or(prev + 1);
+        let cur = self
+            .weighted_offsets
+            .get(orig_idx)
+            .copied()
+            .unwrap_or(prev + 1);
         cur.saturating_sub(prev).max(1)
     }
 
@@ -4005,9 +4224,7 @@ impl UpstreamGroup {
         }
         let h = xxh3_64_with_seed(key.as_bytes(), CONSISTENT_HASH_SEED);
         // h 以上の最初の vnode を探す（なければ先頭へラップ）
-        let start = self
-            .consistent_ring
-            .partition_point(|(vh, _)| *vh < h);
+        let start = self.consistent_ring.partition_point(|(vh, _)| *vh < h);
         let ring_len = self.consistent_ring.len();
         // リングを start から一周し、候補に含まれる最初のサーバーを選ぶ
         for offset in 0..ring_len {
@@ -4030,12 +4247,12 @@ impl UpstreamGroup {
     pub fn len(&self) -> usize {
         self.servers.len()
     }
-    
+
     /// TLS証明書検証を無効化するかどうかを取得
     pub fn tls_insecure(&self) -> bool {
         self.tls_insecure
     }
-    
+
     /// H2C (HTTP/2 over cleartext) を強制するかどうかを取得
     pub fn use_h2c(&self) -> bool {
         self.use_h2c
@@ -4047,7 +4264,7 @@ impl UpstreamGroup {
 // ====================
 
 /// 非同期読み込みトレイト（SafeReadBuffer対応）
-/// 
+///
 /// 読み込み操作で `SafeReadBuffer` を受け取り、返却します。
 /// monoio の `set_init()` コールバックにより、読み込み完了時に
 /// 自動的に `valid_len` が設定されます。
@@ -4068,7 +4285,7 @@ pub trait AsyncWriter {
 // TcpStream用の実装
 impl AsyncReader for TcpStream {
     async fn read_buf(&mut self, buf: SafeReadBuffer) -> (io::Result<usize>, SafeReadBuffer) {
-        use monoio::io::AsyncReadRent;
+        use crate::runtime::io::AsyncReadRent;
         self.read(buf).await
     }
 }
@@ -4083,7 +4300,7 @@ impl AsyncWriter for TcpStream {
 #[cfg(feature = "ktls")]
 impl AsyncReader for KtlsServerStream {
     async fn read_buf(&mut self, buf: SafeReadBuffer) -> (io::Result<usize>, SafeReadBuffer) {
-        use monoio::io::AsyncReadRent;
+        use crate::runtime::io::AsyncReadRent;
         self.read(buf).await
     }
 }
@@ -4099,7 +4316,7 @@ impl AsyncWriter for KtlsServerStream {
 #[cfg(feature = "ktls")]
 impl AsyncReader for KtlsClientStream {
     async fn read_buf(&mut self, buf: SafeReadBuffer) -> (io::Result<usize>, SafeReadBuffer) {
-        use monoio::io::AsyncReadRent;
+        use crate::runtime::io::AsyncReadRent;
         self.read(buf).await
     }
 }
@@ -4115,7 +4332,7 @@ impl AsyncWriter for KtlsClientStream {
 #[cfg(not(feature = "ktls"))]
 impl AsyncReader for crate::simple_tls::SimpleTlsServerStream {
     async fn read_buf(&mut self, buf: SafeReadBuffer) -> (io::Result<usize>, SafeReadBuffer) {
-        use monoio::io::AsyncReadRent;
+        use crate::runtime::io::AsyncReadRent;
         self.read(buf).await
     }
 }
@@ -4131,7 +4348,7 @@ impl AsyncWriter for crate::simple_tls::SimpleTlsServerStream {
 #[cfg(not(feature = "ktls"))]
 impl AsyncReader for crate::simple_tls::SimpleTlsClientStream {
     async fn read_buf(&mut self, buf: SafeReadBuffer) -> (io::Result<usize>, SafeReadBuffer) {
-        use monoio::io::AsyncReadRent;
+        use crate::runtime::io::AsyncReadRent;
         self.read(buf).await
     }
 }
@@ -4149,88 +4366,88 @@ fn validate_config(config: &Config) -> io::Result<()> {
     if !cert_path.exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("TLS certificate file not found: {}", config.tls.cert_path)
+            format!("TLS certificate file not found: {}", config.tls.cert_path),
         ));
     }
-    
+
     let key_path = Path::new(&config.tls.key_path);
     if !key_path.exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("TLS key file not found: {}", config.tls.key_path)
+            format!("TLS key file not found: {}", config.tls.key_path),
         ));
     }
-    
+
     // バインドアドレスの妥当性チェック
     if config.server.listen.parse::<SocketAddr>().is_err() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("Invalid listen address: {}", config.server.listen)
+            format!("Invalid listen address: {}", config.server.listen),
         ));
     }
-    
+
     // Upstream設定の妥当性チェック
     if let Some(ref upstreams) = config.upstreams {
         for (name, upstream) in upstreams {
             if upstream.servers.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("Upstream '{}' has no servers configured", name)
+                    format!("Upstream '{}' has no servers configured", name),
                 ));
             }
-            
+
             for entry in &upstream.servers {
                 if ProxyTarget::parse(&entry.url).is_none() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        format!("Invalid server URL in upstream '{}': {}", name, entry.url)
+                        format!("Invalid server URL in upstream '{}': {}", name, entry.url),
                     ));
                 }
             }
         }
     }
-    
+
     // 統合ルーティング（[[route]]）の妥当性チェック
     if let Some(ref routes) = config.route {
         for (i, route) in routes.iter().enumerate() {
             let route_name = format!("route[{}]", i);
             validate_route_config(
-                route, 
+                route,
                 &route_name,
                 #[cfg(feature = "wasm")]
                 config.wasm.as_ref(),
             )?;
         }
     }
-    
+
     // WASM設定のバリデーション
     #[cfg(feature = "wasm")]
     if let Some(wasm_cfg) = &config.wasm {
         if wasm_cfg.enabled {
-            wasm_cfg.validate()
-                .map_err(|e| io::Error::new(
+            wasm_cfg.validate().map_err(|e| {
+                io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("WASM config validation failed: {}", e)
-                ))?;
+                    format!("WASM config validation failed: {}", e),
+                )
+            })?;
         }
     }
-    
+
     Ok(())
 }
 
 /// ルート設定の妥当性チェック
 fn validate_route_config(
-    route: &Route, 
+    route: &Route,
     route_name: &str,
-    #[cfg(feature = "wasm")]
-    wasm_config: Option<&crate::wasm::WasmConfig>,
+    #[cfg(feature = "wasm")] wasm_config: Option<&crate::wasm::WasmConfig>,
 ) -> io::Result<()> {
     match &route.action {
         BackendConfig::Proxy { url, .. } => {
             if ProxyTarget::parse(url).is_none() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("Invalid proxy URL for route '{}': {}", route_name, url)
+                    format!("Invalid proxy URL for route '{}': {}", route_name, url),
                 ));
             }
         }
@@ -4239,7 +4456,7 @@ fn validate_route_config(
             if upstream.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("Empty upstream name for route '{}'", route_name)
+                    format!("Empty upstream name for route '{}'", route_name),
                 ));
             }
         }
@@ -4248,22 +4465,32 @@ fn validate_route_config(
             if !file_path.exists() {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
-                    format!("File/directory not found for route '{}': {}", route_name, path)
+                    format!(
+                        "File/directory not found for route '{}': {}",
+                        route_name, path
+                    ),
                 ));
             }
-            
+
             if !["sendfile", "memory", ""].contains(&mode.as_str()) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("Invalid mode for route '{}': {} (expected 'sendfile' or 'memory')", route_name, mode)
+                    format!(
+                        "Invalid mode for route '{}': {} (expected 'sendfile' or 'memory')",
+                        route_name, mode
+                    ),
                 ));
             }
         }
-        BackendConfig::Redirect { redirect_url, redirect_status, .. } => {
+        BackendConfig::Redirect {
+            redirect_url,
+            redirect_status,
+            ..
+        } => {
             if redirect_url.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("Empty redirect_url for route '{}'", route_name)
+                    format!("Empty redirect_url for route '{}'", route_name),
                 ));
             }
             if !matches!(*redirect_status, 301 | 302 | 303 | 307 | 308) {
@@ -4274,7 +4501,7 @@ fn validate_route_config(
             }
         }
     }
-    
+
     // WASMモジュールの参照チェック（route直下のmodulesを使用）
     #[cfg(feature = "wasm")]
     if let Some(wasm_cfg) = wasm_config {
@@ -4286,13 +4513,13 @@ fn validate_route_config(
                         format!(
                             "Route '{}' references unknown WASM module: {}",
                             route_name, module_name
-                        )
+                        ),
                     ));
                 }
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -4330,11 +4557,20 @@ fn load_tls_config(
     let cert_reader = BufReader::new(cert_file);
     let cert_chain: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(cert_reader)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Certificate parse error: {}", e)))?;
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Certificate parse error: {}", e),
+            )
+        })?;
 
     let key_reader = BufReader::new(key_file);
-    let keys: PrivateKeyDer<'static> = PrivateKeyDer::from_pem_reader(key_reader)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Private key parse error: {}", e)))?;
+    let keys: PrivateKeyDer<'static> = PrivateKeyDer::from_pem_reader(key_reader).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Private key parse error: {}", e),
+        )
+    })?;
 
     // kTLS 有効時のみ config を変更するため、条件付きで mut を使用
     #[allow(unused_mut)]
@@ -4345,12 +4581,17 @@ fn load_tls_config(
             // TODO: CryptoProviderに暗号スイートを設定（将来的な拡張）
             let _cipher_suites = crate::ktls::ktls_compatible_cipher_suites();
             info!("kTLS enabled: using only compatible cipher suites (AES-GCM)");
-            
+
             ServerConfig::builder_with_provider(
-                rustls::crypto::aws_lc_rs::default_provider().into()
+                rustls::crypto::aws_lc_rs::default_provider().into(),
             )
             .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("TLS version error: {}", e)))?
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("TLS version error: {}", e),
+                )
+            })?
             .with_no_client_auth()
             .with_single_cert(cert_chain, keys)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
@@ -4360,7 +4601,7 @@ fn load_tls_config(
                 .with_single_cert(cert_chain, keys)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
         }
-        
+
         #[cfg(not(feature = "ktls"))]
         {
             let _ = ktls_enabled;
@@ -4406,14 +4647,14 @@ pub struct LoadedConfig {
     /// 証明書リロードチェック間隔（秒、F-03）
     pub tls_reload_interval_secs: u64,
     /// TLS証明書（PEM形式、事前読み込み済み）
-    /// 
+    ///
     /// Landlock適用前に読み込まれた証明書データ。
     /// HTTP/3ではmemfd経由でquicheに渡すことで、
     /// Landlockによるファイルシステム制限下でも動作可能。
     #[cfg_attr(not(feature = "http3"), allow(dead_code))]
     pub tls_cert_pem: Arc<Vec<u8>>,
     /// TLS秘密鍵（PEM形式、事前読み込み済み）
-    /// 
+    ///
     /// Landlock適用前に読み込まれた秘密鍵データ。
     /// HTTP/3ではmemfd経由でquicheに渡す。
     #[cfg_attr(not(feature = "http3"), allow(dead_code))]
@@ -4489,13 +4730,13 @@ pub struct LoadedConfig {
 // ```rust
 // // 設定の読み込み（ロックフリー）
 // let config = CURRENT_CONFIG.load();
-// 
+//
 // // 設定の更新（アトミック）
 // CURRENT_CONFIG.store(Arc::new(new_config));
 // ```
 
 /// ランタイムで使用する設定（ホットリロード対応）
-/// 
+///
 /// 一部のフィールドはホットリロード機能のために保持されているが、
 /// 現在は読み取られていない（将来的にTLS再設定などで使用予定）
 pub struct RuntimeConfig {
@@ -4591,34 +4832,34 @@ pub static CONFIG_PATH: Lazy<ArcSwap<PathBuf>> =
     Lazy::new(|| ArcSwap::from_pointee(PathBuf::from(DEFAULT_CONFIG_PATH)));
 
 /// HTTPSリダイレクト先のポート（listen設定から抽出）
-/// 
+///
 /// HTTP→HTTPSリダイレクト時に使用するポート番号。
 /// デフォルトは443（HTTPSの標準ポート）。
 /// main関数で`[server].listen`の値から初期化される。
-pub static HTTPS_REDIRECT_PORT: std::sync::atomic::AtomicU16 = 
+pub static HTTPS_REDIRECT_PORT: std::sync::atomic::AtomicU16 =
     std::sync::atomic::AtomicU16::new(443);
 
 /// 設定をホットリロードする
-/// 
+///
 /// 実行中のリクエストは古い設定を参照し続け、
 /// 新規リクエストは新しい設定を使用します。
-/// 
+///
 /// ## セキュリティに関する注意
-/// 
+///
 /// TLS証明書・秘密鍵はホットリロードの対象外です。
 /// これはLandlockによるファイルシステム制限を適用後、
 /// 証明書ファイルへのアクセスを禁止するためです。
-/// 
+///
 /// 証明書を更新する場合は、サーバーを再起動してください。
 pub fn reload_config(path: &Path) -> io::Result<()> {
     let loaded = load_config_without_tls(path)?;
-    
+
     // 現在のTLS設定を維持（ホットリロード対象外）
     let current = CURRENT_CONFIG.load();
-    
+
     // キャッシュをクリア（設定変更時）
     loaded.optimized_router.clear_cache();
-    
+
     let runtime_config = RuntimeConfig {
         route: loaded.route,
         optimized_router: loaded.optimized_router,
@@ -4646,16 +4887,16 @@ pub fn reload_config(path: &Path) -> io::Result<()> {
         wasm_filter_engine: current.wasm_filter_engine.clone(),
         performance: loaded.performance.clone(),
     };
-    
+
     // アトミックに設定を入れ替え
     CURRENT_CONFIG.store(Arc::new(runtime_config));
-    
+
     info!("Configuration reloaded successfully (TLS certificates unchanged - restart required for TLS updates)");
     Ok(())
 }
 
 /// ホットリロード用の設定（TLS証明書を除く）
-/// 
+///
 /// Landlock適用後はTLS証明書ファイルへのアクセスが制限されるため、
 /// ホットリロード時はルーティング設定等のみを更新します。
 pub struct LoadedConfigWithoutTls {
@@ -4685,14 +4926,18 @@ pub struct LoadedConfigWithoutTls {
 }
 
 /// TLS証明書を除いた設定をロード（ホットリロード用）
-/// 
+///
 /// Landlock適用後は証明書ファイルへのアクセスが制限されるため、
 /// この関数ではTLS関連の読み込みをスキップします。
 fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
     let config_str = fs::read_to_string(path)?;
-    let config: Config = toml::from_str(&config_str)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("TOML parse error: {}", e)))?;
-    
+    let config: Config = toml::from_str(&config_str).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("TOML parse error: {}", e),
+        )
+    })?;
+
     // 設定ファイルのバリデーション
     validate_config(&config)?;
 
@@ -4727,8 +4972,12 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
                 cfg.tls_insecure,
             ) {
                 let group = group.with_resilience(&cfg.circuit_breaker, &cfg.outlier_detection);
-                info!("Reloaded upstream '{}' with {} servers ({:?})",
-                      name, group.len(), algorithm);
+                info!(
+                    "Reloaded upstream '{}' with {} servers ({:?})",
+                    name,
+                    group.len(),
+                    algorithm
+                );
                 upstream_groups.insert(name.clone(), Arc::new(group));
             } else {
                 warn!("Failed to reload upstream '{}': no valid servers", name);
@@ -4791,30 +5040,30 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
 }
 
 /// ルート配列から OptimizedRouter を構築
-/// 
+///
 /// Phase 1: Host-based グループ化
 /// Phase 2: Path Radix Tree (matchit)
 /// Phase 3: CIDR Tree 最適化
 /// Phase 4: LRU キャッシュ（構築時に初期化）
 fn build_optimized_router(routes: &[Route]) -> Arc<routing::OptimizedRouter> {
     let mut router = routing::OptimizedRouter::with_cache_capacity(10000);
-    
+
     for (idx, route) in routes.iter().enumerate() {
         let conditions = &route.conditions;
-        
+
         // host条件
         let host = conditions.host.as_deref();
         // path条件
         let path = conditions.path.as_deref();
         // source_ip条件
         let source_ip = conditions.source_ip.as_deref();
-        
+
         router.add_route(idx, host, path, source_ip);
     }
-    
+
     // CIDRマッチャーを最適化（ソート）
     router.finalize();
-    
+
     info!(
         "Built OptimizedRouter: {} routes indexed (host groups: {} exact + {} wildcard, path patterns: {})",
         routes.len(),
@@ -4822,15 +5071,19 @@ fn build_optimized_router(routes: &[Route]) -> Arc<routing::OptimizedRouter> {
         router.host_router.wildcard_count(),
         router.path_router.patterns_count()
     );
-    
+
     Arc::new(router)
 }
 
 pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     let config_str = fs::read_to_string(path)?;
-    let config: Config = toml::from_str(&config_str)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("TOML parse error: {}", e)))?;
-    
+    let config: Config = toml::from_str(&config_str).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("TOML parse error: {}", e),
+        )
+    })?;
+
     // 設定ファイルのバリデーション
     validate_config(&config)?;
 
@@ -4859,22 +5112,22 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     let h2c_enabled = config.server.h2c_enabled;
     #[cfg(feature = "http2")]
     let h2c_listen = config.server.h2c_listen.clone();
-    
+
     // Serverヘッダー設定を初期化
     init_server_header(
         config.server.server_header_enabled,
         &config.server.server_header_value,
     );
-    
+
     // バッファプール設定を初期化
     init_buffer_pool_config(config.buffer_pool.clone());
-    
+
     // TLS設定（kTLS有効時はシークレット抽出を有効化、HTTP/2有効時はALPN設定）
     #[cfg(feature = "http2")]
     let tls_config = load_tls_config(&config.tls, ktls_config.enabled, http2_enabled)?;
     #[cfg(not(feature = "http2"))]
     let tls_config = load_tls_config(&config.tls, ktls_config.enabled, false)?;
-    
+
     // Upstream グループを構築（ロードバランシング用）
     let mut upstream_groups: HashMap<String, Arc<UpstreamGroup>> = HashMap::new();
     if let Some(upstreams) = &config.upstreams {
@@ -4888,8 +5141,12 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
                 cfg.tls_insecure,
             ) {
                 let group = group.with_resilience(&cfg.circuit_breaker, &cfg.outlier_detection);
-                info!("Loaded upstream '{}' with {} servers ({:?})",
-                      name, group.len(), algorithm);
+                info!(
+                    "Loaded upstream '{}' with {} servers ({:?})",
+                    name,
+                    group.len(),
+                    algorithm
+                );
                 if cfg.health_check.is_some() {
                     info!("  Health check enabled for '{}'", name);
                 }
@@ -4929,21 +5186,27 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     };
 
     // HTTPリスナーアドレスをパース（HTTPSリダイレクト用）
-    let listen_http_addr = config.server.http.as_ref().and_then(|addr| {
-        match addr.parse::<SocketAddr>() {
-            Ok(socket_addr) => Some(socket_addr),
-            Err(e) => {
-                warn!("Invalid HTTP listen address '{}': {}", addr, e);
-                None
-            }
-        }
-    });
+    let listen_http_addr =
+        config
+            .server
+            .http
+            .as_ref()
+            .and_then(|addr| match addr.parse::<SocketAddr>() {
+                Ok(socket_addr) => Some(socket_addr),
+                Err(e) => {
+                    warn!("Invalid HTTP listen address '{}': {}", addr, e);
+                    None
+                }
+            });
 
     // Prometheusメトリクス設定をログ出力
     // F-09: ランタイムトグルを設定（enabled=false で record_* がノーオップ・endpoint が 404）
     crate::metrics::set_metrics_runtime_enabled(config.prometheus.enabled);
     if config.prometheus.enabled {
-        info!("Prometheus metrics enabled at path: {}", config.prometheus.path);
+        info!(
+            "Prometheus metrics enabled at path: {}",
+            config.prometheus.path
+        );
         if !config.prometheus.allowed_ips.is_empty() {
             info!("  Allowed IPs: {:?}", config.prometheus.allowed_ips);
         }
@@ -4953,13 +5216,24 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
 
     // TLS証明書をバイト列として読み込み（HTTP/3用、Landlock適用前に読み込み）
     // これによりLandlock適用後も証明書ファイルへのアクセスなしで動作可能
-    let tls_cert_pem = fs::read(&config.tls.cert_path)
-        .map_err(|e| io::Error::new(e.kind(), format!("Failed to read TLS cert '{}': {}", config.tls.cert_path, e)))?;
-    let tls_key_pem = fs::read(&config.tls.key_path)
-        .map_err(|e| io::Error::new(e.kind(), format!("Failed to read TLS key '{}': {}", config.tls.key_path, e)))?;
-    
-    info!("TLS certificates pre-loaded for Landlock compatibility (cert: {} bytes, key: {} bytes)",
-          tls_cert_pem.len(), tls_key_pem.len());
+    let tls_cert_pem = fs::read(&config.tls.cert_path).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("Failed to read TLS cert '{}': {}", config.tls.cert_path, e),
+        )
+    })?;
+    let tls_key_pem = fs::read(&config.tls.key_path).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("Failed to read TLS key '{}': {}", config.tls.key_path, e),
+        )
+    })?;
+
+    info!(
+        "TLS certificates pre-loaded for Landlock compatibility (cert: {} bytes, key: {} bytes)",
+        tls_cert_pem.len(),
+        tls_key_pem.len()
+    );
 
     // WASM Filter Engineの初期化
     #[cfg(feature = "wasm")]
@@ -4969,10 +5243,10 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
             if let Err(e) = wasm_config.validate() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("WASM config validation failed: {}", e)
+                    format!("WASM config validation failed: {}", e),
                 ));
             }
-            
+
             // FilterEngine初期化
             info!("Initializing WASM Filter Engine...");
             match crate::wasm::init(wasm_config) {
@@ -4983,7 +5257,7 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
                 Err(e) => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("Failed to initialize WASM Filter Engine: {}", e)
+                        format!("Failed to initialize WASM Filter Engine: {}", e),
                     ));
                 }
             }
@@ -5048,8 +5322,12 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
 /// 設定ファイルからログ設定のみを読み込む（ログ初期化前用）
 pub fn load_logging_config(path: &Path) -> io::Result<LoggingConfigSection> {
     let config_str = fs::read_to_string(path)?;
-    let config: Config = toml::from_str(&config_str)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("TOML parse error: {}", e)))?;
+    let config: Config = toml::from_str(&config_str).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("TOML parse error: {}", e),
+        )
+    })?;
     Ok(config.logging)
 }
 
@@ -5061,46 +5339,68 @@ pub fn load_backend(
     upstream_groups: &HashMap<String, Arc<UpstreamGroup>>,
 ) -> io::Result<Backend> {
     // Routeレベルの設定を取得（route直下の設定のみを使用）
-    let security = route.security.as_ref().map(|s| s.clone()).unwrap_or_default();
-    let compression = route.compression.as_ref().map(|c| c.clone()).unwrap_or_default();
-    let buffering = route.buffering.as_ref().map(|b| b.clone()).unwrap_or_default();
+    let security = route
+        .security
+        .as_ref()
+        .map(|s| s.clone())
+        .unwrap_or_default();
+    let compression = route
+        .compression
+        .as_ref()
+        .map(|c| c.clone())
+        .unwrap_or_default();
+    let buffering = route
+        .buffering
+        .as_ref()
+        .map(|b| b.clone())
+        .unwrap_or_default();
     let cache = route.cache.as_ref().map(|c| c.clone()).unwrap_or_default();
     let modules_arc = route.modules.as_ref().map(|m| Arc::new(m.clone()));
-    
+
     match &route.action {
-        BackendConfig::Proxy { url, sni_name, use_h2c } => {
+        BackendConfig::Proxy {
+            url,
+            sni_name,
+            use_h2c,
+        } => {
             // 単一URLの場合は UpstreamGroup::single で単一サーバーのグループを作成
             let target = ProxyTarget::parse(url)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid proxy URL"))?
                 .with_sni_name(sni_name.clone())
                 .with_h2c(*use_h2c);
-            
+
             if *use_h2c && !target.use_tls {
                 info!("H2C (HTTP/2 over cleartext) enabled for backend: {}", url);
             }
-            
+
             // 圧縮設定のログ出力
             if compression.enabled {
-                info!("Response compression enabled for backend: {} (gzip_level={}, brotli_level={})", 
-                      url, compression.gzip_level, compression.brotli_level);
+                info!(
+                    "Response compression enabled for backend: {} (gzip_level={}, brotli_level={})",
+                    url, compression.gzip_level, compression.brotli_level
+                );
             }
-            
+
             // バッファリング設定のログ出力
             if buffering.is_enabled() {
-                info!("Response buffering enabled for backend: {} (mode={:?}, max_memory={})", 
-                      url, buffering.mode, buffering.max_memory_buffer);
+                info!(
+                    "Response buffering enabled for backend: {} (mode={:?}, max_memory={})",
+                    url, buffering.mode, buffering.max_memory_buffer
+                );
             }
-            
+
             // キャッシュ設定のログ出力
             if cache.enabled {
-                info!("Proxy cache enabled for backend: {} (max_memory={}, ttl={}s)", 
-                      url, cache.max_memory_size, cache.default_ttl_secs);
+                info!(
+                    "Proxy cache enabled for backend: {} (max_memory={}, ttl={}s)",
+                    url, cache.max_memory_size, cache.default_ttl_secs
+                );
             }
-            
+
             let group = UpstreamGroup::single(target);
             Ok(Backend::Proxy(
-                Arc::new(group), 
-                Arc::new(security.clone()), 
+                Arc::new(group),
+                Arc::new(security.clone()),
                 Arc::new(compression.clone()),
                 Arc::new(buffering.clone()),
                 Arc::new(cache.clone()),
@@ -5109,40 +5409,45 @@ pub fn load_backend(
         }
         BackendConfig::ProxyUpstream { upstream, use_h2c } => {
             // Upstream グループ参照
-            let group = upstream_groups.get(upstream)
-                .ok_or_else(|| io::Error::new(
-                    io::ErrorKind::InvalidInput, 
-                    format!("Upstream '{}' not found", upstream)
-                ))?;
-            
+            let group = upstream_groups.get(upstream).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Upstream '{}' not found", upstream),
+                )
+            })?;
+
             // ルート設定で use_h2c が指定されている場合はオーバーライド
             let group = if *use_h2c {
                 Arc::new(group.with_h2c(true))
             } else {
                 group.clone()
             };
-            
+
             // 圧縮設定のログ出力
             if compression.enabled {
                 info!("Response compression enabled for upstream: {} (gzip_level={}, brotli_level={})", 
                       upstream, compression.gzip_level, compression.brotli_level);
             }
-            
+
             // バッファリング設定のログ出力
             if buffering.is_enabled() {
-                info!("Response buffering enabled for upstream: {} (mode={:?}, max_memory={})", 
-                      upstream, buffering.mode, buffering.max_memory_buffer);
+                info!(
+                    "Response buffering enabled for upstream: {} (mode={:?}, max_memory={})",
+                    upstream, buffering.mode, buffering.max_memory_buffer
+                );
             }
-            
+
             // キャッシュ設定のログ出力
             if cache.enabled {
-                info!("Proxy cache enabled for upstream: {} (max_memory={}, ttl={}s)", 
-                      upstream, cache.max_memory_size, cache.default_ttl_secs);
+                info!(
+                    "Proxy cache enabled for upstream: {} (max_memory={}, ttl={}s)",
+                    upstream, cache.max_memory_size, cache.default_ttl_secs
+                );
             }
-            
+
             Ok(Backend::Proxy(
-                group.clone(), 
-                Arc::new(security.clone()), 
+                group.clone(),
+                Arc::new(security.clone()),
                 Arc::new(compression.clone()),
                 Arc::new(buffering.clone()),
                 Arc::new(cache.clone()),
@@ -5151,50 +5456,76 @@ pub fn load_backend(
         }
         BackendConfig::File { path, mode, index } => {
             // Routeレベルの設定のみを使用
-            let security = route.security.as_ref().map(|s| s.clone()).unwrap_or_default();
+            let security = route
+                .security
+                .as_ref()
+                .map(|s| s.clone())
+                .unwrap_or_default();
             let cache = route.cache.as_ref().map(|c| c.clone()).unwrap_or_default();
-            let metadata = fs::metadata(path)
-                .map_err(|e| {
-                    let error_msg = format!(
-                        "Failed to access file '{}': {} (error code: {})",
-                        path,
-                        e,
-                        e.raw_os_error().unwrap_or(-1)
-                    );
-                    io::Error::new(e.kind(), error_msg)
-                })?;
+            let metadata = fs::metadata(path).map_err(|e| {
+                let error_msg = format!(
+                    "Failed to access file '{}': {} (error code: {})",
+                    path,
+                    e,
+                    e.raw_os_error().unwrap_or(-1)
+                );
+                io::Error::new(e.kind(), error_msg)
+            })?;
             let is_dir = metadata.is_dir();
             // インデックスファイル名を Arc<str> に変換（None = デフォルトで "index.html"）
             let index_file: Option<Arc<str>> = index.as_ref().map(|s| Arc::from(s.as_str()));
             let security = Arc::new(security.clone());
             let cache = Arc::new(cache.clone());
             let open_file_cache_arc = route.open_file_cache.as_ref().map(|c| Arc::new(c.clone()));
-            
+
             // キャッシュ設定のログ出力
             if cache.enabled {
-                info!("File cache enabled for path: {} (max_memory={}, ttl={}s)", 
-                      path, cache.max_memory_size, cache.default_ttl_secs);
+                info!(
+                    "File cache enabled for path: {} (max_memory={}, ttl={}s)",
+                    path, cache.max_memory_size, cache.default_ttl_secs
+                );
             }
-            
+
             match mode.as_str() {
                 "memory" => {
                     if is_dir {
-                        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Memory mode not supported for directories"));
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "Memory mode not supported for directories",
+                        ));
                     }
                     let data = fs::read(path)?;
                     let mime_type = mime_guess::from_path(path).first_or_octet_stream();
-                    
-                    Ok(Backend::MemoryFile(Arc::new(data), Arc::from(mime_type.as_ref()), security, modules_arc.clone()))
+
+                    Ok(Backend::MemoryFile(
+                        Arc::new(data),
+                        Arc::from(mime_type.as_ref()),
+                        security,
+                        modules_arc.clone(),
+                    ))
                 }
-                "sendfile" | "" => {
-                    Ok(Backend::SendFile(Arc::new(PathBuf::from(path)), is_dir, index_file, security, cache, open_file_cache_arc, modules_arc.clone()))
-                }
+                "sendfile" | "" => Ok(Backend::SendFile(
+                    Arc::new(PathBuf::from(path)),
+                    is_dir,
+                    index_file,
+                    security,
+                    cache,
+                    open_file_cache_arc,
+                    modules_arc.clone(),
+                )),
                 _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid mode")),
             }
         }
-        BackendConfig::Redirect { redirect_url, redirect_status, preserve_path } => {
-            Ok(Backend::Redirect(Arc::from(redirect_url.as_str()), *redirect_status, *preserve_path, modules_arc.clone()))
-        }
+        BackendConfig::Redirect {
+            redirect_url,
+            redirect_status,
+            preserve_path,
+        } => Ok(Backend::Redirect(
+            Arc::from(redirect_url.as_str()),
+            *redirect_status,
+            *preserve_path,
+            modules_arc.clone(),
+        )),
     }
 }
 
@@ -5217,19 +5548,19 @@ pub fn load_backend(
 // crate::constants モジュールに移動しました
 
 /// HTTPリクエストを処理し、HTTPSにリダイレクトする
-/// 
+///
 /// リクエストからHostヘッダーとパスを読み取り、
 /// https://{host}:{port}{path} への301リダイレクトを返します。
 /// ポートはHETTPS_REDIRECT_PORT（[server].listenから抽出）を使用し、
 /// 443の場合はURL中のポート指定を省略します。
 pub async fn handle_http_redirect(mut stream: TcpStream) {
-    use monoio::io::AsyncReadRent;
+    use crate::runtime::io::AsyncReadRent;
     // リクエストを読み取るためのバッファ（ヘッダーのみなので小さめ）
     let mut buffer = vec![0u8; 4096];
 
     // タイムアウト付きで読み取り
     let read_result = timeout(Duration::from_secs(5), stream.read(buffer)).await;
-    
+
     let (result, buf) = match read_result {
         Ok(r) => r,
         Err(_) => {
@@ -5238,32 +5569,32 @@ pub async fn handle_http_redirect(mut stream: TcpStream) {
         }
     };
     buffer = buf;
-    
+
     let bytes_read = match result {
         Ok(n) if n > 0 => n,
         _ => return,
     };
-    
+
     // HTTPリクエストをパース
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut req = Request::new(&mut headers);
-    
+
     let path = match req.parse(&buffer[..bytes_read]) {
-        Ok(Status::Complete(_)) | Ok(Status::Partial) => {
-            req.path.unwrap_or("/")
-        }
+        Ok(Status::Complete(_)) | Ok(Status::Partial) => req.path.unwrap_or("/"),
         Err(_) => "/",
     };
-    
+
     // Hostヘッダーを取得
-    let host = req.headers.iter()
+    let host = req
+        .headers
+        .iter()
         .find(|h| h.name.eq_ignore_ascii_case("Host"))
         .map(|h| std::str::from_utf8(h.value).unwrap_or(""))
         .unwrap_or("");
-    
+
     // 設定から抽出したHTTPSポートを取得
     let port = HTTPS_REDIRECT_PORT.load(std::sync::atomic::Ordering::Relaxed);
-    
+
     // リダイレクトURLを構築
     let redirect_url = if host.is_empty() {
         // Hostヘッダーがない場合はlocalhost
@@ -5281,21 +5612,21 @@ pub async fn handle_http_redirect(mut stream: TcpStream) {
             format!("https://{}:{}{}", clean_host, port, path)
         }
     };
-    
+
     // 301レスポンスを構築
     let mut response = Vec::with_capacity(
-        HTTP_301_REDIRECT_TEMPLATE.len() + redirect_url.len() + HTTP_301_REDIRECT_SUFFIX.len()
+        HTTP_301_REDIRECT_TEMPLATE.len() + redirect_url.len() + HTTP_301_REDIRECT_SUFFIX.len(),
     );
     response.extend_from_slice(HTTP_301_REDIRECT_TEMPLATE);
     response.extend_from_slice(redirect_url.as_bytes());
     response.extend_from_slice(HTTP_301_REDIRECT_SUFFIX);
-    
+
     // レスポンスを送信
     let _ = timeout(Duration::from_secs(5), stream.write_all(response)).await;
 }
 
 /// High-Performance Reverse Proxy Server
-/// 
+///
 /// io_uring (monoio) と rustls を使用した高性能リバースプロキシサーバー
 #[derive(Parser, Debug)]
 #[command(name = "veil")]
@@ -5304,14 +5635,14 @@ pub struct CliArgs {
     /// 設定ファイルのパス
     #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
     pub config: PathBuf,
-    
+
     /// 設定ファイルの構文と内容を検証して終了（nginx -t 相当）
     #[arg(short = 't', long = "test")]
     pub test_config: bool,
 }
 
 /// 設定ファイルを検証（読み込みとバリデーションのみ、起動しない）
-/// 
+///
 /// nginx -t 相当の機能を提供します。
 /// - TOML構文のパース
 /// - 設定値のバリデーション
@@ -5321,39 +5652,40 @@ pub fn test_config_file(path: &Path) -> io::Result<()> {
     if !path.exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("configuration file not found: {}", path.display())
+            format!("configuration file not found: {}", path.display()),
         ));
     }
-    
+
     // TOMLパース
     let config_str = std::fs::read_to_string(path)?;
-    let config: Config = toml::from_str(&config_str)
-        .map_err(|e| io::Error::new(
-            io::ErrorKind::InvalidData, 
-            format!("TOML parse error: {}", e)
-        ))?;
-    
+    let config: Config = toml::from_str(&config_str).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("TOML parse error: {}", e),
+        )
+    })?;
+
     // 設定バリデーション
     validate_config(&config)?;
-    
+
     // TLS証明書の存在確認
     let cert_path = Path::new(&config.tls.cert_path);
     if !cert_path.exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("TLS certificate not found: {}", config.tls.cert_path)
+            format!("TLS certificate not found: {}", config.tls.cert_path),
         ));
     }
-    
+
     // TLS秘密鍵の存在確認
     let key_path = Path::new(&config.tls.key_path);
     if !key_path.exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("TLS key not found: {}", config.tls.key_path)
+            format!("TLS key not found: {}", config.tls.key_path),
         ));
     }
-    
+
     Ok(())
 }
 
@@ -5465,7 +5797,12 @@ mod load_balancing_tests {
             seen.insert(host);
         }
         // 150 vnodes/サーバーで十分に分散され、全サーバーが使われるはず
-        assert_eq!(seen.len(), 3, "keys not distributed across all servers: {:?}", seen);
+        assert_eq!(
+            seen.len(),
+            3,
+            "keys not distributed across all servers: {:?}",
+            seen
+        );
     }
 
     #[test]
@@ -5612,7 +5949,12 @@ mod circuit_breaker_upstream_tests {
     use crate::resilience::CircuitBreaker;
 
     fn make_entry(url: &str) -> UpstreamServerEntry {
-        UpstreamServerEntry { url: url.to_string(), sni_name: None, use_h2c: false, weight: 1 }
+        UpstreamServerEntry {
+            url: url.to_string(),
+            sni_name: None,
+            use_h2c: false,
+            weight: 1,
+        }
     }
 
     fn trip_config() -> super::CircuitBreakerConfig {
@@ -5770,7 +6112,12 @@ mod advanced_lb_integration_tests {
     use super::*;
 
     fn w_entry(url: &str, weight: u32) -> UpstreamServerEntry {
-        UpstreamServerEntry { url: url.to_string(), sni_name: None, use_h2c: false, weight }
+        UpstreamServerEntry {
+            url: url.to_string(),
+            sni_name: None,
+            use_h2c: false,
+            weight,
+        }
     }
 
     /// Weighted RR: weight=0 は weight=1 として扱われる（最小重みは1）
@@ -5833,9 +6180,14 @@ mod advanced_lb_integration_tests {
         assert!(first.is_some(), "Should select a server in normal state");
 
         // 1台をunhealthyにしても選択できること
-        group.servers[0].healthy.store(false, std::sync::atomic::Ordering::SeqCst);
+        group.servers[0]
+            .healthy
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         let after = group.select("192.168.1.100");
-        assert!(after.is_some(), "Should still select a server with one unhealthy");
+        assert!(
+            after.is_some(),
+            "Should still select a server with one unhealthy"
+        );
     }
 
     /// IpHash: 同じIPは常に同じサーバーへ（既存動作の確認）
@@ -5859,7 +6211,10 @@ mod advanced_lb_integration_tests {
         let first = group.select(ip).unwrap().target.host.clone();
         for _ in 0..20 {
             let host = group.select(ip).unwrap().target.host.clone();
-            assert_eq!(host, first, "IP hash should always route same IP to same server");
+            assert_eq!(
+                host, first,
+                "IP hash should always route same IP to same server"
+            );
         }
     }
 }

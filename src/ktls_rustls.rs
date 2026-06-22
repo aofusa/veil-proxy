@@ -34,8 +34,9 @@ use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 
-use monoio::buf::{IoBuf, IoBufMut, IoVecBuf, IoVecBufMut};
-use monoio::net::TcpStream;
+use crate::runtime::buf::{IoBuf, IoBufMut};
+use crate::runtime::io::{IoVecBuf, IoVecBufMut};
+use crate::runtime::tcp::TcpStream;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection};
 
@@ -114,22 +115,22 @@ impl KtlsServerStream {
     pub fn rustls_conn(&self) -> Option<&ServerConnection> {
         self.conn.as_ref()
     }
-    
+
     /// ALPN でネゴシエートされたプロトコルを取得
-    /// 
+    ///
     /// TLS ハンドシェイク完了後に呼び出すことで、
     /// クライアントと合意したプロトコルを取得できます。
     /// kTLS 有効化後もキャッシュされた値を返します。
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// - `Some(b"h2")`: HTTP/2 がネゴシエートされた
     /// - `Some(b"http/1.1")`: HTTP/1.1 がネゴシエートされた
     /// - `None`: ALPN 未設定または未ネゴシエート
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
         self.alpn_protocol.as_deref()
     }
-    
+
     /// HTTP/2 がネゴシエートされたかどうか
     #[inline]
     pub fn is_http2(&self) -> bool {
@@ -229,7 +230,7 @@ fn raw_write(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
 }
 
 /// rustls コネクションを使用して非同期ハンドシェイクを実行（サーバー側）
-/// 
+///
 /// 重要: ハンドシェイク完了後、kTLS のシークレット抽出に備えて
 /// バッファリングされた全ての TLS レコードを送信する必要があります。
 /// TLS 1.3 ではハンドシェイク完了後もセッションチケット等が送信されます。
@@ -257,14 +258,16 @@ async fn do_server_handshake(
         while conn.wants_write() {
             let mut write_buf = Vec::new();
             conn.write_tls(&mut write_buf)?;
-            
+
             let mut written = 0;
             while written < write_buf.len() {
                 match raw_write(fd, &write_buf[written..]) {
-                    Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0")),
+                    Ok(0) => {
+                        return Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0"))
+                    }
                     Ok(n) => written += n,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        stream.writable(false).await?;
+                        stream.writable().await?;
                     }
                     Err(e) => return Err(e),
                 }
@@ -275,7 +278,12 @@ async fn do_server_handshake(
         if conn.wants_read() {
             loop {
                 match raw_read(fd, &mut read_buf) {
-                    Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "EOF during handshake")),
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "EOF during handshake",
+                        ))
+                    }
                     Ok(n) => {
                         conn.read_tls(&mut &read_buf[..n])?;
                         conn.process_new_packets()
@@ -283,7 +291,7 @@ async fn do_server_handshake(
                         break;
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        stream.readable(false).await?;
+                        stream.readable().await?;
                     }
                     Err(e) => return Err(e),
                 }
@@ -297,18 +305,18 @@ async fn do_server_handshake(
     while conn.wants_write() {
         let mut write_buf = Vec::new();
         conn.write_tls(&mut write_buf)?;
-        
+
         if write_buf.is_empty() {
             break;
         }
-        
+
         let mut written = 0;
         while written < write_buf.len() {
             match raw_write(fd, &write_buf[written..]) {
                 Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0")),
                 Ok(n) => written += n,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    stream.writable(false).await?;
+                    stream.writable().await?;
                 }
                 Err(e) => return Err(e),
             }
@@ -319,13 +327,10 @@ async fn do_server_handshake(
 }
 
 /// rustls コネクションを使用して非同期ハンドシェイクを実行（クライアント側）
-/// 
+///
 /// 重要: ハンドシェイク完了後、kTLS のシークレット抽出に備えて
 /// バッファリングされた全ての TLS レコードを送信する必要があります。
-async fn do_client_handshake(
-    stream: &TcpStream,
-    conn: &mut ClientConnection,
-) -> io::Result<()> {
+async fn do_client_handshake(stream: &TcpStream, conn: &mut ClientConnection) -> io::Result<()> {
     let fd = stream.as_raw_fd();
     let mut read_buf = vec![0u8; 16384];
 
@@ -334,14 +339,16 @@ async fn do_client_handshake(
         while conn.wants_write() {
             let mut write_buf = Vec::new();
             conn.write_tls(&mut write_buf)?;
-            
+
             let mut written = 0;
             while written < write_buf.len() {
                 match raw_write(fd, &write_buf[written..]) {
-                    Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0")),
+                    Ok(0) => {
+                        return Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0"))
+                    }
                     Ok(n) => written += n,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        stream.writable(false).await?;
+                        stream.writable().await?;
                     }
                     Err(e) => return Err(e),
                 }
@@ -352,7 +359,12 @@ async fn do_client_handshake(
         if conn.wants_read() {
             loop {
                 match raw_read(fd, &mut read_buf) {
-                    Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "EOF during handshake")),
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "EOF during handshake",
+                        ))
+                    }
                     Ok(n) => {
                         conn.read_tls(&mut &read_buf[..n])?;
                         conn.process_new_packets()
@@ -360,7 +372,7 @@ async fn do_client_handshake(
                         break;
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        stream.readable(false).await?;
+                        stream.readable().await?;
                     }
                     Err(e) => return Err(e),
                 }
@@ -373,18 +385,18 @@ async fn do_client_handshake(
     while conn.wants_write() {
         let mut write_buf = Vec::new();
         conn.write_tls(&mut write_buf)?;
-        
+
         if write_buf.is_empty() {
             break;
         }
-        
+
         let mut written = 0;
         while written < write_buf.len() {
             match raw_write(fd, &write_buf[written..]) {
                 Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0")),
                 Ok(n) => written += n,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    stream.writable(false).await?;
+                    stream.writable().await?;
                 }
                 Err(e) => return Err(e),
             }
@@ -410,7 +422,7 @@ pub enum KtlsEnableResult<C> {
 }
 
 /// kTLS を有効化する（サーバー側）
-/// 
+///
 /// ULP設定を先に試み、失敗時はconnを返してrustlsへフォールバック可能にする
 /// バッファに残存データがある場合はドレインして返却する
 #[cfg(feature = "ktls")]
@@ -420,9 +432,9 @@ fn try_enable_ktls_server(
     tcp_cork_enabled: bool,
 ) -> KtlsEnableResult<ServerConnection> {
     use crate::ktls::drain_rustls_plaintext;
-    
+
     let fd = stream.as_raw_fd();
-    
+
     // Step 1: ULP設定を試みる（connを消費しない）
     // これが失敗した場合はフォールバック可能
     if let Err(e) = setup_ulp(fd) {
@@ -430,7 +442,7 @@ fn try_enable_ktls_server(
         ftlog::warn!("kTLS: {}, falling back to rustls", msg);
         return KtlsEnableResult::Fallback(conn, msg);
     }
-    
+
     // Step 2: 暗号スイートを取得
     let cipher_suite = match conn.negotiated_cipher_suite() {
         Some(cs) => cs,
@@ -440,7 +452,7 @@ fn try_enable_ktls_server(
             return KtlsEnableResult::Fallback(conn, msg);
         }
     };
-    
+
     // Step 3: rustls バッファから残存データをドレイン
     // kTLS 有効化後はカーネルが直接読み取るため、
     // rustls 内のデータは失われる
@@ -457,7 +469,7 @@ fn try_enable_ktls_server(
             return KtlsEnableResult::Fallback(conn, msg);
         }
     };
-    
+
     // Step 4: rustls::Connection に変換してシークレット抽出とkTLS設定
     // この時点で conn は消費される
     let rustls_conn = rustls::Connection::Server(conn);
@@ -471,7 +483,7 @@ fn try_enable_ktls_server(
 }
 
 /// kTLS を有効化する（クライアント側）
-/// 
+///
 /// ULP設定を先に試み、失敗時はconnを返してrustlsへフォールバック可能にする
 #[cfg(feature = "ktls")]
 fn try_enable_ktls_client(
@@ -480,16 +492,16 @@ fn try_enable_ktls_client(
     tcp_cork_enabled: bool,
 ) -> KtlsEnableResult<ClientConnection> {
     use crate::ktls::drain_rustls_plaintext;
-    
+
     let fd = stream.as_raw_fd();
-    
+
     // Step 1: ULP設定を試みる（connを消費しない）
     if let Err(e) = setup_ulp(fd) {
         let msg = format!("ULP setup failed: {}", e);
         ftlog::warn!("kTLS: {}, falling back to rustls", msg);
         return KtlsEnableResult::Fallback(conn, msg);
     }
-    
+
     // Step 2: 暗号スイートを取得
     let cipher_suite = match conn.negotiated_cipher_suite() {
         Some(cs) => cs,
@@ -499,7 +511,7 @@ fn try_enable_ktls_client(
             return KtlsEnableResult::Fallback(conn, msg);
         }
     };
-    
+
     // Step 3: rustls バッファから残存データをドレイン
     let drained = match drain_rustls_plaintext(&mut conn.reader()) {
         Ok(data) => {
@@ -514,7 +526,7 @@ fn try_enable_ktls_client(
             return KtlsEnableResult::Fallback(conn, msg);
         }
     };
-    
+
     // Step 4: rustls::Connection に変換してシークレット抽出とkTLS設定
     let rustls_conn = rustls::Connection::Client(conn);
     match setup_ktls_after_ulp(fd, rustls_conn, cipher_suite, tcp_cork_enabled) {
@@ -524,7 +536,7 @@ fn try_enable_ktls_client(
 }
 
 /// ULP設定後のkTLS設定（シークレット抽出とTX/RX設定）
-/// 
+///
 /// 自前実装の ktls モジュールを使用して以下を行います：
 /// 1. TCP_CORK を有効化（パケット結合最適化）
 /// 2. rustls からシークレットを抽出
@@ -539,46 +551,54 @@ fn setup_ktls_after_ulp(
     _cipher_suite: rustls::SupportedCipherSuite,
     tcp_cork_enabled: bool,
 ) -> io::Result<()> {
-    use crate::ktls::{extract_tx_rx, setup_tls_info, set_tcp_cork, TLS_TX, TLS_RX};
-    
+    use crate::ktls::{extract_tx_rx, set_tcp_cork, setup_tls_info, TLS_RX, TLS_TX};
+
     // TCP_CORK を有効化（パケット結合最適化）
     if tcp_cork_enabled {
         if let Err(e) = set_tcp_cork(fd, true) {
             ftlog::debug!("TCP_CORK enable failed (non-fatal): {}", e);
         }
     }
-    
+
     // プロトコルバージョンを取得
     let protocol_version = conn.protocol_version();
-    
+
     // シークレットを抽出
-    let secrets = conn.dangerous_extract_secrets()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to extract secrets: {:?}", e)))?;
-    
+    let secrets = conn.dangerous_extract_secrets().map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("Failed to extract secrets: {:?}", e),
+        )
+    })?;
+
     // TX/RX バッチ抽出（共有処理で効率化）
-    let (mut tx, mut rx) = extract_tx_rx(secrets, protocol_version)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to build crypto info: {}", e)))?;
-    
+    let (mut tx, mut rx) = extract_tx_rx(secrets, protocol_version).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("Failed to build crypto info: {}", e),
+        )
+    })?;
+
     // TX 設定
     setup_tls_info(fd, TLS_TX, &tx)?;
-    tx.secure_clear();  // 鍵をセキュアにゼロ化
-    
+    tx.secure_clear(); // 鍵をセキュアにゼロ化
+
     // RX 設定
     setup_tls_info(fd, TLS_RX, &rx)?;
-    rx.secure_clear();  // 鍵をセキュアにゼロ化
-    
+    rx.secure_clear(); // 鍵をセキュアにゼロ化
+
     // TCP_CORK を無効化（バッファリングされたデータを送信）
     if tcp_cork_enabled {
         if let Err(e) = set_tcp_cork(fd, false) {
             ftlog::debug!("TCP_CORK disable failed (non-fatal): {}", e);
         }
     }
-    
+
     Ok(())
 }
 
 /// setsockopt で TLS ULP を設定
-/// 
+///
 /// 注意: この関数は crate::ktls::setup_ulp() を呼び出すラッパーです。
 /// 将来的に完全に ktls モジュールに移行する可能性があります。
 #[cfg(feature = "ktls")]
@@ -605,11 +625,11 @@ pub async fn accept_plain(
 }
 
 /// TLS ハンドシェイクを実行しサーバー TLS ストリームを作成
-/// 
+///
 /// kTLS の有効化に失敗した場合の動作は `allow_fallback` で制御されます：
 /// - true: rustls にフォールバックして接続を継続
 /// - false: kTLS 必須モード、有効化失敗時はエラーを返す
-/// 
+///
 /// 致命的なエラー（シークレット抽出後の失敗等）は常にエラーを返します。
 pub async fn accept(
     stream: TcpStream,
@@ -629,12 +649,12 @@ pub async fn accept(
         }
     }
 
-    let mut conn = ServerConnection::new(config)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let mut conn =
+        ServerConnection::new(config).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     // ハンドシェイクを実行
     do_server_handshake(&stream, &mut conn, &mut initial_data).await?;
-    
+
     // ALPN 情報をキャッシュ（kTLS 有効化後も参照できるように）
     let alpn_protocol = conn.alpn_protocol().map(|p| p.to_vec());
 
@@ -660,7 +680,7 @@ pub async fn accept(
                     );
                     return Err(io::Error::new(
                         io::ErrorKind::Other,
-                        format!("kTLS required but unavailable: {}", reason)
+                        format!("kTLS required but unavailable: {}", reason),
                     ));
                 }
             }
@@ -691,11 +711,11 @@ pub async fn accept(
 }
 
 /// TLS ハンドシェイクを実行しクライアント TLS ストリームを作成
-/// 
+///
 /// kTLS の有効化に失敗した場合の動作は `allow_fallback` で制御されます：
 /// - true: rustls にフォールバックして接続を継続
 /// - false: kTLS 必須モード、有効化失敗時はエラーを返す
-/// 
+///
 /// 致命的なエラー（シークレット抽出後の失敗等）は常にエラーを返します。
 pub async fn connect(
     stream: TcpStream,
@@ -743,7 +763,7 @@ pub async fn connect(
                     );
                     return Err(io::Error::new(
                         io::ErrorKind::Other,
-                        format!("kTLS required but unavailable: {}", reason)
+                        format!("kTLS required but unavailable: {}", reason),
                     ));
                 }
             }
@@ -776,23 +796,19 @@ pub async fn connect(
 // AsyncReadRent / AsyncWriteRent 実装（サーバー側）
 // ====================
 
-impl monoio::io::AsyncReadRent for KtlsServerStream {
-    async fn read<T: IoBufMut>(&mut self, mut buf: T) -> monoio::BufResult<usize, T> {
+impl crate::runtime::io::AsyncReadRent for KtlsServerStream {
+    async fn read<T: IoBufMut>(&mut self, mut buf: T) -> crate::runtime::io::BufResult<usize, T> {
         // 【Phase 2】まずドレインバッファからデータを返す
         if !self.drained_buffer.is_empty() {
             let len = std::cmp::min(self.drained_buffer.len(), buf.bytes_total());
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    self.drained_buffer.as_ptr(),
-                    buf.write_ptr(),
-                    len,
-                );
+                std::ptr::copy_nonoverlapping(self.drained_buffer.as_ptr(), buf.write_ptr(), len);
                 buf.set_init(len);
             }
             self.drained_buffer.drain(..len);
             return (Ok(len), buf);
         }
-        
+
         // kTLS が有効な場合は直接 TCP から読み込み（カーネルが復号化）
         if self.mode != TlsMode::Rustls {
             return self.inner.read(buf).await;
@@ -801,7 +817,12 @@ impl monoio::io::AsyncReadRent for KtlsServerStream {
         // rustls 経由で読み込み
         let conn = match &mut self.conn {
             Some(c) => c,
-            None => return (Err(io::Error::new(io::ErrorKind::Other, "No TLS connection")), buf),
+            None => {
+                return (
+                    Err(io::Error::new(io::ErrorKind::Other, "No TLS connection")),
+                    buf,
+                )
+            }
         };
 
         let fd = self.inner.as_raw_fd();
@@ -809,9 +830,8 @@ impl monoio::io::AsyncReadRent for KtlsServerStream {
 
         loop {
             // 既にデコードされたデータがあるか確認
-            let slice = unsafe {
-                std::slice::from_raw_parts_mut(buf.write_ptr(), buf.bytes_total())
-            };
+            let slice =
+                unsafe { std::slice::from_raw_parts_mut(buf.write_ptr(), buf.bytes_total()) };
 
             let mut rd = conn.reader();
             match std::io::Read::read(&mut rd, slice) {
@@ -830,7 +850,9 @@ impl monoio::io::AsyncReadRent for KtlsServerStream {
             // TLS データを読み込む
             loop {
                 match raw_read(fd, &mut read_buf) {
-                    Ok(0) => { return (Ok(0), buf); }
+                    Ok(0) => {
+                        return (Ok(0), buf);
+                    }
                     Ok(n) => {
                         // read_tls が全てのデータを消費するまでループ
                         let mut consumed = 0;
@@ -849,7 +871,7 @@ impl monoio::io::AsyncReadRent for KtlsServerStream {
                         break;
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        if let Err(e) = self.inner.readable(false).await {
+                        if let Err(e) = self.inner.readable().await {
                             return (Err(e), buf);
                         }
                     }
@@ -859,84 +881,20 @@ impl monoio::io::AsyncReadRent for KtlsServerStream {
         }
     }
 
-    async fn readv<T: IoVecBufMut>(&mut self, mut buf: T) -> monoio::BufResult<usize, T> {
-        // kTLS が有効な場合は直接 TCP から読み込み
-        if self.mode != TlsMode::Rustls {
-            return self.inner.readv(buf).await;
-        }
-
-        // 簡易実装: iovec の最初のバッファのみ使用
-        let iovec_ptr = buf.write_iovec_ptr();
-        let iovec_len = buf.write_iovec_len();
-
-        if iovec_len == 0 {
-            return (Ok(0), buf);
-        }
-
-        let conn = match &mut self.conn {
-            Some(c) => c,
-            None => return (Err(io::Error::new(io::ErrorKind::Other, "No TLS connection")), buf),
-        };
-
-        let slice = unsafe {
-            let iov = &*iovec_ptr;
-            if iov.iov_len == 0 {
-                return (Ok(0), buf);
-            }
-            std::slice::from_raw_parts_mut(iov.iov_base as *mut u8, iov.iov_len)
-        };
-
-        let fd = self.inner.as_raw_fd();
-        let mut read_buf = vec![0u8; 16384];
-
-        loop {
-            let mut rd = conn.reader();
-            match std::io::Read::read(&mut rd, slice) {
-                Ok(n) if n > 0 => {
-                    return (Ok(n), buf);
-                }
-                Ok(0) if !conn.wants_read() => {
-                    return (Ok(0), buf);
-                }
-                Ok(_) => {}  // Not EOF yet, need more TLS data
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}  // Need more TLS data
-                Err(e) => return (Err(e), buf),  // Return actual errors
-            }
-
-            loop {
-                match raw_read(fd, &mut read_buf) {
-                    Ok(0) => return (Ok(0), buf),
-                    Ok(n) => {
-                        // read_tls が全てのデータを消費するまでループ
-                        let mut consumed = 0;
-                        while consumed < n {
-                            let remaining = &read_buf[consumed..n];
-                            let tls_read = match conn.read_tls(&mut &*remaining) {
-                                Ok(0) => break,
-                                Ok(r) => r,
-                                Err(e) => return (Err(e), buf),
-                            };
-                            consumed += tls_read;
-                            if let Err(e) = conn.process_new_packets() {
-                                return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
-                            }
-                        }
-                        break;
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        if let Err(e) = self.inner.readable(false).await {
-                            return (Err(e), buf);
-                        }
-                    }
-                    Err(e) => return (Err(e), buf),
-                }
-            }
-        }
+    async fn readv<T: IoVecBufMut>(
+        &mut self,
+        mut buf: T,
+    ) -> crate::runtime::io::BufResult<usize, T> {
+        // IoVec stub のため未サポート
+        (
+            Err(io::Error::new(io::ErrorKind::Other, "readv not supported")),
+            buf,
+        )
     }
 }
 
-impl monoio::io::AsyncWriteRent for KtlsServerStream {
-    async fn write<T: IoBuf>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
+impl crate::runtime::io::AsyncWriteRent for KtlsServerStream {
+    async fn write<T: IoBuf>(&mut self, buf: T) -> crate::runtime::io::BufResult<usize, T> {
         // kTLS が有効な場合は直接 TCP に書き込み（カーネルが暗号化）
         if self.mode != TlsMode::Rustls {
             return self.inner.write(buf).await;
@@ -945,11 +903,16 @@ impl monoio::io::AsyncWriteRent for KtlsServerStream {
         // rustls 経由で書き込み
         let conn = match &mut self.conn {
             Some(c) => c,
-            None => return (Err(io::Error::new(io::ErrorKind::Other, "No TLS connection")), buf),
+            None => {
+                return (
+                    Err(io::Error::new(io::ErrorKind::Other, "No TLS connection")),
+                    buf,
+                )
+            }
         };
 
         let slice = unsafe { std::slice::from_raw_parts(buf.read_ptr(), buf.bytes_init()) };
-        
+
         // データを TLS レコードにエンコード
         let mut wr = conn.writer();
         if let Err(e) = std::io::Write::write_all(&mut wr, slice) {
@@ -967,10 +930,15 @@ impl monoio::io::AsyncWriteRent for KtlsServerStream {
             let mut written = 0;
             while written < write_buf.len() {
                 match raw_write(fd, &write_buf[written..]) {
-                    Ok(0) => return (Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0")), buf),
+                    Ok(0) => {
+                        return (
+                            Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0")),
+                            buf,
+                        )
+                    }
                     Ok(n) => written += n,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        if let Err(e) = self.inner.writable(false).await {
+                        if let Err(e) = self.inner.writable().await {
                             return (Err(e), buf);
                         }
                     }
@@ -982,61 +950,12 @@ impl monoio::io::AsyncWriteRent for KtlsServerStream {
         (Ok(slice.len()), buf)
     }
 
-    async fn writev<T: IoVecBuf>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
-        // kTLS が有効な場合は直接 TCP に書き込み
-        if self.mode != TlsMode::Rustls {
-            return self.inner.writev(buf).await;
-        }
-
-        // 簡易実装: iovec の最初のバッファのみ使用
-        let iovec_ptr = buf.read_iovec_ptr();
-        let iovec_len = buf.read_iovec_len();
-
-        if iovec_len == 0 {
-            return (Ok(0), buf);
-        }
-
-        let conn = match &mut self.conn {
-            Some(c) => c,
-            None => return (Err(io::Error::new(io::ErrorKind::Other, "No TLS connection")), buf),
-        };
-
-        let slice = unsafe {
-            let iov = &*iovec_ptr;
-            if iov.iov_len == 0 {
-                return (Ok(0), buf);
-            }
-            std::slice::from_raw_parts(iov.iov_base as *const u8, iov.iov_len)
-        };
-
-        let mut wr = conn.writer();
-        if let Err(e) = std::io::Write::write_all(&mut wr, slice) {
-            return (Err(e), buf);
-        }
-
-        let fd = self.inner.as_raw_fd();
-        while conn.wants_write() {
-            let mut write_buf = Vec::new();
-            if let Err(e) = conn.write_tls(&mut write_buf) {
-                return (Err(e), buf);
-            }
-
-            let mut written = 0;
-            while written < write_buf.len() {
-                match raw_write(fd, &write_buf[written..]) {
-                    Ok(0) => return (Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0")), buf),
-                    Ok(n) => written += n,
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        if let Err(e) = self.inner.writable(false).await {
-                            return (Err(e), buf);
-                        }
-                    }
-                    Err(e) => return (Err(e), buf),
-                }
-            }
-        }
-
-        (Ok(slice.len()), buf)
+    async fn writev<T: IoVecBuf>(&mut self, buf: T) -> crate::runtime::io::BufResult<usize, T> {
+        // IoVec stub のため未サポート
+        (
+            Err(io::Error::new(io::ErrorKind::Other, "writev not supported")),
+            buf,
+        )
     }
 
     async fn flush(&mut self) -> io::Result<()> {
@@ -1052,39 +971,39 @@ impl monoio::io::AsyncWriteRent for KtlsServerStream {
 // AsyncReadRent / AsyncWriteRent 実装（クライアント側）
 // ====================
 
-impl monoio::io::AsyncReadRent for KtlsClientStream {
-    async fn read<T: IoBufMut>(&mut self, mut buf: T) -> monoio::BufResult<usize, T> {
+impl crate::runtime::io::AsyncReadRent for KtlsClientStream {
+    async fn read<T: IoBufMut>(&mut self, mut buf: T) -> crate::runtime::io::BufResult<usize, T> {
         // 【Phase 2】まずドレインバッファからデータを返す
         if !self.drained_buffer.is_empty() {
             let len = std::cmp::min(self.drained_buffer.len(), buf.bytes_total());
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    self.drained_buffer.as_ptr(),
-                    buf.write_ptr(),
-                    len,
-                );
+                std::ptr::copy_nonoverlapping(self.drained_buffer.as_ptr(), buf.write_ptr(), len);
                 buf.set_init(len);
             }
             self.drained_buffer.drain(..len);
             return (Ok(len), buf);
         }
-        
+
         if self.mode != TlsMode::Rustls {
             return self.inner.read(buf).await;
         }
 
         let conn = match &mut self.conn {
             Some(c) => c,
-            None => return (Err(io::Error::new(io::ErrorKind::Other, "No TLS connection")), buf),
+            None => {
+                return (
+                    Err(io::Error::new(io::ErrorKind::Other, "No TLS connection")),
+                    buf,
+                )
+            }
         };
 
         let fd = self.inner.as_raw_fd();
         let mut read_buf = vec![0u8; 16384];
 
         loop {
-            let slice = unsafe {
-                std::slice::from_raw_parts_mut(buf.write_ptr(), buf.bytes_total())
-            };
+            let slice =
+                unsafe { std::slice::from_raw_parts_mut(buf.write_ptr(), buf.bytes_total()) };
 
             let mut rd = conn.reader();
             match std::io::Read::read(&mut rd, slice) {
@@ -1095,9 +1014,9 @@ impl monoio::io::AsyncReadRent for KtlsClientStream {
                 Ok(0) if !conn.wants_read() => {
                     return (Ok(0), buf);
                 }
-                Ok(_) => {}  // Not EOF yet, need more TLS data
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}  // Need more TLS data
-                Err(e) => return (Err(e), buf),  // Return actual errors
+                Ok(_) => {} // Not EOF yet, need more TLS data
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {} // Need more TLS data
+                Err(e) => return (Err(e), buf), // Return actual errors
             }
 
             loop {
@@ -1121,7 +1040,7 @@ impl monoio::io::AsyncReadRent for KtlsClientStream {
                         break;
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        if let Err(e) = self.inner.readable(false).await {
+                        if let Err(e) = self.inner.readable().await {
                             return (Err(e), buf);
                         }
                     }
@@ -1131,89 +1050,32 @@ impl monoio::io::AsyncReadRent for KtlsClientStream {
         }
     }
 
-    async fn readv<T: IoVecBufMut>(&mut self, mut buf: T) -> monoio::BufResult<usize, T> {
-        if self.mode != TlsMode::Rustls {
-            return self.inner.readv(buf).await;
-        }
-
-        let iovec_ptr = buf.write_iovec_ptr();
-        let iovec_len = buf.write_iovec_len();
-
-        if iovec_len == 0 {
-            return (Ok(0), buf);
-        }
-
-        let conn = match &mut self.conn {
-            Some(c) => c,
-            None => return (Err(io::Error::new(io::ErrorKind::Other, "No TLS connection")), buf),
-        };
-
-        let slice = unsafe {
-            let iov = &*iovec_ptr;
-            if iov.iov_len == 0 {
-                return (Ok(0), buf);
-            }
-            std::slice::from_raw_parts_mut(iov.iov_base as *mut u8, iov.iov_len)
-        };
-
-        let fd = self.inner.as_raw_fd();
-        let mut read_buf = vec![0u8; 16384];
-
-        loop {
-            let mut rd = conn.reader();
-            match std::io::Read::read(&mut rd, slice) {
-                Ok(n) if n > 0 => {
-                    return (Ok(n), buf);
-                }
-                Ok(0) if !conn.wants_read() => {
-                    return (Ok(0), buf);
-                }
-                Ok(_) => {}  // Not EOF yet, need more TLS data
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}  // Need more TLS data
-                Err(e) => return (Err(e), buf),  // Return actual errors
-            }
-
-            loop {
-                match raw_read(fd, &mut read_buf) {
-                    Ok(0) => return (Ok(0), buf),
-                    Ok(n) => {
-                        // read_tls が全てのデータを消費するまでループ
-                        let mut consumed = 0;
-                        while consumed < n {
-                            let remaining = &read_buf[consumed..n];
-                            let tls_read = match conn.read_tls(&mut &*remaining) {
-                                Ok(0) => break,
-                                Ok(r) => r,
-                                Err(e) => return (Err(e), buf),
-                            };
-                            consumed += tls_read;
-                            if let Err(e) = conn.process_new_packets() {
-                                return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
-                            }
-                        }
-                        break;
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        if let Err(e) = self.inner.readable(false).await {
-                            return (Err(e), buf);
-                        }
-                    }
-                    Err(e) => return (Err(e), buf),
-                }
-            }
-        }
+    async fn readv<T: IoVecBufMut>(
+        &mut self,
+        mut buf: T,
+    ) -> crate::runtime::io::BufResult<usize, T> {
+        // IoVec stub のため未サポート
+        (
+            Err(io::Error::new(io::ErrorKind::Other, "readv not supported")),
+            buf,
+        )
     }
 }
 
-impl monoio::io::AsyncWriteRent for KtlsClientStream {
-    async fn write<T: IoBuf>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
+impl crate::runtime::io::AsyncWriteRent for KtlsClientStream {
+    async fn write<T: IoBuf>(&mut self, buf: T) -> crate::runtime::io::BufResult<usize, T> {
         if self.mode != TlsMode::Rustls {
             return self.inner.write(buf).await;
         }
 
         let conn = match &mut self.conn {
             Some(c) => c,
-            None => return (Err(io::Error::new(io::ErrorKind::Other, "No TLS connection")), buf),
+            None => {
+                return (
+                    Err(io::Error::new(io::ErrorKind::Other, "No TLS connection")),
+                    buf,
+                )
+            }
         };
 
         let slice = unsafe { std::slice::from_raw_parts(buf.read_ptr(), buf.bytes_init()) };
@@ -1233,10 +1095,15 @@ impl monoio::io::AsyncWriteRent for KtlsClientStream {
             let mut written = 0;
             while written < write_buf.len() {
                 match raw_write(fd, &write_buf[written..]) {
-                    Ok(0) => return (Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0")), buf),
+                    Ok(0) => {
+                        return (
+                            Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0")),
+                            buf,
+                        )
+                    }
                     Ok(n) => written += n,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        if let Err(e) = self.inner.writable(false).await {
+                        if let Err(e) = self.inner.writable().await {
                             return (Err(e), buf);
                         }
                     }
@@ -1248,59 +1115,12 @@ impl monoio::io::AsyncWriteRent for KtlsClientStream {
         (Ok(slice.len()), buf)
     }
 
-    async fn writev<T: IoVecBuf>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
-        if self.mode != TlsMode::Rustls {
-            return self.inner.writev(buf).await;
-        }
-
-        let iovec_ptr = buf.read_iovec_ptr();
-        let iovec_len = buf.read_iovec_len();
-
-        if iovec_len == 0 {
-            return (Ok(0), buf);
-        }
-
-        let conn = match &mut self.conn {
-            Some(c) => c,
-            None => return (Err(io::Error::new(io::ErrorKind::Other, "No TLS connection")), buf),
-        };
-
-        let slice = unsafe {
-            let iov = &*iovec_ptr;
-            if iov.iov_len == 0 {
-                return (Ok(0), buf);
-            }
-            std::slice::from_raw_parts(iov.iov_base as *const u8, iov.iov_len)
-        };
-
-        let mut wr = conn.writer();
-        if let Err(e) = std::io::Write::write_all(&mut wr, slice) {
-            return (Err(e), buf);
-        }
-
-        let fd = self.inner.as_raw_fd();
-        while conn.wants_write() {
-            let mut write_buf = Vec::new();
-            if let Err(e) = conn.write_tls(&mut write_buf) {
-                return (Err(e), buf);
-            }
-
-            let mut written = 0;
-            while written < write_buf.len() {
-                match raw_write(fd, &write_buf[written..]) {
-                    Ok(0) => return (Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0")), buf),
-                    Ok(n) => written += n,
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        if let Err(e) = self.inner.writable(false).await {
-                            return (Err(e), buf);
-                        }
-                    }
-                    Err(e) => return (Err(e), buf),
-                }
-            }
-        }
-
-        (Ok(slice.len()), buf)
+    async fn writev<T: IoVecBuf>(&mut self, buf: T) -> crate::runtime::io::BufResult<usize, T> {
+        // IoVec stub のため未サポート
+        (
+            Err(io::Error::new(io::ErrorKind::Other, "writev not supported")),
+            buf,
+        )
     }
 
     async fn flush(&mut self) -> io::Result<()> {
@@ -1334,7 +1154,7 @@ impl RustlsAcceptor {
         RustlsAcceptor {
             config,
             enable_ktls: false,
-            allow_fallback: true,  // デフォルトはフォールバック有効
+            allow_fallback: true,   // デフォルトはフォールバック有効
             tcp_cork_enabled: true, // デフォルトはTCP_CORK有効
         }
     }
@@ -1346,7 +1166,7 @@ impl RustlsAcceptor {
     }
 
     /// kTLS 有効化失敗時のフォールバックを設定
-    /// 
+    ///
     /// - true: kTLS 失敗時は rustls で継続（デフォルト）
     /// - false: kTLS 必須（失敗時は接続拒否）
     pub fn with_fallback(mut self, allow: bool) -> Self {
@@ -1355,7 +1175,7 @@ impl RustlsAcceptor {
     }
 
     /// TCP_CORK を設定
-    /// 
+    ///
     /// - true: TCP_CORK有効（デフォルト、パケット結合最適化）
     /// - false: TCP_CORK無効
     pub fn with_tcp_cork(mut self, enable: bool) -> Self {
@@ -1364,15 +1184,31 @@ impl RustlsAcceptor {
     }
 
     /// TLS ハンドシェイクを実行
-    pub async fn accept(&self, stream: TcpStream, initial_data: Option<Vec<u8>>) -> io::Result<KtlsServerStream> {
+    pub async fn accept(
+        &self,
+        stream: TcpStream,
+        initial_data: Option<Vec<u8>>,
+    ) -> io::Result<KtlsServerStream> {
         // F-03: ホットリロードされた証明書があればそれを使う（毎ハンドシェイクでスナップショット取得）
-        let config = crate::tls_reload::current_global_tls_config()
-            .unwrap_or_else(|| self.config.clone());
-        accept(stream, config, self.enable_ktls, self.allow_fallback, self.tcp_cork_enabled, initial_data).await
+        let config =
+            crate::tls_reload::current_global_tls_config().unwrap_or_else(|| self.config.clone());
+        accept(
+            stream,
+            config,
+            self.enable_ktls,
+            self.allow_fallback,
+            self.tcp_cork_enabled,
+            initial_data,
+        )
+        .await
     }
 
     /// 平文（TLSなし）接続をアクセプト（H2C対応用）
-    pub async fn accept_plain(&self, stream: TcpStream, initial_data: Option<Vec<u8>>) -> io::Result<KtlsServerStream> {
+    pub async fn accept_plain(
+        &self,
+        stream: TcpStream,
+        initial_data: Option<Vec<u8>>,
+    ) -> io::Result<KtlsServerStream> {
         accept_plain(stream, initial_data).await
     }
 }
@@ -1395,7 +1231,7 @@ impl RustlsConnector {
         RustlsConnector {
             config,
             enable_ktls: false,
-            allow_fallback: true,  // デフォルトはフォールバック有効
+            allow_fallback: true,   // デフォルトはフォールバック有効
             tcp_cork_enabled: true, // デフォルトはTCP_CORK有効
         }
     }
@@ -1407,7 +1243,7 @@ impl RustlsConnector {
     }
 
     /// kTLS 有効化失敗時のフォールバックを設定
-    /// 
+    ///
     /// - true: kTLS 失敗時は rustls で継続（デフォルト）
     /// - false: kTLS 必須（失敗時は接続拒否）
     pub fn with_fallback(mut self, allow: bool) -> Self {
@@ -1416,7 +1252,7 @@ impl RustlsConnector {
     }
 
     /// TCP_CORK を設定
-    /// 
+    ///
     /// - true: TCP_CORK有効（デフォルト、パケット結合最適化）
     /// - false: TCP_CORK無効
     pub fn with_tcp_cork(mut self, enable: bool) -> Self {
@@ -1432,7 +1268,15 @@ impl RustlsConnector {
     ) -> io::Result<KtlsClientStream> {
         let server_name = ServerName::try_from(server_name.to_string())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        connect(stream, self.config.clone(), server_name, self.enable_ktls, self.allow_fallback, self.tcp_cork_enabled).await
+        connect(
+            stream,
+            self.config.clone(),
+            server_name,
+            self.enable_ktls,
+            self.allow_fallback,
+            self.tcp_cork_enabled,
+        )
+        .await
     }
 }
 
@@ -1460,7 +1304,9 @@ impl KtlsServerStream {
     /// sendfile によるゼロコピー送信（kTLS 有効時のみ）
     pub fn sendfile(&self, file_fd: RawFd, offset: &mut i64, count: usize) -> io::Result<usize> {
         if !self.is_ktls_send_enabled() {
-            return Err(io::Error::other("kTLS TX is not enabled. Cannot use sendfile."));
+            return Err(io::Error::other(
+                "kTLS TX is not enabled. Cannot use sendfile.",
+            ));
         }
 
         sendfile_ktls(self.as_raw_fd(), file_fd, offset, count)
@@ -1471,7 +1317,9 @@ impl KtlsClientStream {
     /// sendfile によるゼロコピー送信（kTLS 有効時のみ）
     pub fn sendfile(&self, file_fd: RawFd, offset: &mut i64, count: usize) -> io::Result<usize> {
         if !self.is_ktls_send_enabled() {
-            return Err(io::Error::other("kTLS TX is not enabled. Cannot use sendfile."));
+            return Err(io::Error::other(
+                "kTLS TX is not enabled. Cannot use sendfile.",
+            ));
         }
 
         sendfile_ktls(self.as_raw_fd(), file_fd, offset, count)
@@ -1676,9 +1524,9 @@ pub fn is_ktls_available() -> bool {
 // ====================
 
 /// クライアント TLS 設定を作成
-/// 
+///
 /// # Arguments
-/// 
+///
 /// * `enable_ktls` - kTLS を有効化する場合は true。
 ///                   true の場合、シークレット抽出が有効化される。
 pub fn client_config(enable_ktls: bool) -> Arc<ClientConfig> {
@@ -1698,7 +1546,7 @@ pub fn client_config(enable_ktls: bool) -> Arc<ClientConfig> {
 }
 
 /// デフォルトのクライアント TLS 設定を作成（kTLS 無効）
-/// 
+///
 /// 後方互換性のためのラッパー関数
 pub fn default_client_config() -> Arc<ClientConfig> {
     client_config(false)
@@ -1752,9 +1600,9 @@ pub fn insecure_client_config() -> Arc<ClientConfig> {
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
         .with_no_client_auth();
-    
+
     // kTLS サポートのためシークレット抽出を有効化
     config.enable_secret_extraction = true;
-    
+
     Arc::new(config)
 }

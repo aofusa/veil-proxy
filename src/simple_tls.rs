@@ -9,8 +9,9 @@ use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 
-use monoio::buf::{IoBuf, IoBufMut, IoVecBuf, IoVecBufMut};
-use monoio::net::TcpStream;
+use crate::runtime::buf::{IoBuf, IoBufMut};
+use crate::runtime::io::{IoVecBuf, IoVecBufMut};
+use crate::runtime::tcp::TcpStream;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection};
 
@@ -79,21 +80,21 @@ impl SimpleTlsServerStream {
     pub fn is_ktls_send_enabled(&self) -> bool {
         false
     }
-    
+
     /// ALPN でネゴシエートされたプロトコルを取得
-    /// 
+    ///
     /// TLS ハンドシェイク完了後に呼び出すことで、
     /// クライアントと合意したプロトコルを取得できます。
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// - `Some(b"h2")`: HTTP/2 がネゴシエートされた
     /// - `Some(b"http/1.1")`: HTTP/1.1 がネゴシエートされた
     /// - `None`: ALPN 未設定または未ネゴシエート
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
         self.conn.as_ref().and_then(|c| c.alpn_protocol())
     }
-    
+
     /// HTTP/2 がネゴシエートされたかどうか
     #[inline]
     pub fn is_http2(&self) -> bool {
@@ -178,7 +179,7 @@ async fn do_server_handshake(
                     }
                     Ok(n) => written += n,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        stream.writable(false).await?;
+                        stream.writable().await?;
                     }
                     Err(e) => return Err(e),
                 }
@@ -201,7 +202,7 @@ async fn do_server_handshake(
                         break;
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        stream.readable(false).await?;
+                        stream.readable().await?;
                     }
                     Err(e) => return Err(e),
                 }
@@ -222,12 +223,10 @@ async fn do_server_handshake(
         let mut written = 0;
         while written < write_buf.len() {
             match raw_write(fd, &write_buf[written..]) {
-                Ok(0) => {
-                    return Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0"))
-                }
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0")),
                 Ok(n) => written += n,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    stream.writable(false).await?;
+                    stream.writable().await?;
                 }
                 Err(e) => return Err(e),
             }
@@ -237,10 +236,7 @@ async fn do_server_handshake(
     Ok(())
 }
 
-async fn do_client_handshake(
-    stream: &TcpStream,
-    conn: &mut ClientConnection,
-) -> io::Result<()> {
+async fn do_client_handshake(stream: &TcpStream, conn: &mut ClientConnection) -> io::Result<()> {
     let fd = stream.as_raw_fd();
     let mut read_buf = vec![0u8; 16384];
     while conn.is_handshaking() {
@@ -256,7 +252,7 @@ async fn do_client_handshake(
                     }
                     Ok(n) => written += n,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        stream.writable(false).await?;
+                        stream.writable().await?;
                     }
                     Err(e) => return Err(e),
                 }
@@ -279,7 +275,7 @@ async fn do_client_handshake(
                         break;
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        stream.readable(false).await?;
+                        stream.readable().await?;
                     }
                     Err(e) => return Err(e),
                 }
@@ -300,12 +296,10 @@ async fn do_client_handshake(
         let mut written = 0;
         while written < write_buf.len() {
             match raw_write(fd, &write_buf[written..]) {
-                Ok(0) => {
-                    return Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0"))
-                }
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0")),
                 Ok(n) => written += n,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    stream.writable(false).await?;
+                    stream.writable().await?;
                 }
                 Err(e) => return Err(e),
             }
@@ -324,8 +318,8 @@ pub async fn accept(
     config: Arc<ServerConfig>,
     mut initial_data: Option<Vec<u8>>,
 ) -> io::Result<SimpleTlsServerStream> {
-    let mut conn = ServerConnection::new(config)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let mut conn =
+        ServerConnection::new(config).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     do_server_handshake(&stream, &mut conn, &mut initial_data).await?;
 
@@ -360,24 +354,23 @@ pub async fn connect(
 
     do_client_handshake(&stream, &mut conn).await?;
 
-    Ok(SimpleTlsClientStream { inner: stream, conn })
+    Ok(SimpleTlsClientStream {
+        inner: stream,
+        conn,
+    })
 }
 
 // ====================
 // AsyncReadRent 実装（サーバー）
 // ====================
 
-impl monoio::io::AsyncReadRent for SimpleTlsServerStream {
-    async fn read<T: IoBufMut>(&mut self, mut buf: T) -> monoio::BufResult<usize, T> {
+impl crate::runtime::io::AsyncReadRent for SimpleTlsServerStream {
+    async fn read<T: IoBufMut>(&mut self, mut buf: T) -> crate::runtime::io::BufResult<usize, T> {
         // ドレインバッファがあれば優先的に返す
         if !self.drained_buffer.is_empty() {
             let len = std::cmp::min(self.drained_buffer.len(), buf.bytes_total());
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    self.drained_buffer.as_ptr(),
-                    buf.write_ptr(),
-                    len,
-                );
+                std::ptr::copy_nonoverlapping(self.drained_buffer.as_ptr(), buf.write_ptr(), len);
                 buf.set_init(len);
             }
             self.drained_buffer.drain(..len);
@@ -391,7 +384,15 @@ impl monoio::io::AsyncReadRent for SimpleTlsServerStream {
 
         let conn = match self.conn.as_mut() {
             Some(c) => c,
-            None => return (Err(io::Error::new(io::ErrorKind::Other, "TLS connection closed")), buf),
+            None => {
+                return (
+                    Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "TLS connection closed",
+                    )),
+                    buf,
+                )
+            }
         };
 
         let fd = self.inner.as_raw_fd();
@@ -410,9 +411,9 @@ impl monoio::io::AsyncReadRent for SimpleTlsServerStream {
                 Ok(0) if !conn.wants_read() => {
                     return (Ok(0), buf);
                 }
-                Ok(_) => {}  // Not EOF yet, need more TLS data
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}  // Need more TLS data
-                Err(e) => return (Err(e), buf),  // Return actual errors
+                Ok(_) => {} // Not EOF yet, need more TLS data
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {} // Need more TLS data
+                Err(e) => return (Err(e), buf), // Return actual errors
             }
 
             loop {
@@ -436,7 +437,7 @@ impl monoio::io::AsyncReadRent for SimpleTlsServerStream {
                         break;
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        if let Err(e) = self.inner.readable(false).await {
+                        if let Err(e) = self.inner.readable().await {
                             return (Err(e), buf);
                         }
                     }
@@ -446,78 +447,20 @@ impl monoio::io::AsyncReadRent for SimpleTlsServerStream {
         }
     }
 
-    async fn readv<T: IoVecBufMut>(&mut self, mut buf: T) -> monoio::BufResult<usize, T> {
-        let iovec_ptr = buf.write_iovec_ptr();
-        let iovec_len = buf.write_iovec_len();
-
-        if iovec_len == 0 {
-            return (Ok(0), buf);
-        }
-
-        let slice = unsafe {
-            let iov = &*iovec_ptr;
-            if iov.iov_len == 0 {
-                return (Ok(0), buf);
-            }
-            std::slice::from_raw_parts_mut(iov.iov_base as *mut u8, iov.iov_len)
-        };
-
-        let conn = match self.conn.as_mut() {
-            Some(c) => c,
-            None => return (Err(io::Error::new(io::ErrorKind::Other, "TLS connection closed")), buf),
-        };
-
-        let fd = self.inner.as_raw_fd();
-        let mut read_buf = vec![0u8; 16384];
-
-        loop {
-            let mut rd = conn.reader();
-            match std::io::Read::read(&mut rd, slice) {
-                Ok(n) if n > 0 => {
-                    return (Ok(n), buf);
-                }
-                Ok(0) if !conn.wants_read() => {
-                    return (Ok(0), buf);
-                }
-                Ok(_) => {}  // Not EOF yet, need more TLS data
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}  // Need more TLS data
-                Err(e) => return (Err(e), buf),  // Return actual errors
-            }
-
-            loop {
-                match raw_read(fd, &mut read_buf) {
-                    Ok(0) => return (Ok(0), buf),
-                    Ok(n) => {
-                        // read_tls が全てのデータを消費するまでループ
-                        let mut consumed = 0;
-                        while consumed < n {
-                            let remaining = &read_buf[consumed..n];
-                            let tls_read = match conn.read_tls(&mut &*remaining) {
-                                Ok(0) => break,
-                                Ok(r) => r,
-                                Err(e) => return (Err(e), buf),
-                            };
-                            consumed += tls_read;
-                            if let Err(e) = conn.process_new_packets() {
-                                return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
-                            }
-                        }
-                        break;
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        if let Err(e) = self.inner.readable(false).await {
-                            return (Err(e), buf);
-                        }
-                    }
-                    Err(e) => return (Err(e), buf),
-                }
-            }
-        }
+    async fn readv<T: IoVecBufMut>(
+        &mut self,
+        mut buf: T,
+    ) -> crate::runtime::io::BufResult<usize, T> {
+        // IoVec stub のため未サポート
+        (
+            Err(io::Error::new(io::ErrorKind::Other, "readv not supported")),
+            buf,
+        )
     }
 }
 
-impl monoio::io::AsyncWriteRent for SimpleTlsServerStream {
-    async fn write<T: IoBuf>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
+impl crate::runtime::io::AsyncWriteRent for SimpleTlsServerStream {
+    async fn write<T: IoBuf>(&mut self, buf: T) -> crate::runtime::io::BufResult<usize, T> {
         if self.mode == TlsMode::Plain {
             return self.inner.write(buf).await;
         }
@@ -525,7 +468,15 @@ impl monoio::io::AsyncWriteRent for SimpleTlsServerStream {
         let slice = unsafe { std::slice::from_raw_parts(buf.read_ptr(), buf.bytes_init()) };
         let conn = match self.conn.as_mut() {
             Some(c) => c,
-            None => return (Err(io::Error::new(io::ErrorKind::Other, "TLS connection closed")), buf),
+            None => {
+                return (
+                    Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "TLS connection closed",
+                    )),
+                    buf,
+                )
+            }
         };
 
         let mut wr = conn.writer();
@@ -551,7 +502,7 @@ impl monoio::io::AsyncWriteRent for SimpleTlsServerStream {
                     }
                     Ok(n) => written += n,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        if let Err(e) = self.inner.writable(false).await {
+                        if let Err(e) = self.inner.writable().await {
                             return (Err(e), buf);
                         }
                     }
@@ -563,64 +514,12 @@ impl monoio::io::AsyncWriteRent for SimpleTlsServerStream {
         (Ok(slice.len()), buf)
     }
 
-    async fn writev<T: IoVecBuf>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
-        if self.mode == TlsMode::Plain {
-            return self.inner.writev(buf).await;
-        }
-
-        let iovec_ptr = buf.read_iovec_ptr();
-        let iovec_len = buf.read_iovec_len();
-
-        if iovec_len == 0 {
-            return (Ok(0), buf);
-        }
-
-        let slice = unsafe {
-            let iov = &*iovec_ptr;
-            if iov.iov_len == 0 {
-                return (Ok(0), buf);
-            }
-            std::slice::from_raw_parts(iov.iov_base as *const u8, iov.iov_len)
-        };
-
-        let conn = match self.conn.as_mut() {
-            Some(c) => c,
-            None => return (Err(io::Error::new(io::ErrorKind::Other, "TLS connection closed")), buf),
-        };
-
-        let mut wr = conn.writer();
-        if let Err(e) = std::io::Write::write_all(&mut wr, slice) {
-            return (Err(e), buf);
-        }
-
-        let fd = self.inner.as_raw_fd();
-        while conn.wants_write() {
-            let mut write_buf = Vec::new();
-            if let Err(e) = conn.write_tls(&mut write_buf) {
-                return (Err(e), buf);
-            }
-
-            let mut written = 0;
-            while written < write_buf.len() {
-                match raw_write(fd, &write_buf[written..]) {
-                    Ok(0) => {
-                        return (
-                            Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0")),
-                            buf,
-                        )
-                    }
-                    Ok(n) => written += n,
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        if let Err(e) = self.inner.writable(false).await {
-                            return (Err(e), buf);
-                        }
-                    }
-                    Err(e) => return (Err(e), buf),
-                }
-            }
-        }
-
-        (Ok(slice.len()), buf)
+    async fn writev<T: IoVecBuf>(&mut self, buf: T) -> crate::runtime::io::BufResult<usize, T> {
+        // IoVec stub のため未サポート
+        (
+            Err(io::Error::new(io::ErrorKind::Other, "writev not supported")),
+            buf,
+        )
     }
 
     async fn flush(&mut self) -> io::Result<()> {
@@ -636,8 +535,8 @@ impl monoio::io::AsyncWriteRent for SimpleTlsServerStream {
 // AsyncReadRent 実装（クライアント）
 // ====================
 
-impl monoio::io::AsyncReadRent for SimpleTlsClientStream {
-    async fn read<T: IoBufMut>(&mut self, mut buf: T) -> monoio::BufResult<usize, T> {
+impl crate::runtime::io::AsyncReadRent for SimpleTlsClientStream {
+    async fn read<T: IoBufMut>(&mut self, mut buf: T) -> crate::runtime::io::BufResult<usize, T> {
         let fd = self.inner.as_raw_fd();
         let mut read_buf = vec![0u8; 16384];
 
@@ -654,10 +553,10 @@ impl monoio::io::AsyncReadRent for SimpleTlsClientStream {
                 Ok(0) if !self.conn.wants_read() => {
                     return (Ok(0), buf);
                 }
-                Ok(_) => {}  // Not EOF yet, need more TLS data
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}  // Need more TLS data
+                Ok(_) => {} // Not EOF yet, need more TLS data
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {} // Need more TLS data
                 Err(e) => {
-                    return (Err(e), buf);  // Return actual errors
+                    return (Err(e), buf); // Return actual errors
                 }
             }
 
@@ -686,7 +585,7 @@ impl monoio::io::AsyncReadRent for SimpleTlsClientStream {
                         break;
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        if let Err(e) = self.inner.readable(false).await {
+                        if let Err(e) = self.inner.readable().await {
                             return (Err(e), buf);
                         }
                     }
@@ -698,73 +597,20 @@ impl monoio::io::AsyncReadRent for SimpleTlsClientStream {
         }
     }
 
-    async fn readv<T: IoVecBufMut>(&mut self, mut buf: T) -> monoio::BufResult<usize, T> {
-        let iovec_ptr = buf.write_iovec_ptr();
-        let iovec_len = buf.write_iovec_len();
-
-        if iovec_len == 0 {
-            return (Ok(0), buf);
-        }
-
-        let slice = unsafe {
-            let iov = &*iovec_ptr;
-            if iov.iov_len == 0 {
-                return (Ok(0), buf);
-            }
-            std::slice::from_raw_parts_mut(iov.iov_base as *mut u8, iov.iov_len)
-        };
-
-        let fd = self.inner.as_raw_fd();
-        let mut read_buf = vec![0u8; 16384];
-
-        loop {
-            let mut rd = self.conn.reader();
-            match std::io::Read::read(&mut rd, slice) {
-                Ok(n) if n > 0 => {
-                    return (Ok(n), buf);
-                }
-                Ok(0) if !self.conn.wants_read() => {
-                    return (Ok(0), buf);
-                }
-                Ok(_) => {}  // Not EOF yet, need more TLS data
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}  // Need more TLS data
-                Err(e) => return (Err(e), buf),  // Return actual errors
-            }
-
-            loop {
-                match raw_read(fd, &mut read_buf) {
-                    Ok(0) => return (Ok(0), buf),
-                    Ok(n) => {
-                        // read_tls が全てのデータを消費するまでループ
-                        let mut consumed = 0;
-                        while consumed < n {
-                            let remaining = &read_buf[consumed..n];
-                            let tls_read = match self.conn.read_tls(&mut &*remaining) {
-                                Ok(0) => break,
-                                Ok(r) => r,
-                                Err(e) => return (Err(e), buf),
-                            };
-                            consumed += tls_read;
-                            if let Err(e) = self.conn.process_new_packets() {
-                                return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
-                            }
-                        }
-                        break;
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        if let Err(e) = self.inner.readable(false).await {
-                            return (Err(e), buf);
-                        }
-                    }
-                    Err(e) => return (Err(e), buf),
-                }
-            }
-        }
+    async fn readv<T: IoVecBufMut>(
+        &mut self,
+        mut buf: T,
+    ) -> crate::runtime::io::BufResult<usize, T> {
+        // IoVec stub のため未サポート
+        (
+            Err(io::Error::new(io::ErrorKind::Other, "readv not supported")),
+            buf,
+        )
     }
 }
 
-impl monoio::io::AsyncWriteRent for SimpleTlsClientStream {
-    async fn write<T: IoBuf>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
+impl crate::runtime::io::AsyncWriteRent for SimpleTlsClientStream {
+    async fn write<T: IoBuf>(&mut self, buf: T) -> crate::runtime::io::BufResult<usize, T> {
         let slice = unsafe { std::slice::from_raw_parts(buf.read_ptr(), buf.bytes_init()) };
 
         let mut wr = self.conn.writer();
@@ -790,7 +636,7 @@ impl monoio::io::AsyncWriteRent for SimpleTlsClientStream {
                     }
                     Ok(n) => written += n,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        if let Err(e) = self.inner.writable(false).await {
+                        if let Err(e) = self.inner.writable().await {
                             return (Err(e), buf);
                         }
                     }
@@ -802,55 +648,12 @@ impl monoio::io::AsyncWriteRent for SimpleTlsClientStream {
         (Ok(slice.len()), buf)
     }
 
-    async fn writev<T: IoVecBuf>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
-        let iovec_ptr = buf.read_iovec_ptr();
-        let iovec_len = buf.read_iovec_len();
-
-        if iovec_len == 0 {
-            return (Ok(0), buf);
-        }
-
-        let slice = unsafe {
-            let iov = &*iovec_ptr;
-            if iov.iov_len == 0 {
-                return (Ok(0), buf);
-            }
-            std::slice::from_raw_parts(iov.iov_base as *const u8, iov.iov_len)
-        };
-
-        let mut wr = self.conn.writer();
-        if let Err(e) = std::io::Write::write_all(&mut wr, slice) {
-            return (Err(e), buf);
-        }
-
-        let fd = self.inner.as_raw_fd();
-        while self.conn.wants_write() {
-            let mut write_buf = Vec::new();
-            if let Err(e) = self.conn.write_tls(&mut write_buf) {
-                return (Err(e), buf);
-            }
-
-            let mut written = 0;
-            while written < write_buf.len() {
-                match raw_write(fd, &write_buf[written..]) {
-                    Ok(0) => {
-                        return (
-                            Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0")),
-                            buf,
-                        )
-                    }
-                    Ok(n) => written += n,
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        if let Err(e) = self.inner.writable(false).await {
-                            return (Err(e), buf);
-                        }
-                    }
-                    Err(e) => return (Err(e), buf),
-                }
-            }
-        }
-
-        (Ok(slice.len()), buf)
+    async fn writev<T: IoVecBuf>(&mut self, buf: T) -> crate::runtime::io::BufResult<usize, T> {
+        // IoVec stub のため未サポート
+        (
+            Err(io::Error::new(io::ErrorKind::Other, "writev not supported")),
+            buf,
+        )
     }
 
     async fn flush(&mut self) -> io::Result<()> {
@@ -881,15 +684,23 @@ impl SimpleTlsAcceptor {
         self
     }
 
-    pub async fn accept(&self, stream: TcpStream, initial_data: Option<Vec<u8>>) -> io::Result<SimpleTlsServerStream> {
+    pub async fn accept(
+        &self,
+        stream: TcpStream,
+        initial_data: Option<Vec<u8>>,
+    ) -> io::Result<SimpleTlsServerStream> {
         // F-03: ホットリロードされた証明書があればそれを使う（毎ハンドシェイクでスナップショット取得）
-        let config = crate::tls_reload::current_global_tls_config()
-            .unwrap_or_else(|| self.config.clone());
+        let config =
+            crate::tls_reload::current_global_tls_config().unwrap_or_else(|| self.config.clone());
         accept(stream, config, initial_data).await
     }
 
     /// 平文（TLSなし）接続をアクセプト（H2C対応用）
-    pub async fn accept_plain(&self, stream: TcpStream, initial_data: Option<Vec<u8>>) -> io::Result<SimpleTlsServerStream> {
+    pub async fn accept_plain(
+        &self,
+        stream: TcpStream,
+        initial_data: Option<Vec<u8>>,
+    ) -> io::Result<SimpleTlsServerStream> {
         accept_plain(stream, initial_data).await
     }
 }

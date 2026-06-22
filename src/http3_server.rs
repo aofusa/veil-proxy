@@ -20,64 +20,62 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::io::{self, Write as IoWrite, Seek};
+use std::io::{self, Seek, Write as IoWrite};
 use std::net::SocketAddr;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use monoio::net::udp::UdpSocket;
 use crate::udp::QuicUdpSocket;
-use quiche::{h3, Config, ConnectionId};
-use quiche::h3::NameValue;
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+use quiche::h3::NameValue;
+use quiche::{h3, Config, ConnectionId};
 
-use ftlog::{info, warn, error, debug};
+use ftlog::{debug, error, info, warn};
 
+use crate::proxy::{check_security, SecurityCheckResult};
 use crate::{
-    Backend, SecurityConfig, UpstreamGroup, ProxyTarget,
-    find_backend_unified, encode_prometheus_metrics, log_access,
-    AcceptedEncoding, CompressionConfig, resolve_http3_compression_config,
+    encode_prometheus_metrics, find_backend_unified, log_access, resolve_http3_compression_config,
+    AcceptedEncoding, Backend, CompressionConfig, ProxyTarget, SecurityConfig, UpstreamGroup,
     CURRENT_CONFIG, SHUTDOWN_FLAG,
 };
-use crate::proxy::{check_security, SecurityCheckResult};
-
 
 /// memfd_create システムコールのラッパー（セキュリティ強化版）
-/// 
+///
 /// 匿名のメモリファイルを作成します。このファイルはファイルシステム上には
 /// 存在せず、メモリ上にのみ存在します。Landlock のファイルシステム制限を
 /// バイパスしながら、ファイルディスクリプタ経由でアクセスできます。
-/// 
+///
 /// ## セキュリティ対策
 /// - MFD_CLOEXEC: exec() 時に自動的に閉じる（fd リーク防止）
 /// - MFD_ALLOW_SEALING: 書き込み後にシールを適用可能にする
 fn memfd_create_secure(name: &str) -> io::Result<std::fs::File> {
     let c_name = CString::new(name).map_err(|e| {
-        io::Error::new(io::ErrorKind::InvalidInput, format!("invalid memfd name: {}", e))
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid memfd name: {}", e),
+        )
     })?;
-    
+
     // MFD_CLOEXEC (1): exec() 時に自動クローズ
     // MFD_ALLOW_SEALING (2): シール機能を有効化
     const MFD_CLOEXEC: libc::c_uint = 1;
     const MFD_ALLOW_SEALING: libc::c_uint = 2;
-    
-    let fd = unsafe {
-        libc::memfd_create(c_name.as_ptr(), MFD_CLOEXEC | MFD_ALLOW_SEALING)
-    };
-    
+
+    let fd = unsafe { libc::memfd_create(c_name.as_ptr(), MFD_CLOEXEC | MFD_ALLOW_SEALING) };
+
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
-    
+
     Ok(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
 /// memfd にシールを適用（書き込み禁止・サイズ変更禁止）
-/// 
+///
 /// シールを適用することで、memfd の内容が改ざんされることを防ぎます。
 /// これにより、攻撃者が memfd の内容を書き換えて不正な証明書を
 /// 注入することを防止できます。
@@ -92,66 +90,67 @@ fn apply_memfd_seals(fd: i32) -> io::Result<()> {
     const F_SEAL_SHRINK: libc::c_int = 2;
     const F_SEAL_GROW: libc::c_int = 4;
     const F_SEAL_WRITE: libc::c_int = 8;
-    
+
     let seals = F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL;
-    
-    let result = unsafe {
-        libc::fcntl(fd, F_ADD_SEALS, seals)
-    };
-    
+
+    let result = unsafe { libc::fcntl(fd, F_ADD_SEALS, seals) };
+
     if result < 0 {
         return Err(io::Error::last_os_error());
     }
-    
+
     Ok(())
 }
 
 /// PEM データを memfd に書き込み、/proc/self/fd/<fd> パスを返す（セキュリティ強化版）
-/// 
+///
 /// この関数は以下のことを行います：
 /// 1. memfd_create で匿名ファイルを作成（MFD_CLOEXEC + MFD_ALLOW_SEALING）
 /// 2. PEM データを書き込み
 /// 3. シールを適用（書き込み禁止・サイズ変更禁止・追加シール禁止）
 /// 4. ファイル位置を先頭に戻す
 /// 5. /proc/self/fd/<fd> パスを生成
-/// 
+///
 /// ## セキュリティ特性
 /// - memfd の内容は書き込み後に変更不可能（シール適用）
 /// - exec() 時に自動的に閉じる（MFD_CLOEXEC）
 /// - ファイルシステム上には存在しない（Landlock バイパス）
-/// 
+///
 /// ## 注意
 /// 戻り値の File オブジェクトはスコープ内で保持し続ける必要があります。
 /// ドロップされると fd が閉じられ、パスが無効になります。
 fn create_memfd_for_pem(name: &str, pem_data: &[u8]) -> io::Result<(std::fs::File, String)> {
     // memfd を作成（セキュリティフラグ付き）
     let mut memfd = memfd_create_secure(name)?;
-    
+
     // PEM データを書き込み
     memfd.write_all(pem_data)?;
-    
+
     // ファイル位置を先頭に戻す（読み取り用）
     memfd.seek(io::SeekFrom::Start(0))?;
-    
+
     // /proc/self/fd/<fd> パスを生成
     let fd = memfd.as_raw_fd();
     let proc_path = format!("/proc/self/fd/{}", fd);
-    
+
     // シールを適用（書き込み禁止、サイズ変更禁止）
     // 注意: シール適用後は quiche がファイルを読み取る必要があるため、
     // 読み取りは引き続き可能
     if let Err(e) = apply_memfd_seals(fd) {
-        warn!("[HTTP/3] Failed to apply memfd seals: {} (continuing without seals)", e);
+        warn!(
+            "[HTTP/3] Failed to apply memfd seals: {} (continuing without seals)",
+            e
+        );
         // シール適用失敗は致命的ではないため、警告のみで続行
     } else {
         debug!("[HTTP/3] memfd seals applied: WRITE|SHRINK|GROW|SEAL");
     }
-    
+
     Ok((memfd, proc_path))
 }
 
 /// セキュアなバイト配列のゼロ化
-/// 
+///
 /// メモリ上の機密データを安全にゼロ化します。
 /// コンパイラによる最適化（デッドストア削除）を防ぐため、
 /// volatile 書き込みを使用します。
@@ -174,17 +173,17 @@ pub struct Http3ServerConfig {
     /// TLS 秘密鍵パス（後方互換性のため残す、key_pem優先）
     pub key_path: String,
     /// TLS 証明書（PEM形式、事前読み込み済み）
-    /// 
+    ///
     /// Landlock適用前に読み込まれた証明書バイト列。
     /// 設定されている場合、cert_pathより優先される。
-    /// 
+    ///
     /// 注意: 使用後にセキュアにゼロ化されます。
     pub cert_pem: Option<Vec<u8>>,
     /// TLS 秘密鍵（PEM形式、事前読み込み済み）
-    /// 
+    ///
     /// Landlock適用前に読み込まれた秘密鍵バイト列。
     /// 設定されている場合、key_pathより優先される。
-    /// 
+    ///
     /// 注意: 使用後にセキュアにゼロ化されます。
     pub key_pem: Option<Vec<u8>>,
     /// 最大アイドルタイムアウト（ミリ秒）
@@ -228,10 +227,10 @@ impl Default for Http3ServerConfig {
 }
 
 /// HTTP/3 コネクションハンドラー
-/// 
+///
 /// quiche::Connection と h3::Connection をセットで保持し、
 /// コネクションの寿命の間、同一のインスタンスを維持します。
-/// 
+///
 /// HTTP/1.1と同等のルーティング・セキュリティ・プロキシ機能をサポート。
 struct Http3Handler {
     /// QUIC コネクション
@@ -248,10 +247,7 @@ struct Http3Handler {
 
 impl Http3Handler {
     /// 新しいハンドラーを作成
-    fn new(
-        conn: quiche::Connection,
-        peer_addr: SocketAddr,
-    ) -> Self {
+    fn new(conn: quiche::Connection, peer_addr: SocketAddr) -> Self {
         Self {
             conn,
             h3_conn: None,
@@ -269,7 +265,10 @@ impl Http3Handler {
             let h3 = h3::Connection::with_transport(&mut self.conn, &h3_config)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             self.h3_conn = Some(h3);
-            debug!("[HTTP/3] HTTP/3 connection established from {}", self.peer_addr);
+            debug!(
+                "[HTTP/3] HTTP/3 connection established from {}",
+                self.peer_addr
+            );
         }
         Ok(())
     }
@@ -280,7 +279,7 @@ impl Http3Handler {
         let mut pending_requests: Vec<(u64, Vec<h3::Header>, Vec<u8>)> = Vec::new();
         // ストリームごとのボディバッファ
         let mut stream_bodies: HashMap<u64, Vec<u8>> = HashMap::new();
-        
+
         if let Some(ref mut h3_conn) = self.h3_conn {
             loop {
                 match h3_conn.poll(&mut self.conn) {
@@ -303,7 +302,7 @@ impl Http3Handler {
                         // リクエストボディを読み込み
                         let mut buf = vec![0u8; 16384];
                         let body = stream_bodies.entry(stream_id).or_insert_with(Vec::new);
-                        
+
                         loop {
                             match h3_conn.recv_body(&mut self.conn, stream_id, &mut buf) {
                                 Ok(read) if read > 0 => {
@@ -343,9 +342,14 @@ impl Http3Handler {
     }
 
     /// HTTP/3 リクエストを処理（完全版）
-    /// 
+    ///
     /// HTTP/1.1と同等のルーティング・セキュリティ・プロキシ機能をサポート。
-    async fn handle_request(&mut self, stream_id: u64, headers: &[h3::Header], request_body: &[u8]) -> io::Result<()> {
+    async fn handle_request(
+        &mut self,
+        stream_id: u64,
+        headers: &[h3::Header],
+        request_body: &[u8],
+    ) -> io::Result<()> {
         // HTTP/3コネクションが確立されていなければ何もしない
         if self.h3_conn.is_none() {
             return Ok(());
@@ -378,7 +382,7 @@ impl Http3Handler {
                 _ => {}
             }
         }
-        
+
         // クライアントの Accept-Encoding を解析
         let client_encoding = accept_encoding
             .as_ref()
@@ -407,37 +411,71 @@ impl Http3Handler {
 
         #[cfg(feature = "grpc")]
         if is_grpc {
-            debug!("[HTTP/3] gRPC request detected: {}", String::from_utf8_lossy(&path));
+            debug!(
+                "[HTTP/3] gRPC request detected: {}",
+                String::from_utf8_lossy(&path)
+            );
         }
-
 
         // メトリクスエンドポイント（設定可能なパス）
         {
             let config = CURRENT_CONFIG.load();
             let prom_config = &config.prometheus_config;
-            
+
             let path_str = std::str::from_utf8(&path).unwrap_or("/");
-            if prom_config.enabled 
-                && path_str == prom_config.path 
-                && method == b"GET" 
-            {
+            if prom_config.enabled && path_str == prom_config.path && method == b"GET" {
                 // IPアドレス制限チェック
                 if !prom_config.is_ip_allowed(&self.client_ip) {
                     self.send_error_response(stream_id, 403, b"Forbidden")?;
-                    let user_agent_slice: &[u8] = if user_agent.is_empty() { &[] } else { &user_agent };
-                    log_access(&method, &authority, &path, user_agent_slice, request_body.len() as u64, 403, 9, start_time, &self.client_ip, "");
+                    let user_agent_slice: &[u8] = if user_agent.is_empty() {
+                        &[]
+                    } else {
+                        &user_agent
+                    };
+                    log_access(
+                        &method,
+                        &authority,
+                        &path,
+                        user_agent_slice,
+                        request_body.len() as u64,
+                        403,
+                        9,
+                        start_time,
+                        &self.client_ip,
+                        "",
+                    );
                     return Ok(());
                 }
-                
+
                 let body = encode_prometheus_metrics();
-                self.send_response(stream_id, 200, &[
-                    (b":status", b"200"),
-                    (b"content-type", b"text/plain; version=0.0.4; charset=utf-8"),
-                    (b"server", b"veil/http3"),
-                ], Some(&body))?;
-                
-                let user_agent_slice: &[u8] = if user_agent.is_empty() { &[] } else { &user_agent };
-                log_access(&method, &authority, &path, user_agent_slice, request_body.len() as u64, 200, body.len() as u64, start_time, &self.client_ip, "");
+                self.send_response(
+                    stream_id,
+                    200,
+                    &[
+                        (b":status", b"200"),
+                        (b"content-type", b"text/plain; version=0.0.4; charset=utf-8"),
+                        (b"server", b"veil/http3"),
+                    ],
+                    Some(&body),
+                )?;
+
+                let user_agent_slice: &[u8] = if user_agent.is_empty() {
+                    &[]
+                } else {
+                    &user_agent
+                };
+                log_access(
+                    &method,
+                    &authority,
+                    &path,
+                    user_agent_slice,
+                    request_body.len() as u64,
+                    200,
+                    body.len() as u64,
+                    start_time,
+                    &self.client_ip,
+                    "",
+                );
                 return Ok(());
             }
         }
@@ -446,7 +484,8 @@ impl Http3Handler {
         let config = CURRENT_CONFIG.load();
 
         // ヘッダーをゼロコピーのバイト列スライスとして参照（HashMap 不要）
-        let headers_raw: Vec<(&[u8], &[u8])> = headers.iter()
+        let headers_raw: Vec<(&[u8], &[u8])> = headers
+            .iter()
             .filter(|h| !h.name().starts_with(b":")) // 疑似ヘッダーを除外
             .map(|h| (h.name(), h.value()))
             .collect();
@@ -487,7 +526,7 @@ impl Http3Handler {
                 None
             }
         });
-        
+
         let (prefix, backend) = match backend_result {
             Some(b) => b,
             None => {
@@ -496,34 +535,80 @@ impl Http3Handler {
                     String::from_utf8_lossy(&authority),
                     String::from_utf8_lossy(&path)
                 );
-                
+
                 // gRPC リクエストの場合は gRPC エラーレスポンスを返す
                 #[cfg(feature = "grpc")]
                 if is_grpc {
                     // UNIMPLEMENTED (12) - サービス/メソッドが見つからない
                     self.send_grpc_response(stream_id, &[], None, 12, Some("Service not found"))?;
-                    let user_agent_slice: &[u8] = if user_agent.is_empty() { &[] } else { &user_agent };
-                    log_access(&method, &authority, &path, user_agent_slice, request_body.len() as u64, 200, 0, start_time, &self.client_ip, "");
+                    let user_agent_slice: &[u8] = if user_agent.is_empty() {
+                        &[]
+                    } else {
+                        &user_agent
+                    };
+                    log_access(
+                        &method,
+                        &authority,
+                        &path,
+                        user_agent_slice,
+                        request_body.len() as u64,
+                        200,
+                        0,
+                        start_time,
+                        &self.client_ip,
+                        "",
+                    );
                     return Ok(());
                 }
-                
+
                 self.send_error_response(stream_id, 404, b"Not Found")?;
-                let user_agent_slice: &[u8] = if user_agent.is_empty() { &[] } else { &user_agent };
-                log_access(&method, &authority, &path, user_agent_slice, request_body.len() as u64, 404, 9, start_time, &self.client_ip, "");
+                let user_agent_slice: &[u8] = if user_agent.is_empty() {
+                    &[]
+                } else {
+                    &user_agent
+                };
+                log_access(
+                    &method,
+                    &authority,
+                    &path,
+                    user_agent_slice,
+                    request_body.len() as u64,
+                    404,
+                    9,
+                    start_time,
+                    &self.client_ip,
+                    "",
+                );
                 return Ok(());
             }
         };
 
         // セキュリティチェック
         let security = backend.security();
-        let check_result = check_security(security, &self.client_ip, &method, content_length, false);
-        
+        let check_result =
+            check_security(security, &self.client_ip, &method, content_length, false);
+
         if check_result != SecurityCheckResult::Allowed {
             let status = check_result.status_code();
             let msg = check_result.message();
             self.send_error_response(stream_id, status, msg)?;
-            let user_agent_slice: &[u8] = if user_agent.is_empty() { &[] } else { &user_agent };
-            log_access(&method, &authority, &path, user_agent_slice, request_body.len() as u64, status, msg.len() as u64, start_time, &self.client_ip, "");
+            let user_agent_slice: &[u8] = if user_agent.is_empty() {
+                &[]
+            } else {
+                &user_agent
+            };
+            log_access(
+                &method,
+                &authority,
+                &path,
+                user_agent_slice,
+                request_body.len() as u64,
+                status,
+                msg.len() as u64,
+                start_time,
+                &self.client_ip,
+                "",
+            );
             return Ok(());
         }
 
@@ -534,17 +619,18 @@ impl Http3Handler {
             if let Some(ref wasm_engine) = config.wasm_filter_engine {
                 let path_str = std::str::from_utf8(&path).unwrap_or("/");
                 let method_str = std::str::from_utf8(&method).unwrap_or("GET");
-                
+
                 let modules_to_apply = if let Some(backend_modules) = backend.modules() {
                     backend_modules.to_vec()
                 } else {
                     // ルートレベルのmodulesが指定されていない場合は、WASMモジュールを適用しない
                     Vec::new()
                 };
-                
+
                 if !modules_to_apply.is_empty() {
                     // HTTP/3のヘッダーを取得
-                    let headers_vec: Vec<(Vec<u8>, Vec<u8>)> = headers.iter()
+                    let headers_vec: Vec<(Vec<u8>, Vec<u8>)> = headers
+                        .iter()
                         .filter(|h| !h.name().starts_with(b":")) // 疑似ヘッダーを除外
                         .map(|h| (h.name().to_vec(), h.value().to_vec()))
                         .collect();
@@ -561,11 +647,33 @@ impl Http3Handler {
                     match wasm_result {
                         crate::wasm::FilterResult::LocalResponse(resp) => {
                             // ローカルレスポンスを返送
-                            self.send_response(stream_id, resp.status_code, &resp.headers.iter()
-                                .map(|(k, v)| (k.as_slice(), v.as_slice()))
-                                .collect::<Vec<_>>(), Some(&resp.body))?;
-                            let user_agent_slice: &[u8] = if user_agent.is_empty() { &[] } else { &user_agent };
-                            log_access(&method, &authority, &path, user_agent_slice, request_body.len() as u64, resp.status_code, resp.body.len() as u64, start_time, &self.client_ip, "");
+                            self.send_response(
+                                stream_id,
+                                resp.status_code,
+                                &resp
+                                    .headers
+                                    .iter()
+                                    .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                                    .collect::<Vec<_>>(),
+                                Some(&resp.body),
+                            )?;
+                            let user_agent_slice: &[u8] = if user_agent.is_empty() {
+                                &[]
+                            } else {
+                                &user_agent
+                            };
+                            log_access(
+                                &method,
+                                &authority,
+                                &path,
+                                user_agent_slice,
+                                request_body.len() as u64,
+                                resp.status_code,
+                                resp.body.len() as u64,
+                                start_time,
+                                &self.client_ip,
+                                "",
+                            );
                             return Ok(());
                         }
                         crate::wasm::FilterResult::Pause => {
@@ -584,31 +692,44 @@ impl Http3Handler {
         let (status, resp_size) = match backend {
             Backend::Proxy(upstream_group, _, path_compression, _buffering, _cache, _) => {
                 debug!("[HTTP/3] Starting proxy request to upstream group");
-                
+
                 // HTTP/3専用圧縮設定を解決
                 // 優先順位: パス設定 > HTTP/3設定 > デフォルト
                 let config = CURRENT_CONFIG.load();
-                let effective_compression = resolve_http3_compression_config(
-                    &path_compression,
-                    &config.http3_config,
-                );
-                
-                let result = self.handle_proxy(stream_id, &upstream_group, &effective_compression, client_encoding, &method, &path, &prefix, headers, request_body).await
+                let effective_compression =
+                    resolve_http3_compression_config(&path_compression, &config.http3_config);
+
+                let result = self
+                    .handle_proxy(
+                        stream_id,
+                        &upstream_group,
+                        &effective_compression,
+                        client_encoding,
+                        &method,
+                        &path,
+                        &prefix,
+                        headers,
+                        request_body,
+                    )
+                    .await
                     .unwrap_or((502, 11));
-                debug!("[HTTP/3] Proxy request completed: status={}, size={}", result.0, result.1);
+                debug!(
+                    "[HTTP/3] Proxy request completed: status={}, size={}",
+                    result.0, result.1
+                );
                 result
             }
             Backend::MemoryFile(data, mime_type, security, _) => {
                 // パス完全一致チェック
                 let path_str = std::str::from_utf8(&path).unwrap_or("/");
                 let prefix_str = std::str::from_utf8(&prefix).unwrap_or("");
-                
+
                 let remainder = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
                     &path_str[prefix_str.len()..]
                 } else {
                     ""
                 };
-                
+
                 let clean_remainder = remainder.trim_matches('/');
                 if !clean_remainder.is_empty() {
                     self.send_error_response(stream_id, 404, b"Not Found")?;
@@ -618,37 +739,67 @@ impl Http3Handler {
                         (b"content-type", mime_type.as_bytes()),
                         (b"server", b"veil/http3"),
                     ];
-                    
+
                     // セキュリティヘッダー追加
-                    let security_headers: Vec<(Vec<u8>, Vec<u8>)> = security.add_response_headers.iter()
+                    let security_headers: Vec<(Vec<u8>, Vec<u8>)> = security
+                        .add_response_headers
+                        .iter()
                         .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec()))
                         .collect();
-                    
+
                     for (k, v) in &security_headers {
                         resp_headers.push((k.as_slice(), v.as_slice()));
                     }
-                    
+
                     self.send_response(stream_id, 200, &resp_headers, Some(&data))?;
                     (200, data.len())
                 }
             }
-            Backend::SendFile(base_path, is_dir, index_file, security, _cache, _, _) => {
-                self.handle_sendfile(stream_id, &base_path, is_dir, index_file.as_deref(), &path, &prefix, &security)
-                    .unwrap_or((404, 9))
-            }
-            Backend::Redirect(redirect_url, status_code, preserve_path, _) => {
-                self.handle_redirect(stream_id, &redirect_url, status_code, preserve_path, &path, &prefix)
-                    .unwrap_or((500, 0))
-            }
+            Backend::SendFile(base_path, is_dir, index_file, security, _cache, _, _) => self
+                .handle_sendfile(
+                    stream_id,
+                    &base_path,
+                    is_dir,
+                    index_file.as_deref(),
+                    &path,
+                    &prefix,
+                    &security,
+                )
+                .unwrap_or((404, 9)),
+            Backend::Redirect(redirect_url, status_code, preserve_path, _) => self
+                .handle_redirect(
+                    stream_id,
+                    &redirect_url,
+                    status_code,
+                    preserve_path,
+                    &path,
+                    &prefix,
+                )
+                .unwrap_or((500, 0)),
         };
 
-        let user_agent_slice: &[u8] = if user_agent.is_empty() { &[] } else { &user_agent };
-        log_access(&method, &authority, &path, user_agent_slice, request_body.len() as u64, status, resp_size as u64, start_time, &self.client_ip, "");
+        let user_agent_slice: &[u8] = if user_agent.is_empty() {
+            &[]
+        } else {
+            &user_agent
+        };
+        log_access(
+            &method,
+            &authority,
+            &path,
+            user_agent_slice,
+            request_body.len() as u64,
+            status,
+            resp_size as u64,
+            start_time,
+            &self.client_ip,
+            "",
+        );
         Ok(())
     }
-    
+
     /// レスポンス送信ヘルパー
-    /// 
+    ///
     /// HTTP/3 レスポンスを送信します。StreamBlocked エラーが発生した場合は
     /// 部分レスポンスとして保存し、後で flush_partial_responses() で再送します。
     fn send_response(
@@ -658,9 +809,13 @@ impl Http3Handler {
         headers: &[(&[u8], &[u8])],
         body: Option<&[u8]>,
     ) -> io::Result<()> {
-        debug!("[HTTP/3] send_response called: stream_id={}, status={}, h3_conn={}", 
-            stream_id, status, self.h3_conn.is_some());
-        
+        debug!(
+            "[HTTP/3] send_response called: stream_id={}, status={}, h3_conn={}",
+            stream_id,
+            status,
+            self.h3_conn.is_some()
+        );
+
         let h3_conn = match &mut self.h3_conn {
             Some(h3) => h3,
             None => {
@@ -668,26 +823,25 @@ impl Http3Handler {
                 return Ok(());
             }
         };
-        
-        
+
         // ステータスを含むヘッダーを構築（itoa::Buffer使用でヒープ割り当て削減）
         let mut status_buf = itoa::Buffer::new();
         let status_str = status_buf.format(status);
         let mut h3_headers = vec![h3::Header::new(b":status", status_str.as_bytes())];
-        
+
         for (name, value) in headers {
             if *name != b":status" {
                 h3_headers.push(h3::Header::new(*name, *value));
             }
         }
-        
+
         // Content-Length を追加（itoa::Buffer使用）
         if let Some(body_data) = body {
             let mut len_buf = itoa::Buffer::new();
             let len_str = len_buf.format(body_data.len());
             h3_headers.push(h3::Header::new(b"content-length", len_str.as_bytes()));
         }
-        
+
         // ヘッダー送信
         let has_body = body.is_some() && body.map_or(false, |b| !b.is_empty());
         match h3_conn.send_response(&mut self.conn, stream_id, &h3_headers, !has_body) {
@@ -699,31 +853,43 @@ impl Http3Handler {
                 // 次の send_pending_packets() で送信される
                 debug!("[HTTP/3] Stream {} blocked, will retry later", stream_id);
                 if let Some(body_data) = body {
-                    self.partial_responses.insert(stream_id, (body_data.to_vec(), 0));
+                    self.partial_responses
+                        .insert(stream_id, (body_data.to_vec(), 0));
                 }
                 return Ok(());
             }
             Err(e) => {
-                warn!("[HTTP/3] send_response error on stream {}: {}", stream_id, e);
+                warn!(
+                    "[HTTP/3] send_response error on stream {}: {}",
+                    stream_id, e
+                );
                 return Ok(());
             }
         }
-        
+
         // ボディ送信
         if let Some(body_data) = body {
             if !body_data.is_empty() {
                 match h3_conn.send_body(&mut self.conn, stream_id, body_data, true) {
                     Ok(written) => {
-                        debug!("[HTTP/3] Response body sent: {} bytes for stream {}", written, stream_id);
+                        debug!(
+                            "[HTTP/3] Response body sent: {} bytes for stream {}",
+                            written, stream_id
+                        );
                         // 部分的にしか送信できなかった場合
                         if written < body_data.len() {
-                            self.partial_responses.insert(stream_id, (body_data.to_vec(), written));
+                            self.partial_responses
+                                .insert(stream_id, (body_data.to_vec(), written));
                         }
                     }
                     Err(h3::Error::Done) => {
                         // バッファがいっぱい、後で再送
-                        debug!("[HTTP/3] Body buffer full for stream {}, queuing for later", stream_id);
-                        self.partial_responses.insert(stream_id, (body_data.to_vec(), 0));
+                        debug!(
+                            "[HTTP/3] Body buffer full for stream {}, queuing for later",
+                            stream_id
+                        );
+                        self.partial_responses
+                            .insert(stream_id, (body_data.to_vec(), 0));
                     }
                     Err(e) => {
                         warn!("[HTTP/3] send_body error on stream {}: {}", stream_id, e);
@@ -731,17 +897,23 @@ impl Http3Handler {
                 }
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// エラーレスポンス送信
     fn send_error_response(&mut self, stream_id: u64, status: u16, body: &[u8]) -> io::Result<()> {
-        debug!("[HTTP/3] Sending error response: status={}, body_len={}", status, body.len());
-        let result = self.send_response(stream_id, status, &[
-            (b"content-type", b"text/plain"),
-            (b"server", b"veil/http3"),
-        ], Some(body));
+        debug!(
+            "[HTTP/3] Sending error response: status={}, body_len={}",
+            status,
+            body.len()
+        );
+        let result = self.send_response(
+            stream_id,
+            status,
+            &[(b"content-type", b"text/plain"), (b"server", b"veil/http3")],
+            Some(body),
+        );
         debug!("[HTTP/3] Error response send result: {:?}", result.is_ok());
         result
     }
@@ -782,7 +954,7 @@ impl Http3Handler {
             h3::Header::new(b":status", b"200"),
             h3::Header::new(b"content-type", b"application/grpc+proto"),
         ];
-        
+
         for &(name, value) in headers {
             if name != b":status" && !name.eq_ignore_ascii_case(b"content-type") {
                 h3_headers.push(h3::Header::new(name, value));
@@ -791,7 +963,7 @@ impl Http3Handler {
 
         // ボディがあるかどうかを判定
         let has_body = body.is_some() && body.map_or(false, |b| !b.is_empty());
-        
+
         // ボディがない場合はヘッダーのみ送信してトレイラーへ
         if let Err(e) = h3_conn.send_response(&mut self.conn, stream_id, &h3_headers, false) {
             warn!("[HTTP/3] gRPC send_response error: {}", e);
@@ -828,9 +1000,8 @@ impl Http3Handler {
             None => return Ok(()),
         };
 
-        let code = GrpcStatusCode::from_u8(grpc_status as u8)
-            .unwrap_or(GrpcStatusCode::Unknown);
-        
+        let code = GrpcStatusCode::from_u8(grpc_status as u8).unwrap_or(GrpcStatusCode::Unknown);
+
         let status = if let Some(msg) = grpc_message {
             GrpcStatus::error(code, msg)
         } else {
@@ -855,9 +1026,9 @@ impl Http3Handler {
 
         Ok(())
     }
-    
+
     /// プロキシ処理（HTTP/1.1またはHTTP/2バックエンドへの変換）
-    /// 
+    ///
     /// HTTP/3からのリクエストをバックエンドに転送します。
     /// バックエンドがHTTP/3に対応していない場合は、HTTP/2またはHTTP/1.1にフォールバックします。
     async fn handle_proxy(
@@ -880,10 +1051,10 @@ impl Http3Handler {
                 return Ok((502, 11));
             }
         };
-        
+
         server.acquire();
         let target = &server.target;
-        
+
         // リクエストパス構築
         let path_str = std::str::from_utf8(req_path).unwrap_or("/");
         let sub_path = if prefix.is_empty() {
@@ -893,21 +1064,33 @@ impl Http3Handler {
             if path_str.starts_with(prefix_str) {
                 let remaining = &path_str[prefix_str.len()..];
                 let base = target.path_prefix.trim_end_matches('/');
-                
+
                 if remaining.is_empty() {
-                    if base.is_empty() { "/".to_string() } else { format!("{}/", base) }
+                    if base.is_empty() {
+                        "/".to_string()
+                    } else {
+                        format!("{}/", base)
+                    }
                 } else if remaining.starts_with('/') {
-                    if base.is_empty() { remaining.to_string() } else { format!("{}{}", base, remaining) }
+                    if base.is_empty() {
+                        remaining.to_string()
+                    } else {
+                        format!("{}{}", base, remaining)
+                    }
                 } else {
-                    if base.is_empty() { format!("/{}", remaining) } else { format!("{}/{}", base, remaining) }
+                    if base.is_empty() {
+                        format!("/{}", remaining)
+                    } else {
+                        format!("{}/{}", base, remaining)
+                    }
                 }
             } else {
                 path_str.to_string()
             }
         };
-        
+
         let final_path = if sub_path.is_empty() { "/" } else { &sub_path };
-        
+
         // HTTP/1.1 リクエスト構築
         let mut request = Vec::with_capacity(1024 + request_body.len());
         request.extend_from_slice(method);
@@ -915,22 +1098,23 @@ impl Http3Handler {
         request.extend_from_slice(final_path.as_bytes());
         request.extend_from_slice(b" HTTP/1.1\r\nHost: ");
         request.extend_from_slice(target.host.as_bytes());
-        
+
         if !target.is_default_port() {
             request.extend_from_slice(b":");
             let mut port_buf = itoa::Buffer::new();
             request.extend_from_slice(port_buf.format(target.port).as_bytes());
         }
         request.extend_from_slice(b"\r\n");
-        
+
         // ヘッダー追加（疑似ヘッダー以外）
         for header in headers {
             if header.name().starts_with(b":") {
                 continue;
             }
-            if header.name().eq_ignore_ascii_case(b"connection") ||
-               header.name().eq_ignore_ascii_case(b"keep-alive") ||
-               header.name().eq_ignore_ascii_case(b"transfer-encoding") {
+            if header.name().eq_ignore_ascii_case(b"connection")
+                || header.name().eq_ignore_ascii_case(b"keep-alive")
+                || header.name().eq_ignore_ascii_case(b"transfer-encoding")
+            {
                 continue;
             }
             request.extend_from_slice(header.name());
@@ -938,7 +1122,7 @@ impl Http3Handler {
             request.extend_from_slice(header.value());
             request.extend_from_slice(b"\r\n");
         }
-        
+
         // Content-Length 追加
         if !request_body.is_empty() {
             request.extend_from_slice(b"Content-Length: ");
@@ -946,24 +1130,25 @@ impl Http3Handler {
             request.extend_from_slice(len_buf.format(request_body.len()).as_bytes());
             request.extend_from_slice(b"\r\n");
         }
-        
+
         request.extend_from_slice(b"Connection: close\r\n\r\n");
         request.extend_from_slice(request_body);
-        
+
         // 非同期プロキシ処理（monoio TcpStream使用）
         // io_uringベースの非同期I/Oでバックエンド通信を行う
         let timeout_secs = 30;
         let tls_insecure = upstream_group.tls_insecure()
             || std::env::var("VEIL_TLS_INSECURE").map_or(false, |v| v == "1");
-        let proxy_result = proxy_to_backend_async_with_tls(target, request, timeout_secs, tls_insecure).await;
-        
+        let proxy_result =
+            proxy_to_backend_async_with_tls(target, request, timeout_secs, tls_insecure).await;
+
         server.release();
-        
+
         match proxy_result {
             Ok(backend_result) => {
                 // バックエンド結果からHTTP/3レスポンスを構築
                 let status_code = backend_result.status_code;
-                
+
                 // 圧縮判定
                 let mut content_type: Option<&[u8]> = None;
                 let mut existing_encoding: Option<&[u8]> = None;
@@ -974,14 +1159,14 @@ impl Http3Handler {
                         existing_encoding = Some(value.as_slice());
                     }
                 }
-                
+
                 let should_compress = compression.should_compress(
                     client_encoding,
                     content_type,
                     Some(backend_result.body.len()),
                     existing_encoding,
                 );
-                
+
                 // レスポンスヘッダーを構築（ホップバイホップヘッダーをスキップ）
                 let mut resp_headers: Vec<(&[u8], &[u8])> = Vec::new();
                 for (name, value) in &backend_result.headers {
@@ -992,22 +1177,22 @@ impl Http3Handler {
                         continue;
                     }
                     // 圧縮時は Content-Length と Content-Encoding をスキップ
-                    if should_compress.is_some() && (
-                        name.eq_ignore_ascii_case(b"content-length") ||
-                        name.eq_ignore_ascii_case(b"content-encoding")
-                    ) {
+                    if should_compress.is_some()
+                        && (name.eq_ignore_ascii_case(b"content-length")
+                            || name.eq_ignore_ascii_case(b"content-encoding"))
+                    {
                         continue;
                     }
                     resp_headers.push((name.as_slice(), value.as_slice()));
                 }
-                
+
                 // 圧縮処理
                 let response_body = if let Some(enc) = should_compress {
                     compress_body_h3(&backend_result.body, enc, compression)
                 } else {
                     backend_result.body.clone()
                 };
-                
+
                 self.send_response(stream_id, status_code, &resp_headers, Some(&response_body))?;
                 Ok((status_code, response_body.len()))
             }
@@ -1018,7 +1203,7 @@ impl Http3Handler {
             }
         }
     }
-    
+
     /// ファイル配信
     fn handle_sendfile(
         &mut self,
@@ -1032,22 +1217,22 @@ impl Http3Handler {
     ) -> io::Result<(u16, usize)> {
         let path_str = std::str::from_utf8(req_path).unwrap_or("/");
         let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
-        
+
         // プレフィックス除去後のサブパス
         let sub_path = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
             &path_str[prefix_str.len()..]
         } else {
             path_str
         };
-        
+
         let clean_sub = sub_path.trim_start_matches('/');
-        
+
         // パストラバーサル防止
         if clean_sub.contains("..") {
             self.send_error_response(stream_id, 403, b"Forbidden")?;
             return Ok((403, 9));
         }
-        
+
         // ファイルパス構築
         let file_path = if is_dir {
             let mut p = base_path.clone();
@@ -1067,7 +1252,7 @@ impl Http3Handler {
             }
             base_path.clone()
         };
-        
+
         // ファイル読み込み
         let data = match std::fs::read(&file_path) {
             Ok(d) => d,
@@ -1076,28 +1261,30 @@ impl Http3Handler {
                 return Ok((404, 9));
             }
         };
-        
+
         let mime_type = mime_guess::from_path(&file_path).first_or_octet_stream();
         let mime_str = mime_type.as_ref();
-        
+
         let mut resp_headers: Vec<(&[u8], &[u8])> = vec![
             (b"content-type", mime_str.as_bytes()),
             (b"server", b"veil/http3"),
         ];
-        
+
         // セキュリティヘッダー追加
-        let security_headers: Vec<(Vec<u8>, Vec<u8>)> = security.add_response_headers.iter()
+        let security_headers: Vec<(Vec<u8>, Vec<u8>)> = security
+            .add_response_headers
+            .iter()
             .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec()))
             .collect();
-        
+
         for (k, v) in &security_headers {
             resp_headers.push((k.as_slice(), v.as_slice()));
         }
-        
+
         self.send_response(stream_id, 200, &resp_headers, Some(&data))?;
         Ok((200, data.len()))
     }
-    
+
     /// リダイレクト処理
     fn handle_redirect(
         &mut self,
@@ -1110,19 +1297,19 @@ impl Http3Handler {
     ) -> io::Result<(u16, usize)> {
         let path_str = std::str::from_utf8(req_path).unwrap_or("/");
         let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
-        
+
         // パス部分（prefix除去後）
         let sub_path = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
             &path_str[prefix_str.len()..]
         } else {
             path_str
         };
-        
+
         // 変数置換とパス追加
         let mut final_url = redirect_url
             .replace("$request_uri", path_str)
             .replace("$path", sub_path);
-        
+
         if preserve_path && !sub_path.is_empty() {
             if final_url.ends_with('/') && sub_path.starts_with('/') {
                 final_url.push_str(&sub_path[1..]);
@@ -1133,12 +1320,17 @@ impl Http3Handler {
                 final_url.push_str(sub_path);
             }
         }
-        
-        self.send_response(stream_id, status_code, &[
-            (b"location", final_url.as_bytes()),
-            (b"server", b"veil/http3"),
-        ], None)?;
-        
+
+        self.send_response(
+            stream_id,
+            status_code,
+            &[
+                (b"location", final_url.as_bytes()),
+                (b"server", b"veil/http3"),
+            ],
+            None,
+        )?;
+
         Ok((status_code, 0))
     }
 
@@ -1177,7 +1369,7 @@ impl Http3Handler {
     }
 
     /// 書き込み可能なストリームを処理（quiche パターン）
-    /// 
+    ///
     /// conn.writable() で書き込み可能になったストリームに対して、
     /// 保留中の部分レスポンスを再送します。
     fn handle_writable_streams(&mut self) -> io::Result<()> {
@@ -1188,15 +1380,20 @@ impl Http3Handler {
 
         // 書き込み可能なストリームを収集
         let writable_streams: Vec<u64> = self.conn.writable().collect();
-        
+
         for stream_id in writable_streams {
             // 部分レスポンスがあるかチェック
             if let Some((body, written)) = self.partial_responses.get_mut(&stream_id) {
                 if *written < body.len() {
                     match h3_conn.send_body(&mut self.conn, stream_id, &body[*written..], true) {
                         Ok(sent) => {
-                            debug!("[HTTP/3] Writable stream {}: sent {} more bytes ({}/{})", 
-                                stream_id, sent, *written + sent, body.len());
+                            debug!(
+                                "[HTTP/3] Writable stream {}: sent {} more bytes ({}/{})",
+                                stream_id,
+                                sent,
+                                *written + sent,
+                                body.len()
+                            );
                             *written += sent;
                         }
                         Err(h3::Error::Done) => {
@@ -1204,15 +1401,19 @@ impl Http3Handler {
                             debug!("[HTTP/3] Stream {} still blocked", stream_id);
                         }
                         Err(e) => {
-                            warn!("[HTTP/3] send_body error on writable stream {}: {}", stream_id, e);
+                            warn!(
+                                "[HTTP/3] send_body error on writable stream {}: {}",
+                                stream_id, e
+                            );
                         }
                     }
                 }
             }
         }
-        
+
         // 完了したストリームを削除
-        self.partial_responses.retain(|_, (body, written)| *written < body.len());
+        self.partial_responses
+            .retain(|_, (body, written)| *written < body.len());
 
         Ok(())
     }
@@ -1234,7 +1435,7 @@ pub struct BackendProxyResult {
 
 /// バックエンドへの非同期プロキシ処理
 ///
-/// monoio::net::TcpStream を使用して非同期にバックエンドへ接続します。
+/// crate::runtime::tcp::TcpStream を使用して非同期にバックエンドへ接続します。
 /// HTTP/3 コネクションをブロックせずにバックエンド通信を行えます。
 #[allow(dead_code)]
 pub(crate) async fn proxy_to_backend_async(
@@ -1251,18 +1452,20 @@ pub(crate) async fn proxy_to_backend_async_with_tls(
     timeout_secs: u64,
     tls_insecure: bool,
 ) -> io::Result<BackendProxyResult> {
-    use monoio::net::TcpStream;
+    use crate::runtime::tcp::TcpStream;
     use std::os::unix::io::AsRawFd;
-    
+
     let addr = format!("{}:{}", target.host, target.port);
     debug!("[HTTP/3] Async connecting to backend {}", addr);
-    
+
     // 非同期TCP接続（タイムアウト付き）
-    let connect_future = TcpStream::connect(&addr);
-    let backend = match monoio::time::timeout(
+    let connect_future = TcpStream::connect_str(&addr);
+    let backend = match crate::runtime::time::timeout(
         Duration::from_secs(timeout_secs),
-        connect_future
-    ).await {
+        connect_future,
+    )
+    .await
+    {
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => {
             warn!("[HTTP/3] Async backend connect error: {}", e);
@@ -1270,20 +1473,24 @@ pub(crate) async fn proxy_to_backend_async_with_tls(
         }
         Err(_) => {
             warn!("[HTTP/3] Async backend connect timeout");
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "Backend connect timeout"));
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Backend connect timeout",
+            ));
         }
     };
-    
+
     debug!("[HTTP/3] Async connected to backend {}", addr);
     let _ = backend.set_nodelay(true);
-    
+
     // TLSバックエンドの場合
     if target.use_tls {
-        return proxy_to_tls_backend_async(target, request, backend, timeout_secs, tls_insecure).await;
+        return proxy_to_tls_backend_async(target, request, backend, timeout_secs, tls_insecure)
+            .await;
     }
-    
+
     let fd = backend.as_raw_fd();
-    
+
     // リクエスト送信（非同期）
     let mut written = 0;
     while written < request.len() {
@@ -1298,27 +1505,29 @@ pub(crate) async fn proxy_to_backend_async_with_tls(
             Err(e) => return Err(e),
         }
     }
-    
+
     debug!("[HTTP/3] Async request sent: {} bytes", written);
-    
+
     // レスポンス受信（非同期）
     let mut response = Vec::with_capacity(16384);
     let mut buf = vec![0u8; 8192];
     let read_timeout = Duration::from_secs(timeout_secs);
     let start_time = std::time::Instant::now();
-    
+
     loop {
         if start_time.elapsed() > read_timeout {
             break;
         }
-        
+
         match read_nonblocking(fd, &mut buf) {
             Ok(0) => break,
             Ok(n) => response.extend_from_slice(&buf[..n]),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 let remaining = read_timeout.saturating_sub(start_time.elapsed());
-                if remaining.is_zero() { break; }
-                match monoio::time::timeout(remaining, backend.readable(false)).await {
+                if remaining.is_zero() {
+                    break;
+                }
+                match crate::runtime::time::timeout(remaining, backend.readable(false)).await {
                     Ok(Ok(())) => continue,
                     Ok(Err(e)) if response.is_empty() => return Err(e),
                     _ => break,
@@ -1328,7 +1537,7 @@ pub(crate) async fn proxy_to_backend_async_with_tls(
             Err(_) => break,
         }
     }
-    
+
     debug!("[HTTP/3] Async response received: {} bytes", response.len());
     parse_http_response(&response)
 }
@@ -1339,16 +1548,21 @@ pub(crate) async fn proxy_to_backend_async_with_tls(
 async fn proxy_to_tls_backend_async(
     target: &ProxyTarget,
     request: Vec<u8>,
-    tcp_stream: monoio::net::TcpStream,
+    tcp_stream: crate::runtime::tcp::TcpStream,
     timeout_secs: u64,
     tls_insecure: bool,
 ) -> io::Result<BackendProxyResult> {
     // monoio TcpStream は不要（別スレッドで std::net::TcpStream を使うため）
     drop(tcp_stream);
 
-    let skip_verify = tls_insecure || std::env::var("VEIL_TLS_INSECURE").map_or(false, |v| v == "1");
+    let skip_verify =
+        tls_insecure || std::env::var("VEIL_TLS_INSECURE").map_or(false, |v| v == "1");
     let addr = format!("{}:{}", target.host, target.port);
-    let sni_name = target.sni_name.as_deref().unwrap_or(&target.host).to_string();
+    let sni_name = target
+        .sni_name
+        .as_deref()
+        .unwrap_or(&target.host)
+        .to_string();
 
     use rustls::ClientConfig;
     use std::sync::Arc;
@@ -1357,15 +1571,56 @@ async fn proxy_to_tls_backend_async(
         #[derive(Debug)]
         struct NoVerify;
         impl rustls::client::danger::ServerCertVerifier for NoVerify {
-            fn verify_server_cert(&self, _: &rustls::pki_types::CertificateDer<'_>, _: &[rustls::pki_types::CertificateDer<'_>], _: &rustls::pki_types::ServerName<'_>, _: &[u8], _: rustls::pki_types::UnixTime) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> { Ok(rustls::client::danger::ServerCertVerified::assertion()) }
-            fn verify_tls12_signature(&self, _: &[u8], _: &rustls::pki_types::CertificateDer<'_>, _: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> { Ok(rustls::client::danger::HandshakeSignatureValid::assertion()) }
-            fn verify_tls13_signature(&self, _: &[u8], _: &rustls::pki_types::CertificateDer<'_>, _: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> { Ok(rustls::client::danger::HandshakeSignatureValid::assertion()) }
-            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> { rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms.supported_schemes().to_vec() }
+            fn verify_server_cert(
+                &self,
+                _: &rustls::pki_types::CertificateDer<'_>,
+                _: &[rustls::pki_types::CertificateDer<'_>],
+                _: &rustls::pki_types::ServerName<'_>,
+                _: &[u8],
+                _: rustls::pki_types::UnixTime,
+            ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            }
+            fn verify_tls12_signature(
+                &self,
+                _: &[u8],
+                _: &rustls::pki_types::CertificateDer<'_>,
+                _: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
+                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+            }
+            fn verify_tls13_signature(
+                &self,
+                _: &[u8],
+                _: &rustls::pki_types::CertificateDer<'_>,
+                _: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
+                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+            }
+            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+                rustls::crypto::aws_lc_rs::default_provider()
+                    .signature_verification_algorithms
+                    .supported_schemes()
+                    .to_vec()
+            }
         }
-        Arc::new(ClientConfig::builder().dangerous().with_custom_certificate_verifier(Arc::new(NoVerify)).with_no_client_auth())
+        Arc::new(
+            ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerify))
+                .with_no_client_auth(),
+        )
     } else {
-        let root_store = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
-        Arc::new(ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth())
+        let root_store = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        };
+        Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth(),
+        )
     };
 
     // 別スレッドでブロッキング TLS 通信を実行し、mpsc channel 経由で結果を受け取る
@@ -1374,8 +1629,10 @@ async fn proxy_to_tls_backend_async(
         use std::io::Write;
         let result = (|| -> io::Result<BackendProxyResult> {
             let timeout = Duration::from_secs(timeout_secs);
-            let mut std_stream = std::net::TcpStream::connect(&addr)
-                .map_err(|e| { warn!("[HTTP/3] std backend connect error: {}", e); e })?;
+            let mut std_stream = std::net::TcpStream::connect_str(&addr).map_err(|e| {
+                warn!("[HTTP/3] std backend connect error: {}", e);
+                e
+            })?;
             std_stream.set_read_timeout(Some(timeout))?;
             std_stream.set_write_timeout(Some(timeout))?;
             let server_name = rustls::pki_types::ServerName::try_from(sni_name)
@@ -1410,9 +1667,12 @@ async fn proxy_to_tls_backend_async(
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 if std::time::Instant::now() >= deadline {
-                    return Err(io::Error::new(io::ErrorKind::TimedOut, "backend TLS timeout"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "backend TLS timeout",
+                    ));
                 }
-                monoio::time::sleep(Duration::from_millis(5)).await;
+                crate::runtime::time::sleep(Duration::from_millis(5)).await;
             }
         }
     }
@@ -1424,7 +1684,7 @@ async fn proxy_to_tls_backend_async(
 async fn proxy_to_tls_backend_async(
     target: &ProxyTarget,
     request: Vec<u8>,
-    tcp_stream: monoio::net::TcpStream,
+    tcp_stream: crate::runtime::tcp::TcpStream,
     timeout_secs: u64,
     tls_insecure: bool,
 ) -> io::Result<BackendProxyResult> {
@@ -1434,23 +1694,69 @@ async fn proxy_to_tls_backend_async(
     // monoio TcpStream は不要（別スレッドで std::net::TcpStream を使うため）
     drop(tcp_stream);
 
-    let skip_verify = tls_insecure || std::env::var("VEIL_TLS_INSECURE").map_or(false, |v| v == "1");
+    let skip_verify =
+        tls_insecure || std::env::var("VEIL_TLS_INSECURE").map_or(false, |v| v == "1");
     let addr = format!("{}:{}", target.host, target.port);
-    let sni_name = target.sni_name.as_deref().unwrap_or(&target.host).to_string();
+    let sni_name = target
+        .sni_name
+        .as_deref()
+        .unwrap_or(&target.host)
+        .to_string();
 
     let config: Arc<ClientConfig> = if skip_verify {
         #[derive(Debug)]
         struct NoVerify;
         impl rustls::client::danger::ServerCertVerifier for NoVerify {
-            fn verify_server_cert(&self, _: &rustls::pki_types::CertificateDer<'_>, _: &[rustls::pki_types::CertificateDer<'_>], _: &rustls::pki_types::ServerName<'_>, _: &[u8], _: rustls::pki_types::UnixTime) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> { Ok(rustls::client::danger::ServerCertVerified::assertion()) }
-            fn verify_tls12_signature(&self, _: &[u8], _: &rustls::pki_types::CertificateDer<'_>, _: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> { Ok(rustls::client::danger::HandshakeSignatureValid::assertion()) }
-            fn verify_tls13_signature(&self, _: &[u8], _: &rustls::pki_types::CertificateDer<'_>, _: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> { Ok(rustls::client::danger::HandshakeSignatureValid::assertion()) }
-            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> { rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms.supported_schemes().to_vec() }
+            fn verify_server_cert(
+                &self,
+                _: &rustls::pki_types::CertificateDer<'_>,
+                _: &[rustls::pki_types::CertificateDer<'_>],
+                _: &rustls::pki_types::ServerName<'_>,
+                _: &[u8],
+                _: rustls::pki_types::UnixTime,
+            ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            }
+            fn verify_tls12_signature(
+                &self,
+                _: &[u8],
+                _: &rustls::pki_types::CertificateDer<'_>,
+                _: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
+                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+            }
+            fn verify_tls13_signature(
+                &self,
+                _: &[u8],
+                _: &rustls::pki_types::CertificateDer<'_>,
+                _: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
+                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+            }
+            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+                rustls::crypto::aws_lc_rs::default_provider()
+                    .signature_verification_algorithms
+                    .supported_schemes()
+                    .to_vec()
+            }
         }
-        Arc::new(ClientConfig::builder().dangerous().with_custom_certificate_verifier(Arc::new(NoVerify)).with_no_client_auth())
+        Arc::new(
+            ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerify))
+                .with_no_client_auth(),
+        )
     } else {
-        let root_store = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
-        Arc::new(ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth())
+        let root_store = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        };
+        Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth(),
+        )
     };
 
     // 別スレッドでブロッキング TLS 通信を実行し、mpsc channel 経由で結果を受け取る
@@ -1459,8 +1765,10 @@ async fn proxy_to_tls_backend_async(
         use std::io::{Read, Write};
         let result = (|| -> io::Result<BackendProxyResult> {
             let timeout = Duration::from_secs(timeout_secs);
-            let mut std_stream = std::net::TcpStream::connect(&addr)
-                .map_err(|e| { warn!("[HTTP/3] std backend connect error: {}", e); e })?;
+            let mut std_stream = std::net::TcpStream::connect_str(&addr).map_err(|e| {
+                warn!("[HTTP/3] std backend connect error: {}", e);
+                e
+            })?;
             std_stream.set_read_timeout(Some(timeout))?;
             std_stream.set_write_timeout(Some(timeout))?;
             let server_name = rustls::pki_types::ServerName::try_from(sni_name)
@@ -1486,9 +1794,12 @@ async fn proxy_to_tls_backend_async(
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 if std::time::Instant::now() >= deadline {
-                    return Err(io::Error::new(io::ErrorKind::TimedOut, "backend TLS timeout"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "backend TLS timeout",
+                    ));
                 }
-                monoio::time::sleep(Duration::from_millis(5)).await;
+                crate::runtime::time::sleep(Duration::from_millis(5)).await;
             }
         }
     }
@@ -1497,70 +1808,92 @@ async fn proxy_to_tls_backend_async(
 #[inline]
 fn read_nonblocking(fd: i32, buf: &mut [u8]) -> io::Result<usize> {
     let result = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-    if result < 0 { Err(io::Error::last_os_error()) } else { Ok(result as usize) }
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(result as usize)
+    }
 }
 
 #[inline]
 fn write_nonblocking(fd: i32, buf: &[u8]) -> io::Result<usize> {
     let result = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
-    if result < 0 { Err(io::Error::last_os_error()) } else { Ok(result as usize) }
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(result as usize)
+    }
 }
 
 fn parse_http_response(response: &[u8]) -> io::Result<BackendProxyResult> {
-    let header_end = find_header_end(response).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "Invalid HTTP response")
-    })?;
-    
+    let header_end = find_header_end(response)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid HTTP response"))?;
+
     let header_bytes = &response[..header_end];
     let body = response[header_end + 4..].to_vec();
     let status_code = parse_status_code(header_bytes).unwrap_or(502);
-    
+
     let mut headers = Vec::new();
     if let Some(first_crlf) = memchr::memchr(b'\n', header_bytes) {
         for line in header_bytes[first_crlf + 1..].split(|&b| b == b'\n') {
             let line = line.strip_suffix(&[b'\r']).unwrap_or(line);
-            if line.is_empty() { continue; }
+            if line.is_empty() {
+                continue;
+            }
             if let Some(colon_pos) = memchr::memchr(b':', line) {
                 let name = &line[..colon_pos];
-                let value = line[colon_pos + 1..].strip_prefix(&[b' ']).unwrap_or(&line[colon_pos + 1..]);
+                let value = line[colon_pos + 1..]
+                    .strip_prefix(&[b' '])
+                    .unwrap_or(&line[colon_pos + 1..]);
                 if !name.eq_ignore_ascii_case(b"connection")
                     && !name.eq_ignore_ascii_case(b"transfer-encoding")
-                    && !name.eq_ignore_ascii_case(b"keep-alive") {
+                    && !name.eq_ignore_ascii_case(b"keep-alive")
+                {
                     headers.push((name.to_vec(), value.to_vec()));
                 }
             }
         }
     }
-    
-    Ok(BackendProxyResult { status_code, body, headers })
+
+    Ok(BackendProxyResult {
+        status_code,
+        body,
+        headers,
+    })
 }
 
 /// コネクション管理（Rc<RefCell> で共有）
 type ConnectionMap = Rc<RefCell<HashMap<ConnectionId<'static>, Http3Handler>>>;
 
 /// SO_REUSEPORT を設定した UDP ソケットを作成
-/// 
+///
 /// 複数ワーカースレッドが同じポートでリッスンし、
 /// カーネルがフローに基づいてパケットを分散します。
-/// 
+///
 /// **非推奨**: `QuicUdpSocket::bind_reuseport()` を使用してください。
 /// この関数は GSO/GRO を設定しません。
 #[allow(dead_code)]
 fn create_reuseport_udp_socket(bind_addr: SocketAddr) -> io::Result<UdpSocket> {
     use std::os::unix::io::FromRawFd;
-    
+
     // socket2 を使用せず libc を直接使用
     let domain = if bind_addr.is_ipv4() {
         libc::AF_INET
     } else {
         libc::AF_INET6
     };
-    
-    let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0) };
+
+    let fd = unsafe {
+        libc::socket(
+            domain,
+            libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
-    
+
     // SO_REUSEADDR を設定
     let optval: libc::c_int = 1;
     let ret = unsafe {
@@ -1576,7 +1909,7 @@ fn create_reuseport_udp_socket(bind_addr: SocketAddr) -> io::Result<UdpSocket> {
         unsafe { libc::close(fd) };
         return Err(io::Error::last_os_error());
     }
-    
+
     // SO_REUSEPORT を設定
     let ret = unsafe {
         libc::setsockopt(
@@ -1591,7 +1924,7 @@ fn create_reuseport_udp_socket(bind_addr: SocketAddr) -> io::Result<UdpSocket> {
         unsafe { libc::close(fd) };
         return Err(io::Error::last_os_error());
     }
-    
+
     // アドレスをバインド
     let ret = match bind_addr {
         SocketAddr::V4(addr) => {
@@ -1634,17 +1967,17 @@ fn create_reuseport_udp_socket(bind_addr: SocketAddr) -> io::Result<UdpSocket> {
         unsafe { libc::close(fd) };
         return Err(io::Error::last_os_error());
     }
-    
+
     // std::net::UdpSocket を作成し、monoio の UdpSocket に変換
     let std_socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
     UdpSocket::from_std(std_socket)
 }
 
 /// HTTP/3 サーバーを起動（monoio ランタイム上で実行）
-/// 
+///
 /// この関数は monoio のスレッド内から呼び出す必要があります。
 /// HTTP/1.1と同等のルーティング・セキュリティ・プロキシ機能をサポートします。
-/// 
+///
 /// ## セキュリティ
 /// 証明書データ（cert_pem, key_pem）は quiche へのロード完了後、
 /// セキュアにゼロ化してからメモリから解放されます。
@@ -1660,63 +1993,90 @@ pub async fn run_http3_server_async(
     // memfd アプローチ: 事前読み込み済みの PEM バイト列を memfd に書き込み、
     // /proc/self/fd/<fd> パス経由で quiche に渡す
     // これにより Landlock でファイルシステムアクセスを制限しながら HTTP/3 を使用可能
-    // 
+    //
     // セキュリティ: quiche が証明書を読み込んだ後:
     // 1. memfd を即座にドロップ（カーネルがメモリ解放）
     // 2. config 内の Vec<u8> をセキュアにゼロ化してからドロップ
-    if let (Some(mut cert_pem), Some(mut key_pem)) = (config.cert_pem.take(), config.key_pem.take()) {
+    if let (Some(mut cert_pem), Some(mut key_pem)) = (config.cert_pem.take(), config.key_pem.take())
+    {
         // memfd 経由でロード（Landlock 対応）
         info!("[HTTP/3] Loading certificates via memfd (Landlock compatible)");
-        
+
         // 証明書を memfd に書き込み
-        let (cert_memfd, cert_path) = create_memfd_for_pem("tls_cert", &cert_pem)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, 
-                format!("Failed to create memfd for cert: {}", e)))?;
-        
+        let (cert_memfd, cert_path) = create_memfd_for_pem("tls_cert", &cert_pem).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("Failed to create memfd for cert: {}", e),
+            )
+        })?;
+
         // quiche が証明書を読み込む
-        quic_config.load_cert_chain_from_pem_file(&cert_path)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, 
-                format!("cert load error (memfd): {}", e)))?;
-        
+        quic_config
+            .load_cert_chain_from_pem_file(&cert_path)
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("cert load error (memfd): {}", e),
+                )
+            })?;
+
         // 証明書 memfd を即座にドロップ（fd を閉じてカーネルにメモリ解放を依頼）
         drop(cert_memfd);
-        
+
         // 証明書データをセキュアにゼロ化
         secure_zero(&mut cert_pem);
         drop(cert_pem);
         debug!("[HTTP/3] Certificate data securely zeroed and released");
-        
+
         // 秘密鍵を memfd に書き込み
-        let (key_memfd, key_path) = create_memfd_for_pem("tls_key", &key_pem)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, 
-                format!("Failed to create memfd for key: {}", e)))?;
-        
+        let (key_memfd, key_path) = create_memfd_for_pem("tls_key", &key_pem).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("Failed to create memfd for key: {}", e),
+            )
+        })?;
+
         // quiche が秘密鍵を読み込む
-        quic_config.load_priv_key_from_pem_file(&key_path)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, 
-                format!("key load error (memfd): {}", e)))?;
-        
+        quic_config
+            .load_priv_key_from_pem_file(&key_path)
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("key load error (memfd): {}", e),
+                )
+            })?;
+
         // 秘密鍵 memfd を即座にドロップ
         drop(key_memfd);
-        
+
         // 秘密鍵データをセキュアにゼロ化
         secure_zero(&mut key_pem);
         drop(key_pem);
         debug!("[HTTP/3] Private key data securely zeroed and released");
-        
+
         info!("[HTTP/3] Certificates loaded, memfd closed, sensitive data zeroed");
     } else {
         // ファイルパスから直接ロード（後方互換性）
         info!("[HTTP/3] Loading certificates from file path (legacy mode)");
         warn!("[HTTP/3] Note: When using Landlock, add cert/key paths to landlock_read_paths");
-        
-        quic_config.load_cert_chain_from_pem_file(&config.cert_path)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, 
-                format!("cert load error: {}", e)))?;
-        
-        quic_config.load_priv_key_from_pem_file(&config.key_path)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, 
-                format!("key load error: {}", e)))?;
+
+        quic_config
+            .load_cert_chain_from_pem_file(&config.cert_path)
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("cert load error: {}", e),
+                )
+            })?;
+
+        quic_config
+            .load_priv_key_from_pem_file(&config.key_path)
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("key load error: {}", e),
+                )
+            })?;
     }
 
     // QUIC パラメータを設定
@@ -1733,7 +2093,8 @@ pub async fn run_http3_server_async(
     quic_config.enable_early_data();
 
     // HTTP/3 用の ALPN を設定
-    quic_config.set_application_protos(h3::APPLICATION_PROTOCOL)
+    quic_config
+        .set_application_protos(h3::APPLICATION_PROTOCOL)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
     // 設定を Rc で共有（quiche::Config は Clone できないため）
@@ -1743,19 +2104,26 @@ pub async fn run_http3_server_async(
     // SO_REUSEPORT を設定して複数ワーカーで並列処理を可能に
     // GSO/GRO は config.gso_gro_enabled に基づいて設定
     let socket = QuicUdpSocket::bind_reuseport_with_gso(bind_addr, config.gso_gro_enabled)?;
-    info!("[HTTP/3] GSO enabled: {}, GRO enabled: {} (config gso_gro_enabled: {})", 
-        socket.gso_enabled(), socket.gro_enabled(), config.gso_gro_enabled);
+    info!(
+        "[HTTP/3] GSO enabled: {}, GRO enabled: {} (config gso_gro_enabled: {})",
+        socket.gso_enabled(),
+        socket.gro_enabled(),
+        config.gso_gro_enabled
+    );
     let socket = Rc::new(socket);
     let local_addr = bind_addr;
 
-    info!("[HTTP/3] Server listening on {} (QUIC/UDP, monoio io_uring)", bind_addr);
+    info!(
+        "[HTTP/3] Server listening on {} (QUIC/UDP, monoio io_uring)",
+        bind_addr
+    );
 
     // コネクション管理
     let connections: ConnectionMap = Rc::new(RefCell::new(HashMap::new()));
 
     // 乱数生成器
     let rng = SystemRandom::new();
-    
+
     // ルーティング設定を CURRENT_CONFIG から取得（ホットリロード対応）
 
     // メインループ: パケット受信とディスパッチ
@@ -1763,7 +2131,7 @@ pub async fn run_http3_server_async(
         // シャットダウンチェック
         if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
             info!("[HTTP/3] Initiating graceful shutdown...");
-            
+
             // 全QUICコネクションにGOAWAYを送信
             {
                 let conns = connections.borrow();
@@ -1772,23 +2140,26 @@ pub async fn run_http3_server_async(
                     info!("[HTTP/3] Sending GOAWAY to {} connections", conn_count);
                 }
             }
-            
+
             // コネクションが完了するまで待機（タイムアウト付き）
             let drain_timeout = Duration::from_secs(30);
             let drain_start = std::time::Instant::now();
-            
+
             loop {
                 let active_count = connections.borrow().len();
                 if active_count == 0 {
                     info!("[HTTP/3] All connections drained");
                     break;
                 }
-                
+
                 if drain_start.elapsed() > drain_timeout {
-                    warn!("[HTTP/3] Drain timeout, {} connections still active", active_count);
+                    warn!(
+                        "[HTTP/3] Drain timeout, {} connections still active",
+                        active_count
+                    );
                     break;
                 }
-                
+
                 // タイムアウト処理を継続
                 {
                     let mut conns = connections.borrow_mut();
@@ -1803,18 +2174,19 @@ pub async fn run_http3_server_async(
                         conns.remove(&cid);
                     }
                 }
-                
-                monoio::time::sleep(Duration::from_millis(100)).await;
+
+                crate::runtime::time::sleep(Duration::from_millis(100)).await;
             }
-            
+
             info!("[HTTP/3] Shutdown complete");
             break Ok(());
         }
-        
+
         // 最小タイムアウトを計算
         let timeout_duration = {
             let conns = connections.borrow();
-            conns.values()
+            conns
+                .values()
                 .filter_map(|h| h.conn.timeout())
                 .min()
                 .unwrap_or(Duration::from_millis(100))
@@ -1823,7 +2195,8 @@ pub async fn run_http3_server_async(
         // タイムアウト付きでパケット受信
         // QuicUdpSocket の recv_from メソッドを直接使用
         let recv_buf = vec![0u8; 65536];
-        let recv_result = monoio::time::timeout(timeout_duration, socket.recv_from(recv_buf)).await;
+        let recv_result =
+            crate::runtime::time::timeout(timeout_duration, socket.recv_from(recv_buf)).await;
 
         // タイムアウト処理（常に実行）
         {
@@ -1874,7 +2247,7 @@ pub async fn run_http3_server_async(
             // コネクションを検索または作成
             let conn_id = {
                 let mut conns = connections.borrow_mut();
-                
+
                 if !conns.contains_key(&hdr.dcid) {
                     if hdr.ty != quiche::Type::Initial {
                         debug!("[HTTP/3] Non-initial packet for unknown connection");
@@ -1891,14 +2264,8 @@ pub async fn run_http3_server_async(
                     let scid = ConnectionId::from_ref(&scid).into_owned();
 
                     let mut config_ref = quic_config.borrow_mut();
-                    let conn = quiche::accept(
-                        &scid,
-                        None,
-                        local_addr,
-                        from,
-                        &mut config_ref,
-                    )
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    let conn = quiche::accept(&scid, None, local_addr, from, &mut config_ref)
+                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
                     debug!("[HTTP/3] New connection from {}", from);
 
@@ -1932,11 +2299,11 @@ pub async fn run_http3_server_async(
                     }
                 }
             }
-            
+
             // ハンドシェイクパケット送信（H3初期化前に送信することでCryptoFail回避）
             // recv()後、is_established()がtrueになる前にServer Helloを送信する必要がある
             send_pending_packets(&connections, &socket, local_addr).await;
-            
+
             // H3初期化とイベント処理（ハンドシェイクパケット送信後）
             {
                 let mut conns = connections.borrow_mut();
@@ -1973,7 +2340,7 @@ pub async fn run_http3_server_async(
 }
 
 /// 保留中のパケットを全コネクションに対して送信
-/// 
+///
 /// この関数はメインループで常に呼び出され、タイムアウト時でも
 /// ACKやレスポンスパケットを送信します。
 async fn send_pending_packets(
@@ -1984,7 +2351,7 @@ async fn send_pending_packets(
     let mut conns = connections.borrow_mut();
     let mut send_buf = vec![0u8; 1350];
     let mut closed = Vec::new();
-    
+
     for (cid, handler) in conns.iter_mut() {
         loop {
             let (write, send_info) = match handler.conn.send(&mut send_buf) {
@@ -2007,7 +2374,7 @@ async fn send_pending_packets(
             let send_data = send_buf[..write].to_vec();
             let socket_clone = socket.clone();
             let target = send_info.to;
-            
+
             // 非同期送信（spawn しない、直接 await）
             // QuicUdpSocket の send_to メソッドを直接使用
             match socket_clone.send_to(send_data, target).await {
@@ -2032,22 +2399,11 @@ async fn send_pending_packets(
 }
 
 /// HTTP/3 サーバーを起動（同期ラッパー）
-/// 
+///
 /// 別スレッドで monoio ランタイムを作成して実行します。
-pub fn run_http3_server(
-    bind_addr: SocketAddr,
-    config: Http3ServerConfig,
-) -> io::Result<()> {
-    use monoio::RuntimeBuilder;
-
-    let mut rt = RuntimeBuilder::<monoio::IoUringDriver>::new()
-        .enable_timer()
-        .build()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Runtime error: {}", e)))?;
-
-    rt.block_on(async move {
-        run_http3_server_async(bind_addr, config).await
-    })
+pub fn run_http3_server(bind_addr: SocketAddr, config: Http3ServerConfig) -> io::Result<()> {
+    // カスタム io_uring ランタイムで非同期 HTTP/3 サーバーを実行
+    crate::runtime::block_on(async move { run_http3_server_async(bind_addr, config).await })
 }
 
 // ====================
@@ -2059,9 +2415,13 @@ pub fn run_http3_server(
 /// バイト配列を受け取り、指定されたエンコーディングで圧縮して返します。
 /// 圧縮に失敗した場合は元のデータをそのまま返します。
 #[cfg(feature = "compression")]
-fn compress_body_h3(body: &[u8], encoding: AcceptedEncoding, compression: &CompressionConfig) -> Vec<u8> {
-    use flate2::Compression;
+fn compress_body_h3(
+    body: &[u8],
+    encoding: AcceptedEncoding,
+    compression: &CompressionConfig,
+) -> Vec<u8> {
     use flate2::write::GzEncoder;
+    use flate2::Compression;
     use std::io::Write;
 
     match encoding {
@@ -2107,14 +2467,18 @@ fn compress_body_h3(body: &[u8], encoding: AcceptedEncoding, compression: &Compr
 /// compression feature 無効時のスタブ
 #[cfg(not(feature = "compression"))]
 #[inline]
-fn compress_body_h3(body: &[u8], _encoding: AcceptedEncoding, _compression: &CompressionConfig) -> Vec<u8> {
+fn compress_body_h3(
+    body: &[u8],
+    _encoding: AcceptedEncoding,
+    _compression: &CompressionConfig,
+) -> Vec<u8> {
     body.to_vec()
 }
 
 /// HTTPレスポンスのヘッダー終端（\r\n\r\n）を探す
 fn find_header_end(data: &[u8]) -> Option<usize> {
     for i in 0..data.len().saturating_sub(3) {
-        if &data[i..i+4] == b"\r\n\r\n" {
+        if &data[i..i + 4] == b"\r\n\r\n" {
             return Some(i);
         }
     }

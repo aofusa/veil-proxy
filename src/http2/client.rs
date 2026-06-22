@@ -3,13 +3,13 @@
 //! HTTP/2 Prior Knowledge モードでバックエンドに接続するクライアント実装。
 //! RFC 7540 Section 3.4 に基づく実装。
 
+use crate::runtime::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
 use std::io;
-use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 
 use crate::http2::error::{Http2Error, Http2Result};
-use crate::http2::frame::{Frame, FrameHeader, FrameEncoder, FrameDecoder};
-use crate::http2::hpack::{HpackEncoder, HpackDecoder};
-use crate::http2::settings::{Http2Settings, defaults};
+use crate::http2::frame::{Frame, FrameDecoder, FrameEncoder, FrameHeader};
+use crate::http2::hpack::{HpackDecoder, HpackEncoder};
+use crate::http2::settings::{defaults, Http2Settings};
 
 /// HTTP/2 コネクションプリフェース (クライアントが送信)
 pub const CONNECTION_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -118,7 +118,10 @@ where
         let frame = self.read_frame().await?;
 
         match frame {
-            Frame::Settings { ack: false, settings } => {
+            Frame::Settings {
+                ack: false,
+                settings,
+            } => {
                 // サーバー設定を適用
                 for &(id, value) in &settings {
                     match id {
@@ -187,7 +190,7 @@ where
 
         for &(name, value) in headers {
             // 疑似ヘッダーとホップバイホップヘッダーをスキップ
-            if name.starts_with(b":") 
+            if name.starts_with(b":")
                 || name.eq_ignore_ascii_case(b"connection")
                 || name.eq_ignore_ascii_case(b"keep-alive")
                 || name.eq_ignore_ascii_case(b"transfer-encoding")
@@ -199,7 +202,9 @@ where
         }
 
         let end_stream = body.is_none() || body.map(|b| b.is_empty()).unwrap_or(true);
-        let header_block = self.hpack_encoder.encode(&header_list)
+        let header_block = self
+            .hpack_encoder
+            .encode(&header_list)
             .map_err(|e| Http2Error::HpackEncode(e.to_string()))?;
 
         // HEADERS フレームを送信
@@ -224,7 +229,12 @@ where
     }
 
     /// DATA フレームを送信
-    async fn send_data(&mut self, stream_id: u32, data: &[u8], end_stream: bool) -> Http2Result<()> {
+    async fn send_data(
+        &mut self,
+        stream_id: u32,
+        data: &[u8],
+        end_stream: bool,
+    ) -> Http2Result<()> {
         let max_frame_size = self.remote_settings.max_frame_size as usize;
         let mut offset = 0;
 
@@ -240,7 +250,9 @@ where
             }
             self.conn_send_window -= len;
 
-            let frame = self.frame_encoder.encode_data(stream_id, chunk, end_stream && is_last);
+            let frame = self
+                .frame_encoder
+                .encode_data(stream_id, chunk, end_stream && is_last);
             self.write_all(&frame).await?;
 
             offset += chunk_len;
@@ -264,13 +276,21 @@ where
             let frame = self.read_frame().await?;
 
             match frame {
-                Frame::Headers { stream_id: sid, end_stream, end_headers: _, header_block, .. } => {
+                Frame::Headers {
+                    stream_id: sid,
+                    end_stream,
+                    end_headers: _,
+                    header_block,
+                    ..
+                } => {
                     if sid != stream_id {
                         continue;
                     }
 
                     // ヘッダーをデコード
-                    let headers = self.hpack_decoder.decode(&header_block)
+                    let headers = self
+                        .hpack_decoder
+                        .decode(&header_block)
                         .map_err(|e| Http2Error::compression_error(e.to_string()))?;
 
                     if !headers_received {
@@ -296,7 +316,11 @@ where
                         return Ok(response);
                     }
                 }
-                Frame::Data { stream_id: sid, end_stream, data } => {
+                Frame::Data {
+                    stream_id: sid,
+                    end_stream,
+                    data,
+                } => {
                     if sid != stream_id {
                         continue;
                     }
@@ -309,13 +333,16 @@ where
 
                     // WINDOW_UPDATE を送信
                     if self.conn_recv_window < (defaults::CONNECTION_WINDOW_SIZE as i32 / 2) {
-                        let increment = defaults::CONNECTION_WINDOW_SIZE as i32 - self.conn_recv_window;
+                        let increment =
+                            defaults::CONNECTION_WINDOW_SIZE as i32 - self.conn_recv_window;
                         let wu_frame = self.frame_encoder.encode_window_update(0, increment as u32);
                         self.write_all(&wu_frame).await?;
                         self.conn_recv_window += increment;
 
                         // ストリームレベルも
-                        let wu_stream = self.frame_encoder.encode_window_update(stream_id, increment as u32);
+                        let wu_stream = self
+                            .frame_encoder
+                            .encode_window_update(stream_id, increment as u32);
                         self.write_all(&wu_stream).await?;
                     }
 
@@ -331,7 +358,10 @@ where
                     let ping_ack = self.frame_encoder.encode_ping(&data, true);
                     self.write_all(&ping_ack).await?;
                 }
-                Frame::Settings { ack: false, settings } => {
+                Frame::Settings {
+                    ack: false,
+                    settings,
+                } => {
                     // SETTINGS ACK を送信
                     for &(id, value) in &settings {
                         match id {
@@ -347,7 +377,10 @@ where
                 Frame::GoAway { .. } => {
                     return Err(Http2Error::ConnectionClosed);
                 }
-                Frame::RstStream { stream_id: sid, error_code } => {
+                Frame::RstStream {
+                    stream_id: sid,
+                    error_code,
+                } => {
                     if sid == stream_id {
                         return Err(Http2Error::stream_closed(stream_id, error_code));
                     }
@@ -365,7 +398,9 @@ where
         }
 
         // ヘッダーをデコード
-        let header = self.frame_decoder.decode_header(&self.read_buf[self.buf_start..])?;
+        let header = self
+            .frame_decoder
+            .decode_header(&self.read_buf[self.buf_start..])?;
         let total_len = FrameHeader::SIZE + header.length as usize;
 
         // ペイロードを確保
@@ -424,7 +459,7 @@ where
     }
 
     /// データを送信
-    /// 
+    ///
     /// monoio の write_all は成功時に全データ書き込みを保証するため、
     /// 成功時はループを抜ける実装が正しい。
     async fn write_all(&mut self, data: &[u8]) -> Http2Result<()> {
@@ -497,7 +532,6 @@ where
         use crate::grpc::framing::GrpcFrame;
         use crate::grpc::headers::format_grpc_timeout;
 
-
         let stream_id = self.next_stream_id;
         self.next_stream_id += 2;
 
@@ -520,17 +554,15 @@ where
             header_list.push((b"grpc-timeout", timeout_str.as_bytes(), false));
         }
 
-        let header_block = self.hpack_encoder.encode(&header_list)
+        let header_block = self
+            .hpack_encoder
+            .encode(&header_list)
             .map_err(|e| Http2Error::HpackEncode(e.to_string()))?;
 
         // HEADERS フレームを送信 (end_stream=false, body follows)
-        let headers_frame = self.frame_encoder.encode_headers(
-            stream_id,
-            &header_block,
-            false,
-            true,
-            None,
-        );
+        let headers_frame =
+            self.frame_encoder
+                .encode_headers(stream_id, &header_block, false, true, None);
         self.write_all(&headers_frame).await?;
 
         // DATA フレームを送信 (end_stream=true)
@@ -559,12 +591,20 @@ where
             let frame = self.read_frame().await?;
 
             match frame {
-                Frame::Headers { stream_id: sid, end_stream, end_headers: _, header_block, .. } => {
+                Frame::Headers {
+                    stream_id: sid,
+                    end_stream,
+                    end_headers: _,
+                    header_block,
+                    ..
+                } => {
                     if sid != stream_id {
                         continue;
                     }
 
-                    let headers = self.hpack_decoder.decode(&header_block)
+                    let headers = self
+                        .hpack_decoder
+                        .decode(&header_block)
                         .map_err(|e| Http2Error::compression_error(e.to_string()))?;
 
                     if !headers_received {
@@ -584,7 +624,8 @@ where
                         for header in headers {
                             if header.name == b"grpc-status" {
                                 if let Ok(s) = std::str::from_utf8(&header.value) {
-                                    response.grpc_status = s.parse().unwrap_or(2); // Unknown
+                                    response.grpc_status = s.parse().unwrap_or(2);
+                                    // Unknown
                                 }
                             } else if header.name == b"grpc-message" {
                                 response.grpc_message = GrpcStatus::decode_message(&header.value);
@@ -598,7 +639,11 @@ where
                         return Ok(response);
                     }
                 }
-                Frame::Data { stream_id: sid, end_stream, data } => {
+                Frame::Data {
+                    stream_id: sid,
+                    end_stream,
+                    data,
+                } => {
                     if sid != stream_id {
                         continue;
                     }
@@ -610,12 +655,15 @@ where
                     self.conn_recv_window -= data_len;
 
                     if self.conn_recv_window < (defaults::CONNECTION_WINDOW_SIZE as i32 / 2) {
-                        let increment = defaults::CONNECTION_WINDOW_SIZE as i32 - self.conn_recv_window;
+                        let increment =
+                            defaults::CONNECTION_WINDOW_SIZE as i32 - self.conn_recv_window;
                         let wu_frame = self.frame_encoder.encode_window_update(0, increment as u32);
                         self.write_all(&wu_frame).await?;
                         self.conn_recv_window += increment;
 
-                        let wu_stream = self.frame_encoder.encode_window_update(stream_id, increment as u32);
+                        let wu_stream = self
+                            .frame_encoder
+                            .encode_window_update(stream_id, increment as u32);
                         self.write_all(&wu_stream).await?;
                     }
 
@@ -628,22 +676,28 @@ where
                     let ping_ack = self.frame_encoder.encode_ping(&data, true);
                     self.write_all(&ping_ack).await?;
                 }
-                    Frame::Settings { ack: false, settings } => {
-                        for &(id, value) in &settings {
-                            match id {
-                                0x1 => self.hpack_encoder.set_max_table_size(value as usize),
-                                0x4 => self.remote_settings.initial_window_size = value,
-                                0x5 => self.remote_settings.max_frame_size = value,
-                                _ => {}
-                            }
+                Frame::Settings {
+                    ack: false,
+                    settings,
+                } => {
+                    for &(id, value) in &settings {
+                        match id {
+                            0x1 => self.hpack_encoder.set_max_table_size(value as usize),
+                            0x4 => self.remote_settings.initial_window_size = value,
+                            0x5 => self.remote_settings.max_frame_size = value,
+                            _ => {}
                         }
-                        let ack_frame = self.frame_encoder.encode_settings_ack();
-                        self.write_all(&ack_frame).await?;
                     }
+                    let ack_frame = self.frame_encoder.encode_settings_ack();
+                    self.write_all(&ack_frame).await?;
+                }
                 Frame::GoAway { .. } => {
                     return Err(Http2Error::ConnectionClosed);
                 }
-                Frame::RstStream { stream_id: sid, error_code } => {
+                Frame::RstStream {
+                    stream_id: sid,
+                    error_code,
+                } => {
                     if sid == stream_id {
                         return Err(Http2Error::stream_closed(stream_id, error_code));
                     }
