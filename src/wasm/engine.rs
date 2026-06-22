@@ -79,6 +79,8 @@ impl FilterEngine {
         let mut current_headers = headers;
 
         for module in modules {
+            // F-09: WASM フィルタ実行時間を計測
+            let _wasm_start = std::time::Instant::now();
             let result = self.execute_on_request_headers(
                 module,
                 path,
@@ -86,6 +88,11 @@ impl FilterEngine {
                 &current_headers,
                 client_ip,
                 end_of_stream,
+            );
+            crate::metrics::observe_wasm_filter_duration(
+                &module.name,
+                "request_headers",
+                _wasm_start.elapsed().as_secs_f64(),
             );
 
             match result {
@@ -368,8 +375,15 @@ impl FilterEngine {
 
         // Execute in reverse order for response
         for module in modules.iter().rev() {
+            // F-09: WASM フィルタ実行時間を計測
+            let _wasm_start = std::time::Instant::now();
             let result =
                 self.execute_on_response_headers(module, status, &current_headers, end_of_stream);
+            crate::metrics::observe_wasm_filter_duration(
+                &module.name,
+                "response_headers",
+                _wasm_start.elapsed().as_secs_f64(),
+            );
 
             match result {
                 Ok(ModuleResult::Continue { modified_headers }) => {

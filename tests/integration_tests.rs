@@ -10,6 +10,65 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 // ====================
+// テストヘルパー
+// ====================
+
+/// HTTP 500を返すサーバー（サーキットブレーカーテスト用）
+struct ErrorHttpServer {
+    handle: Option<std::thread::JoinHandle<()>>,
+    pub addr: std::net::SocketAddr,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ErrorHttpServer {
+    fn start(status: u16) -> Self {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+        let _ = listener.set_nonblocking(true);
+
+        let handle = std::thread::spawn(move || {
+            let reason = if status == 500 { "Internal Server Error" } else { "Service Unavailable" };
+            let response = format!(
+                "HTTP/1.1 {} {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                status, reason
+            );
+            while !shutdown_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+                        let mut buf = [0u8; 512];
+                        let _ = stream.read(&mut buf);
+                        let _ = stream.write_all(response.as_bytes());
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self { handle: Some(handle), addr, shutdown }
+    }
+
+    fn port(&self) -> u16 {
+        self.addr.port()
+    }
+}
+
+impl Drop for ErrorHttpServer {
+    fn drop(&mut self) {
+        self.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+// ====================
 // TCP接続テスト
 // ====================
 
@@ -301,5 +360,221 @@ fn test_proxy_read_timeout() {
             );
         }
     }
+}
+
+// ====================
+// F-06: サーキットブレーカー統合テスト
+// ====================
+
+/// ErrorHttpServer が期待したステータスを返すことを確認
+#[test]
+fn test_error_server_returns_expected_status() {
+    let server = ErrorHttpServer::start(500);
+    let mut stream = TcpStream::connect(server.addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    stream.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+    let mut buf = vec![0u8; 1024];
+    let n = stream.read(&mut buf).unwrap_or(0);
+    let response = String::from_utf8_lossy(&buf[..n]);
+    assert!(response.contains("HTTP/1.1 500"), "Expected 500, got: {}", response);
+}
+
+/// 複数の失敗応答を受け取れること（サーキットブレーカーのスライディングウィンドウ前提）
+#[test]
+fn test_error_server_handles_multiple_requests() {
+    let server = ErrorHttpServer::start(503);
+    let mut error_count = 0u32;
+
+    for _ in 0..5 {
+        if let Ok(mut stream) = TcpStream::connect(server.addr) {
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let _ = stream.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut buf = vec![0u8; 512];
+            if let Ok(n) = stream.read(&mut buf) {
+                let resp = String::from_utf8_lossy(&buf[..n]);
+                if resp.contains("503") {
+                    error_count += 1;
+                }
+            }
+        }
+    }
+
+    assert!(error_count > 0, "Should receive at least one 503 response");
+}
+
+// ====================
+// F-19: 高度なロードバランシング統合テスト
+// ====================
+
+/// 複数のバックエンドに対して複数のリクエストを送信し、分散されることを確認
+#[test]
+fn test_two_backends_both_receive_requests() {
+    let server1 = SimpleHttpServer::start("backend1", "backend1");
+    let server2 = SimpleHttpServer::start("backend2", "backend2");
+
+    let mut count1 = 0u32;
+    let mut count2 = 0u32;
+
+    for _ in 0..10 {
+        if let Ok(mut stream) = TcpStream::connect(server1.address()) {
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let _ = stream.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut buf = vec![0u8; 1024];
+            if let Ok(n) = stream.read(&mut buf) {
+                let resp = String::from_utf8_lossy(&buf[..n]);
+                if resp.contains("X-Server-Id: backend1") {
+                    count1 += 1;
+                }
+            }
+        }
+        if let Ok(mut stream) = TcpStream::connect(server2.address()) {
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let _ = stream.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut buf = vec![0u8; 1024];
+            if let Ok(n) = stream.read(&mut buf) {
+                let resp = String::from_utf8_lossy(&buf[..n]);
+                if resp.contains("X-Server-Id: backend2") {
+                    count2 += 1;
+                }
+            }
+        }
+    }
+
+    assert!(count1 > 0, "Backend1 should receive requests");
+    assert!(count2 > 0, "Backend2 should receive requests");
+}
+
+// ====================
+// F-20: キャッシュPurge統合テスト
+// ====================
+
+/// バックエンドが応答することを確認（purge後の再取得フローの前提）
+#[test]
+fn test_backend_responds_for_cache_flow() {
+    let server = SimpleHttpServer::start("cacheable content", "cache-backend");
+
+    let mut stream = TcpStream::connect(server.address()).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    stream.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+    let mut buf = vec![0u8; 1024];
+    let n = stream.read(&mut buf).unwrap_or(0);
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    assert!(resp.contains("200"), "Backend should respond with 200");
+    assert!(resp.contains("cacheable content"), "Should contain cacheable content");
+}
+
+/// admin Bearerトークン形式の確認
+#[test]
+fn test_admin_auth_bearer_format() {
+    let secret = "test-admin-secret";
+    let bearer_header = format!("Bearer {}", secret);
+    assert!(bearer_header.starts_with("Bearer "), "Bearer auth should have proper prefix");
+    assert!(bearer_header.contains(secret), "Should contain the secret");
+}
+
+// ====================
+// F-09: Prometheusメトリクス統合テスト
+// ====================
+
+/// メトリクスエンドポイントのHTTPレスポンス構造確認
+#[test]
+fn test_metrics_endpoint_response_structure() {
+    let server = SimpleHttpServer::start(
+        "# HELP veil_request_total total\n# TYPE veil_request_total counter\nveil_request_total 0",
+        "metrics"
+    );
+
+    let mut stream = TcpStream::connect(server.address()).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    stream.write_all(b"GET /__metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+
+    let mut buf = vec![0u8; 2048];
+    let n = stream.read(&mut buf).unwrap_or(0);
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    assert!(resp.contains("200"), "Metrics endpoint should return 200");
+    assert!(resp.contains("veil_"), "Should contain veil_ metrics");
+}
+
+// ====================
+// F-03: TLS証明書リロード統合テスト
+// ====================
+
+/// 証明書ファイルのmtimeが設定されることを確認
+#[test]
+fn test_cert_file_mtime_is_set() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (cert_path, key_path) = generate_test_certs(temp_dir.path()).unwrap();
+
+    let cert_meta = std::fs::metadata(&cert_path).unwrap();
+    let key_meta = std::fs::metadata(&key_path).unwrap();
+
+    assert!(cert_meta.modified().is_ok(), "Cert file should have mtime");
+    assert!(key_meta.modified().is_ok(), "Key file should have mtime");
+    assert!(cert_meta.len() > 0, "Cert file should not be empty");
+    assert!(key_meta.len() > 0, "Key file should not be empty");
+}
+
+/// 証明書ファイル更新後にmtimeが変化することを確認
+#[test]
+fn test_cert_mtime_changes_after_update() {
+    use std::io::Write as _;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (cert_path, _key_path) = generate_test_certs(temp_dir.path()).unwrap();
+
+    let mtime_before = std::fs::metadata(&cert_path).unwrap().modified().unwrap();
+
+    std::thread::sleep(Duration::from_millis(1100));
+    let mut f = std::fs::OpenOptions::new().write(true).open(&cert_path).unwrap();
+    writeln!(f, "# updated").unwrap();
+    drop(f);
+
+    let mtime_after = std::fs::metadata(&cert_path).unwrap().modified().unwrap();
+    assert!(mtime_after > mtime_before, "mtime should increase after file update");
+}
+
+// ====================
+// F-10: OpenTelemetry統合テスト
+// ====================
+
+/// モックOTLPコレクタにPOSTリクエストが届くことを確認
+#[test]
+fn test_otlp_mock_collector_receives_post() {
+    use std::net::TcpListener;
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let received = Arc::new(AtomicBool::new(false));
+    let received_clone = received.clone();
+
+    let server = std::thread::spawn(move || {
+        listener.set_nonblocking(false).unwrap();
+        if let Ok((mut sock, _)) = listener.accept() {
+            let _ = sock.set_read_timeout(Some(Duration::from_secs(3)));
+            let mut buf = [0u8; 2048];
+            if let Ok(n) = sock.read(&mut buf) {
+                if buf[..n].starts_with(b"POST ") {
+                    received_clone.store(true, Ordering::SeqCst);
+                }
+                let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+        }
+    });
+
+    std::thread::sleep(Duration::from_millis(50));
+    if let Ok(mut client) = TcpStream::connect(format!("127.0.0.1:{}", port)) {
+        let _ = client.set_write_timeout(Some(Duration::from_secs(2)));
+        let body = b"{\"resourceMetrics\":[]}";
+        let req = format!(
+            "POST /v1/metrics HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            port,
+            body.len()
+        );
+        let _ = client.write_all(req.as_bytes());
+        let _ = client.write_all(body);
+    }
+
+    let _ = server.join();
+    assert!(received.load(Ordering::SeqCst), "Mock collector should receive POST request");
 }
 

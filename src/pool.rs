@@ -281,16 +281,22 @@ impl HttpConnectionPool {
         if let Some(queue) = self.connections.get_mut(key) {
             while let Some(entry) = queue.pop_front() {
                 if entry.is_valid() {
+                    // F-09: コネクションプールヒットを記録
+                    crate::metrics::record_connection_pool_hit(key);
                     return Some(entry.stream);
                 }
                 // 無効な接続は破棄
             }
         }
+        // F-09: コネクションプールミスを記録
+        crate::metrics::record_connection_pool_miss(key);
         None
     }
 
     /// 接続をプールに返却（設定可能なパラメータ付き）
     pub(crate) fn put(&mut self, key: String, stream: TcpStream, max_idle: usize, idle_timeout_secs: u64) {
+        // F-09: メトリクス用にキーを保持（key は entry へムーブされるため）
+        let metric_key = key.clone();
         let queue = self.connections.entry(key).or_insert_with(VecDeque::new);
 
         // 古い接続を削除（設定可能な最大数を使用）
@@ -299,6 +305,8 @@ impl HttpConnectionPool {
         }
 
         queue.push_back(PooledConnection::new(stream, idle_timeout_secs));
+        // F-09: プールサイズを更新
+        crate::metrics::set_connection_pool_size(&metric_key, queue.len());
     }
 }
 
@@ -319,16 +327,22 @@ impl HttpsConnectionPool {
         if let Some(queue) = self.connections.get_mut(key) {
             while let Some(entry) = queue.pop_front() {
                 if entry.is_valid() {
+                    // F-09: コネクションプールヒットを記録
+                    crate::metrics::record_connection_pool_hit(key);
                     return Some(entry.stream);
                 }
                 // 無効な接続は破棄
             }
         }
+        // F-09: コネクションプールミスを記録
+        crate::metrics::record_connection_pool_miss(key);
         None
     }
 
     /// 接続をプールに返却（設定可能なパラメータ付き）
     pub(crate) fn put(&mut self, key: String, stream: ClientTls, max_idle: usize, idle_timeout_secs: u64) {
+        // F-09: メトリクス用にキーを保持（key は entry へムーブされるため）
+        let metric_key = key.clone();
         let queue = self.connections.entry(key).or_insert_with(VecDeque::new);
 
         // 古い接続を削除（設定可能な最大数を使用）
@@ -337,6 +351,8 @@ impl HttpsConnectionPool {
         }
 
         queue.push_back(PooledConnection::new(stream, idle_timeout_secs));
+        // F-09: プールサイズを更新
+        crate::metrics::set_connection_pool_size(&metric_key, queue.len());
     }
 }
 

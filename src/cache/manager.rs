@@ -301,6 +301,68 @@ impl CacheManager {
         }
         Ok(())
     }
+
+    // ====================
+    // F-20: キャッシュ Purge 機能
+    // ====================
+
+    /// キャッシュエントリを即座に無効化（完全一致）
+    ///
+    /// # Returns
+    /// 該当エントリが存在し削除された場合 true
+    pub fn purge_exact(&self, key: &CacheKey) -> bool {
+        let existed = self.index.contains(key);
+        self.invalidate(key);
+        if existed {
+            crate::metrics::record_cache_eviction("purge", 1);
+        }
+        existed
+    }
+
+    /// プレフィックスでキャッシュを無効化（F-20）
+    ///
+    /// パス（または host+path）が `prefix` で始まるエントリを削除する。
+    ///
+    /// # Returns
+    /// 削除されたエントリ数
+    pub fn purge_by_prefix(&self, prefix: &str) -> usize {
+        let n = self.index.invalidate_prefix(prefix);
+        if n > 0 {
+            crate::metrics::record_cache_eviction("purge", n);
+        }
+        n
+    }
+
+    /// ワイルドカードパターン（glob）でキャッシュを無効化（F-20）
+    ///
+    /// 例: `"/static/*.css"`, `"example.com/api/*"`
+    ///
+    /// # Returns
+    /// 削除されたエントリ数
+    pub fn purge_by_pattern(&self, pattern: &str) -> usize {
+        let n = self.index.invalidate_pattern(pattern);
+        if n > 0 {
+            crate::metrics::record_cache_eviction("purge", n);
+        }
+        n
+    }
+
+    /// 全キャッシュをクリア（F-20）
+    ///
+    /// # Returns
+    /// 削除されたエントリ数
+    pub fn purge_all(&self) -> usize {
+        let n = self.index.len();
+        self.index.clear();
+        self.memory.clear();
+        if let Some(ref disk) = self.disk {
+            let _ = disk.clear();
+        }
+        if n > 0 {
+            crate::metrics::record_cache_eviction("purge", n);
+        }
+        n
+    }
     
     /// 統計情報を取得
     pub fn stats(&self) -> CacheStats {
@@ -516,6 +578,66 @@ mod tests {
              b"no-cache".to_vec().into_boxed_slice()),
         ];
         assert!(!manager.is_request_cacheable(b"GET", "/api/products", &headers));
+    }
+
+    // ====================
+    // F-20: キャッシュ Purge のテスト
+    // ====================
+
+    fn store_entry(manager: &CacheManager, path: &str) {
+        let key = create_test_key(path);
+        manager.store(key, 200, vec![], b"body".to_vec());
+    }
+
+    #[test]
+    fn test_purge_exact() {
+        let manager = CacheManager::new(create_test_config()).unwrap();
+        let key = create_test_key("/exact");
+        manager.store(key.clone(), 200, vec![], b"body".to_vec());
+        assert!(manager.get(&key).is_some());
+
+        assert!(manager.purge_exact(&key));
+        assert!(manager.get(&key).is_none());
+        // 既に削除済みなら false
+        assert!(!manager.purge_exact(&key));
+    }
+
+    #[test]
+    fn test_purge_by_prefix() {
+        let manager = CacheManager::new(create_test_config()).unwrap();
+        store_entry(&manager, "/api/users");
+        store_entry(&manager, "/api/orders");
+        store_entry(&manager, "/static/app.css");
+
+        let purged = manager.purge_by_prefix("/api/");
+        assert_eq!(purged, 2);
+        assert!(manager.get(&create_test_key("/api/users")).is_none());
+        assert!(manager.get(&create_test_key("/static/app.css")).is_some());
+    }
+
+    #[test]
+    fn test_purge_by_pattern() {
+        let manager = CacheManager::new(create_test_config()).unwrap();
+        store_entry(&manager, "/static/app.css");
+        store_entry(&manager, "/static/theme.css");
+        store_entry(&manager, "/static/app.js");
+
+        // host+path 形式に対する glob
+        let purged = manager.purge_by_pattern("example.com/static/*.css");
+        assert_eq!(purged, 2);
+        assert!(manager.get(&create_test_key("/static/app.js")).is_some());
+    }
+
+    #[test]
+    fn test_purge_all() {
+        let manager = CacheManager::new(create_test_config()).unwrap();
+        store_entry(&manager, "/a");
+        store_entry(&manager, "/b");
+        store_entry(&manager, "/c");
+
+        let purged = manager.purge_all();
+        assert_eq!(purged, 3);
+        assert_eq!(manager.stats().entries, 0);
     }
 }
 

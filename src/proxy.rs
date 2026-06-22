@@ -107,6 +107,90 @@ impl SecurityCheckResult {
 /// 3. レートリミット（rate_limit_requests_per_min）
 /// 4. ボディサイズ制限（max_request_body_size）
 /// 
+/// 管理 API: キャッシュ Purge リクエストを処理する（F-20）
+///
+/// クエリパラメータをパースし、キャッシュマネージャーの purge メソッドを呼ぶ。
+/// 認証は呼び出し側で済ませておくこと。
+///
+/// 対応パラメータ:
+/// - `?key=<url-encoded-path>` : 完全一致 Purge（PURGE メソッド時は path 自体）
+/// - `?prefix=/api/`           : プレフィックス Purge
+/// - `?pattern=/static/*.css`  : glob パターン Purge
+/// - `?all=true`               : 全 Purge
+///
+/// PURGE メソッドの場合は、リクエストパス自体をプレフィックス Purge 対象にする。
+///
+/// # Returns
+/// HTTP/1.1 レスポンス（バイト列）
+fn handle_cache_purge(path_with_query: &str, is_purge_method: bool) -> Vec<u8> {
+    // クエリ文字列を分離
+    let (path_part, query) = match path_with_query.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (path_with_query, ""),
+    };
+
+    // クエリパラメータを解析
+    let mut key_param: Option<String> = None;
+    let mut prefix_param: Option<String> = None;
+    let mut pattern_param: Option<String> = None;
+    let mut all_param = false;
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        match k {
+            "key" => key_param = Some(url_decode(v)),
+            "prefix" => prefix_param = Some(url_decode(v)),
+            "pattern" => pattern_param = Some(url_decode(v)),
+            "all" => all_param = v.eq_ignore_ascii_case("true") || v == "1",
+            _ => {}
+        }
+    }
+
+    #[cfg(feature = "cache")]
+    {
+        let manager = match cache::get_global_cache() {
+            Some(m) => m,
+            None => {
+                return b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+            }
+        };
+
+        let purged: usize = if all_param {
+            manager.purge_all()
+        } else if let Some(prefix) = prefix_param {
+            manager.purge_by_prefix(&prefix)
+        } else if let Some(pattern) = pattern_param {
+            manager.purge_by_pattern(&pattern)
+        } else if let Some(key) = key_param {
+            // key はパス（プレフィックス一致として扱う）
+            manager.purge_by_prefix(&key)
+        } else if is_purge_method {
+            // PURGE メソッド: リクエストパスをプレフィックス Purge
+            manager.purge_by_prefix(path_part)
+        } else {
+            // パラメータ不足
+            return b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+        };
+
+        let body = format!("{{\"purged\":{}}}", purged);
+        let mut response = Vec::with_capacity(128 + body.len());
+        response.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ");
+        let mut num_buf = itoa::Buffer::new();
+        response.extend_from_slice(num_buf.format(body.len()).as_bytes());
+        response.extend_from_slice(b"\r\nConnection: close\r\n\r\n");
+        response.extend_from_slice(body.as_bytes());
+        response
+    }
+
+    #[cfg(not(feature = "cache"))]
+    {
+        let _ = (path_part, key_param, prefix_param, pattern_param, all_param, is_purge_method);
+        b"HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+    }
+}
+
 /// ## パフォーマンス
 /// 設定がデフォルトの場合、has_security_checks() で早期リターンし、
 /// オーバーヘッドを最小化。
@@ -943,6 +1027,14 @@ where
                     if let Err(e) = conn.send_grpc_trailers(stream_id, grpc_status, grpc_message).await {
                         warn!("[HTTP/2] H2C send trailers error (stream_id={}): {}", stream_id, e);
                         return None;
+                    }
+
+                    // F-09: gRPC リクエストメトリクスを記録
+                    {
+                        let grpc_method = std::str::from_utf8(path).unwrap_or("");
+                        let mut status_buf = itoa::Buffer::new();
+                        let status_str = status_buf.format(grpc_status);
+                        crate::metrics::record_grpc_request(grpc_method, status_str, &target.host);
                     }
                 }
                 #[cfg(not(feature = "grpc"))]
@@ -2432,6 +2524,55 @@ async fn handle_requests(
                     }
                 }
 
+                // 管理 API エンドポイントの処理（F-20: キャッシュ Purge）
+                // PURGE メソッド、または admin.path_prefix 配下の /cache/purge を処理する
+                {
+                    let config = CURRENT_CONFIG.load();
+                    let admin_config = &config.admin_config;
+                    let is_purge_method = method_bytes.as_ref() == b"PURGE";
+                    let admin_prefix = format!("{}/cache/purge", admin_config.path_prefix);
+                    let is_admin_purge_path = path_str.starts_with(&admin_prefix);
+
+                    if admin_config.enabled && (is_purge_method || is_admin_purge_path) {
+                        let start_instant = Instant::now();
+
+                        // IP制限チェック
+                        let response = if !admin_config.is_ip_allowed(client_ip) {
+                            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                        } else {
+                            // Authorization ヘッダーを取得
+                            let auth = headers_for_proxy.iter().find_map(|(name, value)| {
+                                if name.eq_ignore_ascii_case(b"authorization") {
+                                    std::str::from_utf8(value).ok()
+                                } else {
+                                    None
+                                }
+                            });
+
+                            if !admin_config.check_auth(auth) {
+                                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                            } else {
+                                handle_cache_purge(path_str, is_purge_method)
+                            }
+                        };
+
+                        let resp_size = response.len() as u64;
+                        let status = if response.starts_with(b"HTTP/1.1 200") {
+                            200
+                        } else if response.starts_with(b"HTTP/1.1 401") {
+                            401
+                        } else if response.starts_with(b"HTTP/1.1 403") {
+                            403
+                        } else {
+                            400
+                        };
+                        let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(response)).await;
+                        log_access(&method_bytes, &host_bytes, &path_bytes, &user_agent, 0, status, resp_size, start_instant);
+                        accumulated.clear();
+                        return;
+                    }
+                }
+
                 // Backend選択（統合ルーティング対応）
                 // パス/クエリ分離（スキャンを1回に統一）
                 let query_start_pos = path_bytes.iter().position(|&b| b == b'?');
@@ -3842,7 +3983,14 @@ async fn handle_proxy(
     
     // 接続カウンターを増加（Least Connections 用）
     server.acquire();
-    
+
+    // F-06: リクエスト結果記録用にサーバーのインデックスと開始時刻を記録
+    let resilience_server_idx = upstream_group
+        .servers
+        .iter()
+        .position(|s| std::ptr::eq(s, server));
+    let resilience_start = std::time::Instant::now();
+
     let target = &server.target;
     // コネクションプールキーの生成
     // HTTPS接続でSNI名が設定されている場合は、異なるSNI名は異なるプールとして扱う
@@ -4023,7 +4171,36 @@ async fn handle_proxy(
     
     // 接続カウンターを減少（Least Connections 用）
     server.release();
-    
+
+    // F-06: リクエスト結果をサーキットブレーカー・異常検知へ反映
+    if let Some(idx) = resilience_server_idx {
+        let latency_ms = resilience_start.elapsed().as_millis() as u64;
+        // 5xx をバックエンド障害として扱う
+        let success = match &result {
+            Some((_, status, _, _)) => *status < 500,
+            None => false,
+        };
+        upstream_group.record_outcome(idx, success, latency_ms);
+        #[cfg(feature = "metrics")]
+        {
+            if let Some(s) = upstream_group.servers.get(idx) {
+                if let Some(cb) = &s.circuit_breaker {
+                    crate::metrics::set_circuit_breaker_state(
+                        &upstream_group.name,
+                        cb.state_code(),
+                    );
+                }
+                if s.is_ejected() {
+                    crate::metrics::set_outlier_ejected(
+                        &upstream_group.name,
+                        &format!("{}:{}", s.target.host, s.target.port),
+                        true,
+                    );
+                }
+            }
+        }
+    }
+
     // stale-if-error: バックエンドエラー時にstaleキャッシュを返す
     if cache_config.stale_if_error {
         if let Some((mut client_stream, status_code, _, _)) = result {

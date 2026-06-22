@@ -28,9 +28,11 @@ A high-performance reverse proxy server using io_uring (monoio) and rustls.
 
 ### Proxy Features
 - **Connection Pool**: Latency reduction through backend connection reuse (HTTP/HTTPS support)
-- **Load Balancing**: Request distribution to multiple backends (Round Robin/Least Connections/IP Hash)
+- **Load Balancing**: Request distribution to multiple backends (Round Robin/Least Connections/IP Hash/Weighted/Consistent Hash)
 - **Health Check**: Automatic failover with HTTP/TLS-based active health checks
+- **Circuit Breaker & Retry**: Per-server circuit breaker (Closed→Open→HalfOpen), outlier detection/ejection, EWMA latency tracking (requires `metrics` feature)
 - **Proxy Cache**: Memory and disk-based response caching (ETag/304, stale-while-revalidate, stale-if-error)
+- **Cache Purge Admin API**: Cache invalidation via HTTP (`PURGE` method or `POST /__admin/cache/purge`) with exact/prefix/glob/all modes and Bearer token auth
 - **Buffering Control**: Response buffering to prevent slow clients from blocking backends (Streaming/Full/Adaptive modes)
 - **WebSocket Support**: Bidirectional proxy with Upgrade header detection (Fixed/Adaptive polling modes)
 - **H2C Client**: HTTP/2 backend connection without TLS (gRPC support)
@@ -59,10 +61,12 @@ A high-performance reverse proxy server using io_uring (monoio) and rustls.
 ### Operations
 - **Graceful Shutdown**: Safe termination via SIGINT/SIGTERM
 - **Graceful Reload**: Hot reload configuration via SIGHUP (zero downtime)
+- **TLS Certificate Hot Reload**: Zero-downtime certificate rotation via mtime detection + ArcSwap; existing connections use old cert, new handshakes pick up new cert automatically
 - **Panic Recovery**: Connection-level panic catching to recovery worker thread (only affected connection terminates)
 - **Async Logging**: High-performance async logging with ftlog
 - **Config Validation**: Detailed configuration file validation at startup
-- **Prometheus Metrics**: Export request counts, latency, active connections, upstream health, etc. via metrics endpoint (requires configuration, disabled by default)
+- **Prometheus Metrics**: Export request counts, latency, active connections, upstream health, circuit breaker state, connection pool stats, gRPC/WASM durations, etc. via metrics endpoint (requires configuration, disabled by default); runtime enable/disable without restart
+- **OpenTelemetry (OTLP/HTTP)**: Push Prometheus metrics to any OTLP-compatible collector (Grafana Tempo, Jaeger, etc.) via a dedicated std thread — fully tokio-free (requires `opentelemetry` feature)
 
 ### Security
 - **HTTP to HTTPS Redirect**: Automatic 301 redirect from HTTP to HTTPS
@@ -1306,6 +1310,8 @@ Supports request distribution to multiple backend servers.
 | `round_robin` | Distribute in order (default) | General purpose |
 | `least_conn` | Select server with fewest connections | Long-lived connections |
 | `ip_hash` | Hash by client IP | Session persistence |
+| `weighted` | Weighted round robin proportional to `weight` | Heterogeneous server capacities |
+| `consistent_hash` | 150-vnode consistent hash ring (xxh3) | Cache locality, sticky routing |
 
 ### Configuration Examples
 
@@ -1345,6 +1351,46 @@ servers = [
   "https://api.example.com:443"
 ]
 ```
+
+#### Weighted Round Robin
+
+Route more traffic to higher-capacity servers by assigning relative weights:
+
+```toml
+[upstreams."weighted-api"]
+algorithm = "weighted"
+servers = [
+  { url = "http://api1:8080", weight = 3 },  # receives 75% of traffic
+  { url = "http://api2:8080", weight = 1 },  # receives 25% of traffic
+]
+```
+
+> **Note**: `weight = 0` is treated as `weight = 1` (minimum). Offsets are built at startup — selection is lock-free (atomic fetch_add + binary search).
+
+#### Consistent Hash
+
+Route requests from the same source to the same backend (sticky routing):
+
+```toml
+# Hash by client IP (default)
+[upstreams."ch-pool"]
+algorithm = "consistent_hash"
+servers = ["http://cache1:8080", "http://cache2:8080", "http://cache3:8080"]
+
+# Hash by HTTP header value
+[upstreams."ch-by-user"]
+algorithm = "consistent_hash"
+hash_key = "header:X-User-Id"
+servers = ["http://shard1:8080", "http://shard2:8080"]
+
+# Hash by Cookie value
+[upstreams."ch-by-session"]
+algorithm = "consistent_hash"
+hash_key = "cookie:session_id"
+servers = ["http://node1:8080", "http://node2:8080"]
+```
+
+> **Note**: Uses a 150-vnode ring per server (xxh3 hash). When a server becomes unhealthy it is excluded and the next node in the ring takes over.
 
 ### Compatibility with Single Backend
 
@@ -1443,6 +1489,112 @@ Health status changes are logged:
 [INFO] Upstream api1.internal:8080 is now unhealthy
 [INFO] Upstream api1.internal:8080 is now healthy
 ```
+
+## Circuit Breaker & Resilience
+
+Per-server circuit breaker, outlier detection, and EWMA latency tracking protect upstream servers from cascading failures.
+
+### Circuit Breaker State Machine
+
+```
+Closed ──(failure_threshold exceeded)──▶ Open
+  ▲                                         │
+  │                                  (open_duration_secs)
+  │                                         │
+  └──(success_threshold successes)── HalfOpen ◀─(probe fails)──┐
+                                         │                      │
+                                         └──(probe succeeds)────┘
+```
+
+- **Closed**: Normal operation. Failures are tracked in a sliding window.
+- **Open**: All requests are rejected immediately (fast-fail). After `open_duration_secs`, transitions to HalfOpen.
+- **HalfOpen**: A limited number of probe requests are allowed. On sufficient successes → Closed. On failure → Open again.
+
+When **all** servers in a pool have open circuit breakers, the pool falls back to healthy servers to avoid complete service unavailability.
+
+### Configuration
+
+```toml
+[upstreams."api-pool"]
+algorithm = "round_robin"
+servers = ["http://api1:8080", "http://api2:8080"]
+
+  [upstreams."api-pool".circuit_breaker]
+  enabled = true
+  failure_threshold = 5       # Open after this many failures
+  failure_window_secs = 60    # Sliding window for failure counting
+  open_duration_secs = 30     # Stay Open for this many seconds
+  half_open_probes = 3        # Probe requests allowed in HalfOpen
+  success_threshold = 2       # Successes in HalfOpen to close
+  trip_on_timeout = true      # Count timeouts as failures
+```
+
+### Configuration Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `enabled` | Enable circuit breaker | `false` |
+| `failure_threshold` | Consecutive/window failures to open | `5` |
+| `failure_window_secs` | Sliding window duration | `60` |
+| `open_duration_secs` | How long to stay Open before HalfOpen | `30` |
+| `half_open_probes` | Number of probe requests in HalfOpen | `3` |
+| `success_threshold` | Successes in HalfOpen to close | `2` |
+| `trip_on_timeout` | Treat connection timeouts as failures | `true` |
+
+### Outlier Detection (Passive Ejection)
+
+In addition to the circuit breaker, individual servers can be passively ejected based on error rate:
+
+```toml
+  [upstreams."api-pool".outlier_detection]
+  enabled = true
+  error_rate_threshold = 0.5  # Eject if error rate exceeds 50%
+  interval_secs = 10          # Evaluation interval
+  base_ejection_time_secs = 30  # Base ejection duration
+  max_ejection_percent = 50   # At most 50% of servers ejected simultaneously
+```
+
+### Prometheus Metrics (Circuit Breaker)
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `veil_circuit_breaker_open_total` | Counter | Total number of CB open events per upstream/server |
+| `veil_circuit_breaker_state` | Gauge | Current CB state (0=Closed, 1=Open, 2=HalfOpen) |
+| `veil_retry_total` | Counter | Total retry attempts |
+| `veil_outlier_ejected` | Gauge | 1 if server is currently ejected |
+
+## TLS Certificate Hot Reload
+
+Zero-downtime certificate rotation without restarting the proxy.
+
+### How It Works
+
+- A background thread polls certificate file `mtime` every `reload_interval_secs` seconds.
+- When a change is detected, the new certificate is loaded into an `ArcSwap`.
+- **Existing TLS connections** continue using the old certificate (no disruption).
+- **New TLS handshakes** automatically pick up the new certificate.
+- A `SIGHUP` signal also triggers an immediate reload of both config and certificates.
+
+### Configuration
+
+```toml
+[tls]
+cert_path = "/etc/veil/cert.pem"
+key_path  = "/etc/veil/key.pem"
+# Zero-downtime certificate hot-reload
+auto_reload = true
+reload_interval_secs = 60  # Poll interval (default: 60s)
+```
+
+### Let's Encrypt Integration
+
+```bash
+# Renew certificate (certbot)
+certbot renew --deploy-hook "touch /etc/veil/cert.pem"
+# veil detects the mtime change and reloads automatically
+```
+
+> **Note**: If Landlock sandbox is enabled, the certificate directory must be included in `landlock_read_paths`.
 
 ## Redirect
 
@@ -2532,6 +2684,28 @@ Use the `path` option to change the endpoint path.
 | `veil_proxy_cache_size_bytes` | Gauge | storage | Current cache size in bytes |
 | `veil_proxy_cache_entries` | Gauge | storage | Current number of cache entries |
 | `veil_proxy_buffering_used_total` | Counter | host | Total requests using buffering |
+| `veil_circuit_breaker_open_total` | Counter | upstream, server | CB open event count |
+| `veil_circuit_breaker_state` | Gauge | upstream, server | CB state (0=Closed, 1=Open, 2=HalfOpen) |
+| `veil_retry_total` | Counter | upstream, server | Retry attempt count |
+| `veil_outlier_ejected` | Gauge | upstream, server | Server ejection status (1=ejected) |
+| `veil_connection_pool_size` | Gauge | upstream | Current connection pool size |
+| `veil_connection_pool_hits_total` | Counter | upstream | Connection pool hit count |
+| `veil_connection_pool_misses_total` | Counter | upstream | Connection pool miss count |
+| `veil_grpc_requests_total` | Counter | upstream, method | gRPC request count |
+| `veil_grpc_stream_duration_seconds` | Histogram | upstream, method | gRPC stream duration |
+| `veil_wasm_filter_duration_seconds` | Histogram | module | WASM filter execution time |
+
+### Runtime Enable/Disable
+
+Prometheus metrics can be toggled at runtime without restarting:
+
+```rust
+// Internal API (used by admin/config reload)
+veil::metrics::set_metrics_runtime_enabled(false);  // Disable → endpoint returns 404
+veil::metrics::set_metrics_runtime_enabled(true);   // Re-enable
+```
+
+When disabled, the `/__metrics` endpoint returns `404 Not Found`. All recording functions become no-ops.
 
 ### Grafana Dashboard Examples
 
@@ -2596,6 +2770,117 @@ scrape_configs:
       insecure_skip_verify: true  # For self-signed certificates
     metrics_path: /__metrics
 ```
+
+## OpenTelemetry (OTLP/HTTP)
+
+Push Prometheus metrics to any OTLP-compatible collector without the heavy OpenTelemetry SDK (fully tokio-free).
+
+> **Requires**: `--features opentelemetry` (or `--features full`)
+
+### Architecture
+
+- A dedicated `std::thread` exports metrics on a configurable interval.
+- Bridges the internal Prometheus registry to OTLP/HTTP JSON (`POST /v1/metrics`).
+- Control messages (`Flush`, `Shutdown`) are sent via `std::sync::mpsc::channel` — no tokio involved.
+
+### Configuration
+
+```toml
+[opentelemetry]
+enabled = true
+endpoint = "http://localhost:4318"   # OTLP/HTTP collector endpoint
+service_name = "veil-proxy"          # service.name resource attribute
+batch_interval_secs = 30             # Export interval (default: 30s)
+```
+
+### Configuration Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `enabled` | Enable OTLP export | `false` |
+| `endpoint` | OTLP/HTTP endpoint URL | `http://localhost:4318` |
+| `service_name` | `service.name` resource attribute | `veil-proxy` |
+| `batch_interval_secs` | Export interval (seconds) | `30` |
+
+### Collector Compatibility
+
+Any OTLP/HTTP collector accepting JSON payloads:
+
+| Collector | Notes |
+|-----------|-------|
+| Grafana Alloy / Tempo | Set endpoint to `http://alloy:4318` |
+| Jaeger (v1.35+) | Enable OTLP receiver |
+| OpenTelemetry Collector | Standard OTLP/HTTP receiver |
+| Prometheus Remote Write | Via otel-collector `prometheusremotewrite` exporter |
+
+## Cache Purge Administration API
+
+Invalidate cached responses without restarting the proxy.
+
+> **Requires**: `--features cache` and `[admin]` section in config
+
+### Configuration
+
+```toml
+[admin]
+enabled = true
+path_prefix = "/__admin"    # Admin endpoint prefix
+secret = "changeme"         # Bearer token for authentication
+# allowed_ips = ["127.0.0.1", "::1", "10.0.0.0/8"]  # IP allowlist (empty = all IPs allowed)
+```
+
+### Purge Operations
+
+All purge requests require `Authorization: Bearer <secret>` header.
+
+| Method | Path | Query | Effect |
+|--------|------|-------|--------|
+| `PURGE` | any path | — | Purge exact cache entry matching path |
+| `POST` | `/__admin/cache/purge` | `key=/path` | Purge exact key |
+| `POST` | `/__admin/cache/purge` | `prefix=/api/` | Purge all entries with prefix |
+| `POST` | `/__admin/cache/purge` | `pattern=/static/*.css` | Purge by glob pattern |
+| `POST` | `/__admin/cache/purge` | `all=true` | Purge entire cache |
+
+**Response**: `{"purged": N}` where N is the number of entries removed.
+
+### Examples
+
+```bash
+# Purge a single page
+PURGE https://proxy.example.com/blog/post-1 \
+  -H "Authorization: Bearer changeme"
+
+# Purge all API responses
+curl -X POST "https://proxy.example.com/__admin/cache/purge?prefix=/api/" \
+  -H "Authorization: Bearer changeme"
+
+# Purge CSS files by glob
+curl -X POST "https://proxy.example.com/__admin/cache/purge?pattern=/static/*.css" \
+  -H "Authorization: Bearer changeme"
+
+# Purge everything
+curl -X POST "https://proxy.example.com/__admin/cache/purge?all=true" \
+  -H "Authorization: Bearer changeme"
+```
+
+### Access Control
+
+| Condition | Response |
+|-----------|----------|
+| Source IP not in `allowed_ips` | `403 Forbidden` |
+| No `Authorization` header | `401 Unauthorized` |
+| Wrong secret | `401 Unauthorized` |
+| Admin disabled | `404 Not Found` |
+| Success | `200 OK` with `{"purged": N}` |
+
+IP filtering is checked before authentication. When `allowed_ips` is empty (default), all IPs are allowed.
+
+| Format | Example |
+|--------|---------|
+| Single IPv4 | `127.0.0.1` |
+| IPv4 CIDR | `10.0.0.0/8` |
+| Single IPv6 | `::1` |
+| IPv6 CIDR | `fe80::/10` |
 
 ## Performance Tuning
 

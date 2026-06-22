@@ -212,6 +212,10 @@ pub mod metrics;
 
 pub mod constants;
 pub mod pool;
+pub mod resilience;
+/// OpenTelemetry OTLP/HTTP エクスポート（F-10）
+#[cfg(feature = "opentelemetry")]
+pub mod otel;
 pub mod http_utils;
 use crate::pool::*;
 #[cfg(test)]
@@ -241,6 +245,9 @@ use ktls_rustls::RustlsAcceptor;
 // kTLS 無効時は直接 rustls を使用するシンプルなラッパー
 #[cfg(not(feature = "ktls"))]
 mod simple_tls;
+
+/// TLS 証明書ホットリロード（F-03）
+pub mod tls_reload;
 
 // ClientTls は crate::pool モジュールで定義・再エクスポートされています
 // use crate::pool::* でインポート済み
@@ -344,7 +351,56 @@ fn main() {
     #[cfg(not(feature = "ktls"))]
     let acceptor = simple_tls::SimpleTlsAcceptor::new(loaded_config.tls_config.clone())
         .with_ktls(loaded_config.ktls_config.enabled);
-    
+
+    // F-03: グローバル TLS 設定を初期化（アクセプタが毎ハンドシェイク参照）
+    tls_reload::init_global_tls_config(loaded_config.tls_config.clone());
+
+    // F-10: OpenTelemetry エクスポータを起動（feature 有効かつ enabled 時のみ）
+    #[cfg(feature = "opentelemetry")]
+    {
+        let otel = &loaded_config.opentelemetry;
+        if otel.enabled {
+            otel::init_global(otel::OtelConfig {
+                enabled: true,
+                endpoint: otel.endpoint.clone(),
+                service_name: otel.service_name.clone(),
+                batch_interval_secs: otel.batch_interval_secs,
+            });
+            info!(
+                "OpenTelemetry enabled: exporting to {} (interval: {}s)",
+                otel.endpoint, otel.batch_interval_secs
+            );
+        }
+    }
+
+    // F-03: 証明書ホットリロードスレッドを起動（auto_reload 有効時のみ）
+    //
+    // 注意: Landlock サンドボックス適用後は証明書ファイルへの read が
+    // 制限される。auto_reload を使う場合は、Landlock の許可パスに証明書
+    // ディレクトリを含めるか、サンドボックスを無効化すること。
+    if loaded_config.tls_auto_reload {
+        let cert_path = std::path::PathBuf::from(&loaded_config.tls_cert_path);
+        let key_path = std::path::PathBuf::from(&loaded_config.tls_key_path);
+        let interval = loaded_config.tls_reload_interval_secs.max(1);
+        let ktls_enabled = loaded_config.ktls_config.enabled;
+        #[cfg(feature = "http2")]
+        let http2_enabled = loaded_config.http2_enabled;
+        #[cfg(not(feature = "http2"))]
+        let http2_enabled = false;
+        let builder: tls_reload::ServerConfigBuilder = Box::new(move |c, k| {
+            config::build_server_config_from_paths(c, k, ktls_enabled, http2_enabled)
+        });
+        match tls_reload::TlsCertReloader::new_global(cert_path, key_path, builder) {
+            Ok(reloader) => {
+                spawn_tls_reloader(reloader, interval);
+                info!("TLS certificate auto-reload enabled (interval: {}s, SIGHUP supported)", interval);
+            }
+            Err(e) => {
+                warn!("Failed to initialize TLS cert reloader: {}", e);
+            }
+        }
+    }
+
     let listen_addr = loaded_config.listen_addr.parse::<SocketAddr>()
         .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 443)));
     
@@ -362,6 +418,7 @@ fn main() {
         ktls_config: ktls_config.clone(),
         global_security: Arc::new(loaded_config.global_security.clone()),
         prometheus_config: Arc::new(loaded_config.prometheus_config.clone()),
+        admin_config: Arc::new(loaded_config.admin_config.clone()),
         upstream_groups: loaded_config.upstream_groups.clone(),
         #[cfg(feature = "http2")]
         http2_enabled: loaded_config.http2_enabled,
@@ -1065,6 +1122,10 @@ fn main() {
         }
     }
     
+    // F-10: OpenTelemetry エクスポータをクリーンに停止（最終 flush 込み）
+    #[cfg(feature = "opentelemetry")]
+    otel::shutdown_global();
+
     info!("Server shutdown complete");
 }
 
@@ -2089,16 +2150,19 @@ mod tests {
                     url: "http://server1:8080".into(), 
                     sni_name: None,
                     use_h2c: false,
+                    weight: 1,
                 },
                 UpstreamServerEntry { 
                     url: "http://server2:8080".into(), 
                     sni_name: None,
                     use_h2c: false,
+                    weight: 1,
                 },
                 UpstreamServerEntry { 
                     url: "http://server3:8080".into(), 
                     sni_name: None,
                     use_h2c: false,
+                    weight: 1,
                 },
             ]
         }
@@ -2139,6 +2203,7 @@ mod tests {
                     url: "invalid-url".into(), 
                     sni_name: None,
                     use_h2c: false,
+                    weight: 1,
                 },
             ];
             let group = UpstreamGroup::new(
@@ -2335,11 +2400,13 @@ mod tests {
                     url: "http://healthy:8080".into(), 
                     sni_name: None,
                     use_h2c: false,
+                    weight: 1,
                 },
                 UpstreamServerEntry { 
                     url: "http://unhealthy:8080".into(), 
                     sni_name: None,
                     use_h2c: false,
+                    weight: 1,
                 },
             ];
             let group = UpstreamGroup::new(
@@ -2370,11 +2437,13 @@ mod tests {
                     url: "http://server1:8080".into(), 
                     sni_name: None,
                     use_h2c: false,
+                    weight: 1,
                 },
                 UpstreamServerEntry { 
                     url: "http://server2:8080".into(), 
                     sni_name: None,
                     use_h2c: false,
+                    weight: 1,
                 },
             ];
             let group = UpstreamGroup::new(

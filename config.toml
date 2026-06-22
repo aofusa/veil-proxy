@@ -559,6 +559,52 @@ ktls_fallback_enabled = false
 # false: TCP_CORK無効（特定の低遅延要件がある場合）
 # tcp_cork_enabled = true
 
+# 証明書の0ダウンタイム自動リロード（F-03）
+# auto_reload = true で証明書/秘密鍵ファイルの mtime 変化を検知し、
+# 新しいハンドシェイクのみ新証明書を使用する（既存接続は影響なし）。
+# SIGHUP でも即時リロードされる。
+# 注意: Landlock サンドボックス有効時は証明書ディレクトリへの read を
+#       許可するか、サンドボックスを無効化する必要がある。
+# auto_reload = false
+# reload_interval_secs = 60
+
+
+# ==========================================
+# 管理 API（F-20: キャッシュ Purge）
+# ==========================================
+#
+# キャッシュの無効化（Purge）を行う管理エンドポイント。
+# secret は Authorization ヘッダー（Bearer <secret> または生の値）で検証する。
+#
+# 使用例:
+#   PURGE /path/to/page HTTP/1.1            （パスをプレフィックス Purge）
+#   POST  /__admin/cache/purge?prefix=/api/  （プレフィックス Purge）
+#   POST  /__admin/cache/purge?pattern=/static/*.css （glob Purge）
+#   POST  /__admin/cache/purge?all=true      （全 Purge）
+#   いずれも Authorization: Bearer <secret> が必要。レスポンス: {"purged": N}
+#
+# [admin]
+# enabled = true
+# path_prefix = "/__admin"
+# secret = "changeme"
+# # アクセスを許可するIPアドレス/CIDR（空の場合は全IPを許可）
+# allowed_ips = ["127.0.0.1", "::1", "10.0.0.0/8"]
+
+
+# ==========================================
+# OpenTelemetry（F-10 Phase 1: OTLP/HTTP メトリクス）
+# ==========================================
+#
+# opentelemetry feature 有効時のみ動作。専用の std スレッドで
+# Prometheus レジストリの値を OTLP/HTTP (JSON) として
+# <endpoint>/v1/metrics へ定期送信する（データプレーンは tokio-free）。
+#
+# [opentelemetry]
+# enabled = false
+# endpoint = "http://localhost:4318"
+# service_name = "veil-proxy"
+# batch_interval_secs = 30
+
 
 # ==========================================
 # バッファプール設定（メモリ最適化）
@@ -889,6 +935,40 @@ connection_window_size = 16777216
 #   - round_robin: ラウンドロビン（順番に振り分け、デフォルト）
 #   - least_conn: Least Connections（接続数が最小のサーバーを選択）
 #   - ip_hash: クライアントIPハッシュ（同一クライアントは同一サーバーへ）
+#   - weighted: 重み付きラウンドロビン（F-19、servers の weight に比例）
+#   - consistent_hash: コンシステントハッシュ（F-19、150 vnode リング）
+#       hash_key で "ip"(既定) / "header:X-User-Id" / "cookie:session_id" を指定
+#
+# Weighted / Consistent Hash / レジリエンス設定の例:
+# [upstreams."weighted-pool"]
+# algorithm = "weighted"
+# servers = [
+#   { url = "http://10.0.0.1:8080", weight = 3 },
+#   { url = "http://10.0.0.2:8080", weight = 1 },
+# ]
+#
+# [upstreams."ch-pool"]
+# algorithm = "consistent_hash"
+# hash_key = "header:X-User-Id"   # 省略時は "ip"
+# servers = ["http://10.0.0.1:8080", "http://10.0.0.2:8080"]
+#
+#   # サーキットブレーカー（F-06、サーバー単位）
+#   [upstreams."ch-pool".circuit_breaker]
+#   enabled = true
+#   failure_threshold = 5       # この失敗回数で Open
+#   failure_window_secs = 60
+#   open_duration_secs = 30     # Open 維持時間（経過後 HalfOpen）
+#   half_open_probes = 3
+#   success_threshold = 2       # HalfOpen でこの成功回数で Closed
+#   trip_on_timeout = true
+#
+#   # 異常検知（F-06、パッシブ Outlier Detection）
+#   [upstreams."ch-pool".outlier_detection]
+#   enabled = true
+#   error_rate_threshold = 0.5  # エラー率がこれを超えると排除
+#   interval_secs = 10
+#   base_ejection_time_secs = 30
+#   max_ejection_percent = 50
 #
 # 健康チェック設定（オプション）:
 #   interval_secs: チェック間隔（秒、デフォルト: 10）

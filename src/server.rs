@@ -47,6 +47,11 @@ pub fn setup_signal_handler() {
         } else {
             info!("SIGHUP handler registered for configuration hot reload");
         }
+
+        // F-03: SIGHUP で TLS_RELOAD_FLAG も立てる（証明書ホットリロード用）
+        if let Err(e) = signal_flag::register(SIGHUP, Arc::clone(&TLS_RELOAD_FLAG)) {
+            warn!("Failed to register SIGHUP handler for TLS reload: {}", e);
+        }
     }
 }
 
@@ -88,6 +93,46 @@ pub fn spawn_reload_thread() {
         }
 
         info!("Configuration reload thread stopped");
+    });
+}
+
+/// TLS 証明書リロードスレッドを起動（F-03）
+///
+/// 以下のタイミングで証明書を再読み込みする:
+/// - SIGHUP 受信時（TLS_RELOAD_FLAG）: 即座に reload_now()
+/// - 定期チェック（interval_secs ごと）: mtime 変化を検知して reload
+///
+/// リロードはグローバル ArcSwap を差し替えるため、既存接続は影響を受けず、
+/// 新規ハンドシェイクのみが新しい証明書を使用する。
+pub fn spawn_tls_reloader(mut reloader: crate::tls_reload::TlsCertReloader, interval_secs: u64) {
+    thread::spawn(move || {
+        info!("TLS certificate reload thread started");
+        let mut elapsed: u64 = 0;
+        loop {
+            thread::sleep(Duration::from_millis(500));
+            if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
+                break;
+            }
+
+            // SIGHUP による即時リロード
+            if TLS_RELOAD_FLAG.swap(false, Ordering::SeqCst) {
+                info!("SIGHUP received, reloading TLS certificate...");
+                match reloader.reload_now() {
+                    Ok(()) => info!("TLS certificate reloaded via SIGHUP"),
+                    Err(e) => error!("TLS certificate reload (SIGHUP) failed: {}", e),
+                }
+                elapsed = 0;
+                continue;
+            }
+
+            // 定期 mtime チェック
+            elapsed += 500;
+            if elapsed >= interval_secs * 1000 {
+                elapsed = 0;
+                reloader.check_and_reload();
+            }
+        }
+        info!("TLS certificate reload thread stopped");
     });
 }
 

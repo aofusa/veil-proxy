@@ -339,13 +339,13 @@ impl CacheIndex {
     /// 削除されたエントリ数
     pub fn invalidate_host(&self, host: &str) -> usize {
         let mut keys_to_remove = Vec::new();
-        
+
         for entry in self.entries.iter() {
             if entry.value().key.host() == host {
                 keys_to_remove.push(*entry.key());
             }
         }
-        
+
         let mut removed = 0;
         for hash in keys_to_remove {
             if let Some((_, entry)) = self.entries.remove(&hash) {
@@ -354,7 +354,37 @@ impl CacheIndex {
                 removed += 1;
             }
         }
-        
+
+        removed
+    }
+
+    /// パスのプレフィックスに一致するエントリを全て削除（F-20）
+    ///
+    /// マッチ対象は `path()`（パス部分）。プレフィックスが `/` を含まない
+    /// `host/path` 形式の場合は `host()+path()` 連結に対してもマッチする。
+    ///
+    /// # Returns
+    /// 削除されたエントリ数
+    pub fn invalidate_prefix(&self, prefix: &str) -> usize {
+        let mut keys_to_remove = Vec::new();
+
+        for entry in self.entries.iter() {
+            let k = &entry.value().key;
+            let full_path = format!("{}{}", k.host(), k.path());
+            if k.path().starts_with(prefix) || full_path.starts_with(prefix) {
+                keys_to_remove.push(*entry.key());
+            }
+        }
+
+        let mut removed = 0;
+        for hash in keys_to_remove {
+            if let Some((_, entry)) = self.entries.remove(&hash) {
+                self.entry_count.fetch_sub(1, Ordering::Relaxed);
+                self.memory_usage.fetch_sub(entry.entry.memory_usage(), Ordering::Relaxed);
+                removed += 1;
+            }
+        }
+
         removed
     }
 }

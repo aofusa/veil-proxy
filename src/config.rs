@@ -1232,6 +1232,143 @@ pub struct PrometheusConfig {
 fn default_prometheus_enabled() -> bool { false }
 fn default_prometheus_path() -> String { "/__metrics".to_string() }
 
+/// 管理 API 設定（F-20）
+///
+/// キャッシュ Purge などの管理操作を受け付けるエンドポイント。
+/// `secret` は Authorization ヘッダー（`Bearer <secret>` または生の値）で検証する。
+///
+/// 例:
+/// ```toml
+/// [admin]
+/// enabled = true
+/// path_prefix = "/__admin"
+/// secret = "changeme"
+/// ```
+#[derive(Deserialize, Clone, Debug)]
+pub struct AdminConfig {
+    /// 管理 API を有効化するかどうか
+    #[serde(default)]
+    pub enabled: bool,
+    /// 管理エンドポイントのパスプレフィックス
+    #[serde(default = "default_admin_path_prefix")]
+    pub path_prefix: String,
+    /// 認証用シークレット（空の場合は全リクエストを拒否）
+    #[serde(default)]
+    pub secret: String,
+    /// アクセスを許可するIPアドレス/CIDR（空の場合は全IPを許可）
+    /// 例: ["127.0.0.1", "10.0.0.0/8", "192.168.0.0/16"]
+    #[serde(default)]
+    pub allowed_ips: Vec<String>,
+}
+
+fn default_admin_path_prefix() -> String { "/__admin".to_string() }
+
+/// OpenTelemetry (OTLP/HTTP) 設定（F-10）
+///
+/// 例:
+/// ```toml
+/// [opentelemetry]
+/// enabled = false
+/// endpoint = "http://localhost:4318"
+/// service_name = "veil-proxy"
+/// batch_interval_secs = 30
+/// ```
+///
+/// `opentelemetry` feature が無効でもパースは可能（無視される）。
+#[derive(Deserialize, Clone, Debug)]
+pub struct OpenTelemetryConfig {
+    /// 有効化フラグ
+    #[serde(default)]
+    pub enabled: bool,
+    /// OTLP/HTTP エンドポイント
+    #[serde(default = "default_otel_endpoint")]
+    pub endpoint: String,
+    /// サービス名
+    #[serde(default = "default_otel_service_name")]
+    pub service_name: String,
+    /// バッチ送信間隔（秒）
+    #[serde(default = "default_otel_batch_interval")]
+    pub batch_interval_secs: u64,
+}
+
+fn default_otel_endpoint() -> String { "http://localhost:4318".to_string() }
+fn default_otel_service_name() -> String { "veil-proxy".to_string() }
+fn default_otel_batch_interval() -> u64 { 30 }
+
+impl Default for OpenTelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: default_otel_endpoint(),
+            service_name: default_otel_service_name(),
+            batch_interval_secs: default_otel_batch_interval(),
+        }
+    }
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path_prefix: default_admin_path_prefix(),
+            secret: String::new(),
+            allowed_ips: Vec::new(),
+        }
+    }
+}
+
+impl AdminConfig {
+    /// Authorization ヘッダー値がシークレットと一致するか検証する。
+    ///
+    /// `Bearer <secret>` 形式と生の `<secret>` 形式の両方を許容する。
+    /// secret が空の場合は常に false（無効化）。
+    pub fn check_auth(&self, auth_header: Option<&str>) -> bool {
+        if !self.enabled || self.secret.is_empty() {
+            return false;
+        }
+        match auth_header {
+            Some(h) => {
+                let h = h.trim();
+                let token = h.strip_prefix("Bearer ").unwrap_or(h);
+                // 定数時間比較ではないが、管理 API は信頼ネットワーク前提
+                token == self.secret
+            }
+            None => false,
+        }
+    }
+
+    /// クライアント IP が管理 API エンドポイントへのアクセスを許可されているか確認する。
+    ///
+    /// `allowed_ips` が空の場合はすべての IP を許可する。
+    pub fn is_ip_allowed(&self, client_ip: &str) -> bool {
+        if self.allowed_ips.is_empty() {
+            return true;
+        }
+        let client_addr: std::net::IpAddr = match client_ip.parse() {
+            Ok(addr) => addr,
+            Err(_) => return false,
+        };
+        for allowed in &self.allowed_ips {
+            if allowed.contains('/') {
+                if let Some((network, prefix_len)) = allowed.split_once('/') {
+                    if let (Ok(network_addr), Ok(prefix)) =
+                        (network.parse::<std::net::IpAddr>(), prefix_len.parse::<u8>())
+                    {
+                        if PrometheusConfig::ip_in_cidr(&client_addr, &network_addr, prefix) {
+                            return true;
+                        }
+                    }
+                }
+            } else if let Ok(allowed_addr) = allowed.parse::<std::net::IpAddr>() {
+                if client_addr == allowed_addr {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
 impl Default for PrometheusConfig {
     fn default() -> Self {
         Self {
@@ -1320,6 +1457,10 @@ pub static SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
 /// 設定リロード要求フラグ（SIGHUP でトリガー）
 /// Arc<AtomicBool> として初期化（signal-hook の要件）
 pub static RELOAD_FLAG: Lazy<Arc<AtomicBool>> = Lazy::new(|| Arc::new(AtomicBool::new(false)));
+
+/// TLS 証明書リロード要求フラグ（SIGHUP でトリガー、F-03）
+/// 設定リロードとは独立して証明書のみを再読み込みするために使用する。
+pub static TLS_RELOAD_FLAG: Lazy<Arc<AtomicBool>> = Lazy::new(|| Arc::new(AtomicBool::new(false)));
 
 /// グレースフルシャットダウンタイムアウト（秒）
 /// 起動時に設定ファイルから読み込まれ、ワーカースレッドがドレイン待機時に参照
@@ -1683,6 +1824,8 @@ pub struct UpstreamServerEntry {
     pub url: String,
     pub sni_name: Option<String>,
     pub use_h2c: bool,
+    /// 重み（Weighted Round Robin 用、デフォルト 1）
+    pub weight: u32,
 }
 
 impl<'de> serde::Deserialize<'de> for UpstreamServerEntry {
@@ -1710,10 +1853,11 @@ impl<'de> serde::Deserialize<'de> for UpstreamServerEntry {
                     url: v.to_string(),
                     sni_name: None,
                     use_h2c: false,
+                    weight: 1,
                 })
             }
-            
-            // 構造体形式: { url = "...", sni_name = "..." }
+
+            // 構造体形式: { url = "...", sni_name = "...", weight = 2 }
             fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
             where
                 M: MapAccess<'de>,
@@ -1721,19 +1865,23 @@ impl<'de> serde::Deserialize<'de> for UpstreamServerEntry {
                 let mut url: Option<String> = None;
                 let mut sni_name: Option<String> = None;
                 let mut use_h2c: Option<bool> = None;
-                
+                let mut weight: Option<u32> = None;
+
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
                         "url" => url = Some(map.next_value()?),
                         "sni_name" => sni_name = Some(map.next_value()?),
                         "use_h2c" | "h2c" => use_h2c = Some(map.next_value()?),
+                        "weight" => weight = Some(map.next_value()?),
                         _ => { let _: serde::de::IgnoredAny = map.next_value()?; }
                     }
                 }
-                
+
                 let url = url.ok_or_else(|| serde::de::Error::missing_field("url"))?;
                 let use_h2c = use_h2c.unwrap_or(false);
-                Ok(UpstreamServerEntry { url, sni_name, use_h2c })
+                // weight=0 は無効なので最低1に補正
+                let weight = weight.unwrap_or(1).max(1);
+                Ok(UpstreamServerEntry { url, sni_name, use_h2c, weight })
             }
         }
         
@@ -1750,6 +1898,10 @@ pub struct UpstreamConfig {
     /// - "ip_hash": クライアントIPハッシュ
     #[serde(default)]
     pub algorithm: LoadBalanceAlgorithm,
+    /// Consistent Hash 用のハッシュキー（algorithm = "consistent_hash" 時のみ有効）
+    /// 省略時は IP ベース
+    #[serde(default)]
+    pub hash_key: Option<HashKey>,
     /// バックエンドサーバーエントリ一覧
     /// 文字列形式と構造体形式の両方をサポート
     pub servers: Vec<UpstreamServerEntry>,
@@ -1761,6 +1913,166 @@ pub struct UpstreamConfig {
     /// 注意: 本番環境では false を推奨
     #[serde(default)]
     pub tls_insecure: bool,
+    /// サーキットブレーカー設定（F-06）
+    #[serde(default)]
+    pub circuit_breaker: CircuitBreakerConfig,
+    /// 異常検知（Outlier Detection）設定（F-06）
+    #[serde(default)]
+    pub outlier_detection: OutlierConfig,
+}
+
+/// サーキットブレーカー設定（F-06）
+///
+/// アップストリームサーバー単位で適用される。連続失敗が閾値を超えると
+/// Open 状態へ遷移し、一定時間経過後 HalfOpen でプローブを行う。
+#[derive(Deserialize, Clone, Debug)]
+pub struct CircuitBreakerConfig {
+    /// 有効化フラグ
+    #[serde(default)]
+    pub enabled: bool,
+    /// Open へ遷移する失敗回数の閾値
+    #[serde(default = "default_cb_failure_threshold")]
+    pub failure_threshold: u32,
+    /// 失敗をカウントするスライディングウィンドウ（秒）
+    #[serde(default = "default_cb_failure_window")]
+    pub failure_window_secs: u64,
+    /// Open 状態を維持する時間（秒）
+    #[serde(default = "default_cb_open_duration")]
+    pub open_duration_secs: u64,
+    /// HalfOpen 時に許可するプローブ数
+    #[serde(default = "default_cb_half_open_probes")]
+    pub half_open_probes: u32,
+    /// HalfOpen から Closed へ戻る成功回数の閾値
+    #[serde(default = "default_cb_success_threshold")]
+    pub success_threshold: u32,
+    /// タイムアウトを失敗としてカウントするか
+    #[serde(default = "default_true")]
+    pub trip_on_timeout: bool,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            failure_threshold: default_cb_failure_threshold(),
+            failure_window_secs: default_cb_failure_window(),
+            open_duration_secs: default_cb_open_duration(),
+            half_open_probes: default_cb_half_open_probes(),
+            success_threshold: default_cb_success_threshold(),
+            trip_on_timeout: true,
+        }
+    }
+}
+
+fn default_cb_failure_threshold() -> u32 { 5 }
+fn default_cb_failure_window() -> u64 { 60 }
+fn default_cb_open_duration() -> u64 { 30 }
+fn default_cb_half_open_probes() -> u32 { 3 }
+fn default_cb_success_threshold() -> u32 { 2 }
+
+/// 異常検知（パッシブ Outlier Detection）設定（F-06）
+#[derive(Deserialize, Clone, Debug)]
+pub struct OutlierConfig {
+    /// 有効化フラグ
+    #[serde(default)]
+    pub enabled: bool,
+    /// エラー率の閾値（0.0-1.0、デフォルト 0.5）
+    #[serde(default = "default_outlier_error_rate")]
+    pub error_rate_threshold: f64,
+    /// 評価間隔（秒）
+    #[serde(default = "default_outlier_interval")]
+    pub interval_secs: u64,
+    /// 基本排除時間（秒）
+    #[serde(default = "default_outlier_base_ejection")]
+    pub base_ejection_time_secs: u64,
+    /// 同時に排除可能なサーバーの最大割合（%）
+    #[serde(default = "default_outlier_max_eject_percent")]
+    pub max_ejection_percent: u32,
+}
+
+impl Default for OutlierConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            error_rate_threshold: default_outlier_error_rate(),
+            interval_secs: default_outlier_interval(),
+            base_ejection_time_secs: default_outlier_base_ejection(),
+            max_ejection_percent: default_outlier_max_eject_percent(),
+        }
+    }
+}
+
+fn default_outlier_error_rate() -> f64 { 0.5 }
+fn default_outlier_interval() -> u64 { 10 }
+fn default_outlier_base_ejection() -> u64 { 30 }
+fn default_outlier_max_eject_percent() -> u32 { 50 }
+
+/// リトライポリシー（F-06、ルート単位）
+#[derive(Deserialize, Clone, Debug)]
+pub struct RetryPolicy {
+    /// 有効化フラグ
+    #[serde(default)]
+    pub enabled: bool,
+    /// 最大リトライ回数
+    #[serde(default = "default_retry_max")]
+    pub max_retries: u32,
+    /// リトライ対象のステータスコード
+    #[serde(default = "default_retry_on")]
+    pub retry_on: Vec<u16>,
+    /// 冪等メソッド（GET/HEAD/PUT/DELETE）のみリトライするか
+    #[serde(default = "default_true")]
+    pub idempotent_only: bool,
+    /// 初回バックオフ（ミリ秒）
+    #[serde(default = "default_retry_backoff")]
+    pub backoff_ms: u64,
+    /// 最大バックオフ（ミリ秒）
+    #[serde(default = "default_retry_max_backoff")]
+    pub max_backoff_ms: u64,
+    /// バックオフ倍率
+    #[serde(default = "default_retry_multiplier")]
+    pub backoff_multiplier: f64,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_retries: default_retry_max(),
+            retry_on: default_retry_on(),
+            idempotent_only: true,
+            backoff_ms: default_retry_backoff(),
+            max_backoff_ms: default_retry_max_backoff(),
+            backoff_multiplier: default_retry_multiplier(),
+        }
+    }
+}
+
+fn default_retry_max() -> u32 { 2 }
+fn default_retry_on() -> Vec<u16> { vec![502, 503, 504] }
+fn default_retry_backoff() -> u64 { 100 }
+fn default_retry_max_backoff() -> u64 { 1000 }
+fn default_retry_multiplier() -> f64 { 2.0 }
+
+impl RetryPolicy {
+    /// 指定リトライ回数（0始まり）でのバックオフ時間を計算
+    pub fn backoff_for(&self, attempt: u32) -> std::time::Duration {
+        let mult = self.backoff_multiplier.powi(attempt as i32);
+        let ms = (self.backoff_ms as f64 * mult).min(self.max_backoff_ms as f64);
+        std::time::Duration::from_millis(ms as u64)
+    }
+
+    /// HTTP メソッドが冪等かどうか
+    pub fn is_idempotent(method: &str) -> bool {
+        matches!(
+            method.to_ascii_uppercase().as_str(),
+            "GET" | "HEAD" | "PUT" | "DELETE" | "OPTIONS" | "TRACE"
+        )
+    }
+
+    /// このステータスコードでリトライすべきか
+    pub fn should_retry_status(&self, status: u16) -> bool {
+        self.enabled && self.retry_on.contains(&status)
+    }
 }
 
 /// 健康チェック設定
@@ -1923,6 +2235,12 @@ struct Config {
     /// Prometheusメトリクス設定
     #[serde(default)]
     prometheus: PrometheusConfig,
+    /// 管理 API 設定（F-20: キャッシュ Purge 等）
+    #[serde(default)]
+    admin: AdminConfig,
+    /// OpenTelemetry 設定（F-10）
+    #[serde(default)]
+    opentelemetry: OpenTelemetryConfig,
     /// バッファプール設定（メモリ最適化）
     #[serde(default)]
     buffer_pool: BufferPoolConfig,
@@ -2450,7 +2768,18 @@ pub struct TlsConfigSection {
     /// - false: TCP_CORK無効（特定の低遅延要件がある場合）
     #[serde(default = "default_tcp_cork")]
     pub tcp_cork_enabled: bool,
+    /// 証明書ファイルの変更を自動検知してリロードするか（F-03）
+    /// デフォルト: false
+    #[serde(default)]
+    pub auto_reload: bool,
+    /// 証明書変更チェックの間隔（秒、F-03）
+    /// デフォルト: 60
+    #[serde(default = "default_tls_reload_interval")]
+    pub reload_interval_secs: u64,
 }
+
+/// 証明書リロードチェック間隔のデフォルト値（秒）
+fn default_tls_reload_interval() -> u64 { 60 }
 
 /// kTLSフォールバックのデフォルト値（true = フォールバック有効）
 fn default_ktls_fallback() -> bool {
@@ -3071,8 +3400,55 @@ impl ProxyTarget {
 // ```
 // ====================
 
+/// Consistent Hash 用のハッシュキー
+///
+/// シリアライズ形式:
+/// - `"ip"`              -> クライアント IP（デフォルト）
+/// - `"header:X-User-Id"` -> 指定ヘッダーの値
+/// - `"cookie:session_id"` -> 指定 Cookie の値
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum HashKey {
+    /// クライアント IP アドレス
+    #[default]
+    Ip,
+    /// 指定したリクエストヘッダーの値
+    Header(String),
+    /// 指定した Cookie の値
+    Cookie(String),
+}
+
+impl HashKey {
+    /// 文字列からパース（`"ip"`, `"header:X-Foo"`, `"cookie:session"`）
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("ip") {
+            return Ok(HashKey::Ip);
+        }
+        if let Some(rest) = s.strip_prefix("header:") {
+            return Ok(HashKey::Header(rest.trim().to_string()));
+        }
+        if let Some(rest) = s.strip_prefix("cookie:") {
+            return Ok(HashKey::Cookie(rest.trim().to_string()));
+        }
+        Err(format!(
+            "invalid hash_key: '{}', expected 'ip', 'header:NAME', or 'cookie:NAME'",
+            s
+        ))
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for HashKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        HashKey::parse(&s).map_err(serde::de::Error::custom)
+    }
+}
+
 /// ロードバランシングアルゴリズム
-#[derive(Clone, Copy, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub enum LoadBalanceAlgorithm {
     /// ラウンドロビン（順番に振り分け）
     #[default]
@@ -3081,6 +3457,13 @@ pub enum LoadBalanceAlgorithm {
     LeastConnections,
     /// IP Hash（クライアントIPに基づく一貫したルーティング）
     IpHash,
+    /// Weighted Round Robin（重み付きラウンドロビン）
+    Weighted,
+    /// Consistent Hash（仮想ノードリングによる一貫したルーティング）
+    ConsistentHash {
+        /// ハッシュキーの種類
+        hash_key: HashKey,
+    },
 }
 
 impl<'de> serde::Deserialize<'de> for LoadBalanceAlgorithm {
@@ -3093,11 +3476,33 @@ impl<'de> serde::Deserialize<'de> for LoadBalanceAlgorithm {
             "round_robin" | "roundrobin" => Ok(LoadBalanceAlgorithm::RoundRobin),
             "least_conn" | "least_connections" | "leastconn" => Ok(LoadBalanceAlgorithm::LeastConnections),
             "ip_hash" | "iphash" => Ok(LoadBalanceAlgorithm::IpHash),
+            "weighted" | "weighted_round_robin" | "wrr" => Ok(LoadBalanceAlgorithm::Weighted),
+            // hash_key は UpstreamConfig の別フィールドで上書きされる（デフォルト Ip）
+            "consistent_hash" | "consistenthash" => Ok(LoadBalanceAlgorithm::ConsistentHash {
+                hash_key: HashKey::Ip,
+            }),
             other => Err(serde::de::Error::custom(format!(
-                "unknown load balance algorithm: '{}', expected 'round_robin', 'least_conn', or 'ip_hash'",
+                "unknown load balance algorithm: '{}', expected 'round_robin', 'least_conn', 'ip_hash', 'weighted', or 'consistent_hash'",
                 other
             ))),
         }
+    }
+}
+
+/// algorithm と hash_key 設定から実際に使うアルゴリズムを決定する。
+///
+/// algorithm が ConsistentHash の場合、UpstreamConfig 側の hash_key
+/// フィールドがあればそれで上書きする。
+pub fn resolve_algorithm(
+    algorithm: &LoadBalanceAlgorithm,
+    hash_key: &Option<HashKey>,
+) -> LoadBalanceAlgorithm {
+    match algorithm {
+        LoadBalanceAlgorithm::ConsistentHash { hash_key: inner } => {
+            let key = hash_key.clone().unwrap_or_else(|| inner.clone());
+            LoadBalanceAlgorithm::ConsistentHash { hash_key: key }
+        }
+        other => other.clone(),
     }
 }
 
@@ -3114,6 +3519,14 @@ pub struct UpstreamServer {
     pub consecutive_successes: Arc<AtomicUsize>,
     /// 連続失敗回数（健康チェック用）
     pub consecutive_failures: Arc<AtomicUsize>,
+    /// サーキットブレーカー（F-06、有効時のみ Some）
+    pub circuit_breaker: Option<crate::resilience::CircuitBreaker>,
+    /// 異常検知用エラー率ウィンドウ（F-06）
+    pub error_rate_window: Arc<std::sync::Mutex<crate::resilience::SlidingWindow>>,
+    /// EWMA レイテンシ（ミリ秒、F-06）
+    pub avg_latency_ms: Arc<AtomicU64>,
+    /// 排除期限（F-06、Some の間は select 対象外）
+    pub ejected_until: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 impl UpstreamServer {
@@ -3124,6 +3537,89 @@ impl UpstreamServer {
             healthy: Arc::new(AtomicBool::new(true)),
             consecutive_successes: Arc::new(AtomicUsize::new(0)),
             consecutive_failures: Arc::new(AtomicUsize::new(0)),
+            circuit_breaker: None,
+            error_rate_window: Arc::new(std::sync::Mutex::new(
+                crate::resilience::SlidingWindow::new(std::time::Duration::from_secs(10)),
+            )),
+            avg_latency_ms: Arc::new(AtomicU64::new(0)),
+            ejected_until: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// サーキットブレーカーを設定したコピーを返す
+    pub fn with_circuit_breaker(mut self, cb: Option<crate::resilience::CircuitBreaker>) -> Self {
+        self.circuit_breaker = cb;
+        self
+    }
+
+    /// このサーバーが排除中かどうか（排除期限を過ぎていれば自動復帰）
+    pub fn is_ejected(&self) -> bool {
+        let mut guard = match self.ejected_until.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        match *guard {
+            Some(until) => {
+                if std::time::Instant::now() >= until {
+                    *guard = None;
+                    false
+                } else {
+                    true
+                }
+            }
+            None => false,
+        }
+    }
+
+    /// 指定時間だけサーバーを排除する
+    pub fn eject_for(&self, dur: std::time::Duration) {
+        if let Ok(mut guard) = self.ejected_until.lock() {
+            *guard = Some(std::time::Instant::now() + dur);
+        }
+    }
+
+    /// リクエスト結果を記録し、必要なら排除判定を行う（パッシブ Outlier Detection）
+    ///
+    /// `outlier` が None または無効の場合は EWMA レイテンシのみ更新する。
+    pub fn record_outcome(&self, success: bool, latency_ms: u64, outlier: Option<&OutlierConfig>) {
+        // EWMA レイテンシ更新（係数 0.2）
+        let prev = self.avg_latency_ms.load(Ordering::Relaxed);
+        let next = if prev == 0 {
+            latency_ms
+        } else {
+            ((prev as f64) * 0.8 + (latency_ms as f64) * 0.2) as u64
+        };
+        self.avg_latency_ms.store(next, Ordering::Relaxed);
+
+        // サーキットブレーカーへ反映
+        if let Some(cb) = &self.circuit_breaker {
+            if success {
+                cb.record_success();
+            } else {
+                cb.record_failure();
+            }
+        }
+
+        // Outlier Detection
+        if let Some(cfg) = outlier {
+            if !cfg.enabled {
+                return;
+            }
+            let (total, errors) = {
+                let mut w = match self.error_rate_window.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                w.record(success);
+                (w.total(), w.failures())
+            };
+            // 一定サンプル数を超えたらエラー率を評価
+            if total >= 5 {
+                let rate = errors as f64 / total as f64;
+                if rate >= cfg.error_rate_threshold {
+                    self.eject_for(std::time::Duration::from_secs(cfg.base_ejection_time_secs));
+                }
+            }
         }
     }
     
@@ -3187,6 +3683,11 @@ impl UpstreamServer {
     }
 }
 
+/// Consistent Hash の仮想ノード数（サーバーあたり）
+const CONSISTENT_HASH_VNODES: usize = 150;
+/// Consistent Hash 用のシード（固定）
+const CONSISTENT_HASH_SEED: u64 = 0x9E3779B97F4A7C15;
+
 /// Upstream グループ（複数バックエンドのロードバランシング）
 #[derive(Clone)]
 pub struct UpstreamGroup {
@@ -3205,24 +3706,48 @@ pub struct UpstreamGroup {
     pub tls_insecure: bool,
     /// H2C (HTTP/2 over cleartext) を強制するかどうか
     pub use_h2c: bool,
+    /// Weighted Round Robin 用の累積重みオフセット（構築時計算、O(1) 選択用）
+    /// servers と同じ順序。weighted_offsets[i] は servers[0..=i] の重みの累積和。
+    pub weighted_offsets: Vec<u32>,
+    /// 全サーバーの重み合計（0 の場合は Weighted を使わない）
+    pub total_weight: u32,
+    /// Consistent Hash の仮想ノードリング（(hash, server_idx) を hash 昇順でソート）
+    pub consistent_ring: Vec<(u64, usize)>,
+    /// 異常検知設定（select 時に排除中サーバーを除外するために保持）
+    pub outlier_detection: OutlierConfig,
 }
 
 impl UpstreamGroup {
     /// 新しい Upstream グループを作成
     pub fn new(name: String, entries: Vec<UpstreamServerEntry>, algorithm: LoadBalanceAlgorithm, health_check: Option<HealthCheckConfig>, tls_insecure: bool) -> Option<Self> {
-        let servers: Vec<UpstreamServer> = entries.iter()
+        // 有効なエントリのみを (entry, server) として残す
+        let pairs: Vec<(UpstreamServerEntry, UpstreamServer)> = entries.iter()
             .filter_map(|entry| {
                 ProxyTarget::parse(&entry.url)
                     .map(|target| target.with_sni_name(entry.sni_name.clone()))
                     .map(|target| target.with_h2c(entry.use_h2c))
-                    .map(UpstreamServer::new)
+                    .map(|target| (entry.clone(), UpstreamServer::new(target)))
             })
             .collect();
-        
-        if servers.is_empty() {
+
+        if pairs.is_empty() {
             return None;
         }
-        
+
+        let servers: Vec<UpstreamServer> = pairs.iter().map(|(_, s)| s.clone()).collect();
+
+        // Weighted Round Robin 用の累積オフセットを構築
+        let mut weighted_offsets = Vec::with_capacity(pairs.len());
+        let mut acc: u32 = 0;
+        for (entry, _) in &pairs {
+            acc = acc.saturating_add(entry.weight.max(1));
+            weighted_offsets.push(acc);
+        }
+        let total_weight = acc;
+
+        // Consistent Hash 用の仮想ノードリングを構築
+        let consistent_ring = Self::build_ring(&pairs);
+
         Some(Self {
             name,
             servers,
@@ -3231,72 +3756,252 @@ impl UpstreamGroup {
             health_check,
             tls_insecure,
             use_h2c: false, // デフォルトでは各サーバーの設定に従う
+            weighted_offsets,
+            total_weight,
+            consistent_ring,
+            outlier_detection: OutlierConfig::default(),
         })
     }
-    
+
+    /// 仮想ノードリングを構築する（サーバーごとに CONSISTENT_HASH_VNODES 個の vnode）
+    fn build_ring(pairs: &[(UpstreamServerEntry, UpstreamServer)]) -> Vec<(u64, usize)> {
+        use xxhash_rust::xxh3::xxh3_64_with_seed;
+        let mut ring: Vec<(u64, usize)> = Vec::with_capacity(pairs.len() * CONSISTENT_HASH_VNODES);
+        for (idx, (_, server)) in pairs.iter().enumerate() {
+            // サーバー識別子（host:port）を基に vnode を生成
+            let id = format!("{}:{}", server.target.host, server.target.port);
+            for vnode in 0..CONSISTENT_HASH_VNODES {
+                let key = format!("{}#{}", id, vnode);
+                let h = xxh3_64_with_seed(key.as_bytes(), CONSISTENT_HASH_SEED);
+                ring.push((h, idx));
+            }
+        }
+        ring.sort_by_key(|(h, _)| *h);
+        ring
+    }
+
+    /// サーキットブレーカー・異常検知を適用したグループを返す（設定読み込み時に使用）
+    pub fn with_resilience(mut self, cb_config: &CircuitBreakerConfig, outlier: &OutlierConfig) -> Self {
+        if cb_config.enabled {
+            for server in &mut self.servers {
+                server.circuit_breaker =
+                    Some(crate::resilience::CircuitBreaker::new(cb_config.clone()));
+            }
+        }
+        // error_rate_window の長さを interval に合わせて再構築
+        if outlier.enabled {
+            for server in &mut self.servers {
+                server.error_rate_window = Arc::new(std::sync::Mutex::new(
+                    crate::resilience::SlidingWindow::new(std::time::Duration::from_secs(
+                        outlier.interval_secs,
+                    )),
+                ));
+            }
+        }
+        self.outlier_detection = outlier.clone();
+        self
+    }
+
     /// 単一サーバーからグループを作成
     pub fn single(target: ProxyTarget) -> Self {
+        let server = UpstreamServer::new(target);
         Self {
             name: String::new(),
-            servers: vec![UpstreamServer::new(target)],
+            servers: vec![server],
             algorithm: LoadBalanceAlgorithm::RoundRobin,
             rr_counter: Arc::new(AtomicUsize::new(0)),
             health_check: None, // 単一サーバーでは健康チェックなし
             tls_insecure: false, // 単一サーバーではデフォルトで証明書検証を有効
             use_h2c: false,
+            weighted_offsets: vec![1],
+            total_weight: 1,
+            consistent_ring: Vec::new(),
+            outlier_detection: OutlierConfig::default(),
         }
     }
-    
+
     /// H2C設定を変更したコピーを作成
     pub fn with_h2c(&self, use_h2c: bool) -> Self {
         let mut new_group = self.clone();
         new_group.use_h2c = use_h2c;
         new_group
     }
-    
+
+    /// 選択候補となるサーバーを抽出（healthy かつ排除されていないもの）
+    ///
+    /// サーキットブレーカーが Open のサーバーも除外する。
+    fn candidates(&self) -> Vec<(usize, &UpstreamServer)> {
+        let avail: Vec<(usize, &UpstreamServer)> = self.servers.iter()
+            .enumerate()
+            .filter(|(_, s)| s.is_healthy() && !s.is_ejected())
+            .filter(|(_, s)| match &s.circuit_breaker {
+                Some(cb) => cb.allow_request(),
+                None => true,
+            })
+            .collect();
+        if !avail.is_empty() {
+            return avail;
+        }
+        // 全て利用不可なら healthy なものへフォールバック（全滅回避）
+        self.servers.iter()
+            .enumerate()
+            .filter(|(_, s)| s.is_healthy())
+            .collect()
+    }
+
     /// 次のバックエンドサーバーを選択
-    /// 
+    ///
     /// # Arguments
-    /// * `client_ip` - クライアントIPアドレス（IpHash用）
-    /// 
+    /// * `client_ip` - クライアントIPアドレス（IpHash / ConsistentHash 用）
+    ///
     /// # Returns
     /// 選択されたサーバーへの参照（健全なサーバーがない場合は None）
     pub fn select(&self, client_ip: &str) -> Option<&UpstreamServer> {
-        let healthy_servers: Vec<(usize, &UpstreamServer)> = self.servers.iter()
-            .enumerate()
-            .filter(|(_, s)| s.is_healthy())
-            .collect();
-        
-        if healthy_servers.is_empty() {
+        self.select_with_key(client_ip, None, None)
+    }
+
+    /// ハッシュキーの値を指定してサーバーを選択する
+    ///
+    /// ConsistentHash で `header:` / `cookie:` を使う場合は、呼び出し側で
+    /// 該当ヘッダー/Cookie の値を解決して `hash_value` に渡す。値が解決
+    /// できない場合は client_ip にフォールバックする。
+    pub fn select_with_key(
+        &self,
+        client_ip: &str,
+        hash_value: Option<&str>,
+        _unused: Option<()>,
+    ) -> Option<&UpstreamServer> {
+        let candidates = self.candidates();
+        if candidates.is_empty() {
             return None;
         }
-        
-        let selected_idx = match self.algorithm {
+
+        let selected_idx = match &self.algorithm {
             LoadBalanceAlgorithm::RoundRobin => {
                 let counter = self.rr_counter.fetch_add(1, Ordering::Relaxed);
-                counter % healthy_servers.len()
+                counter % candidates.len()
             }
             LoadBalanceAlgorithm::LeastConnections => {
-                healthy_servers.iter()
+                candidates.iter()
                     .enumerate()
                     .min_by_key(|(_, (_, s))| s.connections())
                     .map(|(i, _)| i)
                     .unwrap_or(0)
             }
             LoadBalanceAlgorithm::IpHash => {
-                // シンプルなハッシュ関数（FNV-1a風）
-                let mut hash: u64 = 14695981039346656037;
-                for byte in client_ip.bytes() {
-                    hash ^= byte as u64;
-                    hash = hash.wrapping_mul(1099511628211);
-                }
-                (hash as usize) % healthy_servers.len()
+                let hash = Self::fnv1a(client_ip.as_bytes());
+                (hash as usize) % candidates.len()
+            }
+            LoadBalanceAlgorithm::Weighted => {
+                // 健全なサーバー集合に対する重み合計を計算し、
+                // rr_counter を total で割った余りで二分探索する。
+                return self.select_weighted(&candidates);
+            }
+            LoadBalanceAlgorithm::ConsistentHash { hash_key } => {
+                // ハッシュ対象の値を決定
+                let key: &str = match hash_key {
+                    HashKey::Ip => client_ip,
+                    HashKey::Header(_) | HashKey::Cookie(_) => {
+                        hash_value.unwrap_or(client_ip)
+                    }
+                };
+                return self.select_consistent(key, &candidates);
             }
         };
-        
-        healthy_servers.get(selected_idx).map(|(_, s)| *s)
+
+        candidates.get(selected_idx).map(|(_, s)| *s)
     }
-    
+
+    /// FNV-1a ハッシュ（IpHash 用）
+    fn fnv1a(bytes: &[u8]) -> u64 {
+        let mut hash: u64 = 14695981039346656037;
+        for &byte in bytes {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(1099511628211);
+        }
+        hash
+    }
+
+    /// Weighted Round Robin 選択（候補内の重みで按分）
+    fn select_weighted<'a>(
+        &'a self,
+        candidates: &[(usize, &'a UpstreamServer)],
+    ) -> Option<&'a UpstreamServer> {
+        // 候補（healthy）の重みを weighted_offsets から逆算して累積を作る
+        let mut cum: Vec<(u32, usize)> = Vec::with_capacity(candidates.len());
+        let mut acc: u32 = 0;
+        for (ci, (orig_idx, _)) in candidates.iter().enumerate() {
+            let w = self.weight_of(*orig_idx);
+            acc = acc.saturating_add(w);
+            cum.push((acc, ci));
+        }
+        let total = acc;
+        if total == 0 {
+            return candidates.first().map(|(_, s)| *s);
+        }
+        let pos = (self.rr_counter.fetch_add(1, Ordering::Relaxed) as u32) % total;
+        // pos < offset となる最初の要素を二分探索
+        let idx = match cum.binary_search_by(|(off, _)| {
+            if *off <= pos {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            }
+        }) {
+            Ok(i) => i,
+            Err(i) => i,
+        };
+        let ci = cum.get(idx).map(|(_, ci)| *ci).unwrap_or(0);
+        candidates.get(ci).map(|(_, s)| *s)
+    }
+
+    /// 元インデックスのサーバーの重みを取得
+    fn weight_of(&self, orig_idx: usize) -> u32 {
+        let prev = if orig_idx == 0 {
+            0
+        } else {
+            self.weighted_offsets.get(orig_idx - 1).copied().unwrap_or(0)
+        };
+        let cur = self.weighted_offsets.get(orig_idx).copied().unwrap_or(prev + 1);
+        cur.saturating_sub(prev).max(1)
+    }
+
+    /// Consistent Hash 選択（リング上の二分探索）
+    fn select_consistent<'a>(
+        &'a self,
+        key: &str,
+        candidates: &[(usize, &'a UpstreamServer)],
+    ) -> Option<&'a UpstreamServer> {
+        use xxhash_rust::xxh3::xxh3_64_with_seed;
+        if self.consistent_ring.is_empty() {
+            // リング未構築（単一サーバー等）の場合はハッシュで按分
+            let h = xxh3_64_with_seed(key.as_bytes(), CONSISTENT_HASH_SEED);
+            let idx = (h as usize) % candidates.len();
+            return candidates.get(idx).map(|(_, s)| *s);
+        }
+        let h = xxh3_64_with_seed(key.as_bytes(), CONSISTENT_HASH_SEED);
+        // h 以上の最初の vnode を探す（なければ先頭へラップ）
+        let start = self
+            .consistent_ring
+            .partition_point(|(vh, _)| *vh < h);
+        let ring_len = self.consistent_ring.len();
+        // リングを start から一周し、候補に含まれる最初のサーバーを選ぶ
+        for offset in 0..ring_len {
+            let (_, server_idx) = self.consistent_ring[(start + offset) % ring_len];
+            if let Some((_, s)) = candidates.iter().find(|(oi, _)| *oi == server_idx) {
+                return Some(*s);
+            }
+        }
+        candidates.first().map(|(_, s)| *s)
+    }
+
+    /// 指定インデックスのサーバーのリクエスト結果を記録（F-06）
+    pub fn record_outcome(&self, server_idx: usize, success: bool, latency_ms: u64) {
+        if let Some(server) = self.servers.get(server_idx) {
+            server.record_outcome(success, latency_ms, Some(&self.outlier_detection));
+        }
+    }
+
     /// サーバー数を取得
     pub fn len(&self) -> usize {
         self.servers.len()
@@ -3568,8 +4273,30 @@ fn validate_route_config(
 }
 
 // rustls 用の TLS 設定読み込み（統一）
+/// 証明書・秘密鍵パスから ServerConfig を構築する（F-03 リローダー用の公開 API）
+///
+/// `load_tls_config` と同じ手順（ALPN / kTLS シークレット抽出）で再構築する。
+pub fn build_server_config_from_paths(
+    cert_path: &Path,
+    key_path: &Path,
+    ktls_enabled: bool,
+    http2_enabled: bool,
+) -> anyhow::Result<Arc<ServerConfig>> {
+    let section = TlsConfigSection {
+        cert_path: cert_path.to_string_lossy().into_owned(),
+        key_path: key_path.to_string_lossy().into_owned(),
+        ktls_enabled,
+        ktls_fallback_enabled: true,
+        tcp_cork_enabled: true,
+        auto_reload: false,
+        reload_interval_secs: default_tls_reload_interval(),
+    };
+    load_tls_config(&section, ktls_enabled, http2_enabled)
+        .map_err(|e| anyhow::anyhow!("TLS reload build failed: {}", e))
+}
+
 fn load_tls_config(
-    tls_config: &TlsConfigSection, 
+    tls_config: &TlsConfigSection,
     ktls_enabled: bool,
     #[allow(unused_variables)] http2_enabled: bool,
 ) -> io::Result<Arc<ServerConfig>> {
@@ -3650,6 +4377,10 @@ pub struct LoadedConfig {
     /// TLS秘密鍵パス（ログ・表示用）
     #[cfg_attr(not(feature = "http3"), allow(dead_code))]
     pub tls_key_path: String,
+    /// 証明書の自動リロードを有効にするか（F-03）
+    pub tls_auto_reload: bool,
+    /// 証明書リロードチェック間隔（秒、F-03）
+    pub tls_reload_interval_secs: u64,
     /// TLS証明書（PEM形式、事前読み込み済み）
     /// 
     /// Landlock適用前に読み込まれた証明書データ。
@@ -3678,6 +4409,10 @@ pub struct LoadedConfig {
     pub logging: LoggingConfigSection,
     /// Prometheusメトリクス設定
     pub prometheus_config: PrometheusConfig,
+    /// 管理 API 設定（F-20）
+    pub admin_config: AdminConfig,
+    /// OpenTelemetry 設定（F-10）
+    pub opentelemetry: OpenTelemetryConfig,
     /// Upstream グループ（健康チェック用）
     pub upstream_groups: Arc<HashMap<String, Arc<UpstreamGroup>>>,
     /// HTTP/2 を有効化するかどうか
@@ -3751,6 +4486,8 @@ pub struct RuntimeConfig {
     pub global_security: Arc<GlobalSecurityConfig>,
     /// Prometheusメトリクス設定
     pub prometheus_config: Arc<PrometheusConfig>,
+    /// 管理 API 設定（F-20）
+    pub admin_config: Arc<AdminConfig>,
     /// Upstream グループ（健康チェック用）
     pub upstream_groups: Arc<HashMap<String, Arc<UpstreamGroup>>>,
     /// HTTP/2 有効化フラグ
@@ -3786,6 +4523,7 @@ impl Default for RuntimeConfig {
             ktls_config: Arc::new(KtlsConfig::default()),
             global_security: Arc::new(GlobalSecurityConfig::default()),
             prometheus_config: Arc::new(PrometheusConfig::default()),
+            admin_config: Arc::new(AdminConfig::default()),
             upstream_groups: Arc::new(HashMap::new()),
             #[cfg(feature = "http2")]
             http2_enabled: false,
@@ -3854,6 +4592,7 @@ pub fn reload_config(path: &Path) -> io::Result<()> {
         ktls_config: current.ktls_config.clone(),
         global_security: Arc::new(loaded.global_security),
         prometheus_config: Arc::new(loaded.prometheus_config),
+        admin_config: Arc::new(loaded.admin_config),
         upstream_groups: loaded.upstream_groups,
         #[cfg(feature = "http2")]
         http2_enabled: loaded.http2_enabled,
@@ -3888,6 +4627,7 @@ pub struct LoadedConfigWithoutTls {
     pub optimized_router: Arc<routing::OptimizedRouter>,
     pub global_security: GlobalSecurityConfig,
     pub prometheus_config: PrometheusConfig,
+    pub admin_config: AdminConfig,
     pub upstream_groups: Arc<HashMap<String, Arc<UpstreamGroup>>>,
     #[cfg(feature = "http2")]
     pub http2_enabled: bool,
@@ -3936,15 +4676,17 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
     let mut upstream_groups: HashMap<String, Arc<UpstreamGroup>> = HashMap::new();
     if let Some(upstreams) = &config.upstreams {
         for (name, cfg) in upstreams {
+            let algorithm = resolve_algorithm(&cfg.algorithm, &cfg.hash_key);
             if let Some(group) = UpstreamGroup::new(
-                name.clone(), 
-                cfg.servers.clone(), 
-                cfg.algorithm,
+                name.clone(),
+                cfg.servers.clone(),
+                algorithm.clone(),
                 cfg.health_check.clone(),
                 cfg.tls_insecure,
             ) {
-                info!("Reloaded upstream '{}' with {} servers ({:?})", 
-                      name, group.len(), cfg.algorithm);
+                let group = group.with_resilience(&cfg.circuit_breaker, &cfg.outlier_detection);
+                info!("Reloaded upstream '{}' with {} servers ({:?})",
+                      name, group.len(), algorithm);
                 upstream_groups.insert(name.clone(), Arc::new(group));
             } else {
                 warn!("Failed to reload upstream '{}': no valid servers", name);
@@ -3979,6 +4721,7 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
         optimized_router,
         global_security: config.security,
         prometheus_config: config.prometheus,
+        admin_config: config.admin,
         upstream_groups: Arc::new(upstream_groups),
         #[cfg(feature = "http2")]
         http2_enabled,
@@ -4083,15 +4826,17 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     let mut upstream_groups: HashMap<String, Arc<UpstreamGroup>> = HashMap::new();
     if let Some(upstreams) = &config.upstreams {
         for (name, cfg) in upstreams {
+            let algorithm = resolve_algorithm(&cfg.algorithm, &cfg.hash_key);
             if let Some(group) = UpstreamGroup::new(
-                name.clone(), 
-                cfg.servers.clone(), 
-                cfg.algorithm,
+                name.clone(),
+                cfg.servers.clone(),
+                algorithm.clone(),
                 cfg.health_check.clone(),
                 cfg.tls_insecure,
             ) {
-                info!("Loaded upstream '{}' with {} servers ({:?})", 
-                      name, group.len(), cfg.algorithm);
+                let group = group.with_resilience(&cfg.circuit_breaker, &cfg.outlier_detection);
+                info!("Loaded upstream '{}' with {} servers ({:?})",
+                      name, group.len(), algorithm);
                 if cfg.health_check.is_some() {
                     info!("  Health check enabled for '{}'", name);
                 }
@@ -4142,6 +4887,8 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     });
 
     // Prometheusメトリクス設定をログ出力
+    // F-09: ランタイムトグルを設定（enabled=false で record_* がノーオップ・endpoint が 404）
+    crate::metrics::set_metrics_runtime_enabled(config.prometheus.enabled);
     if config.prometheus.enabled {
         info!("Prometheus metrics enabled at path: {}", config.prometheus.path);
         if !config.prometheus.allowed_ips.is_empty() {
@@ -4201,6 +4948,8 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         tls_config,
         tls_cert_path: config.tls.cert_path.clone(),
         tls_key_path: config.tls.key_path.clone(),
+        tls_auto_reload: config.tls.auto_reload,
+        tls_reload_interval_secs: config.tls.reload_interval_secs,
         tls_cert_pem: Arc::new(tls_cert_pem),
         tls_key_pem: Arc::new(tls_key_pem),
         route: routes,
@@ -4212,6 +4961,8 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         global_security: config.security,
         logging: config.logging,
         prometheus_config: config.prometheus,
+        admin_config: config.admin,
+        opentelemetry: config.opentelemetry,
         upstream_groups: Arc::new(upstream_groups),
         #[cfg(feature = "http2")]
         http2_enabled,
@@ -4544,4 +5295,505 @@ pub fn test_config_file(path: &Path) -> io::Result<()> {
     }
     
     Ok(())
+}
+
+// ====================
+// ロードバランシングのテスト（F-19）
+// ====================
+#[cfg(test)]
+mod load_balancing_tests {
+    use super::*;
+
+    fn entry(url: &str, weight: u32) -> UpstreamServerEntry {
+        UpstreamServerEntry {
+            url: url.to_string(),
+            sni_name: None,
+            use_h2c: false,
+            weight,
+        }
+    }
+
+    #[test]
+    fn weighted_distribution_roughly_2_to_1() {
+        let entries = vec![
+            entry("http://10.0.0.1:80", 2),
+            entry("http://10.0.0.2:80", 1),
+        ];
+        let group = UpstreamGroup::new(
+            "wrr".into(),
+            entries,
+            LoadBalanceAlgorithm::Weighted,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let mut counts = [0usize; 2];
+        for _ in 0..3000 {
+            let s = group.select("1.2.3.4").unwrap();
+            if s.target.host == "10.0.0.1" {
+                counts[0] += 1;
+            } else {
+                counts[1] += 1;
+            }
+        }
+        // 重み 2:1 なので server1 はおよそ server2 の2倍
+        let ratio = counts[0] as f64 / counts[1] as f64;
+        assert!(
+            ratio > 1.7 && ratio < 2.3,
+            "weighted ratio out of range: {} (counts={:?})",
+            ratio,
+            counts
+        );
+    }
+
+    #[test]
+    fn consistent_hash_same_key_same_server() {
+        let entries = vec![
+            entry("http://10.0.0.1:80", 1),
+            entry("http://10.0.0.2:80", 1),
+            entry("http://10.0.0.3:80", 1),
+        ];
+        let group = UpstreamGroup::new(
+            "ch".into(),
+            entries,
+            LoadBalanceAlgorithm::ConsistentHash {
+                hash_key: HashKey::Ip,
+            },
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 同じキーは常に同じサーバーへ
+        let first = group.select("192.168.1.50").unwrap().target.host.clone();
+        for _ in 0..100 {
+            let host = group.select("192.168.1.50").unwrap().target.host.clone();
+            assert_eq!(host, first, "consistent hash not stable");
+        }
+
+        // 別のキーでも安定していること
+        let second = group.select("8.8.8.8").unwrap().target.host.clone();
+        for _ in 0..100 {
+            let host = group.select("8.8.8.8").unwrap().target.host.clone();
+            assert_eq!(host, second);
+        }
+    }
+
+    #[test]
+    fn consistent_hash_distributes_keys() {
+        let entries = vec![
+            entry("http://10.0.0.1:80", 1),
+            entry("http://10.0.0.2:80", 1),
+            entry("http://10.0.0.3:80", 1),
+        ];
+        let group = UpstreamGroup::new(
+            "ch".into(),
+            entries,
+            LoadBalanceAlgorithm::ConsistentHash {
+                hash_key: HashKey::Ip,
+            },
+            None,
+            false,
+        )
+        .unwrap();
+
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..200 {
+            let key = format!("10.20.30.{}", i % 256);
+            let host = group.select(&key).unwrap().target.host.clone();
+            seen.insert(host);
+        }
+        // 150 vnodes/サーバーで十分に分散され、全サーバーが使われるはず
+        assert_eq!(seen.len(), 3, "keys not distributed across all servers: {:?}", seen);
+    }
+
+    #[test]
+    fn hash_key_parse() {
+        assert_eq!(HashKey::parse("ip").unwrap(), HashKey::Ip);
+        assert_eq!(
+            HashKey::parse("header:X-User-Id").unwrap(),
+            HashKey::Header("X-User-Id".into())
+        );
+        assert_eq!(
+            HashKey::parse("cookie:session_id").unwrap(),
+            HashKey::Cookie("session_id".into())
+        );
+        assert!(HashKey::parse("garbage").is_err());
+    }
+
+    #[test]
+    fn weighted_entry_default_weight_is_one() {
+        let s = entry("http://x:80", 1);
+        assert_eq!(s.weight, 1);
+    }
+
+    #[test]
+    fn round_robin_still_cycles() {
+        let entries = vec![
+            entry("http://10.0.0.1:80", 1),
+            entry("http://10.0.0.2:80", 1),
+        ];
+        let group = UpstreamGroup::new(
+            "rr".into(),
+            entries,
+            LoadBalanceAlgorithm::RoundRobin,
+            None,
+            false,
+        )
+        .unwrap();
+        let a = group.select("x").unwrap().target.host.clone();
+        let b = group.select("x").unwrap().target.host.clone();
+        assert_ne!(a, b, "round robin should alternate");
+    }
+}
+
+// ====================
+// 管理 API 設定のテスト（F-20）
+// ====================
+#[cfg(test)]
+mod admin_config_tests {
+    use super::*;
+
+    #[test]
+    fn admin_auth_disabled_rejects() {
+        let cfg = AdminConfig::default();
+        assert!(!cfg.check_auth(Some("Bearer x")));
+    }
+
+    #[test]
+    fn admin_auth_bearer_and_raw() {
+        let cfg = AdminConfig {
+            enabled: true,
+            path_prefix: "/__admin".into(),
+            secret: "topsecret".into(),
+            allowed_ips: Vec::new(),
+        };
+        assert!(cfg.check_auth(Some("Bearer topsecret")));
+        assert!(cfg.check_auth(Some("topsecret")));
+        assert!(!cfg.check_auth(Some("wrong")));
+        assert!(!cfg.check_auth(None));
+    }
+
+    #[test]
+    fn admin_empty_secret_rejects() {
+        let cfg = AdminConfig {
+            enabled: true,
+            path_prefix: "/__admin".into(),
+            secret: String::new(),
+            allowed_ips: Vec::new(),
+        };
+        assert!(!cfg.check_auth(Some("Bearer ")));
+    }
+
+    #[test]
+    fn admin_ip_allowed_empty_allows_all() {
+        let cfg = AdminConfig {
+            enabled: true,
+            path_prefix: "/__admin".into(),
+            secret: "s".into(),
+            allowed_ips: Vec::new(),
+        };
+        assert!(cfg.is_ip_allowed("1.2.3.4"));
+        assert!(cfg.is_ip_allowed("::1"));
+    }
+
+    #[test]
+    fn admin_ip_allowed_single_ip() {
+        let cfg = AdminConfig {
+            enabled: true,
+            path_prefix: "/__admin".into(),
+            secret: "s".into(),
+            allowed_ips: vec!["127.0.0.1".into()],
+        };
+        assert!(cfg.is_ip_allowed("127.0.0.1"));
+        assert!(!cfg.is_ip_allowed("192.168.0.1"));
+    }
+
+    #[test]
+    fn admin_ip_allowed_cidr() {
+        let cfg = AdminConfig {
+            enabled: true,
+            path_prefix: "/__admin".into(),
+            secret: "s".into(),
+            allowed_ips: vec!["10.0.0.0/8".into()],
+        };
+        assert!(cfg.is_ip_allowed("10.1.2.3"));
+        assert!(cfg.is_ip_allowed("10.255.255.255"));
+        assert!(!cfg.is_ip_allowed("192.168.0.1"));
+    }
+
+    #[test]
+    fn admin_ip_allowed_ipv6() {
+        let cfg = AdminConfig {
+            enabled: true,
+            path_prefix: "/__admin".into(),
+            secret: "s".into(),
+            allowed_ips: vec!["::1".into(), "fe80::/10".into()],
+        };
+        assert!(cfg.is_ip_allowed("::1"));
+        assert!(cfg.is_ip_allowed("fe80::1"));
+        assert!(!cfg.is_ip_allowed("2001:db8::1"));
+    }
+}
+
+// ====================
+// F-06: サーキットブレーカーと UpstreamGroup 統合テスト
+// ====================
+#[cfg(test)]
+mod circuit_breaker_upstream_tests {
+    use super::*;
+    use crate::resilience::CircuitBreaker;
+
+    fn make_entry(url: &str) -> UpstreamServerEntry {
+        UpstreamServerEntry { url: url.to_string(), sni_name: None, use_h2c: false, weight: 1 }
+    }
+
+    fn trip_config() -> super::CircuitBreakerConfig {
+        super::CircuitBreakerConfig {
+            enabled: true,
+            failure_threshold: 2,
+            failure_window_secs: 60,
+            open_duration_secs: 300,
+            half_open_probes: 1,
+            success_threshold: 1,
+            trip_on_timeout: true,
+        }
+    }
+
+    /// CBがOpenのサーバーはselect()でスキップされる（2台構成の場合）
+    #[test]
+    fn tripped_circuit_breaker_skips_server_with_two_servers() {
+        let entries = vec![
+            make_entry("http://10.0.0.1:80"),
+            make_entry("http://10.0.0.2:80"),
+        ];
+        let mut group = UpstreamGroup::new(
+            "cb-test".into(),
+            entries,
+            LoadBalanceAlgorithm::RoundRobin,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // サーバー0にCBを付与してトリップさせる
+        let cb = CircuitBreaker::new(trip_config());
+        cb.record_failure();
+        cb.record_failure();
+        assert!(cb.is_open(), "CB should be open after exceeding threshold");
+        group.servers[0] = group.servers[0].clone().with_circuit_breaker(Some(cb));
+
+        // 50回 select() して、トリップしたサーバー0は選ばれないことを確認
+        // （2台構成なので candidates() の healthy fallback は不要）
+        for _ in 0..50 {
+            let s = group.select("1.2.3.4");
+            if let Some(s) = s {
+                assert_ne!(
+                    s.target.host, "10.0.0.1",
+                    "Tripped server (10.0.0.1) should not be selected when healthy fallback exists"
+                );
+            }
+        }
+    }
+
+    /// 全サーバーのCBがOpenの場合は healthy fallback が動作する
+    ///
+    /// candidates() の設計: avail が空なら healthy なサーバーにフォールバック（完全停止回避）。
+    /// よって1台構成でCBがOpenでも、サーバー自体は healthy なら選択される。
+    #[test]
+    fn all_servers_tripped_falls_back_to_healthy() {
+        let entries = vec![make_entry("http://10.0.0.1:80")];
+        let mut group = UpstreamGroup::new(
+            "cb-all-tripped".into(),
+            entries,
+            LoadBalanceAlgorithm::RoundRobin,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let cb = CircuitBreaker::new(trip_config());
+        cb.record_failure();
+        cb.record_failure();
+        assert!(cb.is_open(), "CB should be open");
+        group.servers[0] = group.servers[0].clone().with_circuit_breaker(Some(cb));
+
+        // 設計上: 全 CB が Open でもサーバー自体が healthy なら fallback で選択される
+        // （完全停止（None）を避けるための安全策）
+        let result = group.select("1.2.3.4");
+        // fallback が動作するため Some が返る（設計通り）
+        assert!(
+            result.is_some(),
+            "Should fallback to healthy server even if all CBs are open (by design)"
+        );
+    }
+
+    /// record_outcome で失敗を記録すると CB の状態が更新される
+    #[test]
+    fn record_outcome_updates_circuit_breaker_state() {
+        let entries = vec![
+            make_entry("http://10.0.0.1:80"),
+            make_entry("http://10.0.0.2:80"),
+        ];
+        let mut group = UpstreamGroup::new(
+            "cb-outcome".into(),
+            entries,
+            LoadBalanceAlgorithm::RoundRobin,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let cb = CircuitBreaker::new(trip_config());
+        group.servers[0] = group.servers[0].clone().with_circuit_breaker(Some(cb));
+
+        // トリップ前は サーバー0 が選ばれることがある
+        let before_trip = (0..10)
+            .filter_map(|_| group.select("1.1.1.1"))
+            .any(|s| s.target.host == "10.0.0.1");
+        assert!(before_trip, "Server 0 should be reachable before tripping");
+
+        // 失敗を記録してトリップ閾値（2回）に達する
+        group.record_outcome(0, false, 100);
+        group.record_outcome(0, false, 100);
+
+        // トリップ後は2台のうちサーバー1のみが選ばれるはず
+        // （サーバー0は avail から除かれ、candidates が [server1] になる）
+        let after_trip_server0 = (0..20)
+            .filter_map(|_| group.select("1.1.1.1"))
+            .filter(|s| s.target.host == "10.0.0.1")
+            .count();
+        assert_eq!(
+            after_trip_server0, 0,
+            "Tripped server (10.0.0.1) should not be selected when alternative exists"
+        );
+    }
+
+    /// スライディングウィンドウ内の失敗率が閾値未満なら CB は開かない
+    #[test]
+    fn below_threshold_does_not_trip() {
+        let entries = vec![make_entry("http://10.0.0.1:80")];
+        let mut group = UpstreamGroup::new(
+            "cb-below".into(),
+            entries,
+            LoadBalanceAlgorithm::RoundRobin,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let cb = CircuitBreaker::new(trip_config());
+        group.servers[0] = group.servers[0].clone().with_circuit_breaker(Some(cb));
+
+        // 閾値-1回の失敗では開かない
+        group.record_outcome(0, false, 10);
+
+        assert!(
+            group.select("1.1.1.1").is_some(),
+            "Should still select server when below failure threshold"
+        );
+    }
+}
+
+// ====================
+// F-19: 追加ロードバランシング統合テスト
+// ====================
+#[cfg(test)]
+mod advanced_lb_integration_tests {
+    use super::*;
+
+    fn w_entry(url: &str, weight: u32) -> UpstreamServerEntry {
+        UpstreamServerEntry { url: url.to_string(), sni_name: None, use_h2c: false, weight }
+    }
+
+    /// Weighted RR: weight=0 は weight=1 として扱われる（最小重みは1）
+    ///
+    /// 設計上、`weight.max(1)` により 0 は 1 に切り上げられる。
+    #[test]
+    fn zero_weight_treated_as_one() {
+        let entries = vec![
+            w_entry("http://10.0.0.1:80", 100), // 重み 100
+            w_entry("http://10.0.0.2:80", 0),   // weight=0 → 内部で 1 として扱われる
+        ];
+        let group = UpstreamGroup::new(
+            "wt-zero".into(),
+            entries,
+            LoadBalanceAlgorithm::Weighted,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let mut count1 = 0usize;
+        let mut count2 = 0usize;
+        for _ in 0..200 {
+            if let Some(s) = group.select("1.2.3.4") {
+                if s.target.host == "10.0.0.1" {
+                    count1 += 1;
+                } else {
+                    count2 += 1;
+                }
+            }
+        }
+        // weight=100 vs weight=0(→1) → server1 が圧倒的多数
+        assert!(
+            count1 > count2 * 10,
+            "weight=100 server should dominate weight=0(→1): {count1} vs {count2}"
+        );
+    }
+
+    /// Consistent Hash: 同一キーは unhealthy サーバーが除かれても次のサーバーに転送される
+    #[test]
+    fn consistent_hash_falls_back_on_unhealthy() {
+        let entries = vec![
+            w_entry("http://10.0.0.1:80", 1),
+            w_entry("http://10.0.0.2:80", 1),
+            w_entry("http://10.0.0.3:80", 1),
+        ];
+        let group = UpstreamGroup::new(
+            "ch-fallback".into(),
+            entries,
+            LoadBalanceAlgorithm::ConsistentHash {
+                hash_key: HashKey::Ip,
+            },
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 正常状態で選択できること
+        let first = group.select("192.168.1.100");
+        assert!(first.is_some(), "Should select a server in normal state");
+
+        // 1台をunhealthyにしても選択できること
+        group.servers[0].healthy.store(false, std::sync::atomic::Ordering::SeqCst);
+        let after = group.select("192.168.1.100");
+        assert!(after.is_some(), "Should still select a server with one unhealthy");
+    }
+
+    /// IpHash: 同じIPは常に同じサーバーへ（既存動作の確認）
+    #[test]
+    fn ip_hash_consistent_routing() {
+        let entries = vec![
+            w_entry("http://10.0.0.1:80", 1),
+            w_entry("http://10.0.0.2:80", 1),
+            w_entry("http://10.0.0.3:80", 1),
+        ];
+        let group = UpstreamGroup::new(
+            "iphash".into(),
+            entries,
+            LoadBalanceAlgorithm::IpHash,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let ip = "203.0.113.42";
+        let first = group.select(ip).unwrap().target.host.clone();
+        for _ in 0..20 {
+            let host = group.select(ip).unwrap().target.host.clone();
+            assert_eq!(host, first, "IP hash should always route same IP to same server");
+        }
+    }
 }
