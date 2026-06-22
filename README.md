@@ -1558,8 +1558,8 @@ In addition to the circuit breaker, individual servers can be passively ejected 
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `veil_circuit_breaker_open_total` | Counter | Total number of CB open events per upstream/server |
-| `veil_circuit_breaker_state` | Gauge | Current CB state (0=Closed, 1=Open, 2=HalfOpen) |
+| `veil_circuit_breaker_open_total` | Counter | Total number of CB open events per upstream |
+| `veil_circuit_breaker_state` | Gauge | Current CB state per upstream (0=Closed, 1=Open, 2=HalfOpen) |
 | `veil_retry_total` | Counter | Total retry attempts |
 | `veil_outlier_ejected` | Gauge | 1 if server is currently ejected |
 
@@ -2681,19 +2681,20 @@ Use the `path` option to change the endpoint path.
 | `veil_proxy_cache_hits_total` | Counter | host | Total cache hit count |
 | `veil_proxy_cache_misses_total` | Counter | host | Total cache miss count |
 | `veil_proxy_cache_stores_total` | Counter | host, storage | Total cache store operations |
+| `veil_proxy_cache_evictions_total` | Counter | reason | Total cache eviction count |
 | `veil_proxy_cache_size_bytes` | Gauge | storage | Current cache size in bytes |
 | `veil_proxy_cache_entries` | Gauge | storage | Current number of cache entries |
 | `veil_proxy_buffering_used_total` | Counter | host | Total requests using buffering |
-| `veil_circuit_breaker_open_total` | Counter | upstream, server | CB open event count |
-| `veil_circuit_breaker_state` | Gauge | upstream, server | CB state (0=Closed, 1=Open, 2=HalfOpen) |
-| `veil_retry_total` | Counter | upstream, server | Retry attempt count |
+| `veil_circuit_breaker_open_total` | Counter | upstream | CB open event count |
+| `veil_circuit_breaker_state` | Gauge | upstream | CB state (0=Closed, 1=Open, 2=HalfOpen) |
+| `veil_retry_total` | Counter | upstream, result | Retry attempt count |
 | `veil_outlier_ejected` | Gauge | upstream, server | Server ejection status (1=ejected) |
 | `veil_connection_pool_size` | Gauge | upstream | Current connection pool size |
 | `veil_connection_pool_hits_total` | Counter | upstream | Connection pool hit count |
 | `veil_connection_pool_misses_total` | Counter | upstream | Connection pool miss count |
-| `veil_grpc_requests_total` | Counter | upstream, method | gRPC request count |
-| `veil_grpc_stream_duration_seconds` | Histogram | upstream, method | gRPC stream duration |
-| `veil_wasm_filter_duration_seconds` | Histogram | module | WASM filter execution time |
+| `veil_grpc_requests_total` | Counter | method, status_code, upstream | gRPC request count |
+| `veil_grpc_stream_duration_seconds` | Histogram | method | gRPC stream duration |
+| `veil_wasm_filter_duration_seconds` | Histogram | filter, phase | WASM filter execution time |
 
 ### Runtime Enable/Disable
 
@@ -2813,47 +2814,6 @@ Any OTLP/HTTP collector accepting JSON payloads:
 | OpenTelemetry Collector | Standard OTLP/HTTP receiver |
 | Prometheus Remote Write | Via otel-collector `prometheusremotewrite` exporter |
 
-## Structured Access Log
-
-Write per-request access logs in JSON or text format, independent of the application log. Uses thread-local buffers to minimize heap allocation.
-
-### Configuration
-
-```toml
-[access_log]
-enabled = true
-format = "json"                         # "json" or "text"
-file_path = "/var/log/veil/access.log"  # omit for stderr
-# Limit output fields (omit for all fields)
-fields = ["timestamp", "method", "host", "path", "status", "duration_ms", "client_ip", "upstream"]
-channel_size = 10000      # async channel capacity to the writer thread (default: 10000)
-flush_interval_ms = 1000  # BufWriter flush interval in ms (default: 1000)
-```
-
-Access logs are written asynchronously by a dedicated writer thread. The hot path (worker thread) only pushes bytes into a bounded channel (`channel_size`). The writer thread holds the file/stderr handle exclusively, eliminating global lock contention. Log lines dropped when the channel is full are silently discarded without blocking request processing.
-
-### Available Fields
-
-| Field | Description |
-|-------|-------------|
-| `timestamp` | Request timestamp (RFC 3339) |
-| `method` | HTTP method |
-| `host` | Request Host header |
-| `path` | Request path |
-| `status` | HTTP response status code |
-| `duration_ms` | Request duration in milliseconds |
-| `client_ip` | Client IP address |
-| `upstream` | Upstream server address |
-| `req_body_size` | Request body size (bytes) |
-| `resp_body_size` | Response body size (bytes) |
-| `user_agent` | User-Agent header |
-
-### Example JSON Output
-
-```json
-{"timestamp":"2026-01-01T00:00:00Z","method":"GET","host":"example.com","path":"/api/data","status":200,"duration_ms":12,"client_ip":"10.0.0.1","upstream":"192.168.1.10:8080","req_body_size":0,"resp_body_size":1024,"user_agent":"curl/8.0"}
-```
-
 ## Logging Configuration
 
 Provides high-performance async logging using ftlog. ftlog internally uses a background thread and channel, minimizing impact on worker threads.
@@ -2903,6 +2863,47 @@ file_path = "/var/log/veil.log"
 level = "info"
 format = "json"
 file_path = "/var/log/veil.json"
+```
+
+## Structured Access Log
+
+Write per-request access logs in JSON or text format, independent of the application log. Uses thread-local buffers to minimize heap allocation.
+
+### Configuration
+
+```toml
+[access_log]
+enabled = true
+format = "json"                         # "json" or "text"
+file_path = "/var/log/veil/access.log"  # omit for stderr
+# Limit output fields (omit for all fields)
+fields = ["timestamp", "method", "host", "path", "status", "duration_ms", "client_ip", "upstream"]
+channel_size = 10000      # async channel capacity to the writer thread (default: 10000)
+flush_interval_ms = 1000  # BufWriter flush interval in ms (default: 1000)
+```
+
+Access logs are written asynchronously by a dedicated writer thread. The hot path (worker thread) only pushes bytes into a bounded channel (`channel_size`). The writer thread holds the file/stderr handle exclusively, eliminating global lock contention. Log lines dropped when the channel is full are silently discarded without blocking request processing.
+
+### Available Fields
+
+| Field | Description |
+|-------|-------------|
+| `timestamp` | Request timestamp (RFC 3339) |
+| `method` | HTTP method |
+| `host` | Request Host header |
+| `path` | Request path |
+| `status` | HTTP response status code |
+| `duration_ms` | Request duration in milliseconds |
+| `client_ip` | Client IP address |
+| `upstream` | Upstream server address |
+| `req_body_size` | Request body size (bytes) |
+| `resp_body_size` | Response body size (bytes) |
+| `user_agent` | User-Agent header |
+
+### Example JSON Output
+
+```json
+{"timestamp":"2026-01-01T00:00:00Z","method":"GET","host":"example.com","path":"/api/data","status":200,"duration_ms":12,"client_ip":"10.0.0.1","upstream":"192.168.1.10:8080","req_body_size":0,"resp_body_size":1024,"user_agent":"curl/8.0"}
 ```
 
 ## Cache Purge Administration API
@@ -3385,24 +3386,6 @@ For CI/CD pipelines:
     ./tests/e2e_setup.sh test
 ```
 
-## Graceful Shutdown
-
-When receiving SIGINT (Ctrl+C) or SIGTERM, the server terminates safely:
-
-1. Stop accepting new connections
-2. Complete processing of existing requests
-3. Wait for all worker threads to finish
-4. Terminate process
-
-```bash
-# Start server
-./veil -c ./config.toml &
-
-# Terminate safely
-kill -SIGTERM $!
-# or Ctrl+C
-```
-
 ## Configuration File Validation
 
 Performs detailed validation of the configuration file at startup and outputs clear error messages if problems are found.
@@ -3425,6 +3408,24 @@ Performs detailed validation of the configuration file at startup and outputs cl
 Error: TLS certificate file not found: /path/to/cert.pem
 Error: Invalid proxy URL for route 'example.com:/api/': invalid-url
 Error: Upstream 'backend-pool' not found
+```
+
+## Graceful Shutdown
+
+When receiving SIGINT (Ctrl+C) or SIGTERM, the server terminates safely:
+
+1. Stop accepting new connections
+2. Complete processing of existing requests
+3. Wait for all worker threads to finish
+4. Terminate process
+
+```bash
+# Start server
+./veil -c ./config.toml &
+
+# Terminate safely
+kill -SIGTERM $!
+# or Ctrl+C
 ```
 
 ## Graceful Reload (Hot Reload)
