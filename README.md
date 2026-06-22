@@ -2882,6 +2882,77 @@ IP filtering is checked before authentication. When `allowed_ips` is empty (defa
 | Single IPv6 | `::1` |
 | IPv6 CIDR | `fe80::/10` |
 
+## Structured Access Log
+
+Write per-request access logs in JSON or text format, independent of the application log. Uses thread-local buffers to minimize heap allocation.
+
+### Configuration
+
+```toml
+[access_log]
+enabled = true
+format = "json"                         # "json" or "text"
+file_path = "/var/log/veil/access.log"  # omit for stderr
+# Limit output fields (omit for all fields)
+fields = ["timestamp", "method", "host", "path", "status", "duration_ms", "client_ip", "upstream"]
+```
+
+### Available Fields
+
+| Field | Description |
+|-------|-------------|
+| `timestamp` | Request timestamp (RFC 3339) |
+| `method` | HTTP method |
+| `host` | Request Host header |
+| `path` | Request path |
+| `status` | HTTP response status code |
+| `duration_ms` | Request duration in milliseconds |
+| `client_ip` | Client IP address |
+| `upstream` | Upstream server address |
+| `req_body_size` | Request body size (bytes) |
+| `resp_body_size` | Response body size (bytes) |
+| `user_agent` | User-Agent header |
+
+### Example JSON Output
+
+```json
+{"timestamp":"2026-01-01T00:00:00Z","method":"GET","host":"example.com","path":"/api/data","status":200,"duration_ms":12,"client_ip":"10.0.0.1","upstream":"192.168.1.10:8080","req_body_size":0,"resp_body_size":1024,"user_agent":"curl/8.0"}
+```
+
+## Admin API
+
+The admin API exposes runtime management endpoints under a configurable prefix (default: `/__admin`). All endpoints require IP filtering and Bearer token authentication (see [Cache Purge Administration API](#cache-purge-administration-api) for configuration).
+
+### Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/__admin/config` | Dump current config as JSON (secrets masked) |
+| `GET` | `/__admin/stats` | Runtime stats (uptime, circuit breaker state) |
+| `POST` | `/__admin/reload` | Trigger config hot-reload |
+| `POST` | `/__admin/tls/reload` | Trigger TLS certificate hot-reload |
+| `POST` | `/__admin/cache/purge` | Cache purge (see Cache Purge section) |
+| `PURGE` | any path | Purge cache entry by path |
+
+### Examples
+
+```bash
+# Get current config (secrets masked)
+curl -H "Authorization: Bearer changeme" https://proxy.example.com/__admin/config
+
+# Get runtime stats
+curl -H "Authorization: Bearer changeme" https://proxy.example.com/__admin/stats
+# → {"uptime_secs": 3600}
+
+# Trigger config reload
+curl -X POST -H "Authorization: Bearer changeme" https://proxy.example.com/__admin/reload
+# → {"ok":true}
+
+# Trigger TLS certificate reload
+curl -X POST -H "Authorization: Bearer changeme" https://proxy.example.com/__admin/tls/reload
+# → {"ok":true}
+```
+
 ## Performance Tuning
 
 ### Worker Thread Count

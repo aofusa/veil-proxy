@@ -1259,6 +1259,10 @@ pub struct AdminConfig {
     /// 例: ["127.0.0.1", "10.0.0.0/8", "192.168.0.0/16"]
     #[serde(default)]
     pub allowed_ips: Vec<String>,
+    /// キャッシュパージプレフィックス（事前計算、リクエスト毎の format! を回避）
+    /// デシリアライズ時に自動計算される: "{path_prefix}/cache/purge"
+    #[serde(skip)]
+    pub cache_purge_prefix: String,
 }
 
 fn default_admin_path_prefix() -> String { "/__admin".to_string() }
@@ -1308,12 +1312,22 @@ impl Default for OpenTelemetryConfig {
 
 impl Default for AdminConfig {
     fn default() -> Self {
+        let path_prefix = default_admin_path_prefix();
+        let cache_purge_prefix = format!("{}/cache/purge", path_prefix);
         Self {
             enabled: false,
-            path_prefix: default_admin_path_prefix(),
+            path_prefix,
             secret: String::new(),
             allowed_ips: Vec::new(),
+            cache_purge_prefix,
         }
+    }
+}
+
+impl AdminConfig {
+    /// デシリアライズ後に事前計算フィールドを補完する
+    pub fn compute_derived(&mut self) {
+        self.cache_purge_prefix = format!("{}/cache/purge", self.path_prefix);
     }
 }
 
@@ -2238,6 +2252,9 @@ struct Config {
     /// 管理 API 設定（F-20: キャッシュ Purge 等）
     #[serde(default)]
     admin: AdminConfig,
+    /// 構造化アクセスログ設定（F-21）
+    #[serde(default)]
+    access_log: crate::access_log::AccessLogConfig,
     /// OpenTelemetry 設定（F-10）
     #[serde(default)]
     opentelemetry: OpenTelemetryConfig,
@@ -4411,6 +4428,8 @@ pub struct LoadedConfig {
     pub prometheus_config: PrometheusConfig,
     /// 管理 API 設定（F-20）
     pub admin_config: AdminConfig,
+    /// 構造化アクセスログ設定（F-21）
+    pub access_log_config: crate::access_log::AccessLogConfig,
     /// OpenTelemetry 設定（F-10）
     pub opentelemetry: OpenTelemetryConfig,
     /// Upstream グループ（健康チェック用）
@@ -4488,6 +4507,8 @@ pub struct RuntimeConfig {
     pub prometheus_config: Arc<PrometheusConfig>,
     /// 管理 API 設定（F-20）
     pub admin_config: Arc<AdminConfig>,
+    /// 構造化アクセスログ設定（F-21）
+    pub access_log_config: Arc<crate::access_log::AccessLogConfig>,
     /// Upstream グループ（健康チェック用）
     pub upstream_groups: Arc<HashMap<String, Arc<UpstreamGroup>>>,
     /// HTTP/2 有効化フラグ
@@ -4524,6 +4545,7 @@ impl Default for RuntimeConfig {
             global_security: Arc::new(GlobalSecurityConfig::default()),
             prometheus_config: Arc::new(PrometheusConfig::default()),
             admin_config: Arc::new(AdminConfig::default()),
+            access_log_config: Arc::new(crate::access_log::AccessLogConfig::default()),
             upstream_groups: Arc::new(HashMap::new()),
             #[cfg(feature = "http2")]
             http2_enabled: false,
@@ -4593,6 +4615,7 @@ pub fn reload_config(path: &Path) -> io::Result<()> {
         global_security: Arc::new(loaded.global_security),
         prometheus_config: Arc::new(loaded.prometheus_config),
         admin_config: Arc::new(loaded.admin_config),
+        access_log_config: Arc::new(loaded.access_log_config),
         upstream_groups: loaded.upstream_groups,
         #[cfg(feature = "http2")]
         http2_enabled: loaded.http2_enabled,
@@ -4628,6 +4651,8 @@ pub struct LoadedConfigWithoutTls {
     pub global_security: GlobalSecurityConfig,
     pub prometheus_config: PrometheusConfig,
     pub admin_config: AdminConfig,
+    /// 構造化アクセスログ設定（F-21）
+    pub access_log_config: crate::access_log::AccessLogConfig,
     pub upstream_groups: Arc<HashMap<String, Arc<UpstreamGroup>>>,
     #[cfg(feature = "http2")]
     pub http2_enabled: bool,
@@ -4716,12 +4741,17 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
         performance_config.open_file_cache_max_entries,
     );
 
+    // AdminConfig の事前計算フィールドを補完
+    let mut admin_config = config.admin;
+    admin_config.compute_derived();
+
     Ok(LoadedConfigWithoutTls {
         route: routes,
         optimized_router,
         global_security: config.security,
         prometheus_config: config.prometheus,
-        admin_config: config.admin,
+        admin_config,
+        access_log_config: config.access_log,
         upstream_groups: Arc::new(upstream_groups),
         #[cfg(feature = "http2")]
         http2_enabled,
@@ -4961,7 +4991,12 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         global_security: config.security,
         logging: config.logging,
         prometheus_config: config.prometheus,
-        admin_config: config.admin,
+        admin_config: {
+            let mut a = config.admin;
+            a.compute_derived();
+            a
+        },
+        access_log_config: config.access_log,
         opentelemetry: config.opentelemetry,
         upstream_groups: Arc::new(upstream_groups),
         #[cfg(feature = "http2")]
@@ -5468,6 +5503,7 @@ mod admin_config_tests {
             path_prefix: "/__admin".into(),
             secret: "topsecret".into(),
             allowed_ips: Vec::new(),
+            cache_purge_prefix: "/__admin/cache/purge".into(),
         };
         assert!(cfg.check_auth(Some("Bearer topsecret")));
         assert!(cfg.check_auth(Some("topsecret")));
@@ -5482,6 +5518,7 @@ mod admin_config_tests {
             path_prefix: "/__admin".into(),
             secret: String::new(),
             allowed_ips: Vec::new(),
+            cache_purge_prefix: "/__admin/cache/purge".into(),
         };
         assert!(!cfg.check_auth(Some("Bearer ")));
     }
@@ -5493,6 +5530,7 @@ mod admin_config_tests {
             path_prefix: "/__admin".into(),
             secret: "s".into(),
             allowed_ips: Vec::new(),
+            cache_purge_prefix: "/__admin/cache/purge".into(),
         };
         assert!(cfg.is_ip_allowed("1.2.3.4"));
         assert!(cfg.is_ip_allowed("::1"));
@@ -5505,6 +5543,7 @@ mod admin_config_tests {
             path_prefix: "/__admin".into(),
             secret: "s".into(),
             allowed_ips: vec!["127.0.0.1".into()],
+            cache_purge_prefix: "/__admin/cache/purge".into(),
         };
         assert!(cfg.is_ip_allowed("127.0.0.1"));
         assert!(!cfg.is_ip_allowed("192.168.0.1"));
@@ -5517,6 +5556,7 @@ mod admin_config_tests {
             path_prefix: "/__admin".into(),
             secret: "s".into(),
             allowed_ips: vec!["10.0.0.0/8".into()],
+            cache_purge_prefix: "/__admin/cache/purge".into(),
         };
         assert!(cfg.is_ip_allowed("10.1.2.3"));
         assert!(cfg.is_ip_allowed("10.255.255.255"));
@@ -5530,6 +5570,7 @@ mod admin_config_tests {
             path_prefix: "/__admin".into(),
             secret: "s".into(),
             allowed_ips: vec!["::1".into(), "fe80::/10".into()],
+            cache_purge_prefix: "/__admin/cache/purge".into(),
         };
         assert!(cfg.is_ip_allowed("::1"));
         assert!(cfg.is_ip_allowed("fe80::1"));

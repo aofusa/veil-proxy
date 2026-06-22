@@ -171,6 +171,27 @@ flush_interval_ms = 1000
 # 超過すると新しいファイルに切り替え（0=ローテーションなし）
 max_log_size = 104857600
 
+
+# ==========================================
+# 構造化アクセスログ（F-21）
+# ==========================================
+#
+# HTTP リクエストのアクセスログを JSON / テキスト形式で出力する。
+# アプリケーションログ（[logging]）とは独立したファイルに書き込める。
+#
+# スレッドローカルバッファを使用してヒープアロケーションを最小化。
+#
+# [access_log]
+# enabled = true
+# format = "json"              # "json" または "text"
+# file_path = "/var/log/veil/access.log"  # 省略時は stderr（[logging] の出力先と同じ）
+# # 出力フィールドを限定する（省略時は全フィールドを出力）
+# fields = [
+#   "timestamp", "method", "host", "path", "status",
+#   "duration_ms", "client_ip", "upstream",
+#   "req_body_size", "resp_body_size", "user_agent"
+# ]
+
 # ログファイルパス（オプション）
 # 指定しない場合は標準エラー出力に出力
 # file_path = "/var/log/veil.log"

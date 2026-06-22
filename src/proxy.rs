@@ -51,6 +51,10 @@ use crate::simple_tls::SimpleTlsServerStream as ServerTls;
 // 接続処理
 // ====================
 
+/// プロキシ起動時刻（F-21: 管理API /stats 用）
+static PROXY_START_TIME: once_cell::sync::Lazy<std::time::Instant> =
+    once_cell::sync::Lazy::new(std::time::Instant::now);
+
 // ====================
 // 共通セキュリティチェック（HTTP/1.1, HTTP/2, HTTP/3 共用）
 // ====================
@@ -107,6 +111,40 @@ impl SecurityCheckResult {
 /// 3. レートリミット（rate_limit_requests_per_min）
 /// 4. ボディサイズ制限（max_request_body_size）
 /// 
+/// 管理 API: 設定情報をJSON形式で返す（F-21: GET /__admin/config）
+///
+/// secret フィールドは "***" にマスクする。
+fn build_admin_config_json(config: &crate::config::RuntimeConfig) -> String {
+    let admin = &config.admin_config;
+    let prom = &config.prometheus_config;
+
+    // secret をマスク
+    let secret_masked = if admin.secret.is_empty() { "" } else { "***" };
+
+    // allowed_ips を JSON 配列に変換
+    let allowed_ips_json = {
+        let mut s = String::from("[");
+        for (i, ip) in admin.allowed_ips.iter().enumerate() {
+            if i > 0 { s.push(','); }
+            s.push('"');
+            s.push_str(ip);
+            s.push('"');
+        }
+        s.push(']');
+        s
+    };
+
+    format!(
+        "{{\"admin\":{{\"enabled\":{},\"path_prefix\":\"{}\",\"secret\":\"{}\",\"allowed_ips\":{}}},\"prometheus\":{{\"enabled\":{},\"path\":\"{}\"}}}}",
+        admin.enabled,
+        admin.path_prefix,
+        secret_masked,
+        allowed_ips_json,
+        prom.enabled,
+        prom.path,
+    )
+}
+
 /// 管理 API: キャッシュ Purge リクエストを処理する（F-20）
 ///
 /// クエリパラメータをパースし、キャッシュマネージャーの purge メソッドを呼ぶ。
@@ -459,7 +497,7 @@ where
                 
                 // アクセスログ出力（log_access内でrecord_request_metricsも呼ばれるため、個別の呼び出しは不要）
                 let (status, resp_size) = result.unwrap_or((500, 0));
-                log_access(&method, &authority, &path, &user_agent, body_len as u64, status, resp_size, start_instant);
+                log_access(&method, &authority, &path, &user_agent, body_len as u64, status, resp_size, start_instant, client_ip, "");
             }
             Ok(None) => {
                 // フレーム処理完了、次のフレームへ
@@ -2502,18 +2540,18 @@ async fn handle_requests(
                         if !prom_config.is_ip_allowed(client_ip) {
                             let err_buf = ERR_MSG_FORBIDDEN.to_vec();
                             let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
-                            log_access(&method_bytes, &host_bytes, &path_bytes, &user_agent, 0, 403, 0, start_instant);
+                            log_access(&method_bytes, &host_bytes, &path_bytes, &user_agent, 0, 403, 0, start_instant, client_ip, "");
                             accumulated.clear();
                             return;
                         }
-                        
+
                         let metrics_response = build_metrics_response();
                         let resp_size = metrics_response.len() as u64;
-                        
+
                         let write_result = timeout(WRITE_TIMEOUT, tls_stream.write_all(metrics_response)).await;
                         match write_result {
                             Ok((Ok(_), _)) => {
-                                log_access(&method_bytes, &host_bytes, &path_bytes, &user_agent, 0, 200, resp_size, start_instant);
+                                log_access(&method_bytes, &host_bytes, &path_bytes, &user_agent, 0, 200, resp_size, start_instant, client_ip, "");
                             }
                             _ => {}
                         }
@@ -2530,8 +2568,8 @@ async fn handle_requests(
                     let config = CURRENT_CONFIG.load();
                     let admin_config = &config.admin_config;
                     let is_purge_method = method_bytes.as_ref() == b"PURGE";
-                    let admin_prefix = format!("{}/cache/purge", admin_config.path_prefix);
-                    let is_admin_purge_path = path_str.starts_with(&admin_prefix);
+                    // パフォーマンス最適化: 事前計算済みプレフィックスを使用（format! 排除）
+                    let is_admin_purge_path = path_str.starts_with(&admin_config.cache_purge_prefix);
 
                     if admin_config.enabled && (is_purge_method || is_admin_purge_path) {
                         let start_instant = Instant::now();
@@ -2567,9 +2605,102 @@ async fn handle_requests(
                             400
                         };
                         let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(response)).await;
-                        log_access(&method_bytes, &host_bytes, &path_bytes, &user_agent, 0, status, resp_size, start_instant);
+                        log_access(&method_bytes, &host_bytes, &path_bytes, &user_agent, 0, status, resp_size, start_instant, client_ip, "");
                         accumulated.clear();
                         return;
+                    }
+                }
+
+                // 管理 API エンドポイントの処理（F-21: /config, /stats, /reload, /tls/reload）
+                {
+                    let config = CURRENT_CONFIG.load();
+                    let admin_config = &config.admin_config;
+
+                    if admin_config.enabled && path_str.starts_with(&admin_config.path_prefix)
+                        && method_bytes.as_ref() != b"PURGE"
+                        && !path_str.starts_with(&admin_config.cache_purge_prefix)
+                    {
+                        // GET /__admin/config, GET /__admin/stats,
+                        // POST /__admin/reload, POST /__admin/tls/reload のみを処理
+                        let path_suffix = &path_str[admin_config.path_prefix.len()..];
+                        let is_known_endpoint = matches!(
+                            (method_bytes.as_ref(), path_suffix),
+                            (b"GET", "/config") | (b"GET", "/stats")
+                            | (b"POST", "/reload") | (b"POST", "/tls/reload")
+                        );
+
+                        if is_known_endpoint {
+                            let start_instant = Instant::now();
+
+                            // IP制限チェック
+                            let response: Vec<u8> = if !admin_config.is_ip_allowed(client_ip) {
+                                b"HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"error\":\"403\"}".to_vec()
+                            } else {
+                                // Authorization ヘッダーを取得
+                                let auth = headers_for_proxy.iter().find_map(|(name, value)| {
+                                    if name.eq_ignore_ascii_case(b"authorization") {
+                                        std::str::from_utf8(value).ok()
+                                    } else {
+                                        None
+                                    }
+                                });
+
+                                if !admin_config.check_auth(auth) {
+                                    b"HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"error\":\"401\"}".to_vec()
+                                } else {
+                                    // 認証成功: エンドポイントに応じた処理
+                                    match (method_bytes.as_ref(), path_suffix) {
+                                        (b"GET", "/config") => {
+                                            // 設定情報をJSON形式で返す（secret はマスク）
+                                            let body = build_admin_config_json(&config);
+                                            let mut resp = format!(
+                                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                                body.len()
+                                            ).into_bytes();
+                                            resp.extend_from_slice(body.as_bytes());
+                                            resp
+                                        }
+                                        (b"GET", "/stats") => {
+                                            // 起動からの経過時間を返す
+                                            // PROXY_START_TIME を初回アクセスで初期化
+                                            let uptime_secs = PROXY_START_TIME.elapsed().as_secs();
+                                            let body = format!("{{\"uptime_secs\":{}}}", uptime_secs);
+                                            let mut resp = format!(
+                                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                                body.len()
+                                            ).into_bytes();
+                                            resp.extend_from_slice(body.as_bytes());
+                                            resp
+                                        }
+                                        (b"POST", "/reload") => {
+                                            // 設定リロードフラグを立てる
+                                            use std::sync::atomic::Ordering;
+                                            RELOAD_FLAG.store(true, Ordering::Relaxed);
+                                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 10\r\nConnection: close\r\n\r\n{\"ok\":true}".to_vec()
+                                        }
+                                        (b"POST", "/tls/reload") => {
+                                            // TLS証明書リロードフラグを立てる
+                                            use std::sync::atomic::Ordering;
+                                            TLS_RELOAD_FLAG.store(true, Ordering::Relaxed);
+                                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 10\r\nConnection: close\r\n\r\n{\"ok\":true}".to_vec()
+                                        }
+                                        _ => {
+                                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                                        }
+                                    }
+                                }
+                            };
+
+                            let resp_size = response.len() as u64;
+                            let status = if response.starts_with(b"HTTP/1.1 200") { 200 }
+                                else if response.starts_with(b"HTTP/1.1 401") { 401 }
+                                else if response.starts_with(b"HTTP/1.1 403") { 403 }
+                                else { 400 };
+                            let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(response)).await;
+                            log_access(&method_bytes, &host_bytes, &path_bytes, &user_agent, 0, status, resp_size, start_instant, client_ip, "");
+                            accumulated.clear();
+                            return;
+                        }
                     }
                 }
 
@@ -2740,7 +2871,7 @@ async fn handle_requests(
                                     let write_result = timeout(WRITE_TIMEOUT, tls_stream.write_all(response)).await;
                                     match write_result {
                                         Ok((Ok(_), _)) => {
-                                            log_access(&method_bytes, &host_bytes, &path_bytes, &user_agent, 0, resp.status_code, resp_size, start_instant);
+                                            log_access(&method_bytes, &host_bytes, &path_bytes, &user_agent, 0, resp.status_code, resp_size, start_instant, client_ip, "");
                                             // WASMライフサイクルコールバック: リクエスト完了
                                             crate::wasm::on_request_complete_async(wasm_engine.clone(), modules_to_apply.clone()).await;
                                         }
@@ -2805,8 +2936,8 @@ async fn handle_requests(
                         
                         match ws_result {
                             Some((status, resp_size)) => {
-                                log_access(&method_bytes, &host_bytes, &path_bytes, &user_agent, content_length as u64, status, resp_size, start_instant);
-                                
+                                log_access(&method_bytes, &host_bytes, &path_bytes, &user_agent, content_length as u64, status, resp_size, start_instant, client_ip, "");
+
                                 // WASMライフサイクルコールバック: リクエスト完了
                                 #[cfg(feature = "wasm")]
                                 {
@@ -2853,7 +2984,7 @@ async fn handle_requests(
 
                 match result {
                     Some((stream_back, status, resp_size, should_close)) => {
-                        log_access(&method_bytes, &host_bytes, &path_bytes, &user_agent, content_length as u64, status, resp_size, start_instant);
+                        log_access(&method_bytes, &host_bytes, &path_bytes, &user_agent, content_length as u64, status, resp_size, start_instant, client_ip, "");
 
                         // WASMライフサイクルコールバック: リクエスト完了
                         #[cfg(feature = "wasm")]

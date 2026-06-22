@@ -14643,3 +14643,129 @@ async fn test_otel_does_not_affect_metrics_endpoint() {
 
     eprintln!("OTel + Metrics coexistence test: both work correctly");
 }
+
+// ====================
+// F-21: Admin API 拡張 E2E テスト
+// ====================
+
+#[tokio::test]
+#[ntest::timeout(15000)]
+async fn test_e2e_admin_stats() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let response = send_request(
+        PROXY_PORT,
+        "/__admin/stats",
+        &[("Authorization", "Bearer test-admin-secret")],
+    ).await;
+    assert!(response.is_some(), "/__admin/stats should return a response");
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    assert_eq!(status, Some(200), "/__admin/stats should return 200");
+    assert!(response.contains("uptime_secs"), "stats should contain uptime_secs");
+
+    eprintln!("Admin stats E2E test: passed");
+}
+
+#[tokio::test]
+#[ntest::timeout(15000)]
+async fn test_e2e_admin_config() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let response = send_request(
+        PROXY_PORT,
+        "/__admin/config",
+        &[("Authorization", "Bearer test-admin-secret")],
+    ).await;
+    assert!(response.is_some(), "/__admin/config should return a response");
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    assert_eq!(status, Some(200), "/__admin/config should return 200");
+    // secretはマスクされていること
+    assert!(!response.contains("test-admin-secret"), "secret must be masked in config dump");
+
+    eprintln!("Admin config E2E test: passed");
+}
+
+#[tokio::test]
+#[ntest::timeout(15000)]
+async fn test_e2e_admin_reload() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let response = send_request_with_method(
+        PROXY_PORT,
+        "/__admin/reload",
+        "POST",
+        &[("Authorization", "Bearer test-admin-secret")],
+        None,
+    ).await;
+    assert!(response.is_some(), "/__admin/reload should return a response");
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    assert_eq!(status, Some(200), "/__admin/reload should return 200");
+    assert!(response.contains("\"ok\":true"), "reload should return {{\"ok\":true}}");
+
+    eprintln!("Admin reload E2E test: passed");
+}
+
+#[tokio::test]
+#[ntest::timeout(15000)]
+async fn test_e2e_admin_tls_reload() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let response = send_request_with_method(
+        PROXY_PORT,
+        "/__admin/tls/reload",
+        "POST",
+        &[("Authorization", "Bearer test-admin-secret")],
+        None,
+    ).await;
+    assert!(response.is_some(), "/__admin/tls/reload should return a response");
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    assert_eq!(status, Some(200), "/__admin/tls/reload should return 200");
+    assert!(response.contains("\"ok\":true"), "tls/reload should return {{\"ok\":true}}");
+
+    eprintln!("Admin TLS reload E2E test: passed");
+}
+
+#[tokio::test]
+#[ntest::timeout(15000)]
+async fn test_e2e_admin_unauthorized() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    // 認証なし → 401
+    let response = send_request(PROXY_PORT, "/__admin/stats", &[]).await;
+    assert!(response.is_some(), "Should get a response even without auth");
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    assert_eq!(status, Some(401), "Missing auth should return 401");
+
+    // 誤ったシークレット → 401
+    let response = send_request(
+        PROXY_PORT,
+        "/__admin/stats",
+        &[("Authorization", "Bearer wrong-secret")],
+    ).await;
+    assert!(response.is_some(), "Should get a response with wrong auth");
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    assert_eq!(status, Some(401), "Wrong auth should return 401");
+
+    eprintln!("Admin unauthorized E2E test: passed");
+}
