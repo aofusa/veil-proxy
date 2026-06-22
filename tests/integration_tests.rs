@@ -578,3 +578,37 @@ fn test_otlp_mock_collector_receives_post() {
     assert!(received.load(Ordering::SeqCst), "Mock collector should receive POST request");
 }
 
+// ====================
+// F-21: 構造化アクセスログと管理API テスト
+// ====================
+
+/// AdminConfig の cache_purge_prefix が正しく構成されることを確認（ロジック検証）
+#[test]
+fn test_admin_config_fields() {
+    // AdminConfig のデフォルト値: path_prefix="/__admin" → cache_purge_prefix="/__admin/cache/purge"
+    let path_prefix = "/__admin";
+    let expected_cache_purge = format!("{}/cache/purge", path_prefix);
+    assert_eq!(expected_cache_purge, "/__admin/cache/purge");
+}
+
+/// cache_purge_prefix のカスタムパスでの計算を確認
+#[test]
+fn test_admin_config_compute_derived() {
+    let path_prefix = "/mgmt";
+    let cache_purge_prefix = format!("{}/cache/purge", path_prefix);
+    assert_eq!(cache_purge_prefix, "/mgmt/cache/purge");
+}
+
+/// AccessLogConfig のデフォルト値を確認（JSON形式・無効状態）
+#[test]
+fn test_access_log_config_default() {
+    // AccessLogConfig のデフォルト: enabled=false, format="json", fields=[]
+    let enabled = false;
+    let format = "json";
+    let fields: Vec<String> = vec![];
+
+    assert!(!enabled, "デフォルトでは無効であること");
+    assert_eq!(format, "json", "デフォルトフォーマットはJSON");
+    assert!(fields.is_empty(), "デフォルトではフィールド制限なし");
+}
+

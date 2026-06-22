@@ -56,7 +56,7 @@
 | F-18 | P1 | 未着手 | [features/l4-stream-proxy.md](features/l4-stream-proxy.md) | L4 (TCP/UDP) ストリームプロキシ |
 | F-19 | P2 | 完了 | [features/advanced-load-balancing.md](features/advanced-load-balancing.md) | 高度なロードバランシング (Weighted, Consistent Hash等) |
 | F-20 | P2 | 完了 | [features/proxy-cache-purge-advanced.md](features/proxy-cache-purge-advanced.md) | キャッシュのPurge機能・制御高度化 |
-| F-21 | P2 | 未着手 | [features/structured-access-log-admin.md](features/structured-access-log-admin.md) | 構造化アクセスログと管理Admin API |
+| F-21 | P2 | 完了 | [features/structured-access-log-admin.md](features/structured-access-log-admin.md) | 構造化アクセスログと管理Admin API |
 | F-22 | P2 | 未着手 | [features/enhanced-health-check.md](features/enhanced-health-check.md) | ヘルスチェックの強化 (Active probing, TCP) |
 | F-23 | P1 | 完了 | [features/refactor-cargo-features.md](features/refactor-cargo-features.md) | Cargo.toml の features フラグ整理 |
 | F-11 | P3 | 未着手 | [features/dashboard.md](features/dashboard.md) | ダッシュボード機能 |

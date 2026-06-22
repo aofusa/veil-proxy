@@ -472,6 +472,8 @@ pub(crate) fn log_access(
     status: u16,
     resp_body_size: u64,
     start_instant: Instant,
+    client_ip: &str,   // F-21: クライアントIPアドレス
+    upstream: &str,    // F-21: アップストリームアドレス
 ) {
     // 処理時間は Instant で高精度計測
     let duration = start_instant.elapsed();
@@ -491,4 +493,18 @@ pub(crate) fn log_access(
 
     // Prometheusメトリクスを記録
     record_request_metrics(method_str, host_str, status, req_body_size, resp_body_size, duration_secs);
+
+    // 構造化アクセスログ出力（F-21）
+    crate::access_log::log_access_structured(
+        method_str,
+        host_str,
+        path_str,
+        ua_str,
+        req_body_size,
+        status,
+        resp_body_size,
+        start_instant,
+        client_ip,
+        upstream,
+    );
 }

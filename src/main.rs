@@ -217,6 +217,11 @@ pub mod resilience;
 #[cfg(feature = "opentelemetry")]
 pub mod otel;
 pub mod http_utils;
+
+/// 構造化アクセスログモジュール（F-21）
+/// - AccessLogConfig（JSON/テキスト形式、フィールドフィルタリング）
+/// - log_access_structured（スレッドローカルバッファによる低アロケーション実装）
+pub mod access_log;
 use crate::pool::*;
 #[cfg(test)]
 use crate::constants::*;
@@ -419,6 +424,7 @@ fn main() {
         global_security: Arc::new(loaded_config.global_security.clone()),
         prometheus_config: Arc::new(loaded_config.prometheus_config.clone()),
         admin_config: Arc::new(loaded_config.admin_config.clone()),
+        access_log_config: Arc::new(loaded_config.access_log_config.clone()),
         upstream_groups: loaded_config.upstream_groups.clone(),
         #[cfg(feature = "http2")]
         http2_enabled: loaded_config.http2_enabled,
