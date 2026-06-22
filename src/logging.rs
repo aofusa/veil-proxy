@@ -75,7 +75,7 @@ pub(crate) enum LogFormat {
 
 /// ログ設定セクション
 #[derive(Deserialize, Clone, Debug)]
-pub(crate) struct LoggingConfigSection {
+pub struct LoggingConfigSection {
     /// ログレベル
     /// - "trace": 全てのログ（開発/デバッグ用）
     /// - "debug": デバッグ情報

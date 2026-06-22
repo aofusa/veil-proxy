@@ -644,6 +644,7 @@ pub fn url_decode(input: &str) -> String {
 /// - "example.com" → 完全一致
 /// - "*.example.com" → サブドメインにマッチ（例: "api.example.com", "www.example.com"）
 /// - "api.*.com" → サポートしない（先頭または末尾のみ）
+#[allow(dead_code)]
 pub(crate) fn matches_wildcard(pattern: &str, text: &str) -> bool {
     if pattern == text {
         return true;
@@ -676,6 +677,7 @@ pub(crate) fn matches_wildcard(pattern: &str, text: &str) -> bool {
 /// - "/api" → 完全一致
 /// - "/api/*" → "/api/" で始まるすべてのパスにマッチ
 /// - "/api/v2/*" → "/api/v2/" で始まるすべてのパスにマッチ
+#[allow(dead_code)]
 pub(crate) fn matches_path_pattern(pattern: &str, path: &[u8]) -> bool {
     let path_str = match std::str::from_utf8(path) {
         Ok(s) => s,
@@ -704,6 +706,7 @@ pub(crate) fn matches_path_pattern(pattern: &str, path: &[u8]) -> bool {
 }
 
 /// ソースIPがCIDR範囲に含まれるかチェック
+#[allow(dead_code)]
 pub(crate) fn matches_cidr(ip: &SocketAddr, cidr_ranges: &[String]) -> bool {
     use std::net::IpAddr;
 

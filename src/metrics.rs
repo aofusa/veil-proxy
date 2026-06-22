@@ -263,6 +263,7 @@ pub(crate) fn record_cache_miss(_host: &str) {
 }
 
 /// メトリクス: キャッシュ保存を記録
+#[allow(dead_code)]
 #[inline]
 pub(crate) fn record_cache_store(_host: &str, _storage: &str) {
     #[cfg(feature = "metrics")]
@@ -426,6 +427,7 @@ pub(crate) fn encode_prometheus_metrics() -> Vec<u8> {
 
 /// metrics feature 無効時のスタブ
 #[cfg(not(feature = "metrics"))]
+#[allow(dead_code)]
 #[inline]
 pub(crate) fn encode_prometheus_metrics() -> Vec<u8> {
     Vec::new()

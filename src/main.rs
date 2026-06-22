@@ -213,69 +213,34 @@ pub mod metrics;
 pub mod constants;
 pub mod pool;
 pub mod http_utils;
-use crate::constants::*;
 use crate::pool::*;
+#[cfg(test)]
+use crate::constants::*;
+#[cfg(test)]
 use crate::http_utils::*;
-
 use crate::logging::*;
 use crate::system::*;
 use crate::metrics::*;
 
-use httparse::{Request, Status};
-use monoio::fs::OpenOptions;
-use monoio::buf::{IoBuf, IoBufMut, IoVecBuf, IoVecBufMut};
-use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
-use monoio::net::{TcpListener, TcpStream};
+use monoio::net::TcpListener;
 use monoio::RuntimeBuilder;
 use monoio::time::timeout;
 use clap::Parser;
-use serde::Deserialize;
-use std::cell::RefCell;
-use std::fs;
-use std::fs::File;
-use std::io;
-use std::io::BufReader;
 use std::net::SocketAddr;
-#[cfg(target_os = "linux")]
-use std::os::unix::io::{AsRawFd, RawFd};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-#[cfg(target_os = "linux")]
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use ftlog::{info, error, warn, debug};
-use memchr::memchr3;
-use arc_swap::ArcSwap;
-use once_cell::sync::Lazy;
-
-// rustls 共通インポート
-use rustls::ServerConfig;
 use rustls::crypto::CryptoProvider;
-use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 
 // ktls_rustls（kTLS 対応）
 #[cfg(feature = "ktls")]
-use ktls_rustls::{RustlsAcceptor, RustlsConnector, KtlsServerStream, KtlsClientStream};
-
-// ====================
-// TLS ストリーム型エイリアス
-// ====================
-//
-// ktls フィーチャーの有無に応じて、使用する TLS ストリーム型を切り替えます。
-// kTLS 有効時は ktls_rustls モジュールの型を使用し、
-// 無効時はシンプルな rustls ラッパーを使用します。
-
-#[cfg(feature = "ktls")]
-type ServerTls = KtlsServerStream;
+use ktls_rustls::RustlsAcceptor;
 
 // kTLS 無効時は直接 rustls を使用するシンプルなラッパー
 #[cfg(not(feature = "ktls"))]
 mod simple_tls;
-
-#[cfg(not(feature = "ktls"))]
-type ServerTls = simple_tls::SimpleTlsServerStream;
 
 // ClientTls は crate::pool モジュールで定義・再エクスポートされています
 // use crate::pool::* でインポート済み

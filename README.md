@@ -2768,12 +2768,12 @@ Veil includes comprehensive test suites covering unit tests, integration tests, 
 
 | Test Type | Count | Status |
 |-----------|-------|--------|
-| **Unit Tests** | 251 | ✅ All passing |
-| **Integration Tests** | 13 | ✅ All passing |
-| **E2E Tests** | 24 | ✅ All passing |
+| **Unit Tests** | 469 | ✅ All passing |
+| **Integration Tests** | 12 | ✅ All passing |
+| **E2E Tests** | 23 | ✅ All passing |
 | **Benchmarks** | 12 files | ✅ Ready |
 
-**Total: 288 tests - All passing ✅**
+**Total: 504 tests - All passing ✅**
 
 ### Running Tests
 
@@ -2781,20 +2781,20 @@ Veil includes comprehensive test suites covering unit tests, integration tests, 
 
 ```bash
 # Run all unit tests
-cargo test --features http2
+cargo test --features full --bin veil
 
 # Run specific test module
-cargo test --features http2 tests::rate_limit_tests
+cargo test --features full --bin veil wasm::tests
 
 # Run with output
-cargo test --features http2 -- --nocapture
+cargo test --features full --bin veil -- --nocapture
 ```
 
 #### Integration Tests
 
 ```bash
 # Run integration tests
-cargo test --test integration_tests --features http2
+cargo test --test integration_tests --features full
 ```
 
 #### E2E Tests
@@ -2807,7 +2807,7 @@ E2E tests require a running test environment. Use the setup script:
 
 # Method 2: Manual
 ./tests/e2e_setup.sh start
-cargo test --test e2e_tests --features http2 -- --test-threads=1
+cargo test --test e2e_tests --features full -- --test-threads=1
 ./tests/e2e_setup.sh stop
 
 # Cleanup only
@@ -2821,11 +2821,11 @@ cargo test --test e2e_tests --features http2 -- --test-threads=1
 ./tests/e2e_setup.sh start
 
 # Run all benchmarks
-cargo bench --features http2
+cargo bench --features full
 
 # Run specific benchmark
-cargo bench --bench throughput --features http2
-cargo bench --bench latency --features http2
+cargo bench --bench throughput --features full
+cargo bench --bench latency --features full
 
 # Stop environment
 ./tests/e2e_setup.sh stop
@@ -2838,7 +2838,7 @@ cargo bench --bench latency --features http2
 
 ### Test Coverage
 
-#### Unit Tests (251 tests)
+#### Unit Tests (469 tests)
 
 - **CIDR/IP Filtering**: IP address filtering, CIDR range validation
 - **Rate Limiting**: Sliding window rate limiting, entry management
@@ -2849,9 +2849,10 @@ cargo bench --bench latency --features http2
 - **Cache Management**: Memory/disk cache, key generation
 - **HTTP/2**: Frame encoding/decoding, HPACK compression
 - **Security**: Security configuration, kernel version detection
+- **WASM**: Proxy-Wasm ABI, filter lifecycle, host function callbacks
 - **Utilities**: Various helper functions
 
-#### Integration Tests (13 tests)
+#### Integration Tests (12 tests)
 
 - TCP connection handling
 - HTTP server responses
@@ -2861,7 +2862,7 @@ cargo bench --bench latency --features http2
 - Configuration file generation
 - Port availability utilities
 
-#### E2E Tests (24 tests)
+#### E2E Tests (23 tests)
 
 - **Proxy Core**: Basic requests, health endpoints
 - **Header Manipulation**: Add/remove headers, backend ID

@@ -18,6 +18,7 @@ pub(crate) use crate::simple_tls::SimpleTlsClientStream as ClientTls;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+#[cfg(feature = "ktls")]
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -219,6 +220,7 @@ unsafe impl IoBufMut for SafeReadBuffer {
 // セキュリティ制限
 pub(crate) const MAX_HEADER_SIZE: usize = 8192;     // 8KB - ヘッダーサイズ上限
 pub(crate) const MAX_BODY_SIZE: usize = 10485760;   // 10MB - ボディサイズ上限
+#[allow(dead_code)]
 pub(crate) const MAX_GRPC_BODY_SIZE: usize = 1_048_576; // 1MB - gRPCメッセージサイズ上限
 
 // タイムアウト設定
