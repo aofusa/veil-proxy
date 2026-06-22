@@ -148,6 +148,12 @@ pub mod http3_server;
 #[cfg(feature = "http3")]
 pub mod udp;
 
+/// カスタム io_uring ランタイム（monoio 置き換え）
+/// - thread-per-core 設計
+/// - IORING_REGISTER_RESTRICTIONS によるセキュリティ強化
+/// - 所有権ベース非同期 I/O
+pub mod runtime;
+
 /// セキュリティ強化モジュール
 /// - io_uring操作制限（IORING_REGISTER_RESTRICTIONS）
 /// - seccompシステムコール制限
@@ -211,38 +217,37 @@ pub mod system;
 pub mod metrics;
 
 pub mod constants;
-pub mod pool;
-pub mod resilience;
+pub mod http_utils;
 /// OpenTelemetry OTLP/HTTP エクスポート（F-10）
 #[cfg(feature = "opentelemetry")]
 pub mod otel;
-pub mod http_utils;
+pub mod pool;
+pub mod resilience;
 
 /// 構造化アクセスログモジュール（F-21）
 /// - AccessLogConfig（JSON/テキスト形式、フィールドフィルタリング）
 /// - log_access_structured（スレッドローカルバッファによる低アロケーション実装）
 #[cfg(feature = "access-log")]
 pub mod access_log;
-use crate::pool::*;
 #[cfg(test)]
 use crate::constants::*;
 #[cfg(test)]
 use crate::http_utils::*;
 use crate::logging::*;
-use crate::system::*;
 use crate::metrics::*;
+use crate::pool::*;
+use crate::system::*;
 
-use monoio::net::TcpListener;
-use monoio::RuntimeBuilder;
-use monoio::time::timeout;
+use crate::runtime::tcp::TcpListener;
+use crate::runtime::time::timeout;
 use clap::Parser;
+use ftlog::{debug, error, info, warn};
+use rustls::crypto::CryptoProvider;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use ftlog::{info, error, warn, debug};
-use rustls::crypto::CryptoProvider;
 
 // ktls_rustls（kTLS 対応）
 #[cfg(feature = "ktls")]
@@ -257,7 +262,6 @@ pub mod tls_reload;
 
 // ClientTls は crate::pool モジュールで定義・再エクスポートされています
 // use crate::pool::* でインポート済み
-
 
 /// 設定モジュール（データ型・設定読み込み関数）
 pub mod config;
@@ -280,37 +284,41 @@ use crate::proxy::*;
 fn main() {
     // コマンドライン引数を解析（--help, --version は clap が自動処理）
     let cli_args = CliArgs::parse();
-    
+
     // 設定ファイルパスをグローバル変数に保存（ホットリロード用）
     CONFIG_PATH.store(Arc::new(cli_args.config.clone()));
     let config_path = cli_args.config;
-    
+
     // -t オプション: 設定ファイルのテストのみ
     if cli_args.test_config {
         match test_config_file(&config_path) {
             Ok(()) => {
-                println!("veil: configuration file {} test is successful", 
-                         config_path.display());
+                println!(
+                    "veil: configuration file {} test is successful",
+                    config_path.display()
+                );
                 std::process::exit(0);
             }
             Err(e) => {
-                eprintln!("veil: configuration file {} test failed", 
-                          config_path.display());
+                eprintln!(
+                    "veil: configuration file {} test failed",
+                    config_path.display()
+                );
                 eprintln!("veil: {}", e);
                 std::process::exit(1);
             }
         }
     }
-    
+
     // プロセスレベルで暗号プロバイダーをインストール（aws-lc-rs使用）
     CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
         .expect("Failed to install rustls crypto provider");
-    
+
     // ログ設定を先に読み込む（ログ初期化前）
     // 設定ファイルが読めない場合はデフォルト設定を使用
-    let logging_config = load_logging_config(&config_path)
-        .unwrap_or_else(|_| LoggingConfigSection::default());
-    
+    let logging_config =
+        load_logging_config(&config_path).unwrap_or_else(|_| LoggingConfigSection::default());
+
     // ftlogを設定に基づいて初期化
     // ftlogは内部でバックグラウンドスレッドとチャネルを使用した非同期ログライブラリ
     // 追加の非同期化層（tokio::sync::mpsc等）は不要
@@ -332,28 +340,34 @@ fn main() {
             return;
         }
     };
-    
+
     // Huge Pages (Large OS Pages) 設定
     // mimallocでHuge Pagesを有効化し、TLBミスを削減
     // 注: グローバルアロケータは静的初期化されるため、
     //     この設定は以降の新規割り当てに影響する
     configure_huge_pages(loaded_config.huge_pages_enabled);
-    
+
     // グレースフルシャットダウンタイムアウトを設定
-    GRACEFUL_SHUTDOWN_TIMEOUT_SECS.store(loaded_config.graceful_shutdown_timeout_secs, Ordering::Relaxed);
+    GRACEFUL_SHUTDOWN_TIMEOUT_SECS.store(
+        loaded_config.graceful_shutdown_timeout_secs,
+        Ordering::Relaxed,
+    );
     if loaded_config.graceful_shutdown_timeout_secs > 0 {
-        info!("Graceful shutdown timeout: {} seconds", loaded_config.graceful_shutdown_timeout_secs);
+        info!(
+            "Graceful shutdown timeout: {} seconds",
+            loaded_config.graceful_shutdown_timeout_secs
+        );
     } else {
         info!("Graceful shutdown timeout: disabled (immediate shutdown)");
     }
-    
+
     // TLS アクセプターを作成
     #[cfg(feature = "ktls")]
     let acceptor = RustlsAcceptor::new(loaded_config.tls_config.clone())
         .with_ktls(loaded_config.ktls_config.enabled)
         .with_fallback(loaded_config.ktls_config.fallback_enabled)
         .with_tcp_cork(loaded_config.ktls_config.tcp_cork_enabled);
-    
+
     #[cfg(not(feature = "ktls"))]
     let acceptor = simple_tls::SimpleTlsAcceptor::new(loaded_config.tls_config.clone())
         .with_ktls(loaded_config.ktls_config.enabled);
@@ -399,7 +413,10 @@ fn main() {
         match tls_reload::TlsCertReloader::new_global(cert_path, key_path, builder) {
             Ok(reloader) => {
                 spawn_tls_reloader(reloader, interval);
-                info!("TLS certificate auto-reload enabled (interval: {}s, SIGHUP supported)", interval);
+                info!(
+                    "TLS certificate auto-reload enabled (interval: {}s, SIGHUP supported)",
+                    interval
+                );
             }
             Err(e) => {
                 warn!("Failed to initialize TLS cert reloader: {}", e);
@@ -407,14 +424,16 @@ fn main() {
         }
     }
 
-    let listen_addr = loaded_config.listen_addr.parse::<SocketAddr>()
+    let listen_addr = loaded_config
+        .listen_addr
+        .parse::<SocketAddr>()
         .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 443)));
-    
+
     // HTTPSリダイレクト用ポートを保存（HTTP→HTTPSリダイレクト時に使用）
     HTTPS_REDIRECT_PORT.store(listen_addr.port(), std::sync::atomic::Ordering::Relaxed);
-    
+
     let ktls_config = Arc::new(loaded_config.ktls_config.clone());
-    
+
     // CURRENT_CONFIG を初期化（ホットリロード対応）
     // ワーカースレッドは CURRENT_CONFIG.load() を使用して最新の設定を取得
     let runtime_config = RuntimeConfig {
@@ -445,7 +464,7 @@ fn main() {
     };
     CURRENT_CONFIG.store(Arc::new(runtime_config));
     info!("Runtime configuration initialized (hot reload enabled via SIGHUP)");
-    
+
     // グローバルプロキシキャッシュの初期化
     // デフォルト設定でグローバルキャッシュを初期化（各ルートのcache設定で有効化される）
     let global_cache_config = cache::CacheConfig {
@@ -453,8 +472,8 @@ fn main() {
         max_memory_size: 100 * 1024 * 1024, // 100MB
         disk_path: None,
         max_disk_size: 1024 * 1024 * 1024, // 1GB
-        memory_threshold: 64 * 1024, // 64KB
-        default_ttl_secs: 300, // 5分
+        memory_threshold: 64 * 1024,       // 64KB
+        default_ttl_secs: 300,             // 5分
         ..Default::default()
     };
 
@@ -466,7 +485,7 @@ fn main() {
             warn!("Failed to initialize global cache: {}", e);
         }
     }
-    
+
     // HTTP/2・HTTP/3・H2C の設定ログ
     #[cfg(feature = "http2")]
     if loaded_config.http2_enabled {
@@ -474,21 +493,29 @@ fn main() {
     }
     #[cfg(feature = "http2")]
     if loaded_config.h2c_enabled {
-        let h2c_addr = loaded_config.h2c_listen.as_deref().unwrap_or(&loaded_config.listen_addr);
+        let h2c_addr = loaded_config
+            .h2c_listen
+            .as_deref()
+            .unwrap_or(&loaded_config.listen_addr);
         info!("H2C (HTTP/2 Cleartext) enabled (listener: {})", h2c_addr);
     }
     #[cfg(feature = "http3")]
     if loaded_config.http3_enabled {
-        info!("HTTP/3 enabled (UDP listener: {})", 
-              loaded_config.http3_listen.as_deref().unwrap_or(&loaded_config.listen_addr));
+        info!(
+            "HTTP/3 enabled (UDP listener: {})",
+            loaded_config
+                .http3_listen
+                .as_deref()
+                .unwrap_or(&loaded_config.listen_addr)
+        );
     }
 
     let hostname = hostname::get()
         .map(|h| h.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "unknown".to_string());
-    
+
     let num_threads = loaded_config.num_threads;
-    
+
     info!("============================================");
     info!("High-Performance Reverse Proxy Server");
     info!("Config File: {}", config_path.display());
@@ -496,26 +523,31 @@ fn main() {
     info!("Listen Address: {}", listen_addr);
     info!("Threads: {} (CPU cores: {})", num_threads, num_cpus::get());
     info!("CPU Affinity: Enabled (pinning workers to cores)");
-    info!("Reuseport Balancing: {:?}", loaded_config.reuseport_balancing);
+    info!(
+        "Reuseport Balancing: {:?}",
+        loaded_config.reuseport_balancing
+    );
     info!("Read Timeout: {:?}", READ_TIMEOUT);
     info!("Write Timeout: {:?}", WRITE_TIMEOUT);
     info!("Connect Timeout: {:?}", CONNECT_TIMEOUT);
     info!("Idle Timeout: {:?}", IDLE_TIMEOUT);
-    
+
     // ログ設定のログ出力
-    info!("Logging: level={}, channel_size={}, flush_interval={}ms",
-          loaded_config.logging.level,
-          loaded_config.logging.channel_size,
-          loaded_config.logging.flush_interval_ms);
+    info!(
+        "Logging: level={}, channel_size={}, flush_interval={}ms",
+        loaded_config.logging.level,
+        loaded_config.logging.channel_size,
+        loaded_config.logging.flush_interval_ms
+    );
     if let Some(ref file_path) = loaded_config.logging.file_path {
         info!("Logging: output to file '{}'", file_path);
     } else {
         info!("Logging: output to stderr (async buffered via ftlog)");
     }
-    
+
     // kTLS設定のログ出力
     log_ktls_status(&ktls_config);
-    
+
     info!("============================================");
 
     // 構造化アクセスログライタースレッドを起動（access-log feature が有効な場合のみ）
@@ -531,13 +563,13 @@ fn main() {
 
     // 設定リロードスレッドを起動（SIGHUP で設定を動的更新）
     spawn_reload_thread();
-    
+
     // 健康チェックスレッドを起動（Upstream の健康状態を監視）
     spawn_health_check_thread();
-    
+
     // キャッシュクリーンアップスレッドを起動（期限切れエントリの削除、LRU eviction）
     spawn_cache_cleanup_thread();
-    
+
     // WASMタイマースレッドを起動（on_tick コールバック処理）
     #[cfg(feature = "wasm")]
     spawn_wasm_tick_thread();
@@ -547,10 +579,12 @@ fn main() {
     // CPUアフィニティ設定のためのコアID取得
     let core_ids = core_affinity::get_core_ids();
     let core_ids_available = core_ids.as_ref().map(|ids| ids.len()).unwrap_or(0);
-    
+
     if core_ids.is_some() && core_ids_available > 0 {
-        info!("CPU Affinity: {} cores available, pinning {} worker threads", 
-              core_ids_available, num_threads);
+        info!(
+            "CPU Affinity: {} cores available, pinning {} worker threads",
+            core_ids_available, num_threads
+        );
     } else {
         warn!("CPU Affinity: Could not detect core IDs, workers will not be pinned");
     }
@@ -571,14 +605,14 @@ fn main() {
     // 3. Landlock（ファイルシステム制限）
     // 4. seccomp（システムコール制限）
     // ====================
-    
+
     if loaded_config.global_security.enable_sandbox {
         // サンドボックスサポート状況をレポート
         security::report_sandbox_support();
-        
+
         // サンドボックス設定を構築
         let sandbox_config = build_sandbox_config(&loaded_config.global_security);
-        
+
         match security::apply_sandbox(&sandbox_config) {
             Ok(()) => {
                 info!("Sandbox restrictions applied successfully");
@@ -586,8 +620,10 @@ fn main() {
                     info!("Sandbox: Mount namespace isolated");
                 }
                 if sandbox_config.unshare_uts {
-                    info!("Sandbox: UTS namespace isolated (hostname: {})", 
-                          sandbox_config.hostname.as_deref().unwrap_or("default"));
+                    info!(
+                        "Sandbox: UTS namespace isolated (hostname: {})",
+                        sandbox_config.hostname.as_deref().unwrap_or("default")
+                    );
                 }
                 if sandbox_config.unshare_ipc {
                     info!("Sandbox: IPC namespace isolated");
@@ -596,14 +632,23 @@ fn main() {
                     info!("Sandbox: PID namespace isolated");
                 }
                 if !sandbox_config.keep_capabilities.is_empty() {
-                    info!("Sandbox: Keeping only capabilities: {:?}", sandbox_config.keep_capabilities);
+                    info!(
+                        "Sandbox: Keeping only capabilities: {:?}",
+                        sandbox_config.keep_capabilities
+                    );
                 } else if !sandbox_config.drop_capabilities.is_empty() {
-                    info!("Sandbox: Dropped capabilities: {:?}", sandbox_config.drop_capabilities);
+                    info!(
+                        "Sandbox: Dropped capabilities: {:?}",
+                        sandbox_config.drop_capabilities
+                    );
                 }
             }
             Err(e) => {
                 if loaded_config.global_security.allow_security_failures {
-                    warn!("Failed to apply sandbox restrictions: {} - continuing without sandbox", e);
+                    warn!(
+                        "Failed to apply sandbox restrictions: {} - continuing without sandbox",
+                        e
+                    );
                     warn!("Hint: Sandbox may require root privileges or CAP_SYS_ADMIN");
                 } else {
                     error!("Failed to apply sandbox restrictions: {}", e);
@@ -634,20 +679,20 @@ fn main() {
     // 注意: seccompはプロセス全体に適用され、不可逆です。
     // ワーカースレッド起動後は新しいスレッドにも自動的に継承されます。
     // ====================
-    
+
     // セキュリティ機能のサポート状況をレポート
     security::report_security_status();
-    
+
     // セキュリティ設定を構築
     let security_config = security::SecurityConfig {
-        enable_io_uring_restrictions: false, // monoioでは現在未サポート
+        enable_io_uring_restrictions: true, // カスタム io_uring 実装で IORING_REGISTER_RESTRICTIONS を適用
         enable_seccomp: loaded_config.global_security.enable_seccomp,
         seccomp_mode: security::SeccompMode::from_str(&loaded_config.global_security.seccomp_mode),
         enable_landlock: loaded_config.global_security.enable_landlock,
         landlock_read_paths: loaded_config.global_security.landlock_read_paths.clone(),
         landlock_write_paths: loaded_config.global_security.landlock_write_paths.clone(),
     };
-    
+
     // セキュリティ制限を適用
     if security_config.enable_seccomp || security_config.enable_landlock {
         match security::apply_security_restrictions(&security_config) {
@@ -657,18 +702,22 @@ fn main() {
                     info!("seccomp: mode={:?}", security_config.seccomp_mode);
                 }
                 if security_config.enable_landlock {
-                    info!("Landlock: read_paths={:?}, write_paths={:?}",
-                          security_config.landlock_read_paths,
-                          security_config.landlock_write_paths);
+                    info!(
+                        "Landlock: read_paths={:?}, write_paths={:?}",
+                        security_config.landlock_read_paths, security_config.landlock_write_paths
+                    );
                 }
             }
             Err(e) => {
                 if loaded_config.global_security.allow_security_failures {
-                    warn!("Failed to apply security restrictions: {} - continuing without them", e);
+                    warn!(
+                        "Failed to apply security restrictions: {} - continuing without them",
+                        e
+                    );
                 } else {
                     error!("Failed to apply security restrictions: {}", e);
                     error!("Server startup aborted. To allow failures, set allow_security_failures = true in config.toml");
-                    
+
                     // より詳細なエラーメッセージ
                     if security_config.enable_seccomp {
                         error!("seccomp was enabled but failed to apply");
@@ -678,7 +727,7 @@ fn main() {
                     }
                     error!("Hint: Check kernel version requirements (seccomp: Linux 3.17+, Landlock: Linux 5.13+)");
                     error!("Hint: Ensure required privileges are available");
-                    
+
                     return;
                 }
             }
@@ -687,17 +736,17 @@ fn main() {
 
     // 同時接続数制限
     let max_connections = loaded_config.global_security.max_concurrent_connections;
-    
+
     // H2C専用サーバーの判定
     // H2Cが有効で、h2c_listenが未指定またはlistenと同じ場合、通常のTLSリスナーは不要
     #[cfg(feature = "http2")]
-    let is_h2c_only_server = loaded_config.h2c_enabled 
-        && (loaded_config.h2c_listen.is_none() 
+    let is_h2c_only_server = loaded_config.h2c_enabled
+        && (loaded_config.h2c_listen.is_none()
             || loaded_config.h2c_listen.as_ref().unwrap() == &loaded_config.listen_addr);
-    
+
     #[cfg(not(feature = "http2"))]
     let is_h2c_only_server = false;
-    
+
     // 通常のTLSリスナーを起動（H2C専用サーバーの場合はスキップ）
     if !is_h2c_only_server {
         info!("============================================");
@@ -705,106 +754,105 @@ fn main() {
         info!("Listen Address: {}", listen_addr);
         info!("Workers: {} (SO_REUSEPORT enabled)", num_threads);
         info!("============================================");
-    
-    for thread_id in 0..num_threads {
-        let acceptor_clone = acceptor.clone();
-        // 注: host_routes と path_routes は CURRENT_CONFIG から取得するため、ここでは不要
-        // ホットリロード時に各接続が最新の設定を参照できるようにする
-        let addr = listen_addr;
-        let balancing = reuseport_balancing;
-        let workers = num_threads;
-        let max_conn = max_connections;
-        
-        // このスレッドに割り当てるコアIDを決定
-        // コア数よりスレッド数が多い場合はモジュロ演算でラップアラウンド
-        let assigned_core = core_ids.as_ref().map(|ids| {
-            let core_index = thread_id % ids.len();
-            ids[core_index]
-        });
 
-        let handle = thread::spawn(move || {
-            // スレッド開始直後にCPUアフィニティを設定
-            // これによりL1/L2キャッシュミスを削減し、レイテンシのジッターを安定化
-            if let Some(core_id) = assigned_core {
-                if core_affinity::set_for_current(core_id) {
-                    info!("[Thread {}] Pinned to CPU core {:?}", thread_id, core_id);
-                } else {
-                    warn!("[Thread {}] Failed to pin to CPU core {:?}, running unpinned", 
-                          thread_id, core_id);
+        for thread_id in 0..num_threads {
+            let acceptor_clone = acceptor.clone();
+            // 注: host_routes と path_routes は CURRENT_CONFIG から取得するため、ここでは不要
+            // ホットリロード時に各接続が最新の設定を参照できるようにする
+            let addr = listen_addr;
+            let balancing = reuseport_balancing;
+            let workers = num_threads;
+            let max_conn = max_connections;
+
+            // このスレッドに割り当てるコアIDを決定
+            // コア数よりスレッド数が多い場合はモジュロ演算でラップアラウンド
+            let assigned_core = core_ids.as_ref().map(|ids| {
+                let core_index = thread_id % ids.len();
+                ids[core_index]
+            });
+
+            let handle = thread::spawn(move || {
+                // スレッド開始直後にCPUアフィニティを設定
+                // これによりL1/L2キャッシュミスを削減し、レイテンシのジッターを安定化
+                if let Some(core_id) = assigned_core {
+                    if core_affinity::set_for_current(core_id) {
+                        info!("[Thread {}] Pinned to CPU core {:?}", thread_id, core_id);
+                    } else {
+                        warn!(
+                            "[Thread {}] Failed to pin to CPU core {:?}, running unpinned",
+                            thread_id, core_id
+                        );
+                    }
                 }
-            }
-            
-            let mut rt = RuntimeBuilder::<monoio::IoUringDriver>::new()
-                .enable_timer()
-                .build()
-                .expect("Failed to create runtime");
-            rt.block_on(async move {
-                let listener = match create_listener(addr, balancing, workers, thread_id) {
-                    Ok(l) => l,
-                    Err(e) => {
-                        error!("[Thread {}] Bind error: {}", thread_id, e);
-                        return;
-                    }
-                };
 
-                info!("[Thread {}] Worker started", thread_id);
-
-                loop {
-                    // Shutdown チェック
-                    if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
-                        info!("[Thread {}] Shutting down...", thread_id);
-                        break;
-                    }
-
-                    // タイムアウト付きaccept（Graceful Shutdown対応）
-                    let accept_result = timeout(Duration::from_secs(1), listener.accept()).await;
-                    
-                    let (stream, peer_addr) = match accept_result {
-                        Ok(Ok(s)) => s,
-                        Ok(Err(e)) => {
-                            error!("[Thread {}] Accept error: {}", thread_id, e);
-                            continue;
-                        }
-                        Err(_) => {
-                            // タイムアウト - ループを継続してshutdownチェック
-                            continue;
+                crate::runtime::block_on(async move {
+                    let listener = match create_listener(addr, balancing, workers, thread_id) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            error!("[Thread {}] Bind error: {}", thread_id, e);
+                            return;
                         }
                     };
-                    
-                    // 同時接続数制限チェック
-                    if max_conn > 0 {
-                        let current = CURRENT_CONNECTIONS.load(Ordering::Relaxed);
-                        if current >= max_conn {
-                            warn!("[Thread {}] Connection limit reached ({}/{}), rejecting connection from {}", 
-                                  thread_id, current, max_conn, peer_addr);
-                            drop(stream);
-                            continue;
+
+                    info!("[Thread {}] Worker started", thread_id);
+
+                    loop {
+                        // Shutdown チェック
+                        if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
+                            info!("[Thread {}] Shutting down...", thread_id);
+                            break;
                         }
+
+                        // タイムアウト付きaccept（Graceful Shutdown対応）
+                        let accept_result =
+                            timeout(Duration::from_secs(1), listener.accept()).await;
+
+                        let (stream, peer_addr) = match accept_result {
+                            Ok(Ok(s)) => s,
+                            Ok(Err(e)) => {
+                                error!("[Thread {}] Accept error: {}", thread_id, e);
+                                continue;
+                            }
+                            Err(_) => {
+                                // タイムアウト - ループを継続してshutdownチェック
+                                continue;
+                            }
+                        };
+
+                        // 同時接続数制限チェック
+                        if max_conn > 0 {
+                            let current = CURRENT_CONNECTIONS.load(Ordering::Relaxed);
+                            if current >= max_conn {
+                                warn!("[Thread {}] Connection limit reached ({}/{}), rejecting connection from {}", 
+                                  thread_id, current, max_conn, peer_addr);
+                                drop(stream);
+                                continue;
+                            }
+                        }
+
+                        let _ = stream.set_nodelay(true);
+
+                        let acceptor = acceptor_clone.clone();
+
+                        // spawn_with_panic_catch を使用してパニック時もスレッドが生存し続ける
+                        spawn_with_panic_catch(async move {
+                            // ConnectionGuard がスコープ内で生存している間、接続がカウントされる
+                            // パニック時も Drop が呼ばれるため、カウンターの整合性が保証される
+                            let _guard = ConnectionGuard::new();
+                            // handle_connection 内で CURRENT_CONFIG から最新の設定を取得
+                            // これによりホットリロード時に新しい設定が即座に反映される
+                            handle_connection(stream, acceptor, peer_addr).await;
+                        });
                     }
-                    
-                    let _ = stream.set_nodelay(true);
-                    
-                    let acceptor = acceptor_clone.clone();
-                    
-                    // spawn_with_panic_catch を使用してパニック時もスレッドが生存し続ける
-                    spawn_with_panic_catch(async move {
-                        // ConnectionGuard がスコープ内で生存している間、接続がカウントされる
-                        // パニック時も Drop が呼ばれるため、カウンターの整合性が保証される
-                        let _guard = ConnectionGuard::new();
-                        // handle_connection 内で CURRENT_CONFIG から最新の設定を取得
-                        // これによりホットリロード時に新しい設定が即座に反映される
-                        handle_connection(stream, acceptor, peer_addr).await;
-                    });
-                }
-                
-                // グレースフルシャットダウン: 既存接続の完了を待機
-                drain_connections("Thread", thread_id).await;
-                
-                info!("[Thread {}] Worker stopped", thread_id);
+
+                    // グレースフルシャットダウン: 既存接続の完了を待機
+                    drain_connections("Thread", thread_id).await;
+
+                    info!("[Thread {}] Worker stopped", thread_id);
+                });
             });
-        });
-        handles.push(handle);
-    }
+            handles.push(handle);
+        }
     } else {
         info!("Skipping TLS listener (H2C-only server detected)");
     }
@@ -816,14 +864,9 @@ fn main() {
         info!("HTTP Listen Address: {}", http_addr);
         info!("All HTTP requests will be redirected to HTTPS (301)");
         info!("============================================");
-        
+
         let http_handle = thread::spawn(move || {
-            let mut rt = RuntimeBuilder::<monoio::IoUringDriver>::new()
-                .enable_timer()
-                .build()
-                .expect("Failed to create HTTP runtime");
-            
-            rt.block_on(async move {
+            crate::runtime::block_on(async move {
                 // HTTPリスナーを作成（SO_REUSEADDRを有効化）
                 let listener = match TcpListener::bind(http_addr) {
                     Ok(l) => l,
@@ -832,19 +875,19 @@ fn main() {
                         return;
                     }
                 };
-                
+
                 info!("[HTTP] Redirect worker started");
-                
+
                 loop {
                     // Shutdown チェック
                     if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
                         info!("[HTTP] Shutting down...");
                         break;
                     }
-                    
+
                     // タイムアウト付きaccept
                     let accept_result = timeout(Duration::from_secs(1), listener.accept()).await;
-                    
+
                     let (stream, _peer_addr) = match accept_result {
                         Ok(Ok(s)) => s,
                         Ok(Err(e)) => {
@@ -856,23 +899,23 @@ fn main() {
                             continue;
                         }
                     };
-                    
+
                     let _ = stream.set_nodelay(true);
-                    
+
                     // 軽量なリダイレクト処理をspawn（パニック耐性あり）
                     spawn_with_panic_catch(async move {
                         handle_http_redirect(stream).await;
                     });
                 }
-                
+
                 // グレースフルシャットダウン: 既存接続の完了を待機
                 // HTTPリダイレクトワーカーはConnectionGuardを使用していないため、
                 // 単純にスリープで待機（リダイレクト処理は高速なため問題なし）
                 let timeout_secs = GRACEFUL_SHUTDOWN_TIMEOUT_SECS.load(Ordering::Relaxed);
                 if timeout_secs > 0 {
-                    monoio::time::sleep(Duration::from_millis(500)).await;
+                    crate::runtime::time::sleep(Duration::from_millis(500)).await;
                 }
-                
+
                 info!("[HTTP] Redirect worker stopped");
             });
         });
@@ -881,15 +924,16 @@ fn main() {
 
     // HTTP/3 (QUIC/UDP) サーバー（設定されている場合のみ）
     // TCP側と同様に複数スレッドで並列起動し、CPUコアにピンニング
-    // 
+    //
     // 注意: quicheはファイルパスからの証明書読み込みのみサポートしているため、
     // HTTP/3を使用する場合はLandlock設定で証明書パスを許可する必要があります。
     #[cfg(feature = "http3")]
     if loaded_config.http3_enabled {
-        let http3_addr_str = loaded_config.http3_listen
+        let http3_addr_str = loaded_config
+            .http3_listen
             .clone()
             .unwrap_or_else(|| loaded_config.listen_addr.clone());
-        
+
         let http3_addr: SocketAddr = match http3_addr_str.parse() {
             Ok(addr) => addr,
             Err(e) => {
@@ -897,97 +941,112 @@ fn main() {
                 return;
             }
         };
-        
+
         // TLS証明書パス
         let tls_cert_path = loaded_config.tls_cert_path.clone();
         let tls_key_path = loaded_config.tls_key_path.clone();
-        
+
         // TLS証明書データ（事前読み込み済み、memfd経由でquicheに渡す）
         let tls_cert_pem = loaded_config.tls_cert_pem.clone();
         let tls_key_pem = loaded_config.tls_key_pem.clone();
-        
+
         // Landlock有効時の情報: memfd経由で証明書をロードするため、
         // ファイルパスをlandlock_read_pathsに追加する必要はない
         if loaded_config.global_security.enable_landlock {
             info!("[HTTP/3] Landlock enabled - using memfd for certificate loading");
             info!("[HTTP/3] No need to add certificate paths to landlock_read_paths");
         }
-        
+
         info!("============================================");
         info!("HTTP/3 (QUIC/UDP) Server");
         info!("HTTP/3 Listen Address: {} (UDP)", http3_addr);
         info!("HTTP/3 Workers: {} (SO_REUSEPORT enabled)", num_threads);
-        info!("TLS Cert: {} (pre-loaded, {} bytes)", tls_cert_path, tls_cert_pem.len());
-        info!("TLS Key: {} (pre-loaded, {} bytes)", tls_key_path, tls_key_pem.len());
+        info!(
+            "TLS Cert: {} (pre-loaded, {} bytes)",
+            tls_cert_path,
+            tls_cert_pem.len()
+        );
+        info!(
+            "TLS Key: {} (pre-loaded, {} bytes)",
+            tls_key_path,
+            tls_key_pem.len()
+        );
         info!("TLS loading method: memfd (Landlock compatible)");
         info!("============================================");
-        
+
         // TCP側と同様に複数スレッドで起動（SO_REUSEPORTでパケット分散）
         for thread_id in 0..num_threads {
             let cert_pem = tls_cert_pem.clone();
             let key_pem = tls_key_pem.clone();
             let addr = http3_addr;
-            
+
             // CPUコアにピンニング
             let assigned_core = core_ids.as_ref().map(|ids| {
                 let core_index = thread_id % ids.len();
                 ids[core_index]
             });
-            
+
             let http3_handle = thread::spawn(move || {
                 // スレッド開始直後にCPUアフィニティを設定
                 if let Some(core_id) = assigned_core {
                     if core_affinity::set_for_current(core_id) {
-                        info!("[HTTP/3 Worker {}] Pinned to CPU core {:?}", thread_id, core_id);
+                        info!(
+                            "[HTTP/3 Worker {}] Pinned to CPU core {:?}",
+                            thread_id, core_id
+                        );
                     } else {
-                        warn!("[HTTP/3 Worker {}] Failed to pin to CPU core {:?}", thread_id, core_id);
+                        warn!(
+                            "[HTTP/3 Worker {}] Failed to pin to CPU core {:?}",
+                            thread_id, core_id
+                        );
                     }
                 }
-                
+
                 // memfd経由で証明書をロード（Landlock対応）
                 // 事前読み込み済みのPEMデータをmemfdに書き込み、
                 // /proc/self/fd/<fd>パス経由でquicheに渡す
-                // 
+                //
                 // セキュリティ: Vec をクローンした後、Arc を即座にドロップして
                 // メインスレッドでのゼロ化を可能にする
                 let cert_data = (*cert_pem).clone();
                 let key_data = (*key_pem).clone();
-                
+
                 // Arc 参照を即座にドロップ（参照カウントを減らす）
                 drop(cert_pem);
                 drop(key_pem);
-                
+
                 let config = http3_server::Http3ServerConfig {
-                    cert_path: String::new(),  // memfd使用時は不要
-                    key_path: String::new(),   // memfd使用時は不要
+                    cert_path: String::new(), // memfd使用時は不要
+                    key_path: String::new(),  // memfd使用時は不要
                     cert_pem: Some(cert_data),
                     key_pem: Some(key_data),
                     ..Default::default()
                 };
-                
+
                 info!("[HTTP/3 Worker {}] Starting...", thread_id);
-                
+
                 if let Err(e) = http3_server::run_http3_server(addr, config) {
                     error!("[HTTP/3 Worker {}] Server error: {}", thread_id, e);
                 }
-                
+
                 info!("[HTTP/3 Worker {}] Stopped", thread_id);
             });
             handles.push(http3_handle);
         }
-        
+
         // ローカル変数の Arc をドロップ（参照カウントを減らす）
         drop(tls_cert_pem);
         drop(tls_key_pem);
     }
-    
+
     // H2C (HTTP/2 Cleartext) サーバー（設定されている場合のみ）
     #[cfg(feature = "http2")]
     if loaded_config.h2c_enabled {
-        let h2c_addr_str = loaded_config.h2c_listen
+        let h2c_addr_str = loaded_config
+            .h2c_listen
             .clone()
             .unwrap_or_else(|| loaded_config.listen_addr.clone());
-        
+
         let h2c_addr: SocketAddr = match h2c_addr_str.parse() {
             Ok(addr) => addr,
             Err(e) => {
@@ -995,62 +1054,65 @@ fn main() {
                 return;
             }
         };
-        
+
         info!("============================================");
         info!("H2C (HTTP/2 Cleartext) Server");
         info!("H2C Listen Address: {}", h2c_addr);
         info!("H2C Workers: {} (SO_REUSEPORT enabled)", num_threads);
         info!("============================================");
-        
+
         // 各ワーカースレッドでH2Cリスナーを起動
         let core_ids = core_ids.clone();
         for thread_id in 0..num_threads {
             let h2c_addr = h2c_addr;
             let balancing = loaded_config.reuseport_balancing;
             let max_conn = loaded_config.global_security.max_concurrent_connections;
-            
+
             // このスレッドに割り当てるコアIDを決定
             let assigned_core = core_ids.as_ref().map(|ids| {
                 let core_index = thread_id % ids.len();
                 ids[core_index]
             });
-            
+
             let h2c_handle = thread::spawn(move || {
                 // スレッド開始直後にCPUアフィニティを設定
                 if let Some(core_id) = assigned_core {
                     if core_affinity::set_for_current(core_id) {
-                        info!("[H2C Worker {}] Pinned to CPU core {:?}", thread_id, core_id);
+                        info!(
+                            "[H2C Worker {}] Pinned to CPU core {:?}",
+                            thread_id, core_id
+                        );
                     } else {
-                        warn!("[H2C Worker {}] Failed to pin to CPU core {:?}", thread_id, core_id);
+                        warn!(
+                            "[H2C Worker {}] Failed to pin to CPU core {:?}",
+                            thread_id, core_id
+                        );
                     }
                 }
-                
-                let mut rt = RuntimeBuilder::<monoio::IoUringDriver>::new()
-                    .enable_timer()
-                    .build()
-                    .expect("Failed to create H2C runtime");
-                
-                rt.block_on(async move {
-                    let listener = match create_listener(h2c_addr, balancing, num_threads, thread_id) {
-                        Ok(l) => l,
-                        Err(e) => {
-                            error!("[H2C Worker {}] Bind error: {}", thread_id, e);
-                            return;
-                        }
-                    };
-                    
+
+                crate::runtime::block_on(async move {
+                    let listener =
+                        match create_listener(h2c_addr, balancing, num_threads, thread_id) {
+                            Ok(l) => l,
+                            Err(e) => {
+                                error!("[H2C Worker {}] Bind error: {}", thread_id, e);
+                                return;
+                            }
+                        };
+
                     info!("[H2C Worker {}] Started", thread_id);
-                    
+
                     loop {
                         // Shutdown チェック
                         if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
                             info!("[H2C Worker {}] Shutting down...", thread_id);
                             break;
                         }
-                        
+
                         // タイムアウト付きaccept
-                        let accept_result = timeout(Duration::from_secs(1), listener.accept()).await;
-                        
+                        let accept_result =
+                            timeout(Duration::from_secs(1), listener.accept()).await;
+
                         let (mut stream, peer_addr) = match accept_result {
                             Ok(Ok(s)) => s,
                             Ok(Err(e)) => {
@@ -1062,7 +1124,7 @@ fn main() {
                                 continue;
                             }
                         };
-                        
+
                         // 同時接続数制限チェック
                         if max_conn > 0 {
                             let current = CURRENT_CONNECTIONS.load(Ordering::Relaxed);
@@ -1073,21 +1135,27 @@ fn main() {
                                 continue;
                             }
                         }
-                        
+
                         let _ = stream.set_nodelay(true);
-                        
+
                         // H2C接続処理をspawn（パニック耐性あり）
                         spawn_with_panic_catch(async move {
                             let _guard = ConnectionGuard::new();
                             // H2C専用リスナーでも、プロトコル検出を実行して初期データを取得
                             // これにより、クライアントがまだプリフェースを送信していない場合でも
                             // 正しく処理できる
-                            let (protocol_type, initial_data) = detect_protocol_with_buffer(&mut stream).await;
-                            
+                            let (protocol_type, initial_data) =
+                                detect_protocol_with_buffer(&mut stream).await;
+
                             match protocol_type {
                                 ProtocolType::H2C => {
                                     // H2C接続処理
-                                    handle_h2c_connection(stream, &peer_addr.ip().to_string(), initial_data).await;
+                                    handle_h2c_connection(
+                                        stream,
+                                        &peer_addr.ip().to_string(),
+                                        initial_data,
+                                    )
+                                    .await;
                                 }
                                 ProtocolType::Http11 => {
                                     // HTTP/1.1はH2C専用サーバーではサポートしない
@@ -1098,33 +1166,42 @@ fn main() {
                                     warn!("[H2C Worker] TLS not supported on H2C-only server, closing connection from {}", peer_addr);
                                 }
                                 ProtocolType::Unknown => {
-                                    warn!("[H2C Worker] Unknown protocol from {}, closing connection", peer_addr);
+                                    warn!(
+                                        "[H2C Worker] Unknown protocol from {}, closing connection",
+                                        peer_addr
+                                    );
                                 }
                             }
                         });
                     }
-                    
+
                     // グレースフルシャットダウン: 既存接続の完了を待機
                     drain_connections("H2C Worker", thread_id).await;
-                    
+
                     info!("[H2C Worker {}] Stopped", thread_id);
                 });
             });
             handles.push(h2c_handle);
         }
     }
-    
+
     // HTTP/3 ワーカーが証明書データをクローンするまで短時間待機
     // その後、LoadedConfig の証明書データをセキュアにゼロ化
     #[cfg(feature = "http3")]
     if loaded_config.http3_enabled {
         // ワーカースレッドが Arc 参照をドロップするまで少し待機
         std::thread::sleep(std::time::Duration::from_millis(100));
-        
+
         // LoadedConfig の証明書データをセキュアにゼロ化
-        secure_clear_arc_vec(&mut loaded_config.tls_cert_pem, "TLS certificate (LoadedConfig)");
-        secure_clear_arc_vec(&mut loaded_config.tls_key_pem, "TLS private key (LoadedConfig)");
-        
+        secure_clear_arc_vec(
+            &mut loaded_config.tls_cert_pem,
+            "TLS certificate (LoadedConfig)",
+        );
+        secure_clear_arc_vec(
+            &mut loaded_config.tls_key_pem,
+            "TLS private key (LoadedConfig)",
+        );
+
         info!("[Security] Pre-loaded TLS credentials have been securely cleared from memory");
     }
 
@@ -1138,7 +1215,7 @@ fn main() {
             }
         }
     }
-    
+
     // F-10: OpenTelemetry エクスポータをクリーンに停止（最終 flush 込み）
     #[cfg(feature = "opentelemetry")]
     otel::shutdown_global();
@@ -1155,7 +1232,7 @@ mod tests {
     // ====================
     // CidrRange テスト
     // ====================
-    
+
     mod cidr_tests {
         use super::*;
 
@@ -1262,7 +1339,7 @@ mod tests {
     // ====================
     // IpFilter テスト
     // ====================
-    
+
     mod ip_filter_tests {
         use super::*;
 
@@ -1280,7 +1357,7 @@ mod tests {
             // 許可リストのみ設定
             let allowed = vec!["192.168.0.0/16".to_string()];
             let filter = IpFilter::from_lists(&allowed, &[]);
-            
+
             assert!(filter.is_allowed("192.168.1.1"));
             assert!(filter.is_allowed("192.168.255.255"));
             assert!(!filter.is_allowed("10.0.0.1"));
@@ -1292,7 +1369,7 @@ mod tests {
             // 拒否リストのみ設定（許可リストが空なので、拒否以外は全て許可）
             let denied = vec!["192.168.1.0/24".to_string()];
             let filter = IpFilter::from_lists(&[], &denied);
-            
+
             assert!(!filter.is_allowed("192.168.1.1"));
             assert!(filter.is_allowed("192.168.2.1"));
             assert!(filter.is_allowed("10.0.0.1"));
@@ -1304,15 +1381,15 @@ mod tests {
             let allowed = vec!["192.168.0.0/16".to_string()];
             let denied = vec!["192.168.1.0/24".to_string()];
             let filter = IpFilter::from_lists(&allowed, &denied);
-            
+
             // 192.168.1.xはdenyされる
             assert!(!filter.is_allowed("192.168.1.1"));
             assert!(!filter.is_allowed("192.168.1.100"));
-            
+
             // 192.168.0.xや192.168.2.xはallowされる
             assert!(filter.is_allowed("192.168.0.1"));
             assert!(filter.is_allowed("192.168.2.1"));
-            
+
             // 許可リスト外は拒否
             assert!(!filter.is_allowed("10.0.0.1"));
         }
@@ -1326,13 +1403,13 @@ mod tests {
                 "192.168.0.0/16".to_string(),
             ];
             let filter = IpFilter::from_lists(&allowed, &[]);
-            
+
             // RFC1918プライベートアドレスは全て許可
             assert!(filter.is_allowed("10.1.2.3"));
             assert!(filter.is_allowed("172.16.100.1"));
             assert!(filter.is_allowed("172.31.255.255"));
             assert!(filter.is_allowed("192.168.0.1"));
-            
+
             // パブリックアドレスは拒否
             assert!(!filter.is_allowed("8.8.8.8"));
             assert!(!filter.is_allowed("1.1.1.1"));
@@ -1343,7 +1420,7 @@ mod tests {
             // 単一IPアドレスの許可
             let allowed = vec!["127.0.0.1".to_string()];
             let filter = IpFilter::from_lists(&allowed, &[]);
-            
+
             assert!(filter.is_allowed("127.0.0.1"));
             assert!(!filter.is_allowed("127.0.0.2"));
         }
@@ -1353,7 +1430,7 @@ mod tests {
             // IPv6アドレスのフィルタリング
             let allowed = vec!["2001:db8::/32".to_string(), "::1".to_string()];
             let filter = IpFilter::from_lists(&allowed, &[]);
-            
+
             assert!(filter.is_allowed("::1"));
             assert!(filter.is_allowed("2001:db8::1"));
             assert!(!filter.is_allowed("2001:db9::1"));
@@ -1364,10 +1441,10 @@ mod tests {
             // フィルターが設定されているかの確認
             let empty = IpFilter::from_lists(&[], &[]);
             assert!(!empty.is_configured());
-            
+
             let with_allow = IpFilter::from_lists(&["10.0.0.0/8".to_string()], &[]);
             assert!(with_allow.is_configured());
-            
+
             let with_deny = IpFilter::from_lists(&[], &["192.168.1.0/24".to_string()]);
             assert!(with_deny.is_configured());
         }
@@ -1381,7 +1458,7 @@ mod tests {
                 "10.0.0.0/8".to_string(),
             ];
             let filter = IpFilter::from_lists(&allowed, &[]);
-            
+
             // 有効なエントリは機能する
             assert!(filter.is_allowed("192.168.1.1"));
             assert!(filter.is_allowed("10.1.2.3"));
@@ -1392,7 +1469,7 @@ mod tests {
     // ====================
     // RateLimitEntry テスト
     // ====================
-    
+
     mod rate_limit_tests {
         use super::*;
 
@@ -1409,7 +1486,7 @@ mod tests {
         fn test_record_same_minute() {
             // 同一分内でのリクエスト記録
             let mut entry = RateLimitEntry::new(100);
-            
+
             // 初期状態: count=1
             let rate = entry.record_request(100, 30);
             // count=2, previous=0, weight=(60-30)/60=0.5
@@ -1423,15 +1500,15 @@ mod tests {
             // 次の分へ移行
             let mut entry = RateLimitEntry::new(100);
             entry.current_count = 10;
-            
+
             let rate = entry.record_request(101, 0);
-            
+
             // previous_count = 10（前の分のカウント）
             // current_count = 1（新しい分）
             assert_eq!(entry.current_minute, 101);
             assert_eq!(entry.previous_count, 10);
             assert_eq!(entry.current_count, 1);
-            
+
             // rate = 10 * (60-0)/60 + 1 = 10 + 1 = 11
             assert_eq!(rate, 11);
         }
@@ -1442,9 +1519,9 @@ mod tests {
             let mut entry = RateLimitEntry::new(100);
             entry.current_count = 100;
             entry.previous_count = 50;
-            
+
             let rate = entry.record_request(103, 0);
-            
+
             // 2分以上経過なのでリセット
             assert_eq!(entry.current_minute, 103);
             assert_eq!(entry.previous_count, 0);
@@ -1458,7 +1535,7 @@ mod tests {
             let mut entry = RateLimitEntry::new(100);
             entry.current_count = 30;
             entry.previous_count = 60;
-            
+
             // 分の真ん中（30秒経過）でのレート計算
             let rate = entry.record_request(100, 30);
             // current_count = 31, previous = 60
@@ -1474,7 +1551,7 @@ mod tests {
             let mut entry = RateLimitEntry::new(100);
             entry.current_count = 50;
             entry.previous_count = 100;
-            
+
             let rate = entry.record_request(100, 59);
             // weight = (60-59)/60 ≈ 0.0167
             // estimated = 100*0.0167 + 51 ≈ 52.67 → ceil → 53
@@ -1486,7 +1563,7 @@ mod tests {
     // ====================
     // AcceptedEncoding テスト
     // ====================
-    
+
     mod encoding_tests {
         use super::*;
 
@@ -1585,7 +1662,7 @@ mod tests {
     // ====================
     // CompressionConfig テスト
     // ====================
-    
+
     mod compression_config_tests {
         use super::*;
 
@@ -1621,7 +1698,7 @@ mod tests {
                 ..Default::default()
             };
             assert!(config.validate().is_err());
-            
+
             let config_zero = CompressionConfig {
                 gzip_level: 0, // 0は無効
                 ..Default::default()
@@ -1647,7 +1724,7 @@ mod tests {
                 ..Default::default()
             };
             assert!(config.validate().is_err());
-            
+
             let config_high = CompressionConfig {
                 zstd_level: 23,
                 ..Default::default()
@@ -1785,12 +1862,7 @@ mod tests {
                 enabled: true,
                 ..Default::default()
             };
-            let result = config.should_compress(
-                AcceptedEncoding::Gzip,
-                None,
-                Some(2048),
-                None,
-            );
+            let result = config.should_compress(AcceptedEncoding::Gzip, None, Some(2048), None);
             assert!(result.is_none());
         }
     }
@@ -1798,7 +1870,7 @@ mod tests {
     // ====================
     // WebSocketPollConfig テスト
     // ====================
-    
+
     mod websocket_poll_tests {
         use super::*;
 
@@ -1822,9 +1894,9 @@ mod tests {
     }
 
     // ====================
-    // SecurityConfig テスト  
+    // SecurityConfig テスト
     // ====================
-    
+
     mod security_config_tests {
         use super::*;
 
@@ -1844,7 +1916,7 @@ mod tests {
             let mut config = SecurityConfig::default();
             config.allowed_ips = vec!["10.0.0.0/8".to_string()];
             config.denied_ips = vec!["10.0.1.0/24".to_string()];
-            
+
             let filter = config.ip_filter();
             assert!(filter.is_allowed("10.0.0.1"));
             assert!(!filter.is_allowed("10.0.1.1"));
@@ -1854,7 +1926,7 @@ mod tests {
     // ====================
     // PooledConnection テスト
     // ====================
-    
+
     mod pooled_connection_tests {
         use super::*;
 
@@ -1863,7 +1935,7 @@ mod tests {
             // PooledConnectionの作成
             let stream = (); // ダミー型
             let conn = PooledConnection::new(stream, 30);
-            
+
             assert_eq!(conn.idle_timeout_secs, 30);
         }
 
@@ -1872,7 +1944,7 @@ mod tests {
             // 作成直後は有効
             let stream = ();
             let conn = PooledConnection::new(stream, 30);
-            
+
             assert!(conn.is_valid());
         }
 
@@ -1881,7 +1953,7 @@ mod tests {
             // タイムアウト0秒の場合、即座に無効
             let stream = ();
             let conn = PooledConnection::new(stream, 0);
-            
+
             // 作成直後でも0秒以上経過しているため無効
             assert!(!conn.is_valid());
         }
@@ -1891,7 +1963,7 @@ mod tests {
             // 長いタイムアウトの場合、有効
             let stream = ();
             let conn = PooledConnection::new(stream, 3600);
-            
+
             assert!(conn.is_valid());
         }
     }
@@ -1899,7 +1971,7 @@ mod tests {
     // ====================
     // Config Parse テスト
     // ====================
-    
+
     mod config_parse_tests {
         use super::*;
 
@@ -1950,7 +2022,7 @@ mod tests {
         fn test_http2_config_default() {
             // HTTP/2設定のデフォルト値
             let config = Http2ConfigSection::default();
-            
+
             assert_eq!(config.header_table_size, 65536);
             assert_eq!(config.max_concurrent_streams, 256);
             assert_eq!(config.initial_window_size, 1048576);
@@ -1965,9 +2037,12 @@ mod tests {
             // HTTP/2設定からHttp2Settingsへの変換
             let config = Http2ConfigSection::default();
             let settings = config.to_http2_settings();
-            
+
             assert_eq!(settings.header_table_size, config.header_table_size);
-            assert_eq!(settings.max_concurrent_streams, config.max_concurrent_streams);
+            assert_eq!(
+                settings.max_concurrent_streams,
+                config.max_concurrent_streams
+            );
             assert_eq!(settings.initial_window_size, config.initial_window_size);
             assert_eq!(settings.max_frame_size, config.max_frame_size);
             assert_eq!(settings.max_header_list_size, config.max_header_list_size);
@@ -1977,7 +2052,7 @@ mod tests {
         fn test_http3_config_default() {
             // HTTP/3設定のデフォルト値
             let config = Http3ConfigSection::default();
-            
+
             assert_eq!(config.max_idle_timeout, 30000);
             assert_eq!(config.max_udp_payload_size, 1350);
             assert_eq!(config.initial_max_data, 10_000_000);
@@ -1996,7 +2071,7 @@ mod tests {
         fn test_prometheus_config_default() {
             // Prometheusメトリクス設定のデフォルト
             let config = PrometheusConfig::default();
-            
+
             assert!(!config.enabled);
             assert_eq!(config.path, "/__metrics");
             assert!(config.allowed_ips.is_empty());
@@ -2007,7 +2082,7 @@ mod tests {
             // Prometheus有効化チェック
             let disabled = PrometheusConfig::default();
             assert!(!disabled.enabled);
-            
+
             let enabled = PrometheusConfig {
                 enabled: true,
                 ..Default::default()
@@ -2019,7 +2094,7 @@ mod tests {
     // ====================
     // UpstreamConfig テスト
     // ====================
-    
+
     mod upstream_config_tests {
         use super::*;
 
@@ -2027,7 +2102,7 @@ mod tests {
         fn test_default_health_check_config() {
             // ヘルスチェック設定のデフォルト値
             let config = HealthCheckConfig::default();
-            
+
             assert_eq!(config.interval_secs, 10);
             assert_eq!(config.path, "/");
             assert_eq!(config.timeout_secs, 5);
@@ -2039,7 +2114,7 @@ mod tests {
         fn test_default_health_check_statuses() {
             // デフォルトの健康ステータスコード
             let config = HealthCheckConfig::default();
-            
+
             assert!(config.healthy_statuses.contains(&200));
             assert!(config.healthy_statuses.contains(&201));
             assert!(config.healthy_statuses.contains(&204));
@@ -2052,7 +2127,7 @@ mod tests {
     // ====================
     // Backend テスト
     // ====================
-    
+
     mod backend_tests {
         #[test]
         fn test_backend_config_types() {
@@ -2073,7 +2148,7 @@ mod tests {
         #[test]
         fn test_parse_http_url() {
             let target = ProxyTarget::parse("http://localhost:8080/api").unwrap();
-            
+
             assert_eq!(target.host, "localhost");
             assert_eq!(target.port, 8080);
             assert!(!target.use_tls);
@@ -2083,7 +2158,7 @@ mod tests {
         #[test]
         fn test_parse_https_url() {
             let target = ProxyTarget::parse("https://example.com/").unwrap();
-            
+
             assert_eq!(target.host, "example.com");
             assert_eq!(target.port, 443);
             assert!(target.use_tls);
@@ -2093,7 +2168,7 @@ mod tests {
         fn test_parse_url_default_ports() {
             let http = ProxyTarget::parse("http://localhost/").unwrap();
             assert_eq!(http.port, 80);
-            
+
             let https = ProxyTarget::parse("https://localhost/").unwrap();
             assert_eq!(https.port, 443);
         }
@@ -2101,7 +2176,7 @@ mod tests {
         #[test]
         fn test_parse_url_with_path() {
             let target = ProxyTarget::parse("http://api.example.com:3000/v1/users").unwrap();
-            
+
             assert_eq!(target.host, "api.example.com");
             assert_eq!(target.port, 3000);
             assert_eq!(target.path_prefix, "/v1/users");
@@ -2110,7 +2185,7 @@ mod tests {
         #[test]
         fn test_parse_url_no_path() {
             let target = ProxyTarget::parse("http://localhost:8080").unwrap();
-            
+
             assert_eq!(target.path_prefix, "/");
         }
 
@@ -2127,7 +2202,7 @@ mod tests {
             let target = ProxyTarget::parse("https://192.168.1.1:443/")
                 .unwrap()
                 .with_sni_name(Some("api.example.com".to_string()));
-            
+
             assert_eq!(target.sni_name, Some("api.example.com".to_string()));
             assert_eq!(target.host, "192.168.1.1");
         }
@@ -2137,7 +2212,7 @@ mod tests {
             let target = ProxyTarget::parse("http://localhost:8080/")
                 .unwrap()
                 .with_h2c(true);
-            
+
             assert!(target.use_h2c);
             assert!(!target.use_tls);
         }
@@ -2163,20 +2238,20 @@ mod tests {
 
         fn create_test_servers() -> Vec<UpstreamServerEntry> {
             vec![
-                UpstreamServerEntry { 
-                    url: "http://server1:8080".into(), 
+                UpstreamServerEntry {
+                    url: "http://server1:8080".into(),
                     sni_name: None,
                     use_h2c: false,
                     weight: 1,
                 },
-                UpstreamServerEntry { 
-                    url: "http://server2:8080".into(), 
+                UpstreamServerEntry {
+                    url: "http://server2:8080".into(),
                     sni_name: None,
                     use_h2c: false,
                     weight: 1,
                 },
-                UpstreamServerEntry { 
-                    url: "http://server3:8080".into(), 
+                UpstreamServerEntry {
+                    url: "http://server3:8080".into(),
                     sni_name: None,
                     use_h2c: false,
                     weight: 1,
@@ -2192,9 +2267,9 @@ mod tests {
                 servers,
                 LoadBalanceAlgorithm::RoundRobin,
                 None,
-                false
+                false,
             );
-            
+
             assert!(group.is_some());
             let group = group.unwrap();
             assert_eq!(group.len(), 3);
@@ -2207,30 +2282,28 @@ mod tests {
                 vec![],
                 LoadBalanceAlgorithm::RoundRobin,
                 None,
-                false
+                false,
             );
-            
+
             assert!(group.is_none());
         }
 
         #[test]
         fn test_upstream_group_invalid_url() {
-            let servers = vec![
-                UpstreamServerEntry { 
-                    url: "invalid-url".into(), 
-                    sni_name: None,
-                    use_h2c: false,
-                    weight: 1,
-                },
-            ];
+            let servers = vec![UpstreamServerEntry {
+                url: "invalid-url".into(),
+                sni_name: None,
+                use_h2c: false,
+                weight: 1,
+            }];
             let group = UpstreamGroup::new(
                 "invalid".into(),
                 servers,
                 LoadBalanceAlgorithm::RoundRobin,
                 None,
-                false
+                false,
             );
-            
+
             assert!(group.is_none());
         }
 
@@ -2242,24 +2315,25 @@ mod tests {
                 servers,
                 LoadBalanceAlgorithm::RoundRobin,
                 None,
-                false
-            ).unwrap();
-            
+                false,
+            )
+            .unwrap();
+
             let mut hosts: Vec<String> = Vec::new();
             for _ in 0..9 {
                 if let Some(server) = group.select("client") {
                     hosts.push(server.target.host.clone());
                 }
             }
-            
+
             // 9回選択で3サイクル
             assert_eq!(hosts.len(), 9);
-            
+
             // 各サーバーが3回ずつ選択される
             let count_server1 = hosts.iter().filter(|h| *h == "server1").count();
             let count_server2 = hosts.iter().filter(|h| *h == "server2").count();
             let count_server3 = hosts.iter().filter(|h| *h == "server3").count();
-            
+
             assert_eq!(count_server1, 3);
             assert_eq!(count_server2, 3);
             assert_eq!(count_server3, 3);
@@ -2273,12 +2347,13 @@ mod tests {
                 servers,
                 LoadBalanceAlgorithm::IpHash,
                 None,
-                false
-            ).unwrap();
-            
+                false,
+            )
+            .unwrap();
+
             let client_ip = "192.168.1.100";
             let first = group.select(client_ip).map(|s| s.target.host.clone());
-            
+
             // 同じIPは常に同じサーバーを選択
             for _ in 0..20 {
                 let selected = group.select(client_ip).map(|s| s.target.host.clone());
@@ -2294,11 +2369,12 @@ mod tests {
                 servers,
                 LoadBalanceAlgorithm::IpHash,
                 None,
-                false
-            ).unwrap();
-            
+                false,
+            )
+            .unwrap();
+
             let mut selected_hosts = std::collections::HashSet::new();
-            
+
             // 100個の異なるIPで分散を確認
             for i in 0..100 {
                 let ip = format!("10.0.{}.{}", i / 256, i % 256);
@@ -2306,9 +2382,12 @@ mod tests {
                     selected_hosts.insert(server.target.host.clone());
                 }
             }
-            
+
             // 複数サーバーに分散されることを確認
-            assert!(selected_hosts.len() >= 2, "Should distribute across multiple servers");
+            assert!(
+                selected_hosts.len() >= 2,
+                "Should distribute across multiple servers"
+            );
         }
 
         #[test]
@@ -2319,9 +2398,10 @@ mod tests {
                 servers,
                 LoadBalanceAlgorithm::LeastConnections,
                 None,
-                false
-            ).unwrap();
-            
+                false,
+            )
+            .unwrap();
+
             // 初期状態では全サーバーの接続数が0なので、最初のサーバーが選択される
             let selected = group.select("client");
             assert!(selected.is_some());
@@ -2331,9 +2411,9 @@ mod tests {
         fn test_single_server_group() {
             let target = ProxyTarget::parse("http://single:8080/").unwrap();
             let group = UpstreamGroup::single(target);
-            
+
             assert_eq!(group.len(), 1);
-            
+
             // 何度選択しても同じサーバー
             for _ in 0..5 {
                 let selected = group.select("client");
@@ -2354,7 +2434,7 @@ mod tests {
         fn test_server_initial_state_healthy() {
             let target = ProxyTarget::parse("http://localhost:8080/").unwrap();
             let server = UpstreamServer::new(target);
-            
+
             assert!(server.is_healthy());
         }
 
@@ -2362,7 +2442,7 @@ mod tests {
         fn test_server_becomes_unhealthy_after_failures() {
             let target = ProxyTarget::parse("http://localhost:8080/").unwrap();
             let server = UpstreamServer::new(target);
-            
+
             // 3回失敗すると不健全になる（デフォルト閾値）
             server.record_failure(3);
             assert!(server.is_healthy()); // まだ健全
@@ -2376,13 +2456,13 @@ mod tests {
         fn test_server_becomes_healthy_after_successes() {
             let target = ProxyTarget::parse("http://localhost:8080/").unwrap();
             let server = UpstreamServer::new(target);
-            
+
             // まず不健全にする
             for _ in 0..3 {
                 server.record_failure(3);
             }
             assert!(!server.is_healthy());
-            
+
             // 2回成功すると健全になる（デフォルト閾値）
             server.record_success(2);
             assert!(!server.is_healthy()); // まだ不健全
@@ -2394,18 +2474,18 @@ mod tests {
         fn test_server_connection_count() {
             let target = ProxyTarget::parse("http://localhost:8080/").unwrap();
             let server = UpstreamServer::new(target);
-            
+
             assert_eq!(server.connections(), 0);
-            
+
             server.acquire();
             assert_eq!(server.connections(), 1);
-            
+
             server.acquire();
             assert_eq!(server.connections(), 2);
-            
+
             server.release();
             assert_eq!(server.connections(), 1);
-            
+
             server.release();
             assert_eq!(server.connections(), 0);
         }
@@ -2413,14 +2493,14 @@ mod tests {
         #[test]
         fn test_select_skips_unhealthy_servers() {
             let servers = vec![
-                UpstreamServerEntry { 
-                    url: "http://healthy:8080".into(), 
+                UpstreamServerEntry {
+                    url: "http://healthy:8080".into(),
                     sni_name: None,
                     use_h2c: false,
                     weight: 1,
                 },
-                UpstreamServerEntry { 
-                    url: "http://unhealthy:8080".into(), 
+                UpstreamServerEntry {
+                    url: "http://unhealthy:8080".into(),
                     sni_name: None,
                     use_h2c: false,
                     weight: 1,
@@ -2431,14 +2511,15 @@ mod tests {
                 servers,
                 LoadBalanceAlgorithm::RoundRobin,
                 None,
-                false
-            ).unwrap();
-            
+                false,
+            )
+            .unwrap();
+
             // 2番目のサーバーを不健全にマーク（3回失敗で不健全）
             for _ in 0..3 {
                 group.servers[1].record_failure(3);
             }
-            
+
             // 10回選択しても不健全サーバーは選択されない
             for _ in 0..10 {
                 let selected = group.select("client");
@@ -2450,14 +2531,14 @@ mod tests {
         #[test]
         fn test_select_returns_none_all_unhealthy() {
             let servers = vec![
-                UpstreamServerEntry { 
-                    url: "http://server1:8080".into(), 
+                UpstreamServerEntry {
+                    url: "http://server1:8080".into(),
                     sni_name: None,
                     use_h2c: false,
                     weight: 1,
                 },
-                UpstreamServerEntry { 
-                    url: "http://server2:8080".into(), 
+                UpstreamServerEntry {
+                    url: "http://server2:8080".into(),
                     sni_name: None,
                     use_h2c: false,
                     weight: 1,
@@ -2468,16 +2549,17 @@ mod tests {
                 servers,
                 LoadBalanceAlgorithm::RoundRobin,
                 None,
-                false
-            ).unwrap();
-            
+                false,
+            )
+            .unwrap();
+
             // 全サーバーを不健全にマーク（3回失敗で不健全）
             for server in &group.servers {
                 for _ in 0..3 {
                     server.record_failure(3);
                 }
             }
-            
+
             let selected = group.select("client");
             assert!(selected.is_none());
         }
@@ -2486,19 +2568,19 @@ mod tests {
         fn test_failure_resets_success_counter() {
             let target = ProxyTarget::parse("http://localhost:8080/").unwrap();
             let server = UpstreamServer::new(target);
-            
+
             // 不健全にする
             for _ in 0..3 {
                 server.record_failure(3);
             }
             assert!(!server.is_healthy());
-            
+
             // 1回成功
             server.record_success(2);
-            
+
             // 失敗で成功カウンターリセット
             server.record_failure(3);
-            
+
             // 再度2回成功が必要
             server.record_success(2);
             assert!(!server.is_healthy());
@@ -2531,7 +2613,7 @@ mod tests {
         #[test]
         fn test_is_status_healthy() {
             let config = HealthCheckConfig::default();
-            
+
             // 健康なステータス
             assert!(config.healthy_statuses.contains(&200));
             assert!(config.healthy_statuses.contains(&201));
@@ -2539,7 +2621,7 @@ mod tests {
             assert!(config.healthy_statuses.contains(&301));
             assert!(config.healthy_statuses.contains(&302));
             assert!(config.healthy_statuses.contains(&304));
-            
+
             // 不健康なステータス
             assert!(!config.healthy_statuses.contains(&400));
             assert!(!config.healthy_statuses.contains(&500));
@@ -2550,7 +2632,7 @@ mod tests {
         fn test_custom_healthy_statuses() {
             let mut config = HealthCheckConfig::default();
             config.healthy_statuses = vec![200, 201];
-            
+
             assert!(config.healthy_statuses.contains(&200));
             assert!(config.healthy_statuses.contains(&201));
             assert!(!config.healthy_statuses.contains(&204));
@@ -2560,17 +2642,16 @@ mod tests {
     // ====================
     // HTTP/1.1 RFC準拠ヘルパー関数テスト
     // ====================
-    
+
     mod http11_tests {
         use super::*;
 
         #[test]
         fn test_add_via_header_new() {
-            let mut headers: Vec<(Vec<u8>, Vec<u8>)> = vec![
-                (b"host".to_vec(), b"example.com".to_vec()),
-            ];
+            let mut headers: Vec<(Vec<u8>, Vec<u8>)> =
+                vec![(b"host".to_vec(), b"example.com".to_vec())];
             add_via_header(&mut headers, "proxy.example.com");
-            
+
             assert_eq!(headers.len(), 2);
             assert_eq!(headers[1].0, b"via".to_vec());
             assert_eq!(headers[1].1, b"1.1 proxy.example.com".to_vec());
@@ -2578,28 +2659,25 @@ mod tests {
 
         #[test]
         fn test_add_via_header_existing() {
-            let mut headers: Vec<(Vec<u8>, Vec<u8>)> = vec![
-                (b"via".to_vec(), b"1.1 first-proxy".to_vec()),
-            ];
+            let mut headers: Vec<(Vec<u8>, Vec<u8>)> =
+                vec![(b"via".to_vec(), b"1.1 first-proxy".to_vec())];
             add_via_header(&mut headers, "second-proxy");
-            
+
             assert_eq!(headers.len(), 1);
             assert_eq!(headers[0].1, b"1.1 first-proxy, 1.1 second-proxy".to_vec());
         }
 
         #[test]
         fn test_validate_http_headers_valid() {
-            let headers: Vec<(Vec<u8>, Vec<u8>)> = vec![
-                (b"content-length".to_vec(), b"100".to_vec()),
-            ];
+            let headers: Vec<(Vec<u8>, Vec<u8>)> =
+                vec![(b"content-length".to_vec(), b"100".to_vec())];
             assert!(validate_http_headers(&headers).is_ok());
         }
 
         #[test]
         fn test_validate_http_headers_valid_transfer_encoding() {
-            let headers: Vec<(Vec<u8>, Vec<u8>)> = vec![
-                (b"transfer-encoding".to_vec(), b"chunked".to_vec()),
-            ];
+            let headers: Vec<(Vec<u8>, Vec<u8>)> =
+                vec![(b"transfer-encoding".to_vec(), b"chunked".to_vec())];
             assert!(validate_http_headers(&headers).is_ok());
         }
 
@@ -2614,17 +2692,15 @@ mod tests {
 
         #[test]
         fn test_check_expect_continue_true() {
-            let headers: Vec<(Vec<u8>, Vec<u8>)> = vec![
-                (b"expect".to_vec(), b"100-continue".to_vec()),
-            ];
+            let headers: Vec<(Vec<u8>, Vec<u8>)> =
+                vec![(b"expect".to_vec(), b"100-continue".to_vec())];
             assert!(check_expect_continue(&headers));
         }
 
         #[test]
         fn test_check_expect_continue_false() {
-            let headers: Vec<(Vec<u8>, Vec<u8>)> = vec![
-                (b"host".to_vec(), b"example.com".to_vec()),
-            ];
+            let headers: Vec<(Vec<u8>, Vec<u8>)> =
+                vec![(b"host".to_vec(), b"example.com".to_vec())];
             assert!(!check_expect_continue(&headers));
         }
 
@@ -2650,47 +2726,43 @@ mod tests {
     // ====================
     // RFC 7230-7233 準拠ヘルパー関数テスト
     // ====================
-    
+
     mod rfc_compliance_tests {
         use super::*;
 
         // Hostヘッダー検証テスト (RFC 7230 Section 5.4)
-        
+
         #[test]
         fn test_validate_host_header_present_http11() {
-            let headers: Vec<(Vec<u8>, Vec<u8>)> = vec![
-                (b"host".to_vec(), b"example.com".to_vec()),
-            ];
+            let headers: Vec<(Vec<u8>, Vec<u8>)> =
+                vec![(b"host".to_vec(), b"example.com".to_vec())];
             assert!(validate_host_header(&headers, 1).is_ok());
         }
 
         #[test]
         fn test_validate_host_header_missing_http11() {
-            let headers: Vec<(Vec<u8>, Vec<u8>)> = vec![
-                (b"content-type".to_vec(), b"text/html".to_vec()),
-            ];
+            let headers: Vec<(Vec<u8>, Vec<u8>)> =
+                vec![(b"content-type".to_vec(), b"text/html".to_vec())];
             assert!(validate_host_header(&headers, 1).is_err());
         }
 
         #[test]
         fn test_validate_host_header_http10_optional() {
             // HTTP/1.0ではHostヘッダーは任意
-            let headers: Vec<(Vec<u8>, Vec<u8>)> = vec![
-                (b"content-type".to_vec(), b"text/html".to_vec()),
-            ];
+            let headers: Vec<(Vec<u8>, Vec<u8>)> =
+                vec![(b"content-type".to_vec(), b"text/html".to_vec())];
             assert!(validate_host_header(&headers, 0).is_ok());
         }
 
         #[test]
         fn test_validate_host_header_case_insensitive() {
-            let headers: Vec<(Vec<u8>, Vec<u8>)> = vec![
-                (b"HOST".to_vec(), b"example.com".to_vec()),
-            ];
+            let headers: Vec<(Vec<u8>, Vec<u8>)> =
+                vec![(b"HOST".to_vec(), b"example.com".to_vec())];
             assert!(validate_host_header(&headers, 1).is_ok());
         }
 
         // Hop-by-hopヘッダーテスト (RFC 7230 Section 6.1)
-        
+
         #[test]
         fn test_is_hop_by_hop_header_connection() {
             assert!(is_hop_by_hop_header(b"connection"));
@@ -2747,14 +2819,18 @@ mod tests {
                 (b"keep-alive".to_vec(), b"timeout=5".to_vec()),
                 (b"content-type".to_vec(), b"text/html".to_vec()),
             ];
-            
+
             strip_hop_by_hop_headers(&mut headers);
-            
+
             assert_eq!(headers.len(), 2);
             assert!(headers.iter().any(|(n, _)| n == b"host"));
             assert!(headers.iter().any(|(n, _)| n == b"content-type"));
-            assert!(!headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(b"connection")));
-            assert!(!headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(b"keep-alive")));
+            assert!(!headers
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case(b"connection")));
+            assert!(!headers
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case(b"keep-alive")));
         }
 
         #[test]
@@ -2765,22 +2841,28 @@ mod tests {
                 (b"connection".to_vec(), b"keep-alive, x-custom".to_vec()),
                 (b"x-custom".to_vec(), b"value".to_vec()),
             ];
-            
+
             strip_hop_by_hop_headers(&mut headers);
-            
+
             assert_eq!(headers.len(), 1);
             assert!(headers.iter().any(|(n, _)| n == b"host"));
         }
 
         // Rangeヘッダーテスト (RFC 7233)
-        
+
         #[test]
         fn test_parse_range_header_single_range() {
             let result = parse_range_header(b"bytes=0-99");
             assert!(result.is_some());
             let parsed = result.unwrap();
             assert_eq!(parsed.ranges.len(), 1);
-            assert_eq!(parsed.ranges[0], RangeSpec::Bytes { start: 0, end: Some(99) });
+            assert_eq!(
+                parsed.ranges[0],
+                RangeSpec::Bytes {
+                    start: 0,
+                    end: Some(99)
+                }
+            );
         }
 
         #[test]
@@ -2788,7 +2870,13 @@ mod tests {
             let result = parse_range_header(b"bytes=100-");
             assert!(result.is_some());
             let parsed = result.unwrap();
-            assert_eq!(parsed.ranges[0], RangeSpec::Bytes { start: 100, end: None });
+            assert_eq!(
+                parsed.ranges[0],
+                RangeSpec::Bytes {
+                    start: 100,
+                    end: None
+                }
+            );
         }
 
         #[test]
@@ -2824,31 +2912,43 @@ mod tests {
         }
 
         // normalize_range テスト
-        
+
         #[test]
         fn test_normalize_range_bytes_within_bounds() {
-            let spec = RangeSpec::Bytes { start: 0, end: Some(99) };
+            let spec = RangeSpec::Bytes {
+                start: 0,
+                end: Some(99),
+            };
             let result = normalize_range(&spec, 1000);
             assert_eq!(result, Some((0, 99)));
         }
 
         #[test]
         fn test_normalize_range_bytes_end_exceeds() {
-            let spec = RangeSpec::Bytes { start: 0, end: Some(9999) };
+            let spec = RangeSpec::Bytes {
+                start: 0,
+                end: Some(9999),
+            };
             let result = normalize_range(&spec, 1000);
             assert_eq!(result, Some((0, 999))); // end should be clamped
         }
 
         #[test]
         fn test_normalize_range_bytes_open_end() {
-            let spec = RangeSpec::Bytes { start: 500, end: None };
+            let spec = RangeSpec::Bytes {
+                start: 500,
+                end: None,
+            };
             let result = normalize_range(&spec, 1000);
             assert_eq!(result, Some((500, 999)));
         }
 
         #[test]
         fn test_normalize_range_bytes_start_exceeds() {
-            let spec = RangeSpec::Bytes { start: 1000, end: Some(1100) };
+            let spec = RangeSpec::Bytes {
+                start: 1000,
+                end: Some(1100),
+            };
             let result = normalize_range(&spec, 1000);
             assert_eq!(result, None); // 416 Range Not Satisfiable
         }
@@ -2862,25 +2962,30 @@ mod tests {
 
         #[test]
         fn test_normalize_range_suffix_larger_than_content() {
-            let spec = RangeSpec::Suffix { suffix_length: 2000 };
+            let spec = RangeSpec::Suffix {
+                suffix_length: 2000,
+            };
             let result = normalize_range(&spec, 1000);
             assert_eq!(result, Some((0, 999)));
         }
 
         #[test]
         fn test_normalize_range_empty_content() {
-            let spec = RangeSpec::Bytes { start: 0, end: Some(100) };
+            let spec = RangeSpec::Bytes {
+                start: 0,
+                end: Some(100),
+            };
             let result = normalize_range(&spec, 0);
             assert_eq!(result, None);
         }
 
         // 206 Partial Content レスポンス構築テスト
-        
+
         #[test]
         fn test_build_partial_response_header() {
             let header = build_partial_response_header(0, 99, 1000, "text/plain", false);
             let header_str = String::from_utf8_lossy(&header);
-            
+
             assert!(header_str.contains("HTTP/1.1 206 Partial Content"));
             assert!(header_str.contains("Content-Range: bytes 0-99/1000"));
             assert!(header_str.contains("Content-Length: 100"));
@@ -2892,7 +2997,7 @@ mod tests {
         fn test_build_partial_response_header_close() {
             let header = build_partial_response_header(0, 99, 1000, "text/plain", true);
             let header_str = String::from_utf8_lossy(&header);
-            
+
             assert!(header_str.contains("Connection: close"));
         }
 
@@ -2900,14 +3005,14 @@ mod tests {
         fn test_build_range_not_satisfiable_response() {
             let response = build_range_not_satisfiable_response(1000);
             let response_str = String::from_utf8_lossy(&response);
-            
+
             assert!(response_str.contains("HTTP/1.1 416 Range Not Satisfiable"));
             assert!(response_str.contains("Content-Range: bytes */1000"));
             assert!(response_str.contains("Content-Length: 0"));
         }
 
         // TEヘッダーテスト (RFC 7230 Section 4.3)
-        
+
         #[test]
         fn test_parse_te_header_trailers() {
             let te = parse_te_header(b"trailers");
@@ -2962,7 +3067,7 @@ mod tests {
         }
 
         // get_range_header テスト
-        
+
         #[test]
         fn test_get_range_header_found() {
             let headers: Vec<(Vec<u8>, Vec<u8>)> = vec![
@@ -2975,24 +3080,22 @@ mod tests {
 
         #[test]
         fn test_get_range_header_not_found() {
-            let headers: Vec<(Vec<u8>, Vec<u8>)> = vec![
-                (b"host".to_vec(), b"example.com".to_vec()),
-            ];
+            let headers: Vec<(Vec<u8>, Vec<u8>)> =
+                vec![(b"host".to_vec(), b"example.com".to_vec())];
             let result = get_range_header(&headers);
             assert!(result.is_none());
         }
 
         #[test]
         fn test_get_range_header_case_insensitive() {
-            let headers: Vec<(Vec<u8>, Vec<u8>)> = vec![
-                (b"Range".to_vec(), b"bytes=0-100".to_vec()),
-            ];
+            let headers: Vec<(Vec<u8>, Vec<u8>)> =
+                vec![(b"Range".to_vec(), b"bytes=0-100".to_vec())];
             let result = get_range_header(&headers);
             assert!(result.is_some());
         }
 
         // should_advertise_accept_ranges テスト
-        
+
         #[test]
         fn test_should_advertise_accept_ranges_get() {
             assert!(should_advertise_accept_ranges(b"GET"));
@@ -3013,4 +3116,3 @@ mod tests {
         }
     }
 }
-

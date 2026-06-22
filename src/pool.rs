@@ -16,24 +16,24 @@ pub(crate) use crate::simple_tls::SimpleTlsClientStream as ClientTls;
 // バッファプール・コネクションプール
 // ====================
 
+use crate::runtime::buf::{IoBuf, IoBufMut};
+use crate::runtime::tcp::TcpStream;
+use ftlog::info;
+use once_cell::sync::Lazy;
+use serde::Deserialize;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 #[cfg(feature = "ktls")]
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
-use monoio::buf::{IoBuf, IoBufMut};
-use monoio::net::TcpStream;
-use serde::Deserialize;
-use once_cell::sync::Lazy;
-use ftlog::info;
 
 #[cfg(feature = "ktls")]
 use crate::ktls_rustls;
 
 // バッファサイズ（ページアライン・L2キャッシュ最適化）
-pub(crate) const BUF_SIZE: usize = 65536;           // 64KB - io_uring最適サイズ
-pub(crate) const HEADER_BUF_CAPACITY: usize = 512;  // HTTPヘッダー用
+pub(crate) const BUF_SIZE: usize = 65536; // 64KB - io_uring最適サイズ
+pub(crate) const HEADER_BUF_CAPACITY: usize = 512; // HTTPヘッダー用
 
 // ====================
 // 安全なバッファラッパー（SafeReadBuffer）
@@ -95,8 +95,13 @@ impl SafeReadBuffer {
         // 読み込み前は valid_len = 0 なので未初期化領域にはアクセスできない
         // SafeReadBuffer は as_valid_slice() を通じてのみデータにアクセスするため、
         // 未初期化領域への誤アクセスは型レベルで防止されている
-        unsafe { v.set_len(cap); }
-        Self { inner: v, valid_len: 0 }
+        unsafe {
+            v.set_len(cap);
+        }
+        Self {
+            inner: v,
+            valid_len: 0,
+        }
     }
 
     /// 既存のVec<u8>からバッファを作成
@@ -107,13 +112,20 @@ impl SafeReadBuffer {
     pub fn from_vec(mut v: Vec<u8>, cap: usize) -> Self {
         if v.capacity() >= cap {
             // SAFETY: capacity >= cap を確認済み
-            unsafe { v.set_len(cap); }
+            unsafe {
+                v.set_len(cap);
+            }
         } else {
             // 容量不足の場合は新規作成
             v = Vec::with_capacity(cap);
-            unsafe { v.set_len(cap); }
+            unsafe {
+                v.set_len(cap);
+            }
         }
-        Self { inner: v, valid_len: 0 }
+        Self {
+            inner: v,
+            valid_len: 0,
+        }
     }
 
     /// 読み込み完了後に有効データ長を設定
@@ -181,7 +193,7 @@ impl SafeReadBuffer {
     }
 }
 
-// monoio の IoBuf トレイト実装
+// IoBuf トレイト実装
 // SAFETY: inner は有効なヒープメモリを指し、read_ptr() は有効なポインタを返す
 unsafe impl IoBuf for SafeReadBuffer {
     #[inline(always)]
@@ -195,7 +207,7 @@ unsafe impl IoBuf for SafeReadBuffer {
     }
 }
 
-// monoio の IoBufMut トレイト実装
+// IoBufMut トレイト実装
 // SAFETY: inner は有効な書き込み可能なヒープメモリを指す
 unsafe impl IoBufMut for SafeReadBuffer {
     #[inline(always)]
@@ -218,8 +230,8 @@ unsafe impl IoBufMut for SafeReadBuffer {
 }
 
 // セキュリティ制限
-pub(crate) const MAX_HEADER_SIZE: usize = 8192;     // 8KB - ヘッダーサイズ上限
-pub(crate) const MAX_BODY_SIZE: usize = 10485760;   // 10MB - ボディサイズ上限
+pub(crate) const MAX_HEADER_SIZE: usize = 8192; // 8KB - ヘッダーサイズ上限
+pub(crate) const MAX_BODY_SIZE: usize = 10485760; // 10MB - ボディサイズ上限
 #[allow(dead_code)]
 pub(crate) const MAX_GRPC_BODY_SIZE: usize = 1_048_576; // 1MB - gRPCメッセージサイズ上限
 
@@ -230,8 +242,8 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 // バックエンドコネクションプール設定（デフォルト値）
-pub(crate) const BACKEND_POOL_MAX_IDLE_PER_HOST: usize = 8;    // ホストあたりの最大アイドル接続数
-pub(crate) const BACKEND_POOL_IDLE_TIMEOUT_SECS: u64 = 30;     // アイドル接続のタイムアウト（秒）
+pub(crate) const BACKEND_POOL_MAX_IDLE_PER_HOST: usize = 8; // ホストあたりの最大アイドル接続数
+pub(crate) const BACKEND_POOL_IDLE_TIMEOUT_SECS: u64 = 30; // アイドル接続のタイムアウト（秒）
 
 // ====================
 // バックエンドコネクションプール
@@ -294,7 +306,13 @@ impl HttpConnectionPool {
     }
 
     /// 接続をプールに返却（設定可能なパラメータ付き）
-    pub(crate) fn put(&mut self, key: String, stream: TcpStream, max_idle: usize, idle_timeout_secs: u64) {
+    pub(crate) fn put(
+        &mut self,
+        key: String,
+        stream: TcpStream,
+        max_idle: usize,
+        idle_timeout_secs: u64,
+    ) {
         // F-09: メトリクス用にキーを保持（key は entry へムーブされるため）
         let metric_key = key.clone();
         let queue = self.connections.entry(key).or_insert_with(VecDeque::new);
@@ -340,7 +358,13 @@ impl HttpsConnectionPool {
     }
 
     /// 接続をプールに返却（設定可能なパラメータ付き）
-    pub(crate) fn put(&mut self, key: String, stream: ClientTls, max_idle: usize, idle_timeout_secs: u64) {
+    pub(crate) fn put(
+        &mut self,
+        key: String,
+        stream: ClientTls,
+        max_idle: usize,
+        idle_timeout_secs: u64,
+    ) {
         // F-09: メトリクス用にキーを保持（key は entry へムーブされるため）
         let metric_key = key.clone();
         let queue = self.connections.entry(key).or_insert_with(VecDeque::new);
@@ -395,7 +419,7 @@ pub(crate) fn get_splice_pipe() -> std::cell::Ref<'static, Option<ktls_rustls::S
 // Raw I/O ヘルパー関数（kTLS + splice 用）
 // ====================
 //
-// monoio の所有権ベースの I/O を回避するため、
+// 所有権ベースの I/O を使わず、
 // libc::read/write を直接使用します。
 // 非同期待機は TcpStream::readable()/writable() を使用。
 // ====================
@@ -404,9 +428,7 @@ pub(crate) fn get_splice_pipe() -> std::cell::Ref<'static, Option<ktls_rustls::S
 #[cfg(feature = "ktls")]
 #[inline]
 pub(crate) fn raw_read(fd: std::os::unix::io::RawFd, buf: &mut [u8]) -> io::Result<usize> {
-    let result = unsafe {
-        libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-    };
+    let result = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
     if result < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -418,9 +440,7 @@ pub(crate) fn raw_read(fd: std::os::unix::io::RawFd, buf: &mut [u8]) -> io::Resu
 #[cfg(feature = "ktls")]
 #[inline]
 pub(crate) fn raw_write(fd: std::os::unix::io::RawFd, buf: &[u8]) -> io::Result<usize> {
-    let result = unsafe {
-        libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len())
-    };
+    let result = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
     if result < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -430,7 +450,7 @@ pub(crate) fn raw_write(fd: std::os::unix::io::RawFd, buf: &[u8]) -> io::Result<
 
 /// 非同期 raw read（TcpStream から FD 経由で読み取り）
 ///
-/// monoio の所有権ベース I/O を回避し、libc::read を直接使用。
+/// libc::read を直接使用。
 /// WouldBlock の場合は readable() で待機してリトライ。
 #[cfg(feature = "ktls")]
 pub(crate) async fn async_raw_read(stream: &TcpStream, buf: &mut [u8]) -> io::Result<usize> {
@@ -442,7 +462,7 @@ pub(crate) async fn async_raw_read(stream: &TcpStream, buf: &mut [u8]) -> io::Re
             Ok(n) => return Ok(n),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 // 読み取り可能になるまで待機
-                stream.readable(false).await?;
+                stream.readable().await?;
             }
             Err(e) => return Err(e),
         }
@@ -451,7 +471,7 @@ pub(crate) async fn async_raw_read(stream: &TcpStream, buf: &mut [u8]) -> io::Re
 
 /// 非同期 raw write（TcpStream へ FD 経由で書き込み）
 ///
-/// monoio の所有権ベース I/O を回避し、libc::write を直接使用。
+/// libc::write を直接使用。
 /// WouldBlock の場合は writable() で待機してリトライ。
 #[cfg(feature = "ktls")]
 pub(crate) async fn async_raw_write(stream: &TcpStream, buf: &[u8]) -> io::Result<usize> {
@@ -465,7 +485,7 @@ pub(crate) async fn async_raw_write(stream: &TcpStream, buf: &[u8]) -> io::Resul
             Ok(n) => written += n,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 // 書き込み可能になるまで待機
-                stream.writable(false).await?;
+                stream.writable().await?;
             }
             Err(e) => return Err(e),
         }
@@ -479,7 +499,10 @@ pub(crate) async fn async_raw_write(stream: &TcpStream, buf: &[u8]) -> io::Resul
 pub(crate) async fn async_raw_write_all(stream: &TcpStream, buf: &[u8]) -> io::Result<()> {
     let written = async_raw_write(stream, buf).await?;
     if written < buf.len() {
-        Err(io::Error::new(io::ErrorKind::WriteZero, "failed to write all bytes"))
+        Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "failed to write all bytes",
+        ))
     } else {
         Ok(())
     }
@@ -489,9 +512,9 @@ pub(crate) async fn async_raw_write_all(stream: &TcpStream, buf: &[u8]) -> io::R
 // バッファプール（パフォーマンス最適化版）
 // ====================
 //
-// 注意: monoioのAsyncWriteRentExtはバッファの所有権を取るため、
-// 完全なゼロコピーは実現できません。バッファプールによりアロケーション
-// コストを削減していますが、Arc<Vec<u8>>からのコピーは避けられません。
+// 注意: バッファプールによりアロケーションコストを削減していますが、
+// Arc<Vec<u8>>からのコピーは避けられないケースがあります。
+// bytes クレートを活用することでゼロコピー化を進める計画（F-26）。
 //
 // ## パフォーマンス最適化: ゼロ埋め削除
 //
@@ -549,7 +572,8 @@ thread_local! {
 #[inline(always)]
 pub(crate) fn buf_get() -> SafeReadBuffer {
     BUF_POOL.with(|p| {
-        p.borrow_mut().pop()
+        p.borrow_mut()
+            .pop()
             .map(|v| SafeReadBuffer::from_vec(v, BUF_SIZE))
             .unwrap_or_else(|| SafeReadBuffer::new(BUF_SIZE))
     })
@@ -590,7 +614,9 @@ pub(crate) fn buf_put_vec(mut buf: Vec<u8>) {
             } else {
                 // 容量が足りない場合は新規作成（通常は発生しない）
                 buf = Vec::with_capacity(BUF_SIZE);
-                unsafe { buf.set_len(BUF_SIZE); }
+                unsafe {
+                    buf.set_len(BUF_SIZE);
+                }
             }
             pool.push(buf);
         }
@@ -679,7 +705,8 @@ impl Default for BufferPoolConfig {
 // 各バッファ取得関数から参照します。
 
 /// グローバルバッファプール設定（起動時に一度だけ設定）
-pub(crate) static BUFFER_POOL_CONFIG: std::sync::OnceLock<BufferPoolConfig> = std::sync::OnceLock::new();
+pub(crate) static BUFFER_POOL_CONFIG: std::sync::OnceLock<BufferPoolConfig> =
+    std::sync::OnceLock::new();
 
 /// バッファプール設定を初期化
 #[inline]
@@ -691,9 +718,9 @@ pub(crate) fn init_buffer_pool_config(config: BufferPoolConfig) {
 #[inline]
 pub(crate) fn get_buffer_pool_config() -> &'static BufferPoolConfig {
     static DEFAULT_CONFIG: std::sync::OnceLock<BufferPoolConfig> = std::sync::OnceLock::new();
-    BUFFER_POOL_CONFIG.get().unwrap_or_else(|| {
-        DEFAULT_CONFIG.get_or_init(BufferPoolConfig::default)
-    })
+    BUFFER_POOL_CONFIG
+        .get()
+        .unwrap_or_else(|| DEFAULT_CONFIG.get_or_init(BufferPoolConfig::default))
 }
 
 thread_local! {
@@ -724,11 +751,15 @@ pub(crate) fn request_buf_get(size_hint: usize) -> Vec<u8> {
     let config = get_buffer_pool_config();
     if size_hint <= config.request_buffer_size {
         REQUEST_BUF_POOL.with(|p| {
-            p.borrow_mut().pop().unwrap_or_else(|| Vec::with_capacity(config.request_buffer_size))
+            p.borrow_mut()
+                .pop()
+                .unwrap_or_else(|| Vec::with_capacity(config.request_buffer_size))
         })
     } else {
         LARGE_REQUEST_BUF_POOL.with(|p| {
-            p.borrow_mut().pop().unwrap_or_else(|| Vec::with_capacity(config.large_request_buffer_size))
+            p.borrow_mut()
+                .pop()
+                .unwrap_or_else(|| Vec::with_capacity(config.large_request_buffer_size))
         })
     }
 }
@@ -742,12 +773,16 @@ pub(crate) fn request_buf_put(mut buf: Vec<u8>) {
     if capacity == config.request_buffer_size {
         REQUEST_BUF_POOL.with(|p| {
             let mut pool = p.borrow_mut();
-            if pool.len() < 32 { pool.push(buf); }
+            if pool.len() < 32 {
+                pool.push(buf);
+            }
         });
     } else if capacity == config.large_request_buffer_size {
         LARGE_REQUEST_BUF_POOL.with(|p| {
             let mut pool = p.borrow_mut();
-            if pool.len() < 8 { pool.push(buf); }
+            if pool.len() < 8 {
+                pool.push(buf);
+            }
         });
     }
 }
@@ -758,7 +793,9 @@ pub(crate) fn request_buf_put(mut buf: Vec<u8>) {
 pub(crate) fn path_string_get() -> String {
     let config = get_buffer_pool_config();
     PATH_STRING_POOL.with(|p| {
-        p.borrow_mut().pop().unwrap_or_else(|| String::with_capacity(config.path_string_size))
+        p.borrow_mut()
+            .pop()
+            .unwrap_or_else(|| String::with_capacity(config.path_string_size))
     })
 }
 
@@ -771,7 +808,9 @@ pub(crate) fn path_string_put(mut s: String) {
     if s.capacity() == config.path_string_size {
         PATH_STRING_POOL.with(|p| {
             let mut pool = p.borrow_mut();
-            if pool.len() < 32 { pool.push(s); }
+            if pool.len() < 32 {
+                pool.push(s);
+            }
         });
     }
 }
@@ -782,7 +821,9 @@ pub(crate) fn path_string_put(mut s: String) {
 pub(crate) fn response_header_buf_get() -> Vec<u8> {
     let config = get_buffer_pool_config();
     RESPONSE_HEADER_BUF_POOL.with(|p| {
-        p.borrow_mut().pop().unwrap_or_else(|| Vec::with_capacity(config.response_header_buffer_size))
+        p.borrow_mut()
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(config.response_header_buffer_size))
     })
 }
 
@@ -796,7 +837,9 @@ pub(crate) fn response_header_buf_put(mut buf: Vec<u8>) {
     if buf.capacity() >= min_size && buf.capacity() <= min_size * 4 {
         RESPONSE_HEADER_BUF_POOL.with(|p| {
             let mut pool = p.borrow_mut();
-            if pool.len() < 32 { pool.push(buf); }
+            if pool.len() < 32 {
+                pool.push(buf);
+            }
         });
     }
 }
@@ -812,9 +855,8 @@ pub(crate) fn response_header_buf_put(mut buf: Vec<u8>) {
 
 /// Serverヘッダー値（起動時/リロード時に更新）
 /// Vec<u8>を使用（ArcSwapはSized型が必要）
-pub(crate) static SERVER_HEADER_VALUE: Lazy<arc_swap::ArcSwap<Vec<u8>>> = Lazy::new(|| {
-    arc_swap::ArcSwap::from(Arc::new(Vec::new()))
-});
+pub(crate) static SERVER_HEADER_VALUE: Lazy<arc_swap::ArcSwap<Vec<u8>>> =
+    Lazy::new(|| arc_swap::ArcSwap::from(Arc::new(Vec::new())));
 
 /// Serverヘッダー有効フラグ
 pub(crate) static SERVER_HEADER_ENABLED: std::sync::atomic::AtomicBool =
