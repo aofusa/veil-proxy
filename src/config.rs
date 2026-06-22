@@ -1255,6 +1255,10 @@ pub struct AdminConfig {
     /// 認証用シークレット（空の場合は全リクエストを拒否）
     #[serde(default)]
     pub secret: String,
+    /// アクセスを許可するIPアドレス/CIDR（空の場合は全IPを許可）
+    /// 例: ["127.0.0.1", "10.0.0.0/8", "192.168.0.0/16"]
+    #[serde(default)]
+    pub allowed_ips: Vec<String>,
 }
 
 fn default_admin_path_prefix() -> String { "/__admin".to_string() }
@@ -1308,6 +1312,7 @@ impl Default for AdminConfig {
             enabled: false,
             path_prefix: default_admin_path_prefix(),
             secret: String::new(),
+            allowed_ips: Vec::new(),
         }
     }
 }
@@ -1330,6 +1335,37 @@ impl AdminConfig {
             }
             None => false,
         }
+    }
+
+    /// クライアント IP が管理 API エンドポイントへのアクセスを許可されているか確認する。
+    ///
+    /// `allowed_ips` が空の場合はすべての IP を許可する。
+    pub fn is_ip_allowed(&self, client_ip: &str) -> bool {
+        if self.allowed_ips.is_empty() {
+            return true;
+        }
+        let client_addr: std::net::IpAddr = match client_ip.parse() {
+            Ok(addr) => addr,
+            Err(_) => return false,
+        };
+        for allowed in &self.allowed_ips {
+            if allowed.contains('/') {
+                if let Some((network, prefix_len)) = allowed.split_once('/') {
+                    if let (Ok(network_addr), Ok(prefix)) =
+                        (network.parse::<std::net::IpAddr>(), prefix_len.parse::<u8>())
+                    {
+                        if PrometheusConfig::ip_in_cidr(&client_addr, &network_addr, prefix) {
+                            return true;
+                        }
+                    }
+                }
+            } else if let Ok(allowed_addr) = allowed.parse::<std::net::IpAddr>() {
+                if client_addr == allowed_addr {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 
@@ -5431,6 +5467,7 @@ mod admin_config_tests {
             enabled: true,
             path_prefix: "/__admin".into(),
             secret: "topsecret".into(),
+            allowed_ips: Vec::new(),
         };
         assert!(cfg.check_auth(Some("Bearer topsecret")));
         assert!(cfg.check_auth(Some("topsecret")));
@@ -5444,8 +5481,59 @@ mod admin_config_tests {
             enabled: true,
             path_prefix: "/__admin".into(),
             secret: String::new(),
+            allowed_ips: Vec::new(),
         };
         assert!(!cfg.check_auth(Some("Bearer ")));
+    }
+
+    #[test]
+    fn admin_ip_allowed_empty_allows_all() {
+        let cfg = AdminConfig {
+            enabled: true,
+            path_prefix: "/__admin".into(),
+            secret: "s".into(),
+            allowed_ips: Vec::new(),
+        };
+        assert!(cfg.is_ip_allowed("1.2.3.4"));
+        assert!(cfg.is_ip_allowed("::1"));
+    }
+
+    #[test]
+    fn admin_ip_allowed_single_ip() {
+        let cfg = AdminConfig {
+            enabled: true,
+            path_prefix: "/__admin".into(),
+            secret: "s".into(),
+            allowed_ips: vec!["127.0.0.1".into()],
+        };
+        assert!(cfg.is_ip_allowed("127.0.0.1"));
+        assert!(!cfg.is_ip_allowed("192.168.0.1"));
+    }
+
+    #[test]
+    fn admin_ip_allowed_cidr() {
+        let cfg = AdminConfig {
+            enabled: true,
+            path_prefix: "/__admin".into(),
+            secret: "s".into(),
+            allowed_ips: vec!["10.0.0.0/8".into()],
+        };
+        assert!(cfg.is_ip_allowed("10.1.2.3"));
+        assert!(cfg.is_ip_allowed("10.255.255.255"));
+        assert!(!cfg.is_ip_allowed("192.168.0.1"));
+    }
+
+    #[test]
+    fn admin_ip_allowed_ipv6() {
+        let cfg = AdminConfig {
+            enabled: true,
+            path_prefix: "/__admin".into(),
+            secret: "s".into(),
+            allowed_ips: vec!["::1".into(), "fe80::/10".into()],
+        };
+        assert!(cfg.is_ip_allowed("::1"));
+        assert!(cfg.is_ip_allowed("fe80::1"));
+        assert!(!cfg.is_ip_allowed("2001:db8::1"));
     }
 }
 

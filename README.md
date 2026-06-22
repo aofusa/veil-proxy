@@ -2826,6 +2826,7 @@ Invalidate cached responses without restarting the proxy.
 enabled = true
 path_prefix = "/__admin"    # Admin endpoint prefix
 secret = "changeme"         # Bearer token for authentication
+# allowed_ips = ["127.0.0.1", "::1", "10.0.0.0/8"]  # IP allowlist (empty = all IPs allowed)
 ```
 
 ### Purge Operations
@@ -2866,10 +2867,20 @@ curl -X POST "https://proxy.example.com/__admin/cache/purge?all=true" \
 
 | Condition | Response |
 |-----------|----------|
+| Source IP not in `allowed_ips` | `403 Forbidden` |
 | No `Authorization` header | `401 Unauthorized` |
 | Wrong secret | `401 Unauthorized` |
 | Admin disabled | `404 Not Found` |
 | Success | `200 OK` with `{"purged": N}` |
+
+IP filtering is checked before authentication. When `allowed_ips` is empty (default), all IPs are allowed.
+
+| Format | Example |
+|--------|---------|
+| Single IPv4 | `127.0.0.1` |
+| IPv4 CIDR | `10.0.0.0/8` |
+| Single IPv6 | `::1` |
+| IPv6 CIDR | `fe80::/10` |
 
 ## Performance Tuning
 

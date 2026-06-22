@@ -2535,19 +2535,25 @@ async fn handle_requests(
 
                     if admin_config.enabled && (is_purge_method || is_admin_purge_path) {
                         let start_instant = Instant::now();
-                        // Authorization ヘッダーを取得
-                        let auth = headers_for_proxy.iter().find_map(|(name, value)| {
-                            if name.eq_ignore_ascii_case(b"authorization") {
-                                std::str::from_utf8(value).ok()
-                            } else {
-                                None
-                            }
-                        });
 
-                        let response = if !admin_config.check_auth(auth) {
-                            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                        // IP制限チェック
+                        let response = if !admin_config.is_ip_allowed(client_ip) {
+                            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
                         } else {
-                            handle_cache_purge(path_str, is_purge_method)
+                            // Authorization ヘッダーを取得
+                            let auth = headers_for_proxy.iter().find_map(|(name, value)| {
+                                if name.eq_ignore_ascii_case(b"authorization") {
+                                    std::str::from_utf8(value).ok()
+                                } else {
+                                    None
+                                }
+                            });
+
+                            if !admin_config.check_auth(auth) {
+                                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                            } else {
+                                handle_cache_purge(path_str, is_purge_method)
+                            }
                         };
 
                         let resp_size = response.len() as u64;
@@ -2555,6 +2561,8 @@ async fn handle_requests(
                             200
                         } else if response.starts_with(b"HTTP/1.1 401") {
                             401
+                        } else if response.starts_with(b"HTTP/1.1 403") {
+                            403
                         } else {
                             400
                         };

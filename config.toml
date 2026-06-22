@@ -587,6 +587,8 @@ ktls_fallback_enabled = false
 # enabled = true
 # path_prefix = "/__admin"
 # secret = "changeme"
+# # アクセスを許可するIPアドレス/CIDR（空の場合は全IPを許可）
+# allowed_ips = ["127.0.0.1", "::1", "10.0.0.0/8"]
 
 
 # ==========================================
