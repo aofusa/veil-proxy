@@ -2813,6 +2813,98 @@ Any OTLP/HTTP collector accepting JSON payloads:
 | OpenTelemetry Collector | Standard OTLP/HTTP receiver |
 | Prometheus Remote Write | Via otel-collector `prometheusremotewrite` exporter |
 
+## Structured Access Log
+
+Write per-request access logs in JSON or text format, independent of the application log. Uses thread-local buffers to minimize heap allocation.
+
+### Configuration
+
+```toml
+[access_log]
+enabled = true
+format = "json"                         # "json" or "text"
+file_path = "/var/log/veil/access.log"  # omit for stderr
+# Limit output fields (omit for all fields)
+fields = ["timestamp", "method", "host", "path", "status", "duration_ms", "client_ip", "upstream"]
+channel_size = 10000      # async channel capacity to the writer thread (default: 10000)
+flush_interval_ms = 1000  # BufWriter flush interval in ms (default: 1000)
+```
+
+Access logs are written asynchronously by a dedicated writer thread. The hot path (worker thread) only pushes bytes into a bounded channel (`channel_size`). The writer thread holds the file/stderr handle exclusively, eliminating global lock contention. Log lines dropped when the channel is full are silently discarded without blocking request processing.
+
+### Available Fields
+
+| Field | Description |
+|-------|-------------|
+| `timestamp` | Request timestamp (RFC 3339) |
+| `method` | HTTP method |
+| `host` | Request Host header |
+| `path` | Request path |
+| `status` | HTTP response status code |
+| `duration_ms` | Request duration in milliseconds |
+| `client_ip` | Client IP address |
+| `upstream` | Upstream server address |
+| `req_body_size` | Request body size (bytes) |
+| `resp_body_size` | Response body size (bytes) |
+| `user_agent` | User-Agent header |
+
+### Example JSON Output
+
+```json
+{"timestamp":"2026-01-01T00:00:00Z","method":"GET","host":"example.com","path":"/api/data","status":200,"duration_ms":12,"client_ip":"10.0.0.1","upstream":"192.168.1.10:8080","req_body_size":0,"resp_body_size":1024,"user_agent":"curl/8.0"}
+```
+
+## Logging Configuration
+
+Provides high-performance async logging using ftlog. ftlog internally uses a background thread and channel, minimizing impact on worker threads.
+
+### Configuration Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `level` | Log level (trace/debug/info/warn/error/off) | info |
+| `format` | Log output format (text/json) | text |
+| `channel_size` | Internal channel buffer size | 100000 |
+| `flush_interval_ms` | Disk flush interval (milliseconds) | 1000 |
+| `max_log_size` | Maximum log file size (bytes, 0=unlimited) | 104857600 |
+| `file_path` | Log file path (defaults to stderr if unspecified) | none |
+
+### Log Output Formats
+
+#### Text Format (Default)
+
+```
+2024-01-01 00:00:00.000+00 0ms INFO main [main.rs:123] Server started
+```
+
+#### JSON Format
+
+Suitable for integration with structured log collection systems (Elasticsearch, Loki, etc.).
+
+```json
+{"timestamp":"2024-01-01T00:00:00.000Z","level":"INFO","target":"veil","file":"main.rs","line":123,"message":"Server started"}
+```
+
+### Configuration Example
+
+```toml
+[logging]
+level = "info"
+format = "text"  # or "json"
+channel_size = 100000
+flush_interval_ms = 1000
+file_path = "/var/log/veil.log"
+```
+
+### JSON Format Configuration Example
+
+```toml
+[logging]
+level = "info"
+format = "json"
+file_path = "/var/log/veil.json"
+```
+
 ## Cache Purge Administration API
 
 Invalidate cached responses without restarting the proxy.
@@ -2881,47 +2973,6 @@ IP filtering is checked before authentication. When `allowed_ips` is empty (defa
 | IPv4 CIDR | `10.0.0.0/8` |
 | Single IPv6 | `::1` |
 | IPv6 CIDR | `fe80::/10` |
-
-## Structured Access Log
-
-Write per-request access logs in JSON or text format, independent of the application log. Uses thread-local buffers to minimize heap allocation.
-
-### Configuration
-
-```toml
-[access_log]
-enabled = true
-format = "json"                         # "json" or "text"
-file_path = "/var/log/veil/access.log"  # omit for stderr
-# Limit output fields (omit for all fields)
-fields = ["timestamp", "method", "host", "path", "status", "duration_ms", "client_ip", "upstream"]
-channel_size = 10000      # async channel capacity to the writer thread (default: 10000)
-flush_interval_ms = 1000  # BufWriter flush interval in ms (default: 1000)
-```
-
-Access logs are written asynchronously by a dedicated writer thread. The hot path (worker thread) only pushes bytes into a bounded channel (`channel_size`). The writer thread holds the file/stderr handle exclusively, eliminating global lock contention. Log lines dropped when the channel is full are silently discarded without blocking request processing.
-
-### Available Fields
-
-| Field | Description |
-|-------|-------------|
-| `timestamp` | Request timestamp (RFC 3339) |
-| `method` | HTTP method |
-| `host` | Request Host header |
-| `path` | Request path |
-| `status` | HTTP response status code |
-| `duration_ms` | Request duration in milliseconds |
-| `client_ip` | Client IP address |
-| `upstream` | Upstream server address |
-| `req_body_size` | Request body size (bytes) |
-| `resp_body_size` | Response body size (bytes) |
-| `user_agent` | User-Agent header |
-
-### Example JSON Output
-
-```json
-{"timestamp":"2026-01-01T00:00:00Z","method":"GET","host":"example.com","path":"/api/data","status":200,"duration_ms":12,"client_ip":"10.0.0.1","upstream":"192.168.1.10:8080","req_body_size":0,"resp_body_size":1024,"user_agent":"curl/8.0"}
-```
 
 ## Admin API
 
@@ -3352,6 +3403,30 @@ kill -SIGTERM $!
 # or Ctrl+C
 ```
 
+## Configuration File Validation
+
+Performs detailed validation of the configuration file at startup and outputs clear error messages if problems are found.
+
+### Validation Items
+
+| Item | Check Content |
+|------|---------------|
+| TLS Certificate | File existence check |
+| TLS Private Key | File existence check |
+| Listen Address | Valid socket address format |
+| Upstream URL | Valid URL format |
+| Proxy URL | Valid URL format |
+| File Path | File/directory existence check |
+| File Mode | `sendfile` or `memory` |
+
+### Error Message Examples
+
+```
+Error: TLS certificate file not found: /path/to/cert.pem
+Error: Invalid proxy URL for route 'example.com:/api/': invalid-url
+Error: Upstream 'backend-pool' not found
+```
+
 ## Graceful Reload (Hot Reload)
 
 When receiving SIGHUP, the server reloads the configuration file.
@@ -3385,81 +3460,6 @@ kill -SIGHUP $(pgrep veil)
 | TLS certificates | ❌ |
 | Listen address | ❌ (requires restart) |
 | Worker thread count | ❌ (requires restart) |
-
-## Configuration File Validation
-
-Performs detailed validation of the configuration file at startup and outputs clear error messages if problems are found.
-
-### Validation Items
-
-| Item | Check Content |
-|------|---------------|
-| TLS Certificate | File existence check |
-| TLS Private Key | File existence check |
-| Listen Address | Valid socket address format |
-| Upstream URL | Valid URL format |
-| Proxy URL | Valid URL format |
-| File Path | File/directory existence check |
-| File Mode | `sendfile` or `memory` |
-
-### Error Message Examples
-
-```
-Error: TLS certificate file not found: /path/to/cert.pem
-Error: Invalid proxy URL for route 'example.com:/api/': invalid-url
-Error: Upstream 'backend-pool' not found
-```
-
-## Logging Configuration
-
-Provides high-performance async logging using ftlog. ftlog internally uses a background thread and channel, minimizing impact on worker threads.
-
-### Configuration Options
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `level` | Log level (trace/debug/info/warn/error/off) | info |
-| `format` | Log output format (text/json) | text |
-| `channel_size` | Internal channel buffer size | 100000 |
-| `flush_interval_ms` | Disk flush interval (milliseconds) | 1000 |
-| `max_log_size` | Maximum log file size (bytes, 0=unlimited) | 104857600 |
-| `file_path` | Log file path (defaults to stderr if unspecified) | none |
-
-### Log Output Formats
-
-#### Text Format (Default)
-
-```
-2024-01-01 00:00:00.000+00 0ms INFO main [main.rs:123] Server started
-```
-
-#### JSON Format
-
-Suitable for integration with structured log collection systems (Elasticsearch, Loki, etc.).
-
-```json
-{"timestamp":"2024-01-01T00:00:00.000Z","level":"INFO","target":"veil","file":"main.rs","line":123,"message":"Server started"}
-```
-
-### Configuration Example
-
-```toml
-[logging]
-level = "info"
-format = "text"  # or "json"
-channel_size = 100000
-flush_interval_ms = 1000
-file_path = "/var/log/veil.log"
-```
-
-### JSON Format Configuration Example
-
-```toml
-[logging]
-level = "info"
-format = "json"
-file_path = "/var/log/veil.json"
-```
 
 ## Self-Sandboxing
 
