@@ -212,6 +212,7 @@ pub(crate) static CACHE_EVICTIONS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
 #[cfg(feature = "metrics")]
 /// キャッシュサイズゲージ（storage ラベル付き）
 /// storage: "memory" or "disk"
+#[allow(dead_code)]
 pub(crate) static CACHE_SIZE_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
     let opts = Opts::new("cache_size_bytes", "Current cache size in bytes")
         .namespace("veil_proxy");
@@ -222,6 +223,7 @@ pub(crate) static CACHE_SIZE_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
 
 #[cfg(feature = "metrics")]
 /// キャッシュエントリ数ゲージ
+#[allow(dead_code)]
 pub(crate) static CACHE_ENTRIES: Lazy<IntGaugeVec> = Lazy::new(|| {
     let opts = Opts::new("cache_entries", "Current number of cache entries")
         .namespace("veil_proxy");
