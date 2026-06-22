@@ -5,15 +5,15 @@
 // HugePages、権限降格、サンドボックス設定、
 // パニックキャッチ、CBPFなどのシステムレベル機能
 
+use ftlog::{error, info, warn};
 use std::io;
-#[allow(unused_imports)]
-use std::sync::Arc;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::pin::Pin;
 #[allow(unused_imports)]
 use std::sync::atomic::Ordering;
-use std::pin::Pin;
+#[allow(unused_imports)]
+use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use ftlog::{info, error, warn};
 
 // ====================
 // HugePages
@@ -103,21 +103,22 @@ pub(crate) fn configure_huge_pages(enabled: bool) {
         {
             unsafe {
                 // mi_option_large_os_pages = 6 (2MiB large pages)
-                libmimalloc_sys::mi_option_set(
-                    libmimalloc_sys::mi_option_large_os_pages,
-                    1,
-                );
+                libmimalloc_sys::mi_option_set(libmimalloc_sys::mi_option_large_os_pages, 1);
             }
         }
 
-        info!("Huge Pages: Enabled (Total: {}, Free: {}, Size: {}KB)",
-              hp_info.total, hp_info.free, hp_info.page_size_kb);
+        info!(
+            "Huge Pages: Enabled (Total: {}, Free: {}, Size: {}KB)",
+            hp_info.total, hp_info.free, hp_info.page_size_kb
+        );
         info!("Huge Pages: TLB miss reduction active, expected 5-10% performance improvement");
 
         // 空きページが少ない場合は警告
         if hp_info.free < hp_info.total / 2 {
-            warn!("Huge Pages: Free pages running low ({}/{}), consider increasing nr_hugepages",
-                  hp_info.free, hp_info.total);
+            warn!(
+                "Huge Pages: Free pages running low ({}/{}), consider increasing nr_hugepages",
+                hp_info.free, hp_info.total
+            );
         }
     } else {
         warn!("Huge Pages: Requested but not available on this system");
@@ -159,12 +160,13 @@ impl CatchUnwindFuture {
     where
         F: std::future::Future<Output = ()> + 'static,
     {
-        Self { inner: Some(Box::pin(future)) }
+        Self {
+            inner: Some(Box::pin(future)),
+        }
     }
 }
 
-impl std::future::Future for CatchUnwindFuture
-{
+impl std::future::Future for CatchUnwindFuture {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -206,7 +208,7 @@ pub(crate) fn spawn_with_panic_catch<F>(future: F)
 where
     F: std::future::Future<Output = ()> + 'static,
 {
-    monoio::spawn(CatchUnwindFuture::new(future));
+    crate::runtime::spawn(CatchUnwindFuture::new(future));
 }
 
 // ====================
@@ -273,9 +275,12 @@ pub(crate) fn drop_privileges(security: &crate::GlobalSecurityConfig) -> io::Res
 
     // グループ降格（先に行う）
     if let Some(ref group_name) = security.drop_privileges_group {
-        let gid = get_gid_by_name(group_name)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound,
-                format!("Group '{}' not found", group_name)))?;
+        let gid = get_gid_by_name(group_name).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Group '{}' not found", group_name),
+            )
+        })?;
 
         if unsafe { libc::setgid(gid) } != 0 {
             return Err(io::Error::last_os_error());
@@ -283,7 +288,10 @@ pub(crate) fn drop_privileges(security: &crate::GlobalSecurityConfig) -> io::Res
 
         // 補助グループをクリア
         if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
-            warn!("Failed to clear supplementary groups: {}", io::Error::last_os_error());
+            warn!(
+                "Failed to clear supplementary groups: {}",
+                io::Error::last_os_error()
+            );
         }
 
         info!("Dropped group privileges to '{}' (gid={})", group_name, gid);
@@ -291,9 +299,12 @@ pub(crate) fn drop_privileges(security: &crate::GlobalSecurityConfig) -> io::Res
 
     // ユーザー降格
     if let Some(ref user_name) = security.drop_privileges_user {
-        let uid = get_uid_by_name(user_name)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound,
-                format!("User '{}' not found", user_name)))?;
+        let uid = get_uid_by_name(user_name).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("User '{}' not found", user_name),
+            )
+        })?;
 
         if unsafe { libc::setuid(uid) } != 0 {
             return Err(io::Error::last_os_error());
@@ -306,7 +317,10 @@ pub(crate) fn drop_privileges(security: &crate::GlobalSecurityConfig) -> io::Res
     if security.drop_privileges_user.is_some() || security.drop_privileges_group.is_some() {
         let current_uid = unsafe { libc::getuid() };
         let current_gid = unsafe { libc::getgid() };
-        info!("Current privileges: uid={}, gid={}", current_uid, current_gid);
+        info!(
+            "Current privileges: uid={}, gid={}",
+            current_uid, current_gid
+        );
 
         // rootに戻れないことを確認
         if security.drop_privileges_user.is_some() {
@@ -333,9 +347,12 @@ pub(crate) fn drop_privileges(_security: &crate::GlobalSecurityConfig) -> io::Re
 /// GlobalSecurityConfigからSandboxConfigを構築
 ///
 /// 設定ファイルのsandbox_*フィールドをsecurity::SandboxConfigに変換します。
-pub(crate) fn build_sandbox_config(global_security: &crate::GlobalSecurityConfig) -> crate::security::SandboxConfig {
+pub(crate) fn build_sandbox_config(
+    global_security: &crate::GlobalSecurityConfig,
+) -> crate::security::SandboxConfig {
     // 読み取り専用バインドマウントのパース
-    let ro_bind_mounts: Vec<crate::security::BindMount> = global_security.sandbox_ro_bind_mounts
+    let ro_bind_mounts: Vec<crate::security::BindMount> = global_security
+        .sandbox_ro_bind_mounts
         .iter()
         .filter_map(|s| {
             let parts: Vec<&str> = s.splitn(2, ':').collect();
@@ -345,14 +362,18 @@ pub(crate) fn build_sandbox_config(global_security: &crate::GlobalSecurityConfig
                 // source:dest が同じ場合は source のみでも可
                 Some(crate::security::BindMount::new(parts[0], parts[0]))
             } else {
-                warn!("Invalid ro-bind mount format: '{}' (expected 'source:dest')", s);
+                warn!(
+                    "Invalid ro-bind mount format: '{}' (expected 'source:dest')",
+                    s
+                );
                 None
             }
         })
         .collect();
 
     // 読み書きバインドマウントのパース
-    let rw_bind_mounts: Vec<crate::security::BindMount> = global_security.sandbox_rw_bind_mounts
+    let rw_bind_mounts: Vec<crate::security::BindMount> = global_security
+        .sandbox_rw_bind_mounts
         .iter()
         .filter_map(|s| {
             let parts: Vec<&str> = s.splitn(2, ':').collect();
@@ -361,7 +382,10 @@ pub(crate) fn build_sandbox_config(global_security: &crate::GlobalSecurityConfig
             } else if parts.len() == 1 && !parts[0].is_empty() {
                 Some(crate::security::BindMount::new(parts[0], parts[0]))
             } else {
-                warn!("Invalid rw-bind mount format: '{}' (expected 'source:dest')", s);
+                warn!(
+                    "Invalid rw-bind mount format: '{}' (expected 'source:dest')",
+                    s
+                );
                 None
             }
         })
@@ -426,7 +450,10 @@ pub(crate) fn secure_clear_arc_vec(arc: &mut Arc<Vec<u8>>, name: &str) {
         }
         None => {
             // 他の参照が存在する場合（通常は発生しない）
-            warn!("[Security] {} cannot be zeroed: other references exist", name);
+            warn!(
+                "[Security] {} cannot be zeroed: other references exist",
+                name
+            );
         }
     }
 }
@@ -438,7 +465,8 @@ pub(crate) fn secure_clear_arc_vec(arc: &mut Arc<Vec<u8>>, name: &str) {
 /// CBPFプログラムがアタッチ済みかどうかを追跡するグローバルカウンター
 /// 最初のワーカーのみがCBPFプログラムをアタッチする
 #[cfg(target_os = "linux")]
-pub(crate) static CBPF_ATTACHED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub(crate) static CBPF_ATTACHED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// クライアントIPハッシュに基づく振り分けCBPFプログラムを生成
 ///
@@ -527,7 +555,11 @@ pub(crate) fn attach_reuseport_cbpf(fd: i32, num_workers: usize) -> io::Result<(
 
     if result < 0 {
         let err = io::Error::last_os_error();
-        warn!("Failed to attach CBPF program: {} (errno: {})", err, err.raw_os_error().unwrap_or(-1));
+        warn!(
+            "Failed to attach CBPF program: {} (errno: {})",
+            err,
+            err.raw_os_error().unwrap_or(-1)
+        );
         return Err(err);
     }
 

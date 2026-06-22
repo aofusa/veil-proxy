@@ -2,23 +2,23 @@
 //!
 //! シグナルハンドラ、バックグラウンドスレッド、リスナーソケットの作成を担当します。
 
-use std::sync::Arc;
+use crate::config::*;
+use crate::runtime::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
+use crate::runtime::tcp::{TcpListener, TcpStream};
+use crate::runtime::time::timeout;
+use ftlog::{debug, error, info, warn};
+use std::io;
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use std::net::SocketAddr;
-use std::io;
-use monoio::net::{TcpListener, TcpStream};
-use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
-use monoio::time::timeout;
-use ftlog::{info, error, warn, debug};
-use crate::config::*;
 
+use crate::http_utils::*;
 use crate::metrics::*;
+use crate::pool::*;
 use crate::system::*;
 use crate::upstream::*;
-use crate::pool::*;
-use crate::http_utils::*;
 
 use crate::cache;
 #[cfg(unix)]
@@ -32,7 +32,8 @@ pub fn setup_signal_handler() {
     ctrlc::set_handler(move || {
         info!("Received shutdown signal, initiating graceful shutdown...");
         SHUTDOWN_FLAG.store(true, Ordering::SeqCst);
-    }).expect("Failed to set signal handler");
+    })
+    .expect("Failed to set signal handler");
 
     // SIGHUP をキャッチして設定リロードをトリガー（Linux/Unix）
     #[cfg(unix)]
@@ -165,7 +166,10 @@ pub fn spawn_background_revalidation(
 
     // Request Collapsing: 同一キーに対して既に更新中であればスキップ
     if !cache::try_start_revalidation(hash) {
-        debug!("Background revalidation skipped (already in progress) for {:?}", cache_key.path());
+        debug!(
+            "Background revalidation skipped (already in progress) for {:?}",
+            cache_key.path()
+        );
         return;
     }
 
@@ -197,7 +201,7 @@ pub fn spawn_background_revalidation(
 
         // バックエンドに接続
         let connect_timeout = Duration::from_secs(security.backend_connect_timeout_secs);
-        let connect_result = timeout(connect_timeout, TcpStream::connect(&addr)).await;
+        let connect_result = timeout(connect_timeout, TcpStream::connect_str(&addr)).await;
 
         let mut backend_stream = match connect_result {
             Ok(Ok(stream)) => {
@@ -224,7 +228,8 @@ pub fn spawn_background_revalidation(
         };
 
         // ホスト名を取得
-        let host_header = headers.iter()
+        let host_header = headers
+            .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case(b"host"))
             .map(|(_, v)| v.as_ref())
             .unwrap_or(target.host.as_bytes());
@@ -298,7 +303,8 @@ pub fn spawn_background_revalidation(
                 if let Some(cl) = parsed.content_length {
                     let remaining = cl.saturating_sub(body.len());
                     if remaining > 0 {
-                        let additional = buffer_exact_bytes_simple(&mut backend_stream, remaining).await;
+                        let additional =
+                            buffer_exact_bytes_simple(&mut backend_stream, remaining).await;
                         body.extend(additional);
                     }
                 } else if !parsed.is_chunked {
@@ -309,7 +315,8 @@ pub fn spawn_background_revalidation(
                             break;
                         }
                         let read_buf = buf_get();
-                        let read_result = timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
+                        let read_result =
+                            timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
 
                         let (res, mut returned_buf) = match read_result {
                             Ok(result) => result,
@@ -336,14 +343,24 @@ pub fn spawn_background_revalidation(
                 let mut response = httparse::Response::new(&mut headers_storage);
 
                 if response.parse(headers_data).is_ok() {
-                    let response_headers: Vec<(Box<[u8]>, Box<[u8]>)> = response.headers.iter()
+                    let response_headers: Vec<(Box<[u8]>, Box<[u8]>)> = response
+                        .headers
+                        .iter()
                         .map(|h| (h.name.as_bytes().into(), h.value.into()))
                         .collect();
 
                     // キャッシュを更新
                     if let Some(cache_manager) = cache::get_global_cache() {
-                        if cache_manager.store(cache_key.clone(), status_code, response_headers, body) {
-                            info!("Background revalidation: cache updated for {:?}", cache_key.path());
+                        if cache_manager.store(
+                            cache_key.clone(),
+                            status_code,
+                            response_headers,
+                            body,
+                        ) {
+                            info!(
+                                "Background revalidation: cache updated for {:?}",
+                                cache_key.path()
+                            );
                         }
                     }
                 }
@@ -465,8 +482,7 @@ pub fn spawn_wasm_tick_thread() {
             let config = CURRENT_CONFIG.load();
             if config.wasm_filter_engine.is_some() {
                 // get_min_tick_period() returns Option<Duration>
-                crate::wasm::get_min_tick_period()
-                    .unwrap_or(Duration::from_millis(100))
+                crate::wasm::get_min_tick_period().unwrap_or(Duration::from_millis(100))
             } else {
                 Duration::from_secs(1) // WASM未設定時は1秒
             }
@@ -522,27 +538,32 @@ pub fn spawn_wasm_tick_thread() {
 
                             // Execute HTTP call using http_executor
                             crate::wasm::http_executor::execute_http_call_safe(
-                                &pending,
-                                host,
-                                port,
-                                use_tls,
+                                &pending, host, port, use_tls,
                             )
                         } else {
                             warn!("[wasm:http_call] No healthy servers in upstream '{}' for module '{}'",
                                 upstream_name, pending.module_name);
                             crate::wasm::HttpCallResponse {
                                 status_code: 503,
-                                headers: vec![(b"x-wasm-error".to_vec(), b"no_healthy_servers".to_vec())],
+                                headers: vec![(
+                                    b"x-wasm-error".to_vec(),
+                                    b"no_healthy_servers".to_vec(),
+                                )],
                                 body: b"No healthy upstream servers available".to_vec(),
                                 trailers: vec![],
                             }
                         }
                     } else {
-                        warn!("[wasm:http_call] Upstream '{}' not found for module '{}'",
-                            upstream_name, pending.module_name);
+                        warn!(
+                            "[wasm:http_call] Upstream '{}' not found for module '{}'",
+                            upstream_name, pending.module_name
+                        );
                         crate::wasm::HttpCallResponse {
                             status_code: 502,
-                            headers: vec![(b"x-wasm-error".to_vec(), b"upstream_not_found".to_vec())],
+                            headers: vec![(
+                                b"x-wasm-error".to_vec(),
+                                b"upstream_not_found".to_vec(),
+                            )],
                             body: format!("Upstream '{}' not found", upstream_name).into_bytes(),
                             trailers: vec![],
                         }
@@ -611,7 +632,9 @@ pub fn spawn_health_check_thread() {
 
             // 次のチェックまで待機（最短間隔を使用）
             // シャットダウン時に迅速に終了するため、短い間隔で分割してスリープ
-            let min_interval = config.upstream_groups.values()
+            let min_interval = config
+                .upstream_groups
+                .values()
                 .filter_map(|g| g.health_check.as_ref())
                 .map(|hc| hc.interval_secs)
                 .min()
@@ -650,22 +673,15 @@ pub fn create_listener(
     #[allow(unused_variables)] num_workers: usize,
     #[allow(unused_variables)] worker_id: usize,
 ) -> io::Result<TcpListener> {
-    let config = monoio::net::ListenerConfig::default()
-        .reuse_port(true)
-        .backlog(8192);
-    let listener = TcpListener::bind_with_config(addr, &config)?;
+    // SO_REUSEPORT を有効にして listen する（カスタム io_uring 実装）
+    let listener = TcpListener::bind_reuse_port(addr)?;
 
     // Linux環境でCBPF振り分けが有効な場合、最初のワーカーのみCBPFプログラムをアタッチ
     // 後続のワーカーはreuseportグループに参加し、自動的にBPFプログラムを継承する
     #[cfg(target_os = "linux")]
     if balancing == ReuseportBalancing::Cbpf {
         // CAS操作で最初の1回だけアタッチを実行
-        let prev = CBPF_ATTACHED.compare_exchange(
-            0,
-            1,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        );
+        let prev = CBPF_ATTACHED.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst);
 
         if prev.is_ok() {
             // このワーカーが最初にリスナーを作成した
@@ -677,8 +693,10 @@ pub fn create_listener(
                 }
                 Err(e) => {
                     // CBPFアタッチに失敗した場合はカーネルデフォルトにフォールバック
-                    warn!("[Worker {}] CBPF attach failed, falling back to kernel default: {}",
-                          worker_id, e);
+                    warn!(
+                        "[Worker {}] CBPF attach failed, falling back to kernel default: {}",
+                        worker_id, e
+                    );
                     // フラグをリセットして他のワーカーも試行できるようにする（オプション）
                     // CBPF_ATTACHED.store(0, Ordering::SeqCst);
                 }
