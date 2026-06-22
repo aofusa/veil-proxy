@@ -76,6 +76,23 @@ io_uring (monoio) と rustls を使用した高性能リバースプロキシサ
 
 ## ビルド
 
+### 依存ライブラリ
+
+有効にするフィーチャーに応じて、以下のシステムライブラリが必要です：
+
+| 依存ライブラリ | 必要なフィーチャー | 備考 |
+|--------------|----------------|------|
+| `cmake` | `http3` フィーチャー（quiche/BoringSSL） | ビルド前にインストールが必要 |
+| `nasm` | `aws-lc-rs`（TLS、常時必要） | 暗号処理のアセンブリ最適化 |
+
+Debian/Ubuntu の場合：
+
+```bash
+apt-get install -y cmake nasm
+```
+
+### ローカルビルド
+
 ```bash
 # デフォルトビルド — kTLS + HTTP/2 + mimalloc（推奨）
 cargo build --release
@@ -88,6 +105,26 @@ cargo build --release --no-default-features
 ```
 
 ビルド後のバイナリは `target/release/veil` に生成されます。
+
+### 配布用ビルド（glibc 2.28、Docker 使用）
+
+古い Linux ディストリビューション（glibc ≥ 2.28）向けのバイナリを生成するには、
+Zig ツールチェーンで最小 glibc バージョンにリンクする [`messense/cargo-zigbuild`](https://github.com/messense/cargo-zigbuild) を使用します。
+
+```bash
+# 全機能ビルド
+docker run --rm -it -v $(pwd):/io -w /io messense/cargo-zigbuild bash -c \
+  "apt-get update -y && apt-get install -y cmake nasm && \
+   cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.28 --features full"
+
+# デフォルトビルド（cmake/nasm 不要）
+docker run --rm -it -v $(pwd):/io -w /io messense/cargo-zigbuild \
+  cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.28
+```
+
+ビルド後のバイナリは `target/x86_64-unknown-linux-gnu/release/veil` に生成されます。
+
+> **注意**: `--features full` でビルドする場合、`http3` フィーチャーが quiche にバンドルされた BoringSSL をコンパイルするため `cmake` が、`aws-lc-rs` がアセンブリ最適化を使用するため `nasm` が、それぞれコンテナ内にインストールされている必要があります。`http3` を含まないデフォルトビルドでは cmake は不要です。
 
 > **Cargo フィーチャー**: 利用可能なフィーチャーフラグの一覧は [`Cargo.toml` の `[features]` セクション](Cargo.toml) を参照してください。
 > 主な注意点：

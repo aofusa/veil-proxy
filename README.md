@@ -76,6 +76,23 @@ A high-performance reverse proxy server using io_uring (monoio) and rustls.
 
 ## Build
 
+### Dependencies
+
+The following system libraries are required depending on enabled features:
+
+| Dependency | Required for | Notes |
+|------------|-------------|-------|
+| `cmake` | `http3` feature (quiche/BoringSSL) | Must be installed before building |
+| `nasm` | `aws-lc-rs` (TLS, always required) | Assembly optimizations for crypto |
+
+On Debian/Ubuntu:
+
+```bash
+apt-get install -y cmake nasm
+```
+
+### Local Build
+
 ```bash
 # Default build — kTLS + HTTP/2 + mimalloc (recommended)
 cargo build --release
@@ -88,6 +105,26 @@ cargo build --release --no-default-features
 ```
 
 The binary is generated at `target/release/veil`.
+
+### Distribution Build (glibc 2.28, Docker)
+
+To produce a binary compatible with older Linux distributions (glibc ≥ 2.28), use
+[`messense/cargo-zigbuild`](https://github.com/messense/cargo-zigbuild) which links against a minimum glibc version via the Zig toolchain.
+
+```bash
+# Full featured build
+docker run --rm -it -v $(pwd):/io -w /io messense/cargo-zigbuild bash -c \
+  "apt-get update -y && apt-get install -y cmake nasm && \
+   cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.28 --features full"
+
+# Default build (no cmake/nasm required)
+docker run --rm -it -v $(pwd):/io -w /io messense/cargo-zigbuild \
+  cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.28
+```
+
+The binary is generated at `target/x86_64-unknown-linux-gnu/release/veil`.
+
+> **Note**: `cmake` and `nasm` must be installed inside the container when building with `--features full` because the `http3` feature compiles quiche's bundled BoringSSL (requires cmake) and `aws-lc-rs` uses assembly optimizations (requires nasm). The default build without `http3` does not need cmake.
 
 > **Cargo features**: The complete list of available feature flags is defined in the [`[features]` section of `Cargo.toml`](Cargo.toml).
 > Key notes:
