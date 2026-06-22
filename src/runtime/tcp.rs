@@ -143,9 +143,7 @@ impl TcpListener {
         }
 
         let (storage, len) = sockaddr_to_storage(&addr);
-        let ret = unsafe {
-            libc::bind(fd, &storage as *const _ as *const libc::sockaddr, len)
-        };
+        let ret = unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, len) };
         if ret < 0 {
             unsafe { libc::close(fd) };
             return Err(io::Error::last_os_error());
@@ -193,9 +191,7 @@ impl TcpListener {
         }
 
         let (storage, len) = sockaddr_to_storage(&addr);
-        let ret = unsafe {
-            libc::bind(fd, &storage as *const _ as *const libc::sockaddr, len)
-        };
+        let ret = unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, len) };
         if ret < 0 {
             unsafe { libc::close(fd) };
             return Err(io::Error::last_os_error());
@@ -218,6 +214,7 @@ impl TcpListener {
             addr_storage: Box::new(unsafe { std::mem::zeroed() }),
             addr_len: Box::new(std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t),
             submitted: false,
+            _marker: std::marker::PhantomData,
         }
     }
 
@@ -346,6 +343,19 @@ impl TcpStream {
         }
     }
 
+    /// 文字列アドレス（"host:port"）から接続する
+    ///
+    /// DNS 解決はブロッキングで行う（コールドパスのみ）。
+    pub async fn connect_str(addr: &str) -> io::Result<TcpStream> {
+        use std::net::ToSocketAddrs;
+        let socket_addr = addr
+            .to_socket_addrs()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no address resolved"))?;
+        TcpStream::connect(socket_addr).await
+    }
+
     /// バッファに非同期で読み込む（io_uring RECV）
     ///
     /// バッファの所有権を取り、完了時に `(Result<usize>, T)` を返す。
@@ -454,6 +464,47 @@ impl TcpStream {
             return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+}
+
+// ====================
+// AsyncReadRent / AsyncWriteRent 実装
+// ====================
+
+impl crate::runtime::io::AsyncReadRent for TcpStream {
+    fn read<T: crate::runtime::buf::IoBufMut>(
+        &mut self,
+        buf: T,
+    ) -> impl std::future::Future<Output = crate::runtime::io::BufResult<usize, T>> {
+        // &self メソッドを &mut self 経由で呼ぶ（内部状態を変更しない）
+        let fd = self.fd;
+        ReadFuture {
+            fd,
+            buf,
+            user_data: 0,
+            submitted: false,
+        }
+    }
+}
+
+impl crate::runtime::io::AsyncWriteRent for TcpStream {
+    fn write<T: crate::runtime::buf::IoBuf>(
+        &mut self,
+        buf: T,
+    ) -> impl std::future::Future<Output = crate::runtime::io::BufResult<usize, T>> {
+        let fd = self.fd;
+        WriteFuture {
+            fd,
+            buf,
+            user_data: 0,
+            submitted: false,
+        }
+    }
+
+    fn shutdown(&mut self) -> impl std::future::Future<Output = std::io::Result<()>> {
+        // SHUT_RDWR でシャットダウン（同期操作だが async として wrap）
+        let result = TcpStream::shutdown(self, std::net::Shutdown::Both);
+        async move { result }
     }
 }
 
@@ -577,15 +628,18 @@ pub struct ReadFuture<T: IoBufMut> {
 impl<T: IoBufMut> Future for ReadFuture<T> {
     type Output = (io::Result<usize>, T);
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if !self.submitted {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: ReadFuture はアンピン可能（ポインタを保持しない）
+        let this = unsafe { self.get_unchecked_mut() };
+
+        if !this.submitted {
             let user_data = next_user_data();
-            self.user_data = user_data;
+            this.user_data = user_data;
             register_op(user_data);
 
-            let fd = self.fd;
-            let buf_ptr = self.buf.write_ptr() as u64;
-            let buf_len = self.buf.bytes_total() as u32;
+            let fd = this.fd;
+            let buf_ptr = this.buf.write_ptr() as u64;
+            let buf_len = this.buf.bytes_total() as u32;
 
             with_ring(|ring| {
                 if let Some(sqe) = ring.get_sqe() {
@@ -599,26 +653,27 @@ impl<T: IoBufMut> Future for ReadFuture<T> {
 
             if let Err(e) = submit_sqes() {
                 remove_op(user_data);
-                // SAFETY: バッファを返却する
-                let buf = unsafe { std::ptr::read(&self.buf) };
-                std::mem::forget(self);
+                // SAFETY: バッファを返却する（drop しないよう forget）
+                let buf = unsafe { std::ptr::read(&this.buf) };
+                std::mem::forget(unsafe { std::ptr::read(this) });
                 return Poll::Ready((Err(e), buf));
             }
 
-            self.submitted = true;
+            this.submitted = true;
         }
 
-        match peek_op_result(self.user_data) {
+        match peek_op_result(this.user_data) {
             Some(res) => {
-                take_op_result(self.user_data);
+                take_op_result(this.user_data);
                 let n = res;
 
-                // SAFETY: バッファを取り出す（self をドロップしない）
-                let this = unsafe { self.get_unchecked_mut() };
                 // buf をムーブアウト
                 let buf = unsafe { std::ptr::read(&this.buf) };
-                // self をドロップしないようにするために forget は不要（Poll::Ready を返す）
-                // ただし buf のドロップ責任は Output に移る
+                // this は ReadFuture 全体として forget（buf を二重 drop しないよう）
+                let ud = this.user_data;
+                let fd = this.fd;
+                std::mem::forget(unsafe { std::ptr::read(this) });
+                let _ = (ud, fd); // suppress warnings
 
                 if n < 0 {
                     Poll::Ready((Err(io::Error::from_raw_os_error(-n)), buf))
@@ -630,7 +685,7 @@ impl<T: IoBufMut> Future for ReadFuture<T> {
                 }
             }
             None => {
-                set_op_waker(self.user_data, cx.waker().clone());
+                set_op_waker(this.user_data, cx.waker().clone());
                 Poll::Pending
             }
         }
@@ -652,15 +707,18 @@ pub struct WriteFuture<T: IoBuf> {
 impl<T: IoBuf> Future for WriteFuture<T> {
     type Output = (io::Result<usize>, T);
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if !self.submitted {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: WriteFuture はアンピン可能（ポインタを保持しない）
+        let this = unsafe { self.get_unchecked_mut() };
+
+        if !this.submitted {
             let user_data = next_user_data();
-            self.user_data = user_data;
+            this.user_data = user_data;
             register_op(user_data);
 
-            let fd = self.fd;
-            let buf_ptr = self.buf.read_ptr() as u64;
-            let buf_len = self.buf.bytes_init() as u32;
+            let fd = this.fd;
+            let buf_ptr = this.buf.read_ptr() as u64;
+            let buf_len = this.buf.bytes_init() as u32;
 
             with_ring(|ring| {
                 if let Some(sqe) = ring.get_sqe() {
@@ -674,20 +732,20 @@ impl<T: IoBuf> Future for WriteFuture<T> {
 
             if let Err(e) = submit_sqes() {
                 remove_op(user_data);
-                let buf = unsafe { std::ptr::read(&self.buf) };
-                std::mem::forget(self);
+                let buf = unsafe { std::ptr::read(&this.buf) };
+                std::mem::forget(unsafe { std::ptr::read(this) });
                 return Poll::Ready((Err(e), buf));
             }
 
-            self.submitted = true;
+            this.submitted = true;
         }
 
-        match peek_op_result(self.user_data) {
+        match peek_op_result(this.user_data) {
             Some(res) => {
-                take_op_result(self.user_data);
+                take_op_result(this.user_data);
                 let n = res;
-                let this = unsafe { self.get_unchecked_mut() };
                 let buf = unsafe { std::ptr::read(&this.buf) };
+                std::mem::forget(unsafe { std::ptr::read(this) });
 
                 if n < 0 {
                     Poll::Ready((Err(io::Error::from_raw_os_error(-n)), buf))
@@ -696,7 +754,7 @@ impl<T: IoBuf> Future for WriteFuture<T> {
                 }
             }
             None => {
-                set_op_waker(self.user_data, cx.waker().clone());
+                set_op_waker(this.user_data, cx.waker().clone());
                 Poll::Pending
             }
         }

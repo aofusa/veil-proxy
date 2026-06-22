@@ -21,8 +21,8 @@ use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crate::runtime::ring::{
     IoUring, IoUringCqe, IORING_ENTER_GETEVENTS, IORING_OP_ACCEPT, IORING_OP_ASYNC_CANCEL,
-    IORING_OP_CLOSE, IORING_OP_CONNECT, IORING_OP_NOP, IORING_OP_POLL_ADD,
-    IORING_OP_POLL_REMOVE, IORING_OP_RECV, IORING_OP_SEND, IORING_OP_SPLICE, IORING_OP_TIMEOUT,
+    IORING_OP_CLOSE, IORING_OP_CONNECT, IORING_OP_NOP, IORING_OP_POLL_ADD, IORING_OP_POLL_REMOVE,
+    IORING_OP_RECV, IORING_OP_SEND, IORING_OP_SPLICE, IORING_OP_TIMEOUT,
 };
 
 // ====================
@@ -153,7 +153,10 @@ pub fn init_ring(entries: u32, flags: u32) -> std::io::Result<()> {
     // IORING_REGISTER_RESTRICTIONS でオペコードを制限
     // 制限適用に失敗しても動作は継続（カーネルバージョン依存）
     if let Err(e) = ring.apply_restrictions(PROXY_ALLOWED_OPCODES) {
-        ftlog::debug!("io_uring restrictions not applied (kernel may not support): {}", e);
+        ftlog::debug!(
+            "io_uring restrictions not applied (kernel may not support): {}",
+            e
+        );
     }
 
     RING.with(|r| {
@@ -169,7 +172,9 @@ where
 {
     RING.with(|r| {
         let mut borrow = r.borrow_mut();
-        let ring = borrow.as_mut().expect("io_uring ring not initialized for this thread");
+        let ring = borrow
+            .as_mut()
+            .expect("io_uring ring not initialized for this thread");
         f(ring)
     })
 }
@@ -227,9 +232,7 @@ pub fn poll_completions() {
 
 /// io_uring の CQE を処理する（最低 1 件完了まで待機）
 pub fn wait_for_completions() -> std::io::Result<()> {
-    with_ring(|ring| {
-        ring.submit_and_wait(1)
-    })?;
+    with_ring(|ring| ring.submit_and_wait(1))?;
 
     poll_completions();
     Ok(())
@@ -404,7 +407,12 @@ impl Executor {
             }
         }
 
-        result.lock().unwrap().take().expect("future completed but no result")
+        let value = result
+            .lock()
+            .unwrap()
+            .take()
+            .expect("future completed but no result");
+        value
     }
 }
 
@@ -436,7 +444,9 @@ where
 {
     EXECUTOR.with(|e| {
         let borrow = e.borrow();
-        let exec = borrow.as_ref().expect("executor not initialized for this thread");
+        let exec = borrow
+            .as_ref()
+            .expect("executor not initialized for this thread");
         exec.spawn(future);
     });
 }

@@ -11,8 +11,11 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use crate::runtime::executor::{next_user_data, peek_op_result, register_op, set_op_waker, submit_sqes, take_op_result, with_ring};
-use crate::runtime::ring::{IoUringSqe, IoUringParams, KernelTimespec, IORING_OP_TIMEOUT};
+use crate::runtime::executor::{
+    next_user_data, peek_op_result, register_op, set_op_waker, submit_sqes, take_op_result,
+    with_ring,
+};
+use crate::runtime::ring::{IoUringParams, IoUringSqe, KernelTimespec, IORING_OP_TIMEOUT};
 
 // ====================
 // Sleep Future
@@ -89,6 +92,16 @@ impl Future for Sleep {
         // Waker を登録
         set_op_waker(user_data, cx.waker().clone());
         Poll::Pending
+    }
+}
+
+// Sleep に FusedFuture を実装（futures::select_biased! で使用するため）
+impl futures::future::FusedFuture for Sleep {
+    fn is_terminated(&self) -> bool {
+        if !self.submitted {
+            return false;
+        }
+        crate::runtime::executor::peek_op_result(self.user_data).is_some()
     }
 }
 

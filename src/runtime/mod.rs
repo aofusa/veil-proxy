@@ -21,6 +21,7 @@
 
 pub mod buf;
 pub mod executor;
+pub mod io;
 pub mod ring;
 pub mod tcp;
 pub mod timer;
@@ -103,8 +104,7 @@ where
     }
 
     // スレッドローカル io_uring リングを初期化
-    executor::init_ring(config.ring_entries, flags)
-        .expect("Failed to initialize io_uring ring");
+    executor::init_ring(config.ring_entries, flags).expect("Failed to initialize io_uring ring");
 
     // スレッドローカルエグゼキュータを初期化
     executor::init_executor();
@@ -120,17 +120,7 @@ where
 
 /// 時間関連ユーティリティ（monoio::time 互換）
 pub mod time {
+    // timer モジュールの sleep/timeout/Elapsed を re-export
     pub use super::timer::{sleep, timeout, Elapsed, Sleep};
     pub use std::time::Duration;
-
-    /// タイムアウト付きで Future を実行する（monoio::time::timeout 互換）
-    pub async fn timeout<F, R>(
-        duration: Duration,
-        future: F,
-    ) -> Result<R, super::timer::Elapsed>
-    where
-        F: std::future::Future<Output = R>,
-    {
-        super::timer::timeout(duration, future).await
-    }
 }

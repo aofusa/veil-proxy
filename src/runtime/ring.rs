@@ -421,40 +421,22 @@ impl IoUring {
         let cq_ring_ptr = cq_ring_ptr as *mut u8;
 
         // オフセットからポインタを計算
-        let sq_head = unsafe {
-            sq_ring_ptr.add(params.sq_off.head as usize) as *const AtomicU32
-        };
-        let sq_tail = unsafe {
-            sq_ring_ptr.add(params.sq_off.tail as usize) as *mut AtomicU32
-        };
-        let sq_ring_mask = unsafe {
-            sq_ring_ptr.add(params.sq_off.ring_mask as usize) as *const u32
-        };
-        let sq_ring_entries = unsafe {
-            sq_ring_ptr.add(params.sq_off.ring_entries as usize) as *const u32
-        };
-        let sq_flags = unsafe {
-            sq_ring_ptr.add(params.sq_off.flags as usize) as *mut u32
-        };
-        let sq_array = unsafe {
-            sq_ring_ptr.add(params.sq_off.array as usize) as *mut u32
-        };
+        let sq_head = unsafe { sq_ring_ptr.add(params.sq_off.head as usize) as *const AtomicU32 };
+        let sq_tail = unsafe { sq_ring_ptr.add(params.sq_off.tail as usize) as *mut AtomicU32 };
+        let sq_ring_mask =
+            unsafe { sq_ring_ptr.add(params.sq_off.ring_mask as usize) as *const u32 };
+        let sq_ring_entries =
+            unsafe { sq_ring_ptr.add(params.sq_off.ring_entries as usize) as *const u32 };
+        let sq_flags = unsafe { sq_ring_ptr.add(params.sq_off.flags as usize) as *mut u32 };
+        let sq_array = unsafe { sq_ring_ptr.add(params.sq_off.array as usize) as *mut u32 };
 
-        let cq_head = unsafe {
-            cq_ring_ptr.add(params.cq_off.head as usize) as *mut AtomicU32
-        };
-        let cq_tail = unsafe {
-            cq_ring_ptr.add(params.cq_off.tail as usize) as *const AtomicU32
-        };
-        let cq_ring_mask = unsafe {
-            cq_ring_ptr.add(params.cq_off.ring_mask as usize) as *const u32
-        };
-        let cq_ring_entries = unsafe {
-            cq_ring_ptr.add(params.cq_off.ring_entries as usize) as *const u32
-        };
-        let cqes_ptr = unsafe {
-            cq_ring_ptr.add(params.cq_off.cqes as usize) as *mut IoUringCqe
-        };
+        let cq_head = unsafe { cq_ring_ptr.add(params.cq_off.head as usize) as *mut AtomicU32 };
+        let cq_tail = unsafe { cq_ring_ptr.add(params.cq_off.tail as usize) as *const AtomicU32 };
+        let cq_ring_mask =
+            unsafe { cq_ring_ptr.add(params.cq_off.ring_mask as usize) as *const u32 };
+        let cq_ring_entries =
+            unsafe { cq_ring_ptr.add(params.cq_off.ring_entries as usize) as *const u32 };
+        let cqes_ptr = unsafe { cq_ring_ptr.add(params.cq_off.cqes as usize) as *mut IoUringCqe };
 
         Ok(Self {
             fd,
