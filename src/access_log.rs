@@ -24,14 +24,14 @@
 // - ArcSwap による lock-free なチャンネル差し替え（ホットリロード対応）
 // - tokio 非依存（std::thread + std::sync::mpsc）
 
+use arc_swap::ArcSwap;
 use std::cell::RefCell;
 use std::io::{self, Write};
 use std::sync::{
+    mpsc::{self, RecvTimeoutError, SyncSender},
     Arc, OnceLock,
-    mpsc::{self, SyncSender, RecvTimeoutError},
 };
 use std::time::Duration;
-use arc_swap::ArcSwap;
 use time::OffsetDateTime;
 
 use crate::config::CURRENT_CONFIG;
@@ -95,8 +95,12 @@ pub struct AccessLogConfig {
     pub flush_interval_ms: u64,
 }
 
-fn default_access_log_channel_size() -> usize { 10_000 }
-fn default_access_log_flush_interval_ms() -> u64 { 1_000 }
+fn default_access_log_channel_size() -> usize {
+    10_000
+}
+fn default_access_log_flush_interval_ms() -> u64 {
+    1_000
+}
 
 impl Default for AccessLogConfig {
     fn default() -> Self {
@@ -128,7 +132,11 @@ pub(crate) fn init_access_log_writer(config: &AccessLogConfig) {
         return;
     }
     let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(config.channel_size);
-    spawn_log_thread(rx, config.file_path.clone(), Duration::from_millis(config.flush_interval_ms));
+    spawn_log_thread(
+        rx,
+        config.file_path.clone(),
+        Duration::from_millis(config.flush_interval_ms),
+    );
     tx_store().store(Arc::new(Some(tx)));
 }
 
@@ -142,7 +150,11 @@ pub(crate) fn reload_access_log_writer(config: &AccessLogConfig) {
         return;
     }
     let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(config.channel_size);
-    spawn_log_thread(rx, config.file_path.clone(), Duration::from_millis(config.flush_interval_ms));
+    spawn_log_thread(
+        rx,
+        config.file_path.clone(),
+        Duration::from_millis(config.flush_interval_ms),
+    );
     // アトミックに差し替え。旧 Arc の refcount がゼロになった時点で旧 SyncSender が drop される。
     tx_store().store(Arc::new(Some(tx)));
 }
@@ -177,7 +189,11 @@ fn spawn_log_thread(
 
             let mut writer = match file_path {
                 Some(ref path) => {
-                    match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    match std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                    {
                         Ok(f) => Writer::File(io::BufWriter::new(f)),
                         Err(e) => {
                             eprintln!("access-log: failed to open '{}': {}", path, e);
@@ -222,12 +238,29 @@ pub(crate) fn write_json_str(buf: &mut Vec<u8>, s: &str) {
     buf.push(b'"');
     for b in s.bytes() {
         match b {
-            b'"'  => { buf.push(b'\\'); buf.push(b'"'); }
-            b'\\' => { buf.push(b'\\'); buf.push(b'\\'); }
-            b'\n' => { buf.push(b'\\'); buf.push(b'n'); }
-            b'\r' => { buf.push(b'\\'); buf.push(b'r'); }
-            b'\t' => { buf.push(b'\\'); buf.push(b't'); }
-            b     => { buf.push(b); }
+            b'"' => {
+                buf.push(b'\\');
+                buf.push(b'"');
+            }
+            b'\\' => {
+                buf.push(b'\\');
+                buf.push(b'\\');
+            }
+            b'\n' => {
+                buf.push(b'\\');
+                buf.push(b'n');
+            }
+            b'\r' => {
+                buf.push(b'\\');
+                buf.push(b'r');
+            }
+            b'\t' => {
+                buf.push(b'\\');
+                buf.push(b't');
+            }
+            b => {
+                buf.push(b);
+            }
         }
     }
     buf.push(b'"');
@@ -295,7 +328,9 @@ pub(crate) fn build_json_log(
     macro_rules! json_field {
         ($name:literal, $write:expr) => {
             if should_output_field(fields, $name) {
-                if !first { buf.push(b','); }
+                if !first {
+                    buf.push(b',');
+                }
                 buf.push(b'"');
                 buf.extend_from_slice($name.as_bytes());
                 buf.extend_from_slice(b"\":");
@@ -305,21 +340,41 @@ pub(crate) fn build_json_log(
         };
     }
 
-    json_field!("timestamp",      {
+    json_field!("timestamp", {
         buf.push(b'"');
         write_rfc3339_into_buf(buf, timestamp);
         buf.push(b'"');
     });
-    json_field!("method",         { write_json_str(buf, method); });
-    json_field!("host",           { write_json_str(buf, host); });
-    json_field!("path",           { write_json_str(buf, path); });
-    json_field!("status",         { write_u16(buf, status); });
-    json_field!("duration_ms",    { write_u128(buf, duration_ms); });
-    json_field!("client_ip",      { write_json_str(buf, client_ip); });
-    json_field!("upstream",       { write_json_str(buf, upstream); });
-    json_field!("req_body_size",  { write_u64(buf, req_body_size); });
-    json_field!("resp_body_size", { write_u64(buf, resp_body_size); });
-    json_field!("user_agent",     { write_json_str(buf, user_agent); });
+    json_field!("method", {
+        write_json_str(buf, method);
+    });
+    json_field!("host", {
+        write_json_str(buf, host);
+    });
+    json_field!("path", {
+        write_json_str(buf, path);
+    });
+    json_field!("status", {
+        write_u16(buf, status);
+    });
+    json_field!("duration_ms", {
+        write_u128(buf, duration_ms);
+    });
+    json_field!("client_ip", {
+        write_json_str(buf, client_ip);
+    });
+    json_field!("upstream", {
+        write_json_str(buf, upstream);
+    });
+    json_field!("req_body_size", {
+        write_u64(buf, req_body_size);
+    });
+    json_field!("resp_body_size", {
+        write_u64(buf, resp_body_size);
+    });
+    json_field!("user_agent", {
+        write_json_str(buf, user_agent);
+    });
 
     buf.push(b'}');
     buf.push(b'\n');
@@ -348,7 +403,9 @@ pub(crate) fn build_text_log(
     macro_rules! text_field {
         ($name:literal, $write:expr) => {
             if should_output_field(fields, $name) {
-                if !first { buf.push(b' '); }
+                if !first {
+                    buf.push(b' ');
+                }
                 buf.extend_from_slice($name.as_bytes());
                 buf.push(b'=');
                 $write;
@@ -357,19 +414,39 @@ pub(crate) fn build_text_log(
         };
     }
 
-    text_field!("timestamp",      {
+    text_field!("timestamp", {
         write_rfc3339_into_buf(buf, timestamp);
     });
-    text_field!("method",         { buf.extend_from_slice(method.as_bytes()); });
-    text_field!("host",           { buf.extend_from_slice(host.as_bytes()); });
-    text_field!("path",           { buf.extend_from_slice(path.as_bytes()); });
-    text_field!("status",         { write_u16(buf, status); });
-    text_field!("duration_ms",    { write_u128(buf, duration_ms); });
-    text_field!("client_ip",      { buf.extend_from_slice(client_ip.as_bytes()); });
-    text_field!("upstream",       { buf.extend_from_slice(upstream.as_bytes()); });
-    text_field!("req_body_size",  { write_u64(buf, req_body_size); });
-    text_field!("resp_body_size", { write_u64(buf, resp_body_size); });
-    text_field!("user_agent",     { buf.extend_from_slice(user_agent.as_bytes()); });
+    text_field!("method", {
+        buf.extend_from_slice(method.as_bytes());
+    });
+    text_field!("host", {
+        buf.extend_from_slice(host.as_bytes());
+    });
+    text_field!("path", {
+        buf.extend_from_slice(path.as_bytes());
+    });
+    text_field!("status", {
+        write_u16(buf, status);
+    });
+    text_field!("duration_ms", {
+        write_u128(buf, duration_ms);
+    });
+    text_field!("client_ip", {
+        buf.extend_from_slice(client_ip.as_bytes());
+    });
+    text_field!("upstream", {
+        buf.extend_from_slice(upstream.as_bytes());
+    });
+    text_field!("req_body_size", {
+        write_u64(buf, req_body_size);
+    });
+    text_field!("resp_body_size", {
+        write_u64(buf, resp_body_size);
+    });
+    text_field!("user_agent", {
+        buf.extend_from_slice(user_agent.as_bytes());
+    });
 
     buf.push(b'\n');
 }
@@ -417,20 +494,32 @@ pub(crate) fn log_access_structured(
             build_json_log(
                 &mut buf,
                 log_time,
-                method, host, path,
-                status, duration_ms,
-                client_ip, upstream,
-                req_body_size, resp_body_size, ua,
+                method,
+                host,
+                path,
+                status,
+                duration_ms,
+                client_ip,
+                upstream,
+                req_body_size,
+                resp_body_size,
+                ua,
                 &acfg.fields,
             );
         } else {
             build_text_log(
                 &mut buf,
                 log_time,
-                method, host, path,
-                status, duration_ms,
-                client_ip, upstream,
-                req_body_size, resp_body_size, ua,
+                method,
+                host,
+                path,
+                status,
+                duration_ms,
+                client_ip,
+                upstream,
+                req_body_size,
+                resp_body_size,
+                ua,
                 &acfg.fields,
             );
         }
@@ -476,15 +565,43 @@ mod tests {
             &[],
         );
         let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains("\"method\":\"GET\""),         "method field missing: {}", s);
-        assert!(s.contains("\"host\":\"example.com\""),   "host field missing: {}", s);
-        assert!(s.contains("\"path\":\"/test\""),          "path field missing: {}", s);
-        assert!(s.contains("\"status\":200"),              "status field missing: {}", s);
-        assert!(s.contains("\"duration_ms\":42"),          "duration_ms field missing: {}", s);
-        assert!(s.contains("\"client_ip\":\"127.0.0.1\""), "client_ip field missing: {}", s);
-        assert!(s.contains("\"user_agent\":\"curl/7.0\""), "user_agent field missing: {}", s);
-        assert!(s.contains("\"timestamp\":\"2024-01-01"), "timestamp field missing: {}", s);
-        assert!(s.ends_with('\n'),                         "should end with newline");
+        assert!(
+            s.contains("\"method\":\"GET\""),
+            "method field missing: {}",
+            s
+        );
+        assert!(
+            s.contains("\"host\":\"example.com\""),
+            "host field missing: {}",
+            s
+        );
+        assert!(
+            s.contains("\"path\":\"/test\""),
+            "path field missing: {}",
+            s
+        );
+        assert!(s.contains("\"status\":200"), "status field missing: {}", s);
+        assert!(
+            s.contains("\"duration_ms\":42"),
+            "duration_ms field missing: {}",
+            s
+        );
+        assert!(
+            s.contains("\"client_ip\":\"127.0.0.1\""),
+            "client_ip field missing: {}",
+            s
+        );
+        assert!(
+            s.contains("\"user_agent\":\"curl/7.0\""),
+            "user_agent field missing: {}",
+            s
+        );
+        assert!(
+            s.contains("\"timestamp\":\"2024-01-01"),
+            "timestamp field missing: {}",
+            s
+        );
+        assert!(s.ends_with('\n'), "should end with newline");
     }
 
     #[test]
@@ -506,10 +623,14 @@ mod tests {
             &[],
         );
         let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains("method=POST"),    "method field missing: {}", s);
-        assert!(s.contains("status=201"),     "status field missing: {}", s);
-        assert!(s.contains("duration_ms=10"), "duration_ms field missing: {}", s);
-        assert!(s.ends_with('\n'),            "should end with newline");
+        assert!(s.contains("method=POST"), "method field missing: {}", s);
+        assert!(s.contains("status=201"), "status field missing: {}", s);
+        assert!(
+            s.contains("duration_ms=10"),
+            "duration_ms field missing: {}",
+            s
+        );
+        assert!(s.ends_with('\n'), "should end with newline");
     }
 
     #[test]
@@ -532,20 +653,50 @@ mod tests {
             &fields,
         );
         let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains("\"method\":\"DELETE\""), "method should be present: {}", s);
-        assert!(s.contains("\"status\":204"),          "status should be present: {}", s);
-        assert!(!s.contains("\"host\""),               "host should be filtered out: {}", s);
-        assert!(!s.contains("\"path\""),               "path should be filtered out: {}", s);
-        assert!(!s.contains("\"user_agent\""),         "user_agent should be filtered out: {}", s);
+        assert!(
+            s.contains("\"method\":\"DELETE\""),
+            "method should be present: {}",
+            s
+        );
+        assert!(
+            s.contains("\"status\":204"),
+            "status should be present: {}",
+            s
+        );
+        assert!(
+            !s.contains("\"host\""),
+            "host should be filtered out: {}",
+            s
+        );
+        assert!(
+            !s.contains("\"path\""),
+            "path should be filtered out: {}",
+            s
+        );
+        assert!(
+            !s.contains("\"user_agent\""),
+            "user_agent should be filtered out: {}",
+            s
+        );
     }
 
     #[test]
     fn test_access_log_config_default() {
         let config = AccessLogConfig::default();
-        assert!(!config.enabled,                   "should be disabled by default");
-        assert_eq!(config.format, AccessLogFormat::Json, "default format should be Json");
-        assert!(config.file_path.is_none(),        "file_path should be None by default");
-        assert!(config.fields.is_empty(),          "fields should be empty by default");
+        assert!(!config.enabled, "should be disabled by default");
+        assert_eq!(
+            config.format,
+            AccessLogFormat::Json,
+            "default format should be Json"
+        );
+        assert!(
+            config.file_path.is_none(),
+            "file_path should be None by default"
+        );
+        assert!(
+            config.fields.is_empty(),
+            "fields should be empty by default"
+        );
         assert_eq!(config.channel_size, 10_000);
         assert_eq!(config.flush_interval_ms, 1_000);
     }
@@ -573,10 +724,17 @@ mod tests {
         let dt = OffsetDateTime::now_utc();
         // デフォルトでは access_log_config.enabled = false なので即座にリターン
         log_access_structured(
-            "GET", "example.com", "/", "-",
-            0, 200, 0,
-            dt, 0,
-            "127.0.0.1", "",
+            "GET",
+            "example.com",
+            "/",
+            "-",
+            0,
+            200,
+            0,
+            dt,
+            0,
+            "127.0.0.1",
+            "",
         );
         // パニックしなければ OK
     }
@@ -601,25 +759,31 @@ mod tests {
             &fields,
         );
         let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains("method=GET"),      "method should be present");
-        assert!(s.contains("path=/filtered"),  "path should be present");
-        assert!(!s.contains("host="),          "host should be filtered");
-        assert!(!s.contains("status="),        "status should be filtered");
+        assert!(s.contains("method=GET"), "method should be present");
+        assert!(s.contains("path=/filtered"), "path should be present");
+        assert!(!s.contains("host="), "host should be filtered");
+        assert!(!s.contains("status="), "status should be filtered");
     }
 
     #[test]
     fn test_access_log_format_serde() {
         // "json" → Json, "text" → Text
-        let json_cfg: AccessLogConfig = toml::from_str(r#"
+        let json_cfg: AccessLogConfig = toml::from_str(
+            r#"
             enabled = true
             format = "json"
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         assert_eq!(json_cfg.format, AccessLogFormat::Json);
 
-        let text_cfg: AccessLogConfig = toml::from_str(r#"
+        let text_cfg: AccessLogConfig = toml::from_str(
+            r#"
             enabled = true
             format = "text"
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         assert_eq!(text_cfg.format, AccessLogFormat::Text);
     }
 

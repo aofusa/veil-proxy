@@ -11,7 +11,7 @@
 //! - キャッシュヒット/ミス時のパフォーマンス
 //! - 各Phase単独パフォーマンス
 
-use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId, black_box};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
@@ -42,7 +42,7 @@ impl Default for BenchRouteConditions {
 /// テスト用ルートを生成
 fn generate_routes(count: usize) -> Vec<BenchRouteConditions> {
     let mut routes = Vec::with_capacity(count);
-    
+
     for i in 0..count {
         let route = BenchRouteConditions {
             host: if i % 3 == 0 {
@@ -72,10 +72,10 @@ fn generate_routes(count: usize) -> Vec<BenchRouteConditions> {
         };
         routes.push(route);
     }
-    
+
     // デフォルトルート（最後）
     routes.push(BenchRouteConditions::default());
-    
+
     routes
 }
 
@@ -98,7 +98,7 @@ fn linear_search(
                 continue;
             }
         }
-        
+
         // Path チェック
         if let Some(ref path_pattern) = route.path {
             if path_pattern.ends_with("/*") {
@@ -110,10 +110,10 @@ fn linear_search(
                 continue;
             }
         }
-        
+
         return Some(i);
     }
-    
+
     None
 }
 
@@ -138,7 +138,7 @@ impl SimulatedOptimizedRouter {
         let mut any_host: Vec<usize> = Vec::new();
         let mut path_router = matchit::Router::new();
         let mut any_path: Vec<usize> = Vec::new();
-        
+
         for (idx, route) in routes.iter().enumerate() {
             // Host indexing
             match &route.host {
@@ -157,7 +157,7 @@ impl SimulatedOptimizedRouter {
                     any_host.push(idx);
                 }
             }
-            
+
             // Path indexing
             match &route.path {
                 Some(p) => {
@@ -166,7 +166,7 @@ impl SimulatedOptimizedRouter {
                     } else {
                         p.clone()
                     };
-                    
+
                     match path_router.at_mut(&matchit_path) {
                         Ok(m) => m.value.push(idx),
                         Err(_) => {
@@ -179,7 +179,7 @@ impl SimulatedOptimizedRouter {
                 }
             }
         }
-        
+
         Self {
             exact_hosts,
             wildcard_hosts,
@@ -188,40 +188,40 @@ impl SimulatedOptimizedRouter {
             any_path,
         }
     }
-    
+
     fn get_candidates(&self, host: &str, path: &str) -> Vec<usize> {
         let host_lower = host.to_lowercase();
         let mut host_candidates = Vec::new();
-        
+
         // Exact match
         if let Some(indices) = self.exact_hosts.get(&host_lower) {
             host_candidates.extend(indices.iter().copied());
         }
-        
+
         // Wildcard match
         for (suffix, indices) in &self.wildcard_hosts {
             if host_lower.ends_with(suffix) {
                 host_candidates.extend(indices.iter().copied());
             }
         }
-        
+
         // Any host
         host_candidates.extend(self.any_host.iter().copied());
-        
+
         // Path candidates
         let mut path_candidates = Vec::new();
         if let Ok(m) = self.path_router.at(path) {
             path_candidates.extend(m.value.iter().copied());
         }
         path_candidates.extend(self.any_path.iter().copied());
-        
+
         // Intersection
         host_candidates
             .into_iter()
             .filter(|idx| path_candidates.contains(idx))
             .collect()
     }
-    
+
     fn find(&self, host: &str, path: &str, _method: &str) -> Option<usize> {
         let candidates = self.get_candidates(host, path);
         candidates.into_iter().min()
@@ -239,29 +239,29 @@ impl CachedRouter {
         Self {
             router: SimulatedOptimizedRouter::new(routes),
             cache: std::sync::Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(cache_size).unwrap()
+                std::num::NonZeroUsize::new(cache_size).unwrap(),
             )),
         }
     }
-    
+
     fn find_with_cache(&self, host: &str, path: &str, method: &str) -> Option<usize> {
         let key = (host.to_string(), path.to_string());
-        
+
         // Cache check
         if let Ok(mut cache) = self.cache.lock() {
             if let Some(result) = cache.get(&key) {
                 return *result;
             }
         }
-        
+
         // Cache miss
         let result = self.router.find(host, path, method);
-        
+
         // Cache result
         if let Ok(mut cache) = self.cache.lock() {
             cache.put(key, result);
         }
-        
+
         result
     }
 }
@@ -269,68 +269,60 @@ impl CachedRouter {
 /// 線形探索 vs 最適化ルーターベンチマーク
 fn benchmark_linear_vs_optimized(c: &mut Criterion) {
     let mut group = c.benchmark_group("routing_comparison");
-    
+
     for route_count in [10, 50, 100, 500].iter() {
         let routes = generate_routes(*route_count);
         let optimized = SimulatedOptimizedRouter::new(&routes);
-        
+
         // 中間位置のルートにマッチするリクエスト
         let mid_idx = route_count / 2;
         let host = format!("example{}.com", mid_idx);
         let path = format!("/api/v{}/resource/item", mid_idx % 5);
-        
+
         group.bench_with_input(
             BenchmarkId::new("linear", route_count),
             &(&routes, &host, &path),
             |b, (routes, host, path)| {
-                b.iter(|| {
-                    black_box(linear_search(routes, host, path, "GET"))
-                });
+                b.iter(|| black_box(linear_search(routes, host, path, "GET")));
             },
         );
-        
+
         group.bench_with_input(
             BenchmarkId::new("optimized", route_count),
             &(&optimized, &host, &path),
             |b, (router, host, path)| {
-                b.iter(|| {
-                    black_box(router.find(host, path, "GET"))
-                });
+                b.iter(|| black_box(router.find(host, path, "GET")));
             },
         );
     }
-    
+
     group.finish();
 }
 
 /// キャッシュ効果ベンチマーク
 fn benchmark_cache_performance(c: &mut Criterion) {
     let mut group = c.benchmark_group("routing_cache");
-    
+
     let routes = generate_routes(100);
     let cached = CachedRouter::new(&routes, 1000);
     let uncached = SimulatedOptimizedRouter::new(&routes);
-    
+
     // 同一リクエストのキャッシュヒット
     let host = "example50.com";
     let path = "/api/v0/resource/item";
-    
+
     // ウォームアップ（キャッシュに入れる）
     let _ = cached.find_with_cache(host, path, "GET");
-    
+
     group.bench_function("cache_hit", |b| {
-        b.iter(|| {
-            black_box(cached.find_with_cache(host, path, "GET"))
-        });
+        b.iter(|| black_box(cached.find_with_cache(host, path, "GET")));
     });
-    
+
     // キャッシュなし（毎回検索）
     group.bench_function("no_cache", |b| {
-        b.iter(|| {
-            black_box(uncached.find(host, path, "GET"))
-        });
+        b.iter(|| black_box(uncached.find(host, path, "GET")));
     });
-    
+
     // さまざまなリクエスト（キャッシュミス）
     group.bench_function("cache_miss_varied", |b| {
         let mut i = 0;
@@ -341,50 +333,46 @@ fn benchmark_cache_performance(c: &mut Criterion) {
             black_box(cached.find_with_cache(&host, &path, "GET"))
         });
     });
-    
+
     group.finish();
 }
 
 /// デフォルトルート（最終ルート）へのフォールバックベンチマーク
 fn benchmark_worst_case(c: &mut Criterion) {
     let mut group = c.benchmark_group("routing_worst_case");
-    
+
     for route_count in [10, 50, 100, 500].iter() {
         let routes = generate_routes(*route_count);
         let optimized = SimulatedOptimizedRouter::new(&routes);
-        
+
         // マッチしないリクエスト（デフォルトルートへ）
         let host = "unknown-host.invalid";
         let path = "/nonexistent/path";
-        
+
         group.bench_with_input(
             BenchmarkId::new("linear_fallback", route_count),
             &(&routes, host, path),
             |b, (routes, host, path)| {
-                b.iter(|| {
-                    black_box(linear_search(routes, host, path, "GET"))
-                });
+                b.iter(|| black_box(linear_search(routes, host, path, "GET")));
             },
         );
-        
+
         group.bench_with_input(
             BenchmarkId::new("optimized_fallback", route_count),
             &(&optimized, host, path),
             |b, (router, host, path)| {
-                b.iter(|| {
-                    black_box(router.find(host, path, "GET"))
-                });
+                b.iter(|| black_box(router.find(host, path, "GET")));
             },
         );
     }
-    
+
     group.finish();
 }
 
 /// 候補フィルタリング効果のベンチマーク
 fn benchmark_candidate_filtering(c: &mut Criterion) {
     let mut group = c.benchmark_group("candidate_filtering");
-    
+
     // 多数のホスト、少数のパス
     let mut routes = Vec::with_capacity(200);
     for i in 0..100 {
@@ -402,25 +390,21 @@ fn benchmark_candidate_filtering(c: &mut Criterion) {
         });
     }
     routes.push(BenchRouteConditions::default()); // default route
-    
+
     let optimized = SimulatedOptimizedRouter::new(&routes);
-    
+
     // 特定のホストへのリクエスト（候補が絞られる）
     let host = "api50.example.com";
     let path = "/api/v1/users";
-    
+
     group.bench_function("filtered_host", |b| {
-        b.iter(|| {
-            black_box(optimized.find(host, path, "GET"))
-        });
+        b.iter(|| black_box(optimized.find(host, path, "GET")));
     });
-    
+
     group.bench_function("linear_200_routes", |b| {
-        b.iter(|| {
-            black_box(linear_search(&routes, host, path, "GET"))
-        });
+        b.iter(|| black_box(linear_search(&routes, host, path, "GET")));
     });
-    
+
     group.finish();
 }
 

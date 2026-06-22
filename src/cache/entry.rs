@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 /// キャッシュエントリ
-/// 
+///
 /// キャッシュされたレスポンスのメタデータとボディを保持します。
 #[derive(Debug, Clone)]
 pub struct CacheEntry {
@@ -44,7 +44,7 @@ impl CacheEntry {
     ) -> Self {
         Self::with_vary(status_code, headers, storage, max_age_secs, None)
     }
-    
+
     /// Varyヘッダー情報を含めてエントリを作成
     pub fn with_vary(
         status_code: u16,
@@ -54,13 +54,13 @@ impl CacheEntry {
         vary_headers: Option<Vec<String>>,
     ) -> Self {
         let body_size = storage.size();
-        
+
         // ヘッダーから重要な値を抽出
         let mut etag = None;
         let mut last_modified = None;
         let mut content_type = None;
         let mut content_encoding = None;
-        
+
         for (name, value) in &headers {
             if name.eq_ignore_ascii_case(b"etag") {
                 if let Ok(s) = std::str::from_utf8(value) {
@@ -80,7 +80,7 @@ impl CacheEntry {
                 }
             }
         }
-        
+
         // Varyヘッダーリストを変換
         let vary_headers_arc = vary_headers.map(|v| {
             v.into_iter()
@@ -88,7 +88,7 @@ impl CacheEntry {
                 .collect::<Vec<_>>()
                 .into()
         });
-        
+
         Self {
             status_code,
             headers: headers.into(),
@@ -103,34 +103,34 @@ impl CacheEntry {
             vary_headers: vary_headers_arc,
         }
     }
-    
+
     /// エントリが有効期限内かチェック
     #[inline]
     pub fn is_valid(&self) -> bool {
         self.created_at.elapsed().as_secs() < self.max_age_secs
     }
-    
+
     /// エントリの残りTTL（秒）を取得
     #[inline]
     pub fn remaining_ttl(&self) -> u64 {
         let elapsed = self.created_at.elapsed().as_secs();
         self.max_age_secs.saturating_sub(elapsed)
     }
-    
+
     /// 期限切れ後の経過時間（秒）
-    /// 
+    ///
     /// stale-while-revalidate や stale-if-error で使用
     pub fn stale_duration(&self) -> u64 {
         let elapsed = self.created_at.elapsed().as_secs();
         elapsed.saturating_sub(self.max_age_secs)
     }
-    
+
     /// ストレージがメモリ内かどうか
     #[inline]
     pub fn is_memory(&self) -> bool {
         matches!(self.storage, CacheStorage::Memory(_))
     }
-    
+
     /// メモリ内のボディを取得
     #[inline]
     pub fn memory_body(&self) -> Option<&Arc<[u8]>> {
@@ -139,7 +139,7 @@ impl CacheEntry {
             _ => None,
         }
     }
-    
+
     /// ディスクパスを取得
     #[inline]
     pub fn disk_path(&self) -> Option<&PathBuf> {
@@ -148,21 +148,21 @@ impl CacheEntry {
             _ => None,
         }
     }
-    
+
     /// 概算メモリ使用量を計算
     pub fn memory_usage(&self) -> usize {
         let mut size = std::mem::size_of::<Self>();
-        
+
         // ヘッダーサイズ
         for (name, value) in self.headers.iter() {
             size += name.len() + value.len();
         }
-        
+
         // ストレージサイズ
         if let CacheStorage::Memory(data) = &self.storage {
             size += data.len();
         }
-        
+
         // オプショナルフィールド
         if let Some(s) = &self.etag {
             size += s.len();
@@ -176,17 +176,17 @@ impl CacheEntry {
         if let Some(s) = &self.content_encoding {
             size += s.len();
         }
-        
+
         // Varyヘッダーサイズ
         if let Some(vary) = &self.vary_headers {
             for s in vary.iter() {
                 size += s.len();
             }
         }
-        
+
         size
     }
-    
+
     /// Varyヘッダーリストを取得
     #[inline]
     pub fn vary_headers(&self) -> Option<&[Box<str>]> {
@@ -200,10 +200,7 @@ pub enum CacheStorage {
     /// インメモリキャッシュ（小さいレスポンス用）
     Memory(Arc<[u8]>),
     /// ディスクキャッシュ（大きいレスポンス用）
-    Disk {
-        path: PathBuf,
-        size: u64,
-    },
+    Disk { path: PathBuf, size: u64 },
 }
 
 impl CacheStorage {
@@ -217,9 +214,9 @@ impl CacheStorage {
 }
 
 /// キャッシュエントリビルダー
-/// 
+///
 /// ビルダーパターンによる柔軟な`CacheEntry`の作成を提供します。
-/// 
+///
 /// # 使用例
 /// ```rust
 /// let entry = CacheEntryBuilder::new(200)
@@ -228,7 +225,7 @@ impl CacheStorage {
 ///     .max_age(3600)
 ///     .build_memory();
 /// ```
-/// 
+///
 /// # 注意
 /// テストコードや将来の機能拡張で使用されることを想定しています。
 #[allow(dead_code)]
@@ -250,43 +247,43 @@ impl CacheEntryBuilder {
             max_age_secs: 300, // デフォルト5分
         }
     }
-    
+
     /// ヘッダーを追加
     pub fn header(mut self, name: &[u8], value: &[u8]) -> Self {
         self.headers.push((name.into(), value.into()));
         self
     }
-    
+
     /// ヘッダーリストを設定
     pub fn headers(mut self, headers: Vec<(Box<[u8]>, Box<[u8]>)>) -> Self {
         self.headers = headers;
         self
     }
-    
+
     /// ボディを設定
     pub fn body(mut self, body: Vec<u8>) -> Self {
         self.body = body;
         self
     }
-    
+
     /// ボディにデータを追加
     pub fn append_body(mut self, data: &[u8]) -> Self {
         self.body.extend_from_slice(data);
         self
     }
-    
+
     /// TTLを設定
     pub fn max_age(mut self, secs: u64) -> Self {
         self.max_age_secs = secs;
         self
     }
-    
+
     /// メモリストレージとしてビルド
     pub fn build_memory(self) -> CacheEntry {
         let storage = CacheStorage::Memory(self.body.into());
         CacheEntry::new(self.status_code, self.headers, storage, self.max_age_secs)
     }
-    
+
     /// ディスクストレージとしてビルド
     pub fn build_disk(self, path: PathBuf) -> (CacheEntry, Vec<u8>) {
         let size = self.body.len() as u64;
@@ -306,7 +303,7 @@ mod tests {
             .max_age(60)
             .body(b"test".to_vec())
             .build_memory();
-        
+
         assert!(entry.is_valid());
         assert!(entry.remaining_ttl() <= 60);
     }
@@ -319,7 +316,7 @@ mod tests {
             .header(b"last-modified", b"Mon, 01 Jan 2024 00:00:00 GMT")
             .body(b"{}".to_vec())
             .build_memory();
-        
+
         assert_eq!(entry.content_type.as_deref(), Some("application/json"));
         assert_eq!(entry.etag.as_deref(), Some("\"abc123\""));
         assert!(entry.last_modified.is_some());
@@ -329,7 +326,7 @@ mod tests {
     fn test_storage_size() {
         let memory = CacheStorage::Memory(vec![1, 2, 3, 4, 5].into());
         assert_eq!(memory.size(), 5);
-        
+
         let disk = CacheStorage::Disk {
             path: PathBuf::from("/tmp/cache"),
             size: 1000,
@@ -343,9 +340,8 @@ mod tests {
             .header(b"content-type", b"text/plain")
             .body(vec![0; 1000])
             .build_memory();
-        
+
         let usage = entry.memory_usage();
         assert!(usage >= 1000); // ボディ + メタデータ
     }
 }
-

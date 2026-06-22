@@ -36,43 +36,48 @@
 
 // DashMap非依存モジュール（常時コンパイル）
 mod config;
-mod key;
 mod entry;
+mod key;
 mod policy;
 
 // DashMap依存モジュール（cache feature 有効時のみ）
 #[cfg(feature = "cache")]
-mod index;
-#[cfg(feature = "cache")]
-mod memory;
-#[cfg(feature = "cache")]
 mod disk;
+#[cfg(feature = "cache")]
+mod file_cache;
+#[cfg(feature = "cache")]
+mod index;
 #[cfg(feature = "cache")]
 mod manager;
 #[cfg(feature = "cache")]
-mod revalidation;
+mod memory;
 #[cfg(feature = "cache")]
-mod file_cache;
+mod revalidation;
 
 // 常時公開 (DashMap 不要)
 pub use config::CacheConfig;
-pub use key::CacheKey;
 pub use entry::{CacheEntry, CacheStorage};
-pub use policy::{CachePolicy, CacheControl, VaryResult};
+pub use key::CacheKey;
+pub use policy::{CacheControl, CachePolicy, VaryResult};
 
 // cache feature 有効時のみ公開
 #[cfg(feature = "cache")]
+pub use disk::DiskCache;
+#[cfg(feature = "cache")]
+pub use file_cache::{
+    configure_global_open_file_cache, get_file_cache, get_file_info, get_file_info_with_config,
+    invalidate_file_cache, CachedFileInfo, OpenFileCache, OpenFileCacheConfig,
+};
+#[cfg(feature = "cache")]
 pub use index::CacheIndex;
+#[cfg(feature = "cache")]
+pub use manager::{get_global_cache, init_global_cache, CacheManager, CacheStats};
 #[cfg(feature = "cache")]
 pub use memory::MemoryCache;
 #[cfg(feature = "cache")]
-pub use disk::DiskCache;
-#[cfg(feature = "cache")]
-pub use manager::{CacheManager, CacheStats, init_global_cache, get_global_cache};
-#[cfg(feature = "cache")]
-pub use revalidation::{try_start_revalidation, finish_revalidation, active_revalidations, collapsed_request_count};
-#[cfg(feature = "cache")]
-pub use file_cache::{get_file_cache, get_file_info, get_file_info_with_config, invalidate_file_cache, CachedFileInfo, OpenFileCache, OpenFileCacheConfig, configure_global_open_file_cache};
+pub use revalidation::{
+    active_revalidations, collapsed_request_count, finish_revalidation, try_start_revalidation,
+};
 
 // ====================
 // cache feature 無効時のスタブ実装
@@ -97,21 +102,71 @@ pub struct CacheManager;
 
 #[cfg(not(feature = "cache"))]
 impl CacheManager {
-    pub fn stats(&self) -> CacheStats { CacheStats::default() }
-    pub fn is_enabled(&self) -> bool { false }
-    pub fn config(&self) -> &CacheConfig { unimplemented!() }
-    pub fn is_request_cacheable(&self, _method: &[u8], _path: &str, _hdrs: &[(Box<[u8]>, Box<[u8]>)]) -> bool { false }
-    pub fn get(&self, _key: &CacheKey) -> Option<std::sync::Arc<CacheEntry>> { None }
-    pub fn get_stale(&self, _key: &CacheKey, _max_stale_secs: u64) -> Option<std::sync::Arc<CacheEntry>> { None }
-    pub fn store(&self, _key: CacheKey, _status: u16, _hdrs: Vec<(Box<[u8]>, Box<[u8]>)>, _body: Vec<u8>) -> bool { false }
-    pub fn store_with_vary(&self, _key: CacheKey, _status: u16, _hdrs: Vec<(Box<[u8]>, Box<[u8]>)>, _body: Vec<u8>, _vary: Option<Vec<String>>) -> bool { false }
+    pub fn stats(&self) -> CacheStats {
+        CacheStats::default()
+    }
+    pub fn is_enabled(&self) -> bool {
+        false
+    }
+    pub fn config(&self) -> &CacheConfig {
+        unimplemented!()
+    }
+    pub fn is_request_cacheable(
+        &self,
+        _method: &[u8],
+        _path: &str,
+        _hdrs: &[(Box<[u8]>, Box<[u8]>)],
+    ) -> bool {
+        false
+    }
+    pub fn get(&self, _key: &CacheKey) -> Option<std::sync::Arc<CacheEntry>> {
+        None
+    }
+    pub fn get_stale(
+        &self,
+        _key: &CacheKey,
+        _max_stale_secs: u64,
+    ) -> Option<std::sync::Arc<CacheEntry>> {
+        None
+    }
+    pub fn store(
+        &self,
+        _key: CacheKey,
+        _status: u16,
+        _hdrs: Vec<(Box<[u8]>, Box<[u8]>)>,
+        _body: Vec<u8>,
+    ) -> bool {
+        false
+    }
+    pub fn store_with_vary(
+        &self,
+        _key: CacheKey,
+        _status: u16,
+        _hdrs: Vec<(Box<[u8]>, Box<[u8]>)>,
+        _body: Vec<u8>,
+        _vary: Option<Vec<String>>,
+    ) -> bool {
+        false
+    }
     pub fn invalidate(&self, _key: &CacheKey) {}
-    pub fn invalidate_pattern(&self, _pattern: &str) -> usize { 0 }
-    pub fn invalidate_host(&self, _host: &str) -> usize { 0 }
-    pub fn evict_expired(&self) -> usize { 0 }
-    pub fn evict_lru(&self) -> usize { 0 }
-    pub fn evict_disk(&self) -> std::io::Result<usize> { Ok(0) }
-    pub fn clear(&self) -> std::io::Result<()> { Ok(()) }
+    pub fn invalidate_pattern(&self, _pattern: &str) -> usize {
+        0
+    }
+    pub fn invalidate_host(&self, _host: &str) -> usize {
+        0
+    }
+    pub fn evict_expired(&self) -> usize {
+        0
+    }
+    pub fn evict_lru(&self) -> usize {
+        0
+    }
+    pub fn evict_disk(&self) -> std::io::Result<usize> {
+        Ok(0)
+    }
+    pub fn clear(&self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// グローバルキャッシュ初期化（スタブ）
@@ -151,16 +206,29 @@ pub struct CachedFileInfo {
 
 #[cfg(not(feature = "cache"))]
 impl CachedFileInfo {
-    pub fn last_modified_rfc7231(&self) -> Option<String> { None }
-    pub fn is_valid(&self, _max_age: std::time::Duration) -> bool { false }
-    pub fn etag(&self) -> Option<String> { None }
+    pub fn last_modified_rfc7231(&self) -> Option<String> {
+        None
+    }
+    pub fn is_valid(&self, _max_age: std::time::Duration) -> bool {
+        false
+    }
+    pub fn etag(&self) -> Option<String> {
+        None
+    }
 }
 
 #[cfg(not(feature = "cache"))]
-pub fn configure_global_open_file_cache(_enabled: bool, _valid_duration_secs: u64, _max_entries: usize) {}
+pub fn configure_global_open_file_cache(
+    _enabled: bool,
+    _valid_duration_secs: u64,
+    _max_entries: usize,
+) {
+}
 
 #[cfg(not(feature = "cache"))]
-pub fn get_file_cache() -> Option<std::sync::Arc<()>> { None }
+pub fn get_file_cache() -> Option<std::sync::Arc<()>> {
+    None
+}
 
 /// ファイル情報取得（スタブ）
 #[cfg(not(feature = "cache"))]
@@ -181,13 +249,19 @@ pub fn invalidate_file_cache(_path: &std::path::Path) {}
 
 /// 再検証スタブ（cache feature 無効時）
 #[cfg(not(feature = "cache"))]
-pub fn try_start_revalidation(_hash: u64) -> bool { false }
+pub fn try_start_revalidation(_hash: u64) -> bool {
+    false
+}
 
 #[cfg(not(feature = "cache"))]
 pub fn finish_revalidation(_hash: u64) {}
 
 #[cfg(not(feature = "cache"))]
-pub fn active_revalidations() -> usize { 0 }
+pub fn active_revalidations() -> usize {
+    0
+}
 
 #[cfg(not(feature = "cache"))]
-pub fn collapsed_request_count() -> u64 { 0 }
+pub fn collapsed_request_count() -> u64 {
+    0
+}

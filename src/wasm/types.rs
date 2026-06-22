@@ -178,7 +178,7 @@ impl WasmConfig {
     /// Validate WASM configuration
     pub fn validate(&self) -> anyhow::Result<()> {
         use std::collections::HashSet;
-        
+
         // モジュール名の重複チェック
         let mut module_names = HashSet::new();
         for module in &self.modules {

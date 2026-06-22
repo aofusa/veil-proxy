@@ -259,10 +259,7 @@ impl GrpcStatus {
 
     /// Format as trailers for HTTP/2 response
     pub fn to_trailers(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let mut trailers = vec![(
-            b"grpc-status".to_vec(),
-            self.code.to_string().into_bytes(),
-        )];
+        let mut trailers = vec![(b"grpc-status".to_vec(), self.code.to_string().into_bytes())];
 
         if let Some(msg) = &self.encoded_message() {
             trailers.push((b"grpc-message".to_vec(), msg.as_bytes().to_vec()));
@@ -303,7 +300,10 @@ mod tests {
     #[test]
     fn test_status_code_from_str() {
         assert_eq!(GrpcStatusCode::from_str("0"), Some(GrpcStatusCode::Ok));
-        assert_eq!(GrpcStatusCode::from_str("13"), Some(GrpcStatusCode::Internal));
+        assert_eq!(
+            GrpcStatusCode::from_str("13"),
+            Some(GrpcStatusCode::Internal)
+        );
         assert_eq!(GrpcStatusCode::from_str("invalid"), None);
         assert_eq!(GrpcStatusCode::from_str("99"), None);
     }
@@ -311,8 +311,14 @@ mod tests {
     #[test]
     fn test_http_status_conversion() {
         assert_eq!(GrpcStatusCode::from_http_status(200), GrpcStatusCode::Ok);
-        assert_eq!(GrpcStatusCode::from_http_status(404), GrpcStatusCode::NotFound);
-        assert_eq!(GrpcStatusCode::from_http_status(500), GrpcStatusCode::Internal);
+        assert_eq!(
+            GrpcStatusCode::from_http_status(404),
+            GrpcStatusCode::NotFound
+        );
+        assert_eq!(
+            GrpcStatusCode::from_http_status(500),
+            GrpcStatusCode::Internal
+        );
 
         assert_eq!(GrpcStatusCode::Ok.to_http_status(), 200);
         assert_eq!(GrpcStatusCode::NotFound.to_http_status(), 404);

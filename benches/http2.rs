@@ -11,14 +11,14 @@
 //!   2. ベンチマーク実行: cargo bench --bench http2 --features http2
 //!   3. 環境停止: ./tests/e2e_setup.sh stop
 
-use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
-use std::io::{Read, Write, ErrorKind};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use rustls::crypto::CryptoProvider;
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ClientConnection};
+use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::Duration;
-use rustls::{ClientConfig, ClientConnection};
-use rustls::crypto::CryptoProvider;
-use rustls::pki_types::ServerName;
 
 const PROXY_PORT: u16 = 8443;
 
@@ -34,37 +34,43 @@ fn init_crypto_provider() {
 /// プロキシサーバーが起動しているか確認（HTTPS、TLSハンドシェイクを正しく行う）
 fn is_proxy_running() -> bool {
     init_crypto_provider();
-    
+
     let mut stream = match TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)) {
         Ok(s) => s,
         Err(_) => return false,
     };
-    
-    if stream.set_read_timeout(Some(Duration::from_secs(2))).is_err() {
+
+    if stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .is_err()
+    {
         return false;
     }
-    if stream.set_write_timeout(Some(Duration::from_secs(2))).is_err() {
+    if stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .is_err()
+    {
         return false;
     }
-    
+
     let config = create_http11_tls_config();
     let server_name = match ServerName::try_from("localhost".to_string()) {
         Ok(name) => name,
         Err(_) => return false,
     };
-    
+
     let mut tls_conn = match ClientConnection::new(config, server_name) {
         Ok(conn) => conn,
         Err(_) => return false,
     };
-    
+
     // TLSハンドシェイクを開始（完了まで待たない）
     let mut handshake_started = false;
     for _ in 0..10 {
         if !tls_conn.is_handshaking() {
             return true;
         }
-        
+
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {
                 handshake_started = true;
@@ -79,7 +85,7 @@ fn is_proxy_running() -> bool {
             Err(_) => return false,
         }
     }
-    
+
     // ハンドシェイクが開始されていればサーバーは起動していると判断
     handshake_started
 }
@@ -132,7 +138,7 @@ fn create_http11_tls_config() -> Arc<ClientConfig> {
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
         .with_no_client_auth();
-    
+
     Arc::new(config)
 }
 
@@ -142,28 +148,28 @@ fn create_http2_tls_config() -> Arc<ClientConfig> {
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
         .with_no_client_auth();
-    
+
     // ALPN: h2 を優先、http/1.1 にフォールバック
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    
+
     Arc::new(config)
 }
 
 /// TLS経由でHTTP/1.1リクエストを送信
 fn send_tls_http11_request(port: u16, path: &str) -> Result<usize, Box<dyn std::error::Error>> {
     init_crypto_provider();
-    
+
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    
+
     let config = create_http11_tls_config();
     let server_name = ServerName::try_from("localhost".to_string())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    
+
     let mut tls_conn = ClientConnection::new(config, server_name)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    
+
     // TLSハンドシェイク
     while tls_conn.is_handshaking() {
         match tls_conn.complete_io(&mut stream) {
@@ -175,40 +181,43 @@ fn send_tls_http11_request(port: u16, path: &str) -> Result<usize, Box<dyn std::
             Err(e) => return Err(Box::new(e)),
         }
     }
-    
+
     let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
-    
+
     let request = format!(
         "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         path
     );
     tls_stream.write_all(request.as_bytes())?;
-    
+
     let mut response = Vec::new();
     tls_stream.read_to_end(&mut response)?;
-    
+
     Ok(response.len())
 }
 
 /// TLS + HTTP/2でリクエストを送信（ALPNでh2ネゴシエーション）
-/// 
+///
 /// 注: 実際のHTTP/2ストリーム多重化を使用するには h2 クレートが必要。
 /// ここではTLS + ALPNでのHTTP/2ネゴシエーションを行い、
 /// サーバーがHTTP/2として接続を確立することを確認する。
-fn send_tls_http2_request(port: u16, path: &str) -> Result<(usize, bool), Box<dyn std::error::Error>> {
+fn send_tls_http2_request(
+    port: u16,
+    path: &str,
+) -> Result<(usize, bool), Box<dyn std::error::Error>> {
     init_crypto_provider();
-    
+
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    
+
     let config = create_http2_tls_config();
     let server_name = ServerName::try_from("localhost".to_string())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    
+
     let mut tls_conn = ClientConnection::new(config, server_name)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    
+
     // TLSハンドシェイク
     while tls_conn.is_handshaking() {
         match tls_conn.complete_io(&mut stream) {
@@ -220,25 +229,26 @@ fn send_tls_http2_request(port: u16, path: &str) -> Result<(usize, bool), Box<dy
             Err(e) => return Err(Box::new(e)),
         }
     }
-    
+
     // ALPNでネゴシエートされたプロトコルを確認
-    let is_http2 = tls_conn.alpn_protocol()
+    let is_http2 = tls_conn
+        .alpn_protocol()
         .map(|p| p == b"h2")
         .unwrap_or(false);
-    
+
     // HTTP/2がネゴシエートされた場合でも、ここではHTTP/1.1にフォールバック
     // 実際のHTTP/2ベンチマークには h2 クレートを使用する必要がある
     let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
-    
+
     let request = format!(
         "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         path
     );
     tls_stream.write_all(request.as_bytes())?;
-    
+
     let mut response = Vec::new();
     tls_stream.read_to_end(&mut response)?;
-    
+
     Ok((response.len(), is_http2))
 }
 
@@ -248,25 +258,25 @@ fn benchmark_http11_vs_http2_throughput(c: &mut Criterion) {
         eprintln!("Proxy server not running, skipping HTTP/2 benchmarks");
         return;
     }
-    
+
     init_crypto_provider();
-    
+
     let mut group = c.benchmark_group("http11_vs_http2_throughput");
-    
+
     // TLS + HTTP/1.1
     group.bench_function("tls_http11", |b| {
         b.iter(|| {
             let _ = send_tls_http11_request(PROXY_PORT, "/");
         });
     });
-    
+
     // TLS + HTTP/2 (ALPN negotiation)
     group.bench_function("tls_http2_alpn", |b| {
         b.iter(|| {
             let _ = send_tls_http2_request(PROXY_PORT, "/");
         });
     });
-    
+
     group.finish();
 }
 
@@ -276,12 +286,12 @@ fn benchmark_concurrent_streams(c: &mut Criterion) {
         eprintln!("Proxy server not running, skipping concurrent streams benchmarks");
         return;
     }
-    
+
     init_crypto_provider();
-    
+
     let mut group = c.benchmark_group("concurrent_streams_tls");
     group.measurement_time(Duration::from_secs(10));
-    
+
     for stream_count in [1, 4, 8, 16, 32].iter() {
         group.bench_with_input(
             BenchmarkId::new("streams", stream_count),
@@ -295,7 +305,7 @@ fn benchmark_concurrent_streams(c: &mut Criterion) {
                             })
                         })
                         .collect();
-                    
+
                     for handle in handles {
                         let _ = handle.join();
                     }
@@ -303,7 +313,7 @@ fn benchmark_concurrent_streams(c: &mut Criterion) {
             },
         );
     }
-    
+
     group.finish();
 }
 
@@ -313,37 +323,41 @@ fn benchmark_header_compression(c: &mut Criterion) {
         eprintln!("Proxy server not running, skipping header compression benchmarks");
         return;
     }
-    
+
     init_crypto_provider();
-    
+
     let mut group = c.benchmark_group("header_compression_tls");
-    
+
     // 小さいヘッダー
     group.bench_function("small_headers", |b| {
         b.iter(|| {
             let _ = send_tls_http11_request(PROXY_PORT, "/");
         });
     });
-    
+
     // 大きいヘッダー（複数のカスタムヘッダー付きでリクエスト）
     group.bench_function("large_headers", |b| {
         b.iter(|| {
             init_crypto_provider();
-            
+
             let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
             let config = create_http11_tls_config();
             let server_name = ServerName::try_from("localhost".to_string()).unwrap();
             let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
-            
+
             while tls_conn.is_handshaking() {
                 let _ = tls_conn.complete_io(&mut stream);
             }
-            
+
             let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
-            
+
             let mut request = "GET / HTTP/1.1\r\nHost: localhost\r\n".to_string();
             for i in 0..20 {
-                request.push_str(&format!("X-Custom-Header-{}: value-{}\r\n", i, "x".repeat(50)));
+                request.push_str(&format!(
+                    "X-Custom-Header-{}: value-{}\r\n",
+                    i,
+                    "x".repeat(50)
+                ));
             }
             request.push_str("Connection: close\r\n\r\n");
             let _ = tls_stream.write_all(request.as_bytes());
@@ -351,7 +365,7 @@ fn benchmark_header_compression(c: &mut Criterion) {
             let _ = tls_stream.read_to_end(&mut response);
         });
     });
-    
+
     group.finish();
 }
 

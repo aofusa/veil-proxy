@@ -41,7 +41,7 @@ impl TickRegistry {
 }
 
 /// Register a module for tick callbacks
-/// 
+///
 /// Called when a module sets its tick period via proxy_set_tick_period_milliseconds.
 /// If period_ms is 0, the module is unregistered from tick callbacks.
 pub fn register_tick(module_name: &str, period_ms: u32) {
@@ -49,7 +49,7 @@ pub fn register_tick(module_name: &str, period_ms: u32) {
         Ok(r) => r,
         Err(_) => return,
     };
-    
+
     if period_ms == 0 {
         // Unregister
         registry.configs.remove(module_name);
@@ -73,17 +73,17 @@ pub fn register_tick(module_name: &str, period_ms: u32) {
 }
 
 /// Get all modules that are due for a tick
-/// 
+///
 /// Returns a list of module names that should receive a tick callback.
 pub fn get_due_ticks() -> Vec<String> {
     let mut registry = match TICK_CONFIGS.write() {
         Ok(r) => r,
         Err(_) => return Vec::new(),
     };
-    
+
     let now = Instant::now();
     let mut due_modules = Vec::new();
-    
+
     for (name, config) in registry.configs.iter_mut() {
         let elapsed = now.duration_since(config.last_tick);
         if elapsed >= Duration::from_millis(config.period_ms as u64) {
@@ -91,24 +91,24 @@ pub fn get_due_ticks() -> Vec<String> {
             config.last_tick = now;
         }
     }
-    
+
     due_modules
 }
 
 /// Execute tick callbacks for all due modules
-/// 
+///
 /// This should be called periodically from a timer loop (e.g., every 10-100ms)
 /// to check for and execute any pending tick callbacks.
 pub fn process_ticks(engine: &Arc<FilterEngine>) {
     let due_modules = get_due_ticks();
-    
+
     for module_name in due_modules {
         engine.on_tick(&module_name);
     }
 }
 
 /// Get the minimum tick period across all registered modules
-/// 
+///
 /// Useful for determining how often to check for due ticks.
 /// Returns None if no modules are registered for ticks.
 pub fn get_min_tick_period() -> Option<Duration> {
@@ -116,7 +116,7 @@ pub fn get_min_tick_period() -> Option<Duration> {
         Ok(r) => r,
         Err(_) => return None,
     };
-    
+
     registry
         .configs
         .values()
@@ -131,7 +131,7 @@ pub fn get_tick_stats() -> TickStats {
         Ok(r) => r,
         Err(_) => return TickStats::default(),
     };
-    
+
     TickStats {
         registered_modules: registry.configs.len(),
         min_period_ms: registry.configs.values().map(|c| c.period_ms).min(),
@@ -153,44 +153,44 @@ pub struct TickStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_register_tick() {
         // Register a module
         register_tick("test_module_tick", 1000);
-        
+
         let stats = get_tick_stats();
         assert!(stats.registered_modules >= 1);
-        
+
         // Unregister
         register_tick("test_module_tick", 0);
     }
-    
+
     #[test]
     fn test_get_min_tick_period() {
         // Register modules with different periods
         register_tick("test_fast", 100);
         register_tick("test_slow", 5000);
-        
+
         let min = get_min_tick_period();
         assert!(min.is_some());
         assert!(min.unwrap().as_millis() <= 5000);
-        
+
         // Cleanup
         register_tick("test_fast", 0);
         register_tick("test_slow", 0);
     }
-    
+
     #[test]
     fn test_tick_stats() {
         register_tick("stats_test_1", 500);
         register_tick("stats_test_2", 1000);
-        
+
         let stats = get_tick_stats();
         assert!(stats.registered_modules >= 2);
         assert!(stats.min_period_ms.is_some());
         assert!(stats.max_period_ms.is_some());
-        
+
         // Cleanup
         register_tick("stats_test_1", 0);
         register_tick("stats_test_2", 0);

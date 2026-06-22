@@ -2,10 +2,10 @@
 //!
 //! HTTP/2 フレームのエンコードとデコードを提供します。
 
-pub mod types;
-pub mod encoder;
 pub mod decoder;
+pub mod encoder;
+pub mod types;
 
-pub use types::{FrameType, FrameHeader, Frame, FrameFlags};
-pub use encoder::FrameEncoder;
 pub use decoder::FrameDecoder;
+pub use encoder::FrameEncoder;
+pub use types::{Frame, FrameFlags, FrameHeader, FrameType};

@@ -111,7 +111,11 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 }
             }
 
-            ftlog::debug!("WASM: proxy_register_shared_queue '{}' -> id={}", name, queue_id);
+            ftlog::debug!(
+                "WASM: proxy_register_shared_queue '{}' -> id={}",
+                name,
+                queue_id
+            );
             PROXY_RESULT_OK
         },
     )?;
@@ -163,11 +167,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     linker.func_wrap(
         "env",
         "proxy_enqueue_shared_queue",
-        |mut caller: Caller<'_, HostState>,
-         queue_id: i32,
-         data_ptr: i32,
-         data_size: i32|
-         -> i32 {
+        |mut caller: Caller<'_, HostState>, queue_id: i32, data_ptr: i32, data_size: i32| -> i32 {
             // Read data from memory
             let data = if data_size > 0 {
                 match read_bytes(&mut caller, data_ptr, data_size) {
@@ -185,12 +185,19 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             };
 
             if success {
-                ftlog::debug!("WASM: proxy_enqueue_shared_queue id={} size={}", queue_id, data_size);
+                ftlog::debug!(
+                    "WASM: proxy_enqueue_shared_queue id={} size={}",
+                    queue_id,
+                    data_size
+                );
                 // Mark queue for pending notification (will be processed in tick loop)
                 crate::wasm::queue_notify::queue_enqueued(queue_id as u32);
                 PROXY_RESULT_OK
             } else {
-                ftlog::debug!("WASM: proxy_enqueue_shared_queue id={} failed (queue full or not found)", queue_id);
+                ftlog::debug!(
+                    "WASM: proxy_enqueue_shared_queue id={} failed (queue full or not found)",
+                    queue_id
+                );
                 PROXY_RESULT_NOT_FOUND
             }
         },
@@ -230,7 +237,11 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                         }
                     }
 
-                    ftlog::debug!("WASM: proxy_dequeue_shared_queue id={} size={}", queue_id, bytes.len());
+                    ftlog::debug!(
+                        "WASM: proxy_dequeue_shared_queue id={} size={}",
+                        queue_id,
+                        bytes.len()
+                    );
                     PROXY_RESULT_OK
                 }
                 None => {

@@ -36,25 +36,44 @@ pub use capabilities::{CapabilityPreset, ModuleCapabilities};
 pub use constants::*;
 pub use context::HttpContext;
 pub use engine::{BodyFilterResult, FilterEngine, FilterResult};
-pub use grpc_integration::{on_grpc_initial_metadata, on_grpc_message, on_grpc_trailing_metadata, on_grpc_close};
-#[cfg(feature = "grpc")]
-pub use grpc_integration::{GrpcCallResponse, process_grpc_response, status as grpc_status};
-pub use integration::{on_request_complete, on_request_complete_async, on_context_destroy, on_http_call_complete, on_tick, on_queue_ready, WasmHttpCallResult, TickConfig, PendingHttpCallInfo, process_pending_http_calls, resume_after_http_call};
-pub use queue_notify::{subscribe_to_queue, unsubscribe_from_queue, notify_queue_subscribers, get_queue_stats, queue_enqueued, process_pending_notifications, QueueStats};
-pub use tick_manager::{register_tick, process_ticks, get_min_tick_period, get_tick_stats, TickStats};
-pub use registry::ModuleRegistry;
-pub use types::*;
-pub use persistent_context::{
-    store_context, take_context, context_exists, context_has_pending_calls, remove_context,
-    take_all_pending_http_calls, take_pending_http_calls_for_module,
-    deliver_http_call_response, get_context_stats, cleanup_old_contexts,
-    PendingHttpCallWithContext, ContextStats,
-    // Global pending calls (for tick thread processing)
-    register_global_pending_call, take_global_pending_calls, get_global_pending_call_count, GlobalPendingCall,
+pub use grpc_integration::{
+    on_grpc_close, on_grpc_initial_metadata, on_grpc_message, on_grpc_trailing_metadata,
 };
-
-
-
+#[cfg(feature = "grpc")]
+pub use grpc_integration::{process_grpc_response, status as grpc_status, GrpcCallResponse};
+pub use integration::{
+    on_context_destroy, on_http_call_complete, on_queue_ready, on_request_complete,
+    on_request_complete_async, on_tick, process_pending_http_calls, resume_after_http_call,
+    PendingHttpCallInfo, TickConfig, WasmHttpCallResult,
+};
+pub use persistent_context::{
+    cleanup_old_contexts,
+    context_exists,
+    context_has_pending_calls,
+    deliver_http_call_response,
+    get_context_stats,
+    get_global_pending_call_count,
+    // Global pending calls (for tick thread processing)
+    register_global_pending_call,
+    remove_context,
+    store_context,
+    take_all_pending_http_calls,
+    take_context,
+    take_global_pending_calls,
+    take_pending_http_calls_for_module,
+    ContextStats,
+    GlobalPendingCall,
+    PendingHttpCallWithContext,
+};
+pub use queue_notify::{
+    get_queue_stats, notify_queue_subscribers, process_pending_notifications, queue_enqueued,
+    subscribe_to_queue, unsubscribe_from_queue, QueueStats,
+};
+pub use registry::ModuleRegistry;
+pub use tick_manager::{
+    get_min_tick_period, get_tick_stats, process_ticks, register_tick, TickStats,
+};
+pub use types::*;
 
 /// Initialize the WASM extension system
 pub fn init(config: &WasmConfig) -> anyhow::Result<FilterEngine> {

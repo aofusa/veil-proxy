@@ -7,13 +7,13 @@
 //! Without it, only identity (no compression) is functional.
 
 #[cfg(feature = "compression")]
-use std::io::{Read, Write};
+use flate2::read::{DeflateDecoder, GzDecoder};
 #[cfg(feature = "compression")]
-use flate2::read::{GzDecoder, DeflateDecoder};
-#[cfg(feature = "compression")]
-use flate2::write::{GzEncoder, DeflateEncoder};
+use flate2::write::{DeflateEncoder, GzEncoder};
 #[cfg(feature = "compression")]
 use flate2::Compression;
+#[cfg(feature = "compression")]
+use std::io::{Read, Write};
 
 use crate::grpc::framing::GrpcError;
 
@@ -264,10 +264,22 @@ mod tests {
 
     #[test]
     fn test_compression_from_bytes() {
-        assert_eq!(GrpcCompression::from_bytes(b"gzip"), Some(GrpcCompression::Gzip));
-        assert_eq!(GrpcCompression::from_bytes(b"GZIP"), Some(GrpcCompression::Gzip));
-        assert_eq!(GrpcCompression::from_bytes(b"deflate"), Some(GrpcCompression::Deflate));
-        assert_eq!(GrpcCompression::from_bytes(b"identity"), Some(GrpcCompression::Identity));
+        assert_eq!(
+            GrpcCompression::from_bytes(b"gzip"),
+            Some(GrpcCompression::Gzip)
+        );
+        assert_eq!(
+            GrpcCompression::from_bytes(b"GZIP"),
+            Some(GrpcCompression::Gzip)
+        );
+        assert_eq!(
+            GrpcCompression::from_bytes(b"deflate"),
+            Some(GrpcCompression::Deflate)
+        );
+        assert_eq!(
+            GrpcCompression::from_bytes(b"identity"),
+            Some(GrpcCompression::Identity)
+        );
         assert_eq!(GrpcCompression::from_bytes(b"unknown"), None);
     }
 }

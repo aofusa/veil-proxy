@@ -590,14 +590,26 @@ mod tests {
 
     #[test]
     fn test_tls_version_conversion() {
-        assert_eq!(get_tls_version(Some(ProtocolVersion::TLSv1_2)).unwrap(), TLS_1_2_VERSION);
-        assert_eq!(get_tls_version(Some(ProtocolVersion::TLSv1_3)).unwrap(), TLS_1_3_VERSION);
+        assert_eq!(
+            get_tls_version(Some(ProtocolVersion::TLSv1_2)).unwrap(),
+            TLS_1_2_VERSION
+        );
+        assert_eq!(
+            get_tls_version(Some(ProtocolVersion::TLSv1_3)).unwrap(),
+            TLS_1_3_VERSION
+        );
         assert_eq!(get_tls_version(None).unwrap(), TLS_1_3_VERSION);
     }
 
     #[test]
     fn test_error_display() {
-        assert_eq!(format!("{}", KtlsError::InvalidKeyLength), "Invalid key length");
-        assert_eq!(format!("{}", KtlsError::UnsupportedCipher), "Unsupported cipher suite");
+        assert_eq!(
+            format!("{}", KtlsError::InvalidKeyLength),
+            "Invalid key length"
+        );
+        assert_eq!(
+            format!("{}", KtlsError::UnsupportedCipher),
+            "Unsupported cipher suite"
+        );
     }
 }

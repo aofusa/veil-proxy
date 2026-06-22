@@ -1,6 +1,6 @@
 //! # HTTP/2 フレームエンコーダ
 
-use super::types::{Frame, FrameHeader, FrameType, FrameFlags, PrioritySpec};
+use super::types::{Frame, FrameFlags, FrameHeader, FrameType, PrioritySpec};
 
 /// フレームエンコーダ
 pub struct FrameEncoder {
@@ -27,7 +27,7 @@ impl FrameEncoder {
         }
 
         let header = FrameHeader::new(FrameType::Data, flags, stream_id, data.len() as u32);
-        
+
         let mut buf = Vec::with_capacity(FrameHeader::SIZE + data.len());
         let mut header_buf = [0u8; 9];
         header.encode(&mut header_buf);
@@ -146,7 +146,12 @@ impl FrameEncoder {
     }
 
     /// GOAWAY フレームをエンコード
-    pub fn encode_goaway(&self, last_stream_id: u32, error_code: u32, debug_data: &[u8]) -> Vec<u8> {
+    pub fn encode_goaway(
+        &self,
+        last_stream_id: u32,
+        error_code: u32,
+        debug_data: &[u8],
+    ) -> Vec<u8> {
         let length = 8 + debug_data.len() as u32;
         let header = FrameHeader::new(FrameType::GoAway, 0, 0, length);
 
@@ -167,8 +172,17 @@ impl FrameEncoder {
         header_block: &[u8],
         end_headers: bool,
     ) -> Vec<u8> {
-        let flags = if end_headers { FrameFlags::END_HEADERS } else { 0 };
-        let header = FrameHeader::new(FrameType::Continuation, flags, stream_id, header_block.len() as u32);
+        let flags = if end_headers {
+            FrameFlags::END_HEADERS
+        } else {
+            0
+        };
+        let header = FrameHeader::new(
+            FrameType::Continuation,
+            flags,
+            stream_id,
+            header_block.len() as u32,
+        );
 
         let mut buf = Vec::with_capacity(FrameHeader::SIZE + header_block.len());
         let mut header_buf = [0u8; 9];
@@ -200,33 +214,48 @@ impl FrameEncoder {
     /// Frame 型からエンコード
     pub fn encode(&self, frame: &Frame) -> Vec<u8> {
         match frame {
-            Frame::Data { stream_id, end_stream, data } => {
-                self.encode_data(*stream_id, data, *end_stream)
-            }
-            Frame::Headers { stream_id, end_stream, end_headers, priority, header_block } => {
-                self.encode_headers(*stream_id, header_block, *end_stream, *end_headers, *priority)
-            }
-            Frame::Settings { ack, settings } => {
-                self.encode_settings(settings, *ack)
-            }
-            Frame::WindowUpdate { stream_id, increment } => {
-                self.encode_window_update(*stream_id, *increment)
-            }
-            Frame::Ping { ack, data } => {
-                self.encode_ping(data, *ack)
-            }
-            Frame::RstStream { stream_id, error_code } => {
-                self.encode_rst_stream(*stream_id, *error_code)
-            }
-            Frame::GoAway { last_stream_id, error_code, debug_data } => {
-                self.encode_goaway(*last_stream_id, *error_code, debug_data)
-            }
-            Frame::Continuation { stream_id, end_headers, header_block } => {
-                self.encode_continuation(*stream_id, header_block, *end_headers)
-            }
-            Frame::Priority { stream_id, priority } => {
-                self.encode_priority(*stream_id, *priority)
-            }
+            Frame::Data {
+                stream_id,
+                end_stream,
+                data,
+            } => self.encode_data(*stream_id, data, *end_stream),
+            Frame::Headers {
+                stream_id,
+                end_stream,
+                end_headers,
+                priority,
+                header_block,
+            } => self.encode_headers(
+                *stream_id,
+                header_block,
+                *end_stream,
+                *end_headers,
+                *priority,
+            ),
+            Frame::Settings { ack, settings } => self.encode_settings(settings, *ack),
+            Frame::WindowUpdate {
+                stream_id,
+                increment,
+            } => self.encode_window_update(*stream_id, *increment),
+            Frame::Ping { ack, data } => self.encode_ping(data, *ack),
+            Frame::RstStream {
+                stream_id,
+                error_code,
+            } => self.encode_rst_stream(*stream_id, *error_code),
+            Frame::GoAway {
+                last_stream_id,
+                error_code,
+                debug_data,
+            } => self.encode_goaway(*last_stream_id, *error_code, debug_data),
+            Frame::Continuation {
+                stream_id,
+                end_headers,
+                header_block,
+            } => self.encode_continuation(*stream_id, header_block, *end_headers),
+            Frame::Priority {
+                stream_id,
+                priority,
+            } => self.encode_priority(*stream_id, *priority),
             Frame::PushPromise { .. } => {
                 // サーバープッシュは無効なので空を返す
                 Vec::new()

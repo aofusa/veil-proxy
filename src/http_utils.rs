@@ -1,7 +1,7 @@
-use std::net::SocketAddr;
 use crate::cache;
-use memchr::memchr3;
 use httparse::Status;
+use memchr::memchr3;
+use std::net::SocketAddr;
 
 // ====================
 // HTTP/1.1 RFC準拠ヘルパー関数
@@ -26,11 +26,13 @@ pub(crate) fn add_via_header(headers: &mut Vec<(Vec<u8>, Vec<u8>)>, hostname: &s
     let via_value = format!("1.1 {}", hostname).into_bytes();
 
     // 既存のViaヘッダーを検索
-    if let Some(pos) = headers.iter().position(|(n, _)| n.eq_ignore_ascii_case(b"via")) {
+    if let Some(pos) = headers
+        .iter()
+        .position(|(n, _)| n.eq_ignore_ascii_case(b"via"))
+    {
         // 既存のViaヘッダーに追加
         let existing = &headers[pos].1;
-        let combined = format!("{}, 1.1 {}",
-            String::from_utf8_lossy(existing), hostname);
+        let combined = format!("{}, 1.1 {}", String::from_utf8_lossy(existing), hostname);
         headers[pos].1 = combined.into_bytes();
     } else {
         // 新規Viaヘッダーを追加
@@ -47,7 +49,9 @@ pub(crate) fn add_via_header(headers: &mut Vec<(Vec<u8>, Vec<u8>)>, hostname: &s
 /// * `Ok(())` - ヘッダーが有効
 /// * `Err(String)` - エラーメッセージ
 #[allow(dead_code)]
-pub(crate) fn validate_http_headers(headers: &[(impl AsRef<[u8]>, impl AsRef<[u8]>)]) -> Result<(), String> {
+pub(crate) fn validate_http_headers(
+    headers: &[(impl AsRef<[u8]>, impl AsRef<[u8]>)],
+) -> Result<(), String> {
     let mut has_content_length = false;
     let mut has_transfer_encoding = false;
 
@@ -99,7 +103,10 @@ pub(crate) fn check_expect_continue(headers: &[(impl AsRef<[u8]>, impl AsRef<[u8
 /// * `Ok(new_max)` - 拡張後の最大ヘッダー数
 /// * `Err(String)` - 上限超過エラー
 #[allow(dead_code)]
-pub(crate) fn check_header_count(current_count: usize, max_headers: usize) -> Result<usize, String> {
+pub(crate) fn check_header_count(
+    current_count: usize,
+    max_headers: usize,
+) -> Result<usize, String> {
     const ABSOLUTE_MAX: usize = 1024;
 
     if current_count < max_headers {
@@ -111,7 +118,10 @@ pub(crate) fn check_header_count(current_count: usize, max_headers: usize) -> Re
     if new_max > max_headers {
         Ok(new_max)
     } else {
-        Err(format!("Header count exceeds maximum limit of {}", ABSOLUTE_MAX))
+        Err(format!(
+            "Header count exceeds maximum limit of {}",
+            ABSOLUTE_MAX
+        ))
     }
 }
 
@@ -134,14 +144,15 @@ pub(crate) fn check_header_count(current_count: usize, max_headers: usize) -> Re
 #[allow(dead_code)]
 pub(crate) fn validate_host_header(
     headers: &[(impl AsRef<[u8]>, impl AsRef<[u8]>)],
-    http_minor_version: u8
+    http_minor_version: u8,
 ) -> Result<(), &'static str> {
     // HTTP/1.0ではHostヘッダーは任意
     if http_minor_version < 1 {
         return Ok(());
     }
 
-    let has_host = headers.iter()
+    let has_host = headers
+        .iter()
         .any(|(name, _)| name.as_ref().eq_ignore_ascii_case(b"host"));
 
     if !has_host {
@@ -159,7 +170,7 @@ pub(crate) const HOP_BY_HOP_HEADERS: &[&[u8]] = &[
     b"keep-alive",
     b"proxy-authenticate",
     b"proxy-authorization",
-    b"proxy-connection",  // 非標準だが一般的
+    b"proxy-connection", // 非標準だが一般的
     b"te",
     b"trailer",
     b"transfer-encoding",
@@ -176,7 +187,9 @@ pub(crate) const HOP_BY_HOP_HEADERS: &[&[u8]] = &[
 /// * `false` - End-to-endヘッダー（転送可）
 #[inline]
 pub(crate) fn is_hop_by_hop_header(name: &[u8]) -> bool {
-    HOP_BY_HOP_HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h))
+    HOP_BY_HOP_HEADERS
+        .iter()
+        .any(|h| name.eq_ignore_ascii_case(h))
 }
 
 /// Hop-by-hopヘッダーを削除 (RFC 7230 Section 6.1)
@@ -190,10 +203,12 @@ pub(crate) fn is_hop_by_hop_header(name: &[u8]) -> bool {
 pub(crate) fn strip_hop_by_hop_headers(headers: &mut Vec<(Vec<u8>, Vec<u8>)>) {
     // Connectionヘッダーで指定された追加ヘッダーを収集
     // Connectionヘッダー値をトリムして収集（lowercase化は eq_ignore_ascii_case で不要）
-    let connection_headers: Vec<Vec<u8>> = headers.iter()
+    let connection_headers: Vec<Vec<u8>> = headers
+        .iter()
         .filter(|(name, _)| name.eq_ignore_ascii_case(b"connection"))
         .flat_map(|(_, value)| {
-            value.split(|&b| b == b',')
+            value
+                .split(|&b| b == b',')
                 .map(|h| trim_ascii_whitespace(h).to_vec())
                 .filter(|h| !h.is_empty())
                 .collect::<Vec<_>>()
@@ -206,7 +221,10 @@ pub(crate) fn strip_hop_by_hop_headers(headers: &mut Vec<(Vec<u8>, Vec<u8>)>) {
             return false;
         }
         // Connectionヘッダーで指定されたカスタムヘッダーもチェック（case-insensitive比較）
-        if connection_headers.iter().any(|h| name.eq_ignore_ascii_case(h)) {
+        if connection_headers
+            .iter()
+            .any(|h| name.eq_ignore_ascii_case(h))
+        {
             return false;
         }
         true
@@ -263,7 +281,9 @@ pub(crate) fn parse_range_header(range_header: &[u8]) -> Option<ParsedRange> {
                 // bytes=-suffix 形式
                 if let Ok(suffix) = end_str.parse::<u64>() {
                     if suffix > 0 {
-                        ranges.push(RangeSpec::Suffix { suffix_length: suffix });
+                        ranges.push(RangeSpec::Suffix {
+                            suffix_length: suffix,
+                        });
                     }
                 }
             } else if let Ok(start) = start_str.parse::<u64>() {
@@ -440,8 +460,11 @@ pub(crate) fn parse_te_header(te_header: &[u8]) -> TeHeader {
 
 /// リクエストからRangeヘッダーを取得
 #[allow(dead_code)]
-pub(crate) fn get_range_header<'a>(headers: &'a [(impl AsRef<[u8]>, impl AsRef<[u8]>)]) -> Option<&'a [u8]> {
-    headers.iter()
+pub(crate) fn get_range_header<'a>(
+    headers: &'a [(impl AsRef<[u8]>, impl AsRef<[u8]>)],
+) -> Option<&'a [u8]> {
+    headers
+        .iter()
         .find(|(name, _)| name.as_ref().eq_ignore_ascii_case(b"range"))
         .map(|(_, value)| value.as_ref())
 }
@@ -583,9 +606,16 @@ pub(crate) fn is_valid_header_value(value: &[u8]) -> bool {
 /// ASCIIの空白（スペース・タブ）をアロケーションなしでトリムする
 #[inline]
 fn trim_ascii_whitespace(s: &[u8]) -> &[u8] {
-    let start = s.iter().position(|&b| b != b' ' && b != b'\t').unwrap_or(s.len());
+    let start = s
+        .iter()
+        .position(|&b| b != b' ' && b != b'\t')
+        .unwrap_or(s.len());
     let s = &s[start..];
-    let end = s.iter().rposition(|&b| b != b' ' && b != b'\t').map(|i| i + 1).unwrap_or(0);
+    let end = s
+        .iter()
+        .rposition(|&b| b != b' ' && b != b'\t')
+        .map(|i| i + 1)
+        .unwrap_or(0);
     &s[..end]
 }
 
@@ -691,8 +721,8 @@ pub(crate) fn matches_path_pattern(pattern: &str, path: &[u8]) -> bool {
 
     // ワイルドカードパターン: "/api/*"
     if let Some(prefix) = pattern.strip_suffix("/*") {
-        return path_str.starts_with(prefix) &&
-               (path_str.len() == prefix.len() || path_str.as_bytes()[prefix.len()] == b'/');
+        return path_str.starts_with(prefix)
+            && (path_str.len() == prefix.len() || path_str.as_bytes()[prefix.len()] == b'/');
     }
 
     // プレフィックス一致（末尾スラッシュなしでもマッチ）
@@ -715,10 +745,9 @@ pub(crate) fn matches_cidr(ip: &SocketAddr, cidr_ranges: &[String]) -> bool {
     for cidr in cidr_ranges {
         // シンプルなCIDRマッチング（IPv4のみ対応）
         if let Some((network_str, prefix_len_str)) = cidr.split_once('/') {
-            if let (Ok(network), Ok(prefix_len)) = (
-                network_str.parse::<IpAddr>(),
-                prefix_len_str.parse::<u8>()
-            ) {
+            if let (Ok(network), Ok(prefix_len)) =
+                (network_str.parse::<IpAddr>(), prefix_len_str.parse::<u8>())
+            {
                 if let (IpAddr::V4(network_v4), IpAddr::V4(ip_v4)) = (network, ip_addr) {
                     let mask = !((1u32 << (32 - prefix_len)) - 1);
                     let network_u32 = u32::from_be_bytes(network_v4.octets());
@@ -775,19 +804,25 @@ pub(crate) fn parse_http_response(data: &[u8]) -> Option<ParsedResponse> {
             let status_code = response.code.unwrap_or(502);
 
             // Content-Length を取得
-            let content_length = response.headers.iter()
+            let content_length = response
+                .headers
+                .iter()
                 .find(|h| h.name.eq_ignore_ascii_case("content-length"))
                 .and_then(|h| std::str::from_utf8(h.value).ok())
                 .and_then(|s| s.trim().parse().ok());
 
             // Transfer-Encoding: chunked をチェック
-            let is_chunked = response.headers.iter()
+            let is_chunked = response
+                .headers
+                .iter()
                 .find(|h| h.name.eq_ignore_ascii_case("transfer-encoding"))
                 .map(|h| is_chunked_encoding(h.value))
                 .unwrap_or(false);
 
             // Connection: close をチェック（HTTP/1.1ではデフォルトはkeep-alive）
-            let is_connection_close = response.headers.iter()
+            let is_connection_close = response
+                .headers
+                .iter()
                 .find(|h| h.name.eq_ignore_ascii_case("connection"))
                 .map(|h| {
                     // アロケーションなしでトリムして比較
@@ -804,7 +839,7 @@ pub(crate) fn parse_http_response(data: &[u8]) -> Option<ParsedResponse> {
             })
         }
         Ok(Status::Partial) => None, // データ不足
-        Err(_) => None, // パースエラー
+        Err(_) => None,              // パースエラー
     }
 }
 
@@ -932,17 +967,23 @@ impl ChunkedDecoder {
             ChunkedState::ReadingChunkSize => {
                 match byte {
                     b'0'..=b'9' => {
-                        self.size_accumulator = self.size_accumulator.saturating_mul(16)
+                        self.size_accumulator = self
+                            .size_accumulator
+                            .saturating_mul(16)
                             .saturating_add((byte - b'0') as u64);
                         self.size_has_digit = true;
                     }
                     b'a'..=b'f' => {
-                        self.size_accumulator = self.size_accumulator.saturating_mul(16)
+                        self.size_accumulator = self
+                            .size_accumulator
+                            .saturating_mul(16)
                             .saturating_add((byte - b'a' + 10) as u64);
                         self.size_has_digit = true;
                     }
                     b'A'..=b'F' => {
-                        self.size_accumulator = self.size_accumulator.saturating_mul(16)
+                        self.size_accumulator = self
+                            .size_accumulator
+                            .saturating_mul(16)
                             .saturating_add((byte - b'A' + 10) as u64);
                         self.size_has_digit = true;
                     }
@@ -979,7 +1020,8 @@ impl ChunkedDecoder {
                         // 通常のチャンク - データセクションへ
                         // サイズ制限チェック（DoS対策）
                         if self.max_body_size > 0 {
-                            let new_total = self.total_body_size.saturating_add(self.size_accumulator);
+                            let new_total =
+                                self.total_body_size.saturating_add(self.size_accumulator);
                             if new_total > self.max_body_size {
                                 self.state = ChunkedState::SizeLimitExceeded;
                                 return ChunkedFeedResult::SizeLimitExceeded;
@@ -1138,7 +1180,11 @@ pub(crate) fn extract_vary_headers_for_cache_key<'a>(
 }
 
 /// 304 Not Modified レスポンスを構築
-pub(crate) fn build_304_response(cached_entry: &cache::CacheEntry, client_wants_close: bool, is_stale: bool) -> Vec<u8> {
+pub(crate) fn build_304_response(
+    cached_entry: &cache::CacheEntry,
+    client_wants_close: bool,
+    is_stale: bool,
+) -> Vec<u8> {
     let mut response = Vec::with_capacity(256);
 
     response.extend_from_slice(b"HTTP/1.1 304 Not Modified\r\n");
@@ -1178,7 +1224,12 @@ pub(crate) fn build_304_response(cached_entry: &cache::CacheEntry, client_wants_
 }
 
 /// キャッシュからのレスポンスを構築（メモリキャッシュ用）
-pub(crate) fn build_cached_response(cached_entry: &cache::CacheEntry, body_data: &[u8], client_wants_close: bool, is_stale: bool) -> Vec<u8> {
+pub(crate) fn build_cached_response(
+    cached_entry: &cache::CacheEntry,
+    body_data: &[u8],
+    client_wants_close: bool,
+    is_stale: bool,
+) -> Vec<u8> {
     let mut response = Vec::with_capacity(512 + body_data.len());
 
     // ステータスライン
@@ -1245,7 +1296,10 @@ pub(crate) fn status_reason_phrase(status: u16) -> &'static str {
 }
 
 /// ヘッダーから特定のヘッダー値を抽出
-pub(crate) fn extract_header_value<'a>(header_data: &'a [u8], header_name: &[u8]) -> Option<&'a [u8]> {
+pub(crate) fn extract_header_value<'a>(
+    header_data: &'a [u8],
+    header_name: &[u8],
+) -> Option<&'a [u8]> {
     let mut headers_storage = [httparse::EMPTY_HEADER; 64];
     let mut response = httparse::Response::new(&mut headers_storage);
 

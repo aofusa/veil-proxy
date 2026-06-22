@@ -193,8 +193,11 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             };
 
             // Store pending call in local context
-            state.http_ctx.pending_http_calls.insert(token, pending_call.clone());
-            
+            state
+                .http_ctx
+                .pending_http_calls
+                .insert(token, pending_call.clone());
+
             // Also register in global registry for async processing
             // This allows the tick thread to pick up and execute pending calls
             crate::wasm::persistent_context::register_global_pending_call(

@@ -55,7 +55,6 @@ fn get_property_value(state: &HostState, path: &str) -> Option<Vec<u8>> {
     }
 }
 
-
 /// Helper to allocate memory in WASM
 fn allocate_wasm_memory(caller: &mut Caller<'_, HostState>, size: usize) -> Option<i32> {
     let func = caller.get_export("proxy_on_memory_allocate")?;

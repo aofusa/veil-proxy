@@ -323,29 +323,29 @@ pub fn huffman_decode(src: &[u8]) -> Result<Vec<u8>, HpackError> {
     let mut result = Vec::with_capacity(src.len() * 2);
     let mut bits: u64 = 0;
     let mut bits_left: u32 = 0;
-    
+
     for &byte in src {
         bits = (bits << 8) | (byte as u64);
         bits_left += 8;
-        
+
         // ビットが十分にある間、シンボルをデコード
         while bits_left >= 5 {
             // 最も長い符号は30ビットだが、ほとんどは短い
             // 上位ビットから符号を探す
             let mut found = false;
-            
+
             for (sym, &(code, len)) in HUFFMAN_ENCODE_TABLE.iter().enumerate() {
                 if sym >= 256 {
                     continue; // EOS (256) はスキップ
                 }
-                
+
                 let len = len as u32;
                 if bits_left >= len {
                     // 上位 len ビットを取り出して比較
                     let shift = bits_left - len;
                     let extracted = (bits >> shift) as u32;
                     let mask = (1u32 << len) - 1;
-                    
+
                     if (extracted & mask) == code {
                         result.push(sym as u8);
                         bits_left -= len;
@@ -355,14 +355,14 @@ pub fn huffman_decode(src: &[u8]) -> Result<Vec<u8>, HpackError> {
                     }
                 }
             }
-            
+
             if !found {
                 // 5ビット以上あるのにマッチしない場合、さらにビットが必要
                 break;
             }
         }
     }
-    
+
     // 残りビットのチェック（パディング）
     // パディングは全て1のビットで構成される（EOS プレフィックス）
     if bits_left > 0 {
@@ -375,7 +375,7 @@ pub fn huffman_decode(src: &[u8]) -> Result<Vec<u8>, HpackError> {
             return Err(HpackError::HuffmanDecodeError);
         }
     }
-    
+
     Ok(result)
 }
 
@@ -397,7 +397,7 @@ mod tests {
         // "www.example.com" のエンコード例 (RFC 7541)
         let input = b"www.example.com";
         let encoded = huffman_encode(input);
-        
+
         // エンコード結果は元のサイズより小さいはず
         assert!(encoded.len() < input.len());
     }
@@ -420,7 +420,7 @@ mod tests {
             // デコードは状態機械の実装が必要なため、ここではスキップ
             // let decoded = huffman_decode(&encoded).unwrap();
             // assert_eq!(decoded, input);
-            
+
             // エンコードサイズの確認
             assert_eq!(huffman_encoded_len(input), encoded.len());
         }
@@ -430,10 +430,10 @@ mod tests {
     fn test_huffman_encoded_len() {
         // '0' の符号長は 5 ビット
         assert_eq!(huffman_encoded_len(b"0"), 1);
-        
+
         // 'a' の符号長は 5 ビット
         assert_eq!(huffman_encoded_len(b"a"), 1);
-        
+
         // 複数文字
         let s = b"aeiou";
         let len = huffman_encoded_len(s);

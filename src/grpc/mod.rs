@@ -22,8 +22,8 @@
 //! ```
 
 pub mod framing;
-pub mod status;
 pub mod headers;
+pub mod status;
 
 #[cfg(feature = "grpc")]
 pub mod stream;
@@ -35,9 +35,9 @@ pub mod compression;
 pub mod web;
 
 // Re-exports
-pub use framing::{GrpcFrame, GrpcFrameDecoder, GrpcError};
+pub use framing::{GrpcError, GrpcFrame, GrpcFrameDecoder};
+pub use headers::{is_grpc_content_type, is_grpc_request, parse_grpc_timeout, GrpcHeaders};
 pub use status::{GrpcStatus, GrpcStatusCode};
-pub use headers::{is_grpc_request, is_grpc_content_type, GrpcHeaders, parse_grpc_timeout};
 
 #[cfg(feature = "grpc")]
 pub use stream::{GrpcStreamState, GrpcStreamType};

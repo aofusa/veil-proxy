@@ -23,16 +23,16 @@
 //! conn.run(|stream| async { /* handle request */ }).await?;
 //! ```
 
-pub mod frame;
-pub mod hpack;
-pub mod stream;
+pub mod client;
 pub mod connection;
 pub mod error;
+pub mod frame;
+pub mod hpack;
 pub mod settings;
-pub mod client;
+pub mod stream;
 
+pub use client::{H2cClient, H2cResponse};
+pub use connection::{Http2Connection, ProcessedRequest};
 pub use error::{Http2Error, Http2ErrorCode};
 pub use settings::Http2Settings;
-pub use connection::{Http2Connection, ProcessedRequest};
-pub use stream::{Stream, StreamState, StreamManager};
-pub use client::{H2cClient, H2cResponse};
+pub use stream::{Stream, StreamManager, StreamState};

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 /// キャッシュマネージャー
-/// 
+///
 /// インデックス、メモリキャッシュ、ディスクキャッシュを統合管理します。
 /// スレッドセーフで、複数のワーカーから同時にアクセス可能です。
 pub struct CacheManager {
@@ -36,7 +36,7 @@ impl CacheManager {
         // メモリキャッシュを作成
         let max_entries = config.max_memory_size / 1024; // 概算エントリ数
         let memory = MemoryCache::new(max_entries, config.max_memory_size);
-        
+
         // ディスクキャッシュを作成（設定されている場合）
         let disk = if let Some(ref disk_path) = config.disk_path {
             let disk_config = DiskCacheConfig {
@@ -49,7 +49,7 @@ impl CacheManager {
         } else {
             None
         };
-        
+
         Ok(Self {
             config,
             index: CacheIndex::new(),
@@ -58,19 +58,19 @@ impl CacheManager {
             created_at: Instant::now(),
         })
     }
-    
+
     /// 設定を取得
     #[inline]
     pub fn config(&self) -> &CacheConfig {
         &self.config
     }
-    
+
     /// キャッシュが有効かどうか
     #[inline]
     pub fn is_enabled(&self) -> bool {
         self.config.enabled
     }
-    
+
     /// リクエストがキャッシュ可能かチェック
     pub fn is_request_cacheable(
         &self,
@@ -82,34 +82,34 @@ impl CacheManager {
         if !self.config.enabled {
             return false;
         }
-        
+
         // メソッドチェック
         if !self.config.is_cacheable_method(method) {
             return false;
         }
-        
+
         // バイパスパターンチェック
         if self.config.should_bypass(path) {
             return false;
         }
-        
+
         // リクエストヘッダーチェック（no-cache, no-store）
         if CachePolicy::request_bypasses_cache(request_headers) {
             return false;
         }
-        
+
         true
     }
-    
+
     /// キャッシュからエントリを取得
     pub fn get(&self, key: &CacheKey) -> Option<Arc<CacheEntry>> {
         self.index.get(key)
     }
-    
+
     /// stale-while-revalidate用にstaleなエントリを取得
     pub fn get_stale(&self, key: &CacheKey, max_stale_secs: u64) -> Option<Arc<CacheEntry>> {
         let entry = self.index.get_stale(key)?;
-        
+
         // stale期間チェック
         if entry.stale_duration() <= max_stale_secs {
             Some(entry)
@@ -117,9 +117,9 @@ impl CacheManager {
             None
         }
     }
-    
+
     /// レスポンスをキャッシュに保存
-    /// 
+    ///
     /// レスポンスがキャッシュ可能な場合のみ保存します。
     pub fn store(
         &self,
@@ -130,9 +130,9 @@ impl CacheManager {
     ) -> bool {
         self.store_with_vary(key, status_code, headers, body, None)
     }
-    
+
     /// Varyヘッダー情報付きでレスポンスをキャッシュに保存
-    /// 
+    ///
     /// レスポンスがキャッシュ可能な場合のみ保存します。
     /// vary_headers には Vary ヘッダーで指定されたヘッダー名のリストを指定します。
     pub fn store_with_vary(
@@ -147,7 +147,7 @@ impl CacheManager {
         if !self.config.is_cacheable_status(status_code) {
             return false;
         }
-        
+
         // Cache-Controlチェック
         let ttl = match CachePolicy::check_response(
             status_code,
@@ -158,30 +158,28 @@ impl CacheManager {
             Some(ttl) => ttl,
             None => return false,
         };
-        
+
         // Varyチェック（Vary: * はキャッシュ不可）
         use super::policy::VaryResult;
         let vary_result = CachePolicy::parse_vary_ex(&headers);
-        
+
         if self.config.respect_vary {
             // Vary: * の場合はキャッシュしない
             if !vary_result.is_cacheable() {
                 return false;
             }
         }
-        
+
         // レスポンスから取得したVaryヘッダー、または渡されたVaryヘッダーを使用
-        let effective_vary = vary_headers.or_else(|| {
-            match vary_result {
-                VaryResult::Headers(h) => Some(h),
-                VaryResult::NotPresent => None,
-                VaryResult::Uncacheable => None,
-            }
+        let effective_vary = vary_headers.or_else(|| match vary_result {
+            VaryResult::Headers(h) => Some(h),
+            VaryResult::NotPresent => None,
+            VaryResult::Uncacheable => None,
         });
-        
+
         // ストレージ選択
         let storage_type = self.config.select_storage(body.len());
-        
+
         let entry = match storage_type {
             StorageType::Memory => {
                 use super::entry::CacheStorage;
@@ -203,7 +201,7 @@ impl CacheManager {
                         Ok(p) => p,
                         Err(_) => return false,
                     };
-                    
+
                     let size = body.len() as u64;
                     CacheEntry::with_vary(
                         status_code,
@@ -224,13 +222,13 @@ impl CacheManager {
                 }
             }
         };
-        
+
         // インデックスに追加
         self.index.insert(key, entry);
-        
+
         true
     }
-    
+
     /// エントリを削除
     pub fn invalidate(&self, key: &CacheKey) {
         // インデックスから削除
@@ -243,45 +241,45 @@ impl CacheManager {
             }
         }
     }
-    
+
     /// パターンに一致するエントリを削除
-    /// 
+    ///
     /// globパターンでパス（ホスト/パス形式）をマッチングし、
     /// 一致するエントリを削除します。
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `pattern` - globパターン（例: "example.com/api/*", "*/admin/*"）
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// 削除されたエントリ数
     pub fn invalidate_pattern(&self, pattern: &str) -> usize {
         let count = self.index.invalidate_pattern(pattern);
-        
+
         // ディスクキャッシュのクリーンアップは別途実行される
         // (エントリ削除時にパスが失われるため、ここでは行わない)
-        
+
         count
     }
-    
+
     /// ホストの全エントリを削除
-    /// 
+    ///
     /// 指定されたホストの全キャッシュを無効化します。
     pub fn invalidate_host(&self, host: &str) -> usize {
         self.index.invalidate_host(host)
     }
-    
+
     /// 期限切れエントリを削除
     pub fn evict_expired(&self) -> usize {
         self.index.evict_expired()
     }
-    
+
     /// LRUエビクションを実行
     pub fn evict_lru(&self) -> usize {
         self.index.evict_lru(self.config.max_memory_size)
     }
-    
+
     /// ディスクエビクションを実行
     pub fn evict_disk(&self) -> io::Result<usize> {
         if let Some(ref disk) = self.disk {
@@ -291,7 +289,7 @@ impl CacheManager {
             Ok(0)
         }
     }
-    
+
     /// 全エントリを削除
     pub fn clear(&self) -> io::Result<()> {
         self.index.clear();
@@ -363,7 +361,7 @@ impl CacheManager {
         }
         n
     }
-    
+
     /// 統計情報を取得
     pub fn stats(&self) -> CacheStats {
         CacheStats {
@@ -398,7 +396,7 @@ pub struct CacheStats {
 }
 
 /// グローバルキャッシュマネージャー（オプション）
-/// 
+///
 /// 複数のルートで共有するキャッシュマネージャーとして使用可能
 use std::sync::OnceLock;
 
@@ -439,7 +437,7 @@ mod tests {
     fn test_manager_creation() {
         let config = create_test_config();
         let manager = CacheManager::new(config).unwrap();
-        
+
         assert!(manager.is_enabled());
         assert_eq!(manager.stats().entries, 0);
     }
@@ -448,16 +446,16 @@ mod tests {
     fn test_store_and_get() {
         let config = create_test_config();
         let manager = CacheManager::new(config).unwrap();
-        
+
         let key = create_test_key("/test");
-        let headers = vec![
-            (b"content-type".to_vec().into_boxed_slice(), 
-             b"text/plain".to_vec().into_boxed_slice()),
-        ];
-        
+        let headers = vec![(
+            b"content-type".to_vec().into_boxed_slice(),
+            b"text/plain".to_vec().into_boxed_slice(),
+        )];
+
         let stored = manager.store(key.clone(), 200, headers, b"test data".to_vec());
         assert!(stored);
-        
+
         let entry = manager.get(&key);
         assert!(entry.is_some());
         assert_eq!(entry.unwrap().status_code, 200);
@@ -467,10 +465,10 @@ mod tests {
     fn test_store_non_cacheable_status() {
         let config = create_test_config();
         let manager = CacheManager::new(config).unwrap();
-        
+
         let key = create_test_key("/test");
         let headers = vec![];
-        
+
         // 201は通常キャッシュ対象外
         let stored = manager.store(key.clone(), 201, headers, b"test".to_vec());
         assert!(!stored);
@@ -480,13 +478,13 @@ mod tests {
     fn test_store_no_store() {
         let config = create_test_config();
         let manager = CacheManager::new(config).unwrap();
-        
+
         let key = create_test_key("/test");
-        let headers = vec![
-            (b"cache-control".to_vec().into_boxed_slice(), 
-             b"no-store".to_vec().into_boxed_slice()),
-        ];
-        
+        let headers = vec![(
+            b"cache-control".to_vec().into_boxed_slice(),
+            b"no-store".to_vec().into_boxed_slice(),
+        )];
+
         let stored = manager.store(key.clone(), 200, headers, b"test".to_vec());
         assert!(!stored);
     }
@@ -495,13 +493,13 @@ mod tests {
     fn test_invalidate() {
         let config = create_test_config();
         let manager = CacheManager::new(config).unwrap();
-        
+
         let key = create_test_key("/test");
         let headers = vec![];
-        
+
         manager.store(key.clone(), 200, headers, b"test".to_vec());
         assert!(manager.get(&key).is_some());
-        
+
         manager.invalidate(&key);
         assert!(manager.get(&key).is_none());
     }
@@ -517,16 +515,16 @@ mod tests {
             max_disk_size: 1024 * 1024,
             ..Default::default()
         };
-        
+
         let manager = CacheManager::new(config).unwrap();
-        
+
         let key = create_test_key("/large");
         let headers = vec![];
         let large_body = vec![0u8; 1000]; // memory_thresholdより大きい
-        
+
         let stored = manager.store(key.clone(), 200, headers, large_body);
         assert!(stored);
-        
+
         let entry = manager.get(&key);
         assert!(entry.is_some());
     }
@@ -535,18 +533,18 @@ mod tests {
     fn test_stats() {
         let config = create_test_config();
         let manager = CacheManager::new(config).unwrap();
-        
+
         let key = create_test_key("/test");
         let headers = vec![];
         manager.store(key.clone(), 200, headers, b"test".to_vec());
-        
+
         // ヒット
         manager.get(&key);
-        
+
         // ミス
         let missing_key = create_test_key("/missing");
         manager.get(&missing_key);
-        
+
         let stats = manager.stats();
         assert_eq!(stats.entries, 1);
         assert_eq!(stats.hits, 1);
@@ -562,21 +560,21 @@ mod tests {
             ..Default::default()
         };
         let manager = CacheManager::new(config).unwrap();
-        
+
         // GET は cacheable
         assert!(manager.is_request_cacheable(b"GET", "/api/products", &[]));
-        
+
         // POST は cacheable でない
         assert!(!manager.is_request_cacheable(b"POST", "/api/products", &[]));
-        
+
         // バイパスパターンにマッチ
         assert!(!manager.is_request_cacheable(b"GET", "/api/user/123", &[]));
-        
+
         // no-cache ヘッダー
-        let headers = vec![
-            (b"cache-control".to_vec().into_boxed_slice(), 
-             b"no-cache".to_vec().into_boxed_slice()),
-        ];
+        let headers = vec![(
+            b"cache-control".to_vec().into_boxed_slice(),
+            b"no-cache".to_vec().into_boxed_slice(),
+        )];
         assert!(!manager.is_request_cacheable(b"GET", "/api/products", &headers));
     }
 
@@ -640,4 +638,3 @@ mod tests {
         assert_eq!(manager.stats().entries, 0);
     }
 }
-

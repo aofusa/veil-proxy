@@ -19,7 +19,7 @@ impl VaryResult {
     pub fn is_cacheable(&self) -> bool {
         !matches!(self, VaryResult::Uncacheable)
     }
-    
+
     /// ヘッダーリストを取得（NotPresentの場合は空のVec）
     #[inline]
     pub fn headers(&self) -> Option<&Vec<String>> {
@@ -63,15 +63,15 @@ impl CacheControl {
     /// Cache-Controlヘッダー値をパース
     pub fn parse(value: &[u8]) -> Self {
         let mut cc = Self::default();
-        
+
         let value_str = match std::str::from_utf8(value) {
             Ok(s) => s,
             Err(_) => return cc,
         };
-        
+
         for directive in value_str.split(',') {
             let directive = directive.trim().to_lowercase();
-            
+
             if directive == "no-cache" {
                 cc.no_cache = true;
             } else if directive == "no-store" {
@@ -98,34 +98,32 @@ impl CacheControl {
                 cc.stale_if_error = value.parse().ok();
             }
         }
-        
+
         cc
     }
-    
+
     /// プロキシでキャッシュ可能かどうか
     pub fn is_cacheable(&self) -> bool {
         // no-store は絶対にキャッシュ不可
         if self.no_store {
             return false;
         }
-        
+
         // private はプロキシでキャッシュ不可
         if self.private {
             return false;
         }
-        
+
         true
     }
-    
+
     /// プロキシ用のTTL（秒）を取得
-    /// 
+    ///
     /// 優先順位: s-maxage > max-age
     pub fn effective_ttl(&self, default_ttl: u64) -> u64 {
-        self.s_maxage
-            .or(self.max_age)
-            .unwrap_or(default_ttl)
+        self.s_maxage.or(self.max_age).unwrap_or(default_ttl)
     }
-    
+
     /// stale-while-revalidate の猶予時間内かチェック
     pub fn within_stale_while_revalidate(&self, stale_secs: u64) -> bool {
         match self.stale_while_revalidate {
@@ -133,7 +131,7 @@ impl CacheControl {
             None => false,
         }
     }
-    
+
     /// stale-if-error の猶予時間内かチェック
     pub fn within_stale_if_error(&self, stale_secs: u64) -> bool {
         match self.stale_if_error {
@@ -144,22 +142,22 @@ impl CacheControl {
 }
 
 /// キャッシュポリシー
-/// 
+///
 /// リクエストとレスポンスからキャッシュ可否を判定します。
 pub struct CachePolicy;
 
 impl CachePolicy {
     /// レスポンスがキャッシュ可能かどうかを判定
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `status_code` - HTTPステータスコード
     /// * `response_headers` - レスポンスヘッダー
     /// * `cacheable_statuses` - キャッシュ可能なステータスコードのリスト
     /// * `default_ttl` - デフォルトTTL
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// キャッシュ可能な場合はTTL（秒）を返す
     pub fn check_response(
         status_code: u16,
@@ -171,32 +169,32 @@ impl CachePolicy {
         if !cacheable_statuses.contains(&status_code) {
             return None;
         }
-        
+
         // Cache-Controlヘッダーを取得
         let cache_control = response_headers
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case(b"cache-control"))
             .map(|(_, value)| CacheControl::parse(value))
             .unwrap_or_default();
-        
+
         // キャッシュ可能性チェック
         if !cache_control.is_cacheable() {
             return None;
         }
-        
+
         // TTLを計算
         let ttl = cache_control.effective_ttl(default_ttl);
-        
+
         // TTLが0の場合はキャッシュしない
         if ttl == 0 {
             return None;
         }
-        
+
         Some(ttl)
     }
-    
+
     /// Varyヘッダーを解析
-    /// 
+    ///
     /// 戻り値:
     /// - `VaryResult::NotPresent` - Varyヘッダーなし
     /// - `VaryResult::Uncacheable` - Vary: * でキャッシュ不可
@@ -206,33 +204,33 @@ impl CachePolicy {
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case(b"vary"))
             .map(|(_, value)| value);
-        
+
         let vary_header = match vary_header {
             Some(h) => h,
             None => return VaryResult::NotPresent,
         };
-        
+
         let vary_str = match std::str::from_utf8(vary_header) {
             Ok(s) => s,
             Err(_) => return VaryResult::NotPresent,
         };
-        
+
         // Vary: * はキャッシュ不可
         if vary_str.trim() == "*" {
             return VaryResult::Uncacheable;
         }
-        
+
         let headers: Vec<String> = vary_str
             .split(',')
             .map(|s| s.trim().to_lowercase())
             .filter(|s| !s.is_empty())
             .collect();
-        
+
         VaryResult::Headers(headers)
     }
-    
+
     /// Varyヘッダーを解析（後方互換性のため）
-    /// 
+    ///
     /// Vary: * の場合はキャッシュ不可を示すNoneを返す
     #[inline]
     pub fn parse_vary(response_headers: &[(Box<[u8]>, Box<[u8]>)]) -> Option<Vec<String>> {
@@ -242,9 +240,9 @@ impl CachePolicy {
             VaryResult::Uncacheable => None,
         }
     }
-    
+
     /// リクエストがキャッシュをバイパスすべきかチェック
-    /// 
+    ///
     /// Pragma: no-cache や Cache-Control: no-cache をチェック
     pub fn request_bypasses_cache(request_headers: &[(Box<[u8]>, Box<[u8]>)]) -> bool {
         for (name, value) in request_headers {
@@ -261,7 +259,7 @@ impl CachePolicy {
         }
         false
     }
-    
+
     /// If-None-Match ヘッダーを取得
     pub fn get_if_none_match(request_headers: &[(Box<[u8]>, Box<[u8]>)]) -> Option<&[u8]> {
         request_headers
@@ -269,7 +267,7 @@ impl CachePolicy {
             .find(|(name, _)| name.eq_ignore_ascii_case(b"if-none-match"))
             .map(|(_, value)| value.as_ref())
     }
-    
+
     /// If-Modified-Since ヘッダーを取得
     pub fn get_if_modified_since(request_headers: &[(Box<[u8]>, Box<[u8]>)]) -> Option<&[u8]> {
         request_headers
@@ -316,7 +314,8 @@ mod tests {
 
     #[test]
     fn test_parse_cache_control_stale() {
-        let cc = CacheControl::parse(b"max-age=300, stale-while-revalidate=60, stale-if-error=86400");
+        let cc =
+            CacheControl::parse(b"max-age=300, stale-while-revalidate=60, stale-if-error=86400");
         assert_eq!(cc.stale_while_revalidate, Some(60));
         assert_eq!(cc.stale_if_error, Some(86400));
         assert!(cc.within_stale_while_revalidate(30));
@@ -325,33 +324,33 @@ mod tests {
 
     #[test]
     fn test_check_response_cacheable() {
-        let headers = vec![
-            (b"cache-control".to_vec().into_boxed_slice(), 
-             b"max-age=3600".to_vec().into_boxed_slice()),
-        ];
-        
+        let headers = vec![(
+            b"cache-control".to_vec().into_boxed_slice(),
+            b"max-age=3600".to_vec().into_boxed_slice(),
+        )];
+
         let ttl = CachePolicy::check_response(200, &headers, &[200], 300);
         assert_eq!(ttl, Some(3600));
     }
 
     #[test]
     fn test_check_response_not_cacheable() {
-        let headers = vec![
-            (b"cache-control".to_vec().into_boxed_slice(), 
-             b"no-store".to_vec().into_boxed_slice()),
-        ];
-        
+        let headers = vec![(
+            b"cache-control".to_vec().into_boxed_slice(),
+            b"no-store".to_vec().into_boxed_slice(),
+        )];
+
         let ttl = CachePolicy::check_response(200, &headers, &[200], 300);
         assert!(ttl.is_none());
     }
 
     #[test]
     fn test_parse_vary() {
-        let headers = vec![
-            (b"vary".to_vec().into_boxed_slice(), 
-             b"Accept-Encoding, User-Agent".to_vec().into_boxed_slice()),
-        ];
-        
+        let headers = vec![(
+            b"vary".to_vec().into_boxed_slice(),
+            b"Accept-Encoding, User-Agent".to_vec().into_boxed_slice(),
+        )];
+
         let vary = CachePolicy::parse_vary(&headers).unwrap();
         assert!(vary.contains(&"accept-encoding".to_string()));
         assert!(vary.contains(&"user-agent".to_string()));
@@ -359,11 +358,11 @@ mod tests {
 
     #[test]
     fn test_parse_vary_star() {
-        let headers = vec![
-            (b"vary".to_vec().into_boxed_slice(), 
-             b"*".to_vec().into_boxed_slice()),
-        ];
-        
+        let headers = vec![(
+            b"vary".to_vec().into_boxed_slice(),
+            b"*".to_vec().into_boxed_slice(),
+        )];
+
         let vary = CachePolicy::parse_vary(&headers);
         assert!(vary.is_none()); // Vary: * はキャッシュ不可
     }
@@ -371,7 +370,7 @@ mod tests {
     #[test]
     fn test_parse_vary_ex_not_present() {
         let headers: Vec<(Box<[u8]>, Box<[u8]>)> = vec![];
-        
+
         let result = CachePolicy::parse_vary_ex(&headers);
         assert_eq!(result, VaryResult::NotPresent);
         assert!(result.is_cacheable());
@@ -379,11 +378,11 @@ mod tests {
 
     #[test]
     fn test_parse_vary_ex_headers() {
-        let headers = vec![
-            (b"vary".to_vec().into_boxed_slice(), 
-             b"Accept-Encoding".to_vec().into_boxed_slice()),
-        ];
-        
+        let headers = vec![(
+            b"vary".to_vec().into_boxed_slice(),
+            b"Accept-Encoding".to_vec().into_boxed_slice(),
+        )];
+
         let result = CachePolicy::parse_vary_ex(&headers);
         assert!(result.is_cacheable());
         match result {
@@ -396,11 +395,11 @@ mod tests {
 
     #[test]
     fn test_parse_vary_ex_uncacheable() {
-        let headers = vec![
-            (b"vary".to_vec().into_boxed_slice(), 
-             b"*".to_vec().into_boxed_slice()),
-        ];
-        
+        let headers = vec![(
+            b"vary".to_vec().into_boxed_slice(),
+            b"*".to_vec().into_boxed_slice(),
+        )];
+
         let result = CachePolicy::parse_vary_ex(&headers);
         assert_eq!(result, VaryResult::Uncacheable);
         assert!(!result.is_cacheable());
@@ -410,9 +409,8 @@ mod tests {
     fn test_parse_vary_no_header_returns_empty() {
         // Varyヘッダーがない場合、parse_varyはSome(空のVec)を返す
         let headers: Vec<(Box<[u8]>, Box<[u8]>)> = vec![];
-        
+
         let vary = CachePolicy::parse_vary(&headers);
         assert_eq!(vary, Some(Vec::new()));
     }
 }
-

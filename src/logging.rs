@@ -10,15 +10,15 @@
 //
 // スレッドローカルでキャッシュするため、マルチスレッド環境でもロックフリー。
 
-use std::cell::Cell;
-use std::time::Instant;
-use std::io;
-use std::borrow::Cow;
-use std::fmt::{Display, Formatter, Result as FmtResult};
-use time::OffsetDateTime;
-use serde::Deserialize;
 #[allow(unused_imports)]
-use ftlog::{info, error, warn, LevelFilter, FtLogFormat, Level, Record};
+use ftlog::{error, info, warn, FtLogFormat, Level, LevelFilter, Record};
+use serde::Deserialize;
+use std::borrow::Cow;
+use std::cell::Cell;
+use std::fmt::{Display, Formatter, Result as FmtResult};
+use std::io;
+use std::time::Instant;
+use time::OffsetDateTime;
 
 use crate::metrics::record_request_metrics;
 
@@ -138,15 +138,15 @@ pub(crate) fn default_log_level() -> String {
 }
 
 pub(crate) fn default_channel_size() -> usize {
-    100000  // ftlogデフォルト(100)より大幅に増加し、高負荷時のドロップを防止
+    100000 // ftlogデフォルト(100)より大幅に増加し、高負荷時のドロップを防止
 }
 
 pub(crate) fn default_flush_interval() -> u64 {
-    1000  // 1秒
+    1000 // 1秒
 }
 
 pub(crate) fn default_max_log_size() -> u64 {
-    104857600  // 100MB
+    104857600 // 100MB
 }
 
 impl Default for LoggingConfigSection {
@@ -202,7 +202,8 @@ impl Display for JsonLogMessage {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         // タイムスタンプを取得（RFC 3339形式）
         let now = time::OffsetDateTime::now_utc();
-        let timestamp = now.format(&time::format_description::well_known::Rfc3339)
+        let timestamp = now
+            .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_else(|_| now.to_string());
 
         // JSON形式でフォーマット
@@ -233,7 +234,9 @@ impl FtLogFormat for JsonLogFormat {
             line: record.line(),
             // as_str() は引数なし static 文字列の場合にアロケーションなしで &'static str を返す。
             // 動的引数がある場合のみ format!() でヒープ確保する（FtLogFormatter と同じ最適化）。
-            args: record.args().as_str()
+            args: record
+                .args()
+                .as_str()
                 .map(Cow::Borrowed)
                 .unwrap_or_else(|| Cow::Owned(format!("{}", record.args()))),
         })
@@ -379,8 +382,8 @@ pub(crate) fn init_logging(config: &LoggingConfigSection) -> ftlog::LoggerGuard 
     if let Some(ref file_path) = config.file_path {
         if use_json {
             // JSON形式: カスタムWriterを使用してftlogのプレフィックスを削除
-            let json_appender = JsonFileAppender::new(file_path)
-                .expect("Failed to create JSON file appender");
+            let json_appender =
+                JsonFileAppender::new(file_path).expect("Failed to create JSON file appender");
 
             ftlog::builder()
                 .max_log_level(level)
@@ -434,7 +437,10 @@ pub(crate) fn log_ktls_status(ktls_config: &crate::KtlsConfig) {
         #[cfg(feature = "ktls")]
         {
             if crate::ktls_rustls::is_ktls_available() {
-                info!("kTLS: Enabled via rustls + ktls2 (TX={}, RX={})", ktls_config.enable_tx, ktls_config.enable_rx);
+                info!(
+                    "kTLS: Enabled via rustls + ktls2 (TX={}, RX={})",
+                    ktls_config.enable_tx, ktls_config.enable_rx
+                );
                 info!("kTLS: Kernel TLS offload active - reduced CPU usage expected");
                 if ktls_config.fallback_enabled {
                     info!("kTLS: Fallback to rustls enabled (graceful degradation)");
@@ -506,7 +512,14 @@ pub(crate) fn log_access(
         log_time, duration_ms, method_str, host_str, path_str, ua_str, req_body_size, status, resp_body_size);
 
     // Prometheusメトリクスを記録
-    record_request_metrics(method_str, host_str, status, req_body_size, resp_body_size, duration_secs);
+    record_request_metrics(
+        method_str,
+        host_str,
+        status,
+        req_body_size,
+        resp_body_size,
+        duration_secs,
+    );
 
     // 構造化アクセスログ出力（F-21）
     // log_time と duration_ms を渡すことで syscall 二重発行と clone を排除

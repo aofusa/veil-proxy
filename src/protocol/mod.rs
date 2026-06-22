@@ -5,4 +5,6 @@
 
 pub mod negotiation;
 
-pub use negotiation::{HttpProtocol, get_negotiated_protocol, configure_alpn_h2, configure_alpn_h2_client};
+pub use negotiation::{
+    configure_alpn_h2, configure_alpn_h2_client, get_negotiated_protocol, HttpProtocol,
+};

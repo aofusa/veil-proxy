@@ -163,11 +163,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     linker.func_wrap(
         "wasi_snapshot_preview1",
         "fd_prestat_dir_name",
-        |_caller: Caller<'_, HostState>,
-         _fd: i32,
-         _path_ptr: i32,
-         _path_len: i32|
-         -> i32 {
+        |_caller: Caller<'_, HostState>, _fd: i32, _path_ptr: i32, _path_len: i32| -> i32 {
             8 // EBADF
         },
     )?;
@@ -183,7 +179,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             };
 
             let data = memory.data_mut(&mut caller);
-            
+
             // Write 0 environment variables
             let count_p = count_ptr as usize;
             let size_p = size_ptr as usize;
@@ -217,7 +213,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             };
 
             let data = memory.data_mut(&mut caller);
-            
+
             // Write 0 arguments
             let count_p = count_ptr as usize;
             let size_p = size_ptr as usize;

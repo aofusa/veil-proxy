@@ -20,12 +20,12 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
+use ftlog::debug;
 use lru::LruCache;
 use std::num::NonZeroUsize;
-use ftlog::debug;
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 // ====================
@@ -33,7 +33,7 @@ use xxhash_rust::xxh3::xxh3_64_with_seed;
 // ====================
 
 /// Host-based route grouping for O(1) initial lookup
-/// 
+///
 /// Routes are grouped by their host condition:
 /// - Exact host matches go into `exact` HashMap
 /// - Wildcard hosts (*.example.com) go into `wildcard` Vec
@@ -106,9 +106,9 @@ impl HostRouter {
         };
         // Remove port if present
         let host_only = host_lower.split(':').next().unwrap_or(&host_lower);
-        
+
         let mut candidates = Vec::new();
-        
+
         // Host normalization for testing (localhost <-> 127.0.0.1)
         let alt_host = if host_only == "localhost" {
             Some("127.0.0.1")
@@ -117,7 +117,7 @@ impl HostRouter {
         } else {
             None
         };
-        
+
         // 1. Exact match (highest priority)
         if let Some(indices) = self.exact.get(host_only) {
             candidates.extend(indices.iter().copied());
@@ -127,7 +127,7 @@ impl HostRouter {
                 candidates.extend(indices.iter().copied());
             }
         }
-        
+
         // 2. Wildcard matches
         for (pattern, indices) in &self.wildcard {
             if pattern.starts_with("__prefix__:") {
@@ -153,10 +153,10 @@ impl HostRouter {
                 }
             }
         }
-        
+
         // 3. Any host (lowest priority, but always included)
         candidates.extend(self.any_host.iter().copied());
-        
+
         candidates
     }
 
@@ -182,7 +182,7 @@ impl Default for HostRouter {
 // ====================
 
 /// Path-based route matching using Radix Tree (matchit)
-/// 
+///
 /// Provides O(k) path matching where k is the path length
 #[derive(Debug)]
 pub struct PathRouter {
@@ -217,7 +217,7 @@ impl PathRouter {
             self.patterns.push((pattern.to_string(), route_idx));
         } else {
             let matchit_pattern = self.convert_pattern(pattern);
-            
+
             if let Err(_) = self.router.insert(matchit_pattern.clone(), vec![route_idx]) {
                 self.patterns.push((pattern.to_string(), route_idx));
             }
@@ -263,19 +263,20 @@ impl PathRouter {
         if pattern == path {
             return true;
         }
-        
+
         // Wildcard pattern: /api/*
         if let Some(prefix) = pattern.strip_suffix("/*") {
-            return path.starts_with(prefix) && 
-                   (path.len() == prefix.len() || path.as_bytes().get(prefix.len()) == Some(&b'/'));
+            return path.starts_with(prefix)
+                && (path.len() == prefix.len()
+                    || path.as_bytes().get(prefix.len()) == Some(&b'/'));
         }
-        
+
         // Prefix match
         if path.starts_with(pattern) {
             let remaining = &path[pattern.len()..];
             return remaining.is_empty() || remaining.starts_with('/');
         }
-        
+
         false
     }
 
@@ -296,7 +297,7 @@ impl Default for PathRouter {
 // ====================
 
 /// Efficient CIDR range matching
-/// 
+///
 /// Uses sorted structures for faster IP range lookups
 #[derive(Debug, Clone)]
 pub struct CidrMatcher {
@@ -339,34 +340,39 @@ impl CidrMatcher {
     fn add_cidr(&mut self, route_idx: usize, cidr: &str) {
         if let Some((network_str, prefix_len_str)) = cidr.split_once('/') {
             // CIDR notation
-            if let (Ok(network), Ok(prefix_len)) = (
-                network_str.parse::<IpAddr>(),
-                prefix_len_str.parse::<u8>()
-            ) {
+            if let (Ok(network), Ok(prefix_len)) =
+                (network_str.parse::<IpAddr>(), prefix_len_str.parse::<u8>())
+            {
                 match network {
                     IpAddr::V4(v4) => {
                         let network_u32 = u32::from_be_bytes(v4.octets());
                         // Find existing range or create new
-                        if let Some(entry) = self.v4_ranges.iter_mut()
+                        if let Some(entry) = self
+                            .v4_ranges
+                            .iter_mut()
                             .find(|(n, p, _)| *n == network_u32 && *p == prefix_len)
                         {
                             if !entry.2.contains(&route_idx) {
                                 entry.2.push(route_idx);
                             }
                         } else {
-                            self.v4_ranges.push((network_u32, prefix_len, vec![route_idx]));
+                            self.v4_ranges
+                                .push((network_u32, prefix_len, vec![route_idx]));
                         }
                     }
                     IpAddr::V6(v6) => {
                         let network_u128 = u128::from_be_bytes(v6.octets());
-                        if let Some(entry) = self.v6_ranges.iter_mut()
+                        if let Some(entry) = self
+                            .v6_ranges
+                            .iter_mut()
                             .find(|(n, p, _)| *n == network_u128 && *p == prefix_len)
                         {
                             if !entry.2.contains(&route_idx) {
                                 entry.2.push(route_idx);
                             }
                         } else {
-                            self.v6_ranges.push((network_u128, prefix_len, vec![route_idx]));
+                            self.v6_ranges
+                                .push((network_u128, prefix_len, vec![route_idx]));
                         }
                     }
                 }
@@ -439,7 +445,7 @@ impl CidrMatcher {
 
         candidates
     }
-    
+
     /// Check if this matcher has any source_ip conditions
     pub fn has_conditions(&self) -> bool {
         !self.v4_ranges.is_empty() || !self.v6_ranges.is_empty() || !self.exact_ips.is_empty()
@@ -625,7 +631,7 @@ impl OptimizedRouter {
     }
 
     /// Add a route to the router
-    /// 
+    ///
     /// # Arguments
     /// * `route_idx` - Index of the route in the routes array
     /// * `host` - Host condition (None for any host)
@@ -650,19 +656,14 @@ impl OptimizedRouter {
     }
 
     /// Get candidate routes for a request
-    /// 
+    ///
     /// Returns route indices that potentially match, in priority order.
     /// The caller should still verify the full conditions (header, method, query).
-    pub fn get_candidates(
-        &self,
-        host: &str,
-        path: &str,
-        source_ip: &SocketAddr,
-    ) -> Vec<usize> {
+    pub fn get_candidates(&self, host: &str, path: &str, source_ip: &SocketAddr) -> Vec<usize> {
         // Get candidates from each router
         let host_candidates = self.host_router.get_candidates(host);
         let path_candidates = self.path_router.get_candidates(path);
-        
+
         // If no source_ip conditions exist, skip CIDR matching
         let ip_candidates = if self.cidr_matcher.has_conditions() {
             self.cidr_matcher.get_candidates(source_ip)
@@ -685,20 +686,24 @@ impl OptimizedRouter {
         }
 
         if final_candidates.is_empty() {
-             // Only log at debug to avoid flooding, but this helps find why a route didn't match
-             const LOG_EVERY_N: u64 = 100;
-             static COUNT: AtomicU64 = AtomicU64::new(0);
-             let c = COUNT.fetch_add(1, Ordering::Relaxed);
-             if c % LOG_EVERY_N == 0 {
-                 debug!("[Routing] get_candidates: host_cand={:?} path_cand_len={} ip_cand_len={}",
-                    host_candidates, path_sorted.len(), ip_sorted.len());
-             }
+            // Only log at debug to avoid flooding, but this helps find why a route didn't match
+            const LOG_EVERY_N: u64 = 100;
+            static COUNT: AtomicU64 = AtomicU64::new(0);
+            let c = COUNT.fetch_add(1, Ordering::Relaxed);
+            if c % LOG_EVERY_N == 0 {
+                debug!(
+                    "[Routing] get_candidates: host_cand={:?} path_cand_len={} ip_cand_len={}",
+                    host_candidates,
+                    path_sorted.len(),
+                    ip_sorted.len()
+                );
+            }
         }
 
         // Sort by index to maintain original priority order
         final_candidates.sort_unstable();
         final_candidates.dedup();
-        
+
         final_candidates
     }
 
@@ -847,7 +852,7 @@ mod tests {
         router.finalize();
 
         let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        
+
         let candidates = router.get_candidates("api.example.com", "/v1/users", &addr);
         assert!(candidates.contains(&0));
         assert!(candidates.contains(&2));

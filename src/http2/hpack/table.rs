@@ -271,9 +271,13 @@ impl DynamicTable {
 ///
 /// インデックス 1-61: 静的テーブル
 /// インデックス 62+: 動的テーブル
-pub fn get_indexed<'a>(static_table: &'a StaticTable, dynamic_table: &'a DynamicTable, index: usize) -> Option<(&'a [u8], &'a [u8])> {
+pub fn get_indexed<'a>(
+    static_table: &'a StaticTable,
+    dynamic_table: &'a DynamicTable,
+    index: usize,
+) -> Option<(&'a [u8], &'a [u8])> {
     let _ = static_table; // StaticTable は関数で使用
-    
+
     if index == 0 {
         return None;
     }
@@ -282,7 +286,9 @@ pub fn get_indexed<'a>(static_table: &'a StaticTable, dynamic_table: &'a Dynamic
         StaticTable::get(index)
     } else {
         let dynamic_index = index - StaticTable::SIZE;
-        dynamic_table.get(dynamic_index).map(|f| (f.name.as_slice(), f.value.as_slice()))
+        dynamic_table
+            .get(dynamic_index)
+            .map(|f| (f.name.as_slice(), f.value.as_slice()))
     }
 }
 
@@ -328,11 +334,11 @@ mod tests {
     #[test]
     fn test_dynamic_table_insert() {
         let mut table = DynamicTable::new(4096);
-        
+
         // Insert entry
         table.insert(b"custom-header".to_vec(), b"custom-value".to_vec());
         assert_eq!(table.len(), 1);
-        
+
         let entry = table.get(1).unwrap();
         assert_eq!(entry.name, b"custom-header");
         assert_eq!(entry.value, b"custom-value");
@@ -342,14 +348,14 @@ mod tests {
     fn test_dynamic_table_eviction() {
         // Small max_size: 名前10 + 値10 + 32 = 52 bytes per entry
         let mut table = DynamicTable::new(100);
-        
+
         table.insert(b"header1234".to_vec(), b"value12345".to_vec()); // 52 bytes
         assert_eq!(table.len(), 1);
-        
+
         table.insert(b"header5678".to_vec(), b"value67890".to_vec()); // 52 bytes, exceeds 100
-        // 最初のエントリが削除される
+                                                                      // 最初のエントリが削除される
         assert_eq!(table.len(), 1);
-        
+
         let entry = table.get(1).unwrap();
         assert_eq!(entry.name, b"header5678");
     }
@@ -357,9 +363,12 @@ mod tests {
     #[test]
     fn test_dynamic_table_clear_on_oversize() {
         let mut table = DynamicTable::new(50);
-        
+
         // 50 bytes を超えるエントリ
-        table.insert(b"very-long-header-name".to_vec(), b"very-long-value".to_vec());
+        table.insert(
+            b"very-long-header-name".to_vec(),
+            b"very-long-value".to_vec(),
+        );
         assert!(table.is_empty());
     }
 

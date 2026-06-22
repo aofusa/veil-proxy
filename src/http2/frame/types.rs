@@ -190,10 +190,7 @@ pub enum Frame {
         priority: PrioritySpec,
     },
     /// RST_STREAM フレーム
-    RstStream {
-        stream_id: u32,
-        error_code: u32,
-    },
+    RstStream { stream_id: u32, error_code: u32 },
     /// SETTINGS フレーム
     Settings {
         ack: bool,
@@ -207,10 +204,7 @@ pub enum Frame {
         header_block: Vec<u8>,
     },
     /// PING フレーム
-    Ping {
-        ack: bool,
-        data: [u8; 8],
-    },
+    Ping { ack: bool, data: [u8; 8] },
     /// GOAWAY フレーム
     GoAway {
         last_stream_id: u32,
@@ -218,10 +212,7 @@ pub enum Frame {
         debug_data: Vec<u8>,
     },
     /// WINDOW_UPDATE フレーム
-    WindowUpdate {
-        stream_id: u32,
-        increment: u32,
-    },
+    WindowUpdate { stream_id: u32, increment: u32 },
     /// CONTINUATION フレーム
     Continuation {
         stream_id: u32,

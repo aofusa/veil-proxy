@@ -38,16 +38,15 @@ pub fn is_grpc_content_type(content_type: &[u8]) -> bool {
 /// Looks for `content-type: application/grpc*`
 pub fn is_grpc_request(headers: &[(impl AsRef<[u8]>, impl AsRef<[u8]>)]) -> bool {
     headers.iter().any(|(name, value)| {
-        name.as_ref().eq_ignore_ascii_case(b"content-type")
-            && is_grpc_content_type(value.as_ref())
+        name.as_ref().eq_ignore_ascii_case(b"content-type") && is_grpc_content_type(value.as_ref())
     })
 }
 
 /// Check if httparse headers indicate a gRPC request
 pub fn is_grpc_request_httparse(headers: &[httparse::Header]) -> bool {
-    headers.iter().any(|h| {
-        h.name.eq_ignore_ascii_case("content-type") && is_grpc_content_type(h.value)
-    })
+    headers
+        .iter()
+        .any(|h| h.name.eq_ignore_ascii_case("content-type") && is_grpc_content_type(h.value))
 }
 
 /// Parse grpc-timeout header value
@@ -241,9 +240,7 @@ impl GrpcHeaders {
 
     /// Build gRPC request headers for proxying
     pub fn to_request_headers(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let mut headers = vec![
-            (b"content-type".to_vec(), GRPC_CONTENT_TYPE_PROTO.to_vec()),
-        ];
+        let mut headers = vec![(b"content-type".to_vec(), GRPC_CONTENT_TYPE_PROTO.to_vec())];
 
         if let Some(timeout) = self.timeout {
             headers.push((
@@ -253,10 +250,7 @@ impl GrpcHeaders {
         }
 
         if self.encoding.is_compressed() {
-            headers.push((
-                b"grpc-encoding".to_vec(),
-                self.encoding.as_bytes().to_vec(),
-            ));
+            headers.push((b"grpc-encoding".to_vec(), self.encoding.as_bytes().to_vec()));
         }
 
         if !self.accept_encoding.is_empty() {
@@ -292,11 +286,20 @@ mod tests {
     #[test]
     fn test_parse_grpc_timeout() {
         assert_eq!(parse_grpc_timeout(b"10S"), Some(Duration::from_secs(10)));
-        assert_eq!(parse_grpc_timeout(b"100m"), Some(Duration::from_millis(100)));
+        assert_eq!(
+            parse_grpc_timeout(b"100m"),
+            Some(Duration::from_millis(100))
+        );
         assert_eq!(parse_grpc_timeout(b"1H"), Some(Duration::from_secs(3600)));
         assert_eq!(parse_grpc_timeout(b"5M"), Some(Duration::from_secs(300)));
-        assert_eq!(parse_grpc_timeout(b"1000u"), Some(Duration::from_micros(1000)));
-        assert_eq!(parse_grpc_timeout(b"1000000n"), Some(Duration::from_nanos(1_000_000)));
+        assert_eq!(
+            parse_grpc_timeout(b"1000u"),
+            Some(Duration::from_micros(1000))
+        );
+        assert_eq!(
+            parse_grpc_timeout(b"1000000n"),
+            Some(Duration::from_nanos(1_000_000))
+        );
 
         assert_eq!(parse_grpc_timeout(b""), None);
         assert_eq!(parse_grpc_timeout(b"10X"), None);
@@ -336,10 +339,16 @@ mod tests {
 
     #[test]
     fn test_grpc_encoding() {
-        assert_eq!(GrpcEncoding::from_bytes(b"identity"), Some(GrpcEncoding::Identity));
+        assert_eq!(
+            GrpcEncoding::from_bytes(b"identity"),
+            Some(GrpcEncoding::Identity)
+        );
         assert_eq!(GrpcEncoding::from_bytes(b"gzip"), Some(GrpcEncoding::Gzip));
         assert_eq!(GrpcEncoding::from_bytes(b"GZIP"), Some(GrpcEncoding::Gzip)); // Case insensitive
-        assert_eq!(GrpcEncoding::from_bytes(b"deflate"), Some(GrpcEncoding::Deflate));
+        assert_eq!(
+            GrpcEncoding::from_bytes(b"deflate"),
+            Some(GrpcEncoding::Deflate)
+        );
         assert_eq!(GrpcEncoding::from_bytes(b"unknown"), None);
 
         assert!(!GrpcEncoding::Identity.is_compressed());
@@ -348,14 +357,12 @@ mod tests {
 
     #[test]
     fn test_is_grpc_request() {
-        let grpc_headers: Vec<(Vec<u8>, Vec<u8>)> = vec![
-            (b"content-type".to_vec(), b"application/grpc".to_vec()),
-        ];
+        let grpc_headers: Vec<(Vec<u8>, Vec<u8>)> =
+            vec![(b"content-type".to_vec(), b"application/grpc".to_vec())];
         assert!(is_grpc_request(&grpc_headers));
 
-        let http_headers: Vec<(Vec<u8>, Vec<u8>)> = vec![
-            (b"content-type".to_vec(), b"application/json".to_vec()),
-        ];
+        let http_headers: Vec<(Vec<u8>, Vec<u8>)> =
+            vec![(b"content-type".to_vec(), b"application/json".to_vec())];
         assert!(!is_grpc_request(&http_headers));
     }
 }

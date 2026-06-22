@@ -8,7 +8,7 @@
 //! - `h2`: HTTP/2 over TLS (RFC 7540)
 //! - `http/1.1`: HTTP/1.1 over TLS (フォールバック)
 
-use rustls::{ServerConfig, ClientConfig};
+use rustls::{ClientConfig, ServerConfig};
 
 /// サポートする HTTP プロトコル
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,14 +31,12 @@ impl std::fmt::Display for HttpProtocol {
 /// ALPN プロトコルリスト
 /// HTTP/2 を優先し、HTTP/1.1 にフォールバック
 pub const ALPN_H2_HTTP11: &[&[u8]] = &[
-    b"h2",        // HTTP/2
-    b"http/1.1",  // HTTP/1.1 フォールバック
+    b"h2",       // HTTP/2
+    b"http/1.1", // HTTP/1.1 フォールバック
 ];
 
 /// HTTP/2 のみの ALPN リスト
-pub const ALPN_H2_ONLY: &[&[u8]] = &[
-    b"h2",
-];
+pub const ALPN_H2_ONLY: &[&[u8]] = &[b"h2"];
 
 /// rustls ServerConfig に HTTP/2 対応の ALPN を設定
 ///
@@ -56,11 +54,9 @@ pub fn configure_alpn_h2(mut config: ServerConfig, http2_only: bool) -> ServerCo
     } else {
         ALPN_H2_HTTP11
     };
-    
-    config.alpn_protocols = protocols.iter()
-        .map(|p| p.to_vec())
-        .collect();
-    
+
+    config.alpn_protocols = protocols.iter().map(|p| p.to_vec()).collect();
+
     config
 }
 
@@ -71,11 +67,9 @@ pub fn configure_alpn_h2_client(mut config: ClientConfig, http2_only: bool) -> C
     } else {
         ALPN_H2_HTTP11
     };
-    
-    config.alpn_protocols = protocols.iter()
-        .map(|p| p.to_vec())
-        .collect();
-    
+
+    config.alpn_protocols = protocols.iter().map(|p| p.to_vec()).collect();
+
     config
 }
 
@@ -126,7 +120,7 @@ mod tests {
         assert_eq!(ALPN_H2_HTTP11.len(), 2);
         assert_eq!(ALPN_H2_HTTP11[0], b"h2");
         assert_eq!(ALPN_H2_HTTP11[1], b"http/1.1");
-        
+
         assert_eq!(ALPN_H2_ONLY.len(), 1);
         assert_eq!(ALPN_H2_ONLY[0], b"h2");
     }

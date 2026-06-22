@@ -281,8 +281,15 @@ impl HttpContext {
 
     /// Register a pending gRPC call
     #[cfg(feature = "grpc")]
-    pub fn register_grpc_call(&mut self, call_id: u32, path: String, message: Vec<u8>, timeout_ms: u32) {
-        self.pending_grpc_calls.insert(call_id, (path, message, timeout_ms));
+    pub fn register_grpc_call(
+        &mut self,
+        call_id: u32,
+        path: String,
+        message: Vec<u8>,
+        timeout_ms: u32,
+    ) {
+        self.pending_grpc_calls
+            .insert(call_id, (path, message, timeout_ms));
     }
 
     /// Cancel a gRPC call

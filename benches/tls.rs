@@ -14,13 +14,13 @@
 //! 注意: 実際のkTLSベンチマークには、kTLS有効/無効の両方のビルドが必要です。
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use std::io::{Read, Write, ErrorKind};
+use rustls::crypto::CryptoProvider;
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ClientConnection};
+use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use rustls::{ClientConfig, ClientConnection};
-use rustls::crypto::CryptoProvider;
-use rustls::pki_types::ServerName;
 
 const PROXY_PORT: u16 = 8443;
 
@@ -36,30 +36,36 @@ fn init_crypto_provider() {
 /// プロキシサーバーが起動しているか確認（HTTPS、TLSハンドシェイクを正しく行う）
 fn is_proxy_running() -> bool {
     init_crypto_provider();
-    
+
     let mut stream = match TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)) {
         Ok(s) => s,
         Err(_) => return false,
     };
-    
-    if stream.set_read_timeout(Some(Duration::from_secs(2))).is_err() {
+
+    if stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .is_err()
+    {
         return false;
     }
-    if stream.set_write_timeout(Some(Duration::from_secs(2))).is_err() {
+    if stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .is_err()
+    {
         return false;
     }
-    
+
     let config = create_tls_config();
     let server_name = match ServerName::try_from("localhost".to_string()) {
         Ok(name) => name,
         Err(_) => return false,
     };
-    
+
     let mut tls_conn = match ClientConnection::new(config, server_name) {
         Ok(conn) => conn,
         Err(_) => return false,
     };
-    
+
     // TLSハンドシェイクを開始（完了まで待たない）
     use std::io::ErrorKind;
     let mut handshake_started = false;
@@ -67,7 +73,7 @@ fn is_proxy_running() -> bool {
         if !tls_conn.is_handshaking() {
             return true;
         }
-        
+
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {
                 handshake_started = true;
@@ -82,7 +88,7 @@ fn is_proxy_running() -> bool {
             Err(_) => return false,
         }
     }
-    
+
     // ハンドシェイクが開始されていればサーバーは起動していると判断
     handshake_started
 }
@@ -135,28 +141,28 @@ fn create_tls_config() -> Arc<ClientConfig> {
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
         .with_no_client_auth();
-    
+
     Arc::new(config)
 }
 
 /// TLS接続でのリクエスト送信
 fn send_tls_request(port: u16, path: &str) -> Result<usize, Box<dyn std::error::Error>> {
     init_crypto_provider();
-    
+
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    
+
     let config = create_tls_config();
-    
+
     // SNI名を決定
     let server_name = ServerName::try_from("localhost".to_string())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    
+
     // TLS接続を確立
     let mut tls_conn = ClientConnection::new(config, server_name)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    
+
     // ハンドシェイクを実行（同期）
     while tls_conn.is_handshaking() {
         match tls_conn.complete_io(&mut stream) {
@@ -169,13 +175,16 @@ fn send_tls_request(port: u16, path: &str) -> Result<usize, Box<dyn std::error::
             Err(e) => return Err(Box::new(e)),
         }
     }
-    
+
     // rustls::Streamを使用して読み書き
     let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
-    
-    let request = format!("GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", path);
+
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        path
+    );
     tls_stream.write_all(request.as_bytes())?;
-    
+
     let mut response = Vec::new();
     // TLS close_notify なしでの接続終了を許容
     // HTTP/1.1 では Content-Length やチャンク転送で完全性を保証するため、
@@ -187,7 +196,7 @@ fn send_tls_request(port: u16, path: &str) -> Result<usize, Box<dyn std::error::
         }
         Err(e) => return Err(Box::new(e)),
     }
-    
+
     Ok(response.len())
 }
 
@@ -197,10 +206,10 @@ fn benchmark_tls_handshake_latency(c: &mut Criterion) {
         eprintln!("Proxy server not running, skipping TLS benchmarks");
         return;
     }
-    
+
     let mut group = c.benchmark_group("tls_handshake_latency");
     group.measurement_time(Duration::from_secs(10));
-    
+
     group.bench_function("handshake", |b| {
         init_crypto_provider();
         b.iter(|| {
@@ -209,7 +218,7 @@ fn benchmark_tls_handshake_latency(c: &mut Criterion) {
             let config = create_tls_config();
             let server_name = ServerName::try_from("localhost".to_string()).unwrap();
             let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
-            
+
             // ハンドシェイクを完了
             while tls_conn.is_handshaking() {
                 if let Err(e) = tls_conn.complete_io(&mut stream) {
@@ -219,11 +228,11 @@ fn benchmark_tls_handshake_latency(c: &mut Criterion) {
                     std::thread::sleep(Duration::from_millis(10));
                 }
             }
-            
+
             start.elapsed()
         });
     });
-    
+
     group.finish();
 }
 
@@ -233,17 +242,17 @@ fn benchmark_tls_throughput(c: &mut Criterion) {
         eprintln!("Proxy server not running, skipping TLS throughput benchmarks");
         return;
     }
-    
+
     let mut group = c.benchmark_group("tls_throughput");
     group.measurement_time(Duration::from_secs(10));
-    
+
     // TLS接続でのリクエスト
     group.bench_function("tls_request", |b| {
         b.iter(|| {
             let _ = send_tls_request(PROXY_PORT, "/");
         });
     });
-    
+
     // 複数リクエスト（接続再利用なし）
     group.bench_function("tls_multiple_requests", |b| {
         b.iter(|| {
@@ -252,7 +261,7 @@ fn benchmark_tls_throughput(c: &mut Criterion) {
             }
         });
     });
-    
+
     group.finish();
 }
 
@@ -262,10 +271,10 @@ fn benchmark_tls_latency(c: &mut Criterion) {
         eprintln!("Proxy server not running, skipping TLS latency benchmarks");
         return;
     }
-    
+
     let mut group = c.benchmark_group("tls_latency");
     group.measurement_time(Duration::from_secs(10));
-    
+
     group.bench_function("tls_request_latency", |b| {
         b.iter(|| {
             let start = Instant::now();
@@ -273,7 +282,7 @@ fn benchmark_tls_latency(c: &mut Criterion) {
             start.elapsed()
         });
     });
-    
+
     group.finish();
 }
 
@@ -284,17 +293,17 @@ fn benchmark_ktls_simulation(c: &mut Criterion) {
         eprintln!("Proxy server not running, skipping kTLS simulation benchmarks");
         return;
     }
-    
+
     let mut group = c.benchmark_group("ktls_simulation");
     group.measurement_time(Duration::from_secs(10));
-    
+
     // 通常のTLS（rustls使用、kTLS無効と想定）
     group.bench_function("rustls_only", |b| {
         b.iter(|| {
             let _ = send_tls_request(PROXY_PORT, "/");
         });
     });
-    
+
     // 注意: 実際のkTLSベンチマークには、kTLS有効ビルドでの実行が必要
     // ここでは同じ測定を実行（実際の比較には別ビルドが必要）
     group.bench_function("ktls_enabled", |b| {
@@ -302,7 +311,7 @@ fn benchmark_ktls_simulation(c: &mut Criterion) {
             let _ = send_tls_request(PROXY_PORT, "/");
         });
     });
-    
+
     group.finish();
 }
 
@@ -314,4 +323,3 @@ criterion_group!(
     benchmark_ktls_simulation,
 );
 criterion_main!(benches);
-

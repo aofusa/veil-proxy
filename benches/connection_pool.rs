@@ -10,14 +10,14 @@
 //!   2. ベンチマーク実行: cargo bench --bench connection_pool
 //!   3. 環境停止: ./tests/e2e_setup.sh stop
 
-use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
-use std::io::{Read, Write, ErrorKind};
-use std::net::TcpStream;
-use std::time::{Duration, Instant};
-use std::sync::Arc;
-use rustls::{ClientConfig, ClientConnection};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ClientConnection};
+use std::io::{ErrorKind, Read, Write};
+use std::net::TcpStream;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const PROXY_PORT: u16 = 8443;
 
@@ -75,49 +75,55 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
 /// TLSクライアント設定を作成（自己署名証明書を許可）
 fn create_tls_config() -> Arc<ClientConfig> {
     init_crypto_provider();
-    
+
     let config = ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
         .with_no_client_auth();
-    
+
     Arc::new(config)
 }
 
 /// プロキシサーバーが起動しているか確認（HTTPS、TLSハンドシェイクを正しく行う）
 fn is_proxy_running() -> bool {
     init_crypto_provider();
-    
+
     let mut stream = match TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)) {
         Ok(s) => s,
         Err(_) => return false,
     };
-    
-    if stream.set_read_timeout(Some(Duration::from_secs(2))).is_err() {
+
+    if stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .is_err()
+    {
         return false;
     }
-    if stream.set_write_timeout(Some(Duration::from_secs(2))).is_err() {
+    if stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .is_err()
+    {
         return false;
     }
-    
+
     let config = create_tls_config();
     let server_name = match ServerName::try_from("localhost".to_string()) {
         Ok(name) => name,
         Err(_) => return false,
     };
-    
+
     let mut tls_conn = match ClientConnection::new(config, server_name) {
         Ok(conn) => conn,
         Err(_) => return false,
     };
-    
+
     // TLSハンドシェイクを開始（完了まで待たない）
     let mut handshake_started = false;
     for _ in 0..10 {
         if !tls_conn.is_handshaking() {
             return true;
         }
-        
+
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {
                 handshake_started = true;
@@ -132,7 +138,7 @@ fn is_proxy_running() -> bool {
             Err(_) => return false,
         }
     }
-    
+
     // ハンドシェイクが開始されていればサーバーは起動していると判断
     handshake_started
 }
@@ -140,20 +146,20 @@ fn is_proxy_running() -> bool {
 /// 新規接続でリクエストを送信（プール未使用、TLS経由）
 fn send_request_new_connection(port: u16, path: &str) -> Result<Duration, std::io::Error> {
     let start = Instant::now();
-    
+
     init_crypto_provider();
-    
+
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    
+
     let config = create_tls_config();
     let server_name = ServerName::try_from("localhost".to_string())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    
+
     let mut tls_conn = ClientConnection::new(config, server_name)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    
+
     // TLSハンドシェイク
     while tls_conn.is_handshaking() {
         match tls_conn.complete_io(&mut stream) {
@@ -165,36 +171,43 @@ fn send_request_new_connection(port: u16, path: &str) -> Result<Duration, std::i
             Err(e) => return Err(e),
         }
     }
-    
+
     let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
-    
-    let request = format!("GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", path);
+
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        path
+    );
     tls_stream.write_all(request.as_bytes())?;
-    
+
     let mut response = Vec::new();
     tls_stream.read_to_end(&mut response)?;
-    
+
     Ok(start.elapsed())
 }
 
 /// Keep-Alive接続でリクエストを送信（プール使用をシミュレート、TLS経由）
 /// 注: TLS接続の再利用は複雑なため、ここでは各リクエストでTLS接続を確立
-fn send_request_keep_alive(port: u16, path: &str, _stream: &mut Option<TcpStream>) -> Result<Duration, std::io::Error> {
+fn send_request_keep_alive(
+    port: u16,
+    path: &str,
+    _stream: &mut Option<TcpStream>,
+) -> Result<Duration, std::io::Error> {
     let start = Instant::now();
-    
+
     init_crypto_provider();
-    
+
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    
+
     let config = create_tls_config();
     let server_name = ServerName::try_from("localhost".to_string())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    
+
     let mut tls_conn = ClientConnection::new(config, server_name)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    
+
     // TLSハンドシェイク
     while tls_conn.is_handshaking() {
         match tls_conn.complete_io(&mut stream) {
@@ -206,15 +219,18 @@ fn send_request_keep_alive(port: u16, path: &str, _stream: &mut Option<TcpStream
             Err(e) => return Err(e),
         }
     }
-    
+
     let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
-    
-    let request = format!("GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n", path);
+
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n",
+        path
+    );
     tls_stream.write_all(request.as_bytes())?;
-    
+
     let mut response = Vec::new();
     tls_stream.read_to_end(&mut response)?;
-    
+
     Ok(start.elapsed())
 }
 
@@ -224,17 +240,17 @@ fn benchmark_pool_vs_no_pool(c: &mut Criterion) {
         eprintln!("Proxy server not running, skipping connection pool benchmarks");
         return;
     }
-    
+
     let mut group = c.benchmark_group("pool_vs_no_pool");
     group.measurement_time(Duration::from_secs(10));
-    
+
     // プールなし（毎回新規接続）
     group.bench_function("no_pool", |b| {
         b.iter(|| {
             let _ = send_request_new_connection(PROXY_PORT, "/");
         });
     });
-    
+
     // プールあり（Keep-Alive接続再利用）
     group.bench_function("with_pool", |b| {
         let mut stream: Option<TcpStream> = None;
@@ -242,7 +258,7 @@ fn benchmark_pool_vs_no_pool(c: &mut Criterion) {
             let _ = send_request_keep_alive(PROXY_PORT, "/", &mut stream);
         });
     });
-    
+
     group.finish();
 }
 
@@ -252,10 +268,10 @@ fn benchmark_pool_sequential_requests(c: &mut Criterion) {
         eprintln!("Proxy server not running, skipping sequential pool benchmarks");
         return;
     }
-    
+
     let mut group = c.benchmark_group("pool_sequential");
     group.measurement_time(Duration::from_secs(15));
-    
+
     for request_count in [5, 10, 20, 50].iter() {
         // プールなし
         group.bench_with_input(
@@ -273,7 +289,7 @@ fn benchmark_pool_sequential_requests(c: &mut Criterion) {
                 });
             },
         );
-        
+
         // プールあり
         group.bench_with_input(
             BenchmarkId::new("with_pool", request_count),
@@ -283,7 +299,8 @@ fn benchmark_pool_sequential_requests(c: &mut Criterion) {
                     let mut stream: Option<TcpStream> = None;
                     let mut total = Duration::ZERO;
                     for _ in 0..count {
-                        if let Ok(duration) = send_request_keep_alive(PROXY_PORT, "/", &mut stream) {
+                        if let Ok(duration) = send_request_keep_alive(PROXY_PORT, "/", &mut stream)
+                        {
                             total += duration;
                         }
                     }
@@ -292,7 +309,7 @@ fn benchmark_pool_sequential_requests(c: &mut Criterion) {
             },
         );
     }
-    
+
     group.finish();
 }
 
@@ -302,10 +319,10 @@ fn benchmark_pool_concurrent_requests(c: &mut Criterion) {
         eprintln!("Proxy server not running, skipping concurrent pool benchmarks");
         return;
     }
-    
+
     let mut group = c.benchmark_group("pool_concurrent");
     group.measurement_time(Duration::from_secs(10));
-    
+
     for concurrent in [1, 4, 8, 16].iter() {
         // プールなし
         group.bench_with_input(
@@ -320,14 +337,14 @@ fn benchmark_pool_concurrent_requests(c: &mut Criterion) {
                             })
                         })
                         .collect();
-                    
+
                     for handle in handles {
                         let _ = handle.join();
                     }
                 });
             },
         );
-        
+
         // プールあり（各スレッドで接続再利用）
         group.bench_with_input(
             BenchmarkId::new("with_pool", concurrent),
@@ -344,7 +361,7 @@ fn benchmark_pool_concurrent_requests(c: &mut Criterion) {
                             })
                         })
                         .collect();
-                    
+
                     for handle in handles {
                         let _ = handle.join();
                     }
@@ -352,7 +369,7 @@ fn benchmark_pool_concurrent_requests(c: &mut Criterion) {
             },
         );
     }
-    
+
     group.finish();
 }
 
@@ -363,4 +380,3 @@ criterion_group!(
     benchmark_pool_concurrent_requests,
 );
 criterion_main!(benches);
-

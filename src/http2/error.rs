@@ -183,11 +183,15 @@ impl Http2Error {
     /// ストリームがクローズされたエラーを作成
     pub fn stream_closed(stream_id: u32, error_code: u32) -> Self {
         let code = Http2ErrorCode::from_u32(error_code);
-        Self::StreamError(stream_id, code, format!("Stream closed with error code {}", error_code))
+        Self::StreamError(
+            stream_id,
+            code,
+            format!("Stream closed with error code {}", error_code),
+        )
     }
 
     /// GOAWAY を送信すべきかどうか
-    /// 
+    ///
     /// RFC 7540 Section 4.2: フレームサイズが大きすぎる場合は接続エラーとしてGOAWAYを送信すべき
     pub fn should_goaway(&self) -> bool {
         matches!(

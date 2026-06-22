@@ -15,13 +15,13 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use quiche::h3::NameValue;
 use ring::rand::SecureRandom;
-use std::io::{Read, Write, ErrorKind};
-use std::net::{TcpStream, UdpSocket, SocketAddr};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use rustls::{ClientConfig, ClientConnection};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ClientConnection};
+use std::io::{ErrorKind, Read, Write};
+use std::net::{SocketAddr, TcpStream, UdpSocket};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const PROXY_HTTPS_PORT: u16 = 8443;
 const PROXY_HTTP3_PORT: u16 = 8443; // HTTP/3 uses same port but UDP
@@ -38,37 +38,43 @@ fn init_crypto_provider() {
 /// プロキシサーバーが起動しているか確認（HTTPS、TLSハンドシェイクを正しく行う）
 fn is_proxy_running() -> bool {
     init_crypto_provider();
-    
+
     let mut stream = match TcpStream::connect(format!("127.0.0.1:{}", PROXY_HTTPS_PORT)) {
         Ok(s) => s,
         Err(_) => return false,
     };
-    
-    if stream.set_read_timeout(Some(Duration::from_secs(2))).is_err() {
+
+    if stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .is_err()
+    {
         return false;
     }
-    if stream.set_write_timeout(Some(Duration::from_secs(2))).is_err() {
+    if stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .is_err()
+    {
         return false;
     }
-    
+
     let config = create_http2_tls_config();
     let server_name = match ServerName::try_from("localhost".to_string()) {
         Ok(name) => name,
         Err(_) => return false,
     };
-    
+
     let mut tls_conn = match ClientConnection::new(config, server_name) {
         Ok(conn) => conn,
         Err(_) => return false,
     };
-    
+
     // TLSハンドシェイクを開始（完了まで待たない）
     let mut handshake_started = false;
     for _ in 0..10 {
         if !tls_conn.is_handshaking() {
             return true;
         }
-        
+
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {
                 handshake_started = true;
@@ -83,7 +89,7 @@ fn is_proxy_running() -> bool {
             Err(_) => return false,
         }
     }
-    
+
     // ハンドシェイクが開始されていればサーバーは起動していると判断
     handshake_started
 }
@@ -136,27 +142,27 @@ fn create_http2_tls_config() -> Arc<ClientConfig> {
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
         .with_no_client_auth();
-    
+
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    
+
     Arc::new(config)
 }
 
 /// TLS経由でHTTP/2リクエストを送信（比較用）
 fn send_tls_http2_request(port: u16, path: &str) -> Result<usize, Box<dyn std::error::Error>> {
     init_crypto_provider();
-    
+
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    
+
     let config = create_http2_tls_config();
     let server_name = ServerName::try_from("localhost".to_string())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    
+
     let mut tls_conn = ClientConnection::new(config, server_name)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    
+
     while tls_conn.is_handshaking() {
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {}
@@ -167,34 +173,34 @@ fn send_tls_http2_request(port: u16, path: &str) -> Result<usize, Box<dyn std::e
             Err(e) => return Err(Box::new(e)),
         }
     }
-    
+
     let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
-    
+
     let request = format!(
         "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         path
     );
     tls_stream.write_all(request.as_bytes())?;
-    
+
     let mut response = Vec::new();
     tls_stream.read_to_end(&mut response)?;
-    
+
     Ok(response.len())
 }
 
 /// QUIC/HTTP/3リクエストを送信
-/// 
+///
 /// quicheクレートを使用した実際のQUIC/HTTP/3接続
 fn send_http3_request(port: u16, _path: &str) -> Result<usize, Box<dyn std::error::Error>> {
     // QUIC設定を作成
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
-    
+
     // HTTP/3 ALPN
     config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
-    
+
     // 証明書検証を無効化（テスト用）
     config.verify_peer(false);
-    
+
     // 接続パラメータ
     config.set_max_idle_timeout(5000);
     config.set_max_recv_udp_payload_size(1350);
@@ -204,23 +210,28 @@ fn send_http3_request(port: u16, _path: &str) -> Result<usize, Box<dyn std::erro
     config.set_initial_max_stream_data_bidi_remote(1_000_000);
     config.set_initial_max_streams_bidi(100);
     config.set_disable_active_migration(true);
-    
+
     // ローカルアドレスをバインド
     let local_addr: SocketAddr = "0.0.0.0:0".parse()?;
     let socket = UdpSocket::bind(local_addr)?;
     socket.set_read_timeout(Some(Duration::from_millis(500)))?;
     socket.set_write_timeout(Some(Duration::from_secs(5)))?;
-    
+
     let peer_addr: SocketAddr = format!("127.0.0.1:{}", port).parse()?;
     socket.connect(&peer_addr)?;
-    
+
     // 接続IDを生成
     let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
     ring::rand::SystemRandom::new()
         .fill(&mut scid)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Failed to generate connection ID"))?;
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Failed to generate connection ID",
+            )
+        })?;
     let scid = quiche::ConnectionId::from_ref(&scid);
-    
+
     // QUIC接続を開始
     let mut conn = quiche::connect(
         Some("localhost"),
@@ -229,23 +240,23 @@ fn send_http3_request(port: u16, _path: &str) -> Result<usize, Box<dyn std::erro
         peer_addr,
         &mut config,
     )?;
-    
+
     let mut buf = [0u8; 65535];
     let mut out = [0u8; 1350];
-    
+
     // 初期パケットを送信
     let (write, _) = conn.send(&mut out)?;
     socket.send(&out[..write])?;
-    
+
     // ハンドシェイクループ
     let start = Instant::now();
     let timeout = Duration::from_secs(5);
-    
+
     while !conn.is_established() {
         if start.elapsed() > timeout {
             return Err("QUIC handshake timeout".into());
         }
-        
+
         // パケット受信
         match socket.recv(&mut buf) {
             Ok(len) => {
@@ -259,17 +270,17 @@ fn send_http3_request(port: u16, _path: &str) -> Result<usize, Box<dyn std::erro
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
             Err(e) => return Err(Box::new(e)),
         }
-        
+
         // パケット送信
         while let Ok((write, _)) = conn.send(&mut out) {
             socket.send(&out[..write])?;
         }
     }
-    
+
     // HTTP/3接続を確立
     let h3_config = quiche::h3::Config::new()?;
     let mut h3_conn = quiche::h3::Connection::with_transport(&mut conn, &h3_config)?;
-    
+
     // HTTP/3リクエストを送信
     let headers = vec![
         quiche::h3::Header::new(b":method", b"GET"),
@@ -277,18 +288,18 @@ fn send_http3_request(port: u16, _path: &str) -> Result<usize, Box<dyn std::erro
         quiche::h3::Header::new(b":authority", b"localhost"),
         quiche::h3::Header::new(b":scheme", b"https"),
     ];
-    
+
     let stream_id = h3_conn.send_request(&mut conn, &headers, true)?;
-    
+
     // パケット送信
     while let Ok((write, _)) = conn.send(&mut out) {
         socket.send(&out[..write])?;
     }
-    
+
     // レスポンス受信
     let mut response_size = 0;
     let start = Instant::now();
-    
+
     while start.elapsed() < timeout {
         // パケット受信
         match socket.recv(&mut buf) {
@@ -308,7 +319,7 @@ fn send_http3_request(port: u16, _path: &str) -> Result<usize, Box<dyn std::erro
             }
             Err(e) => return Err(Box::new(e)),
         }
-        
+
         // HTTP/3イベントを処理
         loop {
             match h3_conn.poll(&mut conn) {
@@ -333,17 +344,17 @@ fn send_http3_request(port: u16, _path: &str) -> Result<usize, Box<dyn std::erro
                 Err(e) => return Err(Box::new(e)),
             }
         }
-        
+
         // パケット送信
         while let Ok((write, _)) = conn.send(&mut out) {
             socket.send(&out[..write])?;
         }
-        
+
         if conn.is_closed() {
             break;
         }
     }
-    
+
     Ok(response_size)
 }
 
@@ -353,25 +364,25 @@ fn benchmark_http2_vs_http3(c: &mut Criterion) {
         eprintln!("Proxy server not running, skipping HTTP/3 benchmarks");
         return;
     }
-    
+
     init_crypto_provider();
-    
+
     let mut group = c.benchmark_group("http2_vs_http3");
-    
+
     // HTTP/2（TLS + TCP経由）
     group.bench_function("http2_tls_tcp", |b| {
         b.iter(|| {
             let _ = send_tls_http2_request(PROXY_HTTPS_PORT, "/");
         });
     });
-    
+
     // HTTP/3（QUIC/UDP経由）
     group.bench_function("http3_quic_udp", |b| {
         b.iter(|| {
             let _ = send_http3_request(PROXY_HTTP3_PORT, "/");
         });
     });
-    
+
     group.finish();
 }
 
@@ -381,10 +392,10 @@ fn benchmark_http3_connection_latency(c: &mut Criterion) {
         eprintln!("Proxy server not running, skipping HTTP/3 connection benchmarks");
         return;
     }
-    
+
     let mut group = c.benchmark_group("http3_connection");
     group.measurement_time(Duration::from_secs(10));
-    
+
     // 新規接続（フル・ハンドシェイク）
     group.bench_function("new_connection", |b| {
         b.iter(|| {
@@ -393,7 +404,7 @@ fn benchmark_http3_connection_latency(c: &mut Criterion) {
             start.elapsed()
         });
     });
-    
+
     group.finish();
 }
 
@@ -403,10 +414,10 @@ fn benchmark_http3_throughput(c: &mut Criterion) {
         eprintln!("Proxy server not running, skipping HTTP/3 throughput benchmarks");
         return;
     }
-    
+
     let mut group = c.benchmark_group("http3_throughput");
     group.measurement_time(Duration::from_secs(10));
-    
+
     group.bench_function("http3_requests", |b| {
         b.iter(|| {
             for _ in 0..5 {
@@ -414,7 +425,7 @@ fn benchmark_http3_throughput(c: &mut Criterion) {
             }
         });
     });
-    
+
     group.finish();
 }
 

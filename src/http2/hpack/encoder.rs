@@ -2,9 +2,9 @@
 //!
 //! HTTP ヘッダーを HPACK 形式でエンコードします。
 
-use super::{HpackResult, encode_integer};
-use super::table::{StaticTable, DynamicTable};
 use super::huffman::{huffman_encode, huffman_encoded_len};
+use super::table::{DynamicTable, StaticTable};
+use super::{encode_integer, HpackResult};
 
 /// HPACK エンコーダ
 pub struct HpackEncoder {
@@ -251,7 +251,7 @@ mod tests {
     fn test_encode_indexed() {
         let encoder = HpackEncoder::new(4096);
         let mut buf = Vec::new();
-        
+
         // :method GET (index 2)
         encoder.encode_indexed(&mut buf, 2);
         assert_eq!(buf, vec![0x82]);
@@ -268,7 +268,7 @@ mod tests {
         ];
 
         let encoded = encoder.encode(&headers).unwrap();
-        
+
         // :method GET と :path / は静的テーブルにあるのでインデックス参照
         assert_eq!(encoded[0] & 0x80, 0x80); // Indexed
         assert_eq!(encoded[1] & 0x80, 0x80); // Indexed
@@ -279,12 +279,14 @@ mod tests {
         let mut encoder = HpackEncoder::new(4096);
         encoder.set_huffman(false);
 
-        let headers = [
-            (b"custom-header".as_slice(), b"custom-value".as_slice(), false),
-        ];
+        let headers = [(
+            b"custom-header".as_slice(),
+            b"custom-value".as_slice(),
+            false,
+        )];
 
         let encoded = encoder.encode(&headers).unwrap();
-        
+
         // Literal with Incremental Indexing
         assert_eq!(encoded[0] & 0xC0, 0x40);
     }
@@ -294,12 +296,10 @@ mod tests {
         let mut encoder = HpackEncoder::new(4096);
         encoder.set_huffman(false);
 
-        let headers = [
-            (b"authorization".as_slice(), b"secret".as_slice(), true),
-        ];
+        let headers = [(b"authorization".as_slice(), b"secret".as_slice(), true)];
 
         let encoded = encoder.encode(&headers).unwrap();
-        
+
         // Never Indexed (静的テーブルに authorization があるのでインデックス使用)
         assert_eq!(encoded[0] & 0xF0, 0x10);
     }

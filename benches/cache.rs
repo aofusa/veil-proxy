@@ -10,14 +10,14 @@
 //!   2. ベンチマーク実行: cargo bench --bench cache
 //!   3. 環境停止: ./tests/e2e_setup.sh stop
 
-use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
-use std::io::{Read, Write, ErrorKind};
-use std::net::TcpStream;
-use std::time::Duration;
-use std::sync::Arc;
-use rustls::{ClientConfig, ClientConnection};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ClientConnection};
+use std::io::{ErrorKind, Read, Write};
+use std::net::TcpStream;
+use std::sync::Arc;
+use std::time::Duration;
 
 const PROXY_PORT: u16 = 8443;
 
@@ -75,49 +75,55 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
 /// TLSクライアント設定を作成（自己署名証明書を許可）
 fn create_tls_config() -> Arc<ClientConfig> {
     init_crypto_provider();
-    
+
     let config = ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
         .with_no_client_auth();
-    
+
     Arc::new(config)
 }
 
 /// プロキシサーバーが起動しているか確認（HTTPS、TLSハンドシェイクを正しく行う）
 fn is_proxy_running() -> bool {
     init_crypto_provider();
-    
+
     let mut stream = match TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)) {
         Ok(s) => s,
         Err(_) => return false,
     };
-    
-    if stream.set_read_timeout(Some(Duration::from_secs(2))).is_err() {
+
+    if stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .is_err()
+    {
         return false;
     }
-    if stream.set_write_timeout(Some(Duration::from_secs(2))).is_err() {
+    if stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .is_err()
+    {
         return false;
     }
-    
+
     let config = create_tls_config();
     let server_name = match ServerName::try_from("localhost".to_string()) {
         Ok(name) => name,
         Err(_) => return false,
     };
-    
+
     let mut tls_conn = match ClientConnection::new(config, server_name) {
         Ok(conn) => conn,
         Err(_) => return false,
     };
-    
+
     // TLSハンドシェイクを開始（完了まで待たない）
     let mut handshake_started = false;
     for _ in 0..10 {
         if !tls_conn.is_handshaking() {
             return true;
         }
-        
+
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {
                 handshake_started = true;
@@ -132,26 +138,30 @@ fn is_proxy_running() -> bool {
             Err(_) => return false,
         }
     }
-    
+
     // ハンドシェイクが開始されていればサーバーは起動していると判断
     handshake_started
 }
 
 /// リクエストを送信してレスポンスを取得（TLS経由）
-fn send_request(port: u16, path: &str, headers: &[(&str, &str)]) -> Result<Vec<u8>, std::io::Error> {
+fn send_request(
+    port: u16,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> Result<Vec<u8>, std::io::Error> {
     init_crypto_provider();
-    
+
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    
+
     let config = create_tls_config();
     let server_name = ServerName::try_from("localhost".to_string())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    
+
     let mut tls_conn = ClientConnection::new(config, server_name)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    
+
     // TLSハンドシェイク
     while tls_conn.is_handshaking() {
         match tls_conn.complete_io(&mut stream) {
@@ -163,17 +173,17 @@ fn send_request(port: u16, path: &str, headers: &[(&str, &str)]) -> Result<Vec<u
             Err(e) => return Err(e),
         }
     }
-    
+
     let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
-    
+
     let mut request = format!("GET {} HTTP/1.1\r\nHost: localhost\r\n", path);
     for (name, value) in headers {
         request.push_str(&format!("{}: {}\r\n", name, value));
     }
     request.push_str("Connection: close\r\n\r\n");
-    
+
     tls_stream.write_all(request.as_bytes())?;
-    
+
     let mut response = Vec::new();
     // TLS close_notify なしでの接続終了を許容
     // HTTP/1.1 では Content-Length やチャンク転送で完全性を保証するため、
@@ -186,7 +196,7 @@ fn send_request(port: u16, path: &str, headers: &[(&str, &str)]) -> Result<Vec<u
         }
         Err(e) => return Err(e),
     }
-    
+
     Ok(response)
 }
 
@@ -196,16 +206,16 @@ fn benchmark_no_cache(c: &mut Criterion) {
         eprintln!("Proxy server not running, skipping cache benchmarks");
         return;
     }
-    
+
     let mut group = c.benchmark_group("cache_no_cache");
     group.measurement_time(Duration::from_secs(10));
-    
+
     group.bench_function("uncached_request", |b| {
         b.iter(|| {
             let _ = send_request(PROXY_PORT, "/", &[]);
         });
     });
-    
+
     group.finish();
 }
 
@@ -215,27 +225,27 @@ fn benchmark_cache_hit(c: &mut Criterion) {
         eprintln!("Proxy server not running, skipping cache hit benchmarks");
         return;
     }
-    
+
     let mut group = c.benchmark_group("cache_hit");
     group.measurement_time(Duration::from_secs(10));
-    
+
     // 最初のリクエスト（キャッシュミス）
     group.bench_function("first_request", |b| {
         b.iter(|| {
             let _ = send_request(PROXY_PORT, "/", &[]);
         });
     });
-    
+
     // 2回目以降のリクエスト（キャッシュヒット想定）
     group.bench_function("cached_request", |b| {
         // 事前に1回リクエストしてキャッシュを準備
         let _ = send_request(PROXY_PORT, "/", &[]);
-        
+
         b.iter(|| {
             let _ = send_request(PROXY_PORT, "/", &[]);
         });
     });
-    
+
     group.finish();
 }
 
@@ -245,30 +255,30 @@ fn benchmark_etag_304(c: &mut Criterion) {
         eprintln!("Proxy server not running, skipping ETag benchmarks");
         return;
     }
-    
+
     let mut group = c.benchmark_group("cache_etag");
     group.measurement_time(Duration::from_secs(10));
-    
+
     // 最初のリクエスト（ETag取得）
     group.bench_function("first_request_with_etag", |b| {
         b.iter(|| {
             let _ = send_request(PROXY_PORT, "/", &[]);
         });
     });
-    
+
     // If-None-Match付きリクエスト（304レスポンス想定）
     group.bench_function("conditional_request", |b| {
         // 事前にETagを取得
         let response = send_request(PROXY_PORT, "/", &[]).unwrap();
         let etag = extract_etag(&response);
-        
+
         b.iter(|| {
             if let Some(etag) = &etag {
                 let _ = send_request(PROXY_PORT, "/", &[("If-None-Match", etag)]);
             }
         });
     });
-    
+
     group.finish();
 }
 
@@ -289,23 +299,23 @@ fn benchmark_cache_size(c: &mut Criterion) {
         eprintln!("Proxy server not running, skipping cache size benchmarks");
         return;
     }
-    
+
     let mut group = c.benchmark_group("cache_size");
-    
+
     // 小さいファイル
     group.bench_function("small_file", |b| {
         b.iter(|| {
             let _ = send_request(PROXY_PORT, "/", &[]);
         });
     });
-    
+
     // 大きいファイル
     group.bench_function("large_file", |b| {
         b.iter(|| {
             let _ = send_request(PROXY_PORT, "/large.txt", &[]);
         });
     });
-    
+
     group.finish();
 }
 
@@ -315,10 +325,10 @@ fn benchmark_cache_sequential(c: &mut Criterion) {
         eprintln!("Proxy server not running, skipping sequential cache benchmarks");
         return;
     }
-    
+
     let mut group = c.benchmark_group("cache_sequential");
     group.measurement_time(Duration::from_secs(15));
-    
+
     for request_count in [10, 50, 100].iter() {
         // キャッシュなし（毎回異なるパス）
         group.bench_with_input(
@@ -333,7 +343,7 @@ fn benchmark_cache_sequential(c: &mut Criterion) {
                 });
             },
         );
-        
+
         // キャッシュあり（同じパス）
         group.bench_with_input(
             BenchmarkId::new("with_cache", request_count),
@@ -341,7 +351,7 @@ fn benchmark_cache_sequential(c: &mut Criterion) {
             |b, &count| {
                 // 事前に1回リクエストしてキャッシュを準備
                 let _ = send_request(PROXY_PORT, "/", &[]);
-                
+
                 b.iter(|| {
                     for _ in 0..count {
                         let _ = send_request(PROXY_PORT, "/", &[]);
@@ -350,7 +360,7 @@ fn benchmark_cache_sequential(c: &mut Criterion) {
             },
         );
     }
-    
+
     group.finish();
 }
 
@@ -363,4 +373,3 @@ criterion_group!(
     benchmark_cache_sequential,
 );
 criterion_main!(benches);
-

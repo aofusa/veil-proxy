@@ -7,15 +7,15 @@
 //!   2. ベンチマーク実行: cargo bench --bench throughput
 //!   3. 環境停止: ./tests/e2e_setup.sh stop
 
-use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::time::Duration;
 use std::sync::Arc;
+use std::time::Duration;
 
-use rustls::{ClientConfig, ClientConnection};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ClientConnection};
 
 const PROXY_HTTPS_PORT: u16 = 8443;
 const BACKEND_PORT: u16 = 9001;
@@ -74,42 +74,48 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
 /// TLSクライアント設定を作成（自己署名証明書を許可）
 fn create_tls_config() -> Arc<ClientConfig> {
     init_crypto_provider();
-    
+
     let config = ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
         .with_no_client_auth();
-    
+
     Arc::new(config)
 }
 
 /// プロキシサーバーが起動しているか確認（HTTPS、TLSハンドシェイクを正しく行う）
 fn is_proxy_running() -> bool {
     init_crypto_provider();
-    
+
     let mut stream = match TcpStream::connect(format!("127.0.0.1:{}", PROXY_HTTPS_PORT)) {
         Ok(s) => s,
         Err(_) => return false,
     };
-    
-    if stream.set_read_timeout(Some(Duration::from_secs(2))).is_err() {
+
+    if stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .is_err()
+    {
         return false;
     }
-    if stream.set_write_timeout(Some(Duration::from_secs(2))).is_err() {
+    if stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .is_err()
+    {
         return false;
     }
-    
+
     let config = create_tls_config();
     let server_name = match ServerName::try_from("localhost".to_string()) {
         Ok(name) => name,
         Err(_) => return false,
     };
-    
+
     let mut tls_conn = match ClientConnection::new(config, server_name) {
         Ok(conn) => conn,
         Err(_) => return false,
     };
-    
+
     // TLSハンドシェイクを開始（完了まで待たない）
     use std::io::ErrorKind;
     let mut handshake_started = false;
@@ -117,7 +123,7 @@ fn is_proxy_running() -> bool {
         if !tls_conn.is_handshaking() {
             return true;
         }
-        
+
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {
                 handshake_started = true;
@@ -132,7 +138,7 @@ fn is_proxy_running() -> bool {
             Err(_) => return false,
         }
     }
-    
+
     // ハンドシェイクが開始されていればサーバーは起動していると判断
     handshake_started
 }
@@ -140,30 +146,36 @@ fn is_proxy_running() -> bool {
 /// バックエンドサーバーが起動しているか確認（HTTPS、TLSハンドシェイクを正しく行う）
 fn is_backend_running() -> bool {
     init_crypto_provider();
-    
+
     let mut stream = match TcpStream::connect(format!("127.0.0.1:{}", BACKEND_PORT)) {
         Ok(s) => s,
         Err(_) => return false,
     };
-    
-    if stream.set_read_timeout(Some(Duration::from_secs(2))).is_err() {
+
+    if stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .is_err()
+    {
         return false;
     }
-    if stream.set_write_timeout(Some(Duration::from_secs(2))).is_err() {
+    if stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .is_err()
+    {
         return false;
     }
-    
+
     let config = create_tls_config();
     let server_name = match ServerName::try_from("localhost".to_string()) {
         Ok(name) => name,
         Err(_) => return false,
     };
-    
+
     let mut tls_conn = match ClientConnection::new(config, server_name) {
         Ok(conn) => conn,
         Err(_) => return false,
     };
-    
+
     // TLSハンドシェイクを開始（完了まで待たない）
     use std::io::ErrorKind;
     let mut handshake_started = false;
@@ -171,7 +183,7 @@ fn is_backend_running() -> bool {
         if !tls_conn.is_handshaking() {
             return true;
         }
-        
+
         match tls_conn.complete_io(&mut stream) {
             Ok(_) => {
                 handshake_started = true;
@@ -186,7 +198,7 @@ fn is_backend_running() -> bool {
             Err(_) => return false,
         }
     }
-    
+
     // ハンドシェイクが開始されていればサーバーは起動していると判断
     handshake_started
 }
@@ -194,18 +206,18 @@ fn is_backend_running() -> bool {
 /// TLS経由でHTTPSリクエストを送信
 fn send_https_request(port: u16, path: &str) -> Result<usize, Box<dyn std::error::Error>> {
     init_crypto_provider();
-    
+
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    
+
     let config = create_tls_config();
     let server_name = ServerName::try_from("localhost".to_string())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    
+
     let mut tls_conn = ClientConnection::new(config, server_name)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    
+
     // TLSハンドシェイク
     use std::io::ErrorKind;
     while tls_conn.is_handshaking() {
@@ -218,25 +230,25 @@ fn send_https_request(port: u16, path: &str) -> Result<usize, Box<dyn std::error
             Err(e) => return Err(Box::new(e)),
         }
     }
-    
+
     let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
-    
+
     let request = format!(
         "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         path
     );
     tls_stream.write_all(request.as_bytes())?;
-    
+
     let mut response = Vec::new();
     tls_stream.read_to_end(&mut response)?;
-    
+
     Ok(response.len())
 }
 
 /// HTTPリクエストスループットベンチマーク
 fn benchmark_http_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("http_throughput");
-    
+
     // 直接バックエンドへのリクエスト（HTTPS）
     if is_backend_running() {
         group.bench_function("direct_backend", |b| {
@@ -247,7 +259,7 @@ fn benchmark_http_throughput(c: &mut Criterion) {
     } else {
         eprintln!("Backend server not running, skipping direct_backend benchmark");
     }
-    
+
     // プロキシ経由のリクエスト（HTTPS）
     if is_proxy_running() {
         group.bench_function("via_proxy", |b| {
@@ -258,7 +270,7 @@ fn benchmark_http_throughput(c: &mut Criterion) {
     } else {
         eprintln!("Proxy server not running, skipping via_proxy benchmark");
     }
-    
+
     group.finish();
 }
 
@@ -268,26 +280,24 @@ fn benchmark_response_size(c: &mut Criterion) {
         eprintln!("Proxy server not running, skipping response_size benchmarks");
         return;
     }
-    
+
     let mut group = c.benchmark_group("response_size");
-    
+
     // 各パスに対応するレスポンスサイズをテスト
     for (path, size) in [
-        ("/", 20),           // 小さいレスポンス
+        ("/", 20),             // 小さいレスポンス
         ("/large.txt", 13000), // 大きいレスポンス
-    ].iter() {
+    ]
+    .iter()
+    {
         group.throughput(Throughput::Bytes(*size as u64));
-        group.bench_with_input(
-            BenchmarkId::new("bytes", size),
-            path,
-            |b, path| {
-                b.iter(|| {
-                    let _ = send_https_request(PROXY_HTTPS_PORT, path);
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("bytes", size), path, |b, path| {
+            b.iter(|| {
+                let _ = send_https_request(PROXY_HTTPS_PORT, path);
+            });
+        });
     }
-    
+
     group.finish();
 }
 
@@ -297,10 +307,10 @@ fn benchmark_concurrent_requests(c: &mut Criterion) {
         eprintln!("Proxy server not running, skipping concurrent benchmarks");
         return;
     }
-    
+
     let mut group = c.benchmark_group("concurrent_requests");
     group.measurement_time(Duration::from_secs(10));
-    
+
     for concurrent in [1, 4, 8, 16].iter() {
         group.bench_with_input(
             BenchmarkId::new("threads", concurrent),
@@ -314,7 +324,7 @@ fn benchmark_concurrent_requests(c: &mut Criterion) {
                             })
                         })
                         .collect();
-                    
+
                     for handle in handles {
                         let _ = handle.join();
                     }
@@ -322,7 +332,7 @@ fn benchmark_concurrent_requests(c: &mut Criterion) {
             },
         );
     }
-    
+
     group.finish();
 }
 
@@ -333,4 +343,3 @@ criterion_group!(
     benchmark_concurrent_requests,
 );
 criterion_main!(benches);
-

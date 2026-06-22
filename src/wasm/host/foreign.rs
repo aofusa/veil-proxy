@@ -20,7 +20,7 @@ static FOREIGN_FUNCTIONS: Lazy<RwLock<HashMap<String, ForeignFn>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
 /// Register a foreign function
-/// 
+///
 /// Note: Currently unused, reserved for future Proxy-Wasm extensions
 #[allow(dead_code)]
 pub fn register_foreign_function(name: &str, func: ForeignFn) {
@@ -54,10 +54,11 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
          return_results_size_ptr: i32|
          -> i32 {
             // Read function name
-            let function_name = match read_string(&mut caller, function_name_ptr, function_name_size) {
-                Some(n) => n,
-                None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
-            };
+            let function_name =
+                match read_string(&mut caller, function_name_ptr, function_name_size) {
+                    Some(n) => n,
+                    None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
+                };
 
             // Read arguments
             let arguments = if arguments_size > 0 {
@@ -82,7 +83,11 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                         Ok(results) => {
                             // Write results size
                             if return_results_size_ptr > 0 {
-                                if !write_u32(&mut caller, return_results_size_ptr, results.len() as u32) {
+                                if !write_u32(
+                                    &mut caller,
+                                    return_results_size_ptr,
+                                    results.len() as u32,
+                                ) {
                                     return PROXY_RESULT_INVALID_MEMORY_ACCESS;
                                 }
                             }
@@ -96,14 +101,16 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
 
                             ftlog::debug!(
                                 "WASM: proxy_call_foreign_function '{}' called, returned {} bytes",
-                                function_name, results.len()
+                                function_name,
+                                results.len()
                             );
                             PROXY_RESULT_OK
                         }
                         Err(code) => {
                             ftlog::debug!(
                                 "WASM: proxy_call_foreign_function '{}' returned error: {}",
-                                function_name, code
+                                function_name,
+                                code
                             );
                             code
                         }

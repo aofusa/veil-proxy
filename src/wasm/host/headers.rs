@@ -249,11 +249,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     linker.func_wrap(
         "env",
         "proxy_set_header_map_pairs",
-        |mut caller: Caller<'_, HostState>,
-         map_type: i32,
-         map_ptr: i32,
-         map_size: i32|
-         -> i32 {
+        |mut caller: Caller<'_, HostState>, map_type: i32, map_ptr: i32, map_size: i32| -> i32 {
             // Check write capability
             {
                 let state = caller.data();
@@ -364,8 +360,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             }
 
             data[ptr_offset..ptr_offset + 4].copy_from_slice(&ptr.to_le_bytes());
-            data[size_offset..size_offset + 4]
-                .copy_from_slice(&(value.len() as i32).to_le_bytes());
+            data[size_offset..size_offset + 4].copy_from_slice(&(value.len() as i32).to_le_bytes());
 
             PROXY_RESULT_OK
         },
@@ -482,11 +477,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     linker.func_wrap(
         "env",
         "proxy_remove_header_map_value",
-        |mut caller: Caller<'_, HostState>,
-         map_type: i32,
-         key_ptr: i32,
-         key_size: i32|
-         -> i32 {
+        |mut caller: Caller<'_, HostState>, map_type: i32, key_ptr: i32, key_size: i32| -> i32 {
             // Check capability
             {
                 let state = caller.data();

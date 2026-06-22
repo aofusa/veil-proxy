@@ -1,7 +1,7 @@
 //! Logging Host Functions
 
+use ftlog::{debug, error, info, trace, warn};
 use wasmtime::{Caller, Linker};
-use ftlog::{trace, debug, info, warn, error};
 
 use crate::wasm::constants::*;
 use crate::wasm::context::HostState;

@@ -64,10 +64,7 @@ impl Default for GrpcWebCorsConfig {
                 "x-user-agent".to_string(),
                 "grpc-timeout".to_string(),
             ],
-            exposed_headers: vec![
-                "grpc-status".to_string(),
-                "grpc-message".to_string(),
-            ],
+            exposed_headers: vec!["grpc-status".to_string(), "grpc-message".to_string()],
             allow_credentials: false,
             max_age: Duration::from_secs(86400), // 24 hours
         }
@@ -238,7 +235,7 @@ pub fn encode_grpc_web_response(
 
     // Trailer frame
     let trailer_data = encode_trailers(trailers);
-    
+
     // Trailer frame header: 0x80 (trailer flag) + 4-byte length
     response.push(0x80);
     response.extend_from_slice(&(trailer_data.len() as u32).to_be_bytes());
@@ -405,9 +402,7 @@ mod tests {
     #[test]
     fn test_encode_grpc_web_response() {
         let body = vec![0, 0, 0, 0, 5, b'H', b'e', b'l', b'l', b'o'];
-        let trailers = vec![
-            (b"grpc-status".to_vec(), b"0".to_vec()),
-        ];
+        let trailers = vec![(b"grpc-status".to_vec(), b"0".to_vec())];
 
         let response = encode_grpc_web_response(&body, &trailers, false);
 

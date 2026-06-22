@@ -107,9 +107,11 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     )?;
 
     // proxy_done
-    linker.func_wrap("env", "proxy_done", |_caller: Caller<'_, HostState>| -> i32 {
-        PROXY_RESULT_OK
-    })?;
+    linker.func_wrap(
+        "env",
+        "proxy_done",
+        |_caller: Caller<'_, HostState>| -> i32 { PROXY_RESULT_OK },
+    )?;
 
     // proxy_set_tick_period_milliseconds
     // Sets the timer period for periodic on_tick callbacks
@@ -147,7 +149,9 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             let status_code = {
                 let state = caller.data();
                 if let Some(token) = state.http_ctx.current_http_call_token {
-                    state.http_ctx.http_call_responses
+                    state
+                        .http_ctx
+                        .http_call_responses
                         .get(&token)
                         .map(|r| r.status_code as u32)
                         .unwrap_or(0)

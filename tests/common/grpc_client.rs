@@ -5,16 +5,16 @@
 //!
 //! 既存のテストロジックとの互換性のため、HTTP/1.1経由のgRPCリクエストもサポート
 
+use super::http1_client::Http1TestClient;
+use bytes::Bytes;
+use http::uri::Uri;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::CryptoProvider;
+use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
+use std::sync::Arc;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tonic::{Request, Response, Status};
-use http::uri::Uri;
-use bytes::Bytes;
-use std::sync::Arc;
-use super::http1_client::Http1TestClient;
-use rustls::client::danger::{ServerCertVerifier, ServerCertVerified, HandshakeSignatureValid};
-use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
-use rustls::crypto::CryptoProvider;
-use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 
 /// gRPCテストクライアント
 /// tonicを使用したHTTP/2ベースのgRPCクライアント
@@ -37,7 +37,7 @@ impl GrpcFrame {
             data,
         }
     }
-    
+
     /// gRPCフレームをエンコード
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(5 + self.data.len());
@@ -49,22 +49,27 @@ impl GrpcFrame {
         buf.extend_from_slice(&self.data);
         buf
     }
-    
+
     /// gRPCフレームをデコード
     pub fn decode(data: &[u8]) -> Result<(Self, usize), Box<dyn std::error::Error>> {
         if data.len() < 5 {
             return Err("Insufficient data for gRPC frame header".into());
         }
-        
+
         let compressed = (data[0] & 1) != 0;
         let length = u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
-        
+
         if data.len() < 5 + length {
-            return Err(format!("Insufficient data: need {} bytes, have {}", 5 + length, data.len()).into());
+            return Err(format!(
+                "Insufficient data: need {} bytes, have {}",
+                5 + length,
+                data.len()
+            )
+            .into());
         }
-        
+
         let message = data[5..5 + length].to_vec();
-        
+
         Ok((
             Self {
                 compressed,
@@ -83,7 +88,7 @@ impl GrpcTestClient {
         port: u16,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let uri: Uri = format!("https://{}:{}", server_addr, port).parse()?;
-        
+
         // CryptoProviderの初期化
         static INIT: std::sync::Once = std::sync::Once::new();
         INIT.call_once(|| {
@@ -147,39 +152,37 @@ impl GrpcTestClient {
                 .domain_name(server_addr)
         } else {
             // 証明書がない場合はデフォルト（検証失敗する可能性あり）
-            ClientTlsConfig::new()
-                .domain_name(server_addr)
+            ClientTlsConfig::new().domain_name(server_addr)
         };
-        
+
         let endpoint = Endpoint::from(uri)
             .tls_config(tls_config)?
             .timeout(std::time::Duration::from_secs(30));
-        
+
         let channel = endpoint.connect().await?;
-        
+
         Ok(Self { channel })
     }
-    
+
     /// 新しいgRPCクライアントを作成（プレーンテキスト/h2c）
     pub async fn new_plaintext(
         server_addr: &str,
         port: u16,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let uri: Uri = format!("http://{}:{}", server_addr, port).parse()?;
-        
-        let endpoint = Endpoint::from(uri)
-            .timeout(std::time::Duration::from_secs(30));
-        
+
+        let endpoint = Endpoint::from(uri).timeout(std::time::Duration::from_secs(30));
+
         let channel = endpoint.connect().await?;
-        
+
         Ok(Self { channel })
     }
-    
+
     /// チャネルを取得（カスタムサービスクライアント作成用）
     pub fn channel(&self) -> Channel {
         self.channel.clone()
     }
-    
+
     /// 生のUnary gRPCリクエストを送信
     /// path: gRPCメソッドパス（例: "/package.Service/MethodName"）
     pub async fn send_unary_request(
@@ -193,24 +196,26 @@ impl GrpcTestClient {
         grpc_frame.push(0); // 圧縮なし
         grpc_frame.extend_from_slice(&(message.len() as u32).to_be_bytes());
         grpc_frame.extend_from_slice(message);
-        
+
         // HTTPリクエストを構築
         let _request_builder = http::Request::builder()
             .method("POST")
             .uri(path)
             .header("content-type", "application/grpc")
             .header("te", "trailers");
-        
+
         // 注意: tonicでは通常、生成されたクライアントコードを使用します。
         // ここでは低レベルAPIを示していますが、実際のテストでは
         // service定義からProtobufで生成したクライアントを使用することを推奨します。
-        
+
         // カスタムコーデックを使用してリクエストを送信する場合は
         // tonic::codec::Codecトレイトを実装する必要があります。
-        
-        Err(GrpcError::NotImplemented("Use generated tonic client instead".to_string()))
+
+        Err(GrpcError::NotImplemented(
+            "Use generated tonic client instead".to_string(),
+        ))
     }
-    
+
     /// HTTP/1.1経由でgRPCリクエストを送信（既存のGrpcTestClientと互換性のあるAPI）
     /// 既存のテストロジックを維持するため、HTTP/1.1経由のgRPCリクエストをサポート
     pub async fn send_grpc_request(
@@ -222,10 +227,10 @@ impl GrpcTestClient {
     ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         let frame = GrpcFrame::new(message.to_vec());
         let frame_bytes = frame.encode();
-        
+
         // HTTP/1.1クライアントを作成
         let client = Http1TestClient::new_https(server_addr, port)?;
-        
+
         // メタデータをヘッダーに変換
         let mut headers = vec![
             ("Content-Type", "application/grpc"),
@@ -235,34 +240,39 @@ impl GrpcTestClient {
         for (name, value) in metadata {
             headers.push((name, value));
         }
-        
+
         // POSTリクエストを送信
-        let (status, body) = client.post_with_headers(path, &headers, &frame_bytes).await?;
-        
+        let (status, body) = client
+            .post_with_headers(path, &headers, &frame_bytes)
+            .await?;
+
         // HTTPレスポンスを構築（既存のGrpcTestClientと互換性のため）
         let status_line = format!("HTTP/1.1 {} OK\r\n", status);
         let mut response = status_line.into_bytes();
         response.extend_from_slice(b"\r\n");
         response.extend_from_slice(&body);
-        
+
         Ok(response)
     }
-    
+
     /// レスポンスからgRPCフレームを抽出（既存のGrpcTestClientと互換性のあるAPI）
-    pub fn extract_grpc_frame(response: &[u8]) -> Result<GrpcFrame, Box<dyn std::error::Error + Send + Sync>> {
-        
+    pub fn extract_grpc_frame(
+        response: &[u8],
+    ) -> Result<GrpcFrame, Box<dyn std::error::Error + Send + Sync>> {
         // HTTPレスポンスからボディを抽出
-        let body_start = response.windows(4)
+        let body_start = response
+            .windows(4)
             .position(|w| w == b"\r\n\r\n")
-            .ok_or("No HTTP body separator found")? + 4;
-        
+            .ok_or("No HTTP body separator found")?
+            + 4;
+
         let body = &response[body_start..];
-        
+
         // gRPCフレームをデコード
         let (frame, _) = GrpcFrame::decode(body).map_err(|e| e.to_string())?;
         Ok(frame)
     }
-    
+
     /// レスポンスからステータスコードを取得（既存のGrpcTestClientと互換性のあるAPI）
     pub fn extract_status_code(response: &[u8]) -> Option<u16> {
         let response_str = std::str::from_utf8(response).ok()?;
@@ -274,7 +284,7 @@ impl GrpcTestClient {
             None
         }
     }
-    
+
     /// レスポンスからgRPCステータスを取得（既存のGrpcTestClientと互換性のあるAPI）
     pub fn extract_grpc_status(response: &[u8]) -> Option<u32> {
         let response_str = std::str::from_utf8(response).ok()?;
@@ -288,7 +298,7 @@ impl GrpcTestClient {
         }
         None
     }
-    
+
     /// レスポンスからgRPCメッセージを取得（既存のGrpcTestClientと互換性のあるAPI）
     pub fn extract_grpc_message(response: &[u8]) -> Option<String> {
         let response_str = std::str::from_utf8(response).ok()?;
@@ -304,7 +314,7 @@ impl GrpcTestClient {
         }
         None
     }
-    
+
     /// レスポンスからすべてのトレーラーヘッダーを取得（既存のGrpcTestClientと互換性のあるAPI）
     pub fn extract_trailers(response: &[u8]) -> Vec<(String, String)> {
         let mut trailers = Vec::new();
@@ -312,11 +322,11 @@ impl GrpcTestClient {
             Ok(s) => s,
             Err(_) => return trailers,
         };
-        
+
         // ヘッダーセクションとボディセクションを分離
         let header_end = response_str.find("\r\n\r\n").unwrap_or(0);
         let trailer_section = &response_str[header_end + 4..];
-        
+
         // grpc-で始まるヘッダーを探す
         for line in trailer_section.lines() {
             if line.starts_with("grpc-") {
@@ -327,7 +337,7 @@ impl GrpcTestClient {
                 }
             }
         }
-        
+
         trailers
     }
 }
@@ -336,7 +346,7 @@ impl GrpcTestClient {
 fn url_decode(encoded: &str) -> String {
     let mut result = String::new();
     let mut chars = encoded.chars().peekable();
-    
+
     while let Some(c) = chars.next() {
         if c == '%' {
             let hex: String = chars.by_ref().take(2).collect();
@@ -352,7 +362,7 @@ fn url_decode(encoded: &str) -> String {
             result.push(c);
         }
     }
-    
+
     result
 }
 
@@ -389,7 +399,7 @@ pub trait GrpcTestHelpers {
             Err(status) => panic!("gRPC request failed: {:?}", status),
         }
     }
-    
+
     /// 特定のgRPCステータスコードをアサート
     fn assert_status_code<T>(result: Result<Response<T>, Status>, expected_code: tonic::Code) {
         match result {
@@ -416,7 +426,9 @@ pub fn create_metadata(pairs: &[(&str, &str)]) -> tonic::metadata::MetadataMap {
     let mut metadata = tonic::metadata::MetadataMap::new();
     for (key, value) in pairs {
         if let Ok(key) = key.parse::<tonic::metadata::MetadataKey<tonic::metadata::Ascii>>() {
-            if let Ok(value) = value.parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>() {
+            if let Ok(value) =
+                value.parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()
+            {
                 metadata.insert(key, value);
             }
         }
@@ -441,7 +453,7 @@ pub fn with_metadata<T>(request: T, metadata: &[(&str, &str)]) -> Request<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[tokio::test]
     async fn test_grpc_client_creation() {
         // このテストは実際のサーバーなしでは失敗するが、
@@ -450,7 +462,7 @@ mod tests {
         // 接続エラーは想定内
         assert!(result.is_err() || result.is_ok());
     }
-    
+
     #[test]
     fn test_metadata_creation() {
         let metadata = create_metadata(&[("x-custom-header", "value")]);

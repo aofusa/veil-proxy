@@ -15,14 +15,14 @@ fn read_wasm_memory(caller: &mut Caller<'_, HostState>, ptr: i32, size: i32) -> 
     let memory = caller.get_export("memory")?;
     let memory = memory.into_memory()?;
     let data = memory.data(caller);
-    
+
     let start = ptr as usize;
     let end = start + size as usize;
-    
+
     if end > data.len() {
         return None;
     }
-    
+
     Some(data[start..end].to_vec())
 }
 
@@ -51,19 +51,33 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             {
                 proxy_grpc_call_impl(
                     &mut caller,
-                    upstream_ptr, upstream_size,
-                    service_ptr, service_size,
-                    method_ptr, method_size,
-                    message_ptr, message_size,
+                    upstream_ptr,
+                    upstream_size,
+                    service_ptr,
+                    service_size,
+                    method_ptr,
+                    method_size,
+                    message_ptr,
+                    message_size,
                     timeout_ms,
                     return_call_id_ptr,
                 )
             }
             #[cfg(not(feature = "grpc"))]
             {
-                let _ = (&mut caller, upstream_ptr, upstream_size, service_ptr, service_size,
-                         method_ptr, method_size, message_ptr, message_size,
-                         timeout_ms, return_call_id_ptr);
+                let _ = (
+                    &mut caller,
+                    upstream_ptr,
+                    upstream_size,
+                    service_ptr,
+                    service_size,
+                    method_ptr,
+                    method_size,
+                    message_ptr,
+                    message_size,
+                    timeout_ms,
+                    return_call_id_ptr,
+                );
                 ftlog::debug!("WASM: proxy_grpc_call called (grpc feature not enabled)");
                 PROXY_RESULT_UNIMPLEMENTED
             }
@@ -90,18 +104,31 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             {
                 proxy_grpc_stream_impl(
                     &mut caller,
-                    upstream_ptr, upstream_size,
-                    service_ptr, service_size,
-                    method_ptr, method_size,
-                    initial_metadata_ptr, initial_metadata_size,
+                    upstream_ptr,
+                    upstream_size,
+                    service_ptr,
+                    service_size,
+                    method_ptr,
+                    method_size,
+                    initial_metadata_ptr,
+                    initial_metadata_size,
                     return_stream_id_ptr,
                 )
             }
             #[cfg(not(feature = "grpc"))]
             {
-                let _ = (&mut caller, upstream_ptr, upstream_size, service_ptr, service_size,
-                         method_ptr, method_size, initial_metadata_ptr,
-                         initial_metadata_size, return_stream_id_ptr);
+                let _ = (
+                    &mut caller,
+                    upstream_ptr,
+                    upstream_size,
+                    service_ptr,
+                    service_size,
+                    method_ptr,
+                    method_size,
+                    initial_metadata_ptr,
+                    initial_metadata_size,
+                    return_stream_id_ptr,
+                );
                 ftlog::debug!("WASM: proxy_grpc_stream called (grpc feature not enabled)");
                 PROXY_RESULT_UNIMPLEMENTED
             }
@@ -159,11 +186,23 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
          -> i32 {
             #[cfg(feature = "grpc")]
             {
-                proxy_grpc_send_impl(&mut caller, stream_id, message_ptr, message_size, end_of_stream)
+                proxy_grpc_send_impl(
+                    &mut caller,
+                    stream_id,
+                    message_ptr,
+                    message_size,
+                    end_of_stream,
+                )
             }
             #[cfg(not(feature = "grpc"))]
             {
-                let _ = (&mut caller, stream_id, message_ptr, message_size, end_of_stream);
+                let _ = (
+                    &mut caller,
+                    stream_id,
+                    message_ptr,
+                    message_size,
+                    end_of_stream,
+                );
                 ftlog::debug!("WASM: proxy_grpc_send called (grpc feature not enabled)");
                 PROXY_RESULT_UNIMPLEMENTED
             }
@@ -246,7 +285,9 @@ fn proxy_grpc_call_impl(
     // Store pending gRPC call info in context for later execution
     let state = caller.data_mut();
     let call_id = state.http_ctx.next_grpc_call_id();
-    state.http_ctx.register_grpc_call(call_id, grpc_path, message, timeout_ms as u32);
+    state
+        .http_ctx
+        .register_grpc_call(call_id, grpc_path, message, timeout_ms as u32);
 
     // Write call_id to return pointer
     if return_call_id_ptr > 0 {
@@ -268,12 +309,9 @@ fn proxy_grpc_call_impl(
 }
 
 #[cfg(feature = "grpc")]
-fn proxy_grpc_cancel_impl(
-    caller: &mut Caller<'_, HostState>,
-    call_id: i32,
-) -> i32 {
+fn proxy_grpc_cancel_impl(caller: &mut Caller<'_, HostState>, call_id: i32) -> i32 {
     let state = caller.data_mut();
-    
+
     if state.http_ctx.cancel_grpc_call(call_id as u32) {
         ftlog::debug!("WASM: proxy_grpc_cancel - cancelled call_id={}", call_id);
         PROXY_RESULT_OK
@@ -342,7 +380,10 @@ fn proxy_grpc_stream_impl(
         initial_metadata,
     };
 
-    state.http_ctx.pending_grpc_streams.insert(stream_id, stream);
+    state
+        .http_ctx
+        .pending_grpc_streams
+        .insert(stream_id, stream);
 
     // Write stream_id to return pointer
     if return_stream_id_ptr > 0 {
@@ -360,16 +401,16 @@ fn proxy_grpc_stream_impl(
 
     ftlog::debug!(
         "WASM: proxy_grpc_stream opened stream_id={} to {}/{}/{}",
-        stream_id, upstream, service, method
+        stream_id,
+        upstream,
+        service,
+        method
     );
     PROXY_RESULT_OK
 }
 
 #[cfg(feature = "grpc")]
-fn proxy_grpc_close_impl(
-    caller: &mut Caller<'_, HostState>,
-    stream_id: i32,
-) -> i32 {
+fn proxy_grpc_close_impl(caller: &mut Caller<'_, HostState>, stream_id: i32) -> i32 {
     use crate::wasm::context::GrpcStreamState;
 
     let state = caller.data_mut();
@@ -411,7 +452,10 @@ fn proxy_grpc_send_impl(
     if let Some(stream) = state.http_ctx.pending_grpc_streams.get_mut(&stream_id_u32) {
         // Check if stream is open
         if stream.state != GrpcStreamState::Open {
-            ftlog::debug!("WASM: proxy_grpc_send - stream_id={} is not open", stream_id);
+            ftlog::debug!(
+                "WASM: proxy_grpc_send - stream_id={} is not open",
+                stream_id
+            );
             return PROXY_RESULT_BAD_ARGUMENT;
         }
 
@@ -423,12 +467,16 @@ fn proxy_grpc_send_impl(
         // Handle end of stream
         if end_of_stream != 0 {
             stream.state = GrpcStreamState::HalfClosed;
-            ftlog::debug!("WASM: proxy_grpc_send - stream_id={} half-closed", stream_id);
+            ftlog::debug!(
+                "WASM: proxy_grpc_send - stream_id={} half-closed",
+                stream_id
+            );
         }
 
         ftlog::debug!(
             "WASM: proxy_grpc_send - queued {} bytes on stream_id={}",
-            message_size, stream_id
+            message_size,
+            stream_id
         );
         PROXY_RESULT_OK
     } else {
@@ -452,7 +500,8 @@ fn deserialize_grpc_metadata(data: &[u8]) -> Vec<(String, String)> {
         if pos + 4 > data.len() {
             break;
         }
-        let key_len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        let key_len =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         pos += 4;
 
         if pos + key_len > data.len() {
@@ -464,7 +513,8 @@ fn deserialize_grpc_metadata(data: &[u8]) -> Vec<(String, String)> {
         if pos + 4 > data.len() {
             break;
         }
-        let val_len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        let val_len =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         pos += 4;
 
         if pos + val_len > data.len() {

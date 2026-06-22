@@ -61,8 +61,15 @@ pub enum GrpcError {
 impl std::fmt::Display for GrpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InsufficientData { required, available } => {
-                write!(f, "Insufficient data: need {} bytes, have {}", required, available)
+            Self::InsufficientData {
+                required,
+                available,
+            } => {
+                write!(
+                    f,
+                    "Insufficient data: need {} bytes, have {}",
+                    required, available
+                )
             }
             Self::MessageTooLarge { size, max } => {
                 write!(f, "Message too large: {} bytes (max: {})", size, max)
@@ -113,16 +120,16 @@ impl GrpcFrame {
     /// Returns 5-byte header + payload
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(GRPC_FRAME_HEADER_SIZE + self.data.len());
-        
+
         // Flags byte: bit 0 = compressed
         buf.push(if self.compressed { 1 } else { 0 });
-        
+
         // Length (4 bytes, big-endian)
         buf.extend_from_slice(&(self.data.len() as u32).to_be_bytes());
-        
+
         // Payload
         buf.extend_from_slice(&self.data);
-        
+
         buf
     }
 
@@ -298,7 +305,7 @@ mod tests {
     fn test_decode_insufficient_payload() {
         let mut buf = vec![0u8; 5];
         buf[1..5].copy_from_slice(&100u32.to_be_bytes()); // Claim 100 bytes
-        // But only provide header
+                                                          // But only provide header
 
         let result = decode_grpc_frame(&buf);
         assert!(matches!(result, Err(GrpcError::InsufficientData { .. })));
@@ -350,7 +357,10 @@ mod tests {
         let header = frame.encode_header();
 
         assert_eq!(header[0], 0); // Uncompressed
-        assert_eq!(u32::from_be_bytes([header[1], header[2], header[3], header[4]]), 100);
+        assert_eq!(
+            u32::from_be_bytes([header[1], header[2], header[3], header[4]]),
+            100
+        );
     }
 
     #[test]

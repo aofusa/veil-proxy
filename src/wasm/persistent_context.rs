@@ -53,14 +53,17 @@ pub fn allocate_context_id() -> u64 {
 pub fn store_context(module_name: &str, context: HttpContext) -> u64 {
     let context_id = allocate_context_id();
     let has_pending = !context.pending_http_calls.is_empty();
-    
+
     if let Ok(mut registry) = CONTEXT_REGISTRY.write() {
-        registry.contexts.insert(context_id, StoredContext {
-            module_name: module_name.to_string(),
-            context,
-            has_pending_calls: has_pending,
-        });
-        
+        registry.contexts.insert(
+            context_id,
+            StoredContext {
+                module_name: module_name.to_string(),
+                context,
+                has_pending_calls: has_pending,
+            },
+        );
+
         ftlog::debug!(
             "[wasm:context] Stored context {} for module '{}' (pending_calls={})",
             context_id,
@@ -68,7 +71,7 @@ pub fn store_context(module_name: &str, context: HttpContext) -> u64 {
             has_pending
         );
     }
-    
+
     context_id
 }
 
@@ -88,7 +91,9 @@ pub fn take_context(context_id: u64) -> Option<StoredContext> {
 /// Check if a context exists and has pending calls
 pub fn context_has_pending_calls(context_id: u64) -> bool {
     if let Ok(registry) = CONTEXT_REGISTRY.read() {
-        registry.contexts.get(&context_id)
+        registry
+            .contexts
+            .get(&context_id)
             .map(|sc| sc.has_pending_calls)
             .unwrap_or(false)
     } else {
@@ -124,7 +129,7 @@ pub struct PendingHttpCallWithContext {
 /// The calls are removed from the contexts.
 pub fn take_all_pending_http_calls() -> Vec<PendingHttpCallWithContext> {
     let mut result = Vec::new();
-    
+
     if let Ok(mut registry) = CONTEXT_REGISTRY.write() {
         for (&context_id, stored) in registry.contexts.iter_mut() {
             if stored.has_pending_calls {
@@ -141,18 +146,18 @@ pub fn take_all_pending_http_calls() -> Vec<PendingHttpCallWithContext> {
             }
         }
     }
-    
+
     if !result.is_empty() {
         ftlog::debug!("[wasm:context] Took {} pending HTTP calls", result.len());
     }
-    
+
     result
 }
 
 /// Take pending HTTP calls for a specific module
 pub fn take_pending_http_calls_for_module(module_name: &str) -> Vec<PendingHttpCallWithContext> {
     let mut result = Vec::new();
-    
+
     if let Ok(mut registry) = CONTEXT_REGISTRY.write() {
         for (&context_id, stored) in registry.contexts.iter_mut() {
             if stored.module_name == module_name && stored.has_pending_calls {
@@ -169,7 +174,7 @@ pub fn take_pending_http_calls_for_module(module_name: &str) -> Vec<PendingHttpC
             }
         }
     }
-    
+
     result
 }
 
@@ -186,7 +191,7 @@ pub fn deliver_http_call_response(
         if let Some(stored) = registry.contexts.get_mut(&context_id) {
             stored.context.http_call_responses.insert(token, response);
             stored.context.current_http_call_token = Some(token);
-            
+
             ftlog::debug!(
                 "[wasm:context] Delivered HTTP call response to context {} token {}",
                 context_id,
@@ -195,7 +200,7 @@ pub fn deliver_http_call_response(
             return true;
         }
     }
-    
+
     ftlog::warn!(
         "[wasm:context] Failed to deliver HTTP call response: context {} not found",
         context_id
@@ -207,10 +212,12 @@ pub fn deliver_http_call_response(
 pub fn get_context_stats() -> ContextStats {
     if let Ok(registry) = CONTEXT_REGISTRY.read() {
         let total = registry.contexts.len();
-        let with_pending = registry.contexts.values()
+        let with_pending = registry
+            .contexts
+            .values()
             .filter(|c| c.has_pending_calls)
             .count();
-        
+
         ContextStats {
             total_contexts: total,
             contexts_with_pending_calls: with_pending,
@@ -234,22 +241,20 @@ pub fn remove_context(context_id: u64) -> bool {
 }
 
 /// Cleanup expired contexts (contexts older than max_age_secs)
-/// 
+///
 /// Note: This is a placeholder - for proper cleanup we'd need timestamps
 pub fn cleanup_old_contexts(max_count: usize) {
     if let Ok(mut registry) = CONTEXT_REGISTRY.write() {
         // Simple cleanup: remove oldest contexts if count exceeds max
         if registry.contexts.len() > max_count {
             let excess = registry.contexts.len() - max_count;
-            let mut ids_to_remove: Vec<u64> = registry.contexts.keys()
-                .take(excess)
-                .copied()
-                .collect();
-            
+            let mut ids_to_remove: Vec<u64> =
+                registry.contexts.keys().take(excess).copied().collect();
+
             for id in ids_to_remove.drain(..) {
                 registry.contexts.remove(&id);
             }
-            
+
             ftlog::debug!("[wasm:context] Cleaned up {} old contexts", excess);
         }
     }
@@ -283,14 +288,10 @@ pub struct GlobalPendingCall {
 }
 
 /// Register a pending HTTP call in the global registry
-/// 
+///
 /// This is called from the host function when proxy_http_call is invoked.
 /// The call can then be picked up by the tick thread for async execution.
-pub fn register_global_pending_call(
-    module_name: &str,
-    token: u32,
-    call: PendingHttpCall,
-) {
+pub fn register_global_pending_call(module_name: &str, token: u32, call: PendingHttpCall) {
     if let Ok(mut registry) = GLOBAL_PENDING_CALLS.write() {
         registry.push(GlobalPendingCall {
             module_name: module_name.to_string(),
@@ -306,7 +307,7 @@ pub fn register_global_pending_call(
 }
 
 /// Take all globally registered pending HTTP calls
-/// 
+///
 /// Returns all pending calls and clears the global registry.
 pub fn take_global_pending_calls() -> Vec<GlobalPendingCall> {
     if let Ok(mut registry) = GLOBAL_PENDING_CALLS.write() {
@@ -333,61 +334,64 @@ pub fn get_global_pending_call_count() -> usize {
 mod tests {
     use super::*;
     use crate::wasm::capabilities::ModuleCapabilities;
-    
+
     #[test]
     fn test_store_and_retrieve_context() {
         let ctx = HttpContext::new(1, ModuleCapabilities::default());
         let context_id = store_context("test_module", ctx);
-        
+
         assert!(context_exists(context_id));
-        
+
         let stored = take_context(context_id);
         assert!(stored.is_some());
         assert_eq!(stored.unwrap().module_name, "test_module");
-        
+
         // Should be removed now
         assert!(!context_exists(context_id));
     }
-    
+
     #[test]
     fn test_pending_http_calls() {
         let mut ctx = HttpContext::new(1, ModuleCapabilities::default());
-        ctx.pending_http_calls.insert(1, PendingHttpCall {
-            token: 1,
-            upstream: "backend".to_string(),
-            timeout_ms: 1000,
-            headers: vec![],
-            body: vec![],
-            trailers: vec![],
-        });
-        
+        ctx.pending_http_calls.insert(
+            1,
+            PendingHttpCall {
+                token: 1,
+                upstream: "backend".to_string(),
+                timeout_ms: 1000,
+                headers: vec![],
+                body: vec![],
+                trailers: vec![],
+            },
+        );
+
         let context_id = store_context("test_http_module", ctx);
-        
+
         let pending = take_all_pending_http_calls();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].context_id, context_id);
         assert_eq!(pending[0].token, 1);
         assert_eq!(pending[0].module_name, "test_http_module");
-        
+
         // Cleanup
         remove_context(context_id);
     }
-    
+
     #[test]
     fn test_deliver_response() {
         let ctx = HttpContext::new(1, ModuleCapabilities::default());
         let context_id = store_context("test_response_module", ctx);
-        
+
         let response = super::super::types::HttpCallResponse {
             status_code: 200,
             headers: vec![],
             body: vec![1, 2, 3],
             trailers: vec![],
         };
-        
+
         let delivered = deliver_http_call_response(context_id, 42, response);
         assert!(delivered);
-        
+
         // Verify the response was stored
         let stored = take_context(context_id);
         assert!(stored.is_some());
@@ -395,7 +399,7 @@ mod tests {
         assert!(ctx.http_call_responses.contains_key(&42));
         assert_eq!(ctx.current_http_call_token, Some(42));
     }
-    
+
     #[test]
     fn test_context_stats() {
         let stats = get_context_stats();

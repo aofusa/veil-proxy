@@ -2,9 +2,9 @@
 //!
 //! HPACK 形式でエンコードされたヘッダーをデコードします。
 
-use super::{HpackError, HpackResult, decode_integer};
-use super::table::{StaticTable, DynamicTable, HeaderField, get_indexed};
 use super::huffman::huffman_decode;
+use super::table::{get_indexed, DynamicTable, HeaderField, StaticTable};
+use super::{decode_integer, HpackError, HpackResult};
 
 /// HPACK デコーダ
 pub struct HpackDecoder {
@@ -118,7 +118,7 @@ impl HpackDecoder {
     fn decode_literal_indexed(&mut self, buf: &[u8], pos: &mut usize) -> HpackResult<HeaderField> {
         // ローカルオフセットで処理
         let mut local_pos = 0usize;
-        
+
         let (index, consumed) = decode_integer(buf, 6)?;
         local_pos += consumed;
 
@@ -149,10 +149,14 @@ impl HpackDecoder {
     }
 
     /// Literal Header Field without Indexing (Section 6.2.2)
-    fn decode_literal_without_indexing(&self, buf: &[u8], pos: &mut usize) -> HpackResult<HeaderField> {
+    fn decode_literal_without_indexing(
+        &self,
+        buf: &[u8],
+        pos: &mut usize,
+    ) -> HpackResult<HeaderField> {
         // ローカルオフセットで処理
         let mut local_pos = 0usize;
-        
+
         let (index, consumed) = decode_integer(buf, 4)?;
         local_pos += consumed;
 
@@ -178,7 +182,11 @@ impl HpackDecoder {
     }
 
     /// Literal Header Field Never Indexed (Section 6.2.3)
-    fn decode_literal_never_indexed(&self, buf: &[u8], pos: &mut usize) -> HpackResult<HeaderField> {
+    fn decode_literal_never_indexed(
+        &self,
+        buf: &[u8],
+        pos: &mut usize,
+    ) -> HpackResult<HeaderField> {
         // Same encoding as without indexing
         self.decode_literal_without_indexing(buf, pos)
     }
@@ -207,7 +215,7 @@ impl HpackDecoder {
 
         let huffman = buf[0] & 0x80 != 0;
         let (length, consumed) = decode_integer(buf, 7)?;
-        
+
         if consumed + length > buf.len() {
             return Err(HpackError::BufferTooShort);
         }
@@ -246,11 +254,11 @@ mod tests {
     #[test]
     fn test_decode_indexed() {
         let mut decoder = HpackDecoder::new(4096);
-        
+
         // :method GET (index 2)
         let buf = [0x82];
         let headers = decoder.decode(&buf).unwrap();
-        
+
         assert_eq!(headers.len(), 1);
         assert_eq!(headers[0].name, b":method");
         assert_eq!(headers[0].value, b"GET");
@@ -259,11 +267,11 @@ mod tests {
     #[test]
     fn test_decode_multiple_indexed() {
         let mut decoder = HpackDecoder::new(4096);
-        
+
         // :method GET (2) + :path / (4)
         let buf = [0x82, 0x84];
         let headers = decoder.decode(&buf).unwrap();
-        
+
         assert_eq!(headers.len(), 2);
         assert_eq!(headers[0].name, b":method");
         assert_eq!(headers[0].value, b"GET");
@@ -275,7 +283,7 @@ mod tests {
     fn test_encode_decode_roundtrip() {
         let mut encoder = HpackEncoder::new(4096);
         encoder.set_huffman(false);
-        
+
         let mut decoder = HpackDecoder::new(4096);
 
         let headers = [

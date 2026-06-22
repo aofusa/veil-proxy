@@ -10,15 +10,15 @@
 //! - `Encoder`: HPACK エンコーダ
 //! - `Decoder`: HPACK デコーダ
 
-pub mod table;
-pub mod huffman;
-pub mod encoder;
 pub mod decoder;
+pub mod encoder;
+pub mod huffman;
+pub mod table;
 
-pub use table::{StaticTable, DynamicTable, HeaderField};
-pub use huffman::{huffman_encode, huffman_decode};
-pub use encoder::HpackEncoder;
 pub use decoder::HpackDecoder;
+pub use encoder::HpackEncoder;
+pub use huffman::{huffman_decode, huffman_encode};
+pub use table::{DynamicTable, HeaderField, StaticTable};
 
 /// HPACK エラー
 #[derive(Debug, Clone)]
@@ -78,7 +78,11 @@ pub fn decode_integer(buf: &[u8], prefix_bits: u8) -> HpackResult<(usize, usize)
         return Err(HpackError::BufferTooShort);
     }
 
-    let mask = if prefix_bits >= 8 { 0xFFu8 } else { (1u8 << prefix_bits) - 1 };
+    let mask = if prefix_bits >= 8 {
+        0xFFu8
+    } else {
+        (1u8 << prefix_bits) - 1
+    };
     let first_byte = buf[0] & mask;
 
     if first_byte < mask {
@@ -127,7 +131,11 @@ pub fn decode_integer(buf: &[u8], prefix_bits: u8) -> HpackResult<(usize, usize)
 /// * `prefix_bits` - プレフィックスビット数 (1-8)
 /// * `prefix` - 最初のバイトのプレフィックス値
 pub fn encode_integer(buf: &mut Vec<u8>, value: usize, prefix_bits: u8, prefix: u8) {
-    let mask = if prefix_bits >= 8 { 0xFFu8 } else { (1u8 << prefix_bits) - 1 };
+    let mask = if prefix_bits >= 8 {
+        0xFFu8
+    } else {
+        (1u8 << prefix_bits) - 1
+    };
 
     if value < mask as usize {
         // 1バイトで完結
@@ -190,7 +198,11 @@ mod tests {
                 let mut buf = Vec::new();
                 encode_integer(&mut buf, value, prefix_bits, 0);
                 let (decoded, _) = decode_integer(&buf, prefix_bits).unwrap();
-                assert_eq!(decoded, value, "Failed for value={}, prefix={}", value, prefix_bits);
+                assert_eq!(
+                    decoded, value,
+                    "Failed for value={}, prefix={}",
+                    value, prefix_bits
+                );
             }
         }
     }

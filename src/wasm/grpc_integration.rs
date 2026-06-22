@@ -26,7 +26,7 @@ pub struct GrpcCallResponse {
 }
 
 /// Notify a WASM module of gRPC initial metadata
-/// 
+///
 /// Called when the gRPC server sends initial metadata (headers).
 #[cfg(feature = "grpc")]
 pub fn on_grpc_initial_metadata(
@@ -39,7 +39,7 @@ pub fn on_grpc_initial_metadata(
 }
 
 /// Notify a WASM module of a gRPC message
-/// 
+///
 /// Called when the gRPC server sends a response message.
 #[cfg(feature = "grpc")]
 pub fn on_grpc_message(
@@ -52,7 +52,7 @@ pub fn on_grpc_message(
 }
 
 /// Notify a WASM module of gRPC trailing metadata
-/// 
+///
 /// Called when the gRPC server sends trailing metadata (trailers).
 #[cfg(feature = "grpc")]
 pub fn on_grpc_trailing_metadata(
@@ -65,7 +65,7 @@ pub fn on_grpc_trailing_metadata(
 }
 
 /// Notify a WASM module that a gRPC call has closed
-/// 
+///
 /// Called when the gRPC call completes or fails.
 #[cfg(feature = "grpc")]
 pub fn on_grpc_close(
@@ -78,17 +78,14 @@ pub fn on_grpc_close(
 }
 
 /// Process a complete gRPC response
-/// 
+///
 /// Convenience function that calls all gRPC callbacks in order:
 /// 1. Initial metadata
 /// 2. Message
 /// 3. Trailing metadata
 /// 4. Close
 #[cfg(feature = "grpc")]
-pub fn process_grpc_response(
-    engine: &Arc<FilterEngine>,
-    response: GrpcCallResponse,
-) {
+pub fn process_grpc_response(engine: &Arc<FilterEngine>, response: GrpcCallResponse) {
     // 1. Initial metadata
     if !response.initial_metadata.is_empty() {
         on_grpc_initial_metadata(
@@ -98,7 +95,7 @@ pub fn process_grpc_response(
             &response.initial_metadata,
         );
     }
-    
+
     // 2. Message
     if !response.message.is_empty() {
         on_grpc_message(
@@ -108,7 +105,7 @@ pub fn process_grpc_response(
             &response.message,
         );
     }
-    
+
     // 3. Trailing metadata
     if !response.trailing_metadata.is_empty() {
         on_grpc_trailing_metadata(
@@ -118,7 +115,7 @@ pub fn process_grpc_response(
             &response.trailing_metadata,
         );
     }
-    
+
     // 4. Close
     on_grpc_close(
         engine,
@@ -170,28 +167,24 @@ pub mod status {
 #[cfg(all(test, feature = "grpc"))]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_grpc_call_response_creation() {
         let response = GrpcCallResponse {
             module_name: "grpc_module".to_string(),
             call_id: 1,
             status_code: status::OK,
-            initial_metadata: vec![
-                ("content-type".to_string(), "application/grpc".to_string()),
-            ],
+            initial_metadata: vec![("content-type".to_string(), "application/grpc".to_string())],
             message: b"response data".to_vec(),
-            trailing_metadata: vec![
-                ("grpc-status".to_string(), "0".to_string()),
-            ],
+            trailing_metadata: vec![("grpc-status".to_string(), "0".to_string())],
         };
-        
+
         assert_eq!(response.module_name, "grpc_module");
         assert_eq!(response.call_id, 1);
         assert_eq!(response.status_code, 0);
         assert!(!response.message.is_empty());
     }
-    
+
     #[test]
     fn test_grpc_status_codes() {
         assert_eq!(status::OK, 0);

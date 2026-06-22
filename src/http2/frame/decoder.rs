@@ -28,7 +28,9 @@ impl FrameDecoder {
     /// フレームヘッダーをデコード
     pub fn decode_header(&self, buf: &[u8]) -> Http2Result<FrameHeader> {
         if buf.len() < FrameHeader::SIZE {
-            return Err(Http2Error::InvalidFrame("Buffer too short for frame header".into()));
+            return Err(Http2Error::InvalidFrame(
+                "Buffer too short for frame header".into(),
+            ));
         }
 
         let header_bytes: [u8; 9] = buf[..9].try_into().unwrap();
@@ -36,7 +38,10 @@ impl FrameDecoder {
 
         // フレームサイズチェック
         if header.length > self.max_frame_size {
-            return Err(Http2Error::FrameTooLarge(header.length as usize, self.max_frame_size as usize));
+            return Err(Http2Error::FrameTooLarge(
+                header.length as usize,
+                self.max_frame_size as usize,
+            ));
         }
 
         Ok(header)
@@ -90,7 +95,7 @@ impl FrameDecoder {
         }
 
         let (data, _pad_length) = self.extract_padding(header, payload)?;
-        
+
         let (priority, header_block) = if header.is_priority() {
             if data.len() < 5 {
                 return Err(Http2Error::frame_size_error("HEADERS priority too short"));
@@ -113,11 +118,15 @@ impl FrameDecoder {
     /// PRIORITY フレームをデコード
     fn decode_priority(&self, header: &FrameHeader, payload: &[u8]) -> Http2Result<Frame> {
         if header.stream_id == 0 {
-            return Err(Http2Error::protocol_error("PRIORITY frame with stream ID 0"));
+            return Err(Http2Error::protocol_error(
+                "PRIORITY frame with stream ID 0",
+            ));
         }
 
         if payload.len() != 5 {
-            return Err(Http2Error::frame_size_error("PRIORITY frame must be 5 bytes"));
+            return Err(Http2Error::frame_size_error(
+                "PRIORITY frame must be 5 bytes",
+            ));
         }
 
         let priority = self.decode_priority_spec(payload);
@@ -131,11 +140,15 @@ impl FrameDecoder {
     /// RST_STREAM フレームをデコード
     fn decode_rst_stream(&self, header: &FrameHeader, payload: &[u8]) -> Http2Result<Frame> {
         if header.stream_id == 0 {
-            return Err(Http2Error::protocol_error("RST_STREAM frame with stream ID 0"));
+            return Err(Http2Error::protocol_error(
+                "RST_STREAM frame with stream ID 0",
+            ));
         }
 
         if payload.len() != 4 {
-            return Err(Http2Error::frame_size_error("RST_STREAM frame must be 4 bytes"));
+            return Err(Http2Error::frame_size_error(
+                "RST_STREAM frame must be 4 bytes",
+            ));
         }
 
         let error_code = u32::from_be_bytes(payload.try_into().unwrap());
@@ -149,7 +162,9 @@ impl FrameDecoder {
     /// SETTINGS フレームをデコード
     fn decode_settings(&self, header: &FrameHeader, payload: &[u8]) -> Http2Result<Frame> {
         if header.stream_id != 0 {
-            return Err(Http2Error::protocol_error("SETTINGS frame with non-zero stream ID"));
+            return Err(Http2Error::protocol_error(
+                "SETTINGS frame with non-zero stream ID",
+            ));
         }
 
         if header.is_ack() {
@@ -163,7 +178,9 @@ impl FrameDecoder {
         }
 
         if payload.len() % 6 != 0 {
-            return Err(Http2Error::frame_size_error("SETTINGS payload must be multiple of 6"));
+            return Err(Http2Error::frame_size_error(
+                "SETTINGS payload must be multiple of 6",
+            ));
         }
 
         let mut settings = Vec::with_capacity(payload.len() / 6);
@@ -182,7 +199,9 @@ impl FrameDecoder {
     /// PUSH_PROMISE フレームをデコード
     fn decode_push_promise(&self, header: &FrameHeader, payload: &[u8]) -> Http2Result<Frame> {
         if header.stream_id == 0 {
-            return Err(Http2Error::protocol_error("PUSH_PROMISE frame with stream ID 0"));
+            return Err(Http2Error::protocol_error(
+                "PUSH_PROMISE frame with stream ID 0",
+            ));
         }
 
         let (data, _pad_length) = self.extract_padding(header, payload)?;
@@ -191,7 +210,8 @@ impl FrameDecoder {
             return Err(Http2Error::frame_size_error("PUSH_PROMISE too short"));
         }
 
-        let promised_stream_id = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) & 0x7FFFFFFF;
+        let promised_stream_id =
+            u32::from_be_bytes([data[0], data[1], data[2], data[3]]) & 0x7FFFFFFF;
 
         Ok(Frame::PushPromise {
             stream_id: header.stream_id,
@@ -204,7 +224,9 @@ impl FrameDecoder {
     /// PING フレームをデコード
     fn decode_ping(&self, header: &FrameHeader, payload: &[u8]) -> Http2Result<Frame> {
         if header.stream_id != 0 {
-            return Err(Http2Error::protocol_error("PING frame with non-zero stream ID"));
+            return Err(Http2Error::protocol_error(
+                "PING frame with non-zero stream ID",
+            ));
         }
 
         if payload.len() != 8 {
@@ -223,14 +245,17 @@ impl FrameDecoder {
     /// GOAWAY フレームをデコード
     fn decode_goaway(&self, header: &FrameHeader, payload: &[u8]) -> Http2Result<Frame> {
         if header.stream_id != 0 {
-            return Err(Http2Error::protocol_error("GOAWAY frame with non-zero stream ID"));
+            return Err(Http2Error::protocol_error(
+                "GOAWAY frame with non-zero stream ID",
+            ));
         }
 
         if payload.len() < 8 {
             return Err(Http2Error::frame_size_error("GOAWAY frame too short"));
         }
 
-        let last_stream_id = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]) & 0x7FFFFFFF;
+        let last_stream_id =
+            u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]) & 0x7FFFFFFF;
         let error_code = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
         let debug_data = payload[8..].to_vec();
 
@@ -244,13 +269,17 @@ impl FrameDecoder {
     /// WINDOW_UPDATE フレームをデコード
     fn decode_window_update(&self, header: &FrameHeader, payload: &[u8]) -> Http2Result<Frame> {
         if payload.len() != 4 {
-            return Err(Http2Error::frame_size_error("WINDOW_UPDATE frame must be 4 bytes"));
+            return Err(Http2Error::frame_size_error(
+                "WINDOW_UPDATE frame must be 4 bytes",
+            ));
         }
 
         let increment = u32::from_be_bytes(payload.try_into().unwrap()) & 0x7FFFFFFF;
 
         if increment == 0 {
-            return Err(Http2Error::protocol_error("WINDOW_UPDATE increment must be non-zero"));
+            return Err(Http2Error::protocol_error(
+                "WINDOW_UPDATE increment must be non-zero",
+            ));
         }
 
         Ok(Frame::WindowUpdate {
@@ -262,7 +291,9 @@ impl FrameDecoder {
     /// CONTINUATION フレームをデコード
     fn decode_continuation(&self, header: &FrameHeader, payload: &[u8]) -> Http2Result<Frame> {
         if header.stream_id == 0 {
-            return Err(Http2Error::protocol_error("CONTINUATION frame with stream ID 0"));
+            return Err(Http2Error::protocol_error(
+                "CONTINUATION frame with stream ID 0",
+            ));
         }
 
         Ok(Frame::Continuation {
@@ -273,7 +304,11 @@ impl FrameDecoder {
     }
 
     /// パディングを抽出
-    fn extract_padding<'a>(&self, header: &FrameHeader, payload: &'a [u8]) -> Http2Result<(&'a [u8], usize)> {
+    fn extract_padding<'a>(
+        &self,
+        header: &FrameHeader,
+        payload: &'a [u8],
+    ) -> Http2Result<(&'a [u8], usize)> {
         if !header.is_padded() {
             return Ok((payload, 0));
         }
@@ -329,7 +364,11 @@ mod tests {
         let frame = decoder.decode(&header, &frame_bytes[9..]).unwrap();
 
         match frame {
-            Frame::Data { stream_id, end_stream, data: decoded_data } => {
+            Frame::Data {
+                stream_id,
+                end_stream,
+                data: decoded_data,
+            } => {
                 assert_eq!(stream_id, 1);
                 assert!(end_stream);
                 assert_eq!(decoded_data, data);
@@ -350,7 +389,10 @@ mod tests {
         let frame = decoder.decode(&header, &frame_bytes[9..]).unwrap();
 
         match frame {
-            Frame::Settings { ack, settings: decoded_settings } => {
+            Frame::Settings {
+                ack,
+                settings: decoded_settings,
+            } => {
                 assert!(!ack);
                 assert_eq!(decoded_settings.len(), 2);
                 assert_eq!(decoded_settings[0], (0x01, 4096));
@@ -371,7 +413,10 @@ mod tests {
         let frame = decoder.decode(&header, &frame_bytes[9..]).unwrap();
 
         match frame {
-            Frame::WindowUpdate { stream_id, increment } => {
+            Frame::WindowUpdate {
+                stream_id,
+                increment,
+            } => {
                 assert_eq!(stream_id, 1);
                 assert_eq!(increment, 65535);
             }

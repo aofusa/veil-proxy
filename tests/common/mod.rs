@@ -15,33 +15,31 @@ pub mod http2_client;
 // 新しいHTTP/1.1テストクライアント（hyper+rustls）
 pub mod http1_client;
 
-
-
-use std::net::{TcpListener, SocketAddr};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::time::Duration;
-use std::io::{Read, Write};
 
 /// テスト用の自己署名TLS証明書を生成
 #[allow(dead_code)]
 pub fn generate_test_certs(output_dir: &std::path::Path) -> std::io::Result<(PathBuf, PathBuf)> {
     use rcgen::{generate_simple_self_signed, CertifiedKey};
-    
+
     let subject_alt_names = vec![
         "localhost".to_string(),
         "127.0.0.1".to_string(),
         "::1".to_string(),
     ];
-    
+
     let CertifiedKey { cert, signing_key } = generate_simple_self_signed(subject_alt_names)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    
+
     let cert_path = output_dir.join("test_cert.pem");
     let key_path = output_dir.join("test_key.pem");
-    
+
     std::fs::write(&cert_path, cert.pem())?;
     std::fs::write(&key_path, signing_key.serialize_pem())?;
-    
+
     Ok((cert_path, key_path))
 }
 
@@ -55,13 +53,13 @@ pub fn get_available_port() -> u16 {
 pub fn get_available_ports(count: usize) -> Vec<u16> {
     let mut ports = Vec::with_capacity(count);
     let mut listeners = Vec::with_capacity(count);
-    
+
     for _ in 0..count {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         ports.push(listener.local_addr().unwrap().port());
         listeners.push(listener);
     }
-    
+
     // リスナーはドロップされてポートが解放される
     ports
 }
@@ -78,10 +76,10 @@ impl EchoServer {
     pub fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        
+
         // リスナーをクローンしてスレッドに渡す
         let listener_clone = listener.try_clone().unwrap();
-        
+
         let handle = std::thread::spawn(move || {
             // 最初の接続のみ処理
             if let Ok((mut stream, _)) = listener_clone.accept() {
@@ -100,19 +98,19 @@ impl EchoServer {
                 }
             }
         });
-        
+
         Self {
             listener: Some(listener),
             handle: Some(handle),
             addr,
         }
     }
-    
+
     /// サーバーのアドレスを取得
     pub fn address(&self) -> String {
         format!("127.0.0.1:{}", self.addr.port())
     }
-    
+
     /// サーバーのポートを取得
     #[allow(dead_code)] // APIの一貫性のため保持
     pub fn port(&self) -> u16 {
@@ -139,7 +137,7 @@ pub struct SimpleHttpServer {
 
 impl SimpleHttpServer {
     /// 新しいHTTPサーバーを起動
-    /// 
+    ///
     /// # Arguments
     /// * `response_body` - 返却するレスポンスボディ
     /// * `server_id` - サーバー識別子（X-Server-Id ヘッダーに使用）
@@ -148,20 +146,20 @@ impl SimpleHttpServer {
         let addr = listener.local_addr().unwrap();
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
-        
+
         let _ = listener.set_nonblocking(true);
-        
+
         let handle = std::thread::spawn(move || {
             while !shutdown_clone.load(std::sync::atomic::Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
                         let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-                        
+
                         // リクエストを読み取る
                         let mut buf = [0u8; 4096];
                         let _ = stream.read(&mut buf);
-                        
+
                         // シンプルなHTTPレスポンス
                         let response = format!(
                             "HTTP/1.1 200 OK\r\n\
@@ -175,7 +173,7 @@ impl SimpleHttpServer {
                             server_id,
                             response_body
                         );
-                        
+
                         let _ = stream.write_all(response.as_bytes());
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -185,19 +183,19 @@ impl SimpleHttpServer {
                 }
             }
         });
-        
+
         Self {
             handle: Some(handle),
             addr,
             shutdown,
         }
     }
-    
+
     /// サーバーのアドレスを取得
     pub fn address(&self) -> String {
         format!("127.0.0.1:{}", self.addr.port())
     }
-    
+
     /// サーバーのポートを取得
     #[allow(dead_code)]
     pub fn port(&self) -> u16 {
@@ -207,13 +205,13 @@ impl SimpleHttpServer {
 
 impl Drop for SimpleHttpServer {
     fn drop(&mut self) {
-        self.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
     }
 }
-
 
 /// テスト用設定ファイルを生成
 #[allow(dead_code)]
@@ -225,12 +223,14 @@ pub fn generate_test_config(
     backend_urls: &[String],
     output_path: &std::path::Path,
 ) -> std::io::Result<()> {
-    let backends: String = backend_urls.iter()
+    let backends: String = backend_urls
+        .iter()
         .map(|url| format!("\"{}\"", url))
         .collect::<Vec<_>>()
         .join(", ");
-    
-    let config = format!(r#"
+
+    let config = format!(
+        r#"
 [server]
 listen = "127.0.0.1:{https_port}"
 http_listen = "127.0.0.1:{http_port}"
@@ -273,7 +273,7 @@ upstream = "backend"
         key_path = key_path.display(),
         backends = backends,
     );
-    
+
     std::fs::write(output_path, config)
 }
 
@@ -303,7 +303,7 @@ pub struct DelayedHttpServer {
 #[allow(dead_code)]
 impl DelayedHttpServer {
     /// 新しい遅延応答HTTPサーバーを起動
-    /// 
+    ///
     /// # Arguments
     /// * `response_body` - 返却するレスポンスボディ
     /// * `server_id` - サーバー識別子
@@ -314,23 +314,23 @@ impl DelayedHttpServer {
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
         let delay_clone = delay;
-        
+
         let _ = listener.set_nonblocking(true);
-        
+
         let handle = std::thread::spawn(move || {
             while !shutdown_clone.load(std::sync::atomic::Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
                         let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
-                        
+
                         // リクエストを読み取る
                         let mut buf = [0u8; 4096];
                         let _ = stream.read(&mut buf);
-                        
+
                         // 遅延
                         std::thread::sleep(delay_clone);
-                        
+
                         // シンプルなHTTPレスポンス
                         let response = format!(
                             "HTTP/1.1 200 OK\r\n\
@@ -344,7 +344,7 @@ impl DelayedHttpServer {
                             server_id,
                             response_body
                         );
-                        
+
                         let _ = stream.write_all(response.as_bytes());
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -354,7 +354,7 @@ impl DelayedHttpServer {
                 }
             }
         });
-        
+
         Self {
             handle: Some(handle),
             addr,
@@ -362,12 +362,12 @@ impl DelayedHttpServer {
             delay,
         }
     }
-    
+
     /// サーバーのアドレスを取得
     pub fn address(&self) -> String {
         format!("127.0.0.1:{}", self.addr.port())
     }
-    
+
     /// サーバーのポートを取得
     #[allow(dead_code)]
     pub fn port(&self) -> u16 {
@@ -377,29 +377,29 @@ impl DelayedHttpServer {
 
 impl Drop for DelayedHttpServer {
     fn drop(&mut self) {
-        self.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_get_available_port() {
         let port = get_available_port();
         assert!(port > 0);
     }
-    
+
     #[test]
     fn test_get_multiple_ports() {
         let ports = get_available_ports(5);
         assert_eq!(ports.len(), 5);
-        
+
         // 全て異なるポート
         let mut unique = std::collections::HashSet::new();
         for port in &ports {
@@ -407,35 +407,36 @@ mod tests {
         }
         assert_eq!(unique.len(), 5);
     }
-    
+
     #[test]
     fn test_echo_server() {
         let server = EchoServer::start();
         let addr = server.address();
-        
+
         let mut stream = std::net::TcpStream::connect(&addr).unwrap();
         stream.write_all(b"hello").unwrap();
-        
+
         let mut buf = [0u8; 5];
         stream.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"hello");
     }
-    
+
     #[test]
     fn test_simple_http_server() {
         let server = SimpleHttpServer::start("test response", "server1");
-        
+
         // シンプルなHTTPリクエスト
         let mut stream = std::net::TcpStream::connect(server.address()).unwrap();
-        stream.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
-        
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+
         let mut response = String::new();
         let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
         let _ = stream.read_to_string(&mut response);
-        
+
         assert!(response.contains("200 OK"));
         assert!(response.contains("test response"));
         assert!(response.contains("X-Server-Id: server1"));
     }
 }
-

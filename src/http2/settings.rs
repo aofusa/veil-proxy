@@ -57,27 +57,27 @@ pub mod defaults {
     pub const CONNECTION_WINDOW_SIZE: u32 = 65535;
     /// SETTINGS タイムアウト (秒)
     pub const SETTINGS_TIMEOUT_SECS: u64 = 10;
-    
+
     // ====================
     // DoS 対策用定数 (仕様外の制約)
     // ====================
-    
+
     /// RST_STREAM レート制限 (Rapid Reset 対策: CVE-2023-44487)
     /// 1秒あたりの最大 RST_STREAM フレーム数
     pub const MAX_RST_STREAM_PER_SECOND: u32 = 100;
-    
+
     /// 制御フレームレート制限 (Control Frame Flooding 対策)
     /// 1秒あたりの最大制御フレーム数 (PING, SETTINGS, WINDOW_UPDATE(stream_id=0))
     pub const MAX_CONTROL_FRAMES_PER_SECOND: u32 = 500;
-    
+
     /// CONTINUATION フレーム制限 (CONTINUATION Flood 対策: CVE-2024-24786)
     /// 1つのヘッダーブロックあたりの最大 CONTINUATION フレーム数
     pub const MAX_CONTINUATION_FRAMES: u32 = 10;
-    
+
     /// 最大ヘッダーブロックサイズ (HPACK Bomb 対策)
     /// HEADERS + CONTINUATION の累積サイズ上限
     pub const MAX_HEADER_BLOCK_SIZE: usize = 65536;
-    
+
     /// ストリームアイドルタイムアウト (Slow Loris 対策)
     /// リクエストが完了しないストリームのタイムアウト (秒)
     pub const STREAM_IDLE_TIMEOUT_SECS: u64 = 60;
@@ -100,27 +100,26 @@ pub struct Http2Settings {
     pub max_header_list_size: u32,
     /// コネクションレベルのウィンドウサイズ (bytes)
     pub connection_window_size: u32,
-    
+
     // ====================
     // DoS 対策設定
     // ====================
-    
     /// RST_STREAM レート制限 (1秒あたりの最大数)
     /// Rapid Reset 対策 (CVE-2023-44487)
     pub max_rst_stream_per_second: u32,
-    
+
     /// 制御フレームレート制限 (1秒あたりの最大数)
     /// Control Frame Flooding 対策
     pub max_control_frames_per_second: u32,
-    
+
     /// CONTINUATION フレーム制限 (ヘッダーブロックあたりの最大数)
     /// CONTINUATION Flood 対策 (CVE-2024-24786)
     pub max_continuation_frames: u32,
-    
+
     /// 最大ヘッダーブロックサイズ (bytes)
     /// HPACK Bomb 対策
     pub max_header_block_size: usize,
-    
+
     /// ストリームアイドルタイムアウト (秒)
     /// Slow Loris 対策
     pub stream_idle_timeout_secs: u64,
@@ -155,13 +154,13 @@ impl Http2Settings {
     /// 高パフォーマンス設定
     pub fn high_performance() -> Self {
         Self {
-            header_table_size: 65536,           // 64KB (より多くのヘッダーをキャッシュ)
+            header_table_size: 65536, // 64KB (より多くのヘッダーをキャッシュ)
             enable_push: false,
-            max_concurrent_streams: 256,        // より多くの同時ストリーム
-            initial_window_size: 1048576,       // 1MB (より大きなウィンドウ)
-            max_frame_size: 65536,              // 64KB (より大きなフレーム)
-            max_header_list_size: 65536,        // 64KB
-            connection_window_size: 16777216,   // 16MB (より大きなコネクションウィンドウ)
+            max_concurrent_streams: 256,      // より多くの同時ストリーム
+            initial_window_size: 1048576,     // 1MB (より大きなウィンドウ)
+            max_frame_size: 65536,            // 64KB (より大きなフレーム)
+            max_header_list_size: 65536,      // 64KB
+            connection_window_size: 16777216, // 16MB (より大きなコネクションウィンドウ)
             // DoS 対策 (デフォルト値を使用)
             max_rst_stream_per_second: defaults::MAX_RST_STREAM_PER_SECOND,
             max_control_frames_per_second: defaults::MAX_CONTROL_FRAMES_PER_SECOND,
@@ -234,7 +233,9 @@ impl Http2Settings {
                     settings.initial_window_size = value;
                 }
                 Some(SettingsId::MaxFrameSize) => {
-                    if value < defaults::MAX_FRAME_SIZE || value > defaults::MAX_FRAME_SIZE_UPPER_LIMIT {
+                    if value < defaults::MAX_FRAME_SIZE
+                        || value > defaults::MAX_FRAME_SIZE_UPPER_LIMIT
+                    {
                         return Err(format!(
                             "MAX_FRAME_SIZE must be between {} and {}",
                             defaults::MAX_FRAME_SIZE,
@@ -293,7 +294,10 @@ mod tests {
 
         assert_eq!(decoded.header_table_size, original.header_table_size);
         assert_eq!(decoded.enable_push, original.enable_push);
-        assert_eq!(decoded.max_concurrent_streams, original.max_concurrent_streams);
+        assert_eq!(
+            decoded.max_concurrent_streams,
+            original.max_concurrent_streams
+        );
         assert_eq!(decoded.initial_window_size, original.initial_window_size);
         assert_eq!(decoded.max_frame_size, original.max_frame_size);
         assert_eq!(decoded.max_header_list_size, original.max_header_list_size);

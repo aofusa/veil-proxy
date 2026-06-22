@@ -216,7 +216,6 @@ mod context_tests {
 
         ctx.set_request("POST", "/api/users", vec![], "10.0.0.1");
 
-
         assert_eq!(ctx.request_path, "/api/users");
         assert_eq!(ctx.request_query, "");
     }
@@ -344,9 +343,9 @@ mod integration_tests {
 // Host function tests - tests the Proxy-Wasm ABI implementation
 mod host_function_tests {
     use crate::wasm::capabilities::{CapabilityPreset, ModuleCapabilities};
+    use crate::wasm::constants::{METRIC_TYPE_COUNTER, METRIC_TYPE_GAUGE, METRIC_TYPE_HISTOGRAM};
     use crate::wasm::context::HttpContext;
     use crate::wasm::types::{Metric, MetricValue};
-    use crate::wasm::constants::{METRIC_TYPE_COUNTER, METRIC_TYPE_GAUGE, METRIC_TYPE_HISTOGRAM};
 
     /// Create a test HttpContext with full capabilities
     fn create_test_context() -> HttpContext {
@@ -379,9 +378,11 @@ mod host_function_tests {
     #[test]
     fn test_get_request_header() {
         let ctx = create_test_context();
-        
+
         // Find :path header
-        let header = ctx.request_headers.iter()
+        let header = ctx
+            .request_headers
+            .iter()
             .find(|(k, _)| k.as_slice() == b":path")
             .and_then(|(_, v)| std::str::from_utf8(v).ok());
 
@@ -391,9 +392,11 @@ mod host_function_tests {
     #[test]
     fn test_get_response_header() {
         let ctx = create_test_context();
-        
+
         // Find content-type header
-        let header = ctx.response_headers.iter()
+        let header = ctx
+            .response_headers
+            .iter()
             .find(|(k, _)| k.as_slice() == b"content-type")
             .and_then(|(_, v)| std::str::from_utf8(v).ok());
 
@@ -403,11 +406,12 @@ mod host_function_tests {
     #[test]
     fn test_modify_request_headers() {
         let mut ctx = create_test_context();
-        
+
         // Add a new header
-        ctx.request_headers.push((b"x-custom".to_vec(), b"value".to_vec()));
+        ctx.request_headers
+            .push((b"x-custom".to_vec(), b"value".to_vec()));
         ctx.request_headers_modified = true;
-        
+
         assert!(ctx.has_request_modifications());
         assert_eq!(ctx.request_headers.len(), 5);
     }
@@ -416,11 +420,12 @@ mod host_function_tests {
     fn test_remove_request_header() {
         let mut ctx = create_test_context();
         let original_len = ctx.request_headers.len();
-        
+
         // Remove user-agent header
-        ctx.request_headers.retain(|(k, _)| k.as_slice() != b"user-agent");
+        ctx.request_headers
+            .retain(|(k, _)| k.as_slice() != b"user-agent");
         ctx.request_headers_modified = true;
-        
+
         assert!(ctx.has_request_modifications());
         assert_eq!(ctx.request_headers.len(), original_len - 1);
     }
@@ -430,7 +435,7 @@ mod host_function_tests {
     #[test]
     fn test_get_request_body_bytes() {
         let ctx = create_test_context();
-        
+
         // Get first 10 bytes
         let bytes = &ctx.request_body[0..10];
         assert_eq!(bytes, b"request bo");
@@ -439,10 +444,10 @@ mod host_function_tests {
     #[test]
     fn test_set_request_body() {
         let mut ctx = create_test_context();
-        
+
         ctx.set_request_body(b"new body".to_vec(), true);
         ctx.request_body_modified = true;
-        
+
         assert!(ctx.has_request_modifications());
         assert_eq!(ctx.request_body, b"new body");
         assert!(ctx.request_body_complete);
@@ -451,17 +456,17 @@ mod host_function_tests {
     #[test]
     fn test_get_response_body_bytes() {
         let ctx = create_test_context();
-        
+
         assert_eq!(&ctx.response_body[..8], b"response");
     }
 
     #[test]
     fn test_set_response_body() {
         let mut ctx = create_test_context();
-        
+
         ctx.set_response_body(b"modified response".to_vec(), true);
         ctx.response_body_modified = true;
-        
+
         assert!(ctx.has_response_modifications());
         assert_eq!(ctx.response_body, b"modified response");
     }
@@ -471,13 +476,13 @@ mod host_function_tests {
     #[test]
     fn test_shared_data_set_and_get() {
         let ctx = create_test_context();
-        
+
         // Set shared data
         {
             let mut data = ctx.shared_data.write().unwrap();
             data.insert("test_key".to_string(), (b"test_value".to_vec(), 1));
         }
-        
+
         // Get shared data
         {
             let data = ctx.shared_data.read().unwrap();
@@ -490,19 +495,19 @@ mod host_function_tests {
     #[test]
     fn test_shared_data_cas_increment() {
         let mut ctx = create_test_context();
-        
+
         // Initial CAS
         let cas1 = ctx.shared_data_cas;
         ctx.shared_data_cas += 1;
         let cas2 = ctx.shared_data_cas;
-        
+
         assert_eq!(cas2, cas1 + 1);
     }
 
     #[test]
     fn test_shared_data_not_found() {
         let ctx = create_test_context();
-        
+
         let data = ctx.shared_data.read().unwrap();
         assert!(data.get("nonexistent_key").is_none());
     }
@@ -512,14 +517,17 @@ mod host_function_tests {
     #[test]
     fn test_define_counter_metric() {
         let mut ctx = create_test_context();
-        
+
         let id = ctx.allocate_metric_id();
-        ctx.metrics.insert(id, Metric {
-            metric_type: METRIC_TYPE_COUNTER,
-            name: "test_counter".to_string(),
-            value: MetricValue::Counter(0),
-        });
-        
+        ctx.metrics.insert(
+            id,
+            Metric {
+                metric_type: METRIC_TYPE_COUNTER,
+                name: "test_counter".to_string(),
+                value: MetricValue::Counter(0),
+            },
+        );
+
         assert!(ctx.metrics.contains_key(&id));
         assert_eq!(ctx.metrics[&id].name, "test_counter");
     }
@@ -527,21 +535,24 @@ mod host_function_tests {
     #[test]
     fn test_increment_counter() {
         let mut ctx = create_test_context();
-        
+
         let id = ctx.allocate_metric_id();
-        ctx.metrics.insert(id, Metric {
-            metric_type: METRIC_TYPE_COUNTER,
-            name: "requests".to_string(),
-            value: MetricValue::Counter(0),
-        });
-        
+        ctx.metrics.insert(
+            id,
+            Metric {
+                metric_type: METRIC_TYPE_COUNTER,
+                name: "requests".to_string(),
+                value: MetricValue::Counter(0),
+            },
+        );
+
         // Increment
         if let Some(metric) = ctx.metrics.get_mut(&id) {
             if let MetricValue::Counter(ref mut v) = metric.value {
                 *v += 5;
             }
         }
-        
+
         if let MetricValue::Counter(v) = ctx.metrics[&id].value {
             assert_eq!(v, 5);
         } else {
@@ -552,28 +563,34 @@ mod host_function_tests {
     #[test]
     fn test_define_gauge_metric() {
         let mut ctx = create_test_context();
-        
+
         let id = ctx.allocate_metric_id();
-        ctx.metrics.insert(id, Metric {
-            metric_type: METRIC_TYPE_GAUGE,
-            name: "connections".to_string(),
-            value: MetricValue::Gauge(100),
-        });
-        
+        ctx.metrics.insert(
+            id,
+            Metric {
+                metric_type: METRIC_TYPE_GAUGE,
+                name: "connections".to_string(),
+                value: MetricValue::Gauge(100),
+            },
+        );
+
         assert_eq!(ctx.metrics[&id].metric_type, METRIC_TYPE_GAUGE);
     }
 
     #[test]
     fn test_get_metric_value() {
         let mut ctx = create_test_context();
-        
+
         let id = ctx.allocate_metric_id();
-        ctx.metrics.insert(id, Metric {
-            metric_type: METRIC_TYPE_HISTOGRAM,
-            name: "latency".to_string(),
-            value: MetricValue::Histogram(vec![42]),
-        });
-        
+        ctx.metrics.insert(
+            id,
+            Metric {
+                metric_type: METRIC_TYPE_HISTOGRAM,
+                name: "latency".to_string(),
+                value: MetricValue::Histogram(vec![42]),
+            },
+        );
+
         if let MetricValue::Histogram(ref buckets) = ctx.metrics[&id].value {
             assert_eq!(buckets[0], 42);
         } else {
@@ -586,13 +603,13 @@ mod host_function_tests {
     #[test]
     fn test_send_local_response() {
         let mut ctx = create_test_context();
-        
+
         ctx.local_response = Some(crate::wasm::types::LocalResponse {
             status_code: 403,
             headers: vec![(b"x-blocked".to_vec(), b"true".to_vec())],
             body: b"Forbidden".to_vec(),
         });
-        
+
         assert!(ctx.should_send_local_response());
         let resp = ctx.local_response.as_ref().unwrap();
         assert_eq!(resp.status_code, 403);
@@ -601,7 +618,7 @@ mod host_function_tests {
     #[test]
     fn test_set_effective_context() {
         let mut ctx = create_test_context();
-        
+
         ctx.context_id = 999;
         assert_eq!(ctx.context_id, 999);
     }
@@ -609,7 +626,7 @@ mod host_function_tests {
     #[test]
     fn test_set_tick_period() {
         let mut ctx = create_test_context();
-        
+
         ctx.tick_period_ms = 1000;
         assert_eq!(ctx.tick_period_ms, 1000);
     }
@@ -619,11 +636,11 @@ mod host_function_tests {
     #[test]
     fn test_allocate_http_call_token() {
         let mut ctx = create_test_context();
-        
+
         let token1 = ctx.allocate_http_call_token();
         let token2 = ctx.allocate_http_call_token();
         let token3 = ctx.allocate_http_call_token();
-        
+
         assert_eq!(token1, 1);
         assert_eq!(token2, 2);
         assert_eq!(token3, 3);
@@ -632,17 +649,20 @@ mod host_function_tests {
     #[test]
     fn test_pending_http_call() {
         let mut ctx = create_test_context();
-        
+
         let token = ctx.allocate_http_call_token();
-        ctx.pending_http_calls.insert(token, crate::wasm::types::PendingHttpCall {
+        ctx.pending_http_calls.insert(
             token,
-            upstream: "backend".to_string(),
-            timeout_ms: 5000,
-            headers: vec![(b"Content-Type".to_vec(), b"application/json".to_vec())],
-            body: b"test body".to_vec(),
-            trailers: vec![],
-        });
-        
+            crate::wasm::types::PendingHttpCall {
+                token,
+                upstream: "backend".to_string(),
+                timeout_ms: 5000,
+                headers: vec![(b"Content-Type".to_vec(), b"application/json".to_vec())],
+                body: b"test body".to_vec(),
+                trailers: vec![],
+            },
+        );
+
         assert!(ctx.pending_http_calls.contains_key(&token));
         assert_eq!(ctx.pending_http_calls[&token].upstream, "backend");
     }
@@ -650,16 +670,19 @@ mod host_function_tests {
     #[test]
     fn test_http_call_response() {
         let mut ctx = create_test_context();
-        
+
         let token = ctx.allocate_http_call_token();
-        ctx.http_call_responses.insert(token, crate::wasm::types::HttpCallResponse {
-            status_code: 200,
-            headers: vec![(b"content-type".to_vec(), b"text/plain".to_vec())],
-            body: b"OK".to_vec(),
-            trailers: vec![],
-        });
+        ctx.http_call_responses.insert(
+            token,
+            crate::wasm::types::HttpCallResponse {
+                status_code: 200,
+                headers: vec![(b"content-type".to_vec(), b"text/plain".to_vec())],
+                body: b"OK".to_vec(),
+                trailers: vec![],
+            },
+        );
         ctx.current_http_call_token = Some(token);
-        
+
         let resp = ctx.http_call_responses.get(&token).unwrap();
         assert_eq!(resp.status_code, 200);
     }
@@ -690,7 +713,7 @@ mod host_function_tests {
             allowed_properties: vec!["request.*".to_string()],
             ..Default::default()
         };
-        
+
         assert!(caps.is_property_allowed("request.path"));
         assert!(caps.is_property_allowed("request.method"));
         assert!(!caps.is_property_allowed("response.status"));
@@ -703,7 +726,7 @@ mod host_function_tests {
             allowed_upstreams: vec!["webdis".to_string(), "auth".to_string()],
             ..Default::default()
         };
-        
+
         assert!(caps.is_upstream_allowed("webdis"));
         assert!(caps.is_upstream_allowed("auth"));
         assert!(!caps.is_upstream_allowed("other_backend"));
@@ -717,13 +740,14 @@ mod host_function_tests {
             ..Default::default()
         };
         let mut ctx = HttpContext::new(1, caps);
-        
+
         // Initially empty
         assert!(ctx.custom_properties.is_empty());
-        
+
         // Add a custom property
-        ctx.custom_properties.insert("my.custom.property".to_string(), b"test_value".to_vec());
-        
+        ctx.custom_properties
+            .insert("my.custom.property".to_string(), b"test_value".to_vec());
+
         // Verify it's stored
         assert_eq!(ctx.custom_properties.len(), 1);
         assert_eq!(
@@ -731,7 +755,7 @@ mod host_function_tests {
             Some(&b"test_value".to_vec())
         );
     }
-    
+
     /// Test multiple custom properties
     #[test]
     fn test_multiple_custom_properties() {
@@ -740,15 +764,17 @@ mod host_function_tests {
             ..Default::default()
         };
         let mut ctx = HttpContext::new(1, caps);
-        
-        ctx.custom_properties.insert("filter.state.key1".to_string(), b"value1".to_vec());
-        ctx.custom_properties.insert("filter.state.key2".to_string(), b"value2".to_vec());
-        ctx.custom_properties.insert("metadata.key3".to_string(), b"value3".to_vec());
-        
+
+        ctx.custom_properties
+            .insert("filter.state.key1".to_string(), b"value1".to_vec());
+        ctx.custom_properties
+            .insert("filter.state.key2".to_string(), b"value2".to_vec());
+        ctx.custom_properties
+            .insert("metadata.key3".to_string(), b"value3".to_vec());
+
         assert_eq!(ctx.custom_properties.len(), 3);
     }
 }
-
 
 // P1: Lifecycle callback tests
 mod lifecycle_callback_tests {
@@ -760,7 +786,7 @@ mod lifecycle_callback_tests {
     fn test_context_log_phase_tracking() {
         let caps = CapabilityPreset::Extended.to_capabilities();
         let ctx = HttpContext::new(1, caps);
-        
+
         // Context should be in initial state
         assert!(!ctx.should_send_local_response());
         assert!(!ctx.has_request_modifications());
@@ -772,17 +798,25 @@ mod lifecycle_callback_tests {
     fn test_context_for_log_callback() {
         let caps = CapabilityPreset::Standard.to_capabilities();
         let mut ctx = HttpContext::new(1, caps);
-        
+
         // Set up request/response data that would be available during log phase
-        ctx.set_request("GET", "/api/test", vec![
-            (b":method".to_vec(), b"GET".to_vec()),
-            (b":path".to_vec(), b"/api/test".to_vec()),
-        ], "192.168.1.1");
-        ctx.set_response(200, vec![
-            (b":status".to_vec(), b"200".to_vec()),
-            (b"content-type".to_vec(), b"application/json".to_vec()),
-        ]);
-        
+        ctx.set_request(
+            "GET",
+            "/api/test",
+            vec![
+                (b":method".to_vec(), b"GET".to_vec()),
+                (b":path".to_vec(), b"/api/test".to_vec()),
+            ],
+            "192.168.1.1",
+        );
+        ctx.set_response(
+            200,
+            vec![
+                (b":status".to_vec(), b"200".to_vec()),
+                (b"content-type".to_vec(), b"application/json".to_vec()),
+            ],
+        );
+
         // Verify data is accessible (would be used by proxy_on_log)
         assert_eq!(ctx.request_method, "GET");
         assert_eq!(ctx.request_path, "/api/test");
@@ -795,15 +829,15 @@ mod lifecycle_callback_tests {
     fn test_context_for_done_callback() {
         let caps = CapabilityPreset::Extended.to_capabilities();
         let mut ctx = HttpContext::new(42, caps);
-        
+
         // Simulate some state that would exist when done is called
         ctx.request_headers_modified = true;
         ctx.response_headers_modified = true;
-        
+
         // Create some pending state
         let token = ctx.allocate_http_call_token();
         assert_eq!(token, 1);
-        
+
         // Verify modifications tracked
         assert!(ctx.has_request_modifications());
         assert!(ctx.has_response_modifications());
@@ -816,7 +850,7 @@ mod lifecycle_callback_tests {
         // 0 = delete context, 1 = keep alive
         let delete_context: i32 = 0;
         let keep_alive: i32 = 1;
-        
+
         assert_eq!(delete_context != 0, false);
         assert_eq!(keep_alive != 0, true);
     }
@@ -825,11 +859,11 @@ mod lifecycle_callback_tests {
     #[test]
     fn test_lifecycle_context_ids() {
         let caps = CapabilityPreset::Standard.to_capabilities();
-        
+
         // Root context ID (typically 1)
         let root_ctx = HttpContext::new(1, caps.clone());
         assert_eq!(root_ctx.context_id, 1);
-        
+
         // HTTP context ID (typically 2, 3, etc.)
         let http_ctx = HttpContext::new(2, caps);
         assert_eq!(http_ctx.context_id, 2);
@@ -854,14 +888,14 @@ mod p2_callback_tests {
     fn test_tick_period_configuration() {
         let caps = CapabilityPreset::Extended.to_capabilities();
         let mut ctx = HttpContext::new(1, caps);
-        
+
         // Default tick period should be 0 (disabled)
         assert_eq!(ctx.tick_period_ms, 0);
-        
+
         // Set tick period
         ctx.tick_period_ms = 1000;
         assert_eq!(ctx.tick_period_ms, 1000);
-        
+
         // Set to different value
         ctx.tick_period_ms = 500;
         assert_eq!(ctx.tick_period_ms, 500);
@@ -872,10 +906,10 @@ mod p2_callback_tests {
     fn test_context_for_tick_callback() {
         let caps = CapabilityPreset::Standard.to_capabilities();
         let mut ctx = HttpContext::new(1, caps);
-        
+
         // Root context ID for tick (typically 1)
         assert_eq!(ctx.context_id, 1);
-        
+
         // Enable tick
         ctx.tick_period_ms = 100;
         assert!(ctx.tick_period_ms > 0);
@@ -886,10 +920,10 @@ mod p2_callback_tests {
     fn test_request_trailers_context() {
         let caps = CapabilityPreset::Extended.to_capabilities();
         let mut ctx = HttpContext::new(1, caps);
-        
+
         // Initially empty
         assert!(ctx.request_trailers.is_empty());
-        
+
         // Set trailers
         ctx.request_trailers = vec![
             (b"grpc-status".to_vec(), b"0".to_vec()),
@@ -905,10 +939,10 @@ mod p2_callback_tests {
     fn test_response_trailers_context() {
         let caps = CapabilityPreset::Extended.to_capabilities();
         let mut ctx = HttpContext::new(1, caps);
-        
+
         // Initially empty
         assert!(ctx.response_trailers.is_empty());
-        
+
         // Set trailers
         ctx.response_trailers = vec![
             (b"grpc-status".to_vec(), b"0".to_vec()),
@@ -925,10 +959,10 @@ mod p2_callback_tests {
     fn test_shared_queue_context() {
         let caps = CapabilityPreset::Extended.to_capabilities();
         let ctx = HttpContext::new(1, caps);
-        
+
         // Shared data should be initialized
         assert!(ctx.shared_data.read().unwrap().is_empty());
-        
+
         // Verify capability for queue operations
         assert!(ctx.capabilities.allow_shared_data);
     }
@@ -940,7 +974,7 @@ mod p2_callback_tests {
         let queue_id_1: u32 = 1;
         let queue_id_2: u32 = 2;
         let queue_id_max: u32 = u32::MAX;
-        
+
         assert_ne!(queue_id_1, queue_id_2);
         assert!(queue_id_max > queue_id_2);
     }
@@ -952,7 +986,7 @@ mod p2_callback_tests {
         let period_ms: u32 = 1000;
         let ticks_per_second = 1000.0 / period_ms as f64;
         assert!((ticks_per_second - 1.0).abs() < f64::EPSILON);
-        
+
         // 100ms period = 10 ticks per second
         let period_ms_fast: u32 = 100;
         let ticks_per_second_fast = 1000.0 / period_ms_fast as f64;
@@ -979,12 +1013,12 @@ mod p3_grpc_callback_tests {
     fn test_grpc_call_id_allocation() {
         let caps = CapabilityPreset::Extended.to_capabilities();
         let mut ctx = HttpContext::new(1, caps);
-        
+
         // Test gRPC call ID allocation
         let call_id_1 = ctx.next_grpc_call_id();
         let call_id_2 = ctx.next_grpc_call_id();
         let call_id_3 = ctx.next_grpc_call_id();
-        
+
         assert_eq!(call_id_1, 1);
         assert_eq!(call_id_2, 2);
         assert_eq!(call_id_3, 3);
@@ -994,12 +1028,12 @@ mod p3_grpc_callback_tests {
     #[test]
     fn test_grpc_stream_states() {
         use crate::wasm::context::{GrpcStream, GrpcStreamState};
-        
+
         // Test all stream states
         assert_eq!(GrpcStreamState::Open, GrpcStreamState::Open);
         assert_ne!(GrpcStreamState::Open, GrpcStreamState::HalfClosed);
         assert_ne!(GrpcStreamState::HalfClosed, GrpcStreamState::Closed);
-        
+
         // Create a stream
         let stream = GrpcStream {
             stream_id: 1,
@@ -1010,7 +1044,7 @@ mod p3_grpc_callback_tests {
             pending_messages: vec![],
             initial_metadata: vec![],
         };
-        
+
         assert_eq!(stream.stream_id, 1);
         assert_eq!(stream.state, GrpcStreamState::Open);
     }
@@ -1020,7 +1054,7 @@ mod p3_grpc_callback_tests {
     fn test_grpc_call_registration() {
         let caps = CapabilityPreset::Extended.to_capabilities();
         let mut ctx = HttpContext::new(1, caps);
-        
+
         let call_id = ctx.next_grpc_call_id();
         ctx.register_grpc_call(
             call_id,
@@ -1028,7 +1062,7 @@ mod p3_grpc_callback_tests {
             vec![0x0a, 0x00],
             5000,
         );
-        
+
         assert!(ctx.pending_grpc_calls.contains_key(&call_id));
         let (path, message, timeout) = ctx.pending_grpc_calls.get(&call_id).unwrap();
         assert_eq!(path, "/grpc.health.v1.Health/Check");
@@ -1041,25 +1075,20 @@ mod p3_grpc_callback_tests {
     fn test_grpc_call_cancellation() {
         let caps = CapabilityPreset::Extended.to_capabilities();
         let mut ctx = HttpContext::new(1, caps);
-        
+
         let call_id = ctx.next_grpc_call_id();
-        ctx.register_grpc_call(
-            call_id,
-            "/test.Service/Method".to_string(),
-            vec![],
-            1000,
-        );
-        
+        ctx.register_grpc_call(call_id, "/test.Service/Method".to_string(), vec![], 1000);
+
         // Cancel the call
         let cancelled = ctx.cancel_grpc_call(call_id);
         assert!(cancelled);
-        
+
         // Verify it's removed from pending
         assert!(!ctx.pending_grpc_calls.contains_key(&call_id));
-        
+
         // Verify it's in cancelled set
         assert!(ctx.cancelled_grpc_calls.contains(&call_id));
-        
+
         // Cancelling again should return false
         let cancelled_again = ctx.cancel_grpc_call(call_id);
         assert!(!cancelled_again);
@@ -1076,7 +1105,7 @@ mod p3_grpc_callback_tests {
         let deadline_exceeded: i32 = 4;
         let not_found: i32 = 5;
         let unavailable: i32 = 14;
-        
+
         assert_eq!(ok, 0);
         assert_eq!(cancelled, 1);
         assert_eq!(unknown, 2);
@@ -1093,12 +1122,12 @@ mod p3_grpc_callback_tests {
             ("content-type".to_string(), "application/grpc".to_string()),
             ("grpc-accept-encoding".to_string(), "gzip".to_string()),
         ];
-        
+
         let trailing_metadata: Vec<(String, String)> = vec![
             ("grpc-status".to_string(), "0".to_string()),
             ("grpc-message".to_string(), "OK".to_string()),
         ];
-        
+
         assert_eq!(initial_metadata.len(), 2);
         assert_eq!(trailing_metadata.len(), 2);
         assert_eq!(initial_metadata[0].0, "content-type");
@@ -1110,16 +1139,16 @@ mod p3_grpc_callback_tests {
     fn test_take_pending_grpc_calls() {
         let caps = CapabilityPreset::Extended.to_capabilities();
         let mut ctx = HttpContext::new(1, caps);
-        
+
         // Register multiple calls
         ctx.register_grpc_call(1, "/path1".to_string(), vec![1], 100);
         ctx.register_grpc_call(2, "/path2".to_string(), vec![2], 200);
-        
+
         assert_eq!(ctx.pending_grpc_calls.len(), 2);
-        
+
         // Take all pending calls
         let taken = ctx.take_pending_grpc_calls();
-        
+
         assert_eq!(taken.len(), 2);
         assert!(ctx.pending_grpc_calls.is_empty());
     }

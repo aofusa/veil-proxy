@@ -220,7 +220,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             }
 
             // Replace range with new value
-            let mut new_buffer = Vec::with_capacity(start_pos + value.len() + buffer.len() - end_pos);
+            let mut new_buffer =
+                Vec::with_capacity(start_pos + value.len() + buffer.len() - end_pos);
             new_buffer.extend_from_slice(&buffer[..start_pos]);
             new_buffer.extend_from_slice(&value);
             if end_pos < buffer.len() {

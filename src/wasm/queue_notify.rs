@@ -33,20 +33,20 @@ impl QueueSubscriptionRegistry {
 }
 
 /// Subscribe a module to a queue
-/// 
+///
 /// Called when a module resolves a queue via proxy_resolve_shared_queue.
 pub fn subscribe_to_queue(module_name: &str, queue_id: u32) {
     let mut registry = match QUEUE_SUBSCRIPTIONS.write() {
         Ok(r) => r,
         Err(_) => return,
     };
-    
+
     registry
         .subscriptions
         .entry(queue_id)
         .or_default()
         .insert(module_name.to_string());
-    
+
     ftlog::debug!(
         "[wasm:queue] Module '{}' subscribed to queue {}",
         module_name,
@@ -60,21 +60,21 @@ pub fn unsubscribe_from_queue(module_name: &str, queue_id: u32) {
         Ok(r) => r,
         Err(_) => return,
     };
-    
+
     if let Some(subscribers) = registry.subscriptions.get_mut(&queue_id) {
         subscribers.remove(module_name);
     }
 }
 
 /// Unsubscribe a module from all queues
-/// 
+///
 /// Called when a module context is destroyed.
 pub fn unsubscribe_from_all_queues(module_name: &str) {
     let mut registry = match QUEUE_SUBSCRIPTIONS.write() {
         Ok(r) => r,
         Err(_) => return,
     };
-    
+
     for subscribers in registry.subscriptions.values_mut() {
         subscribers.remove(module_name);
     }
@@ -86,7 +86,7 @@ pub fn get_queue_subscribers(queue_id: u32) -> Vec<String> {
         Ok(r) => r,
         Err(_) => return Vec::new(),
     };
-    
+
     registry
         .subscriptions
         .get(&queue_id)
@@ -95,11 +95,11 @@ pub fn get_queue_subscribers(queue_id: u32) -> Vec<String> {
 }
 
 /// Notify all subscribers of a queue that data is available
-/// 
+///
 /// This should be called after proxy_enqueue_shared_queue adds data to a queue.
 pub fn notify_queue_subscribers(engine: &Arc<FilterEngine>, queue_id: u32) {
     let subscribers = get_queue_subscribers(queue_id);
-    
+
     for module_name in subscribers {
         engine.on_queue_ready(&module_name, queue_id);
     }
@@ -111,7 +111,7 @@ pub fn register_queue_name(queue_name: &str, queue_id: u32) {
         Ok(r) => r,
         Err(_) => return,
     };
-    
+
     registry.name_to_id.insert(queue_name.to_string(), queue_id);
 }
 
@@ -121,7 +121,7 @@ pub fn resolve_queue_name(queue_name: &str) -> Option<u32> {
         Ok(r) => r,
         Err(_) => return None,
     };
-    
+
     registry.name_to_id.get(queue_name).copied()
 }
 
@@ -130,18 +130,21 @@ static PENDING_QUEUE_NOTIFICATIONS: Lazy<RwLock<HashSet<u32>>> =
     Lazy::new(|| RwLock::new(HashSet::new()));
 
 /// Mark a queue as having pending notifications
-/// 
+///
 /// This should be called after proxy_enqueue_shared_queue adds data to a queue.
 /// The notification will be processed later when process_pending_notifications is called.
 pub fn queue_enqueued(queue_id: u32) {
     if let Ok(mut pending) = PENDING_QUEUE_NOTIFICATIONS.write() {
         pending.insert(queue_id);
-        ftlog::debug!("[wasm:queue] Queue {} marked as having pending notifications", queue_id);
+        ftlog::debug!(
+            "[wasm:queue] Queue {} marked as having pending notifications",
+            queue_id
+        );
     }
 }
 
 /// Process all pending queue notifications
-/// 
+///
 /// This should be called periodically (e.g., in the tick loop) to deliver
 /// queue notifications to subscribed modules.
 pub fn process_pending_notifications(engine: &Arc<FilterEngine>) {
@@ -152,7 +155,7 @@ pub fn process_pending_notifications(engine: &Arc<FilterEngine>) {
             Err(_) => return,
         }
     };
-    
+
     // Notify subscribers for each queue
     for queue_id in pending {
         notify_queue_subscribers(engine, queue_id);
@@ -165,9 +168,9 @@ pub fn get_queue_stats() -> QueueStats {
         Ok(r) => r,
         Err(_) => return QueueStats::default(),
     };
-    
+
     let total_subscriptions: usize = registry.subscriptions.values().map(|s| s.len()).sum();
-    
+
     QueueStats {
         registered_queues: registry.name_to_id.len(),
         queues_with_subscribers: registry.subscriptions.len(),
@@ -189,50 +192,50 @@ pub struct QueueStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_subscribe_to_queue() {
         subscribe_to_queue("test_module_sub", 100);
-        
+
         let subscribers = get_queue_subscribers(100);
         assert!(subscribers.contains(&"test_module_sub".to_string()));
-        
+
         // Cleanup
         unsubscribe_from_queue("test_module_sub", 100);
     }
-    
+
     #[test]
     fn test_unsubscribe_from_all() {
         subscribe_to_queue("test_module_unsub", 200);
         subscribe_to_queue("test_module_unsub", 201);
-        
+
         unsubscribe_from_all_queues("test_module_unsub");
-        
+
         assert!(!get_queue_subscribers(200).contains(&"test_module_unsub".to_string()));
         assert!(!get_queue_subscribers(201).contains(&"test_module_unsub".to_string()));
     }
-    
+
     #[test]
     fn test_queue_name_resolution() {
         register_queue_name("my.queue.name", 300);
-        
+
         let id = resolve_queue_name("my.queue.name");
         assert_eq!(id, Some(300));
-        
+
         let unknown = resolve_queue_name("unknown.queue");
         assert_eq!(unknown, None);
     }
-    
+
     #[test]
     fn test_queue_stats() {
         subscribe_to_queue("stats_module_1", 400);
         subscribe_to_queue("stats_module_2", 400);
         register_queue_name("stats.queue", 400);
-        
+
         let stats = get_queue_stats();
         assert!(stats.registered_queues >= 1);
         assert!(stats.queues_with_subscribers >= 1);
-        
+
         // Cleanup
         unsubscribe_from_queue("stats_module_1", 400);
         unsubscribe_from_queue("stats_module_2", 400);

@@ -253,10 +253,7 @@ mod tests {
     #[test]
     fn test_property_allowed() {
         let caps = ModuleCapabilities {
-            allowed_properties: vec![
-                "request.*".to_string(),
-                "source.address".to_string(),
-            ],
+            allowed_properties: vec!["request.*".to_string(), "source.address".to_string()],
             ..Default::default()
         };
 

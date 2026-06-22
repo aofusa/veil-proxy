@@ -51,35 +51,41 @@ use once_cell::sync::Lazy;
 
 #[cfg(feature = "metrics")]
 use prometheus::{
-    CounterVec, Histogram, HistogramOpts, HistogramVec, IntGaugeVec,
-    Opts, Registry, TextEncoder, Encoder,
+    CounterVec, Encoder, Histogram, HistogramOpts, HistogramVec, IntGaugeVec, Opts, Registry,
+    TextEncoder,
 };
-
 
 #[cfg(feature = "metrics")]
 /// Prometheusメトリクスレジストリ（グローバル）
-pub(crate) static METRICS_REGISTRY: Lazy<Registry> = Lazy::new(|| {
-    Registry::new()
-});
+pub(crate) static METRICS_REGISTRY: Lazy<Registry> = Lazy::new(|| Registry::new());
 
 #[cfg(feature = "metrics")]
 /// HTTPリクエスト総数カウンター（method, status, host ラベル付き）
 pub(crate) static HTTP_REQUESTS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
-    let opts = Opts::new("http_requests_total", "Total number of HTTP requests")
-        .namespace("veil_proxy");
+    let opts =
+        Opts::new("http_requests_total", "Total number of HTTP requests").namespace("veil_proxy");
     let counter = CounterVec::new(opts, &["method", "status", "host"]).unwrap();
-    METRICS_REGISTRY.register(Box::new(counter.clone())).unwrap();
+    METRICS_REGISTRY
+        .register(Box::new(counter.clone()))
+        .unwrap();
     counter
 });
 
 #[cfg(feature = "metrics")]
 /// HTTPリクエスト処理時間ヒストグラム（method, host ラベル付き）
 pub(crate) static HTTP_REQUEST_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
-    let opts = HistogramOpts::new("http_request_duration_seconds", "HTTP request duration in seconds")
-        .namespace("veil_proxy")
-        .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]);
+    let opts = HistogramOpts::new(
+        "http_request_duration_seconds",
+        "HTTP request duration in seconds",
+    )
+    .namespace("veil_proxy")
+    .buckets(vec![
+        0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+    ]);
     let histogram = HistogramVec::new(opts, &["method", "host"]).unwrap();
-    METRICS_REGISTRY.register(Box::new(histogram.clone())).unwrap();
+    METRICS_REGISTRY
+        .register(Box::new(histogram.clone()))
+        .unwrap();
     histogram
 });
 
@@ -88,28 +94,48 @@ pub(crate) static HTTP_REQUEST_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(
 pub(crate) static HTTP_REQUEST_SIZE_BYTES: Lazy<Histogram> = Lazy::new(|| {
     let opts = HistogramOpts::new("http_request_size_bytes", "HTTP request body size in bytes")
         .namespace("veil_proxy")
-        .buckets(vec![100.0, 1000.0, 10000.0, 100000.0, 1000000.0, 10000000.0]);
+        .buckets(vec![
+            100.0, 1000.0, 10000.0, 100000.0, 1000000.0, 10000000.0,
+        ]);
     let histogram = Histogram::with_opts(opts).unwrap();
-    METRICS_REGISTRY.register(Box::new(histogram.clone())).unwrap();
+    METRICS_REGISTRY
+        .register(Box::new(histogram.clone()))
+        .unwrap();
     histogram
 });
 
 #[cfg(feature = "metrics")]
 /// HTTPレスポンスボディサイズヒストグラム
 pub(crate) static HTTP_RESPONSE_SIZE_BYTES: Lazy<Histogram> = Lazy::new(|| {
-    let opts = HistogramOpts::new("http_response_size_bytes", "HTTP response body size in bytes")
-        .namespace("veil_proxy")
-        .buckets(vec![100.0, 1000.0, 10000.0, 100000.0, 1000000.0, 10000000.0, 100000000.0]);
+    let opts = HistogramOpts::new(
+        "http_response_size_bytes",
+        "HTTP response body size in bytes",
+    )
+    .namespace("veil_proxy")
+    .buckets(vec![
+        100.0,
+        1000.0,
+        10000.0,
+        100000.0,
+        1000000.0,
+        10000000.0,
+        100000000.0,
+    ]);
     let histogram = Histogram::with_opts(opts).unwrap();
-    METRICS_REGISTRY.register(Box::new(histogram.clone())).unwrap();
+    METRICS_REGISTRY
+        .register(Box::new(histogram.clone()))
+        .unwrap();
     histogram
 });
 
 #[cfg(feature = "metrics")]
 /// アクティブ接続数ゲージ（ホスト別）
 pub(crate) static HTTP_ACTIVE_CONNECTIONS: Lazy<IntGaugeVec> = Lazy::new(|| {
-    let opts = Opts::new("http_active_connections", "Number of active HTTP connections")
-        .namespace("veil_proxy");
+    let opts = Opts::new(
+        "http_active_connections",
+        "Number of active HTTP connections",
+    )
+    .namespace("veil_proxy");
     let gauge = IntGaugeVec::new(opts, &["host"]).unwrap();
     METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
     gauge
@@ -177,8 +203,11 @@ impl Drop for ConnectionGuard {
 /// アップストリーム健康状態ゲージ（upstream, server ラベル付き）
 /// 1 = healthy, 0 = unhealthy
 pub(crate) static HTTP_UPSTREAM_HEALTH: Lazy<IntGaugeVec> = Lazy::new(|| {
-    let opts = Opts::new("http_upstream_health", "Upstream server health status (1=healthy, 0=unhealthy)")
-        .namespace("veil_proxy");
+    let opts = Opts::new(
+        "http_upstream_health",
+        "Upstream server health status (1=healthy, 0=unhealthy)",
+    )
+    .namespace("veil_proxy");
     let gauge = IntGaugeVec::new(opts, &["upstream", "server"]).unwrap();
     METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
     gauge
@@ -191,20 +220,23 @@ pub(crate) static HTTP_UPSTREAM_HEALTH: Lazy<IntGaugeVec> = Lazy::new(|| {
 #[cfg(feature = "metrics")]
 /// キャッシュヒット数カウンター（host ラベル付き）
 pub(crate) static CACHE_HITS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
-    let opts = Opts::new("cache_hits_total", "Total number of cache hits")
-        .namespace("veil_proxy");
+    let opts = Opts::new("cache_hits_total", "Total number of cache hits").namespace("veil_proxy");
     let counter = CounterVec::new(opts, &["host"]).unwrap();
-    METRICS_REGISTRY.register(Box::new(counter.clone())).unwrap();
+    METRICS_REGISTRY
+        .register(Box::new(counter.clone()))
+        .unwrap();
     counter
 });
 
 #[cfg(feature = "metrics")]
 /// キャッシュミス数カウンター（host ラベル付き）
 pub(crate) static CACHE_MISSES_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
-    let opts = Opts::new("cache_misses_total", "Total number of cache misses")
-        .namespace("veil_proxy");
+    let opts =
+        Opts::new("cache_misses_total", "Total number of cache misses").namespace("veil_proxy");
     let counter = CounterVec::new(opts, &["host"]).unwrap();
-    METRICS_REGISTRY.register(Box::new(counter.clone())).unwrap();
+    METRICS_REGISTRY
+        .register(Box::new(counter.clone()))
+        .unwrap();
     counter
 });
 
@@ -212,10 +244,12 @@ pub(crate) static CACHE_MISSES_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
 /// キャッシュ保存数カウンター（host, storage ラベル付き）
 /// storage: "memory" or "disk"
 pub(crate) static CACHE_STORES_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
-    let opts = Opts::new("cache_stores_total", "Total number of cache stores")
-        .namespace("veil_proxy");
+    let opts =
+        Opts::new("cache_stores_total", "Total number of cache stores").namespace("veil_proxy");
     let counter = CounterVec::new(opts, &["host", "storage"]).unwrap();
-    METRICS_REGISTRY.register(Box::new(counter.clone())).unwrap();
+    METRICS_REGISTRY
+        .register(Box::new(counter.clone()))
+        .unwrap();
     counter
 });
 
@@ -226,7 +260,9 @@ pub(crate) static CACHE_EVICTIONS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     let opts = Opts::new("cache_evictions_total", "Total number of cache evictions")
         .namespace("veil_proxy");
     let counter = CounterVec::new(opts, &["reason"]).unwrap();
-    METRICS_REGISTRY.register(Box::new(counter.clone())).unwrap();
+    METRICS_REGISTRY
+        .register(Box::new(counter.clone()))
+        .unwrap();
     counter
 });
 
@@ -235,8 +271,7 @@ pub(crate) static CACHE_EVICTIONS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
 /// storage: "memory" or "disk"
 #[allow(dead_code)]
 pub(crate) static CACHE_SIZE_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
-    let opts = Opts::new("cache_size_bytes", "Current cache size in bytes")
-        .namespace("veil_proxy");
+    let opts = Opts::new("cache_size_bytes", "Current cache size in bytes").namespace("veil_proxy");
     let gauge = IntGaugeVec::new(opts, &["storage"]).unwrap();
     METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
     gauge
@@ -246,8 +281,8 @@ pub(crate) static CACHE_SIZE_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
 /// キャッシュエントリ数ゲージ
 #[allow(dead_code)]
 pub(crate) static CACHE_ENTRIES: Lazy<IntGaugeVec> = Lazy::new(|| {
-    let opts = Opts::new("cache_entries", "Current number of cache entries")
-        .namespace("veil_proxy");
+    let opts =
+        Opts::new("cache_entries", "Current number of cache entries").namespace("veil_proxy");
     let gauge = IntGaugeVec::new(opts, &["storage"]).unwrap();
     METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
     gauge
@@ -257,10 +292,15 @@ pub(crate) static CACHE_ENTRIES: Lazy<IntGaugeVec> = Lazy::new(|| {
 /// バッファリング使用数カウンター（mode ラベル付き）
 /// バッファリングが使用された回数（ホストごと）
 pub(crate) static BUFFERING_USED_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
-    let opts = Opts::new("buffering_used_total", "Total number of requests using buffering")
-        .namespace("veil_proxy");
+    let opts = Opts::new(
+        "buffering_used_total",
+        "Total number of requests using buffering",
+    )
+    .namespace("veil_proxy");
     let counter = CounterVec::new(opts, &["host"]).unwrap();
-    METRICS_REGISTRY.register(Box::new(counter.clone())).unwrap();
+    METRICS_REGISTRY
+        .register(Box::new(counter.clone()))
+        .unwrap();
     counter
 });
 
@@ -268,7 +308,9 @@ pub(crate) static BUFFERING_USED_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
 #[inline]
 pub(crate) fn update_upstream_health(_upstream: &str, _server: &str, _healthy: bool) {
     #[cfg(feature = "metrics")]
-    HTTP_UPSTREAM_HEALTH.with_label_values(&[_upstream, _server]).set(if _healthy { 1 } else { 0 });
+    HTTP_UPSTREAM_HEALTH
+        .with_label_values(&[_upstream, _server])
+        .set(if _healthy { 1 } else { 0 });
 }
 
 /// メトリクス: キャッシュヒットを記録
@@ -290,14 +332,18 @@ pub(crate) fn record_cache_miss(_host: &str) {
 #[inline]
 pub(crate) fn record_cache_store(_host: &str, _storage: &str) {
     #[cfg(feature = "metrics")]
-    CACHE_STORES_TOTAL.with_label_values(&[_host, _storage]).inc();
+    CACHE_STORES_TOTAL
+        .with_label_values(&[_host, _storage])
+        .inc();
 }
 
 /// メトリクス: キャッシュ削除を記録
 #[inline]
 pub(crate) fn record_cache_eviction(_reason: &str, _count: usize) {
     #[cfg(feature = "metrics")]
-    CACHE_EVICTIONS_TOTAL.with_label_values(&[_reason]).inc_by(_count as f64);
+    CACHE_EVICTIONS_TOTAL
+        .with_label_values(&[_reason])
+        .inc_by(_count as f64);
 }
 
 /// メトリクス: キャッシュサイズを更新
@@ -305,9 +351,15 @@ pub(crate) fn record_cache_eviction(_reason: &str, _count: usize) {
 pub(crate) fn update_cache_size_metrics(_stats: &crate::cache::CacheStats) {
     #[cfg(all(feature = "metrics", feature = "cache"))]
     {
-        CACHE_SIZE_BYTES.with_label_values(&["memory"]).set(_stats.memory_usage as i64);
-        CACHE_SIZE_BYTES.with_label_values(&["disk"]).set(_stats.disk_usage as i64);
-        CACHE_ENTRIES.with_label_values(&["memory"]).set(_stats.entries as i64);
+        CACHE_SIZE_BYTES
+            .with_label_values(&["memory"])
+            .set(_stats.memory_usage as i64);
+        CACHE_SIZE_BYTES
+            .with_label_values(&["disk"])
+            .set(_stats.disk_usage as i64);
+        CACHE_ENTRIES
+            .with_label_values(&["memory"])
+            .set(_stats.entries as i64);
         CACHE_ENTRIES.with_label_values(&["disk"]).set(0);
     }
 }
@@ -330,18 +382,26 @@ pub(crate) fn record_buffering_used(_host: &str) {
 #[cfg(feature = "metrics")]
 /// サーキットブレーカーが Open になった累計回数（upstream ラベル）
 pub(crate) static CIRCUIT_BREAKER_OPEN_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
-    let opts = Opts::new("circuit_breaker_open_total", "Total times a circuit breaker opened")
-        .namespace("veil");
+    let opts = Opts::new(
+        "circuit_breaker_open_total",
+        "Total times a circuit breaker opened",
+    )
+    .namespace("veil");
     let counter = CounterVec::new(opts, &["upstream"]).unwrap();
-    METRICS_REGISTRY.register(Box::new(counter.clone())).unwrap();
+    METRICS_REGISTRY
+        .register(Box::new(counter.clone()))
+        .unwrap();
     counter
 });
 
 #[cfg(feature = "metrics")]
 /// サーキットブレーカーの状態ゲージ（0=closed,1=open,2=half_open）
 pub(crate) static CIRCUIT_BREAKER_STATE: Lazy<IntGaugeVec> = Lazy::new(|| {
-    let opts = Opts::new("circuit_breaker_state", "Circuit breaker state (0=closed,1=open,2=half_open)")
-        .namespace("veil");
+    let opts = Opts::new(
+        "circuit_breaker_state",
+        "Circuit breaker state (0=closed,1=open,2=half_open)",
+    )
+    .namespace("veil");
     let gauge = IntGaugeVec::new(opts, &["upstream"]).unwrap();
     METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
     gauge
@@ -350,18 +410,22 @@ pub(crate) static CIRCUIT_BREAKER_STATE: Lazy<IntGaugeVec> = Lazy::new(|| {
 #[cfg(feature = "metrics")]
 /// リトライ回数カウンター（upstream, result ラベル）
 pub(crate) static RETRY_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
-    let opts = Opts::new("retry_total", "Total number of upstream retries")
-        .namespace("veil");
+    let opts = Opts::new("retry_total", "Total number of upstream retries").namespace("veil");
     let counter = CounterVec::new(opts, &["upstream", "result"]).unwrap();
-    METRICS_REGISTRY.register(Box::new(counter.clone())).unwrap();
+    METRICS_REGISTRY
+        .register(Box::new(counter.clone()))
+        .unwrap();
     counter
 });
 
 #[cfg(feature = "metrics")]
 /// 異常検知による排除状態ゲージ（upstream, server ラベル、1=排除中）
 pub(crate) static OUTLIER_EJECTED: Lazy<IntGaugeVec> = Lazy::new(|| {
-    let opts = Opts::new("outlier_ejected", "Outlier-ejected upstream servers (1=ejected)")
-        .namespace("veil");
+    let opts = Opts::new(
+        "outlier_ejected",
+        "Outlier-ejected upstream servers (1=ejected)",
+    )
+    .namespace("veil");
     let gauge = IntGaugeVec::new(opts, &["upstream", "server"]).unwrap();
     METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
     gauge
@@ -372,7 +436,9 @@ pub(crate) static OUTLIER_EJECTED: Lazy<IntGaugeVec> = Lazy::new(|| {
 pub fn record_circuit_breaker_open(_upstream: &str) {
     #[cfg(feature = "metrics")]
     if metrics_runtime_enabled() {
-        CIRCUIT_BREAKER_OPEN_TOTAL.with_label_values(&[_upstream]).inc();
+        CIRCUIT_BREAKER_OPEN_TOTAL
+            .with_label_values(&[_upstream])
+            .inc();
     }
 }
 
@@ -381,7 +447,9 @@ pub fn record_circuit_breaker_open(_upstream: &str) {
 pub fn set_circuit_breaker_state(_upstream: &str, _state: u64) {
     #[cfg(feature = "metrics")]
     if metrics_runtime_enabled() {
-        CIRCUIT_BREAKER_STATE.with_label_values(&[_upstream]).set(_state as i64);
+        CIRCUIT_BREAKER_STATE
+            .with_label_values(&[_upstream])
+            .set(_state as i64);
     }
 }
 
@@ -399,7 +467,9 @@ pub fn record_retry(_upstream: &str, _result: &str) {
 pub fn set_outlier_ejected(_upstream: &str, _server: &str, _ejected: bool) {
     #[cfg(feature = "metrics")]
     if metrics_runtime_enabled() {
-        OUTLIER_EJECTED.with_label_values(&[_upstream, _server]).set(if _ejected { 1 } else { 0 });
+        OUTLIER_EJECTED
+            .with_label_values(&[_upstream, _server])
+            .set(if _ejected { 1 } else { 0 });
     }
 }
 
@@ -408,8 +478,7 @@ pub fn set_outlier_ejected(_upstream: &str, _server: &str, _ejected: bool) {
 #[cfg(feature = "metrics")]
 /// コネクションプールのサイズゲージ（upstream ラベル）
 pub(crate) static CONNECTION_POOL_SIZE: Lazy<IntGaugeVec> = Lazy::new(|| {
-    let opts = Opts::new("connection_pool_size", "Current connection pool size")
-        .namespace("veil");
+    let opts = Opts::new("connection_pool_size", "Current connection pool size").namespace("veil");
     let gauge = IntGaugeVec::new(opts, &["upstream"]).unwrap();
     METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
     gauge
@@ -418,20 +487,27 @@ pub(crate) static CONNECTION_POOL_SIZE: Lazy<IntGaugeVec> = Lazy::new(|| {
 #[cfg(feature = "metrics")]
 /// コネクションプールのヒット数カウンター（upstream ラベル）
 pub(crate) static CONNECTION_POOL_HITS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
-    let opts = Opts::new("connection_pool_hits_total", "Total connection pool hits")
-        .namespace("veil");
+    let opts =
+        Opts::new("connection_pool_hits_total", "Total connection pool hits").namespace("veil");
     let counter = CounterVec::new(opts, &["upstream"]).unwrap();
-    METRICS_REGISTRY.register(Box::new(counter.clone())).unwrap();
+    METRICS_REGISTRY
+        .register(Box::new(counter.clone()))
+        .unwrap();
     counter
 });
 
 #[cfg(feature = "metrics")]
 /// コネクションプールのミス数カウンター（upstream ラベル）
 pub(crate) static CONNECTION_POOL_MISSES_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
-    let opts = Opts::new("connection_pool_misses_total", "Total connection pool misses")
-        .namespace("veil");
+    let opts = Opts::new(
+        "connection_pool_misses_total",
+        "Total connection pool misses",
+    )
+    .namespace("veil");
     let counter = CounterVec::new(opts, &["upstream"]).unwrap();
-    METRICS_REGISTRY.register(Box::new(counter.clone())).unwrap();
+    METRICS_REGISTRY
+        .register(Box::new(counter.clone()))
+        .unwrap();
     counter
 });
 
@@ -440,7 +516,9 @@ pub(crate) static CONNECTION_POOL_MISSES_TOTAL: Lazy<CounterVec> = Lazy::new(|| 
 pub fn set_connection_pool_size(_upstream: &str, _size: usize) {
     #[cfg(feature = "metrics")]
     if metrics_runtime_enabled() {
-        CONNECTION_POOL_SIZE.with_label_values(&[_upstream]).set(_size as i64);
+        CONNECTION_POOL_SIZE
+            .with_label_values(&[_upstream])
+            .set(_size as i64);
     }
 }
 
@@ -449,7 +527,9 @@ pub fn set_connection_pool_size(_upstream: &str, _size: usize) {
 pub fn record_connection_pool_hit(_upstream: &str) {
     #[cfg(feature = "metrics")]
     if metrics_runtime_enabled() {
-        CONNECTION_POOL_HITS_TOTAL.with_label_values(&[_upstream]).inc();
+        CONNECTION_POOL_HITS_TOTAL
+            .with_label_values(&[_upstream])
+            .inc();
     }
 }
 
@@ -458,7 +538,9 @@ pub fn record_connection_pool_hit(_upstream: &str) {
 pub fn record_connection_pool_miss(_upstream: &str) {
     #[cfg(feature = "metrics")]
     if metrics_runtime_enabled() {
-        CONNECTION_POOL_MISSES_TOTAL.with_label_values(&[_upstream]).inc();
+        CONNECTION_POOL_MISSES_TOTAL
+            .with_label_values(&[_upstream])
+            .inc();
     }
 }
 
@@ -467,21 +549,29 @@ pub fn record_connection_pool_miss(_upstream: &str) {
 #[cfg(all(feature = "metrics", feature = "grpc"))]
 /// gRPC リクエスト総数（method, status_code, upstream）
 pub(crate) static GRPC_REQUESTS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
-    let opts = Opts::new("grpc_requests_total", "Total number of gRPC requests")
-        .namespace("veil");
+    let opts = Opts::new("grpc_requests_total", "Total number of gRPC requests").namespace("veil");
     let counter = CounterVec::new(opts, &["method", "status_code", "upstream"]).unwrap();
-    METRICS_REGISTRY.register(Box::new(counter.clone())).unwrap();
+    METRICS_REGISTRY
+        .register(Box::new(counter.clone()))
+        .unwrap();
     counter
 });
 
 #[cfg(all(feature = "metrics", feature = "grpc"))]
 /// gRPC ストリーム継続時間ヒストグラム（method）
 pub(crate) static GRPC_STREAM_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
-    let opts = HistogramOpts::new("grpc_stream_duration_seconds", "gRPC stream duration in seconds")
-        .namespace("veil")
-        .buckets(vec![0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0]);
+    let opts = HistogramOpts::new(
+        "grpc_stream_duration_seconds",
+        "gRPC stream duration in seconds",
+    )
+    .namespace("veil")
+    .buckets(vec![
+        0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0,
+    ]);
     let histogram = HistogramVec::new(opts, &["method"]).unwrap();
-    METRICS_REGISTRY.register(Box::new(histogram.clone())).unwrap();
+    METRICS_REGISTRY
+        .register(Box::new(histogram.clone()))
+        .unwrap();
     histogram
 });
 
@@ -490,7 +580,9 @@ pub(crate) static GRPC_STREAM_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(|
 pub fn record_grpc_request(_method: &str, _status_code: &str, _upstream: &str) {
     #[cfg(all(feature = "metrics", feature = "grpc"))]
     if metrics_runtime_enabled() {
-        GRPC_REQUESTS_TOTAL.with_label_values(&[_method, _status_code, _upstream]).inc();
+        GRPC_REQUESTS_TOTAL
+            .with_label_values(&[_method, _status_code, _upstream])
+            .inc();
     }
 }
 
@@ -499,7 +591,9 @@ pub fn record_grpc_request(_method: &str, _status_code: &str, _upstream: &str) {
 pub fn observe_grpc_stream_duration(_method: &str, _duration_secs: f64) {
     #[cfg(all(feature = "metrics", feature = "grpc"))]
     if metrics_runtime_enabled() {
-        GRPC_STREAM_DURATION_SECONDS.with_label_values(&[_method]).observe(_duration_secs);
+        GRPC_STREAM_DURATION_SECONDS
+            .with_label_values(&[_method])
+            .observe(_duration_secs);
     }
 }
 
@@ -508,11 +602,18 @@ pub fn observe_grpc_stream_duration(_method: &str, _duration_secs: f64) {
 #[cfg(all(feature = "metrics", feature = "wasm"))]
 /// WASM フィルタ実行時間ヒストグラム（filter, phase）
 pub(crate) static WASM_FILTER_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
-    let opts = HistogramOpts::new("wasm_filter_duration_seconds", "WASM filter execution time in seconds")
-        .namespace("veil")
-        .buckets(vec![0.00001, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5]);
+    let opts = HistogramOpts::new(
+        "wasm_filter_duration_seconds",
+        "WASM filter execution time in seconds",
+    )
+    .namespace("veil")
+    .buckets(vec![
+        0.00001, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5,
+    ]);
     let histogram = HistogramVec::new(opts, &["filter", "phase"]).unwrap();
-    METRICS_REGISTRY.register(Box::new(histogram.clone())).unwrap();
+    METRICS_REGISTRY
+        .register(Box::new(histogram.clone()))
+        .unwrap();
     histogram
 });
 
@@ -521,7 +622,9 @@ pub(crate) static WASM_FILTER_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(|
 pub fn observe_wasm_filter_duration(_filter: &str, _phase: &str, _duration_secs: f64) {
     #[cfg(all(feature = "metrics", feature = "wasm"))]
     if metrics_runtime_enabled() {
-        WASM_FILTER_DURATION_SECONDS.with_label_values(&[_filter, _phase]).observe(_duration_secs);
+        WASM_FILTER_DURATION_SECONDS
+            .with_label_values(&[_filter, _phase])
+            .observe(_duration_secs);
     }
 }
 
@@ -633,8 +736,13 @@ impl CacheSaveContext {
 
                 if stored {
                     record_cache_store(&self.host, "memory");
-                    ftlog::debug!("Cached response for {} (status={}, size={}, vary={:?})",
-                           self.host, self.status_code, self.captured_body.len(), self.vary_headers);
+                    ftlog::debug!(
+                        "Cached response for {} (status={}, size={}, vary={:?})",
+                        self.host,
+                        self.status_code,
+                        self.captured_body.len(),
+                        self.vary_headers
+                    );
                 }
 
                 return stored;
@@ -650,7 +758,9 @@ pub(crate) fn encode_prometheus_metrics() -> Vec<u8> {
     let encoder = TextEncoder::new();
     let metric_families = METRICS_REGISTRY.gather();
     let mut buffer = Vec::new();
-    encoder.encode(&metric_families, &mut buffer).unwrap_or_default();
+    encoder
+        .encode(&metric_families, &mut buffer)
+        .unwrap_or_default();
     buffer
 }
 
@@ -749,7 +859,8 @@ pub(crate) fn record_request_metrics(
 pub(crate) fn build_metrics_response() -> Vec<u8> {
     // ランタイムで無効化されている場合は 404 を返す（F-09）
     if !metrics_runtime_enabled() {
-        return b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+        return b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            .to_vec();
     }
     #[cfg(feature = "metrics")]
     {
@@ -784,14 +895,22 @@ mod tests {
         // 有効時は 200（metrics feature 有効時）または 404（無効時）
         let s = String::from_utf8_lossy(&resp);
         #[cfg(feature = "metrics")]
-        assert!(s.starts_with("HTTP/1.1 200"), "expected 200 when enabled: {}", s);
+        assert!(
+            s.starts_with("HTTP/1.1 200"),
+            "expected 200 when enabled: {}",
+            s
+        );
 
         // 無効化すると 404 を返す
         set_metrics_runtime_enabled(false);
         assert!(!metrics_runtime_enabled());
         let resp = build_metrics_response();
         let s = String::from_utf8_lossy(&resp);
-        assert!(s.starts_with("HTTP/1.1 404"), "expected 404 when disabled: {}", s);
+        assert!(
+            s.starts_with("HTTP/1.1 404"),
+            "expected 404 when disabled: {}",
+            s
+        );
 
         // 後続テストに影響しないよう元に戻す
         set_metrics_runtime_enabled(true);
