@@ -212,6 +212,7 @@ pub(crate) static CACHE_EVICTIONS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
 #[cfg(feature = "metrics")]
 /// キャッシュサイズゲージ（storage ラベル付き）
 /// storage: "memory" or "disk"
+#[allow(dead_code)]
 pub(crate) static CACHE_SIZE_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
     let opts = Opts::new("cache_size_bytes", "Current cache size in bytes")
         .namespace("veil_proxy");
@@ -222,6 +223,7 @@ pub(crate) static CACHE_SIZE_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
 
 #[cfg(feature = "metrics")]
 /// キャッシュエントリ数ゲージ
+#[allow(dead_code)]
 pub(crate) static CACHE_ENTRIES: Lazy<IntGaugeVec> = Lazy::new(|| {
     let opts = Opts::new("cache_entries", "Current number of cache entries")
         .namespace("veil_proxy");
@@ -263,6 +265,7 @@ pub(crate) fn record_cache_miss(_host: &str) {
 }
 
 /// メトリクス: キャッシュ保存を記録
+#[allow(dead_code)]
 #[inline]
 pub(crate) fn record_cache_store(_host: &str, _storage: &str) {
     #[cfg(feature = "metrics")]
@@ -426,6 +429,7 @@ pub(crate) fn encode_prometheus_metrics() -> Vec<u8> {
 
 /// metrics feature 無効時のスタブ
 #[cfg(not(feature = "metrics"))]
+#[allow(dead_code)]
 #[inline]
 pub(crate) fn encode_prometheus_metrics() -> Vec<u8> {
     Vec::new()

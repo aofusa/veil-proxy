@@ -3,11 +3,14 @@
 //! すべてのプロキシハンドリングロジックを担当します。
 //! HTTP/1.1、HTTP/2、WebSocket、ファイル配信などに対応。
 
+#[cfg(feature = "http2")]
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+
 use std::net::SocketAddr;
 use std::io;
-use std::path::{Path, PathBuf};
+#[cfg(feature = "http2")]
+use std::path::PathBuf;
+use std::path::Path;
 use std::time::{Duration, Instant};
 use monoio::buf::{IoBuf, IoBufMut, IoVecBuf, IoVecBufMut};
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
@@ -16,7 +19,7 @@ use monoio::time::timeout;
 use monoio::fs::OpenOptions;
 use ftlog::{info, error, warn, debug};
 use httparse::{Request, Status};
-use memchr::memchr3;
+
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
 use crate::config::*;
@@ -28,21 +31,15 @@ use crate::constants::*;
 use crate::upstream::*;
 use crate::buffering;
 use crate::cache;
-use crate::routing;
+
 use crate::server::spawn_background_revalidation;
 
 #[cfg(feature = "ktls")]
-use crate::ktls_rustls::{RustlsAcceptor, KtlsServerStream, KtlsClientStream, SplicePipe};
+use crate::ktls_rustls::{RustlsAcceptor, KtlsServerStream, SplicePipe};
 #[cfg(not(feature = "ktls"))]
 use crate::simple_tls;
-#[cfg(not(feature = "ktls"))]
-use crate::simple_tls::{SimpleTlsServerStream, SimpleTlsClientStream};
 #[cfg(feature = "http2")]
 use crate::http2;
-#[cfg(feature = "grpc")]
-use crate::grpc;
-#[cfg(feature = "wasm")]
-use crate::wasm;
 
 // ServerTls型エイリアス（main.rsから再エクスポート）
 #[cfg(feature = "ktls")]
@@ -1962,10 +1959,12 @@ pub async fn handle_h2c_connection(
 // kTLS 有効時の接続処理（rustls + ktls2）
 #[cfg(feature = "ktls")]
 pub async fn handle_connection(
+    #[cfg_attr(not(feature = "http2"), allow(unused_mut))]
     mut stream: TcpStream,
     acceptor: RustlsAcceptor,
     peer_addr: SocketAddr,
 ) {
+    #[cfg_attr(not(feature = "http2"), allow(unused_mut))]
     let mut initial_buffer = None;
 
     // H2Cが有効な場合、プロトコル検出を実行
@@ -2047,6 +2046,7 @@ pub async fn handle_connection(
 
 // kTLS 無効時の接続処理（rustls のみ）
 #[cfg(not(feature = "ktls"))]
+#[cfg_attr(not(feature = "http2"), allow(unused_mut))]
 pub async fn handle_connection(
     mut stream: TcpStream,
     acceptor: simple_tls::SimpleTlsAcceptor,
@@ -5263,6 +5263,7 @@ async fn proxy_http_request_with_compression(
 
 /// レスポンスヘッダーを解析し、必要に応じて圧縮してクライアントに転送
 /// キャッシュコンテキストが指定されている場合、レスポンスボディをキャプチャしてキャッシュに保存
+#[cfg_attr(not(feature = "wasm"), allow(unused_variables))]
 async fn transfer_response_with_compression(
     backend_stream: &mut TcpStream,
     client_stream: &mut ServerTls,
@@ -5737,7 +5738,7 @@ async fn transfer_compressed_response(
     _is_chunked: bool,
     _encoding: AcceptedEncoding,
     _compression: &CompressionConfig,
-    backend_wants_keep_alive: bool,
+    _backend_wants_keep_alive: bool,
     _security: &SecurityConfig,
 ) -> (u64, bool) {
     transfer_uncompressed_fallback(client_stream, original_headers, initial_body).await
@@ -5772,6 +5773,7 @@ async fn transfer_uncompressed_fallback(
 
 
 /// 圧縮用にヘッダーを書き換え
+#[allow(dead_code)]
 fn build_compressed_headers(
     original_headers: &[u8],
     encoding: AcceptedEncoding,
@@ -6589,6 +6591,7 @@ async fn proxy_https_request_with_compression(
 }
 
 /// HTTPSレスポンス転送（圧縮対応版）
+#[cfg_attr(not(feature = "wasm"), allow(unused_variables))]
 async fn transfer_https_response_with_compression(
     backend_stream: &mut ClientTls,
     client_stream: &mut ServerTls,
@@ -6991,7 +6994,7 @@ async fn transfer_compressed_https_response(
     _is_chunked: bool,
     _encoding: AcceptedEncoding,
     _compression: &CompressionConfig,
-    backend_wants_keep_alive: bool,
+    _backend_wants_keep_alive: bool,
     _security: &SecurityConfig,
 ) -> (u64, bool) {
     transfer_uncompressed_fallback(client_stream, original_headers, initial_body).await
@@ -7276,6 +7279,7 @@ async fn transfer_chunked_body<R: AsyncReader, W: AsyncWriter>(
 // - TLS暗号化はカーネル内で行われるため安全
 // ====================
 
+#[cfg_attr(not(feature = "wasm"), allow(unused_variables))]
 async fn handle_sendfile(
     mut tls_stream: ServerTls,
     base_path: &Path,

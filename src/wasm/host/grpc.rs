@@ -61,7 +61,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             }
             #[cfg(not(feature = "grpc"))]
             {
-                let _ = (upstream_ptr, upstream_size, service_ptr, service_size,
+                let _ = (&mut caller, upstream_ptr, upstream_size, service_ptr, service_size,
                          method_ptr, method_size, message_ptr, message_size,
                          timeout_ms, return_call_id_ptr);
                 ftlog::debug!("WASM: proxy_grpc_call called (grpc feature not enabled)");
@@ -99,8 +99,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             }
             #[cfg(not(feature = "grpc"))]
             {
-                let _ = (upstream_ptr, upstream_size, service_ptr, service_size,
-                         method_ptr, method_size, initial_metadata_ptr, 
+                let _ = (&mut caller, upstream_ptr, upstream_size, service_ptr, service_size,
+                         method_ptr, method_size, initial_metadata_ptr,
                          initial_metadata_size, return_stream_id_ptr);
                 ftlog::debug!("WASM: proxy_grpc_stream called (grpc feature not enabled)");
                 PROXY_RESULT_UNIMPLEMENTED
@@ -120,7 +120,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             }
             #[cfg(not(feature = "grpc"))]
             {
-                let _ = call_id;
+                let _ = (&mut caller, call_id);
                 ftlog::debug!("WASM: proxy_grpc_cancel called (grpc feature not enabled)");
                 PROXY_RESULT_UNIMPLEMENTED
             }
@@ -139,7 +139,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             }
             #[cfg(not(feature = "grpc"))]
             {
-                let _ = stream_id;
+                let _ = (&mut caller, stream_id);
                 ftlog::debug!("WASM: proxy_grpc_close called (grpc feature not enabled)");
                 PROXY_RESULT_UNIMPLEMENTED
             }
@@ -163,7 +163,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             }
             #[cfg(not(feature = "grpc"))]
             {
-                let _ = (stream_id, message_ptr, message_size, end_of_stream);
+                let _ = (&mut caller, stream_id, message_ptr, message_size, end_of_stream);
                 ftlog::debug!("WASM: proxy_grpc_send called (grpc feature not enabled)");
                 PROXY_RESULT_UNIMPLEMENTED
             }

@@ -3,18 +3,13 @@
 //! バックエンド検索、条件マッチング、ヘルスチェック関数を提供します。
 
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream as StdTcpStream};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use ftlog::{info, warn, debug};
+use ftlog::{warn, debug};
 use crate::config::*;
-use crate::constants::*;
-use crate::pool::*;
 use crate::routing;
 
-#[cfg(feature = "ktls")]
-use crate::ktls_rustls::RustlsConnector;
 
 /// 同期的な健康チェックを実行
 /// 

@@ -403,7 +403,7 @@ impl Http3Handler {
         #[cfg(feature = "grpc")]
         let is_grpc = Self::is_grpc_request(headers);
         #[cfg(not(feature = "grpc"))]
-        let is_grpc = false;
+        let _is_grpc = false;
 
         #[cfg(feature = "grpc")]
         if is_grpc {
@@ -1233,9 +1233,10 @@ pub struct BackendProxyResult {
 }
 
 /// バックエンドへの非同期プロキシ処理
-/// 
+///
 /// monoio::net::TcpStream を使用して非同期にバックエンドへ接続します。
 /// HTTP/3 コネクションをブロックせずにバックエンド通信を行えます。
+#[allow(dead_code)]
 pub(crate) async fn proxy_to_backend_async(
     target: &ProxyTarget,
     request: Vec<u8>,
@@ -1370,7 +1371,7 @@ async fn proxy_to_tls_backend_async(
     // 別スレッドでブロッキング TLS 通信を実行し、mpsc channel 経由で結果を受け取る
     let (tx, rx) = std::sync::mpsc::sync_channel::<io::Result<BackendProxyResult>>(1);
     std::thread::spawn(move || {
-        use std::io::{Read, Write};
+        use std::io::Write;
         let result = (|| -> io::Result<BackendProxyResult> {
             let timeout = Duration::from_secs(timeout_secs);
             let mut std_stream = std::net::TcpStream::connect(&addr)
@@ -1462,7 +1463,7 @@ async fn proxy_to_tls_backend_async(
                 .map_err(|e| { warn!("[HTTP/3] std backend connect error: {}", e); e })?;
             std_stream.set_read_timeout(Some(timeout))?;
             std_stream.set_write_timeout(Some(timeout))?;
-            let server_name = rustls::pki_types::ServerName::try_from(sni_name.as_str())
+            let server_name = rustls::pki_types::ServerName::try_from(sni_name)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
             let mut conn = rustls::ClientConnection::new(config, server_name)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;

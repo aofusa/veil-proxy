@@ -12,8 +12,6 @@ use std::fs::File;
 use std::io;
 use std::io::BufReader;
 use std::net::SocketAddr;
-#[cfg(target_os = "linux")]
-use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -27,15 +25,13 @@ use once_cell::sync::Lazy;
 use rustls::ServerConfig;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use clap::Parser;
-use ftlog::{info, error, warn, debug};
+use ftlog::{info, warn};
 use crate::constants::*;
 use crate::logging::*;
-use crate::system::*;
-use crate::metrics::*;
 use crate::pool::*;
 
 #[cfg(feature = "ktls")]
-use crate::ktls_rustls::{RustlsAcceptor, RustlsConnector, KtlsServerStream, KtlsClientStream};
+use crate::ktls_rustls::{RustlsConnector, KtlsServerStream, KtlsClientStream};
 
 #[cfg(not(feature = "ktls"))]
 use crate::simple_tls;
@@ -1527,7 +1523,7 @@ pub fn check_rate_limit(client_ip: &str, limit: u64) -> bool {
 
 // rustls 用の TLS コネクター（kTLS 有効時は ktls_rustls を使用）
 // kTLSフィーチャー有効時はシークレット抽出を有効化し、kTLS利用可能な状態にする
-#[cfg(feature = "ktls")]
+#[cfg(all(feature = "ktls", feature = "http2"))]
 thread_local! {
     static TLS_CONNECTOR: RustlsConnector = {
         // 設定ファイルから kTLS 有効化、ktls_fallback_enabled, tcp_cork_enabled を読み込み
@@ -1535,11 +1531,11 @@ thread_local! {
         let ktls_enabled = config_guard.ktls_config.enabled;
         let fallback_enabled = config_guard.ktls_config.fallback_enabled;
         let tcp_cork_enabled = config_guard.ktls_config.tcp_cork_enabled;
-        
+
         // kTLS が有効な場合のみシークレット抽出を有効化した設定を使用
         let config = (*crate::ktls_rustls::client_config(ktls_enabled)).clone();
-        let config = protocol::configure_alpn_h2_client(config, false);
-        
+        let config = crate::protocol::configure_alpn_h2_client(config, false);
+
         RustlsConnector::new(Arc::new(config))
             .with_ktls(ktls_enabled)        // 設定に基づいて kTLS を有効化
             .with_fallback(fallback_enabled)    // kTLS 失敗時のフォールバック設定
@@ -1547,8 +1543,26 @@ thread_local! {
     };
 }
 
+// kTLS あり・HTTP/2 なしの場合のコネクター
+#[cfg(all(feature = "ktls", not(feature = "http2")))]
+thread_local! {
+    static TLS_CONNECTOR: RustlsConnector = {
+        let config_guard = CURRENT_CONFIG.load();
+        let ktls_enabled = config_guard.ktls_config.enabled;
+        let fallback_enabled = config_guard.ktls_config.fallback_enabled;
+        let tcp_cork_enabled = config_guard.ktls_config.tcp_cork_enabled;
+
+        let config = (*crate::ktls_rustls::client_config(ktls_enabled)).clone();
+
+        RustlsConnector::new(Arc::new(config))
+            .with_ktls(ktls_enabled)
+            .with_fallback(fallback_enabled)
+            .with_tcp_cork(tcp_cork_enabled)
+    };
+}
+
 // 証明書検証をスキップする TLS コネクター（kTLS 有効時・自己署名証明書用）
-#[cfg(feature = "ktls")]
+#[cfg(all(feature = "ktls", feature = "http2"))]
 thread_local! {
     static TLS_CONNECTOR_INSECURE: RustlsConnector = {
         // 証明書検証をスキップするクライアント設定
@@ -1557,10 +1571,28 @@ thread_local! {
         let ktls_enabled = config_guard.ktls_config.enabled;
         let fallback_enabled = config_guard.ktls_config.fallback_enabled;
         let tcp_cork_enabled = config_guard.ktls_config.tcp_cork_enabled;
-        
+
         let config = (*crate::ktls_rustls::insecure_client_config()).clone();
-        let config = protocol::configure_alpn_h2_client(config, false);
-        
+        let config = crate::protocol::configure_alpn_h2_client(config, false);
+
+        RustlsConnector::new(Arc::new(config))
+            .with_ktls(ktls_enabled)
+            .with_fallback(fallback_enabled)
+            .with_tcp_cork(tcp_cork_enabled)
+    };
+}
+
+// kTLS あり・HTTP/2 なしの場合の insecure コネクター
+#[cfg(all(feature = "ktls", not(feature = "http2")))]
+thread_local! {
+    static TLS_CONNECTOR_INSECURE: RustlsConnector = {
+        let config_guard = CURRENT_CONFIG.load();
+        let ktls_enabled = config_guard.ktls_config.enabled;
+        let fallback_enabled = config_guard.ktls_config.fallback_enabled;
+        let tcp_cork_enabled = config_guard.ktls_config.tcp_cork_enabled;
+
+        let config = (*crate::ktls_rustls::insecure_client_config()).clone();
+
         RustlsConnector::new(Arc::new(config))
             .with_ktls(ktls_enabled)
             .with_fallback(fallback_enabled)
@@ -1636,38 +1668,6 @@ pub fn get_tls_connector_insecure() -> crate::simple_tls::SimpleTlsConnector {
 
 // ====================
 // WASM Response Filter Context
-// ====================
-// Thread-local storage for WASM modules to apply to response headers.
-// Set during request processing, used during response processing.
-// ====================
-
-#[cfg(feature = "wasm")]
-thread_local! {
-    /// WASM modules to apply for the current request/response
-    static WASM_RESPONSE_MODULES: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
-}
-
-#[cfg(feature = "wasm")]
-fn set_wasm_response_modules(modules: Vec<String>) {
-    WASM_RESPONSE_MODULES.with(|m| {
-        *m.borrow_mut() = modules;
-    });
-}
-
-#[cfg(feature = "wasm")]
-fn get_wasm_response_modules() -> Vec<String> {
-    WASM_RESPONSE_MODULES.with(|m| {
-        m.borrow().clone()
-    })
-}
-
-#[cfg(feature = "wasm")]
-fn clear_wasm_response_modules() {
-    WASM_RESPONSE_MODULES.with(|m| {
-        m.borrow_mut().clear();
-    });
-}
-
 // ====================
 // 設定構造体
 // ====================
@@ -3322,14 +3322,16 @@ impl UpstreamGroup {
 /// 読み込み操作で `SafeReadBuffer` を受け取り、返却します。
 /// monoio の `set_init()` コールバックにより、読み込み完了時に
 /// 自動的に `valid_len` が設定されます。
+#[allow(async_fn_in_trait)]
 pub trait AsyncReader {
     async fn read_buf(&mut self, buf: SafeReadBuffer) -> (io::Result<usize>, SafeReadBuffer);
 }
 
 /// 非同期書き込みトレイト
-/// 
+///
 /// 書き込み操作では `Vec<u8>` を受け取ります。
 /// 書き込みデータは既に有効なデータなので、SafeReadBuffer は不要です。
+#[allow(async_fn_in_trait)]
 pub trait AsyncWriter {
     async fn write_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>);
 }
@@ -3412,7 +3414,7 @@ impl AsyncWriter for crate::simple_tls::SimpleTlsClientStream {
     }
 }
 
-pub fn validate_config(config: &Config) -> io::Result<()> {
+fn validate_config(config: &Config) -> io::Result<()> {
     // TLS証明書ファイルの存在チェック
     let cert_path = Path::new(&config.tls.cert_path);
     if !cert_path.exists() {

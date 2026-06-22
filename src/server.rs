@@ -3,7 +3,7 @@
 //! シグナルハンドラ、バックグラウンドスレッド、リスナーソケットの作成を担当します。
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 use std::net::SocketAddr;
@@ -13,13 +13,13 @@ use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::time::timeout;
 use ftlog::{info, error, warn, debug};
 use crate::config::*;
-use crate::logging::*;
+
 use crate::metrics::*;
 use crate::system::*;
 use crate::upstream::*;
 use crate::pool::*;
 use crate::http_utils::*;
-use crate::constants::*;
+
 use crate::cache;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
