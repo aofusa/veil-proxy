@@ -2,9 +2,10 @@
 //!
 //! HTTP/2 ストリームの状態管理とフロー制御を実装します。
 
-use std::collections::HashMap;
 use crate::http2::error::{Http2Error, Http2ErrorCode};
 use crate::http2::hpack::HeaderField;
+use bytes::BytesMut;
+use std::collections::HashMap;
 
 /// ストリーム状態 (RFC 7540 Section 5.1)
 ///
@@ -84,12 +85,12 @@ pub struct Stream {
     pub recv_window: i32,
     /// リクエストヘッダー
     pub request_headers: Vec<HeaderField>,
-    /// リクエストボディ (累積)
-    pub request_body: Vec<u8>,
+    /// リクエストボディ (累積、bytes::BytesMut によるゼロコピー蓄積)
+    pub request_body: BytesMut,
     /// レスポンスヘッダー
     pub response_headers: Vec<HeaderField>,
-    /// レスポンスボディ (累積)
-    pub response_body: Vec<u8>,
+    /// レスポンスボディ (累積、bytes::BytesMut によるゼロコピー蓄積)
+    pub response_body: BytesMut,
     /// 依存ストリーム ID
     pub dependency: u32,
     /// 重み (1-256)
@@ -123,9 +124,9 @@ impl Stream {
             send_window: send_window_size,
             recv_window: recv_window_size,
             request_headers: Vec::new(),
-            request_body: Vec::new(),
+            request_body: BytesMut::new(),
             response_headers: Vec::new(),
-            response_body: Vec::new(),
+            response_body: BytesMut::new(),
             dependency: 0,
             weight: 16,
             exclusive: false,
@@ -357,13 +358,13 @@ impl Stream {
     pub fn pending_header_len(&self) -> usize {
         self.pending_headers.len()
     }
-    
+
     /// 最終アクティビティ時刻を更新
     #[inline]
     pub fn update_activity(&mut self) {
         self.last_activity = std::time::Instant::now();
     }
-    
+
     /// アイドルタイムアウトを超過しているか確認
     #[inline]
     pub fn is_idle_timeout(&self, timeout_secs: u64) -> bool {
@@ -489,7 +490,7 @@ impl StreamManager {
     }
 
     /// クライアントストリームを取得または作成
-    /// 
+    ///
     /// RFC 7540 Section 6.8: GOAWAY 受信後は、last_stream_id より大きい
     /// ストリーム ID の開始を拒否する。
     pub fn get_or_create_client_stream(&mut self, id: u32) -> Result<&mut Stream, Http2Error> {
@@ -522,7 +523,10 @@ impl StreamManager {
         if id <= self.max_client_stream_id {
             return Err(Http2Error::connection_error(
                 Http2ErrorCode::ProtocolError,
-                format!("Stream ID {} not greater than last opened stream {}", id, self.max_client_stream_id),
+                format!(
+                    "Stream ID {} not greater than last opened stream {}",
+                    id, self.max_client_stream_id
+                ),
             ));
         }
 
@@ -537,7 +541,14 @@ impl StreamManager {
         }
 
         self.max_client_stream_id = id;
-        self.streams.insert(id, Stream::new(id, self.peer_initial_window_size, self.local_initial_window_size));
+        self.streams.insert(
+            id,
+            Stream::new(
+                id,
+                self.peer_initial_window_size,
+                self.local_initial_window_size,
+            ),
+        );
 
         self.streams.get_mut(&id).ok_or_else(|| {
             Http2Error::stream_error(id, Http2ErrorCode::StreamClosed, "Stream not found")
@@ -556,19 +567,16 @@ impl StreamManager {
 
     /// アクティブなストリーム数を取得
     pub fn active_stream_count(&self) -> usize {
-        self.streams
-            .values()
-            .filter(|s| s.is_active())
-            .count()
+        self.streams.values().filter(|s| s.is_active()).count()
     }
 
     /// クローズ済みストリームをクリーンアップ
     pub fn cleanup_closed(&mut self) {
         self.streams.retain(|_, s| s.state != StreamState::Closed);
     }
-    
+
     /// アイドルタイムアウトを超過したストリーム ID を取得
-    /// 
+    ///
     /// Slow Loris 対策として、リクエストが完了しないストリームを検出する。
     /// 返されたストリームには RST_STREAM を送信して閉じる必要がある。
     pub fn get_idle_streams(&self, timeout_secs: u64) -> Vec<u32> {
@@ -641,7 +649,7 @@ impl StreamManager {
     }
 
     /// GOAWAY の last_stream_id を設定
-    /// 
+    ///
     /// RFC 7540 Section 6.8: GOAWAY 受信時に呼び出し、
     /// 以降のストリーム作成を制限する。
     pub fn set_goaway_last_stream_id(&mut self, last_stream_id: u32) {
@@ -649,43 +657,52 @@ impl StreamManager {
     }
 
     /// 優先度に基づいてストリームIDをソートして返す
-    /// 
+    ///
     /// RFC 7540 Section 5.3: 優先度に基づくスケジューリング
     /// 重みが大きいほど高優先度（より多くのリソースを割り当て）
-    /// 
+    ///
     /// 戻り値:
     /// - ストリームIDのVec（優先度順、重みが大きい順）
     pub fn get_streams_by_priority(&self) -> Vec<u32> {
-        let mut streams: Vec<_> = self.streams.iter()
-            .filter(|(_, s)| s.state == StreamState::Open || s.state == StreamState::HalfClosedRemote)
+        let mut streams: Vec<_> = self
+            .streams
+            .iter()
+            .filter(|(_, s)| {
+                s.state == StreamState::Open || s.state == StreamState::HalfClosedRemote
+            })
             .collect();
-        
+
         // 重みが大きい順にソート（同じ重みなら依存先ストリームIDが小さい順）
-        streams.sort_by(|a, b| {
-            match b.1.weight.cmp(&a.1.weight) {
-                std::cmp::Ordering::Equal => a.1.dependency.cmp(&b.1.dependency),
-                other => other,
-            }
+        streams.sort_by(|a, b| match b.1.weight.cmp(&a.1.weight) {
+            std::cmp::Ordering::Equal => a.1.dependency.cmp(&b.1.dependency),
+            other => other,
         });
-        
+
         streams.into_iter().map(|(id, _)| *id).collect()
     }
 
     /// 指定した依存先を持つストリームのIDリストを取得
-    /// 
+    ///
     /// RFC 7540 Section 5.3.1: 依存関係の処理
     #[allow(dead_code)]
     pub fn get_dependent_streams(&self, parent_id: u32) -> Vec<u32> {
-        self.streams.iter()
+        self.streams
+            .iter()
             .filter(|(_, s)| s.dependency == parent_id)
             .map(|(id, _)| *id)
             .collect()
     }
 
     /// ストリームの優先度情報を更新
-    /// 
+    ///
     /// RFC 7540 Section 5.3.3: 優先度の再設定
-    pub fn update_priority(&mut self, stream_id: u32, dependency: u32, weight: u8, exclusive: bool) -> Result<(), Http2Error> {
+    pub fn update_priority(
+        &mut self,
+        stream_id: u32,
+        dependency: u32,
+        weight: u8,
+        exclusive: bool,
+    ) -> Result<(), Http2Error> {
         // 自己依存チェック
         if stream_id == dependency {
             return Err(Http2Error::protocol_error("Stream cannot depend on itself"));
@@ -697,7 +714,11 @@ impl StreamManager {
             stream.exclusive = exclusive;
             Ok(())
         } else {
-            Err(Http2Error::stream_error(stream_id, Http2ErrorCode::StreamClosed, "Stream not found"))
+            Err(Http2Error::stream_error(
+                stream_id,
+                Http2ErrorCode::StreamClosed,
+                "Stream not found",
+            ))
         }
     }
 }
@@ -754,8 +775,16 @@ mod tests {
         let mut manager = StreamManager::new(2, 65535);
 
         // 2ストリーム作成
-        manager.get_or_create_client_stream(1).unwrap().recv_headers(false).unwrap();
-        manager.get_or_create_client_stream(3).unwrap().recv_headers(false).unwrap();
+        manager
+            .get_or_create_client_stream(1)
+            .unwrap()
+            .recv_headers(false)
+            .unwrap();
+        manager
+            .get_or_create_client_stream(3)
+            .unwrap()
+            .recv_headers(false)
+            .unwrap();
 
         // 3つ目は失敗
         let result = manager.get_or_create_client_stream(5);
@@ -781,8 +810,16 @@ mod tests {
         let mut manager = StreamManager::new(100, 65535);
 
         // ストリーム1, 3を作成（GOAWAY前）
-        manager.get_or_create_client_stream(1).unwrap().recv_headers(false).unwrap();
-        manager.get_or_create_client_stream(3).unwrap().recv_headers(false).unwrap();
+        manager
+            .get_or_create_client_stream(1)
+            .unwrap()
+            .recv_headers(false)
+            .unwrap();
+        manager
+            .get_or_create_client_stream(3)
+            .unwrap()
+            .recv_headers(false)
+            .unwrap();
 
         // GOAWAY last_stream_id=3 を設定
         manager.set_goaway_last_stream_id(3);
@@ -796,11 +833,11 @@ mod tests {
         // ストリーム5は last_stream_id を超えるので拒否
         let result = manager.get_or_create_client_stream(5);
         assert!(result.is_err());
-        
+
         // ストリーム7も拒否
         let result = manager.get_or_create_client_stream(7);
         assert!(result.is_err());
-        
+
         // エラーメッセージを確認
         if let Err(e) = result {
             assert!(e.to_string().contains("GOAWAY"));
