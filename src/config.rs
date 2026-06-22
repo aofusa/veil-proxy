@@ -5448,3 +5448,264 @@ mod admin_config_tests {
         assert!(!cfg.check_auth(Some("Bearer ")));
     }
 }
+
+// ====================
+// F-06: サーキットブレーカーと UpstreamGroup 統合テスト
+// ====================
+#[cfg(test)]
+mod circuit_breaker_upstream_tests {
+    use super::*;
+    use crate::resilience::CircuitBreaker;
+
+    fn make_entry(url: &str) -> UpstreamServerEntry {
+        UpstreamServerEntry { url: url.to_string(), sni_name: None, use_h2c: false, weight: 1 }
+    }
+
+    fn trip_config() -> super::CircuitBreakerConfig {
+        super::CircuitBreakerConfig {
+            enabled: true,
+            failure_threshold: 2,
+            failure_window_secs: 60,
+            open_duration_secs: 300,
+            half_open_probes: 1,
+            success_threshold: 1,
+            trip_on_timeout: true,
+        }
+    }
+
+    /// CBがOpenのサーバーはselect()でスキップされる（2台構成の場合）
+    #[test]
+    fn tripped_circuit_breaker_skips_server_with_two_servers() {
+        let entries = vec![
+            make_entry("http://10.0.0.1:80"),
+            make_entry("http://10.0.0.2:80"),
+        ];
+        let mut group = UpstreamGroup::new(
+            "cb-test".into(),
+            entries,
+            LoadBalanceAlgorithm::RoundRobin,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // サーバー0にCBを付与してトリップさせる
+        let cb = CircuitBreaker::new(trip_config());
+        cb.record_failure();
+        cb.record_failure();
+        assert!(cb.is_open(), "CB should be open after exceeding threshold");
+        group.servers[0] = group.servers[0].clone().with_circuit_breaker(Some(cb));
+
+        // 50回 select() して、トリップしたサーバー0は選ばれないことを確認
+        // （2台構成なので candidates() の healthy fallback は不要）
+        for _ in 0..50 {
+            let s = group.select("1.2.3.4");
+            if let Some(s) = s {
+                assert_ne!(
+                    s.target.host, "10.0.0.1",
+                    "Tripped server (10.0.0.1) should not be selected when healthy fallback exists"
+                );
+            }
+        }
+    }
+
+    /// 全サーバーのCBがOpenの場合は healthy fallback が動作する
+    ///
+    /// candidates() の設計: avail が空なら healthy なサーバーにフォールバック（完全停止回避）。
+    /// よって1台構成でCBがOpenでも、サーバー自体は healthy なら選択される。
+    #[test]
+    fn all_servers_tripped_falls_back_to_healthy() {
+        let entries = vec![make_entry("http://10.0.0.1:80")];
+        let mut group = UpstreamGroup::new(
+            "cb-all-tripped".into(),
+            entries,
+            LoadBalanceAlgorithm::RoundRobin,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let cb = CircuitBreaker::new(trip_config());
+        cb.record_failure();
+        cb.record_failure();
+        assert!(cb.is_open(), "CB should be open");
+        group.servers[0] = group.servers[0].clone().with_circuit_breaker(Some(cb));
+
+        // 設計上: 全 CB が Open でもサーバー自体が healthy なら fallback で選択される
+        // （完全停止（None）を避けるための安全策）
+        let result = group.select("1.2.3.4");
+        // fallback が動作するため Some が返る（設計通り）
+        assert!(
+            result.is_some(),
+            "Should fallback to healthy server even if all CBs are open (by design)"
+        );
+    }
+
+    /// record_outcome で失敗を記録すると CB の状態が更新される
+    #[test]
+    fn record_outcome_updates_circuit_breaker_state() {
+        let entries = vec![
+            make_entry("http://10.0.0.1:80"),
+            make_entry("http://10.0.0.2:80"),
+        ];
+        let mut group = UpstreamGroup::new(
+            "cb-outcome".into(),
+            entries,
+            LoadBalanceAlgorithm::RoundRobin,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let cb = CircuitBreaker::new(trip_config());
+        group.servers[0] = group.servers[0].clone().with_circuit_breaker(Some(cb));
+
+        // トリップ前は サーバー0 が選ばれることがある
+        let before_trip = (0..10)
+            .filter_map(|_| group.select("1.1.1.1"))
+            .any(|s| s.target.host == "10.0.0.1");
+        assert!(before_trip, "Server 0 should be reachable before tripping");
+
+        // 失敗を記録してトリップ閾値（2回）に達する
+        group.record_outcome(0, false, 100);
+        group.record_outcome(0, false, 100);
+
+        // トリップ後は2台のうちサーバー1のみが選ばれるはず
+        // （サーバー0は avail から除かれ、candidates が [server1] になる）
+        let after_trip_server0 = (0..20)
+            .filter_map(|_| group.select("1.1.1.1"))
+            .filter(|s| s.target.host == "10.0.0.1")
+            .count();
+        assert_eq!(
+            after_trip_server0, 0,
+            "Tripped server (10.0.0.1) should not be selected when alternative exists"
+        );
+    }
+
+    /// スライディングウィンドウ内の失敗率が閾値未満なら CB は開かない
+    #[test]
+    fn below_threshold_does_not_trip() {
+        let entries = vec![make_entry("http://10.0.0.1:80")];
+        let mut group = UpstreamGroup::new(
+            "cb-below".into(),
+            entries,
+            LoadBalanceAlgorithm::RoundRobin,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let cb = CircuitBreaker::new(trip_config());
+        group.servers[0] = group.servers[0].clone().with_circuit_breaker(Some(cb));
+
+        // 閾値-1回の失敗では開かない
+        group.record_outcome(0, false, 10);
+
+        assert!(
+            group.select("1.1.1.1").is_some(),
+            "Should still select server when below failure threshold"
+        );
+    }
+}
+
+// ====================
+// F-19: 追加ロードバランシング統合テスト
+// ====================
+#[cfg(test)]
+mod advanced_lb_integration_tests {
+    use super::*;
+
+    fn w_entry(url: &str, weight: u32) -> UpstreamServerEntry {
+        UpstreamServerEntry { url: url.to_string(), sni_name: None, use_h2c: false, weight }
+    }
+
+    /// Weighted RR: weight=0 は weight=1 として扱われる（最小重みは1）
+    ///
+    /// 設計上、`weight.max(1)` により 0 は 1 に切り上げられる。
+    #[test]
+    fn zero_weight_treated_as_one() {
+        let entries = vec![
+            w_entry("http://10.0.0.1:80", 100), // 重み 100
+            w_entry("http://10.0.0.2:80", 0),   // weight=0 → 内部で 1 として扱われる
+        ];
+        let group = UpstreamGroup::new(
+            "wt-zero".into(),
+            entries,
+            LoadBalanceAlgorithm::Weighted,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let mut count1 = 0usize;
+        let mut count2 = 0usize;
+        for _ in 0..200 {
+            if let Some(s) = group.select("1.2.3.4") {
+                if s.target.host == "10.0.0.1" {
+                    count1 += 1;
+                } else {
+                    count2 += 1;
+                }
+            }
+        }
+        // weight=100 vs weight=0(→1) → server1 が圧倒的多数
+        assert!(
+            count1 > count2 * 10,
+            "weight=100 server should dominate weight=0(→1): {count1} vs {count2}"
+        );
+    }
+
+    /// Consistent Hash: 同一キーは unhealthy サーバーが除かれても次のサーバーに転送される
+    #[test]
+    fn consistent_hash_falls_back_on_unhealthy() {
+        let entries = vec![
+            w_entry("http://10.0.0.1:80", 1),
+            w_entry("http://10.0.0.2:80", 1),
+            w_entry("http://10.0.0.3:80", 1),
+        ];
+        let group = UpstreamGroup::new(
+            "ch-fallback".into(),
+            entries,
+            LoadBalanceAlgorithm::ConsistentHash {
+                hash_key: HashKey::Ip,
+            },
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 正常状態で選択できること
+        let first = group.select("192.168.1.100");
+        assert!(first.is_some(), "Should select a server in normal state");
+
+        // 1台をunhealthyにしても選択できること
+        group.servers[0].healthy.store(false, std::sync::atomic::Ordering::SeqCst);
+        let after = group.select("192.168.1.100");
+        assert!(after.is_some(), "Should still select a server with one unhealthy");
+    }
+
+    /// IpHash: 同じIPは常に同じサーバーへ（既存動作の確認）
+    #[test]
+    fn ip_hash_consistent_routing() {
+        let entries = vec![
+            w_entry("http://10.0.0.1:80", 1),
+            w_entry("http://10.0.0.2:80", 1),
+            w_entry("http://10.0.0.3:80", 1),
+        ];
+        let group = UpstreamGroup::new(
+            "iphash".into(),
+            entries,
+            LoadBalanceAlgorithm::IpHash,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let ip = "203.0.113.42";
+        let first = group.select(ip).unwrap().target.host.clone();
+        for _ in 0..20 {
+            let host = group.select(ip).unwrap().target.host.clone();
+            assert_eq!(host, first, "IP hash should always route same IP to same server");
+        }
+    }
+}

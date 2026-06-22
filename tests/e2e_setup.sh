@@ -329,6 +329,11 @@ level = "debug"
 enabled = true
 path = "/__metrics"
 
+[admin]
+enabled = true
+path_prefix = "/__admin"
+secret = "test-admin-secret"
+
 [http3]
 listen = "127.0.0.1:${PROXY_HTTPS_PORT}"
 compression_enabled = true
@@ -356,6 +361,46 @@ algorithm = "round_robin"
 servers = [
     "http://127.0.0.1:${BACKEND_GRPC_PORT}"
 ]
+
+[upstreams."weighted-pool"]
+algorithm = "weighted"
+servers = [
+    { url = "https://127.0.0.1:${BACKEND1_PORT}", weight = 2 },
+    { url = "https://127.0.0.1:${BACKEND2_PORT}", weight = 1 }
+]
+tls_insecure = true
+
+[upstreams."ch-pool"]
+algorithm = "consistent_hash"
+servers = [
+    "https://127.0.0.1:${BACKEND1_PORT}",
+    "https://127.0.0.1:${BACKEND2_PORT}"
+]
+tls_insecure = true
+
+[upstreams."ch-pool".circuit_breaker]
+enabled = true
+failure_threshold = 5
+failure_window_secs = 60
+open_duration_secs = 10
+half_open_probes = 2
+success_threshold = 2
+trip_on_timeout = true
+
+[upstreams."error-pool"]
+algorithm = "round_robin"
+servers = [
+    "http://127.0.0.1:${BACKEND_ERROR_PORT}"
+]
+
+[upstreams."error-pool".circuit_breaker]
+enabled = true
+failure_threshold = 3
+failure_window_secs = 30
+open_duration_secs = 5
+half_open_probes = 1
+success_threshold = 1
+trip_on_timeout = true
 EOF
 
     # ヘルスチェック設定を追加（healthcheckタイプの時のみ有効化）
@@ -488,14 +533,8 @@ max_disk_buffer = 100
 disk_buffer_path = "/tmp/veil_buffer"
 EOF
 
-    # HTTP 500 エラーバックエンドのルート設定
+    # HTTP 500 エラーバックエンドおよび新機能ルート設定
     cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
-
-[upstreams."error-pool"]
-algorithm = "round_robin"
-servers = [
-    "http://127.0.0.1:${BACKEND_ERROR_PORT}"
-]
 
 [[route]]
 [route.conditions]
@@ -512,6 +551,38 @@ path = "/error-500/*"
 [route.action]
 type = "Proxy"
 upstream = "error-pool"
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/weighted/*"
+[route.action]
+type = "Proxy"
+upstream = "weighted-pool"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/weighted/*"
+[route.action]
+type = "Proxy"
+upstream = "weighted-pool"
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/consistent-hash/*"
+[route.action]
+type = "Proxy"
+upstream = "ch-pool"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/consistent-hash/*"
+[route.action]
+type = "Proxy"
+upstream = "ch-pool"
 EOF
 
     # WebSocketルート設定
