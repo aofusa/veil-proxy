@@ -28,9 +28,11 @@ io_uring (monoio) と rustls を使用した高性能リバースプロキシサ
 
 ### プロキシ機能
 - **コネクションプール**: バックエンド接続の再利用によるレイテンシ削減（HTTP/HTTPS両対応）
-- **ロードバランシング**: 複数バックエンドへのリクエスト分散（Round Robin/Least Connections/IP Hash）
+- **ロードバランシング**: 複数バックエンドへのリクエスト分散（Round Robin/Least Connections/IP Hash/Weighted/Consistent Hash）
 - **ヘルスチェック**: HTTP/TLSベースのアクティブヘルスチェックによる自動フェイルオーバー
+- **サーキットブレーカー＆リトライ**: サーバー単位のサーキットブレーカー（Closed→Open→HalfOpen）、Outlier Detection/排除、EWMAレイテンシ追跡（`metrics` feature が必要）
 - **プロキシキャッシュ**: メモリ・ディスクベースのレスポンスキャッシュ（ETag/304、stale-while-revalidate、stale-if-error）
+- **キャッシュPurge管理API**: HTTPでキャッシュ無効化（`PURGE`メソッド または `POST /__admin/cache/purge`）、exact/prefix/glob/all モードとBearerトークン認証
 - **バッファリング制御**: 低速クライアントによるバックエンド占有防止のためのレスポンスバッファリング（Streaming/Full/Adaptiveモード）
 - **WebSocketサポート**: Upgradeヘッダー検知による双方向プロキシ（Fixed/Adaptiveポーリングモード）
 - **H2C (HTTP/2 over cleartext)**: TLSなしのHTTP/2バックエンド接続（gRPC対応）
@@ -59,10 +61,12 @@ io_uring (monoio) と rustls を使用した高性能リバースプロキシサ
 ### 運用機能
 - **Graceful Shutdown**: SIGINT/SIGTERMによる安全な終了
 - **Graceful Reload**: SIGHUPによる設定のホットリロード（ゼロダウンタイム）
+- **TLS証明書ホットリロード**: mtimeの変化検知＋ArcSwapによるゼロダウンタイム証明書ローテーション（既存接続は旧証明書を使い続け、新しいハンドシェイクのみ新証明書を自動適用）
 - **パニックリカバリー**: 接続レベルのパニックキャッチによるワーカースレッド復帰処理（影響は該当接続のみ）
 - **非同期ログ**: ftlog による高性能非同期ログ
 - **設定バリデーション**: 起動時の詳細な設定ファイル検証
-- **Prometheusメトリクス**: メトリクスエンドポイントでリクエスト数、レイテンシ、アクティブ接続数、アップストリーム健康状態等を出力（要設定、デフォルト無効）
+- **Prometheusメトリクス**: メトリクスエンドポイントでリクエスト数、レイテンシ、アクティブ接続数、アップストリーム健康状態、サーキットブレーカー状態、コネクションプール統計、gRPC/WASM実行時間等を出力（要設定、デフォルト無効）。再起動なしでランタイム有効/無効切り替え対応
+- **OpenTelemetry（OTLP/HTTP）**: Prometheusメトリクスを任意のOTLPコレクタ（Grafana Tempo, Jaeger等）へプッシュ配信。専用 std スレッドで完全tokio-free（`opentelemetry` feature が必要）
 
 ### セキュリティ
 - **HTTP to HTTPSリダイレクト**: HTTPアクセスを自動的にHTTPSへ301リダイレクト
@@ -1306,6 +1310,8 @@ IP制限は **deny → allow** の順で評価されます（denyが優先）。
 | `round_robin` | 順番に振り分け（デフォルト） | 汎用 |
 | `least_conn` | 接続数が最小のサーバーを選択 | 長時間接続 |
 | `ip_hash` | クライアントIPでハッシュ | セッション維持 |
+| `weighted` | 重み付きラウンドロビン（`weight` に比例） | サーバースペックが異なる場合 |
+| `consistent_hash` | 150-vnode コンシステントハッシュリング（xxh3） | キャッシュ局所性、スティッキールーティング |
 
 ### 設定例
 
@@ -1345,6 +1351,46 @@ servers = [
   "https://api.example.com:443"
 ]
 ```
+
+#### 重み付きラウンドロビン
+
+サーバーの処理能力に応じてトラフィックを重み付きで分散します：
+
+```toml
+[upstreams."weighted-api"]
+algorithm = "weighted"
+servers = [
+  { url = "http://api1:8080", weight = 3 },  # トラフィックの75%
+  { url = "http://api2:8080", weight = 1 },  # トラフィックの25%
+]
+```
+
+> **注意**: `weight = 0` は `weight = 1`（最小値）として扱われます。オフセットはサーバーグループ構築時に計算され、選択はロックフリー（atomic fetch_add + 二分探索）で行われます。
+
+#### コンシステントハッシュ
+
+同じ送信元のリクエストを同じバックエンドに転送します（スティッキールーティング）：
+
+```toml
+# クライアントIPでハッシュ（デフォルト）
+[upstreams."ch-pool"]
+algorithm = "consistent_hash"
+servers = ["http://cache1:8080", "http://cache2:8080", "http://cache3:8080"]
+
+# HTTPヘッダー値でハッシュ
+[upstreams."ch-by-user"]
+algorithm = "consistent_hash"
+hash_key = "header:X-User-Id"
+servers = ["http://shard1:8080", "http://shard2:8080"]
+
+# Cookie値でハッシュ
+[upstreams."ch-by-session"]
+algorithm = "consistent_hash"
+hash_key = "cookie:session_id"
+servers = ["http://node1:8080", "http://node2:8080"]
+```
+
+> **注意**: サーバーあたり150個の仮想ノード（vnode）リングを使用（xxh3ハッシュ）。サーバーが unhealthy になると除外され、リング上の次のノードが引き継ぎます。
 
 ### 単一バックエンドとの互換性
 
@@ -1443,6 +1489,112 @@ servers = [
 [INFO] Upstream api1.internal:8080 is now unhealthy
 [INFO] Upstream api1.internal:8080 is now healthy
 ```
+
+## サーキットブレーカー＆レジリエンス
+
+サーバー単位のサーキットブレーカーとOutlier Detectionでカスケード障害を防止します。
+
+### サーキットブレーカーの状態遷移
+
+```
+Closed ──(failure_threshold超過)──▶ Open
+  ▲                                      │
+  │                             (open_duration_secs秒後)
+  │                                      │
+  └──(success_threshold回成功)── HalfOpen ◀─(プローブ失敗)──┐
+                                      │                      │
+                                      └──(プローブ成功)───────┘
+```
+
+- **Closed**: 通常動作。失敗はスライディングウィンドウで追跡。
+- **Open**: 全リクエストを即時拒否（ファストフェイル）。`open_duration_secs` 後にHalfOpenへ。
+- **HalfOpen**: 限定数のプローブリクエストを通過させる。成功が `success_threshold` に達したらClosed、失敗したらOpen。
+
+プール内の**全サーバー**のCBがOpenになった場合は、完全停止を避けるために healthy なサーバーへのフォールバックが動作します。
+
+### 設定
+
+```toml
+[upstreams."api-pool"]
+algorithm = "round_robin"
+servers = ["http://api1:8080", "http://api2:8080"]
+
+  [upstreams."api-pool".circuit_breaker]
+  enabled = true
+  failure_threshold = 5       # この失敗回数でOpen
+  failure_window_secs = 60    # 失敗カウントのスライディングウィンドウ
+  open_duration_secs = 30     # Open維持時間（経過後HalfOpen）
+  half_open_probes = 3        # HalfOpenで許可するプローブリクエスト数
+  success_threshold = 2       # HalfOpenでClosedに戻るための成功回数
+  trip_on_timeout = true      # タイムアウトを失敗としてカウント
+```
+
+### 設定オプション
+
+| オプション | 説明 | デフォルト |
+|-----------|------|-----------|
+| `enabled` | サーキットブレーカーを有効化 | `false` |
+| `failure_threshold` | Openに移行する失敗回数 | `5` |
+| `failure_window_secs` | スライディングウィンドウの時間 | `60` |
+| `open_duration_secs` | Open状態の維持時間（秒） | `30` |
+| `half_open_probes` | HalfOpenで通過させるリクエスト数 | `3` |
+| `success_threshold` | HalfOpenでClosedに戻る成功回数 | `2` |
+| `trip_on_timeout` | タイムアウトを失敗としてカウント | `true` |
+
+### Outlier Detection（パッシブ排除）
+
+サーキットブレーカーに加え、エラー率に基づいてサーバーを受動的に排除できます：
+
+```toml
+  [upstreams."api-pool".outlier_detection]
+  enabled = true
+  error_rate_threshold = 0.5    # エラー率が50%を超えたら排除
+  interval_secs = 10            # 評価間隔（秒）
+  base_ejection_time_secs = 30  # 基本排除時間（秒）
+  max_ejection_percent = 50     # 最大排除割合（50%まで）
+```
+
+### Prometheusメトリクス（サーキットブレーカー）
+
+| メトリクス | タイプ | 説明 |
+|-----------|--------|------|
+| `veil_circuit_breaker_open_total` | Counter | CB Openイベント数（upstream/serverラベル） |
+| `veil_circuit_breaker_state` | Gauge | CB状態（0=Closed, 1=Open, 2=HalfOpen） |
+| `veil_retry_total` | Counter | リトライ試行回数 |
+| `veil_outlier_ejected` | Gauge | サーバー排除状態（1=排除中） |
+
+## TLS証明書ホットリロード
+
+プロキシを再起動せずにTLS証明書をローテーションします。
+
+### 動作原理
+
+- バックグラウンドスレッドが `reload_interval_secs` 秒ごとに証明書ファイルの `mtime` を監視。
+- 変化を検出すると新しい証明書を `ArcSwap` にロード。
+- **既存のTLS接続**は旧証明書を使い続ける（接続断なし）。
+- **新しいTLSハンドシェイク**は自動的に新証明書を使用。
+- SIGHUPシグナルでも設定リロードと同時に即時更新。
+
+### 設定
+
+```toml
+[tls]
+cert_path = "/etc/veil/cert.pem"
+key_path  = "/etc/veil/key.pem"
+# ゼロダウンタイム証明書ホットリロード
+auto_reload = true
+reload_interval_secs = 60  # ポーリング間隔（デフォルト: 60秒）
+```
+
+### Let's Encryptとの連携
+
+```bash
+# 証明書更新（certbot）
+certbot renew --deploy-hook "touch /etc/veil/cert.pem"
+# veilがmtimeの変化を検知して自動リロード
+```
+
+> **注意**: Landlockサンドボックスが有効な場合、証明書ディレクトリを `landlock_read_paths` に含める必要があります。
 
 ## リダイレクト
 
@@ -2575,6 +2727,20 @@ GET /__metrics
 | `veil_proxy_cache_size_bytes` | Gauge | storage | 現在のキャッシュサイズ（バイト） |
 | `veil_proxy_cache_entries` | Gauge | storage | 現在のキャッシュエントリ数 |
 | `veil_proxy_buffering_used_total` | Counter | host | バッファリング使用リクエスト総数 |
+| `veil_circuit_breaker_open_total` | Counter | upstream, server | CBオープンイベント数 |
+| `veil_circuit_breaker_state` | Gauge | upstream, server | CB状態（0=Closed, 1=Open, 2=HalfOpen） |
+| `veil_retry_total` | Counter | upstream, server | リトライ試行回数 |
+| `veil_outlier_ejected` | Gauge | upstream, server | サーバー排除状態（1=排除中） |
+| `veil_connection_pool_size` | Gauge | upstream | コネクションプールサイズ |
+| `veil_connection_pool_hits_total` | Counter | upstream | コネクションプールヒット数 |
+| `veil_connection_pool_misses_total` | Counter | upstream | コネクションプールミス数 |
+| `veil_grpc_requests_total` | Counter | upstream, method | gRPCリクエスト数 |
+| `veil_grpc_stream_duration_seconds` | Histogram | upstream, method | gRPCストリーム処理時間 |
+| `veil_wasm_filter_duration_seconds` | Histogram | module | WASMフィルター実行時間 |
+
+### ランタイム有効/無効切り替え
+
+再起動不要でメトリクスを動的にオン/オフできます。無効時は `/__metrics` が `404 Not Found` を返し、全記録関数がno-opになります。
 
 ### Grafanaダッシュボード例
 
@@ -2639,6 +2805,104 @@ scrape_configs:
       insecure_skip_verify: true  # 自己署名証明書の場合
     metrics_path: /__metrics
 ```
+
+## OpenTelemetry（OTLP/HTTP）
+
+重い OpenTelemetry SDK（tokio 依存）を使わず、Prometheusメトリクスを OTLP 互換コレクタへプッシュ配信します。
+
+> **必要なフィーチャー**: `--features opentelemetry`（または `--features full`）
+
+### アーキテクチャ
+
+- 専用の `std::thread` が設定間隔でメトリクスをエクスポート。
+- 内部 Prometheus レジストリの値を OTLP/HTTP JSON（`POST /v1/metrics`）に変換。
+- 制御メッセージ（Flush/Shutdown）は `std::sync::mpsc::channel` 経由 — tokio 不使用。
+
+### 設定
+
+```toml
+[opentelemetry]
+enabled = true
+endpoint = "http://localhost:4318"   # OTLP/HTTP コレクタエンドポイント
+service_name = "veil-proxy"          # service.name リソース属性
+batch_interval_secs = 30             # エクスポート間隔（デフォルト: 30秒）
+```
+
+### 設定オプション
+
+| オプション | 説明 | デフォルト |
+|-----------|------|-----------|
+| `enabled` | OTLPエクスポートを有効化 | `false` |
+| `endpoint` | OTLP/HTTPエンドポイントURL | `http://localhost:4318` |
+| `service_name` | `service.name` リソース属性 | `veil-proxy` |
+| `batch_interval_secs` | エクスポート間隔（秒） | `30` |
+
+### 対応コレクタ
+
+| コレクタ | 備考 |
+|---------|------|
+| Grafana Alloy / Tempo | `http://alloy:4318` をエンドポイントに設定 |
+| Jaeger (v1.35+) | OTLPレシーバーを有効化 |
+| OpenTelemetry Collector | 標準の OTLP/HTTP レシーバー |
+| Prometheus Remote Write | otel-collector の `prometheusremotewrite` エクスポーター経由 |
+
+## キャッシュPurge管理API
+
+プロキシを再起動せずにキャッシュエントリを無効化します。
+
+> **必要なフィーチャー**: `--features cache` および config の `[admin]` セクション
+
+### 設定
+
+```toml
+[admin]
+enabled = true
+path_prefix = "/__admin"    # 管理エンドポイントのプレフィックス
+secret = "changeme"         # 認証用Bearerトークン
+```
+
+### Purge操作
+
+すべてのPurgeリクエストに `Authorization: Bearer <secret>` ヘッダーが必要です。
+
+| メソッド | パス | クエリ | 効果 |
+|---------|------|--------|------|
+| `PURGE` | 任意のパス | — | パスに一致するキャッシュエントリを削除 |
+| `POST` | `/__admin/cache/purge` | `key=/path` | 正確なキーで削除 |
+| `POST` | `/__admin/cache/purge` | `prefix=/api/` | プレフィックスで一括削除 |
+| `POST` | `/__admin/cache/purge` | `pattern=/static/*.css` | globパターンで削除 |
+| `POST` | `/__admin/cache/purge` | `all=true` | キャッシュ全削除 |
+
+**レスポンス**: `{"purged": N}`（Nは削除されたエントリ数）
+
+### 使用例
+
+```bash
+# 特定ページのキャッシュを削除
+curl -X PURGE "https://proxy.example.com/blog/post-1" \
+  -H "Authorization: Bearer changeme"
+
+# API全体のキャッシュを削除
+curl -X POST "https://proxy.example.com/__admin/cache/purge?prefix=/api/" \
+  -H "Authorization: Bearer changeme"
+
+# CSSファイルをglobパターンで削除
+curl -X POST "https://proxy.example.com/__admin/cache/purge?pattern=/static/*.css" \
+  -H "Authorization: Bearer changeme"
+
+# キャッシュ全削除
+curl -X POST "https://proxy.example.com/__admin/cache/purge?all=true" \
+  -H "Authorization: Bearer changeme"
+```
+
+### アクセス制御
+
+| 条件 | レスポンス |
+|------|-----------|
+| `Authorization` ヘッダーなし | `401 Unauthorized` |
+| 誤ったシークレット | `401 Unauthorized` |
+| 管理API無効 | `404 Not Found` |
+| 成功 | `200 OK`、`{"purged": N}` |
 
 ## パフォーマンスチューニング
 
