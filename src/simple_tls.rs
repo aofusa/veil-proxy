@@ -882,7 +882,10 @@ impl SimpleTlsAcceptor {
     }
 
     pub async fn accept(&self, stream: TcpStream, initial_data: Option<Vec<u8>>) -> io::Result<SimpleTlsServerStream> {
-        accept(stream, self.config.clone(), initial_data).await
+        // F-03: ホットリロードされた証明書があればそれを使う（毎ハンドシェイクでスナップショット取得）
+        let config = crate::tls_reload::current_global_tls_config()
+            .unwrap_or_else(|| self.config.clone());
+        accept(stream, config, initial_data).await
     }
 
     /// 平文（TLSなし）接続をアクセプト（H2C対応用）

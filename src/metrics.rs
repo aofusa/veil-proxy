@@ -20,7 +20,28 @@
 //
 // ====================
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+// ====================
+// ランタイム有効/無効トグル（F-09）
+// ====================
+//
+// compile-time の `metrics` feature とは独立した実行時スイッチ。
+// `[metrics] enabled = false` の場合、エンドポイントは 404 を返し、
+// record_* 関数はノーオップになる。
+static METRICS_RUNTIME_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// メトリクスのランタイム有効状態を設定する（設定読み込み時に呼ぶ）
+#[inline]
+pub fn set_metrics_runtime_enabled(enabled: bool) {
+    METRICS_RUNTIME_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// メトリクスがランタイムで有効かどうか
+#[inline]
+pub fn metrics_runtime_enabled() -> bool {
+    METRICS_RUNTIME_ENABLED.load(Ordering::Relaxed)
+}
 
 // ====================
 // Prometheus 実装（metrics feature 有効時）
@@ -299,6 +320,212 @@ pub(crate) fn record_buffering_used(_host: &str) {
 }
 
 // ====================
+// F-09: 新規メトリクス（veil_ プレフィックス）
+// ====================
+// 既存メトリクスは後方互換のため veil_proxy_ プレフィックスを維持する。
+// 新規メトリクスは veil_ プレフィックスへ標準化する。
+
+// --- サーキットブレーカー・リトライ・異常検知（F-06 連携）---
+
+#[cfg(feature = "metrics")]
+/// サーキットブレーカーが Open になった累計回数（upstream ラベル）
+pub(crate) static CIRCUIT_BREAKER_OPEN_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    let opts = Opts::new("circuit_breaker_open_total", "Total times a circuit breaker opened")
+        .namespace("veil");
+    let counter = CounterVec::new(opts, &["upstream"]).unwrap();
+    METRICS_REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+#[cfg(feature = "metrics")]
+/// サーキットブレーカーの状態ゲージ（0=closed,1=open,2=half_open）
+pub(crate) static CIRCUIT_BREAKER_STATE: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let opts = Opts::new("circuit_breaker_state", "Circuit breaker state (0=closed,1=open,2=half_open)")
+        .namespace("veil");
+    let gauge = IntGaugeVec::new(opts, &["upstream"]).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+#[cfg(feature = "metrics")]
+/// リトライ回数カウンター（upstream, result ラベル）
+pub(crate) static RETRY_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    let opts = Opts::new("retry_total", "Total number of upstream retries")
+        .namespace("veil");
+    let counter = CounterVec::new(opts, &["upstream", "result"]).unwrap();
+    METRICS_REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+#[cfg(feature = "metrics")]
+/// 異常検知による排除状態ゲージ（upstream, server ラベル、1=排除中）
+pub(crate) static OUTLIER_EJECTED: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let opts = Opts::new("outlier_ejected", "Outlier-ejected upstream servers (1=ejected)")
+        .namespace("veil");
+    let gauge = IntGaugeVec::new(opts, &["upstream", "server"]).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+/// メトリクス: サーキットブレーカー Open を記録
+#[inline]
+pub fn record_circuit_breaker_open(_upstream: &str) {
+    #[cfg(feature = "metrics")]
+    if metrics_runtime_enabled() {
+        CIRCUIT_BREAKER_OPEN_TOTAL.with_label_values(&[_upstream]).inc();
+    }
+}
+
+/// メトリクス: サーキットブレーカー状態を更新
+#[inline]
+pub fn set_circuit_breaker_state(_upstream: &str, _state: u64) {
+    #[cfg(feature = "metrics")]
+    if metrics_runtime_enabled() {
+        CIRCUIT_BREAKER_STATE.with_label_values(&[_upstream]).set(_state as i64);
+    }
+}
+
+/// メトリクス: リトライを記録（result は "success" / "exhausted" 等）
+#[inline]
+pub fn record_retry(_upstream: &str, _result: &str) {
+    #[cfg(feature = "metrics")]
+    if metrics_runtime_enabled() {
+        RETRY_TOTAL.with_label_values(&[_upstream, _result]).inc();
+    }
+}
+
+/// メトリクス: 異常検知による排除状態を更新
+#[inline]
+pub fn set_outlier_ejected(_upstream: &str, _server: &str, _ejected: bool) {
+    #[cfg(feature = "metrics")]
+    if metrics_runtime_enabled() {
+        OUTLIER_EJECTED.with_label_values(&[_upstream, _server]).set(if _ejected { 1 } else { 0 });
+    }
+}
+
+// --- コネクションプール（F-09）---
+
+#[cfg(feature = "metrics")]
+/// コネクションプールのサイズゲージ（upstream ラベル）
+pub(crate) static CONNECTION_POOL_SIZE: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let opts = Opts::new("connection_pool_size", "Current connection pool size")
+        .namespace("veil");
+    let gauge = IntGaugeVec::new(opts, &["upstream"]).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+#[cfg(feature = "metrics")]
+/// コネクションプールのヒット数カウンター（upstream ラベル）
+pub(crate) static CONNECTION_POOL_HITS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    let opts = Opts::new("connection_pool_hits_total", "Total connection pool hits")
+        .namespace("veil");
+    let counter = CounterVec::new(opts, &["upstream"]).unwrap();
+    METRICS_REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+#[cfg(feature = "metrics")]
+/// コネクションプールのミス数カウンター（upstream ラベル）
+pub(crate) static CONNECTION_POOL_MISSES_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    let opts = Opts::new("connection_pool_misses_total", "Total connection pool misses")
+        .namespace("veil");
+    let counter = CounterVec::new(opts, &["upstream"]).unwrap();
+    METRICS_REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+/// メトリクス: コネクションプールサイズを更新
+#[inline]
+pub fn set_connection_pool_size(_upstream: &str, _size: usize) {
+    #[cfg(feature = "metrics")]
+    if metrics_runtime_enabled() {
+        CONNECTION_POOL_SIZE.with_label_values(&[_upstream]).set(_size as i64);
+    }
+}
+
+/// メトリクス: コネクションプールヒットを記録
+#[inline]
+pub fn record_connection_pool_hit(_upstream: &str) {
+    #[cfg(feature = "metrics")]
+    if metrics_runtime_enabled() {
+        CONNECTION_POOL_HITS_TOTAL.with_label_values(&[_upstream]).inc();
+    }
+}
+
+/// メトリクス: コネクションプールミスを記録
+#[inline]
+pub fn record_connection_pool_miss(_upstream: &str) {
+    #[cfg(feature = "metrics")]
+    if metrics_runtime_enabled() {
+        CONNECTION_POOL_MISSES_TOTAL.with_label_values(&[_upstream]).inc();
+    }
+}
+
+// --- gRPC（F-09、metrics + grpc 両方有効時）---
+
+#[cfg(all(feature = "metrics", feature = "grpc"))]
+/// gRPC リクエスト総数（method, status_code, upstream）
+pub(crate) static GRPC_REQUESTS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    let opts = Opts::new("grpc_requests_total", "Total number of gRPC requests")
+        .namespace("veil");
+    let counter = CounterVec::new(opts, &["method", "status_code", "upstream"]).unwrap();
+    METRICS_REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+#[cfg(all(feature = "metrics", feature = "grpc"))]
+/// gRPC ストリーム継続時間ヒストグラム（method）
+pub(crate) static GRPC_STREAM_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+    let opts = HistogramOpts::new("grpc_stream_duration_seconds", "gRPC stream duration in seconds")
+        .namespace("veil")
+        .buckets(vec![0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0]);
+    let histogram = HistogramVec::new(opts, &["method"]).unwrap();
+    METRICS_REGISTRY.register(Box::new(histogram.clone())).unwrap();
+    histogram
+});
+
+/// メトリクス: gRPC リクエストを記録
+#[inline]
+pub fn record_grpc_request(_method: &str, _status_code: &str, _upstream: &str) {
+    #[cfg(all(feature = "metrics", feature = "grpc"))]
+    if metrics_runtime_enabled() {
+        GRPC_REQUESTS_TOTAL.with_label_values(&[_method, _status_code, _upstream]).inc();
+    }
+}
+
+/// メトリクス: gRPC ストリーム継続時間を記録
+#[inline]
+pub fn observe_grpc_stream_duration(_method: &str, _duration_secs: f64) {
+    #[cfg(all(feature = "metrics", feature = "grpc"))]
+    if metrics_runtime_enabled() {
+        GRPC_STREAM_DURATION_SECONDS.with_label_values(&[_method]).observe(_duration_secs);
+    }
+}
+
+// --- WASM（F-09、metrics + wasm 両方有効時）---
+
+#[cfg(all(feature = "metrics", feature = "wasm"))]
+/// WASM フィルタ実行時間ヒストグラム（filter, phase）
+pub(crate) static WASM_FILTER_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+    let opts = HistogramOpts::new("wasm_filter_duration_seconds", "WASM filter execution time in seconds")
+        .namespace("veil")
+        .buckets(vec![0.00001, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5]);
+    let histogram = HistogramVec::new(opts, &["filter", "phase"]).unwrap();
+    METRICS_REGISTRY.register(Box::new(histogram.clone())).unwrap();
+    histogram
+});
+
+/// メトリクス: WASM フィルタ実行時間を記録
+#[inline]
+pub fn observe_wasm_filter_duration(_filter: &str, _phase: &str, _duration_secs: f64) {
+    #[cfg(all(feature = "metrics", feature = "wasm"))]
+    if metrics_runtime_enabled() {
+        WASM_FILTER_DURATION_SECONDS.with_label_values(&[_filter, _phase]).observe(_duration_secs);
+    }
+}
+
+// ====================
 // キャッシュ保存コンテキスト
 // ====================
 
@@ -435,6 +662,50 @@ pub(crate) fn encode_prometheus_metrics() -> Vec<u8> {
     Vec::new()
 }
 
+/// メトリクスファミリーを (メトリクス名, [(ラベル集合, 値)]) 形式で収集する（F-10）
+///
+/// OpenTelemetry エクスポータが Prometheus レジストリの値をブリッジする際に使用する。
+/// metrics feature 無効時は空配列を返す。
+#[allow(clippy::type_complexity)]
+pub fn gather_metric_families() -> Vec<(String, Vec<(Vec<(String, String)>, f64)>)> {
+    #[cfg(feature = "metrics")]
+    {
+        let mut result = Vec::new();
+        for mf in METRICS_REGISTRY.gather() {
+            let name = mf.name().to_string();
+            let mut samples = Vec::new();
+            for m in mf.get_metric() {
+                let labels: Vec<(String, String)> = m
+                    .get_label()
+                    .iter()
+                    .map(|l| (l.name().to_string(), l.value().to_string()))
+                    .collect();
+                // カウンタ/ゲージ/ヒストグラムの代表値を抽出
+                // MessageField は Option ライクなので as_ref で内部を取り出す
+                let value = if let Some(c) = m.get_counter().as_ref() {
+                    c.value()
+                } else if let Some(g) = m.get_gauge().as_ref() {
+                    g.value()
+                } else if let Some(h) = m.get_histogram().as_ref() {
+                    h.get_sample_sum()
+                } else {
+                    continue;
+                };
+                samples.push((labels, value));
+            }
+            if !samples.is_empty() {
+                result.push((name, samples));
+            }
+        }
+        result
+    }
+
+    #[cfg(not(feature = "metrics"))]
+    {
+        Vec::new()
+    }
+}
+
 /// メトリクスを記録（リクエスト完了時に呼び出し）
 ///
 /// ## パフォーマンス最適化
@@ -453,6 +724,10 @@ pub(crate) fn record_request_metrics(
 ) {
     #[cfg(feature = "metrics")]
     {
+        // ランタイムで無効化されている場合は記録しない
+        if !metrics_runtime_enabled() {
+            return;
+        }
         // ステータスコードを事前割り当てバッファで文字列化（アロケーション回避）
         let mut status_buf = itoa::Buffer::new();
         let status_str = status_buf.format(_status);
@@ -472,6 +747,10 @@ pub(crate) fn record_request_metrics(
 
 /// メトリクスエンドポイント用のHTTPレスポンスを生成
 pub(crate) fn build_metrics_response() -> Vec<u8> {
+    // ランタイムで無効化されている場合は 404 を返す（F-09）
+    if !metrics_runtime_enabled() {
+        return b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+    }
     #[cfg(feature = "metrics")]
     {
         let body = encode_prometheus_metrics();
@@ -487,4 +766,51 @@ pub(crate) fn build_metrics_response() -> Vec<u8> {
 
     #[cfg(not(feature = "metrics"))]
     b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+}
+
+// ====================
+// メトリクスのテスト（F-09）
+// ====================
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_toggle_controls_endpoint() {
+        // デフォルトは有効
+        set_metrics_runtime_enabled(true);
+        assert!(metrics_runtime_enabled());
+        let resp = build_metrics_response();
+        // 有効時は 200（metrics feature 有効時）または 404（無効時）
+        let s = String::from_utf8_lossy(&resp);
+        #[cfg(feature = "metrics")]
+        assert!(s.starts_with("HTTP/1.1 200"), "expected 200 when enabled: {}", s);
+
+        // 無効化すると 404 を返す
+        set_metrics_runtime_enabled(false);
+        assert!(!metrics_runtime_enabled());
+        let resp = build_metrics_response();
+        let s = String::from_utf8_lossy(&resp);
+        assert!(s.starts_with("HTTP/1.1 404"), "expected 404 when disabled: {}", s);
+
+        // 後続テストに影響しないよう元に戻す
+        set_metrics_runtime_enabled(true);
+    }
+
+    #[test]
+    fn record_functions_are_noop_when_disabled() {
+        // 無効時に record_* がパニックしないことを確認
+        set_metrics_runtime_enabled(false);
+        record_circuit_breaker_open("up");
+        set_circuit_breaker_state("up", 1);
+        record_retry("up", "success");
+        set_outlier_ejected("up", "s1", true);
+        record_connection_pool_hit("up");
+        record_connection_pool_miss("up");
+        set_connection_pool_size("up", 3);
+        record_grpc_request("/svc/Method", "0", "up");
+        observe_grpc_stream_duration("/svc/Method", 0.1);
+        observe_wasm_filter_duration("auth", "request", 0.001);
+        set_metrics_runtime_enabled(true);
+    }
 }

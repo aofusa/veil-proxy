@@ -109,6 +109,14 @@ rate-limit = []
 # ビルド方法: cargo build --features buffering
 buffering = []
 
+# OpenTelemetry (OTLP/HTTP) メトリクスエクスポート（F-10 Phase 1）
+# データプレーンは tokio-free のため、専用の std スレッドで
+# OTLP/HTTP (JSON) を std::net::TcpStream で送信する軽量実装。
+# 重い opentelemetry クレート（tokio 依存）は使用しない。
+# metrics feature と併用することで Prometheus レジストリの値をブリッジする。
+# ビルド方法: cargo build --features opentelemetry
+opentelemetry = []
+
 # ====================
 # 複合フィーチャ（便利用）
 # ====================
@@ -117,6 +125,7 @@ buffering = []
 full = [
     "ktls", "http2", "http3",
     "grpc-full", "wasm",
+    "opentelemetry",
     "compression", "cache", "metrics",
     "websocket", "rate-limit", "buffering",
     "mimalloc",
