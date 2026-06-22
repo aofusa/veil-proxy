@@ -425,7 +425,7 @@ impl Http3Handler {
                 if !prom_config.is_ip_allowed(&self.client_ip) {
                     self.send_error_response(stream_id, 403, b"Forbidden")?;
                     let user_agent_slice: &[u8] = if user_agent.is_empty() { &[] } else { &user_agent };
-                    log_access(&method, &authority, &path, user_agent_slice, request_body.len() as u64, 403, 9, start_time);
+                    log_access(&method, &authority, &path, user_agent_slice, request_body.len() as u64, 403, 9, start_time, &self.client_ip, "");
                     return Ok(());
                 }
                 
@@ -437,7 +437,7 @@ impl Http3Handler {
                 ], Some(&body))?;
                 
                 let user_agent_slice: &[u8] = if user_agent.is_empty() { &[] } else { &user_agent };
-                log_access(&method, &authority, &path, user_agent_slice, request_body.len() as u64, 200, body.len() as u64, start_time);
+                log_access(&method, &authority, &path, user_agent_slice, request_body.len() as u64, 200, body.len() as u64, start_time, &self.client_ip, "");
                 return Ok(());
             }
         }
@@ -503,13 +503,13 @@ impl Http3Handler {
                     // UNIMPLEMENTED (12) - サービス/メソッドが見つからない
                     self.send_grpc_response(stream_id, &[], None, 12, Some("Service not found"))?;
                     let user_agent_slice: &[u8] = if user_agent.is_empty() { &[] } else { &user_agent };
-                    log_access(&method, &authority, &path, user_agent_slice, request_body.len() as u64, 200, 0, start_time);
+                    log_access(&method, &authority, &path, user_agent_slice, request_body.len() as u64, 200, 0, start_time, &self.client_ip, "");
                     return Ok(());
                 }
                 
                 self.send_error_response(stream_id, 404, b"Not Found")?;
                 let user_agent_slice: &[u8] = if user_agent.is_empty() { &[] } else { &user_agent };
-                log_access(&method, &authority, &path, user_agent_slice, request_body.len() as u64, 404, 9, start_time);
+                log_access(&method, &authority, &path, user_agent_slice, request_body.len() as u64, 404, 9, start_time, &self.client_ip, "");
                 return Ok(());
             }
         };
@@ -523,7 +523,7 @@ impl Http3Handler {
             let msg = check_result.message();
             self.send_error_response(stream_id, status, msg)?;
             let user_agent_slice: &[u8] = if user_agent.is_empty() { &[] } else { &user_agent };
-            log_access(&method, &authority, &path, user_agent_slice, request_body.len() as u64, status, msg.len() as u64, start_time);
+            log_access(&method, &authority, &path, user_agent_slice, request_body.len() as u64, status, msg.len() as u64, start_time, &self.client_ip, "");
             return Ok(());
         }
 
@@ -565,7 +565,7 @@ impl Http3Handler {
                                 .map(|(k, v)| (k.as_slice(), v.as_slice()))
                                 .collect::<Vec<_>>(), Some(&resp.body))?;
                             let user_agent_slice: &[u8] = if user_agent.is_empty() { &[] } else { &user_agent };
-                            log_access(&method, &authority, &path, user_agent_slice, request_body.len() as u64, resp.status_code, resp.body.len() as u64, start_time);
+                            log_access(&method, &authority, &path, user_agent_slice, request_body.len() as u64, resp.status_code, resp.body.len() as u64, start_time, &self.client_ip, "");
                             return Ok(());
                         }
                         crate::wasm::FilterResult::Pause => {
@@ -643,7 +643,7 @@ impl Http3Handler {
         };
 
         let user_agent_slice: &[u8] = if user_agent.is_empty() { &[] } else { &user_agent };
-        log_access(&method, &authority, &path, user_agent_slice, request_body.len() as u64, status, resp_size as u64, start_time);
+        log_access(&method, &authority, &path, user_agent_slice, request_body.len() as u64, status, resp_size as u64, start_time, &self.client_ip, "");
         Ok(())
     }
     
