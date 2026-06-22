@@ -29,8 +29,8 @@
 //! リバースプロキシに必要な最小限のシステムコールのみを許可し、
 //! その他のシステムコールは拒否します。
 
+use ftlog::{debug, error, info, warn};
 use std::io;
-use ftlog::{info, warn, error, debug};
 
 // ====================
 // io_uring 制限定数
@@ -125,10 +125,10 @@ pub const ALLOWED_URING_OPCODES: &[u8] = &[
 // ====================
 
 /// systemd SystemCallFilter 互換のシステムコール一覧
-/// 
+///
 /// この定数は、systemd の SystemCallFilter ディレクティブで使用できる
 /// 必要最小限のシステムコール名のリストです。
-/// 
+///
 /// # 使用例 (systemd unit file)
 /// ```ini
 /// [Service]
@@ -183,7 +183,7 @@ sched_getaffinity
 "#;
 
 /// 許可するシステムコールのリスト (x86_64)
-/// 
+///
 /// 最小限のシステムコールのみを含みます。
 /// fork, execve, wait4 等の外部プロセス管理は不要なため除外。
 #[cfg(target_arch = "x86_64")]
@@ -194,7 +194,6 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     425, // io_uring_setup
     426, // io_uring_enter
     427, // io_uring_register
-
     // ============================================
     // ファイル I/O（設定、証明書、ログ）
     // ============================================
@@ -218,13 +217,11 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     262, // newfstatat
     275, // splice (kTLS ゼロコピー転送)
     332, // statx (monoio 非同期ファイルI/Oで使用)
-    
     // ============================================
     // DNS名前解決 (getaddrinfo)
     // ============================================
-    7,   // poll (DNS応答待機)
-    53,  // socketpair (NSS内部通信)
-    
+    7,  // poll (DNS応答待機)
+    53, // socketpair (NSS内部通信)
     // ============================================
     // ネットワーク（TCP/UDP ソケット）
     // ============================================
@@ -245,7 +242,6 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     288, // accept4
     299, // recvmmsg (DNS解決: 複数メッセージ受信)
     307, // sendmmsg (DNS解決: 複数メッセージ送信)
-
     // ============================================
     // メモリ管理（mimalloc、Huge Pages、io_uring）
     // ============================================
@@ -261,7 +257,6 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     152, // munlockall
     325, // mlock2 (io_uring 登録バッファ)
     319, // memfd_create (HTTP/3 TLS証明書のLandlock対応用)
-
     // ============================================
     // スレッド・プロセス管理
     // ============================================
@@ -279,7 +274,6 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     309, // getcpu
     334, // rseq (Restartable Sequences)
     435, // clone3
-
     // ============================================
     // シグナル処理（Graceful Shutdown、Hot Reload）
     // ============================================
@@ -287,7 +281,6 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     14,  // rt_sigprocmask
     15,  // rt_sigreturn
     131, // sigaltstack
-
     // ============================================
     // ユーザー・権限管理（権限降格用）
     // ============================================
@@ -299,14 +292,12 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     108, // getegid
     110, // getppid
     116, // setgroups
-    
     // ============================================
     // 時間・タイマー
     // ============================================
     35,  // nanosleep
     228, // clock_gettime
     230, // clock_nanosleep
-
     // ============================================
     // その他必須
     // ============================================
@@ -317,7 +308,6 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     158, // arch_prctl
     302, // prlimit64
     318, // getrandom (TLS 乱数生成)
-    
     // ============================================
     // epoll (monoio フォールバック、io_uring 非対応環境)
     // ============================================
@@ -326,7 +316,6 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     233, // epoll_ctl
     281, // epoll_pwait
     291, // epoll_create1 (EPOLL_CLOEXEC対応)
-
     // ============================================
     // ログファイル操作
     // ============================================
@@ -334,7 +323,6 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     75,  // fdatasync
     77,  // ftruncate
     285, // fallocate
-
     // ============================================
     // イベント・タイマー（monoio io_uring ランタイム必須）
     // ============================================
@@ -352,9 +340,8 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     // io_uring 関連（monoio ランタイム必須）
     // ============================================
     425, // io_uring_setup
-    426, // io_uring_enter  
+    426, // io_uring_enter
     427, // io_uring_register
-
     // ============================================
     // ファイル I/O
     // ============================================
@@ -377,7 +364,6 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     80,  // fstat
     291, // statx (monoio 非同期ファイルI/Oで使用)
     199, // socketpair (NSS内部通信)
-
     // ============================================
     // ネットワーク
     // ============================================
@@ -398,7 +384,6 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     242, // accept4
     243, // recvmmsg (DNS解決: 複数メッセージ受信)
     269, // sendmmsg (DNS解決: 複数メッセージ送信)
-
     // ============================================
     // メモリ管理
     // ============================================
@@ -413,7 +398,6 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     230, // mlockall
     231, // munlockall
     279, // memfd_create (HTTP/3 TLS証明書のLandlock対応用)
-
     // ============================================
     // スレッド・プロセス管理
     // ============================================
@@ -428,7 +412,6 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     178, // gettid
     220, // clone
     435, // clone3
-
     // ============================================
     // シグナル処理
     // ============================================
@@ -436,7 +419,6 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     134, // rt_sigaction
     135, // rt_sigprocmask
     139, // rt_sigreturn
-
     // ============================================
     // ユーザー・権限管理
     // ============================================
@@ -451,14 +433,12 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     176, // getgid
     177, // getegid
     159, // setgroups
-
     // ============================================
     // 時間・タイマー
     // ============================================
     101, // nanosleep
     113, // clock_gettime
     115, // clock_nanosleep
-
     // ============================================
     // その他必須
     // ============================================
@@ -469,30 +449,27 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     167, // prctl
     261, // prlimit64
     278, // getrandom
-
     // ============================================
     // epoll
     // ============================================
-    20,  // epoll_create1
-    21,  // epoll_ctl
-    22,  // epoll_pwait
-
+    20, // epoll_create1
+    21, // epoll_ctl
+    22, // epoll_pwait
     // ============================================
     // ログファイル操作
     // ============================================
-    82,  // fsync
-    83,  // fdatasync
-    46,  // ftruncate
-    47,  // fallocate
-
+    82, // fsync
+    83, // fdatasync
+    46, // ftruncate
+    47, // fallocate
     // ============================================
     // イベント・タイマー（monoio io_uring ランタイム必須）
     // ============================================
-    85,  // timerfd_create (monoio enable_timer() 必須)
-    86,  // timerfd_settime
-    87,  // timerfd_gettime
-    19,  // eventfd2 (io_uring イベント通知)
-    59,  // pipe2 (内部通信)
+    85, // timerfd_create (monoio enable_timer() 必須)
+    86, // timerfd_settime
+    87, // timerfd_gettime
+    19, // eventfd2 (io_uring イベント通知)
+    59, // pipe2 (内部通信)
 ];
 
 // ====================
@@ -554,9 +531,9 @@ pub struct SecurityConfig {
 
 impl Default for SecurityConfig {
     /// デフォルトのセキュリティ設定
-    /// 
+    ///
     /// # 本番環境での推奨設定
-    /// 
+    ///
     /// ```toml
     /// [security]
     /// enable_seccomp = true
@@ -565,9 +542,9 @@ impl Default for SecurityConfig {
     /// landlock_read_paths = ["/etc/veil", "/usr", "/lib", "/lib64"]
     /// landlock_write_paths = ["/var/log/veil"]
     /// ```
-    /// 
+    ///
     /// # 導入時の推奨手順
-    /// 
+    ///
     /// 1. まず `seccomp_mode = "log"` で動作確認
     /// 2. `journalctl | grep seccomp` でブロックされるシステムコールを確認
     /// 3. 問題がなければ `seccomp_mode = "filter"` に変更
@@ -583,10 +560,7 @@ impl Default for SecurityConfig {
                 "/lib".to_string(),
                 "/lib64".to_string(),
             ],
-            landlock_write_paths: vec![
-                "/var/log".to_string(),
-                "/tmp".to_string(),
-            ],
+            landlock_write_paths: vec!["/var/log".to_string(), "/tmp".to_string()],
         }
     }
 }
@@ -609,21 +583,19 @@ impl KernelVersion {
         let uname = nix::sys::utsname::uname()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         let release = uname.release().to_string_lossy();
-        
+
         // パース: "5.15.0-generic" -> (5, 15, 0)
         let parts: Vec<&str> = release.split(|c: char| c == '.' || c == '-').collect();
-        
-        let major = parts.get(0)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let minor = parts.get(1)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let patch = parts.get(2)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        
-        Ok(Self { major, minor, patch })
+
+        let major = parts.get(0).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let minor = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let patch = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+        Ok(Self {
+            major,
+            minor,
+            patch,
+        })
     }
 
     /// io_uring制限がサポートされているか (5.10+)
@@ -668,7 +640,10 @@ impl std::fmt::Display for KernelVersion {
 /// カーネルバージョンが要件を満たさない場合もエラーを返します。
 pub fn apply_security_restrictions(config: &SecurityConfig) -> io::Result<()> {
     let kernel = KernelVersion::current()?;
-    info!("Kernel version: {} - Checking security feature support", kernel);
+    info!(
+        "Kernel version: {} - Checking security feature support",
+        kernel
+    );
 
     // 1. io_uring制限
     if config.enable_io_uring_restrictions {
@@ -677,19 +652,22 @@ pub fn apply_security_restrictions(config: &SecurityConfig) -> io::Result<()> {
             warn!("monoio does not expose low-level io_uring API (uring_fd/submitter)");
             warn!("Alternative: Use seccomp to limit system calls including io_uring operations");
         } else {
-            warn!("io_uring restrictions require Linux 5.10+ (current: {})", kernel);
+            warn!(
+                "io_uring restrictions require Linux 5.10+ (current: {})",
+                kernel
+            );
         }
     }
 
     // 2. Landlock
     if config.enable_landlock {
         if kernel.supports_landlock() {
-            apply_landlock(config)?;  // エラーを返すように変更
+            apply_landlock(config)?; // エラーを返すように変更
             info!("Landlock filesystem restrictions applied");
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                format!("Landlock requires Linux 5.13+ (current: {})", kernel)
+                format!("Landlock requires Linux 5.13+ (current: {})", kernel),
             ));
         }
     }
@@ -697,12 +675,12 @@ pub fn apply_security_restrictions(config: &SecurityConfig) -> io::Result<()> {
     // 3. seccomp（最後に適用 - 不可逆）
     if config.enable_seccomp && config.seccomp_mode != SeccompMode::Disabled {
         if kernel.supports_seccomp() {
-            apply_seccomp(config)?;  // 既にエラーを返している
+            apply_seccomp(config)?; // 既にエラーを返している
             info!("seccomp filter applied (mode: {:?})", config.seccomp_mode);
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                format!("seccomp requires Linux 3.17+ (current: {})", kernel)
+                format!("seccomp requires Linux 3.17+ (current: {})", kernel),
             ));
         }
     }
@@ -766,6 +744,7 @@ fn build_seccomp_filter(mode: SeccompMode) -> io::Result<Vec<libc::sock_filter>>
     const BPF_W: u16 = 0x00;
     const BPF_ABS: u16 = 0x20;
     const BPF_JEQ: u16 = 0x10;
+    const BPF_JSET: u16 = 0x40; // ビットセットテスト
     const BPF_K: u16 = 0x00;
 
     // seccomp データオフセット
@@ -782,9 +761,9 @@ fn build_seccomp_filter(mode: SeccompMode) -> io::Result<Vec<libc::sock_filter>>
     // アクション
     let action_allow = 0x7fff0000u32; // SECCOMP_RET_ALLOW
     let action_deny = match mode {
-        SeccompMode::Log => 0x7ffc0000u32,     // SECCOMP_RET_LOG
-        SeccompMode::Strict => 0x00000000u32,  // SECCOMP_RET_KILL_PROCESS
-        SeccompMode::Filter => 0x00050001u32,  // SECCOMP_RET_ERRNO | EPERM
+        SeccompMode::Log => 0x7ffc0000u32,      // SECCOMP_RET_LOG
+        SeccompMode::Strict => 0x00000000u32,   // SECCOMP_RET_KILL_PROCESS
+        SeccompMode::Filter => 0x00050001u32,   // SECCOMP_RET_ERRNO | EPERM
         SeccompMode::Disabled => 0x7fff0000u32, // SECCOMP_RET_ALLOW (no-op)
     };
 
@@ -819,17 +798,98 @@ fn build_seccomp_filter(mode: SeccompMode) -> io::Result<Vec<libc::sock_filter>>
         k: OFFSET_NR,
     });
 
+    // ====================
+    // PROT_EXEC 引数レベルチェック（mmap / mprotect）
+    //
+    // mprotect(addr, len, prot) の prot は args[1]（オフセット 24）
+    // mmap(addr, len, prot, ...)  の prot は args[2]（オフセット 32）
+    //
+    // seccomp_data 構造体レイアウト:
+    //   u32 nr       @ offset 0
+    //   u32 arch     @ offset 4
+    //   u64 ip       @ offset 8
+    //   u64 args[0]  @ offset 16
+    //   u64 args[1]  @ offset 24
+    //   u64 args[2]  @ offset 32
+    // ====================
+    const PROT_EXEC: u32 = 0x4;
+
+    // seccomp_data.args フィールドは u64 だが、BPF は 32bit 単位で読む。
+    // リトルエンディアンでは下位 32bit がオフセット位置にある。
+    const OFFSET_ARG1_LO: u32 = 24; // args[1] 下位 32bit（mprotect の prot）
+    const OFFSET_ARG2_LO: u32 = 32; // args[2] 下位 32bit（mmap の prot）
+
+    #[cfg(target_arch = "x86_64")]
+    let (syscall_mmap, syscall_mprotect) = (9u32, 10u32);
+    #[cfg(target_arch = "aarch64")]
+    let (syscall_mmap, syscall_mprotect) = (222u32, 226u32);
+
+    // mprotect の PROT_EXEC チェックサブルーチンを後方に追加する都合上、
+    // まず全チェックの命令数を見積もる。
+    // シンプルな設計: mmap/mprotect は PROT_EXEC チェックジャンプ先に飛ばし、
+    // その他は従来どおり allow へジャンプする。
+    //
+    // フィルターレイアウト:
+    //   [現在位置] syscall_count 個の JEQ チェック
+    //             ├─ mmap   が一致 → PROT_EXEC_CHECK_MMAP へ
+    //             ├─ mprotect が一致 → PROT_EXEC_CHECK_MPROTECT へ
+    //             └─ その他  が一致 → ALLOW へ
+    //   [deny]    DENY
+    //   [allow]   ALLOW
+    //   [prot_exec_check_mprotect]
+    //             LD args[1] 下位32bit
+    //             JSET PROT_EXEC → DENY
+    //             ALLOW
+    //   [prot_exec_check_mmap]
+    //             LD args[2] 下位32bit
+    //             JSET PROT_EXEC → DENY
+    //             ALLOW
+    //
+    // DENY = filter.len() + syscall_count
+    // ALLOW = filter.len() + syscall_count + 1
+    // prot_check_mprotect = filter.len() + syscall_count + 2
+    //   (LD, JSET, ALLOW) = 3 commands
+    // prot_check_mmap = filter.len() + syscall_count + 5
+
+    let base = filter.len(); // syscall LD 命令のインデックス
+    let deny_idx = base + 1; // DENY 命令のインデックス（スキップカウント計算用）
+                             // syscall_count 個の JEQ のあとに DENY, ALLOW, [mprotect check 3命令], [mmap check 3命令]
+
     // 3. 許可リストにあるシステムコールをチェック
     let syscall_count = ALLOWED_SYSCALLS.len();
     for (i, &syscall) in ALLOWED_SYSCALLS.iter().enumerate() {
         let remaining = syscall_count - i - 1;
-        filter.push(libc::sock_filter {
-            code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt: (remaining + 1) as u8, // 許可へジャンプ
-            jf: 0, // 次のチェックへ
-            k: syscall as u32,
-        });
+        let allow_jump_dist = (remaining + 1) as u8; // ALLOW へのオフセット（deny の 1 先）
+
+        let nr = syscall as u32;
+        if nr == syscall_mprotect {
+            // mprotect → PROT_EXEC チェック: deny+2 先（deny, allow, [LD] ← ここ）
+            let prot_check_jump = (remaining + 2) as u8;
+            filter.push(libc::sock_filter {
+                code: BPF_JMP | BPF_JEQ | BPF_K,
+                jt: prot_check_jump, // prot_exec_check_mprotect へ
+                jf: 0,
+                k: nr,
+            });
+        } else if nr == syscall_mmap {
+            // mmap → PROT_EXEC チェック: deny+5 先
+            let prot_check_jump = (remaining + 5) as u8;
+            filter.push(libc::sock_filter {
+                code: BPF_JMP | BPF_JEQ | BPF_K,
+                jt: prot_check_jump, // prot_exec_check_mmap へ
+                jf: 0,
+                k: nr,
+            });
+        } else {
+            filter.push(libc::sock_filter {
+                code: BPF_JMP | BPF_JEQ | BPF_K,
+                jt: allow_jump_dist, // ALLOW へジャンプ
+                jf: 0,               // 次のチェックへ
+                k: nr,
+            });
+        }
     }
+    let _ = deny_idx; // suppress unused warning
 
     // 4. リストにない -> 拒否
     filter.push(libc::sock_filter {
@@ -847,8 +907,71 @@ fn build_seccomp_filter(mode: SeccompMode) -> io::Result<Vec<libc::sock_filter>>
         k: action_allow,
     });
 
-    debug!("Built seccomp filter with {} instructions for {} syscalls", 
-           filter.len(), syscall_count);
+    // 6. mprotect PROT_EXEC チェック（args[1] を検査）
+    // LD args[1] 下位32bit
+    filter.push(libc::sock_filter {
+        code: BPF_LD | BPF_W | BPF_ABS,
+        jt: 0,
+        jf: 0,
+        k: OFFSET_ARG1_LO,
+    });
+    // PROT_EXEC ビットが立っていれば DENY
+    filter.push(libc::sock_filter {
+        code: BPF_JMP | BPF_JSET | BPF_K,
+        jt: 1, // DENY へ（2 命令先 = ALLOW をスキップして DENY）
+        jf: 0, // ALLOW へ（次の命令）
+        k: PROT_EXEC,
+    });
+    // PROT_EXEC なし → 許可
+    filter.push(libc::sock_filter {
+        code: BPF_RET | BPF_K,
+        jt: 0,
+        jf: 0,
+        k: action_allow,
+    });
+    // PROT_EXEC あり → 拒否
+    filter.push(libc::sock_filter {
+        code: BPF_RET | BPF_K,
+        jt: 0,
+        jf: 0,
+        k: action_deny,
+    });
+
+    // 7. mmap PROT_EXEC チェック（args[2] を検査）
+    // LD args[2] 下位32bit
+    filter.push(libc::sock_filter {
+        code: BPF_LD | BPF_W | BPF_ABS,
+        jt: 0,
+        jf: 0,
+        k: OFFSET_ARG2_LO,
+    });
+    // PROT_EXEC ビットが立っていれば DENY
+    filter.push(libc::sock_filter {
+        code: BPF_JMP | BPF_JSET | BPF_K,
+        jt: 1, // ALLOW をスキップして DENY
+        jf: 0, // ALLOW へ
+        k: PROT_EXEC,
+    });
+    // PROT_EXEC なし → 許可
+    filter.push(libc::sock_filter {
+        code: BPF_RET | BPF_K,
+        jt: 0,
+        jf: 0,
+        k: action_allow,
+    });
+    // PROT_EXEC あり → 拒否
+    filter.push(libc::sock_filter {
+        code: BPF_RET | BPF_K,
+        jt: 0,
+        jf: 0,
+        k: action_deny,
+    });
+
+    debug!(
+        "Built seccomp filter with {} instructions for {} syscalls",
+        filter.len(),
+        syscall_count
+    );
 
     Ok(filter)
 }
@@ -858,13 +981,13 @@ fn build_seccomp_filter(mode: SeccompMode) -> io::Result<Vec<libc::sock_filter>>
 // ====================
 
 /// Landlockファイルシステム制限を適用
-/// 
+///
 /// Landlock ABI バージョン対応:
 /// - ABI v1 (Linux 5.13+): 基本的なファイルシステムアクセス制御
 /// - ABI v2 (Linux 5.19+): ファイル参照権限
 /// - ABI v3 (Linux 6.2+):  TRUNCATE権限
 /// - ABI v4 (Linux 6.7+):  ioctl権限
-/// 
+///
 /// 利用可能な最高のABIバージョンを自動検出して使用します。
 #[cfg(target_os = "linux")]
 fn apply_landlock(config: &SecurityConfig) -> io::Result<()> {
@@ -878,7 +1001,7 @@ fn apply_landlock(config: &SecurityConfig) -> io::Result<()> {
     // ============================================
     // Landlock アクセス権限 (ABI v1-v4)
     // ============================================
-    
+
     // ABI v1 (Linux 5.13+) - 基本権限
     // 注: EXECUTE (1 << 0) はサーバーでは不要のため定義しない
     const LANDLOCK_ACCESS_FS_WRITE_FILE: u64 = 1 << 1;
@@ -893,23 +1016,25 @@ fn apply_landlock(config: &SecurityConfig) -> io::Result<()> {
     const LANDLOCK_ACCESS_FS_MAKE_FIFO: u64 = 1 << 10;
     const LANDLOCK_ACCESS_FS_MAKE_BLOCK: u64 = 1 << 11;
     const LANDLOCK_ACCESS_FS_MAKE_SYM: u64 = 1 << 12;
-    
+
     // ABI v2 (Linux 5.19+) - ファイル参照権限
     const LANDLOCK_ACCESS_FS_REFER: u64 = 1 << 13;
-    
+
     // ABI v3 (Linux 6.2+) - TRUNCATE権限
     const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 1 << 14;
-    
+
     // ABI v4 (Linux 6.7+) - ioctl権限
     const LANDLOCK_ACCESS_FS_IOCTL_DEV: u64 = 1 << 15;
 
     // 作成/削除関連の全権限
     #[allow(dead_code)]
-    const LANDLOCK_ACCESS_FS_MAKE_ALL: u64 = 
-        LANDLOCK_ACCESS_FS_MAKE_CHAR | LANDLOCK_ACCESS_FS_MAKE_DIR |
-        LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_MAKE_SOCK |
-        LANDLOCK_ACCESS_FS_MAKE_FIFO | LANDLOCK_ACCESS_FS_MAKE_BLOCK |
-        LANDLOCK_ACCESS_FS_MAKE_SYM;
+    const LANDLOCK_ACCESS_FS_MAKE_ALL: u64 = LANDLOCK_ACCESS_FS_MAKE_CHAR
+        | LANDLOCK_ACCESS_FS_MAKE_DIR
+        | LANDLOCK_ACCESS_FS_MAKE_REG
+        | LANDLOCK_ACCESS_FS_MAKE_SOCK
+        | LANDLOCK_ACCESS_FS_MAKE_FIFO
+        | LANDLOCK_ACCESS_FS_MAKE_BLOCK
+        | LANDLOCK_ACCESS_FS_MAKE_SYM;
 
     // ruleset_attr 構造体
     #[repr(C)]
@@ -939,14 +1064,14 @@ fn apply_landlock(config: &SecurityConfig) -> io::Result<()> {
             LANDLOCK_CREATE_RULESET_VERSION,
         ) as i32
     };
-    
+
     if abi_version < 0 {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "Landlock is not supported on this kernel"
+            "Landlock is not supported on this kernel",
         ));
     }
-    
+
     info!("Landlock: ABI version {} detected", abi_version);
 
     // ABIバージョンに応じたアクセス権限を設定
@@ -960,38 +1085,52 @@ fn apply_landlock(config: &SecurityConfig) -> io::Result<()> {
         1 => {
             // ABI v1: 基本権限のみ
             let read = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
-            let write = read | LANDLOCK_ACCESS_FS_WRITE_FILE | 
-                        LANDLOCK_ACCESS_FS_REMOVE_FILE | LANDLOCK_ACCESS_FS_REMOVE_DIR |
-                        LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_MAKE_DIR;
+            let write = read
+                | LANDLOCK_ACCESS_FS_WRITE_FILE
+                | LANDLOCK_ACCESS_FS_REMOVE_FILE
+                | LANDLOCK_ACCESS_FS_REMOVE_DIR
+                | LANDLOCK_ACCESS_FS_MAKE_REG
+                | LANDLOCK_ACCESS_FS_MAKE_DIR;
             (read, write)
         }
         2 => {
             // ABI v2: REFER権限追加
             let read = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
-            let write = read | LANDLOCK_ACCESS_FS_WRITE_FILE | 
-                        LANDLOCK_ACCESS_FS_REMOVE_FILE | LANDLOCK_ACCESS_FS_REMOVE_DIR |
-                        LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_MAKE_DIR |
-                        LANDLOCK_ACCESS_FS_REFER;
+            let write = read
+                | LANDLOCK_ACCESS_FS_WRITE_FILE
+                | LANDLOCK_ACCESS_FS_REMOVE_FILE
+                | LANDLOCK_ACCESS_FS_REMOVE_DIR
+                | LANDLOCK_ACCESS_FS_MAKE_REG
+                | LANDLOCK_ACCESS_FS_MAKE_DIR
+                | LANDLOCK_ACCESS_FS_REFER;
             (read, write)
         }
         3 | 4 => {
             // ABI v3-v4: TRUNCATE権限追加
             // 注: ABI v4はネットワーク制限を追加するが、FS権限は変更なし
             let read = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
-            let write = read | LANDLOCK_ACCESS_FS_WRITE_FILE | 
-                        LANDLOCK_ACCESS_FS_REMOVE_FILE | LANDLOCK_ACCESS_FS_REMOVE_DIR |
-                        LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_MAKE_DIR |
-                        LANDLOCK_ACCESS_FS_REFER | LANDLOCK_ACCESS_FS_TRUNCATE;
+            let write = read
+                | LANDLOCK_ACCESS_FS_WRITE_FILE
+                | LANDLOCK_ACCESS_FS_REMOVE_FILE
+                | LANDLOCK_ACCESS_FS_REMOVE_DIR
+                | LANDLOCK_ACCESS_FS_MAKE_REG
+                | LANDLOCK_ACCESS_FS_MAKE_DIR
+                | LANDLOCK_ACCESS_FS_REFER
+                | LANDLOCK_ACCESS_FS_TRUNCATE;
             (read, write)
         }
         _ => {
             // ABI v5+: IOCTL_DEV権限追加（Linux 6.10+）
             let read = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
-            let write = read | LANDLOCK_ACCESS_FS_WRITE_FILE | 
-                        LANDLOCK_ACCESS_FS_REMOVE_FILE | LANDLOCK_ACCESS_FS_REMOVE_DIR |
-                        LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_MAKE_DIR |
-                        LANDLOCK_ACCESS_FS_REFER | LANDLOCK_ACCESS_FS_TRUNCATE |
-                        LANDLOCK_ACCESS_FS_IOCTL_DEV;
+            let write = read
+                | LANDLOCK_ACCESS_FS_WRITE_FILE
+                | LANDLOCK_ACCESS_FS_REMOVE_FILE
+                | LANDLOCK_ACCESS_FS_REMOVE_DIR
+                | LANDLOCK_ACCESS_FS_MAKE_REG
+                | LANDLOCK_ACCESS_FS_MAKE_DIR
+                | LANDLOCK_ACCESS_FS_REFER
+                | LANDLOCK_ACCESS_FS_TRUNCATE
+                | LANDLOCK_ACCESS_FS_IOCTL_DEV;
             (read, write)
         }
     };
@@ -1066,16 +1205,12 @@ fn apply_landlock(config: &SecurityConfig) -> io::Result<()> {
     }
 
     // ルールセットを適用
-    let ret = unsafe {
-        libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
-    };
+    let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
     if ret != 0 && unsafe { *libc::__errno_location() } != libc::EINVAL {
         // 既に設定済みの場合は無視
     }
 
-    let ret = unsafe {
-        libc::syscall(LANDLOCK_RESTRICT_SELF, ruleset_fd, 0u32)
-    };
+    let ret = unsafe { libc::syscall(LANDLOCK_RESTRICT_SELF, ruleset_fd, 0u32) };
 
     unsafe { libc::close(ruleset_fd) };
 
@@ -1097,7 +1232,7 @@ fn apply_landlock(_config: &SecurityConfig) -> io::Result<()> {
 // ====================
 
 /// io_uring制限を適用する関数（現在は未実装）
-/// 
+///
 /// monoioが以下のいずれかをサポートした場合に実装可能:
 /// 1. io_uringのファイルディスクリプタへのアクセス
 /// 2. RuntimeBuilderでの制限設定オプション
@@ -1127,7 +1262,7 @@ pub fn apply_io_uring_restrictions() -> io::Result<()> {
     error!("io_uring restrictions cannot be applied directly with monoio");
     error!("monoio abstracts io_uring and does not expose the underlying uring_fd");
     error!("Use seccomp instead to restrict io_uring operations at the syscall level");
-    
+
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "io_uring restrictions not supported with monoio - use seccomp instead",
@@ -1144,12 +1279,30 @@ pub fn report_security_status() {
         Ok(kernel) => {
             info!("=== Security Feature Support ===");
             info!("Kernel version: {}", kernel);
-            info!("io_uring restrictions (5.10+): {}", 
-                  if kernel.supports_uring_restrictions() { "Available" } else { "Not available" });
-            info!("seccomp (3.17+): {}", 
-                  if kernel.supports_seccomp() { "Available" } else { "Not available" });
-            info!("Landlock (5.13+): {}", 
-                  if kernel.supports_landlock() { "Available" } else { "Not available" });
+            info!(
+                "io_uring restrictions (5.10+): {}",
+                if kernel.supports_uring_restrictions() {
+                    "Available"
+                } else {
+                    "Not available"
+                }
+            );
+            info!(
+                "seccomp (3.17+): {}",
+                if kernel.supports_seccomp() {
+                    "Available"
+                } else {
+                    "Not available"
+                }
+            );
+            info!(
+                "Landlock (5.13+): {}",
+                if kernel.supports_landlock() {
+                    "Available"
+                } else {
+                    "Not available"
+                }
+            );
             info!("=================================");
         }
         Err(e) => {
@@ -1192,67 +1345,67 @@ pub fn report_security_status() {
 pub struct SandboxConfig {
     /// サンドボックスを有効化
     pub enabled: bool,
-    
+
     /// PID namespace分離
     /// サンドボックス内のプロセスは外部のプロセスを見ることができなくなります
     pub unshare_pid: bool,
-    
+
     /// Mount namespace分離
     /// サンドボックス内で独自のマウントポイントを持ちます
     pub unshare_mount: bool,
-    
+
     /// UTS namespace分離
     /// サンドボックス内で独自のホスト名を持ちます
     pub unshare_uts: bool,
-    
+
     /// IPC namespace分離
     /// サンドボックス内で独自のIPC（共有メモリ、セマフォ等）を持ちます
     pub unshare_ipc: bool,
-    
+
     /// User namespace分離
     /// サンドボックス内で独自のユーザー/グループIDマッピングを持ちます
     /// 注: rootでなくてもnamespace分離が可能になりますが、制限があります
     pub unshare_user: bool,
-    
+
     /// Network namespace分離
     /// 通常はfalse（サーバーはネットワークアクセスが必要）
     /// trueの場合、サンドボックス内からネットワークにアクセスできなくなります
     pub unshare_net: bool,
-    
+
     /// 新しいルートファイルシステムのパス
     /// 設定されている場合、pivot_rootまたはchrootを実行します
     pub new_root: Option<String>,
-    
+
     /// 読み取り専用バインドマウント
     /// source -> dest へのread-onlyバインドを設定
     pub ro_bind_mounts: Vec<BindMount>,
-    
+
     /// 読み書きバインドマウント
     /// source -> dest へのread-writeバインドを設定
     pub rw_bind_mounts: Vec<BindMount>,
-    
+
     /// tmpfsマウント（メモリファイルシステム）
     /// 指定されたパスにtmpfsをマウント
     pub tmpfs_mounts: Vec<String>,
-    
+
     /// /proc をマウントするかどうか
     pub mount_proc: bool,
-    
+
     /// /dev の最小限のデバイスノードを作成するかどうか
     pub mount_dev: bool,
-    
+
     /// ドロップするケイパビリティのリスト
     /// 例: ["CAP_SYS_ADMIN", "CAP_NET_RAW"]
     pub drop_capabilities: Vec<String>,
-    
+
     /// 保持するケイパビリティのリスト（他は全てドロップ）
     /// drop_capabilitiesより優先されます
     /// 例: ["CAP_NET_BIND_SERVICE"]
     pub keep_capabilities: Vec<String>,
-    
+
     /// サンドボックス内のホスト名
     pub hostname: Option<String>,
-    
+
     /// PR_SET_NO_NEW_PRIVSを設定するかどうか
     /// seccompと併用する場合は自動的にtrueになります
     pub no_new_privs: bool,
@@ -1329,7 +1482,7 @@ impl Capability {
     pub fn from_str(s: &str) -> Option<Self> {
         let s = s.trim().to_uppercase();
         let s = s.strip_prefix("CAP_").unwrap_or(&s);
-        
+
         match s {
             "CHOWN" => Some(Capability::CAP_CHOWN),
             "DAC_OVERRIDE" => Some(Capability::CAP_DAC_OVERRIDE),
@@ -1375,9 +1528,9 @@ impl Capability {
             _ => None,
         }
     }
-    
+
     /// リバースプロキシサーバーに推奨されるケイパビリティセット
-    /// 
+    ///
     /// 最小権限の原則に基づき、以下のケイパビリティのみを保持:
     /// - CAP_NET_BIND_SERVICE: 特権ポート（1024未満）へのバインド
     /// - CAP_SETUID/CAP_SETGID: 権限降格用
@@ -1388,7 +1541,7 @@ impl Capability {
             Capability::CAP_SETGID,
         ]
     }
-    
+
     /// 全てのケイパビリティのリスト
     pub fn all() -> Vec<Self> {
         vec![
@@ -1438,28 +1591,28 @@ impl Capability {
 }
 
 /// サンドボックスを適用
-/// 
+///
 /// bubblewrapと同等のプロセス分離を実現します。
-/// 
+///
 /// # 適用順序
-/// 
+///
 /// 1. PR_SET_NO_NEW_PRIVS設定
 /// 2. Namespace分離（unshare）
 /// 3. Mount namespace内でのbind mounts
 /// 4. Capabilities制限
-/// 
+///
 /// # 注意事項
-/// 
+///
 /// - この関数は一度だけ呼び出してください
 /// - 適用後は設定を変更できません
 /// - Network namespaceを分離するとネットワーク通信ができなくなります
-/// 
+///
 /// # 引数
-/// 
+///
 /// * `config` - サンドボックス設定
-/// 
+///
 /// # エラー
-/// 
+///
 /// 設定の適用に失敗した場合はエラーを返します。
 #[cfg(target_os = "linux")]
 pub fn apply_sandbox(config: &SandboxConfig) -> io::Result<()> {
@@ -1467,9 +1620,9 @@ pub fn apply_sandbox(config: &SandboxConfig) -> io::Result<()> {
         debug!("Sandbox is disabled");
         return Ok(());
     }
-    
+
     info!("Applying sandbox restrictions (bubblewrap-compatible)...");
-    
+
     // 1. PR_SET_NO_NEW_PRIVS を設定
     if config.no_new_privs {
         let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
@@ -1482,25 +1635,25 @@ pub fn apply_sandbox(config: &SandboxConfig) -> io::Result<()> {
         }
         debug!("PR_SET_NO_NEW_PRIVS set successfully");
     }
-    
+
     // 2. Namespace分離
     apply_namespaces(config)?;
-    
+
     // 3. Mount namespace内でのbind mounts
     if config.unshare_mount {
         apply_mounts(config)?;
     }
-    
+
     // 4. ホスト名設定（UTS namespace分離時）
     if config.unshare_uts {
         if let Some(ref hostname) = config.hostname {
             apply_hostname(hostname)?;
         }
     }
-    
+
     // 5. Capabilities制限
     apply_capabilities(config)?;
-    
+
     info!("Sandbox restrictions applied successfully");
     Ok(())
 }
@@ -1515,49 +1668,54 @@ pub fn apply_sandbox(_config: &SandboxConfig) -> io::Result<()> {
 #[cfg(target_os = "linux")]
 fn apply_namespaces(config: &SandboxConfig) -> io::Result<()> {
     use nix::sched::{unshare, CloneFlags};
-    
+
     let mut flags = CloneFlags::empty();
-    
+
     if config.unshare_pid {
         flags |= CloneFlags::CLONE_NEWPID;
         debug!("Will unshare PID namespace");
     }
-    
+
     if config.unshare_mount {
         flags |= CloneFlags::CLONE_NEWNS;
         debug!("Will unshare Mount namespace");
     }
-    
+
     if config.unshare_uts {
         flags |= CloneFlags::CLONE_NEWUTS;
         debug!("Will unshare UTS namespace");
     }
-    
+
     if config.unshare_ipc {
         flags |= CloneFlags::CLONE_NEWIPC;
         debug!("Will unshare IPC namespace");
     }
-    
+
     if config.unshare_user {
         flags |= CloneFlags::CLONE_NEWUSER;
         debug!("Will unshare User namespace");
     }
-    
+
     if config.unshare_net {
         flags |= CloneFlags::CLONE_NEWNET;
         warn!("Will unshare Network namespace - network access will be blocked!");
     }
-    
+
     if flags.is_empty() {
         debug!("No namespaces to unshare");
         return Ok(());
     }
-    
+
     unshare(flags).map_err(|e| {
-        io::Error::new(io::ErrorKind::PermissionDenied, 
-            format!("Failed to unshare namespaces: {} (may require root or CAP_SYS_ADMIN)", e))
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "Failed to unshare namespaces: {} (may require root or CAP_SYS_ADMIN)",
+                e
+            ),
+        )
     })?;
-    
+
     info!("Namespace separation applied: {:?}", flags);
     Ok(())
 }
@@ -1566,7 +1724,7 @@ fn apply_namespaces(config: &SandboxConfig) -> io::Result<()> {
 #[cfg(target_os = "linux")]
 fn apply_mounts(config: &SandboxConfig) -> io::Result<()> {
     use nix::mount::{mount, MsFlags};
-    
+
     // マウントプロパゲーションをprivateに設定
     // これにより、このマウントnamespace内の変更が外部に影響しない
     mount(
@@ -1575,30 +1733,39 @@ fn apply_mounts(config: &SandboxConfig) -> io::Result<()> {
         None::<&str>,
         MsFlags::MS_REC | MsFlags::MS_PRIVATE,
         None::<&str>,
-    ).map_err(|e| {
-        io::Error::new(io::ErrorKind::Other, 
-            format!("Failed to set mount propagation: {}", e))
+    )
+    .map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("Failed to set mount propagation: {}", e),
+        )
     })?;
     debug!("Mount propagation set to private");
-    
+
     // 読み取り専用バインドマウント
     for bind in &config.ro_bind_mounts {
         if let Err(e) = apply_bind_mount(&bind.source, &bind.dest, true) {
-            warn!("Failed to apply ro-bind mount {} -> {}: {}", bind.source, bind.dest, e);
+            warn!(
+                "Failed to apply ro-bind mount {} -> {}: {}",
+                bind.source, bind.dest, e
+            );
         } else {
             debug!("Applied ro-bind mount: {} -> {}", bind.source, bind.dest);
         }
     }
-    
+
     // 読み書きバインドマウント
     for bind in &config.rw_bind_mounts {
         if let Err(e) = apply_bind_mount(&bind.source, &bind.dest, false) {
-            warn!("Failed to apply rw-bind mount {} -> {}: {}", bind.source, bind.dest, e);
+            warn!(
+                "Failed to apply rw-bind mount {} -> {}: {}",
+                bind.source, bind.dest, e
+            );
         } else {
             debug!("Applied rw-bind mount: {} -> {}", bind.source, bind.dest);
         }
     }
-    
+
     // tmpfsマウント
     for path in &config.tmpfs_mounts {
         if let Err(e) = apply_tmpfs_mount(path) {
@@ -1607,7 +1774,7 @@ fn apply_mounts(config: &SandboxConfig) -> io::Result<()> {
             debug!("Applied tmpfs mount: {}", path);
         }
     }
-    
+
     // /proc マウント
     if config.mount_proc {
         if let Err(e) = apply_proc_mount() {
@@ -1616,7 +1783,7 @@ fn apply_mounts(config: &SandboxConfig) -> io::Result<()> {
             debug!("Mounted /proc");
         }
     }
-    
+
     // /dev マウント
     if config.mount_dev {
         if let Err(e) = apply_dev_mount() {
@@ -1625,7 +1792,7 @@ fn apply_mounts(config: &SandboxConfig) -> io::Result<()> {
             debug!("Mounted minimal /dev");
         }
     }
-    
+
     info!("Mount configuration applied");
     Ok(())
 }
@@ -1635,13 +1802,15 @@ fn apply_mounts(config: &SandboxConfig) -> io::Result<()> {
 fn apply_bind_mount(source: &str, dest: &str, readonly: bool) -> io::Result<()> {
     use nix::mount::{mount, MsFlags};
     use std::path::Path;
-    
+
     // ソースパスの存在確認
     if !Path::new(source).exists() {
-        return Err(io::Error::new(io::ErrorKind::NotFound,
-            format!("Source path does not exist: {}", source)));
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Source path does not exist: {}", source),
+        ));
     }
-    
+
     // デスティネーションディレクトリの作成
     let dest_path = Path::new(dest);
     if !dest_path.exists() {
@@ -1654,7 +1823,7 @@ fn apply_bind_mount(source: &str, dest: &str, readonly: bool) -> io::Result<()> 
             std::fs::File::create(dest)?;
         }
     }
-    
+
     // バインドマウント
     mount(
         Some(source),
@@ -1662,11 +1831,14 @@ fn apply_bind_mount(source: &str, dest: &str, readonly: bool) -> io::Result<()> 
         None::<&str>,
         MsFlags::MS_BIND | MsFlags::MS_REC,
         None::<&str>,
-    ).map_err(|e| {
-        io::Error::new(io::ErrorKind::Other,
-            format!("Failed to bind mount {} -> {}: {}", source, dest, e))
+    )
+    .map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("Failed to bind mount {} -> {}: {}", source, dest, e),
+        )
     })?;
-    
+
     // 読み取り専用に再マウント
     if readonly {
         mount(
@@ -1675,12 +1847,15 @@ fn apply_bind_mount(source: &str, dest: &str, readonly: bool) -> io::Result<()> 
             None::<&str>,
             MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY | MsFlags::MS_REC,
             None::<&str>,
-        ).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other,
-                format!("Failed to remount {} as readonly: {}", dest, e))
+        )
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("Failed to remount {} as readonly: {}", dest, e),
+            )
         })?;
     }
-    
+
     Ok(())
 }
 
@@ -1689,23 +1864,26 @@ fn apply_bind_mount(source: &str, dest: &str, readonly: bool) -> io::Result<()> 
 fn apply_tmpfs_mount(path: &str) -> io::Result<()> {
     use nix::mount::{mount, MsFlags};
     use std::path::Path;
-    
+
     // ディレクトリの作成
     if !Path::new(path).exists() {
         std::fs::create_dir_all(path)?;
     }
-    
+
     mount(
         Some("tmpfs"),
         path,
         Some("tmpfs"),
         MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
         Some("mode=0755"),
-    ).map_err(|e| {
-        io::Error::new(io::ErrorKind::Other,
-            format!("Failed to mount tmpfs at {}: {}", path, e))
+    )
+    .map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("Failed to mount tmpfs at {}: {}", path, e),
+        )
     })?;
-    
+
     Ok(())
 }
 
@@ -1714,23 +1892,26 @@ fn apply_tmpfs_mount(path: &str) -> io::Result<()> {
 fn apply_proc_mount() -> io::Result<()> {
     use nix::mount::{mount, MsFlags};
     use std::path::Path;
-    
+
     let proc_path = "/proc";
     if !Path::new(proc_path).exists() {
         std::fs::create_dir_all(proc_path)?;
     }
-    
+
     mount(
         Some("proc"),
         proc_path,
         Some("proc"),
         MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
         None::<&str>,
-    ).map_err(|e| {
-        io::Error::new(io::ErrorKind::Other,
-            format!("Failed to mount /proc: {}", e))
+    )
+    .map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("Failed to mount /proc: {}", e),
+        )
     })?;
-    
+
     Ok(())
 }
 
@@ -1739,25 +1920,28 @@ fn apply_proc_mount() -> io::Result<()> {
 fn apply_dev_mount() -> io::Result<()> {
     use nix::mount::{mount, MsFlags};
     use std::path::Path;
-    
+
     let dev_path = "/dev";
-    
+
     // tmpfs を /dev にマウント
     if !Path::new(dev_path).exists() {
         std::fs::create_dir_all(dev_path)?;
     }
-    
+
     mount(
         Some("tmpfs"),
         dev_path,
         Some("tmpfs"),
         MsFlags::MS_NOSUID,
         Some("mode=0755"),
-    ).map_err(|e| {
-        io::Error::new(io::ErrorKind::Other,
-            format!("Failed to mount tmpfs on /dev: {}", e))
+    )
+    .map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("Failed to mount tmpfs on /dev: {}", e),
+        )
     })?;
-    
+
     // 必須デバイスノードをバインドマウント
     let devices = [
         ("/dev/null", "/dev/null"),
@@ -1765,14 +1949,14 @@ fn apply_dev_mount() -> io::Result<()> {
         ("/dev/random", "/dev/random"),
         ("/dev/urandom", "/dev/urandom"),
     ];
-    
+
     for (src, dest) in &devices {
         // タッチでファイルを作成
         let dest_path = Path::new(dest);
         if !dest_path.exists() {
             std::fs::File::create(dest)?;
         }
-        
+
         if let Err(e) = mount(
             Some(*src),
             *dest,
@@ -1783,19 +1967,19 @@ fn apply_dev_mount() -> io::Result<()> {
             warn!("Failed to bind mount device {}: {}", dest, e);
         }
     }
-    
+
     // /dev/pts を作成
     let pts_path = "/dev/pts";
     if !Path::new(pts_path).exists() {
         std::fs::create_dir_all(pts_path)?;
     }
-    
+
     // /dev/shm を作成
     let shm_path = "/dev/shm";
     if !Path::new(shm_path).exists() {
         std::fs::create_dir_all(shm_path)?;
     }
-    
+
     Ok(())
 }
 
@@ -1803,18 +1987,16 @@ fn apply_dev_mount() -> io::Result<()> {
 #[cfg(target_os = "linux")]
 fn apply_hostname(hostname: &str) -> io::Result<()> {
     use std::ffi::CString;
-    
+
     let hostname_c = CString::new(hostname)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid hostname"))?;
-    
-    let ret = unsafe {
-        libc::sethostname(hostname_c.as_ptr(), hostname.len())
-    };
-    
+
+    let ret = unsafe { libc::sethostname(hostname_c.as_ptr(), hostname.len()) };
+
     if ret != 0 {
         return Err(io::Error::last_os_error());
     }
-    
+
     debug!("Hostname set to: {}", hostname);
     Ok(())
 }
@@ -1824,16 +2006,17 @@ fn apply_hostname(hostname: &str) -> io::Result<()> {
 fn apply_capabilities(config: &SandboxConfig) -> io::Result<()> {
     // keep_capabilitiesが指定されている場合
     if !config.keep_capabilities.is_empty() {
-        let keep_caps: Vec<Capability> = config.keep_capabilities
+        let keep_caps: Vec<Capability> = config
+            .keep_capabilities
             .iter()
             .filter_map(|s| Capability::from_str(s))
             .collect();
-        
+
         if keep_caps.is_empty() {
             warn!("No valid capabilities found in keep_capabilities list");
             return Ok(());
         }
-        
+
         // 保持するケイパビリティ以外を全てドロップ
         let all_caps = Capability::all();
         for cap in all_caps {
@@ -1841,11 +2024,11 @@ fn apply_capabilities(config: &SandboxConfig) -> io::Result<()> {
                 drop_capability(cap)?;
             }
         }
-        
+
         info!("Keeping only capabilities: {:?}", config.keep_capabilities);
         return Ok(());
     }
-    
+
     // drop_capabilitiesが指定されている場合
     if !config.drop_capabilities.is_empty() {
         for cap_name in &config.drop_capabilities {
@@ -1855,10 +2038,10 @@ fn apply_capabilities(config: &SandboxConfig) -> io::Result<()> {
                 warn!("Unknown capability: {}", cap_name);
             }
         }
-        
+
         info!("Dropped capabilities: {:?}", config.drop_capabilities);
     }
-    
+
     Ok(())
 }
 
@@ -1866,10 +2049,8 @@ fn apply_capabilities(config: &SandboxConfig) -> io::Result<()> {
 #[cfg(target_os = "linux")]
 fn drop_capability(cap: Capability) -> io::Result<()> {
     // PR_CAPBSET_DROP を使用してbounding setからケイパビリティを削除
-    let ret = unsafe {
-        libc::prctl(libc::PR_CAPBSET_DROP, cap as u32, 0, 0, 0)
-    };
-    
+    let ret = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap as u32, 0, 0, 0) };
+
     if ret != 0 {
         let err = io::Error::last_os_error();
         // EINVAL は権限不足やケイパビリティが既にない場合
@@ -1877,23 +2058,23 @@ fn drop_capability(cap: Capability) -> io::Result<()> {
             debug!("Failed to drop capability {:?}: {}", cap, err);
         }
     }
-    
+
     Ok(())
 }
 
 /// サンドボックスの推奨設定を生成
-/// 
+///
 /// リバースプロキシサーバー用の推奨設定を返します。
 /// Network namespaceは分離せず、必要最小限のケイパビリティを保持します。
 pub fn recommended_sandbox_config() -> SandboxConfig {
     SandboxConfig {
         enabled: true,
-        unshare_pid: false,      // 通常はプロセス分離不要
-        unshare_mount: true,     // ファイルシステム分離
-        unshare_uts: true,       // ホスト名分離
-        unshare_ipc: true,       // IPC分離
-        unshare_user: false,     // User namespace は複雑なため無効
-        unshare_net: false,      // ネットワークは必要なため分離しない
+        unshare_pid: false,  // 通常はプロセス分離不要
+        unshare_mount: true, // ファイルシステム分離
+        unshare_uts: true,   // ホスト名分離
+        unshare_ipc: true,   // IPC分離
+        unshare_user: false, // User namespace は複雑なため無効
+        unshare_net: false,  // ネットワークは必要なため分離しない
         new_root: None,
         ro_bind_mounts: vec![
             BindMount::new("/usr", "/usr"),
@@ -1919,9 +2100,7 @@ pub fn recommended_sandbox_config() -> SandboxConfig {
         mount_proc: true,
         mount_dev: true,
         drop_capabilities: vec![],
-        keep_capabilities: vec![
-            "CAP_NET_BIND_SERVICE".to_string(),
-        ],
+        keep_capabilities: vec!["CAP_NET_BIND_SERVICE".to_string()],
         hostname: Some("veil-sandbox".to_string()),
         no_new_privs: true,
     }
@@ -1933,20 +2112,32 @@ pub fn report_sandbox_support() {
         Ok(kernel) => {
             info!("=== Sandbox Feature Support ===");
             info!("Kernel version: {}", kernel);
-            
+
             // Namespace サポートチェック（カーネル 2.6.19+ で基本サポート）
             let ns_supported = kernel.major >= 3 || (kernel.major == 2 && kernel.minor >= 6);
-            info!("Namespaces (PID/UTS/IPC/Mount): {}", 
-                  if ns_supported { "Available" } else { "Not available" });
-            
+            info!(
+                "Namespaces (PID/UTS/IPC/Mount): {}",
+                if ns_supported {
+                    "Available"
+                } else {
+                    "Not available"
+                }
+            );
+
             // User namespace（カーネル 3.8+）
             let user_ns = (kernel.major, kernel.minor) >= (3, 8);
-            info!("User namespace (3.8+): {}", 
-                  if user_ns { "Available" } else { "Not available" });
-            
+            info!(
+                "User namespace (3.8+): {}",
+                if user_ns {
+                    "Available"
+                } else {
+                    "Not available"
+                }
+            );
+
             // Capabilities（カーネル 2.6.25+ で改善）
             info!("Capabilities: Available");
-            
+
             info!("================================");
         }
         Err(e) => {
@@ -1978,7 +2169,11 @@ mod tests {
     #[test]
     fn test_kernel_version_5_10() {
         // Linux 5.10 - io_uring制限サポート、Landlockなし
-        let kernel = KernelVersion { major: 5, minor: 10, patch: 0 };
+        let kernel = KernelVersion {
+            major: 5,
+            minor: 10,
+            patch: 0,
+        };
         assert!(kernel.supports_uring_restrictions());
         assert!(kernel.supports_seccomp());
         assert!(!kernel.supports_landlock());
@@ -1987,7 +2182,11 @@ mod tests {
     #[test]
     fn test_kernel_version_5_13() {
         // Linux 5.13 - Landlockサポート開始
-        let kernel = KernelVersion { major: 5, minor: 13, patch: 0 };
+        let kernel = KernelVersion {
+            major: 5,
+            minor: 13,
+            patch: 0,
+        };
         assert!(kernel.supports_uring_restrictions());
         assert!(kernel.supports_seccomp());
         assert!(kernel.supports_landlock());
@@ -1996,7 +2195,11 @@ mod tests {
     #[test]
     fn test_kernel_version_old() {
         // 古いカーネル (3.10)
-        let kernel = KernelVersion { major: 3, minor: 10, patch: 0 };
+        let kernel = KernelVersion {
+            major: 3,
+            minor: 10,
+            patch: 0,
+        };
         assert!(!kernel.supports_uring_restrictions());
         assert!(!kernel.supports_seccomp());
         assert!(!kernel.supports_landlock());
@@ -2005,7 +2208,11 @@ mod tests {
     #[test]
     fn test_kernel_version_3_17() {
         // Linux 3.17 - seccompサポート開始
-        let kernel = KernelVersion { major: 3, minor: 17, patch: 0 };
+        let kernel = KernelVersion {
+            major: 3,
+            minor: 17,
+            patch: 0,
+        };
         assert!(!kernel.supports_uring_restrictions());
         assert!(kernel.supports_seccomp());
         assert!(!kernel.supports_landlock());
@@ -2013,7 +2220,11 @@ mod tests {
 
     #[test]
     fn test_kernel_version_display() {
-        let kernel = KernelVersion { major: 6, minor: 8, patch: 48 };
+        let kernel = KernelVersion {
+            major: 6,
+            minor: 8,
+            patch: 48,
+        };
         assert_eq!(format!("{}", kernel), "6.8.48");
     }
 
@@ -2070,9 +2281,11 @@ mod tests {
         assert!(config.landlock_read_paths.contains(&"/etc".to_string()));
         assert!(config.landlock_read_paths.contains(&"/usr".to_string()));
         assert!(config.landlock_read_paths.contains(&"/lib".to_string()));
-        
+
         // デフォルトの書き込みパス
-        assert!(config.landlock_write_paths.contains(&"/var/log".to_string()));
+        assert!(config
+            .landlock_write_paths
+            .contains(&"/var/log".to_string()));
         assert!(config.landlock_write_paths.contains(&"/tmp".to_string()));
     }
 
@@ -2083,25 +2296,49 @@ mod tests {
     #[test]
     fn test_capability_from_str() {
         // 標準的なケイパビリティ名
-        assert_eq!(Capability::from_str("CAP_NET_BIND_SERVICE"), Some(Capability::CAP_NET_BIND_SERVICE));
-        assert_eq!(Capability::from_str("CAP_SETUID"), Some(Capability::CAP_SETUID));
-        assert_eq!(Capability::from_str("CAP_SETGID"), Some(Capability::CAP_SETGID));
-        assert_eq!(Capability::from_str("CAP_SYS_ADMIN"), Some(Capability::CAP_SYS_ADMIN));
+        assert_eq!(
+            Capability::from_str("CAP_NET_BIND_SERVICE"),
+            Some(Capability::CAP_NET_BIND_SERVICE)
+        );
+        assert_eq!(
+            Capability::from_str("CAP_SETUID"),
+            Some(Capability::CAP_SETUID)
+        );
+        assert_eq!(
+            Capability::from_str("CAP_SETGID"),
+            Some(Capability::CAP_SETGID)
+        );
+        assert_eq!(
+            Capability::from_str("CAP_SYS_ADMIN"),
+            Some(Capability::CAP_SYS_ADMIN)
+        );
     }
 
     #[test]
     fn test_capability_from_str_without_prefix() {
         // CAP_プレフィックスなし
-        assert_eq!(Capability::from_str("NET_BIND_SERVICE"), Some(Capability::CAP_NET_BIND_SERVICE));
+        assert_eq!(
+            Capability::from_str("NET_BIND_SERVICE"),
+            Some(Capability::CAP_NET_BIND_SERVICE)
+        );
         assert_eq!(Capability::from_str("SETUID"), Some(Capability::CAP_SETUID));
-        assert_eq!(Capability::from_str("SYS_ADMIN"), Some(Capability::CAP_SYS_ADMIN));
+        assert_eq!(
+            Capability::from_str("SYS_ADMIN"),
+            Some(Capability::CAP_SYS_ADMIN)
+        );
     }
 
     #[test]
     fn test_capability_from_str_case_insensitive() {
         // 大文字小文字を区別しない
-        assert_eq!(Capability::from_str("cap_net_bind_service"), Some(Capability::CAP_NET_BIND_SERVICE));
-        assert_eq!(Capability::from_str("Net_Bind_Service"), Some(Capability::CAP_NET_BIND_SERVICE));
+        assert_eq!(
+            Capability::from_str("cap_net_bind_service"),
+            Some(Capability::CAP_NET_BIND_SERVICE)
+        );
+        assert_eq!(
+            Capability::from_str("Net_Bind_Service"),
+            Some(Capability::CAP_NET_BIND_SERVICE)
+        );
     }
 
     #[test]
@@ -2115,12 +2352,12 @@ mod tests {
     #[test]
     fn test_capability_recommended_for_server() {
         let recommended = Capability::recommended_for_server();
-        
+
         // サーバーに必要なケイパビリティが含まれている
         assert!(recommended.contains(&Capability::CAP_NET_BIND_SERVICE));
         assert!(recommended.contains(&Capability::CAP_SETUID));
         assert!(recommended.contains(&Capability::CAP_SETGID));
-        
+
         // 危険なケイパビリティは含まれていない
         assert!(!recommended.contains(&Capability::CAP_SYS_ADMIN));
         assert!(!recommended.contains(&Capability::CAP_SYS_PTRACE));
@@ -2129,7 +2366,7 @@ mod tests {
     #[test]
     fn test_capability_all() {
         let all = Capability::all();
-        
+
         // 全てのケイパビリティが含まれている
         assert!(all.len() >= 40); // Linux 5.9時点で41個
         assert!(all.contains(&Capability::CAP_CHOWN));
@@ -2174,34 +2411,36 @@ mod tests {
     #[test]
     fn test_recommended_sandbox_config() {
         let config = recommended_sandbox_config();
-        
+
         // 有効化されている
         assert!(config.enabled);
-        
+
         // 推奨されるnamespace分離
         assert!(config.unshare_mount);
         assert!(config.unshare_uts);
         assert!(config.unshare_ipc);
-        
+
         // ネットワークは分離しない（サーバーには必要）
         assert!(!config.unshare_net);
-        
+
         // User namespaceは無効（複雑なため）
         assert!(!config.unshare_user);
-        
+
         // PID namespaceは無効
         assert!(!config.unshare_pid);
-        
+
         // 必要なケイパビリティが保持される
-        assert!(config.keep_capabilities.contains(&"CAP_NET_BIND_SERVICE".to_string()));
-        
+        assert!(config
+            .keep_capabilities
+            .contains(&"CAP_NET_BIND_SERVICE".to_string()));
+
         // PR_SET_NO_NEW_PRIVS
         assert!(config.no_new_privs);
-        
+
         // /proc と /dev のマウント
         assert!(config.mount_proc);
         assert!(config.mount_dev);
-        
+
         // ホスト名設定
         assert_eq!(config.hostname, Some("veil-sandbox".to_string()));
     }
@@ -2209,12 +2448,14 @@ mod tests {
     #[test]
     fn test_sandbox_config_ro_binds() {
         let config = recommended_sandbox_config();
-        
+
         // 標準的な読み取り専用バインドマウントが含まれている
-        let sources: Vec<&str> = config.ro_bind_mounts.iter()
+        let sources: Vec<&str> = config
+            .ro_bind_mounts
+            .iter()
             .map(|b| b.source.as_str())
             .collect();
-        
+
         assert!(sources.contains(&"/usr"));
         assert!(sources.contains(&"/lib"));
         assert!(sources.contains(&"/etc/resolv.conf"));
@@ -2224,7 +2465,7 @@ mod tests {
     #[test]
     fn test_sandbox_config_tmpfs() {
         let config = recommended_sandbox_config();
-        
+
         // tmpfsマウントが含まれている
         assert!(config.tmpfs_mounts.contains(&"/tmp".to_string()));
     }
@@ -2270,4 +2511,3 @@ mod tests {
         }
     }
 }
-
