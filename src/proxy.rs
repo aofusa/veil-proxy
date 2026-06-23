@@ -8,12 +8,10 @@ use std::sync::Arc;
 
 use crate::runtime::buf::{IoBuf, IoBufMut};
 use crate::runtime::io::OpenOptions;
-use crate::runtime::io::{
-    AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, IoVecBuf, IoVecBufMut,
-};
+use crate::runtime::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, IoVecBuf, IoVecBufMut};
 use crate::runtime::tcp::TcpStream;
 use crate::runtime::time::timeout;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use ftlog::{debug, error, info, warn};
 use httparse::{Request, Status};
 use std::io;
@@ -913,7 +911,11 @@ where
         if !wasm_modules_to_apply.is_empty() {
             let config = CURRENT_CONFIG.load();
             if let Some(ref wasm_engine) = config.wasm_filter_engine {
-                crate::wasm::on_request_complete(wasm_engine, &wasm_modules_to_apply);
+                crate::wasm::on_request_complete_async(
+                    wasm_engine.clone(),
+                    wasm_modules_to_apply.clone(),
+                )
+                .await;
             }
         }
     }
@@ -973,11 +975,13 @@ where
 
     let final_path = if sub_path.is_empty() { "/" } else { &sub_path };
 
-    // リクエストボディを取得
-    let request_body = if let Some(stream) = conn.get_stream(stream_id) {
-        stream.request_body.clone()
+    // リクエストボディを取得。
+    // BytesMut の deep clone（ボディ全体の memcpy）を避け、所有権ごとゼロコピーで
+    // 取り出して Bytes 化する（参照カウント共有。HTTP/2 → バックエンド転送用）。
+    let request_body = if let Some(stream) = conn.get_stream_mut(stream_id) {
+        std::mem::take(&mut stream.request_body).freeze()
     } else {
-        BytesMut::new()
+        Bytes::new()
     };
 
     // HTTP/1.1 リクエスト構築（プール使用）
