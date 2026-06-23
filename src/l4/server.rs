@@ -3,9 +3,8 @@
 //! 設定から L4 リスナーを起動し、接続をハンドラに引き渡す。
 
 use crate::config::{L4ListenerConfig, SHUTDOWN_FLAG};
-use crate::l4::proxy::{
-    handle_l4_connection, L4ConnectionCounter, RoundRobinState,
-};
+use crate::l4::health::{new_health_state, spawn_l4_health_checker};
+use crate::l4::proxy::{handle_l4_connection, L4ConnectionCounter, RoundRobinState};
 use crate::runtime::tcp::TcpListener;
 use crate::runtime::time::timeout;
 use crate::system::spawn_with_panic_catch;
@@ -13,8 +12,8 @@ use ftlog::{error, info, warn};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 use std::thread;
+use std::time::Duration;
 
 /// L4 リスナースレッドを起動する
 ///
@@ -30,16 +29,25 @@ pub fn spawn_l4_listeners(listeners: &[L4ListenerConfig]) {
         let config = Arc::new(config.clone());
         let n_upstreams = config.upstreams.len();
 
+        // ヘルス状態（全 upstream を初期 healthy で初期化）
+        let health_state = new_health_state(n_upstreams);
+
+        // ヘルスチェックスレッド（設定があれば起動）
+        spawn_l4_health_checker(config.clone(), health_state.clone());
+
         info!(
-            "[L4:{}] starting listener on {} ({} upstreams, lb={:?})",
-            config.name, config.listen, n_upstreams, config.lb
+            "[L4:{}] starting listener on {} ({} upstreams, lb={:?}, idle_timeout={}s)",
+            config.name, config.listen, n_upstreams, config.lb, config.idle_timeout_secs
         );
 
         thread::spawn(move || {
             let listen_addr: SocketAddr = match config.listen.parse() {
                 Ok(addr) => addr,
                 Err(e) => {
-                    error!("[L4:{}] invalid listen address '{}': {}", config.name, config.listen, e);
+                    error!(
+                        "[L4:{}] invalid listen address '{}': {}",
+                        config.name, config.listen, e
+                    );
                     return;
                 }
             };
@@ -53,7 +61,10 @@ pub fn spawn_l4_listeners(listeners: &[L4ListenerConfig]) {
                 let listener = match TcpListener::bind(listen_addr) {
                     Ok(l) => l,
                     Err(e) => {
-                        error!("[L4:{}] bind error on {}: {}", config.name, listen_addr, e);
+                        error!(
+                            "[L4:{}] bind error on {}: {}",
+                            config.name, listen_addr, e
+                        );
                         return;
                     }
                 };
@@ -84,6 +95,7 @@ pub fn spawn_l4_listeners(listeners: &[L4ListenerConfig]) {
                     let rr_clone = rr_state.clone();
                     let counters_clone = conn_counters.clone();
                     let listener_counter_clone = listener_counter.clone();
+                    let health_clone = health_state.clone();
 
                     spawn_with_panic_catch(async move {
                         handle_l4_connection(
@@ -93,6 +105,7 @@ pub fn spawn_l4_listeners(listeners: &[L4ListenerConfig]) {
                             rr_clone,
                             counters_clone,
                             listener_counter_clone,
+                            health_clone,
                         )
                         .await;
                     });

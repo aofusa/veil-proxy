@@ -2546,10 +2546,17 @@ pub struct L4ListenerConfig {
     /// バックエンド接続タイムアウト（秒）
     #[serde(default = "default_l4_connect_timeout")]
     pub connect_timeout_secs: u64,
+    /// アイドルタイムアウト（秒）: この時間データ転送がなければ接続を切断（デフォルト: 600）
+    #[serde(default = "default_l4_idle_timeout")]
+    pub idle_timeout_secs: u64,
 }
 
 fn default_l4_connect_timeout() -> u64 {
     10
+}
+
+fn default_l4_idle_timeout() -> u64 {
+    600
 }
 
 // ====================
@@ -6482,7 +6489,7 @@ weight = 1
 
     #[test]
     fn test_l4_listener_config_defaults() {
-        // lb, tls, max_connections, connect_timeout_secs を省略したときデフォルト値になる
+        // lb, tls, max_connections, connect_timeout_secs, idle_timeout_secs を省略したときデフォルト値になる
         let toml = r#"
 name = "minimal"
 listen = "0.0.0.0:9000"
@@ -6495,7 +6502,22 @@ addr = "127.0.0.1:9001"
         assert_eq!(cfg.tls, L4TlsMode::None);
         assert_eq!(cfg.max_connections, 0);
         assert_eq!(cfg.connect_timeout_secs, 10);
+        assert_eq!(cfg.idle_timeout_secs, 600);
         assert_eq!(cfg.upstreams[0].weight, 1);
+    }
+
+    #[test]
+    fn test_l4_listener_config_idle_timeout() {
+        let toml = r#"
+name = "fast-idle"
+listen = "0.0.0.0:8000"
+idle_timeout_secs = 30
+
+[[upstreams]]
+addr = "127.0.0.1:8001"
+"#;
+        let cfg: L4ListenerConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.idle_timeout_secs, 30);
     }
 
     #[test]

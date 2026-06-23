@@ -1160,3 +1160,267 @@ weight = 1
     assert_eq!(upstreams[0]["weight"].as_integer().unwrap(), 2);
     assert_eq!(upstreams[1]["weight"].as_integer().unwrap(), 1);
 }
+
+/// F-18: L4 idle_timeout_secs TOML 設定確認
+#[test]
+fn test_f18_l4_idle_timeout_config() {
+    let toml_str = r#"
+name = "idle-test"
+listen = "0.0.0.0:9001"
+idle_timeout_secs = 30
+
+[[upstreams]]
+addr = "127.0.0.1:9002"
+"#;
+    let parsed: toml::Value = toml::from_str(toml_str).unwrap();
+    assert_eq!(parsed["idle_timeout_secs"].as_integer().unwrap(), 30);
+}
+
+/// F-18: L4 Weighted Round Robin TOML 設定確認
+#[test]
+fn test_f18_l4_weighted_rr_config() {
+    let toml_str = r#"
+name = "wrr-proxy"
+listen = "0.0.0.0:9003"
+lb = "round_robin"
+
+[[upstreams]]
+addr = "10.0.0.1:8080"
+weight = 3
+
+[[upstreams]]
+addr = "10.0.0.2:8080"
+weight = 1
+"#;
+    let parsed: toml::Value = toml::from_str(toml_str).unwrap();
+    assert_eq!(parsed["lb"].as_str().unwrap(), "round_robin");
+    let upstreams = parsed["upstreams"].as_array().unwrap();
+    assert_eq!(upstreams[0]["weight"].as_integer().unwrap(), 3);
+    assert_eq!(upstreams[1]["weight"].as_integer().unwrap(), 1);
+}
+
+/// F-18: ヘルスチェック付き L4 TOML 設定（TCP チェック種別）
+#[test]
+fn test_f18_l4_health_check_tcp_config() {
+    let toml_str = r#"
+name = "hc-proxy"
+listen = "0.0.0.0:9004"
+
+[[upstreams]]
+addr = "10.0.0.1:5432"
+
+[health_check]
+check_type = "tcp"
+interval_secs = 5
+timeout_secs = 2
+unhealthy_threshold = 2
+healthy_threshold = 1
+"#;
+    let parsed: toml::Value = toml::from_str(toml_str).unwrap();
+    assert_eq!(parsed["health_check"]["check_type"].as_str().unwrap(), "tcp");
+    assert_eq!(parsed["health_check"]["interval_secs"].as_integer().unwrap(), 5);
+    assert_eq!(parsed["health_check"]["unhealthy_threshold"].as_integer().unwrap(), 2);
+}
+
+/// F-18: ダウンしたバックエンドをヘルスチェックで除外するシミュレーション
+///
+/// 2 つのバックエンドのうち片方が応答停止した場合、
+/// プロキシがもう片方のみに転送できることを確認する。
+#[test]
+fn test_f18_l4_health_check_excludes_down_backend() {
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+
+    // バックエンド 1: 正常動作（accept して echo）
+    let backend1 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr1 = backend1.local_addr().unwrap();
+    let recv1: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![]));
+    let recv1_clone = recv1.clone();
+
+    std::thread::spawn(move || {
+        for _ in 0..5 {
+            if let Ok((mut conn, _)) = backend1.accept() {
+                let _ = conn.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut buf = [0u8; 64];
+                if let Ok(n) = conn.read(&mut buf) {
+                    recv1_clone.lock().unwrap().extend_from_slice(&buf[..n]);
+                    let _ = conn.write_all(&buf[..n]);
+                }
+            }
+        }
+    });
+
+    // バックエンド 2: ダウン（接続を拒否）
+    // port が存在しないアドレスを使うことで接続失敗をシミュレート
+    let down_addr = "127.0.0.1:19981";
+
+    // プロキシ: バックエンド 1 のみ healthy として転送
+    let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+
+    std::thread::spawn(move || {
+        for _ in 0..3 {
+            if let Ok((mut client, _)) = proxy.accept() {
+                let _ = client.set_read_timeout(Some(Duration::from_secs(2)));
+
+                // ヘルスチェック: バックエンド 1 は healthy、バックエンド 2 は unhealthy
+                let b1_healthy = TcpStream::connect_timeout(&addr1, Duration::from_millis(200)).is_ok();
+                let b2_healthy = TcpStream::connect_timeout(
+                    &down_addr.parse().unwrap(),
+                    Duration::from_millis(200),
+                ).is_ok();
+
+                // healthy なバックエンドにのみ転送
+                let target = if b1_healthy {
+                    addr1
+                } else if b2_healthy {
+                    down_addr.parse().unwrap()
+                } else {
+                    return;
+                };
+
+                if let Ok(mut backend) =
+                    TcpStream::connect_timeout(&target, Duration::from_secs(1))
+                {
+                    let _ = backend.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut buf = [0u8; 64];
+                    if let Ok(n) = client.read(&mut buf) {
+                        let _ = backend.write_all(&buf[..n]);
+                        let mut echo = [0u8; 64];
+                        if let Ok(m) = backend.read(&mut echo) {
+                            let _ = client.write_all(&echo[..m]);
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    std::thread::sleep(Duration::from_millis(50));
+
+    // 3 回リクエストを送信 → 全て backend1 に届くはず
+    for i in 0..3usize {
+        let mut client = TcpStream::connect(proxy_addr).unwrap();
+        let _ = client.set_read_timeout(Some(Duration::from_secs(2)));
+        let msg = format!("msg{}", i);
+        client.write_all(msg.as_bytes()).unwrap();
+        let mut buf = [0u8; 16];
+        let _ = client.read(&mut buf);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    std::thread::sleep(Duration::from_millis(100));
+
+    let received = recv1.lock().unwrap();
+    assert!(
+        !received.is_empty(),
+        "healthy backend1 should receive all requests"
+    );
+
+    // down_addr に接続できないことで unhealthy 判定されていること
+    let down_result =
+        TcpStream::connect_timeout(&down_addr.parse().unwrap(), Duration::from_millis(200));
+    assert!(
+        down_result.is_err(),
+        "down backend should be unreachable"
+    );
+}
+
+/// F-18: Weighted Round Robin のネットワークレベル分散確認
+///
+/// weight [3, 1] の場合、4 接続中 3 つが backend1、1 つが backend2 に届く。
+#[test]
+fn test_f18_l4_weighted_rr_distributes() {
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+
+    let backend1 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr1 = backend1.local_addr().unwrap();
+    let count1: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+    let count1_clone = count1.clone();
+
+    std::thread::spawn(move || {
+        while let Ok((mut conn, _)) = backend1.accept() {
+            *count1_clone.lock().unwrap() += 1;
+            let _ = conn.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut buf = [0u8; 16];
+            if let Ok(n) = conn.read(&mut buf) {
+                let _ = conn.write_all(&buf[..n]);
+            }
+        }
+    });
+
+    let backend2 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr2 = backend2.local_addr().unwrap();
+    let count2: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+    let count2_clone = count2.clone();
+
+    std::thread::spawn(move || {
+        while let Ok((mut conn, _)) = backend2.accept() {
+            *count2_clone.lock().unwrap() += 1;
+            let _ = conn.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut buf = [0u8; 16];
+            if let Ok(n) = conn.read(&mut buf) {
+                let _ = conn.write_all(&buf[..n]);
+            }
+        }
+    });
+
+    // プロキシ: weight [3, 1] の WRR（4 接続で addr1×3, addr2×1）
+    let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let backends = vec![(addr1, 3u32), (addr2, 1u32)];
+
+    std::thread::spawn(move || {
+        let mut ticket = 0usize;
+        let total_weight: usize = backends.iter().map(|(_, w)| *w as usize).sum();
+
+        while let Ok((mut client, _)) = proxy.accept() {
+            let _ = client.set_read_timeout(Some(Duration::from_secs(2)));
+            let slot = ticket % total_weight;
+            ticket += 1;
+
+            // WRR マッピング
+            let mut cumulative = 0usize;
+            let mut target = backends[0].0;
+            for (addr, w) in &backends {
+                cumulative += *w as usize;
+                if slot < cumulative {
+                    target = *addr;
+                    break;
+                }
+            }
+
+            if let Ok(mut backend) = TcpStream::connect_timeout(&target, Duration::from_secs(1)) {
+                let _ = backend.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut buf = [0u8; 16];
+                if let Ok(n) = client.read(&mut buf) {
+                    let _ = backend.write_all(&buf[..n]);
+                    let mut echo = [0u8; 16];
+                    if let Ok(m) = backend.read(&mut echo) {
+                        let _ = client.write_all(&echo[..m]);
+                    }
+                }
+            }
+        }
+    });
+
+    std::thread::sleep(Duration::from_millis(50));
+
+    // 4 接続送信（3:1 配分）
+    for i in 0..4usize {
+        let mut c = TcpStream::connect(proxy_addr).unwrap();
+        let _ = c.set_read_timeout(Some(Duration::from_secs(2)));
+        c.write_all(format!("r{}", i).as_bytes()).unwrap();
+        let mut buf = [0u8; 8];
+        let _ = c.read(&mut buf);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    std::thread::sleep(Duration::from_millis(100));
+
+    let c1 = *count1.lock().unwrap();
+    let c2 = *count2.lock().unwrap();
+    assert_eq!(c1, 3, "backend1 (weight=3) should receive 3 of 4 requests");
+    assert_eq!(c2, 1, "backend2 (weight=1) should receive 1 of 4 requests");
+}

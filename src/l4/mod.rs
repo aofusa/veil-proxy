@@ -16,5 +16,6 @@
 //! - ホットパスでのヒープ割り当てを最小化
 //! - `l4-proxy` feature が無効の場合はコンパイル対象外
 
+pub mod health;
 pub mod proxy;
 pub mod server;
