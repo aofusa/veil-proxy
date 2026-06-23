@@ -6339,3 +6339,183 @@ mod advanced_lb_integration_tests {
         }
     }
 }
+
+// ====================
+// F-22: HealthCheckType / HealthCheckConfig serde テスト
+// ====================
+#[cfg(test)]
+mod health_check_type_tests {
+    use super::*;
+    use serde::Deserialize;
+
+    // TOML はトップレベルにスカラー値を置けないため、ラッパーを使う
+    #[derive(Deserialize)]
+    struct Wrapper {
+        t: HealthCheckType,
+    }
+
+    #[test]
+    fn test_health_check_type_deser_http() {
+        let w: Wrapper = toml::from_str("t = \"http\"").unwrap();
+        assert_eq!(w.t, HealthCheckType::Http);
+    }
+
+    #[test]
+    fn test_health_check_type_deser_tcp() {
+        let w: Wrapper = toml::from_str("t = \"tcp\"").unwrap();
+        assert_eq!(w.t, HealthCheckType::Tcp);
+    }
+
+    #[test]
+    fn test_health_check_type_deser_grpc() {
+        let w: Wrapper = toml::from_str("t = \"grpc\"").unwrap();
+        assert_eq!(w.t, HealthCheckType::Grpc);
+    }
+
+    #[test]
+    fn test_health_check_type_default() {
+        assert_eq!(HealthCheckType::default(), HealthCheckType::Http);
+    }
+
+    #[test]
+    fn test_health_check_config_deser_tcp() {
+        let toml = r#"
+check_type = "tcp"
+interval_secs = 15
+timeout_secs = 3
+"#;
+        let cfg: HealthCheckConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.check_type, HealthCheckType::Tcp);
+        assert_eq!(cfg.interval_secs, 15);
+        assert_eq!(cfg.timeout_secs, 3);
+    }
+
+    #[test]
+    fn test_health_check_config_deser_grpc() {
+        let toml = r#"
+check_type = "grpc"
+path = "my.service.Health"
+timeout_secs = 5
+use_tls = true
+verify_cert = false
+"#;
+        let cfg: HealthCheckConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.check_type, HealthCheckType::Grpc);
+        assert_eq!(cfg.path, "my.service.Health");
+        assert!(cfg.use_tls);
+        assert!(!cfg.verify_cert);
+    }
+
+    #[test]
+    fn test_health_check_config_deser_defaults() {
+        // check_type を省略すると Http になる
+        let cfg: HealthCheckConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.check_type, HealthCheckType::Http);
+    }
+}
+
+// ====================
+// F-18: L4ListenerConfig serde テスト
+// ====================
+#[cfg(all(test, feature = "l4-proxy"))]
+mod l4_config_tests {
+    use super::*;
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct TlsWrapper {
+        t: L4TlsMode,
+    }
+    #[derive(Deserialize)]
+    struct LbWrapper {
+        t: L4LbAlgorithm,
+    }
+
+    #[test]
+    fn test_l4_tls_mode_deser() {
+        let none: TlsWrapper = toml::from_str("t = \"none\"").unwrap();
+        let passthrough: TlsWrapper = toml::from_str("t = \"passthrough\"").unwrap();
+        let terminate: TlsWrapper = toml::from_str("t = \"terminate\"").unwrap();
+        assert_eq!(none.t, L4TlsMode::None);
+        assert_eq!(passthrough.t, L4TlsMode::Passthrough);
+        assert_eq!(terminate.t, L4TlsMode::Terminate);
+    }
+
+    #[test]
+    fn test_l4_lb_algorithm_deser() {
+        let rr: LbWrapper = toml::from_str("t = \"round_robin\"").unwrap();
+        let lc: LbWrapper = toml::from_str("t = \"least_conn\"").unwrap();
+        assert_eq!(rr.t, L4LbAlgorithm::RoundRobin);
+        assert_eq!(lc.t, L4LbAlgorithm::LeastConn);
+    }
+
+    #[test]
+    fn test_l4_listener_config_full_deser() {
+        let toml = r#"
+name = "db-proxy"
+listen = "0.0.0.0:5432"
+lb = "least_conn"
+tls = "passthrough"
+max_connections = 200
+connect_timeout_secs = 5
+
+[[upstreams]]
+addr = "10.0.0.1:5432"
+weight = 2
+
+[[upstreams]]
+addr = "10.0.0.2:5432"
+weight = 1
+"#;
+        let cfg: L4ListenerConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.name, "db-proxy");
+        assert_eq!(cfg.listen, "0.0.0.0:5432");
+        assert_eq!(cfg.lb, L4LbAlgorithm::LeastConn);
+        assert_eq!(cfg.tls, L4TlsMode::Passthrough);
+        assert_eq!(cfg.max_connections, 200);
+        assert_eq!(cfg.connect_timeout_secs, 5);
+        assert_eq!(cfg.upstreams.len(), 2);
+        assert_eq!(cfg.upstreams[0].addr, "10.0.0.1:5432");
+        assert_eq!(cfg.upstreams[0].weight, 2);
+        assert_eq!(cfg.upstreams[1].weight, 1);
+    }
+
+    #[test]
+    fn test_l4_listener_config_defaults() {
+        // lb, tls, max_connections, connect_timeout_secs を省略したときデフォルト値になる
+        let toml = r#"
+name = "minimal"
+listen = "0.0.0.0:9000"
+
+[[upstreams]]
+addr = "127.0.0.1:9001"
+"#;
+        let cfg: L4ListenerConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.lb, L4LbAlgorithm::RoundRobin);
+        assert_eq!(cfg.tls, L4TlsMode::None);
+        assert_eq!(cfg.max_connections, 0);
+        assert_eq!(cfg.connect_timeout_secs, 10);
+        assert_eq!(cfg.upstreams[0].weight, 1);
+    }
+
+    #[test]
+    fn test_l4_listener_config_with_health_check() {
+        let toml = r#"
+name = "mysql"
+listen = "0.0.0.0:3306"
+
+[[upstreams]]
+addr = "10.0.0.1:3306"
+
+[health_check]
+check_type = "tcp"
+interval_secs = 10
+timeout_secs = 3
+"#;
+        let cfg: L4ListenerConfig = toml::from_str(toml).unwrap();
+        let hc = cfg.health_check.unwrap();
+        assert_eq!(hc.check_type, HealthCheckType::Tcp);
+        assert_eq!(hc.interval_secs, 10);
+        assert_eq!(hc.timeout_secs, 3);
+    }
+}

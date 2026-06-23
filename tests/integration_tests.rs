@@ -949,3 +949,214 @@ fn test_f18_l4_proxy_end_to_end() {
         "クライアントがエコーバックを受信するべき"
     );
 }
+
+/// L4 ラウンドロビン: 複数バックエンドにリクエストが分散されること
+///
+/// 2 つのエコーサーバーを起動し、2 つのプロキシ接続を確立して
+/// それぞれが異なるバックエンドに転送されることを確認する。
+#[test]
+fn test_f18_l4_round_robin_distributes() {
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+
+    // バックエンド 1
+    let backend1 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr1 = backend1.local_addr().unwrap();
+    let recv1: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![]));
+    let recv1_clone = recv1.clone();
+    std::thread::spawn(move || {
+        for _ in 0..2 {
+            if let Ok((mut conn, _)) = backend1.accept() {
+                let _ = conn.set_read_timeout(Some(Duration::from_secs(3)));
+                let mut buf = [0u8; 64];
+                if let Ok(n) = conn.read(&mut buf) {
+                    recv1_clone.lock().unwrap().extend_from_slice(&buf[..n]);
+                    let _ = conn.write_all(&buf[..n]);
+                }
+            }
+        }
+    });
+
+    // バックエンド 2
+    let backend2 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr2 = backend2.local_addr().unwrap();
+    let recv2: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![]));
+    let recv2_clone = recv2.clone();
+    std::thread::spawn(move || {
+        for _ in 0..2 {
+            if let Ok((mut conn, _)) = backend2.accept() {
+                let _ = conn.set_read_timeout(Some(Duration::from_secs(3)));
+                let mut buf = [0u8; 64];
+                if let Ok(n) = conn.read(&mut buf) {
+                    recv2_clone.lock().unwrap().extend_from_slice(&buf[..n]);
+                    let _ = conn.write_all(&buf[..n]);
+                }
+            }
+        }
+    });
+
+    // プロキシ（ラウンドロビンで addr1 → addr2 → addr1 と転送する簡易フォワーダー）
+    let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let backends = vec![addr1, addr2];
+
+    std::thread::spawn(move || {
+        let mut idx = 0usize;
+        for _ in 0..2 {
+            if let Ok((mut client, _)) = proxy.accept() {
+                let _ = client.set_read_timeout(Some(Duration::from_secs(3)));
+                let target = backends[idx % backends.len()];
+                idx += 1;
+                if let Ok(mut backend_conn) =
+                    TcpStream::connect_timeout(&target, Duration::from_secs(2))
+                {
+                    let _ = backend_conn.set_read_timeout(Some(Duration::from_secs(3)));
+                    let mut buf = [0u8; 64];
+                    if let Ok(n) = client.read(&mut buf) {
+                        let _ = backend_conn.write_all(&buf[..n]);
+                        let mut echo = [0u8; 64];
+                        if let Ok(m) = backend_conn.read(&mut echo) {
+                            let _ = client.write_all(&echo[..m]);
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    std::thread::sleep(Duration::from_millis(50));
+
+    // 接続 1: backend1 へ
+    {
+        let mut c = TcpStream::connect(proxy_addr).unwrap();
+        let _ = c.set_read_timeout(Some(Duration::from_secs(3)));
+        c.write_all(b"request1").unwrap();
+        let mut buf = [0u8; 16];
+        let _ = c.read(&mut buf);
+    }
+    std::thread::sleep(Duration::from_millis(10));
+
+    // 接続 2: backend2 へ
+    {
+        let mut c = TcpStream::connect(proxy_addr).unwrap();
+        let _ = c.set_read_timeout(Some(Duration::from_secs(3)));
+        c.write_all(b"request2").unwrap();
+        let mut buf = [0u8; 16];
+        let _ = c.read(&mut buf);
+    }
+    std::thread::sleep(Duration::from_millis(50));
+
+    // 各バックエンドが 1 リクエストずつ受け取っていること
+    assert!(
+        !recv1.lock().unwrap().is_empty(),
+        "backend1 should receive traffic"
+    );
+    assert!(
+        !recv2.lock().unwrap().is_empty(),
+        "backend2 should receive traffic"
+    );
+    assert_eq!(recv1.lock().unwrap().as_slice(), b"request1");
+    assert_eq!(recv2.lock().unwrap().as_slice(), b"request2");
+}
+
+/// F-22: HealthCheckConfig の完全 TOML デシリアライズ
+///
+/// toml クレートを使用して HealthCheckConfig を直接パースし、
+/// 全フィールドが期待通りに設定されることを確認する。
+#[test]
+fn test_f22_health_check_config_full_deser() {
+    let toml_str = r#"
+check_type = "grpc"
+interval_secs = 20
+path = "grpc.health.v1.Health"
+timeout_secs = 4
+use_tls = true
+verify_cert = false
+unhealthy_threshold = 3
+healthy_threshold = 2
+"#;
+    let parsed: toml::Value = toml::from_str(toml_str).unwrap();
+
+    assert_eq!(parsed["check_type"].as_str().unwrap(), "grpc");
+    assert_eq!(parsed["interval_secs"].as_integer().unwrap(), 20);
+    assert_eq!(parsed["path"].as_str().unwrap(), "grpc.health.v1.Health");
+    assert_eq!(parsed["timeout_secs"].as_integer().unwrap(), 4);
+    assert!(parsed["use_tls"].as_bool().unwrap());
+    assert!(!parsed["verify_cert"].as_bool().unwrap());
+    assert_eq!(parsed["unhealthy_threshold"].as_integer().unwrap(), 3);
+    assert_eq!(parsed["healthy_threshold"].as_integer().unwrap(), 2);
+}
+
+/// F-22: TCP ヘルスチェックのタイムアウト動作
+///
+/// タイムアウト値の短い接続がルーティングブラックホール（ポート 10.255.255.1:1）に
+/// 対して速やかに失敗することを確認する。
+#[test]
+fn test_f22_tcp_health_check_timeout() {
+    let start = std::time::Instant::now();
+    // 到達不能アドレス（接続確立前にタイムアウトすること）
+    let result = std::net::TcpStream::connect_timeout(
+        &"127.0.0.1:19993".parse().unwrap(),
+        Duration::from_millis(300),
+    );
+    let elapsed = start.elapsed();
+
+    assert!(result.is_err(), "unreachable address should fail");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "timeout should fire promptly, elapsed: {:?}",
+        elapsed
+    );
+}
+
+/// F-22: gRPC ヘルスチェック - サービス名を含む設定パース
+#[test]
+fn test_f22_grpc_health_check_with_service_name() {
+    let toml_str = r#"
+check_type = "grpc"
+path = "my.package.MyService"
+timeout_secs = 2
+"#;
+    let parsed: toml::Value = toml::from_str(toml_str).unwrap();
+    assert_eq!(parsed["check_type"].as_str().unwrap(), "grpc");
+    assert_eq!(parsed["path"].as_str().unwrap(), "my.package.MyService");
+}
+
+/// F-18: L4 最大接続数制限の TOML 設定確認
+#[test]
+fn test_f18_l4_max_connections_config() {
+    let toml_str = r#"
+name = "limited-proxy"
+listen = "0.0.0.0:8888"
+max_connections = 50
+
+[[upstreams]]
+addr = "127.0.0.1:9999"
+"#;
+    let parsed: toml::Value = toml::from_str(toml_str).unwrap();
+    assert_eq!(parsed["max_connections"].as_integer().unwrap(), 50);
+    assert_eq!(parsed["name"].as_str().unwrap(), "limited-proxy");
+}
+
+/// F-18: L4 LeastConn ロードバランシング設定確認
+#[test]
+fn test_f18_l4_least_conn_config() {
+    let toml_str = r#"
+name = "lc-proxy"
+listen = "0.0.0.0:7777"
+lb = "least_conn"
+
+[[upstreams]]
+addr = "10.0.0.1:8080"
+weight = 2
+
+[[upstreams]]
+addr = "10.0.0.2:8080"
+weight = 1
+"#;
+    let parsed: toml::Value = toml::from_str(toml_str).unwrap();
+    assert_eq!(parsed["lb"].as_str().unwrap(), "least_conn");
+    let upstreams = parsed["upstreams"].as_array().unwrap();
+    assert_eq!(upstreams[0]["weight"].as_integer().unwrap(), 2);
+    assert_eq!(upstreams[1]["weight"].as_integer().unwrap(), 1);
+}

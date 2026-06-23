@@ -923,4 +923,96 @@ mod tests {
         );
         assert!(!result);
     }
+
+    #[test]
+    fn test_perform_tcp_health_check_success() {
+        // リスニング中の TCP サーバーには接続できる
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        let _server = std::thread::spawn(move || {
+            let _ = listener.accept();
+        });
+
+        let result = perform_tcp_health_check(&addr, Duration::from_secs(2));
+        assert!(result, "listening port should return true");
+    }
+
+    #[test]
+    fn test_perform_grpc_health_check_success() {
+        // gRPC ヘルスチェックに対して SERVING を返すモックサーバー
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        std::thread::spawn(move || {
+            if let Ok((mut conn, _)) = listener.accept() {
+                let mut buf = [0u8; 512];
+                let _ = conn.read(&mut buf);
+                let response =
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/grpc\r\ngrpc-status: 0\r\n\r\n";
+                let _ = conn.write_all(response);
+            }
+        });
+
+        std::thread::sleep(Duration::from_millis(20));
+        let result = perform_grpc_health_check(&addr, "", false, false, Duration::from_secs(2));
+        assert!(result, "mock gRPC server returning grpc-status: 0 should return true");
+    }
+
+    #[test]
+    fn test_perform_grpc_health_check_not_serving() {
+        // gRPC ヘルスチェックに対して NOT_SERVING を返すモックサーバー
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        std::thread::spawn(move || {
+            if let Ok((mut conn, _)) = listener.accept() {
+                let mut buf = [0u8; 512];
+                let _ = conn.read(&mut buf);
+                let response =
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/grpc\r\ngrpc-status: 2\r\n\r\n";
+                let _ = conn.write_all(response);
+            }
+        });
+
+        std::thread::sleep(Duration::from_millis(20));
+        let result = perform_grpc_health_check(&addr, "", false, false, Duration::from_secs(2));
+        assert!(!result, "grpc-status: 2 (UNKNOWN) should return false");
+    }
+
+    #[test]
+    fn test_check_grpc_response_empty() {
+        // 空レスポンスは false
+        assert!(!check_grpc_response(b""));
+    }
+
+    #[test]
+    fn test_check_grpc_response_no_grpc_status_header() {
+        // grpc-status ヘッダーなしは false
+        let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/grpc\r\n\r\n";
+        assert!(!check_grpc_response(response));
+    }
+
+    #[test]
+    fn test_check_grpc_response_grpc_status_nonzero_values() {
+        // 各 gRPC エラーコードが false になること
+        for status in [1u8, 2, 3, 4, 5, 12, 13, 14, 16] {
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ngrpc-status: {}\r\n\r\n",
+                status
+            );
+            assert!(
+                !check_grpc_response(response.as_bytes()),
+                "grpc-status {} should return false",
+                status
+            );
+        }
+    }
 }
