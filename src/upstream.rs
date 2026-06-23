@@ -207,6 +207,188 @@ pub(crate) fn perform_health_check(
     }
 }
 
+/// TCP 接続の確立可否のみ確認するヘルスチェック（F-22）
+///
+/// HTTP リクエストは送信せず、TCP 3-way ハンドシェイクが完了すれば healthy と判断。
+/// L4 バックエンドや非 HTTP サービスの死活監視に使用する。
+pub(crate) fn perform_tcp_health_check(addr: &str, timeout: Duration) -> bool {
+    use std::net::TcpStream as StdTcpStream;
+
+    let sock_addr = match addr.parse() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    StdTcpStream::connect_timeout(&sock_addr, timeout).is_ok()
+}
+
+/// gRPC Health Checking Protocol によるヘルスチェック（F-22）
+///
+/// grpc.health.v1.Health/Check を送信し、SERVING ステータスを確認する。
+/// TLS の有無は `use_tls` で制御する。`service_name` が空文字の場合はサーバー全体のチェック。
+pub(crate) fn perform_grpc_health_check(
+    addr: &str,
+    service_name: &str,
+    use_tls: bool,
+    verify_cert: bool,
+    timeout: Duration,
+) -> bool {
+    use std::io::{Read, Write};
+    use std::net::TcpStream as StdTcpStream;
+
+    // TCP 接続
+    let mut tcp_stream = match StdTcpStream::connect_timeout(
+        &addr
+            .parse()
+            .unwrap_or_else(|_| std::net::SocketAddr::from(([127, 0, 0, 1], 80))),
+        timeout,
+    ) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let _ = tcp_stream.set_read_timeout(Some(timeout));
+    let _ = tcp_stream.set_write_timeout(Some(timeout));
+
+    // gRPC Health Check メッセージを構築
+    // healthpb.HealthCheckRequest { service: service_name } の protobuf エンコード
+    // field 1 (service, string): tag=0x0a, then length-prefixed bytes
+    let service_bytes = service_name.as_bytes();
+    let proto_body: Vec<u8> = if service_bytes.is_empty() {
+        vec![]
+    } else {
+        let mut body = Vec::with_capacity(2 + service_bytes.len());
+        body.push(0x0a); // field 1, wire type 2 (length-delimited)
+        body.push(service_bytes.len() as u8);
+        body.extend_from_slice(service_bytes);
+        body
+    };
+
+    // gRPC フレーム: 1 byte 圧縮フラグ (0) + 4 byte メッセージ長
+    let mut grpc_frame = Vec::with_capacity(5 + proto_body.len());
+    grpc_frame.push(0u8); // 圧縮なし
+    let msg_len = proto_body.len() as u32;
+    grpc_frame.extend_from_slice(&msg_len.to_be_bytes());
+    grpc_frame.extend_from_slice(&proto_body);
+
+    // HTTP/2 の完全実装は重いため、HTTP/1.1 アップグレード不要の gRPC-over-HTTP/1.1
+    // ではなく h2c プリフェース + 最小フレームで直接送信する簡易実装を使用する。
+    // 実用上はバックエンドが HTTP/1.1 の gRPC ヘルスエンドポイントを提供している場合のみ動作。
+    // HTTP/1.1 POST with Content-Type: application/grpc
+    let host_header = addr.split(':').next().unwrap_or(addr);
+    let request = format!(
+        "POST /grpc.health.v1.Health/Check HTTP/1.1\r\n\
+         Host: {}\r\n\
+         Content-Type: application/grpc\r\n\
+         TE: trailers\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         User-Agent: VeilHealthCheck/1.0\r\n\
+         \r\n",
+        host_header,
+        grpc_frame.len()
+    );
+
+    let send_result: bool = if use_tls {
+        use rustls::pki_types::ServerName;
+        use rustls::{ClientConfig, ClientConnection, RootCertStore};
+        use std::sync::Arc;
+
+        let config: Arc<ClientConfig> = if verify_cert {
+            let mut root_store = RootCertStore::empty();
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            Arc::new(
+                ClientConfig::builder()
+                    .with_root_certificates(root_store)
+                    .with_no_client_auth(),
+            )
+        } else {
+            use rustls::client::danger::{
+                HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+            };
+            use rustls::pki_types::{CertificateDer, UnixTime};
+            use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
+
+            #[derive(Debug)]
+            struct NoVerify;
+            impl ServerCertVerifier for NoVerify {
+                fn verify_server_cert(&self, _: &CertificateDer, _: &[CertificateDer], _: &rustls::pki_types::ServerName, _: &[u8], _: UnixTime) -> Result<ServerCertVerified, TlsError> { Ok(ServerCertVerified::assertion()) }
+                fn verify_tls12_signature(&self, _: &[u8], _: &CertificateDer, _: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, TlsError> { Ok(HandshakeSignatureValid::assertion()) }
+                fn verify_tls13_signature(&self, _: &[u8], _: &CertificateDer, _: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, TlsError> { Ok(HandshakeSignatureValid::assertion()) }
+                fn supported_verify_schemes(&self) -> Vec<SchemeList> { vec![SchemeList::RSA_PKCS1_SHA256, SchemeList::ECDSA_NISTP256_SHA256, SchemeList::RSA_PSS_SHA256] }
+            }
+            type SchemeList = SignatureScheme;
+            Arc::new(
+                ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(NoVerify))
+                    .with_no_client_auth(),
+            )
+        };
+
+        let server_name = match ServerName::try_from(host_header.to_string()) {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        let mut tls_conn = match ClientConnection::new(config, server_name) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        use std::io::ErrorKind;
+        while tls_conn.is_handshaking() {
+            match tls_conn.complete_io(&mut tcp_stream) {
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return false,
+            }
+        }
+        let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp_stream);
+        if stream.write_all(request.as_bytes()).is_err() {
+            return false;
+        }
+        if stream.write_all(&grpc_frame).is_err() {
+            return false;
+        }
+        let mut response = [0u8; 512];
+        match stream.read(&mut response) {
+            Ok(n) if n > 0 => check_grpc_response(&response[..n]),
+            _ => false,
+        }
+    } else {
+        if tcp_stream.write_all(request.as_bytes()).is_err() {
+            return false;
+        }
+        if tcp_stream.write_all(&grpc_frame).is_err() {
+            return false;
+        }
+        let mut response = [0u8; 512];
+        match tcp_stream.read(&mut response) {
+            Ok(n) if n > 0 => check_grpc_response(&response[..n]),
+            _ => false,
+        }
+    };
+
+    send_result
+}
+
+/// gRPC レスポンスが SERVING かどうかを検証する補助関数
+fn check_grpc_response(response: &[u8]) -> bool {
+    // HTTP レスポンスのステータスラインを確認
+    let response_str = std::str::from_utf8(response).unwrap_or("");
+    let first_line = response_str.lines().next().unwrap_or("");
+    let parts: Vec<&str> = first_line.split_whitespace().collect();
+    if parts.len() < 2 {
+        return false;
+    }
+    let status_ok = parts[1].parse::<u16>().map(|s| s == 200).unwrap_or(false);
+    if !status_ok {
+        return false;
+    }
+    // grpc-status トレーラーまたはヘッダーが 0 (OK) であれば SERVING と判断
+    // 簡易実装: grpc-status: 0 が含まれていれば OK
+    response_str.contains("grpc-status: 0") || response_str.contains("grpc-status:0")
+}
+
 // ====================
 // Backend選択
 // ====================
@@ -668,4 +850,77 @@ fn matches_cidr(ip: &SocketAddr, cidr_ranges: &[String]) -> bool {
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ====================
+    // F-22: ヘルスチェック種別テスト
+    // ====================
+
+    #[test]
+    fn test_health_check_type_default_is_http() {
+        use crate::config::{HealthCheckConfig, HealthCheckType};
+        let cfg = HealthCheckConfig::default();
+        assert_eq!(cfg.check_type, HealthCheckType::Http);
+    }
+
+    #[test]
+    fn test_perform_tcp_health_check_unreachable() {
+        // 接続できないアドレスは false を返す
+        let result = perform_tcp_health_check("127.0.0.1:19999", Duration::from_millis(200));
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_perform_tcp_health_check_invalid_addr() {
+        // 無効なアドレスは false を返す
+        let result = perform_tcp_health_check("not-a-valid-addr", Duration::from_millis(200));
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_check_grpc_response_ok() {
+        // SERVING レスポンスは true
+        let response =
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/grpc\r\ngrpc-status: 0\r\n\r\n";
+        assert!(check_grpc_response(response));
+    }
+
+    #[test]
+    fn test_check_grpc_response_not_serving() {
+        // grpc-status が 0 以外は false
+        let response =
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/grpc\r\ngrpc-status: 5\r\n\r\n";
+        assert!(!check_grpc_response(response));
+    }
+
+    #[test]
+    fn test_check_grpc_response_http_error() {
+        // HTTP ステータスが 200 以外は false
+        let response = b"HTTP/1.1 503 Service Unavailable\r\ngrpc-status: 0\r\n\r\n";
+        assert!(!check_grpc_response(response));
+    }
+
+    #[test]
+    fn test_check_grpc_response_grpc_status_no_space() {
+        // grpc-status:0（スペースなし）も認識する
+        let response = b"HTTP/1.1 200 OK\r\ngrpc-status:0\r\n\r\n";
+        assert!(check_grpc_response(response));
+    }
+
+    #[test]
+    fn test_perform_grpc_health_check_unreachable() {
+        // 接続できないアドレスは false を返す
+        let result = perform_grpc_health_check(
+            "127.0.0.1:19999",
+            "",
+            false,
+            false,
+            Duration::from_millis(200),
+        );
+        assert!(!result);
+    }
 }

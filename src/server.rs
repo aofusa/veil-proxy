@@ -606,16 +606,33 @@ pub fn spawn_health_check_thread() {
                         let target = &server.target;
                         let addr = format!("{}:{}", target.host, target.port);
 
-                        // 同期的な TCP 接続でヘルスチェック
-                        let check_result = perform_health_check(
-                            &addr,
-                            &target.host,
-                            &hc_config.path,
-                            hc_config.use_tls,
-                            hc_config.verify_cert,
-                            Duration::from_secs(hc_config.timeout_secs),
-                            &hc_config.healthy_statuses,
-                        );
+                        // チェック種別に応じてヘルスチェックを実行（F-22）
+                        let timeout_dur = Duration::from_secs(hc_config.timeout_secs);
+                        let check_result = match hc_config.check_type {
+                            HealthCheckType::Tcp => {
+                                perform_tcp_health_check(&addr, timeout_dur)
+                            }
+                            HealthCheckType::Grpc => {
+                                perform_grpc_health_check(
+                                    &addr,
+                                    &hc_config.path,
+                                    hc_config.use_tls,
+                                    hc_config.verify_cert,
+                                    timeout_dur,
+                                )
+                            }
+                            HealthCheckType::Http => {
+                                perform_health_check(
+                                    &addr,
+                                    &target.host,
+                                    &hc_config.path,
+                                    hc_config.use_tls,
+                                    hc_config.verify_cert,
+                                    timeout_dur,
+                                    &hc_config.healthy_statuses,
+                                )
+                            }
+                        };
 
                         // メトリクス: ヘルスチェック結果を更新
                         update_upstream_health(name, &addr, check_result);

@@ -2237,19 +2237,40 @@ impl RetryPolicy {
     }
 }
 
+/// ヘルスチェックの種別（F-22）
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthCheckType {
+    /// HTTP/HTTPS リクエストを送信してステータスコードを確認（デフォルト）
+    Http,
+    /// TCP 接続の確立可否のみ確認
+    Tcp,
+    /// gRPC Health Checking Protocol (grpc.health.v1.Health/Check)
+    Grpc,
+}
+
+impl Default for HealthCheckType {
+    fn default() -> Self {
+        HealthCheckType::Http
+    }
+}
+
 /// 健康チェック設定
 #[derive(Deserialize, Clone, Debug)]
 pub struct HealthCheckConfig {
+    /// チェック種別（http / tcp / grpc）。省略時は http。
+    #[serde(default)]
+    pub check_type: HealthCheckType,
     /// チェック間隔（秒）
     #[serde(default = "default_health_check_interval")]
     pub interval_secs: u64,
-    /// チェック対象パス
+    /// チェック対象パス（HTTP チェック時のリクエストパス、gRPC チェック時のサービス名）
     #[serde(default = "default_health_check_path")]
     pub path: String,
     /// タイムアウト（秒）
     #[serde(default = "default_health_check_timeout")]
     pub timeout_secs: u64,
-    /// 成功と判断するHTTPステータスコード（デフォルト: 200-399）
+    /// 成功と判断するHTTPステータスコード（HTTP チェック時のみ有効、デフォルト: 200-399）
     #[serde(default = "default_healthy_statuses")]
     pub healthy_statuses: Vec<u16>,
     /// 何回連続で失敗したら unhealthy とするか
@@ -2290,6 +2311,7 @@ fn default_healthy_threshold() -> u32 {
 impl Default for HealthCheckConfig {
     fn default() -> Self {
         Self {
+            check_type: HealthCheckType::Http,
             interval_secs: default_health_check_interval(),
             path: default_health_check_path(),
             timeout_secs: default_health_check_timeout(),
@@ -2442,6 +2464,92 @@ struct Config {
     #[cfg(feature = "wasm")]
     #[serde(default)]
     wasm: Option<crate::wasm::WasmConfig>,
+    /// L4 (TCP/UDP) ストリームプロキシ設定（F-18）
+    #[cfg(feature = "l4-proxy")]
+    #[serde(default)]
+    l4: Option<Vec<L4ListenerConfig>>,
+}
+
+// ====================
+// L4 (TCP/UDP) ストリームプロキシ設定（F-18）
+// ====================
+
+/// L4 TLS モード
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum L4TlsMode {
+    /// TLS なし（プレーンな TCP）
+    None,
+    /// TLS パススルー（TLS を復号せず upstream にそのまま転送）
+    Passthrough,
+    /// TLS ターミネーション（veil で TLS を終端し、upstream にはプレーン TCP で接続）
+    Terminate,
+}
+
+impl Default for L4TlsMode {
+    fn default() -> Self {
+        L4TlsMode::None
+    }
+}
+
+/// L4 ロードバランシングアルゴリズム
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum L4LbAlgorithm {
+    /// ラウンドロビン（デフォルト）
+    RoundRobin,
+    /// 最小接続数
+    LeastConn,
+}
+
+impl Default for L4LbAlgorithm {
+    fn default() -> Self {
+        L4LbAlgorithm::RoundRobin
+    }
+}
+
+/// L4 upstream バックエンド
+#[derive(Deserialize, Clone, Debug)]
+pub struct L4UpstreamEntry {
+    /// バックエンドアドレス（"host:port" 形式）
+    pub addr: String,
+    /// 重み（weighted round-robin 用、デフォルト: 1）
+    #[serde(default = "default_l4_weight")]
+    pub weight: u32,
+}
+
+fn default_l4_weight() -> u32 {
+    1
+}
+
+/// L4 リスナー設定（TOML: [[l4]]）
+#[derive(Deserialize, Clone, Debug)]
+pub struct L4ListenerConfig {
+    /// リスナー名（ログ・メトリクス識別用）
+    pub name: String,
+    /// リッスンアドレス（例: "0.0.0.0:3306"）
+    pub listen: String,
+    /// upstream バックエンド一覧
+    pub upstreams: Vec<L4UpstreamEntry>,
+    /// ロードバランシングアルゴリズム
+    #[serde(default)]
+    pub lb: L4LbAlgorithm,
+    /// TLS モード（none / passthrough / terminate）
+    #[serde(default)]
+    pub tls: L4TlsMode,
+    /// 最大同時接続数（0 = 無制限）
+    #[serde(default)]
+    pub max_connections: usize,
+    /// ヘルスチェック設定（省略可）
+    #[serde(default)]
+    pub health_check: Option<HealthCheckConfig>,
+    /// バックエンド接続タイムアウト（秒）
+    #[serde(default = "default_l4_connect_timeout")]
+    pub connect_timeout_secs: u64,
+}
+
+fn default_l4_connect_timeout() -> u64 {
+    10
 }
 
 // ====================
@@ -4712,6 +4820,9 @@ pub struct LoadedConfig {
     pub performance: PerformanceConfigSection,
     /// グレースフルシャットダウンタイムアウト（秒）
     pub graceful_shutdown_timeout_secs: u64,
+    /// L4 プロキシリスナー設定（F-18）
+    #[cfg(feature = "l4-proxy")]
+    pub l4_listeners: Vec<L4ListenerConfig>,
 }
 
 // ====================
@@ -4785,6 +4896,9 @@ pub struct RuntimeConfig {
     pub wasm_filter_engine: Option<Arc<crate::wasm::FilterEngine>>,
     /// パフォーマンス設定（Via header, chunk size等）
     pub performance: PerformanceConfigSection,
+    /// L4 プロキシリスナー設定（F-18）
+    #[cfg(feature = "l4-proxy")]
+    pub l4_listeners: Arc<Vec<L4ListenerConfig>>,
 }
 
 impl Default for RuntimeConfig {
@@ -4814,6 +4928,8 @@ impl Default for RuntimeConfig {
             #[cfg(feature = "wasm")]
             wasm_filter_engine: None,
             performance: PerformanceConfigSection::default(),
+            #[cfg(feature = "l4-proxy")]
+            l4_listeners: Arc::new(Vec::new()),
         }
     }
 }
@@ -4886,6 +5002,9 @@ pub fn reload_config(path: &Path) -> io::Result<()> {
         #[cfg(feature = "wasm")]
         wasm_filter_engine: current.wasm_filter_engine.clone(),
         performance: loaded.performance.clone(),
+        // L4 リスナーはホットリロード対象外（再起動が必要）
+        #[cfg(feature = "l4-proxy")]
+        l4_listeners: current.l4_listeners.clone(),
     };
 
     // アトミックに設定を入れ替え
@@ -5316,6 +5435,8 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         wasm_filter_engine,
         performance: config.performance.clone(),
         graceful_shutdown_timeout_secs: config.server.graceful_shutdown_timeout_secs,
+        #[cfg(feature = "l4-proxy")]
+        l4_listeners: config.l4.unwrap_or_default(),
     })
 }
 
