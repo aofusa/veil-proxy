@@ -801,8 +801,9 @@ fn build_seccomp_filter(mode: SeccompMode) -> io::Result<Vec<libc::sock_filter>>
     // ====================
     // PROT_EXEC 引数レベルチェック（mmap / mprotect）
     //
-    // mprotect(addr, len, prot) の prot は args[1]（オフセット 24）
+    // mprotect(addr, len, prot)   の prot は args[2]（オフセット 32）
     // mmap(addr, len, prot, ...)  の prot は args[2]（オフセット 32）
+    // ※ どちらも prot は第 3 引数 = args[2]。len（args[1]）と混同しないこと。
     //
     // seccomp_data 構造体レイアウト:
     //   u32 nr       @ offset 0
@@ -816,8 +817,8 @@ fn build_seccomp_filter(mode: SeccompMode) -> io::Result<Vec<libc::sock_filter>>
 
     // seccomp_data.args フィールドは u64 だが、BPF は 32bit 単位で読む。
     // リトルエンディアンでは下位 32bit がオフセット位置にある。
-    const OFFSET_ARG1_LO: u32 = 24; // args[1] 下位 32bit（mprotect の prot）
-    const OFFSET_ARG2_LO: u32 = 32; // args[2] 下位 32bit（mmap の prot）
+    // mmap・mprotect とも prot は args[2]（第 3 引数, オフセット 32）。
+    const OFFSET_ARG2_LO: u32 = 32; // args[2] 下位 32bit（mmap/mprotect の prot）
 
     #[cfg(target_arch = "x86_64")]
     let (syscall_mmap, syscall_mprotect) = (9u32, 10u32);
@@ -848,8 +849,9 @@ fn build_seccomp_filter(mode: SeccompMode) -> io::Result<Vec<libc::sock_filter>>
     // DENY = filter.len() + syscall_count
     // ALLOW = filter.len() + syscall_count + 1
     // prot_check_mprotect = filter.len() + syscall_count + 2
-    //   (LD, JSET, ALLOW) = 3 commands
-    // prot_check_mmap = filter.len() + syscall_count + 5
+    //   mprotect チェックは LD, JSET, RET(allow), RET(deny) の 4 命令で構成される。
+    // prot_check_mmap = filter.len() + syscall_count + 6
+    //   （DENY 1 + ALLOW 1 + mprotect チェック 4 命令の先が mmap チェックの LD）
 
     let base = filter.len(); // syscall LD 命令のインデックス
     let deny_idx = base + 1; // DENY 命令のインデックス（スキップカウント計算用）
@@ -872,8 +874,10 @@ fn build_seccomp_filter(mode: SeccompMode) -> io::Result<Vec<libc::sock_filter>>
                 k: nr,
             });
         } else if nr == syscall_mmap {
-            // mmap → PROT_EXEC チェック: deny+5 先
-            let prot_check_jump = (remaining + 5) as u8;
+            // mmap → PROT_EXEC チェック: DENY(1) + ALLOW(1) + mprotect チェック(4命令) の先。
+            // mprotect チェックは LD/JSET/RET(allow)/RET(deny) の 4 命令なので +6 が正しい
+            // （+5 だと mprotect ブロックの RET(deny) に着地し、全 mmap が誤って拒否される）。
+            let prot_check_jump = (remaining + 6) as u8;
             filter.push(libc::sock_filter {
                 code: BPF_JMP | BPF_JEQ | BPF_K,
                 jt: prot_check_jump, // prot_exec_check_mmap へ
@@ -907,13 +911,13 @@ fn build_seccomp_filter(mode: SeccompMode) -> io::Result<Vec<libc::sock_filter>>
         k: action_allow,
     });
 
-    // 6. mprotect PROT_EXEC チェック（args[1] を検査）
-    // LD args[1] 下位32bit
+    // 6. mprotect PROT_EXEC チェック（args[2]=prot を検査）
+    // LD args[2] 下位32bit
     filter.push(libc::sock_filter {
         code: BPF_LD | BPF_W | BPF_ABS,
         jt: 0,
         jf: 0,
-        k: OFFSET_ARG1_LO,
+        k: OFFSET_ARG2_LO,
     });
     // PROT_EXEC ビットが立っていれば DENY
     filter.push(libc::sock_filter {
@@ -2509,5 +2513,136 @@ mod tests {
             // mount (165) は含まれていない
             assert!(!ALLOWED_SYSCALLS.contains(&165));
         }
+    }
+
+    // ====================
+    // seccomp BPF PROT_EXEC 引数レベル検証（F-25）の実機テスト
+    // ====================
+
+    /// 子プロセスで実際に seccomp フィルタを適用し、PROT_EXEC の引数レベル拒否を検証する。
+    ///
+    /// 終了コードのビットで結果を返す:
+    ///   bit0 (1): PROT_READ|PROT_WRITE の mmap が許可される
+    ///   bit1 (2): PROT_EXEC 付き mmap が EPERM で拒否される
+    ///   bit2 (4): PROT_EXEC 付き mprotect が EPERM で拒否される
+    ///   bit3 (8): PROT_READ|PROT_WRITE の mprotect が許可される
+    /// 正しい BPF では 15。ジャンプオフセットがずれると 15 にならない
+    /// （例: mmap のオフセットが 1 ずれると通常 mmap が拒否され bit0 が落ちる）。
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn test_seccomp_prot_exec_argument_filter() {
+        // フィルタはフォーク前に構築する（子では heap alloc しない）。
+        let filter = build_seccomp_filter(SeccompMode::Filter).expect("build filter");
+        let prog = libc::sock_fprog {
+            len: filter.len() as u16,
+            filter: filter.as_ptr() as *mut libc::sock_filter,
+        };
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+
+        if pid == 0 {
+            // ===== 子プロセス: async-signal-safe な libc 呼び出しのみ =====
+            // seccomp 適用前に検証用ページを確保しておく。
+            let page = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    4096,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if page == libc::MAP_FAILED {
+                unsafe { libc::_exit(100) };
+            }
+
+            if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+                unsafe { libc::_exit(101) };
+            }
+            let applied = unsafe {
+                libc::prctl(
+                    libc::PR_SET_SECCOMP,
+                    libc::SECCOMP_MODE_FILTER,
+                    &prog as *const libc::sock_fprog,
+                    0,
+                    0,
+                )
+            };
+            if applied != 0 {
+                // 権限なし等で seccomp を適用できない環境 → スキップ用コード。
+                unsafe { libc::_exit(42) };
+            }
+
+            let mut bits: i32 = 0;
+
+            // bit0: 通常 mmap が許可される
+            let benign = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    4096,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if benign != libc::MAP_FAILED {
+                bits |= 1;
+                unsafe { libc::munmap(benign, 4096) };
+            }
+
+            // bit1: PROT_EXEC 付き mmap は EPERM で拒否される
+            let exec_map = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    4096,
+                    libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if exec_map == libc::MAP_FAILED {
+                if unsafe { *libc::__errno_location() } == libc::EPERM {
+                    bits |= 2;
+                }
+            } else {
+                unsafe { libc::munmap(exec_map, 4096) };
+            }
+
+            // bit2: PROT_EXEC 付き mprotect は EPERM で拒否される
+            if unsafe { libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC) } != 0
+                && unsafe { *libc::__errno_location() } == libc::EPERM
+            {
+                bits |= 4;
+            }
+
+            // bit3: 通常 mprotect は許可される
+            if unsafe { libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_WRITE) } == 0 {
+                bits |= 8;
+            }
+
+            unsafe { libc::_exit(bits) };
+        }
+
+        // ===== 親プロセス =====
+        let mut status: libc::c_int = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(libc::WIFEXITED(status), "child did not exit normally");
+        let code = libc::WEXITSTATUS(status);
+
+        if code == 42 {
+            eprintln!("seccomp could not be applied (no privileges?); skipping");
+            return;
+        }
+
+        assert_eq!(
+            code, 15,
+            "seccomp PROT_EXEC filter incorrect (expected 15: \
+             RW-mmap allowed / EXEC-mmap denied / EXEC-mprotect denied / RW-mprotect allowed), \
+             got {code}"
+        );
     }
 }
