@@ -569,12 +569,14 @@ pub fn spawn_wasm_tick_thread() {
                         }
                     };
 
-                    // Deliver response to WASM module
-                    let _ = wasm_engine.on_http_call_response(
+                    // Deliver response to WASM module.
+                    // tick スレッド（io_uring ワーカーではない背景スレッド）上で
+                    // 非同期 WASM 実行を完走させる。ホットパスではないため block_on で良い。
+                    let _ = futures::executor::block_on(wasm_engine.on_http_call_response(
                         &pending.module_name,
                         pending.token,
                         response,
-                    );
+                    ));
                 }
             }
         }
@@ -609,29 +611,23 @@ pub fn spawn_health_check_thread() {
                         // チェック種別に応じてヘルスチェックを実行（F-22）
                         let timeout_dur = Duration::from_secs(hc_config.timeout_secs);
                         let check_result = match hc_config.check_type {
-                            HealthCheckType::Tcp => {
-                                perform_tcp_health_check(&addr, timeout_dur)
-                            }
-                            HealthCheckType::Grpc => {
-                                perform_grpc_health_check(
-                                    &addr,
-                                    &hc_config.path,
-                                    hc_config.use_tls,
-                                    hc_config.verify_cert,
-                                    timeout_dur,
-                                )
-                            }
-                            HealthCheckType::Http => {
-                                perform_health_check(
-                                    &addr,
-                                    &target.host,
-                                    &hc_config.path,
-                                    hc_config.use_tls,
-                                    hc_config.verify_cert,
-                                    timeout_dur,
-                                    &hc_config.healthy_statuses,
-                                )
-                            }
+                            HealthCheckType::Tcp => perform_tcp_health_check(&addr, timeout_dur),
+                            HealthCheckType::Grpc => perform_grpc_health_check(
+                                &addr,
+                                &hc_config.path,
+                                hc_config.use_tls,
+                                hc_config.verify_cert,
+                                timeout_dur,
+                            ),
+                            HealthCheckType::Http => perform_health_check(
+                                &addr,
+                                &target.host,
+                                &hc_config.path,
+                                hc_config.use_tls,
+                                hc_config.verify_cert,
+                                timeout_dur,
+                                &hc_config.healthy_statuses,
+                            ),
                         };
 
                         // メトリクス: ヘルスチェック結果を更新

@@ -22,7 +22,7 @@ pub fn on_request_complete(engine: &Arc<FilterEngine>, modules: &[String]) {
         return;
     }
 
-    engine.on_log_with_modules(modules);
+    futures::executor::block_on(engine.on_log_with_modules(modules));
 }
 
 /// Execute on_log callback for WASM modules at the end of request processing ASYNCHRONOUSLY
@@ -51,7 +51,7 @@ pub fn on_context_destroy(engine: &Arc<FilterEngine>, modules: &[String]) -> boo
         return false;
     }
 
-    engine.on_done_with_modules(modules)
+    futures::executor::block_on(engine.on_done_with_modules(modules))
 }
 
 /// HTTP call result for delivering back to WASM modules
@@ -70,7 +70,11 @@ pub struct WasmHttpCallResult {
 /// * `engine` - The WASM filter engine
 /// * `result` - The HTTP call result containing module name, token, and response
 pub fn on_http_call_complete(engine: &Arc<FilterEngine>, result: WasmHttpCallResult) {
-    let _ = engine.on_http_call_response(&result.module_name, result.token, result.response);
+    let _ = futures::executor::block_on(engine.on_http_call_response(
+        &result.module_name,
+        result.token,
+        result.response,
+    ));
 }
 
 /// Information about a pending HTTP call for async execution
@@ -113,7 +117,7 @@ pub struct TickConfig {
 /// * `engine` - The WASM filter engine
 /// * `module_name` - Name of the module to tick
 pub fn on_tick(engine: &Arc<FilterEngine>, module_name: &str) {
-    engine.on_tick(module_name);
+    futures::executor::block_on(engine.on_tick(module_name));
 }
 
 /// Execute on_queue_ready callback for a WASM module
@@ -126,7 +130,7 @@ pub fn on_tick(engine: &Arc<FilterEngine>, module_name: &str) {
 /// * `module_name` - Name of the module to notify
 /// * `queue_id` - ID of the queue with new data
 pub fn on_queue_ready(engine: &Arc<FilterEngine>, module_name: &str, queue_id: u32) {
-    engine.on_queue_ready(module_name, queue_id);
+    futures::executor::block_on(engine.on_queue_ready(module_name, queue_id));
 }
 
 /// Process all pending HTTP calls from stored contexts
@@ -159,7 +163,11 @@ where
 
             // Take the context and call on_http_call_response
             if let Some(_stored) = take_context(pending.context_id) {
-                engine.on_http_call_response(&pending.module_name, pending.token, response);
+                let _ = futures::executor::block_on(engine.on_http_call_response(
+                    &pending.module_name,
+                    pending.token,
+                    response,
+                ));
             }
         }
     }
@@ -192,7 +200,11 @@ pub fn resume_after_http_call(
 
     // Then take the context and invoke the callback
     if let Some(stored) = take_context(context_id) {
-        engine.on_http_call_response(&stored.module_name, token, response);
+        let _ = futures::executor::block_on(engine.on_http_call_response(
+            &stored.module_name,
+            token,
+            response,
+        ));
         true
     } else {
         false

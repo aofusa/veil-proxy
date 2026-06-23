@@ -103,7 +103,7 @@ pub fn process_ticks(engine: &Arc<FilterEngine>) {
     let due_modules = get_due_ticks();
 
     for module_name in due_modules {
-        engine.on_tick(&module_name);
+        futures::executor::block_on(engine.on_tick(&module_name));
     }
 }
 

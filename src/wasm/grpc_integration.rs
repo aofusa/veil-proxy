@@ -35,7 +35,11 @@ pub fn on_grpc_initial_metadata(
     call_id: u32,
     headers: &[(String, String)],
 ) {
-    engine.on_grpc_receive_initial_metadata(module_name, call_id, headers);
+    futures::executor::block_on(engine.on_grpc_receive_initial_metadata(
+        module_name,
+        call_id,
+        headers,
+    ));
 }
 
 /// Notify a WASM module of a gRPC message
@@ -48,7 +52,7 @@ pub fn on_grpc_message(
     call_id: u32,
     message: &[u8],
 ) {
-    engine.on_grpc_receive(module_name, call_id, message);
+    futures::executor::block_on(engine.on_grpc_receive(module_name, call_id, message));
 }
 
 /// Notify a WASM module of gRPC trailing metadata
@@ -61,7 +65,11 @@ pub fn on_grpc_trailing_metadata(
     call_id: u32,
     trailers: &[(String, String)],
 ) {
-    engine.on_grpc_receive_trailing_metadata(module_name, call_id, trailers);
+    futures::executor::block_on(engine.on_grpc_receive_trailing_metadata(
+        module_name,
+        call_id,
+        trailers,
+    ));
 }
 
 /// Notify a WASM module that a gRPC call has closed
@@ -74,7 +82,7 @@ pub fn on_grpc_close(
     call_id: u32,
     status_code: i32,
 ) {
-    engine.on_grpc_close(module_name, call_id, status_code);
+    futures::executor::block_on(engine.on_grpc_close(module_name, call_id, status_code));
 }
 
 /// Process a complete gRPC response

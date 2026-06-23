@@ -635,14 +635,16 @@ impl Http3Handler {
                         .map(|h| (h.name().to_vec(), h.value().to_vec()))
                         .collect();
 
-                    let wasm_result = wasm_engine.on_request_headers_with_modules(
-                        &modules_to_apply,
-                        path_str,
-                        method_str,
-                        headers_vec,
-                        &self.client_ip,
-                        request_body.is_empty(), // end_of_stream
-                    );
+                    let wasm_result = wasm_engine
+                        .on_request_headers_with_modules(
+                            &modules_to_apply,
+                            path_str,
+                            method_str,
+                            headers_vec,
+                            &self.client_ip,
+                            request_body.is_empty(), // end_of_stream
+                        )
+                        .await;
 
                     match wasm_result {
                         crate::wasm::FilterResult::LocalResponse(resp) => {

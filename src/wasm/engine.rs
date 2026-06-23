@@ -90,7 +90,7 @@ impl FilterEngine {
 
     /// Execute on_request_headers for specified modules (internal helper)
     #[allow(dead_code)]
-    fn execute_on_request_headers_for_modules(
+    async fn execute_on_request_headers_for_modules(
         &self,
         modules: &[Arc<LoadedModule>],
         path: &str,
@@ -111,14 +111,16 @@ impl FilterEngine {
         for module in modules {
             // F-09: WASM フィルタ実行時間を計測
             let _wasm_start = std::time::Instant::now();
-            let result = self.execute_on_request_headers(
-                module,
-                path,
-                method,
-                &current_headers,
-                client_ip,
-                end_of_stream,
-            );
+            let result = self
+                .execute_on_request_headers(
+                    module,
+                    path,
+                    method,
+                    &current_headers,
+                    client_ip,
+                    end_of_stream,
+                )
+                .await;
             crate::metrics::observe_wasm_filter_duration(
                 &module.name,
                 "request_headers",
@@ -151,7 +153,7 @@ impl FilterEngine {
     }
 
     /// Execute on_request_headers for specified modules
-    pub fn on_request_headers_with_modules(
+    pub async fn on_request_headers_with_modules(
         &self,
         module_names: &[String],
         path: &str,
@@ -175,14 +177,16 @@ impl FilterEngine {
         let mut current_headers = headers;
 
         for module in &modules {
-            let result = self.execute_on_request_headers(
-                module,
-                path,
-                method,
-                &current_headers,
-                client_ip,
-                end_of_stream,
-            );
+            let result = self
+                .execute_on_request_headers(
+                    module,
+                    path,
+                    method,
+                    &current_headers,
+                    client_ip,
+                    end_of_stream,
+                )
+                .await;
 
             match result {
                 Ok(ModuleResult::Continue { modified_headers }) => {
@@ -228,10 +232,11 @@ impl FilterEngine {
             &client_ip,
             end_of_stream,
         )
+        .await
     }
 
     /// Execute on_request_headers for a single module
-    fn execute_on_request_headers(
+    async fn execute_on_request_headers(
         &self,
         module: &LoadedModule,
         path: &str,
@@ -250,10 +255,11 @@ impl FilterEngine {
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
         store.set_fuel(self.fuel_limit)?;
+        store.fuel_async_yield_interval(Some(10_000))?;
         store.set_epoch_deadline(self.epoch_deadline);
 
         // Instantiate module
-        let instance = module.instance_pre.instantiate(&mut store)?;
+        let instance = module.instance_pre.instantiate_async(&mut store).await?;
 
         // === Proxy-Wasm SDK Lifecycle ===
         // The SDK requires these callbacks in EXACT order:
@@ -267,12 +273,12 @@ impl FilterEngine {
         // Step 0: Call _start to initialize the SDK
         // This is where set_root_context() is called in the proxy-wasm Rust SDK
         if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
-            match func.call(&mut store, ()) {
+            match func.call_async(&mut store, ()).await {
                 Ok(()) => ftlog::debug!("[wasm:{}] _start() OK", module.name),
                 Err(e) => ftlog::error!("[wasm:{}] _start() failed: {}", module.name, e),
             }
         } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
-            match func.call(&mut store, ()) {
+            match func.call_async(&mut store, ()).await {
                 Ok(()) => ftlog::debug!("[wasm:{}] _initialize() OK", module.name),
                 Err(e) => ftlog::error!("[wasm:{}] _initialize() failed: {}", module.name, e),
             }
@@ -293,7 +299,7 @@ impl FilterEngine {
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
         {
-            match func.call(&mut store, (root_context_id, 0)) {
+            match func.call_async(&mut store, (root_context_id, 0)).await {
                 Ok(()) => ftlog::debug!(
                     "[wasm:{}] proxy_on_context_create({}, 0) OK",
                     module.name,
@@ -317,7 +323,10 @@ impl FilterEngine {
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
         {
-            match func.call(&mut store, (root_context_id, config_size)) {
+            match func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await
+            {
                 Ok(ret) => ftlog::debug!(
                     "[wasm:{}] proxy_on_vm_start({}, {}) => {}",
                     module.name,
@@ -333,7 +342,10 @@ impl FilterEngine {
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
         {
-            match func.call(&mut store, (root_context_id, config_size)) {
+            match func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await
+            {
                 Ok(ret) => ftlog::debug!(
                     "[wasm:{}] proxy_on_configure({}, {}) => {}",
                     module.name,
@@ -350,7 +362,10 @@ impl FilterEngine {
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
         {
-            match func.call(&mut store, (http_context_id, root_context_id)) {
+            match func
+                .call_async(&mut store, (http_context_id, root_context_id))
+                .await
+            {
                 Ok(()) => ftlog::debug!(
                     "[wasm:{}] proxy_on_context_create({}, {}) OK",
                     module.name,
@@ -375,7 +390,8 @@ impl FilterEngine {
             Ok(func) => {
                 let num_headers = headers.len() as i32;
                 let eos = if end_of_stream { 1 } else { 0 };
-                func.call(&mut store, (http_context_id, num_headers, eos))?
+                func.call_async(&mut store, (http_context_id, num_headers, eos))
+                    .await?
             }
             Err(_) => {
                 // Callback not exported, continue
@@ -420,7 +436,7 @@ impl FilterEngine {
     }
 
     /// Execute on_response_headers for specified modules
-    pub fn on_response_headers_with_modules(
+    pub async fn on_response_headers_with_modules(
         &self,
         module_names: &[String],
         status: u16,
@@ -445,8 +461,9 @@ impl FilterEngine {
         for module in modules.iter().rev() {
             // F-09: WASM フィルタ実行時間を計測
             let _wasm_start = std::time::Instant::now();
-            let result =
-                self.execute_on_response_headers(module, status, &current_headers, end_of_stream);
+            let result = self
+                .execute_on_response_headers(module, status, &current_headers, end_of_stream)
+                .await;
             crate::metrics::observe_wasm_filter_duration(
                 &module.name,
                 "response_headers",
@@ -487,10 +504,11 @@ impl FilterEngine {
         end_of_stream: bool,
     ) -> FilterResult {
         self.on_response_headers_with_modules(&module_names, status, headers, end_of_stream)
+            .await
     }
 
     /// Execute on_response_headers for a single module
-    fn execute_on_response_headers(
+    async fn execute_on_response_headers(
         &self,
         module: &LoadedModule,
         status: u16,
@@ -506,18 +524,19 @@ impl FilterEngine {
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
         store.set_fuel(self.fuel_limit)?;
+        store.fuel_async_yield_interval(Some(10_000))?;
         store.set_epoch_deadline(self.epoch_deadline);
         self.registry.engine().increment_epoch();
 
         // Instantiate module
-        let instance = module.instance_pre.instantiate(&mut store)?;
+        let instance = module.instance_pre.instantiate_async(&mut store).await?;
 
         // === Proxy-Wasm SDK Lifecycle ===
         // Step 0: Call _start to initialize the SDK
         if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
-            let _ = func.call(&mut store, ());
+            let _ = func.call_async(&mut store, ()).await;
         } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
-            let _ = func.call(&mut store, ());
+            let _ = func.call_async(&mut store, ()).await;
         }
 
         let root_context_id = 1i32; // Root context ID
@@ -528,28 +547,34 @@ impl FilterEngine {
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
         {
-            let _ = func.call(&mut store, (root_context_id, 0));
+            let _ = func.call_async(&mut store, (root_context_id, 0)).await;
         }
 
         // Step 2: Call proxy_on_vm_start
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
         {
-            let _ = func.call(&mut store, (root_context_id, config_size));
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
         }
 
         // Step 3: Call proxy_on_configure
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
         {
-            let _ = func.call(&mut store, (root_context_id, config_size));
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
         }
 
         // Step 4: Create HTTP context with root as parent
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
         {
-            let _ = func.call(&mut store, (http_context_id, root_context_id));
+            let _ = func
+                .call_async(&mut store, (http_context_id, root_context_id))
+                .await;
         }
 
         // Now call proxy_on_response_headers
@@ -560,7 +585,8 @@ impl FilterEngine {
             Ok(func) => {
                 let num_headers = headers.len() as i32;
                 let eos = if end_of_stream { 1 } else { 0 };
-                func.call(&mut store, (http_context_id, num_headers, eos))?
+                func.call_async(&mut store, (http_context_id, num_headers, eos))
+                    .await?
             }
             Err(_) => 0,
         };
@@ -593,7 +619,7 @@ impl FilterEngine {
     ///
     /// This should be called after an HTTP call completes to deliver the response
     /// back to the WASM module.
-    pub fn on_http_call_response(
+    pub async fn on_http_call_response(
         &self,
         module_name: &str,
         token: u32,
@@ -613,7 +639,10 @@ impl FilterEngine {
             }
         };
 
-        match self.execute_on_http_call_response(&module, token, response) {
+        match self
+            .execute_on_http_call_response(&module, token, response)
+            .await
+        {
             Ok(result) => match result {
                 ModuleResult::Continue { modified_headers } => FilterResult::Continue {
                     headers: modified_headers.unwrap_or_default(),
@@ -633,7 +662,7 @@ impl FilterEngine {
     }
 
     /// Execute on_http_call_response for a single module
-    fn execute_on_http_call_response(
+    async fn execute_on_http_call_response(
         &self,
         module: &LoadedModule,
         token: u32,
@@ -652,18 +681,19 @@ impl FilterEngine {
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
         store.set_fuel(self.fuel_limit)?;
+        store.fuel_async_yield_interval(Some(10_000))?;
         store.set_epoch_deadline(self.epoch_deadline);
         self.registry.engine().increment_epoch();
 
         // Instantiate module
-        let instance = module.instance_pre.instantiate(&mut store)?;
+        let instance = module.instance_pre.instantiate_async(&mut store).await?;
 
         // === Proxy-Wasm SDK Lifecycle ===
         // Step 0: Call _start
         if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
-            let _ = func.call(&mut store, ());
+            let _ = func.call_async(&mut store, ()).await;
         } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
-            let _ = func.call(&mut store, ());
+            let _ = func.call_async(&mut store, ()).await;
         }
 
         let root_context_id = 1i32;
@@ -674,28 +704,34 @@ impl FilterEngine {
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
         {
-            let _ = func.call(&mut store, (root_context_id, 0));
+            let _ = func.call_async(&mut store, (root_context_id, 0)).await;
         }
 
         // Step 2: Call proxy_on_vm_start
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
         {
-            let _ = func.call(&mut store, (root_context_id, config_size));
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
         }
 
         // Step 3: Call proxy_on_configure
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
         {
-            let _ = func.call(&mut store, (root_context_id, config_size));
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
         }
 
         // Step 4: Create HTTP context with root as parent
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
         {
-            let _ = func.call(&mut store, (http_context_id, root_context_id));
+            let _ = func
+                .call_async(&mut store, (http_context_id, root_context_id))
+                .await;
         }
 
         // Call proxy_on_http_call_response
@@ -756,7 +792,7 @@ impl FilterEngine {
     ///
     /// Processes request body chunks through WASM modules.
     /// Returns potentially modified body data.
-    pub fn on_request_body_with_modules(
+    pub async fn on_request_body_with_modules(
         &self,
         module_names: &[String],
         body: &[u8],
@@ -776,7 +812,9 @@ impl FilterEngine {
         let mut current_body = body.to_vec();
 
         for module in &modules {
-            let result = self.execute_on_request_body(module, &current_body, end_of_stream);
+            let result = self
+                .execute_on_request_body(module, &current_body, end_of_stream)
+                .await;
 
             match result {
                 Ok(BodyModuleResult::Continue { modified_body }) => {
@@ -809,10 +847,11 @@ impl FilterEngine {
         end_of_stream: bool,
     ) -> BodyFilterResult {
         self.on_request_body_with_modules(&module_names, &body, end_of_stream)
+            .await
     }
 
     /// Execute on_request_body for a single module
-    fn execute_on_request_body(
+    async fn execute_on_request_body(
         &self,
         module: &LoadedModule,
         body: &[u8],
@@ -835,17 +874,18 @@ impl FilterEngine {
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
         store.set_fuel(self.fuel_limit)?;
+        store.fuel_async_yield_interval(Some(10_000))?;
         store.set_epoch_deadline(self.epoch_deadline);
         self.registry.engine().increment_epoch();
 
         // Instantiate module
-        let instance = module.instance_pre.instantiate(&mut store)?;
+        let instance = module.instance_pre.instantiate_async(&mut store).await?;
 
         // Proxy-Wasm SDK Lifecycle
         if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
-            let _ = func.call(&mut store, ());
+            let _ = func.call_async(&mut store, ()).await;
         } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
-            let _ = func.call(&mut store, ());
+            let _ = func.call_async(&mut store, ()).await;
         }
 
         let root_context_id = 1i32;
@@ -855,25 +895,31 @@ impl FilterEngine {
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
         {
-            let _ = func.call(&mut store, (root_context_id, 0));
+            let _ = func.call_async(&mut store, (root_context_id, 0)).await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
         {
-            let _ = func.call(&mut store, (root_context_id, config_size));
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
         {
-            let _ = func.call(&mut store, (root_context_id, config_size));
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
         {
-            let _ = func.call(&mut store, (http_context_id, root_context_id));
+            let _ = func
+                .call_async(&mut store, (http_context_id, root_context_id))
+                .await;
         }
 
         // Call proxy_on_request_body
@@ -885,7 +931,8 @@ impl FilterEngine {
             Ok(func) => {
                 let body_size = body.len() as i32;
                 let eos = if end_of_stream { 1 } else { 0 };
-                func.call(&mut store, (http_context_id, body_size, eos))?
+                func.call_async(&mut store, (http_context_id, body_size, eos))
+                    .await?
             }
             Err(_) => 0, // Continue if not exported
         };
@@ -913,7 +960,7 @@ impl FilterEngine {
     ///
     /// Processes response body chunks through WASM modules (in reverse order).
     /// Returns potentially modified body data.
-    pub fn on_response_body_with_modules(
+    pub async fn on_response_body_with_modules(
         &self,
         module_names: &[String],
         body: &[u8],
@@ -934,7 +981,9 @@ impl FilterEngine {
 
         // Execute in reverse order for response
         for module in modules.iter().rev() {
-            let result = self.execute_on_response_body(module, &current_body, end_of_stream);
+            let result = self
+                .execute_on_response_body(module, &current_body, end_of_stream)
+                .await;
 
             match result {
                 Ok(BodyModuleResult::Continue { modified_body }) => {
@@ -966,10 +1015,11 @@ impl FilterEngine {
         end_of_stream: bool,
     ) -> BodyFilterResult {
         self.on_response_body_with_modules(&module_names, &body, end_of_stream)
+            .await
     }
 
     /// Execute on_response_body for a single module
-    fn execute_on_response_body(
+    async fn execute_on_response_body(
         &self,
         module: &LoadedModule,
         body: &[u8],
@@ -992,17 +1042,18 @@ impl FilterEngine {
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
         store.set_fuel(self.fuel_limit)?;
+        store.fuel_async_yield_interval(Some(10_000))?;
         store.set_epoch_deadline(self.epoch_deadline);
         self.registry.engine().increment_epoch();
 
         // Instantiate module
-        let instance = module.instance_pre.instantiate(&mut store)?;
+        let instance = module.instance_pre.instantiate_async(&mut store).await?;
 
         // Proxy-Wasm SDK Lifecycle
         if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
-            let _ = func.call(&mut store, ());
+            let _ = func.call_async(&mut store, ()).await;
         } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
-            let _ = func.call(&mut store, ());
+            let _ = func.call_async(&mut store, ()).await;
         }
 
         let root_context_id = 1i32;
@@ -1012,25 +1063,31 @@ impl FilterEngine {
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
         {
-            let _ = func.call(&mut store, (root_context_id, 0));
+            let _ = func.call_async(&mut store, (root_context_id, 0)).await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
         {
-            let _ = func.call(&mut store, (root_context_id, config_size));
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
         {
-            let _ = func.call(&mut store, (root_context_id, config_size));
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
         {
-            let _ = func.call(&mut store, (http_context_id, root_context_id));
+            let _ = func
+                .call_async(&mut store, (http_context_id, root_context_id))
+                .await;
         }
 
         // Call proxy_on_response_body
@@ -1042,7 +1099,8 @@ impl FilterEngine {
             Ok(func) => {
                 let body_size = body.len() as i32;
                 let eos = if end_of_stream { 1 } else { 0 };
-                func.call(&mut store, (http_context_id, body_size, eos))?
+                func.call_async(&mut store, (http_context_id, body_size, eos))
+                    .await?
             }
             Err(_) => 0, // Continue if not exported
         };
@@ -1070,14 +1128,14 @@ impl FilterEngine {
     ///
     /// Called at the end of HTTP request processing (log phase).
     /// This is the final callback before the stream is closed.
-    pub fn on_log_with_modules(&self, module_names: &[String]) {
+    pub async fn on_log_with_modules(&self, module_names: &[String]) {
         let modules: Vec<Arc<LoadedModule>> = module_names
             .iter()
             .filter_map(|name| self.registry.get_module(name))
             .collect();
 
         for module in &modules {
-            if let Err(e) = self.execute_on_log(module) {
+            if let Err(e) = self.execute_on_log(module).await {
                 ftlog::error!("[wasm:{}] on_log error: {}", module.name, e);
             }
         }
@@ -1086,27 +1144,28 @@ impl FilterEngine {
     /// Execute on_log for specified modules ASYNCHRONOUSLY
     /// Note: runs inline in the current async task to avoid cross-thread waker issues with monoio.
     pub async fn on_log_with_modules_async(self: Arc<Self>, module_names: Vec<String>) {
-        self.on_log_with_modules(&module_names);
+        self.on_log_with_modules(&module_names).await;
     }
 
     /// Execute on_log for a single module
-    fn execute_on_log(&self, module: &LoadedModule) -> anyhow::Result<()> {
+    async fn execute_on_log(&self, module: &LoadedModule) -> anyhow::Result<()> {
         // Create context
         let http_ctx = HttpContext::new(1, module.capabilities.clone());
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
         store.set_fuel(self.fuel_limit)?;
+        store.fuel_async_yield_interval(Some(10_000))?;
         store.set_epoch_deadline(self.epoch_deadline);
         self.registry.engine().increment_epoch();
 
         // Instantiate module
-        let instance = module.instance_pre.instantiate(&mut store)?;
+        let instance = module.instance_pre.instantiate_async(&mut store).await?;
 
         // Initialize module
         if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
-            let _ = func.call(&mut store, ());
+            let _ = func.call_async(&mut store, ()).await;
         } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
-            let _ = func.call(&mut store, ());
+            let _ = func.call_async(&mut store, ()).await;
         }
 
         let root_context_id = 1i32;
@@ -1117,31 +1176,37 @@ impl FilterEngine {
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
         {
-            let _ = func.call(&mut store, (root_context_id, 0));
+            let _ = func.call_async(&mut store, (root_context_id, 0)).await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
         {
-            let _ = func.call(&mut store, (root_context_id, config_size));
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
         {
-            let _ = func.call(&mut store, (root_context_id, config_size));
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
         {
-            let _ = func.call(&mut store, (http_context_id, root_context_id));
+            let _ = func
+                .call_async(&mut store, (http_context_id, root_context_id))
+                .await;
         }
 
         // Call proxy_on_log
         // Signature: (context_id) -> void
         if let Ok(func) = instance.get_typed_func::<i32, ()>(&mut store, "proxy_on_log") {
-            match func.call(&mut store, http_context_id) {
+            match func.call_async(&mut store, http_context_id).await {
                 Ok(()) => {
                     ftlog::debug!(
                         "[wasm:{}] proxy_on_log({}) OK",
@@ -1160,7 +1225,7 @@ impl FilterEngine {
     ///
     /// Called when an HTTP context is being deleted.
     /// Returns true if the module wants to keep the context alive (async operation pending).
-    pub fn on_done_with_modules(&self, module_names: &[String]) -> bool {
+    pub async fn on_done_with_modules(&self, module_names: &[String]) -> bool {
         let modules: Vec<Arc<LoadedModule>> = module_names
             .iter()
             .filter_map(|name| self.registry.get_module(name))
@@ -1169,7 +1234,7 @@ impl FilterEngine {
         let mut any_pending = false;
 
         for module in &modules {
-            match self.execute_on_done(module) {
+            match self.execute_on_done(module).await {
                 Ok(keep_alive) => {
                     if keep_alive {
                         any_pending = true;
@@ -1185,23 +1250,24 @@ impl FilterEngine {
     }
 
     /// Execute on_done for a single module
-    fn execute_on_done(&self, module: &LoadedModule) -> anyhow::Result<bool> {
+    async fn execute_on_done(&self, module: &LoadedModule) -> anyhow::Result<bool> {
         // Create context
         let http_ctx = HttpContext::new(1, module.capabilities.clone());
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
         store.set_fuel(self.fuel_limit)?;
+        store.fuel_async_yield_interval(Some(10_000))?;
         store.set_epoch_deadline(self.epoch_deadline);
         self.registry.engine().increment_epoch();
 
         // Instantiate module
-        let instance = module.instance_pre.instantiate(&mut store)?;
+        let instance = module.instance_pre.instantiate_async(&mut store).await?;
 
         // Initialize module
         if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
-            let _ = func.call(&mut store, ());
+            let _ = func.call_async(&mut store, ()).await;
         } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
-            let _ = func.call(&mut store, ());
+            let _ = func.call_async(&mut store, ()).await;
         }
 
         let root_context_id = 1i32;
@@ -1212,31 +1278,37 @@ impl FilterEngine {
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
         {
-            let _ = func.call(&mut store, (root_context_id, 0));
+            let _ = func.call_async(&mut store, (root_context_id, 0)).await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
         {
-            let _ = func.call(&mut store, (root_context_id, config_size));
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
         {
-            let _ = func.call(&mut store, (root_context_id, config_size));
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
         {
-            let _ = func.call(&mut store, (http_context_id, root_context_id));
+            let _ = func
+                .call_async(&mut store, (http_context_id, root_context_id))
+                .await;
         }
 
         // Call proxy_on_done
         // Signature: (context_id) -> bool (1 = keep alive, 0 = delete)
         if let Ok(func) = instance.get_typed_func::<i32, i32>(&mut store, "proxy_on_done") {
-            match func.call(&mut store, http_context_id) {
+            match func.call_async(&mut store, http_context_id).await {
                 Ok(result) => {
                     ftlog::debug!(
                         "[wasm:{}] proxy_on_done({}) => {}",
@@ -1257,35 +1329,36 @@ impl FilterEngine {
     ///
     /// Called periodically based on the tick period set by the module.
     /// This should be called on the root context.
-    pub fn on_tick(&self, module_name: &str) {
+    pub async fn on_tick(&self, module_name: &str) {
         let module = match self.registry.get_module(module_name) {
             Some(m) => m,
             None => return,
         };
 
-        if let Err(e) = self.execute_on_tick(&module) {
+        if let Err(e) = self.execute_on_tick(&module).await {
             ftlog::error!("[wasm:{}] on_tick error: {}", module_name, e);
         }
     }
 
     /// Execute on_tick for a single module
-    fn execute_on_tick(&self, module: &LoadedModule) -> anyhow::Result<()> {
+    async fn execute_on_tick(&self, module: &LoadedModule) -> anyhow::Result<()> {
         // Create context
         let http_ctx = HttpContext::new(1, module.capabilities.clone());
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
         store.set_fuel(self.fuel_limit)?;
+        store.fuel_async_yield_interval(Some(10_000))?;
         store.set_epoch_deadline(self.epoch_deadline);
         self.registry.engine().increment_epoch();
 
         // Instantiate module
-        let instance = module.instance_pre.instantiate(&mut store)?;
+        let instance = module.instance_pre.instantiate_async(&mut store).await?;
 
         // Initialize module
         if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
-            let _ = func.call(&mut store, ());
+            let _ = func.call_async(&mut store, ()).await;
         } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
-            let _ = func.call(&mut store, ());
+            let _ = func.call_async(&mut store, ()).await;
         }
 
         let root_context_id = 1i32;
@@ -1295,25 +1368,29 @@ impl FilterEngine {
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
         {
-            let _ = func.call(&mut store, (root_context_id, 0));
+            let _ = func.call_async(&mut store, (root_context_id, 0)).await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
         {
-            let _ = func.call(&mut store, (root_context_id, config_size));
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
         {
-            let _ = func.call(&mut store, (root_context_id, config_size));
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
         }
 
         // Call proxy_on_tick on root context
         // Signature: (context_id) -> void
         if let Ok(func) = instance.get_typed_func::<i32, ()>(&mut store, "proxy_on_tick") {
-            match func.call(&mut store, root_context_id) {
+            match func.call_async(&mut store, root_context_id).await {
                 Ok(()) => {
                     ftlog::debug!(
                         "[wasm:{}] proxy_on_tick({}) OK",
@@ -1331,7 +1408,7 @@ impl FilterEngine {
     /// Execute on_request_trailers callback for specified modules
     ///
     /// Called when request trailers are received (HTTP/2, gRPC).
-    pub fn on_request_trailers_with_modules(
+    pub async fn on_request_trailers_with_modules(
         &self,
         module_names: &[String],
         trailers: Vec<(Vec<u8>, Vec<u8>)>,
@@ -1351,7 +1428,9 @@ impl FilterEngine {
         let mut current_trailers = trailers;
 
         for module in &modules {
-            let result = self.execute_on_request_trailers(module, &current_trailers);
+            let result = self
+                .execute_on_request_trailers(module, &current_trailers)
+                .await;
 
             match result {
                 Ok(ModuleResult::Continue { modified_headers }) => {
@@ -1378,7 +1457,7 @@ impl FilterEngine {
     }
 
     /// Execute on_request_trailers for a single module
-    fn execute_on_request_trailers(
+    async fn execute_on_request_trailers(
         &self,
         module: &LoadedModule,
         trailers: &[(Vec<u8>, Vec<u8>)],
@@ -1393,17 +1472,18 @@ impl FilterEngine {
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
         store.set_fuel(self.fuel_limit)?;
+        store.fuel_async_yield_interval(Some(10_000))?;
         store.set_epoch_deadline(self.epoch_deadline);
         self.registry.engine().increment_epoch();
 
         // Instantiate module
-        let instance = module.instance_pre.instantiate(&mut store)?;
+        let instance = module.instance_pre.instantiate_async(&mut store).await?;
 
         // Initialize
         if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
-            let _ = func.call(&mut store, ());
+            let _ = func.call_async(&mut store, ()).await;
         } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
-            let _ = func.call(&mut store, ());
+            let _ = func.call_async(&mut store, ()).await;
         }
 
         let root_context_id = 1i32;
@@ -1413,25 +1493,31 @@ impl FilterEngine {
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
         {
-            let _ = func.call(&mut store, (root_context_id, 0));
+            let _ = func.call_async(&mut store, (root_context_id, 0)).await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
         {
-            let _ = func.call(&mut store, (root_context_id, config_size));
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
         {
-            let _ = func.call(&mut store, (root_context_id, config_size));
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
         {
-            let _ = func.call(&mut store, (http_context_id, root_context_id));
+            let _ = func
+                .call_async(&mut store, (http_context_id, root_context_id))
+                .await;
         }
 
         // Call proxy_on_request_trailers
@@ -1442,7 +1528,8 @@ impl FilterEngine {
         let action = match callback {
             Ok(func) => {
                 let num_trailers = trailers.len() as i32;
-                func.call(&mut store, (http_context_id, num_trailers))?
+                func.call_async(&mut store, (http_context_id, num_trailers))
+                    .await?
             }
             Err(_) => 0,
         };
@@ -1469,7 +1556,7 @@ impl FilterEngine {
     /// Execute on_response_trailers callback for specified modules
     ///
     /// Called when response trailers are received (HTTP/2, gRPC).
-    pub fn on_response_trailers_with_modules(
+    pub async fn on_response_trailers_with_modules(
         &self,
         module_names: &[String],
         trailers: Vec<(Vec<u8>, Vec<u8>)>,
@@ -1490,7 +1577,9 @@ impl FilterEngine {
 
         // Execute in reverse order for response
         for module in modules.iter().rev() {
-            let result = self.execute_on_response_trailers(module, &current_trailers);
+            let result = self
+                .execute_on_response_trailers(module, &current_trailers)
+                .await;
 
             match result {
                 Ok(ModuleResult::Continue { modified_headers }) => {
@@ -1517,7 +1606,7 @@ impl FilterEngine {
     }
 
     /// Execute on_response_trailers for a single module
-    fn execute_on_response_trailers(
+    async fn execute_on_response_trailers(
         &self,
         module: &LoadedModule,
         trailers: &[(Vec<u8>, Vec<u8>)],
@@ -1532,17 +1621,18 @@ impl FilterEngine {
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
         store.set_fuel(self.fuel_limit)?;
+        store.fuel_async_yield_interval(Some(10_000))?;
         store.set_epoch_deadline(self.epoch_deadline);
         self.registry.engine().increment_epoch();
 
         // Instantiate module
-        let instance = module.instance_pre.instantiate(&mut store)?;
+        let instance = module.instance_pre.instantiate_async(&mut store).await?;
 
         // Initialize
         if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
-            let _ = func.call(&mut store, ());
+            let _ = func.call_async(&mut store, ()).await;
         } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
-            let _ = func.call(&mut store, ());
+            let _ = func.call_async(&mut store, ()).await;
         }
 
         let root_context_id = 1i32;
@@ -1552,25 +1642,31 @@ impl FilterEngine {
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
         {
-            let _ = func.call(&mut store, (root_context_id, 0));
+            let _ = func.call_async(&mut store, (root_context_id, 0)).await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
         {
-            let _ = func.call(&mut store, (root_context_id, config_size));
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
         {
-            let _ = func.call(&mut store, (root_context_id, config_size));
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
         {
-            let _ = func.call(&mut store, (http_context_id, root_context_id));
+            let _ = func
+                .call_async(&mut store, (http_context_id, root_context_id))
+                .await;
         }
 
         // Call proxy_on_response_trailers
@@ -1581,7 +1677,8 @@ impl FilterEngine {
         let action = match callback {
             Ok(func) => {
                 let num_trailers = trailers.len() as i32;
-                func.call(&mut store, (http_context_id, num_trailers))?
+                func.call_async(&mut store, (http_context_id, num_trailers))
+                    .await?
             }
             Err(_) => 0,
         };
@@ -1608,35 +1705,40 @@ impl FilterEngine {
     /// Execute on_queue_ready callback for a module
     ///
     /// Called when a message is enqueued to a shared queue that the module is subscribed to.
-    pub fn on_queue_ready(&self, module_name: &str, queue_id: u32) {
+    pub async fn on_queue_ready(&self, module_name: &str, queue_id: u32) {
         let module = match self.registry.get_module(module_name) {
             Some(m) => m,
             None => return,
         };
 
-        if let Err(e) = self.execute_on_queue_ready(&module, queue_id) {
+        if let Err(e) = self.execute_on_queue_ready(&module, queue_id).await {
             ftlog::error!("[wasm:{}] on_queue_ready error: {}", module_name, e);
         }
     }
 
     /// Execute on_queue_ready for a single module
-    fn execute_on_queue_ready(&self, module: &LoadedModule, queue_id: u32) -> anyhow::Result<()> {
+    async fn execute_on_queue_ready(
+        &self,
+        module: &LoadedModule,
+        queue_id: u32,
+    ) -> anyhow::Result<()> {
         // Create context
         let http_ctx = HttpContext::new(1, module.capabilities.clone());
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
         store.set_fuel(self.fuel_limit)?;
+        store.fuel_async_yield_interval(Some(10_000))?;
         store.set_epoch_deadline(self.epoch_deadline);
         self.registry.engine().increment_epoch();
 
         // Instantiate module
-        let instance = module.instance_pre.instantiate(&mut store)?;
+        let instance = module.instance_pre.instantiate_async(&mut store).await?;
 
         // Initialize module
         if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
-            let _ = func.call(&mut store, ());
+            let _ = func.call_async(&mut store, ()).await;
         } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
-            let _ = func.call(&mut store, ());
+            let _ = func.call_async(&mut store, ()).await;
         }
 
         let root_context_id = 1i32;
@@ -1646,19 +1748,23 @@ impl FilterEngine {
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
         {
-            let _ = func.call(&mut store, (root_context_id, 0));
+            let _ = func.call_async(&mut store, (root_context_id, 0)).await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
         {
-            let _ = func.call(&mut store, (root_context_id, config_size));
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
         {
-            let _ = func.call(&mut store, (root_context_id, config_size));
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
         }
 
         // Call proxy_on_queue_ready
@@ -1666,7 +1772,10 @@ impl FilterEngine {
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_queue_ready")
         {
-            match func.call(&mut store, (root_context_id, queue_id as i32)) {
+            match func
+                .call_async(&mut store, (root_context_id, queue_id as i32))
+                .await
+            {
                 Ok(()) => {
                     ftlog::debug!(
                         "[wasm:{}] proxy_on_queue_ready({}, {}) OK",
@@ -1690,7 +1799,7 @@ impl FilterEngine {
     ///
     /// Called when initial metadata is received from a gRPC call.
     #[cfg(feature = "grpc")]
-    pub fn on_grpc_receive_initial_metadata(
+    pub async fn on_grpc_receive_initial_metadata(
         &self,
         module_name: &str,
         call_id: u32,
@@ -1701,7 +1810,10 @@ impl FilterEngine {
             None => return,
         };
 
-        if let Err(e) = self.execute_on_grpc_receive_initial_metadata(&module, call_id, headers) {
+        if let Err(e) = self
+            .execute_on_grpc_receive_initial_metadata(&module, call_id, headers)
+            .await
+        {
             ftlog::error!(
                 "[wasm:{}] on_grpc_receive_initial_metadata error: {}",
                 module_name,
@@ -1711,7 +1823,7 @@ impl FilterEngine {
     }
 
     #[cfg(feature = "grpc")]
-    fn execute_on_grpc_receive_initial_metadata(
+    async fn execute_on_grpc_receive_initial_metadata(
         &self,
         module: &LoadedModule,
         call_id: u32,
@@ -1725,16 +1837,17 @@ impl FilterEngine {
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
         store.set_fuel(self.fuel_limit)?;
+        store.fuel_async_yield_interval(Some(10_000))?;
         store.set_epoch_deadline(self.epoch_deadline);
         self.registry.engine().increment_epoch();
 
-        let instance = module.instance_pre.instantiate(&mut store)?;
+        let instance = module.instance_pre.instantiate_async(&mut store).await?;
 
         // Initialize
         if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
-            let _ = func.call(&mut store, ());
+            let _ = func.call_async(&mut store, ()).await;
         } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
-            let _ = func.call(&mut store, ());
+            let _ = func.call_async(&mut store, ()).await;
         }
 
         let root_context_id = 1i32;
@@ -1744,25 +1857,31 @@ impl FilterEngine {
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
         {
-            let _ = func.call(&mut store, (root_context_id, 0));
+            let _ = func.call_async(&mut store, (root_context_id, 0)).await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
         {
-            let _ = func.call(&mut store, (root_context_id, config_size));
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
         {
-            let _ = func.call(&mut store, (root_context_id, config_size));
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
         {
-            let _ = func.call(&mut store, (http_context_id, root_context_id));
+            let _ = func
+                .call_async(&mut store, (http_context_id, root_context_id))
+                .await;
         }
 
         // Call proxy_on_grpc_receive_initial_metadata
@@ -1772,7 +1891,10 @@ impl FilterEngine {
             "proxy_on_grpc_receive_initial_metadata",
         ) {
             let num_headers = headers.len() as i32;
-            match func.call(&mut store, (http_context_id, call_id as i32, num_headers)) {
+            match func
+                .call_async(&mut store, (http_context_id, call_id as i32, num_headers))
+                .await
+            {
                 Ok(()) => {
                     ftlog::debug!(
                         "[wasm:{}] proxy_on_grpc_receive_initial_metadata({}, {}, {}) OK",
@@ -1797,19 +1919,22 @@ impl FilterEngine {
     ///
     /// Called when a gRPC message is received.
     #[cfg(feature = "grpc")]
-    pub fn on_grpc_receive(&self, module_name: &str, call_id: u32, message: &[u8]) {
+    pub async fn on_grpc_receive(&self, module_name: &str, call_id: u32, message: &[u8]) {
         let module = match self.registry.get_module(module_name) {
             Some(m) => m,
             None => return,
         };
 
-        if let Err(e) = self.execute_on_grpc_receive(&module, call_id, message) {
+        if let Err(e) = self
+            .execute_on_grpc_receive(&module, call_id, message)
+            .await
+        {
             ftlog::error!("[wasm:{}] on_grpc_receive error: {}", module_name, e);
         }
     }
 
     #[cfg(feature = "grpc")]
-    fn execute_on_grpc_receive(
+    async fn execute_on_grpc_receive(
         &self,
         module: &LoadedModule,
         call_id: u32,
@@ -1823,16 +1948,17 @@ impl FilterEngine {
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
         store.set_fuel(self.fuel_limit)?;
+        store.fuel_async_yield_interval(Some(10_000))?;
         store.set_epoch_deadline(self.epoch_deadline);
         self.registry.engine().increment_epoch();
 
-        let instance = module.instance_pre.instantiate(&mut store)?;
+        let instance = module.instance_pre.instantiate_async(&mut store).await?;
 
         // Initialize
         if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
-            let _ = func.call(&mut store, ());
+            let _ = func.call_async(&mut store, ()).await;
         } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
-            let _ = func.call(&mut store, ());
+            let _ = func.call_async(&mut store, ()).await;
         }
 
         let root_context_id = 1i32;
@@ -1842,25 +1968,31 @@ impl FilterEngine {
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
         {
-            let _ = func.call(&mut store, (root_context_id, 0));
+            let _ = func.call_async(&mut store, (root_context_id, 0)).await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
         {
-            let _ = func.call(&mut store, (root_context_id, config_size));
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
         {
-            let _ = func.call(&mut store, (root_context_id, config_size));
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
         {
-            let _ = func.call(&mut store, (http_context_id, root_context_id));
+            let _ = func
+                .call_async(&mut store, (http_context_id, root_context_id))
+                .await;
         }
 
         // Call proxy_on_grpc_receive
@@ -1869,7 +2001,10 @@ impl FilterEngine {
             instance.get_typed_func::<(i32, i32, i32), ()>(&mut store, "proxy_on_grpc_receive")
         {
             let message_size = message.len() as i32;
-            match func.call(&mut store, (http_context_id, call_id as i32, message_size)) {
+            match func
+                .call_async(&mut store, (http_context_id, call_id as i32, message_size))
+                .await
+            {
                 Ok(()) => {
                     ftlog::debug!(
                         "[wasm:{}] proxy_on_grpc_receive({}, {}, {}) OK",
@@ -1892,7 +2027,7 @@ impl FilterEngine {
     ///
     /// Called when trailing metadata is received from a gRPC call.
     #[cfg(feature = "grpc")]
-    pub fn on_grpc_receive_trailing_metadata(
+    pub async fn on_grpc_receive_trailing_metadata(
         &self,
         module_name: &str,
         call_id: u32,
@@ -1903,7 +2038,10 @@ impl FilterEngine {
             None => return,
         };
 
-        if let Err(e) = self.execute_on_grpc_receive_trailing_metadata(&module, call_id, trailers) {
+        if let Err(e) = self
+            .execute_on_grpc_receive_trailing_metadata(&module, call_id, trailers)
+            .await
+        {
             ftlog::error!(
                 "[wasm:{}] on_grpc_receive_trailing_metadata error: {}",
                 module_name,
@@ -1913,7 +2051,7 @@ impl FilterEngine {
     }
 
     #[cfg(feature = "grpc")]
-    fn execute_on_grpc_receive_trailing_metadata(
+    async fn execute_on_grpc_receive_trailing_metadata(
         &self,
         module: &LoadedModule,
         call_id: u32,
@@ -1927,16 +2065,17 @@ impl FilterEngine {
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
         store.set_fuel(self.fuel_limit)?;
+        store.fuel_async_yield_interval(Some(10_000))?;
         store.set_epoch_deadline(self.epoch_deadline);
         self.registry.engine().increment_epoch();
 
-        let instance = module.instance_pre.instantiate(&mut store)?;
+        let instance = module.instance_pre.instantiate_async(&mut store).await?;
 
         // Initialize
         if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
-            let _ = func.call(&mut store, ());
+            let _ = func.call_async(&mut store, ()).await;
         } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
-            let _ = func.call(&mut store, ());
+            let _ = func.call_async(&mut store, ()).await;
         }
 
         let root_context_id = 1i32;
@@ -1946,25 +2085,31 @@ impl FilterEngine {
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
         {
-            let _ = func.call(&mut store, (root_context_id, 0));
+            let _ = func.call_async(&mut store, (root_context_id, 0)).await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
         {
-            let _ = func.call(&mut store, (root_context_id, config_size));
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
         {
-            let _ = func.call(&mut store, (root_context_id, config_size));
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
         {
-            let _ = func.call(&mut store, (http_context_id, root_context_id));
+            let _ = func
+                .call_async(&mut store, (http_context_id, root_context_id))
+                .await;
         }
 
         // Call proxy_on_grpc_receive_trailing_metadata
@@ -1974,7 +2119,10 @@ impl FilterEngine {
             "proxy_on_grpc_receive_trailing_metadata",
         ) {
             let num_trailers = trailers.len() as i32;
-            match func.call(&mut store, (http_context_id, call_id as i32, num_trailers)) {
+            match func
+                .call_async(&mut store, (http_context_id, call_id as i32, num_trailers))
+                .await
+            {
                 Ok(()) => {
                     ftlog::debug!(
                         "[wasm:{}] proxy_on_grpc_receive_trailing_metadata({}, {}, {}) OK",
@@ -1999,19 +2147,22 @@ impl FilterEngine {
     ///
     /// Called when a gRPC call is closed.
     #[cfg(feature = "grpc")]
-    pub fn on_grpc_close(&self, module_name: &str, call_id: u32, status_code: i32) {
+    pub async fn on_grpc_close(&self, module_name: &str, call_id: u32, status_code: i32) {
         let module = match self.registry.get_module(module_name) {
             Some(m) => m,
             None => return,
         };
 
-        if let Err(e) = self.execute_on_grpc_close(&module, call_id, status_code) {
+        if let Err(e) = self
+            .execute_on_grpc_close(&module, call_id, status_code)
+            .await
+        {
             ftlog::error!("[wasm:{}] on_grpc_close error: {}", module_name, e);
         }
     }
 
     #[cfg(feature = "grpc")]
-    fn execute_on_grpc_close(
+    async fn execute_on_grpc_close(
         &self,
         module: &LoadedModule,
         call_id: u32,
@@ -2025,16 +2176,17 @@ impl FilterEngine {
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
         store.set_fuel(self.fuel_limit)?;
+        store.fuel_async_yield_interval(Some(10_000))?;
         store.set_epoch_deadline(self.epoch_deadline);
         self.registry.engine().increment_epoch();
 
-        let instance = module.instance_pre.instantiate(&mut store)?;
+        let instance = module.instance_pre.instantiate_async(&mut store).await?;
 
         // Initialize
         if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
-            let _ = func.call(&mut store, ());
+            let _ = func.call_async(&mut store, ()).await;
         } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
-            let _ = func.call(&mut store, ());
+            let _ = func.call_async(&mut store, ()).await;
         }
 
         let root_context_id = 1i32;
@@ -2044,25 +2196,31 @@ impl FilterEngine {
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
         {
-            let _ = func.call(&mut store, (root_context_id, 0));
+            let _ = func.call_async(&mut store, (root_context_id, 0)).await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
         {
-            let _ = func.call(&mut store, (root_context_id, config_size));
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
         {
-            let _ = func.call(&mut store, (root_context_id, config_size));
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
         }
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
         {
-            let _ = func.call(&mut store, (http_context_id, root_context_id));
+            let _ = func
+                .call_async(&mut store, (http_context_id, root_context_id))
+                .await;
         }
 
         // Call proxy_on_grpc_close
@@ -2070,7 +2228,10 @@ impl FilterEngine {
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32, i32), ()>(&mut store, "proxy_on_grpc_close")
         {
-            match func.call(&mut store, (http_context_id, call_id as i32, status_code)) {
+            match func
+                .call_async(&mut store, (http_context_id, call_id as i32, status_code))
+                .await
+            {
                 Ok(()) => {
                     ftlog::debug!(
                         "[wasm:{}] proxy_on_grpc_close({}, {}, {}) OK",
@@ -2127,4 +2288,62 @@ pub enum BodyFilterResult {
     Pause,
     /// Send a local response instead of proxying
     LocalResponse(LocalResponse),
+}
+
+#[cfg(test)]
+mod exec_smoke_tests {
+    use super::*;
+    use crate::wasm::types::{ModuleConfig, WasmConfig, WasmDefaults};
+
+    fn header_filter_engine() -> Option<FilterEngine> {
+        let path = "tests/fixtures/wasm/header_filter.wasm";
+        if !std::path::Path::new(path).exists() {
+            return None;
+        }
+        let config = WasmConfig {
+            enabled: true,
+            defaults: WasmDefaults::default(),
+            modules: vec![ModuleConfig {
+                name: "header_filter".to_string(),
+                path: path.to_string(),
+                configuration: String::new(),
+                capabilities: Default::default(),
+            }],
+        };
+        FilterEngine::new(&config).ok()
+    }
+
+    /// 実モジュール（header_filter.wasm）を実行し、パニックせずに完走することを検証する。
+    /// F-27 で async_support と同期 call が混在すると wasmtime が panic するため、
+    /// このテストが落ちれば WASM 実行パスが壊れていることを意味する。
+    #[test]
+    fn smoke_execute_request_headers_runs_without_panic() {
+        let engine = match header_filter_engine() {
+            Some(e) => e,
+            None => {
+                eprintln!("wasm fixture missing; skipping");
+                return;
+            }
+        };
+        let headers = vec![
+            (b":path".to_vec(), b"/".to_vec()),
+            (b":method".to_vec(), b"GET".to_vec()),
+            (b":authority".to_vec(), b"example.com".to_vec()),
+        ];
+        // async になった WASM 実行をテスト用に駆動する（背景スレッド扱い）。
+        let result = futures::executor::block_on(engine.on_request_headers_with_modules(
+            &["header_filter".to_string()],
+            "/",
+            "GET",
+            headers,
+            "127.0.0.1",
+            true,
+        ));
+        // 中身は問わない。パニックせず FilterResult を返すことだけを確認する。
+        match result {
+            FilterResult::Continue { .. }
+            | FilterResult::Pause
+            | FilterResult::LocalResponse(_) => {}
+        }
+    }
 }

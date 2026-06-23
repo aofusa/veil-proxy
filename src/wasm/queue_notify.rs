@@ -101,7 +101,7 @@ pub fn notify_queue_subscribers(engine: &Arc<FilterEngine>, queue_id: u32) {
     let subscribers = get_queue_subscribers(queue_id);
 
     for module_name in subscribers {
-        engine.on_queue_ready(&module_name, queue_id);
+        futures::executor::block_on(engine.on_queue_ready(&module_name, queue_id));
     }
 }
 
