@@ -6,7 +6,7 @@ use crate::config::{L4LbAlgorithm, L4ListenerConfig, L4TlsMode};
 use crate::runtime::tcp::TcpStream as IoUringTcpStream;
 use crate::runtime::time::timeout;
 use ftlog::{debug, info, warn};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,7 +44,6 @@ impl RoundRobinState {
         }
     }
 
-    /// 次のカウンタ値を返す（total_weight でのモジュロは呼び出し側で行う）
     pub fn next(&self, len: usize) -> usize {
         if len == 0 {
             return 0;
@@ -52,7 +51,6 @@ impl RoundRobinState {
         self.counter.fetch_add(1, Ordering::Relaxed) % len
     }
 
-    /// Weighted Round Robin 用: total_weight でのカウンタを返す
     pub fn next_weighted(&self, total_weight: usize) -> usize {
         if total_weight == 0 {
             return 0;
@@ -67,22 +65,41 @@ impl Default for RoundRobinState {
     }
 }
 
+/// 設定ファイルのアドレス文字列を起動時に `SocketAddr` へ変換して保持する。
+///
+/// hot path での DNS 解決（`to_socket_addrs` は blocking syscall）を排除するため、
+/// サーバ起動時に一度だけパースしてキャッシュする。
+pub fn parse_upstream_addrs(config: &L4ListenerConfig) -> Result<Vec<SocketAddr>, String> {
+    config
+        .upstreams
+        .iter()
+        .map(|u| {
+            u.addr
+                .to_socket_addrs()
+                .map_err(|e| format!("failed to parse upstream addr '{}': {}", u.addr, e))?
+                .next()
+                .ok_or_else(|| format!("no address resolved for '{}'", u.addr))
+        })
+        .collect()
+}
+
 /// upstream アドレスを選択する（ロードバランシング）
 ///
-/// 戻り値: `(upstream_index, upstream_addr)` または `None`（全 upstream が unhealthy）
-pub fn select_upstream(
-    config: &L4ListenerConfig,
+/// 戻り値: `(upstream_index, &str)` — インデックスは `parsed_addrs` への参照用、
+/// `&str` はログ用（`config` からの借用のため追加アロケーション不要）。
+pub fn select_upstream<'a>(
+    config: &'a L4ListenerConfig,
     rr_state: &RoundRobinState,
     conn_counters: &[AtomicUsize],
     health_state: &[AtomicBool],
-) -> Option<(usize, String)> {
+) -> Option<(usize, &'a str)> {
     if config.upstreams.is_empty() {
         return None;
     }
 
     match config.lb {
         L4LbAlgorithm::RoundRobin => {
-            // Weighted Round Robin: weight に比例した頻度で upstream を選択
+            // Weighted Round Robin: unhealthy upstream を weight 計算から除外
             let total_weight: usize = config
                 .upstreams
                 .iter()
@@ -92,7 +109,7 @@ pub fn select_upstream(
                 .sum();
 
             if total_weight == 0 {
-                return None; // 全 upstream が unhealthy
+                return None;
             }
 
             let slot = rr_state.next_weighted(total_weight);
@@ -106,22 +123,21 @@ pub fn select_upstream(
                 }
                 cumulative += upstream.weight.max(1) as usize;
                 if slot < cumulative {
-                    return Some((i, upstream.addr.clone()));
+                    return Some((i, upstream.addr.as_str()));
                 }
             }
             // フォールバック: 最後の healthy upstream
             for (i, upstream) in config.upstreams.iter().enumerate().rev() {
-                let is_healthy = health_state
+                if health_state
                     .get(i)
-                    .map_or(true, |h| h.load(Ordering::Relaxed));
-                if is_healthy {
-                    return Some((i, upstream.addr.clone()));
+                    .map_or(true, |h| h.load(Ordering::Relaxed))
+                {
+                    return Some((i, upstream.addr.as_str()));
                 }
             }
             None
         }
         L4LbAlgorithm::LeastConn => {
-            // 接続中の最も少ない healthy upstream を選択
             config
                 .upstreams
                 .iter()
@@ -136,92 +152,92 @@ pub fn select_upstream(
                         .get(*i)
                         .map_or(0, |c| c.load(Ordering::Relaxed))
                 })
-                .map(|(i, u)| (i, u.addr.clone()))
+                .map(|(i, u)| (i, u.addr.as_str()))
         }
     }
 }
 
-/// バッファサイズ（16KB: キャッシュラインを意識したサイズ）
-const BUF_SIZE: usize = 16 * 1024;
+/// バッファサイズ（64KB: io_uring の一般的な推奨値）
+const BUF_SIZE: usize = 64 * 1024;
 
-/// src から読み取って dst に書き込む（1 往復、ショートライトをリトライ）
+/// 1方向の転送ループ
 ///
-/// 戻り値: 転送バイト数（0 = EOF / エラー）
-async fn forward_once(src: &IoUringTcpStream, dst: &IoUringTcpStream) -> usize {
-    // src から読み取り（Vec<u8> は IoBufMut を実装済み）
-    let buf: Vec<u8> = vec![0u8; BUF_SIZE];
-    let (res, buf) = src.read(buf).await;
-    let n = match res {
-        Ok(0) | Err(_) => return 0,
-        Ok(n) => n,
-    };
+/// バッファはこの関数内でコネクション確立時に **一度だけ** 確保し、
+/// read/write の ownership handoff を利用してループ内での再確保を完全に排除する。
+///
+/// ショートライト時は `copy_within` でバッファ内シフトを行い、追加アロケーション不要。
+async fn forward_direction(
+    src: &IoUringTcpStream,
+    dst: &IoUringTcpStream,
+    idle_timeout: Duration,
+    name: &str,
+) -> usize {
+    // コネクションあたり一度だけ確保。read()/write() が ownership を受け取って返すため
+    // ループ内で再確保されることはない。
+    let mut buf: Vec<u8> = Vec::with_capacity(BUF_SIZE);
+    // SAFETY: capacity ぶんの領域は確保済み。カーネルが read で上書きするため
+    // Rust 側から [len..capacity] を読まない限り安全。
+    unsafe { buf.set_len(BUF_SIZE) };
 
-    // ショートライトをリトライして全バイトを書き込む
-    let mut written = 0;
-    while written < n {
-        let chunk = buf[written..n].to_vec();
-        let (wres, _) = dst.write(chunk).await;
-        match wres {
-            Ok(0) | Err(_) => return 0, // 接続切断またはエラー
-            Ok(wn) => written += wn,
+    let mut total = 0usize;
+    'outer: loop {
+        // read(): buf の ownership を渡し、完了後に (result, buf) として返ってくる
+        let (res, mut b) = match timeout(idle_timeout, src.read(buf)).await {
+            Ok(r) => r,
+            Err(_) => {
+                debug!("[L4:{}] idle timeout", name);
+                break;
+            }
+        };
+        // b.len() == n (set_init(n) がセット済み)
+        let n = match res {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+
+        // ショートライトをリトライ（追加アロケーションなし）
+        let mut written = 0;
+        while written < n {
+            if written > 0 {
+                // 未送信バイトをバッファ先頭にシフト（memmove 相当、ゼロコピー）
+                b.copy_within(written..n, 0);
+                unsafe { b.set_len(n - written) };
+            }
+            let (wres, wb) = dst.write(b).await;
+            b = wb;
+            match wres {
+                Ok(0) | Err(_) => break 'outer,
+                Ok(wn) => written += wn,
+            }
         }
+        total += n;
+
+        // 次の read のためにバッファ長を BUF_SIZE に戻す
+        // (capacity は変わらないため再確保は発生しない)
+        unsafe { b.set_len(BUF_SIZE) };
+        buf = b;
     }
-    n
+    total
 }
 
 /// クライアントと upstream の間でバイダイレクショナル転送を行う
 ///
-/// どちらかの側が切断するか、アイドルタイムアウトになると終了する。
+/// ## アロケーション特性
+/// - Arc: なし（`ReadFuture`/`WriteFuture` は `RawFd` のコピーのみ保持するため `&TcpStream` で十分）
+/// - String: なし（`futures::join!` は同一タスク内で実行されるため `&str` を直接借用可能）
+/// - バッファ: 各方向 1 回だけ（`forward_direction` 参照）
 pub async fn bidirectional_forward(
     client: IoUringTcpStream,
     upstream: IoUringTcpStream,
     idle_timeout: Duration,
     listener_name: &str,
 ) {
-    let client = Arc::new(client);
-    let upstream_arc = Arc::new(upstream);
-
-    let c2u_client = client.clone();
-    let c2u_upstream = upstream_arc.clone();
-    let u2c_client = client.clone();
-    let u2c_upstream = upstream_arc.clone();
-    let name_c2u = listener_name.to_string();
-    let name_u2c = listener_name.to_string();
-
-    // client → upstream 方向の転送タスク
-    let c2u = async move {
-        let mut total = 0usize;
-        loop {
-            match timeout(idle_timeout, forward_once(&c2u_client, &c2u_upstream)).await {
-                Ok(0) => break,
-                Ok(n) => total += n,
-                Err(_) => {
-                    debug!("[L4:{}] c→u idle timeout", name_c2u);
-                    break;
-                }
-            }
-        }
-        total
-    };
-
-    // upstream → client 方向の転送タスク
-    let u2c = async move {
-        let mut total = 0usize;
-        loop {
-            match timeout(idle_timeout, forward_once(&u2c_upstream, &u2c_client)).await {
-                Ok(0) => break,
-                Ok(n) => total += n,
-                Err(_) => {
-                    debug!("[L4:{}] u→c idle timeout", name_u2c);
-                    break;
-                }
-            }
-        }
-        total
-    };
-
-    // 両方向を並行実行（どちらかが終わると Arc カウントが落ち、他方も EOF になる）
-    let (c2u_bytes, u2c_bytes) = futures::join!(c2u, u2c);
+    // futures::join! は両 Future を同一タスク内でインターリーブするため、
+    // &TcpStream の同時借用は安全（Read/Write は &self）。
+    let (c2u_bytes, u2c_bytes) = futures::join!(
+        forward_direction(&client, &upstream, idle_timeout, listener_name),
+        forward_direction(&upstream, &client, idle_timeout, listener_name)
+    );
     debug!(
         "[L4:{}] connection closed: c→u {} bytes, u→c {} bytes",
         listener_name, c2u_bytes, u2c_bytes
@@ -233,6 +249,7 @@ pub async fn handle_l4_connection(
     client: IoUringTcpStream,
     peer_addr: SocketAddr,
     config: Arc<L4ListenerConfig>,
+    parsed_addrs: Arc<Vec<SocketAddr>>,
     rr_state: Arc<RoundRobinState>,
     conn_counters: Arc<Vec<AtomicUsize>>,
     listener_counter: Arc<L4ConnectionCounter>,
@@ -253,7 +270,6 @@ pub async fn handle_l4_connection(
     listener_counter.current.fetch_add(1, Ordering::Relaxed);
     listener_counter.total.fetch_add(1, Ordering::Relaxed);
 
-    // リスナー全体の接続数をデクリメントするガード
     struct ListenerGuard(Arc<L4ConnectionCounter>);
     impl Drop for ListenerGuard {
         fn drop(&mut self) {
@@ -263,15 +279,14 @@ pub async fn handle_l4_connection(
     let _listener_guard = ListenerGuard(listener_counter.clone());
 
     if config.tls == L4TlsMode::Terminate {
-        // TLS ターミネーションは将来実装
         warn!(
             "[L4:{}] TLS termination not yet implemented, treating as passthrough",
             config.name
         );
     }
 
-    // upstream アドレスを選択（インデックスも取得して per-upstream カウンタを管理）
-    let (upstream_idx, upstream_addr) =
+    // upstream 選択（&str は config からの借用、追加アロケーションなし）
+    let (upstream_idx, upstream_addr_str) =
         match select_upstream(&config, &rr_state, &conn_counters, &health_state) {
             Some(pair) => pair,
             None => {
@@ -285,7 +300,6 @@ pub async fn handle_l4_connection(
         c.fetch_add(1, Ordering::Relaxed);
     }
 
-    // upstream 接続数をデクリメントするガード
     struct UpstreamGuard {
         counters: Arc<Vec<AtomicUsize>>,
         idx: usize,
@@ -302,11 +316,22 @@ pub async fn handle_l4_connection(
         idx: upstream_idx,
     };
 
-    // upstream に接続
+    // 起動時パース済み SocketAddr を使用（hot path での DNS 解決を排除）
+    let socket_addr = match parsed_addrs.get(upstream_idx) {
+        Some(a) => *a,
+        None => {
+            warn!(
+                "[L4:{}] parsed_addrs index {} out of range",
+                config.name, upstream_idx
+            );
+            return;
+        }
+    };
+
     let connect_timeout = Duration::from_secs(config.connect_timeout_secs);
     let upstream = match timeout(
         connect_timeout,
-        IoUringTcpStream::connect_str(&upstream_addr),
+        IoUringTcpStream::connect(socket_addr), // SocketAddr → blocking DNS なし
     )
     .await
     {
@@ -314,14 +339,14 @@ pub async fn handle_l4_connection(
         Ok(Err(e)) => {
             warn!(
                 "[L4:{}] failed to connect to upstream {}: {}",
-                config.name, upstream_addr, e
+                config.name, upstream_addr_str, e
             );
             return;
         }
         Err(_) => {
             warn!(
                 "[L4:{}] connection to upstream {} timed out",
-                config.name, upstream_addr
+                config.name, upstream_addr_str
             );
             return;
         }
@@ -331,7 +356,7 @@ pub async fn handle_l4_connection(
 
     info!(
         "[L4:{}] {} → {} (tls={:?})",
-        config.name, peer_addr, upstream_addr, config.tls
+        config.name, peer_addr, upstream_addr_str, config.tls
     );
 
     let idle_timeout = Duration::from_secs(config.idle_timeout_secs);
@@ -389,7 +414,7 @@ mod tests {
         assert_eq!(a0, "127.0.0.1:8001");
         assert_eq!(a1, "127.0.0.1:8002");
         assert_eq!(a2, "127.0.0.1:8003");
-        assert_eq!(a3, "127.0.0.1:8001"); // ラップアラウンド
+        assert_eq!(a3, "127.0.0.1:8001");
     }
 
     #[test]
@@ -415,6 +440,24 @@ mod tests {
         let health: Vec<AtomicBool> = vec![];
 
         assert!(select_upstream(&config, &rr, &counters, &health).is_none());
+    }
+
+    #[test]
+    fn test_parse_upstream_addrs_valid() {
+        let config = make_config(
+            vec!["127.0.0.1:8001", "127.0.0.1:8002"],
+            L4LbAlgorithm::RoundRobin,
+        );
+        let addrs = parse_upstream_addrs(&config).unwrap();
+        assert_eq!(addrs.len(), 2);
+        assert_eq!(addrs[0], "127.0.0.1:8001".parse::<SocketAddr>().unwrap());
+        assert_eq!(addrs[1], "127.0.0.1:8002".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn test_parse_upstream_addrs_invalid() {
+        let config = make_config(vec!["not-a-valid-addr"], L4LbAlgorithm::RoundRobin);
+        assert!(parse_upstream_addrs(&config).is_err());
     }
 
     #[test]
@@ -532,11 +575,7 @@ mod tests {
             let _guard = CounterGuard(counter.clone());
             assert_eq!(counter.current.load(Ordering::Relaxed), 1);
         }
-        assert_eq!(
-            counter.current.load(Ordering::Relaxed),
-            0,
-            "drop should decrement"
-        );
+        assert_eq!(counter.current.load(Ordering::Relaxed), 0, "drop should decrement");
     }
 
     #[test]
@@ -558,13 +597,8 @@ mod tests {
         assert_eq!(addr, "127.0.0.1:8002", "should pick upstream with fewest connections");
     }
 
-    // ====================
-    // 新規: ヘルスフィルタテスト
-    // ====================
-
     #[test]
     fn test_select_upstream_skips_unhealthy() {
-        // upstream[0] が unhealthy → upstream[1] が選ばれる
         let config = make_config(
             vec!["127.0.0.1:8001", "127.0.0.1:8002"],
             L4LbAlgorithm::RoundRobin,
@@ -590,15 +624,11 @@ mod tests {
         let counters: Vec<AtomicUsize> = (0..2).map(|_| AtomicUsize::new(0)).collect();
         let health = vec![AtomicBool::new(false), AtomicBool::new(false)];
 
-        assert!(
-            select_upstream(&config, &rr, &counters, &health).is_none(),
-            "all unhealthy should return None"
-        );
+        assert!(select_upstream(&config, &rr, &counters, &health).is_none());
     }
 
     #[test]
     fn test_least_conn_skips_unhealthy() {
-        // counters: [0, 0, 0] だが index 0 が unhealthy → index 1 (最小 healthy)
         let config = make_config(
             vec!["127.0.0.1:8001", "127.0.0.1:8002", "127.0.0.1:8003"],
             L4LbAlgorithm::LeastConn,
@@ -606,7 +636,7 @@ mod tests {
         let rr = RoundRobinState::new();
         let counters: Vec<AtomicUsize> = (0..3).map(|_| AtomicUsize::new(0)).collect();
         let health = vec![
-            AtomicBool::new(false), // unhealthy
+            AtomicBool::new(false),
             AtomicBool::new(true),
             AtomicBool::new(true),
         ];
@@ -615,13 +645,8 @@ mod tests {
         assert_ne!(idx, 0, "unhealthy upstream[0] should be skipped");
     }
 
-    // ====================
-    // 新規: Weighted Round Robin テスト
-    // ====================
-
     #[test]
     fn test_weighted_round_robin_distribution() {
-        // weight [2, 1] → upstream[0] が 2/3、upstream[1] が 1/3
         let config = make_config_weighted(
             vec![("127.0.0.1:8001", 2), ("127.0.0.1:8002", 1)],
             L4LbAlgorithm::RoundRobin,
@@ -634,7 +659,6 @@ mod tests {
             .map(|_| select_upstream(&config, &rr, &counters, &health).unwrap().0)
             .collect();
 
-        // 3 回で [0, 0, 1] の順（weight 比 2:1）
         let count_0 = results.iter().filter(|&&i| i == 0).count();
         let count_1 = results.iter().filter(|&&i| i == 1).count();
         assert_eq!(count_0, 2, "upstream[0] should get 2/3 of requests");
@@ -643,9 +667,12 @@ mod tests {
 
     #[test]
     fn test_weighted_round_robin_equal_weight_is_round_robin() {
-        // weight が全て 1 なら通常の Round Robin と同じ
         let config = make_config_weighted(
-            vec![("127.0.0.1:8001", 1), ("127.0.0.1:8002", 1), ("127.0.0.1:8003", 1)],
+            vec![
+                ("127.0.0.1:8001", 1),
+                ("127.0.0.1:8002", 1),
+                ("127.0.0.1:8003", 1),
+            ],
             L4LbAlgorithm::RoundRobin,
         );
         let rr = RoundRobinState::new();
@@ -656,7 +683,6 @@ mod tests {
             .map(|_| select_upstream(&config, &rr, &counters, &health).unwrap().0)
             .collect();
 
-        // 6 回で各 upstream が 2 回ずつ
         for expected in 0..3 {
             let count = results.iter().filter(|&&i| i == expected).count();
             assert_eq!(count, 2, "upstream[{}] should appear twice in 6 calls", expected);
@@ -665,7 +691,6 @@ mod tests {
 
     #[test]
     fn test_weighted_rr_skips_unhealthy_in_weight_calculation() {
-        // weight [2, 1] で upstream[0] が unhealthy → upstream[1] のみ選ばれる
         let config = make_config_weighted(
             vec![("127.0.0.1:8001", 2), ("127.0.0.1:8002", 1)],
             L4LbAlgorithm::RoundRobin,
@@ -680,13 +705,8 @@ mod tests {
         }
     }
 
-    // ====================
-    // 新規: per-upstream カウンタの追跡テスト
-    // ====================
-
     #[test]
     fn test_least_conn_uses_per_upstream_counters() {
-        // 初期状態 [0, 0]: select → counters を手動 increment → 次の select は他を選ぶ
         let config = make_config(
             vec!["127.0.0.1:8001", "127.0.0.1:8002"],
             L4LbAlgorithm::LeastConn,
@@ -695,28 +715,45 @@ mod tests {
         let counters: Vec<AtomicUsize> = (0..2).map(|_| AtomicUsize::new(0)).collect();
         let health = all_healthy(2);
 
-        // 1 回目: index 0 (両方 0 → 最初)
         let (idx1, _) = select_upstream(&config, &rr, &counters, &health).unwrap();
-        // 選択後に手動 increment（handle_l4_connection が行う操作をシミュレート）
         counters[idx1].fetch_add(1, Ordering::Relaxed);
 
-        // 2 回目: counter[0]=1, counter[1]=0 → index 1 が選ばれるべき
         let (idx2, _) = select_upstream(&config, &rr, &counters, &health).unwrap();
         assert_eq!(idx2, 1, "after incrementing idx1 counter, idx2 should be the other");
-
-        // 選択後 increment
         counters[idx2].fetch_add(1, Ordering::Relaxed);
 
-        // 3 回目: counter[0]=1, counter[1]=1 → index 0 (tie → first)
         let (idx3, _) = select_upstream(&config, &rr, &counters, &health).unwrap();
         assert_eq!(idx3, 0, "tie should resolve to first upstream");
     }
 
     #[test]
     fn test_idle_timeout_config() {
-        // idle_timeout_secs が設定から読まれること
         let mut config = make_config(vec!["127.0.0.1:8001"], L4LbAlgorithm::RoundRobin);
         config.idle_timeout_secs = 30;
         assert_eq!(config.idle_timeout_secs, 30);
+    }
+
+    // ====================
+    // forward_direction のバッファ再利用テスト
+    // ====================
+
+    #[test]
+    fn test_buf_size_is_64k() {
+        // BUF_SIZE が 64KB であることを確認（変更時にこのテストが警告する）
+        assert_eq!(BUF_SIZE, 64 * 1024);
+    }
+
+    #[test]
+    fn test_copy_within_simulates_short_write_retry() {
+        // forward_direction のショートライト処理（copy_within）を単体でテスト
+        let mut buf: Vec<u8> = vec![1, 2, 3, 4, 5, 6];
+        let n = 6;
+        let written = 2; // 2 バイトだけ書けた
+
+        buf.copy_within(written..n, 0);
+        unsafe { buf.set_len(n - written) };
+
+        // [3, 4, 5, 6] が先頭に詰められているはず
+        assert_eq!(&buf[..], &[3u8, 4, 5, 6]);
     }
 }

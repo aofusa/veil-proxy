@@ -1,10 +1,10 @@
 //! L4 プロキシサーバー起動モジュール
-//!
-//! 設定から L4 リスナーを起動し、接続をハンドラに引き渡す。
 
 use crate::config::{L4ListenerConfig, SHUTDOWN_FLAG};
 use crate::l4::health::{new_health_state, spawn_l4_health_checker};
-use crate::l4::proxy::{handle_l4_connection, L4ConnectionCounter, RoundRobinState};
+use crate::l4::proxy::{
+    handle_l4_connection, parse_upstream_addrs, L4ConnectionCounter, RoundRobinState,
+};
 use crate::runtime::tcp::TcpListener;
 use crate::runtime::time::timeout;
 use crate::system::spawn_with_panic_catch;
@@ -15,10 +15,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-/// L4 リスナースレッドを起動する
-///
-/// 各リスナー設定ごとに 1 スレッドを起動する。
-/// スレッドは io_uring ランタイム上で動作する。
 pub fn spawn_l4_listeners(listeners: &[L4ListenerConfig]) {
     for config in listeners {
         if config.upstreams.is_empty() {
@@ -26,13 +22,19 @@ pub fn spawn_l4_listeners(listeners: &[L4ListenerConfig]) {
             continue;
         }
 
+        // upstream アドレスを起動時に一度だけパース（hot path での DNS 解決を排除）
+        let parsed_addrs = match parse_upstream_addrs(config) {
+            Ok(addrs) => Arc::new(addrs),
+            Err(e) => {
+                error!("[L4:{}] failed to parse upstream addresses: {}", config.name, e);
+                continue;
+            }
+        };
+
         let config = Arc::new(config.clone());
         let n_upstreams = config.upstreams.len();
 
-        // ヘルス状態（全 upstream を初期 healthy で初期化）
         let health_state = new_health_state(n_upstreams);
-
-        // ヘルスチェックスレッド（設定があれば起動）
         spawn_l4_health_checker(config.clone(), health_state.clone());
 
         info!(
@@ -86,12 +88,13 @@ pub fn spawn_l4_listeners(listeners: &[L4ListenerConfig]) {
                             error!("[L4:{}] accept error: {}", config.name, e);
                             continue;
                         }
-                        Err(_) => continue, // タイムアウト: shutdown チェックのため継続
+                        Err(_) => continue,
                     };
 
                     let _ = stream.set_nodelay(true);
 
                     let config_clone = config.clone();
+                    let parsed_addrs_clone = parsed_addrs.clone();
                     let rr_clone = rr_state.clone();
                     let counters_clone = conn_counters.clone();
                     let listener_counter_clone = listener_counter.clone();
@@ -102,6 +105,7 @@ pub fn spawn_l4_listeners(listeners: &[L4ListenerConfig]) {
                             stream,
                             peer_addr,
                             config_clone,
+                            parsed_addrs_clone,
                             rr_clone,
                             counters_clone,
                             listener_counter_clone,
