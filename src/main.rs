@@ -229,6 +229,14 @@ pub mod resilience;
 /// - log_access_structured（スレッドローカルバッファによる低アロケーション実装）
 #[cfg(feature = "access-log")]
 pub mod access_log;
+
+/// L4 (TCP/UDP) ストリームプロキシモジュール（F-18）
+/// - TCP バイダイレクショナル転送
+/// - ラウンドロビン / 最小接続数ロードバランシング
+/// - TLS パススルー
+/// - 接続数制限
+#[cfg(feature = "l4-proxy")]
+pub mod l4;
 #[cfg(test)]
 use crate::constants::*;
 #[cfg(test)]
@@ -461,6 +469,8 @@ fn main() {
         #[cfg(feature = "wasm")]
         wasm_filter_engine: loaded_config.wasm_filter_engine.clone(),
         performance: loaded_config.performance.clone(),
+        #[cfg(feature = "l4-proxy")]
+        l4_listeners: Arc::new(loaded_config.l4_listeners.clone()),
     };
     CURRENT_CONFIG.store(Arc::new(runtime_config));
     info!("Runtime configuration initialized (hot reload enabled via SIGHUP)");
@@ -1182,6 +1192,21 @@ fn main() {
                 });
             });
             handles.push(h2c_handle);
+        }
+    }
+
+    // L4 (TCP/UDP) ストリームプロキシリスナーを起動（F-18）
+    #[cfg(feature = "l4-proxy")]
+    {
+        if !loaded_config.l4_listeners.is_empty() {
+            info!("============================================");
+            info!("L4 Stream Proxy");
+            info!(
+                "Listeners: {}",
+                loaded_config.l4_listeners.len()
+            );
+            info!("============================================");
+            crate::l4::server::spawn_l4_listeners(&loaded_config.l4_listeners);
         }
     }
 

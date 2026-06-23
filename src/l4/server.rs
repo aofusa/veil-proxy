@@ -1,0 +1,105 @@
+//! L4 プロキシサーバー起動モジュール
+//!
+//! 設定から L4 リスナーを起動し、接続をハンドラに引き渡す。
+
+use crate::config::{L4ListenerConfig, SHUTDOWN_FLAG};
+use crate::l4::proxy::{
+    handle_l4_connection, L4ConnectionCounter, RoundRobinState,
+};
+use crate::runtime::tcp::TcpListener;
+use crate::runtime::time::timeout;
+use crate::system::spawn_with_panic_catch;
+use ftlog::{error, info, warn};
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use std::thread;
+
+/// L4 リスナースレッドを起動する
+///
+/// 各リスナー設定ごとに 1 スレッドを起動する。
+/// スレッドは io_uring ランタイム上で動作する。
+pub fn spawn_l4_listeners(listeners: &[L4ListenerConfig]) {
+    for config in listeners {
+        if config.upstreams.is_empty() {
+            warn!("[L4:{}] no upstreams configured, skipping", config.name);
+            continue;
+        }
+
+        let config = Arc::new(config.clone());
+        let n_upstreams = config.upstreams.len();
+
+        info!(
+            "[L4:{}] starting listener on {} ({} upstreams, lb={:?})",
+            config.name, config.listen, n_upstreams, config.lb
+        );
+
+        thread::spawn(move || {
+            let listen_addr: SocketAddr = match config.listen.parse() {
+                Ok(addr) => addr,
+                Err(e) => {
+                    error!("[L4:{}] invalid listen address '{}': {}", config.name, config.listen, e);
+                    return;
+                }
+            };
+
+            let rr_state = Arc::new(RoundRobinState::new());
+            let conn_counters: Arc<Vec<AtomicUsize>> =
+                Arc::new((0..n_upstreams).map(|_| AtomicUsize::new(0)).collect());
+            let listener_counter = Arc::new(L4ConnectionCounter::new());
+
+            crate::runtime::block_on(async move {
+                let listener = match TcpListener::bind(listen_addr) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        error!("[L4:{}] bind error on {}: {}", config.name, listen_addr, e);
+                        return;
+                    }
+                };
+
+                info!("[L4:{}] listening on {}", config.name, listen_addr);
+
+                loop {
+                    if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
+                        info!("[L4:{}] shutting down", config.name);
+                        break;
+                    }
+
+                    let accept_result =
+                        timeout(Duration::from_secs(1), listener.accept()).await;
+
+                    let (stream, peer_addr) = match accept_result {
+                        Ok(Ok(s)) => s,
+                        Ok(Err(e)) => {
+                            error!("[L4:{}] accept error: {}", config.name, e);
+                            continue;
+                        }
+                        Err(_) => continue, // タイムアウト: shutdown チェックのため継続
+                    };
+
+                    let _ = stream.set_nodelay(true);
+
+                    let config_clone = config.clone();
+                    let rr_clone = rr_state.clone();
+                    let counters_clone = conn_counters.clone();
+                    let listener_counter_clone = listener_counter.clone();
+
+                    spawn_with_panic_catch(async move {
+                        handle_l4_connection(
+                            stream,
+                            peer_addr,
+                            config_clone,
+                            rr_clone,
+                            counters_clone,
+                            listener_counter_clone,
+                        )
+                        .await;
+                    });
+                }
+
+                info!("[L4:{}] stopped", config.name);
+            });
+        });
+    }
+}

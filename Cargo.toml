@@ -132,6 +132,13 @@ admin = []
 # ビルド方法: cargo build --features access-log
 access-log = []
 
+# L4 (TCP/UDP) ストリームプロキシ（F-18）
+# nginx stream / Envoy TCP proxy 相当の L4 レイヤープロキシ機能。
+# HTTP 以外のユースケース（DB 接続、バイナリプロトコル等）をサポート。
+# TLS passthrough / termination、接続数制限、LB（RR / LeastConn）を含む。
+# ビルド方法: cargo build --features l4-proxy
+l4-proxy = []
+
 # ====================
 # 複合フィーチャ（便利用）
 # ====================
@@ -146,6 +153,7 @@ full = [
     "mimalloc",
     "admin",
     "access-log",
+    "l4-proxy",
 ]
 
 [dependencies]
