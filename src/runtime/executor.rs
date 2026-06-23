@@ -22,7 +22,7 @@ use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use crate::runtime::ring::{
     IoUring, IoUringCqe, IORING_OP_ACCEPT, IORING_OP_ASYNC_CANCEL,
     IORING_OP_CLOSE, IORING_OP_CONNECT, IORING_OP_NOP, IORING_OP_POLL_ADD, IORING_OP_POLL_REMOVE,
-    IORING_OP_RECV, IORING_OP_SEND, IORING_OP_SPLICE, IORING_OP_TIMEOUT,
+    IORING_OP_RECV, IORING_OP_SEND, IORING_OP_SPLICE, IORING_OP_TIMEOUT, IORING_SETUP_R_DISABLED,
 };
 
 // ====================
@@ -148,16 +148,38 @@ thread_local! {
 
 /// スレッドローカルな io_uring リングを初期化する
 pub fn init_ring(entries: u32, flags: u32) -> std::io::Result<()> {
-    let ring = IoUring::new(entries, flags)?;
-
-    // IORING_REGISTER_RESTRICTIONS でオペコードを制限
-    // 制限適用に失敗しても動作は継続（カーネルバージョン依存）
-    if let Err(e) = ring.apply_restrictions(PROXY_ALLOWED_OPCODES) {
-        ftlog::debug!(
-            "io_uring restrictions not applied (kernel may not support): {}",
-            e
-        );
-    }
+    // IORING_REGISTER_RESTRICTIONS は IORING_SETUP_R_DISABLED 付きで生成した無効状態の
+    // リングにのみ適用できる。「生成（R_DISABLED）→ 制限登録 → ENABLE_RINGS で有効化」の
+    // 順で行う。R_DISABLED 自体が未対応の古いカーネル（<5.10）では制限なしの通常リングへ
+    // フォールバックする。
+    let ring = match IoUring::new(entries, flags | IORING_SETUP_R_DISABLED) {
+        Ok(ring) => {
+            match ring.apply_restrictions(PROXY_ALLOWED_OPCODES) {
+                Ok(()) => {
+                    // 制限適用後は ENABLE_RINGS を呼ばないと SQE が一切処理されない。
+                    ring.enable_rings()?;
+                    ftlog::debug!(
+                        "io_uring restrictions applied ({} opcodes allowed)",
+                        PROXY_ALLOWED_OPCODES.len()
+                    );
+                }
+                Err(e) => {
+                    // 制限が未対応でも R_DISABLED で生成した以上は有効化が必須。
+                    ftlog::debug!("io_uring restrictions not applied: {}", e);
+                    ring.enable_rings()?;
+                }
+            }
+            ring
+        }
+        Err(e) => {
+            // R_DISABLED 未対応カーネル: 制限なしで通常生成にフォールバック。
+            ftlog::debug!(
+                "io_uring R_DISABLED unsupported ({}); creating ring without restrictions",
+                e
+            );
+            IoUring::new(entries, flags)?
+        }
+    };
 
     RING.with(|r| {
         *r.borrow_mut() = Some(ring);

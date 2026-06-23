@@ -265,15 +265,20 @@ pub struct IoUringCqe {
 // ====================
 
 /// io_uring 制限エントリ
+///
+/// カーネルの `struct io_uring_restriction`（16 バイト）と ABI 互換でなければならない。
+/// `register_opcode_or_sqe_op` はカーネルでは `register_op` / `sqe_op` / `sqe_flags` の
+/// 1 バイト union であり、別フィールドに分けると構造体サイズがずれて
+/// `IORING_REGISTER_RESTRICTIONS` が正しく解釈されなくなる（カーネルは 16 バイト
+/// ストライドで配列を読む）。フィールド構成・サイズを変更してはならない。
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IoUringRestriction {
     /// 制限タイプ（IORING_RESTRICTION_*）
     pub opcode: u16,
-    /// 操作コード（SQE_OP または REGISTER_OP）
+    /// 操作コード（SQE_OP / REGISTER_OP / SQE_FLAGS の union。1 バイト）
     pub register_opcode_or_sqe_op: u8,
-    pub sqe_flags: u8,
-    pub resv: u32,
+    pub resv: u8,
     pub resv2: [u32; 3],
 }
 
@@ -464,15 +469,21 @@ impl IoUring {
     /// IORING_REGISTER_RESTRICTIONS を適用して許可オペコードを制限する
     ///
     /// R_DISABLED フラグ付きで作成後、制限を適用してから ENABLE_RINGS を呼ぶこと。
-    pub fn apply_restrictions(&self, opcodes: &[u8]) -> io::Result<()> {
-        let mut restrictions: Vec<IoUringRestriction> = opcodes
-            .iter()
-            .map(|&op| IoUringRestriction {
-                opcode: IORING_RESTRICTION_SQE_OP,
-                register_opcode_or_sqe_op: op,
-                ..Default::default()
-            })
-            .collect();
+    pub fn apply_restrictions(&self, sqe_opcodes: &[u8]) -> io::Result<()> {
+        // 制限登録に成功するとリングは restricted 状態になり、以後の io_uring_register
+        // 操作（ENABLE_RINGS を含む）はすべて register_op ビットマップで検査される。
+        // そのため enable_rings() を呼べるよう ENABLE_RINGS を明示的に許可しておく。
+        let mut restrictions: Vec<IoUringRestriction> = Vec::with_capacity(sqe_opcodes.len() + 1);
+        restrictions.push(IoUringRestriction {
+            opcode: IORING_RESTRICTION_REGISTER_OP,
+            register_opcode_or_sqe_op: IORING_REGISTER_ENABLE_RINGS as u8,
+            ..Default::default()
+        });
+        restrictions.extend(sqe_opcodes.iter().map(|&op| IoUringRestriction {
+            opcode: IORING_RESTRICTION_SQE_OP,
+            register_opcode_or_sqe_op: op,
+            ..Default::default()
+        }));
 
         let ret = unsafe {
             libc::syscall(
@@ -625,5 +636,76 @@ impl Drop for IoUring {
             libc::munmap(self.cq_ring_ptr as *mut libc::c_void, self.cq_ring_size);
             libc::close(self.fd);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `IoUringRestriction` はカーネルの `struct io_uring_restriction` と同じ 16 バイトでなければならない。
+    #[test]
+    fn restriction_struct_is_abi_compatible() {
+        assert_eq!(std::mem::size_of::<IoUringRestriction>(), 16);
+        assert_eq!(std::mem::align_of::<IoUringRestriction>(), 4);
+    }
+
+    /// `IORING_REGISTER_RESTRICTIONS` が実際に許可外オペコードを `-EACCES` で拒否することを検証する。
+    ///
+    /// 「R_DISABLED で生成 → 制限登録 → ENABLE_RINGS で有効化」のシーケンスが正しく機能して
+    /// いることの回帰テスト。3 つの ABI/シーケンスバグのいずれかが再発すると失敗する。
+    #[test]
+    fn restrictions_block_disallowed_opcode() {
+        // R_DISABLED 付きでリング生成（io_uring/権限が無い環境ではスキップ）。
+        let mut ring = match IoUring::new(8, IORING_SETUP_R_DISABLED) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("io_uring R_DISABLED unavailable ({e}); skipping");
+                return;
+            }
+        };
+
+        // NOP のみ許可（ENABLE_RINGS は apply_restrictions が自動で許可する）。
+        if let Err(e) = ring.apply_restrictions(&[IORING_OP_NOP]) {
+            eprintln!("apply_restrictions unsupported ({e}); skipping");
+            return;
+        }
+        // 制限後でも ENABLE_RINGS が許可されているので必ず成功するはず。
+        ring.enable_rings()
+            .expect("enable_rings must succeed on a restricted ring (ENABLE_RINGS allowed)");
+
+        // 許可された NOP は成功する（res == 0）。
+        {
+            let sqe = ring.get_sqe().expect("sqe slot for nop");
+            sqe.opcode = IORING_OP_NOP;
+            sqe.user_data = 1;
+        }
+        ring.submit_and_wait(1).expect("submit nop");
+        let mut nop_res = None;
+        ring.consume_cqes(|cqe| {
+            if cqe.user_data == 1 {
+                nop_res = Some(cqe.res);
+            }
+        });
+        assert_eq!(nop_res, Some(0), "allowed NOP must complete with res=0");
+
+        // 許可外の ASYNC_CANCEL は実行前に -EACCES で拒否される。
+        {
+            let sqe = ring.get_sqe().expect("sqe slot for cancel");
+            sqe.opcode = IORING_OP_ASYNC_CANCEL;
+            sqe.user_data = 2;
+        }
+        ring.submit_and_wait(1).expect("submit disallowed");
+        let mut denied_res = None;
+        ring.consume_cqes(|cqe| {
+            if cqe.user_data == 2 {
+                denied_res = Some(cqe.res);
+            }
+        });
+        assert_eq!(
+            denied_res,
+            Some(-libc::EACCES),
+            "disallowed opcode must be rejected with -EACCES (restrictions active)"
+        );
     }
 }
