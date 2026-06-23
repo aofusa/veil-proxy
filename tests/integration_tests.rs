@@ -751,9 +751,11 @@ fn test_f22_tcp_connect_to_listening_server() {
     });
 
     // TCP 接続できること（HealthCheckType::Tcp と同等のロジック）
-    let result =
-        std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2));
-    assert!(result.is_ok(), "リスニング中のサーバーには TCP 接続できるべき");
+    let result = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2));
+    assert!(
+        result.is_ok(),
+        "リスニング中のサーバーには TCP 接続できるべき"
+    );
 
     let _ = server.join();
 }
@@ -766,7 +768,10 @@ fn test_f22_tcp_connect_to_closed_port() {
         &"127.0.0.1:19997".parse().unwrap(),
         Duration::from_millis(300),
     );
-    assert!(result.is_err(), "閉じているポートへの TCP 接続は失敗するべき");
+    assert!(
+        result.is_err(),
+        "閉じているポートへの TCP 接続は失敗するべき"
+    );
 }
 
 /// gRPC ヘルスチェック用: SERVING レスポンスの形式を確認
@@ -887,7 +892,10 @@ fn test_f18_l4_proxy_end_to_end() {
             let _ = conn.set_read_timeout(Some(Duration::from_secs(3)));
             let mut buf = [0u8; 256];
             if let Ok(n) = conn.read(&mut buf) {
-                backend_recv_clone.lock().unwrap().extend_from_slice(&buf[..n]);
+                backend_recv_clone
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(&buf[..n]);
                 let _ = conn.write_all(&buf[..n]);
             }
         }
@@ -1217,9 +1225,22 @@ unhealthy_threshold = 2
 healthy_threshold = 1
 "#;
     let parsed: toml::Value = toml::from_str(toml_str).unwrap();
-    assert_eq!(parsed["health_check"]["check_type"].as_str().unwrap(), "tcp");
-    assert_eq!(parsed["health_check"]["interval_secs"].as_integer().unwrap(), 5);
-    assert_eq!(parsed["health_check"]["unhealthy_threshold"].as_integer().unwrap(), 2);
+    assert_eq!(
+        parsed["health_check"]["check_type"].as_str().unwrap(),
+        "tcp"
+    );
+    assert_eq!(
+        parsed["health_check"]["interval_secs"]
+            .as_integer()
+            .unwrap(),
+        5
+    );
+    assert_eq!(
+        parsed["health_check"]["unhealthy_threshold"]
+            .as_integer()
+            .unwrap(),
+        2
+    );
 }
 
 /// F-18: ダウンしたバックエンドをヘルスチェックで除外するシミュレーション
@@ -1264,11 +1285,13 @@ fn test_f18_l4_health_check_excludes_down_backend() {
                 let _ = client.set_read_timeout(Some(Duration::from_secs(2)));
 
                 // ヘルスチェック: バックエンド 1 は healthy、バックエンド 2 は unhealthy
-                let b1_healthy = TcpStream::connect_timeout(&addr1, Duration::from_millis(200)).is_ok();
+                let b1_healthy =
+                    TcpStream::connect_timeout(&addr1, Duration::from_millis(200)).is_ok();
                 let b2_healthy = TcpStream::connect_timeout(
                     &down_addr.parse().unwrap(),
                     Duration::from_millis(200),
-                ).is_ok();
+                )
+                .is_ok();
 
                 // healthy なバックエンドにのみ転送
                 let target = if b1_healthy {
@@ -1279,8 +1302,7 @@ fn test_f18_l4_health_check_excludes_down_backend() {
                     return;
                 };
 
-                if let Ok(mut backend) =
-                    TcpStream::connect_timeout(&target, Duration::from_secs(1))
+                if let Ok(mut backend) = TcpStream::connect_timeout(&target, Duration::from_secs(1))
                 {
                     let _ = backend.set_read_timeout(Some(Duration::from_secs(2)));
                     let mut buf = [0u8; 64];
@@ -1320,10 +1342,7 @@ fn test_f18_l4_health_check_excludes_down_backend() {
     // down_addr に接続できないことで unhealthy 判定されていること
     let down_result =
         TcpStream::connect_timeout(&down_addr.parse().unwrap(), Duration::from_millis(200));
-    assert!(
-        down_result.is_err(),
-        "down backend should be unreachable"
-    );
+    assert!(down_result.is_err(), "down backend should be unreachable");
 }
 
 /// F-18: Weighted Round Robin のネットワークレベル分散確認

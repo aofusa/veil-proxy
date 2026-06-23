@@ -310,10 +310,39 @@ pub(crate) fn perform_grpc_health_check(
             #[derive(Debug)]
             struct NoVerify;
             impl ServerCertVerifier for NoVerify {
-                fn verify_server_cert(&self, _: &CertificateDer, _: &[CertificateDer], _: &rustls::pki_types::ServerName, _: &[u8], _: UnixTime) -> Result<ServerCertVerified, TlsError> { Ok(ServerCertVerified::assertion()) }
-                fn verify_tls12_signature(&self, _: &[u8], _: &CertificateDer, _: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, TlsError> { Ok(HandshakeSignatureValid::assertion()) }
-                fn verify_tls13_signature(&self, _: &[u8], _: &CertificateDer, _: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, TlsError> { Ok(HandshakeSignatureValid::assertion()) }
-                fn supported_verify_schemes(&self) -> Vec<SchemeList> { vec![SchemeList::RSA_PKCS1_SHA256, SchemeList::ECDSA_NISTP256_SHA256, SchemeList::RSA_PSS_SHA256] }
+                fn verify_server_cert(
+                    &self,
+                    _: &CertificateDer,
+                    _: &[CertificateDer],
+                    _: &rustls::pki_types::ServerName,
+                    _: &[u8],
+                    _: UnixTime,
+                ) -> Result<ServerCertVerified, TlsError> {
+                    Ok(ServerCertVerified::assertion())
+                }
+                fn verify_tls12_signature(
+                    &self,
+                    _: &[u8],
+                    _: &CertificateDer,
+                    _: &DigitallySignedStruct,
+                ) -> Result<HandshakeSignatureValid, TlsError> {
+                    Ok(HandshakeSignatureValid::assertion())
+                }
+                fn verify_tls13_signature(
+                    &self,
+                    _: &[u8],
+                    _: &CertificateDer,
+                    _: &DigitallySignedStruct,
+                ) -> Result<HandshakeSignatureValid, TlsError> {
+                    Ok(HandshakeSignatureValid::assertion())
+                }
+                fn supported_verify_schemes(&self) -> Vec<SchemeList> {
+                    vec![
+                        SchemeList::RSA_PKCS1_SHA256,
+                        SchemeList::ECDSA_NISTP256_SHA256,
+                        SchemeList::RSA_PSS_SHA256,
+                    ]
+                }
             }
             type SchemeList = SignatureScheme;
             Arc::new(
@@ -960,7 +989,10 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(20));
         let result = perform_grpc_health_check(&addr, "", false, false, Duration::from_secs(2));
-        assert!(result, "mock gRPC server returning grpc-status: 0 should return true");
+        assert!(
+            result,
+            "mock gRPC server returning grpc-status: 0 should return true"
+        );
     }
 
     #[test]
@@ -1004,10 +1036,7 @@ mod tests {
     fn test_check_grpc_response_grpc_status_nonzero_values() {
         // 各 gRPC エラーコードが false になること
         for status in [1u8, 2, 3, 4, 5, 12, 13, 14, 16] {
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ngrpc-status: {}\r\n\r\n",
-                status
-            );
+            let response = format!("HTTP/1.1 200 OK\r\ngrpc-status: {}\r\n\r\n", status);
             assert!(
                 !check_grpc_response(response.as_bytes()),
                 "grpc-status {} should return false",

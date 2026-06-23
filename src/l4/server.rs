@@ -26,7 +26,10 @@ pub fn spawn_l4_listeners(listeners: &[L4ListenerConfig]) {
         let parsed_addrs = match parse_upstream_addrs(config) {
             Ok(addrs) => Arc::new(addrs),
             Err(e) => {
-                error!("[L4:{}] failed to parse upstream addresses: {}", config.name, e);
+                error!(
+                    "[L4:{}] failed to parse upstream addresses: {}",
+                    config.name, e
+                );
                 continue;
             }
         };
@@ -63,10 +66,7 @@ pub fn spawn_l4_listeners(listeners: &[L4ListenerConfig]) {
                 let listener = match TcpListener::bind(listen_addr) {
                     Ok(l) => l,
                     Err(e) => {
-                        error!(
-                            "[L4:{}] bind error on {}: {}",
-                            config.name, listen_addr, e
-                        );
+                        error!("[L4:{}] bind error on {}: {}", config.name, listen_addr, e);
                         return;
                     }
                 };
@@ -79,8 +79,7 @@ pub fn spawn_l4_listeners(listeners: &[L4ListenerConfig]) {
                         break;
                     }
 
-                    let accept_result =
-                        timeout(Duration::from_secs(1), listener.accept()).await;
+                    let accept_result = timeout(Duration::from_secs(1), listener.accept()).await;
 
                     let (stream, peer_addr) = match accept_result {
                         Ok(Ok(s)) => s,

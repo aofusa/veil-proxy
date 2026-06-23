@@ -104,7 +104,11 @@ pub fn select_upstream<'a>(
                 .upstreams
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| health_state.get(*i).map_or(true, |h| h.load(Ordering::Relaxed)))
+                .filter(|(i, _)| {
+                    health_state
+                        .get(*i)
+                        .map_or(true, |h| h.load(Ordering::Relaxed))
+                })
                 .map(|(_, u)| u.weight.max(1) as usize)
                 .sum();
 
@@ -137,23 +141,21 @@ pub fn select_upstream<'a>(
             }
             None
         }
-        L4LbAlgorithm::LeastConn => {
-            config
-                .upstreams
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| {
-                    health_state
-                        .get(*i)
-                        .map_or(true, |h| h.load(Ordering::Relaxed))
-                })
-                .min_by_key(|(i, _)| {
-                    conn_counters
-                        .get(*i)
-                        .map_or(0, |c| c.load(Ordering::Relaxed))
-                })
-                .map(|(i, u)| (i, u.addr.as_str()))
-        }
+        L4LbAlgorithm::LeastConn => config
+            .upstreams
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| {
+                health_state
+                    .get(*i)
+                    .map_or(true, |h| h.load(Ordering::Relaxed))
+            })
+            .min_by_key(|(i, _)| {
+                conn_counters
+                    .get(*i)
+                    .map_or(0, |c| c.load(Ordering::Relaxed))
+            })
+            .map(|(i, u)| (i, u.addr.as_str())),
     }
 }
 
@@ -526,7 +528,10 @@ mod tests {
 
         let (idx, addr) = select_upstream(&config, &rr, &counters, &health).unwrap();
         assert_eq!(idx, 0);
-        assert_eq!(addr, "127.0.0.1:8001", "ties should resolve to first upstream");
+        assert_eq!(
+            addr, "127.0.0.1:8001",
+            "ties should resolve to first upstream"
+        );
     }
 
     #[test]
@@ -575,7 +580,11 @@ mod tests {
             let _guard = CounterGuard(counter.clone());
             assert_eq!(counter.current.load(Ordering::Relaxed), 1);
         }
-        assert_eq!(counter.current.load(Ordering::Relaxed), 0, "drop should decrement");
+        assert_eq!(
+            counter.current.load(Ordering::Relaxed),
+            0,
+            "drop should decrement"
+        );
     }
 
     #[test]
@@ -594,7 +603,10 @@ mod tests {
 
         let (idx, addr) = select_upstream(&config, &rr, &counters, &health).unwrap();
         assert_eq!(idx, 1);
-        assert_eq!(addr, "127.0.0.1:8002", "should pick upstream with fewest connections");
+        assert_eq!(
+            addr, "127.0.0.1:8002",
+            "should pick upstream with fewest connections"
+        );
     }
 
     #[test]
@@ -685,7 +697,11 @@ mod tests {
 
         for expected in 0..3 {
             let count = results.iter().filter(|&&i| i == expected).count();
-            assert_eq!(count, 2, "upstream[{}] should appear twice in 6 calls", expected);
+            assert_eq!(
+                count, 2,
+                "upstream[{}] should appear twice in 6 calls",
+                expected
+            );
         }
     }
 
@@ -719,7 +735,10 @@ mod tests {
         counters[idx1].fetch_add(1, Ordering::Relaxed);
 
         let (idx2, _) = select_upstream(&config, &rr, &counters, &health).unwrap();
-        assert_eq!(idx2, 1, "after incrementing idx1 counter, idx2 should be the other");
+        assert_eq!(
+            idx2, 1,
+            "after incrementing idx1 counter, idx2 should be the other"
+        );
         counters[idx2].fetch_add(1, Ordering::Relaxed);
 
         let (idx3, _) = select_upstream(&config, &rr, &counters, &health).unwrap();

@@ -1201,10 +1201,7 @@ fn main() {
         if !loaded_config.l4_listeners.is_empty() {
             info!("============================================");
             info!("L4 Stream Proxy");
-            info!(
-                "Listeners: {}",
-                loaded_config.l4_listeners.len()
-            );
+            info!("Listeners: {}", loaded_config.l4_listeners.len());
             info!("============================================");
             crate::l4::server::spawn_l4_listeners(&loaded_config.l4_listeners);
         }

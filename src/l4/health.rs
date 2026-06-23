@@ -67,10 +67,7 @@ pub fn spawn_l4_health_checker(config: Arc<L4ListenerConfig>, health_state: L4He
 
                     if !was_healthy && success_counts[i] >= hc.healthy_threshold {
                         health_state[i].store(true, Ordering::Relaxed);
-                        info!(
-                            "[L4:{}] upstream {} is now healthy",
-                            config.name, addr
-                        );
+                        info!("[L4:{}] upstream {} is now healthy", config.name, addr);
                         success_counts[i] = 0;
                     }
                 } else {
@@ -79,10 +76,7 @@ pub fn spawn_l4_health_checker(config: Arc<L4ListenerConfig>, health_state: L4He
 
                     if was_healthy && fail_counts[i] >= hc.unhealthy_threshold {
                         health_state[i].store(false, Ordering::Relaxed);
-                        warn!(
-                            "[L4:{}] upstream {} is now unhealthy",
-                            config.name, addr
-                        );
+                        warn!("[L4:{}] upstream {} is now unhealthy", config.name, addr);
                         fail_counts[i] = 0;
                     }
                 }
@@ -184,7 +178,10 @@ mod tests {
         spawn_l4_health_checker(config, state.clone());
         // スレッドが起動されなくても state は変わらない
         std::thread::sleep(std::time::Duration::from_millis(50));
-        assert!(state[0].load(Ordering::Relaxed), "state should remain healthy");
+        assert!(
+            state[0].load(Ordering::Relaxed),
+            "state should remain healthy"
+        );
     }
 
     #[test]
@@ -224,14 +221,15 @@ mod tests {
         if fail_count >= unhealthy_threshold {
             state[0].store(false, Ordering::Relaxed);
         }
-        assert!(!state[0].load(Ordering::Relaxed), "should be unhealthy after threshold");
+        assert!(
+            !state[0].load(Ordering::Relaxed),
+            "should be unhealthy after threshold"
+        );
 
         // 到達可能なサーバーに戻したら healthy に回復する
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr2 = listener.local_addr().unwrap().to_string();
-        let _server = std::thread::spawn(move || {
-            while let Ok(_) = listener.accept() {}
-        });
+        let _server = std::thread::spawn(move || while let Ok(_) = listener.accept() {});
 
         let result2 = perform_tcp_health_check(&addr2, Duration::from_secs(1));
         assert!(result2, "reachable addr should pass health check");
@@ -242,6 +240,9 @@ mod tests {
         if success_count >= healthy_threshold {
             state[0].store(true, Ordering::Relaxed);
         }
-        assert!(state[0].load(Ordering::Relaxed), "should be healthy after recovery");
+        assert!(
+            state[0].load(Ordering::Relaxed),
+            "should be healthy after recovery"
+        );
     }
 }

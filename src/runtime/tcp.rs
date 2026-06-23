@@ -25,8 +25,7 @@ use crate::runtime::executor::{
     take_op_result, with_ring,
 };
 use crate::runtime::ring::{
-    IORING_OP_ACCEPT, IORING_OP_CONNECT,
-    IORING_OP_POLL_ADD, IORING_OP_RECV, IORING_OP_SEND,
+    IORING_OP_ACCEPT, IORING_OP_CONNECT, IORING_OP_POLL_ADD, IORING_OP_RECV, IORING_OP_SEND,
 };
 
 // POLL イベントフラグ

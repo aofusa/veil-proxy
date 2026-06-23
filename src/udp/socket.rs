@@ -17,8 +17,8 @@ use std::os::unix::io::AsRawFd;
 
 // 非ブロッキング UDP ソケット（std::net::UdpSocket ラッパー）
 // monoio::net::udp::UdpSocket を削除し、std を使用する
-use std::net::UdpSocket;
 use crate::runtime::tcp::{wait_readable_fd, wait_writable_fd};
+use std::net::UdpSocket;
 
 /// GSO セグメントサイズ（QUIC パケットの典型的なサイズ）
 const GSO_SEGMENT_SIZE: usize = 1200;
