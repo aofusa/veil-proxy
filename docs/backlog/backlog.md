@@ -53,11 +53,11 @@
 | F-07 | P2 | 未着手 | [features/fuzzing-chaos-security.md](features/fuzzing-chaos-security.md) | ファジング・カオス・セキュリティスキャン |
 | F-08 | P2 | 未着手 | [features/proxy-wasm-benchmarks.md](features/proxy-wasm-benchmarks.md) | Proxy-Wasm ベンチマーク |
 | F-10 | P1 | 完了 | [features/opentelemetry.md](features/opentelemetry.md) | OpenTelemetry 対応 |
-| F-18 | P1 | 未着手 | [features/l4-stream-proxy.md](features/l4-stream-proxy.md) | L4 (TCP/UDP) ストリームプロキシ |
+| F-18 | P1 | 完了 | [features/l4-stream-proxy.md](features/l4-stream-proxy.md) | L4 (TCP/UDP) ストリームプロキシ |
 | F-19 | P2 | 完了 | [features/advanced-load-balancing.md](features/advanced-load-balancing.md) | 高度なロードバランシング (Weighted, Consistent Hash等) |
 | F-20 | P2 | 完了 | [features/proxy-cache-purge-advanced.md](features/proxy-cache-purge-advanced.md) | キャッシュのPurge機能・制御高度化 |
 | F-21 | P2 | 完了 | [features/structured-access-log-admin.md](features/structured-access-log-admin.md) | 構造化アクセスログと管理Admin API |
-| F-22 | P2 | 未着手 | [features/enhanced-health-check.md](features/enhanced-health-check.md) | ヘルスチェックの強化 (Active probing, TCP) |
+| F-22 | P2 | 完了 | [features/enhanced-health-check.md](features/enhanced-health-check.md) | ヘルスチェックの強化 (Active probing, TCP) |
 | F-23 | P1 | 完了 | [features/refactor-cargo-features.md](features/refactor-cargo-features.md) | Cargo.toml の features フラグ整理 |
 | F-24 | P2 | 未着手 | [features/F-24-zero-copy-pipeline-http2-http3.md](features/F-24-zero-copy-pipeline-http2-http3.md) | HTTP/2・HTTP/3 ゼロコピーパイプライン（splice / バッファ参照渡し） |
 | F-25 | P1 | 進行中 | [features/F-25-seccomp-bpf-prot-exec-validation.md](features/F-25-seccomp-bpf-prot-exec-validation.md) | seccomp BPF 引数レベル検証（mprotect/mmap で PROT_EXEC をブロック） |
