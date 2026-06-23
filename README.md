@@ -29,7 +29,8 @@ A high-performance reverse proxy server using io_uring (custom runtime) and rust
 ### Proxy Features
 - **Connection Pool**: Latency reduction through backend connection reuse (HTTP/HTTPS support)
 - **Load Balancing**: Request distribution to multiple backends (Round Robin/Least Connections/IP Hash/Weighted/Consistent Hash)
-- **Health Check**: Automatic failover with HTTP/TLS-based active health checks
+- **Health Check**: Automatic failover with HTTP/TCP/gRPC active health checks (HTTP with status code validation, TCP connect-only, gRPC Health Checking Protocol)
+- **L4 Stream Proxy**: TCP-level load balancing with Round Robin/LeastConn, TLS passthrough, connection limiting (requires `l4-proxy` feature)
 - **Circuit Breaker & Retry**: Per-server circuit breaker (Closed→Open→HalfOpen), outlier detection/ejection, EWMA latency tracking (requires `metrics` feature)
 - **Proxy Cache**: Memory and disk-based response caching (ETag/304, stale-while-revalidate, stale-if-error)
 - **Cache Purge Admin API**: Cache invalidation via HTTP (`PURGE` method or `POST /__admin/cache/purge`) with exact/prefix/glob/all modes and Bearer token auth
@@ -1423,64 +1424,94 @@ Monitors backend server health and automatically excludes unhealthy servers.
 
 | Option | Description | Default |
 |--------|-------------|---------|
+| `check_type` | Check protocol: `http`, `tcp`, or `grpc` | `http` |
 | `interval_secs` | Check interval (seconds) | 10 |
-| `path` | Path to check | `/` |
+| `path` | Path to check (HTTP: request path; gRPC: service name) | `/` |
 | `timeout_secs` | Timeout (seconds) | 5 |
-| `healthy_statuses` | Status codes considered successful | [200, 201, 202, 204, 301, 302, 304] |
+| `healthy_statuses` | Status codes considered successful (HTTP only) | [200, 201, 202, 204, 301, 302, 304] |
 | `unhealthy_threshold` | Consecutive failures to mark unhealthy | 3 |
 | `healthy_threshold` | Consecutive successes to mark healthy | 2 |
 | `use_tls` | Use TLS connection for health check | **false** |
 | `verify_cert` | Verify TLS certificate (use_tls=true only) | **true** |
 
-### Configuration Example
+### HTTP Health Check (default)
+
+Sends an HTTP/HTTPS request and validates the response status code.
 
 ```toml
 [upstreams."api-servers"]
 algorithm = "least_conn"
 servers = [
   "http://api1.internal:8080",
-  "http://api2.internal:8080",
-  "http://api3.internal:8080"
+  "http://api2.internal:8080"
 ]
 
   [upstreams."api-servers".health_check]
+  check_type = "http"      # default, can be omitted
   interval_secs = 10
   path = "/health"
   timeout_secs = 5
   healthy_statuses = [200]
   unhealthy_threshold = 3
   healthy_threshold = 2
-  # TLS health check (for HTTPS backends)
-  use_tls = false
-  verify_cert = true
+```
+
+### TCP Health Check
+
+Checks liveness by attempting a TCP connection only — no HTTP data is exchanged. Suitable for non-HTTP backends (databases, message brokers, etc.).
+
+```toml
+[upstreams."db-servers"]
+algorithm = "round_robin"
+servers = [
+  "http://db1.internal:5432",
+  "http://db2.internal:5432"
+]
+
+  [upstreams."db-servers".health_check]
+  check_type = "tcp"
+  interval_secs = 15
+  timeout_secs = 3
+  unhealthy_threshold = 2
+  healthy_threshold = 1
+```
+
+### gRPC Health Check
+
+Implements [gRPC Health Checking Protocol](https://github.com/grpc/grpc/blob/master/doc/health-checking.md) via HTTP/1.1 POST with `Content-Type: application/grpc`. A response of `grpc-status: 0` (OK) is treated as healthy.
+
+> **Note**: This implementation uses HTTP/1.1 framing. It works with backends that expose a gRPC health endpoint over HTTP/1.1 (gRPC-Web compatible). Full HTTP/2 gRPC is not currently supported.
+
+```toml
+[upstreams."grpc-servers"]
+algorithm = "least_conn"
+servers = [
+  "http://grpc1.internal:50051",
+  "http://grpc2.internal:50051"
+]
+
+  [upstreams."grpc-servers".health_check]
+  check_type = "grpc"
+  interval_secs = 10
+  path = "grpc.health.v1.Health"  # service name (empty = server-level check)
+  timeout_secs = 5
+  unhealthy_threshold = 3
+  healthy_threshold = 2
 ```
 
 ### TLS Health Check
 
-When `use_tls = true`, the health check uses TLS connection instead of plain HTTP. This is useful for monitoring HTTPS backends.
-
-**Configuration Example for TLS Health Check:**
+When `use_tls = true`, the health check uses TLS connection. Applies to both `http` and `grpc` check types.
 
 ```toml
-[upstreams."api-servers"]
-algorithm = "least_conn"
-servers = [
-  "https://api1.internal:8443",
-  "https://api2.internal:8443"
-]
-
   [upstreams."api-servers".health_check]
-  interval_secs = 10
+  check_type = "http"
   path = "/health"
-  timeout_secs = 5
-  healthy_statuses = [200]
-  # Enable TLS health check
   use_tls = true
-  # Verify certificate (set to false for self-signed certificates)
-  verify_cert = true
+  verify_cert = true   # set to false for self-signed certificates
 ```
 
-> **Note**: When `verify_cert = false`, self-signed certificates are accepted. This is useful for development environments, but not recommended for production.
+> **Note**: When `verify_cert = false`, self-signed certificates are accepted. Not recommended for production.
 
 ### Log Output
 
@@ -1490,6 +1521,107 @@ Health status changes are logged:
 [INFO] Upstream api1.internal:8080 is now unhealthy
 [INFO] Upstream api1.internal:8080 is now healthy
 ```
+
+## L4 Stream Proxy
+
+TCP-level (L4) load balancing proxy. Unlike the HTTP proxy, it forwards raw TCP streams without inspecting protocol payloads. Useful for databases, message brokers, Redis, SMTP, and any non-HTTP binary protocol.
+
+> **Requires**: build with `--features l4-proxy` (included in `--features full`)
+
+### Features
+
+- **Round Robin / LeastConn** load balancing across upstream TCP servers
+- **TLS Passthrough**: forward encrypted TLS without termination (SNI routing is not yet implemented)
+- **Connection Limiting**: reject connections when `max_connections` is reached
+- **Connect Timeout**: configurable upstream connection timeout
+- **Health Check Integration**: TCP or gRPC health checks per L4 listener
+- **Independent threads**: each L4 listener runs in its own thread on the io_uring runtime
+
+### Configuration
+
+L4 listeners are defined using `[[l4]]` sections (separate from HTTP routes). L4 listeners are started at launch and **cannot be hot-reloaded** via SIGHUP.
+
+```toml
+# TCP proxy for PostgreSQL (requires --features l4-proxy)
+[[l4]]
+name = "postgres-proxy"          # identifies this listener in logs
+listen = "0.0.0.0:5432"          # bind address
+lb = "least_conn"                # "round_robin" (default) or "least_conn"
+tls = "none"                     # "none" (default), "passthrough", or "terminate"
+max_connections = 200            # 0 = unlimited (default)
+connect_timeout_secs = 5         # default: 10
+
+  [[l4.upstreams]]
+  addr = "10.0.0.1:5432"
+  weight = 1
+
+  [[l4.upstreams]]
+  addr = "10.0.0.2:5432"
+  weight = 1
+
+  # Optional TCP health check
+  [l4.health_check]
+  check_type = "tcp"
+  interval_secs = 10
+  timeout_secs = 3
+  unhealthy_threshold = 2
+  healthy_threshold = 1
+```
+
+```toml
+# TCP proxy for Redis
+[[l4]]
+name = "redis-proxy"
+listen = "0.0.0.0:6379"
+lb = "round_robin"
+
+  [[l4.upstreams]]
+  addr = "redis1.internal:6379"
+
+  [[l4.upstreams]]
+  addr = "redis2.internal:6379"
+```
+
+```toml
+# gRPC TCP proxy with gRPC health check
+[[l4]]
+name = "grpc-proxy"
+listen = "0.0.0.0:50051"
+lb = "least_conn"
+max_connections = 500
+
+  [[l4.upstreams]]
+  addr = "grpc1.internal:50051"
+
+  [[l4.upstreams]]
+  addr = "grpc2.internal:50051"
+
+  [l4.health_check]
+  check_type = "grpc"
+  path = "grpc.health.v1.Health"
+  interval_secs = 15
+  timeout_secs = 5
+```
+
+### Configuration Reference
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `name` | Listener name (appears in logs) | required |
+| `listen` | Bind address (e.g. `"0.0.0.0:3306"`) | required |
+| `lb` | Load balancing: `round_robin` or `least_conn` | `round_robin` |
+| `tls` | TLS mode: `none`, `passthrough`, or `terminate` | `none` |
+| `max_connections` | Max simultaneous connections (0 = unlimited) | `0` |
+| `connect_timeout_secs` | Upstream connect timeout in seconds | `10` |
+| `upstreams[].addr` | Upstream address (`"host:port"`) | required |
+| `upstreams[].weight` | Weight (reserved for weighted RR) | `1` |
+| `health_check` | Optional health check config (same as upstream health_check) | none |
+
+### Notes
+
+- L4 listeners bind ports at startup. **SIGHUP does not reload L4 configuration**.
+- HTTP proxy and L4 proxy can coexist — they listen on different ports.
+- TLS termination (`tls = "terminate"`) is reserved for future implementation; currently treated as passthrough.
 
 ## Circuit Breaker & Resilience
 
