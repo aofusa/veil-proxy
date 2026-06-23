@@ -21,7 +21,7 @@ use std::task::{Context, Poll};
 
 use crate::runtime::buf::{IoBuf, IoBufMut};
 use crate::runtime::executor::{
-    next_user_data, peek_op_result, register_op, remove_op, set_op_waker, submit_sqes,
+    detach_op, next_user_data, peek_op_result, register_op, remove_op, set_op_waker, submit_sqes,
     take_op_result, with_ring,
 };
 use crate::runtime::ring::{
@@ -68,7 +68,12 @@ fn storage_to_sockaddr(storage: &libc::sockaddr_storage) -> io::Result<SocketAdd
     match storage.ss_family as libc::c_int {
         libc::AF_INET => {
             let sin = unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
-            let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr).to_ne_bytes());
+            // s_addr はネットワークバイトオーダ。Ipv4Addr::from(u32) はホストオーダの u32 を
+            // a.b.c.d として解釈するため from_be 後の値をそのまま渡す。以前は
+            // from_be(...).to_ne_bytes() で二重変換して IP が逆順（例: 127.0.0.1 → 1.0.0.127）
+            // になっていた。これは accept が返すクライアント IP を破壊し、IP ハッシュ・
+            // source_ip 条件・アクセスログ等を誤らせる重大バグだった。
+            let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
             let port = u16::from_be(sin.sin_port);
             Ok(SocketAddr::V4(std::net::SocketAddrV4::new(ip, port)))
         }
@@ -308,6 +313,33 @@ impl<'a> Future for Accept<'a> {
                 set_op_waker(self.user_data, cx.waker().clone());
                 Poll::Pending
             }
+        }
+    }
+}
+
+impl Drop for Accept<'_> {
+    fn drop(&mut self) {
+        // 提出済みかつ未 take（タイムアウト等で in-flight のまま drop された）の場合、
+        // カーネルは addr バッファに書き込む可能性があるため、バッファを生かしたまま
+        // detach し、ASYNC_CANCEL で孤立 accept を除去する。accept が接続を確保済み
+        // だった場合は、その fd を後始末でクローズする（接続を奪ったまま放置しない）。
+        if self.submitted {
+            let storage = std::mem::replace(&mut self.addr_storage, Box::new(unsafe {
+                std::mem::zeroed()
+            }));
+            let len = std::mem::replace(&mut self.addr_len, Box::new(0));
+            detach_op(
+                self.user_data,
+                Box::new(move |res| {
+                    // op の完了/キャンセルが確定したのでここで解放する。
+                    drop(storage);
+                    drop(len);
+                    if res >= 0 {
+                        // accept が成功して fd を得ていたが Future は消えている → クローズ。
+                        unsafe { libc::close(res) };
+                    }
+                }),
+            );
         }
     }
 }
@@ -991,3 +1023,4 @@ pub fn wait_writable_fd(fd: RawFd) -> WritableFd {
         submitted: false,
     }
 }
+

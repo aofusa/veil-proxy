@@ -69,16 +69,32 @@ pub enum OpResult {
     Done(i32),
 }
 
+/// ドロップされた in-flight op の後始末ガード。
+///
+/// io_uring に提出済みで未完了の op を持つ Future がドロップされた場合、カーネルはまだ
+/// バッファ（accept の addr、read/write のデータ領域）を参照し続けている可能性があるため、
+/// 即座に解放すると use-after-free になる。ガードはそれら所有リソースを保持し、op の完了
+/// またはキャンセルの CQE 到着時に呼ばれて後始末（バッファ解放、accept で得た fd の
+/// クローズ等）を行う。引数は CQE.res。
+pub type OpGuard = Box<dyn FnOnce(i32)>;
+
+/// ASYNC_CANCEL op 自身の user_data に使うセンチネル（テーブルに登録されないため無視される）。
+/// USER_DATA_COUNTER は 1 から単調増加するため衝突しない。
+const CANCEL_SENTINEL_USER_DATA: u64 = u64::MAX;
+
 /// スレッドローカルな操作テーブル
 struct OpTable {
-    /// user_data -> (OpResult, Waker)
+    /// user_data -> (OpResult, Waker)（Future が生存している op）
     ops: HashMap<u64, (OpResult, Option<Waker>)>,
+    /// user_data -> ガード（Future がドロップされ detach された op）
+    detached: HashMap<u64, OpGuard>,
 }
 
 impl OpTable {
     fn new() -> Self {
         Self {
             ops: HashMap::new(),
+            detached: HashMap::new(),
         }
     }
 
@@ -102,8 +118,41 @@ impl OpTable {
                 waker.wake();
             }
             true
+        } else if let Some(guard) = self.detached.remove(&cqe.user_data) {
+            // detach 済み op が完了/キャンセルした。ここで初めてバッファ解放・fd クローズを行う。
+            guard(cqe.res);
+            true
         } else {
+            // 未知の user_data（ASYNC_CANCEL 自身の CQE 等）→ 無視。
             false
+        }
+    }
+
+    /// in-flight op を detach する。
+    ///
+    /// 戻り値が true の場合、呼び出し側は ASYNC_CANCEL を投げてカーネルに早期キャンセルを
+    /// 依頼する（accept のように放置すると次の接続を奪う op のため）。
+    fn detach(&mut self, user_data: u64, guard: OpGuard) -> bool {
+        match self.ops.get(&user_data) {
+            Some((OpResult::Done(res), _)) => {
+                // 既に完了済み（CQE 到着済みだが take されていない）。即座に後始末。
+                let res = *res;
+                self.ops.remove(&user_data);
+                guard(res);
+                false
+            }
+            Some((OpResult::Pending, _)) => {
+                // 未完了。ガードを保持して完了/キャンセルの CQE を待つ。
+                self.ops.remove(&user_data);
+                self.detached.insert(user_data, guard);
+                true
+            }
+            None => {
+                // 既に take 済み（Future が正常完了して結果を取り出した）。カーネルはもう
+                // バッファを触らないので、ガードは呼ばずに破棄する（accept fd は引き取り済み）。
+                drop(guard);
+                false
+            }
         }
     }
 
@@ -237,6 +286,35 @@ pub fn remove_op(user_data: u64) {
     OP_TABLE.with(|t| t.borrow_mut().remove(user_data));
 }
 
+/// in-flight op を detach し、必要なら ASYNC_CANCEL を投げる。
+///
+/// 提出済み・未完了の op を持つ Future がドロップされたときに呼ぶ。`guard` はカーネルが
+/// 参照中のバッファ等を保持し、op の完了/キャンセル時に後始末（バッファ解放・accept fd の
+/// クローズ等）を行う。これにより「タイムアウト等で in-flight Future を drop した際に
+/// カーネルが参照中のメモリを解放してしまう use-after-free」や「孤立した accept が後続の
+/// 接続を奪って捨ててしまう問題」を防ぐ。
+pub fn detach_op(user_data: u64, guard: OpGuard) {
+    let should_cancel = OP_TABLE.with(|t| t.borrow_mut().detach(user_data, guard));
+    if should_cancel {
+        submit_cancel(user_data);
+    }
+}
+
+/// 指定した user_data の in-flight op に ASYNC_CANCEL を投げる（ベストエフォート）。
+fn submit_cancel(target_user_data: u64) {
+    with_ring(|ring| {
+        if let Some(sqe) = ring.get_sqe() {
+            sqe.opcode = IORING_OP_ASYNC_CANCEL;
+            sqe.fd = -1;
+            // ASYNC_CANCEL は addr フィールドにキャンセル対象 op の user_data を入れる。
+            sqe.addr_or_splice_off_in = target_user_data;
+            // キャンセル op 自身の CQE はテーブル未登録のため on_cqe で無視される。
+            sqe.user_data = CANCEL_SENTINEL_USER_DATA;
+        }
+    });
+    let _ = submit_sqes();
+}
+
 // ====================
 // io_uring イベントループ
 // ====================
@@ -346,6 +424,11 @@ impl Task {
 }
 
 /// シングルスレッドエグゼキュータ
+///
+/// `queue` は `Arc<Mutex<_>>` で共有可能。Clone すると同一キューを参照するため、
+/// `block_on` するエグゼキュータと `spawn()` 先のスレッドローカルエグゼキュータを
+/// 一致させられる（一致しないと spawn したタスクがポーリングされない）。
+#[derive(Clone)]
 pub struct Executor {
     queue: Arc<Mutex<TaskQueue>>,
 }
@@ -471,4 +554,17 @@ where
             .expect("executor not initialized for this thread");
         exec.spawn(future);
     });
+}
+
+/// 現在のスレッドのグローバルエグゼキュータ（`spawn()` と同じキューを共有）を取得する。
+///
+/// これを使って `block_on` することで、`spawn()` されたタスクが確実に同じイベント
+/// ループでポーリングされる。
+pub fn current_executor() -> Executor {
+    EXECUTOR.with(|e| {
+        e.borrow()
+            .as_ref()
+            .expect("executor not initialized for this thread")
+            .clone()
+    })
 }

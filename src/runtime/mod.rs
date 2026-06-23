@@ -108,8 +108,11 @@ where
     // スレッドローカルエグゼキュータを初期化
     executor::init_executor();
 
-    // エグゼキュータを作成して Future を実行
-    let exec = Executor::new();
+    // spawn() と同じスレッドローカルエグゼキュータ（同一キュー）上で実行する。
+    // 別途 Executor::new() で作ったエグゼキュータを使うと、spawn() されたタスクが
+    // スレッドローカル側のキューに積まれて永遠にポーリングされない（接続を accept
+    // しても handle_connection が動かず応答できなくなる）。
+    let exec = executor::current_executor();
     exec.block_on(future)
 }
 
