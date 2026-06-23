@@ -55,3 +55,14 @@ BPF_JMP BPF_JSET BPF_K k=4 jt=deny jf=allow  # PROT_EXEC set?
 ## 優先度
 
 P1（セキュリティ強化）
+
+---
+
+## 完了メモ（2026-06-23）
+
+PROT_EXEC 引数レベル検証は実装されていたが **2 つのバグで全く機能していなかった**ため修正した:
+
+1. **mmap の BPF ジャンプ off-by-one**: mprotect チェックブロックが 4 命令（LD/JSET/RET/RET）なのに 3 命令と誤算（`remaining+5`）。全 `mmap` が mprotect ブロックの `RET(deny)` に着地し**無条件拒否**（filter モードで起動直後にクラッシュする致命バグ）。`remaining+6` に修正。
+2. **mprotect の prot 引数オフセット誤り**: `prot` は第 3 引数 `args[2]`（offset 32）なのに `args[1]=len`（offset 24）を検査。PROT_EXEC 付き mprotect が素通りしていた。`args[2]` を検査するよう修正。
+
+子プロセスで実際に seccomp filter を適用し「RW-mmap 許可 / EXEC-mmap 拒否 / EXEC-mprotect 拒否 / RW-mprotect 許可」を検証する実機テストを `src/security.rs` に追加（終了コード 15 を期待）。

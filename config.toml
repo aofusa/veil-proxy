@@ -239,8 +239,12 @@ max_log_size = 104857600
 #
 # 背景:
 #   - Googleの報告でバグバウンティの60%がio_uring関連
-#   - IORING_REGISTER_RESTRICTIONS (Linux 5.10+) は直接使用不可（monoioが抽象化）
-#   - 代替としてseccompでプロセス全体のシステムコールを制限
+#   - IORING_REGISTER_RESTRICTIONS (Linux 5.10+) を独自 io_uring ランタイムで適用済み。
+#     リング生成時に許可オペコード（ACCEPT/CONNECT/RECV/SEND/POLL_ADD/TIMEOUT/CLOSE/
+#     SPLICE/POLL_REMOVE/ASYNC_CANCEL/NOP）以外を -EACCES で拒否する（自動・設定不要）。
+#   - 加えて seccomp でプロセス全体のシステムコールを制限（多層防御）。
+#   - seccomp filter モードでは mmap/mprotect の PROT_EXEC を BPF の引数レベルで拒否し、
+#     任意コード実行（RCE）に必要な実行可能メモリの確保を阻止する（WASM 用は初期化済み）。
 #
 # 注意:
 #   - seccompは不可逆（一度適用すると解除不可）

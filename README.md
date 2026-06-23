@@ -2550,6 +2550,7 @@ Veil provides a WASM extension system fully compliant with Proxy-Wasm ABI v0.2.1
 - **Proxy-Wasm v0.2.1 Compliant**: 100% compatible with Nginx/Envoy
 - **AOT Compilation**: Fast startup with `.cwasm` files
 - **Pooling Allocator**: High-speed instance creation
+- **Async Execution (no Head-of-Line blocking)**: Modules run on wasmtime async support with fuel-based cooperative yielding (every ~10k instructions), so a CPU-heavy filter cannot stall the io_uring worker's other I/O
 - **Capability Restrictions**: Fine-grained per-module permission control (all disabled by default)
 
 ### Build

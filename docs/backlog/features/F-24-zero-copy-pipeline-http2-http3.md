@@ -58,3 +58,13 @@ pub struct Stream {
 ## 優先度
 
 P2（F-28 完了後に着手）
+
+---
+
+## 完了メモ（2026-06-23）
+
+- **HTTP/1.1 + kTLS の splice ゼロコピー経路は実装済み**（`src/proxy.rs` の `proxy_http_request_splice` / `splice_body_transfer` / `splice_transfer_response_ktls`）。`SPLICE_F_NONBLOCK` のノンブロッキング splice を io_uring の readiness `.await` と組み合わせて駆動しており、ワーカーをブロックしない非同期パスになっている（スレッドローカル/ストリーム毎パイプ再利用）。kTLS の恩恵を最大化する経路はここ。
+- **HTTP/2**: Veil は HTTP/2 を終端し HTTP/1.1 へ再シリアライズする終端型プロキシのため、フレーム単位の `IORING_OP_SPLICE` による端から端へのゼロコピーは適用できない。代わりに F-26 でボディの deep clone を排除し冗長コピーを削減した。
+- **HTTP/3**: QUIC/UDP は quiche がユーザー空間で暗号化・再送制御を行う設計のため、TCP splice 相当のカーネルゼロコピーは原理的に不可。
+
+end-to-end splice は終端型プロキシのアーキテクチャ上 HTTP/1.1+kTLS 経路に限定されるのが現実的な最適解であり、その経路は非同期・ゼロコピーで実装済み。

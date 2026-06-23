@@ -61,3 +61,18 @@ store.fuel_async_yield_interval(Some(10_000))?;  // 10k 命令ごとに Yield
 ## 優先度
 
 P2
+
+---
+
+## 完了メモ（2026-06-23）
+
+`config.async_support(true)` が設定されていたにもかかわらず、WASM 実行は**同期 `Func::call` / `InstancePre::instantiate` を使用**しており、wasmtime 40 ではこれらが async ストア上で **panic**（`must use *_async`）する。実モジュール実行時に毎回パニックする壊れた状態だった。
+
+修正内容:
+
+- `src/wasm/engine.rs` の全ライフサイクル呼び出し（102 箇所の `func.call` + 15 箇所の `instantiate`）を `call_async().await` / `instantiate_async().await` に変換し、`execute_on_*` および公開ラッパを async 化。
+- `store.fuel_async_yield_interval(Some(10_000))` を追加し、10,000 命令ごとに協調的に yield。CPU バウンドな WASM が io_uring ワーカーを占有して他 I/O をストールさせる Head-of-Line Blocking を解消。
+- ホットパス（proxy.rs / http3_server.rs の async ハンドラ）は `.await` で駆動。背景スレッド（WASM tick スレッド等）は `futures::executor::block_on` で駆動（ホットパスではない）。
+- インスタンスは wasmtime の **Pooling Allocator**（`InstanceAllocationStrategy::Pooling`）からスロット再利用で確保されるため、リクエストごとの `instantiate_async` でもアロケーションコストは抑制される。完全初期化済みインスタンスのキャッシュ（_start/configure のスキップ）は今後の追加最適化。
+
+実モジュール（`header_filter.wasm`）がパニックせず `FilterResult` を返すことを `src/wasm/engine.rs` のスモークテストで検証。

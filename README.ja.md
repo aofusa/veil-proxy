@@ -2551,6 +2551,7 @@ VeilはProxy-Wasm ABI v0.2.1に完全準拠したWASM拡張システムを提供
 - **Proxy-Wasm v0.2.1準拠**: Nginx/Envoyと100%互換
 - **AOTコンパイル**: `.cwasm`ファイルによる高速起動
 - **Pooling Allocator**: 高速なインスタンス化
+- **非同期実行（Head-of-Line ブロッキングなし）**: wasmtime async support + Fuel ベースの協調的 yield（約10k命令ごと）で実行。CPU バウンドなフィルタが io_uring ワーカーの他 I/O をストールさせない
 - **Capability制限**: モジュールごとの細かい権限制御（デフォルト全て無効）
 
 ### ビルド

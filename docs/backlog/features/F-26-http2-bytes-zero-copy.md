@@ -60,3 +60,11 @@ pub struct Stream {
 ## 優先度
 
 P2
+
+---
+
+## 完了メモ（2026-06-23）
+
+`Stream.request_body` / `response_body` は `bytes::BytesMut` 化済みだった。加えて HTTP/2 → バックエンド転送経路（`src/proxy.rs`）に残っていた **`stream.request_body.clone()`（BytesMut の deep clone = ボディ全体の memcpy）を排除**し、`std::mem::take(&mut stream.request_body).freeze()` で所有権ごとゼロコピーに変換（`Bytes` 参照カウント共有）。
+
+アーキテクチャ上の注記: Veil の HTTP/2 はプロキシで終端し、バックエンドへは HTTP/1.1 として**再シリアライズ**するため、DATA フレームのボディは最終的に HTTP/1.1 リクエストバッファへ 1 度はまとめられる（プロトコル変換のため不可避）。本変更はその経路上の**冗長なコピー**を除去するもの。

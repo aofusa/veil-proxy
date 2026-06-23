@@ -102,3 +102,15 @@ const IORING_REGISTER: i64 = 427; // io_uring_register(2)
 ## 優先度
 
 P1（本タスクの核心）
+
+---
+
+## 完了メモ（2026-06-23）
+
+カスタム io_uring ランタイム（`src/runtime/`）は実装済みだったが、**`IORING_REGISTER_RESTRICTIONS` が 3 つのバグで完全に無効化**されていたため修正した:
+
+1. `IoUringRestriction` 構造体が 20 バイトでカーネルの 16 バイトと ABI 不一致（union メンバを別フィールド化 + `resv` を u32 化）。
+2. リングを `IORING_SETUP_R_DISABLED` なしで生成 → `apply_restrictions` が `-EBADFD` で失敗し debug ログに握り潰し。
+3. `enable_rings()` 未呼び出し（かつ制限後は ENABLE_RINGS 自体の register_op 許可が必要）。
+
+「R_DISABLED 生成 → 制限登録（ENABLE_RINGS 許可含む）→ ENABLE_RINGS」の正しいシーケンスに修正。許可外オペコードが `-EACCES` で拒否されること・構造体が 16 バイトであることを `src/runtime/ring.rs` の単体テストで検証。許可オペコード = ACCEPT/CONNECT/RECV/SEND/POLL_ADD/TIMEOUT/CLOSE/SPLICE/POLL_REMOVE/ASYNC_CANCEL/NOP。
