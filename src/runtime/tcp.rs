@@ -153,7 +153,7 @@ impl TcpListener {
             return Err(io::Error::last_os_error());
         }
 
-        let ret = unsafe { libc::listen(fd, 128) };
+        let ret = unsafe { libc::listen(fd, 1024) };
         if ret < 0 {
             unsafe { libc::close(fd) };
             return Err(io::Error::last_os_error());
@@ -201,7 +201,7 @@ impl TcpListener {
             return Err(io::Error::last_os_error());
         }
 
-        let ret = unsafe { libc::listen(fd, 128) };
+        let ret = unsafe { libc::listen(fd, 1024) };
         if ret < 0 {
             unsafe { libc::close(fd) };
             return Err(io::Error::last_os_error());
