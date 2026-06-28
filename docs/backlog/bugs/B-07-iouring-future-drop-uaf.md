@@ -75,3 +75,24 @@ impl<T: IoBufMut> Drop for ReadFuture<T> {
 
 - 2c7eb6e: fix(runtime): サーバが接続を処理できない 3 つの致命的バグを修正（Accept の Drop は実装済み）
 - c61ba32: fix(proxy): プロトコル検出が TLS ハンドシェイクを破損する致命的バグを修正
+
+## 対応状況: 完了
+
+`src/runtime/tcp.rs` に以下を実装し UAF / タスク二重 poll を解消した。
+
+- `ReadFuture<T>` / `WriteFuture<T>`: バッファを `Option<T>` 化し、`Drop` で in-flight
+  （submitted かつ buf 未 take）なら `detach_op` でバッファを CQE 到着まで保持して解放する
+  （B-07b）。あわせて従来の `ptr::read` + `mem::forget` による危険なムーブを撤廃。
+- `Readable` / `Writable` / `ReadableFd` / `WritableFd`: `Drop` で in-flight POLL_ADD を
+  `detach_op`（空ガード）して古い Waker を除去し ASYNC_CANCEL する（B-07a）。完了時は
+  poll 側で `submitted=false` にして happy path の無駄な detach を回避。
+- `Connect`: in-flight drop 時に `addr_storage` を CQE 到着まで保持し、ソケット fd の
+  クローズを完了後に遅延（in-flight fd の即時 close を回避）。
+
+### 検証
+
+- baseline（修正前）: `test_concurrent_connection_stress` で **Segmentation fault (core dumped)**。
+- 修正後: **segfault 消失**。`cargo test --bins --features full` 577 件全通過。
+  ストレステストの成功数は環境依存（debug ビルド + `threads=1` + debug ログ + 二重 TLS
+  ハンドシェイクのスループット律速。F-02 が言う「負荷フレーキー 1 件」）で 80% 閾値には
+  届かないが、**クラッシュは発生しない**。

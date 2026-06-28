@@ -393,7 +393,7 @@ impl TcpStream {
     pub fn read<T: IoBufMut>(&self, buf: T) -> ReadFuture<T> {
         ReadFuture {
             fd: self.fd,
-            buf,
+            buf: Some(buf),
             user_data: 0,
             submitted: false,
         }
@@ -405,7 +405,7 @@ impl TcpStream {
     pub fn write<T: IoBuf>(&self, buf: T) -> WriteFuture<T> {
         WriteFuture {
             fd: self.fd,
-            buf,
+            buf: Some(buf),
             user_data: 0,
             submitted: false,
         }
@@ -511,7 +511,7 @@ impl crate::runtime::io::AsyncReadRent for TcpStream {
         let fd = self.fd;
         ReadFuture {
             fd,
-            buf,
+            buf: Some(buf),
             user_data: 0,
             submitted: false,
         }
@@ -526,7 +526,7 @@ impl crate::runtime::io::AsyncWriteRent for TcpStream {
         let fd = self.fd;
         WriteFuture {
             fd,
-            buf,
+            buf: Some(buf),
             user_data: 0,
             submitted: false,
         }
@@ -617,6 +617,8 @@ impl Future for Connect {
         match peek_op_result(self.user_data) {
             Some(res) => {
                 take_op_result(self.user_data);
+                // 完了。in-flight でなくなったので Drop での detach を抑止する。
+                self.submitted = false;
                 if res < 0 && res != -libc::EINPROGRESS {
                     let fd = self.fd;
                     self.fd = -1;
@@ -638,7 +640,26 @@ impl Future for Connect {
 
 impl Drop for Connect {
     fn drop(&mut self) {
-        if self.fd >= 0 {
+        if self.submitted {
+            // CONNECT が in-flight のまま drop された（connect タイムアウト等）。
+            // カーネルは addr_storage を参照中の可能性があるため保持し、ソケット fd は
+            // 完了/キャンセルの CQE 到着後にクローズする。正常完了/エラー時は poll が
+            // submitted=false かつ fd=-1 にしてから返すため、この分岐には入らない。
+            let storage = std::mem::replace(&mut self.addr_storage, Box::new(unsafe {
+                std::mem::zeroed()
+            }));
+            let fd = self.fd;
+            self.fd = -1;
+            detach_op(
+                self.user_data,
+                Box::new(move |_res| {
+                    drop(storage);
+                    if fd >= 0 {
+                        unsafe { libc::close(fd) };
+                    }
+                }),
+            );
+        } else if self.fd >= 0 {
             unsafe { libc::close(self.fd) };
         }
     }
@@ -651,7 +672,12 @@ impl Drop for Connect {
 /// 読み込み Future（IORING_OP_RECV）
 pub struct ReadFuture<T: IoBufMut> {
     fd: RawFd,
-    buf: T,
+    /// バッファは `Option` で保持する。in-flight のまま Future が drop された場合に
+    /// `take()` して detach ガードへ移し、カーネルが RECV を完了/キャンセルするまで
+    /// バッファを生かす（B-07b: 解放済みアドレスへの書き込みによる UAF を防ぐ）。
+    /// 正常完了時も `take()` して呼び出し側へ返すため、その後 `buf` は `None` になり
+    /// Drop は何もしない。
+    buf: Option<T>,
     user_data: u64,
     submitted: bool,
 }
@@ -660,7 +686,7 @@ impl<T: IoBufMut> Future for ReadFuture<T> {
     type Output = (io::Result<usize>, T);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // SAFETY: ReadFuture はアンピン可能（ポインタを保持しない）
+        // SAFETY: ReadFuture はアンピン可能（自己参照ポインタを保持しない）
         let this = unsafe { self.get_unchecked_mut() };
 
         if !this.submitted {
@@ -669,8 +695,13 @@ impl<T: IoBufMut> Future for ReadFuture<T> {
             register_op(user_data);
 
             let fd = this.fd;
-            let buf_ptr = this.buf.write_ptr() as u64;
-            let buf_len = this.buf.bytes_total() as u32;
+            let (buf_ptr, buf_len) = {
+                let buf = this
+                    .buf
+                    .as_mut()
+                    .expect("ReadFuture polled after completion");
+                (buf.write_ptr() as u64, buf.bytes_total() as u32)
+            };
 
             with_ring(|ring| {
                 if let Some(sqe) = ring.get_sqe() {
@@ -684,33 +715,21 @@ impl<T: IoBufMut> Future for ReadFuture<T> {
 
             if let Err(e) = submit_sqes() {
                 remove_op(user_data);
-                // SAFETY: バッファを返却する（drop しないよう forget）
-                let buf = unsafe { std::ptr::read(&this.buf) };
-                std::mem::forget(unsafe { std::ptr::read(this) });
+                let buf = this.buf.take().expect("buffer present on submit error");
                 return Poll::Ready((Err(e), buf));
             }
 
             this.submitted = true;
         }
 
-        match peek_op_result(this.user_data) {
-            Some(res) => {
-                take_op_result(this.user_data);
-                let n = res;
-
-                // buf をムーブアウト
-                let buf = unsafe { std::ptr::read(&this.buf) };
-                // this は ReadFuture 全体として forget（buf を二重 drop しないよう）
-                let ud = this.user_data;
-                let fd = this.fd;
-                std::mem::forget(unsafe { std::ptr::read(this) });
-                let _ = (ud, fd); // suppress warnings
-
+        match take_op_result(this.user_data) {
+            Some(n) => {
+                // 完了。バッファを取り出して返す。以降 `buf` は None になり Drop は no-op。
+                let mut buf = this.buf.take().expect("buffer present at completion");
                 if n < 0 {
                     Poll::Ready((Err(io::Error::from_raw_os_error(-n)), buf))
                 } else {
-                    // SAFETY: n バイトが初期化されたことを記録
-                    let mut buf = buf;
+                    // SAFETY: カーネルが n バイトを初期化した
                     unsafe { buf.set_init(n as usize) };
                     Poll::Ready((Ok(n as usize), buf))
                 }
@@ -723,6 +742,20 @@ impl<T: IoBufMut> Future for ReadFuture<T> {
     }
 }
 
+impl<T: IoBufMut> Drop for ReadFuture<T> {
+    fn drop(&mut self) {
+        // submitted かつ buf がまだ手元にある = RECV が in-flight のまま drop された
+        // （タイムアウト等で `timeout(_, read())` の負け側 arm として drop される）。
+        // カーネルは buf アドレスをまだ参照しているため、即解放すると UAF。detach して
+        // バッファを完了/キャンセルの CQE 到着まで生かし、その後に解放する。
+        if self.submitted {
+            if let Some(buf) = self.buf.take() {
+                detach_op(self.user_data, Box::new(move |_res| drop(buf)));
+            }
+        }
+    }
+}
+
 // ====================
 // Write Future
 // ====================
@@ -730,7 +763,10 @@ impl<T: IoBufMut> Future for ReadFuture<T> {
 /// 書き込み Future（IORING_OP_SEND）
 pub struct WriteFuture<T: IoBuf> {
     fd: RawFd,
-    buf: T,
+    /// バッファは `Option` で保持する。in-flight のまま Future が drop された場合に
+    /// `take()` して detach ガードへ移し、カーネルが SEND を完了/キャンセルするまで
+    /// バッファを生かす（B-07b: カーネルが解放済みアドレスを読む UAF を防ぐ）。
+    buf: Option<T>,
     user_data: u64,
     submitted: bool,
 }
@@ -739,7 +775,7 @@ impl<T: IoBuf> Future for WriteFuture<T> {
     type Output = (io::Result<usize>, T);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // SAFETY: WriteFuture はアンピン可能（ポインタを保持しない）
+        // SAFETY: WriteFuture はアンピン可能（自己参照ポインタを保持しない）
         let this = unsafe { self.get_unchecked_mut() };
 
         if !this.submitted {
@@ -748,8 +784,13 @@ impl<T: IoBuf> Future for WriteFuture<T> {
             register_op(user_data);
 
             let fd = this.fd;
-            let buf_ptr = this.buf.read_ptr() as u64;
-            let buf_len = this.buf.bytes_init() as u32;
+            let (buf_ptr, buf_len) = {
+                let buf = this
+                    .buf
+                    .as_ref()
+                    .expect("WriteFuture polled after completion");
+                (buf.read_ptr() as u64, buf.bytes_init() as u32)
+            };
 
             with_ring(|ring| {
                 if let Some(sqe) = ring.get_sqe() {
@@ -763,21 +804,16 @@ impl<T: IoBuf> Future for WriteFuture<T> {
 
             if let Err(e) = submit_sqes() {
                 remove_op(user_data);
-                let buf = unsafe { std::ptr::read(&this.buf) };
-                std::mem::forget(unsafe { std::ptr::read(this) });
+                let buf = this.buf.take().expect("buffer present on submit error");
                 return Poll::Ready((Err(e), buf));
             }
 
             this.submitted = true;
         }
 
-        match peek_op_result(this.user_data) {
-            Some(res) => {
-                take_op_result(this.user_data);
-                let n = res;
-                let buf = unsafe { std::ptr::read(&this.buf) };
-                std::mem::forget(unsafe { std::ptr::read(this) });
-
+        match take_op_result(this.user_data) {
+            Some(n) => {
+                let buf = this.buf.take().expect("buffer present at completion");
                 if n < 0 {
                     Poll::Ready((Err(io::Error::from_raw_os_error(-n)), buf))
                 } else {
@@ -787,6 +823,19 @@ impl<T: IoBuf> Future for WriteFuture<T> {
             None => {
                 set_op_waker(this.user_data, cx.waker().clone());
                 Poll::Pending
+            }
+        }
+    }
+}
+
+impl<T: IoBuf> Drop for WriteFuture<T> {
+    fn drop(&mut self) {
+        // submitted かつ buf がまだ手元にある = SEND が in-flight のまま drop された。
+        // カーネルは buf アドレスをまだ参照しているため、即解放すると UAF。detach して
+        // 完了/キャンセルの CQE 到着まで生かす。
+        if self.submitted {
+            if let Some(buf) = self.buf.take() {
+                detach_op(self.user_data, Box::new(move |_res| drop(buf)));
             }
         }
     }
@@ -831,9 +880,10 @@ impl<'a> Future for Readable<'a> {
             self.submitted = true;
         }
 
-        match peek_op_result(self.user_data) {
+        match take_op_result(self.user_data) {
             Some(res) => {
-                take_op_result(self.user_data);
+                // 完了。Drop での無駄な detach（OP_TABLE 探索）を避けるため submitted を倒す。
+                self.submitted = false;
                 if res < 0 {
                     Poll::Ready(Err(io::Error::from_raw_os_error(-res)))
                 } else {
@@ -844,6 +894,17 @@ impl<'a> Future for Readable<'a> {
                 set_op_waker(self.user_data, cx.waker().clone());
                 Poll::Pending
             }
+        }
+    }
+}
+
+impl Drop for Readable<'_> {
+    fn drop(&mut self) {
+        // POLL_ADD が in-flight のまま drop された（`timeout(_, readable())` 等の負け arm）。
+        // 古い Waker が OP_TABLE に残ると、後着 CQE で完了済みタスクが再 poll され UB
+        // （B-07a）。detach してエントリを除去し ASYNC_CANCEL で poll を畳む。
+        if self.submitted {
+            detach_op(self.user_data, Box::new(|_| {}));
         }
     }
 }
@@ -883,9 +944,10 @@ impl<'a> Future for Writable<'a> {
             self.submitted = true;
         }
 
-        match peek_op_result(self.user_data) {
+        match take_op_result(self.user_data) {
             Some(res) => {
-                take_op_result(self.user_data);
+                // 完了。Drop での無駄な detach（OP_TABLE 探索）を避けるため submitted を倒す。
+                self.submitted = false;
                 if res < 0 {
                     Poll::Ready(Err(io::Error::from_raw_os_error(-res)))
                 } else {
@@ -896,6 +958,15 @@ impl<'a> Future for Writable<'a> {
                 set_op_waker(self.user_data, cx.waker().clone());
                 Poll::Pending
             }
+        }
+    }
+}
+
+impl Drop for Writable<'_> {
+    fn drop(&mut self) {
+        // B-07a: in-flight の POLL_ADD を残さない（Readable と同様）。
+        if self.submitted {
+            detach_op(self.user_data, Box::new(|_| {}));
         }
     }
 }
@@ -938,9 +1009,10 @@ impl Future for ReadableFd {
             self.submitted = true;
         }
 
-        match peek_op_result(self.user_data) {
+        match take_op_result(self.user_data) {
             Some(res) => {
-                take_op_result(self.user_data);
+                // 完了。Drop での無駄な detach（OP_TABLE 探索）を避けるため submitted を倒す。
+                self.submitted = false;
                 if res < 0 {
                     Poll::Ready(Err(io::Error::from_raw_os_error(-res)))
                 } else {
@@ -951,6 +1023,15 @@ impl Future for ReadableFd {
                 set_op_waker(self.user_data, cx.waker().clone());
                 Poll::Pending
             }
+        }
+    }
+}
+
+impl Drop for ReadableFd {
+    fn drop(&mut self) {
+        // B-07a: in-flight の POLL_ADD を残さない。
+        if self.submitted {
+            detach_op(self.user_data, Box::new(|_| {}));
         }
     }
 }
@@ -989,9 +1070,10 @@ impl Future for WritableFd {
             self.submitted = true;
         }
 
-        match peek_op_result(self.user_data) {
+        match take_op_result(self.user_data) {
             Some(res) => {
-                take_op_result(self.user_data);
+                // 完了。Drop での無駄な detach（OP_TABLE 探索）を避けるため submitted を倒す。
+                self.submitted = false;
                 if res < 0 {
                     Poll::Ready(Err(io::Error::from_raw_os_error(-res)))
                 } else {
@@ -1002,6 +1084,15 @@ impl Future for WritableFd {
                 set_op_waker(self.user_data, cx.waker().clone());
                 Poll::Pending
             }
+        }
+    }
+}
+
+impl Drop for WritableFd {
+    fn drop(&mut self) {
+        // B-07a: in-flight の POLL_ADD を残さない。
+        if self.submitted {
+            detach_op(self.user_data, Box::new(|_| {}));
         }
     }
 }

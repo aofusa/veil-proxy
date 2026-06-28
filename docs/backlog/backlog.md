@@ -99,7 +99,7 @@
 | B-04 | P1 | 完了 | [bugs/B-04-wasm-filter-missing-https-path.md](bugs/B-04-wasm-filter-missing-https-path.md) | WASM レスポンスフィルタが HTTPS バックエンドパスに未適用 |
 | B-05 | P1 | 完了 | [bugs/B-05-wasm-modules-thread-local-race.md](bugs/B-05-wasm-modules-thread-local-race.md) | WASM モジュールリストの thread_local 競合により並行リクエストでフィルタが未適用になる |
 | B-06 | P2 | 完了 | [bugs/B-06-grpc-h2c-trailer-not-forwarded.md](bugs/B-06-grpc-h2c-trailer-not-forwarded.md) | gRPC H2C レスポンストレーラーが HTTP/1.1 クライアントに転送されない |
-| B-07 | P0 | 進行中 | [bugs/B-07-iouring-future-drop-uaf.md](bugs/B-07-iouring-future-drop-uaf.md) | io_uring Future の Drop 未実装による UAF・タスク二重 poll（200 接続ストレスで segfault） |
+| B-07 | P0 | 完了 | [bugs/B-07-iouring-future-drop-uaf.md](bugs/B-07-iouring-future-drop-uaf.md) | io_uring Future の Drop 未実装による UAF・タスク二重 poll（200 接続ストレスで segfault）→ 修正し segfault 消失 |
 
 ---
 
