@@ -278,26 +278,31 @@ where
 
         let mut full_buf = std::mem::take(&mut self.read_buf);
 
-        // buf_end 以降の部分を切り出す
-        // 注: split_off は割り当てが発生する可能性があるが、safe rustで所有権を扱うために使用
-        // より効率的な方法は unsafe または monoio::buf::Slice を使うことだが、
-        // ここでは安全性を重視して Vec操作を行う
+        // buf_end 以降の部分を切り出して読み込み先にする（既存データを上書きしない）。
         let tail_buf = full_buf.split_off(self.buf_end);
 
         // 読み込み実行
         let (result, returned_tail) = self.stream.read(tail_buf).await;
 
-        // バッファを結合
-        full_buf.extend_from_slice(&returned_tail);
-        self.read_buf = full_buf;
-
         match result {
-            Ok(0) => Err(Http2Error::ConnectionClosed),
+            Ok(0) => {
+                self.read_buf = full_buf;
+                Err(Http2Error::ConnectionClosed)
+            }
             Ok(n) => {
+                // 実際に読み込んだ n バイトのみ結合する。返却バッファの len は
+                // IoBufMut::set_init が grow-only のため（compact 後の残留データを含み）
+                // n より大きくなり得る。必ず result の n を使う（さもないと残留バイトを
+                // 取り込みフレーム解析が壊れて "Frame too large" になる）。
+                full_buf.extend_from_slice(&returned_tail[..n]);
+                self.read_buf = full_buf;
                 self.buf_end += n;
                 Ok(())
             }
-            Err(e) => Err(Http2Error::Io(e)),
+            Err(e) => {
+                self.read_buf = full_buf;
+                Err(Http2Error::Io(e))
+            }
         }
     }
 

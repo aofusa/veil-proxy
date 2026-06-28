@@ -434,17 +434,30 @@ where
             }
         }
 
-        let read_slice = std::mem::take(&mut self.read_buf);
-        let (result, returned_buf) = self.stream.read(read_slice).await;
-        self.read_buf = returned_buf;
+        // buf_end 以降の領域へ「追記」する。RECV は write_ptr=バッファ先頭に書き込むため、
+        // バッファ全体を渡して offset 0 から上書きすると、未パースの部分フレーム
+        // ([buf_start..buf_end]) を破壊し、かつ buf_end += n で長さも誤る（フレームが複数回の
+        // read にまたがる場合に発生）。tail を切り出して渡し、実際に読み込んだ n バイトのみ
+        // 結合する（返却 len は IoBufMut::set_init が grow-only のため信用しない）。
+        let mut full_buf = std::mem::take(&mut self.read_buf);
+        let tail_buf = full_buf.split_off(self.buf_end);
+        let (result, returned_tail) = self.stream.read(tail_buf).await;
 
         match result {
-            Ok(0) => Err(Http2Error::ConnectionClosed),
+            Ok(0) => {
+                self.read_buf = full_buf;
+                Err(Http2Error::ConnectionClosed)
+            }
             Ok(n) => {
+                full_buf.extend_from_slice(&returned_tail[..n]);
+                self.read_buf = full_buf;
                 self.buf_end += n;
                 Ok(())
             }
-            Err(e) => Err(Http2Error::Io(e)),
+            Err(e) => {
+                self.read_buf = full_buf;
+                Err(Http2Error::Io(e))
+            }
         }
     }
 
