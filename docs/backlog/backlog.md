@@ -64,6 +64,14 @@
 | F-26 | P2 | 完了 | [features/F-26-http2-bytes-zero-copy.md](features/F-26-http2-bytes-zero-copy.md) | HTTP/2 ヘッダ/ボディのヒープ割り当て排除（bytes クレートゼロコピー化） |
 | F-27 | P2 | 完了 | [features/F-27-wasm-instance-pooling-async-fuel.md](features/F-27-wasm-instance-pooling-async-fuel.md) | WASM 非同期実行（wasmtime async_support + Fuel Yield）+ pooling allocator |
 | F-28 | P1 | 完了 | [features/F-28-custom-iouring-impl.md](features/F-28-custom-iouring-impl.md) | monoio 削除・カスタム io_uring 実装（thread-per-core、IORING_REGISTER_RESTRICTIONS） |
+| F-29 | P1 | 進行中 | [features/F-29-lockfree-cache-and-async-fs.md](features/F-29-lockfree-cache-and-async-fs.md) | ホットパスのロック排除・非同期FS・ゼロアロケーション化（perf レポート） |
+| F-32 | P1 | 未着手 | [features/F-32-http2-http3-streaming-body.md](features/F-32-http2-http3-streaming-body.md) | HTTP/2・HTTP/3 ボディのストリーミング転送（全バッファリング排除） |
+| F-30 | P2 | 未着手 | [features/F-30-l4-splice-zerocopy.md](features/F-30-l4-splice-zerocopy.md) | L4 ストリームプロキシの splice(2) ゼロコピー転送 |
+| F-31 | P2 | 未着手 | [features/F-31-memory-cache-bytes-zerocopy.md](features/F-31-memory-cache-bytes-zerocopy.md) | メモリキャッシュの bytes::Bytes ゼロコピー配信 |
+| F-33 | P3 | 未着手 | [features/F-33-http3-gso-gro-offload.md](features/F-33-http3-gso-gro-offload.md) | HTTP/3 UDP GSO/GRO オフロード |
+| F-34 | P3 | 未着手 | [features/F-34-connection-state-slab-arena.md](features/F-34-connection-state-slab-arena.md) | コネクション状態の Slab/Arena アロケーション |
+| F-35 | P3 | 未着手 | [features/F-35-xdp-ebpf-ddos-defense.md](features/F-35-xdp-ebpf-ddos-defense.md) | XDP/eBPF 最前線 DDoS 防御（aya） |
+| F-36 | P3 | 未着手 | [features/F-36-wasm-cwasm-aot-cache.md](features/F-36-wasm-cwasm-aot-cache.md) | WASM cwasm AOT 事前コンパイルキャッシュ |
 | F-11 | P3 | 未着手 | [features/dashboard.md](features/dashboard.md) | ダッシュボード機能 |
 | F-12 | P3 | 未着手 | [features/config-generator-webui.md](features/config-generator-webui.md) | config.toml ジェネレータ Web UI |
 | F-13 | P3 | 未着手 | [features/documentation-site.md](features/documentation-site.md) | 公式ドキュメントサイト |
@@ -91,6 +99,7 @@
 | B-04 | P1 | 完了 | [bugs/B-04-wasm-filter-missing-https-path.md](bugs/B-04-wasm-filter-missing-https-path.md) | WASM レスポンスフィルタが HTTPS バックエンドパスに未適用 |
 | B-05 | P1 | 完了 | [bugs/B-05-wasm-modules-thread-local-race.md](bugs/B-05-wasm-modules-thread-local-race.md) | WASM モジュールリストの thread_local 競合により並行リクエストでフィルタが未適用になる |
 | B-06 | P2 | 完了 | [bugs/B-06-grpc-h2c-trailer-not-forwarded.md](bugs/B-06-grpc-h2c-trailer-not-forwarded.md) | gRPC H2C レスポンストレーラーが HTTP/1.1 クライアントに転送されない |
+| B-07 | P0 | 進行中 | [bugs/B-07-iouring-future-drop-uaf.md](bugs/B-07-iouring-future-drop-uaf.md) | io_uring Future の Drop 未実装による UAF・タスク二重 poll（200 接続ストレスで segfault） |
 
 ---
 
