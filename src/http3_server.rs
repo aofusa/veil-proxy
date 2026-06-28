@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 
 use crate::udp::QuicUdpSocket;
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+use bytes::{BufMut, BytesMut};
 use quiche::h3::NameValue;
 use quiche::{h3, Config, ConnectionId};
 
@@ -276,9 +277,9 @@ impl Http3Handler {
     /// HTTP/3 イベントを処理
     async fn process_h3_events(&mut self) -> io::Result<()> {
         // 処理するリクエストを収集（ストリームID → (ヘッダー, ボディ)）
-        let mut pending_requests: Vec<(u64, Vec<h3::Header>, Vec<u8>)> = Vec::new();
-        // ストリームごとのボディバッファ
-        let mut stream_bodies: HashMap<u64, Vec<u8>> = HashMap::new();
+        let mut pending_requests: Vec<(u64, Vec<h3::Header>, BytesMut)> = Vec::new();
+        // ストリームごとのボディバッファ（BytesMut でゼロコピー蓄積、F-32）
+        let mut stream_bodies: HashMap<u64, BytesMut> = HashMap::new();
 
         if let Some(ref mut h3_conn) = self.h3_conn {
             loop {
@@ -290,7 +291,7 @@ impl Http3Handler {
                         );
                         if !more_frames {
                             // ボディがないリクエスト
-                            pending_requests.push((stream_id, list, Vec::new()));
+                            pending_requests.push((stream_id, list, BytesMut::new()));
                         } else {
                             // ボディがある場合、ヘッダーを保持して後で処理
                             // 簡略化: ボディがある場合も即座に処理
@@ -299,14 +300,28 @@ impl Http3Handler {
                         }
                     }
                     Ok((stream_id, h3::Event::Data)) => {
-                        // リクエストボディを読み込み
-                        let mut buf = vec![0u8; 16384];
-                        let body = stream_bodies.entry(stream_id).or_insert_with(Vec::new);
+                        // リクエストボディを BytesMut の spare 容量へ直接読み込む（中間バッファ
+                        // 不要・追加コピーなし・イベントごとのヒープ確保なし、F-32）。
+                        let body = stream_bodies.entry(stream_id).or_default();
 
                         loop {
-                            match h3_conn.recv_body(&mut self.conn, stream_id, &mut buf) {
+                            // 16KB の空き容量を確保し、その uninit スライスへ recv_body させる。
+                            body.reserve(16384);
+                            let spare = body.spare_capacity_mut();
+                            // SAFETY: recv_body は書き込み専用で、戻り値 read バイトのみを
+                            // 初期化する。spare は BytesMut が確保済みの有効メモリ領域であり、
+                            // 初期化した read バイトを advance_mut で len に反映する。これは
+                            // 本クレートの SafeReadBuffer（uninit バッファへの read）と同方針。
+                            let spare_u8 = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    spare.as_mut_ptr() as *mut u8,
+                                    spare.len(),
+                                )
+                            };
+                            match h3_conn.recv_body(&mut self.conn, stream_id, spare_u8) {
                                 Ok(read) if read > 0 => {
-                                    body.extend_from_slice(&buf[..read]);
+                                    // SAFETY: recv_body が先頭 read バイトを初期化済み。
+                                    unsafe { body.advance_mut(read) };
                                 }
                                 Ok(_) => break,
                                 Err(h3::Error::Done) => break,

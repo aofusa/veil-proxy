@@ -39,3 +39,24 @@ HTTP/2・HTTP/3 のリクエスト/レスポンスボディをオンメモリに
 - HTTP/2 フロー制御とストリーミングの結合は難易度が高い。flow window を正しく扱わないと
   デッドロック/ストールの恐れ。段階導入（まずレスポンス方向、次にリクエスト方向）を推奨。
 - gRPC（trailers）/ WASM ボディフィルタとの相互作用に注意（ボディ全体を要求するフィルタは full に退避）。
+
+## 対応状況: bytes/ゼロコピー化は完了、完全ストリーミングは残
+
+### 完了（bytes クレートによるゼロコピー化）
+
+- **HTTP/2**: `http2/stream.rs` の `request_body`/`response_body` は既に `bytes::BytesMut`
+  （F-26）。プロキシ転送時は `std::mem::take(&mut stream.request_body).freeze()` で
+  `Bytes` 化しゼロコピーでバックエンドへ渡している。
+- **HTTP/3**（本対応）: `http3_server.rs` の `pending_requests`/`stream_bodies` を
+  `Vec<u8>` → `BytesMut` に変更。さらに DATA イベントで quiche の `recv_body` を
+  `BytesMut::spare_capacity_mut()` の uninit 領域へ**直接読み込み**、`advance_mut` で確定する
+  方式に変更し、**イベントごとの 16KB ヒープ確保と中間バッファ→本体への追加コピーを撤廃**
+  （SafeReadBuffer と同方針）。
+
+### 残（完全ストリーミング = 大規模再設計）
+
+ボディ全体をメモリに溜めず DATA フレーム単位で下流へ逐次転送する「真のストリーミング」は、
+現状の「全受信→転送」フローの再設計（HTTP/2 フロー制御 WINDOW_UPDATE と下流書込の結合、
+gRPC trailers・WASM ボディフィルタとの整合）を要するため、HTTP/2/gRPC 経路（B-08 で修正
+済み）への回帰リスクが高い。bytes 化でアロケーションとコピーは最小化済みのため、完全
+ストリーミングは独立した大規模タスクとして継続する。
