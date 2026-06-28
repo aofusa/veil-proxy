@@ -2233,110 +2233,90 @@ impl<S: crate::runtime::io::AsyncWriteRent + Unpin> crate::runtime::io::AsyncWri
 /// - 読み込みエラー: Unknownを返し、空のバッファを返す
 /// - タイムアウト: 短いタイムアウトを設定して再試行（将来の改善）
 pub async fn detect_protocol_with_buffer(stream: &mut TcpStream) -> (ProtocolType, Vec<u8>) {
-    use crate::runtime::io::AsyncReadRent;
-
-    // 最大24バイト（HTTP/2プリフェース長）を読み込む
-    // タイムアウトを設定して、無応答接続を検出
-    let mut accumulated = Vec::with_capacity(24);
+    // ソケットバッファを MSG_PEEK で覗き見て（消費せず）プロトコルを判別する。
+    //
+    // 以前は io_uring RECV でバイトを消費し initial_data として持ち回していたが、
+    // タイムアウトキャンセルや所有権の絡みでバイトが欠落/破損し、後続の TLS ハンドシェイクが
+    // `received corrupt message / InvalidContentType` で失敗する不具合があった
+    // （h2c 検出が有効な全接続で発生しうる）。MSG_PEEK ならバイトはソケットに残るため、
+    // 判別後に TLS/H2C/HTTP1.1 各ハンドラがそのまま読み直せる（initial_data は常に空）。
+    let fd = stream.as_raw_fd();
     let start_time = std::time::Instant::now();
     let timeout_duration = Duration::from_millis(200);
+    let mut peeked = [0u8; 24];
+    let mut n = 0usize;
 
-    while accumulated.len() < 24 {
+    loop {
         let remaining_timeout = match timeout_duration.checked_sub(start_time.elapsed()) {
             Some(d) if d.as_millis() > 0 => d,
             _ => break,
         };
 
-        // 重要: monoio (io_uring) の read を timeout() で直接ラップしてキャンセルすると、
-        // カーネルが既に読み取りバッファへコピー済みのバイトが失われる。これにより後続の
-        // TLS ハンドシェイクがストリーム不整合（received corrupt message / InvalidContentType）で
-        // 失敗する（負荷時にスレッドがビジーで 200ms タイムアウトが発火すると顕在化）。
-        //
-        // これを避けるため、まず「読み取り可能になる」のを待つ（データを消費しないため
-        // キャンセルしても安全）。読み取り可能になってから timeout なしで read する。read は
-        // 即座に完了するためキャンセルされず、ソケットからバイトを取りこぼさない。
-        // readable がタイムアウトした場合は何も消費していないため、accumulated のまま
-        // 安全にフォールバックできる（空バッファなら TLS ハンドシェイクが新規に読み直す）。
+        // データ到着を待つ（MSG_PEEK は消費しないのでタイムアウトキャンセルしても安全）。
         match timeout(remaining_timeout, stream.readable()).await {
             Ok(Ok(())) => {}
-            _ => break, // タイムアウト or エラー（消費済みバイト無し）
+            _ => break,
         }
 
-        let peek_buf = vec![0u8; 24 - accumulated.len()];
-        let (result, returned_buf) = stream.read(peek_buf).await;
-
-        match result {
-            Ok(0) => break, // 接続終了
-            Ok(n) => {
-                accumulated.extend_from_slice(&returned_buf[..n]);
+        // 消費せずに覗き見る（毎回ソケットバッファの先頭から最大 24 バイト）。
+        let ret = unsafe {
+            libc::recv(
+                fd,
+                peeked.as_mut_ptr() as *mut libc::c_void,
+                peeked.len(),
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        if ret < 0 {
+            // 偽の readable 通知（EAGAIN）なら再試行、その他はフォールバック。
+            if io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock {
+                continue;
             }
-            Err(_) => break, // エラー
+            break;
         }
-
-        // TLS 検出に必要な 5 バイトが溜まった時点でチェック（早期脱出）
-        if accumulated.len() >= 5 {
-            if accumulated[0] == 0x16
-                && accumulated[1] == 0x03
-                && (accumulated[2] >= 0x01 && accumulated[2] <= 0x03)
-            {
-                return (ProtocolType::TLS, accumulated);
-            }
+        if ret == 0 {
+            break; // 接続終了
         }
-
-        // HTTP/1.1 検出に必要な最低限のバイト数が溜まった時点でチェック（早期脱出）
-        // GET / (5 bytes), POST (5 bytes) 等
-        if accumulated.len() >= 5 {
-            let methods = [
-                b"GET ", b"POST", b"PUT ", b"DELE", b"HEAD", b"OPTI", b"CONN", b"TRAC", b"PATC",
-            ];
-            for method in &methods {
-                if accumulated.starts_with(*method) {
-                    return (ProtocolType::Http11, accumulated);
-                }
-            }
+        n = ret as usize;
+        // TLS/HTTP1.1 は 5 バイト、H2C プリフェースは 24 バイトで判別可能。
+        if n >= 24 || n >= 5 {
+            break;
         }
     }
 
-    let n = accumulated.len();
+    let data = &peeked[..n];
 
-    // HTTP/2プリフェース検出（24バイト固定）
-    if n >= 24 {
-        if &accumulated[..24] == b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" {
-            debug!("[Protocol Detection] H2C (HTTP/2 Cleartext) detected");
-            return (ProtocolType::H2C, accumulated);
-        }
+    // HTTP/2 プリフェース検出（24バイト固定）。MSG_PEEK なので initial_data は空で返す。
+    if n >= 24 && data == b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" {
+        debug!("[Protocol Detection] H2C (HTTP/2 Cleartext) detected");
+        return (ProtocolType::H2C, Vec::new());
     }
 
-    // 溜まったデータで再度チェック（TLS/HTTP1.1 も念のため）
     if n >= 5 {
-        if accumulated[0] == 0x16
-            && accumulated[1] == 0x03
-            && (accumulated[2] >= 0x01 && accumulated[2] <= 0x03)
-        {
+        if data[0] == 0x16 && data[1] == 0x03 && (data[2] >= 0x01 && data[2] <= 0x03) {
             debug!("[Protocol Detection] TLS detected");
-            return (ProtocolType::TLS, accumulated);
+            return (ProtocolType::TLS, Vec::new());
         }
 
-        let methods = [
+        let methods: [&[u8]; 9] = [
             b"GET ", b"POST", b"PUT ", b"DELE", b"HEAD", b"OPTI", b"CONN", b"TRAC", b"PATC",
         ];
         for method in &methods {
-            if accumulated.starts_with(*method) {
+            if data.starts_with(method) {
                 debug!("[Protocol Detection] HTTP/1.1 detected");
-                return (ProtocolType::Http11, accumulated);
+                return (ProtocolType::Http11, Vec::new());
             }
         }
     }
 
     if n > 0 {
         debug!(
-            "[Protocol Detection] Unknown protocol ({} bytes): {:?}",
-            n,
-            String::from_utf8_lossy(&accumulated)
+            "[Protocol Detection] Unknown protocol ({} bytes): hex={:02x?}",
+            n, data
         );
     }
 
-    (ProtocolType::Unknown, accumulated)
+    (ProtocolType::Unknown, Vec::new())
 }
 
 /// H2Cサーバー接続処理
