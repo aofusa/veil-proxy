@@ -2,7 +2,7 @@
 //!
 //! Manages loading and caching of WASM modules.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use wasmtime::{Engine, InstancePre, Linker, Module, PoolingAllocationConfig};
@@ -93,13 +93,13 @@ impl ModuleRegistry {
             anyhow::bail!("Module file not found: {}", config.path);
         }
 
-        // Load module (AOT or standard)
+        // Load module: 明示的 .cwasm はそのまま deserialize、.wasm は AOT サイドカー
+        // キャッシュ（<path>.cwasm）経由でロードする（無ければコンパイルして生成、F-36）。
         let module = if config.path.ends_with(".cwasm") {
-            // AOT compiled module
+            // SAFETY: 信頼できる事前生成 AOT モジュールの明示指定。
             unsafe { Module::deserialize_file(&self.engine, &config.path)? }
         } else {
-            // Standard WASM module
-            Module::from_file(&self.engine, &config.path)?
+            Self::load_or_compile_with_cache(&self.engine, path)?
         };
 
         // Create linker with host functions
@@ -127,6 +127,78 @@ impl ModuleRegistry {
         self.modules.insert(config.name.clone(), Arc::new(loaded));
 
         Ok(())
+    }
+
+    /// `.wasm` を AOT サイドカーキャッシュ経由でロードする（F-36）。
+    ///
+    /// 1. `<path>.cwasm` が存在し `.wasm` 以降に生成されていれば `deserialize_file` で
+    ///    高速ロードする（Cranelift JIT を回避し起動時間とメモリを削減）。
+    /// 2. 不在・古い・wasmtime 版不一致（deserialize 失敗）の場合は `from_file` で
+    ///    コンパイルし、その AOT バイナリをサイドカーへ書き出す（ベストエフォート、
+    ///    書き込み失敗は無視してコンパイル済みモジュールをそのまま使う）。
+    ///
+    /// モジュールロードは起動時（Landlock / seccomp 適用前）に行われるため、サイドカー
+    /// 書き込みの権限問題は通常発生しない。`deserialize` は自前生成の信頼できるキャッシュ
+    /// のみを対象とし（信頼境界は元々の `.wasm` と同じくキャッシュ/設定ディレクトリの
+    /// ファイル完全性）、いかなるエラーも安全側（再コンパイル）にフォールバックする。
+    fn load_or_compile_with_cache(engine: &Engine, wasm_path: &Path) -> anyhow::Result<Module> {
+        // サイドカーパス: "<path>.cwasm"
+        let cache_path: PathBuf = {
+            let mut s = wasm_path.as_os_str().to_owned();
+            s.push(".cwasm");
+            PathBuf::from(s)
+        };
+
+        // キャッシュが .wasm 以降に生成されていれば deserialize を試みる
+        let cache_fresh = matches!(
+            (
+                std::fs::metadata(wasm_path).and_then(|m| m.modified()),
+                std::fs::metadata(&cache_path).and_then(|m| m.modified()),
+            ),
+            (Ok(wasm_mtime), Ok(cache_mtime)) if cache_mtime >= wasm_mtime
+        );
+        if cache_fresh {
+            // SAFETY: 自前生成の AOT キャッシュのみ deserialize。版不一致/破損は Err となり
+            // 下のコンパイル経路へフォールバックする。
+            match unsafe { Module::deserialize_file(engine, &cache_path) } {
+                Ok(module) => {
+                    ftlog::debug!("WASM AOT cache hit: {}", cache_path.display());
+                    return Ok(module);
+                }
+                Err(e) => {
+                    ftlog::debug!("WASM AOT cache invalid ({e}); recompiling");
+                }
+            }
+        }
+
+        // コンパイル（JIT/AOT by Cranelift）
+        let module = Module::from_file(engine, wasm_path)?;
+
+        // AOT バイナリをサイドカーへ書き出す（ベストエフォート、失敗は無視）。
+        // tmp へ書いて rename することで部分書き込み/競合を避ける。
+        match module.serialize() {
+            Ok(bytes) => {
+                let tmp_path: PathBuf = {
+                    let mut s = cache_path.clone().into_os_string();
+                    s.push(".tmp");
+                    PathBuf::from(s)
+                };
+                let written = std::fs::write(&tmp_path, &bytes)
+                    .and_then(|_| std::fs::rename(&tmp_path, &cache_path));
+                if written.is_ok() {
+                    ftlog::debug!("WASM AOT cache written: {}", cache_path.display());
+                } else {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    ftlog::debug!(
+                        "WASM AOT cache write skipped (not writable): {}",
+                        cache_path.display()
+                    );
+                }
+            }
+            Err(e) => ftlog::debug!("WASM serialize failed ({e}); AOT cache skipped"),
+        }
+
+        Ok(module)
     }
 
     /// Get a loaded module by name
