@@ -114,3 +114,20 @@ P1（本タスクの核心）
 3. `enable_rings()` 未呼び出し（かつ制限後は ENABLE_RINGS 自体の register_op 許可が必要）。
 
 「R_DISABLED 生成 → 制限登録（ENABLE_RINGS 許可含む）→ ENABLE_RINGS」の正しいシーケンスに修正。許可外オペコードが `-EACCES` で拒否されること・構造体が 16 バイトであることを `src/runtime/ring.rs` の単体テストで検証。許可オペコード = ACCEPT/CONNECT/RECV/SEND/POLL_ADD/TIMEOUT/CLOSE/SPLICE/POLL_REMOVE/ASYNC_CANCEL/NOP。
+
+## 完了メモ追記（2026-06-28）: サーバが応答できない致命バグ群を修正
+
+E2E（`tests/e2e_setup.sh test`）を実機で通すと、独自ランタイムには「接続を accept しても
+応答できない」致命バグが複数残っていた（エグゼキュータ修正までハンドラが走らず未検出だった）。
+修正後 E2E は 388/389 通過（残り 1 件は 200 同時接続の負荷フレーキーでテスト毎に入れ替わる）。
+
+- **エグゼキュータ不一致**: `block_on_with_config` が `Executor::new()` の別キューを使い、
+  `spawn()` 先のスレッドローカルエグゼキュータと不一致。accept ループが spawn した
+  `handle_connection` が永遠にポーリングされず無応答。`current_executor()` を使うよう修正。
+- **`storage_to_sockaddr` IPv4 バイトオーダ二重変換**: accept が返すクライアント IP が逆順。
+- **Accept の cancel-on-drop**: `timeout(1s, accept())` の drop でバッファ UAF・孤立 accept の
+  リスク。OpTable に detach 機構（ガード保持 + ASYNC_CANCEL）を追加。
+- **プロトコル検出が TLS を破損**: h2c_enabled 時の `detect_protocol_with_buffer` が io_uring
+  RECV でバイトを消費して持ち回す際に破損 → 後続 TLS が `InvalidContentType` で失敗。
+  `libc::recv` の MSG_PEEK（非消費）方式に変更。
+- listen backlog 128→1024（接続バースト耐性）。
