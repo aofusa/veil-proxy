@@ -74,6 +74,57 @@ pub struct Http2Connection<S> {
     continuation_count: u32,
 }
 
+// ====================
+// コネクション読み込みバッファのスレッドローカル再利用プール（F-34）
+// ====================
+// HTTP/2 コネクションは 64KB の読み込みバッファを 1 本確保する。同時接続数が多いと
+// 接続ごとの malloc/free が増えるため、スレッドローカルなフリーリストで再利用して
+// 確保・解放コストを排除する（thread-per-core 設計のためロック不要）。
+
+const H2_READ_BUF_SIZE: usize = 65536;
+/// プールに保持する最大本数（過剰なメモリ保持を防ぐ）
+const H2_READ_BUF_POOL_MAX: usize = 256;
+/// これを超える肥大化バッファはプールに戻さず解放する（1MB）
+const H2_READ_BUF_RETAIN_MAX: usize = 1 << 20;
+
+thread_local! {
+    static H2_READ_BUF_POOL: std::cell::RefCell<Vec<Vec<u8>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// プールから読み込みバッファを取得する（無ければ新規確保）。`len` は `H2_READ_BUF_SIZE`。
+fn acquire_h2_read_buf() -> Vec<u8> {
+    let mut buf = H2_READ_BUF_POOL
+        .with(|p| p.borrow_mut().pop())
+        .unwrap_or_default();
+    buf.clear();
+    buf.resize(H2_READ_BUF_SIZE, 0);
+    buf
+}
+
+/// 読み込みバッファをプールへ返却して次の接続で再利用する。空/肥大バッファは戻さない。
+fn release_h2_read_buf(mut buf: Vec<u8>) {
+    let cap = buf.capacity();
+    if cap == 0 || cap > H2_READ_BUF_RETAIN_MAX {
+        return;
+    }
+    buf.clear();
+    H2_READ_BUF_POOL.with(|p| {
+        let mut pool = p.borrow_mut();
+        if pool.len() < H2_READ_BUF_POOL_MAX {
+            pool.push(buf);
+        }
+    });
+}
+
+impl<S> Drop for Http2Connection<S> {
+    fn drop(&mut self) {
+        // 接続終了時に読み込みバッファをプールへ返却（再利用）。read_more の最中に
+        // drop された場合は read_buf が空（take 済み）のため pool には戻らない。
+        release_h2_read_buf(std::mem::take(&mut self.read_buf));
+    }
+}
+
 impl<S> Http2Connection<S>
 where
     S: AsyncReadRent + AsyncWriteRentExt + Unpin,
@@ -107,8 +158,8 @@ where
         // DoS 対策用のタイムスタンプを初期化
         let now = std::time::Instant::now();
 
-        // 初期バッファを準備（既に読み込んだデータがある場合は使用）
-        let mut read_buf = vec![0u8; 65536];
+        // 初期バッファを準備（スレッドローカルプールから再利用、F-34）
+        let mut read_buf = acquire_h2_read_buf();
         let buf_end = if !initial_data.is_empty() {
             let len = initial_data.len().min(65536);
             read_buf[..len].copy_from_slice(&initial_data[..len]);

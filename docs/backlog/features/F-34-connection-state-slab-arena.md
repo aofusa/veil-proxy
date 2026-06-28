@@ -31,3 +31,27 @@
 
 - thread-per-core 設計のためスレッドローカル Slab が自然。`unsafe`（`MaybeUninit`）の不変条件を
   コメントで明示する必要がある。難易度高。
+
+## 対応状況: HTTP/2 コネクションバッファのプール化を実装
+
+接続ごとの最大の確保は **HTTP/2 コネクションの 64KB 読み込みバッファ**（`Http2Connection`
+の `read_buf = vec![0u8; 65536]`）だった。これをスレッドローカルなフリーリストで再利用する。
+
+- `src/http2/connection.rs`: `H2_READ_BUF_POOL`（thread-local `Vec<Vec<u8>>`）+ `acquire_h2_read_buf`
+  / `release_h2_read_buf` を追加。`new_with_initial_buffer` はプールから取得し、`Drop for
+  Http2Connection` で接続終了時に返却（再利用）。これで**接続ごとの 64KB malloc/free を排除**。
+  thread-per-core のためロック不要。プールは最大 256 本、1MB 超の肥大バッファは戻さず解放。
+- `read_more` 実行中（バッファ take 中）に drop された場合は read_buf が空のためプールに戻らず
+  リークもしない。
+
+### 検証
+
+- `cargo test --bins --features full` 577 通過。
+- E2E（features full）388/389（唯一の失敗 `test_error_handling_431` は負荷フレーキーで、単体
+  実行では通過。HTTP/1.1 経路で本変更とは無関係）。segfault なし。
+
+### 残（より広範な Slab 化）
+
+L7 状態構造体やタスク（executor の `Box<dyn Future>`）自体の Slab/Arena 化は、ランタイムの
+タスク管理の書き換えを要し全接続に影響するため、独立した大規模タスクとして継続する。本対応は
+接続ごと最大確保（64KB バッファ）の排除を優先した。
