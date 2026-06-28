@@ -8676,16 +8676,18 @@ async fn handle_sendfile(
     // Range リクエストの場合は 206 Partial Content
     let (response_status, _response_content_length) = if let Some((start, end)) = range_info {
         let content_length = end - start + 1;
+        // 数値→バイト列は itoa でスタックバッファに直接書き込む（String の一時確保を排除）。
+        let mut num_buf = itoa::Buffer::new();
         header_buf.extend_from_slice(b"HTTP/1.1 206 Partial Content\r\nContent-Type: ");
         header_buf.extend_from_slice(mime_type.as_bytes());
         header_buf.extend_from_slice(b"\r\nAccept-Ranges: bytes\r\nContent-Range: bytes ");
-        header_buf.extend_from_slice(start.to_string().as_bytes());
+        header_buf.extend_from_slice(num_buf.format(start).as_bytes());
         header_buf.extend_from_slice(b"-");
-        header_buf.extend_from_slice(end.to_string().as_bytes());
+        header_buf.extend_from_slice(num_buf.format(end).as_bytes());
         header_buf.extend_from_slice(b"/");
-        header_buf.extend_from_slice(file_size.to_string().as_bytes());
+        header_buf.extend_from_slice(num_buf.format(file_size).as_bytes());
         header_buf.extend_from_slice(b"\r\nContent-Length: ");
-        header_buf.extend_from_slice(content_length.to_string().as_bytes());
+        header_buf.extend_from_slice(num_buf.format(content_length).as_bytes());
         header_buf.extend_from_slice(b"\r\n");
         (206u16, content_length)
     } else {

@@ -12,10 +12,16 @@ O(1) の参照カウント増加のみで完結させ、ゼロコピー配信を
 
 ## 現状の問題
 
-- `src/cache/entry.rs` / `src/cache/memory.rs` でボディが `Box<[u8]>`（または `Vec<u8>`）で
-  保持されている。キャッシュヒット時、各 HTTP ストリームへ渡す際にスライスのコピーが発生し得る。
-- メモリキャッシュは参照カウント共有（`Arc<CacheEntry>`）まではゼロコピーだが、エントリ内部の
-  ボディをクライアントソケットへ書き込む段で `to_vec()` 等のコピーが残る箇所がある。
+> 補足（実装確認 2026-06）: v3 レポートは `Box<[u8]>` 保持を指摘するが、現行コードでは
+> メモリボディは既に **`Arc<[u8]>`**（`CacheEntry::memory_body() -> &Arc<[u8]>`）で
+> 参照カウント共有されており、レポートの主要懸念（ボディの deep copy）は解消済み。
+
+- 残る非ゼロコピー箇所は **ソケット書き込み段**: `http_utils.rs::build_cached_response` が
+  `response.extend_from_slice(body_data)` でヘッダ + ボディを 1 本の `Vec` に連結する際に
+  ボディを 1 回 memcpy している（キャッシュヒットごと）。
+- 原因: `WriteFuture<T: IoBuf>` は所有バッファを要求し、`runtime/buf.rs` の `IoBuf` 実装が
+  `Vec<u8>` / `Box<[u8]>` のみ。`Arc<[u8]>` を直接書けないため連結コピーしている。
+  また `writev`（scatter-gather）は `runtime/io.rs` で stub。
 
 ## 改修内容
 

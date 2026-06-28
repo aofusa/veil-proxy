@@ -79,7 +79,40 @@ struct MemoryCache {
 
 ## 依存・リスク
 
-- `itoa` クレート追加（軽量、ゼロアロケーション数値書き込み）
+- `itoa` クレートは既に依存済み（軽量、ゼロアロケーション数値書き込み）
 - DashMap はすでに依存済み
 - `src/runtime/io.rs` の AsyncFile / STATX 機能が必要（io.rs に OPENAT/STATX が未実装の場合、io_uring の IORING_OP_STATX SQE を追加する必要あり）
 - buffering/handler.rs の非同期化は難易度が高い（既存の `AsyncOpenFile` インターフェースの拡充が必要）
+
+## 対応状況: 一部完了
+
+### 完了
+
+- **(A) cache/memory.rs のロック排除**: 単一 `Mutex<LruCache>` + `Mutex<usize>` を、
+  ハッシュ分散の 16 シャード `Mutex<LruCache>` 群 + ロックフリー `AtomicUsize` メモリ
+  カウンタへ移行。全スレッド直列化を解消（コミット参照）。
+- **(B 一部) cache/file_cache.rs の Atomic 化**: `valid_duration: Mutex<Duration>` →
+  `AtomicU64`（ナノ秒）、`max_entries: Mutex<usize>` → `AtomicUsize`。グローバル設定も
+  atomic 化。静的ファイル配信ホットパスからロックを排除。
+- **(D 一部) proxy.rs のゼロアロケーション化**: Range レスポンス（Content-Range /
+  Content-Length）の数値→バイト列変換を `start/end/file_size/content_length.to_string()`
+  から `itoa::Buffer`（スタックバッファ）へ置換し、リクエストごとの `String` 一時確保を排除。
+
+### 残（難易度・波及が大きいため別タスク化）
+
+- **(B 残) 非同期 FS（STATX/OPENAT）**: `file_cache.rs::fetch_file_info` の
+  `canonicalize()` / `std::fs::metadata()` は **キャッシュミス時のみ** 同期実行。
+  恒常的にはキャッシュヒットで syscall ゼロだが、ミス時はイベントループをブロックする。
+  io_uring `IORING_OP_STATX`/`OPENAT` の Future 追加（`PROXY_ALLOWED_OPCODES`・seccomp
+  許可・restrictions の更新を含む）＋ `fetch_file_info` の async 化（全呼び出し元へ波及）
+  が必要。
+- **(C) buffering/handler.rs の非同期 FS**: 同上の AsyncFile 基盤が前提。
+- **(D 残) proxy.rs のその他アロケーション**: `client_ip`（`peer_addr.ip().to_string()`）
+  と `host:port`（`format!`）は **接続ごと** の小アロケーションで keep-alive / コネクション
+  プールで償却される。ゼロ化にはスタック IP フォーマッタ + 多数の呼び出し元シグネチャ変更が
+  必要。
+- **(E) WASM パスの clone**: `on_request_headers_with_modules_async` は Proxy-Wasm の
+  **async ABI** が所有値（`String`/`Vec`）を `.await` をまたいで要求するため、
+  `path/method/client_ip.to_string()`・ヘッダ deep copy・`modules_to_apply.clone()` が必要。
+  削減には WASM エンジン API を借用 / `Arc<[..]>` ベースへ再設計する必要があり、WASM E2E への
+  回帰リスクが高い（[[F-32]] のストリーミング化と併せて検討）。
