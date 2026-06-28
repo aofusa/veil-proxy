@@ -7,20 +7,29 @@ use super::entry::{CacheEntry, CacheEntryBuilder};
 use super::key::CacheKey;
 use lru::LruCache;
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+/// シャード数（2 の冪）。キャッシュキーのハッシュでシャードに分散し、従来の単一
+/// グローバル `Mutex<LruCache>` による「全スレッド直列化」を排除する。各シャードの
+/// クリティカルセクションは O(1) の LRU 操作のみで、thread-per-core 環境での
+/// ロック競合を 1/SHARD_COUNT に抑える（DashMap 等の内部シャーディングと同方針。
+/// LRU は本質的に共有状態の更新を要するため完全ロックフリー化は非現実的で、
+/// 短時間クリティカルセクションのシャード化が高性能設計の定石）。
+const SHARD_COUNT: usize = 16;
+
 /// メモリキャッシュ
 ///
-/// LRUキャッシュを使用した高速なインメモリストレージ。
-/// スレッドセーフだがロックを使用するため、高並行性には`CacheIndex`を推奨。
+/// シャード化された LRU キャッシュによる高速なインメモリストレージ。
+/// メモリ使用量は全シャード横断のロックフリー `AtomicUsize` で管理する。
 pub struct MemoryCache {
-    /// LRUキャッシュ（Mutexで保護）
-    cache: Mutex<LruCache<u64, MemoryCacheEntry>>,
-    /// 最大メモリ使用量
+    /// シャードごとの LRU キャッシュ
+    shards: Box<[Mutex<LruCache<u64, MemoryCacheEntry>>]>,
+    /// 最大メモリ使用量（全シャード合計）
     max_memory: usize,
-    /// 現在のメモリ使用量（概算）
-    current_memory: Mutex<usize>,
+    /// 現在のメモリ使用量（概算、ロックフリー）
+    current_memory: AtomicUsize,
     /// 作成時刻
     created_at: Instant,
 }
@@ -46,87 +55,114 @@ impl MemoryCache {
     ///
     /// # Arguments
     ///
-    /// * `max_entries` - 最大エントリ数
+    /// * `max_entries` - 最大エントリ数（全シャード合計の目安）
     /// * `max_memory` - 最大メモリ使用量（バイト）
     pub fn new(max_entries: usize, max_memory: usize) -> Self {
-        let capacity = NonZeroUsize::new(max_entries).unwrap_or(NonZeroUsize::new(1000).unwrap());
+        // 1 シャードあたりの容量（最低 1 を保証）。全体で約 max_entries。
+        let per_shard = (max_entries / SHARD_COUNT).max(1);
+        let capacity = NonZeroUsize::new(per_shard).unwrap_or(NonZeroUsize::new(1).unwrap());
+        let shards = (0..SHARD_COUNT)
+            .map(|_| Mutex::new(LruCache::new(capacity)))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
 
         Self {
-            cache: Mutex::new(LruCache::new(capacity)),
+            shards,
             max_memory,
-            current_memory: Mutex::new(0),
+            current_memory: AtomicUsize::new(0),
             created_at: Instant::now(),
         }
+    }
+
+    /// ハッシュからシャードを選択する（SHARD_COUNT は 2 の冪なので下位ビットマスク）
+    #[inline]
+    fn shard(&self, hash: u64) -> &Mutex<LruCache<u64, MemoryCacheEntry>> {
+        &self.shards[(hash as usize) & (SHARD_COUNT - 1)]
     }
 
     /// エントリを取得
     pub fn get(&self, key: &CacheKey) -> Option<Arc<CacheEntry>> {
         let hash = key.hash_value();
-        let mut cache = self.cache.lock().ok()?;
+        let mut cache = self.shard(hash).lock().ok()?;
 
-        // LRUキャッシュから取得（アクセス順を更新）
-        let entry = cache.get(&hash)?;
-
-        // キーの完全一致を確認
-        if entry.key != *key {
-            return None;
+        // LRU の順序を更新しつつ取得
+        match cache.get(&hash) {
+            // キー完全一致かつ有効 → 参照カウント +1 のみで返す（ゼロコピー）
+            Some(entry) if entry.key == *key => {
+                if entry.entry.is_valid() {
+                    return Some(Arc::clone(&entry.entry));
+                }
+                // 期限切れ → 下で除去
+            }
+            // ハッシュ衝突（別キー）またはミス
+            _ => return None,
         }
 
-        // 有効期限チェック
-        if !entry.entry.is_valid() {
-            // 期限切れエントリを削除
-            drop(cache);
-            self.remove(key);
-            return None;
+        // 期限切れエントリをこのシャードから除去し、メモリを返却
+        if let Some(expired) = cache.pop(&hash) {
+            self.current_memory
+                .fetch_sub(expired.entry.memory_usage(), Ordering::Relaxed);
         }
-
-        Some(Arc::clone(&entry.entry))
+        None
     }
 
     /// エントリを挿入
     ///
-    /// メモリ制限に達した場合は古いエントリを自動的に削除します。
+    /// メモリ制限に達した場合は同一シャードの古いエントリを自動的に削除します。
     pub fn insert(&self, key: CacheKey, entry: CacheEntry) -> bool {
-        let hash = key.hash_value();
         let memory = entry.memory_usage();
 
-        // メモリ制限チェック
-        {
-            let mut current = self.current_memory.lock().unwrap();
-
-            // 単一エントリが制限を超える場合は拒否
-            if memory > self.max_memory {
-                return false;
-            }
-
-            // 空きを確保
-            if *current + memory > self.max_memory {
-                let mut cache = self.cache.lock().unwrap();
-
-                while *current + memory > self.max_memory {
-                    if let Some((_, evicted)) = cache.pop_lru() {
-                        *current = current.saturating_sub(evicted.entry.memory_usage());
-                    } else {
-                        break;
-                    }
-                }
-            }
-
-            *current += memory;
+        // 単一エントリが全体制限を超える場合は拒否
+        if memory > self.max_memory {
+            return false;
         }
 
+        let hash = key.hash_value();
         let cache_entry = MemoryCacheEntry {
             key,
             entry: Arc::new(entry),
             inserted_at: Instant::now(),
         };
 
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = match self.shard(hash).lock() {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
 
-        // 既存エントリがある場合はメモリ使用量を調整
+        // 全体メモリが上限を超える間、このシャードの LRU を末尾から退避する。
+        while self.current_memory.load(Ordering::Relaxed) + memory > self.max_memory {
+            match cache.pop_lru() {
+                Some((_, evicted)) => {
+                    self.current_memory
+                        .fetch_sub(evicted.entry.memory_usage(), Ordering::Relaxed);
+                }
+                None => break, // このシャードは空。これ以上ローカルでは退避できない。
+            }
+        }
+
+        // ハードキャップ: ローカル退避後もなお全体上限を超える（メモリは他シャードが
+        // 保持していてクロスシャード退避はロック順序の都合で行わない）場合は、この
+        // エントリのキャッシュを諦めてメモリ上限を厳守する。
+        if self.current_memory.load(Ordering::Relaxed) + memory > self.max_memory {
+            return false;
+        }
+
+        // 容量上限に達していて新規キーなら、先に LRU を 1 つ退避してメモリ計上を精算する
+        // （lru::put は容量超過で別キーを暗黙に捨てるが、その分を current_memory に
+        // 反映できないため、ここで明示的に pop してカウンタを正確に保つ）。
+        if cache.len() >= cache.cap().get() && cache.peek(&hash).is_none() {
+            if let Some((_, evicted)) = cache.pop_lru() {
+                self.current_memory
+                    .fetch_sub(evicted.entry.memory_usage(), Ordering::Relaxed);
+            }
+        }
+
+        self.current_memory.fetch_add(memory, Ordering::Relaxed);
+
+        // 既存エントリ（同一キー）を置き換えた場合は旧エントリ分を差し引く
         if let Some(old) = cache.put(hash, cache_entry) {
-            let mut current = self.current_memory.lock().unwrap();
-            *current = current.saturating_sub(old.entry.memory_usage());
+            self.current_memory
+                .fetch_sub(old.entry.memory_usage(), Ordering::Relaxed);
         }
 
         true
@@ -135,21 +171,26 @@ impl MemoryCache {
     /// エントリを削除
     pub fn remove(&self, key: &CacheKey) -> Option<Arc<CacheEntry>> {
         let hash = key.hash_value();
-        let mut cache = self.cache.lock().ok()?;
+        let mut cache = self.shard(hash).lock().ok()?;
 
         if let Some(entry) = cache.pop(&hash) {
             if entry.key == *key {
-                let mut current = self.current_memory.lock().unwrap();
-                *current = current.saturating_sub(entry.entry.memory_usage());
+                self.current_memory
+                    .fetch_sub(entry.entry.memory_usage(), Ordering::Relaxed);
                 return Some(entry.entry);
             }
+            // ハッシュ衝突の別キーだった → 取り除かずに戻す
+            cache.put(hash, entry);
         }
         None
     }
 
-    /// 現在のエントリ数
+    /// 現在のエントリ数（全シャード合計）
     pub fn len(&self) -> usize {
-        self.cache.lock().map(|c| c.len()).unwrap_or(0)
+        self.shards
+            .iter()
+            .map(|s| s.lock().map(|c| c.len()).unwrap_or(0))
+            .sum()
     }
 
     /// キャッシュが空かどうか
@@ -157,9 +198,9 @@ impl MemoryCache {
         self.len() == 0
     }
 
-    /// 現在のメモリ使用量
+    /// 現在のメモリ使用量（ロックフリー）
     pub fn memory_usage(&self) -> usize {
-        *self.current_memory.lock().unwrap()
+        self.current_memory.load(Ordering::Relaxed)
     }
 
     /// 最大メモリ使用量
@@ -167,28 +208,28 @@ impl MemoryCache {
         self.max_memory
     }
 
-    /// 期限切れエントリを削除
+    /// 期限切れエントリを削除（全シャード）
     pub fn evict_expired(&self) -> usize {
-        let mut cache = match self.cache.lock() {
-            Ok(c) => c,
-            Err(_) => return 0,
-        };
-
         let mut evicted = 0;
-        let mut keys_to_remove = Vec::new();
 
-        for (&hash, entry) in cache.iter() {
-            if !entry.entry.is_valid() {
-                keys_to_remove.push(hash);
-            }
-        }
+        for shard in self.shards.iter() {
+            let mut cache = match shard.lock() {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
 
-        let mut current = self.current_memory.lock().unwrap();
+            let keys_to_remove: Vec<u64> = cache
+                .iter()
+                .filter(|(_, entry)| !entry.entry.is_valid())
+                .map(|(&hash, _)| hash)
+                .collect();
 
-        for hash in keys_to_remove {
-            if let Some(entry) = cache.pop(&hash) {
-                *current = current.saturating_sub(entry.entry.memory_usage());
-                evicted += 1;
+            for hash in keys_to_remove {
+                if let Some(entry) = cache.pop(&hash) {
+                    self.current_memory
+                        .fetch_sub(entry.entry.memory_usage(), Ordering::Relaxed);
+                    evicted += 1;
+                }
             }
         }
 
@@ -197,12 +238,12 @@ impl MemoryCache {
 
     /// 全エントリを削除
     pub fn clear(&self) {
-        if let Ok(mut cache) = self.cache.lock() {
-            cache.clear();
+        for shard in self.shards.iter() {
+            if let Ok(mut cache) = shard.lock() {
+                cache.clear();
+            }
         }
-        if let Ok(mut current) = self.current_memory.lock() {
-            *current = 0;
-        }
+        self.current_memory.store(0, Ordering::Relaxed);
     }
 
     /// 稼働時間（秒）
