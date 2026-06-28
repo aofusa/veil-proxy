@@ -42,3 +42,18 @@ O(1) の参照カウント増加のみで完結させ、ゼロコピー配信を
 
 - `bytes` は既存依存。`IoBuf for Bytes` の有無を `src/runtime/buf.rs` で確認し、未実装なら追加。
 - F-29（キャッシュのロック排除）と同じファイル群を触るため、まとめて実装すると効率的。
+
+## 対応状況: 完了（メモリキャッシュ経路）
+
+- `src/runtime/buf.rs`: `unsafe impl IoBuf for bytes::Bytes` を追加（read_ptr/bytes_init）。
+- `src/cache/entry.rs`: `CacheStorage::Memory(Arc<[u8]>)` → `CacheStorage::Memory(Bytes)`。
+  `memory_body()` は `Option<&Bytes>` を返す。`size()`/`memory_usage()`/`build_memory()` は
+  `.len()`/`.into()` がそのまま使えるため変更不要。
+- `src/http_utils.rs`: `build_cached_response_headers`（ヘッダーのみ）を追加し、
+  `build_cached_response`（ヘッダー+ボディ）はそれを呼んでボディを連結する形に整理。
+- `src/proxy.rs`: メモリキャッシュヒット（通常・stale）の送出を「ヘッダー write_all →
+  ボディ(`Bytes`) write_all」の 2 段に変更。ボディは `Bytes::clone()`（O(1) refcount）で
+  `WriteFuture` に渡され、レスポンスバッファへの memcpy が消滅（ゼロコピー配信）。
+
+ディスクキャッシュ経路はディスク読込で 1 度コピーが入るため対象外（`build_cached_response`
+を継続使用）。`writev`（scatter-gather）が実装されればヘッダー+ボディの 1 syscall 化が可能（残）。

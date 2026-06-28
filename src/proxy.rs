@@ -4588,21 +4588,28 @@ async fn handle_proxy(
                         }
 
                         // キャッシュからレスポンスを返す
-                        // メモリキャッシュの場合
+                        // メモリキャッシュの場合（ボディは bytes::Bytes をゼロコピーで送出）
                         if let Some(body_data) = cached_entry.memory_body() {
-                            let response = build_cached_response(
+                            let body = body_data.clone(); // O(1) refcount、memcpy なし
+                            let body_len = body.len();
+                            // ヘッダーのみ構築し、ボディは連結せず別途ゼロコピーで書き込む
+                            let headers = build_cached_response_headers(
                                 &cached_entry,
-                                body_data,
                                 client_wants_close,
                                 is_stale,
                             );
-
-                            match timeout(WRITE_TIMEOUT, client_stream.write_all(response)).await {
+                            if !matches!(
+                                timeout(WRITE_TIMEOUT, client_stream.write_all(headers)).await,
+                                Ok((Ok(_), _))
+                            ) {
+                                return None;
+                            }
+                            match timeout(WRITE_TIMEOUT, client_stream.write_all(body)).await {
                                 Ok((Ok(_), _)) => {
                                     return Some((
                                         client_stream,
                                         cached_entry.status_code,
-                                        body_data.len() as u64,
+                                        body_len as u64,
                                         client_wants_close,
                                     ));
                                 }
@@ -5007,22 +5014,27 @@ async fn handle_proxy(
                         if let Some(stale_entry) = cache_manager.get_stale(&cache_key, 3600) {
                             debug!("stale-if-error: serving stale cache for {}", host_str);
 
-                            // staleキャッシュを返す
+                            // staleキャッシュを返す（ボディは bytes::Bytes をゼロコピーで送出）
                             if let Some(body_data) = stale_entry.memory_body() {
-                                let response = build_cached_response(
+                                let body = body_data.clone(); // O(1) refcount、memcpy なし
+                                let body_len = body.len();
+                                let headers = build_cached_response_headers(
                                     &stale_entry,
-                                    body_data,
                                     client_wants_close,
                                     true,
                                 );
-                                match timeout(WRITE_TIMEOUT, client_stream.write_all(response))
-                                    .await
-                                {
+                                if !matches!(
+                                    timeout(WRITE_TIMEOUT, client_stream.write_all(headers)).await,
+                                    Ok((Ok(_), _))
+                                ) {
+                                    return None;
+                                }
+                                match timeout(WRITE_TIMEOUT, client_stream.write_all(body)).await {
                                     Ok((Ok(_), _)) => {
                                         return Some((
                                             client_stream,
                                             stale_entry.status_code,
-                                            body_data.len() as u64,
+                                            body_len as u64,
                                             client_wants_close,
                                         ));
                                     }

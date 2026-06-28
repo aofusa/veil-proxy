@@ -1224,13 +1224,16 @@ pub(crate) fn build_304_response(
 }
 
 /// キャッシュからのレスポンスを構築（メモリキャッシュ用）
-pub(crate) fn build_cached_response(
+/// キャッシュレスポンスの **ヘッダー部のみ** を構築する（ボディは含めない）。
+///
+/// メモリキャッシュのヒット時は、ボディ（`bytes::Bytes`）を本ヘッダーとは別に
+/// ゼロコピーでソケットへ書き込むため、ボディを連結しないこのビルダーを使う。
+pub(crate) fn build_cached_response_headers(
     cached_entry: &cache::CacheEntry,
-    body_data: &[u8],
     client_wants_close: bool,
     is_stale: bool,
 ) -> Vec<u8> {
-    let mut response = Vec::with_capacity(512 + body_data.len());
+    let mut response = Vec::with_capacity(512);
 
     // ステータスライン
     response.extend_from_slice(b"HTTP/1.1 ");
@@ -1261,8 +1264,22 @@ pub(crate) fn build_cached_response(
     }
 
     response.extend_from_slice(b"\r\n");
-    response.extend_from_slice(body_data);
+    response
+}
 
+/// キャッシュレスポンス全体（ヘッダー + ボディ）を 1 本の `Vec` に構築する。
+///
+/// ディスクキャッシュのようにボディが所有 `Vec`（ディスクから読込済み）の経路で使う。
+/// メモリキャッシュのゼロコピー配信は [`build_cached_response_headers`] + ボディ別書き込みを使う。
+pub(crate) fn build_cached_response(
+    cached_entry: &cache::CacheEntry,
+    body_data: &[u8],
+    client_wants_close: bool,
+    is_stale: bool,
+) -> Vec<u8> {
+    let mut response = build_cached_response_headers(cached_entry, client_wants_close, is_stale);
+    response.reserve(body_data.len());
+    response.extend_from_slice(body_data);
     response
 }
 

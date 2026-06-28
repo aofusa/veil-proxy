@@ -1,5 +1,6 @@
 //! キャッシュエントリ
 
+use bytes::Bytes;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -131,9 +132,9 @@ impl CacheEntry {
         matches!(self.storage, CacheStorage::Memory(_))
     }
 
-    /// メモリ内のボディを取得
+    /// メモリ内のボディを取得（`Bytes` は clone が O(1) のゼロコピー参照）
     #[inline]
-    pub fn memory_body(&self) -> Option<&Arc<[u8]>> {
+    pub fn memory_body(&self) -> Option<&Bytes> {
         match &self.storage {
             CacheStorage::Memory(data) => Some(data),
             _ => None,
@@ -197,8 +198,8 @@ impl CacheEntry {
 /// キャッシュストレージ
 #[derive(Debug, Clone)]
 pub enum CacheStorage {
-    /// インメモリキャッシュ（小さいレスポンス用）
-    Memory(Arc<[u8]>),
+    /// インメモリキャッシュ（小さいレスポンス用、bytes::Bytes で参照カウント共有・ゼロコピー配信）
+    Memory(Bytes),
     /// ディスクキャッシュ（大きいレスポンス用）
     Disk { path: PathBuf, size: u64 },
 }

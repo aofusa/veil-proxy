@@ -103,3 +103,23 @@ unsafe impl IoBufMut for Box<[u8]> {
         // Box<[u8]> は固定長なので何もしない
     }
 }
+
+// ====================
+// bytes::Bytes の実装（読み取り専用・参照カウント共有のゼロコピーバッファ）
+// ====================
+//
+// `Bytes` は内部で確保済みバッファへの参照カウントを持つ不変ビューであり、
+// `clone()` は O(1)（refcount +1）でデータをコピーしない。`WriteFuture` に所有権を
+// 渡すと in-flight 中はバッファが生存し続け、ドロップ時も B-07 のガードで CQE 到着まで
+// 保持される。これによりキャッシュヒットのボディを memcpy なしでソケットへ送出できる。
+unsafe impl IoBuf for bytes::Bytes {
+    #[inline(always)]
+    fn read_ptr(&self) -> *const u8 {
+        self.as_ptr()
+    }
+
+    #[inline(always)]
+    fn bytes_init(&self) -> usize {
+        self.len()
+    }
+}
