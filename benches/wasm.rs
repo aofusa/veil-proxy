@@ -116,7 +116,9 @@ fn create_tls_config() -> Arc<ClientConfig> {
 fn connect_tls() -> Option<(TcpStream, ClientConnection)> {
     let stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-    stream.set_write_timeout(Some(Duration::from_secs(5))).ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .ok()?;
 
     let config = create_tls_config();
     let server_name = ServerName::try_from("localhost".to_string()).ok()?;
@@ -272,7 +274,9 @@ fn is_wasm_route_available() -> bool {
     let _ = tls_stream.read_to_end(&mut response);
     // 404 でなく何らかの HTTP レスポンスが返ればルートは存在するとみなす。
     let head = String::from_utf8_lossy(&response[..response.len().min(64)]);
-    head.starts_with("HTTP/1.1 2") || head.starts_with("HTTP/1.1 3") || head.starts_with("HTTP/1.1 5")
+    head.starts_with("HTTP/1.1 2")
+        || head.starts_with("HTTP/1.1 3")
+        || head.starts_with("HTTP/1.1 5")
 }
 
 /// 新規接続あたりのオーバーヘッド比較
@@ -316,9 +320,13 @@ fn benchmark_wasm_overhead_keepalive(c: &mut Criterion) {
 
     const COUNT: usize = 50;
     for (label, path) in [("no_wasm", BASELINE_PATH), ("header_filter", WASM_PATH)] {
-        group.bench_with_input(BenchmarkId::new("requests_x50", label), &path, |b, &path| {
-            b.iter(|| measure_keepalive(path, COUNT));
-        });
+        group.bench_with_input(
+            BenchmarkId::new("requests_x50", label),
+            &path,
+            |b, &path| {
+                b.iter(|| measure_keepalive(path, COUNT));
+            },
+        );
     }
 
     group.finish();

@@ -2276,16 +2276,17 @@ pub async fn run_http3_server_async(
                 offset = end;
 
                 // パケットヘッダーを解析（同一バッファスライスを後段の conn.recv にも渡す）
-                let hdr =
-                    match quiche::Header::from_slice(&mut recv_buf[start..end], quiche::MAX_CONN_ID_LEN)
-                    {
-                        Ok(v) => v,
-                        Err(e) => {
-                            warn!("[HTTP/3] Invalid packet header: {}", e);
-                            // このセグメントのみスキップ。送信処理はループ後に実行。
-                            continue;
-                        }
-                    };
+                let hdr = match quiche::Header::from_slice(
+                    &mut recv_buf[start..end],
+                    quiche::MAX_CONN_ID_LEN,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("[HTTP/3] Invalid packet header: {}", e);
+                        // このセグメントのみスキップ。送信処理はループ後に実行。
+                        continue;
+                    }
+                };
 
                 // コネクションを検索または作成
                 let conn_id = {
@@ -2304,8 +2305,9 @@ pub async fn run_http3_server_async(
                         let scid = ConnectionId::from_ref(&scid).into_owned();
 
                         let mut config_ref = quic_config.borrow_mut();
-                        let conn = quiche::accept(&scid, None, local_addr, from, &mut config_ref)
-                            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                        let conn =
+                            quiche::accept(&scid, None, local_addr, from, &mut config_ref)
+                                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
                         debug!("[HTTP/3] New connection from {}", from);
 
@@ -2431,7 +2433,7 @@ async fn send_pending_packets(
             let size_breaks = !offsets.is_empty() && write != seg_size;
             if dest_changed || size_breaks {
                 if let Some(d) = dest {
-                    flush_gso_batch(socket, batch.as_slice(), offsets.as_slice(),d).await;
+                    flush_gso_batch(socket, batch.as_slice(), offsets.as_slice(), d).await;
                 }
                 batch.clear();
                 offsets.clear();
@@ -2448,7 +2450,7 @@ async fn send_pending_packets(
 
             // バッチ満杯（GSO セグメント上限）or 最終セグメント（< seg_size）なら flush。
             if offsets.len() >= MAX_GSO_SEGMENTS || write < seg_size {
-                flush_gso_batch(socket, batch.as_slice(), offsets.as_slice(),send_info.to).await;
+                flush_gso_batch(socket, batch.as_slice(), offsets.as_slice(), send_info.to).await;
                 batch.clear();
                 offsets.clear();
                 seg_size = 0;
@@ -2459,7 +2461,7 @@ async fn send_pending_packets(
         // 残りのバッチを flush
         if !offsets.is_empty() {
             if let Some(d) = dest {
-                flush_gso_batch(socket, batch.as_slice(), offsets.as_slice(),d).await;
+                flush_gso_batch(socket, batch.as_slice(), offsets.as_slice(), d).await;
             }
         }
 
