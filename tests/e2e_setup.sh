@@ -33,6 +33,7 @@ PIDS_FILE="${FIXTURES_DIR}/pids.txt"
 PROXY_HTTPS_PORT=8443
 PROXY_HTTP_PORT=8080
 PROXY_H2C_PORT=8081
+PROXY_L4_PORT=8444
 BACKEND1_PORT=9001
 BACKEND2_PORT=9002
 BACKEND_H2C_TLS_PORT=9013
@@ -337,6 +338,20 @@ secret = "test-admin-secret"
 [http3]
 listen = "127.0.0.1:${PROXY_HTTPS_PORT}"
 compression_enabled = true
+
+# L4 TCP プロキシ（TLS パススルー、F-30 splice 検証用）
+# クライアントの TLS は backend1/2(HTTPS) へ透過転送され、L4 は生バイトを双方向中継する。
+[[l4]]
+name = "l4-passthrough"
+listen = "127.0.0.1:${PROXY_L4_PORT}"
+lb = "round_robin"
+tls = "passthrough"
+
+  [[l4.upstreams]]
+  addr = "127.0.0.1:${BACKEND1_PORT}"
+
+  [[l4.upstreams]]
+  addr = "127.0.0.1:${BACKEND2_PORT}"
 
 [upstreams."backend-pool"]
 algorithm = "${algorithm}"
@@ -1132,7 +1147,7 @@ check_port_conflicts() {
     log_info "Checking for port conflicts..."
     local conflicts=0
     
-    for port in $PROXY_HTTPS_PORT $PROXY_HTTP_PORT $PROXY_H2C_PORT $BACKEND1_PORT $BACKEND2_PORT $BACKEND_H2C_PORT $BACKEND_GRPC_PORT $BACKEND_WS_PORT $BACKEND_ERROR_PORT; do
+    for port in $PROXY_HTTPS_PORT $PROXY_HTTP_PORT $PROXY_H2C_PORT $PROXY_L4_PORT $BACKEND1_PORT $BACKEND2_PORT $BACKEND_H2C_PORT $BACKEND_GRPC_PORT $BACKEND_WS_PORT $BACKEND_ERROR_PORT; do
         if check_port_in_use "$port"; then
             log_error "Port $port is already in use"
             conflicts=$((conflicts + 1))

@@ -101,6 +101,7 @@
 | B-06 | P2 | 完了 | [bugs/B-06-grpc-h2c-trailer-not-forwarded.md](bugs/B-06-grpc-h2c-trailer-not-forwarded.md) | gRPC H2C レスポンストレーラーが HTTP/1.1 クライアントに転送されない |
 | B-07 | P0 | 完了 | [bugs/B-07-iouring-future-drop-uaf.md](bugs/B-07-iouring-future-drop-uaf.md) | io_uring Future の Drop 未実装による UAF・タスク二重 poll（200 接続ストレスで segfault）→ 修正し segfault 消失 |
 | B-08 | P0 | 完了 | [bugs/B-08-http2-read-buffer-corruption.md](bugs/B-08-http2-read-buffer-corruption.md) | HTTP/2 読み込みバッファ破損（部分フレーム時の offset0 上書き・返却 len 誤信）で H2C/gRPC が 502。B-07 修正で顕在化 → 修正し H2C 29/29 通過 |
+| B-09 | P1 | 完了 | [bugs/B-09-l4-forward-writes-full-buffer.md](bugs/B-09-l4-forward-writes-full-buffer.md) | L4 forward_direction が読み取り n バイトでなくバッファ全長(64KB)を送信し転送破損（TLS パススルー不成立）。F-30 の L4 E2E 追加で発覚 → set_len(n) で修正 |
 
 ---
 

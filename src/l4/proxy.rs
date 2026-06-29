@@ -191,11 +191,15 @@ async fn forward_direction(
                 break;
             }
         };
-        // b.len() == n (set_init(n) がセット済み)
         let n = match res {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
+        // ReadFuture<Vec<u8>> の set_init は grow-only のため、read 後も b.len() は BUF_SIZE の
+        // ままで n には縮まらない。実際に読み取った n バイトのみを送信するよう長さを切り詰める。
+        // これを怠ると未初期化の末尾バイトまで送信して転送データを破損させる（生 TCP 中継では
+        // 致命的: TLS パススルー時にバックエンドがハンドシェイクを拒否して u→c が 0 になる）。
+        unsafe { b.set_len(n) };
 
         // ショートライトをリトライ（追加アロケーションなし）
         let mut written = 0;

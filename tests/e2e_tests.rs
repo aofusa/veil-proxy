@@ -61,6 +61,7 @@ use common::grpc_client::GrpcTestClient;
 const PROXY_PORT: u16 = 8443; // プロキシHTTPSポート
 const PROXY_HTTP_PORT: u16 = 8080; // プロキシHTTPポート（HTTPSリダイレクト用）
 const PROXY_H2C_PORT: u16 = 8081; // H2C (HTTP/2 Cleartext) ポート
+const PROXY_L4_PORT: u16 = 8444; // L4 TCP プロキシ（TLS パススルー、F-30）
 const PROXY_HTTP3_PORT: u16 = 8443; // HTTP/3ポート（デフォルトではHTTPSポートと同じ）
 const BACKEND1_PORT: u16 = 9001;
 const BACKEND2_PORT: u16 = 9002;
@@ -16247,4 +16248,70 @@ async fn test_e2e_admin_unauthorized() {
     assert_eq!(status, Some(401), "Wrong auth should return 401");
 
     eprintln!("Admin unauthorized E2E test: passed");
+}
+
+// ====================
+// L4 TCP プロキシ (F-30)
+// ====================
+
+/// L4 TCP プロキシ（TLS パススルー）の基本転送を検証する。
+///
+/// クライアントは L4 ポート(8444)へ TLS 接続し、L4 は生の TCP バイトを backend1/2(HTTPS) へ
+/// 双方向中継する（TLS は backend で終端）。これにより L4 の c→u / u→c 双方向転送が
+/// 壊れていないことを検証する（splice 化のリグレッションガード）。
+#[tokio::test]
+#[ntest::timeout(15000)]
+async fn test_l4_tcp_passthrough_forward() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let response = send_request_with_retry(PROXY_L4_PORT, "/", &[], 3).await;
+    assert!(
+        response.is_some(),
+        "L4 passthrough should forward the request and return a response"
+    );
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    assert_eq!(
+        status,
+        Some(200),
+        "L4 forwarded request should return 200, got: {:?}",
+        status
+    );
+    assert!(
+        response.contains("Hello from Backend"),
+        "L4 should transparently forward the backend's static file body"
+    );
+    eprintln!("L4 passthrough basic forward: passed");
+}
+
+/// L4 TCP プロキシで大きめのペイロード（10KB）が破損・切り詰めなく双方向転送されることを検証する。
+/// splice 化（複数チャンク転送）でのデータ整合性リグレッションを検出する。
+#[tokio::test]
+#[ntest::timeout(15000)]
+async fn test_l4_passthrough_large_payload() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let response = send_request_with_retry(PROXY_L4_PORT, "/large.txt", &[], 3).await;
+    assert!(response.is_some(), "L4 should forward large payload request");
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    assert_eq!(
+        status,
+        Some(200),
+        "L4 large payload should return 200, got: {:?}",
+        status
+    );
+    // large.txt は 'A' が 10000 バイト。連続した 'A' の長い並びが欠落なく転送されていることを確認。
+    let big_run = "A".repeat(5000);
+    assert!(
+        response.contains(big_run.as_str()),
+        "L4 should forward the 10KB body intact (no truncation/corruption)"
+    );
+    eprintln!("L4 passthrough large payload: passed");
 }
