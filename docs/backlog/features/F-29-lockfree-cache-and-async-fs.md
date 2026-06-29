@@ -100,12 +100,22 @@ struct MemoryCache {
 
 ### 残（難易度・波及が大きいため別タスク化）
 
-- **(B 残) 非同期 FS（STATX/OPENAT）**: `file_cache.rs::fetch_file_info` の
-  `canonicalize()` / `std::fs::metadata()` は **キャッシュミス時のみ** 同期実行。
-  恒常的にはキャッシュヒットで syscall ゼロだが、ミス時はイベントループをブロックする。
-  io_uring `IORING_OP_STATX`/`OPENAT` の Future 追加（`PROXY_ALLOWED_OPCODES`・seccomp
-  許可・restrictions の更新を含む）＋ `fetch_file_info` の async 化（全呼び出し元へ波及）
-  が必要。
+- **(B 残) 非同期 FS（STATX）— 調査の結果、現状維持が最適と判断**:
+  - `file_cache.rs::fetch_file_info` の `canonicalize()` / `std::fs::metadata()` は
+    **キャッシュミス時のみ** 同期実行。恒常的にはキャッシュヒットで **syscall ゼロ**
+    （ホットパスは既に最適）。
+  - `IORING_OP_STATX` の非同期 Future は試作し動作したが、本番適用は見送った。理由:
+    1. **canonicalize はセキュリティ要件**（`proxy.rs` でパストラバーサル防止に
+       `canonical_path.starts_with(base)` を使用）かつシンボリックリンク解決を行うが、
+       対応する単一 io_uring オペコードが無いため**同期のまま残さざるを得ない**。よって
+       metadata だけ STATX 化してもイベントループは canonicalize で結局ブロックし、
+       ホットパス効果は限定的（しかも対象はキャッシュミス＝コールドパスのみ）。
+    2. **セキュリティサーフェス**: `IORING_OP_STATX` を `PROXY_ALLOWED_OPCODES` に追加すると
+       io_uring 許可オペコードが増え攻撃面が広がる（最大セキュリティ方針に反する）。
+    3. **テスト**: 既存の file_cache 単体テストは ring 未初期化のため、io_uring STATX を
+       使うと panic する。ring を要する非同期テストへの全面書き換えが必要。
+  - 以上より「ホットパスは既にゼロ syscall・コールドパスの canonicalize は本質的に同期」と
+    結論し、限界的利益のためにセキュリティ面とテストを犠牲にしない判断とした。
 - **(C) buffering/handler.rs の非同期 FS**: 同上の AsyncFile 基盤が前提。
 - **(D 残) proxy.rs のその他アロケーション**: `client_ip`（`peer_addr.ip().to_string()`）
   と `host:port`（`format!`）は **接続ごと** の小アロケーションで keep-alive / コネクション
