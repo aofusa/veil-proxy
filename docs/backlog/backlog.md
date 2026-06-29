@@ -72,6 +72,7 @@
 | F-34 | P3 | 完了 | [features/F-34-connection-state-slab-arena.md](features/F-34-connection-state-slab-arena.md) | executor のタスク管理をスラブ + index Waker へ全面書換（接続ごと Arc<Task> 確保・2 ロック・per-wake Arc クローンを排除）。HTTP/2 64KB バッファ + HTTP/3 送受信の per-op malloc も排除済み |
 | F-35 | P3 | 一部完了 | [features/F-35-xdp-ebpf-ddos-defense.md](features/F-35-xdp-ebpf-ddos-defense.md) | ユーザースペース最前線（accept 段の IP ブロックリスト、TLS 前に切断）を実装。XDP/eBPF 本体は専用環境（CAP_BPF/対応NIC）が必要で継続 |
 | F-36 | P3 | 完了 | [features/F-36-wasm-cwasm-aot-cache.md](features/F-36-wasm-cwasm-aot-cache.md) | WASM cwasm AOT 事前コンパイルキャッシュ |
+| F-37 | P3 | 完了 | [features/F-37-runtime-optable-hotpath.md](features/F-37-runtime-optable-hotpath.md) | ランタイム最ホットパスの per-op コスト排除（OP_TABLE の SipHash→Fibonacci 軽量ハッシュ＋事前確保、user_data 採番を グローバルアトミック→スレッドローカル化で偽共有排除）。F-34 姉妹最適化 |
 | F-11 | P3 | 未着手 | [features/dashboard.md](features/dashboard.md) | ダッシュボード機能 |
 | F-12 | P3 | 未着手 | [features/config-generator-webui.md](features/config-generator-webui.md) | config.toml ジェネレータ Web UI |
 | F-13 | P3 | 未着手 | [features/documentation-site.md](features/documentation-site.md) | 公式ドキュメントサイト |

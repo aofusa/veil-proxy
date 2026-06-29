@@ -16,7 +16,6 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crate::runtime::ring::{
@@ -26,15 +25,31 @@ use crate::runtime::ring::{
 };
 
 // ====================
-// グローバル user_data カウンタ
+// スレッドローカル user_data カウンタ
 // ====================
 
-/// ユニークな user_data を生成するアトミックカウンタ
-static USER_DATA_COUNTER: AtomicU64 = AtomicU64::new(1);
+thread_local! {
+    /// スレッドローカルな user_data カウンタ。
+    ///
+    /// user_data は **同一ワーカースレッド内** でのみ意味を持つ（リング `RING` と操作テーブル
+    /// `OP_TABLE` はともにスレッドローカルで、SQE を提出したスレッドへ CQE が戻り同スレッドで
+    /// 処理される。`offload.rs` の完了通知も eventfd 経由で起点スレッドへ戻る）。よって一意性は
+    /// スレッド内で足りる。旧実装のグローバル `AtomicU64` は **全ワーカーコアが毎 io_uring op で
+    /// 同一キャッシュラインを奪い合う**（thread-per-core のスケールを阻害する偽共有）。スレッド
+    /// ローカル化して **毎 op のアトミック競合（同期コスト）を排除** する。別スレッドが同じ値を
+    /// 持っても別テーブル・別リングのため衝突しない。1 から単調増加し、`CANCEL_SENTINEL_USER_DATA`
+    /// (= u64::MAX) には実時間で到達しない。
+    static USER_DATA_COUNTER: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+}
 
-/// 新しいユニーク user_data を取得
+/// 新しい（スレッド内で）ユニークな user_data を取得する。アトミック不要・ロックフリー。
+#[inline]
 pub fn next_user_data() -> u64 {
-    USER_DATA_COUNTER.fetch_add(1, Ordering::Relaxed)
+    USER_DATA_COUNTER.with(|c| {
+        let v = c.get();
+        c.set(v.wrapping_add(1));
+        v
+    })
 }
 
 // ====================
@@ -82,19 +97,55 @@ pub type OpGuard = Box<dyn FnOnce(i32)>;
 /// USER_DATA_COUNTER は 1 から単調増加するため衝突しない。
 const CANCEL_SENTINEL_USER_DATA: u64 = u64::MAX;
 
+/// `OP_TABLE` のキー（`user_data`）専用の超軽量ハッシャ。
+///
+/// キーはスレッドローカルな単調増加カウンタ由来（`next_user_data`）で、外部入力ではない
+/// （ハッシュ衝突攻撃の対象にならない）。`OP_TABLE` は **io_uring の全オペレーション
+/// （recv/send/accept/splice/timeout/...）の登録・Waker 設定・完了取り出し**で引かれる
+/// プロキシ最ホットパスのため、標準 `HashMap` の SipHash（暗号学的ハッシュ）は純粋な無駄。
+/// 黄金比由来の奇数定数を 1 回掛ける Fibonacci ハッシュで全 64bit に拡散し
+/// （SwissTable は上位 7bit を制御バイトに使うため連番キーでも上位を 0 にしない）、
+/// per-op の SipHash 計算を排除する。乗算 1 回のみ。
+#[derive(Default)]
+struct NoHashU64(u64);
+
+impl std::hash::Hasher for NoHashU64 {
+    #[inline]
+    fn write_u64(&mut self, n: u64) {
+        // Fibonacci ハッシング（FxHash 同系）。連番キーを全ビットへ拡散する。
+        self.0 = n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    #[inline]
+    fn write(&mut self, _bytes: &[u8]) {
+        // user_data(u64) キーは常に write_u64 を通る。到達しない想定。
+        debug_assert!(false, "NoHashU64 supports only u64 keys");
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type NoHashBuilder = std::hash::BuildHasherDefault<NoHashU64>;
+type OpMap<V> = HashMap<u64, V, NoHashBuilder>;
+
+/// 事前確保する in-flight op スロット数（典型的な同時 in-flight op 数を見込む）。
+/// ホットパスでの HashMap 再確保（成長時 malloc）を抑える。
+const OP_TABLE_PREALLOC: usize = 256;
+
 /// スレッドローカルな操作テーブル
 struct OpTable {
     /// user_data -> (OpResult, Waker)（Future が生存している op）
-    ops: HashMap<u64, (OpResult, Option<Waker>)>,
+    ops: OpMap<(OpResult, Option<Waker>)>,
     /// user_data -> ガード（Future がドロップされ detach された op）
-    detached: HashMap<u64, OpGuard>,
+    detached: OpMap<OpGuard>,
 }
 
 impl OpTable {
     fn new() -> Self {
         Self {
-            ops: HashMap::new(),
-            detached: HashMap::new(),
+            ops: HashMap::with_capacity_and_hasher(OP_TABLE_PREALLOC, NoHashBuilder::default()),
+            detached: HashMap::with_capacity_and_hasher(16, NoHashBuilder::default()),
         }
     }
 
@@ -778,5 +829,39 @@ mod executor_tests {
             assert_eq!(idx2, idx, "freed slot should be reused");
             assert_ne!(gen2, gen0, "generation must advance on reuse");
         });
+    }
+
+    /// OP_TABLE 専用ハッシャ（NoHashU64）が u64 キーで衝突なく機能し、HashMap の登録／
+    /// 取得／削除が正しく動くことを検証する（SipHash 排除後のリグレッションガード）。
+    #[test]
+    fn op_table_nohash_roundtrip() {
+        use std::hash::{Hash, Hasher};
+
+        // 異なる連番キーは異なるハッシュへ拡散される（上位ビットも 0 でない）。
+        let mut h1 = NoHashU64::default();
+        1u64.hash(&mut h1);
+        let mut h2 = NoHashU64::default();
+        2u64.hash(&mut h2);
+        assert_ne!(h1.finish(), h2.finish());
+        assert_ne!(
+            h1.finish() >> 57,
+            0,
+            "upper bits must be spread for SwissTable"
+        );
+
+        // OpTable の基本ライフサイクル（register → on_cqe → take）が新ハッシャ上で動作する。
+        let mut table = OpTable::new();
+        for ud in [1u64, 2, 3, 1_000_000, u64::MAX - 1] {
+            table.register(ud);
+        }
+        let cqe = IoUringCqe {
+            user_data: 1_000_000,
+            res: 42,
+            flags: 0,
+        };
+        assert!(table.on_cqe(&cqe));
+        assert_eq!(table.take_result(1_000_000), Some(42));
+        // 未完了キーはまだ取り出せない。
+        assert_eq!(table.take_result(2), None);
     }
 }
