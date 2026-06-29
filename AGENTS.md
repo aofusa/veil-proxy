@@ -24,7 +24,7 @@ AI エージェントおよびコントリビュータ向けの **最小指針**
 
 データプレーン（接続受理〜リクエスト/レスポンス転送〜TLS/HTTP/2/HTTP/3/WASM 実行〜バックエンド I/O の各経路。1 リクエスト/1 コネクションあたり実行される全コード）では、次を **例外なく** 守る。レビュー時もこの観点を最優先で確認する。
 
-- **同期処理（ブロッキング呼び出し）の使用を一切禁止する。** ホットパスのあらゆる I/O・待機・システムコールは **必ず非同期**（`src/runtime/` の io_uring 非同期 API、`.await`）で行う。`std::net`・ブロッキング `libc::read/write/connect`・同期 DNS 解決・`block_on`・`std::thread::sleep`・同期ロック待ち等をホットパスに置いてはならない。WASM 実行のような CPU バウンド処理も、ワーカースレッドを占有しないよう非同期（協調的 yield）で実行する。
+- **同期処理（ブロッキング呼び出し）の使用を一切禁止する。** ホットパスのあらゆる I/O・待機・システムコールは **必ず非同期**（`src/runtime/` の io_uring 非同期 API、`.await`）で行う。`std::net`・ブロッキング `libc::read/write/connect`・同期 DNS 解決・`block_on`・`std::thread::sleep`・同期ロック待ち等をホットパスに置いてはならない。WASM 実行のような CPU バウンド処理も、ワーカースレッドを占有しないよう非同期（協調的 yield）で実行する。対応する io_uring オペコードが存在しないブロッキング処理（例: シンボリックリンク解決を伴う `canonicalize`）は `src/runtime/offload.rs` の `offload()`（専用スレッドプール + スレッドごと eventfd の POLL_ADD で完了待機）でワーカースレッドへ退避し、**イベントループ自体は決してブロックしない**こと（新規 io_uring オペコードを増やしてセキュリティサーフェスを広げてはならない）。
 - **メモリアロケーションは、パフォーマンス上必要である場合を除いて一切禁止する。** リクエストごとの `Vec`/`String`/`HashMap`/`Box` 等の新規確保、`to_vec()`/`to_string()`/`clone()`（ディープコピー）/`format!`/`collect()` をホットパスで増やさない。
 - **ゼロコピーを徹底する。** バッファは `bytes` クレート（`Bytes`/`BytesMut`、参照カウントによる共有・`split()`/`freeze()` によるゼロコピー分割）、`src/pool.rs` のスレッドローカルバッファプール、`splice(2)`/`sendfile(2)` 等のカーネルゼロコピー機構を用い、アロケーションとコピーを発生させない実装にする。
 - **難易度や保守性を理由に妥協しない。** 実装・設計の難易度が高い場合でも一切妥協せず、保守性や実装難易度は度外視して、**最高性能のパフォーマンスとセキュリティ** を最優先に設計・実装する。
@@ -118,7 +118,7 @@ cargo test --bins --test integration_tests --features "full"
 | パス | 役割 |
 |------|------|
 | `src/main.rs` | エントリ・mod 宣言・コア HTTP/1 など（下位モジュールは同 `src/` 配下） |
-| `src/runtime/` | 独自 io_uring ランタイム（ring.rs/executor.rs/tcp.rs/timer.rs/buf.rs/io.rs） |
+| `src/runtime/` | 独自 io_uring ランタイム（ring.rs/executor.rs/tcp.rs/timer.rs/buf.rs/io.rs/splice.rs/offload.rs） |
 | `tests/`、`benches/` | 統合・E2E・ベンチ |
 | `docs/artifacts/` | AI 成果物・一時ファイル |
 | `docs/backlog/` | 機能・バグチケット（親は `backlog.md`） |
