@@ -2438,9 +2438,12 @@ initial_max_streams_uni = 100
 # カーネルレベルでUDPパケットの送受信を効率化する機能です。
 #
 # 効果:
-#   - 複数の小さなUDPパケットを一度に送受信
-#   - システムコール回数の削減
-#   - CPU使用率の低減
+#   - 送信(GSO): 同一宛先・同一サイズの QUIC パケットを連結し 1 回の sendmsg(UDP_SEGMENT) で送出
+#   - 受信(GRO): 同一フローの複数データグラムを 1 回の recvmsg で集約受信
+#   - システムコール回数の削減・CPU使用率の低減
+#   - HTTP/3 受信ループは単一バッファを再利用し、GRO セグメントをスライスのまま quiche へ
+#     渡すため、データグラム毎のヒープ確保とコピーを排除（ゼロコピー受信）。非対応カーネルでは
+#     単発データグラム送受信に自動フォールバック。
 #
 # 注意:
 #   - Linux 5.0+ でサポート
@@ -3403,6 +3406,13 @@ cargo bench --features full
 # 特定のベンチマークを実行
 cargo bench --bench throughput --features full
 cargo bench --bench latency --features full
+
+# WASM フィルタオーバーヘッド（WASM ルート付きでプロキシ起動が前提。e2e_setup を利用）。
+# WASM 適用ルート（/wasm/*）と非適用ルート（/）の同一リクエストを比較し、Keep-Alive 群で
+# 接続コストを償却して 1 リクエストあたりのフィルタオーバーヘッドを切り出す。
+# 期待オーダー: ヘッダフィルタで 1 リクエストあたり数 µs〜数十 µs（マシン/wasmtime 依存）。
+# RSS は `/usr/bin/time -v` で別途計測。
+cargo bench --bench wasm --features wasm
 
 # 環境を停止
 ./tests/e2e_setup.sh stop

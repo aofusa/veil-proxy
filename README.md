@@ -2437,9 +2437,13 @@ initial_max_streams_uni = 100
 # kernel-level features that optimize UDP packet transmission and reception.
 #
 # Effects:
-#   - Send/receive multiple small UDP packets at once
-#   - Reduce system call overhead
-#   - Lower CPU usage
+#   - Send (GSO): coalesce same-destination/same-size QUIC packets into one
+#     sendmsg(UDP_SEGMENT) call
+#   - Receive (GRO): coalesce multiple datagrams of the same flow in one recvmsg
+#   - Reduce system call overhead and CPU usage
+#   - The HTTP/3 receive loop reuses a single buffer and feeds GRO segments to
+#     quiche as slices, eliminating per-datagram heap allocation and copies
+#     (zero-copy receive). Falls back to single-datagram I/O on unsupported kernels.
 #
 # Notes:
 #   - Supported on Linux 5.0+
@@ -3410,6 +3414,13 @@ cargo bench --features full
 # Run specific benchmark
 cargo bench --bench throughput --features full
 cargo bench --bench latency --features full
+
+# WASM filter overhead (requires the proxy started with the WASM route, e.g. via e2e_setup).
+# Compares an identical request through a WASM-filtered route (/wasm/*) vs a plain route (/);
+# the keep-alive group amortizes connection cost to isolate the per-request filter overhead.
+# Expected order: a few µs to tens of µs per request for a header filter (machine/wasmtime
+# dependent). Measure RSS separately with `/usr/bin/time -v`.
+cargo bench --bench wasm --features wasm
 
 # Stop environment
 ./tests/e2e_setup.sh stop
