@@ -382,3 +382,7 @@ harness = false
 [[bench]]
 name = "routing"
 harness = false
+
+[[bench]]
+name = "wasm"
+harness = false
