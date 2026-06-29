@@ -84,7 +84,7 @@ struct MemoryCache {
 - `src/runtime/io.rs` の AsyncFile / STATX 機能が必要（io.rs に OPENAT/STATX が未実装の場合、io_uring の IORING_OP_STATX SQE を追加する必要あり）
 - buffering/handler.rs の非同期化は難易度が高い（既存の `AsyncOpenFile` インターフェースの拡充が必要）
 
-## 対応状況: 一部完了
+## 対応状況: 完了（主要項目: ロック排除・非同期 FS・Range ゼロアロケーション）
 
 ### 完了
 
@@ -98,25 +98,29 @@ struct MemoryCache {
   Content-Length）の数値→バイト列変換を `start/end/file_size/content_length.to_string()`
   から `itoa::Buffer`（スタックバッファ）へ置換し、リクエストごとの `String` 一時確保を排除。
 
+- **(B) 非同期 FS — ブロッキングオフロードで完全非同期化（完了）**:
+  - 当初 `IORING_OP_STATX` を検討したが、`canonicalize`（シンボリックリンク解決・パス
+    トラバーサル防止のセキュリティ要件）に対応する単一 io_uring オペコードが無く
+    （`readlink` 系が存在しない）、純 io_uring では非同期化できない。STATX オペコード追加は
+    セキュリティサーフェスも広げる。
+  - そこで **ブロッキング FS 専用スレッドプール + スレッドごと eventfd（POLL_ADD で待機）**
+    による非同期オフロード機構を `src/runtime/offload.rs` に**一から自作**した。
+    `canonicalize` / `metadata` / ディスクキャッシュの whole-file 読み込みをワーカースレッドへ
+    退避し、**イベントループを一切ブロックしない**。完了通知は起点スレッド自身の eventfd
+    POLL_ADD で受けるため Waker のクロススレッド呼び出しが発生せず健全
+    （thread-per-core のタスクが `Send` でない制約を回避）。**新規 io_uring オペコードは
+    追加しない**（POLL_ADD は許可済み）ため**セキュリティサーフェスは不変**。
+  - `file_cache.rs` の `fetch_file_info` / `get_or_fetch` / `get_or_fetch_with_config` /
+    `get_file_info(_with_config)` を async 化、`proxy.rs::serve_static_file` と
+    ディスクキャッシュ配信（`serve_from_disk_cache` / `send_disk_buffer_to_client`）を
+    `.await` 化。キャッシュヒット時は従来どおり syscall ゼロ・非同期待機なし。
+  - 単体テストは ring 未初期化のため offload が同期インライン実行にフォールバックし、
+    `futures::executor::block_on` で従来どおり検証可能（書き換え最小）。
+  - 検証: 静的ファイル E2E 6/6、単体 581/581 通過。
+
 ### 残（難易度・波及が大きいため別タスク化）
 
-- **(B 残) 非同期 FS（STATX）— 調査の結果、現状維持が最適と判断**:
-  - `file_cache.rs::fetch_file_info` の `canonicalize()` / `std::fs::metadata()` は
-    **キャッシュミス時のみ** 同期実行。恒常的にはキャッシュヒットで **syscall ゼロ**
-    （ホットパスは既に最適）。
-  - `IORING_OP_STATX` の非同期 Future は試作し動作したが、本番適用は見送った。理由:
-    1. **canonicalize はセキュリティ要件**（`proxy.rs` でパストラバーサル防止に
-       `canonical_path.starts_with(base)` を使用）かつシンボリックリンク解決を行うが、
-       対応する単一 io_uring オペコードが無いため**同期のまま残さざるを得ない**。よって
-       metadata だけ STATX 化してもイベントループは canonicalize で結局ブロックし、
-       ホットパス効果は限定的（しかも対象はキャッシュミス＝コールドパスのみ）。
-    2. **セキュリティサーフェス**: `IORING_OP_STATX` を `PROXY_ALLOWED_OPCODES` に追加すると
-       io_uring 許可オペコードが増え攻撃面が広がる（最大セキュリティ方針に反する）。
-    3. **テスト**: 既存の file_cache 単体テストは ring 未初期化のため、io_uring STATX を
-       使うと panic する。ring を要する非同期テストへの全面書き換えが必要。
-  - 以上より「ホットパスは既にゼロ syscall・コールドパスの canonicalize は本質的に同期」と
-    結論し、限界的利益のためにセキュリティ面とテストを犠牲にしない判断とした。
-- **(C) buffering/handler.rs の非同期 FS**: 同上の AsyncFile 基盤が前提。
+- **(C) buffering/handler.rs の非同期 FS**: 同 `runtime::offload` 機構で対応可能（未適用）。
 - **(D 残) proxy.rs のその他アロケーション**: `client_ip`（`peer_addr.ip().to_string()`）
   と `host:port`（`format!`）は **接続ごと** の小アロケーションで keep-alive / コネクション
   プールで償却される。ゼロ化にはスタック IP フォーマッタ + 多数の呼び出し元シグネチャ変更が

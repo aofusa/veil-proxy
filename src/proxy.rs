@@ -5460,14 +5460,17 @@ async fn serve_from_disk_cache(
     client_wants_close: bool,
     is_stale: bool,
 ) -> Option<(u16, u64)> {
-    // ディスクからボディを読み込み（コールドパスのため std::fs 使用）
-    let body_data = match std::fs::read(disk_path) {
-        Ok(data) => data,
-        Err(e) => {
-            error!("Failed to read disk cache file: {}", e);
-            return None;
-        }
-    };
+    // ディスクからボディを読み込み。whole-file 読み込みはイベントループをブロックするため、
+    // ブロッキングオフロードで専用ワーカースレッドへ退避する（F-29 完全非同期化）。
+    let disk_path_owned = disk_path.to_path_buf();
+    let body_data =
+        match crate::runtime::offload::offload(move || std::fs::read(disk_path_owned)).await {
+            Ok(data) => data,
+            Err(e) => {
+                error!("Failed to read disk cache file: {}", e);
+                return None;
+            }
+        };
 
     // レスポンスを構築
     let response = build_cached_response(cached_entry, &body_data, client_wants_close, is_stale);
@@ -5852,8 +5855,9 @@ async fn send_disk_buffer_to_client(
     size: u64,
     timeout_secs: u64,
 ) -> Option<u64> {
-    // ディスクから読み込み（コールドパスのため std::fs 使用）
-    let data = match std::fs::read(path) {
+    // whole-file 読み込みはイベントループをブロックするためオフロードする（F-29）。
+    let path_owned = path.to_path_buf();
+    let data = match crate::runtime::offload::offload(move || std::fs::read(path_owned)).await {
         Ok(d) => d,
         Err(e) => {
             error!("Failed to read disk buffer: {}", e);
@@ -8592,7 +8596,7 @@ async fn handle_sendfile(
     // OpenFileCacheを使用してファイル情報を取得（キャッシュ優先）
     // これにより、canonicalize、metadata、mime_guessのシステムコールをキャッシュ
     // ルーティングごとの設定を考慮
-    let file_info = match cache::get_file_info_with_config(&full_path, open_file_cache_config) {
+    let file_info = match cache::get_file_info_with_config(&full_path, open_file_cache_config).await {
         Some(info) => info,
         None => {
             let err_buf = ERR_MSG_NOT_FOUND.to_vec();
@@ -8604,7 +8608,8 @@ async fn handle_sendfile(
     // ディレクトリの場合はセキュリティチェック
     if is_dir {
         // ベースパスのキャッシュ情報も取得（頻繁にアクセスされるため）
-        if let Some(base_info) = cache::get_file_info_with_config(base_path, open_file_cache_config)
+        if let Some(base_info) =
+            cache::get_file_info_with_config(base_path, open_file_cache_config).await
         {
             if !file_info
                 .canonical_path
@@ -8623,7 +8628,7 @@ async fn handle_sendfile(
         let index_path = file_info.canonical_path.join(filename);
 
         // インデックスファイルの情報をキャッシュから取得
-        match cache::get_file_info_with_config(&index_path, open_file_cache_config) {
+        match cache::get_file_info_with_config(&index_path, open_file_cache_config).await {
             Some(idx_info) if idx_info.is_file => (
                 idx_info.canonical_path.clone(),
                 idx_info.file_size,

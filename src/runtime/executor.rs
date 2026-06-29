@@ -236,6 +236,14 @@ pub fn init_ring(entries: u32, flags: u32) -> std::io::Result<()> {
     Ok(())
 }
 
+/// このスレッドに io_uring リングが初期化済みか判定する。
+///
+/// FS オフロード（F-29）が、リングのあるワーカースレッドでは eventfd ベースの非同期待機を、
+/// リングの無いコンテキスト（単体テスト等）では同期インライン実行をするための分岐に使う。
+pub fn has_ring() -> bool {
+    RING.with(|r| r.borrow().is_some())
+}
+
 /// スレッドローカルな io_uring リングを取得してクロージャを実行
 pub fn with_ring<F, R>(f: F) -> R
 where

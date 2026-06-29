@@ -230,9 +230,9 @@ pub fn get_file_cache() -> Option<std::sync::Arc<()>> {
     None
 }
 
-/// ファイル情報取得（スタブ）
+/// ファイル情報取得（スタブ、F-29 で async 化に追従）
 #[cfg(not(feature = "cache"))]
-pub fn get_file_info_with_config(
+pub async fn get_file_info_with_config(
     _path: &std::path::Path,
     _config: Option<&OpenFileCacheConfig>,
 ) -> Option<CachedFileInfo> {
@@ -240,7 +240,7 @@ pub fn get_file_info_with_config(
 }
 
 #[cfg(not(feature = "cache"))]
-pub fn get_file_info(_path: &std::path::Path) -> Option<CachedFileInfo> {
+pub async fn get_file_info(_path: &std::path::Path) -> Option<CachedFileInfo> {
     None
 }
 

@@ -180,12 +180,12 @@ impl OpenFileCache {
     ///
     /// - `Some(CachedFileInfo)`: ファイルが存在し情報を取得できた場合
     /// - `None`: ファイルが存在しないか、エラーが発生した場合
-    pub fn get_or_fetch(&self, path: &Path) -> Option<CachedFileInfo> {
+    pub async fn get_or_fetch(&self, path: &Path) -> Option<CachedFileInfo> {
         let valid_duration =
             Duration::from_nanos(self.valid_duration_nanos.load(Ordering::Relaxed));
         let max_entries = self.max_entries.load(Ordering::Relaxed);
 
-        // まずキャッシュから検索
+        // まずキャッシュから検索（ヒット時は syscall ゼロ・非同期待機なし）
         if let Some(entry) = self.entries.get(path) {
             if entry.is_valid(valid_duration) {
                 self.hits.fetch_add(1, Ordering::Relaxed);
@@ -193,10 +193,10 @@ impl OpenFileCache {
             }
         }
 
-        // キャッシュミス: ファイルシステムから取得
+        // キャッシュミス: ファイルシステムから取得（オフロードで非同期）
         self.misses.fetch_add(1, Ordering::Relaxed);
 
-        let info = self.fetch_file_info(path)?;
+        let info = self.fetch_file_info(path).await?;
 
         // キャッシュが大きすぎる場合は古いエントリを削除
         if self.entries.len() >= max_entries {
@@ -207,27 +207,33 @@ impl OpenFileCache {
         Some(info)
     }
 
-    /// ファイル情報を直接フェッチ（キャッシュをバイパス）
-    pub(crate) fn fetch_file_info(&self, path: &Path) -> Option<CachedFileInfo> {
-        // パスを正規化
-        let canonical = path.canonicalize().ok()?;
+    /// ファイル情報を直接フェッチ（キャッシュをバイパス、F-29 で完全非同期化）
+    ///
+    /// `canonicalize`（シンボリックリンク解決を含む）と `metadata` は同期 syscall であり、特に
+    /// `canonicalize` は io_uring 非対応。ブロッキングオフロード（`runtime::offload`）で専用
+    /// ワーカースレッドへ退避し、**イベントループをブロックしない**。MIME 推測も同所で実行する。
+    pub(crate) async fn fetch_file_info(&self, path: &Path) -> Option<CachedFileInfo> {
+        let path = path.to_path_buf();
+        crate::runtime::offload::offload(move || {
+            // パスを正規化（シンボリックリンク解決・パストラバーサル防止）
+            let canonical = path.canonicalize().ok()?;
+            // メタデータを取得
+            let metadata = std::fs::metadata(&canonical).ok()?;
+            // MIMEタイプを推測
+            let mime_type = mime_guess::from_path(&canonical)
+                .first_or_octet_stream()
+                .to_string();
 
-        // メタデータを取得
-        let metadata = std::fs::metadata(&canonical).ok()?;
-
-        // MIMEタイプを推測
-        let mime_type = mime_guess::from_path(&canonical)
-            .first_or_octet_stream()
-            .to_string();
-
-        Some(CachedFileInfo {
-            canonical_path: canonical,
-            file_size: metadata.len(),
-            mime_type,
-            last_modified: metadata.modified().ok(),
-            is_file: metadata.is_file(),
-            cached_at: Instant::now(),
+            Some(CachedFileInfo {
+                canonical_path: canonical,
+                file_size: metadata.len(),
+                mime_type,
+                last_modified: metadata.modified().ok(),
+                is_file: metadata.is_file(),
+                cached_at: Instant::now(),
+            })
         })
+        .await
     }
 
     /// 古いエントリを削除（10%を削除）
@@ -306,13 +312,13 @@ impl OpenFileCache {
     }
 
     /// 設定を考慮してファイル情報を取得
-    pub fn get_or_fetch_with_config(
+    pub async fn get_or_fetch_with_config(
         &self,
         path: &Path,
         valid_duration: Duration,
         max_entries: usize,
     ) -> Option<CachedFileInfo> {
-        // まずキャッシュから検索
+        // まずキャッシュから検索（ヒット時は非同期待機なし）
         if let Some(entry) = self.entries.get(path) {
             // ルーティングごとの有効期間で判定
             if entry.is_valid(valid_duration) {
@@ -321,10 +327,10 @@ impl OpenFileCache {
             }
         }
 
-        // キャッシュミス: ファイルシステムから取得
+        // キャッシュミス: ファイルシステムから取得（オフロードで非同期）
         self.misses.fetch_add(1, Ordering::Relaxed);
 
-        let info = self.fetch_file_info(path)?;
+        let info = self.fetch_file_info(path).await?;
 
         // ルーティングごとの最大エントリ数で判定
         let current_max_entries = self.max_entries.load(Ordering::Relaxed);
@@ -345,12 +351,12 @@ pub fn get_file_cache() -> &'static OpenFileCache {
 
 /// ファイル情報をキャッシュから取得
 #[inline]
-pub fn get_file_info(path: &Path) -> Option<CachedFileInfo> {
-    OPEN_FILE_CACHE.get_or_fetch(path)
+pub async fn get_file_info(path: &Path) -> Option<CachedFileInfo> {
+    OPEN_FILE_CACHE.get_or_fetch(path).await
 }
 
 /// ルーティングごとの設定を考慮してファイル情報を取得
-pub fn get_file_info_with_config(
+pub async fn get_file_info_with_config(
     path: &Path,
     config: Option<&OpenFileCacheConfig>,
 ) -> Option<CachedFileInfo> {
@@ -361,7 +367,7 @@ pub fn get_file_info_with_config(
 
     if !enabled {
         // キャッシュ無効時は直接フェッチ（キャッシュしない）
-        return OPEN_FILE_CACHE.fetch_file_info(path);
+        return OPEN_FILE_CACHE.fetch_file_info(path).await;
     }
 
     // 有効期間と最大エントリ数も同様に処理
@@ -377,7 +383,9 @@ pub fn get_file_info_with_config(
         .unwrap_or_else(|| OPEN_FILE_CACHE_GLOBAL_MAX_ENTRIES.load(Ordering::Relaxed));
 
     // キャッシュから取得（有効期間と最大エントリ数を考慮）
-    OPEN_FILE_CACHE.get_or_fetch_with_config(path, valid_duration, max_entries)
+    OPEN_FILE_CACHE
+        .get_or_fetch_with_config(path, valid_duration, max_entries)
+        .await
 }
 
 /// 指定パスのキャッシュを無効化
@@ -405,14 +413,15 @@ mod tests {
 
         let cache = OpenFileCache::new();
 
-        // 最初のアクセス（キャッシュミス）
-        let info1 = cache.get_or_fetch(&file_path);
+        // 最初のアクセス（キャッシュミス）。ring 未初期化のため offload は同期インライン実行され、
+        // futures::executor::block_on が即座に完了する。
+        let info1 = futures::executor::block_on(cache.get_or_fetch(&file_path));
         assert!(info1.is_some());
         assert_eq!(cache.misses(), 1);
         assert_eq!(cache.hits(), 0);
 
         // 2回目のアクセス（キャッシュヒット）
-        let info2 = cache.get_or_fetch(&file_path);
+        let info2 = futures::executor::block_on(cache.get_or_fetch(&file_path));
         assert!(info2.is_some());
         assert_eq!(cache.misses(), 1);
         assert_eq!(cache.hits(), 1);
@@ -431,19 +440,19 @@ mod tests {
         // HTMLファイル
         let html_path = dir.path().join("index.html");
         File::create(&html_path).unwrap();
-        let info = get_file_cache().fetch_file_info(&html_path).unwrap();
+        let info = futures::executor::block_on(get_file_cache().fetch_file_info(&html_path)).unwrap();
         assert!(info.mime_type.starts_with("text/html"));
 
         // CSSファイル
         let css_path = dir.path().join("style.css");
         File::create(&css_path).unwrap();
-        let info = get_file_cache().fetch_file_info(&css_path).unwrap();
+        let info = futures::executor::block_on(get_file_cache().fetch_file_info(&css_path)).unwrap();
         assert!(info.mime_type.starts_with("text/css"));
 
         // JavaScriptファイル
         let js_path = dir.path().join("app.js");
         File::create(&js_path).unwrap();
-        let info = get_file_cache().fetch_file_info(&js_path).unwrap();
+        let info = futures::executor::block_on(get_file_cache().fetch_file_info(&js_path)).unwrap();
         assert!(info.mime_type.contains("javascript"));
     }
 
@@ -456,7 +465,7 @@ mod tests {
         let cache = OpenFileCache::new();
 
         // キャッシュに追加
-        let _ = cache.get_or_fetch(&file_path);
+        let _ = futures::executor::block_on(cache.get_or_fetch(&file_path));
         assert_eq!(cache.len(), 1);
 
         // 無効化
@@ -465,14 +474,14 @@ mod tests {
         // エントリが削除されていることを確認するため、再度取得
         // (新しいミスが発生)
         let initial_misses = cache.misses();
-        let _ = cache.get_or_fetch(&file_path);
+        let _ = futures::executor::block_on(cache.get_or_fetch(&file_path));
         assert_eq!(cache.misses(), initial_misses + 1);
     }
 
     #[test]
     fn test_nonexistent_file() {
         let cache = OpenFileCache::new();
-        let result = cache.get_or_fetch(Path::new("/nonexistent/file.txt"));
+        let result = futures::executor::block_on(cache.get_or_fetch(Path::new("/nonexistent/file.txt")));
         assert!(result.is_none());
     }
 }
