@@ -69,7 +69,7 @@
 | F-30 | P2 | 完了 | [features/F-30-l4-splice-zerocopy.md](features/F-30-l4-splice-zerocopy.md) | L4 ストリームプロキシの splice(2) ゼロコピー転送（E2E 追加→B-09 修正→pipe 経由 splice 実装。ユーザースペースバッファ撤廃） |
 | F-31 | P2 | 完了 | [features/F-31-memory-cache-bytes-zerocopy.md](features/F-31-memory-cache-bytes-zerocopy.md) | メモリキャッシュの bytes::Bytes ゼロコピー配信 |
 | F-33 | P3 | 完了 | [features/F-33-http3-gso-gro-offload.md](features/F-33-http3-gso-gro-offload.md) | HTTP/3 送信 GSO バッチング + 受信 GRO 配線（recv_gro_async）。受信ループの 64KB バッファを再利用し per-datagram の 3 確保 + 2 コピーを排除（ゼロコピー受信）。送信も単一パケット to_vec 排除 + スレッドローカル送信スクラッチ再利用 |
-| F-34 | P3 | 一部完了 | [features/F-34-connection-state-slab-arena.md](features/F-34-connection-state-slab-arena.md) | HTTP/2 コネクション 64KB バッファをスレッドローカル再利用。タスク/状態全体の Slab 化は継続 |
+| F-34 | P3 | 完了 | [features/F-34-connection-state-slab-arena.md](features/F-34-connection-state-slab-arena.md) | executor のタスク管理をスラブ + index Waker へ全面書換（接続ごと Arc<Task> 確保・2 ロック・per-wake Arc クローンを排除）。HTTP/2 64KB バッファ + HTTP/3 送受信の per-op malloc も排除済み |
 | F-35 | P3 | 一部完了 | [features/F-35-xdp-ebpf-ddos-defense.md](features/F-35-xdp-ebpf-ddos-defense.md) | ユーザースペース最前線（accept 段の IP ブロックリスト、TLS 前に切断）を実装。XDP/eBPF 本体は専用環境（CAP_BPF/対応NIC）が必要で継続 |
 | F-36 | P3 | 完了 | [features/F-36-wasm-cwasm-aot-cache.md](features/F-36-wasm-cwasm-aot-cache.md) | WASM cwasm AOT 事前コンパイルキャッシュ |
 | F-11 | P3 | 未着手 | [features/dashboard.md](features/dashboard.md) | ダッシュボード機能 |

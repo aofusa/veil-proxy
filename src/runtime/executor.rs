@@ -12,11 +12,11 @@
 #![allow(dead_code)]
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crate::runtime::ring::{
@@ -356,28 +356,110 @@ pub fn submit_sqes() -> std::io::Result<()> {
 // シングルスレッドエグゼキュータ
 // ====================
 
-/// タスクキュー（Ready な Future のリスト）
-struct TaskQueue {
-    ready: std::collections::VecDeque<Arc<Task>>,
+// thread-per-core 前提の単一スレッドエグゼキュータ。タスクをスレッドローカルのスラブ
+// （free-list 付き Vec）で管理し、Waker は「スロット index + 世代」をポインタ幅へパックして
+// 持つ。これにより:
+//   - 旧実装の接続ごと `Arc<Task>` 確保を排除（スラブのスロット再利用）。
+//   - `Mutex<Pin<Box<dyn Future>>>` と `Arc<Mutex<TaskQueue>>` の 2 ロックを排除（単一スレッド
+//     のため RefCell で十分）。
+//   - wake/schedule ごとの `Arc` クローン（参照カウント atomic）を排除（index の push のみ）。
+//
+// 残る確保は型消去のための `Box<dyn Future>` 1 本のみ（spawn ごと）。異種 Future を一様に保持
+// するため不可避（全スロットを最大サイズでインライン化するのは非現実的）。
+//
+// ## 健全性（Waker のスレッド前提）
+//
+// 本ランタイムでは **すべての wake が所有ワーカースレッド上で発生する**。I/O 完了は同スレッドの
+// io_uring CQE 処理（`on_cqe`）で wake され、ブロッキングオフロード（`offload.rs`）も完了を
+// eventfd + POLL_ADD で **起点スレッドへ** 通知して同スレッドで wake する（Waker をクロス
+// スレッドで呼ばない）。`std::task::Waker` の `Send + Sync` 契約上クロススレッド送信は型的に
+// 可能だが、本ランタイムは上記不変条件を満たすため index ベースの軽量 Waker が
+// スレッドローカル状態へアクセスしても健全である（monoio / glommio と同方針）。Waker は
+// ワーカースレッドより長生きしない（OP_TABLE もスレッドローカルで同時に破棄される）。
+
+/// スラブのスロット。poll 時に `future` を take するため `Option` で保持する。
+struct TaskSlot {
+    /// Future 本体（型消去のため Box。poll 中は take して None になる）
+    future: Option<Pin<Box<dyn Future<Output = ()> + 'static>>>,
+    /// 世代カウンタ。スロット再利用時に +1 し、古い Waker からの wake を弾く。
+    generation: u32,
+    /// 既に ready キューに積まれているか（重複 push 抑止）。
+    scheduled: bool,
 }
 
-impl TaskQueue {
+/// スレッドローカルなエグゼキュータ状態（スラブ + free-list + ready キュー）。
+struct ExecutorState {
+    /// タスクスロット（index で参照、index は Vec の realloc を跨いで安定）
+    slots: Vec<TaskSlot>,
+    /// 空きスロット index の free-list（LIFO）
+    free: Vec<usize>,
+    /// 実行可能タスクの (index, generation) キュー（FIFO）
+    ready: VecDeque<(usize, u32)>,
+}
+
+impl ExecutorState {
     fn new() -> Self {
         Self {
-            ready: std::collections::VecDeque::new(),
+            slots: Vec::new(),
+            free: Vec::new(),
+            ready: VecDeque::new(),
+        }
+    }
+
+    /// Box 化済み Future を新しいスロットへ格納し、ready キューへ積む。
+    fn spawn_boxed(&mut self, future: Pin<Box<dyn Future<Output = ()> + 'static>>) {
+        let index = if let Some(i) = self.free.pop() {
+            let slot = &mut self.slots[i];
+            slot.future = Some(future);
+            slot.scheduled = true;
+            i
+        } else {
+            let i = self.slots.len();
+            self.slots.push(TaskSlot {
+                future: Some(future),
+                generation: 0,
+                scheduled: true,
+            });
+            i
+        };
+        let generation = self.slots[index].generation;
+        self.ready.push_back((index, generation));
+    }
+
+    /// index/generation のタスクを ready キューへ積む（既に積まれていれば何もしない）。
+    fn schedule(&mut self, index: usize, generation: u32) {
+        if let Some(slot) = self.slots.get_mut(index) {
+            // 世代不一致 = 既に解放/再利用された古い Waker。無視。
+            if slot.generation != generation || slot.scheduled {
+                return;
+            }
+            slot.scheduled = true;
+            self.ready.push_back((index, generation));
         }
     }
 }
 
-/// 実行タスク
-struct Task {
-    /// Future 本体（Mutex で Sync を付与）
-    future: Mutex<Pin<Box<dyn Future<Output = ()> + 'static>>>,
-    /// タスクキューへの参照（wake 時に自分自身を再キューイング）
-    queue: Arc<Mutex<TaskQueue>>,
+thread_local! {
+    /// スレッドローカルなエグゼキュータ状態。thread-per-core のためロック不要。
+    static EXEC_STATE: RefCell<ExecutorState> = RefCell::new(ExecutorState::new());
 }
 
-/// タスク用 Waker の vtable
+// ── index ベース Waker ──────────────────────────────────────────────
+
+/// (index, generation) をポインタ幅へパックして Waker の data とする。
+#[inline]
+fn pack_waker(index: usize, generation: u32) -> *const () {
+    (((index as u64) << 32) | (generation as u64)) as *const ()
+}
+
+/// `pack_waker` の逆。
+#[inline]
+fn unpack_waker(data: *const ()) -> (usize, u32) {
+    let v = data as u64;
+    ((v >> 32) as usize, (v & 0xFFFF_FFFF) as u32)
+}
+
+/// タスク用 Waker の vtable（index ベース、参照カウントなし）
 static TASK_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     task_waker_clone,
     task_waker_wake,
@@ -385,102 +467,119 @@ static TASK_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     task_waker_drop,
 );
 
+// SAFETY: data は (index, generation) を埋め込んだ非ポインタ値。参照カウントを持たないため
+// clone はビットコピー、drop は no-op。wake は所有スレッド上でのみ呼ばれる前提（上記健全性参照）。
 unsafe fn task_waker_clone(data: *const ()) -> RawWaker {
-    let arc = Arc::from_raw(data as *const Task);
-    let cloned = arc.clone();
-    std::mem::forget(arc);
-    RawWaker::new(Arc::into_raw(cloned) as *const (), &TASK_WAKER_VTABLE)
+    RawWaker::new(data, &TASK_WAKER_VTABLE)
 }
 
 unsafe fn task_waker_wake(data: *const ()) {
-    let arc = Arc::from_raw(data as *const Task);
-    arc.schedule();
-    // arc はここでドロップ（Arc::into_raw の逆）
+    let (index, generation) = unpack_waker(data);
+    // スレッド破棄中は try_with が Err になり得るため握りつぶす（その場合 wake は不要）。
+    let _ = EXEC_STATE.try_with(|s| s.borrow_mut().schedule(index, generation));
 }
 
 unsafe fn task_waker_wake_by_ref(data: *const ()) {
-    let arc = Arc::from_raw(data as *const Task);
-    arc.schedule();
-    std::mem::forget(arc); // 参照カウントを減らさない
+    let (index, generation) = unpack_waker(data);
+    let _ = EXEC_STATE.try_with(|s| s.borrow_mut().schedule(index, generation));
 }
 
-unsafe fn task_waker_drop(data: *const ()) {
-    drop(Arc::from_raw(data as *const Task));
+unsafe fn task_waker_drop(_data: *const ()) {}
+
+/// index/generation から Waker を構築する。
+fn make_waker(index: usize, generation: u32) -> Waker {
+    let raw = RawWaker::new(pack_waker(index, generation), &TASK_WAKER_VTABLE);
+    // SAFETY: vtable は有効な関数ポインタを持ち、clone/wake/drop の契約を満たす。
+    unsafe { Waker::from_raw(raw) }
 }
 
-impl Task {
-    /// タスクをキューに追加する
-    fn schedule(self: &Arc<Self>) {
-        if let Ok(mut q) = self.queue.lock() {
-            q.ready.push_back(self.clone());
-        }
-    }
-
-    /// タスクを1回ポーリングする
-    fn poll_once(self: &Arc<Self>) -> Poll<()> {
-        let raw = Arc::as_ptr(self) as *const ();
-        let raw_waker = RawWaker::new(raw, &TASK_WAKER_VTABLE);
-        // SAFETY: vtable は有効な関数ポインタを持つ
-        let waker = unsafe { Waker::from_raw(raw_waker) };
-        // Arc の参照カウントを1増やす（Waker が保持）
-        std::mem::forget(self.clone());
-
-        let mut cx = Context::from_waker(&waker);
-        let mut future = self.future.lock().unwrap();
-        future.as_mut().poll(&mut cx)
-    }
-}
-
-/// シングルスレッドエグゼキュータ
+/// シングルスレッドエグゼキュータのハンドル（状態はスレッドローカル `EXEC_STATE`）。
 ///
-/// `queue` は `Arc<Mutex<_>>` で共有可能。Clone すると同一キューを参照するため、
-/// `block_on` するエグゼキュータと `spawn()` 先のスレッドローカルエグゼキュータを
-/// 一致させられる（一致しないと spawn したタスクがポーリングされない）。
-#[derive(Clone)]
+/// 旧実装の `Arc<Mutex<TaskQueue>>` 共有は不要になり、ハンドルは ZST。`spawn()` も
+/// `block_on()` も同一スレッドローカル状態を参照するため、ポーリング対象が一致する。
+#[derive(Clone, Default)]
 pub struct Executor {
-    queue: Arc<Mutex<TaskQueue>>,
+    _private: (),
 }
 
 impl Executor {
-    /// 新しいエグゼキュータを作成する
+    /// 新しいエグゼキュータハンドルを作成する。
     pub fn new() -> Self {
-        Self {
-            queue: Arc::new(Mutex::new(TaskQueue::new())),
-        }
+        Executor { _private: () }
     }
 
-    /// Future をスポーンする
+    /// Future をスポーンする。
     pub fn spawn<F>(&self, future: F)
     where
         F: Future<Output = ()> + 'static,
     {
-        let task = Arc::new(Task {
-            future: Mutex::new(Box::pin(future)),
-            queue: self.queue.clone(),
-        });
-        if let Ok(mut q) = self.queue.lock() {
-            q.ready.push_back(task);
-        }
+        spawn(future);
     }
 
-    /// Ready なタスクをすべてポーリングする
+    /// Ready なタスクを空になるまで poll する。
+    ///
+    /// poll 中は `EXEC_STATE` を borrow しない（future を一旦 take して保持する）ため、
+    /// future 内からの `spawn()` や自身の `wake()`（いずれも `EXEC_STATE` を再 borrow）が
+    /// 安全に行える。
     fn run_ready_tasks(&self) {
         loop {
-            let task = {
-                let mut q = self.queue.lock().unwrap();
-                q.ready.pop_front()
+            // 次の (index, generation) を取り出す（borrow は最小限）。
+            let next = EXEC_STATE.with(|s| s.borrow_mut().ready.pop_front());
+            let (index, generation) = match next {
+                Some(v) => v,
+                None => break,
             };
 
-            match task {
-                Some(t) => {
-                    t.poll_once();
+            // スロットを検証して future を take する（poll 中は borrow しない）。
+            let taken = EXEC_STATE.with(|s| {
+                let mut st = s.borrow_mut();
+                match st.slots.get_mut(index) {
+                    Some(slot) if slot.generation == generation => {
+                        slot.scheduled = false;
+                        slot.future.take()
+                    }
+                    // 世代不一致 = 解放済みの stale エントリ。スキップ。
+                    _ => None,
                 }
-                None => break,
-            }
+            });
+            let mut future = match taken {
+                Some(f) => f,
+                None => continue,
+            };
+
+            // poll（EXEC_STATE 非借用）。
+            let waker = make_waker(index, generation);
+            let mut cx = Context::from_waker(&waker);
+            let poll = future.as_mut().poll(&mut cx);
+
+            // 結果を反映する。
+            EXEC_STATE.with(|s| {
+                let mut st = s.borrow_mut();
+                let ready_done = match st.slots.get_mut(index) {
+                    Some(slot) if slot.generation == generation => match poll {
+                        Poll::Pending => {
+                            // future をスロットへ戻す。
+                            slot.future = Some(future);
+                            false
+                        }
+                        Poll::Ready(()) => {
+                            // スロットを解放: 世代 +1、scheduled クリア。future(ローカル) は drop。
+                            slot.generation = slot.generation.wrapping_add(1);
+                            slot.scheduled = false;
+                            true
+                        }
+                    },
+                    // 通常起き得ない（同一スレッドのため poll 中に解放されない）。
+                    _ => false,
+                };
+                if ready_done {
+                    st.free.push(index);
+                }
+            });
         }
     }
 
-    /// メインの実行ループ
+    /// メインの実行ループ。
     ///
     /// 与えられた Future が完了するまでイベントループを回す。
     pub fn block_on<F, R>(&self, future: F) -> R
@@ -488,25 +587,20 @@ impl Executor {
         F: Future<Output = R> + 'static,
         R: 'static,
     {
-        use std::sync::atomic::AtomicBool;
+        // 単一スレッドのため Rc<RefCell> で十分（Arc/Mutex/AtomicBool 不要）。
+        let result: Rc<RefCell<Option<R>>> = Rc::new(RefCell::new(None));
+        let setter = result.clone();
 
-        let done = Arc::new(AtomicBool::new(false));
-        let result: Arc<Mutex<Option<R>>> = Arc::new(Mutex::new(None));
-
-        let done_clone = done.clone();
-        let result_clone = result.clone();
-
-        self.spawn(async move {
+        spawn(async move {
             let r = future.await;
-            *result_clone.lock().unwrap() = Some(r);
-            done_clone.store(true, Ordering::Release);
+            *setter.borrow_mut() = Some(r);
         });
 
         loop {
             // Ready なタスクを実行
             self.run_ready_tasks();
 
-            if done.load(Ordering::Acquire) {
+            if result.borrow().is_some() {
                 break;
             }
 
@@ -520,18 +614,12 @@ impl Executor {
             }
         }
 
+        // RefMut の一時値を result より先にドロップするため一旦ローカルに束ねる。
         let value = result
-            .lock()
-            .unwrap()
+            .borrow_mut()
             .take()
             .expect("future completed but no result");
         value
-    }
-}
-
-impl Default for Executor {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -539,40 +627,156 @@ impl Default for Executor {
 // グローバルエグゼキュータ（スレッドローカル）
 // ====================
 
-thread_local! {
-    static EXECUTOR: RefCell<Option<Executor>> = const { RefCell::new(None) };
-}
-
-/// スレッドローカルなエグゼキュータを初期化する
+/// スレッドローカルなエグゼキュータ状態を初期化する（スラブを空に準備する）。
 pub fn init_executor() {
-    EXECUTOR.with(|e| {
-        *e.borrow_mut() = Some(Executor::new());
+    EXEC_STATE.with(|s| {
+        let mut st = s.borrow_mut();
+        st.slots.clear();
+        st.free.clear();
+        st.ready.clear();
     });
 }
 
-/// Future をスポーンする（現在のスレッドのエグゼキュータに）
+/// Future をスポーンする（現在のスレッドのエグゼキュータに）。
 pub fn spawn<F>(future: F)
 where
     F: Future<Output = ()> + 'static,
 {
-    EXECUTOR.with(|e| {
-        let borrow = e.borrow();
-        let exec = borrow
-            .as_ref()
-            .expect("executor not initialized for this thread");
-        exec.spawn(future);
-    });
+    // Box 化（確保）はスレッドローカル borrow の外で行う。
+    let boxed: Pin<Box<dyn Future<Output = ()> + 'static>> = Box::pin(future);
+    EXEC_STATE.with(|s| s.borrow_mut().spawn_boxed(boxed));
 }
 
-/// 現在のスレッドのグローバルエグゼキュータ（`spawn()` と同じキューを共有）を取得する。
+/// 現在のスレッドのエグゼキュータハンドルを取得する。
 ///
-/// これを使って `block_on` することで、`spawn()` されたタスクが確実に同じイベント
-/// ループでポーリングされる。
+/// 状態はスレッドローカルのため、ハンドル経由でも `spawn()` 経由でも同一の
+/// イベントループでポーリングされる。
 pub fn current_executor() -> Executor {
-    EXECUTOR.with(|e| {
-        e.borrow()
-            .as_ref()
-            .expect("executor not initialized for this thread")
-            .clone()
-    })
+    Executor::new()
+}
+
+#[cfg(test)]
+mod executor_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// 自分自身を 1 回 wake して Pending→Ready する Future（協調的 yield）。
+    /// 自己 wake のみで進行するため io_uring リング無しでも block_on が完走する
+    /// （ready キューが空になる前に必ず完了し、wait_for_completions に到達しない）。
+    struct YieldOnce {
+        yielded: bool,
+    }
+
+    impl Future for YieldOnce {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.yielded {
+                Poll::Ready(())
+            } else {
+                self.yielded = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+
+    fn yield_once() -> YieldOnce {
+        YieldOnce { yielded: false }
+    }
+
+    #[test]
+    fn block_on_immediate() {
+        init_executor();
+        let exec = current_executor();
+        assert_eq!(exec.block_on(async { 40 + 2 }), 42);
+    }
+
+    #[test]
+    fn block_on_with_self_wake_yield() {
+        init_executor();
+        let exec = current_executor();
+        let r = exec.block_on(async {
+            yield_once().await;
+            yield_once().await;
+            7
+        });
+        assert_eq!(r, 7);
+    }
+
+    #[test]
+    fn spawn_children_and_join() {
+        init_executor();
+        let exec = current_executor();
+        let counter = Rc::new(Cell::new(0usize));
+        let got = exec.block_on({
+            let counter = counter.clone();
+            async move {
+                for _ in 0..100 {
+                    let c = counter.clone();
+                    spawn(async move {
+                        yield_once().await;
+                        c.set(c.get() + 1);
+                    });
+                }
+                while counter.get() < 100 {
+                    yield_once().await;
+                }
+                counter.get()
+            }
+        });
+        assert_eq!(got, 100);
+    }
+
+    #[test]
+    fn slab_reuses_slots() {
+        // 多数の spawn→完了を逐次繰り返し、スロットが再利用される（slots.len が小さい）
+        // ことを確認する。再利用が無ければ slots は 50 を超える。
+        init_executor();
+        let exec = current_executor();
+        let counter = Rc::new(Cell::new(0usize));
+        exec.block_on({
+            let counter = counter.clone();
+            async move {
+                for round in 0..50 {
+                    let c = counter.clone();
+                    spawn(async move {
+                        yield_once().await;
+                        c.set(c.get() + 1);
+                    });
+                    let target = round + 1;
+                    while counter.get() < target {
+                        yield_once().await;
+                    }
+                }
+            }
+        });
+        assert_eq!(counter.get(), 50);
+        let slots = EXEC_STATE.with(|s| s.borrow().slots.len());
+        assert!(slots <= 8, "slab should reuse slots, got {slots}");
+    }
+
+    #[test]
+    fn stale_waker_is_ignored() {
+        // 解放済みスロットの古い Waker が、再利用後のタスクへ誤って割り込まないことを確認。
+        init_executor();
+        // 手動でスロットを 1 つ確保→解放→再確保し、世代が進むことを検証する。
+        EXEC_STATE.with(|s| {
+            let mut st = s.borrow_mut();
+            st.spawn_boxed(Box::pin(async {}));
+            let (idx, gen0) = st.ready.pop_front().unwrap();
+            // 解放（poll で Ready 相当）: 世代 +1 して free へ。
+            st.slots[idx].future = None;
+            st.slots[idx].generation = st.slots[idx].generation.wrapping_add(1);
+            st.slots[idx].scheduled = false;
+            st.free.push(idx);
+            // 古い世代の Waker による schedule は弾かれる。
+            st.schedule(idx, gen0);
+            assert!(st.ready.is_empty(), "stale generation must be ignored");
+            // 再確保すると同じスロットが世代 +1 で払い出される。
+            st.spawn_boxed(Box::pin(async {}));
+            let (idx2, gen2) = st.ready.pop_front().unwrap();
+            assert_eq!(idx2, idx, "freed slot should be reused");
+            assert_ne!(gen2, gen0, "generation must advance on reuse");
+        });
+    }
 }
