@@ -1284,6 +1284,91 @@ where
 
 /// HTTP/2 → HTTP/1.1 プロキシ（HTTPバックエンド）
 #[cfg(feature = "http2")]
+/// バックエンド HTTP/1.1 レスポンス（content-length 既知・非 chunked・非圧縮）のボディを
+/// HTTP/2 DATA フレームとしてストリーミング転送する（全バッファリングを排除、F-32）。
+///
+/// ヘッダはまだ送信していない状態で呼ぶこと。本関数がヘッダ（ボディ無しなら END_STREAM）と
+/// ボディ DATA フレームを送出する。各 `send_data` は HTTP/2 フロー制御（conn/stream ウィンドウ
+/// と WINDOW_UPDATE 待ち）に従うため、クライアントの受信速度に応じたバックプレッシャが効き、
+/// レスポンス全体をメモリに溜めない（RSS がペイロードサイズに比例しない）。
+///
+/// 戻り値: 送信したボディバイト数。
+#[allow(clippy::too_many_arguments)]
+async fn stream_h2_response_body_cl<S, R>(
+    conn: &mut http2::Http2Connection<S>,
+    stream_id: u32,
+    status: u16,
+    h2_headers: &[(&[u8], &[u8])],
+    backend: &mut R,
+    initial_body: &[u8],
+    content_length: usize,
+) -> http2::error::Http2Result<u64>
+where
+    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
+    R: crate::runtime::io::AsyncReadRent + Unpin,
+{
+    use http2::Http2ErrorCode;
+
+    // ヘッダ送信（ボディ無しなら END_STREAM）
+    conn.send_headers(stream_id, status, h2_headers, content_length == 0)
+        .await?;
+    if content_length == 0 {
+        return Ok(0);
+    }
+
+    let mut remaining = content_length;
+
+    // ヘッダ直後に既読のボディ断片を送る（追加コピーなし、スライス直送）
+    let init_len = initial_body.len().min(remaining);
+    if init_len > 0 {
+        let last = init_len >= remaining;
+        conn.send_data(stream_id, &initial_body[..init_len], last)
+            .await?;
+        remaining -= init_len;
+    }
+
+    // 残りをバックエンドから読みつつ逐次転送する（全バッファリングなし）
+    while remaining > 0 {
+        let buf = buf_get();
+        let read_result = timeout(READ_TIMEOUT, backend.read(buf)).await;
+        let (res, mut returned_buf) = match read_result {
+            Ok(r) => r,
+            Err(_) => {
+                // タイムアウト: ヘッダ送信済みのため RST_STREAM で打ち切る
+                let _ = conn
+                    .send_rst_stream(stream_id, Http2ErrorCode::InternalError)
+                    .await;
+                return Ok((content_length - remaining) as u64);
+            }
+        };
+        let n = match res {
+            Ok(0) => {
+                // content-length 未達でバックエンドが切断: END_STREAM で閉じる
+                buf_put(returned_buf);
+                conn.send_data(stream_id, &[], true).await?;
+                return Ok((content_length - remaining) as u64);
+            }
+            Ok(n) => n,
+            Err(_) => {
+                buf_put(returned_buf);
+                let _ = conn
+                    .send_rst_stream(stream_id, Http2ErrorCode::InternalError)
+                    .await;
+                return Ok((content_length - remaining) as u64);
+            }
+        };
+        returned_buf.set_valid_len(n);
+        let take = n.min(remaining);
+        let last = take >= remaining;
+        conn.send_data(stream_id, &returned_buf.as_valid_slice()[..take], last)
+            .await?;
+        buf_put(returned_buf);
+        remaining -= take;
+    }
+
+    Ok(content_length as u64)
+}
+
 async fn handle_http2_proxy_http<S>(
     conn: &mut http2::Http2Connection<S>,
     stream_id: u32,
@@ -1412,6 +1497,57 @@ where
                 .iter()
                 .find(|h| h.name.eq_ignore_ascii_case("content-encoding"))
                 .map(|h| h.value);
+
+            // === F-32 ストリーミング経路 ===
+            // 圧縮なし + content-length 既知 + 非 chunked の場合、レスポンスボディを
+            // 全バッファリングせず DATA フレームとして逐次転送する（大容量ダウンロードの
+            // OOM 耐性。フロー制御で受信速度に追従し RSS をペイロードに比例させない）。
+            let stream_compress_hint = compression.should_compress(
+                client_encoding,
+                content_type,
+                parsed.content_length,
+                existing_encoding,
+            );
+            if stream_compress_hint.is_none() && !parsed.is_chunked {
+                if let Some(content_len) = parsed.content_length {
+                    let server_guard = get_server_header_guard();
+                    let mut h2_headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(16);
+                    if let Some(ref g) = server_guard {
+                        h2_headers.push(g.as_header());
+                    }
+                    for header in resp.headers.iter() {
+                        if header.name.is_empty() {
+                            continue;
+                        }
+                        if header.name.eq_ignore_ascii_case("connection")
+                            || header.name.eq_ignore_ascii_case("keep-alive")
+                            || header.name.eq_ignore_ascii_case("transfer-encoding")
+                            || header.name.eq_ignore_ascii_case("upgrade")
+                        {
+                            continue;
+                        }
+                        h2_headers.push((header.name.as_bytes(), header.value));
+                    }
+                    let sent = match stream_h2_response_body_cl(
+                        conn,
+                        stream_id,
+                        status,
+                        &h2_headers,
+                        &mut backend,
+                        body,
+                        content_len,
+                    )
+                    .await
+                    {
+                        Ok(n) => n,
+                        Err(e) => {
+                            warn!("[HTTP/2] Response stream error: {}", e);
+                            return None;
+                        }
+                    };
+                    return Some((status, sent));
+                }
+            }
 
             // Content-Length が chunked の場合は計算
             let final_body = if parsed.is_chunked {
@@ -1729,6 +1865,57 @@ where
                 .iter()
                 .find(|h| h.name.eq_ignore_ascii_case("content-encoding"))
                 .map(|h| h.value);
+
+            // === F-32 ストリーミング経路 ===
+            // 圧縮なし + content-length 既知 + 非 chunked の場合、レスポンスボディを
+            // 全バッファリングせず DATA フレームとして逐次転送する（大容量ダウンロードの
+            // OOM 耐性。フロー制御で受信速度に追従し RSS をペイロードに比例させない）。
+            let stream_compress_hint = compression.should_compress(
+                client_encoding,
+                content_type,
+                parsed.content_length,
+                existing_encoding,
+            );
+            if stream_compress_hint.is_none() && !parsed.is_chunked {
+                if let Some(content_len) = parsed.content_length {
+                    let server_guard = get_server_header_guard();
+                    let mut h2_headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(16);
+                    if let Some(ref g) = server_guard {
+                        h2_headers.push(g.as_header());
+                    }
+                    for header in resp.headers.iter() {
+                        if header.name.is_empty() {
+                            continue;
+                        }
+                        if header.name.eq_ignore_ascii_case("connection")
+                            || header.name.eq_ignore_ascii_case("keep-alive")
+                            || header.name.eq_ignore_ascii_case("transfer-encoding")
+                            || header.name.eq_ignore_ascii_case("upgrade")
+                        {
+                            continue;
+                        }
+                        h2_headers.push((header.name.as_bytes(), header.value));
+                    }
+                    let sent = match stream_h2_response_body_cl(
+                        conn,
+                        stream_id,
+                        status,
+                        &h2_headers,
+                        &mut backend,
+                        body,
+                        content_len,
+                    )
+                    .await
+                    {
+                        Ok(n) => n,
+                        Err(e) => {
+                            warn!("[HTTP/2] Response stream error: {}", e);
+                            return None;
+                        }
+                    };
+                    return Some((status, sent));
+                }
+            }
 
             // ボディを読む（Chunked対応）
             let final_body = if parsed.is_chunked {

@@ -1564,6 +1564,14 @@ where
             window_update_wait_count = 0; // 送信成功したのでリセット
         }
 
+        // 空ボディ + END_STREAM: 上のループは data.len()==0 で回らないため、ここで
+        // 0 長 DATA フレームを明示送出して END_STREAM を伝える。ストリーミング転送
+        // （F-32）でバックエンドが content-length 未達で切断した際などの終端クローズに使う。
+        if data.is_empty() && end_stream {
+            let frame = self.frame_encoder.encode_data(stream_id, &[], true);
+            self.write_all(&frame).await?;
+        }
+
         // 状態更新
         if end_stream {
             if let Some(stream) = self.streams.get(stream_id) {
