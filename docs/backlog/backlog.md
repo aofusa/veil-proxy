@@ -64,14 +64,14 @@
 | F-26 | P2 | 完了 | [features/F-26-http2-bytes-zero-copy.md](features/F-26-http2-bytes-zero-copy.md) | HTTP/2 ヘッダ/ボディのヒープ割り当て排除（bytes クレートゼロコピー化） |
 | F-27 | P2 | 完了 | [features/F-27-wasm-instance-pooling-async-fuel.md](features/F-27-wasm-instance-pooling-async-fuel.md) | WASM 非同期実行（wasmtime async_support + Fuel Yield）+ pooling allocator |
 | F-28 | P1 | 完了 | [features/F-28-custom-iouring-impl.md](features/F-28-custom-iouring-impl.md) | monoio 削除・カスタム io_uring 実装（thread-per-core、IORING_REGISTER_RESTRICTIONS） |
-| F-29 | P1 | 進行中 | [features/F-29-lockfree-cache-and-async-fs.md](features/F-29-lockfree-cache-and-async-fs.md) | ホットパスのロック排除・非同期FS・ゼロアロケーション化（perf レポート） |
-| F-32 | P1 | 未着手 | [features/F-32-http2-http3-streaming-body.md](features/F-32-http2-http3-streaming-body.md) | HTTP/2・HTTP/3 ボディのストリーミング転送（全バッファリング排除） |
-| F-30 | P2 | 未着手 | [features/F-30-l4-splice-zerocopy.md](features/F-30-l4-splice-zerocopy.md) | L4 ストリームプロキシの splice(2) ゼロコピー転送 |
-| F-31 | P2 | 未着手 | [features/F-31-memory-cache-bytes-zerocopy.md](features/F-31-memory-cache-bytes-zerocopy.md) | メモリキャッシュの bytes::Bytes ゼロコピー配信 |
-| F-33 | P3 | 未着手 | [features/F-33-http3-gso-gro-offload.md](features/F-33-http3-gso-gro-offload.md) | HTTP/3 UDP GSO/GRO オフロード |
-| F-34 | P3 | 未着手 | [features/F-34-connection-state-slab-arena.md](features/F-34-connection-state-slab-arena.md) | コネクション状態の Slab/Arena アロケーション |
-| F-35 | P3 | 未着手 | [features/F-35-xdp-ebpf-ddos-defense.md](features/F-35-xdp-ebpf-ddos-defense.md) | XDP/eBPF 最前線 DDoS 防御（aya） |
-| F-36 | P3 | 未着手 | [features/F-36-wasm-cwasm-aot-cache.md](features/F-36-wasm-cwasm-aot-cache.md) | WASM cwasm AOT 事前コンパイルキャッシュ |
+| F-29 | P1 | 一部完了 | [features/F-29-lockfree-cache-and-async-fs.md](features/F-29-lockfree-cache-and-async-fs.md) | ホットパスのロック排除・非同期FS・ゼロアロケーション化（キャッシュのロックフリー化・Range itoa 完了。STATX は canonicalize の制約で見送り、ホットパスは既に syscall フリー） |
+| F-32 | P1 | 一部完了 | [features/F-32-http2-http3-streaming-body.md](features/F-32-http2-http3-streaming-body.md) | HTTP/2 は既に BytesMut（F-26）、HTTP/3 ボディを BytesMut spare 直読みでゼロコピー化。完全ストリーミングは大規模再設計のため継続 |
+| F-30 | P2 | 保留 | [features/F-30-l4-splice-zerocopy.md](features/F-30-l4-splice-zerocopy.md) | L4 ストリームプロキシの splice(2) ゼロコピー転送（L4 の E2E が無く安全に検証できないため保留） |
+| F-31 | P2 | 完了 | [features/F-31-memory-cache-bytes-zerocopy.md](features/F-31-memory-cache-bytes-zerocopy.md) | メモリキャッシュの bytes::Bytes ゼロコピー配信 |
+| F-33 | P3 | 一部完了 | [features/F-33-http3-gso-gro-offload.md](features/F-33-http3-gso-gro-offload.md) | HTTP/3 送信を GSO バッチング化（既存 send_gso_async を配線、パケット毎の確保を排除）。受信 GRO 配線は継続 |
+| F-34 | P3 | 一部完了 | [features/F-34-connection-state-slab-arena.md](features/F-34-connection-state-slab-arena.md) | HTTP/2 コネクション 64KB バッファをスレッドローカル再利用。タスク/状態全体の Slab 化は継続 |
+| F-35 | P3 | 一部完了 | [features/F-35-xdp-ebpf-ddos-defense.md](features/F-35-xdp-ebpf-ddos-defense.md) | ユーザースペース最前線（accept 段の IP ブロックリスト、TLS 前に切断）を実装。XDP/eBPF 本体は専用環境（CAP_BPF/対応NIC）が必要で継続 |
+| F-36 | P3 | 完了 | [features/F-36-wasm-cwasm-aot-cache.md](features/F-36-wasm-cwasm-aot-cache.md) | WASM cwasm AOT 事前コンパイルキャッシュ |
 | F-11 | P3 | 未着手 | [features/dashboard.md](features/dashboard.md) | ダッシュボード機能 |
 | F-12 | P3 | 未着手 | [features/config-generator-webui.md](features/config-generator-webui.md) | config.toml ジェネレータ Web UI |
 | F-13 | P3 | 未着手 | [features/documentation-site.md](features/documentation-site.md) | 公式ドキュメントサイト |

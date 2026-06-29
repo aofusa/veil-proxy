@@ -360,6 +360,16 @@ fn main() {
         loaded_config.graceful_shutdown_timeout_secs,
         Ordering::Relaxed,
     );
+
+    // F-35: グローバル IP ブロックリスト（accept 段の最前線 DDoS 防御）は config の
+    // ローダ内（build_loaded_config）で起動時・リロード時の両方に適用済み。
+    if !loaded_config.global_security.blocked_ips.is_empty() {
+        info!(
+            "Front-line IP blocklist active: {} CIDR entr(ies)",
+            loaded_config.global_security.blocked_ips.len()
+        );
+    }
+
     if loaded_config.graceful_shutdown_timeout_secs > 0 {
         info!(
             "Graceful shutdown timeout: {} seconds",
@@ -829,11 +839,17 @@ fn main() {
                             }
                         };
 
+                        // F-35: 最前線 IP ブロックリスト。ブロック対象 IP は TLS ハンドシェイク
+                        // 前・ハンドラ spawn 前に切断する（stream は drop で閉じられる）。
+                        if crate::config::is_ip_blocked(peer_addr.ip()) {
+                            continue;
+                        }
+
                         // 同時接続数制限チェック
                         if max_conn > 0 {
                             let current = CURRENT_CONNECTIONS.load(Ordering::Relaxed);
                             if current >= max_conn {
-                                warn!("[Thread {}] Connection limit reached ({}/{}), rejecting connection from {}", 
+                                warn!("[Thread {}] Connection limit reached ({}/{}), rejecting connection from {}",
                                   thread_id, current, max_conn, peer_addr);
                                 drop(stream);
                                 continue;
@@ -898,7 +914,7 @@ fn main() {
                     // タイムアウト付きaccept
                     let accept_result = timeout(Duration::from_secs(1), listener.accept()).await;
 
-                    let (stream, _peer_addr) = match accept_result {
+                    let (stream, peer_addr) = match accept_result {
                         Ok(Ok(s)) => s,
                         Ok(Err(e)) => {
                             error!("[HTTP] Accept error: {}", e);
@@ -909,6 +925,11 @@ fn main() {
                             continue;
                         }
                     };
+
+                    // F-35: 最前線 IP ブロックリスト（リダイレクト処理前に弾く）
+                    if crate::config::is_ip_blocked(peer_addr.ip()) {
+                        continue;
+                    }
 
                     let _ = stream.set_nodelay(true);
 
@@ -1134,6 +1155,11 @@ fn main() {
                                 continue;
                             }
                         };
+
+                        // F-35: 最前線 IP ブロックリスト（プロトコル検出前に弾く）
+                        if crate::config::is_ip_blocked(peer_addr.ip()) {
+                            continue;
+                        }
 
                         // 同時接続数制限チェック
                         if max_conn > 0 {

@@ -1101,6 +1101,7 @@ landlock_write_paths = ["/var/log/veil"]
 | `drop_privileges_user` | Username to drop to after startup | none |
 | `drop_privileges_group` | Group name to drop to after startup | none |
 | `max_concurrent_connections` | Maximum concurrent connections | 0 (unlimited) |
+| `blocked_ips` | Front-line IP/CIDR blocklist; matching connections are dropped right after `accept` (before the TLS handshake / handler spawn), avoiding expensive work for known-bad IPs. CIDRs are parsed once at startup (zero-alloc check on the accept hot path) and hot-reloadable via SIGHUP. Evaluated earlier than per-route `denied_ips`. | `[]` |
 | `allow_security_failures` | Behavior when security feature activation fails | false |
 
 #### Security Feature Failure Handling

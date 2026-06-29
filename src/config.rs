@@ -290,6 +290,30 @@ impl CidrRange {
         }
         false
     }
+
+    /// `IpAddr` がこの CIDR 範囲に含まれるか（文字列を経由しないゼロアロケーション版）。
+    ///
+    /// accept ホットパスでの IP ブロックリスト判定に用いる（F-35）。`to_string()` を
+    /// 介さないため接続ごとのヒープ確保が発生しない。
+    #[inline]
+    pub fn contains_addr(&self, ip: std::net::IpAddr) -> bool {
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                if self.is_ipv6 {
+                    return false;
+                }
+                let addr = u32::from(v4) as u128;
+                (addr & Self::mask_v4(self.prefix_len)) == self.network
+            }
+            std::net::IpAddr::V6(v6) => {
+                if !self.is_ipv6 {
+                    return false;
+                }
+                let addr = u128::from(v6);
+                (addr & Self::mask_v6(self.prefix_len)) == self.network
+            }
+        }
+    }
 }
 
 /// IPフィルター（許可/拒否リスト）
@@ -1077,6 +1101,13 @@ pub struct GlobalSecurityConfig {
     #[serde(default)]
     pub max_concurrent_connections: usize,
 
+    /// 最前線 DDoS 防御: ブロックする IP/CIDR のリスト（F-35）。
+    /// accept 直後（TLS ハンドシェイク前・ハンドラ spawn 前）に評価し、マッチした接続を
+    /// 即座に切断する。既知の不正 IP に対する高コスト処理（TLS ハンドシェイク等）を回避する。
+    /// 例: ["203.0.113.0/24", "198.51.100.5"]
+    #[serde(default)]
+    pub blocked_ips: Vec<String>,
+
     // ====================
     // io_uring / seccomp セキュリティ設定
     // ====================
@@ -1578,6 +1609,38 @@ pub static RELOAD_FLAG: Lazy<Arc<AtomicBool>> = Lazy::new(|| Arc::new(AtomicBool
 /// TLS 証明書リロード要求フラグ（SIGHUP でトリガー、F-03）
 /// 設定リロードとは独立して証明書のみを再読み込みするために使用する。
 pub static TLS_RELOAD_FLAG: Lazy<Arc<AtomicBool>> = Lazy::new(|| Arc::new(AtomicBool::new(false)));
+
+/// グローバル IP ブロックリスト（最前線 DDoS 防御、F-35）。
+///
+/// `accept` 直後（TLS ハンドシェイク前・ハンドラ spawn 前）に評価し、ブロック対象 IP の
+/// 接続を即座に切断することで、既知の不正 IP に対する TLS ハンドシェイク等の高コスト処理を
+/// 行わずに弾く。CIDR は起動時にパース済み（`CidrRange`）で保持し、accept ホットパスでは
+/// 文字列パースを行わない。`ArcSwap` により SIGHUP ホットリロードに対応する。
+///
+/// 注: NIC ドライバ段でドロップする XDP/eBPF（F-35 の本来の設計）は、ビルドに nightly +
+/// bpf-linker、実行に CAP_BPF/対応 NIC を要し本リポジトリのサンドボックスでは検証不能なため、
+/// 検証可能な「ユーザースペース最前線（accept 段の事前ドロップ）」をまず実装する。
+pub static GLOBAL_BLOCKED_IPS: Lazy<ArcSwap<Vec<CidrRange>>> =
+    Lazy::new(|| ArcSwap::from_pointee(Vec::new()));
+
+/// グローバル IP ブロックリストを設定する（起動時・SIGHUP リロード時に呼ぶ）。
+/// パース不能なエントリは黙って無視する（設定検証は別途 `validate` で行う）。
+pub fn set_global_blocked_ips(cidrs: &[String]) {
+    let parsed: Vec<CidrRange> = cidrs.iter().filter_map(|s| CidrRange::parse(s)).collect();
+    GLOBAL_BLOCKED_IPS.store(Arc::new(parsed));
+}
+
+/// 指定 IP がグローバルブロックリストに含まれるか（accept ホットパス、ゼロアロケーション）。
+///
+/// ブロックリスト未設定（空）時は即 `false` を返し、ホットパスのオーバーヘッドを発生させない。
+#[inline]
+pub fn is_ip_blocked(ip: std::net::IpAddr) -> bool {
+    let list = GLOBAL_BLOCKED_IPS.load();
+    if list.is_empty() {
+        return false;
+    }
+    list.iter().any(|cidr| cidr.contains_addr(ip))
+}
 
 /// グレースフルシャットダウンタイムアウト（秒）
 /// 起動時に設定ファイルから読み込まれ、ワーカースレッドがドレイン待機時に参照
@@ -5133,6 +5196,11 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
         performance_config.open_file_cache_max_entries,
     );
 
+    // F-35: グローバル IP ブロックリストを適用（起動時・SIGHUP リロード時の両方で本関数が
+    // 呼ばれるためここで一元的に適用する）。CIDR はパース済みで保持され accept ホットパスでは
+    // 文字列解析を行わない。
+    set_global_blocked_ips(&config.security.blocked_ips);
+
     // AdminConfig の事前計算フィールドを補完
     #[cfg(feature = "admin")]
     let admin_config = {
@@ -5304,6 +5372,11 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         performance_config.open_file_cache_valid_duration_secs,
         performance_config.open_file_cache_max_entries,
     );
+
+    // F-35: グローバル IP ブロックリストを適用（起動時・SIGHUP リロード時の両方で本関数が
+    // 呼ばれるためここで一元的に適用する）。CIDR はパース済みで保持され accept ホットパスでは
+    // 文字列解析を行わない。
+    set_global_blocked_ips(&config.security.blocked_ips);
 
     // スレッド数の決定: 未指定または0の場合はCPUコア数を使用
     let num_threads = match config.server.threads {
@@ -5820,6 +5893,54 @@ pub fn test_config_file(path: &Path) -> io::Result<()> {
 // ====================
 // ロードバランシングのテスト（F-19）
 // ====================
+#[cfg(test)]
+mod blocklist_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn test_cidr_contains_addr_ipv4() {
+        let cidr = CidrRange::parse("192.168.1.0/24").unwrap();
+        assert!(cidr.contains_addr(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50))));
+        assert!(cidr.contains_addr(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 255))));
+        assert!(!cidr.contains_addr(IpAddr::V4(Ipv4Addr::new(192, 168, 2, 1))));
+        // IPv6 は IPv4 CIDR にマッチしない
+        assert!(!cidr.contains_addr(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn test_cidr_contains_addr_single_ipv4() {
+        let cidr = CidrRange::parse("10.0.0.5").unwrap();
+        assert!(cidr.contains_addr(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))));
+        assert!(!cidr.contains_addr(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 6))));
+    }
+
+    #[test]
+    fn test_cidr_contains_addr_ipv6() {
+        let cidr = CidrRange::parse("2001:db8::/32").unwrap();
+        assert!(cidr.contains_addr("2001:db8::1".parse::<IpAddr>().unwrap()));
+        assert!(!cidr.contains_addr("2001:db9::1".parse::<IpAddr>().unwrap()));
+        // IPv4 は IPv6 CIDR にマッチしない
+        assert!(!cidr.contains_addr(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+    }
+
+    #[test]
+    fn test_global_blocklist_set_and_check() {
+        // 空のときは常に false（accept ホットパスの早期 return）
+        set_global_blocked_ips(&[]);
+        assert!(!is_ip_blocked(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5))));
+
+        set_global_blocked_ips(&["203.0.113.0/24".to_string(), "198.51.100.7".to_string()]);
+        assert!(is_ip_blocked(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5))));
+        assert!(is_ip_blocked(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))));
+        assert!(!is_ip_blocked(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8))));
+        assert!(!is_ip_blocked(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+
+        // グローバル状態を空に戻す（他テストへの影響を避ける）
+        set_global_blocked_ips(&[]);
+    }
+}
+
 #[cfg(test)]
 mod load_balancing_tests {
     use super::*;

@@ -1101,6 +1101,7 @@ landlock_write_paths = ["/var/log/veil"]
 | `drop_privileges_user` | 起動後に降格するユーザー名 | なし |
 | `drop_privileges_group` | 起動後に降格するグループ名 | なし |
 | `max_concurrent_connections` | 同時接続数の上限 | 0（無制限） |
+| `blocked_ips` | 最前線 IP/CIDR ブロックリスト。`accept` 直後（TLS ハンドシェイク・ハンドラ生成の前）にマッチした接続を切断し、既知の不正 IP への高コスト処理を回避する。CIDR は起動時に一度だけパースされ（accept ホットパスはゼロアロケーション判定）、SIGHUP でホットリロード可能。ルート単位の `denied_ips` より前段で評価される。 | `[]` |
 | `allow_security_failures` | セキュリティ機能の有効化に失敗した場合の動作 | false |
 
 #### セキュリティ機能失敗時の動作
