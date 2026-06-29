@@ -66,7 +66,7 @@
 | F-28 | P1 | 完了 | [features/F-28-custom-iouring-impl.md](features/F-28-custom-iouring-impl.md) | monoio 削除・カスタム io_uring 実装（thread-per-core、IORING_REGISTER_RESTRICTIONS） |
 | F-29 | P1 | 一部完了 | [features/F-29-lockfree-cache-and-async-fs.md](features/F-29-lockfree-cache-and-async-fs.md) | ホットパスのロック排除・非同期FS・ゼロアロケーション化（キャッシュのロックフリー化・Range itoa 完了。STATX は canonicalize の制約で見送り、ホットパスは既に syscall フリー） |
 | F-32 | P1 | 一部完了 | [features/F-32-http2-http3-streaming-body.md](features/F-32-http2-http3-streaming-body.md) | HTTP/2 は既に BytesMut（F-26）、HTTP/3 ボディを BytesMut spare 直読みでゼロコピー化。完全ストリーミングは大規模再設計のため継続 |
-| F-30 | P2 | 保留 | [features/F-30-l4-splice-zerocopy.md](features/F-30-l4-splice-zerocopy.md) | L4 ストリームプロキシの splice(2) ゼロコピー転送（L4 の E2E が無く安全に検証できないため保留） |
+| F-30 | P2 | 完了 | [features/F-30-l4-splice-zerocopy.md](features/F-30-l4-splice-zerocopy.md) | L4 ストリームプロキシの splice(2) ゼロコピー転送（E2E 追加→B-09 修正→pipe 経由 splice 実装。ユーザースペースバッファ撤廃） |
 | F-31 | P2 | 完了 | [features/F-31-memory-cache-bytes-zerocopy.md](features/F-31-memory-cache-bytes-zerocopy.md) | メモリキャッシュの bytes::Bytes ゼロコピー配信 |
 | F-33 | P3 | 一部完了 | [features/F-33-http3-gso-gro-offload.md](features/F-33-http3-gso-gro-offload.md) | HTTP/3 送信を GSO バッチング化（既存 send_gso_async を配線、パケット毎の確保を排除）。受信 GRO 配線は継続 |
 | F-34 | P3 | 一部完了 | [features/F-34-connection-state-slab-arena.md](features/F-34-connection-state-slab-arena.md) | HTTP/2 コネクション 64KB バッファをスレッドローカル再利用。タスク/状態全体の Slab 化は継続 |

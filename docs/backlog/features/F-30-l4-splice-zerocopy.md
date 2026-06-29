@@ -45,3 +45,32 @@ io_uring の `IORING_OP_SPLICE` でカーネル内完結させ、メモリコピ
 - `IORING_OP_SPLICE` は `PROXY_ALLOWED_OPCODES`（`src/runtime/executor.rs`）に既に許可登録済み。
 - pipe fd の Drop/クローズ管理、short-splice 時の継続ループ、EOF 検出に注意。
 - splice が EINVAL を返す環境（特殊 fd）向けに、ユーザースペース read/write へのフォールバックを残す。
+
+## 対応状況: 完了
+
+### 事前準備（E2E + 既存バグ修正）
+
+L4 には E2E が無く検証できなかったため、まず E2E を追加（`tests/e2e_setup.sh` に `[[l4]]` TLS
+パススルーリスナー、`tests/e2e_tests.rs` に `test_l4_tcp_passthrough_forward` /
+`test_l4_passthrough_large_payload`）。これにより [[B-09]]（forward が読み取り n でなくバッファ
+全長 64KB を送信し転送破損）を発見・修正した。
+
+### 実装
+
+- `src/runtime/splice.rs`（新規）: `Pipe`（`pipe2(O_NONBLOCK|O_CLOEXEC)`、Drop で両端クローズ）と
+  `SpliceFuture`（`IORING_OP_SPLICE`、`off_in/off_out=-1`、`SPLICE_F_MOVE|NONBLOCK|MORE`、B-07 流の
+  in-flight Drop detach）を追加。`runtime/mod.rs` に `pub mod splice`。
+- `src/l4/proxy.rs`: `forward_direction_splice` を追加し、`bidirectional_forward` を splice ベースへ
+  変更。各方向に pipe を 1 本割り当て `src(socket) → pipe → dst(socket)` の 2 段 splice で
+  **カーネル内ゼロコピー転送**（ユーザースペースバッファの確保・コピーが一切なし）。
+  `readable()`/`writable()`（POLL_ADD）で待機しノンブロッキング splice をドレインループで回す
+  （アイドル接続は io_uring ワーカーを占有しない）。dst 満杯時は `writable().await` で
+  バックプレッシャ対応。
+- pipe 作成失敗時（fd 上限等）はユーザースペース read/write（B-09 修正済み）へ安全フォールバック。
+- io_uring 新規オペコードの追加なし（SPLICE は既に許可済み）= セキュリティサーフェス不変。
+
+### 検証
+
+- 新規 L4 E2E（基本転送 + 10KB ペイロード整合性）が splice 経路で通過。
+- 大容量転送でユーザースペースバッファを確保しない（各方向 pipe 1 本のみ、64KB のヒープ
+  確保が消滅）。

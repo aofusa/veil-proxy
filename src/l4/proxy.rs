@@ -3,10 +3,13 @@
 //! バイダイレクショナルストリーム転送、ロードバランシング、TLS パススルーを実装する。
 
 use crate::config::{L4LbAlgorithm, L4ListenerConfig, L4TlsMode};
+use crate::runtime::splice::{splice, Pipe};
 use crate::runtime::tcp::TcpStream as IoUringTcpStream;
 use crate::runtime::time::timeout;
 use ftlog::{debug, info, warn};
+use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -226,12 +229,67 @@ async fn forward_direction(
     total
 }
 
-/// クライアントと upstream の間でバイダイレクショナル転送を行う
+/// 1 方向の splice ゼロコピー転送ループ（F-30）。
 ///
-/// ## アロケーション特性
-/// - Arc: なし（`ReadFuture`/`WriteFuture` は `RawFd` のコピーのみ保持するため `&TcpStream` で十分）
-/// - String: なし（`futures::join!` は同一タスク内で実行されるため `&str` を直接借用可能）
-/// - バッファ: 各方向 1 回だけ（`forward_direction` 参照）
+/// `src(socket) → pipe → dst(socket)` の 2 段 splice でカーネル内転送する。ユーザースペースの
+/// バッファを一切経由しない（メモリコピー・ヒープ確保なし）。`readable()`/`writable()`
+/// （POLL_ADD）で待機し、ノンブロッキング splice をドレインループで回す（エッジトリガ）。
+async fn forward_direction_splice(
+    src: &IoUringTcpStream,
+    dst: &IoUringTcpStream,
+    pipe: &Pipe,
+    idle_timeout: Duration,
+    name: &str,
+) -> usize {
+    let src_fd = src.as_raw_fd();
+    let dst_fd = dst.as_raw_fd();
+    let mut total = 0usize;
+
+    'outer: loop {
+        // src が読み取り可能になるまで待つ（アイドルタイムアウト付き）。
+        match timeout(idle_timeout, src.readable()).await {
+            Ok(Ok(())) => {}
+            _ => {
+                debug!("[L4:{}] idle timeout", name);
+                break;
+            }
+        }
+
+        // 読めるだけ src → pipe → dst へ流す（EAGAIN になるまでドレイン）。
+        loop {
+            let n = match splice(src_fd, pipe.write_fd, BUF_SIZE).await {
+                Ok(0) => break 'outer, // src が EOF（接続クローズ）
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break, // 出尽くした → 再 poll
+                Err(_) => break 'outer,
+            };
+
+            // pipe にある n バイトを dst へすべて流す（dst のバックプレッシャに対応）。
+            let mut moved = 0;
+            while moved < n {
+                match splice(pipe.read_fd, dst_fd, n - moved).await {
+                    Ok(0) => break 'outer, // dst クローズ
+                    Ok(m) => moved += m,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        // dst 送信バッファ満杯 → 書き込み可能になるまで待つ。
+                        if timeout(idle_timeout, dst.writable()).await.is_err() {
+                            break 'outer;
+                        }
+                    }
+                    Err(_) => break 'outer,
+                }
+            }
+            total += n;
+        }
+    }
+    total
+}
+
+/// クライアントと upstream の間でバイダイレクショナル転送を行う。
+///
+/// 各方向に pipe を 1 本割り当て、`splice(2)`（`IORING_OP_SPLICE`）でカーネル内ゼロコピー
+/// 転送する。ユーザースペースのバッファ確保・コピーが発生しない。pipe 作成に失敗した場合
+/// （fd 上限等）のみ、従来のユーザースペース read/write フォールバックを使う。
 pub async fn bidirectional_forward(
     client: IoUringTcpStream,
     upstream: IoUringTcpStream,
@@ -239,15 +297,46 @@ pub async fn bidirectional_forward(
     listener_name: &str,
 ) {
     // futures::join! は両 Future を同一タスク内でインターリーブするため、
-    // &TcpStream の同時借用は安全（Read/Write は &self）。
-    let (c2u_bytes, u2c_bytes) = futures::join!(
-        forward_direction(&client, &upstream, idle_timeout, listener_name),
-        forward_direction(&upstream, &client, idle_timeout, listener_name)
-    );
-    debug!(
-        "[L4:{}] connection closed: c→u {} bytes, u→c {} bytes",
-        listener_name, c2u_bytes, u2c_bytes
-    );
+    // &TcpStream / &Pipe の同時借用は安全。
+    match (Pipe::new(), Pipe::new()) {
+        (Ok(c2u_pipe), Ok(u2c_pipe)) => {
+            let (c2u_bytes, u2c_bytes) = futures::join!(
+                forward_direction_splice(
+                    &client,
+                    &upstream,
+                    &c2u_pipe,
+                    idle_timeout,
+                    listener_name
+                ),
+                forward_direction_splice(
+                    &upstream,
+                    &client,
+                    &u2c_pipe,
+                    idle_timeout,
+                    listener_name
+                )
+            );
+            debug!(
+                "[L4:{}] connection closed (splice): c→u {} bytes, u→c {} bytes",
+                listener_name, c2u_bytes, u2c_bytes
+            );
+        }
+        _ => {
+            // pipe 作成失敗時はユーザースペースコピーへフォールバック。
+            warn!(
+                "[L4:{}] pipe creation failed; falling back to userspace copy",
+                listener_name
+            );
+            let (c2u_bytes, u2c_bytes) = futures::join!(
+                forward_direction(&client, &upstream, idle_timeout, listener_name),
+                forward_direction(&upstream, &client, idle_timeout, listener_name)
+            );
+            debug!(
+                "[L4:{}] connection closed: c→u {} bytes, u→c {} bytes",
+                listener_name, c2u_bytes, u2c_bytes
+            );
+        }
+    }
 }
 
 /// L4 接続を処理する（upstream 選択 → 接続 → バイダイレクショナル転送）

@@ -23,6 +23,7 @@ pub mod buf;
 pub mod executor;
 pub mod io;
 pub mod ring;
+pub mod splice;
 pub mod tcp;
 pub mod timer;
 
