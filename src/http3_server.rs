@@ -2367,9 +2367,19 @@ async fn send_pending_packets(
 ) {
     let mut conns = connections.borrow_mut();
     let mut send_buf = vec![0u8; 1350];
+    // GSO バッチ用の連結バッファとパケット境界（接続ごとに使い回す、F-33）。
+    // 同一宛先・同一サイズのパケットを束ねて 1 回の sendmsg(UDP_SEGMENT) で送出し、
+    // パケットごとの to_vec ヒープ確保と syscall 回数を削減する。
+    let mut batch: Vec<u8> = Vec::new();
+    let mut offsets: Vec<(usize, usize)> = Vec::new();
     let mut closed = Vec::new();
 
     for (cid, handler) in conns.iter_mut() {
+        batch.clear();
+        offsets.clear();
+        let mut seg_size = 0usize;
+        let mut dest: Option<SocketAddr> = None;
+
         loop {
             let (write, send_info) = match handler.conn.send(&mut send_buf) {
                 Ok(v) => v,
@@ -2387,20 +2397,41 @@ async fn send_pending_packets(
                 }
             };
 
-            debug!("[HTTP/3] Sending {} byte packet to {}", write, send_info.to);
-            let send_data = send_buf[..write].to_vec();
-            let socket_clone = socket.clone();
-            let target = send_info.to;
+            // 宛先が変わった or セグメントサイズが変わった（均一バッチの境界）場合は
+            // 現在のバッチを先に flush する（GSO は最終セグメント以外を均一サイズ要求）。
+            let dest_changed = dest.is_some_and(|d| d != send_info.to);
+            let size_breaks = !offsets.is_empty() && write != seg_size;
+            if dest_changed || size_breaks {
+                if let Some(d) = dest {
+                    flush_gso_batch(socket, &batch, &offsets, d).await;
+                }
+                batch.clear();
+                offsets.clear();
+                seg_size = 0;
+            }
 
-            // 非同期送信（spawn しない、直接 await）
-            // QuicUdpSocket の send_to メソッドを直接使用
-            match socket_clone.send_to(send_data, target).await {
-                (Ok(sent), _) => {
-                    debug!("[HTTP/3] Successfully sent {} bytes to {}", sent, target);
-                }
-                (Err(e), _) => {
-                    warn!("[HTTP/3] send_to error: {}", e);
-                }
+            if offsets.is_empty() {
+                seg_size = write;
+            }
+            let start = batch.len();
+            batch.extend_from_slice(&send_buf[..write]);
+            offsets.push((start, write));
+            dest = Some(send_info.to);
+
+            // バッチ満杯（GSO セグメント上限）or 最終セグメント（< seg_size）なら flush。
+            if offsets.len() >= MAX_GSO_SEGMENTS || write < seg_size {
+                flush_gso_batch(socket, &batch, &offsets, send_info.to).await;
+                batch.clear();
+                offsets.clear();
+                seg_size = 0;
+                dest = None;
+            }
+        }
+
+        // 残りのバッチを flush
+        if !offsets.is_empty() {
+            if let Some(d) = dest {
+                flush_gso_batch(socket, &batch, &offsets, d).await;
             }
         }
 
@@ -2412,6 +2443,43 @@ async fn send_pending_packets(
 
     for cid in closed {
         conns.remove(&cid);
+    }
+}
+
+/// GSO セグメント上限（UDP GSO の一般的な最大セグメント数）
+const MAX_GSO_SEGMENTS: usize = 64;
+
+/// 連結済みバッチ（`offsets` でパケット境界を持つ）を送出する。
+///
+/// 単一パケットは通常送信、複数パケットは `send_gso_async`（GSO 無効時は個別送信へ
+/// 安全にフォールバック）で 1 回の sendmsg(UDP_SEGMENT) にまとめて送る。
+async fn flush_gso_batch(
+    socket: &Rc<QuicUdpSocket>,
+    batch: &[u8],
+    offsets: &[(usize, usize)],
+    dest: SocketAddr,
+) {
+    match offsets {
+        [] => {}
+        [(start, len)] => {
+            // 単一パケット: 通常の send_to（GSO 不要）
+            let pkt = batch[*start..*start + *len].to_vec();
+            if let (Err(e), _) = socket.send_to(pkt, dest).await {
+                warn!("[HTTP/3] send_to error: {}", e);
+            }
+        }
+        _ => {
+            // 複数パケット: GSO（send_gso_async は GSO 無効環境では個別送信に
+            // フォールバックするため安全）。スライスはバッチへの参照でアロケーションは
+            // パケット境界ベクタ 1 本のみ。
+            let packets: Vec<&[u8]> = offsets
+                .iter()
+                .map(|&(start, len)| &batch[start..start + len])
+                .collect();
+            if let Err(e) = socket.send_gso_async(&packets, dest).await {
+                warn!("[HTTP/3] GSO batch send error: {}", e);
+            }
+        }
     }
 }
 
