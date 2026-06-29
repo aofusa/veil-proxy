@@ -447,6 +447,26 @@ impl QuicUdpSocket {
         }
     }
 
+    /// パケットを送信（ゼロアロケーション版、スライス直渡し）
+    ///
+    /// `send_to` と異なり所有権付き `Vec` を要求せず、`&[u8]` をそのまま
+    /// 非ブロッキング sendto する（EAGAIN 時は POLL_ADD で待機）。内部の
+    /// `std::net::UdpSocket::send_to` はスライスのみを必要とするため、呼び出し側で
+    /// 送信ごとに `to_vec()` する必要がない。io_uring SEND は使わず POLL_ADD のみのため
+    /// 新規オペコードも増やさない。HTTP/3 の単一パケット送信（最も高頻度な経路）で使用。
+    pub async fn send_to_slice_async(&self, data: &[u8], target: SocketAddr) -> io::Result<usize> {
+        let fd = self.socket.as_raw_fd();
+        loop {
+            match self.socket.send_to(data, target) {
+                Ok(n) => return Ok(n),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    wait_writable_fd(fd).await?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// GSO を使用して複数パケットを効率的に送信
     ///
     /// この関数は sendmsg(2) と UDP_SEGMENT CMSG を使用して、

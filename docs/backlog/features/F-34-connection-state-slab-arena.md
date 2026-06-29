@@ -50,8 +50,21 @@
 - E2E（features full）388/389（唯一の失敗 `test_error_handling_431` は負荷フレーキーで、単体
   実行では通過。HTTP/1.1 経路で本変更とは無関係）。segfault なし。
 
+### 追記: HTTP/3 データプレーンの per-operation malloc 排除（F-33 と同時対応）
+
+接続ごとの 64KB バッファ（HTTP/2）に続き、Slab 化の本質（**ホットパスでの実行時 malloc/free
+排除**）を HTTP/3 の送受信ホットパスへ展開した（詳細は
+[F-33-http3-gso-gro-offload.md](F-33-http3-gso-gro-offload.md)）。
+
+- **受信**: メインループの 64KB 受信バッファを loop 外で一度だけ確保して再利用。
+  データグラム毎の `vec![0u8; 65536]` + 2 回の `to_vec` を排除（GRO 受信と同時）。
+- **送信**: `send_pending_packets` の送信スクラッチ（`send_buf` + GSO 連結バッファ + 境界）を
+  **スレッドローカルのフリーリスト**で再利用（thread-per-core のためロック不要、`take`/`put`
+  で `.await` 跨ぎ安全）。単一パケット送信の `to_vec` も `send_to_slice_async` で排除。
+
 ### 残（より広範な Slab 化）
 
-L7 状態構造体やタスク（executor の `Box<dyn Future>`）自体の Slab/Arena 化は、ランタイムの
-タスク管理の書き換えを要し全接続に影響するため、独立した大規模タスクとして継続する。本対応は
-接続ごと最大確保（64KB バッファ）の排除を優先した。
+L7 状態構造体やタスク（executor の `Arc<Task>` + `Box<dyn Future>`）自体の Slab/Arena 化は、
+ランタイムのタスク管理（Waker / Send+Sync 制約）の書き換えを要し全接続に影響するため、独立した
+大規模タスクとして継続する。本対応は接続ごと最大確保（64KB バッファ）の排除を優先し、さらに
+HTTP/3 送受信ホットパスの per-operation malloc を排除した。

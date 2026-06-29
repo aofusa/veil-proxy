@@ -2143,6 +2143,12 @@ pub async fn run_http3_server_async(
 
     // ルーティング設定を CURRENT_CONFIG から取得（ホットリロード対応）
 
+    // F-33: 受信バッファを loop 外で一度だけ確保し再利用する。
+    // 旧実装はデータグラム毎に 64KB の Vec を確保（さらに 2 回の to_vec コピー）していたが、
+    // GRO 受信（recv_gro_async）+ スライス直渡しでヒープ確保とコピーを完全に排除する。
+    // 64KB は単一 recvmsg の最大値。GRO 集約時はこのバッファに複数データグラムが詰めて返る。
+    let mut recv_buf = vec![0u8; 65536];
+
     // メインループ: パケット受信とディスパッチ
     loop {
         // シャットダウンチェック
@@ -2209,11 +2215,15 @@ pub async fn run_http3_server_async(
                 .unwrap_or(Duration::from_millis(100))
         };
 
-        // タイムアウト付きでパケット受信
-        // QuicUdpSocket の recv_from メソッドを直接使用
-        let recv_buf = vec![0u8; 65536];
+        // タイムアウト付きでパケット受信（F-33: GRO 受信オフロード）
+        // recv_gro_async は recvmsg(2) + UDP_GRO CMSG で同一フローの複数データグラムを
+        // カーネルで集約受信し、per-datagram の syscall を削減する。GRO 非対応カーネルでは
+        // 単発データグラムとして安全にフォールバックする（cmsg 無し → セグメント分割なし）。
+        // バッファは loop 外で再利用するため、データグラム毎の 64KB ヒープ確保を排除。
+        // io_uring の新規オペコードは増やさず、EAGAIN 時は POLL_ADD（wait_readable_fd）で待機。
         let recv_result =
-            crate::runtime::time::timeout(timeout_duration, socket.recv_from(recv_buf)).await;
+            crate::runtime::time::timeout(timeout_duration, socket.recv_gro_async(&mut recv_buf))
+                .await;
 
         // タイムアウト処理（常に実行）
         {
@@ -2232,86 +2242,98 @@ pub async fn run_http3_server_async(
         }
 
         // パケット受信結果を処理（タイムアウト時も送信処理は実行する）
-        let received_packet = match recv_result {
-            Ok((Ok((len, from)), buf)) => Some((buf, len, from)),
-            Ok((Err(e), _)) => {
+        let gro_result = match recv_result {
+            Ok(Ok(r)) => Some(r),
+            Ok(Err(e)) => {
                 if e.kind() != io::ErrorKind::WouldBlock {
-                    error!("[HTTP/3] recv_from error: {}", e);
+                    error!("[HTTP/3] recv_gro error: {}", e);
                 }
                 None
             }
-            Err(_) => {
-                // タイムアウト - パケット受信なし、送信処理は続行
-                None
-            }
+            // タイムアウト - パケット受信なし、送信処理は続行
+            Err(_) => None,
         };
 
         // パケットを受信した場合のみ処理
-        if let Some((recv_buf, len, from)) = received_packet {
-            let mut pkt_buf = recv_buf[..len].to_vec();
+        if let Some(gro) = gro_result {
+            let from = gro.from;
+            let total = gro.bytes_received;
+            // GRO セグメントサイズ。None/0（GRO 非適用 = 単発データグラム）の場合は
+            // 受信全体を 1 セグメントとして扱う。
+            let seg_size = gro
+                .gro_segment_size
+                .map(|s| s as usize)
+                .filter(|&s| s > 0)
+                .unwrap_or(total);
 
-            // パケットヘッダーを解析
-            let hdr = match quiche::Header::from_slice(&mut pkt_buf, quiche::MAX_CONN_ID_LEN) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!("[HTTP/3] Invalid packet header: {}", e);
-                    // 無効なパケットでも送信処理は続行
-                    send_pending_packets(&connections, &socket, local_addr).await;
-                    continue;
-                }
-            };
+            // GRO で集約された各 QUIC データグラムを quiche に供給する。
+            // recv_buf のスライスを quiche::Header::from_slice と conn.recv に直接渡し、
+            // 中間 Vec への 2 回の to_vec コピーを完全に排除する（ゼロコピー受信）。
+            let mut offset = 0;
+            while offset < total {
+                let start = offset;
+                let end = (offset + seg_size).min(total);
+                offset = end;
 
-            // コネクションを検索または作成
-            let conn_id = {
-                let mut conns = connections.borrow_mut();
-
-                if !conns.contains_key(&hdr.dcid) {
-                    if hdr.ty != quiche::Type::Initial {
-                        debug!("[HTTP/3] Non-initial packet for unknown connection");
-                        // 送信処理は続行
-                        drop(conns);
-                        send_pending_packets(&connections, &socket, local_addr).await;
-                        continue;
-                    }
-
-                    // 新規コネクション
-                    let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
-                    rng.fill(&mut scid)
-                        .map_err(|_| io::Error::new(io::ErrorKind::Other, "RNG error"))?;
-                    let scid = ConnectionId::from_ref(&scid).into_owned();
-
-                    let mut config_ref = quic_config.borrow_mut();
-                    let conn = quiche::accept(&scid, None, local_addr, from, &mut config_ref)
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-
-                    debug!("[HTTP/3] New connection from {}", from);
-
-                    // 最新のルーティング設定を取得
-                    let handler = Http3Handler::new(conn, from);
-                    conns.insert(scid.clone(), handler);
-
-                    scid
-                } else {
-                    hdr.dcid.into_owned()
-                }
-            };
-
-            // パケットを処理
-            {
-                let mut conns = connections.borrow_mut();
-                if let Some(handler) = conns.get_mut(&conn_id) {
-                    let recv_info = quiche::RecvInfo {
-                        from,
-                        to: local_addr,
+                // パケットヘッダーを解析（同一バッファスライスを後段の conn.recv にも渡す）
+                let hdr =
+                    match quiche::Header::from_slice(&mut recv_buf[start..end], quiche::MAX_CONN_ID_LEN)
+                    {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!("[HTTP/3] Invalid packet header: {}", e);
+                            // このセグメントのみスキップ。送信処理はループ後に実行。
+                            continue;
+                        }
                     };
 
-                    // パケットを受信
-                    let mut pkt_buf_mut = pkt_buf.to_vec();
-                    match handler.conn.recv(&mut pkt_buf_mut, recv_info) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            warn!("[HTTP/3] recv error: {}", e);
-                            // エラー時も送信処理は続行
+                // コネクションを検索または作成
+                let conn_id = {
+                    let mut conns = connections.borrow_mut();
+
+                    if !conns.contains_key(&hdr.dcid) {
+                        if hdr.ty != quiche::Type::Initial {
+                            debug!("[HTTP/3] Non-initial packet for unknown connection");
+                            continue;
+                        }
+
+                        // 新規コネクション
+                        let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
+                        rng.fill(&mut scid)
+                            .map_err(|_| io::Error::new(io::ErrorKind::Other, "RNG error"))?;
+                        let scid = ConnectionId::from_ref(&scid).into_owned();
+
+                        let mut config_ref = quic_config.borrow_mut();
+                        let conn = quiche::accept(&scid, None, local_addr, from, &mut config_ref)
+                            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+                        debug!("[HTTP/3] New connection from {}", from);
+
+                        // 最新のルーティング設定を取得
+                        let handler = Http3Handler::new(conn, from);
+                        conns.insert(scid.clone(), handler);
+
+                        scid
+                    } else {
+                        hdr.dcid.into_owned()
+                    }
+                };
+
+                // パケットを処理（同一スライスをそのまま渡す。追加コピーなし）
+                {
+                    let mut conns = connections.borrow_mut();
+                    if let Some(handler) = conns.get_mut(&conn_id) {
+                        let recv_info = quiche::RecvInfo {
+                            from,
+                            to: local_addr,
+                        };
+
+                        match handler.conn.recv(&mut recv_buf[start..end], recv_info) {
+                            Ok(_) => {}
+                            Err(e) => {
+                                warn!("[HTTP/3] recv error: {}", e);
+                                // エラー時も送信処理は続行
+                            }
                         }
                     }
                 }
@@ -2366,12 +2388,18 @@ async fn send_pending_packets(
     _local_addr: SocketAddr,
 ) {
     let mut conns = connections.borrow_mut();
-    let mut send_buf = vec![0u8; 1350];
-    // GSO バッチ用の連結バッファとパケット境界（接続ごとに使い回す、F-33）。
-    // 同一宛先・同一サイズのパケットを束ねて 1 回の sendmsg(UDP_SEGMENT) で送出し、
-    // パケットごとの to_vec ヒープ確保と syscall 回数を削減する。
-    let mut batch: Vec<u8> = Vec::new();
-    let mut offsets: Vec<(usize, usize)> = Vec::new();
+
+    // 送信用スクラッチ（send_buf 1350B + GSO 連結バッファ + パケット境界）を
+    // スレッドローカルから払い出して再利用する。thread-per-core のためロック不要。
+    // take/replace により .await をまたいでスレッドローカルの borrow を保持しないので、
+    // 再入（このループ内での多重呼び出し）でも安全。これにより送信のたびに発生していた
+    // 1350B + バッチの malloc を排除する。
+    let mut scratch = take_h3_send_scratch();
+    let H3SendScratch {
+        send_buf,
+        batch,
+        offsets,
+    } = &mut scratch;
     let mut closed = Vec::new();
 
     for (cid, handler) in conns.iter_mut() {
@@ -2381,7 +2409,7 @@ async fn send_pending_packets(
         let mut dest: Option<SocketAddr> = None;
 
         loop {
-            let (write, send_info) = match handler.conn.send(&mut send_buf) {
+            let (write, send_info) = match handler.conn.send(send_buf.as_mut_slice()) {
                 Ok(v) => v,
                 Err(quiche::Error::Done) => break,
                 Err(quiche::Error::CryptoFail) => {
@@ -2403,7 +2431,7 @@ async fn send_pending_packets(
             let size_breaks = !offsets.is_empty() && write != seg_size;
             if dest_changed || size_breaks {
                 if let Some(d) = dest {
-                    flush_gso_batch(socket, &batch, &offsets, d).await;
+                    flush_gso_batch(socket, batch.as_slice(), offsets.as_slice(),d).await;
                 }
                 batch.clear();
                 offsets.clear();
@@ -2420,7 +2448,7 @@ async fn send_pending_packets(
 
             // バッチ満杯（GSO セグメント上限）or 最終セグメント（< seg_size）なら flush。
             if offsets.len() >= MAX_GSO_SEGMENTS || write < seg_size {
-                flush_gso_batch(socket, &batch, &offsets, send_info.to).await;
+                flush_gso_batch(socket, batch.as_slice(), offsets.as_slice(),send_info.to).await;
                 batch.clear();
                 offsets.clear();
                 seg_size = 0;
@@ -2431,7 +2459,7 @@ async fn send_pending_packets(
         // 残りのバッチを flush
         if !offsets.is_empty() {
             if let Some(d) = dest {
-                flush_gso_batch(socket, &batch, &offsets, d).await;
+                flush_gso_batch(socket, batch.as_slice(), offsets.as_slice(),d).await;
             }
         }
 
@@ -2444,10 +2472,52 @@ async fn send_pending_packets(
     for cid in closed {
         conns.remove(&cid);
     }
+
+    // スクラッチをスレッドローカルへ返却し、次回呼び出しで再利用する（malloc 排除）。
+    put_h3_send_scratch(scratch);
 }
 
 /// GSO セグメント上限（UDP GSO の一般的な最大セグメント数）
 const MAX_GSO_SEGMENTS: usize = 64;
+
+/// `send_pending_packets` 用の送信スクラッチ（スレッドローカルで再利用）。
+struct H3SendScratch {
+    /// quiche の単一パケット書き出し用バッファ（最大 1350B）
+    send_buf: Vec<u8>,
+    /// GSO バッチ連結バッファ
+    batch: Vec<u8>,
+    /// バッチ内のパケット境界 (offset, len)
+    offsets: Vec<(usize, usize)>,
+}
+
+thread_local! {
+    /// 送信スクラッチのスレッドローカル保管庫。thread-per-core のためロック不要。
+    static H3_SEND_SCRATCH: std::cell::RefCell<Option<H3SendScratch>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// スクラッチを払い出す（無ければ新規確保）。take してから返すため、.await をまたいで
+/// スレッドローカルの borrow を保持しない（再入安全）。
+fn take_h3_send_scratch() -> H3SendScratch {
+    H3_SEND_SCRATCH
+        .with(|s| s.borrow_mut().take())
+        .unwrap_or_else(|| H3SendScratch {
+            send_buf: vec![0u8; 1350],
+            batch: Vec::new(),
+            offsets: Vec::new(),
+        })
+}
+
+/// スクラッチを返却する（次回再利用）。肥大化した batch は一定上限で解放してメモリを抑える。
+fn put_h3_send_scratch(mut scratch: H3SendScratch) {
+    scratch.batch.clear();
+    scratch.offsets.clear();
+    // バッチが極端に肥大化した場合（>1MB）は確保を手放す。
+    if scratch.batch.capacity() > (1 << 20) {
+        scratch.batch.shrink_to(64 * 1500);
+    }
+    H3_SEND_SCRATCH.with(|s| *s.borrow_mut() = Some(scratch));
+}
 
 /// 連結済みバッチ（`offsets` でパケット境界を持つ）を送出する。
 ///
@@ -2462,9 +2532,12 @@ async fn flush_gso_batch(
     match offsets {
         [] => {}
         [(start, len)] => {
-            // 単一パケット: 通常の send_to（GSO 不要）
-            let pkt = batch[*start..*start + *len].to_vec();
-            if let (Err(e), _) = socket.send_to(pkt, dest).await {
+            // 単一パケット: ゼロアロケーション送信（to_vec 不要）。
+            // batch スライスを直接 sendto するため、パケットごとのヒープ確保を排除。
+            if let Err(e) = socket
+                .send_to_slice_async(&batch[*start..*start + *len], dest)
+                .await
+            {
                 warn!("[HTTP/3] send_to error: {}", e);
             }
         }
