@@ -718,8 +718,7 @@ impl Http3Handler {
             .unwrap_or(AcceptedEncoding::Identity);
         let compression = resolve_http3_compression_config(&path_compression, &config.http3_config);
         let final_path = compute_backend_path(&server.target, path, &prefix);
-        let request_head =
-            build_h1_request_head(&server.target, method, &final_path, headers, more_frames);
+        let request_head = build_h1_request_head(&server.target, method, &final_path, headers);
 
         Decision::Stream(crate::http3_stream::BackendTaskParams {
             server,
@@ -1855,16 +1854,17 @@ fn compute_backend_path(target: &ProxyTarget, req_path: &[u8], prefix: &[u8]) ->
     }
 }
 
-/// HTTP/1.1 リクエスト head（リクエストライン + ヘッダ + 空行、ボディなし）を構築する。
+/// HTTP/1.1 リクエスト head（リクエストライン + ヘッダ、**末尾の空行は含めない**）を構築する。
 ///
-/// ストリーミングではボディ長が不定のため、ボディありの場合は `Transfer-Encoding: chunked`
-/// を付与する（バックエンドへは chunked 逐次転送）。`Connection: close` で 1 リクエスト 1 接続。
+/// ボディフレーミング（`Transfer-Encoding: chunked` か無しか）と末尾の空行は、**実際に
+/// ボディデータが来たか**をバックエンドタスクが判定してから付与する（HTTP/3 では HEADERS
+/// 受信時点でボディ有無が確定しないため。例: h3 クライアントが HEADERS と fin を別送する GET は
+/// `more_frames=true` でもボディなし）。`Connection: close` で 1 リクエスト 1 接続。
 fn build_h1_request_head(
     target: &ProxyTarget,
     method: &[u8],
     final_path: &str,
     headers: &[h3::Header],
-    chunked_body: bool,
 ) -> Vec<u8> {
     let mut req = Vec::with_capacity(512);
     req.extend_from_slice(method);
@@ -1895,10 +1895,8 @@ fn build_h1_request_head(
         req.extend_from_slice(b"\r\n");
     }
 
-    if chunked_body {
-        req.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
-    }
-    req.extend_from_slice(b"Connection: close\r\n\r\n");
+    // ボディフレーミングと末尾空行はタスク側で付与する。
+    req.extend_from_slice(b"Connection: close\r\n");
     req
 }
 

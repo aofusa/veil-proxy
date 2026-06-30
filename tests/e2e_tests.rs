@@ -2836,6 +2836,212 @@ async fn test_http3_chunked_response() {
     }
 }
 
+/// F-32: HTTP/3 リクエスト方向ストリーミングの End-to-End（往復バイト単位一致）。
+///
+/// 初期ストリームフロー制御ウィンドウ（`initial_max_stream_data_bidi_remote` = 1MB）を
+/// **超える** 大容量ボディ（1,500,000 バイト）を POST する。プロキシは HEADERS 受信時点で
+/// バックエンド接続を開始し、DATA を chunked で逐次転送する（`recv_body` pump + 有界チャネルの
+/// バックプレッシャ、WINDOW_UPDATE/MAX_STREAM_DATA に連動）。echo バックエンドが chunked を
+/// デコードして同一ボディを返すので、**往復のバイト単位完全一致**を確認することで、
+/// アクターモデル（メインループ⇔バックエンドタスク）でのストリーミング・chunked エンコード/
+/// デコード・終端・双方向フロー制御の End-to-End 正当性を保証する。
+#[tokio::test]
+#[ntest::timeout(30000)]
+#[cfg(feature = "http3")]
+async fn test_http3_request_body_streaming() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+
+    // 1MB の初期ストリームウィンドウを十分超えるサイズ → 複数バッチ recv_body + フロー制御を強制
+    const UPLOAD_TOTAL: usize = 1_500_000;
+    let upload: Vec<u8> = (0..UPLOAD_TOTAL).map(|i| (i % 256) as u8).collect();
+
+    use common::http3_client::send_http3_request;
+
+    // 大容量往復は重い並列負荷下で QUIC 接続が一時的にリセットされ得る（プロキシの
+    // ストリーミング処理自体は分離タスクで安定）。接続レベルの失敗はリトライし、成功時のみ
+    // バイト単位一致を検証する（他の負荷フレーキーテストと同じレジリエンス方針）。
+    const MAX_ATTEMPTS: usize = 4;
+    let mut last_err = String::new();
+    for attempt in 0..MAX_ATTEMPTS {
+        let (mut _client, mut send_request) =
+            match Http3TestClient::new(server_addr, "localhost").await {
+                Ok(c) => c,
+                Err(e) => {
+                    last_err = format!("connect error: {}", e);
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    continue;
+                }
+            };
+
+        match send_http3_request(
+            &mut send_request,
+            "POST",
+            "/echo-upload/data",
+            &[("content-type", "application/octet-stream")],
+            Some(&upload),
+        )
+        .await
+        {
+            Ok((status, body)) => {
+                assert_eq!(status, 200, "Expected 200 OK for echoed upload (h3)");
+                assert_eq!(
+                    body.len(),
+                    UPLOAD_TOTAL,
+                    "Echoed body length mismatch (got {}, want {})",
+                    body.len(),
+                    UPLOAD_TOTAL
+                );
+                // 往復の完全一致 = ストリーミング転送・chunked エンコード/デコードで破損・欠落なし
+                for (i, (&got, &want)) in body.iter().zip(upload.iter()).enumerate() {
+                    assert_eq!(
+                        got, want,
+                        "Echoed body byte mismatch at offset {} (got {}, want {})",
+                        i, got, want
+                    );
+                }
+                eprintln!(
+                    "HTTP/3 request streaming: uploaded and echoed {} bytes byte-exact (attempt {})",
+                    body.len(),
+                    attempt + 1
+                );
+                return;
+            }
+            Err(e) => {
+                last_err = format!("POST error: {}", e);
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+        }
+    }
+    panic!(
+        "HTTP/3 request body streaming failed after {} attempts: {}",
+        MAX_ATTEMPTS, last_err
+    );
+}
+
+/// F-32: HTTP/3 リクエスト方向ストリーミング（小ボディ・単一 DATA 経路）。
+#[tokio::test]
+#[ntest::timeout(15000)]
+#[cfg(feature = "http3")]
+async fn test_http3_request_body_streaming_small() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+
+    let upload = b"hello streaming request body over http3".to_vec();
+
+    use common::http3_client::send_http3_request;
+
+    let (mut _client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
+    {
+        Ok(c) => c,
+        Err(e) => panic!("Failed to create HTTP/3 client: {}", e),
+    };
+
+    let (status, body) = send_http3_request(
+        &mut send_request,
+        "POST",
+        "/echo-upload/small",
+        &[("content-type", "text/plain")],
+        Some(&upload),
+    )
+    .await
+    .expect("HTTP/3 small request body streaming POST failed");
+
+    assert_eq!(status, 200, "Expected 200 OK for echoed small upload (h3)");
+    assert_eq!(body, upload, "Echoed small body mismatch (h3)");
+}
+
+/// F-32: HTTP/3 レスポンス方向ストリーミングの End-to-End（chunked バックエンド・バイト一致）。
+///
+/// `Transfer-Encoding: chunked` のバックエンド（200,000 バイト・決定論パターン）からの応答を、
+/// プロキシは **全バッファリングせず** `ChunkedDecoder::next_data_span` でゼロコピーデコードしつつ
+/// HTTP/3 DATA（`send_body`）へ逐次転送する（クライアントのフロー制御に連動したバックプレッシャ）。
+/// 実 h3 クライアントが全ボディを **バイト単位まで正確に** 再構成できることを確認する。
+#[tokio::test]
+#[ntest::timeout(30000)]
+#[cfg(feature = "http3")]
+async fn test_http3_response_body_streaming() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+
+    // test-backends/src/main.rs の chunked サーバー定数と一致させること
+    const EXPECTED_TOTAL: usize = 200_000;
+    let expected_byte = |i: usize| -> u8 { (i % 256) as u8 };
+
+    use common::http3_client::send_http3_request;
+
+    const MAX_ATTEMPTS: usize = 4;
+    let mut last_err = String::new();
+    for attempt in 0..MAX_ATTEMPTS {
+        let (mut _client, mut send_request) =
+            match Http3TestClient::new(server_addr, "localhost").await {
+                Ok(c) => c,
+                Err(e) => {
+                    last_err = format!("connect error: {}", e);
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    continue;
+                }
+            };
+
+        match send_http3_request(&mut send_request, "GET", "/chunked-stream/data", &[], None).await
+        {
+            Ok((status, body)) => {
+                assert_eq!(status, 200, "Expected 200 OK for chunked stream (h3)");
+                assert_eq!(
+                    body.len(),
+                    EXPECTED_TOTAL,
+                    "Streamed body length mismatch (got {}, want {})",
+                    body.len(),
+                    EXPECTED_TOTAL
+                );
+                // 決定論パターンの完全一致 = ストリーミング転送中に破損・並べ替え・欠落がない
+                for (i, &b) in body.iter().enumerate() {
+                    assert_eq!(
+                        b,
+                        expected_byte(i),
+                        "Body byte mismatch at offset {} (got {}, want {})",
+                        i,
+                        b,
+                        expected_byte(i)
+                    );
+                }
+                eprintln!(
+                    "HTTP/3 response streaming: reassembled {} bytes byte-exact via DATA frames (attempt {})",
+                    body.len(),
+                    attempt + 1
+                );
+                return;
+            }
+            Err(e) => {
+                last_err = format!("GET error: {}", e);
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+        }
+    }
+    panic!(
+        "HTTP/3 response body streaming failed after {} attempts: {}",
+        MAX_ATTEMPTS, last_err
+    );
+}
+
 #[tokio::test]
 #[ntest::timeout(15000)]
 #[cfg(feature = "http3")]

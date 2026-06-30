@@ -41,7 +41,7 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use bytes::Bytes;
-use ftlog::warn;
+use ftlog::{debug, warn};
 
 use crate::config::UpstreamServer;
 use crate::runtime::tcp::TcpStream;
@@ -399,29 +399,53 @@ async fn run_backend_task(
         };
     let _ = backend.set_nodelay(true);
 
-    // --- リクエスト head 送出 ---
-    if let Err(e) = write_all(&backend, Bytes::from(request_head)).await {
-        warn!("[HTTP/3] streaming backend head write error: {}", e);
-        return Err(502);
-    }
+    // --- リクエスト head + ボディフレーミングの確定 ---
+    // `request_head` は `...Connection: close\r\n`（末尾空行なし・ボディフレーミングなし）。
+    // ボディ有無は HEADERS 受信時点では確定しない（h3 クライアントは HEADERS と fin を別送する
+    // ため、ボディのない GET でも `more_frames=true`）。そこで **最初のボディ断片が実際に届くか**
+    // を見てから framing を確定する: 届けば `Transfer-Encoding: chunked`、届かなければボディなし。
+    let mut head = request_head;
+    let first_chunk = if has_request_body {
+        req_body_rx.recv().await
+    } else {
+        None
+    };
 
-    // --- リクエストボディ（chunked 逐次転送） ---
-    if has_request_body {
-        // クライアント側 END_STREAM（送信端 drop / 明示クローズ）まで逐次転送。
-        while let Some(chunk) = req_body_rx.recv().await {
-            // クライアント → プロキシ → バックエンドのバックプレッシャ:
-            // 書き込み完了まで次フレームを読まない。
-            if let Err(e) = send_backend_chunk(&backend, chunk).await {
+    match first_chunk {
+        Some(first) => {
+            // 実ボディあり → chunked 逐次転送。
+            head.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
+            if let Err(e) = write_all(&backend, Bytes::from(head)).await {
+                warn!("[HTTP/3] streaming backend head write error: {}", e);
+                return Err(502);
+            }
+            if let Err(e) = send_backend_chunk(&backend, first).await {
                 warn!("[HTTP/3] streaming backend body write error: {}", e);
                 return Err(502);
             }
-            // 1 フレーム消化したのでメインループへ「pump 再開可」通知。
             notify.notify();
+            // クライアント側 END_STREAM（送信端 drop / 明示クローズ）まで逐次転送。
+            while let Some(chunk) = req_body_rx.recv().await {
+                // 書き込み完了まで次フレームを読まない（バックプレッシャ）。
+                if let Err(e) = send_backend_chunk(&backend, chunk).await {
+                    warn!("[HTTP/3] streaming backend body write error: {}", e);
+                    return Err(502);
+                }
+                notify.notify();
+            }
+            // 終端チャンク。
+            if let Err(e) = write_all(&backend, Bytes::from_static(b"0\r\n\r\n")).await {
+                warn!("[HTTP/3] streaming backend terminator write error: {}", e);
+                return Err(502);
+            }
         }
-        // 終端チャンク。
-        if let Err(e) = write_all(&backend, Bytes::from_static(b"0\r\n\r\n")).await {
-            warn!("[HTTP/3] streaming backend terminator write error: {}", e);
-            return Err(502);
+        None => {
+            // ボディなし（GET 等、または more_frames=true でも実データ無し） → 空行で head 終端。
+            head.extend_from_slice(b"\r\n");
+            if let Err(e) = write_all(&backend, Bytes::from(head)).await {
+                warn!("[HTTP/3] streaming backend head write error: {}", e);
+                return Err(502);
+            }
         }
     }
 
@@ -457,7 +481,7 @@ async fn stream_response(
         if std::time::Instant::now() >= deadline {
             return Err(504);
         }
-        let (res, buf) = backend.read(read_buf).await;
+        let (res, buf) = read_backend(backend, read_buf).await;
         read_buf = buf;
         let n = match res {
             Ok(0) => {
@@ -569,7 +593,7 @@ async fn stream_body_length(
         if std::time::Instant::now() >= deadline {
             return Ok(()); // 既に head 送出済み → fin（resp_tx drop）で閉じる。
         }
-        let (res, buf) = backend.read(read_buf).await;
+        let (res, buf) = read_backend(backend, read_buf).await;
         read_buf = buf;
         match res {
             Ok(0) => break,
@@ -609,7 +633,7 @@ async fn stream_body_chunked(
         if std::time::Instant::now() >= deadline {
             return Ok(());
         }
-        let (res, buf) = backend.read(read_buf).await;
+        let (res, buf) = read_backend(backend, read_buf).await;
         read_buf = buf;
         match res {
             Ok(0) => break,
@@ -621,7 +645,10 @@ async fn stream_body_chunked(
                 }
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-            Err(_) => break,
+            Err(e) => {
+                debug!("[HTTP/3] streaming chunked read error: {}", e);
+                break;
+            }
         }
     }
     Ok(())
@@ -673,7 +700,7 @@ async fn stream_body_eof(
         if std::time::Instant::now() >= deadline {
             return Ok(());
         }
-        let (res, buf) = backend.read(read_buf).await;
+        let (res, buf) = read_backend(backend, read_buf).await;
         read_buf = buf;
         match res {
             Ok(0) => break,
@@ -721,7 +748,7 @@ async fn stream_response_compressed(
         if std::time::Instant::now() >= deadline {
             break;
         }
-        let (res, buf) = backend.read(read_buf).await;
+        let (res, buf) = read_backend(backend, read_buf).await;
         read_buf = buf;
         match res {
             Ok(0) => break,
@@ -821,7 +848,28 @@ async fn send_body_bytes(
     Ok(())
 }
 
+/// io_uring RECV を発行し、EAGAIN 時は POLL_ADD（`readable()`）で読み取り可能を待って
+/// からリトライする。**ビジースピンせず**イベントループへ制御を返すため、メインループ
+/// （QUIC 駆動）が starve しない（io_uring RECV は無データ時に EAGAIN を返し得る）。
+async fn read_backend(backend: &TcpStream, mut buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+    loop {
+        let (res, b) = backend.read(buf).await;
+        buf = b;
+        match res {
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if let Err(e) = backend.readable().await {
+                    return (Err(e), buf);
+                }
+            }
+            other => return (other, buf),
+        }
+    }
+}
+
 /// 所有バッファ（`Bytes`）をバックエンドへ全量書き込む（部分書き込みを処理）。
+///
+/// EAGAIN 時は POLL_ADD（`writable()`）で書き込み可能を待ってからリトライする。**ビジー
+/// スピンしない**（大容量チャンクで送信バッファが埋まってもメインループを starve させない）。
 async fn write_all(backend: &TcpStream, mut buf: Bytes) -> io::Result<()> {
     use bytes::Buf;
     while !buf.is_empty() {
@@ -842,6 +890,7 @@ async fn write_all(backend: &TcpStream, mut buf: Bytes) -> io::Result<()> {
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                 buf = returned;
+                backend.writable().await?;
             }
             Err(e) => return Err(e),
         }
