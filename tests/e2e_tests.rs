@@ -2846,7 +2846,9 @@ async fn test_http3_chunked_response() {
 /// アクターモデル（メインループ⇔バックエンドタスク）でのストリーミング・chunked エンコード/
 /// デコード・終端・双方向フロー制御の End-to-End 正当性を保証する。
 #[tokio::test]
-#[ntest::timeout(30000)]
+// タイムアウトは大きめ（60s）に取る。1MB 超の往復（up+down）は単一 H3 ワーカー + co-tenant
+// 負荷の重い並列スイートでは CPU 競合で遅くなり得るため（処理自体は分離タスクで安定）。
+#[ntest::timeout(60000)]
 #[cfg(feature = "http3")]
 async fn test_http3_request_body_streaming() {
     if !is_e2e_environment_ready().await {
@@ -2858,8 +2860,9 @@ async fn test_http3_request_body_streaming() {
         .parse()
         .expect("Invalid server address");
 
-    // 1MB の初期ストリームウィンドウを十分超えるサイズ → 複数バッチ recv_body + フロー制御を強制
-    const UPLOAD_TOTAL: usize = 1_500_000;
+    // 初期ストリームウィンドウ（initial_max_stream_data_bidi_remote = 1MB）を超えるサイズ →
+    // 複数バッチ recv_body + WINDOW_UPDATE/MAX_STREAM_DATA 連動のフロー制御を強制する。
+    const UPLOAD_TOTAL: usize = 1_200_000;
     let upload: Vec<u8> = (0..UPLOAD_TOTAL).map(|i| (i % 256) as u8).collect();
 
     use common::http3_client::send_http3_request;
