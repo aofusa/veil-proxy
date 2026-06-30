@@ -105,10 +105,10 @@ prepare_fixtures() {
     # CA:FALSE を指定して end-entity 証明書として生成
     # （CA 証明書として生成すると CaUsedAsEndEntity エラーになる）
     if [ ! -f "${FIXTURES_DIR}/cert.pem" ]; then
-        log_info "Generating test certificates..."
+        log_info "Generating ECDSA test certificates..."
         
-        # OpenSSLで自己署名証明書を生成（end-entity証明書）
-        openssl req -x509 -newkey rsa:2048 -nodes \
+        # OpenSSLでECDSA自己署名証明書を生成（end-entity証明書）
+        openssl req -x509 -newkey EC -pkeyopt ec_paramgen_curve:secp384r1 -nodes \
             -keyout "${FIXTURES_DIR}/key.pem" \
             -out "${FIXTURES_DIR}/cert.pem" \
             -days 365 \
@@ -119,7 +119,7 @@ prepare_fixtures() {
             -addext "extendedKeyUsage=serverAuth" \
             2>/dev/null
         
-        log_info "Certificates generated"
+        log_info "ECDSA Certificates generated (secp384r1)"
     fi
     
     # バックエンド1用テストファイル（テストが "Hello from Backend N" を含むことを確認するため両方含める）
