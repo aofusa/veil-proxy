@@ -16481,7 +16481,10 @@ async fn test_l4_passthrough_large_payload() {
     }
 
     let response = send_request_with_retry(PROXY_L4_PORT, "/large.txt", &[], 3).await;
-    assert!(response.is_some(), "L4 should forward large payload request");
+    assert!(
+        response.is_some(),
+        "L4 should forward large payload request"
+    );
     let response = response.unwrap();
     let status = get_status_code(&response);
     assert_eq!(

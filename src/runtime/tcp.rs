@@ -324,9 +324,10 @@ impl Drop for Accept<'_> {
         // detach し、ASYNC_CANCEL で孤立 accept を除去する。accept が接続を確保済み
         // だった場合は、その fd を後始末でクローズする（接続を奪ったまま放置しない）。
         if self.submitted {
-            let storage = std::mem::replace(&mut self.addr_storage, Box::new(unsafe {
-                std::mem::zeroed()
-            }));
+            let storage = std::mem::replace(
+                &mut self.addr_storage,
+                Box::new(unsafe { std::mem::zeroed() }),
+            );
             let len = std::mem::replace(&mut self.addr_len, Box::new(0));
             detach_op(
                 self.user_data,
@@ -645,9 +646,10 @@ impl Drop for Connect {
             // カーネルは addr_storage を参照中の可能性があるため保持し、ソケット fd は
             // 完了/キャンセルの CQE 到着後にクローズする。正常完了/エラー時は poll が
             // submitted=false かつ fd=-1 にしてから返すため、この分岐には入らない。
-            let storage = std::mem::replace(&mut self.addr_storage, Box::new(unsafe {
-                std::mem::zeroed()
-            }));
+            let storage = std::mem::replace(
+                &mut self.addr_storage,
+                Box::new(unsafe { std::mem::zeroed() }),
+            );
             let fd = self.fd;
             self.fd = -1;
             detach_op(
@@ -1114,4 +1116,3 @@ pub fn wait_writable_fd(fd: RawFd) -> WritableFd {
         submitted: false,
     }
 }
-

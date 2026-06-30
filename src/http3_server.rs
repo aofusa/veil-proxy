@@ -18,7 +18,7 @@
 //! - ファイル配信、リダイレクト、メトリクス
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::CString;
 use std::io::{self, Seek, Write as IoWrite};
 use std::net::{SocketAddr, UdpSocket};
@@ -31,9 +31,16 @@ use std::time::{Duration, Instant};
 
 use crate::udp::QuicUdpSocket;
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use quiche::h3::NameValue;
 use quiche::{h3, Config, ConnectionId};
+
+/// F-32: ストリーミングのリクエストボディ recv_body 1 回分。
+const REQ_RECV_CHUNK: usize = 16 * 1024;
+/// F-32: リクエストボディチャネルの容量（アイテム数。バックプレッシャ）。
+const REQ_CHAN_CAP: usize = 8;
+/// F-32: レスポンス断片チャネルの容量（アイテム数。バックプレッシャ）。
+const RESP_CHAN_CAP: usize = 8;
 
 use ftlog::{debug, error, info, warn};
 
@@ -227,6 +234,99 @@ impl Default for Http3ServerConfig {
     }
 }
 
+/// リクエスト 1 件のストリーミング状態（メインループ側、F-32）。
+///
+/// バックエンドタスクとはチャネル経由で接続される。本構造体はメインループのみが
+/// 触り、`drive_proxy_stream` がフロー制御に従って `send_response`/`send_body`/`recv_body`
+/// を駆動する。
+struct ProxyStream {
+    // ---- レスポンス方向（バックエンドタスク → メインループ） ----
+    /// レスポンス断片の受信端。
+    resp_rx: crate::http3_stream::Receiver<crate::http3_stream::RespMsg>,
+    /// `send_response`（head）送出済みか。
+    resp_started: bool,
+    /// StreamBlocked で送出保留中の head（次回 drive で再送）。
+    head_pending: Option<(u16, crate::http3_stream::RespHeaders)>,
+    /// フロー制御で部分送信になったボディ断片（`(buf, 送信済みオフセット)`）。
+    body_pending: Option<(Bytes, usize)>,
+    /// レスポンス終端（EOF）を受信し、fin 送出が必要（フロー制御で保留中）。
+    need_fin: bool,
+    /// レスポンス fin 送出済み（= レスポンス完了）。
+    resp_fin_sent: bool,
+
+    // ---- リクエスト方向（メインループ → バックエンドタスク） ----
+    /// リクエストボディ断片の送信端（クライアント END_STREAM で None にして EOF 伝播）。
+    req_tx: Option<crate::http3_stream::Sender<Bytes>>,
+    /// チャネルへ未投入のボディ（初回バッチ分／満杯時の溢れ）。
+    req_pending: VecDeque<Bytes>,
+    /// quiche にリクエストボディの読み取り可能データがある（Data イベントで true）。
+    req_readable: bool,
+    /// クライアント END_STREAM（Finished）受信済み。
+    req_eof_seen: bool,
+    /// 受信済みリクエストボディ累計（`max_request_body_size` 強制用）。
+    req_bytes_total: u64,
+    /// 許容リクエストボディ上限（0 = 無制限）。
+    max_request_body: u64,
+    /// ボディ上限超過（413 + ストリームリセット）。
+    req_too_large: bool,
+}
+
+impl ProxyStream {
+    fn new(
+        resp_rx: crate::http3_stream::Receiver<crate::http3_stream::RespMsg>,
+        req_tx: crate::http3_stream::Sender<Bytes>,
+        has_body: bool,
+        max_request_body: u64,
+    ) -> Self {
+        Self {
+            resp_rx,
+            resp_started: false,
+            head_pending: None,
+            body_pending: None,
+            need_fin: false,
+            resp_fin_sent: false,
+            req_tx: Some(req_tx),
+            req_pending: VecDeque::new(),
+            req_readable: false,
+            req_eof_seen: !has_body,
+            req_bytes_total: 0,
+            max_request_body,
+            req_too_large: false,
+        }
+    }
+}
+
+/// バッファリング（非ストリーミング）経路の保留リクエスト（F-32）。
+///
+/// ストリーミング非適格なリクエストは END_STREAM 受信まで `stream_bodies` にボディを
+/// 蓄積し、完了時に既存の `handle_request`（バッファ経路）で処理する。
+struct BufferedReq {
+    /// リクエストヘッダ（所有）。
+    headers: Vec<h3::Header>,
+    /// END_STREAM 受信済み（= 処理可能）。
+    end: bool,
+}
+
+/// メインループの `select_biased!` 受信結果（F-32）。
+enum RecvOutcome {
+    /// UDP パケット受信（GRO 集約結果）。
+    Packet(io::Result<crate::udp::socket::GroRecvResult>),
+    /// バックエンドタスクからの起床通知。
+    Notified,
+    /// タイムアウトティック。
+    Timeout,
+}
+
+/// `classify` の判定結果。
+enum Decision {
+    /// ストリーミング適格 → バックエンドタスクを spawn。
+    Stream(crate::http3_stream::BackendTaskParams),
+    /// 非適格 → バッファ経路（`handle_request`）。
+    Buffer,
+    /// classify が即時応答済み（セキュリティ拒否など）。
+    Handled,
+}
+
 /// HTTP/3 コネクションハンドラー
 ///
 /// quiche::Connection と h3::Connection をセットで保持し、
@@ -244,17 +344,33 @@ struct Http3Handler {
     partial_responses: HashMap<u64, (Vec<u8>, usize)>,
     /// クライアントIPアドレス（文字列）
     client_ip: String,
+    /// ストリーミングプロキシ中のストリーム（F-32）。
+    proxy_streams: HashMap<u64, ProxyStream>,
+    /// バッファ経路の保留リクエスト（F-32）。
+    buffered_reqs: HashMap<u64, BufferedReq>,
+    /// ストリームごとのリクエストボディ蓄積（バッファ経路 + ストリーミング初回バッチ）。
+    stream_bodies: HashMap<u64, BytesMut>,
+    /// バックエンドタスク → メインループの起床通知（F-32）。
+    notify: crate::http3_stream::H3Notify,
 }
 
 impl Http3Handler {
     /// 新しいハンドラーを作成
-    fn new(conn: quiche::Connection, peer_addr: SocketAddr) -> Self {
+    fn new(
+        conn: quiche::Connection,
+        peer_addr: SocketAddr,
+        notify: crate::http3_stream::H3Notify,
+    ) -> Self {
         Self {
             conn,
             h3_conn: None,
             client_ip: peer_addr.ip().to_string(),
             peer_addr,
             partial_responses: HashMap::new(),
+            proxy_streams: HashMap::new(),
+            buffered_reqs: HashMap::new(),
+            stream_bodies: HashMap::new(),
+            notify,
         }
     }
 
@@ -274,66 +390,66 @@ impl Http3Handler {
         Ok(())
     }
 
-    /// HTTP/3 イベントを処理
+    /// HTTP/3 イベントを処理（F-32: ストリーミング/バッファ分岐）
+    ///
+    /// poll で全イベントを収集（Headers 列挙・Data 排出・Finished 記録）した後、
+    /// 各 Headers を `classify` で **ストリーミング適格／バッファ／即時応答済み** に振り分ける。
+    /// ストリーミング適格はバックエンドタスクを spawn し `proxy_streams` に登録、非適格は
+    /// END_STREAM 受信後に既存 `handle_request`（バッファ経路）で処理する。
+    ///
+    /// Data 排出は、**既にストリーミング中のストリーム**には `req_readable` を立てるだけで
+    /// `recv_body` せず（バックプレッシャ対応の `drive_proxy_stream` に委譲）、それ以外は
+    /// `stream_bodies` へ蓄積する（バッファ経路 + ストリーミング初回バッチ）。
     async fn process_h3_events(&mut self) -> io::Result<()> {
-        // 処理するリクエストを収集（ストリームID → (ヘッダー, ボディ)）
-        let mut pending_requests: Vec<(u64, Vec<h3::Header>, BytesMut)> = Vec::new();
-        // ストリームごとのボディバッファ（BytesMut でゼロコピー蓄積、F-32）
-        let mut stream_bodies: HashMap<u64, BytesMut> = HashMap::new();
+        // 新規 Headers（stream_id, headers, more_frames）と Finished / Reset を収集。
+        let mut new_headers: Vec<(u64, Vec<h3::Header>, bool)> = Vec::new();
+        let mut finished: Vec<u64> = Vec::new();
+        let mut reset: Vec<u64> = Vec::new();
 
         if let Some(ref mut h3_conn) = self.h3_conn {
             loop {
                 match h3_conn.poll(&mut self.conn) {
                     Ok((stream_id, h3::Event::Headers { list, more_frames })) => {
-                        info!(
-                            "[HTTP/3] Received Headers event: stream_id={}, more_frames={}, header_count={}",
-                            stream_id, more_frames, list.len()
+                        debug!(
+                            "[HTTP/3] Headers: stream_id={}, more_frames={}, headers={}",
+                            stream_id,
+                            more_frames,
+                            list.len()
                         );
-                        if !more_frames {
-                            // ボディがないリクエスト
-                            pending_requests.push((stream_id, list, BytesMut::new()));
-                        } else {
-                            // ボディがある場合、ヘッダーを保持して後で処理
-                            // 簡略化: ボディがある場合も即座に処理
-                            let body = stream_bodies.remove(&stream_id).unwrap_or_default();
-                            pending_requests.push((stream_id, list, body));
-                        }
+                        new_headers.push((stream_id, list, more_frames));
                     }
                     Ok((stream_id, h3::Event::Data)) => {
-                        // リクエストボディを BytesMut の spare 容量へ直接読み込む（中間バッファ
-                        // 不要・追加コピーなし・イベントごとのヒープ確保なし、F-32）。
-                        let body = stream_bodies.entry(stream_id).or_default();
-
-                        loop {
-                            // 16KB の空き容量を確保し、その uninit スライスへ recv_body させる。
-                            body.reserve(16384);
-                            let spare = body.spare_capacity_mut();
-                            // SAFETY: recv_body は書き込み専用で、戻り値 read バイトのみを
-                            // 初期化する。spare は BytesMut が確保済みの有効メモリ領域であり、
-                            // 初期化した read バイトを advance_mut で len に反映する。これは
-                            // 本クレートの SafeReadBuffer（uninit バッファへの read）と同方針。
-                            let spare_u8 = unsafe {
-                                std::slice::from_raw_parts_mut(
-                                    spare.as_mut_ptr() as *mut u8,
-                                    spare.len(),
-                                )
-                            };
-                            match h3_conn.recv_body(&mut self.conn, stream_id, spare_u8) {
-                                Ok(read) if read > 0 => {
-                                    // SAFETY: recv_body が先頭 read バイトを初期化済み。
-                                    unsafe { body.advance_mut(read) };
-                                }
-                                Ok(_) => break,
-                                Err(h3::Error::Done) => break,
-                                Err(e) => {
-                                    warn!("[HTTP/3] recv_body error: {}", e);
-                                    break;
+                        if let Some(ps) = self.proxy_streams.get_mut(&stream_id) {
+                            // ストリーミング中: バックプレッシャ対応の pump に委譲。
+                            ps.req_readable = true;
+                        } else {
+                            // バッファ経路（または未分類の初回バッチ）: stream_bodies へ排出。
+                            let body = self.stream_bodies.entry(stream_id).or_default();
+                            loop {
+                                body.reserve(REQ_RECV_CHUNK);
+                                let spare = body.spare_capacity_mut();
+                                // SAFETY: recv_body は書き込み専用で read バイトのみ初期化する。
+                                // spare は BytesMut の確保済み有効領域。advance_mut で len に反映。
+                                let spare_u8 = unsafe {
+                                    std::slice::from_raw_parts_mut(
+                                        spare.as_mut_ptr() as *mut u8,
+                                        spare.len(),
+                                    )
+                                };
+                                match h3_conn.recv_body(&mut self.conn, stream_id, spare_u8) {
+                                    Ok(read) if read > 0 => unsafe { body.advance_mut(read) },
+                                    Ok(_) => break,
+                                    Err(h3::Error::Done) => break,
+                                    Err(e) => {
+                                        warn!("[HTTP/3] recv_body error: {}", e);
+                                        break;
+                                    }
                                 }
                             }
                         }
                     }
-                    Ok((_stream_id, h3::Event::Finished)) => {}
-                    Ok((_stream_id, h3::Event::Reset(_))) => {}
+                    Ok((stream_id, h3::Event::Finished)) => finished.push(stream_id),
+                    Ok((stream_id, h3::Event::Reset(_))) => reset.push(stream_id),
                     Ok((_flow_id, h3::Event::GoAway)) => {}
                     Ok((_, h3::Event::PriorityUpdate)) => {}
                     Err(h3::Error::Done) => break,
@@ -345,15 +461,275 @@ impl Http3Handler {
             }
         }
 
-        // リクエストを処理
-        for (stream_id, headers, body) in pending_requests {
-            self.handle_request(stream_id, &headers, &body).await?;
+        // --- 新規 Headers を分類して振り分け ---
+        for (stream_id, headers, more_frames) in new_headers {
+            match self.classify(stream_id, &headers, more_frames) {
+                Decision::Stream(params) => {
+                    let (req_tx, req_rx) = crate::http3_stream::channel::<Bytes>(REQ_CHAN_CAP);
+                    let (resp_tx, resp_rx) =
+                        crate::http3_stream::channel::<crate::http3_stream::RespMsg>(RESP_CHAN_CAP);
+                    let mut ps =
+                        ProxyStream::new(resp_rx, req_tx, more_frames, params.max_request_body);
+                    // 初回バッチで届いていたボディを取り込む。
+                    if let Some(body) = self.stream_bodies.remove(&stream_id) {
+                        if !body.is_empty() {
+                            ps.req_bytes_total += body.len() as u64;
+                            ps.req_pending.push_back(body.freeze());
+                        }
+                    }
+                    crate::http3_stream::spawn_backend_task(
+                        params,
+                        req_rx,
+                        resp_tx,
+                        self.notify.clone(),
+                    );
+                    self.proxy_streams.insert(stream_id, ps);
+                }
+                Decision::Buffer => {
+                    self.buffered_reqs.insert(
+                        stream_id,
+                        BufferedReq {
+                            headers,
+                            end: !more_frames,
+                        },
+                    );
+                }
+                Decision::Handled => {
+                    self.stream_bodies.remove(&stream_id);
+                }
+            }
         }
 
-        // 部分的なレスポンスを送信
+        // --- Finished / Reset 反映 ---
+        for stream_id in finished {
+            if let Some(ps) = self.proxy_streams.get_mut(&stream_id) {
+                ps.req_eof_seen = true;
+            } else if let Some(br) = self.buffered_reqs.get_mut(&stream_id) {
+                br.end = true;
+            }
+        }
+        for stream_id in reset {
+            // ストリームを破棄（チャネル drop でバックエンドタスクも中断）。
+            self.proxy_streams.remove(&stream_id);
+            self.buffered_reqs.remove(&stream_id);
+            self.stream_bodies.remove(&stream_id);
+        }
+
+        // --- 完了したバッファ経路リクエストを処理 ---
+        let ready: Vec<u64> = self
+            .buffered_reqs
+            .iter()
+            .filter(|(_, b)| b.end)
+            .map(|(k, _)| *k)
+            .collect();
+        for stream_id in ready {
+            let br = self.buffered_reqs.remove(&stream_id).unwrap();
+            let body = self
+                .stream_bodies
+                .remove(&stream_id)
+                .map(|b| b.to_vec())
+                .unwrap_or_default();
+            self.handle_request(stream_id, &br.headers, &body).await?;
+        }
+
+        // 部分的なレスポンスを送信（非ストリーミング経路）。
         self.flush_partial_responses()?;
 
+        // ストリーミング駆動はメインループの毎イテレーション drive で行う（通知/タイムアウト時も
+        // 確実に進めるため。ここで重複呼び出ししない）。
+
         Ok(())
+    }
+
+    /// すべてのストリーミングストリームを 1 回駆動する（req pump + resp flush）。
+    ///
+    /// メインループから毎イテレーション呼ばれ、フロー制御に従って `recv_body`→req チャネル、
+    /// resp チャネル→`send_response`/`send_body` を進める。完了したストリームは除去する。
+    fn drive_proxy_streams(&mut self) {
+        let h3 = match self.h3_conn.as_mut() {
+            Some(h) => h,
+            None => return,
+        };
+        let conn = &mut self.conn;
+        let mut done: Vec<u64> = Vec::new();
+        for (&stream_id, ps) in self.proxy_streams.iter_mut() {
+            if drive_proxy_stream(h3, conn, stream_id, ps) {
+                done.push(stream_id);
+            }
+        }
+        for stream_id in done {
+            debug!("[HTTP/3] streaming proxy stream {} done", stream_id);
+            self.proxy_streams.remove(&stream_id);
+        }
+    }
+
+    /// リクエストをストリーミング適格・バッファ・即時応答済みに分類する（F-32）。
+    ///
+    /// ストリーミング適格条件: **Proxy バックエンド + バッファリング非 Full + 非 gRPC +
+    /// WASM モジュール非適用 + 平文バックエンド（TLS 以外）+ セキュリティ許可**。
+    /// セキュリティ拒否は（大容量アップロードを溜め込まないよう）**即時に拒否応答**して
+    /// `Handled` を返す。それ以外の非適格（メトリクス・非 Proxy・404・gRPC・full・wasm・
+    /// TLS・サーバ選択失敗）は `Buffer` を返し、既存の `handle_request` が処理する。
+    fn classify(&mut self, stream_id: u64, headers: &[h3::Header], more_frames: bool) -> Decision {
+        // --- 疑似ヘッダ + 必要ヘッダを抽出 ---
+        let mut method: Option<&[u8]> = None;
+        let mut path: Option<&[u8]> = None;
+        let mut authority: &[u8] = b"";
+        let mut content_length: usize = 0;
+        let mut accept_encoding: Option<&[u8]> = None;
+        let mut user_agent: &[u8] = b"";
+        for h in headers {
+            let name = h.name();
+            if name == b":method" {
+                method = Some(h.value());
+            } else if name == b":path" {
+                path = Some(h.value());
+            } else if name == b":authority" {
+                authority = h.value();
+            } else if name.eq_ignore_ascii_case(b"content-length") {
+                if let Ok(s) = std::str::from_utf8(h.value()) {
+                    content_length = s.trim().parse().unwrap_or(0);
+                }
+            } else if name.eq_ignore_ascii_case(b"accept-encoding") {
+                accept_encoding = Some(h.value());
+            } else if name.eq_ignore_ascii_case(b"user-agent") {
+                user_agent = h.value();
+            }
+        }
+        let method = method.unwrap_or(b"GET");
+        let path = path.unwrap_or(b"/");
+
+        let config = CURRENT_CONFIG.load();
+
+        // メトリクスエンドポイントはバッファ経路（handle_request が配信、GET・ボディなし）。
+        {
+            let prom = &config.prometheus_config;
+            if prom.enabled {
+                if let Ok(p) = std::str::from_utf8(path) {
+                    let p2 = p.split('?').next().unwrap_or(p);
+                    if p2 == prom.path {
+                        return Decision::Buffer;
+                    }
+                }
+            }
+        }
+
+        // --- ルーティング ---
+        let headers_raw: Vec<(&[u8], &[u8])> = headers
+            .iter()
+            .filter(|h| !h.name().starts_with(b":"))
+            .map(|h| (h.name(), h.value()))
+            .collect();
+        let query_start = path.iter().position(|&b| b == b'?');
+        let raw_query: &[u8] = query_start.map(|i| &path[i + 1..]).unwrap_or(b"");
+        let path_wo_query = query_start.map(|i| &path[..i]).unwrap_or(path);
+
+        let backend_result = find_backend_unified(
+            authority,
+            path_wo_query,
+            method,
+            &headers_raw,
+            raw_query,
+            &self.peer_addr,
+            config.route.as_slice(),
+            &config.upstream_groups,
+        )
+        .or_else(|| {
+            if !authority.is_empty() {
+                find_backend_unified(
+                    b"",
+                    path_wo_query,
+                    method,
+                    &headers_raw,
+                    raw_query,
+                    &self.peer_addr,
+                    config.route.as_slice(),
+                    &config.upstream_groups,
+                )
+            } else {
+                None
+            }
+        });
+
+        let (prefix, backend) = match backend_result {
+            Some(b) => b,
+            None => return Decision::Buffer, // handle_request -> 404（gRPC 含む）
+        };
+
+        // Proxy バックエンドのみストリーミング対象。
+        let (upstream_group, path_compression, buffering, _modules) = match &backend {
+            Backend::Proxy(ug, _sec, comp, buf, _cache, mods) => {
+                (ug.clone(), comp.clone(), buf.clone(), mods.clone())
+            }
+            _ => return Decision::Buffer,
+        };
+
+        // バッファリング full は全バッファ経路。
+        if buffering.mode == crate::buffering::BufferingMode::Full {
+            return Decision::Buffer;
+        }
+        // WASM モジュール適用ありはボディ全体が必要 → バッファ経路。
+        #[cfg(feature = "wasm")]
+        if _modules.as_deref().map(|m| !m.is_empty()).unwrap_or(false) {
+            return Decision::Buffer;
+        }
+        // gRPC（トレーラー）はバッファ経路。
+        #[cfg(feature = "grpc")]
+        if Self::is_grpc_request(headers) {
+            return Decision::Buffer;
+        }
+
+        // セキュリティチェック（ストリーミング適格は早期拒否でアップロードを溜めない）。
+        let security = backend.security();
+        let check = check_security(security, &self.client_ip, method, content_length, false);
+        if check != SecurityCheckResult::Allowed {
+            let status = check.status_code();
+            let msg = check.message();
+            let _ = self.send_error_response(stream_id, status, msg);
+            log_access(
+                method,
+                authority,
+                path,
+                user_agent,
+                content_length as u64,
+                status,
+                msg.len() as u64,
+                Instant::now(),
+                &self.client_ip,
+                "",
+            );
+            return Decision::Handled;
+        }
+
+        // サーバ選択。
+        let server = match upstream_group.select(&self.client_ip) {
+            Some(s) => s.clone(),
+            None => return Decision::Buffer, // handle_request -> 502
+        };
+
+        // TLS バックエンドのストリーミングは未対応 → バッファ経路（既存のブロッキング TLS 経路）。
+        if server.target.use_tls {
+            return Decision::Buffer;
+        }
+
+        // --- リクエスト head 構築 ---
+        let client_encoding = accept_encoding
+            .map(AcceptedEncoding::parse)
+            .unwrap_or(AcceptedEncoding::Identity);
+        let compression = resolve_http3_compression_config(&path_compression, &config.http3_config);
+        let final_path = compute_backend_path(&server.target, path, &prefix);
+        let request_head =
+            build_h1_request_head(&server.target, method, &final_path, headers, more_frames);
+
+        Decision::Stream(crate::http3_stream::BackendTaskParams {
+            server,
+            request_head,
+            has_request_body: more_frames,
+            compression,
+            client_encoding,
+            timeout_secs: 30,
+            max_request_body: security.max_request_body_size as u64,
+        })
     }
 
     /// HTTP/3 リクエストを処理（完全版）
@@ -1437,6 +1813,440 @@ impl Http3Handler {
 }
 
 // ====================
+// F-32: ストリーミング用フリー関数（リクエスト head 構築・パス計算・ストリーム駆動）
+// ====================
+
+/// プレフィックス除去 + `path_prefix` 連結でバックエンドへ送るパスを構築する。
+/// `handle_proxy` と同一ロジック（挙動を一致させるため共有）。
+fn compute_backend_path(target: &ProxyTarget, req_path: &[u8], prefix: &[u8]) -> String {
+    let path_str = std::str::from_utf8(req_path).unwrap_or("/");
+    let sub_path = if prefix.is_empty() {
+        path_str.to_string()
+    } else {
+        let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
+        if path_str.starts_with(prefix_str) {
+            let remaining = &path_str[prefix_str.len()..];
+            let base = target.path_prefix.trim_end_matches('/');
+            if remaining.is_empty() {
+                if base.is_empty() {
+                    "/".to_string()
+                } else {
+                    format!("{}/", base)
+                }
+            } else if remaining.starts_with('/') {
+                if base.is_empty() {
+                    remaining.to_string()
+                } else {
+                    format!("{}{}", base, remaining)
+                }
+            } else if base.is_empty() {
+                format!("/{}", remaining)
+            } else {
+                format!("{}/{}", base, remaining)
+            }
+        } else {
+            path_str.to_string()
+        }
+    };
+    if sub_path.is_empty() {
+        "/".to_string()
+    } else {
+        sub_path
+    }
+}
+
+/// HTTP/1.1 リクエスト head（リクエストライン + ヘッダ + 空行、ボディなし）を構築する。
+///
+/// ストリーミングではボディ長が不定のため、ボディありの場合は `Transfer-Encoding: chunked`
+/// を付与する（バックエンドへは chunked 逐次転送）。`Connection: close` で 1 リクエスト 1 接続。
+fn build_h1_request_head(
+    target: &ProxyTarget,
+    method: &[u8],
+    final_path: &str,
+    headers: &[h3::Header],
+    chunked_body: bool,
+) -> Vec<u8> {
+    let mut req = Vec::with_capacity(512);
+    req.extend_from_slice(method);
+    req.push(b' ');
+    req.extend_from_slice(final_path.as_bytes());
+    req.extend_from_slice(b" HTTP/1.1\r\nHost: ");
+    req.extend_from_slice(target.host.as_bytes());
+    if !target.is_default_port() {
+        req.push(b':');
+        let mut port_buf = itoa::Buffer::new();
+        req.extend_from_slice(port_buf.format(target.port).as_bytes());
+    }
+    req.extend_from_slice(b"\r\n");
+
+    for header in headers {
+        let name = header.name();
+        if name.starts_with(b":")
+            || name.eq_ignore_ascii_case(b"connection")
+            || name.eq_ignore_ascii_case(b"keep-alive")
+            || name.eq_ignore_ascii_case(b"transfer-encoding")
+            || name.eq_ignore_ascii_case(b"content-length")
+        {
+            continue;
+        }
+        req.extend_from_slice(name);
+        req.extend_from_slice(b": ");
+        req.extend_from_slice(header.value());
+        req.extend_from_slice(b"\r\n");
+    }
+
+    if chunked_body {
+        req.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+    }
+    req.extend_from_slice(b"Connection: close\r\n\r\n");
+    req
+}
+
+/// 1 ストリームの駆動結果。`true` を返したら呼び出し側が `proxy_streams` から除去する。
+fn drive_proxy_stream(
+    h3: &mut h3::Connection,
+    conn: &mut quiche::Connection,
+    stream_id: u64,
+    ps: &mut ProxyStream,
+) -> bool {
+    drive_request_pump(h3, conn, stream_id, ps);
+    drive_response_flush(h3, conn, stream_id, ps);
+    // 完了条件: レスポンス fin 送出済み かつ リクエスト側クローズ済み。
+    ps.resp_fin_sent && ps.req_tx.is_none() && ps.req_pending.is_empty()
+}
+
+/// リクエストボディ pump: `recv_body` → req チャネル（フロー制御 + バックプレッシャ）。
+fn drive_request_pump(
+    h3: &mut h3::Connection,
+    conn: &mut quiche::Connection,
+    stream_id: u64,
+    ps: &mut ProxyStream,
+) {
+    use crate::http3_stream::TrySendError;
+    let tx = match &ps.req_tx {
+        Some(t) => t,
+        None => return,
+    };
+
+    // ボディ上限超過済みなら何もしない（応答 flush 側で 413 + リセット）。
+    if ps.req_too_large {
+        return;
+    }
+
+    // 1. 未投入ボディ（初回バッチ/溢れ分）を先に流す（ゼロコピー: clone せず move）。
+    while let Some(front) = ps.req_pending.pop_front() {
+        match tx.try_send(front) {
+            Ok(()) => {}
+            Err(TrySendError::Full(item)) => {
+                ps.req_pending.push_front(item); // バックプレッシャ: recv_body も止める。
+                return;
+            }
+            Err(TrySendError::Closed(_)) => {
+                ps.req_pending.clear();
+                ps.req_tx = None;
+                return;
+            }
+        }
+    }
+
+    // 2. quiche から recv_body してチャネルへ（容量がある間だけ = バックプレッシャ）。
+    if ps.req_readable {
+        loop {
+            if tx.is_full() {
+                return; // データを quiche に残す → フロー制御でクライアント送信が止まる。
+            }
+            let mut buf = BytesMut::with_capacity(REQ_RECV_CHUNK);
+            let spare = buf.spare_capacity_mut();
+            // SAFETY: recv_body は read バイトのみ初期化。advance_mut で len に反映。
+            let spare_u8 = unsafe {
+                std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len())
+            };
+            match h3.recv_body(conn, stream_id, spare_u8) {
+                Ok(n) if n > 0 => {
+                    unsafe { buf.advance_mut(n) };
+                    ps.req_bytes_total += n as u64;
+                    // ボディ上限チェック（0 = 無制限）。
+                    if ps.max_request_body > 0 && ps.req_bytes_total > ps.max_request_body {
+                        ps.req_too_large = true;
+                        ps.req_tx = None; // バックエンドタスクを中断。
+                        ps.req_pending.clear();
+                        // クライアントの送信を止める。
+                        let _ = conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0);
+                        return;
+                    }
+                    match tx.try_send(buf.freeze()) {
+                        Ok(()) => continue,
+                        Err(TrySendError::Full(b)) => {
+                            ps.req_pending.push_back(b);
+                            return;
+                        }
+                        Err(TrySendError::Closed(_)) => {
+                            ps.req_tx = None;
+                            return;
+                        }
+                    }
+                }
+                Ok(_) | Err(h3::Error::Done) => {
+                    ps.req_readable = false;
+                    break;
+                }
+                Err(e) => {
+                    debug!("[HTTP/3] recv_body (stream) error: {}", e);
+                    ps.req_readable = false;
+                    break;
+                }
+            }
+        }
+    }
+
+    // 3. クライアント END_STREAM 受信かつ全消化なら送信端を閉じて EOF 伝播。
+    if ps.req_eof_seen && ps.req_pending.is_empty() && !ps.req_readable {
+        ps.req_tx = None;
+    }
+}
+
+/// レスポンス flush: resp チャネル → `send_response`/`send_body`（フロー制御 + 部分送信保持）。
+fn drive_response_flush(
+    h3: &mut h3::Connection,
+    conn: &mut quiche::Connection,
+    stream_id: u64,
+    ps: &mut ProxyStream,
+) {
+    use crate::http3_stream::{RespMsg, TryRecv};
+
+    if ps.resp_fin_sent {
+        return;
+    }
+
+    // ボディ上限超過 → 413 を返して終了（応答未開始時のみ）。
+    if ps.req_too_large && !ps.resp_started {
+        send_simple_h3_error(h3, conn, stream_id, 413);
+        ps.resp_fin_sent = true;
+        return;
+    }
+
+    // 0. 保留中の fin を再送。
+    if ps.need_fin {
+        if try_send_h3_fin(h3, conn, stream_id) {
+            ps.resp_fin_sent = true;
+            ps.need_fin = false;
+        }
+        return;
+    }
+
+    // 1. StreamBlocked で保留した head を再送。
+    if let Some((status, headers)) = ps.head_pending.take() {
+        match send_h3_head(h3, conn, stream_id, status, &headers) {
+            HeadSend::Sent => ps.resp_started = true,
+            HeadSend::Blocked => {
+                ps.head_pending = Some((status, headers));
+                return;
+            }
+            HeadSend::Error => {
+                ps.resp_fin_sent = true;
+                return;
+            }
+        }
+    }
+
+    // 2. 部分送信のボディ断片を flush。
+    if let Some((buf, off)) = ps.body_pending.take() {
+        match send_h3_body(h3, conn, stream_id, &buf, off) {
+            BodySend::Done => {}
+            BodySend::Partial(new_off) => {
+                ps.body_pending = Some((buf, new_off));
+                return;
+            }
+            BodySend::Blocked => {
+                ps.body_pending = Some((buf, off));
+                return;
+            }
+            BodySend::Error => {
+                ps.resp_fin_sent = true;
+                return;
+            }
+        }
+    }
+
+    // 3. チャネルを排出して送出。
+    loop {
+        if ps.head_pending.is_some() || ps.body_pending.is_some() {
+            return;
+        }
+        match ps.resp_rx.try_recv() {
+            TryRecv::Item(RespMsg::Head { status, headers }) => {
+                match send_h3_head(h3, conn, stream_id, status, &headers) {
+                    HeadSend::Sent => ps.resp_started = true,
+                    HeadSend::Blocked => {
+                        ps.head_pending = Some((status, headers));
+                        return;
+                    }
+                    HeadSend::Error => {
+                        ps.resp_fin_sent = true;
+                        return;
+                    }
+                }
+            }
+            TryRecv::Item(RespMsg::Body(b)) => match send_h3_body(h3, conn, stream_id, &b, 0) {
+                BodySend::Done => {}
+                BodySend::Partial(off) => {
+                    ps.body_pending = Some((b, off));
+                    return;
+                }
+                BodySend::Blocked => {
+                    ps.body_pending = Some((b, 0));
+                    return;
+                }
+                BodySend::Error => {
+                    ps.resp_fin_sent = true;
+                    return;
+                }
+            },
+            TryRecv::Item(RespMsg::Error { status }) => {
+                if !ps.resp_started {
+                    send_simple_h3_error(h3, conn, stream_id, status);
+                } else {
+                    // 応答途中のエラー: ストリームをリセット。
+                    let _ = conn.stream_shutdown(stream_id, quiche::Shutdown::Write, 0x10c);
+                }
+                ps.resp_fin_sent = true;
+                return;
+            }
+            TryRecv::Closed => {
+                // バックエンド完了 → fin 送出。
+                if ps.resp_started {
+                    if try_send_h3_fin(h3, conn, stream_id) {
+                        ps.resp_fin_sent = true;
+                    } else {
+                        ps.need_fin = true;
+                    }
+                } else {
+                    // head を一度も生成できなかった → 502。
+                    send_simple_h3_error(h3, conn, stream_id, 502);
+                    ps.resp_fin_sent = true;
+                }
+                return;
+            }
+            TryRecv::Empty => return,
+        }
+    }
+}
+
+/// head 送出の結果。
+enum HeadSend {
+    Sent,
+    Blocked,
+    Error,
+}
+
+/// body 送出の結果。
+enum BodySend {
+    Done,
+    Partial(usize),
+    Blocked,
+    Error,
+}
+
+/// レスポンス head（`:status` + ヘッダ）を `send_response(fin=false)` で送る。
+fn send_h3_head(
+    h3: &mut h3::Connection,
+    conn: &mut quiche::Connection,
+    stream_id: u64,
+    status: u16,
+    headers: &[(Bytes, Bytes)],
+) -> HeadSend {
+    let mut status_buf = itoa::Buffer::new();
+    let status_str = status_buf.format(status);
+    let mut h3_headers: Vec<h3::Header> = Vec::with_capacity(headers.len() + 2);
+    h3_headers.push(h3::Header::new(b":status", status_str.as_bytes()));
+    h3_headers.push(h3::Header::new(b"server", b"veil/http3"));
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case(b":status") || name.eq_ignore_ascii_case(b"server") {
+            continue;
+        }
+        h3_headers.push(h3::Header::new(name, value));
+    }
+    match h3.send_response(conn, stream_id, &h3_headers, false) {
+        Ok(()) => HeadSend::Sent,
+        Err(h3::Error::StreamBlocked) => HeadSend::Blocked,
+        Err(e) => {
+            warn!("[HTTP/3] streaming send_response error: {}", e);
+            HeadSend::Error
+        }
+    }
+}
+
+/// ボディ断片を `send_body(fin=false)` で送る（`off` から）。
+fn send_h3_body(
+    h3: &mut h3::Connection,
+    conn: &mut quiche::Connection,
+    stream_id: u64,
+    buf: &[u8],
+    off: usize,
+) -> BodySend {
+    if off >= buf.len() {
+        return BodySend::Done;
+    }
+    match h3.send_body(conn, stream_id, &buf[off..], false) {
+        Ok(n) => {
+            let new_off = off + n;
+            if new_off >= buf.len() {
+                BodySend::Done
+            } else {
+                BodySend::Partial(new_off)
+            }
+        }
+        Err(h3::Error::Done) => BodySend::Blocked, // 送信バッファ/フロー制御で送れない。
+        Err(e) => {
+            warn!("[HTTP/3] streaming send_body error: {}", e);
+            BodySend::Error
+        }
+    }
+}
+
+/// 空ボディ + fin を送る。`true` で fin 送出完了、`false` でブロック（再試行）。
+fn try_send_h3_fin(h3: &mut h3::Connection, conn: &mut quiche::Connection, stream_id: u64) -> bool {
+    match h3.send_body(conn, stream_id, b"", true) {
+        Ok(_) => true,
+        Err(h3::Error::Done) => false,
+        Err(e) => {
+            debug!("[HTTP/3] streaming fin send error: {}", e);
+            true // これ以上どうにもならないため完了扱い。
+        }
+    }
+}
+
+/// 簡易エラーレスポンス（head + 小ボディ + fin）を送る。
+fn send_simple_h3_error(
+    h3: &mut h3::Connection,
+    conn: &mut quiche::Connection,
+    stream_id: u64,
+    status: u16,
+) {
+    let mut status_buf = itoa::Buffer::new();
+    let status_str = status_buf.format(status);
+    let body: &[u8] = match status {
+        413 => b"Payload Too Large",
+        502 => b"Bad Gateway",
+        504 => b"Gateway Timeout",
+        _ => b"Error",
+    };
+    let mut len_buf = itoa::Buffer::new();
+    let h3_headers = [
+        h3::Header::new(b":status", status_str.as_bytes()),
+        h3::Header::new(b"server", b"veil/http3"),
+        h3::Header::new(b"content-type", b"text/plain"),
+        h3::Header::new(b"content-length", len_buf.format(body.len()).as_bytes()),
+    ];
+    match h3.send_response(conn, stream_id, &h3_headers, false) {
+        Ok(()) => {
+            let _ = h3.send_body(conn, stream_id, body, true);
+        }
+        Err(e) => debug!("[HTTP/3] streaming error response send failed: {}", e),
+    }
+}
+
+// ====================
 // 非同期バックエンドプロキシ（monoio TcpStream 使用）
 // ====================
 
@@ -2138,6 +2948,9 @@ pub async fn run_http3_server_async(
     // コネクション管理
     let connections: ConnectionMap = Rc::new(RefCell::new(HashMap::new()));
 
+    // F-32: バックエンドタスク → メインループの起床通知（全ハンドラ/タスクで共有）。
+    let notify = crate::http3_stream::H3Notify::new();
+
     // 乱数生成器
     let rng = SystemRandom::new();
 
@@ -2215,15 +3028,20 @@ pub async fn run_http3_server_async(
                 .unwrap_or(Duration::from_millis(100))
         };
 
-        // タイムアウト付きでパケット受信（F-33: GRO 受信オフロード）
+        // パケット受信・バックエンドタスク通知・タイムアウトの 3 者を多重化（F-32 + F-33）。
         // recv_gro_async は recvmsg(2) + UDP_GRO CMSG で同一フローの複数データグラムを
         // カーネルで集約受信し、per-datagram の syscall を削減する。GRO 非対応カーネルでは
         // 単発データグラムとして安全にフォールバックする（cmsg 無し → セグメント分割なし）。
         // バッファは loop 外で再利用するため、データグラム毎の 64KB ヒープ確保を排除。
         // io_uring の新規オペコードは増やさず、EAGAIN 時は POLL_ADD（wait_readable_fd）で待機。
-        let recv_result =
-            crate::runtime::time::timeout(timeout_duration, socket.recv_gro_async(&mut recv_buf))
-                .await;
+        // F-32: バックエンドタスクがレスポンス断片を生成 or リクエストボディを消化したら
+        // notify でメインループを起こし、低遅延でストリーミングを駆動する（負け arm の
+        // recv_gro_async drop は既存 timeout と同じく cancel-safe）。
+        let recv_outcome = futures::select_biased! {
+            r = futures::FutureExt::fuse(socket.recv_gro_async(&mut recv_buf)) => RecvOutcome::Packet(r),
+            _ = futures::FutureExt::fuse(notify.wait()) => RecvOutcome::Notified,
+            _ = futures::FutureExt::fuse(crate::runtime::time::sleep(timeout_duration)) => RecvOutcome::Timeout,
+        };
 
         // タイムアウト処理（常に実行）
         {
@@ -2241,17 +3059,17 @@ pub async fn run_http3_server_async(
             }
         }
 
-        // パケット受信結果を処理（タイムアウト時も送信処理は実行する）
-        let gro_result = match recv_result {
-            Ok(Ok(r)) => Some(r),
-            Ok(Err(e)) => {
+        // パケット受信結果を処理（通知/タイムアウト時も以降の drive + 送信処理は実行する）
+        let gro_result = match recv_outcome {
+            RecvOutcome::Packet(Ok(r)) => Some(r),
+            RecvOutcome::Packet(Err(e)) => {
                 if e.kind() != io::ErrorKind::WouldBlock {
                     error!("[HTTP/3] recv_gro error: {}", e);
                 }
                 None
             }
-            // タイムアウト - パケット受信なし、送信処理は続行
-            Err(_) => None,
+            // 通知 or タイムアウト - パケット受信なし、drive + 送信処理は続行
+            RecvOutcome::Notified | RecvOutcome::Timeout => None,
         };
 
         // パケットを受信した場合のみ処理
@@ -2312,7 +3130,7 @@ pub async fn run_http3_server_async(
                         debug!("[HTTP/3] New connection from {}", from);
 
                         // 最新のルーティング設定を取得
-                        let handler = Http3Handler::new(conn, from);
+                        let handler = Http3Handler::new(conn, from, notify.clone());
                         conns.insert(scid.clone(), handler);
 
                         scid
@@ -2371,6 +3189,18 @@ pub async fn run_http3_server_async(
                             warn!("[HTTP/3] process_h3_events error: {}", e);
                         }
                     }
+                }
+            }
+        }
+
+        // F-32: 全ハンドラのストリーミングストリームを駆動（パケット無し = 通知/タイムアウト時も）。
+        // バックエンドタスクが生成したレスポンス断片を send_body、recv_body したリクエストボディを
+        // チャネルへ流す。フロー制御でブロックした分は次イテレーションで再試行される。
+        {
+            let mut conns = connections.borrow_mut();
+            for (_, handler) in conns.iter_mut() {
+                if handler.h3_conn.is_some() {
+                    handler.drive_proxy_streams();
                 }
             }
         }

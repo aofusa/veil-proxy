@@ -182,6 +182,12 @@ impl<T> Sender<T> {
         Ok(())
     }
 
+    /// キューが容量上限に達しているか（バックプレッシャ判定）。
+    pub(crate) fn is_full(&self) -> bool {
+        let s = self.sh.borrow();
+        s.queue.len() >= s.cap
+    }
+
     /// 容量が空くまで待ってから送信する。受信端が閉じていれば `Err(())`。
     pub(crate) async fn send(&self, item: T) -> Result<(), ()> {
         let mut item = Some(item);
@@ -320,6 +326,8 @@ pub(crate) struct BackendTaskParams {
     pub client_encoding: AcceptedEncoding,
     /// 接続/読み取りタイムアウト秒。
     pub timeout_secs: u64,
+    /// リクエストボディ上限（0 = 無制限）。メインループ側の `ProxyStream` が強制する。
+    pub max_request_body: u64,
 }
 
 /// バックエンドストリーミングタスクを起動する。
@@ -399,20 +407,16 @@ async fn run_backend_task(
 
     // --- リクエストボディ（chunked 逐次転送） ---
     if has_request_body {
-        loop {
-            match req_body_rx.recv().await {
-                Some(chunk) => {
-                    // クライアント → プロキシ → バックエンドのバックプレッシャ:
-                    // 書き込み完了まで次フレームを読まない。
-                    if let Err(e) = send_backend_chunk(&backend, chunk).await {
-                        warn!("[HTTP/3] streaming backend body write error: {}", e);
-                        return Err(502);
-                    }
-                    // 1 フレーム消化したのでメインループへ「pump 再開可」通知。
-                    notify.notify();
-                }
-                None => break, // クライアント側 END_STREAM（送信端 drop / 明示クローズ）。
+        // クライアント側 END_STREAM（送信端 drop / 明示クローズ）まで逐次転送。
+        while let Some(chunk) = req_body_rx.recv().await {
+            // クライアント → プロキシ → バックエンドのバックプレッシャ:
+            // 書き込み完了まで次フレームを読まない。
+            if let Err(e) = send_backend_chunk(&backend, chunk).await {
+                warn!("[HTTP/3] streaming backend body write error: {}", e);
+                return Err(502);
             }
+            // 1 フレーム消化したのでメインループへ「pump 再開可」通知。
+            notify.notify();
         }
         // 終端チャンク。
         if let Err(e) = write_all(&backend, Bytes::from_static(b"0\r\n\r\n")).await {
