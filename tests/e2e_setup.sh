@@ -41,6 +41,7 @@ BACKEND_H2C_PORT=9003
 BACKEND_GRPC_PORT=9004
 BACKEND_WS_PORT=9005
 BACKEND_ERROR_PORT=9006
+BACKEND_CHUNKED_PORT=9007
 
 # 色付き出力
 RED='\033[0;31m'
@@ -502,6 +503,24 @@ url = "http://127.0.0.1:${BACKEND_H2C_PORT}"
 use_h2c = true
 [route.security]
 add_response_headers = { "X-Proxied-By" = "veil", "X-H2C-Test" = "true" }
+
+# chunked ストリーミングテスト用ルート (F-32: HTTP/2 chunked レスポンスストリーミング)
+# Transfer-Encoding: chunked のバックエンドを HTTP/2 DATA フレームへ逐次転送する経路を検証
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/chunked-stream/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:${BACKEND_CHUNKED_PORT}"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/chunked-stream/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:${BACKEND_CHUNKED_PORT}"
 
 # タイムアウトテスト用ルート (存在しないポートへ転送)
 [[route]]
@@ -983,20 +1002,20 @@ start_servers() {
     echo $! >> "$PIDS_FILE"
     log_info "gRPC Echo Backend started on port ${BACKEND_GRPC_PORT} (PID: $!, logs: /tmp/grpc_server.log)"
 
-    # テストバックエンド起動（WebSocket Echo + HTTP 500エラー）
+    # テストバックエンド起動（WebSocket Echo + HTTP 500エラー + chunked ストリーミング）
     # Rustバイナリ: tests/test_backends/
-    log_info "Building and starting Rust test backends (WS echo + HTTP error)..."
+    log_info "Building and starting Rust test backends (WS echo + HTTP error + chunked)..."
     (cd "${SCRIPT_DIR}/test_backends" && cargo build --quiet)
-    WS_PORT="${BACKEND_WS_PORT}" ERROR_PORT="${BACKEND_ERROR_PORT}" \
+    WS_PORT="${BACKEND_WS_PORT}" ERROR_PORT="${BACKEND_ERROR_PORT}" CHUNKED_PORT="${BACKEND_CHUNKED_PORT}" \
         RUST_LOG=info "${SCRIPT_DIR}/test_backends/target/debug/test-backends" \
         > /tmp/test_backends.log 2>&1 &
     echo $! >> "$PIDS_FILE"
-    log_info "Test backends started (WS: ${BACKEND_WS_PORT}, error: ${BACKEND_ERROR_PORT}, PID: $!, logs: /tmp/test_backends.log)"
+    log_info "Test backends started (WS: ${BACKEND_WS_PORT}, error: ${BACKEND_ERROR_PORT}, chunked: ${BACKEND_CHUNKED_PORT}, PID: $!, logs: /tmp/test_backends.log)"
 
-    # test_backendsの起動待機（両ポートがリッスン状態になるまで）
+    # test_backendsの起動待機（全ポートがリッスン状態になるまで）
     local tb_wait=0
     while [ $tb_wait -lt 30 ]; do
-        if check_port_in_use "$BACKEND_WS_PORT" && check_port_in_use "$BACKEND_ERROR_PORT"; then
+        if check_port_in_use "$BACKEND_WS_PORT" && check_port_in_use "$BACKEND_ERROR_PORT" && check_port_in_use "$BACKEND_CHUNKED_PORT"; then
             sleep 0.2
             break
         fi

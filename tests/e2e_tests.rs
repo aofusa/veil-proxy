@@ -1462,6 +1462,72 @@ async fn test_http2_stream_multiplexing() {
     }
 }
 
+/// F-32 第2フェーズ: HTTP/2 chunked レスポンスストリーミングの E2E 検証。
+///
+/// バックエンド（test-backends の chunked サーバー, port 9007）が
+/// `Transfer-Encoding: chunked` で 200,000 バイト（HTTP/2 初期フロー制御ウィンドウ
+/// 65,535 を大きく超える）の決定論的ボディ（`body[i] = i % 256`）を返す。
+/// プロキシは新しいストリーミング経路 `stream_h2_response_body_chunked` で、
+/// `ChunkedDecoder::next_data_span` により**全バッファリングせず** DATA フレームへ
+/// 逐次転送し、フロー制御（WINDOW_UPDATE 待ち）でバックプレッシャをかける。
+///
+/// 実 HTTP/2 クライアント（h2 クレート）が全 DATA を**バイト単位まで正確に**再構成
+/// できることを確認する。これはチャンクデコード・ストリーミング転送・終端 END_STREAM・
+/// フロー制御バックプレッシャがすべて正しく協調することの End-to-End な保証になる。
+#[tokio::test]
+#[ntest::timeout(30000)]
+#[cfg(feature = "http2")]
+async fn test_http2_chunked_response_streaming() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    // test-backends/src/main.rs の chunked サーバー定数と一致させること
+    const EXPECTED_TOTAL: usize = 200_000;
+    let expected_byte = |i: usize| -> u8 { (i % 256) as u8 };
+
+    let mut client = match common::http2_client::Http2TestClient::new("127.0.0.1", PROXY_PORT).await
+    {
+        Ok(c) => c,
+        Err(e) => panic!("Failed to establish HTTP/2 connection to proxy: {}", e),
+    };
+
+    let (status, body) = client
+        .send_request(
+            "GET",
+            "/chunked-stream/data",
+            &[("host", "localhost")],
+            None,
+        )
+        .await
+        .expect("HTTP/2 chunked streaming request failed");
+
+    assert_eq!(status, 200, "Expected 200 OK for chunked stream");
+    assert_eq!(
+        body.len(),
+        EXPECTED_TOTAL,
+        "Streamed body length mismatch (got {}, want {})",
+        body.len(),
+        EXPECTED_TOTAL
+    );
+    // 決定論的パターンの完全一致 = ストリーミング転送中にデータ破損・並べ替え・欠落がない
+    for (i, &b) in body.iter().enumerate() {
+        assert_eq!(
+            b,
+            expected_byte(i),
+            "Body byte mismatch at offset {} (got {}, want {})",
+            i,
+            b,
+            expected_byte(i)
+        );
+    }
+    eprintln!(
+        "HTTP/2 chunked streaming: reassembled {} bytes correctly via DATA frames",
+        body.len()
+    );
+}
+
 // ====================
 // セキュリティ機能 E2Eテスト（優先度: 中）
 // ====================
