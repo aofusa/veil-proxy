@@ -17,6 +17,9 @@
 
 set -e
 
+# Increase FD limit for parallel testing
+ulimit -n 65536 2>/dev/null || true
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 # ワークスペース構成の場合、バイナリはワークスペースルートにある

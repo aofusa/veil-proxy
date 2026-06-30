@@ -38,6 +38,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod common;
+use serial_test::serial;
 
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::ServerName;
@@ -932,6 +933,7 @@ async fn test_https_connection() {
 
 #[tokio::test]
 #[ntest::timeout(15000)]
+#[serial]
 async fn test_concurrent_requests() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -4166,7 +4168,7 @@ async fn test_least_connections_distribution() {
             }
         }
         // 接続を確立するために短い待機
-        std::thread::sleep(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     // 両方のバックエンドが使用されていることを確認
@@ -4358,7 +4360,7 @@ async fn test_rate_limiting_enforcement() {
         }
         // レート制限をトリガーするために短い間隔で送信
         if i < 19 {
-            std::thread::sleep(Duration::from_millis(100));
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
@@ -4478,7 +4480,7 @@ async fn test_cache_hit() {
     assert!(response1.is_some(), "Should receive first response");
 
     // 少し待機してから2回目のリクエスト（キャッシュヒットの可能性）
-    std::thread::sleep(Duration::from_millis(100));
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let start2 = Instant::now();
     let response2 = send_request(PROXY_PORT, "/", &[]).await;
     let elapsed2 = start2.elapsed();
@@ -6421,7 +6423,7 @@ async fn test_rate_limiting_with_config() {
         }
         // レート制限をトリガーするために短い間隔で送信（50ms間隔）
         if i < 39 {
-            std::thread::sleep(Duration::from_millis(50));
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
@@ -6671,6 +6673,7 @@ async fn test_malformed_headers() {
 
 #[tokio::test]
 #[ntest::timeout(15000)]
+#[serial]
 async fn test_concurrent_connection_stress() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -8170,7 +8173,7 @@ async fn test_health_check_interval() {
 
         // ヘルスチェック間隔を待つ（実際のテストには時間の経過が必要）
         if i < 4 {
-            std::thread::sleep(Duration::from_millis(100));
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
@@ -8309,7 +8312,7 @@ async fn test_health_check_threshold_reset_on_success() {
 
         // 成功時に失敗カウントがリセットされることを確認
         if i < 4 {
-            std::thread::sleep(Duration::from_millis(50));
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
@@ -8379,7 +8382,7 @@ async fn test_health_check_interval_accuracy() {
     let metrics1 = send_request(PROXY_PORT, "/__metrics", &[]).await;
 
     // ヘルスチェック間隔（デフォルト1秒）を待つ
-    std::thread::sleep(Duration::from_secs(2));
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let metrics2 = send_request(PROXY_PORT, "/__metrics", &[]).await;
     let elapsed = start.elapsed();
@@ -10780,7 +10783,7 @@ async fn test_connection_pool_multiple_sequential() {
         }
 
         // 短い待機時間を入れる（接続プールの動作を確認）
-        std::thread::sleep(Duration::from_millis(10));
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
     assert!(
@@ -10923,7 +10926,7 @@ async fn test_stress_rapid_requests() {
 
         // 非常に短い待機時間（ストレスをかける）
         if i % 10 == 0 {
-            std::thread::sleep(Duration::from_millis(1));
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
     }
 
@@ -10967,7 +10970,7 @@ async fn test_stress_long_duration() {
         }
 
         // 短い待機時間
-        std::thread::sleep(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     let elapsed = start.elapsed();
@@ -11062,7 +11065,7 @@ async fn test_keep_alive_timeout() {
     }
 
     // 短い待機時間の後、2回目のリクエストを送信（接続が維持されている場合）
-    std::thread::sleep(Duration::from_millis(100));
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     let request2 = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n";
     if let Err(e) = tls_stream.write_all(request2) {
@@ -11723,7 +11726,7 @@ async fn test_cache_age_header() {
     assert_eq!(status1, Some(200), "Should return 200 OK");
 
     // 短い待機時間
-    std::thread::sleep(Duration::from_millis(100));
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // 2回目のリクエスト（キャッシュヒットの可能性）
     let response2 = send_request(PROXY_PORT, "/", &[]).await;
@@ -12178,7 +12181,7 @@ async fn test_h2c_connection_reuse() {
     );
 
     // 短い待機時間後に2回目のリクエストを送信
-    std::thread::sleep(Duration::from_millis(100));
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     let response2 = send_request(PROXY_PORT, "/h2c/index.html", &[]).await;
     assert!(
@@ -12566,7 +12569,7 @@ async fn test_h2c_proxy_load_balancing() {
     for _ in 0..5 {
         let response = send_request(PROXY_PORT, "/h2c/", &[]).await;
         responses.push(response);
-        std::thread::sleep(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     // すべてのリクエストがレスポンスを受信することを確認
@@ -12862,7 +12865,7 @@ async fn test_buffering_client_write_timeout() {
     tls_stream.flush().unwrap();
 
     // タイムアウトを待つ（サーバー側のタイムアウト設定によるが、ここでは数秒待機）
-    std::thread::sleep(Duration::from_secs(6));
+    tokio::time::sleep(Duration::from_secs(6)).await;
 
     let mut response = Vec::new();
     let mut buf = [0u8; 8192];
@@ -12903,7 +12906,7 @@ async fn test_buffering_slow_client_detection() {
         if response.is_some() {
             break;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     if let Some(resp) = response {
@@ -12940,7 +12943,7 @@ async fn test_buffering_full_backend_connection_early_release() {
         if response.is_some() {
             break;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let elapsed = start.elapsed();
 
@@ -12979,7 +12982,7 @@ async fn test_buffering_streaming_backend_connection_release() {
         if response.is_some() {
             break;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let elapsed = start.elapsed();
 
@@ -13331,7 +13334,7 @@ async fn test_health_check_unhealthy_threshold_exact() {
             if response.is_some() {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(50));
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         if let Some(resp) = response {
@@ -13347,7 +13350,7 @@ async fn test_health_check_unhealthy_threshold_exact() {
         }
 
         // ヘルスチェック間隔を待つ
-        std::thread::sleep(Duration::from_millis(100));
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     // メトリクスエンドポイントから最終状態を取得
@@ -13389,7 +13392,7 @@ async fn test_health_check_healthy_threshold_exact() {
             if response.is_some() {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(50));
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         if let Some(resp) = response {
@@ -13405,7 +13408,7 @@ async fn test_health_check_healthy_threshold_exact() {
         }
 
         // ヘルスチェック間隔を待つ
-        std::thread::sleep(Duration::from_millis(100));
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     // メトリクスエンドポイントから最終状態を取得
@@ -13496,7 +13499,7 @@ async fn test_health_check_backend_slow_response() {
         if response.is_some() {
             break;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     if let Some(resp) = response {
@@ -13808,7 +13811,7 @@ async fn test_health_check_threshold_counting() {
             if response.is_some() {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(50));
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         if let Some(resp) = response {
@@ -13824,7 +13827,7 @@ async fn test_health_check_threshold_counting() {
         }
 
         // ヘルスチェック間隔を待つ
-        std::thread::sleep(Duration::from_millis(100));
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         // 中間状態のメトリクスを取得
         if i % 5 == 0 {
@@ -15221,7 +15224,7 @@ async fn test_h2c_server_multiple_connections() {
                 success_count += 1;
             }
         }
-        std::thread::sleep(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     // 複数の接続が確立されることを確認
@@ -15678,7 +15681,7 @@ async fn test_backend_rolling_update() {
         }
         // リクエスト間の待機時間を追加（並列実行時の負荷軽減）
         if i < 9 {
-            std::thread::sleep(Duration::from_millis(150));
+            tokio::time::sleep(Duration::from_millis(150)).await;
         }
     }
 
@@ -15714,7 +15717,7 @@ async fn test_health_check_gradual_degradation() {
                 success_count += 1;
             }
         }
-        std::thread::sleep(Duration::from_millis(100));
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     // サービスが継続されることを確認
@@ -15741,7 +15744,7 @@ async fn test_metrics_aggregation() {
     // 複数のリクエストを送信
     for _ in 0..5 {
         let _ = send_request(PROXY_PORT, "/", &[]).await;
-        std::thread::sleep(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     // メトリクスエンドポイントからメトリクスを取得
