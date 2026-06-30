@@ -318,6 +318,11 @@ enum RecvOutcome {
 }
 
 /// `classify` の判定結果。
+///
+/// `classify` の戻り値として生成後に即座に `match` される一時スタック値であり、コレクション
+/// へ格納しない。`Stream` の中身を `Box` 化するとリクエストごとにヒープ確保が増えゼロ
+/// アロケーション原則に反するため、サイズ差は許容する（large_enum_variant を allow）。
+#[allow(clippy::large_enum_variant)]
 enum Decision {
     /// ストリーミング適格 → バックエンドタスクを spawn。
     Stream(crate::http3_stream::BackendTaskParams),
