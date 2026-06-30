@@ -59,6 +59,7 @@ A high-performance reverse proxy server using io_uring (custom runtime) and rust
 - **CBPF Distribution**: Client IP-based load balancing with SO_REUSEPORT (Linux 4.6+)
 - **OpenFileCache**: File metadata cache to reduce system calls (canonicalize, metadata, mime_guess) - 60-67% reduction in system calls for static file serving. On cache miss, the blocking `canonicalize`/`metadata`/disk reads run on a dedicated offload thread pool (completion signaled via `eventfd` + `POLL_ADD`) so the io_uring event loop never blocks
 - **HTTP/2 Response Streaming**: For non-compressed responses, the backend body is forwarded to the HTTP/2 client as DATA frames incrementally instead of being fully buffered — both `Content-Length` and `Transfer-Encoding: chunked` responses. Chunked bodies are decoded zero-copy via a span-based decoder (sub-slices of the read buffer, no intermediate `Vec`). Each DATA frame obeys HTTP/2 flow control (connection/stream window + `WINDOW_UPDATE`), so backpressure follows the client's receive rate and RSS does not scale with payload size (OOM resistance for large downloads)
+- **HTTP/2 Request Streaming (uploads)**: For proxied uploads, the backend connection is opened as soon as the request **HEADERS** arrive (before the body finishes), and each incoming `DATA` frame is forwarded to the backend as a `Transfer-Encoding: chunked` chunk **without buffering the whole body**. The frame's owned buffer is sent zero-copy (only the chunk-size line and CRLF are small allocations); flow-control accounting (`WINDOW_UPDATE`) runs without copying into `request_body`. The proxy does not read the next frame until the backend write completes, so client→proxy→backend backpressure propagates naturally and process-heap retention is at most one frame (RSS independent of upload size). Eligible for `Proxy` backends over HTTP/1.1 (non-h2c), `buffering` mode ≠ `full`, no WASM body filter, non-gRPC; the body-size limit (`max_request_body_size`) is enforced mid-transfer (413 + `RST_STREAM`). Non-eligible requests fall back to the buffered path with no behavior change
 
 ### Operations
 - **Graceful Shutdown**: Safe termination via SIGINT/SIGTERM
@@ -2137,6 +2138,8 @@ Cache keys are generated from:
 ## Buffering Control
 
 Controls response buffering to prevent slow clients from blocking backend connections.
+
+> **Note**: The `mode` also governs **HTTP/2 request (upload) direction**. With `streaming`/`adaptive`, eligible HTTP/2 uploads stream to the backend as they arrive (see *HTTP/2 Request Streaming*); with `full`, uploads are fully buffered before forwarding.
 
 ### Features
 
