@@ -2575,7 +2575,7 @@ pub fn run_http3_server(bind_addr: SocketAddr, config: Http3ServerConfig) -> io:
 /// バイト配列を受け取り、指定されたエンコーディングで圧縮して返します。
 /// 圧縮に失敗した場合は元のデータをそのまま返します。
 #[cfg(feature = "compression")]
-fn compress_body_h3(
+pub(crate) fn compress_body_h3(
     body: &[u8],
     encoding: AcceptedEncoding,
     compression: &CompressionConfig,
@@ -2627,7 +2627,7 @@ fn compress_body_h3(
 /// compression feature 無効時のスタブ
 #[cfg(not(feature = "compression"))]
 #[inline]
-fn compress_body_h3(
+pub(crate) fn compress_body_h3(
     body: &[u8],
     _encoding: AcceptedEncoding,
     _compression: &CompressionConfig,

@@ -141,6 +141,12 @@ pub mod http2;
 #[cfg(feature = "http3")]
 pub mod http3_server;
 
+/// HTTP/3 ストリーミングプロキシ機構 (F-32: ボディ全バッファリング排除)
+/// - メインループ(QUIC/H3) ⇔ バックエンドタスク(TCP I/O) を Rc チャネル + Notify で接続
+/// - リクエスト/レスポンスボディを bytes::Bytes でゼロコピー逐次転送・双方向バックプレッシャ
+#[cfg(feature = "http3")]
+pub mod http3_stream;
+
 /// QUIC 用 UDP ソケット (GSO/GRO 対応)
 /// - sendmsg/recvmsg を使用した GSO/GRO 実装
 /// - EAGAIN 対応の非同期送受信
