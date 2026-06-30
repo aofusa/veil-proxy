@@ -700,6 +700,7 @@ async fn stream_h2_request_body_to_backend<S, B>(
     target_stream: u32,
     backend: &mut B,
     max_body_size: usize,
+    body_bytes: &mut u64,
 ) -> (ReqStreamOutcome, Vec<http2::ProcessedRequest>)
 where
     S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
@@ -707,7 +708,8 @@ where
 {
     use http2::frame::Frame;
 
-    let mut total: usize = 0;
+    // 転送した（デコード済み）ボディ総バイト数を呼び出し側へ返す（アクセスログ用）。
+    // どの分岐で return しても呼び出し側が値を読めるよう `&mut u64` で逐次更新する。
     let mut deferred: Vec<http2::ProcessedRequest> = Vec::new();
 
     loop {
@@ -733,8 +735,8 @@ where
                 {
                     return (ReqStreamOutcome::ConnError(e), deferred);
                 }
-                total = total.saturating_add(data_len);
-                if total > max_body_size {
+                *body_bytes = body_bytes.saturating_add(data_len as u64);
+                if *body_bytes > max_body_size as u64 {
                     return (ReqStreamOutcome::TooLarge, deferred);
                 }
                 if data_len > 0 {
@@ -840,11 +842,16 @@ where
         return (502, 11, 0, Vec::new());
     }
 
-    // リクエストボディを逐次転送
-    let (outcome, deferred) =
-        stream_h2_request_body_to_backend(conn, stream_id, backend, max_body_size).await;
-
-    let req_body_size = 0u64; // 後述: 正確なサイズは outcome から得られないため概算（ログ用）
+    // リクエストボディを逐次転送（転送した総バイト数を req_body_size に得る）
+    let mut req_body_size: u64 = 0;
+    let (outcome, deferred) = stream_h2_request_body_to_backend(
+        conn,
+        stream_id,
+        backend,
+        max_body_size,
+        &mut req_body_size,
+    )
+    .await;
 
     match outcome {
         ReqStreamOutcome::Complete => {
@@ -1131,6 +1138,7 @@ async fn handle_h2_request_streaming<S>(
                 &method,
                 &authority,
                 &path,
+                0,
                 502,
                 11,
                 start_instant,
@@ -1188,11 +1196,11 @@ async fn handle_h2_request_streaming<S>(
 
     // アクセスログ（status==0 は応答不要のため記録しない）
     if status != 0 {
-        let _ = req_body_size;
         log_streamed_access(
             &method,
             &authority,
             &path,
+            req_body_size,
             status,
             resp_size,
             start_instant,
@@ -1213,6 +1221,7 @@ fn log_streamed_access(
     method: &[u8],
     authority: &[u8],
     path: &[u8],
+    req_body_size: u64,
     status: u16,
     resp_size: u64,
     start_instant: Instant,
@@ -1223,7 +1232,7 @@ fn log_streamed_access(
         authority,
         path,
         &[],
-        0,
+        req_body_size,
         status,
         resp_size,
         start_instant,
