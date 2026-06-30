@@ -375,9 +375,7 @@ pub async fn get_file_info_with_config(
         .and_then(|c| c.valid_duration_secs)
         .map(Duration::from_secs)
         .unwrap_or_else(|| {
-            Duration::from_nanos(
-                OPEN_FILE_CACHE_GLOBAL_VALID_DURATION_NANOS.load(Ordering::Relaxed),
-            )
+            Duration::from_nanos(OPEN_FILE_CACHE_GLOBAL_VALID_DURATION_NANOS.load(Ordering::Relaxed))
         });
 
     let max_entries = config
@@ -442,15 +440,13 @@ mod tests {
         // HTMLファイル
         let html_path = dir.path().join("index.html");
         File::create(&html_path).unwrap();
-        let info =
-            futures::executor::block_on(get_file_cache().fetch_file_info(&html_path)).unwrap();
+        let info = futures::executor::block_on(get_file_cache().fetch_file_info(&html_path)).unwrap();
         assert!(info.mime_type.starts_with("text/html"));
 
         // CSSファイル
         let css_path = dir.path().join("style.css");
         File::create(&css_path).unwrap();
-        let info =
-            futures::executor::block_on(get_file_cache().fetch_file_info(&css_path)).unwrap();
+        let info = futures::executor::block_on(get_file_cache().fetch_file_info(&css_path)).unwrap();
         assert!(info.mime_type.starts_with("text/css"));
 
         // JavaScriptファイル
@@ -485,8 +481,7 @@ mod tests {
     #[test]
     fn test_nonexistent_file() {
         let cache = OpenFileCache::new();
-        let result =
-            futures::executor::block_on(cache.get_or_fetch(Path::new("/nonexistent/file.txt")));
+        let result = futures::executor::block_on(cache.get_or_fetch(Path::new("/nonexistent/file.txt")));
         assert!(result.is_none());
     }
 }
