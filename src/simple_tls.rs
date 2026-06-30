@@ -51,6 +51,27 @@ fn raw_write(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
     }
 }
 
+/// rustls の復号済み平文を `drained` の未初期化スペア容量へ直接読み込む（中間バッファ・
+/// リードごとのヒープ確保なし）。`received_plaintext`（rustls 既定 16KB 上限）を空に保つ。
+#[inline]
+fn drain_rustls_into<R: std::io::Read>(drained: &mut Vec<u8>, mut rd: R) {
+    loop {
+        drained.reserve(16384);
+        let start = drained.len();
+        let spare = drained.spare_capacity_mut();
+        // SAFETY: read は書き込み専用。戻り値 m バイトのみ set_len で確定し、未初期化領域は
+        // 長さに含めない。
+        let spare_u8 =
+            unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<u8>(), spare.len()) };
+        match rd.read(spare_u8) {
+            Ok(0) => break,
+            Ok(m) => unsafe { drained.set_len(start + m) },
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(_) => break,
+        }
+    }
+}
+
 // ====================
 // サーバー TLS ストリーム
 // ====================
@@ -388,11 +409,10 @@ impl crate::runtime::io::AsyncReadRent for SimpleTlsServerStream {
 
         let fd = self.inner.as_raw_fd();
         let mut read_buf = vec![0u8; 16384];
-        let mut plain = vec![0u8; 16384];
 
         loop {
-            // rustls が復号済みの平文を drained_buffer へ全量取り出す（received_plaintext
-            // 既定 16KB 上限の溢れ防止。大容量 h2/TLS アップロード対応）。
+            // rustls が復号済みの平文を drained_buffer の uninit スペアへ直書きで取り出す
+            // （received_plaintext 既定 16KB 上限の溢れ防止。大容量 h2/TLS アップロード対応）。
             {
                 let conn = match self.conn.as_mut() {
                     Some(c) => c,
@@ -406,14 +426,7 @@ impl crate::runtime::io::AsyncReadRent for SimpleTlsServerStream {
                         )
                     }
                 };
-                loop {
-                    match std::io::Read::read(&mut conn.reader(), &mut plain) {
-                        Ok(0) => break,
-                        Ok(m) => self.drained_buffer.extend_from_slice(&plain[..m]),
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                        Err(_) => break,
-                    }
-                }
+                drain_rustls_into(&mut self.drained_buffer, conn.reader());
             }
 
             if !self.drained_buffer.is_empty() {
@@ -456,14 +469,7 @@ impl crate::runtime::io::AsyncReadRent for SimpleTlsServerStream {
                         if let Err(e) = conn.process_new_packets() {
                             return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
                         }
-                        loop {
-                            match std::io::Read::read(&mut conn.reader(), &mut plain) {
-                                Ok(0) => break,
-                                Ok(m) => self.drained_buffer.extend_from_slice(&plain[..m]),
-                                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                                Err(_) => break,
-                            }
-                        }
+                        drain_rustls_into(&mut self.drained_buffer, conn.reader());
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -579,19 +585,11 @@ impl crate::runtime::io::AsyncReadRent for SimpleTlsClientStream {
 
         let fd = self.inner.as_raw_fd();
         let mut read_buf = vec![0u8; 16384];
-        let mut plain = vec![0u8; 16384];
 
         loop {
-            // rustls が復号済みの平文を drained_buffer へ全量取り出す（received_plaintext
-            // 既定 16KB 上限の溢れ防止）。
-            loop {
-                match std::io::Read::read(&mut self.conn.reader(), &mut plain) {
-                    Ok(0) => break,
-                    Ok(m) => self.drained_buffer.extend_from_slice(&plain[..m]),
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(_) => break,
-                }
-            }
+            // rustls が復号済みの平文を drained_buffer の uninit スペアへ直書きで取り出す
+            // （received_plaintext 既定 16KB 上限の溢れ防止）。
+            drain_rustls_into(&mut self.drained_buffer, self.conn.reader());
 
             if !self.drained_buffer.is_empty() {
                 let len = std::cmp::min(self.drained_buffer.len(), buf.bytes_total());
@@ -625,14 +623,7 @@ impl crate::runtime::io::AsyncReadRent for SimpleTlsClientStream {
                         if let Err(e) = self.conn.process_new_packets() {
                             return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
                         }
-                        loop {
-                            match std::io::Read::read(&mut self.conn.reader(), &mut plain) {
-                                Ok(0) => break,
-                                Ok(m) => self.drained_buffer.extend_from_slice(&plain[..m]),
-                                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                                Err(_) => break,
-                            }
-                        }
+                        drain_rustls_into(&mut self.drained_buffer, self.conn.reader());
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {

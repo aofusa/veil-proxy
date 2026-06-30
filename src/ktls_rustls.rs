@@ -218,6 +218,31 @@ fn raw_read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     }
 }
 
+/// rustls が復号済みの平文を `drained` バッファの**未初期化スペア容量へ直接読み込む**。
+///
+/// 中間バッファ（`plain` 等）を介さずゼロコピーで取り出し、リードごとのヒープ確保も避ける
+/// （`drained` の容量は接続構造体に保持され再利用される）。`received_plaintext`（rustls
+/// 既定 16KB 上限）を空に保ち、後続の生 TLS 投入での上限超過を防ぐために使う。
+/// SafeReadBuffer / quiche recv_body と同じ uninit 直書き方針。
+#[inline]
+fn drain_rustls_into<R: std::io::Read>(drained: &mut Vec<u8>, mut rd: R) {
+    loop {
+        drained.reserve(16384);
+        let start = drained.len();
+        let spare = drained.spare_capacity_mut();
+        // SAFETY: read は書き込み専用。戻り値 m バイトのみ初期化済みとして set_len で確定し、
+        // 未初期化のままの領域は長さに含めない。
+        let spare_u8 =
+            unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<u8>(), spare.len()) };
+        match rd.read(spare_u8) {
+            Ok(0) => break,
+            Ok(m) => unsafe { drained.set_len(start + m) },
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(_) => break,
+        }
+    }
+}
+
 /// libc::write のラッパー（ノンブロッキング対応）
 #[inline]
 fn raw_write(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
@@ -816,12 +841,11 @@ impl crate::runtime::io::AsyncReadRent for KtlsServerStream {
 
         let fd = self.inner.as_raw_fd();
         let mut read_buf = vec![0u8; 16384];
-        let mut plain = vec![0u8; 16384];
 
         loop {
-            // rustls が復号済みの平文を drained_buffer へ全量取り出す。
-            // これにより received_plaintext バッファ（rustls 既定 16KB 上限）が溢れず、
-            // 大容量バースト（HTTP/2 アップロード等）でも read_tls が
+            // rustls が復号済みの平文を drained_buffer へ全量取り出す（uninit スペアへ直書き、
+            // 中間バッファ無し）。これにより received_plaintext（rustls 既定 16KB 上限）が
+            // 溢れず、大容量バースト（HTTP/2 アップロード等）でも read_tls が
             // "received plaintext buffer full" を返さない（F-32 リクエストストリーミング）。
             {
                 let conn = match self.conn.as_mut() {
@@ -833,14 +857,7 @@ impl crate::runtime::io::AsyncReadRent for KtlsServerStream {
                         )
                     }
                 };
-                loop {
-                    match std::io::Read::read(&mut conn.reader(), &mut plain) {
-                        Ok(0) => break,
-                        Ok(m) => self.drained_buffer.extend_from_slice(&plain[..m]),
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                        Err(_) => break,
-                    }
-                }
+                drain_rustls_into(&mut self.drained_buffer, conn.reader());
             }
 
             // 取り出した平文をユーザーバッファへ返す
@@ -882,16 +899,9 @@ impl crate::runtime::io::AsyncReadRent for KtlsServerStream {
                         if let Err(e) = conn.process_new_packets() {
                             return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
                         }
-                        // 各 process 後に平文を drained_buffer へ退避し、received_plaintext を
-                        // 空に保つ（残りの生 TLS 投入で上限超過させないため）。
-                        loop {
-                            match std::io::Read::read(&mut conn.reader(), &mut plain) {
-                                Ok(0) => break,
-                                Ok(m) => self.drained_buffer.extend_from_slice(&plain[..m]),
-                                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                                Err(_) => break,
-                            }
-                        }
+                        // 各 process 後に平文を退避し received_plaintext を空に保つ
+                        // （残りの生 TLS 投入で上限超過させないため）。
+                        drain_rustls_into(&mut self.drained_buffer, conn.reader());
                     }
                     // ループ先頭へ戻り drained_buffer をユーザーへ返す
                 }
@@ -1011,11 +1021,10 @@ impl crate::runtime::io::AsyncReadRent for KtlsClientStream {
 
         let fd = self.inner.as_raw_fd();
         let mut read_buf = vec![0u8; 16384];
-        let mut plain = vec![0u8; 16384];
 
         loop {
-            // rustls が復号済みの平文を drained_buffer へ全量取り出す（received_plaintext
-            // 既定 16KB 上限の溢れ防止。サーバ側 read と同方針）。
+            // rustls が復号済みの平文を drained_buffer の uninit スペアへ直書きで取り出す
+            // （received_plaintext 既定 16KB 上限の溢れ防止。サーバ側 read と同方針）。
             {
                 let conn = match self.conn.as_mut() {
                     Some(c) => c,
@@ -1026,14 +1035,7 @@ impl crate::runtime::io::AsyncReadRent for KtlsClientStream {
                         )
                     }
                 };
-                loop {
-                    match std::io::Read::read(&mut conn.reader(), &mut plain) {
-                        Ok(0) => break,
-                        Ok(m) => self.drained_buffer.extend_from_slice(&plain[..m]),
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                        Err(_) => break,
-                    }
-                }
+                drain_rustls_into(&mut self.drained_buffer, conn.reader());
             }
 
             if !self.drained_buffer.is_empty() {
@@ -1073,14 +1075,7 @@ impl crate::runtime::io::AsyncReadRent for KtlsClientStream {
                         if let Err(e) = conn.process_new_packets() {
                             return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
                         }
-                        loop {
-                            match std::io::Read::read(&mut conn.reader(), &mut plain) {
-                                Ok(0) => break,
-                                Ok(m) => self.drained_buffer.extend_from_slice(&plain[..m]),
-                                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                                Err(_) => break,
-                            }
-                        }
+                        drain_rustls_into(&mut self.drained_buffer, conn.reader());
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
