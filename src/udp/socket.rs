@@ -520,7 +520,7 @@ impl QuicUdpSocket {
         msg.msg_iov = &iov as *const _ as *mut libc::iovec;
         msg.msg_iovlen = 1;
         msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-        msg.msg_controllen = cmsg_len;
+        msg.msg_controllen = cmsg_len as _;
         msg.msg_flags = 0;
 
         // sendmsg を呼び出し
@@ -593,7 +593,7 @@ impl QuicUdpSocket {
         msg.msg_iov = &mut iov;
         msg.msg_iovlen = 1;
         msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-        msg.msg_controllen = cmsg_buf.len();
+        msg.msg_controllen = cmsg_buf.len() as _;
         msg.msg_flags = 0;
 
         // recvmsg を呼び出し
@@ -786,7 +786,7 @@ fn build_gso_cmsg(buf: &mut [u8], segment_size: u16) -> io::Result<usize> {
     // cmsghdr を構築
     let cmsg = buf.as_mut_ptr() as *mut libc::cmsghdr;
     unsafe {
-        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<u16>() as u32) as usize;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<u16>() as u32) as _;
         (*cmsg).cmsg_level = libc::SOL_UDP;
         (*cmsg).cmsg_type = libc::UDP_SEGMENT;
 
