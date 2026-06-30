@@ -1528,6 +1528,97 @@ async fn test_http2_chunked_response_streaming() {
     );
 }
 
+/// F-32 第3フェーズ: HTTP/2 リクエスト方向ストリーミングの E2E。
+///
+/// 初期フロー制御ウィンドウ（65,535）を超える大容量ボディ（200,000 バイト）を POST する。
+/// h2 クライアントはフロー制御に従い複数 DATA フレームに分割して送信するため、プロキシの
+/// リクエストストリーミング経路（HEADERS 受信時にバックエンド接続を開始し、DATA を chunked で
+/// 逐次転送、WINDOW_UPDATE でバックプレッシャ）が動作する。echo バックエンドが chunked を
+/// デコードして同一ボディを返すので、**往復でバイト単位の完全一致**を確認することで、
+/// ストリーミング・chunked エンコード/デコード・終端・フロー制御の End-to-End 正当性を保証する。
+#[tokio::test]
+#[ntest::timeout(30000)]
+#[cfg(feature = "http2")]
+async fn test_http2_request_body_streaming() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    // 初期ウィンドウ（65535）を十分超えるサイズで複数 DATA フレーム + WINDOW_UPDATE を強制
+    const UPLOAD_TOTAL: usize = 200_000;
+    let upload: Vec<u8> = (0..UPLOAD_TOTAL).map(|i| (i % 256) as u8).collect();
+
+    let mut client = match common::http2_client::Http2TestClient::new("127.0.0.1", PROXY_PORT).await
+    {
+        Ok(c) => c,
+        Err(e) => panic!("Failed to establish HTTP/2 connection to proxy: {}", e),
+    };
+
+    let (status, body) = client
+        .send_request(
+            "POST",
+            "/echo-upload/data",
+            &[("host", "localhost")],
+            Some(&upload),
+        )
+        .await
+        .expect("HTTP/2 request body streaming POST failed");
+
+    assert_eq!(status, 200, "Expected 200 OK for echoed upload");
+    assert_eq!(
+        body.len(),
+        UPLOAD_TOTAL,
+        "Echoed body length mismatch (got {}, want {})",
+        body.len(),
+        UPLOAD_TOTAL
+    );
+    // 往復の完全一致 = ストリーミング転送・chunked エンコード/デコードでデータ破損・欠落がない
+    for (i, (&got, &want)) in body.iter().zip(upload.iter()).enumerate() {
+        assert_eq!(
+            got, want,
+            "Echoed body byte mismatch at offset {} (got {}, want {})",
+            i, got, want
+        );
+    }
+    eprintln!(
+        "HTTP/2 request streaming: uploaded and echoed {} bytes correctly via chunked DATA frames",
+        body.len()
+    );
+}
+
+/// F-32 第3フェーズ: 小さいリクエストボディのストリーミング（単一 DATA フレーム経路）。
+#[tokio::test]
+#[ntest::timeout(15000)]
+#[cfg(feature = "http2")]
+async fn test_http2_request_body_streaming_small() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let upload = b"hello streaming request body".to_vec();
+
+    let mut client = match common::http2_client::Http2TestClient::new("127.0.0.1", PROXY_PORT).await
+    {
+        Ok(c) => c,
+        Err(e) => panic!("Failed to establish HTTP/2 connection to proxy: {}", e),
+    };
+
+    let (status, body) = client
+        .send_request(
+            "POST",
+            "/echo-upload/small",
+            &[("host", "localhost")],
+            Some(&upload),
+        )
+        .await
+        .expect("HTTP/2 small request body streaming POST failed");
+
+    assert_eq!(status, 200, "Expected 200 OK for echoed small upload");
+    assert_eq!(body, upload, "Echoed small body mismatch");
+}
+
 // ====================
 // セキュリティ機能 E2Eテスト（優先度: 中）
 // ====================

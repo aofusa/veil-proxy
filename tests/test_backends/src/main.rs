@@ -172,6 +172,124 @@ async fn handle_chunked(mut stream: TcpStream) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
+/// ボディエコーサーバー（F-32: HTTP/2 リクエスト方向ストリーミング検証用）
+///
+/// リクエストボディ（`Transfer-Encoding: chunked` または `Content-Length`）を読み取り、
+/// そのままレスポンスボディとして返す。プロキシのリクエストストリーミング経路は
+/// chunked でバックエンドへ転送するため、chunked のデコードを正しく行えること、
+/// および大容量ボディがバイト単位で完全一致で届くことを検証できる。
+async fn run_echo_server(addr: SocketAddr) {
+    let listener = TcpListener::bind(addr)
+        .await
+        .unwrap_or_else(|e| panic!("Failed to bind echo server on {}: {}", addr, e));
+    info!("HTTP body-echo server listening on {}", addr);
+
+    loop {
+        match listener.accept().await {
+            Ok((stream, peer)) => {
+                debug!("New echo HTTP connection from {}", peer);
+                tokio::spawn(async move {
+                    if let Err(e) = handle_echo(stream).await {
+                        debug!("Echo handler error: {}", e);
+                    }
+                });
+            }
+            Err(e) => error!("Echo accept error: {}", e),
+        }
+    }
+}
+
+async fn handle_echo(mut stream: TcpStream) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // ヘッダー終端 (\r\n\r\n) まで読む（ボディの先頭も buf に入りうる）
+    let mut buf: Vec<u8> = Vec::with_capacity(8192);
+    let mut tmp = [0u8; 8192];
+    let header_end;
+    loop {
+        let n = stream.read(&mut tmp).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            header_end = pos + 4;
+            break;
+        }
+        if buf.len() > 1 << 20 {
+            return Ok(()); // ヘッダーが大きすぎる
+        }
+    }
+
+    let header_str = String::from_utf8_lossy(&buf[..header_end]).to_lowercase();
+    let is_chunked = header_str.contains("transfer-encoding: chunked");
+    let content_length: Option<usize> = header_str
+        .split("content-length:")
+        .nth(1)
+        .and_then(|s| s.split("\r\n").next())
+        .and_then(|s| s.trim().parse().ok());
+
+    // ボディを読み取り、デコードして echo 用バッファへ
+    let mut body: Vec<u8> = Vec::new();
+    let mut rest = buf[header_end..].to_vec();
+
+    if is_chunked {
+        // chunked デコード（rest を起点に必要に応じて読み足す）
+        let mut pos = 0usize;
+        'outer: loop {
+            // チャンクサイズ行を読む
+            let size_line_end = loop {
+                if let Some(p) = rest[pos..].windows(2).position(|w| w == b"\r\n") {
+                    break pos + p;
+                }
+                let n = stream.read(&mut tmp).await?;
+                if n == 0 {
+                    break 'outer;
+                }
+                rest.extend_from_slice(&tmp[..n]);
+            };
+            let size_hex = String::from_utf8_lossy(&rest[pos..size_line_end]);
+            let chunk_size = usize::from_str_radix(size_hex.trim(), 16).unwrap_or(0);
+            pos = size_line_end + 2; // skip CRLF
+            if chunk_size == 0 {
+                break; // 終端チャンク
+            }
+            // チャンクデータ + 末尾 CRLF を確保
+            while rest.len() < pos + chunk_size + 2 {
+                let n = stream.read(&mut tmp).await?;
+                if n == 0 {
+                    break 'outer;
+                }
+                rest.extend_from_slice(&tmp[..n]);
+            }
+            body.extend_from_slice(&rest[pos..pos + chunk_size]);
+            pos += chunk_size + 2; // skip data + CRLF
+        }
+    } else if let Some(len) = content_length {
+        body.extend_from_slice(&rest);
+        while body.len() < len {
+            let n = stream.read(&mut tmp).await?;
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&tmp[..n]);
+        }
+        body.truncate(len);
+    } else {
+        // ボディ無し
+        body.extend_from_slice(&rest);
+    }
+
+    // echo レスポンス
+    let mut out: Vec<u8> = Vec::with_capacity(body.len() + 128);
+    out.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: ");
+    out.extend_from_slice(body.len().to_string().as_bytes());
+    out.extend_from_slice(b"\r\nConnection: close\r\n\r\n");
+    out.extend_from_slice(&body);
+
+    stream.write_all(&out).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -194,19 +312,25 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(9007);
+    let echo_port: u16 = std::env::var("ECHO_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9008);
 
     let ws_addr: SocketAddr = format!("127.0.0.1:{}", ws_port).parse().unwrap();
     let error_addr: SocketAddr = format!("127.0.0.1:{}", error_port).parse().unwrap();
     let chunked_addr: SocketAddr = format!("127.0.0.1:{}", chunked_port).parse().unwrap();
+    let echo_addr: SocketAddr = format!("127.0.0.1:{}", echo_port).parse().unwrap();
 
     info!(
-        "Starting test-backends: WS={}, HTTP-error={}, chunked={}",
-        ws_addr, error_addr, chunked_addr
+        "Starting test-backends: WS={}, HTTP-error={}, chunked={}, echo={}",
+        ws_addr, error_addr, chunked_addr, echo_addr
     );
 
     tokio::join!(
         run_ws_echo_server(ws_addr),
         run_http_error_server(error_addr),
         run_chunked_server(chunked_addr),
+        run_echo_server(echo_addr),
     );
 }

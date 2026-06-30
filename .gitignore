@@ -26,3 +26,6 @@ tests/wasm/*.wasm
 
 # WASM AOT サイドカーキャッシュ（F-36、起動時に <module>.wasm から自動生成される成果物）
 *.cwasm
+
+# Claude Code worktrees/local state
+.claude/

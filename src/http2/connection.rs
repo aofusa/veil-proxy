@@ -1078,6 +1078,54 @@ where
         }
     }
 
+    /// ストリーミング転送用の DATA 受信処理（F-32 リクエスト方向ストリーミング）
+    ///
+    /// 通常の DATA 処理（`process_frame` → `handle_data`）と同等のフロー制御・
+    /// WINDOW_UPDATE・状態遷移・content-length 検証を行うが、受信データを
+    /// `Stream::request_body` へ**バッファしない**。呼び出し側（proxy）は受信した DATA
+    /// フレームの所有バッファをそのままゼロコピーでバックエンドへ転送できる。
+    ///
+    /// `data_len` には受信した DATA ペイロード長を渡す。`process_frame` の DATA アーム
+    /// と同じ事前検証（ヘッダーブロック受信中でないこと・idle ストリームでないこと）を行う。
+    pub async fn recv_data_for_streaming(
+        &mut self,
+        stream_id: u32,
+        end_stream: bool,
+        data_len: usize,
+    ) -> Http2Result<()> {
+        // RFC 7540 §4.3: ヘッダーブロック受信中は CONTINUATION 以外を受け付けない
+        if self.streams.receiving_headers_stream().is_some() {
+            return Err(Http2Error::connection_error(
+                Http2ErrorCode::ProtocolError,
+                "Expected CONTINUATION frame during header block",
+            ));
+        }
+        // RFC 7540 §5.1: idle ストリームへの DATA は接続エラー
+        self.validate_stream_not_idle(stream_id, "DATA")?;
+
+        // コネクションレベルフロー制御
+        let dl = data_len as i32;
+        if dl > self.conn_recv_window {
+            return Err(Http2Error::connection_error(
+                Http2ErrorCode::FlowControlError,
+                "Connection flow control window exceeded",
+            ));
+        }
+        self.conn_recv_window -= dl;
+
+        // ストリームレベル: アカウンティング（バッファリングなし）
+        let stream = self.streams.get(stream_id).ok_or_else(|| {
+            Http2Error::stream_error(stream_id, Http2ErrorCode::StreamClosed, "Stream not found")
+        })?;
+        stream.update_activity();
+        stream.recv_data_accounting(data_len, end_stream)?;
+
+        // WINDOW_UPDATE を送信 (必要に応じて)
+        self.maybe_send_window_update(stream_id).await?;
+
+        Ok(())
+    }
+
     /// WINDOW_UPDATE を送信 (必要に応じて)
     async fn maybe_send_window_update(&mut self, stream_id: u32) -> Http2Result<()> {
         // コネクションレベル

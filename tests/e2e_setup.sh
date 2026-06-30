@@ -42,6 +42,7 @@ BACKEND_GRPC_PORT=9004
 BACKEND_WS_PORT=9005
 BACKEND_ERROR_PORT=9006
 BACKEND_CHUNKED_PORT=9007
+BACKEND_ECHO_PORT=9008
 
 # 色付き出力
 RED='\033[0;31m'
@@ -521,6 +522,24 @@ path = "/chunked-stream/*"
 [route.action]
 type = "Proxy"
 url = "http://127.0.0.1:${BACKEND_CHUNKED_PORT}"
+
+# ボディエコー用ルート (F-32: HTTP/2 リクエスト方向ストリーミング)
+# リクエストボディを chunked でバックエンドへ逐次転送する経路を検証（echo で往復一致確認）
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/echo-upload/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:${BACKEND_ECHO_PORT}"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/echo-upload/*"
+[route.action]
+type = "Proxy"
+url = "http://127.0.0.1:${BACKEND_ECHO_PORT}"
 
 # タイムアウトテスト用ルート (存在しないポートへ転送)
 [[route]]
@@ -1004,18 +1023,18 @@ start_servers() {
 
     # テストバックエンド起動（WebSocket Echo + HTTP 500エラー + chunked ストリーミング）
     # Rustバイナリ: tests/test_backends/
-    log_info "Building and starting Rust test backends (WS echo + HTTP error + chunked)..."
+    log_info "Building and starting Rust test backends (WS echo + HTTP error + chunked + body-echo)..."
     (cd "${SCRIPT_DIR}/test_backends" && cargo build --quiet)
-    WS_PORT="${BACKEND_WS_PORT}" ERROR_PORT="${BACKEND_ERROR_PORT}" CHUNKED_PORT="${BACKEND_CHUNKED_PORT}" \
+    WS_PORT="${BACKEND_WS_PORT}" ERROR_PORT="${BACKEND_ERROR_PORT}" CHUNKED_PORT="${BACKEND_CHUNKED_PORT}" ECHO_PORT="${BACKEND_ECHO_PORT}" \
         RUST_LOG=info "${SCRIPT_DIR}/test_backends/target/debug/test-backends" \
         > /tmp/test_backends.log 2>&1 &
     echo $! >> "$PIDS_FILE"
-    log_info "Test backends started (WS: ${BACKEND_WS_PORT}, error: ${BACKEND_ERROR_PORT}, chunked: ${BACKEND_CHUNKED_PORT}, PID: $!, logs: /tmp/test_backends.log)"
+    log_info "Test backends started (WS: ${BACKEND_WS_PORT}, error: ${BACKEND_ERROR_PORT}, chunked: ${BACKEND_CHUNKED_PORT}, echo: ${BACKEND_ECHO_PORT}, PID: $!, logs: /tmp/test_backends.log)"
 
     # test_backendsの起動待機（全ポートがリッスン状態になるまで）
     local tb_wait=0
     while [ $tb_wait -lt 30 ]; do
-        if check_port_in_use "$BACKEND_WS_PORT" && check_port_in_use "$BACKEND_ERROR_PORT" && check_port_in_use "$BACKEND_CHUNKED_PORT"; then
+        if check_port_in_use "$BACKEND_WS_PORT" && check_port_in_use "$BACKEND_ERROR_PORT" && check_port_in_use "$BACKEND_CHUNKED_PORT" && check_port_in_use "$BACKEND_ECHO_PORT"; then
             sleep 0.2
             break
         fi

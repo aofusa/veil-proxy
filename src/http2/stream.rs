@@ -224,13 +224,31 @@ impl Stream {
         }
     }
 
-    /// DATA 受信
+    /// DATA 受信（`request_body` へ蓄積する従来経路）
     pub fn recv_data(&mut self, data: &[u8], end_stream: bool) -> Result<(), Http2Error> {
+        // フロー制御・受信量カウント・content-length 検証・状態遷移はアカウンティングに集約。
+        // バッファリングのみ本関数で行う（ストリーミング経路は accounting だけを使う）。
+        self.recv_data_accounting(data.len(), end_stream)?;
+        self.request_body.extend_from_slice(data);
+        Ok(())
+    }
+
+    /// DATA 受信のアカウンティングのみ（バッファリングしない、F-32 リクエスト方向ストリーミング用）
+    ///
+    /// ストリームレベルのフロー制御ウィンドウ消費・受信ボディサイズ加算・
+    /// content-length 検証（RFC 7540 §8.1.2.6）・状態遷移を行うが、`request_body` への
+    /// コピー（`extend_from_slice`）は行わない。これによりストリーミング経路では受信した
+    /// DATA フレームの所有バッファをそのままゼロコピーで下流（バックエンド）へ転送できる。
+    pub fn recv_data_accounting(
+        &mut self,
+        data_len: usize,
+        end_stream: bool,
+    ) -> Result<(), Http2Error> {
         match self.state {
             StreamState::Open | StreamState::HalfClosedLocal => {
                 // フロー制御チェック
-                let data_len = data.len() as i32;
-                if data_len > self.recv_window {
+                let dl = data_len as i32;
+                if dl > self.recv_window {
                     return Err(Http2Error::stream_error(
                         self.id,
                         Http2ErrorCode::FlowControlError,
@@ -238,9 +256,8 @@ impl Stream {
                     ));
                 }
 
-                self.recv_window -= data_len;
-                self.request_body.extend_from_slice(data);
-                self.received_body_size += data.len() as u64;
+                self.recv_window -= dl;
+                self.received_body_size += data_len as u64;
 
                 if end_stream {
                     // RFC 7540 §8.1.2.6: Content-Length validation
@@ -803,6 +820,43 @@ mod tests {
         // ウィンドウ超過
         let result = stream.recv_data(&[0u8; 100], false);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_recv_data_accounting_no_buffer() {
+        // F-32: ストリーミング経路のアカウンティングはフロー制御・状態遷移を行うが
+        // request_body へバッファしない。
+        let mut stream = Stream::new(1, 100, 100);
+        stream.recv_headers(false).unwrap();
+
+        stream.recv_data_accounting(40, false).unwrap();
+        assert_eq!(stream.recv_window, 60, "ウィンドウが消費される");
+        assert_eq!(stream.received_body_size, 40, "受信ボディサイズが加算される");
+        assert!(
+            stream.request_body.is_empty(),
+            "アカウンティングはバッファしない"
+        );
+
+        // ウィンドウ超過は拒否
+        assert!(stream.recv_data_accounting(100, false).is_err());
+
+        // end_stream で状態遷移
+        stream.recv_data_accounting(10, true).unwrap();
+        assert_eq!(stream.state, StreamState::HalfClosedRemote);
+        assert!(stream.request_body.is_empty());
+    }
+
+    #[test]
+    fn test_recv_data_accounting_content_length_validation() {
+        // content-length と実受信量の不一致は end_stream 時にエラー（RFC 7540 §8.1.2.6）
+        let mut stream = Stream::new(1, 1000, 1000);
+        stream.recv_headers(false).unwrap();
+        stream.content_length = Some(100);
+
+        stream.recv_data_accounting(50, false).unwrap();
+        // 合計 60 ≠ 宣言 100 で end_stream → エラー
+        let result = stream.recv_data_accounting(10, true);
+        assert!(result.is_err(), "content-length 不一致は拒否される");
     }
 
     #[test]

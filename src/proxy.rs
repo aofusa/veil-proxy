@@ -456,83 +456,17 @@ where
 
         // フレームを処理
         match conn.process_frame(frame).await {
+            Ok(Some(req)) if req.body_pending => {
+                // F-32: ヘッダー完了・ボディ継続。ストリーミング適格なら HEADERS 受信時点で
+                // バックエンド接続を開始し DATA フレームを逐次転送する。非適格なら何もせず、
+                // DATA は従来どおり request_body に蓄積され END_STREAM で下の分岐が処理する。
+                handle_h2_request_streaming(conn, req.stream_id, client_ip, connection_metric)
+                    .await;
+            }
             Ok(Some(req)) => {
-                // リクエストが完了 - HTTP/1.1と同様のロジックで処理
-                let stream_id = req.stream_id;
-
-                // ストリーム情報を取得
-                let (method, path, authority, body_len) = {
-                    if let Some(stream) = conn.get_stream(stream_id) {
-                        let method = stream
-                            .method()
-                            .map(|m| m.to_vec())
-                            .unwrap_or_else(|| b"GET".to_vec());
-                        let path = stream
-                            .path()
-                            .map(|p| p.to_vec())
-                            .unwrap_or_else(|| b"/".to_vec());
-                        // :authority を取得、見つからない場合は host ヘッダーにフォールバック
-                        let authority = stream
-                            .authority()
-                            .map(|a| a.to_vec())
-                            .or_else(|| {
-                                // :authority が無い場合は host ヘッダーを確認
-                                stream
-                                    .request_headers
-                                    .iter()
-                                    .find(|h| h.name.eq_ignore_ascii_case(b"host"))
-                                    .map(|h| h.value.clone())
-                            })
-                            .unwrap_or_default();
-                        let body_len = stream.request_body.len();
-                        (method, path, authority, body_len)
-                    } else {
-                        continue;
-                    }
-                };
-
-                // メトリクス: 最初のリクエストでホスト名を取得し、インクリメント
-                if let Ok(host_str) = std::str::from_utf8(&authority) {
-                    connection_metric.set_host(host_str.to_string());
-                } else {
-                    connection_metric.set_host("unknown".to_string());
-                }
-
-                // 処理時間計測開始
-                let start_instant = Instant::now();
-
-                // HTTP/2 リクエスト処理
-                let result = handle_http2_single_request(
-                    conn, stream_id, &method, &path, &authority, body_len, client_ip,
-                )
-                .await;
-
-                // User-Agentを取得
-                let user_agent: Box<[u8]> = if let Some(stream) = conn.get_stream(stream_id) {
-                    stream
-                        .request_headers
-                        .iter()
-                        .find(|h| h.name.eq_ignore_ascii_case(b"user-agent"))
-                        .map(|h| Box::from(h.value.clone()))
-                        .unwrap_or_else(|| Box::from([] as [u8; 0]))
-                } else {
-                    Box::from([] as [u8; 0])
-                };
-
-                // アクセスログ出力（log_access内でrecord_request_metricsも呼ばれるため、個別の呼び出しは不要）
-                let (status, resp_size) = result.unwrap_or((500, 0));
-                log_access(
-                    &method,
-                    &authority,
-                    &path,
-                    &user_agent,
-                    body_len as u64,
-                    status,
-                    resp_size,
-                    start_instant,
-                    client_ip,
-                    "",
-                );
+                // リクエストが完了（END_STREAM 受信済み）- HTTP/1.1 と同様のロジックで処理
+                process_completed_h2_request(conn, req.stream_id, client_ip, connection_metric)
+                    .await;
             }
             Ok(None) => {
                 // フレーム処理完了、次のフレームへ
@@ -554,6 +488,735 @@ where
     }
 
     Ok(())
+}
+
+/// HTTP/2 の完了済みリクエスト（END_STREAM 受信済み）を処理し、アクセスログを出力する。
+///
+/// 通常のバッファ経路（END_STREAM の `ProcessedRequest`）と、リクエストストリーミング中に
+/// 完了した他ストリームの遅延処理の両方から呼ばれる。
+#[cfg(feature = "http2")]
+async fn process_completed_h2_request<S>(
+    conn: &mut http2::Http2Connection<S>,
+    stream_id: u32,
+    client_ip: &str,
+    connection_metric: &mut ActiveConnectionMetric,
+) where
+    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
+{
+    // ストリーム情報を取得
+    let (method, path, authority, body_len) = {
+        if let Some(stream) = conn.get_stream(stream_id) {
+            let method = stream
+                .method()
+                .map(|m| m.to_vec())
+                .unwrap_or_else(|| b"GET".to_vec());
+            let path = stream
+                .path()
+                .map(|p| p.to_vec())
+                .unwrap_or_else(|| b"/".to_vec());
+            // :authority を取得、見つからない場合は host ヘッダーにフォールバック
+            let authority = stream
+                .authority()
+                .map(|a| a.to_vec())
+                .or_else(|| {
+                    stream
+                        .request_headers
+                        .iter()
+                        .find(|h| h.name.eq_ignore_ascii_case(b"host"))
+                        .map(|h| h.value.clone())
+                })
+                .unwrap_or_default();
+            let body_len = stream.request_body.len();
+            (method, path, authority, body_len)
+        } else {
+            return;
+        }
+    };
+
+    // メトリクス: ホスト名を取得
+    if let Ok(host_str) = std::str::from_utf8(&authority) {
+        connection_metric.set_host(host_str.to_string());
+    } else {
+        connection_metric.set_host("unknown".to_string());
+    }
+
+    let start_instant = Instant::now();
+
+    let result =
+        handle_http2_single_request(conn, stream_id, &method, &path, &authority, body_len, client_ip)
+            .await;
+
+    // User-Agent を取得
+    let user_agent: Box<[u8]> = if let Some(stream) = conn.get_stream(stream_id) {
+        stream
+            .request_headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case(b"user-agent"))
+            .map(|h| Box::from(h.value.clone()))
+            .unwrap_or_else(|| Box::from([] as [u8; 0]))
+    } else {
+        Box::from([] as [u8; 0])
+    };
+
+    let (status, resp_size) = result.unwrap_or((500, 0));
+    log_access(
+        &method,
+        &authority,
+        &path,
+        &user_agent,
+        body_len as u64,
+        status,
+        resp_size,
+        start_instant,
+        client_ip,
+        "",
+    );
+}
+
+// ====================
+// F-32: HTTP/2 リクエスト方向ストリーミング
+// ====================
+
+/// chunked transfer-encoding のチャンクサイズ行（`<hex>\r\n`）を `buf` へ追記する。
+///
+/// `format!` を使わずに 16 進エンコードする（ホットパスのアロケーション/整形回避）。
+#[cfg(feature = "http2")]
+fn push_chunk_size_line(buf: &mut Vec<u8>, mut n: usize) {
+    if n == 0 {
+        buf.push(b'0');
+    } else {
+        let mut tmp = [0u8; 16];
+        let mut i = tmp.len();
+        while n > 0 {
+            i -= 1;
+            let d = (n & 0xf) as u8;
+            tmp[i] = if d < 10 { b'0' + d } else { b'a' + (d - 10) };
+            n >>= 4;
+        }
+        buf.extend_from_slice(&tmp[i..]);
+    }
+    buf.extend_from_slice(b"\r\n");
+}
+
+/// 所有バッファ（`Bytes`）をバックエンドへ全量書き込む（部分書き込みを正しく処理）。
+///
+/// 共通の `write_all`（io.rs）は単一 `write` 前提で部分書き込み時に誤動作するため、
+/// ストリーミング経路では本ヘルパーで `write` をループ呼びする。`Bytes` は `advance` で
+/// ゼロコピーに前進できるため、再アロケーション・再コピーは発生しない。
+#[cfg(feature = "http2")]
+async fn backend_write_all_bytes<B>(backend: &mut B, mut buf: Bytes) -> io::Result<()>
+where
+    B: crate::runtime::io::AsyncWriteRent,
+{
+    use bytes::Buf;
+    while !buf.is_empty() {
+        let len = buf.len();
+        let (res, returned) = backend.write(buf).await;
+        match res {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "backend write returned 0",
+                ));
+            }
+            Ok(n) if n >= len => return Ok(()),
+            Ok(n) => {
+                let mut b = returned;
+                b.advance(n);
+                buf = b;
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                buf = returned;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// 1 つの DATA フレーム分のボディを chunked エンコードしてバックエンドへ送る。
+///
+/// チャンクサイズ行と終端 CRLF のみ小バッファを確保し、**ペイロード本体は受信フレームの
+/// 所有バッファ（`Bytes`）をそのまま書き込む（ゼロコピー）**。`writev` 未実装のため 3 回の
+/// `write` に分かれるが、ストリーミングバックエンドは Nagle 有効（nodelay 未設定）で
+/// カーネルが結合するため実パケット数は抑えられる。
+#[cfg(feature = "http2")]
+async fn send_backend_chunk<B>(backend: &mut B, data: Bytes) -> io::Result<()>
+where
+    B: crate::runtime::io::AsyncWriteRent,
+{
+    if data.is_empty() {
+        return Ok(());
+    }
+    let mut header = Vec::with_capacity(18);
+    push_chunk_size_line(&mut header, data.len());
+    backend_write_all_bytes(backend, Bytes::from(header)).await?;
+    backend_write_all_bytes(backend, data).await?;
+    backend_write_all_bytes(backend, Bytes::from_static(b"\r\n")).await?;
+    Ok(())
+}
+
+/// リクエストボディストリーミングの結果。
+#[cfg(feature = "http2")]
+enum ReqStreamOutcome {
+    /// END_STREAM（または末尾トレーラー）を受信し終端チャンクを送出した（応答リレーへ）。
+    Complete,
+    /// クライアントが RST_STREAM 等で対象ストリームを閉じた。
+    ClientReset,
+    /// 受信ボディが `max_request_body_size` を超過した。
+    TooLarge,
+    /// バックエンド書き込みエラー。
+    BackendError,
+    /// 接続レベルのプロトコルエラー（呼び出し側で GOAWAY）。
+    ConnError(http2::Http2Error),
+    /// 接続が閉じられた。
+    ConnClosed,
+}
+
+/// HEADERS 受信後のリクエストボディ（DATA フレーム）を chunked でバックエンドへ
+/// ゼロコピー逐次転送する（F-32 リクエスト方向ストリーミングの中核）。
+///
+/// 各 DATA フレームは `recv_data_for_streaming` でフロー制御・WINDOW_UPDATE・content-length
+/// 検証を処理しつつ **`request_body` へはバッファせず**、所有バッファのまま
+/// `send_backend_chunk` で送出する。バックエンド書き込みが完了するまで次フレームを読まない
+/// ため、クライアント → プロキシ → バックエンドのバックプレッシャが自然に伝播し、RSS は
+/// ペイロードサイズに比例しない（保持は最大 1 フレーム分）。
+///
+/// 転送中に**他ストリーム**が完了した場合はその `ProcessedRequest` を `deferred` に収集して返し、
+/// 呼び出し側が逐次処理する（現行の単一リクエスト直列モデルと整合）。
+#[cfg(feature = "http2")]
+async fn stream_h2_request_body_to_backend<S, B>(
+    conn: &mut http2::Http2Connection<S>,
+    target_stream: u32,
+    backend: &mut B,
+    max_body_size: usize,
+) -> (ReqStreamOutcome, Vec<http2::ProcessedRequest>)
+where
+    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
+    B: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRent + Unpin,
+{
+    use http2::frame::Frame;
+
+    let mut total: usize = 0;
+    let mut deferred: Vec<http2::ProcessedRequest> = Vec::new();
+
+    loop {
+        let frame = match conn.read_frame().await {
+            Ok(f) => f,
+            Err(http2::Http2Error::ConnectionClosed) => {
+                return (ReqStreamOutcome::ConnClosed, deferred)
+            }
+            Err(e) => return (ReqStreamOutcome::ConnError(e), deferred),
+        };
+
+        match frame {
+            Frame::Data {
+                stream_id,
+                end_stream,
+                data,
+            } if stream_id == target_stream => {
+                let data_len = data.len();
+                // フロー制御・状態遷移・content-length 検証（バッファリングなし）
+                if let Err(e) = conn
+                    .recv_data_for_streaming(target_stream, end_stream, data_len)
+                    .await
+                {
+                    return (ReqStreamOutcome::ConnError(e), deferred);
+                }
+                total = total.saturating_add(data_len);
+                if total > max_body_size {
+                    return (ReqStreamOutcome::TooLarge, deferred);
+                }
+                if data_len > 0 {
+                    // ゼロコピー: 受信フレームの所有バッファをそのまま chunked 送出
+                    if send_backend_chunk(backend, Bytes::from(data)).await.is_err() {
+                        return (ReqStreamOutcome::BackendError, deferred);
+                    }
+                }
+                if end_stream {
+                    // 終端チャンク
+                    if backend_write_all_bytes(backend, Bytes::from_static(b"0\r\n\r\n"))
+                        .await
+                        .is_err()
+                    {
+                        return (ReqStreamOutcome::BackendError, deferred);
+                    }
+                    return (ReqStreamOutcome::Complete, deferred);
+                }
+            }
+            other => {
+                // 制御フレーム・他ストリーム・対象ストリームのトレーラーは通常処理に委譲
+                match conn.process_frame(other).await {
+                    Ok(Some(req)) => {
+                        if req.stream_id == target_stream {
+                            if !req.body_pending {
+                                // トレーラー（HEADERS with END_STREAM）等で終了
+                                if backend_write_all_bytes(
+                                    backend,
+                                    Bytes::from_static(b"0\r\n\r\n"),
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    return (ReqStreamOutcome::BackendError, deferred);
+                                }
+                                return (ReqStreamOutcome::Complete, deferred);
+                            }
+                            // 対象ストリームの body_pending:true は起こらない想定（既に開始済み）
+                        } else if !req.body_pending {
+                            // 他ストリームが完了 → 遅延処理キューへ（直列処理）
+                            deferred.push(req);
+                        }
+                        // 他ストリームの body_pending:true は無視（DATA は process_frame が蓄積）
+                    }
+                    Ok(None) => {}
+                    Err(e) => return (ReqStreamOutcome::ConnError(e), deferred),
+                }
+                // クライアントが対象ストリームを閉じた（RST_STREAM 等）
+                if conn.get_stream(target_stream).is_none() {
+                    return (ReqStreamOutcome::ClientReset, deferred);
+                }
+            }
+        }
+    }
+}
+
+/// ストリーミングしたリクエストボディをバックエンドへ送り、応答をクライアントへリレーする
+/// 内部処理（バックエンド接続種別 `B` に非依存で総称化）。
+///
+/// 1. リクエストヘッダー（`Transfer-Encoding: chunked`）を送信
+/// 2. `stream_h2_request_body_to_backend` でボディを逐次転送
+/// 3. `relay_h2_response` で応答をリレー
+///
+/// 戻り値: `(status, resp_size, req_body_size, deferred)`。`status == 0` は応答不要
+/// （クライアント RST 等）を示す。
+#[cfg(feature = "http2")]
+#[allow(clippy::too_many_arguments)]
+async fn run_h2_request_streaming<S, B>(
+    conn: &mut http2::Http2Connection<S>,
+    stream_id: u32,
+    backend: &mut B,
+    request_headers: Vec<u8>,
+    compression: &CompressionConfig,
+    client_encoding: AcceptedEncoding,
+    max_body_size: usize,
+) -> (u16, u64, u64, Vec<http2::ProcessedRequest>)
+where
+    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
+    B: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRent + Unpin,
+{
+    use http2::Http2ErrorCode;
+
+    // リクエストヘッダー送信（ヘッダーは小さいため write_all で十分）
+    let (write_res, returned_request) = backend.write_all(request_headers).await;
+    request_buf_put(returned_request);
+    if write_res.is_err() {
+        let server_guard = get_server_header_guard();
+        let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+        if let Some(ref g) = server_guard {
+            headers.push(g.as_header());
+        }
+        // ヘッダー送信前にボディを送れていないため、応答は返せるがクライアントは
+        // まだボディ送信中。502 + RST で打ち切る。
+        let _ = conn
+            .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
+            .await;
+        let _ = conn
+            .send_rst_stream(stream_id, Http2ErrorCode::InternalError)
+            .await;
+        return (502, 11, 0, Vec::new());
+    }
+
+    // リクエストボディを逐次転送
+    let (outcome, deferred) =
+        stream_h2_request_body_to_backend(conn, stream_id, backend, max_body_size).await;
+
+    let req_body_size = 0u64; // 後述: 正確なサイズは outcome から得られないため概算（ログ用）
+
+    match outcome {
+        ReqStreamOutcome::Complete => {
+            // 応答をリレー
+            let (status, resp_size) =
+                relay_h2_response(conn, stream_id, backend, compression, client_encoding)
+                    .await
+                    .unwrap_or((502, 11));
+            (status, resp_size, req_body_size, deferred)
+        }
+        ReqStreamOutcome::TooLarge => {
+            // ボディ上限超過: 413 + RST。バックエンドは終端チャンク未送のまま切断される。
+            let server_guard = get_server_header_guard();
+            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+            if let Some(ref g) = server_guard {
+                headers.push(g.as_header());
+            }
+            let _ = conn
+                .send_response(stream_id, 413, &headers, Some(b"Payload Too Large"))
+                .await;
+            let _ = conn
+                .send_rst_stream(stream_id, Http2ErrorCode::EnhanceYourCalm)
+                .await;
+            (413, 17, req_body_size, deferred)
+        }
+        ReqStreamOutcome::BackendError => {
+            let server_guard = get_server_header_guard();
+            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+            if let Some(ref g) = server_guard {
+                headers.push(g.as_header());
+            }
+            let _ = conn
+                .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
+                .await;
+            (502, 11, req_body_size, deferred)
+        }
+        ReqStreamOutcome::ClientReset | ReqStreamOutcome::ConnClosed => {
+            // クライアントが打ち切ったため応答不要
+            (0, 0, req_body_size, deferred)
+        }
+        ReqStreamOutcome::ConnError(e) => {
+            // 接続レベルエラー: GOAWAY を送って接続を終了させる
+            let _ = conn
+                .send_goaway(e.error_code(), e.to_string().as_bytes())
+                .await;
+            (0, 0, req_body_size, deferred)
+        }
+    }
+}
+
+/// HEADERS 完了（`body_pending`）時点で呼ばれ、リクエストがストリーミング適格なら
+/// HEADERS 受信時点でバックエンド接続を開始しボディ（DATA フレーム）を逐次転送する。
+///
+/// 非適格（プロキシ以外 / h2c バックエンド / WASM モジュール適用 / gRPC / バッファリング
+/// `full` / セキュリティ非許可）の場合は**何もしない**。呼び出し側ループは継続し、DATA は
+/// 従来どおり `request_body` に蓄積され、END_STREAM 受信時に `process_completed_h2_request`
+/// が処理する（回帰なしのフォールバック）。
+#[cfg(feature = "http2")]
+async fn handle_h2_request_streaming<S>(
+    conn: &mut http2::Http2Connection<S>,
+    stream_id: u32,
+    client_ip: &str,
+    connection_metric: &mut ActiveConnectionMetric,
+) where
+    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
+{
+    // --- リクエストライン/ヘッダー情報を取得 ---
+    let (method, path, authority) = {
+        if let Some(stream) = conn.get_stream(stream_id) {
+            let method = stream
+                .method()
+                .map(|m| m.to_vec())
+                .unwrap_or_else(|| b"GET".to_vec());
+            let path = stream
+                .path()
+                .map(|p| p.to_vec())
+                .unwrap_or_else(|| b"/".to_vec());
+            let authority = stream
+                .authority()
+                .map(|a| a.to_vec())
+                .or_else(|| {
+                    stream
+                        .request_headers
+                        .iter()
+                        .find(|h| h.name.eq_ignore_ascii_case(b"host"))
+                        .map(|h| h.value.clone())
+                })
+                .unwrap_or_default();
+            (method, path, authority)
+        } else {
+            return;
+        }
+    };
+
+    // --- ルーティング ---
+    let config = CURRENT_CONFIG.load();
+    let h2_headers_store: Vec<(Vec<u8>, Vec<u8>)> = if let Some(stream) = conn.get_stream(stream_id)
+    {
+        stream
+            .request_headers
+            .iter()
+            .map(|h| (h.name.clone(), h.value.clone()))
+            .collect()
+    } else {
+        return;
+    };
+    let headers_raw: Vec<(&[u8], &[u8])> = h2_headers_store
+        .iter()
+        .map(|(k, v)| (k.as_slice(), v.as_slice()))
+        .collect();
+
+    let query_start_pos = path.iter().position(|&b| b == b'?');
+    let raw_query: &[u8] = query_start_pos.map(|i| &path[i + 1..]).unwrap_or(b"");
+    let path_without_query = query_start_pos.map(|i| &path[..i]).unwrap_or(&path[..]);
+
+    let client_socket_addr = if let Ok(addr) = client_ip.parse::<SocketAddr>() {
+        addr
+    } else if let Ok(ip) = client_ip.parse::<std::net::IpAddr>() {
+        SocketAddr::new(ip, 80)
+    } else {
+        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 0)
+    };
+
+    let backend_result = find_backend_unified(
+        &authority,
+        path_without_query,
+        &method,
+        &headers_raw,
+        raw_query,
+        &client_socket_addr,
+        config.route.as_slice(),
+        &config.upstream_groups,
+    )
+    .or_else(|| {
+        if !authority.is_empty() {
+            find_backend_unified(
+                b"",
+                path_without_query,
+                &method,
+                &headers_raw,
+                raw_query,
+                &client_socket_addr,
+                config.route.as_slice(),
+                &config.upstream_groups,
+            )
+        } else {
+            None
+        }
+    });
+
+    let (prefix, backend) = match backend_result {
+        Some(b) => b,
+        None => return, // ルート無し → バッファ経路（404）にフォールバック
+    };
+
+    // Proxy バックエンドのみストリーミング対象
+    let (upstream_group, security, compression, buffering) = match &backend {
+        Backend::Proxy(ug, sec, comp, buf, _cache, modules) => {
+            // WASM モジュール適用ルートはボディフィルタが全ボディを要求しうるため非対象
+            if modules.as_ref().map_or(false, |m| !m.is_empty()) {
+                return;
+            }
+            (ug.clone(), sec.clone(), comp.clone(), buf.clone())
+        }
+        _ => return, // 静的ファイル/リダイレクト等 → バッファ経路
+    };
+
+    // バッファリングモードが full ならストリーミングしない
+    if buffering.mode == crate::buffering::BufferingMode::Full {
+        return;
+    }
+
+    // gRPC はトレイラー等の特別処理が必要なため非対象（content-type で判定）
+    let is_grpc = h2_headers_store.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case(b"content-type")
+            && value
+                .get(..16)
+                .map(|p| p.eq_ignore_ascii_case(b"application/grpc"))
+                .unwrap_or(false)
+    });
+    if is_grpc {
+        return;
+    }
+
+    // セキュリティ（IP/メソッド/レート）。ボディサイズは転送中に強制するため is_chunked=true。
+    if check_security(&security, client_ip, &method, 0, true) != SecurityCheckResult::Allowed {
+        // 非許可は拒否ロジックを一本化するためバッファ経路に委ねる
+        return;
+    }
+
+    // サーバー選択 + h2c 判定（h2c バックエンドへのストリーミングは未対応）
+    let server = match upstream_group.select(client_ip) {
+        Some(s) => s,
+        None => return,
+    };
+    if server.target.use_h2c {
+        return;
+    }
+
+    // Accept-Encoding（応答圧縮判定用）
+    let client_encoding = h2_headers_store
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(b"accept-encoding"))
+        .map(|(_, v)| AcceptedEncoding::parse(v))
+        .unwrap_or(AcceptedEncoding::Identity);
+
+    let max_body_size = security.max_request_body_size;
+
+    server.acquire();
+    let target = &server.target;
+    let use_tls = target.use_tls;
+    let sni = target.sni().to_string();
+    let addr = format!("{}:{}", target.host, target.port);
+
+    // --- リクエストヘッダー（Transfer-Encoding: chunked）を構築 ---
+    let path_str = std::str::from_utf8(&path).unwrap_or("/");
+    let sub_path = if prefix.is_empty() {
+        path_str.to_string()
+    } else {
+        let prefix_str = std::str::from_utf8(&prefix).unwrap_or("");
+        if path_str.starts_with(prefix_str) {
+            let remaining = &path_str[prefix_str.len()..];
+            let base = target.path_prefix.trim_end_matches('/');
+            build_sub_path(base, remaining)
+        } else {
+            path_str.to_string()
+        }
+    };
+    let final_path = if sub_path.is_empty() { "/" } else { &sub_path };
+
+    let mut request = request_buf_get(1024);
+    request.extend_from_slice(&method);
+    request.extend_from_slice(b" ");
+    request.extend_from_slice(final_path.as_bytes());
+    request.extend_from_slice(b" HTTP/1.1\r\nHost: ");
+    request.extend_from_slice(target.host.as_bytes());
+    if !target.is_default_port() {
+        request.extend_from_slice(b":");
+        let mut port_buf = itoa::Buffer::new();
+        request.extend_from_slice(port_buf.format(target.port).as_bytes());
+    }
+    request.extend_from_slice(b"\r\n");
+    if let Some(stream) = conn.get_stream(stream_id) {
+        for header in &stream.request_headers {
+            if header.name.starts_with(b":") {
+                continue;
+            }
+            if header.name.eq_ignore_ascii_case(b"connection")
+                || header.name.eq_ignore_ascii_case(b"keep-alive")
+                || header.name.eq_ignore_ascii_case(b"transfer-encoding")
+                || header.name.eq_ignore_ascii_case(b"content-length")
+            {
+                continue;
+            }
+            request.extend_from_slice(&header.name);
+            request.extend_from_slice(b": ");
+            request.extend_from_slice(&header.value);
+            request.extend_from_slice(b"\r\n");
+        }
+    }
+    request.extend_from_slice(b"Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n");
+
+    if let Ok(host_str) = std::str::from_utf8(&authority) {
+        connection_metric.set_host(host_str.to_string());
+    }
+    let start_instant = Instant::now();
+
+    // --- バックエンド接続 + ストリーミング ---
+    let connect_result = timeout(CONNECT_TIMEOUT, TcpStream::connect_str(&addr)).await;
+    let backend_tcp = match connect_result {
+        Ok(Ok(s)) => s,
+        _ => {
+            server.release();
+            let server_guard = get_server_header_guard();
+            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+            if let Some(ref g) = server_guard {
+                headers.push(g.as_header());
+            }
+            let _ = conn
+                .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
+                .await;
+            request_buf_put(request);
+            log_streamed_access(
+                &method,
+                &authority,
+                &path,
+                502,
+                11,
+                start_instant,
+                client_ip,
+            );
+            return;
+        }
+    };
+    // ストリーミングアップロードはスループット優先のため Nagle を有効のままにする
+    // （チャンクヘッダ/ペイロード/CRLF の小書き込みをカーネルが結合する）
+
+    let (status, resp_size, req_body_size, deferred) = if use_tls {
+        let connector = get_tls_connector();
+        match timeout(CONNECT_TIMEOUT, connector.connect(backend_tcp, &sni)).await {
+            Ok(Ok(mut backend)) => {
+                run_h2_request_streaming(
+                    conn,
+                    stream_id,
+                    &mut backend,
+                    request,
+                    &compression,
+                    client_encoding,
+                    max_body_size,
+                )
+                .await
+            }
+            _ => {
+                request_buf_put(request);
+                let server_guard = get_server_header_guard();
+                let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+                if let Some(ref g) = server_guard {
+                    headers.push(g.as_header());
+                }
+                let _ = conn
+                    .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
+                    .await;
+                (502, 11, 0, Vec::new())
+            }
+        }
+    } else {
+        let mut backend = backend_tcp;
+        run_h2_request_streaming(
+            conn,
+            stream_id,
+            &mut backend,
+            request,
+            &compression,
+            client_encoding,
+            max_body_size,
+        )
+        .await
+    };
+
+    server.release();
+
+    // アクセスログ（status==0 は応答不要のため記録しない）
+    if status != 0 {
+        let _ = req_body_size;
+        log_streamed_access(
+            &method,
+            &authority,
+            &path,
+            status,
+            resp_size,
+            start_instant,
+            client_ip,
+        );
+    }
+
+    // 転送中に完了した他ストリームを逐次処理
+    for dreq in deferred {
+        process_completed_h2_request(conn, dreq.stream_id, client_ip, connection_metric).await;
+    }
+}
+
+/// ストリーミング経路用のアクセスログ出力ヘルパー（User-Agent はストリーム未保持のため省略）。
+#[cfg(feature = "http2")]
+#[allow(clippy::too_many_arguments)]
+fn log_streamed_access(
+    method: &[u8],
+    authority: &[u8],
+    path: &[u8],
+    status: u16,
+    resp_size: u64,
+    start_instant: Instant,
+    client_ip: &str,
+) {
+    log_access(
+        method,
+        authority,
+        path,
+        &[],
+        0,
+        status,
+        resp_size,
+        start_instant,
+        client_ip,
+        "",
+    );
 }
 
 /// HTTP/2 単一リクエスト処理
@@ -9120,3 +9783,43 @@ async fn handle_sendfile_userspace(
 // ====================
 // ユニットテスト
 // ====================
+
+#[cfg(all(test, feature = "http2"))]
+mod streaming_tests {
+    use super::*;
+
+    /// chunked チャンクサイズ行のエンコードが正しいこと（F-32 リクエストストリーミング）。
+    #[test]
+    fn test_push_chunk_size_line() {
+        fn line(n: usize) -> Vec<u8> {
+            let mut b = Vec::new();
+            push_chunk_size_line(&mut b, n);
+            b
+        }
+        assert_eq!(line(0), b"0\r\n");
+        assert_eq!(line(1), b"1\r\n");
+        assert_eq!(line(15), b"f\r\n");
+        assert_eq!(line(16), b"10\r\n");
+        assert_eq!(line(255), b"ff\r\n");
+        assert_eq!(line(256), b"100\r\n");
+        assert_eq!(line(65535), b"ffff\r\n");
+        assert_eq!(line(16384), b"4000\r\n");
+        // 既存バッファへの追記であること（前の内容を保持）
+        let mut b = b"prefix".to_vec();
+        push_chunk_size_line(&mut b, 16384);
+        assert_eq!(b, b"prefix4000\r\n");
+    }
+
+    /// チャンクサイズ行が標準ライブラリの 16 進表現と一致すること（網羅確認）。
+    #[test]
+    fn test_push_chunk_size_line_matches_hex() {
+        for n in [
+            0usize, 1, 7, 9, 10, 16, 100, 1000, 4096, 16384, 65535, 65536, 1_048_576, 200_000,
+        ] {
+            let mut b = Vec::new();
+            push_chunk_size_line(&mut b, n);
+            let expected = format!("{:x}\r\n", n).into_bytes();
+            assert_eq!(b, expected, "mismatch for n={}", n);
+        }
+    }
+}
