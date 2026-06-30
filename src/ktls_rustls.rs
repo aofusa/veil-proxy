@@ -847,7 +847,11 @@ impl crate::runtime::io::AsyncReadRent for KtlsServerStream {
             if !self.drained_buffer.is_empty() {
                 let len = std::cmp::min(self.drained_buffer.len(), buf.bytes_total());
                 unsafe {
-                    std::ptr::copy_nonoverlapping(self.drained_buffer.as_ptr(), buf.write_ptr(), len);
+                    std::ptr::copy_nonoverlapping(
+                        self.drained_buffer.as_ptr(),
+                        buf.write_ptr(),
+                        len,
+                    );
                     buf.set_init(len);
                 }
                 self.drained_buffer.drain(..len);
@@ -1035,7 +1039,11 @@ impl crate::runtime::io::AsyncReadRent for KtlsClientStream {
             if !self.drained_buffer.is_empty() {
                 let len = std::cmp::min(self.drained_buffer.len(), buf.bytes_total());
                 unsafe {
-                    std::ptr::copy_nonoverlapping(self.drained_buffer.as_ptr(), buf.write_ptr(), len);
+                    std::ptr::copy_nonoverlapping(
+                        self.drained_buffer.as_ptr(),
+                        buf.write_ptr(),
+                        len,
+                    );
                     buf.set_init(len);
                 }
                 self.drained_buffer.drain(..len);

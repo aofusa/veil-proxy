@@ -831,7 +831,10 @@ mod tests {
 
         stream.recv_data_accounting(40, false).unwrap();
         assert_eq!(stream.recv_window, 60, "ウィンドウが消費される");
-        assert_eq!(stream.received_body_size, 40, "受信ボディサイズが加算される");
+        assert_eq!(
+            stream.received_body_size, 40,
+            "受信ボディサイズが加算される"
+        );
         assert!(
             stream.request_body.is_empty(),
             "アカウンティングはバッファしない"

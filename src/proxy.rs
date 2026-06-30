@@ -551,9 +551,10 @@ async fn process_completed_h2_request<S>(
 
     let start_instant = Instant::now();
 
-    let result =
-        handle_http2_single_request(conn, stream_id, &method, &path, &authority, body_len, client_ip)
-            .await;
+    let result = handle_http2_single_request(
+        conn, stream_id, &method, &path, &authority, body_len, client_ip,
+    )
+    .await;
 
     // User-Agent を取得
     let user_agent: Box<[u8]> = if let Some(stream) = conn.get_stream(stream_id) {
@@ -738,7 +739,10 @@ where
                 }
                 if data_len > 0 {
                     // ゼロコピー: 受信フレームの所有バッファをそのまま chunked 送出
-                    if send_backend_chunk(backend, Bytes::from(data)).await.is_err() {
+                    if send_backend_chunk(backend, Bytes::from(data))
+                        .await
+                        .is_err()
+                    {
                         return (ReqStreamOutcome::BackendError, deferred);
                     }
                 }
@@ -2174,9 +2178,14 @@ where
         };
         returned_buf.set_valid_len(n);
         // 借用は drain の await 完了で解放されるため、その後に buf_put する
-        let drain =
-            h2_drain_chunked_spans(conn, stream_id, &mut decoder, returned_buf.as_valid_slice(), &mut sent)
-                .await?;
+        let drain = h2_drain_chunked_spans(
+            conn,
+            stream_id,
+            &mut decoder,
+            returned_buf.as_valid_slice(),
+            &mut sent,
+        )
+        .await?;
         buf_put(returned_buf);
         match drain {
             ChunkedDrain::Complete | ChunkedDrain::Aborted => return Ok(sent),
@@ -2357,7 +2366,12 @@ where
                     h2_headers.push((header.name.as_bytes(), header.value));
                 }
                 let sent = match stream_h2_response_body_chunked(
-                    conn, stream_id, status, &h2_headers, backend, body,
+                    conn,
+                    stream_id,
+                    status,
+                    &h2_headers,
+                    backend,
+                    body,
                 )
                 .await
                 {
@@ -9410,7 +9424,8 @@ async fn handle_sendfile(
     // OpenFileCacheを使用してファイル情報を取得（キャッシュ優先）
     // これにより、canonicalize、metadata、mime_guessのシステムコールをキャッシュ
     // ルーティングごとの設定を考慮
-    let file_info = match cache::get_file_info_with_config(&full_path, open_file_cache_config).await {
+    let file_info = match cache::get_file_info_with_config(&full_path, open_file_cache_config).await
+    {
         Some(info) => info,
         None => {
             let err_buf = ERR_MSG_NOT_FOUND.to_vec();
