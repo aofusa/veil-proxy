@@ -286,6 +286,26 @@ pub mod proxy;
 use crate::proxy::*;
 
 // ====================
+// ワーカースレッド
+// ====================
+
+/// I/O ワーカースレッド（per-core io_uring executor）を 8MB スタックで起動する。
+///
+/// `std::thread::spawn` の既定スタックは 2MB と小さく、接続ハンドラの async future は
+/// 深いネスト（TLS read/write → HTTP/2 フレーム処理 → ストリーミング転送 → 応答リレー）で
+/// 大きくなり得る。spawn 時に future はスタック上で構築されてからボックス化されるため、
+/// 既定 2MB では大きな接続でスタックオーバーフローし得る。十分なスタックを確保して防ぐ。
+fn spawn_worker_thread<F>(f: F) -> thread::JoinHandle<()>
+where
+    F: FnOnce() + Send + 'static,
+{
+    thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(f)
+        .expect("failed to spawn I/O worker thread")
+}
+
+// ====================
 // メイン関数
 // ====================
 
@@ -791,7 +811,7 @@ fn main() {
                 ids[core_index]
             });
 
-            let handle = thread::spawn(move || {
+            let handle = spawn_worker_thread(move || {
                 // スレッド開始直後にCPUアフィニティを設定
                 // これによりL1/L2キャッシュミスを削減し、レイテンシのジッターを安定化
                 if let Some(core_id) = assigned_core {
@@ -891,7 +911,7 @@ fn main() {
         info!("All HTTP requests will be redirected to HTTPS (301)");
         info!("============================================");
 
-        let http_handle = thread::spawn(move || {
+        let http_handle = spawn_worker_thread(move || {
             crate::runtime::block_on(async move {
                 // HTTPリスナーを作成（SO_REUSEADDRを有効化）
                 let listener = match TcpListener::bind(http_addr) {
@@ -1017,7 +1037,7 @@ fn main() {
                 ids[core_index]
             });
 
-            let http3_handle = thread::spawn(move || {
+            let http3_handle = spawn_worker_thread(move || {
                 // スレッド開始直後にCPUアフィニティを設定
                 if let Some(core_id) = assigned_core {
                     if core_affinity::set_for_current(core_id) {
@@ -1105,7 +1125,7 @@ fn main() {
                 ids[core_index]
             });
 
-            let h2c_handle = thread::spawn(move || {
+            let h2c_handle = spawn_worker_thread(move || {
                 // スレッド開始直後にCPUアフィニティを設定
                 if let Some(core_id) = assigned_core {
                     if core_affinity::set_for_current(core_id) {

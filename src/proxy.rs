@@ -460,8 +460,17 @@ where
                 // F-32: ヘッダー完了・ボディ継続。ストリーミング適格なら HEADERS 受信時点で
                 // バックエンド接続を開始し DATA フレームを逐次転送する。非適格なら何もせず、
                 // DATA は従来どおり request_body に蓄積され END_STREAM で下の分岐が処理する。
-                handle_h2_request_streaming(conn, req.stream_id, client_ip, connection_metric)
-                    .await;
+                //
+                // ストリーミング経路は深い async ネスト（接続→ヘッダ送信→ボディ転送→応答リレー）
+                // を持つため、`Box::pin` でヒープへ退避して呼び出し側 future のサイズ肥大化
+                // （spawn 時のスタック上構築でのオーバーフロー）を防ぐ。確保は 1 リクエストに 1 回。
+                Box::pin(handle_h2_request_streaming(
+                    conn,
+                    req.stream_id,
+                    client_ip,
+                    connection_metric,
+                ))
+                .await;
             }
             Ok(Some(req)) => {
                 // リクエストが完了（END_STREAM 受信済み）- HTTP/1.1 と同様のロジックで処理

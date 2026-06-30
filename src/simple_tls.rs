@@ -388,7 +388,7 @@ impl crate::runtime::io::AsyncReadRent for SimpleTlsServerStream {
 
         let fd = self.inner.as_raw_fd();
         let mut read_buf = vec![0u8; 16384];
-        let mut plain = [0u8; 16384];
+        let mut plain = vec![0u8; 16384];
 
         loop {
             // rustls が復号済みの平文を drained_buffer へ全量取り出す（received_plaintext
@@ -569,7 +569,7 @@ impl crate::runtime::io::AsyncReadRent for SimpleTlsClientStream {
 
         let fd = self.inner.as_raw_fd();
         let mut read_buf = vec![0u8; 16384];
-        let mut plain = [0u8; 16384];
+        let mut plain = vec![0u8; 16384];
 
         loop {
             // rustls が復号済みの平文を drained_buffer へ全量取り出す（received_plaintext
