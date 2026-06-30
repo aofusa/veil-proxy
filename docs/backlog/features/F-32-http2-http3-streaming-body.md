@@ -40,7 +40,7 @@ HTTP/2・HTTP/3 のリクエスト/レスポンスボディをオンメモリに
   デッドロック/ストールの恐れ。段階導入（まずレスポンス方向、次にリクエスト方向）を推奨。
 - gRPC（trailers）/ WASM ボディフィルタとの相互作用に注意（ボディ全体を要求するフィルタは full に退避）。
 
-## 対応状況: bytes/ゼロコピー化は完了、完全ストリーミングは残
+## 対応状況: HTTP/2 レスポンス方向（content-length + chunked）ストリーミング完了。リクエスト方向 / HTTP/3 は残
 
 ### 完了（bytes クレートによるゼロコピー化）
 
@@ -76,19 +76,53 @@ F-32 doc 推奨の段階導入（まずレスポンス方向）に従い、**HTT
 ### バッファ経路へ退避するケース（full 相当）
 
 - **圧縮有効**: ボディ全体を圧縮する必要があるためバッファ。
-- **chunked**: 現状の `ChunkedDecoder` は逐次デコード済みバイトを取り出せないためバッファ
-  （= 第2フェーズで逐次デコード対応予定）。
 - **gRPC trailers / WASM ボディフィルタ**: ボディ全体を要求するため従来経路（影響なし）。
+- ※ **chunked** は第2フェーズで逐次デコードストリーミング化済み（下記参照）。
 
 ### 検証
 
 - `cargo test --bins --features full` 585 通過、`cargo test --test integration_tests --features full`
   53/53 通過（既存フレーキー `cache::revalidation::test_active_count` のみ、本変更と無関係）。
 
-### 残（第2フェーズ以降）
+## 対応状況（全面書換・第2フェーズ）: HTTP/2 chunked レスポンスの逐次デコードストリーミング
+
+第1フェーズでバッファ経路へ退避していた **chunked レスポンス** を、**逐次デコードしながら
+DATA フレームへストリーミング転送**する経路に置き換えた。従来は `full_body: Vec<u8>` に
+全溜め → `decode_chunked_body` で再アロケートしていた二重確保を排除する。
+
+### 実装（`src/http_utils.rs` + `src/proxy.rs`）
+
+- 新規 `ChunkedDecoder::next_data_span()`（+ `ChunkedSpan`）: **ゼロコピー span 抽出 API**。
+  フレーミング（チャンクサイズ・CRLF・トレーラー）を内部ステートマシンで消費し、
+  `ReadingChunkData` に入った時点で入力スライス内のデータ run を **1 回の計算で確定**して
+  返す（バイト単位ループや中間バッファなし）。返した範囲は入力のサブスライスなので、
+  呼び出し側は中間 `Vec` を持たずに下流へそのまま送出できる。
+- 新規 `stream_h2_response_body_chunked()` / `h2_drain_chunked_spans()`: 各チャンクの
+  データ範囲（読み取りバッファのサブスライス）を `send_data` で逐次送出。各 `send_data` は
+  HTTP/2 フロー制御（conn/stream ウィンドウ + WINDOW_UPDATE 待ち）に従うためバックプレッシャが
+  効き、RSS をペイロードに比例させない。終端チャンク検出時に 0 長 DATA + END_STREAM で閉じる
+  （トレーラーはボディに含めない）。バックエンドが終端前に切断した場合も END_STREAM で安全に閉じる。
+- `handle_http2_proxy_http` / `_https` に **chunked ストリーミング分岐**を追加: 非圧縮 + chunked の
+  場合にストリーミング、圧縮時は従来バッファ経路（回帰なし）。`content-length`/`transfer-encoding`
+  ヘッダは HTTP/2 へ転送しない。
+
+### 検証（第2フェーズ）
+
+- 単体: `next_data_span` のテスト 10 件（分割境界・トレーラー・チャンク拡張・サイズ制限・
+  `decode_chunked_body` との一致を全分割点で検証）。`cargo test --bins --features full` 597 通過。
+- 結合: `cargo test --test integration_tests --features full` 53/53 通過。
+- E2E: `test_http2_chunked_response_streaming`（実 h2 クライアント）追加。`Transfer-Encoding:
+  chunked` で 200,000 バイト（初期フロー制御ウィンドウ 65,535 超）の決定論的ボディを
+  バイト単位まで完全一致で再構成（ストリーミング・チャンクデコード・END_STREAM・
+  バックプレッシャの End-to-End 保証）。`features full` E2E 389 通過 / 既知の負荷フレーキー
+  3 件（stress・431・100-continue。いずれも本変更と無関係でタイムアウト依存、isolation で通過）。
+
+### 残（第3フェーズ以降）
 
 - **リクエスト方向のストリーミング**: 現状は end_stream まで `request_body` にバッファしてから
   バックエンドへ転送する。真のアップロードストリーミングは、HEADERS 受信時点でバックエンド
   接続を開始し DATA フレームを逐次転送する設計（逐次 frame loop ⇄ バックエンド書込の結合）を
   要し、現行の「全受信→処理」シーケンシャルモデルの再設計が必要。独立した大規模タスクとして継続。
-- **chunked レスポンスの逐次デコード転送**、**HTTP/3 レスポンスストリーミング** も継続課題。
+- **HTTP/3 レスポンスストリーミング**: quiche のパケット処理ループ内でバックエンド読み込みと
+  `send_body` を交互に行う再設計が必要（quiche 自身のフロー制御・partial_responses バッファとの
+  結合）。独立タスクとして継続。

@@ -58,6 +58,7 @@ A high-performance reverse proxy server using io_uring (custom runtime) and rust
 - **CPU Affinity**: Pin worker threads to CPU cores
 - **CBPF Distribution**: Client IP-based load balancing with SO_REUSEPORT (Linux 4.6+)
 - **OpenFileCache**: File metadata cache to reduce system calls (canonicalize, metadata, mime_guess) - 60-67% reduction in system calls for static file serving. On cache miss, the blocking `canonicalize`/`metadata`/disk reads run on a dedicated offload thread pool (completion signaled via `eventfd` + `POLL_ADD`) so the io_uring event loop never blocks
+- **HTTP/2 Response Streaming**: For non-compressed responses, the backend body is forwarded to the HTTP/2 client as DATA frames incrementally instead of being fully buffered — both `Content-Length` and `Transfer-Encoding: chunked` responses. Chunked bodies are decoded zero-copy via a span-based decoder (sub-slices of the read buffer, no intermediate `Vec`). Each DATA frame obeys HTTP/2 flow control (connection/stream window + `WINDOW_UPDATE`), so backpressure follows the client's receive rate and RSS does not scale with payload size (OOM resistance for large downloads)
 
 ### Operations
 - **Graceful Shutdown**: Safe termination via SIGINT/SIGTERM

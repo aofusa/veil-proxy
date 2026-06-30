@@ -65,7 +65,7 @@
 | F-27 | P2 | 完了 | [features/F-27-wasm-instance-pooling-async-fuel.md](features/F-27-wasm-instance-pooling-async-fuel.md) | WASM 非同期実行（wasmtime async_support + Fuel Yield）+ pooling allocator |
 | F-28 | P1 | 完了 | [features/F-28-custom-iouring-impl.md](features/F-28-custom-iouring-impl.md) | monoio 削除・カスタム io_uring 実装（thread-per-core、IORING_REGISTER_RESTRICTIONS） |
 | F-29 | P1 | 完了 | [features/F-29-lockfree-cache-and-async-fs.md](features/F-29-lockfree-cache-and-async-fs.md) | ホットパスのロック排除・非同期FS・Range ゼロアロケーション化。canonicalize/metadata/ディスク読込を runtime::offload（専用スレッドプール+eventfd POLL_ADD）で完全非同期化（イベントループ非ブロック・新規オペコードなし） |
-| F-32 | P1 | 一部完了 | [features/F-32-http2-http3-streaming-body.md](features/F-32-http2-http3-streaming-body.md) | HTTP/2 レスポンス方向の真のストリーミング実装（非圧縮+content-length+非chunkedを DATA フレーム逐次転送、フロー制御バックプレッシャ、全バッファ排除）。リクエスト方向/chunked逐次/HTTP/3 は第2フェーズ継続 |
+| F-32 | P1 | 一部完了 | [features/F-32-http2-http3-streaming-body.md](features/F-32-http2-http3-streaming-body.md) | HTTP/2 レスポンス方向の真のストリーミング実装。第1: 非圧縮+content-length+非chunked を DATA 逐次転送。第2: chunked を `ChunkedDecoder::next_data_span` でゼロコピー逐次デコードしストリーミング（全バッファ排除、フロー制御バックプレッシャ）。リクエスト方向/HTTP/3 は第3フェーズ継続 |
 | F-30 | P2 | 完了 | [features/F-30-l4-splice-zerocopy.md](features/F-30-l4-splice-zerocopy.md) | L4 ストリームプロキシの splice(2) ゼロコピー転送（E2E 追加→B-09 修正→pipe 経由 splice 実装。ユーザースペースバッファ撤廃） |
 | F-31 | P2 | 完了 | [features/F-31-memory-cache-bytes-zerocopy.md](features/F-31-memory-cache-bytes-zerocopy.md) | メモリキャッシュの bytes::Bytes ゼロコピー配信 |
 | F-33 | P3 | 完了 | [features/F-33-http3-gso-gro-offload.md](features/F-33-http3-gso-gro-offload.md) | HTTP/3 送信 GSO バッチング + 受信 GRO 配線（recv_gro_async）。受信ループの 64KB バッファを再利用し per-datagram の 3 確保 + 2 コピーを排除（ゼロコピー受信）。送信も単一パケット to_vec 排除 + スレッドローカル送信スクラッチ再利用 |
