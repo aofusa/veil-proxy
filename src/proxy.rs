@@ -2524,6 +2524,7 @@ where
     Some((502, 11))
 }
 
+#[cfg(feature = "http2")]
 async fn handle_http2_proxy_http<S>(
     conn: &mut http2::Http2Connection<S>,
     stream_id: u32,
