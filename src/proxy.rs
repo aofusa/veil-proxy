@@ -1513,65 +1513,31 @@ where
     }
 }
 
-async fn handle_http2_proxy_http<S>(
+/// バックエンド HTTP/1.1 レスポンスを受信し HTTP/2 クライアントへリレーする共通処理。
+///
+/// HTTP / HTTPS バックエンド双方の応答処理（旧 `handle_http2_proxy_http` /
+/// `handle_http2_proxy_https` で重複していた約 320 行）を一本化したもの。バックエンドの
+/// 接続種別（平文 TCP / TLS）に依存せず `B: AsyncReadRent` で総称化しているため、
+/// リクエスト方向ストリーミング経路（F-32）からも再利用できる。
+///
+/// 内部で以下を判定して最適な転送経路を選ぶ:
+/// - **非圧縮 + content-length 既知 + 非 chunked** → `stream_h2_response_body_cl` で逐次転送
+/// - **非圧縮 + chunked** → `stream_h2_response_body_chunked` でゼロコピー逐次デコード転送
+/// - **圧縮あり / 長さ不明** → 全バッファ後に（必要なら圧縮して）送信
+///
+/// 呼び出し前にバックエンドへリクエストを送信済みであること。
+#[cfg(feature = "http2")]
+async fn relay_h2_response<S, B>(
     conn: &mut http2::Http2Connection<S>,
     stream_id: u32,
-    addr: &str,
-    request: Vec<u8>,
+    backend: &mut B,
     compression: &CompressionConfig,
     client_encoding: AcceptedEncoding,
 ) -> Option<(u16, u64)>
 where
     S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
+    B: crate::runtime::io::AsyncReadRent + Unpin,
 {
-    // バックエンドに接続
-    let connect_result = timeout(CONNECT_TIMEOUT, TcpStream::connect_str(addr)).await;
-
-    let mut backend = match connect_result {
-        Ok(Ok(stream)) => {
-            let _ = stream.set_nodelay(true);
-            stream
-        }
-        Ok(Err(e)) => {
-            warn!("[HTTP/2] Backend connect error: {}", e);
-            let server_guard = get_server_header_guard();
-            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-            if let Some(ref g) = server_guard {
-                headers.push(g.as_header());
-            }
-            let _ = conn
-                .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
-                .await;
-            return Some((502, 11));
-        }
-        Err(_) => {
-            let server_guard = get_server_header_guard();
-            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-            if let Some(ref g) = server_guard {
-                headers.push(g.as_header());
-            }
-            let _ = conn
-                .send_response(stream_id, 504, &headers, Some(b"Gateway Timeout"))
-                .await;
-            return Some((504, 15));
-        }
-    };
-
-    // リクエスト送信
-    let (write_res, returned_request) = backend.write_all(request).await;
-    request_buf_put(returned_request);
-    if write_res.is_err() {
-        let server_guard = get_server_header_guard();
-        let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-        if let Some(ref g) = server_guard {
-            headers.push(g.as_header());
-        }
-        let _ = conn
-            .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
-            .await;
-        return Some((502, 11));
-    }
-
     // レスポンス受信
     let mut response_buf = Vec::with_capacity(BUF_SIZE);
 
@@ -1677,7 +1643,7 @@ where
                         stream_id,
                         status,
                         &h2_headers,
-                        &mut backend,
+                        backend,
                         body,
                         content_len,
                     )
@@ -1719,7 +1685,7 @@ where
                     h2_headers.push((header.name.as_bytes(), header.value));
                 }
                 let sent = match stream_h2_response_body_chunked(
-                    conn, stream_id, status, &h2_headers, &mut backend, body,
+                    conn, stream_id, status, &h2_headers, backend, body,
                 )
                 .await
                 {
@@ -1895,6 +1861,69 @@ where
     Some((502, 11))
 }
 
+async fn handle_http2_proxy_http<S>(
+    conn: &mut http2::Http2Connection<S>,
+    stream_id: u32,
+    addr: &str,
+    request: Vec<u8>,
+    compression: &CompressionConfig,
+    client_encoding: AcceptedEncoding,
+) -> Option<(u16, u64)>
+where
+    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
+{
+    // バックエンドに接続
+    let connect_result = timeout(CONNECT_TIMEOUT, TcpStream::connect_str(addr)).await;
+
+    let mut backend = match connect_result {
+        Ok(Ok(stream)) => {
+            let _ = stream.set_nodelay(true);
+            stream
+        }
+        Ok(Err(e)) => {
+            warn!("[HTTP/2] Backend connect error: {}", e);
+            let server_guard = get_server_header_guard();
+            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+            if let Some(ref g) = server_guard {
+                headers.push(g.as_header());
+            }
+            let _ = conn
+                .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
+                .await;
+            return Some((502, 11));
+        }
+        Err(_) => {
+            let server_guard = get_server_header_guard();
+            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+            if let Some(ref g) = server_guard {
+                headers.push(g.as_header());
+            }
+            let _ = conn
+                .send_response(stream_id, 504, &headers, Some(b"Gateway Timeout"))
+                .await;
+            return Some((504, 15));
+        }
+    };
+
+    // リクエスト送信
+    let (write_res, returned_request) = backend.write_all(request).await;
+    request_buf_put(returned_request);
+    if write_res.is_err() {
+        let server_guard = get_server_header_guard();
+        let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+        if let Some(ref g) = server_guard {
+            headers.push(g.as_header());
+        }
+        let _ = conn
+            .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
+            .await;
+        return Some((502, 11));
+    }
+
+    // レスポンス受信・HTTP/2 へリレー（ストリーミング/バッファリング判定込み、共通処理）
+    relay_h2_response(conn, stream_id, &mut backend, compression, client_encoding).await
+}
+
 /// HTTP/2 → HTTP/1.1 プロキシ（HTTPSバックエンド）
 #[cfg(feature = "http2")]
 async fn handle_http2_proxy_https<S>(
@@ -1988,305 +2017,8 @@ where
         return Some((502, 11));
     }
 
-    // レスポンス受信（HTTP と同様）
-    let mut response_buf = Vec::with_capacity(BUF_SIZE);
-
-    loop {
-        let buf = buf_get();
-        let read_result = timeout(READ_TIMEOUT, backend.read(buf)).await;
-
-        let (res, mut returned_buf) = match read_result {
-            Ok(r) => r,
-            Err(_) => {
-                let server_guard = get_server_header_guard();
-                let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-                if let Some(ref g) = server_guard {
-                    headers.push(g.as_header());
-                }
-                let _ = conn
-                    .send_response(stream_id, 504, &headers, Some(b"Gateway Timeout"))
-                    .await;
-                return Some((504, 15));
-            }
-        };
-
-        let n = match res {
-            Ok(0) => {
-                buf_put(returned_buf);
-                break;
-            }
-            Ok(n) => n,
-            Err(_) => {
-                buf_put(returned_buf);
-                break;
-            }
-        };
-
-        returned_buf.set_valid_len(n);
-        response_buf.extend_from_slice(returned_buf.as_valid_slice());
-        buf_put(returned_buf);
-
-        // ヘッダーが完了したかチェック
-        if let Some(parsed) = parse_http_response(&response_buf) {
-            let status = parsed.status_code;
-            let body_start = parsed.header_len;
-            let body = &response_buf[body_start..];
-
-            // レスポンスヘッダーを解析
-            let mut headers_storage = [httparse::EMPTY_HEADER; 64];
-            let mut resp = httparse::Response::new(&mut headers_storage);
-            let _ = resp.parse(&response_buf);
-
-            // Content-Type と Content-Encoding を取得
-            let content_type = resp
-                .headers
-                .iter()
-                .find(|h| h.name.eq_ignore_ascii_case("content-type"))
-                .map(|h| h.value);
-            let existing_encoding = resp
-                .headers
-                .iter()
-                .find(|h| h.name.eq_ignore_ascii_case("content-encoding"))
-                .map(|h| h.value);
-
-            // === F-32 ストリーミング経路 ===
-            // 圧縮なし + content-length 既知 + 非 chunked の場合、レスポンスボディを
-            // 全バッファリングせず DATA フレームとして逐次転送する（大容量ダウンロードの
-            // OOM 耐性。フロー制御で受信速度に追従し RSS をペイロードに比例させない）。
-            let stream_compress_hint = compression.should_compress(
-                client_encoding,
-                content_type,
-                parsed.content_length,
-                existing_encoding,
-            );
-            if stream_compress_hint.is_none() && !parsed.is_chunked {
-                if let Some(content_len) = parsed.content_length {
-                    let server_guard = get_server_header_guard();
-                    let mut h2_headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(16);
-                    if let Some(ref g) = server_guard {
-                        h2_headers.push(g.as_header());
-                    }
-                    for header in resp.headers.iter() {
-                        if header.name.is_empty() {
-                            continue;
-                        }
-                        if header.name.eq_ignore_ascii_case("connection")
-                            || header.name.eq_ignore_ascii_case("keep-alive")
-                            || header.name.eq_ignore_ascii_case("transfer-encoding")
-                            || header.name.eq_ignore_ascii_case("upgrade")
-                        {
-                            continue;
-                        }
-                        h2_headers.push((header.name.as_bytes(), header.value));
-                    }
-                    let sent = match stream_h2_response_body_cl(
-                        conn,
-                        stream_id,
-                        status,
-                        &h2_headers,
-                        &mut backend,
-                        body,
-                        content_len,
-                    )
-                    .await
-                    {
-                        Ok(n) => n,
-                        Err(e) => {
-                            warn!("[HTTP/2] Response stream error: {}", e);
-                            return None;
-                        }
-                    };
-                    return Some((status, sent));
-                }
-            }
-
-            // === F-32 chunked ストリーミング経路 ===
-            // 圧縮なし + chunked の場合、レスポンス全体を full_body に溜めて
-            // decode_chunked_body で再アロケートする従来経路を避け、next_data_span で
-            // ゼロコピーにデコードしながら DATA フレームを逐次転送する（OOM 耐性 +
-            // バックプレッシャ）。トレーラーは破棄、content-length/transfer-encoding は除外。
-            if stream_compress_hint.is_none() && parsed.is_chunked {
-                let server_guard = get_server_header_guard();
-                let mut h2_headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(16);
-                if let Some(ref g) = server_guard {
-                    h2_headers.push(g.as_header());
-                }
-                for header in resp.headers.iter() {
-                    if header.name.is_empty() {
-                        continue;
-                    }
-                    if header.name.eq_ignore_ascii_case("connection")
-                        || header.name.eq_ignore_ascii_case("keep-alive")
-                        || header.name.eq_ignore_ascii_case("transfer-encoding")
-                        || header.name.eq_ignore_ascii_case("upgrade")
-                        || header.name.eq_ignore_ascii_case("content-length")
-                    {
-                        continue;
-                    }
-                    h2_headers.push((header.name.as_bytes(), header.value));
-                }
-                let sent = match stream_h2_response_body_chunked(
-                    conn, stream_id, status, &h2_headers, &mut backend, body,
-                )
-                .await
-                {
-                    Ok(n) => n,
-                    Err(e) => {
-                        warn!("[HTTP/2] Response chunked stream error: {}", e);
-                        return None;
-                    }
-                };
-                return Some((status, sent));
-            }
-
-            // ボディを読む（Chunked対応）
-            let final_body = if parsed.is_chunked {
-                // Chunked レスポンスの場合、終端検出しながら読み込み
-                let mut decoder = ChunkedDecoder::new_unlimited();
-                let mut full_body = body.to_vec();
-                decoder.feed(body);
-
-                while !decoder.is_complete() {
-                    let buf = buf_get();
-                    let read_result = timeout(READ_TIMEOUT, backend.read(buf)).await;
-                    let (res, mut returned_buf) = match read_result {
-                        Ok(r) => r,
-                        Err(_) => break,
-                    };
-
-                    let n = match res {
-                        Ok(0) => {
-                            buf_put(returned_buf);
-                            break;
-                        }
-                        Ok(n) => n,
-                        Err(_) => {
-                            buf_put(returned_buf);
-                            break;
-                        }
-                    };
-
-                    returned_buf.set_valid_len(n);
-                    full_body.extend_from_slice(returned_buf.as_valid_slice());
-                    decoder.feed(returned_buf.as_valid_slice());
-                    buf_put(returned_buf);
-                }
-                // Chunkedデコード: 生のボディを抽出
-                decode_chunked_body(&full_body)
-            } else if let Some(content_len) = parsed.content_length {
-                let mut full_body = body.to_vec();
-                while full_body.len() < content_len {
-                    let buf = buf_get();
-                    let read_result = timeout(READ_TIMEOUT, backend.read(buf)).await;
-                    let (res, mut returned_buf) = match read_result {
-                        Ok(r) => r,
-                        Err(_) => break,
-                    };
-
-                    let n = match res {
-                        Ok(0) => {
-                            buf_put(returned_buf);
-                            break;
-                        }
-                        Ok(n) => n,
-                        Err(_) => {
-                            buf_put(returned_buf);
-                            break;
-                        }
-                    };
-
-                    returned_buf.set_valid_len(n);
-                    full_body.extend_from_slice(returned_buf.as_valid_slice());
-                    buf_put(returned_buf);
-                }
-                full_body
-            } else {
-                body.to_vec()
-            };
-
-            // 圧縮すべきかどうかを判定
-            let should_compress = compression.should_compress(
-                client_encoding,
-                content_type,
-                Some(final_body.len()),
-                existing_encoding,
-            );
-
-            // HTTP/2用のヘッダーを構築
-            let server_guard = get_server_header_guard();
-            let mut h2_headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(16);
-            if let Some(ref g) = server_guard {
-                h2_headers.push(g.as_header());
-            }
-
-            // 圧縮が有効な場合は Content-Encoding を追加（静的スライス、ゼロアロケーション）
-            if let Some(enc) = should_compress {
-                let encoding_name: &'static [u8] = match enc {
-                    AcceptedEncoding::Zstd => b"zstd",
-                    AcceptedEncoding::Brotli => b"br",
-                    AcceptedEncoding::Gzip => b"gzip",
-                    AcceptedEncoding::Deflate => b"deflate",
-                    AcceptedEncoding::Identity => b"",
-                };
-                if !encoding_name.is_empty() {
-                    h2_headers.push((b"content-encoding", encoding_name));
-                    h2_headers.push((b"vary", b"Accept-Encoding"));
-                }
-            }
-
-            for header in resp.headers.iter() {
-                if header.name.is_empty() {
-                    continue;
-                }
-                // ホップバイホップヘッダーを除外
-                if header.name.eq_ignore_ascii_case("connection")
-                    || header.name.eq_ignore_ascii_case("keep-alive")
-                    || header.name.eq_ignore_ascii_case("transfer-encoding")
-                {
-                    continue;
-                }
-                // 圧縮時は Content-Length と Content-Encoding をスキップ
-                if should_compress.is_some()
-                    && (header.name.eq_ignore_ascii_case("content-length")
-                        || header.name.eq_ignore_ascii_case("content-encoding"))
-                {
-                    continue;
-                }
-                h2_headers.push((header.name.as_bytes(), header.value));
-            }
-
-            // 圧縮処理
-            let response_body = if let Some(enc) = should_compress {
-                compress_body_h2(&final_body, enc, compression)
-            } else {
-                final_body
-            };
-
-            if let Err(e) = conn
-                .send_response(stream_id, status, &h2_headers, Some(&response_body))
-                .await
-            {
-                warn!("[HTTP/2] Response send error: {}", e);
-                return None;
-            }
-
-            return Some((status, response_body.len() as u64));
-        }
-
-        if response_buf.len() > MAX_HEADER_SIZE {
-            break;
-        }
-    }
-
-    let server_guard = get_server_header_guard();
-    let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-    if let Some(ref g) = server_guard {
-        headers.push(g.as_header());
-    }
-    let _ = conn
-        .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
-        .await;
-    Some((502, 11))
+    // レスポンス受信・HTTP/2 へリレー（ストリーミング/バッファリング判定込み、共通処理）
+    relay_h2_response(conn, stream_id, &mut backend, compression, client_encoding).await
 }
 
 /// HTTP/2 用レスポンスボディ圧縮ヘルパー関数

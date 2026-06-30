@@ -711,7 +711,17 @@ where
 
             // リクエストが完了したかチェック
             if end_stream {
-                return Ok(Some(ProcessedRequest { stream_id }));
+                return Ok(Some(ProcessedRequest {
+                    stream_id,
+                    body_pending: false,
+                }));
+            } else if !is_trailer {
+                // ヘッダー完了・ボディ継続: 呼び出し側にストリーミング判断の機会を与える
+                // （F-32）。適格でなければ呼び出し側は無視し、DATA は request_body へ蓄積される。
+                return Ok(Some(ProcessedRequest {
+                    stream_id,
+                    body_pending: true,
+                }));
             }
         } else {
             // CONTINUATION が続く場合、receiving_headers_stream を設定
@@ -796,7 +806,16 @@ where
             self.decode_and_set_headers(stream_id, is_trailer)?;
 
             if end_stream {
-                return Ok(Some(ProcessedRequest { stream_id }));
+                return Ok(Some(ProcessedRequest {
+                    stream_id,
+                    body_pending: false,
+                }));
+            } else if !is_trailer {
+                // 分割ヘッダー完了・ボディ継続: ストリーミング起点（F-32）
+                return Ok(Some(ProcessedRequest {
+                    stream_id,
+                    body_pending: true,
+                }));
             }
         }
 
@@ -1050,7 +1069,10 @@ where
         self.maybe_send_window_update(stream_id).await?;
 
         if end_stream {
-            Ok(Some(ProcessedRequest { stream_id }))
+            Ok(Some(ProcessedRequest {
+                stream_id,
+                body_pending: false,
+            }))
         } else {
             Ok(None)
         }
@@ -1684,7 +1706,7 @@ where
 
             // フレームを処理
             match self.process_frame(frame).await {
-                Ok(Some(req)) => {
+                Ok(Some(req)) if !req.body_pending => {
                     // リクエストが完了 - デフォルトレスポンスを送信
                     let headers: &[(&[u8], &[u8])] =
                         &[(b"content-type", b"text/plain"), (b"server", b"veil/http2")];
@@ -1702,6 +1724,10 @@ where
                             return Err(e);
                         }
                     }
+                }
+                Ok(Some(_)) => {
+                    // body_pending: ヘッダーのみ完了。ボディ受信を待つ（簡易サーバーは
+                    // ストリーミングしないため END_STREAM まで蓄積させる）。
                 }
                 Ok(None) => {
                     // フレーム処理完了、次のフレームへ
@@ -1751,6 +1777,15 @@ where
 pub struct ProcessedRequest {
     /// ストリーム ID
     pub stream_id: u32,
+    /// ヘッダーは完了したがボディ（DATA フレーム）が継続中かどうか。
+    ///
+    /// `true` の場合、HEADERS（+ CONTINUATION）が完了し疑似ヘッダーがデコード済みだが、
+    /// END_STREAM はまだ受信していない（リクエストボディが後続する）ことを示す。
+    /// F-32 リクエスト方向ストリーミングの起点で、呼び出し側はこの時点でバックエンド
+    /// 接続を開始し DATA フレームを逐次転送できる。ストリーミング非適格なら呼び出し側は
+    /// 無視してよく、その場合 DATA は従来どおり `Stream::request_body` に蓄積され、
+    /// END_STREAM 受信時に `body_pending: false` の `ProcessedRequest` が返る。
+    pub body_pending: bool,
 }
 
 #[cfg(test)]
@@ -1780,20 +1815,35 @@ mod tests {
     #[test]
     fn test_processed_request_creation() {
         // ProcessedRequestの作成
-        let req = ProcessedRequest { stream_id: 1 };
+        let req = ProcessedRequest {
+            stream_id: 1,
+            body_pending: false,
+        };
         assert_eq!(req.stream_id, 1);
+        assert!(!req.body_pending);
 
-        let req2 = ProcessedRequest { stream_id: 3 };
+        // ヘッダー完了・ボディ継続（ストリーミング起点）
+        let req2 = ProcessedRequest {
+            stream_id: 3,
+            body_pending: true,
+        };
         assert_eq!(req2.stream_id, 3);
+        assert!(req2.body_pending);
     }
 
     #[test]
     fn test_processed_request_odd_stream_ids() {
         // クライアント開始ストリームは奇数ID
-        let req = ProcessedRequest { stream_id: 1 };
+        let req = ProcessedRequest {
+            stream_id: 1,
+            body_pending: false,
+        };
         assert!(req.stream_id % 2 == 1);
 
-        let req2 = ProcessedRequest { stream_id: 5 };
+        let req2 = ProcessedRequest {
+            stream_id: 5,
+            body_pending: false,
+        };
         assert!(req2.stream_id % 2 == 1);
     }
 
