@@ -895,6 +895,26 @@ pub(crate) enum ChunkedFeedResult {
     SizeLimitExceeded,
 }
 
+/// [`ChunkedDecoder::next_data_span`] の戻り値。
+///
+/// 入力バッファ内に最初に現れた「連続したボディデータ範囲」と、フレーミングの進行状況を
+/// スカラのみで表す（ヒープ確保なし・`Copy`）。ストリーミング転送（F-32）で、読み取り
+/// バッファのサブスライスを中間 `Vec` なしに下流へそのまま送出するために使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChunkedSpan {
+    /// 入力スライス内のボディデータ開始オフセット。
+    pub(crate) data_start: usize,
+    /// ボディデータ長。0 ならこの呼び出しではデータが出現しなかった（フレーミングのみ消費）。
+    pub(crate) data_len: usize,
+    /// 入力スライスから消費したバイト数（フレーミングバイトを含む）。
+    /// 呼び出し側は `input[consumed..]` で再度呼び出してループする。
+    pub(crate) consumed: usize,
+    /// この呼び出しで終端（0 サイズチャンク + トレーラー終端）に達したか。
+    pub(crate) complete: bool,
+    /// `max_body_size` 設定時、累積ボディサイズが上限を超えたか。
+    pub(crate) limit_exceeded: bool,
+}
+
 /// Chunked転送デコーダ（ステートマシン）
 ///
 /// RFC 7230 Section 4.1に準拠し、トレーラーの有無にかかわらず
@@ -1106,6 +1126,97 @@ impl ChunkedDecoder {
             }
         }
         ChunkedFeedResult::Continue
+    }
+
+    /// 入力バッファを処理し、最初に出現する「連続したボディデータ範囲」を 1 つだけ返す。
+    ///
+    /// ストリーミング転送（F-32）用のゼロコピー API。フレーミングバイト（チャンクサイズ・
+    /// CRLF・トレーラー）は内部ステートマシンで消費し、`ReadingChunkData` 状態に入った
+    /// 時点で、この入力スライス内に存在するデータの**連続 run** を 1 回の計算で求めて
+    /// 返す（バイト単位ループや中間バッファを使わない）。返した [`ChunkedSpan`] の
+    /// `data_start..data_start+data_len` は `input` のサブスライスなので、呼び出し側は
+    /// それを下流へそのまま送出できる（コピーなし）。
+    ///
+    /// 呼び出し側は `consumed` バイトを処理済みとして `input[consumed..]` で再呼び出しし、
+    /// `consumed == input.len()` になるまでループする。`complete`/`limit_exceeded` が立った
+    /// 時点でループを終える。
+    pub(crate) fn next_data_span(&mut self, input: &[u8]) -> ChunkedSpan {
+        // 既に終端・制限超過に達していれば、これ以上入力を消費しない。
+        match self.state {
+            ChunkedState::Complete => {
+                return ChunkedSpan {
+                    data_start: 0,
+                    data_len: 0,
+                    consumed: 0,
+                    complete: true,
+                    limit_exceeded: false,
+                };
+            }
+            ChunkedState::SizeLimitExceeded => {
+                return ChunkedSpan {
+                    data_start: 0,
+                    data_len: 0,
+                    consumed: 0,
+                    complete: false,
+                    limit_exceeded: true,
+                };
+            }
+            _ => {}
+        }
+
+        let mut i = 0;
+        while i < input.len() {
+            if self.state == ChunkedState::ReadingChunkData {
+                // データ run を一括で確定（ゼロコピー: スライス範囲のみ算出）。
+                // chunk_remaining は ExpectingChunkSizeLF で >=1 が保証され、avail も >=1。
+                let avail = input.len() - i;
+                let take = (self.chunk_remaining as usize).min(avail);
+                let data_start = i;
+                self.chunk_remaining -= take as u64;
+                i += take;
+                if self.chunk_remaining == 0 {
+                    self.state = ChunkedState::ExpectingChunkDataCR;
+                }
+                return ChunkedSpan {
+                    data_start,
+                    data_len: take,
+                    consumed: i,
+                    complete: false,
+                    limit_exceeded: false,
+                };
+            }
+            match self.feed_byte(input[i]) {
+                ChunkedFeedResult::Continue => i += 1,
+                ChunkedFeedResult::Complete => {
+                    i += 1;
+                    return ChunkedSpan {
+                        data_start: 0,
+                        data_len: 0,
+                        consumed: i,
+                        complete: true,
+                        limit_exceeded: false,
+                    };
+                }
+                ChunkedFeedResult::SizeLimitExceeded => {
+                    i += 1;
+                    return ChunkedSpan {
+                        data_start: 0,
+                        data_len: 0,
+                        consumed: i,
+                        complete: false,
+                        limit_exceeded: true,
+                    };
+                }
+            }
+        }
+        // 入力を使い切った（この呼び出しではデータ run が出現せず）。
+        ChunkedSpan {
+            data_start: 0,
+            data_len: 0,
+            consumed: i,
+            complete: false,
+            limit_exceeded: false,
+        }
     }
 }
 
@@ -1359,5 +1470,154 @@ pub(crate) fn status_code_to_reason(status_code: u16) -> &'static str {
         503 => "Service Unavailable",
         504 => "Gateway Timeout",
         _ => "Unknown",
+    }
+}
+
+#[cfg(test)]
+mod chunked_span_tests {
+    use super::*;
+
+    /// `next_data_span` を入力バッファ列に対して駆動し、デコードされたボディを再構成する
+    /// テストヘルパー。各バッファを `input[consumed..]` で繰り返し処理し、データ run を連結する。
+    /// 戻り値: (再構成したボディ, 終端に達したか, 制限超過したか)。
+    fn drive(decoder: &mut ChunkedDecoder, buffers: &[&[u8]]) -> (Vec<u8>, bool, bool) {
+        let mut out = Vec::new();
+        let mut complete = false;
+        let mut limit = false;
+        for buf in buffers {
+            let mut pos = 0;
+            while pos < buf.len() {
+                let span = decoder.next_data_span(&buf[pos..]);
+                if span.data_len > 0 {
+                    let start = pos + span.data_start;
+                    out.extend_from_slice(&buf[start..start + span.data_len]);
+                }
+                pos += span.consumed;
+                if span.complete {
+                    complete = true;
+                    break;
+                }
+                if span.limit_exceeded {
+                    limit = true;
+                    break;
+                }
+                // 防御: 非空入力なら必ず 1 バイト以上消費する
+                assert!(span.consumed > 0, "next_data_span made no progress");
+            }
+            if complete || limit {
+                break;
+            }
+        }
+        (out, complete, limit)
+    }
+
+    #[test]
+    fn test_span_single_chunk() {
+        let mut d = ChunkedDecoder::new_unlimited();
+        let (body, complete, limit) = drive(&mut d, &[b"5\r\nhello\r\n0\r\n\r\n"]);
+        assert_eq!(body, b"hello");
+        assert!(complete);
+        assert!(!limit);
+        assert!(d.is_complete());
+    }
+
+    #[test]
+    fn test_span_multiple_chunks_one_buffer() {
+        let mut d = ChunkedDecoder::new_unlimited();
+        let (body, complete, _) = drive(&mut d, &[b"3\r\nfoo\r\n3\r\nbar\r\n0\r\n\r\n"]);
+        assert_eq!(body, b"foobar");
+        assert!(complete);
+    }
+
+    #[test]
+    fn test_span_data_split_across_buffers() {
+        // チャンクデータが 2 つの read バッファにまたがる
+        let mut d = ChunkedDecoder::new_unlimited();
+        let (body, complete, _) = drive(&mut d, &[b"a\r\nhel", b"loworld\r\n0\r\n\r\n"]);
+        assert_eq!(body, b"helloworld");
+        assert!(complete);
+    }
+
+    #[test]
+    fn test_span_framing_split_across_buffers() {
+        // チャンクサイズ行が境界で割れる（"1" | "0\r\n..."）
+        let mut d = ChunkedDecoder::new_unlimited();
+        let (body, complete, _) =
+            drive(&mut d, &[b"1", b"0\r\n0123456789abcdef\r\n0\r\n\r\n"]);
+        assert_eq!(body, b"0123456789abcdef");
+        assert!(complete);
+    }
+
+    #[test]
+    fn test_span_byte_by_byte() {
+        // 1 バイトずつ供給しても正しく再構成できる
+        let input = b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
+        let mut d = ChunkedDecoder::new_unlimited();
+        let mut out = Vec::new();
+        let mut complete = false;
+        for &b in input.iter() {
+            let span = d.next_data_span(&[b]);
+            if span.data_len > 0 {
+                out.push(b);
+            }
+            if span.complete {
+                complete = true;
+            }
+        }
+        assert_eq!(out, b"Wikipedia");
+        assert!(complete);
+    }
+
+    #[test]
+    fn test_span_empty_body() {
+        // 即終端（ボディなし）
+        let mut d = ChunkedDecoder::new_unlimited();
+        let (body, complete, _) = drive(&mut d, &[b"0\r\n\r\n"]);
+        assert!(body.is_empty());
+        assert!(complete);
+    }
+
+    #[test]
+    fn test_span_with_trailers() {
+        // トレーラーはボディに含めない
+        let mut d = ChunkedDecoder::new_unlimited();
+        let (body, complete, _) =
+            drive(&mut d, &[b"5\r\nhello\r\n0\r\nX-Trailer: val\r\n\r\n"]);
+        assert_eq!(body, b"hello");
+        assert!(complete);
+    }
+
+    #[test]
+    fn test_span_chunk_extension() {
+        // チャンク拡張（;以降）は無視される
+        let mut d = ChunkedDecoder::new_unlimited();
+        let (body, complete, _) = drive(&mut d, &[b"5;ext=foo\r\nhello\r\n0\r\n\r\n"]);
+        assert_eq!(body, b"hello");
+        assert!(complete);
+    }
+
+    #[test]
+    fn test_span_size_limit_exceeded() {
+        // max_body_size を超えると limit_exceeded
+        let mut d = ChunkedDecoder::new(4);
+        let (_body, complete, limit) = drive(&mut d, &[b"5\r\nhello\r\n0\r\n\r\n"]);
+        assert!(!complete);
+        assert!(limit);
+    }
+
+    #[test]
+    fn test_span_matches_decode_chunked_body() {
+        // ゼロコピー span 経路が既存の decode_chunked_body と同一出力になることを保証。
+        // さまざまな分割境界で同じ結果になることも確認する。
+        let input: &[u8] = b"1a\r\nabcdefghijklmnopqrstuvwxyz\r\n5\r\n01234\r\n0\r\n\r\n";
+        let expected = decode_chunked_body(input);
+
+        for split in 0..=input.len() {
+            let mut d = ChunkedDecoder::new_unlimited();
+            let (first, second) = input.split_at(split);
+            let (body, complete, _) = drive(&mut d, &[first, second]);
+            assert_eq!(body, expected, "mismatch at split {}", split);
+            assert!(complete, "not complete at split {}", split);
+        }
     }
 }

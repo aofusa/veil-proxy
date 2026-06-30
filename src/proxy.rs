@@ -1369,6 +1369,150 @@ where
     Ok(content_length as u64)
 }
 
+/// chunked ストリーミング 1 バッファ分の処理結果。
+#[cfg(feature = "http2")]
+enum ChunkedDrain {
+    /// まだ終端に達していない（次の read が必要）。
+    NeedMore,
+    /// 終端チャンクを検出し END_STREAM を送出した（完了）。
+    Complete,
+    /// サイズ制限超過等で RST_STREAM を送り打ち切った。
+    Aborted,
+}
+
+/// 読み取りバッファ 1 つ分の chunked データを `ChunkedDecoder::next_data_span` で
+/// ゼロコピーにデコードし、各データ run を HTTP/2 DATA フレームとして逐次送出する。
+///
+/// `data` のサブスライスをそのまま `send_data` へ渡すため、デコード済みボディの中間
+/// バッファ（`Vec`）を一切確保しない。終端チャンク検出時は END_STREAM 付き 0 長 DATA を
+/// 送ってクライアントへ完了を伝える。
+#[cfg(feature = "http2")]
+async fn h2_drain_chunked_spans<S>(
+    conn: &mut http2::Http2Connection<S>,
+    stream_id: u32,
+    decoder: &mut crate::http_utils::ChunkedDecoder,
+    data: &[u8],
+    sent: &mut u64,
+) -> http2::error::Http2Result<ChunkedDrain>
+where
+    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
+{
+    use http2::Http2ErrorCode;
+
+    let mut pos = 0;
+    while pos < data.len() {
+        let span = decoder.next_data_span(&data[pos..]);
+        if span.data_len > 0 {
+            let start = pos + span.data_start;
+            // ゼロコピー: 読み取りバッファのサブスライスを直接 DATA フレーム化する
+            conn.send_data(stream_id, &data[start..start + span.data_len], false)
+                .await?;
+            *sent += span.data_len as u64;
+        }
+        pos += span.consumed;
+        if span.complete {
+            // 終端: END_STREAM 付き 0 長 DATA でストリームを閉じる
+            conn.send_data(stream_id, &[], true).await?;
+            return Ok(ChunkedDrain::Complete);
+        }
+        if span.limit_exceeded {
+            let _ = conn
+                .send_rst_stream(stream_id, Http2ErrorCode::InternalError)
+                .await;
+            return Ok(ChunkedDrain::Aborted);
+        }
+        if span.consumed == 0 {
+            // 非空入力なら必ず進むはずだが、防御的に無限ループを防ぐ
+            break;
+        }
+    }
+    Ok(ChunkedDrain::NeedMore)
+}
+
+/// バックエンド HTTP/1.1 の **chunked**（非圧縮）レスポンスボディを HTTP/2 DATA フレーム
+/// としてストリーミング転送する（全バッファリングを排除、F-32 第2フェーズ）。
+///
+/// 従来はレスポンス全体を `full_body: Vec<u8>` に溜め `decode_chunked_body` で再アロケート
+/// していたが、本関数は `ChunkedDecoder::next_data_span` でゼロコピーに各チャンクの
+/// データ範囲（読み取りバッファのサブスライス）を取り出し、`send_data` で逐次送出する。
+/// 各 `send_data` は HTTP/2 フロー制御（conn/stream 送信ウィンドウ + WINDOW_UPDATE 待ち）に
+/// 従うため、**クライアントの受信速度に応じたバックプレッシャ**が効き、レスポンス全体を
+/// メモリに溜めない（RSS がペイロードサイズに比例しない）。トレーラーはボディに含めない。
+///
+/// ヘッダはまだ送信していない状態で呼ぶこと（本関数がヘッダと DATA フレームを送出する）。
+/// 戻り値: 送信したデコード済みボディバイト数。
+#[cfg(feature = "http2")]
+#[allow(clippy::too_many_arguments)]
+async fn stream_h2_response_body_chunked<S, R>(
+    conn: &mut http2::Http2Connection<S>,
+    stream_id: u32,
+    status: u16,
+    h2_headers: &[(&[u8], &[u8])],
+    backend: &mut R,
+    initial_body: &[u8],
+) -> http2::error::Http2Result<u64>
+where
+    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
+    R: crate::runtime::io::AsyncReadRent + Unpin,
+{
+    use http2::Http2ErrorCode;
+
+    // ヘッダ送信（END_STREAM は終端 DATA フレームで送るため false）
+    conn.send_headers(stream_id, status, h2_headers, false)
+        .await?;
+
+    let mut decoder = crate::http_utils::ChunkedDecoder::new_unlimited();
+    let mut sent: u64 = 0;
+
+    // ヘッダ直後に既読のボディ断片（chunked 生データ）をまず処理する
+    match h2_drain_chunked_spans(conn, stream_id, &mut decoder, initial_body, &mut sent).await? {
+        ChunkedDrain::Complete | ChunkedDrain::Aborted => return Ok(sent),
+        ChunkedDrain::NeedMore => {}
+    }
+
+    // 残りをバックエンドから読みつつ逐次デコード・転送する（全バッファリングなし）
+    loop {
+        let buf = buf_get();
+        let read_result = timeout(READ_TIMEOUT, backend.read(buf)).await;
+        let (res, mut returned_buf) = match read_result {
+            Ok(r) => r,
+            Err(_) => {
+                // タイムアウト: ヘッダ送信済みのため RST_STREAM で打ち切る
+                let _ = conn
+                    .send_rst_stream(stream_id, Http2ErrorCode::InternalError)
+                    .await;
+                return Ok(sent);
+            }
+        };
+        let n = match res {
+            Ok(0) => {
+                // 終端チャンク前にバックエンドが切断: END_STREAM で閉じる
+                buf_put(returned_buf);
+                conn.send_data(stream_id, &[], true).await?;
+                return Ok(sent);
+            }
+            Ok(n) => n,
+            Err(_) => {
+                buf_put(returned_buf);
+                let _ = conn
+                    .send_rst_stream(stream_id, Http2ErrorCode::InternalError)
+                    .await;
+                return Ok(sent);
+            }
+        };
+        returned_buf.set_valid_len(n);
+        // 借用は drain の await 完了で解放されるため、その後に buf_put する
+        let drain =
+            h2_drain_chunked_spans(conn, stream_id, &mut decoder, returned_buf.as_valid_slice(), &mut sent)
+                .await?;
+        buf_put(returned_buf);
+        match drain {
+            ChunkedDrain::Complete | ChunkedDrain::Aborted => return Ok(sent),
+            ChunkedDrain::NeedMore => {}
+        }
+    }
+}
+
 async fn handle_http2_proxy_http<S>(
     conn: &mut http2::Http2Connection<S>,
     stream_id: u32,
@@ -1547,6 +1691,45 @@ where
                     };
                     return Some((status, sent));
                 }
+            }
+
+            // === F-32 chunked ストリーミング経路 ===
+            // 圧縮なし + chunked の場合、レスポンス全体を full_body に溜めて
+            // decode_chunked_body で再アロケートする従来経路を避け、next_data_span で
+            // ゼロコピーにデコードしながら DATA フレームを逐次転送する（OOM 耐性 +
+            // バックプレッシャ）。トレーラーは破棄、content-length/transfer-encoding は除外。
+            if stream_compress_hint.is_none() && parsed.is_chunked {
+                let server_guard = get_server_header_guard();
+                let mut h2_headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(16);
+                if let Some(ref g) = server_guard {
+                    h2_headers.push(g.as_header());
+                }
+                for header in resp.headers.iter() {
+                    if header.name.is_empty() {
+                        continue;
+                    }
+                    if header.name.eq_ignore_ascii_case("connection")
+                        || header.name.eq_ignore_ascii_case("keep-alive")
+                        || header.name.eq_ignore_ascii_case("transfer-encoding")
+                        || header.name.eq_ignore_ascii_case("upgrade")
+                        || header.name.eq_ignore_ascii_case("content-length")
+                    {
+                        continue;
+                    }
+                    h2_headers.push((header.name.as_bytes(), header.value));
+                }
+                let sent = match stream_h2_response_body_chunked(
+                    conn, stream_id, status, &h2_headers, &mut backend, body,
+                )
+                .await
+                {
+                    Ok(n) => n,
+                    Err(e) => {
+                        warn!("[HTTP/2] Response chunked stream error: {}", e);
+                        return None;
+                    }
+                };
+                return Some((status, sent));
             }
 
             // Content-Length が chunked の場合は計算
@@ -1915,6 +2098,45 @@ where
                     };
                     return Some((status, sent));
                 }
+            }
+
+            // === F-32 chunked ストリーミング経路 ===
+            // 圧縮なし + chunked の場合、レスポンス全体を full_body に溜めて
+            // decode_chunked_body で再アロケートする従来経路を避け、next_data_span で
+            // ゼロコピーにデコードしながら DATA フレームを逐次転送する（OOM 耐性 +
+            // バックプレッシャ）。トレーラーは破棄、content-length/transfer-encoding は除外。
+            if stream_compress_hint.is_none() && parsed.is_chunked {
+                let server_guard = get_server_header_guard();
+                let mut h2_headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(16);
+                if let Some(ref g) = server_guard {
+                    h2_headers.push(g.as_header());
+                }
+                for header in resp.headers.iter() {
+                    if header.name.is_empty() {
+                        continue;
+                    }
+                    if header.name.eq_ignore_ascii_case("connection")
+                        || header.name.eq_ignore_ascii_case("keep-alive")
+                        || header.name.eq_ignore_ascii_case("transfer-encoding")
+                        || header.name.eq_ignore_ascii_case("upgrade")
+                        || header.name.eq_ignore_ascii_case("content-length")
+                    {
+                        continue;
+                    }
+                    h2_headers.push((header.name.as_bytes(), header.value));
+                }
+                let sent = match stream_h2_response_body_chunked(
+                    conn, stream_id, status, &h2_headers, &mut backend, body,
+                )
+                .await
+                {
+                    Ok(n) => n,
+                    Err(e) => {
+                        warn!("[HTTP/2] Response chunked stream error: {}", e);
+                        return None;
+                    }
+                };
+                return Some((status, sent));
             }
 
             // ボディを読む（Chunked対応）
