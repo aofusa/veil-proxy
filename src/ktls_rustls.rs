@@ -814,69 +814,89 @@ impl crate::runtime::io::AsyncReadRent for KtlsServerStream {
             return self.inner.read(buf).await;
         }
 
-        // rustls 経由で読み込み
-        let conn = match &mut self.conn {
-            Some(c) => c,
-            None => {
-                return (
-                    Err(io::Error::new(io::ErrorKind::Other, "No TLS connection")),
-                    buf,
-                )
-            }
-        };
-
         let fd = self.inner.as_raw_fd();
         let mut read_buf = vec![0u8; 16384];
+        let mut plain = [0u8; 16384];
 
         loop {
-            // 既にデコードされたデータがあるか確認
-            let slice =
-                unsafe { std::slice::from_raw_parts_mut(buf.write_ptr(), buf.bytes_total()) };
-
-            let mut rd = conn.reader();
-            match std::io::Read::read(&mut rd, slice) {
-                Ok(n) if n > 0 => {
-                    unsafe { buf.set_init(n) };
-                    return (Ok(n), buf);
+            // rustls が復号済みの平文を drained_buffer へ全量取り出す。
+            // これにより received_plaintext バッファ（rustls 既定 16KB 上限）が溢れず、
+            // 大容量バースト（HTTP/2 アップロード等）でも read_tls が
+            // "received plaintext buffer full" を返さない（F-32 リクエストストリーミング）。
+            {
+                let conn = match self.conn.as_mut() {
+                    Some(c) => c,
+                    None => {
+                        return (
+                            Err(io::Error::new(io::ErrorKind::Other, "No TLS connection")),
+                            buf,
+                        )
+                    }
+                };
+                loop {
+                    match std::io::Read::read(&mut conn.reader(), &mut plain) {
+                        Ok(0) => break,
+                        Ok(m) => self.drained_buffer.extend_from_slice(&plain[..m]),
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(_) => break,
+                    }
                 }
-                Ok(0) if !conn.wants_read() => {
-                    return (Ok(0), buf);
-                }
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                Err(e) => return (Err(e), buf),
             }
 
-            // TLS データを読み込む
-            loop {
-                match raw_read(fd, &mut read_buf) {
-                    Ok(0) => {
-                        return (Ok(0), buf);
-                    }
-                    Ok(n) => {
-                        // read_tls が全てのデータを消費するまでループ
-                        let mut consumed = 0;
-                        while consumed < n {
-                            let remaining = &read_buf[consumed..n];
-                            let tls_read = match conn.read_tls(&mut &*remaining) {
+            // 取り出した平文をユーザーバッファへ返す
+            if !self.drained_buffer.is_empty() {
+                let len = std::cmp::min(self.drained_buffer.len(), buf.bytes_total());
+                unsafe {
+                    std::ptr::copy_nonoverlapping(self.drained_buffer.as_ptr(), buf.write_ptr(), len);
+                    buf.set_init(len);
+                }
+                self.drained_buffer.drain(..len);
+                return (Ok(len), buf);
+            }
+
+            // 平文が無い → 生 TLS を読み足してデコードする
+            match raw_read(fd, &mut read_buf) {
+                Ok(0) => return (Ok(0), buf), // EOF
+                Ok(n) => {
+                    let conn = match self.conn.as_mut() {
+                        Some(c) => c,
+                        None => {
+                            return (
+                                Err(io::Error::new(io::ErrorKind::Other, "No TLS connection")),
+                                buf,
+                            )
+                        }
+                    };
+                    let mut consumed = 0;
+                    while consumed < n {
+                        let tls_read = match conn.read_tls(&mut &read_buf[consumed..n]) {
+                            Ok(0) => break,
+                            Ok(r) => r,
+                            Err(e) => return (Err(e), buf),
+                        };
+                        consumed += tls_read;
+                        if let Err(e) = conn.process_new_packets() {
+                            return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
+                        }
+                        // 各 process 後に平文を drained_buffer へ退避し、received_plaintext を
+                        // 空に保つ（残りの生 TLS 投入で上限超過させないため）。
+                        loop {
+                            match std::io::Read::read(&mut conn.reader(), &mut plain) {
                                 Ok(0) => break,
-                                Ok(r) => r,
-                                Err(e) => return (Err(e), buf),
-                            };
-                            consumed += tls_read;
-                            if let Err(e) = conn.process_new_packets() {
-                                return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
+                                Ok(m) => self.drained_buffer.extend_from_slice(&plain[..m]),
+                                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                                Err(_) => break,
                             }
                         }
-                        break;
                     }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        if let Err(e) = self.inner.readable().await {
-                            return (Err(e), buf);
-                        }
-                    }
-                    Err(e) => return (Err(e), buf),
+                    // ループ先頭へ戻り drained_buffer をユーザーへ返す
                 }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if let Err(e) = self.inner.readable().await {
+                        return (Err(e), buf);
+                    }
+                }
+                Err(e) => return (Err(e), buf),
             }
         }
     }
@@ -985,64 +1005,82 @@ impl crate::runtime::io::AsyncReadRent for KtlsClientStream {
             return self.inner.read(buf).await;
         }
 
-        let conn = match &mut self.conn {
-            Some(c) => c,
-            None => {
-                return (
-                    Err(io::Error::new(io::ErrorKind::Other, "No TLS connection")),
-                    buf,
-                )
-            }
-        };
-
         let fd = self.inner.as_raw_fd();
         let mut read_buf = vec![0u8; 16384];
+        let mut plain = [0u8; 16384];
 
         loop {
-            let slice =
-                unsafe { std::slice::from_raw_parts_mut(buf.write_ptr(), buf.bytes_total()) };
-
-            let mut rd = conn.reader();
-            match std::io::Read::read(&mut rd, slice) {
-                Ok(n) if n > 0 => {
-                    unsafe { buf.set_init(n) };
-                    return (Ok(n), buf);
+            // rustls が復号済みの平文を drained_buffer へ全量取り出す（received_plaintext
+            // 既定 16KB 上限の溢れ防止。サーバ側 read と同方針）。
+            {
+                let conn = match self.conn.as_mut() {
+                    Some(c) => c,
+                    None => {
+                        return (
+                            Err(io::Error::new(io::ErrorKind::Other, "No TLS connection")),
+                            buf,
+                        )
+                    }
+                };
+                loop {
+                    match std::io::Read::read(&mut conn.reader(), &mut plain) {
+                        Ok(0) => break,
+                        Ok(m) => self.drained_buffer.extend_from_slice(&plain[..m]),
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(_) => break,
+                    }
                 }
-                Ok(0) if !conn.wants_read() => {
-                    return (Ok(0), buf);
-                }
-                Ok(_) => {} // Not EOF yet, need more TLS data
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {} // Need more TLS data
-                Err(e) => return (Err(e), buf), // Return actual errors
             }
 
-            loop {
-                match raw_read(fd, &mut read_buf) {
-                    Ok(0) => return (Ok(0), buf),
-                    Ok(n) => {
-                        // read_tls が全てのデータを消費するまでループ
-                        let mut consumed = 0;
-                        while consumed < n {
-                            let remaining = &read_buf[consumed..n];
-                            let tls_read = match conn.read_tls(&mut &*remaining) {
+            if !self.drained_buffer.is_empty() {
+                let len = std::cmp::min(self.drained_buffer.len(), buf.bytes_total());
+                unsafe {
+                    std::ptr::copy_nonoverlapping(self.drained_buffer.as_ptr(), buf.write_ptr(), len);
+                    buf.set_init(len);
+                }
+                self.drained_buffer.drain(..len);
+                return (Ok(len), buf);
+            }
+
+            match raw_read(fd, &mut read_buf) {
+                Ok(0) => return (Ok(0), buf),
+                Ok(n) => {
+                    let conn = match self.conn.as_mut() {
+                        Some(c) => c,
+                        None => {
+                            return (
+                                Err(io::Error::new(io::ErrorKind::Other, "No TLS connection")),
+                                buf,
+                            )
+                        }
+                    };
+                    let mut consumed = 0;
+                    while consumed < n {
+                        let tls_read = match conn.read_tls(&mut &read_buf[consumed..n]) {
+                            Ok(0) => break,
+                            Ok(r) => r,
+                            Err(e) => return (Err(e), buf),
+                        };
+                        consumed += tls_read;
+                        if let Err(e) = conn.process_new_packets() {
+                            return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
+                        }
+                        loop {
+                            match std::io::Read::read(&mut conn.reader(), &mut plain) {
                                 Ok(0) => break,
-                                Ok(r) => r,
-                                Err(e) => return (Err(e), buf),
-                            };
-                            consumed += tls_read;
-                            if let Err(e) = conn.process_new_packets() {
-                                return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
+                                Ok(m) => self.drained_buffer.extend_from_slice(&plain[..m]),
+                                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                                Err(_) => break,
                             }
                         }
-                        break;
                     }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        if let Err(e) = self.inner.readable().await {
-                            return (Err(e), buf);
-                        }
-                    }
-                    Err(e) => return (Err(e), buf),
                 }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if let Err(e) = self.inner.readable().await {
+                        return (Err(e), buf);
+                    }
+                }
+                Err(e) => return (Err(e), buf),
             }
         }
     }
