@@ -1,0 +1,34 @@
+# syntax=docker/dockerfile:1
+
+
+# musl 静的リンクビルド + scratch ランタイム
+FROM messense/rust-musl-cross:x86_64-musl AS builder
+
+ARG CARGO_FEATURES=full
+ARG RUST_TARGET=x86_64-unknown-linux-musl
+
+WORKDIR /app
+COPY . /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        nasm \
+        cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+# 単体テスト・統合テスト（E2E は除外）
+RUN cargo test --bins --features "${CARGO_FEATURES}" --locked && \
+    cargo build --release --target "${RUST_TARGET}" --features "${CARGO_FEATURES}" --locked
+
+
+FROM scratch AS runtime
+
+ARG RUST_TARGET=x86_64-unknown-linux-musl
+
+COPY --from=builder /app/target/${RUST_TARGET}/release/veil /veil
+COPY --from=builder /app/docker/assets/conf.d/config.toml /etc/veil/conf.d/config.toml
+COPY --from=builder /app/docker/assets/www/index.html /var/www/index.html
+
+EXPOSE 80/tcp 443/tcp
+
+CMD ["./veil", "-c", "/etc/veil/conf.d/config.toml"]

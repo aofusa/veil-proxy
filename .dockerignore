@@ -1,0 +1,9 @@
+# すべて除外（ホワイトリストの基盤）
+**
+
+# 必要なファイルだけ許可
+!Cargo.toml
+!Cargo.lock
+!src/
+!benches/
+!docker/assets
