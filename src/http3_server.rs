@@ -1886,11 +1886,14 @@ fn build_h1_request_head(
 
     for header in headers {
         let name = header.name();
+        // B-11: expect はプロキシが終端する（ボディを無条件転送するため、バックエンドに
+        // 100 Continue 中間応答を出させない）。
         if name.starts_with(b":")
             || name.eq_ignore_ascii_case(b"connection")
             || name.eq_ignore_ascii_case(b"keep-alive")
             || name.eq_ignore_ascii_case(b"transfer-encoding")
             || name.eq_ignore_ascii_case(b"content-length")
+            || name.eq_ignore_ascii_case(b"expect")
         {
             continue;
         }

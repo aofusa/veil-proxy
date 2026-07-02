@@ -868,6 +868,27 @@ pub(crate) struct ParsedResponse {
     pub(crate) is_connection_close: bool,
 }
 
+/// バックエンド応答バッファ先頭の 1xx 中間応答を読み捨てる（B-11）。
+///
+/// RFC 9110 §15.2: 1xx（情報）応答は最終応答に先行する中間応答で、ボディを持たない。
+/// 本プロキシは `Expect: 100-continue` に対して自ら 100 を応答し、リクエストボディを
+/// 無条件に転送するため、バックエンド由来の中間応答（100 Continue / 103 Early Hints 等）は
+/// クライアントへ転送せず読み捨てる。101 Switching Protocols のみ最終応答として扱う
+/// （WebSocket 等のアップグレード応答）。
+///
+/// 中間応答のヘッド（`\r\n\r\n` まで）を drain した後、呼び出し側は通常どおり
+/// [`parse_http_response`] で最終応答を解析すればよい（中間応答のヘッドだけが先行到着した
+/// 場合はバッファが空になり、呼び出し側の読み取りループが継続する）。
+pub(crate) fn drain_interim_responses(accumulated: &mut Vec<u8>) {
+    while let Some(parsed) = parse_http_response(accumulated) {
+        if (100..=199).contains(&parsed.status_code) && parsed.status_code != 101 {
+            accumulated.drain(..parsed.header_len);
+        } else {
+            break;
+        }
+    }
+}
+
 /// HTTPレスポンスをhttparseで解析
 ///
 /// httparseを使用することで以下のメリットがある:
@@ -1737,5 +1758,59 @@ mod stack_fmt_tests {
         let hp = HostPortStr::new(&host, 65535);
         assert_eq!(hp.as_str(), format!("{host}:65535"));
         assert!(matches!(hp, HostPortStr::Heap(_)));
+    }
+
+    // B-11: 1xx 中間応答の読み捨て
+    #[test]
+    fn drain_interim_skips_100_before_final_response() {
+        let mut buf =
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec();
+        drain_interim_responses(&mut buf);
+        let parsed = parse_http_response(&buf).expect("final response should parse");
+        assert_eq!(parsed.status_code, 200);
+        assert_eq!(parsed.content_length, Some(2));
+    }
+
+    #[test]
+    fn drain_interim_skips_multiple_interims() {
+        let mut buf = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </s.css>; rel=preload\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n".to_vec();
+        drain_interim_responses(&mut buf);
+        let parsed = parse_http_response(&buf).expect("final response should parse");
+        assert_eq!(parsed.status_code, 204);
+    }
+
+    #[test]
+    fn drain_interim_handles_lone_interim_head() {
+        // 中間応答のヘッドだけが先行到着 → バッファは空になり、最終応答は次の read を待つ。
+        let mut buf = b"HTTP/1.1 100 Continue\r\n\r\n".to_vec();
+        drain_interim_responses(&mut buf);
+        assert!(buf.is_empty());
+        assert!(parse_http_response(&buf).is_none());
+    }
+
+    #[test]
+    fn drain_interim_preserves_101_switching_protocols() {
+        // 101 はアップグレードの最終応答として扱い読み捨てない。
+        let mut buf = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n".to_vec();
+        drain_interim_responses(&mut buf);
+        let parsed = parse_http_response(&buf).expect("101 should remain");
+        assert_eq!(parsed.status_code, 101);
+    }
+
+    #[test]
+    fn drain_interim_noop_for_final_response() {
+        let mut buf = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec();
+        let before = buf.clone();
+        drain_interim_responses(&mut buf);
+        assert_eq!(buf, before);
+    }
+
+    #[test]
+    fn drain_interim_noop_for_partial_head() {
+        // ヘッダ未完（\r\n\r\n 未到着）は何もしない。
+        let mut buf = b"HTTP/1.1 100 Continue\r\n".to_vec();
+        let before = buf.clone();
+        drain_interim_responses(&mut buf);
+        assert_eq!(buf, before);
     }
 }

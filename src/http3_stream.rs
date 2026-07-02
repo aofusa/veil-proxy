@@ -537,7 +537,9 @@ async fn stream_response(
             }
         };
         head_buf.extend_from_slice(&read_buf[..n]);
-        if let Some(pos) = find_header_end(&head_buf) {
+        // B-11: 1xx 中間応答（101 以外）は読み捨てて最終応答を待つ（バッファ内に後続の
+        // 最終応答ヘッドが既に届いている場合があるため、読み取りせずに再検査する）。
+        if let Some(pos) = drain_interim_and_find_header_end(&mut head_buf) {
             header_end = pos;
             break;
         }
@@ -1065,6 +1067,22 @@ fn parse_response_headers(header_bytes: &[u8]) -> ParsedHeaders {
     }
 }
 
+/// 先頭の 1xx 中間応答（101 以外）を読み捨てた上でヘッダ終端位置を返す（B-11）。
+///
+/// バックエンドが 100 Continue / 103 Early Hints 等の中間応答を最終応答より先に
+/// 送ってきた場合、そのヘッドを drain して最終応答の解析に進む（1xx にボディはない）。
+fn drain_interim_and_find_header_end(head_buf: &mut Vec<u8>) -> Option<usize> {
+    loop {
+        let pos = find_header_end(head_buf)?;
+        let status = parse_status_code(&head_buf[..pos]).unwrap_or(502);
+        if (100..=199).contains(&status) && status != 101 {
+            head_buf.drain(..pos + 4);
+            continue;
+        }
+        return Some(pos);
+    }
+}
+
 /// HTTP レスポンスのヘッダ終端（`\r\n\r\n`）位置を返す。
 fn find_header_end(data: &[u8]) -> Option<usize> {
     let mut search_from = 0;
@@ -1180,6 +1198,23 @@ mod tests {
         let mut b = Vec::new();
         push_chunk_size_line(&mut b, 7000);
         assert_eq!(b, format!("{:x}\r\n", 7000).into_bytes());
+    }
+
+    // B-11: 1xx 中間応答の読み捨て（ストリーミング経路）
+    #[test]
+    fn drain_interim_and_find_header_end_skips_100() {
+        let mut buf = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+            .to_vec();
+        let pos = drain_interim_and_find_header_end(&mut buf).expect("final head");
+        assert_eq!(parse_status_code(&buf[..pos]), Some(200));
+    }
+
+    #[test]
+    fn drain_interim_and_find_header_end_waits_for_final() {
+        // 中間応答のみ到着 → None（呼び出し側が次の read を待つ）。
+        let mut buf = b"HTTP/1.1 100 Continue\r\n\r\n".to_vec();
+        assert!(drain_interim_and_find_header_end(&mut buf).is_none());
+        assert!(buf.is_empty());
     }
 
     #[test]

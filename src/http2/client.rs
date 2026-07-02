@@ -190,11 +190,14 @@ where
 
         for &(name, value) in headers {
             // 疑似ヘッダーとホップバイホップヘッダーをスキップ
+            // B-11: expect はプロキシが終端する（ボディを全量送信するため、バックエンドに
+            // 100 Continue 中間応答を出させない）。
             if name.starts_with(b":")
                 || name.eq_ignore_ascii_case(b"connection")
                 || name.eq_ignore_ascii_case(b"keep-alive")
                 || name.eq_ignore_ascii_case(b"transfer-encoding")
                 || name.eq_ignore_ascii_case(b"host")
+                || name.eq_ignore_ascii_case(b"expect")
             {
                 continue;
             }

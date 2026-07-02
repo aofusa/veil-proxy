@@ -8104,6 +8104,110 @@ async fn test_100_continue() {
     panic!("100-continue request failed after 3 attempts");
 }
 
+/// B-11: Expect: 100-continue で **100 受信後にボディを送信する**（curl と同じ）クライアント。
+///
+/// hyper クライアントは Expect を付けてもボディを即送信するため、「プロキシが 100 を返し、
+/// クライアントがそれを待ってからボディを送る」本来の RFC フローはこのテストでしか踏まない。
+/// 旧実装では、プロキシが Expect をバックエンドへ転送 → バックエンド（veil）が独自の
+/// 100 Continue を返す → その 100 が最終応答と別セグメントで先着するとプロキシが最終応答と
+/// 誤認して転送し、本物の 200 が届かずクライアントが永久待機（間欠ハング）していた。
+/// 修正後は Expect がバックエンドへ転送されず（+ 1xx 中間応答は読み捨て）、常に
+/// 「100 Continue → 200 最終応答」の順で 1 回ずつ届くことを検証する。
+#[tokio::test]
+#[ntest::timeout(60000)]
+async fn test_100_continue_deferred_body() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let body = vec![b'a'; 100];
+
+    // 旧実装の再現率は 1 回あたり 10〜20% 程度（セグメント分割タイミング依存）のため、
+    // 30 回連続で全て成功することを要求して回帰を検出する（1 回 ~60ms）。
+    for round in 0..30u32 {
+        let connector = tokio_rustls::TlsConnector::from(create_client_config());
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", PROXY_PORT))
+            .await
+            .expect("TCP connect failed");
+        let server_name = ServerName::try_from("localhost").unwrap();
+        let mut tls = tokio::time::timeout(
+            Duration::from_secs(5),
+            connector.connect(server_name, tcp),
+        )
+        .await
+        .expect("TLS handshake timed out")
+        .expect("TLS handshake failed");
+
+        // 1. ヘッダーのみ送信（ボディは 100 受信後）。
+        let head = format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        tls.write_all(head.as_bytes()).await.expect("head write failed");
+
+        // 2. 100 Continue を待つ。
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = tokio::time::timeout_at(deadline, tls.read(&mut tmp))
+                .await
+                .unwrap_or_else(|_| panic!("round {}: timed out waiting for 100 Continue", round))
+                .expect("read failed");
+            assert!(n > 0, "round {}: connection closed before 100 Continue", round);
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        let text = String::from_utf8_lossy(&buf);
+        assert!(
+            text.starts_with("HTTP/1.1 100"),
+            "round {}: expected 100 Continue first, got: {}",
+            round,
+            text.lines().next().unwrap_or("")
+        );
+        // 100 のヘッド以降を保持（最終応答の先頭が同時に届いた場合に備える）。
+        let head_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let mut resp = buf.split_off(head_end);
+
+        // 3. ボディ送信。
+        tls.write_all(&body).await.expect("body write failed");
+
+        // 4. 最終応答を受信（Connection: close なので EOF まで）。
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let n = match tokio::time::timeout_at(deadline, tls.read(&mut tmp)).await {
+                Ok(Ok(n)) => n,
+                Ok(Err(_)) => break, // close_notify なしの切断も許容
+                Err(_) => panic!(
+                    "round {}: timed out waiting for final response (B-11 hang regression). got so far: {:?}",
+                    round,
+                    String::from_utf8_lossy(&resp).lines().next().unwrap_or("")
+                ),
+            };
+            if n == 0 {
+                break;
+            }
+            resp.extend_from_slice(&tmp[..n]);
+        }
+        let resp_text = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_text.starts_with("HTTP/1.1 200"),
+            "round {}: expected final 200 OK, got: {}",
+            round,
+            resp_text.lines().next().unwrap_or("(empty)")
+        );
+        // バックエンド由来の 100 Continue が最終応答として転送されていない（1 応答のみ）。
+        assert_eq!(
+            resp_text.matches("HTTP/1.1 100").count(),
+            0,
+            "round {}: interim 100 from backend must not be forwarded as final response",
+            round
+        );
+    }
+}
+
 #[tokio::test]
 #[ntest::timeout(15000)]
 async fn test_buffering_chunked_response() {

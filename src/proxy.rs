@@ -5626,6 +5626,13 @@ async fn handle_proxy(
             continue;
         }
 
+        // B-11: Expect: 100-continue はプロキシが終端する（自ら 100 Continue を応答し、
+        // ボディを無条件に転送する）ため、バックエンドへは転送しない。転送すると
+        // バックエンドが独自の 100 Continue 中間応答を返し、応答解析と競合する。
+        if name.eq_ignore_ascii_case(b"expect") {
+            continue;
+        }
+
         // 設定で削除が指定されているヘッダーをスキップ
         // eq_ignore_ascii_case でアロケーションなしに大文字小文字無視比較
         if security
@@ -6634,6 +6641,9 @@ where
         accumulated.extend_from_slice(returned_buf.as_valid_slice());
         buf_put(returned_buf);
 
+        // B-11: バックエンド由来の 1xx 中間応答を読み捨てる。
+        drain_interim_responses(&mut accumulated);
+
         // ヘッダーが完全に受信されたかチェック
         if let Some(parsed) = parse_http_response(&accumulated) {
             let status_code = parsed.status_code;
@@ -7268,6 +7278,10 @@ async fn transfer_response_with_compression(
         returned_buf.set_valid_len(n);
         accumulated.extend_from_slice(returned_buf.as_valid_slice());
         buf_put(returned_buf);
+
+        // B-11: バックエンド由来の 1xx 中間応答（100 Continue / 103 Early Hints 等）を
+        // 読み捨てる（最終応答と誤認して転送するとクライアントが最終応答を待ち続ける）。
+        drain_interim_responses(&mut accumulated);
 
         // ヘッダーが完全に受信されたかチェック
         if let Some(parsed) = parse_http_response(&accumulated) {
@@ -8255,6 +8269,9 @@ async fn splice_transfer_response_ktls(
 
         accumulated.extend_from_slice(&header_buf[..n]);
 
+        // B-11: バックエンド由来の 1xx 中間応答を読み捨てる。
+        drain_interim_responses(&mut accumulated);
+
         // ヘッダーが完全に受信されたかチェック
         if let Some(parsed) = parse_http_response(&accumulated) {
             status_code = parsed.status_code;
@@ -8692,6 +8709,10 @@ async fn transfer_https_response_with_compression(
         returned_buf.set_valid_len(n);
         accumulated.extend_from_slice(returned_buf.as_valid_slice());
         buf_put(returned_buf);
+
+        // B-11: バックエンド由来の 1xx 中間応答（100 Continue / 103 Early Hints 等）を
+        // 読み捨てる（最終応答と誤認して転送するとクライアントが最終応答を待ち続ける）。
+        drain_interim_responses(&mut accumulated);
 
         // ヘッダーが完全に受信されたかチェック
         if let Some(parsed) = parse_http_response(&accumulated) {
