@@ -73,7 +73,7 @@
 | F-35 | P3 | 一部完了 | [features/F-35-xdp-ebpf-ddos-defense.md](features/F-35-xdp-ebpf-ddos-defense.md) | ユーザースペース最前線（accept 段の IP ブロックリスト、TLS 前に切断）を実装。XDP/eBPF 本体は専用環境（CAP_BPF/対応NIC）が必要で継続 |
 | F-36 | P3 | 完了 | [features/F-36-wasm-cwasm-aot-cache.md](features/F-36-wasm-cwasm-aot-cache.md) | WASM cwasm AOT 事前コンパイルキャッシュ |
 | F-37 | P3 | 完了 | [features/F-37-runtime-optable-hotpath.md](features/F-37-runtime-optable-hotpath.md) | ランタイム最ホットパスの per-op コスト排除（OP_TABLE の SipHash→Fibonacci 軽量ハッシュ＋事前確保、user_data 採番を グローバルアトミック→スレッドローカル化で偽共有排除）。F-34 姉妹最適化 |
-| F-38 | P1 | 未着手 | [features/F-38-iouring-restrictions-security-integration.md](features/F-38-iouring-restrictions-security-integration.md) | io_uring オペコード制限の security.rs 統合と stale monoio スタブ解消（制限本体は F-28 でランタイム実装済み） |
+| F-38 | P1 | 完了 | [features/F-38-iouring-restrictions-security-integration.md](features/F-38-iouring-restrictions-security-integration.md) | io_uring オペコード制限の security.rs 統合と stale monoio スタブ解消（制限本体は F-28 でランタイム実装済み。dead stub 削除・報告修正・許可リストレビュー） |
 | F-39 | P1 | 未着手 | [features/F-39-http-proxy-iouring-splice.md](features/F-39-http-proxy-iouring-splice.md) | HTTP プロキシ層の libc::splice を io_uring 非同期 splice（IORING_OP_SPLICE）に統一 |
 | F-40 | P2 | 未着手 | [features/F-40-l4-pipe-threadlocal-pool.md](features/F-40-l4-pipe-threadlocal-pool.md) | L4 プロキシの splice パイプをスレッドローカルプールで再利用（接続ごと pipe2(2) 排除） |
 | F-41 | P1 | 未着手 | [features/F-41-proxy-per-conn-alloc-elimination.md](features/F-41-proxy-per-conn-alloc-elimination.md) | proxy.rs 接続ごとの client_ip / host:port アロケーション排除（F-29 残件） |

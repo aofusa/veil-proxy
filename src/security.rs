@@ -29,80 +29,23 @@
 //! リバースプロキシに必要な最小限のシステムコールのみを許可し、
 //! その他のシステムコールは拒否します。
 
-use ftlog::{debug, error, info, warn};
+use ftlog::{debug, info, warn};
 use std::io;
 
 // ====================
-// io_uring 制限定数
+// io_uring オペコード制限
 // ====================
 //
-// Linux カーネル 5.10+ で導入された `IORING_REGISTER_RESTRICTIONS` 用の定数。
-// monoio は io_uring の低レベル API を公開していないため、
-// 現在は情報提供のみ。将来の拡張に備えて定義。
-// ====================
-
-/// IORING_REGISTER_RESTRICTIONS オペコード
-/// Linux kernel 5.10+ で利用可能
-#[allow(dead_code)]
-const IORING_REGISTER_RESTRICTIONS: u32 = 11;
-
-/// IORING_REGISTER_ENABLE_RINGS (制限適用後にリングを有効化)
-#[allow(dead_code)]
-const IORING_REGISTER_ENABLE_RINGS: u32 = 10;
-
-/// 制限タイプ: SQE オペコードを許可
-#[allow(dead_code)]
-const IORING_RESTRICTION_REGISTER_OP: u16 = 0;
-
-/// 制限タイプ: SQE オペコードを許可
-#[allow(dead_code)]
-const IORING_RESTRICTION_SQE_OP: u16 = 1;
-
-/// 制限タイプ: SQE フラグを許可
-#[allow(dead_code)]
-const IORING_RESTRICTION_SQE_FLAGS_ALLOWED: u16 = 2;
-
-/// 制限タイプ: SQE フラグを必須
-#[allow(dead_code)]
-const IORING_RESTRICTION_SQE_FLAGS_REQUIRED: u16 = 3;
-
-// ====================
-// io_uring オペコード定義
-// ====================
+// `IORING_REGISTER_RESTRICTIONS`（Linux 5.10+）によるオペコード制限は、
+// カスタム io_uring ランタイム側（`crate::runtime`）で実装・適用済み。
 //
-// monoio (リバースプロキシ) で使用される io_uring オペコード。
-// これらのみを許可することで、攻撃対象面を最小化できます。
+// - 実装: `src/runtime/ring.rs` の `IoUring::apply_restrictions()` / `enable_rings()`
+// - 適用: `src/runtime/executor.rs` の `init_ring()` が各ワーカースレッドのリング生成時に
+//   「R_DISABLED で生成 → `PROXY_ALLOWED_OPCODES` を登録 → ENABLE_RINGS」の順で適用する。
+// - 許可リスト: `crate::runtime::executor::PROXY_ALLOWED_OPCODES`（単一の正）。
+//
+// 本モジュールに io_uring 制限の実装は無い（重複定義を置かない）。
 // ====================
-
-/// リバースプロキシで許可すべきオペコードのリスト
-#[allow(dead_code)]
-pub const ALLOWED_URING_OPCODES: &[u8] = &[
-    0,  // IORING_OP_NOP
-    1,  // IORING_OP_READV
-    2,  // IORING_OP_WRITEV
-    4,  // IORING_OP_FSYNC (ログファイル用)
-    5,  // IORING_OP_READ_FIXED
-    6,  // IORING_OP_WRITE_FIXED
-    7,  // IORING_OP_POLL_ADD
-    8,  // IORING_OP_POLL_REMOVE
-    13, // IORING_OP_ACCEPT
-    14, // IORING_OP_ASYNC_CANCEL
-    16, // IORING_OP_CONNECT
-    18, // IORING_OP_TIMEOUT
-    19, // IORING_OP_TIMEOUT_REMOVE
-    21, // IORING_OP_SEND
-    22, // IORING_OP_RECV
-    23, // IORING_OP_OPENAT
-    24, // IORING_OP_CLOSE
-    25, // IORING_OP_FILES_UPDATE
-    26, // IORING_OP_STATX
-    27, // IORING_OP_READ
-    28, // IORING_OP_WRITE
-    32, // IORING_OP_SENDMSG (UDP/HTTP3用)
-    33, // IORING_OP_RECVMSG (UDP/HTTP3用)
-    36, // IORING_OP_SPLICE (kTLS用)
-    45, // IORING_OP_SOCKET
-];
 
 // ====================
 // seccomp システムコール定数
@@ -112,7 +55,7 @@ pub const ALLOWED_URING_OPCODES: &[u8] = &[
 // systemd の SystemCallFilter と互換性があります。
 //
 // カテゴリ別の必要性:
-// - io_uring: monoio ランタイムの基盤
+// - io_uring: カスタム io_uring ランタイム（src/runtime/）の基盤
 // - ネットワーク: TCP/UDP ソケット操作
 // - ファイルI/O: 設定ファイル、証明書、ログ
 // - メモリ: mimalloc、Huge Pages、io_uring 登録バッファ
@@ -153,7 +96,7 @@ pub const SYSTEMD_SYSCALL_FILTER: &str = r#"
 #
 # ============================================
 
-# --- 必須: io_uring (monoio ランタイム) ---
+# --- 必須: io_uring (カスタム io_uring ランタイム) ---
 io_uring_setup
 io_uring_enter
 io_uring_register
@@ -189,7 +132,7 @@ sched_getaffinity
 #[cfg(target_arch = "x86_64")]
 pub const ALLOWED_SYSCALLS: &[i64] = &[
     // ============================================
-    // io_uring 関連（monoio ランタイム必須）
+    // io_uring 関連（カスタム io_uring ランタイム必須）
     // ============================================
     425, // io_uring_setup
     426, // io_uring_enter
@@ -216,7 +159,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     257, // openat
     262, // newfstatat
     275, // splice (kTLS ゼロコピー転送)
-    332, // statx (monoio 非同期ファイルI/Oで使用)
+    332, // statx (非同期ファイル I/O offload で使用)
     // ============================================
     // DNS名前解決 (getaddrinfo)
     // ============================================
@@ -309,7 +252,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     302, // prlimit64
     318, // getrandom (TLS 乱数生成)
     // ============================================
-    // epoll (monoio フォールバック、io_uring 非対応環境)
+    // epoll (io_uring 非対応環境のフォールバック・補助 I/O)
     // ============================================
     213, // epoll_create (レガシー)
     232, // epoll_wait
@@ -324,9 +267,9 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     77,  // ftruncate
     285, // fallocate
     // ============================================
-    // イベント・タイマー（monoio io_uring ランタイム必須）
+    // イベント・タイマー（io_uring ランタイム・offload 必須）
     // ============================================
-    283, // timerfd_create (monoio enable_timer() 必須)
+    283, // timerfd_create (ランタイムのタイマー機構で使用)
     286, // timerfd_settime
     287, // timerfd_gettime
     290, // eventfd2 (io_uring イベント通知)
@@ -337,7 +280,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
 #[cfg(target_arch = "aarch64")]
 pub const ALLOWED_SYSCALLS: &[i64] = &[
     // ============================================
-    // io_uring 関連（monoio ランタイム必須）
+    // io_uring 関連（カスタム io_uring ランタイム必須）
     // ============================================
     425, // io_uring_setup
     426, // io_uring_enter
@@ -362,7 +305,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     78,  // readlinkat (canonicalize() で使用)
     79,  // fstatat
     80,  // fstat
-    291, // statx (monoio 非同期ファイルI/Oで使用)
+    291, // statx (非同期ファイル I/O offload で使用)
     199, // socketpair (NSS内部通信)
     // ============================================
     // ネットワーク
@@ -463,9 +406,9 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     46, // ftruncate
     47, // fallocate
     // ============================================
-    // イベント・タイマー（monoio io_uring ランタイム必須）
+    // イベント・タイマー（io_uring ランタイム・offload 必須）
     // ============================================
-    85, // timerfd_create (monoio enable_timer() 必須)
+    85, // timerfd_create (ランタイムのタイマー機構で使用)
     86, // timerfd_settime
     87, // timerfd_gettime
     19, // eventfd2 (io_uring イベント通知)
@@ -509,8 +452,11 @@ impl SeccompMode {
 /// セキュリティ設定
 #[derive(Debug, Clone)]
 pub struct SecurityConfig {
-    /// io_uring の操作制限を有効化
-    /// 注意: monoio が低レベル API を公開していないため、現在は効果なし
+    /// io_uring の操作制限（IORING_REGISTER_RESTRICTIONS）
+    ///
+    /// 制限の適用自体はカスタム io_uring ランタイムが各ワーカースレッドの
+    /// リング生成時（`runtime::executor::init_ring`）に行う。本フラグは
+    /// 状態レポート用の情報フラグであり、ここで追加の適用処理は行わない。
     pub enable_io_uring_restrictions: bool,
 
     /// seccomp フィルタを有効化
@@ -630,7 +576,7 @@ impl std::fmt::Display for KernelVersion {
 ///
 /// # 適用順序
 ///
-/// 1. io_uring制限（現在は未サポート）
+/// 1. io_uring制限（カスタムランタイムがワーカーごとのリング生成時に適用済み。ここでは状態報告のみ）
 /// 2. Landlockファイルシステム制限
 /// 3. seccompシステムコール制限（最後に適用）
 ///
@@ -646,14 +592,19 @@ pub fn apply_security_restrictions(config: &SecurityConfig) -> io::Result<()> {
     );
 
     // 1. io_uring制限
+    //
+    // IORING_REGISTER_RESTRICTIONS はリングごとの機構のため、各ワーカースレッドが
+    // リング生成時（runtime::executor::init_ring）に PROXY_ALLOWED_OPCODES で適用する。
+    // ここではカーネルサポート状況の報告のみ行う。
     if config.enable_io_uring_restrictions {
         if kernel.supports_uring_restrictions() {
-            warn!("io_uring restrictions: Currently not supported with monoio");
-            warn!("monoio does not expose low-level io_uring API (uring_fd/submitter)");
-            warn!("Alternative: Use seccomp to limit system calls including io_uring operations");
+            info!(
+                "io_uring restrictions: applied per-worker by runtime at ring init ({} opcodes allowed)",
+                crate::runtime::executor::PROXY_ALLOWED_OPCODES.len()
+            );
         } else {
             warn!(
-                "io_uring restrictions require Linux 5.10+ (current: {})",
+                "io_uring restrictions require Linux 5.10+ (current: {}); runtime falls back to unrestricted rings",
                 kernel
             );
         }
@@ -1232,48 +1183,6 @@ fn apply_landlock(_config: &SecurityConfig) -> io::Result<()> {
 }
 
 // ====================
-// io_uring 制限（将来実装用）
-// ====================
-
-/// io_uring制限を適用する関数（現在は未実装）
-///
-/// monoioが以下のいずれかをサポートした場合に実装可能:
-/// 1. io_uringのファイルディスクリプタへのアクセス
-/// 2. RuntimeBuilderでの制限設定オプション
-/// 3. io-uringクレートの直接使用オプション
-///
-/// # 将来の実装例
-///
-/// ```rust,ignore
-/// use io_uring::{IoUring, register::Restriction};
-///
-/// fn apply_uring_restrictions(ring: &IoUring) -> io::Result<()> {
-///     let restrictions = [
-///         Restriction::allow_opcode(io_uring::opcode::Read::CODE),
-///         Restriction::allow_opcode(io_uring::opcode::Write::CODE),
-///         Restriction::allow_opcode(io_uring::opcode::Accept::CODE),
-///         Restriction::allow_opcode(io_uring::opcode::Connect::CODE),
-///         Restriction::allow_opcode(io_uring::opcode::Send::CODE),
-///         Restriction::allow_opcode(io_uring::opcode::Recv::CODE),
-///         Restriction::allow_opcode(io_uring::opcode::Close::CODE),
-///     ];
-///     ring.submitter().register_restrictions(&restrictions)?;
-///     Ok(())
-/// }
-/// ```
-#[allow(dead_code)]
-pub fn apply_io_uring_restrictions() -> io::Result<()> {
-    error!("io_uring restrictions cannot be applied directly with monoio");
-    error!("monoio abstracts io_uring and does not expose the underlying uring_fd");
-    error!("Use seccomp instead to restrict io_uring operations at the syscall level");
-
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "io_uring restrictions not supported with monoio - use seccomp instead",
-    ))
-}
-
-// ====================
 // セキュリティ状態レポート
 // ====================
 
@@ -1286,9 +1195,9 @@ pub fn report_security_status() {
             info!(
                 "io_uring restrictions (5.10+): {}",
                 if kernel.supports_uring_restrictions() {
-                    "Available"
+                    "Available (applied per-worker by runtime at ring init)"
                 } else {
-                    "Not available"
+                    "Not available (runtime falls back to unrestricted rings)"
                 }
             );
             info!(

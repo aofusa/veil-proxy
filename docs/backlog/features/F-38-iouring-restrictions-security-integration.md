@@ -1,7 +1,15 @@
 # F-38: io_uring オペコード制限の security.rs 統合と stale monoio スタブ解消
 
 - **優先度**: P1
-- **対応状況**: 未着手
+- **対応状況**: 完了（2026-07-02）
+
+## 完了メモ
+
+- security.rs の dead stub `apply_io_uring_restrictions()`・重複 io_uring 定数（`ALLOWED_URING_OPCODES` 等）を削除し、ランタイム実装（`runtime::ring` / `runtime::executor::PROXY_ALLOWED_OPCODES`）への参照に一本化。
+- stale な monoio 参照コメントを全て実態（カスタム io_uring ランタイム / offload）に更新。
+- `apply_security_restrictions` / `report_security_status` が「制限はランタイムがワーカーごとのリング生成時に適用」を正しく報告するよう修正。
+- 禁止オペコード拒否のテストは `runtime::ring::tests::restrictions_block_disallowed_opcode` が既に存在し通過を確認。
+- 全 SQE 提出経路（ACCEPT/CONNECT/RECV/SEND/POLL_ADD/TIMEOUT/ASYNC_CANCEL/SPLICE）が `PROXY_ALLOWED_OPCODES` に含まれることをレビューで確認。
 - **出典**: `docs/artifacts/analysis_results.md` 改善案1
 
 ## 機能説明・現状
