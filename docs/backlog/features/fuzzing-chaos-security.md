@@ -155,4 +155,61 @@ H2SPEC_FULL=1 H2SPEC_STRICT=1 ./tests/container_security/run_h2spec.sh
 - distroless イメージは Docker `User` 未指定（起動 UID=0）だが、Veil プロセス内で特権降下
 - Trivy DB 初回ダウンロードで数分かかる（2 回目以降はキャッシュ）
 - h2spec フルスイートは RFC 厳密準拠で 7〜8 件失敗（上記）。既定 CI ではゲートのみ実行
-- LibAFL / cargo-fuzz は未統合（将来）
+- LibAFL / cargo-fuzz は F-52 で着手（`src/lib.rs` + `fuzz/`）。コンテナ実行は `SKIP_LIBFUZZER=0` で有効化
+
+### 2026-07-02 追記: スイート拡充（F-52〜F-57）
+
+バックログに子チケットを追加し、`tests/container_security/` をプロダクション向けに拡張した。
+
+#### バックログ子チケット
+
+| ID | 概要 | 状態 |
+|----|------|------|
+| [F-52](F-52-cargo-fuzz-libfuzzer.md) | cargo-fuzz（HPACK・config TOML） | 進行中 |
+| [F-53](F-53-chaos-engineering-expansion.md) | Toxiproxy 遅延注入 | 進行中 |
+| [F-54](F-54-security-scan-expansion.md) | cargo-audit、testssl | 進行中 |
+| [F-55](F-55-harness-hardening.md) | ポーリング・タイムアウト・カーネルガード | 進行中 |
+| [F-56](F-56-property-load-tests.md) | proptest、wrk/k6 | 未着手 |
+| [F-57](F-57-container-security-ci.md) | GitHub Actions nightly | 未着手 |
+
+#### 追加ディレクトリ構成
+
+```
+tests/container_security/
+├── chaos/           # Toxiproxy セットアップ
+├── fuzz/            # libFuzzer ラッパー
+├── security/        # cargo-audit
+├── lib/             # capabilities.sh（io_uring/kTLS ガード）
+└── harness/scripts/ # toxiproxy_chaos.sh 等
+```
+
+#### 新フェーズ・環境変数
+
+| フェーズ | 内容 | スキップ |
+|--------|------|----------|
+| 1b libFuzzer | `hpack_decode` / `config_toml`（nightly コンテナ） | `SKIP_LIBFUZZER=1`（既定） |
+| 3b Toxiproxy | upstream 遅延注入・回復検証 | `SKIP_TOXIPROXY=1` |
+| 4b cargo-audit | Rust 依存脆弱性（初回は cargo install で数分） | `SKIP_CARGO_AUDIT=1`（既定） |
+| 4 testssl | TLS 設定動的スキャン | `SKIP_TESTSSL=1` |
+
+#### ハーネス堅牢化（F-55）
+
+- SIGHUP 後: 固定 `sleep` → ヘルスエンドポイントのポーリング（`RELOAD_POLL_ATTEMPTS`）
+- カオス負荷: バックグラウンドジョブに `wait_with_timeout`（`CHAOS_TIMEOUT_SEC`）
+- CI 非対応カーネル: `lib/capabilities.sh` で io_uring/kTLS を検出し正当な理由付きスキップ
+
+#### lib クレート化（F-52）
+
+- `src/lib.rs` + `src/entry.rs`（`veil::run()`）でバイナリとファズターゲットを共有
+- `fuzz/fuzz_targets/hpack_decode.rs` — 自作 HPACK デコーダ
+- `fuzz/fuzz_targets/config_toml.rs` — `test_config_file` 経由の TOML 検証
+
+#### 実行例
+
+```bash
+# 通常（libFuzzer スキップ、h2spec ゲート含む）
+./tests/container_security/run.sh
+
+# libFuzzer + Toxiproxy 含むフル拡張
+SKIP_LIBFUZZER=0 ./tests/container_security/run.sh
+```
