@@ -51,10 +51,10 @@
 | F-01 | P2 | 完了 | [features/grpc.md](features/grpc.md) | gRPC / gRPC-Web の完成度・テスト拡充 |
 | F-05 | P2 | 未着手 | [features/acme.md](features/acme.md) | ACME 統合 |
 | F-07 | P2 | 進行中 | [features/fuzzing-chaos-security.md](features/fuzzing-chaos-security.md) | ファジング・カオス・h2spec・セキュリティスキャン（`tests/container_security/` 基盤完了。F-52〜F-57 で拡充中） |
-| F-52 | P1 | 進行中 | [features/F-52-cargo-fuzz-libfuzzer.md](features/F-52-cargo-fuzz-libfuzzer.md) | cargo-fuzz / LibFuzzer（HPACK・config TOML ターゲット、`src/lib.rs`） |
-| F-53 | P1 | 進行中 | [features/F-53-chaos-engineering-expansion.md](features/F-53-chaos-engineering-expansion.md) | カオス拡充（Toxiproxy 遅延注入、Pumba/tc 残件） |
-| F-54 | P1 | 進行中 | [features/F-54-security-scan-expansion.md](features/F-54-security-scan-expansion.md) | セキュリティスキャン拡充（cargo-audit、testssl、ZAP 残件） |
-| F-55 | P2 | 進行中 | [features/F-55-harness-hardening.md](features/F-55-harness-hardening.md) | ハーネス堅牢化（ポーリング、chaos タイムアウト、カーネルガード） |
+| F-52 | P1 | 進行中 | [features/F-52-cargo-fuzz-libfuzzer.md](features/F-52-cargo-fuzz-libfuzzer.md) | cargo-fuzz（HPACK・frame・header・config、ASAN/corpus 残件） |
+| F-53 | P1 | 進行中 | [features/F-53-chaos-engineering-expansion.md](features/F-53-chaos-engineering-expansion.md) | カオス拡充（CB・slowloris・reset 完了、Pumba/tc 残件） |
+| F-54 | P1 | 進行中 | [features/F-54-security-scan-expansion.md](features/F-54-security-scan-expansion.md) | セキュリティスキャン（testssl・cargo-deny・SECURITY.md、ZAP 残件） |
+| F-55 | P2 | 進行中 | [features/F-55-harness-hardening.md](features/F-55-harness-hardening.md) | ハーネス堅牢化（metrics リロード検知・レポート集約、GHA 残件） |
 | F-56 | P2 | 未着手 | [features/F-56-property-load-tests.md](features/F-56-property-load-tests.md) | プロパティベース・負荷テスト（proptest、wrk/k6） |
 | F-57 | P2 | 未着手 | [features/F-57-container-security-ci.md](features/F-57-container-security-ci.md) | container_security CI/CD 統合（GitHub Actions nightly） |
 | F-08 | P2 | 完了 | [features/proxy-wasm-benchmarks.md](features/proxy-wasm-benchmarks.md) | Proxy-Wasm ベンチマーク（`benches/wasm.rs`：`/wasm/*` 適用 vs 非適用のレイテンシ差でフィルタオーバーヘッドを計測。Keep-Alive で接続コスト償却） |

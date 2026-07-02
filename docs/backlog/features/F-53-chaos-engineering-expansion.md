@@ -11,6 +11,10 @@ circuit breaker、retry、buffering、graceful shutdown の **障害下生存性
 - `prepare_veil_test_config()` — Landlock 下の DNS 制約を回避するため Toxiproxy 上流を起動時 IP に置換
 - `fixtures/veil-config.toml` — Landlock に DNS/NSS 用パス（`/etc/resolv.conf`、`/lib`、`/usr` 等）を追加
 - 既存: 高並行負荷、SIGHUP リロード、接続チャーン
+- `circuit_breaker_chaos.sh` — limit_data toxic + 5xx カウントで CB 発火検証
+- `slowloris_chaos.sh` — 部分リクエスト backpressure 検証
+- `toxiproxy_chaos.sh` — limit_data による接続リセット検証を追加
+- テスト設定: `toxi-pool` upstream + circuit breaker + prometheus
 
 ### 解決済み（2026-07-02）
 

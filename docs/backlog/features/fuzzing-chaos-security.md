@@ -165,10 +165,10 @@ H2SPEC_FULL=1 H2SPEC_STRICT=1 ./tests/container_security/run_h2spec.sh
 
 | ID | 概要 | 状態 |
 |----|------|------|
-| [F-52](F-52-cargo-fuzz-libfuzzer.md) | cargo-fuzz（HPACK・config TOML） | 進行中 |
-| [F-53](F-53-chaos-engineering-expansion.md) | Toxiproxy 遅延注入 | 進行中 |
-| [F-54](F-54-security-scan-expansion.md) | cargo-audit、testssl | 進行中 |
-| [F-55](F-55-harness-hardening.md) | ポーリング・タイムアウト・カーネルガード | 進行中 |
+| [F-52](F-52-cargo-fuzz-libfuzzer.md) | cargo-fuzz（HPACK・frame・header・config） | 進行中 |
+| [F-53](F-53-chaos-engineering-expansion.md) | Toxiproxy + CB + slowloris + reset | 進行中 |
+| [F-54](F-54-security-scan-expansion.md) | testssl・cargo-deny・SECURITY.md | 進行中 |
+| [F-55](F-55-harness-hardening.md) | metrics リロード検知・レポート集約 | 進行中 |
 | [F-56](F-56-property-load-tests.md) | proptest、wrk/k6 | 未着手 |
 | [F-57](F-57-container-security-ci.md) | GitHub Actions nightly | 未着手 |
 
@@ -187,10 +187,12 @@ tests/container_security/
 
 | フェーズ | 内容 | スキップ |
 |--------|------|----------|
-| 1b libFuzzer | `hpack_decode` / `config_toml`（nightly コンテナ） | `SKIP_LIBFUZZER=1`（既定） |
-| 3b Toxiproxy | upstream 遅延注入・回復検証 | `SKIP_TOXIPROXY=1` |
-| 4b cargo-audit | Rust 依存脆弱性（初回は cargo install で数分） | `SKIP_CARGO_AUDIT=1`（既定） |
-| 4 testssl | TLS 設定動的スキャン | `SKIP_TESTSSL=1` |
+| 1b libFuzzer | 4 ターゲット（nightly コンテナ） | `SKIP_LIBFUZZER=1`（既定） |
+| 3b Toxiproxy | 遅延・reset・CB・slowloris | `SKIP_TOXIPROXY=1` |
+| 4a testssl | `run_testssl.sh`（Docker） | `SKIP_TESTSSL=1` |
+| 4b cargo-audit | Rust 依存脆弱性 | `SKIP_CARGO_AUDIT=1`（既定） |
+| 4c cargo-deny | ライセンス・advisory | `SKIP_CARGO_DENY=1`（既定） |
+| 6 レポート | JSON/JUnit サマリ | — |
 
 #### ハーネス堅牢化（F-55）
 
