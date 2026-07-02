@@ -77,6 +77,7 @@ pub mod simple_tls;
 pub mod tls_reload;
 pub mod config;
 pub use crate::config::*;
+pub mod fuzz_api;
 pub mod upstream;
 pub use crate::upstream::*;
 pub mod server;

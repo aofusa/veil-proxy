@@ -8,6 +8,7 @@ RESULTS_DIR="${RESULTS_DIR:-${REPO_ROOT}/tests/container_security/results}"
 RUST_IMAGE="${RUST_FUZZ_IMAGE:-rustlang/rust:nightly-bookworm}"
 FUZZ_RUNS="${FUZZ_RUNS:-2000}"
 FUZZ_MAX_TIME="${FUZZ_MAX_TIME:-120}"
+FUZZ_TARGETS="${FUZZ_TARGETS:-hpack_decode config_toml http2_frame_decode http_header_validate}"
 REPORT="${RESULTS_DIR}/libfuzzer_report.txt"
 
 mkdir -p "${RESULTS_DIR}"
@@ -28,10 +29,11 @@ docker run --rm \
         rustup component add llvm-tools-preview 2>/dev/null || true
         cargo install cargo-fuzz --locked 2>/dev/null
         cd fuzz
-        cargo fuzz run hpack_decode -- -runs=${FUZZ_RUNS} -max_total_time=${FUZZ_MAX_TIME} \
-            2>&1 | tee -a /results/libfuzzer_report.txt
-        cargo fuzz run config_toml -- -runs=${FUZZ_RUNS} -max_total_time=${FUZZ_MAX_TIME} \
-            2>&1 | tee -a /results/libfuzzer_report.txt
+        for target in ${FUZZ_TARGETS}; do
+            echo \"libfuzzer target=\${target}\" | tee -a /results/libfuzzer_report.txt
+            cargo fuzz run \"\${target}\" -- -runs=${FUZZ_RUNS} -max_total_time=${FUZZ_MAX_TIME} \
+                2>&1 | tee -a /results/libfuzzer_report.txt
+        done
         echo libfuzzer: ok | tee -a /results/libfuzzer_report.txt
     "
 
