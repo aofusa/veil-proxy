@@ -424,19 +424,59 @@ async fn run_backend_task(
                 return Err(502);
             }
             notify.notify();
-            // クライアント側 END_STREAM（送信端 drop / 明示クローズ）まで逐次転送。
-            while let Some(chunk) = req_body_rx.recv().await {
-                // 書き込み完了まで次フレームを読まない（バックプレッシャ）。
-                if let Err(e) = send_backend_chunk(&backend, chunk).await {
-                    warn!("[HTTP/3] streaming backend body write error: {}", e);
-                    return Err(502);
+
+            // B-12: 残りのリクエストボディ送信とレスポンス受信を**並行**に駆動する。
+            //
+            // 逐次（全ボディ送信 → レスポンス受信）だと、リクエスト完了前にレスポンスを
+            // 返し始めるバックエンド（エコー・早期エラー応答等）で
+            //   バックエンドの送信バッファ満杯 → バックエンドがリクエスト読み取り停止
+            //   → 本タスクの write ブロック → req チャネル満杯 → QUIC フロー制御で
+            //   クライアント送信停止
+            // という双方向デッドロックに陥り、QUIC アイドルタイムアウトまで完全停止する
+            // （成立はカーネルのソケットバッファ自動調整量に依存するため間欠的）。
+            //
+            // 両 Future は同一タスク内で &TcpStream を共有インターリーブする（L4 の
+            // bidirectional_forward と同方式）。レスポンス完了時はアップロード側を
+            // 打ち切ってよい（バックエンドが応答を完結させた = 残りボディは不要）。
+            let upload = async {
+                // クライアント側 END_STREAM（送信端 drop / 明示クローズ）まで逐次転送。
+                while let Some(chunk) = req_body_rx.recv().await {
+                    // 書き込み完了まで次フレームを読まない（バックプレッシャ）。
+                    send_backend_chunk(&backend, chunk).await?;
+                    notify.notify();
                 }
-                notify.notify();
-            }
-            // 終端チャンク。
-            if let Err(e) = write_all(&backend, Bytes::from_static(b"0\r\n\r\n")).await {
-                warn!("[HTTP/3] streaming backend terminator write error: {}", e);
-                return Err(502);
+                // 終端チャンク。
+                write_all(&backend, Bytes::from_static(b"0\r\n\r\n")).await?;
+                Ok::<(), io::Error>(())
+            };
+            let respond = stream_response(
+                &backend,
+                compression,
+                client_encoding,
+                timeout_secs,
+                resp_tx,
+                notify,
+            );
+
+            let mut upload = std::pin::pin!(futures::FutureExt::fuse(upload));
+            let mut respond = std::pin::pin!(futures::FutureExt::fuse(respond));
+            loop {
+                futures::select_biased! {
+                    r = respond => return r,
+                    u = upload => {
+                        if let Err(e) = u {
+                            // レスポンス完結後にバックエンドがリクエスト読み取りを
+                            // 打ち切るのは合法（Connection: close 等）。ここでは中断せず
+                            // レスポンス側の完了・エラー判定に委ねる。
+                            debug!(
+                                "[HTTP/3] streaming backend body write error: {} (response still in flight)",
+                                e
+                            );
+                        }
+                        // アップロード完了後はレスポンス側のみを待つ
+                        //（fuse 済みのため以降 select から除外される）。
+                    }
+                }
             }
         }
         None => {
@@ -446,19 +486,19 @@ async fn run_backend_task(
                 warn!("[HTTP/3] streaming backend head write error: {}", e);
                 return Err(502);
             }
+
+            // --- レスポンス受信（head → body 逐次） ---
+            stream_response(
+                &backend,
+                compression,
+                client_encoding,
+                timeout_secs,
+                resp_tx,
+                notify,
+            )
+            .await
         }
     }
-
-    // --- レスポンス受信（head → body 逐次） ---
-    stream_response(
-        &backend,
-        compression,
-        client_encoding,
-        timeout_secs,
-        resp_tx,
-        notify,
-    )
-    .await
 }
 
 /// バックエンドレスポンスを head→body の順で受信し、メインループへ逐次転送する。
