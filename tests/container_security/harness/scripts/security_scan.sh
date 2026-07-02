@@ -26,11 +26,12 @@ tls_check() {
 }
 
 # 許可メソッド外 POST が拒否されること（config: HEAD, GET のみ）
+# HTTP:80 は HTTPS へ 301 リダイレクトするため HTTPS で検証する。
 method_restriction() {
     local code
-    code=$(curl -s -o /dev/null -w "%{http_code}" -X POST --max-time 3 \
-        "http://${VEIL_HOST}:${VEIL_HTTP_PORT}/" 2>/dev/null || echo "000")
-    log "post_method_code: ${code}"
+    code=$(curl -sk -o /dev/null -w "%{http_code}" -X POST --max-time 3 \
+        "https://${VEIL_HOST}:${VEIL_HTTPS_PORT}/" 2>/dev/null || echo "000")
+    log "post_method_code_https: ${code}"
     case "${code}" in
         405|403|501) log "method_restriction: ok" ;;
         *)
@@ -43,8 +44,8 @@ method_restriction() {
 # TRACE 等の危険メソッド
 trace_check() {
     local code
-    code=$(curl -s -o /dev/null -w "%{http_code}" -X TRACE --max-time 3 \
-        "http://${VEIL_HOST}:${VEIL_HTTP_PORT}/" 2>/dev/null || echo "000")
+    code=$(curl -sk -o /dev/null -w "%{http_code}" -X TRACE --max-time 3 \
+        "https://${VEIL_HOST}:${VEIL_HTTPS_PORT}/" 2>/dev/null || echo "000")
     log "trace_method_code: ${code}"
     if [[ "${code}" == "200" ]]; then
         log "trace_check: fail (TRACE が 200)"
