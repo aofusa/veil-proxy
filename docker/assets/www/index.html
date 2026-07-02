@@ -1,11 +1,1138 @@
 <!DOCTYPE html>
 <html lang="ja">
 <head>
-  <meta charset="utf-8">
-  <title>Veil</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Veil</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&family=Orbitron:wght@400;700;900&display=swap');
+
+        html {
+            height: 100%;
+            overflow: hidden;
+        }
+
+        /* 常に変容し続ける地獄のようなサイケデリック・サイバー空間背景 */
+        body {
+            margin: 0;
+            height: 100dvh;
+            overflow: hidden;
+            background: #000;
+            color: #fff;
+            font-family: 'Orbitron', sans-serif;
+            display: flex;
+            flex-direction: column;
+            position: relative;
+        }
+
+        /* 背景：万華鏡のように色が変わりねじれる超強力グラデーション */
+        .bg-acid {
+            position: absolute;
+            inset: 0;
+            background: radial-gradient(circle at 50% 50%, rgba(255, 0, 128, 0.3) 0%, rgba(0, 150, 255, 0.2) 40%, rgba(10, 10, 31, 1) 100%);
+            animation: acidTrip 8s ease-in-out infinite alternate;
+            z-index: 1;
+        }
+
+        @keyframes acidTrip {
+            0% { filter: hue-rotate(0deg) saturate(2); background-size: 100% 100%; }
+            50% { filter: hue-rotate(180deg) saturate(5); background-size: 150% 150%; }
+            100% { filter: hue-rotate(360deg) saturate(3); background-size: 100% 100%; }
+        }
+
+        /* 激しく高速移動するグリッド線 */
+        .bg-grid {
+            position: absolute;
+            inset: -200px;
+            background-image: 
+                linear-gradient(rgba(0, 240, 255, 0.2) 2px, transparent 2px),
+                linear-gradient(90deg, rgba(255, 0, 255, 0.2) 2px, transparent 2px);
+            background-size: 40px 40px;
+            opacity: 0.4;
+            transform: perspective(500px) rotateX(60deg);
+            animation: gridCrazy 3s linear infinite;
+            z-index: 2;
+        }
+
+        @keyframes gridCrazy {
+            0% { transform: perspective(500px) rotateX(60deg) translateY(0); }
+            100% { transform: perspective(500px) rotateX(60deg) translateY(40px); }
+        }
+
+        /* 画面全体の走査線ノイズとフラッシュ */
+        .scanlines {
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.35) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.06), rgba(0, 255, 0, 0.02), rgba(0, 0, 255, 0.06));
+            background-size: 100% 4px, 6px 100%;
+            z-index: 999;
+            pointer-events: none;
+            animation: flick 0.15s infinite;
+        }
+
+        @keyframes flick {
+            0% { opacity: 0.95; }
+            50% { opacity: 1; }
+            100% { opacity: 0.9; }
+        }
+
+        .fit-wrapper {
+            flex: 1 1 auto;
+            min-height: 0;
+            width: 100%;
+            display: flex;
+            align-items: stretch;
+            justify-content: center;
+            overflow: hidden;
+            z-index: 10;
+            position: relative;
+            box-sizing: border-box;
+            height: calc(100dvh - var(--ticker-h, 52px));
+        }
+
+        .container {
+            --s: 1;
+            --gap-extra: 0em;
+            --logo-factor: 1;
+            --feature-factor: 1;
+            --brand-head-scale: 1;
+            text-align: center;
+            position: relative;
+            padding: 0 1.5em;
+            max-width: 100%;
+            width: 100%;
+            box-sizing: border-box;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: calc(1.75em + var(--gap-extra, 0em));
+            flex-shrink: 0;
+            font-size: calc(var(--s) * 16px);
+        }
+
+        .brand-block {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 1.2em;
+            flex-shrink: 0;
+            max-width: 100%;
+        }
+
+        .brand-head {
+            flex-shrink: 0;
+        }
+
+        .container.layout-portrait .brand-head {
+            display: flex;
+            flex-direction: row;
+            align-items: center;
+            justify-content: center;
+            gap: 1.1em;
+        }
+
+        .container.layout-portrait .brand-head.brand-head-stacked {
+            flex-direction: column;
+        }
+
+        .brand-head.brand-head-stacked .title {
+            width: 100%;
+            max-width: 100%;
+            box-sizing: border-box;
+            padding-left: 0.8em;
+            padding-right: 0.8em;
+            font-size: 10.8em;
+            text-align: center;
+        }
+
+        .container.layout-compact {
+            padding-left: 0.6em;
+            padding-right: 0.6em;
+            align-items: stretch;
+        }
+
+        .container.layout-compact .brand-block,
+        .container.layout-compact .features,
+        .container.layout-compact .description {
+            width: 100%;
+            max-width: 100%;
+            box-sizing: border-box;
+        }
+
+        .container.layout-compact .brand-block {
+            align-items: stretch;
+        }
+
+        .container.layout-compact .brand-head {
+            width: auto;
+            max-width: 100%;
+            align-self: center;
+            align-items: center;
+        }
+
+        .container.layout-compact .brand-head.brand-head-stacked {
+            font-size: calc(var(--brand-head-scale, 1) * 1em);
+            gap: 1.1em;
+        }
+
+        .container.layout-compact .brand-head.brand-head-stacked .logo-container {
+            width: calc(29em * var(--logo-factor, 1));
+            height: calc(29em * var(--logo-factor, 1));
+        }
+
+        .container.layout-compact .tagline {
+            width: 100%;
+            max-width: 100%;
+            font-size: 3em;
+        }
+
+        .container.layout-compact .tagline-text {
+            max-width: 100%;
+        }
+
+        .container.layout-compact .features {
+            max-width: 100%;
+            padding-left: 0.6em;
+            padding-right: 0.6em;
+            font-size: 1.2em;
+        }
+
+        .container.layout-compact .features.layout-1x4 {
+            grid-template-columns: 1fr;
+            justify-items: stretch;
+        }
+
+        .container.layout-compact .feature {
+            width: 100%;
+            text-align: center;
+        }
+
+        .container.layout-compact .description {
+            max-width: 100%;
+            padding-left: 0.35em;
+            padding-right: 0.35em;
+            font-size: 4.08em;
+        }
+
+        .container.layout-wide .brand-head {
+            display: flex;
+            flex-direction: row;
+            align-items: center;
+            justify-content: center;
+            gap: 1.1em;
+        }
+
+        /* ロゴ周りの超強力サイバーオーラ（逆回転パルス発光） */
+        .logo-container {
+            position: relative;
+            display: inline-block;
+            width: calc(14.5em * var(--logo-factor, 1));
+            height: calc(14.5em * var(--logo-factor, 1));
+            margin: 0;
+            flex-shrink: 0;
+        }
+
+        .container.layout-portrait .logo-container {
+            width: calc(29em * var(--logo-factor, 1));
+            height: calc(29em * var(--logo-factor, 1));
+        }
+
+        .container.layout-wide .logo-container {
+            width: calc(33em * var(--logo-factor, 1));
+            height: calc(33em * var(--logo-factor, 1));
+        }
+
+        .logo-aura {
+            position: absolute;
+            inset: -1.25em;
+            border: 0.25em dashed #00f0ff;
+            border-radius: 50%;
+            box-shadow: 0 0 50px #00f0ff, inset 0 0 50px #ff00ff;
+            animation: spinAura 4s linear infinite;
+            opacity: 0.7;
+        }
+
+        @keyframes spinAura {
+            0% { transform: rotate(0deg) scale(0.9); filter: hue-rotate(0deg); }
+            50% { transform: rotate(-180deg) scale(1.1); filter: hue-rotate(180deg); }
+            100% { transform: rotate(-360deg) scale(0.9); filter: hue-rotate(360deg); }
+        }
+
+        .logo {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            filter: drop-shadow(0 0 30px #00f0ff) drop-shadow(0 0 80px #ff00ff);
+            image-rendering: pixelated;
+            position: relative;
+            z-index: 5;
+            animation: logoBounce 3s infinite alternate;
+        }
+
+        @keyframes logoBounce {
+            0% { transform: translateY(0) scale(1); }
+            100% { transform: translateY(-0.2em) scale(1.03) skewX(-2deg); }
+        }
+
+        .damage-canvas {
+            position: absolute;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            pointer-events: none;
+            mix-blend-mode: screen;
+            z-index: 6;
+        }
+
+        /* 激しい痙攣グリッチとRGBシフティングを施したタイトル */
+        .title {
+            font-size: 13.5em;
+            font-weight: 900;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            position: relative;
+            margin: 0;
+            background: linear-gradient(90deg, #00f0ff, #ff00ff, #ffff00, #00ffaa);
+            background-size: 300%;
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            /* animation: titleGlitch 0.2s infinite, textFlow 4s linear infinite; */
+            line-height: 1.05;
+        }
+
+        @keyframes textFlow {
+            0% { background-position: 0% 50%; }
+            100% { background-position: 300% 50%; }
+        }
+
+        @keyframes titleGlitch {
+            0% { transform: translate(0); text-shadow: 4px -2px #ff0055, -4px 2px #00ffca; }
+            20% { transform: translate(-3px, 2px) skewX(5deg); text-shadow: -3px 3px #ff0055, 3px -3px #00ffca; }
+            40% { transform: translate(3px, -2px) scaleY(1.05); text-shadow: 5px 1px #ffff00, -5px -1px #ff00ff; }
+            60% { transform: translate(-2px, -2px); }
+            80% { transform: translate(2px, 2px) skewX(-5deg); }
+            100% { transform: translate(0); }
+        }
+
+        .tagline {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            max-width: min(100%, 34em);
+            font-family: 'Press Start 2P', cursive;
+            font-size: 2.64em;
+            color: #ffff00;
+            text-shadow: 0 0 15px #ffff00, 0 0 30px #ff00ff;
+            animation: subGlitch 1s infinite steps(2);
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        .tagline-text {
+            flex: 0 0 auto;
+            width: fit-content;
+            max-width: min(30em, calc(100vw - 3.5em));
+            text-align: center;
+            line-height: 1.45;
+            padding: 0 0.18em;
+        }
+
+        .tagline-keep {
+            white-space: nowrap;
+        }
+
+        .tagline-arrow {
+            flex: none;
+            align-self: center;
+            line-height: 1;
+            padding: 0;
+            margin: 0;
+        }
+
+        @keyframes subGlitch {
+            0% { clip-path: inset(40% 0 61% 0); transform: skew(0.3deg); }
+            5% { clip-path: inset(92% 0 1% 0); transform: skew(-1deg); }
+            10% { clip-path: inset(10% 0 80% 0); }
+            15% { clip-path: inset(0); transform: translate(2px, -2px); }
+            100% { transform: translate(0); }
+        }
+
+        /* 浮遊しながら激しく明滅・点滅するテクノロジー特長バッジ（1x4 または 2x2 のみ） */
+        .features {
+            display: grid;
+            gap: 1.1em;
+            margin: 0;
+            padding: 0 0.5em;
+            width: 100%;
+            max-width: 68em;
+            flex-shrink: 0;
+            justify-content: center;
+            font-size: 0.8em;
+        }
+
+        .features.layout-1x4 {
+            grid-template-columns: max-content;
+            grid-template-rows: repeat(4, auto);
+            justify-items: center;
+        }
+
+        .features.layout-2x2 {
+            grid-template-columns: repeat(2, max-content);
+            grid-template-rows: repeat(2, auto);
+            justify-content: center;
+        }
+
+        .feature {
+            background: rgba(0, 0, 0, 0.8);
+            padding: calc(0.65em * var(--feature-factor, 1)) calc(1.35em * var(--feature-factor, 1));
+            border: 0.18em solid #ff00ff;
+            font-size: calc(2.85em * var(--feature-factor, 1));
+            font-weight: 700;
+            letter-spacing: 0.1em;
+            color: #00f0ff;
+            box-shadow: 0 0 30px rgba(255, 0, 255, 0.6), inset 0 0 15px rgba(0, 240, 255, 0.4);
+            position: relative;
+            animation: badgeFloat 2s ease-in-out infinite alternate;
+            white-space: nowrap;
+            width: max-content;
+            max-width: 100%;
+            box-sizing: border-box;
+        }
+
+        .feature::before {
+            content: 'CRITICAL';
+            position: absolute;
+            top: -0.55em; left: 0.6em;
+            font-family: 'Press Start 2P', cursive;
+            font-size: 0.45em;
+            background: #ff00ff;
+            color: #000;
+            padding: 0.12em 0.3em;
+        }
+
+        @keyframes badgeFloat {
+            0% { transform: translateY(0) rotate(-1deg); filter: brightness(1); }
+            50% { filter: brightness(1.5) drop-shadow(0 0 15px #00f0ff); }
+            100% { transform: translateY(-0.35em) rotate(1deg); filter: brightness(1); }
+        }
+
+        /* 下部：バックログ機能・修正バグが流れ狂う無限サイバーティッカー */
+        .ticker-container {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            width: 100%;
+            background: rgba(10, 0, 20, 0.9);
+            border-top: 3px solid #00ffaa;
+            padding: 8px 0 calc(8px + env(safe-area-inset-bottom, 0px));
+            overflow: hidden;
+            z-index: 100;
+            box-shadow: 0 -10px 40px rgba(0, 255, 170, 0.3);
+        }
+
+        .ticker-wrapper {
+            display: flex;
+            white-space: nowrap;
+            animation: tickerMove 20s linear infinite;
+            font-family: 'Press Start 2P', cursive;
+            font-size: clamp(0.7rem, 2.5vw, 0.9rem);
+            color: #00ffaa;
+        }
+
+        .ticker-item {
+            padding: 0 30px;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+
+        .ticker-alert {
+            color: #ff0055;
+            text-shadow: 0 0 10px #ff0055;
+            animation: blink 0.2s infinite alternate;
+        }
+
+        @keyframes tickerMove {
+            0% { transform: translate3d(0, 0, 0); }
+            100% { transform: translate3d(-50%, 0, 0); }
+        }
+
+        @keyframes blink {
+            from { opacity: 0.3; }
+            to { opacity: 1; }
+        }
+
+        .description {
+            margin: 0;
+            font-size: 3em;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+            line-height: 1.65;
+            color: #fff;
+            text-shadow: 0 0 10px rgba(255,255,255,0.5);
+            padding: 0 1em;
+            box-sizing: border-box;
+            max-width: 34em;
+            flex-shrink: 0;
+        }
+
+        .highlight-text {
+            color: #ff007f;
+            animation: textPulse 0.5s infinite alternate;
+        }
+
+        @keyframes textPulse {
+            from { text-shadow: 0 0 5px #ff007f; }
+            to { text-shadow: 0 0 20px #ff007f, 0 0 40px #ff00ff; }
+        }
+
+        @media (max-height: 620px) {
+            .feature::before {
+                display: none;
+            }
+        }
+    </style>
 </head>
 <body>
-  <h1>Veil Proxy</h1>
-  <p>Container default page.</p>
+    <div class="bg-acid"></div>
+    <div class="bg-grid"></div>
+    <div class="scanlines"></div>
+    <div class="particles" id="particles"></div>
+
+    <div class="fit-wrapper" id="fit-wrapper">
+    <div class="container">
+        <div class="brand-block">
+            <div class="brand-head">
+                <div class="logo-container">
+                    <div class="logo-aura"></div>
+                    <img id="veil-logo" 
+                         src="https://raw.githubusercontent.com/aofusa/veil-proxy/main/docs/images/veil_logo.webp" 
+                         alt="Veil Logo" class="logo">
+                    <canvas id="damage-canvas" class="damage-canvas"></canvas>
+                </div>
+                <h1 class="title">VEIL</h1>
+            </div>
+            <div class="tagline"><span class="tagline-arrow" aria-hidden="true">▼</span><span class="tagline-text">HIGH-PERFORMANCE <span class="tagline-keep">REVERSE PROXY</span></span><span class="tagline-arrow" aria-hidden="true">▼</span></div>
+        </div>
+
+        <div class="features layout-1x4" id="features">
+            <div class="feature" style="animation-delay: 0s; border-color: #00f0ff; color: #00f0ff;">io_uring [CUSTOM_RT]</div>
+            <div class="feature" style="animation-delay: 0.3s; border-color: #ff00ff; color: #ff00ff;">kTLS [KERNEL_OFFLOAD]</div>
+            <div class="feature" style="animation-delay: 0.6s; border-color: #ffff00; color: #ffff00;">HTTP/3 [QUICHE_0-RTT]</div>
+            <div class="feature" style="animation-delay: 0.9s; border-color: #00ffaa; color: #00ffaa;">Proxy-Wasm [AOT_POOL]</div>
+        </div>
+
+        <p class="description">
+            <span class="highlight-text">ドン引きするほど高速。</span><br>
+            Linuxカーネルの深淵と同期する、最凶のリバースプロキシ。
+        </p>
+    </div>
+    </div>
+
+    <div class="ticker-container">
+        <div class="ticker-wrapper" id="ticker-wrapper">
+            </div>
+    </div>
+
+    <script>
+        // 電光掲示板に流すプロジェクトデータ（バックログと解決済みバグから抽出）
+        const tickerData = [
+            { text: "SYSTEM STATUS: ACTIVE [THREAD-PER-CORE]", alert: false },
+            { text: "CUSTOM io_uring RUNTIME — DATA PLANE WITHOUT TOKIO/MONOIO [LIBC+BYTES]", alert: false },
+            { text: "kTLS KERNEL TLS OFFLOAD — RUSTLS + LINUX 5.15+ SOCKET BYPASS", alert: false },
+            { text: "HTTP/3 QUIC — 0-RTT CONNECTION VIA QUICHE [UDP/GSO/GRO]", alert: false },
+            { text: "HTTP/2 MULTIPLEXING — ALPN + HPACK STREAM COMPRESSION", alert: false },
+            { text: "PROXY-WASM AOT POOL — HOT-PATH FILTER EXTENSION", alert: false },
+            { text: "L4 STREAM PROXY — SPLICE(2) ZERO-COPY KERNEL FORWARDING", alert: false },
+            { text: "LOAD BALANCING — RR / LEAST-CONN / IP-HASH / WEIGHTED / CONSISTENT HASH", alert: false },
+            { text: "GRACEFUL RELOAD — SIGHUP HOT CONFIG + TLS CERT ARCSWAP ROTATION", alert: false },
+            { text: "SECCOMP BPF + LANDLOCK + io_uring OPCODE RESTRICTIONS", alert: true },
+            { text: "PROMETHEUS METRICS + OTLP/HTTP TELEMETRY PUSH", alert: false },
+        ];
+
+        const tickerWrapper = document.getElementById('ticker-wrapper');
+        const fullContent = [...tickerData, ...tickerData].map(item => `
+            <div class="ticker-item">
+                <span class="${item.alert ? 'ticker-alert' : ''}">${item.alert ? '⚠️' : '⚡'}</span>
+                <span>${item.text}</span>
+            </div>
+        `).join('');
+        tickerWrapper.innerHTML = fullContent;
+
+        const fitWrapper = document.getElementById('fit-wrapper');
+        const mainContainer = document.querySelector('.container');
+        const tickerContainer = document.querySelector('.ticker-container');
+        const featuresEl = document.getElementById('features');
+
+        const FIT_MARGIN = 0.985;
+        const FIT_MIN = 0.42;
+        const FIT_MIN_COMPACT = 0.26;
+        const FIT_MAX = 1.32;
+        const FIT_BASE_FONT = 16;
+        const FIT_SECTION_COUNT = 3;
+        const FIT_DECOR_PAD_EM = 2.2;
+        const FIT_H_PAD_EM = 1.5;
+        const FIT_SECTIONS = '.brand-block, .features, .description';
+        const LOGO_FACTOR_MIN = 0.55;
+        const LOGO_FACTOR_SHRINK = 0.16;
+        const FEATURE_FACTOR_MAX = 1.55;
+        const FEATURE_FACTOR_GROW = 0.28;
+
+        let fitApplied = false;
+        let lastViewportKey = '';
+        let lastAppliedKey = '';
+        let fitRunning = false;
+
+        function clampScale(value) {
+            return Math.max(FIT_MIN, Math.min(FIT_MAX, value));
+        }
+
+        function viewportKey() {
+            const vv = window.visualViewport;
+            return [
+                Math.round(fitWrapper?.clientWidth ?? 0),
+                Math.round(fitWrapper?.clientHeight ?? 0),
+                Math.round(vv?.width ?? window.innerWidth),
+                Math.round(vv?.height ?? window.innerHeight),
+            ].join('|');
+        }
+
+        function isPortraitViewport() {
+            const vv = window.visualViewport;
+            const w = vv?.width ?? window.innerWidth;
+            const h = vv?.height ?? window.innerHeight;
+            return h > w;
+        }
+
+        function updateLayoutMode() {
+            const portrait = isPortraitViewport();
+            mainContainer.classList.toggle('layout-portrait', portrait);
+            mainContainer.classList.toggle('layout-wide', !portrait);
+        }
+
+        function applyBrandHeadLayout(stacked) {
+            const brandHead = mainContainer.querySelector('.brand-head');
+            if (!brandHead) return;
+            brandHead.classList.toggle('brand-head-stacked', stacked);
+        }
+
+        function applyCompactLayout(compact) {
+            mainContainer.classList.toggle('layout-compact', compact);
+        }
+
+        function resetBrandHeadScale() {
+            mainContainer.style.setProperty('--brand-head-scale', '1');
+        }
+
+        function measureBrandHeadContentWidth(brandHead) {
+            const logo = brandHead.querySelector('.logo-container');
+            const title = brandHead.querySelector('.title');
+            const logoW = logo?.getBoundingClientRect().width ?? 0;
+            const titleW = title?.getBoundingClientRect().width ?? 0;
+            return Math.max(logoW, titleW);
+        }
+
+        function compactBrandHeadTargetWidth(availW) {
+            const containerFont = parseFloat(getComputedStyle(mainContainer).fontSize) || FIT_BASE_FONT;
+            return availW - 0.6 * 2 * containerFont;
+        }
+
+        function syncBrandHeadScale(availW) {
+            if (!mainContainer.classList.contains('layout-compact')) {
+                resetBrandHeadScale();
+                return 1;
+            }
+
+            const brandHead = mainContainer.querySelector('.brand-head.brand-head-stacked');
+            if (!brandHead) {
+                resetBrandHeadScale();
+                return 1;
+            }
+
+            const targetW = compactBrandHeadTargetWidth(availW);
+            let scale = 1;
+
+            for (let i = 0; i < 6; i++) {
+                mainContainer.style.setProperty('--brand-head-scale', String(scale));
+                void brandHead.offsetWidth;
+
+                const contentW = measureBrandHeadContentWidth(brandHead);
+                if (contentW <= 0 || targetW <= 0) break;
+
+                const nextScale = scale * (targetW / contentW);
+                if (Math.abs(nextScale - scale) < 0.002) {
+                    scale = nextScale;
+                    break;
+                }
+                scale = nextScale;
+            }
+
+            mainContainer.style.setProperty('--brand-head-scale', scale.toFixed(4));
+            return scale;
+        }
+
+        function isCompactPortraitResult(result) {
+            return isPortraitViewport()
+                && result?.layoutName === 'layout-1x4'
+                && !!result?.brandHeadStacked;
+        }
+
+        function updateAspectFactors(availW, availH) {
+            const aspectRatio = Math.max(availW, availH) / Math.min(availW, availH);
+            const elongation = Math.max(0, aspectRatio - 1);
+            const logoFactor = Math.max(LOGO_FACTOR_MIN, 1 - elongation * LOGO_FACTOR_SHRINK);
+            const featureFactor = Math.min(FEATURE_FACTOR_MAX, 1 + elongation * FEATURE_FACTOR_GROW);
+
+            mainContainer.style.setProperty('--logo-factor', logoFactor.toFixed(4));
+            mainContainer.style.setProperty('--feature-factor', featureFactor.toFixed(4));
+
+            return { logoFactor, featureFactor };
+        }
+
+        function resolveFeatureLayout(availW, availH) {
+            if (!isPortraitViewport()) {
+                return evaluateLayout('layout-2x2', availW, availH, false);
+            }
+
+            const layout2x2 = evaluateLayout('layout-2x2', availW, availH, false);
+            if (layout2x2?.fits) return layout2x2;
+
+            return evaluateLayout('layout-1x4', availW, availH, true);
+        }
+
+        function applyFeatureLayout(layoutName) {
+            if (!featuresEl) return;
+            featuresEl.classList.remove('layout-2x2', 'layout-1x4');
+            featuresEl.classList.add(layoutName);
+        }
+
+        function resetDistribution() {
+            mainContainer.style.paddingTop = '0em';
+            mainContainer.style.paddingBottom = '0em';
+            mainContainer.style.setProperty('--gap-extra', '0em');
+        }
+
+        function measureIntrinsic(layoutName, brandHeadStacked) {
+            const compactPortrait = layoutName === 'layout-1x4' && brandHeadStacked;
+            updateLayoutMode();
+            applyCompactLayout(compactPortrait);
+            applyBrandHeadLayout(brandHeadStacked);
+            applyFeatureLayout(layoutName);
+            mainContainer.classList.add('fitting');
+            mainContainer.style.setProperty('--s', '1');
+            resetBrandHeadScale();
+            resetDistribution();
+            void mainContainer.offsetHeight;
+            return {
+                contentW: mainContainer.scrollWidth,
+                contentH: mainContainer.scrollHeight,
+            };
+        }
+
+        function computeDistribution(availH, scaledContentH) {
+            if (scaledContentH >= availH) {
+                return { gapExtraEm: 0, padEm: 0 };
+            }
+
+            const slack = availH - scaledContentH;
+            const share = slack / (FIT_SECTION_COUNT + 1);
+            const gapExtraEm = (share * 0.55) / FIT_BASE_FONT;
+            const padEm = (share * 0.8) / FIT_BASE_FONT;
+            return { gapExtraEm, padEm };
+        }
+
+        function extraDistributionHeight(dist, scale) {
+            const gapCount = Math.max(0, FIT_SECTION_COUNT - 1);
+            return (dist.gapExtraEm * gapCount + dist.padEm * 2) * FIT_BASE_FONT * scale;
+        }
+
+        function layoutDecorPad(layoutName, brandHeadStacked = false) {
+            const base = FIT_DECOR_PAD_EM * FIT_BASE_FONT;
+            if (layoutName === 'layout-2x2') return base * 1.2;
+            if (brandHeadStacked) return base * 2;
+            return base;
+        }
+
+        function layoutBaseSize(intrinsic, layoutName, brandHeadStacked = false) {
+            const compactPortrait = layoutName === 'layout-1x4' && brandHeadStacked;
+            const decor = layoutDecorPad(layoutName, brandHeadStacked);
+            const hPadEm = compactPortrait ? 0.6 * 2 : FIT_H_PAD_EM * 2;
+            const hPad = hPadEm * FIT_BASE_FONT;
+            return {
+                baseW: intrinsic.contentW + decor * 2 + hPad,
+                baseH: intrinsic.contentH + decor * 2,
+            };
+        }
+
+        function layoutTotalSize(baseW, baseH, scale, dist) {
+            return {
+                totalW: baseW * scale,
+                totalH: baseH * scale + extraDistributionHeight(dist, scale),
+            };
+        }
+
+        function clampCompactScale(value) {
+            return Math.max(FIT_MIN_COMPACT, Math.min(FIT_MAX, value));
+        }
+
+        function evaluateLayout(layoutName, availW, availH, brandHeadStacked) {
+            const compactPortrait = layoutName === 'layout-1x4' && brandHeadStacked;
+            const intrinsic = measureIntrinsic(layoutName, brandHeadStacked);
+            if (!intrinsic.contentW || !intrinsic.contentH) return null;
+
+            const { baseW, baseH } = layoutBaseSize(intrinsic, layoutName, brandHeadStacked);
+            const clampFit = compactPortrait ? clampCompactScale : clampScale;
+            let scale = clampFit(
+                Math.min(availW / baseW, availH / baseH) * FIT_MARGIN
+            );
+            let dist = { gapExtraEm: 0, padEm: 0 };
+            let fits = false;
+
+            for (let i = 0; i < 12; i++) {
+                if (compactPortrait) {
+                    dist = { gapExtraEm: 0, padEm: 0 };
+                } else {
+                    dist = computeDistribution(availH, baseH * scale + extraDistributionHeight(dist, scale));
+                }
+                const { totalW, totalH } = layoutTotalSize(baseW, baseH, scale, dist);
+
+                if (totalW <= availW && totalH <= availH) {
+                    fits = true;
+                    break;
+                }
+
+                const fix = Math.min(
+                    availW / totalW,
+                    availH / totalH,
+                    0.992
+                );
+                scale = clampFit(scale * fix);
+            }
+
+            if (!fits) {
+                const { totalW, totalH } = layoutTotalSize(baseW, baseH, scale, dist);
+                fits = totalW <= availW && totalH <= availH;
+            }
+
+            return {
+                layoutName,
+                scale: clampFit(scale),
+                gapExtraEm: compactPortrait ? 0 : dist.gapExtraEm,
+                padEm: compactPortrait ? 0 : dist.padEm,
+                fits,
+                brandHeadStacked,
+            };
+        }
+
+        function measureAppliedBounds() {
+            const wrapper = fitWrapper.getBoundingClientRect();
+            const stacked = mainContainer.querySelector('.brand-head')?.classList.contains('brand-head-stacked');
+            const layoutName = featuresEl.classList.contains('layout-2x2') ? 'layout-2x2' : 'layout-1x4';
+            const decor = layoutDecorPad(layoutName, stacked);
+            let top = Infinity;
+            let left = Infinity;
+            let right = -Infinity;
+            let bottom = -Infinity;
+
+            mainContainer.querySelectorAll(FIT_SECTIONS).forEach((el) => {
+                const rect = el.getBoundingClientRect();
+                top = Math.min(top, rect.top);
+                left = Math.min(left, rect.left);
+                right = Math.max(right, rect.right);
+                bottom = Math.max(bottom, rect.bottom);
+            });
+
+            return {
+                availW: wrapper.width,
+                availH: wrapper.height,
+                contentW: right - left + decor,
+                contentH: bottom - top + decor,
+            };
+        }
+
+        function tightenLandscapeFit(result) {
+            if (isPortraitViewport() || !result) return result;
+
+            let current = { ...result };
+            applyFitResult(current);
+
+            for (let i = 0; i < 6; i++) {
+                const bounds = measureAppliedBounds();
+                if (bounds.contentW <= bounds.availW && bounds.contentH <= bounds.availH) {
+                    return current;
+                }
+
+                const fix = Math.min(
+                    bounds.availW / bounds.contentW,
+                    bounds.availH / bounds.contentH,
+                    0.99
+                );
+                current.scale = clampScale(current.scale * fix);
+                applyFitResult(current);
+            }
+
+            return current;
+        }
+
+        function tightenCompactPortraitFit(result) {
+            if (!isCompactPortraitResult(result)) return result;
+
+            let current = {
+                ...result,
+                gapExtraEm: 0,
+                padEm: 0,
+            };
+            applyFitResult(current);
+
+            for (let i = 0; i < 10; i++) {
+                const bounds = measureAppliedBounds();
+                if (bounds.contentW <= bounds.availW && bounds.contentH <= bounds.availH) {
+                    return current;
+                }
+
+                const fix = Math.min(
+                    bounds.availW / bounds.contentW,
+                    bounds.availH / bounds.contentH,
+                    0.985
+                );
+                current.scale = clampCompactScale(current.scale * fix);
+                applyFitResult(current);
+            }
+
+            return current;
+        }
+
+        function maximizeCompactPortraitFit(result) {
+            if (!isCompactPortraitResult(result)) return result;
+
+            let current = { ...result };
+            applyFitResult(current);
+
+            for (let i = 0; i < 12; i++) {
+                const bounds = measureAppliedBounds();
+                const grow = Math.min(
+                    bounds.availW / bounds.contentW,
+                    bounds.availH / bounds.contentH,
+                    1.06
+                );
+
+                if (grow <= 1.008) break;
+
+                const nextScale = clampCompactScale(current.scale * grow * FIT_MARGIN);
+                if (nextScale <= current.scale) break;
+
+                const trial = { ...current, scale: nextScale };
+                applyFitResult(trial);
+                const after = measureAppliedBounds();
+                if (after.contentW > after.availW || after.contentH > after.availH) {
+                    applyFitResult(current);
+                    break;
+                }
+
+                current = trial;
+            }
+
+            return current;
+        }
+
+        function applyFitResult(result) {
+            applyCompactLayout(isCompactPortraitResult(result));
+            applyBrandHeadLayout(!!result.brandHeadStacked);
+            applyFeatureLayout(result.layoutName);
+            mainContainer.style.setProperty('--s', String(result.scale));
+            mainContainer.style.setProperty('--gap-extra', `${result.gapExtraEm}em`);
+            mainContainer.style.paddingTop = `${result.padEm}em`;
+            mainContainer.style.paddingBottom = `${result.padEm}em`;
+            mainContainer.classList.remove('fitting');
+
+            const availW = fitWrapper?.clientWidth ?? 0;
+            if (isCompactPortraitResult(result) && availW) {
+                syncBrandHeadScale(availW);
+            } else {
+                resetBrandHeadScale();
+            }
+        }
+
+        function fitToViewport(force = false) {
+            if (!fitWrapper || !mainContainer || !tickerContainer || !featuresEl) return;
+            if (fitRunning) return;
+
+            const nextViewportKey = viewportKey();
+            if (!force && fitApplied && nextViewportKey === lastViewportKey) return;
+
+            fitRunning = true;
+            mainContainer.classList.add('fitting');
+
+            const tickerH = tickerContainer.getBoundingClientRect().height;
+            document.documentElement.style.setProperty('--ticker-h', `${tickerH}px`);
+
+            const availW = fitWrapper.clientWidth;
+            const availH = fitWrapper.clientHeight;
+
+            updateLayoutMode();
+
+            const aspectFactors = availW && availH
+                ? updateAspectFactors(availW, availH)
+                : { logoFactor: 1, featureFactor: 1 };
+
+            let best = availW && availH ? resolveFeatureLayout(availW, availH) : null;
+
+            if (!best) {
+                const portrait = isPortraitViewport();
+                best = {
+                    layoutName: portrait ? 'layout-1x4' : 'layout-2x2',
+                    scale: FIT_MIN,
+                    gapExtraEm: 0,
+                    padEm: 0,
+                    fits: false,
+                    brandHeadStacked: portrait,
+                };
+            }
+
+            if (!isPortraitViewport()) {
+                best = tightenLandscapeFit(best);
+            } else {
+                best = tightenCompactPortraitFit(best);
+                best = maximizeCompactPortraitFit(best);
+                applyFitResult(best);
+                if (isCompactPortraitResult(best)) {
+                    syncBrandHeadScale(availW);
+                    best = tightenCompactPortraitFit(best);
+                    applyFitResult(best);
+                }
+            }
+
+            const finalKey = [
+                best.layoutName,
+                best.scale.toFixed(4),
+                best.gapExtraEm.toFixed(4),
+                best.padEm.toFixed(4),
+                aspectFactors.logoFactor.toFixed(4),
+                aspectFactors.featureFactor.toFixed(4),
+                best.brandHeadStacked ? '1' : '0',
+                isCompactPortraitResult(best) ? '1' : '0',
+                mainContainer.style.getPropertyValue('--brand-head-scale') || '1',
+            ].join('|');
+
+            if (finalKey !== lastAppliedKey) {
+                lastAppliedKey = finalKey;
+                if (typeof resizeCanvas === 'function') resizeCanvas();
+            }
+
+            lastViewportKey = viewportKey();
+            fitApplied = true;
+            fitRunning = false;
+        }
+
+        let fitFrame = 0;
+        function scheduleFit(force = false) {
+            cancelAnimationFrame(fitFrame);
+            fitFrame = requestAnimationFrame(() => fitToViewport(force));
+        }
+
+        scheduleFit(true);
+        window.addEventListener('load', () => scheduleFit(true));
+        window.addEventListener('orientationchange', () => scheduleFit(true));
+        function onViewportResize() {
+            scheduleFit(false);
+            if (typeof resizeCanvas === 'function') resizeCanvas();
+        }
+        window.addEventListener('resize', onViewportResize);
+        if (window.visualViewport) {
+            window.visualViewport.addEventListener('resize', onViewportResize);
+        }
+        if (document.fonts && document.fonts.ready) {
+            document.fonts.ready.then(() => scheduleFit(true));
+        }
+        // 粒子エフェクト
+        function createParticle() {
+            const p = document.createElement('div');
+            p.style.position = 'absolute';
+            p.style.width = Math.random() * 4 + 2 + 'px';
+            p.style.height = p.style.width;
+            const colors = ['#00f0ff', '#ff00ff', '#ffff00', '#00ffaa'];
+            p.style.background = colors[Math.floor(Math.random() * colors.length)];
+            p.style.borderRadius = '50%';
+            p.style.left = Math.random() * 100 + 'vw';
+            p.style.top = '-20px';
+            p.style.opacity = Math.random() * 0.9 + 0.3;
+            p.style.boxShadow = `0 0 15px currentColor`;
+            document.getElementById('particles').appendChild(p);
+
+            const duration = Math.random() * 3 + 2;
+            p.animate([
+                { transform: 'translateY(0) scale(1) rotate(0deg)', opacity: 1 },
+                { transform: `translateY(${window.innerHeight + 50}px) scale(0.1) rotate(360deg)`, opacity: 0 }
+            ], { duration: duration * 1000, easing: 'linear' });
+
+            setTimeout(() => p.remove(), duration * 1000 + 100);
+        }
+
+        setInterval(createParticle, 20);
+
+        // Canvasダメージエフェクト
+        const img = document.getElementById('veil-logo');
+        const canvas = document.getElementById('damage-canvas');
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+        function resizeCanvas() {
+            const containerWidth = document.querySelector('.logo-container').offsetWidth;
+            canvas.width = containerWidth;
+            canvas.height = containerWidth;
+        }
+
+        function applyStrongDigitalDamage() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            if (Math.random() > 0.15) {
+                ctx.globalAlpha = Math.random() * 0.9 + 0.3;
+                ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+                const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                const data = imageData.data;
+
+                for (let i = 0; i < data.length; i += 4) {
+                    if (Math.random() > 0.7) {
+                        data[i]     = data[i] ^ 255;
+                        data[i + 1] = Math.random() > 0.5 ? 255 : 0;
+                        data[i + 2] = 255;
+                    }
+                    if (Math.random() > 0.96) {
+                        data[i + 3] = 0;
+                    }
+                }
+
+                for (let y = 0; y < canvas.height; y += 4) {
+                    if (Math.random() > 0.5) {
+                        const shift = (Math.random() * 40 - 20) | 0;
+                        ctx.putImageData(imageData, shift, y, 0, y, canvas.width, 4);
+                    }
+                }
+
+                if (Math.random() > 0.7) {
+                    ctx.fillStyle = `rgba(0, 240, 255, ${Math.random() * 0.8})`;
+                    ctx.fillRect(0, Math.random() * canvas.height, canvas.width, Math.random() * 4);
+                }
+
+                canvas.style.opacity = '0.95';
+            } else {
+                canvas.style.opacity = '0.1';
+            }
+        }
+
+        img.onload = () => {
+            resizeCanvas();
+            setInterval(applyStrongDigitalDamage, 30);
+        };
+
+        setTimeout(() => {
+            if (canvas.width === 0) {
+                resizeCanvas();
+                setInterval(applyStrongDigitalDamage, 30);
+            }
+        }, 500);
+
+
+    </script>
 </body>
 </html>
