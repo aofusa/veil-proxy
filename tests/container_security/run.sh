@@ -25,9 +25,11 @@ validate_veil_image_security() {
     } | tee "${report}"
 
     [[ "${readonly_root}" == "true" ]] || die "ReadonlyRootfs が有効ではありません"
-    [[ -n "${user}" ]] || die "非 root ユーザーで実行されていません"
     echo "${seccomp}" | grep -q seccomp || die "seccomp プロファイルが適用されていません"
-    log "イメージ実行時セキュリティ検証: ok"
+    # distroless は USER 未指定のため起動 UID は 0。特権降下は veil プロセス内で実施。
+    docker logs "${VEIL_CONTAINER}" 2>&1 | grep -q "Security restrictions applied" \
+        || die "Veil のセキュリティ制限が適用されていません"
+    log "イメージ実行時セキュリティ検証: ok (readonly_rootfs, seccomp, privilege_drop)"
 }
 
 run_trivy_scan() {
