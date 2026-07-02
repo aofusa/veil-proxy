@@ -73,6 +73,20 @@
 | F-35 | P3 | 一部完了 | [features/F-35-xdp-ebpf-ddos-defense.md](features/F-35-xdp-ebpf-ddos-defense.md) | ユーザースペース最前線（accept 段の IP ブロックリスト、TLS 前に切断）を実装。XDP/eBPF 本体は専用環境（CAP_BPF/対応NIC）が必要で継続 |
 | F-36 | P3 | 完了 | [features/F-36-wasm-cwasm-aot-cache.md](features/F-36-wasm-cwasm-aot-cache.md) | WASM cwasm AOT 事前コンパイルキャッシュ |
 | F-37 | P3 | 完了 | [features/F-37-runtime-optable-hotpath.md](features/F-37-runtime-optable-hotpath.md) | ランタイム最ホットパスの per-op コスト排除（OP_TABLE の SipHash→Fibonacci 軽量ハッシュ＋事前確保、user_data 採番を グローバルアトミック→スレッドローカル化で偽共有排除）。F-34 姉妹最適化 |
+| F-38 | P1 | 未着手 | [features/F-38-iouring-restrictions-security-integration.md](features/F-38-iouring-restrictions-security-integration.md) | io_uring オペコード制限の security.rs 統合と stale monoio スタブ解消（制限本体は F-28 でランタイム実装済み） |
+| F-39 | P1 | 未着手 | [features/F-39-http-proxy-iouring-splice.md](features/F-39-http-proxy-iouring-splice.md) | HTTP プロキシ層の libc::splice を io_uring 非同期 splice（IORING_OP_SPLICE）に統一 |
+| F-40 | P2 | 未着手 | [features/F-40-l4-pipe-threadlocal-pool.md](features/F-40-l4-pipe-threadlocal-pool.md) | L4 プロキシの splice パイプをスレッドローカルプールで再利用（接続ごと pipe2(2) 排除） |
+| F-41 | P1 | 未着手 | [features/F-41-proxy-per-conn-alloc-elimination.md](features/F-41-proxy-per-conn-alloc-elimination.md) | proxy.rs 接続ごとの client_ip / host:port アロケーション排除（F-29 残件） |
+| F-42 | P1 | 未着手 | [features/F-42-buffering-async-fs-offload.md](features/F-42-buffering-async-fs-offload.md) | buffering/handler.rs の非同期 FS 化（runtime::offload 適用、F-29 残件） |
+| F-43 | P3 | 未着手 | [features/F-43-wasm-hotpath-alloc-reduction.md](features/F-43-wasm-hotpath-alloc-reduction.md) | WASM パスのアロケーション（clone / deep copy）削減（F-29 残件） |
+| F-44 | P1 | 未着手 | [features/F-44-tls-backend-streaming.md](features/F-44-tls-backend-streaming.md) | TLS バックエンドのストリーミング化（F-32 残件） |
+| F-45 | P3 | 未着手 | [features/F-45-http3-gro-batch-recv.md](features/F-45-http3-gro-batch-recv.md) | HTTP/3 GRO 一括 recv とセグメントサイズ調整（F-33 残件） |
+| F-46 | P3 | 未着手 | [features/F-46-typed-task-pool-optable-slab.md](features/F-46-typed-task-pool-optable-slab.md) | executor の Box&lt;dyn Future&gt; 排除・OP_TABLE スラブ化（F-34 / F-37 残件） |
+| F-47 | P3 | 保留 | [features/F-47-xdp-ebpf-sandbox-env.md](features/F-47-xdp-ebpf-sandbox-env.md) | XDP/eBPF 隔離検証環境の構築とモジュール分離（F-35 残件、CAP_BPF / 対応 NIC の環境依存） |
+| F-48 | P3 | 未着手 | [features/F-48-proxy-wasm-benchmark-expansion.md](features/F-48-proxy-wasm-benchmark-expansion.md) | Proxy-Wasm ベンチマーク拡充（プール枯渇・fuel・RSS・HTTP コールあり、F-08 残件） |
+| F-49 | P1 | 未着手 | [features/F-49-reload-e2e-verification.md](features/F-49-reload-e2e-verification.md) | 設定ファイル・TLS 証明書リロードの正常性確認 E2E テスト |
+| F-50 | P1 | 未着手 | [features/F-50-tls-cipher-suites-config.md](features/F-50-tls-cipher-suites-config.md) | [tls] cipher_suites 設定（nginx 風の取捨選択・優先度指定） |
+| F-51 | P1 | 未着手 | [features/F-51-config-toml-sync.md](features/F-51-config-toml-sync.md) | config.toml を src/config.rs と完全同期（網羅・重複・抜け漏れ排除） |
 | F-11 | P3 | 未着手 | [features/dashboard.md](features/dashboard.md) | ダッシュボード機能 |
 | F-12 | P3 | 未着手 | [features/config-generator-webui.md](features/config-generator-webui.md) | config.toml ジェネレータ Web UI |
 | F-13 | P3 | 未着手 | [features/documentation-site.md](features/documentation-site.md) | 公式ドキュメントサイト |
@@ -103,6 +117,7 @@
 | B-07 | P0 | 完了 | [bugs/B-07-iouring-future-drop-uaf.md](bugs/B-07-iouring-future-drop-uaf.md) | io_uring Future の Drop 未実装による UAF・タスク二重 poll（200 接続ストレスで segfault）→ 修正し segfault 消失 |
 | B-08 | P0 | 完了 | [bugs/B-08-http2-read-buffer-corruption.md](bugs/B-08-http2-read-buffer-corruption.md) | HTTP/2 読み込みバッファ破損（部分フレーム時の offset0 上書き・返却 len 誤信）で H2C/gRPC が 502。B-07 修正で顕在化 → 修正し H2C 29/29 通過 |
 | B-09 | P1 | 完了 | [bugs/B-09-l4-forward-writes-full-buffer.md](bugs/B-09-l4-forward-writes-full-buffer.md) | L4 forward_direction が読み取り n バイトでなくバッファ全長(64KB)を送信し転送破損（TLS パススルー不成立）。F-30 の L4 E2E 追加で発覚 → set_len(n) で修正 |
+| B-10 | P2 | 未着手 | [bugs/B-10-e2e-parallel-shared-state-flaky.md](bugs/B-10-e2e-parallel-shared-state-flaky.md) | E2E 並列実行でロードバランシング系テストが共有 Round Robin ステートと干渉しフレーキー化 |
 
 ---
 
