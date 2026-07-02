@@ -56,7 +56,7 @@ def mutate(data: bytes, rng: random.Random) -> bytes:
         end = min(len(buf), start + rng.randint(1, max(1, len(buf) - start)))
         del buf[start:end]
     else:
-        buf.extend(bytes(rng.getrandbits(8) for _ in range(rng.randint(1, 128)))
+        buf.extend(bytes(rng.getrandbits(8) for _ in range(rng.randint(1, 128))))
     return bytes(buf)
 
 
