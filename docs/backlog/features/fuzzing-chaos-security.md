@@ -96,15 +96,63 @@
 | **セキュリティ（コンテナ）** | read-only rootfs、seccomp 適用、Veil 特権降下ログ | `readonly_rootfs=true`、seccomp 適用済み、`Security restrictions applied` を確認 |
 | **Trivy** | `docker save` + `--input` で `veil:glibc` スキャン（HIGH/CRITICAL） | debian 13.5 ベース層 **脆弱性 0 件** |
 
+### 2026-07-02 追記: h2spec 統合
+
+[h2spec](https://github.com/summerwind/h2spec) v2.6.0 を `tests/container_security/harness/` に同梱し、HTTP/2 準拠テストを追加した。
+
+#### 実行方法
+
+```bash
+# 全フェーズ（h2spec ゲート含む。デフォルトは generic+hpack のみ）
+./tests/container_security/run.sh
+
+# h2spec のみ（開発用）
+./tests/container_security/run_h2spec.sh
+
+# RFC 7540/7541 全件（各 ~3.5 分、TLS + H2C で計 ~7 分）
+H2SPEC_FULL=1 ./tests/container_security/run_h2spec.sh
+
+# 全件で 1 件でも失敗したら exit 1
+H2SPEC_FULL=1 H2SPEC_STRICT=1 ./tests/container_security/run_h2spec.sh
+```
+
+| 環境変数 | 既定 | 説明 |
+|----------|------|------|
+| `SKIP_H2SPEC` | `0` | `1` で h2spec をスキップ |
+| `H2SPEC_FULL` | `0` | `1` で RFC 全件スイートを追加実行 |
+| `H2SPEC_STRICT` | `0` | `1` でフルスイート失敗時に exit 1 |
+| `H2SPEC_TIMEOUT` | `30` | h2spec タイムアウト（秒） |
+
+テスト用設定 `tests/container_security/fixtures/veil-config.toml` で **H2C `:8443`** を有効化し、h2spec 要件（GET/POST `/` → 200 + 非空ボディ）を満たす。
+
+#### h2spec 結果（`veil:glibc`、2026-07-02）
+
+| スイート | 対象 | 結果 |
+|--------|------|------|
+| **ゲート** `generic hpack` | TLS `:443` | **52/52 通過**（~2s） |
+| **ゲート** `generic hpack` | H2C `:8443` | **52/52 通過**（~0.7s） |
+| **フル** RFC 7540/7541 | TLS `:443` | 139/146 通過、**7 失敗**（~216s） |
+| **フル** RFC 7540/7541 | H2C `:8443` | 138/146 通過、**8 失敗**（~211s） |
+
+フルスイートの主な失敗箇所（TLS/H2C 共通傾向）:
+
+- `http2/5.1` half-closed (remote) ストリームへの DATA/HEADERS/CONTINUATION → `STREAM_CLOSED` 期待
+- `http2/6.10` END_HEADERS 後の不正 CONTINUATION → `PROTOCOL_ERROR` 期待
+
+ゲート（相互運用必須セット）は **TLS・H2C とも全通過**。フルスイートの残件は HTTP/2 ストリーム状態機械の厳密準拠として backlog 化を検討。
+
 #### 成果物
 
 - オーケストレータ: `tests/container_security/run.sh`
-- ハーネス: `tests/container_security/harness/`（Dockerfile、fuzz/chaos/security スクリプト、シードコーパス）
-- レポート出力: `tests/container_security/results/`（実行時生成、gitignore）
+- h2spec 単体: `tests/container_security/run_h2spec.sh`
+- ハーネス: `tests/container_security/harness/`（Dockerfile、h2spec バイナリ、fuzz/chaos/security/h2spec スクリプト）
+- テスト設定: `tests/container_security/fixtures/veil-config.toml`
+- レポート出力: `tests/container_security/results/`（`h2spec_report.txt`、`h2spec_*_junit.xml` 等）
 
 #### 既知の制限
 
-- HTTP:80 は HTTPS へ 301 リダイレクトするため、メソッド制限検証は HTTPS で実施
+- HTTP:80 は HTTPS へ 301 リダイレクトするため、メソッド制限検証は HTTPS + DELETE で実施（POST は h2spec 用に許可）
 - distroless イメージは Docker `User` 未指定（起動 UID=0）だが、Veil プロセス内で特権降下
 - Trivy DB 初回ダウンロードで数分かかる（2 回目以降はキャッシュ）
-- h2spec / LibAFL / cargo-fuzz は未統合（将来 CI nightly 向け）
+- h2spec フルスイートは RFC 厳密準拠で 7〜8 件失敗（上記）。既定 CI ではゲートのみ実行
+- LibAFL / cargo-fuzz は未統合（将来）
