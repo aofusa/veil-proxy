@@ -69,6 +69,7 @@ main() {
     trap cleanup EXIT
     require_docker
     mkdir -p "${RESULTS_DIR}"
+    cleanup || true
 
     log "=== Veil コンテナセキュリティテスト開始 ==="
     log "イメージ: ${VEIL_IMAGE}"
