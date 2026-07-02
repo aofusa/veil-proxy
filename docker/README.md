@@ -5,9 +5,6 @@ Dockerイメージのビルドとコンテナの実行
 
 ビルド
 ```sh
-# glibc版とmusl版を一度にビルド
-./build.sh
-
 # glibc版のビルド
 docker build -f Dockerfile.glibc -t "veil:glibc" --build-arg CARGO_FEATURES='full' ..
 
@@ -35,7 +32,8 @@ openssl req -x509 -newkey EC -pkeyopt ec_paramgen_curve:secp384r1 -nodes \
 docker run -it --rm \
   -p 80:80 -p 443:443 \
   --read-only \
-  --tmpfs /tmp \
+  --tmpfs /var/cache/veil:rw,noexec,nosuid,uid=65532,gid=65532,size=512m \
+  --tmpfs /var/tmp/veil:rw,noexec,nosuid,uid=65532,gid=65532,size=256m \
   -v ./assets/conf.d:/etc/veil/conf.d:ro \
   -v ./assets/ssl:/etc/veil/ssl:ro \
   -v ./assets/www:/var/www:ro \
