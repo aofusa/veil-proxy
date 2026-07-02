@@ -12,6 +12,7 @@ SKIP_H2SPEC="${SKIP_H2SPEC:-0}"
 SKIP_TOXIPROXY="${SKIP_TOXIPROXY:-0}"
 SKIP_LIBFUZZER="${SKIP_LIBFUZZER:-1}"
 SKIP_CARGO_AUDIT="${SKIP_CARGO_AUDIT:-1}"
+SKIP_CARGO_DENY="${SKIP_CARGO_DENY:-1}"
 SKIP_TESTSSL="${SKIP_TESTSSL:-0}"
 H2SPEC_FULL="${H2SPEC_FULL:-0}"
 H2SPEC_STRICT="${H2SPEC_STRICT:-0}"
@@ -86,21 +87,29 @@ bootstrap_chaos_infra() {
     start_chaos_infra
 }
 
+poll_reload_ready() {
+    local veil_host="$1"
+    local metrics_path="${METRICS_PATH:-/__metrics}"
+    docker run --rm --network "${NET_NAME}" --entrypoint curl "${HARNESS_IMAGE}" \
+        -sk --max-time 3 "https://${veil_host}:443${metrics_path}" 2>/dev/null \
+        | grep -q 'veil_' || return 1
+    docker run --rm --network "${NET_NAME}" \
+        -e "VEIL_HOST=${veil_host}" "${HARNESS_IMAGE}" health >/dev/null 2>&1
+}
+
 sighup_chaos() {
     log "SIGHUP カオス: 設定リロードシグナル送信"
     docker kill --signal=SIGHUP "${VEIL_CONTAINER}" >/dev/null
-    local i
+    local i veil_host
     for ((i = 1; i <= RELOAD_POLL_ATTEMPTS; i++)); do
-        local veil_host
         veil_host="$(resolve_veil_host)"
-        if [[ -n "${veil_host}" ]] && docker run --rm --network "${NET_NAME}" \
-            -e "VEIL_HOST=${veil_host}" "${HARNESS_IMAGE}" health >/dev/null 2>&1; then
-            log "SIGHUP 後ヘルス復帰 (${i}/${RELOAD_POLL_ATTEMPTS})"
+        if [[ -n "${veil_host}" ]] && poll_reload_ready "${veil_host}"; then
+            log "SIGHUP 後メトリクス+ヘルス復帰 (${i}/${RELOAD_POLL_ATTEMPTS})"
             return 0
         fi
         sleep 1
     done
-    log "警告: SIGHUP 後のヘルス復帰を確認できませんでした"
+    log "警告: SIGHUP 後のメトリクス/ヘルス復帰を確認できませんでした"
     return 1
 }
 
@@ -114,6 +123,10 @@ main() {
     log "イメージ: ${VEIL_IMAGE}"
 
     check_kernel_capabilities
+    if should_skip_io_heavy_phases; then
+        log "io_uring 必須環境で非対応のため chaos フェーズをスキップ (${KERNEL_SKIP_REASON})"
+        export SKIP_CHAOS_LOAD=1
+    fi
     build_harness_image
     start_network
     bootstrap_chaos_infra
@@ -141,11 +154,16 @@ main() {
     fi
 
     # フェーズ 3: カオス負荷 + SIGHUP（タイムアウト付き）
-    run_harness chaos chaos &
-    local chaos_pid=$!
-    sleep 3
-    sighup_chaos || true
-    wait_with_timeout "${chaos_pid}" "${CHAOS_TIMEOUT_SEC}" "chaos_load" || die "chaos フェーズ失敗"
+    if [[ "${SKIP_CHAOS_LOAD:-0}" != "1" ]]; then
+        run_harness chaos chaos &
+        local chaos_pid=$!
+        sleep 3
+        sighup_chaos || true
+        wait_with_timeout "${chaos_pid}" "${CHAOS_TIMEOUT_SEC}" "chaos_load" || die "chaos フェーズ失敗"
+    else
+        log "chaos 負荷をスキップ (SKIP_CHAOS_LOAD=1)"
+        echo "chaos: skipped (${KERNEL_SKIP_REASON:-manual})" >"${RESULTS_DIR}/chaos_report.txt"
+    fi
 
     # フェーズ 3b: Toxiproxy 遅延注入・upstream 遮断
     if [[ "${SKIP_TOXIPROXY}" != "1" ]]; then
@@ -154,15 +172,26 @@ main() {
         run_harness slowloris slowloris || log "slowloris カオスで警告（レポート参照）"
     fi
 
-    # フェーズ 4: アプリセキュリティ（TLS・メソッド制限・testssl）
-    export SKIP_TESTSSL
+    # フェーズ 4: アプリセキュリティ（TLS・メソッド制限）
+    export SKIP_TESTSSL=1
     run_harness security security
+
+    # フェーズ 4a: testssl（Docker コンテナ）
+    export SKIP_TESTSSL
+    "${SCRIPT_DIR}/security/run_testssl.sh" || log "testssl で警告（レポート参照）"
 
     # フェーズ 4b: cargo-audit
     if [[ "${SKIP_CARGO_AUDIT}" != "1" ]]; then
         "${SCRIPT_DIR}/security/run_cargo_audit.sh" || log "cargo-audit で警告"
     else
         log "cargo-audit をスキップ (SKIP_CARGO_AUDIT=1)"
+    fi
+
+    # フェーズ 4c: cargo-deny
+    if [[ "${SKIP_CARGO_DENY}" != "1" ]]; then
+        "${SCRIPT_DIR}/security/run_cargo_deny.sh" || log "cargo-deny で警告"
+    else
+        log "cargo-deny をスキップ (SKIP_CARGO_DENY=1)"
     fi
 
     # フェーズ 5: Trivy イメージスキャン
@@ -176,6 +205,11 @@ main() {
         sleep 2
         [[ "${i}" -eq 10 ]] && die "最終ヘルスチェック失敗"
     done
+
+    # フェーズ 6: レポート集約
+    # shellcheck source=lib/report.sh
+    source "${SCRIPT_DIR}/lib/report.sh"
+    aggregate_reports
 
     log "=== 全テスト完了 ==="
     log "結果: ${RESULTS_DIR}/"

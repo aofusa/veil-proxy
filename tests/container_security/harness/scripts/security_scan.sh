@@ -74,19 +74,10 @@ path_traversal() {
 
 testssl_check() {
     if [[ "${SKIP_TESTSSL:-0}" == "1" ]]; then
-        log "testssl: skipped"
+        log "testssl: skipped (run.sh の run_testssl.sh で実行)"
         return 0
     fi
-    if command -v testssl.sh >/dev/null 2>&1; then
-        if testssl.sh --warnings off -p --openssl-timeout 5 "${VEIL_HOST}:${VEIL_HTTPS_PORT}" 2>&1 \
-            | tee -a "${RESULTS}" | grep -qiE 'TLS1_2|TLS1_3'; then
-            log "testssl: ok"
-        else
-            log "testssl: completed with review recommended"
-        fi
-    else
-        log "testssl: skipped (binary not in harness)"
-    fi
+    log "testssl: delegated to run_testssl.sh"
 }
 
 log "security_scan start"
