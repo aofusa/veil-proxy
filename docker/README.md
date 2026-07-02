@@ -5,15 +5,14 @@ Dockerイメージのビルドとコンテナの実行
 
 ビルド
 ```sh
-# glibc版のビルド
+# glibc版ビルド
 docker build -f Dockerfile.glibc -t "veil:glibc" --build-arg CARGO_FEATURES='full' ..
 
-# musl版をビルド
+# musl版ビルド
 docker build -f Dockerfile.musl -t "veil:musl" --build-arg CARGO_FEATURES='full' ..
 ```
 
-dockerを実行する場合io_uringはデフォルトで禁止されている
-[seccomp許可リスト](./assets/security/seccomp.json)のjsonを作成してコンテナ実行時に `--security-opt seccomp=<seccomp.json>` で渡し許可する必要がある
+io_uringはdockerではデフォルトで禁止されている。そのため [seccomp許可リスト](./assets/security/seccomp.json) を作成しコンテナ実行時に `--security-opt seccomp=<seccomp.json>` で許可する必要がある
 
 テスト実行
 ```sh
