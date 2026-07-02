@@ -22,8 +22,8 @@ enable_seccomp = true
 enable_landlock = true
 enable_sandbox = false
 seccomp_mode = "filter"
-landlock_read_paths = ["/var/www"]
-landlock_write_paths = []
+landlock_read_paths = ["/var/www", "/var/cache/veil", "/var/tmp/veil"]
+landlock_write_paths = ["/var/cache/veil", "/var/tmp/veil"]
 
 [performance]
 huge_pages_enabled = false

@@ -1,34 +1,99 @@
 # syntax=docker/dockerfile:1
+# musl 向けビルド + scratch ランタイム
+
+# ==========================================
+# 1. 最小設定ファイルやツールを用意する共通ステージ
+# ==========================================
+FROM messense/rust-musl-cross:x86_64-musl AS tool-builder
+
+WORKDIR /app
+
+# 依存パッケージのインストール
+RUN apt-get update -y \
+    && apt-get install -y --no-install-recommends \
+        nasm \
+        cmake \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# 最小設定ファイルとキャッシュディレクトリのオンデマンド生成
+RUN mkdir -p /etc_minimal/etc \
+    && echo "root:x:0:0:root:/root:/sbin/nologin" > /etc_minimal/etc/passwd \
+    && echo "nonroot:x:65532:65532:nonroot:/:/sbin/nologin" >> /etc_minimal/etc/passwd \
+    && echo "root:x:0:" > /etc_minimal/etc/group \
+    && echo "nonroot:x:65532:" >> /etc_minimal/etc/group \
+    && echo "passwd: files\ngroup: files\nhosts: files dns" > /etc_minimal/etc/nsswitch.conf \
+    && echo "127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback" > /etc_minimal/etc/hosts \
+    && mkdir -p /var/cache/veil /var/tmp/veil
 
 
-# musl 静的リンクビルド + scratch ランタイム
-FROM messense/rust-musl-cross:x86_64-musl AS builder
+# ==========================================
+# 2. 依存ライブラリの事前ビルドステージ
+# ==========================================
+FROM tool-builder AS cacher
 
 ARG CARGO_FEATURES=full
 ARG RUST_TARGET=x86_64-unknown-linux-musl
 
-WORKDIR /app
+# Cargo.toml と Cargo.lock だけを先にコピー
+COPY Cargo.toml Cargo.lock /app/
+
+# 空の main.rs を作り、依存関係「だけ」を先にコンパイルしてキャッシュ化する
+RUN mkdir src benches \
+    && echo "fn main() {}" > src/main.rs \
+    # Cargo.toml から name = "xxx"（ベンチマーク名）を抽出して、自動的にダミーファイルを一括作成
+    && awk -F'"' '/^\[\[bench\]\]/{p=1} p && /name =/{print $2; p=0}' Cargo.toml \
+       | xargs -I {} touch benches/{}.rs \
+    && cargo test --bins --no-run --target "${RUST_TARGET}" --features "${CARGO_FEATURES}" --locked \
+    && cargo build --release --target "${RUST_TARGET}" --features "${CARGO_FEATURES}" --locked \
+    && rm -rf src/
+
+
+# ==========================================
+# 3. アプリケーションコードのビルドステージ
+# ==========================================
+FROM tool-builder AS builder
+
+ARG CARGO_FEATURES=full
+ARG RUST_TARGET=x86_64-unknown-linux-musl
+
+# cacher ステージから「ビルド済みの依存関係アセット（target/）」をコピー
+COPY --from=cacher /root/.cargo /root/.cargo
+COPY --from=cacher /app/target /app/target
+COPY --from=cacher /app/benches /app/benches
+COPY Cargo.toml Cargo.lock /app/
+
+# ソースコードをコピー
 COPY . /app
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        nasm \
-        cmake \
-    && rm -rf /var/lib/apt/lists/*
-
-# 単体テスト・統合テスト（E2E は除外）
-RUN cargo test --bins --features "${CARGO_FEATURES}" --locked && \
-    cargo build --release --target "${RUST_TARGET}" --features "${CARGO_FEATURES}" --locked
+# テストとビルド
+RUN touch src/main.rs \
+    && cargo test --bins --features "${CARGO_FEATURES}" --locked \
+    && cargo build --release --target "${RUST_TARGET}" --features "${CARGO_FEATURES}" --locked
 
 
+# ==========================================
+# 4. 最終実行用ランタイム（scratch）
+# ==========================================
 FROM scratch AS runtime
 
 ARG RUST_TARGET=x86_64-unknown-linux-musl
 
+# ユーザー・グループ情報・ドメイン名でのネットワーク解決（DNS）を安定させるための設定ファイル
+COPY --from=builder /etc_minimal/etc/. /etc/
+
+# TLS通信用のCAルート証明書
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
+# ディスク書き込みが発生するディレクトリの構造と所有権の持込
+COPY --from=builder --chown=65532:65532 /var/cache/veil /var/cache/veil
+COPY --from=builder --chown=65532:65532 /var/tmp/veil /var/tmp/veil
+
+# アプリケーションバイナリと設定アセット
 COPY --from=builder /app/target/${RUST_TARGET}/release/veil /veil
 COPY --from=builder /app/docker/assets/conf.d/config.toml /etc/veil/conf.d/config.toml
 COPY --from=builder /app/docker/assets/www/index.html /var/www/index.html
 
 EXPOSE 80/tcp 443/tcp
 
-CMD ["./veil", "-c", "/etc/veil/conf.d/config.toml"]
+CMD ["/veil", "-c", "/etc/veil/conf.d/config.toml"]

@@ -1,33 +1,84 @@
 # syntax=docker/dockerfile:1
+# glibc 2.28 向けビルド + distroless/base-nossl ランタイム
+
+# ==========================================
+# 1. 最小設定ファイルやツールを用意する共通ステージ
+# ==========================================
+FROM messense/cargo-zigbuild AS tool-builder
+
+WORKDIR /app
+
+# 依存パッケージのインストール
+RUN apt-get update -y \
+    && apt-get install -y --no-install-recommends \
+        nasm \
+        cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+# キャッシュディレクトリの事前準備
+RUN mkdir -p /var/cache/veil /var/tmp/veil
 
 
-# glibc 2.28 向けビルド + distroless ランタイム
-FROM messense/cargo-zigbuild AS builder
+# ==========================================
+# 2. 依存ライブラリの事前ビルドステージ
+# ==========================================
+FROM tool-builder AS cacher
 
 ARG CARGO_FEATURES=full
 ARG RUST_TARGET=x86_64-unknown-linux-gnu
 ARG LIBC_VERSION=.2.28
 
-WORKDIR /app
+# Cargo.toml と Cargo.lock だけを先にコピー
+COPY Cargo.toml Cargo.lock /app/
+
+# 空の main.rs を作り、依存関係「だけ」を先にコンパイルしてキャッシュ化する
+RUN mkdir src benches \
+    && echo "fn main() {}" > src/main.rs \
+    # Cargo.toml から name = "xxx"（ベンチマーク名）を抽出して、自動的にダミーファイルを一括作成
+    && awk -F'"' '/^\[\[bench\]\]/{p=1} p && /name =/{print $2; p=0}' Cargo.toml \
+       | xargs -I {} touch benches/{}.rs \
+    && cargo test --bins --no-run --target "${RUST_TARGET}" --features "${CARGO_FEATURES}" --locked \
+    && cargo zigbuild --release --target "${RUST_TARGET}${LIBC_VERSION}" --features "${CARGO_FEATURES}" --locked \
+    && rm -rf src/
+
+
+# ==========================================
+# 3. アプリケーションコードのビルドステージ
+# ==========================================
+FROM tool-builder AS builder
+
+ARG CARGO_FEATURES=full
+ARG RUST_TARGET=x86_64-unknown-linux-gnu
+ARG LIBC_VERSION=.2.28
+
+# cacher ステージから「ビルド済みの依存関係アセット（target/）」をコピー
+COPY --from=cacher /usr/local/cargo /usr/local/cargo
+COPY --from=cacher /app/target /app/target
+COPY --from=cacher /app/benches /app/benches
+COPY Cargo.toml Cargo.lock /app/
+
+# ソースコードをコピー
 COPY . /app
 
-RUN apt-get update -y \
-    && apt-get install -y --no-install-recommends \
-        cmake \
-        nasm \
-    && rm -rf /var/lib/apt/lists/*
-
-# 単体テスト・統合テスト（E2E は除外）
-RUN cargo test --bins --features "${CARGO_FEATURES}" --locked && \
-    cargo zigbuild --release --target "${RUST_TARGET}${LIBC_VERSION}" --features "${CARGO_FEATURES}" --locked
+# テストとビルド
+RUN touch src/main.rs \
+    && cargo test --bins --features "${CARGO_FEATURES}" --locked \
+    && cargo zigbuild --release --target "${RUST_TARGET}${LIBC_VERSION}" --features "${CARGO_FEATURES}" --locked
 
 
-# veil は動的リンクかつrustls利用のため base-nossl-debian13 を使用
+# ==========================================
+# 4. 最終実行用ランタイム（distroless/base-nossl）
+# ==========================================
 FROM gcr.io/distroless/base-nossl-debian13 AS runtime
 
 ARG RUST_TARGET=x86_64-unknown-linux-gnu
 ARG LIBC_VERSION=.2.28
 
+# ディスク書き込みが発生するディレクトリの構造と所有権の持込
+COPY --from=builder --chown=65532:65532 /var/cache/veil /var/cache/veil
+COPY --from=builder --chown=65532:65532 /var/tmp/veil /var/tmp/veil
+
+# アプリケーションバイナリと設定アセット
 COPY --from=builder /app/target/${RUST_TARGET}/release/veil /veil
 COPY --from=builder /app/docker/assets/conf.d/config.toml /etc/veil/conf.d/config.toml
 COPY --from=builder /app/docker/assets/www/index.html /var/www/index.html

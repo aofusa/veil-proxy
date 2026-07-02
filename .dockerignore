@@ -5,5 +5,4 @@
 !Cargo.toml
 !Cargo.lock
 !src/
-!benches/
 !docker/assets
