@@ -1,4 +1,5 @@
 [workspace]
+members = [".", "fuzz"]
 
 [package]
 name = "veil"
@@ -7,6 +8,10 @@ edition = "2021"
 description = "High-performance reverse proxy server using io_uring and rustls"
 license = "Apache-2.0 OR MIT"
 authors = ["aofusa"]
+
+[lib]
+name = "veil"
+path = "src/lib.rs"
 
 [features]
 # デフォルトビルド（kTLS + HTTP/2 + mimalloc）

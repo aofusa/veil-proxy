@@ -50,7 +50,13 @@
 | F-09 | P1 | 完了 | [features/prometheus-feature-flags.md](features/prometheus-feature-flags.md) | Prometheus 拡充と feature 無効化 |
 | F-01 | P2 | 完了 | [features/grpc.md](features/grpc.md) | gRPC / gRPC-Web の完成度・テスト拡充 |
 | F-05 | P2 | 未着手 | [features/acme.md](features/acme.md) | ACME 統合 |
-| F-07 | P2 | 完了 | [features/fuzzing-chaos-security.md](features/fuzzing-chaos-security.md) | ファジング・カオス・h2spec・セキュリティスキャン（`tests/container_security/`。h2spec ゲート 52/52×2 通過。RFC フルは 7〜8 件残。config/env 上書きは残件） |
+| F-07 | P2 | 進行中 | [features/fuzzing-chaos-security.md](features/fuzzing-chaos-security.md) | ファジング・カオス・h2spec・セキュリティスキャン（`tests/container_security/` 基盤完了。F-52〜F-57 で拡充中） |
+| F-52 | P1 | 進行中 | [features/F-52-cargo-fuzz-libfuzzer.md](features/F-52-cargo-fuzz-libfuzzer.md) | cargo-fuzz / LibFuzzer（HPACK・config TOML ターゲット、`src/lib.rs`） |
+| F-53 | P1 | 進行中 | [features/F-53-chaos-engineering-expansion.md](features/F-53-chaos-engineering-expansion.md) | カオス拡充（Toxiproxy 遅延注入、Pumba/tc 残件） |
+| F-54 | P1 | 進行中 | [features/F-54-security-scan-expansion.md](features/F-54-security-scan-expansion.md) | セキュリティスキャン拡充（cargo-audit、testssl、ZAP 残件） |
+| F-55 | P2 | 進行中 | [features/F-55-harness-hardening.md](features/F-55-harness-hardening.md) | ハーネス堅牢化（ポーリング、chaos タイムアウト、カーネルガード） |
+| F-56 | P2 | 未着手 | [features/F-56-property-load-tests.md](features/F-56-property-load-tests.md) | プロパティベース・負荷テスト（proptest、wrk/k6） |
+| F-57 | P2 | 未着手 | [features/F-57-container-security-ci.md](features/F-57-container-security-ci.md) | container_security CI/CD 統合（GitHub Actions nightly） |
 | F-08 | P2 | 完了 | [features/proxy-wasm-benchmarks.md](features/proxy-wasm-benchmarks.md) | Proxy-Wasm ベンチマーク（`benches/wasm.rs`：`/wasm/*` 適用 vs 非適用のレイテンシ差でフィルタオーバーヘッドを計測。Keep-Alive で接続コスト償却） |
 | F-10 | P1 | 完了 | [features/opentelemetry.md](features/opentelemetry.md) | OpenTelemetry 対応 |
 | F-18 | P1 | 完了 | [features/l4-stream-proxy.md](features/l4-stream-proxy.md) | L4 (TCP/UDP) ストリームプロキシ |

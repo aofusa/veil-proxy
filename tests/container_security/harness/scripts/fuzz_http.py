@@ -28,6 +28,12 @@ BUILTIN_SEEDS: list[bytes] = [
     b"HEAD / HTTP/1.1\r\nHost: test\r\n\r\n",
     b"OPTIONS * HTTP/1.1\r\nHost: test\r\n\r\n",
     b"GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nHost: test\r\n\r\n0\r\n\r\n",
+    # chunked / Range / Expect: 100-continue
+    b"GET / HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+    b"GET / HTTP/1.1\r\nHost: test\r\nRange: bytes=0-1024\r\n\r\n",
+    b"POST / HTTP/1.1\r\nHost: test\r\nExpect: 100-continue\r\nContent-Length: 4\r\n\r\nbody",
+    # slowloris 風（不完全ヘッダ）
+    b"GET / HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n",
     b"",
 ]
 

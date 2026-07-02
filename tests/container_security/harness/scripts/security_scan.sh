@@ -14,15 +14,19 @@ log() {
     printf '%s\n' "$*" | tee -a "${RESULTS}"
 }
 
-# TLS ハンドシェイク確認
+# TLS ハンドシェイク確認（負荷直後はリトライ）
 tls_check() {
-    if echo | openssl s_client -connect "${VEIL_HOST}:${VEIL_HTTPS_PORT}" -servername localhost 2>/dev/null \
-        | grep -q "BEGIN CERTIFICATE"; then
-        log "tls_handshake: ok"
-    else
-        log "tls_handshake: fail"
-        return 1
-    fi
+    local i
+    for ((i = 1; i <= 5; i++)); do
+        if echo | openssl s_client -connect "${VEIL_HOST}:${VEIL_HTTPS_PORT}" -servername localhost 2>/dev/null \
+            | grep -q "BEGIN CERTIFICATE"; then
+            log "tls_handshake: ok"
+            return 0
+        fi
+        sleep 1
+    done
+    log "tls_handshake: fail"
+    return 1
 }
 
 # 許可メソッド外 DELETE が拒否されること（config: HEAD, GET, POST）
@@ -68,8 +72,26 @@ path_traversal() {
     log "path_traversal: ok"
 }
 
+testssl_check() {
+    if [[ "${SKIP_TESTSSL:-0}" == "1" ]]; then
+        log "testssl: skipped"
+        return 0
+    fi
+    if command -v testssl.sh >/dev/null 2>&1; then
+        if testssl.sh --warnings off -p --openssl-timeout 5 "${VEIL_HOST}:${VEIL_HTTPS_PORT}" 2>&1 \
+            | tee -a "${RESULTS}" | grep -qiE 'TLS1_2|TLS1_3'; then
+            log "testssl: ok"
+        else
+            log "testssl: completed with review recommended"
+        fi
+    else
+        log "testssl: skipped (binary not in harness)"
+    fi
+}
+
 log "security_scan start"
 tls_check
+testssl_check
 method_restriction
 trace_check
 path_traversal

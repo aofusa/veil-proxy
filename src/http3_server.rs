@@ -44,12 +44,14 @@ const RESP_CHAN_CAP: usize = 8;
 
 use ftlog::{debug, error, info, warn};
 
-use crate::proxy::{check_security, SecurityCheckResult};
-use crate::{
-    encode_prometheus_metrics, find_backend_unified, log_access, resolve_http3_compression_config,
-    AcceptedEncoding, Backend, CompressionConfig, ProxyTarget, SecurityConfig, UpstreamGroup,
-    CURRENT_CONFIG, SHUTDOWN_FLAG,
+use crate::config::{
+    resolve_http3_compression_config, AcceptedEncoding, Backend, CompressionConfig,
+    ProxyTarget, SecurityConfig, UpstreamGroup, CURRENT_CONFIG, SHUTDOWN_FLAG,
 };
+use crate::logging::log_access;
+use crate::metrics::encode_prometheus_metrics;
+use crate::proxy::{check_security, SecurityCheckResult};
+use crate::upstream::find_backend_unified;
 
 /// memfd_create システムコールのラッパー（セキュリティ強化版）
 ///

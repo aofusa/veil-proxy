@@ -35,6 +35,15 @@ ktls_fallback_enabled = true
 
 [[route]]
 [route.conditions]
+path = "/api/"
+[route.action]
+type = "Proxy"
+url = "http://veil-sec-toxiproxy:8480/"
+[route.security]
+allowed_methods = ["HEAD", "GET", "POST"]
+
+[[route]]
+[route.conditions]
 path = "/"
 [route.action]
 type = "File"

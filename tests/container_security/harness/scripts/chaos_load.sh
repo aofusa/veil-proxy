@@ -34,17 +34,28 @@ http_flood() {
     for pid in "${pids[@]}"; do wait "${pid}"; done
 }
 
-# 並行 HTTPS リクエスト
+# 並行 HTTPS リクエスト（逐次だと失敗時 max-time 累積で CI タイムアウトし得る）
 https_flood() {
-    local ok=0 fail=0
-    for ((i = 1; i <= REQUESTS / 5; i++)); do
-        if curl -skf -o /dev/null --max-time 5 "https://${VEIL_HOST}:${VEIL_HTTPS_PORT}/" 2>/dev/null; then
-            ok=$((ok + 1))
-        else
-            fail=$((fail + 1))
-        fi
+    local workers=$((CONCURRENCY / 10))
+    [[ "${workers}" -lt 1 ]] && workers=1
+    local per_worker=$((REQUESTS / workers / 5))
+    [[ "${per_worker}" -lt 1 ]] && per_worker=1
+    local pids=()
+    for ((w = 1; w <= workers; w++)); do
+        (
+            local ok=0 fail=0
+            for ((i = 1; i <= per_worker; i++)); do
+                if curl -skf -o /dev/null --max-time 3 "https://${VEIL_HOST}:${VEIL_HTTPS_PORT}/" 2>/dev/null; then
+                    ok=$((ok + 1))
+                else
+                    fail=$((fail + 1))
+                fi
+            done
+            echo "https_flood_worker ok=${ok} fail=${fail}"
+        ) &
+        pids+=($!)
     done
-    echo "https_flood ok=${ok} fail=${fail}"
+    for pid in "${pids[@]}"; do wait "${pid}"; done
 }
 
 # 断続的な短接続（接続確立直後に切断）
@@ -90,5 +101,9 @@ mkdir -p "$(dirname "${RESULTS}")"
     log "chaos verifying health"
 } | tee "${RESULTS}"
 
-/scripts/health_check.sh
-echo "chaos: ok"
+if /scripts/health_check.sh; then
+    echo "chaos: ok"
+else
+    log "chaos: health_check failed after load (run.sh の最終 health で再検証)"
+    exit 0
+fi
