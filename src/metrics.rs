@@ -269,7 +269,6 @@ pub(crate) static CACHE_EVICTIONS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
 #[cfg(feature = "metrics")]
 /// キャッシュサイズゲージ（storage ラベル付き）
 /// storage: "memory" or "disk"
-#[allow(dead_code)]
 pub(crate) static CACHE_SIZE_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
     let opts = Opts::new("cache_size_bytes", "Current cache size in bytes").namespace("veil_proxy");
     let gauge = IntGaugeVec::new(opts, &["storage"]).unwrap();
@@ -279,7 +278,6 @@ pub(crate) static CACHE_SIZE_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
 
 #[cfg(feature = "metrics")]
 /// キャッシュエントリ数ゲージ
-#[allow(dead_code)]
 pub(crate) static CACHE_ENTRIES: Lazy<IntGaugeVec> = Lazy::new(|| {
     let opts =
         Opts::new("cache_entries", "Current number of cache entries").namespace("veil_proxy");
@@ -328,8 +326,9 @@ pub(crate) fn record_cache_miss(_host: &str) {
 }
 
 /// メトリクス: キャッシュ保存を記録
-#[allow(dead_code)]
 #[inline]
+// cache feature 有効時のみ呼び出される
+#[cfg_attr(not(feature = "cache"), allow(dead_code))]
 pub(crate) fn record_cache_store(_host: &str, _storage: &str) {
     #[cfg(feature = "metrics")]
     CACHE_STORES_TOTAL
@@ -762,14 +761,6 @@ pub(crate) fn encode_prometheus_metrics() -> Vec<u8> {
         .encode(&metric_families, &mut buffer)
         .unwrap_or_default();
     buffer
-}
-
-/// metrics feature 無効時のスタブ
-#[cfg(not(feature = "metrics"))]
-#[allow(dead_code)]
-#[inline]
-pub(crate) fn encode_prometheus_metrics() -> Vec<u8> {
-    Vec::new()
 }
 
 /// メトリクスファミリーを (メトリクス名, [(ラベル集合, 値)]) 形式で収集する（F-10）

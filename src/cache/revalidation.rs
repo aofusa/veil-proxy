@@ -74,16 +74,6 @@ pub fn collapsed_request_count() -> u64 {
     COLLAPSED_REQUESTS.load(Ordering::Relaxed)
 }
 
-/// 統計情報をリセット
-///
-/// メトリクスリセット用のユーティリティ関数。
-/// 現在は未使用だが、将来のメトリクス管理機能で使用される可能性がある。
-#[inline]
-#[allow(dead_code)]
-pub fn reset_stats() {
-    COLLAPSED_REQUESTS.store(0, Ordering::Relaxed);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

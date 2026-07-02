@@ -701,7 +701,6 @@ impl StreamManager {
     /// 指定した依存先を持つストリームのIDリストを取得
     ///
     /// RFC 7540 Section 5.3.1: 依存関係の処理
-    #[allow(dead_code)]
     pub fn get_dependent_streams(&self, parent_id: u32) -> Vec<u32> {
         self.streams
             .iter()

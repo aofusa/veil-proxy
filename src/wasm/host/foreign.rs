@@ -19,25 +19,6 @@ pub type ForeignFn = fn(&[u8]) -> Result<Vec<u8>, i32>;
 static FOREIGN_FUNCTIONS: Lazy<RwLock<HashMap<String, ForeignFn>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
-/// Register a foreign function
-///
-/// Note: Currently unused, reserved for future Proxy-Wasm extensions
-#[allow(dead_code)]
-pub fn register_foreign_function(name: &str, func: ForeignFn) {
-    if let Ok(mut registry) = FOREIGN_FUNCTIONS.write() {
-        registry.insert(name.to_string(), func);
-        ftlog::info!("Registered foreign function: {}", name);
-    }
-}
-
-/// Unregister a foreign function
-#[allow(dead_code)]
-pub fn unregister_foreign_function(name: &str) {
-    if let Ok(mut registry) = FOREIGN_FUNCTIONS.write() {
-        registry.remove(name);
-    }
-}
-
 /// Add foreign function calls to linker
 pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     // proxy_call_foreign_function

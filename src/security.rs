@@ -964,13 +964,8 @@ fn apply_landlock(config: &SecurityConfig) -> io::Result<()> {
     const LANDLOCK_ACCESS_FS_READ_DIR: u64 = 1 << 3;
     const LANDLOCK_ACCESS_FS_REMOVE_DIR: u64 = 1 << 4;
     const LANDLOCK_ACCESS_FS_REMOVE_FILE: u64 = 1 << 5;
-    const LANDLOCK_ACCESS_FS_MAKE_CHAR: u64 = 1 << 6;
     const LANDLOCK_ACCESS_FS_MAKE_DIR: u64 = 1 << 7;
     const LANDLOCK_ACCESS_FS_MAKE_REG: u64 = 1 << 8;
-    const LANDLOCK_ACCESS_FS_MAKE_SOCK: u64 = 1 << 9;
-    const LANDLOCK_ACCESS_FS_MAKE_FIFO: u64 = 1 << 10;
-    const LANDLOCK_ACCESS_FS_MAKE_BLOCK: u64 = 1 << 11;
-    const LANDLOCK_ACCESS_FS_MAKE_SYM: u64 = 1 << 12;
 
     // ABI v2 (Linux 5.19+) - ファイル参照権限
     const LANDLOCK_ACCESS_FS_REFER: u64 = 1 << 13;
@@ -980,16 +975,6 @@ fn apply_landlock(config: &SecurityConfig) -> io::Result<()> {
 
     // ABI v4 (Linux 6.7+) - ioctl権限
     const LANDLOCK_ACCESS_FS_IOCTL_DEV: u64 = 1 << 15;
-
-    // 作成/削除関連の全権限
-    #[allow(dead_code)]
-    const LANDLOCK_ACCESS_FS_MAKE_ALL: u64 = LANDLOCK_ACCESS_FS_MAKE_CHAR
-        | LANDLOCK_ACCESS_FS_MAKE_DIR
-        | LANDLOCK_ACCESS_FS_MAKE_REG
-        | LANDLOCK_ACCESS_FS_MAKE_SOCK
-        | LANDLOCK_ACCESS_FS_MAKE_FIFO
-        | LANDLOCK_ACCESS_FS_MAKE_BLOCK
-        | LANDLOCK_ACCESS_FS_MAKE_SYM;
 
     // ruleset_attr 構造体
     #[repr(C)]

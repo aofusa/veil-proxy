@@ -294,7 +294,6 @@ The following table lists default values for major configuration options:
 | `[logging]` | `format` | `"text"` | Log format |
 | `[logging]` | `channel_size` | `100000` | Log channel buffer size |
 | `[logging]` | `flush_interval_ms` | `1000` | Flush interval (ms) |
-| `[logging]` | `max_log_size` | `104857600` | Max log file size (100MB) |
 | `[prometheus]` | `enabled` | `false` | Enable Prometheus metrics |
 | `[prometheus]` | `path` | `"/__metrics"` | Metrics endpoint path |
 | `[performance]` | `reuseport_balancing` | `"cbpf"` | SO_REUSEPORT balancing |
@@ -314,8 +313,6 @@ The following table lists default values for major configuration options:
 | `[buffer_pool]` | `request_buffer_size` | `1024` | Request buffer size (1KB) |
 | `[buffer_pool]` | `initial_request_buffers` | `16` | Initial request buffers |
 | `[buffer_pool]` | `large_request_buffer_size` | `4096` | Large request buffer (4KB) |
-| `[buffer_pool]` | `path_string_size` | `256` | Path string buffer size |
-| `[buffer_pool]` | `response_header_buffer_size` | `512` | Response header buffer size |
 | `[http2]` | `header_table_size` | `65536` | HPACK table size (64KB) |
 | `[http2]` | `max_concurrent_streams` | `256` | Max concurrent streams |
 | `[http2]` | `initial_window_size` | `1048576` | Stream window size (1MB) |
@@ -371,7 +368,6 @@ channel_size = 100000
 # Flush interval (milliseconds)
 flush_interval_ms = 1000
 # Maximum log file size (bytes, 0=no rotation)
-max_log_size = 104857600
 # Log file path (optional, defaults to stderr)
 # file_path = "/var/log/veil.log"
 
@@ -3327,11 +3323,9 @@ large_request_buffer_size = 4096
 
 # Path string buffer size (bytes)
 # Default: 256
-path_string_size = 256
 
 # Response header buffer size (bytes)
 # Default: 512
-response_header_buffer_size = 512
 ```
 
 **Note**: Buffer pool configuration is optional. Default values are optimized for most use cases. Adjust only if you have specific memory constraints or performance requirements.

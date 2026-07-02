@@ -17,7 +17,8 @@ use xxhash_rust::xxh3::xxh3_64;
 ///
 /// # 注意
 /// 実際のバッファリング処理では`disk_buffer`モジュールの関数を使用してください。
-#[allow(dead_code)] // テストコードで使用、将来の使用に備える
+// 現在は単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn key_to_path(base_path: &std::path::Path, key: &[u8]) -> PathBuf {
     let hash = xxh3_64(key);
 

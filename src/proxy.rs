@@ -6343,18 +6343,7 @@ enum BufferedBodyResult {
     Failed,
 }
 
-impl BufferedBodyResult {
-    /// サイズを取得
-    #[allow(dead_code)]
-    fn size(&self) -> u64 {
-        match self {
-            BufferedBodyResult::Memory(data) => data.len() as u64,
-            BufferedBodyResult::Disk { size, .. } => *size,
-            BufferedBodyResult::LimitExceeded => 0,
-            BufferedBodyResult::Failed => 0,
-        }
-    }
-}
+impl BufferedBodyResult {}
 
 // ====================
 // HTTPリクエスト送信とレスポンス受信（バッファリング対応版）
@@ -7771,7 +7760,8 @@ async fn transfer_uncompressed_fallback(
 }
 
 /// 圧縮用にヘッダーを書き換え
-#[allow(dead_code)]
+// compression feature 有効時のみ呼び出される
+#[cfg_attr(not(feature = "compression"), allow(dead_code))]
 fn build_compressed_headers(
     original_headers: &[u8],
     encoding: AcceptedEncoding,

@@ -3364,7 +3364,6 @@ fn default_manual_chunk_size() -> usize {
 /// ファイルサイズに応じた最適なチャンクサイズを計算
 ///
 /// 動的調整モード時に使用されます。
-#[allow(dead_code)]
 pub fn calculate_optimal_chunk_size(file_size: u64) -> usize {
     match file_size {
         0..=65_536 => 65_536,          // 64KB以下: 64KB
@@ -3541,7 +3540,6 @@ pub enum Backend {
         Arc<buffering::BufferingConfig>,
         Arc<cache::CacheConfig>,
         /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
-        #[allow(dead_code)]
         Option<Arc<Vec<String>>>,
     ),
     /// MemoryFile バックエンド
@@ -3553,7 +3551,6 @@ pub enum Backend {
         Arc<str>,
         Arc<SecurityConfig>,
         /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
-        #[allow(dead_code)]
         Option<Arc<Vec<String>>>,
     ),
     /// SendFile バックエンド
@@ -3571,7 +3568,6 @@ pub enum Backend {
         Arc<cache::CacheConfig>,
         Option<Arc<cache::OpenFileCacheConfig>>,
         /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
-        #[allow(dead_code)]
         Option<Arc<Vec<String>>>,
     ),
     /// Redirect バックエンド
@@ -3583,7 +3579,6 @@ pub enum Backend {
         u16,
         bool,
         /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
-        #[allow(dead_code)]
         Option<Arc<Vec<String>>>,
     ),
 }
@@ -3605,7 +3600,6 @@ impl Backend {
 
     /// このバックエンドに適用するWASMモジュール名のリストを取得
     #[inline]
-    #[allow(dead_code)]
     pub fn modules(&self) -> Option<&[String]> {
         match self {
             Backend::Proxy(_, _, _, _, _, modules) => modules.as_deref().map(|v| v.as_slice()),
@@ -3614,27 +3608,6 @@ impl Backend {
                 modules.as_deref().map(|v| v.as_slice())
             }
             Backend::Redirect(_, _, _, modules) => modules.as_deref().map(|v| v.as_slice()),
-        }
-    }
-
-    /// このバックエンドのバッファリング設定を取得
-    #[inline]
-    #[allow(dead_code)]
-    fn buffering(&self) -> Option<&buffering::BufferingConfig> {
-        match self {
-            Backend::Proxy(_, _, _, buffering, _, _) => Some(buffering),
-            _ => None,
-        }
-    }
-
-    /// このバックエンドのキャッシュ設定を取得
-    #[inline]
-    #[allow(dead_code)]
-    fn cache(&self) -> Option<&cache::CacheConfig> {
-        match self {
-            Backend::Proxy(_, _, _, _, cache, _) => Some(cache),
-            Backend::SendFile(_, _, _, _, cache, _, _) => Some(cache),
-            _ => None,
         }
     }
 }
@@ -4042,7 +4015,6 @@ const CONSISTENT_HASH_SEED: u64 = 0x9E3779B97F4A7C15;
 #[derive(Clone)]
 pub struct UpstreamGroup {
     /// グループ名（ログ出力用）
-    #[allow(dead_code)]
     pub name: String,
     /// バックエンドサーバーリスト
     pub servers: Vec<UpstreamServer>,
@@ -4941,13 +4913,10 @@ pub struct RuntimeConfig {
     /// 最適化ルーター（Phase 1-4最適化適用）
     pub optimized_router: Arc<routing::OptimizedRouter>,
     /// TLS設定（ホットリロード時の参照用）
-    #[allow(dead_code)]
     pub tls_config: Option<Arc<ServerConfig>>,
     /// kTLS設定（ホットリロード時の参照用）
-    #[allow(dead_code)]
     pub ktls_config: Arc<KtlsConfig>,
     /// グローバルセキュリティ設定（ホットリロード時の参照用）
-    #[allow(dead_code)]
     pub global_security: Arc<GlobalSecurityConfig>,
     /// Prometheusメトリクス設定
     pub prometheus_config: Arc<PrometheusConfig>,
@@ -4974,7 +4943,6 @@ pub struct RuntimeConfig {
     /// H2C リスニングアドレス（オプション）
     /// ホットリロード時の参照用（現在は起動時のみ使用）
     #[cfg(feature = "http2")]
-    #[allow(dead_code)]
     pub h2c_listen: Option<String>,
     /// WASM Filter Engine（WASM機能が有効な場合）
     #[cfg(feature = "wasm")]

@@ -97,7 +97,8 @@ impl HostPortStr {
 ///
 /// # 形式
 /// `Via: 1.1 <hostname>`
-#[allow(dead_code)]
+// 現在は単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn add_via_header(headers: &mut Vec<(Vec<u8>, Vec<u8>)>, hostname: &str) {
     let via_value = format!("1.1 {}", hostname).into_bytes();
 
@@ -124,7 +125,8 @@ pub(crate) fn add_via_header(headers: &mut Vec<(Vec<u8>, Vec<u8>)>, hostname: &s
 /// # Returns
 /// * `Ok(())` - ヘッダーが有効
 /// * `Err(String)` - エラーメッセージ
-#[allow(dead_code)]
+// 現在は単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn validate_http_headers(
     headers: &[(impl AsRef<[u8]>, impl AsRef<[u8]>)],
 ) -> Result<(), String> {
@@ -154,7 +156,6 @@ pub(crate) fn validate_http_headers(
 /// # Returns
 /// * `true` - 100 Continue レスポンスを送信すべき
 /// * `false` - 通常のリクエスト処理を継続
-#[allow(dead_code)]
 pub(crate) fn check_expect_continue(headers: &[(impl AsRef<[u8]>, impl AsRef<[u8]>)]) -> bool {
     for (name, value) in headers {
         let name = name.as_ref();
@@ -178,7 +179,8 @@ pub(crate) fn check_expect_continue(headers: &[(impl AsRef<[u8]>, impl AsRef<[u8
 /// # Returns
 /// * `Ok(new_max)` - 拡張後の最大ヘッダー数
 /// * `Err(String)` - 上限超過エラー
-#[allow(dead_code)]
+// 現在は単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn check_header_count(
     current_count: usize,
     max_headers: usize,
@@ -217,7 +219,6 @@ pub(crate) fn check_header_count(
 /// # Returns
 /// * `Ok(())` - Hostヘッダーが存在する、またはHTTP/1.0で任意
 /// * `Err(&'static str)` - HTTP/1.1でHostヘッダーが存在しない
-#[allow(dead_code)]
 pub(crate) fn validate_host_header(
     headers: &[(impl AsRef<[u8]>, impl AsRef<[u8]>)],
     http_minor_version: u8,
@@ -275,7 +276,8 @@ pub(crate) fn is_hop_by_hop_header(name: &[u8]) -> bool {
 ///
 /// # Arguments
 /// * `headers` - ヘッダーのリスト（変更される）
-#[allow(dead_code)]
+// 現在は単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn strip_hop_by_hop_headers(headers: &mut Vec<(Vec<u8>, Vec<u8>)>) {
     // Connectionヘッダーで指定された追加ヘッダーを収集
     // Connectionヘッダー値をトリムして収集（lowercase化は eq_ignore_ascii_case で不要）
@@ -333,7 +335,6 @@ pub struct ParsedRange {
 /// # Returns
 /// * `Some(ParsedRange)` - 正常にパースできた場合
 /// * `None` - 不正な形式の場合
-#[allow(dead_code)]
 pub(crate) fn parse_range_header(range_header: &[u8]) -> Option<ParsedRange> {
     // "bytes=" プレフィックスを確認
     if range_header.len() < 6 || !range_header[..6].eq_ignore_ascii_case(b"bytes=") {
@@ -394,7 +395,6 @@ pub(crate) fn parse_range_header(range_header: &[u8]) -> Option<ParsedRange> {
 /// # Returns
 /// * `Some((actual_start, actual_end))` - 満足可能なレンジ（0-indexed、両端含む）
 /// * `None` - 416 Range Not Satisfiable を返すべき
-#[allow(dead_code)]
 pub(crate) fn normalize_range(spec: &RangeSpec, content_length: u64) -> Option<(u64, u64)> {
     if content_length == 0 {
         return None;
@@ -429,7 +429,8 @@ pub(crate) fn normalize_range(spec: &RangeSpec, content_length: u64) -> Option<(
 ///
 /// # Returns
 /// 206レスポンスヘッダー（ボディなし）
-#[allow(dead_code)]
+// 現在は単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_partial_response_header(
     start: u64,
     end: u64,
@@ -474,7 +475,6 @@ pub(crate) fn build_partial_response_header(
 }
 
 /// 416 Range Not Satisfiable レスポンスを構築 (RFC 7233 Section 4.4)
-#[allow(dead_code)]
 pub(crate) fn build_range_not_satisfiable_response(content_length: u64) -> Vec<u8> {
     let mut response = Vec::with_capacity(128);
     response.extend_from_slice(b"HTTP/1.1 416 Range Not Satisfiable\r\n");
@@ -505,7 +505,6 @@ pub struct TeHeader {
 ///
 /// # Returns
 /// `TeHeader` 構造体
-#[allow(dead_code)]
 pub(crate) fn parse_te_header(te_header: &[u8]) -> TeHeader {
     let mut result = TeHeader::default();
 
@@ -535,7 +534,8 @@ pub(crate) fn parse_te_header(te_header: &[u8]) -> TeHeader {
 }
 
 /// リクエストからRangeヘッダーを取得
-#[allow(dead_code)]
+// 現在は単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn get_range_header<'a>(
     headers: &'a [(impl AsRef<[u8]>, impl AsRef<[u8]>)],
 ) -> Option<&'a [u8]> {
@@ -548,7 +548,8 @@ pub(crate) fn get_range_header<'a>(
 /// Accept-Ranges: bytes ヘッダーを追加するかチェック
 ///
 /// 静的ファイル配信時にクライアントにRangeリクエストサポートを通知
-#[allow(dead_code)]
+// 現在は単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn should_advertise_accept_ranges(method: &[u8]) -> bool {
     // GETとHEADでのみAccept-Rangesを通知
     method.eq_ignore_ascii_case(b"GET") || method.eq_ignore_ascii_case(b"HEAD")
@@ -750,7 +751,8 @@ pub fn url_decode(input: &str) -> String {
 /// - "example.com" → 完全一致
 /// - "*.example.com" → サブドメインにマッチ（例: "api.example.com", "www.example.com"）
 /// - "api.*.com" → サポートしない（先頭または末尾のみ）
-#[allow(dead_code)]
+// 現在は単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn matches_wildcard(pattern: &str, text: &str) -> bool {
     if pattern == text {
         return true;
@@ -783,7 +785,8 @@ pub(crate) fn matches_wildcard(pattern: &str, text: &str) -> bool {
 /// - "/api" → 完全一致
 /// - "/api/*" → "/api/" で始まるすべてのパスにマッチ
 /// - "/api/v2/*" → "/api/v2/" で始まるすべてのパスにマッチ
-#[allow(dead_code)]
+// 現在は単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn matches_path_pattern(pattern: &str, path: &[u8]) -> bool {
     let path_str = match std::str::from_utf8(path) {
         Ok(s) => s,
@@ -812,7 +815,8 @@ pub(crate) fn matches_path_pattern(pattern: &str, path: &[u8]) -> bool {
 }
 
 /// ソースIPがCIDR範囲に含まれるかチェック
-#[allow(dead_code)]
+// 現在は単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn matches_cidr(ip: &SocketAddr, cidr_ranges: &[String]) -> bool {
     use std::net::IpAddr;
 

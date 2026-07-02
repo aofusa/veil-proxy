@@ -9,7 +9,6 @@
 //! - CQE を受け取ると対応する Waker を呼ぶ
 //! - Future は `OpState` として登録され、完了時に結果を格納する
 
-
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;

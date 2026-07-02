@@ -3,7 +3,6 @@
 //! 大きいレスポンス用のディスクベースキャッシュを提供します。
 //! monoio::fsを使用した非同期I/Oにより、ワーカースレッドのブロッキングを防ぎます。
 
-use super::entry::CacheStorage;
 use super::key::CacheKey;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -76,23 +75,6 @@ impl DiskCache {
     /// キャッシュキーからファイルパスを生成
     pub fn key_to_path(&self, key: &CacheKey) -> PathBuf {
         let (dir1, dir2, filename) = key.to_path_components();
-        self.config.base_path.join(dir1).join(dir2).join(filename)
-    }
-
-    /// ハッシュ値からファイルパスを生成
-    ///
-    /// 将来の使用に備えた機能。ハッシュベースのキャッシュ管理や
-    /// キャッシュ移行時に使用可能。
-    ///
-    /// # 使用例
-    /// - キャッシュの再構築（メタデータのみからパスを復元）
-    /// - ハッシュベースのキャッシュ検索
-    #[allow(dead_code)]
-    fn hash_to_path(&self, hash: u64) -> PathBuf {
-        let dir1 = format!("{:02x}", (hash >> 56) as u8);
-        let dir2 = format!("{:02x}", (hash >> 48) as u8);
-        let filename = format!("{:016x}.{}", hash, self.config.extension);
-
         self.config.base_path.join(dir1).join(dir2).join(filename)
     }
 
@@ -371,21 +353,6 @@ pub mod async_io {
         file.write_all(&data)?;
         file.sync_all()?;
         Ok(())
-    }
-
-    /// ファイル削除
-    #[allow(dead_code)]
-    pub async fn remove_file(path: &Path) -> io::Result<()> {
-        std::fs::remove_file(path)
-    }
-}
-
-/// CacheStorageからディスクパスを抽出するヘルパー
-#[allow(dead_code)]
-pub fn get_disk_path(storage: &CacheStorage) -> Option<&PathBuf> {
-    match storage {
-        CacheStorage::Disk { path, .. } => Some(path),
-        _ => None,
     }
 }
 

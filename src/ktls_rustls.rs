@@ -27,7 +27,6 @@
 //! - `modprobe tls` でカーネルモジュールをロード
 //! - AES-GCM 暗号スイート
 
-
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;

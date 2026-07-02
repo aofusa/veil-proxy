@@ -40,14 +40,6 @@ struct MemoryCacheEntry {
     key: CacheKey,
     /// キャッシュエントリ
     entry: Arc<CacheEntry>,
-    /// 挿入時刻
-    ///
-    /// キャッシュエントリの挿入時刻を記録。以下の用途で使用可能：
-    /// - キャッシュ統計（平均TTL、ヒット率分析）
-    /// - デバッグ情報（エントリの生存時間）
-    /// - TTLベースのエビクション（将来実装）
-    #[allow(dead_code)]
-    inserted_at: Instant,
 }
 
 impl MemoryCache {
@@ -121,7 +113,6 @@ impl MemoryCache {
         let cache_entry = MemoryCacheEntry {
             key,
             entry: Arc::new(entry),
-            inserted_at: Instant::now(),
         };
 
         let mut cache = match self.shard(hash).lock() {
@@ -262,7 +253,8 @@ impl MemoryCache {
 /// let entry = create_memory_entry(200, headers, body, 3600);
 /// cache.insert(key, entry);
 /// ```
-#[allow(dead_code)]
+// 現在は単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn create_memory_entry(
     status_code: u16,
     headers: Vec<(Box<[u8]>, Box<[u8]>)>,

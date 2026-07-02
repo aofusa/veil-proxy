@@ -3,7 +3,6 @@
 //! monoio の `AsyncReadRent` / `AsyncWriteRentExt` に相当するトレイトを自前定義する。
 //! 所有権ベースの I/O モデルを維持しつつ、monoio への依存を排除する。
 
-
 use super::buf::{IoBuf, IoBufMut};
 use std::io;
 

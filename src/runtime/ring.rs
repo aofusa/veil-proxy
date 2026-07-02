@@ -7,7 +7,6 @@
 //! - Linux kernel docs: Documentation/block/io-uring.rst
 //! - man io_uring_setup(2), io_uring_enter(2), io_uring_register(2)
 
-
 use std::io;
 use std::sync::atomic::{AtomicU32, Ordering};
 

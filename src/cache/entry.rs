@@ -229,15 +229,15 @@ impl CacheStorage {
 ///
 /// # 注意
 /// テストコードや将来の機能拡張で使用されることを想定しています。
-#[allow(dead_code)]
+// 現在は単体テストのみで使用（キャッシュエントリ構築の公開 API）
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct CacheEntryBuilder {
     status_code: u16,
     headers: Vec<(Box<[u8]>, Box<[u8]>)>,
     body: Vec<u8>,
     max_age_secs: u64,
 }
-
-#[allow(dead_code)]
+#[cfg_attr(not(test), allow(dead_code))]
 impl CacheEntryBuilder {
     /// 新しいビルダーを作成
     pub fn new(status_code: u16) -> Self {

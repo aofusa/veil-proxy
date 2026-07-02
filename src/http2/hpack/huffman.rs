@@ -295,26 +295,6 @@ pub fn huffman_encode(src: &[u8]) -> Vec<u8> {
     result
 }
 
-/// Huffman デコード状態
-#[allow(dead_code)]
-struct HuffmanDecoder {
-    /// 状態
-    state: u8,
-    /// 出力バッファが有効かどうか
-    has_output: bool,
-    /// 出力シンボル
-    output: u8,
-}
-
-/// Huffman デコードテーブルエントリ
-/// (次の状態, 出力シンボル, フラグ)
-/// フラグ: 0=継続, 1=出力あり, 2=エラー, 3=最終状態許可
-#[allow(dead_code)]
-type DecodeEntry = (u8, u8, u8);
-
-// 状態機械ベースのデコードテーブル (簡略版)
-// 実際の実装ではより最適化されたテーブルを使用
-
 /// Huffman デコード
 ///
 /// Huffman 符号化されたバイト列をデコードします。

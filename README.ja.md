@@ -295,7 +295,6 @@ sudo setcap 'cap_net_bind_service=+ep' ./target/release/veil
 | `[logging]` | `format` | `"text"` | ログ形式 |
 | `[logging]` | `channel_size` | `100000` | ログチャネルバッファサイズ |
 | `[logging]` | `flush_interval_ms` | `1000` | フラッシュ間隔（ミリ秒） |
-| `[logging]` | `max_log_size` | `104857600` | 最大ログファイルサイズ（100MB） |
 | `[prometheus]` | `enabled` | `false` | Prometheusメトリクスを有効化 |
 | `[prometheus]` | `path` | `"/__metrics"` | メトリクスエンドポイントパス |
 | `[performance]` | `reuseport_balancing` | `"cbpf"` | SO_REUSEPORT振り分け方式 |
@@ -315,8 +314,6 @@ sudo setcap 'cap_net_bind_service=+ep' ./target/release/veil
 | `[buffer_pool]` | `request_buffer_size` | `1024` | リクエストバッファサイズ（1KB） |
 | `[buffer_pool]` | `initial_request_buffers` | `16` | リクエストバッファ初期数 |
 | `[buffer_pool]` | `large_request_buffer_size` | `4096` | 大容量リクエストバッファ（4KB） |
-| `[buffer_pool]` | `path_string_size` | `256` | パス文字列バッファサイズ |
-| `[buffer_pool]` | `response_header_buffer_size` | `512` | レスポンスヘッダーバッファサイズ |
 | `[http2]` | `header_table_size` | `65536` | HPACKテーブルサイズ（64KB） |
 | `[http2]` | `max_concurrent_streams` | `256` | 最大同時ストリーム数 |
 | `[http2]` | `initial_window_size` | `1048576` | ストリームウィンドウサイズ（1MB） |
@@ -372,7 +369,6 @@ channel_size = 100000
 # フラッシュ間隔（ミリ秒）
 flush_interval_ms = 1000
 # 最大ログファイルサイズ（バイト、0=ローテーションなし）
-max_log_size = 104857600
 # ログファイルパス（オプション、未指定で標準エラー出力）
 # file_path = "/var/log/veil.log"
 
@@ -3319,11 +3315,9 @@ large_request_buffer_size = 4096
 
 # パス文字列バッファサイズ（バイト）
 # デフォルト: 256
-path_string_size = 256
 
 # レスポンスヘッダーバッファサイズ（バイト）
 # デフォルト: 512
-response_header_buffer_size = 512
 ```
 
 **注意**: バッファプール設定はオプションです。デフォルト値はほとんどの用途に最適化されています。特定のメモリ制約やパフォーマンス要件がある場合のみ調整してください。

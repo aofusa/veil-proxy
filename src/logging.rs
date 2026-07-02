@@ -112,19 +112,6 @@ pub struct LoggingConfigSection {
     #[serde(default = "default_flush_interval")]
     pub(crate) flush_interval_ms: u64,
 
-    /// 最大ログファイルサイズ（バイト）
-    ///
-    /// ログファイルの最大サイズ。超過すると新しいファイルに切り替え。
-    /// 0の場合はローテーションなし。
-    ///
-    /// 注意: ftlogは現在日次ローテーションのみをサポート。
-    /// サイズベースローテーションは将来的な拡張で対応予定。
-    ///
-    /// デフォルト: 104857600 (100MB)
-    #[serde(default = "default_max_log_size")]
-    #[allow(dead_code)]
-    pub(crate) max_log_size: u64,
-
     /// ログファイルパス
     ///
     /// ログファイルの出力先パス。
@@ -145,10 +132,6 @@ pub(crate) fn default_flush_interval() -> u64 {
     1000 // 1秒
 }
 
-pub(crate) fn default_max_log_size() -> u64 {
-    104857600 // 100MB
-}
-
 impl Default for LoggingConfigSection {
     fn default() -> Self {
         Self {
@@ -156,7 +139,6 @@ impl Default for LoggingConfigSection {
             format: LogFormat::default(),
             channel_size: default_channel_size(),
             flush_interval_ms: default_flush_interval(),
-            max_log_size: default_max_log_size(),
             file_path: None,
         }
     }

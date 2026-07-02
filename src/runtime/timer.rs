@@ -3,7 +3,6 @@
 //! io_uring の `IORING_OP_TIMEOUT` を使用したタイムアウト Future を実装する。
 //! monoio の `monoio::time::timeout` / `monoio::time::sleep` に相当する。
 
-
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};

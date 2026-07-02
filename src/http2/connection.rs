@@ -3,7 +3,6 @@
 //! HTTP/2 コネクションの確立、フレーム処理、ストリーム管理を行います。
 //! monoio 非同期ランタイムと統合して動作します。
 
-use std::collections::VecDeque;
 use std::io;
 
 use crate::runtime::io::{AsyncReadRent, AsyncWriteRentExt};
@@ -53,9 +52,6 @@ pub struct Http2Connection<S> {
     buf_start: usize,
     /// バッファ内の有効データ終了位置
     buf_end: usize,
-    /// 送信キュー
-    #[allow(dead_code)]
-    send_queue: VecDeque<Vec<u8>>,
 
     // ====================
     // DoS 対策用状態
@@ -186,7 +182,6 @@ where
             read_buf,
             buf_start: 0,
             buf_end,
-            send_queue: VecDeque::new(),
             // DoS 対策
             rst_stream_count: 0,
             rst_stream_window_start: now,

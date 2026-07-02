@@ -232,7 +232,8 @@ unsafe impl IoBufMut for SafeReadBuffer {
 // セキュリティ制限
 pub(crate) const MAX_HEADER_SIZE: usize = 8192; // 8KB - ヘッダーサイズ上限
 pub(crate) const MAX_BODY_SIZE: usize = 10485760; // 10MB - ボディサイズ上限
-#[allow(dead_code)]
+                                                  // http2 (H2C/gRPC) 経路でのみ使用
+#[cfg_attr(not(feature = "http2"), allow(dead_code))]
 pub(crate) const MAX_GRPC_BODY_SIZE: usize = 1_048_576; // 1MB - gRPCメッセージサイズ上限
 
 // タイムアウト設定
@@ -636,7 +637,6 @@ pub(crate) const REQUEST_BUF_SIZE: usize = 1024;
 /// 大容量リクエスト用バッファサイズ
 pub(crate) const LARGE_REQUEST_BUF_SIZE: usize = 4096;
 /// パス文字列用バッファサイズ
-pub(crate) const PATH_STRING_SIZE: usize = 256;
 
 // ====================
 // バッファプール設定（config.toml対応）
@@ -672,14 +672,6 @@ pub struct BufferPoolConfig {
     /// 大容量リクエストバッファサイズ（バイト）
     /// デフォルト: 4096 (4KB)
     pub large_request_buffer_size: usize,
-
-    /// パス文字列バッファサイズ（バイト）
-    /// デフォルト: 256
-    pub path_string_size: usize,
-
-    /// レスポンスヘッダーバッファサイズ（バイト）
-    /// デフォルト: 512
-    pub response_header_buffer_size: usize,
 }
 
 impl Default for BufferPoolConfig {
@@ -691,8 +683,6 @@ impl Default for BufferPoolConfig {
             request_buffer_size: REQUEST_BUF_SIZE,
             initial_request_buffers: 16,
             large_request_buffer_size: LARGE_REQUEST_BUF_SIZE,
-            path_string_size: PATH_STRING_SIZE,
-            response_header_buffer_size: 512,
         }
     }
 }
@@ -734,15 +724,6 @@ thread_local! {
         (0..4).map(|_| Vec::with_capacity(LARGE_REQUEST_BUF_SIZE)).collect()
     );
 
-    /// パス構築用Stringプール（256B × 16）
-    pub(crate) static PATH_STRING_POOL: RefCell<Vec<String>> = RefCell::new(
-        (0..16).map(|_| String::with_capacity(PATH_STRING_SIZE)).collect()
-    );
-
-    /// レスポンスヘッダー構築用バッファプール（512B × 16）
-    pub(crate) static RESPONSE_HEADER_BUF_POOL: RefCell<Vec<Vec<u8>>> = RefCell::new(
-        (0..16).map(|_| Vec::with_capacity(512)).collect()
-    );
 }
 
 /// リクエスト構築用バッファを取得
@@ -781,63 +762,6 @@ pub(crate) fn request_buf_put(mut buf: Vec<u8>) {
         LARGE_REQUEST_BUF_POOL.with(|p| {
             let mut pool = p.borrow_mut();
             if pool.len() < 8 {
-                pool.push(buf);
-            }
-        });
-    }
-}
-
-/// パス文字列用Stringを取得
-#[inline]
-#[allow(dead_code)]
-pub(crate) fn path_string_get() -> String {
-    let config = get_buffer_pool_config();
-    PATH_STRING_POOL.with(|p| {
-        p.borrow_mut()
-            .pop()
-            .unwrap_or_else(|| String::with_capacity(config.path_string_size))
-    })
-}
-
-/// パス文字列用Stringを返却
-#[inline]
-#[allow(dead_code)]
-pub(crate) fn path_string_put(mut s: String) {
-    s.clear();
-    let config = get_buffer_pool_config();
-    if s.capacity() == config.path_string_size {
-        PATH_STRING_POOL.with(|p| {
-            let mut pool = p.borrow_mut();
-            if pool.len() < 32 {
-                pool.push(s);
-            }
-        });
-    }
-}
-
-/// レスポンスヘッダー構築用バッファを取得
-#[inline]
-#[allow(dead_code)]
-pub(crate) fn response_header_buf_get() -> Vec<u8> {
-    let config = get_buffer_pool_config();
-    RESPONSE_HEADER_BUF_POOL.with(|p| {
-        p.borrow_mut()
-            .pop()
-            .unwrap_or_else(|| Vec::with_capacity(config.response_header_buffer_size))
-    })
-}
-
-/// レスポンスヘッダー構築用バッファを返却
-#[inline]
-#[allow(dead_code)]
-pub(crate) fn response_header_buf_put(mut buf: Vec<u8>) {
-    buf.clear();
-    let config = get_buffer_pool_config();
-    let min_size = config.response_header_buffer_size;
-    if buf.capacity() >= min_size && buf.capacity() <= min_size * 4 {
-        RESPONSE_HEADER_BUF_POOL.with(|p| {
-            let mut pool = p.borrow_mut();
-            if pool.len() < 32 {
                 pool.push(buf);
             }
         });
@@ -896,7 +820,6 @@ impl ServerHeaderGuard {
 
     /// 値のスライスとして取得
     #[inline]
-    #[allow(dead_code)]
     pub fn value(&self) -> &[u8] {
         self.guard.as_slice()
     }

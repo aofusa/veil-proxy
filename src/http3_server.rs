@@ -21,7 +21,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::CString;
 use std::io::{self, Seek, Write as IoWrite};
-use std::net::{SocketAddr, UdpSocket};
+use std::net::SocketAddr;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -2263,19 +2263,6 @@ pub struct BackendProxyResult {
     pub headers: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
-/// バックエンドへの非同期プロキシ処理
-///
-/// crate::runtime::tcp::TcpStream を使用して非同期にバックエンドへ接続します。
-/// HTTP/3 コネクションをブロックせずにバックエンド通信を行えます。
-#[allow(dead_code)]
-pub(crate) async fn proxy_to_backend_async(
-    target: &ProxyTarget,
-    request: Vec<u8>,
-    timeout_secs: u64,
-) -> io::Result<BackendProxyResult> {
-    proxy_to_backend_async_with_tls(target, request, timeout_secs, false).await
-}
-
 pub(crate) async fn proxy_to_backend_async_with_tls(
     target: &ProxyTarget,
     request: Vec<u8>,
@@ -2694,114 +2681,6 @@ fn parse_http_response(response: &[u8]) -> io::Result<BackendProxyResult> {
 
 /// コネクション管理（Rc<RefCell> で共有）
 type ConnectionMap = Rc<RefCell<HashMap<ConnectionId<'static>, Http3Handler>>>;
-
-/// SO_REUSEPORT を設定した UDP ソケットを作成
-///
-/// 複数ワーカースレッドが同じポートでリッスンし、
-/// カーネルがフローに基づいてパケットを分散します。
-///
-/// **非推奨**: `QuicUdpSocket::bind_reuseport()` を使用してください。
-/// この関数は GSO/GRO を設定しません。
-#[allow(dead_code)]
-fn create_reuseport_udp_socket(bind_addr: SocketAddr) -> io::Result<UdpSocket> {
-    use std::os::unix::io::FromRawFd;
-
-    // socket2 を使用せず libc を直接使用
-    let domain = if bind_addr.is_ipv4() {
-        libc::AF_INET
-    } else {
-        libc::AF_INET6
-    };
-
-    let fd = unsafe {
-        libc::socket(
-            domain,
-            libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-            0,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    // SO_REUSEADDR を設定
-    let optval: libc::c_int = 1;
-    let ret = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_REUSEADDR,
-            &optval as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if ret < 0 {
-        unsafe { libc::close(fd) };
-        return Err(io::Error::last_os_error());
-    }
-
-    // SO_REUSEPORT を設定
-    let ret = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_REUSEPORT,
-            &optval as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if ret < 0 {
-        unsafe { libc::close(fd) };
-        return Err(io::Error::last_os_error());
-    }
-
-    // アドレスをバインド
-    let ret = match bind_addr {
-        SocketAddr::V4(addr) => {
-            let sin = libc::sockaddr_in {
-                sin_family: libc::AF_INET as libc::sa_family_t,
-                sin_port: addr.port().to_be(),
-                sin_addr: libc::in_addr {
-                    s_addr: u32::from_ne_bytes(addr.ip().octets()),
-                },
-                sin_zero: [0; 8],
-            };
-            unsafe {
-                libc::bind(
-                    fd,
-                    &sin as *const _ as *const libc::sockaddr,
-                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-                )
-            }
-        }
-        SocketAddr::V6(addr) => {
-            let sin6 = libc::sockaddr_in6 {
-                sin6_family: libc::AF_INET6 as libc::sa_family_t,
-                sin6_port: addr.port().to_be(),
-                sin6_flowinfo: addr.flowinfo(),
-                sin6_addr: libc::in6_addr {
-                    s6_addr: addr.ip().octets(),
-                },
-                sin6_scope_id: addr.scope_id(),
-            };
-            unsafe {
-                libc::bind(
-                    fd,
-                    &sin6 as *const _ as *const libc::sockaddr,
-                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-                )
-            }
-        }
-    };
-    if ret < 0 {
-        unsafe { libc::close(fd) };
-        return Err(io::Error::last_os_error());
-    }
-
-    // std::net::UdpSocket を作成（非ブロッキングモードで設定済み）
-    let std_socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
-    Ok(std_socket)
-}
 
 /// HTTP/3 サーバーを起動（monoio ランタイム上で実行）
 ///

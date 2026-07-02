@@ -4,8 +4,6 @@
 //! 各ワーカースレッドが専用のモジュールキャッシュを持つことで、
 //! Arc デリファレンス・HashMap ルックアップのオーバーヘッドを削減する。
 
-use std::cell::RefCell;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use wasmtime::Store;
@@ -17,28 +15,6 @@ use super::types::{FilterAction, LocalResponse, WasmConfig};
 // ====================
 // スレッドローカルインスタンスプール
 // ====================
-
-// スレッドローカルモジュールキャッシュ
-//
-// 各ワーカースレッドがモジュール名 → Arc<LoadedModule> のマップを保持する。
-// これによりホットパスでの Arc クローン・HashMap ルックアップを局所化する。
-thread_local! {
-    static MODULE_CACHE: RefCell<HashMap<String, Arc<LoadedModule>>> = RefCell::new(HashMap::new());
-}
-
-/// スレッドローカルキャッシュからモジュールを取得（なければ登録）
-#[allow(dead_code)]
-fn get_cached_module(name: &str, module: &Arc<LoadedModule>) -> Arc<LoadedModule> {
-    MODULE_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let Some(m) = cache.get(name) {
-            Arc::clone(m)
-        } else {
-            cache.insert(name.to_owned(), Arc::clone(module));
-            Arc::clone(module)
-        }
-    })
-}
 
 /// Filter engine for executing WASM modules
 pub struct FilterEngine {
@@ -84,70 +60,6 @@ impl FilterEngine {
     ) -> FilterResult {
         FilterResult::Continue {
             headers,
-            body: None,
-        }
-    }
-
-    /// Execute on_request_headers for specified modules (internal helper)
-    #[allow(dead_code)]
-    async fn execute_on_request_headers_for_modules(
-        &self,
-        modules: &[Arc<LoadedModule>],
-        path: &str,
-        method: &str,
-        headers: Vec<(Vec<u8>, Vec<u8>)>,
-        client_ip: &str,
-        end_of_stream: bool,
-    ) -> FilterResult {
-        if modules.is_empty() {
-            return FilterResult::Continue {
-                headers,
-                body: None,
-            };
-        }
-
-        let mut current_headers = headers;
-
-        for module in modules {
-            // F-09: WASM フィルタ実行時間を計測
-            let _wasm_start = std::time::Instant::now();
-            let result = self
-                .execute_on_request_headers(
-                    module,
-                    path,
-                    method,
-                    &current_headers,
-                    client_ip,
-                    end_of_stream,
-                )
-                .await;
-            crate::metrics::observe_wasm_filter_duration(
-                &module.name,
-                "request_headers",
-                _wasm_start.elapsed().as_secs_f64(),
-            );
-
-            match result {
-                Ok(ModuleResult::Continue { modified_headers }) => {
-                    if let Some(h) = modified_headers {
-                        current_headers = h;
-                    }
-                }
-                Ok(ModuleResult::Pause) => {
-                    return FilterResult::Pause;
-                }
-                Ok(ModuleResult::LocalResponse(resp)) => {
-                    return FilterResult::LocalResponse(resp);
-                }
-                Err(e) => {
-                    ftlog::error!("[wasm:{}] on_request_headers error: {}", module.name, e);
-                    // Continue on error
-                }
-            }
-        }
-
-        FilterResult::Continue {
-            headers: current_headers,
             body: None,
         }
     }
