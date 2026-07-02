@@ -1,0 +1,4 @@
+GET / HTTP/1.1
+Header-Without-Colon
+Host: fuzz
+Content-Length: not-a-number
