@@ -39,23 +39,31 @@ run_trivy_scan() {
     fi
 
     local report="${RESULTS_DIR}/trivy_report.txt"
+    local image_tar="${RESULTS_DIR}/veil-image.tar"
     mkdir -p "${RESULTS_DIR}"
     log "Trivy イメージスキャン: ${VEIL_IMAGE}"
 
     docker pull aquasec/trivy:latest >/dev/null 2>&1 || true
+    log "イメージを tar へエクスポート（docker.sock 非依存）"
+    docker save "${VEIL_IMAGE}" -o "${image_tar}"
+
     if docker run --rm \
         --name "${TRIVY_CONTAINER}" \
-        -v /var/run/docker.sock:/var/run/docker.sock:ro \
+        -v "${RESULTS_DIR}:/results:ro" \
         aquasec/trivy:latest \
         image \
+        --input /results/veil-image.tar \
+        --scanners vuln \
+        --timeout 10m \
         --severity "${TRIVY_SEVERITY}" \
         --ignore-unfixed \
         --exit-code 0 \
-        "${VEIL_IMAGE}" 2>&1 | tee "${report}"; then
+        2>&1 | tee "${report}"; then
         log "Trivy スキャン完了"
     else
         log "Trivy スキャンで警告あり（レポート参照）"
     fi
+    rm -f "${image_tar}"
 }
 
 sighup_chaos() {
