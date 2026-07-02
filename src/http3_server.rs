@@ -3090,6 +3090,15 @@ pub async fn run_http3_server_async(
             // GRO で集約された各 QUIC データグラムを quiche に供給する。
             // recv_buf のスライスを quiche::Header::from_slice と conn.recv に直接渡し、
             // 中間 Vec への 2 回の to_vec コピーを完全に排除する（ゼロコピー受信）。
+            //
+            // F-45: GRO バッチはカーネルが**同一フロー**のデータグラムを集約したものなので、
+            // - `connections` の RefCell 借用はバッチ全体で 1 回だけ取る（従来はセグメント
+            //   ごとに 2 回 borrow_mut していた）。
+            // - 直前セグメントと同じ DCID なら新規接続判定（contains_key + Initial 検査）を
+            //   スキップし、per-segment のオーバーヘッドをルックアップ 1 回に抑える。
+            // quiche の `recv` API は 1 データグラム単位のため呼び出し自体は per-segment。
+            let mut conns = connections.borrow_mut();
+            let mut prev_cid: Option<ConnectionId<'static>> = None;
             let mut offset = 0;
             while offset < total {
                 let start = offset;
@@ -3109,58 +3118,62 @@ pub async fn run_http3_server_async(
                     }
                 };
 
-                // コネクションを検索または作成
-                let conn_id = {
-                    let mut conns = connections.borrow_mut();
+                // コネクションを検索または作成（直前セグメントと同一 DCID なら判定スキップ）
+                let conn_id = match &prev_cid {
+                    Some(prev) if *prev == hdr.dcid => prev.clone(),
+                    _ => {
+                        if !conns.contains_key(&hdr.dcid) {
+                            if hdr.ty != quiche::Type::Initial {
+                                debug!("[HTTP/3] Non-initial packet for unknown connection");
+                                continue;
+                            }
 
-                    if !conns.contains_key(&hdr.dcid) {
-                        if hdr.ty != quiche::Type::Initial {
-                            debug!("[HTTP/3] Non-initial packet for unknown connection");
-                            continue;
+                            // 新規コネクション
+                            let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
+                            rng.fill(&mut scid)
+                                .map_err(|_| io::Error::new(io::ErrorKind::Other, "RNG error"))?;
+                            let scid = ConnectionId::from_ref(&scid).into_owned();
+
+                            let mut config_ref = quic_config.borrow_mut();
+                            let conn =
+                                quiche::accept(&scid, None, local_addr, from, &mut config_ref)
+                                    .map_err(|e| {
+                                        io::Error::new(io::ErrorKind::Other, e.to_string())
+                                    })?;
+
+                            debug!("[HTTP/3] New connection from {}", from);
+
+                            // 最新のルーティング設定を取得
+                            let handler = Http3Handler::new(conn, from, notify.clone());
+                            conns.insert(scid.clone(), handler);
+
+                            prev_cid = Some(scid.clone());
+                            scid
+                        } else {
+                            let cid = hdr.dcid.into_owned();
+                            prev_cid = Some(cid.clone());
+                            cid
                         }
-
-                        // 新規コネクション
-                        let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
-                        rng.fill(&mut scid)
-                            .map_err(|_| io::Error::new(io::ErrorKind::Other, "RNG error"))?;
-                        let scid = ConnectionId::from_ref(&scid).into_owned();
-
-                        let mut config_ref = quic_config.borrow_mut();
-                        let conn =
-                            quiche::accept(&scid, None, local_addr, from, &mut config_ref)
-                                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-
-                        debug!("[HTTP/3] New connection from {}", from);
-
-                        // 最新のルーティング設定を取得
-                        let handler = Http3Handler::new(conn, from, notify.clone());
-                        conns.insert(scid.clone(), handler);
-
-                        scid
-                    } else {
-                        hdr.dcid.into_owned()
                     }
                 };
 
                 // パケットを処理（同一スライスをそのまま渡す。追加コピーなし）
-                {
-                    let mut conns = connections.borrow_mut();
-                    if let Some(handler) = conns.get_mut(&conn_id) {
-                        let recv_info = quiche::RecvInfo {
-                            from,
-                            to: local_addr,
-                        };
+                if let Some(handler) = conns.get_mut(&conn_id) {
+                    let recv_info = quiche::RecvInfo {
+                        from,
+                        to: local_addr,
+                    };
 
-                        match handler.conn.recv(&mut recv_buf[start..end], recv_info) {
-                            Ok(_) => {}
-                            Err(e) => {
-                                warn!("[HTTP/3] recv error: {}", e);
-                                // エラー時も送信処理は続行
-                            }
+                    match handler.conn.recv(&mut recv_buf[start..end], recv_info) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            warn!("[HTTP/3] recv error: {}", e);
+                            // エラー時も送信処理は続行
                         }
                     }
                 }
             }
+            drop(conns);
 
             // ハンドシェイクパケット送信（H3初期化前に送信することでCryptoFail回避）
             // recv()後、is_established()がtrueになる前にServer Helloを送信する必要がある
