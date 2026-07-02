@@ -23,6 +23,12 @@ run_phase() {
         toxiproxy)
             exec /scripts/toxiproxy_chaos.sh
             ;;
+        circuit_breaker)
+            exec /scripts/circuit_breaker_chaos.sh
+            ;;
+        slowloris)
+            exec /scripts/slowloris_chaos.sh
+            ;;
         all)
             /scripts/health_check.sh
             /scripts/fuzz_http.py

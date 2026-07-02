@@ -147,9 +147,11 @@ main() {
     sighup_chaos || true
     wait_with_timeout "${chaos_pid}" "${CHAOS_TIMEOUT_SEC}" "chaos_load" || die "chaos フェーズ失敗"
 
-    # フェーズ 3b: Toxiproxy 遅延注入
+    # フェーズ 3b: Toxiproxy 遅延注入・upstream 遮断
     if [[ "${SKIP_TOXIPROXY}" != "1" ]]; then
         run_harness toxiproxy toxiproxy || log "Toxiproxy カオスで警告（レポート参照）"
+        run_harness circuit_breaker circuit_breaker || log "サーキットブレーカーカオスで警告（レポート参照）"
+        run_harness slowloris slowloris || log "slowloris カオスで警告（レポート参照）"
     fi
 
     # フェーズ 4: アプリセキュリティ（TLS・メソッド制限・testssl）
