@@ -127,6 +127,7 @@
         "stat",
         "statx",
         "tgkill",
+        "tkill",
         "timerfd_create",
         "timerfd_gettime",
         "timerfd_settime",

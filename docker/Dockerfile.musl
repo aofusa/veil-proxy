@@ -19,10 +19,11 @@ RUN apt-get update -y \
 # 最小設定ファイルとキャッシュディレクトリのオンデマンド生成
 RUN mkdir -p /etc_minimal/etc \
     && echo "root:x:0:0:root:/root:/sbin/nologin" > /etc_minimal/etc/passwd \
-    && echo "nonroot:x:65532:65532:nonroot:/:/sbin/nologin" >> /etc_minimal/etc/passwd \
+    && echo "nonroot:x:65532:65532:nonroot:/home/nonroot:/sbin/nologin" >> /etc_minimal/etc/passwd \
     && echo "root:x:0:" > /etc_minimal/etc/group \
     && echo "nonroot:x:65532:" >> /etc_minimal/etc/group \
-    && echo "passwd: files\ngroup: files\nhosts: files dns" > /etc_minimal/etc/nsswitch.conf \
+    && printf 'passwd: files\ngroup: files\nhosts: files dns\n' > /etc_minimal/etc/nsswitch.conf \
+    && echo "multi on" > /etc_minimal/etc/host.conf \
     && echo "127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback" > /etc_minimal/etc/hosts \
     && mkdir -p /var/cache/veil /var/tmp/veil
 
