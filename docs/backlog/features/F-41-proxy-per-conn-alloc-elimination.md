@@ -1,7 +1,17 @@
 # F-41: proxy.rs 接続ごとの client_ip / host:port アロケーション排除
 
 - **優先度**: P1
-- **対応状況**: 未着手
+- **対応状況**: 完了（2026-07-02）
+
+## 完了メモ
+
+- `src/http_utils.rs` にスタックフォーマッタを追加:
+  - `IpStr`: `[u8; 46]` 固定バッファへ IP アドレスを書き出し（IPv6 最長 45 文字対応）。
+  - `HostPortStr`: `[u8; 260]` 固定バッファへ `host:port` を書き出し（ホスト名 253 文字 + ポート。超過時のみヒープフォールバック）。
+- `peer_addr.ip().to_string()`（接続ごと）6 箇所を `IpStr` に置換（proxy.rs）。
+- `format!("{}:{}", host, port)`（リクエスト/接続ごと）8 箇所を `HostPortStr` に置換（proxy.rs 7 箇所 + http3_stream.rs 1 箇所）。呼び出し先はすべて `&str` API のため下流変更なし。
+- 対象外として残置: 接続プールキー（`HashMap<String>` の owned キーが必要。プールキー型の非 String 化は F-46 級の別改修）、メトリクスの `set_host`（メトリクス基盤が String 保持）。
+- 単体テスト 3 件追加（v4/v6/最長ケース・スタック経路・ヒープフォールバック）。全 627 テスト通過。
 - **出典**: `docs/artifacts/remaining_tasks_analysis.md` F-29 残件 / アイデア1
 
 ## 機能説明・現状

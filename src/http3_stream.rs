@@ -381,7 +381,8 @@ async fn run_backend_task(
     notify: &H3Notify,
 ) -> Result<(), u16> {
     let target = &server.target;
-    let addr = format!("{}:{}", target.host, target.port);
+    let addr = crate::http_utils::HostPortStr::new(&target.host, target.port); // F-41
+    let addr = addr.as_str();
 
     // --- 非同期接続（タイムアウト付き） ---
     let connect = TcpStream::connect_str(&addr);

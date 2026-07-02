@@ -10,6 +10,82 @@ use std::net::SocketAddr;
 /// HTTP/1.1 100 Continue レスポンス
 pub(crate) const HTTP_100_CONTINUE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
 
+// ====================
+// スタックフォーマッタ（F-41: ホットパスのヒープ確保排除）
+// ====================
+
+/// IP アドレスをスタックバッファへフォーマットする（`to_string()` のヒープ確保排除）。
+///
+/// IPv6 の最大表記（39 文字）+ IPv4-mapped 形式（45 文字）を収める 46 バイト固定。
+/// `as_str()` で `&str` として下流（`&str` を取る全 API）へ渡す。
+pub(crate) struct IpStr {
+    buf: [u8; 46],
+    len: u8,
+}
+
+impl IpStr {
+    #[inline]
+    pub(crate) fn new(ip: std::net::IpAddr) -> Self {
+        use std::io::Write;
+        let mut s = Self {
+            buf: [0u8; 46],
+            len: 0,
+        };
+        let mut cur = std::io::Cursor::new(&mut s.buf[..]);
+        // 46 バイトは IpAddr の Display 最大長を常に満たすため write! は失敗しない。
+        let _ = write!(cur, "{}", ip);
+        s.len = cur.position() as u8;
+        s
+    }
+
+    #[inline]
+    pub(crate) fn as_str(&self) -> &str {
+        // SAFETY: IpAddr の Display 出力は ASCII のみ。
+        unsafe { std::str::from_utf8_unchecked(&self.buf[..self.len as usize]) }
+    }
+}
+
+/// `host:port` をスタックバッファへフォーマットする（`format!` のヒープ確保排除）。
+///
+/// ホスト名最大 253 文字 + ':' + ポート 5 桁 = 259 バイトを収める 260 バイト固定。
+/// ホストが上限を超える場合のみ（実運用では発生しない）切り詰めずヒープへフォールバックする。
+pub(crate) enum HostPortStr {
+    Stack { buf: [u8; 260], len: u16 },
+    Heap(String),
+}
+
+impl HostPortStr {
+    #[inline]
+    pub(crate) fn new(host: &str, port: u16) -> Self {
+        let mut port_buf = itoa::Buffer::new();
+        let port_str = port_buf.format(port);
+        let need = host.len() + 1 + port_str.len();
+        if need <= 260 {
+            let mut buf = [0u8; 260];
+            buf[..host.len()].copy_from_slice(host.as_bytes());
+            buf[host.len()] = b':';
+            buf[host.len() + 1..need].copy_from_slice(port_str.as_bytes());
+            HostPortStr::Stack {
+                buf,
+                len: need as u16,
+            }
+        } else {
+            HostPortStr::Heap(format!("{host}:{port_str}"))
+        }
+    }
+
+    #[inline]
+    pub(crate) fn as_str(&self) -> &str {
+        match self {
+            // SAFETY: host は &str（UTF-8）、':' とポートは ASCII。UTF-8 境界で連結している。
+            HostPortStr::Stack { buf, len } => unsafe {
+                std::str::from_utf8_unchecked(&buf[..*len as usize])
+            },
+            HostPortStr::Heap(s) => s.as_str(),
+        }
+    }
+}
+
 /// Via ヘッダーを追加 (RFC 7230 Section 5.7.1)
 ///
 /// プロキシ経由のリクエスト/レスポンスにViaヘッダーを追加します。
@@ -1617,5 +1693,42 @@ mod chunked_span_tests {
             assert_eq!(body, expected, "mismatch at split {}", split);
             assert!(complete, "not complete at split {}", split);
         }
+    }
+}
+
+#[cfg(test)]
+mod stack_fmt_tests {
+    use super::*;
+
+    #[test]
+    fn ip_str_formats_v4_and_v6() {
+        let v4: std::net::IpAddr = "192.168.1.100".parse().unwrap();
+        assert_eq!(IpStr::new(v4).as_str(), "192.168.1.100");
+
+        let v6: std::net::IpAddr = "2001:db8::1".parse().unwrap();
+        assert_eq!(IpStr::new(v6).as_str(), "2001:db8::1");
+
+        // 最長ケース（IPv4-mapped IPv6、45 文字）が収まる
+        let long: std::net::IpAddr = "::ffff:255.255.255.255".parse().unwrap();
+        let s = IpStr::new(long);
+        assert_eq!(s.as_str(), long.to_string());
+    }
+
+    #[test]
+    fn host_port_str_stack_path() {
+        let hp = HostPortStr::new("backend.example.com", 8443);
+        assert_eq!(hp.as_str(), "backend.example.com:8443");
+        assert!(matches!(hp, HostPortStr::Stack { .. }));
+
+        let hp = HostPortStr::new("127.0.0.1", 80);
+        assert_eq!(hp.as_str(), "127.0.0.1:80");
+    }
+
+    #[test]
+    fn host_port_str_heap_fallback_for_oversized_host() {
+        let host = "a".repeat(300);
+        let hp = HostPortStr::new(&host, 65535);
+        assert_eq!(hp.as_str(), format!("{host}:65535"));
+        assert!(matches!(hp, HostPortStr::Heap(_)));
     }
 }

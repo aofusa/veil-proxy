@@ -76,7 +76,7 @@
 | F-38 | P1 | 完了 | [features/F-38-iouring-restrictions-security-integration.md](features/F-38-iouring-restrictions-security-integration.md) | io_uring オペコード制限の security.rs 統合と stale monoio スタブ解消（制限本体は F-28 でランタイム実装済み。dead stub 削除・報告修正・許可リストレビュー） |
 | F-39 | P1 | 完了 | [features/F-39-http-proxy-iouring-splice.md](features/F-39-http-proxy-iouring-splice.md) | HTTP プロキシ層の libc::splice を io_uring 非同期 splice（IORING_OP_SPLICE）に統一（同期ラッパー削除・pipe 全量ドレインでデータ損失も修正） |
 | F-40 | P2 | 完了 | [features/F-40-l4-pipe-threadlocal-pool.md](features/F-40-l4-pipe-threadlocal-pool.md) | L4 プロキシの splice パイプをスレッドローカルプールで再利用（接続ごと pipe2(2) 排除、FIONREAD 残データ検査で混線防止） |
-| F-41 | P1 | 未着手 | [features/F-41-proxy-per-conn-alloc-elimination.md](features/F-41-proxy-per-conn-alloc-elimination.md) | proxy.rs 接続ごとの client_ip / host:port アロケーション排除（F-29 残件） |
+| F-41 | P1 | 完了 | [features/F-41-proxy-per-conn-alloc-elimination.md](features/F-41-proxy-per-conn-alloc-elimination.md) | proxy.rs 接続ごとの client_ip / host:port アロケーション排除（IpStr/HostPortStr スタックフォーマッタで計 14 箇所置換、F-29 残件） |
 | F-42 | P1 | 未着手 | [features/F-42-buffering-async-fs-offload.md](features/F-42-buffering-async-fs-offload.md) | buffering/handler.rs の非同期 FS 化（runtime::offload 適用、F-29 残件） |
 | F-43 | P3 | 未着手 | [features/F-43-wasm-hotpath-alloc-reduction.md](features/F-43-wasm-hotpath-alloc-reduction.md) | WASM パスのアロケーション（clone / deep copy）削減（F-29 残件） |
 | F-44 | P1 | 未着手 | [features/F-44-tls-backend-streaming.md](features/F-44-tls-backend-streaming.md) | TLS バックエンドのストリーミング化（F-32 残件） |

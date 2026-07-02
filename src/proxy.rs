@@ -1064,7 +1064,8 @@ async fn handle_h2_request_streaming<S>(
     let target = &server.target;
     let use_tls = target.use_tls;
     let sni = target.sni().to_string();
-    let addr = format!("{}:{}", target.host, target.port);
+    let addr = HostPortStr::new(&target.host, target.port); // F-41: スタック上に構築（ヒープ確保なし）
+    let addr = addr.as_str();
 
     // --- リクエストヘッダー（Transfer-Encoding: chunked）を構築 ---
     let path_str = std::str::from_utf8(&path).unwrap_or("/");
@@ -1718,7 +1719,8 @@ where
     request.extend_from_slice(&request_body);
 
     // バックエンドに接続して転送
-    let addr = format!("{}:{}", target.host, target.port);
+    let addr = HostPortStr::new(&target.host, target.port); // F-41: スタック上に構築（ヒープ確保なし）
+    let addr = addr.as_str();
 
     let result = if target.use_h2c {
         // H2C (Prior Knowledge) プロキシ
@@ -3215,9 +3217,10 @@ pub async fn handle_connection(
             match protocol_type {
                 ProtocolType::H2C => {
                     // H2Cサーバーハンドラー
+                    let client_ip = IpStr::new(peer_addr.ip());
                     handle_h2c_connection(
                         stream,
-                        &peer_addr.ip().to_string(),
+                        client_ip.as_str(),
                         initial_buffer.take().unwrap(),
                     )
                     .await;
@@ -3234,8 +3237,8 @@ pub async fn handle_connection(
                                 return;
                             }
                         };
-                    let client_ip = peer_addr.ip().to_string();
-                    handle_requests(plain_stream, &client_ip, peer_addr).await;
+                    let client_ip = IpStr::new(peer_addr.ip());
+                    handle_requests(plain_stream, client_ip.as_str(), peer_addr).await;
                     return;
                 }
                 ProtocolType::TLS => {
@@ -3275,18 +3278,18 @@ pub async fn handle_connection(
         }
     };
 
-    // クライアントIPアドレスを文字列に変換
-    let client_ip = peer_addr.ip().to_string();
+    // クライアントIPアドレスをスタックバッファへ変換（F-41: 接続ごとのヒープ確保排除）
+    let client_ip = IpStr::new(peer_addr.ip());
 
     // HTTP/2 が有効かつネゴシエートされた場合は HTTP/2 ハンドラーを使用
     #[cfg(feature = "http2")]
     if http2_enabled && tls_stream.is_http2() {
-        handle_http2_connection(tls_stream, &client_ip).await;
+        handle_http2_connection(tls_stream, client_ip.as_str()).await;
         return;
     }
 
     // HTTP/1.1 ハンドラー
-    handle_requests(tls_stream, &client_ip, peer_addr).await;
+    handle_requests(tls_stream, client_ip.as_str(), peer_addr).await;
 }
 
 // kTLS 無効時の接続処理（rustls のみ）
@@ -3310,9 +3313,10 @@ pub async fn handle_connection(
             match protocol_type {
                 ProtocolType::H2C => {
                     // H2Cサーバーハンドラー
+                    let client_ip = IpStr::new(peer_addr.ip());
                     handle_h2c_connection(
                         stream,
-                        &peer_addr.ip().to_string(),
+                        client_ip.as_str(),
                         initial_buffer.take().unwrap(),
                     )
                     .await;
@@ -3329,8 +3333,8 @@ pub async fn handle_connection(
                                 return;
                             }
                         };
-                    let client_ip = peer_addr.ip().to_string();
-                    handle_requests(plain_stream, &client_ip, peer_addr).await;
+                    let client_ip = IpStr::new(peer_addr.ip());
+                    handle_requests(plain_stream, client_ip.as_str(), peer_addr).await;
                     return;
                 }
                 ProtocolType::TLS => {
@@ -3369,18 +3373,18 @@ pub async fn handle_connection(
         }
     };
 
-    // クライアントIPアドレスを文字列に変換
-    let client_ip = peer_addr.ip().to_string();
+    // クライアントIPアドレスをスタックバッファへ変換（F-41: 接続ごとのヒープ確保排除）
+    let client_ip = IpStr::new(peer_addr.ip());
 
     // HTTP/2 が有効かつネゴシエートされた場合は HTTP/2 ハンドラーを使用
     #[cfg(feature = "http2")]
     if http2_enabled && tls_stream.is_http2() {
-        handle_http2_connection(tls_stream, &client_ip).await;
+        handle_http2_connection(tls_stream, client_ip.as_str()).await;
         return;
     }
 
     // HTTP/1.1 ハンドラー
-    handle_requests(tls_stream, &client_ip, peer_addr).await;
+    handle_requests(tls_stream, client_ip.as_str(), peer_addr).await;
 }
 
 // ====================
@@ -4800,7 +4804,8 @@ async fn handle_websocket_proxy_http(
     poll_config: &WebSocketPollConfig,
 ) -> Option<(u16, u64)> {
     // バックエンドに接続
-    let addr = format!("{}:{}", target.host, target.port);
+    let addr = HostPortStr::new(&target.host, target.port); // F-41: スタック上に構築（ヒープ確保なし）
+    let addr = addr.as_str();
     let connect_result = timeout(connect_timeout, TcpStream::connect_str(&addr)).await;
 
     let mut backend_stream = match connect_result {
@@ -4903,7 +4908,8 @@ async fn handle_websocket_proxy_https(
     poll_config: &WebSocketPollConfig,
 ) -> Option<(u16, u64)> {
     // バックエンドに TCP 接続
-    let addr = format!("{}:{}", target.host, target.port);
+    let addr = HostPortStr::new(&target.host, target.port); // F-41: スタック上に構築（ヒープ確保なし）
+    let addr = addr.as_str();
     let connect_result = timeout(connect_timeout, TcpStream::connect_str(&addr)).await;
 
     let backend_tcp = match connect_result {
@@ -5941,7 +5947,8 @@ async fn proxy_http_pooled(
         Some(stream) => stream,
         None => {
             // 新規接続を作成
-            let addr = format!("{}:{}", target.host, target.port);
+            let addr = HostPortStr::new(&target.host, target.port); // F-41: スタック上に構築（ヒープ確保なし）
+            let addr = addr.as_str();
             let connect_result = timeout(connect_timeout, TcpStream::connect_str(&addr)).await;
 
             match connect_result {
@@ -6163,7 +6170,8 @@ async fn proxy_h2c(
     let connect_timeout = Duration::from_secs(security.backend_connect_timeout_secs);
 
     // バックエンドに接続
-    let addr = format!("{}:{}", target.host, target.port);
+    let addr = HostPortStr::new(&target.host, target.port); // F-41: スタック上に構築（ヒープ確保なし）
+    let addr = addr.as_str();
     let connect_result = timeout(connect_timeout, TcpStream::connect_str(&addr)).await;
 
     let backend_stream = match connect_result {
@@ -8368,7 +8376,8 @@ async fn connect_https_backend_fresh(
     connect_timeout: Duration,
     tls_insecure: bool,
 ) -> Result<ClientTls, (u16, &'static [u8])> {
-    let addr = format!("{}:{}", target.host, target.port);
+    let addr = HostPortStr::new(&target.host, target.port); // F-41: スタック上に構築（ヒープ確保なし）
+    let addr = addr.as_str();
     let backend_tcp = match timeout(connect_timeout, TcpStream::connect_str(&addr)).await {
         Ok(Ok(stream)) => {
             let _ = stream.set_nodelay(true);
