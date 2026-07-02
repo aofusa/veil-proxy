@@ -72,4 +72,39 @@
 
 ## 実施記録
 
-（テスト実施後に追記）
+### 2026-07-02（ブランチ `feat/docker`）
+
+`tests/container_security/` を追加し、`veil:glibc` コンテナに対するファジング・カオス・セキュリティ検証を **docker コマンドのみ** で実施した。`tests/e2e_setup.sh` は未使用・未改変。
+
+#### 実行方法
+
+```bash
+./tests/container_security/run.sh
+```
+
+- ハーネスイメージ `veil-sec-harness:local` をビルド
+- Docker ネットワーク `veil-sec-test-net` 上に `veil:glibc` を起動（read-only rootfs、seccomp、TLS/設定マウント）
+- ハーネスコンテナ内で各フェーズを実行（Veil へのトラフィックはコンテナ間通信のみ）
+
+#### 結果サマリ
+
+| フェーズ | 内容 | 結果 |
+|--------|------|------|
+| **ファジング** | HTTP/1.1 シード 14 種 + 変異 200 回（不正ヘッダ・巨大 Host・不完全ボディ等） | `sent=200 transport_errors=0 healthy_after_fuzz=True` — クラッシュなし |
+| **カオス** | 並行 HTTP 500 リクエスト×10 ワーカー、HTTPS 100 リクエスト、接続チャーン 100、POST ストレス 50、負荷中 **SIGHUP** リロード | 全 HTTP ワーカー `ok=50 fail=0`、`method_stress denied=49`、SIGHUP 後もヘルス OK |
+| **セキュリティ（アプリ）** | TLS ハンドシェイク、POST/TRACE メソッド拒否（HTTPS）、パストラバーサル | TLS OK、POST/TRACE → 405、パストラバーサル OK |
+| **セキュリティ（コンテナ）** | read-only rootfs、seccomp 適用、Veil 特権降下ログ | `readonly_rootfs=true`、seccomp 適用済み、`Security restrictions applied` を確認 |
+| **Trivy** | `docker save` + `--input` で `veil:glibc` スキャン（HIGH/CRITICAL） | debian 13.5 ベース層 **脆弱性 0 件** |
+
+#### 成果物
+
+- オーケストレータ: `tests/container_security/run.sh`
+- ハーネス: `tests/container_security/harness/`（Dockerfile、fuzz/chaos/security スクリプト、シードコーパス）
+- レポート出力: `tests/container_security/results/`（実行時生成、gitignore）
+
+#### 既知の制限
+
+- HTTP:80 は HTTPS へ 301 リダイレクトするため、メソッド制限検証は HTTPS で実施
+- distroless イメージは Docker `User` 未指定（起動 UID=0）だが、Veil プロセス内で特権降下
+- Trivy DB 初回ダウンロードで数分かかる（2 回目以降はキャッシュ）
+- h2spec / LibAFL / cargo-fuzz は未統合（将来 CI nightly 向け）
