@@ -62,7 +62,7 @@ COPY . /app
 
 # テストとビルド
 RUN touch src/main.rs \
-    && cargo test --bins --features "${CARGO_FEATURES}" --locked \
+    && cargo test --bins --target "${RUST_TARGET}" --features "${CARGO_FEATURES}" --locked \
     && cargo zigbuild --release --target "${RUST_TARGET}${LIBC_VERSION}" --features "${CARGO_FEATURES}" --locked
 
 
