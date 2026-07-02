@@ -1,7 +1,14 @@
 # B-10: E2E テストの並列実行による共有状態競合（ロードバランシング系フレーキー）
 
 - **優先度**: P2
-- **対応状況**: 未着手
+- **対応状況**: 完了（2026-07-02）
+
+## 完了メモ
+
+- `tests/e2e_setup.sh` に専用プール `rr-isolated-pool` と専用ルート `/rr-test/*`（+fixtures）を追加し、RR 分散を Assert する 2 テスト（`test_round_robin_distribution`, `test_load_balancing_round_robin_distribution`）を隔離パスへ移行。
+- 併せて同種の共有状態競合だった `cache::revalidation` の単体テスト 3 件をミューテックスで直列化（並列実行時の偽陽性を解消）。
+- 修正後の features full E2E で `test_round_robin_distribution` 通過を確認。
+- 調査中に別の実バグ（Expect: 100-continue 間欠ハング）を発見 → [B-11](B-11-expect-100-continue-intermittent-hang.md) として起票。
 - **出典**: `docs/artifacts/analysis_results.md` 改善案4
 
 ## 事象

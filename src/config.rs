@@ -3168,6 +3168,27 @@ pub struct TlsConfigSection {
     /// - false: TCP_CORK無効（特定の低遅延要件がある場合）
     #[serde(default = "default_tcp_cork")]
     pub tcp_cork_enabled: bool,
+    /// 利用を許可する TLS 暗号スイート（nginx の `ssl_ciphers` 相当、F-50）
+    ///
+    /// **記載順 = サーバ優先度順**（rustls はサーバ選好でネゴシエートする）。
+    /// 未指定（空）の場合は rustls 既定（DEFAULT_CIPHER_SUITES）を使用する。
+    /// 不正なスイート名は起動時（設定検証時）にエラーとなる。
+    ///
+    /// 指定可能な名前（aws-lc-rs プロバイダ）:
+    /// - TLS 1.3: `TLS13_AES_256_GCM_SHA384`, `TLS13_AES_128_GCM_SHA256`,
+    ///   `TLS13_CHACHA20_POLY1305_SHA256`
+    /// - TLS 1.2: `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`,
+    ///   `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256`,
+    ///   `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256`,
+    ///   `TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384`,
+    ///   `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`,
+    ///   `TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256`
+    ///
+    /// 注意: kTLS は AES-GCM 系のみ対応。kTLS 有効時に CHACHA20 系を含めると、
+    /// そのスイートでネゴシエートした接続は kTLS へオフロードされず rustls で
+    /// 処理される（`ktls_fallback_enabled = false` の場合は接続拒否）。
+    #[serde(default)]
+    pub cipher_suites: Vec<String>,
     /// 証明書ファイルの変更を自動検知してリロードするか（F-03）
     /// デフォルト: false
     #[serde(default)]
@@ -4710,6 +4731,7 @@ pub fn build_server_config_from_paths(
     key_path: &Path,
     ktls_enabled: bool,
     http2_enabled: bool,
+    cipher_suites: &[String],
 ) -> anyhow::Result<Arc<ServerConfig>> {
     let section = TlsConfigSection {
         cert_path: cert_path.to_string_lossy().into_owned(),
@@ -4717,11 +4739,53 @@ pub fn build_server_config_from_paths(
         ktls_enabled,
         ktls_fallback_enabled: true,
         tcp_cork_enabled: true,
+        cipher_suites: cipher_suites.to_vec(),
         auto_reload: false,
         reload_interval_secs: default_tls_reload_interval(),
     };
     load_tls_config(&section, ktls_enabled, http2_enabled)
         .map_err(|e| anyhow::anyhow!("TLS reload build failed: {}", e))
+}
+
+/// 設定名（例: `TLS13_AES_256_GCM_SHA384`）から rustls の暗号スイートを解決する（F-50）。
+///
+/// 配列の順序を保持する（記載順 = サーバ優先度順）。不明な名前・重複はエラー。
+/// 設定読み込み時（非ホットパス）にのみ呼ばれるため、ここでのアロケーションは許容される。
+pub fn resolve_cipher_suites(names: &[String]) -> io::Result<Vec<rustls::SupportedCipherSuite>> {
+    use rustls::crypto::aws_lc_rs::ALL_CIPHER_SUITES;
+
+    let mut out: Vec<rustls::SupportedCipherSuite> = Vec::with_capacity(names.len());
+    for name in names {
+        let found = ALL_CIPHER_SUITES
+            .iter()
+            .find(|s| format!("{:?}", s.suite()).eq_ignore_ascii_case(name));
+        match found {
+            Some(s) => {
+                if out.iter().any(|e| e.suite() == s.suite()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("[tls] cipher_suites: duplicate cipher suite '{}'", name),
+                    ));
+                }
+                out.push(*s);
+            }
+            None => {
+                let valid: Vec<String> = ALL_CIPHER_SUITES
+                    .iter()
+                    .map(|s| format!("{:?}", s.suite()))
+                    .collect();
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "[tls] cipher_suites: unknown cipher suite '{}'. Valid names: {}",
+                        name,
+                        valid.join(", ")
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn load_tls_config(
@@ -4750,20 +4814,58 @@ fn load_tls_config(
         )
     })?;
 
+    // F-50: [tls] cipher_suites による暗号スイートの取捨選択・優先度指定
+    //
+    // 指定がある場合は CryptoProvider の cipher_suites を設定順（= サーバ優先度順）で
+    // 差し替える。不正な名前はここでエラーになる（起動時 / リロード時の検証）。
+    let custom_suites = if !tls_config.cipher_suites.is_empty() {
+        let suites = resolve_cipher_suites(&tls_config.cipher_suites)?;
+        info!(
+            "TLS cipher suites restricted by config (priority order): {:?}",
+            tls_config.cipher_suites
+        );
+        Some(suites)
+    } else {
+        None
+    };
+
+    // kTLS 互換性チェック: kTLS は AES-GCM 系のみオフロード可能。
+    // 非互換スイートが指定されている場合は警告する（該当接続は rustls フォールバック、
+    // ktls_fallback_enabled = false ならハンドシェイク後に拒否される）。
+    #[cfg(feature = "ktls")]
+    if ktls_enabled {
+        if let Some(ref suites) = custom_suites {
+            let compat = crate::ktls::ktls_compatible_cipher_suites();
+            let incompatible: Vec<String> = suites
+                .iter()
+                .filter(|s| !compat.contains(s))
+                .map(|s| format!("{:?}", s.suite()))
+                .collect();
+            if !incompatible.is_empty() {
+                warn!(
+                    "kTLS enabled but non-kTLS-compatible cipher suites configured: {}. \
+                     Connections negotiating these will not be offloaded to kTLS",
+                    incompatible.join(", ")
+                );
+            }
+        } else {
+            info!("kTLS enabled: kTLS offload is available for AES-GCM cipher suites");
+        }
+    }
+
     // kTLS 有効時のみ config を変更するため、条件付きで mut を使用
     #[allow(unused_mut)]
     let mut config = {
-        #[cfg(feature = "ktls")]
-        if ktls_enabled {
-            // kTLS 有効時は互換暗号スイートのみを使用
-            // TODO: CryptoProviderに暗号スイートを設定（将来的な拡張）
-            let _cipher_suites = crate::ktls::ktls_compatible_cipher_suites();
-            info!("kTLS enabled: using only compatible cipher suites (AES-GCM)");
+        #[cfg(not(feature = "ktls"))]
+        let _ = ktls_enabled;
 
-            ServerConfig::builder_with_provider(
-                rustls::crypto::aws_lc_rs::default_provider().into(),
-            )
-            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+        let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+        if let Some(suites) = custom_suites {
+            provider.cipher_suites = suites;
+        }
+
+        ServerConfig::builder_with_provider(provider.into())
+            .with_protocol_versions(rustls::DEFAULT_VERSIONS)
             .map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -4773,21 +4875,6 @@ fn load_tls_config(
             .with_no_client_auth()
             .with_single_cert(cert_chain, keys)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-        } else {
-            ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(cert_chain, keys)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-        }
-
-        #[cfg(not(feature = "ktls"))]
-        {
-            let _ = ktls_enabled;
-            ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(cert_chain, keys)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-        }
     };
 
     // kTLS が有効な場合のみシークレット抽出を有効化
@@ -4824,6 +4911,8 @@ pub struct LoadedConfig {
     pub tls_auto_reload: bool,
     /// 証明書リロードチェック間隔（秒、F-03）
     pub tls_reload_interval_secs: u64,
+    /// 設定された TLS 暗号スイート（F-50、リロード時の再構築用）
+    pub tls_cipher_suites: Vec<String>,
     /// TLS証明書（PEM形式、事前読み込み済み）
     ///
     /// Landlock適用前に読み込まれた証明書データ。
@@ -5476,6 +5565,7 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         tls_key_path: config.tls.key_path.clone(),
         tls_auto_reload: config.tls.auto_reload,
         tls_reload_interval_secs: config.tls.reload_interval_secs,
+        tls_cipher_suites: config.tls.cipher_suites.clone(),
         tls_cert_pem: Arc::new(tls_cert_pem),
         tls_key_pem: Arc::new(tls_key_pem),
         route: routes,
@@ -6660,5 +6750,110 @@ timeout_secs = 3
         assert_eq!(hc.check_type, HealthCheckType::Tcp);
         assert_eq!(hc.interval_secs, 10);
         assert_eq!(hc.timeout_secs, 3);
+    }
+}
+
+// ====================
+// TLS 暗号スイート設定（F-50）のテスト
+// ====================
+
+#[cfg(test)]
+mod cipher_suites_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_known_suites_preserves_order() {
+        let names = vec![
+            "TLS13_AES_256_GCM_SHA384".to_string(),
+            "TLS13_AES_128_GCM_SHA256".to_string(),
+            "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384".to_string(),
+        ];
+        let suites = resolve_cipher_suites(&names).unwrap();
+        assert_eq!(suites.len(), 3);
+        // 設定順 = 優先度順が保持される
+        for (name, suite) in names.iter().zip(suites.iter()) {
+            assert_eq!(&format!("{:?}", suite.suite()), name);
+        }
+    }
+
+    #[test]
+    fn resolve_is_case_insensitive() {
+        let names = vec!["tls13_aes_128_gcm_sha256".to_string()];
+        let suites = resolve_cipher_suites(&names).unwrap();
+        assert_eq!(
+            format!("{:?}", suites[0].suite()),
+            "TLS13_AES_128_GCM_SHA256"
+        );
+    }
+
+    #[test]
+    fn resolve_unknown_suite_is_error() {
+        let names = vec!["TLS_RSA_WITH_RC4_128_MD5".to_string()];
+        let err = resolve_cipher_suites(&names).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        // エラーメッセージに有効な候補一覧が含まれる
+        assert!(err.to_string().contains("TLS13_AES_256_GCM_SHA384"));
+    }
+
+    #[test]
+    fn resolve_duplicate_suite_is_error() {
+        let names = vec![
+            "TLS13_AES_128_GCM_SHA256".to_string(),
+            "TLS13_AES_128_GCM_SHA256".to_string(),
+        ];
+        let err = resolve_cipher_suites(&names).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("duplicate"));
+    }
+
+    #[test]
+    fn resolve_empty_returns_empty() {
+        assert!(resolve_cipher_suites(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn tls_section_deserializes_cipher_suites() {
+        let toml = r#"
+cert_path = "/tmp/cert.pem"
+key_path = "/tmp/key.pem"
+cipher_suites = ["TLS13_AES_256_GCM_SHA384", "TLS13_AES_128_GCM_SHA256"]
+"#;
+        let section: TlsConfigSection = toml::from_str(toml).unwrap();
+        assert_eq!(
+            section.cipher_suites,
+            vec!["TLS13_AES_256_GCM_SHA384", "TLS13_AES_128_GCM_SHA256"]
+        );
+    }
+
+    #[test]
+    fn tls_section_cipher_suites_defaults_to_empty() {
+        let toml = r#"
+cert_path = "/tmp/cert.pem"
+key_path = "/tmp/key.pem"
+"#;
+        let section: TlsConfigSection = toml::from_str(toml).unwrap();
+        assert!(section.cipher_suites.is_empty());
+    }
+
+    /// build_server_config_from_paths が cipher_suites を反映した ServerConfig を
+    /// 構築できることを確認する（自己署名証明書使用）。
+    #[test]
+    fn build_server_config_with_custom_suites() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
+
+        let suites = vec!["TLS13_AES_256_GCM_SHA384".to_string()];
+        let config =
+            build_server_config_from_paths(&cert_path, &key_path, false, false, &suites).unwrap();
+        // ServerConfig 構築成功 = スイート解決と provider 差し替えが機能
+        assert!(Arc::strong_count(&config) >= 1);
+
+        // 不正なスイート名はエラー
+        let bad = vec!["NOT_A_SUITE".to_string()];
+        assert!(build_server_config_from_paths(&cert_path, &key_path, false, false, &bad).is_err());
     }
 }

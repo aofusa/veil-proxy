@@ -1,7 +1,16 @@
 # F-50: [tls] cipher_suites 設定（nginx 風の取捨選択・優先度指定）
 
 - **優先度**: P1
-- **対応状況**: 未着手
+- **対応状況**: 完了（2026-07-02）
+
+## 完了メモ
+
+- `TlsConfigSection` に `cipher_suites: Vec<String>`（serde default 空 = 従来挙動）を追加。
+- `resolve_cipher_suites()` で名前解決（大文字小文字非依存・順序保持・不明/重複はエラー）。`CryptoProvider.cipher_suites` を設定順で差し替え、`builder_with_provider` に一本化。
+- kTLS 有効時に非互換（非 AES-GCM）スイートが含まれる場合は警告（接続は rustls フォールバック）。従来 TODO のままだった「kTLS 時のスイート制限」も本設定で運用可能に。
+- リロード経路（`build_server_config_from_paths` / main.rs の reload builder）にも伝搬し、証明書リロード後もスイート設定を維持。
+- 単体テスト 8 件 + E2E 3 件（サーバ優先度・許可スイート・除外スイート拒否）追加、全通過。
+- 適用範囲は TLS(TCP) リスナー（HTTP/1.1/2）。HTTP/3 (QUIC) は quiche 管理のため対象外（config.toml に明記）。
 - **出典**: ユーザー要求
 
 ## 機能説明・現状

@@ -594,6 +594,36 @@ ktls_fallback_enabled = false
 # false: TCP_CORK無効（特定の低遅延要件がある場合）
 # tcp_cork_enabled = true
 
+# 利用を許可する TLS 暗号スイート（nginx の ssl_ciphers 相当、F-50）
+#
+# 記載順 = サーバ優先度順（rustls はサーバ選好でネゴシエートする）。
+# 未指定（空・コメントアウト）の場合は rustls 既定の全スイートを使用。
+# 不正なスイート名は起動時にエラーとなる。
+#
+# 指定可能な名前（aws-lc-rs プロバイダ）:
+#   TLS 1.3:
+#     TLS13_AES_256_GCM_SHA384
+#     TLS13_AES_128_GCM_SHA256
+#     TLS13_CHACHA20_POLY1305_SHA256
+#   TLS 1.2:
+#     TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+#     TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+#     TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+#     TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+#     TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+#     TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+#
+# 注意:
+# - kTLS オフロードは AES-GCM 系のみ対応。kTLS 有効時に CHACHA20 系を含めると、
+#   そのスイートでネゴシエートした接続は kTLS へオフロードされず rustls で処理される
+#   （ktls_fallback_enabled = false の場合は接続拒否）。
+# - 本設定は TLS(TCP) リスナー（HTTP/1.1 / HTTP/2）に適用される。
+#   HTTP/3 (QUIC) は quiche が TLS を管理するため対象外。
+# cipher_suites = [
+#     "TLS13_AES_256_GCM_SHA384",
+#     "TLS13_AES_128_GCM_SHA256",
+# ]
+
 # 証明書の0ダウンタイム自動リロード（F-03）
 # auto_reload = true で証明書/秘密鍵ファイルの mtime 変化を検知し、
 # 新しいハンドシェイクのみ新証明書を使用する（既存接続は影響なし）。

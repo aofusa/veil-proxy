@@ -1542,8 +1542,7 @@ mod chunked_span_tests {
     fn test_span_framing_split_across_buffers() {
         // チャンクサイズ行が境界で割れる（"1" | "0\r\n..."）
         let mut d = ChunkedDecoder::new_unlimited();
-        let (body, complete, _) =
-            drive(&mut d, &[b"1", b"0\r\n0123456789abcdef\r\n0\r\n\r\n"]);
+        let (body, complete, _) = drive(&mut d, &[b"1", b"0\r\n0123456789abcdef\r\n0\r\n\r\n"]);
         assert_eq!(body, b"0123456789abcdef");
         assert!(complete);
     }
@@ -1581,8 +1580,7 @@ mod chunked_span_tests {
     fn test_span_with_trailers() {
         // トレーラーはボディに含めない
         let mut d = ChunkedDecoder::new_unlimited();
-        let (body, complete, _) =
-            drive(&mut d, &[b"5\r\nhello\r\n0\r\nX-Trailer: val\r\n\r\n"]);
+        let (body, complete, _) = drive(&mut d, &[b"5\r\nhello\r\n0\r\nX-Trailer: val\r\n\r\n"]);
         assert_eq!(body, b"hello");
         assert!(complete);
     }

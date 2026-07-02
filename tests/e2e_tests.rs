@@ -669,8 +669,11 @@ async fn test_round_robin_distribution() {
     let mut backend2_count = 0;
 
     // 10回リクエストを送信
+    // B-10: 共有の "/"（backend-pool）は並列実行中の他テストと RR カーソルを
+    // 共有して分散カウントが干渉するため、専用プール（rr-isolated-pool）へ
+    // ルーティングされる専用パスを使う。
     for _ in 0..10 {
-        let response = send_request(PROXY_PORT, "/", &[]).await;
+        let response = send_request(PROXY_PORT, "/rr-test/", &[]).await;
         if let Some(response) = response {
             if let Some(server_id) = get_header_value(&response, "X-Server-Id") {
                 match server_id.as_str() {
@@ -11847,8 +11850,9 @@ async fn test_load_balancing_round_robin_distribution() {
     let mut backend1_count = 0;
     let mut backend2_count = 0;
 
+    // B-10: 分散カウントの干渉を避けるため専用プールのパスを使う（test_round_robin_distribution と同様）
     for _ in 0..num_requests {
-        let response = send_request(PROXY_PORT, "/", &[]).await;
+        let response = send_request(PROXY_PORT, "/rr-test/", &[]).await;
         if let Some(response) = response {
             let server_id = get_header_value(&response, "X-Server-Id");
             if let Some(id) = server_id {
@@ -16709,4 +16713,120 @@ async fn test_l4_passthrough_large_payload() {
         "L4 should forward the 10KB body intact (no truncation/corruption)"
     );
     eprintln!("L4 passthrough large payload: passed");
+}
+
+// ====================
+// TLS cipher_suites 設定テスト（F-50）
+// ====================
+//
+// e2e_setup.sh の proxy.toml は [tls].cipher_suites で
+// AES-GCM 系のみ（先頭 = TLS13_AES_256_GCM_SHA384）を許可し、CHACHA20 系を除外している。
+// ここでは「設定順のサーバ優先度」「許可スイートのみネゴシエート」「除外スイートの拒否」を検証する。
+
+/// 指定した暗号スイート群のみを提示するクライアントで TLS ハンドシェイクを行い、
+/// ネゴシエートされたスイートを返す（失敗時は Err）。
+fn tls_handshake_negotiated_suite(
+    port: u16,
+    client_suites: Option<Vec<rustls::SupportedCipherSuite>>,
+) -> Result<String, String> {
+    init_crypto_provider();
+
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    if let Some(suites) = client_suites {
+        provider.cipher_suites = suites;
+    }
+    let config = ClientConfig::builder_with_provider(provider.into())
+        .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+        .map_err(|e| format!("version error: {e}"))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+        .with_no_client_auth();
+
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let mut conn = ClientConnection::new(Arc::new(config), server_name)
+        .map_err(|e| format!("client conn error: {e}"))?;
+    let mut sock = std::net::TcpStream::connect(("127.0.0.1", port))
+        .map_err(|e| format!("connect error: {e}"))?;
+    sock.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .ok();
+
+    while conn.is_handshaking() {
+        conn.complete_io(&mut sock)
+            .map_err(|e| format!("handshake error: {e}"))?;
+    }
+
+    conn.negotiated_cipher_suite()
+        .map(|s| format!("{:?}", s.suite()))
+        .ok_or_else(|| "no negotiated suite".to_string())
+}
+
+/// サーバは設定順の先頭（TLS13_AES_256_GCM_SHA384）を優先する。
+#[tokio::test]
+#[ntest::timeout(15000)]
+async fn test_tls_cipher_suites_server_preference() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    // デフォルトクライアント（AES256/AES128/CHACHA20 を提示）
+    let negotiated =
+        tokio::task::spawn_blocking(move || tls_handshake_negotiated_suite(PROXY_PORT, None))
+            .await
+            .unwrap()
+            .expect("handshake should succeed");
+
+    assert_eq!(
+        negotiated, "TLS13_AES_256_GCM_SHA384",
+        "server must prefer the first configured cipher suite"
+    );
+}
+
+/// 設定に含まれる低優先度スイート（AES_128）のみを提示すればそれが選ばれる。
+#[tokio::test]
+#[ntest::timeout(15000)]
+async fn test_tls_cipher_suites_allows_configured_suite() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let negotiated = tokio::task::spawn_blocking(move || {
+        use rustls::crypto::aws_lc_rs::cipher_suite;
+        tls_handshake_negotiated_suite(
+            PROXY_PORT,
+            Some(vec![cipher_suite::TLS13_AES_128_GCM_SHA256]),
+        )
+    })
+    .await
+    .unwrap()
+    .expect("handshake should succeed with configured suite");
+
+    assert_eq!(negotiated, "TLS13_AES_128_GCM_SHA256");
+}
+
+/// 設定から除外されたスイート（CHACHA20）のみを提示するとハンドシェイクが失敗する。
+#[tokio::test]
+#[ntest::timeout(15000)]
+async fn test_tls_cipher_suites_rejects_excluded_suite() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let result = tokio::task::spawn_blocking(move || {
+        use rustls::crypto::aws_lc_rs::cipher_suite;
+        tls_handshake_negotiated_suite(
+            PROXY_PORT,
+            Some(vec![cipher_suite::TLS13_CHACHA20_POLY1305_SHA256]),
+        )
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        result.is_err(),
+        "handshake must fail when only excluded suites are offered, got: {:?}",
+        result
+    );
 }

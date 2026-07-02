@@ -164,6 +164,9 @@ prepare_fixtures() {
         mkdir -p "${FIXTURES_DIR}/${backend}/v2"
         echo "v1 test" > "${FIXTURES_DIR}/${backend}/v1/test"
         echo "v2 test" > "${FIXTURES_DIR}/${backend}/v2/test"
+        # B-10: ロードバランシング分散テスト専用パス（共有 "/" の RR ステートと隔離）
+        mkdir -p "${FIXTURES_DIR}/${backend}/rr-test"
+        echo "<h1>RR Test</h1>" > "${FIXTURES_DIR}/${backend}/rr-test/index.html"
     done
 
     # 必要なディレクトリの作成
@@ -327,6 +330,14 @@ http3_enabled = true
 cert_path = "${FIXTURES_DIR}/cert.pem"
 key_path = "${FIXTURES_DIR}/key.pem"
 ktls_enabled = false
+# F-50: cipher_suites の取捨選択・優先度（記載順 = サーバ優先度順）検証用。
+# CHACHA20 系を意図的に除外し、E2E で「除外スイートは拒否・先頭スイートが優先」を検証する。
+cipher_suites = [
+    "TLS13_AES_256_GCM_SHA384",
+    "TLS13_AES_128_GCM_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+]
 
 [logging]
 level = "debug"
@@ -375,6 +386,17 @@ healthy_threshold = 1
 unhealthy_threshold = 10000
 use_tls = true
 verify_cert = false
+
+# B-10: Round Robin 分散テスト専用プール
+# 他のテストが同時に "/"（backend-pool）へリクエストすると RR カーソルが共有されて
+# 分散カウントが干渉するため、分散を Assert するテストはこの専用プールを使う。
+[upstreams."rr-isolated-pool"]
+algorithm = "round_robin"
+servers = [
+    "https://127.0.0.1:${BACKEND1_PORT}",
+    "https://127.0.0.1:${BACKEND2_PORT}"
+]
+tls_insecure = true
 
 [upstreams."grpc-pool"]
 algorithm = "round_robin"
@@ -607,6 +629,23 @@ path = "/error-500/*"
 [route.action]
 type = "Proxy"
 upstream = "error-pool"
+
+# B-10: Round Robin 分散テスト専用ルート（共有 "/" と RR ステートを隔離）
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/rr-test/*"
+[route.action]
+type = "Proxy"
+upstream = "rr-isolated-pool"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/rr-test/*"
+[route.action]
+type = "Proxy"
+upstream = "rr-isolated-pool"
 
 [[route]]
 [route.conditions]

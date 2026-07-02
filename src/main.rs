@@ -451,8 +451,16 @@ fn main() {
         let http2_enabled = loaded_config.http2_enabled;
         #[cfg(not(feature = "http2"))]
         let http2_enabled = false;
+        // F-50: リロード時も設定された暗号スイートを維持する
+        let cipher_suites = loaded_config.tls_cipher_suites.clone();
         let builder: tls_reload::ServerConfigBuilder = Box::new(move |c, k| {
-            config::build_server_config_from_paths(c, k, ktls_enabled, http2_enabled)
+            config::build_server_config_from_paths(
+                c,
+                k,
+                ktls_enabled,
+                http2_enabled,
+                &cipher_suites,
+            )
         });
         match tls_reload::TlsCertReloader::new_global(cert_path, key_path, builder) {
             Ok(reloader) => {
