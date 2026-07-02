@@ -114,8 +114,8 @@ prepare_veil_test_config() {
         toxi_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
             "${TOXIPROXY_CONTAINER}" 2>/dev/null || true)
         if [[ -n "${toxi_ip}" ]]; then
-            sed -i "s|http://veil-sec-toxiproxy:8480/|http://${toxi_ip}:8480/|g" "${dst}"
-            log "Toxiproxy 上流を IP 指定に設定: ${toxi_ip}:8480"
+            sed -i "s|veil-sec-toxiproxy|${toxi_ip}|g" "${dst}"
+            log "Toxiproxy ホスト名を IP 指定に置換: ${toxi_ip}"
         fi
     fi
     echo "${dst}"
