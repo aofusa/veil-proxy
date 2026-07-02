@@ -229,6 +229,53 @@ async fn forward_direction(
     total
 }
 
+// ====================
+// L4 splice パイプのスレッドローカルプール（F-40）
+// ====================
+//
+// 接続ごとに `pipe2(2)` を発行するコスト（システムコール + fd 確保）をホットパスから
+// 排除するため、使い終わったパイプをスレッドローカルに保持して再利用する。
+// パイプに残データがあるまま再利用すると**次の接続へデータが混線する**ため、
+// 返却時に FIONREAD で空であることを確認できた場合のみプールへ戻す（それ以外は破棄）。
+
+thread_local! {
+    static L4_PIPE_POOL: std::cell::RefCell<Vec<Pipe>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// プールに保持するパイプ本数の上限（スレッドごと）。
+/// 1 接続あたり 2 本（上り/下り）使うため、同時 32 接続分をカバーする。
+const L4_PIPE_POOL_MAX: usize = 64;
+
+/// プールからパイプを取得する。空ならば新規作成（`pipe2(2)`）にフォールバック。
+fn acquire_pipe() -> io::Result<Pipe> {
+    if let Some(p) = L4_PIPE_POOL.with(|pool| pool.borrow_mut().pop()) {
+        return Ok(p);
+    }
+    Pipe::new()
+}
+
+/// パイプをプールへ返却する。
+///
+/// 残データがあるパイプを再利用すると次接続へデータが漏れる（混線する）ため、
+/// FIONREAD で空を確認できた場合のみ返却し、それ以外（残データあり・ioctl 失敗・
+/// プール満杯）は Drop に任せて破棄する。
+fn release_pipe(pipe: Pipe) {
+    let mut pending: libc::c_int = 0;
+    let ret = unsafe { libc::ioctl(pipe.read_fd, libc::FIONREAD, &mut pending) };
+    if ret != 0 || pending != 0 {
+        // 破棄（Drop が fd をクローズ）
+        return;
+    }
+    L4_PIPE_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < L4_PIPE_POOL_MAX {
+            pool.push(pipe);
+        }
+        // 満杯なら Drop で破棄
+    });
+}
+
 /// 1 方向の splice ゼロコピー転送ループ（F-30）。
 ///
 /// `src(socket) → pipe → dst(socket)` の 2 段 splice でカーネル内転送する。ユーザースペースの
@@ -298,7 +345,8 @@ pub async fn bidirectional_forward(
 ) {
     // futures::join! は両 Future を同一タスク内でインターリーブするため、
     // &TcpStream / &Pipe の同時借用は安全。
-    match (Pipe::new(), Pipe::new()) {
+    // パイプはスレッドローカルプール（F-40）から取得し、接続ごとの pipe2(2) を排除する。
+    match (acquire_pipe(), acquire_pipe()) {
         (Ok(c2u_pipe), Ok(u2c_pipe)) => {
             let (c2u_bytes, u2c_bytes) = futures::join!(
                 forward_direction_splice(
@@ -320,6 +368,9 @@ pub async fn bidirectional_forward(
                 "[L4:{}] connection closed (splice): c→u {} bytes, u→c {} bytes",
                 listener_name, c2u_bytes, u2c_bytes
             );
+            // 空であることを確認できたパイプのみ再利用のためプールへ返却する。
+            release_pipe(c2u_pipe);
+            release_pipe(u2c_pipe);
         }
         _ => {
             // pipe 作成失敗時はユーザースペースコピーへフォールバック。
@@ -867,5 +918,73 @@ mod tests {
 
         // [3, 4, 5, 6] が先頭に詰められているはず
         assert_eq!(&buf[..], &[3u8, 4, 5, 6]);
+    }
+
+    // ====================
+    // L4 splice パイプのスレッドローカルプール（F-40）
+    // ====================
+
+    /// 空のパイプは返却後に再利用される（同じ fd が返る = pipe2(2) が発行されない）。
+    #[test]
+    fn test_pipe_pool_reuses_clean_pipe() {
+        let pipe = acquire_pipe().expect("pipe");
+        let (rfd, wfd) = (pipe.read_fd, pipe.write_fd);
+        release_pipe(pipe);
+
+        let reused = acquire_pipe().expect("pipe");
+        assert_eq!(
+            (reused.read_fd, reused.write_fd),
+            (rfd, wfd),
+            "clean pipe must be reused from the pool"
+        );
+        release_pipe(reused);
+    }
+
+    /// 残データのあるパイプは返却時に破棄され、次の接続へデータが混線しない。
+    #[test]
+    fn test_pipe_pool_discards_dirty_pipe() {
+        // プールを空にしてから開始（他テストの影響を排除）
+        L4_PIPE_POOL.with(|p| p.borrow_mut().clear());
+
+        let pipe = acquire_pipe().expect("pipe");
+        // パイプに残データを作る
+        let data = b"leftover";
+        let n = unsafe {
+            libc::write(
+                pipe.write_fd,
+                data.as_ptr() as *const libc::c_void,
+                data.len(),
+            )
+        };
+        assert_eq!(n, data.len() as isize);
+
+        release_pipe(pipe);
+
+        // 汚れたパイプは破棄されたので、プールは空のまま
+        let pooled = L4_PIPE_POOL.with(|p| p.borrow().len());
+        assert_eq!(pooled, 0, "dirty pipe must be discarded, not pooled");
+
+        // 次に取得したパイプは空である（データ混線なし）
+        let fresh = acquire_pipe().expect("pipe");
+        let mut pending: libc::c_int = -1;
+        let ret = unsafe { libc::ioctl(fresh.read_fd, libc::FIONREAD, &mut pending) };
+        assert_eq!(ret, 0);
+        assert_eq!(pending, 0, "freshly acquired pipe must be empty");
+        release_pipe(fresh);
+    }
+
+    /// プール上限を超えた返却は破棄される（fd リークなし・無制限成長なし）。
+    #[test]
+    fn test_pipe_pool_respects_max() {
+        L4_PIPE_POOL.with(|p| p.borrow_mut().clear());
+
+        let pipes: Vec<Pipe> = (0..L4_PIPE_POOL_MAX + 8)
+            .map(|_| Pipe::new().expect("pipe"))
+            .collect();
+        for pipe in pipes {
+            release_pipe(pipe);
+        }
+        let pooled = L4_PIPE_POOL.with(|p| p.borrow().len());
+        assert_eq!(pooled, L4_PIPE_POOL_MAX);
     }
 }
