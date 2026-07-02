@@ -269,6 +269,8 @@ pub(crate) static CACHE_EVICTIONS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
 #[cfg(feature = "metrics")]
 /// キャッシュサイズゲージ（storage ラベル付き）
 /// storage: "memory" or "disk"
+// cache feature 有効時のみ参照される
+#[cfg_attr(not(feature = "cache"), allow(dead_code))]
 pub(crate) static CACHE_SIZE_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
     let opts = Opts::new("cache_size_bytes", "Current cache size in bytes").namespace("veil_proxy");
     let gauge = IntGaugeVec::new(opts, &["storage"]).unwrap();
@@ -278,6 +280,8 @@ pub(crate) static CACHE_SIZE_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
 
 #[cfg(feature = "metrics")]
 /// キャッシュエントリ数ゲージ
+// cache feature 有効時のみ参照される
+#[cfg_attr(not(feature = "cache"), allow(dead_code))]
 pub(crate) static CACHE_ENTRIES: Lazy<IntGaugeVec> = Lazy::new(|| {
     let opts =
         Opts::new("cache_entries", "Current number of cache entries").namespace("veil_proxy");
@@ -761,6 +765,16 @@ pub(crate) fn encode_prometheus_metrics() -> Vec<u8> {
         .encode(&metric_families, &mut buffer)
         .unwrap_or_default();
     buffer
+}
+
+/// metrics feature 無効時のスタブ
+///
+/// HTTP/2・HTTP/3 のメトリクスエンドポイント経路（cfg ゲートなしで呼び出す）が
+/// metrics 無効ビルドでもコンパイルできるように提供する。
+#[cfg(all(not(feature = "metrics"), any(feature = "http2", feature = "http3")))]
+#[inline]
+pub(crate) fn encode_prometheus_metrics() -> Vec<u8> {
+    Vec::new()
 }
 
 /// メトリクスファミリーを (メトリクス名, [(ラベル集合, 値)]) 形式で収集する（F-10）
