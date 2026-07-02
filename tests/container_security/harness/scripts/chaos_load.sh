@@ -65,11 +65,11 @@ PY
     echo "connection_churn success=${count}"
 }
 
-# 許可されていないメソッド POST の大量送信（HTTPS で 405 等が返ること）
+# 許可されていないメソッド DELETE の大量送信（HTTPS で 405 等が返ること）
 method_stress() {
     local denied=0
     for ((i = 1; i <= 50; i++)); do
-        code=$(curl -sk -o /dev/null -w "%{http_code}" -X POST --max-time 2 \
+        code=$(curl -sk -o /dev/null -w "%{http_code}" -X DELETE --max-time 2 \
             "https://${VEIL_HOST}:${VEIL_HTTPS_PORT}/" 2>/dev/null || echo "000")
         if [[ "${code}" == "405" || "${code}" == "403" || "${code}" == "501" ]]; then
             denied=$((denied + 1))
