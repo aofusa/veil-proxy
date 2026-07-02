@@ -1,7 +1,13 @@
 # F-42: buffering/handler.rs の非同期 FS 化（runtime::offload 適用）
 
 - **優先度**: P1
-- **対応状況**: 未着手
+- **対応状況**: 完了（2026-07-02）
+
+## 完了メモ
+
+- `disk_buffer::write_to_disk`（create_dir_all + write_all + fsync）、`read_from_disk`（metadata + read_exact）、`remove_disk_buffer`（unlink）の全ブロッキング FS 操作を `runtime::offload::offload()` 経由に移行。イベントループは POLL_ADD（eventfd）で完了待機し、決してブロックしない。
+- `remove_disk_buffer` は async 化（呼び出し元なしのため互換影響なし）。
+- write → read → remove のラウンドトリップ単体テストを追加。全単体テスト通過。
 - **出典**: `docs/artifacts/remaining_tasks_analysis.md` F-29 残件
 
 ## 機能説明・現状

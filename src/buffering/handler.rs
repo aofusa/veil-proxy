@@ -29,15 +29,19 @@ pub fn key_to_path(base_path: &std::path::Path, key: &[u8]) -> PathBuf {
     base_path.join(&dir1).join(&dir2).join(&filename)
 }
 
-/// ディスクバッファ操作（std::fs ベース）
+/// ディスクバッファ操作（F-42: `runtime::offload` による完全非同期化）
+///
+/// ディスク I/O（create_dir_all / write / fsync / read / unlink）はブロッキング
+/// システムコールのため、`runtime::offload`（専用スレッドプール + スレッドごと
+/// eventfd の POLL_ADD で完了待機）でワーカースレッドへ退避し、**イベントループを
+/// 決してブロックしない**（新規 io_uring オペコードは追加しない）。
 #[cfg(target_os = "linux")]
 pub mod disk_buffer {
     use std::io;
     use std::path::Path;
     use xxhash_rust::xxh3::xxh3_64;
 
-    /// ディスクバッファへの非同期書き込み
-    /// コールドパスのためブロッキング I/O を使用
+    /// ディスクバッファへの非同期書き込み（offload 経由・イベントループ非ブロック）
     pub async fn write_to_disk(
         base_path: &Path,
         key: &[u8],
@@ -53,40 +57,47 @@ pub mod disk_buffer {
         let dir_path = base_path.join(&dir1).join(&dir2);
         let file_path = dir_path.join(&filename);
 
-        // ディレクトリ作成
-        std::fs::create_dir_all(&dir_path)?;
-
-        // 同期書き込み（コールドパスのみ使用）
-        use std::io::Write;
-        let mut file = std::fs::File::create(&file_path)?;
-        file.write_all(&data)?;
-        file.sync_all()?;
+        // ブロッキング FS 操作一式をオフロードスレッドで実行
+        let file_path_for_io = file_path.clone();
+        crate::runtime::offload::offload(move || {
+            std::fs::create_dir_all(&dir_path)?;
+            use std::io::Write;
+            let mut file = std::fs::File::create(&file_path_for_io)?;
+            file.write_all(&data)?;
+            file.sync_all()?;
+            Ok::<(), io::Error>(())
+        })
+        .await?;
 
         Ok(file_path)
     }
 
-    /// ディスクバッファからの非同期読み込み
+    /// ディスクバッファからの非同期読み込み（offload 経由・イベントループ非ブロック）
     pub async fn read_from_disk(path: &Path) -> io::Result<Vec<u8>> {
-        let metadata = std::fs::metadata(path)?;
-        let size = metadata.len() as usize;
+        let path = path.to_path_buf();
+        crate::runtime::offload::offload(move || {
+            let metadata = std::fs::metadata(&path)?;
+            let size = metadata.len() as usize;
 
-        let mut buf = Vec::with_capacity(size);
-        #[allow(clippy::uninit_vec)]
-        unsafe {
-            buf.set_len(size);
-        }
+            let mut buf = Vec::with_capacity(size);
+            #[allow(clippy::uninit_vec)]
+            unsafe {
+                buf.set_len(size);
+            }
 
-        // 同期読み込み（コールドパスのみ使用）
-        use std::io::Read;
-        let mut file = std::fs::File::open(path)?;
-        file.read_exact(&mut buf)?;
+            use std::io::Read;
+            let mut file = std::fs::File::open(&path)?;
+            file.read_exact(&mut buf)?;
 
-        Ok(buf)
+            Ok(buf)
+        })
+        .await
     }
 
-    /// ディスクバッファを削除
-    pub fn remove_disk_buffer(path: &Path) -> io::Result<()> {
-        std::fs::remove_file(path)
+    /// ディスクバッファを削除（offload 経由・イベントループ非ブロック）
+    pub async fn remove_disk_buffer(path: &Path) -> io::Result<()> {
+        let path = path.to_path_buf();
+        crate::runtime::offload::offload(move || std::fs::remove_file(&path)).await
     }
 }
 
@@ -195,5 +206,52 @@ mod tests {
         // 100個のキーで複数のディレクトリに分散されることを確認
         // （ハッシュの性質上、完全にユニークではない可能性があるが、1より多いはず）
         assert!(directories.len() > 1);
+    }
+
+    // ====================
+    // disk_buffer（F-42: offload 非同期化後のラウンドトリップ）
+    // ====================
+
+    /// write → read → remove のラウンドトリップ。
+    /// リング無しコンテキストでは offload が同期インライン実行にフォールバックするため、
+    /// 軽量 executor（block_on 相当）なしで poll できるよう単純な待機で駆動する。
+    #[test]
+    fn test_disk_buffer_roundtrip() {
+        use super::disk_buffer;
+
+        fn block_on<F: std::future::Future>(mut fut: F) -> F::Output {
+            use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+            fn noop(_: *const ()) {}
+            fn clone(_: *const ()) -> RawWaker {
+                RawWaker::new(std::ptr::null(), &VTABLE)
+            }
+            static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+            let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+            let mut cx = Context::from_waker(&waker);
+            let mut fut = unsafe { std::pin::Pin::new_unchecked(&mut fut) };
+            loop {
+                match fut.as_mut().poll(&mut cx) {
+                    Poll::Ready(v) => return v,
+                    // リング無し環境では offload は同期実行のため Pending にならない
+                    Poll::Pending => std::thread::yield_now(),
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let data = vec![0xABu8; 4096];
+        let path = block_on(disk_buffer::write_to_disk(
+            dir.path(),
+            b"rt-key",
+            data.clone(),
+        ))
+        .unwrap();
+        assert!(path.exists());
+
+        let read = block_on(disk_buffer::read_from_disk(&path)).unwrap();
+        assert_eq!(read, data);
+
+        block_on(disk_buffer::remove_disk_buffer(&path)).unwrap();
+        assert!(!path.exists());
     }
 }
