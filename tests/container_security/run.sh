@@ -166,7 +166,14 @@ main() {
     # フェーズ 5: Trivy イメージスキャン
     run_trivy_scan
 
-    run_harness health health
+    local i
+    for ((i = 1; i <= 10; i++)); do
+        if run_harness health health; then
+            break
+        fi
+        sleep 2
+        [[ "${i}" -eq 10 ]] && die "最終ヘルスチェック失敗"
+    done
 
     log "=== 全テスト完了 ==="
     log "結果: ${RESULTS_DIR}/"

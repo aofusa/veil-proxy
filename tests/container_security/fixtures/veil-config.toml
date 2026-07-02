@@ -20,7 +20,19 @@ enable_seccomp = true
 enable_landlock = true
 enable_sandbox = false
 seccomp_mode = "filter"
-landlock_read_paths = ["/var/www", "/var/cache/veil", "/var/tmp/veil"]
+# Proxy 上流（Toxiproxy）への DNS 解決に /etc/resolv.conf・NSS ライブラリが必要
+landlock_read_paths = [
+  "/var/www",
+  "/var/cache/veil",
+  "/var/tmp/veil",
+  "/etc/veil",
+  "/etc/resolv.conf",
+  "/etc/hosts",
+  "/etc/nsswitch.conf",
+  "/lib",
+  "/lib64",
+  "/usr",
+]
 landlock_write_paths = ["/var/cache/veil", "/var/tmp/veil"]
 
 [performance]
