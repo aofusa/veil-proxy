@@ -7,7 +7,6 @@
 //! - Linux kernel docs: Documentation/block/io-uring.rst
 //! - man io_uring_setup(2), io_uring_enter(2), io_uring_register(2)
 
-#![allow(dead_code)]
 
 use std::io;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -314,6 +313,10 @@ pub struct IoUring {
     sq_tail: *mut AtomicU32,
     sq_ring_mask: *const u32,
     sq_ring_entries: *const u32,
+    // カーネルと共有する SQ フラグ領域（IORING_SQ_NEED_WAKEUP 等）。現在は SQPOLL 未使用の
+    // ため読まないが、mmap レイアウトの完全なマッピングとして保持する（削除するとレイアウト
+    // 導出コードの対応関係が崩れ、将来 SQPOLL 対応時の再導出が必要になる）。
+    #[allow(dead_code)]
     sq_flags: *mut u32,
     sq_array: *mut u32,
 
@@ -327,6 +330,9 @@ pub struct IoUring {
     cq_head: *mut AtomicU32,
     cq_tail: *const AtomicU32,
     cq_ring_mask: *const u32,
+    // CQ リングエントリ数。CQ オーバーフロー検査（将来対応）用に mmap レイアウトの
+    // 完全なマッピングとして保持する（sq_flags と同趣旨）。
+    #[allow(dead_code)]
     cq_ring_entries: *const u32,
     cqes_ptr: *mut IoUringCqe,
 }

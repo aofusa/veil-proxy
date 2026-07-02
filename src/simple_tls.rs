@@ -3,7 +3,6 @@
 //! kTLS 無効時に使用される、rustls を直接使用した TLS ストリーム実装。
 //! monoio の AsyncReadRent/AsyncWriteRent を実装します.
 
-#![allow(dead_code)]
 
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -484,7 +483,7 @@ impl crate::runtime::io::AsyncReadRent for SimpleTlsServerStream {
 
     async fn readv<T: IoVecBufMut>(
         &mut self,
-        mut buf: T,
+        buf: T,
     ) -> crate::runtime::io::BufResult<usize, T> {
         // IoVec stub のため未サポート
         (
@@ -640,7 +639,7 @@ impl crate::runtime::io::AsyncReadRent for SimpleTlsClientStream {
 
     async fn readv<T: IoVecBufMut>(
         &mut self,
-        mut buf: T,
+        buf: T,
     ) -> crate::runtime::io::BufResult<usize, T> {
         // IoVec stub のため未サポート
         (

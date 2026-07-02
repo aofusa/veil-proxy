@@ -3,7 +3,6 @@
 //! monoio の `AsyncReadRent` / `AsyncWriteRentExt` に相当するトレイトを自前定義する。
 //! 所有権ベースの I/O モデルを維持しつつ、monoio への依存を排除する。
 
-#![allow(dead_code)]
 
 use super::buf::{IoBuf, IoBufMut};
 use std::io;
@@ -78,6 +77,10 @@ pub trait AsyncWriteRent {
 }
 
 /// AsyncWriteRent の拡張メソッド（monoio::io::AsyncWriteRentExt 互換）
+///
+/// バイナリクレート内部専用のトレイトのため、auto trait 境界（Send 等）を
+/// 呼び出し側で指定する必要がなく、`async fn` のままで問題ない。
+#[allow(async_fn_in_trait)]
 pub trait AsyncWriteRentExt: AsyncWriteRent {
     /// バッファを全て書き込む（ループで write を呼ぶ）
     async fn write_all<T: IoBuf>(&mut self, buf: T) -> BufResult<usize, T> {
@@ -209,7 +212,6 @@ impl File {
 
 impl std::os::unix::io::AsRawFd for File {
     fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
-        use std::os::unix::io::AsRawFd;
         self.inner.as_raw_fd()
     }
 }

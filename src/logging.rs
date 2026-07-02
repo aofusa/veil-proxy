@@ -480,6 +480,8 @@ pub(crate) fn log_ktls_status(ktls_config: &crate::KtlsConfig) {
 /// access-log が有効な場合: 構造化ログ（JSON/テキスト）をログスレッドへ送信。
 ///   テキスト形式の info!() は出力しない（二重出力防止）。
 /// access-log が無効な場合: ftlog 経由のテキスト形式のみ出力。
+// client_ip / upstream は構造化ログ（access-log feature）でのみ使用する
+#[cfg_attr(not(feature = "access-log"), allow(unused_variables))]
 pub(crate) fn log_access(
     method: &[u8],
     host: &[u8],

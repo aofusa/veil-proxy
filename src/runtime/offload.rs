@@ -20,7 +20,6 @@
 //!   eventfd を叩くため取りこぼしは無い。
 //! - リング未初期化（単体テスト等）では同期インライン実行にフォールバックする。
 
-#![allow(dead_code)]
 
 use std::cell::Cell;
 use std::collections::VecDeque;

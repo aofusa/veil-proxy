@@ -31,7 +31,7 @@ A high-performance reverse proxy server using io_uring (custom runtime) and rust
 - **Load Balancing**: Request distribution to multiple backends (Round Robin/Least Connections/IP Hash/Weighted/Consistent Hash)
 - **Health Check**: Automatic failover with HTTP/TCP/gRPC active health checks (HTTP with status code validation, TCP connect-only, gRPC Health Checking Protocol)
 - **L4 Stream Proxy**: TCP-level load balancing with Round Robin/LeastConn, TLS passthrough, zero-copy `splice(2)` kernel forwarding (no userspace buffer), connection limiting (requires `l4-proxy` feature)
-- **Circuit Breaker & Retry**: Per-server circuit breaker (Closed→Open→HalfOpen), outlier detection/ejection, EWMA latency tracking (requires `metrics` feature)
+- **Circuit Breaker**: Per-server circuit breaker (Closed→Open→HalfOpen), outlier detection/ejection, EWMA latency tracking (requires `metrics` feature; request retry is not implemented)
 - **Proxy Cache**: Memory and disk-based response caching (ETag/304, stale-while-revalidate, stale-if-error)
 - **Cache Purge Admin API**: Cache invalidation via HTTP (`PURGE` method or `POST /__admin/cache/purge`) with exact/prefix/glob/all modes and Bearer token auth
 - **Buffering Control**: Response buffering to prevent slow clients from blocking backends (Streaming/Full/Adaptive modes)

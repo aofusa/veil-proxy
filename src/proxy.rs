@@ -8,10 +8,11 @@ use std::sync::Arc;
 
 use crate::runtime::buf::{IoBuf, IoBufMut};
 use crate::runtime::io::OpenOptions;
-use crate::runtime::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, IoVecBuf, IoVecBufMut};
+use crate::runtime::io::{AsyncReadRent, AsyncWriteRentExt, IoVecBuf, IoVecBufMut};
 use crate::runtime::tcp::TcpStream;
 use crate::runtime::time::timeout;
-use bytes::{Bytes, BytesMut};
+#[cfg(feature = "http2")]
+use bytes::Bytes;
 use ftlog::{debug, error, info, warn};
 use httparse::{Request, Status};
 use std::io;

@@ -27,8 +27,6 @@
 //! - `modprobe tls` でカーネルモジュールをロード
 //! - AES-GCM 暗号スイート
 
-// 将来の拡張用に残している未使用コードの警告を抑制
-#![allow(dead_code)]
 
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -1495,13 +1493,6 @@ pub fn client_config(enable_ktls: bool) -> Arc<ClientConfig> {
     }
 
     Arc::new(config)
-}
-
-/// デフォルトのクライアント TLS 設定を作成（kTLS 無効）
-///
-/// 後方互換性のためのラッパー関数
-pub fn default_client_config() -> Arc<ClientConfig> {
-    client_config(false)
 }
 
 /// 証明書検証をスキップするカスタム検証器（テスト/自己署名証明書用）

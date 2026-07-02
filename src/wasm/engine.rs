@@ -18,10 +18,10 @@ use super::types::{FilterAction, LocalResponse, WasmConfig};
 // スレッドローカルインスタンスプール
 // ====================
 
-/// スレッドローカルモジュールキャッシュ
-///
-/// 各ワーカースレッドがモジュール名 → Arc<LoadedModule> のマップを保持する。
-/// これによりホットパスでの Arc クローン・HashMap ルックアップを局所化する。
+// スレッドローカルモジュールキャッシュ
+//
+// 各ワーカースレッドがモジュール名 → Arc<LoadedModule> のマップを保持する。
+// これによりホットパスでの Arc クローン・HashMap ルックアップを局所化する。
 thread_local! {
     static MODULE_CACHE: RefCell<HashMap<String, Arc<LoadedModule>>> = RefCell::new(HashMap::new());
 }

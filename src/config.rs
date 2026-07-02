@@ -5771,7 +5771,6 @@ pub fn load_backend(
 /// ポートはHETTPS_REDIRECT_PORT（[server].listenから抽出）を使用し、
 /// 443の場合はURL中のポート指定を省略します。
 pub async fn handle_http_redirect(mut stream: TcpStream) {
-    use crate::runtime::io::AsyncReadRent;
     // リクエストを読み取るためのバッファ（ヘッダーのみなので小さめ）
     let mut buffer = vec![0u8; 4096];
 

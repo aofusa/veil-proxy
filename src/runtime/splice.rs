@@ -12,7 +12,6 @@
 //! `readable()` / `writable()`（io_uring `POLL_ADD`）で待機してから再試行する。これにより
 //! アイドル接続が io_uring の非同期ワーカーを占有しない（POLL_ADD のみ登録される）。
 
-#![allow(dead_code)]
 
 use std::future::Future;
 use std::io;

@@ -10,7 +10,6 @@
 //! - `readable()` / `writable()` は POLL_ADD を使用して準備完了を待つ
 //! - ノンブロッキングソケットを使用し、libc::read/write と組み合わせて使用可能
 
-#![allow(dead_code)]
 
 use std::future::Future;
 use std::io;
