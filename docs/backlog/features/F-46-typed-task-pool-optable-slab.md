@@ -19,6 +19,11 @@
 - spawn / op 発行のホットパスからハッシュルックアップと `Box::new` が消える。
 - 全 E2E（features full）が通過し、ストレステストで UAF / 二重 poll が発生しない（B-07 回帰確認）。
 
+## 調査メモ（2026-07-02）
+
+- `runtime::spawn` の `Box<dyn Future>` 利用箇所と OP_TABLE（Fibonacci ハッシュ HashMap、F-37 済み）を確認。detach ガード（B-07 の UAF 対策）が user_data キーの意味論に依存しており、slot+generation パックへの移行は detach/cancel 経路の全面書き換えを伴う。
+- UAF 直結領域のため、専用の設計レビューとストレステスト（B-07 回帰）を伴う独立フェーズとして継続する。
+
 ## 依存・リスク
 
 - 汎用 `spawn(future)` API が失われ拡張性が落ちる（設計哲学上は許容）。
