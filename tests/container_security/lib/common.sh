@@ -100,6 +100,9 @@ run_harness() {
         -e "VEIL_HTTP_PORT=80" \
         -e "VEIL_HTTPS_PORT=443" \
         -e "VEIL_H2C_PORT=8443" \
+        -e "H2SPEC_FULL=${H2SPEC_FULL:-0}" \
+        -e "H2SPEC_STRICT=${H2SPEC_STRICT:-0}" \
+        -e "H2SPEC_TIMEOUT=${H2SPEC_TIMEOUT:-30}" \
         -e "PHASE=${phase}" \
         -v "${RESULTS_DIR}:/results:rw" \
         "${HARNESS_IMAGE}" \
