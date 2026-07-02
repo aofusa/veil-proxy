@@ -119,7 +119,7 @@
 | B-09 | P1 | 完了 | [bugs/B-09-l4-forward-writes-full-buffer.md](bugs/B-09-l4-forward-writes-full-buffer.md) | L4 forward_direction が読み取り n バイトでなくバッファ全長(64KB)を送信し転送破損（TLS パススルー不成立）。F-30 の L4 E2E 追加で発覚 → set_len(n) で修正 |
 | B-10 | P2 | 完了 | [bugs/B-10-e2e-parallel-shared-state-flaky.md](bugs/B-10-e2e-parallel-shared-state-flaky.md) | E2E 並列実行でロードバランシング系テストが共有 Round Robin ステートと干渉しフレーキー化（専用プール `/rr-test/` へ隔離。cache/revalidation の単体テスト直列化も実施） |
 | B-11 | P3 | 未着手 | [bugs/B-11-expect-100-continue-intermittent-hang.md](bugs/B-11-expect-100-continue-intermittent-hang.md) | Expect: 100-continue の POST が間欠的にハング（高負荷時のみ。無負荷では 30/30 成功。優先度は判断により最下位へ） |
-| B-12 | P3 | 進行中 | [bugs/B-12-http3-request-body-streaming-stall.md](bugs/B-12-http3-request-body-streaming-stall.md) | HTTP/3 リクエストボディストリーミングが間欠的にストール。バックエンドタスクの逐次処理デッドロックは並行化で修正済み、別の根本原因が残存（優先度は判断により最下位へ） |
+| B-12 | P3 | 完了 | [bugs/B-12-http3-request-body-streaming-stall.md](bugs/B-12-http3-request-body-streaming-stall.md) | HTTP/3 リクエストボディストリーミングが間欠的にストール。根本原因は h3 クライアントの fin 直前 GREASE フレーム × 「h3.poll をパケット受信時のみ実行」の組み合わせで Finished イベントが永久滞留する設計バグ → poll を毎イテレーション実行 + pump に stream_finished 直接確認で修正（20 回連続成功） |
 
 ---
 

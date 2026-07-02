@@ -2002,6 +2002,16 @@ fn drive_request_pump(
         }
     }
 
+    // B-12: fin を含む最終データを本 pump の `recv_body`（`h3.poll()` の外）で消費した場合、
+    // h3 の `Finished` イベントは内部キューに積まれるが、`poll` はパケット受信時にしか
+    // 呼ばれないため、クライアントが送信を終えると新規パケットが来ず永久に取り出されない
+    // （EOF 未伝播 → バックエンドタスクが待機 → レスポンス無し → QUIC アイドルタイムアウト）。
+    // トランスポート層の `stream_finished`（fin 受信済みかつ全データ消費済み）を直接確認して
+    // EOF を伝播する。
+    if !ps.req_eof_seen && conn.stream_finished(stream_id) {
+        ps.req_eof_seen = true;
+    }
+
     // 3. クライアント END_STREAM 受信かつ全消化なら送信端を閉じて EOF 伝播。
     if ps.req_eof_seen && ps.req_pending.is_empty() && !ps.req_readable {
         ps.req_tx = None;
@@ -3057,32 +3067,41 @@ pub async fn run_http3_server_async(
             // ハンドシェイクパケット送信（H3初期化前に送信することでCryptoFail回避）
             // recv()後、is_established()がtrueになる前にServer Helloを送信する必要がある
             send_pending_packets(&connections, &socket, local_addr).await;
+        }
 
-            // H3初期化とイベント処理（ハンドシェイクパケット送信後）
-            {
-                let mut conns = connections.borrow_mut();
-                for (_, handler) in conns.iter_mut() {
-                    // HTTP/3 初期化
-                    if handler.h3_conn.is_none() && handler.conn.is_established() {
-                        debug!("[HTTP/3] Connection established, initializing H3");
-                    }
-                    if let Err(e) = handler.init_h3() {
-                        warn!("[HTTP/3] init_h3 error: {}", e);
-                    }
+        // H3初期化とイベント処理（B-12: パケット受信時だけでなく**毎イテレーション**実行する）。
+        //
+        // `drive_proxy_streams` の `recv_body`（`h3.poll()` の外）がストリームを進めると、
+        // h3 イベントは poll でしか取り出せない形で滞留する。具体例（B-12 のハング）:
+        // h3 クライアント（hyperium h3）は fin 直前に GREASE フレームを送るため、pump の
+        // `recv_body` が最終 DATA を消費してもフレームペイロードが未読で残り
+        // （非 DATA フレームの消費は poll 専用）、`Finished` も生成されない。クライアントは
+        // 送信完了後は無通信のため「パケット到着時のみ poll」だと永久に取り残され、
+        // EOF 未伝播 → レスポンス無し → QUIC アイドルタイムアウトの双方向デッドロックに陥る。
+        // poll はイベントが無ければ即 `Done` を返すだけで安価なので、毎イテレーション呼ぶ。
+        {
+            let mut conns = connections.borrow_mut();
+            for (_, handler) in conns.iter_mut() {
+                // HTTP/3 初期化
+                if handler.h3_conn.is_none() && handler.conn.is_established() {
+                    debug!("[HTTP/3] Connection established, initializing H3");
+                }
+                if let Err(e) = handler.init_h3() {
+                    warn!("[HTTP/3] init_h3 error: {}", e);
+                }
 
-                    // 書き込み可能なストリームを処理（quiche パターン）
-                    // 部分レスポンスを再送する
-                    if handler.h3_conn.is_some() {
-                        if let Err(e) = handler.handle_writable_streams() {
-                            warn!("[HTTP/3] handle_writable_streams error: {}", e);
-                        }
+                // 書き込み可能なストリームを処理（quiche パターン）
+                // 部分レスポンスを再送する
+                if handler.h3_conn.is_some() {
+                    if let Err(e) = handler.handle_writable_streams() {
+                        warn!("[HTTP/3] handle_writable_streams error: {}", e);
                     }
+                }
 
-                    // HTTP/3 イベント処理
-                    if handler.h3_conn.is_some() {
-                        if let Err(e) = handler.process_h3_events().await {
-                            warn!("[HTTP/3] process_h3_events error: {}", e);
-                        }
+                // HTTP/3 イベント処理
+                if handler.h3_conn.is_some() {
+                    if let Err(e) = handler.process_h3_events().await {
+                        warn!("[HTTP/3] process_h3_events error: {}", e);
                     }
                 }
             }

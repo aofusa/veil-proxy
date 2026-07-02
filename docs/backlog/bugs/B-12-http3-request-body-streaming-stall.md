@@ -1,7 +1,7 @@
 # B-12: HTTP/3 リクエストボディストリーミングが間欠的にストールする
 
 - **優先度**: P3（ユーザー判断で優先度を最下位へ変更。2026-07-02）
-- **対応状況**: 進行中（部分修正済み・根本原因の残りは未特定）
+- **対応状況**: 完了（2026-07-02 根本原因特定・修正。`test_http3_request_body_streaming` 20 回連続成功で受け入れ条件達成）
 - **発見**: 2026-07-02、features full E2E 実行中
 
 ## 事象
@@ -39,6 +39,24 @@ for i in $(seq 1 10); do cargo test --test e2e_tests --features full -- test_htt
 - quiche のフロー制御（stream/connection window）と `Notify` の待機条件をログで可視化し、ストール地点（クライアント→プロキシ受信 or プロキシ→バックエンド送信）を特定する。
 - `select_biased!` の分岐で readable 通知が失われるケース（通知消費とデータ残存の競合）を確認する。
 
+## 根本原因と修正（2026-07-02 完了）
+
+quiche trace ログ + 計測ログで fin パケット到着とアプリ側消費のタイムラインを突き合わせて特定した。
+
+**根本原因**: hyperium h3 クライアントは `finish()` 時（接続ごと初回）に **fin 直前へ GREASE フレーム**を送るため、リクエストストリーム末尾は `[DATA ペイロード][GREASE フレーム][fin]` になる。プロキシ側の `drive_request_pump` の `recv_body`（`h3.poll()` の外）は DATA ペイロードしか消費できず、**非 DATA フレームの消費と `Finished` イベントの取り出しは `h3.poll()` 専用**（quiche 内部で `polling=false` の経路は `State::FramePayload` で break する）。veil は `h3.poll()`（`process_h3_events`）を**パケット受信時にしか呼ばなかった**ため、
+
+1. pump が最終 DATA を消費 → GREASE ペイロードが未読で残る → 読み取りオフセット < fin オフセット → `stream_finished()` = false、`Finished` も生成されない
+2. クライアントは送信完了済みで以後無通信 → poll が二度と走らない
+3. EOF 未伝播 → バックエンドタスクが `req_body_rx.recv()` で永久待機 → レスポンス無し → 30 秒 QUIC アイドルタイムアウト
+
+間欠性の正体は「fin+GREASE を poll 内の Data 排出で消費したか、pump（poll 外）で消費したか」のパケット着弾タイミングのレース。
+
+**修正**（`src/http3_server.rs`）:
+
+1. **H3 初期化・イベント処理（`process_h3_events` = `h3.poll()`）をパケット受信時だけでなくメインループの毎イテテーション実行**に変更。pump が残した非 DATA フレームの消費と滞留 `Finished` の取り出しが、次の起床（バックエンドタスクの notify 等）で必ず行われる。poll はイベントが無ければ即 `Done` を返すだけで安価。
+2. `drive_request_pump` に **トランスポート層 `conn.stream_finished()` の直接確認**を追加（fin を pump の `recv_body` が消費したケースの即時 EOF 伝播。GREASE 無し = 同一接続 2 リクエスト目以降のケースを次の poll を待たず処理）。
+
 ## 受け入れ条件
 
 - `test_http3_request_body_streaming` を 20 回連続実行して全て数秒以内に成功する。
+  → **達成**（2026-07-02、20/20 成功・各 4〜8 秒（cargo 起動込み）・ハングなし。HTTP/3 E2E 全 30 テストも通過）
