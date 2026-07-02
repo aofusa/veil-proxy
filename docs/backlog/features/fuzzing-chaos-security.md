@@ -41,3 +41,35 @@
 ## リスク
 
 - CI 時間・フレーク。ファジングは並列ワーカーとタイムボックスが必須。
+
+---
+
+## 将来拡張（F-07 残件）
+
+[post-stability-containerization.md](post-stability-containerization.md)（F-14）で `docker/` 基盤が整備済み。以下はコンテナ運用（docker-compose / Kubernetes）を見据えた追加機能として backlog に残す。
+
+### 1. 設定のランタイム上書き
+
+| 手段 | 想定用途 |
+|------|----------|
+| **環境変数** | `VEIL_SERVER_LISTEN` 等、機密を含まないキーのオーバーライド。既存 TOML（serde）との優先順位を定義する。 |
+| **CLI 引数** | `-c` 以外に `--set key=value` 形式で起動時のみ上書き。検証（`-t`）経路にも反映する。 |
+
+- 受け入れ条件案: README / docker README に env・CLI の対応表。E2E（コンテナテスト）で代表キーが上書きされること。
+
+### 2. 証明書・秘密鍵の安全な受け渡し
+
+| 手段 | 想定用途 |
+|------|----------|
+| **ファイルマウント（read-only）** | 現行 `docker/assets/ssl/` + `-v ...:ro`（開発・単一ノード）。 |
+| **Docker secrets / K8s Secret** | ボリュームマウント `/run/secrets/tls-cert` 等。パスは env で `config.toml` の `cert_path` / `key_path` と整合。 |
+| **環境変数（PEM 本文）** | `VEIL_TLS_CERT_PEM` / `VEIL_TLS_KEY_PEM`（またはファイルパス）。起動時に tmpfs へ書き込まずメモリ上のみで保持する設計を検討。 |
+| **SIGHUP リロード** | シークレット差し替え後のゼロダウンタイム更新（F-03 連携）。 |
+
+- 受け入れ条件案: compose / K8s マニフェストのサンプル（参考実装）と、コンテナセキュリティテストで TLS ハンドシェイクが成立すること。
+
+---
+
+## 実施記録
+
+（テスト実施後に追記）
