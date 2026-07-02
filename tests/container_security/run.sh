@@ -9,6 +9,8 @@ source "${SCRIPT_DIR}/lib/common.sh"
 TRIVY_SEVERITY="${TRIVY_SEVERITY:-HIGH,CRITICAL}"
 SKIP_TRIVY="${SKIP_TRIVY:-0}"
 SKIP_H2SPEC="${SKIP_H2SPEC:-0}"
+H2SPEC_FULL="${H2SPEC_FULL:-0}"
+H2SPEC_STRICT="${H2SPEC_STRICT:-0}"
 
 validate_veil_image_security() {
     local report="${RESULTS_DIR}/image_security_report.txt"
