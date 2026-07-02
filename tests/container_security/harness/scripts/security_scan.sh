@@ -25,13 +25,13 @@ tls_check() {
     fi
 }
 
-# 許可メソッド外 POST が拒否されること（config: HEAD, GET のみ）
-# HTTP:80 は HTTPS へ 301 リダイレクトするため HTTPS で検証する。
+# 許可メソッド外 DELETE が拒否されること（config: HEAD, GET, POST）
+# h2spec 要件で POST は許可。HTTP:80 は 301 のため HTTPS で検証。
 method_restriction() {
     local code
-    code=$(curl -sk -o /dev/null -w "%{http_code}" -X POST --max-time 3 \
+    code=$(curl -sk -o /dev/null -w "%{http_code}" -X DELETE --max-time 3 \
         "https://${VEIL_HOST}:${VEIL_HTTPS_PORT}/" 2>/dev/null || echo "000")
-    log "post_method_code_https: ${code}"
+    log "delete_method_code_https: ${code}"
     case "${code}" in
         405|403|501) log "method_restriction: ok" ;;
         *)

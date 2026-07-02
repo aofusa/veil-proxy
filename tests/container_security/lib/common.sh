@@ -70,6 +70,8 @@ start_veil_container() {
     local seccomp_path="${DOCKER_DIR}/assets/security/seccomp.json"
     [[ -f "${seccomp_path}" ]] || die "seccomp プロファイルが見つかりません: ${seccomp_path}"
     [[ -f "${DOCKER_DIR}/assets/ssl/cert.pem" ]] || die "TLS 証明書が見つかりません。docker/README.md を参照して生成してください"
+    local test_config="${REPO_ROOT}/tests/container_security/fixtures/veil-config.toml"
+    [[ -f "${test_config}" ]] || die "テスト用設定が見つかりません: ${test_config}"
 
     log "Veil コンテナ起動: ${VEIL_CONTAINER} (${VEIL_IMAGE})"
     docker run -d \
@@ -79,7 +81,7 @@ start_veil_container() {
         --read-only \
         --tmpfs /var/cache/veil:rw,noexec,nosuid,uid=65532,gid=65532,size=512m \
         --tmpfs /var/tmp/veil:rw,noexec,nosuid,uid=65532,gid=65532,size=256m \
-        -v "${DOCKER_DIR}/assets/conf.d:/etc/veil/conf.d:ro" \
+        -v "${test_config}:/etc/veil/conf.d/config.toml:ro" \
         -v "${DOCKER_DIR}/assets/ssl:/etc/veil/ssl:ro" \
         -v "${DOCKER_DIR}/assets/www:/var/www:ro" \
         --security-opt "seccomp=${seccomp_path}" \
@@ -97,6 +99,7 @@ run_harness() {
         -e "VEIL_HOST=${VEIL_CONTAINER}" \
         -e "VEIL_HTTP_PORT=80" \
         -e "VEIL_HTTPS_PORT=443" \
+        -e "VEIL_H2C_PORT=8443" \
         -e "PHASE=${phase}" \
         -v "${RESULTS_DIR}:/results:rw" \
         "${HARNESS_IMAGE}" \

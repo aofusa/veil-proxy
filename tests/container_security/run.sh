@@ -8,6 +8,7 @@ source "${SCRIPT_DIR}/lib/common.sh"
 
 TRIVY_SEVERITY="${TRIVY_SEVERITY:-HIGH,CRITICAL}"
 SKIP_TRIVY="${SKIP_TRIVY:-0}"
+SKIP_H2SPEC="${SKIP_H2SPEC:-0}"
 
 validate_veil_image_security() {
     local report="${RESULTS_DIR}/image_security_report.txt"
@@ -93,17 +94,24 @@ main() {
     # フェーズ 1: ファジング
     run_harness fuzz fuzz
 
-    # フェーズ 2: カオス負荷（並行）+ SIGHUP
+    # フェーズ 2: h2spec（HTTP/2 準拠）
+    if [[ "${SKIP_H2SPEC}" != "1" ]]; then
+        run_harness h2spec h2spec
+    else
+        log "h2spec をスキップ (SKIP_H2SPEC=1)"
+    fi
+
+    # フェーズ 3: カオス負荷（並行）+ SIGHUP
     run_harness chaos chaos &
     local chaos_pid=$!
     sleep 3
     sighup_chaos || true
     wait "${chaos_pid}"
 
-    # フェーズ 3: セキュリティスキャン（TLS・メソッド制限等）
+    # フェーズ 4: セキュリティスキャン（TLS・メソッド制限等）
     run_harness security security
 
-    # フェーズ 4: コンテナイメージ脆弱性スキャン
+    # フェーズ 5: コンテナイメージ脆弱性スキャン
     run_trivy_scan
 
     # 最終ヘルスチェック

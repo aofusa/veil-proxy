@@ -1,0 +1,43 @@
+# container_security テスト用 Veil 設定（docker/assets/conf.d をベースに拡張）
+# h2spec 要件: GET/POST / が 200 + 非空ボディ。H2C 8443 で cleartext HTTP/2 も検証。
+
+[server]
+listen = "0.0.0.0:443"
+http = "0.0.0.0:80"
+http2_enabled = true
+h2c_enabled = true
+h2c_listen = "0.0.0.0:8443"
+threads = 0
+
+[logging]
+level = "info"
+
+[security]
+allow_security_failures = false
+drop_privileges_user = "nonroot"
+drop_privileges_group = "nonroot"
+enable_seccomp = true
+enable_landlock = true
+enable_sandbox = false
+seccomp_mode = "filter"
+landlock_read_paths = ["/var/www", "/var/cache/veil", "/var/tmp/veil"]
+landlock_write_paths = ["/var/cache/veil", "/var/tmp/veil"]
+
+[performance]
+huge_pages_enabled = false
+reuseport_balancing = "cbpf"
+
+[tls]
+cert_path = "/etc/veil/ssl/cert.pem"
+key_path = "/etc/veil/ssl/key.pem"
+ktls_enabled = true
+ktls_fallback_enabled = true
+
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "/var/www/"
+[route.security]
+allowed_methods = ["HEAD", "GET", "POST"]

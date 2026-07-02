@@ -17,9 +17,13 @@ run_phase() {
         security)
             exec /scripts/security_scan.sh
             ;;
+        h2spec)
+            exec /scripts/h2spec_run.sh
+            ;;
         all)
             /scripts/health_check.sh
             /scripts/fuzz_http.py
+            /scripts/h2spec_run.sh
             /scripts/chaos_load.sh
             /scripts/security_scan.sh
             ;;
