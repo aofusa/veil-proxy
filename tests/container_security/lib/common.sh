@@ -42,7 +42,7 @@ wait_veil_healthy() {
         if docker run --rm \
             --network "${NET_NAME}" \
             "${HARNESS_IMAGE}" \
-            /scripts/health_check.sh >/dev/null 2>&1; then
+            health >/dev/null 2>&1; then
             log "Veil が応答可能 (${i}/${attempts})"
             return 0
         fi
