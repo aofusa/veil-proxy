@@ -100,12 +100,33 @@ build_harness_image() {
         "${REPO_ROOT}/tests/container_security/harness"
 }
 
+prepare_veil_test_config() {
+    local src="${REPO_ROOT}/tests/container_security/fixtures/veil-config.toml"
+    local dst="${RESULTS_DIR}/veil-config.runtime.toml"
+    [[ -f "${src}" ]] || die "テスト用設定が見つかりません: ${src}"
+    mkdir -p "${RESULTS_DIR}"
+    cp "${src}" "${dst}"
+
+    # Landlock 下では glibc の NSS が /usr 配下を参照する。Docker DNS ホスト名は
+    # 起動時に IP へ置換して上流接続の安定性を確保する（F-53 Toxiproxy 経路）。
+    if docker inspect "${TOXIPROXY_CONTAINER}" >/dev/null 2>&1; then
+        local toxi_ip
+        toxi_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
+            "${TOXIPROXY_CONTAINER}" 2>/dev/null || true)
+        if [[ -n "${toxi_ip}" ]]; then
+            sed -i "s|http://veil-sec-toxiproxy:8480/|http://${toxi_ip}:8480/|g" "${dst}"
+            log "Toxiproxy 上流を IP 指定に設定: ${toxi_ip}:8480"
+        fi
+    fi
+    echo "${dst}"
+}
+
 start_veil_container() {
     local seccomp_path="${DOCKER_DIR}/assets/security/seccomp.json"
     [[ -f "${seccomp_path}" ]] || die "seccomp プロファイルが見つかりません: ${seccomp_path}"
     [[ -f "${DOCKER_DIR}/assets/ssl/cert.pem" ]] || die "TLS 証明書が見つかりません。docker/README.md を参照して生成してください"
-    local test_config="${REPO_ROOT}/tests/container_security/fixtures/veil-config.toml"
-    [[ -f "${test_config}" ]] || die "テスト用設定が見つかりません: ${test_config}"
+    local test_config
+    test_config="$(prepare_veil_test_config)"
 
     log "Veil コンテナ起動: ${VEIL_CONTAINER} (${VEIL_IMAGE})"
     docker run -d \
