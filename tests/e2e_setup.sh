@@ -338,6 +338,9 @@ cipher_suites = [
     "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
     "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
 ]
+# F-49: 証明書ホットリロード（SIGHUP 即時 + mtime 定期チェック）の E2E 検証用
+auto_reload = true
+reload_interval_secs = 60
 
 [logging]
 level = "debug"
@@ -1132,6 +1135,8 @@ start_servers() {
     log_info "Starting veil proxy..."
     VEIL_TLS_INSECURE=1 "${VEIL_BIN}" --config "${FIXTURES_DIR}/proxy.toml" > /tmp/proxy.log 2>&1 &
     echo $! >> "$PIDS_FILE"
+    # F-49: リロード E2E テストが SIGHUP を送るためのプロキシ PID ファイル
+    echo $! > "${FIXTURES_DIR}/proxy.pid"
     log_info "Proxy started on ports ${PROXY_HTTPS_PORT}/${PROXY_HTTP_PORT} (PID: $!)"
     
     # プロキシ起動待機（動的）

@@ -84,7 +84,7 @@
 | F-46 | P3 | 未着手 | [features/F-46-typed-task-pool-optable-slab.md](features/F-46-typed-task-pool-optable-slab.md) | executor の Box&lt;dyn Future&gt; 排除・OP_TABLE スラブ化（F-34 / F-37 残件） |
 | F-47 | P3 | 保留 | [features/F-47-xdp-ebpf-sandbox-env.md](features/F-47-xdp-ebpf-sandbox-env.md) | XDP/eBPF 隔離検証環境の構築とモジュール分離（F-35 残件、CAP_BPF / 対応 NIC の環境依存） |
 | F-48 | P3 | 未着手 | [features/F-48-proxy-wasm-benchmark-expansion.md](features/F-48-proxy-wasm-benchmark-expansion.md) | Proxy-Wasm ベンチマーク拡充（プール枯渇・fuel・RSS・HTTP コールあり、F-08 残件） |
-| F-49 | P1 | 未着手 | [features/F-49-reload-e2e-verification.md](features/F-49-reload-e2e-verification.md) | 設定ファイル・TLS 証明書リロードの正常性確認 E2E テスト |
+| F-49 | P1 | 完了 | [features/F-49-reload-e2e-verification.md](features/F-49-reload-e2e-verification.md) | 設定ファイル・TLS 証明書リロードの正常性確認 E2E テスト（SIGHUP 実送出でルート反映・不正設定フェイルセーフ・証明書差し替え/ゼロダウンタイムを検証） |
 | F-50 | P1 | 完了 | [features/F-50-tls-cipher-suites-config.md](features/F-50-tls-cipher-suites-config.md) | [tls] cipher_suites 設定（nginx 風の取捨選択・優先度指定。リロード経路にも伝搬、E2E でネゴシエーション検証） |
 | F-51 | P1 | 未着手 | [features/F-51-config-toml-sync.md](features/F-51-config-toml-sync.md) | config.toml を src/config.rs と完全同期（網羅・重複・抜け漏れ排除） |
 | F-11 | P3 | 未着手 | [features/dashboard.md](features/dashboard.md) | ダッシュボード機能 |
@@ -119,6 +119,7 @@
 | B-09 | P1 | 完了 | [bugs/B-09-l4-forward-writes-full-buffer.md](bugs/B-09-l4-forward-writes-full-buffer.md) | L4 forward_direction が読み取り n バイトでなくバッファ全長(64KB)を送信し転送破損（TLS パススルー不成立）。F-30 の L4 E2E 追加で発覚 → set_len(n) で修正 |
 | B-10 | P2 | 完了 | [bugs/B-10-e2e-parallel-shared-state-flaky.md](bugs/B-10-e2e-parallel-shared-state-flaky.md) | E2E 並列実行でロードバランシング系テストが共有 Round Robin ステートと干渉しフレーキー化（専用プール `/rr-test/` へ隔離。cache/revalidation の単体テスト直列化も実施） |
 | B-11 | P1 | 未着手 | [bugs/B-11-expect-100-continue-intermittent-hang.md](bugs/B-11-expect-100-continue-intermittent-hang.md) | Expect: 100-continue の POST が間欠的にハング（単独実行でも 1/5 再現、E2E フレーキーの真因） |
+| B-12 | P1 | 未着手 | [bugs/B-12-http3-request-body-streaming-stall.md](bugs/B-12-http3-request-body-streaming-stall.md) | HTTP/3 リクエストボディストリーミングが間欠的にストール（単独でも再現、60 秒タイムアウト） |
 
 ---
 

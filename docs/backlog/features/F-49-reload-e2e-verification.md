@@ -1,7 +1,17 @@
 # F-49: 設定ファイル・TLS 証明書リロードの正常性確認 E2E テスト
 
 - **優先度**: P1
-- **対応状況**: 未着手
+- **対応状況**: 完了（2026-07-02）
+
+## 完了メモ
+
+- `tests/e2e_setup.sh`: プロキシ PID を `fixtures/proxy.pid` に出力し、`[tls] auto_reload = true` を有効化（TLS リローダースレッドの起動条件）。
+- E2E テスト 3 件を追加（実プロセスへの SIGHUP 送出ベース、`RELOAD_TEST_LOCK` で直列化・終了時に原状復帰）:
+  - `test_config_reload_adds_route_via_sighup`: ルート追加 → SIGHUP → 新ルートがサービング開始 → 復元で消えることを確認。
+  - `test_config_reload_invalid_config_keeps_serving`: 壊れた TOML → SIGHUP → 旧設定でサービング継続。
+  - `test_tls_cert_reload_via_sighup`: 証明書差し替え → SIGHUP → 新規ハンドシェイクが新証明書を観測、リロード中もリクエスト成功（ゼロダウンタイム、F-03 回帰確認）、復元も検証。
+- 既存のリロード系 E2E（`test_graceful_reload*` 等）は「プロセス管理が必要」というスタブだったギャップを解消。
+- features full E2E 402 通過。リロード機構自体のバグは検出されず。調査過程で発見した別件の間欠バグは [B-11](../bugs/B-11-expect-100-continue-intermittent-hang.md) / [B-12](../bugs/B-12-http3-request-body-streaming-stall.md) として起票。
 - **出典**: ユーザー要求（リロード処理が正しく実装・動作していることの E2E 検証）
 
 ## 機能説明・現状

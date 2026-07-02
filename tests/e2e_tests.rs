@@ -16830,3 +16830,288 @@ async fn test_tls_cipher_suites_rejects_excluded_suite() {
         result
     );
 }
+
+// ====================
+// 設定・証明書リロードの正常性確認テスト（F-49）
+// ====================
+//
+// e2e_setup.sh が起動したプロキシプロセスへ実際に SIGHUP を送り、
+// - 設定ホットリロード（ルート追加が反映される）
+// - 不正設定時のフェイルセーフ（旧設定でサービング継続）
+// - TLS 証明書ホットリロード（新規ハンドシェイクが新証明書を観測、リロード中も無停止）
+// を検証する。proxy.toml / 証明書はスイート共有のため、変更は追加的（他テストへ無影響）にし、
+// テスト間の直列化と終了時の原状復帰を行う。
+
+/// リロード系テストの直列化ロック（proxy.toml / 証明書ファイルを共有するため）
+static RELOAD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn fixtures_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+}
+
+/// e2e_setup.sh が書き出したプロキシの PID を読む
+fn proxy_pid() -> Option<i32> {
+    std::fs::read_to_string(fixtures_dir().join("proxy.pid"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// プロキシへ SIGHUP を送る（設定 + TLS 証明書リロードのトリガー）
+fn send_sighup(pid: i32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-HUP", &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// TLS ハンドシェイクを行い、サーバ証明書（リーフ）の DER を返す
+fn get_server_cert_der(port: u16) -> Result<Vec<u8>, String> {
+    init_crypto_provider();
+    let config = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+        .with_no_client_auth();
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let mut conn = ClientConnection::new(Arc::new(config), server_name)
+        .map_err(|e| format!("client conn error: {e}"))?;
+    let mut sock = std::net::TcpStream::connect(("127.0.0.1", port))
+        .map_err(|e| format!("connect error: {e}"))?;
+    sock.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .ok();
+    while conn.is_handshaking() {
+        conn.complete_io(&mut sock)
+            .map_err(|e| format!("handshake error: {e}"))?;
+    }
+    conn.peer_certificates()
+        .and_then(|certs| certs.first())
+        .map(|c| c.as_ref().to_vec())
+        .ok_or_else(|| "no peer certificate".to_string())
+}
+
+/// 設定リロード: ルート追加が SIGHUP 後に反映される
+#[tokio::test]
+#[ntest::timeout(60000)]
+async fn test_config_reload_adds_route_via_sighup() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let _guard = RELOAD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let pid = match proxy_pid() {
+        Some(p) => p,
+        None => {
+            eprintln!("Skipping test: proxy.pid not found (old e2e environment)");
+            return;
+        }
+    };
+    let proxy_toml = fixtures_dir().join("proxy.toml");
+    let original = std::fs::read_to_string(&proxy_toml).expect("read proxy.toml");
+
+    // リロード前: 専用パスはルートされない（バックエンドの 404 ではなくプロキシの 404）
+    let before = send_request(PROXY_PORT, "/reload-added-route/", &[]).await;
+    if let Some(resp) = &before {
+        assert_ne!(
+            get_status_code(resp),
+            Some(200),
+            "route must not exist before reload"
+        );
+    }
+
+    // ルートを追加して SIGHUP
+    // File アクションは「ディレクトリ + リクエストパス」でファイルを解決するため、
+    // /reload-added-route/index.html に対応する実ファイルを用意する。
+    let serve_dir = fixtures_dir().join("backend1");
+    let route_file_dir = serve_dir.join("reload-added-route");
+    std::fs::create_dir_all(&route_file_dir).expect("create route dir");
+    std::fs::write(
+        route_file_dir.join("index.html"),
+        "<h1>Reload Added Route</h1>",
+    )
+    .expect("write route index");
+    let added = format!(
+        r#"
+
+# F-49 reload test (temporary route)
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/reload-added-route/*"
+[route.action]
+type = "File"
+path = "{dir}"
+index = "index.html"
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/reload-added-route/*"
+[route.action]
+type = "File"
+path = "{dir}"
+index = "index.html"
+"#,
+        dir = serve_dir.display()
+    );
+    std::fs::write(&proxy_toml, format!("{original}{added}")).expect("write proxy.toml");
+    assert!(send_sighup(pid), "SIGHUP must be delivered");
+
+    // リロードスレッドは 500ms 周期。反映をポーリングで確認（最大 10 秒）
+    let mut reloaded = false;
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if let Some(resp) = send_request(PROXY_PORT, "/reload-added-route/", &[]).await {
+            if get_status_code(&resp) == Some(200) {
+                reloaded = true;
+                break;
+            }
+        }
+    }
+
+    // 原状復帰（追加ルート・作成ファイルを削除して再リロード）
+    std::fs::write(&proxy_toml, &original).expect("restore proxy.toml");
+    let _ = std::fs::remove_dir_all(&route_file_dir);
+    send_sighup(pid);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    assert!(
+        reloaded,
+        "added route must start serving after SIGHUP reload"
+    );
+
+    // 復帰確認: 専用パスが再び未ルートに戻る
+    let mut restored = false;
+    for _ in 0..10 {
+        if let Some(resp) = send_request(PROXY_PORT, "/reload-added-route/", &[]).await {
+            if get_status_code(&resp) != Some(200) {
+                restored = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(restored, "route must disappear after restoring config");
+}
+
+/// 不正な設定でのリロードは拒否され、旧設定でサービングが継続する
+#[tokio::test]
+#[ntest::timeout(60000)]
+async fn test_config_reload_invalid_config_keeps_serving() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let _guard = RELOAD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let pid = match proxy_pid() {
+        Some(p) => p,
+        None => {
+            eprintln!("Skipping test: proxy.pid not found (old e2e environment)");
+            return;
+        }
+    };
+    let proxy_toml = fixtures_dir().join("proxy.toml");
+    let original = std::fs::read_to_string(&proxy_toml).expect("read proxy.toml");
+
+    // 壊れた TOML を書いて SIGHUP
+    std::fs::write(&proxy_toml, "this is [not valid toml =").expect("write broken toml");
+    assert!(send_sighup(pid), "SIGHUP must be delivered");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // 旧設定で引き続きサービングされる
+    let resp = send_request_with_retry(PROXY_PORT, "/", &[], 3).await;
+
+    // 原状復帰
+    std::fs::write(&proxy_toml, &original).expect("restore proxy.toml");
+    send_sighup(pid);
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    let resp = resp.expect("proxy must keep serving with old config after invalid reload");
+    assert_eq!(
+        get_status_code(&resp),
+        Some(200),
+        "old config must remain active after invalid reload"
+    );
+}
+
+/// TLS 証明書リロード: SIGHUP 後の新規ハンドシェイクが新証明書を観測し、
+/// リロード中もリクエストが途切れない（ゼロダウンタイム、F-03 回帰確認）
+#[tokio::test]
+#[ntest::timeout(60000)]
+async fn test_tls_cert_reload_via_sighup() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let _guard = RELOAD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let pid = match proxy_pid() {
+        Some(p) => p,
+        None => {
+            eprintln!("Skipping test: proxy.pid not found (old e2e environment)");
+            return;
+        }
+    };
+    let cert_path = fixtures_dir().join("cert.pem");
+    let key_path = fixtures_dir().join("key.pem");
+    let original_cert = std::fs::read(&cert_path).expect("read cert.pem");
+    let original_key = std::fs::read(&key_path).expect("read key.pem");
+
+    let old_der = tokio::task::spawn_blocking(move || get_server_cert_der(PROXY_PORT))
+        .await
+        .unwrap()
+        .expect("handshake before reload");
+
+    // 新しい自己署名証明書（ECDSA）に差し替えて SIGHUP
+    let cert =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .expect("generate cert");
+    std::fs::write(&cert_path, cert.cert.pem()).expect("write new cert");
+    std::fs::write(&key_path, cert.signing_key.serialize_pem()).expect("write new key");
+    assert!(send_sighup(pid), "SIGHUP must be delivered");
+
+    // リロード反映をポーリング（最大 10 秒）。その間もリクエストが成功し続けること。
+    let mut new_der: Option<Vec<u8>> = None;
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // ゼロダウンタイム確認: リロード中の通常リクエストが成功する
+        let resp = send_request_with_retry(PROXY_PORT, "/", &[], 2).await;
+        assert!(
+            resp.is_some(),
+            "requests must keep succeeding during cert reload"
+        );
+
+        let der = tokio::task::spawn_blocking(move || get_server_cert_der(PROXY_PORT))
+            .await
+            .unwrap();
+        if let Ok(der) = der {
+            if der != old_der {
+                new_der = Some(der);
+                break;
+            }
+        }
+    }
+
+    // 原状復帰（元の証明書へ戻して再リロード）
+    std::fs::write(&cert_path, &original_cert).expect("restore cert");
+    std::fs::write(&key_path, &original_key).expect("restore key");
+    send_sighup(pid);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let new_der = new_der.expect("new handshakes must observe the reloaded certificate");
+    assert_ne!(new_der, old_der);
+
+    // 復帰確認
+    let restored_der = tokio::task::spawn_blocking(move || get_server_cert_der(PROXY_PORT))
+        .await
+        .unwrap()
+        .expect("handshake after restore");
+    assert_eq!(
+        restored_der, old_der,
+        "original certificate must be served after restore"
+    );
+}
