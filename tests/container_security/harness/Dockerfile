@@ -13,7 +13,7 @@ RUN apt-get update -y \
         python3 \
         python3-minimal \
     && curl -fsSL -o /tmp/h2spec.tar.gz \
-        "https://github.com/summerwind/h2spec/releases/download/v${H2SPEC_VERSION}/h2spec_${H2SPEC_VERSION}_linux_amd64.tar.gz" \
+        "https://github.com/summerwind/h2spec/releases/download/v${H2SPEC_VERSION}/h2spec_linux_amd64.tar.gz" \
     && tar -xzf /tmp/h2spec.tar.gz -C /usr/local/bin h2spec \
     && chmod +x /usr/local/bin/h2spec \
     && rm -f /tmp/h2spec.tar.gz \
