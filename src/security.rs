@@ -2605,7 +2605,11 @@ mod tests {
                 )
             };
             if exec_map == libc::MAP_FAILED {
-                if unsafe { *libc::__errno_location() } == libc::EPERM {
+                let errno = unsafe { *libc::__errno_location() };
+                // musl は匿名 mmap のカーネル EPERM を ENOMEM に変換する (src/mman/mmap.c)。
+                let exec_denied = errno == libc::EPERM
+                    || (cfg!(target_env = "musl") && errno == libc::ENOMEM);
+                if exec_denied {
                     bits |= 2;
                 }
             } else {
