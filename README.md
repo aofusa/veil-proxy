@@ -305,6 +305,9 @@ The following table lists default values for major configuration options:
 | `[tls]` | `ktls_enabled` | `false` | Enable kTLS |
 | `[tls]` | `ktls_fallback_enabled` | `true` | kTLS fallback to rustls |
 | `[tls]` | `tcp_cork_enabled` | `true` | Enable TCP_CORK |
+| `[tls]` | `cipher_suites` | `[]` (rustls default) | Allowed TLS cipher suites (like nginx `ssl_ciphers`; listed order = server preference; unknown names fail at startup; see config.toml) |
+| `[tls]` | `auto_reload` | `false` | Certificate hot reload (mtime detection + SIGHUP) |
+| `[tls]` | `reload_interval_secs` | `60` | Certificate change check interval (seconds) |
 | `[buffer_pool]` | `read_buffer_size` | `65536` | Read buffer size (64KB) |
 | `[buffer_pool]` | `initial_read_buffers` | `32` | Initial read buffers |
 | `[buffer_pool]` | `max_read_buffers` | `128` | Max read buffers |

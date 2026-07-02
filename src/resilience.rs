@@ -2,7 +2,7 @@
 //!
 //! - サーキットブレーカー（Closed -> Open -> HalfOpen -> Closed）
 //! - スライディングウィンドウ（失敗率の計測）
-//! - リトライポリシー（設定は config.rs の RetryPolicy）
+//! - リトライポリシーは未実装（旧 RetryPolicy 構造体は dead code のため F-51 で削除）
 //! - パッシブ異常検知（Outlier Detection、config.rs の UpstreamServer で実装）
 //!
 //! データプレーン上で動作するため tokio に依存しない。

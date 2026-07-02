@@ -306,6 +306,9 @@ sudo setcap 'cap_net_bind_service=+ep' ./target/release/veil
 | `[tls]` | `ktls_enabled` | `false` | kTLSを有効化 |
 | `[tls]` | `ktls_fallback_enabled` | `true` | kTLS失敗時のrustlsフォールバック |
 | `[tls]` | `tcp_cork_enabled` | `true` | TCP_CORKを有効化 |
+| `[tls]` | `cipher_suites` | `[]`（rustls 既定） | 許可する TLS 暗号スイート（nginx の `ssl_ciphers` 相当。記載順 = サーバ優先度順。不正名は起動エラー。詳細は config.toml 参照） |
+| `[tls]` | `auto_reload` | `false` | 証明書の自動リロード（mtime 検知 + SIGHUP） |
+| `[tls]` | `reload_interval_secs` | `60` | 証明書変更チェック間隔（秒） |
 | `[buffer_pool]` | `read_buffer_size` | `65536` | 読み込みバッファサイズ（64KB） |
 | `[buffer_pool]` | `initial_read_buffers` | `32` | 読み込みバッファ初期数 |
 | `[buffer_pool]` | `max_read_buffers` | `128` | 読み込みバッファ最大数 |

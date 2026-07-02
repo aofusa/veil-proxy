@@ -903,98 +903,26 @@ connection_window_size = 16777216
 
 
 # ==========================================
-# gRPC 設定 (--features 'grpc')
+# gRPC (--features 'grpc')
 # ==========================================
 #
-# gRPC-over-HTTP/2 のサポートを有効化できます。
-# HTTP/3 上の gRPC は --features 'grpc-full' または
-# --features 'grpc,http3' でビルドする必要があります。
+# gRPC-over-HTTP/2 のサポートはビルド時の feature フラグで有効化します。
+# gRPC 専用の設定セクション（[grpc]）は存在しません。
+# gRPC / gRPC-Web の変換はリクエストの Content-Type
+# （application/grpc / application/grpc-web）から自動判定されます。
 #
 # ビルド方法:
 #   gRPC基本:     cargo build --features grpc
 #   gRPC-Web:     cargo build --features grpc-web
 #   gRPC全機能:   cargo build --features grpc-full
 #
-[grpc]
-# gRPC サポートを有効化（デフォルト: false）
-# enabled = true
-
-# デフォルトタイムアウト（ミリ秒）
-# grpc-timeout ヘッダーが指定されていない場合に使用
-# timeout_ms = 30000
-
-# 最大メッセージサイズ（バイト）
-# gRPC メッセージの最大サイズ制限
-# max_message_size = 4194304  # 4MB
-
-# 許可する圧縮エンコーディング
-# identity, gzip, deflate から選択
-# encodings = ["identity", "gzip"]
-
-# 圧縮レベル（1-9、高いほど圧縮率高・速度遅）
-# compression_level = 6
-
-# 圧縮を適用する最小メッセージサイズ
-# これより小さいメッセージは圧縮しない（オーバーヘッド削減）
-# min_compression_size = 1024
-
-# ------------------------------------------
-# gRPC-Web 設定 (--features 'grpc-web')
-# ------------------------------------------
-#
-# ブラウザ互換の gRPC-Web プロトコル変換を有効化します。
-# CORS 設定はルートごとに個別に設定できます。
-#
-# gRPC-Web とは:
-#   - ブラウザから gRPC サーバーにアクセスするためのプロトコル
-#   - HTTP/1.1 / HTTP/2 で動作
-#   - application/grpc-web Content-Type を使用
-#   - トレイラーをボディにエンコード
-#
-# [grpc.grpc_web]
-# # gRPC-Web サポートを有効化
-# enabled = true
-
-# ------------------------------------------
-# gRPC-Web CORS 設定（ルートごとの設定例）
-# ------------------------------------------
-#
-# 各ルートで grpc_web_cors セクションを使用して
-# CORS ポリシーを個別に設定できます。
-#
-# [route.grpc_web_cors]
-# # 許可するオリジン（"*" で全オリジン）
-# allowed_origins = ["https://app.example.com", "https://admin.example.com"]
-#
-# # 許可するヘッダー
-# allowed_headers = ["content-type", "x-grpc-web", "grpc-timeout"]
-#
-# # ブラウザがアクセスできるヘッダー
-# exposed_headers = ["grpc-status", "grpc-message"]
-#
-# # クレデンシャル（Cookie等）を許可
-# allow_credentials = true
-#
-# # プリフライトキャッシュ時間（秒）
-# max_age_secs = 86400
-
-# ------------------------------------------
-# gRPC バックエンド接続設定例
-# ------------------------------------------
-#
-# gRPC バックエンドへの接続は use_h2c = true で
-# HTTP/2 Cleartext（H2C）を使用します。
+# gRPC バックエンドへの接続はルートの use_h2c = true で
+# HTTP/2 Cleartext（H2C）を使用します:
 #
 # [route.action]
 # type = "Proxy"
 # url = "http://grpc-backend:50051"
 # use_h2c = true  # gRPC は H2C が必要
-#
-# # gRPC-Web CORS 設定（このルート専用）
-#   [route.grpc_web_cors]
-#   allowed_origins = ["*"]
-#   allowed_headers = ["content-type", "x-grpc-web", "grpc-timeout"]
-
 
 
 # ==========================================
@@ -1204,7 +1132,28 @@ connection_window_size = 16777216
 #   # レスポンスボディ操作（allow_body_manipulationの代替、必要に応じて）
 #   # allow_response_body_read = false
 #   # allow_response_body_write = false
-#   
+#
+#   # メトリクス操作（proxy_define_metric 等）
+#   # allow_metrics = false
+#
+#   # 共有データアクセス（proxy_get/set_shared_data）
+#   # allow_shared_data = false
+#
+#   # 共有データの最大サイズ（バイト、allow_shared_data = true 時）
+#   # max_shared_data_size = 1048576  # 1MB
+#
+#   # ローカルレスポンス送信（proxy_send_local_response。認証フィルタ等で使用）
+#   # allow_send_local_response = false
+#
+#   # 同時 HTTP コール数の上限（allow_http_calls = true 時）
+#   # max_http_calls = 10
+#
+#   # 読み取りを許可するプロパティパスのパターン（空 = 全許可）
+#   # allowed_properties = ["request.path", "request.method"]
+#
+#   # proxy_set_property によるカスタムプロパティ書き込みを許可
+#   # allow_property_write = false
+#
 #   # 注意: 以下のcapabilityは存在しません:
 #   # - allow_grpc_calls (現在未実装)
 #
@@ -1400,6 +1349,42 @@ allowed_methods = ["GET", "POST", "PUT"]
 max_request_body_size = 5_242_880
 backend_connect_timeout_secs = 5
 rate_limit_requests_per_min = 60
+
+# --- [route.security] のその他の設定キー（デフォルト値と説明） ---
+#
+# Chunked 転送時の累積最大ボディサイズ（バイト）
+# max_chunked_body_size = 10_485_760
+#
+# クライアントヘッダー受信タイムアウト（秒）
+# client_header_timeout_secs = 30
+#
+# クライアントボディ受信タイムアウト（秒）
+# client_body_timeout_secs = 30
+#
+# リクエストヘッダー最大サイズ（バイト）。超過時は 431 を返す
+# max_request_header_size = 16384
+#
+# バックエンド接続プール: ホストごとの最大アイドル接続数
+# max_idle_connections_per_host = 32
+#
+# バックエンド接続プール: アイドル接続の維持時間（秒）
+# idle_connection_timeout_secs = 60
+#
+# レスポンスから削除するヘッダー（クライアントへ返送前）
+# remove_response_headers = ["Server", "X-Powered-By"]
+#
+# WebSocket 転送のポーリングモード（"adaptive" | "fixed"）
+# adaptive: アイドル時にタイムアウトを指数的に伸ばして CPU を節約（デフォルト）
+# websocket_poll_mode = "adaptive"
+#
+# WebSocket adaptive ポーリングの初期タイムアウト（ミリ秒）
+# websocket_poll_timeout_ms = 1
+#
+# WebSocket adaptive ポーリングの最大タイムアウト（ミリ秒）
+# websocket_poll_max_timeout_ms = 100
+#
+# WebSocket adaptive ポーリングのバックオフ倍率
+# websocket_poll_backoff_multiplier = 2.0
 
 # ------------------------------------------
 # ルーティング条件の例（header, method, query, source_ip）
@@ -1841,6 +1826,7 @@ allowed_methods = ["GET", "POST"]
 #   tls: TLSモード（"none"（デフォルト）/ "passthrough" / "terminate"）
 #   max_connections: 最大同時接続数（0 = 無制限、デフォルト: 0）
 #   connect_timeout_secs: upstream接続タイムアウト秒数（デフォルト: 10）
+#   idle_timeout_secs: アイドルタイムアウト秒数。この時間データ転送がなければ接続を切断（デフォルト: 600）
 #   [[l4.upstreams]]: upstreamバックエンド一覧
 #     addr: バックエンドアドレス（"host:port"）
 #     weight: 重み（デフォルト: 1）
@@ -1856,6 +1842,7 @@ allowed_methods = ["GET", "POST"]
 # tls = "none"
 # max_connections = 200
 # connect_timeout_secs = 5
+# idle_timeout_secs = 600
 #
 #   [[l4.upstreams]]
 #   addr = "10.0.0.1:5432"

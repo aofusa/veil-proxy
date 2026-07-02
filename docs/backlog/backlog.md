@@ -86,7 +86,7 @@
 | F-48 | P3 | 未着手 | [features/F-48-proxy-wasm-benchmark-expansion.md](features/F-48-proxy-wasm-benchmark-expansion.md) | Proxy-Wasm ベンチマーク拡充（プール枯渇・fuel・RSS・HTTP コールあり、F-08 残件） |
 | F-49 | P1 | 完了 | [features/F-49-reload-e2e-verification.md](features/F-49-reload-e2e-verification.md) | 設定ファイル・TLS 証明書リロードの正常性確認 E2E テスト（SIGHUP 実送出でルート反映・不正設定フェイルセーフ・証明書差し替え/ゼロダウンタイムを検証） |
 | F-50 | P1 | 完了 | [features/F-50-tls-cipher-suites-config.md](features/F-50-tls-cipher-suites-config.md) | [tls] cipher_suites 設定（nginx 風の取捨選択・優先度指定。リロード経路にも伝搬、E2E でネゴシエーション検証） |
-| F-51 | P1 | 未着手 | [features/F-51-config-toml-sync.md](features/F-51-config-toml-sync.md) | config.toml を src/config.rs と完全同期（網羅・重複・抜け漏れ排除） |
+| F-51 | P1 | 完了 | [features/F-51-config-toml-sync.md](features/F-51-config-toml-sync.md) | config.toml を src/config.rs と完全同期（route.security/WASM capabilities 等 19 キー追記、stale な [grpc] セクションと dead な RetryPolicy を削除、同期保証テスト追加） |
 | F-11 | P3 | 未着手 | [features/dashboard.md](features/dashboard.md) | ダッシュボード機能 |
 | F-12 | P3 | 未着手 | [features/config-generator-webui.md](features/config-generator-webui.md) | config.toml ジェネレータ Web UI |
 | F-13 | P3 | 未着手 | [features/documentation-site.md](features/documentation-site.md) | 公式ドキュメントサイト |

@@ -2222,83 +2222,9 @@ fn default_outlier_max_eject_percent() -> u32 {
     50
 }
 
-/// リトライポリシー（F-06、ルート単位）
-#[derive(Deserialize, Clone, Debug)]
-pub struct RetryPolicy {
-    /// 有効化フラグ
-    #[serde(default)]
-    pub enabled: bool,
-    /// 最大リトライ回数
-    #[serde(default = "default_retry_max")]
-    pub max_retries: u32,
-    /// リトライ対象のステータスコード
-    #[serde(default = "default_retry_on")]
-    pub retry_on: Vec<u16>,
-    /// 冪等メソッド（GET/HEAD/PUT/DELETE）のみリトライするか
-    #[serde(default = "default_true")]
-    pub idempotent_only: bool,
-    /// 初回バックオフ（ミリ秒）
-    #[serde(default = "default_retry_backoff")]
-    pub backoff_ms: u64,
-    /// 最大バックオフ（ミリ秒）
-    #[serde(default = "default_retry_max_backoff")]
-    pub max_backoff_ms: u64,
-    /// バックオフ倍率
-    #[serde(default = "default_retry_multiplier")]
-    pub backoff_multiplier: f64,
-}
-
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            max_retries: default_retry_max(),
-            retry_on: default_retry_on(),
-            idempotent_only: true,
-            backoff_ms: default_retry_backoff(),
-            max_backoff_ms: default_retry_max_backoff(),
-            backoff_multiplier: default_retry_multiplier(),
-        }
-    }
-}
-
-fn default_retry_max() -> u32 {
-    2
-}
-fn default_retry_on() -> Vec<u16> {
-    vec![502, 503, 504]
-}
-fn default_retry_backoff() -> u64 {
-    100
-}
-fn default_retry_max_backoff() -> u64 {
-    1000
-}
-fn default_retry_multiplier() -> f64 {
-    2.0
-}
-
-impl RetryPolicy {
-    /// 指定リトライ回数（0始まり）でのバックオフ時間を計算
-    pub fn backoff_for(&self, attempt: u32) -> std::time::Duration {
-        let mult = self.backoff_multiplier.powi(attempt as i32);
-        let ms = (self.backoff_ms as f64 * mult).min(self.max_backoff_ms as f64);
-        std::time::Duration::from_millis(ms as u64)
-    }
-
-    /// HTTP メソッドが冪等かどうか
-    pub fn is_idempotent(method: &str) -> bool {
-        matches!(
-            method.to_ascii_uppercase().as_str(),
-            "GET" | "HEAD" | "PUT" | "DELETE" | "OPTIONS" | "TRACE"
-        )
-    }
-
-    /// このステータスコードでリトライすべきか
-    pub fn should_retry_status(&self, status: u16) -> bool {
-        self.enabled && self.retry_on.contains(&status)
-    }
-}
+// 注: リトライポリシー（RetryPolicy）は F-06 で構造体のみ定義されたが、リトライ機構
+// 本体が未実装でどこからも参照されない dead code だったため F-51 で削除した。
+// リトライを実装する際は resilience.rs と併せて再設計すること。
 
 /// ヘルスチェックの種別（F-22）
 #[derive(Deserialize, Clone, Debug, PartialEq)]
@@ -6855,5 +6781,52 @@ key_path = "/tmp/key.pem"
         // 不正なスイート名はエラー
         let bad = vec!["NOT_A_SUITE".to_string()];
         assert!(build_server_config_from_paths(&cert_path, &key_path, false, false, &bad).is_err());
+    }
+}
+
+// ====================
+// 同梱 config.toml の同期検証（F-51）
+// ====================
+
+#[cfg(test)]
+mod shipped_config_tests {
+    use super::*;
+
+    /// リポジトリ同梱の config.toml が常にパース・バリデーション可能であることを保証する。
+    ///
+    /// config.rs の設定構造とドキュメント（config.toml）の乖離を CI で検出する。
+    /// cert_path / key_path のプレースホルダーのみ、実在する自己署名証明書に差し替える。
+    #[test]
+    fn shipped_config_toml_parses_and_validates() {
+        let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.toml");
+        let content = std::fs::read_to_string(&shipped).expect("read shipped config.toml");
+
+        // プレースホルダー証明書を実在ファイルに差し替え
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
+
+        // File ルート例のプレースホルダー（/var/www/...）も実在ディレクトリへ差し替え
+        // （バリデーションはファイル/ディレクトリの実在を確認するため）
+        let www = dir.path().join("www");
+        for sub in ["assets", "user", "app", "docs"] {
+            std::fs::create_dir_all(www.join(sub)).unwrap();
+        }
+        std::fs::write(www.join("robots.txt"), "User-agent: *\n").unwrap();
+        std::fs::write(www.join("index.html"), "<html></html>").unwrap();
+
+        let content = content
+            .replace("/path/to/cert.pem", &cert_path.to_string_lossy())
+            .replace("/path/to/key.pem", &key_path.to_string_lossy())
+            .replace("/var/www", &www.to_string_lossy());
+
+        let test_path = dir.path().join("config.toml");
+        std::fs::write(&test_path, content).unwrap();
+
+        // nginx -t 相当の検証（TOML パース + バリデーション + 証明書存在確認）
+        test_config_file(&test_path).expect("shipped config.toml must parse and validate");
     }
 }
