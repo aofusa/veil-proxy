@@ -8002,10 +8002,13 @@ async fn transfer_exact_bytes_from_backend_with_cache(
 
 /// kTLS + splice によるボディ転送（Content-Length固定長のみ）
 ///
-/// FD間でsplice(2)を使用してゼロコピー転送を行います。
-/// 非ブロッキングソケットに対応し、WouldBlockの場合は待機します。
+/// `src → pipe → dst` の 2 段 splice を **io_uring（IORING_OP_SPLICE）の非同期 Future**
+/// で発行し、カーネル内ゼロコピー転送を行う（F-39）。同期 `libc::splice` は使用しない。
+/// データ/空きが無い場合は `WouldBlock` が返るため、`readable()` / `writable()`
+/// （POLL_ADD）で待機してから再試行する（L4 の `forward_direction_splice` と同方式）。
 ///
-/// splice(2) によるボディ転送（固定長）
+/// pipe に取り込んだ n バイトは dst のバックプレッシャに追従して**必ず全量ドレイン**
+/// してから次のチャンクへ進む（pipe 内残データと `remaining` のずれによるデータ損失を防ぐ）。
 #[cfg(feature = "ktls")]
 async fn splice_body_transfer(
     src_stream: &TcpStream,
@@ -8013,6 +8016,7 @@ async fn splice_body_transfer(
     pipe: &SplicePipe,
     mut remaining: usize,
 ) -> u64 {
+    use crate::runtime::splice::splice as iouring_splice;
     use std::os::unix::io::AsRawFd;
 
     let src_fd = src_stream.as_raw_fd();
@@ -8028,26 +8032,47 @@ async fn splice_body_transfer(
         }
     };
 
-    while remaining > 0 {
+    'outer: while remaining > 0 {
         let chunk_size = remaining.min(chunk_size_config);
 
-        match pipe.transfer(src_fd, dst_fd, chunk_size) {
-            Ok(0) => break,
-            Ok(n) => {
-                total += n as u64;
-                remaining = remaining.saturating_sub(n);
-            }
+        // Step 1: src → pipe（io_uring 非同期 splice）
+        let n = match iouring_splice(src_fd, pipe.write_fd(), chunk_size).await {
+            Ok(0) => break, // src EOF
+            Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // 読み取り可能になるまで待機
-                if let Err(_) = src_stream.readable().await {
+                // src にデータが無い → 読み取り可能になるまで待機（POLL_ADD）
+                if src_stream.readable().await.is_err() {
                     break;
                 }
+                continue;
             }
             Err(e) => {
-                warn!("splice body transfer error: {}", e);
+                warn!("splice body transfer error (src→pipe): {}", e);
                 break;
             }
+        };
+
+        // Step 2: pipe → dst（n バイトを全量ドレイン。dst のバックプレッシャに追従）
+        let mut moved = 0usize;
+        while moved < n {
+            match iouring_splice(pipe.read_fd(), dst_fd, n - moved).await {
+                Ok(0) => break 'outer, // dst クローズ
+                Ok(m) => moved += m,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // dst 送信バッファ満杯 → 書き込み可能になるまで待機（POLL_ADD）
+                    if dst_stream.writable().await.is_err() {
+                        break 'outer;
+                    }
+                }
+                Err(e) => {
+                    warn!("splice body transfer error (pipe→dst): {}", e);
+                    break 'outer;
+                }
+            }
         }
+
+        total += n as u64;
+        remaining = remaining.saturating_sub(n);
     }
 
     total

@@ -1,7 +1,14 @@
 # F-39: HTTP プロキシ層の splice を io_uring 非同期 splice に統一
 
 - **優先度**: P1
-- **対応状況**: 未着手
+- **対応状況**: 完了（2026-07-02）
+
+## 完了メモ
+
+- `splice_body_transfer` を `runtime::splice`（IORING_OP_SPLICE）の非同期 Future ベースに書き換え。`src → pipe → dst` の両段を io_uring 化し、WouldBlock 時は `readable()` / `writable()`（POLL_ADD）で待機。
+- 旧実装の潜在バグも解消: pipe → dst 段が WouldBlock で中断すると pipe 内残データと `remaining` カウントがずれてデータ損失し得たが、新実装は取り込んだ n バイトを必ず全量ドレインしてから次チャンクへ進む。
+- `ktls_rustls.rs` の同期 `libc::splice` ラッパー（`splice` / `splice_transfer` / `SplicePipe::transfer`）を削除。`SplicePipe` はパイプ管理のみに縮小。
+- `rg libc::splice src/` の実呼び出しゼロを確認。features full E2E 396 通過（失敗 1 件は既知の B-10 フレーキーで本件と無関係）。
 - **出典**: `docs/artifacts/analysis_results.md` 改善案2（ホットパス絶対規則違反の是正）
 
 ## 機能説明・現状

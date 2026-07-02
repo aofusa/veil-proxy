@@ -88,8 +88,14 @@ pub fn reset_stats() {
 mod tests {
     use super::*;
 
+    /// `REVALIDATING_KEYS` はプロセス全体のグローバル状態のため、並列実行される
+    /// テスト同士でキー数が干渉する（B-10 と同種の共有状態競合）。グローバル件数を
+    /// 検証するテストはこのミューテックスで直列化する。
+    static GLOBAL_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_request_collapsing() {
+        let _guard = GLOBAL_STATE_LOCK.lock().unwrap();
         let hash = 12345u64;
 
         // 最初のリクエストは成功
@@ -112,6 +118,7 @@ mod tests {
 
     #[test]
     fn test_different_keys() {
+        let _guard = GLOBAL_STATE_LOCK.lock().unwrap();
         let hash1 = 111u64;
         let hash2 = 222u64;
 
@@ -125,6 +132,7 @@ mod tests {
 
     #[test]
     fn test_active_count() {
+        let _guard = GLOBAL_STATE_LOCK.lock().unwrap();
         let hash1 = 333u64;
         let hash2 = 444u64;
 

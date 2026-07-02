@@ -1364,40 +1364,9 @@ impl KtlsClientStream {
 // ====================
 // splice サポート
 // ====================
-
-/// splice システムコールのフラグ
-pub mod splice_flags {
-    pub const SPLICE_F_NONBLOCK: libc::c_uint = 0x02;
-    pub const SPLICE_F_MOVE: libc::c_uint = 0x01;
-    pub const SPLICE_F_MORE: libc::c_uint = 0x04;
-}
-
-/// splice(2) システムコールのラッパー
-pub fn splice(
-    fd_in: RawFd,
-    off_in: Option<&mut i64>,
-    fd_out: RawFd,
-    off_out: Option<&mut i64>,
-    len: usize,
-    flags: libc::c_uint,
-) -> io::Result<usize> {
-    let off_in_ptr = match off_in {
-        Some(off) => off as *mut i64,
-        None => std::ptr::null_mut(),
-    };
-    let off_out_ptr = match off_out {
-        Some(off) => off as *mut i64,
-        None => std::ptr::null_mut(),
-    };
-
-    let result = unsafe { libc::splice(fd_in, off_in_ptr, fd_out, off_out_ptr, len, flags) };
-
-    if result < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(result as usize)
-    }
-}
+//
+// splice(2) の発行自体は io_uring（`crate::runtime::splice`、IORING_OP_SPLICE）で
+// 非同期に行う（F-39）。本モジュールはパイプ（中継バッファ）の管理のみを担う。
 
 /// パイプを作成
 pub fn create_pipe() -> io::Result<(RawFd, RawFd)> {
@@ -1430,54 +1399,6 @@ pub fn set_pipe_size(pipe_fd: RawFd, size: i32) -> io::Result<i32> {
     }
 }
 
-/// splice を使用したゼロコピー転送
-pub fn splice_transfer(
-    src_fd: RawFd,
-    dst_fd: RawFd,
-    pipe_read_fd: RawFd,
-    pipe_write_fd: RawFd,
-    chunk_size: usize,
-) -> io::Result<usize> {
-    use splice_flags::*;
-
-    // Step 1: src_fd → パイプ
-    let to_pipe = splice(
-        src_fd,
-        None,
-        pipe_write_fd,
-        None,
-        chunk_size,
-        SPLICE_F_NONBLOCK | SPLICE_F_MOVE,
-    )?;
-
-    if to_pipe == 0 {
-        return Ok(0);
-    }
-
-    // Step 2: パイプ → dst_fd
-    let mut transferred = 0;
-    while transferred < to_pipe {
-        let remaining = to_pipe - transferred;
-        match splice(
-            pipe_read_fd,
-            None,
-            dst_fd,
-            None,
-            remaining,
-            SPLICE_F_NONBLOCK | SPLICE_F_MOVE,
-        ) {
-            Ok(0) => break,
-            Ok(n) => transferred += n,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                break;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-
-    Ok(transferred)
-}
-
 /// 再利用可能なパイプペアを管理する構造体
 pub struct SplicePipe {
     read_fd: RawFd,
@@ -1499,10 +1420,6 @@ impl SplicePipe {
 
     pub fn write_fd(&self) -> RawFd {
         self.write_fd
-    }
-
-    pub fn transfer(&self, src_fd: RawFd, dst_fd: RawFd, chunk_size: usize) -> io::Result<usize> {
-        splice_transfer(src_fd, dst_fd, self.read_fd, self.write_fd, chunk_size)
     }
 }
 
