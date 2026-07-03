@@ -200,12 +200,17 @@ mod context_tests {
             (b"Content-Type".to_vec(), b"application/json".to_vec()),
         ];
 
-        ctx.set_request("GET", "/api/users?page=1", headers, "192.168.1.1");
+        ctx.set_request(
+            "GET".into(),
+            "/api/users?page=1".into(),
+            headers,
+            "192.168.1.1".into(),
+        );
 
-        assert_eq!(ctx.request_method, "GET");
-        assert_eq!(ctx.request_path, "/api/users?page=1");
+        assert_eq!(&*ctx.request_method, "GET");
+        assert_eq!(&*ctx.request_path, "/api/users?page=1");
         assert_eq!(ctx.request_query, "page=1");
-        assert_eq!(ctx.client_ip, "192.168.1.1");
+        assert_eq!(&*ctx.client_ip, "192.168.1.1");
         assert_eq!(ctx.request_headers.len(), 2);
     }
 
@@ -214,9 +219,14 @@ mod context_tests {
         let caps = ModuleCapabilities::default();
         let mut ctx = HttpContext::new(1, caps);
 
-        ctx.set_request("POST", "/api/users", vec![], "10.0.0.1");
+        ctx.set_request(
+            "POST".into(),
+            "/api/users".into(),
+            vec![],
+            "10.0.0.1".into(),
+        );
 
-        assert_eq!(ctx.request_path, "/api/users");
+        assert_eq!(&*ctx.request_path, "/api/users");
         assert_eq!(ctx.request_query, "");
     }
 
@@ -809,13 +819,13 @@ mod lifecycle_callback_tests {
 
         // Set up request/response data that would be available during log phase
         ctx.set_request(
-            "GET",
-            "/api/test",
+            "GET".into(),
+            "/api/test".into(),
             vec![
                 (b":method".to_vec(), b"GET".to_vec()),
                 (b":path".to_vec(), b"/api/test".to_vec()),
             ],
-            "192.168.1.1",
+            "192.168.1.1".into(),
         );
         ctx.set_response(
             200,
@@ -826,10 +836,10 @@ mod lifecycle_callback_tests {
         );
 
         // Verify data is accessible (would be used by proxy_on_log)
-        assert_eq!(ctx.request_method, "GET");
-        assert_eq!(ctx.request_path, "/api/test");
+        assert_eq!(&*ctx.request_method, "GET");
+        assert_eq!(&*ctx.request_path, "/api/test");
         assert_eq!(ctx.response_status, 200);
-        assert_eq!(ctx.client_ip, "192.168.1.1");
+        assert_eq!(&*ctx.client_ip, "192.168.1.1");
     }
 
     /// Test context cleanup state for done callback

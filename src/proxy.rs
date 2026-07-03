@@ -1406,17 +1406,18 @@ where
 
     // WASMモジュールの適用
     #[cfg(feature = "wasm")]
-    let wasm_modules_to_apply: Vec<String> = {
+    let wasm_modules_to_apply: Arc<Vec<String>> = {
         let config = CURRENT_CONFIG.load();
         if let Some(ref wasm_engine) = config.wasm_filter_engine {
             let path_str = std::str::from_utf8(path).unwrap_or("/");
             let method_str = std::str::from_utf8(method).unwrap_or("GET");
 
-            let modules_to_apply = if let Some(backend_modules) = backend.modules() {
-                backend_modules.to_vec()
+            // F-43: モジュールリストは Arc 共有（リクエストごとの Vec<String> deep copy 排除）
+            let modules_to_apply = if let Some(backend_modules) = backend.modules_arc() {
+                backend_modules.clone()
             } else {
                 // ルートレベルのmodulesが指定されていない場合は、WASMモジュールを適用しない
-                Vec::new()
+                crate::wasm::empty_wasm_modules()
             };
 
             if !modules_to_apply.is_empty() {
@@ -1436,10 +1437,10 @@ where
                     .clone()
                     .on_request_headers_with_modules_async(
                         modules_to_apply.clone(),
-                        path_str.to_string(),
-                        method_str.to_string(),
+                        Arc::from(path_str),
+                        Arc::from(method_str),
                         headers_vec,
-                        client_ip.to_string(),
+                        Arc::from(client_ip),
                         body_len == 0, // end_of_stream
                     )
                     .await;
@@ -1463,7 +1464,7 @@ where
                         // ライフサイクルコールバック: リクエスト完了
                         crate::wasm::on_request_complete_async(
                             wasm_engine.clone(),
-                            modules_to_apply.to_vec(),
+                            modules_to_apply.clone(),
                         )
                         .await;
                         return Some((resp.status_code, resp.body.len() as u64));
@@ -1479,7 +1480,7 @@ where
             }
             modules_to_apply
         } else {
-            Vec::new()
+            crate::wasm::empty_wasm_modules()
         }
     };
 
@@ -4014,13 +4015,14 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
 
                 // WASMモジュールの適用
                 // モジュールリストをローカル変数として保持（スレッドローカルを使わない、並行タスク間の干渉を防ぐ）
+                // F-43: モジュールリストは Arc 共有（リクエストごとの deep copy 排除）
                 #[cfg(feature = "wasm")]
-                let modules_to_apply: Vec<String> = if let Some(backend_modules) = backend.modules()
-                {
-                    backend_modules.to_vec()
-                } else {
-                    Vec::new()
-                };
+                let modules_to_apply: Arc<Vec<String>> =
+                    if let Some(backend_modules) = backend.modules_arc() {
+                        backend_modules.clone()
+                    } else {
+                        crate::wasm::empty_wasm_modules()
+                    };
 
                 #[cfg(feature = "wasm")]
                 let headers_for_proxy = {
@@ -4041,10 +4043,10 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                                 .clone()
                                 .on_request_headers_with_modules_async(
                                     modules_to_apply.clone(),
-                                    path_str.to_string(),
-                                    method_str.to_string(),
+                                    Arc::from(path_str),
+                                    Arc::from(method_str),
                                     headers_vec,
-                                    client_ip.to_string(),
+                                    Arc::from(client_ip),
                                     initial_body.is_empty() && !is_chunked, // end_of_stream
                                 )
                                 .await;
@@ -4055,14 +4057,10 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                                     ..
                                 } => {
                                     // 修正されたヘッダーを使用
+                                    // F-43: 所有権ムーブで変換（deep copy しない）
                                     modified_headers
-                                        .iter()
-                                        .map(|(k, v)| {
-                                            (
-                                                k.clone().into_boxed_slice(),
-                                                v.clone().into_boxed_slice(),
-                                            )
-                                        })
+                                        .into_iter()
+                                        .map(|(k, v)| (k.into_boxed_slice(), v.into_boxed_slice()))
                                         .collect()
                                 }
                                 crate::wasm::FilterResult::LocalResponse(resp) => {
@@ -4380,7 +4378,7 @@ async fn handle_backend(
     headers: &[(Box<[u8]>, Box<[u8]>)],
     initial_body: &[u8],
     client_wants_close: bool,
-    wasm_modules: Vec<String>,
+    wasm_modules: Arc<Vec<String>>,
     client_ip: &str,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // Proxy バックエンドはリクエストボディを上流へ転送して消費する。それ以外（File/Memory/
@@ -5251,7 +5249,7 @@ async fn handle_proxy(
     headers: &[(Box<[u8]>, Box<[u8]>)],
     initial_body: &[u8],
     client_wants_close: bool,
-    wasm_modules: Vec<String>,
+    wasm_modules: Arc<Vec<String>>,
     client_ip: &str,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // クライアントの Accept-Encoding を解析
@@ -5945,7 +5943,7 @@ async fn proxy_http_pooled(
     initial_body: &[u8],
     client_wants_close: bool,
     cache_ctx: Option<&mut CacheSaveContext>,
-    wasm_modules: Vec<String>,
+    wasm_modules: Arc<Vec<String>>,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // セキュリティ設定からタイムアウトを取得
     let connect_timeout = Duration::from_secs(security.backend_connect_timeout_secs);
@@ -7157,7 +7155,7 @@ async fn proxy_http_request_with_compression(
     client_encoding: AcceptedEncoding,
     cache_ctx: Option<&mut CacheSaveContext>,
     security: &SecurityConfig,
-    wasm_modules: Vec<String>,
+    wasm_modules: Arc<Vec<String>>,
 ) -> Option<(u16, u64, bool)> {
     // 1. リクエストヘッダー送信（タイムアウト付き）
     let write_result = timeout(WRITE_TIMEOUT, backend_stream.write_all(request)).await;
@@ -7243,7 +7241,7 @@ async fn transfer_response_with_compression(
     client_encoding: AcceptedEncoding,
     mut cache_ctx: Option<&mut CacheSaveContext>,
     security: &SecurityConfig,
-    wasm_modules: Vec<String>,
+    wasm_modules: Arc<Vec<String>>,
 ) -> (u64, u16, bool) {
     let mut accumulated = Vec::with_capacity(BUF_SIZE);
     let mut total = 0u64;
@@ -8440,7 +8438,7 @@ async fn proxy_https_pooled(
     initial_body: &[u8],
     client_wants_close: bool,
     tls_insecure: bool,
-    wasm_modules: Vec<String>,
+    wasm_modules: Arc<Vec<String>>,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // セキュリティ設定からタイムアウトを取得
     let connect_timeout = Duration::from_secs(security.backend_connect_timeout_secs);
@@ -8585,7 +8583,7 @@ async fn proxy_https_request_with_compression(
     compression: &CompressionConfig,
     client_encoding: AcceptedEncoding,
     security: &SecurityConfig,
-    wasm_modules: Vec<String>,
+    wasm_modules: Arc<Vec<String>>,
 ) -> Option<(u16, u64, bool)> {
     // 1. リクエストヘッダー送信
     let write_result = timeout(WRITE_TIMEOUT, backend_stream.write_all(request)).await;
@@ -8662,7 +8660,7 @@ async fn transfer_https_response_with_compression(
     compression: &CompressionConfig,
     client_encoding: AcceptedEncoding,
     security: &SecurityConfig,
-    wasm_modules: Vec<String>,
+    wasm_modules: Arc<Vec<String>>,
 ) -> (u64, u16, bool) {
     let mut accumulated = Vec::with_capacity(BUF_SIZE);
     let mut total = 0u64;
@@ -9411,7 +9409,7 @@ async fn handle_sendfile(
     security: &SecurityConfig,
     range_header: Option<&[u8]>, // RFC 7233 Range header support
     open_file_cache_config: Option<&cache::OpenFileCacheConfig>, // OpenFileCache設定（ルーティングごと）
-    wasm_modules: Vec<String>,
+    wasm_modules: Arc<Vec<String>>,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // --- パス解決ロジック（Nginx風） ---
     //

@@ -24,9 +24,9 @@ pub struct HttpContext {
     /// Request trailers (binary)
     pub request_trailers: Vec<(Vec<u8>, Vec<u8>)>,
     /// Request path
-    pub request_path: String,
+    pub request_path: std::sync::Arc<str>,
     /// Request method
-    pub request_method: String,
+    pub request_method: std::sync::Arc<str>,
     /// Request query string
     pub request_query: String,
     /// Is request body complete
@@ -46,7 +46,7 @@ pub struct HttpContext {
 
     // === Metadata ===
     /// Client IP address
-    pub client_ip: String,
+    pub client_ip: std::sync::Arc<str>,
     /// Plugin name
     pub plugin_name: String,
     /// Plugin configuration
@@ -163,8 +163,8 @@ impl HttpContext {
             request_headers: Vec::new(),
             request_body: Vec::new(),
             request_trailers: Vec::new(),
-            request_path: String::new(),
-            request_method: String::new(),
+            request_path: std::sync::Arc::from(""),
+            request_method: std::sync::Arc::from(""),
             request_query: String::new(),
             request_body_complete: false,
             response_status: 0,
@@ -172,7 +172,7 @@ impl HttpContext {
             response_body: Vec::new(),
             response_trailers: Vec::new(),
             response_body_complete: false,
-            client_ip: String::new(),
+            client_ip: std::sync::Arc::from(""),
             plugin_name: String::new(),
             plugin_configuration: Vec::new(),
             vm_configuration: Vec::new(),
@@ -206,22 +206,24 @@ impl HttpContext {
     }
 
     /// Set request data
+    ///
+    /// F-43: 文字列は `Arc<str>` 共有・ヘッダは所有権ムーブで受け取り、
+    /// per-module の deep copy を排除する。
     pub fn set_request(
         &mut self,
-        method: &str,
-        path: &str,
+        method: std::sync::Arc<str>,
+        path: std::sync::Arc<str>,
         headers: Vec<(Vec<u8>, Vec<u8>)>,
-        client_ip: &str,
+        client_ip: std::sync::Arc<str>,
     ) {
-        self.request_method = method.to_string();
-        self.request_path = path.to_string();
-        self.request_headers = headers;
-        self.client_ip = client_ip.to_string();
-
         // Extract query string
         if let Some(pos) = path.find('?') {
             self.request_query = path[pos + 1..].to_string();
         }
+        self.request_method = method;
+        self.request_path = path;
+        self.request_headers = headers;
+        self.client_ip = client_ip;
     }
 
     /// Set request body

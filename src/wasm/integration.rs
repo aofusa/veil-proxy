@@ -26,7 +26,13 @@ pub fn on_request_complete(engine: &Arc<FilterEngine>, modules: &[String]) {
 }
 
 /// Execute on_log callback for WASM modules at the end of request processing ASYNCHRONOUSLY
-pub async fn on_request_complete_async(engine: Arc<FilterEngine>, modules: Vec<String>) {
+/// 空のモジュールリスト（Arc 共有・プロセスで 1 個。F-43: リクエストごとの確保排除）。
+pub fn empty_wasm_modules() -> Arc<Vec<String>> {
+    static EMPTY: std::sync::OnceLock<Arc<Vec<String>>> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(|| Arc::new(Vec::new())).clone()
+}
+
+pub async fn on_request_complete_async(engine: Arc<FilterEngine>, modules: Arc<Vec<String>>) {
     if modules.is_empty() {
         return;
     }

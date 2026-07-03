@@ -42,9 +42,9 @@ pub use grpc_integration::{
 #[cfg(feature = "grpc")]
 pub use grpc_integration::{process_grpc_response, status as grpc_status, GrpcCallResponse};
 pub use integration::{
-    on_context_destroy, on_http_call_complete, on_queue_ready, on_request_complete,
-    on_request_complete_async, on_tick, process_pending_http_calls, resume_after_http_call,
-    PendingHttpCallInfo, TickConfig, WasmHttpCallResult,
+    empty_wasm_modules, on_context_destroy, on_http_call_complete, on_queue_ready,
+    on_request_complete, on_request_complete_async, on_tick, process_pending_http_calls,
+    resume_after_http_call, PendingHttpCallInfo, TickConfig, WasmHttpCallResult,
 };
 pub use persistent_context::{
     cleanup_old_contexts,

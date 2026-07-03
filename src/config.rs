@@ -3600,6 +3600,16 @@ impl Backend {
 
     /// このバックエンドに適用するWASMモジュール名のリストを取得
     #[inline]
+    /// F-43: WASM モジュールリストを Arc 共有で取得する（リクエストごとの deep copy 排除）。
+    pub fn modules_arc(&self) -> Option<&Arc<Vec<String>>> {
+        match self {
+            Backend::Proxy(_, _, _, _, _, modules) => modules.as_ref(),
+            Backend::MemoryFile(_, _, _, modules) => modules.as_ref(),
+            Backend::SendFile(_, _, _, _, _, _, modules) => modules.as_ref(),
+            Backend::Redirect(_, _, _, modules) => modules.as_ref(),
+        }
+    }
+
     pub fn modules(&self) -> Option<&[String]> {
         match self {
             Backend::Proxy(_, _, _, _, _, modules) => modules.as_deref().map(|v| v.as_slice()),

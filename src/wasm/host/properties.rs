@@ -233,14 +233,14 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 // Allow setting some request properties
                 "request.path" => {
                     if let Ok(s) = String::from_utf8(value) {
-                        state.http_ctx.request_path = s;
+                        state.http_ctx.request_path = std::sync::Arc::from(s);
                         return PROXY_RESULT_OK;
                     }
                     return PROXY_RESULT_PARSE_FAILURE;
                 }
                 "request.method" => {
                     if let Ok(s) = String::from_utf8(value) {
-                        state.http_ctx.request_method = s;
+                        state.http_ctx.request_method = std::sync::Arc::from(s);
                         return PROXY_RESULT_OK;
                     }
                     return PROXY_RESULT_PARSE_FAILURE;

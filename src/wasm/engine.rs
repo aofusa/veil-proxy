@@ -65,13 +65,16 @@ impl FilterEngine {
     }
 
     /// Execute on_request_headers for specified modules
+    ///
+    /// F-43: `path`/`method`/`client_ip` は `Arc<str>` 共有（per-module の `to_string` 排除）、
+    /// ヘッダは所有権ムーブスルー（per-module の deep copy 排除）。
     pub async fn on_request_headers_with_modules(
         &self,
         module_names: &[String],
-        path: &str,
-        method: &str,
+        path: &Arc<str>,
+        method: &Arc<str>,
         headers: Vec<(Vec<u8>, Vec<u8>)>,
-        client_ip: &str,
+        client_ip: &Arc<str>,
         end_of_stream: bool,
     ) -> FilterResult {
         let modules: Vec<Arc<LoadedModule>> = module_names
@@ -89,27 +92,25 @@ impl FilterEngine {
         let mut current_headers = headers;
 
         for module in &modules {
-            let result = self
+            let (returned, result) = self
                 .execute_on_request_headers(
                     module,
                     path,
                     method,
-                    &current_headers,
+                    current_headers,
                     client_ip,
                     end_of_stream,
                 )
                 .await;
+            // ヘッダは変更有無に関わらず回収済み（ムーブスルー）。
+            current_headers = returned;
 
             match result {
-                Ok(ModuleResult::Continue { modified_headers }) => {
-                    if let Some(h) = modified_headers {
-                        current_headers = h;
-                    }
-                }
-                Ok(ModuleResult::Pause) => {
+                Ok(ModuleAction::Continue) => {}
+                Ok(ModuleAction::Pause) => {
                     return FilterResult::Pause;
                 }
-                Ok(ModuleResult::LocalResponse(resp)) => {
+                Ok(ModuleAction::LocalResponse(resp)) => {
                     return FilterResult::LocalResponse(resp);
                 }
                 Err(e) => {
@@ -127,13 +128,15 @@ impl FilterEngine {
 
     /// Execute on_request_headers for specified modules ASYNCHRONOUSLY
     /// Note: runs inline in the current async task to avoid cross-thread waker issues with monoio.
+    ///
+    /// F-43: `module_names` は `Arc` 共有（呼び出しごとの `Vec<String>` deep copy 排除）。
     pub async fn on_request_headers_with_modules_async(
         self: Arc<Self>,
-        module_names: Vec<String>,
-        path: String,
-        method: String,
+        module_names: Arc<Vec<String>>,
+        path: Arc<str>,
+        method: Arc<str>,
         headers: Vec<(Vec<u8>, Vec<u8>)>,
-        client_ip: String,
+        client_ip: Arc<str>,
         end_of_stream: bool,
     ) -> FilterResult {
         self.on_request_headers_with_modules(
@@ -147,187 +150,141 @@ impl FilterEngine {
         .await
     }
 
-    /// Execute on_request_headers for a single module
-    async fn execute_on_request_headers(
+    /// Proxy-Wasm SDK ライフサイクル（_start → root/HTTP コンテキスト生成 → vm_start →
+    /// configure → 指定ヘッダコールバック）を実行して action を返す（ヘッダ系フィルタ共通）。
+    async fn run_headers_module(
         &self,
         module: &LoadedModule,
-        path: &str,
-        method: &str,
-        headers: &[(Vec<u8>, Vec<u8>)],
-        client_ip: &str,
+        store: &mut Store<HostState>,
+        callback_name: &str,
+        num_headers: i32,
         end_of_stream: bool,
-    ) -> anyhow::Result<ModuleResult> {
-        // Create context
-        let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
-        http_ctx.set_request(method, path, headers.to_vec(), client_ip);
-        http_ctx.plugin_name = module.name.clone();
-        http_ctx.plugin_configuration = module.configuration.clone();
-
-        // Create store with fuel limit
-        let host_state = HostState::new(http_ctx);
-        let mut store = Store::new(self.registry.engine(), host_state);
+    ) -> anyhow::Result<i32> {
         store.set_fuel(self.fuel_limit)?;
         store.fuel_async_yield_interval(Some(10_000))?;
         store.set_epoch_deadline(self.epoch_deadline);
+        self.registry.engine().increment_epoch();
 
         // Instantiate module
-        let instance = module.instance_pre.instantiate_async(&mut store).await?;
+        let instance = module.instance_pre.instantiate_async(&mut *store).await?;
 
         // === Proxy-Wasm SDK Lifecycle ===
-        // The SDK requires these callbacks in EXACT order:
-        // 0. _start - MUST be called first! This runs set_root_context() in the SDK
-        // 1. proxy_on_context_create(root_id, 0) - creates ROOT context (parent=0 means root)
-        // 2. proxy_on_vm_start(root_id, config_size) - notifies VM started
-        // 3. proxy_on_configure(root_id, config_size) - sends configuration
-        // 4. proxy_on_context_create(http_id, root_id) - creates HTTP context under root
-        // 5. proxy_on_request_headers - processes the request
-
         // Step 0: Call _start to initialize the SDK
-        // This is where set_root_context() is called in the proxy-wasm Rust SDK
-        if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
-            match func.call_async(&mut store, ()).await {
-                Ok(()) => ftlog::debug!("[wasm:{}] _start() OK", module.name),
-                Err(e) => ftlog::error!("[wasm:{}] _start() failed: {}", module.name, e),
+        if let Ok(func) = instance.get_typed_func::<(), ()>(&mut *store, "_start") {
+            if let Err(e) = func.call_async(&mut *store, ()).await {
+                ftlog::error!("[wasm:{}] _start() failed: {}", module.name, e);
             }
-        } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
-            match func.call_async(&mut store, ()).await {
-                Ok(()) => ftlog::debug!("[wasm:{}] _initialize() OK", module.name),
-                Err(e) => ftlog::error!("[wasm:{}] _initialize() failed: {}", module.name, e),
+        } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut *store, "_initialize") {
+            if let Err(e) = func.call_async(&mut *store, ()).await {
+                ftlog::error!("[wasm:{}] _initialize() failed: {}", module.name, e);
             }
-        } else {
-            ftlog::warn!(
-                "[wasm:{}] Neither _start nor _initialize exported",
-                module.name
-            );
         }
 
         let root_context_id = 1i32; // Root context ID (SDK uses 1)
         let http_context_id = 2i32; // HTTP context ID
         let config_size = module.configuration.len() as i32;
 
-        // Step 1: Create ROOT context first (parent_context_id = 0 means root)
-        // This MUST be called BEFORE proxy_on_vm_start
-        // Note: proxy_on_context_create has signature (i32, i32) -> void
+        // Step 1: Create ROOT context first (parent=0 means root)
         if let Ok(func) =
-            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+            instance.get_typed_func::<(i32, i32), ()>(&mut *store, "proxy_on_context_create")
         {
-            match func.call_async(&mut store, (root_context_id, 0)).await {
-                Ok(()) => ftlog::debug!(
-                    "[wasm:{}] proxy_on_context_create({}, 0) OK",
-                    module.name,
-                    root_context_id
-                ),
-                Err(e) => ftlog::error!(
-                    "[wasm:{}] proxy_on_context_create({}, 0) failed: {}",
-                    module.name,
-                    root_context_id,
-                    e
-                ),
-            }
-        } else {
-            ftlog::debug!(
-                "[wasm:{}] proxy_on_context_create not exported",
-                module.name
-            );
+            let _ = func.call_async(&mut *store, (root_context_id, 0)).await;
         }
 
-        // Step 2: Call proxy_on_vm_start on the root context
+        // Step 2: Call proxy_on_vm_start
         if let Ok(func) =
-            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
+            instance.get_typed_func::<(i32, i32), i32>(&mut *store, "proxy_on_vm_start")
         {
-            match func
-                .call_async(&mut store, (root_context_id, config_size))
-                .await
-            {
-                Ok(ret) => ftlog::debug!(
-                    "[wasm:{}] proxy_on_vm_start({}, {}) => {}",
-                    module.name,
-                    root_context_id,
-                    config_size,
-                    ret
-                ),
-                Err(e) => ftlog::error!("[wasm:{}] proxy_on_vm_start failed: {}", module.name, e),
-            }
+            let _ = func
+                .call_async(&mut *store, (root_context_id, config_size))
+                .await;
         }
 
-        // Step 3: Call proxy_on_configure on the root context
+        // Step 3: Call proxy_on_configure
         if let Ok(func) =
-            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
+            instance.get_typed_func::<(i32, i32), i32>(&mut *store, "proxy_on_configure")
         {
-            match func
-                .call_async(&mut store, (root_context_id, config_size))
-                .await
-            {
-                Ok(ret) => ftlog::debug!(
-                    "[wasm:{}] proxy_on_configure({}, {}) => {}",
-                    module.name,
-                    root_context_id,
-                    config_size,
-                    ret
-                ),
-                Err(e) => ftlog::error!("[wasm:{}] proxy_on_configure failed: {}", module.name, e),
-            }
+            let _ = func
+                .call_async(&mut *store, (root_context_id, config_size))
+                .await;
         }
 
         // Step 4: Create HTTP context with root as parent
-        // Note: proxy_on_context_create has signature (i32, i32) -> void
         if let Ok(func) =
-            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+            instance.get_typed_func::<(i32, i32), ()>(&mut *store, "proxy_on_context_create")
         {
-            match func
-                .call_async(&mut store, (http_context_id, root_context_id))
-                .await
-            {
-                Ok(()) => ftlog::debug!(
-                    "[wasm:{}] proxy_on_context_create({}, {}) OK",
-                    module.name,
-                    http_context_id,
-                    root_context_id
-                ),
-                Err(e) => ftlog::error!(
-                    "[wasm:{}] proxy_on_context_create({}, {}) failed: {}",
-                    module.name,
-                    http_context_id,
-                    root_context_id,
-                    e
-                ),
-            }
+            let _ = func
+                .call_async(&mut *store, (http_context_id, root_context_id))
+                .await;
         }
 
-        // Now call proxy_on_request_headers
-        let callback =
-            instance.get_typed_func::<(i32, i32, i32), i32>(&mut store, "proxy_on_request_headers");
+        // 指定されたヘッダコールバックを呼ぶ
+        let callback = instance.get_typed_func::<(i32, i32, i32), i32>(&mut *store, callback_name);
 
-        let action = match callback {
+        match callback {
             Ok(func) => {
-                let num_headers = headers.len() as i32;
                 let eos = if end_of_stream { 1 } else { 0 };
-                func.call_async(&mut store, (http_context_id, num_headers, eos))
-                    .await?
+                Ok(func
+                    .call_async(&mut *store, (http_context_id, num_headers, eos))
+                    .await?)
             }
-            Err(_) => {
-                // Callback not exported, continue
-                0
+            Err(_) => Ok(0), // Callback not exported, continue
+        }
+    }
+
+    /// Execute on_request_headers for a single module
+    ///
+    /// F-43: ヘッダは所有権で受け取り、（変更有無に関わらず）コンテキストから回収して
+    /// 返す（ムーブスルー）。エラー時もヘッダは失われない。
+    async fn execute_on_request_headers(
+        &self,
+        module: &LoadedModule,
+        path: &Arc<str>,
+        method: &Arc<str>,
+        headers: Vec<(Vec<u8>, Vec<u8>)>,
+        client_ip: &Arc<str>,
+        end_of_stream: bool,
+    ) -> (Vec<(Vec<u8>, Vec<u8>)>, anyhow::Result<ModuleAction>) {
+        let num_headers = headers.len() as i32;
+
+        // Create context（文字列は Arc 共有、ヘッダはムーブ）
+        let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
+        http_ctx.set_request(method.clone(), path.clone(), headers, client_ip.clone());
+        http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_configuration = module.configuration.clone();
+
+        // Create store with fuel limit
+        let host_state = HostState::new(http_ctx);
+        let mut store = Store::new(self.registry.engine(), host_state);
+
+        let run = self
+            .run_headers_module(
+                module,
+                &mut store,
+                "proxy_on_request_headers",
+                num_headers,
+                end_of_stream,
+            )
+            .await;
+
+        // ヘッダをコンテキストから回収（ゼロコピー・ムーブ）
+        let headers = std::mem::take(&mut store.data_mut().http_ctx.request_headers);
+
+        let result = match run {
+            Ok(action) => {
+                let state = store.data();
+                if let Some(local_response) = &state.http_ctx.local_response {
+                    Ok(ModuleAction::LocalResponse(local_response.clone()))
+                } else {
+                    match FilterAction::from(action) {
+                        FilterAction::Continue => Ok(ModuleAction::Continue),
+                        FilterAction::Pause => Ok(ModuleAction::Pause),
+                    }
+                }
             }
+            Err(e) => Err(e),
         };
-
-        // Check for local response
-        let state = store.data();
-        if let Some(local_response) = &state.http_ctx.local_response {
-            return Ok(ModuleResult::LocalResponse(local_response.clone()));
-        }
-
-        // Check for modifications
-        let modified_headers = if state.http_ctx.request_headers_modified {
-            Some(state.http_ctx.request_headers.clone())
-        } else {
-            None
-        };
-
-        match FilterAction::from(action) {
-            FilterAction::Continue => Ok(ModuleResult::Continue { modified_headers }),
-            FilterAction::Pause => Ok(ModuleResult::Pause),
-        }
+        (headers, result)
     }
 
     /// Execute on_response_headers callback for all modules (reverse order)
@@ -348,6 +305,8 @@ impl FilterEngine {
     }
 
     /// Execute on_response_headers for specified modules
+    ///
+    /// F-43: ヘッダは所有権ムーブスルー（per-module の deep copy 排除）。
     pub async fn on_response_headers_with_modules(
         &self,
         module_names: &[String],
@@ -373,9 +332,10 @@ impl FilterEngine {
         for module in modules.iter().rev() {
             // F-09: WASM フィルタ実行時間を計測
             let _wasm_start = std::time::Instant::now();
-            let result = self
-                .execute_on_response_headers(module, status, &current_headers, end_of_stream)
+            let (returned, result) = self
+                .execute_on_response_headers(module, status, current_headers, end_of_stream)
                 .await;
+            current_headers = returned;
             crate::metrics::observe_wasm_filter_duration(
                 &module.name,
                 "response_headers",
@@ -383,15 +343,11 @@ impl FilterEngine {
             );
 
             match result {
-                Ok(ModuleResult::Continue { modified_headers }) => {
-                    if let Some(h) = modified_headers {
-                        current_headers = h;
-                    }
-                }
-                Ok(ModuleResult::Pause) => {
+                Ok(ModuleAction::Continue) => {}
+                Ok(ModuleAction::Pause) => {
                     return FilterResult::Pause;
                 }
-                Ok(ModuleResult::LocalResponse(resp)) => {
+                Ok(ModuleAction::LocalResponse(resp)) => {
                     return FilterResult::LocalResponse(resp);
                 }
                 Err(e) => {
@@ -408,9 +364,11 @@ impl FilterEngine {
 
     /// Execute on_response_headers for specified modules ASYNCHRONOUSLY
     /// Note: runs inline in the current async task to avoid cross-thread waker issues with monoio.
+    ///
+    /// F-43: `module_names` は `Arc` 共有（呼び出しごとの `Vec<String>` deep copy 排除）。
     pub async fn on_response_headers_with_modules_async(
         self: Arc<Self>,
-        module_names: Vec<String>,
+        module_names: Arc<Vec<String>>,
         status: u16,
         headers: Vec<(Vec<u8>, Vec<u8>)>,
         end_of_stream: bool,
@@ -420,106 +378,54 @@ impl FilterEngine {
     }
 
     /// Execute on_response_headers for a single module
+    ///
+    /// F-43: ヘッダは所有権ムーブスルー（`execute_on_request_headers` と同方針）。
     async fn execute_on_response_headers(
         &self,
         module: &LoadedModule,
         status: u16,
-        headers: &[(Vec<u8>, Vec<u8>)],
+        headers: Vec<(Vec<u8>, Vec<u8>)>,
         end_of_stream: bool,
-    ) -> anyhow::Result<ModuleResult> {
-        // Create context
+    ) -> (Vec<(Vec<u8>, Vec<u8>)>, anyhow::Result<ModuleAction>) {
+        let num_headers = headers.len() as i32;
+
+        // Create context（ヘッダはムーブ）
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
-        http_ctx.set_response(status, headers.to_vec());
+        http_ctx.set_response(status, headers);
         http_ctx.plugin_name = module.name.clone();
 
         // Create store with fuel limit
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
-        store.set_fuel(self.fuel_limit)?;
-        store.fuel_async_yield_interval(Some(10_000))?;
-        store.set_epoch_deadline(self.epoch_deadline);
-        self.registry.engine().increment_epoch();
 
-        // Instantiate module
-        let instance = module.instance_pre.instantiate_async(&mut store).await?;
+        let run = self
+            .run_headers_module(
+                module,
+                &mut store,
+                "proxy_on_response_headers",
+                num_headers,
+                end_of_stream,
+            )
+            .await;
 
-        // === Proxy-Wasm SDK Lifecycle ===
-        // Step 0: Call _start to initialize the SDK
-        if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
-            let _ = func.call_async(&mut store, ()).await;
-        } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
-            let _ = func.call_async(&mut store, ()).await;
-        }
+        // ヘッダをコンテキストから回収（ゼロコピー・ムーブ）
+        let headers = std::mem::take(&mut store.data_mut().http_ctx.response_headers);
 
-        let root_context_id = 1i32; // Root context ID
-        let http_context_id = 2i32; // HTTP context ID
-        let config_size = module.configuration.len() as i32;
-
-        // Step 1: Create ROOT context first (parent=0 means root)
-        if let Ok(func) =
-            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
-        {
-            let _ = func.call_async(&mut store, (root_context_id, 0)).await;
-        }
-
-        // Step 2: Call proxy_on_vm_start
-        if let Ok(func) =
-            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
-        {
-            let _ = func
-                .call_async(&mut store, (root_context_id, config_size))
-                .await;
-        }
-
-        // Step 3: Call proxy_on_configure
-        if let Ok(func) =
-            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
-        {
-            let _ = func
-                .call_async(&mut store, (root_context_id, config_size))
-                .await;
-        }
-
-        // Step 4: Create HTTP context with root as parent
-        if let Ok(func) =
-            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
-        {
-            let _ = func
-                .call_async(&mut store, (http_context_id, root_context_id))
-                .await;
-        }
-
-        // Now call proxy_on_response_headers
-        let callback = instance
-            .get_typed_func::<(i32, i32, i32), i32>(&mut store, "proxy_on_response_headers");
-
-        let action = match callback {
-            Ok(func) => {
-                let num_headers = headers.len() as i32;
-                let eos = if end_of_stream { 1 } else { 0 };
-                func.call_async(&mut store, (http_context_id, num_headers, eos))
-                    .await?
+        let result = match run {
+            Ok(action) => {
+                let state = store.data();
+                if let Some(local_response) = &state.http_ctx.local_response {
+                    Ok(ModuleAction::LocalResponse(local_response.clone()))
+                } else {
+                    match FilterAction::from(action) {
+                        FilterAction::Continue => Ok(ModuleAction::Continue),
+                        FilterAction::Pause => Ok(ModuleAction::Pause),
+                    }
+                }
             }
-            Err(_) => 0,
+            Err(e) => Err(e),
         };
-
-        // Check for local response
-        let state = store.data();
-        if let Some(local_response) = &state.http_ctx.local_response {
-            return Ok(ModuleResult::LocalResponse(local_response.clone()));
-        }
-
-        // Check for modifications
-        let modified_headers = if state.http_ctx.response_headers_modified {
-            Some(state.http_ctx.response_headers.clone())
-        } else {
-            None
-        };
-
-        match FilterAction::from(action) {
-            FilterAction::Continue => Ok(ModuleResult::Continue { modified_headers }),
-            FilterAction::Pause => Ok(ModuleResult::Pause),
-        }
+        (headers, result)
     }
 
     /// Get a loaded module by name
@@ -1055,7 +961,7 @@ impl FilterEngine {
 
     /// Execute on_log for specified modules ASYNCHRONOUSLY
     /// Note: runs inline in the current async task to avoid cross-thread waker issues with monoio.
-    pub async fn on_log_with_modules_async(self: Arc<Self>, module_names: Vec<String>) {
+    pub async fn on_log_with_modules_async(self: Arc<Self>, module_names: Arc<Vec<String>>) {
         self.on_log_with_modules(&module_names).await;
     }
 
@@ -2172,6 +2078,13 @@ enum ModuleResult {
     LocalResponse(LocalResponse),
 }
 
+/// ヘッダ系フィルタの実行結果（F-43: ヘッダ本体はムーブスルーで別途返すため持たない）
+enum ModuleAction {
+    Continue,
+    Pause,
+    LocalResponse(LocalResponse),
+}
+
 /// Result from filter chain execution
 pub enum FilterResult {
     /// Continue with potentially modified headers/body
@@ -2245,10 +2158,10 @@ mod exec_smoke_tests {
         // async になった WASM 実行をテスト用に駆動する（背景スレッド扱い）。
         let result = futures::executor::block_on(engine.on_request_headers_with_modules(
             &["header_filter".to_string()],
-            "/",
-            "GET",
+            &Arc::from("/"),
+            &Arc::from("GET"),
             headers,
-            "127.0.0.1",
+            &Arc::from("127.0.0.1"),
             true,
         ));
         // 中身は問わない。パニックせず FilterResult を返すことだけを確認する。

@@ -1017,11 +1017,12 @@ impl Http3Handler {
                 let path_str = std::str::from_utf8(&path).unwrap_or("/");
                 let method_str = std::str::from_utf8(&method).unwrap_or("GET");
 
-                let modules_to_apply = if let Some(backend_modules) = backend.modules() {
-                    backend_modules.to_vec()
+                // F-43: モジュールリストは Arc 共有（リクエストごとの deep copy 排除）
+                let modules_to_apply = if let Some(backend_modules) = backend.modules_arc() {
+                    backend_modules.clone()
                 } else {
                     // ルートレベルのmodulesが指定されていない場合は、WASMモジュールを適用しない
-                    Vec::new()
+                    crate::wasm::empty_wasm_modules()
                 };
 
                 if !modules_to_apply.is_empty() {
@@ -1035,10 +1036,10 @@ impl Http3Handler {
                     let wasm_result = wasm_engine
                         .on_request_headers_with_modules(
                             &modules_to_apply,
-                            path_str,
-                            method_str,
+                            &std::sync::Arc::from(path_str),
+                            &std::sync::Arc::from(method_str),
                             headers_vec,
-                            &self.client_ip,
+                            &std::sync::Arc::from(self.client_ip.as_str()),
                             request_body.is_empty(), // end_of_stream
                         )
                         .await;
