@@ -100,20 +100,6 @@ mod tests {
     use super::*;
     use crate::config::{HealthCheckConfig, HealthCheckType, L4LbAlgorithm, L4UpstreamEntry};
 
-    fn make_hc_config(check_type: HealthCheckType) -> HealthCheckConfig {
-        HealthCheckConfig {
-            check_type,
-            interval_secs: 10,
-            path: String::new(),
-            timeout_secs: 1,
-            healthy_statuses: vec![200],
-            unhealthy_threshold: 2,
-            healthy_threshold: 1,
-            use_tls: false,
-            verify_cert: true,
-        }
-    }
-
     fn make_l4_config_with_hc(upstreams: Vec<&str>, hc: HealthCheckConfig) -> L4ListenerConfig {
         L4ListenerConfig {
             name: "test-hc".to_string(),

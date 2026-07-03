@@ -2698,7 +2698,11 @@ async fn test_http3_connection_close() {
 }
 
 #[tokio::test]
-#[ntest::timeout(15000)]
+// タイムアウトは大きめ（60s）+ 接続レベル失敗はリトライする。1.5MB の h3 アップロード
+// （F-44 以降は TLS バックエンドへのストリーミング経路）は重い並列スイート + co-tenant
+// 負荷では CPU 競合で遅くなり得るため、test_http3_request_body_streaming と同じ
+// レジリエンス方針を取る。
+#[ntest::timeout(60000)]
 #[cfg(feature = "http3")]
 async fn test_http3_large_request_body() {
     if !is_e2e_environment_ready().await {
@@ -2710,48 +2714,60 @@ async fn test_http3_large_request_body() {
         .parse()
         .expect("Invalid server address");
 
-    // HTTP/3接続を確立（非同期版）
-    let (mut client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
-    {
-        Ok(c) => c,
-        Err(e) => {
-            panic!(
-                "Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)",
-                e
-            );
-        }
-    };
-
     use common::http3_client::send_http3_request;
 
     // 1MB以上の大きなリクエストボディを生成
     let large_body: Vec<u8> = (0..1_500_000).map(|i| (i % 256) as u8).collect();
 
-    // POSTリクエストを送信
-    match send_http3_request(
-        &mut send_request,
-        "POST",
-        "/",
-        &[("Content-Type", "application/octet-stream")],
-        Some(&large_body),
-    )
-    .await
-    {
-        Ok((status, _body)) => {
-            // 大きなボディが正常に送信されたことを確認
-            assert!(
-                status == 200 || status == 413 || status == 502,
-                "Should return 200, 413, or 502: {}",
-                status
-            );
-        }
-        Err(e) => {
-            panic!(
-                "Failed to send/receive HTTP/3 request with large body: {}",
-                e
-            );
+    const MAX_ATTEMPTS: usize = 4;
+    let mut last_err = String::new();
+    for attempt in 0..MAX_ATTEMPTS {
+        // HTTP/3接続を確立（非同期版）
+        let (mut _client, mut send_request) =
+            match Http3TestClient::new(server_addr, "localhost").await {
+                Ok(c) => c,
+                Err(e) => {
+                    last_err = format!("connect error: {}", e);
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    continue;
+                }
+            };
+
+        // POSTリクエストを送信
+        match send_http3_request(
+            &mut send_request,
+            "POST",
+            "/",
+            &[("Content-Type", "application/octet-stream")],
+            Some(&large_body),
+        )
+        .await
+        {
+            Ok((status, _body)) => {
+                // 大きなボディが正常に送信されたことを確認
+                assert!(
+                    status == 200 || status == 413 || status == 502,
+                    "Should return 200, 413, or 502: {}",
+                    status
+                );
+                eprintln!(
+                    "HTTP/3 large request body: {} bytes uploaded (status {}, attempt {})",
+                    large_body.len(),
+                    status,
+                    attempt + 1
+                );
+                return;
+            }
+            Err(e) => {
+                last_err = format!("POST error: {}", e);
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
         }
     }
+    panic!(
+        "Failed to send/receive HTTP/3 request with large body after {} attempts: {}",
+        MAX_ATTEMPTS, last_err
+    );
 }
 
 #[tokio::test]

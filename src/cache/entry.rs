@@ -255,21 +255,9 @@ impl CacheEntryBuilder {
         self
     }
 
-    /// ヘッダーリストを設定
-    pub fn headers(mut self, headers: Vec<(Box<[u8]>, Box<[u8]>)>) -> Self {
-        self.headers = headers;
-        self
-    }
-
     /// ボディを設定
     pub fn body(mut self, body: Vec<u8>) -> Self {
         self.body = body;
-        self
-    }
-
-    /// ボディにデータを追加
-    pub fn append_body(mut self, data: &[u8]) -> Self {
-        self.body.extend_from_slice(data);
         self
     }
 
@@ -283,14 +271,6 @@ impl CacheEntryBuilder {
     pub fn build_memory(self) -> CacheEntry {
         let storage = CacheStorage::Memory(self.body.into());
         CacheEntry::new(self.status_code, self.headers, storage, self.max_age_secs)
-    }
-
-    /// ディスクストレージとしてビルド
-    pub fn build_disk(self, path: PathBuf) -> (CacheEntry, Vec<u8>) {
-        let size = self.body.len() as u64;
-        let storage = CacheStorage::Disk { path, size };
-        let entry = CacheEntry::new(self.status_code, self.headers, storage, self.max_age_secs);
-        (entry, self.body)
     }
 }
 

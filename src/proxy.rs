@@ -3,7 +3,6 @@
 //! すべてのプロキシハンドリングロジックを担当します。
 //! HTTP/1.1、HTTP/2、WebSocket、ファイル配信などに対応。
 
-#[cfg(feature = "http2")]
 use std::sync::Arc;
 
 use crate::runtime::buf::{IoBuf, IoBufMut};
@@ -4235,7 +4234,7 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                         }
                         #[cfg(not(feature = "wasm"))]
                         {
-                            Vec::new()
+                            Arc::new(Vec::new())
                         }
                     },
                     client_ip,

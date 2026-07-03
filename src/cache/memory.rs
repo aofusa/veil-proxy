@@ -3,7 +3,7 @@
 //! 小さいレスポンス用の高速インメモリキャッシュを提供します。
 //! LRUアルゴリズムによるエビクションを実装しています。
 
-use super::entry::{CacheEntry, CacheEntryBuilder};
+use super::entry::CacheEntry;
 use super::key::CacheKey;
 use lru::LruCache;
 use std::num::NonZeroUsize;
@@ -243,34 +243,10 @@ impl MemoryCache {
     }
 }
 
-/// ボディデータからCacheEntryを作成するヘルパー
-///
-/// テストコードや簡易的なエントリ作成に使用。
-/// より柔軟な設定が必要な場合は`CacheEntryBuilder`を使用してください。
-///
-/// # 使用例
-/// ```rust
-/// let entry = create_memory_entry(200, headers, body, 3600);
-/// cache.insert(key, entry);
-/// ```
-// 現在は単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn create_memory_entry(
-    status_code: u16,
-    headers: Vec<(Box<[u8]>, Box<[u8]>)>,
-    body: Vec<u8>,
-    ttl_secs: u64,
-) -> CacheEntry {
-    CacheEntryBuilder::new(status_code)
-        .headers(headers)
-        .body(body)
-        .max_age(ttl_secs)
-        .build_memory()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::entry::CacheEntryBuilder;
     use crate::cache::key::CacheableMethod;
 
     fn create_test_key(path: &str) -> CacheKey {

@@ -1,7 +1,6 @@
 use crate::cache;
 use httparse::Status;
 use memchr::memchr3;
-use std::net::SocketAddr;
 
 // ====================
 // HTTP/1.1 RFC準拠ヘルパー関数
@@ -743,111 +742,6 @@ pub fn url_decode(input: &str) -> String {
     }
 
     result
-}
-
-/// ワイルドカードパターンマッチング（シンプルな実装）
-///
-/// パターン例:
-/// - "example.com" → 完全一致
-/// - "*.example.com" → サブドメインにマッチ（例: "api.example.com", "www.example.com"）
-/// - "api.*.com" → サポートしない（先頭または末尾のみ）
-// 現在は単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn matches_wildcard(pattern: &str, text: &str) -> bool {
-    if pattern == text {
-        return true;
-    }
-
-    // 先頭ワイルドカード: "*.example.com"
-    if let Some(rest) = pattern.strip_prefix("*.") {
-        if text.ends_with(rest) {
-            // サブドメインのチェック（少なくとも1つのドットが必要）
-            let subdomain = &text[..text.len() - rest.len()];
-            return !subdomain.is_empty() && !subdomain.contains('.');
-        }
-    }
-
-    // 末尾ワイルドカード: "api.*"
-    if let Some(rest) = pattern.strip_suffix(".*") {
-        if text.starts_with(rest) {
-            // ドメイン部分のチェック
-            let domain = &text[rest.len()..];
-            return !domain.is_empty() && domain.starts_with('.');
-        }
-    }
-
-    false
-}
-
-/// パスパターンマッチング（ワイルドカード対応）
-///
-/// パターン例:
-/// - "/api" → 完全一致
-/// - "/api/*" → "/api/" で始まるすべてのパスにマッチ
-/// - "/api/v2/*" → "/api/v2/" で始まるすべてのパスにマッチ
-// 現在は単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn matches_path_pattern(pattern: &str, path: &[u8]) -> bool {
-    let path_str = match std::str::from_utf8(path) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-
-    // 完全一致
-    if pattern == path_str {
-        return true;
-    }
-
-    // ワイルドカードパターン: "/api/*"
-    if let Some(prefix) = pattern.strip_suffix("/*") {
-        return path_str.starts_with(prefix)
-            && (path_str.len() == prefix.len() || path_str.as_bytes()[prefix.len()] == b'/');
-    }
-
-    // プレフィックス一致（末尾スラッシュなしでもマッチ）
-    if path_str.starts_with(pattern) {
-        // パターンが完全一致、または次の文字がスラッシュ
-        let remaining = &path_str[pattern.len()..];
-        return remaining.is_empty() || remaining.starts_with('/');
-    }
-
-    false
-}
-
-/// ソースIPがCIDR範囲に含まれるかチェック
-// 現在は単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn matches_cidr(ip: &SocketAddr, cidr_ranges: &[String]) -> bool {
-    use std::net::IpAddr;
-
-    let ip_addr = ip.ip();
-
-    for cidr in cidr_ranges {
-        // シンプルなCIDRマッチング（IPv4のみ対応）
-        if let Some((network_str, prefix_len_str)) = cidr.split_once('/') {
-            if let (Ok(network), Ok(prefix_len)) =
-                (network_str.parse::<IpAddr>(), prefix_len_str.parse::<u8>())
-            {
-                if let (IpAddr::V4(network_v4), IpAddr::V4(ip_v4)) = (network, ip_addr) {
-                    let mask = !((1u32 << (32 - prefix_len)) - 1);
-                    let network_u32 = u32::from_be_bytes(network_v4.octets());
-                    let ip_u32 = u32::from_be_bytes(ip_v4.octets());
-                    if (network_u32 & mask) == (ip_u32 & mask) {
-                        return true;
-                    }
-                }
-            }
-        } else {
-            // CIDR表記なし（完全一致）
-            if let Ok(parsed_ip) = cidr.parse::<IpAddr>() {
-                if parsed_ip == ip_addr {
-                    return true;
-                }
-            }
-        }
-    }
-
-    false
 }
 
 // ====================

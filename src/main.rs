@@ -244,8 +244,6 @@ pub mod access_log;
 #[cfg(feature = "l4-proxy")]
 pub mod l4;
 #[cfg(test)]
-use crate::constants::*;
-#[cfg(test)]
 use crate::http_utils::*;
 use crate::logging::*;
 use crate::metrics::*;
