@@ -149,46 +149,54 @@ pub(crate) fn configure_huge_pages(enabled: bool) {
 
 /// A future wrapper that catches panics during polling
 ///
-/// Uses Box<dyn Future> internally to handle pin projection safely.
-/// The Box makes the inner future Unpin, allowing safe mutable access.
-pub(crate) struct CatchUnwindFuture {
-    inner: Option<Pin<Box<dyn std::future::Future<Output = ()> + 'static>>>,
+/// F-46: ジェネリック化して内部の `Box<dyn Future>` を排除した（型付きタスクプール
+/// [`crate::runtime::TaskPool`] にインライン格納できる）。pin 投影は
+/// `Pin::new_unchecked` による構造的投影で行う（下記 SAFETY 参照）。
+pub(crate) struct CatchUnwindFuture<F> {
+    inner: Option<F>,
 }
 
-impl CatchUnwindFuture {
-    pub(crate) fn new<F>(future: F) -> Self
-    where
-        F: std::future::Future<Output = ()> + 'static,
-    {
+impl<F> CatchUnwindFuture<F>
+where
+    F: std::future::Future<Output = ()> + 'static,
+{
+    pub(crate) fn new(future: F) -> Self {
         Self {
-            inner: Some(Box::pin(future)),
+            inner: Some(future),
         }
     }
 }
 
-impl std::future::Future for CatchUnwindFuture {
+impl<F> std::future::Future for CatchUnwindFuture<F>
+where
+    F: std::future::Future<Output = ()> + 'static,
+{
     type Output = ();
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // Get mutable reference to inner (safe because this struct is Unpin due to Box)
-        let inner = match self.inner.as_mut() {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: 構造的 pin 投影。`inner` の future は完了/パニック時に in-place で
+        // `None` 化（drop）する以外にムーブしない（Drop 保証を満たす）。
+        let this = unsafe { self.get_unchecked_mut() };
+        let inner = match this.inner.as_mut() {
             Some(f) => f,
             None => return Poll::Ready(()),
         };
+        // SAFETY: 上記のとおり inner はムーブしないため再ピン留めできる。
+        let pinned = unsafe { Pin::new_unchecked(inner) };
 
         // Wrap the poll in catch_unwind to catch panics
-        let result = catch_unwind(AssertUnwindSafe(|| inner.as_mut().poll(cx)));
+        let result = catch_unwind(AssertUnwindSafe(|| pinned.poll(cx)));
 
         match result {
             Ok(Poll::Ready(())) => {
-                self.inner = None;
+                this.inner = None;
                 Poll::Ready(())
             }
             Ok(Poll::Pending) => Poll::Pending,
             Err(panic_info) => {
                 // Panic caught - log and complete the future
                 error!("Task panicked during poll: {:?}", panic_info);
-                self.inner = None;
+                this.inner = None;
                 Poll::Ready(())
             }
         }
@@ -209,6 +217,20 @@ where
     F: std::future::Future<Output = ()> + 'static,
 {
     crate::runtime::spawn(CatchUnwindFuture::new(future));
+}
+
+/// F-46: 型付きタスクプールへパニックキャッチ付きで spawn する。
+///
+/// `spawn_with_panic_catch` と異なり、`Box<dyn Future>` 確保を伴わない
+/// （プールのスラブスロットへインライン格納。ウォームアップ後は malloc ゼロ）。
+/// プールは spawn 呼び出しサイト（accept ループ等）で `TaskPool::new()` して使い回す。
+pub(crate) fn spawn_pooled_with_panic_catch<F>(
+    pool: &crate::runtime::TaskPool<CatchUnwindFuture<F>>,
+    future: F,
+) where
+    F: std::future::Future<Output = ()> + 'static,
+{
+    pool.spawn(CatchUnwindFuture::new(future));
 }
 
 // ====================

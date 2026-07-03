@@ -7,7 +7,6 @@ use crate::l4::proxy::{
 };
 use crate::runtime::tcp::TcpListener;
 use crate::runtime::time::timeout;
-use crate::system::spawn_with_panic_catch;
 use ftlog::{error, info, warn};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -73,6 +72,9 @@ pub fn spawn_l4_listeners(listeners: &[L4ListenerConfig]) {
 
                 info!("[L4:{}] listening on {}", config.name, listen_addr);
 
+                // F-46: L4 接続ハンドラの型付きタスクプール
+                let conn_pool = crate::runtime::TaskPool::new();
+
                 loop {
                     if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
                         info!("[L4:{}] shutting down", config.name);
@@ -99,7 +101,7 @@ pub fn spawn_l4_listeners(listeners: &[L4ListenerConfig]) {
                     let listener_counter_clone = listener_counter.clone();
                     let health_clone = health_state.clone();
 
-                    spawn_with_panic_catch(async move {
+                    crate::system::spawn_pooled_with_panic_catch(&conn_pool, async move {
                         handle_l4_connection(
                             stream,
                             peer_addr,

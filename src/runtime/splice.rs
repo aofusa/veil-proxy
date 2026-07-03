@@ -19,8 +19,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use crate::runtime::executor::{
-    detach_op, next_user_data, register_op, remove_op, set_op_waker, submit_sqes, take_op_result,
-    with_ring,
+    alloc_op, detach_op, remove_op, set_op_waker, submit_sqes, take_op_result, with_ring, OpGuard,
 };
 use crate::runtime::ring::IORING_OP_SPLICE;
 
@@ -88,9 +87,8 @@ impl Future for SpliceFuture {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if !self.submitted {
-            let user_data = next_user_data();
+            let user_data = alloc_op();
             self.user_data = user_data;
-            register_op(user_data);
 
             let (fd_in, fd_out, len) = (self.fd_in, self.fd_out, self.len);
             with_ring(|ring| {
@@ -139,7 +137,7 @@ impl Drop for SpliceFuture {
         // ユーザーメモリは参照しないため、detach + ASYNC_CANCEL で除去するのみでよい
         // （fd は呼び出し側が TcpStream / Pipe として保持し続ける。B-07a と同方針）。
         if self.submitted {
-            detach_op(self.user_data, Box::new(|_| {}));
+            detach_op(self.user_data, OpGuard::Noop);
         }
     }
 }

@@ -30,7 +30,7 @@ pub mod timer;
 
 // 公開 API の再エクスポート
 pub use buf::{IoBuf, IoBufMut};
-pub use executor::{spawn, yield_now, Executor};
+pub use executor::{spawn, yield_now, Executor, TaskPool};
 pub use ring::IoUring;
 pub use tcp::{TcpListener, TcpStream};
 pub use timer::{sleep, timeout, Elapsed};

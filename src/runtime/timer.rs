@@ -9,8 +9,8 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use crate::runtime::executor::{
-    next_user_data, peek_op_result, register_op, set_op_waker, submit_sqes, take_op_result,
-    with_ring,
+    alloc_op, detach_op_no_cancel, peek_op_result, set_op_waker, submit_sqes, take_op_result,
+    with_ring, OpGuard,
 };
 use crate::runtime::ring::{KernelTimespec, IORING_OP_TIMEOUT};
 
@@ -33,13 +33,14 @@ pub struct Sleep {
 impl Sleep {
     /// 指定した Duration 後に完了する Sleep Future を作成する
     pub fn new(duration: Duration) -> Self {
-        let user_data = next_user_data();
         let ts = KernelTimespec {
             tv_sec: duration.as_secs() as i64,
             tv_nsec: duration.subsec_nanos() as i64,
         };
         Self {
-            user_data,
+            // F-46: スロットは初回 poll（SQE 提出時）に確保する。0 は無効 ID で、
+            // 未提出のまま peek/take されてもどのスロットとも一致しない。
+            user_data: 0,
             ts,
             submitted: false,
         }
@@ -62,8 +63,9 @@ impl Future for Sleep {
         }
 
         if !self.submitted {
-            // SQE を提出
-            register_op(user_data);
+            // SQE を提出（op スロットを確保）
+            let user_data = alloc_op();
+            self.user_data = user_data;
 
             let ts_ptr = &self.ts as *const KernelTimespec as u64;
 
@@ -86,8 +88,8 @@ impl Future for Sleep {
             self.submitted = true;
         }
 
-        // Waker を登録
-        set_op_waker(user_data, cx.waker().clone());
+        // Waker を登録（初回 poll では上でスロット確保済みの self.user_data を使う）
+        set_op_waker(self.user_data, cx.waker().clone());
         Poll::Pending
     }
 }
@@ -104,10 +106,12 @@ impl futures::future::FusedFuture for Sleep {
 
 impl Drop for Sleep {
     fn drop(&mut self) {
-        // キャンセルは ASYNC_CANCEL で行うが、シンプル化のため省略
-        // タイムアウトは自然に完了する
-        if self.submitted {
-            take_op_result(self.user_data);
+        if self.submitted && take_op_result(self.user_data).is_none() {
+            // in-flight のまま drop された（`timeout()` で内側 Future が勝った場合等）。
+            // 旧実装はエントリを残したまま放置しテーブルをリークしていた（F-46 で修正）。
+            // TIMEOUT はカーネル参照バッファを持たず自然完了するため、キャンセルは投げず
+            // Noop ガードで detach し、満了 CQE の到着時にスロットを解放する。
+            detach_op_no_cancel(self.user_data, OpGuard::Noop);
         }
     }
 }

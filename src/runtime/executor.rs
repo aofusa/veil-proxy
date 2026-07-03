@@ -10,7 +10,7 @@
 //! - Future は `OpState` として登録され、完了時に結果を格納する
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -21,34 +21,6 @@ use crate::runtime::ring::{
     IORING_OP_CONNECT, IORING_OP_NOP, IORING_OP_POLL_ADD, IORING_OP_POLL_REMOVE, IORING_OP_RECV,
     IORING_OP_SEND, IORING_OP_SPLICE, IORING_OP_TIMEOUT, IORING_SETUP_R_DISABLED,
 };
-
-// ====================
-// スレッドローカル user_data カウンタ
-// ====================
-
-thread_local! {
-    /// スレッドローカルな user_data カウンタ。
-    ///
-    /// user_data は **同一ワーカースレッド内** でのみ意味を持つ（リング `RING` と操作テーブル
-    /// `OP_TABLE` はともにスレッドローカルで、SQE を提出したスレッドへ CQE が戻り同スレッドで
-    /// 処理される。`offload.rs` の完了通知も eventfd 経由で起点スレッドへ戻る）。よって一意性は
-    /// スレッド内で足りる。旧実装のグローバル `AtomicU64` は **全ワーカーコアが毎 io_uring op で
-    /// 同一キャッシュラインを奪い合う**（thread-per-core のスケールを阻害する偽共有）。スレッド
-    /// ローカル化して **毎 op のアトミック競合（同期コスト）を排除** する。別スレッドが同じ値を
-    /// 持っても別テーブル・別リングのため衝突しない。1 から単調増加し、`CANCEL_SENTINEL_USER_DATA`
-    /// (= u64::MAX) には実時間で到達しない。
-    static USER_DATA_COUNTER: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
-}
-
-/// 新しい（スレッド内で）ユニークな user_data を取得する。アトミック不要・ロックフリー。
-#[inline]
-pub fn next_user_data() -> u64 {
-    USER_DATA_COUNTER.with(|c| {
-        let v = c.get();
-        c.set(v.wrapping_add(1));
-        v
-    })
-}
 
 // ====================
 // 許可オペコードリスト
@@ -82,98 +54,182 @@ pub enum OpResult {
     Done(i32),
 }
 
-/// ドロップされた in-flight op の後始末ガード。
+/// ドロップされた in-flight op の後始末ガード（F-46: 確保不要の `Noop` を追加）。
 ///
 /// io_uring に提出済みで未完了の op を持つ Future がドロップされた場合、カーネルはまだ
 /// バッファ（accept の addr、read/write のデータ領域）を参照し続けている可能性があるため、
 /// 即座に解放すると use-after-free になる。ガードはそれら所有リソースを保持し、op の完了
 /// またはキャンセルの CQE 到着時に呼ばれて後始末（バッファ解放、accept で得た fd の
 /// クローズ等）を行う。引数は CQE.res。
-pub type OpGuard = Box<dyn FnOnce(i32)>;
-
-/// ASYNC_CANCEL op 自身の user_data に使うセンチネル（テーブルに登録されないため無視される）。
-/// USER_DATA_COUNTER は 1 から単調増加するため衝突しない。
-const CANCEL_SENTINEL_USER_DATA: u64 = u64::MAX;
-
-/// `OP_TABLE` のキー（`user_data`）専用の超軽量ハッシャ。
 ///
-/// キーはスレッドローカルな単調増加カウンタ由来（`next_user_data`）で、外部入力ではない
-/// （ハッシュ衝突攻撃の対象にならない）。`OP_TABLE` は **io_uring の全オペレーション
-/// （recv/send/accept/splice/timeout/...）の登録・Waker 設定・完了取り出し**で引かれる
-/// プロキシ最ホットパスのため、標準 `HashMap` の SipHash（暗号学的ハッシュ）は純粋な無駄。
-/// 黄金比由来の奇数定数を 1 回掛ける Fibonacci ハッシュで全 64bit に拡散し
-/// （SwissTable は上位 7bit を制御バイトに使うため連番キーでも上位を 0 にしない）、
-/// per-op の SipHash 計算を排除する。乗算 1 回のみ。
-#[derive(Default)]
-struct NoHashU64(u64);
+/// カーネルが参照するリソースを持たない op（TIMEOUT 等）は `Noop` を使い、
+/// detach ごとのクロージャ確保を避ける。
+pub enum OpGuard {
+    /// 後始末不要（カーネル参照リソースなし）。
+    Noop,
+    /// 後始末クロージャ（バッファ・fd 等を保持）。
+    Cleanup(Box<dyn FnOnce(i32)>),
+}
 
-impl std::hash::Hasher for NoHashU64 {
+impl OpGuard {
+    /// ガードを実行する（`Noop` は何もしない）。
     #[inline]
-    fn write_u64(&mut self, n: u64) {
-        // Fibonacci ハッシング（FxHash 同系）。連番キーを全ビットへ拡散する。
-        self.0 = n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    }
-    #[inline]
-    fn write(&mut self, _bytes: &[u8]) {
-        // user_data(u64) キーは常に write_u64 を通る。到達しない想定。
-        debug_assert!(false, "NoHashU64 supports only u64 keys");
-    }
-    #[inline]
-    fn finish(&self) -> u64 {
-        self.0
+    fn run(self, res: i32) {
+        if let OpGuard::Cleanup(f) = self {
+            f(res);
+        }
     }
 }
 
-type NoHashBuilder = std::hash::BuildHasherDefault<NoHashU64>;
-type OpMap<V> = HashMap<u64, V, NoHashBuilder>;
+/// ASYNC_CANCEL op 自身の user_data に使うセンチネル。
+/// パックすると index = u32::MAX となり、スロット数が u32::MAX に達しない限り
+/// 実スロットと衝突せず `on_cqe` で自然に無視される。
+const CANCEL_SENTINEL_USER_DATA: u64 = u64::MAX;
+
+// ====================
+// OP_TABLE（スラブ、F-46）
+// ====================
+//
+// F-37 までは Fibonacci ハッシュの `HashMap` だったが、`user_data` に
+// **スロット index（下位 32bit）+ 世代（上位 32bit）** をパックした純粋な配列インデックスへ
+// 置換し、per-op のハッシュ計算・probe を排除する。detach ガードの意味論（B-07 の UAF 対策:
+// キャンセル済み op の CQE を世代不一致で無視する）は世代カウンタがそのまま担う。
+//
+// - `user_data = 0` は無効 ID（世代は 1 始まりのため実スロットと一致しない）。Future の
+//   フィールド初期値 `user_data: 0` が誤って実 op を参照する事故を型レベルでなく値レベルで防ぐ。
+// - スロット解放時に世代を +1 し（0 は飛ばす）、stale な CQE / Waker / detach を弾く。
 
 /// 事前確保する in-flight op スロット数（典型的な同時 in-flight op 数を見込む）。
-/// ホットパスでの HashMap 再確保（成長時 malloc）を抑える。
 const OP_TABLE_PREALLOC: usize = 256;
 
-/// スレッドローカルな操作テーブル
+/// op スロットの状態。
+enum OpSlotState {
+    /// 空きスロット（free-list に登録済み）。
+    Free,
+    /// Future 生存中の op。
+    Active {
+        result: OpResult,
+        waker: Option<Waker>,
+    },
+    /// Future がドロップされ detach された op（完了/キャンセルの CQE 待ち）。
+    Detached(OpGuard),
+}
+
+/// op スラブのスロット。
+struct OpSlot {
+    /// 世代カウンタ（1 始まり。解放ごとに +1、0 は飛ばす）。
+    generation: u32,
+    state: OpSlotState,
+}
+
+/// user_data へ (index, generation) をパックする。
+#[inline]
+fn pack_op(index: u32, generation: u32) -> u64 {
+    ((generation as u64) << 32) | index as u64
+}
+
+/// user_data から (index, generation) を取り出す。
+#[inline]
+fn unpack_op(user_data: u64) -> (u32, u32) {
+    (user_data as u32, (user_data >> 32) as u32)
+}
+
+/// スレッドローカルな操作テーブル（スラブ + free-list）
 struct OpTable {
-    /// user_data -> (OpResult, Waker)（Future が生存している op）
-    ops: OpMap<(OpResult, Option<Waker>)>,
-    /// user_data -> ガード（Future がドロップされ detach された op）
-    detached: OpMap<OpGuard>,
+    slots: Vec<OpSlot>,
+    free: Vec<u32>,
 }
 
 impl OpTable {
     fn new() -> Self {
-        Self {
-            ops: HashMap::with_capacity_and_hasher(OP_TABLE_PREALLOC, NoHashBuilder::default()),
-            detached: HashMap::with_capacity_and_hasher(16, NoHashBuilder::default()),
+        let mut slots = Vec::with_capacity(OP_TABLE_PREALLOC);
+        let mut free = Vec::with_capacity(OP_TABLE_PREALLOC);
+        for i in 0..OP_TABLE_PREALLOC as u32 {
+            slots.push(OpSlot {
+                generation: 1,
+                state: OpSlotState::Free,
+            });
+            free.push(i);
         }
+        Self { slots, free }
     }
 
-    /// 操作を登録する
-    fn register(&mut self, user_data: u64) {
-        self.ops.insert(user_data, (OpResult::Pending, None));
+    /// スロットを確保して user_data（index + 世代パック）を返す。
+    fn alloc(&mut self) -> u64 {
+        let index = match self.free.pop() {
+            Some(i) => i,
+            None => {
+                let i = self.slots.len() as u32;
+                self.slots.push(OpSlot {
+                    generation: 1,
+                    state: OpSlotState::Free,
+                });
+                i
+            }
+        };
+        let slot = &mut self.slots[index as usize];
+        slot.state = OpSlotState::Active {
+            result: OpResult::Pending,
+            waker: None,
+        };
+        pack_op(index, slot.generation)
+    }
+
+    /// user_data を検証して現世代のスロット index を返す（不一致 = stale は None）。
+    #[inline]
+    fn resolve(&self, user_data: u64) -> Option<usize> {
+        let (index, generation) = unpack_op(user_data);
+        let slot = self.slots.get(index as usize)?;
+        if slot.generation != generation {
+            return None;
+        }
+        Some(index as usize)
+    }
+
+    /// スロットを解放する（世代 +1 で stale 参照を無効化し free-list へ返す）。
+    fn free_slot(&mut self, index: usize) {
+        let slot = &mut self.slots[index];
+        slot.generation = slot.generation.wrapping_add(1);
+        if slot.generation == 0 {
+            slot.generation = 1; // 0 は「無効 ID」用に予約
+        }
+        slot.state = OpSlotState::Free;
+        self.free.push(index as u32);
     }
 
     /// Waker を設定する
     fn set_waker(&mut self, user_data: u64, waker: Waker) {
-        if let Some(entry) = self.ops.get_mut(&user_data) {
-            entry.1 = Some(waker);
+        if let Some(i) = self.resolve(user_data) {
+            if let OpSlotState::Active { waker: w, .. } = &mut self.slots[i].state {
+                *w = Some(waker);
+            }
         }
     }
 
     /// CQE を処理して対応する Waker を wake する
     fn on_cqe(&mut self, cqe: &IoUringCqe) -> bool {
-        if let Some(entry) = self.ops.get_mut(&cqe.user_data) {
-            entry.0 = OpResult::Done(cqe.res);
-            if let Some(waker) = entry.1.take() {
-                waker.wake();
+        let Some(i) = self.resolve(cqe.user_data) else {
+            // 未知/stale な user_data（ASYNC_CANCEL 自身の CQE 等）→ 無視。
+            return false;
+        };
+        match &mut self.slots[i].state {
+            OpSlotState::Active { result, waker } => {
+                *result = OpResult::Done(cqe.res);
+                if let Some(w) = waker.take() {
+                    w.wake();
+                }
+                true
             }
-            true
-        } else if let Some(guard) = self.detached.remove(&cqe.user_data) {
-            // detach 済み op が完了/キャンセルした。ここで初めてバッファ解放・fd クローズを行う。
-            guard(cqe.res);
-            true
-        } else {
-            // 未知の user_data（ASYNC_CANCEL 自身の CQE 等）→ 無視。
-            false
+            OpSlotState::Detached(_) => {
+                // detach 済み op が完了/キャンセルした。ここで初めてバッファ解放・fd クローズを行う。
+                let state = std::mem::replace(&mut self.slots[i].state, OpSlotState::Free);
+                self.free_slot(i);
+                if let OpSlotState::Detached(guard) = state {
+                    guard.run(cqe.res);
+                }
+                true
+            }
+            OpSlotState::Free => false,
         }
     }
 
@@ -182,53 +238,66 @@ impl OpTable {
     /// 戻り値が true の場合、呼び出し側は ASYNC_CANCEL を投げてカーネルに早期キャンセルを
     /// 依頼する（accept のように放置すると次の接続を奪う op のため）。
     fn detach(&mut self, user_data: u64, guard: OpGuard) -> bool {
-        match self.ops.get(&user_data) {
-            Some((OpResult::Done(res), _)) => {
+        let Some(i) = self.resolve(user_data) else {
+            // 既に take 済み（Future が正常完了して結果を取り出した）等。カーネルはもう
+            // バッファを触らないので、ガードは呼ばずに破棄する（accept fd は引き取り済み）。
+            return false;
+        };
+        match &self.slots[i].state {
+            OpSlotState::Active {
+                result: OpResult::Done(res),
+                ..
+            } => {
                 // 既に完了済み（CQE 到着済みだが take されていない）。即座に後始末。
                 let res = *res;
-                self.ops.remove(&user_data);
-                guard(res);
+                self.free_slot(i);
+                guard.run(res);
                 false
             }
-            Some((OpResult::Pending, _)) => {
+            OpSlotState::Active {
+                result: OpResult::Pending,
+                ..
+            } => {
                 // 未完了。ガードを保持して完了/キャンセルの CQE を待つ。
-                self.ops.remove(&user_data);
-                self.detached.insert(user_data, guard);
+                self.slots[i].state = OpSlotState::Detached(guard);
                 true
             }
-            None => {
-                // 既に take 済み（Future が正常完了して結果を取り出した）。カーネルはもう
-                // バッファを触らないので、ガードは呼ばずに破棄する（accept fd は引き取り済み）。
-                drop(guard);
-                false
-            }
+            _ => false,
         }
     }
 
-    /// 操作の結果を取得し、エントリを削除する
+    /// 操作の結果を取得し、スロットを解放する
     fn take_result(&mut self, user_data: u64) -> Option<i32> {
-        if let Some(entry) = self.ops.get(&user_data) {
-            if let OpResult::Done(res) = entry.0 {
-                self.ops.remove(&user_data);
-                return Some(res);
-            }
+        let i = self.resolve(user_data)?;
+        if let OpSlotState::Active {
+            result: OpResult::Done(res),
+            ..
+        } = self.slots[i].state
+        {
+            self.free_slot(i);
+            return Some(res);
         }
         None
     }
 
-    /// 操作の結果を取得する（エントリを削除しない）
+    /// 操作の結果を取得する（スロットを解放しない）
     fn peek_result(&self, user_data: u64) -> Option<i32> {
-        if let Some(entry) = self.ops.get(&user_data) {
-            if let OpResult::Done(res) = entry.0 {
-                return Some(res);
-            }
+        let i = self.resolve(user_data)?;
+        if let OpSlotState::Active {
+            result: OpResult::Done(res),
+            ..
+        } = self.slots[i].state
+        {
+            return Some(res);
         }
         None
     }
 
-    /// 操作を削除する
+    /// 操作を削除する（結果を待たずスロットを解放する。SQE 提出失敗時等）
     fn remove(&mut self, user_data: u64) {
-        self.ops.remove(&user_data);
+        if let Some(i) = self.resolve(user_data) {
+            self.free_slot(i);
+        }
     }
 }
 
@@ -307,11 +376,14 @@ where
     })
 }
 
-/// 操作を登録する
-pub fn register_op(user_data: u64) {
-    OP_TABLE.with(|t| {
-        t.borrow_mut().register(user_data);
-    });
+/// 操作スロットを確保し、SQE に設定する user_data を返す（F-46: スラブ）。
+///
+/// 返り値は「スロット index + 世代」のパック。スレッドローカルのため一意性は
+/// スレッド内で足りる（リング `RING` と `OP_TABLE` はともにスレッドローカルで、
+/// SQE を提出したスレッドへ CQE が戻る）。`0` は無効 ID（どのスロットとも一致しない）。
+#[inline]
+pub fn alloc_op() -> u64 {
+    OP_TABLE.with(|t| t.borrow_mut().alloc())
 }
 
 /// 操作の Waker を設定する
@@ -355,6 +427,15 @@ pub fn detach_op(user_data: u64, guard: OpGuard) {
     if should_cancel {
         submit_cancel(user_data);
     }
+}
+
+/// in-flight op を detach する（ASYNC_CANCEL は投げない）。
+///
+/// TIMEOUT のように放置しても自然完了し、副作用（接続の横取り等）がない op 用。
+/// キャンセル SQE + 即時 submit のシステムコールを節約する（`timeout()` で内側 Future が
+/// 勝つたびに発生するホットパス）。スロットは自然完了の CQE 到着時に解放される。
+pub fn detach_op_no_cancel(user_data: u64, guard: OpGuard) {
+    let _ = OP_TABLE.with(|t| t.borrow_mut().detach(user_data, guard));
 }
 
 /// 指定した user_data の in-flight op に ASYNC_CANCEL を投げる（ベストエフォート）。
@@ -426,10 +507,41 @@ pub fn submit_sqes() -> std::io::Result<()> {
 // スレッドローカル状態へアクセスしても健全である（monoio / glommio と同方針）。Waker は
 // ワーカースレッドより長生きしない（OP_TABLE もスレッドローカルで同時に破棄される）。
 
-/// スラブのスロット。poll 時に `future` を take するため `Option` で保持する。
+/// プールされたタスクの poll フック（F-46）。
+///
+/// モノモルフィックな [`TaskPool`]`<F>` ごとに 1 つの vtable（`Rc<dyn PoolPoll>`）を共有し、
+/// タスクごとの `Box<dyn Future>` 確保を排除する。ディスパッチコストは従来の
+/// `dyn Future::poll` と同等（間接呼び出し 1 回）。
+pub(crate) trait PoolPoll {
+    /// スロットの future を poll する。`Ready` 時はスロットを解放済みで返す。
+    fn poll_slot(&self, slot: u32, cx: &mut Context<'_>) -> Poll<()>;
+    /// スロットの future を drop して解放する（未完了タスクの破棄時）。
+    /// 既に解放済み（`Ready` 返却後）の場合は何もしない。
+    fn drop_slot(&self, slot: u32);
+}
+
+/// タスク本体（F-46: Box 型消去 or 型付きプールのスロット参照）。
+enum TaskBody {
+    /// 型消去された Future（汎用 `spawn()`）。
+    Boxed(Pin<Box<dyn Future<Output = ()> + 'static>>),
+    /// 型付きプールに格納された Future（`TaskPool::spawn()`。spawn ごとのヒープ確保なし）。
+    Pooled { pool: Rc<dyn PoolPoll>, slot: u32 },
+}
+
+impl Drop for TaskBody {
+    fn drop(&mut self) {
+        if let TaskBody::Pooled { pool, slot } = self {
+            // 未完了のまま破棄された場合に future を解放する。正常完了時は
+            // `poll_slot` が解放済みで、`drop_slot` は no-op（二重解放しない）。
+            pool.drop_slot(*slot);
+        }
+    }
+}
+
+/// スラブのスロット。poll 時に `body` を take するため `Option` で保持する。
 struct TaskSlot {
-    /// Future 本体（型消去のため Box。poll 中は take して None になる）
-    future: Option<Pin<Box<dyn Future<Output = ()> + 'static>>>,
+    /// タスク本体（poll 中は take して None になる）
+    body: Option<TaskBody>,
     /// 世代カウンタ。スロット再利用時に +1 し、古い Waker からの wake を弾く。
     generation: u32,
     /// 既に ready キューに積まれているか（重複 push 抑止）。
@@ -455,17 +567,17 @@ impl ExecutorState {
         }
     }
 
-    /// Box 化済み Future を新しいスロットへ格納し、ready キューへ積む。
-    fn spawn_boxed(&mut self, future: Pin<Box<dyn Future<Output = ()> + 'static>>) {
+    /// タスク本体を新しいスロットへ格納し、ready キューへ積む。
+    fn spawn_body(&mut self, body: TaskBody) {
         let index = if let Some(i) = self.free.pop() {
             let slot = &mut self.slots[i];
-            slot.future = Some(future);
+            slot.body = Some(body);
             slot.scheduled = true;
             i
         } else {
             let i = self.slots.len();
             self.slots.push(TaskSlot {
-                future: Some(future),
+                body: Some(body),
                 generation: 0,
                 scheduled: true,
             });
@@ -579,27 +691,30 @@ impl Executor {
                 None => break,
             };
 
-            // スロットを検証して future を take する（poll 中は borrow しない）。
+            // スロットを検証してタスク本体を take する（poll 中は borrow しない）。
             let taken = EXEC_STATE.with(|s| {
                 let mut st = s.borrow_mut();
                 match st.slots.get_mut(index) {
                     Some(slot) if slot.generation == generation => {
                         slot.scheduled = false;
-                        slot.future.take()
+                        slot.body.take()
                     }
                     // 世代不一致 = 解放済みの stale エントリ。スキップ。
                     _ => None,
                 }
             });
-            let mut future = match taken {
-                Some(f) => f,
+            let mut body = match taken {
+                Some(b) => b,
                 None => continue,
             };
 
             // poll（EXEC_STATE 非借用）。
             let waker = make_waker(index, generation);
             let mut cx = Context::from_waker(&waker);
-            let poll = future.as_mut().poll(&mut cx);
+            let poll = match &mut body {
+                TaskBody::Boxed(f) => f.as_mut().poll(&mut cx),
+                TaskBody::Pooled { pool, slot } => pool.poll_slot(*slot, &mut cx),
+            };
 
             // 結果を反映する。
             EXEC_STATE.with(|s| {
@@ -607,12 +722,13 @@ impl Executor {
                 let ready_done = match st.slots.get_mut(index) {
                     Some(slot) if slot.generation == generation => match poll {
                         Poll::Pending => {
-                            // future をスロットへ戻す。
-                            slot.future = Some(future);
+                            // タスク本体をスロットへ戻す。
+                            slot.body = Some(body);
                             false
                         }
                         Poll::Ready(()) => {
-                            // スロットを解放: 世代 +1、scheduled クリア。future(ローカル) は drop。
+                            // スロットを解放: 世代 +1、scheduled クリア。body(ローカル) は drop
+                            //（Pooled の場合、pool スロットは poll_slot が解放済み）。
                             slot.generation = slot.generation.wrapping_add(1);
                             slot.scheduled = false;
                             true
@@ -693,7 +809,7 @@ where
 {
     // Box 化（確保）はスレッドローカル borrow の外で行う。
     let boxed: Pin<Box<dyn Future<Output = ()> + 'static>> = Box::pin(future);
-    EXEC_STATE.with(|s| s.borrow_mut().spawn_boxed(boxed));
+    EXEC_STATE.with(|s| s.borrow_mut().spawn_body(TaskBody::Boxed(boxed)));
 }
 
 /// 現在のスレッドのエグゼキュータハンドルを取得する。
@@ -702,6 +818,152 @@ where
 /// イベントループでポーリングされる。
 pub fn current_executor() -> Executor {
     Executor::new()
+}
+
+// ====================
+// 型付きタスクプール（F-46）
+// ====================
+
+/// 1 チャンクあたりのスロット数。
+///
+/// 接続ハンドラの async fn Future は非常に大きい（全ローカル変数を await 跨ぎで内包する）
+/// ため、チャンク粒度を小さめにして未使用スロットの RSS を抑える。
+const POOL_CHUNK: usize = 16;
+
+/// 型付きタスクプール（F-46: spawn ごとの `Box<dyn Future>` ヒープ確保を排除）。
+///
+/// 同一の具象 Future 型 `F`（接続ハンドラ・HTTP/3 バックエンドタスク等、spawn
+/// 呼び出しサイトごとに 1 つ定まる `async` ブロック型）をチャンク化スラブに
+/// インライン格納する。spawn の定常コストは「スラブスロット再利用 + `Rc` クローン +
+/// エグゼキュータスロット再利用」のみで、**ウォームアップ後は malloc ゼロ**になる。
+///
+/// ## Pin 健全性
+///
+/// future は `Box<[RefCell<Option<F>>; POOL_CHUNK]>`（ヒープ上の固定長配列）に格納され、
+/// チャンク列（`Vec<Box<..>>`）が成長しても **チャンク自体は移動しない**。poll は
+/// in-place（take しない）で行い、解放（`Option` を `None` 化して drop）まで一切
+/// ムーブしないため、`Pin::new_unchecked` の要件を満たす。
+///
+/// ## 借用規律（単一スレッド）
+///
+/// - `poll_slot` はチャンク列の借用を **poll 前に解放**する（poll 中の future が同じ
+///   プールへ `spawn` して `chunks` を可変借用しても安全）。
+/// - スロットセルの `RefCell` 借用は poll 中保持されるが、同一スロットを再入的に
+///   poll する経路は存在しない（エグゼキュータはスロットごとに 1 タスクとして直列に
+///   poll する）。万一の再入は `RefCell` が panic で検出する。
+pub struct TaskPool<F: Future<Output = ()> + 'static> {
+    inner: Rc<PoolInner<F>>,
+}
+
+impl<F: Future<Output = ()> + 'static> Clone for TaskPool<F> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+struct PoolInner<F> {
+    /// チャンク列。チャンクは Box によりヒープ上で位置固定（Pin 健全性の要）。
+    chunks: RefCell<Vec<Box<[RefCell<Option<F>>]>>>,
+    /// 空きスロット index の free-list（LIFO）。
+    free: RefCell<Vec<u32>>,
+}
+
+impl<F: Future<Output = ()> + 'static> TaskPool<F> {
+    /// 空のプールを作成する。`F` は最初の `spawn` 呼び出しから推論される。
+    pub fn new() -> Self {
+        Self {
+            inner: Rc::new(PoolInner {
+                chunks: RefCell::new(Vec::new()),
+                free: RefCell::new(Vec::new()),
+            }),
+        }
+    }
+
+    /// future をプールのスロットへ格納し、エグゼキュータのタスクとして起動する。
+    pub fn spawn(&self, future: F) {
+        let slot = {
+            let mut free = self.inner.free.borrow_mut();
+            match free.pop() {
+                Some(s) => s,
+                None => {
+                    // 新チャンクを確保し、先頭以外を free-list へ積む。
+                    // 注意: 巨大な async fn Future ではチャンク（POOL_CHUNK × size_of::<F>()）が
+                    // 数 MB になり得るため、スタック経由の配列構築（Box::new([..; N])）は
+                    // スタックオーバーフローを起こす。Vec 経由でヒープ上に直接構築する。
+                    let mut chunks = self.inner.chunks.borrow_mut();
+                    let base = (chunks.len() * POOL_CHUNK) as u32;
+                    let chunk: Box<[RefCell<Option<F>>]> = (0..POOL_CHUNK)
+                        .map(|_| RefCell::new(None))
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice();
+                    chunks.push(chunk);
+                    for i in (1..POOL_CHUNK as u32).rev() {
+                        free.push(base + i);
+                    }
+                    base
+                }
+            }
+        };
+        {
+            let chunks = self.inner.chunks.borrow();
+            let cell = &chunks[slot as usize / POOL_CHUNK][slot as usize % POOL_CHUNK];
+            *cell.borrow_mut() = Some(future);
+        }
+        let pool: Rc<dyn PoolPoll> = self.inner.clone();
+        EXEC_STATE.with(|s| s.borrow_mut().spawn_body(TaskBody::Pooled { pool, slot }));
+    }
+}
+
+impl<F: Future<Output = ()> + 'static> Default for TaskPool<F> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<F: Future<Output = ()> + 'static> PoolPoll for PoolInner<F> {
+    fn poll_slot(&self, slot: u32, cx: &mut Context<'_>) -> Poll<()> {
+        // チャンク列の借用を poll 前に解放するため、セルへの生ポインタを取る。
+        // SAFETY: チャンクは Box で位置固定・縮小しない。スロットの解放者は本 poll
+        // のみ（単一スレッド・エグゼキュータのタスク直列 poll）なので、poll 中に
+        // セルが解放・再利用されることはない。
+        let cell: *const RefCell<Option<F>> = {
+            let chunks = self.chunks.borrow();
+            &chunks[slot as usize / POOL_CHUNK][slot as usize % POOL_CHUNK] as *const _
+        };
+        let cell = unsafe { &*cell };
+        let mut guard = cell.borrow_mut();
+        let fut = guard.as_mut().expect("pooled task polled after completion");
+        // SAFETY: future は格納後、解放（in-place drop）まで一切ムーブしない。
+        let pinned = unsafe { Pin::new_unchecked(fut) };
+        match pinned.poll(cx) {
+            Poll::Ready(()) => {
+                *guard = None; // future を in-place drop
+                drop(guard);
+                self.free.borrow_mut().push(slot);
+                Poll::Ready(())
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn drop_slot(&self, slot: u32) {
+        let cell: *const RefCell<Option<F>> = {
+            let chunks = self.chunks.borrow();
+            &chunks[slot as usize / POOL_CHUNK][slot as usize % POOL_CHUNK] as *const _
+        };
+        // SAFETY: poll_slot と同じ固定位置保証。
+        let cell = unsafe { &*cell };
+        let had_future = {
+            let mut guard = cell.borrow_mut();
+            guard.take().is_some() // in-place drop
+        };
+        if had_future {
+            // 正常完了時（poll_slot が解放済み）は free へ二重 push しない。
+            self.free.borrow_mut().push(slot);
+        }
+    }
 }
 
 /// 現在のタスクを一度だけ実行キューの末尾へ譲る（協調的 yield）。
@@ -834,10 +1096,10 @@ mod executor_tests {
         // 手動でスロットを 1 つ確保→解放→再確保し、世代が進むことを検証する。
         EXEC_STATE.with(|s| {
             let mut st = s.borrow_mut();
-            st.spawn_boxed(Box::pin(async {}));
+            st.spawn_body(TaskBody::Boxed(Box::pin(async {})));
             let (idx, gen0) = st.ready.pop_front().unwrap();
             // 解放（poll で Ready 相当）: 世代 +1 して free へ。
-            st.slots[idx].future = None;
+            st.slots[idx].body = None;
             st.slots[idx].generation = st.slots[idx].generation.wrapping_add(1);
             st.slots[idx].scheduled = false;
             st.free.push(idx);
@@ -845,7 +1107,7 @@ mod executor_tests {
             st.schedule(idx, gen0);
             assert!(st.ready.is_empty(), "stale generation must be ignored");
             // 再確保すると同じスロットが世代 +1 で払い出される。
-            st.spawn_boxed(Box::pin(async {}));
+            st.spawn_body(TaskBody::Boxed(Box::pin(async {})));
             let (idx2, gen2) = st.ready.pop_front().unwrap();
             assert_eq!(idx2, idx, "freed slot should be reused");
             assert_ne!(gen2, gen0, "generation must advance on reuse");
@@ -854,35 +1116,204 @@ mod executor_tests {
 
     /// OP_TABLE 専用ハッシャ（NoHashU64）が u64 キーで衝突なく機能し、HashMap の登録／
     /// 取得／削除が正しく動くことを検証する（SipHash 排除後のリグレッションガード）。
+    // ==================== OP_TABLE スラブ（F-46） ====================
+
     #[test]
-    fn op_table_nohash_roundtrip() {
-        use std::hash::{Hash, Hasher};
-
-        // 異なる連番キーは異なるハッシュへ拡散される（上位ビットも 0 でない）。
-        let mut h1 = NoHashU64::default();
-        1u64.hash(&mut h1);
-        let mut h2 = NoHashU64::default();
-        2u64.hash(&mut h2);
-        assert_ne!(h1.finish(), h2.finish());
-        assert_ne!(
-            h1.finish() >> 57,
-            0,
-            "upper bits must be spread for SwissTable"
-        );
-
-        // OpTable の基本ライフサイクル（register → on_cqe → take）が新ハッシャ上で動作する。
+    fn op_table_slab_roundtrip() {
         let mut table = OpTable::new();
-        for ud in [1u64, 2, 3, 1_000_000, u64::MAX - 1] {
-            table.register(ud);
-        }
+        let ud = table.alloc();
+        assert_ne!(ud, 0, "user_data 0 は無効 ID として予約");
+        // 未完了はまだ取り出せない。
+        assert_eq!(table.take_result(ud), None);
+        assert_eq!(table.peek_result(ud), None);
         let cqe = IoUringCqe {
-            user_data: 1_000_000,
+            user_data: ud,
             res: 42,
             flags: 0,
         };
         assert!(table.on_cqe(&cqe));
-        assert_eq!(table.take_result(1_000_000), Some(42));
-        // 未完了キーはまだ取り出せない。
-        assert_eq!(table.take_result(2), None);
+        assert_eq!(table.peek_result(ud), Some(42));
+        assert_eq!(table.take_result(ud), Some(42));
+        // take 後は世代が進み、同じ user_data は無効。
+        assert_eq!(table.take_result(ud), None);
+        assert!(!table.on_cqe(&cqe), "stale CQE は無視される");
+    }
+
+    #[test]
+    fn op_table_slab_reuses_slots_with_new_generation() {
+        let mut table = OpTable::new();
+        let ud1 = table.alloc();
+        assert_eq!(table.take_result(ud1), None);
+        table.remove(ud1);
+        let ud2 = table.alloc();
+        // 同じスロットが再利用されるが世代が異なる（旧 ID は無効）。
+        assert_eq!(
+            unpack_op(ud1).0,
+            unpack_op(ud2).0,
+            "LIFO free-list で同一スロット"
+        );
+        assert_ne!(ud1, ud2, "世代が進んで別 ID");
+        let stale = IoUringCqe {
+            user_data: ud1,
+            res: 7,
+            flags: 0,
+        };
+        assert!(
+            !table.on_cqe(&stale),
+            "旧世代の CQE は新 op に影響しない (B-07)"
+        );
+        assert_eq!(table.peek_result(ud2), None);
+    }
+
+    #[test]
+    fn op_table_slab_detach_pending_then_cqe_runs_guard() {
+        let mut table = OpTable::new();
+        let ud = table.alloc();
+        let ran = Rc::new(Cell::new(-1i32));
+        let ran2 = ran.clone();
+        let should_cancel = table.detach(ud, OpGuard::Cleanup(Box::new(move |res| ran2.set(res))));
+        assert!(should_cancel, "未完了 op の detach はキャンセル要求");
+        assert_eq!(ran.get(), -1, "ガードは CQE 到着まで実行されない");
+        let cqe = IoUringCqe {
+            user_data: ud,
+            res: -125, // ECANCELED
+            flags: 0,
+        };
+        assert!(table.on_cqe(&cqe));
+        assert_eq!(ran.get(), -125, "CQE でガードが実行される");
+        // スロットは解放済み → 同 ID は無効。
+        assert!(!table.on_cqe(&cqe));
+    }
+
+    #[test]
+    fn op_table_slab_detach_done_runs_guard_immediately() {
+        let mut table = OpTable::new();
+        let ud = table.alloc();
+        let cqe = IoUringCqe {
+            user_data: ud,
+            res: 5,
+            flags: 0,
+        };
+        assert!(table.on_cqe(&cqe));
+        let ran = Rc::new(Cell::new(-1i32));
+        let ran2 = ran.clone();
+        let should_cancel = table.detach(ud, OpGuard::Cleanup(Box::new(move |res| ran2.set(res))));
+        assert!(!should_cancel, "完了済み op の detach はキャンセル不要");
+        assert_eq!(ran.get(), 5, "完了済みなら即座にガード実行");
+    }
+
+    #[test]
+    fn op_table_slab_detach_after_take_drops_guard() {
+        let mut table = OpTable::new();
+        let ud = table.alloc();
+        let cqe = IoUringCqe {
+            user_data: ud,
+            res: 1,
+            flags: 0,
+        };
+        table.on_cqe(&cqe);
+        assert_eq!(table.take_result(ud), Some(1));
+        let ran = Rc::new(Cell::new(false));
+        let ran2 = ran.clone();
+        let should_cancel = table.detach(ud, OpGuard::Cleanup(Box::new(move |_| ran2.set(true))));
+        assert!(!should_cancel);
+        assert!(!ran.get(), "take 済み op の detach はガードを実行せず破棄");
+    }
+
+    #[test]
+    fn op_table_slab_invalid_ids_ignored() {
+        let mut table = OpTable::new();
+        let _ud = table.alloc();
+        // 0（無効 ID）と CANCEL_SENTINEL は常に無視される。
+        assert!(!table.on_cqe(&IoUringCqe {
+            user_data: 0,
+            res: 0,
+            flags: 0
+        }));
+        assert!(!table.on_cqe(&IoUringCqe {
+            user_data: CANCEL_SENTINEL_USER_DATA,
+            res: 0,
+            flags: 0
+        }));
+        assert_eq!(table.take_result(0), None);
+        assert_eq!(table.peek_result(0), None);
+    }
+
+    // ==================== 型付きタスクプール（F-46） ====================
+
+    #[test]
+    fn task_pool_spawn_and_complete() {
+        init_executor();
+        let exec = current_executor();
+        let counter = Rc::new(Cell::new(0usize));
+        let got = exec.block_on({
+            let counter = counter.clone();
+            async move {
+                let pool = TaskPool::new();
+                for _ in 0..100 {
+                    let c = counter.clone();
+                    pool.spawn(async move {
+                        yield_once().await;
+                        c.set(c.get() + 1);
+                    });
+                }
+                while counter.get() < 100 {
+                    yield_once().await;
+                }
+                counter.get()
+            }
+        });
+        assert_eq!(got, 100);
+    }
+
+    #[test]
+    fn task_pool_reuses_slots() {
+        // 逐次 spawn→完了を繰り返してもチャンクが増えない（スロット再利用）。
+        init_executor();
+        let exec = current_executor();
+        exec.block_on(async move {
+            let pool = TaskPool::new();
+            for _ in 0..500 {
+                let done = Rc::new(Cell::new(false));
+                let d = done.clone();
+                pool.spawn(async move {
+                    yield_once().await;
+                    d.set(true);
+                });
+                while !done.get() {
+                    yield_once().await;
+                }
+            }
+            let chunks = pool.inner.chunks.borrow().len();
+            assert_eq!(chunks, 1, "逐次実行では 1 チャンクで足りる");
+        });
+    }
+
+    #[test]
+    fn task_pool_grows_chunks_under_concurrency() {
+        // 同時 100 タスクは 2 チャンク（128 スロット）に収まる。
+        init_executor();
+        let exec = current_executor();
+        let counter = Rc::new(Cell::new(0usize));
+        exec.block_on({
+            let counter = counter.clone();
+            async move {
+                let pool = TaskPool::new();
+                for _ in 0..100 {
+                    let c = counter.clone();
+                    pool.spawn(async move {
+                        yield_once().await;
+                        yield_once().await;
+                        c.set(c.get() + 1);
+                    });
+                }
+                while counter.get() < 100 {
+                    yield_once().await;
+                }
+                let need = 100usize.div_ceil(POOL_CHUNK);
+                assert_eq!(pool.inner.chunks.borrow().len(), need);
+                assert_eq!(pool.inner.free.borrow().len(), need * POOL_CHUNK);
+            }
+        });
     }
 }

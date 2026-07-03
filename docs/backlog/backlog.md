@@ -81,7 +81,7 @@
 | F-43 | P3 | 未着手 | [features/F-43-wasm-hotpath-alloc-reduction.md](features/F-43-wasm-hotpath-alloc-reduction.md) | WASM パスのアロケーション（clone / deep copy）削減（F-29 残件） |
 | F-44 | P1 | 完了 | [features/F-44-tls-backend-streaming.md](features/F-44-tls-backend-streaming.md) | TLS バックエンドのストリーミング化（F-32 残件）。HTTP/3 classify の TLS 除外を撤去し、全二重 TLS ラッパー（TlsBackend、RefCell 借用を await 跨ぎで保持しない設計）で貫通。旧「リクエストごと std::thread + ブロッキング TLS + 全量バッファ」経路を置換 |
 | F-45 | P3 | 完了 | [features/F-45-http3-gro-batch-recv.md](features/F-45-http3-gro-batch-recv.md) | HTTP/3 GRO バッチの per-segment オーバーヘッド削減（RefCell 借用 1 回化・同一 DCID 判定スキップ。quiche recv は 1 データグラム API のため一括渡しは不可、F-33 残件） |
-| F-46 | P3 | 未着手 | [features/F-46-typed-task-pool-optable-slab.md](features/F-46-typed-task-pool-optable-slab.md) | executor の Box&lt;dyn Future&gt; 排除・OP_TABLE スラブ化（F-34 / F-37 残件） |
+| F-46 | P3 | 完了 | [features/F-46-typed-task-pool-optable-slab.md](features/F-46-typed-task-pool-optable-slab.md) | executor の Box&lt;dyn Future&gt; 排除・OP_TABLE スラブ化（F-34 / F-37 残件）。OP_TABLE を index+世代パックのスラブへ置換（per-op ハッシュ排除、B-07 の detach 意味論は世代で担保）、型付き TaskPool で接続/リクエスト spawn の malloc をゼロ化。Sleep の in-flight drop リークも修正 |
 | F-47 | P3 | 保留 | [features/F-47-xdp-ebpf-sandbox-env.md](features/F-47-xdp-ebpf-sandbox-env.md) | XDP/eBPF 隔離検証環境の構築とモジュール分離（F-35 残件、CAP_BPF / 対応 NIC の環境依存） |
 | F-48 | P3 | 未着手 | [features/F-48-proxy-wasm-benchmark-expansion.md](features/F-48-proxy-wasm-benchmark-expansion.md) | Proxy-Wasm ベンチマーク拡充（プール枯渇・fuel・RSS・HTTP コールあり、F-08 残件） |
 | F-49 | P1 | 完了 | [features/F-49-reload-e2e-verification.md](features/F-49-reload-e2e-verification.md) | 設定ファイル・TLS 証明書リロードの正常性確認 E2E テスト（SIGHUP 実送出でルート反映・不正設定フェイルセーフ・証明書差し替え/ゼロダウンタイムを検証） |

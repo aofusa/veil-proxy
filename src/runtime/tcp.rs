@@ -19,8 +19,8 @@ use std::task::{Context, Poll};
 
 use crate::runtime::buf::{IoBuf, IoBufMut};
 use crate::runtime::executor::{
-    detach_op, next_user_data, peek_op_result, register_op, remove_op, set_op_waker, submit_sqes,
-    take_op_result, with_ring,
+    alloc_op, detach_op, peek_op_result, remove_op, set_op_waker, submit_sqes, take_op_result,
+    with_ring, OpGuard,
 };
 use crate::runtime::ring::{
     IORING_OP_ACCEPT, IORING_OP_CONNECT, IORING_OP_POLL_ADD, IORING_OP_RECV, IORING_OP_SEND,
@@ -269,9 +269,8 @@ impl<'a> Future for Accept<'a> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if !self.submitted {
-            let user_data = next_user_data();
+            let user_data = alloc_op();
             self.user_data = user_data;
-            register_op(user_data);
 
             let listener_fd = self.listener_fd;
             let addr_ptr = self.addr_storage.as_mut() as *mut libc::sockaddr_storage;
@@ -329,7 +328,7 @@ impl Drop for Accept<'_> {
             let len = std::mem::replace(&mut self.addr_len, Box::new(0));
             detach_op(
                 self.user_data,
-                Box::new(move |res| {
+                OpGuard::Cleanup(Box::new(move |res| {
                     // op の完了/キャンセルが確定したのでここで解放する。
                     drop(storage);
                     drop(len);
@@ -337,7 +336,7 @@ impl Drop for Accept<'_> {
                         // accept が成功して fd を得ていたが Future は消えている → クローズ。
                         unsafe { libc::close(res) };
                     }
-                }),
+                })),
             );
         }
     }
@@ -583,9 +582,8 @@ impl Future for Connect {
             };
             self.fd = fd;
 
-            let user_data = next_user_data();
+            let user_data = alloc_op();
             self.user_data = user_data;
-            register_op(user_data);
 
             let (storage, len) = sockaddr_to_storage(&self.addr);
             *self.addr_storage = storage;
@@ -652,12 +650,12 @@ impl Drop for Connect {
             self.fd = -1;
             detach_op(
                 self.user_data,
-                Box::new(move |_res| {
+                OpGuard::Cleanup(Box::new(move |_res| {
                     drop(storage);
                     if fd >= 0 {
                         unsafe { libc::close(fd) };
                     }
-                }),
+                })),
             );
         } else if self.fd >= 0 {
             unsafe { libc::close(self.fd) };
@@ -690,9 +688,8 @@ impl<T: IoBufMut> Future for ReadFuture<T> {
         let this = unsafe { self.get_unchecked_mut() };
 
         if !this.submitted {
-            let user_data = next_user_data();
+            let user_data = alloc_op();
             this.user_data = user_data;
-            register_op(user_data);
 
             let fd = this.fd;
             let (buf_ptr, buf_len) = {
@@ -750,7 +747,10 @@ impl<T: IoBufMut> Drop for ReadFuture<T> {
         // バッファを完了/キャンセルの CQE 到着まで生かし、その後に解放する。
         if self.submitted {
             if let Some(buf) = self.buf.take() {
-                detach_op(self.user_data, Box::new(move |_res| drop(buf)));
+                detach_op(
+                    self.user_data,
+                    OpGuard::Cleanup(Box::new(move |_res| drop(buf))),
+                );
             }
         }
     }
@@ -779,9 +779,8 @@ impl<T: IoBuf> Future for WriteFuture<T> {
         let this = unsafe { self.get_unchecked_mut() };
 
         if !this.submitted {
-            let user_data = next_user_data();
+            let user_data = alloc_op();
             this.user_data = user_data;
-            register_op(user_data);
 
             let fd = this.fd;
             let (buf_ptr, buf_len) = {
@@ -835,7 +834,10 @@ impl<T: IoBuf> Drop for WriteFuture<T> {
         // 完了/キャンセルの CQE 到着まで生かす。
         if self.submitted {
             if let Some(buf) = self.buf.take() {
-                detach_op(self.user_data, Box::new(move |_res| drop(buf)));
+                detach_op(
+                    self.user_data,
+                    OpGuard::Cleanup(Box::new(move |_res| drop(buf))),
+                );
             }
         }
     }
@@ -858,9 +860,8 @@ impl<'a> Future for Readable<'a> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if !self.submitted {
-            let user_data = next_user_data();
+            let user_data = alloc_op();
             self.user_data = user_data;
-            register_op(user_data);
 
             let fd = self.fd;
             with_ring(|ring| {
@@ -904,7 +905,7 @@ impl Drop for Readable<'_> {
         // 古い Waker が OP_TABLE に残ると、後着 CQE で完了済みタスクが再 poll され UB
         // （B-07a）。detach してエントリを除去し ASYNC_CANCEL で poll を畳む。
         if self.submitted {
-            detach_op(self.user_data, Box::new(|_| {}));
+            detach_op(self.user_data, OpGuard::Noop);
         }
     }
 }
@@ -922,9 +923,8 @@ impl<'a> Future for Writable<'a> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if !self.submitted {
-            let user_data = next_user_data();
+            let user_data = alloc_op();
             self.user_data = user_data;
-            register_op(user_data);
 
             let fd = self.fd;
             with_ring(|ring| {
@@ -966,7 +966,7 @@ impl Drop for Writable<'_> {
     fn drop(&mut self) {
         // B-07a: in-flight の POLL_ADD を残さない（Readable と同様）。
         if self.submitted {
-            detach_op(self.user_data, Box::new(|_| {}));
+            detach_op(self.user_data, OpGuard::Noop);
         }
     }
 }
@@ -987,9 +987,8 @@ impl Future for ReadableFd {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if !self.submitted {
-            let user_data = next_user_data();
+            let user_data = alloc_op();
             self.user_data = user_data;
-            register_op(user_data);
 
             let fd = self.fd;
             with_ring(|ring| {
@@ -1031,7 +1030,7 @@ impl Drop for ReadableFd {
     fn drop(&mut self) {
         // B-07a: in-flight の POLL_ADD を残さない。
         if self.submitted {
-            detach_op(self.user_data, Box::new(|_| {}));
+            detach_op(self.user_data, OpGuard::Noop);
         }
     }
 }
@@ -1048,9 +1047,8 @@ impl Future for WritableFd {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if !self.submitted {
-            let user_data = next_user_data();
+            let user_data = alloc_op();
             self.user_data = user_data;
-            register_op(user_data);
 
             let fd = self.fd;
             with_ring(|ring| {
@@ -1092,7 +1090,7 @@ impl Drop for WritableFd {
     fn drop(&mut self) {
         // B-07a: in-flight の POLL_ADD を残さない。
         if self.submitted {
-            detach_op(self.user_data, Box::new(|_| {}));
+            detach_op(self.user_data, OpGuard::Noop);
         }
     }
 }

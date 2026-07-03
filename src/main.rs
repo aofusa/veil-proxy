@@ -850,6 +850,9 @@ fn main() {
 
                     info!("[Thread {}] Worker started", thread_id);
 
+                    // F-46: 接続ハンドラの型付きタスクプール（spawn ごとの Box 確保を排除）
+                    let conn_pool = crate::runtime::TaskPool::new();
+
                     loop {
                         // Shutdown チェック
                         if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
@@ -894,8 +897,8 @@ fn main() {
 
                         let acceptor = acceptor_clone.clone();
 
-                        // spawn_with_panic_catch を使用してパニック時もスレッドが生存し続ける
-                        spawn_with_panic_catch(async move {
+                        // パニックキャッチ + 型付きプール（F-46）でスレッド生存とゼロ確保を両立
+                        crate::system::spawn_pooled_with_panic_catch(&conn_pool, async move {
                             // ConnectionGuard がスコープ内で生存している間、接続がカウントされる
                             // パニック時も Drop が呼ばれるため、カウンターの整合性が保証される
                             let _guard = ConnectionGuard::new();
@@ -938,6 +941,9 @@ fn main() {
 
                 info!("[HTTP] Redirect worker started");
 
+                // F-46: リダイレクトハンドラの型付きタスクプール
+                let redirect_pool = crate::runtime::TaskPool::new();
+
                 loop {
                     // Shutdown チェック
                     if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
@@ -967,8 +973,8 @@ fn main() {
 
                     let _ = stream.set_nodelay(true);
 
-                    // 軽量なリダイレクト処理をspawn（パニック耐性あり）
-                    spawn_with_panic_catch(async move {
+                    // 軽量なリダイレクト処理をspawn（パニック耐性あり・型付きプール）
+                    crate::system::spawn_pooled_with_panic_catch(&redirect_pool, async move {
                         handle_http_redirect(stream).await;
                     });
                 }
@@ -1167,6 +1173,9 @@ fn main() {
 
                     info!("[H2C Worker {}] Started", thread_id);
 
+                    // F-46: H2C 接続ハンドラの型付きタスクプール
+                    let conn_pool = crate::runtime::TaskPool::new();
+
                     loop {
                         // Shutdown チェック
                         if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
@@ -1208,8 +1217,8 @@ fn main() {
 
                         let _ = stream.set_nodelay(true);
 
-                        // H2C接続処理をspawn（パニック耐性あり）
-                        spawn_with_panic_catch(async move {
+                        // H2C接続処理をspawn（パニック耐性あり・型付きプール）
+                        crate::system::spawn_pooled_with_panic_catch(&conn_pool, async move {
                             let _guard = ConnectionGuard::new();
                             // H2C専用リスナーでも、プロトコル検出を実行して初期データを取得
                             // これにより、クライアントがまだプリフェースを送信していない場合でも

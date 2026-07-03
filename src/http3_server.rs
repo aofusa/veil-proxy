@@ -357,6 +357,8 @@ struct Http3Handler {
     stream_bodies: HashMap<u64, BytesMut>,
     /// バックエンドタスク → メインループの起床通知（F-32）。
     notify: crate::http3_stream::H3Notify,
+    /// バックエンドタスクのスポーナ（F-46: 型付きタスクプール。ワーカースレッドで共有）。
+    backend_spawner: crate::http3_stream::BackendSpawner,
 }
 
 impl Http3Handler {
@@ -365,6 +367,7 @@ impl Http3Handler {
         conn: quiche::Connection,
         peer_addr: SocketAddr,
         notify: crate::http3_stream::H3Notify,
+        backend_spawner: crate::http3_stream::BackendSpawner,
     ) -> Self {
         Self {
             conn,
@@ -376,6 +379,7 @@ impl Http3Handler {
             buffered_reqs: HashMap::new(),
             stream_bodies: HashMap::new(),
             notify,
+            backend_spawner,
         }
     }
 
@@ -482,12 +486,7 @@ impl Http3Handler {
                             ps.req_pending.push_back(body.freeze());
                         }
                     }
-                    crate::http3_stream::spawn_backend_task(
-                        params,
-                        req_rx,
-                        resp_tx,
-                        self.notify.clone(),
-                    );
+                    (self.backend_spawner)(params, req_rx, resp_tx, self.notify.clone());
                     self.proxy_streams.insert(stream_id, ps);
                 }
                 Decision::Buffer => {
@@ -2848,6 +2847,8 @@ pub async fn run_http3_server_async(
 
     // F-32: バックエンドタスク → メインループの起床通知（全ハンドラ/タスクで共有）。
     let notify = crate::http3_stream::H3Notify::new();
+    // F-46: バックエンドタスクの型付きプール（本ワーカースレッドの全接続で共有）。
+    let backend_spawner = crate::http3_stream::backend_task_spawner();
 
     // 乱数生成器
     let rng = SystemRandom::new();
@@ -3039,7 +3040,12 @@ pub async fn run_http3_server_async(
                             debug!("[HTTP/3] New connection from {}", from);
 
                             // 最新のルーティング設定を取得
-                            let handler = Http3Handler::new(conn, from, notify.clone());
+                            let handler = Http3Handler::new(
+                                conn,
+                                from,
+                                notify.clone(),
+                                backend_spawner.clone(),
+                            );
                             conns.insert(scid.clone(), handler);
 
                             prev_cid = Some(scid.clone());

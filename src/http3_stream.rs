@@ -654,44 +654,60 @@ pub(crate) struct BackendTaskParams {
     pub tls_insecure: bool,
 }
 
-/// バックエンドストリーミングタスクを起動する。
+/// バックエンドタスクを起動するスポーナ（F-46: 型付きタスクプール）。
 ///
-/// メインループ（`process_h3_events`）から `crate::runtime::spawn` で呼ばれ、当該リクエストの
+/// リクエストごとに spawn される最ホットなタスクのため、`Box<dyn Future>` 確保を
+/// 型付きプール（[`crate::runtime::TaskPool`]）で排除する。タスクの具象 Future 型
+/// （`async fn` の匿名型）はモジュール外から命名できないため、プールをクロージャに
+/// 閉じ込めて `Rc<dyn Fn>` として配布する（クロージャは HTTP/3 ワーカースレッドごとに
+/// 1 回だけ作られ、spawn 呼び出しは動的ディスパッチ 1 回 + プールスロット再利用のみ）。
+pub(crate) type BackendSpawner =
+    Rc<dyn Fn(BackendTaskParams, Receiver<Bytes>, Sender<RespMsg>, H3Notify)>;
+
+/// HTTP/3 ワーカースレッド用のバックエンドタスクスポーナを作成する。
+pub(crate) fn backend_task_spawner() -> BackendSpawner {
+    let pool = crate::runtime::TaskPool::new();
+    Rc::new(move |params, req_body_rx, resp_tx, notify| {
+        pool.spawn(backend_task(params, req_body_rx, resp_tx, notify));
+    })
+}
+
+/// バックエンドストリーミングタスク本体。
+///
+/// メインループ（`process_h3_events`）から [`BackendSpawner`] 経由で起動され、当該リクエストの
 /// バックエンド往復を独立タスクとして駆動する。タスクは `connections` を一切触らず、
 /// チャネル経由でのみメインループと通信する（quiche の非 Send 制約を満たす）。
-pub(crate) fn spawn_backend_task(
+async fn backend_task(
     params: BackendTaskParams,
     req_body_rx: Receiver<Bytes>,
     resp_tx: Sender<RespMsg>,
     notify: H3Notify,
 ) {
-    crate::runtime::spawn(async move {
-        let server = params.server;
-        server.acquire();
-        let outcome = run_backend_task(
-            &server,
-            params.request_head,
-            params.has_request_body,
-            &params.compression,
-            params.client_encoding,
-            params.timeout_secs,
-            params.use_tls,
-            &params.sni,
-            params.tls_insecure,
-            &req_body_rx,
-            &resp_tx,
-            &notify,
-        )
-        .await;
-        server.release();
+    let server = params.server;
+    server.acquire();
+    let outcome = run_backend_task(
+        &server,
+        params.request_head,
+        params.has_request_body,
+        &params.compression,
+        params.client_encoding,
+        params.timeout_secs,
+        params.use_tls,
+        &params.sni,
+        params.tls_insecure,
+        &req_body_rx,
+        &resp_tx,
+        &notify,
+    )
+    .await;
+    server.release();
 
-        if let Err(status) = outcome {
-            // head 送出前のエラーはステータスを通知（送出後は resp_tx drop で fin）。
-            let _ = resp_tx.send(RespMsg::Error { status }).await;
-        }
-        // resp_tx / req_body_rx はここで drop → メインループへ fin（EOF）伝播。
-        notify.notify();
-    });
+    if let Err(status) = outcome {
+        // head 送出前のエラーはステータスを通知（送出後は resp_tx drop で fin）。
+        let _ = resp_tx.send(RespMsg::Error { status }).await;
+    }
+    // resp_tx / req_body_rx はここで drop → メインループへ fin（EOF）伝播。
+    notify.notify();
 }
 
 /// バックエンド往復本体。`Err(status)` は **head 未送出時のみ** のエラー（指定ステータスを返す）。
