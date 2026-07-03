@@ -199,7 +199,53 @@ async fn run_echo_server(addr: SocketAddr) {
     }
 }
 
-async fn handle_echo(mut stream: TcpStream) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+/// TLS 版ボディエコーサーバー（F-44: TLS バックエンドストリーミングの E2E 用）
+async fn run_tls_echo_server(addr: SocketAddr, cert_path: String, key_path: String) {
+    use std::sync::Arc;
+    use tokio_rustls::rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&cert_path)
+        .unwrap_or_else(|e| panic!("Failed to read cert {}: {}", cert_path, e))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_else(|e| panic!("Failed to parse cert {}: {}", cert_path, e));
+    let key = PrivateKeyDer::from_pem_file(&key_path)
+        .unwrap_or_else(|e| panic!("Failed to read key {}: {}", key_path, e));
+    let config = tokio_rustls::rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .unwrap_or_else(|e| panic!("Failed to build TLS config: {}", e));
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+
+    let listener = TcpListener::bind(addr)
+        .await
+        .unwrap_or_else(|e| panic!("Failed to bind TLS echo server on {}: {}", addr, e));
+    info!("HTTPS body-echo server listening on {}", addr);
+
+    loop {
+        match listener.accept().await {
+            Ok((stream, peer)) => {
+                debug!("New echo HTTPS connection from {}", peer);
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    match acceptor.accept(stream).await {
+                        Ok(tls) => {
+                            if let Err(e) = handle_echo(tls).await {
+                                debug!("TLS echo handler error: {}", e);
+                            }
+                        }
+                        Err(e) => debug!("TLS echo handshake error: {}", e),
+                    }
+                });
+            }
+            Err(e) => error!("TLS echo accept error: {}", e),
+        }
+    }
+}
+
+async fn handle_echo<S>(mut stream: S) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     // ヘッダー終端 (\r\n\r\n) まで読む（ボディの先頭も buf に入りうる）
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
     let mut tmp = [0u8; 8192];
@@ -316,15 +362,22 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(9008);
+    let tls_echo_port: u16 = std::env::var("TLS_ECHO_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9018);
+    let tls_cert = std::env::var("TLS_CERT_PATH").unwrap_or_else(|_| "cert.pem".to_string());
+    let tls_key = std::env::var("TLS_KEY_PATH").unwrap_or_else(|_| "key.pem".to_string());
 
     let ws_addr: SocketAddr = format!("127.0.0.1:{}", ws_port).parse().unwrap();
     let error_addr: SocketAddr = format!("127.0.0.1:{}", error_port).parse().unwrap();
     let chunked_addr: SocketAddr = format!("127.0.0.1:{}", chunked_port).parse().unwrap();
     let echo_addr: SocketAddr = format!("127.0.0.1:{}", echo_port).parse().unwrap();
+    let tls_echo_addr: SocketAddr = format!("127.0.0.1:{}", tls_echo_port).parse().unwrap();
 
     info!(
-        "Starting test-backends: WS={}, HTTP-error={}, chunked={}, echo={}",
-        ws_addr, error_addr, chunked_addr, echo_addr
+        "Starting test-backends: WS={}, HTTP-error={}, chunked={}, echo={}, tls-echo={}",
+        ws_addr, error_addr, chunked_addr, echo_addr, tls_echo_addr
     );
 
     tokio::join!(
@@ -332,5 +385,6 @@ async fn main() {
         run_http_error_server(error_addr),
         run_chunked_server(chunked_addr),
         run_echo_server(echo_addr),
+        run_tls_echo_server(tls_echo_addr, tls_cert, tls_key),
     );
 }

@@ -46,6 +46,7 @@ BACKEND_WS_PORT=9005
 BACKEND_ERROR_PORT=9006
 BACKEND_CHUNKED_PORT=9007
 BACKEND_ECHO_PORT=9008
+BACKEND_TLS_ECHO_PORT=9018
 
 # 色付き出力
 RED='\033[0;31m'
@@ -569,6 +570,23 @@ path = "/echo-upload/*"
 type = "Proxy"
 url = "http://127.0.0.1:${BACKEND_ECHO_PORT}"
 
+# F-44: TLS バックエンドストリーミング検証用（HTTPS echo バックエンド）
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/echo-upload-tls/*"
+[route.action]
+type = "Proxy"
+url = "https://127.0.0.1:${BACKEND_TLS_ECHO_PORT}"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/echo-upload-tls/*"
+[route.action]
+type = "Proxy"
+url = "https://127.0.0.1:${BACKEND_TLS_ECHO_PORT}"
+
 # タイムアウトテスト用ルート (存在しないポートへ転送)
 [[route]]
 [route.conditions]
@@ -1071,6 +1089,7 @@ start_servers() {
     log_info "Building and starting Rust test backends (WS echo + HTTP error + chunked + body-echo)..."
     (cd "${SCRIPT_DIR}/test_backends" && cargo build --quiet)
     WS_PORT="${BACKEND_WS_PORT}" ERROR_PORT="${BACKEND_ERROR_PORT}" CHUNKED_PORT="${BACKEND_CHUNKED_PORT}" ECHO_PORT="${BACKEND_ECHO_PORT}" \
+        TLS_ECHO_PORT="${BACKEND_TLS_ECHO_PORT}" TLS_CERT_PATH="${FIXTURES_DIR}/cert.pem" TLS_KEY_PATH="${FIXTURES_DIR}/key.pem" \
         RUST_LOG=info "${SCRIPT_DIR}/test_backends/target/debug/test-backends" \
         > /tmp/test_backends.log 2>&1 &
     echo $! >> "$PIDS_FILE"
@@ -1079,7 +1098,7 @@ start_servers() {
     # test_backendsの起動待機（全ポートがリッスン状態になるまで）
     local tb_wait=0
     while [ $tb_wait -lt 30 ]; do
-        if check_port_in_use "$BACKEND_WS_PORT" && check_port_in_use "$BACKEND_ERROR_PORT" && check_port_in_use "$BACKEND_CHUNKED_PORT" && check_port_in_use "$BACKEND_ECHO_PORT"; then
+        if check_port_in_use "$BACKEND_WS_PORT" && check_port_in_use "$BACKEND_ERROR_PORT" && check_port_in_use "$BACKEND_CHUNKED_PORT" && check_port_in_use "$BACKEND_ECHO_PORT" && check_port_in_use "$BACKEND_TLS_ECHO_PORT"; then
             sleep 0.2
             break
         fi

@@ -79,7 +79,7 @@
 | F-41 | P1 | 完了 | [features/F-41-proxy-per-conn-alloc-elimination.md](features/F-41-proxy-per-conn-alloc-elimination.md) | proxy.rs 接続ごとの client_ip / host:port アロケーション排除（IpStr/HostPortStr スタックフォーマッタで計 14 箇所置換、F-29 残件） |
 | F-42 | P1 | 完了 | [features/F-42-buffering-async-fs-offload.md](features/F-42-buffering-async-fs-offload.md) | buffering/handler.rs の非同期 FS 化（write/read/remove 全操作を runtime::offload 適用、F-29 残件） |
 | F-43 | P3 | 未着手 | [features/F-43-wasm-hotpath-alloc-reduction.md](features/F-43-wasm-hotpath-alloc-reduction.md) | WASM パスのアロケーション（clone / deep copy）削減（F-29 残件） |
-| F-44 | P1 | 未着手 | [features/F-44-tls-backend-streaming.md](features/F-44-tls-backend-streaming.md) | TLS バックエンドのストリーミング化（F-32 残件） |
+| F-44 | P1 | 完了 | [features/F-44-tls-backend-streaming.md](features/F-44-tls-backend-streaming.md) | TLS バックエンドのストリーミング化（F-32 残件）。HTTP/3 classify の TLS 除外を撤去し、全二重 TLS ラッパー（TlsBackend、RefCell 借用を await 跨ぎで保持しない設計）で貫通。旧「リクエストごと std::thread + ブロッキング TLS + 全量バッファ」経路を置換 |
 | F-45 | P3 | 完了 | [features/F-45-http3-gro-batch-recv.md](features/F-45-http3-gro-batch-recv.md) | HTTP/3 GRO バッチの per-segment オーバーヘッド削減（RefCell 借用 1 回化・同一 DCID 判定スキップ。quiche recv は 1 データグラム API のため一括渡しは不可、F-33 残件） |
 | F-46 | P3 | 未着手 | [features/F-46-typed-task-pool-optable-slab.md](features/F-46-typed-task-pool-optable-slab.md) | executor の Box&lt;dyn Future&gt; 排除・OP_TABLE スラブ化（F-34 / F-37 残件） |
 | F-47 | P3 | 保留 | [features/F-47-xdp-ebpf-sandbox-env.md](features/F-47-xdp-ebpf-sandbox-env.md) | XDP/eBPF 隔離検証環境の構築とモジュール分離（F-35 残件、CAP_BPF / 対応 NIC の環境依存） |

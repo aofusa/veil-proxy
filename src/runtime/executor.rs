@@ -704,6 +704,29 @@ pub fn current_executor() -> Executor {
     Executor::new()
 }
 
+/// 現在のタスクを一度だけ実行キューの末尾へ譲る（協調的 yield）。
+///
+/// 長時間 Ready であり続けるループ（例: HTTP/3 メインループがパケットフラッドを
+/// 処理し続けるケース）が同一スレッドの他タスク（バックエンド I/O タスク等）を
+/// 飢餓させないために使う。`wake_by_ref` で即座に再スケジュールされるため、
+/// 他の Ready タスクを 1 巡実行した後に制御が戻る。
+pub async fn yield_now() {
+    struct YieldNow(bool);
+    impl Future for YieldNow {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.0 {
+                Poll::Ready(())
+            } else {
+                self.0 = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+    YieldNow(false).await
+}
+
 #[cfg(test)]
 mod executor_tests {
     use super::*;

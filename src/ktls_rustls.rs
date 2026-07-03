@@ -192,6 +192,16 @@ impl KtlsClientStream {
     pub fn as_raw_fd(&self) -> RawFd {
         self.inner.as_raw_fd()
     }
+
+    /// F-44: ストリームを構成要素に分解する。
+    ///
+    /// HTTP/3 ストリーミング経路がアップロード/レスポンス受信を同一タスク内で並行駆動する
+    /// ための全二重ラッパー（`http3_stream::TlsBackend`）の構築に使う。戻り値は
+    /// `(TCP ストリーム, rustls セッション（kTLS 移行済みなら None）, TLS モード,
+    /// 復号済みドレインバッファ)`。
+    pub fn into_parts(self) -> (TcpStream, Option<ClientConnection>, TlsMode, Vec<u8>) {
+        (self.inner, self.conn, self.mode, self.drained_buffer)
+    }
 }
 
 impl AsRawFd for KtlsClientStream {

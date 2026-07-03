@@ -157,6 +157,14 @@ impl SimpleTlsClientStream {
     pub fn is_ktls_send_enabled(&self) -> bool {
         false
     }
+
+    /// F-44: ストリームを構成要素に分解する。
+    ///
+    /// HTTP/3 ストリーミング経路の全二重 TLS ラッパー（`http3_stream::TlsBackend`）構築用。
+    /// 戻り値は `(TCP ストリーム, rustls セッション, 復号済みドレインバッファ)`。
+    pub fn into_parts(self) -> (TcpStream, ClientConnection, Vec<u8>) {
+        (self.inner, self.conn, self.drained_buffer)
+    }
 }
 
 impl AsRawFd for SimpleTlsClientStream {

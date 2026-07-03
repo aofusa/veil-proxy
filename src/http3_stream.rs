@@ -36,6 +36,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::poll_fn;
 use std::io;
+use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -289,6 +290,323 @@ impl<T> Drop for Receiver<T> {
 }
 
 // ============================================================================
+// バックエンド I/O 抽象（F-44: 平文 TCP / TLS バックエンドの全二重ストリーミング）
+// ============================================================================
+
+/// バックエンドへの接続。平文 TCP または TLS（rustls / kTLS）。
+///
+/// アップロード（リクエストボディ送信）とレスポンス受信は **同一タスク内で
+/// `select_biased!` により並行駆動**されるため、read / write とも `&self` で
+/// 呼べる必要がある。平文は io_uring `TcpStream` がもともと `&self` API。TLS は
+/// [`TlsBackend`] が rustls セッションを `RefCell` で内包し、**借用を `.await` を
+/// 跨いで保持しない**よう read / write の状態機械を実装する（thread-per-core 前提）。
+pub(crate) enum BackendIo {
+    /// 平文 TCP（従来経路）。
+    Plain(TcpStream),
+    /// TLS バックエンド（rustls ユーザー空間 or kTLS 移行済み）。
+    Tls(Box<TlsBackend>),
+}
+
+impl BackendIo {
+    /// 所有バッファへ読み取る（EAGAIN 時は POLL_ADD で待機、ビジースピンしない）。
+    async fn read_into(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+        match self {
+            BackendIo::Plain(s) => read_tcp(s, buf).await,
+            BackendIo::Tls(t) => t.read_into(buf).await,
+        }
+    }
+
+    /// 所有バッファ（`Bytes`）を全量書き込む（部分書き込み・EAGAIN を処理）。
+    async fn write_all(&self, data: Bytes) -> io::Result<()> {
+        match self {
+            BackendIo::Plain(s) => write_all_tcp(s, data).await,
+            BackendIo::Tls(t) => t.write_all(data).await,
+        }
+    }
+}
+
+/// TLS バックエンドの全二重ラッパー（F-44）。
+///
+/// `KtlsClientStream` / `SimpleTlsClientStream` の I/O は `&mut self` を要求するため、
+/// アップロードとレスポンス受信の同一タスク内並行駆動（`&self` 共有）ができない。
+/// 本型はハンドシェイク済みストリームを `into_parts()` で分解して受け取り、
+/// rustls セッションを `RefCell` に置いて read / write を `&self` で提供する。
+///
+/// **不変条件**: `RefCell` の借用は同期区間のみで完結し、`.await`（`readable()` /
+/// `writable()`）を跨いで保持しない。single-thread executor 上でのみ使用する。
+pub(crate) struct TlsBackend {
+    /// 基盤 TCP ストリーム（`readable()` / `writable()` の POLL_ADD 待機に使用）。
+    inner: TcpStream,
+    /// ユーザー空間 rustls セッション。kTLS 移行済み（生ソケット I/O 可能）なら `None`。
+    session: Option<RefCell<rustls::ClientConnection>>,
+    /// rustls が復号済みの平文の退避バッファ（received_plaintext 上限溢れ防止兼リード供給源）。
+    drained: RefCell<Vec<u8>>,
+    /// 暗号文読み取りスクラッチ（確保再利用。借用は await を跨がないため take/replace で移動）。
+    read_scratch: RefCell<Vec<u8>>,
+    /// TLS レコード書き出しスクラッチ（同上）。
+    write_scratch: RefCell<Vec<u8>>,
+}
+
+/// TLS スクラッチバッファサイズ（rustls の最大レコード長 16KB に合わせる）。
+const TLS_SCRATCH: usize = 16 * 1024;
+
+impl TlsBackend {
+    /// ハンドシェイク済みストリームの構成要素からラッパーを構築する。
+    ///
+    /// `session` が `None` の場合は kTLS 移行済みで、生ソケット I/O（io_uring）を使う。
+    fn new(inner: TcpStream, session: Option<rustls::ClientConnection>, drained: Vec<u8>) -> Self {
+        // 生 read/write（ノンブロッキング前提）を行うため O_NONBLOCK を保証する
+        // （io_uring の CONNECT は O_NONBLOCK を保証しない。ktls_rustls::connect と同方針）。
+        let fd = inner.as_raw_fd();
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+            if flags >= 0 && (flags & libc::O_NONBLOCK) == 0 {
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+        }
+        Self {
+            inner,
+            session: session.map(RefCell::new),
+            drained: RefCell::new(drained),
+            read_scratch: RefCell::new(vec![0u8; TLS_SCRATCH]),
+            write_scratch: RefCell::new(Vec::with_capacity(TLS_SCRATCH)),
+        }
+    }
+
+    /// ドレイン済み平文を `buf` 先頭へコピーして返す（無ければ `None`）。
+    fn copy_drained(&self, buf: &mut [u8]) -> Option<usize> {
+        let mut d = self.drained.borrow_mut();
+        if d.is_empty() {
+            return None;
+        }
+        let n = d.len().min(buf.len());
+        buf[..n].copy_from_slice(&d[..n]);
+        d.drain(..n);
+        Some(n)
+    }
+
+    /// 平文を読み取る。復号済みバッファ → rustls セッション → 生ソケットの順に供給する。
+    async fn read_into(&self, mut buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+        if let Some(n) = self.copy_drained(&mut buf) {
+            return (Ok(n), buf);
+        }
+        let cell = match &self.session {
+            // kTLS 移行済み: カーネルが復号するため生ソケット read でよい。
+            None => return read_tcp(&self.inner, buf).await,
+            Some(c) => c,
+        };
+        let fd = self.inner.as_raw_fd();
+        loop {
+            // rustls 内に滞留する平文を排出（借用は同期区間のみ）。
+            {
+                let mut conn = cell.borrow_mut();
+                let mut d = self.drained.borrow_mut();
+                drain_plaintext(&mut d, &mut conn.reader());
+            }
+            if let Some(n) = self.copy_drained(&mut buf) {
+                return (Ok(n), buf);
+            }
+
+            // 暗号文を生ソケットから読み rustls へ供給する。
+            let mut cipher = self.read_scratch.take();
+            match raw_fd_read(fd, &mut cipher) {
+                Ok(0) => {
+                    self.read_scratch.replace(cipher);
+                    return (Ok(0), buf); // EOF（close_notify なしも HTTP/1.1 では正常終了扱い）
+                }
+                Ok(n) => {
+                    let res = {
+                        let mut conn = cell.borrow_mut();
+                        let mut consumed = 0;
+                        let mut err = None;
+                        while consumed < n {
+                            match conn.read_tls(&mut &cipher[consumed..n]) {
+                                Ok(0) => break,
+                                Ok(r) => consumed += r,
+                                Err(e) => {
+                                    err = Some(e);
+                                    break;
+                                }
+                            }
+                            if let Err(e) = conn.process_new_packets() {
+                                err = Some(io::Error::new(io::ErrorKind::InvalidData, e));
+                                break;
+                            }
+                        }
+                        err
+                    };
+                    self.read_scratch.replace(cipher);
+                    if let Some(e) = res {
+                        return (Err(e), buf);
+                    }
+                    // ループ先頭で平文を排出して返す。
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    self.read_scratch.replace(cipher);
+                    if let Err(e) = self.inner.readable().await {
+                        return (Err(e), buf);
+                    }
+                }
+                Err(e) => {
+                    self.read_scratch.replace(cipher);
+                    return (Err(e), buf);
+                }
+            }
+        }
+    }
+
+    /// 平文を全量書き込む（rustls で暗号化し TLS レコードを全て送出する）。
+    async fn write_all(&self, data: Bytes) -> io::Result<()> {
+        let cell = match &self.session {
+            // kTLS 移行済み: カーネルが暗号化するため生ソケット write でよい。
+            None => return write_all_tcp(&self.inner, data).await,
+            Some(c) => c,
+        };
+        let mut off = 0;
+        while off < data.len() {
+            let n = {
+                let mut conn = cell.borrow_mut();
+                let mut w = conn.writer();
+                std::io::Write::write(&mut w, &data[off..])?
+            };
+            off += n;
+            // rustls 内部バッファ（既定 64KB）を溢れさせないよう都度フラッシュする。
+            self.flush_tls(cell).await?;
+            if n == 0 {
+                // フラッシュ後も 1 バイトも受け付けない = 進捗なし。
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "rustls writer made no progress",
+                ));
+            }
+        }
+        self.flush_tls(cell).await
+    }
+
+    /// rustls が送出待ちの TLS レコードを全てソケットへ書き出す。
+    async fn flush_tls(&self, cell: &RefCell<rustls::ClientConnection>) -> io::Result<()> {
+        let fd = self.inner.as_raw_fd();
+        loop {
+            let mut out = self.write_scratch.take();
+            out.clear();
+            {
+                let mut conn = cell.borrow_mut();
+                if !conn.wants_write() {
+                    self.write_scratch.replace(out);
+                    return Ok(());
+                }
+                if let Err(e) = conn.write_tls(&mut out) {
+                    self.write_scratch.replace(out);
+                    return Err(e);
+                }
+            }
+            let mut written = 0;
+            while written < out.len() {
+                match raw_fd_write(fd, &out[written..]) {
+                    Ok(0) => {
+                        self.write_scratch.replace(out);
+                        return Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "backend TLS write returned 0",
+                        ));
+                    }
+                    Ok(n) => written += n,
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        if let Err(e) = self.inner.writable().await {
+                            self.write_scratch.replace(out);
+                            return Err(e);
+                        }
+                    }
+                    Err(e) => {
+                        self.write_scratch.replace(out);
+                        return Err(e);
+                    }
+                }
+            }
+            self.write_scratch.replace(out);
+        }
+    }
+}
+
+/// rustls セッションに滞留する復号済み平文を `dst` の未初期化スペアへ排出する。
+fn drain_plaintext(dst: &mut Vec<u8>, rd: &mut dyn std::io::Read) {
+    loop {
+        dst.reserve(TLS_SCRATCH);
+        let spare = dst.spare_capacity_mut();
+        // SAFETY: read は書き込んだバイト数のみ返し、set_len はその分だけ伸ばす。
+        let sbuf =
+            unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len()) };
+        match rd.read(sbuf) {
+            Ok(0) => break,
+            Ok(n) => unsafe { dst.set_len(dst.len() + n) },
+            Err(_) => break, // WouldBlock = 平文なし
+        }
+    }
+}
+
+/// `libc::read` ラッパー（ノンブロッキング fd 用）。
+fn raw_fd_read(fd: std::os::fd::RawFd, buf: &mut [u8]) -> io::Result<usize> {
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+    if n < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(n as usize)
+    }
+}
+
+/// `libc::write` ラッパー（ノンブロッキング fd 用）。
+fn raw_fd_write(fd: std::os::fd::RawFd, buf: &[u8]) -> io::Result<usize> {
+    let n = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
+    if n < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(n as usize)
+    }
+}
+
+/// TLS ハンドシェイクを実行して [`BackendIo::Tls`] を構築する（F-44）。
+///
+/// kTLS ビルドでは `RustlsConnector`（設定に応じて kTLS 移行を試行）、非 kTLS ビルドでは
+/// `SimpleTlsConnector` を使う。`insecure` はアップストリーム設定 `tls_insecure` または
+/// 環境変数 `VEIL_TLS_INSECURE=1` に対応する（既存のバッファ経路と同じ規則）。
+async fn tls_connect(tcp: TcpStream, sni: &str, insecure: bool) -> io::Result<BackendIo> {
+    #[cfg(feature = "ktls")]
+    {
+        let connector = if insecure {
+            crate::config::get_tls_connector_insecure()
+        } else {
+            crate::config::get_tls_connector()
+        };
+        let stream = connector.connect(tcp, sni).await?;
+        let (inner, session, _mode, drained) = stream.into_parts();
+        Ok(BackendIo::Tls(Box::new(TlsBackend::new(
+            inner, session, drained,
+        ))))
+    }
+    #[cfg(not(feature = "ktls"))]
+    {
+        let connector = if insecure {
+            crate::config::get_tls_connector_insecure()
+        } else {
+            crate::config::get_tls_connector()
+        };
+        let stream = connector.connect(tcp, sni).await?;
+        let (inner, session, drained) = stream.into_parts();
+        Ok(BackendIo::Tls(Box::new(TlsBackend::new(
+            inner,
+            Some(session),
+            drained,
+        ))))
+    }
+}
+
+/// `VEIL_TLS_INSECURE=1` が設定されているか（プロセス起動時に一度だけ評価）。
+fn tls_insecure_env() -> bool {
+    static INSECURE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *INSECURE.get_or_init(|| std::env::var("VEIL_TLS_INSECURE").map_or(false, |v| v == "1"))
+}
+
+// ============================================================================
 // レスポンスメッセージ（バックエンドタスク → メインループ）
 // ============================================================================
 
@@ -328,6 +646,12 @@ pub(crate) struct BackendTaskParams {
     pub timeout_secs: u64,
     /// リクエストボディ上限（0 = 無制限）。メインループ側の `ProxyStream` が強制する。
     pub max_request_body: u64,
+    /// TLS バックエンドか（F-44: `https://` アップストリーム）。
+    pub use_tls: bool,
+    /// TLS の SNI / 証明書検証に使うサーバ名（`sni_name` 設定またはホスト名）。
+    pub sni: String,
+    /// 証明書検証をスキップするか（アップストリーム設定 `tls_insecure`）。
+    pub tls_insecure: bool,
 }
 
 /// バックエンドストリーミングタスクを起動する。
@@ -351,6 +675,9 @@ pub(crate) fn spawn_backend_task(
             &params.compression,
             params.client_encoding,
             params.timeout_secs,
+            params.use_tls,
+            &params.sni,
+            params.tls_insecure,
             &req_body_rx,
             &resp_tx,
             &notify,
@@ -376,6 +703,9 @@ async fn run_backend_task(
     compression: &CompressionConfig,
     client_encoding: AcceptedEncoding,
     timeout_secs: u64,
+    use_tls: bool,
+    sni: &str,
+    tls_insecure: bool,
     req_body_rx: &Receiver<Bytes>,
     resp_tx: &Sender<RespMsg>,
     notify: &H3Notify,
@@ -386,19 +716,42 @@ async fn run_backend_task(
 
     // --- 非同期接続（タイムアウト付き） ---
     let connect = TcpStream::connect_str(&addr);
-    let backend =
-        match crate::runtime::time::timeout(Duration::from_secs(timeout_secs), connect).await {
-            Ok(Ok(s)) => s,
+    let tcp = match crate::runtime::time::timeout(Duration::from_secs(timeout_secs), connect).await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            warn!("[HTTP/3] streaming backend connect error: {}", e);
+            return Err(502);
+        }
+        Err(_) => {
+            warn!("[HTTP/3] streaming backend connect timeout");
+            return Err(504);
+        }
+    };
+    let _ = tcp.set_nodelay(true);
+
+    // --- F-44: TLS バックエンドはハンドシェイクして全二重 TLS ラッパーで包む ---
+    let backend = if use_tls {
+        let insecure = tls_insecure || tls_insecure_env();
+        match crate::runtime::time::timeout(
+            Duration::from_secs(timeout_secs),
+            tls_connect(tcp, sni, insecure),
+        )
+        .await
+        {
+            Ok(Ok(b)) => b,
             Ok(Err(e)) => {
-                warn!("[HTTP/3] streaming backend connect error: {}", e);
+                warn!("[HTTP/3] streaming backend TLS handshake error: {}", e);
                 return Err(502);
             }
             Err(_) => {
-                warn!("[HTTP/3] streaming backend connect timeout");
+                warn!("[HTTP/3] streaming backend TLS handshake timeout");
                 return Err(504);
             }
-        };
-    let _ = backend.set_nodelay(true);
+        }
+    } else {
+        BackendIo::Plain(tcp)
+    };
 
     // --- リクエスト head + ボディフレーミングの確定 ---
     // `request_head` は `...Connection: close\r\n`（末尾空行なし・ボディフレーミングなし）。
@@ -416,7 +769,7 @@ async fn run_backend_task(
         Some(first) => {
             // 実ボディあり → chunked 逐次転送。
             head.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
-            if let Err(e) = write_all(&backend, Bytes::from(head)).await {
+            if let Err(e) = backend.write_all(Bytes::from(head)).await {
                 warn!("[HTTP/3] streaming backend head write error: {}", e);
                 return Err(502);
             }
@@ -447,7 +800,7 @@ async fn run_backend_task(
                     notify.notify();
                 }
                 // 終端チャンク。
-                write_all(&backend, Bytes::from_static(b"0\r\n\r\n")).await?;
+                backend.write_all(Bytes::from_static(b"0\r\n\r\n")).await?;
                 Ok::<(), io::Error>(())
             };
             let respond = stream_response(
@@ -483,7 +836,7 @@ async fn run_backend_task(
         None => {
             // ボディなし（GET 等、または more_frames=true でも実データ無し） → 空行で head 終端。
             head.extend_from_slice(b"\r\n");
-            if let Err(e) = write_all(&backend, Bytes::from(head)).await {
+            if let Err(e) = backend.write_all(Bytes::from(head)).await {
                 warn!("[HTTP/3] streaming backend head write error: {}", e);
                 return Err(502);
             }
@@ -504,7 +857,7 @@ async fn run_backend_task(
 
 /// バックエンドレスポンスを head→body の順で受信し、メインループへ逐次転送する。
 async fn stream_response(
-    backend: &TcpStream,
+    backend: &BackendIo,
     compression: &CompressionConfig,
     client_encoding: AcceptedEncoding,
     timeout_secs: u64,
@@ -522,7 +875,7 @@ async fn stream_response(
         if std::time::Instant::now() >= deadline {
             return Err(504);
         }
-        let (res, buf) = read_backend(backend, read_buf).await;
+        let (res, buf) = backend.read_into(read_buf).await;
         read_buf = buf;
         let n = match res {
             Ok(0) => {
@@ -613,7 +966,7 @@ async fn stream_response(
 
 /// 非圧縮・content-length 既知（または不明だが length フレーミング）のボディ転送。
 async fn stream_body_length(
-    backend: &TcpStream,
+    backend: &BackendIo,
     leftover: Bytes,
     mut read_buf: Vec<u8>,
     total: usize,
@@ -636,7 +989,7 @@ async fn stream_body_length(
         if std::time::Instant::now() >= deadline {
             return Ok(()); // 既に head 送出済み → fin（resp_tx drop）で閉じる。
         }
-        let (res, buf) = read_backend(backend, read_buf).await;
+        let (res, buf) = backend.read_into(read_buf).await;
         read_buf = buf;
         match res {
             Ok(0) => break,
@@ -657,7 +1010,7 @@ async fn stream_body_length(
 
 /// 非圧縮・chunked のボディ転送（`ChunkedDecoder::next_data_span` でゼロコピーデコード）。
 async fn stream_body_chunked(
-    backend: &TcpStream,
+    backend: &BackendIo,
     leftover: Bytes,
     mut read_buf: Vec<u8>,
     deadline: std::time::Instant,
@@ -676,7 +1029,7 @@ async fn stream_body_chunked(
         if std::time::Instant::now() >= deadline {
             return Ok(());
         }
-        let (res, buf) = read_backend(backend, read_buf).await;
+        let (res, buf) = backend.read_into(read_buf).await;
         read_buf = buf;
         match res {
             Ok(0) => break,
@@ -729,7 +1082,7 @@ async fn drain_chunked(
 
 /// 非圧縮・EOF 終端（`Connection: close`）のボディ転送。
 async fn stream_body_eof(
-    backend: &TcpStream,
+    backend: &BackendIo,
     leftover: Bytes,
     mut read_buf: Vec<u8>,
     deadline: std::time::Instant,
@@ -743,7 +1096,7 @@ async fn stream_body_eof(
         if std::time::Instant::now() >= deadline {
             return Ok(());
         }
-        let (res, buf) = read_backend(backend, read_buf).await;
+        let (res, buf) = backend.read_into(read_buf).await;
         read_buf = buf;
         match res {
             Ok(0) => break,
@@ -763,7 +1116,7 @@ async fn stream_body_eof(
 /// 圧縮経路: ボディ全体を読み切り、圧縮してから head + body を送る。
 #[allow(clippy::too_many_arguments)]
 async fn stream_response_compressed(
-    backend: &TcpStream,
+    backend: &BackendIo,
     status: u16,
     parsed: ParsedHeaders,
     leftover: Bytes,
@@ -791,7 +1144,7 @@ async fn stream_response_compressed(
         if std::time::Instant::now() >= deadline {
             break;
         }
-        let (res, buf) = read_backend(backend, read_buf).await;
+        let (res, buf) = backend.read_into(read_buf).await;
         read_buf = buf;
         match res {
             Ok(0) => break,
@@ -894,7 +1247,7 @@ async fn send_body_bytes(
 /// io_uring RECV を発行し、EAGAIN 時は POLL_ADD（`readable()`）で読み取り可能を待って
 /// からリトライする。**ビジースピンせず**イベントループへ制御を返すため、メインループ
 /// （QUIC 駆動）が starve しない（io_uring RECV は無データ時に EAGAIN を返し得る）。
-async fn read_backend(backend: &TcpStream, mut buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+async fn read_tcp(backend: &TcpStream, mut buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
     loop {
         let (res, b) = backend.read(buf).await;
         buf = b;
@@ -913,7 +1266,7 @@ async fn read_backend(backend: &TcpStream, mut buf: Vec<u8>) -> (io::Result<usiz
 ///
 /// EAGAIN 時は POLL_ADD（`writable()`）で書き込み可能を待ってからリトライする。**ビジー
 /// スピンしない**（大容量チャンクで送信バッファが埋まってもメインループを starve させない）。
-async fn write_all(backend: &TcpStream, mut buf: Bytes) -> io::Result<()> {
+async fn write_all_tcp(backend: &TcpStream, mut buf: Bytes) -> io::Result<()> {
     use bytes::Buf;
     while !buf.is_empty() {
         let len = buf.len();
@@ -945,15 +1298,15 @@ async fn write_all(backend: &TcpStream, mut buf: Bytes) -> io::Result<()> {
 ///
 /// チャンクサイズ行と終端 CRLF のみ小バッファを確保し、**ペイロード本体は受信フレームの
 /// 所有バッファ（`Bytes`）をそのまま書き込む（ゼロコピー）**。
-async fn send_backend_chunk(backend: &TcpStream, data: Bytes) -> io::Result<()> {
+async fn send_backend_chunk(backend: &BackendIo, data: Bytes) -> io::Result<()> {
     if data.is_empty() {
         return Ok(());
     }
     let mut header = Vec::with_capacity(18);
     push_chunk_size_line(&mut header, data.len());
-    write_all(backend, Bytes::from(header)).await?;
-    write_all(backend, data).await?;
-    write_all(backend, Bytes::from_static(b"\r\n")).await?;
+    backend.write_all(Bytes::from(header)).await?;
+    backend.write_all(data).await?;
+    backend.write_all(Bytes::from_static(b"\r\n")).await?;
     Ok(())
 }
 
@@ -1203,8 +1556,8 @@ mod tests {
     // B-11: 1xx 中間応答の読み捨て（ストリーミング経路）
     #[test]
     fn drain_interim_and_find_header_end_skips_100() {
-        let mut buf = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
-            .to_vec();
+        let mut buf =
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec();
         let pos = drain_interim_and_find_header_end(&mut buf).expect("final head");
         assert_eq!(parse_status_code(&buf[..pos]), Some(200));
     }

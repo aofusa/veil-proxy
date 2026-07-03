@@ -712,11 +712,6 @@ impl Http3Handler {
             None => return Decision::Buffer, // handle_request -> 502
         };
 
-        // TLS バックエンドのストリーミングは未対応 → バッファ経路（既存のブロッキング TLS 経路）。
-        if server.target.use_tls {
-            return Decision::Buffer;
-        }
-
         // --- リクエスト head 構築 ---
         let client_encoding = accept_encoding
             .map(AcceptedEncoding::parse)
@@ -724,6 +719,11 @@ impl Http3Handler {
         let compression = resolve_http3_compression_config(&path_compression, &config.http3_config);
         let final_path = compute_backend_path(&server.target, path, &prefix);
         let request_head = build_h1_request_head(&server.target, method, &final_path, headers);
+
+        // F-44: TLS バックエンドもストリーミング対象（バックエンドタスクが全二重 TLS で貫通）。
+        let use_tls = server.target.use_tls;
+        let sni = server.target.sni().to_string();
+        let tls_insecure = upstream_group.tls_insecure();
 
         Decision::Stream(crate::http3_stream::BackendTaskParams {
             server,
@@ -733,6 +733,9 @@ impl Http3Handler {
             client_encoding,
             timeout_secs: 30,
             max_request_body: security.max_request_body_size as u64,
+            use_tls,
+            sni,
+            tls_insecure,
         })
     }
 
@@ -3124,6 +3127,12 @@ pub async fn run_http3_server_async(
 
         // 送信処理（常に実行 - タイムアウト時も送信が必要）
         send_pending_packets(&connections, &socket, local_addr).await;
+
+        // F-44: 協調的 yield。パケットが連続して到着すると select の recv arm が
+        // 即 Ready になり続け、本タスクが単一 poll 内でループし続けて同一スレッドの
+        // バックエンド I/O タスク（TLS ハンドシェイク・TCP 転送）が飢餓する。
+        // 毎イテレーション一度キュー末尾へ譲り、spawn 済みタスクを 1 巡実行させる。
+        crate::runtime::yield_now().await;
     }
 }
 

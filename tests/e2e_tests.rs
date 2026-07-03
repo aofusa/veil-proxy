@@ -2931,6 +2931,128 @@ async fn test_http3_request_body_streaming() {
     );
 }
 
+/// F-44: HTTP/3 リクエスト方向ストリーミング × **TLS バックエンド**の End-to-End。
+///
+/// `/echo-upload-tls/*` は HTTPS の echo バックエンドへ振り分けられ、バックエンドタスクは
+/// 全二重 TLS ラッパー（`http3_stream::TlsBackend`）でアップロードとレスポンス受信を
+/// 同一タスク内並行駆動する。初期ストリームウィンドウ（1MB）を超える 1,200,000 バイトを
+/// POST し、往復のバイト単位完全一致で「TLS 経由でも全量バッファせず逐次転送」を検証する。
+#[tokio::test]
+#[ntest::timeout(60000)]
+#[cfg(feature = "http3")]
+async fn test_http3_request_body_streaming_tls_backend() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+
+    const UPLOAD_TOTAL: usize = 1_200_000;
+    let upload: Vec<u8> = (0..UPLOAD_TOTAL).map(|i| (i % 256) as u8).collect();
+
+    use common::http3_client::send_http3_request;
+
+    const MAX_ATTEMPTS: usize = 4;
+    let mut last_err = String::new();
+    for attempt in 0..MAX_ATTEMPTS {
+        let (mut _client, mut send_request) =
+            match Http3TestClient::new(server_addr, "localhost").await {
+                Ok(c) => c,
+                Err(e) => {
+                    last_err = format!("connect error: {}", e);
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    continue;
+                }
+            };
+
+        match send_http3_request(
+            &mut send_request,
+            "POST",
+            "/echo-upload-tls/data",
+            &[("content-type", "application/octet-stream")],
+            Some(&upload),
+        )
+        .await
+        {
+            Ok((status, body)) => {
+                assert_eq!(status, 200, "Expected 200 OK for echoed upload (h3+TLS)");
+                assert_eq!(
+                    body.len(),
+                    UPLOAD_TOTAL,
+                    "Echoed body length mismatch over TLS backend (got {}, want {})",
+                    body.len(),
+                    UPLOAD_TOTAL
+                );
+                for (i, (&got, &want)) in body.iter().zip(upload.iter()).enumerate() {
+                    assert_eq!(
+                        got, want,
+                        "Echoed body byte mismatch at offset {} (TLS backend)",
+                        i
+                    );
+                }
+                eprintln!(
+                    "HTTP/3 TLS-backend streaming: uploaded and echoed {} bytes byte-exact (attempt {})",
+                    body.len(),
+                    attempt + 1
+                );
+                return;
+            }
+            Err(e) => {
+                last_err = format!("POST error: {}", e);
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+        }
+    }
+    panic!(
+        "HTTP/3 TLS-backend request body streaming failed after {} attempts: {}",
+        MAX_ATTEMPTS, last_err
+    );
+}
+
+/// F-44: HTTP/3 × TLS バックエンド（小ボディ・単一 DATA 経路）。
+#[tokio::test]
+#[ntest::timeout(15000)]
+#[cfg(feature = "http3")]
+async fn test_http3_request_body_streaming_tls_backend_small() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+
+    let upload = b"hello streaming request body over http3 via tls backend".to_vec();
+
+    use common::http3_client::send_http3_request;
+
+    let (mut _client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
+    {
+        Ok(c) => c,
+        Err(e) => panic!("Failed to create HTTP/3 client: {}", e),
+    };
+
+    let (status, body) = send_http3_request(
+        &mut send_request,
+        "POST",
+        "/echo-upload-tls/small",
+        &[("content-type", "text/plain")],
+        Some(&upload),
+    )
+    .await
+    .expect("HTTP/3 small TLS-backend streaming POST failed");
+
+    assert_eq!(
+        status, 200,
+        "Expected 200 OK for echoed small upload (h3+TLS)"
+    );
+    assert_eq!(body, upload, "Echoed small body mismatch (h3+TLS)");
+}
+
 /// F-32: HTTP/3 リクエスト方向ストリーミング（小ボディ・単一 DATA 経路）。
 #[tokio::test]
 #[ntest::timeout(15000)]
@@ -8133,20 +8255,20 @@ async fn test_100_continue_deferred_body() {
             .await
             .expect("TCP connect failed");
         let server_name = ServerName::try_from("localhost").unwrap();
-        let mut tls = tokio::time::timeout(
-            Duration::from_secs(5),
-            connector.connect(server_name, tcp),
-        )
-        .await
-        .expect("TLS handshake timed out")
-        .expect("TLS handshake failed");
+        let mut tls =
+            tokio::time::timeout(Duration::from_secs(5), connector.connect(server_name, tcp))
+                .await
+                .expect("TLS handshake timed out")
+                .expect("TLS handshake failed");
 
         // 1. ヘッダーのみ送信（ボディは 100 受信後）。
         let head = format!(
             "POST / HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         );
-        tls.write_all(head.as_bytes()).await.expect("head write failed");
+        tls.write_all(head.as_bytes())
+            .await
+            .expect("head write failed");
 
         // 2. 100 Continue を待つ。
         let mut buf = Vec::new();
@@ -8157,7 +8279,11 @@ async fn test_100_continue_deferred_body() {
                 .await
                 .unwrap_or_else(|_| panic!("round {}: timed out waiting for 100 Continue", round))
                 .expect("read failed");
-            assert!(n > 0, "round {}: connection closed before 100 Continue", round);
+            assert!(
+                n > 0,
+                "round {}: connection closed before 100 Continue",
+                round
+            );
             buf.extend_from_slice(&tmp[..n]);
         }
         let text = String::from_utf8_lossy(&buf);
