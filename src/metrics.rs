@@ -631,6 +631,32 @@ pub fn observe_wasm_filter_duration(_filter: &str, _phase: &str, _duration_secs:
     }
 }
 
+#[cfg(all(feature = "metrics", feature = "wasm"))]
+/// WASM fuel 消費量カウンタ（filter, phase。F-48: ベンチ・運用での CPU 消費観測用）
+pub(crate) static WASM_FUEL_CONSUMED_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    let opts = Opts::new(
+        "wasm_fuel_consumed_total",
+        "Total wasmtime fuel consumed by WASM filters",
+    )
+    .namespace("veil");
+    let counter = CounterVec::new(opts, &["filter", "phase"]).unwrap();
+    METRICS_REGISTRY
+        .register(Box::new(counter.clone()))
+        .unwrap();
+    counter
+});
+
+/// メトリクス: WASM フィルタの fuel 消費量を記録（F-48）
+#[inline]
+pub fn observe_wasm_fuel_consumed(_filter: &str, _phase: &str, _fuel: u64) {
+    #[cfg(all(feature = "metrics", feature = "wasm"))]
+    if metrics_runtime_enabled() {
+        WASM_FUEL_CONSUMED_TOTAL
+            .with_label_values(&[_filter, _phase])
+            .inc_by(_fuel as f64);
+    }
+}
+
 // ====================
 // キャッシュ保存コンテキスト
 // ====================

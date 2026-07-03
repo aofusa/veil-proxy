@@ -23,9 +23,18 @@
 //! # 計測シナリオ
 //! - `no_wasm`        : `GET /`（WASM 非適用） … ベースライン
 //! - `header_filter`  : `GET /wasm/bench`（header_filter 適用）
+//! - `pool_exhaustion`: 並行度 2/8/32 で `/wasm/*` へ同時リクエスト（F-48。
+//!   wasmtime pooling allocator のスロット競合・枯渇時の挙動を計測。全応答の
+//!   成功も検証する）
 //!
 //! それぞれ「新規接続あたり」と「Keep-Alive で接続コストを償却した 1 リクエスト
 //! あたり」を測る。後者の差分が WASM フィルタ純粋オーバーヘッドの近似となる。
+//!
+//! # fuel / RSS レポート（F-48）
+//! ベンチ末尾でプロキシの Prometheus メトリクス（`veil_wasm_fuel_consumed_total` /
+//! `veil_wasm_filter_duration_seconds`）とプロキシプロセスの RSS（`/proc/<pid>/status`）を
+//! 収集し、stderr に要約を出力する。fuel はモジュール・フェーズごとの累積 CPU 消費、
+//! RSS はプール常駐コストの指標になる。
 //!
 //! # 期待オーダー（参考・環境依存）
 //! WASM 実行は CPU バウンドでネットワーク I/O より桁違いに小さい。Pooling Allocator +
@@ -44,8 +53,10 @@ use std::time::{Duration, Instant};
 
 const PROXY_PORT: u16 = 8443; // HTTPS ポート
 
-/// WASM 適用パス（e2e_setup の `/wasm/*` ルート、header_filter 適用）
-const WASM_PATH: &str = "/wasm/bench";
+/// WASM 適用パス（e2e_setup の `/wasm/*` ルート、header_filter 適用。
+/// バックエンド（静的ファイル）に実在するパスを使う: `/wasm/bench` 等の
+/// 存在しないファイルは 404 になりルート可用性判定に失敗する）
+const WASM_PATH: &str = "/wasm/";
 /// 非 WASM ベースラインパス
 const BASELINE_PATH: &str = "/";
 
@@ -332,9 +343,133 @@ fn benchmark_wasm_overhead_keepalive(c: &mut Criterion) {
     group.finish();
 }
 
+/// F-48: インスタンスプール枯渇シナリオ。
+///
+/// 並行度をプールスロット数より小さい値から大きい値までスイープし、`/wasm/*` への
+/// 同時 Keep-Alive リクエストのスループットを比較する。プール枯渇時（並行度 >
+/// プールスロット）はインスタンス確保が直列化されるが、**エラーにならず全リクエストが
+/// 成功する**ことも検証する（枯渇時の挙動確認）。
+fn benchmark_wasm_pool_exhaustion(c: &mut Criterion) {
+    if !is_proxy_running() || !is_wasm_route_available() {
+        eprintln!("/wasm/* route not available (start e2e with WASM config); skipping");
+        return;
+    }
+
+    let mut group = c.benchmark_group("wasm_pool_exhaustion");
+    group.measurement_time(Duration::from_secs(15));
+    group.sample_size(10);
+
+    // 1 スレッドあたりのリクエスト数（Keep-Alive 償却）
+    const REQS_PER_THREAD: usize = 10;
+
+    for threads in [2usize, 8, 32] {
+        group.bench_with_input(
+            BenchmarkId::new("concurrency", threads),
+            &threads,
+            |b, &threads| {
+                b.iter(|| {
+                    let handles: Vec<_> = (0..threads)
+                        .map(|_| {
+                            std::thread::spawn(move || {
+                                measure_keepalive(WASM_PATH, REQS_PER_THREAD)
+                            })
+                        })
+                        .collect();
+                    let mut worst = Duration::ZERO;
+                    for h in handles {
+                        let d = h.join().expect("bench thread panicked");
+                        assert!(
+                            d < Duration::from_secs(10),
+                            "request failed under pool exhaustion (concurrency={})",
+                            threads
+                        );
+                        worst = worst.max(d);
+                    }
+                    worst
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+// ====================
+// fuel / RSS レポート（F-48）
+// ====================
+
+/// プロキシの Prometheus メトリクスを取得する（HTTPS。HTTP ポートは 301 になり得る）。
+fn scrape_metrics() -> Option<String> {
+    let (mut stream, mut tls_conn) = connect_tls()?;
+    let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
+    tls_stream
+        .write_all(b"GET /__metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .ok()?;
+    let mut buf = Vec::new();
+    let _ = tls_stream.read_to_end(&mut buf);
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// プロキシプロセス（fixtures/proxy.toml で起動）の RSS[kB] を取得する。
+fn proxy_rss_kb() -> Option<u64> {
+    let out = std::process::Command::new("pgrep")
+        .args(["-f", "fixtures/proxy.toml"])
+        .output()
+        .ok()?;
+    let pid = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()?
+        .trim()
+        .to_string();
+    let status = std::fs::read_to_string(format!("/proc/{}/status", pid)).ok()?;
+    status
+        .lines()
+        .find(|l| l.starts_with("VmRSS:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|v| v.parse().ok())
+}
+
+/// F-48: fuel 消費・RSS の要約レポートを stderr に出力する（criterion 計測はしない）。
+///
+/// 直前までのベンチ実行で蓄積された `veil_wasm_fuel_consumed_total` を取得し、
+/// モジュール・フェーズごとの累積 fuel とプロキシ RSS を表示する。
+fn report_fuel_and_rss(_c: &mut Criterion) {
+    if !is_proxy_running() {
+        return;
+    }
+    eprintln!("=== WASM fuel / RSS report (F-48) ===");
+    if let Some(rss) = proxy_rss_kb() {
+        eprintln!("proxy RSS: {} kB", rss);
+    } else {
+        eprintln!("proxy RSS: unavailable (pgrep/procfs)");
+    }
+    match scrape_metrics() {
+        Some(metrics) => {
+            let mut found = false;
+            for line in metrics.lines() {
+                if line.starts_with("veil_wasm_fuel_consumed_total")
+                    || line.starts_with("veil_wasm_filter_duration_seconds_count")
+                {
+                    eprintln!("{}", line);
+                    found = true;
+                }
+            }
+            if !found {
+                eprintln!(
+                    "no fuel metrics found (metrics feature disabled or no WASM traffic yet)"
+                );
+            }
+        }
+        None => eprintln!("metrics scrape failed (proxy HTTP port 8080)"),
+    }
+    eprintln!("=====================================");
+}
+
 criterion_group!(
     benches,
     benchmark_wasm_overhead_per_connection,
     benchmark_wasm_overhead_keepalive,
+    benchmark_wasm_pool_exhaustion,
+    report_fuel_and_rss,
 );
 criterion_main!(benches);

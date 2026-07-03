@@ -2838,6 +2838,7 @@ Use the `path` option to change the endpoint path.
 | `veil_grpc_requests_total` | Counter | method, status_code, upstream | gRPC request count |
 | `veil_grpc_stream_duration_seconds` | Histogram | method | gRPC stream duration |
 | `veil_wasm_filter_duration_seconds` | Histogram | filter, phase | WASM filter execution time |
+| `veil_wasm_fuel_consumed_total` | Counter | filter, phase | Total wasmtime fuel consumed by WASM filters |
 
 ### Runtime Enable/Disable
 

@@ -221,15 +221,27 @@ impl FilterEngine {
         // 指定されたヘッダコールバックを呼ぶ
         let callback = instance.get_typed_func::<(i32, i32, i32), i32>(&mut *store, callback_name);
 
-        match callback {
+        let action = match callback {
             Ok(func) => {
                 let eos = if end_of_stream { 1 } else { 0 };
-                Ok(func
-                    .call_async(&mut *store, (http_context_id, num_headers, eos))
-                    .await?)
+                func.call_async(&mut *store, (http_context_id, num_headers, eos))
+                    .await?
             }
-            Err(_) => Ok(0), // Callback not exported, continue
-        }
+            Err(_) => 0, // Callback not exported, continue
+        };
+
+        // F-48: fuel 消費量を記録（ライフサイクル + コールバック 1 実行分）。
+        let consumed = self
+            .fuel_limit
+            .saturating_sub(store.get_fuel().unwrap_or(0));
+        let phase = if callback_name == "proxy_on_request_headers" {
+            "request_headers"
+        } else {
+            "response_headers"
+        };
+        crate::metrics::observe_wasm_fuel_consumed(&module.name, phase, consumed);
+
+        Ok(action)
     }
 
     /// Execute on_request_headers for a single module
