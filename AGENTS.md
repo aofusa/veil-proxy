@@ -124,5 +124,6 @@ cargo test --bins --test integration_tests --features "full"
 | `tests/`、`benches/` | 統合・E2E・ベンチ |
 | `docs/artifacts/` | AI 成果物・一時ファイル |
 | `docs/backlog/` | 機能・バグチケット（親は `backlog.md`） |
+| `docker/` | コンテナイメージ（glibc/musl）・seccomp/Landlock アセット。`docker/perf/` は glibc/musl/nginx 比較用のパフォーマンス計測ハーネス（`gen_configs.py`/`run_perf.sh`） |
 
 細かいモジュール対応は `src/lib.rs` の `mod` と README の構成を参照。

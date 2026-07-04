@@ -31,4 +31,18 @@
 
 - kTLS 経路との整合。部分書き込み（short write）時の再送ロジック。
 
-## 対応状況: 未着手
+## 実装調査（2026-07 / 本ブランチ）
+
+- キャッシュヒットのソケット送出は `runtime` の **`IORING_OP_SEND`** を使用しており、
+  `IORING_OP_WRITE`/`WRITEV` は使っていない。ヘッダ + ボディを 1 syscall にまとめるには
+  scatter-gather 送信＝ **`IORING_OP_SENDMSG`（iovec 付き msghdr）** の新規追加が必要。
+- しかし `src/runtime/executor.rs` の `PROXY_ALLOWED_OPCODES` は F-28/F-38 で **意図的に
+  最小化**（11 opcode）されており、`SENDMSG` を追加すると **io_uring のセキュリティサーフェスを
+  拡大**する。AGENTS.md のホットパス/セキュリティ方針（オペコードを不用意に増やさない）に反する。
+- 現状のキャッシュヒット経路は既に **ボディがゼロコピー（`Bytes`）**で、ヘッダ SEND + ボディ SEND の
+  2 syscall。削減できるのは 1 syscall/ヒットのみで、**セキュリティサーフェス拡大に見合う利得が薄い**。
+- 判断: **セキュリティ最優先の方針を優先し保留**。将来、SENDMSG 追加の是非（restriction 許可リストの
+  レビュー含む）を独立チケットで検討する。partial-write 再送・kTLS 経路（kTLS は sendmsg 不可の
+  ケースあり）の設計も前提。
+
+## 対応状況: 保留（セキュリティサーフェス拡大とのトレードオフのため）
