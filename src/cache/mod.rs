@@ -294,3 +294,32 @@ pub fn active_revalidations() -> usize {
 pub fn collapsed_request_count() -> u64 {
     0
 }
+
+// B-14 回帰テスト: cache feature 無効時でも静的ファイルが解決できること
+// （以前はスタブが None を返し全ての静的配信が 404 になっていた）
+#[cfg(all(test, not(feature = "cache")))]
+mod nocache_file_info_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn get_file_info_resolves_real_file_without_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("index.html");
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        f.write_all(b"<html>hello</html>").unwrap();
+        drop(f);
+
+        // ring 未初期化のため offload は同期インライン実行され block_on が即完了する。
+        let info = futures::executor::block_on(get_file_info(&file_path));
+        assert!(info.is_some(), "cache 無効でもファイル情報を解決できるべき");
+        let info = info.unwrap();
+        assert!(info.is_file);
+        assert_eq!(info.file_size, 18);
+        assert!(info.mime_type.starts_with("text/html"));
+
+        // 存在しないファイルは None
+        let missing = futures::executor::block_on(get_file_info(&dir.path().join("nope.txt")));
+        assert!(missing.is_none());
+    }
+}
