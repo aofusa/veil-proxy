@@ -28,7 +28,7 @@ B-13 / B-14 / B-15 の修正後、glibc 版・musl 版・nginx(alpine) をコン
 ## 対応状況: 完了
 
 - レポート: `docs/artifacts/performance_report_veil_vs_nginx_v2.md`（生データ
-  `perf_results_v2_raw.tsv`）。全 24 計測 Non-2xx=0。再現ハーネス `docker/perf/`。
+  `perf_results_v2_raw.tsv`）。全 24 計測 Non-2xx=0。再現ハーネス `tools/perf/`。
 - 主要知見: コンテナでは kTLS 無効が高速 / cbpf は単一クライアント IP を 1 ワーカーに集約 /
   kernel 分散は HTTP/1.1 を伸ばすが HTTP/2 を劣化 / OpenFileCache が静的配信を底上げ /
   glibc≈musl / Veil 最良構成は nginx に肉薄しつつ CPU 効率が高い。

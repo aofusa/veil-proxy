@@ -4,7 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-RESULTS_DIR="${RESULTS_DIR:-${REPO_ROOT}/tests/container_security/results}"
+RESULTS_DIR="${RESULTS_DIR:-${REPO_ROOT}/tools/container_security/results}"
 RUST_IMAGE="${RUST_FUZZ_IMAGE:-rustlang/rust:nightly-bookworm}"
 FUZZ_RUNS="${FUZZ_RUNS:-2000}"
 FUZZ_MAX_TIME="${FUZZ_MAX_TIME:-120}"
@@ -22,7 +22,7 @@ docker run --rm \
     -v "${REPO_ROOT}:/app:rw" \
     -v "${RESULTS_DIR}:/results:rw" \
     -w /app \
-    -e CARGO_TARGET_DIR=/app/tests/container_security/results/cargo-target \
+    -e CARGO_TARGET_DIR=/app/tools/container_security/results/cargo-target \
     "${RUST_IMAGE}" \
     bash -c "
         set -euo pipefail

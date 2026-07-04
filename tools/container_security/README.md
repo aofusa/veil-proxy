@@ -41,12 +41,12 @@ openssl req -x509 -newkey EC -pkeyopt ec_paramgen_curve:secp384r1 -nodes \
 
 ```bash
 # 既定（libFuzzer / cargo-audit / cargo-deny はスキップ）
-./tests/container_security/run.sh
+./tools/container_security/run.sh
 ```
 
 所要時間の目安: 10〜20 分（h2spec・Toxiproxy カオス含む）
 
-レポート出力先: `tests/container_security/results/`
+レポート出力先: `tools/container_security/results/`
 
 ---
 
@@ -55,30 +55,30 @@ openssl req -x509 -newkey EC -pkeyopt ec_paramgen_curve:secp384r1 -nodes \
 ### 通常 CI / 開発
 
 ```bash
-./tests/container_security/run.sh
+./tools/container_security/run.sh
 ```
 
 ### スモーク（重いフェーズを省略）
 
 ```bash
-SKIP_TRIVY=1 SKIP_H2SPEC=1 SKIP_TESTSSL=1 ./tests/container_security/run.sh
+SKIP_TRIVY=1 SKIP_H2SPEC=1 SKIP_TESTSSL=1 ./tools/container_security/run.sh
 ```
 
 ### nightly / リリース前（フル拡張）
 
 ```bash
 SKIP_LIBFUZZER=0 SKIP_CARGO_AUDIT=0 SKIP_CARGO_DENY=0 SKIP_TRIVY=0 \
-  ./tests/container_security/run.sh
+  ./tools/container_security/run.sh
 ```
 
 ### libFuzzer のみ
 
 ```bash
 # 既定: 各ターゲット 2000 runs、最大 120 秒/ターゲット
-./tests/container_security/fuzz/run_libfuzzer.sh
+./tools/container_security/fuzz/run_libfuzzer.sh
 
 # runs / 時間を変更
-FUZZ_RUNS=5000 FUZZ_MAX_TIME=300 ./tests/container_security/fuzz/run_libfuzzer.sh
+FUZZ_RUNS=5000 FUZZ_MAX_TIME=300 ./tools/container_security/fuzz/run_libfuzzer.sh
 ```
 
 初回はコンテナ内で `cargo-fuzz` のインストールと `veil` のビルドが走るため **15〜20 分** かかることがあります。2 回目以降はキャッシュで短縮されます。
@@ -86,13 +86,13 @@ FUZZ_RUNS=5000 FUZZ_MAX_TIME=300 ./tests/container_security/fuzz/run_libfuzzer.s
 検証済み例（4 ターゲット × 2000 runs、クラッシュなし、`libfuzzer: ok`）:
 
 ```bash
-FUZZ_RUNS=2000 FUZZ_MAX_TIME=120 ./tests/container_security/fuzz/run_libfuzzer.sh
+FUZZ_RUNS=2000 FUZZ_MAX_TIME=120 ./tools/container_security/fuzz/run_libfuzzer.sh
 ```
 
 ### h2spec のみ
 
 ```bash
-./tests/container_security/run_h2spec.sh
+./tools/container_security/run_h2spec.sh
 ```
 
 ---
@@ -193,7 +193,7 @@ CARGO_TARGET_DIR=/tmp/veil-build-target cargo build -p veil-fuzz
 | `VEIL_IMAGE` | `veil:glibc` |
 | `HARNESS_IMAGE` | `veil-sec-harness:local` |
 | `NET_NAME` | `veil-sec-test-net` |
-| `RESULTS_DIR` | `tests/container_security/results` |
+| `RESULTS_DIR` | `tools/container_security/results` |
 | `TRIVY_SEVERITY` | `HIGH,CRITICAL` |
 
 ### カーネル能力
@@ -207,7 +207,7 @@ CARGO_TARGET_DIR=/tmp/veil-build-target cargo build -p veil-fuzz
 ## ディレクトリ構成
 
 ```
-tests/container_security/
+tools/container_security/
 ├── run.sh                 # メインオーケストレータ
 ├── run_h2spec.sh          # h2spec のみ
 ├── README.md              # 本ファイル

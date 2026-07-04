@@ -121,9 +121,10 @@ cargo test --bins --test integration_tests --features "full"
 | `src/lib.rs` | クレートルート・mod 宣言・公開 API（`cargo fuzz`・統合テスト向け） |
 | `src/entry.rs` | サーバ起動配線（`run()`：ワーカースレッド・accept ループなど） |
 | `src/runtime/` | 独自 io_uring ランタイム（ring.rs/executor.rs/tcp.rs/timer.rs/buf.rs/io.rs/splice.rs/offload.rs） |
-| `tests/`、`benches/` | 統合・E2E・ベンチ |
+| `tests/`、`benches/` | 統合・E2E・ベンチ（`cargo test` が拾うホワイトボックス） |
 | `docs/artifacts/` | AI 成果物・一時ファイル |
 | `docs/backlog/` | 機能・バグチケット（親は `backlog.md`） |
-| `docker/` | コンテナイメージ（glibc/musl）・seccomp/Landlock アセット。`docker/perf/` は glibc/musl/nginx 比較用のパフォーマンス計測ハーネス（`gen_configs.py`/`run_perf.sh`） |
+| `docker/` | コンテナイメージ（glibc/musl）・共有アセット（`assets/`：ssl/www/seccomp/Landlock） |
+| `tools/` | Docker ベースの外形検証ツール。`tools/perf/` は glibc/musl/nginx 比較のパフォーマンス計測ハーネス（`gen_configs.sh`/`run_perf.sh`）、`tools/container_security/` はファジング・カオス・h2spec・セキュリティスキャンのオーケストレータ（`run.sh`） |
 
 細かいモジュール対応は `src/lib.rs` の `mod` と README の構成を参照。

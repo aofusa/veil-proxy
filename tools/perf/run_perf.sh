@@ -1,12 +1,13 @@
 #!/bin/bash
 # Veil パフォーマンス計測ハーネス（glibc / musl / nginx をコンテナ間通信で比較）
-# 使い方: docker/ ディレクトリ相当のパスから  bash perf/run_perf.sh
+# 使い方: リポジトリのどこからでも  bash tools/perf/run_perf.sh
 set -u
-cd "$(dirname "$0")/.."   # -> docker/
-HERE="$(pwd)"
+HERE="$(cd "$(dirname "$0")" && pwd)"          # -> tools/perf
+REPO_ROOT="$(cd "$HERE/../.." && pwd)"          # -> リポジトリルート
+ASSETS="$REPO_ROOT/docker/assets"               # ssl / www / security/seccomp.json の所在
 NET=perf_net
-RESULTS="perf/results/results.tsv"
-LOGDIR="perf/results/logs"
+RESULTS="$HERE/results/results.tsv"
+LOGDIR="$HERE/results/logs"
 mkdir -p "$LOGDIR"
 
 WRK_IMG=williamyeh/wrk:latest
@@ -95,10 +96,10 @@ start_veil() { # image config_file container_name
         --read-only \
         --tmpfs /var/cache/veil:rw,noexec,nosuid,uid=65532,gid=65532,size=512m \
         --tmpfs /var/tmp/veil:rw,noexec,nosuid,uid=65532,gid=65532,size=256m \
-        -v "$HERE/$cfgfile:/etc/veil/conf.d/config.toml:ro" \
-        -v "$HERE/assets/ssl:/etc/veil/ssl:ro" \
-        -v "$HERE/assets/www:/var/www:ro" \
-        --security-opt seccomp="$HERE/assets/security/seccomp.json" \
+        -v "$cfgfile:/etc/veil/conf.d/config.toml:ro" \
+        -v "$ASSETS/ssl:/etc/veil/ssl:ro" \
+        -v "$ASSETS/www:/var/www:ro" \
+        --security-opt seccomp="$ASSETS/security/seccomp.json" \
         --name "$name" "$img" >/dev/null
 }
 
@@ -120,9 +121,9 @@ wait_ready() { # container
 echo "### nginx"
 docker rm -f nginx-perf >/dev/null 2>&1
 docker run -d --rm --network $NET \
-    -v "$HERE/perf/nginx/nginx.conf:/etc/nginx/nginx.conf:ro" \
-    -v "$HERE/assets/ssl:/etc/veil/ssl:ro" \
-    -v "$HERE/assets/www:/var/www:ro" \
+    -v "$HERE/nginx/nginx.conf:/etc/nginx/nginx.conf:ro" \
+    -v "$ASSETS/ssl:/etc/veil/ssl:ro" \
+    -v "$ASSETS/www:/var/www:ro" \
     --name nginx-perf nginx:alpine >/dev/null
 if wait_ready nginx-perf; then
     run_load nginx base nginx-perf 1
@@ -132,7 +133,7 @@ docker rm -f nginx-perf >/dev/null 2>&1
 # ---- veil glibc / musl x configs ----
 for build in glibc musl; do
     img="veil:$build"
-    for cfgfile in perf/configs/*.toml; do
+    for cfgfile in "$HERE"/configs/*.toml; do
         name=$(basename "$cfgfile" .toml)
         h2=1; [ "$name" = "no_http2" ] && h2=0
         echo "### veil:$build / $name"

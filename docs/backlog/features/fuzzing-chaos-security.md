@@ -74,12 +74,12 @@
 
 ### 2026-07-02（ブランチ `feat/docker`）
 
-`tests/container_security/` を追加し、`veil:glibc` コンテナに対するファジング・カオス・セキュリティ検証を **docker コマンドのみ** で実施した。`tests/e2e_setup.sh` は未使用・未改変。
+`tools/container_security/` を追加し、`veil:glibc` コンテナに対するファジング・カオス・セキュリティ検証を **docker コマンドのみ** で実施した。`tests/e2e_setup.sh` は未使用・未改変。
 
 #### 実行方法
 
 ```bash
-./tests/container_security/run.sh
+./tools/container_security/run.sh
 ```
 
 - ハーネスイメージ `veil-sec-harness:local` をビルド
@@ -98,22 +98,22 @@
 
 ### 2026-07-02 追記: h2spec 統合
 
-[h2spec](https://github.com/summerwind/h2spec) v2.6.0 を `tests/container_security/harness/` に同梱し、HTTP/2 準拠テストを追加した。
+[h2spec](https://github.com/summerwind/h2spec) v2.6.0 を `tools/container_security/harness/` に同梱し、HTTP/2 準拠テストを追加した。
 
 #### 実行方法
 
 ```bash
 # 全フェーズ（h2spec ゲート含む。デフォルトは generic+hpack のみ）
-./tests/container_security/run.sh
+./tools/container_security/run.sh
 
 # h2spec のみ（開発用）
-./tests/container_security/run_h2spec.sh
+./tools/container_security/run_h2spec.sh
 
 # RFC 7540/7541 全件（各 ~3.5 分、TLS + H2C で計 ~7 分）
-H2SPEC_FULL=1 ./tests/container_security/run_h2spec.sh
+H2SPEC_FULL=1 ./tools/container_security/run_h2spec.sh
 
 # 全件で 1 件でも失敗したら exit 1
-H2SPEC_FULL=1 H2SPEC_STRICT=1 ./tests/container_security/run_h2spec.sh
+H2SPEC_FULL=1 H2SPEC_STRICT=1 ./tools/container_security/run_h2spec.sh
 ```
 
 | 環境変数 | 既定 | 説明 |
@@ -123,7 +123,7 @@ H2SPEC_FULL=1 H2SPEC_STRICT=1 ./tests/container_security/run_h2spec.sh
 | `H2SPEC_STRICT` | `0` | `1` でフルスイート失敗時に exit 1 |
 | `H2SPEC_TIMEOUT` | `30` | h2spec タイムアウト（秒） |
 
-テスト用設定 `tests/container_security/fixtures/veil-config.toml` で **H2C `:8443`** を有効化し、h2spec 要件（GET/POST `/` → 200 + 非空ボディ）を満たす。
+テスト用設定 `tools/container_security/fixtures/veil-config.toml` で **H2C `:8443`** を有効化し、h2spec 要件（GET/POST `/` → 200 + 非空ボディ）を満たす。
 
 #### h2spec 結果（`veil:glibc`、2026-07-02）
 
@@ -143,11 +143,11 @@ H2SPEC_FULL=1 H2SPEC_STRICT=1 ./tests/container_security/run_h2spec.sh
 
 #### 成果物
 
-- オーケストレータ: `tests/container_security/run.sh`
-- h2spec 単体: `tests/container_security/run_h2spec.sh`
-- ハーネス: `tests/container_security/harness/`（Dockerfile、h2spec バイナリ、fuzz/chaos/security/h2spec スクリプト）
-- テスト設定: `tests/container_security/fixtures/veil-config.toml`
-- レポート出力: `tests/container_security/results/`（`h2spec_report.txt`、`h2spec_*_junit.xml` 等）
+- オーケストレータ: `tools/container_security/run.sh`
+- h2spec 単体: `tools/container_security/run_h2spec.sh`
+- ハーネス: `tools/container_security/harness/`（Dockerfile、h2spec バイナリ、fuzz/chaos/security/h2spec スクリプト）
+- テスト設定: `tools/container_security/fixtures/veil-config.toml`
+- レポート出力: `tools/container_security/results/`（`h2spec_report.txt`、`h2spec_*_junit.xml` 等）
 
 #### 既知の制限
 
@@ -159,7 +159,7 @@ H2SPEC_FULL=1 H2SPEC_STRICT=1 ./tests/container_security/run_h2spec.sh
 
 ### 2026-07-02 追記: スイート拡充（F-52〜F-57）
 
-バックログに子チケットを追加し、`tests/container_security/` をプロダクション向けに拡張した。
+バックログに子チケットを追加し、`tools/container_security/` をプロダクション向けに拡張した。
 
 #### バックログ子チケット
 
@@ -175,7 +175,7 @@ H2SPEC_FULL=1 H2SPEC_STRICT=1 ./tests/container_security/run_h2spec.sh
 #### 追加ディレクトリ構成
 
 ```
-tests/container_security/
+tools/container_security/
 ├── chaos/           # Toxiproxy セットアップ
 ├── fuzz/            # libFuzzer ラッパー
 ├── security/        # cargo-audit
@@ -210,8 +210,8 @@ tests/container_security/
 
 ```bash
 # 通常（libFuzzer スキップ、h2spec ゲート含む）
-./tests/container_security/run.sh
+./tools/container_security/run.sh
 
 # libFuzzer + Toxiproxy 含むフル拡張
-SKIP_LIBFUZZER=0 ./tests/container_security/run.sh
+SKIP_LIBFUZZER=0 ./tools/container_security/run.sh
 ```

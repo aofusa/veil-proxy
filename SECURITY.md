@@ -6,7 +6,7 @@
 
 ## container_security スイート
 
-`tests/container_security/run.sh` は Docker のみで以下を実行します。
+`tools/container_security/run.sh` は Docker のみで以下を実行します。
 
 | フェーズ | ツール | スキップ環境変数 |
 |----------|--------|------------------|
@@ -19,10 +19,10 @@
 
 ## HIGH / CRITICAL 対応フロー
 
-1. **検知**: Trivy / cargo-audit / cargo-deny のレポートを `tests/container_security/results/` で確認する。
+1. **検知**: Trivy / cargo-audit / cargo-deny のレポートを `tools/container_security/results/` で確認する。
 2. **トリアージ**: 本番バイナリ（`veil:glibc`）に実際にバンドルされる依存か、ビルド専用かを切り分ける。
 3. **修正**: パッチ版への更新、feature 無効化、代替クレートへの置換のいずれかで解消する。
-4. **検証**: `SKIP_TRIVY=0 SKIP_CARGO_AUDIT=0 ./tests/container_security/run.sh` を再実行し、同一 ID が再出しないことを確認する。
+4. **検証**: `SKIP_TRIVY=0 SKIP_CARGO_AUDIT=0 ./tools/container_security/run.sh` を再実行し、同一 ID が再出しないことを確認する。
 5. **記録**: 対応内容を PR 説明またはリリースノートに記載する。
 
 ### 例外（許容）の判断基準
@@ -34,8 +34,8 @@
 
 ```bash
 # 既定（重いフェーズはスキップ）
-./tests/container_security/run.sh
+./tools/container_security/run.sh
 
 # nightly / リリース前
-SKIP_LIBFUZZER=0 SKIP_CARGO_AUDIT=0 SKIP_CARGO_DENY=0 SKIP_TRIVY=0 ./tests/container_security/run.sh
+SKIP_LIBFUZZER=0 SKIP_CARGO_AUDIT=0 SKIP_CARGO_DENY=0 SKIP_TRIVY=0 ./tools/container_security/run.sh
 ```

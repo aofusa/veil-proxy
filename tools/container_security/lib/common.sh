@@ -15,7 +15,7 @@ export HARNESS_CONTAINER="${HARNESS_CONTAINER:-veil-sec-harness}"
 export TRIVY_CONTAINER="${TRIVY_CONTAINER:-veil-sec-trivy}"
 export VEIL_IMAGE="${VEIL_IMAGE:-veil:glibc}"
 export HARNESS_IMAGE="${HARNESS_IMAGE:-veil-sec-harness:local}"
-export RESULTS_DIR="${RESULTS_DIR:-${REPO_ROOT}/tests/container_security/results}"
+export RESULTS_DIR="${RESULTS_DIR:-${REPO_ROOT}/tools/container_security/results}"
 export BACKEND_CONTAINER="${BACKEND_CONTAINER:-veil-sec-backend}"
 export TOXIPROXY_CONTAINER="${TOXIPROXY_CONTAINER:-veil-sec-toxiproxy}"
 export CHAOS_TIMEOUT_SEC="${CHAOS_TIMEOUT_SEC:-300}"
@@ -96,12 +96,12 @@ build_harness_image() {
     log "ハーネスイメージをビルド: ${HARNESS_IMAGE}"
     docker build \
         -t "${HARNESS_IMAGE}" \
-        -f "${REPO_ROOT}/tests/container_security/harness/Dockerfile" \
-        "${REPO_ROOT}/tests/container_security/harness"
+        -f "${REPO_ROOT}/tools/container_security/harness/Dockerfile" \
+        "${REPO_ROOT}/tools/container_security/harness"
 }
 
 prepare_veil_test_config() {
-    local src="${REPO_ROOT}/tests/container_security/fixtures/veil-config.toml"
+    local src="${REPO_ROOT}/tools/container_security/fixtures/veil-config.toml"
     local dst="${RESULTS_DIR}/veil-config.runtime.toml"
     [[ -f "${src}" ]] || die "テスト用設定が見つかりません: ${src}"
     mkdir -p "${RESULTS_DIR}"

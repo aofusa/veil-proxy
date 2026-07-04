@@ -5,9 +5,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 # shellcheck source=../lib/common.sh
-source "${REPO_ROOT}/tests/container_security/lib/common.sh"
+source "${REPO_ROOT}/tools/container_security/lib/common.sh"
 
-RESULTS_DIR="${RESULTS_DIR:-${REPO_ROOT}/tests/container_security/results}"
+RESULTS_DIR="${RESULTS_DIR:-${REPO_ROOT}/tools/container_security/results}"
 TESTSSL_IMAGE="${TESTSSL_IMAGE:-drwetter/testssl.sh:3.2}"
 REPORT="${RESULTS_DIR}/testssl_report.txt"
 VEIL_HOST_RESOLVED="${VEIL_HOST_RESOLVED:-}"

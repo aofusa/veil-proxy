@@ -50,7 +50,7 @@
 | F-09 | P1 | 完了 | [features/prometheus-feature-flags.md](features/prometheus-feature-flags.md) | Prometheus 拡充と feature 無効化 |
 | F-01 | P2 | 完了 | [features/grpc.md](features/grpc.md) | gRPC / gRPC-Web の完成度・テスト拡充 |
 | F-05 | P2 | 未着手 | [features/acme.md](features/acme.md) | ACME 統合 |
-| F-07 | P2 | 進行中 | [features/fuzzing-chaos-security.md](features/fuzzing-chaos-security.md) | ファジング・カオス・h2spec・セキュリティスキャン（`tests/container_security/` 基盤完了。F-52〜F-57 で拡充中） |
+| F-07 | P2 | 進行中 | [features/fuzzing-chaos-security.md](features/fuzzing-chaos-security.md) | ファジング・カオス・h2spec・セキュリティスキャン（`tools/container_security/` 基盤完了。F-52〜F-57 で拡充中） |
 | F-52 | P1 | 進行中 | [features/F-52-cargo-fuzz-libfuzzer.md](features/F-52-cargo-fuzz-libfuzzer.md) | cargo-fuzz（HPACK・frame・header・config、ASAN/corpus 残件） |
 | F-53 | P1 | 進行中 | [features/F-53-chaos-engineering-expansion.md](features/F-53-chaos-engineering-expansion.md) | カオス拡充（CB・slowloris・reset 完了、Pumba/tc 残件） |
 | F-54 | P1 | 進行中 | [features/F-54-security-scan-expansion.md](features/F-54-security-scan-expansion.md) | セキュリティスキャン（testssl・cargo-deny・SECURITY.md、ZAP 残件） |

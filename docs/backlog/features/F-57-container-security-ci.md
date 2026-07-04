@@ -2,7 +2,7 @@
 
 ## 目的
 
-`tests/container_security/run.sh` を GitHub Actions 等に組み込み、nightly でフルスイートを実行する。
+`tools/container_security/run.sh` を GitHub Actions 等に組み込み、nightly でフルスイートを実行する。
 
 ## 改修案
 

@@ -6,8 +6,8 @@ circuit breaker、retry、buffering、graceful shutdown の **障害下生存性
 
 ## 現状
 
-- `tests/container_security/chaos/toxiproxy_setup.sh` — Toxiproxy 2.9（API :8474、proxy :8480）+ whoami backend
-- `tests/container_security/harness/scripts/toxiproxy_chaos.sh` — 遅延注入・回復検証
+- `tools/container_security/chaos/toxiproxy_setup.sh` — Toxiproxy 2.9（API :8474、proxy :8480）+ whoami backend
+- `tools/container_security/harness/scripts/toxiproxy_chaos.sh` — 遅延注入・回復検証
 - `prepare_veil_test_config()` — Landlock 下の DNS 制約を回避するため Toxiproxy 上流を起動時 IP に置換
 - `fixtures/veil-config.toml` — Landlock に DNS/NSS 用パス（`/etc/resolv.conf`、`/lib`、`/usr` 等）を追加
 - 既存: 高並行負荷、SIGHUP リロード、接続チャーン

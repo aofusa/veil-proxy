@@ -4,7 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-RESULTS_DIR="${RESULTS_DIR:-${REPO_ROOT}/tests/container_security/results}"
+RESULTS_DIR="${RESULTS_DIR:-${REPO_ROOT}/tools/container_security/results}"
 RUST_IMAGE="${RUST_AUDIT_IMAGE:-rust:1-bookworm}"
 REPORT="${RESULTS_DIR}/cargo_audit_report.txt"
 
