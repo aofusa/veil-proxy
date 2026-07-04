@@ -76,9 +76,10 @@ COPY Cargo.toml Cargo.lock /app/
 # ソースコードをコピー
 COPY . /app
 
-# リリースビルド（テストは CI / ローカルの cargo test --lib で実施。
-# イメージビルドは成果物のコンパイルに専念し、環境依存テストで詰まらせない）
+# テストとビルド（ビルド環境でユニットテストを実行して動作を確認してからリリースビルド。
+# 環境依存テスト（例: 同梱 config.toml 読込）はテスト側で存在チェックしスキップ済み）
 RUN touch src/main.rs \
+    && cargo test --lib --features "${CARGO_FEATURES}" --locked \
     && cargo build --release --target "${RUST_TARGET}" --features "${CARGO_FEATURES}" --locked
 
 
