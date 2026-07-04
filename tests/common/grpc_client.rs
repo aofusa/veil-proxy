@@ -367,7 +367,12 @@ fn url_decode(encoded: &str) -> String {
 }
 
 /// gRPCエラー
+///
+/// テスト用 gRPC クライアントのエラー面。現状は `NotImplemented` のみ生成されるが、
+/// Display 実装は全バリアントを網羅しており、将来のテスト拡張で使う error surface として
+/// 保持する（dead_code 警告のみ抑止）。
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum GrpcError {
     ConnectionError(String),
     RequestError(String),
