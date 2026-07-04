@@ -112,24 +112,15 @@ pub struct LoggingConfigSection {
     #[serde(default = "default_flush_interval")]
     pub(crate) flush_interval_ms: u64,
 
-    /// ログファイルパス（レガシー・後方互換）
-    ///
-    /// `app_file_path` / `error_file_path` が未指定の場合のフォールバック元。
-    /// 指定すると app / error 両系統がこのファイルへ出力される（従来の「全ログを 1 ファイルへ」挙動）。
-    #[serde(default)]
-    pub(crate) file_path: Option<String>,
-
     /// アプリ本体ログ（INFO / WARN / DEBUG / TRACE）の出力先ファイルパス
     ///
     /// 指定しない場合は **標準出力 (stdout)** に出力。
-    /// `file_path` が指定されていればそちらをフォールバックとして使用する。
     #[serde(default)]
     pub(crate) app_file_path: Option<String>,
 
     /// エラーログ（ERROR）の出力先ファイルパス
     ///
     /// 指定しない場合は **標準エラー出力 (stderr)** に出力。
-    /// `file_path` が指定されていればそちらをフォールバックとして使用する。
     #[serde(default)]
     pub(crate) error_file_path: Option<String>,
 }
@@ -153,7 +144,6 @@ impl Default for LoggingConfigSection {
             format: LogFormat::default(),
             channel_size: default_channel_size(),
             flush_interval_ms: default_flush_interval(),
-            file_path: None,
             app_file_path: None,
             error_file_path: None,
         }
@@ -161,16 +151,14 @@ impl Default for LoggingConfigSection {
 }
 
 impl LoggingConfigSection {
-    /// アプリ本体ログの出力先ファイルパス（未指定時はレガシー `file_path` にフォールバック）
+    /// アプリ本体ログの出力先ファイルパス（未指定時は標準出力）
     pub(crate) fn resolved_app_path(&self) -> Option<&str> {
-        self.app_file_path.as_deref().or(self.file_path.as_deref())
+        self.app_file_path.as_deref()
     }
 
-    /// エラーログの出力先ファイルパス（未指定時はレガシー `file_path` にフォールバック）
+    /// エラーログの出力先ファイルパス（未指定時は標準エラー出力）
     pub(crate) fn resolved_error_path(&self) -> Option<&str> {
-        self.error_file_path
-            .as_deref()
-            .or(self.file_path.as_deref())
+        self.error_file_path.as_deref()
     }
 }
 
@@ -447,7 +435,6 @@ pub(crate) fn init_logging(config: &LoggingConfigSection) -> ftlog::LoggerGuard 
     let use_json = config.format == LogFormat::Json;
 
     // app 本体ログ（既定: stdout）/ エラーログ（既定: stderr）の出力先を構築。
-    // app_file_path / error_file_path 未指定時はレガシー file_path にフォールバックする。
     let app_sink = build_log_sink(config.resolved_app_path(), false);
     let error_sink = build_log_sink(config.resolved_error_path(), true);
 

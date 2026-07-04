@@ -26,8 +26,9 @@
 1. **レベル振り分け（app/error）**: ftlog の `FtLogFormat` が生成する msg 先頭に 1 バイトのルーティング用センチネル（app=`0x01` / error=`0x02`、レベルから決定）を埋め込み、root writer（`LogRoutingWriter`）がセンチネルを読んで app / error の出力先へ振り分け・センチネルを除去する。app/error ログは低頻度（リクエストごとではない）ため走査コストはホットパス規則に抵触しない。ファイル出力は従来どおり `ftlog::appender::FileAppender`（日次ローテーション）を内部 writer として使用。
 2. **`type` フィールド**: 統合フォーマッタ `AppLogFormat`（text/json 両対応）が `type` を出力。`type` は `target == "access"` なら `access`、`ERROR` なら `error`、それ以外は `app`。
 3. **access ログ**: `AccessLogConfig` の未指定時デフォルトを stderr→**stdout** に変更。`build_json_log` / `build_text_log` に `type=access` を追加。feature 無効時のフォールバックは `info!(target: "access", ...)`（レベル INFO のため app ストリーム＝既定 stdout に出力、`type=access` で識別可能）。
-4. **Landlock 自動許可**: 起動時（`entry.rs`）に app/error/legacy/access の各ファイルパスの親ディレクトリを `landlock_write_paths` へ重複排除しつつ追加。
-5. **後方互換**: 既存 `[logging].file_path` を維持。`app_file_path` / `error_file_path` 未指定時のフォールバック元として使用（従来「全ログを 1 ファイルへ」の挙動を保持）。
+4. **Landlock 自動許可**: 起動時（`entry.rs`）に app/error/access の各ファイルパスの親ディレクトリを `landlock_write_paths` へ重複排除しつつ追加。
+
+> 補足: 旧実装のレガシー `[logging].file_path`（app/error 兼用フォールバック）は不要のため削除済み。出力先は `app_file_path` / `error_file_path` / `[access_log].file_path` で個別指定する。
 
 ## 受け入れ条件
 
