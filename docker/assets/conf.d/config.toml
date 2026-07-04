@@ -3,7 +3,7 @@
 # セキュリティ機能（seccomp/Landlock）は有効化
 # サンドボックス機能はコンテナエンジンと衝突するので無効化
 # パフォーマンス設定はコンテナ向けの汎用設定
-# ktlsは利用可能であれば使用、不可であればrustlsにフォールバック
+# ktlsはコンテナ環境のvethと相性が悪いためオフ
 
 [server]
 listen = "0.0.0.0:443"
@@ -22,7 +22,21 @@ enable_seccomp = true
 enable_landlock = true
 enable_sandbox = false
 seccomp_mode = "filter"
-landlock_read_paths = ["/var/www", "/var/cache/veil", "/var/tmp/veil"]
+landlock_read_paths = [
+  # ファイル配信ディレクトリ（プロキシ機能のみであれば不要）
+  "/var/www",
+  # キャッシュ・バッファリングの一時ディレクトリ（キャッシュ・バッファを使用しないなら不要）
+  "/var/cache/veil",
+  "/var/tmp/veil",
+  # プロキシ機能の名前解決に必要（ファイル配信のみであれば不要）
+  "/etc/veil",
+  "/etc/resolv.conf",
+  "/etc/hosts",
+  "/etc/nsswitch.conf",
+  "/lib",
+  "/lib64",
+  "/usr"
+]
 landlock_write_paths = ["/var/cache/veil", "/var/tmp/veil"]
 
 [performance]
@@ -32,8 +46,7 @@ reuseport_balancing = "cbpf"
 [tls]
 cert_path = "/etc/veil/ssl/cert.pem"
 key_path = "/etc/veil/ssl/key.pem"
-ktls_enabled = true
-ktls_fallback_enabled = true
+ktls_enabled = false
 
 [[route]]
 [route.conditions]
