@@ -4,7 +4,7 @@
 # 必要なファイルだけ許可
 !Cargo.toml
 !Cargo.lock
-# 同梱 config.toml（builder の cargo test --lib が config 同期テストで読み込む）
+# 同梱 config.toml（設定リファレンス。ビルドコンテキストに含めておく）
 !config.toml
 !src/
 !docker/assets
