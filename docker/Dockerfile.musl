@@ -36,15 +36,21 @@ FROM tool-builder AS cacher
 ARG CARGO_FEATURES=full
 ARG RUST_TARGET=x86_64-unknown-linux-musl
 
-# Cargo.toml と Cargo.lock だけを先にコピー
+# Cargo.toml と Cargo.lock、および fuzz ワークスペースメンバのマニフェストを先にコピー
+# （[workspace] members = [".", "fuzz"] のため、fuzz/Cargo.toml が無いとワークスペース解決に失敗する）
 COPY Cargo.toml Cargo.lock /app/
+COPY fuzz/Cargo.toml /app/fuzz/Cargo.toml
 
 # 空の main.rs を作り、依存関係「だけ」を先にコンパイルしてキャッシュ化する
+# fuzz メンバはワークスペース解決のためにスタブのターゲットだけ用意し、本体はビルドしない
 RUN mkdir src benches \
     && echo "fn main() {}" > src/main.rs \
     # Cargo.toml から name = "xxx"（ベンチマーク名）を抽出して、自動的にダミーファイルを一括作成
     && awk -F'"' '/^\[\[bench\]\]/{p=1} p && /name =/{print $2; p=0}' Cargo.toml \
        | xargs -I {} touch benches/{}.rs \
+    # fuzz/Cargo.toml の [[bin]] path = "..." を抽出し、スタブソースを生成
+    && awk -F'"' '/^path =/{print $2}' fuzz/Cargo.toml \
+       | while read -r p; do mkdir -p "fuzz/$(dirname "$p")" && echo "fn main() {}" > "fuzz/$p"; done \
     && cargo test --bins --no-run --target "${RUST_TARGET}" --features "${CARGO_FEATURES}" --locked \
     && cargo build --release --target "${RUST_TARGET}" --features "${CARGO_FEATURES}" --locked \
     && rm -rf src/
