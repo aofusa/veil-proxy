@@ -3056,7 +3056,7 @@ flush_interval_ms = 1000  # BufWriter のフラッシュ間隔（ミリ秒、デ
 ### JSON出力例
 
 ```json
-{"type":"access","timestamp":"2026-01-01T00:00:00Z","method":"GET","host":"example.com","path":"/api/data","status":200,"duration_ms":12,"client_ip":"10.0.0.1","upstream":"192.168.1.10:8080","req_body_size":0,"resp_body_size":1024,"user_agent":"curl/8.0"}
+{"timestamp":"2026-01-01T00:00:00Z","type":"access","method":"GET","host":"example.com","path":"/api/data","status":200,"duration_ms":12,"client_ip":"10.0.0.1","upstream":"192.168.1.10:8080","req_body_size":0,"resp_body_size":1024,"user_agent":"curl/8.0"}
 ```
 
 ## キャッシュPurge管理API
