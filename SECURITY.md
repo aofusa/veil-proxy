@@ -13,9 +13,19 @@
 | イメージ | Trivy | `SKIP_TRIVY=1` |
 | HTTP/2 | h2spec | `SKIP_H2SPEC=1` |
 | ファジング | libFuzzer | `SKIP_LIBFUZZER=1`（既定） |
+| ファジング（ASAN+corpus） | libFuzzer + AddressSanitizer | `SKIP_LIBFUZZER_ASAN=1`（既定, F-71） |
 | TLS | testssl.sh | `SKIP_TESTSSL=1` |
+| SAST | semgrep（`p/rust`+`p/security-audit`） | `SKIP_SEMGREP=1`（F-64） |
+| SBOM | syft（CycloneDX/SPDX） | `SKIP_SBOM=1`（F-65） |
+| DAST | OWASP ZAP baseline | `SKIP_ZAP=1`（既定, F-66） |
+| カオス（プロトコル違反） | bad_backend モック | `SKIP_BAD_BACKEND=1`（既定, F-67） |
+| カオス（netem） | Pumba / tc | `SKIP_PUMBA=1`（既定, F-69） |
+| カオス（リソース枯渇） | cgroup 制約 | `SKIP_RESOURCE_EXHAUSTION=1`（既定, F-68） |
 | 依存関係 | cargo-audit | `SKIP_CARGO_AUDIT=1`（既定） |
 | ライセンス | cargo-deny | `SKIP_CARGO_DENY=1`（既定） |
+
+WASM モジュール/ABI 境界のファジングターゲット `wasm_abi` は
+`cargo fuzz run wasm_abi --features wasm` で実行する（F-70）。
 
 ## HIGH / CRITICAL 対応フロー
 

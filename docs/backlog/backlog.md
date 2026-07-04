@@ -99,6 +99,15 @@
 | F-61 | P3 | 未着手 | [features/F-61-wasm-body-filter-alloc-reduction.md](features/F-61-wasm-body-filter-alloc-reduction.md) | WASM ボディフィルタ経路のアロケーション削減（F-43 残件） |
 | F-62 | P3 | 未着手 | [features/F-62-proxy-wasm-http-call-benchmark.md](features/F-62-proxy-wasm-http-call-benchmark.md) | Proxy-Wasm「HTTP コールあり」フィルタのベンチマーク（F-48 残件、Pause/resume 配線が前提） |
 | F-63 | P1 | 完了 | [features/F-63-log-output-routing.md](features/F-63-log-output-routing.md) | ログ出力先の分離ルーティング（app=stdout / error=stderr / access=stdout をレベル別に振り分け、`type` 識別フィールド付与、JSON 順は timestamp→level→type、ログファイル親ディレクトリを landlock_write_paths へ自動追加） |
+| F-64 | P2 | 進行中 | [features/F-64-sast-semgrep.md](features/F-64-sast-semgrep.md) | SAST（semgrep）導入。`run_semgrep.sh` 追加・実行（233 件すべて `unsafe-usage`、新規脆弱性なし）。カスタムルール整備が残件（F-54 子） |
+| F-65 | P2 | 進行中 | [features/F-65-sbom-generation.md](features/F-65-sbom-generation.md) | SBOM 自動生成（syft）。source CycloneDX 823 件 + image SPDX 7 件を生成。CI 添付が残件（F-54 子） |
+| F-66 | P2 | 進行中 | [features/F-66-dast-owasp-zap.md](features/F-66-dast-owasp-zap.md) | 高度な DAST（OWASP ZAP Baseline）。`run_zap.sh` 追加・配線。スマグリング能動テストが残件（F-54 子） |
+| F-67 | P1 | 進行中 | [features/F-67-backend-protocol-violation-tests.md](features/F-67-backend-protocol-violation-tests.md) | バックエンドのプロトコル違反テスト。`bad_backend_chaos.sh` 追加・実行→**B-16 / B-17 を検出**（未修正・起票のみ）。F-53 子 |
+| F-68 | P2 | 未着手 | [features/F-68-resource-exhaustion-tests.md](features/F-68-resource-exhaustion-tests.md) | リソース枯渇テスト。`resource_exhaustion_chaos.sh` 追加・配線（フル実行は保留）。F-53 子 |
+| F-69 | P2 | 進行中 | [features/F-69-pumba-network-kernel-chaos.md](features/F-69-pumba-network-kernel-chaos.md) | ネットワーク/カーネル層カオス（Pumba/tc netem）。`pumba_chaos.sh` 追加・配線。F-53 子 |
+| F-70 | P2 | 進行中 | [features/F-70-wasm-abi-fuzzing.md](features/F-70-wasm-abi-fuzzing.md) | WASM モジュール/ABI 境界ファジング。`wasm_abi` ターゲット + `fuzz_api::wasm_module_smoke` 追加（build 確認済み）。host ABI ファジングが残件。F-52 子 |
+| F-71 | P2 | 進行中 | [features/F-71-asan-corpus-fuzzing.md](features/F-71-asan-corpus-fuzzing.md) | ASAN ファジングパイプライン + Corpus 永続化。`run_libfuzzer_asan.sh` + `corpus/` 追加・配線。TSAN/MSAN・外部永続化が残件。F-52 子 |
+| F-72 | P3 | 未着手 | [features/F-72-security-testing-further-hardening.md](features/F-72-security-testing-further-hardening.md) | セキュリティテスト追加提案（レポート範囲外）: gitleaks・スマグリング専用・差分テスト・OSS-Fuzz・カバレッジ常設・回帰コーパス |
 | F-11 | P3 | 未着手 | [features/dashboard.md](features/dashboard.md) | ダッシュボード機能 |
 | F-12 | P3 | 未着手 | [features/config-generator-webui.md](features/config-generator-webui.md) | config.toml ジェネレータ Web UI |
 | F-13 | P3 | 未着手 | [features/documentation-site.md](features/documentation-site.md) | 公式ドキュメントサイト |
@@ -135,6 +144,8 @@
 | B-13 | P1 | 完了 | [bugs/B-13-seccomp-faccessat2-static-404.md](bugs/B-13-seccomp-faccessat2-static-404.md) | seccomp 許可リストに `faccessat2`(439) が無く、seccomp 有効時に静的ファイル配信が 404（HTTP/1.1 全滅・musl 版配信不能の一因）。`ALLOWED_SYSCALLS` と docker seccomp.json に faccessat/faccessat2 を追加 |
 | B-14 | P1 | 完了 | [bugs/B-14-nocache-static-file-404.md](bugs/B-14-nocache-static-file-404.md) | `cache` feature 無効（default features 等）で静的ファイル配信が 404。`get_file_info` スタブが `None` を返していた → キャッシュせず実解決する実装へ修正 |
 | B-15 | P1 | 完了 | [bugs/B-15-dockerfile-fuzz-workspace-build.md](bugs/B-15-dockerfile-fuzz-workspace-build.md) | Dockerfile(glibc/musl) の cacher が fuzz ワークスペースメンバ未対応でビルド失敗（exit 101）→ cacher で fuzz マニフェスト+スタブを用意 |
+| B-16 | P0 | 未着手 | [bugs/B-16-splice-pipe-refcell-borrow-panic.md](bugs/B-16-splice-pipe-refcell-borrow-panic.md) | kTLS splice パイプ取得（`src/pool.rs:401` `get_splice_pipe` の `borrow_mut`）で RefCell 二重借用 panic。不正バックエンド応答＋並行アクセスで顕在化（F-67）。タスク単位で捕捉されプロセスは継続。**未修正・記録のみ** |
+| B-17 | P1 | 未着手 | [bugs/B-17-malformed-backend-client-hang.md](bugs/B-17-malformed-backend-client-hang.md) | 不正バックエンド応答（ヘッダー途中切断・巨大ヘッダー・不正ステータス・即クローズ・CL 過大）でクライアント可視のハング（速やかな 502/クローズにならない）。F-67 で検出。**未修正・記録のみ** |
 
 ---
 
