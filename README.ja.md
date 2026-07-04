@@ -3646,6 +3646,11 @@ enable_seccomp = true
 seccomp_mode = "filter"  # "log" / "filter" / "strict"
 ```
 
+> 許可リストには静的ファイル配信に必要な `faccessat2`（glibc 2.33+ / musl が
+> `access()`/`faccessat()` の実体として発行）を含みます。これが無いと seccomp 有効時に
+> ファイル解決が `EPERM` で失敗し、静的配信が 404 になります（コンテナ用
+> `docker/assets/security/seccomp.json` にも同システムコールを含めています）。
+
 **推奨導入手順:**
 
 ```bash

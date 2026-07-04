@@ -380,6 +380,8 @@ max_concurrent_connections = 10000
 
 # seccomp system call restriction (Linux only)
 # Recommended to verify with log mode first, then switch to filter mode
+# The allowlist includes faccessat2 (issued by glibc 2.33+/musl for access()/faccessat());
+# without it, file resolution fails with EPERM under seccomp and static serving returns 404.
 enable_seccomp = true
 seccomp_mode = "filter"  # "disabled" / "log" / "filter" / "strict"
 
