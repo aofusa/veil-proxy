@@ -71,7 +71,7 @@ pub struct AccessLogConfig {
     /// 出力フォーマット: "json"（デフォルト）または "text"
     #[serde(default)]
     pub format: AccessLogFormat,
-    /// ログ出力先ファイルパス（省略時は stderr）
+    /// ログ出力先ファイルパス（省略時は標準出力 stdout）
     #[serde(default)]
     pub file_path: Option<String>,
     /// 出力するフィールドのリスト（空の場合は全フィールドを出力）
@@ -170,23 +170,24 @@ fn spawn_log_thread(
         .spawn(move || {
             enum Writer {
                 File(io::BufWriter<std::fs::File>),
-                Stderr(io::BufWriter<io::Stderr>),
+                Stdout(io::BufWriter<io::Stdout>),
             }
             impl Write for Writer {
                 fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
                     match self {
                         Writer::File(w) => w.write(buf),
-                        Writer::Stderr(w) => w.write(buf),
+                        Writer::Stdout(w) => w.write(buf),
                     }
                 }
                 fn flush(&mut self) -> io::Result<()> {
                     match self {
                         Writer::File(w) => w.flush(),
-                        Writer::Stderr(w) => w.flush(),
+                        Writer::Stdout(w) => w.flush(),
                     }
                 }
             }
 
+            // 出力先未指定時のデフォルトは標準出力 (stdout)
             let mut writer = match file_path {
                 Some(ref path) => {
                     match std::fs::OpenOptions::new()
@@ -197,11 +198,11 @@ fn spawn_log_thread(
                         Ok(f) => Writer::File(io::BufWriter::new(f)),
                         Err(e) => {
                             eprintln!("access-log: failed to open '{}': {}", path, e);
-                            Writer::Stderr(io::BufWriter::new(io::stderr()))
+                            Writer::Stdout(io::BufWriter::new(io::stdout()))
                         }
                     }
                 }
-                None => Writer::Stderr(io::BufWriter::new(io::stderr())),
+                None => Writer::Stdout(io::BufWriter::new(io::stdout())),
             };
 
             loop {
@@ -323,7 +324,10 @@ pub(crate) fn build_json_log(
     fields: &[String],
 ) {
     buf.push(b'{');
-    let mut first = true;
+    // 識別用 type フィールドは常に先頭に出力する（fields フィルタの対象外）。
+    // アプリ本体ログ / エラーログと区別するための固定値 "access"。
+    buf.extend_from_slice(b"\"type\":\"access\"");
+    let mut first = false;
 
     macro_rules! json_field {
         ($name:literal, $write:expr) => {
@@ -398,7 +402,9 @@ pub(crate) fn build_text_log(
     user_agent: &str,
     fields: &[String],
 ) {
-    let mut first = true;
+    // 識別用 type フィールドは常に先頭に出力する（fields フィルタの対象外）。
+    buf.extend_from_slice(b"type=access");
+    let mut first = false;
 
     macro_rules! text_field {
         ($name:literal, $write:expr) => {
@@ -602,6 +608,43 @@ mod tests {
             s
         );
         assert!(s.ends_with('\n'), "should end with newline");
+    }
+
+    #[test]
+    fn test_access_log_type_field_present() {
+        // JSON: 先頭に "type":"access" が出力される
+        let mut buf = Vec::new();
+        build_json_log(
+            &mut buf, test_dt(), "GET", "example.com", "/", 200, 1, "127.0.0.1", "", 0, 0,
+            "-", &[],
+        );
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("\"type\":\"access\""), "json type missing: {}", s);
+        assert!(s.starts_with("{\"type\":\"access\""), "type should be first: {}", s);
+
+        // Text: 先頭に type=access が出力される
+        let mut buf = Vec::new();
+        build_text_log(
+            &mut buf, test_dt(), "GET", "example.com", "/", 200, 1, "127.0.0.1", "", 0, 0,
+            "-", &[],
+        );
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.starts_with("type=access"), "text type missing/first: {}", s);
+    }
+
+    #[test]
+    fn test_access_log_type_field_survives_field_filter() {
+        // fields で type を指定しなくても type は常に出力される
+        let fields: Vec<String> = vec!["method".to_string()];
+        let mut buf = Vec::new();
+        build_json_log(
+            &mut buf, test_dt(), "GET", "example.com", "/", 200, 1, "127.0.0.1", "", 0, 0,
+            "-", &fields,
+        );
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("\"type\":\"access\""), "type must survive filter: {}", s);
+        assert!(s.contains("\"method\":\"GET\""));
+        assert!(!s.contains("\"host\""));
     }
 
     #[test]

@@ -15,7 +15,7 @@ use ftlog::{error, info, warn, FtLogFormat, Level, LevelFilter, Record};
 use serde::Deserialize;
 use std::borrow::Cow;
 use std::cell::Cell;
-use std::fmt::{Display, Formatter, Result as FmtResult};
+use std::fmt::{Display, Formatter, Result as FmtResult, Write as _};
 use std::io;
 use std::time::Instant;
 use time::OffsetDateTime;
@@ -112,12 +112,26 @@ pub struct LoggingConfigSection {
     #[serde(default = "default_flush_interval")]
     pub(crate) flush_interval_ms: u64,
 
-    /// ログファイルパス
+    /// ログファイルパス（レガシー・後方互換）
     ///
-    /// ログファイルの出力先パス。
-    /// 指定しない場合は標準エラー出力に出力。
+    /// `app_file_path` / `error_file_path` が未指定の場合のフォールバック元。
+    /// 指定すると app / error 両系統がこのファイルへ出力される（従来の「全ログを 1 ファイルへ」挙動）。
     #[serde(default)]
     pub(crate) file_path: Option<String>,
+
+    /// アプリ本体ログ（INFO / WARN / DEBUG / TRACE）の出力先ファイルパス
+    ///
+    /// 指定しない場合は **標準出力 (stdout)** に出力。
+    /// `file_path` が指定されていればそちらをフォールバックとして使用する。
+    #[serde(default)]
+    pub(crate) app_file_path: Option<String>,
+
+    /// エラーログ（ERROR）の出力先ファイルパス
+    ///
+    /// 指定しない場合は **標準エラー出力 (stderr)** に出力。
+    /// `file_path` が指定されていればそちらをフォールバックとして使用する。
+    #[serde(default)]
+    pub(crate) error_file_path: Option<String>,
 }
 
 pub(crate) fn default_log_level() -> String {
@@ -140,7 +154,23 @@ impl Default for LoggingConfigSection {
             channel_size: default_channel_size(),
             flush_interval_ms: default_flush_interval(),
             file_path: None,
+            app_file_path: None,
+            error_file_path: None,
         }
+    }
+}
+
+impl LoggingConfigSection {
+    /// アプリ本体ログの出力先ファイルパス（未指定時はレガシー `file_path` にフォールバック）
+    pub(crate) fn resolved_app_path(&self) -> Option<&str> {
+        self.app_file_path.as_deref().or(self.file_path.as_deref())
+    }
+
+    /// エラーログの出力先ファイルパス（未指定時はレガシー `file_path` にフォールバック）
+    pub(crate) fn resolved_error_path(&self) -> Option<&str> {
+        self.error_file_path
+            .as_deref()
+            .or(self.file_path.as_deref())
     }
 }
 
@@ -158,56 +188,130 @@ pub(crate) fn parse_log_level(level: &str) -> LevelFilter {
 }
 
 // ====================
-// JSON形式ログフォーマッタ
+// ログフォーマッタ・出力先ルーティング
 // ====================
+//
+// ftlog はターゲット接頭辞でのみ appender を振り分け、**レベルによる振り分け機能を
+// 持たない**。そこで app 本体ログ（INFO/WARN/DEBUG/TRACE）とエラーログ（ERROR）を
+// 別々の出力先へ分離するために、フォーマッタが生成する msg 先頭に 1 バイトの
+// ルーティング用センチネル（下記 SENTINEL_*）を埋め込み、root writer
+// （`LogRoutingWriter`）がそれを読んで振り分け・除去する。
+//
+// app/error ログはリクエストごとではない低頻度ログのため、この 1 行あたりの
+// 走査コストはホットパス規則に抵触しない（アクセスログのホットパスは
+// access-log feature 有効時は `access_log.rs` 専用スレッドが担う）。
 
-/// JSON形式ログフォーマッタ
+/// ルーティング用センチネルバイト: アプリ本体ログ（INFO/WARN/DEBUG/TRACE）。
+/// 制御文字のため通常のログ内容・RFC3339 タイムスタンプには出現しない。
+const SENTINEL_APP: u8 = 0x01;
+/// ルーティング用センチネルバイト: エラーログ（ERROR）。
+const SENTINEL_ERROR: u8 = 0x02;
+
+/// ログ種別（識別用 `type` フィールド）を決定する
 ///
-/// ログメッセージをJSON形式で出力するカスタムフォーマッタです。
-/// 出力形式:
-/// ```json
-/// {"timestamp":"2024-01-01T00:00:00.000Z","level":"INFO","target":"veil","file":"main.rs","line":123,"message":"..."}
-/// ```
-struct JsonLogFormat;
+/// - `target == "access"` → `"access"`（access-log feature 無効時のフォールバック経路）
+/// - `ERROR` → `"error"`
+/// - それ以外 → `"app"`
+#[inline]
+fn log_kind(level: Level, is_access: bool) -> &'static str {
+    if is_access {
+        "access"
+    } else if level == Level::Error {
+        "error"
+    } else {
+        "app"
+    }
+}
 
-/// JSON形式ログメッセージ
-struct JsonLogMessage {
+/// レベルからルーティング用センチネルを決定する（ERROR のみ error ストリームへ）
+#[inline]
+fn routing_sentinel(level: Level) -> u8 {
+    if level == Level::Error {
+        SENTINEL_ERROR
+    } else {
+        SENTINEL_APP
+    }
+}
+
+/// text / json 両対応の統合ログフォーマッタ
+///
+/// `type` 識別フィールドとルーティング用センチネルを付与する。
+struct AppLogFormat {
+    json: bool,
+}
+
+/// ログメッセージ（ログスレッドで文字列化される）
+struct AppLogMessage {
+    json: bool,
     level: Level,
+    /// 識別用 `type` フィールド値（"app" / "error" / "access"）
+    kind: &'static str,
+    /// ルーティング用センチネル（msg 先頭に埋め込む）
+    sentinel: u8,
     target: Cow<'static, str>,
+    /// text 形式でのみ使用（スレッド名）
+    thread: Option<String>,
     file: Cow<'static, str>,
     line: Option<u32>,
     /// static なフォーマット文字列（引数なし）の場合は Borrowed でアロケーションなし
     args: Cow<'static, str>,
 }
 
-impl Display for JsonLogMessage {
+impl Display for AppLogMessage {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        // タイムスタンプを取得（RFC 3339形式）
-        let now = time::OffsetDateTime::now_utc();
-        let timestamp = now
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap_or_else(|_| now.to_string());
+        // 先頭にルーティング用センチネルを 1 バイト書き込む（writer 側で除去）
+        f.write_char(self.sentinel as char)?;
 
-        // JSON形式でフォーマット
-        // メッセージ内の特殊文字をエスケープ
-        write!(
-            f,
-            r#"{{"timestamp":"{}","level":"{}","target":"{}","file":"{}","line":{},"message":"{}"}}"#,
-            timestamp,
-            self.level,
-            escape_json(&self.target),
-            escape_json(&self.file),
-            self.line.unwrap_or(0),
-            escape_json(&self.args)
-        )
+        if self.json {
+            // タイムスタンプを取得（RFC 3339形式）
+            let now = time::OffsetDateTime::now_utc();
+            let timestamp = now
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_else(|_| now.to_string());
+            write!(
+                f,
+                r#"{{"timestamp":"{}","level":"{}","type":"{}","target":"{}","file":"{}","line":{},"message":"{}"}}"#,
+                timestamp,
+                self.level,
+                self.kind,
+                escape_json(&self.target),
+                escape_json(&self.file),
+                self.line.unwrap_or(0),
+                escape_json(&self.args)
+            )
+        } else {
+            // 既存 ftlog テキスト形式（`{level} {thread} [{file}:{line}] {msg}`）に
+            // `type=...` を付与
+            write!(
+                f,
+                "{} type={} {} [{}:{}] {}",
+                self.level,
+                self.kind,
+                self.thread.as_deref().unwrap_or(""),
+                self.file,
+                self.line.unwrap_or(0),
+                self.args
+            )
+        }
     }
 }
 
-impl FtLogFormat for JsonLogFormat {
+impl FtLogFormat for AppLogFormat {
     fn msg(&self, record: &Record) -> Box<dyn Send + Sync + Display> {
-        Box::new(JsonLogMessage {
-            level: record.level(),
+        let level = record.level();
+        let is_access = record.target() == "access";
+        Box::new(AppLogMessage {
+            json: self.json,
+            level,
+            kind: log_kind(level, is_access),
+            sentinel: routing_sentinel(level),
             target: record.target().to_string().into(),
+            // スレッド名は text 形式のみ必要。json では省略してアロケーションを避ける。
+            thread: if self.json {
+                None
+            } else {
+                std::thread::current().name().map(|n| n.to_string())
+            },
             file: record
                 .file_static()
                 .map(Cow::Borrowed)
@@ -245,95 +349,77 @@ fn escape_json(s: &str) -> String {
     result
 }
 
-/// JSON形式ログ用カスタムWriter
+/// ログ出力先（stdout / stderr / ローテーション付きファイル）を構築する
 ///
-/// ftlogが出力するログ行からプレフィックス（タイムスタンプと遅延時間）を削除し、
-/// JSONのみを出力します。
-///
-/// ftlogの出力形式: `{timestamp} {delay}ms {json_message}\n`
-/// 出力形式: `{json_message}\n`
-struct JsonLogWriter<W: io::Write + Send> {
-    inner: W,
-}
-
-impl<W: io::Write + Send> JsonLogWriter<W> {
-    fn new(writer: W) -> Self {
-        Self { inner: writer }
+/// - `Some(path)`: `ftlog::appender::FileAppender`（日次ローテーション・内部バッファ）
+/// - `None`: `default_stderr` が true なら stderr、false なら stdout
+fn build_log_sink(file_path: Option<&str>, default_stderr: bool) -> Box<dyn io::Write + Send> {
+    match file_path {
+        Some(path) => {
+            let appender = ftlog::appender::FileAppender::builder()
+                .path(path)
+                .rotate(ftlog::appender::Period::Day)
+                .build();
+            Box::new(appender)
+        }
+        None => {
+            if default_stderr {
+                Box::new(io::stderr())
+            } else {
+                Box::new(io::stdout())
+            }
+        }
     }
 }
 
-impl<W: io::Write + Send> io::Write for JsonLogWriter<W> {
+/// レベル別ルーティング writer（ftlog の root として使用）
+///
+/// フォーマッタが埋め込んだセンチネル（`SENTINEL_APP` / `SENTINEL_ERROR`）を読み、
+/// アプリ本体ログ / エラーログの出力先へ振り分ける。センチネルバイトは除去して出力する。
+/// ftlog は 1 ログ行を 1 回の `write` で渡すため、行内の 1 バイト除去は前後 2 回の
+/// `write_all` で実現する（追加アロケーションなし）。
+struct LogRoutingWriter {
+    app: Box<dyn io::Write + Send>,
+    error: Box<dyn io::Write + Send>,
+    json: bool,
+}
+
+impl io::Write for LogRoutingWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // ftlogの出力からJSON部分を抽出
-        // 形式: "{timestamp} {delay}ms {json}\n"
-        // JSONは '{' で始まるため、最初の '{' を見つける
-        if let Some(json_start) = buf.iter().position(|&b| b == b'{') {
-            // JSON部分のみを書き込み
-            self.inner.write_all(&buf[json_start..])?;
-            Ok(buf.len())
+        // センチネルを探索してルーティング先を決定
+        let sentinel_pos = buf
+            .iter()
+            .position(|&b| b == SENTINEL_APP || b == SENTINEL_ERROR);
+        let to_error = matches!(sentinel_pos, Some(i) if buf[i] == SENTINEL_ERROR);
+        let w: &mut dyn io::Write = if to_error {
+            &mut self.error
         } else {
-            // JSONが見つからない場合はそのまま書き込み
-            self.inner.write_all(buf)?;
-            Ok(buf.len())
+            &mut self.app
+        };
+
+        if self.json {
+            // JSON 部分（最初の '{' 以降）のみ出力。センチネルは '{' より前にあるため同時に除去される。
+            if let Some(j) = buf.iter().position(|&b| b == b'{') {
+                w.write_all(&buf[j..])?;
+            } else if let Some(i) = sentinel_pos {
+                w.write_all(&buf[..i])?;
+                w.write_all(&buf[i + 1..])?;
+            } else {
+                w.write_all(buf)?;
+            }
+        } else if let Some(i) = sentinel_pos {
+            // テキスト形式: センチネルバイトのみ除去して前後を出力
+            w.write_all(&buf[..i])?;
+            w.write_all(&buf[i + 1..])?;
+        } else {
+            w.write_all(buf)?;
         }
+        Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-/// JSON形式ログ用FileAppender
-///
-/// ファイルへのJSON形式ログ出力用のカスタムAppenderです。
-/// ftlogのプレフィックスを削除してJSONのみをファイルに書き込みます。
-struct JsonFileAppender {
-    writer: JsonLogWriter<std::io::BufWriter<std::fs::File>>,
-}
-
-impl JsonFileAppender {
-    fn new(path: &str) -> io::Result<Self> {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        let buf_writer = std::io::BufWriter::new(file);
-        Ok(Self {
-            writer: JsonLogWriter::new(buf_writer),
-        })
-    }
-}
-
-impl io::Write for JsonFileAppender {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.writer.write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush()
-    }
-}
-
-/// 標準エラー出力用JSON形式Writer
-struct JsonStderrWriter {
-    writer: JsonLogWriter<std::io::Stderr>,
-}
-
-impl JsonStderrWriter {
-    fn new() -> Self {
-        Self {
-            writer: JsonLogWriter::new(std::io::stderr()),
-        }
-    }
-}
-
-impl io::Write for JsonStderrWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.writer.write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush()
+        self.app.flush()?;
+        self.error.flush()
     }
 }
 
@@ -360,56 +446,24 @@ pub(crate) fn init_logging(config: &LoggingConfigSection) -> ftlog::LoggerGuard 
     let level = parse_log_level(&config.level);
     let use_json = config.format == LogFormat::Json;
 
-    // ファイル出力が設定されている場合
-    if let Some(ref file_path) = config.file_path {
-        if use_json {
-            // JSON形式: カスタムWriterを使用してftlogのプレフィックスを削除
-            let json_appender =
-                JsonFileAppender::new(file_path).expect("Failed to create JSON file appender");
+    // app 本体ログ（既定: stdout）/ エラーログ（既定: stderr）の出力先を構築。
+    // app_file_path / error_file_path 未指定時はレガシー file_path にフォールバックする。
+    let app_sink = build_log_sink(config.resolved_app_path(), false);
+    let error_sink = build_log_sink(config.resolved_error_path(), true);
 
-            ftlog::builder()
-                .max_log_level(level)
-                .bounded(config.channel_size, false)
-                .format(JsonLogFormat)
-                .root(json_appender)
-                .try_init()
-                .expect("Failed to initialize ftlog with JSON file appender")
-        } else {
-            // テキスト形式: ftlogの標準FileAppenderを使用
-            let file_appender = ftlog::appender::FileAppender::builder()
-                .path(file_path)
-                .rotate(ftlog::appender::Period::Day)
-                .build();
+    let root = LogRoutingWriter {
+        app: app_sink,
+        error: error_sink,
+        json: use_json,
+    };
 
-            ftlog::builder()
-                .max_log_level(level)
-                .bounded(config.channel_size, false)
-                .root(file_appender)
-                .try_init()
-                .expect("Failed to initialize ftlog with file appender")
-        }
-    } else {
-        // 標準エラー出力
-        if use_json {
-            // JSON形式: カスタムWriterを使用してftlogのプレフィックスを削除
-            let json_writer = JsonStderrWriter::new();
-
-            ftlog::builder()
-                .max_log_level(level)
-                .bounded(config.channel_size, false)
-                .format(JsonLogFormat)
-                .root(json_writer)
-                .try_init()
-                .expect("Failed to initialize ftlog with JSON stderr writer")
-        } else {
-            // テキスト形式（デフォルト）
-            ftlog::builder()
-                .max_log_level(level)
-                .bounded(config.channel_size, false)
-                .try_init()
-                .expect("Failed to initialize ftlog")
-        }
-    }
+    ftlog::builder()
+        .max_log_level(level)
+        .bounded(config.channel_size, false)
+        .format(AppLogFormat { json: use_json })
+        .root(root)
+        .try_init()
+        .expect("Failed to initialize ftlog")
 }
 
 /// kTLSの状態をログ出力
@@ -491,8 +545,12 @@ pub(crate) fn log_access(
 
     // access-log が無効な場合のみ ftlog 経由のテキストアクセスログを出力
     // （access-log 有効時は構造化ログと二重出力しない）
+    //
+    // `target: "access"` を指定することでフォーマッタが `type=access` を付与する。
+    // レベル INFO のため app ストリーム（既定 stdout = access ログの既定出力先）へ流れ、
+    // `type` フィールドでアプリ本体ログと判別できる。
     #[cfg(not(feature = "access-log"))]
-    info!("Access: time={} duration={}ms method={} host={} path={} ua={} req_body_size={} status={} resp_body_size={}",
+    info!(target: "access", "Access: time={} duration={}ms method={} host={} path={} ua={} req_body_size={} status={} resp_body_size={}",
         log_time, duration_ms, method_str, host_str, path_str, ua_str, req_body_size, status, resp_body_size);
 
     // Prometheusメトリクスを記録
@@ -521,4 +579,103 @@ pub(crate) fn log_access(
         client_ip,
         upstream,
     );
+}
+
+// ====================
+// テスト
+// ====================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+    use std::sync::{Arc, Mutex};
+
+    /// テスト用: 共有 Vec<u8> へ書き込む writer
+    #[derive(Clone)]
+    struct SharedSink(Arc<Mutex<Vec<u8>>>);
+    impl io::Write for SharedSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn routing_writer(json: bool) -> (LogRoutingWriter, Arc<Mutex<Vec<u8>>>, Arc<Mutex<Vec<u8>>>) {
+        let app = Arc::new(Mutex::new(Vec::new()));
+        let err = Arc::new(Mutex::new(Vec::new()));
+        let w = LogRoutingWriter {
+            app: Box::new(SharedSink(app.clone())),
+            error: Box::new(SharedSink(err.clone())),
+            json,
+        };
+        (w, app, err)
+    }
+
+    fn s(v: &Arc<Mutex<Vec<u8>>>) -> String {
+        String::from_utf8(v.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn test_log_kind() {
+        assert_eq!(log_kind(Level::Info, false), "app");
+        assert_eq!(log_kind(Level::Warn, false), "app");
+        assert_eq!(log_kind(Level::Debug, false), "app");
+        assert_eq!(log_kind(Level::Trace, false), "app");
+        assert_eq!(log_kind(Level::Error, false), "error");
+        // target == "access" は access（レベル問わず）
+        assert_eq!(log_kind(Level::Info, true), "access");
+        assert_eq!(log_kind(Level::Error, true), "access");
+    }
+
+    #[test]
+    fn test_routing_sentinel() {
+        assert_eq!(routing_sentinel(Level::Error), SENTINEL_ERROR);
+        assert_eq!(routing_sentinel(Level::Info), SENTINEL_APP);
+        assert_eq!(routing_sentinel(Level::Warn), SENTINEL_APP);
+    }
+
+    #[test]
+    fn test_routing_text_app_vs_error() {
+        let (mut w, app, err) = routing_writer(false);
+        // app 行（センチネル APP）
+        let app_line = format!("2024-01-01 0ms {}INFO type=app main [f:1] hello\n", SENTINEL_APP as char);
+        w.write_all(app_line.as_bytes()).unwrap();
+        // error 行（センチネル ERROR）
+        let err_line = format!("2024-01-01 0ms {}ERROR type=error main [f:2] boom\n", SENTINEL_ERROR as char);
+        w.write_all(err_line.as_bytes()).unwrap();
+
+        let app_out = s(&app);
+        let err_out = s(&err);
+        // app にはアプリ行のみ、error にはエラー行のみ
+        assert!(app_out.contains("hello"), "app: {}", app_out);
+        assert!(!app_out.contains("boom"), "app must not have error: {}", app_out);
+        assert!(err_out.contains("boom"), "err: {}", err_out);
+        assert!(!err_out.contains("hello"), "err must not have app: {}", err_out);
+        // センチネルバイトは除去されている
+        assert!(!app_out.contains(SENTINEL_APP as char));
+        assert!(!err_out.contains(SENTINEL_ERROR as char));
+        // タイムスタンプ・type フィールドは保持
+        assert!(app_out.contains("type=app"));
+        assert!(app_out.contains("2024-01-01"));
+    }
+
+    #[test]
+    fn test_routing_json_strips_prefix_and_sentinel() {
+        let (mut w, app, _err) = routing_writer(true);
+        let line = format!(
+            "2024-01-01 0ms {}{{\"level\":\"INFO\",\"type\":\"app\",\"message\":\"hi\"}}\n",
+            SENTINEL_APP as char
+        );
+        w.write_all(line.as_bytes()).unwrap();
+        let out = s(&app);
+        // ftlog プレフィックスとセンチネルが除去され JSON のみ
+        assert!(out.starts_with('{'), "out: {}", out);
+        assert!(out.contains("\"type\":\"app\""));
+        assert!(!out.contains(SENTINEL_APP as char));
+        assert!(!out.contains("0ms"));
+    }
 }

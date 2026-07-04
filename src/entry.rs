@@ -326,10 +326,13 @@ pub fn run() {
         loaded_config.logging.channel_size,
         loaded_config.logging.flush_interval_ms
     );
-    if let Some(ref file_path) = loaded_config.logging.file_path {
-        info!("Logging: output to file '{}'", file_path);
-    } else {
-        info!("Logging: output to stderr (async buffered via ftlog)");
+    match loaded_config.logging.resolved_app_path() {
+        Some(p) => info!("Logging: app log (INFO/WARN/DEBUG) -> file '{}'", p),
+        None => info!("Logging: app log (INFO/WARN/DEBUG) -> stdout"),
+    }
+    match loaded_config.logging.resolved_error_path() {
+        Some(p) => info!("Logging: error log (ERROR) -> file '{}'", p),
+        None => info!("Logging: error log (ERROR) -> stderr"),
     }
 
     // kTLS設定のログ出力
@@ -470,6 +473,29 @@ pub fn run() {
     // セキュリティ機能のサポート状況をレポート
     crate::security::report_security_status();
 
+    // ログ出力先ファイルの親ディレクトリを Landlock 書き込み許可へ自動追加する。
+    // （Landlock 有効時にログ書き込みが拒否されるのを防ぐ。日次ローテーションで生成される
+    //   ファイルも同ディレクトリ配下のため、ファイル単体でなく親ディレクトリを許可する。）
+    let mut landlock_write_paths = loaded_config.global_security.landlock_write_paths.clone();
+    {
+        let mut add_parent_dir = |file_path: Option<&str>| {
+            if let Some(path) = file_path {
+                let dir = std::path::Path::new(path)
+                    .parent()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| ".".to_string());
+                if !landlock_write_paths.contains(&dir) {
+                    landlock_write_paths.push(dir);
+                }
+            }
+        };
+        add_parent_dir(loaded_config.logging.resolved_app_path());
+        add_parent_dir(loaded_config.logging.resolved_error_path());
+        #[cfg(feature = "access-log")]
+        add_parent_dir(loaded_config.access_log_config.file_path.as_deref());
+    }
+
     // セキュリティ設定を構築
     let security_config = crate::security::SecurityConfig {
         enable_io_uring_restrictions: true, // カスタム io_uring 実装で IORING_REGISTER_RESTRICTIONS を適用
@@ -477,7 +503,7 @@ pub fn run() {
         seccomp_mode: crate::security::SeccompMode::from_str(&loaded_config.global_security.seccomp_mode),
         enable_landlock: loaded_config.global_security.enable_landlock,
         landlock_read_paths: loaded_config.global_security.landlock_read_paths.clone(),
-        landlock_write_paths: loaded_config.global_security.landlock_write_paths.clone(),
+        landlock_write_paths,
     };
 
     // セキュリティ制限を適用
