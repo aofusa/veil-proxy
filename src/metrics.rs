@@ -922,15 +922,17 @@ mod tests {
         // デフォルトは有効
         set_metrics_runtime_enabled(true);
         assert!(metrics_runtime_enabled());
-        let resp = build_metrics_response();
-        // 有効時は 200（metrics feature 有効時）または 404（無効時）
-        let s = String::from_utf8_lossy(&resp);
+        // 有効時は 200 を返すこと（metrics feature 有効時のみ検証。無効時は下の 404 検証のみ）
         #[cfg(feature = "metrics")]
-        assert!(
-            s.starts_with("HTTP/1.1 200"),
-            "expected 200 when enabled: {}",
-            s
-        );
+        {
+            let resp = build_metrics_response();
+            let s = String::from_utf8_lossy(&resp);
+            assert!(
+                s.starts_with("HTTP/1.1 200"),
+                "expected 200 when enabled: {}",
+                s
+            );
+        }
 
         // 無効化すると 404 を返す
         set_metrics_runtime_enabled(false);
