@@ -1997,10 +1997,9 @@ where
 {
     use http2::Http2ErrorCode;
 
-    // ヘッダ送信（ボディ無しなら END_STREAM）
-    conn.send_headers(stream_id, status, h2_headers, content_length == 0)
-        .await?;
     if content_length == 0 {
+        // ボディ無し: HEADERS を END_STREAM 付きで即送出。
+        conn.send_headers(stream_id, status, h2_headers, true).await?;
         return Ok(0);
     }
 
@@ -2009,10 +2008,19 @@ where
     // ヘッダ直後に既読のボディ断片を送る（追加コピーなし、スライス直送）
     let init_len = initial_body.len().min(remaining);
     if init_len > 0 {
+        // HEADERS を連結バッファへ積み、続く send_data と 1 回の書き込みにまとめる
+        // （送信ホットパスのシステムコール削減）。send_data 末尾で両者をフラッシュする。
+        conn.send_headers_buffered(stream_id, status, h2_headers)
+            .await?;
         let last = init_len >= remaining;
         conn.send_data(stream_id, &initial_body[..init_len], last)
             .await?;
         remaining -= init_len;
+    } else {
+        // 既読断片が無い場合は HEADERS を即送出（後続の read で RST を挟む可能性があるため
+        // 連結バッファに残さない）。
+        conn.send_headers(stream_id, status, h2_headers, false)
+            .await?;
     }
 
     // 残りをバックエンドから読みつつ逐次転送する（全バッファリングなし）

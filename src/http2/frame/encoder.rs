@@ -21,6 +21,23 @@ impl FrameEncoder {
 
     /// DATA フレームをエンコード
     pub fn encode_data(&self, stream_id: u32, data: &[u8], end_stream: bool) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(FrameHeader::SIZE + data.len());
+        self.encode_data_into(&mut buf, stream_id, data, end_stream);
+        buf
+    }
+
+    /// DATA フレームを既存バッファへ追記（送信ホットパスのフレーム連結用・ゼロ追加確保）
+    ///
+    /// 単一レスポンスの HEADERS/DATA/トレイラーを 1 本の連続バッファへ連結し、
+    /// io_uring への書き込みを 1 回にまとめるためのゼロコピー追記 API。per-frame
+    /// `Vec` 確保を排除する。
+    pub fn encode_data_into(
+        &self,
+        out: &mut Vec<u8>,
+        stream_id: u32,
+        data: &[u8],
+        end_stream: bool,
+    ) {
         let mut flags = 0u8;
         if end_stream {
             flags |= FrameFlags::END_STREAM;
@@ -28,12 +45,11 @@ impl FrameEncoder {
 
         let header = FrameHeader::new(FrameType::Data, flags, stream_id, data.len() as u32);
 
-        let mut buf = Vec::with_capacity(FrameHeader::SIZE + data.len());
         let mut header_buf = [0u8; 9];
         header.encode(&mut header_buf);
-        buf.extend_from_slice(&header_buf);
-        buf.extend_from_slice(data);
-        buf
+        out.reserve(FrameHeader::SIZE + data.len());
+        out.extend_from_slice(&header_buf);
+        out.extend_from_slice(data);
     }
 
     /// HEADERS フレームをエンコード
@@ -45,6 +61,29 @@ impl FrameEncoder {
         end_headers: bool,
         priority: Option<PrioritySpec>,
     ) -> Vec<u8> {
+        let priority_len = if priority.is_some() { 5 } else { 0 };
+        let mut buf = Vec::with_capacity(FrameHeader::SIZE + priority_len + header_block.len());
+        self.encode_headers_into(
+            &mut buf,
+            stream_id,
+            header_block,
+            end_stream,
+            end_headers,
+            priority,
+        );
+        buf
+    }
+
+    /// HEADERS フレームを既存バッファへ追記（送信ホットパスのフレーム連結用・ゼロ追加確保）
+    pub fn encode_headers_into(
+        &self,
+        out: &mut Vec<u8>,
+        stream_id: u32,
+        header_block: &[u8],
+        end_stream: bool,
+        end_headers: bool,
+        priority: Option<PrioritySpec>,
+    ) {
         let mut flags = 0u8;
         if end_stream {
             flags |= FrameFlags::END_STREAM;
@@ -57,14 +96,14 @@ impl FrameEncoder {
         }
 
         let priority_len = if priority.is_some() { 5 } else { 0 };
-        let length = priority_len + header_block.len() as u32;
+        let length = priority_len as u32 + header_block.len() as u32;
 
         let header = FrameHeader::new(FrameType::Headers, flags, stream_id, length);
 
-        let mut buf = Vec::with_capacity(FrameHeader::SIZE + length as usize);
         let mut header_buf = [0u8; 9];
         header.encode(&mut header_buf);
-        buf.extend_from_slice(&header_buf);
+        out.reserve(FrameHeader::SIZE + length as usize);
+        out.extend_from_slice(&header_buf);
 
         // Priority
         if let Some(p) = priority {
@@ -73,12 +112,11 @@ impl FrameEncoder {
             } else {
                 p.dependency
             };
-            buf.extend_from_slice(&dep.to_be_bytes());
-            buf.push(p.weight.saturating_sub(1)); // weight は 0-255 で送信
+            out.extend_from_slice(&dep.to_be_bytes());
+            out.push(p.weight.saturating_sub(1)); // weight は 0-255 で送信
         }
 
-        buf.extend_from_slice(header_block);
-        buf
+        out.extend_from_slice(header_block);
     }
 
     /// SETTINGS フレームをエンコード
@@ -291,6 +329,48 @@ mod tests {
         assert_eq!(header.stream_id, 1);
         assert_eq!(header.length, data.len() as u32);
         assert!(header.is_end_stream());
+    }
+
+    #[test]
+    fn test_encode_data_into_matches_owned() {
+        // 追記版 encode_data_into は所有 Vec を返す encode_data と完全一致すべき
+        // （送信ホットパスの連結最適化がフレーム内容を変えていないことの保証）。
+        let encoder = FrameEncoder::new(16384);
+        let data = b"Hello, World!";
+        let owned = encoder.encode_data(7, data, true);
+
+        let mut buf = Vec::new();
+        encoder.encode_data_into(&mut buf, 7, data, true);
+        assert_eq!(buf, owned);
+
+        // 既存バッファへの追記でも末尾に正しく連結される（前置データが保持される）。
+        let mut buf2 = vec![0xAA, 0xBB];
+        encoder.encode_data_into(&mut buf2, 7, data, false);
+        assert_eq!(&buf2[..2], &[0xAA, 0xBB]);
+        assert_eq!(&buf2[2..], &encoder.encode_data(7, data, false)[..]);
+    }
+
+    #[test]
+    fn test_encode_headers_into_matches_owned() {
+        let encoder = FrameEncoder::new(16384);
+        let block = b"\x82\x86\x84"; // 適当な HPACK 済みブロック
+
+        // priority 無し
+        let owned = encoder.encode_headers(3, block, true, true, None);
+        let mut buf = Vec::new();
+        encoder.encode_headers_into(&mut buf, 3, block, true, true, None);
+        assert_eq!(buf, owned);
+
+        // priority 有り
+        let prio = PrioritySpec {
+            dependency: 1,
+            weight: 16,
+            exclusive: true,
+        };
+        let owned_p = encoder.encode_headers(3, block, false, true, Some(prio));
+        let mut buf_p = Vec::new();
+        encoder.encode_headers_into(&mut buf_p, 3, block, false, true, Some(prio));
+        assert_eq!(buf_p, owned_p);
     }
 
     #[test]

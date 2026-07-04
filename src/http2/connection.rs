@@ -68,6 +68,13 @@ pub struct Http2Connection<S> {
 
     /// 現在のストリームの CONTINUATION カウンター
     continuation_count: u32,
+
+    /// 送信フレーム連結バッファ（送信ホットパス最適化）
+    ///
+    /// 1 レスポンス分の HEADERS/DATA/トレイラーを連結し、io_uring への書き込みを
+    /// 1 回にまとめる再利用バッファ。呼び出し境界では常に空（`flush_write_buf` 済み）。
+    /// 接続をまたいでスレッドローカルプールで再利用する（F-73 続き）。
+    write_buf: Vec<u8>,
 }
 
 // ====================
@@ -82,6 +89,13 @@ const H2_READ_BUF_SIZE: usize = 65536;
 const H2_READ_BUF_POOL_MAX: usize = 256;
 /// これを超える肥大化バッファはプールに戻さず解放する（1MB）
 const H2_READ_BUF_RETAIN_MAX: usize = 1 << 20;
+
+/// 送信連結バッファの途中フラッシュ閾値（128KB）。
+///
+/// 大きなボディのストリーミング時に連結バッファが無制限に肥大化しないよう、
+/// この閾値を超えたら 1 回書き込んでバッファを空にする。小〜中サイズのレスポンスは
+/// 閾値未満のため HEADERS + 全 DATA が 1 回の書き込みにまとまる。
+const WRITE_BUF_FLUSH_THRESHOLD: usize = 128 * 1024;
 
 thread_local! {
     static H2_READ_BUF_POOL: std::cell::RefCell<Vec<Vec<u8>>> =
@@ -113,11 +127,48 @@ fn release_h2_read_buf(mut buf: Vec<u8>) {
     });
 }
 
+// ====================
+// 送信連結バッファのスレッドローカル再利用プール（F-73 続き）
+// ====================
+// 送信ホットパスの HEADERS/DATA/トレイラー連結バッファを接続をまたいで再利用し、
+// 接続ごとの確保・解放コストを排除する（thread-per-core 設計のためロック不要）。
+
+thread_local! {
+    static H2_WRITE_BUF_POOL: std::cell::RefCell<Vec<Vec<u8>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// プールから送信連結バッファを取得する（無ければ新規確保・空）。
+fn acquire_h2_write_buf() -> Vec<u8> {
+    let mut buf = H2_WRITE_BUF_POOL
+        .with(|p| p.borrow_mut().pop())
+        .unwrap_or_default();
+    buf.clear();
+    buf
+}
+
+/// 送信連結バッファをプールへ返却する。空/肥大バッファは戻さない。
+fn release_h2_write_buf(mut buf: Vec<u8>) {
+    let cap = buf.capacity();
+    if cap == 0 || cap > H2_READ_BUF_RETAIN_MAX {
+        return;
+    }
+    buf.clear();
+    H2_WRITE_BUF_POOL.with(|p| {
+        let mut pool = p.borrow_mut();
+        if pool.len() < H2_READ_BUF_POOL_MAX {
+            pool.push(buf);
+        }
+    });
+}
+
 impl<S> Drop for Http2Connection<S> {
     fn drop(&mut self) {
         // 接続終了時に読み込みバッファをプールへ返却（再利用）。read_more の最中に
         // drop された場合は read_buf が空（take 済み）のため pool には戻らない。
         release_h2_read_buf(std::mem::take(&mut self.read_buf));
+        // 送信連結バッファも同様にプールへ返却する。
+        release_h2_write_buf(std::mem::take(&mut self.write_buf));
     }
 }
 
@@ -188,6 +239,7 @@ where
             control_frame_count: 0,
             control_frame_window_start: now,
             continuation_count: 0,
+            write_buf: acquire_h2_write_buf(),
         }
     }
 
@@ -369,11 +421,31 @@ where
     /// 従来の per-frame `data[..].to_vec()` に由来するアロケーション + 全コピーを排除する
     /// （HTTP/2 送信ホットパス最適化）。runtime の write_all は「全書き込み or WriteZero」
     /// のため、`Ok` は常に完全書き込みを意味する。`WouldBlock` のみ同一バッファで再試行する。
-    async fn write_all(&mut self, mut buf: Vec<u8>) -> Http2Result<()> {
+    async fn write_all(&mut self, buf: Vec<u8>) -> Http2Result<()> {
+        // 呼び出し境界では write_buf は空である不変条件（各送信 API は復帰前に flush する）。
+        // 直接 write_all する制御フレーム等が連結バッファを追い越して順序が壊れないよう保証する。
+        debug_assert!(
+            self.write_buf.is_empty(),
+            "write_all called with pending coalesced write_buf"
+        );
+        let returned = self.write_all_raw(buf).await?;
+        // 所有バッファの容量を再利用のため回収（write_buf が空のときのみ）。
+        if self.write_buf.is_empty() && returned.capacity() > self.write_buf.capacity() {
+            self.write_buf = returned;
+            self.write_buf.clear();
+        }
+        Ok(())
+    }
+
+    /// 所有バッファを io_uring stream へ書き込み、完了後にバッファを返す（容量再利用用）。
+    ///
+    /// runtime の write_all は「全書き込み or WriteZero」のため、`Ok` は常に完全書き込みを
+    /// 意味する。`WouldBlock` のみ同一バッファで再試行する。
+    async fn write_all_raw(&mut self, mut buf: Vec<u8>) -> Http2Result<Vec<u8>> {
         loop {
             let (result, returned) = self.stream.write_all(buf).await;
             match result {
-                Ok(_) => return Ok(()),
+                Ok(_) => return Ok(returned),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     buf = returned;
                     continue;
@@ -381,6 +453,21 @@ where
                 Err(e) => return Err(Http2Error::Io(e)),
             }
         }
+    }
+
+    /// 連結バッファ `write_buf` に溜まったフレームを 1 回の書き込みで送出する。
+    ///
+    /// 送信ホットパスの HEADERS/DATA/トレイラーを 1 本にまとめて io_uring 書き込み回数を
+    /// 削減する。バッファは書き込み後に空にして容量を再利用する。
+    async fn flush_write_buf(&mut self) -> Http2Result<()> {
+        if self.write_buf.is_empty() {
+            return Ok(());
+        }
+        let buf = std::mem::take(&mut self.write_buf);
+        let mut returned = self.write_all_raw(buf).await?;
+        returned.clear();
+        self.write_buf = returned;
+        Ok(())
     }
 
     /// フレームを処理（外部からアクセス可能）
@@ -1210,12 +1297,17 @@ where
             lowercase_names.push(name.to_ascii_lowercase());
         }
 
+        let empty_body = body.is_none() || body.map(|b| b.is_empty()).unwrap_or(true);
+
+        // HEADERS を連結バッファへ積む。ボディがあるときはフラッシュせず、続く DATA と
+        // 1 回の書き込みにまとめる（送信ホットパスのシステムコール削減・F-73 続き）。
         self.send_headers_internal(
             stream_id,
             status,
             headers,
             &lowercase_names,
-            body.is_none() || body.map(|b| b.is_empty()).unwrap_or(true),
+            empty_body,
+            empty_body, // flush: ボディ無しなら即フラッシュ
         )
         .await?;
 
@@ -1241,11 +1333,36 @@ where
             lowercase_names.push(name.to_ascii_lowercase());
         }
 
-        self.send_headers_internal(stream_id, status, headers, &lowercase_names, end_stream)
+        self.send_headers_internal(stream_id, status, headers, &lowercase_names, end_stream, true)
+            .await
+    }
+
+    /// ヘッダーを連結バッファへ積むだけで即送出しない（ストリーミング応答の HEADERS +
+    /// 最初の DATA 連結用）。
+    ///
+    /// 送信ホットパス最適化。呼び出し後は **必ず** 同一ストリームの `send_data`（末尾で
+    /// フラッシュする）を続けて呼ぶこと。途中で `write_all` を伴う制御フレーム送出
+    /// （`send_rst_stream` 等）を挟んではならない（連結バッファに HEADERS が残っているため
+    /// 順序が壊れる）。`end_stream=false` 固定（ボディが続く前提）。
+    pub async fn send_headers_buffered(
+        &mut self,
+        stream_id: u32,
+        status: u16,
+        headers: &[(&[u8], &[u8])],
+    ) -> Http2Result<()> {
+        let mut lowercase_names: Vec<Vec<u8>> = Vec::with_capacity(headers.len());
+        for &(name, _) in headers {
+            lowercase_names.push(name.to_ascii_lowercase());
+        }
+
+        self.send_headers_internal(stream_id, status, headers, &lowercase_names, false, false)
             .await
     }
 
     /// ヘッダー送信の内部実装
+    ///
+    /// `flush` が `true` のとき連結バッファを即座に書き込む。`false` のときは
+    /// 続く DATA/トレイラーと 1 回の書き込みにまとめるためバッファに残す。
     async fn send_headers_internal(
         &mut self,
         stream_id: u32,
@@ -1253,6 +1370,7 @@ where
         headers: &[(&[u8], &[u8])],
         lowercase_names: &[Vec<u8>],
         end_stream: bool,
+        flush: bool,
     ) -> Http2Result<()> {
         // ステータスコードを文字列に変換
         let mut status_buf = [0u8; 3];
@@ -1293,7 +1411,8 @@ where
             .encode(&header_list)
             .map_err(|e| Http2Error::HpackEncode(e.to_string()))?;
 
-        let frame = self.frame_encoder.encode_headers(
+        self.frame_encoder.encode_headers_into(
+            &mut self.write_buf,
             stream_id,
             &header_block,
             end_stream,
@@ -1301,7 +1420,9 @@ where
             None,
         );
 
-        self.write_all(frame).await?;
+        if flush {
+            self.flush_write_buf().await?;
+        }
 
         // ストリーム状態を更新
         if let Some(stream) = self.streams.get(stream_id) {
@@ -1459,26 +1580,32 @@ where
             .encode(&header_list)
             .map_err(|e| Http2Error::HpackEncode(e.to_string()))?;
 
-        // HEADERS with end_stream=false (body + trailers follow)
-        let headers_frame = self.frame_encoder.encode_headers(
+        // HEADERS with end_stream=false (body + trailers follow)。連結バッファへ積み、
+        // フラッシュせず続く DATA と 1 回の書き込みにまとめる（送信ホットパス最適化）。
+        self.frame_encoder.encode_headers_into(
+            &mut self.write_buf,
             stream_id,
             &header_block,
             false, // end_stream
             true,  // end_headers
             None,
         );
-        self.write_all(headers_frame).await?;
 
         // ストリーム状態を更新
         if let Some(stream) = self.streams.get(stream_id) {
             stream.send_headers(false)?;
         }
 
-        // 2. DATA フレーム送信
+        // 2. DATA フレーム送信（send_data が末尾でまとめてフラッシュする）
         if let Some(body) = body {
             if !body.is_empty() {
                 self.send_data(stream_id, body, false).await?;
+            } else {
+                // 空ボディ: HEADERS を先に送出しておく（トレイラーは別途送出）。
+                self.flush_write_buf().await?;
             }
+        } else {
+            self.flush_write_buf().await?;
         }
 
         // 3. TRAILERS フレーム送信 (grpc-status, grpc-message)
@@ -1568,7 +1695,10 @@ where
             let available_window = self.conn_send_window.min(stream_window).max(0) as usize;
 
             if available_window == 0 {
-                // ウィンドウが0の場合、WINDOW_UPDATEを待つ
+                // ウィンドウが0の場合、WINDOW_UPDATEを待つ。ブロックする前に、連結バッファに
+                // 溜めた DATA を必ず送出しておく（順序保証 + 相手のウィンドウ回復を促す）。
+                self.flush_write_buf().await?;
+
                 window_update_wait_count += 1;
                 if window_update_wait_count > MAX_WINDOW_UPDATE_WAITS {
                     return Err(Http2Error::stream_error(
@@ -1619,10 +1749,19 @@ where
                 stream.send_window -= len;
             }
 
-            let frame = self
-                .frame_encoder
-                .encode_data(stream_id, chunk, end_stream && is_last);
-            self.write_all(frame).await?;
+            // DATA フレームを連結バッファへ追記（per-frame Vec 確保を排除）。HEADERS と
+            // 同一バッファに載せることで 1 レスポンスの書き込みを 1 回にまとめる。
+            self.frame_encoder.encode_data_into(
+                &mut self.write_buf,
+                stream_id,
+                chunk,
+                end_stream && is_last,
+            );
+
+            // 連結バッファが閾値を超えたら途中フラッシュしてメモリを抑え、送信をパイプライン化。
+            if self.write_buf.len() >= WRITE_BUF_FLUSH_THRESHOLD {
+                self.flush_write_buf().await?;
+            }
 
             offset += chunk_len;
             window_update_wait_count = 0; // 送信成功したのでリセット
@@ -1632,9 +1771,12 @@ where
         // 0 長 DATA フレームを明示送出して END_STREAM を伝える。ストリーミング転送
         // （F-32）でバックエンドが content-length 未達で切断した際などの終端クローズに使う。
         if data.is_empty() && end_stream {
-            let frame = self.frame_encoder.encode_data(stream_id, &[], true);
-            self.write_all(frame).await?;
+            self.frame_encoder
+                .encode_data_into(&mut self.write_buf, stream_id, &[], true);
         }
+
+        // 連結バッファに残ったフレーム（HEADERS + 全 DATA）を 1 回で送出する。
+        self.flush_write_buf().await?;
 
         // 状態更新
         if end_stream {
@@ -1946,6 +2088,241 @@ mod tests {
         assert!((settings.initial_window_size as i32) <= max_window_size);
     }
 
-    // 注: 実際のコネクション処理のテストはモックTLSストリームが必要なため、
-    // 統合テストとして別途実施することを推奨
+    // ====================
+    // 送信ホットパス連結（coalescing）テスト
+    // ====================
+    //
+    // モックストリームで `write` 呼び出し回数と送出バイト列を捕捉し、送信ホットパスの
+    // フレーム連結（HEADERS + DATA を 1 回の書き込みにまとめる最適化・F-73 続き）が
+    // 実際に機能していること、およびフレーム内容が RFC 準拠であることを検証する。
+
+    use crate::runtime::buf::IoBuf;
+    use crate::runtime::io::{AsyncReadRent, AsyncWriteRent, BufResult};
+    use std::future::Future;
+
+    /// 送出バイト列と write 呼び出し回数を記録するモックストリーム。
+    ///
+    /// - `write`: 呼び出しごとに渡されたバイト列を 1 要素として `writes` に記録する
+    ///   （= 何回の書き込みに分割されたかを厳密に観測できる）。常に全長書き込み成功を返す。
+    /// - `read`: 送信専用テストでは呼ばれない前提（ウィンドウ枯渇待ちに入ると呼ばれるが、
+    ///   本テストは十分なウィンドウ内でのみ送信する）。呼ばれた場合は EOF(0) を返す。
+    struct RecordingStream {
+        writes: Vec<Vec<u8>>,
+    }
+
+    impl RecordingStream {
+        fn new() -> Self {
+            Self { writes: Vec::new() }
+        }
+
+        /// 記録された全書き込みを連結したバイト列。
+        fn concat(&self) -> Vec<u8> {
+            self.writes.iter().flatten().copied().collect()
+        }
+    }
+
+    impl AsyncReadRent for RecordingStream {
+        fn read<T: crate::runtime::buf::IoBufMut>(
+            &mut self,
+            buf: T,
+        ) -> impl Future<Output = BufResult<usize, T>> {
+            // 送信専用テストでは読み取りは EOF 扱い（ウィンドウ枯渇待ちに入らせない）。
+            async move { (Ok(0), buf) }
+        }
+    }
+
+    impl AsyncWriteRent for RecordingStream {
+        fn write<T: IoBuf>(&mut self, buf: T) -> impl Future<Output = BufResult<usize, T>> {
+            let len = buf.bytes_init();
+            // SAFETY: read_ptr()..len は IoBuf の初期化済み領域。write 完了までバッファは生存。
+            let slice = unsafe { std::slice::from_raw_parts(buf.read_ptr(), len) };
+            self.writes.push(slice.to_vec());
+            async move { (Ok(len), buf) }
+        }
+
+        fn shutdown(&mut self) -> impl Future<Output = io::Result<()>> {
+            async move { Ok(()) }
+        }
+    }
+
+    /// 単純な同期ドライバ（io_uring 不要な送信テスト用）。Pending は自己 wake 前提で即再試行。
+    fn drive<F: Future>(mut fut: F) -> F::Output {
+        use std::sync::Arc;
+        use std::task::{Context, Poll, Wake, Waker};
+        struct NoopWake;
+        impl Wake for NoopWake {
+            fn wake(self: Arc<Self>) {}
+        }
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = unsafe { std::pin::Pin::new_unchecked(&mut fut) };
+        loop {
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(v) => return v,
+                Poll::Pending => {}
+            }
+        }
+    }
+
+    /// 連結バイト列を HTTP/2 フレーム列 (type, flags, stream_id, payload) にパースする。
+    fn parse_frames(bytes: &[u8]) -> Vec<(u8, u8, u32, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 9 <= bytes.len() {
+            let len =
+                ((bytes[i] as usize) << 16) | ((bytes[i + 1] as usize) << 8) | bytes[i + 2] as usize;
+            let ftype = bytes[i + 3];
+            let flags = bytes[i + 4];
+            let sid = u32::from_be_bytes([bytes[i + 5] & 0x7f, bytes[i + 6], bytes[i + 7], bytes[i + 8]]);
+            assert!(i + 9 + len <= bytes.len(), "truncated frame payload");
+            let payload = bytes[i + 9..i + 9 + len].to_vec();
+            out.push((ftype, flags, sid, payload));
+            i += 9 + len;
+        }
+        assert_eq!(i, bytes.len(), "trailing bytes not frame-aligned");
+        out
+    }
+
+    const FRAME_DATA: u8 = 0x0;
+    const FRAME_HEADERS: u8 = 0x1;
+    const FLAG_END_STREAM: u8 = 0x1;
+    const FLAG_END_HEADERS: u8 = 0x4;
+
+    /// HalfClosedRemote（= リクエスト受信済み）状態のストリームを 1 本持つ接続を用意する。
+    fn conn_with_open_stream(stream_id: u32) -> Http2Connection<RecordingStream> {
+        let mut conn = Http2Connection::new(RecordingStream::new(), Http2Settings::default());
+        let stream = conn
+            .streams
+            .get_or_create_client_stream(stream_id)
+            .expect("create stream");
+        // リクエストを END_STREAM 付きで受信した想定（ボディ無しリクエスト）。
+        stream.recv_headers(true).expect("recv_headers");
+        conn
+    }
+
+    #[test]
+    fn send_response_coalesces_headers_and_data_into_one_write() {
+        let mut conn = conn_with_open_stream(1);
+        let body = b"hello world";
+        drive(conn.send_response(
+            1,
+            200,
+            &[(b"content-type", b"text/plain")],
+            Some(body),
+        ))
+        .expect("send_response");
+
+        // HEADERS + DATA が 1 回の write に連結されていること（システムコール削減の核心）。
+        assert_eq!(
+            conn.stream.writes.len(),
+            1,
+            "HEADERS と DATA は 1 回の書き込みに連結されるべき"
+        );
+
+        let frames = parse_frames(&conn.stream.concat());
+        assert_eq!(frames.len(), 2, "HEADERS + DATA の 2 フレーム");
+
+        // 1 フレーム目: HEADERS（END_HEADERS 有・END_STREAM 無）
+        assert_eq!(frames[0].0, FRAME_HEADERS);
+        assert_eq!(frames[0].1 & FLAG_END_HEADERS, FLAG_END_HEADERS);
+        assert_eq!(frames[0].1 & FLAG_END_STREAM, 0);
+        assert_eq!(frames[0].2, 1);
+
+        // 2 フレーム目: DATA（END_STREAM 有・ボディ一致）
+        assert_eq!(frames[1].0, FRAME_DATA);
+        assert_eq!(frames[1].1 & FLAG_END_STREAM, FLAG_END_STREAM);
+        assert_eq!(frames[1].2, 1);
+        assert_eq!(frames[1].3, body);
+    }
+
+    #[test]
+    fn send_response_empty_body_is_single_headers_frame() {
+        let mut conn = conn_with_open_stream(1);
+        drive(conn.send_response(1, 204, &[(b"x-test", b"1")], None)).expect("send_response");
+
+        assert_eq!(conn.stream.writes.len(), 1, "ヘッダのみで 1 write");
+        let frames = parse_frames(&conn.stream.concat());
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].0, FRAME_HEADERS);
+        // ボディ無しは HEADERS に END_STREAM が立つ。
+        assert_eq!(frames[0].1 & FLAG_END_STREAM, FLAG_END_STREAM);
+        assert_eq!(frames[0].1 & FLAG_END_HEADERS, FLAG_END_HEADERS);
+    }
+
+    #[test]
+    fn send_headers_buffered_then_data_coalesces_into_one_write() {
+        // ストリーミング応答経路の連結（send_headers_buffered → send_data）を検証。
+        let mut conn = conn_with_open_stream(1);
+        let body = b"streamed-body-chunk";
+        drive(async {
+            conn.send_headers_buffered(1, 200, &[(b"content-type", b"application/octet-stream")])
+                .await?;
+            conn.send_data(1, body, true).await
+        })
+        .expect("streaming send");
+
+        assert_eq!(
+            conn.stream.writes.len(),
+            1,
+            "buffered HEADERS と続く DATA は 1 write に連結されるべき"
+        );
+        let frames = parse_frames(&conn.stream.concat());
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].0, FRAME_HEADERS);
+        assert_eq!(frames[0].1 & FLAG_END_STREAM, 0);
+        assert_eq!(frames[1].0, FRAME_DATA);
+        assert_eq!(frames[1].1 & FLAG_END_STREAM, FLAG_END_STREAM);
+        assert_eq!(frames[1].3, body);
+    }
+
+    #[test]
+    fn send_data_splits_by_max_frame_size_but_still_one_write() {
+        // remote の max_frame_size を小さくし、ボディが複数 DATA フレームに分割されても
+        // ウィンドウ内なら 1 write に連結され、ボディ整合性と END_STREAM 位置が正しいこと。
+        let mut conn = conn_with_open_stream(1);
+        conn.remote_settings.max_frame_size = 4; // 4 バイトごとに分割
+        let body = b"0123456789"; // 10 バイト → 4,4,2 の 3 フレーム
+        drive(async {
+            conn.send_headers_buffered(1, 200, &[(b"content-type", b"text/plain")])
+                .await?;
+            conn.send_data(1, body, true).await
+        })
+        .expect("send");
+
+        assert_eq!(conn.stream.writes.len(), 1, "閾値未満なので 1 write に連結");
+        let frames = parse_frames(&conn.stream.concat());
+        // HEADERS + 3 DATA
+        assert_eq!(frames.len(), 4);
+        assert_eq!(frames[0].0, FRAME_HEADERS);
+
+        let data_frames: Vec<_> = frames[1..].iter().collect();
+        assert_eq!(data_frames.len(), 3);
+        // 各 DATA は max_frame_size 以下。
+        for f in &data_frames {
+            assert_eq!(f.0, FRAME_DATA);
+            assert!(f.3.len() <= 4);
+        }
+        // END_STREAM は最後の DATA にのみ立つ。
+        assert_eq!(data_frames[0].1 & FLAG_END_STREAM, 0);
+        assert_eq!(data_frames[1].1 & FLAG_END_STREAM, 0);
+        assert_eq!(data_frames[2].1 & FLAG_END_STREAM, FLAG_END_STREAM);
+        // ボディ全体を連結すると元データに一致（ゼロコピー分割の整合性）。
+        let reassembled: Vec<u8> = data_frames.iter().flat_map(|f| f.3.clone()).collect();
+        assert_eq!(reassembled, body);
+    }
+
+    #[test]
+    fn write_buf_is_returned_to_pool_and_reused() {
+        // 送信後に write_buf が空へ戻り（呼び出し境界の不変条件）、容量が再利用可能なこと。
+        let mut conn = conn_with_open_stream(1);
+        drive(conn.send_response(1, 200, &[(b"a", b"b")], Some(b"body"))).expect("send");
+        assert!(
+            conn.write_buf.is_empty(),
+            "呼び出し境界では write_buf は空であるべき"
+        );
+        assert!(
+            conn.write_buf.capacity() > 0,
+            "書き込み後にバッファ容量が再利用のため保持されるべき"
+        );
+    }
 }
