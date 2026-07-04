@@ -167,9 +167,26 @@ level = "info"
 # 大きい値: I/O効率が良いがログ遅延
 # flush_interval_ms = 1000
 
-# ログファイルパス（オプション）
-# 指定しない場合は標準エラー出力に出力
+# ----------------------------------------
+# ログ出力先（app / error を系統別に指定）
+# ----------------------------------------
+# 各ログ行には識別用 type フィールドが付与される（app / error / access）。
+#
+# アプリ本体ログ（INFO / WARN / DEBUG / TRACE）の出力先。
+#   未指定時は標準出力 (stdout)。
+# app_file_path = "/var/log/veil/veil.log"
+#
+# エラーログ（ERROR）の出力先。
+#   未指定時は標準エラー出力 (stderr)。
+# error_file_path = "/var/log/veil/veil.error.log"
+#
+# レガシー: file_path（後方互換）。
+#   app_file_path / error_file_path が未指定のとき、両系統のフォールバック元となる
+#   （＝従来どおり app・error 双方をこのファイルへ出力）。
 # file_path = "/var/log/veil/veil.log"
+#
+# 注意: ログ出力先にファイルパスを指定した場合、その親ディレクトリが
+#       [security].landlock_write_paths に自動追加される（Landlock 有効時の書き込み許可）。
 
 
 
@@ -185,7 +202,7 @@ level = "info"
 [access_log]
 # enabled = true
 # format = "json"              # "json" または "text"
-# file_path = "/var/log/veil/access.log"  # 省略時は stderr
+# file_path = "/var/log/veil/access.log"  # 省略時は標準出力 (stdout)。指定時は親ディレクトリを landlock_write_paths へ自動追加
 # # 出力フィールドを限定する（省略時は全フィールドを出力）
 # fields = [
 #   "timestamp", "method", "host", "path", "status",

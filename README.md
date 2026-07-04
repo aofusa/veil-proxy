@@ -294,6 +294,8 @@ The following table lists default values for major configuration options:
 | `[logging]` | `format` | `"text"` | Log format |
 | `[logging]` | `channel_size` | `100000` | Log channel buffer size |
 | `[logging]` | `flush_interval_ms` | `1000` | Flush interval (ms) |
+| `[logging]` | `app_file_path` | none (stdout) | App log (INFO/WARN/DEBUG) output path |
+| `[logging]` | `error_file_path` | none (stderr) | Error log (ERROR) output path |
 | `[prometheus]` | `enabled` | `false` | Enable Prometheus metrics |
 | `[prometheus]` | `path` | `"/__metrics"` | Metrics endpoint path |
 | `[performance]` | `reuseport_balancing` | `"cbpf"` | SO_REUSEPORT balancing |
@@ -2973,14 +2975,28 @@ Provides high-performance async logging using ftlog. ftlog internally uses a bac
 | `channel_size` | Internal channel buffer size | 100000 |
 | `flush_interval_ms` | Disk flush interval (milliseconds) | 1000 |
 | `max_log_size` | Maximum log file size (bytes, 0=unlimited) | 104857600 |
-| `file_path` | Log file path (defaults to stderr if unspecified) | none |
+| `app_file_path` | App log (INFO/WARN/DEBUG/TRACE) output path | none (**stdout**) |
+| `error_file_path` | Error log (ERROR) output path | none (**stderr**) |
+| `file_path` | Legacy: fallback for `app_file_path` / `error_file_path` when unset (writes both streams to this file) | none |
+
+### Log Output Destinations (by stream)
+
+Application logs and error logs are routed to **separate destinations by level**, and each log line carries a `type` field (`app` / `error` / `access`) so mixed streams remain distinguishable:
+
+| Stream | Levels | Config key | Default | `type` |
+|--------|--------|-----------|---------|--------|
+| App log | INFO / WARN / DEBUG / TRACE | `app_file_path` | **stdout** | `app` |
+| Error log | ERROR | `error_file_path` | **stderr** | `error` |
+| Access log | (per-request) | `[access_log].file_path` | **stdout** | `access` |
+
+When a file path is set for any stream, its **parent directory** is automatically added to `[security].landlock_write_paths` so logging is not denied when Landlock is enabled (daily-rotated files live under the same directory).
 
 ### Log Output Formats
 
 #### Text Format (Default)
 
 ```
-2024-01-01 00:00:00.000+00 0ms INFO main [main.rs:123] Server started
+2024-01-01 00:00:00.000+00 0ms INFO type=app main [main.rs:123] Server started
 ```
 
 #### JSON Format
@@ -2988,7 +3004,7 @@ Provides high-performance async logging using ftlog. ftlog internally uses a bac
 Suitable for integration with structured log collection systems (Elasticsearch, Loki, etc.).
 
 ```json
-{"timestamp":"2024-01-01T00:00:00.000Z","level":"INFO","target":"veil","file":"main.rs","line":123,"message":"Server started"}
+{"timestamp":"2024-01-01T00:00:00.000Z","level":"INFO","type":"app","target":"veil","file":"main.rs","line":123,"message":"Server started"}
 ```
 
 ### Configuration Example
@@ -2999,7 +3015,10 @@ level = "info"
 format = "text"  # or "json"
 channel_size = 100000
 flush_interval_ms = 1000
-file_path = "/var/log/veil.log"
+# App log -> stdout by default; Error log -> stderr by default.
+app_file_path = "/var/log/veil/veil.log"          # optional
+error_file_path = "/var/log/veil/veil.error.log"  # optional
+# file_path = "/var/log/veil.log"  # legacy: both streams to one file
 ```
 
 ### JSON Format Configuration Example
@@ -3021,7 +3040,7 @@ Write per-request access logs in JSON or text format, independent of the applica
 [access_log]
 enabled = true
 format = "json"                         # "json" or "text"
-file_path = "/var/log/veil/access.log"  # omit for stderr
+file_path = "/var/log/veil/access.log"  # omit for stdout; parent dir auto-added to landlock_write_paths
 # Limit output fields (omit for all fields)
 fields = ["timestamp", "method", "host", "path", "status", "duration_ms", "client_ip", "upstream"]
 channel_size = 10000      # async channel capacity to the writer thread (default: 10000)
@@ -3049,7 +3068,7 @@ Access logs are written asynchronously by a dedicated writer thread. The hot pat
 ### Example JSON Output
 
 ```json
-{"timestamp":"2026-01-01T00:00:00Z","method":"GET","host":"example.com","path":"/api/data","status":200,"duration_ms":12,"client_ip":"10.0.0.1","upstream":"192.168.1.10:8080","req_body_size":0,"resp_body_size":1024,"user_agent":"curl/8.0"}
+{"type":"access","timestamp":"2026-01-01T00:00:00Z","method":"GET","host":"example.com","path":"/api/data","status":200,"duration_ms":12,"client_ip":"10.0.0.1","upstream":"192.168.1.10:8080","req_body_size":0,"resp_body_size":1024,"user_agent":"curl/8.0"}
 ```
 
 ## Cache Purge Administration API
