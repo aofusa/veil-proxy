@@ -108,15 +108,22 @@ FUZZ_RUNS=2000 FUZZ_MAX_TIME=120 ./tools/container_security/fuzz/run_libfuzzer.s
 | 0c 実行時セキュリティ | `validate_veil_image_security` | ReadonlyRootfs、seccomp、特権降下ログ |
 | 1 HTTP ファジング | `harness/scripts/fuzz_http.py` | 不正ヘッダー・不完全リクエストのブラックボックス送信 |
 | 1b libFuzzer | `fuzz/run_libfuzzer.sh` | HPACK / TOML / HTTP/2 フレーム / HTTP/1 ヘッダー境界（オプション） |
+| 1c libFuzzer(ASAN) | `fuzz/run_libfuzzer_asan.sh` | 上記を AddressSanitizer + 永続 corpus で実行（F-71、既定 SKIP） |
 | 2 h2spec | `harness/scripts/h2spec_run.sh` | HTTP/2 プロトコル準拠（TLS + H2C） |
 | 3 カオス負荷 | `harness/scripts/chaos_load.sh` | 高並行 HTTP/HTTPS、接続チャーン、SIGHUP リロード |
 | 3b Toxiproxy | `toxiproxy_chaos.sh` | 遅延注入・回復、`limit_data` による接続リセット |
 | 3c サーキットブレーカー | `circuit_breaker_chaos.sh` | upstream 障害 → CB 発火 → 回復（Prometheus + 5xx カウント） |
 | 3d slowloris | `slowloris_chaos.sh` | 部分リクエストによる backpressure、事後ヘルス |
+| 3e bad_backend | `chaos/bad_backend_chaos.sh` | バックエンドのプロトコル違反（F-67、既定 SKIP。B-16/B-17 検出実績） |
+| 3f Pumba netem | `chaos/pumba_chaos.sh` | パケットロス/遅延/重複/破損の注入と回復（F-69、既定 SKIP） |
+| 3g リソース枯渇 | `chaos/resource_exhaustion_chaos.sh` | cgroup 制約下の高並行負荷で panic/OOM 回避（F-68、既定 SKIP） |
 | 4 セキュリティ | `security_scan.sh` | TLS ハンドシェイク、メソッド制限、TRACE、パストラバーサル |
 | 4a testssl | `security/run_testssl.sh` | `drwetter/testssl.sh` コンテナで TLS 設定スキャン |
 | 4b cargo-audit | `security/run_cargo_audit.sh` | Rust 依存関係の脆弱性 |
 | 4c cargo-deny | `security/run_cargo_deny.sh` | advisory + ライセンス（`deny.toml`） |
+| 4d semgrep(SAST) | `security/run_semgrep.sh` | 自作コードの静的解析（`p/rust`+`p/security-audit`、F-64） |
+| 4e SBOM | `security/run_sbom.sh` | syft で source(CycloneDX)+image(SPDX) 生成（F-65） |
+| 4f ZAP(DAST) | `security/run_zap.sh` | OWASP ZAP baseline（F-66、既定 SKIP） |
 | 5 Trivy | `run_trivy_scan` | イメージ脆弱性（HIGH/CRITICAL） |
 | 6 レポート集約 | `lib/report.sh` | `suite_summary.json` / `suite_summary_junit.xml` |
 | 最終 | `health_check.sh` | 全フェーズ後の応答確認（最大 10 回リトライ） |
@@ -133,6 +140,7 @@ FUZZ_RUNS=2000 FUZZ_MAX_TIME=120 ./tools/container_security/fuzz/run_libfuzzer.s
 | `config_toml` | 設定 TOML パーサ（`test_config_file`） |
 | `http2_frame_decode` | HTTP/2 フレームデコーダ |
 | `http_header_validate` | HTTP/1 ヘッダー名・値の境界検証（`fuzz_api`） |
+| `wasm_abi` | WASM モジュール/ABI 境界（`fuzz_api::wasm_module_smoke`、F-70。`--features wasm` で有効化） |
 
 環境変数:
 
@@ -168,6 +176,13 @@ CARGO_TARGET_DIR=/tmp/veil-build-target cargo build -p veil-fuzz
 | `SKIP_TESTSSL` | `0` | testssl.sh |
 | `SKIP_CARGO_AUDIT` | `1` | cargo-audit |
 | `SKIP_CARGO_DENY` | `1` | cargo-deny |
+| `SKIP_SEMGREP` | `0` | semgrep（SAST、F-64） |
+| `SKIP_SBOM` | `0` | SBOM 生成（syft、F-65） |
+| `SKIP_ZAP` | `1` | OWASP ZAP baseline（DAST、F-66） |
+| `SKIP_BAD_BACKEND` | `1` | バックエンドプロトコル違反カオス（F-67） |
+| `SKIP_PUMBA` | `1` | Pumba netem カオス（F-69） |
+| `SKIP_RESOURCE_EXHAUSTION` | `1` | リソース枯渇カオス（F-68） |
+| `SKIP_LIBFUZZER_ASAN` | `1` | libFuzzer + ASAN（F-71） |
 | `SKIP_CHAOS_LOAD` | `0` | 高並行負荷 + SIGHUP（`KERNEL_REQUIRE_IO_URING=1` 時は自動） |
 
 ### h2spec

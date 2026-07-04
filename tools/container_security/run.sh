@@ -14,6 +14,15 @@ SKIP_LIBFUZZER="${SKIP_LIBFUZZER:-1}"
 SKIP_CARGO_AUDIT="${SKIP_CARGO_AUDIT:-1}"
 SKIP_CARGO_DENY="${SKIP_CARGO_DENY:-1}"
 SKIP_TESTSSL="${SKIP_TESTSSL:-0}"
+# 拡充フェーズ（F-64〜F-71）。重いもの・専用トポロジが要るものは既定 SKIP。
+SKIP_SEMGREP="${SKIP_SEMGREP:-0}"
+SKIP_SBOM="${SKIP_SBOM:-0}"
+SKIP_ZAP="${SKIP_ZAP:-1}"
+SKIP_BAD_BACKEND="${SKIP_BAD_BACKEND:-1}"
+SKIP_RESOURCE_EXHAUSTION="${SKIP_RESOURCE_EXHAUSTION:-1}"
+SKIP_PUMBA="${SKIP_PUMBA:-1}"
+SKIP_LIBFUZZER_ASAN="${SKIP_LIBFUZZER_ASAN:-1}"
+export SKIP_SEMGREP SKIP_SBOM SKIP_ZAP SKIP_BAD_BACKEND SKIP_RESOURCE_EXHAUSTION SKIP_PUMBA SKIP_LIBFUZZER_ASAN
 H2SPEC_FULL="${H2SPEC_FULL:-0}"
 H2SPEC_STRICT="${H2SPEC_STRICT:-0}"
 
@@ -146,6 +155,9 @@ main() {
         log "libFuzzer をスキップ (SKIP_LIBFUZZER=1)"
     fi
 
+    # フェーズ 1c: libFuzzer + ASAN（F-71、既定 SKIP。永続 corpus）
+    "${SCRIPT_DIR}/fuzz/run_libfuzzer_asan.sh" || log "libFuzzer(ASAN) で警告（レポート参照）"
+
     # フェーズ 2: h2spec
     if [[ "${SKIP_H2SPEC}" != "1" ]]; then
         run_harness h2spec h2spec
@@ -172,6 +184,12 @@ main() {
         run_harness slowloris slowloris || log "slowloris カオスで警告（レポート参照）"
     fi
 
+    # フェーズ 3c: 拡充カオス（F-67 プロトコル違反 / F-68 リソース枯渇 / F-69 Pumba netem）
+    # いずれも既定 SKIP。標準以外のトポロジ・特権が要るため個別トグルで明示有効化する。
+    "${SCRIPT_DIR}/chaos/bad_backend_chaos.sh" || log "bad_backend カオスで警告（レポート参照）"
+    "${SCRIPT_DIR}/chaos/pumba_chaos.sh" || log "pumba カオスで警告（レポート参照）"
+    "${SCRIPT_DIR}/chaos/resource_exhaustion_chaos.sh" || log "resource_exhaustion カオスで警告（レポート参照）"
+
     # フェーズ 4: アプリセキュリティ（TLS・メソッド制限）
     export SKIP_TESTSSL=1
     run_harness security security
@@ -193,6 +211,15 @@ main() {
     else
         log "cargo-deny をスキップ (SKIP_CARGO_DENY=1)"
     fi
+
+    # フェーズ 4d: SAST（semgrep、F-64）
+    "${SCRIPT_DIR}/security/run_semgrep.sh" || log "semgrep で警告（レポート参照）"
+
+    # フェーズ 4e: SBOM 生成（syft、F-65）
+    "${SCRIPT_DIR}/security/run_sbom.sh" || log "SBOM 生成で警告（レポート参照）"
+
+    # フェーズ 4f: DAST（OWASP ZAP baseline、F-66、既定 SKIP）
+    "${SCRIPT_DIR}/security/run_zap.sh" || log "ZAP で警告（レポート参照）"
 
     # フェーズ 5: Trivy イメージスキャン
     run_trivy_scan
