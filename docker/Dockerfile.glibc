@@ -71,7 +71,11 @@ COPY . /app
 
 # テストとビルド（ビルド環境でユニットテストを実行して動作を確認してからリリースビルド。
 # 環境依存テスト（例: 同梱 config.toml 読込）はテスト側で存在チェックしスキップ済み）
-RUN touch src/main.rs \
+#
+# cacher 段はスタブの src/main.rs / src/lib.rs で release プロファイルの成果物をキャッシュする。
+# 実ソースへ差し替えた後は全 .rs の mtime を更新して cargo に再コンパイルを強制する
+# （main.rs だけ touch すると lib のスタブ成果物が最新と誤判定され veil::run 未定義になる）。
+RUN find src -name '*.rs' -exec touch {} + \
     && cargo test --lib --target "${RUST_TARGET}" --features "${CARGO_FEATURES}" --locked \
     && cargo zigbuild --release --target "${RUST_TARGET}${LIBC_VERSION}" --features "${CARGO_FEATURES}" --locked
 
