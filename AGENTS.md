@@ -7,7 +7,7 @@ AI エージェントおよびコントリビュータ向けの **最小指針**
 ## プロジェクトの事実
 
 - クレート名 `veil`（ディレクトリ名 `veil-proxy`）。リリースバイナリは `target/release/veil`。
-- **バイナリクレート**（`src/lib.rs` なし）。エントリと mod は主に [src/main.rs](src/main.rs)。
+- **ライブラリ + バイナリ構成**。mod 宣言・公開 API は [src/lib.rs](src/lib.rs)（`cargo fuzz`・統合テスト向けに公開）、サーバ起動配線は [src/entry.rs](src/entry.rs)（`veil::run()`）、[src/main.rs](src/main.rs) は `veil::run()` を呼ぶだけの薄いエントリ。
 - 設定は TOML（`serde`）。ホットリロード・検証の挙動は README を参照。
 
 ---
@@ -48,7 +48,7 @@ AI エージェントおよびコントリビュータ向けの **最小指針**
 1. 上記 **設計哲学・設計制約** に整合するか確認する。
 2. 変更前に、触るコードの `cfg(feature)`、エラーハンドリング、ftlog、serde設定型を読む。
 3. 外部契約（設定キー、CLI、メトリクス名、プロトコル範囲）を変えたら **同じ PR で README（必要なら .ja）を更新**する。`specs/` 等を使う場合も矛盾を残さない。
-4. 大きなロジックは **専用モジュール**へ。`main.rs` は配線中心に保つ。
+4. 大きなロジックは **専用モジュール**へ。`entry.rs` は配線中心に保つ（`main.rs` は `veil::run()` のみ）。
 5. 挙動変更には **単体 / 統合 / E2E** のいずれかを追加または更新し、**`cargo test` で実証**する。
 
 ### AI 成果物・ログ・一時ファイル
@@ -95,7 +95,7 @@ AI エージェントおよびコントリビュータ向けの **最小指針**
 詳細・feature 組み合わせ・E2E・ベンチは **README の Build / Testing 節**を参照。
 
 ### 注意事項
-- **コンパイル時の依存関係**: `main.rs` は `http2` や `grpc`（もしくは `grpc-full`）feature が有効でないと、`send_grpc_trailers` の呼び出し箇所等でコンパイルエラーが発生します。そのため、ビルドやテストの際は必ず十分な feature（例：`--features "http2,grpc-full"` またはフルフィーチャー）を指定して実行してください。
+- **コンパイル時の依存関係**: `entry.rs`/各モジュールは `http2` や `grpc`（もしくは `grpc-full`）feature が有効でないと、`send_grpc_trailers` の呼び出し箇所等でコンパイルエラーが発生します。そのため、ビルドやテストの際は必ず十分な feature（例：`--features "http2,grpc-full"` またはフルフィーチャー）を指定して実行してください。
 - **E2Eテスト**: E2Eテストは専用のバックエンド環境を起動する必要があります。手動で直接 `cargo test` を叩くとバックエンドへの接続ができずタイムアウトするため、必ず `./tests/e2e_setup.sh test` を使用して自動セットアップ・実行・クリーンアップを行ってください。また、ポート競合エラーが発生した場合は、`pkill -f veil` 等で残存プロセスを終了させてから再実行してください。
 
 ### 実行コマンド例
@@ -117,10 +117,12 @@ cargo test --bins --test integration_tests --features "full"
 
 | パス | 役割 |
 |------|------|
-| `src/main.rs` | エントリ・mod 宣言・コア HTTP/1 など（下位モジュールは同 `src/` 配下） |
+| `src/main.rs` | 薄いバイナリエントリ（`veil::run()` を呼ぶだけ） |
+| `src/lib.rs` | クレートルート・mod 宣言・公開 API（`cargo fuzz`・統合テスト向け） |
+| `src/entry.rs` | サーバ起動配線（`run()`：ワーカースレッド・accept ループなど） |
 | `src/runtime/` | 独自 io_uring ランタイム（ring.rs/executor.rs/tcp.rs/timer.rs/buf.rs/io.rs/splice.rs/offload.rs） |
 | `tests/`、`benches/` | 統合・E2E・ベンチ |
 | `docs/artifacts/` | AI 成果物・一時ファイル |
 | `docs/backlog/` | 機能・バグチケット（親は `backlog.md`） |
 
-細かいモジュール対応は `src/main.rs` の `mod` と README の構成を参照。
+細かいモジュール対応は `src/lib.rs` の `mod` と README の構成を参照。
