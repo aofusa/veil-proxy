@@ -85,3 +85,7 @@ pub mod proxy;
 
 mod entry;
 pub use entry::run;
+
+// bin(旧 main.rs）から移設したクレート内部テスト群（lib+bin 構成対応）
+#[cfg(test)]
+mod legacy_bin_tests;

@@ -1601,6 +1601,8 @@ mod chunked_span_tests {
         assert!(limit);
     }
 
+    // decode_chunked_body は http2 feature でのみ提供されるため、比較テストも同 feature で gate する
+    #[cfg(feature = "http2")]
     #[test]
     fn test_span_matches_decode_chunked_body() {
         // ゼロコピー span 経路が既存の decode_chunked_body と同一出力になることを保証。
