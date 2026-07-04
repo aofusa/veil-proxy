@@ -230,18 +230,47 @@ pub fn get_file_cache() -> Option<std::sync::Arc<()>> {
     None
 }
 
-/// ファイル情報取得（スタブ、F-29 で async 化に追従）
+/// ファイル情報取得（`cache` feature 無効時）
+///
+/// キャッシュは持たないが、静的ファイル配信（SendFile）はどの feature 構成でも成立させる
+/// 必要があるため、ここで **キャッシュせず** に実ファイルの解決（canonicalize + metadata +
+/// MIME 推測）を行う。以前はスタブが `None` を返しており、`cache` を含まない構成
+/// （例: default features）では全ての静的ファイルが 404 になっていた（回帰バグ）。
+///
+/// `canonicalize` / `metadata` は同期 syscall で io_uring 非対応のため、`runtime::offload`
+/// の専用ワーカースレッドへ退避し、イベントループをブロックしない（`cache` 有効時の
+/// `fetch_file_info` と同じ設計）。
 #[cfg(not(feature = "cache"))]
-pub async fn get_file_info_with_config(
-    _path: &std::path::Path,
-    _config: Option<&OpenFileCacheConfig>,
-) -> Option<CachedFileInfo> {
-    None
+async fn fetch_file_info_uncached(path: &std::path::Path) -> Option<CachedFileInfo> {
+    let path = path.to_path_buf();
+    crate::runtime::offload::offload(move || {
+        let canonical = path.canonicalize().ok()?;
+        let metadata = std::fs::metadata(&canonical).ok()?;
+        let mime_type = mime_guess::from_path(&canonical)
+            .first_or_octet_stream()
+            .to_string();
+        Some(CachedFileInfo {
+            canonical_path: canonical,
+            file_size: metadata.len(),
+            mime_type,
+            last_modified: metadata.modified().ok(),
+            is_file: metadata.is_file(),
+        })
+    })
+    .await
 }
 
 #[cfg(not(feature = "cache"))]
-pub async fn get_file_info(_path: &std::path::Path) -> Option<CachedFileInfo> {
-    None
+pub async fn get_file_info_with_config(
+    path: &std::path::Path,
+    _config: Option<&OpenFileCacheConfig>,
+) -> Option<CachedFileInfo> {
+    fetch_file_info_uncached(path).await
+}
+
+#[cfg(not(feature = "cache"))]
+pub async fn get_file_info(path: &std::path::Path) -> Option<CachedFileInfo> {
+    fetch_file_info_uncached(path).await
 }
 
 #[cfg(not(feature = "cache"))]
