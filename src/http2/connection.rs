@@ -1333,8 +1333,15 @@ where
             lowercase_names.push(name.to_ascii_lowercase());
         }
 
-        self.send_headers_internal(stream_id, status, headers, &lowercase_names, end_stream, true)
-            .await
+        self.send_headers_internal(
+            stream_id,
+            status,
+            headers,
+            &lowercase_names,
+            end_stream,
+            true,
+        )
+        .await
     }
 
     /// ヘッダーを連結バッファへ積むだけで即送出しない（ストリーミング応答の HEADERS +
@@ -2122,10 +2129,7 @@ mod tests {
     }
 
     impl AsyncReadRent for RecordingStream {
-        async fn read<T: crate::runtime::buf::IoBufMut>(
-            &mut self,
-            buf: T,
-        ) -> BufResult<usize, T> {
+        async fn read<T: crate::runtime::buf::IoBufMut>(&mut self, buf: T) -> BufResult<usize, T> {
             // 送信専用テストでは読み取りは EOF 扱い（ウィンドウ枯渇待ちに入らせない）。
             (Ok(0), buf)
         }
@@ -2169,11 +2173,17 @@ mod tests {
         let mut out = Vec::new();
         let mut i = 0;
         while i + 9 <= bytes.len() {
-            let len =
-                ((bytes[i] as usize) << 16) | ((bytes[i + 1] as usize) << 8) | bytes[i + 2] as usize;
+            let len = ((bytes[i] as usize) << 16)
+                | ((bytes[i + 1] as usize) << 8)
+                | bytes[i + 2] as usize;
             let ftype = bytes[i + 3];
             let flags = bytes[i + 4];
-            let sid = u32::from_be_bytes([bytes[i + 5] & 0x7f, bytes[i + 6], bytes[i + 7], bytes[i + 8]]);
+            let sid = u32::from_be_bytes([
+                bytes[i + 5] & 0x7f,
+                bytes[i + 6],
+                bytes[i + 7],
+                bytes[i + 8],
+            ]);
             assert!(i + 9 + len <= bytes.len(), "truncated frame payload");
             let payload = bytes[i + 9..i + 9 + len].to_vec();
             out.push((ftype, flags, sid, payload));
@@ -2204,13 +2214,8 @@ mod tests {
     fn send_response_coalesces_headers_and_data_into_one_write() {
         let mut conn = conn_with_open_stream(1);
         let body = b"hello world";
-        drive(conn.send_response(
-            1,
-            200,
-            &[(b"content-type", b"text/plain")],
-            Some(body),
-        ))
-        .expect("send_response");
+        drive(conn.send_response(1, 200, &[(b"content-type", b"text/plain")], Some(body)))
+            .expect("send_response");
 
         // HEADERS + DATA が 1 回の write に連結されていること（システムコール削減の核心）。
         assert_eq!(

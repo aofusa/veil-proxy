@@ -1689,7 +1689,11 @@ async fn test_http2_multiplexed_coalesced_responses() {
         .await
         .expect("HTTP/2 multiplexed concurrent requests failed");
 
-    assert_eq!(results.len(), uploads.len(), "レスポンス数が要求数と一致すべき");
+    assert_eq!(
+        results.len(),
+        uploads.len(),
+        "レスポンス数が要求数と一致すべき"
+    );
     for (i, ((status, body), expected)) in results.iter().zip(uploads.iter()).enumerate() {
         assert_eq!(*status, 200, "stream {} は 200 OK を返すべき", i);
         assert_eq!(

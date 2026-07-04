@@ -1999,7 +1999,8 @@ where
 
     if content_length == 0 {
         // ボディ無し: HEADERS を END_STREAM 付きで即送出。
-        conn.send_headers(stream_id, status, h2_headers, true).await?;
+        conn.send_headers(stream_id, status, h2_headers, true)
+            .await?;
         return Ok(0);
     }
 
