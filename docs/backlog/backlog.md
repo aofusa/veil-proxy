@@ -93,6 +93,11 @@
 | F-49 | P1 | 完了 | [features/F-49-reload-e2e-verification.md](features/F-49-reload-e2e-verification.md) | 設定ファイル・TLS 証明書リロードの正常性確認 E2E テスト（SIGHUP 実送出でルート反映・不正設定フェイルセーフ・証明書差し替え/ゼロダウンタイムを検証） |
 | F-50 | P1 | 完了 | [features/F-50-tls-cipher-suites-config.md](features/F-50-tls-cipher-suites-config.md) | [tls] cipher_suites 設定（nginx 風の取捨選択・優先度指定。リロード経路にも伝搬、E2E でネゴシエーション検証） |
 | F-51 | P1 | 完了 | [features/F-51-config-toml-sync.md](features/F-51-config-toml-sync.md) | config.toml を src/config.rs と完全同期（route.security/WASM capabilities 等 19 キー追記、stale な [grpc] セクションと dead な RetryPolicy を削除、同期保証テスト追加） |
+| F-58 | P1 | 進行中 | [features/F-58-perf-report-glibc-musl-nginx.md](features/F-58-perf-report-glibc-musl-nginx.md) | パフォーマンス測定レポート（glibc/musl/nginx 比較・B-13/B-14/B-15 修正後の再測定） |
+| F-59 | P2 | 未着手 | [features/F-59-writev-scatter-gather-cache.md](features/F-59-writev-scatter-gather-cache.md) | メモリキャッシュヒットの `writev` scatter-gather 1-syscall 送出（F-31 残件） |
+| F-60 | P3 | 未着手 | [features/F-60-http3-gro-batch-autosize.md](features/F-60-http3-gro-batch-autosize.md) | HTTP/3 GRO 一括 recv・GSO/GRO セグメントサイズ自動調整（F-33 残件） |
+| F-61 | P3 | 未着手 | [features/F-61-wasm-body-filter-alloc-reduction.md](features/F-61-wasm-body-filter-alloc-reduction.md) | WASM ボディフィルタ経路のアロケーション削減（F-43 残件） |
+| F-62 | P3 | 未着手 | [features/F-62-proxy-wasm-http-call-benchmark.md](features/F-62-proxy-wasm-http-call-benchmark.md) | Proxy-Wasm「HTTP コールあり」フィルタのベンチマーク（F-48 残件、Pause/resume 配線が前提） |
 | F-11 | P3 | 未着手 | [features/dashboard.md](features/dashboard.md) | ダッシュボード機能 |
 | F-12 | P3 | 未着手 | [features/config-generator-webui.md](features/config-generator-webui.md) | config.toml ジェネレータ Web UI |
 | F-13 | P3 | 未着手 | [features/documentation-site.md](features/documentation-site.md) | 公式ドキュメントサイト |
@@ -126,6 +131,9 @@
 | B-10 | P2 | 完了 | [bugs/B-10-e2e-parallel-shared-state-flaky.md](bugs/B-10-e2e-parallel-shared-state-flaky.md) | E2E 並列実行でロードバランシング系テストが共有 Round Robin ステートと干渉しフレーキー化（専用プール `/rr-test/` へ隔離。cache/revalidation の単体テスト直列化も実施） |
 | B-11 | P3 | 完了 | [bugs/B-11-expect-100-continue-intermittent-hang.md](bugs/B-11-expect-100-continue-intermittent-hang.md) | Expect: 100-continue の POST が間欠的にハング。根本原因は Expect のバックエンド転送 × 応答パーサの 1xx 中間応答未対応 → Expect をプロキシで終端 + 1xx 読み捨て（drain_interim_responses）で修正（20 回連続成功・curl 実フロー 60/60） |
 | B-12 | P3 | 完了 | [bugs/B-12-http3-request-body-streaming-stall.md](bugs/B-12-http3-request-body-streaming-stall.md) | HTTP/3 リクエストボディストリーミングが間欠的にストール。根本原因は h3 クライアントの fin 直前 GREASE フレーム × 「h3.poll をパケット受信時のみ実行」の組み合わせで Finished イベントが永久滞留する設計バグ → poll を毎イテレーション実行 + pump に stream_finished 直接確認で修正（20 回連続成功） |
+| B-13 | P1 | 完了 | [bugs/B-13-seccomp-faccessat2-static-404.md](bugs/B-13-seccomp-faccessat2-static-404.md) | seccomp 許可リストに `faccessat2`(439) が無く、seccomp 有効時に静的ファイル配信が 404（HTTP/1.1 全滅・musl 版配信不能の一因）。`ALLOWED_SYSCALLS` と docker seccomp.json に faccessat/faccessat2 を追加 |
+| B-14 | P1 | 完了 | [bugs/B-14-nocache-static-file-404.md](bugs/B-14-nocache-static-file-404.md) | `cache` feature 無効（default features 等）で静的ファイル配信が 404。`get_file_info` スタブが `None` を返していた → キャッシュせず実解決する実装へ修正 |
+| B-15 | P1 | 完了 | [bugs/B-15-dockerfile-fuzz-workspace-build.md](bugs/B-15-dockerfile-fuzz-workspace-build.md) | Dockerfile(glibc/musl) の cacher が fuzz ワークスペースメンバ未対応でビルド失敗（exit 101）→ cacher で fuzz マニフェスト+スタブを用意 |
 
 ---
 
