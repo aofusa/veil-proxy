@@ -37,6 +37,9 @@ COPY fuzz/Cargo.toml /app/fuzz/Cargo.toml
 # fuzz メンバはワークスペース解決のためにスタブのターゲットだけ用意し、本体はビルドしない
 RUN mkdir src benches \
     && echo "fn main() {}" > src/main.rs \
+    # 本クレートは lib + bin 構成（src/lib.rs）。--bins ビルドでも lib ターゲットが
+    # コンパイルされるため、依存キャッシュ段では空の lib スタブが必要。
+    && echo "" > src/lib.rs \
     # Cargo.toml から name = "xxx"（ベンチマーク名）を抽出して、自動的にダミーファイルを一括作成
     && awk -F'"' '/^\[\[bench\]\]/{p=1} p && /name =/{print $2; p=0}' Cargo.toml \
        | xargs -I {} touch benches/{}.rs \
