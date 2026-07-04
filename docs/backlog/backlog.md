@@ -109,6 +109,7 @@
 | F-71 | P2 | 進行中 | [features/F-71-asan-corpus-fuzzing.md](features/F-71-asan-corpus-fuzzing.md) | ASAN ファジングパイプライン + Corpus 永続化。`run_libfuzzer_asan.sh` + `corpus/` 追加・配線。TSAN/MSAN・外部永続化が残件。F-52 子 |
 | F-72 | P3 | 未着手 | [features/F-72-security-testing-further-hardening.md](features/F-72-security-testing-further-hardening.md) | セキュリティテスト追加提案（レポート範囲外）: gitleaks・スマグリング専用・差分テスト・OSS-Fuzz・カバレッジ常設・回帰コーパス |
 | F-73 | P1 | 完了 | [features/F-73-http2-send-zerocopy-writeall.md](features/F-73-http2-send-zerocopy-writeall.md) | HTTP/2 送信ホットパスの write_all ゼロコピー化（per-frame の 2 度目の to_vec 確保+コピーを排除）。A/B で **HTTP/2 +11.6%**（1577→1761 req/s、nginx 比 75%→84%）、HTTP/1.1 不変・応答ボディ sha256 一致。レポート `docs/artifacts/performance_report_veil_vs_nginx_v3.md` |
+| F-74 | P1 | 完了 | [features/F-74-http2-send-frame-coalescing.md](features/F-74-http2-send-frame-coalescing.md) | HTTP/2 送信ホットパスのフレーム連結（HEADERS/DATA コアレッシング）。1 レスポンス分のフレームを接続再利用連結バッファ `write_buf`（スレッドローカルプール）へ積み **1 回の書き込み** で送出。`encode_*_into` 追記 API・`send_headers_buffered`・128KB 途中フラッシュ閾値を追加。per-frame 送信システムコールを削減。単体 660 / http2 E2E 11 / gRPC E2E 35 グリーン。F-73 続き |
 | F-11 | P3 | 未着手 | [features/dashboard.md](features/dashboard.md) | ダッシュボード機能 |
 | F-12 | P3 | 未着手 | [features/config-generator-webui.md](features/config-generator-webui.md) | config.toml ジェネレータ Web UI |
 | F-13 | P3 | 未着手 | [features/documentation-site.md](features/documentation-site.md) | 公式ドキュメントサイト |
