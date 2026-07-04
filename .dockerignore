@@ -6,3 +6,8 @@
 !Cargo.lock
 !src/
 !docker/assets
+# fuzz ワークスペースメンバ（[workspace] members = [".", "fuzz"]）の解決に必要。
+# 本体はコンテナではビルドしないが、マニフェストとターゲットが無いと cargo が
+# ワークスペース解決に失敗する。
+!fuzz/Cargo.toml
+!fuzz/fuzz_targets
