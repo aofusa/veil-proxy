@@ -98,6 +98,7 @@
 | F-60 | P3 | 未着手 | [features/F-60-http3-gro-batch-autosize.md](features/F-60-http3-gro-batch-autosize.md) | HTTP/3 GRO 一括 recv・GSO/GRO セグメントサイズ自動調整（F-33 残件） |
 | F-61 | P3 | 未着手 | [features/F-61-wasm-body-filter-alloc-reduction.md](features/F-61-wasm-body-filter-alloc-reduction.md) | WASM ボディフィルタ経路のアロケーション削減（F-43 残件） |
 | F-62 | P3 | 未着手 | [features/F-62-proxy-wasm-http-call-benchmark.md](features/F-62-proxy-wasm-http-call-benchmark.md) | Proxy-Wasm「HTTP コールあり」フィルタのベンチマーク（F-48 残件、Pause/resume 配線が前提） |
+| F-63 | P1 | 完了 | [features/F-63-log-output-routing.md](features/F-63-log-output-routing.md) | ログ出力先の分離ルーティング（app=stdout / error=stderr / access=stdout をレベル別に振り分け、`type` 識別フィールド付与、JSON 順は timestamp→level→type、ログファイル親ディレクトリを landlock_write_paths へ自動追加） |
 | F-11 | P3 | 未着手 | [features/dashboard.md](features/dashboard.md) | ダッシュボード機能 |
 | F-12 | P3 | 未着手 | [features/config-generator-webui.md](features/config-generator-webui.md) | config.toml ジェネレータ Web UI |
 | F-13 | P3 | 未着手 | [features/documentation-site.md](features/documentation-site.md) | 公式ドキュメントサイト |
