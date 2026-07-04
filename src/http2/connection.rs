@@ -2122,26 +2122,26 @@ mod tests {
     }
 
     impl AsyncReadRent for RecordingStream {
-        fn read<T: crate::runtime::buf::IoBufMut>(
+        async fn read<T: crate::runtime::buf::IoBufMut>(
             &mut self,
             buf: T,
-        ) -> impl Future<Output = BufResult<usize, T>> {
+        ) -> BufResult<usize, T> {
             // 送信専用テストでは読み取りは EOF 扱い（ウィンドウ枯渇待ちに入らせない）。
-            async move { (Ok(0), buf) }
+            (Ok(0), buf)
         }
     }
 
     impl AsyncWriteRent for RecordingStream {
-        fn write<T: IoBuf>(&mut self, buf: T) -> impl Future<Output = BufResult<usize, T>> {
+        async fn write<T: IoBuf>(&mut self, buf: T) -> BufResult<usize, T> {
             let len = buf.bytes_init();
             // SAFETY: read_ptr()..len は IoBuf の初期化済み領域。write 完了までバッファは生存。
             let slice = unsafe { std::slice::from_raw_parts(buf.read_ptr(), len) };
             self.writes.push(slice.to_vec());
-            async move { (Ok(len), buf) }
+            (Ok(len), buf)
         }
 
-        fn shutdown(&mut self) -> impl Future<Output = io::Result<()>> {
-            async move { Ok(()) }
+        async fn shutdown(&mut self) -> io::Result<()> {
+            Ok(())
         }
     }
 

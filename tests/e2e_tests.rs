@@ -1647,6 +1647,65 @@ async fn test_http2_request_body_streaming_small() {
     assert_eq!(body, upload, "Echoed small body mismatch");
 }
 
+/// 送信ホットパスのフレーム連結（HEADERS+DATA を 1 回の書き込みにまとめる最適化・F-73 続き）が
+/// **多重化下でもフレーム境界・ストリーム対応・ボディ整合性を壊さない**ことの E2E 検証。
+///
+/// 同一 HTTP/2 接続上で内容の異なる小レスポンスを複数ストリーム並行で要求する。プロキシは
+/// 各ストリームのレスポンスを連結して交互に送出するため、連結バッファ `write_buf` の
+/// 接続内再利用や途中フラッシュにバグ（前レスポンスの残バイト混入・ストリーム取り違え）が
+/// あれば、いずれかのレスポンスボディが期待値と食い違って検出できる。ベンチマーク（h2load の
+/// 多重ストリーム）と同じ利用形態を End-to-End で保証する。
+#[tokio::test]
+#[ntest::timeout(30000)]
+#[cfg(feature = "http2")]
+async fn test_http2_multiplexed_coalesced_responses() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let mut client = match common::http2_client::Http2TestClient::new("127.0.0.1", PROXY_PORT).await
+    {
+        Ok(c) => c,
+        Err(e) => panic!("Failed to establish HTTP/2 connection to proxy: {}", e),
+    };
+
+    // 各ストリームで異なる長さ・内容のボディを echo させる（連結バッファに残バイトが
+    // 混入すれば長さ/内容が食い違う）。空ボディも混ぜて END_STREAM 経路も同時に検証する。
+    let uploads: Vec<Vec<u8>> = (0..8u8)
+        .map(|i| {
+            let len = 1 + (i as usize) * 37; // 1,38,75,... バイトと可変
+            (0..len).map(|j| ((i as usize + j) % 251) as u8).collect()
+        })
+        .collect();
+
+    let reqs: Vec<(&str, &str, Option<&[u8]>)> = uploads
+        .iter()
+        .map(|u| ("POST", "/echo-upload/mux", Some(u.as_slice())))
+        .collect();
+
+    let results = client
+        .send_concurrent(&reqs)
+        .await
+        .expect("HTTP/2 multiplexed concurrent requests failed");
+
+    assert_eq!(results.len(), uploads.len(), "レスポンス数が要求数と一致すべき");
+    for (i, ((status, body), expected)) in results.iter().zip(uploads.iter()).enumerate() {
+        assert_eq!(*status, 200, "stream {} は 200 OK を返すべき", i);
+        assert_eq!(
+            body, expected,
+            "stream {} のエコーボディが不一致（連結/多重化でデータ破損の疑い）: got {} bytes, want {} bytes",
+            i,
+            body.len(),
+            expected.len()
+        );
+    }
+    eprintln!(
+        "HTTP/2 multiplexed coalescing: {} streams echoed byte-exact on one connection",
+        results.len()
+    );
+}
+
 // ====================
 // セキュリティ機能 E2Eテスト（優先度: 中）
 // ====================

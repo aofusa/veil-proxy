@@ -95,6 +95,51 @@ impl Http2TestClient {
         Ok((status, body_data))
     }
 
+    /// 同一 HTTP/2 接続で複数リクエストを**多重化して並行送信**し、各レスポンスを
+    /// `(status, body)` の配列で返す（要求順に対応）。
+    ///
+    /// 全リクエストの response future を先に発行してから await するため、プロキシは
+    /// 複数ストリームのレスポンス（連結された HEADERS+DATA）を 1 接続上で交互に送出する。
+    /// 送信ホットパスのフレーム連結が多重化下でもフレーム境界・ストリーム対応を壊さない
+    /// ことを検証するために使う。
+    pub async fn send_concurrent(
+        &mut self,
+        reqs: &[(&str, &str, Option<&[u8]>)],
+    ) -> Result<Vec<(u16, Vec<u8>)>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut response_futures = Vec::with_capacity(reqs.len());
+        for (method, path, body) in reqs {
+            let request = Request::builder()
+                .method(*method)
+                .uri(*path)
+                .header("host", "localhost")
+                .body(())?;
+            let end_of_stream = body.is_none();
+            // 少数の並行ストリーム（max_concurrent_streams 内）のため ready() 待ちは不要。
+            let (response_future, mut send_body) =
+                self.sender.send_request(request, end_of_stream)?;
+            if let Some(body_data) = body {
+                send_body.send_data(Bytes::copy_from_slice(body_data), true)?;
+            }
+            response_futures.push(response_future);
+        }
+
+        let mut results = Vec::with_capacity(response_futures.len());
+        for response_future in response_futures {
+            let response = response_future.await?;
+            let status = response.status().as_u16();
+            let mut body_data = Vec::new();
+            let mut body_stream = response.into_body();
+            while let Some(chunk) = body_stream.data().await {
+                let data = chunk?;
+                body_data.extend_from_slice(&data);
+                body_stream.flow_control().release_capacity(data.len())?;
+            }
+            results.push((status, body_data));
+        }
+
+        Ok(results)
+    }
+
     /// GETリクエストを送信
     pub async fn get(
         &mut self,
