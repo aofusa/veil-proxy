@@ -142,6 +142,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     // ============================================
     0,   // read
     1,   // write
+    2,   // open (musl の canonicalize/ファイルオープンが openat でなく open を使用。未許可だと static 配信が 404 になる)
     3,   // close
     4,   // stat (DNS解決: /etc/resolv.conf等)
     5,   // fstat
@@ -2411,6 +2412,13 @@ mod tests {
         {
             assert!(ALLOWED_SYSCALLS.contains(&21)); // access
             assert!(ALLOWED_SYSCALLS.contains(&269)); // faccessat
+            // open(2): musl の canonicalize/ファイルオープンが openat でなく open を使うため必須。
+            // 未許可だと musl ビルドで static 配信が 404 になる回帰を防ぐ。
+            assert!(
+                ALLOWED_SYSCALLS.contains(&2),
+                "open(2) が許可リストに無いと musl の static 配信が 404 になる"
+            );
+            assert!(ALLOWED_SYSCALLS.contains(&257)); // openat
         }
         #[cfg(target_arch = "aarch64")]
         {
