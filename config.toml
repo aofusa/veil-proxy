@@ -4,7 +4,7 @@
 # ==========================================
 
 [server]
-listen = "0.0.0.0:443"
+listen = "127.0.0.1:443"
 
 # HTTP to HTTPS リダイレクト（オプション）
 #
@@ -18,11 +18,11 @@ listen = "0.0.0.0:443"
 #
 # 推奨: 公開サーバーではこの設定を有効にすることをお勧めします
 #
-# http = "0.0.0.0:80"
+http = "127.0.0.1:80"
 
 # ワーカースレッド数（オプション）
 # 未指定または0の場合はCPUコア数と同じスレッド数を使用
-threads = 4
+# threads = 4
 
 # ====================
 # HTTP/2・HTTP/3 設定
@@ -32,7 +32,6 @@ threads = 4
 # 各プロトコルを使用するには対応するフィーチャーでビルドする必要があります:
 #   HTTP/2: cargo build --features http2
 #   HTTP/3: cargo build --features http3
-#   両方:   cargo build --features all-protocols
 
 # HTTP/2 を有効化（TLS ALPN ネゴシエーション）
 #
@@ -41,7 +40,7 @@ threads = 4
 # - HPACK ヘッダー圧縮によるオーバーヘッド削減
 # - HTTP/1.1 へのフォールバック対応
 #
-# http2_enabled = true
+http2_enabled = true
 
 # H2C (HTTP/2 Cleartext) サーバーを有効化
 #
@@ -67,11 +66,11 @@ threads = 4
 # 指定した場合、H2C専用のリスナーを起動します。
 # 未指定の場合は、TLSリスナーと同じアドレスでプロトコル検出を行います。
 #
-# 例: "0.0.0.0:8080"
+# 例: "127.0.0.1:8080"
 #
 # 注意: 同じポートでTLSとH2Cの両方を処理する場合は未指定にしてください。
 #
-# h2c_listen = "0.0.0.0:8080"
+# h2c_listen = "127.0.0.1:8080"
 
 # ====================
 # グレースフルシャットダウン設定
@@ -115,8 +114,8 @@ threads = 4
 # - 本番環境では無効化を推奨（デフォルト: false）
 #
 # Serverヘッダーを有効化
-# server_header_enabled = false
-#
+server_header_enabled = true
+
 # カスタムServerヘッダー値（server_header_enabled = true時のみ有効）
 # デフォルト: "veil"
 # 未指定の場合、プロトコルごとに自動設定:
@@ -159,13 +158,17 @@ level = "info"
 # ログチャネルサイズ（内部バッファ）
 # 高負荷時のログドロップを防止するため、デフォルト(100)より大幅に増加
 # 推奨範囲: 10000 - 1000000
-channel_size = 100000
+# channel_size = 100000
 
 # フラッシュ間隔（ミリ秒）
 # ログバッファをディスクにフラッシュする間隔
 # 小さい値: 即座にログが書き込まれるがI/O負荷増
 # 大きい値: I/O効率が良いがログ遅延
-flush_interval_ms = 1000
+# flush_interval_ms = 1000
+
+# ログファイルパス（オプション）
+# 指定しない場合は標準エラー出力に出力
+# file_path = "/var/log/veil/veil.log"
 
 
 # ==========================================
@@ -190,10 +193,6 @@ flush_interval_ms = 1000
 # channel_size = 10000        # 非同期チャネルキャパシティ（デフォルト: 10000）
 # flush_interval_ms = 1000    # BufWriter フラッシュ間隔ミリ秒（デフォルト: 1000）
 
-# ログファイルパス（オプション）
-# 指定しない場合は標準エラー出力に出力
-# file_path = "/var/log/veil.log"
-
 
 # ==========================================
 # グローバルセキュリティ設定
@@ -208,8 +207,8 @@ flush_interval_ms = 1000
 #      sudo setcap 'cap_net_bind_service=+ep' ./target/release/veil
 #   2. または非特権ポート（1024以上）を使用
 #
-# drop_privileges_user = "nobody"
-# drop_privileges_group = "nogroup"
+# drop_privileges_user = "veil"
+# drop_privileges_group = "veil"
 
 # グローバル同時接続上限（0 = 無制限）
 # max_concurrent_connections = 10000
@@ -274,7 +273,7 @@ flush_interval_ms = 1000
 # ============================================
 #
 # enable_seccomp = true
-#
+
 # seccompモード:
 #   "disabled" - 無効（デフォルト）
 #   "log"      - 違反をログに記録（ブロックしない、導入時推奨）
@@ -282,7 +281,7 @@ flush_interval_ms = 1000
 #   "strict"   - 違反したプロセスをSIGKILL（最も厳格、デバッグ困難）
 #
 # seccomp_mode = "log"  # まずログモードで検証
-#
+
 # ============================================
 # Landlock設定 (Linux 5.13+)
 # ============================================
@@ -297,13 +296,29 @@ flush_interval_ms = 1000
 #   v4 (Linux 6.7+):  ioctl権限
 #
 # enable_landlock = true
-#
+
 # 読み取り専用パス（設定ファイル、ライブラリ等）
-# landlock_read_paths = ["/etc", "/usr", "/lib", "/lib64"]
-#
+# landlock_read_paths = [
+#   # ファイル配信ディレクトリ（プロキシ機能のみであれば不要）
+#   "/var/www",
+#   
+#   # キャッシュ・バッファリングの一時ディレクトリ（キャッシュ・バッファを使用しないなら不要）
+#   # "/var/cache/veil",
+#   # "/var/tmp/veil",
+#   
+#   # プロキシ機能の名前解決に必要（ファイル配信のみであれば不要）
+#   "/etc/veil",
+#   "/etc/resolv.conf",
+#   "/etc/hosts",
+#   "/etc/nsswitch.conf",
+#   "/lib",
+#   "/lib64",
+#   "/usr"
+# ]
+
 # 読み書きパス（ログ、一時ファイル等）
-# landlock_write_paths = ["/var/log", "/tmp"]
-#
+# landlock_write_paths = ["/var/log/veil", "/var/cache/veil", "/var/tmp/veil"]
+
 # ============================================
 # 本番環境向け推奨設定
 # ============================================
@@ -311,8 +326,19 @@ flush_interval_ms = 1000
 # enable_seccomp = true
 # seccomp_mode = "filter"
 # enable_landlock = true
-# landlock_read_paths = ["/etc/veil", "/usr", "/lib", "/lib64"]
-# landlock_write_paths = ["/var/log/veil"]
+# landlock_read_paths = [
+#   "/var/www",
+#   "/var/cache/veil",
+#   "/var/tmp/veil",
+#   "/etc/veil",
+#   "/etc/resolv.conf",
+#   "/etc/hosts",
+#   "/etc/nsswitch.conf",
+#   "/lib",
+#   "/lib64",
+#   "/usr"
+# ]
+# landlock_write_paths = ["/var/log/veil", "/var/cache/veil", "/var/tmp/veil"]
 
 # ============================================
 # サンドボックス設定（bubblewrap相当）
@@ -368,17 +394,21 @@ flush_interval_ms = 1000
 # 読み取り専用バインドマウント（source:dest 形式）
 # DNS解決に必要なファイルを含める必要があります
 # sandbox_ro_bind_mounts = [
-#   "/usr:/usr",
-#   "/lib:/lib",
-#   "/lib64:/lib64",
-#   "/etc/ssl:/etc/ssl",
-#   # DNS解決に必要
+#   # ファイル配信ディレクトリ（プロキシ機能のみであれば不要）
+#   "/var/www:/var/www",
+# 
+#   # プロキシ機能の名前解決に必要（ファイル配信のみであれば不要）
+#   "/etc/veil:/etc/veil",
 #   "/etc/resolv.conf:/etc/resolv.conf",
 #   "/etc/hosts:/etc/hosts",
 #   "/etc/nsswitch.conf:/etc/nsswitch.conf",
-#   "/etc/gai.conf:/etc/gai.conf",
+#   "/lib:/lib",
+#   "/lib64:/lib64",
+#   "/usr:/usr"
+# 
 #   # systemd-resolved使用時に必要
 #   "/run/systemd/resolve:/run/systemd/resolve",
+# 
 #   # ユーザー/グループ情報
 #   "/etc/passwd:/etc/passwd",
 #   "/etc/group:/etc/group"
@@ -387,13 +417,16 @@ flush_interval_ms = 1000
 # 読み書きバインドマウント（source:dest 形式）
 # 設定ファイル、ログディレクトリなどを指定
 # sandbox_rw_bind_mounts = [
-#   "/var/log/veil:/var/log/veil",
-#   "/etc/veil:/etc/veil"
+#   "/var/log/veil:/var/log/veil"
 # ]
 
 # tmpfsマウント先（メモリファイルシステム）
 # 注: /run はsystemd-resolvedのDNS解決に必要なため除外推奨
-# sandbox_tmpfs_mounts = ["/tmp"]
+# sandbox_tmpfs_mounts = [
+#   # キャッシュ・バッファリングの一時ディレクトリ（キャッシュ・バッファを使用しないなら不要）
+#   "/var/cache/veil",
+#   "/var/tmp/veil",
+#]
 
 # /proc をマウント（デフォルト: true）
 # sandbox_mount_proc = true
@@ -430,30 +463,45 @@ flush_interval_ms = 1000
 # sandbox_unshare_ipc = true
 # sandbox_keep_capabilities = ["CAP_NET_BIND_SERVICE"]
 # sandbox_ro_bind_mounts = [
-#   "/usr:/usr",
-#   "/lib:/lib",
-#   "/lib64:/lib64",
-#   "/etc/ssl:/etc/ssl",
-#   # DNS解決に必要
+#   "/var/www:/var/www",
+#   "/etc/veil:/etc/veil",
 #   "/etc/resolv.conf:/etc/resolv.conf",
 #   "/etc/hosts:/etc/hosts",
 #   "/etc/nsswitch.conf:/etc/nsswitch.conf",
-#   "/etc/gai.conf:/etc/gai.conf",
-#   "/run/systemd/resolve:/run/systemd/resolve"
+#   "/lib:/lib",
+#   "/lib64:/lib64",
+#   "/usr:/usr"
+#   "/run/systemd/resolve:/run/systemd/resolve",
+#   "/etc/passwd:/etc/passwd",
+#   "/etc/group:/etc/group"
 # ]
 # sandbox_rw_bind_mounts = [
 #   "/var/log/veil:/var/log/veil"
 # ]
-# sandbox_tmpfs_mounts = ["/tmp"]
+# sandbox_tmpfs_mounts = [
+#   "/var/cache/veil",
+#   "/var/tmp/veil",
+# ]
 #
 # # 権限降格
-# drop_privileges_user = "www-data"
-# drop_privileges_group = "www-data"
+# drop_privileges_user = "veil"
+# drop_privileges_group = "veil"
 #
 # # Landlock（ファイルシステム制限）
 # enable_landlock = true
-# landlock_read_paths = ["/etc/veil", "/usr", "/lib", "/lib64", "/etc/ssl"]
-# landlock_write_paths = ["/var/log/veil"]
+# landlock_read_paths = [
+#   "/var/www",
+#   "/var/cache/veil",
+#   "/var/tmp/veil",
+#   "/etc/veil",
+#   "/etc/resolv.conf",
+#   "/etc/hosts",
+#   "/etc/nsswitch.conf",
+#   "/lib",
+#   "/lib64",
+#   "/usr"
+# ]
+# landlock_write_paths = ["/var/log/veil", "/var/cache/veil", "/var/tmp/veil"]
 #
 # # seccomp（システムコール制限）
 # enable_seccomp = true
@@ -486,7 +534,7 @@ reuseport_balancing = "cbpf"
 # 注意:
 #   - コンテナ環境（Docker/K8s）では無効化される可能性あり
 #   - 利用不可の場合は自動的に通常ページにフォールバック
-huge_pages_enabled = true
+# huge_pages_enabled = true
 
 # ------------------------------------------
 # Via ヘッダー設定 (RFC 7230 Section 5.7.1)
@@ -552,17 +600,17 @@ huge_pages_enabled = true
 #   - ルーティング設定がない場合は、このグローバル設定が使用される
 #
 # デフォルト: false（無効）
-#open_file_cache_enabled = false
+# open_file_cache_enabled = true
 
 # OpenFileCacheの有効期間（秒、グローバルデフォルト）
 # キャッシュされたファイル情報が有効とみなされる期間
 # デフォルト: 60秒
-#open_file_cache_valid_duration_secs = 60
+# open_file_cache_valid_duration_secs = 60
 
 # OpenFileCacheの最大エントリ数（グローバルデフォルト）
 # キャッシュに保持する最大ファイル情報数
 # デフォルト: 10000
-#open_file_cache_max_entries = 10000
+# open_file_cache_max_entries = 10000
 
 
 # ==========================================
@@ -574,12 +622,12 @@ cert_path = "/path/to/cert.pem"
 key_path = "/path/to/key.pem"
 
 # kTLS有効化（Linux 5.15+、feature flag必須）
-ktls_enabled = false
+ktls_enabled = true
 
 # kTLS有効化失敗時にrustlsへフォールバックするかどうか
 # false: kTLS必須（失敗時は接続拒否）
 # true: kTLS失敗時はrustlsで継続（デフォルト）
-ktls_fallback_enabled = false
+ktls_fallback_enabled = true
 
 # kTLS有効時にTCP_CORKを使用するかどうか
 #
@@ -618,6 +666,10 @@ ktls_fallback_enabled = false
 # cipher_suites = [
 #     "TLS13_AES_256_GCM_SHA384",
 #     "TLS13_AES_128_GCM_SHA256",
+#     "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+#     "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+#     "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+#     "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
 # ]
 
 # 証明書の0ダウンタイム自動リロード（F-03）
@@ -644,7 +696,7 @@ ktls_fallback_enabled = false
 #   POST  /__admin/cache/purge?all=true      （全 Purge）
 #   いずれも Authorization: Bearer <secret> が必要。レスポンス: {"purged": N}
 #
-# [admin]
+[admin]
 # enabled = true
 # path_prefix = "/__admin"
 # secret = "changeme"
@@ -660,7 +712,7 @@ ktls_fallback_enabled = false
 # Prometheus レジストリの値を OTLP/HTTP (JSON) として
 # <endpoint>/v1/metrics へ定期送信する（データプレーンは tokio-free）。
 #
-# [opentelemetry]
+[opentelemetry]
 # enabled = false
 # endpoint = "http://localhost:4318"
 # service_name = "veil-proxy"
@@ -730,12 +782,12 @@ ktls_fallback_enabled = false
 # RFC 7540標準: 65535 (64KB - 1)
 # 高スループット: 4194304 (4MB) - 大きなファイル転送時のパフォーマンス向上
 # 注意: FLOW_CONTROL_ERROR を防ぐため、大きなレスポンス用に増加推奨
-initial_window_size = 4194304
+# initial_window_size = 4194304
 
 # SETTINGS_MAX_FRAME_SIZE (最大フレームサイズ)
 # デフォルト: 65536 (64KB) - high-performance設定
 # RFC 7540標準: 16384 (16KB)
-max_frame_size = 65536
+# max_frame_size = 65536
 
 # SETTINGS_MAX_HEADER_LIST_SIZE (最大ヘッダーリストサイズ)
 # デフォルト: 65536 (64KB)
@@ -747,7 +799,7 @@ max_frame_size = 65536
 # RFC 7540標準: 65535 (64KB - 1)
 # 高スループット: 16777216 (16MB)
 # 注意: 大きなレスポンスを複数ストリームで同時に送信する場合に増加推奨
-connection_window_size = 16777216
+# connection_window_size = 16777216
 
 # ------------------------------------------
 # HTTP/2 DoS 対策設定
@@ -807,7 +859,7 @@ connection_window_size = 16777216
 [http3]
 # HTTP/3リッスンアドレス（UDP）
 # 未指定の場合は server.listen と同じアドレスを使用
-# listen = "0.0.0.0:443"
+# listen = "127.0.0.1:443"
 
 # 最大アイドルタイムアウト（ミリ秒）
 # デフォルト: 30000 (30秒)
@@ -889,7 +941,7 @@ connection_window_size = 16777216
 #
 # デフォルト: false
 #
-# gso_gro_enabled = false
+# gso_gro_enabled = true
 
 
 # ==========================================
@@ -1072,25 +1124,25 @@ connection_window_size = 16777216
 #
 [wasm]
 # WASM拡張を有効化（デフォルト: false）
-# enabled = false
+# enabled = true
 
-  # デフォルト設定
-  [wasm.defaults]
-  # 最大実行時間（ミリ秒）
-  # デフォルト: 100
-  # max_execution_time_ms = 100
+# デフォルト設定
+# [wasm.defaults]
+# 最大実行時間（ミリ秒）
+# デフォルト: 100
+# max_execution_time_ms = 100
 
-    # Poolingアロケータ設定
-    [wasm.defaults.pooling]
-    # メモリプール総数
-    # デフォルト: 128
-    # total_memories = 128
-    # テーブルプール総数
-    # デフォルト: 128
-    # total_tables = 128
-    # インスタンスごとの最大メモリサイズ（バイト）
-    # デフォルト: 10485760 (10MB)
-    # max_memory_size = 10485760
+# Poolingアロケータ設定
+# [wasm.defaults.pooling]
+# メモリプール総数
+# デフォルト: 128
+# total_memories = 128
+# テーブルプール総数
+# デフォルト: 128
+# total_tables = 128
+# インスタンスごとの最大メモリサイズ（バイト）
+# デフォルト: 10485760 (10MB)
+# max_memory_size = 10485760
 #
 # # モジュール定義
 # [[wasm.modules]]
@@ -1146,11 +1198,13 @@ connection_window_size = 16777216
 #
 #   # 注意: 以下のcapabilityは存在しません:
 #   # - allow_grpc_calls (現在未実装)
-#
+
 # ==========================================
 # Prometheusメトリクス
 # ==========================================
-# Prometheusスクレイピング用のメトリクスエンドポイントを提供します。
+[prometheus]
+# Prometheusスクレイピング用のメトリクスエンドポイントを提供します。（デフォルト: false）
+# enabled = true
 #
 # 利用可能なメトリクス:
 #   veil_proxy_http_requests_total          リクエスト総数（method, status, hostラベル付き）
@@ -1159,12 +1213,6 @@ connection_window_size = 16777216
 #   veil_proxy_http_response_size_bytes     レスポンスボディサイズ
 #   veil_proxy_http_active_connections      アクティブな接続数
 #   veil_proxy_http_upstream_health         アップストリームの健康状態
-#
-# 設定例:
-#
-# [prometheus]
-# # メトリクスエンドポイントの有効化（デフォルト: false）
-# enabled = true
 #
 # # メトリクスエンドポイントのパス（デフォルト: "/__metrics"）
 # path = "/metrics"
@@ -1178,13 +1226,6 @@ connection_window_size = 16777216
 #   "172.16.0.0/12",
 #   "192.168.0.0/16"
 # ]
-
-# [prometheus]
-# # メトリクスエンドポイントの有効化（デフォルト: false）
-# enabled = true
-# path = "/__metrics"
-# allowed_ips = []  # 空の場合は全てのIPを許可
-
 
 # ==========================================
 # ルーティング定義
@@ -1234,82 +1275,81 @@ connection_window_size = 16777216
 # - source_ip: ソースIPマッチ（CIDR表記、配列で複数CIDR指定可能）
 #   例: ["192.168.0.0/16", "10.0.0.0/8"]
 
-
 # ------------------------------------------
 # 静的ファイル（完全一致）
 # ------------------------------------------
 # リクエスト: /robots.txt → /var/www/robots.txt を返す
 # リクエスト: /robots.txt/hoge → 404 Not Found
-[[route]]
-[route.conditions]
-host = "example.com"
-path = "/robots.txt"
-[route.action]
-type = "File"
-path = "/var/www/robots.txt"
+# [[route]]
+# [route.conditions]
+# host = "example.com"
+# path = "/robots.txt"
+# [route.action]
+# type = "File"
+# path = "/var/www/robots.txt"
 
 # ------------------------------------------
 # 静的ディレクトリ配信
 # ------------------------------------------
 
 # デフォルトインデックス (index.html)
-[[route]]
-[route.conditions]
-host = "example.com"
-path = "/static/*"
-[route.action]
-type = "File"
-path = "/var/www/assets/"
-mode = "sendfile"
-# OpenFileCache設定（ルーティングごと、グローバル設定を上書き）
-# この設定により、ファイルメタデータ（canonicalize、metadata、mime_guess）がキャッシュされ、
-# システムコールが60〜67%削減されます（キャッシュヒット時）
-[route.open_file_cache]
-enabled = true
-valid_duration_secs = 300  # 5分（静的ファイルは変更頻度が低い）
-max_entries = 50000
+# [[route]]
+# [route.conditions]
+# host = "example.com"
+# path = "/static/*"
+# [route.action]
+# type = "File"
+# path = "/var/www/assets/"
+# mode = "sendfile"
+# # OpenFileCache設定（ルーティングごと、グローバル設定を上書き）
+# # この設定により、ファイルメタデータ（canonicalize、metadata、mime_guess）がキャッシュされ、
+# # システムコールが60〜67%削減されます（キャッシュヒット時）
+# [route.open_file_cache]
+# enabled = true
+# valid_duration_secs = 300  # 5分（静的ファイルは変更頻度が低い）
+# max_entries = 50000
 
 # カスタムインデックス (profile.html)
-[[route]]
-[route.conditions]
-host = "example.com"
-path = "/user/*"
-[route.action]
-type = "File"
-path = "/var/www/user/"
-index = "profile.html"
+# [[route]]
+# [route.conditions]
+# host = "example.com"
+# path = "/user/*"
+# [route.action]
+# type = "File"
+# path = "/var/www/user/"
+# index = "profile.html"
 
 # カスタムインデックス (dashboard.html)
-[[route]]
-[route.conditions]
-host = "example.com"
-path = "/app/*"
-[route.action]
-type = "File"
-path = "/var/www/app/"
-index = "dashboard.html"
+# [[route]]
+# [route.conditions]
+# host = "example.com"
+# path = "/app/*"
+# [route.action]
+# type = "File"
+# path = "/var/www/app/"
+# index = "dashboard.html"
 
 # 末尾スラッシュなし（301リダイレクトなし）
-[[route]]
-[route.conditions]
-host = "example.com"
-path = "/docs"
-[route.action]
-type = "File"
-path = "/var/www/docs/"
+# [[route]]
+# [route.conditions]
+# host = "example.com"
+# path = "/docs"
+# [route.action]
+# type = "File"
+# path = "/var/www/docs/"
 
 # ------------------------------------------
 # プロキシ配信
 # ------------------------------------------
 
 # シンプルなプロキシ
-[[route]]
-[route.conditions]
-host = "example.com"
-path = "/backend"
-[route.action]
-type = "Proxy"
-url = "http://localhost:3000"
+# [[route]]
+# [route.conditions]
+# host = "example.com"
+# path = "/backend"
+# [route.action]
+# type = "Proxy"
+# url = "http://localhost:3000"
 
 # ------------------------------------------
 # SNI名指定付きHTTPSプロキシ
@@ -1321,24 +1361,24 @@ url = "http://localhost:3000"
 # type = "Proxy"
 # url = "https://192.168.1.100:443"
 # sni_name = "api.internal.example.com"
-
+# 
 # セキュリティ設定付きプロキシ
 # - 許可メソッド: GET, POST, PUT のみ
 # - ボディサイズ制限: 5MB
 # - バックエンド接続タイムアウト: 5秒
 # - レートリミット: 60リクエスト/分
-[[route]]
-[route.conditions]
-host = "example.com"
-path = "/api/*"
-[route.action]
-type = "Proxy"
-url = "http://localhost:8080/app/"
-[route.security]
-allowed_methods = ["GET", "POST", "PUT"]
-max_request_body_size = 5_242_880
-backend_connect_timeout_secs = 5
-rate_limit_requests_per_min = 60
+# [[route]]
+# [route.conditions]
+# host = "example.com"
+# path = "/api/*"
+# [route.action]
+# type = "Proxy"
+# url = "http://localhost:8080/app/"
+# [route.security]
+# allowed_methods = ["GET", "POST", "PUT"]
+# max_request_body_size = 5_242_880
+# backend_connect_timeout_secs = 10
+# rate_limit_requests_per_min = 60
 
 # --- [route.security] のその他の設定キー（デフォルト値と説明） ---
 #
@@ -1352,13 +1392,13 @@ rate_limit_requests_per_min = 60
 # client_body_timeout_secs = 30
 #
 # リクエストヘッダー最大サイズ（バイト）。超過時は 431 を返す
-# max_request_header_size = 16384
+# max_request_header_size = 8192
 #
 # バックエンド接続プール: ホストごとの最大アイドル接続数
-# max_idle_connections_per_host = 32
+# max_idle_connections_per_host = 8
 #
 # バックエンド接続プール: アイドル接続の維持時間（秒）
-# idle_connection_timeout_secs = 60
+# idle_connection_timeout_secs = 30
 #
 # レスポンスから削除するヘッダー（クライアントへ返送前）
 # remove_response_headers = ["Server", "X-Powered-By"]
@@ -1382,74 +1422,74 @@ rate_limit_requests_per_min = 60
 
 # HTTPヘッダー条件付きルーティング
 # X-Versionヘッダーが"v2"の場合のみマッチ
-[[route]]
-[route.conditions]
-host = "api.example.com"
-path = "/api/*"
-header = { "X-Version" = "v2" }
-[route.action]
-type = "Proxy"
-url = "http://localhost:8080/v2/"
+# [[route]]
+# [route.conditions]
+# host = "api.example.com"
+# path = "/api/*"
+# header = { "X-Version" = "v2" }
+# [route.action]
+# type = "Proxy"
+# url = "http://localhost:8080/v2/"
 
 # HTTPメソッド条件付きルーティング
 # GETとPOSTのみ許可
-[[route]]
-[route.conditions]
-host = "api.example.com"
-path = "/api/*"
-method = ["GET", "POST"]
-[route.action]
-type = "Proxy"
-url = "http://localhost:8080/"
+# [[route]]
+# [route.conditions]
+# host = "api.example.com"
+# path = "/api/*"
+# method = ["GET", "POST"]
+# [route.action]
+# type = "Proxy"
+# url = "http://localhost:8080/"
 
 # クエリパラメータ条件付きルーティング
 # tokenクエリパラメータが"secret"の場合のみマッチ
-[[route]]
-[route.conditions]
-host = "api.example.com"
-path = "/api/*"
-query = { "token" = "secret" }
-[route.action]
-type = "Proxy"
-url = "http://localhost:8080/"
+# [[route]]
+# [route.conditions]
+# host = "api.example.com"
+# path = "/api/*"
+# query = { "token" = "secret" }
+# [route.action]
+# type = "Proxy"
+# url = "http://localhost:8080/"
 
 # ソースIP条件付きルーティング
 # 特定のCIDR範囲からのアクセスのみ許可
-[[route]]
-[route.conditions]
-host = "admin.example.com"
-path = "/admin/*"
-source_ip = ["192.168.0.0/16", "10.0.0.0/8"]
-[route.action]
-type = "Proxy"
-url = "http://localhost:9000/"
+# [[route]]
+# [route.conditions]
+# host = "admin.example.com"
+# path = "/admin/*"
+# source_ip = ["192.168.0.0/16", "10.0.0.0/8"]
+# [route.action]
+# type = "Proxy"
+# url = "http://localhost:9000/"
 
 # 複数条件の組み合わせ（すべてANDで結合）
-[[route]]
-[route.conditions]
-host = "api.example.com"
-path = "/api/v2/*"
-header = { "X-Version" = "v2", "X-API-Key" = "secret" }
-method = ["GET", "POST"]
-query = { "format" = "json" }
-source_ip = ["192.168.0.0/16"]
-[route.action]
-type = "Proxy"
-url = "http://localhost:8080/v2/"
+# [[route]]
+# [route.conditions]
+# host = "api.example.com"
+# path = "/api/v2/*"
+# header = { "X-Version" = "v2", "X-API-Key" = "secret" }
+# method = ["GET", "POST"]
+# query = { "format" = "json" }
+# source_ip = ["192.168.0.0/16"]
+# [route.action]
+# type = "Proxy"
+# url = "http://localhost:8080/v2/"
 
 # ------------------------------------------
 # Proxy-Wasm拡張機能（route直下で設定）
 # ------------------------------------------
 # WASMモジュールはroute直下で設定します（route.action配下ではありません）
-[[route]]
-[route.conditions]
-host = "api.example.com"
-path = "/api/*"
-[route.action]
-type = "Proxy"
-url = "http://localhost:8080/"
-# WASMモジュール名のリスト（このルートに適用するWASMモジュール）
-modules = ["header_filter", "waf_filter"]
+# [[route]]
+# [route.conditions]
+# host = "api.example.com"
+# path = "/api/*"
+# [route.action]
+# type = "Proxy"
+# url = "http://localhost:8080/"
+# # WASMモジュール名のリスト（このルートに適用するWASMモジュール）
+# modules = ["header_filter", "waf_filter"]
 
 # ------------------------------------------
 # レスポンス圧縮設定付きプロキシ
@@ -1530,7 +1570,7 @@ modules = ["header_filter", "waf_filter"]
 #
 #   [route.compression]
 #   enabled = false  # 明示的に無効化（デフォルト値と同じ）
-
+# 
 # ------------------------------------------
 # 分析データAPI（圧縮有効、高圧縮率）
 # ------------------------------------------
@@ -1554,21 +1594,21 @@ modules = ["header_filter", "waf_filter"]
 # 内部ネットワークからのみアクセス許可
 # - 許可: 192.168.0.0/16, 10.0.0.0/8, 127.0.0.1
 # - 拒否: 192.168.1.100（特定のホストを除外）
-[[route]]
-[route.conditions]
-host = "example.com"
-path = "/admin/*"
-[route.action]
-type = "Proxy"
-url = "http://localhost:9000/"
-[route.security]
-allowed_ips = [
-  "192.168.0.0/16",
-  "10.0.0.0/8",
-  "127.0.0.1"
-]
-denied_ips = ["192.168.1.100"]
-allowed_methods = ["GET", "POST"]
+# [[route]]
+# [route.conditions]
+# host = "example.com"
+# path = "/admin/*"
+# [route.action]
+# type = "Proxy"
+# url = "http://localhost:9000/"
+# [route.security]
+# allowed_ips = [
+#   "192.168.0.0/16",
+#   "10.0.0.0/8",
+#   "127.0.0.1"
+# ]
+# denied_ips = ["192.168.1.100"]
+# allowed_methods = ["GET", "POST"]
 
 # ------------------------------------------
 # プロキシキャッシュ設定
@@ -1688,7 +1728,7 @@ allowed_methods = ["GET", "POST"]
 #
 #   # ディスクバッファ最大サイズ（デフォルト: 100MB）
 #   max_disk_buffer = 104857600
-
+# 
 # ------------------------------------------
 # WebSocket プロキシ
 # ------------------------------------------
@@ -1797,7 +1837,7 @@ allowed_methods = ["GET", "POST"]
 # upstream = "backend-pool"
 #
 #   [route.security]
-#   rate_limit_requests_per_min = 100
+#   rate_limit_requests_per_min = 60
 
 # ==========================================
 # L4 ストリームプロキシ設定（F-18）
@@ -1907,10 +1947,9 @@ allowed_methods = ["GET", "POST"]
 # catch-all動作はなし: マッチしないパスは404
 [[route]]
 [route.conditions]
-host = "example.com"
 path = "/"
 [route.action]
 type = "File"
-path = "/var/www/index.html"
+path = "/var/www/"
 [route.security]
-allowed_methods = ["GET"]
+allowed_methods = ["HEAD", "GET"]
