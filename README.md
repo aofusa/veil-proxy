@@ -2977,7 +2977,6 @@ Provides high-performance async logging using ftlog. ftlog internally uses a bac
 | `max_log_size` | Maximum log file size (bytes, 0=unlimited) | 104857600 |
 | `app_file_path` | App log (INFO/WARN/DEBUG/TRACE) output path | none (**stdout**) |
 | `error_file_path` | Error log (ERROR) output path | none (**stderr**) |
-| `file_path` | Legacy: fallback for `app_file_path` / `error_file_path` when unset (writes both streams to this file) | none |
 
 ### Log Output Destinations (by stream)
 
@@ -3018,7 +3017,6 @@ flush_interval_ms = 1000
 # App log -> stdout by default; Error log -> stderr by default.
 app_file_path = "/var/log/veil/veil.log"          # optional
 error_file_path = "/var/log/veil/veil.error.log"  # optional
-# file_path = "/var/log/veil.log"  # legacy: both streams to one file
 ```
 
 ### JSON Format Configuration Example

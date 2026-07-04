@@ -180,11 +180,6 @@ level = "info"
 #   未指定時は標準エラー出力 (stderr)。
 # error_file_path = "/var/log/veil/veil.error.log"
 #
-# レガシー: file_path（後方互換）。
-#   app_file_path / error_file_path が未指定のとき、両系統のフォールバック元となる
-#   （＝従来どおり app・error 双方をこのファイルへ出力）。
-# file_path = "/var/log/veil/veil.log"
-#
 # 注意: ログ出力先にファイルパスを指定した場合、その親ディレクトリが
 #       [security].landlock_write_paths に自動追加される（Landlock 有効時の書き込み許可）。
 
