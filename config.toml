@@ -125,6 +125,7 @@ server_header_enabled = true
 # server_header_value = "veil/1.0"
 
 
+
 # ====================
 # ログ設定（非同期ログの最適化）
 # ====================
@@ -171,6 +172,7 @@ level = "info"
 # file_path = "/var/log/veil/veil.log"
 
 
+
 # ==========================================
 # 構造化アクセスログ（F-21）
 # ==========================================
@@ -180,7 +182,7 @@ level = "info"
 #
 # スレッドローカルバッファを使用してヒープアロケーションを最小化。
 #
-# [access_log]
+[access_log]
 # enabled = true
 # format = "json"              # "json" または "text"
 # file_path = "/var/log/veil/access.log"  # 省略時は stderr
@@ -192,6 +194,183 @@ level = "info"
 # ]
 # channel_size = 10000        # 非同期チャネルキャパシティ（デフォルト: 10000）
 # flush_interval_ms = 1000    # BufWriter フラッシュ間隔ミリ秒（デフォルト: 1000）
+
+
+
+# ==========================================
+# TLS設定
+# ==========================================
+[tls]
+
+cert_path = "/path/to/cert.pem"
+key_path = "/path/to/key.pem"
+
+# kTLS有効化（Linux 5.15+、feature flag必須）
+ktls_enabled = true
+
+# kTLS有効化失敗時にrustlsへフォールバックするかどうか
+# false: kTLS必須（失敗時は接続拒否）
+# true: kTLS失敗時はrustlsで継続（デフォルト）
+ktls_fallback_enabled = true
+
+# kTLS有効時にTCP_CORKを使用するかどうか
+#
+# TCP_CORKはkTLS設定中に小さなTCPパケットの送信を遅延し、
+# パケット結合により効率的なネットワーク転送を実現します。
+#
+# true: TCP_CORK有効（デフォルト、推奨）
+# false: TCP_CORK無効（特定の低遅延要件がある場合）
+# tcp_cork_enabled = true
+
+# 利用を許可する TLS 暗号スイート（nginx の ssl_ciphers 相当、F-50）
+#
+# 記載順 = サーバ優先度順（rustls はサーバ選好でネゴシエートする）。
+# 未指定（空・コメントアウト）の場合は rustls 既定の全スイートを使用。
+# 不正なスイート名は起動時にエラーとなる。
+#
+# 指定可能な名前（aws-lc-rs プロバイダ）:
+#   TLS 1.3:
+#     TLS13_AES_256_GCM_SHA384
+#     TLS13_AES_128_GCM_SHA256
+#     TLS13_CHACHA20_POLY1305_SHA256
+#   TLS 1.2:
+#     TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+#     TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+#     TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+#     TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+#     TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+#     TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+#
+# 注意:
+# - kTLS オフロードは AES-GCM 系のみ対応。kTLS 有効時に CHACHA20 系を含めると、
+#   そのスイートでネゴシエートした接続は kTLS へオフロードされず rustls で処理される
+#   （ktls_fallback_enabled = false の場合は接続拒否）。
+# - 本設定は TLS(TCP) リスナー（HTTP/1.1 / HTTP/2）に適用される。
+#   HTTP/3 (QUIC) は quiche が TLS を管理するため対象外。
+# cipher_suites = [
+#     "TLS13_AES_256_GCM_SHA384",
+#     "TLS13_AES_128_GCM_SHA256",
+#     "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+#     "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+#     "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+#     "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
+# ]
+
+# 証明書の0ダウンタイム自動リロード（F-03）
+# auto_reload = true で証明書/秘密鍵ファイルの mtime 変化を検知し、
+# 新しいハンドシェイクのみ新証明書を使用する（既存接続は影響なし）。
+# SIGHUP でも即時リロードされる。
+# 注意: Landlock サンドボックス有効時は証明書ディレクトリへの read を
+#       許可するか、サンドボックスを無効化する必要がある。
+# auto_reload = false
+# reload_interval_secs = 60
+
+
+
+# ==========================================
+# パフォーマンス設定
+# ==========================================
+[performance]
+
+# SO_REUSEPORT の振り分け方式
+# "kernel" = カーネルデフォルト（3元タプルハッシュ）
+# "cbpf"   = クライアントIPベースのCBPF（キャッシュ効率向上、Linux 4.6+必須）
+reuseport_balancing = "cbpf"
+
+# Huge Pages (Large OS Pages) の使用
+# true: mimallocでHuge Pages（2MB）を優先使用し、TLBミスを削減
+# false: 通常の4KBページを使用
+#
+# 利点:
+#   - TLB（Translation Lookaside Buffer）ミス削減
+#   - 大容量メモリ使用時（バッファプール拡大）のページフォルト減少
+#   - kTLS/splice時のカーネル連携で効果的（5-10%パフォーマンス向上）
+#
+# 要件（Linux）:
+#   sudo echo 128 > /proc/sys/vm/nr_hugepages
+#   または /etc/sysctl.conf に vm.nr_hugepages=128 を追加
+#
+# 注意:
+#   - コンテナ環境（Docker/K8s）では無効化される可能性あり
+#   - 利用不可の場合は自動的に通常ページにフォールバック
+# huge_pages_enabled = true
+
+# ------------------------------------------
+# Via ヘッダー設定 (RFC 7230 Section 5.7.1)
+# ------------------------------------------
+#
+# プロキシ経由のリクエスト/レスポンスにViaヘッダーを追加します。
+# Viaヘッダーはリクエストがどのプロキシを経由したかを示し、
+# ループ検出やデバッグに使用されます。
+#
+# 形式: Via: 1.1 <hostname>
+#
+# via_header_enabled = true
+# via_header_hostname = "veil"  # デフォルト: "veil"
+
+# ------------------------------------------
+# チャンクサイズ設定 (sendfile/splice)
+# ------------------------------------------
+#
+# kTLSのsendfile/splice転送時のチャンクサイズを制御します。
+#
+# モード:
+#   "dynamic" - ファイルサイズに基づいて自動調整（デフォルト）
+#               64KB以下: 64KB
+#               1MB以下: 256KB
+#               1MB超: 1MB
+#   "manual"  - manual_chunk_size で指定した固定サイズを使用
+#
+# chunk_size_mode = "dynamic"
+# manual_chunk_size = 1048576  # 1MB (manual mode時のみ有効)
+
+# ------------------------------------------
+# Per-Stream パイプ割当 (kTLS splice)
+# ------------------------------------------
+#
+# splice転送で使用するパイプの割当方式を制御します。
+#
+# false（デフォルト）: スレッドローカルパイプを再利用
+#   - メモリ効率が良い
+#   - 通常の負荷に最適
+#
+# true: ストリーム毎に新規パイプを作成
+#   - 高並行性環境でのパイプ競合を回避
+#   - メモリ使用量が増加
+#   - 数千の同時接続がある場合に検討
+#
+# per_stream_pipe_enabled = false
+
+# ------------------------------------------
+# OpenFileCache設定（ファイルメタデータキャッシュ）
+# ------------------------------------------
+# 効果:
+#   - canonicalize、metadata、mime_guessのシステムコールをキャッシュ
+#   - 1リクエストあたり5〜6回のシステムコールを2回に削減（キャッシュヒット時）
+#   - パフォーマンス向上: 60〜67%のシステムコール削減
+# 
+# 注意事項:
+#   - ファイル変更の検出が最大60秒（デフォルト）遅延する可能性
+#   - シンボリックリンク変更の検出が遅延する可能性
+#   - 静的ファイル配信に最適（動的に変更されるファイルには不向き）
+#
+# ルーティングごとの設定:
+#   - 各ルーティングで`open_file_cache`セクションを指定可能
+#   - ルーティング設定がない場合は、このグローバル設定が使用される
+#
+# デフォルト: false（無効）
+# open_file_cache_enabled = true
+
+# OpenFileCacheの有効期間（秒、グローバルデフォルト）
+# キャッシュされたファイル情報が有効とみなされる期間
+# デフォルト: 60秒
+# open_file_cache_valid_duration_secs = 60
+
+# OpenFileCacheの最大エントリ数（グローバルデフォルト）
+# キャッシュに保持する最大ファイル情報数
+# デフォルト: 10000
+# open_file_cache_max_entries = 10000
+
 
 
 # ==========================================
@@ -508,216 +687,6 @@ level = "info"
 # seccomp_mode = "filter"
 
 
-# ==========================================
-# パフォーマンス設定
-# ==========================================
-[performance]
-
-# SO_REUSEPORT の振り分け方式
-# "kernel" = カーネルデフォルト（3元タプルハッシュ）
-# "cbpf"   = クライアントIPベースのCBPF（キャッシュ効率向上、Linux 4.6+必須）
-reuseport_balancing = "cbpf"
-
-# Huge Pages (Large OS Pages) の使用
-# true: mimallocでHuge Pages（2MB）を優先使用し、TLBミスを削減
-# false: 通常の4KBページを使用
-#
-# 利点:
-#   - TLB（Translation Lookaside Buffer）ミス削減
-#   - 大容量メモリ使用時（バッファプール拡大）のページフォルト減少
-#   - kTLS/splice時のカーネル連携で効果的（5-10%パフォーマンス向上）
-#
-# 要件（Linux）:
-#   sudo echo 128 > /proc/sys/vm/nr_hugepages
-#   または /etc/sysctl.conf に vm.nr_hugepages=128 を追加
-#
-# 注意:
-#   - コンテナ環境（Docker/K8s）では無効化される可能性あり
-#   - 利用不可の場合は自動的に通常ページにフォールバック
-# huge_pages_enabled = true
-
-# ------------------------------------------
-# Via ヘッダー設定 (RFC 7230 Section 5.7.1)
-# ------------------------------------------
-#
-# プロキシ経由のリクエスト/レスポンスにViaヘッダーを追加します。
-# Viaヘッダーはリクエストがどのプロキシを経由したかを示し、
-# ループ検出やデバッグに使用されます。
-#
-# 形式: Via: 1.1 <hostname>
-#
-# via_header_enabled = true
-# via_header_hostname = "veil"  # デフォルト: "veil"
-
-# ------------------------------------------
-# チャンクサイズ設定 (sendfile/splice)
-# ------------------------------------------
-#
-# kTLSのsendfile/splice転送時のチャンクサイズを制御します。
-#
-# モード:
-#   "dynamic" - ファイルサイズに基づいて自動調整（デフォルト）
-#               64KB以下: 64KB
-#               1MB以下: 256KB
-#               1MB超: 1MB
-#   "manual"  - manual_chunk_size で指定した固定サイズを使用
-#
-# chunk_size_mode = "dynamic"
-# manual_chunk_size = 1048576  # 1MB (manual mode時のみ有効)
-
-# ------------------------------------------
-# Per-Stream パイプ割当 (kTLS splice)
-# ------------------------------------------
-#
-# splice転送で使用するパイプの割当方式を制御します。
-#
-# false（デフォルト）: スレッドローカルパイプを再利用
-#   - メモリ効率が良い
-#   - 通常の負荷に最適
-#
-# true: ストリーム毎に新規パイプを作成
-#   - 高並行性環境でのパイプ競合を回避
-#   - メモリ使用量が増加
-#   - 数千の同時接続がある場合に検討
-#
-# per_stream_pipe_enabled = false
-
-# ------------------------------------------
-# OpenFileCache設定（ファイルメタデータキャッシュ）
-# ------------------------------------------
-# 効果:
-#   - canonicalize、metadata、mime_guessのシステムコールをキャッシュ
-#   - 1リクエストあたり5〜6回のシステムコールを2回に削減（キャッシュヒット時）
-#   - パフォーマンス向上: 60〜67%のシステムコール削減
-# 
-# 注意事項:
-#   - ファイル変更の検出が最大60秒（デフォルト）遅延する可能性
-#   - シンボリックリンク変更の検出が遅延する可能性
-#   - 静的ファイル配信に最適（動的に変更されるファイルには不向き）
-#
-# ルーティングごとの設定:
-#   - 各ルーティングで`open_file_cache`セクションを指定可能
-#   - ルーティング設定がない場合は、このグローバル設定が使用される
-#
-# デフォルト: false（無効）
-# open_file_cache_enabled = true
-
-# OpenFileCacheの有効期間（秒、グローバルデフォルト）
-# キャッシュされたファイル情報が有効とみなされる期間
-# デフォルト: 60秒
-# open_file_cache_valid_duration_secs = 60
-
-# OpenFileCacheの最大エントリ数（グローバルデフォルト）
-# キャッシュに保持する最大ファイル情報数
-# デフォルト: 10000
-# open_file_cache_max_entries = 10000
-
-
-# ==========================================
-# TLS設定
-# ==========================================
-[tls]
-
-cert_path = "/path/to/cert.pem"
-key_path = "/path/to/key.pem"
-
-# kTLS有効化（Linux 5.15+、feature flag必須）
-ktls_enabled = true
-
-# kTLS有効化失敗時にrustlsへフォールバックするかどうか
-# false: kTLS必須（失敗時は接続拒否）
-# true: kTLS失敗時はrustlsで継続（デフォルト）
-ktls_fallback_enabled = true
-
-# kTLS有効時にTCP_CORKを使用するかどうか
-#
-# TCP_CORKはkTLS設定中に小さなTCPパケットの送信を遅延し、
-# パケット結合により効率的なネットワーク転送を実現します。
-#
-# true: TCP_CORK有効（デフォルト、推奨）
-# false: TCP_CORK無効（特定の低遅延要件がある場合）
-# tcp_cork_enabled = true
-
-# 利用を許可する TLS 暗号スイート（nginx の ssl_ciphers 相当、F-50）
-#
-# 記載順 = サーバ優先度順（rustls はサーバ選好でネゴシエートする）。
-# 未指定（空・コメントアウト）の場合は rustls 既定の全スイートを使用。
-# 不正なスイート名は起動時にエラーとなる。
-#
-# 指定可能な名前（aws-lc-rs プロバイダ）:
-#   TLS 1.3:
-#     TLS13_AES_256_GCM_SHA384
-#     TLS13_AES_128_GCM_SHA256
-#     TLS13_CHACHA20_POLY1305_SHA256
-#   TLS 1.2:
-#     TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
-#     TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
-#     TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
-#     TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
-#     TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
-#     TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
-#
-# 注意:
-# - kTLS オフロードは AES-GCM 系のみ対応。kTLS 有効時に CHACHA20 系を含めると、
-#   そのスイートでネゴシエートした接続は kTLS へオフロードされず rustls で処理される
-#   （ktls_fallback_enabled = false の場合は接続拒否）。
-# - 本設定は TLS(TCP) リスナー（HTTP/1.1 / HTTP/2）に適用される。
-#   HTTP/3 (QUIC) は quiche が TLS を管理するため対象外。
-# cipher_suites = [
-#     "TLS13_AES_256_GCM_SHA384",
-#     "TLS13_AES_128_GCM_SHA256",
-#     "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
-#     "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
-#     "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
-#     "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
-# ]
-
-# 証明書の0ダウンタイム自動リロード（F-03）
-# auto_reload = true で証明書/秘密鍵ファイルの mtime 変化を検知し、
-# 新しいハンドシェイクのみ新証明書を使用する（既存接続は影響なし）。
-# SIGHUP でも即時リロードされる。
-# 注意: Landlock サンドボックス有効時は証明書ディレクトリへの read を
-#       許可するか、サンドボックスを無効化する必要がある。
-# auto_reload = false
-# reload_interval_secs = 60
-
-
-# ==========================================
-# 管理 API（F-20: キャッシュ Purge）
-# ==========================================
-#
-# キャッシュの無効化（Purge）を行う管理エンドポイント。
-# secret は Authorization ヘッダー（Bearer <secret> または生の値）で検証する。
-#
-# 使用例:
-#   PURGE /path/to/page HTTP/1.1            （パスをプレフィックス Purge）
-#   POST  /__admin/cache/purge?prefix=/api/  （プレフィックス Purge）
-#   POST  /__admin/cache/purge?pattern=/static/*.css （glob Purge）
-#   POST  /__admin/cache/purge?all=true      （全 Purge）
-#   いずれも Authorization: Bearer <secret> が必要。レスポンス: {"purged": N}
-#
-[admin]
-# enabled = true
-# path_prefix = "/__admin"
-# secret = "changeme"
-# # アクセスを許可するIPアドレス/CIDR（空の場合は全IPを許可）
-# allowed_ips = ["127.0.0.1", "::1", "10.0.0.0/8"]
-
-
-# ==========================================
-# OpenTelemetry（F-10 Phase 1: OTLP/HTTP メトリクス）
-# ==========================================
-#
-# opentelemetry feature 有効時のみ動作。専用の std スレッドで
-# Prometheus レジストリの値を OTLP/HTTP (JSON) として
-# <endpoint>/v1/metrics へ定期送信する（データプレーンは tokio-free）。
-#
-[opentelemetry]
-# enabled = false
-# endpoint = "http://localhost:4318"
-# service_name = "veil-proxy"
-# batch_interval_secs = 30
-
 
 # ==========================================
 # バッファプール設定（メモリ最適化）
@@ -944,27 +913,162 @@ ktls_fallback_enabled = true
 # gso_gro_enabled = true
 
 
+
 # ==========================================
-# gRPC (--features 'grpc')
+# 管理 API（F-20: キャッシュ Purge）
 # ==========================================
 #
-# gRPC-over-HTTP/2 のサポートはビルド時の feature フラグで有効化します。
-# gRPC 専用の設定セクション（[grpc]）は存在しません。
-# gRPC / gRPC-Web の変換はリクエストの Content-Type
-# （application/grpc / application/grpc-web）から自動判定されます。
+# キャッシュの無効化（Purge）を行う管理エンドポイント。
+# secret は Authorization ヘッダー（Bearer <secret> または生の値）で検証する。
 #
-# ビルド方法:
-#   gRPC基本:     cargo build --features grpc
-#   gRPC-Web:     cargo build --features grpc-web
-#   gRPC全機能:   cargo build --features grpc-full
+# 使用例:
+#   PURGE /path/to/page HTTP/1.1            （パスをプレフィックス Purge）
+#   POST  /__admin/cache/purge?prefix=/api/  （プレフィックス Purge）
+#   POST  /__admin/cache/purge?pattern=/static/*.css （glob Purge）
+#   POST  /__admin/cache/purge?all=true      （全 Purge）
+#   いずれも Authorization: Bearer <secret> が必要。レスポンス: {"purged": N}
 #
-# gRPC バックエンドへの接続はルートの use_h2c = true で
-# HTTP/2 Cleartext（H2C）を使用します:
+[admin]
+# enabled = true
+# path_prefix = "/__admin"
+# secret = "changeme"
+# # アクセスを許可するIPアドレス/CIDR（空の場合は全IPを許可）
+# allowed_ips = ["127.0.0.1", "::1", "10.0.0.0/8"]
+
+
+
+# ==========================================
+# Prometheusメトリクス
+# ==========================================
+[prometheus]
+# Prometheusスクレイピング用のメトリクスエンドポイントを提供します。（デフォルト: false）
+# enabled = true
 #
-# [route.action]
-# type = "Proxy"
-# url = "http://grpc-backend:50051"
-# use_h2c = true  # gRPC は H2C が必要
+# 利用可能なメトリクス:
+#   veil_proxy_http_requests_total          リクエスト総数（method, status, hostラベル付き）
+#   veil_proxy_http_request_duration_seconds リクエスト処理時間のヒストグラム
+#   veil_proxy_http_request_size_bytes      リクエストボディサイズ
+#   veil_proxy_http_response_size_bytes     レスポンスボディサイズ
+#   veil_proxy_http_active_connections      アクティブな接続数
+#   veil_proxy_http_upstream_health         アップストリームの健康状態
+#
+# # メトリクスエンドポイントのパス（デフォルト: "/__metrics"）
+# path = "/metrics"
+#
+# # アクセスを許可するIPアドレス/CIDR（空の場合は全てのIPを許可）
+# # 例: 内部ネットワークとlocalhostのみ許可
+# allowed_ips = [
+#   "127.0.0.1",
+#   "::1",
+#   "10.0.0.0/8",
+#   "172.16.0.0/12",
+#   "192.168.0.0/16"
+# ]
+
+
+
+# ==========================================
+# OpenTelemetry（F-10 Phase 1: OTLP/HTTP メトリクス）
+# ==========================================
+#
+# opentelemetry feature 有効時のみ動作。専用の std スレッドで
+# Prometheus レジストリの値を OTLP/HTTP (JSON) として
+# <endpoint>/v1/metrics へ定期送信する（データプレーンは tokio-free）。
+#
+[opentelemetry]
+# enabled = false
+# endpoint = "http://localhost:4318"
+# service_name = "veil-proxy"
+# batch_interval_secs = 30
+
+
+
+# ==========================================
+# WASM拡張設定（Proxy-WASM互換）
+# ==========================================
+#
+# Proxy-WASM ABI互換のWASMモジュールを使用して
+# リクエスト/レスポンス処理をカスタマイズできます。
+#
+# 注意: --features wasm でビルドする必要があります
+#
+[wasm]
+# WASM拡張を有効化（デフォルト: false）
+# enabled = true
+
+# デフォルト設定
+# [wasm.defaults]
+# 最大実行時間（ミリ秒）
+# デフォルト: 100
+# max_execution_time_ms = 100
+
+# Poolingアロケータ設定
+# [wasm.defaults.pooling]
+# メモリプール総数
+# デフォルト: 128
+# total_memories = 128
+# テーブルプール総数
+# デフォルト: 128
+# total_tables = 128
+# インスタンスごとの最大メモリサイズ（バイト）
+# デフォルト: 10485760 (10MB)
+# max_memory_size = 10485760
+#
+# # モジュール定義
+# [[wasm.modules]]
+# name = "auth_filter"         # モジュール名（一意識別子）
+# path = "/etc/veil/wasm/auth.wasm"  # .wasm または .cwasm ファイルパス
+# configuration = '{"key": "value"}'  # プラグイン設定（JSON文字列）
+#
+#   # ケーパビリティ設定（モジュールが使用可能なAPIを制限）
+#   [wasm.modules.capabilities]
+#   # 基本機能
+#   allow_logging = true
+#   
+#   # HTTP外部呼び出し
+#   allow_http_calls = true
+#   allowed_upstreams = []  # 空の場合は全て許可（allow_http_calls=true時）
+#   
+#   # リクエストヘッダー操作（allow_header_manipulationの代替）
+#   allow_request_headers_read = true
+#   allow_request_headers_write = true
+#   
+#   # レスポンスヘッダー操作（allow_header_manipulationの代替）
+#   allow_response_headers_read = true
+#   allow_response_headers_write = true
+#   
+#   # リクエストボディ操作（allow_body_manipulationの代替、必要に応じて）
+#   # allow_request_body_read = false
+#   # allow_request_body_write = false
+#   
+#   # レスポンスボディ操作（allow_body_manipulationの代替、必要に応じて）
+#   # allow_response_body_read = false
+#   # allow_response_body_write = false
+#
+#   # メトリクス操作（proxy_define_metric 等）
+#   # allow_metrics = false
+#
+#   # 共有データアクセス（proxy_get/set_shared_data）
+#   # allow_shared_data = false
+#
+#   # 共有データの最大サイズ（バイト、allow_shared_data = true 時）
+#   # max_shared_data_size = 1048576  # 1MB
+#
+#   # ローカルレスポンス送信（proxy_send_local_response。認証フィルタ等で使用）
+#   # allow_send_local_response = false
+#
+#   # 同時 HTTP コール数の上限（allow_http_calls = true 時）
+#   # max_http_calls = 10
+#
+#   # 読み取りを許可するプロパティパスのパターン（空 = 全許可）
+#   # allowed_properties = ["request.path", "request.method"]
+#
+#   # proxy_set_property によるカスタムプロパティ書き込みを許可
+#   # allow_property_write = false
+#
+#   # 注意: 以下のcapabilityは存在しません:
+#   # - allow_grpc_calls (現在未実装)
+
 
 
 # ==========================================
@@ -1113,119 +1217,7 @@ ktls_fallback_enabled = true
 # # 注意: 本番環境では false を推奨
 # tls_insecure = false
 
-# ==========================================
-# WASM拡張設定（Proxy-WASM互換）
-# ==========================================
-#
-# Proxy-WASM ABI互換のWASMモジュールを使用して
-# リクエスト/レスポンス処理をカスタマイズできます。
-#
-# 注意: --features wasm でビルドする必要があります
-#
-[wasm]
-# WASM拡張を有効化（デフォルト: false）
-# enabled = true
 
-# デフォルト設定
-# [wasm.defaults]
-# 最大実行時間（ミリ秒）
-# デフォルト: 100
-# max_execution_time_ms = 100
-
-# Poolingアロケータ設定
-# [wasm.defaults.pooling]
-# メモリプール総数
-# デフォルト: 128
-# total_memories = 128
-# テーブルプール総数
-# デフォルト: 128
-# total_tables = 128
-# インスタンスごとの最大メモリサイズ（バイト）
-# デフォルト: 10485760 (10MB)
-# max_memory_size = 10485760
-#
-# # モジュール定義
-# [[wasm.modules]]
-# name = "auth_filter"         # モジュール名（一意識別子）
-# path = "/etc/veil/wasm/auth.wasm"  # .wasm または .cwasm ファイルパス
-# configuration = '{"key": "value"}'  # プラグイン設定（JSON文字列）
-#
-#   # ケーパビリティ設定（モジュールが使用可能なAPIを制限）
-#   [wasm.modules.capabilities]
-#   # 基本機能
-#   allow_logging = true
-#   
-#   # HTTP外部呼び出し
-#   allow_http_calls = true
-#   allowed_upstreams = []  # 空の場合は全て許可（allow_http_calls=true時）
-#   
-#   # リクエストヘッダー操作（allow_header_manipulationの代替）
-#   allow_request_headers_read = true
-#   allow_request_headers_write = true
-#   
-#   # レスポンスヘッダー操作（allow_header_manipulationの代替）
-#   allow_response_headers_read = true
-#   allow_response_headers_write = true
-#   
-#   # リクエストボディ操作（allow_body_manipulationの代替、必要に応じて）
-#   # allow_request_body_read = false
-#   # allow_request_body_write = false
-#   
-#   # レスポンスボディ操作（allow_body_manipulationの代替、必要に応じて）
-#   # allow_response_body_read = false
-#   # allow_response_body_write = false
-#
-#   # メトリクス操作（proxy_define_metric 等）
-#   # allow_metrics = false
-#
-#   # 共有データアクセス（proxy_get/set_shared_data）
-#   # allow_shared_data = false
-#
-#   # 共有データの最大サイズ（バイト、allow_shared_data = true 時）
-#   # max_shared_data_size = 1048576  # 1MB
-#
-#   # ローカルレスポンス送信（proxy_send_local_response。認証フィルタ等で使用）
-#   # allow_send_local_response = false
-#
-#   # 同時 HTTP コール数の上限（allow_http_calls = true 時）
-#   # max_http_calls = 10
-#
-#   # 読み取りを許可するプロパティパスのパターン（空 = 全許可）
-#   # allowed_properties = ["request.path", "request.method"]
-#
-#   # proxy_set_property によるカスタムプロパティ書き込みを許可
-#   # allow_property_write = false
-#
-#   # 注意: 以下のcapabilityは存在しません:
-#   # - allow_grpc_calls (現在未実装)
-
-# ==========================================
-# Prometheusメトリクス
-# ==========================================
-[prometheus]
-# Prometheusスクレイピング用のメトリクスエンドポイントを提供します。（デフォルト: false）
-# enabled = true
-#
-# 利用可能なメトリクス:
-#   veil_proxy_http_requests_total          リクエスト総数（method, status, hostラベル付き）
-#   veil_proxy_http_request_duration_seconds リクエスト処理時間のヒストグラム
-#   veil_proxy_http_request_size_bytes      リクエストボディサイズ
-#   veil_proxy_http_response_size_bytes     レスポンスボディサイズ
-#   veil_proxy_http_active_connections      アクティブな接続数
-#   veil_proxy_http_upstream_health         アップストリームの健康状態
-#
-# # メトリクスエンドポイントのパス（デフォルト: "/__metrics"）
-# path = "/metrics"
-#
-# # アクセスを許可するIPアドレス/CIDR（空の場合は全てのIPを許可）
-# # 例: 内部ネットワークとlocalhostのみ許可
-# allowed_ips = [
-#   "127.0.0.1",
-#   "::1",
-#   "10.0.0.0/8",
-#   "172.16.0.0/12",
-#   "192.168.0.0/16"
-# ]
 
 # ==========================================
 # ルーティング定義
@@ -1838,6 +1830,28 @@ ktls_fallback_enabled = true
 #
 #   [route.security]
 #   rate_limit_requests_per_min = 60
+
+# ==========================================
+# gRPC (--features 'grpc')
+# ==========================================
+#
+# gRPC-over-HTTP/2 のサポートはビルド時の feature フラグで有効化します。
+# gRPC 専用の設定セクション（[grpc]）は存在しません。
+# gRPC / gRPC-Web の変換はリクエストの Content-Type
+# （application/grpc / application/grpc-web）から自動判定されます。
+#
+# ビルド方法:
+#   gRPC基本:     cargo build --features grpc
+#   gRPC-Web:     cargo build --features grpc-web
+#   gRPC全機能:   cargo build --features grpc-full
+#
+# gRPC バックエンドへの接続はルートの use_h2c = true で
+# HTTP/2 Cleartext（H2C）を使用します:
+#
+# [route.action]
+# type = "Proxy"
+# url = "http://grpc-backend:50051"
+# use_h2c = true  # gRPC は H2C が必要
 
 # ==========================================
 # L4 ストリームプロキシ設定（F-18）
