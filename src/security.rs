@@ -158,8 +158,10 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     89,  // readlink (canonicalize() で使用)
     257, // openat
     262, // newfstatat
+    269, // faccessat (新しめの libc がファイルアクセス確認で使用)
     275, // splice (kTLS ゼロコピー転送)
     332, // statx (非同期ファイル I/O offload で使用)
+    439, // faccessat2 (glibc 2.33+/musl のファイル存在・権限確認。未許可だと静的配信が 404 になる)
     // ============================================
     // DNS名前解決 (getaddrinfo)
     // ============================================
@@ -306,6 +308,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     79,  // fstatat
     80,  // fstat
     291, // statx (非同期ファイル I/O offload で使用)
+    439, // faccessat2 (glibc 2.33+/musl のファイル存在・権限確認。未許可だと静的配信が 404 になる)
     199, // socketpair (NSS内部通信)
     // ============================================
     // ネットワーク
@@ -2392,6 +2395,26 @@ mod tests {
             assert!(ALLOWED_SYSCALLS.contains(&42)); // connect
             assert!(ALLOWED_SYSCALLS.contains(&49)); // bind
             assert!(ALLOWED_SYSCALLS.contains(&50)); // listen
+        }
+    }
+
+    #[test]
+    fn test_allowed_syscalls_contains_file_access() {
+        // faccessat2 (439) は glibc 2.33+/musl のファイル存在・権限確認で使用される。
+        // 未許可だと seccomp が EPERM を返し、静的ファイル配信が 404 になる回帰を防ぐ。
+        assert!(
+            ALLOWED_SYSCALLS.contains(&439),
+            "faccessat2 (439) が許可リストに無いと静的配信が 404 になる"
+        );
+        // 従来の access/faccessat 系も許可されていること
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert!(ALLOWED_SYSCALLS.contains(&21)); // access
+            assert!(ALLOWED_SYSCALLS.contains(&269)); // faccessat
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert!(ALLOWED_SYSCALLS.contains(&48)); // faccessat
         }
     }
 
