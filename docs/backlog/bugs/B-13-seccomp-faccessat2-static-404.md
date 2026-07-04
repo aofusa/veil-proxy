@@ -36,12 +36,21 @@
 - 外部（Docker）seccomp プロファイル `docker/assets/security/seccomp.json` にも `faccessat2`
   が無く、二重に拒否していた。
 
+### musl 版の追加要因（open(2)）
+
+`faccessat2` 追加後も **musl 版コンテナ**は 404 のままだった。musl バイナリを host で
+`strace` した結果、musl libc の `canonicalize`／ファイルオープンは `openat`(257) ではなく
+**レガシー `open`(2)** を発行しており（`open("/var/www/index.html", O_RDONLY|O_LARGEFILE|O_CLOEXEC) = -1 EPERM`）、
+許可リストに `open`(2) が無いため拒否されていた（glibc は `openat` を使うため影響なし）。
+
 ## 改修内容
 
-- `src/security.rs`: `ALLOWED_SYSCALLS` に `faccessat2`(439) を x86_64 / aarch64 両方へ追加。
-  x86_64 には `faccessat`(269) も追加。
-- `docker/assets/security/seccomp.json`: `faccessat` / `faccessat2` を許可リストへ追加。
-- 回帰テスト `security::tests::test_allowed_syscalls_contains_file_access` を追加。
+- `src/security.rs`: `ALLOWED_SYSCALLS`（x86_64）に `open`(2) を追加（musl 対応）。
+  `faccessat2`(439) を x86_64 / aarch64 両方へ、`faccessat`(269) を x86_64 へ追加。
+- `docker/assets/security/seccomp.json`: `faccessat` / `faccessat2` を許可リストへ追加
+  （`open` は既存）。
+- 回帰テスト `security::tests::test_allowed_syscalls_contains_file_access` に
+  `open`(2) / `openat`(257) / `faccessat2`(439) の存在確認を追加。
 
 ## 受け入れ条件
 
