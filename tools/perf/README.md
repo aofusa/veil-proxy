@@ -12,11 +12,12 @@
 
 | パス | 役割 |
 |------|------|
-| `run_perf.sh` | 計測オーケストレータ（nginx → veil glibc/musl × 各バリアント） |
-| `gen_configs.sh` | 計測用 `config.toml` バリアントを `configs/` に生成 |
+| `run_perf.sh` | 計測オーケストレータ（nginx → veil glibc/musl × 全バリアント × 反復）。完了後に集計も実行 |
+| `gen_configs.sh` | 計測用 `config.toml` バリアントを **完全直交 2⁴=16** で `configs/` に生成 |
+| `analyze_results.sh` | 反復生データ（`results_raw.tsv`）を **median±stdev** に集計し Markdown を出力 |
 | `configs/*.toml` | 生成済みバリアント（`gen_configs.sh` で再生成可能） |
 | `nginx/nginx.conf` | 比較対象 nginx の設定（`access_log off` で公平化） |
-| `results/` | 計測結果（`results.tsv` / `logs/` は `.gitignore` 対象） |
+| `results/` | 計測結果（`results_raw.tsv` / `results_summary.md` / `logs/` は `.gitignore` 対象） |
 
 計測に必要な静的アセットは **`docker/assets/`** を参照します（このディレクトリには複製しません）。
 
@@ -53,48 +54,71 @@ bash tools/perf/run_perf.sh
 
 リポジトリのどこから実行しても、スクリプトが自身の位置からリポジトリルートと `docker/assets/` を解決します。
 
-完了すると結果テーブルが標準出力に表示され、`results/results.tsv` に保存されます。個別の負荷ツールログと CPU/メモリのサンプルは `results/logs/` 以下に残ります。
+各構成は**ウォームアップ後に `ITERATIONS`（既定 3）回**計測します。生データは `results/results_raw.tsv`
+（1 反復 1 行）に、median±stdev 集計は `results/results_summary.md` に保存され、後者が標準出力にも表示されます。
+個別の負荷ツールログと CPU/メモリサンプルは `results/logs/` に残ります。
 
-### 負荷パラメータ（`run_perf.sh` 冒頭で調整可能）
+集計だけをやり直す場合:
+
+```sh
+bash tools/perf/analyze_results.sh tools/perf/results/results_raw.tsv
+```
+
+### 負荷パラメータ（環境変数で上書き可）
 
 | 変数 | 既定 | 意味 |
 |------|------|------|
-| `WRK_ARGS` | `-t4 -c100 -d15s --timeout 5s --latency` | HTTP/1.1（wrk）: 4 スレッド・100 接続・15 秒 |
+| `ITERATIONS` | `3` | 各 (config, proto) の反復回数（median±stdev 集計用） |
+| `WRK_ARGS` | `-t4 -c100 -d10s --timeout 5s --latency` | HTTP/1.1（wrk）: 4 スレッド・100 接続・10 秒 |
 | `H2_ARGS` | `-n 30000 -c100 -m10` | HTTP/2（h2load）: 30000 リクエスト・100 接続・多重化 10 |
+
+> 全 16 構成 × glibc/musl × 反復 のフルスイートは時間がかかります。素早く確認したい場合は
+> `ITERATIONS=1` や、`configs/` を一部だけ残して実行してください。
 
 ---
 
 ## 計測バリアント（`gen_configs.sh`）
 
-いずれも同一の静的ファイル（`/var/www/index.html`）を `File` アクションで配信し、`http2 / ktls / reuseport balancing / open_file_cache` の組み合わせのみを変えます。アクセスログは `logging.level = "warn"` で抑止し、nginx の `access_log off` と条件を揃えます。
+いずれも同一の静的ファイル（`/var/www/index.html`）を `File` アクションで配信し、4 因子
+**`http2 × ktls × reuseport_balancing(cbpf/kernel) × open_file_cache`** を **完全直交（2⁴=16 構成）**
+で組み合わせます。アクセスログは `logging.level = "warn"` で抑止し、nginx の `access_log off` と条件を揃えます。
 
-| 名前 | http2 | ktls | reuseport_balancing | open_file_cache |
-|------|:-----:|:----:|:-------------------:|:---------------:|
-| `base` | ✓ | ✓ | cbpf | – |
-| `no_ktls` | ✓ | – | cbpf | – |
-| `no_http2` | – | ✓ | cbpf | – |
-| `kernel_lb` | ✓ | ✓ | kernel | – |
-| `ofc` | ✓ | ✓ | cbpf | ✓ |
-| `no_ktls_ofc` | –→✓ | – | cbpf | ✓ |
+バリアント名は `h2_<0|1>_ktls_<0|1>_lb_<cbpf|kernel>_ofc_<0|1>`。`run_perf.sh` は名前の `h2_1` から
+HTTP/2 負荷（h2load）の要否を判定します（`h2_0_*` は wrk のみ）。
+
+主な着目点（[docs/artifacts/perf_benchmark/results_summary.md](../../docs/artifacts/perf_benchmark/results_summary.md) 参照）:
+
+- **最良構成 `h2_1_ktls_0_lb_kernel_ofc_1`**（HTTP/2 有効・kTLS 無効・kernel LB・OFC 有効）で
+  **veil は nginx を上回る**（例: musl HTTP/1.1 +61% / HTTP/2 +11%、glibc HTTP/1.1 +46%）。
+- コンテナ（veth）では **kTLS 有効が不利**（`ktls_1` は軒並み低下）。
+- 単一クライアント IP 負荷では **`cbpf` が 1 ワーカーに集約**して 4 コアを使い切れず、`kernel` 分散が有利。
+  ただし **`kernel` + HTTP/2 + `ktls_1` は激減**（接続偏り、166 req/s 級）→ HTTP/2 は kTLS 無効を推奨。
 
 ---
 
-## 出力フォーマット（`results/results.tsv`）
+## 出力フォーマット
 
-タブ区切りで 1 計測 1 行。列は以下のとおり。
+### 生データ `results/results_raw.tsv`（1 反復 1 行）
 
 ```
-target  config  proto   req_per_sec  transfer  lat_avg  lat_p99  non2xx  cpu_pct  mem_mb
+target  config  proto  iteration  req_per_sec  transfer  lat_avg  lat_p99  non2xx  cpu_pct  mem_mb
 ```
 
 - `target`: `nginx` / `veil_glibc` / `veil_musl`
 - `config`: バリアント名（nginx は `base` 固定）
 - `proto`: `http1.1`（wrk）/ `http2`（h2load）
-- `cpu_pct` / `mem_mb`: 負荷中に `docker stats` を 3 回サンプルした平均
+- `iteration`: 反復番号（1..`ITERATIONS`）
+- `cpu_pct` / `mem_mb`: 各反復の負荷中に `docker stats` を 3 回サンプルした平均
+
+### 集計 `results/results_summary.md`（`analyze_results.sh`）
+
+`(target, config, proto)` 単位で **Req/s の median±stdev**、レイテンシ/CPU/メモリの median、
+エラー合計を Markdown 表にまとめます。
 
 ---
 
 ## 注意
 
-- 4 コア程度のホストや co-tenant 負荷がある環境では計測が揺れます。比較は同一実行内の相対値で評価してください（[docs/artifacts/](../../docs/artifacts/) の負荷フレーキー記録参照）。
-- `configs/_debug*.toml` / `results/logs/` / `results/results.tsv` は `.gitignore` 対象です。
+- 4 コア程度のホストや co-tenant 負荷がある環境では計測が揺れます。**quiet host（loadavg 低）** での
+  計測と、同一実行内の相対比較を推奨します（[docs/artifacts/](../../docs/artifacts/) の負荷フレーキー記録参照）。
+- `configs/_debug*.toml` / `results/logs/` / `results/results_raw.tsv` / `results/results_summary.md` は `.gitignore` 対象です。

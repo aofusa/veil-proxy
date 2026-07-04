@@ -1,4 +1,6 @@
 results/logs/
 results/results.tsv
+results/results_raw.tsv
+results/results_summary.md
 results/run.log
 configs/_debug*.toml

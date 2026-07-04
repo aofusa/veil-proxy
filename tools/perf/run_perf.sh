@@ -13,16 +13,21 @@ mkdir -p "$LOGDIR"
 WRK_IMG=williamyeh/wrk:latest
 H2_IMG=local/h2load:latest
 
-# 負荷パラメータ
-WRK_ARGS="-t4 -c100 -d15s --timeout 5s --latency"
-H2_ARGS="-n 30000 -c100 -m10"
+# 負荷パラメータ（環境変数で上書き可）
+WRK_ARGS="${WRK_ARGS:--t4 -c100 -d10s --timeout 5s --latency}"
+H2_ARGS="${H2_ARGS:--n 30000 -c100 -m10}"
+ITERATIONS="${ITERATIONS:-3}"      # 各 (config, proto) の反復回数（median±stdev 集計用）
+
+# 計測結果は raw（1 反復 1 行）で保存し、analyze_results.sh で median±stdev に集計する。
+RESULTS_RAW="$HERE/results/results_raw.tsv"
+SUMMARY="$HERE/results/results_summary.md"
 
 docker network inspect $NET >/dev/null 2>&1 || docker network create $NET >/dev/null
 
-echo -e "target\tconfig\tproto\treq_per_sec\ttransfer\tlat_avg\tlat_p99\tnon2xx\tcpu_pct\tmem_mb" > "$RESULTS"
+echo -e "target\tconfig\tproto\titeration\treq_per_sec\ttransfer\tlat_avg\tlat_p99\tnon2xx\tcpu_pct\tmem_mb" > "$RESULTS_RAW"
 
-emit() { # target config proto reqps transfer latavg latp99 non2xx cpu mem
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >> "$RESULTS"
+emit() { # target config proto iteration reqps transfer latavg latp99 non2xx cpu mem
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >> "$RESULTS_RAW"
 }
 
 sample_stats() { # container -> "cpu_pct mem_mb" averaged over 3 samples during load
@@ -67,25 +72,34 @@ parse_h2load() { # logfile -> "reqps throughput latmean non2xx"
 }
 
 run_load() { # target_label config_label container has_http2
-    local label="$1" cfg="$2" c="$3" h2="$4"
-    # HTTP/1.1 (wrk)
-    ( sleep 4; sample_stats "$c" > "$LOGDIR/${label}_${cfg}_wrk.stats" ) &
-    docker run --rm --network $NET $WRK_IMG $WRK_ARGS "https://$c:443/" \
-        > "$LOGDIR/${label}_${cfg}_wrk.log" 2>&1
-    wait
-    read reqps transfer latavg latp99 non2xx < <(parse_wrk "$LOGDIR/${label}_${cfg}_wrk.log")
-    read cpu mem < "$LOGDIR/${label}_${cfg}_wrk.stats" 2>/dev/null || { cpu=NA; mem=NA; }
-    emit "$label" "$cfg" "http1.1" "$reqps" "$transfer" "$latavg" "$latp99" "$non2xx" "$cpu" "$mem"
+    local label="$1" cfg="$2" c="$3" h2="$4" iter reqps transfer latavg latp99 non2xx cpu mem tput latmean
 
-    # HTTP/2 (h2load)
-    if [ "$h2" = "1" ]; then
-        ( sleep 1; sample_stats "$c" > "$LOGDIR/${label}_${cfg}_h2.stats" ) &
-        docker run --rm --network $NET --entrypoint h2load $H2_IMG $H2_ARGS "https://$c:443/" \
-            > "$LOGDIR/${label}_${cfg}_h2.log" 2>&1
+    # ウォームアップ（JIT/ページキャッシュ/接続確立コストを計測外にする）
+    docker run --rm --network $NET $WRK_IMG -t2 -c10 -d2s "https://$c:443/" >/dev/null 2>&1
+
+    # HTTP/1.1 (wrk) × ITERATIONS
+    for iter in $(seq 1 "$ITERATIONS"); do
+        ( sleep 2; sample_stats "$c" > "$LOGDIR/${label}_${cfg}_wrk_${iter}.stats" ) &
+        docker run --rm --network $NET $WRK_IMG $WRK_ARGS "https://$c:443/" \
+            > "$LOGDIR/${label}_${cfg}_wrk_${iter}.log" 2>&1
         wait
-        read reqps tput latmean non2xx < <(parse_h2load "$LOGDIR/${label}_${cfg}_h2.log")
-        read cpu mem < "$LOGDIR/${label}_${cfg}_h2.stats" 2>/dev/null || { cpu=NA; mem=NA; }
-        emit "$label" "$cfg" "http2" "$reqps" "$tput" "$latmean" "NA" "$non2xx" "$cpu" "$mem"
+        read reqps transfer latavg latp99 non2xx < <(parse_wrk "$LOGDIR/${label}_${cfg}_wrk_${iter}.log")
+        read cpu mem < "$LOGDIR/${label}_${cfg}_wrk_${iter}.stats" 2>/dev/null || { cpu=NA; mem=NA; }
+        emit "$label" "$cfg" "http1.1" "$iter" "$reqps" "$transfer" "$latavg" "$latp99" "$non2xx" "$cpu" "$mem"
+    done
+
+    # HTTP/2 (h2load) × ITERATIONS
+    if [ "$h2" = "1" ]; then
+        docker run --rm --network $NET --entrypoint h2load $H2_IMG -n 1000 -c 10 "https://$c:443/" >/dev/null 2>&1
+        for iter in $(seq 1 "$ITERATIONS"); do
+            ( sleep 1; sample_stats "$c" > "$LOGDIR/${label}_${cfg}_h2_${iter}.stats" ) &
+            docker run --rm --network $NET --entrypoint h2load $H2_IMG $H2_ARGS "https://$c:443/" \
+                > "$LOGDIR/${label}_${cfg}_h2_${iter}.log" 2>&1
+            wait
+            read reqps tput latmean non2xx < <(parse_h2load "$LOGDIR/${label}_${cfg}_h2_${iter}.log")
+            read cpu mem < "$LOGDIR/${label}_${cfg}_h2_${iter}.stats" 2>/dev/null || { cpu=NA; mem=NA; }
+            emit "$label" "$cfg" "http2" "$iter" "$reqps" "$tput" "$latmean" "NA" "$non2xx" "$cpu" "$mem"
+        done
     fi
 }
 
@@ -135,17 +149,24 @@ for build in glibc musl; do
     img="veil:$build"
     for cfgfile in "$HERE"/configs/*.toml; do
         name=$(basename "$cfgfile" .toml)
-        h2=1; [ "$name" = "no_http2" ] && h2=0
+        # 名前 h2_1_* は HTTP/2 有効 → h2load も実施。h2_0_* は HTTP/1.1 のみ。
+        case "$name" in h2_1_*) h2=1 ;; *) h2=0 ;; esac
         echo "### veil:$build / $name"
         start_veil "$img" "$cfgfile" veil-container
         if wait_ready veil-container; then
             run_load "veil_$build" "$name" veil-container "$h2"
         else
-            emit "veil_$build" "$name" "http1.1" NA NA NA NA NA NA NA
+            emit "veil_$build" "$name" "http1.1" 1 NA NA NA NA NA NA NA
         fi
         docker rm -f veil-container >/dev/null 2>&1
     done
 done
 
-echo "=== DONE. results at $RESULTS ==="
-column -t -s $'\t' "$RESULTS"
+echo "=== 生データ: $RESULTS_RAW（${ITERATIONS} 反復/構成）==="
+# median±stdev へ集計してサマリ Markdown を生成
+if bash "$HERE/analyze_results.sh" "$RESULTS_RAW" > "$SUMMARY" 2>/dev/null; then
+    echo "=== 集計: $SUMMARY ==="
+    cat "$SUMMARY"
+else
+    echo "!! 集計に失敗（生データは $RESULTS_RAW 参照）" >&2
+fi

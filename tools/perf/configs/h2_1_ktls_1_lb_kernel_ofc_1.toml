@@ -1,0 +1,45 @@
+# 自動生成: Veil パフォーマンス計測用バリアント
+# http2=True ktls=True lb=kernel open_file_cache=True
+[server]
+listen = "0.0.0.0:443"
+http = "0.0.0.0:80"
+http2_enabled = true
+threads = 0
+
+[logging]
+# アクセスログ (INFO) はホットパスのオーバーヘッドになるため計測中は抑止（nginx も access_log off で公平化）
+level = "warn"
+
+[security]
+allow_security_failures = false
+drop_privileges_user = "nonroot"
+drop_privileges_group = "nonroot"
+enable_seccomp = true
+enable_landlock = true
+enable_sandbox = false
+seccomp_mode = "filter"
+landlock_read_paths = ["/var/www", "/var/cache/veil", "/var/tmp/veil"]
+landlock_write_paths = ["/var/cache/veil", "/var/tmp/veil"]
+
+[performance]
+huge_pages_enabled = false
+reuseport_balancing = "kernel"
+
+[tls]
+cert_path = "/etc/veil/ssl/cert.pem"
+key_path = "/etc/veil/ssl/key.pem"
+ktls_enabled = true
+ktls_fallback_enabled = true
+
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "/var/www/"
+[route.security]
+allowed_methods = ["HEAD", "GET"]
+[route.open_file_cache]
+enabled = true
+valid_duration_secs = 60
+max_entries = 10000
