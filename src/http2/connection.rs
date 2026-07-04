@@ -211,7 +211,7 @@ where
         if target_window > default_window {
             let increment = (target_window - default_window) as u32;
             let frame = self.frame_encoder.encode_window_update(0, increment);
-            self.write_all(&frame).await?;
+            self.write_all(frame).await?;
         }
 
         Ok(())
@@ -250,7 +250,7 @@ where
             .collect();
 
         let frame = self.frame_encoder.encode_settings(&settings, false);
-        self.write_all(&frame).await?;
+        self.write_all(frame).await?;
         self.settings_ack_pending = true;
 
         Ok(())
@@ -362,26 +362,25 @@ where
         }
     }
 
-    /// データを送信
+    /// データを送信（所有バッファを io_uring stream へ直接委譲）
     ///
-    /// monoio の write_all は成功時に全データ書き込みを保証するため、
-    /// 成功時はループを抜ける実装が正しい。
-    async fn write_all(&mut self, data: &[u8]) -> Http2Result<()> {
-        let mut offset = 0;
-        while offset < data.len() {
-            let buf = data[offset..].to_vec();
-            let buf_len = buf.len();
-            let (result, _) = self.stream.write_all(buf).await;
+    /// runtime の `write_all`（`AsyncWriteRentExt`）は所有バッファ（`IoBuf`）を取り
+    /// 完了時に返す。フレームエンコード結果の `Vec<u8>` をそのままムーブで渡すことで、
+    /// 従来の per-frame `data[..].to_vec()` に由来するアロケーション + 全コピーを排除する
+    /// （HTTP/2 送信ホットパス最適化）。runtime の write_all は「全書き込み or WriteZero」
+    /// のため、`Ok` は常に完全書き込みを意味する。`WouldBlock` のみ同一バッファで再試行する。
+    async fn write_all(&mut self, mut buf: Vec<u8>) -> Http2Result<()> {
+        loop {
+            let (result, returned) = self.stream.write_all(buf).await;
             match result {
-                Ok(_) => {
-                    // monoio の write_all は成功時に全データ書き込みを保証
-                    offset += buf_len;
+                Ok(_) => return Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    buf = returned;
+                    continue;
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
                 Err(e) => return Err(Http2Error::Io(e)),
             }
         }
-        Ok(())
     }
 
     /// フレームを処理（外部からアクセス可能）
@@ -599,7 +598,7 @@ where
 
         // SETTINGS ACK を送信
         let ack_frame = self.frame_encoder.encode_settings_ack();
-        self.write_all(&ack_frame).await?;
+        self.write_all(ack_frame).await?;
 
         Ok(())
     }
@@ -1129,7 +1128,7 @@ where
             let frame = self
                 .frame_encoder
                 .encode_window_update(0, conn_increment as u32);
-            self.write_all(&frame).await?;
+            self.write_all(frame).await?;
             self.conn_recv_window += conn_increment;
         }
 
@@ -1149,7 +1148,7 @@ where
             let frame = self
                 .frame_encoder
                 .encode_window_update(stream_id, increment as u32);
-            self.write_all(&frame).await?;
+            self.write_all(frame).await?;
             if let Some(stream) = self.streams.get(stream_id) {
                 stream.update_recv_window(increment);
             }
@@ -1194,7 +1193,7 @@ where
 
             // PING ACK を送信
             let frame = self.frame_encoder.encode_ping(data, true);
-            self.write_all(&frame).await?;
+            self.write_all(frame).await?;
         }
         Ok(())
     }
@@ -1302,7 +1301,7 @@ where
             None,
         );
 
-        self.write_all(&frame).await?;
+        self.write_all(frame).await?;
 
         // ストリーム状態を更新
         if let Some(stream) = self.streams.get(stream_id) {
@@ -1468,7 +1467,7 @@ where
             true,  // end_headers
             None,
         );
-        self.write_all(&headers_frame).await?;
+        self.write_all(headers_frame).await?;
 
         // ストリーム状態を更新
         if let Some(stream) = self.streams.get(stream_id) {
@@ -1528,7 +1527,7 @@ where
             true, // end_headers
             None,
         );
-        self.write_all(&trailer_frame).await?;
+        self.write_all(trailer_frame).await?;
 
         // ストリーム状態を更新
         if let Some(stream) = self.streams.get(stream_id) {
@@ -1623,7 +1622,7 @@ where
             let frame = self
                 .frame_encoder
                 .encode_data(stream_id, chunk, end_stream && is_last);
-            self.write_all(&frame).await?;
+            self.write_all(frame).await?;
 
             offset += chunk_len;
             window_update_wait_count = 0; // 送信成功したのでリセット
@@ -1634,7 +1633,7 @@ where
         // （F-32）でバックエンドが content-length 未達で切断した際などの終端クローズに使う。
         if data.is_empty() && end_stream {
             let frame = self.frame_encoder.encode_data(stream_id, &[], true);
-            self.write_all(&frame).await?;
+            self.write_all(frame).await?;
         }
 
         // 状態更新
@@ -1661,7 +1660,7 @@ where
         let frame = self
             .frame_encoder
             .encode_goaway(last_stream_id, error_code as u32, debug_data);
-        self.write_all(&frame).await?;
+        self.write_all(frame).await?;
         self.goaway_sent = true;
 
         Ok(())
@@ -1676,7 +1675,7 @@ where
         let frame = self
             .frame_encoder
             .encode_rst_stream(stream_id, error_code as u32);
-        self.write_all(&frame).await?;
+        self.write_all(frame).await?;
 
         if let Some(stream) = self.streams.get(stream_id) {
             stream.send_rst_stream();
