@@ -324,10 +324,7 @@ pub(crate) fn build_json_log(
     fields: &[String],
 ) {
     buf.push(b'{');
-    // 識別用 type フィールドは常に先頭に出力する（fields フィルタの対象外）。
-    // アプリ本体ログ / エラーログと区別するための固定値 "access"。
-    buf.extend_from_slice(b"\"type\":\"access\"");
-    let mut first = false;
+    let mut first = true;
 
     macro_rules! json_field {
         ($name:literal, $write:expr) => {
@@ -344,11 +341,20 @@ pub(crate) fn build_json_log(
         };
     }
 
+    // フィールド順: timestamp → type → 以降。
+    // timestamp は fields フィルタ対象（未指定なら省略）。
     json_field!("timestamp", {
         buf.push(b'"');
         write_rfc3339_into_buf(buf, timestamp);
         buf.push(b'"');
     });
+    // 識別用 type フィールドは timestamp の直後に必ず出力する（fields フィルタ対象外）。
+    // アプリ本体ログ / エラーログと区別するための固定値 "access"。
+    if !first {
+        buf.push(b',');
+    }
+    buf.extend_from_slice(b"\"type\":\"access\"");
+    first = false;
     json_field!("method", {
         write_json_str(buf, method);
     });
@@ -402,9 +408,7 @@ pub(crate) fn build_text_log(
     user_agent: &str,
     fields: &[String],
 ) {
-    // 識別用 type フィールドは常に先頭に出力する（fields フィルタの対象外）。
-    buf.extend_from_slice(b"type=access");
-    let mut first = false;
+    let mut first = true;
 
     macro_rules! text_field {
         ($name:literal, $write:expr) => {
@@ -420,9 +424,16 @@ pub(crate) fn build_text_log(
         };
     }
 
+    // フィールド順: timestamp → type → 以降。
     text_field!("timestamp", {
         write_rfc3339_into_buf(buf, timestamp);
     });
+    // 識別用 type フィールドは timestamp の直後に必ず出力する（fields フィルタ対象外）。
+    if !first {
+        buf.push(b' ');
+    }
+    buf.extend_from_slice(b"type=access");
+    first = false;
     text_field!("method", {
         buf.extend_from_slice(method.as_bytes());
     });
@@ -612,7 +623,7 @@ mod tests {
 
     #[test]
     fn test_access_log_type_field_present() {
-        // JSON: 先頭に "type":"access" が出力される
+        // JSON: フィールド順は timestamp → type → 以降
         let mut buf = Vec::new();
         build_json_log(
             &mut buf, test_dt(), "GET", "example.com", "/", 200, 1, "127.0.0.1", "", 0, 0,
@@ -620,21 +631,29 @@ mod tests {
         );
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("\"type\":\"access\""), "json type missing: {}", s);
-        assert!(s.starts_with("{\"type\":\"access\""), "type should be first: {}", s);
+        assert!(s.starts_with("{\"timestamp\":"), "timestamp should be first: {}", s);
+        // type は timestamp の直後（method より前）
+        let ts = s.find("\"timestamp\"").unwrap();
+        let ty = s.find("\"type\"").unwrap();
+        let me = s.find("\"method\"").unwrap();
+        assert!(ts < ty && ty < me, "order timestamp<type<method: {}", s);
 
-        // Text: 先頭に type=access が出力される
+        // Text: timestamp → type → 以降
         let mut buf = Vec::new();
         build_text_log(
             &mut buf, test_dt(), "GET", "example.com", "/", 200, 1, "127.0.0.1", "", 0, 0,
             "-", &[],
         );
         let s = String::from_utf8(buf).unwrap();
-        assert!(s.starts_with("type=access"), "text type missing/first: {}", s);
+        assert!(s.starts_with("timestamp="), "timestamp should be first: {}", s);
+        let ty = s.find("type=access").unwrap();
+        let me = s.find("method=").unwrap();
+        assert!(ty < me, "type before method: {}", s);
     }
 
     #[test]
     fn test_access_log_type_field_survives_field_filter() {
-        // fields で type を指定しなくても type は常に出力される
+        // fields で type / timestamp を指定しなくても type は常に出力される
         let fields: Vec<String> = vec!["method".to_string()];
         let mut buf = Vec::new();
         build_json_log(
@@ -643,6 +662,8 @@ mod tests {
         );
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("\"type\":\"access\""), "type must survive filter: {}", s);
+        // timestamp はフィルタで除外されるため type が先頭になる
+        assert!(s.starts_with("{\"type\":\"access\""), "type first when ts filtered: {}", s);
         assert!(s.contains("\"method\":\"GET\""));
         assert!(!s.contains("\"host\""));
     }
