@@ -83,7 +83,7 @@ where
     /// 4. SETTINGS ACK を送受信
     pub async fn handshake(&mut self) -> Http2Result<()> {
         // 1. コネクションプリフェースを送信
-        self.write_all(CONNECTION_PREFACE).await?;
+        self.write_all(CONNECTION_PREFACE.to_vec()).await?;
 
         // 2. クライアント SETTINGS を送信
         self.send_settings().await?;
@@ -107,7 +107,7 @@ where
             .collect();
 
         let frame = self.frame_encoder.encode_settings(&settings, false);
-        self.write_all(&frame).await?;
+        self.write_all(frame).await?;
         self.settings_ack_pending = true;
 
         Ok(())
@@ -137,7 +137,7 @@ where
 
                 // SETTINGS ACK を送信
                 let ack_frame = self.frame_encoder.encode_settings_ack();
-                self.write_all(&ack_frame).await?;
+                self.write_all(ack_frame).await?;
             }
             _ => {
                 return Err(Http2Error::protocol_error("Expected SETTINGS frame"));
@@ -158,7 +158,7 @@ where
                 Frame::Ping { ack: false, data } => {
                     // PING ACK を送信
                     let ping_ack = self.frame_encoder.encode_ping(&data, true);
-                    self.write_all(&ping_ack).await?;
+                    self.write_all(ping_ack).await?;
                 }
                 _ => {
                     // 他のフレームはスキップ
@@ -218,7 +218,7 @@ where
             true, // end_headers
             None,
         );
-        self.write_all(&headers_frame).await?;
+        self.write_all(headers_frame).await?;
 
         // ボディを送信
         if let Some(body_data) = body {
@@ -256,7 +256,7 @@ where
             let frame = self
                 .frame_encoder
                 .encode_data(stream_id, chunk, end_stream && is_last);
-            self.write_all(&frame).await?;
+            self.write_all(frame).await?;
 
             offset += chunk_len;
         }
@@ -339,14 +339,14 @@ where
                         let increment =
                             defaults::CONNECTION_WINDOW_SIZE as i32 - self.conn_recv_window;
                         let wu_frame = self.frame_encoder.encode_window_update(0, increment as u32);
-                        self.write_all(&wu_frame).await?;
+                        self.write_all(wu_frame).await?;
                         self.conn_recv_window += increment;
 
                         // ストリームレベルも
                         let wu_stream = self
                             .frame_encoder
                             .encode_window_update(stream_id, increment as u32);
-                        self.write_all(&wu_stream).await?;
+                        self.write_all(wu_stream).await?;
                     }
 
                     if end_stream {
@@ -359,7 +359,7 @@ where
                 Frame::Ping { ack: false, data } => {
                     // PING ACK を送信
                     let ping_ack = self.frame_encoder.encode_ping(&data, true);
-                    self.write_all(&ping_ack).await?;
+                    self.write_all(ping_ack).await?;
                 }
                 Frame::Settings {
                     ack: false,
@@ -375,7 +375,7 @@ where
                         }
                     }
                     let ack_frame = self.frame_encoder.encode_settings_ack();
-                    self.write_all(&ack_frame).await?;
+                    self.write_all(ack_frame).await?;
                 }
                 Frame::GoAway { .. } => {
                     return Err(Http2Error::ConnectionClosed);
@@ -474,26 +474,26 @@ where
         }
     }
 
-    /// データを送信
+    /// データを送信（所有バッファを io_uring stream へ直接委譲）
     ///
-    /// monoio の write_all は成功時に全データ書き込みを保証するため、
-    /// 成功時はループを抜ける実装が正しい。
-    async fn write_all(&mut self, data: &[u8]) -> Http2Result<()> {
-        let mut offset = 0;
-        while offset < data.len() {
-            let buf = data[offset..].to_vec();
-            let buf_len = buf.len();
-            let (result, _) = self.stream.write_all(buf).await;
+    /// runtime の `write_all`（`AsyncWriteRentExt`）は所有バッファ（`IoBuf`）を取り
+    /// 完了時に返す。フレームエンコード結果の `Vec<u8>` をそのままムーブで渡すことで、
+    /// 従来の per-frame `data[offset..].to_vec()` に由来するアロケーション + 全コピーを
+    /// 排除する（proxy→バックエンド方向 HTTP/2 送信ホットパス最適化・F-73 残件）。
+    /// runtime の write_all は「全書き込み or WriteZero」のため、`Ok` は常に完全書き込みを
+    /// 意味する。`WouldBlock` のみ同一バッファで再試行する。
+    async fn write_all(&mut self, mut buf: Vec<u8>) -> Http2Result<()> {
+        loop {
+            let (result, returned) = self.stream.write_all(buf).await;
             match result {
-                Ok(_) => {
-                    // monoio の write_all は成功時に全データ書き込みを保証
-                    offset += buf_len;
+                Ok(_) => return Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    buf = returned;
+                    continue;
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
                 Err(e) => return Err(Http2Error::Io(e)),
             }
         }
-        Ok(())
     }
 }
 
@@ -579,7 +579,7 @@ where
         let headers_frame =
             self.frame_encoder
                 .encode_headers(stream_id, &header_block, false, true, None);
-        self.write_all(&headers_frame).await?;
+        self.write_all(headers_frame).await?;
 
         // DATA フレームを送信 (end_stream=true)
         self.send_data(stream_id, &framed_message, true).await?;
@@ -674,13 +674,13 @@ where
                         let increment =
                             defaults::CONNECTION_WINDOW_SIZE as i32 - self.conn_recv_window;
                         let wu_frame = self.frame_encoder.encode_window_update(0, increment as u32);
-                        self.write_all(&wu_frame).await?;
+                        self.write_all(wu_frame).await?;
                         self.conn_recv_window += increment;
 
                         let wu_stream = self
                             .frame_encoder
                             .encode_window_update(stream_id, increment as u32);
-                        self.write_all(&wu_stream).await?;
+                        self.write_all(wu_stream).await?;
                     }
 
                     if end_stream {
@@ -690,7 +690,7 @@ where
                 Frame::WindowUpdate { .. } => {}
                 Frame::Ping { ack: false, data } => {
                     let ping_ack = self.frame_encoder.encode_ping(&data, true);
-                    self.write_all(&ping_ack).await?;
+                    self.write_all(ping_ack).await?;
                 }
                 Frame::Settings {
                     ack: false,
@@ -705,7 +705,7 @@ where
                         }
                     }
                     let ack_frame = self.frame_encoder.encode_settings_ack();
-                    self.write_all(&ack_frame).await?;
+                    self.write_all(ack_frame).await?;
                 }
                 Frame::GoAway { .. } => {
                     return Err(Http2Error::ConnectionClosed);
@@ -721,5 +721,178 @@ where
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! H2C クライアント送信ホットパスの検証
+    //!
+    //! F-73 残件（proxy→バックエンド方向 HTTP/2 送信）で `write_all` を所有 `Vec<u8>` の
+    //! ムーブ委譲へ変更した。送出バイト列が RFC 7540 準拠のフレーム列として正しいこと
+    //! （＝ゼロコピー化でバイト内容を壊していないこと）と、スクリプト応答を正しく
+    //! 受信・パースできることをモックストリームで検証する。
+
+    use super::*;
+    use crate::http2::frame::FrameEncoder;
+    use crate::http2::hpack::HpackEncoder;
+    use crate::runtime::buf::{IoBuf, IoBufMut};
+    use crate::runtime::io::{AsyncReadRent, AsyncWriteRent, BufResult};
+    use std::future::Future;
+
+    /// 送出バイト列を記録しつつ、スクリプト応答を read で返すモックストリーム。
+    struct ScriptedStream {
+        writes: Vec<Vec<u8>>,
+        read_data: Vec<u8>,
+        read_pos: usize,
+    }
+
+    impl ScriptedStream {
+        fn new(read_data: Vec<u8>) -> Self {
+            Self {
+                writes: Vec::new(),
+                read_data,
+                read_pos: 0,
+            }
+        }
+
+        fn written(&self) -> Vec<u8> {
+            self.writes.iter().flatten().copied().collect()
+        }
+    }
+
+    impl AsyncReadRent for ScriptedStream {
+        async fn read<T: IoBufMut>(&mut self, mut buf: T) -> BufResult<usize, T> {
+            let remaining = self.read_data.len() - self.read_pos;
+            let cap = buf.bytes_total();
+            let n = remaining.min(cap);
+            if n > 0 {
+                // SAFETY: write_ptr()..cap は buf の書き込み可能領域。n<=cap。
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        self.read_data.as_ptr().add(self.read_pos),
+                        buf.write_ptr(),
+                        n,
+                    );
+                    buf.set_init(n);
+                }
+                self.read_pos += n;
+            }
+            (Ok(n), buf)
+        }
+    }
+
+    impl AsyncWriteRent for ScriptedStream {
+        async fn write<T: IoBuf>(&mut self, buf: T) -> BufResult<usize, T> {
+            let len = buf.bytes_init();
+            // SAFETY: read_ptr()..len は IoBuf の初期化済み領域。write 完了までバッファは生存。
+            let slice = unsafe { std::slice::from_raw_parts(buf.read_ptr(), len) };
+            self.writes.push(slice.to_vec());
+            (Ok(len), buf)
+        }
+
+        async fn shutdown(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// io_uring 不要な同期ドライバ（Pending は自己 wake 前提で即再試行）。
+    fn drive<F: Future>(mut fut: F) -> F::Output {
+        use std::sync::Arc;
+        use std::task::{Context, Poll, Wake, Waker};
+        struct NoopWake;
+        impl Wake for NoopWake {
+            fn wake(self: Arc<Self>) {}
+        }
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = unsafe { std::pin::Pin::new_unchecked(&mut fut) };
+        loop {
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(v) => return v,
+                Poll::Pending => {}
+            }
+        }
+    }
+
+    /// 連結バイト列を HTTP/2 フレーム列 (type, flags, stream_id, payload) にパースする。
+    fn parse_frames(bytes: &[u8]) -> Vec<(u8, u8, u32, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 9 <= bytes.len() {
+            let len = ((bytes[i] as usize) << 16)
+                | ((bytes[i + 1] as usize) << 8)
+                | bytes[i + 2] as usize;
+            let ftype = bytes[i + 3];
+            let flags = bytes[i + 4];
+            let sid = u32::from_be_bytes([
+                bytes[i + 5] & 0x7f,
+                bytes[i + 6],
+                bytes[i + 7],
+                bytes[i + 8],
+            ]);
+            assert!(i + 9 + len <= bytes.len(), "truncated frame payload");
+            out.push((ftype, flags, sid, bytes[i + 9..i + 9 + len].to_vec()));
+            i += 9 + len;
+        }
+        assert_eq!(i, bytes.len(), "trailing bytes not frame-aligned");
+        out
+    }
+
+    /// サーバー応答（HEADERS :status 200 + DATA END_STREAM）をライブラリ自身の
+    /// エンコーダで構築する。
+    fn build_response(body: &[u8]) -> Vec<u8> {
+        let mut hpack = HpackEncoder::new(4096);
+        let enc = FrameEncoder::new(16384);
+        let header_block = hpack
+            .encode(&[
+                (b":status", b"200", false),
+                (b"content-type", b"text/plain", false),
+            ])
+            .expect("encode response headers");
+        let mut out = enc.encode_headers(1, &header_block, false, true, None);
+        out.extend_from_slice(&enc.encode_data(1, body, true));
+        out
+    }
+
+    #[test]
+    fn send_request_emits_correct_frames_and_parses_response() {
+        let resp_body = b"pong";
+        let mut client =
+            H2cClient::new(ScriptedStream::new(build_response(resp_body)), Http2Settings::default());
+
+        let req_body = b"ping-body";
+        let resp = drive(client.send_request(
+            b"POST",
+            b"/echo",
+            b"backend.local",
+            &[(b"x-test", b"1")],
+            Some(req_body),
+        ))
+        .expect("send_request");
+
+        // 応答が正しくパースされる（ゼロコピー化した送信経路でも往復が成立する）。
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, resp_body);
+        assert!(resp
+            .headers
+            .iter()
+            .any(|(n, v)| n == b"content-type" && v == b"text/plain"));
+
+        // 送出フレーム: HEADERS(END_HEADERS) + DATA(END_STREAM)。
+        let frames = parse_frames(&client.stream.written());
+        assert_eq!(frames.len(), 2, "expected HEADERS + DATA, got {frames:?}");
+
+        let (htype, hflags, hsid, _) = &frames[0];
+        assert_eq!(*htype, 0x1, "first frame is HEADERS");
+        assert_eq!(*hsid, 1, "client stream id starts at 1");
+        assert_eq!(hflags & 0x4, 0x4, "END_HEADERS set");
+        assert_eq!(hflags & 0x1, 0x0, "END_STREAM not set (body follows)");
+
+        let (dtype, dflags, dsid, dpayload) = &frames[1];
+        assert_eq!(*dtype, 0x0, "second frame is DATA");
+        assert_eq!(*dsid, 1);
+        assert_eq!(dflags & 0x1, 0x1, "END_STREAM set on last DATA");
+        assert_eq!(dpayload.as_slice(), req_body, "DATA payload byte-identical");
     }
 }
