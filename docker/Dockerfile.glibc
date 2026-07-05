@@ -70,7 +70,7 @@ COPY Cargo.toml Cargo.lock /app/
 COPY . /app
 
 # テストとビルド（ビルド環境でユニットテストを実行して動作を確認してからリリースビルド。
-# 環境依存テスト（例: 同梱 config.toml 読込）はテスト側で存在チェックしスキップ済み）
+# 環境依存テスト（例: 同梱 examples/config.toml 読込）はテスト側で存在チェックしスキップ済み）
 #
 # cacher 段はスタブの src/main.rs / src/lib.rs で release プロファイルの成果物をキャッシュする。
 # 実ソースへ差し替えた後は全 .rs の mtime を更新して cargo に再コンパイルを強制する

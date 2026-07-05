@@ -1,6 +1,6 @@
 # AGENTS.md — Veil (veil-proxy)
 
-AI エージェントおよびコントリビュータ向けの **最小指針**。機能説明・ビルド例・テスト手順の **正** は [README.md](README.md) / [README.ja.md](README.ja.md)。フィーチャー定義は [Cargo.toml](Cargo.toml) の `[features]`。
+AI エージェントおよびコントリビュータ向けの **最小指針**。機能説明・ビルド例・テスト手順の **正** は [README.md](README.md) / [docs/readme/README.ja.md](docs/readme/README.ja.md)。フィーチャー定義は [Cargo.toml](Cargo.toml) の `[features]`。
 
 ---
 
@@ -122,6 +122,8 @@ cargo test --bins --test integration_tests --features "full"
 | `src/entry.rs` | サーバ起動配線（`run()`：ワーカースレッド・accept ループなど） |
 | `src/runtime/` | 独自 io_uring ランタイム（ring.rs/executor.rs/tcp.rs/timer.rs/buf.rs/io.rs/splice.rs/offload.rs） |
 | `tests/`、`benches/` | 統合・E2E・ベンチ（`cargo test` が拾うホワイトボックス） |
+| `examples/config.toml` | 設定リファレンス（全キー網羅・`src/config.rs` 同期） |
+| `docs/readme/` | 日本語 README（`README.ja.md`） |
 | `docs/artifacts/` | AI 成果物・一時ファイル |
 | `docs/backlog/` | 機能・バグチケット（親は `backlog.md`） |
 | `docker/` | コンテナイメージ（glibc/musl）・共有アセット（`assets/`：ssl/www/seccomp/Landlock） |

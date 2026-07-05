@@ -6762,23 +6762,23 @@ key_path = "/tmp/key.pem"
 }
 
 // ====================
-// 同梱 config.toml の同期検証（F-51）
+// 同梱 examples/config.toml の同期検証（F-51）
 // ====================
 
 #[cfg(test)]
 mod shipped_config_tests {
     use super::*;
 
-    /// リポジトリ同梱の config.toml が常にパース・バリデーション可能であることを保証する。
+    /// リポジトリ同梱の examples/config.toml が常にパース・バリデーション可能であることを保証する。
     ///
-    /// config.rs の設定構造とドキュメント（config.toml）の乖離を CI で検出する。
+    /// config.rs の設定構造とドキュメント（examples/config.toml）の乖離を CI で検出する。
     /// cert_path / key_path のプレースホルダーのみ、実在する自己署名証明書に差し替える。
     #[test]
     fn shipped_config_toml_parses_and_validates() {
-        // 同梱リファレンス config.toml は開発／CI 環境（リポジトリツリー）でのみ存在する。
+        // 同梱リファレンス examples/config.toml は開発／CI 環境（リポジトリツリー）でのみ存在する。
         // コンテナビルド等、ビルドコンテキストに含めない環境ではファイルが無いためスキップする
         // （コンテナ実行時の設定は docker/assets/conf.d/config.toml を使用する）。
-        let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.toml");
+        let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/config.toml");
         let content = match std::fs::read_to_string(&shipped) {
             Ok(c) => c,
             Err(_) => {

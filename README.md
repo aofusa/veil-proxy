@@ -1,4 +1,4 @@
-[English](README.md) | [日本語](README.ja.md)
+[English](README.md) | [日本語](docs/readme/README.ja.md)
 
 <p align="center">
   <img src="docs/images/veil_logo.webp" alt="Veil Logo" width="300" align="middle" />
@@ -307,7 +307,7 @@ The following table lists default values for major configuration options:
 | `[tls]` | `ktls_enabled` | `false` | Enable kTLS |
 | `[tls]` | `ktls_fallback_enabled` | `true` | kTLS fallback to rustls |
 | `[tls]` | `tcp_cork_enabled` | `true` | Enable TCP_CORK |
-| `[tls]` | `cipher_suites` | `[]` (rustls default) | Allowed TLS cipher suites (like nginx `ssl_ciphers`; listed order = server preference; unknown names fail at startup; see config.toml) |
+| `[tls]` | `cipher_suites` | `[]` (rustls default) | Allowed TLS cipher suites (like nginx `ssl_ciphers`; listed order = server preference; unknown names fail at startup; see examples/config.toml) |
 | `[tls]` | `auto_reload` | `false` | Certificate hot reload (mtime detection + SIGHUP) |
 | `[tls]` | `reload_interval_secs` | `60` | Certificate change check interval (seconds) |
 | `[buffer_pool]` | `read_buffer_size` | `65536` | Read buffer size (64KB) |
@@ -338,7 +338,7 @@ The following table lists default values for major configuration options:
 | `[http3]` | `compression_enabled` | `false` | Enable compression |
 | `[http3]` | `gso_gro_enabled` | `false` | Enable GSO/GRO |
 
-Configuration file example (`config.toml`):
+Configuration file example (`examples/config.toml`):
 
 ```toml
 [server]
@@ -3366,13 +3366,13 @@ wrk -t4 -c100 -d30s https://localhost/
 
 # 1. kTLS disabled (using rustls)
 cargo build --release
-./veil -c ./config.toml &
+./veil -c ./examples/config.toml &
 wrk -t4 -c100 -d30s https://localhost/
 
 # 2. kTLS enabled (using rustls + custom kTLS module)
 cargo build --release --features ktls
 # Set ktls_enabled = true in config.toml
-./veil -c ./config.toml &
+./veil -c ./examples/config.toml &
 wrk -t4 -c100 -d30s https://localhost/
 ```
 
@@ -3595,7 +3595,7 @@ When receiving SIGINT (Ctrl+C) or SIGTERM, the server terminates safely:
 
 ```bash
 # Start server
-./veil -c ./config.toml &
+./veil -c ./examples/config.toml &
 
 # Terminate safely
 kill -SIGTERM $!
@@ -3619,7 +3619,7 @@ Existing connections are not interrupted, and new settings apply to new connecti
 
 ```bash
 # Edit config file
-vim config.toml
+vim examples/config.toml
 
 # Reload configuration (zero downtime)
 kill -SIGHUP $(pgrep veil)
@@ -3772,7 +3772,7 @@ sudo mkdir -p /var/log/veil
 sudo chown veil:veil /var/log/veil
 
 # 3. Copy configuration files
-sudo cp config.toml /etc/veil/
+sudo cp examples/config.toml /etc/veil/
 sudo cp server.crt server.key /etc/veil/
 sudo chmod 600 /etc/veil/server.key
 sudo chown -R veil:veil /etc/veil
