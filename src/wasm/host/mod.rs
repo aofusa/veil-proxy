@@ -2,7 +2,7 @@
 //!
 //! Implements all required host functions exposed to WASM modules.
 
-mod abi;
+pub(crate) mod abi;
 mod buffers;
 mod foreign;
 mod grpc;

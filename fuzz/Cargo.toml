@@ -51,3 +51,10 @@ path = "fuzz_targets/wasm_abi.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "wasm_host_abi"
+path = "fuzz_targets/wasm_host_abi.rs"
+test = false
+doc = false
+bench = false
