@@ -151,6 +151,7 @@
 | B-18 | P2 | 完了 | [bugs/B-18-http3-gso-batch-emsgsize-overflow.md](bugs/B-18-http3-gso-batch-emsgsize-overflow.md) | HTTP/3 GSO バッチが sendmsg の UDP ペイロード上限（65507B）を超え EMSGSIZE でバッチ全体（最大 64 パケット）が破棄され得る。F-60 実装中に検出。**修正済み**: `MAX_GSO_BATCH_BYTES` による追加前 flush + flush 判定の純関数化・単体テスト |
 | B-19 | P1 | 完了 | [bugs/B-19-proxy-wasm-abi-mismatch.md](bugs/B-19-proxy-wasm-abi-mismatch.md) | Proxy-Wasm ABI 不一致（BufferType 番号・マップ直列化形式）で SDK の読み取り系 API を使うモジュールが panic。F-62 で検出。**修正済み**: 定数を SDK/ABI 準拠へ、直列化を `host/abi.rs` へ集約（SDK 互換ワイヤ形式 + 不正データ拒否） |
 | B-20 | P1 | 完了 | [bugs/B-20-wasm-sync-call-async-store-panic.md](bugs/B-20-wasm-sync-call-async-store-panic.md) | WASM 読み取り系ホスト関数 5 つが async store で同期 `call` を使い panic（"must use call_async"）。F-62 で検出。**修正済み**: `func_wrap_async` + `call_async` 化 |
+| B-21 | P1 | 完了 | [bugs/B-21-hpack-huffman-decode-shift-panic.md](bugs/B-21-hpack-huffman-decode-shift-panic.md) | HPACK Huffman デコーダが不正入力（符号非一致でビット蓄積）でシフト量オーバーフロー panic。外部から HTTP/2 ヘッダで到達可能な DoS 面。`cargo fuzz`（F-52）で検出。**修正済み**: 最長符号長(30bit)超過で HuffmanDecodeError を返すガード + 回帰テスト（クラッシュ入力・ラウンドトリップ） |
 
 ---
 

@@ -300,6 +300,12 @@ pub fn huffman_encode(src: &[u8]) -> Vec<u8> {
 /// Huffman 符号化されたバイト列をデコードします。
 /// ビットストリームベースの完全な実装。
 pub fn huffman_decode(src: &[u8]) -> Result<Vec<u8>, HpackError> {
+    // HPACK Huffman 符号の最長は 30 ビット（RFC 7541 Appendix B）。
+    // B-21: これを超えてビットが溜まってもどのシンボルにも一致しない入力は不正。
+    // ガードが無いと bits_left が単調増加して `bits >> (bits_left - len)` の
+    // シフト量が 64 以上になり panic する（不正 Huffman 入力で外部からトリガ可能）。
+    const MAX_CODE_LEN: u32 = 30;
+
     let mut result = Vec::with_capacity(src.len() * 2);
     let mut bits: u64 = 0;
     let mut bits_left: u32 = 0;
@@ -337,7 +343,13 @@ pub fn huffman_decode(src: &[u8]) -> Result<Vec<u8>, HpackError> {
             }
 
             if !found {
-                // 5ビット以上あるのにマッチしない場合、さらにビットが必要
+                // B-21: 最長符号長以上のビットがあるのにどの符号にも一致しない
+                // 場合は不正入力（パディングは 7 ビット以下）。ここで打ち切らないと
+                // bits_left が u64 幅を超えてシフト panic を起こす。
+                if bits_left >= MAX_CODE_LEN {
+                    return Err(HpackError::HuffmanDecodeError);
+                }
+                // まだ符号を確定できない → 次のバイトを読む
                 break;
             }
         }
@@ -418,5 +430,40 @@ mod tests {
         let s = b"aeiou";
         let len = huffman_encoded_len(s);
         assert!(len < s.len());
+    }
+
+    /// 正当な Huffman 列はラウンドトリップできること。
+    #[test]
+    fn test_huffman_roundtrip_decode() {
+        for input in [
+            b"www.example.com".as_slice(),
+            b"custom-key",
+            b"custom-value",
+            b"/",
+            b"GET",
+        ] {
+            let encoded = huffman_encode(input);
+            let decoded = huffman_decode(&encoded).expect("valid huffman must decode");
+            assert_eq!(decoded, input, "roundtrip mismatch for {:?}", input);
+        }
+    }
+
+    /// B-21: 不正な Huffman 入力（どの符号にも一致せずビットが溜まり続ける）で
+    /// panic せずエラーを返すこと。cargo-fuzz が検出したクラッシュの回帰テスト。
+    #[test]
+    fn test_huffman_decode_invalid_no_panic() {
+        // cargo-fuzz が発見したクラッシュ入力そのもの。
+        let crash = [
+            0x94, 0x01, 0x94, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0xf9,
+        ];
+        // panic せず Ok/Err のいずれかを返せばよい（重要なのは落ちないこと）。
+        let _ = huffman_decode(&crash);
+
+        // 全ビット 0 の長い列（符号長超過をまたぐ）でも panic しない。
+        let _ = huffman_decode(&[0u8; 64]);
+        // 明示的にデコード不能な入力はエラーになる（'0' の 5bit 符号 00000 の後に
+        // 全ビット 0 が続くとパディング不正/符号超過で Err）。
+        assert!(huffman_decode(&[0x00; 8]).is_err());
     }
 }
