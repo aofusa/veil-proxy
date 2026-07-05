@@ -31,6 +31,31 @@
 
 - kTLS 経路との整合。部分書き込み（short write）時の再送ロジック。
 
+## 実装（2026-07-05 / 本ブランチ）
+
+セキュリティサーフェス拡大（restriction 許可リスト +1）を許容する判断のもと、
+`IORING_OP_SENDMSG` ベースの scatter-gather 送出を実装した。
+
+1. **`IORING_OP_SENDMSG` を `PROXY_ALLOWED_OPCODES` に追加**（`src/runtime/executor.rs`）。
+   F-38 の io_uring restrictions 許可リストは 11 → 12 opcode。
+2. **`SendMsgFuture`**（`src/runtime/tcp.rs`）: 2 つの不連続バッファ（ヘッダ + ボディ）を
+   1 SQE / 1 CQE で送出。カーネル参照領域（`msghdr` + `iovec[2]`）は
+   `Box<SendMsgState>` でヒープ固定し、スレッドローカルプール（上限 64）で再利用して
+   ホットパスの確保を排除。in-flight のまま Future が drop された場合は
+   msghdr / iovec / バッファの 3 者すべてを detach ガードへ移して CQE まで延命
+   （B-07 ガードの拡張）。UAF・ダングリング iovec を構造的に防止。
+3. **`TcpStream::writev2` / `write_all_vectored`**: 部分送信（short write）時は
+   連結視の送信済みオフセット `skip` を進めて iovec を再構築・再発行（コピーなし）。
+4. **`KtlsServerStream::write_all_vectored` / `SimpleTlsServerStream::write_all_vectored`**:
+   平文（`TlsMode::Plain`）は 1 回の SENDMSG、kTLS はカーネル/NIC 依存の挙動差異が
+   あるため、rustls はユーザー空間レコード化のため、従来の 2 回書き込みへフォールバック。
+5. **配線**: メモリキャッシュヒット送出・stale-if-error 送出・HTTP/HTTPS プロキシ応答の
+   ヘッダ + 初期ボディ送出（`transfer_response_with_compression` /
+   `transfer_https_response_with_compression`）を `write_all_vectored` へ集約。
+
+テスト: `src/runtime/tcp.rs::tests`（scatter-gather 送出の正確性 / 空ボディ /
+4MB ボディでの short-write 継続と順序保証）、E2E 全 415 件 + cache 構成で回帰なし。
+
 ## 実装調査（2026-07 / 本ブランチ）
 
 - キャッシュヒットのソケット送出は `runtime` の **`IORING_OP_SEND`** を使用しており、
@@ -45,4 +70,4 @@
   レビュー含む）を独立チケットで検討する。partial-write 再送・kTLS 経路（kTLS は sendmsg 不可の
   ケースあり）の設計も前提。
 
-## 対応状況: 保留（セキュリティサーフェス拡大とのトレードオフのため）
+## 対応状況: 完了（2026-07-05。SENDMSG 追加を許容する判断により実装）

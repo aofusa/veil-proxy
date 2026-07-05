@@ -5462,20 +5462,21 @@ async fn handle_proxy(
                         if let Some(body_data) = cached_entry.memory_body() {
                             let body = body_data.clone(); // O(1) refcount、memcpy なし
                             let body_len = body.len();
-                            // ヘッダーのみ構築し、ボディは連結せず別途ゼロコピーで書き込む
+                            // ヘッダーのみ構築し、ボディは連結せずゼロコピーのまま
+                            // F-59: ヘッダ + ボディを 1 回の SENDMSG（scatter-gather）で送出
+                            // （平文接続。kTLS/rustls は内部で 2 回書き込みへフォールバック）
                             let headers = build_cached_response_headers(
                                 &cached_entry,
                                 client_wants_close,
                                 is_stale,
                             );
-                            if !matches!(
-                                timeout(WRITE_TIMEOUT, client_stream.write_all(headers)).await,
-                                Ok((Ok(_), _))
-                            ) {
-                                return None;
-                            }
-                            match timeout(WRITE_TIMEOUT, client_stream.write_all(body)).await {
-                                Ok((Ok(_), _)) => {
+                            match timeout(
+                                WRITE_TIMEOUT,
+                                client_stream.write_all_vectored(headers, body),
+                            )
+                            .await
+                            {
+                                Ok((Ok(()), _, _)) => {
                                     return Some((
                                         client_stream,
                                         cached_entry.status_code,
@@ -5892,6 +5893,7 @@ async fn handle_proxy(
                             debug!("stale-if-error: serving stale cache for {}", host_str);
 
                             // staleキャッシュを返す（ボディは bytes::Bytes をゼロコピーで送出）
+                            // F-59: ヘッダ + ボディを 1 回の SENDMSG（scatter-gather）で送出
                             if let Some(body_data) = stale_entry.memory_body() {
                                 let body = body_data.clone(); // O(1) refcount、memcpy なし
                                 let body_len = body.len();
@@ -5900,14 +5902,13 @@ async fn handle_proxy(
                                     client_wants_close,
                                     true,
                                 );
-                                if !matches!(
-                                    timeout(WRITE_TIMEOUT, client_stream.write_all(headers)).await,
-                                    Ok((Ok(_), _))
-                                ) {
-                                    return None;
-                                }
-                                match timeout(WRITE_TIMEOUT, client_stream.write_all(body)).await {
-                                    Ok((Ok(_), _)) => {
+                                match timeout(
+                                    WRITE_TIMEOUT,
+                                    client_stream.write_all_vectored(headers, body),
+                                )
+                                .await
+                                {
+                                    Ok((Ok(()), _, _)) => {
                                         return Some((
                                             client_stream,
                                             stale_entry.status_code,
@@ -7530,24 +7531,19 @@ async fn transfer_response_with_compression(
                     modified_headers = new_header_lines.into_iter().flatten().collect();
                 }
 
-                // 修正したヘッダーを送信
-                let write_result =
-                    timeout(WRITE_TIMEOUT, client_stream.write_all(modified_headers)).await;
-                if !matches!(write_result, Ok((Ok(_), _))) {
+                // 修正したヘッダー + 初期ボディを送信
+                // F-59: 平文接続では 1 回の SENDMSG（scatter-gather）で送出
+                let body_data = body_start.to_vec();
+                let write_result = timeout(
+                    WRITE_TIMEOUT,
+                    client_stream.write_all_vectored(modified_headers, body_data),
+                )
+                .await;
+                if !matches!(write_result, Ok((Ok(()), _, _))) {
                     return (total, status_code, false, true);
                 }
                 total += header_len as u64;
-
-                // 初期ボディを送信
-                if !body_start.is_empty() {
-                    let body_data = body_start.to_vec();
-                    let write_result =
-                        timeout(WRITE_TIMEOUT, client_stream.write_all(body_data)).await;
-                    if !matches!(write_result, Ok((Ok(_), _))) {
-                        return (total, status_code, false, true);
-                    }
-                    total += body_start.len() as u64;
-                }
+                total += body_start.len() as u64;
 
                 // 残りのボディを転送（キャッシュキャプチャ対応）
                 let body_remaining = if let Some(cl) = parsed.content_length {
@@ -8983,22 +8979,18 @@ async fn transfer_https_response_with_compression(
                     modified_headers = new_header_lines.into_iter().flatten().collect();
                 }
 
-                let write_result =
-                    timeout(WRITE_TIMEOUT, client_stream.write_all(modified_headers)).await;
-                if !matches!(write_result, Ok((Ok(_), _))) {
+                // F-59: ヘッダー + 初期ボディを平文接続では 1 回の SENDMSG で送出
+                let body_data = body_start.to_vec();
+                let write_result = timeout(
+                    WRITE_TIMEOUT,
+                    client_stream.write_all_vectored(modified_headers, body_data),
+                )
+                .await;
+                if !matches!(write_result, Ok((Ok(()), _, _))) {
                     return (total, status_code, false, true);
                 }
                 total += header_len as u64;
-
-                if !body_start.is_empty() {
-                    let body_data = body_start.to_vec();
-                    let write_result =
-                        timeout(WRITE_TIMEOUT, client_stream.write_all(body_data)).await;
-                    if !matches!(write_result, Ok((Ok(_), _))) {
-                        return (total, status_code, false, true);
-                    }
-                    total += body_start.len() as u64;
-                }
+                total += body_start.len() as u64;
 
                 // 残りのボディを転送
                 let body_remaining = if let Some(cl) = parsed.content_length {

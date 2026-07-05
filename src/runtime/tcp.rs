@@ -24,6 +24,7 @@ use crate::runtime::executor::{
 };
 use crate::runtime::ring::{
     IORING_OP_ACCEPT, IORING_OP_CONNECT, IORING_OP_POLL_ADD, IORING_OP_RECV, IORING_OP_SEND,
+    IORING_OP_SENDMSG,
 };
 
 // POLL イベントフラグ
@@ -407,6 +408,56 @@ impl TcpStream {
             user_data: 0,
             submitted: false,
         }
+    }
+
+    /// 2 つの不連続バッファを 1 回の SENDMSG（scatter-gather）で書き込む（F-59）
+    ///
+    /// ヘッダ + ボディのようにメモリ上不連続な 2 バッファを、コピー・連結なしに
+    /// 1 SQE / 1 CQE で送出する。`skip` は 2 バッファを連結とみなした先頭からの
+    /// 送信済みバイト数（部分送信の継続用）。
+    pub fn writev2<A: IoBuf, B: IoBuf>(&self, a: A, b: B, skip: usize) -> SendMsgFuture<A, B> {
+        SendMsgFuture {
+            fd: self.fd,
+            bufs: Some((a, b)),
+            skip,
+            state: None,
+            user_data: 0,
+            submitted: false,
+        }
+    }
+
+    /// 2 つの不連続バッファを全量書き込む（F-59: SENDMSG scatter-gather）
+    ///
+    /// 部分送信（short write）時は送信済みオフセットを進めて iovec を再構築し、
+    /// 全量送出まで SENDMSG を再発行する。バッファのコピーは一切発生しない。
+    pub async fn write_all_vectored<A: IoBuf, B: IoBuf>(
+        &self,
+        a: A,
+        b: B,
+    ) -> (io::Result<()>, A, B) {
+        let total = a.bytes_init() + b.bytes_init();
+        let mut sent = 0usize;
+        let (mut a, mut b) = (a, b);
+        while sent < total {
+            let (res, ra, rb) = self.writev2(a, b, sent).await;
+            a = ra;
+            b = rb;
+            match res {
+                Ok(0) => {
+                    return (
+                        Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "sendmsg returned zero",
+                        )),
+                        a,
+                        b,
+                    );
+                }
+                Ok(n) => sent += n,
+                Err(e) => return (Err(e), a, b),
+            }
+        }
+        (Ok(()), a, b)
     }
 
     /// 読み取り可能になるまで待つ（POLL_ADD POLLIN）
@@ -844,6 +895,189 @@ impl<T: IoBuf> Drop for WriteFuture<T> {
 }
 
 // ====================
+// SendMsg (scatter-gather) Future（F-59）
+// ====================
+
+/// SENDMSG 用のカーネル参照領域（`iovec` 配列 + `msghdr`）。
+///
+/// カーネルは CQE 返却まで `msghdr` と `msg_iov` の指す `iovec` 配列、さらに各 `iovec` が
+/// 指すバッファを読むため、これらすべてのアドレスが in-flight 中に移動・解放されては
+/// ならない。`Box` によりヒープ上でアドレスを固定し、Future の drop 時（B-07 ガード）には
+/// バッファとまとめて detach ガードへ移して CQE 到着まで延命する。
+struct SendMsgState {
+    iovecs: [libc::iovec; 2],
+    msghdr: libc::msghdr,
+}
+
+impl SendMsgState {
+    fn new_boxed() -> Box<Self> {
+        // SAFETY: iovec / msghdr は全ゼロが有効な初期値（ポインタは submit 前に設定する）
+        Box::new(unsafe { std::mem::zeroed() })
+    }
+}
+
+// ホットパスでの Box 確保を避けるための SendMsgState スレッドローカルプール。
+// 取得は同期スコープ内で完結し、借用を await 跨ぎで保持しない（B-16 の教訓）。
+thread_local! {
+    static SENDMSG_STATE_POOL: std::cell::RefCell<Vec<Box<SendMsgState>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+const SENDMSG_STATE_POOL_MAX: usize = 64;
+
+fn acquire_sendmsg_state() -> Box<SendMsgState> {
+    SENDMSG_STATE_POOL
+        .with(|pool| pool.borrow_mut().pop())
+        .unwrap_or_else(SendMsgState::new_boxed)
+}
+
+fn release_sendmsg_state(state: Box<SendMsgState>) {
+    SENDMSG_STATE_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < SENDMSG_STATE_POOL_MAX {
+            pool.push(state);
+        }
+        // 満杯なら Drop で解放
+    });
+}
+
+/// scatter-gather 書き込み Future（IORING_OP_SENDMSG、F-59）
+///
+/// 2 つの不連続バッファ（ヘッダ + ボディ）を 1 SQE で送出する。
+/// `skip` は 2 バッファを連結とみなした先頭からの送信済みバイト数で、
+/// 部分送信の続きを再発行する際に iovec の開始位置と長さを調整する。
+///
+/// ## メモリ安全性（B-07 拡張）
+///
+/// in-flight 中にカーネルが参照するのは (1) `msghdr` (2) `iovec` 配列 (3) 各バッファ本体。
+/// (1)(2) は `Box<SendMsgState>` でヒープ固定し、(3) は所有権を Future が保持する。
+/// Future が in-flight のまま drop された場合は 3 者すべてを detach ガードへ移し、
+/// 完了/キャンセルの CQE 到着までカーネルと同期して延命する。
+pub struct SendMsgFuture<A: IoBuf, B: IoBuf> {
+    fd: RawFd,
+    /// in-flight のまま drop された場合に detach ガードへ移すため Option で保持
+    bufs: Option<(A, B)>,
+    /// 連結視での送信済みバイト数（この位置から iovec を構築する）
+    skip: usize,
+    /// カーネル参照領域（submit 時に確保、完了時にプールへ返却）
+    state: Option<Box<SendMsgState>>,
+    user_data: u64,
+    submitted: bool,
+}
+
+impl<A: IoBuf, B: IoBuf> Future for SendMsgFuture<A, B> {
+    type Output = (io::Result<usize>, A, B);
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: SendMsgFuture 自体は自己参照を持たない（カーネル参照領域は Box で固定）
+        let this = unsafe { self.get_unchecked_mut() };
+
+        if !this.submitted {
+            let mut state = acquire_sendmsg_state();
+
+            // skip を反映した iovec を構築（空になった iovec は詰めて除外する）
+            let (a, b) = this
+                .bufs
+                .as_ref()
+                .expect("SendMsgFuture polled after completion");
+            let (a_ptr, a_len) = (a.read_ptr(), a.bytes_init());
+            let (b_ptr, b_len) = (b.read_ptr(), b.bytes_init());
+            let skip = this.skip;
+            debug_assert!(skip < a_len + b_len);
+
+            let mut iov_count = 0usize;
+            if skip < a_len {
+                state.iovecs[iov_count] = libc::iovec {
+                    iov_base: unsafe { a_ptr.add(skip) } as *mut libc::c_void,
+                    iov_len: a_len - skip,
+                };
+                iov_count += 1;
+                if b_len > 0 {
+                    state.iovecs[iov_count] = libc::iovec {
+                        iov_base: b_ptr as *mut libc::c_void,
+                        iov_len: b_len,
+                    };
+                    iov_count += 1;
+                }
+            } else {
+                let b_skip = skip - a_len;
+                state.iovecs[iov_count] = libc::iovec {
+                    iov_base: unsafe { b_ptr.add(b_skip) } as *mut libc::c_void,
+                    iov_len: b_len - b_skip,
+                };
+                iov_count += 1;
+            }
+
+            state.msghdr = unsafe { std::mem::zeroed() };
+            state.msghdr.msg_iov = state.iovecs.as_mut_ptr();
+            // msg_iovlen はターゲットにより型が異なる（glibc: usize / musl: c_int）
+            state.msghdr.msg_iovlen = iov_count as _;
+
+            let user_data = alloc_op();
+            this.user_data = user_data;
+
+            let fd = this.fd;
+            let msghdr_ptr = &state.msghdr as *const libc::msghdr as u64;
+            with_ring(|ring| {
+                if let Some(sqe) = ring.get_sqe() {
+                    sqe.opcode = IORING_OP_SENDMSG;
+                    sqe.fd = fd;
+                    sqe.addr_or_splice_off_in = msghdr_ptr;
+                    sqe.len = 1;
+                    sqe.op_flags = libc::MSG_NOSIGNAL as u32;
+                    sqe.user_data = user_data;
+                }
+            });
+            this.state = Some(state);
+
+            if let Err(e) = submit_sqes() {
+                remove_op(user_data);
+                release_sendmsg_state(this.state.take().expect("state present on submit error"));
+                let (a, b) = this.bufs.take().expect("buffers present on submit error");
+                return Poll::Ready((Err(e), a, b));
+            }
+
+            this.submitted = true;
+        }
+
+        match take_op_result(this.user_data) {
+            Some(n) => {
+                release_sendmsg_state(this.state.take().expect("state present at completion"));
+                let (a, b) = this.bufs.take().expect("buffers present at completion");
+                if n < 0 {
+                    Poll::Ready((Err(io::Error::from_raw_os_error(-n)), a, b))
+                } else {
+                    Poll::Ready((Ok(n as usize), a, b))
+                }
+            }
+            None => {
+                set_op_waker(this.user_data, cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+}
+
+impl<A: IoBuf, B: IoBuf> Drop for SendMsgFuture<A, B> {
+    fn drop(&mut self) {
+        // submitted かつリソースが手元にある = SENDMSG が in-flight のまま drop された。
+        // カーネルは msghdr / iovec / バッファをまだ参照しているため、3 者すべてを
+        // detach ガードへ移して CQE 到着まで延命する（B-07 拡張）。
+        if self.submitted {
+            if let (Some(bufs), Some(state)) = (self.bufs.take(), self.state.take()) {
+                detach_op(
+                    self.user_data,
+                    OpGuard::Cleanup(Box::new(move |_res| {
+                        drop(bufs);
+                        release_sendmsg_state(state);
+                    })),
+                );
+            }
+        }
+    }
+}
+
+// ====================
 // Readable / Writable Future
 // ====================
 
@@ -1110,5 +1344,98 @@ pub fn wait_writable_fd(fd: RawFd) -> WritableFd {
         fd,
         user_data: 0,
         submitted: false,
+    }
+}
+
+// ====================
+// テスト
+// ====================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read as _;
+
+    /// 受信スレッドを立て、接続クローズまでの全受信バイトを返すリスナーを作る。
+    fn spawn_sink_server() -> (SocketAddr, std::thread::JoinHandle<Vec<u8>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let handle = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().expect("accept");
+            let mut received = Vec::new();
+            s.read_to_end(&mut received).expect("read_to_end");
+            received
+        });
+        (addr, handle)
+    }
+
+    /// F-59: SENDMSG scatter-gather で 2 バッファが 1 回で正しく送出されること。
+    #[test]
+    fn test_writev2_sendmsg_scatter_gather() {
+        let (addr, handle) = spawn_sink_server();
+
+        let header = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n".to_vec();
+        let body = bytes::Bytes::from_static(b"hello");
+        let mut expected = header.clone();
+        expected.extend_from_slice(&body);
+
+        crate::runtime::block_on(async move {
+            let stream = TcpStream::connect(addr).await.expect("connect");
+            let (res, _h, _b) = stream.write_all_vectored(header, body).await;
+            res.expect("write_all_vectored");
+            // stream drop で fd がクローズされサーバーは EOF を観測する
+        });
+
+        let received = handle.join().expect("join");
+        assert_eq!(received, expected);
+    }
+
+    /// F-59: ボディが空でも SENDMSG（iovec 1 本）で送出できること。
+    #[test]
+    fn test_writev2_sendmsg_empty_body() {
+        let (addr, handle) = spawn_sink_server();
+
+        let header = b"HTTP/1.1 204 No Content\r\n\r\n".to_vec();
+        let expected = header.clone();
+
+        crate::runtime::block_on(async move {
+            let stream = TcpStream::connect(addr).await.expect("connect");
+            let (res, _h, _b) = stream.write_all_vectored(header, bytes::Bytes::new()).await;
+            res.expect("write_all_vectored");
+        });
+
+        let received = handle.join().expect("join");
+        assert_eq!(received, expected);
+    }
+
+    /// F-59: ソケット送信バッファを大きく超えるデータで部分送信（short write）が発生しても、
+    /// skip 進行の再発行で全量が順序どおり送出されること。
+    #[test]
+    fn test_write_all_vectored_short_write_continuation() {
+        let (addr, handle) = spawn_sink_server();
+
+        // ヘッダ 1KB + ボディ 4MB（送信バッファを大きく超え、確実に複数回の SENDMSG になる）
+        let header = vec![b'H'; 1024];
+        let mut body_vec = Vec::with_capacity(4 * 1024 * 1024);
+        for i in 0..4 * 1024 * 1024usize {
+            body_vec.push((i % 251) as u8); // 素数周期でオフセットずれを検出しやすくする
+        }
+        let body = bytes::Bytes::from(body_vec);
+
+        let mut expected = header.clone();
+        expected.extend_from_slice(&body);
+
+        crate::runtime::block_on(async move {
+            let stream = TcpStream::connect(addr).await.expect("connect");
+            let (res, _h, _b) = stream.write_all_vectored(header, body).await;
+            res.expect("write_all_vectored");
+        });
+
+        let received = handle.join().expect("join");
+        assert_eq!(received.len(), expected.len());
+        assert_eq!(
+            received, expected,
+            "byte order must be preserved across short writes"
+        );
     }
 }

@@ -19,7 +19,8 @@ use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use crate::runtime::ring::{
     IoUring, IoUringCqe, IORING_OP_ACCEPT, IORING_OP_ASYNC_CANCEL, IORING_OP_CLOSE,
     IORING_OP_CONNECT, IORING_OP_NOP, IORING_OP_POLL_ADD, IORING_OP_POLL_REMOVE, IORING_OP_RECV,
-    IORING_OP_SEND, IORING_OP_SPLICE, IORING_OP_TIMEOUT, IORING_SETUP_R_DISABLED,
+    IORING_OP_SEND, IORING_OP_SENDMSG, IORING_OP_SPLICE, IORING_OP_TIMEOUT,
+    IORING_SETUP_R_DISABLED,
 };
 
 // ====================
@@ -27,6 +28,11 @@ use crate::runtime::ring::{
 // ====================
 
 /// リバースプロキシが使用する io_uring オペコード一覧
+///
+/// F-59: `IORING_OP_SENDMSG` を追加。ヘッダ + ボディの不連続バッファを 1 SQE / 1 CQE の
+/// scatter-gather 送信（ゼロコピー）で送出するために使用する。セキュリティサーフェスの
+/// 拡大（restriction 許可リスト +1）は、レスポンス送出ホットパスの syscall/SQE 半減の
+/// 利得を優先して許容する（`docs/backlog/features/F-59` 参照）。
 pub const PROXY_ALLOWED_OPCODES: &[u8] = &[
     IORING_OP_NOP,
     IORING_OP_POLL_ADD,
@@ -37,6 +43,7 @@ pub const PROXY_ALLOWED_OPCODES: &[u8] = &[
     IORING_OP_CONNECT,
     IORING_OP_RECV,
     IORING_OP_SEND,
+    IORING_OP_SENDMSG,
     IORING_OP_CLOSE,
     IORING_OP_SPLICE,
 ];

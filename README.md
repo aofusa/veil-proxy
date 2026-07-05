@@ -80,7 +80,7 @@ A high-performance reverse proxy server using io_uring (custom runtime) and rust
 - **IP Restriction**: IP address filtering with CIDR support
 - **Privilege Dropping**: Drop to unprivileged user after root startup
 - **seccomp Filter**: BPF-based system call restriction with argument-level PROT_EXEC validation for mmap/mprotect (optional)
-- **io_uring Opcode Restrictions**: `IORING_REGISTER_RESTRICTIONS` applied at ring creation to allow only necessary opcodes (ACCEPT/RECV/SEND/CONNECT/TIMEOUT/SPLICE/POLL_ADD)
+- **io_uring Opcode Restrictions**: `IORING_REGISTER_RESTRICTIONS` applied at ring creation to allow only necessary opcodes (ACCEPT/RECV/SEND/SENDMSG/CONNECT/TIMEOUT/SPLICE/POLL_ADD)
 - **Landlock Sandbox**: Filesystem access restriction (Linux 5.13+)
 - **systemd Sandbox**: Namespace isolation and system call restriction support
 

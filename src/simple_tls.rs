@@ -119,6 +119,34 @@ impl SimpleTlsServerStream {
     pub fn is_http2(&self) -> bool {
         self.alpn_protocol() == Some(b"h2")
     }
+
+    /// 2 つの不連続バッファ（ヘッダ + ボディ）を全量書き込む（F-59）
+    ///
+    /// 平文（`TlsMode::Plain`）接続では 1 回の `IORING_OP_SENDMSG`（scatter-gather）で
+    /// 送出し、syscall/SQE を半減する。rustls モードはユーザー空間でレコード化するため
+    /// 従来の 2 回書き込みへフォールバックする。
+    pub async fn write_all_vectored<A: IoBuf, B: IoBuf>(
+        &mut self,
+        a: A,
+        b: B,
+    ) -> (io::Result<()>, A, B) {
+        if self.mode == TlsMode::Plain {
+            return self.inner.write_all_vectored(a, b).await;
+        }
+        use crate::runtime::io::AsyncWriteRentExt;
+        let (res, a) = self.write_all(a).await;
+        if let Err(e) = res {
+            return (Err(e), a, b);
+        }
+        if b.bytes_init() > 0 {
+            let (res, b) = self.write_all(b).await;
+            if let Err(e) = res {
+                return (Err(e), a, b);
+            }
+            return (Ok(()), a, b);
+        }
+        (Ok(()), a, b)
+    }
 }
 
 impl AsRawFd for SimpleTlsServerStream {

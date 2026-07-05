@@ -94,7 +94,7 @@
 | F-50 | P1 | 完了 | [features/F-50-tls-cipher-suites-config.md](features/F-50-tls-cipher-suites-config.md) | [tls] cipher_suites 設定（nginx 風の取捨選択・優先度指定。リロード経路にも伝搬、E2E でネゴシエーション検証） |
 | F-51 | P1 | 完了 | [features/F-51-config-toml-sync.md](features/F-51-config-toml-sync.md) | config.toml を src/config.rs と完全同期（route.security/WASM capabilities 等 19 キー追記、stale な [grpc] セクションと dead な RetryPolicy を削除、同期保証テスト追加） |
 | F-58 | P1 | 完了 | [features/F-58-perf-report-glibc-musl-nginx.md](features/F-58-perf-report-glibc-musl-nginx.md) | パフォーマンス測定レポート（glibc/musl/nginx 比較・B-13/B-14/B-15 修正後の再測定）。全 24 計測 Non-2xx=0、レポート `docs/artifacts/performance_report_veil_vs_nginx_v2.md` |
-| F-59 | P2 | 保留 | [features/F-59-writev-scatter-gather-cache.md](features/F-59-writev-scatter-gather-cache.md) | メモリキャッシュヒットの `writev` scatter-gather 1-syscall 送出（F-31 残件）。SENDMSG 追加が必要で io_uring セキュリティサーフェス拡大とのトレードオフのため保留 |
+| F-59 | P2 | 完了 | [features/F-59-writev-scatter-gather-cache.md](features/F-59-writev-scatter-gather-cache.md) | ヘッダ + ボディの scatter-gather 1-syscall 送出。**実装済み**: `IORING_OP_SENDMSG` を許可リストへ追加（サーフェス拡大を許容する判断）、`SendMsgFuture`（msghdr/iovec の Box 固定 + B-07 detach 延命 + 状態プール）、short-write 継続、キャッシュヒット・プロキシ応答ヘッダ+初期ボディへ配線。kTLS/rustls はフォールバック |
 | F-60 | P3 | 未着手 | [features/F-60-http3-gro-batch-autosize.md](features/F-60-http3-gro-batch-autosize.md) | HTTP/3 GRO 一括 recv・GSO/GRO セグメントサイズ自動調整（F-33 残件） |
 | F-61 | P3 | 未着手 | [features/F-61-wasm-body-filter-alloc-reduction.md](features/F-61-wasm-body-filter-alloc-reduction.md) | WASM ボディフィルタ経路のアロケーション削減（F-43 残件） |
 | F-62 | P3 | 未着手 | [features/F-62-proxy-wasm-http-call-benchmark.md](features/F-62-proxy-wasm-http-call-benchmark.md) | Proxy-Wasm「HTTP コールあり」フィルタのベンチマーク（F-48 残件、Pause/resume 配線が前提） |
