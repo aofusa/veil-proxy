@@ -55,7 +55,7 @@
 | F-53 | P1 | 進行中 | [features/F-53-chaos-engineering-expansion.md](features/F-53-chaos-engineering-expansion.md) | カオス拡充（CB・slowloris・reset 完了、Pumba/tc 残件） |
 | F-54 | P1 | 進行中 | [features/F-54-security-scan-expansion.md](features/F-54-security-scan-expansion.md) | セキュリティスキャン（testssl・cargo-deny・SECURITY.md、ZAP 残件） |
 | F-55 | P2 | 進行中 | [features/F-55-harness-hardening.md](features/F-55-harness-hardening.md) | ハーネス堅牢化（metrics リロード検知・レポート集約、GHA 残件） |
-| F-56 | P2 | 未着手 | [features/F-56-property-load-tests.md](features/F-56-property-load-tests.md) | プロパティベース・負荷テスト（proptest、wrk/k6） |
+| F-56 | P2 | 進行中 | [features/F-56-property-load-tests.md](features/F-56-property-load-tests.md) | プロパティベース・負荷テスト。**proptest でルーティング不変条件**（get_candidates の panic なし・決定性・ソート/dedup/範囲、Host/Path ワイルドカード意味論、キャッシュ整合）を `tests/routing_proptest.rs` に実装。実行中に **B-22 を検出・修正**。wrk/k6 負荷ハーネスが残件 |
 | F-57 | P2 | 未着手 | [features/F-57-container-security-ci.md](features/F-57-container-security-ci.md) | container_security CI/CD 統合（GitHub Actions nightly） |
 | F-08 | P2 | 完了 | [features/proxy-wasm-benchmarks.md](features/proxy-wasm-benchmarks.md) | Proxy-Wasm ベンチマーク（`benches/wasm.rs`：`/wasm/*` 適用 vs 非適用のレイテンシ差でフィルタオーバーヘッドを計測。Keep-Alive で接続コスト償却） |
 | F-10 | P1 | 完了 | [features/opentelemetry.md](features/opentelemetry.md) | OpenTelemetry 対応 |
@@ -152,6 +152,7 @@
 | B-19 | P1 | 完了 | [bugs/B-19-proxy-wasm-abi-mismatch.md](bugs/B-19-proxy-wasm-abi-mismatch.md) | Proxy-Wasm ABI 不一致（BufferType 番号・マップ直列化形式）で SDK の読み取り系 API を使うモジュールが panic。F-62 で検出。**修正済み**: 定数を SDK/ABI 準拠へ、直列化を `host/abi.rs` へ集約（SDK 互換ワイヤ形式 + 不正データ拒否） |
 | B-20 | P1 | 完了 | [bugs/B-20-wasm-sync-call-async-store-panic.md](bugs/B-20-wasm-sync-call-async-store-panic.md) | WASM 読み取り系ホスト関数 5 つが async store で同期 `call` を使い panic（"must use call_async"）。F-62 で検出。**修正済み**: `func_wrap_async` + `call_async` 化 |
 | B-21 | P1 | 完了 | [bugs/B-21-hpack-huffman-decode-shift-panic.md](bugs/B-21-hpack-huffman-decode-shift-panic.md) | HPACK Huffman デコーダが不正入力（符号非一致でビット蓄積）でシフト量オーバーフロー panic。外部から HTTP/2 ヘッダで到達可能な DoS 面。`cargo fuzz`（F-52）で検出。**修正済み**: 最長符号長(30bit)超過で HuffmanDecodeError を返すガード + 回帰テスト（クラッシュ入力・ラウンドトリップ） |
+| B-22 | P2 | 完了 | [bugs/B-22-path-wildcard-boundary-mismatch.md](bugs/B-22-path-wildcard-boundary-mismatch.md) | パスワイルドカード `/api/*` が境界パス `/api`・`/api/` を取りこぼす（matchit キャッチオール `{*rest}` が空セグメント非対応、fallback `matches_pattern` と意味論不一致）。F-56 プロパティテストで検出。**修正済み**: ワイルドカードを matchit + fallback へ二重登録し境界意味論を一致（候補は上位で dedup）。回帰単体 + プロパティテスト |
 
 ---
 

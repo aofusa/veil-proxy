@@ -285,6 +285,10 @@ futures = "0.3.31"
 # テスト用一時ディレクトリ
 tempfile = "3.24.0"
 
+# プロパティベーステスト（F-56：ルーティング不変条件の検証。任意入力で panic なし・
+# 決定性・キャッシュ整合を検査）。テスト専用のためデータプレーン依存には含めない。
+proptest = "1"
+
 # TLS証明書生成（テスト用自己署名証明書）
 rcgen = { version = "0.14.6", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
 

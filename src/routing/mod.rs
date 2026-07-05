@@ -220,6 +220,14 @@ impl PathRouter {
 
             if let Err(_) = self.router.insert(matchit_pattern.clone(), vec![route_idx]) {
                 self.patterns.push((pattern.to_string(), route_idx));
+            } else if pattern.ends_with("/*") {
+                // B-22: matchit のキャッチオール `{*rest}` は **空セグメント** にマッチしない
+                // ため、`/api/*` が境界パス `/api`・`/api/` を取りこぼす。fallback の
+                // `matches_pattern` は本来これらを含む正しいプレフィックス境界意味論を持つ
+                // ので、ワイルドカードパターンは matchit（深いパスの高速一致）に加えて
+                // fallback にも登録し、両経路の意味論を一致させる。深いパスは両方に一致するが
+                // 候補は上位（OptimizedRouter）で dedup される。
+                self.patterns.push((pattern.to_string(), route_idx));
             }
         }
     }
@@ -800,6 +808,24 @@ mod tests {
         let candidates = router.get_candidates("/api/v1/users");
         assert!(candidates.contains(&1));
         assert!(candidates.contains(&2));
+    }
+
+    /// B-22 回帰: `/api/*` は境界パス `/api`・`/api/` にもマッチし（matchit の空
+    /// キャッチオール取りこぼしを fallback で補完）、`/apix` のような語境界外は
+    /// 誤検出しないこと。matchit 経路と fallback 経路の意味論一致を検証する。
+    #[test]
+    fn test_path_wildcard_boundary_matches_base_and_trailing_slash() {
+        let mut router = PathRouter::new();
+        router.add_route(0, Some("/api/*"));
+
+        // 境界パス（空セグメント）— 従来 matchit の {*rest} が取りこぼしていたケース。
+        assert!(router.get_candidates("/api").contains(&0), "/api should match /api/*");
+        assert!(router.get_candidates("/api/").contains(&0), "/api/ should match /api/*");
+        // 深いパス（matchit 経路）。
+        assert!(router.get_candidates("/api/v1").contains(&0));
+        // 語境界外は非マッチ（/apix は /api/ 配下ではない）。
+        assert!(!router.get_candidates("/apix").contains(&0), "/apix must not match /api/*");
+        assert!(!router.get_candidates("/other").contains(&0));
     }
 
     #[test]
