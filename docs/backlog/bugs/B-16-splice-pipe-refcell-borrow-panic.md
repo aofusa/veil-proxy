@@ -4,7 +4,7 @@
 
 `tools/container_security/chaos/bad_backend_chaos.sh`（F-67 で追加したバックエンド
 プロトコル違反カオス）。不正なバックエンド応答を返すモックへ Veil をプロキシさせた際に
-顕在化。**本チケットは事象記録のみ。修正は未実施。**
+顕在化。**2026-07-05 修正済み**（下記「修正内容」参照）。
 
 ## 事象（再現手順）
 
@@ -44,12 +44,30 @@
 - 不正バックエンド応答（早期切断・巨大ヘッダー）で splice 経路のエラーパスが
   通常と異なる順序で `get_splice_pipe()` を呼ぶことが引き金と推定。
 
-## 改修案（実施しない）
+## 修正内容（2026-07-05）
 
-- `get_splice_pipe()` が `Ref` を返さず、必要な操作をクロージャ内で完結させる
-  （`with(|pipe| ...)` パターン）か、借用を await 跨ぎで保持しない呼び出し規約に変更する。
-- あるいは初期化を接続開始時の同期地点に前倒しし、ホットパスでの `borrow_mut()` を排除する。
-- 修正時は `bad_backend_chaos.sh` を回帰テストとして用いる。
+根本原因は 2 つ:
+
+1. `get_splice_pipe()` が `RefCell` の `Ref` を `unsafe transmute` で `'static` 化して
+   返却し、呼び出し側（`proxy_http_request_splice`）が **await を跨いで保持**していた。
+   その間に同一スレッドの別タスクが `get_splice_pipe()` を呼ぶと、遅延初期化のための
+   無条件 `borrow_mut()`（初期化済みでも実行される）が `BorrowMutError` で panic。
+2. そもそも単一のスレッドローカルパイプを複数タスクが await 跨ぎで共有すると、
+   splice 途中データの**混線**（別リクエストへの応答データ漏れ）リスクがあった。
+
+修正（`src/pool.rs` / `src/proxy.rs`）:
+
+- `SPLICE_PIPE`（`RefCell<Option<SplicePipe>>`）を L4 パイプツール（F-40）と同じ
+  **checkout/return 型プール** `SPLICE_PIPE_POOL`（`RefCell<Vec<SplicePipe>>`、上限 64）へ置換。
+- `get_splice_pipe()` は所有権ベースの RAII ガード `PooledSplicePipe` を返す。
+  借用はプール pop/push の同期スコープ内でのみ発生し、await 跨ぎの `Ref` 保持が構造的に不可能。
+- ガードの Drop で FIONREAD により**残データが無い場合のみ**プールへ返却
+  （残データあり・ioctl 失敗・満杯時は破棄）。データ混線を防止。
+- `proxy.rs` 側の `#[allow(unused_assignments)]` によるライフタイム延命ハックも撤去。
+
+回帰テスト: `src/pool.rs::tests::splice_pipe_pool`（同時 2 ガード保持で panic しない /
+クリーンなパイプの再利用 / 残データありパイプの破棄 / プール上限）。
+`bad_backend_chaos.sh`（F-67）も回帰確認に使用可能。
 
 ## 関連
 

@@ -386,34 +386,86 @@ thread_local! {
     pub(crate) static HTTPS_POOL: RefCell<HttpsConnectionPool> = RefCell::new(HttpsConnectionPool::new());
 }
 
-// kTLS 有効時のスレッドローカル Splice パイプ
-// splice(2) によるゼロコピー転送に使用
+// kTLS 有効時のスレッドローカル Splice パイプの checkout/return 型プール（B-16）
+// splice(2) によるゼロコピー転送に使用。
+//
+// 旧実装は `RefCell<Option<SplicePipe>>` の `Ref` を `'static` に transmute して
+// 返却しており、呼び出し側が await を跨いで `Ref` を保持したまま同一スレッドの
+// 別タスクが再度 `borrow_mut()`（遅延初期化）を実行すると `BorrowMutError` panic、
+// さらに同一パイプの並行 splice によるデータ混線のリスクがあった。
+// 本実装は L4 パイプツール（F-40）と同じ checkout/return 方式:
+// 取得時にプールから所有権ごと取り出し（借用を await 跨ぎで保持しない）、
+// Drop 時に FIONREAD で空を確認できた場合のみプールへ返却する。
 #[cfg(feature = "ktls")]
 thread_local! {
-    pub(crate) static SPLICE_PIPE: RefCell<Option<ktls_rustls::SplicePipe>> = RefCell::new(None);
+    static SPLICE_PIPE_POOL: RefCell<Vec<ktls_rustls::SplicePipe>> =
+        const { RefCell::new(Vec::new()) };
 }
 
-/// スレッドローカルな Splice パイプを取得または初期化
+/// プールに保持するパイプ本数の上限（スレッドごと）。
+/// kTLS splice 経路は 1 リクエストあたり 1 本使用するため、同時 64 リクエスト分をカバーする。
 #[cfg(feature = "ktls")]
-pub(crate) fn get_splice_pipe() -> std::cell::Ref<'static, Option<ktls_rustls::SplicePipe>> {
-    SPLICE_PIPE.with(|p| {
-        {
-            let mut pipe = p.borrow_mut();
-            if pipe.is_none() {
-                match ktls_rustls::SplicePipe::new() {
-                    Ok(new_pipe) => {
-                        *pipe = Some(new_pipe);
-                        ftlog::info!("Splice pipe initialized for this thread");
-                    }
-                    Err(e) => {
-                        ftlog::warn!("Failed to create splice pipe: {}", e);
-                    }
-                }
-            }
+const SPLICE_PIPE_POOL_MAX: usize = 64;
+
+/// プールから取得した splice パイプの RAII ガード。
+///
+/// 所有権ベースのため await を跨いで保持しても `RefCell` の借用は残らない。
+/// Drop 時、パイプに残データが無い（FIONREAD == 0）場合のみプールへ返却する。
+/// 残データがあるパイプを再利用すると次のリクエストへデータが混線するため、
+/// それ以外（残データあり・ioctl 失敗・プール満杯）は破棄する（fd クローズ）。
+#[cfg(feature = "ktls")]
+pub(crate) struct PooledSplicePipe {
+    pipe: Option<ktls_rustls::SplicePipe>,
+}
+
+#[cfg(feature = "ktls")]
+impl std::ops::Deref for PooledSplicePipe {
+    type Target = ktls_rustls::SplicePipe;
+
+    fn deref(&self) -> &Self::Target {
+        // 不変条件: `pipe` は Drop まで必ず Some（take するのは drop 内のみ）
+        self.pipe.as_ref().unwrap()
+    }
+}
+
+#[cfg(feature = "ktls")]
+impl Drop for PooledSplicePipe {
+    fn drop(&mut self) {
+        let Some(pipe) = self.pipe.take() else {
+            return;
+        };
+        let mut pending: libc::c_int = 0;
+        let ret = unsafe { libc::ioctl(pipe.read_fd(), libc::FIONREAD, &mut pending) };
+        if ret != 0 || pending != 0 {
+            // 残データあり or ioctl 失敗: 破棄（SplicePipe::drop が fd をクローズ）
+            return;
         }
-        // Safety: ライフタイムを'staticに拡張（thread_localなので安全）
-        unsafe { std::mem::transmute(p.borrow()) }
-    })
+        SPLICE_PIPE_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if pool.len() < SPLICE_PIPE_POOL_MAX {
+                pool.push(pipe);
+            }
+            // 満杯なら Drop で破棄
+        });
+    }
+}
+
+/// スレッドローカルプールから splice パイプを取得する（B-16: 所有権ベース）。
+///
+/// プールが空の場合は新規作成（`pipe2(2)`）にフォールバックする。
+/// 作成に失敗した場合は `None` を返す（呼び出し側は通常転送へフォールバック）。
+#[cfg(feature = "ktls")]
+pub(crate) fn get_splice_pipe() -> Option<PooledSplicePipe> {
+    if let Some(pipe) = SPLICE_PIPE_POOL.with(|pool| pool.borrow_mut().pop()) {
+        return Some(PooledSplicePipe { pipe: Some(pipe) });
+    }
+    match ktls_rustls::SplicePipe::new() {
+        Ok(pipe) => Some(PooledSplicePipe { pipe: Some(pipe) }),
+        Err(e) => {
+            ftlog::warn!("Failed to create splice pipe: {}", e);
+            None
+        }
+    }
 }
 
 // ====================
@@ -841,4 +893,74 @@ pub(crate) fn init_server_header(enabled: bool, value: &str) {
         if enabled { "enabled" } else { "disabled" },
         if enabled { value } else { "" }
     );
+}
+
+// ====================
+// テスト
+// ====================
+
+#[cfg(test)]
+mod tests {
+    // B-16: splice パイプの checkout/return プールの回帰テスト。
+    // 各テストは独立スレッドで実行されるため thread_local プールは常に空から始まる。
+    #[cfg(feature = "ktls")]
+    mod splice_pipe_pool {
+        use super::super::*;
+
+        fn pool_len() -> usize {
+            SPLICE_PIPE_POOL.with(|p| p.borrow().len())
+        }
+
+        /// 複数のガードを同時に保持できること（旧実装では 2 回目の取得で
+        /// `RefCell` 二重借用 panic した経路の回帰テスト）。
+        #[test]
+        fn test_concurrent_guards_do_not_panic() {
+            let a = get_splice_pipe().expect("pipe a");
+            let b = get_splice_pipe().expect("pipe b");
+            // 別々のパイプが払い出される（同一パイプの並行使用によるデータ混線がない）
+            assert_ne!(a.read_fd(), b.read_fd());
+            assert_ne!(a.write_fd(), b.write_fd());
+            drop(a);
+            drop(b);
+            assert_eq!(pool_len(), 2);
+        }
+
+        /// 空のパイプは Drop でプールへ返却され、次の取得で再利用されること。
+        #[test]
+        fn test_reuses_clean_pipe() {
+            let pipe = get_splice_pipe().expect("pipe");
+            let fd = pipe.read_fd();
+            drop(pipe);
+            assert_eq!(pool_len(), 1);
+            let pipe2 = get_splice_pipe().expect("pipe2");
+            assert_eq!(pipe2.read_fd(), fd);
+        }
+
+        /// 残データのあるパイプは返却されず破棄されること（データ混線防止）。
+        #[test]
+        fn test_discards_dirty_pipe() {
+            let pipe = get_splice_pipe().expect("pipe");
+            let buf = [0u8; 8];
+            let n = unsafe {
+                libc::write(
+                    pipe.write_fd(),
+                    buf.as_ptr() as *const libc::c_void,
+                    buf.len(),
+                )
+            };
+            assert_eq!(n, 8);
+            drop(pipe);
+            assert_eq!(pool_len(), 0);
+        }
+
+        /// プールが上限を超えて肥大化しないこと。
+        #[test]
+        fn test_respects_max() {
+            let guards: Vec<_> = (0..SPLICE_PIPE_POOL_MAX + 8)
+                .map(|_| get_splice_pipe().expect("pipe"))
+                .collect();
+            drop(guards);
+            assert_eq!(pool_len(), SPLICE_PIPE_POOL_MAX);
+        }
+    }
 }

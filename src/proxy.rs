@@ -8133,59 +8133,36 @@ async fn proxy_http_request_splice(
         config.performance.per_stream_pipe_enabled
     };
 
-    // パイプ取得: ストリーム毎の新規パイプ or スレッドローカル再利用
+    // パイプ取得: ストリーム毎の新規パイプ or スレッドローカルプールから checkout（B-16）
     //
-    // 重要: 以下のunused_assignments警告は意図的に抑制しています。
-    // 理由: Rustの所有権システムでは、参照が有効な間は元の値を保持する必要があります。
-    //       `pipe` は借用参照であり、その参照元である `per_stream_pipe` または
-    //       `thread_local_pipe_ref` が関数終了まで生存する必要があります。
-    //       これらの変数への代入は「読み取られない」ように見えますが、
-    //       実際にはライフタイム延長のために必須です。
-    //
-    // 参照: 実装評価レポート validation_report.md (2025-12-29)
-    #[allow(unused_assignments)]
-    let mut per_stream_pipe: Option<SplicePipe> = None;
-    #[allow(unused_assignments)]
-    let mut thread_local_pipe_ref = None;
-
-    // #[allow(unused_assignments)] は以下のif-elseブロック内の代入にも適用
-    // コンパイラはこれらを「読み取られない」と判断しますが、
-    // 実際には所有権保持のために必須です
-    let pipe: &SplicePipe = if per_stream_pipe_enabled {
+    // どちらの経路も所有権ベースのため、await を跨いで RefCell の借用が残らない。
+    // プール checkout は Drop 時に残データ検査つきで返却される（src/pool.rs）。
+    let per_stream_pipe: Option<SplicePipe> = if per_stream_pipe_enabled {
         // ストリーム毎に新規パイプを作成（高並行性環境向け）
         match SplicePipe::new() {
-            Ok(p) => {
-                per_stream_pipe = Some(p);
-                // thread_local_pipe_ref への代入は不要（per_stream_pipe が所有権を持つ）
-                per_stream_pipe.as_ref().unwrap()
-            }
+            Ok(p) => Some(p),
             Err(e) => {
                 warn!(
-                    "Failed to create per-stream splice pipe: {}, falling back to thread-local",
+                    "Failed to create per-stream splice pipe: {}, falling back to pooled pipe",
                     e
                 );
-                // フォールバック: スレッドローカルパイプを使用
-                thread_local_pipe_ref = Some(get_splice_pipe());
-                // per_stream_pipe への代入は不要（thread_local_pipe_ref が所有権を持つ）
-                match thread_local_pipe_ref.as_ref().and_then(|r| r.as_ref()) {
-                    Some(p) => p,
-                    None => {
-                        warn!("splice pipe not available, falling back to normal transfer");
-                        return None;
-                    }
-                }
+                None
             }
         }
     } else {
-        // スレッドローカルパイプを再利用（メモリ効率重視）
-        // per_stream_pipe への代入は不要（thread_local_pipe_ref が所有権を持つ）
-        thread_local_pipe_ref = Some(get_splice_pipe());
-        match thread_local_pipe_ref.as_ref().and_then(|r| r.as_ref()) {
-            Some(p) => p,
-            None => {
-                warn!("splice pipe not available, falling back to normal transfer");
-                return None;
-            }
+        None
+    };
+    let pooled_pipe = if per_stream_pipe.is_none() {
+        get_splice_pipe()
+    } else {
+        None
+    };
+    let pipe: &SplicePipe = match (per_stream_pipe.as_ref(), pooled_pipe.as_deref()) {
+        (Some(p), _) => p,
+        (None, Some(p)) => p,
+        (None, None) => {
+            warn!("splice pipe not available, falling back to normal transfer");
+            return None;
         }
     };
 

@@ -146,7 +146,7 @@
 | B-13 | P1 | 完了 | [bugs/B-13-seccomp-faccessat2-static-404.md](bugs/B-13-seccomp-faccessat2-static-404.md) | seccomp 許可リストに `faccessat2`(439) が無く、seccomp 有効時に静的ファイル配信が 404（HTTP/1.1 全滅・musl 版配信不能の一因）。`ALLOWED_SYSCALLS` と docker seccomp.json に faccessat/faccessat2 を追加 |
 | B-14 | P1 | 完了 | [bugs/B-14-nocache-static-file-404.md](bugs/B-14-nocache-static-file-404.md) | `cache` feature 無効（default features 等）で静的ファイル配信が 404。`get_file_info` スタブが `None` を返していた → キャッシュせず実解決する実装へ修正 |
 | B-15 | P1 | 完了 | [bugs/B-15-dockerfile-fuzz-workspace-build.md](bugs/B-15-dockerfile-fuzz-workspace-build.md) | Dockerfile(glibc/musl) の cacher が fuzz ワークスペースメンバ未対応でビルド失敗（exit 101）→ cacher で fuzz マニフェスト+スタブを用意 |
-| B-16 | P0 | 未着手 | [bugs/B-16-splice-pipe-refcell-borrow-panic.md](bugs/B-16-splice-pipe-refcell-borrow-panic.md) | kTLS splice パイプ取得（`src/pool.rs:401` `get_splice_pipe` の `borrow_mut`）で RefCell 二重借用 panic。不正バックエンド応答＋並行アクセスで顕在化（F-67）。タスク単位で捕捉されプロセスは継続。**未修正・記録のみ** |
+| B-16 | P0 | 完了 | [bugs/B-16-splice-pipe-refcell-borrow-panic.md](bugs/B-16-splice-pipe-refcell-borrow-panic.md) | kTLS splice パイプ取得（`get_splice_pipe` の `borrow_mut`）で RefCell 二重借用 panic。**修正済み**: `Ref` 返却＋`'static` transmute を廃止し、L4（F-40）と同じ checkout/return 型プール（`PooledSplicePipe` RAII ガード + FIONREAD 残データ検査つき返却）へ変更。回帰単体テスト 4 件追加 |
 | B-17 | P1 | 未着手 | [bugs/B-17-malformed-backend-client-hang.md](bugs/B-17-malformed-backend-client-hang.md) | 不正バックエンド応答（ヘッダー途中切断・巨大ヘッダー・不正ステータス・即クローズ・CL 過大）でクライアント可視のハング（速やかな 502/クローズにならない）。F-67 で検出。**未修正・記録のみ** |
 
 ---
