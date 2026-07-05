@@ -107,7 +107,13 @@
 | F-69 | P2 | 進行中 | [features/F-69-pumba-network-kernel-chaos.md](features/F-69-pumba-network-kernel-chaos.md) | ネットワーク/カーネル層カオス（Pumba/tc netem）。`pumba_chaos.sh` 追加・配線。F-53 子 |
 | F-70 | P2 | 完了 | [features/F-70-wasm-abi-fuzzing.md](features/F-70-wasm-abi-fuzzing.md) | WASM モジュール/ABI 境界ファジング。`wasm_abi`（モジュールバイト列）+ **`wasm_host_abi`（ゲスト→ホスト ABI マップ復元境界の冪等性検査、`fuzz_api::wasm_host_abi_map_smoke`）** を追加。回帰単体テスト + container_security への opt-in 配線済み。実インスタンス化を伴う host functions ファジングのみ残件。F-52 子 |
 | F-71 | P2 | 進行中 | [features/F-71-asan-corpus-fuzzing.md](features/F-71-asan-corpus-fuzzing.md) | ASAN ファジングパイプライン + Corpus 永続化。`run_libfuzzer_asan.sh` + `corpus/` 追加・配線。TSAN/MSAN・外部永続化が残件。F-52 子 |
-| F-72 | P3 | 未着手 | [features/F-72-security-testing-further-hardening.md](features/F-72-security-testing-further-hardening.md) | セキュリティテスト追加提案（レポート範囲外）: gitleaks・スマグリング専用・差分テスト・OSS-Fuzz・カバレッジ常設・回帰コーパス |
+| F-72 | P3 | 完了 | [features/F-72-security-testing-further-hardening.md](features/F-72-security-testing-further-hardening.md) | セキュリティテスト追加提案（レポート範囲外）。6 項目を **個別チケット F-75〜F-80 へ分割**して backlog へ反映（本チケットの受け入れ条件を達成） |
+| F-75 | P2 | 完了 | [features/F-75-secret-scan-gitleaks.md](features/F-75-secret-scan-gitleaks.md) | シークレットスキャン（gitleaks）。`run_gitleaks.sh` 追加（SARIF・redact・非ブロッキング）、`run.sh` フェーズ 4g + `report.sh` に配線。トリアージ方針の文書化が残件。F-72 子 |
+| F-76 | P2 | 未着手 | [features/F-76-http-smuggling-active-tests.md](features/F-76-http-smuggling-active-tests.md) | HTTP リクエストスマグリング専用テスト（CL.TE/TE.CL/H2C ダウングレード能動検査）。F-72 子 |
+| F-77 | P3 | 未着手 | [features/F-77-differential-testing.md](features/F-77-differential-testing.md) | プロトコル差分テスト（Veil vs nginx/envoy の応答差分比較）。F-72 子 |
+| F-78 | P3 | 未着手 | [features/F-78-oss-fuzz-integration.md](features/F-78-oss-fuzz-integration.md) | OSS-Fuzz 連携（継続ファジング・クラッシュ自動起票、外部インフラ依存）。F-72 子 |
+| F-79 | P3 | 未着手 | [features/F-79-fuzz-coverage-llvm-cov.md](features/F-79-fuzz-coverage-llvm-cov.md) | カバレッジ計測の常設化（cargo llvm-cov、suite サマリ統合）。F-72 子 |
+| F-80 | P2 | 一部完了 | [features/F-80-regression-corpus.md](features/F-80-regression-corpus.md) | 回帰コーパス固定（既知クラッシュを corpus seed + 単体テスト化）。B-21/B-22 は単体テスト固定済み、corpus seed 追加が残件。F-72 子 |
 | F-73 | P1 | 完了 | [features/F-73-http2-send-zerocopy-writeall.md](features/F-73-http2-send-zerocopy-writeall.md) | HTTP/2 送信ホットパスの write_all ゼロコピー化（per-frame の 2 度目の to_vec 確保+コピーを排除）。A/B で **HTTP/2 +11.6%**（1577→1761 req/s、nginx 比 75%→84%）、HTTP/1.1 不変・応答ボディ sha256 一致。レポート `docs/artifacts/performance_report_veil_vs_nginx_v3.md` |
 | F-74 | P1 | 完了 | [features/F-74-http2-send-frame-coalescing.md](features/F-74-http2-send-frame-coalescing.md) | HTTP/2 送信ホットパスのフレーム連結（HEADERS/DATA コアレッシング）。1 レスポンス分のフレームを接続再利用連結バッファ `write_buf`（スレッドローカルプール）へ積み **1 回の書き込み** で送出。`encode_*_into` 追記 API・`send_headers_buffered`・128KB 途中フラッシュ閾値を追加。per-frame 送信システムコールを削減。単体 660 / http2 E2E 11 / gRPC E2E 35 グリーン。F-73 続き |
 | F-11 | P3 | 未着手 | [features/dashboard.md](features/dashboard.md) | ダッシュボード機能 |

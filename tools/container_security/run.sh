@@ -221,6 +221,9 @@ main() {
     # フェーズ 4f: DAST（OWASP ZAP baseline、F-66、既定 SKIP）
     "${SCRIPT_DIR}/security/run_zap.sh" || log "ZAP で警告（レポート参照）"
 
+    # フェーズ 4g: シークレットスキャン（gitleaks、F-75）
+    "${SCRIPT_DIR}/security/run_gitleaks.sh" || log "gitleaks で警告（レポート参照）"
+
     # フェーズ 5: Trivy イメージスキャン
     run_trivy_scan
 

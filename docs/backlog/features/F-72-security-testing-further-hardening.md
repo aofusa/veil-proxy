@@ -31,6 +31,19 @@
 6. **回帰コーパスとしての既知クラッシュ固定**
    - B-16/B-17 等の再現入力を `corpus/`・E2E に固定し、修正後の回帰を防ぐ。
 
+## 個別チケットへの分割（2026-07-05）
+
+各提案項目を個別チケット化し `backlog.md` に反映した:
+
+| 項目 | チケット | 状況 |
+|------|----------|------|
+| 1. シークレットスキャン | [F-75](F-75-secret-scan-gitleaks.md) | **実装済み**（`run_gitleaks.sh` 追加・配線） |
+| 2. スマグリング専用テスト | [F-76](F-76-http-smuggling-active-tests.md) | 未着手 |
+| 3. 差分（differential）テスト | [F-77](F-77-differential-testing.md) | 未着手 |
+| 4. OSS-Fuzz 連携 | [F-78](F-78-oss-fuzz-integration.md) | 未着手（P3・外部依存） |
+| 5. カバレッジ常設化 | [F-79](F-79-fuzz-coverage-llvm-cov.md) | 未着手 |
+| 6. 回帰コーパス固定 | [F-80](F-80-regression-corpus.md) | 一部完了（B-21/B-22 は単体テスト固定済み） |
+
 ## 受け入れ条件
 
-- 各項目のうち着手するものを個別チケット（F-xx）へ分割し、`backlog.md` に反映する。
+- [x] 各項目のうち着手するものを個別チケット（F-75〜F-80）へ分割し、`backlog.md` に反映する。
