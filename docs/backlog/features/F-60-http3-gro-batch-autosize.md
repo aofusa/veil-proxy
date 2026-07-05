@@ -30,4 +30,25 @@
 
 - quiche の API 制約（一括受信不可）。効果は環境依存。P3・任意継続。
 
-## 対応状況: 未着手
+## 実装（2026-07-05）
+
+1. **GRO 一括 recv**: F-45 で既に「バッチ全体で RefCell 借用 1 回・DCID 連続一致時の
+   ルックアップスキップ・セグメント境界のスライスゼロコピー分割」まで最適化済みであり、
+   quiche の `recv` API が 1 データグラム単位である制約上、これが到達可能な最適点で
+   あることを確認（追加変更なし）。
+2. **GSO セグメントサイズ自動調整**（`send_pending_packets`）:
+   - 送信バッファを固定 1350B から上限クランプ長（`MAX_UDP_SEND_PAYLOAD` = 65507）で確保し、
+     per-connection で quiche の PMTU 探索結果 `Connection::max_send_udp_payload_size()`
+     （ハンドシェイク中 1200 → 検証後は経路 MTU と設定 `max_udp_payload_size` の小さい方）
+     にスライスして追従。下限クランプは `MIN_UDP_SEND_PAYLOAD` = 1200（RFC 9000）。
+   - これにより `max_udp_payload_size` を 1350 超（ジャンボフレーム等）に設定した場合も
+     GSO セグメントが設定値まで自動で大きくなる。
+3. **B-18 検出・修正**: GSO バッチ合計バイトの上限チェック欠落（64 セグメント × 1350B =
+   86.4KB > sendmsg 上限 65507B → EMSGSIZE でバッチ全体破棄）を検出し、
+   `MAX_GSO_BATCH_BYTES` による事前 flush で修正。flush 判定を純関数
+   `gso_batch_must_flush_before_append` へ抽出し単体テストで境界値を検証。
+   詳細: [B-18](../bugs/B-18-http3-gso-batch-emsgsize-overflow.md)
+
+テスト: 単体 `test_gso_batch_flush_rules`、HTTP/3 E2E 35 件回帰なし。
+
+## 対応状況: 完了（2026-07-05）

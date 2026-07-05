@@ -3175,8 +3175,19 @@ async fn send_pending_packets(
         let mut seg_size = 0usize;
         let mut dest: Option<SocketAddr> = None;
 
+        // F-60: GSO セグメントサイズの自動調整。quiche の PMTU 探索結果
+        // （`max_send_udp_payload_size`: ハンドシェイク中 1200 → 検証後は
+        // 設定上限・経路 MTU の小さい方へ成長）に per-connection で追従し、
+        // 下限 MIN_UDP_SEND_PAYLOAD / 上限 send_buf 長でクランプする。
+        // これによりハンドシェイク初期は RFC 準拠の 1200B、検証後は経路が許す
+        // 最大セグメントで GSO バッチが構成される。
+        let max_payload = handler
+            .conn
+            .max_send_udp_payload_size()
+            .clamp(MIN_UDP_SEND_PAYLOAD, send_buf.len());
+
         loop {
-            let (write, send_info) = match handler.conn.send(send_buf.as_mut_slice()) {
+            let (write, send_info) = match handler.conn.send(&mut send_buf[..max_payload]) {
                 Ok(v) => v,
                 Err(quiche::Error::Done) => break,
                 Err(quiche::Error::CryptoFail) => {
@@ -3194,9 +3205,12 @@ async fn send_pending_packets(
 
             // 宛先が変わった or セグメントサイズが変わった（均一バッチの境界）場合は
             // 現在のバッチを先に flush する（GSO は最終セグメント以外を均一サイズ要求）。
+            // B-18: 合計バイトが sendmsg の UDP ペイロード上限を超える場合も先に flush する
+            // （超過すると EMSGSIZE でバッチ全体が破棄される）。
             let dest_changed = dest.is_some_and(|d| d != send_info.to);
-            let size_breaks = !offsets.is_empty() && write != seg_size;
-            if dest_changed || size_breaks {
+            if dest_changed
+                || gso_batch_must_flush_before_append(offsets.len(), batch.len(), write, seg_size)
+            {
                 if let Some(d) = dest {
                     flush_gso_batch(socket, batch.as_slice(), offsets.as_slice(), d).await;
                 }
@@ -3247,9 +3261,43 @@ async fn send_pending_packets(
 /// GSO セグメント上限（UDP GSO の一般的な最大セグメント数）
 const MAX_GSO_SEGMENTS: usize = 64;
 
+/// F-60: 送信セグメントサイズの下限クランプ（RFC 9000 の最小 QUIC データグラム 1200B）
+const MIN_UDP_SEND_PAYLOAD: usize = 1200;
+
+/// F-60: 送信セグメントサイズの上限クランプ（単一 UDP データグラムの最大ペイロード。
+/// 65535 - 8(UDP ヘッダ) - 20(IPv4 ヘッダ) = 65507）。
+/// 実際のセグメントサイズは quiche の PMTU 探索と設定 `max_udp_payload_size` の
+/// 小さい方に per-connection で自動追従する（`send_pending_packets` 参照）。
+const MAX_UDP_SEND_PAYLOAD: usize = 65507;
+
+/// B-18: 1 回の sendmsg(UDP_SEGMENT) に載せられる GSO バッチ合計バイト上限。
+/// UDP sendmsg のペイロード上限（65507）を超えると EMSGSIZE でバッチ全体が破棄される
+/// （QUIC の再送で回復するが帯域・レイテンシを浪費する）ため、超過前に flush する。
+/// 従来は MAX_GSO_SEGMENTS(64) × 1350B = 86.4KB まで蓄積し得たため上限超過が起こり得た。
+const MAX_GSO_BATCH_BYTES: usize = 65507;
+
+/// 次パケット（`write` バイト）をバッチへ追加する**前に** flush が必要か判定する。
+///
+/// - 均一サイズ要求: バッチ内の既存セグメントサイズ `seg_size` と異なるサイズは同居不可
+///   （GSO は最終セグメントのみ小さくてよい。大きくなるケースは分割が必要）
+/// - B-18: 追加すると合計が `MAX_GSO_BATCH_BYTES` を超える場合は先に flush
+#[inline]
+fn gso_batch_must_flush_before_append(
+    offsets_len: usize,
+    batch_len: usize,
+    write: usize,
+    seg_size: usize,
+) -> bool {
+    if offsets_len == 0 {
+        return false;
+    }
+    write != seg_size || batch_len + write > MAX_GSO_BATCH_BYTES
+}
+
 /// `send_pending_packets` 用の送信スクラッチ（スレッドローカルで再利用）。
 struct H3SendScratch {
-    /// quiche の単一パケット書き出し用バッファ（最大 1350B）
+    /// quiche の単一パケット書き出し用バッファ（F-60: 上限クランプ長で確保し、
+    /// per-connection の動的セグメントサイズでスライスして使用）
     send_buf: Vec<u8>,
     /// GSO バッチ連結バッファ
     batch: Vec<u8>,
@@ -3269,7 +3317,7 @@ fn take_h3_send_scratch() -> H3SendScratch {
     H3_SEND_SCRATCH
         .with(|s| s.borrow_mut().take())
         .unwrap_or_else(|| H3SendScratch {
-            send_buf: vec![0u8; 1350],
+            send_buf: vec![0u8; MAX_UDP_SEND_PAYLOAD],
             batch: Vec::new(),
             offsets: Vec::new(),
         })
@@ -3432,5 +3480,41 @@ mod tests {
         let config = Http3ServerConfig::default();
         assert_eq!(config.max_idle_timeout, 30000);
         assert_eq!(config.max_udp_payload_size, 1350);
+    }
+
+    /// B-18: GSO バッチの flush 判定。
+    #[test]
+    fn test_gso_batch_flush_rules() {
+        // 空バッチには常に追加可能（flush 不要）
+        assert!(!gso_batch_must_flush_before_append(0, 0, 1350, 0));
+        assert!(!gso_batch_must_flush_before_append(0, 0, 65507, 0));
+
+        // 均一サイズ・上限内は追加可能
+        assert!(!gso_batch_must_flush_before_append(2, 2700, 1350, 1350));
+
+        // セグメントサイズが変わる場合は flush（GSO の均一サイズ要求）
+        assert!(gso_batch_must_flush_before_append(2, 2700, 800, 1350));
+        assert!(gso_batch_must_flush_before_append(2, 2700, 1500, 1350));
+
+        // B-18: 合計バイトが sendmsg の UDP ペイロード上限を超える場合は flush。
+        // 従来は 64 セグメント × 1350B = 86.4KB まで蓄積し EMSGSIZE でバッチ全体が
+        // 破棄されていた（48 セグメント目で 64800 + 1350 > 65507）。
+        assert!(gso_batch_must_flush_before_append(
+            48,
+            48 * 1350,
+            1350,
+            1350
+        ));
+
+        // ちょうど上限までは許容
+        let seg = 1000;
+        let batch_len = 64_507; // + 1000 = 65507 (== MAX_GSO_BATCH_BYTES)
+        assert!(!gso_batch_must_flush_before_append(10, batch_len, seg, seg));
+        assert!(gso_batch_must_flush_before_append(
+            10,
+            batch_len + 1,
+            seg,
+            seg
+        ));
     }
 }

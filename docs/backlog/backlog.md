@@ -95,7 +95,7 @@
 | F-51 | P1 | 完了 | [features/F-51-config-toml-sync.md](features/F-51-config-toml-sync.md) | config.toml を src/config.rs と完全同期（route.security/WASM capabilities 等 19 キー追記、stale な [grpc] セクションと dead な RetryPolicy を削除、同期保証テスト追加） |
 | F-58 | P1 | 完了 | [features/F-58-perf-report-glibc-musl-nginx.md](features/F-58-perf-report-glibc-musl-nginx.md) | パフォーマンス測定レポート（glibc/musl/nginx 比較・B-13/B-14/B-15 修正後の再測定）。全 24 計測 Non-2xx=0、レポート `docs/artifacts/performance_report_veil_vs_nginx_v2.md` |
 | F-59 | P2 | 完了 | [features/F-59-writev-scatter-gather-cache.md](features/F-59-writev-scatter-gather-cache.md) | ヘッダ + ボディの scatter-gather 1-syscall 送出。**実装済み**: `IORING_OP_SENDMSG` を許可リストへ追加（サーフェス拡大を許容する判断）、`SendMsgFuture`（msghdr/iovec の Box 固定 + B-07 detach 延命 + 状態プール）、short-write 継続、キャッシュヒット・プロキシ応答ヘッダ+初期ボディへ配線。kTLS/rustls はフォールバック |
-| F-60 | P3 | 未着手 | [features/F-60-http3-gro-batch-autosize.md](features/F-60-http3-gro-batch-autosize.md) | HTTP/3 GRO 一括 recv・GSO/GRO セグメントサイズ自動調整（F-33 残件） |
+| F-60 | P3 | 完了 | [features/F-60-http3-gro-batch-autosize.md](features/F-60-http3-gro-batch-autosize.md) | HTTP/3 GRO 一括 recv・GSO/GRO セグメントサイズ自動調整（F-33 残件）。**実装済み**: GSO セグメントを quiche PMTU 探索へ per-connection 追従（クランプ 1200〜65507）。GRO 側は F-45 時点で最適点を確認。実装中に **B-18 を検出・修正** |
 | F-61 | P3 | 未着手 | [features/F-61-wasm-body-filter-alloc-reduction.md](features/F-61-wasm-body-filter-alloc-reduction.md) | WASM ボディフィルタ経路のアロケーション削減（F-43 残件） |
 | F-62 | P3 | 未着手 | [features/F-62-proxy-wasm-http-call-benchmark.md](features/F-62-proxy-wasm-http-call-benchmark.md) | Proxy-Wasm「HTTP コールあり」フィルタのベンチマーク（F-48 残件、Pause/resume 配線が前提） |
 | F-63 | P1 | 完了 | [features/F-63-log-output-routing.md](features/F-63-log-output-routing.md) | ログ出力先の分離ルーティング（app=stdout / error=stderr / access=stdout をレベル別に振り分け、`type` 識別フィールド付与、JSON 順は timestamp→level→type、ログファイル親ディレクトリを landlock_write_paths へ自動追加） |
@@ -148,6 +148,7 @@
 | B-15 | P1 | 完了 | [bugs/B-15-dockerfile-fuzz-workspace-build.md](bugs/B-15-dockerfile-fuzz-workspace-build.md) | Dockerfile(glibc/musl) の cacher が fuzz ワークスペースメンバ未対応でビルド失敗（exit 101）→ cacher で fuzz マニフェスト+スタブを用意 |
 | B-16 | P0 | 完了 | [bugs/B-16-splice-pipe-refcell-borrow-panic.md](bugs/B-16-splice-pipe-refcell-borrow-panic.md) | kTLS splice パイプ取得（`get_splice_pipe` の `borrow_mut`）で RefCell 二重借用 panic。**修正済み**: `Ref` 返却＋`'static` transmute を廃止し、L4（F-40）と同じ checkout/return 型プール（`PooledSplicePipe` RAII ガード + FIONREAD 残データ検査つき返却）へ変更。回帰単体テスト 4 件追加 |
 | B-17 | P1 | 完了 | [bugs/B-17-malformed-backend-client-hang.md](bugs/B-17-malformed-backend-client-hang.md) | 不正バックエンド応答でクライアント可視のハング。**修正済み**: ヘッダーフェーズ失敗の即時 502/504 送出、`BACKEND_HEADER_TIMEOUT`(10s)・`MAX_RESPONSE_HEADER_SIZE`(64KB) 新設、CL 未達/chunked 終端前 EOF の即時クローズ（`client_must_close` 伝搬）。E2E 回帰テスト 8 件（`test_b17_*`）追加 |
+| B-18 | P2 | 完了 | [bugs/B-18-http3-gso-batch-emsgsize-overflow.md](bugs/B-18-http3-gso-batch-emsgsize-overflow.md) | HTTP/3 GSO バッチが sendmsg の UDP ペイロード上限（65507B）を超え EMSGSIZE でバッチ全体（最大 64 パケット）が破棄され得る。F-60 実装中に検出。**修正済み**: `MAX_GSO_BATCH_BYTES` による追加前 flush + flush 判定の純関数化・単体テスト |
 
 ---
 
