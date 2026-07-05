@@ -136,7 +136,7 @@ impl SimulatedOptimizedRouter {
         let mut exact_hosts: HashMap<String, Vec<usize>> = HashMap::new();
         let mut wildcard_hosts: Vec<(String, Vec<usize>)> = Vec::new();
         let mut any_host: Vec<usize> = Vec::new();
-        let mut path_router = matchit::Router::new();
+        let mut path_router: matchit::Router<Vec<usize>> = matchit::Router::new();
         let mut any_path: Vec<usize> = Vec::new();
 
         for (idx, route) in routes.iter().enumerate() {

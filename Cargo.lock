@@ -3476,6 +3476,7 @@ dependencies = [
  "quinn",
  "rayon",
  "rcgen",
+ "ring",
  "rustls",
  "rustls-pki-types",
  "serde",
