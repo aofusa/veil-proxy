@@ -109,13 +109,14 @@ FUZZ_RUNS=2000 FUZZ_MAX_TIME=120 ./tools/container_security/fuzz/run_libfuzzer.s
 | 1 HTTP ファジング | `harness/scripts/fuzz_http.py` | 不正ヘッダー・不完全リクエストのブラックボックス送信 |
 | 1b libFuzzer | `fuzz/run_libfuzzer.sh` | HPACK / TOML / HTTP/2 フレーム / HTTP/1 ヘッダー境界（オプション） |
 | 1c libFuzzer(ASAN) | `fuzz/run_libfuzzer_asan.sh` | 上記を AddressSanitizer + 永続 corpus で実行（F-71、既定 SKIP） |
+| 1d libFuzzer(TSAN) | `fuzz/run_libfuzzer_tsan.sh` | ThreadSanitizer でデータ競合検出（F-71、既定 SKIP） |
 | 2 h2spec | `harness/scripts/h2spec_run.sh` | HTTP/2 プロトコル準拠（TLS + H2C） |
 | 3 カオス負荷 | `harness/scripts/chaos_load.sh` | 高並行 HTTP/HTTPS、接続チャーン、SIGHUP リロード |
 | 3b Toxiproxy | `toxiproxy_chaos.sh` | 遅延注入・回復、`limit_data` による接続リセット |
 | 3c サーキットブレーカー | `circuit_breaker_chaos.sh` | upstream 障害 → CB 発火 → 回復（Prometheus + 5xx カウント） |
 | 3d slowloris | `slowloris_chaos.sh` | 部分リクエストによる backpressure、事後ヘルス |
 | 3e bad_backend | `chaos/bad_backend_chaos.sh` | バックエンドのプロトコル違反（F-67、既定 SKIP。B-16/B-17 検出実績） |
-| 3f Pumba netem | `chaos/pumba_chaos.sh` | パケットロス/遅延/重複/破損の注入と回復（F-69、既定 SKIP） |
+| 3f Pumba netem | `chaos/pumba_chaos.sh` | パケットロス/遅延/重複/破損/順序逆転 + 複合(loss+delay)の注入と回復（F-69、既定 SKIP） |
 | 3g リソース枯渇 | `chaos/resource_exhaustion_chaos.sh` | cgroup 制約下の高並行負荷で panic/OOM 回避（F-68、既定 SKIP） |
 | 4 セキュリティ | `security_scan.sh` | TLS ハンドシェイク、メソッド制限、TRACE、パストラバーサル |
 | 4a testssl | `security/run_testssl.sh` | `drwetter/testssl.sh` コンテナで TLS 設定スキャン |
@@ -187,6 +188,10 @@ CARGO_TARGET_DIR=/tmp/veil-build-target cargo build -p veil-fuzz
 | `SKIP_PUMBA` | `1` | Pumba netem カオス（F-69） |
 | `SKIP_RESOURCE_EXHAUSTION` | `1` | リソース枯渇カオス（F-68） |
 | `SKIP_LIBFUZZER_ASAN` | `1` | libFuzzer + ASAN（F-71） |
+| `SKIP_LIBFUZZER_TSAN` | `1` | libFuzzer + TSAN（データ競合、F-71） |
+| `SKIP_PUMBA_COMPOUND` | `0` | Pumba の複合障害（tc で loss+delay 同時、F-69） |
+| `SEED_REGRESSION_CORPUS` | `1` | `fuzz/regression_corpus/` の既知クラッシュ seed をコーパスへ複製（F-80） |
+| `SEMGREP_CUSTOM_RULES` | `1` | `.semgrep/` の Veil カスタムルールを併用（F-64） |
 | `SKIP_CHAOS_LOAD` | `0` | 高並行負荷 + SIGHUP（`KERNEL_REQUIRE_IO_URING=1` 時は自動） |
 
 ### h2spec

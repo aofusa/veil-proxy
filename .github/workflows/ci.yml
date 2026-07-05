@@ -1,0 +1,95 @@
+# F-57: PR / push ゲート CI
+#
+# fmt / clippy / feature マトリクスビルド / ユニット・統合・E2E テストを実行する。
+# データプレーンは Linux/io_uring 前提のため ubuntu ランナーで実行する。
+# コンテナ必須のフルセキュリティスイート（fuzz/chaos/scan）は nightly（別 workflow）。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# 同一ブランチの古い実行はキャンセルして無駄なランナー消費を避ける。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # ネットワーク不要なオフラインビルドで再現性を高める。
+  CARGO_NET_RETRY: "3"
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy (full)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: sudo apt-get update -y && sudo apt-get install -y cmake nasm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # AGENTS.md: allow(dead_code) 禁止・論拠なき allow 追加禁止のため、
+      # 変更由来の新規 warning を可視化する（既存のツールチェーン全体 lint は別途対応）。
+      - run: cargo clippy --features full --tests
+
+  build:
+    name: build (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - features: "--no-default-features"
+          - features: "" # default features
+          - features: "--features full"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: sudo apt-get update -y && sudo apt-get install -y cmake nasm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build ${{ matrix.features }}
+
+  test:
+    name: unit + integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: sudo apt-get update -y && sudo apt-get install -y cmake nasm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Unit tests (lib, full)
+        run: cargo test --lib --features full
+      - name: Integration tests (full)
+        run: cargo test --test integration_tests --features full
+      - name: Routing property tests
+        run: cargo test --test routing_proptest --features full
+
+  e2e:
+    name: e2e (features full)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: sudo apt-get update -y && sudo apt-get install -y cmake nasm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # E2E は専用バックエンドを自動セットアップ・実行・クリーンアップする。
+      - name: Run E2E suite
+        run: ./tests/e2e_setup.sh test

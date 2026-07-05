@@ -22,11 +22,24 @@
   汎用ルールは本コードベースでは `unsafe` を一律に警告するノイズが主。
   詳細は `docs/artifacts/security_chaos_fuzzing_report_findings.md`。
 
+## 実装済み（カスタムルール・2026-07-05）
+
+- `.semgrep/veil-rules.yml`（generic `pattern-regex`、対象 `src/` 限定）に **誤検知が極小の
+  高信号ルール**を整備:
+  - `veil-no-static-lifetime-transmute`（ERROR）: ライフタイムを `'static` へ延命する
+    transmute（B-16 の RefCell 借用 UAF panic と同種）。現状 src/ 0 件＝新規混入の番人。
+  - `veil-no-bare-allow-dead-code`（WARNING）: 素の `#[allow(dead_code)]`（AGENTS.md 禁止事項。
+    cfg 条件つき `#[cfg_attr(..., allow(dead_code))]` は許容＝regex で除外、既存 3 件ベースライン）。
+- `run_semgrep.sh` に `--config /src/.semgrep`（`SEMGREP_CUSTOM_RULES=0` で無効化可能）を配線。
+- **設計判断**: `block_on`/`thread::sleep`/`std::net` の一律検出は、テスト/起動配線/offload
+  専用スレッド等の正当用途（実測 block_on 49・sleep 11 箇所の大半）を単純 regex では
+  区別できずノイズになるため**あえて含めない**（F-64 目的「意味のある差分だけ」）。
+  `#[cfg(test)]` スコープを解する AST ベース検査が要るため [F-79] で対応する。
+
 ## 残件
 
-- `unsafe` 一律警告ではなく、**io_uring/ゼロコピー固有の不変条件**を検査する
-  カスタム semgrep ルール（`.semgrep/` 配下）を整備し、意味のある差分だけを拾う。
-- CI（[F-57](F-57-container-security-ci.md)）で PR 時にベースライン差分のみ失敗させる。
+- CI（[F-57](F-57-container-security-ci.md)）で PR 時にベースライン差分のみ失敗させる
+  仕組み（現状は nightly で全件レポート。差分ゲートは semgrep `--baseline-commit` 利用で別途）。
 
 ## 受け入れ条件
 

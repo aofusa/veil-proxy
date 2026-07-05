@@ -43,8 +43,8 @@ pub fn wasm_host_abi_map_smoke(bytes: &[u8]) {
     };
     // 復元に成功したマップは正規形へ直列化でき、再復元で同一に戻ること（冪等）。
     let reserialized = serialize_headers(&map);
-    let reparsed = deserialize_headers(&reserialized)
-        .expect("re-serialized canonical map must deserialize");
+    let reparsed =
+        deserialize_headers(&reserialized).expect("re-serialized canonical map must deserialize");
     assert_eq!(
         map, reparsed,
         "host ABI map roundtrip must be idempotent (guest/host consistency)"

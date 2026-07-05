@@ -36,6 +36,15 @@ docker run --rm \
         rustup component add llvm-tools-preview 2>/dev/null || true
         cargo install cargo-fuzz --locked 2>/dev/null
         cd fuzz
+        # F-80: 回帰 seed を cargo-fuzz 既定コーパス（fuzz/corpus/<target>/）へ複製。
+        if [ -d regression_corpus ]; then
+            for tdir in regression_corpus/*/; do
+                [ -d \"\${tdir}\" ] || continue
+                tname=\$(basename \"\${tdir}\")
+                mkdir -p \"corpus/\${tname}\"
+                cp -n \"\${tdir}\"* \"corpus/\${tname}/\" 2>/dev/null || true
+            done
+        fi
         for target in ${FUZZ_TARGETS}; do
             echo \"libfuzzer target=\${target}\" | tee -a /results/libfuzzer_report.txt
             cargo fuzz run \"\${target}\" -- -runs=${FUZZ_RUNS} -max_total_time=${FUZZ_MAX_TIME} \

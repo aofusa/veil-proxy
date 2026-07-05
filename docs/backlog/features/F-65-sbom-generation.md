@@ -19,10 +19,17 @@
 - ソース: **823 コンポーネント**（Rust クレート）。
 - イメージ（`veil:glibc`）: **7 パッケージ**（distroless 相当の最小構成）。
 
+## 実装済み（CI 添付・2026-07-05）
+
+- **`.github/workflows/container-security-nightly.yml` の `sbom-release` ジョブ**で
+  `run_sbom.sh` を実行し、`sbom_source.cdx.json`（CycloneDX）+ `sbom_image.spdx.json`（SPDX）を
+  **artifact として保存**（retention 90 日、[F-57](F-57-container-security-ci.md)）。
+
 ## 残件
 
-- `grype`/`cargo-audit` と SBOM を連携し、SBOM ベースの脆弱性照合を CI 成果物に添付。
-- CycloneDX/SPDX を GitHub Release にアタッチ（[F-57](F-57-container-security-ci.md)）。
+- `grype` と SBOM を連携した SBOM ベースの脆弱性照合（現状は cargo-audit/deny が別フェーズで
+  依存脆弱性を検査）。
+- GitHub **Release** への正式アタッチ（タグ発行フロー確立後。現状は nightly artifact）。
 
 ## 受け入れ条件
 

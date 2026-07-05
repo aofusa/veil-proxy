@@ -858,8 +858,10 @@ mod tests {
     #[test]
     fn send_request_emits_correct_frames_and_parses_response() {
         let resp_body = b"pong";
-        let mut client =
-            H2cClient::new(ScriptedStream::new(build_response(resp_body)), Http2Settings::default());
+        let mut client = H2cClient::new(
+            ScriptedStream::new(build_response(resp_body)),
+            Http2Settings::default(),
+        );
 
         let req_body = b"ping-body";
         let resp = drive(client.send_request(

@@ -12,6 +12,7 @@ aggregate_reports() {
         "fuzz:fuzz_report.txt"
         "libfuzzer:libfuzzer_report.txt"
         "libfuzzer_asan:libfuzzer_asan_report.txt"
+        "libfuzzer_tsan:libfuzzer_tsan_report.txt"
         "h2spec:h2spec_report.txt"
         "chaos:chaos_report.txt"
         "toxiproxy:toxiproxy_chaos_report.txt"

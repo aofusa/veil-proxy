@@ -25,6 +25,19 @@ if [[ "${SKIP_LIBFUZZER_ASAN:-1}" == "1" ]]; then
     exit 0
 fi
 
+# F-80: version-controlled な回帰 seed を永続コーパスへ複製（既存を上書きしない）。
+# 既知クラッシュ（B-21 等）が必ず第 1 コーパスに含まれ、修正後の回帰を検出できる。
+REGRESSION_CORPUS="${REPO_ROOT}/fuzz/regression_corpus"
+if [[ "${SEED_REGRESSION_CORPUS:-1}" == "1" && -d "${REGRESSION_CORPUS}" ]]; then
+    for tdir in "${REGRESSION_CORPUS}"/*/; do
+        [[ -d "${tdir}" ]] || continue
+        tname="$(basename "${tdir}")"
+        mkdir -p "${CORPUS_DIR}/${tname}"
+        cp -n "${tdir}"* "${CORPUS_DIR}/${tname}/" 2>/dev/null || true
+    done
+    echo "libfuzzer_asan: seeded regression corpus" | tee -a "${REPORT}"
+fi
+
 : >"${REPORT}"
 echo "libfuzzer_asan start sanitizer=${SANITIZER} runs=${FUZZ_RUNS} max_time=${FUZZ_MAX_TIME}s" | tee -a "${REPORT}"
 

@@ -1,0 +1,42 @@
+# F-64: Veil 固有のカスタム semgrep ルール
+#
+# 汎用 p/rust は `unsafe` を一律警告してノイズになるため、ここでは AGENTS.md の
+# 「ホットパス絶対規則」「禁止事項」に直結し、かつ **誤検知が極小** の不変条件だけを拾う。
+# semgrep の Rust フロントエンドは experimental のため、取りこぼし/誤検知の少ない
+# `pattern-regex`（generic）で表現し、対象は src/ に限定する。
+#
+# 設計方針: 「意味のある差分だけを拾う」（F-64 目的）。テスト・起動配線・offload
+# 専用スレッド等で正当に使われる `block_on` / `thread::sleep` / `std::net` は、
+# 単純な正規表現ではホットパスと区別できずノイズになる（実測 block_on 49・sleep 11
+# 箇所の大半が正当）。これらは #[cfg(test)] スコープを解する AST ベース検査が必要な
+# ため本ファイルでは扱わず、[F-79] のカバレッジ/静的解析拡充で AST 対応時に追加する。
+rules:
+  # B-16（kTLS splice パイプの RefCell 借用を 'static へ延命 → UAF panic）と同種の
+  # 「ライフタイム洗浄 transmute」を検出する。現状 src/ に 0 件（新規混入を防ぐ番人）。
+  - id: veil-no-static-lifetime-transmute
+    languages: [generic]
+    severity: ERROR
+    message: >
+      ライフタイムを 'static へ延命する transmute は B-16（RefCell 借用 UAF panic）と
+      同種の危険パターン。所有権を持つ型プール（checkout/return, RAII ガード）で置き換えること。
+    paths:
+      include:
+        - "src/"
+    patterns:
+      - pattern-regex: "transmute[^;]*&\\s*'static"
+
+  # AGENTS.md 禁止事項: 素の `#[allow(dead_code)]`。cfg 条件つき
+  # （`#[cfg_attr(not(test), allow(dead_code))]` 等）は対象外＝正当なので regex で除外される。
+  # 既存 3 件はベースライン。CI（F-57）はベースライン差分で新規のみを失格にする運用を想定。
+  - id: veil-no-bare-allow-dead-code
+    languages: [generic]
+    severity: WARNING
+    message: >
+      AGENTS.md 禁止事項: 素の `#[allow(dead_code)]` は原則禁止。デッドコードは削除し、
+      どうしても必要なら理由をコメントで明記して個別レビューすること
+      （cfg 条件つき `#[cfg_attr(..., allow(dead_code))]` は許容）。
+    paths:
+      include:
+        - "src/"
+    patterns:
+      - pattern-regex: '#\[allow\(dead_code\)\]'

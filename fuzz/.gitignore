@@ -1,0 +1,8 @@
+# cargo-fuzz のビルド成果物・実行時コーパス・クラッシュ artifact は追跡しない。
+/target
+/corpus
+/artifacts
+/coverage
+
+# ただし F-80 の version-controlled 回帰 seed は追跡する（下の regression_corpus/ は
+# 上のいずれのパターンにも該当しないため既定で追跡される）。

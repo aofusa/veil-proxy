@@ -25,6 +25,11 @@ echo "semgrep start config=${SEMGREP_CONFIG}" | tee "${REPORT}"
 # --error は付けない（findings があっても suite は継続、結果は backlog 起票用）
 config_args=()
 for c in ${SEMGREP_CONFIG}; do config_args+=(--config "${c}"); done
+# F-64: Veil 固有のカスタムルール（.semgrep/）。io_uring/ゼロコピー/禁止事項の
+# 意味のある差分だけを拾う。SEMGREP_CUSTOM_RULES=0 で無効化可能。
+if [[ "${SEMGREP_CUSTOM_RULES:-1}" == "1" && -d "${REPO_ROOT}/.semgrep" ]]; then
+    config_args+=(--config /src/.semgrep)
+fi
 
 docker run --rm \
     -v "${REPO_ROOT}:/src:ro" \

@@ -1,0 +1,109 @@
+# F-57 / F-55 / F-64 / F-65 / F-71: nightly コンテナセキュリティスイート
+#
+# tools/container_security/run.sh を docker で実行し、fuzz・chaos・SAST・SBOM・
+# TLS スキャン等をまとめて回す。結果（results/）は失敗時も含め artifact として保存する。
+# 重い/専用トポロジのフェーズは入力トグルで選択的に有効化する。
+name: container-security-nightly
+
+on:
+  schedule:
+    # 毎日 UTC 18:00（JST 03:00）。
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+    inputs:
+      run_libfuzzer:
+        description: "libFuzzer（短時間）を有効化"
+        type: boolean
+        default: true
+      run_libfuzzer_asan:
+        description: "libFuzzer + ASAN を有効化（重い）"
+        type: boolean
+        default: false
+      run_wasm_fuzz:
+        description: "WASM 系 fuzz ターゲット（wasm_abi/wasm_host_abi）を有効化"
+        type: boolean
+        default: false
+
+concurrency:
+  group: container-security-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  suite:
+    name: run.sh (${{ matrix.libc }})
+    runs-on: ubuntu-latest
+    # nightly のフルスイートは長時間になり得るため上限を明示。
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        libc: [glibc, musl]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Veil image (${{ matrix.libc }})
+        working-directory: docker
+        run: |
+          docker build -f Dockerfile.${{ matrix.libc }} \
+            -t "veil:${{ matrix.libc }}" \
+            --build-arg CARGO_FEATURES='full' ..
+
+      - name: Run container security suite
+        env:
+          VEIL_IMAGE: "veil:${{ matrix.libc }}"
+          # nightly は fuzz・cargo-audit・cargo-deny を有効化。
+          SKIP_LIBFUZZER: ${{ (github.event_name == 'schedule' || inputs.run_libfuzzer) && '0' || '1' }}
+          SKIP_LIBFUZZER_ASAN: ${{ inputs.run_libfuzzer_asan && '0' || '1' }}
+          RUN_WASM_FUZZ: ${{ inputs.run_wasm_fuzz && '1' || '0' }}
+          SKIP_CARGO_AUDIT: "0"
+          SKIP_CARGO_DENY: "0"
+          SKIP_GITLEAKS: "0"
+          # h2spec はフル、fuzz は長め。
+          H2SPEC_FULL: "1"
+          FUZZ_MAX_TIME: "300"
+        run: ./tools/container_security/run.sh
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-security-results-${{ matrix.libc }}
+          path: |
+            tools/container_security/results/
+          retention-days: 14
+
+      - name: Publish suite summary
+        if: always()
+        run: |
+          summary="tools/container_security/results/suite_summary.json"
+          if [ -f "$summary" ]; then
+            echo '### container-security summary (${{ matrix.libc }})' >> "$GITHUB_STEP_SUMMARY"
+            echo '```json' >> "$GITHUB_STEP_SUMMARY"
+            cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  sbom-release:
+    name: SBOM artifact (F-65)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Veil image (glibc)
+        working-directory: docker
+        run: |
+          docker build -f Dockerfile.glibc -t "veil:glibc" \
+            --build-arg CARGO_FEATURES='full' ..
+      - name: Generate SBOM (source + image)
+        env:
+          VEIL_IMAGE: "veil:glibc"
+          SKIP_SBOM: "0"
+        run: ./tools/container_security/security/run_sbom.sh
+      - name: Upload SBOM
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: |
+            tools/container_security/results/sbom_source.cdx.json
+            tools/container_security/results/sbom_image.spdx.json
+          retention-days: 90

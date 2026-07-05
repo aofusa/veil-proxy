@@ -823,12 +823,21 @@ mod tests {
         router.add_route(0, Some("/api/*"));
 
         // 境界パス（空セグメント）— 従来 matchit の {*rest} が取りこぼしていたケース。
-        assert!(router.get_candidates("/api").contains(&0), "/api should match /api/*");
-        assert!(router.get_candidates("/api/").contains(&0), "/api/ should match /api/*");
+        assert!(
+            router.get_candidates("/api").contains(&0),
+            "/api should match /api/*"
+        );
+        assert!(
+            router.get_candidates("/api/").contains(&0),
+            "/api/ should match /api/*"
+        );
         // 深いパス（matchit 経路）。
         assert!(router.get_candidates("/api/v1").contains(&0));
         // 語境界外は非マッチ（/apix は /api/ 配下ではない）。
-        assert!(!router.get_candidates("/apix").contains(&0), "/apix must not match /api/*");
+        assert!(
+            !router.get_candidates("/apix").contains(&0),
+            "/apix must not match /api/*"
+        );
         assert!(!router.get_candidates("/other").contains(&0));
     }
 
