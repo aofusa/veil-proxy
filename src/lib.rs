@@ -40,11 +40,11 @@ pub mod http3_stream;
 #[cfg(feature = "http3")]
 pub mod udp;
 
-pub mod runtime;
-pub mod security;
 pub mod buffering;
 pub mod cache;
 pub mod routing;
+pub mod runtime;
+pub mod security;
 
 #[cfg(feature = "wasm")]
 pub mod wasm;
@@ -53,8 +53,8 @@ pub mod wasm;
 pub mod grpc;
 
 pub mod logging;
-pub mod system;
 pub mod metrics;
+pub mod system;
 
 pub mod constants;
 pub mod http_utils;
@@ -74,14 +74,14 @@ pub mod l4;
 #[cfg(not(feature = "ktls"))]
 pub mod simple_tls;
 
-pub mod tls_reload;
 pub mod config;
+pub mod tls_reload;
 pub use crate::config::*;
 pub mod fuzz_api;
 pub mod upstream;
 pub use crate::upstream::*;
-pub mod server;
 pub mod proxy;
+pub mod server;
 
 mod entry;
 pub use entry::run;

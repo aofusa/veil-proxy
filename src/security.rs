@@ -142,21 +142,21 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     // ============================================
     0,   // read
     1,   // write
-    2,   // open (musl の canonicalize/ファイルオープンが openat でなく open を使用。未許可だと static 配信が 404 になる)
-    3,   // close
-    4,   // stat (DNS解決: /etc/resolv.conf等)
-    5,   // fstat
-    6,   // lstat (DNS解決: シンボリックリンク確認)
-    8,   // lseek
-    17,  // pread64
-    18,  // pwrite64
-    19,  // readv
-    20,  // writev
-    21,  // access (DNS解決: ファイルアクセス権確認)
-    40,  // sendfile (kTLS ゼロコピー転送)
-    72,  // fcntl
-    79,  // getcwd (canonicalize() で使用)
-    89,  // readlink (canonicalize() で使用)
+    2, // open (musl の canonicalize/ファイルオープンが openat でなく open を使用。未許可だと static 配信が 404 になる)
+    3, // close
+    4, // stat (DNS解決: /etc/resolv.conf等)
+    5, // fstat
+    6, // lstat (DNS解決: シンボリックリンク確認)
+    8, // lseek
+    17, // pread64
+    18, // pwrite64
+    19, // readv
+    20, // writev
+    21, // access (DNS解決: ファイルアクセス権確認)
+    40, // sendfile (kTLS ゼロコピー転送)
+    72, // fcntl
+    79, // getcwd (canonicalize() で使用)
+    89, // readlink (canonicalize() で使用)
     257, // openat
     262, // newfstatat
     269, // faccessat (新しめの libc がファイルアクセス確認で使用)
@@ -2412,8 +2412,8 @@ mod tests {
         {
             assert!(ALLOWED_SYSCALLS.contains(&21)); // access
             assert!(ALLOWED_SYSCALLS.contains(&269)); // faccessat
-            // open(2): musl の canonicalize/ファイルオープンが openat でなく open を使うため必須。
-            // 未許可だと musl ビルドで static 配信が 404 になる回帰を防ぐ。
+                                                      // open(2): musl の canonicalize/ファイルオープンが openat でなく open を使うため必須。
+                                                      // 未許可だと musl ビルドで static 配信が 404 になる回帰を防ぐ。
             assert!(
                 ALLOWED_SYSCALLS.contains(&2),
                 "open(2) が許可リストに無いと musl の static 配信が 404 になる"

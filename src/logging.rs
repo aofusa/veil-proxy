@@ -629,19 +629,33 @@ mod tests {
     fn test_routing_text_app_vs_error() {
         let (mut w, app, err) = routing_writer(false);
         // app 行（センチネル APP）
-        let app_line = format!("2024-01-01 0ms {}INFO type=app main [f:1] hello\n", SENTINEL_APP as char);
+        let app_line = format!(
+            "2024-01-01 0ms {}INFO type=app main [f:1] hello\n",
+            SENTINEL_APP as char
+        );
         w.write_all(app_line.as_bytes()).unwrap();
         // error 行（センチネル ERROR）
-        let err_line = format!("2024-01-01 0ms {}ERROR type=error main [f:2] boom\n", SENTINEL_ERROR as char);
+        let err_line = format!(
+            "2024-01-01 0ms {}ERROR type=error main [f:2] boom\n",
+            SENTINEL_ERROR as char
+        );
         w.write_all(err_line.as_bytes()).unwrap();
 
         let app_out = s(&app);
         let err_out = s(&err);
         // app にはアプリ行のみ、error にはエラー行のみ
         assert!(app_out.contains("hello"), "app: {}", app_out);
-        assert!(!app_out.contains("boom"), "app must not have error: {}", app_out);
+        assert!(
+            !app_out.contains("boom"),
+            "app must not have error: {}",
+            app_out
+        );
         assert!(err_out.contains("boom"), "err: {}", err_out);
-        assert!(!err_out.contains("hello"), "err must not have app: {}", err_out);
+        assert!(
+            !err_out.contains("hello"),
+            "err must not have app: {}",
+            err_out
+        );
         // センチネルバイトは除去されている
         assert!(!app_out.contains(SENTINEL_APP as char));
         assert!(!err_out.contains(SENTINEL_ERROR as char));

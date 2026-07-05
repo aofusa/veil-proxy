@@ -45,8 +45,8 @@ const RESP_CHAN_CAP: usize = 8;
 use ftlog::{debug, error, info, warn};
 
 use crate::config::{
-    resolve_http3_compression_config, AcceptedEncoding, Backend, CompressionConfig,
-    ProxyTarget, SecurityConfig, UpstreamGroup, CURRENT_CONFIG, SHUTDOWN_FLAG,
+    resolve_http3_compression_config, AcceptedEncoding, Backend, CompressionConfig, ProxyTarget,
+    SecurityConfig, UpstreamGroup, CURRENT_CONFIG, SHUTDOWN_FLAG,
 };
 use crate::logging::log_access;
 use crate::metrics::encode_prometheus_metrics;

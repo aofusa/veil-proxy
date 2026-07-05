@@ -626,12 +626,31 @@ mod tests {
         // JSON: フィールド順は timestamp → type → 以降
         let mut buf = Vec::new();
         build_json_log(
-            &mut buf, test_dt(), "GET", "example.com", "/", 200, 1, "127.0.0.1", "", 0, 0,
-            "-", &[],
+            &mut buf,
+            test_dt(),
+            "GET",
+            "example.com",
+            "/",
+            200,
+            1,
+            "127.0.0.1",
+            "",
+            0,
+            0,
+            "-",
+            &[],
         );
         let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains("\"type\":\"access\""), "json type missing: {}", s);
-        assert!(s.starts_with("{\"timestamp\":"), "timestamp should be first: {}", s);
+        assert!(
+            s.contains("\"type\":\"access\""),
+            "json type missing: {}",
+            s
+        );
+        assert!(
+            s.starts_with("{\"timestamp\":"),
+            "timestamp should be first: {}",
+            s
+        );
         // type は timestamp の直後（method より前）
         let ts = s.find("\"timestamp\"").unwrap();
         let ty = s.find("\"type\"").unwrap();
@@ -641,11 +660,26 @@ mod tests {
         // Text: timestamp → type → 以降
         let mut buf = Vec::new();
         build_text_log(
-            &mut buf, test_dt(), "GET", "example.com", "/", 200, 1, "127.0.0.1", "", 0, 0,
-            "-", &[],
+            &mut buf,
+            test_dt(),
+            "GET",
+            "example.com",
+            "/",
+            200,
+            1,
+            "127.0.0.1",
+            "",
+            0,
+            0,
+            "-",
+            &[],
         );
         let s = String::from_utf8(buf).unwrap();
-        assert!(s.starts_with("timestamp="), "timestamp should be first: {}", s);
+        assert!(
+            s.starts_with("timestamp="),
+            "timestamp should be first: {}",
+            s
+        );
         let ty = s.find("type=access").unwrap();
         let me = s.find("method=").unwrap();
         assert!(ty < me, "type before method: {}", s);
@@ -657,13 +691,32 @@ mod tests {
         let fields: Vec<String> = vec!["method".to_string()];
         let mut buf = Vec::new();
         build_json_log(
-            &mut buf, test_dt(), "GET", "example.com", "/", 200, 1, "127.0.0.1", "", 0, 0,
-            "-", &fields,
+            &mut buf,
+            test_dt(),
+            "GET",
+            "example.com",
+            "/",
+            200,
+            1,
+            "127.0.0.1",
+            "",
+            0,
+            0,
+            "-",
+            &fields,
         );
         let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains("\"type\":\"access\""), "type must survive filter: {}", s);
+        assert!(
+            s.contains("\"type\":\"access\""),
+            "type must survive filter: {}",
+            s
+        );
         // timestamp はフィルタで除外されるため type が先頭になる
-        assert!(s.starts_with("{\"type\":\"access\""), "type first when ts filtered: {}", s);
+        assert!(
+            s.starts_with("{\"type\":\"access\""),
+            "type first when ts filtered: {}",
+            s
+        );
         assert!(s.contains("\"method\":\"GET\""));
         assert!(!s.contains("\"host\""));
     }

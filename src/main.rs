@@ -86,7 +86,6 @@
 //! - [rustls](https://github.com/rustls/rustls): Pure Rust TLS実装
 //! - [ktls2](https://crates.io/crates/ktls2): rustls用kTLS統合クレート
 
-
 fn main() {
     veil::run();
 }

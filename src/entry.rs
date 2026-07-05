@@ -21,8 +21,8 @@ use std::time::Duration;
 use crate::ktls_rustls::RustlsAcceptor;
 
 pub use crate::config::*;
-use crate::server::*;
 use crate::proxy::*;
+use crate::server::*;
 
 // ====================
 // ワーカースレッド
@@ -500,7 +500,9 @@ pub fn run() {
     let security_config = crate::security::SecurityConfig {
         enable_io_uring_restrictions: true, // カスタム io_uring 実装で IORING_REGISTER_RESTRICTIONS を適用
         enable_seccomp: loaded_config.global_security.enable_seccomp,
-        seccomp_mode: crate::security::SeccompMode::from_str(&loaded_config.global_security.seccomp_mode),
+        seccomp_mode: crate::security::SeccompMode::from_str(
+            &loaded_config.global_security.seccomp_mode,
+        ),
         enable_landlock: loaded_config.global_security.enable_landlock,
         landlock_read_paths: loaded_config.global_security.landlock_read_paths.clone(),
         landlock_write_paths,
