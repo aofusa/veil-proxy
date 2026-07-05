@@ -17548,3 +17548,67 @@ async fn test_b17_bad_backend_no_response_returns_504() {
     .expect("must receive a response");
     assert_eq!(res.0, 504, "unresponsive upstream must yield 504");
 }
+
+// ====================
+// F-62: Proxy-Wasm HTTP コール Pause/resume の E2E テスト
+// ====================
+//
+// http_call_filter.wasm は on_http_request_headers で upstream "backend-pool" へ
+// dispatch_http_call して Pause を返す。ホスト（エンジン）がコールをインラインで
+// 解決して proxy_on_http_call_response で resume し、フィルタはコール結果の
+// ステータスを含むローカルレスポンスを返す。
+
+#[tokio::test]
+async fn test_f62_wasm_http_call_pause_resume() {
+    let client = Http1TestClient::new_https("127.0.0.1", PROXY_PORT).expect("client");
+    let (status, headers, body) = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.send_request_with_response_headers(http::Method::GET, "/wasm-http-call/", &[], None),
+    )
+    .await
+    .expect("must not hang (pause must be resumed)")
+    .expect("must receive a response");
+
+    // フィルタが resume されローカルレスポンスを返したこと
+    assert_eq!(
+        status, 200,
+        "resumed filter must produce its local response"
+    );
+    assert_eq!(body, b"wasm-http-call-ok");
+
+    // HTTP コールの結果（backend-pool の応答ステータス 200）が反映されていること
+    let call_status = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-wasm-http-call-status"))
+        .map(|(_, v)| v.as_str());
+    assert_eq!(
+        call_status,
+        Some("200"),
+        "http_call must reach the upstream and return its status"
+    );
+    let resumed = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-wasm-http-call"))
+        .map(|(_, v)| v.as_str());
+    assert_eq!(resumed, Some("resumed"));
+}
+
+#[tokio::test]
+async fn test_f62_wasm_http_call_concurrent_requests() {
+    // Pause/resume がリクエストごとに独立して機能すること（並行 8 リクエスト）
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        handles.push(tokio::spawn(async {
+            let client = Http1TestClient::new_https("127.0.0.1", PROXY_PORT).expect("client");
+            tokio::time::timeout(Duration::from_secs(10), client.get("/wasm-http-call/"))
+                .await
+                .expect("must not hang")
+                .expect("must receive a response")
+        }));
+    }
+    for h in handles {
+        let (status, body) = h.await.expect("join");
+        assert_eq!(status, 200);
+        assert_eq!(body, b"wasm-http-call-ok");
+    }
+}

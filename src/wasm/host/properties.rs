@@ -56,11 +56,13 @@ fn get_property_value(state: &HostState, path: &str) -> Option<Vec<u8>> {
 }
 
 /// Helper to allocate memory in WASM
-fn allocate_wasm_memory(caller: &mut Caller<'_, HostState>, size: usize) -> Option<i32> {
+///
+/// B-20: async store のため `call_async` を使用（同期 `call` は panic する）。
+async fn allocate_wasm_memory(caller: &mut Caller<'_, HostState>, size: usize) -> Option<i32> {
     let func = caller.get_export("proxy_on_memory_allocate")?;
     let func = func.into_func()?;
     let typed = func.typed::<i32, i32>(&mut *caller).ok()?;
-    typed.call(&mut *caller, size as i32).ok()
+    typed.call_async(&mut *caller, size as i32).await.ok()
 }
 
 /// Helper to write to WASM memory
@@ -132,60 +134,60 @@ fn parse_path(data: &[u8]) -> Option<String> {
 /// Add properties functions to linker
 pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     // proxy_get_property
-    linker.func_wrap(
+    // B-20: wasm 側アロケータへ再入するため async ホスト関数
+    linker.func_wrap_async(
         "env",
         "proxy_get_property",
         |mut caller: Caller<'_, HostState>,
-         path_ptr: i32,
-         path_size: i32,
-         return_value_ptr: i32,
-         return_value_size: i32|
-         -> i32 {
-            // Read path from WASM memory
-            let path_data = match read_bytes(&mut caller, path_ptr, path_size) {
-                Some(d) => d,
-                None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
-            };
+         (path_ptr, path_size, return_value_ptr, return_value_size): (i32, i32, i32, i32)| {
+            Box::new(async move {
+                // Read path from WASM memory
+                let path_data = match read_bytes(&mut caller, path_ptr, path_size) {
+                    Some(d) => d,
+                    None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
+                };
 
-            let path = match parse_path(&path_data) {
-                Some(p) => p,
-                None => return PROXY_RESULT_PARSE_FAILURE,
-            };
+                let path = match parse_path(&path_data) {
+                    Some(p) => p,
+                    None => return PROXY_RESULT_PARSE_FAILURE,
+                };
 
-            let state = caller.data();
-            let value = match get_property_value(state, &path) {
-                Some(v) => v,
-                None => return PROXY_RESULT_NOT_FOUND,
-            };
+                let state = caller.data();
+                let value = match get_property_value(state, &path) {
+                    Some(v) => v,
+                    None => return PROXY_RESULT_NOT_FOUND,
+                };
 
-            // Allocate memory and write value
-            let ptr = match allocate_wasm_memory(&mut caller, value.len()) {
-                Some(p) => p,
-                None => return PROXY_RESULT_INTERNAL_FAILURE,
-            };
+                // Allocate memory and write value
+                let ptr = match allocate_wasm_memory(&mut caller, value.len()).await {
+                    Some(p) => p,
+                    None => return PROXY_RESULT_INTERNAL_FAILURE,
+                };
 
-            if !write_to_wasm(&mut caller, ptr, &value) {
-                return PROXY_RESULT_INVALID_MEMORY_ACCESS;
-            }
+                if !write_to_wasm(&mut caller, ptr, &value) {
+                    return PROXY_RESULT_INVALID_MEMORY_ACCESS;
+                }
 
-            // Write return values
-            let memory = match caller.get_export("memory") {
-                Some(wasmtime::Extern::Memory(mem)) => mem,
-                _ => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
-            };
+                // Write return values
+                let memory = match caller.get_export("memory") {
+                    Some(wasmtime::Extern::Memory(mem)) => mem,
+                    _ => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
+                };
 
-            let data = memory.data_mut(&mut caller);
-            let ptr_offset = return_value_ptr as usize;
-            let size_offset = return_value_size as usize;
+                let data = memory.data_mut(&mut caller);
+                let ptr_offset = return_value_ptr as usize;
+                let size_offset = return_value_size as usize;
 
-            if ptr_offset + 4 > data.len() || size_offset + 4 > data.len() {
-                return PROXY_RESULT_INVALID_MEMORY_ACCESS;
-            }
+                if ptr_offset + 4 > data.len() || size_offset + 4 > data.len() {
+                    return PROXY_RESULT_INVALID_MEMORY_ACCESS;
+                }
 
-            data[ptr_offset..ptr_offset + 4].copy_from_slice(&ptr.to_le_bytes());
-            data[size_offset..size_offset + 4].copy_from_slice(&(value.len() as i32).to_le_bytes());
+                data[ptr_offset..ptr_offset + 4].copy_from_slice(&ptr.to_le_bytes());
+                data[size_offset..size_offset + 4]
+                    .copy_from_slice(&(value.len() as i32).to_le_bytes());
 
-            PROXY_RESULT_OK
+                PROXY_RESULT_OK
+            })
         },
     )?;
 

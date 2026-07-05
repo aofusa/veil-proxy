@@ -78,18 +78,27 @@ pub const HTTP_CALL_RESPONSE_TRAILERS: i32 = 7;
 // proxy_buffer_type_t - Buffer types
 // ============================================================
 
+// B-19: 値は proxy-wasm ABI（Rust SDK `types::BufferType`）と一致させること。
+// 旧実装は HTTP_CALL_RESPONSE_BODY=2 / PLUGIN_CONFIGURATION=4 / VM_CONFIGURATION=5 と
+// 独自番号になっており、SDK の get_plugin_configuration()（=7）等が未知タイプ →
+// NOT_ALLOWED となり SDK 側が panic していた。
+
 /// Request body from downstream
 pub const HTTP_REQUEST_BODY: i32 = 0;
 /// Response body from upstream
 pub const HTTP_RESPONSE_BODY: i32 = 1;
+/// Downstream data (L4, not supported)
+pub const DOWNSTREAM_DATA: i32 = 2;
+/// Upstream data (L4, not supported)
+pub const UPSTREAM_DATA: i32 = 3;
 /// HTTP call response body
-pub const HTTP_CALL_RESPONSE_BODY: i32 = 2;
+pub const HTTP_CALL_RESPONSE_BODY: i32 = 4;
 /// gRPC receive buffer (not supported)
-pub const GRPC_RECEIVE_BUFFER: i32 = 3;
-/// Plugin configuration
-pub const PLUGIN_CONFIGURATION: i32 = 4;
+pub const GRPC_RECEIVE_BUFFER: i32 = 5;
 /// VM configuration
-pub const VM_CONFIGURATION: i32 = 5;
+pub const VM_CONFIGURATION: i32 = 6;
+/// Plugin configuration
+pub const PLUGIN_CONFIGURATION: i32 = 7;
 
 // ============================================================
 // proxy_stream_type_t - Stream types

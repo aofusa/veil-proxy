@@ -57,6 +57,9 @@ const PROXY_PORT: u16 = 8443; // HTTPS ポート
 /// バックエンド（静的ファイル）に実在するパスを使う: `/wasm/bench` 等の
 /// 存在しないファイルは 404 になりルート可用性判定に失敗する）
 const WASM_PATH: &str = "/wasm/";
+
+/// F-62: HTTP コール（Pause/resume）フィルタのルート
+const WASM_HTTP_CALL_PATH: &str = "/wasm-http-call/";
 /// 非 WASM ベースラインパス
 const BASELINE_PATH: &str = "/";
 
@@ -343,6 +346,60 @@ fn benchmark_wasm_overhead_keepalive(c: &mut Criterion) {
     group.finish();
 }
 
+/// F-62: 「HTTP コールあり」フィルタのベンチマーク。
+///
+/// `/wasm-http-call/*` の http_call_filter は on_request_headers で上流へ
+/// `dispatch_http_call` して Pause し、ホストがコールをインライン解決して
+/// `proxy_on_http_call_response` で resume する。header_filter（コールなし）との
+/// レイテンシ差が「Pause/resume + 上流 HTTP コール 1 回」のオーバーヘッド近似。
+fn benchmark_wasm_http_call(c: &mut Criterion) {
+    if !is_proxy_running() {
+        eprintln!("Proxy server not running, skipping WASM http_call benchmarks");
+        return;
+    }
+    if !is_wasm_route_available() {
+        eprintln!("/wasm/* route not available (start e2e with WASM config); skipping");
+        return;
+    }
+    // http_call ルートの存在確認（200 + resume ヘッダが返ること）
+    {
+        let Some((mut stream, mut tls_conn)) = connect_tls() else {
+            return;
+        };
+        let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
+        let request = format!(
+            "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            WASM_HTTP_CALL_PATH
+        );
+        if tls_stream.write_all(request.as_bytes()).is_err() {
+            eprintln!("/wasm-http-call/* route not reachable; skipping");
+            return;
+        }
+        let mut response = Vec::new();
+        let _ = tls_stream.read_to_end(&mut response);
+        let head = String::from_utf8_lossy(&response[..response.len().min(256)]);
+        if !head.starts_with("HTTP/1.1 200") {
+            eprintln!(
+                "/wasm-http-call/* route not available (start e2e with WASM config); skipping"
+            );
+            return;
+        }
+    }
+
+    let mut group = c.benchmark_group("wasm_http_call");
+    group.measurement_time(Duration::from_secs(10));
+
+    // コールなしフィルタ（header_filter）との比較
+    group.bench_function("header_filter_no_call", |b| {
+        b.iter(|| measure_request_latency(WASM_PATH));
+    });
+    group.bench_function("http_call_pause_resume", |b| {
+        b.iter(|| measure_request_latency(WASM_HTTP_CALL_PATH));
+    });
+
+    group.finish();
+}
+
 /// F-48: インスタンスプール枯渇シナリオ。
 ///
 /// 並行度をプールスロット数より小さい値から大きい値までスイープし、`/wasm/*` への
@@ -470,6 +527,7 @@ criterion_group!(
     benchmark_wasm_overhead_per_connection,
     benchmark_wasm_overhead_keepalive,
     benchmark_wasm_pool_exhaustion,
+    benchmark_wasm_http_call,
     report_fuel_and_rss,
 );
 criterion_main!(benches);

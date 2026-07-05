@@ -245,7 +245,10 @@ fn parse_http_response_from_bytes(data: &[u8]) -> Result<HttpCallResponse, Strin
     let status_code: u16 = status_parts[1].parse().map_err(|_| "Invalid status code")?;
 
     // Parse headers
+    // F-62: Proxy-Wasm SDK の get_http_call_response_headers は Envoy 互換の
+    // `:status` 擬似ヘッダを期待するため先頭に付与する
     let mut headers = Vec::new();
+    headers.push((b":status".to_vec(), status_code.to_string().into_bytes()));
     for line in header_section.lines().skip(1) {
         if let Some(colon_pos) = line.find(':') {
             let key = line[..colon_pos].trim().as_bytes().to_vec();

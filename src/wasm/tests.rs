@@ -29,9 +29,16 @@ mod constants_tests {
 
     #[test]
     fn test_buffer_type_constants() {
+        // B-19: 値は proxy-wasm Rust SDK の `types::BufferType` と一致していること
+        // （旧実装の独自番号は SDK の get_plugin_configuration 等を panic させた）
         assert_eq!(HTTP_REQUEST_BODY, 0);
         assert_eq!(HTTP_RESPONSE_BODY, 1);
-        assert_eq!(PLUGIN_CONFIGURATION, 4);
+        assert_eq!(DOWNSTREAM_DATA, 2);
+        assert_eq!(UPSTREAM_DATA, 3);
+        assert_eq!(HTTP_CALL_RESPONSE_BODY, 4);
+        assert_eq!(GRPC_RECEIVE_BUFFER, 5);
+        assert_eq!(VM_CONFIGURATION, 6);
+        assert_eq!(PLUGIN_CONFIGURATION, 7);
     }
 
     #[test]

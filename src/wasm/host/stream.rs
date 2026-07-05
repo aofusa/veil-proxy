@@ -2,6 +2,8 @@
 
 use wasmtime::{Caller, Linker};
 
+// B-19: マップ直列化は SDK 互換の共通モジュールを使用
+use super::abi::deserialize_headers;
 use crate::wasm::constants::*;
 use crate::wasm::context::HostState;
 use crate::wasm::types::LocalResponse;
@@ -184,47 +186,4 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     // Note: proxy_get_current_time_nanoseconds is defined in logging.rs
 
     Ok(())
-}
-
-/// Deserialize headers from Proxy-Wasm format
-fn deserialize_headers(data: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
-    if data.len() < 4 {
-        return None;
-    }
-
-    let num_pairs = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    let mut headers = Vec::with_capacity(num_pairs);
-    let mut pos = 4;
-
-    for _ in 0..num_pairs {
-        if pos + 4 > data.len() {
-            return None;
-        }
-        let key_len =
-            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-        pos += 4;
-
-        if pos + key_len > data.len() {
-            return None;
-        }
-        let key = data[pos..pos + key_len].to_vec();
-        pos += key_len;
-
-        if pos + 4 > data.len() {
-            return None;
-        }
-        let val_len =
-            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-        pos += 4;
-
-        if pos + val_len > data.len() {
-            return None;
-        }
-        let value = data[pos..pos + val_len].to_vec();
-        pos += val_len;
-
-        headers.push((key, value));
-    }
-
-    Some(headers)
 }

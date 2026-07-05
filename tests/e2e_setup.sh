@@ -180,6 +180,10 @@ prepare_fixtures() {
     else
         log_warn "WASM module header_filter.wasm not found at ${SCRIPT_DIR}/wasm/header_filter.wasm"
     fi
+    if [ -f "${SCRIPT_DIR}/wasm/http_call_filter.wasm" ]; then
+        cp "${SCRIPT_DIR}/wasm/http_call_filter.wasm" "${FIXTURES_DIR}/wasm/http_call_filter.wasm"
+        log_info "WASM module http_call_filter.wasm copied"
+    fi
 }
 
 # 設定ファイルを生成
@@ -799,6 +803,25 @@ allow_response_headers_read = true
 allow_response_headers_write = true
 allow_send_local_response = true
 EOF
+
+            # F-62: HTTP コール（Pause/resume）フィルタ
+            if [ -f "${FIXTURES_DIR}/wasm/http_call_filter.wasm" ]; then
+                cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
+
+[[wasm.modules]]
+name = "http_call_filter"
+path = "${FIXTURES_DIR}/wasm/http_call_filter.wasm"
+configuration = 'bad-pool'
+
+[wasm.modules.capabilities]
+allow_logging = true
+allow_request_headers_read = true
+allow_request_headers_write = true
+allow_send_local_response = true
+allow_http_calls = true
+allowed_upstreams = ["bad-pool"]
+EOF
+            fi
             
             # WASMモジュールを適用するルートを追加
             # 注意: modulesはroute直下（[route.action]配下ではなく）に設定する必要がある
@@ -826,6 +849,30 @@ upstream = "backend-pool"
 [route.security]
 add_response_headers = { "X-Proxied-By" = "veil" }
 EOF
+
+            # F-62: HTTP コール（Pause/resume）フィルタのルート
+            if [ -f "${FIXTURES_DIR}/wasm/http_call_filter.wasm" ]; then
+                cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
+
+[[route]]
+modules = ["http_call_filter"]
+[route.conditions]
+host = "localhost"
+path = "/wasm-http-call/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+
+[[route]]
+modules = ["http_call_filter"]
+[route.conditions]
+host = "127.0.0.1"
+path = "/wasm-http-call/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+EOF
+            fi
         fi
     fi
 

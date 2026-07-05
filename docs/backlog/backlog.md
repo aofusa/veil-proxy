@@ -97,7 +97,7 @@
 | F-59 | P2 | 完了 | [features/F-59-writev-scatter-gather-cache.md](features/F-59-writev-scatter-gather-cache.md) | ヘッダ + ボディの scatter-gather 1-syscall 送出。**実装済み**: `IORING_OP_SENDMSG` を許可リストへ追加（サーフェス拡大を許容する判断）、`SendMsgFuture`（msghdr/iovec の Box 固定 + B-07 detach 延命 + 状態プール）、short-write 継続、キャッシュヒット・プロキシ応答ヘッダ+初期ボディへ配線。kTLS/rustls はフォールバック |
 | F-60 | P3 | 完了 | [features/F-60-http3-gro-batch-autosize.md](features/F-60-http3-gro-batch-autosize.md) | HTTP/3 GRO 一括 recv・GSO/GRO セグメントサイズ自動調整（F-33 残件）。**実装済み**: GSO セグメントを quiche PMTU 探索へ per-connection 追従（クランプ 1200〜65507）。GRO 側は F-45 時点で最適点を確認。実装中に **B-18 を検出・修正** |
 | F-61 | P3 | 完了 | [features/F-61-wasm-body-filter-alloc-reduction.md](features/F-61-wasm-body-filter-alloc-reduction.md) | WASM ボディフィルタ経路のアロケーション削減（F-43 残件）。**実装済み**: `BodyBuffer`（Shared Bytes / Owned Vec の CoW）を新設し、エンジン API・ホスト関数を Bytes ベース化。読み取りのみのモジュールでボディ deep copy ゼロ |
-| F-62 | P3 | 未着手 | [features/F-62-proxy-wasm-http-call-benchmark.md](features/F-62-proxy-wasm-http-call-benchmark.md) | Proxy-Wasm「HTTP コールあり」フィルタのベンチマーク（F-48 残件、Pause/resume 配線が前提） |
+| F-62 | P3 | 完了 | [features/F-62-proxy-wasm-http-call-benchmark.md](features/F-62-proxy-wasm-http-call-benchmark.md) | Proxy-Wasm「HTTP コールあり」フィルタのベンチマーク（F-48 残件）。**実装済み**: Pause → インライン上流コール（offload 退避）→ 同一インスタンスで proxy_on_http_call_response resume の配線、http_call_filter.wasm + E2E 2 件 + ベンチ `wasm_http_call`。実装中に **B-19 / B-20 を検出・修正** |
 | F-63 | P1 | 完了 | [features/F-63-log-output-routing.md](features/F-63-log-output-routing.md) | ログ出力先の分離ルーティング（app=stdout / error=stderr / access=stdout をレベル別に振り分け、`type` 識別フィールド付与、JSON 順は timestamp→level→type、ログファイル親ディレクトリを landlock_write_paths へ自動追加） |
 | F-64 | P2 | 進行中 | [features/F-64-sast-semgrep.md](features/F-64-sast-semgrep.md) | SAST（semgrep）導入。`run_semgrep.sh` 追加・実行（233 件すべて `unsafe-usage`、新規脆弱性なし）。カスタムルール整備が残件（F-54 子） |
 | F-65 | P2 | 進行中 | [features/F-65-sbom-generation.md](features/F-65-sbom-generation.md) | SBOM 自動生成（syft）。source CycloneDX 823 件 + image SPDX 7 件を生成。CI 添付が残件（F-54 子） |
@@ -149,6 +149,8 @@
 | B-16 | P0 | 完了 | [bugs/B-16-splice-pipe-refcell-borrow-panic.md](bugs/B-16-splice-pipe-refcell-borrow-panic.md) | kTLS splice パイプ取得（`get_splice_pipe` の `borrow_mut`）で RefCell 二重借用 panic。**修正済み**: `Ref` 返却＋`'static` transmute を廃止し、L4（F-40）と同じ checkout/return 型プール（`PooledSplicePipe` RAII ガード + FIONREAD 残データ検査つき返却）へ変更。回帰単体テスト 4 件追加 |
 | B-17 | P1 | 完了 | [bugs/B-17-malformed-backend-client-hang.md](bugs/B-17-malformed-backend-client-hang.md) | 不正バックエンド応答でクライアント可視のハング。**修正済み**: ヘッダーフェーズ失敗の即時 502/504 送出、`BACKEND_HEADER_TIMEOUT`(10s)・`MAX_RESPONSE_HEADER_SIZE`(64KB) 新設、CL 未達/chunked 終端前 EOF の即時クローズ（`client_must_close` 伝搬）。E2E 回帰テスト 8 件（`test_b17_*`）追加 |
 | B-18 | P2 | 完了 | [bugs/B-18-http3-gso-batch-emsgsize-overflow.md](bugs/B-18-http3-gso-batch-emsgsize-overflow.md) | HTTP/3 GSO バッチが sendmsg の UDP ペイロード上限（65507B）を超え EMSGSIZE でバッチ全体（最大 64 パケット）が破棄され得る。F-60 実装中に検出。**修正済み**: `MAX_GSO_BATCH_BYTES` による追加前 flush + flush 判定の純関数化・単体テスト |
+| B-19 | P1 | 完了 | [bugs/B-19-proxy-wasm-abi-mismatch.md](bugs/B-19-proxy-wasm-abi-mismatch.md) | Proxy-Wasm ABI 不一致（BufferType 番号・マップ直列化形式）で SDK の読み取り系 API を使うモジュールが panic。F-62 で検出。**修正済み**: 定数を SDK/ABI 準拠へ、直列化を `host/abi.rs` へ集約（SDK 互換ワイヤ形式 + 不正データ拒否） |
+| B-20 | P1 | 完了 | [bugs/B-20-wasm-sync-call-async-store-panic.md](bugs/B-20-wasm-sync-call-async-store-panic.md) | WASM 読み取り系ホスト関数 5 つが async store で同期 `call` を使い panic（"must use call_async"）。F-62 で検出。**修正済み**: `func_wrap_async` + `call_async` 化 |
 
 ---
 

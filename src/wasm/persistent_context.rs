@@ -306,6 +306,20 @@ pub fn register_global_pending_call(module_name: &str, token: u32, call: Pending
     }
 }
 
+/// Remove a specific pending HTTP call from the global registry (F-62)
+///
+/// リクエスト経路のインライン Pause/resume で処理済みのコールを、
+/// tick スレッドが二重実行しないようレジストリから取り除く。
+pub fn remove_global_pending_call(module_name: &str, token: u32) -> bool {
+    if let Ok(mut registry) = GLOBAL_PENDING_CALLS.write() {
+        let before = registry.len();
+        registry.retain(|c| !(c.module_name == module_name && c.token == token));
+        registry.len() < before
+    } else {
+        false
+    }
+}
+
 /// Take all globally registered pending HTTP calls
 ///
 /// Returns all pending calls and clears the global registry.

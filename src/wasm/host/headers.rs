@@ -5,66 +5,8 @@ use wasmtime::{Caller, Linker};
 use crate::wasm::constants::*;
 use crate::wasm::context::HostState;
 
-/// Serialize headers to Proxy-Wasm format
-/// Format: [num_pairs:4][key1_len:4][key1][val1_len:4][val1]...
-fn serialize_headers(headers: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
-    let mut buf = Vec::new();
-
-    // Number of pairs
-    buf.extend_from_slice(&(headers.len() as u32).to_le_bytes());
-
-    for (key, value) in headers {
-        buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
-        buf.extend_from_slice(key);
-        buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
-        buf.extend_from_slice(value);
-    }
-
-    buf
-}
-
-/// Deserialize headers from Proxy-Wasm format
-fn deserialize_headers(data: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
-    if data.len() < 4 {
-        return None;
-    }
-
-    let num_pairs = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    let mut headers = Vec::with_capacity(num_pairs);
-    let mut pos = 4;
-
-    for _ in 0..num_pairs {
-        if pos + 4 > data.len() {
-            return None;
-        }
-        let key_len =
-            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-        pos += 4;
-
-        if pos + key_len > data.len() {
-            return None;
-        }
-        let key = data[pos..pos + key_len].to_vec();
-        pos += key_len;
-
-        if pos + 4 > data.len() {
-            return None;
-        }
-        let val_len =
-            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-        pos += 4;
-
-        if pos + val_len > data.len() {
-            return None;
-        }
-        let value = data[pos..pos + val_len].to_vec();
-        pos += val_len;
-
-        headers.push((key, value));
-    }
-
-    Some(headers)
-}
+// B-19: マップ直列化は SDK 互換のワイヤ形式を実装する共通モジュールへ集約
+use super::abi::{deserialize_headers, serialize_headers};
 
 /// Get headers by map type
 fn get_headers<'a>(state: &'a HostState, map_type: i32) -> Option<&'a Vec<(Vec<u8>, Vec<u8>)>> {
@@ -159,12 +101,16 @@ fn read_string(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option
 }
 
 /// Helper to allocate memory in WASM
-fn allocate_wasm_memory(caller: &mut Caller<'_, HostState>, size: usize) -> Option<i32> {
+///
+/// B-20: エンジンは async store（`async_support(true)` + fuel yield）で動作するため、
+/// wasm への再入呼び出しは `call_async` でなければならない（同期 `call` は
+/// "must use call_async with async stores" で panic する）。
+async fn allocate_wasm_memory(caller: &mut Caller<'_, HostState>, size: usize) -> Option<i32> {
     // Call proxy_on_memory_allocate if exported
     let func = caller.get_export("proxy_on_memory_allocate")?;
     let func = func.into_func()?;
     let typed = func.typed::<i32, i32>(&mut *caller).ok()?;
-    typed.call(&mut *caller, size as i32).ok()
+    typed.call_async(&mut *caller, size as i32).await.ok()
 }
 
 /// Helper to write to WASM memory
@@ -189,59 +135,59 @@ fn write_to_wasm(caller: &mut Caller<'_, HostState>, ptr: i32, data: &[u8]) -> b
 /// Add header functions to linker
 pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     // proxy_get_header_map_pairs
-    linker.func_wrap(
+    // B-20: wasm 側アロケータ（proxy_on_memory_allocate）へ再入するため async ホスト関数
+    linker.func_wrap_async(
         "env",
         "proxy_get_header_map_pairs",
         |mut caller: Caller<'_, HostState>,
-         map_type: i32,
-         return_map_ptr: i32,
-         return_map_size: i32|
-         -> i32 {
-            let state = caller.data();
+         (map_type, return_map_ptr, return_map_size): (i32, i32, i32)| {
+            Box::new(async move {
+                let state = caller.data();
 
-            // Check capability
-            if !check_read_capability(state, map_type) {
-                return PROXY_RESULT_NOT_ALLOWED;
-            }
+                // Check capability
+                if !check_read_capability(state, map_type) {
+                    return PROXY_RESULT_NOT_ALLOWED;
+                }
 
-            let headers = match get_headers(state, map_type) {
-                Some(h) => h.clone(),
-                None => return PROXY_RESULT_BAD_ARGUMENT,
-            };
+                let headers = match get_headers(state, map_type) {
+                    Some(h) => h.clone(),
+                    None => return PROXY_RESULT_BAD_ARGUMENT,
+                };
 
-            let serialized = serialize_headers(&headers);
-            let size = serialized.len();
+                let serialized = serialize_headers(&headers);
+                let size = serialized.len();
 
-            // Allocate memory in WASM
-            let ptr = match allocate_wasm_memory(&mut caller, size) {
-                Some(p) => p,
-                None => return PROXY_RESULT_INTERNAL_FAILURE,
-            };
+                // Allocate memory in WASM
+                let ptr = match allocate_wasm_memory(&mut caller, size).await {
+                    Some(p) => p,
+                    None => return PROXY_RESULT_INTERNAL_FAILURE,
+                };
 
-            // Write serialized headers
-            if !write_to_wasm(&mut caller, ptr, &serialized) {
-                return PROXY_RESULT_INVALID_MEMORY_ACCESS;
-            }
+                // Write serialized headers
+                if !write_to_wasm(&mut caller, ptr, &serialized) {
+                    return PROXY_RESULT_INVALID_MEMORY_ACCESS;
+                }
 
-            // Write return values
-            let memory = match caller.get_export("memory") {
-                Some(wasmtime::Extern::Memory(mem)) => mem,
-                _ => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
-            };
+                // Write return values
+                let memory = match caller.get_export("memory") {
+                    Some(wasmtime::Extern::Memory(mem)) => mem,
+                    _ => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
+                };
 
-            let data = memory.data_mut(&mut caller);
+                let data = memory.data_mut(&mut caller);
 
-            let ptr_offset = return_map_ptr as usize;
-            let size_offset = return_map_size as usize;
+                let ptr_offset = return_map_ptr as usize;
+                let size_offset = return_map_size as usize;
 
-            if ptr_offset + 4 > data.len() || size_offset + 4 > data.len() {
-                return PROXY_RESULT_INVALID_MEMORY_ACCESS;
-            }
+                if ptr_offset + 4 > data.len() || size_offset + 4 > data.len() {
+                    return PROXY_RESULT_INVALID_MEMORY_ACCESS;
+                }
 
-            data[ptr_offset..ptr_offset + 4].copy_from_slice(&ptr.to_le_bytes());
-            data[size_offset..size_offset + 4].copy_from_slice(&(size as i32).to_le_bytes());
+                data[ptr_offset..ptr_offset + 4].copy_from_slice(&ptr.to_le_bytes());
+                data[size_offset..size_offset + 4].copy_from_slice(&(size as i32).to_le_bytes());
 
-            PROXY_RESULT_OK
+                PROXY_RESULT_OK
+            })
         },
     )?;
 
@@ -296,73 +242,78 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     )?;
 
     // proxy_get_header_map_value
-    linker.func_wrap(
+    linker.func_wrap_async(
         "env",
         "proxy_get_header_map_value",
+        // B-20: wasm 側アロケータへ再入するため async ホスト関数
         |mut caller: Caller<'_, HostState>,
-         map_type: i32,
-         key_ptr: i32,
-         key_size: i32,
-         return_value_ptr: i32,
-         return_value_size: i32|
-         -> i32 {
-            let state = caller.data();
+         (map_type, key_ptr, key_size, return_value_ptr, return_value_size): (
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+        )| {
+            Box::new(async move {
+                let state = caller.data();
 
-            // Check capability
-            if !check_read_capability(state, map_type) {
-                return PROXY_RESULT_NOT_ALLOWED;
-            }
+                // Check capability
+                if !check_read_capability(state, map_type) {
+                    return PROXY_RESULT_NOT_ALLOWED;
+                }
 
-            let key = match read_string(&mut caller, key_ptr, key_size) {
-                Some(k) => k,
-                None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
-            };
+                let key = match read_string(&mut caller, key_ptr, key_size) {
+                    Some(k) => k,
+                    None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
+                };
 
-            let headers = match get_headers(caller.data(), map_type) {
-                Some(h) => h,
-                None => return PROXY_RESULT_BAD_ARGUMENT,
-            };
+                let headers = match get_headers(caller.data(), map_type) {
+                    Some(h) => h,
+                    None => return PROXY_RESULT_BAD_ARGUMENT,
+                };
 
-            // Find header value (case-insensitive)
-            let value = headers
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(key.as_bytes()))
-                .map(|(_, v)| v.clone());
+                // Find header value (case-insensitive)
+                let value = headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(key.as_bytes()))
+                    .map(|(_, v)| v.clone());
 
-            let value = match value {
-                Some(v) => v,
-                None => return PROXY_RESULT_NOT_FOUND,
-            };
+                let value = match value {
+                    Some(v) => v,
+                    None => return PROXY_RESULT_NOT_FOUND,
+                };
 
-            // Allocate memory and write value
-            let ptr = match allocate_wasm_memory(&mut caller, value.len()) {
-                Some(p) => p,
-                None => return PROXY_RESULT_INTERNAL_FAILURE,
-            };
+                // Allocate memory and write value
+                let ptr = match allocate_wasm_memory(&mut caller, value.len()).await {
+                    Some(p) => p,
+                    None => return PROXY_RESULT_INTERNAL_FAILURE,
+                };
 
-            if !write_to_wasm(&mut caller, ptr, &value) {
-                return PROXY_RESULT_INVALID_MEMORY_ACCESS;
-            }
+                if !write_to_wasm(&mut caller, ptr, &value) {
+                    return PROXY_RESULT_INVALID_MEMORY_ACCESS;
+                }
 
-            // Write return pointers
-            let memory = match caller.get_export("memory") {
-                Some(wasmtime::Extern::Memory(mem)) => mem,
-                _ => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
-            };
+                // Write return pointers
+                let memory = match caller.get_export("memory") {
+                    Some(wasmtime::Extern::Memory(mem)) => mem,
+                    _ => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
+                };
 
-            let data = memory.data_mut(&mut caller);
+                let data = memory.data_mut(&mut caller);
 
-            let ptr_offset = return_value_ptr as usize;
-            let size_offset = return_value_size as usize;
+                let ptr_offset = return_value_ptr as usize;
+                let size_offset = return_value_size as usize;
 
-            if ptr_offset + 4 > data.len() || size_offset + 4 > data.len() {
-                return PROXY_RESULT_INVALID_MEMORY_ACCESS;
-            }
+                if ptr_offset + 4 > data.len() || size_offset + 4 > data.len() {
+                    return PROXY_RESULT_INVALID_MEMORY_ACCESS;
+                }
 
-            data[ptr_offset..ptr_offset + 4].copy_from_slice(&ptr.to_le_bytes());
-            data[size_offset..size_offset + 4].copy_from_slice(&(value.len() as i32).to_le_bytes());
+                data[ptr_offset..ptr_offset + 4].copy_from_slice(&ptr.to_le_bytes());
+                data[size_offset..size_offset + 4]
+                    .copy_from_slice(&(value.len() as i32).to_le_bytes());
 
-            PROXY_RESULT_OK
+                PROXY_RESULT_OK
+            })
         },
     )?;
 

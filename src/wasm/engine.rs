@@ -159,7 +159,7 @@ impl FilterEngine {
         callback_name: &str,
         num_headers: i32,
         end_of_stream: bool,
-    ) -> anyhow::Result<i32> {
+    ) -> anyhow::Result<(i32, wasmtime::Instance)> {
         store.set_fuel(self.fuel_limit)?;
         store.fuel_async_yield_interval(Some(10_000))?;
         store.set_epoch_deadline(self.epoch_deadline);
@@ -241,7 +241,135 @@ impl FilterEngine {
         };
         crate::metrics::observe_wasm_fuel_consumed(&module.name, phase, consumed);
 
-        Ok(action)
+        // F-62: Pause/resume（proxy_on_http_call_response）で同一インスタンスを
+        // 再度呼び出せるようインスタンスも返す。
+        Ok((action, instance))
+    }
+
+    /// F-62: Pause 中に登録された HTTP コールをインラインで解決し、
+    /// `proxy_on_http_call_response` で同一インスタンスを resume する。
+    ///
+    /// - 上流解決は `CURRENT_CONFIG` の upstream_groups から行う（tick スレッドと同一規約）
+    /// - ブロッキング HTTP クライアント（http_executor）は `runtime::offload` で
+    ///   専用スレッドへ退避し、**イベントループはブロックしない**（ホットパス絶対規則）
+    /// - 解決済みコールはグローバルレジストリから取り除き、tick スレッドでの二重実行を防ぐ
+    /// - resume 後にモジュールが新たなコールを登録した場合は続けて解決する
+    ///   （無限ループ防止のため `max_http_calls` 回で打ち切り）
+    ///
+    /// 戻り値: 1 件でもコールを解決して resume した場合 true。
+    async fn resolve_pending_http_calls_inline(
+        &self,
+        module: &LoadedModule,
+        store: &mut Store<HostState>,
+        instance: wasmtime::Instance,
+    ) -> anyhow::Result<bool> {
+        let http_context_id = 2i32;
+        let mut resumed = false;
+        let max_rounds = module.capabilities.max_http_calls.max(1);
+
+        for _ in 0..max_rounds {
+            // pending コールをドレイン（同期スコープ内で完結）
+            let pending: Vec<super::types::PendingHttpCall> = {
+                let ctx = &mut store.data_mut().http_ctx;
+                let tokens: Vec<u32> = ctx.pending_http_calls.keys().copied().collect();
+                tokens
+                    .into_iter()
+                    .filter_map(|t| ctx.pending_http_calls.remove(&t))
+                    .collect()
+            };
+            if pending.is_empty() {
+                break;
+            }
+
+            for call in pending {
+                let token = call.token;
+                // tick スレッドの二重実行を防止
+                super::persistent_context::remove_global_pending_call(&module.name, token);
+
+                let response = Self::execute_http_call_offloaded(&module.name, call).await;
+
+                // 応答をコンテキストへ格納して proxy_on_http_call_response を呼ぶ
+                let (num_headers, body_size, num_trailers) = (
+                    response.headers.len() as i32,
+                    response.body.len() as i32,
+                    response.trailers.len() as i32,
+                );
+                {
+                    let ctx = &mut store.data_mut().http_ctx;
+                    ctx.http_call_responses.insert(token, response);
+                    ctx.current_http_call_token = Some(token);
+                }
+
+                if let Ok(func) = instance.get_typed_func::<(i32, i32, i32, i32, i32), ()>(
+                    &mut *store,
+                    "proxy_on_http_call_response",
+                ) {
+                    func.call_async(
+                        &mut *store,
+                        (
+                            http_context_id,
+                            token as i32,
+                            num_headers,
+                            body_size,
+                            num_trailers,
+                        ),
+                    )
+                    .await?;
+                }
+                store.data_mut().http_ctx.current_http_call_token = None;
+                resumed = true;
+
+                // ローカルレスポンスが設定されたら以降のコールは不要
+                if store.data().http_ctx.local_response.is_some() {
+                    return Ok(resumed);
+                }
+            }
+        }
+
+        Ok(resumed)
+    }
+
+    /// F-62: 上流を解決し、ブロッキング HTTP コールを offload スレッドで実行する。
+    /// エラー時は tick スレッド経路と同一規約のエラー応答（502/503/504）を返す。
+    async fn execute_http_call_offloaded(
+        module_name: &str,
+        call: super::types::PendingHttpCall,
+    ) -> super::types::HttpCallResponse {
+        use super::types::HttpCallResponse;
+
+        // 上流解決（ArcSwap ロード、ロックなし）
+        let config = crate::config::CURRENT_CONFIG.load();
+        let resolved = config
+            .upstream_groups
+            .get(&call.upstream)
+            .and_then(|group| group.select("0.0.0.0"))
+            .map(|server| (server.host().to_string(), server.port(), server.use_tls()));
+
+        let Some((host, port, use_tls)) = resolved else {
+            ftlog::warn!(
+                "[wasm:http_call] Upstream '{}' not resolvable for module '{}' (inline resume)",
+                call.upstream,
+                module_name
+            );
+            return HttpCallResponse {
+                status_code: 502,
+                headers: vec![(b"x-wasm-error".to_vec(), b"upstream_not_found".to_vec())],
+                body: format!("Upstream '{}' not found", call.upstream).into_bytes(),
+                trailers: Vec::new(),
+            };
+        };
+
+        let pending = super::persistent_context::GlobalPendingCall {
+            module_name: module_name.to_string(),
+            token: call.token,
+            call,
+        };
+
+        // ブロッキング I/O を専用スレッドへ退避（イベントループを塞がない）
+        crate::runtime::offload::offload(move || {
+            super::http_executor::execute_http_call_safe(&pending, &host, port, use_tls)
+        })
+        .await
     }
 
     /// Execute on_request_headers for a single module
@@ -279,16 +407,34 @@ impl FilterEngine {
             )
             .await;
 
-        // ヘッダをコンテキストから回収（ゼロコピー・ムーブ）
-        let headers = std::mem::take(&mut store.data_mut().http_ctx.request_headers);
-
         let result = match run {
-            Ok(action) => {
+            Ok((action, instance)) => {
+                // F-62: Pause かつ pending HTTP コールあり → インラインで解決して resume
+                let action = match FilterAction::from(action) {
+                    FilterAction::Pause => {
+                        match self
+                            .resolve_pending_http_calls_inline(module, &mut store, instance)
+                            .await
+                        {
+                            Ok(true) => FilterAction::Continue,
+                            Ok(false) => FilterAction::Pause,
+                            Err(e) => {
+                                ftlog::error!(
+                                    "[wasm:{}] http_call resume error: {}",
+                                    module.name,
+                                    e
+                                );
+                                FilterAction::Continue
+                            }
+                        }
+                    }
+                    other => other,
+                };
                 let state = store.data();
                 if let Some(local_response) = &state.http_ctx.local_response {
                     Ok(ModuleAction::LocalResponse(local_response.clone()))
                 } else {
-                    match FilterAction::from(action) {
+                    match action {
                         FilterAction::Continue => Ok(ModuleAction::Continue),
                         FilterAction::Pause => Ok(ModuleAction::Pause),
                     }
@@ -296,6 +442,9 @@ impl FilterEngine {
             }
             Err(e) => Err(e),
         };
+
+        // ヘッダをコンテキストから回収（ゼロコピー・ムーブ。resume 中の変更も反映される）
+        let headers = std::mem::take(&mut store.data_mut().http_ctx.request_headers);
         (headers, result)
     }
 
@@ -420,16 +569,34 @@ impl FilterEngine {
             )
             .await;
 
-        // ヘッダをコンテキストから回収（ゼロコピー・ムーブ）
-        let headers = std::mem::take(&mut store.data_mut().http_ctx.response_headers);
-
         let result = match run {
-            Ok(action) => {
+            Ok((action, instance)) => {
+                // F-62: Pause かつ pending HTTP コールあり → インラインで解決して resume
+                let action = match FilterAction::from(action) {
+                    FilterAction::Pause => {
+                        match self
+                            .resolve_pending_http_calls_inline(module, &mut store, instance)
+                            .await
+                        {
+                            Ok(true) => FilterAction::Continue,
+                            Ok(false) => FilterAction::Pause,
+                            Err(e) => {
+                                ftlog::error!(
+                                    "[wasm:{}] http_call resume error: {}",
+                                    module.name,
+                                    e
+                                );
+                                FilterAction::Continue
+                            }
+                        }
+                    }
+                    other => other,
+                };
                 let state = store.data();
                 if let Some(local_response) = &state.http_ctx.local_response {
                     Ok(ModuleAction::LocalResponse(local_response.clone()))
                 } else {
-                    match FilterAction::from(action) {
+                    match action {
                         FilterAction::Continue => Ok(ModuleAction::Continue),
                         FilterAction::Pause => Ok(ModuleAction::Pause),
                     }
@@ -437,6 +604,9 @@ impl FilterEngine {
             }
             Err(e) => Err(e),
         };
+
+        // ヘッダをコンテキストから回収（ゼロコピー・ムーブ。resume 中の変更も反映される）
+        let headers = std::mem::take(&mut store.data_mut().http_ctx.response_headers);
         (headers, result)
     }
 

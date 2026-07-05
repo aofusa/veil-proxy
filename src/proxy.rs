@@ -4091,6 +4091,20 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                                         response.extend_from_slice(v);
                                         response.extend_from_slice(b"\r\n");
                                     }
+                                    // F-62: モジュールが Content-Length を設定していない場合は
+                                    // 補完する（欠落するとクライアントは接続クローズまで
+                                    // ボディを待ち続け、TLS では close_notify 無しの EOF
+                                    // エラーになる）
+                                    let has_content_length = resp
+                                        .headers
+                                        .iter()
+                                        .any(|(k, _)| k.eq_ignore_ascii_case(b"content-length"));
+                                    if !has_content_length {
+                                        response.extend_from_slice(
+                                            format!("Content-Length: {}\r\n", resp.body.len())
+                                                .as_bytes(),
+                                        );
+                                    }
                                     response.extend_from_slice(b"\r\n");
                                     response.extend_from_slice(&resp.body);
 
