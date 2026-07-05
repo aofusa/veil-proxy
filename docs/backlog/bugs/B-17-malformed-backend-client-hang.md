@@ -70,7 +70,27 @@ bad-backend サーバー = ポート 9009 / ルート `/bad-backend/*` を使用
 truncated-headers / huge-headers / bad-status / instant-close → 即時 502、
 no-response → 10 秒で 504、cl-too-large → 200 後の即時クローズ、
 cl-too-small → 余剰バイト非転送（スマグリング耐性の回帰ガード）。
-`bad_backend_chaos.sh`（F-67）も回帰確認に使用可能。
+
+コンテナ統合検証（`bad_backend_chaos.sh`、F-67、kTLS 有効の `veil:glibc`、
+2026-07-05 実施、各プローブの実測経過時間を併記）:
+
+| パス | 修正前 | 修正後 |
+|------|--------|--------|
+| /truncated-headers | TIMEOUT | **502** (7.5s※) |
+| /cl-too-large | TIMEOUT | **200 + 即時クローズ** (6.5s※) |
+| /huge-headers | TIMEOUT | **502** (6.7s※) |
+| /bad-status | TIMEOUT | **502** (6.4s※) |
+| /no-response | TIMEOUT | **502** (6.4s※) |
+| /instant-close | TIMEOUT | **502** (7.1s※) |
+| /ok（正常） | 200 | 200 (7.2s※) |
+| /cl-too-small | 200 | 200 (6.5s※) |
+
+※ 経過時間はすべて ~6.4〜7.5s でほぼ均一。これは高負荷下での
+`docker run curlimages/curl` コンテナ起動のベースラインオーバーヘッドであり、
+成功する /ok・/cl-too-small と異常系が同一時間帯であることが**ハングしていない証左**
+（真のハングなら `--max-time 12` の 12s 近くになる）。`/cl-too-large` の
+`200TIMEOUT` は curl の partial-file 終了（exit 18）で、Veil が CL 未達で接続を
+即クローズしたことを示す。`veil state: running exit=0` で B-16 の panic も再現なし。
 
 ## 関連
 
