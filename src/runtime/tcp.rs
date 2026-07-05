@@ -1356,6 +1356,14 @@ mod tests {
     use super::*;
     use std::io::Read as _;
 
+    /// io_uring が利用可能か（生成できるか）を検査する。
+    /// io_uring を許可しない環境（Docker ビルドサンドボックス・古いカーネル・
+    /// seccomp 制限下など）ではリング生成が失敗するため、実 I/O を伴うテストは
+    /// スキップする（それらの環境では E2E で網羅する）。
+    fn io_uring_available() -> bool {
+        crate::runtime::ring::IoUring::new(8, 0).is_ok()
+    }
+
     /// 受信スレッドを立て、接続クローズまでの全受信バイトを返すリスナーを作る。
     fn spawn_sink_server() -> (SocketAddr, std::thread::JoinHandle<Vec<u8>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -1372,6 +1380,10 @@ mod tests {
     /// F-59: SENDMSG scatter-gather で 2 バッファが 1 回で正しく送出されること。
     #[test]
     fn test_writev2_sendmsg_scatter_gather() {
+        if !io_uring_available() {
+            eprintln!("io_uring unavailable; skipping test_writev2_sendmsg_scatter_gather");
+            return;
+        }
         let (addr, handle) = spawn_sink_server();
 
         let header = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n".to_vec();
@@ -1393,6 +1405,10 @@ mod tests {
     /// F-59: ボディが空でも SENDMSG（iovec 1 本）で送出できること。
     #[test]
     fn test_writev2_sendmsg_empty_body() {
+        if !io_uring_available() {
+            eprintln!("io_uring unavailable; skipping test_writev2_sendmsg_empty_body");
+            return;
+        }
         let (addr, handle) = spawn_sink_server();
 
         let header = b"HTTP/1.1 204 No Content\r\n\r\n".to_vec();
@@ -1412,6 +1428,12 @@ mod tests {
     /// skip 進行の再発行で全量が順序どおり送出されること。
     #[test]
     fn test_write_all_vectored_short_write_continuation() {
+        if !io_uring_available() {
+            eprintln!(
+                "io_uring unavailable; skipping test_write_all_vectored_short_write_continuation"
+            );
+            return;
+        }
         let (addr, handle) = spawn_sink_server();
 
         // ヘッダ 1KB + ボディ 4MB（送信バッファを大きく超え、確実に複数回の SENDMSG になる）
