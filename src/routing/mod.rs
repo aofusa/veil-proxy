@@ -218,7 +218,11 @@ impl PathRouter {
         } else {
             let matchit_pattern = self.convert_pattern(pattern);
 
-            if let Err(_) = self.router.insert(matchit_pattern.clone(), vec![route_idx]) {
+            if self
+                .router
+                .insert(matchit_pattern.clone(), vec![route_idx])
+                .is_err()
+            {
                 self.patterns.push((pattern.to_string(), route_idx));
             } else if pattern.ends_with("/*") {
                 // B-22: matchit のキャッチオール `{*rest}` は **空セグメント** にマッチしない

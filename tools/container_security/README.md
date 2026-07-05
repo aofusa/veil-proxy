@@ -124,6 +124,7 @@ FUZZ_RUNS=2000 FUZZ_MAX_TIME=120 ./tools/container_security/fuzz/run_libfuzzer.s
 | 4d semgrep(SAST) | `security/run_semgrep.sh` | 自作コードの静的解析（`p/rust`+`p/security-audit`、F-64） |
 | 4e SBOM | `security/run_sbom.sh` | syft で source(CycloneDX)+image(SPDX) 生成（F-65） |
 | 4f ZAP(DAST) | `security/run_zap.sh` | OWASP ZAP baseline（F-66、既定 SKIP） |
+| 4g gitleaks | `security/run_gitleaks.sh` | シークレット（鍵/トークン）誤コミット検出（SARIF、F-75） |
 | 5 Trivy | `run_trivy_scan` | イメージ脆弱性（HIGH/CRITICAL） |
 | 6 レポート集約 | `lib/report.sh` | `suite_summary.json` / `suite_summary_junit.xml` |
 | 最終 | `health_check.sh` | 全フェーズ後の応答確認（最大 10 回リトライ） |
@@ -141,6 +142,7 @@ FUZZ_RUNS=2000 FUZZ_MAX_TIME=120 ./tools/container_security/fuzz/run_libfuzzer.s
 | `http2_frame_decode` | HTTP/2 フレームデコーダ |
 | `http_header_validate` | HTTP/1 ヘッダー名・値の境界検証（`fuzz_api`） |
 | `wasm_abi` | WASM モジュール/ABI 境界（`fuzz_api::wasm_module_smoke`、F-70。`--features wasm` で有効化） |
+| `wasm_host_abi` | WASM ホスト ABI 境界＝ゲスト→ホスト マップ復元の冪等性（`fuzz_api::wasm_host_abi_map_smoke`、F-70。`--features wasm`。`RUN_WASM_FUZZ=1` で有効化） |
 
 環境変数:
 
@@ -179,6 +181,8 @@ CARGO_TARGET_DIR=/tmp/veil-build-target cargo build -p veil-fuzz
 | `SKIP_SEMGREP` | `0` | semgrep（SAST、F-64） |
 | `SKIP_SBOM` | `0` | SBOM 生成（syft、F-65） |
 | `SKIP_ZAP` | `1` | OWASP ZAP baseline（DAST、F-66） |
+| `SKIP_GITLEAKS` | `0` | gitleaks シークレットスキャン（F-75。`GITLEAKS_MODE=dir\|git`、`GITLEAKS_BLOCKING=1` で検出時 fail） |
+| `RUN_WASM_FUZZ` | `0` | `1` で WASM 系 libFuzzer ターゲット（`wasm_abi`/`wasm_host_abi`、`--features wasm`）を実行 |
 | `SKIP_BAD_BACKEND` | `1` | バックエンドプロトコル違反カオス（F-67） |
 | `SKIP_PUMBA` | `1` | Pumba netem カオス（F-69） |
 | `SKIP_RESOURCE_EXHAUSTION` | `1` | リソース枯渇カオス（F-68） |
