@@ -2756,7 +2756,12 @@ cp target/wasm32-wasip1/release/my_filter.wasm /etc/veil/wasm/
 
 ### External Service Integration (HTTP Calls)
 
-Use Proxy-Wasm's `dispatch_http_call` to call external HTTP services (e.g., Webdis for Redis):
+Use Proxy-Wasm's `dispatch_http_call` to call external HTTP services (e.g., Webdis for Redis).
+When a filter returns `Action::Pause` after dispatching a call, Veil resolves the upstream
+call inline on the request path — the blocking HTTP client runs on a dedicated offload thread
+so the event loop is never blocked — and resumes the same WASM instance via
+`proxy_on_http_call_response`. A runnable example lives at
+`examples/wasm-filters/http-call-filter/`.
 
 ```rust
 fn on_http_request_headers(&mut self, _: usize, _: bool) -> Action {

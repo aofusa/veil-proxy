@@ -2752,7 +2752,11 @@ cp target/wasm32-wasip1/release/my_filter.wasm /etc/veil/wasm/
 
 ### 外部サービス連携（HTTP呼び出し）
 
-Proxy-Wasmの`dispatch_http_call`を使用して外部HTTPサービス（Redis用Webdis等）を呼び出せます：
+Proxy-Wasmの`dispatch_http_call`を使用して外部HTTPサービス（Redis用Webdis等）を呼び出せます。
+フィルタが呼び出し後に`Action::Pause`を返すと、Veilはリクエスト経路上で上流コールを
+インライン解決し（ブロッキングHTTPクライアントは専用オフロードスレッドで実行するため
+イベントループはブロックしません）、`proxy_on_http_call_response`で同一WASMインスタンスを
+再開します。動作例は`examples/wasm-filters/http-call-filter/`にあります。
 
 ```rust
 fn on_http_request_headers(&mut self, _: usize, _: bool) -> Action {
