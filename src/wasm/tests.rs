@@ -362,7 +362,7 @@ mod integration_tests {
 mod host_function_tests {
     use crate::wasm::capabilities::{CapabilityPreset, ModuleCapabilities};
     use crate::wasm::constants::{METRIC_TYPE_COUNTER, METRIC_TYPE_GAUGE, METRIC_TYPE_HISTOGRAM};
-    use crate::wasm::context::HttpContext;
+    use crate::wasm::context::{BodyBuffer, HttpContext};
     use crate::wasm::types::{Metric, MetricValue};
 
     /// Create a test HttpContext with full capabilities
@@ -380,8 +380,8 @@ mod host_function_tests {
             (b":status".to_vec(), b"200".to_vec()),
             (b"content-type".to_vec(), b"application/json".to_vec()),
         ];
-        ctx.request_body = b"request body content".to_vec();
-        ctx.response_body = b"response body content".to_vec();
+        ctx.request_body = BodyBuffer::Shared(bytes::Bytes::from_static(b"request body content"));
+        ctx.response_body = BodyBuffer::Shared(bytes::Bytes::from_static(b"response body content"));
         ctx
     }
 
@@ -455,7 +455,7 @@ mod host_function_tests {
         let ctx = create_test_context();
 
         // Get first 10 bytes
-        let bytes = &ctx.request_body[0..10];
+        let bytes = &ctx.request_body.as_slice()[0..10];
         assert_eq!(bytes, b"request bo");
     }
 
@@ -463,11 +463,11 @@ mod host_function_tests {
     fn test_set_request_body() {
         let mut ctx = create_test_context();
 
-        ctx.set_request_body(b"new body".to_vec(), true);
+        ctx.set_request_body(bytes::Bytes::from_static(b"new body"), true);
         ctx.request_body_modified = true;
 
         assert!(ctx.has_request_modifications());
-        assert_eq!(ctx.request_body, b"new body");
+        assert_eq!(ctx.request_body.as_slice(), b"new body");
         assert!(ctx.request_body_complete);
     }
 
@@ -475,18 +475,18 @@ mod host_function_tests {
     fn test_get_response_body_bytes() {
         let ctx = create_test_context();
 
-        assert_eq!(&ctx.response_body[..8], b"response");
+        assert_eq!(&ctx.response_body.as_slice()[..8], b"response");
     }
 
     #[test]
     fn test_set_response_body() {
         let mut ctx = create_test_context();
 
-        ctx.set_response_body(b"modified response".to_vec(), true);
+        ctx.set_response_body(bytes::Bytes::from_static(b"modified response"), true);
         ctx.response_body_modified = true;
 
         assert!(ctx.has_response_modifications());
-        assert_eq!(ctx.response_body, b"modified response");
+        assert_eq!(ctx.response_body.as_slice(), b"modified response");
     }
 
     // === Shared Data Operations Tests ===
@@ -1169,5 +1169,63 @@ mod p3_grpc_callback_tests {
 
         assert_eq!(taken.len(), 2);
         assert!(ctx.pending_grpc_calls.is_empty());
+    }
+}
+
+// === F-61: BodyBuffer (CoW) Tests ===
+
+#[cfg(test)]
+mod body_buffer_tests {
+    use crate::wasm::context::BodyBuffer;
+    use bytes::Bytes;
+
+    /// Shared のまま読む限りコピーが発生しない（share() が同一メモリを指す）
+    #[test]
+    fn test_shared_read_is_zero_copy() {
+        let original = Bytes::from_static(b"zero copy body");
+        let ptr = original.as_ptr();
+        let buf = BodyBuffer::Shared(original);
+
+        assert_eq!(buf.as_slice(), b"zero copy body");
+        let shared = buf.share();
+        // 参照カウント共有: 同一メモリを指す（deep copy なし）
+        assert_eq!(shared.as_ptr(), ptr);
+
+        // into_bytes も同一メモリ（ムーブのみ）
+        let back = buf.into_bytes();
+        assert_eq!(back.as_ptr(), ptr);
+    }
+
+    /// to_mut は初回書き込み時のみ Owned へ昇格し、元の Bytes に影響しない（CoW）
+    #[test]
+    fn test_to_mut_copy_on_write() {
+        let original = Bytes::from_static(b"immutable");
+        let mut buf = BodyBuffer::Shared(original.clone());
+
+        buf.to_mut().extend_from_slice(b" + modified");
+        assert_eq!(buf.as_slice(), b"immutable + modified");
+        // 元の共有 Bytes は不変
+        assert_eq!(&original[..], b"immutable");
+        assert!(matches!(buf, BodyBuffer::Owned(_)));
+    }
+
+    /// Owned の into_bytes はアロケーションをムーブする（コピーなし）
+    #[test]
+    fn test_owned_into_bytes_moves_allocation() {
+        let vec = b"owned body".to_vec();
+        let ptr = vec.as_ptr();
+        let buf = BodyBuffer::Owned(vec);
+        let bytes = buf.into_bytes();
+        // Vec のアロケーションがそのまま Bytes に引き継がれる
+        assert_eq!(bytes.as_ptr(), ptr);
+        assert_eq!(&bytes[..], b"owned body");
+    }
+
+    /// 空バッファのふるまい
+    #[test]
+    fn test_empty_buffer() {
+        let buf = BodyBuffer::empty();
+        assert!(buf.is_empty());
+        assert_eq!(buf.len(), 0);
     }
 }

@@ -6,23 +6,30 @@ use crate::wasm::constants::*;
 use crate::wasm::context::HostState;
 
 /// Get buffer by type
-fn get_buffer<'a>(state: &'a HostState, buffer_type: i32) -> Option<&'a Vec<u8>> {
+///
+/// F-61: ボディは CoW `BodyBuffer` の共有 `Bytes` を O(1) で取得する
+/// （従来は Vec 全体を clone していた）。その他のバッファは従来どおりコピー。
+fn get_buffer(state: &HostState, buffer_type: i32) -> Option<bytes::Bytes> {
     match buffer_type {
-        HTTP_REQUEST_BODY => Some(&state.http_ctx.request_body),
-        HTTP_RESPONSE_BODY => Some(&state.http_ctx.response_body),
+        HTTP_REQUEST_BODY => Some(state.http_ctx.request_body.share()),
+        HTTP_RESPONSE_BODY => Some(state.http_ctx.response_body.share()),
         HTTP_CALL_RESPONSE_BODY => {
             if let Some(token) = state.http_ctx.current_http_call_token {
                 state
                     .http_ctx
                     .http_call_responses
                     .get(&token)
-                    .map(|r| &r.body)
+                    .map(|r| bytes::Bytes::copy_from_slice(&r.body))
             } else {
                 None
             }
         }
-        PLUGIN_CONFIGURATION => Some(&state.http_ctx.plugin_configuration),
-        VM_CONFIGURATION => Some(&state.http_ctx.vm_configuration),
+        PLUGIN_CONFIGURATION => Some(bytes::Bytes::copy_from_slice(
+            &state.http_ctx.plugin_configuration,
+        )),
+        VM_CONFIGURATION => Some(bytes::Bytes::copy_from_slice(
+            &state.http_ctx.vm_configuration,
+        )),
         _ => None,
     }
 }
@@ -94,8 +101,9 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 return PROXY_RESULT_NOT_ALLOWED;
             }
 
+            // F-61: ボディは Bytes の参照カウント共有で取得（deep copy なし）
             let buffer = match get_buffer(state, buffer_type) {
-                Some(b) => b.clone(),
+                Some(b) => b,
                 None => return PROXY_RESULT_BAD_ARGUMENT,
             };
 
@@ -199,10 +207,11 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             let value = data[start_idx..end_idx].to_vec();
 
             // Get mutable buffer
+            // F-61: CoW — モジュールが書き込む時のみ Owned(Vec) へ昇格する
             let state = caller.data_mut();
             let buffer = match buffer_type {
-                HTTP_REQUEST_BODY => &mut state.http_ctx.request_body,
-                HTTP_RESPONSE_BODY => &mut state.http_ctx.response_body,
+                HTTP_REQUEST_BODY => state.http_ctx.request_body.to_mut(),
+                HTTP_RESPONSE_BODY => state.http_ctx.response_body.to_mut(),
                 _ => return PROXY_RESULT_BAD_ARGUMENT,
             };
 

@@ -625,7 +625,7 @@ impl FilterEngine {
     pub async fn on_request_body_with_modules(
         &self,
         module_names: &[String],
-        body: &[u8],
+        body: bytes::Bytes,
         end_of_stream: bool,
     ) -> BodyFilterResult {
         let modules: Vec<Arc<LoadedModule>> = module_names
@@ -634,16 +634,16 @@ impl FilterEngine {
             .collect();
 
         if modules.is_empty() {
-            return BodyFilterResult::Continue {
-                body: body.to_vec(),
-            };
+            // F-61: モジュール未登録時はゼロコピーでそのまま返す
+            return BodyFilterResult::Continue { body };
         }
 
-        let mut current_body = body.to_vec();
+        // F-61: `Bytes` の参照カウント共有でフィルタチェーンを回す（deep copy なし）
+        let mut current_body = body;
 
         for module in &modules {
             let result = self
-                .execute_on_request_body(module, &current_body, end_of_stream)
+                .execute_on_request_body(module, current_body.clone(), end_of_stream)
                 .await;
 
             match result {
@@ -673,10 +673,10 @@ impl FilterEngine {
     pub async fn on_request_body_with_modules_async(
         self: Arc<Self>,
         module_names: Vec<String>,
-        body: Vec<u8>,
+        body: bytes::Bytes,
         end_of_stream: bool,
     ) -> BodyFilterResult {
-        self.on_request_body_with_modules(&module_names, &body, end_of_stream)
+        self.on_request_body_with_modules(&module_names, body, end_of_stream)
             .await
     }
 
@@ -684,7 +684,7 @@ impl FilterEngine {
     async fn execute_on_request_body(
         &self,
         module: &LoadedModule,
-        body: &[u8],
+        body: bytes::Bytes,
         end_of_stream: bool,
     ) -> anyhow::Result<BodyModuleResult> {
         // Check capability
@@ -696,7 +696,8 @@ impl FilterEngine {
 
         // Create context
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
-        http_ctx.set_request_body(body.to_vec(), end_of_stream);
+        let body_len = body.len();
+        http_ctx.set_request_body(body, end_of_stream);
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_configuration = module.configuration.clone();
 
@@ -759,7 +760,7 @@ impl FilterEngine {
 
         let action = match callback {
             Ok(func) => {
-                let body_size = body.len() as i32;
+                let body_size = body_len as i32;
                 let eos = if end_of_stream { 1 } else { 0 };
                 func.call_async(&mut store, (http_context_id, body_size, eos))
                     .await?
@@ -774,8 +775,11 @@ impl FilterEngine {
         }
 
         // Check for modifications
-        let modified_body = if state.http_ctx.request_body_modified {
-            Some(state.http_ctx.request_body.clone())
+        // F-61: 変更時は store からムーブで取り出す（clone による deep copy を排除）
+        let body_modified = state.http_ctx.request_body_modified;
+        let modified_body = if body_modified {
+            let taken = std::mem::take(&mut store.data_mut().http_ctx.request_body);
+            Some(taken.into_bytes())
         } else {
             None
         };
@@ -793,7 +797,7 @@ impl FilterEngine {
     pub async fn on_response_body_with_modules(
         &self,
         module_names: &[String],
-        body: &[u8],
+        body: bytes::Bytes,
         end_of_stream: bool,
     ) -> BodyFilterResult {
         let modules: Vec<Arc<LoadedModule>> = module_names
@@ -802,17 +806,17 @@ impl FilterEngine {
             .collect();
 
         if modules.is_empty() {
-            return BodyFilterResult::Continue {
-                body: body.to_vec(),
-            };
+            // F-61: モジュール未登録時はゼロコピーでそのまま返す
+            return BodyFilterResult::Continue { body };
         }
 
-        let mut current_body = body.to_vec();
+        // F-61: `Bytes` の参照カウント共有でフィルタチェーンを回す（deep copy なし）
+        let mut current_body = body;
 
         // Execute in reverse order for response
         for module in modules.iter().rev() {
             let result = self
-                .execute_on_response_body(module, &current_body, end_of_stream)
+                .execute_on_response_body(module, current_body.clone(), end_of_stream)
                 .await;
 
             match result {
@@ -841,10 +845,10 @@ impl FilterEngine {
     pub async fn on_response_body_with_modules_async(
         self: Arc<Self>,
         module_names: Vec<String>,
-        body: Vec<u8>,
+        body: bytes::Bytes,
         end_of_stream: bool,
     ) -> BodyFilterResult {
-        self.on_response_body_with_modules(&module_names, &body, end_of_stream)
+        self.on_response_body_with_modules(&module_names, body, end_of_stream)
             .await
     }
 
@@ -852,7 +856,7 @@ impl FilterEngine {
     async fn execute_on_response_body(
         &self,
         module: &LoadedModule,
-        body: &[u8],
+        body: bytes::Bytes,
         end_of_stream: bool,
     ) -> anyhow::Result<BodyModuleResult> {
         // Check capability
@@ -864,7 +868,8 @@ impl FilterEngine {
 
         // Create context
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
-        http_ctx.set_response_body(body.to_vec(), end_of_stream);
+        let body_len = body.len();
+        http_ctx.set_response_body(body, end_of_stream);
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_configuration = module.configuration.clone();
 
@@ -927,7 +932,7 @@ impl FilterEngine {
 
         let action = match callback {
             Ok(func) => {
-                let body_size = body.len() as i32;
+                let body_size = body_len as i32;
                 let eos = if end_of_stream { 1 } else { 0 };
                 func.call_async(&mut store, (http_context_id, body_size, eos))
                     .await?
@@ -942,8 +947,11 @@ impl FilterEngine {
         }
 
         // Check for modifications
-        let modified_body = if state.http_ctx.response_body_modified {
-            Some(state.http_ctx.response_body.clone())
+        // F-61: 変更時は store からムーブで取り出す（clone による deep copy を排除）
+        let body_modified = state.http_ctx.response_body_modified;
+        let modified_body = if body_modified {
+            let taken = std::mem::take(&mut store.data_mut().http_ctx.response_body);
+            Some(taken.into_bytes())
         } else {
             None
         };
@@ -2112,15 +2120,15 @@ pub enum FilterResult {
 
 /// Result from body module execution (internal)
 enum BodyModuleResult {
-    Continue { modified_body: Option<Vec<u8>> },
+    Continue { modified_body: Option<bytes::Bytes> },
     Pause,
     LocalResponse(LocalResponse),
 }
 
 /// Result from body filter chain execution
 pub enum BodyFilterResult {
-    /// Continue with potentially modified body
-    Continue { body: Vec<u8> },
+    /// Continue with potentially modified body（F-61: `Bytes` によるゼロコピー返却）
+    Continue { body: bytes::Bytes },
     /// Pause processing (async operation pending)
     Pause,
     /// Send a local response instead of proxying

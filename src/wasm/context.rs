@@ -5,8 +5,82 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use bytes::Bytes;
+
 use super::capabilities::ModuleCapabilities;
 use super::types::{HttpCallResponse, LocalResponse, Metric, PendingHttpCall};
+
+/// ボディの Copy-on-Write バッファ（F-61）
+///
+/// ホスト側からは参照カウント共有の `Bytes` をゼロコピーで受け取り（`Shared`）、
+/// WASM モジュールがボディを書き換えた時のみ所有 `Vec<u8>` へ昇格する（`Owned`）。
+/// 読み取りのみのモジュール（大多数）ではボディの deep copy が一切発生しない。
+pub enum BodyBuffer {
+    /// ホストと共有する不変ボディ（読み取り専用、O(1) クローン）
+    Shared(Bytes),
+    /// モジュールが書き換えた後の所有ボディ
+    Owned(Vec<u8>),
+}
+
+impl BodyBuffer {
+    /// 空のバッファ
+    pub fn empty() -> Self {
+        BodyBuffer::Shared(Bytes::new())
+    }
+
+    /// バイトスライスとして参照
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            BodyBuffer::Shared(b) => b,
+            BodyBuffer::Owned(v) => v,
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+
+    /// 可変参照を取得する（CoW: `Shared` は初回書き込み時のみコピーして `Owned` へ昇格）
+    pub fn to_mut(&mut self) -> &mut Vec<u8> {
+        if let BodyBuffer::Shared(b) = self {
+            *self = BodyBuffer::Owned(b.to_vec());
+        }
+        match self {
+            BodyBuffer::Owned(v) => v,
+            BodyBuffer::Shared(_) => unreachable!("converted to Owned above"),
+        }
+    }
+
+    /// `Bytes` として共有取得（`Shared` は O(1)、`Owned` はコピー。
+    /// `Owned` になるのはモジュールが書き換えた後のみで稀）
+    pub fn share(&self) -> Bytes {
+        match self {
+            BodyBuffer::Shared(b) => b.clone(),
+            BodyBuffer::Owned(v) => Bytes::copy_from_slice(v),
+        }
+    }
+
+    /// `Bytes` へ変換（`Shared` はそのまま、`Owned` はムーブ。いずれもコピーなし）
+    pub fn into_bytes(self) -> Bytes {
+        match self {
+            BodyBuffer::Shared(b) => b,
+            BodyBuffer::Owned(v) => Bytes::from(v),
+        }
+    }
+}
+
+impl Default for BodyBuffer {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
 
 /// HTTP context for a single request
 pub struct HttpContext {
@@ -19,8 +93,8 @@ pub struct HttpContext {
     // === Request ===
     /// Request headers (binary)
     pub request_headers: Vec<(Vec<u8>, Vec<u8>)>,
-    /// Request body
-    pub request_body: Vec<u8>,
+    /// Request body（F-61: CoW バッファ。共有 Bytes で受け取り書き換え時のみ所有化）
+    pub request_body: BodyBuffer,
     /// Request trailers (binary)
     pub request_trailers: Vec<(Vec<u8>, Vec<u8>)>,
     /// Request path
@@ -37,8 +111,8 @@ pub struct HttpContext {
     pub response_status: u16,
     /// Response headers (binary)
     pub response_headers: Vec<(Vec<u8>, Vec<u8>)>,
-    /// Response body
-    pub response_body: Vec<u8>,
+    /// Response body（F-61: CoW バッファ）
+    pub response_body: BodyBuffer,
     /// Response trailers (binary)
     pub response_trailers: Vec<(Vec<u8>, Vec<u8>)>,
     /// Is response body complete
@@ -161,7 +235,7 @@ impl HttpContext {
             context_id,
             root_context_id: 0,
             request_headers: Vec::new(),
-            request_body: Vec::new(),
+            request_body: BodyBuffer::empty(),
             request_trailers: Vec::new(),
             request_path: std::sync::Arc::from(""),
             request_method: std::sync::Arc::from(""),
@@ -169,7 +243,7 @@ impl HttpContext {
             request_body_complete: false,
             response_status: 0,
             response_headers: Vec::new(),
-            response_body: Vec::new(),
+            response_body: BodyBuffer::empty(),
             response_trailers: Vec::new(),
             response_body_complete: false,
             client_ip: std::sync::Arc::from(""),
@@ -226,9 +300,9 @@ impl HttpContext {
         self.client_ip = client_ip;
     }
 
-    /// Set request body
-    pub fn set_request_body(&mut self, body: Vec<u8>, complete: bool) {
-        self.request_body = body;
+    /// Set request body（F-61: 共有 `Bytes` をゼロコピーで受け取る）
+    pub fn set_request_body(&mut self, body: Bytes, complete: bool) {
+        self.request_body = BodyBuffer::Shared(body);
         self.request_body_complete = complete;
     }
 
@@ -238,9 +312,9 @@ impl HttpContext {
         self.response_headers = headers;
     }
 
-    /// Set response body
-    pub fn set_response_body(&mut self, body: Vec<u8>, complete: bool) {
-        self.response_body = body;
+    /// Set response body（F-61: 共有 `Bytes` をゼロコピーで受け取る）
+    pub fn set_response_body(&mut self, body: Bytes, complete: bool) {
+        self.response_body = BodyBuffer::Shared(body);
         self.response_body_complete = complete;
     }
 
