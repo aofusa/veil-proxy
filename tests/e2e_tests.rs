@@ -17424,3 +17424,127 @@ async fn test_tls_cert_reload_via_sighup() {
         "original certificate must be served after restore"
     );
 }
+
+// ====================
+// B-17: 不正バックエンド応答の即時エラー化テスト
+// ====================
+//
+// 上流がプロトコル違反応答（ヘッダー途中切断・巨大ヘッダー・不正ステータス・
+// 即クローズ・無応答・Content-Length 過大）を返した場合に、Veil がクライアントを
+// ハングさせず速やかに 502/504/接続クローズへ変換することを検証する。
+// バックエンドは tests/test_backends の bad-backend サーバー（ポート 9009）。
+
+/// B-17 プローブ: 指定パスへ GET し、(status, body) を返す。
+/// 修正前はクライアントタイムアウトまでハングしていたため、8 秒で打ち切る。
+async fn b17_probe(
+    path: &str,
+) -> Result<
+    Result<(u16, Vec<u8>), Box<dyn std::error::Error + Send + Sync>>,
+    tokio::time::error::Elapsed,
+> {
+    let client = Http1TestClient::new_https("127.0.0.1", PROXY_PORT).expect("client");
+    tokio::time::timeout(Duration::from_secs(8), client.get(path)).await
+}
+
+#[tokio::test]
+async fn test_b17_bad_backend_ok_baseline() {
+    // 正常プローブ: bad-backend ルート自体が機能していることの前提確認
+    let res = b17_probe("/bad-backend/ok")
+        .await
+        .expect("must not hang")
+        .expect("must succeed");
+    assert_eq!(res.0, 200);
+    assert_eq!(res.1, b"ok");
+}
+
+#[tokio::test]
+async fn test_b17_bad_backend_instant_close_returns_502() {
+    // 応答せず即クローズ → 即時 502
+    let res = b17_probe("/bad-backend/instant-close")
+        .await
+        .expect("must not hang (B-17)")
+        .expect("must receive a response");
+    assert_eq!(res.0, 502, "instant-close must yield 502");
+}
+
+#[tokio::test]
+async fn test_b17_bad_backend_truncated_headers_returns_502() {
+    // ヘッダー途中切断 → 即時 502
+    let res = b17_probe("/bad-backend/truncated-headers")
+        .await
+        .expect("must not hang (B-17)")
+        .expect("must receive a response");
+    assert_eq!(res.0, 502, "truncated headers must yield 502");
+}
+
+#[tokio::test]
+async fn test_b17_bad_backend_bad_status_returns_502() {
+    // 不正なステータスライン → 即時 502
+    let res = b17_probe("/bad-backend/bad-status")
+        .await
+        .expect("must not hang (B-17)")
+        .expect("must receive a response");
+    assert_eq!(res.0, 502, "malformed status line must yield 502");
+}
+
+#[tokio::test]
+async fn test_b17_bad_backend_huge_headers_returns_502() {
+    // 256KB 応答ヘッダー（MAX_RESPONSE_HEADER_SIZE=64KB 超過）→ 即時 502
+    let res = b17_probe("/bad-backend/huge-headers")
+        .await
+        .expect("must not hang (B-17)")
+        .expect("must receive a response");
+    assert_eq!(res.0, 502, "oversized response headers must yield 502");
+}
+
+#[tokio::test]
+async fn test_b17_bad_backend_cl_too_large_closes_promptly() {
+    // Content-Length: 1000 に対し 5 バイトのみ送信して EOF
+    // → ヘッダーは転送済みのため 502 にはできないが、接続を即クローズして
+    //   クライアントを CL 到達まで待たせないこと（ハングしないこと）を検証。
+    let started = std::time::Instant::now();
+    let res = b17_probe("/bad-backend/cl-too-large")
+        .await
+        .expect("must not hang (B-17)");
+    // hyper は不完全ボディを IncompleteMessage エラーにする（成功しても部分ボディ）
+    match res {
+        Ok((status, body)) => {
+            assert_eq!(status, 200);
+            assert!(
+                body.len() < 1000,
+                "body must be truncated, got {}",
+                body.len()
+            );
+        }
+        Err(_) => {} // IncompleteMessage 等は期待どおり（接続が即クローズされた）
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "connection must be closed promptly"
+    );
+}
+
+#[tokio::test]
+async fn test_b17_bad_backend_cl_too_small_no_smuggling() {
+    // Content-Length: 10 に対し 500 バイト送信 → 余剰バイトが転送されないこと（回帰ガード）
+    let res = b17_probe("/bad-backend/cl-too-small")
+        .await
+        .expect("must not hang")
+        .expect("must succeed");
+    assert_eq!(res.0, 200);
+    assert_eq!(res.1, b"XXXXXXXXXX", "exactly CL bytes must be forwarded");
+}
+
+#[tokio::test]
+async fn test_b17_bad_backend_no_response_returns_504() {
+    // 受理後 30 秒無応答 → BACKEND_HEADER_TIMEOUT (10s) で 504
+    let client = Http1TestClient::new_https("127.0.0.1", PROXY_PORT).expect("client");
+    let res = tokio::time::timeout(
+        Duration::from_secs(15),
+        client.get("/bad-backend/no-response"),
+    )
+    .await
+    .expect("must not hang past the backend header timeout (B-17)")
+    .expect("must receive a response");
+    assert_eq!(res.0, 504, "unresponsive upstream must yield 504");
+}

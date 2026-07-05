@@ -4847,8 +4847,18 @@ async fn handle_websocket_proxy_http(
     let status_code;
 
     loop {
+        // B-17: ハンドシェイク応答の読取にタイムアウトを設け、無応答上流で
+        // クライアントを待たせない
         let buf = buf_get();
-        let (res, mut returned_buf) = backend_stream.read(buf).await;
+        let read_result = timeout(BACKEND_HEADER_TIMEOUT, backend_stream.read(buf)).await;
+        let (res, mut returned_buf) = match read_result {
+            Ok(result) => result,
+            Err(_) => {
+                let err_buf = ERR_MSG_GATEWAY_TIMEOUT.to_vec();
+                let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
+                return Some((504, 0));
+            }
+        };
 
         let n = match res {
             Ok(0) => {
@@ -4974,8 +4984,18 @@ async fn handle_websocket_proxy_https(
     let status_code;
 
     loop {
+        // B-17: ハンドシェイク応答の読取にタイムアウトを設け、無応答上流で
+        // クライアントを待たせない
         let buf = buf_get();
-        let (res, mut returned_buf) = backend_stream.read(buf).await;
+        let read_result = timeout(BACKEND_HEADER_TIMEOUT, backend_stream.read(buf)).await;
+        let (res, mut returned_buf) = match read_result {
+            Ok(result) => result,
+            Err(_) => {
+                let err_buf = ERR_MSG_GATEWAY_TIMEOUT.to_vec();
+                let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
+                return Some((504, 0));
+            }
+        };
 
         let n = match res {
             Ok(0) => {
@@ -6135,7 +6155,19 @@ async fn proxy_http_pooled(
     };
 
     match result {
-        Some((status_code, total, backend_wants_keep_alive)) => {
+        Some((status_code, total, backend_wants_keep_alive, client_must_close)) => {
+            // B-17: クライアントへ 1 バイトも送らないままバックエンド異常で終わった場合、
+            // エラーページ（502/504）を即時送出してクローズする（従来はクライアントが
+            // 自身のタイムアウトまでハングしていた）
+            if total == 0 && status_code >= 500 {
+                let err_buf = if status_code == 504 {
+                    ERR_MSG_GATEWAY_TIMEOUT.to_vec()
+                } else {
+                    ERR_MSG_BAD_GATEWAY.to_vec()
+                };
+                let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
+                return Some((client_stream, status_code, 0, true));
+            }
             // バックエンドがKeep-Aliveを許可している場合、プールに返却
             if backend_wants_keep_alive {
                 let max_idle = security.max_idle_connections_per_host;
@@ -6146,7 +6178,8 @@ async fn proxy_http_pooled(
                 });
             }
             // 408 (body timeout) sends Connection: close — must actually close
-            let should_close = client_wants_close || status_code == 408;
+            // B-17: 上流異常でボディが完結しなかった場合もクローズする
+            let should_close = client_wants_close || status_code == 408 || client_must_close;
             Some((client_stream, status_code, total, should_close))
         }
         None => {
@@ -6386,7 +6419,7 @@ async fn proxy_request_buffered<R>(
     buffering_config: &buffering::BufferingConfig,
     cache_ctx: Option<&mut CacheSaveContext>,
     security: &SecurityConfig,
-) -> Option<(u16, u64, bool)>
+) -> Option<(u16, u64, bool, bool)>
 where
     R: AsyncReader
         + AsyncWriter
@@ -6439,7 +6472,7 @@ where
                     let _ = client_stream
                         .write_all(ERR_MSG_REQUEST_TIMEOUT.to_vec())
                         .await;
-                    return Some((408, 0, false));
+                    return Some((408, 0, false, true));
                 }
             }
         }
@@ -6450,6 +6483,12 @@ where
 
     match buffered {
         Some((status_code, headers_data, body_result, backend_wants_keep_alive)) => {
+            // B-17: ボディのバッファリングに失敗した場合、クライアントへは未送信のため
+            // ヘッダーだけ送って（CL 分のボディを待たせて）ハングさせず、
+            // None → 呼び出し元の 502 送出 + クローズに委ねる
+            if matches!(body_result, BufferedBodyResult::Failed) {
+                return None;
+            }
             // 5. バッファからクライアントへ送信
             let mut total = 0u64;
 
@@ -6485,7 +6524,7 @@ where
 
                         if !matches!(write_result, Ok((Ok(_), _))) {
                             let _ = crate::runtime::io::remove_file(&path).await;
-                            return Some((status_code, 0, false));
+                            return Some((status_code, 0, false, true));
                         }
 
                         total = headers_len as u64;
@@ -6504,7 +6543,7 @@ where
                             }
                             None => {
                                 let _ = crate::runtime::io::remove_file(&path).await;
-                                return Some((status_code, total, false));
+                                return Some((status_code, total, false, true));
                             }
                         }
                         let _ = crate::runtime::io::remove_file(&path).await;
@@ -6520,7 +6559,7 @@ where
                         if matches!(write_result, Ok((Ok(_), _))) {
                             total = headers_len as u64;
                         }
-                        return Some((status_code, total, false));
+                        return Some((status_code, total, false, true));
                     }
                     BufferedBodyResult::LimitExceeded => {
                         // 507 Insufficient Storage を送信
@@ -6531,7 +6570,7 @@ where
                         )
                         .await;
                         // 507 エラー時は接続を閉じる (should_close = true, backend keep-alive = false)
-                        return Some((507, 0, false));
+                        return Some((507, 0, false, true));
                     }
                 }
             } else {
@@ -6549,7 +6588,7 @@ where
                     if let BufferedBodyResult::Disk { ref path, .. } = body_result {
                         let _ = crate::runtime::io::remove_file(path).await;
                     }
-                    return Some((status_code, 0, false));
+                    return Some((status_code, 0, false, true));
                 }
 
                 total = headers_len as u64;
@@ -6566,7 +6605,7 @@ where
                             .await;
 
                             if !matches!(write_result, Ok((Ok(_), _))) {
-                                return Some((status_code, total, false));
+                                return Some((status_code, total, false, true));
                             }
 
                             total += body_len as u64;
@@ -6587,22 +6626,22 @@ where
                             }
                             None => {
                                 let _ = crate::runtime::io::remove_file(&path).await;
-                                return Some((status_code, total, false));
+                                return Some((status_code, total, false, true));
                             }
                         }
                         let _ = crate::runtime::io::remove_file(&path).await;
                     }
                     BufferedBodyResult::Failed => {
-                        return Some((status_code, total, false));
+                        return Some((status_code, total, false, true));
                     }
                     BufferedBodyResult::LimitExceeded => {
                         // すでにヘッダー送信済みのため、507を返すことはできないので接続を閉じる
-                        return Some((status_code, total, true));
+                        return Some((status_code, total, true, true));
                     }
                 }
             }
 
-            Some((status_code, total, backend_wants_keep_alive))
+            Some((status_code, total, backend_wants_keep_alive, false))
         }
         None => None,
     }
@@ -7164,7 +7203,7 @@ async fn proxy_http_request_with_compression(
     cache_ctx: Option<&mut CacheSaveContext>,
     security: &SecurityConfig,
     wasm_modules: Arc<Vec<String>>,
-) -> Option<(u16, u64, bool)> {
+) -> Option<(u16, u64, bool, bool)> {
     // 1. リクエストヘッダー送信（タイムアウト付き）
     let write_result = timeout(WRITE_TIMEOUT, backend_stream.write_all(request)).await;
     if !matches!(write_result, Ok((Ok(_), _))) {
@@ -7214,25 +7253,31 @@ async fn proxy_http_request_with_compression(
                     let _ = client_stream
                         .write_all(ERR_MSG_REQUEST_TIMEOUT.to_vec())
                         .await;
-                    return Some((408, 0, false));
+                    return Some((408, 0, false, true));
                 }
             }
         }
     }
 
     // 4. レスポンスを受信して転送（圧縮対応、キャッシュ保存対応）
-    let (total, status_code, backend_wants_keep_alive) = transfer_response_with_compression(
-        backend_stream,
-        client_stream,
-        compression,
-        client_encoding,
-        cache_ctx,
-        security,
-        wasm_modules,
-    )
-    .await;
+    let (total, status_code, backend_wants_keep_alive, client_must_close) =
+        transfer_response_with_compression(
+            backend_stream,
+            client_stream,
+            compression,
+            client_encoding,
+            cache_ctx,
+            security,
+            wasm_modules,
+        )
+        .await;
 
-    Some((status_code, total, backend_wants_keep_alive))
+    Some((
+        status_code,
+        total,
+        backend_wants_keep_alive,
+        client_must_close,
+    ))
 }
 
 // ====================
@@ -7241,6 +7286,10 @@ async fn proxy_http_request_with_compression(
 
 /// レスポンスヘッダーを解析し、必要に応じて圧縮してクライアントに転送
 /// キャッシュコンテキストが指定されている場合、レスポンスボディをキャプチャしてキャッシュに保存
+///
+/// 戻り値: (転送バイト数, ステータス, backend_wants_keep_alive, client_must_close)
+/// `client_must_close` は B-17: 上流異常（ヘッダー不完全・CL 未達 EOF 等）でクライアント
+/// 接続を即時クローズすべき場合に true。
 #[cfg_attr(not(feature = "wasm"), allow(unused_variables))]
 async fn transfer_response_with_compression(
     backend_stream: &mut TcpStream,
@@ -7250,7 +7299,7 @@ async fn transfer_response_with_compression(
     mut cache_ctx: Option<&mut CacheSaveContext>,
     security: &SecurityConfig,
     wasm_modules: Arc<Vec<String>>,
-) -> (u64, u16, bool) {
+) -> (u64, u16, bool, bool) {
     let mut accumulated = Vec::with_capacity(BUF_SIZE);
     let mut total = 0u64;
     let mut status_code = 502u16;
@@ -7259,25 +7308,28 @@ async fn transfer_response_with_compression(
 
     // ヘッダー読み取り用バッファ
     loop {
+        // B-17: ヘッダー読取は専用の短いタイムアウトで打ち切り、504 へ即変換する
         let read_buf = buf_get();
-        let read_result = timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
+        let read_result = timeout(BACKEND_HEADER_TIMEOUT, backend_stream.read(read_buf)).await;
 
         let (res, mut returned_buf) = match read_result {
             Ok(result) => result,
             Err(_) => {
-                return (total, status_code, backend_wants_keep_alive);
+                warn!("Backend response header read timeout");
+                return (total, 504, false, true);
             }
         };
 
         let n = match res {
             Ok(0) => {
                 buf_put(returned_buf);
-                return (total, status_code, backend_wants_keep_alive);
+                // B-17: ヘッダー完了前の EOF は 502 として即時応答する
+                return (total, status_code, backend_wants_keep_alive, true);
             }
             Ok(n) => n,
             Err(_) => {
                 buf_put(returned_buf);
-                return (total, status_code, backend_wants_keep_alive);
+                return (total, status_code, backend_wants_keep_alive, true);
             }
         };
 
@@ -7331,7 +7383,7 @@ async fn transfer_response_with_compression(
                 )
                 .await;
 
-                return (result.0, status_code, result.1);
+                return (result.0, status_code, result.1, false);
             } else {
                 // 圧縮無効: そのまま転送（キャッシュ保存対応）
 
@@ -7482,7 +7534,7 @@ async fn transfer_response_with_compression(
                 let write_result =
                     timeout(WRITE_TIMEOUT, client_stream.write_all(modified_headers)).await;
                 if !matches!(write_result, Ok((Ok(_), _))) {
-                    return (total, status_code, false);
+                    return (total, status_code, false, true);
                 }
                 total += header_len as u64;
 
@@ -7492,7 +7544,7 @@ async fn transfer_response_with_compression(
                     let write_result =
                         timeout(WRITE_TIMEOUT, client_stream.write_all(body_data)).await;
                     if !matches!(write_result, Ok((Ok(_), _))) {
-                        return (total, status_code, false);
+                        return (total, status_code, false, true);
                     }
                     total += body_start.len() as u64;
                 }
@@ -7518,15 +7570,29 @@ async fn transfer_response_with_compression(
                     )
                     .await;
                     total += transferred;
+
+                    // B-17: Content-Length 宣言に満たないまま上流が終了した場合、
+                    // クライアントは残りボディを待ち続けるため接続を即クローズして通知する
+                    if parsed.content_length.is_some() && transferred < body_remaining as u64 {
+                        warn!(
+                            "Backend response body incomplete: {} < {}",
+                            transferred, body_remaining
+                        );
+                        return (total, status_code, false, true);
+                    }
                 }
 
-                return (total, status_code, backend_wants_keep_alive);
+                return (total, status_code, backend_wants_keep_alive, false);
             }
         }
 
-        // ヘッダーが大きすぎる場合は中止
-        if accumulated.len() > MAX_HEADER_SIZE {
-            return (0, 502, false);
+        // B-17: レスポンスヘッダーの上限超過は 502 で即時応答する
+        if accumulated.len() > MAX_RESPONSE_HEADER_SIZE {
+            warn!(
+                "Backend response header too large (> {} bytes)",
+                MAX_RESPONSE_HEADER_SIZE
+            );
+            return (0, 502, false, true);
         }
     }
 }
@@ -8060,8 +8126,10 @@ async fn splice_body_transfer(
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 // src にデータが無い → 読み取り可能になるまで待機（POLL_ADD）
-                if src_stream.readable().await.is_err() {
-                    break;
+                // B-17: 無応答の上流で永久待機しないよう READ_TIMEOUT で打ち切る
+                match timeout(READ_TIMEOUT, src_stream.readable()).await {
+                    Ok(Ok(())) => {}
+                    _ => break,
                 }
                 continue;
             }
@@ -8079,8 +8147,10 @@ async fn splice_body_transfer(
                 Ok(m) => moved += m,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     // dst 送信バッファ満杯 → 書き込み可能になるまで待機（POLL_ADD）
-                    if dst_stream.writable().await.is_err() {
-                        break 'outer;
+                    // B-17: 受信停止したクライアントで永久待機しないよう WRITE_TIMEOUT で打ち切る
+                    match timeout(WRITE_TIMEOUT, dst_stream.writable()).await {
+                        Ok(Ok(())) => {}
+                        _ => break 'outer,
                     }
                 }
                 Err(e) => {
@@ -8126,7 +8196,7 @@ async fn proxy_http_request_splice(
     content_length: usize,
     is_chunked: bool,
     initial_body: &[u8],
-) -> Option<(u16, u64, bool)> {
+) -> Option<(u16, u64, bool, bool)> {
     // 設定に基づいてパイプを取得または作成
     let per_stream_pipe_enabled = {
         let config = CURRENT_CONFIG.load();
@@ -8219,12 +8289,13 @@ async fn proxy_http_request_splice(
 ///
 /// バックエンド(TCP) からヘッダーを読み取り、パースしてクライアント(kTLS)に送信。
 /// ボディは Content-Length の場合は splice、Chunked の場合は通常転送。
+/// 戻り値: (ステータス, 転送バイト数, backend_wants_keep_alive, client_must_close)
 #[cfg(feature = "ktls")]
 async fn splice_transfer_response_ktls(
     backend_stream: &TcpStream,
     client_stream: &KtlsServerStream,
     pipe: &SplicePipe,
-) -> (u16, u64, bool) {
+) -> (u16, u64, bool, bool) {
     let client_tcp = client_stream.get_ref();
 
     let mut total = 0u64;
@@ -8238,15 +8309,25 @@ async fn splice_transfer_response_ktls(
     // 1. ヘッダーを読み取り（raw_read + パース）
     loop {
         // バックエンドからヘッダーを読み取り
-        let n = match async_raw_read(backend_stream, &mut header_buf).await {
-            Ok(0) => {
-                // EOF
-                return (status_code, total, false);
+        // B-17: ヘッダー読取は専用の短いタイムアウトで打ち切り、504 へ即変換する
+        let n = match timeout(
+            BACKEND_HEADER_TIMEOUT,
+            async_raw_read(backend_stream, &mut header_buf),
+        )
+        .await
+        {
+            Ok(Ok(0)) => {
+                // B-17: ヘッダー完了前の EOF は 502 として即時応答する
+                return (status_code, total, false, true);
             }
-            Ok(n) => n,
-            Err(e) => {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
                 warn!("Failed to read response header: {}", e);
-                return (status_code, total, false);
+                return (status_code, total, false, true);
+            }
+            Err(_) => {
+                warn!("Backend response header read timeout (splice)");
+                return (504, total, false, true);
             }
         };
 
@@ -8266,9 +8347,12 @@ async fn splice_transfer_response_ktls(
             // ヘッダー + 初期ボディをクライアントに送信（raw_write）
             if let Err(e) = async_raw_write_all(client_tcp, &accumulated).await {
                 warn!("Failed to send response header: {}", e);
-                return (status_code, total, false);
+                return (status_code, total, false, true);
             }
             total += accumulated.len() as u64;
+
+            // B-17: ボディが完結しなかった場合にクライアント接続をクローズするためのフラグ
+            let mut client_must_close = false;
 
             // ボディ転送
             if parsed.is_chunked {
@@ -8282,17 +8366,29 @@ async fn splice_transfer_response_ktls(
                         == ChunkedFeedResult::Complete
                     {
                         // 初期ボディで完了
-                        return (status_code, total, backend_wants_keep_alive);
+                        return (status_code, total, backend_wants_keep_alive, false);
                     }
                 }
 
                 // 残りの Chunked ボディを転送
                 loop {
-                    let n = match async_raw_read(backend_stream, &mut header_buf).await {
-                        Ok(0) => break,
-                        Ok(n) => n,
-                        Err(_) => {
+                    // B-17: 無応答の上流で永久待機しないよう READ_TIMEOUT で打ち切る
+                    let n = match timeout(
+                        READ_TIMEOUT,
+                        async_raw_read(backend_stream, &mut header_buf),
+                    )
+                    .await
+                    {
+                        Ok(Ok(0)) => {
+                            // B-17: 終端チャンク前の EOF はクライアントを待たせないようクローズ
                             backend_wants_keep_alive = false;
+                            client_must_close = true;
+                            break;
+                        }
+                        Ok(Ok(n)) => n,
+                        Ok(Err(_)) | Err(_) => {
+                            backend_wants_keep_alive = false;
+                            client_must_close = true;
                             break;
                         }
                     };
@@ -8301,6 +8397,7 @@ async fn splice_transfer_response_ktls(
 
                     if let Err(_) = async_raw_write_all(client_tcp, &header_buf[..n]).await {
                         backend_wants_keep_alive = false;
+                        client_must_close = true;
                         break;
                     }
                     total += n as u64;
@@ -8320,7 +8417,9 @@ async fn splice_transfer_response_ktls(
                     total += transferred;
 
                     if transferred < remaining as u64 {
+                        // B-17: CL 未達のままの終了はクライアントを待たせないようクローズ
                         backend_wants_keep_alive = false;
+                        client_must_close = true;
                     }
                 }
             } else {
@@ -8329,10 +8428,16 @@ async fn splice_transfer_response_ktls(
                 backend_wants_keep_alive = false;
 
                 loop {
-                    let n = match async_raw_read(backend_stream, &mut header_buf).await {
-                        Ok(0) => break,
-                        Ok(n) => n,
-                        Err(_) => break,
+                    // B-17: 無応答の上流で永久待機しないよう READ_TIMEOUT で打ち切る
+                    let n = match timeout(
+                        READ_TIMEOUT,
+                        async_raw_read(backend_stream, &mut header_buf),
+                    )
+                    .await
+                    {
+                        Ok(Ok(0)) => break,
+                        Ok(Ok(n)) => n,
+                        Ok(Err(_)) | Err(_) => break,
                     };
 
                     if let Err(_) = async_raw_write_all(client_tcp, &header_buf[..n]).await {
@@ -8340,15 +8445,26 @@ async fn splice_transfer_response_ktls(
                     }
                     total += n as u64;
                 }
+
+                // 接続クローズが終端のためクライアント側もクローズが必要
+                client_must_close = true;
             }
 
-            return (status_code, total, backend_wants_keep_alive);
+            return (
+                status_code,
+                total,
+                backend_wants_keep_alive,
+                client_must_close,
+            );
         }
 
-        // ヘッダーが大きすぎる場合は中止
-        if accumulated.len() > MAX_HEADER_SIZE {
-            warn!("Response header too large");
-            return (502, 0, false);
+        // B-17: レスポンスヘッダーの上限超過は 502 で即時応答する
+        if accumulated.len() > MAX_RESPONSE_HEADER_SIZE {
+            warn!(
+                "Backend response header too large (> {} bytes, splice)",
+                MAX_RESPONSE_HEADER_SIZE
+            );
+            return (502, 0, false, true);
         }
     }
 }
@@ -8518,11 +8634,22 @@ async fn proxy_https_pooled(
         };
 
         match result {
-            Some((status_code, total, backend_wants_keep_alive)) => {
+            Some((status_code, total, backend_wants_keep_alive, client_must_close)) => {
                 // プールから取り出した接続が応答前に死んでいた（total==0 かつ status は初期値 502 = レスポンス未受信）。
                 // クライアントへ未送信のため、新規接続で一度だけ透過リトライ。死んだ接続はプールに戻さない。
                 if from_pool && total == 0 && status_code == 502 && replayable && attempt < 2 {
                     continue;
+                }
+                // B-17: クライアントへ 1 バイトも送らないままバックエンド異常で終わった場合、
+                // エラーページ（502/504）を即時送出してクローズする
+                if total == 0 && status_code >= 500 {
+                    let err_buf = if status_code == 504 {
+                        ERR_MSG_GATEWAY_TIMEOUT.to_vec()
+                    } else {
+                        ERR_MSG_BAD_GATEWAY.to_vec()
+                    };
+                    let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
+                    return Some((client_stream, status_code, 0, true));
                 }
                 // バックエンドがKeep-Aliveを許可している場合、プールに返却
                 if backend_wants_keep_alive {
@@ -8538,7 +8665,8 @@ async fn proxy_https_pooled(
                     });
                 }
                 // 408 (body timeout) sends Connection: close — must actually close
-                let should_close = client_wants_close || status_code == 408;
+                // B-17: 上流異常でボディが完結しなかった場合もクローズする
+                let should_close = client_wants_close || status_code == 408 || client_must_close;
                 return Some((client_stream, status_code, total, should_close));
             }
             None => {
@@ -8569,7 +8697,7 @@ async fn proxy_https_request_with_compression(
     client_encoding: AcceptedEncoding,
     security: &SecurityConfig,
     wasm_modules: Arc<Vec<String>>,
-) -> Option<(u16, u64, bool)> {
+) -> Option<(u16, u64, bool, bool)> {
     // 1. リクエストヘッダー送信
     let write_result = timeout(WRITE_TIMEOUT, backend_stream.write_all(request)).await;
     if !matches!(write_result, Ok((Ok(_), _))) {
@@ -8618,23 +8746,29 @@ async fn proxy_https_request_with_compression(
                 let _ = client_stream
                     .write_all(ERR_MSG_REQUEST_TIMEOUT.to_vec())
                     .await;
-                return Some((408, 0, false));
+                return Some((408, 0, false, true));
             }
         }
     }
 
     // 4. レスポンスを受信して転送（圧縮対応）
-    let (total, status_code, backend_wants_keep_alive) = transfer_https_response_with_compression(
-        backend_stream,
-        client_stream,
-        compression,
-        client_encoding,
-        security,
-        wasm_modules,
-    )
-    .await;
+    let (total, status_code, backend_wants_keep_alive, client_must_close) =
+        transfer_https_response_with_compression(
+            backend_stream,
+            client_stream,
+            compression,
+            client_encoding,
+            security,
+            wasm_modules,
+        )
+        .await;
 
-    Some((status_code, total, backend_wants_keep_alive))
+    Some((
+        status_code,
+        total,
+        backend_wants_keep_alive,
+        client_must_close,
+    ))
 }
 
 /// HTTPSレスポンス転送（圧縮対応版）
@@ -8646,7 +8780,7 @@ async fn transfer_https_response_with_compression(
     client_encoding: AcceptedEncoding,
     security: &SecurityConfig,
     wasm_modules: Arc<Vec<String>>,
-) -> (u64, u16, bool) {
+) -> (u64, u16, bool, bool) {
     let mut accumulated = Vec::with_capacity(BUF_SIZE);
     let mut total = 0u64;
     let mut status_code = 502u16;
@@ -8655,14 +8789,15 @@ async fn transfer_https_response_with_compression(
 
     // ヘッダー読み取り用バッファ
     loop {
+        // B-17: ヘッダー読取は専用の短いタイムアウトで打ち切り、504 へ即変換する
         let read_buf = buf_get();
-        let read_result = timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
+        let read_result = timeout(BACKEND_HEADER_TIMEOUT, backend_stream.read(read_buf)).await;
 
         let (res, mut returned_buf) = match read_result {
             Ok(result) => result,
             Err(_) => {
                 warn!("Backend response timeout while reading headers");
-                return (total, status_code, backend_wants_keep_alive);
+                return (total, 504, false, true);
             }
         };
 
@@ -8670,7 +8805,7 @@ async fn transfer_https_response_with_compression(
             Ok(0) => {
                 buf_put(returned_buf);
                 warn!("Backend closed connection without sending response (read returned 0 bytes)");
-                return (total, status_code, backend_wants_keep_alive);
+                return (total, status_code, backend_wants_keep_alive, true);
             }
             Ok(n) => n,
             Err(e) => {
@@ -8685,7 +8820,7 @@ async fn transfer_https_response_with_compression(
                 } else {
                     warn!("Backend read error: {}", e);
                 }
-                return (total, status_code, backend_wants_keep_alive);
+                return (total, status_code, backend_wants_keep_alive, true);
             }
         };
 
@@ -8734,7 +8869,7 @@ async fn transfer_https_response_with_compression(
                 )
                 .await;
 
-                return (result.0, status_code, result.1);
+                return (result.0, status_code, result.1, false);
             } else {
                 // 圧縮無効: そのまま転送（ヘッダー追加処理）
                 let mut modified_headers = accumulated[..header_len].to_vec();
@@ -8851,7 +8986,7 @@ async fn transfer_https_response_with_compression(
                 let write_result =
                     timeout(WRITE_TIMEOUT, client_stream.write_all(modified_headers)).await;
                 if !matches!(write_result, Ok((Ok(_), _))) {
-                    return (total, status_code, false);
+                    return (total, status_code, false, true);
                 }
                 total += header_len as u64;
 
@@ -8860,7 +8995,7 @@ async fn transfer_https_response_with_compression(
                     let write_result =
                         timeout(WRITE_TIMEOUT, client_stream.write_all(body_data)).await;
                     if !matches!(write_result, Ok((Ok(_), _))) {
-                        return (total, status_code, false);
+                        return (total, status_code, false, true);
                     }
                     total += body_start.len() as u64;
                 }
@@ -8884,14 +9019,29 @@ async fn transfer_https_response_with_compression(
                     )
                     .await;
                     total += transferred;
+
+                    // B-17: Content-Length 宣言に満たないまま上流が終了した場合、
+                    // クライアントは残りボディを待ち続けるため接続を即クローズして通知する
+                    if parsed.content_length.is_some() && transferred < body_remaining as u64 {
+                        warn!(
+                            "Backend response body incomplete: {} < {}",
+                            transferred, body_remaining
+                        );
+                        return (total, status_code, false, true);
+                    }
                 }
 
-                return (total, status_code, backend_wants_keep_alive);
+                return (total, status_code, backend_wants_keep_alive, false);
             }
         }
 
-        if accumulated.len() > MAX_HEADER_SIZE {
-            return (0, 502, false);
+        // B-17: レスポンスヘッダーの上限超過は 502 で即時応答する
+        if accumulated.len() > MAX_RESPONSE_HEADER_SIZE {
+            warn!(
+                "Backend response header too large (> {} bytes)",
+                MAX_RESPONSE_HEADER_SIZE
+            );
+            return (0, 502, false, true);
         }
     }
 }

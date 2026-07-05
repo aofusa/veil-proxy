@@ -242,6 +242,16 @@ pub(crate) const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+// B-17: バックエンド応答ヘッダー読取の専用タイムアウト。
+// 上流が無応答・ヘッダー途中で停止した場合に、クライアントを長時間待たせず
+// 速やかに 504 を返すため READ_TIMEOUT より短くする。
+pub(crate) const BACKEND_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+
+// B-17: バックエンド応答ヘッダーサイズの上限。
+// 超過時は 502 を返して接続をクローズする（巨大ヘッダーによるメモリ肥大・ハング防止）。
+// リクエスト側の MAX_HEADER_SIZE (8KB) より緩く、大きな Set-Cookie 等を許容する。
+pub(crate) const MAX_RESPONSE_HEADER_SIZE: usize = 64 * 1024;
+
 // バックエンドコネクションプール設定（デフォルト値）
 pub(crate) const BACKEND_POOL_MAX_IDLE_PER_HOST: usize = 8; // ホストあたりの最大アイドル接続数
 pub(crate) const BACKEND_POOL_IDLE_TIMEOUT_SECS: u64 = 30; // アイドル接続のタイムアウト（秒）

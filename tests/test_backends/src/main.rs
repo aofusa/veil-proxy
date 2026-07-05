@@ -3,6 +3,7 @@
 //! - WebSocket Echo Server (WS_PORT env var, default 9005)
 //! - HTTP 500 Error Server (ERROR_PORT env var, default 9006)
 //! - HTTP Chunked Streaming Server (CHUNKED_PORT env var, default 9007)
+//! - プロトコル違反サーバー (BAD_PORT env var, default 9009) — B-17 回帰テスト用
 
 use futures_util::{SinkExt, StreamExt};
 use std::net::SocketAddr;
@@ -12,7 +13,8 @@ use tracing::{debug, error, info};
 
 /// WebSocket Echoサーバー: 受信メッセージをそのまま返送する
 async fn run_ws_echo_server(addr: SocketAddr) {
-    let listener = TcpListener::bind(addr).await
+    let listener = TcpListener::bind(addr)
+        .await
         .unwrap_or_else(|e| panic!("Failed to bind WS server on {}: {}", addr, e));
     info!("WebSocket echo server listening on {}", addr);
 
@@ -44,9 +46,103 @@ async fn handle_ws(stream: TcpStream) -> Result<(), Box<dyn std::error::Error + 
     Ok(())
 }
 
+/// プロトコル違反サーバー（B-17 回帰テスト用）
+///
+/// リクエストパスに応じて意図的に不正な HTTP 応答を返す。
+/// プロキシがハングせず速やかに 502/504/クローズへ変換することを検証する。
+/// `tools/container_security/harness/scripts/bad_backend_server.py` と同等のプローブ。
+async fn run_bad_backend_server(addr: SocketAddr) {
+    let listener = TcpListener::bind(addr)
+        .await
+        .unwrap_or_else(|e| panic!("Failed to bind bad-backend server on {}: {}", addr, e));
+    info!("Bad backend server listening on {}", addr);
+
+    loop {
+        match listener.accept().await {
+            Ok((stream, peer)) => {
+                debug!("New bad-backend connection from {}", peer);
+                tokio::spawn(async move {
+                    if let Err(e) = handle_bad_backend(stream).await {
+                        debug!("Bad-backend handler error: {}", e);
+                    }
+                });
+            }
+            Err(e) => error!("Bad-backend accept error: {}", e),
+        }
+    }
+}
+
+async fn handle_bad_backend(
+    mut stream: TcpStream,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // リクエストヘッダーを読み取り（\r\n\r\n まで）
+    let mut buf = vec![0u8; 8192];
+    let mut total = 0;
+    loop {
+        let n = stream.read(&mut buf[total..]).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        total += n;
+        if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+        if total == buf.len() {
+            buf.resize(buf.len() * 2, 0);
+        }
+    }
+
+    // パスを抽出（"GET /path HTTP/1.1" の 2 番目のトークン）
+    let request = &buf[..total];
+    let path = request.split(|&b| b == b' ').nth(1).unwrap_or(b"/");
+
+    // パスはプロキシ側でプレフィックスが付く可能性があるため部分一致で判定する
+    let contains = |needle: &[u8]| path.windows(needle.len()).any(|w| w == needle);
+
+    if contains(b"truncated-headers") {
+        // ヘッダー途中で切断
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/pl")
+            .await?;
+    } else if contains(b"cl-too-large") {
+        // Content-Length > 実ボディ（クライアントは残りを待ってハングしうる）
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nshort")
+            .await?;
+    } else if contains(b"cl-too-small") {
+        // Content-Length < 実ボディ（余剰バイト＝スマグリング誘発）
+        let mut resp = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n".to_vec();
+        resp.extend_from_slice(&[b'X'; 500]);
+        stream.write_all(&resp).await?;
+    } else if contains(b"huge-headers") {
+        // 巨大ヘッダー（256KB）— MAX_RESPONSE_HEADER_SIZE (64KB) 超過
+        let mut resp = b"HTTP/1.1 200 OK\r\nX-Huge: ".to_vec();
+        resp.extend_from_slice(&vec![b'A'; 256 * 1024]);
+        resp.extend_from_slice(b"\r\nContent-Length: 2\r\n\r\nok");
+        stream.write_all(&resp).await?;
+    } else if contains(b"bad-status") {
+        // 不正なステータスライン
+        stream
+            .write_all(b"HTTP/1.1 999 \x00\x01\x02\r\nContent-Length: 2\r\n\r\nok")
+            .await?;
+    } else if contains(b"no-response") {
+        // 受理後に無応答（BACKEND_HEADER_TIMEOUT 検証）
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    } else if contains(b"instant-close") {
+        // 何も返さず即クローズ
+    } else {
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .await?;
+    }
+    let _ = stream.flush().await;
+    Ok(())
+}
+
 /// HTTP 500エラーサーバー: 常にHTTP 500を返す
 async fn run_http_error_server(addr: SocketAddr) {
-    let listener = TcpListener::bind(addr).await
+    let listener = TcpListener::bind(addr)
+        .await
         .unwrap_or_else(|e| panic!("Failed to bind error server on {}: {}", addr, e));
     info!("HTTP 500 error server listening on {}", addr);
 
@@ -65,7 +161,9 @@ async fn run_http_error_server(addr: SocketAddr) {
     }
 }
 
-async fn handle_http_error(mut stream: TcpStream) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn handle_http_error(
+    mut stream: TcpStream,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // リクエストヘッダーを読み捨て（\r\n\r\n まで）してから 500 を返す
     let mut buf = vec![0u8; 4096];
     let mut total = 0;
@@ -126,7 +224,9 @@ async fn run_chunked_server(addr: SocketAddr) {
     }
 }
 
-async fn handle_chunked(mut stream: TcpStream) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn handle_chunked(
+    mut stream: TcpStream,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // リクエストヘッダーを読み捨て（\r\n\r\n まで）
     let mut buf = vec![0u8; 4096];
     let mut total = 0;
@@ -145,7 +245,8 @@ async fn handle_chunked(mut stream: TcpStream) -> Result<(), Box<dyn std::error:
     }
 
     // chunked レスポンスを構築（テストバックエンドなのでアロケーションは許容）
-    let mut out: Vec<u8> = Vec::with_capacity(CHUNKED_TOTAL + CHUNKED_TOTAL / CHUNKED_CHUNK * 16 + 256);
+    let mut out: Vec<u8> =
+        Vec::with_capacity(CHUNKED_TOTAL + CHUNKED_TOTAL / CHUNKED_CHUNK * 16 + 256);
     out.extend_from_slice(
         b"HTTP/1.1 200 OK\r\n\
           Content-Type: application/octet-stream\r\n\
@@ -326,7 +427,9 @@ where
 
     // echo レスポンス
     let mut out: Vec<u8> = Vec::with_capacity(body.len() + 128);
-    out.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: ");
+    out.extend_from_slice(
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: ",
+    );
     out.extend_from_slice(body.len().to_string().as_bytes());
     out.extend_from_slice(b"\r\nConnection: close\r\n\r\n");
     out.extend_from_slice(&body);
@@ -354,6 +457,10 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(9006);
+    let bad_port: u16 = std::env::var("BAD_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9009);
     let chunked_port: u16 = std::env::var("CHUNKED_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -371,13 +478,14 @@ async fn main() {
 
     let ws_addr: SocketAddr = format!("127.0.0.1:{}", ws_port).parse().unwrap();
     let error_addr: SocketAddr = format!("127.0.0.1:{}", error_port).parse().unwrap();
+    let bad_addr: SocketAddr = format!("127.0.0.1:{}", bad_port).parse().unwrap();
     let chunked_addr: SocketAddr = format!("127.0.0.1:{}", chunked_port).parse().unwrap();
     let echo_addr: SocketAddr = format!("127.0.0.1:{}", echo_port).parse().unwrap();
     let tls_echo_addr: SocketAddr = format!("127.0.0.1:{}", tls_echo_port).parse().unwrap();
 
     info!(
-        "Starting test-backends: WS={}, HTTP-error={}, chunked={}, echo={}, tls-echo={}",
-        ws_addr, error_addr, chunked_addr, echo_addr, tls_echo_addr
+        "Starting test-backends: WS={}, HTTP-error={}, chunked={}, echo={}, tls-echo={}, bad={}",
+        ws_addr, error_addr, chunked_addr, echo_addr, tls_echo_addr, bad_addr
     );
 
     tokio::join!(
@@ -386,5 +494,6 @@ async fn main() {
         run_chunked_server(chunked_addr),
         run_echo_server(echo_addr),
         run_tls_echo_server(tls_echo_addr, tls_cert, tls_key),
+        run_bad_backend_server(bad_addr),
     );
 }

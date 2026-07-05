@@ -147,7 +147,7 @@
 | B-14 | P1 | 完了 | [bugs/B-14-nocache-static-file-404.md](bugs/B-14-nocache-static-file-404.md) | `cache` feature 無効（default features 等）で静的ファイル配信が 404。`get_file_info` スタブが `None` を返していた → キャッシュせず実解決する実装へ修正 |
 | B-15 | P1 | 完了 | [bugs/B-15-dockerfile-fuzz-workspace-build.md](bugs/B-15-dockerfile-fuzz-workspace-build.md) | Dockerfile(glibc/musl) の cacher が fuzz ワークスペースメンバ未対応でビルド失敗（exit 101）→ cacher で fuzz マニフェスト+スタブを用意 |
 | B-16 | P0 | 完了 | [bugs/B-16-splice-pipe-refcell-borrow-panic.md](bugs/B-16-splice-pipe-refcell-borrow-panic.md) | kTLS splice パイプ取得（`get_splice_pipe` の `borrow_mut`）で RefCell 二重借用 panic。**修正済み**: `Ref` 返却＋`'static` transmute を廃止し、L4（F-40）と同じ checkout/return 型プール（`PooledSplicePipe` RAII ガード + FIONREAD 残データ検査つき返却）へ変更。回帰単体テスト 4 件追加 |
-| B-17 | P1 | 未着手 | [bugs/B-17-malformed-backend-client-hang.md](bugs/B-17-malformed-backend-client-hang.md) | 不正バックエンド応答（ヘッダー途中切断・巨大ヘッダー・不正ステータス・即クローズ・CL 過大）でクライアント可視のハング（速やかな 502/クローズにならない）。F-67 で検出。**未修正・記録のみ** |
+| B-17 | P1 | 完了 | [bugs/B-17-malformed-backend-client-hang.md](bugs/B-17-malformed-backend-client-hang.md) | 不正バックエンド応答でクライアント可視のハング。**修正済み**: ヘッダーフェーズ失敗の即時 502/504 送出、`BACKEND_HEADER_TIMEOUT`(10s)・`MAX_RESPONSE_HEADER_SIZE`(64KB) 新設、CL 未達/chunked 終端前 EOF の即時クローズ（`client_must_close` 伝搬）。E2E 回帰テスト 8 件（`test_b17_*`）追加 |
 
 ---
 

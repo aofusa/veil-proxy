@@ -44,6 +44,7 @@ BACKEND_H2C_PORT=9003
 BACKEND_GRPC_PORT=9004
 BACKEND_WS_PORT=9005
 BACKEND_ERROR_PORT=9006
+BACKEND_BAD_PORT=9009
 BACKEND_CHUNKED_PORT=9007
 BACKEND_ECHO_PORT=9008
 BACKEND_TLS_ECHO_PORT=9018
@@ -447,6 +448,14 @@ open_duration_secs = 5
 half_open_probes = 1
 success_threshold = 1
 trip_on_timeout = true
+
+# B-17: プロトコル違反バックエンド（回帰テスト用）。
+# サーキットブレーカは無効（連続 5xx で open になると 502 の由来が曖昧になるため）
+[upstreams."bad-pool"]
+algorithm = "round_robin"
+servers = [
+    "http://127.0.0.1:${BACKEND_BAD_PORT}"
+]
 EOF
 
     # ヘルスチェック設定を追加（healthcheckタイプの時のみ有効化）
@@ -650,6 +659,23 @@ path = "/error-500/*"
 [route.action]
 type = "Proxy"
 upstream = "error-pool"
+
+# B-17: プロトコル違反バックエンドへのルート（回帰テスト用）
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/bad-backend/*"
+[route.action]
+type = "Proxy"
+upstream = "bad-pool"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/bad-backend/*"
+[route.action]
+type = "Proxy"
+upstream = "bad-pool"
 
 # B-10: Round Robin 分散テスト専用ルート（共有 "/" と RR ステートを隔離）
 [[route]]
@@ -1088,7 +1114,7 @@ start_servers() {
     # Rustバイナリ: tests/test_backends/
     log_info "Building and starting Rust test backends (WS echo + HTTP error + chunked + body-echo)..."
     (cd "${SCRIPT_DIR}/test_backends" && cargo build --quiet)
-    WS_PORT="${BACKEND_WS_PORT}" ERROR_PORT="${BACKEND_ERROR_PORT}" CHUNKED_PORT="${BACKEND_CHUNKED_PORT}" ECHO_PORT="${BACKEND_ECHO_PORT}" \
+    WS_PORT="${BACKEND_WS_PORT}" ERROR_PORT="${BACKEND_ERROR_PORT}" BAD_PORT="${BACKEND_BAD_PORT}" CHUNKED_PORT="${BACKEND_CHUNKED_PORT}" ECHO_PORT="${BACKEND_ECHO_PORT}" \
         TLS_ECHO_PORT="${BACKEND_TLS_ECHO_PORT}" TLS_CERT_PATH="${FIXTURES_DIR}/cert.pem" TLS_KEY_PATH="${FIXTURES_DIR}/key.pem" \
         RUST_LOG=info "${SCRIPT_DIR}/test_backends/target/debug/test-backends" \
         > /tmp/test_backends.log 2>&1 &
@@ -1098,7 +1124,7 @@ start_servers() {
     # test_backendsの起動待機（全ポートがリッスン状態になるまで）
     local tb_wait=0
     while [ $tb_wait -lt 30 ]; do
-        if check_port_in_use "$BACKEND_WS_PORT" && check_port_in_use "$BACKEND_ERROR_PORT" && check_port_in_use "$BACKEND_CHUNKED_PORT" && check_port_in_use "$BACKEND_ECHO_PORT" && check_port_in_use "$BACKEND_TLS_ECHO_PORT"; then
+        if check_port_in_use "$BACKEND_WS_PORT" && check_port_in_use "$BACKEND_ERROR_PORT" && check_port_in_use "$BACKEND_CHUNKED_PORT" && check_port_in_use "$BACKEND_ECHO_PORT" && check_port_in_use "$BACKEND_TLS_ECHO_PORT" && check_port_in_use "$BACKEND_BAD_PORT"; then
             sleep 0.2
             break
         fi
