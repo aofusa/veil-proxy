@@ -6,6 +6,55 @@ pub fn validate_http_header_boundary(name: &[u8], value: &[u8]) -> bool {
     crate::http_utils::is_valid_header_name(name) && crate::http_utils::is_valid_header_value(value)
 }
 
+/// HTTP リクエストスマグリング分類（B-23 デシンク防御）のファジング（ホットパス外）。
+///
+/// `classify_request_framing` はフロントエンド／バックエンドの本文長解釈を一致させ、
+/// CL.TE / TE.CL デシンクを塞ぐ **信頼境界の関門**である。外部から HTTP ヘッダーで
+/// 任意の Content-Length / Transfer-Encoding 組み合わせが到達し得る。
+///
+/// 本エントリは `data` を改行区切りのヘッダーブロックとみなして `(name, value)` へ分解し、
+/// 分類器に通す。任意入力で **panic せず**、かつ **反スマグリング不変条件**（Content-Length と
+/// Transfer-Encoding が同時に存在するなら必ず拒否 = `Err`。`Ok` になればデシンクの温床）を
+/// 満たすことを検証する。ファザーは戻り値を捨て、クラッシュ / assert 失敗だけを不具合として扱う。
+pub fn http_request_smuggling_smoke(data: &[u8]) {
+    use crate::http_utils::classify_request_framing;
+
+    let mut headers: Vec<(&[u8], &[u8])> = Vec::new();
+    let mut saw_content_length = false;
+    let mut saw_transfer_encoding = false;
+
+    for line in data.split(|&b| b == b'\n') {
+        // CR を落とし、空行はスキップ（ヘッダー終端相当）。
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        let Some(idx) = line.iter().position(|&b| b == b':') else {
+            continue;
+        };
+        let name = line[..idx].trim_ascii();
+        let value = line[idx + 1..].trim_ascii();
+        if name.eq_ignore_ascii_case(b"content-length") {
+            saw_content_length = true;
+        } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
+            saw_transfer_encoding = true;
+        }
+        headers.push((name, value));
+    }
+
+    let result = classify_request_framing(headers.iter().copied());
+
+    // 反スマグリング不変条件: CL と TE が両方存在するなら必ず拒否されねばならない。
+    if saw_content_length && saw_transfer_encoding {
+        assert!(
+            result.is_err(),
+            "CL+TE combination must be rejected (anti-desync invariant); headers={headers:?}"
+        );
+    }
+    // それ以外は Ok/Err どちらでも良い（panic しないことが主目的）。
+    let _ = result;
+}
+
 /// WASM モジュールバイト列の検証・コンパイル境界のスモークファジング（ホットパス外）。
 ///
 /// Proxy-Wasm では信頼できない `.wasm` バイト列が wasmtime のバリデータ/コンパイラへ
@@ -49,6 +98,38 @@ pub fn wasm_host_abi_map_smoke(bytes: &[u8]) {
         map, reparsed,
         "host ABI map roundtrip must be idempotent (guest/host consistency)"
     );
+}
+
+#[cfg(test)]
+mod smuggling_tests {
+    use super::*;
+
+    /// スマグリング smoke: 任意入力で panic せず、CL+TE は必ず拒否される（反デシンク不変条件）。
+    #[test]
+    fn http_request_smuggling_smoke_handles_arbitrary_input() {
+        // 無害・不正・境界入力（panic しないこと）。
+        for bad in [
+            &b""[..],
+            &b"\n\n\n"[..],
+            &b"Content-Length"[..], // コロンなし
+            &b":\r\n"[..],
+            &b"Transfer-Encoding: chunked\r\n"[..],
+            &b"Content-Length: 10\r\n"[..],
+            &b"garbage \xff\x00 bytes: value"[..],
+        ] {
+            http_request_smuggling_smoke(bad);
+        }
+
+        // CL+TE の各種組み合わせ（`Content-Length: 0` + chunked = B-23 の取りこぼしを含む）は
+        // すべて assert（Err 要求）を通過すること。もし分類器が Ok を返せば panic する。
+        for desync in [
+            &b"Content-Length: 0\r\nTransfer-Encoding: chunked\r\n"[..],
+            &b"content-length: 5\r\ntransfer-encoding: chunked\r\n"[..],
+            &b"Transfer-Encoding: chunked\r\nContent-Length: 42\r\n"[..],
+        ] {
+            http_request_smuggling_smoke(desync);
+        }
+    }
 }
 
 #[cfg(all(test, feature = "wasm"))]

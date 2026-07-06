@@ -46,6 +46,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "http_request_smuggling"
+path = "fuzz_targets/http_request_smuggling.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "wasm_abi"
 path = "fuzz_targets/wasm_abi.rs"
 test = false
