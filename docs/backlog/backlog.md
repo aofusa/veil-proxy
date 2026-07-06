@@ -117,6 +117,11 @@
 | F-81 | P2 | 未着手 | [features/F-81-sbom-ci-integration.md](features/F-81-sbom-ci-integration.md) | SBOMのCIパイプライン統合およびRelease添付。F-65から分離。 |
 | F-82 | P2 | 未着手 | [features/F-82-fuzzing-ci-nightly.md](features/F-82-fuzzing-ci-nightly.md) | ファジングのCI統合（長時間実行・Corpus永続化）。F-52から分離。 |
 | F-83 | P3 | 未着手 | [features/F-83-nuclei-landlock-firing.md](features/F-83-nuclei-landlock-firing.md) | Nuclei（DAST テンプレスキャン）と Landlock 違反の意図的発火コンテナテスト。F-54 から分離。 |
+| F-84 | P1 | 未着手 | [features/F-84-iouring-executor-cqe-fuzzing.md](features/F-84-iouring-executor-cqe-fuzzing.md) | io_uring executor 擬似 CQE 注入ファジング（異常 res・stale user_data・順序逆転で panic/状態不整合なし）。container_security レビューレポート提案1 |
+| F-85 | P2 | 未着手 | [features/F-85-e2e-chaos-sanitizers.md](features/F-85-e2e-chaos-sanitizers.md) | E2E カオス負荷への ASAN/TSAN 統合（sanitizer ビルドの Veil でカオス実行、UAF/リーク検出）。レポート提案2 |
+| F-86 | P2 | 未着手 | [features/F-86-syscall-fault-injection-chaos.md](features/F-86-syscall-fault-injection-chaos.md) | syscall レベルのフォールトインジェクション（strace inject で io_uring_enter に EBUSY/ENOMEM/EFAULT 注入）。レポート提案3 |
+| F-87 | P1 | 未着手 | [features/F-87-future-cancellation-safety-tests.md](features/F-87-future-cancellation-safety-tests.md) | io_uring Future のランダム Drop（キャンセル安全性）テスト（遅延 CQE と解放済みバッファの UAF 検出）。レポート提案4 |
+| F-88 | P2 | 未着手 | [features/F-88-ast-hotpath-blocking-lint.md](features/F-88-ast-hotpath-blocking-lint.md) | AST ベース静的解析（clippy disallowed-methods）でホットパスのブロッキング呼び出し混入を検出。レポート提案5 |
 | F-73 | P1 | 完了 | [features/F-73-http2-send-zerocopy-writeall.md](features/F-73-http2-send-zerocopy-writeall.md) | HTTP/2 送信ホットパスの write_all ゼロコピー化（per-frame の 2 度目の to_vec 確保+コピーを排除）。A/B で **HTTP/2 +11.6%**（1577→1761 req/s、nginx 比 75%→84%）、HTTP/1.1 不変・応答ボディ sha256 一致。レポート `docs/artifacts/performance_report_veil_vs_nginx_v3.md` |
 | F-74 | P1 | 完了 | [features/F-74-http2-send-frame-coalescing.md](features/F-74-http2-send-frame-coalescing.md) | HTTP/2 送信ホットパスのフレーム連結（HEADERS/DATA コアレッシング）。1 レスポンス分のフレームを接続再利用連結バッファ `write_buf`（スレッドローカルプール）へ積み **1 回の書き込み** で送出。`encode_*_into` 追記 API・`send_headers_buffered`・128KB 途中フラッシュ閾値を追加。per-frame 送信システムコールを削減。単体 660 / http2 E2E 11 / gRPC E2E 35 グリーン。F-73 続き |
 | F-11 | P3 | 未着手 | [features/dashboard.md](features/dashboard.md) | ダッシュボード機能 |
