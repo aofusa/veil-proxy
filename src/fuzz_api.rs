@@ -100,6 +100,64 @@ pub fn wasm_host_abi_map_smoke(bytes: &[u8]) {
     );
 }
 
+/// io_uring executor への擬似 CQE 注入ファジング（F-84、ホットパス外）。
+///
+/// コアランタイム（`src/runtime/executor.rs`）の op テーブル・完了ディスパッチ経路を、
+/// 実リング（カーネル）を介さずに Fuzzer 生成の操作列で駆動する。異常な `res` 値、
+/// `user_data` の偽造・stale 世代、完了順序の逆転・重複到着に対して panic せず、
+/// detach ガードの exactly-once 実行（B-07 の UAF/リーク対策の意味論）と
+/// スロット非リークを不変条件として検査する。詳細は
+/// `runtime::executor::fuzz_op_table_sequence` の doc コメントを参照。
+pub fn io_uring_executor_smoke(data: &[u8]) {
+    crate::runtime::executor::fuzz_op_table_sequence(data);
+}
+
+#[cfg(test)]
+mod io_uring_executor_tests {
+    use super::*;
+
+    /// 代表的な操作列（正常完了・detach・偽造 CQE・境界）で不変条件が成立すること。
+    #[test]
+    fn io_uring_executor_smoke_handles_representative_sequences() {
+        // 空・単一 alloc・切り詰め入力。
+        io_uring_executor_smoke(b"");
+        io_uring_executor_smoke(&[0]);
+        io_uring_executor_smoke(&[1]); // id 指定バイト不足で途中終了
+
+        // alloc → CQE(res=-1) → take の正常完了経路。
+        io_uring_executor_smoke(&[0, 1, 0, 0xFF, 0xFF, 0xFF, 0xFF, 4, 0]);
+
+        // alloc → detach(pending) → （フラッシュで遅延 CQE が届きガードが 1 回走る）。
+        io_uring_executor_smoke(&[0, 3, 0]);
+
+        // alloc → CQE → detach(done: ガード即時実行) 。
+        io_uring_executor_smoke(&[0, 1, 0, 42, 0, 0, 0, 3, 0]);
+
+        // 偽造 user_data への CQE（センチネル u64::MAX・無効 0・ランダム）。
+        io_uring_executor_smoke(&[
+            0, // alloc
+            2, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // u64::MAX
+            2, 0, 0, 0, 0, 0, 0, 0, 0, // 無効 ID 0
+            2, 0x37, 0x13, 0, 0, 0x01, 0, 0, 0, // 適当な世代不一致
+        ]);
+    }
+
+    /// 決定的な擬似乱数列による長い操作列でも不変条件が成立すること（ミニファザー）。
+    #[test]
+    fn io_uring_executor_smoke_survives_pseudo_random_sequences() {
+        // 単純な LCG で 256 本の 96 バイト列を決定的に生成する。
+        let mut state = 0x243F_6A88_85A3_08D3u64;
+        for _ in 0..256 {
+            let mut buf = [0u8; 96];
+            for b in buf.iter_mut() {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                *b = (state >> 33) as u8;
+            }
+            io_uring_executor_smoke(&buf);
+        }
+    }
+}
+
 #[cfg(test)]
 mod smuggling_tests {
     use super::*;

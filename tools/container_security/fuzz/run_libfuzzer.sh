@@ -8,7 +8,7 @@ RESULTS_DIR="${RESULTS_DIR:-${REPO_ROOT}/tools/container_security/results}"
 RUST_IMAGE="${RUST_FUZZ_IMAGE:-rustlang/rust:nightly-bookworm}"
 FUZZ_RUNS="${FUZZ_RUNS:-2000}"
 FUZZ_MAX_TIME="${FUZZ_MAX_TIME:-120}"
-FUZZ_TARGETS="${FUZZ_TARGETS:-hpack_decode config_toml http2_frame_decode http_header_validate http_request_smuggling}"
+FUZZ_TARGETS="${FUZZ_TARGETS:-hpack_decode config_toml http2_frame_decode http_header_validate http_request_smuggling io_uring_executor}"
 # WASM 系ターゲット（wasmtime 依存で重いため既定 off）。`--features wasm` で実体が動く。
 #   wasm_abi      … 信頼境界外 .wasm バイト列のコンパイル境界（F-70）
 #   wasm_host_abi … ゲスト→ホスト ABI マップ復元境界の冪等性（F-70 残件）

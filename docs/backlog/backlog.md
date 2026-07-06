@@ -117,7 +117,7 @@
 | F-81 | P2 | 未着手 | [features/F-81-sbom-ci-integration.md](features/F-81-sbom-ci-integration.md) | SBOMのCIパイプライン統合およびRelease添付。F-65から分離。 |
 | F-82 | P2 | 未着手 | [features/F-82-fuzzing-ci-nightly.md](features/F-82-fuzzing-ci-nightly.md) | ファジングのCI統合（長時間実行・Corpus永続化）。F-52から分離。 |
 | F-83 | P3 | 未着手 | [features/F-83-nuclei-landlock-firing.md](features/F-83-nuclei-landlock-firing.md) | Nuclei（DAST テンプレスキャン）と Landlock 違反の意図的発火コンテナテスト。F-54 から分離。 |
-| F-84 | P1 | 未着手 | [features/F-84-iouring-executor-cqe-fuzzing.md](features/F-84-iouring-executor-cqe-fuzzing.md) | io_uring executor 擬似 CQE 注入ファジング（異常 res・stale user_data・順序逆転で panic/状態不整合なし）。container_security レビューレポート提案1 |
+| F-84 | P1 | 完了 | [features/F-84-iouring-executor-cqe-fuzzing.md](features/F-84-iouring-executor-cqe-fuzzing.md) | io_uring executor 擬似 CQE 注入ファジング（異常 res・偽造/stale user_data・順序逆転で panic/ガード二重実行/スロットリークなし）。fuzz ターゲット `io_uring_executor` + 回帰単体。レポート提案1 |
 | F-85 | P2 | 未着手 | [features/F-85-e2e-chaos-sanitizers.md](features/F-85-e2e-chaos-sanitizers.md) | E2E カオス負荷への ASAN/TSAN 統合（sanitizer ビルドの Veil でカオス実行、UAF/リーク検出）。レポート提案2 |
 | F-86 | P2 | 未着手 | [features/F-86-syscall-fault-injection-chaos.md](features/F-86-syscall-fault-injection-chaos.md) | syscall レベルのフォールトインジェクション（strace inject で io_uring_enter に EBUSY/ENOMEM/EFAULT 注入）。レポート提案3 |
 | F-87 | P1 | 未着手 | [features/F-87-future-cancellation-safety-tests.md](features/F-87-future-cancellation-safety-tests.md) | io_uring Future のランダム Drop（キャンセル安全性）テスト（遅延 CQE と解放済みバッファの UAF 検出）。レポート提案4 |

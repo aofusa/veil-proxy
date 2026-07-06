@@ -306,6 +306,192 @@ impl OpTable {
             self.free_slot(i);
         }
     }
+
+    /// 全スロットが解放済みか（F-84 ファジング・テストの不変条件検査用）。
+    fn all_slots_free(&self) -> bool {
+        self.free.len() == self.slots.len()
+            && self
+                .slots
+                .iter()
+                .all(|s| matches!(s.state, OpSlotState::Free))
+    }
+}
+
+// ====================
+// F-84: 擬似 CQE 注入ファジングドライバ（ホットパス外）
+// ====================
+
+/// ファジング駆動用の no-op Waker（wake 経路を通すことのみが目的）。
+fn fuzz_noop_waker() -> Waker {
+    fn clone(data: *const ()) -> RawWaker {
+        RawWaker::new(data, &NOOP_VTABLE)
+    }
+    fn noop(_data: *const ()) {}
+    static NOOP_VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+    // SAFETY: data は未使用の null。全 vtable 関数が副作用なしで契約を満たす。
+    unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &NOOP_VTABLE)) }
+}
+
+/// F-84: Fuzzer が生成したバイト列を「op テーブル操作列 + 擬似 CQE」として解釈し、
+/// 実リング（カーネル）を介さずに executor の完了ディスパッチ経路を駆動する。
+///
+/// 異常な `res` 値（負のエラーコード・想定外サイズ）、`user_data` の不整合（偽造・
+/// stale 世代・センチネル衝突）、完了順序の逆転・重複到着を大量生成し、次の不変条件を
+/// 検査する（違反は assert 失敗 = ファザーがクラッシュとして報告）:
+///
+/// 1. 任意の操作列で panic しない。
+/// 2. detach ガードは **高々 1 回** しか実行されない（2 回 = 二重解放相当）。
+/// 3. detach 時点で未完了（pending）だったガードは、遅延 CQE の到着で **ちょうど 1 回**
+///    実行される（0 回 = カーネル参照バッファのリーク相当、B-07 の意味論）。
+/// 4. 全 CQE 処理後にスロットがリークしない（alloc された op は必ず解放経路に到達する）。
+///
+/// 実カーネルの SQE 提出・restriction 検証は対象外（F-86 の syscall フォールト注入と
+/// F-87 の実リング統合テストが補完する）。
+pub(crate) fn fuzz_op_table_sequence(data: &[u8]) {
+    /// 操作列の上限（スロット数爆発とファジングの時間超過を防ぐ）。
+    const MAX_OPS: usize = 1024;
+    /// 同時追跡する op の上限。
+    const MAX_TRACKED: usize = 256;
+
+    let mut table = OpTable::new();
+    // alloc 済み op の user_data と「detach 済みか」（実コードでは Future ドロップ後に
+    // 所有者が take/remove を呼ぶ経路は存在しないため、detach 済み id への remove は
+    // 発行しない = 実際の呼び出し契約をモデル化する）。
+    let mut tracked: Vec<(u64, bool)> = Vec::new();
+    // detach ガードの実行回数カウンタと「detach 時点で pending だったか」。
+    let mut guards: Vec<(Rc<std::cell::Cell<u32>>, bool)> = Vec::new();
+
+    let mut cursor = 0usize;
+    let mut next = |n: usize| -> Option<&[u8]> {
+        let end = cursor.checked_add(n)?;
+        let s = data.get(cursor..end)?;
+        cursor = end;
+        Some(s)
+    };
+
+    for _ in 0..MAX_OPS {
+        let Some(op) = next(1) else { break };
+        match op[0] % 8 {
+            // alloc: 新しい op スロットを確保
+            0 => {
+                if tracked.len() < MAX_TRACKED {
+                    tracked.push((table.alloc(), false));
+                }
+            }
+            // 追跡中 id への CQE 配送（res は任意の i32 = 負のエラーコード・巨大サイズ等）
+            1 => {
+                let Some(b) = next(5) else { break };
+                if !tracked.is_empty() {
+                    let (ud, _) = tracked[b[0] as usize % tracked.len()];
+                    let res = i32::from_le_bytes([b[1], b[2], b[3], b[4]]);
+                    table.on_cqe(&IoUringCqe {
+                        user_data: ud,
+                        res,
+                        flags: 0,
+                    });
+                }
+            }
+            // 偽造 user_data への CQE 配送（無効 index・stale 世代・センチネル等）
+            2 => {
+                let Some(b) = next(8) else { break };
+                let ud = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+                table.on_cqe(&IoUringCqe {
+                    user_data: ud,
+                    res: -22, // EINVAL
+                    flags: 0,
+                });
+            }
+            // detach（Future ドロップの模擬。ガード実行回数を数える）
+            3 => {
+                let Some(b) = next(1) else { break };
+                if !tracked.is_empty() {
+                    let i = b[0] as usize % tracked.len();
+                    let (ud, _) = tracked[i];
+                    let counter = Rc::new(std::cell::Cell::new(0u32));
+                    let c = counter.clone();
+                    let was_pending =
+                        table.detach(ud, OpGuard::Cleanup(Box::new(move |_res| c.set(c.get() + 1))));
+                    assert!(
+                        counter.get() <= 1,
+                        "detach guard ran {} times synchronously",
+                        counter.get()
+                    );
+                    guards.push((counter, was_pending));
+                    tracked[i].1 = true;
+                }
+            }
+            // take_result（完了結果の取り出し = 正常完了経路）
+            4 => {
+                let Some(b) = next(1) else { break };
+                if !tracked.is_empty() {
+                    let (ud, _) = tracked[b[0] as usize % tracked.len()];
+                    let _ = table.take_result(ud);
+                }
+            }
+            // peek_result（非破壊参照）
+            5 => {
+                let Some(b) = next(1) else { break };
+                if !tracked.is_empty() {
+                    let (ud, _) = tracked[b[0] as usize % tracked.len()];
+                    let _ = table.peek_result(ud);
+                }
+            }
+            // remove（SQE 提出失敗の模擬。detach 済み id には所有者がいないため発行しない）
+            6 => {
+                let Some(b) = next(1) else { break };
+                if !tracked.is_empty() {
+                    let i = b[0] as usize % tracked.len();
+                    let (ud, detached) = tracked[i];
+                    if !detached {
+                        table.remove(ud);
+                    }
+                }
+            }
+            // set_waker（wake 経路の駆動）
+            7 => {
+                let Some(b) = next(1) else { break };
+                if !tracked.is_empty() {
+                    let (ud, _) = tracked[b[0] as usize % tracked.len()];
+                    table.set_waker(ud, fuzz_noop_waker());
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    // 遅延 CQE フラッシュ: カーネルから遅れて到着する完了/キャンセル CQE を全 id へ配送する
+    // （解放済み id へは stale として無視されることも同時に検査される）。
+    for &(ud, _) in &tracked {
+        table.on_cqe(&IoUringCqe {
+            user_data: ud,
+            res: -125, // ECANCELED
+            flags: 0,
+        });
+    }
+    // 未回収の完了結果を取り出してスロットを解放する（正常系の後始末）。
+    for &(ud, _) in &tracked {
+        let _ = table.take_result(ud);
+    }
+
+    // 不変条件 2・3: ガードは高々 1 回、pending detach はちょうど 1 回。
+    for (counter, was_pending) in &guards {
+        let runs = counter.get();
+        assert!(runs <= 1, "detach guard must run at most once, ran {runs}");
+        if *was_pending {
+            assert_eq!(
+                runs, 1,
+                "pending detach guard must run exactly once after late CQE (leak otherwise)"
+            );
+        }
+    }
+
+    // 不変条件 4: 全スロット解放済み（リークなし）。
+    assert!(
+        table.all_slots_free(),
+        "op table slot leak: {} slots, {} free",
+        table.slots.len(),
+        table.free.len()
+    );
 }
 
 // ====================

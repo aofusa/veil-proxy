@@ -53,6 +53,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "io_uring_executor"
+path = "fuzz_targets/io_uring_executor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "wasm_abi"
 path = "fuzz_targets/wasm_abi.rs"
 test = false

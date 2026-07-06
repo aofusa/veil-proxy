@@ -144,6 +144,7 @@ FUZZ_RUNS=2000 FUZZ_MAX_TIME=120 ./tools/container_security/fuzz/run_libfuzzer.s
 | `config_toml` | 設定 TOML パーサ（`test_config_file`） |
 | `http2_frame_decode` | HTTP/2 フレームデコーダ |
 | `http_header_validate` | HTTP/1 ヘッダー名・値の境界検証（`fuzz_api`） |
+| `io_uring_executor` | io_uring executor への擬似 CQE 注入（異常 res・偽造/stale user_data・順序逆転。`fuzz_api::io_uring_executor_smoke`、F-84） |
 | `wasm_abi` | WASM モジュール/ABI 境界（`fuzz_api::wasm_module_smoke`、F-70。`--features wasm` で有効化） |
 | `wasm_host_abi` | WASM ホスト ABI 境界＝ゲスト→ホスト マップ復元の冪等性（`fuzz_api::wasm_host_abi_map_smoke`、F-70。`--features wasm`。`RUN_WASM_FUZZ=1` で有効化） |
 
