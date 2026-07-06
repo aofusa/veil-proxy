@@ -139,7 +139,7 @@ docker run --rm -it -v $(pwd):/io -w /io messense/cargo-zigbuild \
 Debian/Ubuntu（`.deb`）と Amazon Linux 2023（`.rpm`）向けのインストールパッケージを、全機能（`--features full`）で一括ビルドします。
 
 ```bash
-./packaging/build.sh
+./packaging/scripts/build.sh
 ```
 
 成果物:
@@ -153,10 +153,10 @@ Docker でのビルド（[docker/Dockerfile.glibc](../../docker/Dockerfile.glibc
 
 ```bash
 # バイナリのみ Docker、パッケージはホストで生成
-./packaging/build.sh --docker
+./packaging/scripts/build.sh --docker
 
 # または Docker 内でパッケージまで一括ビルド
-docker build -f packaging/Dockerfile.package -t veil-package:local .
+docker build -f packaging/scripts/docker/Dockerfile.package -t veil-package:local .
 cid=$(docker create veil-package:local)
 docker cp "$cid:/app/packaging/output/." packaging/output/
 docker rm "$cid"
@@ -178,7 +178,7 @@ sudo systemctl enable --now veil
 Docker コンテナでのインストール・起動・curl 動作確認（両パッケージ）:
 
 ```bash
-./packaging/test-install.sh
+./packaging/scripts/test-install.sh
 ```
 
 詳細は [packaging/README.md](../../packaging/README.md) を参照してください。

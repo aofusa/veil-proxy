@@ -36,4 +36,4 @@ COPY . /app
 RUN find src -name '*.rs' -exec touch {} + \
     && cargo test --lib --target "${RUST_TARGET}" --features "${CARGO_FEATURES}" --locked \
     && cargo zigbuild --release --target "${RUST_TARGET}${LIBC_VERSION}" --features "${CARGO_FEATURES}" --locked \
-    && ./packaging/build.sh --skip-build --binary "/app/target/${RUST_TARGET}/release/veil"
+    && ./packaging/scripts/build.sh --skip-build --binary "/app/target/${RUST_TARGET}/release/veil"

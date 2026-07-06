@@ -2,7 +2,9 @@
 # Amazon Linux 2023 Docker コンテナ内で .rpm パッケージのインストールと動作確認
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+DOCKER_DIR="${SCRIPT_DIR}/docker"
 OUTPUT_DIR="${ROOT}/packaging/output"
 RPM_FILE="$(ls -1 "${OUTPUT_DIR}"/veil-*.rpm 2>/dev/null | head -1)"
 IMAGE="${VEIL_TEST_IMAGE:-veil-package-test:al2023}"
@@ -11,7 +13,7 @@ HTTP_PORT="${VEIL_TEST_HTTP_PORT:-28080}"
 HTTPS_PORT="${VEIL_TEST_HTTPS_PORT:-28443}"
 
 if [[ -z "${RPM_FILE}" || ! -f "${RPM_FILE}" ]]; then
-    echo "ERROR: rpm package not found. Run packaging/build.sh first." >&2
+    echo "ERROR: rpm package not found. Run packaging/scripts/build.sh first." >&2
     exit 1
 fi
 
@@ -22,7 +24,7 @@ trap cleanup EXIT
 
 if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
     echo "==> Building test image (${IMAGE})"
-    docker build -t "${IMAGE}" -f "${ROOT}/packaging/Dockerfile.test-al2023" "${ROOT}/packaging"
+    docker build -t "${IMAGE}" -f "${DOCKER_DIR}/Dockerfile.test-rpm" "${DOCKER_DIR}"
 fi
 
 echo "==> Starting Amazon Linux 2023 container with systemd (${IMAGE})"

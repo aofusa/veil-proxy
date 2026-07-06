@@ -2,14 +2,16 @@
 # Ubuntu Docker コンテナ内で .deb パッケージのインストールと動作確認
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+DOCKER_DIR="${SCRIPT_DIR}/docker"
 OUTPUT_DIR="${ROOT}/packaging/output"
 DEB_FILE="$(ls -1 "${OUTPUT_DIR}"/veil_*.deb | head -1)"
 IMAGE="${VEIL_TEST_IMAGE:-veil-package-test:ubuntu24.04}"
 CONTAINER_NAME="veil-package-test-$$"
 
 if [ ! -f "${DEB_FILE}" ]; then
-    echo "ERROR: deb package not found. Run packaging/build.sh first." >&2
+    echo "ERROR: deb package not found. Run packaging/scripts/build.sh first." >&2
     exit 1
 fi
 
@@ -20,7 +22,7 @@ trap cleanup EXIT
 
 if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
     echo "==> Building test image (${IMAGE})"
-    docker build -t "${IMAGE}" -f "${ROOT}/packaging/Dockerfile.test" "${ROOT}/packaging"
+    docker build -t "${IMAGE}" -f "${DOCKER_DIR}/Dockerfile.test-deb" "${DOCKER_DIR}"
 fi
 
 echo "==> Starting Ubuntu container with systemd (${IMAGE})"

@@ -2,8 +2,10 @@
 # veil Linux パッケージ統合ビルド（.deb + .rpm）
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 PKG_ROOT="${ROOT}/packaging"
+DOCKER_DIR="${SCRIPT_DIR}/docker"
 OUTPUT_DIR="${PKG_ROOT}/output"
 BUILD_DIR="${PKG_ROOT}/build"
 VERSION="$(awk -F'"' '/^version = / { print $2; exit }' "${ROOT}/Cargo.toml")"
@@ -30,8 +32,8 @@ Environment:
   LIBC_VERSION     glibc suffix for zigbuild (default: .2.28)
 
 Outputs:
-  packaging/output/veil_${VERSION}_<deb_arch>.deb
-  packaging/output/veil-${VERSION}-1.<rpm_arch>.rpm
+  packaging/output/veil_\${VERSION}_<deb_arch>.deb
+  packaging/output/veil-\${VERSION}-1.<rpm_arch>.rpm
 EOF
 }
 
@@ -81,7 +83,7 @@ build_binary_native() {
         BINARY_PATH="${ROOT}/target/${target}/release/veil"
     else
         echo "==> WARNING: cargo zigbuild unavailable; host glibc binary may not run on Amazon Linux 2023" >&2
-        echo "==> Use ./packaging/build.sh --docker for portable packages" >&2
+        echo "==> Use ./packaging/scripts/build.sh --docker for portable packages" >&2
         cargo build --release --features "${CARGO_FEATURES:-full}" --locked
         BINARY_PATH="${ROOT}/target/release/veil"
     fi
@@ -93,7 +95,7 @@ build_binary_docker() {
     local target="${RUST_TARGET:-x86_64-unknown-linux-gnu}"
     local libc="${LIBC_VERSION:-.2.28}"
     mkdir -p "${BUILD_DIR}"
-    docker build -f "${PKG_ROOT}/Dockerfile.build" \
+    docker build -f "${DOCKER_DIR}/Dockerfile.build" \
         --target export-binary \
         --build-arg CARGO_FEATURES="${features}" \
         --build-arg RUST_TARGET="${target}" \
@@ -134,8 +136,8 @@ stage_rootfs() {
     install -m 0644 "${ROOT}/contrib/config/config.toml" "${dest}/usr/share/veil/config.toml.default"
     install -m 0644 "${ROOT}/docker/assets/www/index.html" "${dest}/usr/share/veil/www/index.html"
     install -m 0644 "${ROOT}/contrib/systemd/veil.service" "${dest}/lib/systemd/system/veil.service"
-    install -m 0755 "${PKG_ROOT}/scripts/postinstall.sh" "${dest}/usr/share/veil/scripts/postinstall.sh"
-    install -m 0755 "${PKG_ROOT}/scripts/preuninstall.sh" "${dest}/usr/share/veil/scripts/preuninstall.sh"
+    install -m 0755 "${SCRIPT_DIR}/postinstall.sh" "${dest}/usr/share/veil/scripts/postinstall.sh"
+    install -m 0755 "${SCRIPT_DIR}/preuninstall.sh" "${dest}/usr/share/veil/scripts/preuninstall.sh"
 }
 
 build_deb() {
@@ -185,7 +187,7 @@ build_rpm() {
                 export DEBIAN_FRONTEND=noninteractive
                 apt-get update -qq
                 apt-get install -y -qq rpm
-                ./packaging/build.sh --skip-build --binary /src/${rel_binary} --rpm-only-internal
+                ./packaging/scripts/build.sh --skip-build --binary /src/${rel_binary} --rpm-only-internal
             "
         if [[ -f "${OUTPUT_DIR}/${RPM_NAME}" ]]; then
             echo "==> Created ${OUTPUT_DIR}/${RPM_NAME}"

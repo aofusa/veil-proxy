@@ -139,7 +139,7 @@ The binary is generated at `target/x86_64-unknown-linux-gnu/release/veil`.
 Build Debian/Ubuntu (`.deb`) and Amazon Linux 2023 (`.rpm`) install packages with all features enabled (`--features full`):
 
 ```bash
-./packaging/build.sh
+./packaging/scripts/build.sh
 ```
 
 Outputs:
@@ -153,10 +153,10 @@ Build inside Docker (same approach as [docker/Dockerfile.glibc](docker/Dockerfil
 
 ```bash
 # Binary via Docker, packages on host
-./packaging/build.sh --docker
+./packaging/scripts/build.sh --docker
 
 # Or build everything inside Docker
-docker build -f packaging/Dockerfile.package -t veil-package:local .
+docker build -f packaging/scripts/docker/Dockerfile.package -t veil-package:local .
 cid=$(docker create veil-package:local)
 docker cp "$cid:/app/packaging/output/." packaging/output/
 docker rm "$cid"
@@ -178,7 +178,7 @@ sudo systemctl enable --now veil
 Verify in Docker (both packages):
 
 ```bash
-./packaging/test-install.sh
+./packaging/scripts/test-install.sh
 ```
 
 See [packaging/README.md](packaging/README.md) for details (Docker build, postinst behavior, troubleshooting).
