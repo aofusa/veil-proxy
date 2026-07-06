@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
-# Ubuntu Docker コンテナ内で .deb パッケージのインストールと動作確認
+# Amazon Linux 2023 Docker コンテナ内で .rpm パッケージのインストールと動作確認
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUTPUT_DIR="${ROOT}/packaging/output"
-DEB_FILE="$(ls -1 "${OUTPUT_DIR}"/veil_*.deb | head -1)"
-IMAGE="${VEIL_TEST_IMAGE:-veil-package-test:ubuntu24.04}"
-CONTAINER_NAME="veil-package-test-$$"
+RPM_FILE="$(ls -1 "${OUTPUT_DIR}"/veil-*.rpm 2>/dev/null | head -1)"
+IMAGE="${VEIL_TEST_IMAGE:-veil-package-test:al2023}"
+CONTAINER_NAME="veil-package-rpm-test-$$"
+HTTP_PORT="${VEIL_TEST_HTTP_PORT:-28080}"
+HTTPS_PORT="${VEIL_TEST_HTTPS_PORT:-28443}"
 
-if [ ! -f "${DEB_FILE}" ]; then
-    echo "ERROR: deb package not found. Run packaging/build.sh first." >&2
+if [[ -z "${RPM_FILE}" || ! -f "${RPM_FILE}" ]]; then
+    echo "ERROR: rpm package not found. Run packaging/build.sh first." >&2
     exit 1
 fi
 
@@ -20,14 +22,14 @@ trap cleanup EXIT
 
 if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
     echo "==> Building test image (${IMAGE})"
-    docker build -t "${IMAGE}" -f "${ROOT}/packaging/Dockerfile.test" "${ROOT}/packaging"
+    docker build -t "${IMAGE}" -f "${ROOT}/packaging/Dockerfile.test-al2023" "${ROOT}/packaging"
 fi
 
-echo "==> Starting Ubuntu container with systemd (${IMAGE})"
+echo "==> Starting Amazon Linux 2023 container with systemd (${IMAGE})"
 docker run -d --privileged --name "${CONTAINER_NAME}" \
     --cgroupns=host \
     -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
-    -p 18080:80 -p 18443:443 \
+    -p "${HTTP_PORT}:80" -p "${HTTPS_PORT}:443" \
     "${IMAGE}"
 
 echo "==> Waiting for container init"
@@ -39,11 +41,10 @@ for _ in $(seq 1 60); do
 done
 
 echo "==> Installing package"
-cat "${DEB_FILE}" | docker exec -i "${CONTAINER_NAME}" sh -c 'cat > /tmp/veil.deb'
+cat "${RPM_FILE}" | docker exec -i "${CONTAINER_NAME}" sh -c 'cat > /tmp/veil.rpm'
 docker exec "${CONTAINER_NAME}" bash -c '
     set -euo pipefail
-    export DEBIAN_FRONTEND=noninteractive
-    dpkg -i /tmp/veil.deb || apt-get install -f -y -qq
+    dnf install -y /tmp/veil.rpm
 '
 
 echo "==> Starting veil service"
@@ -61,19 +62,20 @@ done
 if ! docker exec "${CONTAINER_NAME}" systemctl is-active veil | grep -q '^active$'; then
     echo "ERROR: veil service failed to start" >&2
     docker exec "${CONTAINER_NAME}" journalctl -u veil --no-pager -n 80 >&2 || true
+    docker exec "${CONTAINER_NAME}" tail -30 /var/log/veil/veil.error-*.log 2>/dev/null >&2 || true
     exit 1
 fi
 
 echo "==> HTTP redirect check (port 80)"
-docker exec "${CONTAINER_NAME}" curl -skI http://127.0.0.1/ | tee /tmp/veil-http-check.txt
-grep -qi '301\|302\|location: https' /tmp/veil-http-check.txt
+docker exec "${CONTAINER_NAME}" curl -skI http://127.0.0.1/ | tee /tmp/veil-rpm-http-check.txt
+grep -qi '301\|302\|location: https' /tmp/veil-rpm-http-check.txt
 
 echo "==> HTTPS content check (port 443)"
-docker exec "${CONTAINER_NAME}" curl -sk https://127.0.0.1/ | tee /tmp/veil-https-check.txt
-grep -qi 'VEIL' /tmp/veil-https-check.txt
+docker exec "${CONTAINER_NAME}" curl -sk https://127.0.0.1/ | tee /tmp/veil-rpm-https-check.txt
+grep -qi 'VEIL' /tmp/veil-rpm-https-check.txt
 
 echo "==> Host port mapping check"
-curl -skI http://127.0.0.1:18080/ | grep -qi '301\|302\|location: https'
-curl -sk https://127.0.0.1:18443/ | grep -qi 'VEIL'
+curl -skI "http://127.0.0.1:${HTTP_PORT}/" | grep -qi '301\|302\|location: https'
+curl -sk "https://127.0.0.1:${HTTPS_PORT}/" | grep -qi 'VEIL'
 
-echo "==> All checks passed"
+echo "==> All checks passed (Amazon Linux 2023 / RPM)"

@@ -134,39 +134,54 @@ docker run --rm -it -v $(pwd):/io -w /io messense/cargo-zigbuild \
 
 ビルド後のバイナリは `target/x86_64-unknown-linux-gnu/release/veil` に生成されます。
 
-### Linux パッケージ（.deb）
+### Linux パッケージ（.deb / .rpm）
 
-Debian/Ubuntu 向けのインストールパッケージを、全機能（`--features full`）でビルドします。
+Debian/Ubuntu（`.deb`）と Amazon Linux 2023（`.rpm`）向けのインストールパッケージを、全機能（`--features full`）で一括ビルドします。
 
 ```bash
-./packaging/build-deb.sh
+./packaging/build.sh
 ```
 
-成果物は `packaging/output/veil_<version>_<arch>.deb` に出力されます。
+成果物:
+
+```
+packaging/output/veil_<version>_<arch>.deb
+packaging/output/veil-<version>-1.<arch>.rpm
+```
+
+Docker でのビルド（[docker/Dockerfile.glibc](../../docker/Dockerfile.glibc) と同様の `messense/cargo-zigbuild` による glibc 2.28 互換バイナリ）:
+
+```bash
+# バイナリのみ Docker、パッケージはホストで生成
+./packaging/build.sh --docker
+
+# または Docker 内でパッケージまで一括ビルド
+docker build -f packaging/Dockerfile.package -t veil-package:local .
+cid=$(docker create veil-package:local)
+docker cp "$cid:/app/packaging/output/." packaging/output/
+docker rm "$cid"
+```
 
 インストール手順:
 
 ```bash
+# Debian/Ubuntu
 sudo dpkg -i packaging/output/veil_0.4.0_amd64.deb
-sudo apt-get install -f   # 依存関係不足時
+sudo apt-get install -f
+sudo systemctl enable --now veil
+
+# Amazon Linux 2023
+sudo dnf install -y packaging/output/veil-0.4.0-1.x86_64.rpm
 sudo systemctl enable --now veil
 ```
 
-パッケージの内容:
-
-- バイナリ: `/usr/bin/veil`
-- 設定: `/var/etc/veil/config.toml`（`contrib/config/config.toml` をベース）
-- systemd ユニット: `contrib/systemd/veil.service`
-- 専用ユーザー/グループ: `veil:veil`
-- ディレクトリ: `/var/www`, `/var/log/veil`, `/var/cache/veil`, `/var/tmp/veil`, `/var/etc/veil`
-
-Ubuntu Docker コンテナでのインストール・起動・curl 動作確認:
+Docker コンテナでのインストール・起動・curl 動作確認（両パッケージ）:
 
 ```bash
-./packaging/test-docker-install.sh
+./packaging/test-install.sh
 ```
 
-詳細は [packaging/README.md](../../packaging/README.md) を参照してください（postinst の挙動、トラブルシューティング、設定カスタマイズ）。
+詳細は [packaging/README.md](../../packaging/README.md) を参照してください。
 
 > **注意**: `--features full` でビルドする場合、`http3` フィーチャーが quiche にバンドルされた BoringSSL をコンパイルするため `cmake` が、`aws-lc-rs` がアセンブリ最適化を使用するため `nasm` が、それぞれコンテナ内にインストールされている必要があります。`http3` を含まないデフォルトビルドでは cmake は不要です。
 

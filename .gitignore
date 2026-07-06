@@ -34,5 +34,14 @@ tests/fixtures/proxy.pid
 tests/load/results/
 
 # Linux パッケージビルド成果物
-packaging/staging/
+packaging/build/
 packaging/output/
+packaging/staging/
+packaging/staging-deb/
+packaging/staging-rpm/
+packaging/rpm/BUILD/
+packaging/rpm/BUILDROOT/
+packaging/rpm/RPMS/
+packaging/rpm/SPECS/
+packaging/rpm/SRPM/
+packaging/rpm/SOURCES/rootfs/

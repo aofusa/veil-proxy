@@ -134,39 +134,54 @@ docker run --rm -it -v $(pwd):/io -w /io messense/cargo-zigbuild \
 
 The binary is generated at `target/x86_64-unknown-linux-gnu/release/veil`.
 
-### Linux Package (.deb)
+### Linux Packages (.deb / .rpm)
 
-Build a Debian/Ubuntu install package with all features enabled (`--features full`):
+Build Debian/Ubuntu (`.deb`) and Amazon Linux 2023 (`.rpm`) install packages with all features enabled (`--features full`):
 
 ```bash
-./packaging/build-deb.sh
+./packaging/build.sh
 ```
 
-The package is written to `packaging/output/veil_<version>_<arch>.deb`.
+Outputs:
 
-Install on a target host:
+```
+packaging/output/veil_<version>_<arch>.deb
+packaging/output/veil-<version>-1.<arch>.rpm
+```
+
+Build inside Docker (same approach as [docker/Dockerfile.glibc](docker/Dockerfile.glibc), using `messense/cargo-zigbuild` for glibc 2.28-compatible binaries):
 
 ```bash
+# Binary via Docker, packages on host
+./packaging/build.sh --docker
+
+# Or build everything inside Docker
+docker build -f packaging/Dockerfile.package -t veil-package:local .
+cid=$(docker create veil-package:local)
+docker cp "$cid:/app/packaging/output/." packaging/output/
+docker rm "$cid"
+```
+
+Install:
+
+```bash
+# Debian/Ubuntu
 sudo dpkg -i packaging/output/veil_0.4.0_amd64.deb
-sudo apt-get install -f   # if dependencies are missing
+sudo apt-get install -f
+sudo systemctl enable --now veil
+
+# Amazon Linux 2023
+sudo dnf install -y packaging/output/veil-0.4.0-1.x86_64.rpm
 sudo systemctl enable --now veil
 ```
 
-The package installs:
-
-- Binary: `/usr/bin/veil`
-- Config: `/var/etc/veil/config.toml` (from `contrib/config/config.toml`)
-- systemd unit: `contrib/systemd/veil.service`
-- Dedicated user/group: `veil:veil`
-- Directories: `/var/www`, `/var/log/veil`, `/var/cache/veil`, `/var/tmp/veil`, `/var/etc/veil`
-
-Verify the package in an Ubuntu Docker container (install, systemd start, curl):
+Verify in Docker (both packages):
 
 ```bash
-./packaging/test-docker-install.sh
+./packaging/test-install.sh
 ```
 
-See [packaging/README.md](packaging/README.md) for details (postinst behavior, troubleshooting, customization).
+See [packaging/README.md](packaging/README.md) for details (Docker build, postinst behavior, troubleshooting).
 
 > **Note**: `cmake` and `nasm` must be installed inside the container when building with `--features full` because the `http3` feature compiles quiche's bundled BoringSSL (requires cmake) and `aws-lc-rs` uses assembly optimizations (requires nasm). The default build without `http3` does not need cmake.
 

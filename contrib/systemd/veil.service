@@ -5,10 +5,18 @@
 # io_uring ベースの高性能リバースプロキシサーバー用
 # サンドボックス化による堅牢なセキュリティを提供
 #
-# インストール:
+# パッケージインストール時:
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable veil
 #   sudo systemctl start veil
+#
+# 手動インストール時:
+#   sudo cp contrib/systemd/veil.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable veil
+#   sudo systemctl start veil
+#
+# 設定ファイル: /var/etc/veil/config.toml
 #
 # ============================================
 
@@ -28,40 +36,72 @@ RestartSec=5s
 # ============================================
 # ユーザー・グループ設定
 # ============================================
+# 専用ユーザーで実行（パッケージ postinst で veil:veil を作成）
 User=veil
 Group=veil
 
 # ============================================
 # リソース制限
 # ============================================
+# ファイルディスクリプタ上限（大量の同時接続に対応）
 LimitNOFILE=1048576
+
+# メモリロック上限（io_uring 登録バッファ、Huge Pages 用）
+# io_uring はメモリロックを必要とするため infinity を推奨
 LimitMEMLOCK=infinity
+
+# プロセス数上限（スレッド数 + α）
 LimitNPROC=4096
+
+# コアダンプ無効化（セキュリティ上の理由）
 LimitCORE=0
 
 # ============================================
 # ケイパビリティ設定
 # ============================================
+# 全ケイパビリティを削除してから必要なものだけ付与
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
 AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+# 特権ポート (443, 80) へのバインドを許可
+# CAP_NET_RAW は raw ソケットアクセス（ヘルスチェック等）
 
 # ============================================
 # ファイルシステム隔離
 # ============================================
+# ルートファイルシステムを読み取り専用に
 ProtectSystem=strict
+
+# /home, /root, /run/user をアクセス不可に
 ProtectHome=yes
+
+# 専用の /tmp を使用
 PrivateTmp=yes
+
+# デバイスファイルへのアクセスを制限
 PrivateDevices=yes
+
+# 設定・証明書は読み取り専用、ログ・キャッシュは systemd が管理
 LogsDirectory=veil
 CacheDirectory=veil
 ReadOnlyPaths=/var/etc/veil
 
+# 注: /var/tmp/veil は ProtectSystem=strict 下で書き込み可能。
+# ReadWritePaths への明示指定はマウント名前空間エラーの原因になるため使用しない。
+
 # ============================================
 # 名前空間隔離
 # ============================================
+# ユーザー名前空間の作成を禁止
 RestrictNamespaces=yes
+
+# カーネルモジュールのロードを禁止
 ProtectKernelModules=yes
+
+# カーネルログへのアクセスを禁止
 ProtectKernelLogs=yes
+
+# /proc, /sys を読み取り専用に
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 ProtectProc=invisible
@@ -69,26 +109,58 @@ ProtectProc=invisible
 # ============================================
 # ネットワーク設定
 # ============================================
+# ホストのネットワークスタックを直接使用（パフォーマンス重視）
+# 特定のアドレスファミリのみ許可
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 
 # ============================================
 # セキュリティ強化
 # ============================================
+# 新しい特権の取得を禁止
 NoNewPrivileges=yes
-# WASM (full feature) は実行可能メモリを必要とするため無効化
+
+# 実行可能メモリマッピングを制限
+# full ビルド（WASM）では実行可能メモリが必要なため無効化
 # MemoryDenyWriteExecute=yes
+
+# setuid/setgid ビットを無視
 RestrictSUIDSGID=yes
+
+# リアルタイムスケジューリングを禁止
 RestrictRealtime=yes
+
+# ロックダウン（カーネルロックダウン機能との統合）
 LockPersonality=yes
 
-# システムコール制限は config.toml の seccomp / Landlock に委譲する。
-# systemd の SystemCallFilter と併用すると veil 側の seccomp/Landlock 適用が失敗する。
+# ============================================
+# システムコール制限
+# ============================================
+# config.toml の seccomp / Landlock に委譲する。
+# systemd の SystemCallFilter と併用すると veil 側の seccomp/Landlock 適用が
+# 失敗する（起動直後にサービスが終了する）ため、ここでは設定しない。
+#
+# 参考（使用しない）:
+# @system-service: ネットワークサービス向けの基本セット
+# io_uring_*: 独自 io_uring ランタイム必須
+# mlock*: io_uring 登録バッファ、Huge Pages 用
+# sched_*affinity: CPU ピンニング用
+# SystemCallFilter=@system-service
+# SystemCallFilter=io_uring_setup io_uring_enter io_uring_register
+# SystemCallFilter=mlock mlock2 mlockall munlock munlockall
+# SystemCallFilter=sched_setaffinity sched_getaffinity
+# SystemCallErrorNumber=EPERM
+# SystemCallArchitectures=native
 
 # ============================================
 # 環境変数
 # ============================================
+# 環境をクリーンにして必要な変数のみ設定
 Environment=RUST_BACKTRACE=1
 Environment=MALLOC_CONF=background_thread:true
+
+# Huge Pages の使用を促進（mimalloc 用）
+# カーネル側で事前確保が必要: echo 128 > /proc/sys/vm/nr_hugepages
+# Environment=MIMALLOC_LARGE_OS_PAGES=1
 
 [Install]
 WantedBy=multi-user.target
