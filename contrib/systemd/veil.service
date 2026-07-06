@@ -51,7 +51,10 @@ LimitNOFILE=1048576
 LimitMEMLOCK=infinity
 
 # プロセス数上限（スレッド数 + α）
-LimitNPROC=4096
+LimitNPROC=infinity
+
+# cgroup タスク上限
+TasksMax=infinity
 
 # コアダンプ無効化（セキュリティ上の理由）
 LimitCORE=0
