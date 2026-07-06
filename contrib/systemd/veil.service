@@ -36,9 +36,9 @@ RestartSec=5s
 # ============================================
 # ユーザー・グループ設定
 # ============================================
-# 専用ユーザーで実行（パッケージ postinst で veil:veil を作成）
-User=veil
-Group=veil
+# root で起動し、veil が config.toml の drop_privileges_* で veil:veil へ降格する。
+# サンドボックス（unshare / bind mount）適用には起動時の特権が必要。
+# User=/Group= は指定しない（デフォルト root）。
 
 # ============================================
 # リソース制限
@@ -51,7 +51,10 @@ LimitNOFILE=1048576
 LimitMEMLOCK=infinity
 
 # プロセス数上限（スレッド数 + α）
-LimitNPROC=4096
+LimitNPROC=infinity
+
+# cgroup タスク上限
+TasksMax=infinity
 
 # コアダンプ無効化（セキュリティ上の理由）
 LimitCORE=0
@@ -59,12 +62,10 @@ LimitCORE=0
 # ============================================
 # ケイパビリティ設定
 # ============================================
-# 全ケイパビリティを削除してから必要なものだけ付与
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-
-# 特権ポート (443, 80) へのバインドを許可
-# CAP_NET_RAW は raw ソケットアクセス（ヘルスチェック等）
+# 起動時: CAP_SYS_ADMIN（sandbox）+ CAP_SETUID/CAP_SETGID（drop_privileges）が必要
+# 権限降格後: config.toml の sandbox_keep_capabilities で CAP_NET_BIND_SERVICE のみ保持
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SETUID CAP_SETGID CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SETUID CAP_SETGID CAP_NET_BIND_SERVICE
 
 # ============================================
 # ファイルシステム隔離
@@ -92,8 +93,7 @@ ReadOnlyPaths=/var/etc/veil
 # ============================================
 # 名前空間隔離
 # ============================================
-# ユーザー名前空間の作成を禁止
-RestrictNamespaces=yes
+# RestrictNamespaces は使用しない（config.toml の sandbox が unshare を使用）
 
 # カーネルモジュールのロードを禁止
 ProtectKernelModules=yes
@@ -116,15 +116,13 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 # ============================================
 # セキュリティ強化
 # ============================================
-# 新しい特権の取得を禁止
-NoNewPrivileges=yes
+# NoNewPrivileges は使用しない（drop_privileges の setuid/setgid に必要）
 
 # 実行可能メモリマッピングを制限
 # full ビルド（WASM）では実行可能メモリが必要なため無効化
 # MemoryDenyWriteExecute=yes
 
-# setuid/setgid ビットを無視
-RestrictSUIDSGID=yes
+# RestrictSUIDSGID は使用しない（drop_privileges の setuid/setgid に必要）
 
 # リアルタイムスケジューリングを禁止
 RestrictRealtime=yes

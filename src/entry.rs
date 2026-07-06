@@ -390,20 +390,23 @@ pub fn run() {
     // 権限降格やseccomp/Landlockより先に適用します。
     //
     // 適用順序:
-    // 1. サンドボックス（namespace分離、bind mounts、capabilities）
+    // 1. サンドボックス setup（namespace分離、bind mounts）
     // 2. 権限降格（setuid/setgid）
-    // 3. Landlock（ファイルシステム制限）
-    // 4. seccomp（システムコール制限）
+    // 3. サンドボックス lockdown（PR_SET_NO_NEW_PRIVS、ケイパビリティ制限）
+    // 4. Landlock（ファイルシステム制限）
+    // 5. seccomp（システムコール制限）
     // ====================
 
-    if loaded_config.global_security.enable_sandbox {
+    let sandbox_config = if loaded_config.global_security.enable_sandbox {
         // サンドボックスサポート状況をレポート
         crate::security::report_sandbox_support();
+        Some(build_sandbox_config(&loaded_config.global_security))
+    } else {
+        None
+    };
 
-        // サンドボックス設定を構築
-        let sandbox_config = build_sandbox_config(&loaded_config.global_security);
-
-        match crate::security::apply_sandbox(&sandbox_config) {
+    if let Some(ref sandbox_config) = sandbox_config {
+        match crate::security::apply_sandbox_setup(sandbox_config) {
             Ok(()) => {
                 info!("Sandbox restrictions applied successfully");
                 if sandbox_config.unshare_mount {
@@ -420,17 +423,6 @@ pub fn run() {
                 }
                 if sandbox_config.unshare_pid {
                     info!("Sandbox: PID namespace isolated");
-                }
-                if !sandbox_config.keep_capabilities.is_empty() {
-                    info!(
-                        "Sandbox: Keeping only capabilities: {:?}",
-                        sandbox_config.keep_capabilities
-                    );
-                } else if !sandbox_config.drop_capabilities.is_empty() {
-                    info!(
-                        "Sandbox: Dropped capabilities: {:?}",
-                        sandbox_config.drop_capabilities
-                    );
                 }
             }
             Err(e) => {
@@ -457,6 +449,36 @@ pub fn run() {
     if let Err(e) = drop_privileges(&loaded_config.global_security) {
         error!("Failed to drop privileges: {}", e);
         return;
+    }
+
+    if let Some(ref sandbox_config) = sandbox_config {
+        match crate::security::apply_sandbox_lockdown(sandbox_config) {
+            Ok(()) => {
+                if !sandbox_config.keep_capabilities.is_empty() {
+                    info!(
+                        "Sandbox: Keeping only capabilities: {:?}",
+                        sandbox_config.keep_capabilities
+                    );
+                } else if !sandbox_config.drop_capabilities.is_empty() {
+                    info!(
+                        "Sandbox: Dropped capabilities: {:?}",
+                        sandbox_config.drop_capabilities
+                    );
+                }
+            }
+            Err(e) => {
+                if loaded_config.global_security.allow_security_failures {
+                    warn!(
+                        "Failed to apply sandbox lockdown: {} - continuing without capability restriction",
+                        e
+                    );
+                } else {
+                    error!("Failed to apply sandbox lockdown: {}", e);
+                    error!("Server startup aborted. To allow failures, set allow_security_failures = true in config.toml");
+                    return;
+                }
+            }
+        }
     }
 
     // ====================

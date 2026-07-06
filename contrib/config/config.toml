@@ -114,7 +114,7 @@ http3_enabled = true
 # - 本番環境では無効化を推奨（デフォルト: false）
 #
 # Serverヘッダーを有効化
-server_header_enabled = false
+server_header_enabled = true
 
 # カスタムServerヘッダー値（server_header_enabled = true時のみ有効）
 # デフォルト: "veil"
@@ -144,8 +144,6 @@ server_header_enabled = false
 [logging]
 # ログレベル: "trace", "debug", "info", "warn", "error", "off"
 level = "info"
-app_file_path = "/var/log/veil/veil.log"
-error_file_path = "/var/log/veil/veil.error.log"
 
 # ログ出力形式: "text", "json"
 # 
@@ -156,7 +154,7 @@ error_file_path = "/var/log/veil/veil.error.log"
 #   {"timestamp":"2024-01-01T00:00:00.000Z","level":"INFO","target":"veil","file":"main.rs","line":123,"message":"..."}
 #
 # JSON形式は構造化ログ収集システム（Elasticsearch, Loki等）との連携に適しています。
-# format = "text"
+format = "text"
 
 # ログチャネルサイズ（内部バッファ）
 # 高負荷時のログドロップを防止するため、デフォルト(100)より大幅に増加
@@ -176,14 +174,13 @@ error_file_path = "/var/log/veil/veil.error.log"
 #
 # アプリ本体ログ（INFO / WARN / DEBUG / TRACE）の出力先。
 #   未指定時は標準出力 (stdout)。
-# app_file_path = "/var/log/veil/veil.log"
-#
+app_file_path = "/var/log/veil/veil.log"
+
 # エラーログ（ERROR）の出力先。
 #   未指定時は標準エラー出力 (stderr)。
-# error_file_path = "/var/log/veil/veil.error.log"
-#
 # 注意: ログ出力先にファイルパスを指定した場合、その親ディレクトリが
 #       [security].landlock_write_paths に自動追加される（Landlock 有効時の書き込み許可）。
+error_file_path = "/var/log/veil/error.log"
 
 
 
@@ -198,8 +195,27 @@ error_file_path = "/var/log/veil/veil.error.log"
 #
 [access_log]
 enabled = true
-format = "json"
+
+# ログ出力形式: "text", "json"
+# 
+# text形式（デフォルト）:
+#   INFO main [examples/ftlog.rs:27] Hello, world!
+#
+# json形式:
+#   {"timestamp":"2024-01-01T00:00:00.000Z","level":"INFO","target":"veil","file":"main.rs","line":123,"message":"..."}
+#
+# JSON形式は構造化ログ収集システム（Elasticsearch, Loki等）との連携に適しています。
+format = "text"
+
+# ----------------------------------------
+# ログ出力先
+# ----------------------------------------
+# 各ログ行には識別用 type フィールドが付与される（app / error / access）。
+#
+# アクセスログの出力先。
+#   未指定時は標準出力 (stdout)。
 file_path = "/var/log/veil/access.log"
+
 # # 出力フィールドを限定する（省略時は全フィールドを出力）
 # fields = [
 #   "timestamp", "method", "host", "path", "status",
@@ -402,7 +418,6 @@ reuseport_balancing = "cbpf"
 #
 drop_privileges_user = "veil"
 drop_privileges_group = "veil"
-allow_security_failures = false
 
 # グローバル同時接続上限（0 = 無制限）
 # max_concurrent_connections = 10000
@@ -424,23 +439,7 @@ allow_security_failures = false
 # - セキュリティ機能が確実に有効化されることを保証
 # - 開発環境でセキュリティ機能が利用できない場合のみ true に設定
 #
-enable_seccomp = true
-seccomp_mode = "filter"
-enable_landlock = true
-landlock_read_paths = [
-  "/var/www",
-  "/var/cache/veil",
-  "/var/tmp/veil",
-  "/var/etc/veil",
-  "/etc/resolv.conf",
-  "/etc/hosts",
-  "/etc/nsswitch.conf",
-  "/run/systemd/resolve",
-  "/lib",
-  "/lib64",
-  "/usr"
-]
-landlock_write_paths = ["/var/log/veil", "/var/cache/veil", "/var/tmp/veil"]
+allow_security_failures = false
 
 # ====================
 # io_uring / seccomp セキュリティ制限
@@ -482,15 +481,14 @@ landlock_write_paths = ["/var/log/veil", "/var/cache/veil", "/var/tmp/veil"]
 # seccomp設定
 # ============================================
 #
-# enable_seccomp = true
+enable_seccomp = true
 
 # seccompモード:
 #   "disabled" - 無効（デフォルト）
 #   "log"      - 違反をログに記録（ブロックしない、導入時推奨）
 #   "filter"   - 違反をEPERMで拒否（本番推奨）
 #   "strict"   - 違反したプロセスをSIGKILL（最も厳格、デバッグ困難）
-#
-# seccomp_mode = "log"  # まずログモードで検証
+seccomp_mode = "filter"
 
 # ============================================
 # Landlock設定 (Linux 5.13+)
@@ -505,50 +503,29 @@ landlock_write_paths = ["/var/log/veil", "/var/cache/veil", "/var/tmp/veil"]
 #   v3 (Linux 6.2+):  TRUNCATE権限
 #   v4 (Linux 6.7+):  ioctl権限
 #
-# enable_landlock = true
+enable_landlock = true
 
 # 読み取り専用パス（設定ファイル、ライブラリ等）
-# landlock_read_paths = [
-#   # ファイル配信ディレクトリ（プロキシ機能のみであれば不要）
-#   "/var/www",
-#   
-#   # キャッシュ・バッファリングの一時ディレクトリ（キャッシュ・バッファを使用しないなら不要）
-#   # "/var/cache/veil",
-#   # "/var/tmp/veil",
-#   
-#   # プロキシ機能の名前解決に必要（ファイル配信のみであれば不要）
-#   "/etc/veil",
-#   "/etc/resolv.conf",
-#   "/etc/hosts",
-#   "/etc/nsswitch.conf",
-#   "/lib",
-#   "/lib64",
-#   "/usr"
-# ]
+landlock_read_paths = [
+  # ファイル配信ディレクトリ（プロキシ機能のみであれば不要）
+  "/var/www",
+  
+  # キャッシュ・バッファリングの一時ディレクトリ（キャッシュ・バッファを使用しないなら不要）
+  # "/var/cache/veil",
+  # "/var/tmp/veil",
+  
+  # プロキシ機能の名前解決に必要（ファイル配信のみであれば不要）
+  "/var/etc/veil",
+  "/etc/resolv.conf",
+  "/etc/hosts",
+  "/etc/nsswitch.conf",
+  "/lib",
+  "/lib64",
+  "/usr"
+]
 
 # 読み書きパス（ログ、一時ファイル等）
-# landlock_write_paths = ["/var/log/veil", "/var/cache/veil", "/var/tmp/veil"]
-
-# ============================================
-# 本番環境向け推奨設定
-# ============================================
-#
-# enable_seccomp = true
-# seccomp_mode = "filter"
-# enable_landlock = true
-# landlock_read_paths = [
-#   "/var/www",
-#   "/var/cache/veil",
-#   "/var/tmp/veil",
-#   "/etc/veil",
-#   "/etc/resolv.conf",
-#   "/etc/hosts",
-#   "/etc/nsswitch.conf",
-#   "/lib",
-#   "/lib64",
-#   "/usr"
-# ]
-# landlock_write_paths = ["/var/log/veil", "/var/cache/veil", "/var/tmp/veil"]
+landlock_write_paths = ["/var/log/veil", "/var/cache/veil", "/var/tmp/veil"]
 
 # ============================================
 # サンドボックス設定（bubblewrap相当）
@@ -572,7 +549,8 @@ landlock_write_paths = ["/var/log/veil", "/var/cache/veil", "/var/tmp/veil"]
 # ============================================
 
 # サンドボックスを有効化（デフォルト: false）
-# enable_sandbox = true
+# systemd は root で起動し、適用後に drop_privileges で veil:veil へ降格する。
+enable_sandbox = true
 
 # Namespace分離設定
 # -------------------
@@ -603,40 +581,39 @@ landlock_write_paths = ["/var/log/veil", "/var/cache/veil", "/var/tmp/veil"]
 # -------------------
 # 読み取り専用バインドマウント（source:dest 形式）
 # DNS解決に必要なファイルを含める必要があります
-# sandbox_ro_bind_mounts = [
-#   # ファイル配信ディレクトリ（プロキシ機能のみであれば不要）
-#   "/var/www:/var/www",
-# 
-#   # プロキシ機能の名前解決に必要（ファイル配信のみであれば不要）
-#   "/etc/veil:/etc/veil",
-#   "/etc/resolv.conf:/etc/resolv.conf",
-#   "/etc/hosts:/etc/hosts",
-#   "/etc/nsswitch.conf:/etc/nsswitch.conf",
-#   "/lib:/lib",
-#   "/lib64:/lib64",
-#   "/usr:/usr"
-# 
-#   # systemd-resolved使用時に必要
-#   "/run/systemd/resolve:/run/systemd/resolve",
-# 
-#   # ユーザー/グループ情報
-#   "/etc/passwd:/etc/passwd",
-#   "/etc/group:/etc/group"
-# ]
+sandbox_ro_bind_mounts = [
+  # ファイル配信ディレクトリ（プロキシ機能のみであれば不要）
+  "/var/www:/var/www",
+
+  # プロキシ機能の名前解決に必要（ファイル配信のみであれば不要）
+  "/var/etc/veil:/var/etc/veil",
+  "/etc/resolv.conf:/etc/resolv.conf",
+  "/etc/hosts:/etc/hosts",
+  "/etc/nsswitch.conf:/etc/nsswitch.conf",
+  "/lib:/lib",
+  "/lib64:/lib64",
+  "/usr:/usr",
+  # systemd-resolved使用時に必要
+  "/run/systemd/resolve:/run/systemd/resolve",
+
+  # ユーザー/グループ情報
+  "/etc/passwd:/etc/passwd",
+  "/etc/group:/etc/group"
+]
 
 # 読み書きバインドマウント（source:dest 形式）
 # 設定ファイル、ログディレクトリなどを指定
-# sandbox_rw_bind_mounts = [
-#   "/var/log/veil:/var/log/veil"
-# ]
+sandbox_rw_bind_mounts = [
+  "/var/log/veil:/var/log/veil"
+]
 
 # tmpfsマウント先（メモリファイルシステム）
 # 注: /run はsystemd-resolvedのDNS解決に必要なため除外推奨
-# sandbox_tmpfs_mounts = [
-#   # キャッシュ・バッファリングの一時ディレクトリ（キャッシュ・バッファを使用しないなら不要）
-#   "/var/cache/veil",
-#   "/var/tmp/veil",
-#]
+sandbox_tmpfs_mounts = [
+  # キャッシュ・バッファリングの一時ディレクトリ（キャッシュ・バッファを使用しないなら不要）
+  "/var/cache/veil",
+  "/var/tmp/veil",
+]
 
 # /proc をマウント（デフォルト: true）
 # sandbox_mount_proc = true
@@ -651,7 +628,7 @@ landlock_write_paths = ["/var/log/veil", "/var/cache/veil", "/var/tmp/veil"]
 
 # 保持するケイパビリティ（これ以外は全てドロップ、優先度高）
 # リバースプロキシ推奨設定:
-# sandbox_keep_capabilities = ["CAP_NET_BIND_SERVICE"]
+sandbox_keep_capabilities = ["CAP_NET_BIND_SERVICE"]
 
 # その他の設定
 # -------------------
