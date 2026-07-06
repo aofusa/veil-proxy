@@ -2632,7 +2632,10 @@ mod tests {
         // ---- Filter モード: EPERM で拒否 ----
         let filter = build_seccomp_filter(SeccompMode::Filter).expect("build filter");
         let status = fork_apply_call(&filter);
-        assert!(libc::WIFEXITED(status), "Filter child did not exit normally");
+        assert!(
+            libc::WIFEXITED(status),
+            "Filter child did not exit normally"
+        );
         match libc::WEXITSTATUS(status) {
             42 => {
                 eprintln!("seccomp could not be applied (no privileges?); skipping");
