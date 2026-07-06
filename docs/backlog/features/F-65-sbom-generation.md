@@ -27,9 +27,8 @@
 
 ## 残件
 
-- `grype` と SBOM を連携した SBOM ベースの脆弱性照合（現状は cargo-audit/deny が別フェーズで
-  依存脆弱性を検査）。
-- GitHub **Release** への正式アタッチ（タグ発行フロー確立後。現状は nightly artifact）。
+- なし（本チケットでの残件は解消）。
+- `grype`連携、GitHub Releaseへの正式アタッチなど、CI・外部インフラが必要なタスクについては [F-81](F-81-sbom-ci-integration.md) として未着手の別タスクへ分離したため、本タスクは完了とする。
 
 ## 受け入れ条件
 

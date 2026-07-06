@@ -51,7 +51,7 @@
 | F-01 | P2 | 完了 | [features/grpc.md](features/grpc.md) | gRPC / gRPC-Web の完成度・テスト拡充 |
 | F-05 | P2 | 未着手 | [features/acme.md](features/acme.md) | ACME 統合 |
 | F-07 | P2 | 進行中 | [features/fuzzing-chaos-security.md](features/fuzzing-chaos-security.md) | ファジング・カオス・h2spec・セキュリティスキャン（`tools/container_security/` 基盤完了。F-52〜F-57 で拡充中） |
-| F-52 | P1 | 進行中 | [features/F-52-cargo-fuzz-libfuzzer.md](features/F-52-cargo-fuzz-libfuzzer.md) | cargo-fuzz（HPACK・frame・header・config、ASAN/corpus 残件） |
+| F-52 | P1 | 進行中 | [features/F-52-cargo-fuzz-libfuzzer.md](features/F-52-cargo-fuzz-libfuzzer.md) | cargo-fuzz（HPACK・frame・header・config、LibAFL移行検討が残件。ASAN/corpus CI化はF-82へ分離） |
 | F-53 | P1 | 進行中 | [features/F-53-chaos-engineering-expansion.md](features/F-53-chaos-engineering-expansion.md) | カオス拡充（CB・slowloris・reset 完了、Pumba/tc 残件） |
 | F-54 | P1 | 進行中 | [features/F-54-security-scan-expansion.md](features/F-54-security-scan-expansion.md) | セキュリティスキャン（testssl・cargo-deny・SECURITY.md、ZAP 残件） |
 | F-55 | P2 | 完了 | [features/F-55-harness-hardening.md](features/F-55-harness-hardening.md) | ハーネス堅牢化（metrics リロード検知・レポート集約）。**GHA glibc/musl マトリクス統合を実装**（F-57 nightly、results artifact + Job Summary） |
@@ -100,7 +100,7 @@
 | F-62 | P3 | 完了 | [features/F-62-proxy-wasm-http-call-benchmark.md](features/F-62-proxy-wasm-http-call-benchmark.md) | Proxy-Wasm「HTTP コールあり」フィルタのベンチマーク（F-48 残件）。**実装済み**: Pause → インライン上流コール（offload 退避）→ 同一インスタンスで proxy_on_http_call_response resume の配線、http_call_filter.wasm + E2E 2 件 + ベンチ `wasm_http_call`。実装中に **B-19 / B-20 を検出・修正** |
 | F-63 | P1 | 完了 | [features/F-63-log-output-routing.md](features/F-63-log-output-routing.md) | ログ出力先の分離ルーティング（app=stdout / error=stderr / access=stdout をレベル別に振り分け、`type` 識別フィールド付与、JSON 順は timestamp→level→type、ログファイル親ディレクトリを landlock_write_paths へ自動追加） |
 | F-64 | P2 | 完了 | [features/F-64-sast-semgrep.md](features/F-64-sast-semgrep.md) | SAST（semgrep）導入。`run_semgrep.sh` + **Veil カスタムルール `.semgrep/veil-rules.yml`（static-lifetime transmute=B-16 番人・bare allow(dead_code)）を整備・配線**。CI 差分ゲートのみ残件（F-54 子） |
-| F-65 | P2 | 進行中 | [features/F-65-sbom-generation.md](features/F-65-sbom-generation.md) | SBOM 自動生成（syft）。source CycloneDX 823 件 + image SPDX 7 件を生成。**CI（F-57 nightly）で artifact 添付を実装**。grype 連携・GitHub Release 添付が残件（F-54 子） |
+| F-65 | P2 | 完了 | [features/F-65-sbom-generation.md](features/F-65-sbom-generation.md) | SBOM 自動生成（syft）。source CycloneDX 823 件 + image SPDX 7 件を生成。**CI（F-57 nightly）で artifact 添付を実装**。残件のgrype連携・GitHub Release添付は外部インフラ・CIタスクとしてF-81へ分離したため完了（F-54 子） |
 | F-66 | P2 | 完了 | [features/F-66-dast-owasp-zap.md](features/F-66-dast-owasp-zap.md) | 高度な DAST（OWASP ZAP Baseline）。`run_zap.sh` 追加・配線。スマグリング能動テストは F-76 で実装（Active Scan トグルのみ残件、F-54 子） |
 | F-67 | P1 | 完了 | [features/F-67-backend-protocol-violation-tests.md](features/F-67-backend-protocol-violation-tests.md) | バックエンドのプロトコル違反テスト。`bad_backend_chaos.sh`（B-16/B-17 検出・修正済）+ **H2C クライアントの違反応答耐性 単体5件**（EOF/切り詰め/ゴミ/GOAWAY/RST で panic・hang なし Err）。HTTP/3 上流のみ残件。F-53 子 |
 | F-68 | P2 | 未着手 | [features/F-68-resource-exhaustion-tests.md](features/F-68-resource-exhaustion-tests.md) | リソース枯渇テスト。`resource_exhaustion_chaos.sh` 追加・配線（フル実行は保留）。F-53 子 |
@@ -114,6 +114,8 @@
 | F-78 | P3 | 完了 | [features/F-78-oss-fuzz-integration.md](features/F-78-oss-fuzz-integration.md) | OSS-Fuzz 連携。`tools/oss-fuzz/`（project.yaml/Dockerfile/build.sh/README、6 ターゲット + F-80 seed 添付）を用意。実走・上流申請のみ残件（外部インフラ）。F-72 子 |
 | F-79 | P3 | 未着手 | [features/F-79-fuzz-coverage-llvm-cov.md](features/F-79-fuzz-coverage-llvm-cov.md) | カバレッジ計測の常設化（cargo llvm-cov、suite サマリ統合）。F-72 子 |
 | F-80 | P2 | 完了 | [features/F-80-regression-corpus.md](features/F-80-regression-corpus.md) | 回帰コーパス固定。**`fuzz/regression_corpus/`（version-controlled）を新設**し B-21 クラッシュ seed を固定、3 fuzz ランナーが起動時にコーパスへ複製。B-21/B-22 は単体テスト固定済み。F-72 子 |
+| F-81 | P2 | 未着手 | [features/F-81-sbom-ci-integration.md](features/F-81-sbom-ci-integration.md) | SBOMのCIパイプライン統合およびRelease添付。F-65から分離。 |
+| F-82 | P2 | 未着手 | [features/F-82-fuzzing-ci-nightly.md](features/F-82-fuzzing-ci-nightly.md) | ファジングのCI統合（長時間実行・Corpus永続化）。F-52から分離。 |
 | F-73 | P1 | 完了 | [features/F-73-http2-send-zerocopy-writeall.md](features/F-73-http2-send-zerocopy-writeall.md) | HTTP/2 送信ホットパスの write_all ゼロコピー化（per-frame の 2 度目の to_vec 確保+コピーを排除）。A/B で **HTTP/2 +11.6%**（1577→1761 req/s、nginx 比 75%→84%）、HTTP/1.1 不変・応答ボディ sha256 一致。レポート `docs/artifacts/performance_report_veil_vs_nginx_v3.md` |
 | F-74 | P1 | 完了 | [features/F-74-http2-send-frame-coalescing.md](features/F-74-http2-send-frame-coalescing.md) | HTTP/2 送信ホットパスのフレーム連結（HEADERS/DATA コアレッシング）。1 レスポンス分のフレームを接続再利用連結バッファ `write_buf`（スレッドローカルプール）へ積み **1 回の書き込み** で送出。`encode_*_into` 追記 API・`send_headers_buffered`・128KB 途中フラッシュ閾値を追加。per-frame 送信システムコールを削減。単体 660 / http2 E2E 11 / gRPC E2E 35 グリーン。F-73 続き |
 | F-11 | P3 | 未着手 | [features/dashboard.md](features/dashboard.md) | ダッシュボード機能 |
