@@ -16,8 +16,8 @@ bash ベースの `security_scan.sh`（メソッド制限・TRACE・パストラ
 
 ## 残件
 
-- **HTTP リクエストスマグリング**（CL.TE / TE.CL）の能動テストは ZAP baseline では
-  カバーされない。`smuggler`/`h2csmuggler` 等の専用ツール、または Nuclei テンプレートの追加。
+- ~~**HTTP リクエストスマグリング**（CL.TE / TE.CL）の能動テスト~~ → **[F-76](F-76-http-smuggling-active-tests.md)
+  で実装**（`run_smuggling.sh`、実行中に [B-23](../bugs/B-23-request-smuggling-cl-te.md) を検出・修正）。
 - Active Scan（攻撃的スキャン）の別トグル化と対象 URL 群の定義。
 
 ## 受け入れ条件

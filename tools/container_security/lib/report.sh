@@ -27,6 +27,7 @@ aggregate_reports() {
         "sbom:sbom_report.txt"
         "zap:zap_report.txt"
         "gitleaks:gitleaks_report.txt"
+        "smuggling:smuggling_report.txt"
         "cargo_audit:cargo_audit_report.txt"
         "cargo_deny:cargo_deny_report.txt"
         "trivy:trivy_report.txt"

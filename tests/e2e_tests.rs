@@ -7084,6 +7084,115 @@ async fn test_malformed_headers() {
     }
 }
 
+/// 生の（crafted）リクエストを TLS 経由でプロキシへ送り、レスポンス文字列を返すヘルパ。
+/// スマグリングベクタ検証用（httparse 等で正規化されない生バイト列を送る）。
+fn send_raw_tls_request(request: &[u8]) -> Option<String> {
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .ok()?;
+
+    let config = create_client_config();
+    let server_name = ServerName::try_from("localhost".to_string()).ok()?;
+    let mut tls_conn = ClientConnection::new(config, server_name).ok()?;
+    while tls_conn.is_handshaking() {
+        if tls_conn.complete_io(&mut stream).is_err() {
+            return None;
+        }
+    }
+    let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
+    tls_stream.write_all(request).ok()?;
+    tls_stream.flush().ok()?;
+
+    let mut response = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match tls_stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    Some(String::from_utf8_lossy(&response).into_owned())
+}
+
+/// B-23: HTTP リクエストスマグリング（CL.TE / TE.CL）の能動テスト（F-76）。
+///
+/// フロントエンド（Veil）とバックエンドが本文長を別々に解釈し得る曖昧フレーミングを
+/// Veil が **一貫して 400 で拒否**し、バックエンドへ転送しない（＝スマグリング不成立）
+/// ことを検証する。
+#[tokio::test]
+#[ntest::timeout(15000)]
+async fn test_request_smuggling_cl_te_rejected() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    // 各ベクタ: (名前, 生リクエスト)。いずれも 400 で拒否されること。
+    let smuggling_vectors: &[(&str, &[u8])] = &[
+        // CL.TE: Content-Length と Transfer-Encoding: chunked の同時指定（CL>0）。
+        (
+            "CL>0 + TE:chunked",
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 6\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\nX",
+        ),
+        // B-23 の核心: Content-Length: 0 + Transfer-Encoding: chunked（従来の取りこぼし）。
+        (
+            "CL:0 + TE:chunked",
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        ),
+        // 複数 Content-Length（RFC 7230 §3.3.2 違反）。
+        (
+            "duplicate Content-Length",
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello",
+        ),
+        // TE.CL 変種: 最終エンコーディングが chunked でない TE（本文長不確定）。
+        (
+            "TE without terminal chunked",
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked, gzip\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        ),
+    ];
+
+    for (name, req) in smuggling_vectors {
+        let response = send_raw_tls_request(req)
+            .unwrap_or_else(|| panic!("smuggling vector '{}' produced no response", name));
+        let status = get_status_code(&response);
+        assert_eq!(
+            status,
+            Some(400),
+            "smuggling vector '{}' must be rejected with 400, got {:?}\nresponse: {:?}",
+            name,
+            status,
+            response.chars().take(200).collect::<String>()
+        );
+        eprintln!("smuggling vector '{}' correctly rejected (400)", name);
+    }
+}
+
+/// スマグリング防御が正常リクエストを誤検知しないこと（回帰防止）。
+/// 単独の Content-Length、単独の Transfer-Encoding: chunked は通す。
+#[tokio::test]
+#[ntest::timeout(15000)]
+async fn test_request_smuggling_legitimate_framing_allowed() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    // 単独 chunked（正当）→ 400 にならない（バックエンドへ到達）。
+    let chunked = b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+    let response = send_raw_tls_request(chunked).expect("no response for legitimate chunked");
+    let status = get_status_code(&response);
+    assert_ne!(
+        status,
+        Some(400),
+        "legitimate single Transfer-Encoding: chunked must not be rejected as smuggling, got 400\nresponse: {:?}",
+        response.chars().take(200).collect::<String>()
+    );
+    eprintln!("legitimate chunked framing accepted (status {:?})", status);
+}
+
 #[tokio::test]
 #[ntest::timeout(15000)]
 #[serial]

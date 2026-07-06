@@ -695,6 +695,69 @@ fn trim_ascii_whitespace(s: &[u8]) -> &[u8] {
     &s[..end]
 }
 
+/// リクエスト本文フレーミングの分類結果（B-23: スマグリング防御）
+///
+/// `Ok(is_chunked)` … 受理可能。`is_chunked` が真なら chunked 転送。
+/// `Err(reason)` … RFC 7230 §3.3.3 違反 or 曖昧フレーミング。呼び出し側は 400 で拒否する。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RequestFraming {
+    /// Content-Length ベース（または本文なし）
+    ContentLength,
+    /// Transfer-Encoding: chunked ベース
+    Chunked,
+}
+
+/// リクエストのフレーミングを RFC 7230 §3.3.3 準拠で分類し、スマグリング要因を拒否する。
+///
+/// HTTP リクエストスマグリング（CL.TE / TE.CL）は、フロントエンド（Veil）とバックエンドが
+/// 本文長を別々に解釈することで発生する。それを不可能にするため、曖昧・不正なフレーミングは
+/// **転送前に一律 400 で拒否**する。検査項目:
+///
+/// - **複数 Content-Length** ヘッダー → 拒否（RFC 7230 §3.3.2）。
+/// - **Content-Length と Transfer-Encoding の同時指定** → 拒否（CL の値に関わらず。
+///   `Content-Length: 0` + `Transfer-Encoding: chunked` も含む＝B-23 で塞いだ取りこぼし）。
+/// - **Transfer-Encoding があるが最終エンコーディングが chunked でない** → 本文長を確定
+///   できずスマグリングの温床になるため拒否（リクエストで許可される TE は chunked のみ）。
+///
+/// ヘッダーは `(name, value)` のイテレータで受け取り、1 パス・ゼロアロケーションで判定する。
+pub(crate) fn classify_request_framing<'a>(
+    headers: impl IntoIterator<Item = (&'a [u8], &'a [u8])>,
+) -> Result<RequestFraming, &'static str> {
+    let mut content_length_count = 0usize;
+    let mut has_transfer_encoding = false;
+    // 全 Transfer-Encoding ヘッダーをカンマ区切りで走査したときの「最終の非空トークン」が
+    // chunked かどうか（複数 TE ヘッダーは連結相当として扱う）。
+    let mut last_te_token_is_chunked = false;
+
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case(b"content-length") {
+            content_length_count += 1;
+        } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
+            has_transfer_encoding = true;
+            for part in value.split(|&b| b == b',') {
+                let token = trim_ascii_whitespace(part);
+                if !token.is_empty() {
+                    last_te_token_is_chunked = token.eq_ignore_ascii_case(b"chunked");
+                }
+            }
+        }
+    }
+
+    if content_length_count > 1 {
+        return Err("multiple Content-Length headers");
+    }
+    if content_length_count == 1 && has_transfer_encoding {
+        return Err("Content-Length and Transfer-Encoding both present");
+    }
+    if has_transfer_encoding {
+        if !last_te_token_is_chunked {
+            return Err("Transfer-Encoding without terminal chunked");
+        }
+        return Ok(RequestFraming::Chunked);
+    }
+    Ok(RequestFraming::ContentLength)
+}
+
 /// Transfer-Encoding ヘッダー値から chunked かどうかを正確に判定
 ///
 /// Vec割り当てなしでスライスベースのトリムを使用する。
@@ -1617,6 +1680,89 @@ mod chunked_span_tests {
             assert_eq!(body, expected, "mismatch at split {}", split);
             assert!(complete, "not complete at split {}", split);
         }
+    }
+
+    // ====================
+    // B-23: リクエストスマグリング分類（classify_request_framing）
+    // ====================
+
+    fn classify(headers: &[(&[u8], &[u8])]) -> Result<RequestFraming, &'static str> {
+        classify_request_framing(headers.iter().map(|(n, v)| (*n, *v)))
+    }
+
+    #[test]
+    fn framing_plain_content_length() {
+        assert_eq!(
+            classify(&[(b"host", b"x"), (b"content-length", b"5")]),
+            Ok(RequestFraming::ContentLength)
+        );
+        // 本文なし（CL も TE も無し）も ContentLength 扱い。
+        assert_eq!(
+            classify(&[(b"host", b"x")]),
+            Ok(RequestFraming::ContentLength)
+        );
+    }
+
+    #[test]
+    fn framing_plain_chunked() {
+        assert_eq!(
+            classify(&[(b"transfer-encoding", b"chunked")]),
+            Ok(RequestFraming::Chunked)
+        );
+        // カンマ区切りで最終が chunked（`gzip, chunked`）は受理。
+        assert_eq!(
+            classify(&[(b"transfer-encoding", b"gzip, chunked")]),
+            Ok(RequestFraming::Chunked)
+        );
+    }
+
+    #[test]
+    fn framing_rejects_cl_te_conflict_regardless_of_value() {
+        // CL>0 + chunked（従来も拒否）。
+        assert!(classify(&[
+            (b"content-length", b"5"),
+            (b"transfer-encoding", b"chunked")
+        ])
+        .is_err());
+        // B-23 の核心: Content-Length: 0 + chunked（従来は取りこぼしていた CL.TE desync）。
+        assert!(classify(&[
+            (b"content-length", b"0"),
+            (b"transfer-encoding", b"chunked")
+        ])
+        .is_err());
+        // TE ヘッダーが chunked 以外でも CL と併存すれば拒否。
+        assert!(classify(&[(b"content-length", b"5"), (b"transfer-encoding", b"gzip")]).is_err());
+    }
+
+    #[test]
+    fn framing_rejects_multiple_content_length() {
+        assert!(classify(&[(b"content-length", b"5"), (b"content-length", b"6")]).is_err());
+    }
+
+    #[test]
+    fn framing_rejects_te_without_terminal_chunked() {
+        // 最終エンコーディングが chunked でない（本文長を確定できない）→ 拒否。
+        assert!(classify(&[(b"transfer-encoding", b"gzip")]).is_err());
+        // chunked が最終でない（`chunked, gzip`）→ 拒否（TE.CL スマグリング対策）。
+        assert!(classify(&[(b"transfer-encoding", b"chunked, gzip")]).is_err());
+    }
+
+    #[test]
+    fn framing_multiple_te_headers_treated_as_concatenated() {
+        // 複数 TE ヘッダーは連結相当。最終ヘッダーの最終トークンが chunked なら受理。
+        assert_eq!(
+            classify(&[
+                (b"transfer-encoding", b"gzip"),
+                (b"transfer-encoding", b"chunked")
+            ]),
+            Ok(RequestFraming::Chunked)
+        );
+        // 最終ヘッダーが chunked 以外（`chunked` の後に `identity`）→ 拒否。
+        assert!(classify(&[
+            (b"transfer-encoding", b"chunked"),
+            (b"transfer-encoding", b"identity")
+        ])
+        .is_err());
     }
 }
 

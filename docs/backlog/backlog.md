@@ -101,7 +101,7 @@
 | F-63 | P1 | 完了 | [features/F-63-log-output-routing.md](features/F-63-log-output-routing.md) | ログ出力先の分離ルーティング（app=stdout / error=stderr / access=stdout をレベル別に振り分け、`type` 識別フィールド付与、JSON 順は timestamp→level→type、ログファイル親ディレクトリを landlock_write_paths へ自動追加） |
 | F-64 | P2 | 完了 | [features/F-64-sast-semgrep.md](features/F-64-sast-semgrep.md) | SAST（semgrep）導入。`run_semgrep.sh` + **Veil カスタムルール `.semgrep/veil-rules.yml`（static-lifetime transmute=B-16 番人・bare allow(dead_code)）を整備・配線**。CI 差分ゲートのみ残件（F-54 子） |
 | F-65 | P2 | 進行中 | [features/F-65-sbom-generation.md](features/F-65-sbom-generation.md) | SBOM 自動生成（syft）。source CycloneDX 823 件 + image SPDX 7 件を生成。**CI（F-57 nightly）で artifact 添付を実装**。grype 連携・GitHub Release 添付が残件（F-54 子） |
-| F-66 | P2 | 進行中 | [features/F-66-dast-owasp-zap.md](features/F-66-dast-owasp-zap.md) | 高度な DAST（OWASP ZAP Baseline）。`run_zap.sh` 追加・配線。スマグリング能動テストが残件（F-54 子） |
+| F-66 | P2 | 完了 | [features/F-66-dast-owasp-zap.md](features/F-66-dast-owasp-zap.md) | 高度な DAST（OWASP ZAP Baseline）。`run_zap.sh` 追加・配線。スマグリング能動テストは F-76 で実装（Active Scan トグルのみ残件、F-54 子） |
 | F-67 | P1 | 進行中 | [features/F-67-backend-protocol-violation-tests.md](features/F-67-backend-protocol-violation-tests.md) | バックエンドのプロトコル違反テスト。`bad_backend_chaos.sh` 追加・実行→**B-16 / B-17 を検出**（未修正・起票のみ）。F-53 子 |
 | F-68 | P2 | 未着手 | [features/F-68-resource-exhaustion-tests.md](features/F-68-resource-exhaustion-tests.md) | リソース枯渇テスト。`resource_exhaustion_chaos.sh` 追加・配線（フル実行は保留）。F-53 子 |
 | F-69 | P2 | 完了 | [features/F-69-pumba-network-kernel-chaos.md](features/F-69-pumba-network-kernel-chaos.md) | ネットワーク/カーネル層カオス（Pumba/tc netem）。loss/delay/dup/corrupt に加え **reorder + 複合(tc で loss+delay 同時)** を追加。F-53 子 |
@@ -109,7 +109,7 @@
 | F-71 | P2 | 完了 | [features/F-71-asan-corpus-fuzzing.md](features/F-71-asan-corpus-fuzzing.md) | ASAN + **TSAN パイプライン**（`run_libfuzzer_tsan.sh`）+ **version-controlled 回帰 corpus（F-80）**。MSAN（-Zbuild-std 要）・外部永続化のみ残件。F-52 子 |
 | F-72 | P3 | 完了 | [features/F-72-security-testing-further-hardening.md](features/F-72-security-testing-further-hardening.md) | セキュリティテスト追加提案（レポート範囲外）。6 項目を **個別チケット F-75〜F-80 へ分割**して backlog へ反映（本チケットの受け入れ条件を達成） |
 | F-75 | P2 | 完了 | [features/F-75-secret-scan-gitleaks.md](features/F-75-secret-scan-gitleaks.md) | シークレットスキャン（gitleaks）。`run_gitleaks.sh` 追加（SARIF・redact・非ブロッキング）、`run.sh` フェーズ 4g + `report.sh` に配線。トリアージ方針の文書化が残件。F-72 子 |
-| F-76 | P2 | 未着手 | [features/F-76-http-smuggling-active-tests.md](features/F-76-http-smuggling-active-tests.md) | HTTP リクエストスマグリング専用テスト（CL.TE/TE.CL/H2C ダウングレード能動検査）。F-72 子 |
+| F-76 | P2 | 完了 | [features/F-76-http-smuggling-active-tests.md](features/F-76-http-smuggling-active-tests.md) | HTTP リクエストスマグリング能動テスト。`run_smuggling.sh`（CL.TE/TE.CL/複数CL/終端非chunked を 400 検証）+ Rust 単体/E2E。**実行中に B-23 を検出・修正**。H2C 専用プローブのみ残件。F-72 子 |
 | F-77 | P3 | 未着手 | [features/F-77-differential-testing.md](features/F-77-differential-testing.md) | プロトコル差分テスト（Veil vs nginx/envoy の応答差分比較）。F-72 子 |
 | F-78 | P3 | 未着手 | [features/F-78-oss-fuzz-integration.md](features/F-78-oss-fuzz-integration.md) | OSS-Fuzz 連携（継続ファジング・クラッシュ自動起票、外部インフラ依存）。F-72 子 |
 | F-79 | P3 | 未着手 | [features/F-79-fuzz-coverage-llvm-cov.md](features/F-79-fuzz-coverage-llvm-cov.md) | カバレッジ計測の常設化（cargo llvm-cov、suite サマリ統合）。F-72 子 |
@@ -159,6 +159,7 @@
 | B-20 | P1 | 完了 | [bugs/B-20-wasm-sync-call-async-store-panic.md](bugs/B-20-wasm-sync-call-async-store-panic.md) | WASM 読み取り系ホスト関数 5 つが async store で同期 `call` を使い panic（"must use call_async"）。F-62 で検出。**修正済み**: `func_wrap_async` + `call_async` 化 |
 | B-21 | P1 | 完了 | [bugs/B-21-hpack-huffman-decode-shift-panic.md](bugs/B-21-hpack-huffman-decode-shift-panic.md) | HPACK Huffman デコーダが不正入力（符号非一致でビット蓄積）でシフト量オーバーフロー panic。外部から HTTP/2 ヘッダで到達可能な DoS 面。`cargo fuzz`（F-52）で検出。**修正済み**: 最長符号長(30bit)超過で HuffmanDecodeError を返すガード + 回帰テスト（クラッシュ入力・ラウンドトリップ） |
 | B-22 | P2 | 完了 | [bugs/B-22-path-wildcard-boundary-mismatch.md](bugs/B-22-path-wildcard-boundary-mismatch.md) | パスワイルドカード `/api/*` が境界パス `/api`・`/api/` を取りこぼす（matchit キャッチオール `{*rest}` が空セグメント非対応、fallback `matches_pattern` と意味論不一致）。F-56 プロパティテストで検出。**修正済み**: ワイルドカードを matchit + fallback へ二重登録し境界意味論を一致（候補は上位で dedup）。回帰単体 + プロパティテスト |
+| B-23 | P1 | 完了 | [bugs/B-23-request-smuggling-cl-te.md](bugs/B-23-request-smuggling-cl-te.md) | HTTP リクエストスマグリング（CL.TE）。`Content-Length: 0` + `Transfer-Encoding: chunked` が拒否されずバックエンドへ CL+TE 曖昧メッセージを転送（デシンク）。F-76 プローブ設計中に検出。**修正済み**: `classify_request_framing` 純関数で一律 400 拒否 + chunked 時 CL 転送除去。単体6+E2E2 |
 
 ---
 

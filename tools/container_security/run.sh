@@ -229,6 +229,9 @@ main() {
     # フェーズ 4g: シークレットスキャン（gitleaks、F-75）
     "${SCRIPT_DIR}/security/run_gitleaks.sh" || log "gitleaks で警告（レポート参照）"
 
+    # フェーズ 4h: HTTP リクエストスマグリング能動テスト（F-76）
+    "${SCRIPT_DIR}/security/run_smuggling.sh" || log "smuggling で警告（レポート参照）"
+
     # フェーズ 5: Trivy イメージスキャン
     run_trivy_scan
 

@@ -3597,21 +3597,23 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                     0
                 };
 
-                // Transfer-Encoding: chunked チェック（改善版）
-                let is_chunked: bool = req
-                    .headers
-                    .iter()
-                    .find(|h| h.name.eq_ignore_ascii_case("transfer-encoding"))
-                    .map(|h| is_chunked_encoding(h.value))
-                    .unwrap_or(false);
-
-                // Content-Length と Transfer-Encoding の競合は RFC 7230 Section 3.3.3 違反 → 400
-                if content_length > 0 && is_chunked {
-                    drop(req);
-                    let err_buf = ERR_MSG_BAD_REQUEST.to_vec();
-                    let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
-                    return;
-                }
+                // B-23: リクエストフレーミングを RFC 7230 §3.3.3 準拠で分類し、HTTP リクエスト
+                // スマグリング（CL.TE / TE.CL）要因を転送前に一律 400 で拒否する。
+                // 従来は `content_length > 0 && is_chunked` のみを弾いており、
+                // `Content-Length: 0` + `Transfer-Encoding: chunked`（CL の値に依らない CL.TE）や
+                // 最終エンコーディングが chunked でない TE を取りこぼしていた。
+                let is_chunked: bool = match classify_request_framing(
+                    req.headers.iter().map(|h| (h.name.as_bytes(), h.value)),
+                ) {
+                    Ok(RequestFraming::Chunked) => true,
+                    Ok(RequestFraming::ContentLength) => false,
+                    Err(_) => {
+                        drop(req);
+                        let err_buf = ERR_MSG_BAD_REQUEST.to_vec();
+                        let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+                        return;
+                    }
+                };
 
                 // Connection ヘッダーチェック（Keep-Alive / Upgrade対応）
                 let connection_header: Option<&[u8]> = req
@@ -5664,6 +5666,15 @@ async fn handle_proxy(
         // Connection, Keep-Alive, Proxy-Connection, TE, Trailer, Transfer-Encoding, Upgrade
         // これらのヘッダーはプロキシで終端され、バックエンドに転送してはならない
         if is_hop_by_hop_header(name) {
+            continue;
+        }
+
+        // B-23（多層防御）: chunked 転送時にクライアント由来の Content-Length を
+        // バックエンドへ渡さない。フレーミング分類（classify_request_framing）が CL+TE を
+        // 既に 400 で拒否しているため通常ここには到達しないが、chunked では下で
+        // `Transfer-Encoding: chunked` を再付与するため、万一 CL が残っても
+        // バックエンドに CL+TE の曖昧メッセージを渡さないよう保険で除去する。
+        if is_chunked && name.eq_ignore_ascii_case(b"content-length") {
             continue;
         }
 
