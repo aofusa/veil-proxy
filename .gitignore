@@ -31,3 +31,4 @@ tests/wasm/*.wasm
 # Claude Code worktrees/local state
 .claude/
 tests/fixtures/proxy.pid
+tests/load/results/
