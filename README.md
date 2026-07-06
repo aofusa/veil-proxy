@@ -3407,6 +3407,23 @@ large_request_buffer_size = 4096
 
 ## Benchmarking
 
+Veil ships a reproducible Docker-based performance harness in
+[`tools/perf/`](tools/perf/) that compares `veil:glibc` / `veil:musl` (built with
+**full features**) against `nginx:alpine` over container-to-container networking, for both
+HTTP/1.1 (`wrk`) and HTTP/2 (`h2load`). It covers the default+http2 tuning matrix
+(http2 × kTLS × SO_REUSEPORT balancing × open_file_cache) **and** the full-only features
+(compression / cache / buffering / reverse-proxy). Full data and a summary are in
+[**docs/perf**](docs/perf/).
+
+```bash
+# Generate configs, run the comparison, and aggregate (median±stdev)
+bash tools/perf/gen_configs.sh
+bash tools/perf/run_perf.sh
+# Results: tools/perf/results/results_raw.tsv and results_summary.md
+```
+
+Ad-hoc single-target benchmarking:
+
 ```bash
 # Benchmark using wrk
 wrk -t4 -c100 -d30s https://localhost/
@@ -3433,12 +3450,23 @@ Veil includes comprehensive test suites covering unit tests, integration tests, 
 
 | Test Type | Count | Status |
 |-----------|-------|--------|
-| **Unit Tests** | 469 | ✅ All passing |
-| **Integration Tests** | 12 | ✅ All passing |
-| **E2E Tests** | 23 | ✅ All passing |
-| **Benchmarks** | 12 files | ✅ Ready |
+| **Unit Tests** (lib) | 692 | ✅ All passing |
+| **Integration Tests** (`integration_tests` + property tests) | 40+ | ✅ All passing |
+| **E2E Tests** (`e2e_tests`) | 419 | ✅ All passing |
+| **Fuzz Targets** (`cargo fuzz`) | 5+ | ✅ No crashes |
+| **Benchmarks** | 13 files | ✅ Ready |
 
-**Total: 504 tests - All passing ✅**
+The unit-test count is verified inside the release image build (`docker/Dockerfile.musl`
+runs `cargo test --lib --features full` — 692 passed). In addition to the in-repo tests,
+two Docker-based external-verification harnesses are provided:
+
+- **[`tools/container_security/`](tools/container_security/)** — fuzzing, chaos, h2spec HTTP/2
+  conformance, request-smuggling / differential probes, and image/security scanners, run
+  against the **full-features** container image. Fuzzing and the malformed-backend mock are
+  Rust binaries (no Python); TLS/plaintext probes use `openssl` / bash `/dev/tcp`.
+- **[`tools/perf/`](tools/perf/)** — `veil:glibc` / `veil:musl` (full features) vs `nginx`
+  throughput/latency/CPU/memory comparison, covering both default+http2 tuning and the
+  full-only features (compression / cache / buffering / reverse-proxy). See [docs/perf](docs/perf/).
 
 ### Running Tests
 
@@ -3467,7 +3495,7 @@ cargo test --test integration_tests --features full
 E2E tests require a running test environment. Use the setup script:
 
 ```bash
-# Method 1: Automated (recommended)
+# Method 1: Automated (recommended) — proxy runs as a host binary
 ./tests/e2e_setup.sh test
 
 # Method 2: Manual
@@ -3478,6 +3506,22 @@ cargo test --test e2e_tests --features full -- --test-threads=1
 # Cleanup only
 ./tests/e2e_setup.sh clean
 ```
+
+**Container mode** — run the exact same E2E suite/config/topology but with the proxy launched
+from the **veil container image** (validates the shipped image). Pass `container` (and optionally
+`glibc`/`musl`, default `glibc`). Backends run on the host and `--network host` keeps ports/config
+identical; omit `container` for the traditional host-binary run.
+
+```bash
+# Container E2E with veil:glibc (default image)
+./tests/e2e_setup.sh test container
+
+# Container E2E with veil:musl
+./tests/e2e_setup.sh test container musl
+```
+
+> The container images must be built with full features first
+> (`docker build -f docker/Dockerfile.glibc -t veil:glibc --build-arg CARGO_FEATURES='full' .`).
 
 #### Benchmarks
 
