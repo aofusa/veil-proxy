@@ -162,6 +162,7 @@
 | B-21 | P1 | 完了 | [bugs/B-21-hpack-huffman-decode-shift-panic.md](bugs/B-21-hpack-huffman-decode-shift-panic.md) | HPACK Huffman デコーダが不正入力（符号非一致でビット蓄積）でシフト量オーバーフロー panic。外部から HTTP/2 ヘッダで到達可能な DoS 面。`cargo fuzz`（F-52）で検出。**修正済み**: 最長符号長(30bit)超過で HuffmanDecodeError を返すガード + 回帰テスト（クラッシュ入力・ラウンドトリップ） |
 | B-22 | P2 | 完了 | [bugs/B-22-path-wildcard-boundary-mismatch.md](bugs/B-22-path-wildcard-boundary-mismatch.md) | パスワイルドカード `/api/*` が境界パス `/api`・`/api/` を取りこぼす（matchit キャッチオール `{*rest}` が空セグメント非対応、fallback `matches_pattern` と意味論不一致）。F-56 プロパティテストで検出。**修正済み**: ワイルドカードを matchit + fallback へ二重登録し境界意味論を一致（候補は上位で dedup）。回帰単体 + プロパティテスト |
 | B-23 | P1 | 完了 | [bugs/B-23-request-smuggling-cl-te.md](bugs/B-23-request-smuggling-cl-te.md) | HTTP リクエストスマグリング（CL.TE）。`Content-Length: 0` + `Transfer-Encoding: chunked` が拒否されずバックエンドへ CL+TE 曖昧メッセージを転送（デシンク）。F-76 プローブ設計中に検出。**修正済み**: `classify_request_framing` 純関数で一律 400 拒否 + chunked 時 CL 転送除去。単体6+E2E2 |
+| B-24 | P1 | 完了 | [bugs/B-24-sq-full-future-hang.md](bugs/B-24-sq-full-future-hang.md) | io_uring SQ リング満杯時に全 I/O Future が SQE 未投入のまま `submitted=true` にして永久ハング（CQ 永久未着）。F-68 リソース枯渇テスト設計中に検出。**修正済み**: `get_sqe_or_submit`（満杯時 pending 提出→再取得）+ 確保失敗を WouldBlock で graceful 化。回帰単体1 |
 
 ---
 

@@ -91,8 +91,8 @@ impl Future for SpliceFuture {
             self.user_data = user_data;
 
             let (fd_in, fd_out, len) = (self.fd_in, self.fd_out, self.len);
-            with_ring(|ring| {
-                if let Some(sqe) = ring.get_sqe() {
+            let acquired = with_ring(|ring| {
+                if let Some(sqe) = ring.get_sqe_or_submit() {
                     // SPLICE SQE: fd=fd_out, splice_fd_in=fd_in, addr=off_in(-1), off=off_out(-1),
                     // len=nbytes, op_flags=splice_flags
                     sqe.opcode = IORING_OP_SPLICE;
@@ -103,8 +103,17 @@ impl Future for SpliceFuture {
                     sqe.len = len;
                     sqe.op_flags = SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE;
                     sqe.user_data = user_data;
+                    true
+                } else {
+                    false
                 }
             });
+            if !acquired {
+                // B-24: SQ/CQ 枯渇で SQE を確保できず。op を解放し WouldBlock で graceful に
+                // 失敗する（submitted を立てないためハングしない）。
+                remove_op(user_data);
+                return Poll::Ready(Err(io::Error::from(io::ErrorKind::WouldBlock)));
+            }
 
             if let Err(e) = submit_sqes() {
                 remove_op(user_data);

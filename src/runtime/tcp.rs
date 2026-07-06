@@ -277,16 +277,26 @@ impl<'a> Future for Accept<'a> {
             let addr_ptr = self.addr_storage.as_mut() as *mut libc::sockaddr_storage;
             let addr_len_ptr = self.addr_len.as_mut() as *mut libc::socklen_t;
 
-            with_ring(|ring| {
-                if let Some(sqe) = ring.get_sqe() {
+            let acquired = with_ring(|ring| {
+                if let Some(sqe) = ring.get_sqe_or_submit() {
                     sqe.opcode = IORING_OP_ACCEPT;
                     sqe.fd = listener_fd;
                     sqe.addr_or_splice_off_in = addr_ptr as u64;
                     sqe.off_or_addr2 = addr_len_ptr as u64;
                     sqe.op_flags = (libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC) as u32;
                     sqe.user_data = user_data;
+                    true
+                } else {
+                    false
                 }
             });
+            if !acquired {
+                // B-24: SQ/CQ 枯渇で SQE スロットを確保できず。op を解放し WouldBlock で
+                // graceful に失敗する（submitted を立てないためハングしない。accept ループは
+                // 次イテレーションで再試行する）。
+                remove_op(user_data);
+                return Poll::Ready(Err(io::Error::from(io::ErrorKind::WouldBlock)));
+            }
 
             if let Err(e) = submit_sqes() {
                 remove_op(user_data);
@@ -643,15 +653,26 @@ impl Future for Connect {
             let addr_ptr = self.addr_storage.as_ref() as *const libc::sockaddr_storage;
             let addr_len = self.addr_len;
 
-            with_ring(|ring| {
-                if let Some(sqe) = ring.get_sqe() {
+            let acquired = with_ring(|ring| {
+                if let Some(sqe) = ring.get_sqe_or_submit() {
                     sqe.opcode = IORING_OP_CONNECT;
                     sqe.fd = fd;
                     sqe.addr_or_splice_off_in = addr_ptr as u64;
                     sqe.off_or_addr2 = addr_len as u64;
                     sqe.user_data = user_data;
+                    true
+                } else {
+                    false
                 }
             });
+            if !acquired {
+                // B-24: SQ/CQ 枯渇で SQE を確保できず。ソケットと op を解放し WouldBlock で
+                // graceful に失敗する（submitted を立てないためハングしない）。
+                unsafe { libc::close(fd) };
+                self.fd = -1;
+                remove_op(user_data);
+                return Poll::Ready(Err(io::Error::from(io::ErrorKind::WouldBlock)));
+            }
 
             if let Err(e) = submit_sqes() {
                 unsafe { libc::close(fd) };
@@ -751,15 +772,25 @@ impl<T: IoBufMut> Future for ReadFuture<T> {
                 (buf.write_ptr() as u64, buf.bytes_total() as u32)
             };
 
-            with_ring(|ring| {
-                if let Some(sqe) = ring.get_sqe() {
+            let acquired = with_ring(|ring| {
+                if let Some(sqe) = ring.get_sqe_or_submit() {
                     sqe.opcode = IORING_OP_RECV;
                     sqe.fd = fd;
                     sqe.addr_or_splice_off_in = buf_ptr;
                     sqe.len = buf_len;
                     sqe.user_data = user_data;
+                    true
+                } else {
+                    false
                 }
             });
+            if !acquired {
+                // B-24: SQ/CQ 枯渇で SQE を確保できず。op を解放しバッファを返して WouldBlock で
+                // graceful に失敗する（submitted を立てないためハングしない）。
+                remove_op(user_data);
+                let buf = this.buf.take().expect("buffer present on SQ-full");
+                return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buf));
+            }
 
             if let Err(e) = submit_sqes() {
                 remove_op(user_data);
@@ -842,15 +873,25 @@ impl<T: IoBuf> Future for WriteFuture<T> {
                 (buf.read_ptr() as u64, buf.bytes_init() as u32)
             };
 
-            with_ring(|ring| {
-                if let Some(sqe) = ring.get_sqe() {
+            let acquired = with_ring(|ring| {
+                if let Some(sqe) = ring.get_sqe_or_submit() {
                     sqe.opcode = IORING_OP_SEND;
                     sqe.fd = fd;
                     sqe.addr_or_splice_off_in = buf_ptr;
                     sqe.len = buf_len;
                     sqe.user_data = user_data;
+                    true
+                } else {
+                    false
                 }
             });
+            if !acquired {
+                // B-24: SQ/CQ 枯渇で SQE を確保できず。op を解放しバッファを返して WouldBlock で
+                // graceful に失敗する（submitted を立てないためハングしない）。
+                remove_op(user_data);
+                let buf = this.buf.take().expect("buffer present on SQ-full");
+                return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), buf));
+            }
 
             if let Err(e) = submit_sqes() {
                 remove_op(user_data);
@@ -1018,17 +1059,29 @@ impl<A: IoBuf, B: IoBuf> Future for SendMsgFuture<A, B> {
 
             let fd = this.fd;
             let msghdr_ptr = &state.msghdr as *const libc::msghdr as u64;
-            with_ring(|ring| {
-                if let Some(sqe) = ring.get_sqe() {
+            let acquired = with_ring(|ring| {
+                if let Some(sqe) = ring.get_sqe_or_submit() {
                     sqe.opcode = IORING_OP_SENDMSG;
                     sqe.fd = fd;
                     sqe.addr_or_splice_off_in = msghdr_ptr;
                     sqe.len = 1;
                     sqe.op_flags = libc::MSG_NOSIGNAL as u32;
                     sqe.user_data = user_data;
+                    true
+                } else {
+                    false
                 }
             });
             this.state = Some(state);
+
+            if !acquired {
+                // B-24: SQ/CQ 枯渇で SQE を確保できず。op・state・バッファを解放し WouldBlock で
+                // graceful に失敗する（submitted を立てないためハングしない）。
+                remove_op(user_data);
+                release_sendmsg_state(this.state.take().expect("state present on SQ-full"));
+                let (a, b) = this.bufs.take().expect("buffers present on SQ-full");
+                return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), a, b));
+            }
 
             if let Err(e) = submit_sqes() {
                 remove_op(user_data);
@@ -1098,14 +1151,23 @@ impl<'a> Future for Readable<'a> {
             self.user_data = user_data;
 
             let fd = self.fd;
-            with_ring(|ring| {
-                if let Some(sqe) = ring.get_sqe() {
+            let acquired = with_ring(|ring| {
+                if let Some(sqe) = ring.get_sqe_or_submit() {
                     sqe.opcode = IORING_OP_POLL_ADD;
                     sqe.fd = fd;
                     sqe.op_flags = POLLIN as u32;
                     sqe.user_data = user_data;
+                    true
+                } else {
+                    false
                 }
             });
+            if !acquired {
+                // B-24: SQ/CQ 枯渇で SQE を確保できず。op を解放し WouldBlock で graceful に
+                // 失敗する（submitted を立てないためハングしない）。
+                remove_op(user_data);
+                return Poll::Ready(Err(io::Error::from(io::ErrorKind::WouldBlock)));
+            }
 
             if let Err(e) = submit_sqes() {
                 remove_op(user_data);
@@ -1161,14 +1223,23 @@ impl<'a> Future for Writable<'a> {
             self.user_data = user_data;
 
             let fd = self.fd;
-            with_ring(|ring| {
-                if let Some(sqe) = ring.get_sqe() {
+            let acquired = with_ring(|ring| {
+                if let Some(sqe) = ring.get_sqe_or_submit() {
                     sqe.opcode = IORING_OP_POLL_ADD;
                     sqe.fd = fd;
                     sqe.op_flags = POLLOUT as u32;
                     sqe.user_data = user_data;
+                    true
+                } else {
+                    false
                 }
             });
+            if !acquired {
+                // B-24: SQ/CQ 枯渇で SQE を確保できず。op を解放し WouldBlock で graceful に
+                // 失敗する（submitted を立てないためハングしない）。
+                remove_op(user_data);
+                return Poll::Ready(Err(io::Error::from(io::ErrorKind::WouldBlock)));
+            }
 
             if let Err(e) = submit_sqes() {
                 remove_op(user_data);
@@ -1225,14 +1296,23 @@ impl Future for ReadableFd {
             self.user_data = user_data;
 
             let fd = self.fd;
-            with_ring(|ring| {
-                if let Some(sqe) = ring.get_sqe() {
+            let acquired = with_ring(|ring| {
+                if let Some(sqe) = ring.get_sqe_or_submit() {
                     sqe.opcode = IORING_OP_POLL_ADD;
                     sqe.fd = fd;
                     sqe.op_flags = POLLIN as u32;
                     sqe.user_data = user_data;
+                    true
+                } else {
+                    false
                 }
             });
+            if !acquired {
+                // B-24: SQ/CQ 枯渇で SQE を確保できず。op を解放し WouldBlock で graceful に
+                // 失敗する（submitted を立てないためハングしない）。
+                remove_op(user_data);
+                return Poll::Ready(Err(io::Error::from(io::ErrorKind::WouldBlock)));
+            }
 
             if let Err(e) = submit_sqes() {
                 remove_op(user_data);
@@ -1285,14 +1365,23 @@ impl Future for WritableFd {
             self.user_data = user_data;
 
             let fd = self.fd;
-            with_ring(|ring| {
-                if let Some(sqe) = ring.get_sqe() {
+            let acquired = with_ring(|ring| {
+                if let Some(sqe) = ring.get_sqe_or_submit() {
                     sqe.opcode = IORING_OP_POLL_ADD;
                     sqe.fd = fd;
                     sqe.op_flags = POLLOUT as u32;
                     sqe.user_data = user_data;
+                    true
+                } else {
+                    false
                 }
             });
+            if !acquired {
+                // B-24: SQ/CQ 枯渇で SQE を確保できず。op を解放し WouldBlock で graceful に
+                // 失敗する（submitted を立てないためハングしない）。
+                remove_op(user_data);
+                return Poll::Ready(Err(io::Error::from(io::ErrorKind::WouldBlock)));
+            }
 
             if let Err(e) = submit_sqes() {
                 remove_op(user_data);

@@ -448,7 +448,9 @@ pub fn detach_op_no_cancel(user_data: u64, guard: OpGuard) {
 /// 指定した user_data の in-flight op に ASYNC_CANCEL を投げる（ベストエフォート）。
 fn submit_cancel(target_user_data: u64) {
     with_ring(|ring| {
-        if let Some(sqe) = ring.get_sqe() {
+        // B-24: SQ 満杯なら提出してスロットを確保してからキャンセル SQE を積む
+        //（ベストエフォート。取得できなくても副作用はない）。
+        if let Some(sqe) = ring.get_sqe_or_submit() {
             sqe.opcode = IORING_OP_ASYNC_CANCEL;
             sqe.fd = -1;
             // ASYNC_CANCEL は addr フィールドにキャンセル対象 op の user_data を入れる。

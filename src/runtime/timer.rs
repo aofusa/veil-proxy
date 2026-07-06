@@ -9,8 +9,8 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use crate::runtime::executor::{
-    alloc_op, detach_op_no_cancel, peek_op_result, set_op_waker, submit_sqes, take_op_result,
-    with_ring, OpGuard,
+    alloc_op, detach_op_no_cancel, peek_op_result, remove_op, set_op_waker, submit_sqes,
+    take_op_result, with_ring, OpGuard,
 };
 use crate::runtime::ring::{KernelTimespec, IORING_OP_TIMEOUT};
 
@@ -69,18 +69,28 @@ impl Future for Sleep {
 
             let ts_ptr = &self.ts as *const KernelTimespec as u64;
 
-            with_ring(|ring| {
-                if let Some(sqe) = ring.get_sqe() {
+            let acquired = with_ring(|ring| {
+                if let Some(sqe) = ring.get_sqe_or_submit() {
                     sqe.opcode = IORING_OP_TIMEOUT;
                     sqe.fd = -1;
                     sqe.addr_or_splice_off_in = ts_ptr;
                     sqe.len = 1; // 件数
                     sqe.user_data = user_data;
                     sqe.off_or_addr2 = 0; // 絶対タイムアウトカウント 0 = 相対タイムアウト
+                    true
+                } else {
+                    false
                 }
             });
+            if !acquired {
+                // B-24: SQ/CQ 枯渇で TIMEOUT SQE を確保できず。op を解放し、満了扱いで完了する
+                //（submitted を立てず永久ハングを避ける。`timeout()` は内側 Future を畳む）。
+                remove_op(user_data);
+                return Poll::Ready(());
+            }
 
             if let Err(e) = submit_sqes() {
+                remove_op(user_data);
                 ftlog::error!("Sleep submit failed: {}", e);
                 return Poll::Ready(());
             }

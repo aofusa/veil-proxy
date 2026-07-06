@@ -553,6 +553,40 @@ impl IoUring {
         }
     }
 
+    /// SQ に空きスロットがあるかを返す（`get_sqe` を消費せず判定するための軽量チェック）。
+    #[inline]
+    fn sq_has_space(&self) -> bool {
+        unsafe {
+            let head = (*self.sq_head).load(Ordering::Acquire);
+            let tail = (*self.sq_tail).load(Ordering::Relaxed);
+            tail.wrapping_sub(head) < *self.sq_ring_entries
+        }
+    }
+
+    /// SQE スロットを取得する。SQ が満杯の場合は **未提出の SQE をカーネルへ提出**して
+    /// スロットを解放し、再取得を試みる。
+    ///
+    /// 各 I/O Future は 1 スロットを取得したら直ちに提出するのが基本だが、瞬間的に
+    /// 提出前 SQE が `sq_ring_entries` 個溜まると SQ が満杯になり `get_sqe` が `None` を
+    /// 返す。旧実装はこの `None` を握り潰して SQE を埋めないまま `submitted=true` にして
+    /// おり、対応する CQE が永久に来ず Future がハングしていた（[B-24]）。
+    ///
+    /// 非 SQPOLL リングでは `submit()`（`io_uring_enter(to_submit=pending)`）がカーネルに
+    /// 全 pending SQE を同期的に消費させ SQ ヘッドを前進させるため、この再取得で通常は
+    /// 必ずスロットが得られる。ただし CQ リング溢れ等で `submit()` が失敗した場合は
+    /// スロットを解放できず `None` を返し得る。呼び出し側は `None` を **ハングさせず
+    /// graceful なエラー**（`WouldBlock` 等）へ変換すること。
+    ///
+    /// [B-24]: docs/backlog/bugs/B-24-sq-full-future-hang.md
+    pub fn get_sqe_or_submit(&mut self) -> Option<&mut IoUringSqe> {
+        if self.sq_has_space() {
+            return self.get_sqe();
+        }
+        // SQ 満杯: pending をカーネルへ提出してスロットを解放してから再取得する。
+        let _ = self.submit();
+        self.get_sqe()
+    }
+
     /// io_uring_enter(2) で SQE をカーネルに送信し、CQE を待つ
     ///
     /// # Arguments
@@ -712,5 +746,59 @@ mod tests {
             Some(-libc::EACCES),
             "disallowed opcode must be rejected with -EACCES (restrictions active)"
         );
+    }
+
+    /// B-24 回帰: SQ が満杯でも `get_sqe_or_submit` は pending を提出してスロットを解放し、
+    /// 必ず新スロットを返す（`None` を握り潰して Future をハングさせない）。
+    ///
+    /// SQ 容量 = 4 の NOP で満たしたあと、`get_sqe`（旧経路）が満杯で `None` を返すこと、
+    /// および `get_sqe_or_submit` が同状況で `Some` を返し、投入済み SQE がすべて完了
+    /// （op が失われずハングしない）することを検証する。
+    #[test]
+    fn get_sqe_or_submit_drains_full_sq() {
+        let mut ring = match IoUring::new(4, 0) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("io_uring unavailable ({e}); skipping");
+                return;
+            }
+        };
+
+        // SQ を容量いっぱい（4 件）まで NOP で満たす（未提出）。
+        for i in 0..4u64 {
+            let sqe = ring.get_sqe().expect("slot available within capacity");
+            sqe.opcode = IORING_OP_NOP;
+            sqe.user_data = i + 1;
+        }
+
+        // 旧経路は満杯で None（これが B-24 のハング起点だった）。
+        assert!(
+            ring.get_sqe().is_none(),
+            "plain get_sqe must report SQ full when saturated"
+        );
+
+        // 新経路は pending を提出してスロットを確保し Some を返す。
+        {
+            let sqe = ring
+                .get_sqe_or_submit()
+                .expect("get_sqe_or_submit must drain a full SQ and yield a slot");
+            sqe.opcode = IORING_OP_NOP;
+            sqe.user_data = 5;
+        }
+
+        // 5 件すべての NOP 完了を回収できること（op が失われずハングしない）。
+        let mut seen = 0u64;
+        for _ in 0..16 {
+            ring.submit_and_wait(1).expect("submit_and_wait");
+            ring.consume_cqes(|cqe| {
+                if (1..=5).contains(&cqe.user_data) {
+                    seen += 1;
+                }
+            });
+            if seen >= 5 {
+                break;
+            }
+        }
+        assert_eq!(seen, 5, "all 5 NOPs must complete (no lost/hung ops)");
     }
 }
