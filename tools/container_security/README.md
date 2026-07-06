@@ -118,6 +118,7 @@ FUZZ_RUNS=2000 FUZZ_MAX_TIME=120 ./tools/container_security/fuzz/run_libfuzzer.s
 | 3e bad_backend | `chaos/bad_backend_chaos.sh` | バックエンドのプロトコル違反（F-67、既定 SKIP。B-16/B-17 検出実績） |
 | 3f Pumba netem | `chaos/pumba_chaos.sh` | パケットロス/遅延/重複/破損/順序逆転 + 複合(loss+delay)の注入と回復（F-69、既定 SKIP） |
 | 3g リソース枯渇 | `chaos/resource_exhaustion_chaos.sh` | cgroup 制約下の高並行負荷で panic/OOM 回避（F-68、既定 SKIP） |
+| 3h syscall 障害注入 | `chaos/syscall_chaos.sh` | strace inject で io_uring_enter/setup に EBUSY/ENOMEM/EINTR/EFAULT を注入し panic/segfault なしを検証（F-86、既定 SKIP。CAP_SYS_PTRACE 必要） |
 | 4 セキュリティ | `security_scan.sh` | TLS ハンドシェイク、メソッド制限、TRACE、パストラバーサル |
 | 4a testssl | `security/run_testssl.sh` | `drwetter/testssl.sh` コンテナで TLS 設定スキャン |
 | 4b cargo-audit | `security/run_cargo_audit.sh` | Rust 依存関係の脆弱性 |
@@ -192,6 +193,7 @@ CARGO_TARGET_DIR=/tmp/veil-build-target cargo build -p veil-fuzz
 | `SKIP_BAD_BACKEND` | `1` | バックエンドプロトコル違反カオス（F-67） |
 | `SKIP_PUMBA` | `1` | Pumba netem カオス（F-69） |
 | `SKIP_RESOURCE_EXHAUSTION` | `1` | リソース枯渇カオス（F-68） |
+| `SKIP_SYSCALL_CHAOS` | `1` | syscall 障害注入カオス（F-86。strace inject。`SC_INJECTIONS`/`SC_WHEN_FIRST`/`SC_WHEN_STEP`、`SYSCALL_CHAOS_BLOCKING=1` で panic 検出時 fail） |
 | `SKIP_LIBFUZZER_ASAN` | `1` | libFuzzer + ASAN（F-71） |
 | `SKIP_LIBFUZZER_TSAN` | `1` | libFuzzer + TSAN（データ競合、F-71） |
 | `SKIP_PUMBA_COMPOUND` | `0` | Pumba の複合障害（tc で loss+delay 同時、F-69） |
