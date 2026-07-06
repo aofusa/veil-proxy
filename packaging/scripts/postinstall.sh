@@ -49,18 +49,19 @@ if [ ! -f /var/etc/veil/ssl/cert.pem ] || [ ! -f /var/etc/veil/ssl/key.pem ]; th
         -addext "basicConstraints=critical,CA:FALSE" \
         -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
         -addext "extendedKeyUsage=serverAuth"
-    chown veil:veil /var/etc/veil/ssl/key.pem /var/etc/veil/ssl/cert.pem
-    chmod 600 /var/etc/veil/ssl/key.pem
+    chown root:veil /var/etc/veil/ssl/key.pem /var/etc/veil/ssl/cert.pem
+    chmod 640 /var/etc/veil/ssl/key.pem
     chmod 644 /var/etc/veil/ssl/cert.pem
 fi
 
 chown -R veil:veil /var/log/veil /var/cache/veil /var/tmp/veil
 chown -R root:veil /var/etc/veil
-chown veil:veil /var/etc/veil/ssl/key.pem
+# root:veil 640 — systemd CapabilityBoundingSet 下の root 起動と veil 降格後の両方から読める
+chown root:veil /var/etc/veil/ssl/key.pem
 chmod 0750 /var/etc/veil
 chmod 0750 /var/etc/veil/ssl
 chmod 0640 /var/etc/veil/config.toml
-chmod 600 /var/etc/veil/ssl/key.pem
+chmod 640 /var/etc/veil/ssl/key.pem
 
 if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload || true

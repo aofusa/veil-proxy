@@ -549,9 +549,8 @@ landlock_write_paths = ["/var/log/veil", "/var/cache/veil", "/var/tmp/veil"]
 # ============================================
 
 # サンドボックスを有効化（デフォルト: false）
-# systemd ユニットで veil 非特権ユーザー実行時は CAP_SYS_ADMIN が無く unshare に失敗するため無効化。
-# 隔離は systemd（ProtectSystem/PrivateTmp 等）と seccomp/Landlock で担保する。
-enable_sandbox = false
+# systemd は root で起動し、適用後に drop_privileges で veil:veil へ降格する。
+enable_sandbox = true
 
 # Namespace分離設定
 # -------------------

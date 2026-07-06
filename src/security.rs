@@ -1517,7 +1517,7 @@ impl Capability {
 ///
 /// 設定の適用に失敗した場合はエラーを返します。
 #[cfg(target_os = "linux")]
-pub fn apply_sandbox(config: &SandboxConfig) -> io::Result<()> {
+pub fn apply_sandbox_setup(config: &SandboxConfig) -> io::Result<()> {
     if !config.enabled {
         debug!("Sandbox is disabled");
         return Ok(());
@@ -1525,12 +1525,38 @@ pub fn apply_sandbox(config: &SandboxConfig) -> io::Result<()> {
 
     info!("Applying sandbox restrictions (bubblewrap-compatible)...");
 
-    // 1. PR_SET_NO_NEW_PRIVS を設定
+    // Namespace分離
+    apply_namespaces(config)?;
+
+    // Mount namespace内でのbind mounts
+    if config.unshare_mount {
+        apply_mounts(config)?;
+    }
+
+    // ホスト名設定（UTS namespace分離時）
+    if config.unshare_uts {
+        if let Some(ref hostname) = config.hostname {
+            apply_hostname(hostname)?;
+        }
+    }
+
+    info!("Sandbox namespace/mount setup completed");
+    Ok(())
+}
+
+/// サンドボックスの権限制限フェーズ（PR_SET_NO_NEW_PRIVS・ケイパビリティ制限）
+///
+/// `drop_privileges` の **後** に呼び出すこと。先に適用すると setuid/setgid 降格が失敗する。
+#[cfg(target_os = "linux")]
+pub fn apply_sandbox_lockdown(config: &SandboxConfig) -> io::Result<()> {
+    if !config.enabled {
+        return Ok(());
+    }
+
     if config.no_new_privs {
         let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
         if ret != 0 {
             let err = io::Error::last_os_error();
-            // 既に設定済みの場合は無視
             if err.raw_os_error() != Some(libc::EINVAL) {
                 return Err(err);
             }
@@ -1538,32 +1564,34 @@ pub fn apply_sandbox(config: &SandboxConfig) -> io::Result<()> {
         debug!("PR_SET_NO_NEW_PRIVS set successfully");
     }
 
-    // 2. Namespace分離
-    apply_namespaces(config)?;
-
-    // 3. Mount namespace内でのbind mounts
-    if config.unshare_mount {
-        apply_mounts(config)?;
-    }
-
-    // 4. ホスト名設定（UTS namespace分離時）
-    if config.unshare_uts {
-        if let Some(ref hostname) = config.hostname {
-            apply_hostname(hostname)?;
-        }
-    }
-
-    // 5. Capabilities制限
     apply_capabilities(config)?;
 
+    info!("Sandbox lockdown (no_new_privs/capabilities) applied");
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub fn apply_sandbox(config: &SandboxConfig) -> io::Result<()> {
+    apply_sandbox_setup(config)?;
+    apply_sandbox_lockdown(config)?;
     info!("Sandbox restrictions applied successfully");
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn apply_sandbox(_config: &SandboxConfig) -> io::Result<()> {
+pub fn apply_sandbox_setup(_config: &SandboxConfig) -> io::Result<()> {
     warn!("Sandbox is only available on Linux");
     Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn apply_sandbox_lockdown(_config: &SandboxConfig) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn apply_sandbox(config: &SandboxConfig) -> io::Result<()> {
+    apply_sandbox_setup(config)
 }
 
 /// Namespace分離を適用
