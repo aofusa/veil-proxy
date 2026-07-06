@@ -5092,6 +5092,8 @@ pub struct LoadedConfigWithoutTls {
 ///
 /// Landlock適用後は証明書ファイルへのアクセスが制限されるため、
 /// この関数ではTLS関連の読み込みをスキップします。
+// 理由付き allow: 起動・リロード・設定検証時のみ実行されるコールドパス（データプレーン非経由）。
+#[allow(clippy::disallowed_methods)]
 fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
     let config_str = fs::read_to_string(path)?;
     let config: Config = toml::from_str(&config_str).map_err(|e| {
@@ -5243,6 +5245,8 @@ fn build_optimized_router(routes: &[Route]) -> Arc<routing::OptimizedRouter> {
     Arc::new(router)
 }
 
+// 理由付き allow: 起動・リロード・設定検証時のみ実行されるコールドパス（データプレーン非経由）。
+#[allow(clippy::disallowed_methods)]
 pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     let config_str = fs::read_to_string(path)?;
     let config: Config = toml::from_str(&config_str).map_err(|e| {
@@ -5496,6 +5500,8 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
 }
 
 /// 設定ファイルからログ設定のみを読み込む（ログ初期化前用）
+// 理由付き allow: 起動・リロード・設定検証時のみ実行されるコールドパス（データプレーン非経由）。
+#[allow(clippy::disallowed_methods)]
 pub fn load_logging_config(path: &Path) -> io::Result<LoggingConfigSection> {
     let config_str = fs::read_to_string(path)?;
     let config: Config = toml::from_str(&config_str).map_err(|e| {
@@ -5510,6 +5516,8 @@ pub fn load_logging_config(path: &Path) -> io::Result<LoggingConfigSection> {
 // JSON形式ログフォーマッタ（JsonLogFormat 等）と init_logging は
 // crate::logging モジュールに移動しました。
 
+// 理由付き allow: 起動・リロード・設定検証時のみ実行されるコールドパス（データプレーン非経由）。
+#[allow(clippy::disallowed_methods)]
 pub fn load_backend(
     route: &Route,
     upstream_groups: &HashMap<String, Arc<UpstreamGroup>>,
@@ -5806,6 +5814,8 @@ pub struct CliArgs {
 /// - TOML構文のパース
 /// - 設定値のバリデーション
 /// - TLS証明書・秘密鍵の存在確認
+// 理由付き allow: 起動・リロード・設定検証時のみ実行されるコールドパス（データプレーン非経由）。
+#[allow(clippy::disallowed_methods)]
 pub fn test_config_file(path: &Path) -> io::Result<()> {
     // ファイル存在確認
     if !path.exists() {
@@ -6627,6 +6637,8 @@ timeout_secs = 3
 
 #[cfg(test)]
 mod cipher_suites_tests {
+    // 理由付き allow: テストコードは同期 I/O・sleep を使用してよい（データプレーン非経由）。
+    #![allow(clippy::disallowed_methods)]
     use super::*;
 
     #[test]
@@ -6732,6 +6744,8 @@ key_path = "/tmp/key.pem"
 
 #[cfg(test)]
 mod shipped_config_tests {
+    // 理由付き allow: テストコードは同期 I/O・sleep を使用してよい（データプレーン非経由）。
+    #![allow(clippy::disallowed_methods)]
     use super::*;
 
     /// リポジトリ同梱の examples/config.toml が常にパース・バリデーション可能であることを保証する。

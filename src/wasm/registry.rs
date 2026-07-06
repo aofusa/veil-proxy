@@ -141,6 +141,8 @@ impl ModuleRegistry {
     /// 書き込みの権限問題は通常発生しない。`deserialize` は自前生成の信頼できるキャッシュ
     /// のみを対象とし（信頼境界は元々の `.wasm` と同じくキャッシュ/設定ディレクトリの
     /// ファイル完全性）、いかなるエラーも安全側（再コンパイル）にフォールバックする。
+    // 理由付き allow: WASM モジュールのロード・AOT キャッシュ生成は設定適用時（起動/リロード）のコールドパス。
+    #[allow(clippy::disallowed_methods)]
     fn load_or_compile_with_cache(engine: &Engine, wasm_path: &Path) -> anyhow::Result<Module> {
         // サイドカーパス: "<path>.cwasm"
         let cache_path: PathBuf = {

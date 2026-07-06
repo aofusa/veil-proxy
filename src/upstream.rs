@@ -14,6 +14,8 @@ use std::time::Duration;
 ///
 /// TCP 接続して HTTP GET リクエストを送信し、レスポンスをチェック。
 /// TLS接続もサポート（use_tls=true時）。
+// 理由付き allow: 専用ヘルスチェックスレッドから呼ばれる同期プローブ（イベントループ外）。
+#[allow(clippy::disallowed_methods)]
 pub(crate) fn perform_health_check(
     addr: &str,
     host: &str,
@@ -225,6 +227,8 @@ pub(crate) fn perform_tcp_health_check(addr: &str, timeout: Duration) -> bool {
 ///
 /// grpc.health.v1.Health/Check を送信し、SERVING ステータスを確認する。
 /// TLS の有無は `use_tls` で制御する。`service_name` が空文字の場合はサーバー全体のチェック。
+// 理由付き allow: 専用ヘルスチェックスレッドから呼ばれる同期プローブ（イベントループ外）。
+#[allow(clippy::disallowed_methods)]
 pub(crate) fn perform_grpc_health_check(
     addr: &str,
     service_name: &str,
@@ -874,6 +878,8 @@ fn matches_cidr(ip: &SocketAddr, cidr_ranges: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    // 理由付き allow: テストコードは同期 I/O・sleep を使用してよい（データプレーン非経由）。
+    #![allow(clippy::disallowed_methods)]
     use super::*;
 
     // ====================

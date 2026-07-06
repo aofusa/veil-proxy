@@ -230,6 +230,8 @@ impl CacheManager {
     }
 
     /// エントリを削除
+    // 理由付き allow: キャッシュ無効化（purge 管理 API / 失効時）のコールドパス。
+    #[allow(clippy::disallowed_methods)]
     pub fn invalidate(&self, key: &CacheKey) {
         // インデックスから削除
         if let Some(entry) = self.index.remove(key) {

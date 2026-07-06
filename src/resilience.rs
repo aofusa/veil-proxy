@@ -266,6 +266,8 @@ impl CircuitBreaker {
 
 #[cfg(test)]
 mod tests {
+    // 理由付き allow: テストコードは同期 I/O・sleep を使用してよい（データプレーン非経由）。
+    #![allow(clippy::disallowed_methods)]
     use super::*;
 
     fn test_config() -> CircuitBreakerConfig {

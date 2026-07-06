@@ -11,12 +11,19 @@
 //! - キャッシュヒット/ミス時のパフォーマンス
 //! - 各Phase単独パフォーマンス
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+// 理由付き allow: ベンチマークハーネスは同期 I/O / sleep / std::net を意図的に使用する
+// （被計測のプロキシ本体とは別スレッド・別プロセス）。F-88 の disallowed-methods は
+// データプレーン向け規則のためベンチではファイル単位で許容する。
+#![allow(clippy::disallowed_methods)]
+
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use std::hint::black_box;
 use std::collections::HashMap;
-use std::net::SocketAddr;
 
 // ベンチマーク用のルート条件構造体（シミュレーション）
 #[derive(Clone, Debug)]
+#[derive(Default)]
+#[allow(dead_code)] // ベンチ入力生成専用の構造体（ルータ登録時のみ使用、直接読み出しなし）
 struct BenchRouteConditions {
     host: Option<String>,
     path: Option<String>,
@@ -26,18 +33,6 @@ struct BenchRouteConditions {
     source_ip: Option<Vec<String>>,
 }
 
-impl Default for BenchRouteConditions {
-    fn default() -> Self {
-        Self {
-            host: None,
-            path: None,
-            method: None,
-            header: None,
-            query: None,
-            source_ip: None,
-        }
-    }
-}
 
 /// テスト用ルートを生成
 fn generate_routes(count: usize) -> Vec<BenchRouteConditions> {
@@ -89,8 +84,7 @@ fn linear_search(
     for (i, route) in routes.iter().enumerate() {
         // Host チェック
         if let Some(ref host_pattern) = route.host {
-            if host_pattern.starts_with("*.") {
-                let suffix = &host_pattern[2..];
+            if let Some(suffix) = host_pattern.strip_prefix("*.") {
                 if !host.ends_with(suffix) {
                     continue;
                 }

@@ -10,6 +10,11 @@
 //!   2. ベンチマーク実行: cargo bench --bench websocket
 //!   3. 環境停止: ./tests/e2e_setup.sh stop
 
+// 理由付き allow: ベンチマークハーネスは同期 I/O / sleep / std::net を意図的に使用する
+// （被計測のプロキシ本体とは別スレッド・別プロセス）。F-88 の disallowed-methods は
+// データプレーン向け規則のためベンチではファイル単位で許容する。
+#![allow(clippy::disallowed_methods)]
+
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::ServerName;
@@ -159,7 +164,7 @@ fn establish_websocket_connection(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
     let mut tls_conn = ClientConnection::new(config, server_name)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     // TLSハンドシェイク
     while tls_conn.is_handshaking() {

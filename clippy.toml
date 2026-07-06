@@ -1,0 +1,31 @@
+# F-88: ホットパス絶対規則（AGENTS.md）のブロッキング呼び出し禁止を AST レベルで検出する。
+#
+# Semgrep（F-64）は Rust を正規表現ベースでしか解析できず、ブロッキング呼び出しの検出は
+# 誤検知回避のため除外されている。ここでは clippy の disallowed-methods（AST 解決済みパス
+# マッチ）でデータプレーンへの同期処理混入をコンパイル（clippy）レベルでブロックする。
+#
+# 正当な利用箇所（runtime::offload のオフロード先ワーカー・起動/リロード時の一度きりの
+# 初期化・専用スレッド・テスト/ベンチ）は、**理由コメントを添えた個別 allow** で明示する:
+#   #[allow(clippy::disallowed_methods)] // 起動時のみ: ...
+# 理由のない bare allow は増やさない（.semgrep/veil-rules.yml の監視方針に合わせる）。
+
+disallowed-methods = [
+    { path = "std::thread::sleep", reason = "ホットパス禁止（AGENTS.md）: イベントループをブロックする。runtime::time::sleep / timeout を使う。オフロード先ワーカー・テストのみ理由付き allow 可" },
+    { path = "std::net::TcpStream::connect", reason = "ホットパス禁止（AGENTS.md）: 同期 connect。runtime::TcpStream::connect を使う。専用スレッド内のみ理由付き allow 可" },
+    { path = "std::fs::canonicalize", reason = "ホットパス禁止（AGENTS.md）: シンボリックリンク解決を伴う同期 FS。runtime::offload 経由で退避する" },
+    { path = "std::fs::metadata", reason = "ホットパス禁止（AGENTS.md）: 同期 FS。runtime::offload 経由で退避する" },
+    { path = "std::fs::read", reason = "ホットパス禁止（AGENTS.md）: 同期 FS。runtime::io::read / offload を使う" },
+    { path = "std::fs::read_to_string", reason = "ホットパス禁止（AGENTS.md）: 同期 FS。起動/リロード時のみ理由付き allow 可" },
+    { path = "std::fs::write", reason = "ホットパス禁止（AGENTS.md）: 同期 FS。buffering 等は runtime::offload 経由で行う" },
+    { path = "std::fs::remove_file", reason = "ホットパス禁止（AGENTS.md）: 同期 FS。runtime::io::remove_file / offload を使う" },
+    { path = "std::io::copy", reason = "ホットパス禁止（AGENTS.md）: 同期コピー。splice / 非同期 I/O を使う" },
+]
+
+# 引数数・型複雑度の閾値（プロジェクト判断）:
+# - ホットパスでは接続/リクエストごとの状態を構造体へ詰め直すコスト（ムーブ・再借用の整理）を
+#   避け、借用の集合をそのまま引数で渡すスタイルを許容する（最大 16 引数の転送系関数がある）。
+# - 型複雑度は `(io::Result<usize>, A, B)` のような所有権 handoff タプルや
+#   `Rc<RefCell<HashMap<ConnectionId, Handler>>>` 等ゼロコスト合成型に由来し、
+#   エイリアス化は寿命注釈をかえって複雑にするため閾値を引き上げる。
+too-many-arguments-threshold = 17
+type-complexity-threshold = 1000

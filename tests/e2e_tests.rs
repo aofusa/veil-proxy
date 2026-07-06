@@ -32,6 +32,11 @@
 //! - レスポンス圧縮
 //! - ヘルスチェック
 
+// 理由付き allow: テストハーネス・E2E クライアントは同期 I/O / sleep / std::net を
+// 意図的に使用する（プロキシ本体のデータプレーンとは別プロセス・別スレッド）。
+// F-88 の disallowed-methods はデータプレーン向け規則のため、テストではファイル単位で許容する。
+#![allow(clippy::disallowed_methods)]
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;

@@ -1166,6 +1166,7 @@ impl Http3Handler {
                     &prefix,
                     &security,
                 )
+                .await
                 .unwrap_or((404, 9)),
             Backend::Redirect(redirect_url, status_code, preserve_path, _) => self
                 .handle_redirect(
@@ -1605,7 +1606,7 @@ impl Http3Handler {
     }
 
     /// ファイル配信
-    fn handle_sendfile(
+    async fn handle_sendfile(
         &mut self,
         stream_id: u64,
         base_path: &Path,
@@ -1653,8 +1654,14 @@ impl Http3Handler {
             base_path.to_path_buf()
         };
 
-        // ファイル読み込み
-        let data = match std::fs::read(&file_path) {
+        // ファイル読み込み（B-26: whole-file の同期 read はイベントループをブロックするため
+        // offload（専用スレッドプール）へ退避する。HTTP/1.1 経路の proxy.rs と同方式）。
+        let read_path = file_path.clone();
+        // 理由付き allow: offload ワーカースレッド内で実行（イベントループ非ブロック）。
+        #[allow(clippy::disallowed_methods)]
+        let read_result =
+            crate::runtime::offload::offload(move || std::fs::read(read_path)).await;
+        let data = match read_result {
             Ok(d) => d,
             Err(_) => {
                 self.send_error_response(stream_id, 404, b"Not Found")?;
@@ -2377,6 +2384,8 @@ pub(crate) async fn proxy_to_backend_async_with_tls(
 /// TLSバックエンドへの非同期プロキシ処理（kTLS版）
 /// kTLS/rustlsフォールバック問題を回避するため spawn_blocking で std TLS 接続を使用
 #[cfg(feature = "ktls")]
+// 理由付き allow: 同期 connect/TLS は std::thread::spawn した専用スレッド内で実行し、結果を mpsc + ポーリングで受け取る（イベントループ非ブロック）。
+#[allow(clippy::disallowed_methods)]
 async fn proxy_to_tls_backend_async(
     target: &ProxyTarget,
     request: Vec<u8>,

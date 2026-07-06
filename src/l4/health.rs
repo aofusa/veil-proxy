@@ -88,6 +88,8 @@ pub fn spawn_l4_health_checker(config: Arc<L4ListenerConfig>, health_state: L4He
                 if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
                     return;
                 }
+                // 理由付き allow: 専用ヘルスチェックスレッド上の待機（イベントループ外）。
+                #[allow(clippy::disallowed_methods)]
                 std::thread::sleep(Duration::from_secs(1));
                 waited += Duration::from_secs(1);
             }
@@ -97,6 +99,8 @@ pub fn spawn_l4_health_checker(config: Arc<L4ListenerConfig>, health_state: L4He
 
 #[cfg(test)]
 mod tests {
+    // 理由付き allow: テストコードは同期 I/O・sleep を使用してよい（データプレーン非経由）。
+    #![allow(clippy::disallowed_methods)]
     use super::*;
     use crate::config::{HealthCheckConfig, HealthCheckType, L4LbAlgorithm, L4UpstreamEntry};
 

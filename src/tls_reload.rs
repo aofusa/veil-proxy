@@ -90,6 +90,8 @@ impl TlsCertReloader {
     }
 
     /// 証明書と秘密鍵の mtime のうち新しい方を返す。
+    // 理由付き allow: 専用 TLS リロードスレッドから呼ばれる mtime 検査（イベントループ外・500ms 周期）。
+    #[allow(clippy::disallowed_methods)]
     fn combined_mtime(cert: &PathBuf, key: &PathBuf) -> anyhow::Result<SystemTime> {
         let cert_m = std::fs::metadata(cert)?.modified()?;
         let key_m = std::fs::metadata(key)?.modified()?;
@@ -148,6 +150,8 @@ impl TlsCertReloader {
 
 #[cfg(test)]
 mod tests {
+    // 理由付き allow: テストコードは同期 I/O・sleep を使用してよい（データプレーン非経由）。
+    #![allow(clippy::disallowed_methods)]
     use super::*;
     use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering};

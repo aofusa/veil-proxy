@@ -2,6 +2,11 @@
 //!
 //! 統合テストおよびE2Eテストで使用する共通のユーティリティを提供します。
 
+// 理由付き allow: テストハーネス・E2E クライアントは同期 I/O / sleep / std::net を
+// 意図的に使用する（プロキシ本体のデータプレーンとは別プロセス・別スレッド）。
+// F-88 の disallowed-methods はデータプレーン向け規則のため、テストではファイル単位で許容する。
+#![allow(clippy::disallowed_methods)]
+
 // 新しいHTTP/3テストクライアント（h3+quinn版）
 // http3 featureフラグなしで有効
 pub mod http3_client;

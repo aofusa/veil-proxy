@@ -13,6 +13,11 @@
 //!
 //! 注意: 実際のkTLSベンチマークには、kTLS有効/無効の両方のビルドが必要です。
 
+// 理由付き allow: ベンチマークハーネスは同期 I/O / sleep / std::net を意図的に使用する
+// （被計測のプロキシ本体とは別スレッド・別プロセス）。F-88 の disallowed-methods は
+// データプレーン向け規則のためベンチではファイル単位で許容する。
+#![allow(clippy::disallowed_methods)]
+
 use criterion::{criterion_group, criterion_main, Criterion};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::ServerName;
@@ -161,7 +166,7 @@ fn send_tls_request(port: u16, path: &str) -> Result<usize, Box<dyn std::error::
 
     // TLS接続を確立
     let mut tls_conn = ClientConnection::new(config, server_name)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     // ハンドシェイクを実行（同期）
     while tls_conn.is_handshaking() {

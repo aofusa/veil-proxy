@@ -16,7 +16,6 @@ use ftlog::{debug, error, info, warn};
 use httparse::{Request, Status};
 use std::io;
 use std::net::SocketAddr;
-#[cfg(feature = "http2")]
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -6351,6 +6350,8 @@ async fn serve_from_disk_cache(
     // ディスクからボディを読み込み。whole-file 読み込みはイベントループをブロックするため、
     // ブロッキングオフロードで専用ワーカースレッドへ退避する（F-29 完全非同期化）。
     let disk_path_owned = disk_path.to_path_buf();
+    // 理由付き allow: 同期 FS は offload 閉包内（専用ワーカースレッド）で実行され、イベントループを塞がない。
+    #[allow(clippy::disallowed_methods)]
     let body_data =
         match crate::runtime::offload::offload(move || std::fs::read(disk_path_owned)).await {
             Ok(data) => data,
@@ -6743,6 +6744,8 @@ async fn send_disk_buffer_to_client(
 ) -> Option<u64> {
     // whole-file 読み込みはイベントループをブロックするためオフロードする（F-29）。
     let path_owned = path.to_path_buf();
+    // 理由付き allow: 同期 FS は offload 閉包内（専用ワーカースレッド）で実行され、イベントループを塞がない。
+    #[allow(clippy::disallowed_methods)]
     let data = match crate::runtime::offload::offload(move || std::fs::read(path_owned)).await {
         Ok(d) => d,
         Err(e) => {

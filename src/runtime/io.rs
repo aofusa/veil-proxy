@@ -116,18 +116,24 @@ impl<T: AsyncWriteRent> AsyncWriteRentExt for T {}
 
 /// ファイルを読み取る（std::fs::read の非同期版）
 ///
-/// monoio::fs::read の互換実装。
-/// ホットパスでは使用しないため、std::fs を使う。
+/// monoio::fs::read の互換実装。ホットパス（静的ファイル配信の memory モード等）からも
+/// 呼ばれるため、ブロッキング FS を offload（専用スレッドプール + eventfd 完了待機）へ
+/// 退避してイベントループを塞がない（B-26。リング未初期化のコンテキストでは inline 実行）。
 pub async fn read(path: impl AsRef<std::path::Path>) -> io::Result<Vec<u8>> {
     let path = path.as_ref().to_owned();
-    // ブロッキング操作を許容（設定ファイル読み込み等のコールドパスのみ使用）
-    std::fs::read(path)
+    // 理由付き allow: offload ワーカースレッド内で実行されるためイベントループ非ブロック。
+    #[allow(clippy::disallowed_methods)]
+    crate::runtime::offload::offload(move || std::fs::read(path)).await
 }
 
 /// ファイルを削除する（monoio::fs::remove_file の互換実装）
+///
+/// B-26: offload 経由でイベントループを塞がない。
 pub async fn remove_file(path: impl AsRef<std::path::Path>) -> io::Result<()> {
     let path = path.as_ref().to_owned();
-    std::fs::remove_file(path)
+    // 理由付き allow: offload ワーカースレッド内で実行されるためイベントループ非ブロック。
+    #[allow(clippy::disallowed_methods)]
+    crate::runtime::offload::offload(move || std::fs::remove_file(path)).await
 }
 
 // ====================

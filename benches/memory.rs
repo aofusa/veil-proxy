@@ -12,6 +12,11 @@
 //!
 //! 注意: メモリ使用量の測定にはsysinfoクレートを使用します。
 
+// 理由付き allow: ベンチマークハーネスは同期 I/O / sleep / std::net を意図的に使用する
+// （被計測のプロキシ本体とは別スレッド・別プロセス）。F-88 の disallowed-methods は
+// データプレーン向け規則のためベンチではファイル単位で許容する。
+#![allow(clippy::disallowed_methods)]
+
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::ServerName;
@@ -159,7 +164,7 @@ fn send_https_request(port: u16, path: &str) -> Result<(), Box<dyn std::error::E
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
     let mut tls_conn = ClientConnection::new(config, server_name)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     // TLSハンドシェイク
     while tls_conn.is_handshaking() {
@@ -193,7 +198,7 @@ fn get_memory_usage() -> Option<u64> {
     system.refresh_all();
 
     // veilプロセスを検索
-    for (_pid, process) in system.processes() {
+    for process in system.processes().values() {
         if process.name().to_string_lossy().contains("veil") {
             return Some(process.memory() * 1024); // KB to bytes
         }

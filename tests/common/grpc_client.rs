@@ -5,6 +5,11 @@
 //!
 //! 既存のテストロジックとの互換性のため、HTTP/1.1経由のgRPCリクエストもサポート
 
+// 理由付き allow: テストハーネス・E2E クライアントは同期 I/O / sleep / std::net を
+// 意図的に使用する（プロキシ本体のデータプレーンとは別プロセス・別スレッド）。
+// F-88 の disallowed-methods はデータプレーン向け規則のため、テストではファイル単位で許容する。
+#![allow(clippy::disallowed_methods)]
+
 use super::http1_client::Http1TestClient;
 use http::uri::Uri;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};

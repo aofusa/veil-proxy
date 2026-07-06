@@ -74,6 +74,8 @@ pub mod disk_buffer {
     }
 
     /// ディスクバッファからの非同期読み込み（offload 経由・イベントループ非ブロック）
+    // 理由付き allow: 同期 FS は offload 閉包内（専用ワーカースレッド）で実行され、イベントループを塞がない。
+    #[allow(clippy::disallowed_methods)]
     pub async fn read_from_disk(path: &Path) -> io::Result<Vec<u8>> {
         let path = path.to_path_buf();
         crate::runtime::offload::offload(move || {
@@ -96,6 +98,8 @@ pub mod disk_buffer {
     }
 
     /// ディスクバッファを削除（offload 経由・イベントループ非ブロック）
+    // 理由付き allow: 同期 FS は offload 閉包内（専用ワーカースレッド）で実行され、イベントループを塞がない。
+    #[allow(clippy::disallowed_methods)]
     pub async fn remove_disk_buffer(path: &Path) -> io::Result<()> {
         let path = path.to_path_buf();
         crate::runtime::offload::offload(move || std::fs::remove_file(&path)).await

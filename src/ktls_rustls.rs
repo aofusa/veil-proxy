@@ -1428,6 +1428,8 @@ impl Default for SplicePipe {
 // ====================
 
 /// kTLS が利用可能かどうかをチェック
+// 理由付き allow: 起動時に一度だけ /proc を読む可用性プローブ（コールドパス）。
+#[allow(clippy::disallowed_methods)]
 pub fn is_ktls_available() -> bool {
     // /proc/modules で tls モジュールがロードされているか確認
     if let Ok(modules) = std::fs::read_to_string("/proc/modules") {

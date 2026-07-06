@@ -12,6 +12,11 @@
 //!
 //! 注意: HTTP/3はQUIC/UDPベースで、quicheクレートを使用します。
 
+// 理由付き allow: ベンチマークハーネスは同期 I/O / sleep / std::net を意図的に使用する
+// （被計測のプロキシ本体とは別スレッド・別プロセス）。F-88 の disallowed-methods は
+// データプレーン向け規則のためベンチではファイル単位で許容する。
+#![allow(clippy::disallowed_methods)]
+
 use criterion::{criterion_group, criterion_main, Criterion};
 use quiche::h3::NameValue;
 use ring::rand::SecureRandom;
@@ -161,7 +166,7 @@ fn send_tls_http2_request(port: u16, path: &str) -> Result<usize, Box<dyn std::e
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
     let mut tls_conn = ClientConnection::new(config, server_name)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     while tls_conn.is_handshaking() {
         match tls_conn.complete_io(&mut stream) {
@@ -218,15 +223,14 @@ fn send_http3_request(port: u16, _path: &str) -> Result<usize, Box<dyn std::erro
     socket.set_write_timeout(Some(Duration::from_secs(5)))?;
 
     let peer_addr: SocketAddr = format!("127.0.0.1:{}", port).parse()?;
-    socket.connect(&peer_addr)?;
+    socket.connect(peer_addr)?;
 
     // 接続IDを生成
     let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
     ring::rand::SystemRandom::new()
         .fill(&mut scid)
         .map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
+            std::io::Error::other(
                 "Failed to generate connection ID",
             )
         })?;

@@ -84,6 +84,8 @@ impl DiskCache {
     }
 
     /// 同期的なファイル読み込み（非推奨、互換性のため）
+    // 理由付き allow: 明示同期モード（use_async_io=false）・非 Linux フォールバック・テスト用 API。Linux 本番経路は offload 化済み（B-26）。
+    #[allow(clippy::disallowed_methods)]
     pub fn read_sync(&self, key: &CacheKey) -> io::Result<Vec<u8>> {
         let path = self.key_to_path(key);
         self.reads.fetch_add(1, Ordering::Relaxed);
@@ -91,6 +93,8 @@ impl DiskCache {
     }
 
     /// 同期的なファイル書き込み（非推奨、互換性のため）
+    // 理由付き allow: 明示同期モード（use_async_io=false）・非 Linux フォールバック・テスト用 API。Linux 本番経路は offload 化済み（B-26）。
+    #[allow(clippy::disallowed_methods)]
     pub fn write_sync(&self, key: &CacheKey, data: &[u8]) -> io::Result<PathBuf> {
         let path = self.key_to_path(key);
 
@@ -109,6 +113,8 @@ impl DiskCache {
     }
 
     /// ファイルを削除
+    // 理由付き allow: 明示同期モード（use_async_io=false）・非 Linux フォールバック・テスト用 API。Linux 本番経路は offload 化済み（B-26）。
+    #[allow(clippy::disallowed_methods)]
     pub fn remove(&self, key: &CacheKey) -> io::Result<()> {
         let path = self.key_to_path(key);
 
@@ -185,6 +191,8 @@ impl DiskCache {
     }
 
     /// 古いキャッシュファイルを削除してディスク使用量を削減
+    // 理由付き allow: LRU 追い出しはバックグラウンドのクリーンアップスレッド（server.rs）から呼ばれるコールドパス。
+    #[allow(clippy::disallowed_methods)]
     pub fn evict_to_size(&self, target_size: u64) -> io::Result<usize> {
         let current = self.current_size();
 
@@ -271,11 +279,7 @@ impl DiskCache {
         let path = self.key_to_path(key);
         let data_len = data.len() as u64;
 
-        // 親ディレクトリを作成（io_uring 非同期版）
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
+        // 親ディレクトリ作成は write_file（offload 閉包内）が担う。
         async_io::write_file(&path, data).await?;
 
         self.writes.fetch_add(1, Ordering::Relaxed);
@@ -336,23 +340,37 @@ pub mod async_io {
     use std::io;
     use std::path::Path;
 
-    /// ファイル読み込み（コールドパスのため同期 I/O を使用）
+    /// ファイル読み込み（B-26: offload でイベントループ非ブロック）
+    ///
+    /// 旧実装は「コールドパス」名目でイベントループ上の同期 read だったが、
+    /// キャッシュヒット時のディスク層読み込みはデータプレーン経路のため、
+    /// offload（専用スレッドプール + eventfd 完了待機）へ退避する。
     pub async fn read_file(path: &Path) -> io::Result<Vec<u8>> {
-        std::fs::read(path)
+        let path = path.to_path_buf();
+        // 理由付き allow: offload ワーカースレッド内で実行（イベントループ非ブロック）。
+        #[allow(clippy::disallowed_methods)]
+        crate::runtime::offload::offload(move || std::fs::read(path)).await
     }
 
-    /// ファイル書き込み（コールドパスのため同期 I/O を使用）
+    /// ファイル書き込み（B-26: offload でイベントループ非ブロック）
+    ///
+    /// 親ディレクトリ作成・書き込み・fsync をまとめて専用ワーカースレッドで実行する。
     pub async fn write_file(path: &Path, data: Vec<u8>) -> io::Result<()> {
-        // 親ディレクトリを作成
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        use std::io::Write;
-        let mut file = std::fs::File::create(path)?;
-        file.write_all(&data)?;
-        file.sync_all()?;
-        Ok(())
+        let path = path.to_path_buf();
+        // 理由付き allow: offload ワーカースレッド内で実行（イベントループ非ブロック）。
+        #[allow(clippy::disallowed_methods)]
+        crate::runtime::offload::offload(move || {
+            // 親ディレクトリを作成
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            use std::io::Write;
+            let mut file = std::fs::File::create(&path)?;
+            file.write_all(&data)?;
+            file.sync_all()?;
+            Ok(())
+        })
+        .await
     }
 }
 

@@ -1063,6 +1063,8 @@ pub fn run() {
     #[cfg(feature = "http3")]
     if loaded_config.http3_enabled {
         // ワーカースレッドが Arc 参照をドロップするまで少し待機
+        // 理由付き allow: メインスレッドで一度だけ実行する起動後の待機（ワーカーの Arc ドロップ待ち）。イベントループ外。
+        #[allow(clippy::disallowed_methods)]
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         // LoadedConfig の証明書データをセキュアにゼロ化

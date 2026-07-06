@@ -275,6 +275,8 @@ fn json_escape(s: &str) -> String {
 /// OTLP/HTTP エンドポイントへ JSON を POST する（std::net、ブロッキング）。
 ///
 /// `<endpoint>/v1/metrics` に対して最小限の HTTP/1.1 リクエストを送る。
+// 理由付き allow: 専用エクスポータスレッドから呼ばれる同期送信（イベントループ外・データプレーン非経由）。
+#[allow(clippy::disallowed_methods)]
 fn post_otlp(config: &OtelConfig, body: &str) -> anyhow::Result<()> {
     let (host, port, path_base) = parse_endpoint(&config.endpoint)?;
     let path = format!("{}/v1/metrics", path_base.trim_end_matches('/'));
@@ -328,6 +330,8 @@ fn parse_endpoint(endpoint: &str) -> anyhow::Result<(String, u16, String)> {
 
 #[cfg(test)]
 mod tests {
+    // 理由付き allow: テストコードは同期 I/O・sleep を使用してよい（データプレーン非経由）。
+    #![allow(clippy::disallowed_methods)]
     use super::*;
     use std::io::Read;
     use std::net::TcpListener;

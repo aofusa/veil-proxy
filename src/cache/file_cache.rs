@@ -212,6 +212,8 @@ impl OpenFileCache {
     /// `canonicalize`（シンボリックリンク解決を含む）と `metadata` は同期 syscall であり、特に
     /// `canonicalize` は io_uring 非対応。ブロッキングオフロード（`runtime::offload`）で専用
     /// ワーカースレッドへ退避し、**イベントループをブロックしない**。MIME 推測も同所で実行する。
+    // 理由付き allow: 同期 FS は offload 閉包内（専用ワーカースレッド）で実行され、イベントループを塞がない。
+    #[allow(clippy::disallowed_methods)]
     pub(crate) async fn fetch_file_info(&self, path: &Path) -> Option<CachedFileInfo> {
         let path = path.to_path_buf();
         crate::runtime::offload::offload(move || {

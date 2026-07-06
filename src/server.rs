@@ -61,6 +61,8 @@ pub fn setup_signal_handler() {
 /// RELOAD_FLAG を監視し、シグナルを受け取ったら設定をリロードします。
 /// ワーカースレッドは CURRENT_CONFIG を参照するため、
 /// リロード後の新規リクエストは自動的に新しい設定を使用します。
+// 理由付き allow: 専用リロード監視スレッド上の待機（イベントループ外）。
+#[allow(clippy::disallowed_methods)]
 pub fn spawn_reload_thread() {
     thread::spawn(move || {
         info!("Configuration reload thread started");
@@ -112,6 +114,8 @@ pub fn spawn_reload_thread() {
 ///
 /// リロードはグローバル ArcSwap を差し替えるため、既存接続は影響を受けず、
 /// 新規ハンドシェイクのみが新しい証明書を使用する。
+// 理由付き allow: 専用 TLS リロードスレッド上の待機（イベントループ外）。
+#[allow(clippy::disallowed_methods)]
 pub fn spawn_tls_reloader(mut reloader: crate::tls_reload::TlsCertReloader, interval_secs: u64) {
     thread::spawn(move || {
         info!("TLS certificate reload thread started");
@@ -417,6 +421,8 @@ pub async fn buffer_exact_bytes_simple(
 /// - 期限切れエントリの削除
 /// - LRU eviction（メモリ使用量が閾値を超えた場合）
 /// - メトリクスの更新
+// 理由付き allow: 専用キャッシュクリーンアップスレッド上の待機（イベントループ外）。
+#[allow(clippy::disallowed_methods)]
 pub fn spawn_cache_cleanup_thread() {
     thread::spawn(move || {
         info!("Cache cleanup thread started (interval=60s)");
@@ -472,6 +478,8 @@ pub fn spawn_cache_cleanup_thread() {
 /// WASM モジュールの `on_tick` コールバックを定期的に呼び出します。
 /// tick period は各モジュールの `proxy_set_tick_period` 設定に基づきます。
 #[cfg(feature = "wasm")]
+// 理由付き allow: 専用 WASM tick スレッド上の待機（イベントループ外）。
+#[allow(clippy::disallowed_methods)]
 pub fn spawn_wasm_tick_thread() {
     thread::spawn(move || {
         info!("WASM tick thread started");
@@ -582,6 +590,8 @@ pub fn spawn_wasm_tick_thread() {
     });
 }
 
+// 理由付き allow: 専用ヘルスチェックスレッド上の待機（イベントループ外）。
+#[allow(clippy::disallowed_methods)]
 pub fn spawn_health_check_thread() {
     thread::spawn(move || {
         info!("Health check thread started");

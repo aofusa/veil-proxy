@@ -42,6 +42,11 @@
 //! あたり概ね数 µs〜数十 µs 程度（マシン・wasmtime 版・モジュール依存）。RSS は別途
 //! `/usr/bin/time -v` 等で計測すること。
 
+// 理由付き allow: ベンチマークハーネスは同期 I/O / sleep / std::net を意図的に使用する
+// （被計測のプロキシ本体とは別スレッド・別プロセス）。F-88 の disallowed-methods は
+// データプレーン向け規則のためベンチではファイル単位で許容する。
+#![allow(clippy::disallowed_methods)]
+
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::ServerName;
