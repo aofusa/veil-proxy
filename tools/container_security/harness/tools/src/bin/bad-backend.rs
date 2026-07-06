@@ -28,6 +28,39 @@ fn parse_content_length(head: &[u8]) -> usize {
     0
 }
 
+fn header_is_chunked(head: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(head);
+    for line in text.split("\r\n") {
+        if let Some((k, v)) = line.split_once(':') {
+            if k.trim().eq_ignore_ascii_case("transfer-encoding")
+                && v.to_ascii_lowercase().contains("chunked")
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// chunked ボディを終端（"0\r\n\r\n"）まで読み捨てる。`initial` はヘッダ読み取り時に
+/// 既にバッファへ入っているボディ先頭バイト。単純にバイト列上で終端シーケンスを探す。
+fn drain_chunked_body(conn: &mut TcpStream, initial: &[u8], buf: &mut [u8; 4096]) {
+    let mut acc: Vec<u8> = initial.to_vec();
+    let terminator: &[u8] = b"0\r\n\r\n";
+    loop {
+        if acc.windows(terminator.len()).any(|w| w == terminator) {
+            return;
+        }
+        if acc.len() > 1024 * 1024 {
+            return;
+        }
+        match conn.read(buf) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => acc.extend_from_slice(&buf[..n]),
+        }
+    }
+}
+
 fn handle(mut conn: TcpStream) {
     let _ = conn.set_read_timeout(Some(Duration::from_secs(5)));
     let mut req: Vec<u8> = Vec::new();
@@ -84,19 +117,25 @@ fn handle(mut conn: TcpStream) {
         // 何も返さず即クローズ。
     } else {
         // 既定: ボディを読み切ってから 200（differential の共有バックエンド用途）。
-        let cl = parse_content_length(&req);
-        if cl > 0 {
-            let header_end = req
-                .windows(4)
-                .position(|w| w == b"\r\n\r\n")
-                .map(|p| p + 4)
-                .unwrap_or(req.len());
-            let already = req.len().saturating_sub(header_end);
-            let mut remaining = cl.saturating_sub(already);
-            while remaining > 0 {
-                match conn.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => remaining = remaining.saturating_sub(n),
+        // Content-Length と Transfer-Encoding: chunked の両方に対応する（プロキシが
+        // どちらの framing で転送してきても早期応答して接続を落とさないようにする）。
+        let header_end = req
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|p| p + 4)
+            .unwrap_or(req.len());
+        if header_is_chunked(&req) {
+            drain_chunked_body(&mut conn, &req[header_end..], &mut buf);
+        } else {
+            let cl = parse_content_length(&req);
+            if cl > 0 {
+                let already = req.len().saturating_sub(header_end);
+                let mut remaining = cl.saturating_sub(already);
+                while remaining > 0 {
+                    match conn.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => remaining = remaining.saturating_sub(n),
+                    }
                 }
             }
         }
