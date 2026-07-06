@@ -52,16 +52,22 @@ run_h2spec() {
     return 1
 }
 
-# H2C プリフェイスを bash /dev/tcp で送り、何らかの応答が返ることを確認する。
+# H2C プリフェイスを bash /dev/tcp で送り、何らかの応答（SETTINGS フレーム等）が
+# 返ることを確認する。SETTINGS フレームは 64B 未満のため、固定長読み取り（head -c 64）
+# だと満たされずブロックしてタイムアウトする。dd の 1 回の read() で「到着した分だけ」
+# を読み、バイト数 > 0 を成功とみなす。
 verify_h2_preface() {
-    local resp=""
+    local nbytes=0
     if { exec 3<>"/dev/tcp/${VEIL_HOST}/${VEIL_H2C_PORT}"; } 2>/dev/null; then
-        printf 'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n' >&3 2>/dev/null || true
-        resp=$(timeout 3 head -c 64 <&3 2>/dev/null || true)
+        # 接続プリフェイス（マジック）に続けて空の SETTINGS フレーム
+        # （len=0 type=0x04 flags=0 stream=0）を送る。サーバはこれを受けて
+        # 自身の SETTINGS フレームを返す（マジックだけでは応答しない実装がある）。
+        printf 'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00' >&3 2>/dev/null || true
+        nbytes=$(timeout 3 dd bs=64 count=1 <&3 2>/dev/null | wc -c)
         exec 3>&- 3<&- 2>/dev/null || true
     fi
-    if [[ -n "${resp}" ]]; then
-        log "h2c_preface: ok"
+    if [[ "${nbytes}" -gt 0 ]]; then
+        log "h2c_preface: ok (${nbytes} bytes)"
     else
         log "h2c_preface: fail"
         return 1
