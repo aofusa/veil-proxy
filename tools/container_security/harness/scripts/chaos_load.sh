@@ -58,18 +58,13 @@ https_flood() {
     for pid in "${pids[@]}"; do wait "${pid}"; done
 }
 
-# 断続的な短接続（接続確立直後に切断）
+# 断続的な短接続（接続確立直後に切断）。bash の /dev/tcp で不完全リクエストを送って即切断する。
 connection_churn() {
     local count=0
     for ((i = 1; i <= 100; i++)); do
-        if python3 - <<'PY' 2>/dev/null; then
-import os, socket
-h = os.environ["VEIL_HOST"]
-p = int(os.environ["VEIL_HTTP_PORT"])
-s = socket.create_connection((h, p), timeout=1)
-s.send(b"GET / HTTP/1.1\r\nHost: x\r\n")
-s.close()
-PY
+        if { exec 3<>"/dev/tcp/${VEIL_HOST}/${VEIL_HTTP_PORT}"; } 2>/dev/null; then
+            printf 'GET / HTTP/1.1\r\nHost: x\r\n' >&3 2>/dev/null || true
+            exec 3>&- 3<&- 2>/dev/null || true
             count=$((count + 1))
         fi
     done

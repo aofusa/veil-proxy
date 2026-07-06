@@ -9,7 +9,7 @@ run_phase() {
             exec /scripts/health_check.sh
             ;;
         fuzz)
-            exec /scripts/fuzz_http.py
+            exec /usr/local/bin/fuzz-http
             ;;
         chaos)
             exec /scripts/chaos_load.sh
@@ -31,7 +31,7 @@ run_phase() {
             ;;
         all)
             /scripts/health_check.sh
-            /scripts/fuzz_http.py
+            /usr/local/bin/fuzz-http
             /scripts/h2spec_run.sh
             /scripts/chaos_load.sh
             /scripts/security_scan.sh

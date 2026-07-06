@@ -52,18 +52,15 @@ run_h2spec() {
     return 1
 }
 
+# H2C プリフェイスを bash /dev/tcp で送り、何らかの応答が返ることを確認する。
 verify_h2_preface() {
-    if python3 - <<'PY' 2>/dev/null; then
-import os, socket
-h = os.environ["VEIL_HOST"]
-p = int(os.environ["VEIL_H2C_PORT"])
-s = socket.create_connection((h, p), timeout=5)
-s.send(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
-s.settimeout(3)
-data = s.recv(64)
-s.close()
-exit(0 if data else 1)
-PY
+    local resp=""
+    if { exec 3<>"/dev/tcp/${VEIL_HOST}/${VEIL_H2C_PORT}"; } 2>/dev/null; then
+        printf 'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n' >&3 2>/dev/null || true
+        resp=$(timeout 3 head -c 64 <&3 2>/dev/null || true)
+        exec 3>&- 3<&- 2>/dev/null || true
+    fi
+    if [[ -n "${resp}" ]]; then
         log "h2c_preface: ok"
     else
         log "h2c_preface: fail"

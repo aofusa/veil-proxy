@@ -1,0 +1,21 @@
+# container_security ハーネス用の外形検証ツール（std のみ・依存ゼロで高速ビルド）。
+# 旧 Python スクリプト（fuzz_http.py / bad_backend_server.py）を Rust へ置換したもの。
+# ハーネス Docker イメージのビルドステージでビルドし、バイナリのみを実行イメージへコピーする。
+[workspace]
+
+[package]
+name = "veil-sec-tools"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "fuzz-http"
+path = "src/bin/fuzz-http.rs"
+
+[[bin]]
+name = "bad-backend"
+path = "src/bin/bad-backend.rs"
+
+[profile.release]
+opt-level = 2

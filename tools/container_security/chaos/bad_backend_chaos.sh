@@ -13,10 +13,10 @@ RESULTS_DIR="${RESULTS_DIR:-${REPO_ROOT}/tools/container_security/results}"
 DOCKER_DIR="${REPO_ROOT}/docker"
 NET_NAME="${NET_NAME:-veil-sec-test-net}"
 VEIL_IMAGE="${VEIL_IMAGE:-veil:glibc}"
+HARNESS_IMAGE="${HARNESS_IMAGE:-veil-sec-harness:local}"
 SECCOMP="${DOCKER_DIR}/assets/security/seccomp.json"
 BB_BACKEND="${BB_BACKEND:-veil-sec-badbackend}"
 BB_VEIL="${BB_VEIL:-veil-sec-badbackend-proxy}"
-SERVER_PY="${SCRIPT_DIR}/../harness/scripts/bad_backend_server.py"
 REPORT="${RESULTS_DIR}/bad_backend_report.txt"
 
 mkdir -p "${RESULTS_DIR}"
@@ -34,10 +34,10 @@ echo "bad_backend chaos start" | tee -a "${REPORT}"
 docker network inspect "${NET_NAME}" >/dev/null 2>&1 || docker network create "${NET_NAME}" >/dev/null
 cleanup_bb
 
-# 1) モックバックエンド起動（python 標準ライブラリのみ）
+# 1) モックバックエンド起動（harness イメージの Rust 製 bad-backend）
 docker run -d --name "${BB_BACKEND}" --network "${NET_NAME}" \
-    -v "${SERVER_PY}:/srv/bad_backend_server.py:ro" \
-    python:3-alpine python3 /srv/bad_backend_server.py >/dev/null
+    --entrypoint /usr/local/bin/bad-backend \
+    "${HARNESS_IMAGE}" >/dev/null
 
 # バックエンド IP を解決して upstream に埋め込む。Landlock/sandbox 下では glibc NSS 経由の
 # 実行時 DNS 解決が不安定なため、既存ハーネス（prepare_veil_test_config）同様に IP 直指定する。

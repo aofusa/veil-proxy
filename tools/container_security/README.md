@@ -106,7 +106,7 @@ FUZZ_RUNS=2000 FUZZ_MAX_TIME=120 ./tools/container_security/fuzz/run_libfuzzer.s
 | 0 起動 | `lib/common.sh` | ネットワーク作成、ハーネスビルド、Veil 起動、ヘルス待ち |
 | 0b カオス基盤 | `chaos/toxiproxy_setup.sh` | whoami backend + Toxiproxy 2.9（API :8474、proxy :8480） |
 | 0c 実行時セキュリティ | `validate_veil_image_security` | ReadonlyRootfs、seccomp、特権降下ログ |
-| 1 HTTP ファジング | `harness/scripts/fuzz_http.py` | 不正ヘッダー・不完全リクエストのブラックボックス送信 |
+| 1 HTTP ファジング | `harness/tools`（Rust `fuzz-http`） | 不正ヘッダー・不完全リクエストのブラックボックス送信 |
 | 1b libFuzzer | `fuzz/run_libfuzzer.sh` | HPACK / TOML / HTTP/2 フレーム / HTTP/1 ヘッダー境界（オプション） |
 | 1c libFuzzer(ASAN) | `fuzz/run_libfuzzer_asan.sh` | 上記を AddressSanitizer + 永続 corpus で実行（F-71、既定 SKIP） |
 | 1d libFuzzer(TSAN) | `fuzz/run_libfuzzer_tsan.sh` | ThreadSanitizer でデータ競合検出（F-71、既定 SKIP） |
@@ -254,9 +254,10 @@ tools/container_security/
 │   ├── capabilities.sh    # io_uring / kTLS 検出
 │   └── report.sh          # JSON / JUnit 集約
 ├── harness/
-│   ├── Dockerfile         # debian + curl + h2spec + python3
+│   ├── Dockerfile         # rust builder + debian + curl + h2spec + openssl
+│   ├── tools/             # Rust 製ツール（fuzz-http / bad-backend、std のみ）
 │   ├── fixtures/seeds/    # HTTP ファジングシード
-│   └── scripts/           # 各フェーズの実行スクリプト
+│   └── scripts/           # 各フェーズの実行スクリプト（bash + openssl）
 └── results/               # レポート出力（gitignore、.gitkeep のみ追跡）
 ```
 

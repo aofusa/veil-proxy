@@ -45,3 +45,6 @@ packaging/rpm/RPMS/
 packaging/rpm/SPECS/
 packaging/rpm/SRPM/
 packaging/rpm/SOURCES/rootfs/
+# container_security ハーネス Rust ツールのビルド成果物
+tools/container_security/harness/tools/target/
+tools/container_security/harness/tools/Cargo.lock
