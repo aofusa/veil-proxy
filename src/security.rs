@@ -2580,10 +2580,11 @@ mod tests {
     ///
     /// PROT_EXEC 引数フィルタ（`test_seccomp_prot_exec_argument_filter`）が「許可 syscall の
     /// 引数レベル拒否」を見るのに対し、本テストは「そもそも許可リストに無い syscall」が
-    /// - Filter モードで `EPERM`（`SECCOMP_RET_ERRNO`）
-    /// - Strict モードで `SIGSYS` 即死（`SECCOMP_RET_KILL_PROCESS`）
-    /// になることを検証する。ptrace(2)=101 は allowlist に含まれない
-    /// （`test_allowed_syscalls_no_dangerous` 参照）ため、無害な禁止 syscall プローブに使う。
+    /// Filter モードで `EPERM`（`SECCOMP_RET_ERRNO`）、Strict モードで `SIGSYS` 即死
+    /// （`SECCOMP_RET_KILL_PROCESS`）になることを検証する。
+    ///
+    /// ptrace(2)=101 は allowlist に含まれない（`test_allowed_syscalls_no_dangerous` 参照）ため、
+    /// 無害な禁止 syscall プローブに使う。
     #[test]
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn test_seccomp_denies_disallowed_syscall() {
