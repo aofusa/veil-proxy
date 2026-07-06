@@ -6,7 +6,6 @@
 //! 既存のテストロジックとの互換性のため、HTTP/1.1経由のgRPCリクエストもサポート
 
 use super::http1_client::Http1TestClient;
-use bytes::Bytes;
 use http::uri::Uri;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
@@ -137,7 +136,7 @@ impl GrpcTestClient {
             }
         }
 
-        let rustls_config = ClientConfig::builder()
+        let _rustls_config = ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
             .with_no_client_auth();

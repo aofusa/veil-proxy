@@ -99,12 +99,12 @@ fn handle(mut conn: TcpStream) {
     } else if starts(b"/cl-too-small") {
         // Content-Length < 実ボディ（余剰バイト＝スマグリング誘発）。
         let mut resp = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n".to_vec();
-        resp.extend(std::iter::repeat(b'X').take(500));
+        resp.resize(resp.len() + 500, b'X');
         let _ = conn.write_all(&resp);
     } else if starts(b"/huge-headers") {
         // 巨大ヘッダー（256 KB）。
         let mut resp = b"HTTP/1.1 200 OK\r\nX-Huge: ".to_vec();
-        resp.extend(std::iter::repeat(b'A').take(256 * 1024));
+        resp.resize(resp.len() + 256 * 1024, b'A');
         resp.extend_from_slice(b"\r\nContent-Length: 2\r\n\r\nok");
         let _ = conn.write_all(&resp);
     } else if starts(b"/bad-status") {

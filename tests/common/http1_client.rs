@@ -4,9 +4,8 @@
 //! TLS対応の非同期HTTP/1.1リクエストを送信
 
 use bytes::Bytes;
-use http::{Method, Request, Response, StatusCode, Uri};
-use http_body_util::{BodyExt, Empty, Full};
-use hyper::body::Incoming;
+use http::{Method, Request, Uri};
+use http_body_util::{BodyExt, Full};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use rustls::ClientConfig;

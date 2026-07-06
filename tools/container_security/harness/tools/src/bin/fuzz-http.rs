@@ -27,7 +27,7 @@ fn builtin_seeds() -> Vec<Vec<u8>> {
     ];
     // 巨大ヘッダ（Host: A*8192）
     let mut big = b"GET / HTTP/1.1\r\nHost: ".to_vec();
-    big.extend(std::iter::repeat(b'A').take(8192));
+    big.resize(big.len() + 8192, b'A');
     big.extend_from_slice(b"\r\n\r\n");
     v.push(big);
     v.push(vec![0x00, 0x01, 0x02, 0xff, 0xfe]);

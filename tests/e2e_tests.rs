@@ -60,7 +60,6 @@ use common::grpc_client::GrpcTestClient;
 
 // E2E環境のポート設定（e2e_setup.shと一致させる）
 const PROXY_PORT: u16 = 8443; // プロキシHTTPSポート
-const PROXY_HTTP_PORT: u16 = 8080; // プロキシHTTPポート（HTTPSリダイレクト用）
 const PROXY_H2C_PORT: u16 = 8081; // H2C (HTTP/2 Cleartext) ポート
 const PROXY_L4_PORT: u16 = 8444; // L4 TCP プロキシ（TLS パススルー、F-30）
 const PROXY_HTTP3_PORT: u16 = 8443; // HTTP/3ポート（デフォルトではHTTPSポートと同じ）
@@ -947,7 +946,7 @@ async fn test_concurrent_requests() {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
-    use std::thread;
+    
 
     let success_count = Arc::new(AtomicUsize::new(0));
     let total_requests = 20;
@@ -1884,7 +1883,7 @@ async fn test_http3_basic_connection() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (mut client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
     {
         Ok(c) => c,
         Err(e) => {
@@ -1941,7 +1940,7 @@ async fn test_http3_get_request() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (mut client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
     {
         Ok(c) => c,
         Err(e) => {
@@ -1990,7 +1989,7 @@ async fn test_http3_post_request() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (mut client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
     {
         Ok(c) => c,
         Err(e) => {
@@ -2078,7 +2077,7 @@ async fn test_http3_multiple_streams() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (mut client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
     {
         Ok(c) => c,
         Err(e) => {
@@ -2151,7 +2150,7 @@ async fn test_http3_proxy_forwarding() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (mut client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
     {
         Ok(c) => c,
         Err(e) => {
@@ -2207,7 +2206,7 @@ async fn test_http3_proxy_compression() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (mut client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
     {
         Ok(c) => c,
         Err(e) => {
@@ -2284,7 +2283,7 @@ async fn test_http3_stream_priority() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (mut client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
     {
         Ok(c) => c,
         Err(e) => {
@@ -2329,7 +2328,7 @@ async fn test_http3_stream_cancellation() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (mut client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
     {
         Ok(c) => c,
         Err(e) => {
@@ -2373,7 +2372,7 @@ async fn test_http3_bidirectional_streams() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (mut client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
     {
         Ok(c) => c,
         Err(e) => {
@@ -2421,7 +2420,7 @@ async fn test_http3_proxy_header_manipulation() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (mut client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
     {
         Ok(c) => c,
         Err(e) => {
@@ -2483,7 +2482,7 @@ async fn test_http3_proxy_load_balancing() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (mut client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
     {
         Ok(c) => c,
         Err(e) => {
@@ -2532,7 +2531,7 @@ async fn test_http3_stream_timeout() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (mut client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
     {
         Ok(c) => c,
         Err(e) => {
@@ -2571,7 +2570,7 @@ async fn test_http3_invalid_frame() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (mut client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
     {
         Ok(c) => c,
         Err(e) => {
@@ -2606,7 +2605,7 @@ async fn test_http3_backend_failure() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (mut client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
     {
         Ok(c) => c,
         Err(e) => {
@@ -2649,7 +2648,7 @@ async fn test_http3_tls_handshake() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版、TLS 1.3ハンドシェイクを含む）
-    let (mut client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
     {
         Ok(c) => {
             eprintln!("TLS 1.3 handshake completed successfully");
@@ -2740,7 +2739,7 @@ async fn test_http3_connection_close() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (mut client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
     {
         Ok(c) => c,
         Err(e) => {
@@ -2847,7 +2846,7 @@ async fn test_http3_large_response_body() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (mut client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
     {
         Ok(c) => c,
         Err(e) => {
@@ -2891,7 +2890,7 @@ async fn test_http3_chunked_response() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (mut client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
     {
         Ok(c) => c,
         Err(e) => {
@@ -3263,7 +3262,7 @@ async fn test_http3_throughput() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (mut client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
     {
         Ok(c) => c,
         Err(e) => {
@@ -3326,7 +3325,7 @@ async fn test_http3_latency() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (mut client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
     {
         Ok(c) => c,
         Err(e) => {
@@ -3617,7 +3616,7 @@ async fn test_http3_qpack_compression() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (mut client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
     {
         Ok(c) => c,
         Err(e) => {
@@ -4835,7 +4834,7 @@ async fn test_connection_limit_enforcement() {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
-    use std::thread;
+    
 
     let success_count = Arc::new(AtomicUsize::new(0));
     let total_connections = 100;
@@ -6343,7 +6342,7 @@ async fn test_ktls_multiple_connections() {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
-    use std::thread;
+    
 
     let success_count = Arc::new(AtomicUsize::new(0));
     let total_connections = 10;
@@ -7207,7 +7206,7 @@ async fn test_concurrent_connection_stress() {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
-    use std::thread;
+    
 
     let success_count = Arc::new(AtomicUsize::new(0));
     let error_count = Arc::new(AtomicUsize::new(0));
@@ -11186,7 +11185,7 @@ async fn test_concurrent_requests_different_paths() {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
-    use std::thread;
+    
 
     let success_count = Arc::new(AtomicUsize::new(0));
     let total_requests = 30;
@@ -11241,7 +11240,7 @@ async fn test_concurrent_requests_mixed_methods() {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
-    use std::thread;
+    
 
     let success_count = Arc::new(AtomicUsize::new(0));
     let total_requests = 20;
@@ -11297,7 +11296,7 @@ async fn test_concurrent_requests_with_headers() {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
-    use std::thread;
+    
 
     let success_count = Arc::new(AtomicUsize::new(0));
     let total_requests = 25;
@@ -15079,7 +15078,7 @@ mod wasm_tests {
 
         // 同時実行時の動作を確認
         // 複数のリクエストを同時に送信して、WASMモジュールが正常に動作することを確認
-        use std::thread;
+        
 
         let mut handles = Vec::new();
         let num_requests = 10;

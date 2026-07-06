@@ -5,11 +5,11 @@
 
 use bytes::Bytes;
 use h2::client::SendRequest;
-use http::{Request, Response, StatusCode};
+use http::Request;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+use tokio_rustls::rustls::ClientConfig;
 use tokio_rustls::TlsConnector;
 
 /// HTTP/2テストクライアント

@@ -61,10 +61,6 @@ impl ErrorHttpServer {
             shutdown,
         }
     }
-
-    fn port(&self) -> u16 {
-        self.addr.port()
-    }
 }
 
 impl Drop for ErrorHttpServer {
