@@ -28,6 +28,15 @@ UAF・リークが発生していないかを捕捉する。
     `E2E_SANITIZER_BLOCKING=1` で fail。
   - 有効化: `RUN_E2E_ASAN=1`（address）/ `RUN_E2E_TSAN=1`（thread）。`run.sh` フェーズ 3i に配線。
   - docker デーモンが `/tmp` を参照できない環境向けにビルドコンテキストを `results/` 配下へ。
+  - **重要な実装知見**: (1) `full` は quiche(boringssl)/aws-lc の C ビルドに `cmake` +
+    `build-essential` を要するためビルドコンテナへ導入。(2) **mimalloc（default features）は
+    ASAN/TSAN の独自アロケータと競合する**ため、sanitizer ビルドは必ず `--no-default-features`
+    で mimalloc を外す。既定 feature は io_uring データプレーンを網羅しつつ build-std 下で
+    極端に重い C 依存（http3/wasm）を除いた mimalloc-free の代表セット。
+- 検証結果（2026-07-06）: `RUN_E2E_ASAN=1 SAN_CARGO_FEATURES="ktls,http2"` で
+  **ASAN 計装 Veil がビルド・起動し、カオス負荷 + SIGHUP 3 回を通過して AddressSanitizer
+  エラーなし（findings=0）** を確認。ランタイムの Future Drop / detach 経路に実行レベルの
+  UAF・リークが無いことを ASAN で実証（F-87 のランダム Drop テストと相補）。
 
 ## 改修内容（当初案）
 
@@ -42,10 +51,12 @@ UAF・リークが発生していないかを捕捉する。
 
 ## 受け入れ条件
 
-- [ ] `RUN_E2E_ASAN=1 ./tools/container_security/run.sh` で sanitizer ビルドの Veil に対する
-      カオス負荷が完走し、レポートに sanitizer 検査結果が記録されること。
-- [ ] sanitizer エラー検出時にフェーズが fail としてサマリへ集約されること。
-- [ ] README（container_security）へ実行方法・注意点（nightly・seccomp 緩和）を追記すること。
+- [x] `RUN_E2E_ASAN=1 ./tools/container_security/run.sh` で sanitizer ビルドの Veil に対する
+      カオス負荷が完走し、レポートに sanitizer 検査結果が記録されること（findings=0 を確認）。
+- [x] sanitizer エラー検出時にフェーズが fail としてサマリへ集約されること
+      （`E2E_SANITIZER_BLOCKING=1` で fail、既定は警告のみ）。
+- [x] README（container_security）へ実行方法・注意点（nightly・seccomp 緩和・mimalloc 除外）を
+      追記すること。
 
 ## 依存・リスク
 

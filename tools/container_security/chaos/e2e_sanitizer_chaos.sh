@@ -19,7 +19,13 @@ NET_NAME="${NET_NAME:-veil-sec-test-net}"
 RUST_IMAGE="${RUST_FUZZ_IMAGE:-rustlang/rust:nightly-bookworm}"
 SAN_CONTAINER="${SAN_CONTAINER:-veil-sec-san}"
 SAN_RUN_IMAGE="veil-sec-san:local"
-SAN_CARGO_FEATURES="${SAN_CARGO_FEATURES:-full}"
+# sanitizer ビルドの feature（`--no-default-features` で指定）。
+# 重要: mimalloc（default features）は ASAN/TSAN の独自アロケータと競合するため **必ず外す**。
+# 既定は io_uring データプレーン（TCP/TLS/HTTP1/2/L4 splice/cache/buffering）を網羅しつつ、
+# build-std 下で極端に重い C 依存（http3=quiche/boringssl・wasm=wasmtime）を除いた代表セット。
+# 網羅性を上げたい場合は full 相当（mimalloc 抜き）を明示指定する:
+#   SAN_CARGO_FEATURES="ktls,http2,http3,grpc-full,wasm,opentelemetry,compression,cache,metrics,websocket,rate-limit,buffering,admin,access-log,l4-proxy"
+SAN_CARGO_FEATURES="${SAN_CARGO_FEATURES:-ktls,http2,cache,buffering,compression,metrics,websocket,rate-limit,access-log,l4-proxy}"
 SAN_LOAD_SECONDS="${SAN_LOAD_SECONDS:-20}"
 SAN_TARGET="${SAN_TARGET:-x86_64-unknown-linux-gnu}"
 REPORT="${RESULTS_DIR}/e2e_sanitizer_report.txt"
@@ -63,9 +69,14 @@ if ! docker run --rm \
     "${RUST_IMAGE}" \
     bash -c "
         set -euo pipefail
+        # full features は quiche(boringssl) のビルドに cmake + C/C++ ツールチェインを要する。
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update >/dev/null 2>&1 && \
+            apt-get install -y --no-install-recommends cmake build-essential perl >/dev/null 2>&1 || true
         rustup component add rust-src 2>/dev/null || true
+        # --no-default-features で mimalloc を確実に外す（ASAN の独自アロケータと競合するため）。
         cargo build -Zbuild-std --target ${SAN_TARGET} \
-            --features '${SAN_CARGO_FEATURES}' --bin veil 2>&1 | tail -20
+            --no-default-features --features '${SAN_CARGO_FEATURES}' --bin veil 2>&1 | tail -20
     " >>"${REPORT}" 2>&1; then
     echo "e2e_sanitizer: sanitizer ビルドに失敗しスキップ（ログ: ${REPORT}）" | tee -a "${REPORT}"
     exit 0
