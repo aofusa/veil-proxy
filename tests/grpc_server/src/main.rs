@@ -60,7 +60,7 @@ impl TestService for MyTestService {
 
     type BidirectionalStreamingStream = Pin<Box<dyn Stream<Item = Result<SimpleResponse, Status>> + Send>>;
 
-    async fn bidirectional_streaming(&self, mut request: Request<tonic::Streaming<SimpleRequest>>) -> Result<Response<Self::BidirectionalStreamingStream>, Status> {
+    async fn bidirectional_streaming(&self, request: Request<tonic::Streaming<SimpleRequest>>) -> Result<Response<Self::BidirectionalStreamingStream>, Status> {
         let mut stream = request.into_inner();
         let output = async_stream::try_stream! {
             while let Some(msg) = stream.message().await? {

@@ -441,7 +441,8 @@ impl SeccompMode {
     /// 文字列からSeccompModeを解析
     pub fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
-            "disabled" | "off" | "none" => SeccompMode::Disabled,
+            // 未設定（空文字）は既定の無効。警告は出さない（設定省略は正当なため）。
+            "" | "disabled" | "off" | "none" => SeccompMode::Disabled,
             "log" | "audit" => SeccompMode::Log,
             "strict" | "kill" => SeccompMode::Strict,
             "filter" | "errno" | "deny" => SeccompMode::Filter,

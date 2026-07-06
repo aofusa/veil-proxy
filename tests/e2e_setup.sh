@@ -174,14 +174,17 @@ prepare_fixtures() {
     # 必要なディレクトリの作成
     mkdir -p "${FIXTURES_DIR}/wasm"
     mkdir -p "/tmp/veil_buffer"
+    # cp -p でソースの mtime を維持する。維持しないと毎回コピー先 .wasm の mtime が
+    # 更新され、前回生成の AOT キャッシュ（<path>.cwasm）が「古い」と判定されて
+    # 毎回 WASM を再コンパイルしてしまう（起動が数十秒遅くなる）。
     if [ -f "${SCRIPT_DIR}/wasm/header_filter.wasm" ]; then
-        cp "${SCRIPT_DIR}/wasm/header_filter.wasm" "${FIXTURES_DIR}/wasm/header_filter.wasm"
+        cp -p "${SCRIPT_DIR}/wasm/header_filter.wasm" "${FIXTURES_DIR}/wasm/header_filter.wasm"
         log_info "WASM module header_filter.wasm copied"
     else
         log_warn "WASM module header_filter.wasm not found at ${SCRIPT_DIR}/wasm/header_filter.wasm"
     fi
     if [ -f "${SCRIPT_DIR}/wasm/http_call_filter.wasm" ]; then
-        cp "${SCRIPT_DIR}/wasm/http_call_filter.wasm" "${FIXTURES_DIR}/wasm/http_call_filter.wasm"
+        cp -p "${SCRIPT_DIR}/wasm/http_call_filter.wasm" "${FIXTURES_DIR}/wasm/http_call_filter.wasm"
         log_info "WASM module http_call_filter.wasm copied"
     fi
 }
@@ -348,8 +351,13 @@ cipher_suites = [
 auto_reload = true
 reload_interval_secs = 60
 
+# 注意: level は "info"。"debug" にすると WASM AOT コンパイル時に
+# cranelift/wasmtime の内部 DEBUG ログ（数万行）が ftlog 経由で出力され、
+# モジュール 1 つあたり数十秒かかって起動レディネス待ち（数秒）を超過し、
+# 「Proxy failed to start」の一過性エラーを起こす。E2E テストはプロキシの
+# debug ログを参照しないため info で十分。
 [logging]
-level = "debug"
+level = "info"
 
 [prometheus]
 enabled = true
@@ -1231,18 +1239,14 @@ start_servers() {
     echo $! > "${FIXTURES_DIR}/proxy.pid"
     log_info "Proxy started on ports ${PROXY_HTTPS_PORT}/${PROXY_HTTP_PORT} (PID: $!)"
     
-    # プロキシ起動待機（動的）
-    log_info "Waiting for proxy to be ready..."
-    if wait_for_server "http://127.0.0.1:${PROXY_HTTP_PORT}/__metrics" "Proxy" 15; then
+    # プロキシ起動待機（WASM AOT コンパイル対応のデッドライン方式）
+    log_info "Waiting for proxy to be ready (allowing for WASM AOT compile on cold cache)..."
+    if wait_for_proxy_ready; then
         log_info "Proxy is ready"
     else
-        if wait_for_server "https://127.0.0.1:${PROXY_HTTPS_PORT}/__metrics" "Proxy HTTPS" 15; then
-            log_info "Proxy HTTPS is ready"
-        else
-            log_warn "Proxy may not be fully ready, continuing..."
-        fi
+        log_warn "Proxy may not be fully ready, continuing..."
     fi
-    
+
     log_info "All servers started"
 }
 
@@ -1340,13 +1344,37 @@ check_port_conflicts() {
     return 0
 }
 
+# プロキシの起動待機（WASM AOT コンパイル対応・デッドライン方式）
+#
+# WASM モジュールは初回起動時に cranelift で AOT コンパイルされ .cwasm キャッシュへ
+# 書き出される。コールドキャッシュ（初回／wasm 再ビルド後）ではモジュール 1 つあたり
+# 数十秒かかることがあり、固定回数リトライ（数秒）では起動前にタイムアウトして
+# 「Proxy failed to start」の一過性エラーになる。ウォームキャッシュでは 1 秒未満で復帰する。
+# HTTP・HTTPS いずれかの __metrics が応答すればレディとみなす。
+wait_for_proxy_ready() {
+    local deadline_secs="${PROXY_READY_TIMEOUT:-180}"
+    local start_ts
+    start_ts=$(date +%s)
+    while true; do
+        if curl -ks "http://127.0.0.1:${PROXY_HTTP_PORT}/__metrics" > /dev/null 2>&1 \
+            || curl -ks "https://127.0.0.1:${PROXY_HTTPS_PORT}/__metrics" > /dev/null 2>&1; then
+            return 0
+        fi
+        if [ $(( $(date +%s) - start_ts )) -ge "$deadline_secs" ]; then
+            log_error "Proxy failed to become ready within ${deadline_secs}s (WASM AOT compile?)"
+            return 1
+        fi
+        sleep 0.5
+    done
+}
+
 # サーバーの起動を待機（リトライ付き）
 wait_for_server() {
     local url=$1
     local name=$2
     local max_attempts=${3:-30}  # デフォルト30回
     local attempt=0
-    
+
     while [ $attempt -lt $max_attempts ]; do
         if curl -ks "$url" > /dev/null 2>&1; then
             return 0
@@ -1354,7 +1382,7 @@ wait_for_server() {
         attempt=$((attempt + 1))
         sleep 0.2
     done
-    
+
     log_error "$name failed to start after $max_attempts attempts"
     return 1
 }
@@ -1440,19 +1468,14 @@ health_check() {
     # fi
     log_info "H2C Backend: Skipping health check (intermittent curl failure, but server should be up)"
     
-    # プロキシ（HTTPポート - リダイレクト無効なのでHTTPで接続可能）
-    if wait_for_server "http://127.0.0.1:${PROXY_HTTP_PORT}/__metrics" "Proxy HTTP" 30; then
-        log_info "Proxy HTTP: OK"
+    # プロキシ（WASM AOT コンパイル対応のデッドライン方式で待機）
+    if wait_for_proxy_ready; then
+        log_info "Proxy: OK"
     else
-        # HTTPSでも確認
-        if wait_for_server "https://127.0.0.1:${PROXY_HTTPS_PORT}/__metrics" "Proxy HTTPS" 30; then
-            log_info "Proxy HTTPS: OK"
-        else
-            log_error "Proxy: FAILED"
-            return 1
-        fi
+        log_error "Proxy: FAILED"
+        return 1
     fi
-    
+
     log_info "All servers healthy"
 }
 
