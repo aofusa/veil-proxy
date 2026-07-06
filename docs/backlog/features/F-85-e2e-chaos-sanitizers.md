@@ -11,7 +11,25 @@ UAF 等）を実行レベルで検出できていない。`chaos_load.sh` の E2
 オーケストレータに新設し、カーネルと密に連携する経路（Future キャンセル・切断・リロード）で
 UAF・リークが発生していないかを捕捉する。
 
-## 改修内容
+## 実装済み（2026-07-06）
+
+- `tools/container_security/chaos/e2e_sanitizer_chaos.sh` を新設（既定 SKIP）:
+  - nightly コンテナで `RUSTFLAGS="-Zsanitizer=<address|thread>"` + `cargo build -Zbuild-std
+    --features full --bin veil` により sanitizer 計装済み Veil バイナリを生成
+    （std ごと計装し io_uring 周辺の unsafe を確実にカバー）。
+  - バイナリを `debian:bookworm-slim` + `llvm`（symbolizer）へパッケージし、
+    `--security-opt seccomp=unconfined`（ASAN ランタイムの mmap/シグナル操作と干渉するため
+    緩和）+ `ASAN_OPTIONS`/`TSAN_OPTIONS` で起動。
+  - カオス負荷: 高並行 HTTP/HTTPS（curl 並列 churn）+ 負荷中の SIGHUP リロード 3 回 +
+    追加の短時間接続 churn。最後に SIGTERM で正常終了させ LeakSanitizer のプロセス終了時
+    レポートを促す。
+  - 判定: コンテナログを `ERROR: AddressSanitizer|heap-use-after-free|heap-buffer-overflow|
+    LeakSanitizer`（ASAN）/ `ThreadSanitizer|data race`（TSAN）で検査し、検出時 findings=1。
+    `E2E_SANITIZER_BLOCKING=1` で fail。
+  - 有効化: `RUN_E2E_ASAN=1`（address）/ `RUN_E2E_TSAN=1`（thread）。`run.sh` フェーズ 3i に配線。
+  - docker デーモンが `/tmp` を参照できない環境向けにビルドコンテキストを `results/` 配下へ。
+
+## 改修内容（当初案）
 
 - sanitizer ビルドの Veil コンテナイメージを作る仕組み（例: `RUSTFLAGS="-Zsanitizer=address"`
   + nightly ビルドの Dockerfile ステージ or 専用ビルドスクリプト）。

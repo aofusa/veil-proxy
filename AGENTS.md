@@ -61,6 +61,7 @@ AI エージェントおよびコントリビュータ向けの **最小指針**
 
 - 既存に合わせる（多くは **日本語のモジュール／doc コメント**）。英語への統一リファクタはしない。
 - `cargo fmt`、原則 `cargo clippy`。`#[allow(clippy::…)]` を同等の論拠なく増やさない。
+- **ホットパスのブロッキング検出（[clippy.toml](clippy.toml) の `disallowed-methods`）**: 同期 `std::fs`・`std::thread::sleep`・ブロッキング `std::net` はデータプレーンで clippy エラー。正当な利用（`runtime::offload` 閉包内・専用スレッド・起動/リロードのコールドパス・テスト/ベンチ）は **理由コメント付きの個別 `#[allow(clippy::disallowed_methods)]`** で明示する（理由なしの追加は禁止）。
 - 依存追加は慎重に。[Cargo.toml](Cargo.toml) の記法と feature を尊重。`ftlog` のレベル・頻度は既存に揃える。
 
 ---

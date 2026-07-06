@@ -3450,11 +3450,23 @@ Veil includes comprehensive test suites covering unit tests, integration tests, 
 
 | Test Type | Count | Status |
 |-----------|-------|--------|
-| **Unit Tests** (lib) | 692 | ✅ All passing |
-| **Integration Tests** (`integration_tests` + property tests) | 40+ | ✅ All passing |
+| **Unit Tests** (lib) | 694 | ✅ All passing |
+| **Integration Tests** (`integration_tests` + property + cancellation-safety) | 55+ | ✅ All passing |
 | **E2E Tests** (`e2e_tests`) | 419 | ✅ All passing |
-| **Fuzz Targets** (`cargo fuzz`) | 5+ | ✅ No crashes |
+| **Fuzz Targets** (`cargo fuzz`) | 8 | ✅ No crashes |
 | **Benchmarks** | 13 files | ✅ Ready |
+
+The fuzz targets include `io_uring_executor`, which injects arbitrary pseudo-CQE sequences
+into the runtime's completion-dispatch path (`src/runtime/executor.rs`) to assert the op-table
+never panics, leaks slots, or runs a drop guard more than once — complementing the
+`runtime_cancellation_test` integration test that randomly drops in-flight recv/send/accept/timer
+futures on a live ring.
+
+Hot-path discipline (the "no blocking calls on the event loop" rule) is enforced at the AST level
+by clippy `disallowed-methods` in [`clippy.toml`](clippy.toml): synchronous `std::fs`,
+`std::thread::sleep`, and blocking `std::net` sockets are rejected in data-plane code, with
+reason-annotated `#[allow]` at the legitimate call sites (offload closures, dedicated threads,
+startup/reload cold paths, tests/benches).
 
 The unit-test count is verified inside the release image build (`docker/Dockerfile.musl`
 runs `cargo test --lib --features full` — 692 passed). In addition to the in-repo tests,
