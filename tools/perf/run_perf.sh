@@ -74,13 +74,22 @@ parse_h2load() { # logfile -> "reqps throughput latmean non2xx"
 run_load() { # target_label config_label container has_http2
     local label="$1" cfg="$2" c="$3" h2="$4" iter reqps transfer latavg latp99 non2xx cpu mem tput latmean
 
+    # compression 構成は Accept-Encoding を送らないと圧縮経路を通らないため付与する。
+    local wrk_extra=() h2_extra=()
+    case "$cfg" in
+        *feat_compression*)
+            wrk_extra=(-H "Accept-Encoding: gzip, br, zstd")
+            h2_extra=(-H "accept-encoding: gzip, br, zstd")
+            ;;
+    esac
+
     # ウォームアップ（JIT/ページキャッシュ/接続確立コストを計測外にする）
     docker run --rm --network $NET $WRK_IMG -t2 -c10 -d2s "https://$c:443/" >/dev/null 2>&1
 
     # HTTP/1.1 (wrk) × ITERATIONS
     for iter in $(seq 1 "$ITERATIONS"); do
         ( sleep 2; sample_stats "$c" > "$LOGDIR/${label}_${cfg}_wrk_${iter}.stats" ) &
-        docker run --rm --network $NET $WRK_IMG $WRK_ARGS "https://$c:443/" \
+        docker run --rm --network $NET $WRK_IMG $WRK_ARGS "${wrk_extra[@]}" "https://$c:443/" \
             > "$LOGDIR/${label}_${cfg}_wrk_${iter}.log" 2>&1
         wait
         read reqps transfer latavg latp99 non2xx < <(parse_wrk "$LOGDIR/${label}_${cfg}_wrk_${iter}.log")
@@ -93,7 +102,7 @@ run_load() { # target_label config_label container has_http2
         docker run --rm --network $NET --entrypoint h2load $H2_IMG -n 1000 -c 10 "https://$c:443/" >/dev/null 2>&1
         for iter in $(seq 1 "$ITERATIONS"); do
             ( sleep 1; sample_stats "$c" > "$LOGDIR/${label}_${cfg}_h2_${iter}.stats" ) &
-            docker run --rm --network $NET --entrypoint h2load $H2_IMG $H2_ARGS "https://$c:443/" \
+            docker run --rm --network $NET --entrypoint h2load $H2_IMG $H2_ARGS "${h2_extra[@]}" "https://$c:443/" \
                 > "$LOGDIR/${label}_${cfg}_h2_${iter}.log" 2>&1
             wait
             read reqps tput latmean non2xx < <(parse_h2load "$LOGDIR/${label}_${cfg}_h2_${iter}.log")
@@ -131,6 +140,16 @@ wait_ready() { # container
     return 1
 }
 
+# ---- 逆プロキシ系（feat_proxy / feat_buffering）用の上流バックエンド ----
+# veil の Proxy 経路を計測するため、同一 www を配信する nginx を perf-backend として起動する。
+echo "### perf-backend (upstream for proxy/buffering configs)"
+docker rm -f perf-backend >/dev/null 2>&1
+docker run -d --rm --network $NET --network-alias perf-backend \
+    -v "$HERE/nginx/nginx-backend.conf:/etc/nginx/nginx.conf:ro" \
+    -v "$ASSETS/www:/var/www:ro" \
+    --name perf-backend nginx:alpine >/dev/null 2>&1 || \
+    echo "!! perf-backend 起動失敗（proxy/buffering 構成はスキップされ得る）" >&2
+
 # ---- nginx baseline ----
 echo "### nginx"
 docker rm -f nginx-perf >/dev/null 2>&1
@@ -161,6 +180,8 @@ for build in glibc musl; do
         docker rm -f veil-container >/dev/null 2>&1
     done
 done
+
+docker rm -f perf-backend >/dev/null 2>&1
 
 echo "=== 生データ: $RESULTS_RAW（${ITERATIONS} 反復/構成）==="
 # median±stdev へ集計してサマリ Markdown を生成

@@ -93,4 +93,141 @@ for h2 in 0 1; do
         done
     done
 done
+# ============================================================
+# full features 機能ショーケース（default=ktls/http2 に加えて full で有効化される
+# compression / cache / buffering / 逆プロキシ経路のスループットを計測する）。
+# いずれも最良の基盤（http2=on, ktls=on, kernel LB）上に 1 機能を重ねる。
+# 名前を h2_1_* にして run_perf.sh が HTTP/2 負荷も実施するようにする。
+# proxy / buffering は上流 backend（run_perf.sh が起動する perf-backend）へ中継する。
+# ============================================================
+
+feat_base_head() {
+    cat <<'EOF'
+[server]
+listen = "0.0.0.0:443"
+http = "0.0.0.0:80"
+http2_enabled = true
+threads = 0
+
+[logging]
+level = "warn"
+
+[security]
+allow_security_failures = false
+drop_privileges_user = "nonroot"
+drop_privileges_group = "nonroot"
+enable_seccomp = true
+enable_landlock = true
+enable_sandbox = false
+seccomp_mode = "filter"
+landlock_read_paths = ["/var/www", "/var/cache/veil", "/var/tmp/veil", "/etc/veil", "/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf", "/lib", "/lib64", "/usr"]
+landlock_write_paths = ["/var/cache/veil", "/var/tmp/veil"]
+
+[performance]
+huge_pages_enabled = false
+reuseport_balancing = "kernel"
+
+[tls]
+cert_path = "/etc/veil/ssl/cert.pem"
+key_path = "/etc/veil/ssl/key.pem"
+ktls_enabled = true
+ktls_fallback_enabled = true
+EOF
+}
+
+# 逆プロキシ系（proxy / buffering）が中継する上流定義。
+feat_upstream() {
+    cat <<'EOF'
+
+[upstreams."perf-backend"]
+algorithm = "round_robin"
+servers = ["http://perf-backend:80/"]
+EOF
+}
+
+# compression: 静的ファイル + レスポンス圧縮（Accept-Encoding 時に zstd/br/gzip）
+{
+    feat_base_head
+    cat <<'EOF'
+
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "/var/www/"
+[route.compression]
+enabled = true
+preferred_encodings = ["zstd", "br", "gzip"]
+min_size = 256
+[route.security]
+allowed_methods = ["HEAD", "GET"]
+EOF
+} > "$OUT/h2_1_feat_compression.toml"
+echo "wrote $OUT/h2_1_feat_compression.toml"
+count=$((count + 1))
+
+# cache: 静的ファイル + インメモリキャッシュ（GET/200）
+{
+    feat_base_head
+    cat <<'EOF'
+
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "/var/www/"
+[route.cache]
+enabled = true
+default_ttl_secs = 60
+methods = ["GET"]
+cacheable_statuses = [200]
+[route.security]
+allowed_methods = ["HEAD", "GET"]
+EOF
+} > "$OUT/h2_1_feat_cache.toml"
+echo "wrote $OUT/h2_1_feat_cache.toml"
+count=$((count + 1))
+
+# proxy: 逆プロキシ経路（backend へ中継。プロキシのホットパス）
+{
+    feat_base_head
+    feat_upstream
+    cat <<'EOF'
+
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "Proxy"
+upstream = "perf-backend"
+[route.security]
+allowed_methods = ["HEAD", "GET"]
+EOF
+} > "$OUT/h2_1_feat_proxy.toml"
+echo "wrote $OUT/h2_1_feat_proxy.toml"
+count=$((count + 1))
+
+# buffering: 逆プロキシ + 高度なバッファリング制御（full buffering）
+{
+    feat_base_head
+    feat_upstream
+    cat <<'EOF'
+
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "Proxy"
+upstream = "perf-backend"
+[route.buffering]
+mode = "full"
+[route.security]
+allowed_methods = ["HEAD", "GET"]
+EOF
+} > "$OUT/h2_1_feat_buffering.toml"
+echo "wrote $OUT/h2_1_feat_buffering.toml"
+count=$((count + 1))
+
 echo "生成完了: ${count} バリアント -> $OUT"

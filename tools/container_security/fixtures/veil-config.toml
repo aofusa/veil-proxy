@@ -1,10 +1,16 @@
 # container_security テスト用 Veil 設定（docker/assets/conf.d をベースに拡張）
 # h2spec 要件: GET/POST / が 200 + 非空ボディ。H2C 8443 で cleartext HTTP/2 も検証。
+#
+# full features ビルドで default(ktls/http2/mimalloc) に加えて有効化される機能
+# （compression / cache / buffering / rate-limit / admin / access-log / http3 /
+#  l4-proxy / websocket / opentelemetry）も、稼働中のプロキシで有効化して
+# ファジング・カオス・h2spec・セキュリティスキャンが full 機能面を通過するようにする。
 
 [server]
 listen = "0.0.0.0:443"
 http = "0.0.0.0:80"
 http2_enabled = true
+http3_enabled = true
 h2c_enabled = true
 h2c_listen = "0.0.0.0:8443"
 threads = 0
@@ -43,6 +49,22 @@ reuseport_balancing = "cbpf"
 enabled = true
 path = "/__metrics"
 
+# full: 管理 API（Bearer 認証 + IP 制限つき）。設定ロード・エンドポイント経路を有効化。
+[admin]
+enabled = true
+path_prefix = "/__admin"
+secret = "veil-sec-test-admin"
+
+# full: 構造化アクセスログ（stdout・非同期スレッド）。ホットパスのアクセスログ経路を有効化。
+[access_log]
+enabled = true
+format = "json"
+
+# full: HTTP/3（QUIC over UDP 443）。ハンドシェイク/設定経路を有効化。
+[http3]
+listen = "0.0.0.0:443"
+compression_enabled = true
+
 [upstreams."toxi-pool"]
 algorithm = "round_robin"
 servers = ["http://veil-sec-toxiproxy:8480/"]
@@ -62,20 +84,57 @@ key_path = "/etc/veil/ssl/key.pem"
 ktls_enabled = true
 ktls_fallback_enabled = true
 
+# full: L4（TCP）ストリームプロキシ。TLS パススルーで Toxiproxy 上流へ中継する
+# リスナーを 4443 に立てる（設定・起動経路を有効化。接続時にのみ上流へダイヤル）。
+[[l4]]
+name = "l4-passthrough"
+listen = "0.0.0.0:4443"
+lb = "round_robin"
+tls = "passthrough"
+
+  [[l4.upstreams]]
+  addr = "veil-sec-toxiproxy:8480"
+
+# Proxy 経路（/api/）: full の buffering / rate-limit を併せて有効化。
+# rate-limit はカオス flood でも誤トリップしないよう高い上限にする（経路のみ有効化）。
 [[route]]
 [route.conditions]
 path = "/api/"
 [route.action]
 type = "Proxy"
 upstream = "toxi-pool"
+[route.buffering]
+mode = "adaptive"
 [route.security]
 allowed_methods = ["HEAD", "GET", "POST"]
+rate_limit_requests_per_min = 1000000
 
+# full: キャッシュ経路（GET をインメモリキャッシュ）。File 配信 + cache を有効化。
+[[route]]
+[route.conditions]
+path = "/cached/"
+[route.action]
+type = "File"
+path = "/var/www/"
+[route.cache]
+enabled = true
+default_ttl_secs = 5
+methods = ["GET"]
+cacheable_statuses = [200]
+[route.security]
+allowed_methods = ["HEAD", "GET"]
+
+# 既定 File 経路（h2spec 要件: GET/POST / が 200 + 非空ボディ）。
+# full: レスポンス圧縮を有効化（Accept-Encoding 時に gzip/br/zstd）。
 [[route]]
 [route.conditions]
 path = "/"
 [route.action]
 type = "File"
 path = "/var/www/"
+[route.compression]
+enabled = true
+preferred_encodings = ["zstd", "br", "gzip"]
+min_size = 256
 [route.security]
 allowed_methods = ["HEAD", "GET", "POST"]
