@@ -1,0 +1,2000 @@
+# ==========================================
+# High-Performance Reverse Proxy Server
+# 設定ファイル
+# ==========================================
+
+[server]
+listen = "0.0.0.0:443"
+
+# HTTP to HTTPS リダイレクト（オプション）
+#
+# HTTPアクセスをHTTPSにリダイレクトするリスナーを起動します。
+# ブラウザがhttp://でアクセスした場合、自動的にhttps://にリダイレクトされます。
+#
+# セキュリティ考慮事項:
+# - HTTPではリダイレクトのみを行い、コンテンツは一切配信しません
+# - 301 Moved Permanently を返すため、ブラウザがURLをキャッシュします
+# - 初回HTTPアクセス時のみ平文通信が発生します
+#
+# 推奨: 公開サーバーではこの設定を有効にすることをお勧めします
+#
+http = "0.0.0.0:80"
+
+# ワーカースレッド数（オプション）
+# 未指定または0の場合はCPUコア数と同じスレッド数を使用
+# threads = 4
+
+# ====================
+# HTTP/2・HTTP/3 設定
+# ====================
+#
+# HTTP/2 と HTTP/3 のサポートを有効化できます。
+# 各プロトコルを使用するには対応するフィーチャーでビルドする必要があります:
+#   HTTP/2: cargo build --features http2
+#   HTTP/3: cargo build --features http3
+
+# HTTP/2 を有効化（TLS ALPN ネゴシエーション）
+#
+# 効果:
+# - ストリーム多重化によるレイテンシ削減
+# - HPACK ヘッダー圧縮によるオーバーヘッド削減
+# - HTTP/1.1 へのフォールバック対応
+#
+http2_enabled = true
+
+# H2C (HTTP/2 Cleartext) サーバーを有効化
+#
+# TLSなしでHTTP/2を使用するプロトコルです（RFC 7540 Section 3.4）。
+# Prior Knowledgeモードをサポートします。
+#
+# 効果:
+# - ストリーム多重化によるレイテンシ削減
+# - HPACK ヘッダー圧縮によるオーバーヘッド削減
+# - gRPC バックエンドへの接続に適している
+#
+# セキュリティ考慮事項:
+# - H2Cは平文通信のため、本番環境では内部ネットワークでのみ使用を推奨
+# - 外部公開時はTLS必須
+# - デフォルトで無効（明示的に有効化が必要）
+#
+# 注意: `--features http2` でビルドする必要があります
+#
+# h2c_enabled = false
+
+# H2C リスニングアドレス（オプション）
+#
+# 指定した場合、H2C専用のリスナーを起動します。
+# 未指定の場合は、TLSリスナーと同じアドレスでプロトコル検出を行います。
+#
+# 例: "127.0.0.1:8080"
+#
+# 注意: 同じポートでTLSとH2Cの両方を処理する場合は未指定にしてください。
+#
+# h2c_listen = "127.0.0.1:8080"
+
+# ====================
+# グレースフルシャットダウン設定
+# ====================
+#
+# SIGTERMまたはSIGINT（Ctrl+C）受信時に、既存の接続が完了するまで
+# 待機する最大時間を秒単位で指定します。
+#
+# シャットダウン時の動作:
+#   1. 新規接続の受付を停止
+#   2. 既存接続の完了を待機（最大graceful_shutdown_timeout_secs秒）
+#   3. タイムアウト後、残りの接続を強制終了
+#
+# デフォルト: 30秒
+# 0に設定した場合: 即座に終了（待機なし）
+#
+# graceful_shutdown_timeout_secs = 30
+
+# HTTP/3 を有効化（QUIC/UDP ベース）
+#
+# 効果:
+# - 0-RTT 接続確立
+# - Head-of-Line ブロッキング解消
+# - 接続マイグレーション
+#
+# 注意:
+# - UDP ベースのため kTLS は使用不可
+# - GSO/GRO による高パフォーマンス UDP 処理を使用
+#
+http3_enabled = true
+
+# ====================
+# Serverヘッダー設定
+# ====================
+#
+# Serverヘッダーを有効化/無効化し、カスタム値を設定できます。
+#
+# セキュリティ考慮事項:
+# - Serverヘッダーはサーバーソフトウェア情報を公開します
+# - 攻撃者がバージョン別の脆弱性を狙う手がかりになり得ます
+# - 本番環境では無効化を推奨（デフォルト: false）
+#
+# Serverヘッダーを有効化
+server_header_enabled = false
+
+# カスタムServerヘッダー値（server_header_enabled = true時のみ有効）
+# デフォルト: "veil"
+# 未指定の場合、プロトコルごとに自動設定:
+#   - HTTP/1.1: "veil/http1.1"
+#   - HTTP/2: "veil/http2"
+#   - HTTP/3: "veil/http3"
+# server_header_value = "veil/1.0"
+
+
+
+# ====================
+# ログ設定（非同期ログの最適化）
+# ====================
+#
+# ftlogは内部でバックグラウンドスレッドとチャネルを使用した非同期ログライブラリです。
+# 「ftlogは同期ログ」という指摘は不正確です。
+#
+# ftlogのアーキテクチャ:
+# - ログマクロ → 内部チャネルにプッシュ（ノンブロッキング）
+# - バックグラウンドスレッド → チャネルから読み取りファイルI/O
+#
+# tokio::sync::mpscを使った追加の非同期化層は不要であり、
+# むしろオーバーヘッドを増やす可能性があります。
+# また、tokioのチャネルはmonoioランタイムと互換性がありません。
+#
+[logging]
+# ログレベル: "trace", "debug", "info", "warn", "error", "off"
+level = "info"
+app_file_path = "/var/log/veil/veil.log"
+error_file_path = "/var/log/veil/veil.error.log"
+
+# ログ出力形式: "text", "json"
+# 
+# text形式（デフォルト）:
+#   INFO main [examples/ftlog.rs:27] Hello, world!
+#
+# json形式:
+#   {"timestamp":"2024-01-01T00:00:00.000Z","level":"INFO","target":"veil","file":"main.rs","line":123,"message":"..."}
+#
+# JSON形式は構造化ログ収集システム（Elasticsearch, Loki等）との連携に適しています。
+# format = "text"
+
+# ログチャネルサイズ（内部バッファ）
+# 高負荷時のログドロップを防止するため、デフォルト(100)より大幅に増加
+# 推奨範囲: 10000 - 1000000
+# channel_size = 100000
+
+# フラッシュ間隔（ミリ秒）
+# ログバッファをディスクにフラッシュする間隔
+# 小さい値: 即座にログが書き込まれるがI/O負荷増
+# 大きい値: I/O効率が良いがログ遅延
+# flush_interval_ms = 1000
+
+# ----------------------------------------
+# ログ出力先（app / error を系統別に指定）
+# ----------------------------------------
+# 各ログ行には識別用 type フィールドが付与される（app / error / access）。
+#
+# アプリ本体ログ（INFO / WARN / DEBUG / TRACE）の出力先。
+#   未指定時は標準出力 (stdout)。
+# app_file_path = "/var/log/veil/veil.log"
+#
+# エラーログ（ERROR）の出力先。
+#   未指定時は標準エラー出力 (stderr)。
+# error_file_path = "/var/log/veil/veil.error.log"
+#
+# 注意: ログ出力先にファイルパスを指定した場合、その親ディレクトリが
+#       [security].landlock_write_paths に自動追加される（Landlock 有効時の書き込み許可）。
+
+
+
+# ==========================================
+# 構造化アクセスログ（F-21）
+# ==========================================
+#
+# HTTP リクエストのアクセスログを JSON / テキスト形式で出力する。
+# アプリケーションログ（[logging]）とは独立したファイルに書き込める。
+#
+# スレッドローカルバッファを使用してヒープアロケーションを最小化。
+#
+[access_log]
+enabled = true
+format = "json"
+file_path = "/var/log/veil/access.log"
+# # 出力フィールドを限定する（省略時は全フィールドを出力）
+# fields = [
+#   "timestamp", "method", "host", "path", "status",
+#   "duration_ms", "client_ip", "upstream",
+#   "req_body_size", "resp_body_size", "user_agent"
+# ]
+# channel_size = 10000        # 非同期チャネルキャパシティ（デフォルト: 10000）
+# flush_interval_ms = 1000    # BufWriter フラッシュ間隔ミリ秒（デフォルト: 1000）
+
+
+
+# ==========================================
+# TLS設定
+# ==========================================
+[tls]
+
+cert_path = "/var/etc/veil/ssl/cert.pem"
+key_path = "/var/etc/veil/ssl/key.pem"
+
+# kTLS有効化（Linux 5.15+、feature flag必須）
+ktls_enabled = true
+
+# kTLS有効化失敗時にrustlsへフォールバックするかどうか
+# false: kTLS必須（失敗時は接続拒否）
+# true: kTLS失敗時はrustlsで継続（デフォルト）
+ktls_fallback_enabled = true
+
+# kTLS有効時にTCP_CORKを使用するかどうか
+#
+# TCP_CORKはkTLS設定中に小さなTCPパケットの送信を遅延し、
+# パケット結合により効率的なネットワーク転送を実現します。
+#
+# true: TCP_CORK有効（デフォルト、推奨）
+# false: TCP_CORK無効（特定の低遅延要件がある場合）
+# tcp_cork_enabled = true
+
+# 利用を許可する TLS 暗号スイート（nginx の ssl_ciphers 相当、F-50）
+#
+# 記載順 = サーバ優先度順（rustls はサーバ選好でネゴシエートする）。
+# 未指定（空・コメントアウト）の場合は rustls 既定の全スイートを使用。
+# 不正なスイート名は起動時にエラーとなる。
+#
+# 指定可能な名前（aws-lc-rs プロバイダ）:
+#   TLS 1.3:
+#     TLS13_AES_256_GCM_SHA384
+#     TLS13_AES_128_GCM_SHA256
+#     TLS13_CHACHA20_POLY1305_SHA256
+#   TLS 1.2:
+#     TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+#     TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+#     TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+#     TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+#     TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+#     TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+#
+# 注意:
+# - kTLS オフロードは AES-GCM 系のみ対応。kTLS 有効時に CHACHA20 系を含めると、
+#   そのスイートでネゴシエートした接続は kTLS へオフロードされず rustls で処理される
+#   （ktls_fallback_enabled = false の場合は接続拒否）。
+# - 本設定は TLS(TCP) リスナー（HTTP/1.1 / HTTP/2）に適用される。
+#   HTTP/3 (QUIC) は quiche が TLS を管理するため対象外。
+# cipher_suites = [
+#     "TLS13_AES_256_GCM_SHA384",
+#     "TLS13_AES_128_GCM_SHA256",
+#     "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+#     "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+#     "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+#     "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
+# ]
+
+# 証明書の0ダウンタイム自動リロード（F-03）
+# auto_reload = true で証明書/秘密鍵ファイルの mtime 変化を検知し、
+# 新しいハンドシェイクのみ新証明書を使用する（既存接続は影響なし）。
+# SIGHUP でも即時リロードされる。
+# 注意: Landlock サンドボックス有効時は証明書ディレクトリへの read を
+#       許可するか、サンドボックスを無効化する必要がある。
+# auto_reload = false
+# reload_interval_secs = 60
+
+
+
+# ==========================================
+# パフォーマンス設定
+# ==========================================
+[performance]
+
+# SO_REUSEPORT の振り分け方式
+# "kernel" = カーネルデフォルト（3元タプルハッシュ）
+# "cbpf"   = クライアントIPベースのCBPF（キャッシュ効率向上、Linux 4.6+必須）
+reuseport_balancing = "cbpf"
+
+# Huge Pages (Large OS Pages) の使用
+# true: mimallocでHuge Pages（2MB）を優先使用し、TLBミスを削減
+# false: 通常の4KBページを使用
+#
+# 利点:
+#   - TLB（Translation Lookaside Buffer）ミス削減
+#   - 大容量メモリ使用時（バッファプール拡大）のページフォルト減少
+#   - kTLS/splice時のカーネル連携で効果的（5-10%パフォーマンス向上）
+#
+# 要件（Linux）:
+#   sudo echo 128 > /proc/sys/vm/nr_hugepages
+#   または /etc/sysctl.conf に vm.nr_hugepages=128 を追加
+#
+# 注意:
+#   - コンテナ環境（Docker/K8s）では無効化される可能性あり
+#   - 利用不可の場合は自動的に通常ページにフォールバック
+# huge_pages_enabled = true
+
+# ------------------------------------------
+# Via ヘッダー設定 (RFC 7230 Section 5.7.1)
+# ------------------------------------------
+#
+# プロキシ経由のリクエスト/レスポンスにViaヘッダーを追加します。
+# Viaヘッダーはリクエストがどのプロキシを経由したかを示し、
+# ループ検出やデバッグに使用されます。
+#
+# 形式: Via: 1.1 <hostname>
+#
+# via_header_enabled = true
+# via_header_hostname = "veil"  # デフォルト: "veil"
+
+# ------------------------------------------
+# チャンクサイズ設定 (sendfile/splice)
+# ------------------------------------------
+#
+# kTLSのsendfile/splice転送時のチャンクサイズを制御します。
+#
+# モード:
+#   "dynamic" - ファイルサイズに基づいて自動調整（デフォルト）
+#               64KB以下: 64KB
+#               1MB以下: 256KB
+#               1MB超: 1MB
+#   "manual"  - manual_chunk_size で指定した固定サイズを使用
+#
+# chunk_size_mode = "dynamic"
+# manual_chunk_size = 1048576  # 1MB (manual mode時のみ有効)
+
+# ------------------------------------------
+# Per-Stream パイプ割当 (kTLS splice)
+# ------------------------------------------
+#
+# splice転送で使用するパイプの割当方式を制御します。
+#
+# false（デフォルト）: スレッドローカルパイプを再利用
+#   - メモリ効率が良い
+#   - 通常の負荷に最適
+#
+# true: ストリーム毎に新規パイプを作成
+#   - 高並行性環境でのパイプ競合を回避
+#   - メモリ使用量が増加
+#   - 数千の同時接続がある場合に検討
+#
+# per_stream_pipe_enabled = false
+
+# ------------------------------------------
+# OpenFileCache設定（ファイルメタデータキャッシュ）
+# ------------------------------------------
+# 効果:
+#   - canonicalize、metadata、mime_guessのシステムコールをキャッシュ
+#   - 1リクエストあたり5〜6回のシステムコールを2回に削減（キャッシュヒット時）
+#   - パフォーマンス向上: 60〜67%のシステムコール削減
+# 
+# 注意事項:
+#   - ファイル変更の検出が最大60秒（デフォルト）遅延する可能性
+#   - シンボリックリンク変更の検出が遅延する可能性
+#   - 静的ファイル配信に最適（動的に変更されるファイルには不向き）
+#
+# ルーティングごとの設定:
+#   - 各ルーティングで`open_file_cache`セクションを指定可能
+#   - ルーティング設定がない場合は、このグローバル設定が使用される
+#
+# デフォルト: false（無効）
+# open_file_cache_enabled = true
+
+# OpenFileCacheの有効期間（秒、グローバルデフォルト）
+# キャッシュされたファイル情報が有効とみなされる期間
+# デフォルト: 60秒
+# open_file_cache_valid_duration_secs = 60
+
+# OpenFileCacheの最大エントリ数（グローバルデフォルト）
+# キャッシュに保持する最大ファイル情報数
+# デフォルト: 10000
+# open_file_cache_max_entries = 10000
+
+
+
+# ==========================================
+# グローバルセキュリティ設定
+# ==========================================
+[security]
+
+# 権限降格設定（Linux専用）
+# rootで起動した場合、リスナー作成後に指定ユーザー/グループへ降格
+# 
+# 注意: 特権ポート（1024未満）を使用する場合は、以下のいずれかが必要:
+#   1. CAP_NET_BIND_SERVICEケイパビリティを付与:
+#      sudo setcap 'cap_net_bind_service=+ep' ./target/release/veil
+#   2. または非特権ポート（1024以上）を使用
+#
+drop_privileges_user = "veil"
+drop_privileges_group = "veil"
+allow_security_failures = false
+
+# グローバル同時接続上限（0 = 無制限）
+# max_concurrent_connections = 10000
+
+# 最前線 IP ブロックリスト（DDoS 防御、F-35）
+# accept 直後（TLS ハンドシェイク前・ハンドラ生成前）に評価し、マッチした接続を即座に切断する。
+# 既知の不正 IP に対する TLS ハンドシェイク等の高コスト処理を回避する。
+# CIDR は起動時にパース済みで保持され、accept ホットパスでは文字列解析を行わない。
+# SIGHUP でホットリロード可能。ルート単位の denied_ips（[route.security]）より前段で弾く。
+# 例: blocked_ips = ["203.0.113.0/24", "198.51.100.7", "2001:db8::/32"]
+# blocked_ips = []
+
+# セキュリティ機能の有効化に失敗した場合の動作
+# false: 有効化に失敗した場合はサーバーの起動を失敗させる（デフォルト、推奨）
+# true: 有効化に失敗しても警告を出して起動を続行する（開発・デバッグ用）
+# 
+# セキュリティ考慮事項:
+# - 本番環境では false（デフォルト）を推奨
+# - セキュリティ機能が確実に有効化されることを保証
+# - 開発環境でセキュリティ機能が利用できない場合のみ true に設定
+#
+enable_seccomp = true
+seccomp_mode = "filter"
+enable_landlock = true
+landlock_read_paths = [
+  "/var/www",
+  "/var/cache/veil",
+  "/var/tmp/veil",
+  "/var/etc/veil",
+  "/etc/resolv.conf",
+  "/etc/hosts",
+  "/etc/nsswitch.conf",
+  "/run/systemd/resolve",
+  "/lib",
+  "/lib64",
+  "/usr"
+]
+landlock_write_paths = ["/var/log/veil", "/var/cache/veil", "/var/tmp/veil"]
+
+# ====================
+# io_uring / seccomp セキュリティ制限
+# ====================
+#
+# io_uringは強力な非同期I/Oインターフェースですが、悪用されると
+# カーネル権限を奪われるリスクがあります。
+# seccompとLandlockを使用してシステムコールとファイルアクセスを制限できます。
+#
+# 背景:
+#   - Googleの報告でバグバウンティの60%がio_uring関連
+#   - IORING_REGISTER_RESTRICTIONS (Linux 5.10+) を独自 io_uring ランタイムで適用済み。
+#     リング生成時に許可オペコード（ACCEPT/CONNECT/RECV/SEND/POLL_ADD/TIMEOUT/CLOSE/
+#     SPLICE/POLL_REMOVE/ASYNC_CANCEL/NOP）以外を -EACCES で拒否する（自動・設定不要）。
+#   - 加えて seccomp でプロセス全体のシステムコールを制限（多層防御）。
+#   - seccomp filter モードでは mmap/mprotect の PROT_EXEC を BPF の引数レベルで拒否し、
+#     任意コード実行（RCE）に必要な実行可能メモリの確保を阻止する（WASM 用は初期化済み）。
+#
+# 注意:
+#   - seccompは不可逆（一度適用すると解除不可）
+#   - 新しいスレッドにも自動的に継承される
+#   - 必要なシステムコールを許可リストに含めること
+#
+# ============================================
+# 推奨セットアップ手順
+# ============================================
+#
+# ステップ1: まずログモードで動作確認（ブロックせずログのみ）
+#   enable_seccomp = true
+#   seccomp_mode = "log"
+#
+# ステップ2: journalctl でブロックされるシステムコールを確認
+#   journalctl -f | grep -i seccomp
+#
+# ステップ3: 問題がなければ "filter" モードに変更
+#   seccomp_mode = "filter"
+#
+# ============================================
+# seccomp設定
+# ============================================
+#
+# enable_seccomp = true
+
+# seccompモード:
+#   "disabled" - 無効（デフォルト）
+#   "log"      - 違反をログに記録（ブロックしない、導入時推奨）
+#   "filter"   - 違反をEPERMで拒否（本番推奨）
+#   "strict"   - 違反したプロセスをSIGKILL（最も厳格、デバッグ困難）
+#
+# seccomp_mode = "log"  # まずログモードで検証
+
+# ============================================
+# Landlock設定 (Linux 5.13+)
+# ============================================
+#
+# Landlockはコード内から「自分はこれ以降、このディレクトリ以外は見ません」
+# と宣言できるファイルシステムサンドボックス機能です。
+#
+# 対応ABIバージョン:
+#   v1 (Linux 5.13+): 基本的なファイルシステムアクセス制御
+#   v2 (Linux 5.19+): ファイル参照権限 (REFER)
+#   v3 (Linux 6.2+):  TRUNCATE権限
+#   v4 (Linux 6.7+):  ioctl権限
+#
+# enable_landlock = true
+
+# 読み取り専用パス（設定ファイル、ライブラリ等）
+# landlock_read_paths = [
+#   # ファイル配信ディレクトリ（プロキシ機能のみであれば不要）
+#   "/var/www",
+#   
+#   # キャッシュ・バッファリングの一時ディレクトリ（キャッシュ・バッファを使用しないなら不要）
+#   # "/var/cache/veil",
+#   # "/var/tmp/veil",
+#   
+#   # プロキシ機能の名前解決に必要（ファイル配信のみであれば不要）
+#   "/etc/veil",
+#   "/etc/resolv.conf",
+#   "/etc/hosts",
+#   "/etc/nsswitch.conf",
+#   "/lib",
+#   "/lib64",
+#   "/usr"
+# ]
+
+# 読み書きパス（ログ、一時ファイル等）
+# landlock_write_paths = ["/var/log/veil", "/var/cache/veil", "/var/tmp/veil"]
+
+# ============================================
+# 本番環境向け推奨設定
+# ============================================
+#
+# enable_seccomp = true
+# seccomp_mode = "filter"
+# enable_landlock = true
+# landlock_read_paths = [
+#   "/var/www",
+#   "/var/cache/veil",
+#   "/var/tmp/veil",
+#   "/etc/veil",
+#   "/etc/resolv.conf",
+#   "/etc/hosts",
+#   "/etc/nsswitch.conf",
+#   "/lib",
+#   "/lib64",
+#   "/usr"
+# ]
+# landlock_write_paths = ["/var/log/veil", "/var/cache/veil", "/var/tmp/veil"]
+
+# ============================================
+# サンドボックス設定（bubblewrap相当）
+# ============================================
+#
+# Linuxのnamespace分離、bind mounts、capabilities制限を
+# プログラム起動時に適用することで、bubblewrapと同等の
+# セキュリティ分離を実現します。
+#
+# 適用順序:
+#   1. サンドボックス（namespace分離、bind mounts、capabilities）
+#   2. 権限降格（setuid/setgid）
+#   3. Landlock（ファイルシステム制限）
+#   4. seccomp（システムコール制限）
+#
+# 注意:
+#   - rootまたはCAP_SYS_ADMINが必要です
+#   - namespace分離とLandlockの両方が使用可能です（相互補完）
+#   - sandbox_unshare_net = true にするとネットワークが使用不可になります
+#
+# ============================================
+
+# サンドボックスを有効化（デフォルト: false）
+# enable_sandbox = true
+
+# Namespace分離設定
+# -------------------
+# PID namespace分離（プロセス一覧の隔離）
+# sandbox_unshare_pid = false
+
+# Mount namespace分離（ファイルシステムの隔離）
+# デフォルト: true（サンドボックス有効時）
+# sandbox_unshare_mount = true
+
+# UTS namespace分離（ホスト名の隔離）
+# デフォルト: true（サンドボックス有効時）
+# sandbox_unshare_uts = true
+
+# IPC namespace分離（共有メモリ・セマフォの隔離）
+# デフォルト: true（サンドボックス有効時）
+# sandbox_unshare_ipc = true
+
+# User namespace分離（UID/GIDマッピングの隔離）
+# 複雑なケースがあるためデフォルト: false
+# sandbox_unshare_user = false
+
+# Network namespace分離（警告: ネットワークが使用不可になる）
+# サーバーでは通常 false
+# sandbox_unshare_net = false
+
+# バインドマウント設定
+# -------------------
+# 読み取り専用バインドマウント（source:dest 形式）
+# DNS解決に必要なファイルを含める必要があります
+# sandbox_ro_bind_mounts = [
+#   # ファイル配信ディレクトリ（プロキシ機能のみであれば不要）
+#   "/var/www:/var/www",
+# 
+#   # プロキシ機能の名前解決に必要（ファイル配信のみであれば不要）
+#   "/etc/veil:/etc/veil",
+#   "/etc/resolv.conf:/etc/resolv.conf",
+#   "/etc/hosts:/etc/hosts",
+#   "/etc/nsswitch.conf:/etc/nsswitch.conf",
+#   "/lib:/lib",
+#   "/lib64:/lib64",
+#   "/usr:/usr"
+# 
+#   # systemd-resolved使用時に必要
+#   "/run/systemd/resolve:/run/systemd/resolve",
+# 
+#   # ユーザー/グループ情報
+#   "/etc/passwd:/etc/passwd",
+#   "/etc/group:/etc/group"
+# ]
+
+# 読み書きバインドマウント（source:dest 形式）
+# 設定ファイル、ログディレクトリなどを指定
+# sandbox_rw_bind_mounts = [
+#   "/var/log/veil:/var/log/veil"
+# ]
+
+# tmpfsマウント先（メモリファイルシステム）
+# 注: /run はsystemd-resolvedのDNS解決に必要なため除外推奨
+# sandbox_tmpfs_mounts = [
+#   # キャッシュ・バッファリングの一時ディレクトリ（キャッシュ・バッファを使用しないなら不要）
+#   "/var/cache/veil",
+#   "/var/tmp/veil",
+#]
+
+# /proc をマウント（デフォルト: true）
+# sandbox_mount_proc = true
+
+# /dev に最小限のデバイスノードを作成（デフォルト: true）
+# sandbox_mount_dev = true
+
+# ケイパビリティ設定
+# -------------------
+# ドロップするケイパビリティ（個別指定）
+# sandbox_drop_capabilities = ["CAP_SYS_ADMIN", "CAP_NET_RAW", "CAP_SYS_PTRACE"]
+
+# 保持するケイパビリティ（これ以外は全てドロップ、優先度高）
+# リバースプロキシ推奨設定:
+# sandbox_keep_capabilities = ["CAP_NET_BIND_SERVICE"]
+
+# その他の設定
+# -------------------
+# サンドボックス内のホスト名
+# sandbox_hostname = "veil-sandbox"
+
+# PR_SET_NO_NEW_PRIVS を設定（デフォルト: true）
+# sandbox_no_new_privs = true
+
+# ============================================
+# サンドボックス + seccomp + Landlock 推奨設定例
+# ============================================
+#
+# [security]
+# # サンドボックス（namespace分離）
+# enable_sandbox = true
+# sandbox_unshare_mount = true
+# sandbox_unshare_uts = true
+# sandbox_unshare_ipc = true
+# sandbox_keep_capabilities = ["CAP_NET_BIND_SERVICE"]
+# sandbox_ro_bind_mounts = [
+#   "/var/www:/var/www",
+#   "/etc/veil:/etc/veil",
+#   "/etc/resolv.conf:/etc/resolv.conf",
+#   "/etc/hosts:/etc/hosts",
+#   "/etc/nsswitch.conf:/etc/nsswitch.conf",
+#   "/lib:/lib",
+#   "/lib64:/lib64",
+#   "/usr:/usr"
+#   "/run/systemd/resolve:/run/systemd/resolve",
+#   "/etc/passwd:/etc/passwd",
+#   "/etc/group:/etc/group"
+# ]
+# sandbox_rw_bind_mounts = [
+#   "/var/log/veil:/var/log/veil"
+# ]
+# sandbox_tmpfs_mounts = [
+#   "/var/cache/veil",
+#   "/var/tmp/veil",
+# ]
+#
+# # 権限降格
+# drop_privileges_user = "veil"
+# drop_privileges_group = "veil"
+#
+# # Landlock（ファイルシステム制限）
+# enable_landlock = true
+# landlock_read_paths = [
+#   "/var/www",
+#   "/var/cache/veil",
+#   "/var/tmp/veil",
+#   "/etc/veil",
+#   "/etc/resolv.conf",
+#   "/etc/hosts",
+#   "/etc/nsswitch.conf",
+#   "/lib",
+#   "/lib64",
+#   "/usr"
+# ]
+# landlock_write_paths = ["/var/log/veil", "/var/cache/veil", "/var/tmp/veil"]
+#
+# # seccomp（システムコール制限）
+# enable_seccomp = true
+# seccomp_mode = "filter"
+
+
+
+# ==========================================
+# バッファプール設定（メモリ最適化）
+# ==========================================
+#
+# スレッドローカルバッファプールの設定です。
+# 起動時に事前確保され、リクエスト処理中のメモリ割り当てを削減します。
+#
+# 注意: バッファプール設定はオプションです。デフォルト値はほとんどの用途に最適化されています。
+# 特定のメモリ制約やパフォーマンス要件がある場合のみ調整してください。
+#
+[buffer_pool]
+# 読み込みバッファサイズ（バイト）
+# デフォルト: 65536 (64KB)
+# read_buffer_size = 65536
+
+# 読み込みバッファ初期プール数
+# デフォルト: 32
+# initial_read_buffers = 32
+
+# 読み込みバッファ最大プール数
+# デフォルト: 128
+# max_read_buffers = 128
+
+# リクエスト構築バッファサイズ（バイト）
+# デフォルト: 1024 (1KB)
+# request_buffer_size = 1024
+
+# リクエスト構築バッファ初期プール数
+# デフォルト: 16
+# initial_request_buffers = 16
+
+# 大容量リクエストバッファサイズ（バイト）
+# デフォルト: 4096 (4KB)
+# large_request_buffer_size = 4096
+
+
+
+# ==========================================
+# HTTP/2 詳細設定 (RFC 7540)
+# ==========================================
+#
+# HTTP/2 プロトコルの詳細なパラメータを設定できます。
+# server.http2_enabled = true で有効化してください。
+#
+# 注意: --features http2 でビルドする必要があります
+#
+[http2]
+# SETTINGS_HEADER_TABLE_SIZE (HPACK動的テーブルサイズ)
+# デフォルト: 65536 (64KB) - high-performance設定
+# RFC 7540標準: 4096 (4KB)
+# header_table_size = 65536
+
+# SETTINGS_MAX_CONCURRENT_STREAMS (同時ストリーム数)
+# デフォルト: 256
+# RFC 7540標準: 100
+# 高負荷サーバー: 1000 - 並列リクエスト処理能力向上
+# max_concurrent_streams = 1000
+
+# SETTINGS_INITIAL_WINDOW_SIZE (ストリームウィンドウサイズ)
+# デフォルト: 1048576 (1MB) - high-performance設定
+# RFC 7540標準: 65535 (64KB - 1)
+# 高スループット: 4194304 (4MB) - 大きなファイル転送時のパフォーマンス向上
+# 注意: FLOW_CONTROL_ERROR を防ぐため、大きなレスポンス用に増加推奨
+# initial_window_size = 4194304
+
+# SETTINGS_MAX_FRAME_SIZE (最大フレームサイズ)
+# デフォルト: 65536 (64KB) - high-performance設定
+# RFC 7540標準: 16384 (16KB)
+# max_frame_size = 65536
+
+# SETTINGS_MAX_HEADER_LIST_SIZE (最大ヘッダーリストサイズ)
+# デフォルト: 65536 (64KB)
+# 大きなCookie/ヘッダー対応に最適
+# max_header_list_size = 65536
+
+# コネクションウィンドウサイズ（コネクション全体のフロー制御）
+# デフォルト: 1048576 (1MB) - high-performance設定
+# RFC 7540標準: 65535 (64KB - 1)
+# 高スループット: 16777216 (16MB)
+# 注意: 大きなレスポンスを複数ストリームで同時に送信する場合に増加推奨
+# connection_window_size = 16777216
+
+# ------------------------------------------
+# HTTP/2 DoS 対策設定
+# ------------------------------------------
+#
+# HTTP/2 プロトコルに対する各種 DoS 攻撃を防止するための設定です。
+# 以下の脆弱性に対応しています:
+#   - CVE-2023-44487 (Rapid Reset Attack)
+#   - CVE-2024-24786 (CONTINUATION Flood)
+#   - Control Frame Flooding (PING/SETTINGS)
+#   - HPACK Bomb
+#   - Slow Loris
+#
+# これらの設定を調整する場合は、正規のクライアントに影響がないことを
+# 確認してください。
+
+# RST_STREAM レート制限 (1秒あたりの最大数)
+# Rapid Reset 対策 (CVE-2023-44487)
+# デフォルト: 100
+# max_rst_stream_per_second = 100
+
+# 制御フレームレート制限 (1秒あたりの最大数)
+# PING/SETTINGS フラッド対策
+# デフォルト: 500
+# max_control_frames_per_second = 500
+
+# CONTINUATION フレーム制限 (ヘッダーブロックあたりの最大数)
+# CONTINUATION Flood 対策 (CVE-2024-24786)
+# デフォルト: 10
+# max_continuation_frames = 10
+
+# 最大ヘッダーブロックサイズ (bytes)
+# HPACK Bomb 対策
+# HEADERS + CONTINUATION の累積サイズ上限
+# デフォルト: 65536 (64KB)
+# max_header_block_size = 65536
+
+# ストリームアイドルタイムアウト (秒)
+# Slow Loris 対策
+# リクエストが完了しないストリームの切断までの時間
+# デフォルト: 60
+# stream_idle_timeout_secs = 60
+
+
+# ==========================================
+# HTTP/3 詳細設定 (RFC 9114, QUIC RFC 9000)
+# ==========================================
+#
+# HTTP/3 (QUIC) プロトコルの詳細なパラメータを設定できます。
+# server.http3_enabled = true で有効化してください。
+#
+# 注意:
+#   - --features http3 でビルドする必要があります
+#   - HTTP/3 は UDP ベースのため kTLS は使用不可
+#   - quiche (Cloudflare製) を使用
+#
+[http3]
+# HTTP/3リッスンアドレス（UDP）
+# 未指定の場合は server.listen と同じアドレスを使用
+# listen = "127.0.0.1:443"
+
+# 最大アイドルタイムアウト（ミリ秒）
+# デフォルト: 30000 (30秒)
+# 長寿命接続: 60000 (60秒)
+# max_idle_timeout = 30000
+
+# 最大UDPペイロードサイズ
+# デフォルト: 1350 (MTU考慮)
+# ジャンボフレーム環境: 9000
+# max_udp_payload_size = 1350
+
+# 初期最大データサイズ（コネクション全体）
+# デフォルト: 10000000 (10MB)
+# initial_max_data = 10000000
+
+# 初期最大ストリームデータサイズ（双方向ローカル）
+# デフォルト: 1000000 (1MB)
+# initial_max_stream_data_bidi_local = 1000000
+
+# 初期最大ストリームデータサイズ（双方向リモート）
+# デフォルト: 1000000 (1MB)
+# initial_max_stream_data_bidi_remote = 1000000
+
+# 初期最大ストリームデータサイズ（単方向）
+# デフォルト: 1000000 (1MB)
+# initial_max_stream_data_uni = 1000000
+
+# 初期最大双方向ストリーム数
+# デフォルト: 100
+# initial_max_streams_bidi = 100
+
+# 初期最大単方向ストリーム数
+# デフォルト: 100
+# initial_max_streams_uni = 100
+
+# ------------------------------------------
+# HTTP/3 専用圧縮設定
+# ------------------------------------------
+# HTTP/3接続時のみ圧縮を常に有効化できます。
+# パスごとの設定で compression.enabled = false の場合はそちらが優先されます。
+#
+# compression_enabled = true  # HTTP/3接続時は常に圧縮を有効化
+#
+# # HTTP/3専用の圧縮パラメータ（パス設定より優先）
+# [http3.compression]
+# preferred_encodings = ["zstd", "br", "gzip"]  # Zstd最優先
+# gzip_level = 6           # HTTP/3は帯域節約が重要なためやや高めに
+# brotli_level = 5         # Brotli圧縮レベル
+# zstd_level = 3           # Zstd圧縮レベル (1-22)
+# min_size = 512           # 小さいレスポンスも圧縮（HTTP/3では効果的）
+# compressible_types = [
+#     "text/",
+#     "application/json",
+#     "application/javascript",
+#     "application/xml",
+# ]
+
+# ------------------------------------------
+# GSO/GRO 設定（UDP パフォーマンス最適化）
+# ------------------------------------------
+# GSO (Generic Segmentation Offload) / GRO (Generic Receive Offload) は
+# カーネルレベルでUDPパケットの送受信を効率化する機能です。
+#
+# 効果:
+#   - 複数の小さなUDPパケットを一度に送受信（送信 GSO バッチング / 受信 GRO 集約）
+#   - システムコール回数の削減
+#   - CPU使用率の低減
+#
+# 実装メモ（F-33）:
+#   - 送信は同一宛先・同一サイズの QUIC パケットを連結し 1 回の sendmsg(UDP_SEGMENT) で送出。
+#   - 受信は recvmsg(2) + UDP_GRO で同一フローの複数データグラムを集約受信し、受信バッファを
+#     再利用してデータグラム毎のヒープ確保とコピーを排除（ゼロコピー受信）。
+#   - 非対応カーネルでは単発データグラム送受信に自動フォールバックする（false 相当の挙動）。
+#
+# 注意:
+#   - Linux 5.0+ でサポート
+#   - 一部の仮想環境やDockerでは期待通りに動作しない場合あり
+#   - 問題が発生した場合は false に設定してください
+#
+# デフォルト: false
+#
+# gso_gro_enabled = true
+
+
+
+# ==========================================
+# 管理 API（F-20: キャッシュ Purge）
+# ==========================================
+#
+# キャッシュの無効化（Purge）を行う管理エンドポイント。
+# secret は Authorization ヘッダー（Bearer <secret> または生の値）で検証する。
+#
+# 使用例:
+#   PURGE /path/to/page HTTP/1.1            （パスをプレフィックス Purge）
+#   POST  /__admin/cache/purge?prefix=/api/  （プレフィックス Purge）
+#   POST  /__admin/cache/purge?pattern=/static/*.css （glob Purge）
+#   POST  /__admin/cache/purge?all=true      （全 Purge）
+#   いずれも Authorization: Bearer <secret> が必要。レスポンス: {"purged": N}
+#
+[admin]
+# enabled = true
+# path_prefix = "/__admin"
+# secret = "changeme"
+# # アクセスを許可するIPアドレス/CIDR（空の場合は全IPを許可）
+# allowed_ips = ["127.0.0.1", "::1", "10.0.0.0/8"]
+
+
+
+# ==========================================
+# Prometheusメトリクス
+# ==========================================
+[prometheus]
+# Prometheusスクレイピング用のメトリクスエンドポイントを提供します。（デフォルト: false）
+# enabled = true
+#
+# 利用可能なメトリクス:
+#   veil_proxy_http_requests_total          リクエスト総数（method, status, hostラベル付き）
+#   veil_proxy_http_request_duration_seconds リクエスト処理時間のヒストグラム
+#   veil_proxy_http_request_size_bytes      リクエストボディサイズ
+#   veil_proxy_http_response_size_bytes     レスポンスボディサイズ
+#   veil_proxy_http_active_connections      アクティブな接続数
+#   veil_proxy_http_upstream_health         アップストリームの健康状態
+#
+# # メトリクスエンドポイントのパス（デフォルト: "/__metrics"）
+# path = "/metrics"
+#
+# # アクセスを許可するIPアドレス/CIDR（空の場合は全てのIPを許可）
+# # 例: 内部ネットワークとlocalhostのみ許可
+# allowed_ips = [
+#   "127.0.0.1",
+#   "::1",
+#   "10.0.0.0/8",
+#   "172.16.0.0/12",
+#   "192.168.0.0/16"
+# ]
+
+
+
+# ==========================================
+# OpenTelemetry（F-10 Phase 1: OTLP/HTTP メトリクス）
+# ==========================================
+#
+# opentelemetry feature 有効時のみ動作。専用の std スレッドで
+# Prometheus レジストリの値を OTLP/HTTP (JSON) として
+# <endpoint>/v1/metrics へ定期送信する（データプレーンは tokio-free）。
+#
+[opentelemetry]
+# enabled = false
+# endpoint = "http://localhost:4318"
+# service_name = "veil-proxy"
+# batch_interval_secs = 30
+
+
+
+# ==========================================
+# WASM拡張設定（Proxy-WASM互換）
+# ==========================================
+#
+# Proxy-WASM ABI互換のWASMモジュールを使用して
+# リクエスト/レスポンス処理をカスタマイズできます。
+#
+# 注意: --features wasm でビルドする必要があります
+#
+[wasm]
+# WASM拡張を有効化（デフォルト: false）
+# enabled = true
+
+# デフォルト設定
+# [wasm.defaults]
+# 最大実行時間（ミリ秒）
+# デフォルト: 100
+# max_execution_time_ms = 100
+
+# Poolingアロケータ設定
+# [wasm.defaults.pooling]
+# メモリプール総数
+# デフォルト: 128
+# total_memories = 128
+# テーブルプール総数
+# デフォルト: 128
+# total_tables = 128
+# インスタンスごとの最大メモリサイズ（バイト）
+# デフォルト: 10485760 (10MB)
+# max_memory_size = 10485760
+#
+# # モジュール定義
+# [[wasm.modules]]
+# name = "auth_filter"         # モジュール名（一意識別子）
+# path = "/etc/veil/wasm/auth.wasm"  # .wasm または .cwasm ファイルパス
+# configuration = '{"key": "value"}'  # プラグイン設定（JSON文字列）
+#
+#   # ケーパビリティ設定（モジュールが使用可能なAPIを制限）
+#   [wasm.modules.capabilities]
+#   # 基本機能
+#   allow_logging = true
+#   
+#   # HTTP外部呼び出し
+#   allow_http_calls = true
+#   allowed_upstreams = []  # 空の場合は全て許可（allow_http_calls=true時）
+#   
+#   # リクエストヘッダー操作（allow_header_manipulationの代替）
+#   allow_request_headers_read = true
+#   allow_request_headers_write = true
+#   
+#   # レスポンスヘッダー操作（allow_header_manipulationの代替）
+#   allow_response_headers_read = true
+#   allow_response_headers_write = true
+#   
+#   # リクエストボディ操作（allow_body_manipulationの代替、必要に応じて）
+#   # allow_request_body_read = false
+#   # allow_request_body_write = false
+#   
+#   # レスポンスボディ操作（allow_body_manipulationの代替、必要に応じて）
+#   # allow_response_body_read = false
+#   # allow_response_body_write = false
+#
+#   # メトリクス操作（proxy_define_metric 等）
+#   # allow_metrics = false
+#
+#   # 共有データアクセス（proxy_get/set_shared_data）
+#   # allow_shared_data = false
+#
+#   # 共有データの最大サイズ（バイト、allow_shared_data = true 時）
+#   # max_shared_data_size = 1048576  # 1MB
+#
+#   # ローカルレスポンス送信（proxy_send_local_response。認証フィルタ等で使用）
+#   # allow_send_local_response = false
+#
+#   # 同時 HTTP コール数の上限（allow_http_calls = true 時）
+#   # max_http_calls = 10
+#
+#   # 読み取りを許可するプロパティパスのパターン（空 = 全許可）
+#   # allowed_properties = ["request.path", "request.method"]
+#
+#   # proxy_set_property によるカスタムプロパティ書き込みを許可
+#   # allow_property_write = false
+#
+#   # 注意: 以下のcapabilityは存在しません:
+#   # - allow_grpc_calls (現在未実装)
+
+
+
+# ==========================================
+# Upstream グループ定義（ロードバランシング）
+# ==========================================
+# 複数のバックエンドサーバーを定義し、リクエストを分散できます。
+#
+# アルゴリズム:
+#   - round_robin: ラウンドロビン（順番に振り分け、デフォルト）
+#   - least_conn: Least Connections（接続数が最小のサーバーを選択）
+#   - ip_hash: クライアントIPハッシュ（同一クライアントは同一サーバーへ）
+#   - weighted: 重み付きラウンドロビン（F-19、servers の weight に比例）
+#   - consistent_hash: コンシステントハッシュ（F-19、150 vnode リング）
+#       hash_key で "ip"(既定) / "header:X-User-Id" / "cookie:session_id" を指定
+#
+# Weighted / Consistent Hash / レジリエンス設定の例:
+# [upstreams."weighted-pool"]
+# algorithm = "weighted"
+# servers = [
+#   { url = "http://10.0.0.1:8080", weight = 3 },
+#   { url = "http://10.0.0.2:8080", weight = 1 },
+# ]
+#
+# [upstreams."ch-pool"]
+# algorithm = "consistent_hash"
+# hash_key = "header:X-User-Id"   # 省略時は "ip"
+# servers = ["http://10.0.0.1:8080", "http://10.0.0.2:8080"]
+#
+#   # サーキットブレーカー（F-06、サーバー単位）
+#   [upstreams."ch-pool".circuit_breaker]
+#   enabled = true
+#   failure_threshold = 5       # この失敗回数で Open
+#   failure_window_secs = 60
+#   open_duration_secs = 30     # Open 維持時間（経過後 HalfOpen）
+#   half_open_probes = 3
+#   success_threshold = 2       # HalfOpen でこの成功回数で Closed
+#   trip_on_timeout = true
+#
+#   # 異常検知（F-06、パッシブ Outlier Detection）
+#   [upstreams."ch-pool".outlier_detection]
+#   enabled = true
+#   error_rate_threshold = 0.5  # エラー率がこれを超えると排除
+#   interval_secs = 10
+#   base_ejection_time_secs = 30
+#   max_ejection_percent = 50
+#
+# 健康チェック設定（オプション）:
+#   check_type: チェックプロトコル（"http"（デフォルト）/ "tcp" / "grpc"）
+#   interval_secs: チェック間隔（秒、デフォルト: 10）
+#   path: チェック対象パス（HTTP: リクエストパス、gRPC: サービス名、デフォルト: /）
+#   timeout_secs: タイムアウト（秒、デフォルト: 5）
+#   healthy_statuses: 成功と判断するステータスコード（HTTPのみ、デフォルト: [200, 201, 202, 204, 301, 302, 304]）
+#   unhealthy_threshold: 何回連続失敗で unhealthy にするか（デフォルト: 3）
+#   healthy_threshold: 何回連続成功で healthy に戻すか（デフォルト: 2）
+#   use_tls: TLS接続を使用したヘルスチェック（デフォルト: false）
+#   verify_cert: TLS証明書の検証（use_tls=true時のみ有効、デフォルト: true）
+
+# ------------------------------------------
+# HTTPヘルスチェック（デフォルト）
+# ------------------------------------------
+# [upstreams."backend-pool"]
+# algorithm = "round_robin"
+# servers = [
+#   "http://localhost:8080",
+#   "http://localhost:8081",
+#   "http://localhost:8082"
+# ]
+#
+#   [upstreams."backend-pool".health_check]
+#   check_type = "http"    # 省略可（デフォルト）
+#   interval_secs = 10
+#   path = "/health"
+#   timeout_secs = 5
+#   healthy_statuses = [200]
+#   unhealthy_threshold = 3
+#   healthy_threshold = 2
+#   # TLSヘルスチェック（HTTPSバックエンド用）
+#   use_tls = false
+#   verify_cert = true
+
+# ------------------------------------------
+# TCPヘルスチェック（F-22）
+# ------------------------------------------
+# TCP接続確立の可否のみを確認。データベースなど非HTTPバックエンド向け。
+#
+# [upstreams."db-pool"]
+# algorithm = "least_conn"
+# servers = ["http://db1.internal:5432", "http://db2.internal:5432"]
+#
+#   [upstreams."db-pool".health_check]
+#   check_type = "tcp"
+#   interval_secs = 15
+#   timeout_secs = 3
+#   unhealthy_threshold = 2
+#   healthy_threshold = 1
+
+# ------------------------------------------
+# gRPCヘルスチェック（F-22）
+# ------------------------------------------
+# gRPC Health Checking Protocol (grpc.health.v1.Health/Check) でチェック。
+# path にサービス名を指定（空文字 = サーバー全体チェック）。
+# HTTP/1.1 + Content-Type: application/grpc を使用。grpc-status: 0 で healthy 判定。
+#
+# [upstreams."grpc-pool"]
+# algorithm = "least_conn"
+# servers = ["http://grpc1.internal:50051", "http://grpc2.internal:50051"]
+#
+#   [upstreams."grpc-pool".health_check]
+#   check_type = "grpc"
+#   path = "grpc.health.v1.Health"
+#   interval_secs = 10
+#   timeout_secs = 5
+#   unhealthy_threshold = 3
+#   healthy_threshold = 2
+
+# ------------------------------------------
+# SNI名指定付きHTTPSアップストリーム
+# ------------------------------------------
+# サーバーエントリは文字列と構造体の両方をサポート:
+#   - 文字列形式: "http://localhost:8080"
+#   - 構造体形式: { url = "https://192.168.1.100:443", sni_name = "api.example.com" }
+#
+# IPアドレス指定でHTTPSバックエンドに接続する場合、sni_nameでドメイン名を指定可能
+# これにより、仮想ホスト構成のサーバーでも正しい証明書を取得できます
+#
+# [upstreams."https-pool"]
+# algorithm = "least_conn"
+# servers = [
+#   { url = "https://192.168.1.100:443", sni_name = "api.example.com" },
+#   { url = "https://192.168.1.101:443", sni_name = "api.example.com" },
+#   "https://api.example.com:443"  # 通常のドメイン名指定（sni_name不要）
+# ]
+# 
+#   [upstreams."https-pool".health_check]
+#   interval_secs = 10
+#   path = "/health"
+#   timeout_secs = 5
+#   healthy_statuses = [200]
+#   unhealthy_threshold = 3
+#   healthy_threshold = 2
+#   # HTTPSバックエンドの場合はTLSヘルスチェックを有効化
+#   use_tls = true
+#   verify_cert = true  # 自己署名証明書の場合は false に設定
+#
+# # TLS証明書検証を無効化（自己署名証明書対応、デフォルト: false）
+# # 注意: 本番環境では false を推奨
+# tls_insecure = false
+
+
+
+# ==========================================
+# ルーティング定義
+# ==========================================
+# 優先順位: 配列の順序で評価（first-match方式）
+#
+# ルーティングの挙動:
+# 
+# 1. 静的ファイル（完全一致）
+#    パスが末尾スラッシュなし & 設定pathがファイル → 完全一致
+#    例: "/robots.txt" → リクエスト "/robots.txt" にのみマッチ
+#
+# 2. ディレクトリ配信（Alias動作）
+#    設定pathがディレクトリ → プレフィックス除去後の残りパスをディレクトリに結合
+#    例: "/static/" + path="/var/www/assets/"
+#        リクエスト "/static/css/style.css" → "/var/www/assets/css/style.css"
+#
+# 3. インデックスファイル
+#    index オプションでディレクトリアクセス時に返すファイルを指定
+#    未指定の場合はデフォルトで "index.html" を使用
+#
+# 4. プロキシ（Proxy Pass動作）
+#    プレフィックス除去後の残りパスをバックエンドURLに結合
+#    例: "/api/" + url="http://backend:3000/app/"
+#        リクエスト "/api/v1/users" → "http://backend:3000/app/v1/users"
+#
+# ルーティング条件（[route.conditions]）:
+# 
+# すべての条件はANDで結合されます。
+# 条件が指定されていない場合は、すべてのリクエストにマッチします（デフォルトルート）。
+#
+# - host: ホスト名マッチ（ワイルドカード対応）
+#   例: "api.example.com", "*.example.com"
+#
+# - path: パスマッチ（ワイルドカード対応）
+#   例: "/api/*", "/static/*", "/api/v2/*"
+#
+# - header: HTTPヘッダーマッチ（マップで複数ヘッダー指定可能）
+#   例: { "X-Version" = "v2", "X-API-Key" = "secret" }
+#
+# - method: HTTPメソッドマッチ（配列で複数メソッド指定可能）
+#   例: ["GET", "POST"]
+#
+# - query: クエリパラメータマッチ（マップで複数クエリ指定可能）
+#   例: { "key" = "value", "token" = "abc123" }
+#
+# - source_ip: ソースIPマッチ（CIDR表記、配列で複数CIDR指定可能）
+#   例: ["192.168.0.0/16", "10.0.0.0/8"]
+
+# ------------------------------------------
+# 静的ファイル（完全一致）
+# ------------------------------------------
+# リクエスト: /robots.txt → /var/www/robots.txt を返す
+# リクエスト: /robots.txt/hoge → 404 Not Found
+# [[route]]
+# [route.conditions]
+# host = "example.com"
+# path = "/robots.txt"
+# [route.action]
+# type = "File"
+# path = "/var/www/robots.txt"
+
+# ------------------------------------------
+# 静的ディレクトリ配信
+# ------------------------------------------
+
+# デフォルトインデックス (index.html)
+# [[route]]
+# [route.conditions]
+# host = "example.com"
+# path = "/static/*"
+# [route.action]
+# type = "File"
+# path = "/var/www/assets/"
+# mode = "sendfile"
+# # OpenFileCache設定（ルーティングごと、グローバル設定を上書き）
+# # この設定により、ファイルメタデータ（canonicalize、metadata、mime_guess）がキャッシュされ、
+# # システムコールが60〜67%削減されます（キャッシュヒット時）
+# [route.open_file_cache]
+# enabled = true
+# valid_duration_secs = 300  # 5分（静的ファイルは変更頻度が低い）
+# max_entries = 50000
+
+# カスタムインデックス (profile.html)
+# [[route]]
+# [route.conditions]
+# host = "example.com"
+# path = "/user/*"
+# [route.action]
+# type = "File"
+# path = "/var/www/user/"
+# index = "profile.html"
+
+# カスタムインデックス (dashboard.html)
+# [[route]]
+# [route.conditions]
+# host = "example.com"
+# path = "/app/*"
+# [route.action]
+# type = "File"
+# path = "/var/www/app/"
+# index = "dashboard.html"
+
+# 末尾スラッシュなし（301リダイレクトなし）
+# [[route]]
+# [route.conditions]
+# host = "example.com"
+# path = "/docs"
+# [route.action]
+# type = "File"
+# path = "/var/www/docs/"
+
+# ------------------------------------------
+# プロキシ配信
+# ------------------------------------------
+
+# シンプルなプロキシ
+# [[route]]
+# [route.conditions]
+# host = "example.com"
+# path = "/backend"
+# [route.action]
+# type = "Proxy"
+# url = "http://localhost:3000"
+
+# ------------------------------------------
+# SNI名指定付きHTTPSプロキシ
+# ------------------------------------------
+# バックエンドがIPアドレス指定の場合、SNIにドメイン名を指定可能
+# これにより、仮想ホスト構成のサーバーでも正しい証明書を取得できます
+#
+# [route.action]
+# type = "Proxy"
+# url = "https://192.168.1.100:443"
+# sni_name = "api.internal.example.com"
+# 
+# セキュリティ設定付きプロキシ
+# - 許可メソッド: GET, POST, PUT のみ
+# - ボディサイズ制限: 5MB
+# - バックエンド接続タイムアウト: 5秒
+# - レートリミット: 60リクエスト/分
+# [[route]]
+# [route.conditions]
+# host = "example.com"
+# path = "/api/*"
+# [route.action]
+# type = "Proxy"
+# url = "http://localhost:8080/app/"
+# [route.security]
+# allowed_methods = ["GET", "POST", "PUT"]
+# max_request_body_size = 5_242_880
+# backend_connect_timeout_secs = 10
+# rate_limit_requests_per_min = 60
+
+# --- [route.security] のその他の設定キー（デフォルト値と説明） ---
+#
+# Chunked 転送時の累積最大ボディサイズ（バイト）
+# max_chunked_body_size = 10_485_760
+#
+# クライアントヘッダー受信タイムアウト（秒）
+# client_header_timeout_secs = 30
+#
+# クライアントボディ受信タイムアウト（秒）
+# client_body_timeout_secs = 30
+#
+# リクエストヘッダー最大サイズ（バイト）。超過時は 431 を返す
+# max_request_header_size = 8192
+#
+# バックエンド接続プール: ホストごとの最大アイドル接続数
+# max_idle_connections_per_host = 8
+#
+# バックエンド接続プール: アイドル接続の維持時間（秒）
+# idle_connection_timeout_secs = 30
+#
+# レスポンスから削除するヘッダー（クライアントへ返送前）
+# remove_response_headers = ["Server", "X-Powered-By"]
+#
+# WebSocket 転送のポーリングモード（"adaptive" | "fixed"）
+# adaptive: アイドル時にタイムアウトを指数的に伸ばして CPU を節約（デフォルト）
+# websocket_poll_mode = "adaptive"
+#
+# WebSocket adaptive ポーリングの初期タイムアウト（ミリ秒）
+# websocket_poll_timeout_ms = 1
+#
+# WebSocket adaptive ポーリングの最大タイムアウト（ミリ秒）
+# websocket_poll_max_timeout_ms = 100
+#
+# WebSocket adaptive ポーリングのバックオフ倍率
+# websocket_poll_backoff_multiplier = 2.0
+
+# ------------------------------------------
+# ルーティング条件の例（header, method, query, source_ip）
+# ------------------------------------------
+
+# HTTPヘッダー条件付きルーティング
+# X-Versionヘッダーが"v2"の場合のみマッチ
+# [[route]]
+# [route.conditions]
+# host = "api.example.com"
+# path = "/api/*"
+# header = { "X-Version" = "v2" }
+# [route.action]
+# type = "Proxy"
+# url = "http://localhost:8080/v2/"
+
+# HTTPメソッド条件付きルーティング
+# GETとPOSTのみ許可
+# [[route]]
+# [route.conditions]
+# host = "api.example.com"
+# path = "/api/*"
+# method = ["GET", "POST"]
+# [route.action]
+# type = "Proxy"
+# url = "http://localhost:8080/"
+
+# クエリパラメータ条件付きルーティング
+# tokenクエリパラメータが"secret"の場合のみマッチ
+# [[route]]
+# [route.conditions]
+# host = "api.example.com"
+# path = "/api/*"
+# query = { "token" = "secret" }
+# [route.action]
+# type = "Proxy"
+# url = "http://localhost:8080/"
+
+# ソースIP条件付きルーティング
+# 特定のCIDR範囲からのアクセスのみ許可
+# [[route]]
+# [route.conditions]
+# host = "admin.example.com"
+# path = "/admin/*"
+# source_ip = ["192.168.0.0/16", "10.0.0.0/8"]
+# [route.action]
+# type = "Proxy"
+# url = "http://localhost:9000/"
+
+# 複数条件の組み合わせ（すべてANDで結合）
+# [[route]]
+# [route.conditions]
+# host = "api.example.com"
+# path = "/api/v2/*"
+# header = { "X-Version" = "v2", "X-API-Key" = "secret" }
+# method = ["GET", "POST"]
+# query = { "format" = "json" }
+# source_ip = ["192.168.0.0/16"]
+# [route.action]
+# type = "Proxy"
+# url = "http://localhost:8080/v2/"
+
+# ------------------------------------------
+# Proxy-Wasm拡張機能（route直下で設定）
+# ------------------------------------------
+# WASMモジュールはroute直下で設定します（route.action配下ではありません）
+# [[route]]
+# [route.conditions]
+# host = "api.example.com"
+# path = "/api/*"
+# [route.action]
+# type = "Proxy"
+# url = "http://localhost:8080/"
+# # WASMモジュール名のリスト（このルートに適用するWASMモジュール）
+# modules = ["header_filter", "waf_filter"]
+
+# ------------------------------------------
+# レスポンス圧縮設定付きプロキシ
+# ------------------------------------------
+# バックエンドからのレスポンスを動的に圧縮してクライアントに転送
+# 
+# 注意:
+#   - デフォルトは無効（enabled = false）
+#   - 有効にするとkTLSのゼロコピー最適化は迂回されます
+#   - 帯域節約が重要なAPIエンドポイントでの使用を推奨
+#
+# [route.action]
+# type = "Proxy"
+# url = "http://localhost:8080"
+#
+#   [route.compression]
+#   # 圧縮を有効化（デフォルト: false）
+#   enabled = true
+#   
+#   # 圧縮方式の優先順位（クライアントのAccept-Encodingと照合）
+#   # サポート: "zstd", "br" (Brotli), "gzip", "deflate"
+#   preferred_encodings = ["zstd", "br", "gzip"]
+#   
+#   # Gzip圧縮レベル (1-9)
+#   # 1: 最速（圧縮率低）、9: 最遅（圧縮率高）
+#   gzip_level = 4
+#   
+#   # Brotli圧縮レベル (0-11)
+#   # 0: 最速、11: 最遅（圧縮率最高）
+#   brotli_level = 4
+#   
+#   # 最小圧縮サイズ（バイト）
+#   # これより小さいレスポンスは圧縮オーバーヘッドの方が大きいためスキップ
+#   min_size = 1024
+#   
+#   # 圧縮対象のMIMEタイプ（プレフィックスマッチ）
+#   compressible_types = [
+#     "text/",
+#     "application/json",
+#     "application/javascript",
+#     "application/xml",
+#     "image/svg+xml",
+#   ]
+#   
+#   # 圧縮をスキップするMIMEタイプ（プレフィックスマッチ）
+#   skip_types = [
+#     "image/",
+#     "video/",
+#     "audio/",
+#     "application/octet-stream",
+#   ]
+
+# ------------------------------------------
+# 高スループットAPI（圧縮有効、速度優先）
+# ------------------------------------------
+# 大量のJSONレスポンスを返すAPIエンドポイント
+# 帯域節約のため圧縮を有効化、速度優先で低レベル圧縮
+#
+# [route.action]
+# type = "Proxy"
+# url = "http://backend-api:8080"
+#
+#   [route.compression]
+#   enabled = true
+#   min_size = 512              # 小さいレスポンスも圧縮
+#   gzip_level = 1              # 速度優先
+#   preferred_encodings = ["gzip"]  # Brotliは遅いのでスキップ
+
+# ------------------------------------------
+# リアルタイムAPI（圧縮無効、kTLS最適化維持）
+# ------------------------------------------
+# 低レイテンシが重要なエンドポイント
+# kTLS最適化を維持するため圧縮無効（デフォルト動作）
+#
+# [route.action]
+# type = "Proxy"
+# url = "http://realtime-backend:8080"
+#
+#   [route.compression]
+#   enabled = false  # 明示的に無効化（デフォルト値と同じ）
+# 
+# ------------------------------------------
+# 分析データAPI（圧縮有効、高圧縮率）
+# ------------------------------------------
+# 大きなデータセットを返す分析API
+# レイテンシより帯域節約を優先
+#
+# [route.action]
+# type = "Proxy"
+# url = "http://analytics-backend:8080"
+#
+#   [route.compression]
+#   enabled = true
+#   min_size = 256
+#   gzip_level = 6              # 圧縮率優先
+#   brotli_level = 6
+#   preferred_encodings = ["zstd", "br", "gzip"]  # Zstdを最優先
+
+# ------------------------------------------
+# 管理用API（IP制限付き）
+# ------------------------------------------
+# 内部ネットワークからのみアクセス許可
+# - 許可: 192.168.0.0/16, 10.0.0.0/8, 127.0.0.1
+# - 拒否: 192.168.1.100（特定のホストを除外）
+# [[route]]
+# [route.conditions]
+# host = "example.com"
+# path = "/admin/*"
+# [route.action]
+# type = "Proxy"
+# url = "http://localhost:9000/"
+# [route.security]
+# allowed_ips = [
+#   "192.168.0.0/16",
+#   "10.0.0.0/8",
+#   "127.0.0.1"
+# ]
+# denied_ips = ["192.168.1.100"]
+# allowed_methods = ["GET", "POST"]
+
+# ------------------------------------------
+# プロキシキャッシュ設定
+# ------------------------------------------
+# バックエンドからのレスポンスをキャッシュし、
+# 同じリクエストへの応答時間を短縮します。
+#
+# [route.action]
+# type = "Proxy"
+# url = "http://localhost:8080"
+#
+#   # キャッシュ設定
+#   [route.cache]
+#   # キャッシュを有効化
+#   enabled = true
+#   
+#   # インメモリキャッシュ最大サイズ（バイト）
+#   # デフォルト: 100MB (104857600)
+#   max_memory_size = 104857600
+#   
+#   # ディスクキャッシュパス（大きいレスポンス用）
+#   # 未設定の場合はメモリのみ
+#   disk_path = "/var/cache/veil/api"
+#   
+#   # ディスクキャッシュ最大サイズ（バイト）
+#   # デフォルト: 1GB (1073741824)
+#   max_disk_size = 1073741824
+#   
+#   # メモリキャッシュ閾値（バイト）
+#   # これより大きいレスポンスはディスクへ保存
+#   # デフォルト: 64KB (65536)
+#   memory_threshold = 65536
+#   
+#   # デフォルトTTL（秒）
+#   # Cache-Controlヘッダーがない場合に使用
+#   # デフォルト: 300秒（5分）
+#   default_ttl_secs = 300
+#   
+#   # キャッシュ対象HTTPメソッド
+#   # デフォルト: ["GET", "HEAD"]
+#   methods = ["GET", "HEAD"]
+#   
+#   # キャッシュ対象ステータスコード
+#   # デフォルト: [200, 301, 302, 304]
+#   cacheable_statuses = [200, 301, 302, 304]
+#   
+#   # キャッシュ除外パスパターン（globパターン）
+#   bypass_patterns = ["/cached-api/user/*", "/cached-api/session"]
+#   
+#   # Varyヘッダーを尊重するか
+#   # trueの場合、Varyに基づいて別々のキャッシュエントリを作成
+#   respect_vary = true
+#   
+#   # ETag検証を有効化
+#   enable_etag = true
+#   
+#   # クエリパラメータをキャッシュキーに含めるか
+#   include_query = true
+#
+#   # stale-while-revalidate（期限切れキャッシュを返しながらバックグラウンド更新）
+#   stale_while_revalidate = false
+#
+#   # stale-if-error（バックエンドエラー時に期限切れキャッシュを返す）
+#   stale_if_error = false
+#
+#   # キャッシュキーに含めるヘッダー（ユーザーごとのキャッシュ等）
+#   key_headers = ["Authorization"]
+#
+#   # 非同期I/O使用（io_uring環境のみ、デフォルト: true）
+#   use_async_io = true
+
+# ------------------------------------------
+# バッファリング制御設定
+# ------------------------------------------
+# 低速クライアントによるバックエンド占有を防止するため、
+# レスポンスをバッファリングしてからクライアントに送信します。
+#
+# [route.action]
+# type = "Proxy"
+# url = "http://localhost:8080"
+#
+#   # バッファリング設定
+#   [route.buffering]
+#   # バッファリングモード: "streaming", "full", "adaptive"
+#   # - streaming: ストリーミング転送（従来の動作、デフォルト）
+#   # - full: フルバッファリング（全レスポンスをバッファ後に転送）
+#   # - adaptive: 適応型（小さいレスポンスはフル、大きいレスポンスはストリーミング）
+#   # 注: mode は HTTP/2 リクエスト（アップロード）方向にも適用される。
+#   #     streaming/adaptive では適格なアップロードを受信しながらバックエンドへ
+#   #     chunked でストリーミングし、full ではアップロードを全バッファしてから転送する。
+#   # 注: HTTP/3 でも mode が適用される。streaming/adaptive では適格な Proxy リクエスト/
+#   #     レスポンスをアクターモデル（メインループ⇔バックエンドタスク）で双方向ストリーミング
+#   #     転送し、full では従来どおり全バッファする（TLS バックエンドは当面バッファ経路）。
+#   mode = "adaptive"
+#   
+#   # 適応型モードの閾値（バイト）
+#   # Content-Lengthがこの値以下の場合はフルバッファリング
+#   # デフォルト: 1MB (1048576)
+#   adaptive_threshold = 1048576
+#   
+#   # フルバッファリング時のメモリ最大サイズ（バイト）
+#   # この値を超えるレスポンスはディスクバッファへスピルオーバー
+#   # デフォルト: 10MB (10485760)
+#   max_memory_buffer = 10485760
+#   
+#   # ディスクバッファパス
+#   # メモリバッファを超えた場合の一時ファイル保存先
+#   # 未設定の場合はディスクバッファを使用しない
+#   # disk_buffer_path = "/var/tmp/veil/buffer"
+#   
+#   # クライアント書き込みタイムアウト（秒）
+#   # バッファからクライアントへの書き込みがこの時間を超えると接続を切断
+#   client_write_timeout_secs = 60
+#
+#   # レスポンスヘッダーもバッファに含めるか（デフォルト: true）
+#   buffer_headers = true
+#
+#   # ディスクバッファ最大サイズ（デフォルト: 100MB）
+#   max_disk_buffer = 104857600
+# 
+# ------------------------------------------
+# WebSocket プロキシ
+# ------------------------------------------
+# Connection: Upgrade と Upgrade: websocket ヘッダーを自動検出
+# 101 Switching Protocols 後は双方向バイパス転送
+# 
+# [route.action]
+# type = "Proxy"
+# url = "http://localhost:3000"
+
+# ------------------------------------------
+# H2C (HTTP/2 over cleartext) 対応プロキシ（クライアント側）
+# ------------------------------------------
+# バックエンドがH2C (HTTP/2 prior knowledge) をサポートしている場合、
+# use_h2c = true を指定することで HTTP/2 で通信できます。
+#
+# 効果:
+#   - HTTP/2 の多重化とヘッダー圧縮をバックエンド通信でも活用
+#   - gRPC バックエンドへの接続に適している
+#
+# 注意:
+#   - バックエンドが H2C (HTTP/2 without TLS) をサポートしている必要があります
+#   - HTTPS バックエンド（use_tls=true）では use_h2c は無効です
+#   - Prior Knowledge モードを使用（Upgrade経由ではない）
+#
+# [route.action]
+# type = "Proxy"
+# url = "http://localhost:50051"
+# use_h2c = true
+
+# ------------------------------------------
+# H2C (HTTP/2 Cleartext) サーバー設定
+# ------------------------------------------
+# H2Cサーバーを有効化すると、TLSなしでHTTP/2接続を受け付けます。
+# 内部ネットワークでの使用や、gRPCサーバーとしての動作に適しています。
+#
+# 設定例:
+#
+# [server]
+# h2c_enabled = true
+# h2c_listen = "0.0.0.0:8080"  # H2C専用ポート（オプション）
+#
+# 使用例:
+#   # curlでH2Cサーバーに接続
+#   curl --http2-prior-knowledge http://localhost:8080/
+#
+#   # gRPCクライアントでH2Cサーバーに接続
+#   grpc_client --plaintext http://localhost:8080
+#
+# セキュリティ注意事項:
+#   - H2Cは平文通信のため、本番環境では内部ネットワークでのみ使用を推奨
+#   - 外部公開時はTLS必須
+#   - デフォルトで無効（明示的に有効化が必要）
+#
+# [server]
+# h2c_enabled = true
+# h2c_listen = "0.0.0.0:8080"
+
+# ------------------------------------------
+# ヘッダー操作付きプロキシ
+# ------------------------------------------
+# X-Real-IP, X-Forwarded-Proto などを追加し、
+# セキュリティヘッダーをレスポンスに付与
+#
+# [route.action]
+# type = "Proxy"
+# url = "http://localhost:8080"
+#
+#   [route.security]
+#   # バックエンドに転送前にヘッダーを追加
+#   add_request_headers = { "X-Real-IP" = "$client_ip", "X-Forwarded-Proto" = "https" }
+#   # バックエンドに転送前にヘッダーを削除
+#   remove_request_headers = ["X-Debug-Token"]
+#   # クライアントに返送前にセキュリティヘッダーを追加
+#   add_response_headers = { "Strict-Transport-Security" = "max-age=31536000", "X-Frame-Options" = "DENY", "X-Content-Type-Options" = "nosniff" }
+
+# ------------------------------------------
+# リダイレクト設定
+# ------------------------------------------
+# 301/302/303/307/308 リダイレクトを設定
+# WWW非対応やHTTPS強制、旧URL移行などに使用
+#
+# 例1: WWWへリダイレクト
+# [route.action]
+# type = "Redirect"
+# redirect_url = "https://www.example.com/new-path/"
+# redirect_status = 301
+# preserve_path = false
+#
+# 例2: パスを保持してリダイレクト
+# [route.action]
+# type = "Redirect"
+# redirect_url = "https://example.com/v2"
+# redirect_status = 301
+# preserve_path = true
+# # /legacy/users → https://example.com/v2/users
+
+# ------------------------------------------
+# ロードバランシング（Upstream参照）
+# ------------------------------------------
+# upstreams セクションで定義したグループを参照
+# url の代わりに upstream を指定
+#
+# [route.action]
+# type = "Proxy"
+# upstream = "backend-pool"
+#
+#   [route.security]
+#   rate_limit_requests_per_min = 60
+
+# ==========================================
+# gRPC (--features 'grpc')
+# ==========================================
+#
+# gRPC-over-HTTP/2 のサポートはビルド時の feature フラグで有効化します。
+# gRPC 専用の設定セクション（[grpc]）は存在しません。
+# gRPC / gRPC-Web の変換はリクエストの Content-Type
+# （application/grpc / application/grpc-web）から自動判定されます。
+#
+# ビルド方法:
+#   gRPC基本:     cargo build --features grpc
+#   gRPC-Web:     cargo build --features grpc-web
+#   gRPC全機能:   cargo build --features grpc-full
+#
+# gRPC バックエンドへの接続はルートの use_h2c = true で
+# HTTP/2 Cleartext（H2C）を使用します:
+#
+# [route.action]
+# type = "Proxy"
+# url = "http://grpc-backend:50051"
+# use_h2c = true  # gRPC は H2C が必要
+
+# ==========================================
+# L4 ストリームプロキシ設定（F-18）
+# ==========================================
+#
+# TCPレイヤーのロードバランシングプロキシ。
+# データベース、Redis、SMTP などの非HTTPバイナリプロトコルを透過転送します。
+#
+# 注意: --features l4-proxy でビルドする必要があります（full に含まれます）
+# 注意: L4リスナーは起動時にバインドするため SIGHUP でのホットリロードは不可
+#
+# 設定項目:
+#   name: リスナー名（ログ・メトリクス識別用）
+#   listen: バインドアドレス（例: "0.0.0.0:3306"）
+#   lb: ロードバランシング方式（"round_robin"（デフォルト）/ "least_conn"）
+#   tls: TLSモード（"none"（デフォルト）/ "passthrough" / "terminate"）
+#   max_connections: 最大同時接続数（0 = 無制限、デフォルト: 0）
+#   connect_timeout_secs: upstream接続タイムアウト秒数（デフォルト: 10）
+#   idle_timeout_secs: アイドルタイムアウト秒数。この時間データ転送がなければ接続を切断（デフォルト: 600）
+#   [[l4.upstreams]]: upstreamバックエンド一覧
+#     addr: バックエンドアドレス（"host:port"）
+#     weight: 重み（デフォルト: 1）
+#   [l4.health_check]: ヘルスチェック設定（upstreamと同形式、オプション）
+
+# ------------------------------------------
+# 例1: PostgreSQL TCPプロキシ
+# ------------------------------------------
+# [[l4]]
+# name = "postgres-proxy"
+# listen = "0.0.0.0:5432"
+# lb = "least_conn"
+# tls = "none"
+# max_connections = 200
+# connect_timeout_secs = 5
+# idle_timeout_secs = 600
+#
+#   [[l4.upstreams]]
+#   addr = "10.0.0.1:5432"
+#   weight = 1
+#
+#   [[l4.upstreams]]
+#   addr = "10.0.0.2:5432"
+#   weight = 1
+#
+#   [l4.health_check]
+#   check_type = "tcp"
+#   interval_secs = 10
+#   timeout_secs = 3
+#   unhealthy_threshold = 2
+#   healthy_threshold = 1
+
+# ------------------------------------------
+# 例2: Redis TCPプロキシ（シンプル構成）
+# ------------------------------------------
+# [[l4]]
+# name = "redis-proxy"
+# listen = "0.0.0.0:6379"
+# lb = "round_robin"
+#
+#   [[l4.upstreams]]
+#   addr = "redis1.internal:6379"
+#
+#   [[l4.upstreams]]
+#   addr = "redis2.internal:6379"
+
+# ------------------------------------------
+# 例3: gRPC TCPプロキシ + gRPCヘルスチェック
+# ------------------------------------------
+# [[l4]]
+# name = "grpc-proxy"
+# listen = "0.0.0.0:50051"
+# lb = "least_conn"
+# max_connections = 500
+#
+#   [[l4.upstreams]]
+#   addr = "grpc1.internal:50051"
+#
+#   [[l4.upstreams]]
+#   addr = "grpc2.internal:50051"
+#
+#   [l4.health_check]
+#   check_type = "grpc"
+#   path = "grpc.health.v1.Health"
+#   interval_secs = 15
+#   timeout_secs = 5
+
+# ------------------------------------------
+# 例4: MySQL TCPプロキシ（TLSパススルー）
+# ------------------------------------------
+# TLSパススルー: TLSを復号せずupstreamにそのまま転送（SNIルーティングは未実装）
+# [[l4]]
+# name = "mysql-tls-passthrough"
+# listen = "0.0.0.0:3306"
+# lb = "round_robin"
+# tls = "passthrough"
+#
+#   [[l4.upstreams]]
+#   addr = "mysql1.internal:3306"
+#
+#   [[l4.upstreams]]
+#   addr = "mysql2.internal:3306"
+
+# ------------------------------------------
+# ルートパス
+# ------------------------------------------
+# "/" は完全一致（/へのリクエストのみマッチ）
+# catch-all動作はなし: マッチしないパスは404
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "/var/www/"
+[route.security]
+allowed_methods = ["HEAD", "GET"]

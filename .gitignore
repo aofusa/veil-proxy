@@ -32,3 +32,7 @@ tests/wasm/*.wasm
 .claude/
 tests/fixtures/proxy.pid
 tests/load/results/
+
+# Linux パッケージビルド成果物
+packaging/staging/
+packaging/output/

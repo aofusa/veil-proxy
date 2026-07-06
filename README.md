@@ -134,6 +134,40 @@ docker run --rm -it -v $(pwd):/io -w /io messense/cargo-zigbuild \
 
 The binary is generated at `target/x86_64-unknown-linux-gnu/release/veil`.
 
+### Linux Package (.deb)
+
+Build a Debian/Ubuntu install package with all features enabled (`--features full`):
+
+```bash
+./packaging/build-deb.sh
+```
+
+The package is written to `packaging/output/veil_<version>_<arch>.deb`.
+
+Install on a target host:
+
+```bash
+sudo dpkg -i packaging/output/veil_0.4.0_amd64.deb
+sudo apt-get install -f   # if dependencies are missing
+sudo systemctl enable --now veil
+```
+
+The package installs:
+
+- Binary: `/usr/bin/veil`
+- Config: `/var/etc/veil/config.toml` (from `contrib/config/config.toml`)
+- systemd unit: `contrib/systemd/veil.service`
+- Dedicated user/group: `veil:veil`
+- Directories: `/var/www`, `/var/log/veil`, `/var/cache/veil`, `/var/tmp/veil`, `/var/etc/veil`
+
+Verify the package in an Ubuntu Docker container (install, systemd start, curl):
+
+```bash
+./packaging/test-docker-install.sh
+```
+
+See [packaging/README.md](packaging/README.md) for details (postinst behavior, troubleshooting, customization).
+
 > **Note**: `cmake` and `nasm` must be installed inside the container when building with `--features full` because the `http3` feature compiles quiche's bundled BoringSSL (requires cmake) and `aws-lc-rs` uses assembly optimizations (requires nasm). The default build without `http3` does not need cmake.
 
 > **Cargo features**: The complete list of available feature flags is defined in the [`[features]` section of `Cargo.toml`](Cargo.toml).
@@ -3762,23 +3796,29 @@ A sandbox-enabled service file is provided at `contrib/systemd/veil.service`.
 
 #### Installation
 
+For automated setup, use the `.deb` package ([packaging/README.md](packaging/README.md)).
+The steps below are for manual installation.
+
 ```bash
 # 1. Create dedicated user
 sudo useradd -r -s /sbin/nologin veil
 
 # 2. Create directories
-sudo mkdir -p /etc/veil
-sudo mkdir -p /var/log/veil
-sudo chown veil:veil /var/log/veil
+sudo mkdir -p /var/etc/veil/ssl
+sudo mkdir -p /var/log/veil /var/cache/veil /var/tmp/veil
+sudo chown -R veil:veil /var/log/veil /var/cache/veil /var/tmp/veil
 
 # 3. Copy configuration files
-sudo cp examples/config.toml /etc/veil/
-sudo cp server.crt server.key /etc/veil/
-sudo chmod 600 /etc/veil/server.key
-sudo chown -R veil:veil /etc/veil
+sudo cp contrib/config/config.toml /var/etc/veil/config.toml
+sudo cp server.crt /var/etc/veil/ssl/cert.pem
+sudo cp server.key /var/etc/veil/ssl/key.pem
+sudo chown veil:veil /var/etc/veil/ssl/key.pem
+sudo chmod 600 /var/etc/veil/ssl/key.pem
+sudo chown -R root:veil /var/etc/veil
+sudo chmod 0640 /var/etc/veil/config.toml
 
 # 4. Install binary
-sudo cp target/release/veil /usr/local/bin/
+sudo cp target/release/veil /usr/bin/veil
 
 # 5. Install service file
 sudo cp contrib/systemd/veil.service /etc/systemd/system/
@@ -3807,8 +3847,9 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
-ReadOnlyPaths=/etc/veil
-ReadWritePaths=/var/log/veil
+LogsDirectory=veil
+CacheDirectory=veil
+ReadOnlyPaths=/var/etc/veil
 
 # === Namespace Isolation ===
 RestrictNamespaces=yes
@@ -3821,15 +3862,11 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 
 # === Security Hardening ===
 NoNewPrivileges=yes
-MemoryDenyWriteExecute=yes
+# MemoryDenyWriteExecute=yes  # disabled for WASM (full build)
 RestrictSUIDSGID=yes
 
 # === System Call Restriction ===
-# @system-service + io_uring + mlock
-SystemCallFilter=@system-service
-SystemCallFilter=io_uring_setup io_uring_enter io_uring_register
-SystemCallFilter=mlock mlock2 mlockall munlock munlockall
-SystemCallFilter=sched_setaffinity sched_getaffinity
+# Delegated to config.toml seccomp/Landlock (SystemCallFilter omitted)
 SystemCallErrorNumber=EPERM
 ```
 

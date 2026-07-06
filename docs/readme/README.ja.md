@@ -134,6 +134,40 @@ docker run --rm -it -v $(pwd):/io -w /io messense/cargo-zigbuild \
 
 ビルド後のバイナリは `target/x86_64-unknown-linux-gnu/release/veil` に生成されます。
 
+### Linux パッケージ（.deb）
+
+Debian/Ubuntu 向けのインストールパッケージを、全機能（`--features full`）でビルドします。
+
+```bash
+./packaging/build-deb.sh
+```
+
+成果物は `packaging/output/veil_<version>_<arch>.deb` に出力されます。
+
+インストール手順:
+
+```bash
+sudo dpkg -i packaging/output/veil_0.4.0_amd64.deb
+sudo apt-get install -f   # 依存関係不足時
+sudo systemctl enable --now veil
+```
+
+パッケージの内容:
+
+- バイナリ: `/usr/bin/veil`
+- 設定: `/var/etc/veil/config.toml`（`contrib/config/config.toml` をベース）
+- systemd ユニット: `contrib/systemd/veil.service`
+- 専用ユーザー/グループ: `veil:veil`
+- ディレクトリ: `/var/www`, `/var/log/veil`, `/var/cache/veil`, `/var/tmp/veil`, `/var/etc/veil`
+
+Ubuntu Docker コンテナでのインストール・起動・curl 動作確認:
+
+```bash
+./packaging/test-docker-install.sh
+```
+
+詳細は [packaging/README.md](../../packaging/README.md) を参照してください（postinst の挙動、トラブルシューティング、設定カスタマイズ）。
+
 > **注意**: `--features full` でビルドする場合、`http3` フィーチャーが quiche にバンドルされた BoringSSL をコンパイルするため `cmake` が、`aws-lc-rs` がアセンブリ最適化を使用するため `nasm` が、それぞれコンテナ内にインストールされている必要があります。`http3` を含まないデフォルトビルドでは cmake は不要です。
 
 > **Cargo フィーチャー**: 利用可能なフィーチャーフラグの一覧は [`Cargo.toml` の `[features]` セクション](../../Cargo.toml) を参照してください。
@@ -3754,23 +3788,29 @@ io_uringは強力な非同期I/Oインターフェースですが、悪用され
 
 #### インストール
 
+自動セットアップには `.deb` パッケージ（[packaging/README.md](../../packaging/README.md)）を使用してください。
+以下は手動インストール手順です。
+
 ```bash
 # 1. 専用ユーザーを作成
 sudo useradd -r -s /sbin/nologin veil
 
 # 2. ディレクトリを作成
-sudo mkdir -p /etc/veil
-sudo mkdir -p /var/log/veil
-sudo chown veil:veil /var/log/veil
+sudo mkdir -p /var/etc/veil/ssl
+sudo mkdir -p /var/log/veil /var/cache/veil /var/tmp/veil
+sudo chown -R veil:veil /var/log/veil /var/cache/veil /var/tmp/veil
 
 # 3. 設定ファイルをコピー
-sudo cp examples/config.toml /etc/veil/
-sudo cp server.crt server.key /etc/veil/
-sudo chmod 600 /etc/veil/server.key
-sudo chown -R veil:veil /etc/veil
+sudo cp contrib/config/config.toml /var/etc/veil/config.toml
+sudo cp server.crt /var/etc/veil/ssl/cert.pem
+sudo cp server.key /var/etc/veil/ssl/key.pem
+sudo chown veil:veil /var/etc/veil/ssl/key.pem
+sudo chmod 600 /var/etc/veil/ssl/key.pem
+sudo chown -R root:veil /var/etc/veil
+sudo chmod 0640 /var/etc/veil/config.toml
 
 # 4. バイナリをインストール
-sudo cp target/release/veil /usr/local/bin/
+sudo cp target/release/veil /usr/bin/veil
 
 # 5. サービスファイルをインストール
 sudo cp contrib/systemd/veil.service /etc/systemd/system/
@@ -3799,8 +3839,9 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
-ReadOnlyPaths=/etc/veil
-ReadWritePaths=/var/log/veil
+LogsDirectory=veil
+CacheDirectory=veil
+ReadOnlyPaths=/var/etc/veil
 
 # === 名前空間隔離 ===
 RestrictNamespaces=yes
@@ -3813,15 +3854,11 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 
 # === セキュリティ強化 ===
 NoNewPrivileges=yes
-MemoryDenyWriteExecute=yes
+# MemoryDenyWriteExecute=yes  # WASM（full ビルド）のため無効
 RestrictSUIDSGID=yes
 
 # === システムコール制限 ===
-# @system-service + io_uring + mlock
-SystemCallFilter=@system-service
-SystemCallFilter=io_uring_setup io_uring_enter io_uring_register
-SystemCallFilter=mlock mlock2 mlockall munlock munlockall
-SystemCallFilter=sched_setaffinity sched_getaffinity
+# config.toml の seccomp/Landlock に委譲（SystemCallFilter は使用しない）
 SystemCallErrorNumber=EPERM
 ```
 
