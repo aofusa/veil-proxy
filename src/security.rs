@@ -2574,4 +2574,90 @@ mod tests {
              got {code}"
         );
     }
+
+    /// F-54: 許可リスト**外**のシステムコールが seccomp で実際に拒否される（意図的発火）ことを
+    /// 子プロセスで実機検証する。
+    ///
+    /// PROT_EXEC 引数フィルタ（`test_seccomp_prot_exec_argument_filter`）が「許可 syscall の
+    /// 引数レベル拒否」を見るのに対し、本テストは「そもそも許可リストに無い syscall」が
+    /// - Filter モードで `EPERM`（`SECCOMP_RET_ERRNO`）
+    /// - Strict モードで `SIGSYS` 即死（`SECCOMP_RET_KILL_PROCESS`）
+    /// になることを検証する。ptrace(2)=101 は allowlist に含まれない
+    /// （`test_allowed_syscalls_no_dangerous` 参照）ため、無害な禁止 syscall プローブに使う。
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn test_seccomp_denies_disallowed_syscall() {
+        const PTRACE_TRACEME: libc::c_long = 0;
+
+        // 子で seccomp を適用し、禁止 syscall ptrace(TRACEME) を呼ぶ。
+        // 戻り値は wait status（生）。適用不可環境は _exit(42) で通知する。
+        // async-signal-safe: フォーク後は libc 直呼びのみ。
+        fn fork_apply_call(filter: &[libc::sock_filter]) -> libc::c_int {
+            let prog = libc::sock_fprog {
+                len: filter.len() as u16,
+                filter: filter.as_ptr() as *mut libc::sock_filter,
+            };
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+                    unsafe { libc::_exit(42) };
+                }
+                let applied = unsafe {
+                    libc::prctl(
+                        libc::PR_SET_SECCOMP,
+                        libc::SECCOMP_MODE_FILTER,
+                        &prog as *const libc::sock_fprog,
+                        0,
+                        0,
+                    )
+                };
+                if applied != 0 {
+                    unsafe { libc::_exit(42) };
+                }
+                // 禁止 syscall。Filter では EPERM 返却、Strict では SIGSYS 即死。
+                let ret = unsafe { libc::syscall(libc::SYS_ptrace, PTRACE_TRACEME, 0, 0, 0) };
+                let errno = unsafe { *libc::__errno_location() };
+                if ret == -1 && errno == libc::EPERM {
+                    unsafe { libc::_exit(1) }; // Filter: 期待どおり拒否
+                }
+                unsafe { libc::_exit(2) }; // 拒否されなかった（想定外）
+            }
+            let mut status: libc::c_int = 0;
+            unsafe { libc::waitpid(pid, &mut status, 0) };
+            status
+        }
+
+        // ---- Filter モード: EPERM で拒否 ----
+        let filter = build_seccomp_filter(SeccompMode::Filter).expect("build filter");
+        let status = fork_apply_call(&filter);
+        assert!(libc::WIFEXITED(status), "Filter child did not exit normally");
+        match libc::WEXITSTATUS(status) {
+            42 => {
+                eprintln!("seccomp could not be applied (no privileges?); skipping");
+                return;
+            }
+            1 => { /* 期待どおり EPERM で拒否 */ }
+            other => panic!(
+                "Filter mode: disallowed ptrace(101) was not denied with EPERM (child code {other})"
+            ),
+        }
+
+        // ---- Strict モード: SIGSYS 即死 ----
+        let strict = build_seccomp_filter(SeccompMode::Strict).expect("build strict filter");
+        let status = fork_apply_call(&strict);
+        if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 42 {
+            eprintln!("seccomp strict could not be applied; skipping strict assertion");
+            return;
+        }
+        assert!(
+            libc::WIFSIGNALED(status),
+            "Strict mode: disallowed syscall must kill the process (SECCOMP_RET_KILL_PROCESS)"
+        );
+        assert_eq!(
+            libc::WTERMSIG(status),
+            libc::SIGSYS,
+            "Strict mode: process must be killed by SIGSYS on a disallowed syscall"
+        );
+    }
 }
