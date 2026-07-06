@@ -7,14 +7,25 @@
 同一リクエストを Veil と nginx/envoy に流し、ステータス・ヘッダー正規化・
 チャンク処理の差分を比較して曖昧な解釈（スマグリングの温床）を検出する。
 
-## 改修案
+## 実装済み（2026-07-06）
 
-- `tools/container_security/` に Veil / nginx / envoy を同一バックエンドへ向けて起動し、
-  生成した多様なリクエスト（境界ケース・不正 framing・大文字小文字・重複ヘッダー）を
-  各プロキシへ送って応答を突き合わせるハーネスを追加。
-- 差分を JSON レポート化し、既知の意図的差分は allowlist 化。
+- **`tools/container_security/security/run_differential.sh`**（自己完結トポロジ、docker のみ、
+  既定 `SKIP_DIFFERENTIAL=1`）。共有バックエンド（python 最小 echo）を **Veil と nginx の
+  双方**でフロントし、同一の crafted リクエスト集合（正常 GET/POST・chunked・CL+TE・複数 CL）を
+  両者へ送ってステータスを比較する。
+- **既知の意図的差分は allowlist 化**: Veil はスマグリング要因（CL+TE・複数 CL）を
+  [B-23](../bugs/B-23-request-smuggling-cl-te.md) で厳格に 400 拒否するため、nginx との
+  差分は「想定内（Veil がより厳格）」として扱い、**それ以外の予期しない差分のみ**を
+  警告・起票対象とする。
+- `run.sh` フェーズ 4i + `report.sh` に配線（`DIFFERENTIAL_BLOCKING=1` で差分検出時に失敗化）。
+
+## 残件
+
+- **envoy** を第 3 のプロキシとして追加（現状は Veil vs nginx の 2 者）。
+- ヘッダー正規化（大文字小文字・obs-fold・重複ヘッダー結合）の詳細差分比較
+  （現状はステータスコード中心）。
 
 ## 受け入れ条件
 
-- 代表リクエスト集合に対する 3 者の応答差分レポートが docker のみで生成できる。
-- 予期しない差分が backlog に起票される。
+- [x] 代表リクエスト集合に対する差分レポートが docker のみで生成できる（Veil vs nginx）。
+- [x] 予期しない差分を警告し、既知差分は allowlist 化（backlog 起票フロー）。

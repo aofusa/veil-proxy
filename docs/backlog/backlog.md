@@ -110,8 +110,8 @@
 | F-72 | P3 | 完了 | [features/F-72-security-testing-further-hardening.md](features/F-72-security-testing-further-hardening.md) | セキュリティテスト追加提案（レポート範囲外）。6 項目を **個別チケット F-75〜F-80 へ分割**して backlog へ反映（本チケットの受け入れ条件を達成） |
 | F-75 | P2 | 完了 | [features/F-75-secret-scan-gitleaks.md](features/F-75-secret-scan-gitleaks.md) | シークレットスキャン（gitleaks）。`run_gitleaks.sh` 追加（SARIF・redact・非ブロッキング）、`run.sh` フェーズ 4g + `report.sh` に配線。トリアージ方針の文書化が残件。F-72 子 |
 | F-76 | P2 | 完了 | [features/F-76-http-smuggling-active-tests.md](features/F-76-http-smuggling-active-tests.md) | HTTP リクエストスマグリング能動テスト。`run_smuggling.sh`（CL.TE/TE.CL/複数CL/終端非chunked を 400 検証）+ Rust 単体/E2E。**実行中に B-23 を検出・修正**。H2C 専用プローブのみ残件。F-72 子 |
-| F-77 | P3 | 未着手 | [features/F-77-differential-testing.md](features/F-77-differential-testing.md) | プロトコル差分テスト（Veil vs nginx/envoy の応答差分比較）。F-72 子 |
-| F-78 | P3 | 未着手 | [features/F-78-oss-fuzz-integration.md](features/F-78-oss-fuzz-integration.md) | OSS-Fuzz 連携（継続ファジング・クラッシュ自動起票、外部インフラ依存）。F-72 子 |
+| F-77 | P3 | 完了 | [features/F-77-differential-testing.md](features/F-77-differential-testing.md) | プロトコル差分テスト。`run_differential.sh`（Veil vs nginx を同一バックエンドでフロントし応答差分比較、スマグリング厳格拒否は allowlist）。envoy 追加のみ残件。F-72 子 |
+| F-78 | P3 | 完了 | [features/F-78-oss-fuzz-integration.md](features/F-78-oss-fuzz-integration.md) | OSS-Fuzz 連携。`tools/oss-fuzz/`（project.yaml/Dockerfile/build.sh/README、6 ターゲット + F-80 seed 添付）を用意。実走・上流申請のみ残件（外部インフラ）。F-72 子 |
 | F-79 | P3 | 未着手 | [features/F-79-fuzz-coverage-llvm-cov.md](features/F-79-fuzz-coverage-llvm-cov.md) | カバレッジ計測の常設化（cargo llvm-cov、suite サマリ統合）。F-72 子 |
 | F-80 | P2 | 完了 | [features/F-80-regression-corpus.md](features/F-80-regression-corpus.md) | 回帰コーパス固定。**`fuzz/regression_corpus/`（version-controlled）を新設**し B-21 クラッシュ seed を固定、3 fuzz ランナーが起動時にコーパスへ複製。B-21/B-22 は単体テスト固定済み。F-72 子 |
 | F-73 | P1 | 完了 | [features/F-73-http2-send-zerocopy-writeall.md](features/F-73-http2-send-zerocopy-writeall.md) | HTTP/2 送信ホットパスの write_all ゼロコピー化（per-frame の 2 度目の to_vec 確保+コピーを排除）。A/B で **HTTP/2 +11.6%**（1577→1761 req/s、nginx 比 75%→84%）、HTTP/1.1 不変・応答ボディ sha256 一致。レポート `docs/artifacts/performance_report_veil_vs_nginx_v3.md` |

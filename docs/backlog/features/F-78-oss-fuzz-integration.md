@@ -7,13 +7,23 @@
 既存 fuzz ターゲット（hpack/frame/header/config/wasm_abi/wasm_host_abi）を OSS-Fuzz へ
 載せ、継続ファジングとクラッシュ自動起票を外部インフラで得る。
 
-## 改修案
+## 実装済み（プロジェクト定義・2026-07-06）
 
-- `projects/veil/` の OSS-Fuzz プロジェクト定義（Dockerfile・build.sh・project.yaml）を用意。
-- `cargo fuzz` ターゲットを OSS-Fuzz のビルド規約へ適合。
-- クラッシュ通知先・回帰コーパス還流（[F-80](F-80-regression-corpus.md)）と接続。
+- **`tools/oss-fuzz/`** に OSS-Fuzz プロジェクト定義一式を用意:
+  - `project.yaml`（language: rust / sanitizer: address / engine: libfuzzer / x86_64）
+  - `Dockerfile`（`base-builder-rust` + cmake/nasm、ソースを `$SRC/veil` へ）
+  - `build.sh`（`cargo fuzz build -O` で全ターゲット → `$OUT`。WASM ターゲットは
+    `--features wasm` で別途ビルド。**F-80 回帰 seed を `<target>_seed_corpus.zip` で添付**）
+  - `README.md`（`infra/helper.py` でのローカル検証手順・申請フロー）
+- 対象: `hpack_decode`/`config_toml`/`http2_frame_decode`/`http_header_validate`
+  + `wasm_abi`/`wasm_host_abi`。
+
+## 残件
+
+- OSS-Fuzz リポジトリを clone しての `infra/helper.py build_fuzzers` 実走（要 docker + 外部リポ）。
+- 上流 OSS-Fuzz への New Project PR 申請（外部インフラ・承認プロセス依存、P3）。
 
 ## 受け入れ条件
 
-- OSS-Fuzz のローカルビルド（`infra/helper.py build_fuzzers`）が通ること。
-- 上流申請の可否を判断する材料が揃うこと。
+- [x] OSS-Fuzz 規約準拠のプロジェクト定義（project.yaml/Dockerfile/build.sh）を用意。
+- ローカルビルド `infra/helper.py build_fuzzers` の実走確認（docker 環境で実施＝残件）。

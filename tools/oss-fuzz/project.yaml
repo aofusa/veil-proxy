@@ -1,0 +1,17 @@
+# F-78: OSS-Fuzz プロジェクト定義（Veil）
+#
+# OSS-Fuzz へ申請する際は本ディレクトリの内容を oss-fuzz リポジトリの
+# `projects/veil/` へ配置する。ローカル検証:
+#   python infra/helper.py build_fuzzers --sanitizer address veil <path-to-veil>
+#   python infra/helper.py check_build veil
+homepage: "https://github.com/aofusa/veil"
+language: rust
+primary_contact: "5000enpcinaofusa@gmail.com"
+main_repo: "https://github.com/aofusa/veil"
+# Rust の libFuzzer は ASAN 前提。TSAN/MSAN は別途（F-71 参照）。
+sanitizers:
+  - address
+fuzzing_engines:
+  - libfuzzer
+architectures:
+  - x86_64
