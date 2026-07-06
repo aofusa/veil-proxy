@@ -215,7 +215,7 @@ mod tests {
         // 到達可能なサーバーに戻したら healthy に回復する
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr2 = listener.local_addr().unwrap().to_string();
-        let _server = std::thread::spawn(move || while let Ok(_) = listener.accept() {});
+        let _server = std::thread::spawn(move || while listener.accept().is_ok() {});
 
         let result2 = perform_tcp_health_check(&addr2, Duration::from_secs(1));
         assert!(result2, "reachable addr should pass health check");

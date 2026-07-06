@@ -150,7 +150,9 @@ mod io_uring_executor_tests {
         for _ in 0..256 {
             let mut buf = [0u8; 96];
             for b in buf.iter_mut() {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 *b = (state >> 33) as u8;
             }
             io_uring_executor_smoke(&buf);

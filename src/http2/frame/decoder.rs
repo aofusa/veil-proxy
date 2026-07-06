@@ -177,7 +177,7 @@ impl FrameDecoder {
             });
         }
 
-        if payload.len() % 6 != 0 {
+        if !payload.len().is_multiple_of(6) {
             return Err(Http2Error::frame_size_error(
                 "SETTINGS payload must be multiple of 6",
             ));

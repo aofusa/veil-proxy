@@ -555,32 +555,26 @@ pub fn find_backend_unified(
     );
 
     // Phase 4: キャッシュチェック
+    // キャッシュが「マッチなし」（Some(None)）の場合も header/query 条件は動的なため
+    // フォールスルーして全ルートを再評価する。
     let cache_key = routing::RouteCacheKey::new(host, path, method, source_ip);
-    if let Some(cached_result) = optimized_router.try_cache(&cache_key) {
-        match cached_result {
-            Some(route_idx) => {
-                // キャッシュヒット: ルートが見つかっている
-                if let Some(route) = routes.get(route_idx) {
-                    // 条件が変わっていないか確認（header/query/methodは動的）
-                    if matches_conditions(
-                        &route.conditions,
-                        host,
-                        path,
-                        method,
-                        headers,
-                        raw_query,
-                        source_ip,
-                    ) {
-                        if let Ok(backend) = load_backend(route, upstream_groups) {
-                            let prefix = extract_path_prefix(route);
-                            return Some((prefix, backend));
-                        }
-                    }
+    if let Some(Some(route_idx)) = optimized_router.try_cache(&cache_key) {
+        // キャッシュヒット: ルートが見つかっている
+        if let Some(route) = routes.get(route_idx) {
+            // 条件が変わっていないか確認（header/query/methodは動的）
+            if matches_conditions(
+                &route.conditions,
+                host,
+                path,
+                method,
+                headers,
+                raw_query,
+                source_ip,
+            ) {
+                if let Ok(backend) = load_backend(route, upstream_groups) {
+                    let prefix = extract_path_prefix(route);
+                    return Some((prefix, backend));
                 }
-            }
-            None => {
-                // キャッシュが「マッチなし」を示しているが、header/query条件は動的なため
-                // フォールスルーして全ルートを再評価する
             }
         }
     }
@@ -753,7 +747,7 @@ pub(crate) fn find_backend_linear(
                 Ok(backend) => {
                     let prefix = extract_path_prefix(route);
                     // キャッシュに保存
-                    optimized_router.cache_result(cache_key.clone(), Some(i));
+                    optimized_router.cache_result(*cache_key, Some(i));
                     return Some((prefix, backend));
                 }
                 Err(e) => {
@@ -776,7 +770,7 @@ pub(crate) fn find_backend_linear(
     );
 
     // キャッシュにマッチなしを保存
-    optimized_router.cache_result(cache_key.clone(), None);
+    optimized_router.cache_result(*cache_key, None);
     None
 }
 
@@ -795,18 +789,16 @@ fn matches_wildcard(pattern: &str, text: &str) -> bool {
 
     // 先頭ワイルドカード: "*.example.com"
     if let Some(rest) = pattern.strip_prefix("*.") {
-        if text.ends_with(rest) {
+        if let Some(subdomain) = text.strip_suffix(rest) {
             // サブドメインのチェック（少なくとも1つのドットが必要）
-            let subdomain = &text[..text.len() - rest.len()];
             return !subdomain.is_empty() && !subdomain.contains('.');
         }
     }
 
     // 末尾ワイルドカード: "api.*"
     if let Some(rest) = pattern.strip_suffix(".*") {
-        if text.starts_with(rest) {
+        if let Some(domain) = text.strip_prefix(rest) {
             // ドメイン部分のチェック
-            let domain = &text[rest.len()..];
             return !domain.is_empty() && domain.starts_with('.');
         }
     }
@@ -838,9 +830,8 @@ fn matches_path_pattern(pattern: &str, path: &[u8]) -> bool {
     }
 
     // プレフィックス一致（末尾スラッシュなしでもマッチ）
-    if path_str.starts_with(pattern) {
+    if let Some(remaining) = path_str.strip_prefix(pattern) {
         // パターンが完全一致、または次の文字がスラッシュ
-        let remaining = &path_str[pattern.len()..];
         return remaining.is_empty() || remaining.starts_with('/');
     }
 

@@ -876,8 +876,8 @@ mod lifecycle_callback_tests {
         let delete_context: i32 = 0;
         let keep_alive: i32 = 1;
 
-        assert_eq!(delete_context != 0, false);
-        assert_eq!(keep_alive != 0, true);
+        assert!(delete_context == 0);
+        assert!(keep_alive != 0);
     }
 
     /// Test multiple context IDs for lifecycle

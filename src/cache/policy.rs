@@ -251,10 +251,10 @@ impl CachePolicy {
                 if cc.no_cache || cc.no_store {
                     return true;
                 }
-            } else if name.eq_ignore_ascii_case(b"pragma") {
-                if value.eq_ignore_ascii_case(b"no-cache") {
-                    return true;
-                }
+            } else if name.eq_ignore_ascii_case(b"pragma")
+                && value.eq_ignore_ascii_case(b"no-cache")
+            {
+                return true;
             }
         }
         false

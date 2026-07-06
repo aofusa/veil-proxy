@@ -909,15 +909,15 @@ mod tests {
         // GSO セグメントサイズは適切な値
         // 通常のQUICパケットサイズに合わせて設定
         assert_eq!(GSO_SEGMENT_SIZE, 1200);
-        assert!(GSO_SEGMENT_SIZE > 0);
-        assert!(GSO_SEGMENT_SIZE <= 65535); // UDPペイロード最大
+        const _: () = assert!(GSO_SEGMENT_SIZE > 0);
+        const _: () = assert!(GSO_SEGMENT_SIZE <= 65535); // UDPペイロード最大
     }
 
     #[test]
     fn test_recv_buffer_size() {
         // 受信バッファサイズは十分な大きさ
         assert_eq!(RECV_BUFFER_SIZE, 65536);
-        assert!(RECV_BUFFER_SIZE >= GSO_SEGMENT_SIZE);
+        const _: () = assert!(RECV_BUFFER_SIZE >= GSO_SEGMENT_SIZE);
     }
 
     // ====================

@@ -218,9 +218,7 @@ impl CidrRange {
             for part in &left_parts {
                 all_parts.push(u16::from_str_radix(part, 16).ok()?);
             }
-            for _ in 0..missing {
-                all_parts.push(0);
-            }
+            all_parts.resize(all_parts.len() + missing, 0);
             for part in &right_parts {
                 all_parts.push(u16::from_str_radix(part, 16).ok()?);
             }
@@ -957,22 +955,22 @@ impl CompressionConfig {
 
         // 6. クライアントがサポートし、かつ設定で許可されている圧縮方式を選択
         let client_supports = |enc: &str| -> bool {
-            match (enc, client_encoding) {
-                ("zstd", AcceptedEncoding::Zstd) => true,
-                ("br", AcceptedEncoding::Brotli | AcceptedEncoding::Zstd) => true,
-                (
-                    "gzip",
-                    AcceptedEncoding::Gzip | AcceptedEncoding::Brotli | AcceptedEncoding::Zstd,
-                ) => true,
-                (
-                    "deflate",
-                    AcceptedEncoding::Deflate
-                    | AcceptedEncoding::Gzip
-                    | AcceptedEncoding::Brotli
-                    | AcceptedEncoding::Zstd,
-                ) => true,
-                _ => false,
-            }
+            matches!(
+                (enc, client_encoding),
+                ("zstd", AcceptedEncoding::Zstd)
+                    | ("br", AcceptedEncoding::Brotli | AcceptedEncoding::Zstd)
+                    | (
+                        "gzip",
+                        AcceptedEncoding::Gzip | AcceptedEncoding::Brotli | AcceptedEncoding::Zstd,
+                    )
+                    | (
+                        "deflate",
+                        AcceptedEncoding::Deflate
+                            | AcceptedEncoding::Gzip
+                            | AcceptedEncoding::Brotli
+                            | AcceptedEncoding::Zstd,
+                    )
+            )
         };
 
         for enc in &self.preferred_encodings {
@@ -2229,19 +2227,15 @@ fn default_outlier_max_eject_percent() -> u32 {
 /// ヘルスチェックの種別（F-22）
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum HealthCheckType {
     /// HTTP/HTTPS リクエストを送信してステータスコードを確認（デフォルト）
+    #[default]
     Http,
     /// TCP 接続の確立可否のみ確認
     Tcp,
     /// gRPC Health Checking Protocol (grpc.health.v1.Health/Check)
     Grpc,
-}
-
-impl Default for HealthCheckType {
-    fn default() -> Self {
-        HealthCheckType::Http
-    }
 }
 
 /// 健康チェック設定
@@ -2321,7 +2315,7 @@ impl Default for HealthCheckConfig {
 ///
 /// すべての条件はANDで結合されます。
 /// 条件が指定されていない場合は、すべてのリクエストにマッチします（デフォルトルート）。
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Default)]
 pub struct RouteConditions {
     /// host-header: ホスト名マッチ（ワイルドカード対応）
     /// 例: "api.example.com", "*.example.com"
@@ -2352,19 +2346,6 @@ pub struct RouteConditions {
     /// 例: ["192.168.0.0/16", "10.0.0.0/8"]
     #[serde(default)]
     pub source_ip: Option<Vec<String>>,
-}
-
-impl Default for RouteConditions {
-    fn default() -> Self {
-        Self {
-            host: None,
-            path: None,
-            header: None,
-            method: None,
-            query: None,
-            source_ip: None,
-        }
-    }
 }
 
 /// ルーティングルール
@@ -2466,8 +2447,10 @@ struct Config {
 /// L4 TLS モード
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum L4TlsMode {
     /// TLS なし（プレーンな TCP）
+    #[default]
     None,
     /// TLS パススルー（TLS を復号せず upstream にそのまま転送）
     Passthrough,
@@ -2475,26 +2458,16 @@ pub enum L4TlsMode {
     Terminate,
 }
 
-impl Default for L4TlsMode {
-    fn default() -> Self {
-        L4TlsMode::None
-    }
-}
-
 /// L4 ロードバランシングアルゴリズム
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum L4LbAlgorithm {
     /// ラウンドロビン（デフォルト）
+    #[default]
     RoundRobin,
     /// 最小接続数
     LeastConn,
-}
-
-impl Default for L4LbAlgorithm {
-    fn default() -> Self {
-        L4LbAlgorithm::RoundRobin
-    }
 }
 
 /// L4 upstream バックエンド
@@ -2747,7 +2720,7 @@ impl Http3CompressionConfig {
     /// 設定の妥当性を検証
     pub fn validate(&self) -> Result<(), String> {
         if let Some(level) = self.gzip_level {
-            if level < 1 || level > 9 {
+            if !(1..=9).contains(&level) {
                 return Err(format!(
                     "http3.compression.gzip_level: {} (must be 1-9)",
                     level
@@ -2763,7 +2736,7 @@ impl Http3CompressionConfig {
             }
         }
         if let Some(level) = self.zstd_level {
-            if level < 1 || level > 22 {
+            if !(1..=22).contains(&level) {
                 return Err(format!(
                     "http3.compression.zstd_level: {} (must be 1-22)",
                     level
@@ -3377,6 +3350,7 @@ pub enum BackendConfig {
     /// 単一URLプロキシ（後方互換性のため維持）
     /// - sni_name: TLS接続時のSNI名（IP直打ち時にドメイン名を指定可能）
     /// - use_h2c: H2C (HTTP/2 over cleartext) を使用するかどうか
+    ///
     /// 注意: security, compression, buffering, cache, modules は route 直下で設定
     Proxy {
         url: String,
@@ -3390,6 +3364,7 @@ pub enum BackendConfig {
     /// - path: ファイルまたはディレクトリのパス
     /// - mode: "sendfile" または "memory"
     /// - index: ディレクトリアクセス時に返すファイル名（デフォルト: "index.html"）
+    ///
     /// 注意: security, cache, open_file_cache, modules は route 直下で設定
     File {
         path: String,
@@ -3400,6 +3375,7 @@ pub enum BackendConfig {
     /// - redirect_url: リダイレクト先URL（$request_uri, $host, $path 変数使用可能）
     /// - redirect_status: ステータスコード（301, 302, 307, 308）
     /// - preserve_path: 元のパスをリダイレクト先に追加するか
+    ///
     /// 注意: modules は route 直下で設定
     Redirect {
         redirect_url: String,
@@ -3508,7 +3484,7 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                             preserve_path,
                         })
                     }
-                    "File" | _ => {
+                    _ => {
                         let path = path.ok_or_else(|| serde::de::Error::missing_field("path"))?;
                         let mode = mode.unwrap_or_else(|| "sendfile".to_string());
                         Ok(BackendConfig::File { path, mode, index })
@@ -3639,10 +3615,10 @@ pub struct ProxyTarget {
 
 impl ProxyTarget {
     pub fn parse(url: &str) -> Option<Self> {
-        let (scheme, rest) = if url.starts_with("https://") {
-            (true, &url[8..])
-        } else if url.starts_with("http://") {
-            (false, &url[7..])
+        let (scheme, rest) = if let Some(rest) = url.strip_prefix("https://") {
+            (true, rest)
+        } else if let Some(rest) = url.strip_prefix("http://") {
+            (false, rest)
         } else {
             return None;
         };
@@ -4353,6 +4329,11 @@ impl UpstreamGroup {
     /// サーバー数を取得
     pub fn len(&self) -> usize {
         self.servers.len()
+    }
+
+    /// サーバーが空かどうか
+    pub fn is_empty(&self) -> bool {
+        self.servers.is_empty()
     }
 
     /// TLS証明書検証を無効化するかどうかを取得
@@ -5534,22 +5515,10 @@ pub fn load_backend(
     upstream_groups: &HashMap<String, Arc<UpstreamGroup>>,
 ) -> io::Result<Backend> {
     // Routeレベルの設定を取得（route直下の設定のみを使用）
-    let security = route
-        .security
-        .as_ref()
-        .map(|s| s.clone())
-        .unwrap_or_default();
-    let compression = route
-        .compression
-        .as_ref()
-        .map(|c| c.clone())
-        .unwrap_or_default();
-    let buffering = route
-        .buffering
-        .as_ref()
-        .map(|b| b.clone())
-        .unwrap_or_default();
-    let cache = route.cache.as_ref().map(|c| c.clone()).unwrap_or_default();
+    let security = route.security.clone().unwrap_or_default();
+    let compression = route.compression.clone().unwrap_or_default();
+    let buffering = route.buffering.clone().unwrap_or_default();
+    let cache = route.cache.clone().unwrap_or_default();
     let modules_arc = route.modules.as_ref().map(|m| Arc::new(m.clone()));
 
     match &route.action {
@@ -5651,12 +5620,8 @@ pub fn load_backend(
         }
         BackendConfig::File { path, mode, index } => {
             // Routeレベルの設定のみを使用
-            let security = route
-                .security
-                .as_ref()
-                .map(|s| s.clone())
-                .unwrap_or_default();
-            let cache = route.cache.as_ref().map(|c| c.clone()).unwrap_or_default();
+            let security = route.security.clone().unwrap_or_default();
+            let cache = route.cache.clone().unwrap_or_default();
             let metadata = fs::metadata(path).map_err(|e| {
                 let error_msg = format!(
                     "Failed to access file '{}': {} (error code: {})",

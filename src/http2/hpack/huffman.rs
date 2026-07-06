@@ -377,7 +377,7 @@ pub fn huffman_encoded_len(src: &[u8]) -> usize {
     for &byte in src {
         bits += HUFFMAN_ENCODE_TABLE[byte as usize].1 as usize;
     }
-    (bits + 7) / 8
+    bits.div_ceil(8)
 }
 
 #[cfg(test)]

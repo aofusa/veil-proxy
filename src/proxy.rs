@@ -16,9 +16,8 @@ use ftlog::{debug, error, info, warn};
 use httparse::{Request, Status};
 use std::io;
 use std::net::SocketAddr;
-use std::path::Path;
 #[cfg(feature = "http2")]
-use std::path::PathBuf;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::buffering;
@@ -276,10 +275,10 @@ pub fn check_security(
     }
 
     // レートリミットチェック
-    if security.rate_limit_requests_per_min > 0 {
-        if !check_rate_limit(client_ip, security.rate_limit_requests_per_min) {
-            return SecurityCheckResult::RateLimitExceeded;
-        }
+    if security.rate_limit_requests_per_min > 0
+        && !check_rate_limit(client_ip, security.rate_limit_requests_per_min)
+    {
+        return SecurityCheckResult::RateLimitExceeded;
     }
 
     // ボディサイズ制限（chunked以外）
@@ -1011,7 +1010,7 @@ async fn handle_h2_request_streaming<S>(
     let (upstream_group, security, compression, buffering) = match &backend {
         Backend::Proxy(ug, sec, comp, buf, _cache, modules) => {
             // WASM モジュール適用ルートはボディフィルタが全ボディを要求しうるため非対象
-            if modules.as_ref().map_or(false, |m| !m.is_empty()) {
+            if modules.as_ref().is_some_and(|m| !m.is_empty()) {
                 return;
             }
             (ug.clone(), sec.clone(), comp.clone(), buf.clone())
@@ -1073,8 +1072,7 @@ async fn handle_h2_request_streaming<S>(
         path_str.to_string()
     } else {
         let prefix_str = std::str::from_utf8(&prefix).unwrap_or("");
-        if path_str.starts_with(prefix_str) {
-            let remaining = &path_str[prefix_str.len()..];
+        if let Some(remaining) = path_str.strip_prefix(prefix_str) {
             let base = target.path_prefix.trim_end_matches('/');
             build_sub_path(base, remaining)
         } else {
@@ -1121,7 +1119,7 @@ async fn handle_h2_request_streaming<S>(
     let start_instant = Instant::now();
 
     // --- バックエンド接続 + ストリーミング ---
-    let connect_result = timeout(CONNECT_TIMEOUT, TcpStream::connect_str(&addr)).await;
+    let connect_result = timeout(CONNECT_TIMEOUT, TcpStream::connect_str(addr)).await;
     let backend_tcp = match connect_result {
         Ok(Ok(s)) => s,
         _ => {
@@ -1651,8 +1649,7 @@ where
         path_str.to_string()
     } else {
         let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
-        if path_str.starts_with(prefix_str) {
-            let remaining = &path_str[prefix_str.len()..];
+        if let Some(remaining) = path_str.strip_prefix(prefix_str) {
             let base = target.path_prefix.trim_end_matches('/');
             build_sub_path(base, remaining)
         } else {
@@ -1728,7 +1725,7 @@ where
         handle_http2_proxy_h2c(
             conn,
             stream_id,
-            &addr,
+            addr,
             target,
             request_body.to_vec(),
             method,
@@ -1740,7 +1737,7 @@ where
         handle_http2_proxy_https(
             conn,
             stream_id,
-            &addr,
+            addr,
             target.sni(),
             request,
             compression,
@@ -1749,15 +1746,7 @@ where
         .await
     } else {
         // HTTP/2 → HTTP (HTTP/1.1)
-        handle_http2_proxy_http(
-            conn,
-            stream_id,
-            &addr,
-            request,
-            compression,
-            client_encoding,
-        )
-        .await
+        handle_http2_proxy_http(conn, stream_id, addr, request, compression, client_encoding).await
     };
 
     server.release();
@@ -2799,7 +2788,7 @@ fn compress_body_h2(
 async fn handle_http2_sendfile<S>(
     conn: &mut http2::Http2Connection<S>,
     stream_id: u32,
-    base_path: &PathBuf,
+    base_path: &Path,
     is_dir: bool,
     index_file: Option<&str>,
     req_path: &[u8],
@@ -2842,7 +2831,7 @@ where
 
     // ファイルパス構築
     let file_path = if is_dir {
-        let mut p = base_path.clone();
+        let mut p = base_path.to_path_buf();
         if clean_sub.is_empty() || clean_sub == "/" {
             p.push(index_file.unwrap_or("index.html"));
         } else {
@@ -2864,7 +2853,7 @@ where
                 .await;
             return Some((404, 9));
         }
-        base_path.clone()
+        base_path.to_path_buf()
     };
 
     // ファイル読み込み（io_uring による非同期I/O でワーカースレッドをブロックしない）
@@ -3037,8 +3026,7 @@ impl<S: AsyncReadRent + Unpin> AsyncReadRent for BufferedStream<S> {
         // 現在の実装では readv は使用しないため、バッファがある場合は未サポート
         if self.buffer.is_some() {
             return (
-                Err(io::Error::new(
-                    io::ErrorKind::Other,
+                Err(io::Error::other(
                     "readv not supported for BufferedStream with data",
                 )),
                 buf,
@@ -3432,6 +3420,10 @@ async fn lingering_drain_before_close(stream: &mut ServerTls) {
 }
 
 // 統一されたリクエスト処理ループ（型エイリアスを使用）
+// clippy::drop_non_drop 許容理由: `req` はヘッダバッファ（accumulated）への借用を保持する
+// 非 Drop 型で、`drop(req)` は借用領域を明示的に終わらせて後続の可変利用を許すための
+// 意図的な記述（`let _ =` より意図が明確なため維持する）。
+#[allow(clippy::drop_non_drop)]
 async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: SocketAddr) {
     let mut accumulated = Vec::with_capacity(BUF_SIZE);
 
@@ -3486,12 +3478,9 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                         .position(|&b| b == b' ')
                         .and_then(|method_end| {
                             let after_method = &request_line[method_end + 1..];
-                            after_method
-                                .iter()
-                                .rposition(|&b| b == b' ')
-                                .map(|uri_end| uri_end)
+                            after_method.iter().rposition(|&b| b == b' ')
                         })
-                        .map_or(false, |uri_len| uri_len > MAX_HEADER_SIZE);
+                        .is_some_and(|uri_len| uri_len > MAX_HEADER_SIZE);
 
                     if uri_too_long {
                         ERR_MSG_URI_TOO_LONG
@@ -3721,22 +3710,19 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
 
                         let write_result =
                             timeout(WRITE_TIMEOUT, tls_stream.write_all(metrics_response)).await;
-                        match write_result {
-                            Ok((Ok(_), _)) => {
-                                log_access(
-                                    &method_bytes,
-                                    &host_bytes,
-                                    &path_bytes,
-                                    &user_agent,
-                                    0,
-                                    200,
-                                    resp_size,
-                                    start_instant,
-                                    client_ip,
-                                    "",
-                                );
-                            }
-                            _ => {}
+                        if let Ok((Ok(_), _)) = write_result {
+                            log_access(
+                                &method_bytes,
+                                &host_bytes,
+                                &path_bytes,
+                                &user_agent,
+                                0,
+                                200,
+                                resp_size,
+                                start_instant,
+                                client_ip,
+                                "",
+                            );
                         }
 
                         // メトリクスエンドポイントは常に接続を閉じる
@@ -4008,12 +3994,12 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                 }
 
                 // レートリミットチェック
-                if security.rate_limit_requests_per_min > 0 {
-                    if !check_rate_limit(client_ip, security.rate_limit_requests_per_min) {
-                        let err_buf = ERR_MSG_TOO_MANY_REQUESTS.to_vec();
-                        let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
-                        return;
-                    }
+                if security.rate_limit_requests_per_min > 0
+                    && !check_rate_limit(client_ip, security.rate_limit_requests_per_min)
+                {
+                    let err_buf = ERR_MSG_TOO_MANY_REQUESTS.to_vec();
+                    let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+                    return;
                 }
 
                 // 初期ボディ（ヘッダー後のデータ）
@@ -4115,28 +4101,25 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                                     let write_result =
                                         timeout(WRITE_TIMEOUT, tls_stream.write_all(response))
                                             .await;
-                                    match write_result {
-                                        Ok((Ok(_), _)) => {
-                                            log_access(
-                                                &method_bytes,
-                                                &host_bytes,
-                                                &path_bytes,
-                                                &user_agent,
-                                                0,
-                                                resp.status_code,
-                                                resp_size,
-                                                start_instant,
-                                                client_ip,
-                                                "",
-                                            );
-                                            // WASMライフサイクルコールバック: リクエスト完了
-                                            crate::wasm::on_request_complete_async(
-                                                wasm_engine.clone(),
-                                                modules_to_apply.clone(),
-                                            )
-                                            .await;
-                                        }
-                                        _ => {}
+                                    if let Ok((Ok(_), _)) = write_result {
+                                        log_access(
+                                            &method_bytes,
+                                            &host_bytes,
+                                            &path_bytes,
+                                            &user_agent,
+                                            0,
+                                            resp.status_code,
+                                            resp_size,
+                                            start_instant,
+                                            client_ip,
+                                            "",
+                                        );
+                                        // WASMライフサイクルコールバック: リクエスト完了
+                                        crate::wasm::on_request_complete_async(
+                                            wasm_engine.clone(),
+                                            modules_to_apply.clone(),
+                                        )
+                                        .await;
                                     }
                                     accumulated.clear();
                                     return;
@@ -4198,37 +4181,34 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
 
                         server.release();
 
-                        match ws_result {
-                            Some((status, resp_size)) => {
-                                log_access(
-                                    &method_bytes,
-                                    &host_bytes,
-                                    &path_bytes,
-                                    &user_agent,
-                                    content_length as u64,
-                                    status,
-                                    resp_size,
-                                    start_instant,
-                                    client_ip,
-                                    "",
-                                );
+                        if let Some((status, resp_size)) = ws_result {
+                            log_access(
+                                &method_bytes,
+                                &host_bytes,
+                                &path_bytes,
+                                &user_agent,
+                                content_length as u64,
+                                status,
+                                resp_size,
+                                start_instant,
+                                client_ip,
+                                "",
+                            );
 
-                                // WASMライフサイクルコールバック: リクエスト完了
-                                #[cfg(feature = "wasm")]
-                                {
-                                    if !modules_to_apply.is_empty() {
-                                        let config = CURRENT_CONFIG.load();
-                                        if let Some(ref wasm_engine) = config.wasm_filter_engine {
-                                            crate::wasm::on_request_complete_async(
-                                                wasm_engine.clone(),
-                                                modules_to_apply.clone(),
-                                            )
-                                            .await;
-                                        }
+                            // WASMライフサイクルコールバック: リクエスト完了
+                            #[cfg(feature = "wasm")]
+                            {
+                                if !modules_to_apply.is_empty() {
+                                    let config = CURRENT_CONFIG.load();
+                                    if let Some(ref wasm_engine) = config.wasm_filter_engine {
+                                        crate::wasm::on_request_complete_async(
+                                            wasm_engine.clone(),
+                                            modules_to_apply.clone(),
+                                        )
+                                        .await;
                                     }
                                 }
                             }
-                            None => {}
                         }
                         // WebSocket 接続終了後は HTTP 接続も終了
                         return;
@@ -4408,12 +4388,12 @@ async fn handle_backend(
     // Proxy バックエンドはリクエストボディを上流へ転送して消費する。それ以外（File/Memory/
     // Redirect 等のローカル応答）はボディを読まないため、keep-alive 接続でボディが次の
     // リクエストに混入して 400 desync を起こす。ローカル応答の前に残りのボディを読み捨てる。
-    if !matches!(backend, Backend::Proxy(..)) && (is_chunked || content_length > initial_body.len())
+    if !matches!(backend, Backend::Proxy(..))
+        && (is_chunked || content_length > initial_body.len())
+        && !drain_request_body(&mut tls_stream, content_length, is_chunked, initial_body).await
     {
-        if !drain_request_body(&mut tls_stream, content_length, is_chunked, initial_body).await {
-            // ドレイン失敗（接続が汚染されている可能性）→ 接続を閉じる
-            return Some((tls_stream, 400, 0, true));
-        }
+        // ドレイン失敗（接続が汚染されている可能性）→ 接続を閉じる
+        return Some((tls_stream, 400, 0, true));
     }
     match backend {
         Backend::Proxy(upstream_group, security, compression, buffering, cache, _) => {
@@ -4496,7 +4476,7 @@ async fn handle_backend(
                                     return None;
                                 }
                                 let colon_pos = line_trimmed.find(':')?;
-                                let name = line_trimmed[..colon_pos].as_bytes().to_vec();
+                                let name = line_trimmed.as_bytes()[..colon_pos].to_vec();
                                 let value = line_trimmed[colon_pos + 1..]
                                     .trim_start()
                                     .as_bytes()
@@ -4741,8 +4721,7 @@ async fn handle_websocket_proxy(
         path_str.to_string()
     } else {
         let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
-        if path_str.starts_with(prefix_str) {
-            let remaining = &path_str[prefix_str.len()..];
+        if let Some(remaining) = path_str.strip_prefix(prefix_str) {
             let base = target.path_prefix.trim_end_matches('/');
             build_sub_path(base, remaining)
         } else {
@@ -4829,7 +4808,7 @@ async fn handle_websocket_proxy_http(
     // バックエンドに接続
     let addr = HostPortStr::new(&target.host, target.port); // F-41: スタック上に構築（ヒープ確保なし）
     let addr = addr.as_str();
-    let connect_result = timeout(connect_timeout, TcpStream::connect_str(&addr)).await;
+    let connect_result = timeout(connect_timeout, TcpStream::connect_str(addr)).await;
 
     let mut backend_stream = match connect_result {
         Ok(Ok(stream)) => {
@@ -4943,7 +4922,7 @@ async fn handle_websocket_proxy_https(
     // バックエンドに TCP 接続
     let addr = HostPortStr::new(&target.host, target.port); // F-41: スタック上に構築（ヒープ確保なし）
     let addr = addr.as_str();
-    let connect_result = timeout(connect_timeout, TcpStream::connect_str(&addr)).await;
+    let connect_result = timeout(connect_timeout, TcpStream::connect_str(addr)).await;
 
     let backend_tcp = match connect_result {
         Ok(Ok(stream)) => {
@@ -5628,8 +5607,7 @@ async fn handle_proxy(
         path_str.to_string()
     } else {
         let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
-        if path_str.starts_with(prefix_str) {
-            let remaining = &path_str[prefix_str.len()..];
+        if let Some(remaining) = path_str.strip_prefix(prefix_str) {
             let base = target.path_prefix.trim_end_matches('/');
             build_sub_path(base, remaining)
         } else {
@@ -5946,7 +5924,7 @@ async fn handle_proxy(
                                     }
                                 }
                             } else if let Some(disk_path) = stale_entry.disk_path() {
-                                match serve_from_disk_cache(
+                                if let Some((code, size)) = serve_from_disk_cache(
                                     &mut client_stream,
                                     &stale_entry,
                                     disk_path,
@@ -5955,15 +5933,7 @@ async fn handle_proxy(
                                 )
                                 .await
                                 {
-                                    Some((code, size)) => {
-                                        return Some((
-                                            client_stream,
-                                            code,
-                                            size,
-                                            client_wants_close,
-                                        ));
-                                    }
-                                    None => {}
+                                    return Some((client_stream, code, size, client_wants_close));
                                 }
                             }
                         }
@@ -6009,7 +5979,7 @@ async fn proxy_http_pooled(
             // 新規接続を作成
             let addr = HostPortStr::new(&target.host, target.port); // F-41: スタック上に構築（ヒープ確保なし）
             let addr = addr.as_str();
-            let connect_result = timeout(connect_timeout, TcpStream::connect_str(&addr)).await;
+            let connect_result = timeout(connect_timeout, TcpStream::connect_str(addr)).await;
 
             match connect_result {
                 Ok(Ok(stream)) => {
@@ -6109,7 +6079,7 @@ async fn proxy_http_pooled(
                 "Calling proxy_request_buffered for {} {}",
                 target.host, target.port
             );
-            record_buffering_used(&host_str_for_metrics);
+            record_buffering_used(host_str_for_metrics);
             proxy_request_buffered(
                 &mut client_stream,
                 &mut backend_stream,
@@ -6245,7 +6215,7 @@ async fn proxy_h2c(
     // バックエンドに接続
     let addr = HostPortStr::new(&target.host, target.port); // F-41: スタック上に構築（ヒープ確保なし）
     let addr = addr.as_str();
-    let connect_result = timeout(connect_timeout, TcpStream::connect_str(&addr)).await;
+    let connect_result = timeout(connect_timeout, TcpStream::connect_str(addr)).await;
 
     let backend_stream = match connect_result {
         Ok(Ok(stream)) => {
@@ -6818,7 +6788,7 @@ where
 
     if let Some(cl) = content_length {
         // Content-Length 転送
-        let cl_usize = cl as usize;
+        let cl_usize = cl;
         let remaining = cl.saturating_sub(body.len());
 
         // バッファサイズ制限チェック (メモリ)
@@ -7490,7 +7460,7 @@ async fn transfer_response_with_compression(
                                             return None;
                                         }
                                         let colon_pos = line_trimmed.find(':')?;
-                                        let name = line_trimmed[..colon_pos].as_bytes().to_vec();
+                                        let name = line_trimmed.as_bytes()[..colon_pos].to_vec();
                                         let value = line_trimmed[colon_pos + 1..]
                                             .trim_start()
                                             .as_bytes()
@@ -8382,13 +8352,12 @@ async fn splice_transfer_response_ktls(
                 let mut chunked_decoder = ChunkedDecoder::new_unlimited();
 
                 // 初期ボディ部分をデコーダにフィード
-                if body_start_len > 0 {
-                    if chunked_decoder.feed(&accumulated[header_len..])
+                if body_start_len > 0
+                    && chunked_decoder.feed(&accumulated[header_len..])
                         == ChunkedFeedResult::Complete
-                    {
-                        // 初期ボディで完了
-                        return (status_code, total, backend_wants_keep_alive, false);
-                    }
+                {
+                    // 初期ボディで完了
+                    return (status_code, total, backend_wants_keep_alive, false);
                 }
 
                 // 残りの Chunked ボディを転送
@@ -8416,7 +8385,7 @@ async fn splice_transfer_response_ktls(
 
                     let feed_result = chunked_decoder.feed(&header_buf[..n]);
 
-                    if let Err(_) = async_raw_write_all(client_tcp, &header_buf[..n]).await {
+                    if (async_raw_write_all(client_tcp, &header_buf[..n]).await).is_err() {
                         backend_wants_keep_alive = false;
                         client_must_close = true;
                         break;
@@ -8461,7 +8430,7 @@ async fn splice_transfer_response_ktls(
                         Ok(Err(_)) | Err(_) => break,
                     };
 
-                    if let Err(_) = async_raw_write_all(client_tcp, &header_buf[..n]).await {
+                    if (async_raw_write_all(client_tcp, &header_buf[..n]).await).is_err() {
                         break;
                     }
                     total += n as u64;
@@ -8506,7 +8475,7 @@ async fn connect_https_backend_fresh(
 ) -> Result<ClientTls, (u16, &'static [u8])> {
     let addr = HostPortStr::new(&target.host, target.port); // F-41: スタック上に構築（ヒープ確保なし）
     let addr = addr.as_str();
-    let backend_tcp = match timeout(connect_timeout, TcpStream::connect_str(&addr)).await {
+    let backend_tcp = match timeout(connect_timeout, TcpStream::connect_str(addr)).await {
         Ok(Ok(stream)) => {
             let _ = stream.set_nodelay(true);
             stream
@@ -8608,10 +8577,7 @@ async fn proxy_https_pooled(
 
         // リトライ可能要求は複製を渡し（次の試行のため原本を保持）、それ以外は move する。
         let req = if replayable {
-            request_holder
-                .as_ref()
-                .map(|r| r.clone())
-                .unwrap_or_default()
+            request_holder.clone().unwrap_or_default()
         } else {
             request_holder.take().unwrap_or_default()
         };
@@ -8622,7 +8588,7 @@ async fn proxy_https_pooled(
             && (!compression.enabled || client_encoding == AcceptedEncoding::Identity)
         {
             let host_str_for_metrics = &target.host;
-            record_buffering_used(&host_str_for_metrics);
+            record_buffering_used(host_str_for_metrics);
             proxy_request_buffered(
                 &mut client_stream,
                 &mut backend_stream,
@@ -8950,7 +8916,7 @@ async fn transfer_https_response_with_compression(
                                             return None;
                                         }
                                         let colon_pos = line_trimmed.find(':')?;
-                                        let name = line_trimmed[..colon_pos].as_bytes().to_vec();
+                                        let name = line_trimmed.as_bytes()[..colon_pos].to_vec();
                                         let value = line_trimmed[colon_pos + 1..]
                                             .trim_start()
                                             .as_bytes()
@@ -8969,29 +8935,27 @@ async fn transfer_https_response_with_compression(
                                     )
                                     .await;
 
-                                match wasm_result {
-                                    crate::wasm::FilterResult::Continue {
-                                        headers: modified_headers_wasm,
-                                        ..
-                                    } => {
-                                        new_header_lines.clear();
-                                        let status_line = format!(
-                                            "HTTP/1.1 {} {}\r\n",
-                                            status_code,
-                                            status_code_to_reason(status_code)
-                                        );
-                                        new_header_lines.push(status_line.into_bytes());
-                                        for (name, value) in modified_headers_wasm {
-                                            let mut line =
-                                                Vec::with_capacity(name.len() + value.len() + 4);
-                                            line.extend_from_slice(&name);
-                                            line.extend_from_slice(b": ");
-                                            line.extend_from_slice(&value);
-                                            line.extend_from_slice(b"\r\n");
-                                            new_header_lines.push(line);
-                                        }
+                                if let crate::wasm::FilterResult::Continue {
+                                    headers: modified_headers_wasm,
+                                    ..
+                                } = wasm_result
+                                {
+                                    new_header_lines.clear();
+                                    let status_line = format!(
+                                        "HTTP/1.1 {} {}\r\n",
+                                        status_code,
+                                        status_code_to_reason(status_code)
+                                    );
+                                    new_header_lines.push(status_line.into_bytes());
+                                    for (name, value) in modified_headers_wasm {
+                                        let mut line =
+                                            Vec::with_capacity(name.len() + value.len() + 4);
+                                        line.extend_from_slice(&name);
+                                        line.extend_from_slice(b": ");
+                                        line.extend_from_slice(&value);
+                                        line.extend_from_slice(b"\r\n");
+                                        new_header_lines.push(line);
                                     }
-                                    _ => {}
                                 }
                             }
                         }
@@ -9701,7 +9665,7 @@ async fn handle_sendfile(
     // RFC 7233 Range リクエスト処理
     let range_info: Option<(u64, u64)> = if let Some(range_bytes) = range_header {
         if let Some(parsed) = parse_range_header(range_bytes) {
-            if let Some(ref first_range) = parsed.ranges.first() {
+            if let Some(first_range) = parsed.ranges.first() {
                 match normalize_range(first_range, file_size) {
                     Some((start, end)) => Some((start, end)),
                     None => {
@@ -9782,7 +9746,7 @@ async fn handle_sendfile(
                             return None;
                         }
                         let colon_pos = line_trimmed.find(':')?;
-                        let name = line_trimmed[..colon_pos].as_bytes().to_vec();
+                        let name = line_trimmed.as_bytes()[..colon_pos].to_vec();
                         let value = line_trimmed[colon_pos + 1..]
                             .trim_start()
                             .as_bytes()
@@ -9932,7 +9896,7 @@ async fn handle_sendfile_zerocopy(
                 // EAGAIN/EWOULDBLOCK の場合は再試行（非同期ソケットの場合）
                 if e.kind() == io::ErrorKind::WouldBlock {
                     // writable を待ってから再試行
-                    if let Err(_) = tls_stream.get_ref().writable().await {
+                    if (tls_stream.get_ref().writable().await).is_err() {
                         break;
                     }
                     continue;

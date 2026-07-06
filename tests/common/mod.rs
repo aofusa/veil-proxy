@@ -31,8 +31,8 @@ pub fn generate_test_certs(output_dir: &std::path::Path) -> std::io::Result<(Pat
         "::1".to_string(),
     ];
 
-    let CertifiedKey { cert, signing_key } = generate_simple_self_signed(subject_alt_names)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let CertifiedKey { cert, signing_key } =
+        generate_simple_self_signed(subject_alt_names).map_err(std::io::Error::other)?;
 
     let cert_path = output_dir.join("test_cert.pem");
     let key_path = output_dir.join("test_key.pem");

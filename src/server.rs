@@ -220,10 +220,9 @@ pub fn spawn_background_revalidation(
             std::borrow::Cow::Borrowed(path_str)
         } else {
             let prefix_str = std::str::from_utf8(&prefix).unwrap_or("");
-            if path_str.starts_with(prefix_str) {
-                std::borrow::Cow::Borrowed(&path_str[prefix_str.len()..])
-            } else {
-                std::borrow::Cow::Borrowed(path_str)
+            match path_str.strip_prefix(prefix_str) {
+                Some(stripped) => std::borrow::Cow::Borrowed(stripped),
+                None => std::borrow::Cow::Borrowed(path_str),
             }
         };
 

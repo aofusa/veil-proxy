@@ -438,8 +438,8 @@ pub enum SeccompMode {
 }
 
 impl SeccompMode {
-    /// 文字列からSeccompModeを解析
-    pub fn from_str(s: &str) -> Self {
+    /// 文字列からSeccompModeを解析（std::str::FromStr と紛らわしいため独自名）
+    pub fn parse_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             // 未設定（空文字）は既定の無効。警告は出さない（設定省略は正当なため）。
             "" | "disabled" | "off" | "none" => SeccompMode::Disabled,
@@ -531,14 +531,13 @@ pub struct KernelVersion {
 impl KernelVersion {
     /// 現在のカーネルバージョンを取得
     pub fn current() -> io::Result<Self> {
-        let uname = nix::sys::utsname::uname()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let uname = nix::sys::utsname::uname().map_err(|e| io::Error::other(e.to_string()))?;
         let release = uname.release().to_string_lossy();
 
         // パース: "5.15.0-generic" -> (5, 15, 0)
-        let parts: Vec<&str> = release.split(|c: char| c == '.' || c == '-').collect();
+        let parts: Vec<&str> = release.split(['.', '-']).collect();
 
-        let major = parts.get(0).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let major = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
         let minor = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
         let patch = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
 
@@ -723,15 +722,13 @@ fn build_seccomp_filter(mode: SeccompMode) -> io::Result<Vec<libc::sock_filter>>
         SeccompMode::Disabled => 0x7fff0000u32, // SECCOMP_RET_ALLOW (no-op)
     };
 
-    let mut filter = Vec::new();
-
     // 1. アーキテクチャチェック
-    filter.push(libc::sock_filter {
+    let mut filter = vec![libc::sock_filter {
         code: BPF_LD | BPF_W | BPF_ABS,
         jt: 0,
         jf: 0,
         k: OFFSET_ARCH,
-    });
+    }];
     filter.push(libc::sock_filter {
         code: BPF_JMP | BPF_JEQ | BPF_K,
         jt: 1, // 次の命令へ
@@ -1381,8 +1378,8 @@ pub enum Capability {
 }
 
 impl Capability {
-    /// 文字列からケイパビリティを解析
-    pub fn from_str(s: &str) -> Option<Self> {
+    /// 文字列からケイパビリティを解析（std::str::FromStr と紛らわしいため独自名）
+    pub fn parse_str(s: &str) -> Option<Self> {
         let s = s.trim().to_uppercase();
         let s = s.strip_prefix("CAP_").unwrap_or(&s);
 
@@ -1665,12 +1662,7 @@ fn apply_mounts(config: &SandboxConfig) -> io::Result<()> {
         MsFlags::MS_REC | MsFlags::MS_PRIVATE,
         None::<&str>,
     )
-    .map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            format!("Failed to set mount propagation: {}", e),
-        )
-    })?;
+    .map_err(|e| io::Error::other(format!("Failed to set mount propagation: {}", e)))?;
     debug!("Mount propagation set to private");
 
     // 読み取り専用バインドマウント
@@ -1764,10 +1756,10 @@ fn apply_bind_mount(source: &str, dest: &str, readonly: bool) -> io::Result<()> 
         None::<&str>,
     )
     .map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            format!("Failed to bind mount {} -> {}: {}", source, dest, e),
-        )
+        io::Error::other(format!(
+            "Failed to bind mount {} -> {}: {}",
+            source, dest, e
+        ))
     })?;
 
     // 読み取り専用に再マウント
@@ -1779,12 +1771,7 @@ fn apply_bind_mount(source: &str, dest: &str, readonly: bool) -> io::Result<()> 
             MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY | MsFlags::MS_REC,
             None::<&str>,
         )
-        .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("Failed to remount {} as readonly: {}", dest, e),
-            )
-        })?;
+        .map_err(|e| io::Error::other(format!("Failed to remount {} as readonly: {}", dest, e)))?;
     }
 
     Ok(())
@@ -1808,12 +1795,7 @@ fn apply_tmpfs_mount(path: &str) -> io::Result<()> {
         MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
         Some("mode=0755"),
     )
-    .map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            format!("Failed to mount tmpfs at {}: {}", path, e),
-        )
-    })?;
+    .map_err(|e| io::Error::other(format!("Failed to mount tmpfs at {}: {}", path, e)))?;
 
     Ok(())
 }
@@ -1836,12 +1818,7 @@ fn apply_proc_mount() -> io::Result<()> {
         MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
         None::<&str>,
     )
-    .map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            format!("Failed to mount /proc: {}", e),
-        )
-    })?;
+    .map_err(|e| io::Error::other(format!("Failed to mount /proc: {}", e)))?;
 
     Ok(())
 }
@@ -1866,12 +1843,7 @@ fn apply_dev_mount() -> io::Result<()> {
         MsFlags::MS_NOSUID,
         Some("mode=0755"),
     )
-    .map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            format!("Failed to mount tmpfs on /dev: {}", e),
-        )
-    })?;
+    .map_err(|e| io::Error::other(format!("Failed to mount tmpfs on /dev: {}", e)))?;
 
     // 必須デバイスノードをバインドマウント
     let devices = [
@@ -1940,7 +1912,7 @@ fn apply_capabilities(config: &SandboxConfig) -> io::Result<()> {
         let keep_caps: Vec<Capability> = config
             .keep_capabilities
             .iter()
-            .filter_map(|s| Capability::from_str(s))
+            .filter_map(|s| Capability::parse_str(s))
             .collect();
 
         if keep_caps.is_empty() {
@@ -1963,7 +1935,7 @@ fn apply_capabilities(config: &SandboxConfig) -> io::Result<()> {
     // drop_capabilitiesが指定されている場合
     if !config.drop_capabilities.is_empty() {
         for cap_name in &config.drop_capabilities {
-            if let Some(cap) = Capability::from_str(cap_name) {
+            if let Some(cap) = Capability::parse_str(cap_name) {
                 drop_capability(cap)?;
             } else {
                 warn!("Unknown capability: {}", cap_name);
@@ -2165,31 +2137,31 @@ mod tests {
 
     #[test]
     fn test_seccomp_mode_parse() {
-        assert_eq!(SeccompMode::from_str("disabled"), SeccompMode::Disabled);
-        assert_eq!(SeccompMode::from_str("log"), SeccompMode::Log);
-        assert_eq!(SeccompMode::from_str("strict"), SeccompMode::Strict);
-        assert_eq!(SeccompMode::from_str("filter"), SeccompMode::Filter);
-        assert_eq!(SeccompMode::from_str("unknown"), SeccompMode::Disabled);
+        assert_eq!(SeccompMode::parse_str("disabled"), SeccompMode::Disabled);
+        assert_eq!(SeccompMode::parse_str("log"), SeccompMode::Log);
+        assert_eq!(SeccompMode::parse_str("strict"), SeccompMode::Strict);
+        assert_eq!(SeccompMode::parse_str("filter"), SeccompMode::Filter);
+        assert_eq!(SeccompMode::parse_str("unknown"), SeccompMode::Disabled);
     }
 
     #[test]
     fn test_seccomp_mode_case_insensitive() {
         // 大文字小文字を区別しない
-        assert_eq!(SeccompMode::from_str("DISABLED"), SeccompMode::Disabled);
-        assert_eq!(SeccompMode::from_str("Log"), SeccompMode::Log);
-        assert_eq!(SeccompMode::from_str("STRICT"), SeccompMode::Strict);
-        assert_eq!(SeccompMode::from_str("Filter"), SeccompMode::Filter);
+        assert_eq!(SeccompMode::parse_str("DISABLED"), SeccompMode::Disabled);
+        assert_eq!(SeccompMode::parse_str("Log"), SeccompMode::Log);
+        assert_eq!(SeccompMode::parse_str("STRICT"), SeccompMode::Strict);
+        assert_eq!(SeccompMode::parse_str("Filter"), SeccompMode::Filter);
     }
 
     #[test]
     fn test_seccomp_mode_aliases() {
         // エイリアス
-        assert_eq!(SeccompMode::from_str("off"), SeccompMode::Disabled);
-        assert_eq!(SeccompMode::from_str("none"), SeccompMode::Disabled);
-        assert_eq!(SeccompMode::from_str("audit"), SeccompMode::Log);
-        assert_eq!(SeccompMode::from_str("kill"), SeccompMode::Strict);
-        assert_eq!(SeccompMode::from_str("errno"), SeccompMode::Filter);
-        assert_eq!(SeccompMode::from_str("deny"), SeccompMode::Filter);
+        assert_eq!(SeccompMode::parse_str("off"), SeccompMode::Disabled);
+        assert_eq!(SeccompMode::parse_str("none"), SeccompMode::Disabled);
+        assert_eq!(SeccompMode::parse_str("audit"), SeccompMode::Log);
+        assert_eq!(SeccompMode::parse_str("kill"), SeccompMode::Strict);
+        assert_eq!(SeccompMode::parse_str("errno"), SeccompMode::Filter);
+        assert_eq!(SeccompMode::parse_str("deny"), SeccompMode::Filter);
     }
 
     // ====================
@@ -2228,19 +2200,19 @@ mod tests {
     fn test_capability_from_str() {
         // 標準的なケイパビリティ名
         assert_eq!(
-            Capability::from_str("CAP_NET_BIND_SERVICE"),
+            Capability::parse_str("CAP_NET_BIND_SERVICE"),
             Some(Capability::CAP_NET_BIND_SERVICE)
         );
         assert_eq!(
-            Capability::from_str("CAP_SETUID"),
+            Capability::parse_str("CAP_SETUID"),
             Some(Capability::CAP_SETUID)
         );
         assert_eq!(
-            Capability::from_str("CAP_SETGID"),
+            Capability::parse_str("CAP_SETGID"),
             Some(Capability::CAP_SETGID)
         );
         assert_eq!(
-            Capability::from_str("CAP_SYS_ADMIN"),
+            Capability::parse_str("CAP_SYS_ADMIN"),
             Some(Capability::CAP_SYS_ADMIN)
         );
     }
@@ -2249,12 +2221,15 @@ mod tests {
     fn test_capability_from_str_without_prefix() {
         // CAP_プレフィックスなし
         assert_eq!(
-            Capability::from_str("NET_BIND_SERVICE"),
+            Capability::parse_str("NET_BIND_SERVICE"),
             Some(Capability::CAP_NET_BIND_SERVICE)
         );
-        assert_eq!(Capability::from_str("SETUID"), Some(Capability::CAP_SETUID));
         assert_eq!(
-            Capability::from_str("SYS_ADMIN"),
+            Capability::parse_str("SETUID"),
+            Some(Capability::CAP_SETUID)
+        );
+        assert_eq!(
+            Capability::parse_str("SYS_ADMIN"),
             Some(Capability::CAP_SYS_ADMIN)
         );
     }
@@ -2263,11 +2238,11 @@ mod tests {
     fn test_capability_from_str_case_insensitive() {
         // 大文字小文字を区別しない
         assert_eq!(
-            Capability::from_str("cap_net_bind_service"),
+            Capability::parse_str("cap_net_bind_service"),
             Some(Capability::CAP_NET_BIND_SERVICE)
         );
         assert_eq!(
-            Capability::from_str("Net_Bind_Service"),
+            Capability::parse_str("Net_Bind_Service"),
             Some(Capability::CAP_NET_BIND_SERVICE)
         );
     }
@@ -2275,9 +2250,9 @@ mod tests {
     #[test]
     fn test_capability_from_str_invalid() {
         // 無効なケイパビリティ
-        assert_eq!(Capability::from_str("INVALID"), None);
-        assert_eq!(Capability::from_str("CAP_INVALID"), None);
-        assert_eq!(Capability::from_str(""), None);
+        assert_eq!(Capability::parse_str("INVALID"), None);
+        assert_eq!(Capability::parse_str("CAP_INVALID"), None);
+        assert_eq!(Capability::parse_str(""), None);
     }
 
     #[test]

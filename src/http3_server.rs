@@ -23,7 +23,7 @@ use std::ffi::CString;
 use std::io::{self, Seek, Write as IoWrite};
 use std::net::SocketAddr;
 use std::os::unix::io::{AsRawFd, FromRawFd};
-use std::path::PathBuf;
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -388,10 +388,9 @@ impl Http3Handler {
     /// HTTP/3 コネクションを初期化（QUIC 確立後）
     fn init_h3(&mut self) -> io::Result<()> {
         if self.h3_conn.is_none() && self.conn.is_established() {
-            let h3_config = h3::Config::new()
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let h3_config = h3::Config::new().map_err(|e| io::Error::other(e.to_string()))?;
             let h3 = h3::Connection::with_transport(&mut self.conn, &h3_config)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| io::Error::other(e.to_string()))?;
             self.h3_conn = Some(h3);
             debug!(
                 "[HTTP/3] HTTP/3 connection established from {}",
@@ -1233,7 +1232,7 @@ impl Http3Handler {
 
         for (name, value) in headers {
             if *name != b":status" {
-                h3_headers.push(h3::Header::new(*name, *value));
+                h3_headers.push(h3::Header::new(name, value));
             }
         }
 
@@ -1245,7 +1244,7 @@ impl Http3Handler {
         }
 
         // ヘッダー送信
-        let has_body = body.is_some() && body.map_or(false, |b| !b.is_empty());
+        let has_body = body.is_some() && body.is_some_and(|b| !b.is_empty());
         match h3_conn.send_response(&mut self.conn, stream_id, &h3_headers, !has_body) {
             Ok(()) => {
                 debug!("[HTTP/3] Response headers sent for stream {}", stream_id);
@@ -1364,7 +1363,7 @@ impl Http3Handler {
         }
 
         // ボディがあるかどうかを判定
-        let has_body = body.is_some() && body.map_or(false, |b| !b.is_empty());
+        let has_body = body.is_some() && body.is_some_and(|b| !b.is_empty());
 
         // ボディがない場合はヘッダーのみ送信してトレイラーへ
         if let Err(e) = h3_conn.send_response(&mut self.conn, stream_id, &h3_headers, false) {
@@ -1463,8 +1462,7 @@ impl Http3Handler {
             path_str.to_string()
         } else {
             let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
-            if path_str.starts_with(prefix_str) {
-                let remaining = &path_str[prefix_str.len()..];
+            if let Some(remaining) = path_str.strip_prefix(prefix_str) {
                 let base = target.path_prefix.trim_end_matches('/');
 
                 if remaining.is_empty() {
@@ -1540,7 +1538,7 @@ impl Http3Handler {
         // io_uringベースの非同期I/Oでバックエンド通信を行う
         let timeout_secs = 30;
         let tls_insecure = upstream_group.tls_insecure()
-            || std::env::var("VEIL_TLS_INSECURE").map_or(false, |v| v == "1");
+            || std::env::var("VEIL_TLS_INSECURE").is_ok_and(|v| v == "1");
         let proxy_result =
             proxy_to_backend_async_with_tls(target, request, timeout_secs, tls_insecure).await;
 
@@ -1610,7 +1608,7 @@ impl Http3Handler {
     fn handle_sendfile(
         &mut self,
         stream_id: u64,
-        base_path: &PathBuf,
+        base_path: &Path,
         is_dir: bool,
         index_file: Option<&str>,
         req_path: &[u8],
@@ -1637,7 +1635,7 @@ impl Http3Handler {
 
         // ファイルパス構築
         let file_path = if is_dir {
-            let mut p = base_path.clone();
+            let mut p = base_path.to_path_buf();
             if clean_sub.is_empty() || clean_sub == "/" {
                 p.push(index_file.unwrap_or("index.html"));
             } else {
@@ -1652,7 +1650,7 @@ impl Http3Handler {
                 self.send_error_response(stream_id, 404, b"Not Found")?;
                 return Ok((404, 9));
             }
-            base_path.clone()
+            base_path.to_path_buf()
         };
 
         // ファイル読み込み
@@ -1833,8 +1831,7 @@ fn compute_backend_path(target: &ProxyTarget, req_path: &[u8], prefix: &[u8]) ->
         path_str.to_string()
     } else {
         let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
-        if path_str.starts_with(prefix_str) {
-            let remaining = &path_str[prefix_str.len()..];
+        if let Some(remaining) = path_str.strip_prefix(prefix_str) {
             let base = target.path_prefix.trim_end_matches('/');
             if remaining.is_empty() {
                 if base.is_empty() {
@@ -2390,8 +2387,7 @@ async fn proxy_to_tls_backend_async(
     // monoio TcpStream は不要（別スレッドで std::net::TcpStream を使うため）
     drop(tcp_stream);
 
-    let skip_verify =
-        tls_insecure || std::env::var("VEIL_TLS_INSECURE").map_or(false, |v| v == "1");
+    let skip_verify = tls_insecure || std::env::var("VEIL_TLS_INSECURE").is_ok_and(|v| v == "1");
     let addr = format!("{}:{}", target.host, target.port);
     let sni_name = target
         .sni_name
@@ -2498,7 +2494,7 @@ async fn proxy_to_tls_backend_async(
         match rx.try_recv() {
             Ok(result) => return result,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                return Err(io::Error::new(io::ErrorKind::Other, "backend thread died"));
+                return Err(io::Error::other("backend thread died"));
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 if std::time::Instant::now() >= deadline {
@@ -2671,14 +2667,14 @@ fn parse_http_response(response: &[u8]) -> io::Result<BackendProxyResult> {
     let mut headers = Vec::new();
     if let Some(first_crlf) = memchr::memchr(b'\n', header_bytes) {
         for line in header_bytes[first_crlf + 1..].split(|&b| b == b'\n') {
-            let line = line.strip_suffix(&[b'\r']).unwrap_or(line);
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
             if line.is_empty() {
                 continue;
             }
             if let Some(colon_pos) = memchr::memchr(b':', line) {
                 let name = &line[..colon_pos];
                 let value = line[colon_pos + 1..]
-                    .strip_prefix(&[b' '])
+                    .strip_prefix(b" ")
                     .unwrap_or(&line[colon_pos + 1..]);
                 if !name.eq_ignore_ascii_case(b"connection")
                     && !name.eq_ignore_ascii_case(b"transfer-encoding")
@@ -2708,6 +2704,11 @@ type ConnectionMap = Rc<RefCell<HashMap<ConnectionId<'static>, Http3Handler>>>;
 /// ## セキュリティ
 /// 証明書データ（cert_pem, key_pem）は quiche へのロード完了後、
 /// セキュアにゼロ化してからメモリから解放されます。
+// clippy::await_holding_refcell_ref 許容理由: `connections`（Rc<RefCell<HashMap>>）を
+// 借用するのは本 H3 メインループタスクのみ。バックエンドタスクは Rc チャネル + Notify
+// 経由で通信し RefCell に触れない（F-32 のアクターモデル）ため、await 中に他タスクが
+// 再入借用して panic する経路は存在しない（B-16 とは異なり単一借用者）。
+#[allow(clippy::await_holding_refcell_ref)]
 pub async fn run_http3_server_async(
     bind_addr: SocketAddr,
     mut config: Http3ServerConfig,
@@ -2730,12 +2731,8 @@ pub async fn run_http3_server_async(
         info!("[HTTP/3] Loading certificates via memfd (Landlock compatible)");
 
         // 証明書を memfd に書き込み
-        let (cert_memfd, cert_path) = create_memfd_for_pem("tls_cert", &cert_pem).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("Failed to create memfd for cert: {}", e),
-            )
-        })?;
+        let (cert_memfd, cert_path) = create_memfd_for_pem("tls_cert", &cert_pem)
+            .map_err(|e| io::Error::other(format!("Failed to create memfd for cert: {}", e)))?;
 
         // quiche が証明書を読み込む
         quic_config
@@ -2756,12 +2753,8 @@ pub async fn run_http3_server_async(
         debug!("[HTTP/3] Certificate data securely zeroed and released");
 
         // 秘密鍵を memfd に書き込み
-        let (key_memfd, key_path) = create_memfd_for_pem("tls_key", &key_pem).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("Failed to create memfd for key: {}", e),
-            )
-        })?;
+        let (key_memfd, key_path) = create_memfd_for_pem("tls_key", &key_pem)
+            .map_err(|e| io::Error::other(format!("Failed to create memfd for key: {}", e)))?;
 
         // quiche が秘密鍵を読み込む
         quic_config
@@ -3030,15 +3023,13 @@ pub async fn run_http3_server_async(
                             // 新規コネクション
                             let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
                             rng.fill(&mut scid)
-                                .map_err(|_| io::Error::new(io::ErrorKind::Other, "RNG error"))?;
+                                .map_err(|_| io::Error::other("RNG error"))?;
                             let scid = ConnectionId::from_ref(&scid).into_owned();
 
                             let mut config_ref = quic_config.borrow_mut();
                             let conn =
                                 quiche::accept(&scid, None, local_addr, from, &mut config_ref)
-                                    .map_err(|e| {
-                                        io::Error::new(io::ErrorKind::Other, e.to_string())
-                                    })?;
+                                    .map_err(|e| io::Error::other(e.to_string()))?;
 
                             debug!("[HTTP/3] New connection from {}", from);
 
@@ -3149,6 +3140,11 @@ pub async fn run_http3_server_async(
 ///
 /// この関数はメインループで常に呼び出され、タイムアウト時でも
 /// ACKやレスポンスパケットを送信します。
+// clippy::await_holding_refcell_ref 許容理由: `connections`（Rc<RefCell<HashMap>>）を
+// 借用するのは本 H3 メインループタスクのみ。バックエンドタスクは Rc チャネル + Notify
+// 経由で通信し RefCell に触れない（F-32 のアクターモデル）ため、await 中に他タスクが
+// 再入借用して panic する経路は存在しない（B-16 とは異なり単一借用者）。
+#[allow(clippy::await_holding_refcell_ref)]
 async fn send_pending_packets(
     connections: &ConnectionMap,
     socket: &Rc<QuicUdpSocket>,

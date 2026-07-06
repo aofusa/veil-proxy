@@ -9,7 +9,7 @@ use crate::wasm::context::HostState;
 use super::abi::{deserialize_headers, serialize_headers};
 
 /// Get headers by map type
-fn get_headers<'a>(state: &'a HostState, map_type: i32) -> Option<&'a Vec<(Vec<u8>, Vec<u8>)>> {
+fn get_headers(state: &HostState, map_type: i32) -> Option<&Vec<(Vec<u8>, Vec<u8>)>> {
     match map_type {
         HTTP_REQUEST_HEADERS => Some(&state.http_ctx.request_headers),
         HTTP_REQUEST_TRAILERS => Some(&state.http_ctx.request_trailers),
@@ -42,10 +42,7 @@ fn get_headers<'a>(state: &'a HostState, map_type: i32) -> Option<&'a Vec<(Vec<u
 }
 
 /// Get mutable headers by map type
-fn get_headers_mut<'a>(
-    state: &'a mut HostState,
-    map_type: i32,
-) -> Option<&'a mut Vec<(Vec<u8>, Vec<u8>)>> {
+fn get_headers_mut(state: &mut HostState, map_type: i32) -> Option<&mut Vec<(Vec<u8>, Vec<u8>)>> {
     match map_type {
         HTTP_REQUEST_HEADERS => Some(&mut state.http_ctx.request_headers),
         HTTP_REQUEST_TRAILERS => Some(&mut state.http_ctx.request_trailers),

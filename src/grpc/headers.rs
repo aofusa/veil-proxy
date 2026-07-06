@@ -92,12 +92,12 @@ pub fn format_grpc_timeout(duration: Duration) -> String {
 
     // Try to use the largest unit that gives an integer value
     let hours = duration.as_secs() / 3600;
-    if hours > 0 && duration.as_secs() % 3600 == 0 {
+    if hours > 0 && duration.as_secs().is_multiple_of(3600) {
         return format!("{}H", hours);
     }
 
     let minutes = duration.as_secs() / 60;
-    if minutes > 0 && duration.as_secs() % 60 == 0 {
+    if minutes > 0 && duration.as_secs().is_multiple_of(60) {
         return format!("{}M", minutes);
     }
 
@@ -107,12 +107,12 @@ pub fn format_grpc_timeout(duration: Duration) -> String {
     }
 
     let millis = duration.as_millis();
-    if millis > 0 && nanos % 1_000_000 == 0 {
+    if millis > 0 && nanos.is_multiple_of(1_000_000) {
         return format!("{}m", millis);
     }
 
     let micros = duration.as_micros();
-    if micros > 0 && nanos % 1000 == 0 {
+    if micros > 0 && nanos.is_multiple_of(1000) {
         return format!("{}u", micros);
     }
 

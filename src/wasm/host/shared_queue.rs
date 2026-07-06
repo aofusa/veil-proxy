@@ -105,10 +105,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             };
 
             // Write queue_id to return pointer
-            if return_queue_id_ptr > 0 {
-                if !write_u32(&mut caller, return_queue_id_ptr, queue_id) {
-                    return PROXY_RESULT_INVALID_MEMORY_ACCESS;
-                }
+            if return_queue_id_ptr > 0 && !write_u32(&mut caller, return_queue_id_ptr, queue_id) {
+                return PROXY_RESULT_INVALID_MEMORY_ACCESS;
             }
 
             ftlog::debug!(
@@ -146,10 +144,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
 
             match queue_id {
                 Some(id) => {
-                    if return_queue_id_ptr > 0 {
-                        if !write_u32(&mut caller, return_queue_id_ptr, id) {
-                            return PROXY_RESULT_INVALID_MEMORY_ACCESS;
-                        }
+                    if return_queue_id_ptr > 0 && !write_u32(&mut caller, return_queue_id_ptr, id) {
+                        return PROXY_RESULT_INVALID_MEMORY_ACCESS;
                     }
                     ftlog::debug!("WASM: proxy_resolve_shared_queue '{}' -> id={}", name, id);
                     PROXY_RESULT_OK
@@ -224,17 +220,18 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                     // Allocate memory in WASM and write data
                     // For simplicity, we expect the caller to have preallocated buffer
                     // Write size first
-                    if return_data_size_ptr > 0 {
-                        if !write_u32(&mut caller, return_data_size_ptr, bytes.len() as u32) {
-                            return PROXY_RESULT_INVALID_MEMORY_ACCESS;
-                        }
+                    if return_data_size_ptr > 0
+                        && !write_u32(&mut caller, return_data_size_ptr, bytes.len() as u32)
+                    {
+                        return PROXY_RESULT_INVALID_MEMORY_ACCESS;
                     }
 
                     // Write data
-                    if return_data_ptr > 0 && !bytes.is_empty() {
-                        if !write_bytes(&mut caller, return_data_ptr, &bytes) {
-                            return PROXY_RESULT_INVALID_MEMORY_ACCESS;
-                        }
+                    if return_data_ptr > 0
+                        && !bytes.is_empty()
+                        && !write_bytes(&mut caller, return_data_ptr, &bytes)
+                    {
+                        return PROXY_RESULT_INVALID_MEMORY_ACCESS;
                     }
 
                     ftlog::debug!(

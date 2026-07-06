@@ -63,21 +63,22 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                     match f(&arguments) {
                         Ok(results) => {
                             // Write results size
-                            if return_results_size_ptr > 0 {
-                                if !write_u32(
+                            if return_results_size_ptr > 0
+                                && !write_u32(
                                     &mut caller,
                                     return_results_size_ptr,
                                     results.len() as u32,
-                                ) {
-                                    return PROXY_RESULT_INVALID_MEMORY_ACCESS;
-                                }
+                                )
+                            {
+                                return PROXY_RESULT_INVALID_MEMORY_ACCESS;
                             }
 
                             // Write results data
-                            if return_results_ptr > 0 && !results.is_empty() {
-                                if !write_bytes(&mut caller, return_results_ptr, &results) {
-                                    return PROXY_RESULT_INVALID_MEMORY_ACCESS;
-                                }
+                            if return_results_ptr > 0
+                                && !results.is_empty()
+                                && !write_bytes(&mut caller, return_results_ptr, &results)
+                            {
+                                return PROXY_RESULT_INVALID_MEMORY_ACCESS;
                             }
 
                             ftlog::debug!(

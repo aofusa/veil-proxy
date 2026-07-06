@@ -603,7 +603,7 @@ async fn tls_connect(tcp: TcpStream, sni: &str, insecure: bool) -> io::Result<Ba
 /// `VEIL_TLS_INSECURE=1` が設定されているか（プロセス起動時に一度だけ評価）。
 fn tls_insecure_env() -> bool {
     static INSECURE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *INSECURE.get_or_init(|| std::env::var("VEIL_TLS_INSECURE").map_or(false, |v| v == "1"))
+    *INSECURE.get_or_init(|| std::env::var("VEIL_TLS_INSECURE").is_ok_and(|v| v == "1"))
 }
 
 // ============================================================================
@@ -731,7 +731,7 @@ async fn run_backend_task(
     let addr = addr.as_str();
 
     // --- 非同期接続（タイムアウト付き） ---
-    let connect = TcpStream::connect_str(&addr);
+    let connect = TcpStream::connect_str(addr);
     let tcp = match crate::runtime::time::timeout(Duration::from_secs(timeout_secs), connect).await
     {
         Ok(Ok(s)) => s,

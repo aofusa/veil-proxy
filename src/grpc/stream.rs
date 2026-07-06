@@ -9,9 +9,10 @@
 use std::time::Instant;
 
 /// gRPC RPC types
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GrpcStreamType {
     /// Single request, single response
+    #[default]
     Unary,
     /// Multiple requests (client streaming), single response
     ClientStreaming,
@@ -30,12 +31,6 @@ impl GrpcStreamType {
     /// Check if this type expects multiple server messages
     pub fn is_server_streaming(&self) -> bool {
         matches!(self, Self::ServerStreaming | Self::BidirectionalStreaming)
-    }
-}
-
-impl Default for GrpcStreamType {
-    fn default() -> Self {
-        Self::Unary
     }
 }
 

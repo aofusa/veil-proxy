@@ -87,10 +87,10 @@ fn storage_to_sockaddr(storage: &libc::sockaddr_storage) -> io::Result<SocketAdd
                 sin6.sin6_scope_id,
             )))
         }
-        family => Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("unsupported address family: {}", family),
-        )),
+        family => Err(io::Error::other(format!(
+            "unsupported address family: {}",
+            family
+        ))),
     }
 }
 
@@ -960,6 +960,10 @@ impl SendMsgState {
 // ホットパスでの Box 確保を避けるための SendMsgState スレッドローカルプール。
 // 取得は同期スコープ内で完結し、借用を await 跨ぎで保持しない（B-16 の教訓）。
 thread_local! {
+    // clippy::vec_box 許容理由: SendMsgState（msghdr/iovec）はカーネルが SQE 経由で参照する
+    // ためアドレス固定が必須。Vec<SendMsgState> にすると realloc / 取り出しで状態が移動し、
+    // in-flight op の msghdr が無効になる（B-07 の UAF 相当）。Box のまま保持する。
+    #[allow(clippy::vec_box)]
     static SENDMSG_STATE_POOL: std::cell::RefCell<Vec<Box<SendMsgState>>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }

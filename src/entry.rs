@@ -522,7 +522,7 @@ pub fn run() {
     let security_config = crate::security::SecurityConfig {
         enable_io_uring_restrictions: true, // カスタム io_uring 実装で IORING_REGISTER_RESTRICTIONS を適用
         enable_seccomp: loaded_config.global_security.enable_seccomp,
-        seccomp_mode: crate::security::SeccompMode::from_str(
+        seccomp_mode: crate::security::SeccompMode::parse_str(
             &loaded_config.global_security.seccomp_mode,
         ),
         enable_landlock: loaded_config.global_security.enable_landlock,
@@ -918,7 +918,6 @@ pub fn run() {
         // 各ワーカースレッドでH2Cリスナーを起動
         let core_ids = core_ids.clone();
         for thread_id in 0..num_threads {
-            let h2c_addr = h2c_addr;
             let balancing = loaded_config.reuseport_balancing;
             let max_conn = loaded_config.global_security.max_concurrent_connections;
 

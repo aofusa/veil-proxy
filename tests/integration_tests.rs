@@ -776,7 +776,7 @@ fn test_f22_tcp_connect_to_closed_port() {
 #[test]
 fn test_f22_grpc_response_format_serving() {
     // grpc-status: 0 を含む HTTP/1.1 200 レスポンスは SERVING と判定される
-    let response_lines = vec![
+    let response_lines = [
         "HTTP/1.1 200 OK",
         "Content-Type: application/grpc",
         "grpc-status: 0",
@@ -1002,7 +1002,7 @@ fn test_f18_l4_round_robin_distributes() {
     // プロキシ（ラウンドロビンで addr1 → addr2 → addr1 と転送する簡易フォワーダー）
     let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
     let proxy_addr = proxy.local_addr().unwrap();
-    let backends = vec![addr1, addr2];
+    let backends = [addr1, addr2];
 
     std::thread::spawn(move || {
         let mut idx = 0usize;

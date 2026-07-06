@@ -110,7 +110,7 @@ pub fn select_upstream<'a>(
                 .filter(|(i, _)| {
                     health_state
                         .get(*i)
-                        .map_or(true, |h| h.load(Ordering::Relaxed))
+                        .is_none_or(|h| h.load(Ordering::Relaxed))
                 })
                 .map(|(_, u)| u.weight.max(1) as usize)
                 .sum();
@@ -124,7 +124,7 @@ pub fn select_upstream<'a>(
             for (i, upstream) in config.upstreams.iter().enumerate() {
                 let is_healthy = health_state
                     .get(i)
-                    .map_or(true, |h| h.load(Ordering::Relaxed));
+                    .is_none_or(|h| h.load(Ordering::Relaxed));
                 if !is_healthy {
                     continue;
                 }
@@ -137,7 +137,7 @@ pub fn select_upstream<'a>(
             for (i, upstream) in config.upstreams.iter().enumerate().rev() {
                 if health_state
                     .get(i)
-                    .map_or(true, |h| h.load(Ordering::Relaxed))
+                    .is_none_or(|h| h.load(Ordering::Relaxed))
                 {
                     return Some((i, upstream.addr.as_str()));
                 }
@@ -151,7 +151,7 @@ pub fn select_upstream<'a>(
             .filter(|(i, _)| {
                 health_state
                     .get(*i)
-                    .map_or(true, |h| h.load(Ordering::Relaxed))
+                    .is_none_or(|h| h.load(Ordering::Relaxed))
             })
             .min_by_key(|(i, _)| {
                 conn_counters
@@ -179,10 +179,17 @@ async fn forward_direction(
 ) -> usize {
     // コネクションあたり一度だけ確保。read()/write() が ownership を受け取って返すため
     // ループ内で再確保されることはない。
-    let mut buf: Vec<u8> = Vec::with_capacity(BUF_SIZE);
-    // SAFETY: capacity ぶんの領域は確保済み。カーネルが read で上書きするため
-    // Rust 側から [len..capacity] を読まない限り安全。
-    unsafe { buf.set_len(BUF_SIZE) };
+    // clippy::uninit_vec 許容理由: カーネルが read(2) で先頭 n バイトを上書きし、直後の
+    // set_len(n) 切り詰めにより未初期化領域を Rust 側から一切読まない。ゼロ初期化は
+    // コネクションごとに 64KB の memset を追加するためホットパス絶対規則により回避する。
+    #[allow(clippy::uninit_vec)]
+    let mut buf: Vec<u8> = {
+        let mut b = Vec::with_capacity(BUF_SIZE);
+        // SAFETY: capacity ぶんの領域は確保済み。カーネルが read で上書きするため
+        // Rust 側から [len..capacity] を読まない限り安全。
+        unsafe { b.set_len(BUF_SIZE) };
+        b
+    };
 
     let mut total = 0usize;
     'outer: loop {

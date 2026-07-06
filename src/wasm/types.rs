@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use super::capabilities::ModuleCapabilities;
 
 /// WASM extension configuration
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct WasmConfig {
     /// Enable WASM extensions
     #[serde(default)]
@@ -18,16 +18,6 @@ pub struct WasmConfig {
     /// Module definitions
     #[serde(default)]
     pub modules: Vec<ModuleConfig>,
-}
-
-impl Default for WasmConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            defaults: WasmDefaults::default(),
-            modules: Vec::new(),
-        }
-    }
 }
 
 /// Default WASM settings

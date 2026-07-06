@@ -57,7 +57,7 @@ use prometheus::{
 
 #[cfg(feature = "metrics")]
 /// Prometheusメトリクスレジストリ（グローバル）
-pub(crate) static METRICS_REGISTRY: Lazy<Registry> = Lazy::new(|| Registry::new());
+pub(crate) static METRICS_REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
 
 #[cfg(feature = "metrics")]
 /// HTTPリクエスト総数カウンター（method, status, host ラベル付き）
@@ -903,7 +903,7 @@ pub(crate) fn build_metrics_response() -> Vec<u8> {
         response.extend_from_slice(num_buf.format(body.len()).as_bytes());
         response.extend_from_slice(b"\r\nConnection: close\r\n\r\n");
         response.extend_from_slice(&body);
-        return response;
+        response
     }
 
     #[cfg(not(feature = "metrics"))]

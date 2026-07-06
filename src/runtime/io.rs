@@ -11,9 +11,19 @@ use std::io;
 // ====================
 
 /// 複数バッファの読み取り用トレイト（stub）
+///
+/// # Safety
+///
+/// 実装型は readv 系 API がバッファポインタ/長さを信頼できることを保証すること
+/// （現状 stub のため実装型なし）。
 pub unsafe trait IoVecBufMut: 'static {}
 
 /// 複数バッファの書き込み用トレイト（stub）
+///
+/// # Safety
+///
+/// 実装型は writev 系 API がバッファポインタ/長さを信頼できることを保証すること
+/// （現状 stub のため実装型なし）。
 pub unsafe trait IoVecBuf: 'static {}
 
 // BufResult: monoio 互換の結果型エイリアス
@@ -32,15 +42,7 @@ pub trait AsyncReadRent {
         &mut self,
         buf: T,
     ) -> impl std::future::Future<Output = BufResult<usize, T>> {
-        async move {
-            (
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "readv not implemented",
-                )),
-                buf,
-            )
-        }
+        async move { (Err(std::io::Error::other("readv not implemented")), buf) }
     }
 }
 
@@ -55,15 +57,7 @@ pub trait AsyncWriteRent {
         &mut self,
         buf: T,
     ) -> impl std::future::Future<Output = BufResult<usize, T>> {
-        async move {
-            (
-                Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "writev not implemented",
-                )),
-                buf,
-            )
-        }
+        async move { (Err(io::Error::other("writev not implemented")), buf) }
     }
 
     /// フラッシュ（デフォルト実装は no-op）
@@ -189,7 +183,7 @@ impl File {
             let ret = unsafe {
                 libc::pread(
                     fd,
-                    (buf.write_ptr() as *mut u8).add(read) as *mut libc::c_void,
+                    buf.write_ptr().add(read) as *mut libc::c_void,
                     total - read,
                     (offset + read as u64) as libc::off_t,
                 )

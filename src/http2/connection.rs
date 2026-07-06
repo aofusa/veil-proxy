@@ -661,8 +661,8 @@ where
                 }
                 0x5 => {
                     // MAX_FRAME_SIZE
-                    if value < defaults::MAX_FRAME_SIZE
-                        || value > defaults::MAX_FRAME_SIZE_UPPER_LIMIT
+                    if !(defaults::MAX_FRAME_SIZE..=defaults::MAX_FRAME_SIZE_UPPER_LIMIT)
+                        .contains(&value)
                     {
                         return Err(Http2Error::protocol_error("Invalid MAX_FRAME_SIZE"));
                     }
@@ -1056,7 +1056,7 @@ where
                     }
                     b"te" => {
                         // TE ヘッダーは "trailers" 以外禁止 (RFC 7540 8.1.2.2)
-                        if header.value.to_ascii_lowercase() != b"trailers" {
+                        if !header.value.eq_ignore_ascii_case(b"trailers") {
                             return Err(Http2Error::stream_error(
                                 stream_id,
                                 Http2ErrorCode::ProtocolError,

@@ -7,9 +7,10 @@ use std::fmt;
 
 /// gRPC status code values (0-16)
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum GrpcStatusCode {
     /// Not an error; returned on success
+    #[default]
     Ok = 0,
     /// The operation was cancelled
     Cancelled = 1,
@@ -71,13 +72,14 @@ impl GrpcStatusCode {
     }
 
     /// Parse from string (grpc-status header value)
-    pub fn from_str(s: &str) -> Option<Self> {
+    /// （std::str::FromStr と紛らわしいため独自名）
+    pub fn parse_str(s: &str) -> Option<Self> {
         s.parse::<u8>().ok().and_then(Self::from_u8)
     }
 
     /// Parse from bytes
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        std::str::from_utf8(bytes).ok().and_then(Self::from_str)
+        std::str::from_utf8(bytes).ok().and_then(Self::parse_str)
     }
 
     /// Get numeric value
@@ -133,8 +135,8 @@ impl GrpcStatusCode {
             501 => Self::Unimplemented,
             503 => Self::Unavailable,
             504 => Self::DeadlineExceeded,
-            _ if http_status >= 200 && http_status < 300 => Self::Ok,
-            _ if http_status >= 400 && http_status < 500 => Self::InvalidArgument,
+            _ if (200..300).contains(&http_status) => Self::Ok,
+            _ if (400..500).contains(&http_status) => Self::InvalidArgument,
             _ => Self::Unknown,
         }
     }
@@ -166,12 +168,6 @@ impl GrpcStatusCode {
 impl fmt::Display for GrpcStatusCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.as_u8())
-    }
-}
-
-impl Default for GrpcStatusCode {
-    fn default() -> Self {
-        Self::Ok
     }
 }
 
@@ -299,13 +295,13 @@ mod tests {
 
     #[test]
     fn test_status_code_from_str() {
-        assert_eq!(GrpcStatusCode::from_str("0"), Some(GrpcStatusCode::Ok));
+        assert_eq!(GrpcStatusCode::parse_str("0"), Some(GrpcStatusCode::Ok));
         assert_eq!(
-            GrpcStatusCode::from_str("13"),
+            GrpcStatusCode::parse_str("13"),
             Some(GrpcStatusCode::Internal)
         );
-        assert_eq!(GrpcStatusCode::from_str("invalid"), None);
-        assert_eq!(GrpcStatusCode::from_str("99"), None);
+        assert_eq!(GrpcStatusCode::parse_str("invalid"), None);
+        assert_eq!(GrpcStatusCode::parse_str("99"), None);
     }
 
     #[test]

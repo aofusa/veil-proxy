@@ -171,7 +171,7 @@ impl CacheManager {
         }
 
         // レスポンスから取得したVaryヘッダー、または渡されたVaryヘッダーを使用
-        let effective_vary = vary_headers.or_else(|| match vary_result {
+        let effective_vary = vary_headers.or(match vary_result {
             VaryResult::Headers(h) => Some(h),
             VaryResult::NotPresent => None,
             VaryResult::Uncacheable => None,
@@ -255,12 +255,10 @@ impl CacheManager {
     ///
     /// 削除されたエントリ数
     pub fn invalidate_pattern(&self, pattern: &str) -> usize {
-        let count = self.index.invalidate_pattern(pattern);
-
         // ディスクキャッシュのクリーンアップは別途実行される
         // (エントリ削除時にパスが失われるため、ここでは行わない)
 
-        count
+        self.index.invalidate_pattern(pattern)
     }
 
     /// ホストの全エントリを削除

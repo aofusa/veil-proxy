@@ -46,9 +46,6 @@ use rustls::{ClientConfig, ClientConnection};
 
 use common::grpc_client::GrpcFrame;
 
-#[cfg(feature = "grpc-web")]
-use base64;
-
 // 新しい非同期テストクライアント（hyper + tokio）
 use common::http1_client::Http1TestClient;
 
@@ -690,12 +687,12 @@ async fn test_round_robin_distribution() {
 
     // Round Robinなのでほぼ均等に分散（許容範囲: 2-8、接続の再利用により完全に均等にならない可能性がある）
     assert!(
-        backend1_count >= 2 && backend1_count <= 8,
+        (2..=8).contains(&backend1_count),
         "Backend 1 should receive roughly half: got {}",
         backend1_count
     );
     assert!(
-        backend2_count >= 2 && backend2_count <= 8,
+        (2..=8).contains(&backend2_count),
         "Backend 2 should receive roughly half: got {}",
         backend2_count
     );
@@ -761,7 +758,7 @@ async fn test_compression_gzip() {
     if prereq.is_none() {
         panic!("Prerequisite check failed: no response from /large.txt");
     }
-    let prereq_status = get_status_code(&prereq.as_ref().unwrap());
+    let prereq_status = get_status_code(prereq.as_ref().unwrap());
     if prereq_status != Some(200) {
         panic!(
             "Prerequisite failed: /large.txt not found (status: {:?})",
@@ -946,7 +943,6 @@ async fn test_concurrent_requests() {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
-    
 
     let success_count = Arc::new(AtomicUsize::new(0));
     let total_requests = 20;
@@ -1883,8 +1879,7 @@ async fn test_http3_basic_connection() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
-    {
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!(
@@ -1940,8 +1935,7 @@ async fn test_http3_get_request() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
-    {
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!(
@@ -1989,8 +1983,7 @@ async fn test_http3_post_request() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
-    {
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!(
@@ -2077,8 +2070,7 @@ async fn test_http3_multiple_streams() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
-    {
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!(
@@ -2150,8 +2142,7 @@ async fn test_http3_proxy_forwarding() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
-    {
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!(
@@ -2206,8 +2197,7 @@ async fn test_http3_proxy_compression() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
-    {
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!(
@@ -2283,8 +2273,7 @@ async fn test_http3_stream_priority() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
-    {
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!(
@@ -2328,8 +2317,7 @@ async fn test_http3_stream_cancellation() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
-    {
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!(
@@ -2372,8 +2360,7 @@ async fn test_http3_bidirectional_streams() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
-    {
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!(
@@ -2420,8 +2407,7 @@ async fn test_http3_proxy_header_manipulation() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
-    {
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!(
@@ -2482,8 +2468,7 @@ async fn test_http3_proxy_load_balancing() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
-    {
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!(
@@ -2510,7 +2495,7 @@ async fn test_http3_proxy_load_balancing() {
 
     // 少なくともいくつかのレスポンスを受信したことを確認
     assert!(
-        responses.len() > 0,
+        !responses.is_empty(),
         "Should receive at least some responses"
     );
 }
@@ -2531,8 +2516,7 @@ async fn test_http3_stream_timeout() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
-    {
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!(
@@ -2570,8 +2554,7 @@ async fn test_http3_invalid_frame() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
-    {
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!(
@@ -2605,8 +2588,7 @@ async fn test_http3_backend_failure() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
-    {
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!(
@@ -2648,8 +2630,7 @@ async fn test_http3_tls_handshake() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版、TLS 1.3ハンドシェイクを含む）
-    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
-    {
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
         Ok(c) => {
             eprintln!("TLS 1.3 handshake completed successfully");
             c
@@ -2739,8 +2720,7 @@ async fn test_http3_connection_close() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
-    {
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!(
@@ -2846,8 +2826,7 @@ async fn test_http3_large_response_body() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
-    {
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!(
@@ -2890,8 +2869,7 @@ async fn test_http3_chunked_response() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
-    {
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!(
@@ -3262,8 +3240,7 @@ async fn test_http3_throughput() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
-    {
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!(
@@ -3325,8 +3302,7 @@ async fn test_http3_latency() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
-    {
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!(
@@ -3616,8 +3592,7 @@ async fn test_http3_qpack_compression() {
         .expect("Invalid server address");
 
     // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
-    {
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
         Ok(c) => c,
         Err(e) => {
             panic!(
@@ -4834,7 +4809,6 @@ async fn test_connection_limit_enforcement() {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
-    
 
     let success_count = Arc::new(AtomicUsize::new(0));
     let total_connections = 100;
@@ -6342,7 +6316,6 @@ async fn test_ktls_multiple_connections() {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
-    
 
     let success_count = Arc::new(AtomicUsize::new(0));
     let total_connections = 10;
@@ -7206,7 +7179,6 @@ async fn test_concurrent_connection_stress() {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
-    
 
     let success_count = Arc::new(AtomicUsize::new(0));
     let error_count = Arc::new(AtomicUsize::new(0));
@@ -8681,7 +8653,7 @@ async fn test_buffering_adaptive_content_length_missing() {
 
     // Content-Lengthがない場合でも正常に処理されることを確認
     assert!(
-        content_length.is_none() || transfer_encoding.is_some() || response.len() > 0,
+        content_length.is_none() || transfer_encoding.is_some() || !response.is_empty(),
         "Response should be processed even without Content-Length"
     );
 }
@@ -8743,7 +8715,7 @@ async fn test_buffering_invalid_content_length() {
     let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
 
     while tls_conn.is_handshaking() {
-        if let Err(_) = tls_conn.complete_io(&mut stream) {
+        if tls_conn.complete_io(&mut stream).is_err() {
             panic!("TLS handshake error");
         }
     }
@@ -9786,8 +9758,8 @@ async fn test_connection_abort() {
     }
     tls_stream.flush().unwrap();
 
-    // 接続を切断（ドロップ）
-    drop(tls_stream);
+    // 接続を切断（ドロップ）。tls_stream は stream への借用のため先に手放す。
+    let _ = tls_stream;
     drop(stream);
 
     // プロキシが接続中断を正しく処理することを確認
@@ -9854,7 +9826,7 @@ async fn test_empty_request() {
 
     // 空のリクエストの場合、400 Bad Requestが返される可能性がある
     assert!(
-        status == Some(400) || status == None,
+        status == Some(400) || status.is_none(),
         "Should return 400 Bad Request or close connection: {:?}",
         status
     );
@@ -11185,11 +11157,10 @@ async fn test_concurrent_requests_different_paths() {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
-    
 
     let success_count = Arc::new(AtomicUsize::new(0));
     let total_requests = 30;
-    let paths = vec!["/", "/large.txt", "/__metrics"];
+    let paths = ["/", "/large.txt", "/__metrics"];
 
     let handles: Vec<_> = (0..total_requests)
         .map(|i| {
@@ -11240,11 +11211,10 @@ async fn test_concurrent_requests_mixed_methods() {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
-    
 
     let success_count = Arc::new(AtomicUsize::new(0));
     let total_requests = 20;
-    let methods = vec!["GET", "POST", "HEAD", "OPTIONS"];
+    let methods = ["GET", "POST", "HEAD", "OPTIONS"];
 
     let handles: Vec<_> = (0..total_requests)
         .map(|i| {
@@ -11296,7 +11266,6 @@ async fn test_concurrent_requests_with_headers() {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
-    
 
     let success_count = Arc::new(AtomicUsize::new(0));
     let total_requests = 25;
@@ -12109,7 +12078,7 @@ async fn test_compression_zstd() {
     if prereq.is_none() {
         panic!("Prerequisite check failed: no response from /large.txt");
     }
-    let prereq_status = get_status_code(&prereq.as_ref().unwrap());
+    let prereq_status = get_status_code(prereq.as_ref().unwrap());
     if prereq_status != Some(200) {
         panic!(
             "Prerequisite failed: /large.txt not found (status: {:?})",
@@ -12159,7 +12128,7 @@ async fn test_compression_multiple_encodings() {
     if prereq.is_none() {
         panic!("Prerequisite check failed: no response from /large.txt");
     }
-    let prereq_status = get_status_code(&prereq.as_ref().unwrap());
+    let prereq_status = get_status_code(prereq.as_ref().unwrap());
     if prereq_status != Some(200) {
         panic!(
             "Prerequisite failed: /large.txt not found (status: {:?})",
@@ -12212,7 +12181,7 @@ async fn test_compression_no_encoding() {
     if prereq.is_none() {
         panic!("Prerequisite check failed: no response from /large.txt");
     }
-    let prereq_status = get_status_code(&prereq.as_ref().unwrap());
+    let prereq_status = get_status_code(prereq.as_ref().unwrap());
     if prereq_status != Some(200) {
         panic!(
             "Prerequisite failed: /large.txt not found (status: {:?})",
@@ -12506,7 +12475,7 @@ async fn test_buffering_memory_limit() {
     if prereq.is_none() {
         panic!("Prerequisite check failed: no response from /large.txt");
     }
-    let prereq_status = get_status_code(&prereq.as_ref().unwrap());
+    let prereq_status = get_status_code(prereq.as_ref().unwrap());
     if prereq_status != Some(200) {
         panic!(
             "Prerequisite failed: /large.txt not found (status: {:?})",
@@ -13479,7 +13448,7 @@ async fn test_buffering_client_write_timeout() {
     let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
 
     while tls_conn.is_handshaking() {
-        if let Err(_) = tls_conn.complete_io(&mut stream) {
+        if tls_conn.complete_io(&mut stream).is_err() {
             panic!("TLS handshake error");
         }
     }
@@ -15078,7 +15047,6 @@ mod wasm_tests {
 
         // 同時実行時の動作を確認
         // 複数のリクエストを同時に送信して、WASMモジュールが正常に動作することを確認
-        
 
         let mut handles = Vec::new();
         let num_requests = 10;
@@ -15093,17 +15061,14 @@ mod wasm_tests {
 
         let mut success_count = 0;
         for handle in handles {
-            match handle.await {
-                Ok((_i, Some(response))) => {
-                    let status = get_status_code(&response);
-                    if status == Some(200) {
-                        let processed = get_header_value(&response, "X-Veil-Processed");
-                        if processed == Some("true".to_string()) {
-                            success_count += 1;
-                        }
+            if let Ok((_i, Some(response))) = handle.await {
+                let status = get_status_code(&response);
+                if status == Some(200) {
+                    let processed = get_header_value(&response, "X-Veil-Processed");
+                    if processed == Some("true".to_string()) {
+                        success_count += 1;
                     }
                 }
-                _ => {}
             }
         }
 
@@ -17311,6 +17276,10 @@ fn get_server_cert_der(port: u16) -> Result<Vec<u8>, String> {
 /// 設定リロード: ルート追加が SIGHUP 後に反映される
 #[tokio::test]
 #[ntest::timeout(60000)]
+// clippy::await_holding_lock 許容理由: RELOAD_TEST_LOCK は SIGHUP リロード系テストを
+// テストプロセス内で直列化するための意図的なガードで、テスト全体（await を含む）を
+// 覆う必要がある（tokio マルチスレッドでも所有スレッドは同一タスク内で完結する）。
+#[allow(clippy::await_holding_lock)]
 async fn test_config_reload_adds_route_via_sighup() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -17416,6 +17385,10 @@ index = "index.html"
 /// 不正な設定でのリロードは拒否され、旧設定でサービングが継続する
 #[tokio::test]
 #[ntest::timeout(60000)]
+// clippy::await_holding_lock 許容理由: RELOAD_TEST_LOCK は SIGHUP リロード系テストを
+// テストプロセス内で直列化するための意図的なガードで、テスト全体（await を含む）を
+// 覆う必要がある（tokio マルチスレッドでも所有スレッドは同一タスク内で完結する）。
+#[allow(clippy::await_holding_lock)]
 async fn test_config_reload_invalid_config_keeps_serving() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -17458,6 +17431,10 @@ async fn test_config_reload_invalid_config_keeps_serving() {
 /// リロード中もリクエストが途切れない（ゼロダウンタイム、F-03 回帰確認）
 #[tokio::test]
 #[ntest::timeout(60000)]
+// clippy::await_holding_lock 許容理由: RELOAD_TEST_LOCK は SIGHUP リロード系テストを
+// テストプロセス内で直列化するための意図的なガードで、テスト全体（await を含む）を
+// 覆う必要がある（tokio マルチスレッドでも所有スレッドは同一タスク内で完結する）。
+#[allow(clippy::await_holding_lock)]
 async fn test_tls_cert_reload_via_sighup() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -17615,16 +17592,14 @@ async fn test_b17_bad_backend_cl_too_large_closes_promptly() {
         .await
         .expect("must not hang (B-17)");
     // hyper は不完全ボディを IncompleteMessage エラーにする（成功しても部分ボディ）
-    match res {
-        Ok((status, body)) => {
-            assert_eq!(status, 200);
-            assert!(
-                body.len() < 1000,
-                "body must be truncated, got {}",
-                body.len()
-            );
-        }
-        Err(_) => {} // IncompleteMessage 等は期待どおり（接続が即クローズされた）
+    // Err(IncompleteMessage 等) は期待どおり（接続が即クローズされた）
+    if let Ok((status, body)) = res {
+        assert_eq!(status, 200);
+        assert!(
+            body.len() < 1000,
+            "body must be truncated, got {}",
+            body.len()
+        );
     }
     assert!(
         started.elapsed() < Duration::from_secs(8),

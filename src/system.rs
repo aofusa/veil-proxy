@@ -54,7 +54,7 @@ pub(crate) fn check_huge_pages_availability() -> HugePagesInfo {
     };
 
     let reader = StdBufReader::new(file);
-    for line in reader.lines().flatten() {
+    for line in reader.lines().map_while(Result::ok) {
         if line.starts_with("HugePages_Total:") {
             if let Some(val) = line.split_whitespace().nth(1) {
                 info.total = val.parse().unwrap_or(0);
@@ -345,10 +345,8 @@ pub(crate) fn drop_privileges(security: &crate::GlobalSecurityConfig) -> io::Res
         );
 
         // rootに戻れないことを確認
-        if security.drop_privileges_user.is_some() {
-            if unsafe { libc::setuid(0) } == 0 {
-                warn!("WARNING: Process can still regain root privileges!");
-            }
+        if security.drop_privileges_user.is_some() && unsafe { libc::setuid(0) } == 0 {
+            warn!("WARNING: Process can still regain root privileges!");
         }
     }
 

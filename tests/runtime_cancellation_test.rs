@@ -6,9 +6,8 @@
 //! 世代スラブ、B-07 の意味論）がクリティカルである。
 //!
 //! 本テストは実リング（実カーネル）上で I/O Future（recv / send / accept / timer）を
-//! **ランダムなタイミングで強制 Drop** し続け、
-//! - panic / abort が発生しない
-//! - Drop 後もランタイムが生存し、後続の I/O が正しく完了する（liveness + 正当性）
+//! **ランダムなタイミングで強制 Drop** し続け、「panic / abort が発生しない」
+//! 「Drop 後もランタイムが生存し、後続の I/O が正しく完了する（liveness + 正当性）」
 //! ことを検証する。ASAN ビルド（F-85）と組み合わせると UAF を実行レベルで検出できる。
 //!
 //! 乱数は決定的 LCG。シードは `VEIL_CANCEL_TEST_SEED` で上書き可能（失敗再現用に
@@ -86,7 +85,9 @@ fn spawn_payload_server(
 #[test]
 fn random_drop_of_recv_send_futures_keeps_runtime_alive() {
     if !io_uring_available() {
-        eprintln!("io_uring unavailable; skipping random_drop_of_recv_send_futures_keeps_runtime_alive");
+        eprintln!(
+            "io_uring unavailable; skipping random_drop_of_recv_send_futures_keeps_runtime_alive"
+        );
         return;
     }
 
@@ -114,33 +115,29 @@ fn random_drop_of_recv_send_futures_keeps_runtime_alive() {
                 //     ペイロード到着タイミングとの競合で「完了直前 / 完了後」も踏む）。
                 1 => {
                     let micros = rng.below(800);
-                    let _ = timeout(
-                        Duration::from_micros(micros),
-                        async { stream.read(vec![0u8; 4096]).await },
-                    )
+                    let _ = timeout(Duration::from_micros(micros), async {
+                        stream.read(vec![0u8; 4096]).await
+                    })
                     .await;
                 }
                 // (c) send を打ち切る（送信 in-flight の Drop。小さな送信は即完了しうる）。
                 2 => {
                     let micros = rng.below(200);
                     let data = vec![b'x'; 32 * 1024];
-                    let _ = timeout(
-                        Duration::from_micros(micros),
-                        async { stream.write(data).await },
-                    )
+                    let _ = timeout(Duration::from_micros(micros), async {
+                        stream.write(data).await
+                    })
                     .await;
                 }
                 // (d) recv を打ち切った直後に同一接続でもう一度 recv して Drop（多重キャンセル）。
                 _ => {
-                    let _ = timeout(
-                        Duration::from_micros(rng.below(300)),
-                        async { stream.read(vec![0u8; 1024]).await },
-                    )
+                    let _ = timeout(Duration::from_micros(rng.below(300)), async {
+                        stream.read(vec![0u8; 1024]).await
+                    })
                     .await;
-                    let _ = timeout(
-                        Duration::from_micros(rng.below(300)),
-                        async { stream.read(vec![0u8; 1024]).await },
-                    )
+                    let _ = timeout(Duration::from_micros(rng.below(300)), async {
+                        stream.read(vec![0u8; 1024]).await
+                    })
                     .await;
                 }
             }
@@ -153,11 +150,10 @@ fn random_drop_of_recv_send_futures_keeps_runtime_alive() {
                 let mut received = Vec::new();
                 while received.len() < PAYLOAD.len() {
                     let buf = vec![0u8; 4096];
-                    let (res, buf) = timeout(Duration::from_secs(5), async {
-                        probe.read(buf).await
-                    })
-                    .await
-                    .expect("runtime must stay alive: probe read timed out");
+                    let (res, buf) =
+                        timeout(Duration::from_secs(5), async { probe.read(buf).await })
+                            .await
+                            .expect("runtime must stay alive: probe read timed out");
                     let n = res.expect("probe read");
                     assert!(n > 0, "unexpected EOF before full payload");
                     received.extend_from_slice(&buf[..n]);

@@ -512,7 +512,7 @@ impl StreamManager {
     /// ストリーム ID の開始を拒否する。
     pub fn get_or_create_client_stream(&mut self, id: u32) -> Result<&mut Stream, Http2Error> {
         // クライアントストリームは奇数
-        if id % 2 == 0 {
+        if id.is_multiple_of(2) {
             return Err(Http2Error::connection_error(
                 Http2ErrorCode::ProtocolError,
                 "Client stream ID must be odd",

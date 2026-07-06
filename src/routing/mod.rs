@@ -88,7 +88,7 @@ impl HostRouter {
                     // Exact match
                     self.exact
                         .entry(pattern.to_lowercase())
-                        .or_insert_with(Vec::new)
+                        .or_default()
                         .push(route_idx);
                 }
             }
@@ -130,9 +130,8 @@ impl HostRouter {
 
         // 2. Wildcard matches
         for (pattern, indices) in &self.wildcard {
-            if pattern.starts_with("__prefix__:") {
+            if let Some(prefix) = pattern.strip_prefix("__prefix__:") {
                 // Prefix pattern (api.*)
-                let prefix = &pattern["__prefix__:".len()..];
                 if host_only.starts_with(prefix) && host_only.len() > prefix.len() {
                     let rest = &host_only[prefix.len()..];
                     if rest.starts_with('.') {
@@ -284,8 +283,7 @@ impl PathRouter {
         }
 
         // Prefix match
-        if path.starts_with(pattern) {
-            let remaining = &path[pattern.len()..];
+        if let Some(remaining) = path.strip_prefix(pattern) {
             return remaining.is_empty() || remaining.starts_with('/');
         }
 
@@ -392,10 +390,7 @@ impl CidrMatcher {
         } else {
             // Exact IP
             if let Ok(ip) = cidr.parse::<IpAddr>() {
-                self.exact_ips
-                    .entry(ip)
-                    .or_insert_with(Vec::new)
-                    .push(route_idx);
+                self.exact_ips.entry(ip).or_default().push(route_idx);
             }
         }
     }
@@ -702,7 +697,7 @@ impl OptimizedRouter {
             const LOG_EVERY_N: u64 = 100;
             static COUNT: AtomicU64 = AtomicU64::new(0);
             let c = COUNT.fetch_add(1, Ordering::Relaxed);
-            if c % LOG_EVERY_N == 0 {
+            if c.is_multiple_of(LOG_EVERY_N) {
                 debug!(
                     "[Routing] get_candidates: host_cand={:?} path_cand_len={} ip_cand_len={}",
                     host_candidates,

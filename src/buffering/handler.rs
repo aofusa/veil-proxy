@@ -121,7 +121,7 @@ mod tests {
 
         // パスが正しい構造を持つことを確認
         assert!(path.starts_with(base));
-        assert!(path.extension().map_or(false, |ext| ext == "buf"));
+        assert!(path.extension().is_some_and(|ext| ext == "buf"));
     }
 
     #[test]

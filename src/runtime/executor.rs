@@ -409,8 +409,10 @@ pub(crate) fn fuzz_op_table_sequence(data: &[u8]) {
                     let (ud, _) = tracked[i];
                     let counter = Rc::new(std::cell::Cell::new(0u32));
                     let c = counter.clone();
-                    let was_pending =
-                        table.detach(ud, OpGuard::Cleanup(Box::new(move |_res| c.set(c.get() + 1))));
+                    let was_pending = table.detach(
+                        ud,
+                        OpGuard::Cleanup(Box::new(move |_res| c.set(c.get() + 1))),
+                    );
                     assert!(
                         counter.get() <= 1,
                         "detach guard ran {} times synchronously",

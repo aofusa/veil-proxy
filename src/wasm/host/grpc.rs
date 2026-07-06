@@ -292,7 +292,7 @@ fn proxy_grpc_call_impl(
     // Write call_id to return pointer
     if return_call_id_ptr > 0 {
         if let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) {
-            let call_id_bytes = (call_id as u32).to_le_bytes();
+            let call_id_bytes = call_id.to_le_bytes();
             let data = memory.data_mut(&mut *caller);
             let ptr = return_call_id_ptr as usize;
             if ptr + 4 <= data.len() {

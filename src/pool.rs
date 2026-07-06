@@ -326,7 +326,7 @@ impl HttpConnectionPool {
     ) {
         // F-09: メトリクス用にキーを保持（key は entry へムーブされるため）
         let metric_key = key.clone();
-        let queue = self.connections.entry(key).or_insert_with(VecDeque::new);
+        let queue = self.connections.entry(key).or_default();
 
         // 古い接続を削除（設定可能な最大数を使用）
         while queue.len() >= max_idle {
@@ -378,7 +378,7 @@ impl HttpsConnectionPool {
     ) {
         // F-09: メトリクス用にキーを保持（key は entry へムーブされるため）
         let metric_key = key.clone();
-        let queue = self.connections.entry(key).or_insert_with(VecDeque::new);
+        let queue = self.connections.entry(key).or_default();
 
         // 古い接続を削除（設定可能な最大数を使用）
         while queue.len() >= max_idle {
@@ -698,7 +698,6 @@ pub(crate) fn buf_put_vec(mut buf: Vec<u8>) {
 pub(crate) const REQUEST_BUF_SIZE: usize = 1024;
 /// 大容量リクエスト用バッファサイズ
 pub(crate) const LARGE_REQUEST_BUF_SIZE: usize = 4096;
-/// パス文字列用バッファサイズ
 
 // ====================
 // バッファプール設定（config.toml対応）

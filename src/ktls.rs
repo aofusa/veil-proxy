@@ -199,7 +199,7 @@ impl std::error::Error for KtlsError {}
 
 impl From<KtlsError> for io::Error {
     fn from(e: KtlsError) -> Self {
-        io::Error::new(io::ErrorKind::Other, e.to_string())
+        io::Error::other(e.to_string())
     }
 }
 
@@ -475,7 +475,7 @@ pub fn setup_ulp(fd: RawFd) -> io::Result<()> {
             fd,
             SOL_TCP,
             TCP_ULP,
-            "tls\0".as_ptr() as *const libc::c_void,
+            c"tls".as_ptr() as *const libc::c_void,
             4, // "tls\0" の長さ
         )
     };

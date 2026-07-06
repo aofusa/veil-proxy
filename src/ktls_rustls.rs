@@ -626,20 +626,13 @@ fn setup_ktls_after_ulp(
     let protocol_version = conn.protocol_version();
 
     // シークレットを抽出
-    let secrets = conn.dangerous_extract_secrets().map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            format!("Failed to extract secrets: {:?}", e),
-        )
-    })?;
+    let secrets = conn
+        .dangerous_extract_secrets()
+        .map_err(|e| io::Error::other(format!("Failed to extract secrets: {:?}", e)))?;
 
     // TX/RX バッチ抽出（共有処理で効率化）
-    let (mut tx, mut rx) = extract_tx_rx(secrets, protocol_version).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            format!("Failed to build crypto info: {}", e),
-        )
-    })?;
+    let (mut tx, mut rx) = extract_tx_rx(secrets, protocol_version)
+        .map_err(|e| io::Error::other(format!("Failed to build crypto info: {}", e)))?;
 
     // TX 設定
     setup_tls_info(fd, TLS_TX, &tx)?;
@@ -740,10 +733,10 @@ pub async fn accept(
                         "kTLS unavailable ({}) and fallback disabled, rejecting connection",
                         reason
                     );
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("kTLS required but unavailable: {}", reason),
-                    ));
+                    return Err(io::Error::other(format!(
+                        "kTLS required but unavailable: {}",
+                        reason
+                    )));
                 }
             }
             KtlsEnableResult::Fatal(e) => {
@@ -823,10 +816,10 @@ pub async fn connect(
                         "kTLS unavailable ({}) and fallback disabled, rejecting connection",
                         reason
                     );
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("kTLS required but unavailable: {}", reason),
-                    ));
+                    return Err(io::Error::other(format!(
+                        "kTLS required but unavailable: {}",
+                        reason
+                    )));
                 }
             }
             KtlsEnableResult::Fatal(e) => {
@@ -887,12 +880,7 @@ impl crate::runtime::io::AsyncReadRent for KtlsServerStream {
             {
                 let conn = match self.conn.as_mut() {
                     Some(c) => c,
-                    None => {
-                        return (
-                            Err(io::Error::new(io::ErrorKind::Other, "No TLS connection")),
-                            buf,
-                        )
-                    }
+                    None => return (Err(io::Error::other("No TLS connection")), buf),
                 };
                 drain_rustls_into(&mut self.drained_buffer, conn.reader());
             }
@@ -918,12 +906,7 @@ impl crate::runtime::io::AsyncReadRent for KtlsServerStream {
                 Ok(n) => {
                     let conn = match self.conn.as_mut() {
                         Some(c) => c,
-                        None => {
-                            return (
-                                Err(io::Error::new(io::ErrorKind::Other, "No TLS connection")),
-                                buf,
-                            )
-                        }
+                        None => return (Err(io::Error::other("No TLS connection")), buf),
                     };
                     let mut consumed = 0;
                     while consumed < n {
@@ -954,10 +937,7 @@ impl crate::runtime::io::AsyncReadRent for KtlsServerStream {
 
     async fn readv<T: IoVecBufMut>(&mut self, buf: T) -> crate::runtime::io::BufResult<usize, T> {
         // IoVec stub のため未サポート
-        (
-            Err(io::Error::new(io::ErrorKind::Other, "readv not supported")),
-            buf,
-        )
+        (Err(io::Error::other("readv not supported")), buf)
     }
 }
 
@@ -971,12 +951,7 @@ impl crate::runtime::io::AsyncWriteRent for KtlsServerStream {
         // rustls 経由で書き込み
         let conn = match &mut self.conn {
             Some(c) => c,
-            None => {
-                return (
-                    Err(io::Error::new(io::ErrorKind::Other, "No TLS connection")),
-                    buf,
-                )
-            }
+            None => return (Err(io::Error::other("No TLS connection")), buf),
         };
 
         let slice = unsafe { std::slice::from_raw_parts(buf.read_ptr(), buf.bytes_init()) };
@@ -1020,10 +995,7 @@ impl crate::runtime::io::AsyncWriteRent for KtlsServerStream {
 
     async fn writev<T: IoVecBuf>(&mut self, buf: T) -> crate::runtime::io::BufResult<usize, T> {
         // IoVec stub のため未サポート
-        (
-            Err(io::Error::new(io::ErrorKind::Other, "writev not supported")),
-            buf,
-        )
+        (Err(io::Error::other("writev not supported")), buf)
     }
 
     async fn flush(&mut self) -> io::Result<()> {
@@ -1065,12 +1037,7 @@ impl crate::runtime::io::AsyncReadRent for KtlsClientStream {
             {
                 let conn = match self.conn.as_mut() {
                     Some(c) => c,
-                    None => {
-                        return (
-                            Err(io::Error::new(io::ErrorKind::Other, "No TLS connection")),
-                            buf,
-                        )
-                    }
+                    None => return (Err(io::Error::other("No TLS connection")), buf),
                 };
                 drain_rustls_into(&mut self.drained_buffer, conn.reader());
             }
@@ -1094,12 +1061,7 @@ impl crate::runtime::io::AsyncReadRent for KtlsClientStream {
                 Ok(n) => {
                     let conn = match self.conn.as_mut() {
                         Some(c) => c,
-                        None => {
-                            return (
-                                Err(io::Error::new(io::ErrorKind::Other, "No TLS connection")),
-                                buf,
-                            )
-                        }
+                        None => return (Err(io::Error::other("No TLS connection")), buf),
                     };
                     let mut consumed = 0;
                     while consumed < n {
@@ -1127,10 +1089,7 @@ impl crate::runtime::io::AsyncReadRent for KtlsClientStream {
 
     async fn readv<T: IoVecBufMut>(&mut self, buf: T) -> crate::runtime::io::BufResult<usize, T> {
         // IoVec stub のため未サポート
-        (
-            Err(io::Error::new(io::ErrorKind::Other, "readv not supported")),
-            buf,
-        )
+        (Err(io::Error::other("readv not supported")), buf)
     }
 }
 
@@ -1142,12 +1101,7 @@ impl crate::runtime::io::AsyncWriteRent for KtlsClientStream {
 
         let conn = match &mut self.conn {
             Some(c) => c,
-            None => {
-                return (
-                    Err(io::Error::new(io::ErrorKind::Other, "No TLS connection")),
-                    buf,
-                )
-            }
+            None => return (Err(io::Error::other("No TLS connection")), buf),
         };
 
         let slice = unsafe { std::slice::from_raw_parts(buf.read_ptr(), buf.bytes_init()) };
@@ -1189,10 +1143,7 @@ impl crate::runtime::io::AsyncWriteRent for KtlsClientStream {
 
     async fn writev<T: IoVecBuf>(&mut self, buf: T) -> crate::runtime::io::BufResult<usize, T> {
         // IoVec stub のため未サポート
-        (
-            Err(io::Error::new(io::ErrorKind::Other, "writev not supported")),
-            buf,
-        )
+        (Err(io::Error::other("writev not supported")), buf)
     }
 
     async fn flush(&mut self) -> io::Result<()> {
@@ -1516,8 +1467,7 @@ pub fn is_ktls_available() -> bool {
 ///
 /// # Arguments
 ///
-/// * `enable_ktls` - kTLS を有効化する場合は true。
-///                   true の場合、シークレット抽出が有効化される。
+/// * `enable_ktls` - kTLS を有効化する場合は true。true の場合、シークレット抽出が有効化される。
 pub fn client_config(enable_ktls: bool) -> Arc<ClientConfig> {
     let mut root_store = RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());

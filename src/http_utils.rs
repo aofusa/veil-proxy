@@ -48,6 +48,10 @@ impl IpStr {
 ///
 /// ホスト名最大 253 文字 + ':' + ポート 5 桁 = 259 バイトを収める 260 バイト固定。
 /// ホストが上限を超える場合のみ（実運用では発生しない）切り詰めずヒープへフォールバックする。
+// clippy::large_enum_variant 許容理由: Stack バリアントのインライン 260B こそが本型の目的
+// （F-41: リクエストごとの host:port 文字列ヒープ確保をスタック整形で排除）。Box 化すると
+// ホットパスにアロケーションが戻り本末転倒になる。
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum HostPortStr {
     Stack { buf: [u8; 260], len: u16 },
     Heap(String),
@@ -535,9 +539,7 @@ pub(crate) fn parse_te_header(te_header: &[u8]) -> TeHeader {
 /// リクエストからRangeヘッダーを取得
 // 現在は単体テストのみで使用（実装済み RFC/ユーティリティヘルパー）
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn get_range_header<'a>(
-    headers: &'a [(impl AsRef<[u8]>, impl AsRef<[u8]>)],
-) -> Option<&'a [u8]> {
+pub(crate) fn get_range_header(headers: &[(impl AsRef<[u8]>, impl AsRef<[u8]>)]) -> Option<&[u8]> {
     headers
         .iter()
         .find(|(name, _)| name.as_ref().eq_ignore_ascii_case(b"range"))

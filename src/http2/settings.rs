@@ -203,7 +203,7 @@ impl Http2Settings {
 
     /// SETTINGS フレームのペイロードからデコード
     pub fn decode(payload: &[u8]) -> Result<Self, String> {
-        if payload.len() % 6 != 0 {
+        if !payload.len().is_multiple_of(6) {
             return Err("SETTINGS payload length must be multiple of 6".into());
         }
 
@@ -233,8 +233,8 @@ impl Http2Settings {
                     settings.initial_window_size = value;
                 }
                 Some(SettingsId::MaxFrameSize) => {
-                    if value < defaults::MAX_FRAME_SIZE
-                        || value > defaults::MAX_FRAME_SIZE_UPPER_LIMIT
+                    if !(defaults::MAX_FRAME_SIZE..=defaults::MAX_FRAME_SIZE_UPPER_LIMIT)
+                        .contains(&value)
                     {
                         return Err(format!(
                             "MAX_FRAME_SIZE must be between {} and {}",
