@@ -26,10 +26,24 @@
 - **[B-17](../bugs/B-17-malformed-backend-client-hang.md)**: ヘッダー異常・早期切断・
   巨大ヘッダー時に **クライアント可視のハング**（速やかな 502/クローズにならない）。
 
+## 実装済み（HTTP/2 上流耐性・2026-07-06）
+
+- **H2C クライアント（proxy→h2 バックエンド）の違反応答耐性を単体テスト化**
+  （`src/http2/client.rs` の `backend_*` 5 件）。不正な h2 バックエンド応答に対し
+  クライアントが **panic・無限ループせず必ず `Err` を返す**ことを検証:
+  - 即時 EOF（無応答切断）→ `ConnectionClosed`
+  - 切り詰めフレーム（宣言長にペイロード未達で EOF）→ `Err`
+  - フレーム解釈不能なゴミバイト列 → panic せず `Err`
+  - バックエンド `GOAWAY` → `ConnectionClosed`
+  - 対象ストリームへの `RST_STREAM` → stream error `Err`
+- ScriptedStream モック + 同期ドライバで、実バックエンド不要にホワイトボックス検証。
+
 ## 残件
 
-- HTTP/2・HTTP/3 上流に対する同種の違反注入（現状は HTTP/1.1 上流）。
-- B-16 / B-17 修正後、本スクリプトを回帰テストとして CI 化。
+- HTTP/3 上流に対する同種の違反注入（quiche クライアント経路）。
+- コンテナレベルの h2 フレーム単位モックバックエンド（現状は HTTP/1.1 の
+  `bad_backend_server.py` + h2 クライアント単体テスト）。
+- B-16 / B-17 修正済み。`bad_backend_chaos.sh` の CI 化は [F-57](F-57-container-security-ci.md) 管理。
 
 ## 受け入れ条件
 

@@ -897,4 +897,61 @@ mod tests {
         assert_eq!(dflags & 0x1, 0x1, "END_STREAM set on last DATA");
         assert_eq!(dpayload.as_slice(), req_body, "DATA payload byte-identical");
     }
+
+    // ====================
+    // F-67: HTTP/2 上流（バックエンド）プロトコル違反への耐性
+    // ====================
+    //
+    // 不正な h2 バックエンド応答（早期切断・切り詰めフレーム・ゴミバイト・GOAWAY・
+    // RST_STREAM）に対し、H2C クライアントが **panic・無限ループせず必ず Err を返す**
+    // ことを検証する（クラッシュ／ハングでのクライアント可視デシンクを防ぐ）。
+
+    /// バックエンドが応答を返さず即切断（EOF）→ ConnectionClosed で速やかに Err。
+    #[test]
+    fn backend_immediate_eof_returns_error() {
+        let mut client = H2cClient::new(ScriptedStream::new(Vec::new()), Http2Settings::default());
+        let result = drive(client.send_request(b"GET", b"/", b"b", &[], None));
+        assert!(result.is_err(), "immediate EOF must yield Err, not hang/panic");
+    }
+
+    /// フレームヘッダは完全だが宣言長ぶんのペイロードが届かず EOF（切り詰め）→ Err。
+    #[test]
+    fn backend_truncated_frame_returns_error() {
+        let full = build_response(b"body");
+        // HEADERS フレームヘッダ(9B)+数バイトだけ渡して切り詰める（宣言長に満たない）。
+        let truncated = full[..12.min(full.len())].to_vec();
+        let mut client = H2cClient::new(ScriptedStream::new(truncated), Http2Settings::default());
+        let result = drive(client.send_request(b"GET", b"/", b"b", &[], None));
+        assert!(result.is_err(), "truncated frame must yield Err, not hang");
+    }
+
+    /// フレームとして解釈不能なゴミバイト列 → panic せず Err。
+    #[test]
+    fn backend_garbage_bytes_returns_error() {
+        let garbage = vec![0xffu8; 64];
+        let mut client = H2cClient::new(ScriptedStream::new(garbage), Http2Settings::default());
+        let result = drive(client.send_request(b"GET", b"/", b"b", &[], None));
+        assert!(result.is_err(), "garbage bytes must yield Err, not panic");
+    }
+
+    /// バックエンドが GOAWAY を返す → ConnectionClosed で Err。
+    #[test]
+    fn backend_goaway_returns_error() {
+        let enc = FrameEncoder::new(16384);
+        let goaway = enc.encode_goaway(0, 0, b"");
+        let mut client = H2cClient::new(ScriptedStream::new(goaway), Http2Settings::default());
+        let result = drive(client.send_request(b"GET", b"/", b"b", &[], None));
+        assert!(matches!(result, Err(Http2Error::ConnectionClosed)));
+    }
+
+    /// バックエンドが対象ストリームへ RST_STREAM を返す → stream error で Err。
+    #[test]
+    fn backend_rst_stream_returns_error() {
+        let enc = FrameEncoder::new(16384);
+        // クライアントの最初のストリーム ID は 1。
+        let rst = enc.encode_rst_stream(1, 0x8 /* CANCEL */);
+        let mut client = H2cClient::new(ScriptedStream::new(rst), Http2Settings::default());
+        let result = drive(client.send_request(b"GET", b"/", b"b", &[], None));
+        assert!(result.is_err(), "RST_STREAM must yield Err");
+    }
 }
