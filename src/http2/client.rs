@@ -911,7 +911,10 @@ mod tests {
     fn backend_immediate_eof_returns_error() {
         let mut client = H2cClient::new(ScriptedStream::new(Vec::new()), Http2Settings::default());
         let result = drive(client.send_request(b"GET", b"/", b"b", &[], None));
-        assert!(result.is_err(), "immediate EOF must yield Err, not hang/panic");
+        assert!(
+            result.is_err(),
+            "immediate EOF must yield Err, not hang/panic"
+        );
     }
 
     /// フレームヘッダは完全だが宣言長ぶんのペイロードが届かず EOF（切り詰め）→ Err。
