@@ -32,6 +32,11 @@ fi
 FIXTURES_DIR="${SCRIPT_DIR}/fixtures"
 PIDS_FILE="${FIXTURES_DIR}/pids.txt"
 
+# 実行モード（host / container）。引数パースで上書きされる。
+RUN_MODE="host"
+VEIL_IMAGE="veil:glibc"
+VEIL_PROXY_CONTAINER="veil-e2e-proxy"
+
 # ポート設定
 PROXY_HTTPS_PORT=8443
 PROXY_HTTP_PORT=8080
@@ -1139,6 +1144,72 @@ EOF
     log_info "Configuration files generated (type: ${config_type})"
 }
 
+# プロキシを起動する（RUN_MODE により host / container を切り替える）。
+#
+# host モード（既定・従来通り）:
+#   ビルド済みバイナリを直接起動する。proxy.pid はそのプロセス PID。
+#
+# container モード（e2e_setup.sh test container [glibc|musl]）:
+#   プロキシ（テスト対象）を veil コンテナイメージ（veil:glibc / veil:musl）から起動する。
+#   バックエンド群は host モードと全く同じ構成でホスト上に起動し、`--network host` で
+#   コンテナ内 veil が同一ループバックの同一ポートを bind・到達できるようにする（＝既存の
+#   e2e_setup.sh test と全く同じ構成・同じ設定・同じテストがコンテナ環境で実行される）。
+#   io_uring 用に seccomp 許可リストを適用し、フィクスチャを同一パスにマウントして
+#   証明書・WASM・ディスクスピルオーバのパスを解決する。SIGHUP リロードテスト用に
+#   `docker run`（アタッチ）をバックグラウンド起動し、その docker クライアント PID を
+#   proxy.pid に記録する（docker のシグナルプロキシで SIGHUP が veil PID1 に転送される）。
+start_proxy() {
+    if [ "${RUN_MODE}" = "container" ]; then
+        start_proxy_container
+    else
+        start_proxy_host
+    fi
+}
+
+start_proxy_host() {
+    # プロキシ起動（自己署名証明書を許可するため VEIL_TLS_INSECURE=1 を設定）
+    log_info "Starting veil proxy (host mode, binary: ${VEIL_BIN})..."
+    VEIL_TLS_INSECURE=1 "${VEIL_BIN}" --config "${FIXTURES_DIR}/proxy.toml" > /tmp/proxy.log 2>&1 &
+    echo $! >> "$PIDS_FILE"
+    # F-49: リロード E2E テストが SIGHUP を送るためのプロキシ PID ファイル
+    echo $! > "${FIXTURES_DIR}/proxy.pid"
+    log_info "Proxy started on ports ${PROXY_HTTPS_PORT}/${PROXY_HTTP_PORT} (PID: $!)"
+}
+
+start_proxy_container() {
+    local seccomp="${PROJECT_DIR}/docker/assets/security/seccomp.json"
+    if [ ! -f "$seccomp" ]; then
+        log_error "seccomp プロファイルが見つかりません: $seccomp"
+        exit 1
+    fi
+    if ! docker image inspect "${VEIL_IMAGE}" >/dev/null 2>&1; then
+        log_error "コンテナイメージ ${VEIL_IMAGE} が見つかりません。docker/README.md の手順で"
+        log_error "  docker build -f Dockerfile.<glibc|musl> -t ${VEIL_IMAGE} --build-arg CARGO_FEATURES='full' .. でビルドしてください"
+        exit 1
+    fi
+
+    log_info "Starting veil proxy (container mode, image: ${VEIL_IMAGE}, --network host)..."
+    docker rm -f "${VEIL_PROXY_CONTAINER}" >/dev/null 2>&1 || true
+    mkdir -p /tmp/veil_buffer
+
+    # アタッチ実行（-d ではない）をバックグラウンド起動し、docker クライアント PID を
+    # proxy.pid に記録する。docker のシグナルプロキシにより kill -HUP <client-pid> が
+    # コンテナ内 veil(PID1) へ転送され、F-49 の証明書リロードテストが機能する。
+    docker run --rm --name "${VEIL_PROXY_CONTAINER}" \
+        --network host \
+        --user "$(id -u):$(id -g)" \
+        -e VEIL_TLS_INSECURE=1 \
+        --security-opt "seccomp=${seccomp}" \
+        -v "${FIXTURES_DIR}:${FIXTURES_DIR}:rw" \
+        -v /tmp/veil_buffer:/tmp/veil_buffer:rw \
+        "${VEIL_IMAGE}" \
+        ./veil --config "${FIXTURES_DIR}/proxy.toml" > /tmp/proxy.log 2>&1 &
+    local run_pid=$!
+    echo "$run_pid" >> "$PIDS_FILE"
+    echo "$run_pid" > "${FIXTURES_DIR}/proxy.pid"
+    log_info "Proxy container '${VEIL_PROXY_CONTAINER}' started (docker client PID: $run_pid)"
+}
+
 # サーバーを起動
 start_servers() {
     log_info "Starting backend servers..."
@@ -1230,15 +1301,10 @@ start_servers() {
     fi
     
     log_info "Starting proxy server..."
-    
-    # プロキシ起動（自己署名証明書を許可するためVEIL_TLS_INSECURE=1を設定）
-    log_info "Starting veil proxy..."
-    VEIL_TLS_INSECURE=1 "${VEIL_BIN}" --config "${FIXTURES_DIR}/proxy.toml" > /tmp/proxy.log 2>&1 &
-    echo $! >> "$PIDS_FILE"
-    # F-49: リロード E2E テストが SIGHUP を送るためのプロキシ PID ファイル
-    echo $! > "${FIXTURES_DIR}/proxy.pid"
-    log_info "Proxy started on ports ${PROXY_HTTPS_PORT}/${PROXY_HTTP_PORT} (PID: $!)"
-    
+
+    # プロキシ起動（ホスト or コンテナ）
+    start_proxy
+
     # プロキシ起動待機（WASM AOT コンパイル対応のデッドライン方式）
     log_info "Waiting for proxy to be ready (allowing for WASM AOT compile on cold cache)..."
     if wait_for_proxy_ready; then
@@ -1252,6 +1318,9 @@ start_servers() {
 
 # サーバーを停止
 stop_servers() {
+    # コンテナモードのプロキシコンテナを確実に除去する（PID 経由の停止に依存しない）
+    docker rm -f "${VEIL_PROXY_CONTAINER}" >/dev/null 2>&1 || true
+
     if [ -f "$PIDS_FILE" ]; then
         log_info "Stopping servers..."
         
@@ -1610,9 +1679,49 @@ cleanup() {
 }
 
 # メイン処理
-CONFIG_TYPE="${2:-default}"  # 設定タイプ（default|cache|buffering|healthcheck|least_conn|ip_hash）
+#
+# 引数（$1=コマンドの後は順不同）:
+#   config_type: default|cache|buffering|healthcheck|least_conn|ip_hash|wasm|security
+#   container  : 指定するとプロキシを veil コンテナイメージで起動（未指定なら従来のホスト起動）
+#   glibc|musl : container 指定時のイメージ選択（既定 glibc）
+#
+# 例:
+#   ./tests/e2e_setup.sh test                    # ホスト環境（従来通り）
+#   ./tests/e2e_setup.sh test container          # コンテナ環境（veil:glibc）
+#   ./tests/e2e_setup.sh test container musl     # コンテナ環境（veil:musl）
+#   ./tests/e2e_setup.sh test cache container    # config_type=cache をコンテナ環境で
+COMMAND="${1:-}"
+CONFIG_TYPE="default"
+shift || true
+for arg in "$@"; do
+    case "$arg" in
+        container)
+            RUN_MODE="container"
+            ;;
+        glibc)
+            VEIL_IMAGE="veil:glibc"
+            ;;
+        musl)
+            VEIL_IMAGE="veil:musl"
+            ;;
+        default|cache|buffering|healthcheck|least_conn|ip_hash|wasm|security)
+            CONFIG_TYPE="$arg"
+            ;;
+        "")
+            ;;
+        *)
+            log_warn "不明な引数を無視します: $arg"
+            ;;
+    esac
+done
 
-case "${1:-}" in
+if [ "$RUN_MODE" = "container" ]; then
+    log_info "実行モード: container（プロキシイメージ: ${VEIL_IMAGE}）"
+else
+    log_info "実行モード: host"
+fi
+
+case "${COMMAND}" in
     start)
         ensure_veil_binary
         check_port_conflicts || exit 1
@@ -1689,7 +1798,7 @@ case "${1:-}" in
         cleanup
         ;;
     *)
-        echo "Usage: $0 {start|stop|restart|health|test|clean} [config_type]"
+        echo "Usage: $0 {start|stop|restart|health|test|clean} [config_type] [container [glibc|musl]]"
         echo ""
         echo "Commands:"
         echo "  start   - Start all servers"
@@ -1707,6 +1816,19 @@ case "${1:-}" in
         echo "  least_conn   - Use least connections algorithm"
         echo "  ip_hash      - Use IP hash algorithm"
         echo "  security     - Enable security features (rate limiting, IP restriction)"
+        echo ""
+        echo "Run Mode (optional, default: host):"
+        echo "  container        - Run the proxy from the veil container image (default veil:glibc)."
+        echo "                     Backends run on host and --network host is used so the exact"
+        echo "                     same composition/config/tests run in the container environment."
+        echo "  container glibc  - Use the veil:glibc image (default)."
+        echo "  container musl   - Use the veil:musl image."
+        echo "  (omit 'container' to run the proxy as a host binary, as before)"
+        echo ""
+        echo "  Examples:"
+        echo "    $0 test                 # host mode (unchanged)"
+        echo "    $0 test container       # container mode (veil:glibc)"
+        echo "    $0 test container musl  # container mode (veil:musl)"
         echo ""
         echo "Parallelization (Phase 1):"
         echo "  Tests are now run in parallel for faster execution."
