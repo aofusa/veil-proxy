@@ -115,11 +115,25 @@ run_load() { # target_label config_label container has_http2
 start_veil() { # image config_file container_name
     local img="$1" cfgfile="$2" name="$3"
     docker rm -f "$name" >/dev/null 2>&1
+
+    # 逆プロキシ系（perf-backend を上流に持つ）構成では、Landlock 下の glibc NSS による
+    # 実行時 DNS 解決が不安定なため、上流ホスト名を perf-backend の IP へ置換した
+    # ランタイム設定を使う（container_security ハーネスと同じ方針）。
+    local mount_cfg="$cfgfile"
+    if grep -q 'perf-backend:80' "$cfgfile" 2>/dev/null; then
+        local be_ip
+        be_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' perf-backend 2>/dev/null || true)
+        if [ -n "$be_ip" ]; then
+            mount_cfg="$LOGDIR/$(basename "$cfgfile" .toml).runtime.toml"
+            sed "s/perf-backend:80/${be_ip}:80/g" "$cfgfile" > "$mount_cfg"
+        fi
+    fi
+
     docker run -d --rm --network $NET \
         --read-only \
         --tmpfs /var/cache/veil:rw,noexec,nosuid,uid=65532,gid=65532,size=512m \
         --tmpfs /var/tmp/veil:rw,noexec,nosuid,uid=65532,gid=65532,size=256m \
-        -v "$cfgfile:/etc/veil/conf.d/config.toml:ro" \
+        -v "$mount_cfg:/etc/veil/conf.d/config.toml:ro" \
         -v "$ASSETS/ssl:/etc/veil/ssl:ro" \
         -v "$ASSETS/www:/var/www:ro" \
         --security-opt seccomp="$ASSETS/security/seccomp.json" \

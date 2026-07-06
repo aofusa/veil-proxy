@@ -97,7 +97,8 @@ mkdir -p "$(dirname "${RESULTS}")"
 } | tee "${RESULTS}"
 
 if /scripts/health_check.sh; then
-    echo "chaos: ok"
+    # 最終ステータスをレポートにも記録する（report.sh の集計が拾えるように）。
+    echo "chaos: ok" | tee -a "${RESULTS}"
 else
     log "chaos: health_check failed after load (run.sh の最終 health で再検証)"
     exit 0

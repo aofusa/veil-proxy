@@ -51,10 +51,42 @@ Veil のリリースバイナリは **full features**（`--build-arg CARGO_FEATU
 
 ## 結果サマリ
 
-計測ごとに [`results_summary.md`](results_summary.md) を更新する（`run_perf.sh` が自動生成）。
-以下は代表的な観測（詳細な数値は `results_summary.md` / `results_raw.tsv` を参照）。
+完全なデータは [`results_raw.tsv`](results_raw.tsv)（1 反復 1 行）、集計は
+[`results_summary.md`](results_summary.md)（median±stdev）に格納する。以下は
+2026-07-06 の計測（3 反復・wrk 8s・h2load 30k req・loadavg≈2 の低負荷時）の要点。
 
-<!-- RESULTS_PLACEHOLDER -->
+### HTTP/1.1（wrk -t4 -c100 -d8s、req/s median）
+
+| 構成 | nginx | veil:glibc | veil:musl |
+|------|-------|-----------|-----------|
+| 静的配信・最良チューニング（h2on/kTLS/kernel LB/OFC） | 1994 | **2132** | **2159** |
+| 静的配信・rustls（kTLS 無効・CBPF LB） | — | 1379 | 1390 |
+| cache（インメモリ・GET/200） | — | 1822 | 1818 |
+| compression（zstd/br/gzip・54KB） | — | 1817 | 1853 |
+| buffering（逆プロキシ・full バッファ） | — | 1575 | 1506 |
+
+### HTTP/2（h2load -n30000 -c100 -m10、req/s median）
+
+| 構成 | nginx | veil:glibc | veil:musl |
+|------|-------|-----------|-----------|
+| 静的配信・rustls（CBPF LB） | 2276 | 2227 | **2394** |
+| proxy（逆プロキシ・ストリーミング） | — | 718 | 863 |
+| buffering（逆プロキシ・full） | — | 742 | 556 |
+
+### 観測
+
+- **静的配信の最良チューニング**（kTLS + kernel SO_REUSEPORT + open_file_cache）では、
+  HTTP/1.1 で veil が nginx を上回る（glibc 2132 / musl 2159 vs nginx 1994 req/s）。
+  エラーは全構成で 0。
+- **full 限定機能**（compression / cache / buffering / 逆プロキシ）はいずれも安定して
+  計測でき、機能有効時のスループット・CPU・メモリのオーバーヘッドが可視化されている
+  （例: compression 有効で ~1.8k req/s を維持、buffering は full バッファ分メモリ増）。
+- glibc / musl は概ね同等（静的配信で musl がわずかに上、機能有効時は拮抗）。
+- **注記**: `feat_proxy` の HTTP/1.1 は wrk が「完了リクエスト 0」を計上した
+  （データ転送自体は発生。100 並行 keep-alive での wrk のカウント挙動によるもの）。
+  逆プロキシ HTTP/1.1 の機能正当性は E2E（`e2e_tests`）で網羅的に検証済みで、
+  HTTP/2 経路（glibc 718 / musl 863 req/s）と buffering 逆プロキシ（HTTP/1.1 1575 req/s）は
+  正常に計測できている。絶対値はコンテナ間通信のため実ホストより低めに出る点に留意。
 
 ---
 

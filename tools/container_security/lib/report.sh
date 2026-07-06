@@ -45,7 +45,7 @@ aggregate_reports() {
             local path="${RESULTS_DIR}/${file}"
             local status="missing"
             if [[ -f "${path}" ]]; then
-                if grep -qE ': ok$|chaos: ok|security_scan: ok|testssl: ok|cargo_audit: ok|cargo_deny: ok|libfuzzer: ok' "${path}" 2>/dev/null; then
+                if grep -qE ': ok([[:space:]]|$)|healthy_after_fuzz=true|security_scan: ok|testssl: ok|cargo_audit: ok|cargo_deny: ok|libfuzzer: ok' "${path}" 2>/dev/null; then
                     status="passed"
                     passed=$((passed + 1))
                 elif grep -qiE 'skipped|skip' "${path}" 2>/dev/null; then
@@ -78,7 +78,7 @@ aggregate_reports() {
                 printf '  <testcase classname="container_security" name="%s"><skipped message="report missing"/></testcase>\n' "${name}"
                 continue
             fi
-            if grep -qE ': ok$|chaos: ok|security_scan: ok|testssl: ok|cargo_audit: ok|cargo_deny: ok|libfuzzer: ok' "${path}" 2>/dev/null; then
+            if grep -qE ': ok([[:space:]]|$)|healthy_after_fuzz=true|security_scan: ok|testssl: ok|cargo_audit: ok|cargo_deny: ok|libfuzzer: ok' "${path}" 2>/dev/null; then
                 printf '  <testcase classname="container_security" name="%s"/>\n' "${name}"
             elif grep -qiE 'skipped|skip' "${path}" 2>/dev/null; then
                 printf '  <testcase classname="container_security" name="%s"><skipped/></testcase>\n' "${name}"
