@@ -28,8 +28,9 @@ Veil のリリースバイナリは **full features**（`--build-arg CARGO_FEATU
 | `h2_1_feat_buffering` | 逆プロキシ + 高度なバッファリング制御（full） | **buffering** |
 
 > 完全直交 2⁴=16 の静的配信バリアント（http2 × ktls × LB × open_file_cache）は
-> `tools/perf/gen_configs.sh` で生成でき、`tools/perf/configs_full_backup/` に退避してある。
-> 上表はそのうち代表 2 点＋ full 機能 4 点に絞った計測結果。
+> `tools/perf/gen_configs.sh` で生成できる。本計測（2026-07-07）は **全 16 静的バリアント +
+> full 機能 4 点** を実行した（上表は代表構成の抜粋。全結果は
+> [`results_summary.md`](results_summary.md) 参照）。
 
 ---
 
@@ -37,9 +38,9 @@ Veil のリリースバイナリは **full features**（`--build-arg CARGO_FEATU
 
 | 項目 | 値 |
 |------|-----|
-| ハードウェア | 4 コア（co-tenant 負荷あり・計測時 loadavg ≈ 2 の低負荷時に取得） |
-| HTTP/1.1 負荷 | `wrk -t4 -c100 -d8s`（3 反復、median±stdev） |
-| HTTP/2 負荷 | `h2load -n30000 -c100 -m10`（3 反復） |
+| ハードウェア | 4 コア（quiet host・計測開始時 loadavg < 0.5 で取得） |
+| HTTP/1.1 負荷 | `wrk -t4 -c100 -d10s`（ウォームアップ後 1 反復） |
+| HTTP/2 負荷 | `h2load -n30000 -c100 -m10`（ウォームアップ後 1 反復） |
 | TLS | 自己署名 ECDSA(secp384r1)、TLS1.3 |
 | 配信コンテンツ | `docker/assets/www/index.html`（約 54KB・圧縮対象として十分なサイズ） |
 | 基準 | `nginx:alpine`（`access_log off`・HTTP/2 有効で公平化） |
@@ -53,40 +54,50 @@ Veil のリリースバイナリは **full features**（`--build-arg CARGO_FEATU
 
 完全なデータは [`results_raw.tsv`](results_raw.tsv)（1 反復 1 行）、集計は
 [`results_summary.md`](results_summary.md)（median±stdev）に格納する。以下は
-2026-07-06 の計測（3 反復・wrk 8s・h2load 30k req・loadavg≈2 の低負荷時）の要点。
+2026-07-07（v0.5.0、B-25/B-27/B-28 修正後）の計測（全 2⁴=16 静的バリアント + full 機能
+4 点・wrk 10s・h2load 30k req・quiet host loadavg<0.5）の要点。
 
-### HTTP/1.1（wrk -t4 -c100 -d8s、req/s median）
+### HTTP/1.1（wrk -t4 -c100 -d10s、req/s median）
 
 | 構成 | nginx | veil:glibc | veil:musl |
 |------|-------|-----------|-----------|
-| 静的配信・最良チューニング（h2on/kTLS/kernel LB/OFC） | 1994 | **2132** | **2159** |
-| 静的配信・rustls（kTLS 無効・CBPF LB） | — | 1379 | 1390 |
-| cache（インメモリ・GET/200） | — | 1822 | 1818 |
-| compression（zstd/br/gzip・54KB） | — | 1817 | 1853 |
-| buffering（逆プロキシ・full バッファ） | — | 1575 | 1506 |
+| 静的配信・最良（h2on/rustls/kernel LB/OFC） | 2309 | **3124** | **3178** |
+| 静的配信・kTLS/kernel LB/OFC | — | 2494 | 2464 |
+| 静的配信・rustls（CBPF LB） | — | 1463 | 1470 |
+| cache（インメモリ・GET/200） | — | 2157 | 2167 |
+| compression（zstd/br/gzip・54KB） | — | 2114 | 2128 |
+| proxy（逆プロキシ・ストリーミング） | — | 1763 | 1779 |
+| buffering（逆プロキシ・full バッファ） | — | 1828 | 1775 |
 
 ### HTTP/2（h2load -n30000 -c100 -m10、req/s median）
 
 | 構成 | nginx | veil:glibc | veil:musl |
 |------|-------|-----------|-----------|
-| 静的配信・rustls（CBPF LB） | 2276 | 2227 | **2394** |
-| proxy（逆プロキシ・ストリーミング） | — | 718 | 863 |
-| buffering（逆プロキシ・full） | — | 742 | 556 |
+| 静的配信・最良（rustls/kernel LB/OFC） | 2435 | **2757** | **2685** |
+| 静的配信・kTLS/kernel LB/OFC | — | 2513 | 2490 |
+| cache（インメモリ・GET/200） | — | 2473 | 2461 |
+| compression（zstd/br/gzip・54KB） | — | 2530 | 2495 |
+| proxy（逆プロキシ・ストリーミング） | — | 1985 | 2042 |
+| buffering（逆プロキシ・full） | — | 2038 | 2021 |
 
 ### 観測
 
-- **静的配信の最良チューニング**（kTLS + kernel SO_REUSEPORT + open_file_cache）では、
-  HTTP/1.1 で veil が nginx を上回る（glibc 2132 / musl 2159 vs nginx 1994 req/s）。
-  エラーは全構成で 0。
+- **静的配信の最良チューニング**（rustls + kernel SO_REUSEPORT + open_file_cache）で
+  veil は nginx を明確に上回る（HTTP/1.1 +35〜38%、HTTP/2 +10〜13%）。
+  **エラーは全 68 計測で 0**。
+- コンテナ（veth）では kTLS 有効が rustls 比で不利（HTTP/1.1 3124→2494 等）。
+  単一クライアント IP 負荷では CBPF LB が 1 ワーカーに集約されるため kernel LB が有利。
 - **full 限定機能**（compression / cache / buffering / 逆プロキシ）はいずれも安定して
-  計測でき、機能有効時のスループット・CPU・メモリのオーバーヘッドが可視化されている
-  （例: compression 有効で ~1.8k req/s を維持、buffering は full バッファ分メモリ増）。
-- glibc / musl は概ね同等（静的配信で musl がわずかに上、機能有効時は拮抗）。
-- **注記**: `feat_proxy` の HTTP/1.1 は wrk が「完了リクエスト 0」を計上した
-  （データ転送自体は発生。100 並行 keep-alive での wrk のカウント挙動によるもの）。
-  逆プロキシ HTTP/1.1 の機能正当性は E2E（`e2e_tests`）で網羅的に検証済みで、
-  HTTP/2 経路（glibc 718 / musl 863 req/s）と buffering 逆プロキシ（HTTP/1.1 1575 req/s）は
-  正常に計測できている。絶対値はコンテナ間通信のため実ホストより低めに出る点に留意。
+  計測でき、機能有効時のオーバーヘッドが可視化されている。
+- glibc / musl は概ね同等（拮抗、構成によりわずかに前後）。
+- **修正履歴**: 2026-07-06 の初回計測で検出された 3 つの異常は v0.5.0 で修正済み。
+  1. `feat_proxy` HTTP/1.1 の「wrk 完了リクエスト 0」→ kTLS splice の `SPLICE_F_MORE`
+     による最終部分 TLS レコード保留（[B-25](../backlog/bugs/B-25-reverse-proxy-http1-wrk-zero-completed.md)）。
+  2. kTLS + HTTP/2 高並行の激減（256〜736 req/s）→ `write_all` の short write 未継続に
+     よるフレーム同期破壊（[B-27](../backlog/bugs/B-27-ktls-http2-short-write-frame-desync.md)）。
+  3. HTTP/2 逆プロキシの 5xx 混入（h2load 30k 中 1000〜1500 件）→ バックエンド接続
+     非再利用によるエフェメラルポート枯渇（[B-28](../backlog/bugs/B-28-h2-proxy-no-backend-pooling-port-exhaustion.md)）。
+- 絶対値はコンテナ間通信のため実ホストより低めに出る点に留意。
 
 ---
 

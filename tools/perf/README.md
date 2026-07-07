@@ -4,7 +4,7 @@
 
 すべて **docker コマンドのみ** で完結し、ホストへの追加インストールは不要です（証明書生成に `openssl` を使う場合を除く）。
 
-計測結果レポートの例は [docs/artifacts/](../../docs/artifacts/) の `performance_report_veil_vs_nginx*.md` を参照してください。バックログ上は [F-58](../../docs/backlog/features/F-58-perf-report-glibc-musl-nginx.md) の再現ハーネスです。
+計測結果は [docs/perf/](../../docs/perf/) を参照してください。バックログ上は [F-58](../../docs/backlog/features/F-58-perf-report-glibc-musl-nginx.md) の再現ハーネスです。
 
 ---
 
@@ -86,13 +86,17 @@ bash tools/perf/analyze_results.sh tools/perf/results/results_raw.tsv
 バリアント名は `h2_<0|1>_ktls_<0|1>_lb_<cbpf|kernel>_ofc_<0|1>`。`run_perf.sh` は名前の `h2_1` から
 HTTP/2 負荷（h2load）の要否を判定します（`h2_0_*` は wrk のみ）。
 
-主な着目点（[docs/artifacts/perf_benchmark/results_summary.md](../../docs/artifacts/perf_benchmark/results_summary.md) 参照）:
+主な着目点（[docs/perf/results_summary.md](../../docs/perf/results_summary.md) 参照、2026-07-07 v0.5.0 計測）:
 
 - **最良構成 `h2_1_ktls_0_lb_kernel_ofc_1`**（HTTP/2 有効・kTLS 無効・kernel LB・OFC 有効）で
-  **veil は nginx を上回る**（例: musl HTTP/1.1 +61% / HTTP/2 +11%、glibc HTTP/1.1 +46%）。
-- コンテナ（veth）では **kTLS 有効が不利**（`ktls_1` は軒並み低下）。
+  **veil は nginx を上回る**（HTTP/1.1 glibc 3124 / musl 3178 vs nginx 2309 = +35〜38%、
+  HTTP/2 glibc 2757 / musl 2685 vs nginx 2435 = +10〜13%）。エラーは全 68 計測で 0。
+- コンテナ（veth）では **kTLS 有効が不利**（`ktls_1` は rustls 比で低下）。
 - 単一クライアント IP 負荷では **`cbpf` が 1 ワーカーに集約**して 4 コアを使い切れず、`kernel` 分散が有利。
-  ただし **`kernel` + HTTP/2 + `ktls_1` は激減**（接続偏り、166 req/s 級）→ HTTP/2 は kTLS 無効を推奨。
+- 過去計測（2026-07-06）で異常だった「`feat_proxy` HTTP/1.1 の wrk 完了 0」「`kernel` +
+  HTTP/2 + `ktls_1` の激減」「HTTP/2 逆プロキシの 5xx 混入」は、それぞれ
+  B-25（splice `SPLICE_F_MORE`）/ B-27（`write_all` short write）/ B-28（バックエンド接続
+  プーリング欠如）として **v0.5.0 で修正済み**（[docs/backlog/backlog.md](../../docs/backlog/backlog.md) 参照）。
 
 ---
 
@@ -120,5 +124,5 @@ target  config  proto  iteration  req_per_sec  transfer  lat_avg  lat_p99  non2x
 ## 注意
 
 - 4 コア程度のホストや co-tenant 負荷がある環境では計測が揺れます。**quiet host（loadavg 低）** での
-  計測と、同一実行内の相対比較を推奨します（[docs/artifacts/](../../docs/artifacts/) の負荷フレーキー記録参照）。
+  計測と、同一実行内の相対比較を推奨します（負荷フレークに注意）。
 - `configs/_debug*.toml` / `results/logs/` / `results/results_raw.tsv` / `results/results_summary.md` は `.gitignore` 対象です。
