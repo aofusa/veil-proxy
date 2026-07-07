@@ -143,6 +143,13 @@ prepare_fixtures() {
     head -c 10000 /dev/zero | tr '\0' 'A' > "${FIXTURES_DIR}/backend1/large.txt"
     head -c 10000 /dev/zero | tr '\0' 'A' > "${FIXTURES_DIR}/backend2/large.txt"
     head -c 10000 /dev/zero | tr '\0' 'A' > "${FIXTURES_DIR}/backend_h2c/large.txt"
+
+    # H2C テスト用ファイル（test_h2c_post_request / test_h2c_large_request_body が
+    # /h2c/test.txt、test_h2c_multiple_streams が /h2c/test{0,1,2}.txt を参照する）
+    echo "h2c test file" > "${FIXTURES_DIR}/backend_h2c/test.txt"
+    for i in 0 1 2; do
+        echo "h2c stream test ${i}" > "${FIXTURES_DIR}/backend_h2c/test${i}.txt"
+    done
     
     # /healthエンドポイント用JSONファイル（プロキシが直接サービスする）
     echo '{"status":"ok","proxy":"veil"}' > "${FIXTURES_DIR}/proxy_health.json"
