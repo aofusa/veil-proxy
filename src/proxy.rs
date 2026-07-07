@@ -853,11 +853,12 @@ where
 
     match outcome {
         ReqStreamOutcome::Complete => {
-            // 応答をリレー
-            let (status, resp_size) =
+            // 応答をリレー（この経路のバックエンドはリクエストを chunked 送信した専用接続の
+            // ため、再利用フラグは使わずクローズする）
+            let (status, resp_size, _reusable) =
                 relay_h2_response(conn, stream_id, backend, compression, client_encoding)
                     .await
-                    .unwrap_or((502, 11));
+                    .unwrap_or((502, 11, false));
             (status, resp_size, req_body_size, deferred)
         }
         ReqStreamOutcome::TooLarge => {
@@ -1494,7 +1495,7 @@ where
 
     // Backend処理
     let result = match backend {
-        Backend::Proxy(upstream_group, _, compression, _buffering, _cache, _) => {
+        Backend::Proxy(upstream_group, security, compression, _buffering, _cache, _) => {
             handle_http2_proxy(
                 conn,
                 stream_id,
@@ -1505,6 +1506,7 @@ where
                 path,
                 &prefix,
                 client_ip,
+                &security,
             )
             .await
         }
@@ -1619,6 +1621,7 @@ async fn handle_http2_proxy<S>(
     req_path: &[u8],
     prefix: &[u8],
     client_ip: &str,
+    security: &SecurityConfig,
 ) -> Option<(u16, u64)>
 where
     S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
@@ -1741,11 +1744,21 @@ where
             request,
             compression,
             client_encoding,
+            security,
         )
         .await
     } else {
         // HTTP/2 → HTTP (HTTP/1.1)
-        handle_http2_proxy_http(conn, stream_id, addr, request, compression, client_encoding).await
+        handle_http2_proxy_http(
+            conn,
+            stream_id,
+            addr,
+            request,
+            compression,
+            client_encoding,
+            security,
+        )
+        .await
     };
 
     server.release();
@@ -2216,6 +2229,10 @@ where
 /// - **圧縮あり / 長さ不明** → 全バッファ後に（必要なら圧縮して）送信
 ///
 /// 呼び出し前にバックエンドへリクエストを送信済みであること。
+///
+/// 戻り値の第 3 要素は **バックエンド接続の再利用可否**（B-28）。レスポンスを境界まで
+/// 正確に消費し（Content-Length 全量 / 0 長）、かつ `Connection: close` でない場合のみ
+/// `true`。chunked・EOF 終端・エラー・打ち切りは残データ混入の恐れがあるため `false`。
 #[cfg(feature = "http2")]
 async fn relay_h2_response<S, B>(
     conn: &mut http2::Http2Connection<S>,
@@ -2223,7 +2240,7 @@ async fn relay_h2_response<S, B>(
     backend: &mut B,
     compression: &CompressionConfig,
     client_encoding: AcceptedEncoding,
-) -> Option<(u16, u64)>
+) -> Option<(u16, u64, bool)>
 where
     S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
     B: crate::runtime::io::AsyncReadRent + Unpin,
@@ -2246,7 +2263,7 @@ where
                 let _ = conn
                     .send_response(stream_id, 504, &headers, Some(b"Gateway Timeout"))
                     .await;
-                return Some((504, 15));
+                return Some((504, 15, false));
             }
         };
 
@@ -2266,7 +2283,7 @@ where
                 let _ = conn
                     .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
                     .await;
-                return Some((502, 11));
+                return Some((502, 11, false));
             }
         };
 
@@ -2345,7 +2362,9 @@ where
                             return None;
                         }
                     };
-                    return Some((status, sent));
+                    // B-28: Content-Length 全量を消費できた場合のみ接続を再利用可能
+                    let reusable = sent == content_len as u64 && !parsed.is_connection_close;
+                    return Some((status, sent, reusable));
                 }
             }
 
@@ -2390,9 +2409,12 @@ where
                         return None;
                     }
                 };
-                return Some((status, sent));
+                // B-28: chunked はトレーラー等の残データ混入の恐れがあるため再利用しない
+                return Some((status, sent, false));
             }
 
+            // B-28: バッファリング経路の接続再利用可否（CL 全量読取時のみ true にする）
+            let mut backend_reusable = false;
             // Content-Length が chunked の場合は計算
             let final_body = if parsed.is_chunked {
                 // Chunked レスポンスの場合、終端検出しながら読み込み
@@ -2454,6 +2476,8 @@ where
                     full_body.extend_from_slice(returned_buf.as_valid_slice());
                     buf_put(returned_buf);
                 }
+                // B-28: CL 全量をちょうど消費できた場合のみ再利用可能
+                backend_reusable = full_body.len() == content_len;
                 full_body
             } else {
                 body.to_vec()
@@ -2527,7 +2551,11 @@ where
                 return None;
             }
 
-            return Some((status, response_body.len() as u64));
+            return Some((
+                status,
+                response_body.len() as u64,
+                backend_reusable && !parsed.is_connection_close,
+            ));
         }
 
         // ヘッダーが大きすぎる
@@ -2540,7 +2568,7 @@ where
             let _ = conn
                 .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
                 .await;
-            return Some((502, 11));
+            return Some((502, 11, false));
         }
     }
 
@@ -2553,7 +2581,7 @@ where
     let _ = conn
         .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
         .await;
-    Some((502, 11))
+    Some((502, 11, false))
 }
 
 #[cfg(feature = "http2")]
@@ -2564,40 +2592,48 @@ async fn handle_http2_proxy_http<S>(
     request: Vec<u8>,
     compression: &CompressionConfig,
     client_encoding: AcceptedEncoding,
+    security: &SecurityConfig,
 ) -> Option<(u16, u64)>
 where
     S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
 {
-    // バックエンドに接続
-    let connect_result = timeout(CONNECT_TIMEOUT, TcpStream::connect_str(addr)).await;
-
-    let mut backend = match connect_result {
-        Ok(Ok(stream)) => {
-            let _ = stream.set_nodelay(true);
-            stream
-        }
-        Ok(Err(e)) => {
-            warn!("[HTTP/2] Backend connect error: {}", e);
-            let server_guard = get_server_header_guard();
-            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-            if let Some(ref g) = server_guard {
-                headers.push(g.as_header());
+    // B-28: バックエンド接続をプールから再利用する（HTTP/1.1 経路と同じ HTTP_POOL・
+    // 同じ "host:port" キーを共有）。従来はリクエスト毎に新規接続 + クローズだったため、
+    // 高負荷時に veil 側 TIME_WAIT が積み上がりエフェメラルポート枯渇
+    // （EADDRNOTAVAIL → 502）を起こしていた。
+    let mut backend = match HTTP_POOL.with(|p| p.borrow_mut().get(addr)) {
+        Some(stream) => stream,
+        None => {
+            let connect_result = timeout(CONNECT_TIMEOUT, TcpStream::connect_str(addr)).await;
+            match connect_result {
+                Ok(Ok(stream)) => {
+                    let _ = stream.set_nodelay(true);
+                    stream
+                }
+                Ok(Err(e)) => {
+                    warn!("[HTTP/2] Backend connect error: {}", e);
+                    let server_guard = get_server_header_guard();
+                    let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+                    if let Some(ref g) = server_guard {
+                        headers.push(g.as_header());
+                    }
+                    let _ = conn
+                        .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
+                        .await;
+                    return Some((502, 11));
+                }
+                Err(_) => {
+                    let server_guard = get_server_header_guard();
+                    let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+                    if let Some(ref g) = server_guard {
+                        headers.push(g.as_header());
+                    }
+                    let _ = conn
+                        .send_response(stream_id, 504, &headers, Some(b"Gateway Timeout"))
+                        .await;
+                    return Some((504, 15));
+                }
             }
-            let _ = conn
-                .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
-                .await;
-            return Some((502, 11));
-        }
-        Err(_) => {
-            let server_guard = get_server_header_guard();
-            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-            if let Some(ref g) = server_guard {
-                headers.push(g.as_header());
-            }
-            let _ = conn
-                .send_response(stream_id, 504, &headers, Some(b"Gateway Timeout"))
-                .await;
-            return Some((504, 15));
         }
     };
 
@@ -2617,7 +2653,25 @@ where
     }
 
     // レスポンス受信・HTTP/2 へリレー（ストリーミング/バッファリング判定込み、共通処理）
-    relay_h2_response(conn, stream_id, &mut backend, compression, client_encoding).await
+    let result =
+        relay_h2_response(conn, stream_id, &mut backend, compression, client_encoding).await;
+
+    // B-28: 境界まで正確に消費できた接続はプールへ返却して再利用する
+    if let Some((status, sent, reusable)) = result {
+        if reusable {
+            HTTP_POOL.with(|p| {
+                p.borrow_mut().put(
+                    addr.to_string(),
+                    backend,
+                    security.max_idle_connections_per_host,
+                    security.idle_connection_timeout_secs,
+                )
+            });
+        }
+        Some((status, sent))
+    } else {
+        None
+    }
 }
 
 /// HTTP/2 → HTTP/1.1 プロキシ（HTTPSバックエンド）
@@ -2630,71 +2684,81 @@ async fn handle_http2_proxy_https<S>(
     request: Vec<u8>,
     compression: &CompressionConfig,
     client_encoding: AcceptedEncoding,
+    security: &SecurityConfig,
 ) -> Option<(u16, u64)>
 where
     S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
 {
-    // バックエンドに TCP 接続
-    let connect_result = timeout(CONNECT_TIMEOUT, TcpStream::connect_str(addr)).await;
+    // B-28: TLS 済みバックエンド接続をプールから再利用する（TLS ハンドシェイク削減 +
+    // TIME_WAIT によるエフェメラルポート枯渇の防止）。SNI 毎に別プールとする。
+    let pool_key = format!("{}:{}", addr, sni);
 
-    let backend_tcp = match connect_result {
-        Ok(Ok(stream)) => {
-            let _ = stream.set_nodelay(true);
-            stream
-        }
-        Ok(Err(e)) => {
-            warn!("[HTTP/2] Backend connect error: {}", e);
-            let server_guard = get_server_header_guard();
-            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-            if let Some(ref g) = server_guard {
-                headers.push(g.as_header());
-            }
-            let _ = conn
-                .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
-                .await;
-            return Some((502, 11));
-        }
-        Err(_) => {
-            let server_guard = get_server_header_guard();
-            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-            if let Some(ref g) = server_guard {
-                headers.push(g.as_header());
-            }
-            let _ = conn
-                .send_response(stream_id, 504, &headers, Some(b"Gateway Timeout"))
-                .await;
-            return Some((504, 15));
-        }
-    };
+    let mut backend = match HTTPS_POOL.with(|p| p.borrow_mut().get(&pool_key)) {
+        Some(stream) => stream,
+        None => {
+            // バックエンドに TCP 接続
+            let connect_result = timeout(CONNECT_TIMEOUT, TcpStream::connect_str(addr)).await;
 
-    // TLS ハンドシェイク
-    let connector = get_tls_connector();
-    let tls_result = timeout(CONNECT_TIMEOUT, connector.connect(backend_tcp, sni)).await;
+            let backend_tcp = match connect_result {
+                Ok(Ok(stream)) => {
+                    let _ = stream.set_nodelay(true);
+                    stream
+                }
+                Ok(Err(e)) => {
+                    warn!("[HTTP/2] Backend connect error: {}", e);
+                    let server_guard = get_server_header_guard();
+                    let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+                    if let Some(ref g) = server_guard {
+                        headers.push(g.as_header());
+                    }
+                    let _ = conn
+                        .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
+                        .await;
+                    return Some((502, 11));
+                }
+                Err(_) => {
+                    let server_guard = get_server_header_guard();
+                    let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+                    if let Some(ref g) = server_guard {
+                        headers.push(g.as_header());
+                    }
+                    let _ = conn
+                        .send_response(stream_id, 504, &headers, Some(b"Gateway Timeout"))
+                        .await;
+                    return Some((504, 15));
+                }
+            };
 
-    let mut backend = match tls_result {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(e)) => {
-            warn!("[HTTP/2] TLS handshake error: {}", e);
-            let server_guard = get_server_header_guard();
-            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-            if let Some(ref g) = server_guard {
-                headers.push(g.as_header());
+            // TLS ハンドシェイク
+            let connector = get_tls_connector();
+            let tls_result = timeout(CONNECT_TIMEOUT, connector.connect(backend_tcp, sni)).await;
+
+            match tls_result {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => {
+                    warn!("[HTTP/2] TLS handshake error: {}", e);
+                    let server_guard = get_server_header_guard();
+                    let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+                    if let Some(ref g) = server_guard {
+                        headers.push(g.as_header());
+                    }
+                    let _ = conn
+                        .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
+                        .await;
+                    return Some((502, 11));
+                }
+                Err(_) => {
+                    let server_guard = get_server_header_guard();
+                    let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+                    if let Some(ref g) = server_guard {
+                        headers.push(g.as_header());
+                    }
+                    let _ = conn
+                        .send_response(stream_id, 504, &headers, Some(b"Gateway Timeout"))
+                        .await;
+                    return Some((504, 15));
+                }
             }
-            let _ = conn
-                .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
-                .await;
-            return Some((502, 11));
-        }
-        Err(_) => {
-            let server_guard = get_server_header_guard();
-            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-            if let Some(ref g) = server_guard {
-                headers.push(g.as_header());
-            }
-            let _ = conn
-                .send_response(stream_id, 504, &headers, Some(b"Gateway Timeout"))
-                .await;
-            return Some((504, 15));
         }
     };
 
@@ -2714,7 +2778,25 @@ where
     }
 
     // レスポンス受信・HTTP/2 へリレー（ストリーミング/バッファリング判定込み、共通処理）
-    relay_h2_response(conn, stream_id, &mut backend, compression, client_encoding).await
+    let result =
+        relay_h2_response(conn, stream_id, &mut backend, compression, client_encoding).await;
+
+    // B-28: 境界まで正確に消費できた接続はプールへ返却して再利用する
+    if let Some((status, sent, reusable)) = result {
+        if reusable {
+            HTTPS_POOL.with(|p| {
+                p.borrow_mut().put(
+                    pool_key,
+                    backend,
+                    security.max_idle_connections_per_host,
+                    security.idle_connection_timeout_secs,
+                )
+            });
+        }
+        Some((status, sent))
+    } else {
+        None
+    }
 }
 
 /// HTTP/2 用レスポンスボディ圧縮ヘルパー関数

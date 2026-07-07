@@ -303,7 +303,10 @@ mod tests {
         let fut = stream.write_all(data.clone());
         let (result, returned) = futures::executor::block_on(fut);
         assert_eq!(result.unwrap(), 100, "write_all は全量書き込みを返す");
-        assert_eq!(stream.written, data, "short write 継続でバイト列が欠落・重複しない");
+        assert_eq!(
+            stream.written, data,
+            "short write 継続でバイト列が欠落・重複しない"
+        );
         assert_eq!(returned, data, "元のバッファがそのまま返却される");
     }
 
