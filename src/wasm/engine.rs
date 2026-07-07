@@ -184,10 +184,14 @@ impl FilterEngine {
         let http_context_id = 2i32; // HTTP context ID
         let config_size = module.configuration.len() as i32;
 
+        // proxy_on_context_create は root / HTTP の 2 回呼ぶが、エクスポート解決
+        // （get_typed_func：エクスポート表のハッシュ探索 + 型チェック）は 1 回で済ませ、
+        // 得た関数ハンドルを両方の呼び出しで再利用する（ホットパスの重複解決を排除）。
+        let on_context_create =
+            instance.get_typed_func::<(i32, i32), ()>(&mut *store, "proxy_on_context_create");
+
         // Step 1: Create ROOT context first (parent=0 means root)
-        if let Ok(func) =
-            instance.get_typed_func::<(i32, i32), ()>(&mut *store, "proxy_on_context_create")
-        {
+        if let Ok(ref func) = on_context_create {
             let _ = func.call_async(&mut *store, (root_context_id, 0)).await;
         }
 
@@ -209,10 +213,8 @@ impl FilterEngine {
                 .await;
         }
 
-        // Step 4: Create HTTP context with root as parent
-        if let Ok(func) =
-            instance.get_typed_func::<(i32, i32), ()>(&mut *store, "proxy_on_context_create")
-        {
+        // Step 4: Create HTTP context with root as parent（Step 1 と同じハンドルを再利用）
+        if let Ok(ref func) = on_context_create {
             let _ = func
                 .call_async(&mut *store, (http_context_id, root_context_id))
                 .await;
