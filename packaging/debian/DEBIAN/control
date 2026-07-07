@@ -1,5 +1,5 @@
 Package: veil
-Version: 0.4.0
+Version: __VERSION__
 Section: web
 Priority: optional
 Architecture: amd64

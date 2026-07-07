@@ -166,12 +166,12 @@ Install:
 
 ```bash
 # Debian/Ubuntu
-sudo dpkg -i packaging/output/veil_0.4.0_amd64.deb
+sudo dpkg -i packaging/output/veil_0.5.0_amd64.deb
 sudo apt-get install -f
 sudo systemctl enable --now veil
 
 # Amazon Linux 2023
-sudo dnf install -y packaging/output/veil-0.4.0-1.x86_64.rpm
+sudo dnf install -y packaging/output/veil-0.5.0-1.x86_64.rpm
 sudo systemctl enable --now veil
 ```
 

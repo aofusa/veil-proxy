@@ -116,11 +116,16 @@ packaging/output/veil_<version>_<deb_arch>.deb
 packaging/output/veil-<version>-1.<rpm_arch>.rpm
 ```
 
+`<version>` は **`Cargo.toml` の `[package] version` からビルド時に自動取得**され、
+ファイル名・deb の `Version:` フィールド（`debian/DEBIAN/control` はプレースホルダ
+`__VERSION__` を持つテンプレート）・rpm の `%{veil_version}` マクロへ反映されます。
+リリース時に packaging/ 配下のファイルを手動更新する必要はありません。
+
 例:
 
 ```
-packaging/output/veil_0.4.0_amd64.deb
-packaging/output/veil-0.4.0-1.x86_64.rpm
+packaging/output/veil_0.5.0_amd64.deb
+packaging/output/veil-0.5.0-1.x86_64.rpm
 ```
 
 ### ビルド処理の流れ
@@ -140,7 +145,7 @@ packaging/output/veil-0.4.0-1.x86_64.rpm
 ### Debian / Ubuntu
 
 ```bash
-sudo dpkg -i packaging/output/veil_0.4.0_amd64.deb
+sudo dpkg -i packaging/output/veil_0.5.0_amd64.deb
 sudo apt-get install -f
 sudo systemctl enable --now veil
 ```
@@ -148,7 +153,7 @@ sudo systemctl enable --now veil
 ### Amazon Linux 2023
 
 ```bash
-sudo dnf install -y packaging/output/veil-0.4.0-1.x86_64.rpm
+sudo dnf install -y packaging/output/veil-0.5.0-1.x86_64.rpm
 sudo systemctl enable --now veil
 ```
 
