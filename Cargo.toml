@@ -8,6 +8,7 @@ edition = "2021"
 description = "High-performance reverse proxy server using io_uring and rustls"
 license = "Apache-2.0 OR MIT"
 authors = ["aofusa"]
+build = "build.rs"
 
 [lib]
 name = "veil"
@@ -41,7 +42,9 @@ http2 = []
 # UDP/QUIC を使用した HTTP/3 プロトコル
 # 注意: HTTP/3 は UDP ベースのため kTLS は使用不可
 # GSO/GRO による高パフォーマンス UDP 処理
-http3 = ["dep:quiche"]
+# quiche の TLS は aws-lc-sys（rustls と同一の AWS-LC ビルド）を共有する。
+# build.rs が libssl をリンクするため dep:aws-lc-sys が必要。
+http3 = ["dep:quiche", "dep:aws-lc-sys"]
 
 # WASM Extension サポート (Proxy-Wasm v0.2.1)
 # Wasmtime ランタイムによる WebAssembly フィルタ
@@ -165,7 +168,10 @@ full = [
 # monoio 削除: カスタム io_uring 実装 (src/runtime/) に完全移行
 # rustls を直接使用（ハンドシェイク後に kTLS へオフロード）
 rustls = { version = "0.23.35", features = ["tls12", "aws_lc_rs"] }
-aws-lc-rs = "1.15.2"
+# bindgen: AWS_LC_SYS_NO_PREFIX 時に aws-lc-sys がバインディング生成するため必要
+aws-lc-rs = { version = "1.15.2", features = ["bindgen"] }
+# http3 有効時のみ: ssl ライブラリをビルドし quiche と rustls で共有
+aws-lc-sys = { version = "0.41", features = ["ssl", "bindgen"], optional = true }
 webpki-roots = "1.0.4"
 rustls-pki-types = "1.13.2"
 libc = "0.2.178"
@@ -213,8 +219,8 @@ prometheus = { version = "0.14.0", optional = true }
 clap = { version = "4.5.53", features = ["derive"] }
 
 # HTTP/3 用 QUIC 実装（Cloudflare quiche）
-# 実績のある QUIC/HTTP/3 実装を使用
-quiche = { version = "0.24.6", optional = true }
+# default-features = false で内蔵 BoringSSL ビルドを抑制し、aws-lc-sys と共有
+quiche = { version = "0.24.6", default-features = false, optional = true }
 
 # Wasmtime: WebAssembly ランタイム (Proxy-Wasm v0.2.1)
 # - pooling-allocator: 高速インスタンス化

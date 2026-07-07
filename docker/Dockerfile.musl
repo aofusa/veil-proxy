@@ -27,6 +27,8 @@ RUN mkdir -p /etc_minimal/etc \
     && echo "127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback" > /etc_minimal/etc/hosts \
     && mkdir -p /var/cache/veil /var/tmp/veil
 
+# http3/quiche と rustls が同一 AWS-LC（非プレフィックス）を共有
+ENV AWS_LC_SYS_NO_PREFIX=1
 
 # ==========================================
 # 2. 依存ライブラリの事前ビルドステージ
