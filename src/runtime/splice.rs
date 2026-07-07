@@ -63,11 +63,34 @@ impl Drop for Pipe {
 ///
 /// ソケット/パイプはシーク可能なオフセットを持たないため `off_in`/`off_out` は `-1`。
 /// `SPLICE_F_NONBLOCK` 付きで発行するため、データ/空きが無い場合は `WouldBlock` を返す。
+///
+/// `SPLICE_F_MORE` は付与しない（B-25）。`fd_out` が kTLS ソケットの場合、`SPLICE_F_MORE`
+/// は MSG_MORE として TLS レコードを「後続データ待ち」のまま開いた状態に保つため、
+/// 16KiB 未満の最終部分レコードがカーネル内に保留され続け、クライアントへ送信されない
+/// （転送が完了したように見えて応答が完結しないハングになる）。後続データが確実に
+/// 存在する中間チャンクには `splice_more` を使う。
 pub fn splice(fd_in: RawFd, fd_out: RawFd, len: usize) -> SpliceFuture {
     SpliceFuture {
         fd_in,
         fd_out,
         len: len as u32,
+        flags: SPLICE_F_MOVE | SPLICE_F_NONBLOCK,
+        user_data: 0,
+        submitted: false,
+    }
+}
+
+/// `splice` の `SPLICE_F_MORE` 付き版。
+///
+/// この splice の後に**同一 `fd_out` へ送るデータが確実に続く**場合のみ使用する
+/// （カーネルへのヒント: kTLS では TLS レコードを閉じずに満杯まで詰められる）。
+/// 転送全体の最終チャンクに使うと kTLS で部分レコードがフラッシュされない（B-25）。
+pub fn splice_more(fd_in: RawFd, fd_out: RawFd, len: usize) -> SpliceFuture {
+    SpliceFuture {
+        fd_in,
+        fd_out,
+        len: len as u32,
+        flags: SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE,
         user_data: 0,
         submitted: false,
     }
@@ -78,6 +101,7 @@ pub struct SpliceFuture {
     fd_in: RawFd,
     fd_out: RawFd,
     len: u32,
+    flags: u32,
     user_data: u64,
     submitted: bool,
 }
@@ -90,7 +114,7 @@ impl Future for SpliceFuture {
             let user_data = alloc_op();
             self.user_data = user_data;
 
-            let (fd_in, fd_out, len) = (self.fd_in, self.fd_out, self.len);
+            let (fd_in, fd_out, len, flags) = (self.fd_in, self.fd_out, self.len, self.flags);
             let acquired = with_ring(|ring| {
                 if let Some(sqe) = ring.get_sqe_or_submit() {
                     // SPLICE SQE: fd=fd_out, splice_fd_in=fd_in, addr=off_in(-1), off=off_out(-1),
@@ -101,7 +125,7 @@ impl Future for SpliceFuture {
                     sqe.addr_or_splice_off_in = u64::MAX; // off_in = -1（ソケット/パイプ）
                     sqe.off_or_addr2 = u64::MAX; // off_out = -1（ソケット/パイプ）
                     sqe.len = len;
-                    sqe.op_flags = SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE;
+                    sqe.op_flags = flags;
                     sqe.user_data = user_data;
                     true
                 } else {

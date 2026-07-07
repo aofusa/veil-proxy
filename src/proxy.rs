@@ -8095,7 +8095,7 @@ async fn splice_body_transfer(
     pipe: &SplicePipe,
     mut remaining: usize,
 ) -> u64 {
-    use crate::runtime::splice::splice as iouring_splice;
+    use crate::runtime::splice::{splice as iouring_splice, splice_more as iouring_splice_more};
     use std::os::unix::io::AsRawFd;
 
     let src_fd = src_stream.as_raw_fd();
@@ -8134,9 +8134,20 @@ async fn splice_body_transfer(
         };
 
         // Step 2: pipe → dst（n バイトを全量ドレイン。dst のバックプレッシャに追従）
+        //
+        // B-25: SPLICE_F_MORE（splice_more）は「このチャンクの後に確実にデータが続く」
+        // 中間チャンクのみに付与する。最終チャンクに付与すると、dst が kTLS ソケットの
+        // 場合に 16KiB 未満の最終部分 TLS レコードがカーネル内で保留されたまま
+        // フラッシュされず、クライアントが応答完了を永遠に待つハングになる。
+        let more_follows = remaining > n;
         let mut moved = 0usize;
         while moved < n {
-            match iouring_splice(pipe.read_fd(), dst_fd, n - moved).await {
+            let splice_step = if more_follows {
+                iouring_splice_more(pipe.read_fd(), dst_fd, n - moved)
+            } else {
+                iouring_splice(pipe.read_fd(), dst_fd, n - moved)
+            };
+            match splice_step.await {
                 Ok(0) => break 'outer, // dst クローズ
                 Ok(m) => moved += m,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
