@@ -27,9 +27,6 @@ RUN mkdir -p /etc_minimal/etc \
     && echo "127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback" > /etc_minimal/etc/hosts \
     && mkdir -p /var/cache/veil /var/tmp/veil
 
-# http3/quiche と rustls が同一 AWS-LC（非プレフィックス）を共有
-ENV AWS_LC_SYS_NO_PREFIX=1
-
 # ==========================================
 # 2. 依存ライブラリの事前ビルドステージ
 # ==========================================
@@ -41,6 +38,7 @@ ARG RUST_TARGET=x86_64-unknown-linux-musl
 # Cargo.toml と Cargo.lock、および fuzz ワークスペースメンバのマニフェストを先にコピー
 # （[workspace] members = [".", "fuzz"] のため、fuzz/Cargo.toml が無いとワークスペース解決に失敗する）
 COPY Cargo.toml Cargo.lock /app/
+COPY .cargo/config.toml /app/.cargo/config.toml
 COPY fuzz/Cargo.toml /app/fuzz/Cargo.toml
 
 # 空の main.rs を作り、依存関係「だけ」を先にコンパイルしてキャッシュ化する

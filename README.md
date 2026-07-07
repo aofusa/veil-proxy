@@ -183,7 +183,7 @@ Verify in Docker (both packages):
 
 See [packaging/README.md](packaging/README.md) for details (Docker build, postinst behavior, troubleshooting).
 
-> **Note**: `cmake` and `nasm` must be installed inside the container when building with `--features full` because the `http3` feature builds aws-lc-sys `libssl` (shared with quiche and rustls; requires cmake when `AWS_LC_SYS_NO_PREFIX=1`) and `aws-lc-rs` uses assembly optimizations (requires nasm). The default build without `http3` does not need cmake. For `http3` / `full` builds, set `AWS_LC_SYS_NO_PREFIX=1` so quiche links the same unprefixed AWS-LC symbols as rustls (see `build.rs` and `tests/e2e_setup.sh`).
+> **Note**: `cmake` and `nasm` must be installed inside the container when building with `--features full` because the `http3` feature builds aws-lc-sys `libssl` (shared with quiche and rustls; requires cmake) and `aws-lc-rs` uses assembly optimizations (requires nasm). The default build without `http3` does not need cmake. For `http3` / `full` builds, `AWS_LC_SYS_NO_PREFIX=1` is applied automatically via `.cargo/config.toml` and `build.rs` so quiche links the same unprefixed AWS-LC symbols as rustls.
 
 > **Cargo features**: The complete list of available feature flags is defined in the [`[features]` section of `Cargo.toml`](Cargo.toml).
 > Key notes:

@@ -18,10 +18,6 @@ RUN apt-get update -y \
 # キャッシュディレクトリの事前準備
 RUN mkdir -p /var/cache/veil /var/tmp/veil
 
-# http3/quiche と rustls が同一 AWS-LC（非プレフィックス）を共有
-ENV AWS_LC_SYS_NO_PREFIX=1
-
-
 # ==========================================
 # 2. 依存ライブラリの事前ビルドステージ
 # ==========================================
@@ -34,6 +30,7 @@ ARG LIBC_VERSION=.2.28
 # Cargo.toml と Cargo.lock、および fuzz ワークスペースメンバのマニフェストを先にコピー
 # （[workspace] members = [".", "fuzz"] のため、fuzz/Cargo.toml が無いとワークスペース解決に失敗する）
 COPY Cargo.toml Cargo.lock /app/
+COPY .cargo/config.toml /app/.cargo/config.toml
 COPY fuzz/Cargo.toml /app/fuzz/Cargo.toml
 
 # 空の main.rs を作り、依存関係「だけ」を先にコンパイルしてキャッシュ化する

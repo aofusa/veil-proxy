@@ -90,8 +90,7 @@ check_ktls_available() {
 ensure_veil_binary() {
     log_info "Building veil with all features enabled (full)..."
     cd "$PROJECT_DIR"
-    # http3/quiche と rustls が同一 AWS-LC（非プレフィックス）を共有するため veil ビルド時のみ設定
-    AWS_LC_SYS_NO_PREFIX=1 cargo build --features 'full'
+    cargo build --features 'full'
     cd - > /dev/null
     
     if [ ! -f "$VEIL_BIN" ]; then
@@ -1664,15 +1663,15 @@ run_tests() {
     # デバッグ: 実際に実行されるコマンドを確認
     if [ -n "${TEST_FILTER:-}" ]; then
         log_info "Running filtered tests: ${TEST_FILTER}"
-        log_info "Command: AWS_LC_SYS_NO_PREFIX=1 cargo test --test e2e_tests --features 'full' -- ${TEST_FILTER} --test-threads=${TEST_THREADS} --nocapture"
+        log_info "Command: cargo test --test e2e_tests --features 'full' -- ${TEST_FILTER} --test-threads=${TEST_THREADS} --nocapture"
         
-        # テスト実行（http3: quiche と rustls の AWS-LC 共有）
-        AWS_LC_SYS_NO_PREFIX=1 cargo test --test e2e_tests --features 'full' -- "${TEST_FILTER}" --test-threads=${TEST_THREADS} --nocapture
+        # テスト実行
+        cargo test --test e2e_tests --features 'full' -- "${TEST_FILTER}" --test-threads=${TEST_THREADS} --nocapture
     else
-        log_info "Command: AWS_LC_SYS_NO_PREFIX=1 cargo test --test e2e_tests --features 'full' -- --test-threads=${TEST_THREADS}"
+        log_info "Command: cargo test --test e2e_tests --features 'full' -- --test-threads=${TEST_THREADS}"
         
-        # テスト実行（http3: quiche と rustls の AWS-LC 共有）
-        AWS_LC_SYS_NO_PREFIX=1 cargo test --test e2e_tests --features 'full' -- --test-threads=${TEST_THREADS}
+        # テスト実行
+        cargo test --test e2e_tests --features 'full' -- --test-threads=${TEST_THREADS}
     fi
     
     log_info "E2E tests completed"
