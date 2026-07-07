@@ -17,12 +17,11 @@
 #![allow(clippy::disallowed_methods)]
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use std::hint::black_box;
 use std::collections::HashMap;
+use std::hint::black_box;
 
 // ベンチマーク用のルート条件構造体（シミュレーション）
-#[derive(Clone, Debug)]
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 #[allow(dead_code)] // ベンチ入力生成専用の構造体（ルータ登録時のみ使用、直接読み出しなし）
 struct BenchRouteConditions {
     host: Option<String>,
@@ -32,7 +31,6 @@ struct BenchRouteConditions {
     query: Option<HashMap<String, String>>,
     source_ip: Option<Vec<String>>,
 }
-
 
 /// テスト用ルートを生成
 fn generate_routes(count: usize) -> Vec<BenchRouteConditions> {

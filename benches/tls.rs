@@ -165,8 +165,7 @@ fn send_tls_request(port: u16, path: &str) -> Result<usize, Box<dyn std::error::
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
     // TLS接続を確立
-    let mut tls_conn = ClientConnection::new(config, server_name)
-        .map_err(std::io::Error::other)?;
+    let mut tls_conn = ClientConnection::new(config, server_name).map_err(std::io::Error::other)?;
 
     // ハンドシェイクを実行（同期）
     while tls_conn.is_handshaking() {

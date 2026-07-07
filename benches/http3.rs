@@ -165,8 +165,7 @@ fn send_tls_http2_request(port: u16, path: &str) -> Result<usize, Box<dyn std::e
     let server_name = ServerName::try_from("localhost".to_string())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
-    let mut tls_conn = ClientConnection::new(config, server_name)
-        .map_err(std::io::Error::other)?;
+    let mut tls_conn = ClientConnection::new(config, server_name).map_err(std::io::Error::other)?;
 
     while tls_conn.is_handshaking() {
         match tls_conn.complete_io(&mut stream) {
@@ -229,11 +228,7 @@ fn send_http3_request(port: u16, _path: &str) -> Result<usize, Box<dyn std::erro
     let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
     ring::rand::SystemRandom::new()
         .fill(&mut scid)
-        .map_err(|_| {
-            std::io::Error::other(
-                "Failed to generate connection ID",
-            )
-        })?;
+        .map_err(|_| std::io::Error::other("Failed to generate connection ID"))?;
     let scid = quiche::ConnectionId::from_ref(&scid);
 
     // QUIC接続を開始

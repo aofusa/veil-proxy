@@ -172,8 +172,7 @@ fn send_tls_http11_request(port: u16, path: &str) -> Result<usize, Box<dyn std::
     let server_name = ServerName::try_from("localhost".to_string())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
-    let mut tls_conn = ClientConnection::new(config, server_name)
-        .map_err(std::io::Error::other)?;
+    let mut tls_conn = ClientConnection::new(config, server_name).map_err(std::io::Error::other)?;
 
     // TLSハンドシェイク
     while tls_conn.is_handshaking() {
@@ -220,8 +219,7 @@ fn send_tls_http2_request(
     let server_name = ServerName::try_from("localhost".to_string())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
-    let mut tls_conn = ClientConnection::new(config, server_name)
-        .map_err(std::io::Error::other)?;
+    let mut tls_conn = ClientConnection::new(config, server_name).map_err(std::io::Error::other)?;
 
     // TLSハンドシェイク
     while tls_conn.is_handshaking() {

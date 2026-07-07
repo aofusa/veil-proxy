@@ -1659,8 +1659,7 @@ impl Http3Handler {
         let read_path = file_path.clone();
         // 理由付き allow: offload ワーカースレッド内で実行（イベントループ非ブロック）。
         #[allow(clippy::disallowed_methods)]
-        let read_result =
-            crate::runtime::offload::offload(move || std::fs::read(read_path)).await;
+        let read_result = crate::runtime::offload::offload(move || std::fs::read(read_path)).await;
         let data = match read_result {
             Ok(d) => d,
             Err(_) => {
