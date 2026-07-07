@@ -2548,7 +2548,8 @@ pub struct Http2ConfigSection {
     pub initial_window_size: u32,
 
     /// SETTINGS_MAX_FRAME_SIZE (最大フレームサイズ)
-    /// デフォルト: 16384 (16KB)
+    /// デフォルト: 65536 (64KB)。これは **受信側の上限として相手へ広告する値** であり、
+    /// 送信フレームは相手の SETTINGS_MAX_FRAME_SIZE（既定 16384）に従って分割される。
     #[serde(default = "default_h2_max_frame_size")]
     pub max_frame_size: u32,
 
