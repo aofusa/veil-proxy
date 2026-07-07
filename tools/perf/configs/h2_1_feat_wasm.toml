@@ -28,16 +28,22 @@ key_path = "/etc/veil/ssl/key.pem"
 ktls_enabled = false
 ktls_fallback_enabled = true
 
+[wasm]
+enabled = true
+
+[[wasm.modules]]
+name = "passthrough"
+path = "/etc/veil/wasm/passthrough_filter.wasm"
+
+[wasm.modules.capabilities]
+allow_logging = true
+
 [[route]]
 [route.conditions]
 path = "/"
 [route.action]
 type = "File"
 path = "/var/www/"
-[route.cache]
-enabled = true
-default_ttl_secs = 60
-methods = ["GET"]
-cacheable_statuses = [200]
+modules = ["passthrough"]
 [route.security]
 allowed_methods = ["HEAD", "GET"]

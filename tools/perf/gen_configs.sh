@@ -96,7 +96,9 @@ done
 # ============================================================
 # full features 機能ショーケース（default=ktls/http2 に加えて full で有効化される
 # compression / cache / buffering / 逆プロキシ経路のスループットを計測する）。
-# いずれも最良の基盤（http2=on, ktls=on, kernel LB）上に 1 機能を重ねる。
+# いずれも共通基盤（http2=on, ktls=off, kernel LB）上に 1 機能を重ねる。
+# ※ kTLS はコンテナ環境と相性が悪いため feat 系構成では既定オフ
+#   （kTLS 自体の影響は直交表 16 構成の ktls 因子で計測する）。
 # 名前を h2_1_* にして run_perf.sh が HTTP/2 負荷も実施するようにする。
 # proxy / buffering は上流 backend（run_perf.sh が起動する perf-backend）へ中継する。
 # ============================================================
@@ -130,7 +132,7 @@ reuseport_balancing = "kernel"
 [tls]
 cert_path = "/etc/veil/ssl/cert.pem"
 key_path = "/etc/veil/ssl/key.pem"
-ktls_enabled = true
+ktls_enabled = false
 ktls_fallback_enabled = true
 EOF
 }
@@ -228,6 +230,193 @@ allowed_methods = ["HEAD", "GET"]
 EOF
 } > "$OUT/h2_1_feat_buffering.toml"
 echo "wrote $OUT/h2_1_feat_buffering.toml"
+count=$((count + 1))
+
+# ============================================================
+# full features 機能ショーケース第 2 弾（F-89: perf_measurement_report.md 指摘分）。
+# wasm / metrics / access-log / rate-limit / admin / opentelemetry / l4-proxy を
+# それぞれ 1 機能だけベース構成へ重ね、機能単位のオーバーヘッドを計測する。
+# http3 / grpc-full / websocket は専用クライアントが必要なため残件（F-89 参照）。
+# ============================================================
+
+# wasm: パススルー Proxy-Wasm フィルタ 1 枚（wasmtime 呼び出しの素のオーバーヘッド）。
+# モジュールは run_perf.sh が docker/assets/wasm を /etc/veil/wasm へマウントする。
+{
+    feat_base_head
+    cat <<'EOF'
+
+[wasm]
+enabled = true
+
+[[wasm.modules]]
+name = "passthrough"
+path = "/etc/veil/wasm/passthrough_filter.wasm"
+
+[wasm.modules.capabilities]
+allow_logging = true
+
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "/var/www/"
+modules = ["passthrough"]
+[route.security]
+allowed_methods = ["HEAD", "GET"]
+EOF
+} > "$OUT/h2_1_feat_wasm.toml"
+echo "wrote $OUT/h2_1_feat_wasm.toml"
+count=$((count + 1))
+
+# metrics: Prometheus メトリクス（リクエストごとのカウンタ/ヒストグラム更新コスト）
+{
+    feat_base_head
+    cat <<'EOF'
+
+[prometheus]
+enabled = true
+allowed_ips = ["127.0.0.1"]
+
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "/var/www/"
+[route.security]
+allowed_methods = ["HEAD", "GET"]
+EOF
+} > "$OUT/h2_1_feat_metrics.toml"
+echo "wrote $OUT/h2_1_feat_metrics.toml"
+count=$((count + 1))
+
+# access-log: JSON 構造化アクセスログ（フォーマット + 非同期ファイル出力コスト）。
+# 出力先は tmpfs（/var/tmp/veil）でディスク I/O 自体は計測対象外、ホットパス側の
+# フォーマット・チャネル送信コストを見る。
+{
+    feat_base_head
+    cat <<'EOF'
+
+[access_log]
+enabled = true
+format = "json"
+file_path = "/var/tmp/veil/access.log"
+
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "/var/www/"
+[route.security]
+allowed_methods = ["HEAD", "GET"]
+EOF
+} > "$OUT/h2_1_feat_access_log.toml"
+echo "wrote $OUT/h2_1_feat_access_log.toml"
+count=$((count + 1))
+
+# rate-limit: スライディングウィンドウ判定コスト（上限は負荷を大きく上回る値にして
+# 429 を発生させない。判定・状態更新のオーバーヘッドのみを見る）
+{
+    feat_base_head
+    cat <<'EOF'
+
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "/var/www/"
+[route.security]
+allowed_methods = ["HEAD", "GET"]
+rate_limit_requests_per_min = 100000000
+EOF
+} > "$OUT/h2_1_feat_rate_limit.toml"
+echo "wrote $OUT/h2_1_feat_rate_limit.toml"
+count=$((count + 1))
+
+# admin: Admin API 有効化時の通常リクエストへのルーティング判定オーバーヘッド
+{
+    feat_base_head
+    cat <<'EOF'
+
+[admin]
+enabled = true
+path_prefix = "/__admin"
+secret = "perf-admin-secret"
+allowed_ips = ["127.0.0.1"]
+
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "/var/www/"
+[route.security]
+allowed_methods = ["HEAD", "GET"]
+EOF
+} > "$OUT/h2_1_feat_admin.toml"
+echo "wrote $OUT/h2_1_feat_admin.toml"
+count=$((count + 1))
+
+# opentelemetry: OTLP/HTTP エクスポートスレッド動作時のデータプレーン干渉
+# （metrics 併用で Prometheus レジストリをブリッジ）。エクスポート先は実コレクタ
+# ではなく perf-backend（404 応答）で、収集・直列化・送信の干渉のみを見る。
+{
+    feat_base_head
+    cat <<'EOF'
+
+[prometheus]
+enabled = true
+allowed_ips = ["127.0.0.1"]
+
+[opentelemetry]
+enabled = true
+endpoint = "http://perf-backend:80"
+service_name = "veil-perf"
+batch_interval_secs = 5
+
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "/var/www/"
+[route.security]
+allowed_methods = ["HEAD", "GET"]
+EOF
+} > "$OUT/h2_1_feat_otel.toml"
+echo "wrote $OUT/h2_1_feat_otel.toml"
+count=$((count + 1))
+
+# l4-proxy: L4 TCP ストリームプロキシ（perf-backend:80 へ素通し転送）。
+# 平文 HTTP/1.1 負荷を 9080 の L4 リスナー経由で流す（run_perf.sh が URL を切替）。
+# 443 の File ルートは readiness チェック用。
+{
+    feat_base_head
+    cat <<'EOF'
+
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "/var/www/"
+[route.security]
+allowed_methods = ["HEAD", "GET"]
+
+[[l4]]
+name = "perf-l4"
+listen = "0.0.0.0:9080"
+lb = "round_robin"
+tls = "none"
+
+  [[l4.upstreams]]
+  addr = "perf-backend:80"
+EOF
+} > "$OUT/h2_0_feat_l4.toml"
+echo "wrote $OUT/h2_0_feat_l4.toml"
 count=$((count + 1))
 
 echo "生成完了: ${count} バリアント -> $OUT"

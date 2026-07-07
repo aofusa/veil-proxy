@@ -83,13 +83,20 @@ run_load() { # target_label config_label container has_http2
             ;;
     esac
 
+    # HTTP/1.1 負荷の宛先。L4 ストリームプロキシ構成は 443 の HTTPS ではなく
+    # 平文 L4 リスナー（9080 → perf-backend:80 素通し）を計測する。
+    local h1_url="https://$c:443/"
+    case "$cfg" in
+        *feat_l4*) h1_url="http://$c:9080/" ;;
+    esac
+
     # ウォームアップ（JIT/ページキャッシュ/接続確立コストを計測外にする）
-    docker run --rm --network $NET $WRK_IMG -t2 -c10 -d2s "https://$c:443/" >/dev/null 2>&1
+    docker run --rm --network $NET $WRK_IMG -t2 -c10 -d2s "$h1_url" >/dev/null 2>&1
 
     # HTTP/1.1 (wrk) × ITERATIONS
     for iter in $(seq 1 "$ITERATIONS"); do
         ( sleep 2; sample_stats "$c" > "$LOGDIR/${label}_${cfg}_wrk_${iter}.stats" ) &
-        docker run --rm --network $NET $WRK_IMG $WRK_ARGS "${wrk_extra[@]}" "https://$c:443/" \
+        docker run --rm --network $NET $WRK_IMG $WRK_ARGS "${wrk_extra[@]}" "$h1_url" \
             > "$LOGDIR/${label}_${cfg}_wrk_${iter}.log" 2>&1
         wait
         read reqps transfer latavg latp99 non2xx < <(parse_wrk "$LOGDIR/${label}_${cfg}_wrk_${iter}.log")
@@ -136,6 +143,7 @@ start_veil() { # image config_file container_name
         -v "$mount_cfg:/etc/veil/conf.d/config.toml:ro" \
         -v "$ASSETS/ssl:/etc/veil/ssl:ro" \
         -v "$ASSETS/www:/var/www:ro" \
+        -v "$ASSETS/wasm:/etc/veil/wasm:ro" \
         --security-opt seccomp="$ASSETS/security/seccomp.json" \
         --name "$name" "$img" >/dev/null
 }

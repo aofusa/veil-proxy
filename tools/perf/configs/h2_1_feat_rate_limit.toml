@@ -34,10 +34,6 @@ path = "/"
 [route.action]
 type = "File"
 path = "/var/www/"
-[route.cache]
-enabled = true
-default_ttl_secs = 60
-methods = ["GET"]
-cacheable_statuses = [200]
 [route.security]
 allowed_methods = ["HEAD", "GET"]
+rate_limit_requests_per_min = 100000000

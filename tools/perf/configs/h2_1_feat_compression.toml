@@ -25,7 +25,7 @@ reuseport_balancing = "kernel"
 [tls]
 cert_path = "/etc/veil/ssl/cert.pem"
 key_path = "/etc/veil/ssl/key.pem"
-ktls_enabled = true
+ktls_enabled = false
 ktls_fallback_enabled = true
 
 [[route]]
