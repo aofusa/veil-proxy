@@ -1,6 +1,8 @@
 results/logs/
+results/logs_feat/
 results/results.tsv
 results/results_raw.tsv
 results/results_summary.md
+results/feat_raw.tsv
 results/run.log
 configs/_debug*.toml

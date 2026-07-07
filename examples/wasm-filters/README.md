@@ -6,6 +6,7 @@ veil-proxy用のProxy-WASMフィルタサンプル集
 
 | フィルタ | 説明 | サイズ |
 |---------|------|--------|
+| [passthrough-filter](./passthrough-filter/) | 無変更パススルー（perf 計測用ベースライン、F-89） | 130 KB |
 | [header-filter](./header-filter/) | ヘッダ追加・削除 | 144 KB |
 | [cache-filter](./cache-filter/) | 分散キャッシュ（Redis/Memcached） | - |
 | [jwt-filter](./jwt-filter/) | JWT認証（HS256/RS256、JWKS） | - |

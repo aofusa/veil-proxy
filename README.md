@@ -3414,9 +3414,14 @@ Veil ships a reproducible Docker-based performance harness in
 [`tools/perf/`](tools/perf/) that compares `veil:glibc` / `veil:musl` (built with
 **full features**) against `nginx:alpine` over container-to-container networking, for both
 HTTP/1.1 (`wrk`) and HTTP/2 (`h2load`). It covers the default+http2 tuning matrix
-(http2 × kTLS × SO_REUSEPORT balancing × open_file_cache) **and** the full-only features
-(compression / cache / buffering / reverse-proxy). Full data and a summary are in
-[**docs/perf**](docs/perf/).
+(http2 × kTLS × SO_REUSEPORT balancing × open_file_cache) **and** per-feature showcase
+configs that layer a single full-only feature on a shared baseline — compression / cache /
+buffering / reverse-proxy / **wasm / metrics / access-log / rate-limit / admin /
+opentelemetry / l4-proxy** (`h2_1_feat_*` / `h2_0_feat_l4`). Full data and a summary are in
+[**docs/perf**](docs/perf/); the per-feature analysis is in
+[docs/artifacts/perf_full_features_report.md](docs/artifacts/perf_full_features_report.md)
+(TLS termination is the dominant cost — plaintext L4 is up to 2.2× faster — while L7 feature
+logic stays within noise, all configs Non-2xx=0).
 
 ```bash
 # Generate configs, run the comparison, and aggregate (median±stdev)

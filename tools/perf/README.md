@@ -13,7 +13,7 @@
 | パス | 役割 |
 |------|------|
 | `run_perf.sh` | 計測オーケストレータ（nginx → veil glibc/musl × 全バリアント × 反復）。完了後に集計も実行 |
-| `gen_configs.sh` | 計測用 `config.toml` バリアントを **完全直交 2⁴=16** で `configs/` に生成 |
+| `gen_configs.sh` | 計測用 `config.toml` バリアントを生成（**完全直交 2⁴=16** + full features 機能ショーケース `feat_*`） |
 | `analyze_results.sh` | 反復生データ（`results_raw.tsv`）を **median±stdev** に集計し Markdown を出力 |
 | `configs/*.toml` | 生成済みバリアント（`gen_configs.sh` で再生成可能） |
 | `nginx/nginx.conf` | 比較対象 nginx の設定（`access_log off` で公平化） |
@@ -85,6 +85,34 @@ bash tools/perf/analyze_results.sh tools/perf/results/results_raw.tsv
 
 バリアント名は `h2_<0|1>_ktls_<0|1>_lb_<cbpf|kernel>_ofc_<0|1>`。`run_perf.sh` は名前の `h2_1` から
 HTTP/2 負荷（h2load）の要否を判定します（`h2_0_*` は wrk のみ）。
+
+### full features 機能ショーケース（`h2_1_feat_*` / `h2_0_feat_l4`）
+
+直交表に加え、full features に含まれる各機能のオーバーヘッドを計測する `feat_*` 構成を生成します。
+いずれも共通ベース（**HTTP/2 有効・kTLS 無効・kernel LB**。kTLS はコンテナ環境と相性が悪いため
+feat 系では既定オフ）へ **1 機能だけを重ね**、ベースライン比の相対オーバーヘッドを見ます（F-89）。
+
+| 構成 | 機能 | 計測対象 |
+|------|------|----------|
+| `h2_1_feat_compression` | compression | zstd/br/gzip 圧縮（Accept-Encoding 付与） |
+| `h2_1_feat_cache` | cache | インメモリキャッシュ |
+| `h2_1_feat_proxy` | 逆プロキシ | perf-backend(nginx) へ中継 |
+| `h2_1_feat_buffering` | buffering | 逆プロキシ + full バッファリング |
+| `h2_1_feat_wasm` | wasm | パススルー Proxy-Wasm フィルタ 1 枚の wasmtime オーバーヘッド |
+| `h2_1_feat_metrics` | metrics | Prometheus カウンタ/ヒストグラム更新コスト |
+| `h2_1_feat_access_log` | access-log | JSON 構造化ログのフォーマット + 非同期出力 |
+| `h2_1_feat_rate_limit` | rate-limit | スライディングウィンドウ判定コスト |
+| `h2_1_feat_admin` | admin | Admin API 有効化時のルーティング判定 |
+| `h2_1_feat_otel` | opentelemetry(+metrics) | OTLP エクスポートスレッドのデータプレーン干渉 |
+| `h2_0_feat_l4` | l4-proxy | L4 TCP 素通し（**平文 9080** を wrk で計測。`run_perf.sh` が URL を切替） |
+
+wasm 構成は `docker/assets/wasm/passthrough_filter.wasm`（`examples/wasm-filters/passthrough-filter/`）を
+`run_perf.sh` が `/etc/veil/wasm:ro` にマウントして使用します。http3 / grpc-full / websocket は
+専用の負荷クライアントが必要なため残件（[F-89](../../docs/backlog/features/F-89-perf-full-features-coverage.md) 参照）。
+
+計測結果とボトルネック分析は [docs/artifacts/perf_full_features_report.md](../../docs/artifacts/perf_full_features_report.md)
+を参照（要約: **TLS 終端が支配的コスト**で L4 平文は最大 2.2 倍、L7 機能ロジックのオーバーヘッドは
+ノイズ範囲内・全構成 Non-2xx=0、逆プロキシのみバックエンドホップで −15%）。
 
 主な着目点（[docs/perf/results_summary.md](../../docs/perf/results_summary.md) 参照、2026-07-07 v0.5.0 計測）:
 

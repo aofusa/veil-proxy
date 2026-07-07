@@ -128,6 +128,6 @@ cargo test --bins --test integration_tests --features "full"
 | `docs/artifacts/` | AI 成果物・一時ファイル |
 | `docs/backlog/` | 機能・バグチケット（親は `backlog.md`） |
 | `docker/` | コンテナイメージ（glibc/musl）・共有アセット（`assets/`：ssl/www/seccomp/Landlock） |
-| `tools/` | Docker ベースの外形検証ツール。`tools/perf/` は glibc/musl/nginx 比較のパフォーマンス計測ハーネス（`gen_configs.sh` で 2⁴=16 構成生成 /`run_perf.sh` で反復計測 /`analyze_results.sh` で median±stdev 集計）、`tools/container_security/` はファジング・カオス・h2spec・セキュリティスキャンのオーケストレータ（`run.sh`） |
+| `tools/` | Docker ベースの外形検証ツール。`tools/perf/` は glibc/musl/nginx 比較のパフォーマンス計測ハーネス（`gen_configs.sh` で 2⁴=16 直交表 + full features 機能ショーケース `feat_*` 構成を生成 /`run_perf.sh` で反復計測 /`analyze_results.sh` で median±stdev 集計）、`tools/container_security/` はファジング・カオス・h2spec・セキュリティスキャンのオーケストレータ（`run.sh`） |
 
 細かいモジュール対応は `src/lib.rs` の `mod` と README の構成を参照。

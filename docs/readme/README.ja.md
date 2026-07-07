@@ -3450,9 +3450,12 @@ recv/send/accept/timer Future をランダムに Drop する `runtime_cancellati
   バックエンドモックは Rust バイナリ（Python 非依存）、TLS/平文プローブは `openssl` /
   bash `/dev/tcp` を用いる。
 - **[`tools/perf/`](../../tools/perf/)** — `veil:glibc` / `veil:musl`（full features）と
-  `nginx` のスループット/レイテンシ/CPU/メモリ比較。default+http2 チューニングに加え、
-  full 限定機能（compression / cache / buffering / 逆プロキシ）も計測する。
-  結果は [docs/perf](../perf/) を参照。
+  `nginx` のスループット/レイテンシ/CPU/メモリ比較。default+http2 チューニング（2⁴=16 直交表）に加え、
+  ベースへ 1 機能だけを重ねた機能ショーケース構成（compression / cache / buffering / 逆プロキシ /
+  **wasm / metrics / access-log / rate-limit / admin / opentelemetry / l4-proxy**、`h2_1_feat_*` /
+  `h2_0_feat_l4`）で機能単位のオーバーヘッドを計測する。結果は [docs/perf](../perf/)、機能単位の
+  分析は [docs/artifacts/perf_full_features_report.md](../artifacts/perf_full_features_report.md) を参照
+  （TLS 終端が支配的コストで平文 L4 は最大 2.2 倍、L7 機能ロジックはノイズ範囲内・全構成 Non-2xx=0）。
 
 ### テストの実行
 
