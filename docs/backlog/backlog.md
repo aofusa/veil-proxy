@@ -171,6 +171,7 @@
 | B-24 | P1 | 完了 | [bugs/B-24-sq-full-future-hang.md](bugs/B-24-sq-full-future-hang.md) | io_uring SQ リング満杯時に全 I/O Future が SQE 未投入のまま `submitted=true` にして永久ハング（CQ 永久未着）。F-68 リソース枯渇テスト設計中に検出。**修正済み**: `get_sqe_or_submit`（満杯時 pending 提出→再取得）+ 確保失敗を WouldBlock で graceful 化。回帰単体1 |
 | B-25 | P1 | 完了 | [bugs/B-25-reverse-proxy-http1-wrk-zero-completed.md](bugs/B-25-reverse-proxy-http1-wrk-zero-completed.md) | 逆プロキシ構成 `feat_proxy` の HTTP/1.1（kTLS 有効）が wrk で「完了リクエスト0」。**原因確定・修正済み**: `runtime/splice.rs` が全 splice に `SPLICE_F_MORE` を無条件付与し、kTLS の 16KiB 未満の最終部分 TLS レコードがカーネル内に保留され応答が完結しなかった。既定 `splice()` から MORE を除去し、後続データが確実な中間チャンク専用の `splice_more()` を新設（curl 全量受信・wrk 正常計上・perf 再計測で検証） |
 | B-26 | P1 | 完了 | [bugs/B-26-sync-fs-on-event-loop.md](bugs/B-26-sync-fs-on-event-loop.md) | イベントループ上の同期 FS 呼び出し残存（HTTP/3 sendfile の whole-file read・runtime::io::read/remove_file・ディスクキャッシュ async_io）。**F-88 の clippy disallowed-methods で検出・修正済み**: 3 系統とも runtime::offload へ退避 |
+| B-27 | P1 | 完了 | [bugs/B-27-ktls-http2-short-write-frame-desync.md](bugs/B-27-ktls-http2-short-write-frame-desync.md) | kTLS + HTTP/2 高並行送信が FRAME_SIZE_ERROR GOAWAY で激減（`h2_1_ktls_1_lb_kernel_*` 256〜736 req/s）。**原因確定・修正済み**: `runtime/io.rs` の `write_all` が short write の残りを書かず WriteZero を返し、送信済みプレフィックスでフレーム同期が破壊されていた。`SlicedIoBuf` による継続書き込みへ修正（回帰単体 3 件 + h2load 検証） |
 
 ---
 

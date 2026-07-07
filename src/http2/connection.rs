@@ -419,8 +419,8 @@ where
     /// runtime の `write_all`（`AsyncWriteRentExt`）は所有バッファ（`IoBuf`）を取り
     /// 完了時に返す。フレームエンコード結果の `Vec<u8>` をそのままムーブで渡すことで、
     /// 従来の per-frame `data[..].to_vec()` に由来するアロケーション + 全コピーを排除する
-    /// （HTTP/2 送信ホットパス最適化）。runtime の write_all は「全書き込み or WriteZero」
-    /// のため、`Ok` は常に完全書き込みを意味する。`WouldBlock` のみ同一バッファで再試行する。
+    /// （HTTP/2 送信ホットパス最適化）。runtime の write_all は short write を内部で
+    /// 継続する（B-27）ため、`Ok` は常に完全書き込みを意味する。
     async fn write_all(&mut self, buf: Vec<u8>) -> Http2Result<()> {
         // 呼び出し境界では write_buf は空である不変条件（各送信 API は復帰前に flush する）。
         // 直接 write_all する制御フレーム等が連結バッファを追い越して順序が壊れないよう保証する。

@@ -72,6 +72,52 @@ unsafe impl IoBufMut for Vec<u8> {
 }
 
 // ====================
+// SlicedIoBuf: 部分書き込み継続用のオフセット付きラッパー
+// ====================
+
+/// 部分書き込みの継続用に、内部バッファの `offset` 以降だけを公開する `IoBuf` ラッパー。
+///
+/// `write_all`（`src/runtime/io.rs`）が short write の残りを**追加アロケーションなし**で
+/// 書き続けるために使う（B-27）。`advance()` で送信済みバイト数を進め、完了後は
+/// `into_inner()` で元のバッファを取り出して呼び出し側へ返却する。
+pub struct SlicedIoBuf<T: IoBuf> {
+    inner: T,
+    offset: usize,
+}
+
+impl<T: IoBuf> SlicedIoBuf<T> {
+    #[inline(always)]
+    pub fn new(inner: T) -> Self {
+        Self { inner, offset: 0 }
+    }
+
+    /// 送信済みバイト数を進める（`bytes_init` を超えないよう飽和）。
+    #[inline(always)]
+    pub fn advance(&mut self, n: usize) {
+        self.offset = (self.offset + n).min(self.inner.bytes_init());
+    }
+
+    /// 元のバッファを取り出す。
+    #[inline(always)]
+    pub fn into_inner(self) -> T {
+        self.inner
+    }
+}
+
+unsafe impl<T: IoBuf> IoBuf for SlicedIoBuf<T> {
+    #[inline(always)]
+    fn read_ptr(&self) -> *const u8 {
+        // SAFETY: offset は常に bytes_init 以下（advance で飽和）のため範囲内。
+        unsafe { self.inner.read_ptr().add(self.offset) }
+    }
+
+    #[inline(always)]
+    fn bytes_init(&self) -> usize {
+        self.inner.bytes_init() - self.offset
+    }
+}
+
+// ====================
 // Box<[u8]> の実装
 // ====================
 

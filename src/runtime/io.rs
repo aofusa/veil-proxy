@@ -76,34 +76,44 @@ pub trait AsyncWriteRent {
 #[allow(async_fn_in_trait)]
 pub trait AsyncWriteRentExt: AsyncWriteRent {
     /// バッファを全て書き込む（ループで write を呼ぶ）
+    ///
+    /// B-27: 部分書き込み（short write）時は `SlicedIoBuf` で送信済みオフセットを進め、
+    /// **残りを追加アロケーションなしで書き続ける**。旧実装は 1 回の `write` で書き
+    /// 切れないと WriteZero エラーを返しており、kTLS 経路（`write` が単発 io_uring
+    /// SEND のため sndbuf 満杯で部分書き込みが起こる）の高並行 HTTP/2 送信で、
+    /// 送信済みプレフィックスだけがワイヤに残ってフレーム同期が壊れていた。
     async fn write_all<T: IoBuf>(&mut self, buf: T) -> BufResult<usize, T> {
         let total = buf.bytes_init();
-        let mut written = 0;
-        let mut buf = buf;
+        let mut sliced = super::buf::SlicedIoBuf::new(buf);
+        let mut written = 0usize;
 
-        // 書き込み済みデータを追跡するためのオフセット付きラッパー
-        // 実際の実装では、IoBuf のスライスをサポートするか、
-        // Vec<u8> に変換して書き込む
-        // ここでは簡略実装として、一度で書き込めない場合はエラーを返す
-        let (result, returned_buf) = self.write(buf).await;
-        match result {
-            Ok(n) => {
-                written += n;
-                buf = returned_buf;
+        while written < total {
+            let (result, returned) = self.write(sliced).await;
+            sliced = returned;
+            match result {
+                Ok(0) => {
+                    return (
+                        Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "write returned 0 bytes",
+                        )),
+                        sliced.into_inner(),
+                    );
+                }
+                Ok(n) => {
+                    written += n;
+                    sliced.advance(n);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // 同一オフセットで再試行（送信バッファの空き待ちは write 実装側の
+                    // POLL_ADD / io_uring 完了に委ねる）
+                    continue;
+                }
+                Err(e) => return (Err(e), sliced.into_inner()),
             }
-            Err(e) => return (Err(e), returned_buf),
         }
 
-        if written < total {
-            // 部分書き込みの場合、残りをループで書き込む
-            // 簡略実装: WriteZero エラーを返す
-            (
-                Err(io::Error::new(io::ErrorKind::WriteZero, "partial write")),
-                buf,
-            )
-        } else {
-            (Ok(written), buf)
-        }
+        (Ok(written), sliced.into_inner())
     }
 }
 
@@ -256,5 +266,67 @@ impl OpenOptions {
 impl Default for OpenOptions {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 1 回の write で最大 `max_per_write` バイトしか書けないモックストリーム。
+    /// B-27: write_all が short write の残りを正しいオフセットから書き続けることを検証する。
+    struct ShortWriteStream {
+        written: Vec<u8>,
+        max_per_write: usize,
+    }
+
+    impl AsyncWriteRent for ShortWriteStream {
+        async fn write<T: IoBuf>(&mut self, buf: T) -> BufResult<usize, T> {
+            let len = buf.bytes_init().min(self.max_per_write);
+            let slice = unsafe { std::slice::from_raw_parts(buf.read_ptr(), len) };
+            self.written.extend_from_slice(slice);
+            (Ok(len), buf)
+        }
+
+        async fn shutdown(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_all_continues_after_short_write() {
+        let mut stream = ShortWriteStream {
+            written: Vec::new(),
+            max_per_write: 7,
+        };
+        let data: Vec<u8> = (0..100u8).collect();
+        let fut = stream.write_all(data.clone());
+        let (result, returned) = futures::executor::block_on(fut);
+        assert_eq!(result.unwrap(), 100, "write_all は全量書き込みを返す");
+        assert_eq!(stream.written, data, "short write 継続でバイト列が欠落・重複しない");
+        assert_eq!(returned, data, "元のバッファがそのまま返却される");
+    }
+
+    #[test]
+    fn write_all_single_full_write() {
+        let mut stream = ShortWriteStream {
+            written: Vec::new(),
+            max_per_write: usize::MAX,
+        };
+        let data = b"hello".to_vec();
+        let (result, _) = futures::executor::block_on(stream.write_all(data.clone()));
+        assert_eq!(result.unwrap(), 5);
+        assert_eq!(stream.written, data);
+    }
+
+    #[test]
+    fn write_all_zero_write_is_error() {
+        let mut stream = ShortWriteStream {
+            written: Vec::new(),
+            max_per_write: 0,
+        };
+        let data = b"x".to_vec();
+        let (result, _) = futures::executor::block_on(stream.write_all(data));
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WriteZero);
     }
 }

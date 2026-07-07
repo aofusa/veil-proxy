@@ -480,8 +480,8 @@ where
     /// 完了時に返す。フレームエンコード結果の `Vec<u8>` をそのままムーブで渡すことで、
     /// 従来の per-frame `data[offset..].to_vec()` に由来するアロケーション + 全コピーを
     /// 排除する（proxy→バックエンド方向 HTTP/2 送信ホットパス最適化・F-73 残件）。
-    /// runtime の write_all は「全書き込み or WriteZero」のため、`Ok` は常に完全書き込みを
-    /// 意味する。`WouldBlock` のみ同一バッファで再試行する。
+    /// runtime の write_all は short write を内部で継続する（B-27）ため、`Ok` は常に
+    /// 完全書き込みを意味する。
     async fn write_all(&mut self, mut buf: Vec<u8>) -> Http2Result<()> {
         loop {
             let (result, returned) = self.stream.write_all(buf).await;
