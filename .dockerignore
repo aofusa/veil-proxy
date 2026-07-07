@@ -4,6 +4,8 @@
 # 必要なファイルだけ許可
 !Cargo.toml
 !Cargo.lock
+!.cargo/
+!build.rs
 !src/
 # コンテナ同梱の設定は docker/assets/conf.d/config.toml を使用する（ルートの config.toml は含めない）
 !docker/assets

@@ -39,6 +39,7 @@ ARG RUST_TARGET=x86_64-unknown-linux-musl
 # （[workspace] members = [".", "fuzz"] のため、fuzz/Cargo.toml が無いとワークスペース解決に失敗する）
 COPY Cargo.toml Cargo.lock /app/
 COPY .cargo/config.toml /app/.cargo/config.toml
+COPY build.rs /app/build.rs
 COPY fuzz/Cargo.toml /app/fuzz/Cargo.toml
 
 # 空の main.rs を作り、依存関係「だけ」を先にコンパイルしてキャッシュ化する
@@ -72,6 +73,8 @@ COPY --from=cacher /root/.cargo /root/.cargo
 COPY --from=cacher /app/target /app/target
 COPY --from=cacher /app/benches /app/benches
 COPY Cargo.toml Cargo.lock /app/
+COPY .cargo/config.toml /app/.cargo/config.toml
+COPY build.rs /app/build.rs
 
 # ソースコードをコピー
 COPY . /app
