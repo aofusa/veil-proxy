@@ -86,6 +86,10 @@ pub enum L4UpstreamTarget {
 ///
 /// 起動時に解決できるアドレスは `Resolved` としてキャッシュし、
 /// DNS 未解決（B-33）のホスト名は `Unresolved` として保持して接続時に解決する。
+///
+/// コールドパス（L4 リスナー起動時のみ）。同期 DNS は接続時 `resolve_upstream_target` の
+/// `offload` へ退避し、ホットパスでは呼ばない。
+#[allow(clippy::disallowed_methods)] // 起動時のみ: リスナー初期化で上流を Resolved/Unresolved に分類
 pub fn parse_upstream_targets(config: &L4ListenerConfig) -> Vec<L4UpstreamTarget> {
     config
         .upstreams
@@ -104,6 +108,8 @@ pub fn parse_upstream_targets(config: &L4ListenerConfig) -> Vec<L4UpstreamTarget
         .collect()
 }
 
+/// `runtime::offload` 専用ワーカー内でのみ呼ぶ（B-33 接続時 DNS 解決）。
+#[allow(clippy::disallowed_methods)] // offload ワーカー内: ホットパスからは `resolve_upstream_target` 経由のみ
 fn resolve_upstream_addr_sync(addr: &str) -> Option<SocketAddr> {
     if let Ok(sa) = addr.parse::<SocketAddr>() {
         return Some(sa);
@@ -924,6 +930,19 @@ mod tests {
     fn test_parse_upstream_addrs_invalid() {
         let config = make_config(vec!["not-a-valid-addr"], L4LbAlgorithm::RoundRobin);
         assert!(parse_upstream_addrs(&config).is_err());
+    }
+
+    #[test]
+    fn test_parse_upstream_targets_unresolved_hostname() {
+        let config = make_config(vec!["backend.example:4443"], L4LbAlgorithm::RoundRobin);
+        let targets = parse_upstream_targets(&config);
+        assert_eq!(targets.len(), 1);
+        match &targets[0] {
+            L4UpstreamTarget::Unresolved(host) => assert_eq!(host.as_ref(), "backend.example:4443"),
+            L4UpstreamTarget::Resolved(_) => {
+                panic!("expected Unresolved for hostname upstream")
+            }
+        }
     }
 
     #[test]
