@@ -27,9 +27,9 @@ Rust の AST を理解する lint（clippy の `disallowed-methods` / `disallowe
 
 ## 受け入れ条件
 
-- [ ] `clippy.toml` の disallowed 設定が入り、違反を意図的に書くと clippy が検出すること。
-- [ ] 既存コードの正当な利用箇所すべてに理由付き allow が付与され、警告ゼロであること。
-- [ ] CI（`.github/workflows/ci.yml` の clippy ジョブ）でこの lint が有効なこと。
+- [x] `clippy.toml` の disallowed 設定が入り、違反を意図的に書くと clippy が検出すること。
+- [x] 既存コードの正当な利用箇所すべてに理由付き allow が付与され、警告ゼロであること（B-26 含む）。
+- [x] CI（`.github/workflows/ci.yml` の clippy ジョブ）でこの lint が有効なこと。
 
 ## 依存・リスク
 
