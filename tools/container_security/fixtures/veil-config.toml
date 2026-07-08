@@ -204,7 +204,7 @@ allowed_methods = ["GET"]
 # full: キャッシュ経路（GET をインメモリキャッシュ）。File 配信 + cache を有効化。
 [[route]]
 [route.conditions]
-path = "/cached/"
+path = "/cached/*"
 [route.action]
 type = "File"
 path = "/var/www/"

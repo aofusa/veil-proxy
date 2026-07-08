@@ -25,8 +25,9 @@ else
 fi
 
 # quiche ベース HTTP/3 クライアント（P-03 本番検証）
-# 軽量なキャッシュ済み静的ファイルで応答完了を検証（巨大 index.html は QUIC フロー制御で遅延しうる）
-export HTTP3_PATH="${HTTP3_PATH:-/cached/index.html}"
+# 既定 File ルート `/`（200 応答）。`/cached/` はプレフィックス末尾スラッシュのみで
+# `/cached/index.html` にマッチしないため使用しない。
+export HTTP3_PATH="${HTTP3_PATH:-/}"
 h3_ok=0
 if command -v http3-client >/dev/null 2>&1; then
     if http3-client; then
