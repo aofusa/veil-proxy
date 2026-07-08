@@ -31,4 +31,4 @@
 
 ## 対応状況
 
-完了（fix/e2e ブランチ、427/430 E2E 通過。残件: B-30/B-31、http3_large_request_body フレーキー）
+完了（fix/e2e ブランチ、430/430 E2E 実装・`#[ignore]` 0 件。B-29〜B-31 修正済み。既知フレーキー: `test_concurrent_connection_stress` 等の負荷系）

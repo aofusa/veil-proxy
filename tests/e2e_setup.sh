@@ -221,16 +221,27 @@ prepare_fixtures() {
     # cp -p でソースの mtime を維持する。維持しないと毎回コピー先 .wasm の mtime が
     # 更新され、前回生成の AOT キャッシュ（<path>.cwasm）が「古い」と判定されて
     # 毎回 WASM を再コンパイルしてしまう（起動が数十秒遅くなる）。
-    if [ -f "${SCRIPT_DIR}/wasm/header_filter.wasm" ]; then
-        cp -p "${SCRIPT_DIR}/wasm/header_filter.wasm" "${FIXTURES_DIR}/wasm/header_filter.wasm"
-        log_info "WASM module header_filter.wasm copied"
-    else
-        log_warn "WASM module header_filter.wasm not found at ${SCRIPT_DIR}/wasm/header_filter.wasm"
-    fi
-    if [ -f "${SCRIPT_DIR}/wasm/http_call_filter.wasm" ]; then
-        cp -p "${SCRIPT_DIR}/wasm/http_call_filter.wasm" "${FIXTURES_DIR}/wasm/http_call_filter.wasm"
-        log_info "WASM module http_call_filter.wasm copied"
-    fi
+    # tests/wasm/*.wasm は gitignore 対象のため、追跡済み tests/fixtures/wasm/ をフォールバックに使う
+    copy_wasm_module() {
+        local name="$1"
+        local dest="${FIXTURES_DIR}/wasm/${name}"
+        local tests_src="${SCRIPT_DIR}/wasm/${name}"
+        local fixtures_src="${SCRIPT_DIR}/fixtures/wasm/${name}"
+        if [ -f "$tests_src" ]; then
+            cp -p "$tests_src" "$dest"
+            log_info "WASM module ${name} copied from tests/wasm"
+        elif [ -f "$fixtures_src" ]; then
+            # FIXTURES_DIR が tests/fixtures の場合は同一パスのためコピー不要
+            if [ "$fixtures_src" != "$dest" ]; then
+                cp -p "$fixtures_src" "$dest"
+            fi
+            log_info "WASM module ${name} ready (tests/fixtures/wasm)"
+        else
+            log_warn "WASM module ${name} not found (tests/wasm or tests/fixtures/wasm)"
+        fi
+    }
+    copy_wasm_module "header_filter.wasm"
+    copy_wasm_module "http_call_filter.wasm"
 }
 
 # 設定ファイルを生成
