@@ -179,6 +179,7 @@
 | B-31 | P2 | 未着手 | [bugs/B-31-rate-limit-thread-local-per-worker.md](bugs/B-31-rate-limit-thread-local-per-worker.md) | レートリミットが thread_local でワーカー分散し実効上限が N×workers に。F-90 rate_limit_probe で検出 |
 | B-32 | P2 | 未着手 | [bugs/B-32-compression-not-applied-http2.md](bugs/B-32-compression-not-applied-http2.md) | HTTP/2 で Accept-Encoding 時も Content-Encoding 未付与。F-90 compression_cache_probe で検出 |
 | B-33 | P2 | 未着手 | [bugs/B-33-l4-listener-upstream-dns-startup.md](bugs/B-33-l4-listener-upstream-dns-startup.md) | L4 リスナーが上流 DNS 未解決で起動失敗（4443 未待受）。F-90 l4_flood_probe で検出 |
+| B-34 | P2 | 未着手 | [bugs/B-34-http3-quiche-client-response-timeout.md](bugs/B-34-http3-quiche-client-response-timeout.md) | HTTP/3 quiche クライアントが GET `/` で応答タイムアウト（TLS 経路は 200）。F-90 http3-client で検出 |
 
 ---
 

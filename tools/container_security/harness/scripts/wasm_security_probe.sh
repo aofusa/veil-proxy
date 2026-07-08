@@ -53,6 +53,29 @@ else
     fails=$((fails + 1))
 fi
 
+# W-06: fuel 枯渇モジュール（応答がタイムアウト内に返りプロセスが生存）
+fuel_start=$(date +%s%N 2>/dev/null || date +%s)
+fuel_code=$(curl -sk --http1.1 -o /dev/null -w "%{http_code}" --max-time 8 \
+    "https://${VEIL_HOST}:${VEIL_HTTPS_PORT}/wasm-fuel/" 2>/dev/null || echo "000")
+fuel_end=$(date +%s%N 2>/dev/null || date +%s)
+log "wasm_fuel_route: code=${fuel_code}"
+
+if [[ "${fuel_code}" == "000" ]]; then
+    log "FAIL wasm_fuel_timeout (hang?)"
+    fails=$((fails + 1))
+else
+    log "PASS wasm_fuel_no_hang code=${fuel_code}"
+fi
+
+hc=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 \
+    "https://${VEIL_HOST}:${VEIL_HTTPS_PORT}/" 2>/dev/null || echo "000")
+if [[ "${hc}" == "200" ]]; then
+    log "post_fuel_health: ok"
+else
+    log "post_fuel_health: fail (${hc})"
+    fails=$((fails + 1))
+fi
+
 if [[ "${fails}" -eq 0 ]]; then
     log "wasm_security: ok"
     exit 0

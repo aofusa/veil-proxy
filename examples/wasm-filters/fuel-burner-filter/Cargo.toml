@@ -1,0 +1,17 @@
+[package]
+name = "fuel-burner-filter"
+version = "0.1.0"
+edition = "2021"
+description = "Proxy-Wasm filter that burns CPU (fuel timeout security probe)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+proxy-wasm = "0.2"
+
+[profile.release]
+lto = true
+opt-level = "s"
+
+[workspace]

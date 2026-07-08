@@ -46,6 +46,18 @@ c=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 \
     "https://${VEIL_HOST}:${VEIL_HTTPS_PORT}/ws/" 2>/dev/null || echo "000")
 check_not_101 "missing_upgrade" "${c}"
 
+# P-09: 仕様外コントロールフレーム（ws-probe Rust クライアント）
+if command -v ws-probe >/dev/null 2>&1; then
+    if ws-probe; then
+        log "PASS ws_control_frame_probe"
+    else
+        log "FAIL ws_control_frame_probe"
+        fails=$((fails + 1))
+    fi
+else
+    log "WARN ws-probe binary missing (P-09 skipped)"
+fi
+
 # 事後ヘルス
 hc=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 \
     "https://${VEIL_HOST}:${VEIL_HTTPS_PORT}/" 2>/dev/null || echo "000")

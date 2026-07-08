@@ -24,20 +24,29 @@ else
     log "udp_reachability: inconclusive (continuing)"
 fi
 
-# curl --http3-only（ビルド依存。未対応ならスキップ扱いで TLS ヘルスへフォールバック）
+# quiche ベース HTTP/3 クライアント（P-03 本番検証）
+h3_ok=0
+if command -v http3-client >/dev/null 2>&1; then
+    if http3-client; then
+        log "http3_client: ok"
+        h3_ok=1
+    else
+        log "WARN http3_client: failed (see http3_client_report.txt)"
+    fi
+else
+    log "http3_client: missing binary"
+fi
+
+# curl --http3-only フォールバック
 h3_code="000"
-if curl --version 2>/dev/null | grep -qi http3; then
+if [[ "${h3_ok}" -eq 0 ]] && curl --version 2>/dev/null | grep -qi http3; then
     h3_code=$(curl -sk --http3-only -o /dev/null -w "%{http_code}" --max-time 8 \
         "https://${VEIL_HOST}:${VEIL_HTTP3_PORT}/" 2>/dev/null || echo "000")
     log "curl_http3: code=${h3_code}"
-    if [[ "${h3_code}" =~ ^(200|301|302)$ ]]; then
-        log "PASS http3_get"
-    else
-        log "WARN http3_get: code=${h3_code} (implementation or curl QUIC support)"
-        # 実装問題の切り分けはレポートへ。プロセス生存は TLS で確認。
-    fi
-else
-    log "curl_http3: skipped (curl without HTTP/3 support in harness image)"
+    [[ "${h3_code}" =~ ^(200|301|302)$ ]] && h3_ok=1
+fi
+if [[ "${h3_ok}" -eq 1 ]]; then
+    log "PASS http3_get"
 fi
 
 # プロセス生存（TLS 経路）
@@ -50,9 +59,9 @@ else
     fails=$((fails + 1))
 fi
 
-# curl HTTP/3 非対応 (h3_code=000) は TLS 生存で合格。対応かつ非 2xx は実装問題として失敗。
+# http3-client/curl 成功、または TLS 生存で合格（QUIC 未検証時は WARN のみ）
 if [[ "${fails}" -eq 0 ]]; then
-    if [[ "${h3_code}" =~ ^(200|301|302)$ ]] || [[ "${h3_code}" == "000" ]]; then
+    if [[ "${h3_ok}" -eq 1 ]] || [[ "${h3_code}" =~ ^(200|301|302)$ ]] || [[ "${h3_code}" == "000" ]]; then
         log "http3: ok"
         exit 0
     fi

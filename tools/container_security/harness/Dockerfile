@@ -6,6 +6,15 @@
 
 # --- Rust ツールビルドステージ（std のみ・依存ゼロ）---
 FROM rust:1-slim-bookworm AS tools-builder
+RUN apt-get update -y \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        clang \
+        cmake \
+        perl \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY tools/ /build/
 RUN cargo build --release --bins
@@ -32,6 +41,8 @@ RUN apt-get update -y \
 # Rust 製ツール（旧 python スクリプトの置換）を配置。
 COPY --from=tools-builder /build/target/release/fuzz-http /usr/local/bin/fuzz-http
 COPY --from=tools-builder /build/target/release/bad-backend /usr/local/bin/bad-backend
+COPY --from=tools-builder /build/target/release/http3-client /usr/local/bin/http3-client
+COPY --from=tools-builder /build/target/release/ws-probe /usr/local/bin/ws-probe
 
 WORKDIR /work
 COPY scripts/ /scripts/

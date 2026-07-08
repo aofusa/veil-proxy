@@ -30,22 +30,38 @@ echo "full_features_security start target=${ip}" | tee -a "${REPORT}"
 PROBES=(
     admin_security_probe
     compression_cache_probe
+    access_log_probe
     http3_probe
     l4_flood_probe
     websocket_probe
     grpc_probe
+    grpc_web_probe
     rate_limit_probe
     wasm_security_probe
     metrics_probe
     otel_probe
 )
 
+# W-04: 不正 WASM モジュール（ホスト docker から ephemeral 起動）
+echo "--- wasm_invalid_module_probe ---" | tee -a "${REPORT}"
+set +e
+"${SCRIPT_DIR}/../harness/scripts/wasm_invalid_module_probe.sh" 2>&1 | tee -a "${REPORT}"
+host_rc="${PIPESTATUS[0]}"
+set -e
 total_fails=0
+if [[ "${host_rc}" -ne 0 ]]; then
+    total_fails=$((total_fails + 1))
+    echo "wasm_invalid_module_probe: FAIL (rc=${host_rc})" | tee -a "${REPORT}"
+else
+    echo "wasm_invalid_module_probe: ok" | tee -a "${REPORT}"
+fi
+
 for probe in "${PROBES[@]}"; do
     echo "--- ${probe} ---" | tee -a "${REPORT}"
     set +e
     docker run --rm --network "${NET_NAME}" \
-        -e "VEIL_HOST=${ip}" \
+        -e "VEIL_HOST=veil-proxy" \
+        -e "VEIL_SNI=veil-proxy" \
         -e "ADMIN_SECRET=${ADMIN_SECRET:-veil-sec-test-admin}" \
         -e "METRICS_PATH=${METRICS_PATH:-/__metrics}" \
         -v "${RESULTS_DIR}:/results:rw" \

@@ -1,6 +1,6 @@
-# container_security ハーネス用の外形検証ツール（std のみ・依存ゼロで高速ビルド）。
+# container_security ハーネス用の外形検証ツール。
 # 旧 Python スクリプト（fuzz_http.py / bad_backend_server.py）を Rust へ置換したもの。
-# ハーネス Docker イメージのビルドステージでビルドし、バイナリのみを実行イメージへコピーする。
+# HTTP/3・WebSocket プローブ用に quiche/rustls を追加（P-03 / P-09）。
 [workspace]
 
 [package]
@@ -16,6 +16,20 @@ path = "src/bin/fuzz-http.rs"
 [[bin]]
 name = "bad-backend"
 path = "src/bin/bad-backend.rs"
+
+[[bin]]
+name = "http3-client"
+path = "src/bin/http3-client.rs"
+
+[[bin]]
+name = "ws-probe"
+path = "src/bin/ws-probe.rs"
+
+[dependencies]
+# ハーネス単体ビルドでは vendored BoringSSL を使用（veil 本体の aws-lc 共有は不要）
+quiche = { version = "=0.24.6", default-features = false, features = ["boringssl-vendored"] }
+getrandom = "0.2"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 
 [profile.release]
 opt-level = 2

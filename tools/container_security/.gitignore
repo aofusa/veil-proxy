@@ -3,6 +3,7 @@ results/*
 results/cargo-target/
 results/cargo-target-asan/
 results/veil-config.runtime.toml
+results/veil-config.invalid-wasm.toml
 results/veil-image.tar
 fuzz/corpus/*
 !fuzz/corpus/.gitkeep

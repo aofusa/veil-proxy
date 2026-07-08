@@ -133,6 +133,9 @@ start_veil_container() {
     if [[ -d "${wasm_dir}" ]] && [[ -f "${wasm_dir}/header_filter.wasm" ]]; then
         wasm_mount=(-v "${wasm_dir}:/etc/veil/wasm:ro")
         log "WASM モジュールをマウント: ${wasm_dir}"
+        if [[ ! -f "${wasm_dir}/fuel_burner.wasm" ]]; then
+            log "警告: fuel_burner.wasm 未検出。W-06 プローブが失敗する可能性があります"
+        fi
     else
         log "警告: WASM モジュール未検出 (${wasm_dir})。wasm_security プローブはスキップされる可能性があります"
     fi

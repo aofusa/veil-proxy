@@ -77,6 +77,10 @@ batch_interval_secs = 5
 [wasm]
 enabled = true
 
+[wasm.defaults]
+# fuel 枯渇プローブ（W-06）用。header_filter は軽量のため通常は完走する。
+max_execution_time_ms = 50
+
 [[wasm.modules]]
 name = "header_filter"
 path = "/etc/veil/wasm/header_filter.wasm"
@@ -89,6 +93,16 @@ allow_request_headers_write = true
 allow_response_headers_read = true
 allow_response_headers_write = true
 allow_send_local_response = true
+
+[[wasm.modules]]
+name = "fuel_burner"
+path = "/etc/veil/wasm/fuel_burner.wasm"
+configuration = '{}'
+
+[wasm.modules.capabilities]
+allow_logging = true
+allow_response_headers_read = true
+allow_response_headers_write = true
 
 [upstreams."toxi-pool"]
 algorithm = "round_robin"
@@ -170,6 +184,17 @@ allowed_methods = ["POST"]
 modules = ["header_filter"]
 [route.conditions]
 path = "/wasm/"
+[route.action]
+type = "File"
+path = "/var/www/"
+[route.security]
+allowed_methods = ["GET"]
+
+# full: fuel 枯渇モジュール経路（W-06。タイムアウト内応答 + プロセス生存を検証）
+[[route]]
+modules = ["fuel_burner"]
+[route.conditions]
+path = "/wasm-fuel/"
 [route.action]
 type = "File"
 path = "/var/www/"

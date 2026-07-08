@@ -59,6 +59,12 @@ run_phase() {
         otel)
             exec /scripts/otel_probe.sh
             ;;
+        access_log)
+            exec /scripts/access_log_probe.sh
+            ;;
+        grpc_web)
+            exec /scripts/grpc_web_probe.sh
+            ;;
         all)
             /scripts/health_check.sh
             /usr/local/bin/fuzz-http
