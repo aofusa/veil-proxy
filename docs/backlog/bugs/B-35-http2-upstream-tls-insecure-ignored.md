@@ -1,4 +1,4 @@
-# B-29: HTTP/2 上流 HTTPS 接続で tls_insecure が無視される
+# B-35: HTTP/2 上流 HTTPS 接続で tls_insecure が無視される
 
 ## 事象
 
