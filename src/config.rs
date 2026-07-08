@@ -16,6 +16,7 @@ use once_cell::sync::Lazy;
 use rustls::ServerConfig;
 use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use serde::Deserialize;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
@@ -1829,9 +1830,9 @@ impl RateLimiter {
     }
 }
 
-/// 全ワーカー共有のレートリミッター（B-31: thread_local だとワーカー数に比例して実効上限が増える）
-static GLOBAL_RATE_LIMITER: Lazy<std::sync::Mutex<RateLimiter>> =
-    Lazy::new(|| std::sync::Mutex::new(RateLimiter::new()));
+thread_local! {
+    static RATE_LIMITER: RefCell<RateLimiter> = RefCell::new(RateLimiter::new());
+}
 
 /// レートリミットをチェック
 /// 戻り値: レート制限内であればtrue
@@ -1840,13 +1841,10 @@ pub fn check_rate_limit(client_ip: &str, limit: u64) -> bool {
         return true; // 0 = 無制限
     }
 
-    match GLOBAL_RATE_LIMITER.lock() {
-        Ok(mut limiter) => {
-            let (allowed, _rate) = limiter.check_and_record(client_ip, limit);
-            allowed
-        }
-        Err(_) => true,
-    }
+    RATE_LIMITER.with(|limiter| {
+        let (allowed, _rate) = limiter.borrow_mut().check_and_record(client_ip, limit);
+        allowed
+    })
 }
 
 // ====================
