@@ -152,14 +152,8 @@ packaging/output/veil-<version>-1.<arch>.rpm
 Build inside Docker (same approach as [docker/Dockerfile.glibc](docker/Dockerfile.glibc), using `messense/cargo-zigbuild` for glibc 2.28-compatible binaries):
 
 ```bash
-# Binary via Docker, packages on host
+# Build binary and packages entirely inside Docker
 ./packaging/scripts/build.sh --docker
-
-# Or build everything inside Docker
-docker build -f packaging/scripts/docker/Dockerfile.package -t veil-package:local .
-cid=$(docker create veil-package:local)
-docker cp "$cid:/app/packaging/output/." packaging/output/
-docker rm "$cid"
 ```
 
 Install:

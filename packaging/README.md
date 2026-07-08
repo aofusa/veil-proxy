@@ -29,8 +29,6 @@ packaging/
 │   ├── postinstall.sh           # deb/rpm 共通インストール後処理
 │   ├── preuninstall.sh          # deb/rpm 共通アンインストール前処理
 │   └── docker/
-│       ├── Dockerfile.build     # バイナリのみ Docker ビルド
-│       ├── Dockerfile.package   # Docker 内でパッケージまで一括ビルド
 │       ├── Dockerfile.test-deb  # Ubuntu テスト用イメージ
 │       └── Dockerfile.test-rpm  # Amazon Linux 2023 テスト用イメージ
 ├── build/                       # Docker ビルド中間成果物（.gitignore）
@@ -58,22 +56,11 @@ apt-get install -y cmake nasm dpkg-dev rpm
 
 ### Docker ビルド（推奨）
 
-ホストに Rust ツールチェーンがなくても、Docker だけでビルドできます。
-[docker/Dockerfile.glibc](../docker/Dockerfile.glibc) と同様に `messense/cargo-zigbuild` を使用し、glibc 2.28 互換バイナリを生成します。
+ホストに Rust ツールチェーンや dpkg-deb, rpmbuild がなくても、Docker だけでビルドできます。
+`docker/Dockerfile.glibc` でバイナリをビルドし、コンテナ内で deb/rpm パッケージを作成します。
 
 ```bash
 # パッケージ一式を Docker 内でビルド
-docker build -f packaging/scripts/docker/Dockerfile.package -t veil-package:local .
-
-# 成果物をホストへコピー
-cid=$(docker create veil-package:local)
-docker cp "$cid:/app/packaging/output/." packaging/output/
-docker rm "$cid"
-```
-
-バイナリのみ Docker でビルドし、パッケージングはホストで行う場合:
-
-```bash
 ./packaging/scripts/build.sh --docker
 ```
 
@@ -195,7 +182,6 @@ sudo systemctl enable --now veil
 2. パッケージのインストール
 3. `systemctl enable` / `systemctl start veil`
 4. コンテナ内 `curl` で HTTP リダイレクト（80）と HTTPS 応答（443）を確認
-5. ホストポートマッピング確認（deb: 18080/18443、rpm: 28080/28443）
 
 ## systemd ユニットの設計上の注意
 
