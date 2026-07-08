@@ -814,7 +814,12 @@ pub fn run() {
         info!("============================================");
         info!("HTTP/3 (QUIC/UDP) Server");
         info!("HTTP/3 Listen Address: {} (UDP)", http3_addr);
-        info!("HTTP/3 Workers: {} (SO_REUSEPORT enabled)", num_threads);
+        // QUIC は接続状態がソケット単位のため HTTP/3 は単一ワーカーに集約（B-34）。
+        let http3_workers = 1usize;
+        info!(
+            "HTTP/3 Workers: {} (single worker; QUIC state is per-socket)",
+            http3_workers
+        );
         info!(
             "TLS Cert: {} (pre-loaded, {} bytes)",
             tls_cert_path,
@@ -828,8 +833,7 @@ pub fn run() {
         info!("TLS loading method: memfd (Landlock compatible)");
         info!("============================================");
 
-        // TCP側と同様に複数スレッドで起動（SO_REUSEPORTでパケット分散）
-        for thread_id in 0..num_threads {
+        for thread_id in 0..http3_workers {
             let cert_pem = tls_cert_pem.clone();
             let key_pem = tls_key_pem.clone();
             let addr = http3_addr;

@@ -387,7 +387,10 @@ impl Http3Handler {
 
     /// HTTP/3 コネクションを初期化（QUIC 確立後）
     fn init_h3(&mut self) -> io::Result<()> {
-        if self.h3_conn.is_none() && self.conn.is_established() {
+        if self.h3_conn.is_none()
+            && self.conn.is_established()
+            && !self.conn.is_closed()
+        {
             let h3_config = h3::Config::new().map_err(|e| io::Error::other(e.to_string()))?;
             let h3 = h3::Connection::with_transport(&mut self.conn, &h3_config)
                 .map_err(|e| io::Error::other(e.to_string()))?;
@@ -3070,6 +3073,14 @@ pub async fn run_http3_server_async(
                         Err(e) => {
                             warn!("[HTTP/3] recv error: {}", e);
                             // エラー時も送信処理は続行
+                        }
+                    }
+
+                    // B-34: クライアントがハンドシェイク直後に HTTP/3 フレームを送るため、
+                    // 次の recv やメインループ待ちの前に h3 レイヤを確立する（StreamLimit 回避）。
+                    if handler.conn.is_established() {
+                        if let Err(e) = handler.init_h3() {
+                            warn!("[HTTP/3] eager init_h3 error: {}", e);
                         }
                     }
                 }

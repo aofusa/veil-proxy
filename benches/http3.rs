@@ -212,7 +212,9 @@ fn send_http3_request(port: u16, _path: &str) -> Result<usize, Box<dyn std::erro
     config.set_initial_max_data(10_000_000);
     config.set_initial_max_stream_data_bidi_local(1_000_000);
     config.set_initial_max_stream_data_bidi_remote(1_000_000);
+    config.set_initial_max_stream_data_uni(1_000_000);
     config.set_initial_max_streams_bidi(100);
+    config.set_initial_max_streams_uni(100);
     config.set_disable_active_migration(true);
 
     // ローカルアドレスをバインド

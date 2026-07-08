@@ -55,7 +55,10 @@ fn send_http3_get(host: &str, port: u16, path: &str) -> Result<usize, Box<dyn st
     config.set_initial_max_data(10_000_000);
     config.set_initial_max_stream_data_bidi_local(1_000_000);
     config.set_initial_max_stream_data_bidi_remote(1_000_000);
+    config.set_initial_max_stream_data_uni(1_000_000);
     config.set_initial_max_streams_bidi(100);
+    // サーバが HTTP/3 制御/QPACK 用の uni ストリームを開くために必須（未設定時 0 で StreamLimit）
+    config.set_initial_max_streams_uni(100);
     config.set_disable_active_migration(true);
 
     let local_addr: SocketAddr = "0.0.0.0:0".parse()?;
@@ -102,6 +105,27 @@ fn send_http3_get(host: &str, port: u16, path: &str) -> Result<usize, Box<dyn st
         }
         while let Ok((write, _)) = conn.send(&mut out) {
             socket.send(&out[..write])?;
+        }
+    }
+
+    // ハンドシェイク完了後、サーバが h3 レイヤを確立する猶予を与える（StreamLimit レース回避）
+    let settle_start = Instant::now();
+    while settle_start.elapsed() < Duration::from_millis(500) {
+        while let Ok((write, _)) = conn.send(&mut out) {
+            socket.send(&out[..write])?;
+        }
+        match socket.recv(&mut buf) {
+            Ok(len) => {
+                let recv_info = quiche::RecvInfo {
+                    from: peer_addr,
+                    to: socket.local_addr()?,
+                };
+                let _ = conn.recv(&mut buf[..len], recv_info);
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => return Err(Box::new(e)),
         }
     }
 
