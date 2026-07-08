@@ -42,6 +42,8 @@ PROXY_HTTPS_PORT=8443
 PROXY_HTTP_PORT=8080
 PROXY_H2C_PORT=8081
 PROXY_L4_PORT=8444
+PROXY_L4_LEAST_CONN_PORT=8445
+PROXY_L4_TERMINATE_PORT=8446
 BACKEND1_PORT=9001
 BACKEND2_PORT=9002
 BACKEND_H2C_TLS_PORT=9013
@@ -84,21 +86,51 @@ check_ktls_available() {
     return 1
 }
 
-# veilバイナリの存在確認・ビルド
-# E2Eテストではすべてのfeaturesを有効化してビルドします
+# ビルド済みバイナリの存在・実行可能性を確認（最大 timeout 秒）
+wait_for_binary_ready() {
+    local bin="$1"
+    local label="$2"
+    local timeout_secs="${3:-300}"
+    local waited=0
+    while [ "$waited" -lt "$timeout_secs" ]; do
+        if [ -f "$bin" ] && [ -x "$bin" ]; then
+            log_info "${label} ready: $bin"
+            return 0
+        fi
+        sleep 0.5
+        waited=$((waited + 1))
+    done
+    log_error "${label} not ready after ${timeout_secs}s: $bin"
+    return 1
+}
+
+# E2E に必要な全バイナリをビルドし、完了を確認してから次フェーズへ進む
 # features: full（全機能有効）
 ensure_veil_binary() {
-    log_info "Building veil with all features enabled (full)..."
+    local grpc_bin="${SCRIPT_DIR}/grpc_server/target/debug/grpc-server"
+    local backends_bin="${SCRIPT_DIR}/test_backends/target/debug/test-backends"
+
+    log_info "Building all E2E binaries (veil + grpc-server + test-backends) with features full..."
     cd "$PROJECT_DIR"
-    cargo build --features 'full'
-    cd - > /dev/null
-    
-    if [ ! -f "$VEIL_BIN" ]; then
-        log_error "Failed to build veil binary"
+    if ! cargo build --features 'full'; then
+        log_error "cargo build --features full failed"
         exit 1
     fi
-    
-    log_info "Using veil binary: $VEIL_BIN"
+    if ! (cd "${SCRIPT_DIR}/grpc_server" && cargo build --quiet); then
+        log_error "grpc_server build failed"
+        exit 1
+    fi
+    if ! (cd "${SCRIPT_DIR}/test_backends" && cargo build --quiet); then
+        log_error "test_backends build failed"
+        exit 1
+    fi
+    cd - > /dev/null
+
+    wait_for_binary_ready "$VEIL_BIN" "veil" 300 || exit 1
+    wait_for_binary_ready "$grpc_bin" "grpc-server" 120 || exit 1
+    wait_for_binary_ready "$backends_bin" "test-backends" 120 || exit 1
+
+    log_info "All E2E binaries built and verified"
 }
 
 # フィクスチャディレクトリの準備
@@ -205,6 +237,15 @@ prepare_fixtures() {
 # 引数: 設定タイプ (default|cache|buffering|healthcheck|least_conn|ip_hash)
 generate_configs() {
     local config_type="${1:-default}"
+
+    # kTLS: カーネルが対応している場合のみ有効化（E2E でデータプレーンを検証）
+    local ktls_enabled="false"
+    if check_ktls_available; then
+        ktls_enabled="true"
+        log_info "kTLS available on this host — enabling ktls_enabled in E2E configs"
+    else
+        log_warn "kTLS not available — E2E configs use ktls_enabled = false"
+    fi
     
     # バックエンド1設定（静的ファイル配信）
     cat > "${FIXTURES_DIR}/backend1.toml" << EOF
@@ -215,7 +256,7 @@ threads = 1
 [tls]
 cert_path = "${FIXTURES_DIR}/cert.pem"
 key_path = "${FIXTURES_DIR}/key.pem"
-ktls_enabled = false
+ktls_enabled = ${ktls_enabled}
 
 [logging]
 level = "warn"
@@ -252,7 +293,7 @@ threads = 1
 [tls]
 cert_path = "${FIXTURES_DIR}/cert.pem"
 key_path = "${FIXTURES_DIR}/key.pem"
-ktls_enabled = false
+ktls_enabled = ${ktls_enabled}
 
 [logging]
 level = "warn"
@@ -295,7 +336,7 @@ h2c_enabled = true
 [tls]
 cert_path = "${FIXTURES_DIR}/cert.pem"
 key_path = "${FIXTURES_DIR}/key.pem"
-ktls_enabled = false
+ktls_enabled = ${ktls_enabled}
 # 注意: H2C専用サーバーのため、TLS証明書は使用されないが、設定ファイルの検証で必要
 
 [logging]
@@ -350,7 +391,7 @@ http3_enabled = true
 [tls]
 cert_path = "${FIXTURES_DIR}/cert.pem"
 key_path = "${FIXTURES_DIR}/key.pem"
-ktls_enabled = false
+ktls_enabled = ${ktls_enabled}
 # F-50: cipher_suites の取捨選択・優先度（記載順 = サーバ優先度順）検証用。
 # CHACHA20 系を意図的に除外し、E2E で「除外スイートは拒否・先頭スイートが優先」を検証する。
 cipher_suites = [
@@ -397,6 +438,29 @@ tls = "passthrough"
 
   [[l4.upstreams]]
   addr = "127.0.0.1:${BACKEND2_PORT}"
+
+# L4 TCP プロキシ（Least Connection 負荷分散）
+[[l4]]
+name = "l4-least-conn"
+listen = "127.0.0.1:${PROXY_L4_LEAST_CONN_PORT}"
+lb = "least_conn"
+tls = "passthrough"
+
+  [[l4.upstreams]]
+  addr = "127.0.0.1:${BACKEND1_PORT}"
+
+  [[l4.upstreams]]
+  addr = "127.0.0.1:${BACKEND2_PORT}"
+
+# L4 TCP プロキシ（TLS 終端 → 平文 HTTP バックエンドへ転送）
+[[l4]]
+name = "l4-tls-terminate"
+listen = "127.0.0.1:${PROXY_L4_TERMINATE_PORT}"
+lb = "round_robin"
+tls = "terminate"
+
+  [[l4.upstreams]]
+  addr = "127.0.0.1:${BACKEND_ECHO_PORT}"
 
 [upstreams."backend-pool"]
 algorithm = "${algorithm}"
@@ -480,6 +544,56 @@ algorithm = "round_robin"
 servers = [
     "http://127.0.0.1:${BACKEND_BAD_PORT}"
 ]
+
+# SNI 上書き検証用（IP 直打ち + sni_name = localhost）
+[upstreams."sni-pool"]
+algorithm = "round_robin"
+servers = [
+    { url = "https://127.0.0.1:${BACKEND1_PORT}", sni_name = "localhost" }
+]
+tls_insecure = true
+
+# 厳密証明書検証用（自己署名証明書は拒否される想定）
+[upstreams."strict-cert-pool"]
+algorithm = "round_robin"
+servers = [
+    "https://127.0.0.1:${BACKEND1_PORT}"
+]
+tls_insecure = false
+
+# TCP ヘルスチェック検証用
+[upstreams."tcp-health-pool"]
+algorithm = "round_robin"
+servers = [
+    "https://127.0.0.1:${BACKEND1_PORT}"
+]
+tls_insecure = true
+
+[upstreams."tcp-health-pool".health_check]
+enabled = true
+check_type = "tcp"
+interval_secs = 2
+timeout_secs = 2
+healthy_threshold = 1
+unhealthy_threshold = 3
+use_tls = true
+verify_cert = false
+
+# gRPC ヘルスチェック検証用
+[upstreams."grpc-health-pool"]
+algorithm = "round_robin"
+servers = [
+    "http://127.0.0.1:${BACKEND_GRPC_PORT}"
+]
+
+[upstreams."grpc-health-pool".health_check]
+enabled = true
+check_type = "grpc"
+path = "grpc.health.v1.Health"
+interval_secs = 2
+timeout_secs = 3
+healthy_threshold = 1
+unhealthy_threshold = 3
 EOF
 
     # ヘルスチェック設定を追加（healthcheckタイプの時のみ有効化）
@@ -501,8 +615,8 @@ EOF
     # NOTE: Global [route.cache] and [route.buffering] are removed to avoid TOML duplicate key error.
     # Specific route settings below will handle them.
     
-    # バッファリングモード別のルート設定（streaming, full, adaptive）
-    if [ "$config_type" = "buffering" ] || [ "$config_type" = "default" ]; then
+    # バッファリング・キャッシュモード別のルート設定（streaming, full, adaptive, cached）
+    if [ "$config_type" = "buffering" ] || [ "$config_type" = "default" ] || [ "$config_type" = "cache" ]; then
         cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
 
 [[route]]
@@ -527,7 +641,62 @@ mode = "full"
 
 [[route]]
 [route.conditions]
+host = "127.0.0.1"
+path = "/streaming/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+[route.buffering]
+mode = "streaming"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/full/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+[route.buffering]
+mode = "full"
+
+[[route]]
+[route.conditions]
 host = "localhost"
+path = "/adaptive/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+[route.buffering]
+mode = "adaptive"
+adaptive_threshold = 4096
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/adaptive/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+[route.buffering]
+mode = "adaptive"
+adaptive_threshold = 4096
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/cached/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+[route.cache]
+enabled = true
+default_ttl_secs = 1
+methods = ["GET"]
+cacheable_statuses = [200]
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
 path = "/cached/*"
 [route.action]
 type = "Proxy"
@@ -539,6 +708,102 @@ methods = ["GET"]
 cacheable_statuses = [200]
 EOF
     fi
+
+    # security プロファイル: レート制限・接続制限を集中検証
+    if [ "$config_type" = "security" ] || [ "$config_type" = "default" ]; then
+        cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/rate-limited/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+[route.security]
+rate_limit_requests_per_min = 30
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/rate-limited/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+[route.security]
+rate_limit_requests_per_min = 30
+EOF
+    fi
+
+    # バックエンド接続オプション検証ルート（SNI / 厳密証明書 / ヘルスチェック種別）
+    cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/sni-upstream/*"
+[route.action]
+type = "Proxy"
+upstream = "sni-pool"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/sni-upstream/*"
+[route.action]
+type = "Proxy"
+upstream = "sni-pool"
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/strict-cert/*"
+[route.action]
+type = "Proxy"
+upstream = "strict-cert-pool"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/strict-cert/*"
+[route.action]
+type = "Proxy"
+upstream = "strict-cert-pool"
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/tcp-health/*"
+[route.action]
+type = "Proxy"
+upstream = "tcp-health-pool"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/tcp-health/*"
+[route.action]
+type = "Proxy"
+upstream = "tcp-health-pool"
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/grpc-health/*"
+[route.action]
+type = "Proxy"
+upstream = "grpc-health-pool"
+use_h2c = true
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/grpc-health/*"
+[route.action]
+type = "Proxy"
+upstream = "grpc-health-pool"
+use_h2c = true
+EOF
     
 
     # gRPC/H2C ルート設定 (優先順位を上げるため先に定義)
@@ -1236,17 +1501,15 @@ start_servers() {
     echo $! >> "$PIDS_FILE"
     log_info "H2C Backend started on port ${BACKEND_H2C_PORT} (PID: $!)"
 
-    # gRPCバックエンド起動（スタンドアロンEchoサーバー）
-    log_info "Building and starting gRPC Echo Backend..."
-    (cd "${SCRIPT_DIR}/grpc_server" && cargo build --quiet)
+    # gRPCバックエンド起動（スタンドアロンEchoサーバー、ビルドは ensure_veil_binary で完了済み）
+    log_info "Starting gRPC Echo Backend..."
     RUST_LOG=debug "${SCRIPT_DIR}/grpc_server/target/debug/grpc-server" > /tmp/grpc_server.log 2>&1 &
     echo $! >> "$PIDS_FILE"
     log_info "gRPC Echo Backend started on port ${BACKEND_GRPC_PORT} (PID: $!, logs: /tmp/grpc_server.log)"
 
     # テストバックエンド起動（WebSocket Echo + HTTP 500エラー + chunked ストリーミング）
-    # Rustバイナリ: tests/test_backends/
-    log_info "Building and starting Rust test backends (WS echo + HTTP error + chunked + body-echo)..."
-    (cd "${SCRIPT_DIR}/test_backends" && cargo build --quiet)
+    # ビルドは ensure_veil_binary で完了済み
+    log_info "Starting Rust test backends (WS echo + HTTP error + chunked + body-echo)..."
     WS_PORT="${BACKEND_WS_PORT}" ERROR_PORT="${BACKEND_ERROR_PORT}" BAD_PORT="${BACKEND_BAD_PORT}" CHUNKED_PORT="${BACKEND_CHUNKED_PORT}" ECHO_PORT="${BACKEND_ECHO_PORT}" \
         TLS_ECHO_PORT="${BACKEND_TLS_ECHO_PORT}" TLS_CERT_PATH="${FIXTURES_DIR}/cert.pem" TLS_KEY_PATH="${FIXTURES_DIR}/key.pem" \
         RUST_LOG=info "${SCRIPT_DIR}/test_backends/target/debug/test-backends" \
@@ -1404,7 +1667,7 @@ check_port_conflicts() {
     log_info "Checking for port conflicts..."
     local conflicts=0
     
-    for port in $PROXY_HTTPS_PORT $PROXY_HTTP_PORT $PROXY_H2C_PORT $PROXY_L4_PORT $BACKEND1_PORT $BACKEND2_PORT $BACKEND_H2C_PORT $BACKEND_GRPC_PORT $BACKEND_WS_PORT $BACKEND_ERROR_PORT; do
+    for port in $PROXY_HTTPS_PORT $PROXY_HTTP_PORT $PROXY_H2C_PORT $PROXY_L4_PORT $PROXY_L4_LEAST_CONN_PORT $PROXY_L4_TERMINATE_PORT $BACKEND1_PORT $BACKEND2_PORT $BACKEND_H2C_PORT $BACKEND_GRPC_PORT $BACKEND_WS_PORT $BACKEND_ERROR_PORT $BACKEND_BAD_PORT $BACKEND_CHUNKED_PORT $BACKEND_ECHO_PORT $BACKEND_TLS_ECHO_PORT; do
         if check_port_in_use "$port"; then
             log_error "Port $port is already in use"
             conflicts=$((conflicts + 1))
@@ -1711,7 +1974,7 @@ for arg in "$@"; do
         musl)
             VEIL_IMAGE="veil:musl"
             ;;
-        default|cache|buffering|healthcheck|least_conn|ip_hash|wasm|security)
+        default|cache|buffering|healthcheck|least_conn|ip_hash|wasm|security|ktls)
             CONFIG_TYPE="$arg"
             ;;
         "")
@@ -1822,7 +2085,8 @@ case "${COMMAND}" in
         echo "  healthcheck  - Enable health checks"
         echo "  least_conn   - Use least connections algorithm"
         echo "  ip_hash      - Use IP hash algorithm"
-        echo "  security     - Enable security features (rate limiting, IP restriction)"
+        echo "  security     - Enable security features (rate limiting on /rate-limited/*)"
+        echo "  ktls         - Alias for default (kTLS auto-enabled when kernel supports it)"
         echo ""
         echo "Run Mode (optional, default: host):"
         echo "  container        - Run the proxy from the veil container image (default veil:glibc)."

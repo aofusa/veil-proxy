@@ -82,9 +82,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    // gRPC Health Checking Protocol（E2E の grpc ヘルスチェック検証用）
+    let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+    health_reporter
+        .set_serving::<TestServiceServer<MyTestService>>()
+        .await;
+
     println!("gRPC Test Server listening on {}", addr);
 
     Server::builder()
+        .add_service(health_service)
         .add_service(TestServiceServer::new(test_service))
         .serve(addr)
         .await?;

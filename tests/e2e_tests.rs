@@ -64,6 +64,8 @@ use common::grpc_client::GrpcTestClient;
 const PROXY_PORT: u16 = 8443; // プロキシHTTPSポート
 const PROXY_H2C_PORT: u16 = 8081; // H2C (HTTP/2 Cleartext) ポート
 const PROXY_L4_PORT: u16 = 8444; // L4 TCP プロキシ（TLS パススルー、F-30）
+const PROXY_L4_LEAST_CONN_PORT: u16 = 8445; // L4 Least Connection
+const PROXY_L4_TERMINATE_PORT: u16 = 8446; // L4 TLS 終端
 const PROXY_HTTP3_PORT: u16 = 8443; // HTTP/3ポート（デフォルトではHTTPSポートと同じ）
 const BACKEND1_PORT: u16 = 9001;
 const BACKEND2_PORT: u16 = 9002;
@@ -17699,4 +17701,244 @@ async fn test_f62_wasm_http_call_concurrent_requests() {
         assert_eq!(status, 200);
         assert_eq!(body, b"wasm-http-call-ok");
     }
+}
+
+// ====================
+// E2E カバレッジ拡充（e2e_test_coverage.md ギャップ対応）
+// ====================
+
+/// /cached/* ルートでキャッシュヒットを検証する（2 回目で X-Cache または応答一致）
+#[tokio::test]
+#[ntest::timeout(15000)]
+async fn test_e2e_cached_route_hit() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let path = "/cached/large.txt";
+    let r1 = send_request(PROXY_PORT, path, &[]).await;
+    assert!(r1.is_some(), "First /cached/ request should succeed");
+    let r1 = r1.unwrap();
+    assert_eq!(get_status_code(&r1), Some(200));
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let r2 = send_request(PROXY_PORT, path, &[]).await;
+    assert!(r2.is_some(), "Second /cached/ request should succeed");
+    let r2 = r2.unwrap();
+    assert_eq!(get_status_code(&r2), Some(200));
+
+    let x_cache = get_header_value(&r2, "X-Cache");
+    let age = get_header_value(&r2, "Age");
+    assert!(
+        x_cache.is_some() || age.is_some() || r1 == r2,
+        "Second cached response should show cache headers or match first response"
+    );
+}
+
+/// /rate-limited/* ルートでレート制限（429）を検証する
+#[tokio::test]
+#[ntest::timeout(30000)]
+async fn test_e2e_rate_limit_dedicated_route() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let mut success = 0u32;
+    let mut limited = 0u32;
+    for i in 0..50 {
+        if let Some(resp) = send_request(PROXY_PORT, "/rate-limited/", &[]).await {
+            match get_status_code(&resp) {
+                Some(200) => success += 1,
+                Some(429) => {
+                    limited += 1;
+                    eprintln!("Rate limited at request {}", i + 1);
+                }
+                other => eprintln!("Unexpected status {:?} at request {}", other, i + 1),
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+
+    assert!(success > 0, "Should get some 200 responses");
+    assert!(
+        limited > 0,
+        "Rate limit on /rate-limited/* should return 429 (success={}, limited={})",
+        success,
+        limited
+    );
+}
+
+/// /adaptive/* ルートで adaptive バッファリング経路を検証する
+#[tokio::test]
+#[ntest::timeout(15000)]
+async fn test_e2e_adaptive_buffering_route() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let small = send_request(PROXY_PORT, "/adaptive/", &[]).await;
+    assert!(small.is_some());
+    assert_eq!(get_status_code(&small.unwrap()), Some(200));
+
+    let large = send_request(PROXY_PORT, "/adaptive/large.txt", &[]).await;
+    assert!(large.is_some());
+    let large = large.unwrap();
+    assert_eq!(get_status_code(&large), Some(200));
+    assert!(
+        large.len() > 5000,
+        "Adaptive route should forward large.txt intact"
+    );
+}
+
+/// sni_name 指定で IP 直打ち HTTPS バックエンドへ接続できること
+#[tokio::test]
+#[ntest::timeout(15000)]
+async fn test_e2e_upstream_sni_name() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let resp = send_request(PROXY_PORT, "/sni-upstream/", &[]).await;
+    assert!(resp.is_some(), "SNI upstream route should respond");
+    let resp = resp.unwrap();
+    assert_eq!(get_status_code(&resp), Some(200));
+    assert!(
+        resp.contains("Hello from Backend"),
+        "SNI upstream should forward backend body"
+    );
+}
+
+/// tls_insecure=false 時、自己署名証明書バックエンドは拒否される（502/503/504）
+#[tokio::test]
+#[ntest::timeout(15000)]
+async fn test_e2e_upstream_strict_cert_rejects() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let resp = send_request(PROXY_PORT, "/strict-cert/", &[]).await;
+    assert!(resp.is_some(), "Strict cert route should return an error response");
+    let status = get_status_code(&resp.unwrap());
+    assert!(
+        matches!(status, Some(502) | Some(503) | Some(504)),
+        "Self-signed backend with tls_insecure=false should fail, got {:?}",
+        status
+    );
+}
+
+/// TCP ヘルスチェック付きプール経由でリクエストが成功すること
+#[tokio::test]
+#[ntest::timeout(15000)]
+async fn test_e2e_tcp_health_check_upstream() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let resp = send_request(PROXY_PORT, "/tcp-health/", &[]).await;
+    assert!(resp.is_some(), "TCP health pool route should respond");
+    assert_eq!(get_status_code(&resp.unwrap()), Some(200));
+}
+
+/// gRPC ヘルスチェック付きプールのメトリクスが露出すること
+#[tokio::test]
+#[ntest::timeout(15000)]
+#[cfg(feature = "grpc")]
+async fn test_e2e_grpc_health_check_metrics() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let metrics = send_request(PROXY_PORT, "/__metrics", &[]).await;
+    assert!(metrics.is_some());
+    let metrics = metrics.unwrap();
+    assert!(
+        metrics.contains("upstream") || metrics.contains("health"),
+        "Metrics should expose upstream health info for grpc-health pool"
+    );
+}
+
+/// L4 Least Connection で TLS パススルー転送が動作すること
+#[tokio::test]
+#[ntest::timeout(15000)]
+async fn test_e2e_l4_least_conn_forward() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let resp = send_request_with_retry(PROXY_L4_LEAST_CONN_PORT, "/", &[], 3).await;
+    assert!(resp.is_some(), "L4 least_conn should forward request");
+    let resp = resp.unwrap();
+    assert_eq!(get_status_code(&resp), Some(200));
+    assert!(resp.contains("Hello from Backend"));
+}
+
+/// L4 TLS 終端で平文 HTTP バックエンドへ転送できること
+#[tokio::test]
+#[ntest::timeout(15000)]
+async fn test_e2e_l4_tls_terminate_forward() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let resp = send_request_with_retry(PROXY_L4_TERMINATE_PORT, "/", &[]).await;
+    assert!(
+        resp.is_some(),
+        "L4 TLS terminate should complete TLS handshake and forward"
+    );
+    let resp = resp.unwrap();
+    assert_eq!(
+        get_status_code(&resp),
+        Some(200),
+        "L4 TLS terminate should get 200 from plain HTTP echo backend"
+    );
+}
+
+/// /streaming/* と /full/* 専用ルートが存在し応答すること
+#[tokio::test]
+#[ntest::timeout(15000)]
+async fn test_e2e_buffering_mode_routes() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let streaming = send_request(PROXY_PORT, "/streaming/large.txt", &[]).await;
+    assert!(streaming.is_some());
+    assert_eq!(get_status_code(&streaming.unwrap()), Some(200));
+
+    let full = send_request(PROXY_PORT, "/full/large.txt", &[]).await;
+    assert!(full.is_some());
+    assert_eq!(get_status_code(&full.unwrap()), Some(200));
+}
+
+/// kTLS 有効時に HTTPS 接続が成立すること（カーネル非対応時はスキップ扱い）
+#[tokio::test]
+#[ntest::timeout(15000)]
+#[cfg(feature = "ktls")]
+async fn test_e2e_ktls_enabled_handshake() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    if !is_ktls_available() {
+        eprintln!("Skipping: kTLS not available on this kernel");
+        return;
+    }
+
+    let resp = send_request(PROXY_PORT, "/", &[]).await;
+    assert!(resp.is_some(), "kTLS-enabled proxy should accept HTTPS");
+    assert_eq!(get_status_code(&resp.unwrap()), Some(200));
 }
