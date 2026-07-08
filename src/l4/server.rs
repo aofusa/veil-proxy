@@ -3,7 +3,7 @@
 use crate::config::{L4ListenerConfig, SHUTDOWN_FLAG};
 use crate::l4::health::{new_health_state, spawn_l4_health_checker};
 use crate::l4::proxy::{
-    handle_l4_connection, parse_upstream_addrs, L4ConnectionCounter, RoundRobinState,
+    handle_l4_connection, parse_upstream_targets, L4ConnectionCounter, RoundRobinState,
 };
 use crate::runtime::tcp::TcpListener;
 use crate::runtime::time::timeout;
@@ -21,17 +21,8 @@ pub fn spawn_l4_listeners(listeners: &[L4ListenerConfig]) {
             continue;
         }
 
-        // upstream アドレスを起動時に一度だけパース（hot path での DNS 解決を排除）
-        let parsed_addrs = match parse_upstream_addrs(config) {
-            Ok(addrs) => Arc::new(addrs),
-            Err(e) => {
-                error!(
-                    "[L4:{}] failed to parse upstream addresses: {}",
-                    config.name, e
-                );
-                continue;
-            }
-        };
+        // 起動時に解決できる上流はキャッシュ、未解決ホスト名は接続時に解決（B-33）
+        let upstream_targets = Arc::new(parse_upstream_targets(config));
 
         let config = Arc::new(config.clone());
         let n_upstreams = config.upstreams.len();
@@ -95,7 +86,7 @@ pub fn spawn_l4_listeners(listeners: &[L4ListenerConfig]) {
                     let _ = stream.set_nodelay(true);
 
                     let config_clone = config.clone();
-                    let parsed_addrs_clone = parsed_addrs.clone();
+                    let upstream_targets_clone = upstream_targets.clone();
                     let rr_clone = rr_state.clone();
                     let counters_clone = conn_counters.clone();
                     let listener_counter_clone = listener_counter.clone();
@@ -106,7 +97,7 @@ pub fn spawn_l4_listeners(listeners: &[L4ListenerConfig]) {
                             stream,
                             peer_addr,
                             config_clone,
-                            parsed_addrs_clone,
+                            upstream_targets_clone,
                             rr_clone,
                             counters_clone,
                             listener_counter_clone,

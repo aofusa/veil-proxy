@@ -132,12 +132,13 @@ fn send_http3_get(host: &str, port: u16, path: &str) -> Result<usize, Box<dyn st
                 };
                 conn.recv(&mut buf[..len], recv_info)?;
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
                 if conn.is_closed() {
                     break;
                 }
-                continue;
             }
             Err(e) => return Err(Box::new(e)),
         }

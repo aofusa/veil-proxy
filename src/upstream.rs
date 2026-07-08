@@ -545,7 +545,7 @@ pub fn find_backend_unified(
     source_ip: &SocketAddr,
     routes: &[Route],
     upstream_groups: &Arc<HashMap<String, Arc<UpstreamGroup>>>,
-) -> Option<(Box<[u8]>, Backend)> {
+) -> Option<(Box<[u8]>, Backend, Arc<CompressionConfig>)> {
     // CURRENT_CONFIG から OptimizedRouter を取得
     let config = CURRENT_CONFIG.load();
     let optimized_router = &config.optimized_router;
@@ -577,7 +577,9 @@ pub fn find_backend_unified(
             ) {
                 if let Ok(backend) = load_backend(route, upstream_groups) {
                     let prefix = extract_path_prefix(route);
-                    return Some((prefix, backend));
+                    let compression =
+                        Arc::new(route.compression.clone().unwrap_or_default());
+                    return Some((prefix, backend, compression));
                 }
             }
         }
@@ -627,9 +629,11 @@ pub fn find_backend_unified(
                 match load_backend(route, upstream_groups) {
                     Ok(backend) => {
                         let prefix = extract_path_prefix(route);
+                        let compression =
+                            Arc::new(route.compression.clone().unwrap_or_default());
                         // キャッシュに保存
                         optimized_router.cache_result(cache_key, Some(route_idx));
-                        return Some((prefix, backend));
+                        return Some((prefix, backend, compression));
                     }
                     Err(e) => {
                         warn!(
@@ -729,7 +733,7 @@ pub(crate) fn find_backend_linear(
     upstream_groups: &Arc<HashMap<String, Arc<UpstreamGroup>>>,
     cache_key: &routing::RouteCacheKey,
     optimized_router: &routing::OptimizedRouter,
-) -> Option<(Box<[u8]>, Backend)> {
+) -> Option<(Box<[u8]>, Backend, Arc<CompressionConfig>)> {
     // 配列の順序で評価（first-match）
     for (i, route) in routes.iter().enumerate() {
         let matched = matches_conditions(
@@ -750,9 +754,11 @@ pub(crate) fn find_backend_linear(
             match load_backend(route, upstream_groups) {
                 Ok(backend) => {
                     let prefix = extract_path_prefix(route);
+                    let compression =
+                        Arc::new(route.compression.clone().unwrap_or_default());
                     // キャッシュに保存
                     optimized_router.cache_result(*cache_key, Some(i));
-                    return Some((prefix, backend));
+                    return Some((prefix, backend, compression));
                 }
                 Err(e) => {
                     warn!(

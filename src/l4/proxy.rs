@@ -6,6 +6,7 @@ use crate::config::{L4LbAlgorithm, L4ListenerConfig, L4TlsMode, CURRENT_CONFIG};
 use crate::runtime::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
 use crate::runtime::splice::{splice, Pipe};
 use crate::runtime::tcp::TcpStream as IoUringTcpStream;
+use crate::runtime::offload::offload;
 use crate::runtime::time::timeout;
 
 #[cfg(feature = "ktls")]
@@ -74,20 +75,64 @@ impl Default for RoundRobinState {
     }
 }
 
-/// 設定ファイルのアドレス文字列を起動時に `SocketAddr` へ変換して保持する。
+/// L4 上流アドレス（起動時解決済み、または接続時に解決する未解決ホスト名）
+#[derive(Clone, Debug)]
+pub enum L4UpstreamTarget {
+    Resolved(SocketAddr),
+    Unresolved(Arc<str>),
+}
+
+/// 設定ファイルのアドレス文字列を L4 上流ターゲットへ変換する。
 ///
-/// hot path での DNS 解決（`to_socket_addrs` は blocking syscall）を排除するため、
-/// サーバ起動時に一度だけパースしてキャッシュする。
-pub fn parse_upstream_addrs(config: &L4ListenerConfig) -> Result<Vec<SocketAddr>, String> {
+/// 起動時に解決できるアドレスは `Resolved` としてキャッシュし、
+/// DNS 未解決（B-33）のホスト名は `Unresolved` として保持して接続時に解決する。
+pub fn parse_upstream_targets(config: &L4ListenerConfig) -> Vec<L4UpstreamTarget> {
     config
         .upstreams
         .iter()
         .map(|u| {
-            u.addr
-                .to_socket_addrs()
-                .map_err(|e| format!("failed to parse upstream addr '{}': {}", u.addr, e))?
-                .next()
-                .ok_or_else(|| format!("no address resolved for '{}'", u.addr))
+            if let Ok(addr) = u.addr.parse::<SocketAddr>() {
+                return L4UpstreamTarget::Resolved(addr);
+            }
+            if let Ok(mut addrs) = u.addr.to_socket_addrs() {
+                if let Some(addr) = addrs.next() {
+                    return L4UpstreamTarget::Resolved(addr);
+                }
+            }
+            L4UpstreamTarget::Unresolved(Arc::from(u.addr.as_str()))
+        })
+        .collect()
+}
+
+fn resolve_upstream_addr_sync(addr: &str) -> Option<SocketAddr> {
+    if let Ok(sa) = addr.parse::<SocketAddr>() {
+        return Some(sa);
+    }
+    addr.to_socket_addrs().ok().and_then(|mut iter| iter.next())
+}
+
+/// 接続時に上流 `SocketAddr` を解決する（未解決ホスト名は offload で DNS 解決）
+async fn resolve_upstream_target(target: &L4UpstreamTarget) -> Option<SocketAddr> {
+    match target {
+        L4UpstreamTarget::Resolved(addr) => Some(*addr),
+        L4UpstreamTarget::Unresolved(addr) => {
+            let addr = Arc::clone(addr);
+            offload(move || resolve_upstream_addr_sync(&addr)).await
+        }
+    }
+}
+
+/// 設定ファイルのアドレス文字列を起動時に `SocketAddr` へ変換して保持する。
+///
+/// 全上流が起動時に解決可能な場合のみ成功（単体テスト・後方互換用）。
+pub fn parse_upstream_addrs(config: &L4ListenerConfig) -> Result<Vec<SocketAddr>, String> {
+    parse_upstream_targets(config)
+        .into_iter()
+        .map(|target| match target {
+            L4UpstreamTarget::Resolved(addr) => Ok(addr),
+            L4UpstreamTarget::Unresolved(addr) => resolve_upstream_addr_sync(&addr).ok_or_else(|| {
+                format!("failed to parse upstream addr '{}': name resolution failed", addr)
+            }),
         })
         .collect()
 }
@@ -408,7 +453,7 @@ pub async fn handle_l4_connection(
     client: IoUringTcpStream,
     peer_addr: SocketAddr,
     config: Arc<L4ListenerConfig>,
-    parsed_addrs: Arc<Vec<SocketAddr>>,
+    upstream_targets: Arc<Vec<L4UpstreamTarget>>,
     rr_state: Arc<RoundRobinState>,
     conn_counters: Arc<Vec<AtomicUsize>>,
     listener_counter: Arc<L4ConnectionCounter>,
@@ -449,7 +494,7 @@ pub async fn handle_l4_connection(
             client,
             peer_addr,
             config,
-            parsed_addrs,
+            upstream_targets,
             rr_state,
             conn_counters,
             health_state,
@@ -489,12 +534,20 @@ pub async fn handle_l4_connection(
         idx: upstream_idx,
     };
 
-    // 起動時パース済み SocketAddr を使用（hot path での DNS 解決を排除）
-    let socket_addr = match parsed_addrs.get(upstream_idx) {
-        Some(a) => *a,
+    let socket_addr = match upstream_targets.get(upstream_idx) {
+        Some(target) => match resolve_upstream_target(target).await {
+            Some(a) => a,
+            None => {
+                warn!(
+                    "[L4:{}] failed to resolve upstream {}",
+                    config.name, upstream_addr_str
+                );
+                return;
+            }
+        },
         None => {
             warn!(
-                "[L4:{}] parsed_addrs index {} out of range",
+                "[L4:{}] upstream_targets index {} out of range",
                 config.name, upstream_idx
             );
             return;
@@ -504,7 +557,7 @@ pub async fn handle_l4_connection(
     let connect_timeout = Duration::from_secs(config.connect_timeout_secs);
     let upstream = match timeout(
         connect_timeout,
-        IoUringTcpStream::connect(socket_addr), // SocketAddr → blocking DNS なし
+        IoUringTcpStream::connect(socket_addr),
     )
     .await
     {
@@ -685,7 +738,7 @@ async fn handle_l4_tls_terminate_connection(
     client: IoUringTcpStream,
     peer_addr: SocketAddr,
     config: Arc<L4ListenerConfig>,
-    parsed_addrs: Arc<Vec<SocketAddr>>,
+    upstream_targets: Arc<Vec<L4UpstreamTarget>>,
     rr_state: Arc<RoundRobinState>,
     conn_counters: Arc<Vec<AtomicUsize>>,
     health_state: Arc<Vec<AtomicBool>>,
@@ -726,11 +779,20 @@ async fn handle_l4_tls_terminate_connection(
         idx: upstream_idx,
     };
 
-    let socket_addr = match parsed_addrs.get(upstream_idx) {
-        Some(a) => *a,
+    let socket_addr = match upstream_targets.get(upstream_idx) {
+        Some(target) => match resolve_upstream_target(target).await {
+            Some(a) => a,
+            None => {
+                warn!(
+                    "[L4:{}] failed to resolve upstream {}",
+                    config.name, upstream_addr_str
+                );
+                return;
+            }
+        },
         None => {
             warn!(
-                "[L4:{}] parsed_addrs index {} out of range",
+                "[L4:{}] upstream_targets index {} out of range",
                 config.name, upstream_idx
             );
             return;

@@ -1015,7 +1015,7 @@ async fn handle_h2_request_streaming<S>(
         }
     });
 
-    let (prefix, backend) = match backend_result {
+    let (prefix, backend, _route_compression) = match backend_result {
         Some(b) => b,
         None => return, // ルート無し → バッファ経路（404）にフォールバック
     };
@@ -1261,6 +1261,220 @@ fn log_streamed_access(
     );
 }
 
+/// HTTP/1.1 レスポンスバイト列からステータスコードとボディを抽出（管理 API Purge 用）
+#[cfg(all(feature = "http2", feature = "admin"))]
+fn parse_http1_admin_response(resp: &[u8]) -> (u16, Vec<u8>) {
+    let status = if resp.starts_with(b"HTTP/1.1 200") {
+        200
+    } else if resp.starts_with(b"HTTP/1.1 401") {
+        401
+    } else if resp.starts_with(b"HTTP/1.1 403") {
+        403
+    } else if resp.starts_with(b"HTTP/1.1 503") {
+        503
+    } else if resp.starts_with(b"HTTP/1.1 501") {
+        501
+    } else {
+        400
+    };
+    let body = resp
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| resp[i + 4..].to_vec())
+        .unwrap_or_default();
+    (status, body)
+}
+
+/// HTTP/2 管理 API 処理（B-29: HTTP/1.1 経路と同等の admin / cache purge）
+#[cfg(all(feature = "http2", feature = "admin"))]
+async fn handle_http2_admin_request<S>(
+    conn: &mut http2::Http2Connection<S>,
+    stream_id: u32,
+    method: &[u8],
+    path: &[u8],
+    client_ip: &str,
+    headers_raw: &[(&[u8], &[u8])],
+) -> Option<(u16, u64)>
+where
+    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
+{
+    let config = CURRENT_CONFIG.load();
+    let admin_config = &config.admin_config;
+    if !admin_config.enabled {
+        return None;
+    }
+
+    let path_str = std::str::from_utf8(path).unwrap_or("/");
+    let auth = headers_raw.iter().find_map(|(name, value)| {
+        if name.eq_ignore_ascii_case(b"authorization") {
+            std::str::from_utf8(value).ok()
+        } else {
+            None
+        }
+    });
+
+    let is_purge_method = method == b"PURGE";
+    let is_admin_purge_path = path_str.starts_with(&admin_config.cache_purge_prefix);
+
+    if is_purge_method || is_admin_purge_path {
+        let (status, body) = if !admin_config.is_ip_allowed(client_ip) {
+            (403, Vec::new())
+        } else if !admin_config.check_auth(auth) {
+            (401, Vec::new())
+        } else {
+            let resp = handle_cache_purge(path_str, is_purge_method);
+            parse_http1_admin_response(&resp)
+        };
+
+        let server_guard = get_server_header_guard();
+        let mut h2_headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+        if let Some(ref g) = server_guard {
+            h2_headers.push(g.as_header());
+        }
+        let body_ref = if body.is_empty() { None } else { Some(body.as_slice()) };
+        let _ = conn.send_response(stream_id, status, &h2_headers, body_ref).await;
+        return Some((status, body.len().max(0) as u64));
+    }
+
+    if !path_str.starts_with(&admin_config.path_prefix)
+        || method == b"PURGE"
+        || path_str.starts_with(&admin_config.cache_purge_prefix)
+    {
+        return None;
+    }
+
+    let path_suffix = &path_str[admin_config.path_prefix.len()..];
+    let is_known_endpoint = matches!(
+        (method, path_suffix),
+        (b"GET", "/config") | (b"GET", "/stats") | (b"POST", "/reload") | (b"POST", "/tls/reload")
+    );
+    if !is_known_endpoint {
+        return None;
+    }
+
+    let (status, body) = if !admin_config.is_ip_allowed(client_ip) {
+        (403, b"{\"error\":\"403\"}".to_vec())
+    } else if !admin_config.check_auth(auth) {
+        (401, b"{\"error\":\"401\"}".to_vec())
+    } else {
+        match (method, path_suffix) {
+            (b"GET", "/config") => {
+                let json = build_admin_config_json(&config);
+                (200, json.into_bytes())
+            }
+            (b"GET", "/stats") => {
+                let uptime_secs = PROXY_START_TIME.elapsed().as_secs();
+                let json = format!("{{\"uptime_secs\":{}}}", uptime_secs);
+                (200, json.into_bytes())
+            }
+            (b"POST", "/reload") => {
+                use std::sync::atomic::Ordering;
+                RELOAD_FLAG.store(true, Ordering::Relaxed);
+                (200, b"{\"ok\":true}".to_vec())
+            }
+            (b"POST", "/tls/reload") => {
+                use std::sync::atomic::Ordering;
+                TLS_RELOAD_FLAG.store(true, Ordering::Relaxed);
+                (200, b"{\"ok\":true}".to_vec())
+            }
+            _ => (404, Vec::new()),
+        }
+    };
+
+    let server_guard = get_server_header_guard();
+    let mut h2_headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(3);
+    h2_headers.push((b"content-type", b"application/json"));
+    if let Some(ref g) = server_guard {
+        h2_headers.push(g.as_header());
+    }
+    let body_ref = if body.is_empty() { None } else { Some(body.as_slice()) };
+    let _ = conn
+        .send_response(stream_id, status, &h2_headers, body_ref)
+        .await;
+    Some((status, body.len() as u64))
+}
+
+/// HTTP/2 応答ヘッダーへ WASM レスポンスフィルタを適用（B-30）
+#[cfg(all(feature = "http2", feature = "wasm"))]
+async fn apply_h2_wasm_response_headers(
+    wasm_modules: &Arc<Vec<String>>,
+    status: u16,
+    mut header_store: Vec<(Vec<u8>, Vec<u8>)>,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    if wasm_modules.is_empty() {
+        return header_store;
+    }
+    let config = CURRENT_CONFIG.load();
+    let Some(ref wasm_engine) = config.wasm_filter_engine else {
+        return header_store;
+    };
+
+    let wasm_result = wasm_engine
+        .clone()
+        .on_response_headers_with_modules_async(
+            wasm_modules.clone(),
+            status,
+            header_store.clone(),
+            true,
+        )
+        .await;
+
+    if let crate::wasm::FilterResult::Continue {
+        headers: modified_headers,
+        ..
+    } = wasm_result
+    {
+        header_store = modified_headers;
+    }
+    header_store
+}
+
+/// HTTP/2 静的応答の圧縮ネゴシエーションとヘッダー構築（B-32）
+#[cfg(feature = "http2")]
+fn build_h2_compressed_file_response(
+    data: &[u8],
+    mime_type: &str,
+    security: &SecurityConfig,
+    compression: &CompressionConfig,
+    client_encoding: AcceptedEncoding,
+) -> (Vec<(Vec<u8>, Vec<u8>)>, Vec<u8>) {
+    let should_compress = compression.should_compress(
+        client_encoding,
+        Some(mime_type.as_bytes()),
+        Some(data.len()),
+        None,
+    );
+
+    let mut header_store: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(8);
+    header_store.push((b"content-type".to_vec(), mime_type.as_bytes().to_vec()));
+    if let Some(ref g) = get_server_header_guard() {
+        let (n, v) = g.as_header();
+        header_store.push((n.to_vec(), v.to_vec()));
+    }
+    for (k, v) in &security.add_response_headers {
+        header_store.push((k.as_bytes().to_vec(), v.as_bytes().to_vec()));
+    }
+
+    let response_body = if let Some(enc) = should_compress {
+        let encoding_name: &[u8] = match enc {
+            AcceptedEncoding::Zstd => b"zstd",
+            AcceptedEncoding::Brotli => b"br",
+            AcceptedEncoding::Gzip => b"gzip",
+            AcceptedEncoding::Deflate => b"deflate",
+            AcceptedEncoding::Identity => b"",
+        };
+        if !encoding_name.is_empty() {
+            header_store.push((b"content-encoding".to_vec(), encoding_name.to_vec()));
+            header_store.push((b"vary".to_vec(), b"Accept-Encoding".to_vec()));
+        }
+        compress_body_h2(data, enc, compression)
+    } else {
+        data.to_vec()
+    };
+
+    (header_store, response_body)
+}
+
 /// HTTP/2 単一リクエスト処理
 #[cfg(feature = "http2")]
 async fn handle_http2_single_request<S>(
@@ -1333,6 +1547,14 @@ where
         .map(|(k, v)| (k.as_slice(), v.as_slice()))
         .collect();
 
+    // 管理 API（B-29: HTTP/2 経路でも /__admin へ到達可能にする）
+    #[cfg(feature = "admin")]
+    if let Some(result) =
+        handle_http2_admin_request(conn, stream_id, method, path, client_ip, &headers_raw).await
+    {
+        return Some(result);
+    }
+
     // パス/クエリ分離（スキャンを1回に統一）
     let query_start_pos = path.iter().position(|&b| b == b'?');
     let raw_query: &[u8] = query_start_pos.map(|i| &path[i + 1..]).unwrap_or(b"");
@@ -1384,7 +1606,7 @@ where
         }
     });
 
-    let (prefix, backend) = match backend_result {
+    let (prefix, backend, route_compression) = match backend_result {
         Some(b) => b,
         None => {
             warn!(
@@ -1554,26 +1776,37 @@ where
                     .await;
                 Some((404, 9))
             } else {
-                let server_guard = get_server_header_guard();
-                let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(4);
-                headers.push((b"content-type", mime_type.as_bytes()));
-                if let Some(ref g) = server_guard {
-                    headers.push(g.as_header());
+                let (mut header_store, response_body) = build_h2_compressed_file_response(
+                    &data,
+                    mime_type.as_ref(),
+                    &security,
+                    &route_compression,
+                    client_encoding,
+                );
+
+                #[cfg(feature = "wasm")]
+                {
+                    header_store = apply_h2_wasm_response_headers(
+                        &wasm_modules_to_apply,
+                        200,
+                        header_store,
+                    )
+                    .await;
                 }
 
-                // セキュリティヘッダー追加
-                for (k, v) in &security.add_response_headers {
-                    headers.push((k.as_bytes(), v.as_bytes()));
-                }
+                let headers: Vec<(&[u8], &[u8])> = header_store
+                    .iter()
+                    .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                    .collect();
 
                 if let Err(e) = conn
-                    .send_response(stream_id, 200, &headers, Some(&data))
+                    .send_response(stream_id, 200, &headers, Some(&response_body))
                     .await
                 {
                     warn!("[HTTP/2] Memory file response error: {}", e);
                     None
                 } else {
-                    Some((200, data.len() as u64))
+                    Some((200, response_body.len() as u64))
                 }
             }
         }
@@ -1595,6 +1828,10 @@ where
                 path,
                 &prefix,
                 &security,
+                &route_compression,
+                client_encoding,
+                #[cfg(feature = "wasm")]
+                &wasm_modules_to_apply,
             )
             .await
         }
@@ -2908,6 +3145,9 @@ async fn handle_http2_sendfile<S>(
     req_path: &[u8],
     prefix: &[u8],
     security: &SecurityConfig,
+    compression: &CompressionConfig,
+    client_encoding: AcceptedEncoding,
+    #[cfg(feature = "wasm")] wasm_modules: &Arc<Vec<String>>,
 ) -> Option<(u16, u64)>
 where
     S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
@@ -2989,27 +3229,34 @@ where
     let mime_type = mime_guess::from_path(&file_path).first_or_octet_stream();
     let mime_str = mime_type.as_ref();
 
-    let server_guard = get_server_header_guard();
-    let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(4);
-    headers.push((b"content-type", mime_str.as_bytes()));
-    if let Some(ref g) = server_guard {
-        headers.push(g.as_header());
+    let (mut header_store, response_body) = build_h2_compressed_file_response(
+        &data,
+        mime_str,
+        security,
+        compression,
+        client_encoding,
+    );
+
+    #[cfg(feature = "wasm")]
+    {
+        header_store =
+            apply_h2_wasm_response_headers(wasm_modules, 200, header_store).await;
     }
 
-    // セキュリティヘッダー追加
-    for (k, v) in &security.add_response_headers {
-        headers.push((k.as_bytes(), v.as_bytes()));
-    }
+    let headers: Vec<(&[u8], &[u8])> = header_store
+        .iter()
+        .map(|(k, v)| (k.as_slice(), v.as_slice()))
+        .collect();
 
     if let Err(e) = conn
-        .send_response(stream_id, 200, &headers, Some(&data))
+        .send_response(stream_id, 200, &headers, Some(&response_body))
         .await
     {
         warn!("[HTTP/2] File response error: {}", e);
         return None;
     }
 
-    Some((200, data.len() as u64))
+    Some((200, response_body.len() as u64))
 }
 
 /// HTTP/2 リダイレクト処理
@@ -4066,7 +4313,7 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                 // ルーティング完了後に req をドロップ（accumulated の borrow を解放）
                 drop(req);
 
-                let (prefix, backend) = match backend_result {
+                let (prefix, backend, _route_compression) = match backend_result {
                     Some(b) => b,
                     None => {
                         let err_buf = ERR_MSG_NOT_FOUND.to_vec();

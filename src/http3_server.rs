@@ -656,7 +656,7 @@ impl Http3Handler {
             }
         });
 
-        let (prefix, backend) = match backend_result {
+        let (prefix, backend, _route_compression) = match backend_result {
             Some(b) => b,
             None => return Decision::Buffer, // handle_request -> 404（gRPC 含む）
         };
@@ -925,7 +925,7 @@ impl Http3Handler {
             }
         });
 
-        let (prefix, backend) = match backend_result {
+        let (prefix, backend, _route_compression) = match backend_result {
             Some(b) => b,
             None => {
                 debug!(
