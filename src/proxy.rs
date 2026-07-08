@@ -1149,9 +1149,16 @@ async fn handle_h2_request_streaming<S>(
     // ストリーミングアップロードはスループット優先のため Nagle を有効のままにする
     // （チャンクヘッダ/ペイロード/CRLF の小書き込みをカーネルが結合する）
 
+    let tls_insecure = upstream_group.tls_insecure();
     let (status, resp_size, req_body_size, deferred) = if use_tls {
-        let connector = get_tls_connector();
-        match timeout(CONNECT_TIMEOUT, connector.connect(backend_tcp, &sni)).await {
+        let tls_result = if tls_insecure {
+            let connector = get_tls_connector_insecure();
+            timeout(CONNECT_TIMEOUT, connector.connect(backend_tcp, &sni)).await
+        } else {
+            let connector = get_tls_connector();
+            timeout(CONNECT_TIMEOUT, connector.connect(backend_tcp, &sni)).await
+        };
+        match tls_result {
             Ok(Ok(mut backend)) => {
                 run_h2_request_streaming(
                     conn,
@@ -1745,6 +1752,7 @@ where
             compression,
             client_encoding,
             security,
+            upstream_group.tls_insecure(),
         )
         .await
     } else {
@@ -2685,6 +2693,7 @@ async fn handle_http2_proxy_https<S>(
     compression: &CompressionConfig,
     client_encoding: AcceptedEncoding,
     security: &SecurityConfig,
+    tls_insecure: bool,
 ) -> Option<(u16, u64)>
 where
     S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
@@ -2729,9 +2738,14 @@ where
                 }
             };
 
-            // TLS ハンドシェイク
-            let connector = get_tls_connector();
-            let tls_result = timeout(CONNECT_TIMEOUT, connector.connect(backend_tcp, sni)).await;
+            // TLS ハンドシェイク（tls_insecure 時は自己署名証明書を許可）
+            let tls_result = if tls_insecure {
+                let connector = get_tls_connector_insecure();
+                timeout(CONNECT_TIMEOUT, connector.connect(backend_tcp, sni)).await
+            } else {
+                let connector = get_tls_connector();
+                timeout(CONNECT_TIMEOUT, connector.connect(backend_tcp, sni)).await
+            };
 
             match tls_result {
                 Ok(Ok(stream)) => stream,

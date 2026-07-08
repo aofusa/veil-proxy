@@ -238,16 +238,15 @@ prepare_fixtures() {
 generate_configs() {
     local config_type="${1:-default}"
 
-    # kTLS: プロキシのフロント TLS のみ有効化（バックエンドは常に false）
-    # バックエンド側 kTLS を有効にすると上流 HTTPS 接続が 502 化するため、
-    # クライアント→プロキシ経路のみ検証する。
+    # kTLS: 既定は無効（E2E クライアントは rustls ユーザ空間 TLS）。
+    # config_type=ktls かつカーネル対応時のみプロキシで有効化する。
     local proxy_ktls_enabled="false"
     local backend_ktls_enabled="false"
-    if check_ktls_available; then
+    if [ "$config_type" = "ktls" ] && check_ktls_available; then
         proxy_ktls_enabled="true"
-        log_info "kTLS available — enabling ktls on proxy only (backends stay false)"
-    else
-        log_warn "kTLS not available — proxy/backends use ktls_enabled = false"
+        log_info "kTLS profile: enabling ktls on proxy (backends stay false)"
+    elif [ "$config_type" = "ktls" ]; then
+        log_warn "kTLS profile requested but kernel module unavailable"
     fi
     
     # バックエンド1設定（静的ファイル配信）
