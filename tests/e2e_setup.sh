@@ -238,13 +238,16 @@ prepare_fixtures() {
 generate_configs() {
     local config_type="${1:-default}"
 
-    # kTLS: カーネルが対応している場合のみ有効化（E2E でデータプレーンを検証）
-    local ktls_enabled="false"
+    # kTLS: プロキシのフロント TLS のみ有効化（バックエンドは常に false）
+    # バックエンド側 kTLS を有効にすると上流 HTTPS 接続が 502 化するため、
+    # クライアント→プロキシ経路のみ検証する。
+    local proxy_ktls_enabled="false"
+    local backend_ktls_enabled="false"
     if check_ktls_available; then
-        ktls_enabled="true"
-        log_info "kTLS available on this host — enabling ktls_enabled in E2E configs"
+        proxy_ktls_enabled="true"
+        log_info "kTLS available — enabling ktls on proxy only (backends stay false)"
     else
-        log_warn "kTLS not available — E2E configs use ktls_enabled = false"
+        log_warn "kTLS not available — proxy/backends use ktls_enabled = false"
     fi
     
     # バックエンド1設定（静的ファイル配信）
@@ -256,7 +259,7 @@ threads = 1
 [tls]
 cert_path = "${FIXTURES_DIR}/cert.pem"
 key_path = "${FIXTURES_DIR}/key.pem"
-ktls_enabled = ${ktls_enabled}
+ktls_enabled = ${backend_ktls_enabled}
 
 [logging]
 level = "warn"
@@ -293,7 +296,7 @@ threads = 1
 [tls]
 cert_path = "${FIXTURES_DIR}/cert.pem"
 key_path = "${FIXTURES_DIR}/key.pem"
-ktls_enabled = ${ktls_enabled}
+ktls_enabled = ${backend_ktls_enabled}
 
 [logging]
 level = "warn"
@@ -336,7 +339,7 @@ h2c_enabled = true
 [tls]
 cert_path = "${FIXTURES_DIR}/cert.pem"
 key_path = "${FIXTURES_DIR}/key.pem"
-ktls_enabled = ${ktls_enabled}
+ktls_enabled = ${backend_ktls_enabled}
 # 注意: H2C専用サーバーのため、TLS証明書は使用されないが、設定ファイルの検証で必要
 
 [logging]
@@ -391,7 +394,7 @@ http3_enabled = true
 [tls]
 cert_path = "${FIXTURES_DIR}/cert.pem"
 key_path = "${FIXTURES_DIR}/key.pem"
-ktls_enabled = ${ktls_enabled}
+ktls_enabled = ${proxy_ktls_enabled}
 # F-50: cipher_suites の取捨選択・優先度（記載順 = サーバ優先度順）検証用。
 # CHACHA20 系を意図的に除外し、E2E で「除外スイートは拒否・先頭スイートが優先」を検証する。
 cipher_suites = [
@@ -721,7 +724,7 @@ path = "/rate-limited/*"
 type = "Proxy"
 upstream = "backend-pool"
 [route.security]
-rate_limit_requests_per_min = 30
+rate_limit_requests_per_min = 10
 
 [[route]]
 [route.conditions]
@@ -731,7 +734,7 @@ path = "/rate-limited/*"
 type = "Proxy"
 upstream = "backend-pool"
 [route.security]
-rate_limit_requests_per_min = 30
+rate_limit_requests_per_min = 10
 EOF
     fi
 
