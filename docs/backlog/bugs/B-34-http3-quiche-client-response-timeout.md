@@ -39,9 +39,12 @@
 **根本原因**: `http3-client` が `initial_max_streams_uni` 未設定（既定 0）のため、サーバが HTTP/3 制御ストリームを開く際に `StreamLimit` で接続が切断されていた。
 
 **修正**:
-- `http3-client` に `set_initial_max_streams_uni(100)` / `set_initial_max_stream_data_uni` を追加
-- HTTP/3 を単一ワーカーに集約（QUIC 状態の SO_REUSEPORT 分散回避）
-- ハンドシェイク直後の eager `init_h3`
+- `http3-client` に `set_initial_max_streams_uni(100)` / `set_initial_max_stream_data_uni` を追加（**本修正**）
+- ハンドシェイク直後の eager `init_h3`（`conn.is_closed()` ガード付き）
 - `http3_probe` の検証パスを `/`（200 応答）へ変更
+
+**注**: 調査中に一時的に HTTP/3 を単一ワーカーへ落としたが、根本原因はクライアント側の
+uni ストリーム上限未設定であり、サーバは HTTP/2 と同様 `num_threads` + SO_REUSEPORT の
+thread-per-core 設計を維持する（各ワーカーが独立した QUIC 接続テーブルを持つ）。
 
 **検証**: F-90 `http3_probe` — `http3_client: ok`（2026-07-08）
