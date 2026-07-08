@@ -181,6 +181,7 @@
 | B-32 | P2 | 未着手 | [bugs/B-32-compression-not-applied-http2.md](bugs/B-32-compression-not-applied-http2.md) | HTTP/2 で Accept-Encoding 時も Content-Encoding 未付与。F-90 compression_cache_probe で検出 |
 | B-33 | P2 | 未着手 | [bugs/B-33-l4-listener-upstream-dns-startup.md](bugs/B-33-l4-listener-upstream-dns-startup.md) | L4 リスナーが上流 DNS 未解決で起動失敗（4443 未待受）。F-90 l4_flood_probe で検出 |
 | B-34 | P2 | 未着手 | [bugs/B-34-http3-quiche-client-response-timeout.md](bugs/B-34-http3-quiche-client-response-timeout.md) | HTTP/3 quiche クライアントが GET `/` で応答タイムアウト（TLS 経路は 200）。F-90 http3-client で検出 |
+| B-29 | P1 | 完了 | [bugs/B-29-http2-upstream-tls-insecure-ignored.md](bugs/B-29-http2-upstream-tls-insecure-ignored.md) | HTTP/2 上流 HTTPS で `tls_insecure` 無視 → 自己署名バックエンドへ 502（UnknownIssuer）。E2E 214 件連鎖失敗の根本原因。**修正済み**: `handle_http2_proxy_https` + H2 ストリーミング経路で `get_tls_connector_insecure()` を使用 |
 
 ---
 
