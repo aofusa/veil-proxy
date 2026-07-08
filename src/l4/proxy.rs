@@ -2,10 +2,16 @@
 //!
 //! バイダイレクショナルストリーム転送、ロードバランシング、TLS パススルーを実装する。
 
-use crate::config::{L4LbAlgorithm, L4ListenerConfig, L4TlsMode};
+use crate::config::{L4LbAlgorithm, L4ListenerConfig, L4TlsMode, CURRENT_CONFIG};
+use crate::runtime::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
 use crate::runtime::splice::{splice, Pipe};
 use crate::runtime::tcp::TcpStream as IoUringTcpStream;
 use crate::runtime::time::timeout;
+
+#[cfg(feature = "ktls")]
+use crate::ktls_rustls::{KtlsServerStream, RustlsAcceptor};
+#[cfg(not(feature = "ktls"))]
+use crate::simple_tls::{SimpleTlsAcceptor, SimpleTlsServerStream};
 use ftlog::{debug, info, warn};
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -432,10 +438,24 @@ pub async fn handle_l4_connection(
     let _listener_guard = ListenerGuard(listener_counter.clone());
 
     if config.tls == L4TlsMode::Terminate {
-        warn!(
-            "[L4:{}] TLS termination not yet implemented, treating as passthrough",
-            config.name
-        );
+        if l4_server_tls_config().is_none() {
+            warn!(
+                "[L4:{}] TLS terminate requires server TLS configuration",
+                config.name
+            );
+            return;
+        }
+        handle_l4_tls_terminate_connection(
+            client,
+            peer_addr,
+            config,
+            parsed_addrs,
+            rr_state,
+            conn_counters,
+            health_state,
+        )
+        .await;
+        return;
     }
 
     // upstream 選択（&str は config からの借用、追加アロケーションなし）
@@ -514,6 +534,237 @@ pub async fn handle_l4_connection(
 
     let idle_timeout = Duration::from_secs(config.idle_timeout_secs);
     bidirectional_forward(client, upstream, idle_timeout, &config.name).await;
+}
+
+/// L4 TLS 終端用のサーバー TLS 設定を取得する。
+fn l4_server_tls_config() -> Option<std::sync::Arc<rustls::ServerConfig>> {
+    crate::tls_reload::current_global_tls_config().or_else(|| {
+        CURRENT_CONFIG
+            .load()
+            .tls_config
+            .as_ref()
+            .map(std::sync::Arc::clone)
+    })
+}
+
+/// クライアント側 TLS ハンドシェイクを完了し、平文ストリームへ復号する。
+#[cfg(feature = "ktls")]
+async fn accept_l4_tls_client(
+    client: IoUringTcpStream,
+    handshake_timeout: Duration,
+    listener_name: &str,
+    peer_addr: SocketAddr,
+) -> Option<KtlsServerStream> {
+    let tls_config = l4_server_tls_config()?;
+    let runtime = CURRENT_CONFIG.load();
+    let acceptor = RustlsAcceptor::new(tls_config)
+        .with_ktls(runtime.ktls_config.enabled)
+        .with_fallback(runtime.ktls_config.fallback_enabled)
+        .with_tcp_cork(runtime.ktls_config.tcp_cork_enabled);
+
+    match timeout(handshake_timeout, acceptor.accept(client, None)).await {
+        Ok(Ok(stream)) => Some(stream),
+        Ok(Err(e)) => {
+            warn!(
+                "[L4:{}] TLS handshake failed from {}: {}",
+                listener_name, peer_addr, e
+            );
+            None
+        }
+        Err(_) => {
+            warn!(
+                "[L4:{}] TLS handshake timed out from {}",
+                listener_name, peer_addr
+            );
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "ktls"))]
+async fn accept_l4_tls_client(
+    client: IoUringTcpStream,
+    handshake_timeout: Duration,
+    listener_name: &str,
+    peer_addr: SocketAddr,
+) -> Option<SimpleTlsServerStream> {
+    let tls_config = l4_server_tls_config()?;
+    let acceptor = SimpleTlsAcceptor::new(tls_config);
+
+    match timeout(handshake_timeout, acceptor.accept(client, None)).await {
+        Ok(Ok(stream)) => Some(stream),
+        Ok(Err(e)) => {
+            warn!(
+                "[L4:{}] TLS handshake failed from {}: {}",
+                listener_name, peer_addr, e
+            );
+            None
+        }
+        Err(_) => {
+            warn!(
+                "[L4:{}] TLS handshake timed out from {}",
+                listener_name, peer_addr
+            );
+            None
+        }
+    }
+}
+
+/// TLS 終端後のクライアント平文ストリームと upstream 間の双方向転送。
+///
+/// splice は平文 fd が両端に揃う場合のみ使えるため、TLS 復号後は WebSocket 転送と同様の
+/// ポーリングループで実装する（`&mut` クライアントと `&` upstream の同時借用を避ける）。
+async fn bidirectional_forward_tls_terminate<C>(
+    client: &mut C,
+    upstream: &IoUringTcpStream,
+    idle_timeout: Duration,
+    listener_name: &str,
+) where
+    C: AsyncReadRent + AsyncWriteRent + Unpin,
+{
+    #[allow(clippy::uninit_vec)]
+    let make_buf = || {
+        let mut b = Vec::with_capacity(BUF_SIZE);
+        // SAFETY: read で上書きするため未初期化領域は読まない。
+        unsafe { b.set_len(BUF_SIZE) };
+        b
+    };
+
+    loop {
+        let mut had_activity = false;
+
+        let buf = make_buf();
+        match timeout(idle_timeout, client.read(buf)).await {
+            Ok((Ok(0), _)) => break,
+            Ok((Ok(n), mut b)) => {
+                unsafe { b.set_len(n) };
+                let mut pending = b;
+                let mut written = 0usize;
+                while written < n {
+                    if written > 0 {
+                        pending.copy_within(written..n, 0);
+                        unsafe { pending.set_len(n - written) };
+                    }
+                    let (wres, returned) = upstream.write(pending).await;
+                    pending = returned;
+                    match wres {
+                        Ok(0) | Err(_) => return,
+                        Ok(wn) => written += wn,
+                    }
+                }
+                had_activity = true;
+            }
+            Ok((Err(_), _)) => break,
+            Err(_) => {}
+        }
+
+        let buf = make_buf();
+        match timeout(idle_timeout, upstream.read(buf)).await {
+            Ok((Ok(0), _)) => break,
+            Ok((Ok(n), mut b)) => {
+                unsafe { b.set_len(n) };
+                let (wres, _) = client.write_all(b).await;
+                if wres.is_err() {
+                    break;
+                }
+                had_activity = true;
+            }
+            Ok((Err(_), _)) => break,
+            Err(_) => {}
+        }
+
+        if !had_activity {
+            debug!("[L4:{}] TLS terminate idle timeout", listener_name);
+            break;
+        }
+    }
+}
+
+/// TLS 終端モードの接続を処理する（ハンドシェイク → upstream 接続 → 平文転送）。
+async fn handle_l4_tls_terminate_connection(
+    client: IoUringTcpStream,
+    peer_addr: SocketAddr,
+    config: Arc<L4ListenerConfig>,
+    parsed_addrs: Arc<Vec<SocketAddr>>,
+    rr_state: Arc<RoundRobinState>,
+    conn_counters: Arc<Vec<AtomicUsize>>,
+    health_state: Arc<Vec<AtomicBool>>,
+) {
+    let handshake_timeout = Duration::from_secs(config.connect_timeout_secs);
+    let Some(mut tls_client) =
+        accept_l4_tls_client(client, handshake_timeout, &config.name, peer_addr).await
+    else {
+        return;
+    };
+
+    let (upstream_idx, upstream_addr_str) =
+        match select_upstream(&config, &rr_state, &conn_counters, &health_state) {
+            Some(pair) => pair,
+            None => {
+                warn!("[L4:{}] no healthy upstream available", config.name);
+                return;
+            }
+        };
+
+    if let Some(c) = conn_counters.get(upstream_idx) {
+        c.fetch_add(1, Ordering::Relaxed);
+    }
+
+    struct UpstreamGuard {
+        counters: Arc<Vec<AtomicUsize>>,
+        idx: usize,
+    }
+    impl Drop for UpstreamGuard {
+        fn drop(&mut self) {
+            if let Some(c) = self.counters.get(self.idx) {
+                c.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    }
+    let _upstream_guard = UpstreamGuard {
+        counters: conn_counters.clone(),
+        idx: upstream_idx,
+    };
+
+    let socket_addr = match parsed_addrs.get(upstream_idx) {
+        Some(a) => *a,
+        None => {
+            warn!(
+                "[L4:{}] parsed_addrs index {} out of range",
+                config.name, upstream_idx
+            );
+            return;
+        }
+    };
+
+    let connect_timeout = Duration::from_secs(config.connect_timeout_secs);
+    let upstream = match timeout(connect_timeout, IoUringTcpStream::connect(socket_addr)).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => {
+            warn!(
+                "[L4:{}] failed to connect to upstream {}: {}",
+                config.name, upstream_addr_str, e
+            );
+            return;
+        }
+        Err(_) => {
+            warn!(
+                "[L4:{}] connection to upstream {} timed out",
+                config.name, upstream_addr_str
+            );
+            return;
+        }
+    };
+    let _ = upstream.set_nodelay(true);
+
+    info!(
+        "[L4:{}] {} → {} (tls=Terminate)",
+        config.name, peer_addr, upstream_addr_str
+    );
+
+    let idle_timeout = Duration::from_secs(config.idle_timeout_secs);
+    bidirectional_forward_tls_terminate(&mut tls_client, &upstream, idle_timeout, &config.name)
+        .await;
 }
 
 #[cfg(test)]
