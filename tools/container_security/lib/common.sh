@@ -117,6 +117,11 @@ prepare_veil_test_config() {
             sed -i "s|veil-sec-toxiproxy|${toxi_ip}|g" "${dst}"
             log "Toxiproxy ホスト名を IP 指定に置換: ${toxi_ip}"
         fi
+    else
+        # Toxiproxy 未起動（SKIP_TOXIPROXY 等）でも L4 リスナーが立つようループバックへ置換
+        sed -i "s|veil-sec-toxiproxy:8480|127.0.0.1:1|g" "${dst}"
+        sed -i "s|veil-sec-toxiproxy|127.0.0.1|g" "${dst}"
+        log "Toxiproxy 未起動: upstream を 127.0.0.1 へ置換（L4 起動安定化）"
     fi
     echo "${dst}"
 }

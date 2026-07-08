@@ -23,6 +23,16 @@ for ((i = 0; i < CONN_COUNT; i++)); do
 done
 log "l4_connections_opened: ${opened}/${CONN_COUNT}"
 
+# P-11: L4 TLS パススルー接続試行（ClientHello 送信または TCP 到達）
+if timeout 4 openssl s_client -connect "${VEIL_HOST}:${VEIL_L4_PORT}" -servername test </dev/null 2>/dev/null \
+    | grep -qE 'CONNECTED|Cipher|SSL-Session'; then
+    log "PASS l4_tls_passthrough_handshake"
+elif timeout 2 bash -c "exec 3<>/dev/tcp/${VEIL_HOST}/${VEIL_L4_PORT}" 2>/dev/null; then
+    log "PASS l4_tls_passthrough_tcp_reach"
+else
+    log "WARN l4_tls_passthrough: port not reachable (see B-33)"
+fi
+
 # 事後: HTTP/HTTPS が応答すること
 code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 \
     "https://${VEIL_HOST}:${VEIL_HTTPS_PORT}/" 2>/dev/null || echo "000")

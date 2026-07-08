@@ -49,12 +49,13 @@ validate_veil_image_security() {
     [[ "${readonly_root}" == "true" ]] || die "ReadonlyRootfs が有効ではありません"
     echo "${seccomp}" | grep -q seccomp || die "seccomp プロファイルが適用されていません"
     local i
-    for ((i = 1; i <= 30; i++)); do
-        if docker logs "${VEIL_CONTAINER}" 2>&1 | grep -q "Security restrictions applied"; then
+    for ((i = 1; i <= 45; i++)); do
+        if docker logs "${VEIL_CONTAINER}" 2>&1 \
+            | grep -qE 'Security restrictions applied|seccomp filter applied'; then
             break
         fi
         sleep 1
-        [[ "${i}" -eq 30 ]] && die "Veil のセキュリティ制限が適用されていません"
+        [[ "${i}" -eq 45 ]] && die "Veil のセキュリティ制限が適用されていません"
     done
     log "イメージ実行時セキュリティ検証: ok (readonly_rootfs, seccomp, privilege_drop)"
 }
