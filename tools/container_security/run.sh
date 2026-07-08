@@ -240,6 +240,9 @@ main() {
     # フェーズ 4i: プロトコル差分テスト（Veil vs nginx、F-77、専用トポロジ・既定 SKIP）
     "${SCRIPT_DIR}/security/run_differential.sh" || log "differential で警告（レポート参照）"
 
+    # フェーズ 4j: full features セキュリティプローブ（F-90）
+    "${SCRIPT_DIR}/security/run_full_features_security.sh" || log "full_features_security で警告（レポート参照）"
+
     # フェーズ 5: Trivy イメージスキャン
     run_trivy_scan
 

@@ -128,6 +128,15 @@ start_veil_container() {
     local test_config
     test_config="$(prepare_veil_test_config)"
 
+    local wasm_dir="${REPO_ROOT}/tests/fixtures/wasm"
+    local -a wasm_mount=()
+    if [[ -d "${wasm_dir}" ]] && [[ -f "${wasm_dir}/header_filter.wasm" ]]; then
+        wasm_mount=(-v "${wasm_dir}:/etc/veil/wasm:ro")
+        log "WASM モジュールをマウント: ${wasm_dir}"
+    else
+        log "警告: WASM モジュール未検出 (${wasm_dir})。wasm_security プローブはスキップされる可能性があります"
+    fi
+
     log "Veil コンテナ起動: ${VEIL_CONTAINER} (${VEIL_IMAGE})"
     docker run -d \
         --name "${VEIL_CONTAINER}" \
@@ -140,6 +149,7 @@ start_veil_container() {
         -v "${test_config}:/etc/veil/conf.d/config.toml:ro" \
         -v "${DOCKER_DIR}/assets/ssl:/etc/veil/ssl:ro" \
         -v "${DOCKER_DIR}/assets/www:/var/www:ro" \
+        "${wasm_mount[@]}" \
         --security-opt "seccomp=${seccomp_path}" \
         "${VEIL_IMAGE}" >/dev/null
 }
@@ -159,6 +169,9 @@ run_harness() {
         -e "VEIL_HTTP_PORT=80" \
         -e "VEIL_HTTPS_PORT=443" \
         -e "VEIL_H2C_PORT=8443" \
+        -e "VEIL_L4_PORT=4443" \
+        -e "VEIL_HTTP3_PORT=443" \
+        -e "ADMIN_SECRET=${ADMIN_SECRET:-veil-sec-test-admin}" \
         -e "H2SPEC_FULL=${H2SPEC_FULL:-0}" \
         -e "H2SPEC_STRICT=${H2SPEC_STRICT:-0}" \
         -e "H2SPEC_TIMEOUT=${H2SPEC_TIMEOUT:-30}" \

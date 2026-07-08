@@ -19,6 +19,8 @@ RUN apt-get update -y \
         bash \
         ca-certificates \
         curl \
+        gzip \
+        netcat-openbsd \
         openssl \
     && curl -fsSL -o /tmp/h2spec.tar.gz \
         "https://github.com/summerwind/h2spec/releases/download/v${H2SPEC_VERSION}/h2spec_linux_amd64.tar.gz" \

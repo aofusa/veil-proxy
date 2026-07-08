@@ -39,6 +39,7 @@ landlock_read_paths = [
   "/lib64",
   "/usr",
 ]
+# full: WASM モジュール (.wasm / .cwasm AOT キャッシュ書込は /var/tmp/veil)
 landlock_write_paths = ["/var/cache/veil", "/var/tmp/veil"]
 
 [performance]
@@ -64,6 +65,30 @@ format = "json"
 [http3]
 listen = "0.0.0.0:443"
 compression_enabled = true
+
+# full: OTLP ブリッジ（到達不能エンドポイントでもプロセスが生存することを検証）
+[opentelemetry]
+enabled = true
+endpoint = "http://127.0.0.1:1"
+service_name = "veil-sec-test"
+batch_interval_secs = 5
+
+# full: Proxy-Wasm モジュール（header_filter: 応答ヘッダへ X-Wasm-Processed を付与）
+[wasm]
+enabled = true
+
+[[wasm.modules]]
+name = "header_filter"
+path = "/etc/veil/wasm/header_filter.wasm"
+configuration = '{"add_header": "X-Wasm-Processed", "add_value": "true"}'
+
+[wasm.modules.capabilities]
+allow_logging = true
+allow_request_headers_read = true
+allow_request_headers_write = true
+allow_response_headers_read = true
+allow_response_headers_write = true
+allow_send_local_response = true
 
 [upstreams."toxi-pool"]
 algorithm = "round_robin"
@@ -95,8 +120,7 @@ tls = "passthrough"
   [[l4.upstreams]]
   addr = "veil-sec-toxiproxy:8480"
 
-# Proxy 経路（/api/）: full の buffering / rate-limit を併せて有効化。
-# rate-limit はカオス flood でも誤トリップしないよう高い上限にする（経路のみ有効化）。
+# Proxy 経路（/api/）: full の buffering を有効化（rate-limit は専用経路で検証）。
 [[route]]
 [route.conditions]
 path = "/api/"
@@ -107,7 +131,49 @@ upstream = "toxi-pool"
 mode = "adaptive"
 [route.security]
 allowed_methods = ["HEAD", "GET", "POST"]
-rate_limit_requests_per_min = 1000000
+
+# full: レートリミット検証専用（低閾値で 429 を期待）
+[[route]]
+[route.conditions]
+path = "/rate-limit/"
+[route.action]
+type = "File"
+path = "/var/www/"
+[route.security]
+allowed_methods = ["GET"]
+rate_limit_requests_per_min = 30
+
+# full: WebSocket プロキシ経路（異常 Upgrade 耐性検証。上流は HTTP のみだがプロキシ層を通過）
+[[route]]
+[route.conditions]
+path = "/ws/"
+[route.action]
+type = "Proxy"
+upstream = "toxi-pool"
+[route.security]
+allowed_methods = ["GET"]
+
+# full: gRPC プロキシ経路（H2C 上流・不正フレーム耐性検証）
+[[route]]
+[route.conditions]
+path = "/grpc.test.v1.TestService/"
+[route.action]
+type = "Proxy"
+upstream = "toxi-pool"
+use_h2c = true
+[route.security]
+allowed_methods = ["POST"]
+
+# full: Proxy-Wasm フィルタ適用経路
+[[route]]
+modules = ["header_filter"]
+[route.conditions]
+path = "/wasm/"
+[route.action]
+type = "Proxy"
+upstream = "toxi-pool"
+[route.security]
+allowed_methods = ["GET"]
 
 # full: キャッシュ経路（GET をインメモリキャッシュ）。File 配信 + cache を有効化。
 [[route]]
