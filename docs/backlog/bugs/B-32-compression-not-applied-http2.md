@@ -18,3 +18,7 @@ HTTP/2 応答の `Content-Encoding` が付かない（`compression_cache_probe`:
 
 - F-90 compression_cache_probe
 - `compression` feature
+
+## 対応状況（完了）
+
+`build_h2_compressed_file_response` とルート圧縮設定の伝搬を追加。F-90 `compression_cache_probe` で `encoding=gzip` を確認（2026-07-08）。

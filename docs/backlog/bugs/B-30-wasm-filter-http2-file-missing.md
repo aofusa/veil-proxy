@@ -27,3 +27,7 @@ curl -sk -D - -o /dev/null https://<veil>/wasm/ | grep -i veil-processed        
 
 - B-04, B-05（WASM 適用経路の過去バグ）
 - F-90 wasm_security_probe（HTTP/1.1 で検証）
+
+## 対応状況（完了）
+
+HTTP/2 File 応答へ `apply_h2_wasm_response_headers` を適用。F-90 `wasm_security_probe` で `X-Veil-Processed=true` を確認（2026-07-08）。

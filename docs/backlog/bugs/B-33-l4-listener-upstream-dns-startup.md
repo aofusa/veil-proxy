@@ -25,3 +25,7 @@
 
 - F-90 l4_flood_probe
 - F-18 L4 ストリームプロキシ
+
+## 対応状況（完了）
+
+`L4UpstreamTarget` + `resolve_upstream_target`（offload 遅延 DNS 解決）を実装。F-90 `l4_flood_probe` で 80/80 接続成功（2026-07-08）。

@@ -33,3 +33,7 @@ curl -sk --http1.1 -o /dev/null -w "%{http_code}\n" https://<veil>:443/__admin/c
 
 - F-90 admin_security_probe（テストは HTTP/1.1 で検証）
 - F-21 管理 Admin API
+
+## 対応状況（完了）
+
+`handle_http2_admin_request` を HTTP/2 単一リクエスト経路へ配線。F-90 `admin_security_probe` 全ケース通過（2026-07-08）。
