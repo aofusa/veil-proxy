@@ -38,7 +38,8 @@ check "response_compression" "[[ '${code}' == '200' ]]"
 dd if=/dev/zero bs=1M count=10 2>/dev/null | gzip -9 >"${TMP}/bomb.gz"
 bomb_code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 10 \
     -X POST -H "Content-Encoding: gzip" -H "Content-Type: application/octet-stream" \
-    --data-binary @"${TMP}/bomb.gz" "https://${VEIL_HOST}:${VEIL_HTTPS_PORT}/" 2>/dev/null || echo "000")
+    --data-binary @"${TMP}/bomb.gz" "https://${VEIL_HOST}:${VEIL_HTTPS_PORT}/" 2>/dev/null)
+bomb_code="${bomb_code:-000}"
 log "gzip_bomb_post: code=${bomb_code}"
 check "gzip_bomb_no_crash" "[[ '${bomb_code}' != '000' ]]"
 hc=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 \

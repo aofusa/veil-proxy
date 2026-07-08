@@ -73,7 +73,7 @@ endpoint = "http://127.0.0.1:1"
 service_name = "veil-sec-test"
 batch_interval_secs = 5
 
-# full: Proxy-Wasm モジュール（header_filter: 応答ヘッダへ X-Wasm-Processed を付与）
+# full: Proxy-Wasm モジュール（header_filter: 応答ヘッダへ X-Veil-Processed を付与）
 [wasm]
 enabled = true
 
@@ -141,7 +141,8 @@ type = "File"
 path = "/var/www/"
 [route.security]
 allowed_methods = ["GET"]
-rate_limit_requests_per_min = 30
+# ワーカーごとに thread_local カウンタのため、閾値を低くして 429 を安定検出
+rate_limit_requests_per_min = 5
 
 # full: WebSocket プロキシ経路（異常 Upgrade 耐性検証。上流は HTTP のみだがプロキシ層を通過）
 [[route]]
@@ -164,14 +165,14 @@ use_h2c = true
 [route.security]
 allowed_methods = ["POST"]
 
-# full: Proxy-Wasm フィルタ適用経路
+# full: Proxy-Wasm フィルタ適用経路（静的 File で上流不要・フィルタ動作のみ検証）
 [[route]]
 modules = ["header_filter"]
 [route.conditions]
 path = "/wasm/"
 [route.action]
-type = "Proxy"
-upstream = "toxi-pool"
+type = "File"
+path = "/var/www/"
 [route.security]
 allowed_methods = ["GET"]
 

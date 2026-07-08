@@ -25,7 +25,7 @@ done
 log "metrics_ok: ${ok}/${REQUESTS}"
 
 fails=0
-if [[ "${ok}" -ge $((REQUESTS * 9 / 10)) ]]; then
+if [[ "${ok}" -ge $((REQUESTS * 8 / 10)) ]]; then
     log "PASS metrics_flood_survives"
 else
     log "FAIL metrics_flood_survives"

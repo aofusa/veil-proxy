@@ -5,7 +5,8 @@ set -euo pipefail
 VEIL_HOST="${VEIL_HOST:-veil-proxy}"
 VEIL_HTTPS_PORT="${VEIL_HTTPS_PORT:-443}"
 RESULTS="/results/rate_limit_report.txt"
-BURST="${RATE_LIMIT_BURST:-40}"
+# thread-per-core でカウンタが分散するため十分なバーストを送る
+BURST="${RATE_LIMIT_BURST:-60}"
 
 mkdir -p "$(dirname "${RESULTS}")"
 : >"${RESULTS}"

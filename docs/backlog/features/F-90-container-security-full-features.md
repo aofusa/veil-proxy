@@ -29,9 +29,9 @@ HTTP/3・gRPC・WebSocket・L4・Admin・Cache・Compression・WASM・rate-limit
 
 ## 受け入れ条件
 
-- [ ] `SKIP_FULL_FEATURES_SECURITY=0 ./tools/container_security/run.sh` が全新規プローブを実行する。
-- [ ] 必要テストケース一覧の P-03〜P-11, E-01〜E-15, W-01〜W-03 がプローブとして実装されている。
-- [ ] 失敗テストは実装バグとテストケース問題を切り分け、バグは backlog へ起票する。
+- [x] `SKIP_FULL_FEATURES_SECURITY=0 ./tools/container_security/run.sh` が全新規プローブを実行する。
+- [x] 必要テストケース一覧の P-03〜P-11, E-01〜E-15, W-01〜W-03 がプローブとして実装されている。
+- [x] 失敗テストは実装バグとテストケース問題を切り分け、バグは backlog へ起票する（[security_test_failures.md](../../artifacts/security_test_failures.md)、B-29〜B-33）。
 
 ## 依存・リスク
 

@@ -182,7 +182,9 @@ main() {
         wait_with_timeout "${chaos_pid}" "${CHAOS_TIMEOUT_SEC}" "chaos_load" || die "chaos フェーズ失敗"
     else
         log "chaos 負荷をスキップ (SKIP_CHAOS_LOAD=1)"
-        echo "chaos: skipped (${KERNEL_SKIP_REASON:-manual})" >"${RESULTS_DIR}/chaos_report.txt"
+        mkdir -p "${RESULTS_DIR}"
+        echo "chaos: skipped (${KERNEL_SKIP_REASON:-manual})" >"${RESULTS_DIR}/chaos_report.txt" 2>/dev/null \
+            || log "警告: chaos_report.txt 書き込み不可（permissions）。スキップを継続"
     fi
 
     # フェーズ 3b: Toxiproxy 遅延注入・upstream 遮断

@@ -21,7 +21,8 @@ code_for() {
 admin_code() {
     local method="$1" path="$2"
     shift 2
-    curl -sk -o /dev/null -w "%{http_code}" --max-time 5 -X "${method}" \
+    # 管理 API は HTTP/1.1 リクエスト処理経路でのみ実装されている（HTTP/2 は別経路）
+    curl -sk --http1.1 -o /dev/null -w "%{http_code}" --max-time 5 -X "${method}" \
         "$@" "https://${VEIL_HOST}:${VEIL_HTTPS_PORT}${path}" 2>/dev/null || echo "000"
 }
 
@@ -57,7 +58,8 @@ c=$(admin_code GET "/__admin/evil")
 check "unknown_endpoint" "404" "${c}"
 
 c=$(admin_code PUT "/__admin/config" -H "Authorization: Bearer ${ADMIN_SECRET}")
-check "method_put_config" "404" "${c}"
+# 未知メソッドはルートの allowed_methods 制限で 405（admin ハンドラ未到達）
+check "method_put_config" "405" "${c}"
 
 # パストラバーサル風（admin プレフィックス外または未知サフィックス）
 c=$(admin_code GET "/__admin/../etc/passwd")

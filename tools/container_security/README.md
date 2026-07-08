@@ -130,6 +130,7 @@ FUZZ_RUNS=2000 FUZZ_MAX_TIME=120 ./tools/container_security/fuzz/run_libfuzzer.s
 | 4g gitleaks | `security/run_gitleaks.sh` | シークレット（鍵/トークン）誤コミット検出（SARIF、F-75） |
 | 4h smuggling | `security/run_smuggling.sh` | HTTP リクエストスマグリング能動テスト（CL.TE/TE.CL を 400 検証、F-76） |
 | 4i differential | `security/run_differential.sh` | Veil vs nginx の応答差分比較（曖昧解釈検出、F-77、専用トポロジ・既定 SKIP） |
+| 4j full features | `security/run_full_features_security.sh` | admin/compression+cache/http3/l4/ws/grpc/rate-limit/wasm/metrics/otel プローブ（F-90） |
 | 5 Trivy | `run_trivy_scan` | イメージ脆弱性（HIGH/CRITICAL） |
 | 6 レポート集約 | `lib/report.sh` | `suite_summary.json` / `suite_summary_junit.xml` |
 | 最終 | `health_check.sh` | 全フェーズ後の応答確認（最大 10 回リトライ） |
@@ -190,6 +191,7 @@ CARGO_TARGET_DIR=/tmp/veil-build-target cargo build -p veil-fuzz
 | `SKIP_GITLEAKS` | `0` | gitleaks シークレットスキャン（F-75。`GITLEAKS_MODE=dir\|git`、`GITLEAKS_BLOCKING=1` で検出時 fail） |
 | `SKIP_SMUGGLING` | `0` | HTTP リクエストスマグリング能動テスト（F-76。`SMUGGLING_BLOCKING=1` で退行時 fail） |
 | `SKIP_DIFFERENTIAL` | `1` | Veil vs nginx 差分テスト（F-77。専用トポロジ。`DIFFERENTIAL_BLOCKING=1` で差分時 fail） |
+| `SKIP_FULL_FEATURES_SECURITY` | `0` | full features セキュリティプローブ群（F-90。`FULL_FEATURES_SECURITY_BLOCKING=1` で失敗時 fail） |
 | `RUN_WASM_FUZZ` | `0` | `1` で WASM 系 libFuzzer ターゲット（`wasm_abi`/`wasm_host_abi`、`--features wasm`）を実行 |
 | `SKIP_BAD_BACKEND` | `1` | バックエンドプロトコル違反カオス（F-67） |
 | `SKIP_PUMBA` | `1` | Pumba netem カオス（F-69） |

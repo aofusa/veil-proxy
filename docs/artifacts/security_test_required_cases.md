@@ -66,7 +66,7 @@
 
 | ID | テストケース | 期待結果 |
 |----|-------------|----------|
-| W-01 | header_filter 適用: `X-Wasm-Processed: true` 付与 | Proxy-Wasm v0.2.1 準拠動作 |
+| W-01 | header_filter 適用: `X-Veil-Processed: true` 付与 | Proxy-Wasm v0.2.1 準拠動作 |
 | W-02 | フィルタ経路で 200 応答 | モジュール実行完走 |
 | W-03 | 並行リクエスト (10+) でフィルタ適用 | 競合なし (B-05 回帰) |
 | W-04 | 不正 WASM モジュールパス | 起動失敗またはルート 5xx、クラッシュなし |

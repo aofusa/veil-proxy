@@ -122,7 +122,7 @@
 | F-86 | P2 | 完了 | [features/F-86-syscall-fault-injection-chaos.md](features/F-86-syscall-fault-injection-chaos.md) | syscall レベルのフォールトインジェクション。`chaos/syscall_chaos.sh`（strace inject で io_uring_enter に EBUSY/ENOMEM/EINTR、setup に EFAULT を注入、panic/segfault なしを検証）。EBUSY 注入で graceful-exit 確認。レポート提案3 |
 | F-87 | P1 | 完了 | [features/F-87-future-cancellation-safety-tests.md](features/F-87-future-cancellation-safety-tests.md) | io_uring Future のランダム Drop（キャンセル安全性）テスト。`tests/runtime_cancellation_test.rs`（recv/send/accept/timer の提出前・in-flight・多重キャンセル Drop + liveness プローブ、決定的シード）。レポート提案4 |
 | F-88 | P2 | 完了 | [features/F-88-ast-hotpath-blocking-lint.md](features/F-88-ast-hotpath-blocking-lint.md) | AST ベース静的解析（clippy disallowed-methods）でホットパスのブロッキング呼び出し混入を検出。**`clippy.toml` + 理由付き allow + CI `cargo clippy --features full --tests` + B-26 修正済み** |
-| F-90 | P1 | 進行中 | [features/F-90-container-security-full-features.md](features/F-90-container-security-full-features.md) | container_security full features 網羅（admin/compression+cache/http3/l4/ws/grpc/rate-limit/wasm/metrics/otel プローブ）。coverage_report 起点 |
+| F-90 | P1 | 完了 | [features/F-90-container-security-full-features.md](features/F-90-container-security-full-features.md) | container_security full features 網羅（10 プローブ + テストケース文書 + 実行検証）。実装バグは B-29〜B-33 へ起票 |
 | F-73 | P1 | 完了 | [features/F-73-http2-send-zerocopy-writeall.md](features/F-73-http2-send-zerocopy-writeall.md) | HTTP/2 送信ホットパスの write_all ゼロコピー化（per-frame の 2 度目の to_vec 確保+コピーを排除）。A/B で **HTTP/2 +11.6%**（1577→1761 req/s、nginx 比 75%→84%）、HTTP/1.1 不変・応答ボディ sha256 一致。レポート `docs/artifacts/performance_report_veil_vs_nginx_v3.md` |
 | F-74 | P1 | 完了 | [features/F-74-http2-send-frame-coalescing.md](features/F-74-http2-send-frame-coalescing.md) | HTTP/2 送信ホットパスのフレーム連結（HEADERS/DATA コアレッシング）。1 レスポンス分のフレームを接続再利用連結バッファ `write_buf`（スレッドローカルプール）へ積み **1 回の書き込み** で送出。`encode_*_into` 追記 API・`send_headers_buffered`・128KB 途中フラッシュ閾値を追加。per-frame 送信システムコールを削減。単体 660 / http2 E2E 11 / gRPC E2E 35 グリーン。F-73 続き |
 | F-11 | P3 | 未着手 | [features/dashboard.md](features/dashboard.md) | ダッシュボード機能 |
@@ -174,6 +174,11 @@
 | B-26 | P1 | 完了 | [bugs/B-26-sync-fs-on-event-loop.md](bugs/B-26-sync-fs-on-event-loop.md) | イベントループ上の同期 FS 呼び出し残存（HTTP/3 sendfile の whole-file read・runtime::io::read/remove_file・ディスクキャッシュ async_io）。**F-88 の clippy disallowed-methods で検出・修正済み**: 3 系統とも runtime::offload へ退避 |
 | B-27 | P1 | 完了 | [bugs/B-27-ktls-http2-short-write-frame-desync.md](bugs/B-27-ktls-http2-short-write-frame-desync.md) | kTLS + HTTP/2 高並行送信が FRAME_SIZE_ERROR GOAWAY で激減（`h2_1_ktls_1_lb_kernel_*` 256〜736 req/s）。**原因確定・修正済み**: `runtime/io.rs` の `write_all` が short write の残りを書かず WriteZero を返し、送信済みプレフィックスでフレーム同期が破壊されていた。`SlicedIoBuf` による継続書き込みへ修正（回帰単体 3 件 + h2load 検証） |
 | B-28 | P1 | 完了 | [bugs/B-28-h2-proxy-no-backend-pooling-port-exhaustion.md](bugs/B-28-h2-proxy-no-backend-pooling-port-exhaustion.md) | HTTP/2 逆プロキシがバックエンド接続をリクエスト毎に新規作成・クローズし、TIME_WAIT 蓄積でエフェメラルポート枯渇（EADDRNOTAVAIL → 502、h2load 30000 リクエスト中 1000〜1500 件 5xx）。**修正済み**: `relay_h2_response` に再利用可否判定を追加し、HTTP/1.1 経路と同じ `HTTP_POOL`/`HTTPS_POOL` で接続を再利用（CL 全量消費 + 非 close 時のみ返却）。chunked 応答と H2C バックエンドの再利用は残件 |
+| B-29 | P1 | 未着手 | [bugs/B-29-admin-api-http2-unreachable.md](bugs/B-29-admin-api-http2-unreachable.md) | 管理 API が HTTP/2 経路で 404（HTTP/1.1 のみ 401/200）。F-90 admin_security_probe で検出 |
+| B-30 | P1 | 未着手 | [bugs/B-30-wasm-filter-http2-file-missing.md](bugs/B-30-wasm-filter-http2-file-missing.md) | WASM フィルタが HTTP/2 File 応答に未適用（X-Veil-Processed 欠落）。F-90 wasm_security_probe で検出 |
+| B-31 | P2 | 未着手 | [bugs/B-31-rate-limit-thread-local-per-worker.md](bugs/B-31-rate-limit-thread-local-per-worker.md) | レートリミットが thread_local でワーカー分散し実効上限が N×workers に。F-90 rate_limit_probe で検出 |
+| B-32 | P2 | 未着手 | [bugs/B-32-compression-not-applied-http2.md](bugs/B-32-compression-not-applied-http2.md) | HTTP/2 で Accept-Encoding 時も Content-Encoding 未付与。F-90 compression_cache_probe で検出 |
+| B-33 | P2 | 未着手 | [bugs/B-33-l4-listener-upstream-dns-startup.md](bugs/B-33-l4-listener-upstream-dns-startup.md) | L4 リスナーが上流 DNS 未解決で起動失敗（4443 未待受）。F-90 l4_flood_probe で検出 |
 
 ---
 
