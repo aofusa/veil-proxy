@@ -17892,7 +17892,7 @@ async fn test_e2e_l4_tls_terminate_forward() {
         return;
     }
 
-    let resp = send_request_with_retry(PROXY_L4_TERMINATE_PORT, "/", &[]).await;
+    let resp = send_request_with_retry(PROXY_L4_TERMINATE_PORT, "/", &[], 3).await;
     assert!(
         resp.is_some(),
         "L4 TLS terminate should complete TLS handshake and forward"
