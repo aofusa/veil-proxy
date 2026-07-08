@@ -25,6 +25,8 @@ else
 fi
 
 # quiche ベース HTTP/3 クライアント（P-03 本番検証）
+# 軽量なキャッシュ済み静的ファイルで応答完了を検証（巨大 index.html は QUIC フロー制御で遅延しうる）
+export HTTP3_PATH="${HTTP3_PATH:-/cached/index.html}"
 h3_ok=0
 if command -v http3-client >/dev/null 2>&1; then
     if http3-client; then
@@ -59,13 +61,13 @@ else
     fails=$((fails + 1))
 fi
 
-# http3-client/curl 成功、または TLS 生存で合格（QUIC 未検証時は WARN のみ）
+# http3-client 成功を必須（B-34 修正後は TLS フォールバックのみの合格を廃止）
 if [[ "${fails}" -eq 0 ]]; then
-    if [[ "${h3_ok}" -eq 1 ]] || [[ "${h3_code}" =~ ^(200|301|302)$ ]] || [[ "${h3_code}" == "000" ]]; then
+    if [[ "${h3_ok}" -eq 1 ]]; then
         log "http3: ok"
         exit 0
     fi
-    log "http3: FAILURES (http3_code=${h3_code})"
+    log "http3: FAILURES (http3_client failed, curl_code=${h3_code})"
     exit 1
 fi
 log "http3: FAILURES (fails=${fails})"

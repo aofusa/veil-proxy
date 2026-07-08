@@ -16,8 +16,8 @@ fails=0
 log "wasm_security_probe start"
 
 # W-01/W-02: header_filter が X-Veil-Processed を付与（Proxy-Wasm サンプルモジュール準拠）
-# WASM フィルタは HTTP/1.1 経路で検証（HTTP/2 File 応答は別経路）
-headers=$(curl -sk --http1.1 -D - -o /dev/null --max-time 8 \
+# B-30 修正後: HTTP/2（curl 既定 ALPN）File 応答でも WASM フィルタを検証
+headers=$(curl -sk -D - -o /dev/null --max-time 8 \
     "https://${VEIL_HOST}:${VEIL_HTTPS_PORT}/wasm/" 2>/dev/null | tr -d '\r')
 code=$(printf '%s\n' "${headers}" | awk 'BEGIN{c=0} /^HTTP/{c=$2} END{print c}')
 wasm_hdr=$(printf '%s\n' "${headers}" | grep -i '^x-veil-processed:' | head -1 | awk '{print $2}')
@@ -40,7 +40,7 @@ fi
 # W-03: 連続 12 リクエストでフィルタが安定（B-05 回帰）
 parallel_ok=0
 for ((i = 1; i <= 12; i++)); do
-    h=$(curl -sk --http1.1 -D - -o /dev/null --max-time 8 \
+    h=$(curl -sk -D - -o /dev/null --max-time 8 \
         "https://${VEIL_HOST}:${VEIL_HTTPS_PORT}/wasm/" 2>/dev/null \
         | tr -d '\r' | grep -i '^x-veil-processed:' | head -1 | awk '{print $2}' || true)
     [[ "${h}" == "true" ]] && parallel_ok=$((parallel_ok + 1))

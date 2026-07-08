@@ -21,8 +21,8 @@ code_for() {
 admin_code() {
     local method="$1" path="$2"
     shift 2
-    # 管理 API は HTTP/1.1 リクエスト処理経路でのみ実装されている（HTTP/2 は別経路）
-    curl -sk --http1.1 -o /dev/null -w "%{http_code}" --max-time 5 -X "${method}" \
+    # B-29 修正後: HTTP/2（curl 既定 ALPN）経路でも管理 API に到達可能
+    curl -sk -o /dev/null -w "%{http_code}" --max-time 5 -X "${method}" \
         "$@" "https://${VEIL_HOST}:${VEIL_HTTPS_PORT}${path}" 2>/dev/null || echo "000"
 }
 

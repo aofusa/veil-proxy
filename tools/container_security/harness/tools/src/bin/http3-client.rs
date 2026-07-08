@@ -48,7 +48,8 @@ fn send_http3_get(host: &str, port: u16, path: &str) -> Result<usize, Box<dyn st
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
     config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
     config.verify_peer(false);
-    config.set_max_idle_timeout(5000);
+    // サーバ既定（Http3ServerConfig.max_idle_timeout=30000）と整合させる
+    config.set_max_idle_timeout(30_000);
     config.set_max_recv_udp_payload_size(1350);
     config.set_max_send_udp_payload_size(1350);
     config.set_initial_max_data(10_000_000);
@@ -158,6 +159,9 @@ fn send_http3_get(host: &str, port: u16, path: &str) -> Result<usize, Box<dyn st
                 Ok((id, quiche::h3::Event::Data)) if id == stream_id => {
                     while let Ok(read) = h3_conn.recv_body(&mut conn, id, &mut buf) {
                         response_size += read;
+                    }
+                    if matches!(status, Some(200) | Some(301) | Some(302)) && response_size > 0 {
+                        return Ok(response_size);
                     }
                 }
                 Ok((id, quiche::h3::Event::Finished)) if id == stream_id => {
