@@ -1538,8 +1538,7 @@ impl Http3Handler {
         // 非同期プロキシ処理（monoio TcpStream使用）
         // io_uringベースの非同期I/Oでバックエンド通信を行う
         let timeout_secs = 30;
-        let tls_insecure = upstream_group.tls_insecure()
-            || std::env::var("VEIL_TLS_INSECURE").is_ok_and(|v| v == "1");
+        let tls_insecure = upstream_group.tls_insecure();
         let proxy_result =
             proxy_to_backend_async_with_tls(target, request, timeout_secs, tls_insecure).await;
 
@@ -2395,7 +2394,7 @@ async fn proxy_to_tls_backend_async(
     // monoio TcpStream は不要（別スレッドで std::net::TcpStream を使うため）
     drop(tcp_stream);
 
-    let skip_verify = tls_insecure || std::env::var("VEIL_TLS_INSECURE").is_ok_and(|v| v == "1");
+    let skip_verify = tls_insecure;
     let addr = format!("{}:{}", target.host, target.port);
     let sni_name = target
         .sni_name
@@ -2533,8 +2532,7 @@ async fn proxy_to_tls_backend_async(
     // monoio TcpStream は不要（別スレッドで std::net::TcpStream を使うため）
     drop(tcp_stream);
 
-    let skip_verify =
-        tls_insecure || std::env::var("VEIL_TLS_INSECURE").map_or(false, |v| v == "1");
+    let skip_verify = tls_insecure;
     let addr = format!("{}:{}", target.host, target.port);
     let sni_name = target
         .sni_name

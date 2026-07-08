@@ -567,8 +567,7 @@ fn raw_fd_write(fd: std::os::fd::RawFd, buf: &[u8]) -> io::Result<usize> {
 /// TLS ハンドシェイクを実行して [`BackendIo::Tls`] を構築する（F-44）。
 ///
 /// kTLS ビルドでは `RustlsConnector`（設定に応じて kTLS 移行を試行）、非 kTLS ビルドでは
-/// `SimpleTlsConnector` を使う。`insecure` はアップストリーム設定 `tls_insecure` または
-/// 環境変数 `VEIL_TLS_INSECURE=1` に対応する（既存のバッファ経路と同じ規則）。
+/// `SimpleTlsConnector` を使う。`insecure` はアップストリーム設定 `tls_insecure` に対応する。
 async fn tls_connect(tcp: TcpStream, sni: &str, insecure: bool) -> io::Result<BackendIo> {
     #[cfg(feature = "ktls")]
     {
@@ -598,12 +597,6 @@ async fn tls_connect(tcp: TcpStream, sni: &str, insecure: bool) -> io::Result<Ba
             drained,
         ))))
     }
-}
-
-/// `VEIL_TLS_INSECURE=1` が設定されているか（プロセス起動時に一度だけ評価）。
-fn tls_insecure_env() -> bool {
-    static INSECURE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *INSECURE.get_or_init(|| std::env::var("VEIL_TLS_INSECURE").is_ok_and(|v| v == "1"))
 }
 
 // ============================================================================
@@ -748,7 +741,7 @@ async fn run_backend_task(
 
     // --- F-44: TLS バックエンドはハンドシェイクして全二重 TLS ラッパーで包む ---
     let backend = if use_tls {
-        let insecure = tls_insecure || tls_insecure_env();
+        let insecure = tls_insecure;
         match crate::runtime::time::timeout(
             Duration::from_secs(timeout_secs),
             tls_connect(tcp, sni, insecure),

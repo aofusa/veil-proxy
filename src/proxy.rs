@@ -50,6 +50,20 @@ use crate::simple_tls::SimpleTlsServerStream as ServerTls;
 // 接続処理
 // ====================
 
+/// HTTPS コネクションプールキー（`tls_insecure` 設定毎に分離しプール汚染を防ぐ）
+#[inline]
+fn https_pool_key(host: &str, port: u16, sni: &str, tls_insecure: bool) -> String {
+    let tag = if tls_insecure { "insecure" } else { "verify" };
+    format!("{}:{}:{}:{}", host, port, sni, tag)
+}
+
+/// HTTPS コネクションプールキー（SNI なし）
+#[inline]
+fn https_pool_key_no_sni(host: &str, port: u16, tls_insecure: bool) -> String {
+    let tag = if tls_insecure { "insecure" } else { "verify" };
+    format!("{}:{}:{}", host, port, tag)
+}
+
 /// プロキシ起動時刻（F-21: 管理API /stats 用）
 #[cfg(feature = "admin")]
 static PROXY_START_TIME: once_cell::sync::Lazy<std::time::Instant> =
@@ -2699,8 +2713,13 @@ where
     S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
 {
     // B-28: TLS 済みバックエンド接続をプールから再利用する（TLS ハンドシェイク削減 +
-    // TIME_WAIT によるエフェメラルポート枯渇の防止）。SNI 毎に別プールとする。
-    let pool_key = format!("{}:{}", addr, sni);
+    // TIME_WAIT によるエフェメラルポート枯渇の防止）。SNI と tls_insecure 毎に別プールとする。
+    let pool_key = format!(
+        "{}:{}:{}",
+        addr,
+        sni,
+        if tls_insecure { "insecure" } else { "verify" }
+    );
 
     let mut backend = match HTTPS_POOL.with(|p| p.borrow_mut().get(&pool_key)) {
         Some(stream) => stream,
@@ -5689,9 +5708,12 @@ async fn handle_proxy(
 
     let target = &server.target;
     // コネクションプールキーの生成
-    // HTTPS接続でSNI名が設定されている場合は、異なるSNI名は異なるプールとして扱う
+    // HTTPS: SNI と tls_insecure 毎に別プール（B-30: 検証設定の異なる接続の再利用を防ぐ）
+    let tls_insecure = upstream_group.tls_insecure();
     let pool_key = if target.use_tls && target.sni_name.is_some() {
-        format!("{}:{}:{}", target.host, target.port, target.sni())
+        https_pool_key(&target.host, target.port, target.sni(), tls_insecure)
+    } else if target.use_tls {
+        https_pool_key_no_sni(&target.host, target.port, tls_insecure)
     } else {
         format!("{}:{}", target.host, target.port)
     };
@@ -5851,11 +5873,7 @@ async fn handle_proxy(
 
     let result = if target.use_tls {
         // HTTPS接続（キャッシュ保存はHTTPのみサポート、HTTPSは別途実装が必要）
-        // 設定ファイルの tls_insecure、または環境変数 VEIL_TLS_INSECURE で証明書検証スキップを制御
-        let tls_insecure = upstream_group.tls_insecure()
-            || std::env::var("VEIL_TLS_INSECURE")
-                .map(|v| v == "1" || v == "true")
-                .unwrap_or(false);
+        // 上流証明書検証は per-upstream の tls_insecure のみで制御（B-30: VEIL_TLS_INSECURE はクライアント向け）
         proxy_https_pooled(
             client_stream,
             target,
