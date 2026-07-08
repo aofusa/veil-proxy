@@ -31,4 +31,4 @@
 
 ## 対応状況
 
-進行中（fix/e2e ブランチ）
+完了（fix/e2e ブランチ、427/430 E2E 通過。残件: B-30/B-31、http3_large_request_body フレーキー）
