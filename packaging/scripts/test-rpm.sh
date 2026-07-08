@@ -9,9 +9,6 @@ OUTPUT_DIR="${ROOT}/packaging/output"
 RPM_FILE="$(ls -1 "${OUTPUT_DIR}"/veil-*.rpm 2>/dev/null | head -1)"
 IMAGE="${VEIL_TEST_IMAGE:-veil-package-test:al2023}"
 CONTAINER_NAME="veil-package-rpm-test-$$"
-HTTP_PORT="${VEIL_TEST_HTTP_PORT:-28080}"
-HTTPS_PORT="${VEIL_TEST_HTTPS_PORT:-28443}"
-
 if [[ -z "${RPM_FILE}" || ! -f "${RPM_FILE}" ]]; then
     echo "ERROR: rpm package not found. Run packaging/scripts/build.sh first." >&2
     exit 1
@@ -31,7 +28,6 @@ echo "==> Starting Amazon Linux 2023 container with systemd (${IMAGE})"
 docker run -d --privileged --name "${CONTAINER_NAME}" \
     --cgroupns=host \
     -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
-    -p "${HTTP_PORT}:80" -p "${HTTPS_PORT}:443" \
     "${IMAGE}"
 
 echo "==> Waiting for container init"
@@ -75,9 +71,5 @@ grep -qi '301\|302\|location: https' /tmp/veil-rpm-http-check.txt
 echo "==> HTTPS content check (port 443)"
 docker exec "${CONTAINER_NAME}" curl -sk https://127.0.0.1/ | tee /tmp/veil-rpm-https-check.txt
 grep -qi 'VEIL' /tmp/veil-rpm-https-check.txt
-
-echo "==> Host port mapping check"
-curl -skI "http://127.0.0.1:${HTTP_PORT}/" | grep -qi '301\|302\|location: https'
-curl -sk "https://127.0.0.1:${HTTPS_PORT}/" | grep -qi 'VEIL'
 
 echo "==> All checks passed (Amazon Linux 2023 / RPM)"

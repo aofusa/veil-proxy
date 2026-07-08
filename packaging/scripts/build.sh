@@ -38,12 +38,14 @@ EOF
 }
 
 RPM_ONLY_INTERNAL=0
+DEB_ONLY_INTERNAL=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --docker) USE_DOCKER=1; shift ;;
         --skip-build) SKIP_BUILD=1; shift ;;
         --binary) SKIP_BUILD=1; BINARY_PATH="$2"; shift 2 ;;
         --rpm-only-internal) RPM_ONLY_INTERNAL=1; shift ;;
+        --deb-only-internal) DEB_ONLY_INTERNAL=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
     esac
@@ -95,24 +97,58 @@ build_binary_docker() {
     local target="${RUST_TARGET:-x86_64-unknown-linux-gnu}"
     local libc="${LIBC_VERSION:-.2.28}"
     mkdir -p "${BUILD_DIR}"
-    docker build -f "${DOCKER_DIR}/Dockerfile.build" \
-        --target export-binary \
+    docker build -f "${ROOT}/docker/Dockerfile.glibc" \
         --build-arg CARGO_FEATURES="${features}" \
         --build-arg RUST_TARGET="${target}" \
         --build-arg LIBC_VERSION="${libc}" \
-        -t veil-package-builder:local \
+        -t veil:glibc \
         "${ROOT}"
-    docker run --rm --entrypoint cat veil-package-builder:local /veil > "${BUILD_DIR}/veil"
+    
+    local cid
+    cid=$(docker create veil:glibc)
+    docker cp "${cid}:/veil" "${BUILD_DIR}/veil"
+    docker rm "${cid}"
+    
     chmod +x "${BUILD_DIR}/veil"
     BINARY_PATH="${BUILD_DIR}/veil"
 }
 
-if [[ "${SKIP_BUILD}" -eq 0 ]]; then
-    if [[ "${USE_DOCKER}" -eq 1 ]]; then
+if [[ "${USE_DOCKER}" -eq 1 && "${RPM_ONLY_INTERNAL}" -eq 0 && "${DEB_ONLY_INTERNAL}" -eq 0 ]]; then
+    if [[ "${SKIP_BUILD}" -eq 0 ]]; then
         build_binary_docker
-    else
-        build_binary_native
+    elif [[ -z "${BINARY_PATH}" ]]; then
+        BINARY_PATH="${ROOT}/target/release/veil"
     fi
+    if [[ ! -f "${BINARY_PATH}" ]]; then
+        echo "ERROR: binary not found: ${BINARY_PATH}" >&2
+        exit 1
+    fi
+
+    echo "==> Packaging in Docker (ubuntu:24.04)"
+    rel_binary="${BINARY_PATH#"${ROOT}/"}"
+    docker run --rm \
+        -v "${ROOT}:/src" \
+        -w /src \
+        ubuntu:24.04 bash -c "
+            set -euo pipefail
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq
+            apt-get install -y -qq dpkg-dev rpm
+            ./packaging/scripts/build.sh --skip-build --binary /src/${rel_binary}
+        "
+    
+    if command -v docker >/dev/null 2>&1; then
+        docker run --rm -v "${ROOT}:/src" alpine:3.20 \
+            chown -R "$(id -u):$(id -g)" /src/packaging/output 2>/dev/null || true
+    fi
+    
+    echo "==> All packages built in ${OUTPUT_DIR}/"
+    ls -lh "${OUTPUT_DIR}/"
+    exit 0
+fi
+
+if [[ "${SKIP_BUILD}" -eq 0 ]]; then
+    build_binary_native
 elif [[ -z "${BINARY_PATH}" ]]; then
     BINARY_PATH="${ROOT}/target/release/veil"
 fi
@@ -142,17 +178,38 @@ stage_rootfs() {
 
 build_deb() {
     echo "==> Building ${DEB_NAME}"
-    local staging="${PKG_ROOT}/staging-deb"
-    stage_rootfs "${staging}"
+    if command -v dpkg-deb >/dev/null 2>&1; then
+        local staging="${PKG_ROOT}/staging-deb"
+        stage_rootfs "${staging}"
 
-    mkdir -p "${staging}/DEBIAN"
-    sed "s/^Version: .*/Version: ${VERSION}/" "${PKG_ROOT}/debian/DEBIAN/control" > "${staging}/DEBIAN/control"
-    sed -i "s/^Architecture: .*/Architecture: ${DEB_ARCH}/" "${staging}/DEBIAN/control"
-    install -m 0755 "${PKG_ROOT}/debian/DEBIAN/postinst" "${staging}/DEBIAN/postinst"
-    install -m 0755 "${PKG_ROOT}/debian/DEBIAN/prerm" "${staging}/DEBIAN/prerm"
+        mkdir -p "${staging}/DEBIAN"
+        sed "s/^Version: .*/Version: ${VERSION}/" "${PKG_ROOT}/debian/DEBIAN/control" > "${staging}/DEBIAN/control"
+        sed -i "s/^Architecture: .*/Architecture: ${DEB_ARCH}/" "${staging}/DEBIAN/control"
+        install -m 0755 "${PKG_ROOT}/debian/DEBIAN/postinst" "${staging}/DEBIAN/postinst"
+        install -m 0755 "${PKG_ROOT}/debian/DEBIAN/prerm" "${staging}/DEBIAN/prerm"
 
-    dpkg-deb --build --root-owner-group "${staging}" "${OUTPUT_DIR}/${DEB_NAME}"
-    echo "==> Created ${OUTPUT_DIR}/${DEB_NAME}"
+        dpkg-deb --build --root-owner-group "${staging}" "${OUTPUT_DIR}/${DEB_NAME}"
+        echo "==> Created ${OUTPUT_DIR}/${DEB_NAME}"
+    else
+        echo "==> dpkg-deb not found; using Docker (ubuntu:24.04)"
+        local rel_binary="${BINARY_PATH#"${ROOT}/"}"
+        docker run --rm \
+            -v "${ROOT}:/src" \
+            -w /src \
+            ubuntu:24.04 bash -c "
+                set -euo pipefail
+                export DEBIAN_FRONTEND=noninteractive
+                apt-get update -qq
+                apt-get install -y -qq dpkg-dev
+                ./packaging/scripts/build.sh --skip-build --binary /src/${rel_binary} --deb-only-internal
+            "
+        if [[ -f "${OUTPUT_DIR}/${DEB_NAME}" ]]; then
+            echo "==> Created ${OUTPUT_DIR}/${DEB_NAME}"
+            return
+        fi
+        echo "ERROR: Docker DEB build failed" >&2
+        exit 1
+    fi
 }
 
 build_rpm_tree() {
@@ -206,6 +263,11 @@ build_rpm() {
     cp "${built}" "${OUTPUT_DIR}/${RPM_NAME}"
     echo "==> Created ${OUTPUT_DIR}/${RPM_NAME}"
 }
+
+if [[ "${DEB_ONLY_INTERNAL}" -eq 1 ]]; then
+    build_deb
+    exit 0
+fi
 
 if [[ "${RPM_ONLY_INTERNAL}" -eq 1 ]]; then
     build_rpm_tree

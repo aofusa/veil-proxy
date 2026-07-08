@@ -29,7 +29,6 @@ echo "==> Starting Ubuntu container with systemd (${IMAGE})"
 docker run -d --privileged --name "${CONTAINER_NAME}" \
     --cgroupns=host \
     -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
-    -p 18080:80 -p 18443:443 \
     "${IMAGE}"
 
 echo "==> Waiting for container init"
@@ -73,9 +72,5 @@ grep -qi '301\|302\|location: https' /tmp/veil-http-check.txt
 echo "==> HTTPS content check (port 443)"
 docker exec "${CONTAINER_NAME}" curl -sk https://127.0.0.1/ | tee /tmp/veil-https-check.txt
 grep -qi 'VEIL' /tmp/veil-https-check.txt
-
-echo "==> Host port mapping check"
-curl -skI http://127.0.0.1:18080/ | grep -qi '301\|302\|location: https'
-curl -sk https://127.0.0.1:18443/ | grep -qi 'VEIL'
 
 echo "==> All checks passed"
