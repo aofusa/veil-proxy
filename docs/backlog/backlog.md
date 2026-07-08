@@ -44,7 +44,7 @@
 | ID | 優先度 | 対応状況 | ドキュメント | 概要 |
 |----|--------|----------|--------------|------|
 | F-02 | P1 | 完了 | [features/e2e-test-hardening.md](features/e2e-test-hardening.md) | E2E の網羅・実装乖離の解消（369 テスト中 368～369 通過、負荷フレーキー1件を除き全通過） |
-| F-90 | P1 | 完了 | [features/e2e-coverage-expansion.md](features/e2e-coverage-expansion.md) | e2e_test_coverage.md ギャップ解消（427/430 通過、B-29 修正、新規 E2E 11 件、残り B-30/B-31 + フレーキー1 件） |
+| F-90 | P1 | 完了 | [features/e2e-coverage-expansion.md](features/e2e-coverage-expansion.md) | e2e_test_coverage.md ギャップ解消（430/430 通過、B-29〜B-31 修正、新規 E2E 11 件、`#[ignore]` 0 件） |
 | F-03 | P1 | 完了 | [features/tls-cert-zero-downtime.md](features/tls-cert-zero-downtime.md) | 0 ダウンタイム TLS 証明書更新 |
 | F-04 | P1 | 未着手 | [features/vds-xds-dynamic-config.md](features/vds-xds-dynamic-config.md) | 動的設定配信 API（VDS / xDS 相当） |
 | F-06 | P1 | 完了 | [features/resilience-outlier-detection.md](features/resilience-outlier-detection.md) | サーキットブレーカー・リトライ・異常検知 |
@@ -182,8 +182,8 @@
 | B-33 | P2 | 未着手 | [bugs/B-33-l4-listener-upstream-dns-startup.md](bugs/B-33-l4-listener-upstream-dns-startup.md) | L4 リスナーが上流 DNS 未解決で起動失敗（4443 未待受）。F-90 l4_flood_probe で検出 |
 | B-34 | P2 | 未着手 | [bugs/B-34-http3-quiche-client-response-timeout.md](bugs/B-34-http3-quiche-client-response-timeout.md) | HTTP/3 quiche クライアントが GET `/` で応答タイムアウト（TLS 経路は 200）。F-90 http3-client で検出 |
 | B-29 | P1 | 完了 | [bugs/B-29-http2-upstream-tls-insecure-ignored.md](bugs/B-29-http2-upstream-tls-insecure-ignored.md) | HTTP/2 上流 HTTPS で `tls_insecure` 無視 → 自己署名バックエンドへ 502（UnknownIssuer）。E2E 214 件連鎖失敗の根本原因。**修正済み**: `handle_http2_proxy_https` + H2 ストリーミング経路で `get_tls_connector_insecure()` を使用 |
-| B-30 | P2 | 未着手 | [bugs/B-30-veil-tls-insecure-overrides-upstream-verify.md](bugs/B-30-veil-tls-insecure-overrides-upstream-verify.md) | `VEIL_TLS_INSECURE=1` が per-upstream `tls_insecure=false` を上書きし厳密証明書検証 E2E が無意味化 |
-| B-31 | P2 | 未着手 | [bugs/B-31-l4-tls-terminate-e2e-timeout.md](bugs/B-31-l4-tls-terminate-e2e-timeout.md) | L4 `tls=terminate` リスナー（8446）が E2E でタイムアウト。passthrough/least_conn は正常 |
+| B-30 | P2 | 完了 | [bugs/B-30-veil-tls-insecure-overrides-upstream-verify.md](bugs/B-30-veil-tls-insecure-overrides-upstream-verify.md) | `VEIL_TLS_INSECURE=1` が per-upstream `tls_insecure=false` を上書き。**修正済み**: 上流経路から env OR を削除し per-upstream 設定のみに |
+| B-31 | P2 | 完了 | [bugs/B-31-l4-tls-terminate-e2e-timeout.md](bugs/B-31-l4-tls-terminate-e2e-timeout.md) | L4 `tls=terminate` リスナー（8446）が E2E でタイムアウト。**修正済み**: `src/l4/proxy.rs` に TLS 終端 + 平文転送を実装 |
 
 ---
 

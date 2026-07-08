@@ -555,6 +555,14 @@ servers = [
 ]
 tls_insecure = true
 
+# F-44: HTTPS echo バックエンド（自己署名証明書・TLS ストリーミング検証用）
+[upstreams."tls-echo-pool"]
+algorithm = "round_robin"
+servers = [
+    "https://127.0.0.1:${BACKEND_TLS_ECHO_PORT}"
+]
+tls_insecure = true
+
 # 厳密証明書検証用（自己署名証明書は拒否される想定）
 [upstreams."strict-cert-pool"]
 algorithm = "round_robin"
@@ -877,7 +885,7 @@ host = "localhost"
 path = "/echo-upload-tls/*"
 [route.action]
 type = "Proxy"
-url = "https://127.0.0.1:${BACKEND_TLS_ECHO_PORT}"
+upstream = "tls-echo-pool"
 
 [[route]]
 [route.conditions]
@@ -885,7 +893,7 @@ host = "127.0.0.1"
 path = "/echo-upload-tls/*"
 [route.action]
 type = "Proxy"
-url = "https://127.0.0.1:${BACKEND_TLS_ECHO_PORT}"
+upstream = "tls-echo-pool"
 
 # タイムアウトテスト用ルート (存在しないポートへ転送)
 [[route]]

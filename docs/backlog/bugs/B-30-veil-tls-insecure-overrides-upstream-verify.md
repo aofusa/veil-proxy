@@ -22,4 +22,4 @@
 
 ## 対応状況
 
-未着手
+完了（2026-07-08）: `proxy.rs` / `http3_server.rs` / `http3_stream.rs` から上流経路の `VEIL_TLS_INSECURE` OR を削除。HTTPS プールキーに `tls_insecure` タグを追加しプール汚染を防止。E2E の `/echo-upload-tls/*` を `tls-echo-pool`（`tls_insecure=true`）へ移行。`test_e2e_upstream_strict_cert_rejects` の `#[ignore]` を解除。

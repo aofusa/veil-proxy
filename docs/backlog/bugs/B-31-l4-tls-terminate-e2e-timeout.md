@@ -21,4 +21,4 @@ L4 passthrough（8444）・least_conn（8445）は正常。
 
 ## 対応状況
 
-未着手
+完了（2026-07-08）: `src/l4/proxy.rs` に TLS 終端実装（サーバー TLS ハンドシェイク + 平文 upstream 双方向転送）。`test_e2e_l4_tls_terminate_forward` の `#[ignore]` を解除。
