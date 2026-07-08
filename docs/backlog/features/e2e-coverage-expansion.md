@@ -31,4 +31,4 @@
 
 ## 対応状況
 
-完了（fix/e2e ブランチ、430/430 E2E 実装・`#[ignore]` 0 件。B-29〜B-31 修正済み。既知フレーキー: `test_concurrent_connection_stress` 等の負荷系）
+完了（fix/e2e ブランチ、430/430 E2E 実装・`#[ignore]` 0 件。B-35〜B-37 修正済み。既知フレーキー: `test_concurrent_connection_stress` 等の負荷系）

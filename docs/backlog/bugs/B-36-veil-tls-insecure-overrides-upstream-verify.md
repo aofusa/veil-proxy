@@ -1,4 +1,4 @@
-# B-30: VEIL_TLS_INSECURE が per-upstream tls_insecure=false を上書きする
+# B-36: VEIL_TLS_INSECURE が per-upstream tls_insecure=false を上書きする
 
 ## 事象
 
