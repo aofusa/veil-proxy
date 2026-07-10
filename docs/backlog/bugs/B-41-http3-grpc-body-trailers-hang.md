@@ -47,4 +47,5 @@ quiche 0.24 では **初期応答ヘッダ専用**が `send_response`、**後続
 
 ## 対応状況
 
-進行中（fix/test）
+完了（2026-07-10）。`send_additional_headers` 化 + 初期ヘッダフィルタ + E2E 成功パス固定。  
+回帰: `test_grpc_over_http3` / metadata / error_handling / streaming すべて PASS。

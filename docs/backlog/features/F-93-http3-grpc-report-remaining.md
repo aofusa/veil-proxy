@@ -51,11 +51,11 @@ H2 向け Slowloris/RST・H3 handshake/amplification を対象とした。
 
 ## 受け入れ条件
 
-- [ ] レポート 2.1 の未実装テストが実ロジックを持ち E2E で実行される
-- [ ] `grpc_probe` が HTTP/3(QUIC) 向け攻撃ケースを含む
-- [ ] 失敗切り分けが `docs/artifacts/` に記録される
-- [ ] full / default / no-default / 主要 features でビルド警告・エラーなし
-- [ ] `allow(dead_code)` を理由なしに追加しない
+- [x] レポート 2.1 の未実装テストが実ロジックを持ち E2E で実行される
+- [x] `grpc_probe` が HTTP/3(QUIC) 向け攻撃ケースを含む
+- [x] 失敗切り分けが `docs/artifacts/` に記録される
+- [x] full / default / no-default / 主要 features でビルド警告・エラーなし
+- [x] `allow(dead_code)` を理由なしに追加しない
 
 ## 依存・リスク
 
@@ -65,4 +65,6 @@ H2 向け Slowloris/RST・H3 handshake/amplification を対象とした。
 
 ## 対応状況
 
-進行中（fix/test）
+完了（fix/test）。実装中に **B-41** を検出・修正。  
+詳細: `docs/artifacts/f93_failed_tests_report.md`  
+検証: E2E 445/445、単体 712、container_security ok、feature ビルド 0 警告

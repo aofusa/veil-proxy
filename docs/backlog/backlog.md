@@ -126,7 +126,7 @@
 | F-90 | P1 | 完了 | [features/F-90-container-security-full-features.md](features/F-90-container-security-full-features.md) | container_security full features 網羅（14 プローブ + http3/ws クライアント + テストケース文書 + 実行検証）。B-29〜B-30・B-32〜B-34 修正済み、B-31 は意図的設計で保留 |
 | F-91 | P1 | 完了 | [features/F-91-http3-grpc-coverage.md](features/F-91-http3-grpc-coverage.md) | HTTP/3・gRPC の E2E/container_security 網羅。不足ケース実装済。失敗は B-38/B-39。正本: `docs/artifacts/required_test_cases.md` |
 | F-92 | P1 | 完了 | [features/F-92-http3-grpc-detailed-coverage.md](features/F-92-http3-grpc-detailed-coverage.md) | http3_grpc_test_coverage_report 指摘の E2E 詳細5件 + gRPC Slowloris/RST flood + H3 handshake/amplification。B-40 修正済み |
-| F-93 | P1 | 進行中 | [features/F-93-http3-grpc-report-remaining.md](features/F-93-http3-grpc-report-remaining.md) | http3_grpc_test_coverage_report 残件: connection_reuse / early_data / gRPC over H3 streaming・metadata・error + QUIC gRPC 攻撃プローブ |
+| F-93 | P1 | 完了 | [features/F-93-http3-grpc-report-remaining.md](features/F-93-http3-grpc-report-remaining.md) | http3_grpc_test_coverage_report 残件: connection_reuse / early_data / gRPC over H3 streaming・metadata・error + QUIC gRPC 攻撃プローブ。B-41 修正済み |
 | F-73 | P1 | 完了 | [features/F-73-http2-send-zerocopy-writeall.md](features/F-73-http2-send-zerocopy-writeall.md) | HTTP/2 送信ホットパスの write_all ゼロコピー化（per-frame の 2 度目の to_vec 確保+コピーを排除）。A/B で **HTTP/2 +11.6%**（1577→1761 req/s、nginx 比 75%→84%）、HTTP/1.1 不変・応答ボディ sha256 一致。レポート `docs/artifacts/performance_report_veil_vs_nginx_v3.md` |
 | F-74 | P1 | 完了 | [features/F-74-http2-send-frame-coalescing.md](features/F-74-http2-send-frame-coalescing.md) | HTTP/2 送信ホットパスのフレーム連結（HEADERS/DATA コアレッシング）。1 レスポンス分のフレームを接続再利用連結バッファ `write_buf`（スレッドローカルプール）へ積み **1 回の書き込み** で送出。`encode_*_into` 追記 API・`send_headers_buffered`・128KB 途中フラッシュ閾値を追加。per-frame 送信システムコールを削減。単体 660 / http2 E2E 11 / gRPC E2E 35 グリーン。F-73 続き |
 | F-11 | P3 | 未着手 | [features/dashboard.md](features/dashboard.md) | ダッシュボード機能 |
@@ -190,7 +190,7 @@
 | B-38 | P1 | 完了 | [bugs/B-38-http3-wasm-response-headers-not-applied.md](bugs/B-38-http3-wasm-response-headers-not-applied.md) | HTTP/3 WASM レスポンスヘッダ未適用 → `apply_h3_wasm_response_headers` で修正。`test_http3_wasm_integration` PASS |
 | B-39 | P1 | 完了 | [bugs/B-39-http3-grpc-proxy-502.md](bugs/B-39-http3-grpc-proxy-502.md) | HTTP/3 gRPC 502 → H2C 上流 + フルパス保持で修正。`test_grpc_over_http3` PASS |
 | B-40 | P1 | 完了 | [bugs/B-40-grpc-path-prefix-stripping.md](bugs/B-40-grpc-path-prefix-stripping.md) | H1/H2 gRPC が `/*` プレフィックス除去で UNIMPLEMENTED/502。フルパス保持 + H2 use_h2c + HPACK 小文字化で修正（F-92） |
-| B-41 | P1 | 進行中 | [bugs/B-41-http3-grpc-body-trailers-hang.md](bugs/B-41-http3-grpc-body-trailers-hang.md) | HTTP/3 gRPC ボディあり応答が trailers API 誤用でハング（`send_response` → `send_additional_headers`） |
+| B-41 | P1 | 完了 | [bugs/B-41-http3-grpc-body-trailers-hang.md](bugs/B-41-http3-grpc-body-trailers-hang.md) | HTTP/3 gRPC ボディあり応答が trailers API 誤用でハング → `send_additional_headers` で修正（F-93） |
 
 ---
 
