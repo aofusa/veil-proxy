@@ -13,12 +13,17 @@ use tokio_rustls::rustls::ClientConfig;
 use tokio_rustls::TlsConnector;
 
 /// HTTP/2テストクライアント
-#[allow(dead_code)]
+///
+/// `ping_pong` は F-96 gRPC Keepalive 検証用。handshake 直後に一度だけ取得し、
+/// バックグラウンド Connection タスクと共有する（h2 は 1 接続 1 PingPong）。
+#[allow(dead_code)] // テストヘルパ: 一部メソッドは個別 E2E のみから呼ばれる
 pub struct Http2TestClient {
     sender: SendRequest<Bytes>,
+    /// HTTP/2 PING 用ハンドル（取得済みなら Some）
+    ping_pong: Option<h2::PingPong>,
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // テストヘルパ全体: 未使用メソッドが feature 組み合わせで残る
 impl Http2TestClient {
     /// 新しいHTTP/2クライアントを作成
     pub async fn new(
@@ -35,7 +40,10 @@ impl Http2TestClient {
         let tls_stream = connector.connect(server_name, tcp).await?;
 
         // HTTP/2ハンドシェイク
-        let (sender, connection) = h2::client::handshake(tls_stream).await?;
+        let (sender, mut connection) = h2::client::handshake(tls_stream).await?;
+
+        // PING ハンドルを Connection から取得（後から取れないため先に取り出す）
+        let ping_pong = connection.ping_pong();
 
         // 接続をバックグラウンドで維持
         tokio::spawn(async move {
@@ -44,7 +52,17 @@ impl Http2TestClient {
             }
         });
 
-        Ok(Self { sender })
+        Ok(Self { sender, ping_pong })
+    }
+
+    /// HTTP/2 PING を送信し ACK（PONG）を待つ。gRPC keepalive 検証用（F-96）。
+    pub async fn ping(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let pp = self
+            .ping_pong
+            .as_mut()
+            .ok_or("HTTP/2 PingPong handle unavailable")?;
+        let _pong = pp.ping(h2::Ping::opaque()).await?;
+        Ok(())
     }
 
     /// HTTPリクエストを送信
@@ -247,6 +265,82 @@ impl Http2TestClient {
         }
         send_body.send_reset(h2::Reason::CANCEL);
         Ok(())
+    }
+
+    /// ボディの途中（end_stream=false）で Trailers を挿入する攻撃/異常系検証用（F-96）。
+    /// プロトコル違反になり得るが、プロキシが panic/hang しないことを確認する。
+    pub async fn send_premature_trailers(
+        &mut self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body_partial: &[u8],
+        trailers: &[(&str, &str)],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut builder = Request::builder().method(method).uri(path);
+        if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
+            builder = builder.header("host", "localhost");
+        }
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let request = builder.body(())?;
+        let (response_future, mut send_body) = self.sender.send_request(request, false)?;
+        if !body_partial.is_empty() {
+            send_body.send_data(Bytes::copy_from_slice(body_partial), false)?;
+        }
+        let mut map = http::HeaderMap::new();
+        for (name, value) in trailers {
+            map.insert(
+                http::HeaderName::from_bytes(name.as_bytes())?,
+                http::HeaderValue::from_str(value)?,
+            );
+        }
+        // Trailers 送信は end-stream 扱い。ボディ未完のまま trailers を送る。
+        let _ = send_body.send_trailers(map);
+        // 応答は待たず（攻撃完了）— future を drop してキャンセル相当にもできるが
+        // ここでは短時間だけ待つ
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), response_future).await;
+        Ok(())
+    }
+
+    /// 同時に N 本のストリームを開き（ボディ遅延）、MAX_CONCURRENT_STREAMS 境界を刺激する。
+    /// 開いたストリーム数と、エラーで止まった場合の理由を返す。
+    pub async fn open_many_streams(
+        &mut self,
+        path: &str,
+        headers: &[(&str, &str)],
+        count: usize,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let mut opened = 0usize;
+        let mut pending = Vec::new();
+        for i in 0..count {
+            let mut builder = Request::builder().method("POST").uri(path);
+            if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
+                builder = builder.header("host", "localhost");
+            }
+            for (name, value) in headers {
+                builder = builder.header(*name, *value);
+            }
+            // ストリーム識別用
+            builder = builder.header("x-stream-idx", i.to_string());
+            let request = builder.body(())?;
+            match self.sender.send_request(request, false) {
+                Ok((fut, mut send_body)) => {
+                    // 最小ボディを end=false で送り half-open を維持
+                    let _ = send_body.send_data(Bytes::from_static(b"\x00\x00\x00\x00\x00"), false);
+                    pending.push((fut, send_body));
+                    opened += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        // 短時間待ってからリセット解放
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        for (_fut, mut send_body) in pending {
+            send_body.send_reset(h2::Reason::CANCEL);
+        }
+        Ok(opened)
     }
 
     async fn collect_response(

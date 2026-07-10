@@ -19444,3 +19444,489 @@ async fn test_grpc_wasm_interceptor() {
         resp.headers
     );
 }
+
+// =============================================================================
+// F-96: http3_grpc_test_coverage_report §5 — エッジケース / リソース枯渇
+// =============================================================================
+
+/// E-H3-F96-01: 様々なボディサイズでの HTTP/3 転送（PMTU/断片化の近似検証）。
+/// 真の Path MTU Discovery は NIC/ルーティング依存のため、巨大 UDP ペイロード相当の
+/// リクエストボディを複数サイズで送り、プロキシがクラッシュせず処理することを確認する。
+#[tokio::test]
+#[ntest::timeout(60000)]
+#[cfg(feature = "http3")]
+async fn test_http3_pmtu_payload_sizes() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    use common::http3_client::send_http3_request_full;
+
+    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .unwrap();
+    let (_client, mut send_request) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("HTTP/3 client for PMTU");
+
+    // 典型的 QUIC 初期 MTU 付近〜大きめ（断片化を誘発し得る）サイズ群
+    let sizes = [512usize, 1200, 2400, 8000, 16000, 32000, 64000];
+    let mut ok = 0usize;
+    for &sz in &sizes {
+        let body = vec![b'P'; sz];
+        let result = tokio::time::timeout(
+            Duration::from_secs(15),
+            send_http3_request_full(
+                &mut send_request,
+                "POST",
+                "/echo-upload/pmtu",
+                &[("content-type", "application/octet-stream")],
+                Some(&body),
+            ),
+        )
+        .await;
+        match result {
+            Ok(Ok(resp)) => {
+                eprintln!("PMTU size={} status={} body_len={}", sz, resp.status, resp.body.len());
+                // 200 または 404/405 等でも「到達・応答」していれば MTU 経路は生存
+                if resp.status < 600 {
+                    ok += 1;
+                }
+            }
+            Ok(Err(e)) => {
+                eprintln!("PMTU size={} request error (controlled): {}", sz, e);
+                // 接続が死んだ場合は再接続して継続
+                match Http3TestClient::new(server_addr, "localhost").await {
+                    Ok((_c, sr)) => {
+                        send_request = sr;
+                        ok += 1; // プロキシ生存
+                    }
+                    Err(re) => panic!("proxy dead after PMTU size={}: {}", sz, re),
+                }
+            }
+            Err(_) => panic!("PMTU size={} hung for 15s", sz),
+        }
+    }
+    assert!(
+        ok >= sizes.len().saturating_sub(1),
+        "most PMTU payload sizes should complete without hang, ok={}/{}",
+        ok,
+        sizes.len()
+    );
+    assert!(
+        is_e2e_environment_ready().await,
+        "proxy must survive PMTU payload stress"
+    );
+}
+
+/// E-H3-F96-02: Connection ID 更新相当 — 切断後に新接続（新 CID）でセッション維持。
+/// quinn クライアントは NEW_CONNECTION_ID フレームを直接操作できないため、
+/// 接続 drop → 再接続（新 SCID）→ 正常リクエスト で追従性を検証する。
+#[tokio::test]
+#[ntest::timeout(30000)]
+#[cfg(feature = "http3")]
+async fn test_http3_cid_update_retire_simulation() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    use common::http3_client::send_http3_request_full;
+
+    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .unwrap();
+
+    // 接続 A
+    let (client_a, mut sr_a) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("H3 conn A");
+    let r1 = send_http3_request_full(&mut sr_a, "GET", "/", &[], None)
+        .await
+        .expect("request on CID A");
+    assert_eq!(r1.status, 200, "first request on conn A");
+
+    // 接続 A を明示 drop（旧 CID をリタイア相当）
+    drop(sr_a);
+    drop(client_a);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // 接続 B（新しい Connection ID）
+    let (_client_b, mut sr_b) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("H3 conn B after CID retire");
+    let r2 = send_http3_request_full(&mut sr_b, "GET", "/", &[], None)
+        .await
+        .expect("request on CID B");
+    assert_eq!(r2.status, 200, "request on new CID must succeed");
+
+    // 旧接続後もプロキシ健全
+    let r3 = send_http3_request_full(&mut sr_b, "GET", "/health", &[], None)
+        .await
+        .expect("health after CID rotation");
+    assert!(
+        r3.status == 200 || r3.status == 404,
+        "proxy must serve after CID rotation, status={}",
+        r3.status
+    );
+    eprintln!("HTTP/3 CID update/retire simulation: ok");
+}
+
+/// E-H3-F96-03: QUIC Keep-Alive — アイドル後も接続が意図せず切れないこと。
+#[tokio::test]
+#[ntest::timeout(45000)]
+#[cfg(feature = "http3")]
+async fn test_http3_quic_keepalive_idle() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    use common::http3_client::send_http3_request_full;
+
+    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .unwrap();
+    let (_client, mut send_request) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("H3 client for keepalive");
+
+    let warm = send_http3_request_full(&mut send_request, "GET", "/", &[], None)
+        .await
+        .expect("warm-up");
+    assert_eq!(warm.status, 200);
+
+    // サーバ max_idle_timeout 既定 30s 未満のアイドル（PING/keep-alive 相当の待機）
+    let idle = Duration::from_secs(12);
+    eprintln!("HTTP/3 keepalive: idling for {:?} ...", idle);
+    tokio::time::sleep(idle).await;
+
+    let after = tokio::time::timeout(
+        Duration::from_secs(10),
+        send_http3_request_full(&mut send_request, "GET", "/", &[], None),
+    )
+    .await;
+
+    match after {
+        Ok(Ok(resp)) => {
+            assert_eq!(
+                resp.status, 200,
+                "request after idle should succeed on same conn"
+            );
+            eprintln!("HTTP/3 keepalive: same-conn request ok after idle");
+        }
+        Ok(Err(e)) => {
+            // 接続が idle timeout で閉じた場合は再接続できれば合格（意図的タイムアウト設定）
+            eprintln!("HTTP/3 keepalive: conn closed after idle ({}), reconnecting", e);
+            let (_c, mut sr) = Http3TestClient::new(server_addr, "localhost")
+                .await
+                .expect("reconnect after idle");
+            let resp = send_http3_request_full(&mut sr, "GET", "/", &[], None)
+                .await
+                .expect("request after reconnect");
+            assert_eq!(resp.status, 200, "proxy must accept after idle reconnect");
+        }
+        Err(_) => panic!("HTTP/3 request after idle hung"),
+    }
+}
+
+/// E-H3-F96-04: GOAWAY / Graceful — SIGHUP リロード中も H3 がドレインされ新規接続可能。
+#[tokio::test]
+#[ntest::timeout(45000)]
+#[cfg(feature = "http3")]
+async fn test_http3_goaway_graceful_reload() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    use common::http3_client::send_http3_request_full;
+
+    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .unwrap();
+    let (_client, mut h3_sr) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("H3 before reload");
+
+    let before = send_http3_request_full(&mut h3_sr, "GET", "/", &[], None)
+        .await
+        .expect("before SIGHUP");
+    assert_eq!(before.status, 200);
+
+    // SIGHUP で graceful reload（GOAWAY 相当の接続ドレインを誘発し得る）
+    let pid = proxy_pid();
+    if let Some(pid) = pid {
+        assert!(send_sighup(pid), "SIGHUP must be delivered");
+        tokio::time::sleep(Duration::from_millis(800)).await;
+    } else {
+        eprintln!("WARN: proxy.pid missing; skipping SIGHUP, verifying reconnect only");
+    }
+
+    // 既存ストリーム上のリクエスト（接続が残っていれば成功、閉じていれば再接続）
+    let mid = tokio::time::timeout(
+        Duration::from_secs(10),
+        send_http3_request_full(&mut h3_sr, "GET", "/", &[], None),
+    )
+    .await;
+    match mid {
+        Ok(Ok(resp)) => {
+            eprintln!("H3 mid-reload same-conn status={}", resp.status);
+            assert!(resp.status < 600);
+        }
+        Ok(Err(e)) => eprintln!("H3 mid-reload conn closed (expected possible): {}", e),
+        Err(_) => panic!("H3 mid-reload hung"),
+    }
+
+    // 新規接続が必ず通ること
+    let (_c2, mut sr2) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("H3 after graceful reload");
+    let after = send_http3_request_full(&mut sr2, "GET", "/", &[], None)
+        .await
+        .expect("after graceful reload");
+    assert_eq!(after.status, 200, "new H3 after reload must work");
+
+    // HTTP/1.1 も生存
+    let h1 = send_request(PROXY_PORT, "/", &[]).await;
+    assert!(h1.is_some(), "H1 must work after H3 graceful reload test");
+    eprintln!("HTTP/3 GOAWAY/graceful reload simulation: ok");
+}
+
+/// E-G-F96-05: gRPC リトライと Hedging（並行投機リクエスト）の透過制御。
+#[tokio::test]
+#[ntest::timeout(45000)]
+#[cfg(all(feature = "http2", feature = "grpc"))]
+async fn test_grpc_retry_and_hedging() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    // --- リトライ: エラー経路の後に成功経路へ再試行 ---
+    let mut client = Http2TestClient::new("127.0.0.1", PROXY_PORT)
+        .await
+        .expect("h2 for retry");
+    let headers = [
+        ("content-type", "application/grpc"),
+        ("te", "trailers"),
+    ];
+    let err_body = encode_grpc_lpm(&encode_simple_request("retry-probe"));
+    let err = client
+        .send_request_full(
+            "POST",
+            "/grpc.test.v1.TestService/StreamReset",
+            &headers,
+            Some(&err_body),
+        )
+        .await
+        .expect("stream reset for retry setup");
+    // StreamReset は INTERNAL 等の非 0 を返す想定
+    let st = err.grpc_status();
+    eprintln!("gRPC retry setup: status={} grpc_status={:?}", err.status, st);
+
+    // 直後の Unary リトライが成功すること
+    let ok_body = encode_grpc_lpm(&encode_simple_request("retry-ok"));
+    let ok = client
+        .send_request_full(
+            "POST",
+            "/grpc.test.v1.TestService/UnaryCall",
+            &headers,
+            Some(&ok_body),
+        )
+        .await
+        .expect("retry unary");
+    assert_eq!(ok.status, 200, "retry unary must be HTTP 200");
+    assert_eq!(
+        ok.grpc_status(),
+        Some(0),
+        "retry unary grpc-status must be 0, got {:?}",
+        ok.grpc_status()
+    );
+
+    // --- Hedging: 同一 RPC を複数接続から並行発行し、いずれも完了すること ---
+    // Http2TestClient は sender を &mut 占有するため、並行は複数クライアントで近似する。
+    let bodies: Vec<Vec<u8>> = (0..4)
+        .map(|i| encode_grpc_lpm(&encode_simple_request(&format!("hedge-{}", i))))
+        .collect();
+    let mut handles = Vec::new();
+    for (i, body) in bodies.into_iter().enumerate() {
+        handles.push(tokio::spawn(async move {
+            let mut c = Http2TestClient::new("127.0.0.1", PROXY_PORT)
+                .await
+                .expect("hedge client");
+            let headers = [
+                ("content-type", "application/grpc"),
+                ("te", "trailers"),
+            ];
+            c.send_request_full(
+                "POST",
+                "/grpc.test.v1.TestService/UnaryCall",
+                &headers,
+                Some(&body),
+            )
+            .await
+            .map(|r| (i, r.status, r.grpc_status()))
+        }));
+    }
+    let mut hedge_ok = 0usize;
+    for h in handles {
+        match h.await {
+            Ok(Ok((i, status, gs))) => {
+                eprintln!("hedge[{}]: status={} grpc_status={:?}", i, status, gs);
+                if status == 200 && gs == Some(0) {
+                    hedge_ok += 1;
+                }
+            }
+            Ok(Err(e)) => eprintln!("hedge error: {}", e),
+            Err(e) => eprintln!("hedge join error: {}", e),
+        }
+    }
+    assert!(
+        hedge_ok >= 3,
+        "at least 3/4 hedged RPCs should succeed, ok={}",
+        hedge_ok
+    );
+    eprintln!("gRPC retry + hedging: ok");
+}
+
+/// E-G-F96-06: gRPC Keepalive — HTTP/2 PING がプロキシ越しに ACK されること。
+#[tokio::test]
+#[ntest::timeout(30000)]
+#[cfg(all(feature = "http2", feature = "grpc"))]
+async fn test_grpc_keepalive_ping() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let mut client = Http2TestClient::new("127.0.0.1", PROXY_PORT)
+        .await
+        .expect("h2 for ping");
+
+    // ウォームアップ Unary
+    let headers = [
+        ("content-type", "application/grpc"),
+        ("te", "trailers"),
+    ];
+    let body = encode_grpc_lpm(&encode_simple_request("before-ping"));
+    let warm = client
+        .send_request_full(
+            "POST",
+            "/grpc.test.v1.TestService/UnaryCall",
+            &headers,
+            Some(&body),
+        )
+        .await
+        .expect("warm unary");
+    assert_eq!(warm.status, 200);
+
+    // PING → PONG
+    for i in 0..3 {
+        client
+            .ping()
+            .await
+            .unwrap_or_else(|e| panic!("HTTP/2 PING {} failed: {}", i, e));
+        eprintln!("gRPC keepalive PING {} ACK'd", i);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // アイドル + PING 後も Unary が通る
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    client.ping().await.expect("ping after idle");
+    let body2 = encode_grpc_lpm(&encode_simple_request("after-ping"));
+    let after = client
+        .send_request_full(
+            "POST",
+            "/grpc.test.v1.TestService/UnaryCall",
+            &headers,
+            Some(&body2),
+        )
+        .await
+        .expect("unary after ping");
+    assert_eq!(after.status, 200);
+    assert_eq!(after.grpc_status(), Some(0));
+    eprintln!("gRPC keepalive PING: ok");
+}
+
+/// E-G-F96-07: サーバ起因のストリーム異常終了が適切な gRPC ステータスへ伝播すること。
+#[tokio::test]
+#[ntest::timeout(30000)]
+#[cfg(all(feature = "http2", feature = "grpc"))]
+async fn test_grpc_server_stream_abnormal_termination() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let mut client = Http2TestClient::new("127.0.0.1", PROXY_PORT)
+        .await
+        .expect("h2 for abnormal term");
+    let headers = [
+        ("content-type", "application/grpc"),
+        ("te", "trailers"),
+    ];
+
+    // 1) バックエンドが明示的に INTERNAL を返す StreamReset
+    let body = encode_grpc_lpm(&encode_simple_request("abnormal"));
+    let resp = client
+        .send_request_full(
+            "POST",
+            "/grpc.test.v1.TestService/StreamReset",
+            &headers,
+            Some(&body),
+        )
+        .await
+        .expect("StreamReset call");
+    eprintln!(
+        "StreamReset: status={} grpc_status={:?} msg={:?} trailers={:?}",
+        resp.status,
+        resp.grpc_status(),
+        resp.grpc_message(),
+        resp.trailers
+    );
+    // HTTP 200 + grpc-status != 0 が正常な gRPC エラー伝播
+    assert_eq!(resp.status, 200, "gRPC errors should be HTTP 200 + trailers");
+    let code = resp.grpc_status().expect("grpc-status must be present");
+    // INTERNAL(13) が期待。UNAVAILABLE(14)/UNKNOWN(2)/CANCELLED(1) も許容
+    assert!(
+        matches!(code, 1 | 2 | 13 | 14),
+        "expected INTERNAL/UNAVAILABLE/UNKNOWN/CANCELLED, got {}",
+        code
+    );
+
+    // 2) 存在しないメソッド → UNIMPLEMENTED(12) または NOT_FOUND 系
+    let body2 = encode_grpc_lpm(&encode_simple_request("no-such"));
+    let resp2 = client
+        .send_request_full(
+            "POST",
+            "/grpc.test.v1.TestService/DoesNotExist",
+            &headers,
+            Some(&body2),
+        )
+        .await
+        .expect("missing method");
+    eprintln!(
+        "DoesNotExist: status={} grpc_status={:?}",
+        resp2.status,
+        resp2.grpc_status()
+    );
+    // プロキシがハングせず応答すること
+    assert!(resp2.status < 600);
+
+    // 3) 異常後も通常 Unary が通ること
+    let body3 = encode_grpc_lpm(&encode_simple_request("recover"));
+    let ok = client
+        .send_request_full(
+            "POST",
+            "/grpc.test.v1.TestService/UnaryCall",
+            &headers,
+            Some(&body3),
+        )
+        .await
+        .expect("recover unary");
+    assert_eq!(ok.status, 200);
+    assert_eq!(ok.grpc_status(), Some(0));
+    eprintln!("gRPC server abnormal termination propagation: ok");
+}

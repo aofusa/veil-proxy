@@ -131,6 +131,26 @@ else
     log "SKIP h3spec_run: script missing"
 fi
 
+# ---------------------------------------------------------------------------
+# F-96: レポート §5.2 HTTP/3 エッジ / DoS
+# ---------------------------------------------------------------------------
+
+# S-H3-10: UDP リフレクション/増幅（複数ソースポート Initial flood、3 倍制限）
+run_h3_mode amplification_spoof "h3_amplification_spoof" || true
+check_tls_health "post_h3_amplification_spoof" || true
+
+# S-H3-11: MAX_STREAMS 枯渇（データ無しストリーム大量オープン）
+run_h3_mode max_streams "h3_max_streams_attack" || true
+check_tls_health "post_h3_max_streams" || true
+
+# S-H3-12: Connection Migration スプーフィング
+run_h3_mode migration_spoof "h3_migration_spoof" || true
+check_tls_health "post_h3_migration_spoof" || true
+
+# S-H3-13: QPACK 動的テーブル非同期参照攻撃（近似）
+run_h3_mode qpack_async_ref "h3_qpack_async_ref" || true
+check_tls_health "post_h3_qpack_async_ref" || true
+
 # 最終ヘルス
 check_tls_health "post_http3_tls_health" || true
 

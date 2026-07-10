@@ -6,6 +6,7 @@
 //! - HTTP3_MODE: get | handshake_flood | qpack_bomb | cid_spoof | malformed
 //!               | handshake_slowloris | amplification_check | early_data_replay
 //!               | grpc_malformed | grpc_header_spoof | grpc_slowloris | grpc_stream_reset
+//!               | amplification_spoof | max_streams | migration_spoof | qpack_async_ref
 //! - HTTP3_REPORT
 //! - HTTP3_GRPC_PATH (default /grpc.test.v1.TestService/UnaryCall)
 //! - AMPLIFICATION_STRICT (default 1): amplification_check で ratio>3 をエラーにする
@@ -79,6 +80,15 @@ fn main() {
             .map(|s| format!("grpc_slowloris done detail={}", s)),
         "grpc_stream_reset" => grpc_stream_reset(&host, port, &grpc_path)
             .map(|s| format!("grpc_stream_reset done detail={}", s)),
+        // F-96: レポート §5.2 HTTP/3 セキュリティ
+        "amplification_spoof" => amplification_spoof(&host, port)
+            .map(|s| format!("amplification_spoof {}", s)),
+        "max_streams" => max_streams_attack(&host, port, &path)
+            .map(|s| format!("max_streams done detail={}", s)),
+        "migration_spoof" => migration_spoof(&host, port)
+            .map(|s| format!("migration_spoof done detail={}", s)),
+        "qpack_async_ref" => qpack_async_ref(&host, port, &path)
+            .map(|s| format!("qpack_async_ref done detail={}", s)),
         other => Err(format!("unknown HTTP3_MODE={}", other).into()),
     };
 
@@ -95,6 +105,7 @@ fn main() {
             if mode == "get"
                 || mode.is_empty()
                 || mode == "amplification_check"
+                || mode == "amplification_spoof"
                 || msg.contains("AMPLIFICATION_EXCEEDED")
                 || msg.starts_with("unknown HTTP3_MODE")
             {
@@ -882,6 +893,224 @@ fn grpc_stream_reset(
     Ok(format!(
         "reset stream_id={} closed={}",
         stream_id,
+        session.conn.is_closed()
+    ))
+}
+
+/// F-96: 複数ソースポートから Initial を連打し、応答肥大化（増幅）を計量する。
+/// 真の IP spoof は CAP_NET_RAW が必要なため、別 ephemeral ポートからの Initial flood で近似。
+fn amplification_spoof(host: &str, port: u16) -> Result<String, Box<dyn std::error::Error>> {
+    let peer = resolve(host, port)?;
+    let mut total_sent = 0u64;
+    let mut total_recv = 0u64;
+    let mut sockets = Vec::new();
+
+    // 16 ソースポートから同時に Initial 風パケットを送る
+    for _ in 0..16 {
+        let socket = UdpSocket::bind("0.0.0.0:0")?;
+        socket.set_read_timeout(Some(Duration::from_millis(200)))?;
+        socket.set_write_timeout(Some(Duration::from_secs(2)))?;
+        socket.connect(peer)?;
+        sockets.push(socket);
+    }
+
+    let mut pkt = vec![0u8; 1200];
+    pkt[0] = 0xc0;
+    pkt[1..5].copy_from_slice(&1u32.to_be_bytes());
+    pkt[5] = 8;
+    pkt[14] = 0;
+
+    for round in 0..8 {
+        for (si, socket) in sockets.iter().enumerate() {
+            getrandom::getrandom(&mut pkt[6..14]).ok();
+            pkt[15] = ((round * 16 + si) & 0xff) as u8;
+            getrandom::getrandom(&mut pkt[16..]).ok();
+            if let Ok(n) = socket.send(&pkt) {
+                total_sent += n as u64;
+            }
+        }
+    }
+
+    // 応答を収集（増幅比測定）
+    let start = Instant::now();
+    let mut buf = [0u8; 65535];
+    while start.elapsed() < Duration::from_secs(3) {
+        for socket in &sockets {
+            match socket.recv(&mut buf) {
+                Ok(n) => total_recv += n as u64,
+                Err(_) => {}
+            }
+        }
+    }
+
+    let ratio = if total_sent == 0 {
+        0.0
+    } else {
+        total_recv as f64 / total_sent as f64
+    };
+    let strict = env::var("AMPLIFICATION_STRICT")
+        .map(|v| v != "0" && v != "false")
+        .unwrap_or(true);
+    let detail = format!(
+        "sent={} recv={} ratio={:.3} sockets={}",
+        total_sent,
+        total_recv,
+        ratio,
+        sockets.len()
+    );
+    if strict && ratio > 3.0 && total_sent > 0 {
+        return Err(format!("AMPLIFICATION_EXCEEDED {}", detail).into());
+    }
+    Ok(detail)
+}
+
+/// F-96: データ無し/最小ストリームを MAX_STREAMS 付近まで大量オープン（QUIC Slowloris）。
+fn max_streams_attack(
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut session = establish_h3(host, port, 30_000)?;
+    let mut opened = 0usize;
+    let mut refused = 0usize;
+    // 既定 initial_max_streams_bidi=100 を超える試行
+    for i in 0..150 {
+        let headers = vec![
+            quiche::h3::Header::new(b":method", b"GET"),
+            quiche::h3::Header::new(b":path", path.as_bytes()),
+            quiche::h3::Header::new(b":authority", host.as_bytes()),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b"x-stream-idx", format!("{}", i).as_bytes()),
+        ];
+        // fin=false でストリームを開いたまま維持
+        match session.h3.send_request(&mut session.conn, &headers, false) {
+            Ok(_sid) => opened += 1,
+            Err(_) => {
+                refused += 1;
+                break;
+            }
+        }
+        pump_io(&mut session);
+        let _ = drain_events(&mut session);
+        if session.conn.is_closed() {
+            break;
+        }
+    }
+    // 少し保持してから解放（生存確認はプローブ側）
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(2) {
+        pump_io(&mut session);
+        let _ = drain_events(&mut session);
+        if session.conn.is_closed() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(format!(
+        "opened={} refused={} closed={}",
+        opened,
+        refused,
+        session.conn.is_closed()
+    ))
+}
+
+/// F-96: 正規ハンドシェイク後に別ソースポートから同一 DCID 風パケットを送り
+/// connection migration spoof を刺激する。
+fn migration_spoof(host: &str, port: u16) -> Result<String, Box<dyn std::error::Error>> {
+    let mut session = establish_h3(host, port, 15_000)?;
+    // 正規トラフィックを 1 リクエスト送る
+    let headers = vec![
+        quiche::h3::Header::new(b":method", b"GET"),
+        quiche::h3::Header::new(b":path", b"/"),
+        quiche::h3::Header::new(b":authority", host.as_bytes()),
+        quiche::h3::Header::new(b":scheme", b"https"),
+    ];
+    let _ = session.h3.send_request(&mut session.conn, &headers, true);
+    pump_io(&mut session);
+    let _ = drain_events(&mut session);
+
+    // サーバが観測した DCID はクライアント SCID とは別。short-header 風の偽パケットを
+    // 別ソケット（別 4-tuple）から大量送信してマイグレーション検証を刺激する。
+    let peer = session.peer_addr;
+    let mut spoof_sent = 0usize;
+    for _ in 0..5 {
+        let sock = UdpSocket::bind("0.0.0.0:0")?;
+        sock.set_write_timeout(Some(Duration::from_secs(1)))?;
+        sock.connect(peer)?;
+        let mut pkt = [0u8; 120];
+        for _ in 0..40 {
+            pkt[0] = 0x40; // short header
+            getrandom::getrandom(&mut pkt[1..]).ok();
+            if sock.send(&pkt).is_ok() {
+                spoof_sent += 1;
+            }
+        }
+    }
+
+    // 正規接続が生存しているか（または安全に閉じたか）を確認
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(2) {
+        pump_io(&mut session);
+        let _ = drain_events(&mut session);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(format!(
+        "spoof_sent={} conn_closed={}",
+        spoof_sent,
+        session.conn.is_closed()
+    ))
+}
+
+/// F-96: QPACK 動的テーブル非同期参照の近似 — 巨大・多数ヘッダを複数ストリームで
+/// ほぼ同時に送り、エンコーダ/デコーダ状態の破壊耐性を検証する。
+fn qpack_async_ref(
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut session = establish_h3(host, port, 20_000)?;
+    let big = "Q".repeat(2048);
+    let mut opened = 0usize;
+    for i in 0..12 {
+        let mut headers = vec![
+            quiche::h3::Header::new(b":method", b"GET"),
+            quiche::h3::Header::new(b":path", path.as_bytes()),
+            quiche::h3::Header::new(b":authority", host.as_bytes()),
+            quiche::h3::Header::new(b":scheme", b"https"),
+        ];
+        // 同一名の巨大ヘッダを繰り返し（動的テーブル挿入 + 参照を誘発）
+        for j in 0..8 {
+            let name = format!("x-qpack-{}-{}", i, j % 3);
+            headers.push(quiche::h3::Header::new(name.as_bytes(), big.as_bytes()));
+        }
+        match session.h3.send_request(&mut session.conn, &headers, true) {
+            Ok(_) => opened += 1,
+            Err(e) => {
+                return Ok(format!("stopped early err={} opened={}", e, opened));
+            }
+        }
+        // 意図的に pump を遅らせて順序逆転風の負荷を作る
+        if i % 3 == 0 {
+            pump_io(&mut session);
+            let _ = drain_events(&mut session);
+        }
+    }
+    let start = Instant::now();
+    let mut last_status = None;
+    while start.elapsed() < Duration::from_secs(5) {
+        pump_io(&mut session);
+        let (st, fin) = drain_events(&mut session);
+        if st.is_some() {
+            last_status = st;
+        }
+        if session.conn.is_closed() || fin {
+            break;
+        }
+    }
+    Ok(format!(
+        "opened={} status={:?} closed={}",
+        opened,
+        last_status,
         session.conn.is_closed()
     ))
 }

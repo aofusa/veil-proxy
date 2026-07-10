@@ -284,6 +284,108 @@ check_health "post_h3_grpc_slowloris" || true
 run_h3_grpc_mode grpc_stream_reset "h3_grpc_stream_reset"
 check_health "post_h3_grpc_stream_reset" || true
 
+# ---------------------------------------------------------------------------
+# F-96: レポート §5.2 gRPC セキュリティ
+# ---------------------------------------------------------------------------
+
+# S-G-12: HPACK ヘッダ展開ボム相当 — 巨大ヘッダ多数を gRPC に付与
+hpack_bomb_hdrs=()
+for i in $(seq 1 40); do
+    # 各 2KiB のカスタムヘッダ（合計 ~80KiB）
+    val=$(printf 'H%.0s' {1..2048})
+    hpack_bomb_hdrs+=(-H "x-hpack-bomb-${i}: ${val}")
+done
+set +e
+c=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 --http2-prior-knowledge \
+    -X POST -H "Content-Type: application/grpc" -H "TE: trailers" \
+    "${hpack_bomb_hdrs[@]}" \
+    -d $'\x00\x00\x00\x00\x02{}' \
+    "http://${VEIL_HOST}:${VEIL_H2C_PORT}/grpc.test.v1.TestService/UnaryCall" 2>/dev/null || echo "000")
+set -e
+check_no_crash "grpc_hpack_bomb" "${c}"
+check_health "post_grpc_hpack_bomb" || true
+
+# S-G-13: MAX_CONCURRENT_STREAMS 違反 — 大量並行 gRPC でストリーム上限を刺激
+# curl は 1 リクエスト/接続のため並列 curl 連打で近似（拒否/リセットは正常）
+set +e
+for _ in $(seq 1 60); do
+    timeout 3 curl -s -o /dev/null -w "%{http_code}" --max-time 2 --http2-prior-knowledge \
+        -X POST -H "Content-Type: application/grpc" -H "TE: trailers" \
+        -d $'\x00\x00\x00\x00\x02{}' \
+        "http://${VEIL_HOST}:${VEIL_H2C_PORT}/grpc.test.v1.TestService/UnaryCall" >/dev/null 2>&1 &
+done
+wait || true
+set -e
+log "PASS grpc_max_concurrent_streams_burst: launched 60 parallel RPCs"
+check_health "post_grpc_max_concurrent_streams" || true
+
+# S-G-14: Half-closed 強化 — ヘッダ完了後ボディ未送で長時間保持
+half2_log="$(mktemp)"
+set +e
+{
+    printf 'POST /grpc.test.v1.TestService/UnaryCall HTTP/1.1\r\n'
+    printf 'Host: veil-proxy\r\n'
+    printf 'Content-Type: application/grpc\r\n'
+    printf 'TE: trailers\r\n'
+    printf 'Content-Length: 37\r\n'
+    printf '\r\n'
+    # LPM ヘッダのみ（flags+len=32）を送りボディは放置
+    printf '\x00\x00\x00\x00\x20'
+    sleep 8
+} | timeout 15 openssl s_client -connect "${VEIL_HOST}:${VEIL_HTTPS_PORT}" \
+    -servername "${VEIL_HOST}" -quiet 2>/dev/null >"${half2_log}" 2>&1
+half2_rc=$?
+set -e
+if [[ "${half2_rc}" -eq 0 ]] || [[ "${half2_rc}" -eq 124 ]] || [[ "${half2_rc}" -eq 1 ]]; then
+    log "PASS grpc_half_closed_body_hold: completed (rc=${half2_rc})"
+else
+    log "WARN grpc_half_closed_body_hold: rc=${half2_rc}"
+fi
+rm -f "${half2_log}"
+check_health "post_grpc_half_closed_body" || true
+
+# S-G-15: 悪意のある Trailers 挿入 — ボディ途中で trailers 風終端を送る
+# HTTP/1.1 では chunked で早期 trailer を模倣
+trail_log="$(mktemp)"
+set +e
+{
+    printf 'POST /grpc.test.v1.TestService/UnaryCall HTTP/1.1\r\n'
+    printf 'Host: veil-proxy\r\n'
+    printf 'Content-Type: application/grpc\r\n'
+    printf 'TE: trailers\r\n'
+    printf 'Transfer-Encoding: chunked\r\n'
+    printf '\r\n'
+    # 部分 LPM
+    printf '5\r\n'
+    printf '\x00\x00\x00\x00\x20'
+    printf '\r\n'
+    # ボディ未完のまま 0-chunk + trailers（早期 trailer 挿入）
+    printf '0\r\n'
+    printf 'grpc-status: 0\r\n'
+    printf 'grpc-message: premature\r\n'
+    printf '\r\n'
+    sleep 2
+} | timeout 10 openssl s_client -connect "${VEIL_HOST}:${VEIL_HTTPS_PORT}" \
+    -servername "${VEIL_HOST}" -quiet 2>/dev/null >"${trail_log}" 2>&1
+trail_rc=$?
+set -e
+if [[ "${trail_rc}" -eq 0 ]] || [[ "${trail_rc}" -eq 124 ]] || [[ "${trail_rc}" -eq 1 ]]; then
+    log "PASS grpc_malicious_trailers: completed (rc=${trail_rc})"
+else
+    log "WARN grpc_malicious_trailers: rc=${trail_rc}"
+fi
+rm -f "${trail_log}"
+check_health "post_grpc_malicious_trailers" || true
+
+# H2C でも premature trailer 相当（不正な小さな body + grpc-status ヘッダ）
+c=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 --http2-prior-knowledge \
+    -X POST -H "Content-Type: application/grpc" -H "TE: trailers" \
+    -H "grpc-status: 0" -H "Trailer: grpc-status" \
+    -d $'\x00\x00\x00\x00\x10 partial' \
+    "http://${VEIL_HOST}:${VEIL_H2C_PORT}/grpc.test.v1.TestService/UnaryCall" 2>/dev/null || echo "000")
+check_no_crash "grpc_malicious_trailers_h2c" "${c}"
+check_health "post_grpc_malicious_trailers_h2c" || true
+
 check_health "post_probe_health" || true
 
 if [[ "${fails}" -eq 0 ]]; then
