@@ -1510,47 +1510,19 @@ impl Http3Handler {
             .map(|h| (h.name().to_vec(), h.value().to_vec()))
             .collect();
 
-        // gRPC はサービス/メソッドのフルパスを保持する（/* プレフィックス除去で UNIMPLEMENTED になるのを防ぐ）
+        // gRPC はサービス/メソッドのフルパスを保持（B-39）
         #[cfg(feature = "grpc")]
-        let is_grpc_req = header_pairs.iter().any(|(n, v)| {
-            n.eq_ignore_ascii_case(b"content-type") && crate::grpc::headers::is_grpc_content_type(v)
-        });
+        let is_grpc_req = header_pairs_indicate_grpc(&header_pairs);
         #[cfg(not(feature = "grpc"))]
         let is_grpc_req = false;
 
-        let sub_path = if is_grpc_req {
-            // B-39: gRPC フルパス維持
-            path_str.to_string()
-        } else if prefix.is_empty() {
-            path_str.to_string()
-        } else {
-            let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
-            if let Some(remaining) = path_str.strip_prefix(prefix_str) {
-                let base = target.path_prefix.trim_end_matches('/');
-
-                if remaining.is_empty() {
-                    if base.is_empty() {
-                        "/".to_string()
-                    } else {
-                        format!("{}/", base)
-                    }
-                } else if remaining.starts_with('/') {
-                    if base.is_empty() {
-                        remaining.to_string()
-                    } else {
-                        format!("{}{}", base, remaining)
-                    }
-                } else if base.is_empty() {
-                    format!("/{}", remaining)
-                } else {
-                    format!("{}/{}", base, remaining)
-                }
-            } else {
-                path_str.to_string()
-            }
-        };
-
-        let final_path = if sub_path.is_empty() { "/" } else { &sub_path };
+        let final_path_owned = compute_upstream_request_path(
+            path_str,
+            prefix,
+            &target.path_prefix,
+            is_grpc_req,
+        );
+        let final_path = final_path_owned.as_str();
 
         // B-39: H2C 上流（gRPC 等）
         let use_h2c = target.use_h2c || upstream_group.use_h2c();
@@ -1664,34 +1636,12 @@ impl Http3Handler {
                     )
                 };
 
-                // レスポンスヘッダー構築
-                let mut owned_headers: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-                for (name, value) in &resp_header_store {
-                    if name.eq_ignore_ascii_case(b"connection")
-                        || name.eq_ignore_ascii_case(b"transfer-encoding")
-                        || name.eq_ignore_ascii_case(b"keep-alive")
-                    {
-                        continue;
-                    }
-                    if should_compress.is_some()
-                        && (name.eq_ignore_ascii_case(b"content-length")
-                            || name.eq_ignore_ascii_case(b"content-encoding"))
-                    {
-                        continue;
-                    }
-                    owned_headers.push((name.clone(), value.clone()));
-                }
-
-                // H2C trailers（gRPC-status 等）をヘッダへマージ
-                // （HTTP/3 トレイラー API の制限があるため、クライアント到達性を優先）
-                for (name, value) in &trailers {
-                    if !owned_headers
-                        .iter()
-                        .any(|(n, _)| n.eq_ignore_ascii_case(name))
-                    {
-                        owned_headers.push((name.clone(), value.clone()));
-                    }
-                }
+                // レスポンスヘッダ + H2C trailers をマージ（B-39）
+                let owned_headers = merge_response_headers_and_trailers(
+                    &resp_header_store,
+                    &trailers,
+                    should_compress.is_some(),
+                );
 
                 let response_body = if let Some(enc) = should_compress {
                     compress_body_h3(&body, enc, compression)
@@ -1967,12 +1917,33 @@ impl Http3Handler {
 /// `handle_proxy` と同一ロジック（挙動を一致させるため共有）。
 fn compute_backend_path(target: &ProxyTarget, req_path: &[u8], prefix: &[u8]) -> String {
     let path_str = std::str::from_utf8(req_path).unwrap_or("/");
+    compute_upstream_request_path(path_str, prefix, &target.path_prefix, false)
+}
+
+/// 上流リクエストパスを構築する。
+///
+/// - `preserve_full_path = true`（gRPC）: ルート `/*` プレフィックスを除去せずフルパスを返す（B-39）
+/// - それ以外: `prefix` を剥がし `target_path_prefix` を前置
+fn compute_upstream_request_path(
+    path_str: &str,
+    prefix: &[u8],
+    target_path_prefix: &str,
+    preserve_full_path: bool,
+) -> String {
+    if preserve_full_path {
+        return if path_str.is_empty() {
+            "/".to_string()
+        } else {
+            path_str.to_string()
+        };
+    }
+
     let sub_path = if prefix.is_empty() {
         path_str.to_string()
     } else {
         let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
         if let Some(remaining) = path_str.strip_prefix(prefix_str) {
-            let base = target.path_prefix.trim_end_matches('/');
+            let base = target_path_prefix.trim_end_matches('/');
             if remaining.is_empty() {
                 if base.is_empty() {
                     "/".to_string()
@@ -1999,6 +1970,44 @@ fn compute_backend_path(target: &ProxyTarget, req_path: &[u8], prefix: &[u8]) ->
     } else {
         sub_path
     }
+}
+
+/// リクエストヘッダが gRPC（`application/grpc*`）かどうかを判定する。
+#[cfg(feature = "grpc")]
+fn header_pairs_indicate_grpc(headers: &[(Vec<u8>, Vec<u8>)]) -> bool {
+    headers.iter().any(|(n, v)| {
+        n.eq_ignore_ascii_case(b"content-type") && crate::grpc::headers::is_grpc_content_type(v)
+    })
+}
+
+/// ホップバイホップヘッダを除き、必要なら CL/CE を除いたうえで trailers をマージする（B-39）。
+fn merge_response_headers_and_trailers(
+    headers: &[(Vec<u8>, Vec<u8>)],
+    trailers: &[(Vec<u8>, Vec<u8>)],
+    skip_content_length_encoding: bool,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut owned: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(headers.len() + trailers.len());
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case(b"connection")
+            || name.eq_ignore_ascii_case(b"transfer-encoding")
+            || name.eq_ignore_ascii_case(b"keep-alive")
+        {
+            continue;
+        }
+        if skip_content_length_encoding
+            && (name.eq_ignore_ascii_case(b"content-length")
+                || name.eq_ignore_ascii_case(b"content-encoding"))
+        {
+            continue;
+        }
+        owned.push((name.clone(), value.clone()));
+    }
+    for (name, value) in trailers {
+        if !owned.iter().any(|(n, _)| n.eq_ignore_ascii_case(name)) {
+            owned.push((name.clone(), value.clone()));
+        }
+    }
+    owned
 }
 
 /// HTTP/1.1 リクエスト head（リクエストライン + ヘッダ、**末尾の空行は含めない**）を構築する。
@@ -3793,5 +3802,180 @@ mod tests {
             seg,
             seg
         ));
+    }
+
+    // --------------------
+    // B-38 / B-39 単体テスト
+    // --------------------
+
+    /// B-39: gRPC はルート prefix を剥がさずフルパスを維持する
+    #[test]
+    fn test_b39_upstream_path_preserves_grpc_full_path() {
+        let prefix = b"/grpc.test.v1.TestService";
+        let path = "/grpc.test.v1.TestService/UnaryCall";
+        let got = compute_upstream_request_path(path, prefix, "", true);
+        assert_eq!(got, path, "gRPC must keep full service/method path");
+    }
+
+    /// B-39: 非 gRPC は /* プレフィックスを除去する
+    #[test]
+    fn test_b39_upstream_path_strips_wildcard_prefix() {
+        let prefix = b"/api";
+        let path = "/api/v1/items";
+        let got = compute_upstream_request_path(path, prefix, "", false);
+        assert_eq!(got, "/v1/items");
+
+        // target path_prefix 前置
+        let got2 = compute_upstream_request_path(path, prefix, "/backend", false);
+        assert_eq!(got2, "/backend/v1/items");
+
+        // prefix なし
+        assert_eq!(
+            compute_upstream_request_path("/health", b"", "", false),
+            "/health"
+        );
+
+        // 空パスは /
+        assert_eq!(compute_upstream_request_path("", b"", "", true), "/");
+        assert_eq!(compute_upstream_request_path("", b"", "", false), "/");
+    }
+
+    /// B-39: compute_backend_path は preserve_full=false と同等
+    #[test]
+    fn test_compute_backend_path_matches_upstream_helper() {
+        let target = ProxyTarget::parse("http://127.0.0.1:9004").expect("target");
+        let path = b"/grpc.test.v1.TestService/UnaryCall";
+        let prefix = b"/grpc.test.v1.TestService";
+        let a = compute_backend_path(&target, path, prefix);
+        let b = compute_upstream_request_path(
+            std::str::from_utf8(path).unwrap(),
+            prefix,
+            &target.path_prefix,
+            false,
+        );
+        assert_eq!(a, b);
+        // プレフィックス除去後
+        assert_eq!(a, "/UnaryCall");
+    }
+
+    /// B-39: trailers をヘッダへマージし、重複名は既存を優先
+    #[test]
+    fn test_b39_merge_response_headers_and_trailers() {
+        let headers = vec![
+            (b"content-type".to_vec(), b"application/grpc".to_vec()),
+            (b"connection".to_vec(), b"close".to_vec()),
+            (b"content-length".to_vec(), b"0".to_vec()),
+        ];
+        let trailers = vec![
+            (b"grpc-status".to_vec(), b"0".to_vec()),
+            (b"grpc-message".to_vec(), b"ok".to_vec()),
+            // 既存 content-type は上書きしない
+            (b"content-type".to_vec(), b"should-not-win".to_vec()),
+        ];
+
+        let merged = merge_response_headers_and_trailers(&headers, &trailers, false);
+        assert!(
+            merged
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case(b"connection"))
+                == false
+        );
+        assert!(
+            merged
+                .iter()
+                .any(|(n, v)| n.eq_ignore_ascii_case(b"grpc-status") && v == b"0")
+        );
+        assert!(
+            merged
+                .iter()
+                .any(|(n, v)| n.eq_ignore_ascii_case(b"content-type")
+                    && v == b"application/grpc")
+        );
+
+        // 圧縮時は content-length / content-encoding を落とす
+        let compressed = merge_response_headers_and_trailers(&headers, &[], true);
+        assert!(
+            !compressed
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case(b"content-length"))
+        );
+    }
+
+    /// parse_http_response: 正常系と trailers 空
+    #[test]
+    fn test_parse_http_response_basic() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello";
+        let r = parse_http_response(raw).expect("parse");
+        assert_eq!(r.status_code, 200);
+        assert_eq!(r.body, b"hello");
+        assert!(r.trailers.is_empty());
+        assert!(r
+            .headers
+            .iter()
+            .any(|(n, v)| n.eq_ignore_ascii_case(b"content-type") && v == b"text/plain"));
+    }
+
+    /// parse_http_response: 不正レスポンスは Err
+    #[test]
+    fn test_parse_http_response_invalid() {
+        let raw = b"not-http-at-all";
+        assert!(parse_http_response(raw).is_err());
+    }
+
+    /// find_header_end / parse_status_code
+    #[test]
+    fn test_parse_status_and_header_end() {
+        assert_eq!(find_header_end(b"HTTP/1.1 404 N\r\n\r\n"), Some(14));
+        assert_eq!(
+            parse_status_code(b"HTTP/1.1 502 Bad Gateway\r\n"),
+            Some(502)
+        );
+        assert_eq!(parse_status_code(b"garbage"), None);
+    }
+
+    /// B-38: モジュール空ならヘッダをそのまま返す（WASM エンジン不要）
+    #[cfg(feature = "wasm")]
+    #[test]
+    fn test_b38_apply_h3_wasm_empty_modules_passthrough() {
+        let modules = std::sync::Arc::new(Vec::new());
+        let headers = vec![(b"x-a".to_vec(), b"1".to_vec())];
+        let out = futures::executor::block_on(apply_h3_wasm_response_headers(
+            &modules,
+            200,
+            headers.clone(),
+        ));
+        assert_eq!(out, headers);
+    }
+
+    /// B-39: content-type から gRPC を検出
+    #[cfg(feature = "grpc")]
+    #[test]
+    fn test_b39_header_pairs_indicate_grpc() {
+        assert!(header_pairs_indicate_grpc(&[(
+            b"content-type".to_vec(),
+            b"application/grpc".to_vec()
+        )]));
+        assert!(header_pairs_indicate_grpc(&[(
+            b"Content-Type".to_vec(),
+            b"application/grpc+proto".to_vec()
+        )]));
+        assert!(!header_pairs_indicate_grpc(&[(
+            b"content-type".to_vec(),
+            b"application/json".to_vec()
+        )]));
+        assert!(!header_pairs_indicate_grpc(&[]));
+    }
+
+    /// Http3Handler::is_grpc_request と同等の content-type 判定
+    #[cfg(feature = "grpc")]
+    #[test]
+    fn test_b39_is_grpc_content_type_via_headers_module() {
+        assert!(crate::grpc::headers::is_grpc_content_type(
+            b"application/grpc"
+        ));
+        assert!(crate::grpc::headers::is_grpc_content_type(
+            b"application/grpc+proto"
+        ));
+        assert!(!crate::grpc::headers::is_grpc_content_type(b"text/plain"));
     }
 }
