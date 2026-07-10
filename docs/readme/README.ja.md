@@ -2506,7 +2506,7 @@ gso_gro_enabled = false
 
 - HTTP/3はUDPベースのため、**kTLSは使用不可**です（TCPを使用しないため）
 - UDPポート443をファイアウォールで開放する必要があります
-- Alt-SvcヘッダーでブラウザにHTTP/3対応を通知できます
+- `server.http3_enabled = true` のとき、HTTP/1.1・HTTP/2 応答に `Alt-Svc` で HTTP/3 を広告します（既定 `server.alt_svc_enabled = true`。上書きは `[http3].alt_svc` / `alt_svc_ma_secs`）
 
 ## kTLS（Kernel TLS）サポート
 

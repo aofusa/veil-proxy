@@ -1800,6 +1800,8 @@ where
                 &prefix,
                 client_ip,
                 &security,
+                #[cfg(feature = "wasm")]
+                &wasm_modules_to_apply,
             )
             .await
         }
@@ -1930,6 +1932,7 @@ async fn handle_http2_proxy<S>(
     prefix: &[u8],
     client_ip: &str,
     security: &SecurityConfig,
+    #[cfg(feature = "wasm")] wasm_modules: &Arc<Vec<String>>,
 ) -> Option<(u16, u64)>
 where
     S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
@@ -2047,6 +2050,8 @@ where
             request_body.to_vec(),
             method,
             final_path.as_bytes(),
+            #[cfg(feature = "wasm")]
+            wasm_modules,
         )
         .await
     } else if target.use_tls {
@@ -2091,6 +2096,7 @@ async fn handle_http2_proxy_h2c<S>(
     request_body: Vec<u8>,
     method: &[u8],
     path: &[u8],
+    #[cfg(feature = "wasm")] wasm_modules: &Arc<Vec<String>>,
 ) -> Option<(u16, u64)>
 where
     S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
@@ -2189,22 +2195,39 @@ where
         .await
     {
         Ok(h2c_resp) => {
-            // レスポンスをクライアントに中継
-            let mut headers: Vec<(&[u8], &[u8])> = h2c_resp
+            // レスポンスヘッダを所有バッファへ（WASM 適用・Server/Alt-Svc 追記用）
+            let mut header_store: Vec<(Vec<u8>, Vec<u8>)> = h2c_resp
                 .headers
                 .iter()
-                .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
+
+            // F-94: gRPC/H2C 経路でも WASM レスポンスヘッダフィルタを適用
+            #[cfg(feature = "wasm")]
+            {
+                header_store = apply_h2_wasm_response_headers(
+                    wasm_modules,
+                    h2c_resp.status,
+                    header_store,
+                )
+                .await;
+            }
 
             let server_guard = get_server_header_guard();
             if let Some(ref g) = server_guard {
-                headers.push(g.as_header());
+                let (n, v) = g.as_header();
+                header_store.push((n.to_vec(), v.to_vec()));
             }
-            // F-94: HTTP/3 広告（Alt-Svc）。ガードは send_headers 完了まで保持。
-            let alt_svc_guard = get_alt_svc_guard();
-            if let Some(ref g) = alt_svc_guard {
-                headers.push(g.as_header());
+            // F-94: HTTP/3 広告（Alt-Svc）
+            if let Some(g) = get_alt_svc_guard() {
+                let (n, v) = g.as_header();
+                header_store.push((n.to_vec(), v.to_vec()));
             }
+
+            let headers: Vec<(&[u8], &[u8])> = header_store
+                .iter()
+                .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                .collect();
 
             let has_body = !h2c_resp.body.is_empty();
             let has_trailers = !h2c_resp.trailers.is_empty();

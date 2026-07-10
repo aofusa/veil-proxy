@@ -46,10 +46,13 @@ fi
 
 fails=0
 
-# kazu-yamamoto/h3spec: HTTPS URL を渡す（QUIC/H3 エラーケース検証）
-# 使い方はリリースによって差があるため、一般的な形式を試す。
+# kazu-yamamoto/h3spec: 引数は `<host> <port>`（URL 形式ではない）
+# 追加オプション: -n（証明書検証スキップ）、-t タイムアウト(ms)
 set +e
-timeout "${H3SPEC_TIMEOUT}" h3spec "https://${VEIL_HOST}:${VEIL_HTTP3_PORT}" \
+timeout "${H3SPEC_TIMEOUT}" h3spec \
+    -n \
+    -t "$((H3SPEC_TIMEOUT * 1000))" \
+    "${VEIL_HOST}" "${VEIL_HTTP3_PORT}" \
     >>"${RESULTS}" 2>&1
 rc=$?
 set -e

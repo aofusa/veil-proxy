@@ -40,12 +40,14 @@
 
 ## 受け入れ条件
 
-- [ ] レポート 1〜11 が実装または明確に文書化（11 の quiche 内部は文書）
-- [ ] E2E / container_security / 単体が実行され、失敗は artifacts に切り分け
-- [ ] full / default / no-default / 各 feature でビルド警告・エラーなし
-- [ ] `allow(dead_code)` を理由なしに追加しない
-- [ ] CI 組み込みは F-95 のみ（本チケットでは行わない）
+- [x] レポート 1〜11 が実装または明確に文書化（11 の quiche 内部は文書）
+- [x] E2E / container_security / 単体が実行され、失敗は artifacts に切り分け
+- [x] full / default / no-default / 各 feature でビルド警告・エラーなし
+- [x] `allow(dead_code)` を理由なしに追加しない
+- [x] CI 組み込みは F-95 のみ（本チケットでは行わない）
 
 ## 対応状況
 
-進行中（fix/test）
+完了（fix/test）。  
+詳細: `docs/artifacts/f94_failed_tests_report.md`  
+検証: 単体 717 / 統合 53 / E2E 448+1 フレーキー / container_security ok / feature ビルド 0 警告
