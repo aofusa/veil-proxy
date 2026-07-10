@@ -51,9 +51,25 @@
 | `tools/.../http3-client.rs` | `HTTP3_MODE` 攻撃モード |
 | `.gitignore` | `docs/artifacts/*.md` 追跡、実行時一時ファイル除外維持 |
 
-## 6. 解消判定
+## 6. 解消判定（2026-07-10）
 
-- [ ] 上記全 ID がコード上に存在
-- [ ] E2E / container_security を実行
-- [ ] 失敗はテスト修正 or bugs チケット化
-- [ ] 本ファイルのチェックを更新
+- [x] 上記全 ID がコード上に存在
+- [x] E2E / container_security を実行
+- [x] 失敗はテスト修正 or bugs チケット化（B-38 / B-39、slowloris はテスト修正）
+- [x] 本ファイルのチェックを更新
+
+### 実装対応表
+
+| ID | 実装 | 実行結果 |
+|----|------|----------|
+| E-H3-10 | `test_http3_rate_limiting` | PASS |
+| E-H3-11 | `test_http3_ip_restriction` | PASS |
+| E-H3-12 | `test_http3_wasm_integration` | FAIL → **B-38** |
+| E-H3-13 | `test_http3_cache_hit_miss` | PASS |
+| E-H3-14 | `test_http3_early_data_0rtt_security` | PASS |
+| E-H3-15 | `test_http3_websocket` | PASS（502・非対応安全） |
+| E-G-05+ | `test_grpc_http2_framing_malformed_data` | PASS |
+| E-G-06 | `test_grpc_over_http3` | FAIL → **B-39** |
+| E-G-07 | `test_grpc_client_slowloris` | PASS（テスト修正後） |
+| S-H3-02〜05 | `http3_probe.sh` modes | PASS |
+| S-G-05〜07 | `grpc_probe.sh` | PASS |

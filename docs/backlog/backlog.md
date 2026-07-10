@@ -124,7 +124,7 @@
 | F-87 | P1 | 完了 | [features/F-87-future-cancellation-safety-tests.md](features/F-87-future-cancellation-safety-tests.md) | io_uring Future のランダム Drop（キャンセル安全性）テスト。`tests/runtime_cancellation_test.rs`（recv/send/accept/timer の提出前・in-flight・多重キャンセル Drop + liveness プローブ、決定的シード）。レポート提案4 |
 | F-88 | P2 | 完了 | [features/F-88-ast-hotpath-blocking-lint.md](features/F-88-ast-hotpath-blocking-lint.md) | AST ベース静的解析（clippy disallowed-methods）でホットパスのブロッキング呼び出し混入を検出。**`clippy.toml` + 理由付き allow + CI `cargo clippy --features full --tests` + B-26 修正済み** |
 | F-90 | P1 | 完了 | [features/F-90-container-security-full-features.md](features/F-90-container-security-full-features.md) | container_security full features 網羅（14 プローブ + http3/ws クライアント + テストケース文書 + 実行検証）。B-29〜B-30・B-32〜B-34 修正済み、B-31 は意図的設計で保留 |
-| F-91 | P1 | 進行中 | [features/F-91-http3-grpc-coverage.md](features/F-91-http3-grpc-coverage.md) | HTTP/3・gRPC の E2E/container_security 網羅（rate-limit/IP/WASM/cache/0-RTT/WS-H3・gRPC-over-H3・slowloris・QUIC/gRPC 攻撃プローブ）。正本: `docs/artifacts/required_test_cases.md` |
+| F-91 | P1 | 完了 | [features/F-91-http3-grpc-coverage.md](features/F-91-http3-grpc-coverage.md) | HTTP/3・gRPC の E2E/container_security 網羅。不足ケース実装済。失敗は B-38/B-39。正本: `docs/artifacts/required_test_cases.md` |
 | F-73 | P1 | 完了 | [features/F-73-http2-send-zerocopy-writeall.md](features/F-73-http2-send-zerocopy-writeall.md) | HTTP/2 送信ホットパスの write_all ゼロコピー化（per-frame の 2 度目の to_vec 確保+コピーを排除）。A/B で **HTTP/2 +11.6%**（1577→1761 req/s、nginx 比 75%→84%）、HTTP/1.1 不変・応答ボディ sha256 一致。レポート `docs/artifacts/performance_report_veil_vs_nginx_v3.md` |
 | F-74 | P1 | 完了 | [features/F-74-http2-send-frame-coalescing.md](features/F-74-http2-send-frame-coalescing.md) | HTTP/2 送信ホットパスのフレーム連結（HEADERS/DATA コアレッシング）。1 レスポンス分のフレームを接続再利用連結バッファ `write_buf`（スレッドローカルプール）へ積み **1 回の書き込み** で送出。`encode_*_into` 追記 API・`send_headers_buffered`・128KB 途中フラッシュ閾値を追加。per-frame 送信システムコールを削減。単体 660 / http2 E2E 11 / gRPC E2E 35 グリーン。F-73 続き |
 | F-11 | P3 | 未着手 | [features/dashboard.md](features/dashboard.md) | ダッシュボード機能 |
@@ -185,6 +185,8 @@
 | B-35 | P1 | 完了 | [bugs/B-35-http2-upstream-tls-insecure-ignored.md](bugs/B-35-http2-upstream-tls-insecure-ignored.md) | HTTP/2 上流 HTTPS で `tls_insecure` 無視 → 自己署名バックエンドへ 502（UnknownIssuer）。E2E 214 件連鎖失敗の根本原因。**修正済み**: `handle_http2_proxy_https` + H2 ストリーミング経路で `get_tls_connector_insecure()` を使用 |
 | B-36 | P2 | 完了 | [bugs/B-36-veil-tls-insecure-overrides-upstream-verify.md](bugs/B-36-veil-tls-insecure-overrides-upstream-verify.md) | `VEIL_TLS_INSECURE=1` が per-upstream `tls_insecure=false` を上書き。**修正済み**: 上流経路から env OR を削除し per-upstream 設定のみに |
 | B-37 | P2 | 完了 | [bugs/B-37-l4-tls-terminate-e2e-timeout.md](bugs/B-37-l4-tls-terminate-e2e-timeout.md) | L4 `tls=terminate` リスナー（8446）が E2E でタイムアウト。**修正済み**: `src/l4/proxy.rs` に TLS 終端 + 平文転送を実装 |
+| B-38 | P1 | 未着手 | [bugs/B-38-http3-wasm-response-headers-not-applied.md](bugs/B-38-http3-wasm-response-headers-not-applied.md) | HTTP/3 で WASM レスポンスヘッダ変更が未適用（F-91 `test_http3_wasm_integration` 失敗。Continue でヘッダ変更スキップ） |
+| B-39 | P1 | 未着手 | [bugs/B-39-http3-grpc-proxy-502.md](bugs/B-39-http3-grpc-proxy-502.md) | HTTP/3 上 gRPC が 502（F-91 `test_grpc_over_http3`。H2C 上流へ H1 接続し Invalid HTTP response） |
 
 ---
 

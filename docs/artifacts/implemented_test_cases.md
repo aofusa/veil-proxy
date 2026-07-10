@@ -22,7 +22,7 @@
 | `test_http3_qpack_compression` / connection_migration / concurrent / throughput / latency | E-H3-16 |
 | `test_http3_proxy_header_manipulation` | F-HDR×H3 |
 
-**未実装（本作業前）**: E-H3-10〜15（rate_limit / ip_restriction / wasm / cache / 0rtt security / websocket）
+**F-91 追加済**: E-H3-10〜15（`test_http3_rate_limiting` / `ip_restriction` / `wasm_integration` / `cache_hit_miss` / `early_data_0rtt_security` / `websocket`）
 
 ---
 
@@ -38,7 +38,7 @@
 | proxy_forwarding / load_balancing / timeout / error / trailer / compression* / metadata / wire / status | E-G-08 |
 | `test_e2e_grpc_health_check_metrics` | E-G-09 |
 
-**未実装（本作業前）**: E-G-06 `test_grpc_over_http3`、E-G-07 `test_grpc_client_slowloris`、E-G-05 の厳密化
+**F-91 追加済**: E-G-06 `test_grpc_over_http3`、E-G-07 `test_grpc_client_slowloris`、E-G-05+ `test_grpc_http2_framing_malformed_data`
 
 ---
 
@@ -70,7 +70,7 @@
 | `run_smuggling` / differential / testssl / trivy / semgrep / sbom / gitleaks | セキュリティ |
 | `run_full_features_security.sh` | 上記 full プローブ群オーケストレーション |
 
-**未実装（本作業前）**: S-H3-02〜05、S-G-05〜07
+**F-91 追加済**: S-H3-02〜05（handshake_flood / qpack_bomb / cid_spoof / malformed）、S-G-05〜07（status_spoofing / oversized / infinite_streaming）
 
 ---
 

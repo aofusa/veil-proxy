@@ -27,10 +27,10 @@
 
 ## 受け入れ条件
 
-- [ ] `missing_test_cases.md` の全 ID が実装されている
-- [ ] `./tests/e2e_setup.sh test` で新規テストが実行される
-- [ ] `tools/container_security/run.sh`（または full_features プローブ）で新規プローブが動く
-- [ ] 失敗の切り分け結果が `docs/artifacts/` に記録され、実装バグは bugs 化済み
+- [x] `missing_test_cases.md` の全 ID が実装されている
+- [x] E2E 環境で新規テストが実行される（個別 `cargo test --test e2e_tests`）
+- [x] container_security `http3_probe` / `grpc_probe` で新規攻撃系が動く
+- [x] 失敗の切り分け結果が `docs/artifacts/failed_tests_report.md` に記録され、実装バグは B-38 / B-39
 
 ## 依存・リスク
 
@@ -40,4 +40,4 @@
 
 ## 対応状況
 
-進行中（fix/test ブランチ）
+完了（fix/test、テスト実装・実行・バグチケット化まで。製品バグ B-38/B-39 は未修正）

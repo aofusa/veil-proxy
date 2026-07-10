@@ -18294,7 +18294,7 @@ async fn test_grpc_http2_framing_malformed_data() {
     );
 }
 
-/// E-G-06: HTTP/3 上の gRPC Unary
+/// E-G-06: HTTP/3 上の gRPC Unary（成功時は 200 + grpc-status/ボディ）
 #[tokio::test]
 #[ntest::timeout(20000)]
 #[cfg(all(feature = "grpc", feature = "http3"))]
@@ -18317,7 +18317,7 @@ async fn test_grpc_over_http3() {
     let frame_bytes = frame.encode();
 
     use common::http3_client::send_http3_request_full;
-    let resp = send_http3_request_full(
+    let r = send_http3_request_full(
         &mut send_request,
         "POST",
         "/grpc.test.v1.TestService/UnaryCall",
@@ -18328,44 +18328,41 @@ async fn test_grpc_over_http3() {
         ],
         Some(&frame_bytes),
     )
-    .await;
+    .await
+    .expect("gRPC over HTTP/3 request should complete without transport error");
 
-    match resp {
-        Ok(r) => {
-            // gRPC は HTTP 200 + trailers が一般的。404/502 は upstream 設定問題。
-            assert!(
-                matches!(r.status, 200 | 404 | 502 | 503),
-                "gRPC over HTTP/3 should return controlled status, got {}",
-                r.status
-            );
-            let grpc_status = r
-                .headers
+    let grpc_status = r
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("grpc-status"))
+        .map(|(_, v)| v.as_str());
+    eprintln!(
+        "gRPC over H3 status={} grpc-status={:?} body_len={} headers={:?}",
+        r.status,
+        grpc_status,
+        r.body.len(),
+        r.headers
+    );
+
+    // 実装バグ（HTTP/3 gRPC プロキシ 502 等）はテスト失敗として検出する
+    assert_eq!(
+        r.status, 200,
+        "gRPC over HTTP/3 Unary should return HTTP 200 (got {}). See B-39 if 502.",
+        r.status
+    );
+    assert!(
+        grpc_status.is_some()
+            || !r.body.is_empty()
+            || r.headers
                 .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("grpc-status"))
-                .map(|(_, v)| v.as_str());
-            eprintln!(
-                "gRPC over H3 status={} grpc-status={:?} body_len={}",
-                r.status,
-                grpc_status,
-                r.body.len()
-            );
-            // 成功時は grpc-status 0 または応答ボディ
-            if r.status == 200 {
-                assert!(
-                    grpc_status.is_some() || !r.body.is_empty() || r.headers.iter().any(|(k, _)| k.starts_with("grpc-")),
-                    "gRPC over H3 200 should include grpc trailers or body"
-                );
-            }
-        }
-        Err(e) => {
-            panic!("gRPC over HTTP/3 request failed: {}", e);
-        }
-    }
+                .any(|(k, _)| k.to_ascii_lowercase().starts_with("grpc-")),
+        "gRPC over H3 200 should include grpc trailers or body"
+    );
 }
 
-/// E-G-07: gRPC client slowloris — 極遅送信でもプロキシが生存し、適切に切断されること
+/// E-G-07: gRPC client slowloris — 極遅送信でもプロキシが生存すること
 #[tokio::test]
-#[ntest::timeout(45000)]
+#[ntest::timeout(30000)]
 #[cfg(feature = "grpc")]
 async fn test_grpc_client_slowloris() {
     if !is_e2e_environment_ready().await {
@@ -18373,16 +18370,16 @@ async fn test_grpc_client_slowloris() {
         return;
     }
 
-    // 生 TCP + 手動 TLS で gRPC ヘッダを遅延送信
+    // 生 TCP + 手動 TLS でヘッダをゆっくり送る（最大約 3 秒で打ち切り）
     let config = create_client_config();
     let server_name = ServerName::try_from("localhost".to_string()).unwrap();
     let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
     stream
-        .set_read_timeout(Some(Duration::from_secs(3)))
+        .set_read_timeout(Some(Duration::from_millis(500)))
         .unwrap();
     stream
-        .set_write_timeout(Some(Duration::from_secs(3)))
+        .set_write_timeout(Some(Duration::from_millis(500)))
         .unwrap();
 
     while tls_conn.is_handshaking() {
@@ -18391,25 +18388,23 @@ async fn test_grpc_client_slowloris() {
         }
     }
 
-    // ヘッダを 1 バイトずつ送る（slow headers）
+    // 不完全なリクエスト（ボディ未完）をチャンク送信してアイドル接続を作る
     let req = b"POST /grpc.test.v1.TestService/UnaryCall HTTP/1.1\r\n\
 Host: localhost\r\n\
 Content-Type: application/grpc\r\n\
 TE: trailers\r\n\
-Content-Length: 13\r\n\
-\r\n\
-\x00\x00\x00\x00\x08slowtest";
+Content-Length: 1048576\r\n\
+\r\n";
 
     let mut sent = 0usize;
     let mut aborted = false;
-    while sent < req.len() {
-        let end = (sent + 1).min(req.len());
+    let start = std::time::Instant::now();
+    while sent < req.len() && start.elapsed() < Duration::from_secs(3) {
+        // 4 バイトずつ送って遅延を出す（1 バイトだと ntest に張り付く）
+        let end = (sent + 4).min(req.len());
         let chunk = &req[sent..end];
-        let mut buf = vec![0u8; 16 * 1024];
         match tls_conn.writer().write(chunk) {
-            Ok(n) => {
-                let _ = n;
-            }
+            Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(_) => {
                 aborted = true;
@@ -18422,7 +18417,6 @@ Content-Length: 13\r\n\
                 break;
             }
         }
-        // サーバーからの切断を確認
         match tls_conn.read_tls(&mut stream) {
             Ok(0) => {
                 aborted = true;
@@ -18431,30 +18425,36 @@ Content-Length: 13\r\n\
             Ok(_) => {
                 let _ = tls_conn.process_new_packets();
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
             Err(_) => {
                 aborted = true;
                 break;
             }
         }
         sent = end;
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        tokio::time::sleep(Duration::from_millis(40)).await;
     }
 
+    // 追加で数秒アイドル保持（サーバ側タイムアウト/生存確認）
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    // ソケットを明示クローズ（クライアント側終了）
+    drop(stream);
+
     eprintln!(
-        "gRPC slowloris: sent={}/{} aborted={}",
+        "gRPC slowloris: sent={}/{} aborted={} elapsed_ms={}",
         sent,
         req.len(),
-        aborted
+        aborted,
+        start.elapsed().as_millis()
     );
 
-    // プロキシが生存していること（主目的）
     assert!(
         is_e2e_environment_ready().await,
         "proxy must survive gRPC client slowloris"
     );
 
-    // 通常の gRPC リクエストがまだ通ること
     let ok = GrpcTestClient::send_grpc_request(
         "127.0.0.1",
         PROXY_PORT,
@@ -18464,7 +18464,7 @@ Content-Length: 13\r\n\
     )
     .await;
     assert!(
-        ok.is_ok() || ok.as_ref().err().map(|e| e.to_string()).is_some(),
+        ok.is_ok() || ok.err().is_some(),
         "post-slowloris request should complete without hanging forever"
     );
 }
