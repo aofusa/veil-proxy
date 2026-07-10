@@ -1013,7 +1013,11 @@ impl Http3Handler {
             return Ok(());
         }
 
-        // WASMモジュールの適用
+        // WASM モジュール適用（B-38: リクエストヘッダ変更 + レスポンスヘッダ変更）
+        #[cfg(feature = "wasm")]
+        let mut wasm_modules_to_apply: Option<std::sync::Arc<Vec<String>>> = None;
+        #[cfg(feature = "wasm")]
+        let mut wasm_request_headers: Option<Vec<(Vec<u8>, Vec<u8>)>> = None;
         #[cfg(feature = "wasm")]
         {
             let config = CURRENT_CONFIG.load();
@@ -1025,15 +1029,15 @@ impl Http3Handler {
                 let modules_to_apply = if let Some(backend_modules) = backend.modules_arc() {
                     backend_modules.clone()
                 } else {
-                    // ルートレベルのmodulesが指定されていない場合は、WASMモジュールを適用しない
                     crate::wasm::empty_wasm_modules()
                 };
 
                 if !modules_to_apply.is_empty() {
-                    // HTTP/3のヘッダーを取得
+                    wasm_modules_to_apply = Some(modules_to_apply.clone());
+
                     let headers_vec: Vec<(Vec<u8>, Vec<u8>)> = headers
                         .iter()
-                        .filter(|h| !h.name().starts_with(b":")) // 疑似ヘッダーを除外
+                        .filter(|h| !h.name().starts_with(b":"))
                         .map(|h| (h.name().to_vec(), h.value().to_vec()))
                         .collect();
 
@@ -1044,13 +1048,12 @@ impl Http3Handler {
                             &std::sync::Arc::from(method_str),
                             headers_vec,
                             &std::sync::Arc::from(self.client_ip.as_str()),
-                            request_body.is_empty(), // end_of_stream
+                            request_body.is_empty(),
                         )
                         .await;
 
                     match wasm_result {
                         crate::wasm::FilterResult::LocalResponse(resp) => {
-                            // ローカルレスポンスを返送
                             self.send_response(
                                 stream_id,
                                 resp.status_code,
@@ -1083,9 +1086,9 @@ impl Http3Handler {
                         crate::wasm::FilterResult::Pause => {
                             warn!("WASM module requested pause, but async operations are not yet supported");
                         }
-                        crate::wasm::FilterResult::Continue { .. } => {
-                            // ヘッダー変更はHTTP/3では複雑なため、現時点ではスキップ
-                            // 将来的に実装可能
+                        crate::wasm::FilterResult::Continue { headers: modified, .. } => {
+                            // B-38: 変更後ヘッダを上流リクエストへ反映
+                            wasm_request_headers = Some(modified);
                         }
                     }
                 }
@@ -1114,6 +1117,10 @@ impl Http3Handler {
                         &prefix,
                         headers,
                         request_body,
+                        #[cfg(feature = "wasm")]
+                        wasm_modules_to_apply.as_ref(),
+                        #[cfg(feature = "wasm")]
+                        wasm_request_headers.as_deref(),
                     )
                     .await
                     .unwrap_or((502, 11));
@@ -1432,10 +1439,11 @@ impl Http3Handler {
         Ok(())
     }
 
-    /// プロキシ処理（HTTP/1.1またはHTTP/2バックエンドへの変換）
+    /// プロキシ処理（HTTP/1.1 または H2C バックエンドへの変換）
     ///
-    /// HTTP/3からのリクエストをバックエンドに転送します。
-    /// バックエンドがHTTP/3に対応していない場合は、HTTP/2またはHTTP/1.1にフォールバックします。
+    /// - 通常: HTTP/1.1 で上流へ転送
+    /// - `use_h2c`: H2C (Prior Knowledge) で上流へ転送（B-39: gRPC over HTTP/3）
+    /// - WASM: リクエスト/レスポンスヘッダ変更を適用（B-38）
     async fn handle_proxy(
         &mut self,
         stream_id: u64,
@@ -1447,6 +1455,8 @@ impl Http3Handler {
         prefix: &[u8],
         headers: &[h3::Header],
         request_body: &[u8],
+        #[cfg(feature = "wasm")] wasm_modules: Option<&std::sync::Arc<Vec<String>>>,
+        #[cfg(feature = "wasm")] wasm_request_headers: Option<&[(Vec<u8>, Vec<u8>)]>,
     ) -> io::Result<(u16, usize)> {
         // サーバー選択
         let server = match upstream_group.select(&self.client_ip) {
@@ -1462,7 +1472,56 @@ impl Http3Handler {
 
         // リクエストパス構築
         let path_str = std::str::from_utf8(req_path).unwrap_or("/");
-        let sub_path = if prefix.is_empty() {
+        let timeout_secs = 30;
+
+        // 上流へ送るヘッダソース（WASM 変更後 or 生 H3 ヘッダ）
+        #[cfg(feature = "wasm")]
+        let header_pairs: Vec<(Vec<u8>, Vec<u8>)> = if let Some(ov) = wasm_request_headers {
+            ov.iter()
+                .filter(|(n, _)| {
+                    !n.starts_with(b":")
+                        && !n.eq_ignore_ascii_case(b"connection")
+                        && !n.eq_ignore_ascii_case(b"keep-alive")
+                        && !n.eq_ignore_ascii_case(b"transfer-encoding")
+                })
+                .cloned()
+                .collect()
+        } else {
+            headers
+                .iter()
+                .filter(|h| {
+                    !h.name().starts_with(b":")
+                        && !h.name().eq_ignore_ascii_case(b"connection")
+                        && !h.name().eq_ignore_ascii_case(b"keep-alive")
+                        && !h.name().eq_ignore_ascii_case(b"transfer-encoding")
+                })
+                .map(|h| (h.name().to_vec(), h.value().to_vec()))
+                .collect()
+        };
+        #[cfg(not(feature = "wasm"))]
+        let header_pairs: Vec<(Vec<u8>, Vec<u8>)> = headers
+            .iter()
+            .filter(|h| {
+                !h.name().starts_with(b":")
+                    && !h.name().eq_ignore_ascii_case(b"connection")
+                    && !h.name().eq_ignore_ascii_case(b"keep-alive")
+                    && !h.name().eq_ignore_ascii_case(b"transfer-encoding")
+            })
+            .map(|h| (h.name().to_vec(), h.value().to_vec()))
+            .collect();
+
+        // gRPC はサービス/メソッドのフルパスを保持する（/* プレフィックス除去で UNIMPLEMENTED になるのを防ぐ）
+        #[cfg(feature = "grpc")]
+        let is_grpc_req = header_pairs.iter().any(|(n, v)| {
+            n.eq_ignore_ascii_case(b"content-type") && crate::grpc::headers::is_grpc_content_type(v)
+        });
+        #[cfg(not(feature = "grpc"))]
+        let is_grpc_req = false;
+
+        let sub_path = if is_grpc_req {
+            // B-39: gRPC フルパス維持
+            path_str.to_string()
+        } else if prefix.is_empty() {
             path_str.to_string()
         } else {
             let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
@@ -1481,12 +1540,10 @@ impl Http3Handler {
                     } else {
                         format!("{}{}", base, remaining)
                     }
+                } else if base.is_empty() {
+                    format!("/{}", remaining)
                 } else {
-                    if base.is_empty() {
-                        format!("/{}", remaining)
-                    } else {
-                        format!("{}/{}", base, remaining)
-                    }
+                    format!("{}/{}", base, remaining)
                 }
             } else {
                 path_str.to_string()
@@ -1495,62 +1552,81 @@ impl Http3Handler {
 
         let final_path = if sub_path.is_empty() { "/" } else { &sub_path };
 
-        // HTTP/1.1 リクエスト構築
-        let mut request = Vec::with_capacity(1024 + request_body.len());
-        request.extend_from_slice(method);
-        request.extend_from_slice(b" ");
-        request.extend_from_slice(final_path.as_bytes());
-        request.extend_from_slice(b" HTTP/1.1\r\nHost: ");
-        request.extend_from_slice(target.host.as_bytes());
-
-        if !target.is_default_port() {
-            request.extend_from_slice(b":");
-            let mut port_buf = itoa::Buffer::new();
-            request.extend_from_slice(port_buf.format(target.port).as_bytes());
-        }
-        request.extend_from_slice(b"\r\n");
-
-        // ヘッダー追加（疑似ヘッダー以外）
-        for header in headers {
-            if header.name().starts_with(b":") {
-                continue;
-            }
-            if header.name().eq_ignore_ascii_case(b"connection")
-                || header.name().eq_ignore_ascii_case(b"keep-alive")
-                || header.name().eq_ignore_ascii_case(b"transfer-encoding")
+        // B-39: H2C 上流（gRPC 等）
+        let use_h2c = target.use_h2c || upstream_group.use_h2c();
+        let proxy_result = if use_h2c {
+            #[cfg(feature = "http2")]
             {
-                continue;
+                proxy_to_h2c_backend_async(
+                    target,
+                    method,
+                    final_path.as_bytes(),
+                    &header_pairs,
+                    request_body,
+                    timeout_secs,
+                )
+                .await
             }
-            request.extend_from_slice(header.name());
-            request.extend_from_slice(b": ");
-            request.extend_from_slice(header.value());
+            #[cfg(not(feature = "http2"))]
+            {
+                warn!("[HTTP/3] use_h2c requested but http2 feature disabled");
+                Err(io::Error::other("H2C requires http2 feature"))
+            }
+        } else {
+            // HTTP/1.1 リクエスト構築
+            let mut request = Vec::with_capacity(1024 + request_body.len());
+            request.extend_from_slice(method);
+            request.extend_from_slice(b" ");
+            request.extend_from_slice(final_path.as_bytes());
+            request.extend_from_slice(b" HTTP/1.1\r\nHost: ");
+            request.extend_from_slice(target.host.as_bytes());
+
+            if !target.is_default_port() {
+                request.extend_from_slice(b":");
+                let mut port_buf = itoa::Buffer::new();
+                request.extend_from_slice(port_buf.format(target.port).as_bytes());
+            }
             request.extend_from_slice(b"\r\n");
-        }
 
-        // Content-Length 追加
-        if !request_body.is_empty() {
-            request.extend_from_slice(b"Content-Length: ");
-            let mut len_buf = itoa::Buffer::new();
-            request.extend_from_slice(len_buf.format(request_body.len()).as_bytes());
-            request.extend_from_slice(b"\r\n");
-        }
+            for (name, value) in &header_pairs {
+                request.extend_from_slice(name);
+                request.extend_from_slice(b": ");
+                request.extend_from_slice(value);
+                request.extend_from_slice(b"\r\n");
+            }
 
-        request.extend_from_slice(b"Connection: close\r\n\r\n");
-        request.extend_from_slice(request_body);
+            if !request_body.is_empty() {
+                request.extend_from_slice(b"Content-Length: ");
+                let mut len_buf = itoa::Buffer::new();
+                request.extend_from_slice(len_buf.format(request_body.len()).as_bytes());
+                request.extend_from_slice(b"\r\n");
+            }
 
-        // 非同期プロキシ処理（monoio TcpStream使用）
-        // io_uringベースの非同期I/Oでバックエンド通信を行う
-        let timeout_secs = 30;
-        let tls_insecure = upstream_group.tls_insecure();
-        let proxy_result =
-            proxy_to_backend_async_with_tls(target, request, timeout_secs, tls_insecure).await;
+            request.extend_from_slice(b"Connection: close\r\n\r\n");
+            request.extend_from_slice(request_body);
+
+            let tls_insecure = upstream_group.tls_insecure();
+            proxy_to_backend_async_with_tls(target, request, timeout_secs, tls_insecure).await
+        };
 
         server.release();
 
         match proxy_result {
-            Ok(backend_result) => {
-                // バックエンド結果からHTTP/3レスポンスを構築
+            Ok(mut backend_result) => {
                 let status_code = backend_result.status_code;
+
+                // B-38: WASM レスポンスヘッダフィルタ
+                #[cfg(feature = "wasm")]
+                if let Some(modules) = wasm_modules {
+                    if !modules.is_empty() {
+                        backend_result.headers = apply_h3_wasm_response_headers(
+                            modules,
+                            status_code,
+                            std::mem::take(&mut backend_result.headers),
+                        )
+                        .await;
+                    }
+                }
 
                 // 圧縮判定
                 let mut content_type: Option<&[u8]> = None;
@@ -1563,15 +1639,27 @@ impl Http3Handler {
                     }
                 }
 
-                let should_compress = compression.should_compress(
-                    client_encoding,
-                    content_type,
-                    Some(backend_result.body.len()),
-                    existing_encoding,
-                );
+                // gRPC は圧縮ネゴシエーション対象外（application/grpc）
+                #[cfg(feature = "grpc")]
+                let is_grpc_ct = content_type
+                    .map(|ct| crate::grpc::headers::is_grpc_content_type(ct))
+                    .unwrap_or(false);
+                #[cfg(not(feature = "grpc"))]
+                let is_grpc_ct = false;
 
-                // レスポンスヘッダーを構築（ホップバイホップヘッダーをスキップ）
-                let mut resp_headers: Vec<(&[u8], &[u8])> = Vec::new();
+                let should_compress = if is_grpc_ct {
+                    None
+                } else {
+                    compression.should_compress(
+                        client_encoding,
+                        content_type,
+                        Some(backend_result.body.len()),
+                        existing_encoding,
+                    )
+                };
+
+                // レスポンスヘッダー構築
+                let mut owned_headers: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
                 for (name, value) in &backend_result.headers {
                     if name.eq_ignore_ascii_case(b"connection")
                         || name.eq_ignore_ascii_case(b"transfer-encoding")
@@ -1579,22 +1667,62 @@ impl Http3Handler {
                     {
                         continue;
                     }
-                    // 圧縮時は Content-Length と Content-Encoding をスキップ
                     if should_compress.is_some()
                         && (name.eq_ignore_ascii_case(b"content-length")
                             || name.eq_ignore_ascii_case(b"content-encoding"))
                     {
                         continue;
                     }
-                    resp_headers.push((name.as_slice(), value.as_slice()));
+                    owned_headers.push((name.clone(), value.clone()));
                 }
 
-                // 圧縮処理
+                // H2C trailers（gRPC-status 等）をヘッダへマージ
+                // （HTTP/3 トレイラー API の制限があるため、クライアント到達性を優先）
+                for (name, value) in &backend_result.trailers {
+                    if !owned_headers
+                        .iter()
+                        .any(|(n, _)| n.eq_ignore_ascii_case(name))
+                    {
+                        owned_headers.push((name.clone(), value.clone()));
+                    }
+                }
+
                 let response_body = if let Some(enc) = should_compress {
                     compress_body_h3(&backend_result.body, enc, compression)
                 } else {
                     backend_result.body.clone()
                 };
+
+                let resp_headers: Vec<(&[u8], &[u8])> = owned_headers
+                    .iter()
+                    .map(|(n, v)| (n.as_slice(), v.as_slice()))
+                    .collect();
+
+                // gRPC: trailers 用 API で終端（status は既に headers にマージ済み）
+                #[cfg(feature = "grpc")]
+                if is_grpc_ct && !backend_result.trailers.is_empty() {
+                    let grpc_status = backend_result
+                        .trailers
+                        .iter()
+                        .find(|(n, _)| n.eq_ignore_ascii_case(b"grpc-status"))
+                        .and_then(|(_, v)| std::str::from_utf8(v).ok())
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .unwrap_or(0);
+                    let grpc_message = backend_result
+                        .trailers
+                        .iter()
+                        .find(|(n, _)| n.eq_ignore_ascii_case(b"grpc-message"))
+                        .and_then(|(_, v)| String::from_utf8(v.clone()).ok());
+                    // ヘッダにマージ済み + ボディ送信。status 200 で trailers も送る。
+                    self.send_grpc_response(
+                        stream_id,
+                        &resp_headers,
+                        Some(&response_body),
+                        grpc_status,
+                        grpc_message.as_deref(),
+                    )?;
+                    return Ok((status_code, response_body.len()));
+                }
 
                 self.send_response(stream_id, status_code, &resp_headers, Some(&response_body))?;
                 Ok((status_code, response_body.len()))
@@ -2284,6 +2412,8 @@ pub struct BackendProxyResult {
     pub body: Vec<u8>,
     /// レスポンスヘッダー（(name, value) のペア）
     pub headers: Vec<(Vec<u8>, Vec<u8>)>,
+    /// HTTP/2 trailers（H2C/gRPC 用。H1 バックエンドでは空）
+    pub trailers: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 pub(crate) async fn proxy_to_backend_async_with_tls(
@@ -2699,6 +2829,136 @@ fn parse_http_response(response: &[u8]) -> io::Result<BackendProxyResult> {
         status_code,
         body,
         headers,
+        trailers: Vec::new(),
+    })
+}
+
+/// B-38: HTTP/3 経路で WASM on_response_headers を適用する
+#[cfg(feature = "wasm")]
+async fn apply_h3_wasm_response_headers(
+    wasm_modules: &std::sync::Arc<Vec<String>>,
+    status: u16,
+    header_store: Vec<(Vec<u8>, Vec<u8>)>,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    if wasm_modules.is_empty() {
+        return header_store;
+    }
+    let config = CURRENT_CONFIG.load();
+    let Some(ref wasm_engine) = config.wasm_filter_engine else {
+        return header_store;
+    };
+
+    let wasm_result = wasm_engine
+        .clone()
+        .on_response_headers_with_modules_async(
+            wasm_modules.clone(),
+            status,
+            header_store.clone(),
+            true,
+        )
+        .await;
+
+    if let crate::wasm::FilterResult::Continue {
+        headers: modified_headers,
+        ..
+    } = wasm_result
+    {
+        return modified_headers;
+    }
+    header_store
+}
+
+/// B-39: HTTP/3 → H2C 上流プロキシ（gRPC 等）
+///
+/// Prior Knowledge で H2C 接続し、レスポンスヘッダ + ボディ + trailers を返す。
+#[cfg(feature = "http2")]
+async fn proxy_to_h2c_backend_async(
+    target: &ProxyTarget,
+    method: &[u8],
+    path: &[u8],
+    headers: &[(Vec<u8>, Vec<u8>)],
+    request_body: &[u8],
+    timeout_secs: u64,
+) -> io::Result<BackendProxyResult> {
+    use crate::http2::{H2cClient, Http2Settings};
+    use crate::runtime::tcp::TcpStream;
+
+    let addr = format!("{}:{}", target.host, target.port);
+    debug!("[HTTP/3] H2C connecting to backend {}", addr);
+
+    let connect_future = TcpStream::connect_str(&addr);
+    let backend = match crate::runtime::time::timeout(
+        Duration::from_secs(timeout_secs),
+        connect_future,
+    )
+    .await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => {
+            warn!("[HTTP/3] H2C backend connect error: {}", e);
+            return Err(e);
+        }
+        Err(_) => {
+            warn!("[HTTP/3] H2C backend connect timeout");
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "H2C backend connect timeout",
+            ));
+        }
+    };
+    let _ = backend.set_nodelay(true);
+
+    let settings = Http2Settings::default();
+    let mut client = H2cClient::new(backend, settings);
+
+    if let Err(e) = client.handshake().await {
+        warn!("[HTTP/3] H2C handshake error: {}", e);
+        return Err(io::Error::other(format!("H2C handshake: {}", e)));
+    }
+
+    let headers_ref: Vec<(&[u8], &[u8])> = headers
+        .iter()
+        .map(|(k, v)| (k.as_slice(), v.as_slice()))
+        .collect();
+    let body = if request_body.is_empty() {
+        None
+    } else {
+        Some(request_body)
+    };
+    let authority = target.host.as_bytes();
+
+    let response = match crate::runtime::time::timeout(
+        Duration::from_secs(timeout_secs),
+        client.send_request(method, path, authority, &headers_ref, body),
+    )
+    .await
+    {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(e)) => {
+            warn!("[HTTP/3] H2C request error: {}", e);
+            return Err(io::Error::other(format!("H2C request: {}", e)));
+        }
+        Err(_) => {
+            warn!("[HTTP/3] H2C request timeout");
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "H2C request timeout",
+            ));
+        }
+    };
+
+    debug!(
+        "[HTTP/3] H2C response: status={} body_len={} trailers={}",
+        response.status,
+        response.body.len(),
+        response.trailers.len()
+    );
+
+    Ok(BackendProxyResult {
+        status_code: response.status,
+        body: response.body,
+        headers: response.headers,
+        trailers: response.trailers,
     })
 }
 
