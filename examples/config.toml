@@ -102,9 +102,6 @@ http2_enabled = true
 #
 # http3_enabled = true
 
-# HTTP/3 有効時に HTTP/1.1・HTTP/2 応答へ Alt-Svc を付与するか（F-94、デフォルト: true）
-# alt_svc_enabled = true
-
 # ====================
 # Serverヘッダー設定
 # ====================
@@ -845,8 +842,16 @@ reuseport_balancing = "cbpf"
 # 未指定の場合は server.listen と同じアドレスを使用
 # listen = "127.0.0.1:443"
 
-# Alt-Svc 値の上書き（未指定時は listen ポートから h3=":PORT"; ma=86400 を自動生成）
+# ====================
+# Alt-Svc（HTTP/3 広告、F-94）— [http3] に集約
+# ====================
+# server.http3_enabled = true のとき、HTTP/1.1・HTTP/2 応答へ Alt-Svc を付与する。
+# 既定: true（広告する）。false で抑制。
+# alt_svc_enabled = true
+#
+# ヘッダー値の上書き（未指定時は listen ポートから h3=":PORT"; ma=86400 を自動生成）
 # alt_svc = "h3=\":443\"; ma=86400"
+# 自動生成時の max-age（秒）。デフォルト: 86400
 # alt_svc_ma_secs = 86400
 
 # 最大アイドルタイムアウト（ミリ秒）

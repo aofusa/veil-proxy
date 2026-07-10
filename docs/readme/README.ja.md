@@ -379,6 +379,9 @@ sudo setcap 'cap_net_bind_service=+ep' ./target/release/veil
 | `[http3]` | `initial_max_streams_uni` | `100` | 最大単方向ストリーム数 |
 | `[http3]` | `compression_enabled` | `false` | 圧縮を有効化 |
 | `[http3]` | `gso_gro_enabled` | `false` | GSO/GROを有効化 |
+| `[http3]` | `alt_svc_enabled` | `true` | H1/H2 応答へ Alt-Svc で HTTP/3 を広告（`server.http3_enabled` 時のみ） |
+| `[http3]` | `alt_svc` | _(自動)_ | Alt-Svc ヘッダー値の上書き（未指定時は listen ポートから `h3=":PORT"; ma=…`） |
+| `[http3]` | `alt_svc_ma_secs` | `86400` | 自動生成 Alt-Svc の max-age（秒） |
 
 設定ファイル例（`examples/config.toml`）:
 
@@ -2500,13 +2503,19 @@ initial_max_streams_uni = 100
 #
 # デフォルト: false
 gso_gro_enabled = false
+
+# Alt-Svc（HTTP/1.1・HTTP/2 応答での HTTP/3 広告、F-94）
+# 関連キーはすべて [http3] に集約。server.http3_enabled = true のときのみ有効。
+alt_svc_enabled = true          # 既定: true。false で広告を抑制
+# alt_svc = "h3=\":443\"; ma=86400"  # 任意の全文上書き（未指定時は listen ポートから自動生成）
+# alt_svc_ma_secs = 86400            # 自動生成時の max-age（秒、既定 86400）
 ```
 
 ### 注意事項
 
 - HTTP/3はUDPベースのため、**kTLSは使用不可**です（TCPを使用しないため）
 - UDPポート443をファイアウォールで開放する必要があります
-- `server.http3_enabled = true` のとき、HTTP/1.1・HTTP/2 応答に `Alt-Svc` で HTTP/3 を広告します（既定 `server.alt_svc_enabled = true`。上書きは `[http3].alt_svc` / `alt_svc_ma_secs`）
+- `server.http3_enabled = true` のとき、HTTP/1.1・HTTP/2 応答に `Alt-Svc` で HTTP/3 を広告します（設定はすべて `[http3]`：`alt_svc_enabled`、任意で `alt_svc` / `alt_svc_ma_secs`）
 
 ## kTLS（Kernel TLS）サポート
 

@@ -2839,7 +2839,17 @@ pub struct Http3ConfigSection {
     #[serde(default)]
     pub gso_gro_enabled: bool,
 
-    /// Alt-Svc ヘッダー値の上書き（F-94）
+    // ====================
+    // Alt-Svc（HTTP/3 広告、F-94）— すべて [http3] に集約
+    // ====================
+    /// HTTP/1.1・HTTP/2 応答へ `Alt-Svc` ヘッダーを付与するか
+    ///
+    /// デフォルト: `true`（`server.http3_enabled = true` のときのみ実際に広告される）
+    /// `false` にすると広告を抑制する。
+    #[serde(default = "default_true")]
+    pub alt_svc_enabled: bool,
+
+    /// Alt-Svc ヘッダー値の上書き
     ///
     /// 未指定時はリッスンポートから `h3=":PORT"; ma=86400` を自動生成する。
     /// 明示指定例: `h3=":443"; ma=86400, h3=":443"; ma=2592000`
@@ -2885,6 +2895,7 @@ impl Default for Http3ConfigSection {
             compression_enabled: false,
             compression: Http3CompressionConfig::default(),
             gso_gro_enabled: false,
+            alt_svc_enabled: true,
             alt_svc: None,
             alt_svc_ma_secs: default_h3_alt_svc_ma(),
         }
@@ -2987,14 +2998,6 @@ pub struct ServerConfigSection {
     #[serde(default)]
     #[cfg_attr(not(feature = "http3"), allow(dead_code))]
     pub http3_enabled: bool,
-
-    /// HTTP/3 有効時に HTTP/1.1・HTTP/2 応答へ `Alt-Svc` ヘッダーを付与するか（F-94）
-    ///
-    /// デフォルト: `true`（`http3_enabled = true` のときのみ実際に広告される）
-    /// `false` にすると広告を抑制する。値の上書きは [http3].alt_svc を使用。
-    #[serde(default = "default_true")]
-    #[cfg_attr(not(feature = "http3"), allow(dead_code))]
-    pub alt_svc_enabled: bool,
 
     // ====================
     // H2C (HTTP/2 Cleartext) 設定
@@ -4475,12 +4478,13 @@ impl AsyncWriter for crate::simple_tls::SimpleTlsClientStream {
 
 /// HTTP/3 有効時に Alt-Svc 広告を初期化する（F-94、コールドパス）。
 ///
-/// `server.http3_enabled && server.alt_svc_enabled` のとき、
+/// `server.http3_enabled && [http3].alt_svc_enabled` のとき、
 /// `[http3].alt_svc` 明示値、または listen ポートから自動生成した値を登録する。
+/// Alt-Svc 関連キーはすべて `[http3]` に集約する。
 fn apply_alt_svc_from_config(config: &Config) {
     #[cfg(feature = "http3")]
     {
-        let enabled = config.server.http3_enabled && config.server.alt_svc_enabled;
+        let enabled = config.server.http3_enabled && config.http3.alt_svc_enabled;
         let value = if enabled {
             if let Some(ref explicit) = config.http3.alt_svc {
                 explicit.clone()

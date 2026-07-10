@@ -32,7 +32,7 @@
 
 ## 改修内容
 
-1. Alt-Svc 製品機能（`http3_enabled` 時にグローバル広告、ホットパスゼロコピー Guard）
+1. Alt-Svc 製品機能（`server.http3_enabled` 時にグローバル広告。設定キーはすべて `[http3]` に集約: `alt_svc_enabled` / `alt_svc` / `alt_svc_ma_secs`。ホットパスゼロコピー Guard）
 2. E2E 4 件追加
 3. `h3spec_run.sh` + Dockerfile インストール + `run.sh` / `http3_probe` 連携
 4. amplification 厳格アサート、0-RTT replay / fragmented LPM / half-closed プローブ

@@ -380,6 +380,9 @@ The following table lists default values for major configuration options:
 | `[http3]` | `initial_max_streams_uni` | `100` | Max unidirectional streams |
 | `[http3]` | `compression_enabled` | `false` | Enable compression |
 | `[http3]` | `gso_gro_enabled` | `false` | Enable GSO/GRO |
+| `[http3]` | `alt_svc_enabled` | `true` | Advertise HTTP/3 via Alt-Svc on H1/H2 responses (when `server.http3_enabled`) |
+| `[http3]` | `alt_svc` | _(auto)_ | Override Alt-Svc header value (default: `h3=":PORT"; ma=…` from listen port) |
+| `[http3]` | `alt_svc_ma_secs` | `86400` | max-age for auto-generated Alt-Svc |
 
 Configuration file example (`examples/config.toml`):
 
@@ -2504,13 +2507,19 @@ initial_max_streams_uni = 100
 #
 # Default: false
 gso_gro_enabled = false
+
+# Alt-Svc (HTTP/3 advertisement on HTTP/1.1 and HTTP/2 responses; F-94)
+# All Alt-Svc keys live under [http3]. Effective only when server.http3_enabled = true.
+alt_svc_enabled = true          # default: true; set false to suppress advertising
+# alt_svc = "h3=\":443\"; ma=86400"  # optional full override (auto from listen port if omitted)
+# alt_svc_ma_secs = 86400            # max-age for auto-generated value (default: 86400)
 ```
 
 ### Notes
 
 - HTTP/3 is UDP-based, so **kTLS cannot be used** (doesn't use TCP)
 - UDP port 443 must be opened in the firewall
-- When `server.http3_enabled = true`, HTTP/1.1 and HTTP/2 responses advertise HTTP/3 via `Alt-Svc` (default `server.alt_svc_enabled = true`; override with `[http3].alt_svc` / `alt_svc_ma_secs`)
+- When `server.http3_enabled = true`, HTTP/1.1 and HTTP/2 responses advertise HTTP/3 via `Alt-Svc` (all options under `[http3]`: `alt_svc_enabled`, optional `alt_svc` / `alt_svc_ma_secs`)
 
 ## kTLS (Kernel TLS) Support
 
