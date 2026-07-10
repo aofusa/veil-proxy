@@ -190,6 +190,7 @@
 | B-38 | P1 | 完了 | [bugs/B-38-http3-wasm-response-headers-not-applied.md](bugs/B-38-http3-wasm-response-headers-not-applied.md) | HTTP/3 WASM レスポンスヘッダ未適用 → `apply_h3_wasm_response_headers` で修正。`test_http3_wasm_integration` PASS |
 | B-39 | P1 | 完了 | [bugs/B-39-http3-grpc-proxy-502.md](bugs/B-39-http3-grpc-proxy-502.md) | HTTP/3 gRPC 502 → H2C 上流 + フルパス保持で修正。`test_grpc_over_http3` PASS |
 | B-40 | P1 | 完了 | [bugs/B-40-grpc-path-prefix-stripping.md](bugs/B-40-grpc-path-prefix-stripping.md) | H1/H2 gRPC が `/*` プレフィックス除去で UNIMPLEMENTED/502。フルパス保持 + H2 use_h2c + HPACK 小文字化で修正（F-92） |
+| B-41 | P1 | 進行中 | [bugs/B-41-http3-grpc-body-trailers-hang.md](bugs/B-41-http3-grpc-body-trailers-hang.md) | HTTP/3 gRPC ボディあり応答が trailers API 誤用でハング（`send_response` → `send_additional_headers`） |
 
 ---
 

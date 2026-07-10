@@ -18479,9 +18479,9 @@ async fn test_grpc_over_http3() {
         Err(e) => panic!("HTTP/3 client failed: {}", e),
     };
 
-    let msg = b"hello-grpc-over-h3";
-    let frame = GrpcFrame::new(msg.to_vec());
-    let frame_bytes = frame.encode();
+    // 正しい SimpleRequest protobuf（B-41: ボディあり成功パスを固定。不正ペイロードだと
+    // 空ボディ+エラーのみで trailers ハングバグを隠蔽する）
+    let frame_bytes = encode_grpc_lpm(&encode_simple_request("hello-grpc-over-h3"));
 
     use common::http3_client::send_http3_request_full;
     let r = send_http3_request_full(
@@ -18498,11 +18498,7 @@ async fn test_grpc_over_http3() {
     .await
     .expect("gRPC over HTTP/3 request should complete without transport error");
 
-    let grpc_status = r
-        .headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("grpc-status"))
-        .map(|(_, v)| v.as_str());
+    let grpc_status = r.grpc_status();
     eprintln!(
         "gRPC over H3 status={} grpc-status={:?} body_len={} headers={:?}",
         r.status,
@@ -18511,19 +18507,21 @@ async fn test_grpc_over_http3() {
         r.headers
     );
 
-    // 実装バグ（HTTP/3 gRPC プロキシ 502 等）はテスト失敗として検出する
+    // 実装バグ（HTTP/3 gRPC プロキシ 502 / B-41 trailers ハング等）はテスト失敗として検出する
     assert_eq!(
         r.status, 200,
         "gRPC over HTTP/3 Unary should return HTTP 200 (got {}). See B-39 if 502.",
         r.status
     );
+    assert_eq!(
+        grpc_status,
+        Some(0),
+        "valid Unary over H3 should yield grpc-status=0 (got {:?}). See B-41 if hang/missing trailers.",
+        grpc_status
+    );
     assert!(
-        grpc_status.is_some()
-            || !r.body.is_empty()
-            || r.headers
-                .iter()
-                .any(|(k, _)| k.to_ascii_lowercase().starts_with("grpc-")),
-        "gRPC over H3 200 should include grpc trailers or body"
+        !r.body.is_empty(),
+        "successful Unary should return a response LPM body"
     );
 }
 

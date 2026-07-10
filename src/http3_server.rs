@@ -1345,8 +1345,10 @@ impl Http3Handler {
 
     /// gRPC レスポンスを送信 (トレイラー付き)
     ///
-    /// HTTP/3 では QPACK を使用してトレイラーを送信します。
-    /// ボディ送信後に grpc-status と grpc-message をトレイラーとして送信。
+    /// HTTP/3 では初期 HEADERS の後、ボディ（任意）を送り、
+    /// **`send_additional_headers` で trailers を fin=true で送出**する（B-41）。
+    /// quiche の `send_response` は初期応答専用で、2 回目に使うと失敗しストリームが
+    /// 閉じられずクライアントがハングする。
     #[cfg(feature = "grpc")]
     fn send_grpc_response(
         &mut self,
@@ -1361,28 +1363,25 @@ impl Http3Handler {
             None => return Ok(()),
         };
 
-        // 1. ヘッダー送信 (200 OK + content-type: application/grpc)
+        // 1. 初期ヘッダ（:status + content-type）。grpc-status/message は trailers 専用。
         let mut h3_headers = vec![
             h3::Header::new(b":status", b"200"),
-            h3::Header::new(b"content-type", b"application/grpc+proto"),
+            h3::Header::new(b"content-type", b"application/grpc"),
         ];
 
-        for &(name, value) in headers {
-            if name != b":status" && !name.eq_ignore_ascii_case(b"content-type") {
-                h3_headers.push(h3::Header::new(name, value));
-            }
+        for (name, value) in filter_h3_grpc_initial_headers(headers) {
+            h3_headers.push(h3::Header::new(name, value));
         }
 
-        // ボディがあるかどうかを判定
-        let has_body = body.is_some() && body.is_some_and(|b| !b.is_empty());
+        let has_body = body.is_some_and(|b| !b.is_empty());
 
-        // ボディがない場合はヘッダーのみ送信してトレイラーへ
+        // ボディ有無に関わらず初期ヘッダは fin=false（trailers で終端）
         if let Err(e) = h3_conn.send_response(&mut self.conn, stream_id, &h3_headers, false) {
             warn!("[HTTP/3] gRPC send_response error: {}", e);
             return Ok(());
         }
 
-        // 2. ボディ送信 (ボディがある場合のみ)
+        // 2. ボディ（fin=false — trailers が続く）
         if has_body {
             if let Some(body_data) = body {
                 if let Err(e) = h3_conn.send_body(&mut self.conn, stream_id, body_data, false) {
@@ -1391,13 +1390,11 @@ impl Http3Handler {
             }
         }
 
-        // 3. トレイラー送信 (grpc-status, grpc-message)
+        // 3. trailers（fin=true）
         self.send_grpc_trailers_internal(stream_id, grpc_status, grpc_message)
     }
 
-    /// gRPC トレイラーを送信（内部ヘルパー）
-    ///
-    /// grpc-status と grpc-message をトレイラーとして送信し、ストリームを終了。
+    /// gRPC トレイラーを `send_additional_headers` で送信しストリームを終了（B-41）。
     #[cfg(feature = "grpc")]
     fn send_grpc_trailers_internal(
         &mut self,
@@ -1421,19 +1418,21 @@ impl Http3Handler {
         };
         let trailer_pairs = status.to_trailers();
 
-        // quiche の H3 トレイラー送信
         let trailers: Vec<h3::Header> = trailer_pairs
             .iter()
             .map(|(n, v)| h3::Header::new(n.as_slice(), v.as_slice()))
             .collect();
 
-        // send_response with fin=true acts as trailers in HTTP/3
-        // However, quiche doesn't have a direct send_trailers API
-        // We need to use send_body with fin=true after all data
-        // For now, use send_response as trailers-only frame
-        if let Err(e) = h3_conn.send_response(&mut self.conn, stream_id, &trailers, true) {
-            // Note: This might not work for all cases, but quiche's h3 API is limited
-            debug!("[HTTP/3] gRPC trailers send attempt: {:?}", e);
+        // B-41: trailers は send_additional_headers（is_trailer_section=true, fin=true）
+        // send_response の再利用は不可（初期応答専用 API）
+        if let Err(e) =
+            h3_conn.send_additional_headers(&mut self.conn, stream_id, &trailers, true, true)
+        {
+            warn!("[HTTP/3] gRPC trailers send_additional_headers error: {}", e);
+            // フォールバック: 空ボディ + fin でストリームを閉じ、クライアントハングを防ぐ
+            if let Err(e2) = h3_conn.send_body(&mut self.conn, stream_id, &[], true) {
+                debug!("[HTTP/3] gRPC trailers fin fallback error: {:?}", e2);
+            }
         }
 
         Ok(())
@@ -1977,6 +1976,23 @@ fn compute_upstream_request_path(
 fn header_pairs_indicate_grpc(headers: &[(Vec<u8>, Vec<u8>)]) -> bool {
     headers.iter().any(|(n, v)| {
         n.eq_ignore_ascii_case(b"content-type") && crate::grpc::headers::is_grpc_content_type(v)
+    })
+}
+
+/// gRPC over H3 の初期応答ヘッダから、trailers / 擬似ヘッダ / 重複を除外する（B-41）。
+///
+/// `grpc-status` / `grpc-message` は `send_additional_headers` の trailers 専用にし、
+/// 初期 HEADERS には載せない。
+#[cfg(feature = "grpc")]
+fn filter_h3_grpc_initial_headers<'a>(
+    headers: &'a [(&'a [u8], &'a [u8])],
+) -> impl Iterator<Item = (&'a [u8], &'a [u8])> + 'a {
+    headers.iter().copied().filter(|(name, _)| {
+        *name != b":status"
+            && !name.eq_ignore_ascii_case(b"content-type")
+            && !name.eq_ignore_ascii_case(b"grpc-status")
+            && !name.eq_ignore_ascii_case(b"grpc-message")
+            && !name.eq_ignore_ascii_case(b"content-length")
     })
 }
 
@@ -3945,6 +3961,27 @@ mod tests {
             headers.clone(),
         ));
         assert_eq!(out, headers);
+    }
+
+    /// B-41: 初期ヘッダから grpc-status/message と CL を除外し trailers 専用にする
+    #[cfg(feature = "grpc")]
+    #[test]
+    fn test_b41_filter_h3_grpc_initial_headers() {
+        let headers: &[(&[u8], &[u8])] = &[
+            (b":status", b"200"),
+            (b"content-type", b"application/grpc"),
+            (b"grpc-status", b"0"),
+            (b"grpc-message", b"ok"),
+            (b"content-length", b"12"),
+            (b"x-server-id", b"grpc-server"),
+            (b"date", b"Fri, 10 Jul 2026 00:00:00 GMT"),
+        ];
+        let kept: Vec<(&[u8], &[u8])> = filter_h3_grpc_initial_headers(headers).collect();
+        assert_eq!(kept.len(), 2);
+        assert!(kept.iter().any(|(n, v)| *n == b"x-server-id" && *v == b"grpc-server"));
+        assert!(kept.iter().any(|(n, _)| *n == b"date"));
+        assert!(!kept.iter().any(|(n, _)| n.eq_ignore_ascii_case(b"grpc-status")));
+        assert!(!kept.iter().any(|(n, _)| n.eq_ignore_ascii_case(b"content-length")));
     }
 
     /// B-39: content-type から gRPC を検出
