@@ -1066,6 +1066,8 @@ EOF
     # gRPCルート設定
     cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
 [[route]]
+# F-94: gRPC + WASM インターセプタ E2E 用（modules は route 直下）
+modules = ["header_filter"]
 [route.conditions]
 host = "localhost"
 path = "/grpc.test.v1.TestService/*"
@@ -1077,6 +1079,7 @@ use_h2c = true
 add_response_headers = { "X-Proxied-By" = "veil", "X-GRPC-Test" = "true", "X-Fixed-Routing" = "true" }
 
 [[route]]
+modules = ["header_filter"]
 [route.conditions]
 host = "127.0.0.1"
 path = "/grpc.test.v1.TestService/*"

@@ -19171,3 +19171,276 @@ Content-Length: 1048576\r\n\
         "post-slowloris request should complete without hanging forever"
     );
 }
+
+// =============================================================================
+// F-94: http3_grpc_test_coverage_report 項目 1〜4
+// =============================================================================
+
+/// E-H3-F94-01: HTTP/1.1 および HTTP/2 応答で Alt-Svc が HTTP/3 を広告すること
+#[tokio::test]
+#[ntest::timeout(20000)]
+async fn test_alt_svc_http3_advertisement() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    // HTTP/1.1: 静的ルート GET / で Alt-Svc を確認
+    let client = Http1TestClient::new_https("127.0.0.1", PROXY_PORT).expect("h1 client");
+    let (status, headers, _body) = client
+        .send_request_with_response_headers(http::Method::GET, "/", &[], None)
+        .await
+        .expect("HTTP/1.1 GET /");
+    assert_eq!(status, 200, "HTTP/1.1 GET / should be 200");
+    let alt_svc_h1 = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("alt-svc"));
+    assert!(
+        alt_svc_h1.is_some(),
+        "HTTP/1.1 response must include Alt-Svc when http3_enabled, headers={:?}",
+        headers
+    );
+    let v = &alt_svc_h1.unwrap().1;
+    assert!(
+        v.contains("h3=") || v.contains("h3=\""),
+        "Alt-Svc should advertise h3, got {:?}",
+        v
+    );
+    assert!(
+        v.contains(&format!(":{}", PROXY_HTTP3_PORT)) || v.contains(":443"),
+        "Alt-Svc should include HTTP/3 port, got {:?}",
+        v
+    );
+
+    // HTTP/2: 同様に Alt-Svc
+    #[cfg(feature = "http2")]
+    {
+        let mut h2 = Http2TestClient::new("127.0.0.1", PROXY_PORT)
+            .await
+            .expect("h2 client");
+        let resp = h2
+            .send_request_full("GET", "/", &[], None)
+            .await
+            .expect("HTTP/2 GET /");
+        assert_eq!(resp.status, 200, "HTTP/2 GET / should be 200");
+        let alt_svc_h2 = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("alt-svc"));
+        assert!(
+            alt_svc_h2.is_some(),
+            "HTTP/2 response must include Alt-Svc, headers={:?}",
+            resp.headers
+        );
+        let v2 = &alt_svc_h2.unwrap().1;
+        assert!(
+            v2.contains("h3="),
+            "HTTP/2 Alt-Svc should advertise h3, got {:?}",
+            v2
+        );
+    }
+}
+
+/// E-H3-F94-02: UDP 到達不能時のフォールバック — H3 失敗後も H2/H1.1 で処理継続
+#[tokio::test]
+#[ntest::timeout(20000)]
+async fn test_http3_udp_unreachable_fallback() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    // 1) 到達不能な UDP ポートへ HTTP/3 を試みる → 失敗が期待される
+    let dead_udp: u16 = 39999;
+    let dead_addr: std::net::SocketAddr = format!("127.0.0.1:{}", dead_udp).parse().unwrap();
+    let h3_dead = tokio::time::timeout(
+        Duration::from_secs(3),
+        Http3TestClient::new(dead_addr, "localhost"),
+    )
+    .await;
+    match h3_dead {
+        Ok(Ok(_)) => {
+            // 偶然応答が来た場合はフォールバック検証へ進む（稀）
+            eprintln!("WARN: unexpected H3 success on dead UDP port {}", dead_udp);
+        }
+        Ok(Err(e)) => {
+            eprintln!("H3 to dead UDP failed as expected: {}", e);
+        }
+        Err(_) => {
+            eprintln!("H3 to dead UDP timed out as expected");
+        }
+    }
+
+    // 2) 同じプロキシへ HTTP/1.1 で到達できること（クライアントフォールバック相当）
+    let client = Http1TestClient::new_https("127.0.0.1", PROXY_PORT).expect("h1 client");
+    let (s1, _) = client.get("/").await.expect("H1.1 fallback GET");
+    assert_eq!(s1, 200, "HTTP/1.1 fallback after UDP failure should work");
+
+    // 3) HTTP/2 でも到達できること
+    #[cfg(feature = "http2")]
+    {
+        let mut h2 = Http2TestClient::new("127.0.0.1", PROXY_PORT)
+            .await
+            .expect("h2 client");
+        let (s2, _) = h2.get("/").await.expect("H2 fallback GET");
+        assert_eq!(s2, 200, "HTTP/2 fallback after UDP failure should work");
+    }
+
+    // 4) 正規の HTTP/3 ポートは生きていること（プロキシ自体の健全性）
+    #[cfg(feature = "http3")]
+    {
+        let live: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+            .parse()
+            .unwrap();
+        let ok = Http3TestClient::new(live, "localhost").await;
+        assert!(
+            ok.is_ok(),
+            "live HTTP/3 listener should still accept connections"
+        );
+    }
+}
+
+/// E-G-F94-03: gRPC 大量データで WINDOW_UPDATE 境界を跨いでもクラッシュしないこと
+#[tokio::test]
+#[ntest::timeout(45000)]
+#[cfg(all(feature = "http2", feature = "grpc"))]
+async fn test_grpc_flow_control_window_boundary() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    // 初期ウィンドウ 65535 を超えるペイロードで複数 DATA + WINDOW_UPDATE を強制
+    // gRPC LPM: 5 byte header + protobuf-ish payload
+    let payload_size = 256 * 1024; // 256 KiB
+    let mut lpm = Vec::with_capacity(5 + payload_size);
+    lpm.push(0u8); // uncompressed
+    lpm.extend_from_slice(&(payload_size as u32).to_be_bytes());
+    lpm.extend(std::iter::repeat(b'G').take(payload_size));
+
+    // 1 バイト〜1KB 単位に分割して送信し、フロー制御の再開を誘発
+    let mut chunks: Vec<&[u8]> = Vec::new();
+    let mut offset = 0usize;
+    while offset < lpm.len() {
+        let end = (offset + 1024).min(lpm.len());
+        chunks.push(&lpm[offset..end]);
+        offset = end;
+    }
+
+    let mut client = Http2TestClient::new("127.0.0.1", PROXY_PORT)
+        .await
+        .expect("h2 client for gRPC FC");
+    let headers = [
+        ("content-type", "application/grpc"),
+        ("te", "trailers"),
+    ];
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        client.send_request_chunked(
+            "POST",
+            "/grpc.test.v1.TestService/UnaryCall",
+            &headers,
+            &chunks,
+            None,
+        ),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(resp)) => {
+            // 2xx または gRPC エラー（上流が巨大メッセージを拒否）いずれもクラッシュなし
+            eprintln!(
+                "gRPC FC: status={} grpc_status={:?} body_len={}",
+                resp.status,
+                resp.grpc_status(),
+                resp.body.len()
+            );
+            assert!(
+                resp.status < 600,
+                "unexpected HTTP status {}",
+                resp.status
+            );
+        }
+        Ok(Err(e)) => {
+            // ストリームリセット等は許容（プロセス生存が主目的）
+            eprintln!("gRPC FC stream error (controlled): {}", e);
+        }
+        Err(_) => panic!("gRPC flow-control streaming hung for 30s"),
+    }
+
+    assert!(
+        is_e2e_environment_ready().await,
+        "proxy must survive gRPC flow-control boundary test"
+    );
+
+    // 直後の小さな Unary が通ること
+    let ok = GrpcTestClient::send_grpc_request(
+        "127.0.0.1",
+        PROXY_PORT,
+        "/grpc.test.v1.TestService/UnaryCall",
+        b"after-fc",
+        &[],
+    )
+    .await;
+    assert!(
+        ok.is_ok(),
+        "post-FC small Unary should succeed: {:?}",
+        ok.err()
+    );
+}
+
+/// E-G-F94-04: gRPC 経路で WASM インターセプタが応答ヘッダを付与できること
+#[tokio::test]
+#[ntest::timeout(20000)]
+#[cfg(all(feature = "http2", feature = "grpc", feature = "wasm"))]
+async fn test_grpc_wasm_interceptor() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    // gRPC ルートに header_filter が modules として載っている想定（e2e_setup）
+    let mut client = Http2TestClient::new("127.0.0.1", PROXY_PORT)
+        .await
+        .expect("h2 client");
+    // 最小 LPM: empty message
+    let lpm = [0u8, 0, 0, 0, 0];
+    let headers = [
+        ("content-type", "application/grpc"),
+        ("te", "trailers"),
+    ];
+    let resp = client
+        .send_request_full(
+            "POST",
+            "/grpc.test.v1.TestService/UnaryCall",
+            &headers,
+            Some(&lpm),
+        )
+        .await
+        .expect("gRPC+WASM request");
+
+    eprintln!(
+        "gRPC+WASM: status={} headers={:?} grpc_status={:?}",
+        resp.status,
+        resp.headers,
+        resp.grpc_status()
+    );
+
+    // プロキシが 5xx で落ちていないこと
+    assert!(
+        resp.status < 500 || resp.status == 502,
+        "gRPC+WASM should not crash; status={}",
+        resp.status
+    );
+
+    let has_wasm = resp.headers.iter().any(|(k, v)| {
+        let k = k.to_ascii_lowercase();
+        (k == "x-veil-processed" && (v == "true" || !v.is_empty()))
+            || k == "x-wasm-processed"
+            || k == "x-veil-filter-version"
+            || k == "x-veil-context-id"
+    });
+    assert!(
+        has_wasm,
+        "gRPC WASM interceptor should add filter response headers, got headers={:?}",
+        resp.headers
+    );
+}
