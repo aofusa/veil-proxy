@@ -55,3 +55,6 @@ tools/container_security/harness/tools/target/
 tools/container_security/harness/tools/Cargo.lock
 # container_security 実行レポート（run.sh 毎回生成）
 tools/container_security/results/
+
+# 作業用一時 diff
+diff.txt
