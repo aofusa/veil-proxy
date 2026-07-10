@@ -182,6 +182,60 @@ else
 fi
 check_health "post_grpc_rst_flood" || true
 
+# S-G-10 (F-94): Fragmented LPM — 正常 LPM を 1 バイト単位で H2C DATA 相当に分割送信
+# curl はフレーム制御できないため、openssl で HTTP/1.1 ボディを 1 バイトずつ送る
+frag_log="$(mktemp)"
+set +e
+{
+    printf 'POST /grpc.test.v1.TestService/UnaryCall HTTP/1.1\r\n'
+    printf 'Host: veil-proxy\r\n'
+    printf 'Content-Type: application/grpc\r\n'
+    printf 'TE: trailers\r\n'
+    printf 'Content-Length: 7\r\n'
+    printf '\r\n'
+    # LPM: flags=0 length=2 body={}
+    for b in $'\x00' $'\x00' $'\x00' $'\x00' $'\x02' '{' '}'; do
+        printf '%s' "${b}"
+        sleep 0.05
+    done
+} | timeout 10 openssl s_client -connect "${VEIL_HOST}:${VEIL_HTTPS_PORT}" \
+    -servername "${VEIL_HOST}" -quiet 2>/dev/null >"${frag_log}" 2>&1
+frag_rc=$?
+set -e
+if [[ "${frag_rc}" -eq 0 ]] || [[ "${frag_rc}" -eq 124 ]] || [[ "${frag_rc}" -eq 1 ]]; then
+    log "PASS grpc_fragmented_lpm: completed (rc=${frag_rc})"
+else
+    log "WARN grpc_fragmented_lpm: rc=${frag_rc}"
+fi
+rm -f "${frag_log}"
+check_health "post_grpc_fragmented_lpm" || true
+
+# S-G-11 (F-94): Half-closed ストリーム悪用 — リクエスト完了後に応答を読まず放置
+half_log="$(mktemp)"
+set +e
+{
+    # 完全な小リクエストを送り、応答を読まずに接続を保持
+    printf 'POST /grpc.test.v1.TestService/UnaryCall HTTP/1.1\r\n'
+    printf 'Host: veil-proxy\r\n'
+    printf 'Content-Type: application/grpc\r\n'
+    printf 'TE: trailers\r\n'
+    printf 'Content-Length: 7\r\n'
+    printf '\r\n'
+    printf '\x00\x00\x00\x00\x02{}'
+    # 応答を意図的に読まず 5 秒保持（TCP window 枯渇の近似）
+    sleep 5
+} | timeout 12 openssl s_client -connect "${VEIL_HOST}:${VEIL_HTTPS_PORT}" \
+    -servername "${VEIL_HOST}" -quiet 2>/dev/null >"${half_log}" 2>&1
+half_rc=$?
+set -e
+if [[ "${half_rc}" -eq 0 ]] || [[ "${half_rc}" -eq 124 ]] || [[ "${half_rc}" -eq 1 ]]; then
+    log "PASS grpc_half_closed_hold: completed (rc=${half_rc})"
+else
+    log "WARN grpc_half_closed_hold: rc=${half_rc}"
+fi
+rm -f "${half_log}"
+check_health "post_grpc_half_closed" || true
+
 # ---------------------------------------------------------------------------
 # F-93: gRPC over HTTP/3 (QUIC) 攻撃検証
 # 合格条件: クライアント完了 + プロセス生存（post health 200）

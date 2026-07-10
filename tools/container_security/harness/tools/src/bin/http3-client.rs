@@ -4,10 +4,11 @@
 //! - VEIL_HOST / VEIL_SNI / VEIL_HTTP3_PORT (default 443)
 //! - HTTP3_PATH (default /)
 //! - HTTP3_MODE: get | handshake_flood | qpack_bomb | cid_spoof | malformed
-//!               | handshake_slowloris | amplification_check
+//!               | handshake_slowloris | amplification_check | early_data_replay
 //!               | grpc_malformed | grpc_header_spoof | grpc_slowloris | grpc_stream_reset
 //! - HTTP3_REPORT
 //! - HTTP3_GRPC_PATH (default /grpc.test.v1.TestService/UnaryCall)
+//! - AMPLIFICATION_STRICT (default 1): amplification_check で ratio>3 をエラーにする
 //!
 //! 終了: 0 = モード成功（攻撃系は crash せず完了）、1 = 失敗
 
@@ -63,9 +64,12 @@ fn main() {
         // F-92: Initial のみ送ってハンドシェイクを完了させず放置
         "handshake_slowloris" => handshake_slowloris(&host, port)
             .map(|s| format!("handshake_slowloris done detail={}", s)),
-        // F-92: クライアント送信バイト vs サーバ応答バイトの増幅比を計測（3 倍ルール目安）
+        // F-92/F-94: クライアント送信バイト vs サーバ応答バイトの増幅比（RFC 9000 ≤3x）
         "amplification_check" => amplification_check(&host, port)
             .map(|s| format!("amplification_check {}", s)),
+        // F-94: 0-RTT / Early Data への非冪等 POST リプレイ
+        "early_data_replay" => early_data_replay(&host, port, &path)
+            .map(|s| format!("early_data_replay done detail={}", s)),
         // F-93: gRPC over HTTP/3 攻撃モード
         "grpc_malformed" => grpc_malformed(&host, port, &grpc_path)
             .map(|s| format!("grpc_malformed done detail={}", s)),
@@ -84,17 +88,24 @@ fn main() {
             std::process::exit(0);
         }
         Err(e) => {
-            log_line(&report, &format!("http3_client: FAIL {}", e));
-            // 攻撃系はサーバ側クラッシュ検出をプローブ側 health に委ねるため、
-            // クライアント側のプロトコルエラーは 0 で「完了」扱いにするモードもある。
-            // 不明モードのみ 1。
-            if mode == "get" || mode.is_empty() {
+            let msg = format!("{}", e);
+            log_line(&report, &format!("http3_client: FAIL {}", msg));
+            // 正常 GET / 不明モード / 厳格 amplification 超過は失敗扱い。
+            // その他攻撃系はサーバ側 crash 検出を post-health に委ね 0 終了。
+            if mode == "get"
+                || mode.is_empty()
+                || mode == "amplification_check"
+                || msg.contains("AMPLIFICATION_EXCEEDED")
+                || msg.starts_with("unknown HTTP3_MODE")
+            {
                 std::process::exit(1);
             }
-            // 攻撃モード: クライアントが例外なく終了できれば 0
             log_line(
                 &report,
-                &format!("http3_client: attack mode completed with client error (ok): {}", e),
+                &format!(
+                    "http3_client: attack mode completed with client error (ok): {}",
+                    msg
+                ),
             );
             std::process::exit(0);
         }
@@ -426,11 +437,131 @@ fn amplification_check(host: &str, port: u16) -> Result<String, Box<dyn std::err
     } else {
         recv as f64 / sent as f64
     };
-    // RFC 9000 anti-amplification: 検証前は送信の 3 倍まで。観測のみ（失敗にしない）。
-    Ok(format!(
-        "sent={} recv={} ratio={:.2} (anti-amplification guideline <=3 before path validation)",
+    // RFC 9000 §8: アドレス検証前は送信量の 3 倍を超えてはならない。
+    // AMPLIFICATION_STRICT=1（既定）で ratio>3 をエラーにする（F-94）。
+    let strict = env::var("AMPLIFICATION_STRICT")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
+    let detail = format!(
+        "sent={} recv={} ratio={:.2} (RFC9000 anti-amplification limit=3 before path validation)",
         sent, recv, ratio
+    );
+    if strict && sent > 0 && ratio > 3.0 {
+        return Err(format!("AMPLIFICATION_EXCEEDED {}", detail).into());
+    }
+    Ok(detail)
+}
+
+/// F-94: 0-RTT リプレイ近似 — セッション確立後に非冪等 POST を複数回送り、
+/// サーバがクラッシュせず安全に拒否または 1 回処理に留まること（health はプローブ側）。
+/// 真の 0-RTT チケット再利用は quiche セッション永続化が必要なため、
+/// ここでは「短時間に同一非冪等 POST を連打」してリプレイ面を近似する。
+fn early_data_replay(
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    // 1 回目: セッション確立 + GET
+    let _ = send_http3_get(host, port, path);
+
+    let mut ok = 0u32;
+    let mut err = 0u32;
+    let body = b"non-idempotent-replay-body";
+    for i in 0..5 {
+        match send_http3_post(host, port, path, body) {
+            Ok(_) => ok += 1,
+            Err(e) => {
+                err += 1;
+                // 接続拒否・リセットは安全な失敗として許容
+                let _ = e;
+            }
+        }
+        // わずかに間隔を空けてリプレイ列を作る
+        std::thread::sleep(Duration::from_millis(20 + i as u64 * 5));
+    }
+    Ok(format!(
+        "replay_posts ok={} err={} (crash check deferred to post-health)",
+        ok, err
     ))
+}
+
+fn send_http3_post(
+    host: &str,
+    port: u16,
+    path: &str,
+    body: &[u8],
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut session = establish_h3(host, port, 10_000)?;
+    let cl = body.len().to_string();
+    let headers = vec![
+        quiche::h3::Header::new(b":method", b"POST"),
+        quiche::h3::Header::new(b":path", path.as_bytes()),
+        quiche::h3::Header::new(b":authority", host.as_bytes()),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b"content-type", b"application/octet-stream"),
+        quiche::h3::Header::new(b"content-length", cl.as_bytes()),
+    ];
+    let stream_id = session
+        .h3
+        .send_request(&mut session.conn, &headers, false)?;
+    session
+        .h3
+        .send_body(&mut session.conn, stream_id, body, true)?;
+    pump_io(&mut session);
+
+    let mut total = 0usize;
+    let start = Instant::now();
+    let timeout = Duration::from_secs(5);
+    while start.elapsed() < timeout {
+        match session.socket.recv(&mut session.buf) {
+            Ok(len) => {
+                let recv_info = quiche::RecvInfo {
+                    from: session.peer_addr,
+                    to: session.socket.local_addr()?,
+                };
+                session.conn.recv(&mut session.buf[..len], recv_info)?;
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                if session.conn.is_closed() {
+                    break;
+                }
+            }
+            Err(e) => return Err(Box::new(e)),
+        }
+        loop {
+            match session.h3.poll(&mut session.conn) {
+                Ok((id, quiche::h3::Event::Data)) if id == stream_id => {
+                    while let Ok(n) =
+                        session
+                            .h3
+                            .recv_body(&mut session.conn, id, &mut session.buf)
+                    {
+                        total += n;
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                }
+                Ok((id, quiche::h3::Event::Finished)) if id == stream_id => {
+                    return Ok(total);
+                }
+                Ok((id, quiche::h3::Event::Reset(_))) if id == stream_id => {
+                    return Ok(total);
+                }
+                Ok(_) => {}
+                Err(quiche::h3::Error::Done) => break,
+                Err(e) => return Err(Box::new(e)),
+            }
+        }
+        pump_io(&mut session);
+        if session.conn.is_closed() {
+            break;
+        }
+    }
+    Ok(total)
 }
 
 /// quiche 接続 + H3 トランスポートの共通セットアップ。

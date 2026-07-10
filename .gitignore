@@ -51,3 +51,7 @@ tools/container_security/harness/tools/target/
 tools/container_security/harness/tools/Cargo.lock
 # container_security 実行レポート（run.sh 毎回生成）
 tools/container_security/results/
+
+# fuzz 実行時の target 隔離（run_libfuzzer.sh）
+tools/container_security/results/cargo-target/
+

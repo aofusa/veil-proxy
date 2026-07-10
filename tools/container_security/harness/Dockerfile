@@ -22,6 +22,8 @@ RUN cargo build --release --bins
 FROM debian:bookworm-slim
 
 ARG H2SPEC_VERSION=2.6.0
+# F-94: h3spec（kazu-yamamoto/h3spec）— HTTP/3 / QUIC エラーケース検証
+ARG H3SPEC_VERSION=0.1.13
 
 RUN apt-get update -y \
     && apt-get install -y --no-install-recommends \
@@ -36,6 +38,9 @@ RUN apt-get update -y \
     && tar -xzf /tmp/h2spec.tar.gz -C /usr/local/bin h2spec \
     && chmod +x /usr/local/bin/h2spec \
     && rm -f /tmp/h2spec.tar.gz \
+    && curl -fsSL -o /usr/local/bin/h3spec \
+        "https://github.com/kazu-yamamoto/h3spec/releases/download/v${H3SPEC_VERSION}/h3spec-linux-x86_64" \
+    && chmod +x /usr/local/bin/h3spec \
     && rm -rf /var/lib/apt/lists/*
 
 # Rust 製ツール（旧 python スクリプトの置換）を配置。

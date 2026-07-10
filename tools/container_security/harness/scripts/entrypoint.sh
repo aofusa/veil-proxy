@@ -20,6 +20,9 @@ run_phase() {
         h2spec)
             exec /scripts/h2spec_run.sh
             ;;
+        h3spec)
+            exec /scripts/h3spec_run.sh
+            ;;
         toxiproxy)
             exec /scripts/toxiproxy_chaos.sh
             ;;

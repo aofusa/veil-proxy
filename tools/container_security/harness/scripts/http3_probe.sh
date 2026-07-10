@@ -105,27 +105,30 @@ check_tls_health "post_h3_malformed_frames" || true
 run_h3_mode handshake_slowloris "h3_handshake_slowloris" || true
 check_tls_health "post_h3_handshake_slowloris" || true
 
-# S-H3-07 (F-92): Amplification / reflection 観測（増幅比ログ、crash なし）
+# S-H3-07 (F-92/F-94): Amplification — RFC 9000 の 3 倍制限を厳格アサート
+# AMPLIFICATION_STRICT=1（既定）で ratio>3 を FAIL。0 で観測のみ。
+export AMPLIFICATION_STRICT="${AMPLIFICATION_STRICT:-1}"
 run_h3_mode amplification_check "h3_amplification_check" || true
 check_tls_health "post_h3_amplification_check" || true
 
-# S-H3-08 (F-92): h3spec 相当は専用バイナリが無い場合が多い。
-# 利用可能なら実行、無ければスキップ（h2spec と同様の位置づけ）。
-if command -v h3spec >/dev/null 2>&1; then
+# S-H3-08 (F-94): 0-RTT リプレイ（非冪等 POST の Early Data 再送）
+run_h3_mode early_data_replay "h3_early_data_replay" || true
+check_tls_health "post_h3_early_data_replay" || true
+
+# S-H3-09 (F-94): h3spec — 専用スクリプトへ委譲（H3SPEC_STRICT / H3SPEC_REQUIRED）
+if [[ -x /scripts/h3spec_run.sh ]]; then
     set +e
-    timeout 60 h3spec "https://${VEIL_HOST}:${VEIL_HTTP3_PORT}" \
-        >"/results/h3spec_report.txt" 2>&1
-    h3_rc=$?
+    /scripts/h3spec_run.sh
+    h3spec_rc=$?
     set -e
-    if [[ "${h3_rc}" -eq 0 ]]; then
-        log "PASS h3spec: exit=0"
+    if [[ "${h3spec_rc}" -eq 0 ]]; then
+        log "PASS h3spec_run"
     else
-        # 準拠失敗はログに残し、プロセス生存のみ必須（strict ではない）
-        log "WARN h3spec: exit=${h3_rc} (see h3spec_report.txt)"
+        log "FAIL h3spec_run: rc=${h3spec_rc}"
+        fails=$((fails + 1))
     fi
-    check_tls_health "post_h3spec" || true
 else
-    log "SKIP h3spec: binary not installed (optional; see F-92)"
+    log "SKIP h3spec_run: script missing"
 fi
 
 # 最終ヘルス
