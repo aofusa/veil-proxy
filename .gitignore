@@ -7,6 +7,10 @@ docs/*
 !docs/backlog
 !docs/readme
 !docs/perf
+# カバレッジ一覧・失敗レポート等の md は追跡（一時ログは除外）
+!docs/artifacts/
+docs/artifacts/**
+!docs/artifacts/**/*.md
 
 # テスト実行時に作成される一時ファイル
 # E2Eテスト・ベンチマークテスト用の一時ファイル

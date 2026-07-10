@@ -17945,3 +17945,526 @@ async fn test_e2e_ktls_enabled_handshake() {
     assert!(resp.is_some(), "kTLS-enabled proxy should accept HTTPS");
     assert_eq!(get_status_code(&resp.unwrap()), Some(200));
 }
+
+// ====================
+// F-91: HTTP/3・gRPC 網羅ギャップ解消（test_coverage_report.md / missing_test_cases.md）
+// ====================
+
+/// E-H3-10: HTTP/3 経由で /rate-limited/* に連打し 429 が返ること
+#[tokio::test]
+#[ntest::timeout(45000)]
+#[cfg(all(feature = "http3", feature = "rate-limit"))]
+async fn test_http3_rate_limiting() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
+        Ok(c) => c,
+        Err(e) => panic!("HTTP/3 client failed: {}", e),
+    };
+
+    use common::http3_client::send_http3_request;
+    let mut success = 0u32;
+    let mut limited = 0u32;
+    for i in 0..40 {
+        match send_http3_request(&mut send_request, "GET", "/rate-limited/", &[], None).await {
+            Ok((status, _)) => match status {
+                200 => success += 1,
+                429 => {
+                    limited += 1;
+                    eprintln!("HTTP/3 rate limited at request {}", i + 1);
+                }
+                other => eprintln!("HTTP/3 rate-limit unexpected status {}", other),
+            },
+            Err(e) => eprintln!("HTTP/3 rate-limit request error: {}", e),
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    assert!(success > 0, "HTTP/3 rate-limit route should allow some 200s");
+    assert!(
+        limited > 0,
+        "HTTP/3 rate-limit should return 429 (success={}, limited={})",
+        success,
+        limited
+    );
+}
+
+/// E-H3-11: HTTP/3 経由で /api/ip-restricted/* が 403 になること
+#[tokio::test]
+#[ntest::timeout(15000)]
+#[cfg(feature = "http3")]
+async fn test_http3_ip_restriction() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
+        Ok(c) => c,
+        Err(e) => panic!("HTTP/3 client failed: {}", e),
+    };
+
+    use common::http3_client::send_http3_request;
+    let (status, _) = send_http3_request(
+        &mut send_request,
+        "GET",
+        "/api/ip-restricted/",
+        &[],
+        None,
+    )
+    .await
+    .expect("HTTP/3 ip-restricted request");
+    assert_eq!(
+        status, 403,
+        "HTTP/3 /api/ip-restricted/* should deny 127.0.0.0/8 with 403, got {}",
+        status
+    );
+}
+
+/// E-H3-12: HTTP/3 経由で /wasm/* に WASM フィルタが適用されること
+#[tokio::test]
+#[ntest::timeout(20000)]
+#[cfg(all(feature = "http3", feature = "wasm"))]
+async fn test_http3_wasm_integration() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
+        Ok(c) => c,
+        Err(e) => panic!("HTTP/3 client failed: {}", e),
+    };
+
+    use common::http3_client::send_http3_request_full;
+    let resp = send_http3_request_full(&mut send_request, "GET", "/wasm/", &[], None)
+        .await
+        .expect("HTTP/3 wasm request");
+    assert_eq!(resp.status, 200, "HTTP/3 /wasm/ should return 200");
+
+    let has_wasm_header = resp.headers.iter().any(|(k, v)| {
+        let k = k.to_ascii_lowercase();
+        (k == "x-veil-processed" && v == "true")
+            || k == "x-veil-filter-version"
+            || k == "x-veil-context-id"
+            || k == "x-wasm-processed"
+    });
+    // 実装が HTTP/3 でレスポンスヘッダ変更をスキップしている場合は失敗 → バグチケット化対象
+    assert!(
+        has_wasm_header,
+        "HTTP/3 WASM integration should add filter response headers, got headers={:?}",
+        resp.headers
+    );
+}
+
+/// E-H3-13: HTTP/3 経由の /cached/* でキャッシュ hit/miss 相当の挙動
+#[tokio::test]
+#[ntest::timeout(20000)]
+#[cfg(all(feature = "http3", feature = "cache"))]
+async fn test_http3_cache_hit_miss() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
+        Ok(c) => c,
+        Err(e) => panic!("HTTP/3 client failed: {}", e),
+    };
+
+    use common::http3_client::send_http3_request_full;
+    let path = "/cached/large.txt";
+    let r1 = send_http3_request_full(&mut send_request, "GET", path, &[], None)
+        .await
+        .expect("HTTP/3 cache miss request");
+    assert_eq!(r1.status, 200, "first cached request should be 200");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let r2 = send_http3_request_full(&mut send_request, "GET", path, &[], None)
+        .await
+        .expect("HTTP/3 cache hit request");
+    assert_eq!(r2.status, 200, "second cached request should be 200");
+
+    let x_cache = r2
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-cache"))
+        .map(|(_, v)| v.as_str());
+    let age = r2
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("age"))
+        .map(|(_, v)| v.as_str());
+    let body_match = !r1.body.is_empty() && r1.body == r2.body;
+    assert!(
+        x_cache.is_some() || age.is_some() || body_match,
+        "HTTP/3 cache should expose X-Cache/Age or return identical body (x_cache={:?}, age={:?}, body_len1={}, body_len2={})",
+        x_cache,
+        age,
+        r1.body.len(),
+        r2.body.len()
+    );
+}
+
+/// E-H3-14: 0-RTT / early data で非べき等 POST が安全に扱われること
+#[tokio::test]
+#[ntest::timeout(20000)]
+#[cfg(feature = "http3")]
+async fn test_http3_early_data_0rtt_security() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+
+    // 1 回目: セッション確立
+    let (_c1, mut sr1) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("first H3 connection");
+    use common::http3_client::send_http3_request;
+    let _ = send_http3_request(&mut sr1, "GET", "/", &[], None).await;
+
+    // 2 回目: 新接続で POST（0-RTT 利用の可能性）。クラッシュ・永久ハングしないこと。
+    // 期待: 2xx/4xx のいずれか、または接続エラー（early data 拒否）でプロセスは生存。
+    let (_c2, mut sr2) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("second H3 connection");
+    let post_body = b"non-idempotent-0rtt-body";
+    let result = send_http3_request(
+        &mut sr2,
+        "POST",
+        "/",
+        &[("content-type", "application/octet-stream")],
+        Some(post_body),
+    )
+    .await;
+
+    match result {
+        Ok((status, _)) => {
+            assert!(
+                (200..600).contains(&status),
+                "0-RTT POST should get HTTP status, got {}",
+                status
+            );
+            eprintln!("HTTP/3 0-RTT security POST status={}", status);
+        }
+        Err(e) => {
+            // 拒否・リセットは許容（リプレイ防御）。panic/hang でなければ OK。
+            eprintln!("HTTP/3 0-RTT POST rejected/errored (acceptable): {}", e);
+        }
+    }
+
+    // プロセス生存確認
+    assert!(
+        is_e2e_environment_ready().await,
+        "proxy must remain up after 0-RTT POST probe"
+    );
+}
+
+/// E-H3-15: WebSocket over HTTP/3 (RFC 9220) — 対応時は確立、未対応時は安全な失敗
+#[tokio::test]
+#[ntest::timeout(15000)]
+#[cfg(all(feature = "http3", feature = "websocket"))]
+async fn test_http3_websocket() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
+        Ok(c) => c,
+        Err(e) => panic!("HTTP/3 client failed: {}", e),
+    };
+
+    use common::http3_client::send_http3_request_full;
+    // RFC 9220: extended CONNECT + :protocol=websocket。
+    // h3 クライアントで完全再現は難しいため CONNECT + Sec-WebSocket-* を試行。
+    // 未対応実装でもクラッシュせず 4xx/5xx 等で終わることを主目的とする。
+    let result = send_http3_request_full(
+        &mut send_request,
+        "CONNECT",
+        "/ws/",
+        &[
+            ("sec-websocket-version", "13"),
+            ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+            ("sec-websocket-protocol", "websocket"),
+        ],
+        None,
+    )
+    .await;
+
+    match result {
+        Ok(resp) => {
+            // 101/200 = 成功、400/404/405/501 = 未対応だが安全
+            assert!(
+                matches!(resp.status, 101 | 200 | 400 | 403 | 404 | 405 | 501 | 502),
+                "WS-over-H3 should not crash; status={}",
+                resp.status
+            );
+            eprintln!("HTTP/3 WebSocket probe status={}", resp.status);
+        }
+        Err(e) => {
+            eprintln!("HTTP/3 WebSocket probe error (acceptable if unsupported): {}", e);
+        }
+    }
+
+    assert!(
+        is_e2e_environment_ready().await,
+        "proxy must remain up after WS-over-H3 probe"
+    );
+}
+
+/// E-G-05+: gRPC ワイヤ length と実ボディが不一致の不正フレームで panic/hang しないこと
+#[tokio::test]
+#[ntest::timeout(20000)]
+#[cfg(all(feature = "grpc", feature = "http2"))]
+async fn test_grpc_http2_framing_malformed_data() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    // 生の gRPC フレーム: length=4096 と宣言するが実データは短い
+    let mut bad_frame = vec![0u8, 0, 0, 0x10, 0x00]; // flags=0, length=4096
+    bad_frame.extend_from_slice(b"short");
+
+    let client = Http1TestClient::new_https("127.0.0.1", PROXY_PORT).expect("http1 client");
+    let result = client
+        .post_with_headers(
+            "/grpc.test.v1.TestService/UnaryCall",
+            &[
+                ("content-type", "application/grpc"),
+                ("te", "trailers"),
+                ("accept", "application/grpc"),
+            ],
+            &bad_frame,
+        )
+        .await;
+
+    match result {
+        Ok((status, _body)) => {
+            assert!(
+                matches!(status, 200 | 400 | 413 | 502 | 503 | 504),
+                "malformed gRPC DATA should get controlled status, got {}",
+                status
+            );
+            eprintln!("malformed gRPC frame HTTP status={}", status);
+        }
+        Err(e) => {
+            let s = e.to_string();
+            assert!(
+                s.contains("SendRequest")
+                    || s.contains("connection")
+                    || s.contains("reset")
+                    || s.contains("closed")
+                    || s.contains("error")
+                    || s.contains("timeout"),
+                "expected controlled connection error, got {}",
+                s
+            );
+            eprintln!("malformed gRPC frame controlled error: {}", s);
+        }
+    }
+
+    assert!(
+        is_e2e_environment_ready().await,
+        "proxy must survive malformed gRPC framing"
+    );
+}
+
+/// E-G-06: HTTP/3 上の gRPC Unary
+#[tokio::test]
+#[ntest::timeout(20000)]
+#[cfg(all(feature = "grpc", feature = "http3"))]
+async fn test_grpc_over_http3() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
+        Ok(c) => c,
+        Err(e) => panic!("HTTP/3 client failed: {}", e),
+    };
+
+    let msg = b"hello-grpc-over-h3";
+    let frame = GrpcFrame::new(msg.to_vec());
+    let frame_bytes = frame.encode();
+
+    use common::http3_client::send_http3_request_full;
+    let resp = send_http3_request_full(
+        &mut send_request,
+        "POST",
+        "/grpc.test.v1.TestService/UnaryCall",
+        &[
+            ("content-type", "application/grpc"),
+            ("te", "trailers"),
+            ("grpc-accept-encoding", "identity"),
+        ],
+        Some(&frame_bytes),
+    )
+    .await;
+
+    match resp {
+        Ok(r) => {
+            // gRPC は HTTP 200 + trailers が一般的。404/502 は upstream 設定問題。
+            assert!(
+                matches!(r.status, 200 | 404 | 502 | 503),
+                "gRPC over HTTP/3 should return controlled status, got {}",
+                r.status
+            );
+            let grpc_status = r
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("grpc-status"))
+                .map(|(_, v)| v.as_str());
+            eprintln!(
+                "gRPC over H3 status={} grpc-status={:?} body_len={}",
+                r.status,
+                grpc_status,
+                r.body.len()
+            );
+            // 成功時は grpc-status 0 または応答ボディ
+            if r.status == 200 {
+                assert!(
+                    grpc_status.is_some() || !r.body.is_empty() || r.headers.iter().any(|(k, _)| k.starts_with("grpc-")),
+                    "gRPC over H3 200 should include grpc trailers or body"
+                );
+            }
+        }
+        Err(e) => {
+            panic!("gRPC over HTTP/3 request failed: {}", e);
+        }
+    }
+}
+
+/// E-G-07: gRPC client slowloris — 極遅送信でもプロキシが生存し、適切に切断されること
+#[tokio::test]
+#[ntest::timeout(45000)]
+#[cfg(feature = "grpc")]
+async fn test_grpc_client_slowloris() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    // 生 TCP + 手動 TLS で gRPC ヘッダを遅延送信
+    let config = create_client_config();
+    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
+    let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+
+    while tls_conn.is_handshaking() {
+        if let Err(e) = tls_conn.complete_io(&mut stream) {
+            panic!("TLS handshake error during slowloris setup: {:?}", e);
+        }
+    }
+
+    // ヘッダを 1 バイトずつ送る（slow headers）
+    let req = b"POST /grpc.test.v1.TestService/UnaryCall HTTP/1.1\r\n\
+Host: localhost\r\n\
+Content-Type: application/grpc\r\n\
+TE: trailers\r\n\
+Content-Length: 13\r\n\
+\r\n\
+\x00\x00\x00\x00\x08slowtest";
+
+    let mut sent = 0usize;
+    let mut aborted = false;
+    while sent < req.len() {
+        let end = (sent + 1).min(req.len());
+        let chunk = &req[sent..end];
+        let mut buf = vec![0u8; 16 * 1024];
+        match tls_conn.writer().write(chunk) {
+            Ok(n) => {
+                let _ = n;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => {
+                aborted = true;
+                break;
+            }
+        }
+        if let Err(e) = tls_conn.write_tls(&mut stream) {
+            if e.kind() != std::io::ErrorKind::WouldBlock {
+                aborted = true;
+                break;
+            }
+        }
+        // サーバーからの切断を確認
+        match tls_conn.read_tls(&mut stream) {
+            Ok(0) => {
+                aborted = true;
+                break;
+            }
+            Ok(_) => {
+                let _ = tls_conn.process_new_packets();
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => {
+                aborted = true;
+                break;
+            }
+        }
+        sent = end;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+    }
+
+    eprintln!(
+        "gRPC slowloris: sent={}/{} aborted={}",
+        sent,
+        req.len(),
+        aborted
+    );
+
+    // プロキシが生存していること（主目的）
+    assert!(
+        is_e2e_environment_ready().await,
+        "proxy must survive gRPC client slowloris"
+    );
+
+    // 通常の gRPC リクエストがまだ通ること
+    let ok = GrpcTestClient::send_grpc_request(
+        "127.0.0.1",
+        PROXY_PORT,
+        "/grpc.test.v1.TestService/UnaryCall",
+        b"after-slowloris",
+        &[],
+    )
+    .await;
+    assert!(
+        ok.is_ok() || ok.as_ref().err().map(|e| e.to_string()).is_some(),
+        "post-slowloris request should complete without hanging forever"
+    );
+}

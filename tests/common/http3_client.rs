@@ -70,6 +70,14 @@ impl Http3TestClient {
     }
 }
 
+/// HTTP/3 レスポンス（ステータス・ヘッダ・ボディ）
+#[derive(Debug, Clone)]
+pub struct Http3Response {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
 /// HTTP/3リクエストを送信するヘルパー関数
 #[allow(dead_code)]
 pub async fn send_http3_request(
@@ -79,6 +87,19 @@ pub async fn send_http3_request(
     headers: &[(&str, &str)],
     body: Option<&[u8]>,
 ) -> Result<(u16, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+    let resp = send_http3_request_full(send_request, method, path, headers, body).await?;
+    Ok((resp.status, resp.body))
+}
+
+/// HTTP/3リクエストを送信し、レスポンスヘッダも返す
+#[allow(dead_code)]
+pub async fn send_http3_request_full(
+    send_request: &mut SendRequest<h3_quinn::OpenStreams, Bytes>,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<&[u8]>,
+) -> Result<Http3Response, Box<dyn std::error::Error + Send + Sync>> {
     // HTTP/3では:authority擬似ヘッダーが必須なので完全なURIを使用
     let uri = if path.starts_with("http://") || path.starts_with("https://") {
         path.to_string()
@@ -108,6 +129,13 @@ pub async fn send_http3_request(
     // レスポンスを受信
     let response = stream.recv_response().await?;
     let status = response.status().as_u16();
+    let mut resp_headers = Vec::new();
+    for (name, value) in response.headers().iter() {
+        resp_headers.push((
+            name.as_str().to_string(),
+            String::from_utf8_lossy(value.as_bytes()).into_owned(),
+        ));
+    }
 
     // レスポンスボディを受信
     let mut body_data = Vec::new();
@@ -121,7 +149,21 @@ pub async fn send_http3_request(
         }
     }
 
-    Ok((status, body_data))
+    // トレーラー（gRPC 等）
+    if let Ok(Some(trailers)) = stream.recv_trailers().await {
+        for (name, value) in trailers.iter() {
+            resp_headers.push((
+                name.as_str().to_string(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            ));
+        }
+    }
+
+    Ok(Http3Response {
+        status,
+        headers: resp_headers,
+        body: body_data,
+    })
 }
 
 /// GETリクエストを送信するヘルパー関数

@@ -1,7 +1,12 @@
-//! QUIC/HTTP/3 クライアント（container_security P-03 用）。
+//! QUIC/HTTP/3 クライアント（container_security P-03 / F-91 攻撃モード）。
 //!
-//! 環境変数: VEIL_HOST, VEIL_HTTP3_PORT (default 443)
-//! 終了: 0 = 200 系応答ボディ受信、1 = 失敗
+//! 環境変数:
+//! - VEIL_HOST / VEIL_SNI / VEIL_HTTP3_PORT (default 443)
+//! - HTTP3_PATH (default /)
+//! - HTTP3_MODE: get | handshake_flood | qpack_bomb | cid_spoof | malformed
+//! - HTTP3_REPORT
+//!
+//! 終了: 0 = モード成功（攻撃系は crash せず完了）、1 = 失敗
 
 use quiche::h3::NameValue;
 use std::env;
@@ -18,7 +23,6 @@ fn log_line(path: &str, msg: &str) {
 }
 
 fn main() {
-    // QUIC の :authority / SNI は IP よりホスト名が安定（Docker では veil-proxy エイリアス）
     let host = env::var("VEIL_SNI")
         .or_else(|_| env::var("VEIL_HOST"))
         .unwrap_or_else(|_| "veil-proxy".into());
@@ -27,20 +31,303 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(443);
     let path = env::var("HTTP3_PATH").unwrap_or_else(|_| "/".into());
-    let report = env::var("HTTP3_REPORT").unwrap_or_else(|_| "/results/http3_client_report.txt".into());
+    let mode = env::var("HTTP3_MODE").unwrap_or_else(|_| "get".into());
+    let report =
+        env::var("HTTP3_REPORT").unwrap_or_else(|_| "/results/http3_client_report.txt".into());
 
     let _ = std::fs::write(&report, "");
-    log_line(&report, &format!("http3_client start host={} port={} path={}", host, port, path));
+    log_line(
+        &report,
+        &format!(
+            "http3_client start host={} port={} path={} mode={}",
+            host, port, path, mode
+        ),
+    );
 
-    match send_http3_get(&host, port, &path) {
-        Ok(size) => {
-            log_line(&report, &format!("http3_client: ok body_bytes={}", size));
+    let result = match mode.as_str() {
+        "get" | "" => send_http3_get(&host, port, &path).map(|n| format!("ok body_bytes={}", n)),
+        "handshake_flood" => handshake_flood(&host, port, 200)
+            .map(|n| format!("handshake_flood sent={} packets", n)),
+        "qpack_bomb" => qpack_bomb(&host, port, &path)
+            .map(|s| format!("qpack_bomb done status_or_err={}", s)),
+        "cid_spoof" => cid_spoof(&host, port).map(|n| format!("cid_spoof sent={} packets", n)),
+        "malformed" => malformed_frames(&host, port)
+            .map(|s| format!("malformed done detail={}", s)),
+        other => Err(format!("unknown HTTP3_MODE={}", other).into()),
+    };
+
+    match result {
+        Ok(msg) => {
+            log_line(&report, &format!("http3_client: {}", msg));
             std::process::exit(0);
         }
         Err(e) => {
             log_line(&report, &format!("http3_client: FAIL {}", e));
-            std::process::exit(1);
+            // 攻撃系はサーバ側クラッシュ検出をプローブ側 health に委ねるため、
+            // クライアント側のプロトコルエラーは 0 で「完了」扱いにするモードもある。
+            // 不明モードのみ 1。
+            if mode == "get" || mode.is_empty() {
+                std::process::exit(1);
+            }
+            // 攻撃モード: クライアントが例外なく終了できれば 0
+            log_line(
+                &report,
+                &format!("http3_client: attack mode completed with client error (ok): {}", e),
+            );
+            std::process::exit(0);
         }
+    }
+}
+
+fn resolve(host: &str, port: u16) -> Result<SocketAddr, Box<dyn std::error::Error>> {
+    format!("{}:{}", host, port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| "DNS resolve failed".into())
+}
+
+fn handshake_flood(
+    host: &str,
+    port: u16,
+    count: usize,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let peer = resolve(host, port)?;
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.set_write_timeout(Some(Duration::from_secs(2)))?;
+    socket.connect(peer)?;
+
+    // QUIC long-header Initial 風の最小パケット（不正でも受信処理を刺激）
+    let mut pkt = vec![0u8; 1200];
+    pkt[0] = 0xc0; // long header, Initial
+    // version draft/v1
+    pkt[1..5].copy_from_slice(&1u32.to_be_bytes());
+    pkt[5] = 8; // DCID len
+    getrandom::getrandom(&mut pkt[6..14]).ok();
+    pkt[14] = 0; // SCID len
+    // 残りは乱数
+    getrandom::getrandom(&mut pkt[15..]).ok();
+
+    let mut sent = 0usize;
+    for i in 0..count {
+        // DCID を毎回変えてステートを増やす
+        getrandom::getrandom(&mut pkt[6..14]).ok();
+        pkt[15] = (i & 0xff) as u8;
+        match socket.send(&pkt) {
+            Ok(_) => sent += 1,
+            Err(_) => break,
+        }
+    }
+    Ok(sent)
+}
+
+fn cid_spoof(host: &str, port: u16) -> Result<usize, Box<dyn std::error::Error>> {
+    let peer = resolve(host, port)?;
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.set_write_timeout(Some(Duration::from_secs(2)))?;
+    socket.connect(peer)?;
+
+    let mut sent = 0usize;
+    let mut pkt = [0u8; 64];
+    for _ in 0..100 {
+        pkt[0] = 0x40; // short header 風
+        getrandom::getrandom(&mut pkt[1..]).ok();
+        if socket.send(&pkt).is_ok() {
+            sent += 1;
+        }
+    }
+    Ok(sent)
+}
+
+fn malformed_frames(host: &str, port: u16) -> Result<String, Box<dyn std::error::Error>> {
+    // 部分ハンドシェイク後にゴミ UDP を送り、生存確認はプローブ側
+    let peer = resolve(host, port)?;
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.set_read_timeout(Some(Duration::from_millis(200)))?;
+    socket.set_write_timeout(Some(Duration::from_secs(2)))?;
+    socket.connect(peer)?;
+
+    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
+    config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
+    config.verify_peer(false);
+    config.set_max_idle_timeout(5_000);
+    config.set_max_recv_udp_payload_size(1350);
+    config.set_max_send_udp_payload_size(1350);
+    config.set_initial_max_data(1_000_000);
+    config.set_initial_max_stream_data_bidi_local(100_000);
+    config.set_initial_max_stream_data_bidi_remote(100_000);
+    config.set_initial_max_stream_data_uni(100_000);
+    config.set_initial_max_streams_bidi(10);
+    config.set_initial_max_streams_uni(10);
+    config.set_disable_active_migration(true);
+
+    let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
+    getrandom::getrandom(&mut scid).ok();
+    let scid = quiche::ConnectionId::from_ref(&scid);
+    let mut conn = quiche::connect(Some(host), &scid, socket.local_addr()?, peer, &mut config)?;
+
+    let mut buf = [0u8; 65535];
+    let mut out = [0u8; 1350];
+    let (write, _) = conn.send(&mut out)?;
+    socket.send(&out[..write])?;
+
+    // 数回ポンプ
+    for _ in 0..10 {
+        match socket.recv(&mut buf) {
+            Ok(len) => {
+                let recv_info = quiche::RecvInfo {
+                    from: peer,
+                    to: socket.local_addr()?,
+                };
+                let _ = conn.recv(&mut buf[..len], recv_info);
+            }
+            Err(_) => {}
+        }
+        while let Ok((write, _)) = conn.send(&mut out) {
+            let _ = socket.send(&out[..write]);
+        }
+        if conn.is_established() {
+            break;
+        }
+    }
+
+    // 不正な H3 風バイト列を raw 送信
+    let garbage = [0x01, 0xff, 0x00, 0x00, 0x10, 0xde, 0xad, 0xbe, 0xef];
+    for _ in 0..20 {
+        let _ = socket.send(&garbage);
+        let mut junk = [0u8; 200];
+        junk[0] = 0x40;
+        getrandom::getrandom(&mut junk[1..]).ok();
+        let _ = socket.send(&junk);
+    }
+
+    Ok(if conn.is_established() {
+        "established_then_garbage".into()
+    } else {
+        "partial_hs_then_garbage".into()
+    })
+}
+
+fn qpack_bomb(host: &str, port: u16, path: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
+    config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
+    config.verify_peer(false);
+    config.set_max_idle_timeout(15_000);
+    config.set_max_recv_udp_payload_size(1350);
+    config.set_max_send_udp_payload_size(1350);
+    config.set_initial_max_data(10_000_000);
+    config.set_initial_max_stream_data_bidi_local(1_000_000);
+    config.set_initial_max_stream_data_bidi_remote(1_000_000);
+    config.set_initial_max_stream_data_uni(1_000_000);
+    config.set_initial_max_streams_bidi(100);
+    config.set_initial_max_streams_uni(100);
+    config.set_disable_active_migration(true);
+
+    let peer_addr = resolve(host, port)?;
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.set_read_timeout(Some(Duration::from_millis(500)))?;
+    socket.set_write_timeout(Some(Duration::from_secs(5)))?;
+    socket.connect(peer_addr)?;
+
+    let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
+    getrandom::getrandom(&mut scid).map_err(|_| "random scid failed")?;
+    let scid = quiche::ConnectionId::from_ref(&scid);
+    let mut conn =
+        quiche::connect(Some(host), &scid, socket.local_addr()?, peer_addr, &mut config)?;
+
+    let mut buf = [0u8; 65535];
+    let mut out = [0u8; 1350];
+    let (write, _) = conn.send(&mut out)?;
+    socket.send(&out[..write])?;
+
+    let start = Instant::now();
+    let timeout = Duration::from_secs(10);
+    while !conn.is_established() {
+        if start.elapsed() > timeout {
+            return Err("QUIC handshake timeout".into());
+        }
+        match socket.recv(&mut buf) {
+            Ok(len) => {
+                let recv_info = quiche::RecvInfo {
+                    from: peer_addr,
+                    to: socket.local_addr()?,
+                };
+                conn.recv(&mut buf[..len], recv_info)?;
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => return Err(Box::new(e)),
+        }
+        while let Ok((write, _)) = conn.send(&mut out) {
+            socket.send(&out[..write])?;
+        }
+    }
+
+    let h3_config = quiche::h3::Config::new()?;
+    let mut h3_conn = quiche::h3::Connection::with_transport(&mut conn, &h3_config)?;
+
+    // 巨大ヘッダ多数（QPACK / ヘッダサイズ枯渇刺激）
+    let big = "A".repeat(4096);
+    let mut headers = vec![
+        quiche::h3::Header::new(b":method", b"GET"),
+        quiche::h3::Header::new(b":path", path.as_bytes()),
+        quiche::h3::Header::new(b":authority", host.as_bytes()),
+        quiche::h3::Header::new(b":scheme", b"https"),
+    ];
+    for i in 0..32 {
+        let name = format!("x-bomb-{}", i);
+        headers.push(quiche::h3::Header::new(name.as_bytes(), big.as_bytes()));
+    }
+
+    let send_result = h3_conn.send_request(&mut conn, &headers, true);
+    while let Ok((write, _)) = conn.send(&mut out) {
+        let _ = socket.send(&out[..write]);
+    }
+
+    match send_result {
+        Ok(stream_id) => {
+            let mut status: Option<u16> = None;
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(5) {
+                match socket.recv(&mut buf) {
+                    Ok(len) => {
+                        let recv_info = quiche::RecvInfo {
+                            from: peer_addr,
+                            to: socket.local_addr()?,
+                        };
+                        let _ = conn.recv(&mut buf[..len], recv_info);
+                    }
+                    Err(_) => {}
+                }
+                loop {
+                    match h3_conn.poll(&mut conn) {
+                        Ok((id, quiche::h3::Event::Headers { list, .. })) if id == stream_id => {
+                            for h in &list {
+                                if h.name() == b":status" {
+                                    status = std::str::from_utf8(h.value())
+                                        .ok()
+                                        .and_then(|s| s.parse().ok());
+                                }
+                            }
+                        }
+                        Ok((_, quiche::h3::Event::Finished)) => {
+                            return Ok(format!("finished status={:?}", status));
+                        }
+                        Ok(_) => {}
+                        Err(quiche::h3::Error::Done) => break,
+                        Err(e) => return Ok(format!("h3_err={}", e)),
+                    }
+                }
+                while let Ok((write, _)) = conn.send(&mut out) {
+                    let _ = socket.send(&out[..write]);
+                }
+                if conn.is_closed() {
+                    return Ok(format!("conn_closed status={:?}", status));
+                }
+            }
+            Ok(format!("timeout status={:?}", status))
+        }
+        Err(e) => Ok(format!("send_rejected={}", e)),
     }
 }
 
@@ -48,7 +335,6 @@ fn send_http3_get(host: &str, port: u16, path: &str) -> Result<usize, Box<dyn st
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
     config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
     config.verify_peer(false);
-    // サーバ既定（Http3ServerConfig.max_idle_timeout=30000）と整合させる
     config.set_max_idle_timeout(30_000);
     config.set_max_recv_udp_payload_size(1350);
     config.set_max_send_udp_payload_size(1350);
@@ -57,7 +343,6 @@ fn send_http3_get(host: &str, port: u16, path: &str) -> Result<usize, Box<dyn st
     config.set_initial_max_stream_data_bidi_remote(1_000_000);
     config.set_initial_max_stream_data_uni(1_000_000);
     config.set_initial_max_streams_bidi(100);
-    // サーバが HTTP/3 制御/QPACK 用の uni ストリームを開くために必須（未設定時 0 で StreamLimit）
     config.set_initial_max_streams_uni(100);
     config.set_disable_active_migration(true);
 
@@ -66,17 +351,15 @@ fn send_http3_get(host: &str, port: u16, path: &str) -> Result<usize, Box<dyn st
     socket.set_read_timeout(Some(Duration::from_millis(500)))?;
     socket.set_write_timeout(Some(Duration::from_secs(5)))?;
 
-    let peer_addr: SocketAddr = format!("{}:{}", host, port)
-        .to_socket_addrs()?
-        .next()
-        .ok_or("DNS resolve failed")?;
+    let peer_addr = resolve(host, port)?;
     socket.connect(peer_addr)?;
 
     let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
     getrandom::getrandom(&mut scid).map_err(|_| "random scid failed")?;
     let scid = quiche::ConnectionId::from_ref(&scid);
 
-    let mut conn = quiche::connect(Some(host), &scid, socket.local_addr()?, peer_addr, &mut config)?;
+    let mut conn =
+        quiche::connect(Some(host), &scid, socket.local_addr()?, peer_addr, &mut config)?;
 
     let mut buf = [0u8; 65535];
     let mut out = [0u8; 1350];
@@ -108,7 +391,6 @@ fn send_http3_get(host: &str, port: u16, path: &str) -> Result<usize, Box<dyn st
         }
     }
 
-    // ハンドシェイク完了後、サーバが h3 レイヤを確立する猶予を与える（StreamLimit レース回避）
     let settle_start = Instant::now();
     while settle_start.elapsed() < Duration::from_millis(500) {
         while let Ok((write, _)) = conn.send(&mut out) {
@@ -188,13 +470,11 @@ fn send_http3_get(host: &str, port: u16, path: &str) -> Result<usize, Box<dyn st
                         return Ok(response_size);
                     }
                 }
-                Ok((id, quiche::h3::Event::Finished)) if id == stream_id => {
-                    match status {
-                        Some(200) | Some(301) | Some(302) => return Ok(response_size),
-                        Some(code) => return Err(format!("unexpected status {}", code).into()),
-                        None => return Err("no :status header".into()),
-                    }
-                }
+                Ok((id, quiche::h3::Event::Finished)) if id == stream_id => match status {
+                    Some(200) | Some(301) | Some(302) => return Ok(response_size),
+                    Some(code) => return Err(format!("unexpected status {}", code).into()),
+                    None => return Err("no :status header".into()),
+                },
                 Ok(_) => {}
                 Err(quiche::h3::Error::Done) => break,
                 Err(e) => return Err(Box::new(e)),
