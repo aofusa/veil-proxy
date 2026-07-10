@@ -15,7 +15,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 #[cfg(feature = "jemalloc")]
 use tikv_jemallocator::Jemalloc;
 
-#[cfg(feature = "jemalloc")]
+#[cfg(all(feature = "jemalloc", not(feature = "mimalloc")))]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
