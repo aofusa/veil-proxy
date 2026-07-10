@@ -75,6 +75,21 @@ where
         }
     }
 
+    /// 上流へ転送しないリクエストヘッダか。
+    ///
+    /// 疑似ヘッダ・ホップバイホップ・Host・Expect（B-11 終端）・Content-Length
+    /// （DATA で送る）を除外する。
+    #[inline]
+    fn skip_forwarded_request_header(name: &[u8]) -> bool {
+        name.starts_with(b":")
+            || name.eq_ignore_ascii_case(b"connection")
+            || name.eq_ignore_ascii_case(b"keep-alive")
+            || name.eq_ignore_ascii_case(b"transfer-encoding")
+            || name.eq_ignore_ascii_case(b"host")
+            || name.eq_ignore_ascii_case(b"expect")
+            || name.eq_ignore_ascii_case(b"content-length")
+    }
+
     /// HTTP/2 ハンドシェイクを実行 (クライアント側)
     ///
     /// 1. コネクションプリフェースを送信
@@ -182,26 +197,34 @@ where
         self.next_stream_id += 2;
 
         // ヘッダーリストを構築
+        // HTTP/2 はヘッダ名の小文字必須（RFC 9113 §8.2）。H1 からの転送で
+        // Content-Type 等が混ざると h2/tonic が HPACK InvalidUtf8 → GOAWAY する（B-40）。
+        // 小文字化した名前は encode 完了までこの Vec に保持する。
+        let mut lowered_names: Vec<Vec<u8>> = Vec::with_capacity(headers.len());
+        for &(name, _) in headers {
+            if Self::skip_forwarded_request_header(name) {
+                continue;
+            }
+            if name.iter().any(|b| b.is_ascii_uppercase()) {
+                lowered_names.push(name.to_ascii_lowercase());
+            } else {
+                lowered_names.push(name.to_vec());
+            }
+        }
+
         let mut header_list: Vec<(&[u8], &[u8], bool)> = Vec::with_capacity(headers.len() + 4);
         header_list.push((b":method", method, false));
         header_list.push((b":path", path, false));
         header_list.push((b":scheme", b"http", false));
         header_list.push((b":authority", authority, false));
 
+        let mut li = 0usize;
         for &(name, value) in headers {
-            // 疑似ヘッダーとホップバイホップヘッダーをスキップ
-            // B-11: expect はプロキシが終端する（ボディを全量送信するため、バックエンドに
-            // 100 Continue 中間応答を出させない）。
-            if name.starts_with(b":")
-                || name.eq_ignore_ascii_case(b"connection")
-                || name.eq_ignore_ascii_case(b"keep-alive")
-                || name.eq_ignore_ascii_case(b"transfer-encoding")
-                || name.eq_ignore_ascii_case(b"host")
-                || name.eq_ignore_ascii_case(b"expect")
-            {
+            if Self::skip_forwarded_request_header(name) {
                 continue;
             }
-            header_list.push((name, value, false));
+            header_list.push((lowered_names[li].as_slice(), value, false));
+            li += 1;
         }
 
         let end_stream = body.is_none() || body.map(|b| b.is_empty()).unwrap_or(true);

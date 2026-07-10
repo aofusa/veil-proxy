@@ -362,6 +362,49 @@ fn build_sub_path(base: &str, remaining: &str) -> String {
     }
 }
 
+/// 上流へ転送するリクエストパスを構築する。
+///
+/// - `preserve_full_path = true`（gRPC）: ルート `/*` プレフィックスを除去しない。
+///   `/grpc.Service/*` マッチで `/UnaryCall` だけ残すと上流が UNIMPLEMENTED になる（B-39/B-40）。
+/// - それ以外: `prefix` を剥がし `target_path_prefix` を前置（従来どおり）。
+#[inline]
+fn compute_upstream_path(
+    path_str: &str,
+    prefix: &[u8],
+    target_path_prefix: &str,
+    preserve_full_path: bool,
+) -> String {
+    if preserve_full_path {
+        return if path_str.is_empty() {
+            "/".to_string()
+        } else {
+            path_str.to_string()
+        };
+    }
+    let sub_path = if prefix.is_empty() {
+        path_str.to_string()
+    } else {
+        let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
+        if let Some(remaining) = path_str.strip_prefix(prefix_str) {
+            let base = target_path_prefix.trim_end_matches('/');
+            build_sub_path(base, remaining)
+        } else {
+            path_str.to_string()
+        }
+    };
+    if sub_path.is_empty() {
+        "/".to_string()
+    } else {
+        sub_path
+    }
+}
+
+/// Content-Type が application/grpc* かどうか（ホップバイホップ転送前の判定用）。
+#[inline]
+fn header_pair_is_grpc(name: &[u8], value: &[u8]) -> bool {
+    name.eq_ignore_ascii_case(b"content-type") && value.starts_with(b"application/grpc")
+}
+
 fn is_connection_closed_error(e: &std::io::Error) -> bool {
     use std::io::ErrorKind;
 
@@ -1081,19 +1124,21 @@ async fn handle_h2_request_streaming<S>(
     let addr = addr.as_str();
 
     // --- リクエストヘッダー（Transfer-Encoding: chunked）を構築 ---
+    // gRPC はフルパス保持（B-40）。ストリーミング経路は通常 gRPC 非対象だが一貫させる。
     let path_str = std::str::from_utf8(&path).unwrap_or("/");
-    let sub_path = if prefix.is_empty() {
-        path_str.to_string()
-    } else {
-        let prefix_str = std::str::from_utf8(&prefix).unwrap_or("");
-        if let Some(remaining) = path_str.strip_prefix(prefix_str) {
-            let base = target.path_prefix.trim_end_matches('/');
-            build_sub_path(base, remaining)
-        } else {
-            path_str.to_string()
-        }
-    };
-    let final_path = if sub_path.is_empty() { "/" } else { &sub_path };
+    let preserve_grpc_path = conn.get_stream(stream_id).is_some_and(|stream| {
+        stream
+            .request_headers
+            .iter()
+            .any(|h| header_pair_is_grpc(&h.name, &h.value))
+    });
+    let final_path_owned = compute_upstream_path(
+        path_str,
+        &prefix,
+        &target.path_prefix,
+        preserve_grpc_path,
+    );
+    let final_path = final_path_owned.as_str();
 
     let mut request = request_buf_get(1024);
     request.extend_from_slice(&method);
@@ -1904,20 +1949,25 @@ where
     let target = &server.target;
 
     // リクエストパス構築
+    // gRPC はサービス/メソッドのフルパス必須（/* プレフィックス除去で UNIMPLEMENTED → B-40）
     let path_str = std::str::from_utf8(req_path).unwrap_or("/");
-    let sub_path = if prefix.is_empty() {
-        path_str.to_string()
-    } else {
-        let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
-        if let Some(remaining) = path_str.strip_prefix(prefix_str) {
-            let base = target.path_prefix.trim_end_matches('/');
-            build_sub_path(base, remaining)
+    let preserve_grpc_path = {
+        if let Some(stream) = conn.get_stream(stream_id) {
+            stream
+                .request_headers
+                .iter()
+                .any(|h| header_pair_is_grpc(&h.name, &h.value))
         } else {
-            path_str.to_string()
+            false
         }
     };
-
-    let final_path = if sub_path.is_empty() { "/" } else { &sub_path };
+    let final_path_owned = compute_upstream_path(
+        path_str,
+        prefix,
+        &target.path_prefix,
+        preserve_grpc_path,
+    );
+    let final_path = final_path_owned.as_str();
 
     // リクエストボディを取得。
     // BytesMut の deep clone（ボディ全体の memcpy）を避け、所有権ごとゼロコピーで
@@ -1980,7 +2030,9 @@ where
     let addr = HostPortStr::new(&target.host, target.port); // F-41: スタック上に構築（ヒープ確保なし）
     let addr = addr.as_str();
 
-    let result = if target.use_h2c {
+    // ルートの use_h2c は UpstreamGroup に載る（target 単体はサーバー URL 由来で false のまま）。
+    // H1 経路と同様 group.use_h2c() も見る（B-40: H2 クライアント gRPC が H1 バックエンド誤接続で 502 になっていた）。
+    let result = if target.use_h2c || upstream_group.use_h2c() {
         // H2C (Prior Knowledge) プロキシ
         handle_http2_proxy_h2c(
             conn,
@@ -2090,19 +2142,28 @@ where
     }
 
     // ヘッダーを抽出
+    // gRPC は TE: trailers が必須のため除外しない（RFC 9113 でも TE はエンドツーエンド可）。
+    let is_grpc_upstream = if let Some(stream) = conn.get_stream(stream_id) {
+        stream
+            .request_headers
+            .iter()
+            .any(|h| header_pair_is_grpc(&h.name, &h.value))
+    } else {
+        false
+    };
     let headers_vec: Vec<(&[u8], &[u8])> = if let Some(stream) = conn.get_stream(stream_id) {
         stream
             .request_headers
             .iter()
             .filter(|h| !h.name.starts_with(b":")) // 疑似ヘッダーを除外
             .filter(|h| {
-                // ホップバイホップヘッダーを除外
+                // ホップバイホップヘッダーを除外（gRPC 時は te を残す）
                 !h.name.eq_ignore_ascii_case(b"connection")
                     && !h.name.eq_ignore_ascii_case(b"keep-alive")
                     && !h.name.eq_ignore_ascii_case(b"proxy-connection")
                     && !h.name.eq_ignore_ascii_case(b"transfer-encoding")
-                    && !h.name.eq_ignore_ascii_case(b"te")
                     && !h.name.eq_ignore_ascii_case(b"upgrade")
+                    && (is_grpc_upstream || !h.name.eq_ignore_ascii_case(b"te"))
             })
             .map(|h| (h.name.as_ref(), h.value.as_ref()))
             .collect()
@@ -5966,20 +6027,18 @@ async fn handle_proxy(
     };
 
     // リクエストパス構築
+    // gRPC はフルパス保持（/* プレフィックス除去で UNIMPLEMENTED → B-40）
     let path_str = std::str::from_utf8(req_path).unwrap_or("/");
-    let sub_path = if prefix.is_empty() {
-        path_str.to_string()
-    } else {
-        let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
-        if let Some(remaining) = path_str.strip_prefix(prefix_str) {
-            let base = target.path_prefix.trim_end_matches('/');
-            build_sub_path(base, remaining)
-        } else {
-            path_str.to_string()
-        }
-    };
-
-    let final_path = if sub_path.is_empty() { "/" } else { &sub_path };
+    let preserve_grpc_path = headers
+        .iter()
+        .any(|(n, v)| header_pair_is_grpc(n, v));
+    let final_path_owned = compute_upstream_path(
+        path_str,
+        prefix,
+        &target.path_prefix,
+        preserve_grpc_path,
+    );
+    let final_path = final_path_owned.as_str();
 
     // HTTPリクエスト構築（プール使用）
     // 定数バイト列を使用してアロケーションを削減
@@ -10390,5 +10449,35 @@ mod streaming_tests {
             let expected = format!("{:x}\r\n", n).into_bytes();
             assert_eq!(b, expected, "mismatch for n={}", n);
         }
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    /// B-40: gRPC はルート /* プレフィックスを剥がさずフルパスを維持する。
+    #[test]
+    fn test_b40_grpc_preserves_full_path() {
+        let path = "/grpc.test.v1.TestService/UnaryCall";
+        let prefix = b"/grpc.test.v1.TestService";
+        let full = compute_upstream_path(path, prefix, "", true);
+        assert_eq!(full, path);
+        // 非 gRPC では従来どおり prefix 除去
+        let stripped = compute_upstream_path(path, prefix, "", false);
+        assert_eq!(stripped, "/UnaryCall");
+    }
+
+    #[test]
+    fn test_b40_grpc_path_empty_becomes_slash() {
+        assert_eq!(compute_upstream_path("", b"", "", true), "/");
+    }
+
+    #[test]
+    fn test_header_pair_is_grpc() {
+        assert!(header_pair_is_grpc(b"content-type", b"application/grpc"));
+        assert!(header_pair_is_grpc(b"Content-Type", b"application/grpc+proto"));
+        assert!(!header_pair_is_grpc(b"content-type", b"text/plain"));
+        assert!(!header_pair_is_grpc(b"accept", b"application/grpc"));
     }
 }
