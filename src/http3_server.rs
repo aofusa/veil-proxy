@@ -1612,26 +1612,32 @@ impl Http3Handler {
         server.release();
 
         match proxy_result {
-            Ok(mut backend_result) => {
+            Ok(backend_result) => {
                 let status_code = backend_result.status_code;
+                let body = backend_result.body;
+                let trailers = backend_result.trailers;
 
                 // B-38: WASM レスポンスヘッダフィルタ
                 #[cfg(feature = "wasm")]
+                let mut resp_header_store = backend_result.headers;
+                #[cfg(feature = "wasm")]
                 if let Some(modules) = wasm_modules {
                     if !modules.is_empty() {
-                        backend_result.headers = apply_h3_wasm_response_headers(
+                        resp_header_store = apply_h3_wasm_response_headers(
                             modules,
                             status_code,
-                            std::mem::take(&mut backend_result.headers),
+                            resp_header_store,
                         )
                         .await;
                     }
                 }
+                #[cfg(not(feature = "wasm"))]
+                let resp_header_store = backend_result.headers;
 
                 // 圧縮判定
                 let mut content_type: Option<&[u8]> = None;
                 let mut existing_encoding: Option<&[u8]> = None;
-                for (name, value) in &backend_result.headers {
+                for (name, value) in &resp_header_store {
                     if name.eq_ignore_ascii_case(b"content-type") {
                         content_type = Some(value.as_slice());
                     } else if name.eq_ignore_ascii_case(b"content-encoding") {
@@ -1653,14 +1659,14 @@ impl Http3Handler {
                     compression.should_compress(
                         client_encoding,
                         content_type,
-                        Some(backend_result.body.len()),
+                        Some(body.len()),
                         existing_encoding,
                     )
                 };
 
                 // レスポンスヘッダー構築
                 let mut owned_headers: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-                for (name, value) in &backend_result.headers {
+                for (name, value) in &resp_header_store {
                     if name.eq_ignore_ascii_case(b"connection")
                         || name.eq_ignore_ascii_case(b"transfer-encoding")
                         || name.eq_ignore_ascii_case(b"keep-alive")
@@ -1678,7 +1684,7 @@ impl Http3Handler {
 
                 // H2C trailers（gRPC-status 等）をヘッダへマージ
                 // （HTTP/3 トレイラー API の制限があるため、クライアント到達性を優先）
-                for (name, value) in &backend_result.trailers {
+                for (name, value) in &trailers {
                     if !owned_headers
                         .iter()
                         .any(|(n, _)| n.eq_ignore_ascii_case(name))
@@ -1688,9 +1694,9 @@ impl Http3Handler {
                 }
 
                 let response_body = if let Some(enc) = should_compress {
-                    compress_body_h3(&backend_result.body, enc, compression)
+                    compress_body_h3(&body, enc, compression)
                 } else {
-                    backend_result.body.clone()
+                    body
                 };
 
                 let resp_headers: Vec<(&[u8], &[u8])> = owned_headers
@@ -1700,16 +1706,14 @@ impl Http3Handler {
 
                 // gRPC: trailers 用 API で終端（status は既に headers にマージ済み）
                 #[cfg(feature = "grpc")]
-                if is_grpc_ct && !backend_result.trailers.is_empty() {
-                    let grpc_status = backend_result
-                        .trailers
+                if is_grpc_ct && !trailers.is_empty() {
+                    let grpc_status = trailers
                         .iter()
                         .find(|(n, _)| n.eq_ignore_ascii_case(b"grpc-status"))
                         .and_then(|(_, v)| std::str::from_utf8(v).ok())
                         .and_then(|s| s.parse::<u32>().ok())
                         .unwrap_or(0);
-                    let grpc_message = backend_result
-                        .trailers
+                    let grpc_message = trailers
                         .iter()
                         .find(|(n, _)| n.eq_ignore_ascii_case(b"grpc-message"))
                         .and_then(|(_, v)| String::from_utf8(v.clone()).ok());

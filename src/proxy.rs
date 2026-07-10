@@ -1776,7 +1776,7 @@ where
                     .await;
                 Some((404, 9))
             } else {
-                let (mut header_store, response_body) = build_h2_compressed_file_response(
+                let (built_headers, response_body) = build_h2_compressed_file_response(
                     &data,
                     mime_type.as_ref(),
                     &security,
@@ -1785,14 +1785,14 @@ where
                 );
 
                 #[cfg(feature = "wasm")]
-                {
-                    header_store = apply_h2_wasm_response_headers(
-                        &wasm_modules_to_apply,
-                        200,
-                        header_store,
-                    )
-                    .await;
-                }
+                let header_store = apply_h2_wasm_response_headers(
+                    &wasm_modules_to_apply,
+                    200,
+                    built_headers,
+                )
+                .await;
+                #[cfg(not(feature = "wasm"))]
+                let header_store = built_headers;
 
                 let headers: Vec<(&[u8], &[u8])> = header_store
                     .iter()
@@ -3229,7 +3229,7 @@ where
     let mime_type = mime_guess::from_path(&file_path).first_or_octet_stream();
     let mime_str = mime_type.as_ref();
 
-    let (mut header_store, response_body) = build_h2_compressed_file_response(
+    let (built_headers, response_body) = build_h2_compressed_file_response(
         &data,
         mime_str,
         security,
@@ -3238,10 +3238,10 @@ where
     );
 
     #[cfg(feature = "wasm")]
-    {
-        header_store =
-            apply_h2_wasm_response_headers(wasm_modules, 200, header_store).await;
-    }
+    let header_store =
+        apply_h2_wasm_response_headers(wasm_modules, 200, built_headers).await;
+    #[cfg(not(feature = "wasm"))]
+    let header_store = built_headers;
 
     let headers: Vec<(&[u8], &[u8])> = header_store
         .iter()

@@ -56,4 +56,8 @@ crate::wasm::FilterResult::Continue { .. } => {
 
 ## 対応状況
 
-未着手（F-91 で検出・チケットのみ。製品修正は別 PR）
+**完了**（2026-07-10）
+
+- `src/http3_server.rs`: `on_response_headers` を `handle_proxy` 内で適用（`apply_h3_wasm_response_headers`）
+- リクエスト側 `Continue` のヘッダ変更を上流へ反映
+- 回帰: `test_http3_wasm_integration` PASS

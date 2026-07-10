@@ -185,8 +185,8 @@
 | B-35 | P1 | 完了 | [bugs/B-35-http2-upstream-tls-insecure-ignored.md](bugs/B-35-http2-upstream-tls-insecure-ignored.md) | HTTP/2 上流 HTTPS で `tls_insecure` 無視 → 自己署名バックエンドへ 502（UnknownIssuer）。E2E 214 件連鎖失敗の根本原因。**修正済み**: `handle_http2_proxy_https` + H2 ストリーミング経路で `get_tls_connector_insecure()` を使用 |
 | B-36 | P2 | 完了 | [bugs/B-36-veil-tls-insecure-overrides-upstream-verify.md](bugs/B-36-veil-tls-insecure-overrides-upstream-verify.md) | `VEIL_TLS_INSECURE=1` が per-upstream `tls_insecure=false` を上書き。**修正済み**: 上流経路から env OR を削除し per-upstream 設定のみに |
 | B-37 | P2 | 完了 | [bugs/B-37-l4-tls-terminate-e2e-timeout.md](bugs/B-37-l4-tls-terminate-e2e-timeout.md) | L4 `tls=terminate` リスナー（8446）が E2E でタイムアウト。**修正済み**: `src/l4/proxy.rs` に TLS 終端 + 平文転送を実装 |
-| B-38 | P1 | 未着手 | [bugs/B-38-http3-wasm-response-headers-not-applied.md](bugs/B-38-http3-wasm-response-headers-not-applied.md) | HTTP/3 で WASM レスポンスヘッダ変更が未適用（F-91 `test_http3_wasm_integration` 失敗。Continue でヘッダ変更スキップ） |
-| B-39 | P1 | 未着手 | [bugs/B-39-http3-grpc-proxy-502.md](bugs/B-39-http3-grpc-proxy-502.md) | HTTP/3 上 gRPC が 502（F-91 `test_grpc_over_http3`。H2C 上流へ H1 接続し Invalid HTTP response） |
+| B-38 | P1 | 完了 | [bugs/B-38-http3-wasm-response-headers-not-applied.md](bugs/B-38-http3-wasm-response-headers-not-applied.md) | HTTP/3 WASM レスポンスヘッダ未適用 → `apply_h3_wasm_response_headers` で修正。`test_http3_wasm_integration` PASS |
+| B-39 | P1 | 完了 | [bugs/B-39-http3-grpc-proxy-502.md](bugs/B-39-http3-grpc-proxy-502.md) | HTTP/3 gRPC 502 → H2C 上流 + フルパス保持で修正。`test_grpc_over_http3` PASS |
 
 ---
 
