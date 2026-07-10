@@ -10,7 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 tempfile = "3.24.0"
-veil = { path = "..", features = ["http2"] }
+veil = { path = "..", features = ["http2", "grpc"] }
 
 [features]
 # wasm_abi ターゲット用の passthrough。既定ビルドに wasmtime を強制しないため
@@ -69,6 +69,12 @@ bench = false
 [[bin]]
 name = "wasm_host_abi"
 path = "fuzz_targets/wasm_host_abi.rs"
+test = false
+doc = false
+bench = false
+[[bin]]
+name = "grpc_frame_decode"
+path = "fuzz_targets/grpc_frame_decode.rs"
 test = false
 doc = false
 bench = false
