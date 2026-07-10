@@ -4,6 +4,7 @@
 //! - VEIL_HOST / VEIL_SNI / VEIL_HTTP3_PORT (default 443)
 //! - HTTP3_PATH (default /)
 //! - HTTP3_MODE: get | handshake_flood | qpack_bomb | cid_spoof | malformed
+//!               | handshake_slowloris | amplification_check
 //! - HTTP3_REPORT
 //!
 //! 終了: 0 = モード成功（攻撃系は crash せず完了）、1 = 失敗
@@ -53,6 +54,12 @@ fn main() {
         "cid_spoof" => cid_spoof(&host, port).map(|n| format!("cid_spoof sent={} packets", n)),
         "malformed" => malformed_frames(&host, port)
             .map(|s| format!("malformed done detail={}", s)),
+        // F-92: Initial のみ送ってハンドシェイクを完了させず放置
+        "handshake_slowloris" => handshake_slowloris(&host, port)
+            .map(|s| format!("handshake_slowloris done detail={}", s)),
+        // F-92: クライアント送信バイト vs サーバ応答バイトの増幅比を計測（3 倍ルール目安）
+        "amplification_check" => amplification_check(&host, port)
+            .map(|s| format!("amplification_check {}", s)),
         other => Err(format!("unknown HTTP3_MODE={}", other).into()),
     };
 
@@ -329,6 +336,86 @@ fn qpack_bomb(host: &str, port: u16, path: &str) -> Result<String, Box<dyn std::
         }
         Err(e) => Ok(format!("send_rejected={}", e)),
     }
+}
+
+/// F-92: Initial 相当パケットを 1 回送り、ハンドシェイクを完了させずに待機する。
+/// サーバがアイドルタイムアウトで状態を破棄してもクラッシュしないことをプローブ側 health で確認する。
+fn handshake_slowloris(host: &str, port: u16) -> Result<String, Box<dyn std::error::Error>> {
+    let peer = resolve(host, port)?;
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.set_read_timeout(Some(Duration::from_millis(300)))?;
+    socket.set_write_timeout(Some(Duration::from_secs(2)))?;
+    socket.connect(peer)?;
+
+    let mut pkt = vec![0u8; 1200];
+    pkt[0] = 0xc0; // long header, Initial
+    pkt[1..5].copy_from_slice(&1u32.to_be_bytes());
+    pkt[5] = 8;
+    getrandom::getrandom(&mut pkt[6..14]).ok();
+    pkt[14] = 0;
+    getrandom::getrandom(&mut pkt[15..]).ok();
+    socket.send(&pkt)?;
+
+    // 応答を軽く読み捨てつつ ~5 秒放置（ハンドシェイク未完了）
+    let mut buf = [0u8; 2048];
+    let mut recv_bytes = 0usize;
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        match socket.recv(&mut buf) {
+            Ok(n) => recv_bytes += n,
+            Err(_) => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    Ok(format!("idle_5s recv_bytes={}", recv_bytes))
+}
+
+/// F-92: 不完全ハンドシェイク時の UDP 増幅比を概算する。
+/// クライアント送信合計とサーバ応答合計を比較し、極端な増幅がないことをログする。
+/// （真の IP spoof は権限・ネットワーク制約で不可。増幅耐性の観測用。）
+fn amplification_check(host: &str, port: u16) -> Result<String, Box<dyn std::error::Error>> {
+    let peer = resolve(host, port)?;
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.set_read_timeout(Some(Duration::from_millis(200)))?;
+    socket.set_write_timeout(Some(Duration::from_secs(2)))?;
+    socket.connect(peer)?;
+
+    // 小さな Initial 風パケットを数回送る
+    let mut sent = 0usize;
+    let mut recv = 0usize;
+    let mut pkt = vec![0u8; 200]; // 意図的に小さめ（増幅誘発用）
+    pkt[0] = 0xc0;
+    pkt[1..5].copy_from_slice(&1u32.to_be_bytes());
+    pkt[5] = 8;
+    getrandom::getrandom(&mut pkt[6..14]).ok();
+    pkt[14] = 0;
+
+    for i in 0..10 {
+        getrandom::getrandom(&mut pkt[6..14]).ok();
+        pkt[15] = (i & 0xff) as u8;
+        match socket.send(&pkt) {
+            Ok(n) => sent += n,
+            Err(_) => break,
+        }
+        let mut buf = [0u8; 65535];
+        let deadline = Instant::now() + Duration::from_millis(150);
+        while Instant::now() < deadline {
+            match socket.recv(&mut buf) {
+                Ok(n) => recv += n,
+                Err(_) => break,
+            }
+        }
+    }
+
+    let ratio = if sent == 0 {
+        0.0
+    } else {
+        recv as f64 / sent as f64
+    };
+    // RFC 9000 anti-amplification: 検証前は送信の 3 倍まで。観測のみ（失敗にしない）。
+    Ok(format!(
+        "sent={} recv={} ratio={:.2} (anti-amplification guideline <=3 before path validation)",
+        sent, recv, ratio
+    ))
 }
 
 fn send_http3_get(host: &str, port: u16, path: &str) -> Result<usize, Box<dyn std::error::Error>> {

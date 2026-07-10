@@ -101,6 +101,33 @@ check_tls_health "post_h3_cid_spoof" || true
 run_h3_mode malformed "h3_malformed_frames" || true
 check_tls_health "post_h3_malformed_frames" || true
 
+# S-H3-06 (F-92): QUIC Handshake Slowloris — Initial 後に未完了放置
+run_h3_mode handshake_slowloris "h3_handshake_slowloris" || true
+check_tls_health "post_h3_handshake_slowloris" || true
+
+# S-H3-07 (F-92): Amplification / reflection 観測（増幅比ログ、crash なし）
+run_h3_mode amplification_check "h3_amplification_check" || true
+check_tls_health "post_h3_amplification_check" || true
+
+# S-H3-08 (F-92): h3spec 相当は専用バイナリが無い場合が多い。
+# 利用可能なら実行、無ければスキップ（h2spec と同様の位置づけ）。
+if command -v h3spec >/dev/null 2>&1; then
+    set +e
+    timeout 60 h3spec "https://${VEIL_HOST}:${VEIL_HTTP3_PORT}" \
+        >"/results/h3spec_report.txt" 2>&1
+    h3_rc=$?
+    set -e
+    if [[ "${h3_rc}" -eq 0 ]]; then
+        log "PASS h3spec: exit=0"
+    else
+        # 準拠失敗はログに残し、プロセス生存のみ必須（strict ではない）
+        log "WARN h3spec: exit=${h3_rc} (see h3spec_report.txt)"
+    fi
+    check_tls_health "post_h3spec" || true
+else
+    log "SKIP h3spec: binary not installed (optional; see F-92)"
+fi
+
 # 最終ヘルス
 check_tls_health "post_http3_tls_health" || true
 

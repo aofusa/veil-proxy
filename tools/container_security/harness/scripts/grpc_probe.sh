@@ -121,6 +121,66 @@ fi
 rm -f "${inf_log}"
 check_health "post_grpc_infinite_streaming" || true
 
+# S-G-08 (F-92): gRPC Slowloris — LPM を極端に遅く送り、タイムアウト/解放後にヘルスが生きていること
+# HTTP/1.1 + Content-Length でヘッダ完了後にボディを 1 バイト/200ms 程度で遅延送信
+slow_log="$(mktemp)"
+set +e
+{
+    # ヘッダ + 不完全 LPM（flags + length=32 を宣言し、ペイロードを遅延）
+    printf 'POST /grpc.test.v1.TestService/UnaryCall HTTP/1.1\r\n'
+    printf 'Host: veil-proxy\r\n'
+    printf 'Content-Type: application/grpc\r\n'
+    printf 'TE: trailers\r\n'
+    printf 'Content-Length: 37\r\n'
+    printf '\r\n'
+    # LPM header: flags=0, length=32
+    printf '\x00\x00\x00\x00\x20'
+    # 32 バイトをゆっくり送る（約 6 秒）
+    for _ in $(seq 1 32); do
+        printf 'A'
+        sleep 0.2
+    done
+} | timeout 12 openssl s_client -connect "${VEIL_HOST}:${VEIL_HTTPS_PORT}" \
+    -servername "${VEIL_HOST}" -quiet 2>/dev/null >"${slow_log}" 2>&1
+slow_rc=$?
+set -e
+if [[ "${slow_rc}" -eq 0 ]] || [[ "${slow_rc}" -eq 124 ]] || [[ "${slow_rc}" -eq 1 ]]; then
+    log "PASS grpc_slowloris_lpm: completed (rc=${slow_rc})"
+else
+    log "WARN grpc_slowloris_lpm: rc=${slow_rc}"
+fi
+rm -f "${slow_log}"
+check_health "post_grpc_slowloris" || true
+
+# S-G-09 (F-92): RST_STREAM flood 相当 — 短命の gRPC リクエストを大量連打し、
+# ストリームを即座に閉じてリソース枯渇しないことを post-health で確認
+# （curl は RST を明示できないが、接続をすぐ切る連打で同様の負荷を与える）
+flood_ok=0
+flood_fail=0
+for i in $(seq 1 40); do
+    set +e
+    c=$(timeout 2 curl -s -o /dev/null -w "%{http_code}" --max-time 1 --http2-prior-knowledge \
+        -X POST -H "Content-Type: application/grpc" -H "TE: trailers" \
+        -d $'\x00\x00\x00\x00\x02{}' \
+        "http://${VEIL_HOST}:${VEIL_H2C_PORT}/grpc.test.v1.TestService/UnaryCall" 2>/dev/null)
+    rc=$?
+    set -e
+    # 124/timeout・接続リセット・何らかの HTTP コードいずれも「サーバ生存下の完了」
+    if [[ "${rc}" -eq 0 ]] || [[ "${rc}" -eq 124 ]] || [[ -n "${c}" ]]; then
+        flood_ok=$((flood_ok + 1))
+    else
+        flood_fail=$((flood_fail + 1))
+    fi
+done
+log "grpc_rst_flood_sim: ok=${flood_ok} fail=${flood_fail}"
+if [[ "${flood_ok}" -ge 20 ]]; then
+    log "PASS grpc_rst_flood_sim: completed burst"
+else
+    log "FAIL grpc_rst_flood_sim: too few completions (ok=${flood_ok})"
+    fails=$((fails + 1))
+fi
+check_health "post_grpc_rst_flood" || true
+
 check_health "post_probe_health" || true
 
 if [[ "${fails}" -eq 0 ]]; then

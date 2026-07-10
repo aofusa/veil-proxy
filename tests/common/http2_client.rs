@@ -156,6 +156,165 @@ impl Http2TestClient {
     ) -> Result<(u16, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
         self.send_request("POST", path, &[], Some(body)).await
     }
+
+    /// HTTP/2 リクエストを送信し、レスポンスヘッダ・トレーラーも返す。
+    /// gRPC の `grpc-status` / `grpc-message` 検証用。
+    pub async fn send_request_full(
+        &mut self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> Result<Http2Response, Box<dyn std::error::Error + Send + Sync>> {
+        let mut builder = Request::builder().method(method).uri(path);
+        if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
+            builder = builder.header("host", "localhost");
+        }
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let request = builder.body(())?;
+        let end_of_stream = body.is_none();
+        let (response_future, mut send_body) = self.sender.send_request(request, end_of_stream)?;
+        if let Some(body_data) = body {
+            send_body.send_data(Bytes::copy_from_slice(body_data), true)?;
+        }
+        Self::collect_response(response_future).await
+    }
+
+    /// ボディを複数 DATA フレームに分割して送信する。
+    /// gRPC LPM 境界と HTTP/2 DATA 境界のずれを検証する用途。
+    /// `chunk_delay` が `Some` のときはチャンク間で sleep する（Slowloris 系）。
+    pub async fn send_request_chunked(
+        &mut self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        chunks: &[&[u8]],
+        chunk_delay: Option<std::time::Duration>,
+    ) -> Result<Http2Response, Box<dyn std::error::Error + Send + Sync>> {
+        let mut builder = Request::builder().method(method).uri(path);
+        if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
+            builder = builder.header("host", "localhost");
+        }
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let request = builder.body(())?;
+        let (response_future, mut send_body) = self.sender.send_request(request, false)?;
+
+        let n = chunks.len();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let end = i + 1 == n;
+            if !chunk.is_empty() || end {
+                send_body.send_data(Bytes::copy_from_slice(chunk), end)?;
+            }
+            if !end {
+                if let Some(d) = chunk_delay {
+                    tokio::time::sleep(d).await;
+                }
+            }
+        }
+        if n == 0 {
+            send_body.send_data(Bytes::new(), true)?;
+        }
+
+        Self::collect_response(response_future).await
+    }
+
+    /// リクエスト送信後に RST_STREAM（キャンセル）する。
+    /// 大量キャンセル時の生存確認用。戻り値は cancel 成功可否。
+    pub async fn send_and_reset(
+        &mut self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut builder = Request::builder().method(method).uri(path);
+        if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
+            builder = builder.header("host", "localhost");
+        }
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let request = builder.body(())?;
+        let end_of_stream = body.is_none();
+        let (_response_future, mut send_body) = self.sender.send_request(request, end_of_stream)?;
+        if let Some(body_data) = body {
+            // end_stream=false で送り、直後に reset
+            send_body.send_data(Bytes::copy_from_slice(body_data), false)?;
+        }
+        send_body.send_reset(h2::Reason::CANCEL);
+        Ok(())
+    }
+
+    async fn collect_response(
+        response_future: h2::client::ResponseFuture,
+    ) -> Result<Http2Response, Box<dyn std::error::Error + Send + Sync>> {
+        let response = response_future.await?;
+        let status = response.status().as_u16();
+        let mut headers = Vec::new();
+        for (name, value) in response.headers().iter() {
+            headers.push((
+                name.as_str().to_string(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            ));
+        }
+
+        let mut body_data = Vec::new();
+        let mut body_stream = response.into_body();
+        while let Some(chunk) = body_stream.data().await {
+            let data = chunk?;
+            body_data.extend_from_slice(&data);
+            body_stream.flow_control().release_capacity(data.len())?;
+        }
+
+        let mut trailers = Vec::new();
+        if let Some(tr) = body_stream.trailers().await? {
+            for (name, value) in tr.iter() {
+                trailers.push((
+                    name.as_str().to_string(),
+                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                ));
+            }
+        }
+
+        Ok(Http2Response {
+            status,
+            headers,
+            body: body_data,
+            trailers,
+        })
+    }
+}
+
+/// HTTP/2 レスポンス（ステータス・ヘッダ・ボディ・トレーラー）
+#[derive(Debug, Clone)]
+pub struct Http2Response {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+    pub trailers: Vec<(String, String)>,
+}
+
+impl Http2Response {
+    /// gRPC トレーラーまたは初期ヘッダから grpc-status を取得
+    pub fn grpc_status(&self) -> Option<u32> {
+        self.trailers
+            .iter()
+            .chain(self.headers.iter())
+            .find(|(k, _)| k.eq_ignore_ascii_case("grpc-status"))
+            .and_then(|(_, v)| v.parse().ok())
+    }
+
+    pub fn grpc_message(&self) -> Option<String> {
+        self.trailers
+            .iter()
+            .chain(self.headers.iter())
+            .find(|(k, _)| k.eq_ignore_ascii_case("grpc-message"))
+            .map(|(_, v)| v.clone())
+    }
 }
 
 /// テスト用TLS設定を作成（証明書検証なし）

@@ -60,6 +60,49 @@ use common::http3_client::{http3_get, Http3TestClient};
 // 新しい非同期gRPCテストクライアント（tonic）
 use common::grpc_client::GrpcTestClient;
 
+// HTTP/2 クライアント（gRPC framing / trailers 詳細検証）
+#[cfg(feature = "http2")]
+use common::http2_client::Http2TestClient;
+
+/// SimpleRequest { message } の最小 protobuf エンコード（field 1, length-delimited）。
+/// メッセージ長は 127 バイト未満を想定。F-92 gRPC 詳細 E2E 専用。
+#[cfg(all(feature = "grpc", feature = "http2"))]
+fn encode_simple_request(msg: &str) -> Vec<u8> {
+    let bytes = msg.as_bytes();
+    assert!(
+        bytes.len() < 128,
+        "encode_simple_request: message too long for single-byte length"
+    );
+    let mut out = Vec::with_capacity(2 + bytes.len());
+    out.push(0x0a); // field 1, wire type 2
+    out.push(bytes.len() as u8);
+    out.extend_from_slice(bytes);
+    out
+}
+
+/// gRPC LPM（Length-Prefixed Message）を組み立てる。F-92 gRPC 詳細 E2E 専用。
+#[cfg(all(feature = "grpc", feature = "http2"))]
+fn encode_grpc_lpm(message: &[u8]) -> Vec<u8> {
+    GrpcFrame::new(message.to_vec()).encode()
+}
+
+/// ボディから複数 gRPC LPM を順に抽出。F-92 gRPC 詳細 E2E 専用。
+#[cfg(all(feature = "grpc", feature = "http2"))]
+fn decode_all_grpc_frames(body: &[u8]) -> Vec<GrpcFrame> {
+    let mut frames = Vec::new();
+    let mut offset = 0usize;
+    while offset + 5 <= body.len() {
+        match GrpcFrame::decode(&body[offset..]) {
+            Ok((frame, consumed)) => {
+                frames.push(frame);
+                offset += consumed;
+            }
+            Err(_) => break,
+        }
+    }
+    frames
+}
+
 // E2E環境のポート設定（e2e_setup.shと一致させる）
 const PROXY_PORT: u16 = 8443; // プロキシHTTPSポート
 const PROXY_H2C_PORT: u16 = 8081; // H2C (HTTP/2 Cleartext) ポート
@@ -3355,11 +3398,12 @@ async fn test_http3_latency() {
 }
 
 // ====================
-// 未実装テスト: HTTP/2ベースのgRPC詳細テスト
+// F-92: HTTP/2 ベースの gRPC 詳細フレーミング
 // ====================
 
+/// HTTP/2 DATA 境界と gRPC LPM 境界がずれたケースを含む詳細フレーミング検証。
 #[tokio::test]
-#[ntest::timeout(15000)]
+#[ntest::timeout(30000)]
 #[cfg(all(feature = "grpc", feature = "http2"))]
 async fn test_grpc_http2_framing() {
     if !is_e2e_environment_ready().await {
@@ -3367,282 +3411,374 @@ async fn test_grpc_http2_framing() {
         return;
     }
 
-    // HTTP/2ベースのgRPC詳細テスト
-    // HTTP/2フレームレベルでのgRPCの動作を確認
+    let mut client = Http2TestClient::new("127.0.0.1", PROXY_PORT)
+        .await
+        .expect("HTTP/2 client for gRPC framing");
 
-    // TLS接続を確立し、ALPNでHTTP/2をネゴシエート
-    let config = create_client_config();
-    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
-    let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
+    let grpc_headers = [
+        ("content-type", "application/grpc"),
+        ("te", "trailers"),
+        ("accept", "application/grpc"),
+    ];
+    let path = "/grpc.test.v1.TestService/UnaryCall";
+    let msg = encode_simple_request("framing-ok");
+    let lpm = encode_grpc_lpm(&msg);
 
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-
-    // TLSハンドシェイクを完了
-    while tls_conn.is_handshaking() {
-        match tls_conn.complete_io(&mut stream) {
-            Ok(_) => {}
-            Err(e) => {
-                panic!("TLS handshake error: {:?}", e);
-            }
-        }
-    }
-
-    // ALPNでHTTP/2がネゴシエートされたことを確認
-    let protocol = tls_conn.alpn_protocol();
-    if let Some(proto) = protocol {
-        if proto != b"h2" {
-            eprintln!("HTTP/2 not negotiated, got: {:?}", proto);
-            // HTTP/2がネゴシエートされない場合でも、gRPCリクエストは送信可能
-        } else {
-            eprintln!("HTTP/2 successfully negotiated via ALPN");
-        }
-    }
-
-    // gRPCリクエストを送信（HTTP/2経由）
-    // 注意: 実際のHTTP/2フレーム解析には専用のクライアントライブラリが必要
-    // ここでは、非同期版のGrpcTestClientを使用して基本的な動作確認を行う
-    // gRPCリクエストを送信（非同期版）
-    let response = match GrpcTestClient::send_grpc_request(
-        "127.0.0.1",
-        PROXY_PORT,
-        "/grpc.test.v1.TestService/Test",
-        b"test message",
-        &[],
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            panic!("Failed to send gRPC request: {}", e);
-        }
-    };
-
-    // HTTPステータスコードを確認
-    let http_status = GrpcTestClient::extract_status_code(&response);
+    // Case 1: 単一 DATA フレームに完全な LPM
+    let r1 = client
+        .send_request_full("POST", path, &grpc_headers, Some(&lpm))
+        .await
+        .expect("unary single-frame gRPC");
+    assert_eq!(r1.status, 200, "single-frame gRPC should be HTTP 200");
+    let st1 = r1.grpc_status();
     assert!(
-        http_status == Some(200) || http_status == Some(404) || http_status == Some(502),
-        "Should return 200, 404, or 502: {:?}",
-        http_status
+        st1.is_some(),
+        "single-frame: grpc-status trailer/header required, headers={:?} trailers={:?}",
+        r1.headers,
+        r1.trailers
+    );
+    eprintln!(
+        "Case1 single-frame: grpc-status={:?} body_len={} frames={}",
+        st1,
+        r1.body.len(),
+        decode_all_grpc_frames(&r1.body).len()
     );
 
-    // gRPCフレームを抽出
-    if let Ok(frame) = GrpcTestClient::extract_grpc_frame(&response) {
-        // gRPCフレームの構造を確認
-        // 5-byteヘッダー（1 byte flags + 4 bytes length）+ メッセージ
-        assert!(
-            !frame.data.is_empty() || http_status == Some(404),
-            "Should receive gRPC frame or 404"
-        );
+    // Case 2: LPM ヘッダ 5 バイトとボディを別 DATA に分割
+    let (hdr5, rest) = lpm.split_at(5);
+    let r2 = client
+        .send_request_chunked(
+            "POST",
+            path,
+            &grpc_headers,
+            &[hdr5, rest],
+            Some(Duration::from_millis(10)),
+        )
+        .await
+        .expect("split LPM header/body");
+    assert_eq!(r2.status, 200, "split LPM should still yield HTTP 200");
+    assert!(
+        r2.grpc_status().is_some(),
+        "split LPM: grpc-status required"
+    );
+    eprintln!(
+        "Case2 split-header: grpc-status={:?} body_len={}",
+        r2.grpc_status(),
+        r2.body.len()
+    );
 
-        eprintln!(
-            "gRPC frame extracted: compressed={}, data_len={}",
-            frame.compressed,
-            frame.data.len()
-        );
+    // Case 3: LPM を 1 バイトずつ細切れ DATA で送信（境界ずれ最大）
+    let msg3 = encode_simple_request("byte-split");
+    let lpm3 = encode_grpc_lpm(&msg3);
+    let one_byte_chunks: Vec<&[u8]> = lpm3.chunks(1).collect();
+    let r3 = client
+        .send_request_chunked(
+            "POST",
+            path,
+            &grpc_headers,
+            &one_byte_chunks,
+            None,
+        )
+        .await
+        .expect("byte-split LPM");
+    assert_eq!(r3.status, 200, "byte-split LPM should yield HTTP 200");
+    assert!(
+        r3.grpc_status().is_some(),
+        "byte-split: grpc-status required"
+    );
+    eprintln!(
+        "Case3 byte-split: grpc-status={:?} body_len={}",
+        r3.grpc_status(),
+        r3.body.len()
+    );
+
+    // Case 4: 宣言 length と実ボディ不一致（不正 LPM）— 制御された応答・生存
+    let bad = vec![0u8, 0, 0, 0x10, 0x00, b'x', b'y']; // length=4096, body=2B
+    let r4 = client
+        .send_request_full("POST", path, &grpc_headers, Some(&bad))
+        .await;
+    match r4 {
+        Ok(resp) => {
+            assert!(
+                matches!(resp.status, 200 | 400 | 413 | 502 | 503),
+                "malformed LPM controlled status, got {}",
+                resp.status
+            );
+            eprintln!(
+                "Case4 malformed: status={} grpc-status={:?}",
+                resp.status,
+                resp.grpc_status()
+            );
+        }
+        Err(e) => {
+            eprintln!("Case4 malformed: transport error (acceptable): {}", e);
+        }
     }
 
-    // トレーラーを確認
-    let trailers = GrpcTestClient::extract_trailers(&response);
-    eprintln!("gRPC trailers: {:?}", trailers);
-
-    // HTTP/2ベースのgRPCでは、以下のフレーム構造が期待される:
-    // 1. HEADERSフレーム: 疑似ヘッダー（:method, :path, :scheme, :authority）とgRPCヘッダー
-    // 2. DATAフレーム: gRPCフレーム（5-byteヘッダー + メッセージ）
-    // 3. TRAILERSフレーム: grpc-status, grpc-message
-    // 実際のフレームレベルの解析には、h2クレートなどの専用ライブラリが必要
-    eprintln!("HTTP/2-based gRPC framing test completed (basic verification)");
+    assert!(
+        is_e2e_environment_ready().await,
+        "proxy must survive gRPC HTTP/2 framing edge cases"
+    );
 }
 
 // ====================
-// 未実装テスト: gRPCストリーミングの詳細テスト
+// F-92: gRPC ストリーミング詳細
 // ====================
 
+/// 複数メッセージのサーバ/クライアントストリームと途中切断後の生存を検証。
 #[tokio::test]
-#[ntest::timeout(15000)]
-#[cfg(feature = "grpc")]
+#[ntest::timeout(45000)]
+#[cfg(all(feature = "grpc", feature = "http2"))]
 async fn test_grpc_streaming_detailed() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
         return;
     }
 
-    // gRPCストリーミングの詳細テスト
-    // 各ストリーミングタイプ（Server Streaming、Client Streaming、Bidirectional Streaming）の
-    // 実際の動作を詳細に検証
+    let mut client = Http2TestClient::new("127.0.0.1", PROXY_PORT)
+        .await
+        .expect("HTTP/2 client for streaming");
 
-    // Server Streamingのテスト
-    eprintln!("Testing Server Streaming...");
+    let grpc_headers = [
+        ("content-type", "application/grpc"),
+        ("te", "trailers"),
+        ("accept", "application/grpc"),
+    ];
 
-    // Server Streamingリクエストを送信（非同期版、静的メソッド）
-    // 注意: 実際のストリーミングにはHTTP/2のストリーム機能が必要
-    // ここでは、基本的な動作確認を行う
-    let response1 = match GrpcTestClient::send_grpc_request(
-        "127.0.0.1",
-        PROXY_PORT,
-        "/grpc.test.v1.TestService/ServerStreaming",
-        b"start streaming",
-        &[],
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            panic!("Failed to send Server Streaming request: {}", e);
-        }
-    };
-
-    let status1 = GrpcTestClient::extract_status_code(&response1);
+    // --- Server Streaming: 1 リクエストで複数 LPM 応答 ---
+    let ss_msg = encode_simple_request("ss-start");
+    let ss_lpm = encode_grpc_lpm(&ss_msg);
+    let ss = client
+        .send_request_full(
+            "POST",
+            "/grpc.test.v1.TestService/ServerStreaming",
+            &grpc_headers,
+            Some(&ss_lpm),
+        )
+        .await
+        .expect("server streaming");
+    assert_eq!(ss.status, 200, "server streaming HTTP status");
+    let ss_frames = decode_all_grpc_frames(&ss.body);
+    eprintln!(
+        "ServerStreaming: frames={} grpc-status={:?} body_len={}",
+        ss_frames.len(),
+        ss.grpc_status(),
+        ss.body.len()
+    );
+    // 上流が 5 メッセージ返す。透過プロキシなら複数フレーム期待。
+    // フレーム 0 でも grpc-status があればストリームは完結している。
     assert!(
-        status1 == Some(200) || status1 == Some(404) || status1 == Some(502),
-        "Should return 200, 404, or 502: {:?}",
-        status1
+        ss.grpc_status().is_some() || !ss_frames.is_empty(),
+        "server streaming should yield frames or grpc-status"
+    );
+    if ss.grpc_status() == Some(0) {
+        assert!(
+            ss_frames.len() >= 2,
+            "ok server stream should return multiple LPMs, got {}",
+            ss_frames.len()
+        );
+    }
+
+    // --- Client Streaming: 複数 LPM を同一ストリームで送信 ---
+    let mut client_chunks: Vec<Vec<u8>> = Vec::new();
+    for i in 0..4 {
+        let m = encode_simple_request(&format!("cs-{}", i));
+        client_chunks.push(encode_grpc_lpm(&m));
+    }
+    let chunk_refs: Vec<&[u8]> = client_chunks.iter().map(|v| v.as_slice()).collect();
+    let cs = client
+        .send_request_chunked(
+            "POST",
+            "/grpc.test.v1.TestService/ClientStreaming",
+            &grpc_headers,
+            &chunk_refs,
+            Some(Duration::from_millis(15)),
+        )
+        .await
+        .expect("client streaming");
+    assert_eq!(cs.status, 200, "client streaming HTTP status");
+    assert!(
+        cs.grpc_status().is_some(),
+        "client streaming needs grpc-status"
+    );
+    let cs_frames = decode_all_grpc_frames(&cs.body);
+    eprintln!(
+        "ClientStreaming: frames={} grpc-status={:?} body={:?}",
+        cs_frames.len(),
+        cs.grpc_status(),
+        cs_frames
+            .first()
+            .map(|f| String::from_utf8_lossy(&f.data).into_owned())
     );
 
-    // Client Streamingのテスト
-    eprintln!("Testing Client Streaming...");
-
-    // 複数のメッセージを送信（Client Streamingのシミュレーション、非同期版）
+    // --- Bidirectional: 複数送受信 ---
+    let mut bidi_chunks: Vec<Vec<u8>> = Vec::new();
     for i in 0..3 {
-        let message = format!("Client streaming message {}", i).into_bytes();
-        let response = match GrpcTestClient::send_grpc_request(
-            "127.0.0.1",
-            PROXY_PORT,
-            "/grpc.test.v1.TestService/ClientStreaming",
-            &message,
-            &[],
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                panic!("Failed to send Client Streaming request {}: {}", i, e);
-            }
-        };
-
-        let status = GrpcTestClient::extract_status_code(&response);
-        assert_eq!(
-            status,
-            Some(200),
-            "Should return 200 OK for gRPC request, got: {:?}",
-            status
-        );
+        let m = encode_simple_request(&format!("bidi-{}", i));
+        bidi_chunks.push(encode_grpc_lpm(&m));
     }
-
-    // Bidirectional Streamingのテスト
-    eprintln!("Testing Bidirectional Streaming...");
-
-    // 複数のメッセージを送受信（Bidirectional Streamingのシミュレーション、非同期版）
-    for i in 0..3 {
-        let message = format!("Bidirectional streaming message {}", i).into_bytes();
-        let response = match GrpcTestClient::send_grpc_request(
-            "127.0.0.1",
-            PROXY_PORT,
+    let bidi_refs: Vec<&[u8]> = bidi_chunks.iter().map(|v| v.as_slice()).collect();
+    let bidi = client
+        .send_request_chunked(
+            "POST",
             "/grpc.test.v1.TestService/BidirectionalStreaming",
-            &message,
-            &[],
+            &grpc_headers,
+            &bidi_refs,
+            Some(Duration::from_millis(10)),
         )
         .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                panic!(
-                    "Failed to send Bidirectional Streaming request {}: {}",
-                    i, e
-                );
-            }
-        };
+        .expect("bidirectional streaming");
+    assert_eq!(bidi.status, 200, "bidi streaming HTTP status");
+    let bidi_frames = decode_all_grpc_frames(&bidi.body);
+    eprintln!(
+        "Bidirectional: frames={} grpc-status={:?}",
+        bidi_frames.len(),
+        bidi.grpc_status()
+    );
+    assert!(
+        bidi.grpc_status().is_some() || !bidi_frames.is_empty(),
+        "bidi should complete with status or frames"
+    );
 
-        let status = GrpcTestClient::extract_status_code(&response);
-        assert_eq!(
-            status,
-            Some(200),
-            "Should return 200 OK for gRPC request, got: {:?}",
-            status
-        );
+    // --- 途中切断: 部分 LPM 送信後に RST ---
+    let partial = encode_grpc_lpm(&encode_simple_request("will-reset"));
+    let _ = client
+        .send_and_reset(
+            "POST",
+            "/grpc.test.v1.TestService/UnaryCall",
+            &grpc_headers,
+            Some(&partial[..partial.len().saturating_sub(2).max(1)]),
+        )
+        .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // gRPCフレームを抽出
-        if let Ok(frame) = GrpcTestClient::extract_grpc_frame(&response) {
-            eprintln!("Received gRPC frame {}: data_len={}", i, frame.data.len());
-        }
-    }
-
+    // 切断後も Unary が通ること
+    let after = client
+        .send_request_full(
+            "POST",
+            "/grpc.test.v1.TestService/UnaryCall",
+            &grpc_headers,
+            Some(&encode_grpc_lpm(&encode_simple_request("after-reset"))),
+        )
+        .await
+        .expect("post mid-stream reset unary");
+    assert_eq!(after.status, 200, "proxy must accept traffic after RST");
+    assert!(
+        is_e2e_environment_ready().await,
+        "proxy must survive streaming mid-disconnect"
+    );
     eprintln!("gRPC streaming detailed test completed");
-    eprintln!("Note: Full streaming support requires HTTP/2 stream functionality");
 }
 
 // ====================
-// 未実装テスト: QPACK圧縮の詳細テスト
+// F-92: QPACK 圧縮の詳細
 // ====================
 
+/// 同一接続で同一ヘッダ連打（動的テーブル利用）と巨大ヘッダの制御された処理を検証。
 #[tokio::test]
-#[ntest::timeout(15000)]
+#[ntest::timeout(30000)]
 #[cfg(feature = "http3")]
-#[allow(unused_assignments)]
 async fn test_http3_qpack_compression() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
         return;
     }
 
-    // QPACK圧縮の詳細テスト
-    // 同じヘッダーセットを持つ複数のリクエストを送信し、
-    // 2回目以降のリクエストでヘッダーが動的テーブルから参照されることを確認
-
     let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
         .parse()
         .expect("Invalid server address");
+    let (_client, mut send_request) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("HTTP/3 client for QPACK");
 
-    // HTTP/3接続を確立（非同期版）
-    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
-        Ok(c) => c,
-        Err(e) => {
-            panic!(
-                "Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)",
-                e
-            );
-        }
-    };
+    use common::http3_client::{send_http3_request, send_http3_request_full};
 
-    use common::http3_client::send_http3_request;
-
-    // 同じヘッダーセットを持つ複数のリクエストを送信
-    let headers = vec![
-        ("User-Agent", "test-client/1.0"),
-        ("Accept", "application/json"),
-        ("X-Custom-Header", "test-value"),
+    // 同一ヘッダセットを多数回送信 → 動的テーブル参照パスを刺激
+    let headers = [
+        ("user-agent", "qpack-test-client/1.0"),
+        ("accept", "application/json"),
+        ("x-custom-header", "qpack-dynamic-table-value"),
+        ("x-session-id", "qpack-session-abc123"),
     ];
-
-    // 非同期版では、パケットサイズの測定は実装が異なるため、
-    // 複数のリクエストを送信してQPACK圧縮の動作を確認
-    for i in 0..3 {
+    let mut ok = 0u32;
+    for i in 0..12 {
         match send_http3_request(&mut send_request, "GET", "/", &headers, None).await {
-            Ok((status, _body)) => {
-                eprintln!("Request {} completed with status: {}", i, status);
+            Ok((status, body)) => {
+                assert_eq!(
+                    status, 200,
+                    "QPACK repeated request {} should be 200, got {}",
+                    i, status
+                );
+                assert!(!body.is_empty() || status == 200, "body or empty 200 ok");
+                ok += 1;
             }
-            Err(e) => {
-                panic!("Failed to send/receive HTTP/3 request {}: {}", i, e);
-            }
+            Err(e) => panic!("QPACK repeated request {} failed: {}", i, e),
+        }
+    }
+    assert_eq!(ok, 12, "all QPACK warm-up requests should succeed");
+
+    // 巨大ヘッダブロック → メモリ制限 / 431 相当 / 接続エラーのいずれかで制御
+    let big = "B".repeat(8192);
+    let big_headers = [
+        ("user-agent", "qpack-bomb-client/1.0"),
+        ("x-huge-1", big.as_str()),
+        ("x-huge-2", big.as_str()),
+        ("x-huge-3", big.as_str()),
+        ("x-huge-4", big.as_str()),
+    ];
+    match send_http3_request_full(&mut send_request, "GET", "/", &big_headers, None).await {
+        Ok(resp) => {
+            assert!(
+                matches!(resp.status, 200 | 400 | 413 | 431 | 502 | 503),
+                "oversized H3 headers controlled status, got {}",
+                resp.status
+            );
+            eprintln!("QPACK oversized headers status={}", resp.status);
+        }
+        Err(e) => {
+            // ストリームリセット・接続クローズは許容（DoS 防御）
+            eprintln!("QPACK oversized headers rejected (ok): {}", e);
         }
     }
 
-    // QPACK圧縮の効果を確認
-    // 非同期版では、パケットサイズの直接測定は困難なため、
-    // リクエストが正常に処理されることを確認
-    eprintln!("QPACK compression test completed (multiple requests sent)");
+    // 巨大ヘッダ後も通常リクエストが通る（接続全滅していない）
+    match send_http3_request(&mut send_request, "GET", "/", &headers, None).await {
+        Ok((status, _)) => {
+            assert!(
+                matches!(status, 200 | 400 | 502),
+                "post-bomb request status {}",
+                status
+            );
+            eprintln!("QPACK post-bomb status={}", status);
+        }
+        Err(e) => {
+            // 接続が閉じられた場合は新規接続で生存確認
+            eprintln!("QPACK connection closed after bomb (reconnecting): {}", e);
+            let (_c2, mut sr2) = Http3TestClient::new(server_addr, "localhost")
+                .await
+                .expect("reconnect after QPACK bomb");
+            let (st, _) = send_http3_request(&mut sr2, "GET", "/", &[], None)
+                .await
+                .expect("GET after reconnect");
+            assert_eq!(st, 200, "proxy must accept new H3 after QPACK bomb");
+        }
+    }
+
+    assert!(
+        is_e2e_environment_ready().await,
+        "proxy must survive QPACK stress"
+    );
 }
 
 // ====================
-// 未実装テスト: 接続マイグレーション
+// F-92: HTTP/3 接続マイグレーション相当
 // ====================
 
+/// 別ソースポートからの並行接続と、既存接続の継続性を検証。
+/// 真の path migration（同一 CID・別 4-tuple）は quinn クライアント制約のため、
+/// 複数 UDP エンドポイントでのストリーム継続・クラッシュなしを合格条件とする。
 #[tokio::test]
-#[ntest::timeout(15000)]
+#[ntest::timeout(30000)]
 #[cfg(feature = "http3")]
 async fn test_http3_connection_migration() {
     if !is_e2e_environment_ready().await {
@@ -3650,64 +3786,68 @@ async fn test_http3_connection_migration() {
         return;
     }
 
-    // 接続マイグレーションの簡易テスト
-    // 実際のネットワーク変更をシミュレートするのは困難なため、
-    // 複数のUDPソケットを使用した基本的な動作確認
-
     let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
         .parse()
         .expect("Invalid server address");
 
-    // 最初のHTTP/3接続を確立（非同期版）
-    let (_client1, mut send_request1) = match Http3TestClient::new(server_addr, "localhost").await {
-        Ok(c) => c,
-        Err(e) => {
-            panic!(
-                "Failed to create HTTP/3 client: {} (HTTP/3 may not be enabled)",
-                e
-            );
-        }
-    };
-
     use common::http3_client::send_http3_request;
 
-    // 1回目のリクエストを送信（マイグレーション前）
-    match send_http3_request(&mut send_request1, "GET", "/", &[], None).await {
-        Ok((status, _body)) => {
-            assert_eq!(status, 200, "Should return 200 OK before migration");
-        }
-        Err(e) => {
-            panic!("Failed to send/receive HTTP/3 request: {}", e);
-        }
+    // 接続 A: 確立後に複数リクエスト（同一 Connection ID 上の継続）
+    let (_client_a, mut sr_a) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("H3 connection A");
+    for i in 0..3 {
+        let (st, _) = send_http3_request(&mut sr_a, "GET", "/", &[], None)
+            .await
+            .unwrap_or_else(|e| panic!("conn A request {}: {}", i, e));
+        assert_eq!(st, 200, "conn A request {} status", i);
     }
 
-    // 新しい接続を確立（接続マイグレーションのシミュレーション、非同期版）
-    // 注意: 実際の接続マイグレーションはquicheの内部実装に依存するため、
-    // ここでは新しい接続を確立して動作確認を行う
-    let (_client2, mut send_request2) = match Http3TestClient::new(server_addr, "localhost").await {
-        Ok(c) => c,
-        Err(e) => {
-            panic!(
-                "Failed to create second HTTP/3 client: {} (HTTP/3 may not be enabled)",
-                e
-            );
-        }
-    };
+    // 接続 B: 別 UDP ソケット（別ソースポート）— マイグレーション後の新パス相当
+    let (_client_b, mut sr_b) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("H3 connection B (new source port)");
+    let (st_b, _) = send_http3_request(&mut sr_b, "GET", "/health", &[], None)
+        .await
+        .expect("conn B request");
+    assert!(
+        matches!(st_b, 200 | 404),
+        "conn B should work from new source port, got {}",
+        st_b
+    );
 
-    // 2回目のリクエストを送信（新しい接続）
-    match send_http3_request(&mut send_request2, "GET", "/", &[], None).await {
-        Ok((status, _body)) => {
-            assert_eq!(
-                status, 200,
-                "Should return 200 OK after migration simulation"
-            );
-        }
-        Err(e) => {
-            panic!("Failed to send/receive HTTP/3 request: {}", e);
-        }
-    }
+    // 接続 A が B 開設後も継続できること（サーバ状態が破綻していない）
+    let (st_a2, _) = send_http3_request(&mut sr_a, "GET", "/", &[], None)
+        .await
+        .expect("conn A after B");
+    assert_eq!(st_a2, 200, "conn A must continue after peer path change sim");
 
-    eprintln!("Connection migration simulation test completed");
+    // 接続 C: 同時多重（別ポート）で並列 GET
+    let (_client_c, mut sr_c) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("H3 connection C");
+    let (st_c, _) = send_http3_request(&mut sr_c, "GET", "/", &[], None)
+        .await
+        .expect("conn C");
+    assert_eq!(st_c, 200, "conn C parallel path");
+
+    // 旧接続をドロップし、新規接続で再確立（クライアント側パス喪失のシミュレーション）
+    drop(sr_a);
+    drop(_client_a);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (_client_d, mut sr_d) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("H3 reconnection after path loss");
+    let (st_d, _) = send_http3_request(&mut sr_d, "GET", "/", &[], None)
+        .await
+        .expect("reconnect after path loss");
+    assert_eq!(st_d, 200, "new connection after path loss must work");
+
+    assert!(
+        is_e2e_environment_ready().await,
+        "proxy must survive connection migration simulation"
+    );
+    eprintln!("HTTP/3 connection migration simulation completed");
 }
 
 #[tokio::test]
@@ -6121,101 +6261,128 @@ async fn test_grpc_compression_negotiation() {
 }
 
 // ====================
-// 未実装テスト: gRPCトレーラーの詳細テスト
+// F-92: gRPC トレーラー詳細
 // ====================
 
+/// 正常応答とエラー応答で grpc-status / grpc-message トレーラーが透過されることを検証。
 #[tokio::test]
-#[ntest::timeout(15000)]
-#[cfg(feature = "grpc")]
+#[ntest::timeout(30000)]
+#[cfg(all(feature = "grpc", feature = "http2"))]
 async fn test_grpc_trailer_detailed() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
         return;
     }
 
-    // gRPCトレーラーの詳細テスト
-    // 様々なgRPCステータスコードとエラーメッセージの処理を検証
+    let mut client = Http2TestClient::new("127.0.0.1", PROXY_PORT)
+        .await
+        .expect("HTTP/2 client for trailer detailed");
 
-    // gRPCリクエストを送信（非同期版）
-    let response = match GrpcTestClient::send_grpc_request(
-        "127.0.0.1",
-        PROXY_PORT,
-        "/grpc.test.v1.TestService/Test",
-        b"test message",
-        &[],
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            panic!("Failed to send gRPC request: {}", e);
-        }
-    };
+    let grpc_headers = [
+        ("content-type", "application/grpc"),
+        ("te", "trailers"),
+        ("accept", "application/grpc"),
+    ];
 
-    // HTTPステータスコードを確認
-    let http_status = GrpcTestClient::extract_status_code(&response);
+    // --- 正常 Unary: grpc-status: 0 ---
+    let ok_body = encode_grpc_lpm(&encode_simple_request("trailer-ok"));
+    let ok = client
+        .send_request_full(
+            "POST",
+            "/grpc.test.v1.TestService/UnaryCall",
+            &grpc_headers,
+            Some(&ok_body),
+        )
+        .await
+        .expect("ok unary for trailers");
+    assert_eq!(ok.status, 200, "ok unary HTTP 200");
+    let ok_status = ok.grpc_status();
     assert!(
-        http_status == Some(200) || http_status == Some(404) || http_status == Some(502),
-        "Should return 200, 404, or 502: {:?}",
-        http_status
+        ok_status.is_some(),
+        "ok unary must expose grpc-status, trailers={:?} headers={:?}",
+        ok.trailers,
+        ok.headers
+    );
+    let ok_code = ok_status.unwrap();
+    assert!(
+        ok_code <= 16,
+        "grpc-status must be 0-16, got {}",
+        ok_code
+    );
+    eprintln!(
+        "Unary OK: grpc-status={} grpc-message={:?} trailers={:?}",
+        ok_code,
+        ok.grpc_message(),
+        ok.trailers
     );
 
-    // トレーラーを抽出
-    let trailers = GrpcTestClient::extract_trailers(&response);
+    // --- エラー: StreamReset → grpc-status != 0 + grpc-message ---
+    let err_body = encode_grpc_lpm(&encode_simple_request("force-error"));
+    let err = client
+        .send_request_full(
+            "POST",
+            "/grpc.test.v1.TestService/StreamReset",
+            &grpc_headers,
+            Some(&err_body),
+        )
+        .await
+        .expect("error unary for trailers");
+    assert_eq!(err.status, 200, "gRPC errors still use HTTP 200");
+    let err_status = err.grpc_status();
+    assert!(
+        err_status.is_some(),
+        "error path must expose grpc-status, trailers={:?} headers={:?}",
+        err.trailers,
+        err.headers
+    );
+    let err_code = err_status.unwrap();
+    assert!(
+        err_code > 0 && err_code <= 16,
+        "StreamReset should yield non-zero grpc-status, got {}",
+        err_code
+    );
+    let err_msg = err.grpc_message();
+    assert!(
+        err_msg.as_ref().map(|m| !m.is_empty()).unwrap_or(false),
+        "error path should forward grpc-message, got {:?}",
+        err_msg
+    );
+    eprintln!(
+        "StreamReset: grpc-status={} grpc-message={:?} trailers={:?}",
+        err_code, err_msg, err.trailers
+    );
 
-    // grpc-statusの存在を確認（エンドポイントが存在する場合）
-    let grpc_status = GrpcTestClient::extract_grpc_status(&response);
-    if grpc_status.is_some() {
-        let status_code = grpc_status.unwrap();
+    // --- カスタムメタデータ付きリクエスト（クライアント→上流）。トレーラー破壊なし ---
+    let meta_headers = [
+        ("content-type", "application/grpc"),
+        ("te", "trailers"),
+        ("accept", "application/grpc"),
+        ("x-custom-meta", "trailer-test-value"),
+    ];
+    let meta = client
+        .send_request_full(
+            "POST",
+            "/grpc.test.v1.TestService/UnaryCall",
+            &meta_headers,
+            Some(&encode_grpc_lpm(&encode_simple_request("with-meta"))),
+        )
+        .await
+        .expect("unary with custom metadata");
+    assert_eq!(meta.status, 200);
+    assert!(
+        meta.grpc_status().is_some(),
+        "custom metadata must not strip grpc-status"
+    );
 
-        // gRPCステータスコードは0-16の範囲内であることを確認
+    // トレーラー名は grpc-* または x-* メタ
+    for (name, _) in meta.trailers.iter().chain(err.trailers.iter()) {
+        let lower = name.to_ascii_lowercase();
         assert!(
-            status_code <= 16,
-            "gRPC status code should be in range 0-16, got: {}",
-            status_code
-        );
-
-        // grpc-statusトレーラーが存在することを確認
-        let has_grpc_status = trailers.iter().any(|(name, _)| name == "grpc-status");
-        assert!(has_grpc_status, "grpc-status trailer should be present");
-
-        // grpc-messageの存在を確認（エラーの場合）
-        if status_code != 0 {
-            let grpc_message = GrpcTestClient::extract_grpc_message(&response);
-            // エラーの場合、grpc-messageが存在する可能性がある
-            if grpc_message.is_some() {
-                let message = grpc_message.unwrap();
-                assert!(
-                    !message.is_empty(),
-                    "grpc-message should not be empty if present"
-                );
-
-                // grpc-messageトレーラーが存在することを確認
-                let has_grpc_message = trailers.iter().any(|(name, _)| name == "grpc-message");
-                assert!(
-                    has_grpc_message,
-                    "grpc-message trailer should be present for errors"
-                );
-            }
-        }
-
-        eprintln!(
-            "gRPC status code: {}, trailers: {:?}",
-            status_code, trailers
-        );
-    } else {
-        // エンドポイントが存在しない場合、トレーラーが存在しない可能性がある
-        eprintln!(
-            "gRPC status not found (endpoint may not exist), trailers: {:?}",
-            trailers
-        );
-    }
-
-    // トレーラーヘッダーがgrpc-で始まることを確認
-    for (name, _) in &trailers {
-        assert!(
-            name.starts_with("grpc-"),
-            "Trailer header should start with 'grpc-', got: {}",
+            lower.starts_with("grpc-")
+                || lower.starts_with("x-")
+                || lower == "content-type"
+                || lower == "content-length",
+            "unexpected trailer name: {}",
             name
         );
     }
