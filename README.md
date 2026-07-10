@@ -2510,7 +2510,7 @@ gso_gro_enabled = false
 
 - HTTP/3 is UDP-based, so **kTLS cannot be used** (doesn't use TCP)
 - UDP port 443 must be opened in the firewall
-- Use Alt-Svc header to notify browsers of HTTP/3 support
+- When `server.http3_enabled = true`, HTTP/1.1 and HTTP/2 responses advertise HTTP/3 via `Alt-Svc` (default `server.alt_svc_enabled = true`; override with `[http3].alt_svc` / `alt_svc_ma_secs`)
 
 ## kTLS (Kernel TLS) Support
 
