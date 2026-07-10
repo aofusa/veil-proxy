@@ -905,6 +905,156 @@ pub(crate) fn init_server_header(enabled: bool, value: &str) {
 }
 
 // ====================
+// Alt-Svc ヘッダー（HTTP/3 広告、F-94）
+// ====================
+//
+// `server.http3_enabled` 時に HTTP/1.1 / HTTP/2 応答へ `Alt-Svc: h3=":port"; ma=...`
+// を付与し、ブラウザ等クライアントが HTTP/3 へアップグレードできるようにする。
+// Server ヘッダーと同じく ArcSwap + AtomicBool でホットパスのゼロコピー参照を実現。
+
+/// Alt-Svc ヘッダー値（起動時/リロード時に更新）
+pub(crate) static ALT_SVC_VALUE: Lazy<arc_swap::ArcSwap<Vec<u8>>> =
+    Lazy::new(|| arc_swap::ArcSwap::from(Arc::new(Vec::new())));
+
+/// Alt-Svc ヘッダー有効フラグ
+pub(crate) static ALT_SVC_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Alt-Svc 設定を安全に取得（Guard でリクエスト処理中の無効化を防ぐ）
+#[inline]
+pub fn get_alt_svc_guard() -> Option<AltSvcGuard> {
+    if ALT_SVC_ENABLED.load(std::sync::atomic::Ordering::Acquire) {
+        let guard = ALT_SVC_VALUE.load();
+        if !guard.is_empty() {
+            Some(AltSvcGuard { guard })
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+/// Alt-Svc 値を保持する Guard
+pub struct AltSvcGuard {
+    pub(crate) guard: arc_swap::Guard<Arc<Vec<u8>>>,
+}
+
+impl AltSvcGuard {
+    /// ヘッダータプルとして取得（ゼロコピー）。名前は小文字（HTTP/2/HPACK 向け）。
+    #[inline]
+    pub fn as_header(&self) -> (&'static [u8], &[u8]) {
+        (b"alt-svc", self.guard.as_slice())
+    }
+
+    /// 値のスライスとして取得
+    #[inline]
+    pub fn value(&self) -> &[u8] {
+        self.guard.as_slice()
+    }
+}
+
+/// Alt-Svc 設定を初期化
+///
+/// * `enabled` - 広告を有効にするか（通常は `http3_enabled` と連動）
+/// * `value` - ヘッダー値全文（例: `h3=":8443"; ma=86400`）。空なら無効扱い
+pub(crate) fn init_alt_svc(enabled: bool, value: &str) {
+    if !value.is_empty() {
+        ALT_SVC_VALUE.store(Arc::new(value.as_bytes().to_vec()));
+    } else {
+        ALT_SVC_VALUE.store(Arc::new(Vec::new()));
+    }
+    let effective = enabled && !value.is_empty();
+    ALT_SVC_ENABLED.store(effective, std::sync::atomic::Ordering::Release);
+    info!(
+        "Alt-Svc header: {} (value: {:?})",
+        if effective { "enabled" } else { "disabled" },
+        if effective { value } else { "" }
+    );
+}
+
+/// HTTP/3 リッスンアドレスから標準的な Alt-Svc 値を構築する（コールドパス）。
+///
+/// `listen` 例: `"127.0.0.1:8443"` / `"[::]:443"` / `"0.0.0.0:443"`
+/// → `h3=":8443"; ma=86400`（ホスト省略のポート広告。RFC 7838 / RFC 9114）
+pub fn build_alt_svc_value(listen: &str, ma_secs: u64) -> String {
+    let port = parse_listen_port(listen).unwrap_or(443);
+    format!("h3=\":{}\"; ma={}", port, ma_secs)
+}
+
+/// HTTP/1.1 応答バッファへ `Alt-Svc: ...\r\n` を追記（有効時のみ、値はゼロコピー）。
+#[inline]
+pub fn append_alt_svc_header_line(buf: &mut Vec<u8>) {
+    if let Some(g) = get_alt_svc_guard() {
+        buf.extend_from_slice(b"Alt-Svc: ");
+        buf.extend_from_slice(g.value());
+        buf.extend_from_slice(b"\r\n");
+    }
+}
+
+/// `host:port` / `[ipv6]:port` からポートを抽出（失敗時 None）
+fn parse_listen_port(listen: &str) -> Option<u16> {
+    let s = listen.trim();
+    if let Some(bracket_end) = s.rfind(']') {
+        // [ipv6]:port
+        let rest = s.get(bracket_end + 1..)?;
+        let port_str = rest.strip_prefix(':')?;
+        return port_str.parse().ok();
+    }
+    // host:port
+    let port_str = s.rsplit_once(':')?.1;
+    port_str.parse().ok()
+}
+
+#[cfg(test)]
+mod alt_svc_tests {
+    use super::*;
+
+    #[test]
+    fn build_alt_svc_value_ipv4() {
+        assert_eq!(
+            build_alt_svc_value("127.0.0.1:8443", 86400),
+            "h3=\":8443\"; ma=86400"
+        );
+    }
+
+    #[test]
+    fn build_alt_svc_value_default_port() {
+        assert_eq!(
+            build_alt_svc_value("0.0.0.0:443", 3600),
+            "h3=\":443\"; ma=3600"
+        );
+    }
+
+    #[test]
+    fn build_alt_svc_value_ipv6() {
+        assert_eq!(
+            build_alt_svc_value("[::1]:9443", 86400),
+            "h3=\":9443\"; ma=86400"
+        );
+    }
+
+    #[test]
+    fn parse_listen_port_invalid() {
+        assert!(parse_listen_port("no-port").is_none());
+        assert!(parse_listen_port("").is_none());
+    }
+
+    #[test]
+    fn init_and_get_alt_svc_guard() {
+        init_alt_svc(true, "h3=\":8443\"; ma=86400");
+        let g = get_alt_svc_guard().expect("guard");
+        let (name, value) = g.as_header();
+        assert_eq!(name, b"alt-svc");
+        assert_eq!(value, b"h3=\":8443\"; ma=86400");
+        init_alt_svc(false, "h3=\":8443\"; ma=86400");
+        assert!(get_alt_svc_guard().is_none());
+        // テスト間汚染防止
+        init_alt_svc(false, "");
+    }
+}
+
+// ====================
 // テスト
 // ====================
 

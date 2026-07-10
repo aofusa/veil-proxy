@@ -1499,6 +1499,11 @@ fn build_h2_compressed_file_response(
     for (k, v) in &security.add_response_headers {
         header_store.push((k.as_bytes().to_vec(), v.as_bytes().to_vec()));
     }
+    // F-94: HTTP/3 広告（Alt-Svc）
+    if let Some(g) = get_alt_svc_guard() {
+        let (n, v) = g.as_header();
+        header_store.push((n.to_vec(), v.to_vec()));
+    }
 
     let response_body = if let Some(enc) = should_compress {
         let encoding_name: &[u8] = match enc {
@@ -2195,6 +2200,11 @@ where
             if let Some(ref g) = server_guard {
                 headers.push(g.as_header());
             }
+            // F-94: HTTP/3 広告（Alt-Svc）。ガードは send_headers 完了まで保持。
+            let alt_svc_guard = get_alt_svc_guard();
+            if let Some(ref g) = alt_svc_guard {
+                headers.push(g.as_header());
+            }
 
             let has_body = !h2c_resp.body.is_empty();
             let has_trailers = !h2c_resp.trailers.is_empty();
@@ -2648,8 +2658,12 @@ where
             if stream_compress_hint.is_none() && !parsed.is_chunked {
                 if let Some(content_len) = parsed.content_length {
                     let server_guard = get_server_header_guard();
+                    let alt_svc_guard = get_alt_svc_guard();
                     let mut h2_headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(16);
                     if let Some(ref g) = server_guard {
+                        h2_headers.push(g.as_header());
+                    }
+                    if let Some(ref g) = alt_svc_guard {
                         h2_headers.push(g.as_header());
                     }
                     for header in resp.headers.iter() {
@@ -2695,8 +2709,12 @@ where
             // バックプレッシャ）。トレーラーは破棄、content-length/transfer-encoding は除外。
             if stream_compress_hint.is_none() && parsed.is_chunked {
                 let server_guard = get_server_header_guard();
+                let alt_svc_guard = get_alt_svc_guard();
                 let mut h2_headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(16);
                 if let Some(ref g) = server_guard {
+                    h2_headers.push(g.as_header());
+                }
+                if let Some(ref g) = alt_svc_guard {
                     h2_headers.push(g.as_header());
                 }
                 for header in resp.headers.iter() {
@@ -2813,8 +2831,12 @@ where
 
             // HTTP/2用のヘッダーを構築（ホップバイホップヘッダー除外）
             let server_guard = get_server_header_guard();
+            let alt_svc_guard = get_alt_svc_guard();
             let mut h2_headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(16);
             if let Some(ref g) = server_guard {
+                h2_headers.push(g.as_header());
+            }
+            if let Some(ref g) = alt_svc_guard {
                 h2_headers.push(g.as_header());
             }
 
@@ -4875,6 +4897,8 @@ async fn handle_backend(
                 header.extend_from_slice(header_value.as_bytes());
                 header.extend_from_slice(b"\r\n");
             }
+            // F-94: HTTP/3 広告（Alt-Svc）
+            append_alt_svc_header_line(&mut header);
 
             // WASMレスポンスヘッダーフィルタを適用
             #[cfg(feature = "wasm")]
@@ -7865,6 +7889,14 @@ async fn transfer_response_with_compression(
                         new_header_lines
                             .push(format!("{}: {}\r\n", header_name, header_value).into_bytes());
                     }
+                    // F-94: HTTP/3 広告（Alt-Svc）
+                    if let Some(g) = get_alt_svc_guard() {
+                        let mut line = Vec::with_capacity(16 + g.value().len());
+                        line.extend_from_slice(b"Alt-Svc: ");
+                        line.extend_from_slice(g.value());
+                        line.extend_from_slice(b"\r\n");
+                        new_header_lines.push(line);
+                    }
 
                     // WASMレスポンスヘッダーフィルタを適用
                     #[cfg(feature = "wasm")]
@@ -8330,6 +8362,8 @@ fn build_compressed_headers(
         new_headers.extend_from_slice(header_value.as_bytes());
         new_headers.extend_from_slice(b"\r\n");
     }
+    // F-94: HTTP/3 広告（Alt-Svc）
+    append_alt_svc_header_line(&mut new_headers);
 
     // ヘッダー終端
     new_headers.extend_from_slice(b"\r\n");
@@ -9333,6 +9367,14 @@ async fn transfer_https_response_with_compression(
                         new_header_lines
                             .push(format!("{}: {}\r\n", header_name, header_value).into_bytes());
                     }
+                    // F-94: HTTP/3 広告（Alt-Svc）
+                    if let Some(g) = get_alt_svc_guard() {
+                        let mut line = Vec::with_capacity(16 + g.value().len());
+                        line.extend_from_slice(b"Alt-Svc: ");
+                        line.extend_from_slice(g.value());
+                        line.extend_from_slice(b"\r\n");
+                        new_header_lines.push(line);
+                    }
 
                     // WASMレスポンスヘッダーフィルタを適用
                     #[cfg(feature = "wasm")]
@@ -10158,6 +10200,8 @@ async fn handle_sendfile(
         header_buf.extend_from_slice(header_value.as_bytes());
         header_buf.extend_from_slice(b"\r\n");
     }
+    // F-94: HTTP/3 広告（Alt-Svc）
+    append_alt_svc_header_line(&mut header_buf);
 
     // WASMレスポンスヘッダーフィルタを適用
     #[cfg(feature = "wasm")]

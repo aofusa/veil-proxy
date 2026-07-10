@@ -2838,6 +2838,17 @@ pub struct Http3ConfigSection {
     /// デフォルト: false
     #[serde(default)]
     pub gso_gro_enabled: bool,
+
+    /// Alt-Svc ヘッダー値の上書き（F-94）
+    ///
+    /// 未指定時はリッスンポートから `h3=":PORT"; ma=86400` を自動生成する。
+    /// 明示指定例: `h3=":443"; ma=86400, h3=":443"; ma=2592000`
+    #[serde(default)]
+    pub alt_svc: Option<String>,
+
+    /// Alt-Svc の max-age（秒）。`alt_svc` 未指定時の自動生成に使用。デフォルト: 86400
+    #[serde(default = "default_h3_alt_svc_ma")]
+    pub alt_svc_ma_secs: u64,
 }
 
 fn default_h3_max_idle_timeout() -> u64 {
@@ -2855,6 +2866,9 @@ fn default_h3_initial_max_stream_data() -> u64 {
 fn default_h3_max_streams() -> u64 {
     100
 }
+fn default_h3_alt_svc_ma() -> u64 {
+    86400
+}
 
 impl Default for Http3ConfigSection {
     fn default() -> Self {
@@ -2871,6 +2885,8 @@ impl Default for Http3ConfigSection {
             compression_enabled: false,
             compression: Http3CompressionConfig::default(),
             gso_gro_enabled: false,
+            alt_svc: None,
+            alt_svc_ma_secs: default_h3_alt_svc_ma(),
         }
     }
 }
@@ -2971,6 +2987,14 @@ pub struct ServerConfigSection {
     #[serde(default)]
     #[cfg_attr(not(feature = "http3"), allow(dead_code))]
     pub http3_enabled: bool,
+
+    /// HTTP/3 有効時に HTTP/1.1・HTTP/2 応答へ `Alt-Svc` ヘッダーを付与するか（F-94）
+    ///
+    /// デフォルト: `true`（`http3_enabled = true` のときのみ実際に広告される）
+    /// `false` にすると広告を抑制する。値の上書きは [http3].alt_svc を使用。
+    #[serde(default = "default_true")]
+    #[cfg_attr(not(feature = "http3"), allow(dead_code))]
+    pub alt_svc_enabled: bool,
 
     // ====================
     // H2C (HTTP/2 Cleartext) 設定
@@ -4449,6 +4473,37 @@ impl AsyncWriter for crate::simple_tls::SimpleTlsClientStream {
     }
 }
 
+/// HTTP/3 有効時に Alt-Svc 広告を初期化する（F-94、コールドパス）。
+///
+/// `server.http3_enabled && server.alt_svc_enabled` のとき、
+/// `[http3].alt_svc` 明示値、または listen ポートから自動生成した値を登録する。
+fn apply_alt_svc_from_config(config: &Config) {
+    #[cfg(feature = "http3")]
+    {
+        let enabled = config.server.http3_enabled && config.server.alt_svc_enabled;
+        let value = if enabled {
+            if let Some(ref explicit) = config.http3.alt_svc {
+                explicit.clone()
+            } else {
+                let listen = config
+                    .http3
+                    .listen
+                    .as_deref()
+                    .unwrap_or(config.server.listen.as_str());
+                crate::pool::build_alt_svc_value(listen, config.http3.alt_svc_ma_secs)
+            }
+        } else {
+            String::new()
+        };
+        crate::pool::init_alt_svc(enabled, &value);
+    }
+    #[cfg(not(feature = "http3"))]
+    {
+        let _ = config;
+        crate::pool::init_alt_svc(false, "");
+    }
+}
+
 fn validate_config(config: &Config) -> io::Result<()> {
     // TLS証明書ファイルの存在チェック
     let cert_path = Path::new(&config.tls.cert_path);
@@ -5125,6 +5180,9 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
         &config.server.server_header_value,
     );
 
+    // Alt-Svc（HTTP/3 広告、F-94）— リロードでも同期
+    apply_alt_svc_from_config(&config);
+
     // Upstream グループを構築（ロードバランシング用）
     let mut upstream_groups: HashMap<String, Arc<UpstreamGroup>> = HashMap::new();
     if let Some(upstreams) = &config.upstreams {
@@ -5291,6 +5349,9 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         config.server.server_header_enabled,
         &config.server.server_header_value,
     );
+
+    // Alt-Svc（HTTP/3 広告、F-94）
+    apply_alt_svc_from_config(&config);
 
     // バッファプール設定を初期化
     init_buffer_pool_config(config.buffer_pool.clone());
