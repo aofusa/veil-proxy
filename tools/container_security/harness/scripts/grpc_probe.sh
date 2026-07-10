@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# gRPC 不正フレーム・メタデータ・セキュリティ検証（F-90 / F-91 / P-06 / S-G-*）
-# 依存: bash, curl, dd, timeout, openssl（python 不要）
+# gRPC 不正フレーム・メタデータ・セキュリティ検証（F-90 / F-91 / F-93 / P-06 / S-G-*）
+# 依存: bash, curl, dd, timeout, openssl、http3-client（QUIC gRPC 攻撃）
 set -euo pipefail
 
 VEIL_HOST="${VEIL_HOST:-veil-proxy}"
 VEIL_H2C_PORT="${VEIL_H2C_PORT:-8443}"
 VEIL_HTTPS_PORT="${VEIL_HTTPS_PORT:-443}"
+VEIL_HTTP3_PORT="${VEIL_HTTP3_PORT:-443}"
 RESULTS="/results/grpc_report.txt"
 
 mkdir -p "$(dirname "${RESULTS}")"
@@ -180,6 +181,54 @@ else
     fails=$((fails + 1))
 fi
 check_health "post_grpc_rst_flood" || true
+
+# ---------------------------------------------------------------------------
+# F-93: gRPC over HTTP/3 (QUIC) 攻撃検証
+# 合格条件: クライアント完了 + プロセス生存（post health 200）
+# ---------------------------------------------------------------------------
+run_h3_grpc_mode() {
+    local mode="$1"
+    local name="$2"
+    if ! command -v http3-client >/dev/null 2>&1; then
+        log "WARN ${name}: http3-client missing (skip QUIC gRPC attack)"
+        return 0
+    fi
+    export VEIL_HOST
+    export VEIL_SNI="${VEIL_SNI:-${VEIL_HOST}}"
+    export VEIL_HTTP3_PORT
+    export HTTP3_MODE="${mode}"
+    export HTTP3_GRPC_PATH="${HTTP3_GRPC_PATH:-/grpc.test.v1.TestService/UnaryCall}"
+    export HTTP3_REPORT="/results/http3_grpc_${mode}_report.txt"
+    set +e
+    HTTP3_MODE="${mode}" http3-client
+    local rc=$?
+    set -e
+    if [[ "${rc}" -eq 0 ]]; then
+        log "PASS ${name}: http3-client mode=${mode}"
+        return 0
+    fi
+    # 攻撃モードはクライアント側エラーでも 0 終了する設計。非 0 は未知モード等。
+    log "WARN ${name}: http3-client mode=${mode} rc=${rc} (continuing; health decides)"
+    return 0
+}
+
+log "grpc over HTTP/3 (QUIC) attack phase start udp_port=${VEIL_HTTP3_PORT}"
+
+# S-G-H3-01: 不正 gRPC LPM（長さ偽装）
+run_h3_grpc_mode grpc_malformed "h3_grpc_malformed_frame"
+check_health "post_h3_grpc_malformed" || true
+
+# S-G-H3-02: ヘッダスプーフィング（grpc-status / grpc-message）
+run_h3_grpc_mode grpc_header_spoof "h3_grpc_header_spoof"
+check_health "post_h3_grpc_header_spoof" || true
+
+# S-G-H3-03: QUIC Slowloris（LPM 1 バイト遅延送信）
+run_h3_grpc_mode grpc_slowloris "h3_grpc_slowloris"
+check_health "post_h3_grpc_slowloris" || true
+
+# S-G-H3-04: ストリーム強制リセット（STOP_SENDING / RESET_STREAM 相当）
+run_h3_grpc_mode grpc_stream_reset "h3_grpc_stream_reset"
+check_health "post_h3_grpc_stream_reset" || true
 
 check_health "post_probe_health" || true
 

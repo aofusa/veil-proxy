@@ -78,6 +78,32 @@ pub struct Http3Response {
     pub body: Vec<u8>,
 }
 
+impl Http3Response {
+    /// ヘッダまたはトレーラーから `grpc-status` を取得（gRPC over H3 用）。
+    pub fn grpc_status(&self) -> Option<u32> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("grpc-status"))
+            .and_then(|(_, v)| v.parse().ok())
+    }
+
+    /// ヘッダまたはトレーラーから `grpc-message` を取得。
+    pub fn grpc_message(&self) -> Option<String> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("grpc-message"))
+            .map(|(_, v)| v.clone())
+    }
+
+    /// 指定名のヘッダ値を返す（大文字小文字無視）。
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
 /// HTTP/3リクエストを送信するヘルパー関数
 #[allow(dead_code)]
 pub async fn send_http3_request(
@@ -164,6 +190,114 @@ pub async fn send_http3_request_full(
         headers: resp_headers,
         body: body_data,
     })
+}
+
+/// HTTP/3 リクエストを複数 DATA チャンクで送信する（クライアントストリーミング / チャンクアップロード用）。
+///
+/// `chunks` を順に `send_data` し、チャンク間に任意の `inter_chunk_delay` を挟む。
+/// 終端は `finish()` で FIN を立てる。
+pub async fn send_http3_request_chunked(
+    send_request: &mut SendRequest<h3_quinn::OpenStreams, Bytes>,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    chunks: &[&[u8]],
+    inter_chunk_delay: Option<std::time::Duration>,
+) -> Result<Http3Response, Box<dyn std::error::Error + Send + Sync>> {
+    let uri = if path.starts_with("http://") || path.starts_with("https://") {
+        path.to_string()
+    } else {
+        format!("https://localhost{}", path)
+    };
+
+    let mut builder = Request::builder().method(method).uri(uri);
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let request = builder.body(())?;
+    let mut stream = send_request.send_request(request).await?;
+
+    for (i, chunk) in chunks.iter().enumerate() {
+        if !chunk.is_empty() {
+            stream
+                .send_data(Bytes::copy_from_slice(chunk))
+                .await
+                .map_err(|e| format!("send_data chunk {}: {}", i, e))?;
+        }
+        if let Some(d) = inter_chunk_delay {
+            if i + 1 < chunks.len() {
+                tokio::time::sleep(d).await;
+            }
+        }
+    }
+    stream.finish().await?;
+
+    let response = stream.recv_response().await?;
+    let status = response.status().as_u16();
+    let mut resp_headers = Vec::new();
+    for (name, value) in response.headers().iter() {
+        resp_headers.push((
+            name.as_str().to_string(),
+            String::from_utf8_lossy(value.as_bytes()).into_owned(),
+        ));
+    }
+
+    let mut body_data = Vec::new();
+    while let Some(chunk) = stream.recv_data().await? {
+        let mut remaining = chunk;
+        while remaining.has_remaining() {
+            let bytes = remaining.chunk();
+            body_data.extend_from_slice(bytes);
+            remaining.advance(bytes.len());
+        }
+    }
+
+    if let Ok(Some(trailers)) = stream.recv_trailers().await {
+        for (name, value) in trailers.iter() {
+            resp_headers.push((
+                name.as_str().to_string(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            ));
+        }
+    }
+
+    Ok(Http3Response {
+        status,
+        headers: resp_headers,
+        body: body_data,
+    })
+}
+
+/// リクエスト開始後にボディを途中まで送り、ストリームを drop して強制切断する（RST 相当）。
+/// プロキシ生存確認用。エラーは返さず完了のみ。
+pub async fn send_http3_and_reset(
+    send_request: &mut SendRequest<h3_quinn::OpenStreams, Bytes>,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    partial_body: Option<&[u8]>,
+) {
+    let uri = if path.starts_with("http://") || path.starts_with("https://") {
+        path.to_string()
+    } else {
+        format!("https://localhost{}", path)
+    };
+
+    let mut builder = Request::builder().method(method).uri(uri);
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let Ok(request) = builder.body(()) else {
+        return;
+    };
+    let Ok(mut stream) = send_request.send_request(request).await else {
+        return;
+    };
+    if let Some(body) = partial_body {
+        let _ = stream.send_data(Bytes::copy_from_slice(body)).await;
+    }
+    // finish せず drop → STOP_SENDING / RESET_STREAM 相当
+    drop(stream);
 }
 
 /// GETリクエストを送信するヘルパー関数

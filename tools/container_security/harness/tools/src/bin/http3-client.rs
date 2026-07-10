@@ -1,11 +1,13 @@
-//! QUIC/HTTP/3 クライアント（container_security P-03 / F-91 攻撃モード）。
+//! QUIC/HTTP/3 クライアント（container_security P-03 / F-91 / F-93 攻撃モード）。
 //!
 //! 環境変数:
 //! - VEIL_HOST / VEIL_SNI / VEIL_HTTP3_PORT (default 443)
 //! - HTTP3_PATH (default /)
 //! - HTTP3_MODE: get | handshake_flood | qpack_bomb | cid_spoof | malformed
 //!               | handshake_slowloris | amplification_check
+//!               | grpc_malformed | grpc_header_spoof | grpc_slowloris | grpc_stream_reset
 //! - HTTP3_REPORT
+//! - HTTP3_GRPC_PATH (default /grpc.test.v1.TestService/UnaryCall)
 //!
 //! 終了: 0 = モード成功（攻撃系は crash せず完了）、1 = 失敗
 
@@ -15,6 +17,8 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
+
+const DEFAULT_GRPC_PATH: &str = "/grpc.test.v1.TestService/UnaryCall";
 
 fn log_line(path: &str, msg: &str) {
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
@@ -45,6 +49,8 @@ fn main() {
         ),
     );
 
+    let grpc_path = env::var("HTTP3_GRPC_PATH").unwrap_or_else(|_| DEFAULT_GRPC_PATH.into());
+
     let result = match mode.as_str() {
         "get" | "" => send_http3_get(&host, port, &path).map(|n| format!("ok body_bytes={}", n)),
         "handshake_flood" => handshake_flood(&host, port, 200)
@@ -60,6 +66,15 @@ fn main() {
         // F-92: クライアント送信バイト vs サーバ応答バイトの増幅比を計測（3 倍ルール目安）
         "amplification_check" => amplification_check(&host, port)
             .map(|s| format!("amplification_check {}", s)),
+        // F-93: gRPC over HTTP/3 攻撃モード
+        "grpc_malformed" => grpc_malformed(&host, port, &grpc_path)
+            .map(|s| format!("grpc_malformed done detail={}", s)),
+        "grpc_header_spoof" => grpc_header_spoof(&host, port, &grpc_path)
+            .map(|s| format!("grpc_header_spoof done detail={}", s)),
+        "grpc_slowloris" => grpc_slowloris(&host, port, &grpc_path)
+            .map(|s| format!("grpc_slowloris done detail={}", s)),
+        "grpc_stream_reset" => grpc_stream_reset(&host, port, &grpc_path)
+            .map(|s| format!("grpc_stream_reset done detail={}", s)),
         other => Err(format!("unknown HTTP3_MODE={}", other).into()),
     };
 
@@ -418,11 +433,21 @@ fn amplification_check(host: &str, port: u16) -> Result<String, Box<dyn std::err
     ))
 }
 
-fn send_http3_get(host: &str, port: u16, path: &str) -> Result<usize, Box<dyn std::error::Error>> {
+/// quiche 接続 + H3 トランスポートの共通セットアップ。
+struct H3Session {
+    socket: UdpSocket,
+    peer_addr: SocketAddr,
+    conn: quiche::Connection,
+    h3: quiche::h3::Connection,
+    buf: [u8; 65535],
+    out: [u8; 1350],
+}
+
+fn make_config(idle_ms: u64) -> Result<quiche::Config, Box<dyn std::error::Error>> {
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
     config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
     config.verify_peer(false);
-    config.set_max_idle_timeout(30_000);
+    config.set_max_idle_timeout(idle_ms);
     config.set_max_recv_udp_payload_size(1350);
     config.set_max_send_udp_payload_size(1350);
     config.set_initial_max_data(10_000_000);
@@ -432,31 +457,30 @@ fn send_http3_get(host: &str, port: u16, path: &str) -> Result<usize, Box<dyn st
     config.set_initial_max_streams_bidi(100);
     config.set_initial_max_streams_uni(100);
     config.set_disable_active_migration(true);
+    Ok(config)
+}
 
-    let local_addr: SocketAddr = "0.0.0.0:0".parse()?;
-    let socket = UdpSocket::bind(local_addr)?;
+fn establish_h3(host: &str, port: u16, idle_ms: u64) -> Result<H3Session, Box<dyn std::error::Error>> {
+    let mut config = make_config(idle_ms)?;
+    let peer_addr = resolve(host, port)?;
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
     socket.set_read_timeout(Some(Duration::from_millis(500)))?;
     socket.set_write_timeout(Some(Duration::from_secs(5)))?;
-
-    let peer_addr = resolve(host, port)?;
     socket.connect(peer_addr)?;
 
     let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
     getrandom::getrandom(&mut scid).map_err(|_| "random scid failed")?;
     let scid = quiche::ConnectionId::from_ref(&scid);
-
     let mut conn =
         quiche::connect(Some(host), &scid, socket.local_addr()?, peer_addr, &mut config)?;
 
     let mut buf = [0u8; 65535];
     let mut out = [0u8; 1350];
-
     let (write, _) = conn.send(&mut out)?;
     socket.send(&out[..write])?;
 
     let start = Instant::now();
     let timeout = Duration::from_secs(15);
-
     while !conn.is_established() {
         if start.elapsed() > timeout {
             return Err("QUIC handshake timeout".into());
@@ -469,8 +493,9 @@ fn send_http3_get(host: &str, port: u16, path: &str) -> Result<usize, Box<dyn st
                 };
                 conn.recv(&mut buf[..len], recv_info)?;
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
             Err(e) => return Err(Box::new(e)),
         }
         while let Ok((write, _)) = conn.send(&mut out) {
@@ -478,8 +503,9 @@ fn send_http3_get(host: &str, port: u16, path: &str) -> Result<usize, Box<dyn st
         }
     }
 
+    // settle
     let settle_start = Instant::now();
-    while settle_start.elapsed() < Duration::from_millis(500) {
+    while settle_start.elapsed() < Duration::from_millis(300) {
         while let Ok((write, _)) = conn.send(&mut out) {
             socket.send(&out[..write])?;
         }
@@ -491,16 +517,246 @@ fn send_http3_get(host: &str, port: u16, path: &str) -> Result<usize, Box<dyn st
                 };
                 let _ = conn.recv(&mut buf[..len], recv_info);
             }
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(e) => return Err(Box::new(e)),
+            Err(_) => {}
         }
     }
 
     let h3_config = quiche::h3::Config::new()?;
-    let mut h3_conn = quiche::h3::Connection::with_transport(&mut conn, &h3_config)?;
+    let h3 = quiche::h3::Connection::with_transport(&mut conn, &h3_config)?;
+    Ok(H3Session {
+        socket,
+        peer_addr,
+        conn,
+        h3,
+        buf,
+        out,
+    })
+}
 
+fn pump_io(session: &mut H3Session) {
+    while let Ok((write, _)) = session.conn.send(&mut session.out) {
+        let _ = session.socket.send(&session.out[..write]);
+    }
+    match session.socket.recv(&mut session.buf) {
+        Ok(len) => {
+            let recv_info = quiche::RecvInfo {
+                from: session.peer_addr,
+                to: session.socket.local_addr().unwrap_or(session.peer_addr),
+            };
+            let _ = session.conn.recv(&mut session.buf[..len], recv_info);
+        }
+        Err(_) => {}
+    }
+}
+
+fn drain_events(session: &mut H3Session) -> (Option<u16>, bool) {
+    let mut status = None;
+    let mut finished = false;
+    loop {
+        match session.h3.poll(&mut session.conn) {
+            Ok((_id, quiche::h3::Event::Headers { list, .. })) => {
+                for h in &list {
+                    if h.name() == b":status" {
+                        status = std::str::from_utf8(h.value())
+                            .ok()
+                            .and_then(|s| s.parse().ok());
+                    }
+                }
+            }
+            Ok((id, quiche::h3::Event::Data)) => {
+                while let Ok(_n) = session.h3.recv_body(&mut session.conn, id, &mut session.buf) {}
+            }
+            Ok((_id, quiche::h3::Event::Finished)) => {
+                finished = true;
+            }
+            Ok((_id, quiche::h3::Event::Reset(_))) => {
+                finished = true;
+            }
+            Ok(_) => {}
+            Err(quiche::h3::Error::Done) => break,
+            Err(_) => {
+                finished = true;
+                break;
+            }
+        }
+    }
+    (status, finished)
+}
+
+fn grpc_base_headers(host: &str, path: &str) -> Vec<quiche::h3::Header> {
+    vec![
+        quiche::h3::Header::new(b":method", b"POST"),
+        quiche::h3::Header::new(b":path", path.as_bytes()),
+        quiche::h3::Header::new(b":authority", host.as_bytes()),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b"content-type", b"application/grpc"),
+        quiche::h3::Header::new(b"te", b"trailers"),
+    ]
+}
+
+/// F-93: 不正 LPM（長さ偽装）を HTTP/3 で送りクラッシュしないこと。
+fn grpc_malformed(
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut session = establish_h3(host, port, 15_000)?;
+    let headers = grpc_base_headers(host, path);
+    // flags=0 + length=0x00080000 (512KiB) + 短いボディ（宣言と不一致）
+    let mut body = vec![0u8, 0x00, 0x08, 0x00, 0x00];
+    body.extend_from_slice(b"BAD");
+
+    let stream_id = session.h3.send_request(&mut session.conn, &headers, false)?;
+    session
+        .h3
+        .send_body(&mut session.conn, stream_id, &body, true)?;
+    pump_io(&mut session);
+
+    let start = Instant::now();
+    let mut last_status = None;
+    while start.elapsed() < Duration::from_secs(8) {
+        pump_io(&mut session);
+        let (st, fin) = drain_events(&mut session);
+        if st.is_some() {
+            last_status = st;
+        }
+        if fin || session.conn.is_closed() {
+            break;
+        }
+    }
+    Ok(format!("status={:?} closed={}", last_status, session.conn.is_closed()))
+}
+
+/// F-93: クライアントから grpc-status / grpc-message をスプーフィング。
+fn grpc_header_spoof(
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut session = establish_h3(host, port, 15_000)?;
+    let mut headers = grpc_base_headers(host, path);
+    headers.push(quiche::h3::Header::new(b"grpc-status", b"0"));
+    headers.push(quiche::h3::Header::new(b"grpc-message", b"spoofed"));
+
+    // 最小 LPM: flags=0 length=2 body={}
+    let body = [0u8, 0, 0, 0, 2, b'{', b'}'];
+    let stream_id = session.h3.send_request(&mut session.conn, &headers, false)?;
+    session
+        .h3
+        .send_body(&mut session.conn, stream_id, &body, true)?;
+    pump_io(&mut session);
+
+    let start = Instant::now();
+    let mut last_status = None;
+    while start.elapsed() < Duration::from_secs(8) {
+        pump_io(&mut session);
+        let (st, fin) = drain_events(&mut session);
+        if st.is_some() {
+            last_status = st;
+        }
+        if fin || session.conn.is_closed() {
+            break;
+        }
+    }
+    Ok(format!("status={:?}", last_status))
+}
+
+/// F-93: gRPC LPM を 1 バイトずつ極端に遅く送信（QUIC Slowloris）。
+fn grpc_slowloris(
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut session = establish_h3(host, port, 30_000)?;
+    let headers = grpc_base_headers(host, path);
+    // LPM: flags=0 length=16 + 16 バイトペイロード
+    let mut body = vec![0u8, 0, 0, 0, 16];
+    body.extend_from_slice(b"AAAAAAAAAAAAAAAA");
+
+    let stream_id = session.h3.send_request(&mut session.conn, &headers, false)?;
+    pump_io(&mut session);
+
+    // 1 バイトずつ ~150ms 間隔で送信（全体 ~3s）
+    let mut sent = 0usize;
+    for (i, byte) in body.iter().enumerate() {
+        let fin = i + 1 == body.len();
+        match session
+            .h3
+            .send_body(&mut session.conn, stream_id, &[*byte], fin)
+        {
+            Ok(n) => sent += n,
+            Err(e) => {
+                return Ok(format!("send_stopped early err={} sent={}", e, sent));
+            }
+        }
+        pump_io(&mut session);
+        let _ = drain_events(&mut session);
+        if session.conn.is_closed() {
+            return Ok(format!("conn_closed mid_slowloris sent={}", sent));
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+
+    let start = Instant::now();
+    let mut last_status = None;
+    while start.elapsed() < Duration::from_secs(5) {
+        pump_io(&mut session);
+        let (st, fin) = drain_events(&mut session);
+        if st.is_some() {
+            last_status = st;
+        }
+        if fin || session.conn.is_closed() {
+            break;
+        }
+    }
+    Ok(format!("sent={} status={:?}", sent, last_status))
+}
+
+/// F-93: gRPC 通信途中にストリームを RESET（STOP_SENDING / RESET_STREAM 相当）。
+fn grpc_stream_reset(
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut session = establish_h3(host, port, 15_000)?;
+    let headers = grpc_base_headers(host, path);
+    // 不完全 LPM（length=32 を宣言し 3 バイトだけ送る）
+    let partial = [0u8, 0, 0, 0, 32, b'A', b'B', b'C'];
+    let stream_id = session.h3.send_request(&mut session.conn, &headers, false)?;
+    session
+        .h3
+        .send_body(&mut session.conn, stream_id, &partial, false)?;
+    pump_io(&mut session);
+    let _ = drain_events(&mut session);
+
+    // ストリームをリセット
+    let _ = session
+        .conn
+        .stream_shutdown(stream_id, quiche::Shutdown::Write, 0);
+    let _ = session
+        .conn
+        .stream_shutdown(stream_id, quiche::Shutdown::Read, 0);
+    pump_io(&mut session);
+
+    // 少し待ってから生存用に何もしない（health はプローブ側）
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(2) {
+        pump_io(&mut session);
+        let _ = drain_events(&mut session);
+        if session.conn.is_closed() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(format!(
+        "reset stream_id={} closed={}",
+        stream_id,
+        session.conn.is_closed()
+    ))
+}
+
+fn send_http3_get(host: &str, port: u16, path: &str) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut session = establish_h3(host, port, 30_000)?;
     let headers = vec![
         quiche::h3::Header::new(b":method", b"GET"),
         quiche::h3::Header::new(b":path", path.as_bytes()),
@@ -508,29 +764,28 @@ fn send_http3_get(host: &str, port: u16, path: &str) -> Result<usize, Box<dyn st
         quiche::h3::Header::new(b":scheme", b"https"),
     ];
 
-    let stream_id = h3_conn.send_request(&mut conn, &headers, true)?;
-    while let Ok((write, _)) = conn.send(&mut out) {
-        socket.send(&out[..write])?;
-    }
+    let stream_id = session.h3.send_request(&mut session.conn, &headers, true)?;
+    pump_io(&mut session);
 
     let mut response_size = 0usize;
     let mut status: Option<u16> = None;
     let start = Instant::now();
+    let timeout = Duration::from_secs(15);
 
     while start.elapsed() < timeout {
-        match socket.recv(&mut buf) {
+        match session.socket.recv(&mut session.buf) {
             Ok(len) => {
                 let recv_info = quiche::RecvInfo {
-                    from: peer_addr,
-                    to: socket.local_addr()?,
+                    from: session.peer_addr,
+                    to: session.socket.local_addr()?,
                 };
-                conn.recv(&mut buf[..len], recv_info)?;
+                session.conn.recv(&mut session.buf[..len], recv_info)?;
             }
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
-                if conn.is_closed() {
+                if session.conn.is_closed() {
                     break;
                 }
             }
@@ -538,7 +793,7 @@ fn send_http3_get(host: &str, port: u16, path: &str) -> Result<usize, Box<dyn st
         }
 
         loop {
-            match h3_conn.poll(&mut conn) {
+            match session.h3.poll(&mut session.conn) {
                 Ok((id, quiche::h3::Event::Headers { list, .. })) if id == stream_id => {
                     for h in &list {
                         if h.name() == b":status" {
@@ -550,7 +805,9 @@ fn send_http3_get(host: &str, port: u16, path: &str) -> Result<usize, Box<dyn st
                     }
                 }
                 Ok((id, quiche::h3::Event::Data)) if id == stream_id => {
-                    while let Ok(read) = h3_conn.recv_body(&mut conn, id, &mut buf) {
+                    while let Ok(read) =
+                        session.h3.recv_body(&mut session.conn, id, &mut session.buf)
+                    {
                         response_size += read;
                     }
                     if matches!(status, Some(200) | Some(301) | Some(302)) && response_size > 0 {
@@ -568,10 +825,10 @@ fn send_http3_get(host: &str, port: u16, path: &str) -> Result<usize, Box<dyn st
             }
         }
 
-        while let Ok((write, _)) = conn.send(&mut out) {
-            socket.send(&out[..write])?;
+        while let Ok((write, _)) = session.conn.send(&mut session.out) {
+            session.socket.send(&session.out[..write])?;
         }
-        if conn.is_closed() {
+        if session.conn.is_closed() {
             break;
         }
     }

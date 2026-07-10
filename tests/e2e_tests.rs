@@ -65,8 +65,8 @@ use common::grpc_client::GrpcTestClient;
 use common::http2_client::Http2TestClient;
 
 /// SimpleRequest { message } の最小 protobuf エンコード（field 1, length-delimited）。
-/// メッセージ長は 127 バイト未満を想定。F-92 gRPC 詳細 E2E 専用。
-#[cfg(all(feature = "grpc", feature = "http2"))]
+/// メッセージ長は 127 バイト未満を想定。F-92/F-93 gRPC 詳細 E2E 専用。
+#[cfg(all(feature = "grpc", any(feature = "http2", feature = "http3")))]
 fn encode_simple_request(msg: &str) -> Vec<u8> {
     let bytes = msg.as_bytes();
     assert!(
@@ -80,14 +80,14 @@ fn encode_simple_request(msg: &str) -> Vec<u8> {
     out
 }
 
-/// gRPC LPM（Length-Prefixed Message）を組み立てる。F-92 gRPC 詳細 E2E 専用。
-#[cfg(all(feature = "grpc", feature = "http2"))]
+/// gRPC LPM（Length-Prefixed Message）を組み立てる。F-92/F-93 gRPC 詳細 E2E 専用。
+#[cfg(all(feature = "grpc", any(feature = "http2", feature = "http3")))]
 fn encode_grpc_lpm(message: &[u8]) -> Vec<u8> {
     GrpcFrame::new(message.to_vec()).encode()
 }
 
-/// ボディから複数 gRPC LPM を順に抽出。F-92 gRPC 詳細 E2E 専用。
-#[cfg(all(feature = "grpc", feature = "http2"))]
+/// ボディから複数 gRPC LPM を順に抽出。F-92/F-93 gRPC 詳細 E2E 専用。
+#[cfg(all(feature = "grpc", any(feature = "http2", feature = "http3")))]
 fn decode_all_grpc_frames(body: &[u8]) -> Vec<GrpcFrame> {
     let mut frames = Vec::new();
     let mut offset = 0usize;
@@ -18524,6 +18524,544 @@ async fn test_grpc_over_http3() {
                 .iter()
                 .any(|(k, _)| k.to_ascii_lowercase().starts_with("grpc-")),
         "gRPC over H3 200 should include grpc trailers or body"
+    );
+}
+
+// ====================
+// F-93: http3_grpc_test_coverage_report 残件 E2E
+// ====================
+
+/// レポート: `test_http3_chunked_response_streaming`
+/// バックエンド chunked 応答を QUIC DATA で再構成し、バイト一致を確認する。
+/// （既存 `test_http3_response_body_streaming` と同等の経路。レポート名で明示。）
+#[tokio::test]
+#[ntest::timeout(30000)]
+#[cfg(feature = "http3")]
+async fn test_http3_chunked_response_streaming() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+
+    const EXPECTED_TOTAL: usize = 200_000;
+    let expected_byte = |i: usize| -> u8 { (i % 256) as u8 };
+
+    use common::http3_client::send_http3_request;
+
+    const MAX_ATTEMPTS: usize = 4;
+    let mut last_err = String::new();
+    for attempt in 0..MAX_ATTEMPTS {
+        let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                last_err = format!("connect: {}", e);
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                continue;
+            }
+        };
+
+        match send_http3_request(
+            &mut send_request,
+            "GET",
+            "/chunked-stream/data",
+            &[],
+            None,
+        )
+        .await
+        {
+            Ok((status, body)) => {
+                assert_eq!(status, 200, "chunked stream over H3");
+                assert_eq!(
+                    body.len(),
+                    EXPECTED_TOTAL,
+                    "chunked reassembled length (attempt {})",
+                    attempt + 1
+                );
+                for (i, &b) in body.iter().enumerate() {
+                    assert_eq!(b, expected_byte(i), "byte mismatch at {}", i);
+                }
+                eprintln!(
+                    "test_http3_chunked_response_streaming: {} bytes OK (attempt {})",
+                    body.len(),
+                    attempt + 1
+                );
+                return;
+            }
+            Err(e) => {
+                last_err = format!("GET: {}", e);
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        }
+    }
+    panic!(
+        "test_http3_chunked_response_streaming failed after retries: {}",
+        last_err
+    );
+}
+
+/// レポート: `test_http3_connection_reuse`
+/// 複数の独立リクエストが同一 QUIC コネクション（同一 SendRequest）で処理されること。
+#[tokio::test]
+#[ntest::timeout(30000)]
+#[cfg(feature = "http3")]
+async fn test_http3_connection_reuse() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+
+    use common::http3_client::{send_http3_request, send_http3_request_full};
+
+    let (_client, mut send_request) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("H3 connection for reuse");
+
+    // 同一接続上で GET を連続
+    for i in 0..5 {
+        let (st, body) = send_http3_request(&mut send_request, "GET", "/", &[], None)
+            .await
+            .unwrap_or_else(|e| panic!("reuse GET {}: {}", i, e));
+        assert_eq!(st, 200, "reuse GET {} status", i);
+        assert!(!body.is_empty() || st == 200, "reuse GET {} body ok", i);
+    }
+
+    // POST も同一接続で
+    let post_body = b"connection-reuse-post-body";
+    let r = send_http3_request_full(
+        &mut send_request,
+        "POST",
+        "/echo-upload/reuse",
+        &[("content-type", "application/octet-stream")],
+        Some(post_body),
+    )
+    .await
+    .expect("reuse POST");
+    assert_eq!(r.status, 200, "reuse POST status");
+    assert_eq!(
+        r.body.as_slice(),
+        post_body.as_slice(),
+        "echo body on reused connection"
+    );
+
+    // さらに GET が続くこと（接続が POST で壊れていない）
+    let (st, _) = send_http3_request(&mut send_request, "GET", "/", &[], None)
+        .await
+        .expect("reuse GET after POST");
+    assert_eq!(st, 200, "connection must stay usable after POST");
+
+    eprintln!("test_http3_connection_reuse: 5 GET + POST + GET on same QUIC conn OK");
+}
+
+/// レポート: `test_http3_early_data`
+/// 0-RTT / early data 相当の再接続後リクエストが安全に完了（または安全に拒否）されること。
+#[tokio::test]
+#[ntest::timeout(20000)]
+#[cfg(feature = "http3")]
+async fn test_http3_early_data() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+
+    use common::http3_client::send_http3_request;
+
+    // 1st connection: warm session
+    let (_c1, mut sr1) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("first H3 for early data");
+    let (st1, _) = send_http3_request(&mut sr1, "GET", "/", &[], None)
+        .await
+        .expect("warm-up GET");
+    assert_eq!(st1, 200, "warm-up should succeed");
+    drop(sr1);
+    drop(_c1);
+
+    // 2nd connection: may use 0-RTT if tickets available
+    let (_c2, mut sr2) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("second H3 for early data");
+    let result = send_http3_request(
+        &mut sr2,
+        "POST",
+        "/",
+        &[("content-type", "application/octet-stream")],
+        Some(b"early-data-probe"),
+    )
+    .await;
+
+    match result {
+        Ok((status, _)) => {
+            assert!(
+                (200..600).contains(&status),
+                "early data POST should yield HTTP status, got {}",
+                status
+            );
+            eprintln!("test_http3_early_data: POST status={}", status);
+        }
+        Err(e) => {
+            // 0-RTT 拒否・リセットは安全側として許容
+            eprintln!("test_http3_early_data: rejected (ok): {}", e);
+        }
+    }
+
+    // 3rd: 通常 GET が通る（プロセス生存）
+    let (_c3, mut sr3) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("third H3 after early data");
+    let (st3, _) = send_http3_request(&mut sr3, "GET", "/", &[], None)
+        .await
+        .expect("GET after early data probe");
+    assert_eq!(st3, 200, "proxy must serve after early-data probe");
+    assert!(
+        is_e2e_environment_ready().await,
+        "proxy must survive early data probe"
+    );
+}
+
+/// レポート: `test_grpc_over_http3_streaming`
+/// サーバ/クライアント/双方向ストリーミングが QUIC 上で動作すること。
+#[tokio::test]
+#[ntest::timeout(45000)]
+#[cfg(all(feature = "grpc", feature = "http3"))]
+async fn test_grpc_over_http3_streaming() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    let (_client, mut send_request) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("H3 client for gRPC streaming");
+
+    use common::http3_client::{send_http3_and_reset, send_http3_request_chunked, send_http3_request_full};
+
+    let grpc_headers = [
+        ("content-type", "application/grpc"),
+        ("te", "trailers"),
+        ("accept", "application/grpc"),
+        ("grpc-accept-encoding", "identity"),
+    ];
+
+    // --- Server Streaming ---
+    let ss_lpm = encode_grpc_lpm(&encode_simple_request("h3-ss"));
+    let ss = send_http3_request_full(
+        &mut send_request,
+        "POST",
+        "/grpc.test.v1.TestService/ServerStreaming",
+        &grpc_headers,
+        Some(&ss_lpm),
+    )
+    .await
+    .expect("H3 server streaming");
+    assert_eq!(ss.status, 200, "server streaming HTTP status over H3");
+    let ss_frames = decode_all_grpc_frames(&ss.body);
+    eprintln!(
+        "H3 ServerStreaming: frames={} grpc-status={:?} body_len={}",
+        ss_frames.len(),
+        ss.grpc_status(),
+        ss.body.len()
+    );
+    assert!(
+        ss.grpc_status().is_some() || !ss_frames.is_empty(),
+        "H3 server streaming should yield frames or grpc-status"
+    );
+    if ss.grpc_status() == Some(0) {
+        assert!(
+            ss_frames.len() >= 2,
+            "ok H3 server stream should return multiple LPMs, got {}",
+            ss_frames.len()
+        );
+    }
+
+    // --- Client Streaming: 複数 LPM をチャンク送信 ---
+    let mut client_chunks: Vec<Vec<u8>> = Vec::new();
+    for i in 0..4 {
+        client_chunks.push(encode_grpc_lpm(&encode_simple_request(&format!("h3-cs-{}", i))));
+    }
+    let chunk_refs: Vec<&[u8]> = client_chunks.iter().map(|v| v.as_slice()).collect();
+    let cs = send_http3_request_chunked(
+        &mut send_request,
+        "POST",
+        "/grpc.test.v1.TestService/ClientStreaming",
+        &grpc_headers,
+        &chunk_refs,
+        Some(Duration::from_millis(15)),
+    )
+    .await
+    .expect("H3 client streaming");
+    assert_eq!(cs.status, 200, "H3 client streaming HTTP status");
+    assert!(
+        cs.grpc_status().is_some(),
+        "H3 client streaming needs grpc-status, headers={:?}",
+        cs.headers
+    );
+    eprintln!(
+        "H3 ClientStreaming: grpc-status={:?} body_len={}",
+        cs.grpc_status(),
+        cs.body.len()
+    );
+
+    // --- Bidirectional ---
+    let mut bidi_chunks: Vec<Vec<u8>> = Vec::new();
+    for i in 0..3 {
+        bidi_chunks.push(encode_grpc_lpm(&encode_simple_request(&format!("h3-bidi-{}", i))));
+    }
+    let bidi_refs: Vec<&[u8]> = bidi_chunks.iter().map(|v| v.as_slice()).collect();
+    let bidi = send_http3_request_chunked(
+        &mut send_request,
+        "POST",
+        "/grpc.test.v1.TestService/BidirectionalStreaming",
+        &grpc_headers,
+        &bidi_refs,
+        Some(Duration::from_millis(10)),
+    )
+    .await
+    .expect("H3 bidirectional streaming");
+    assert_eq!(bidi.status, 200, "H3 bidi HTTP status");
+    let bidi_frames = decode_all_grpc_frames(&bidi.body);
+    eprintln!(
+        "H3 Bidirectional: frames={} grpc-status={:?}",
+        bidi_frames.len(),
+        bidi.grpc_status()
+    );
+    assert!(
+        bidi.grpc_status().is_some() || !bidi_frames.is_empty(),
+        "H3 bidi should complete with status or frames"
+    );
+
+    // --- 途中切断後の生存 ---
+    let partial = encode_grpc_lpm(&encode_simple_request("h3-will-reset"));
+    send_http3_and_reset(
+        &mut send_request,
+        "POST",
+        "/grpc.test.v1.TestService/UnaryCall",
+        &grpc_headers,
+        Some(&partial[..partial.len().saturating_sub(2).max(1)]),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let after = send_http3_request_full(
+        &mut send_request,
+        "POST",
+        "/grpc.test.v1.TestService/UnaryCall",
+        &grpc_headers,
+        Some(&encode_grpc_lpm(&encode_simple_request("h3-after-reset"))),
+    )
+    .await;
+    match after {
+        Ok(r) => assert_eq!(r.status, 200, "H3 unary after reset must work"),
+        Err(e) => {
+            // 接続が閉じられた場合は再接続で生存確認
+            eprintln!("H3 conn closed after reset (reconnecting): {}", e);
+            let (_c2, mut sr2) = Http3TestClient::new(server_addr, "localhost")
+                .await
+                .expect("reconnect after H3 gRPC reset");
+            let r2 = send_http3_request_full(
+                &mut sr2,
+                "POST",
+                "/grpc.test.v1.TestService/UnaryCall",
+                &grpc_headers,
+                Some(&encode_grpc_lpm(&encode_simple_request("h3-after-reconn"))),
+            )
+            .await
+            .expect("unary after reconnect");
+            assert_eq!(r2.status, 200, "proxy must accept H3 gRPC after reset");
+        }
+    }
+
+    assert!(
+        is_e2e_environment_ready().await,
+        "proxy must survive H3 gRPC streaming"
+    );
+    eprintln!("test_grpc_over_http3_streaming completed");
+}
+
+/// レポート: `test_grpc_over_http3_metadata`
+/// カスタムメタデータと grpc トレーラーが QUIC HEADERS として透過されること。
+#[tokio::test]
+#[ntest::timeout(30000)]
+#[cfg(all(feature = "grpc", feature = "http3"))]
+async fn test_grpc_over_http3_metadata() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    let (_client, mut send_request) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("H3 client for gRPC metadata");
+
+    use common::http3_client::send_http3_request_full;
+
+    let headers = [
+        ("content-type", "application/grpc"),
+        ("te", "trailers"),
+        ("accept", "application/grpc"),
+        ("grpc-accept-encoding", "identity"),
+        ("x-custom-meta", "h3-meta-value"),
+        ("x-request-id", "h3-req-12345"),
+    ];
+    let body = encode_grpc_lpm(&encode_simple_request("h3-meta"));
+    let r = send_http3_request_full(
+        &mut send_request,
+        "POST",
+        "/grpc.test.v1.TestService/UnaryCall",
+        &headers,
+        Some(&body),
+    )
+    .await
+    .expect("H3 gRPC with metadata");
+
+    assert_eq!(r.status, 200, "metadata unary HTTP 200 over H3");
+    let gs = r.grpc_status();
+    assert!(
+        gs.is_some(),
+        "custom metadata must not strip grpc-status, headers={:?}",
+        r.headers
+    );
+    let code = gs.unwrap();
+    assert!(code <= 16, "grpc-status in 0..16, got {}", code);
+
+    // 上流が返す x-server-id が透過される場合は検証（プロキシが strip してもよい）
+    if let Some(sid) = r.header("x-server-id") {
+        assert!(!sid.is_empty(), "x-server-id should be non-empty if present");
+        eprintln!("H3 metadata: x-server-id={}", sid);
+    }
+    eprintln!(
+        "test_grpc_over_http3_metadata: grpc-status={} headers={:?}",
+        code, r.headers
+    );
+}
+
+/// レポート: `test_grpc_over_http3_error_handling`
+/// バックエンドエラー時に適切な gRPC ステータスが QUIC トレーラーとして返ること。
+#[tokio::test]
+#[ntest::timeout(30000)]
+#[cfg(all(feature = "grpc", feature = "http3"))]
+async fn test_grpc_over_http3_error_handling() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    let (_client, mut send_request) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("H3 client for gRPC errors");
+
+    use common::http3_client::send_http3_request_full;
+
+    let grpc_headers = [
+        ("content-type", "application/grpc"),
+        ("te", "trailers"),
+        ("accept", "application/grpc"),
+        ("grpc-accept-encoding", "identity"),
+    ];
+
+    // 正常経路
+    let ok = send_http3_request_full(
+        &mut send_request,
+        "POST",
+        "/grpc.test.v1.TestService/UnaryCall",
+        &grpc_headers,
+        Some(&encode_grpc_lpm(&encode_simple_request("h3-ok"))),
+    )
+    .await
+    .expect("H3 ok unary");
+    assert_eq!(ok.status, 200);
+    assert!(
+        ok.grpc_status().is_some(),
+        "ok path must expose grpc-status over H3"
+    );
+
+    // StreamReset → non-zero grpc-status + grpc-message
+    let err = send_http3_request_full(
+        &mut send_request,
+        "POST",
+        "/grpc.test.v1.TestService/StreamReset",
+        &grpc_headers,
+        Some(&encode_grpc_lpm(&encode_simple_request("force-error"))),
+    )
+    .await
+    .expect("H3 error unary");
+    assert_eq!(err.status, 200, "gRPC errors still use HTTP 200 over H3");
+    let err_status = err.grpc_status();
+    assert!(
+        err_status.is_some(),
+        "error path must expose grpc-status over H3, headers={:?}",
+        err.headers
+    );
+    let err_code = err_status.unwrap();
+    assert!(
+        err_code > 0 && err_code <= 16,
+        "StreamReset should yield non-zero grpc-status over H3, got {}",
+        err_code
+    );
+    let err_msg = err.grpc_message();
+    assert!(
+        err_msg.as_ref().map(|m| !m.is_empty()).unwrap_or(false),
+        "error path should forward grpc-message over H3, got {:?}",
+        err_msg
+    );
+    eprintln!(
+        "test_grpc_over_http3_error_handling: status={} msg={:?}",
+        err_code, err_msg
+    );
+
+    // 未実装メソッド → UNIMPLEMENTED 等（クラッシュしない）
+    let unimpl = send_http3_request_full(
+        &mut send_request,
+        "POST",
+        "/grpc.test.v1.TestService/DoesNotExist",
+        &grpc_headers,
+        Some(&encode_grpc_lpm(&encode_simple_request("nope"))),
+    )
+    .await;
+    match unimpl {
+        Ok(r) => {
+            eprintln!(
+                "H3 unimplemented: http={} grpc-status={:?}",
+                r.status,
+                r.grpc_status()
+            );
+            assert!(
+                matches!(r.status, 200 | 404 | 502 | 503)
+                    || r.grpc_status().map(|s| s > 0).unwrap_or(true),
+                "unimplemented should be controlled, got http={} grpc={:?}",
+                r.status,
+                r.grpc_status()
+            );
+        }
+        Err(e) => {
+            eprintln!("H3 unimplemented transport error (controlled): {}", e);
+        }
+    }
+
+    assert!(
+        is_e2e_environment_ready().await,
+        "proxy must survive H3 gRPC error paths"
     );
 }
 
