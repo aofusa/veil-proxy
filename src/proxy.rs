@@ -4984,9 +4984,9 @@ async fn handle_backend(
             // F-94: HTTP/3 広告（Alt-Svc）
             append_alt_svc_header_line(&mut header);
 
-            // WASMレスポンスヘッダーフィルタを適用
+            // WASMレスポンスヘッダーフィルタを適用（後段で Connection ヘッダーを追記するため mut）
             #[cfg(feature = "wasm")]
-            let header = {
+            let mut header = {
                 ftlog::debug!(
                     "[WASM Response] MemoryFile: wasm_modules count = {}",
                     wasm_modules.len()
@@ -5059,8 +5059,7 @@ async fn handle_backend(
                 }
             };
 
-            // Connection header を追加（headerをmutableにする）
-            let mut header = header;
+            // Connection header を追加（header は上で `let mut` 済み）
             if client_wants_close {
                 header.extend_from_slice(b"Connection: close\r\n\r\n");
             } else {
@@ -6654,7 +6653,7 @@ async fn proxy_http_pooled(
     #[cfg(not(feature = "ktls"))]
     let result = if buffering_enabled && !compression_enabled {
         // バッファリング有効時（圧縮無効の場合のみ）
-        record_buffering_used(&host_str_for_metrics);
+        record_buffering_used(host_str_for_metrics);
         proxy_request_buffered(
             &mut client_stream,
             &mut backend_stream,
@@ -10299,9 +10298,9 @@ async fn handle_sendfile(
     // F-94: HTTP/3 広告（Alt-Svc）
     append_alt_svc_header_line(&mut header_buf);
 
-    // WASMレスポンスヘッダーフィルタを適用
+    // WASMレスポンスヘッダーフィルタを適用（後段で Connection ヘッダーを追記するため mut）
     #[cfg(feature = "wasm")]
-    let header_buf = {
+    let mut header_buf = {
         ftlog::info!(
             "[WASM Response] SendFile: wasm_modules count = {}",
             wasm_modules.len()
@@ -10373,8 +10372,7 @@ async fn handle_sendfile(
         }
     };
 
-    // Connection ヘッダーを追加（headerをmutableにする）
-    let mut header_buf = header_buf;
+    // Connection ヘッダーを追加（header_buf は上で `let mut` 済み）
     if client_wants_close {
         header_buf.extend_from_slice(b"Connection: close\r\n\r\n");
     } else {

@@ -245,6 +245,9 @@ async fn fetch_file_info_uncached(path: &std::path::Path) -> Option<CachedFileIn
     let path = path.to_path_buf();
     crate::runtime::offload::offload(move || {
         let canonical = path.canonicalize().ok()?;
+        // 理由付き allow: offload の専用ワーカースレッド内であり、イベントループを
+        // ブロックしない（AGENTS.md がホットパス外の正当な同期 FS 利用として許可）。
+        #[allow(clippy::disallowed_methods)]
         let metadata = std::fs::metadata(&canonical).ok()?;
         let mime_type = mime_guess::from_path(&canonical)
             .first_or_octet_stream()

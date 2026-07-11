@@ -252,7 +252,7 @@ impl Http3ActiveConnGuard {
                 HTTP3_ACTIVE_CONNECTIONS.inc();
                 return Self { active: true };
             }
-            return Self { active: false };
+            Self { active: false }
         }
         #[cfg(not(feature = "metrics"))]
         Self {}

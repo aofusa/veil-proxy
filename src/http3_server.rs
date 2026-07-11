@@ -1765,7 +1765,7 @@ impl Http3Handler {
                 // gRPC は圧縮ネゴシエーション対象外（application/grpc）
                 #[cfg(feature = "grpc")]
                 let is_grpc_ct = content_type
-                    .map(|ct| crate::grpc::headers::is_grpc_content_type(ct))
+                    .map(crate::grpc::headers::is_grpc_content_type)
                     .unwrap_or(false);
                 #[cfg(not(feature = "grpc"))]
                 let is_grpc_ct = false;
