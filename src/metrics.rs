@@ -1019,9 +1019,20 @@ pub(crate) fn build_metrics_response() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    /// `METRICS_RUNTIME_ENABLED` と HTTP/3 ゲージはプロセスグローバル。
+    /// 並列テストでトグルと inc/dec が交差すると偽失敗になるため直列化する。
+    fn metrics_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn runtime_toggle_controls_endpoint() {
+        let _guard = metrics_test_lock();
         // デフォルトは有効
         set_metrics_runtime_enabled(true);
         assert!(metrics_runtime_enabled());
@@ -1054,6 +1065,7 @@ mod tests {
 
     #[test]
     fn record_functions_are_noop_when_disabled() {
+        let _guard = metrics_test_lock();
         // 無効時に record_* がパニックしないことを確認
         set_metrics_runtime_enabled(false);
         record_circuit_breaker_open("up");
@@ -1081,6 +1093,7 @@ mod tests {
     #[test]
     #[cfg(all(feature = "metrics", feature = "http3"))]
     fn http3_conn_and_stream_gauges_are_symmetric() {
+        let _guard = metrics_test_lock();
         set_metrics_runtime_enabled(true);
         let before_conn = HTTP3_ACTIVE_CONNECTIONS.get();
         let before_streams = HTTP3_ACTIVE_STREAMS.get();
