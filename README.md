@@ -3412,12 +3412,16 @@ large_request_buffer_size = 4096
 
 Veil ships a reproducible Docker-based performance harness in
 [`tools/perf/`](tools/perf/) that compares `veil:glibc` / `veil:musl` (built with
-**full features**) against `nginx:alpine` over container-to-container networking, for both
-HTTP/1.1 (`wrk`) and HTTP/2 (`h2load`). It covers the default+http2 tuning matrix
+**full features**) against `nginx:alpine` over container-to-container networking, across
+HTTP/1.1 (`wrk`), HTTP/2 (`h2load`), **HTTP/3 (QUIC-enabled `h2load`)**, and
+**gRPC / WebSocket (`grafana/k6`)**. It covers the default+http2 tuning matrix
 (http2 × kTLS × SO_REUSEPORT balancing × open_file_cache) **and** per-feature showcase
 configs that layer a single full-only feature on a shared baseline — compression / cache /
 buffering / reverse-proxy / **wasm / metrics / access-log / rate-limit / admin /
-opentelemetry / l4-proxy** (`h2_1_feat_*` / `h2_0_feat_l4`). Full data and a summary are in
+opentelemetry / l4-proxy / http3 / grpc / websocket** (`h2_1_feat_*` / `h2_0_feat_l4`).
+The HTTP/3 client needs a QUIC-enabled h2load (`docker build -t local/h2load-h3:latest
+tools/perf/h2load-http3`; http3 is skipped if absent); gRPC/WebSocket use `grafana/k6`
+against `moul/grpcbin` / `jmalloc/echo-server` upstreams. Full data and a summary are in
 [**docs/perf**](docs/perf/); the per-feature analysis is in
 [docs/perf/reports/perf_full_features_report.md](docs/perf/reports/perf_full_features_report.md)
 (TLS termination is the dominant cost — plaintext L4 is up to 2.2× faster — while L7 feature

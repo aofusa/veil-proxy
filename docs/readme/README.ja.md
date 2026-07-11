@@ -3450,10 +3450,15 @@ recv/send/accept/timer Future をランダムに Drop する `runtime_cancellati
   バックエンドモックは Rust バイナリ（Python 非依存）、TLS/平文プローブは `openssl` /
   bash `/dev/tcp` を用いる。
 - **[`tools/perf/`](../../tools/perf/)** — `veil:glibc` / `veil:musl`（full features）と
-  `nginx` のスループット/レイテンシ/CPU/メモリ比較。default+http2 チューニング（2⁴=16 直交表）に加え、
-  ベースへ 1 機能だけを重ねた機能ショーケース構成（compression / cache / buffering / 逆プロキシ /
-  **wasm / metrics / access-log / rate-limit / admin / opentelemetry / l4-proxy**、`h2_1_feat_*` /
-  `h2_0_feat_l4`）で機能単位のオーバーヘッドを計測する。結果は [docs/perf](../perf/)、機能単位の
+  `nginx` のスループット/レイテンシ/CPU/メモリ比較。HTTP/1.1（`wrk`）・HTTP/2（`h2load`）・
+  **HTTP/3（QUIC 対応 `h2load`）**・**gRPC / WebSocket（`grafana/k6`）** の各クライアントで計測する。
+  default+http2 チューニング（2⁴=16 直交表）に加え、ベースへ 1 機能だけを重ねた機能ショーケース構成
+  （compression / cache / buffering / 逆プロキシ /
+  **wasm / metrics / access-log / rate-limit / admin / opentelemetry / l4-proxy / http3 / grpc /
+  websocket**、`h2_1_feat_*` / `h2_0_feat_l4`）で機能単位のオーバーヘッドを計測する。HTTP/3 は
+  QUIC 対応 h2load（`docker build -t local/h2load-h3:latest tools/perf/h2load-http3`。未ビルド時は
+  スキップ）、gRPC/WebSocket は `moul/grpcbin` / `jmalloc/echo-server` を上流に `grafana/k6` で計測する。
+  結果は [docs/perf](../perf/)、機能単位の
   分析は [docs/perf/reports/perf_full_features_report.md](../perf/reports/perf_full_features_report.md) を参照
   （TLS 終端が支配的コストで平文 L4 は最大 2.2 倍、L7 機能ロジックはノイズ範囲内・全構成 Non-2xx=0）。
 

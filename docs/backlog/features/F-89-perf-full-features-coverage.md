@@ -40,13 +40,23 @@ feat 系構成では既定オフとし、kTLS 自体の影響は直交表 16 構
 - **`tools/perf/run_perf.sh`**: `docker/assets/wasm` を `/etc/veil/wasm:ro` にマウント。
   `feat_l4` 構成では負荷 URL を `http://<container>:9080/`（平文 L4 リスナー）へ切り替える。
 
-### 残件（本チケット範囲外・別途対応）
+### 残件だった 3 プロトコル（第 3 弾で実装・完了）
 
-以下は専用の負荷クライアント・バックエンドの導入が必要なため、実装状況を本表に記録した上で残件とする。
+専用の負荷クライアント・バックエンドを導入し計測可能にした。
 
-1. **`http3`**: h2load の HTTP/3 対応ビルド（ngtcp2 統合）または quiche クライアントの導入が必要。
-2. **`grpc-full`**: ghz 等の gRPC ベンチマーククライアントと gRPC バックエンドが必要。
-3. **`websocket`**: WebSocket echo バックエンドと ws ベンチマークツールが必要。
+| 構成 | クライアント | 上流 | 計測内容 |
+|------|--------------|------|----------|
+| `h2_1_feat_http3` | QUIC 対応 h2load（`local/h2load-h3`, `--alpn-list=h3`。`tools/perf/h2load-http3/` でビルド） | なし（静的配信） | HTTP/3 (QUIC/UDP) スループット |
+| `h2_1_feat_grpc` | grafana k6 gRPC（`tools/perf/k6/grpc.js`） | `moul/grpcbin`(h2c) | gRPC unary 中継（TLS h2 → h2c）のフレーミング/中継コスト |
+| `h2_1_feat_websocket` | grafana k6 WebSocket（`tools/perf/k6/websocket.js`） | `jmalloc/echo-server` | WebSocket Upgrade + フレーム転送コスト |
+
+- **既定 `local/h2load` は QUIC 非搭載**のため、ngtcp2/nghttp3/quictls を組み込んだ
+  `local/h2load-h3` ビルド用 Dockerfile（`tools/perf/h2load-http3/`）を新設。未ビルド時は http3 をスキップ。
+- gRPC の h2c フルパス保持・`use_h2c` 尊重・HPACK 小文字化は **B-40（F-92）で修正済み**であり、
+  本ハーネスはその修正後イメージ前提で Non-2xx=0 を確認（当初 grpcbin/tonic ともに 502 になる
+  現象を再現し、B-40 修正が有効であることを検証）。
+- k6 gRPC は完了ストリームごとに RST_STREAM を送るため、grpc 構成で
+  `[http2] max_rst_stream_per_second` を大きく設定し Rapid Reset 対策（CVE-2023-44487）の誤検知を回避。
 
 ## 受け入れ条件
 
@@ -57,13 +67,16 @@ feat 系構成では既定オフとし、kTLS 自体の影響は直交表 16 構
 - [x] 計測で顕著なオーバーヘッドが判明した場合、最適化チケットを起票または同一作業で修正する
   → 計測は **TLS 終端が支配的・L7 機能ロジックはノイズ範囲内**であることを示した。レポート主要関心事の
   WASM ホットパスの冗長な per-request エクスポート解決を同一作業で排除（`src/wasm/engine.rs`）。
+- [x] **http3 / grpc / websocket 計測を専用クライアントで実装**（第 3 弾。合計 30 構成）。
+  gRPC の h2c 中継バグは B-40（F-92）で修正済みであることを本ハーネスで再検証。
 
 ## 完了
 
-- 完了日: 2026-07-07
-- 主要成果: feat 系 9 構成の計測ハーネス化 + パススルー WASM モジュール、機能単位オーバーヘッドの
-  定量化（全構成 Non-2xx=0）、WASM ライフサイクルの重複エクスポート解決排除。
-- http3 / grpc-full / websocket 計測は専用クライアント要のため残件として継続。
+- 完了日（第 1・2 弾）: 2026-07-07 / 完了日（第 3 弾 http3/grpc/websocket）: 2026-07-11
+- 主要成果: feat 系 9 構成 + http3/grpc/websocket 3 構成の計測ハーネス化（合計 30 構成）、
+  パススルー WASM モジュール、機能単位オーバーヘッドの定量化（全構成 Non-2xx=0）、
+  WASM ライフサイクルの重複エクスポート解決排除、QUIC 対応 h2load / k6 クライアントの導入。
+- 計測結果は [docs/perf/reports/perf_full_features_report.md](../../perf/reports/perf_full_features_report.md) を参照。
 
 ## 依存・リスク
 
