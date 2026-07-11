@@ -20933,3 +20933,363 @@ async fn test_http3_active_connections_metric() {
         eprintln!("test_http3_active_connections_metric: decrease observed");
     }
 }
+
+// ====================
+// F-101: HTTP/3 基本 Web 機能・Alt-Svc アップグレード
+// ====================
+
+/// F-101: HTTP/3 経由の大容量静的ファイル提供
+#[tokio::test]
+#[ntest::timeout(30000)]
+#[cfg(feature = "http3")]
+async fn test_http3_static_file_large() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    use common::http3_client::send_http3_request_full;
+
+    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .unwrap();
+    let (_client, mut sr) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("H3 client for static large");
+    let resp = send_http3_request_full(&mut sr, "GET", "/large.txt", &[], None)
+        .await
+        .expect("H3 GET /large.txt");
+    assert_eq!(resp.status, 200, "H3 static large should be 200");
+    assert!(
+        resp.body.len() > 1000,
+        "large file body should be >1000 bytes, got {}",
+        resp.body.len()
+    );
+    eprintln!(
+        "test_http3_static_file_large: status={} body_len={}",
+        resp.status,
+        resp.body.len()
+    );
+}
+
+/// F-101: HTTP/3 経由の ETag（存在すれば quoted 形式）
+#[tokio::test]
+#[ntest::timeout(30000)]
+#[cfg(feature = "http3")]
+async fn test_http3_static_file_etag() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    use common::http3_client::send_http3_request_full;
+
+    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .unwrap();
+    let (_client, mut sr) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("H3 client for etag");
+    let resp = send_http3_request_full(&mut sr, "GET", "/large.txt", &[], None)
+        .await
+        .expect("H3 GET /large.txt for etag");
+    assert_eq!(resp.status, 200);
+    if let Some(etag) = resp.header("etag") {
+        assert!(
+            (etag.starts_with('"') && etag.ends_with('"'))
+                || (etag.starts_with("W/\"") && etag.ends_with('"')),
+            "ETag should be quoted, got {:?}",
+            etag
+        );
+        eprintln!("test_http3_static_file_etag: ETag={}", etag);
+    } else {
+        // プロキシ/バックエンドが ETag を付けない構成でも 200 + 本文配信は必須
+        assert!(!resp.body.is_empty(), "static body should be non-empty");
+        eprintln!("test_http3_static_file_etag: ETag absent (optional)");
+    }
+}
+
+/// F-101: HTTP/3 経由の 302 リダイレクト + Location
+#[tokio::test]
+#[ntest::timeout(30000)]
+#[cfg(feature = "http3")]
+async fn test_http3_redirect_302() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    use common::http3_client::send_http3_request_full;
+
+    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .unwrap();
+    let (_client, mut sr) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("H3 client for redirect 302");
+    let resp = send_http3_request_full(&mut sr, "GET", "/redirect-test", &[], None)
+        .await
+        .expect("H3 GET /redirect-test");
+    assert_eq!(
+        resp.status, 302,
+        "H3 redirect-test should be 302, got {}",
+        resp.status
+    );
+    let loc = resp.header("location");
+    assert!(
+        loc.is_some(),
+        "302 response must include Location, headers={:?}",
+        resp.headers
+    );
+    let loc = loc.unwrap();
+    assert!(
+        loc.contains("8443") || loc.contains("localhost") || loc.contains("127.0.0.1"),
+        "Location should point to proxy, got {:?}",
+        loc
+    );
+    eprintln!(
+        "test_http3_redirect_302: status={} location={}",
+        resp.status, loc
+    );
+}
+
+/// F-101: HTTP/3 経由の 307 リダイレクト
+#[tokio::test]
+#[ntest::timeout(30000)]
+#[cfg(feature = "http3")]
+async fn test_http3_redirect_307() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    use common::http3_client::send_http3_request_full;
+
+    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .unwrap();
+    let (_client, mut sr) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("H3 client for redirect 307");
+    let resp = send_http3_request_full(&mut sr, "GET", "/redirect-307", &[], None)
+        .await
+        .expect("H3 GET /redirect-307");
+    assert_eq!(
+        resp.status, 307,
+        "H3 redirect-307 should be 307, got {}",
+        resp.status
+    );
+    assert!(
+        resp.header("location").is_some(),
+        "307 must include Location"
+    );
+    eprintln!(
+        "test_http3_redirect_307: status={} location={:?}",
+        resp.status,
+        resp.header("location")
+    );
+}
+
+/// F-101: HTTP/3 SNI（localhost）接続 + 証明書 SIGHUP 中も H3 が生存すること。
+///
+/// 注: H3 証明書は起動時 memfd 固定のため、SIGHUP 後も H3 は旧証明書を使い続ける。
+/// 本テストは (1) SNI で H3 が確立できること (2) TCP TLS 証明書差し替え中に H3 が
+/// クラッシュせずリクエストを処理し続けられることを検証する。
+#[tokio::test]
+#[ntest::timeout(60000)]
+#[cfg(feature = "http3")]
+async fn test_http3_sni_and_cert_reload() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    use common::http3_client::send_http3_request;
+
+    let _guard = RELOAD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .unwrap();
+
+    // (1) SNI=localhost で H3 接続
+    let (_c1, mut sr1) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("H3 SNI localhost");
+    let (st, _) = send_http3_request(&mut sr1, "GET", "/", &[], None)
+        .await
+        .expect("H3 GET with SNI");
+    assert_eq!(st, 200, "H3 with SNI localhost should work");
+
+    let pid = match proxy_pid() {
+        Some(p) => p,
+        None => {
+            eprintln!("Skipping cert reload part: proxy.pid not found");
+            return;
+        }
+    };
+    let cert_path = fixtures_dir().join("cert.pem");
+    let key_path = fixtures_dir().join("key.pem");
+    let original_cert = std::fs::read(&cert_path).expect("read cert");
+    let original_key = std::fs::read(&key_path).expect("read key");
+
+    // (2) 証明書差し替え + SIGHUP 中に H3 が生き続ける
+    let cert =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .expect("generate cert");
+    std::fs::write(&cert_path, cert.cert.pem()).expect("write cert");
+    std::fs::write(&key_path, cert.signing_key.serialize_pem()).expect("write key");
+    assert!(send_sighup(pid), "SIGHUP must be delivered");
+
+    for i in 0..6 {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        match Http3TestClient::new(server_addr, "localhost").await {
+            Ok((_c, mut sr)) => match send_http3_request(&mut sr, "GET", "/", &[], None).await {
+                Ok((st, _)) => {
+                    assert_eq!(
+                        st, 200,
+                        "H3 must stay healthy during cert reload (attempt {})",
+                        i
+                    );
+                }
+                Err(e) => panic!("H3 request failed during cert reload (attempt {}): {}", i, e),
+            },
+            Err(e) => panic!("H3 connect failed during cert reload (attempt {}): {}", i, e),
+        }
+    }
+
+    // 原状復帰
+    std::fs::write(&cert_path, &original_cert).expect("restore cert");
+    std::fs::write(&key_path, &original_key).expect("restore key");
+    send_sighup(pid);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let (_c3, mut sr3) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("H3 after restore");
+    let (st3, _) = send_http3_request(&mut sr3, "GET", "/", &[], None)
+        .await
+        .expect("H3 GET after restore");
+    assert_eq!(st3, 200);
+    eprintln!("test_http3_sni_and_cert_reload: SNI + H3 survival through cert reload OK");
+}
+
+/// F-101: HTTP/3 (QPACK) 巨大ヘッダは 431 または接続/ストリーム切断で拒否
+#[tokio::test]
+#[ntest::timeout(30000)]
+#[cfg(feature = "http3")]
+async fn test_http3_oversized_header() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    use common::http3_client::{send_http3_request, send_http3_request_full};
+
+    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .unwrap();
+    let (_client, mut sr) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("H3 client for oversized header");
+
+    // 単一ヘッダ ~9KB（MAX_HEADER_SIZE=8KB 超）
+    let huge = "H".repeat(9000);
+    let headers = [("x-oversized-header", huge.as_str())];
+    match send_http3_request_full(&mut sr, "GET", "/", &headers, None).await {
+        Ok(resp) => {
+            assert!(
+                matches!(resp.status, 400 | 413 | 431),
+                "oversized H3 header must be rejected (431 preferred), got {}",
+                resp.status
+            );
+            eprintln!("test_http3_oversized_header: status={}", resp.status);
+        }
+        Err(e) => {
+            // ストリーム/接続リセットも防御として許容
+            eprintln!("test_http3_oversized_header: rejected with error (ok): {}", e);
+        }
+    }
+
+    // プロキシが生存していること
+    match Http3TestClient::new(server_addr, "localhost").await {
+        Ok((_c2, mut sr2)) => {
+            let (st, _) = send_http3_request(&mut sr2, "GET", "/", &[], None)
+                .await
+                .expect("normal GET after oversized");
+            assert_eq!(st, 200, "proxy must accept new H3 after oversized reject");
+        }
+        Err(e) => panic!("reconnect after oversized header failed: {}", e),
+    }
+}
+
+/// F-101: Alt-Svc 広告を受け取り HTTP/3 へ接続を切り替えるフロー
+#[tokio::test]
+#[ntest::timeout(45000)]
+#[cfg(feature = "http3")]
+async fn test_alt_svc_upgrade_flow() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    use common::http3_client::send_http3_request;
+
+    // 1) HTTP/1.1 で開始し Alt-Svc を取得
+    let client = Http1TestClient::new_https("127.0.0.1", PROXY_PORT).expect("h1 client");
+    let (status, headers, _body) = client
+        .send_request_with_response_headers(http::Method::GET, "/", &[], None)
+        .await
+        .expect("H1 GET for Alt-Svc");
+    assert_eq!(status, 200);
+    let alt_svc = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("alt-svc"))
+        .map(|(_, v)| v.clone());
+    assert!(
+        alt_svc.is_some(),
+        "Alt-Svc required for upgrade flow, headers={:?}",
+        headers
+    );
+    let alt = alt_svc.unwrap();
+    assert!(
+        alt.contains("h3=") || alt.contains("h3=\""),
+        "Alt-Svc must advertise h3, got {:?}",
+        alt
+    );
+
+    // 2) 広告されたポート（なければ既定 H3 ポート）へ HTTP/3 接続
+    let h3_port = PROXY_HTTP3_PORT;
+    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", h3_port).parse().unwrap();
+    let (_c, mut sr) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("H3 connect after Alt-Svc advertisement");
+    let (st, body) = send_http3_request(&mut sr, "GET", "/", &[], None)
+        .await
+        .expect("H3 GET after upgrade");
+    assert_eq!(st, 200, "upgraded H3 request should succeed");
+    assert!(!body.is_empty() || st == 200);
+
+    // 3) HTTP/2 経路でも同様に Alt-Svc → H3
+    #[cfg(feature = "http2")]
+    {
+        let mut h2 = Http2TestClient::new("127.0.0.1", PROXY_PORT)
+            .await
+            .expect("h2 for upgrade");
+        let resp = h2
+            .send_request_full("GET", "/", &[], None)
+            .await
+            .expect("H2 GET");
+        assert_eq!(resp.status, 200);
+        let alt2 = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("alt-svc"));
+        assert!(alt2.is_some(), "H2 must also advertise Alt-Svc");
+        let (_c2, mut sr2) = Http3TestClient::new(server_addr, "localhost")
+            .await
+            .expect("H3 after H2 Alt-Svc");
+        let (st2, _) = send_http3_request(&mut sr2, "GET", "/", &[], None)
+            .await
+            .expect("H3 after H2");
+        assert_eq!(st2, 200);
+    }
+
+    eprintln!(
+        "test_alt_svc_upgrade_flow: Alt-Svc={:?} H3 upgrade OK",
+        alt
+    );
+}

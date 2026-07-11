@@ -53,8 +53,20 @@ use crate::metrics::{
     encode_prometheus_metrics, http3_stream_closed, http3_stream_opened, http3_streams_closed_n,
     Http3ActiveConnGuard,
 };
+use crate::pool::MAX_HEADER_SIZE;
 use crate::proxy::{check_security, SecurityCheckResult};
 use crate::upstream::find_backend_unified;
+
+/// HTTP/3 リクエストヘッダブロックの近似サイズ（name + value の合計）。
+///
+/// H1 のワイヤ上ヘッダサイズ制限（`MAX_HEADER_SIZE`）と同等の DoS 防御に使う。
+/// QPACK 展開後の論理サイズで判定する（圧縮効率に依存しない）。
+fn h3_request_header_block_size(headers: &[h3::Header]) -> usize {
+    headers
+        .iter()
+        .map(|h| h.name().len().saturating_add(h.value().len()))
+        .sum()
+}
 
 /// memfd_create システムコールのラッパー（セキュリティ強化版）
 ///
@@ -650,6 +662,36 @@ impl Http3Handler {
         let method = method.unwrap_or(b"GET");
         let path = path.unwrap_or(b"/");
 
+        // F-101: H1 と同等のリクエストヘッダサイズ上限（RFC 6585 / 431）。
+        // 巨大 QPACK 展開ヘッダによるメモリ枯渇をストリーム処理前に拒否する。
+        let header_block = h3_request_header_block_size(headers);
+        if header_block > MAX_HEADER_SIZE {
+            warn!(
+                "[HTTP/3] request header block too large: {} bytes (limit {})",
+                header_block, MAX_HEADER_SIZE
+            );
+            let path_too_long = path.len() > MAX_HEADER_SIZE;
+            let (status, msg): (u16, &[u8]) = if path_too_long {
+                (414, b"URI Too Long")
+            } else {
+                (431, b"Request Header Fields Too Large")
+            };
+            let _ = self.send_error_response(stream_id, status, msg);
+            log_access(
+                method,
+                authority,
+                path,
+                user_agent,
+                content_length as u64,
+                status,
+                msg.len() as u64,
+                Instant::now(),
+                &self.client_ip,
+                "",
+            );
+            return Decision::Handled;
+        }
+
         let config = CURRENT_CONFIG.load();
 
         // メトリクスエンドポイントはバッファ経路（handle_request が配信、GET・ボディなし）。
@@ -806,6 +848,22 @@ impl Http3Handler {
     ) -> io::Result<()> {
         // HTTP/3コネクションが確立されていなければ何もしない
         if self.h3_conn.is_none() {
+            return Ok(());
+        }
+
+        // F-101: バッファ経路でもヘッダサイズ上限を enforce（classify を経由しないケース）
+        let header_block = h3_request_header_block_size(headers);
+        if header_block > MAX_HEADER_SIZE {
+            let path_len = headers
+                .iter()
+                .find(|h| h.name() == b":path")
+                .map(|h| h.value().len())
+                .unwrap_or(0);
+            if path_len > MAX_HEADER_SIZE {
+                self.send_error_response(stream_id, 414, b"URI Too Long")?;
+            } else {
+                self.send_error_response(stream_id, 431, b"Request Header Fields Too Large")?;
+            }
             return Ok(());
         }
 
@@ -3870,6 +3928,40 @@ mod tests {
         let config = Http3ServerConfig::default();
         assert_eq!(config.max_idle_timeout, 30000);
         assert_eq!(config.max_udp_payload_size, 1350);
+    }
+
+    /// F-101: ヘッダブロックサイズ合計が MAX_HEADER_SIZE 判定に使えること
+    #[test]
+    fn test_h3_request_header_block_size() {
+        let small = vec![
+            h3::Header::new(b":method", b"GET"),
+            h3::Header::new(b":path", b"/"),
+            h3::Header::new(b":authority", b"localhost"),
+            h3::Header::new(b":scheme", b"https"),
+        ];
+        let small_sz = h3_request_header_block_size(&small);
+        assert!(small_sz < MAX_HEADER_SIZE);
+        assert_eq!(
+            small_sz,
+            b":method".len()
+                + b"GET".len()
+                + b":path".len()
+                + b"/".len()
+                + b":authority".len()
+                + b"localhost".len()
+                + b":scheme".len()
+                + b"https".len()
+        );
+
+        let big_val = vec![b'A'; 9000];
+        let big = vec![
+            h3::Header::new(b":method", b"GET"),
+            h3::Header::new(b":path", b"/"),
+            h3::Header::new(b":authority", b"localhost"),
+            h3::Header::new(b":scheme", b"https"),
+            h3::Header::new(b"x-huge", &big_val),
+        ];
+        assert!(h3_request_header_block_size(&big) > MAX_HEADER_SIZE);
     }
 
     /// B-18: GSO バッチの flush 判定。

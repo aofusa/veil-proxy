@@ -10,6 +10,7 @@
 //!               | stream_body_slowloris | qpack_memory_exhaustion
 //!               | grpc_qpack_bomb | grpc_max_streams | grpc_half_closed | grpc_malicious_trailers
 //!               | grpc_web_malformed | grpc_web_large_b64
+//!               | flow_control_violation
 //! - HTTP3_REPORT
 //! - HTTP3_GRPC_PATH (default /grpc.test.v1.TestService/UnaryCall)
 //! - AMPLIFICATION_STRICT (default 1): amplification_check で ratio>3 をエラーにする
@@ -113,6 +114,9 @@ fn main() {
             .map(|s| format!("grpc_web_malformed done detail={}", s)),
         "grpc_web_large_b64" => grpc_web_large_b64(&host, port, &grpc_path)
             .map(|s| format!("grpc_web_large_b64 done detail={}", s)),
+        // F-101: QUIC フロー制御（MAX_DATA / MAX_STREAM_DATA）限界突破刺激
+        "flow_control_violation" => flow_control_violation(&host, port, &path)
+            .map(|s| format!("flow_control_violation done detail={}", s)),
         other => Err(format!("unknown HTTP3_MODE={}", other).into()),
     };
 
@@ -1591,6 +1595,140 @@ fn qpack_memory_exhaustion(
         opened,
         stopped_err,
         session.conn.is_closed()
+    ))
+}
+
+/// F-101 S-H3-17: QUIC フロー制御限界突破刺激（MAX_DATA / MAX_STREAM_DATA）。
+///
+/// quiche クライアントは送信時に peer のウィンドウを尊重するため、真の
+/// FLOW_CONTROL_ERROR フレーム偽造はできない。代わりに:
+/// 1. 多数の並行ストリームで大容量ボディを一気に送ろうとする
+/// 2. 接続レベル・ストリームレベルの FC に突き当たるまでポンプ
+/// 3. 接続が閉じられる／ストリームがリセットされる／Done で止まる、のいずれでも
+///    クライアント側 panic なく完了し、サーバ生存は probe 側の post-health で確認
+fn flow_control_violation(
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut session = establish_h3(host, port, 30_000)?;
+
+    // 大きめボディ（接続ウィンドウを複数ストリームで圧迫）
+    let chunk = vec![0x41u8; 64 * 1024]; // 64 KiB
+    let streams_target = 32usize;
+    let mut opened = 0usize;
+    let mut total_sent = 0usize;
+    let mut stream_ids: Vec<u64> = Vec::new();
+    let mut stop_reason = String::from("completed");
+
+    for i in 0..streams_target {
+        let headers = vec![
+            quiche::h3::Header::new(b":method", b"POST"),
+            quiche::h3::Header::new(b":path", path.as_bytes()),
+            quiche::h3::Header::new(b":authority", host.as_bytes()),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b"content-type", b"application/octet-stream"),
+            // Content-Length は「意図した巨大アップロード」を示す
+            quiche::h3::Header::new(b"content-length", b"2097152"), // 2 MiB
+        ];
+        match session.h3.send_request(&mut session.conn, &headers, false) {
+            Ok(sid) => {
+                opened += 1;
+                stream_ids.push(sid);
+            }
+            Err(e) => {
+                stop_reason = format!("send_request_err={}", e);
+                break;
+            }
+        }
+        pump_io(&mut session);
+        if session.conn.is_closed() {
+            stop_reason = "closed_during_open".into();
+            break;
+        }
+        // 各ストリームにできるだけボディを詰める（fin=false のままウィンドウを埋める）
+        if let Some(&sid) = stream_ids.last() {
+            for _ in 0..8 {
+                match session
+                    .h3
+                    .send_body(&mut session.conn, sid, &chunk, false)
+                {
+                    Ok(n) => {
+                        total_sent += n;
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                    Err(quiche::h3::Error::Done) => break,
+                    Err(e) => {
+                        stop_reason = format!("send_body_err={} stream={}", e, i);
+                        break;
+                    }
+                }
+                pump_io(&mut session);
+                if session.conn.is_closed() {
+                    stop_reason = "closed_during_body".into();
+                    break;
+                }
+            }
+        }
+        if session.conn.is_closed() {
+            break;
+        }
+        let _ = drain_events(&mut session);
+        if stop_reason != "completed" {
+            break;
+        }
+    }
+
+    // 残りのウィンドウを埋める追加ラウンド
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(5) && !session.conn.is_closed() {
+        let mut any = false;
+        for &sid in &stream_ids {
+            match session.h3.send_body(&mut session.conn, sid, &chunk, false) {
+                Ok(n) if n > 0 => {
+                    total_sent += n;
+                    any = true;
+                }
+                Ok(_) => {}
+                Err(quiche::h3::Error::Done) => {}
+                Err(e) => {
+                    stop_reason = format!("flood_err={}", e);
+                    break;
+                }
+            }
+        }
+        pump_io(&mut session);
+        let _ = drain_events(&mut session);
+        if !any {
+            // 全ストリーム FC ブロック — ウィンドウ枯渇を観測
+            if stop_reason == "completed" {
+                stop_reason = "flow_control_blocked".into();
+            }
+            break;
+        }
+    }
+
+    // 最終 drain
+    let drain_start = Instant::now();
+    while drain_start.elapsed() < Duration::from_secs(2) {
+        pump_io(&mut session);
+        let _ = drain_events(&mut session);
+        if session.conn.is_closed() {
+            if stop_reason == "completed" || stop_reason == "flow_control_blocked" {
+                stop_reason = format!("{},conn_closed", stop_reason);
+            }
+            break;
+        }
+    }
+
+    Ok(format!(
+        "opened={} total_sent={} closed={} reason={}",
+        opened,
+        total_sent,
+        session.conn.is_closed(),
+        stop_reason
     ))
 }
 

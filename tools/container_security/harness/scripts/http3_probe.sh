@@ -167,6 +167,14 @@ check_tls_health "post_h3_qpack_memory_exhaustion" || true
 run_h3_mode authority_host_mismatch "h3_authority_host_mismatch" || true
 check_tls_health "post_h3_authority_host_mismatch" || true
 
+# ---------------------------------------------------------------------------
+# F-101: レポート [追加提案3] QUIC フロー制御違反
+# ---------------------------------------------------------------------------
+
+# S-H3-17: MAX_DATA / MAX_STREAM_DATA 限界突破刺激 → crash なし
+run_h3_mode flow_control_violation "h3_flow_control_violation" || true
+check_tls_health "post_h3_flow_control_violation" || true
+
 # 最終ヘルス
 check_tls_health "post_http3_tls_health" || true
 
