@@ -2870,6 +2870,8 @@ async fn proxy_to_tls_backend_async(
 /// TLSバックエンドへの非同期プロキシ処理（non-kTLS）
 /// 別スレッドでブロッキング TLS 通信を行う
 #[cfg(not(feature = "ktls"))]
+// 理由付き allow: 同期 connect/TLS は std::thread::spawn した専用スレッド内で実行し、結果を mpsc + ポーリングで受け取る（イベントループ非ブロック）。
+#[allow(clippy::disallowed_methods)]
 async fn proxy_to_tls_backend_async(
     target: &ProxyTarget,
     request: Vec<u8>,
@@ -2978,7 +2980,7 @@ async fn proxy_to_tls_backend_async(
         match rx.try_recv() {
             Ok(result) => return result,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                return Err(io::Error::new(io::ErrorKind::Other, "backend thread died"));
+                return Err(io::Error::other("backend thread died"));
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 if std::time::Instant::now() >= deadline {
