@@ -19313,7 +19313,7 @@ async fn test_grpc_flow_control_window_boundary() {
     let mut lpm = Vec::with_capacity(5 + payload_size);
     lpm.push(0u8); // uncompressed
     lpm.extend_from_slice(&(payload_size as u32).to_be_bytes());
-    lpm.extend(std::iter::repeat(b'G').take(payload_size));
+    lpm.extend(std::iter::repeat_n(b'G', payload_size));
 
     // 1 バイト〜1KB 単位に分割して送信し、フロー制御の再開を誘発
     let mut chunks: Vec<&[u8]> = Vec::new();
@@ -21064,6 +21064,10 @@ async fn test_http3_redirect_307() {
 #[tokio::test]
 #[ntest::timeout(60000)]
 #[cfg(feature = "http3")]
+// clippy::await_holding_lock 許容理由: RELOAD_TEST_LOCK は SIGHUP リロード系テストを
+// テストプロセス内で直列化するための意図的なガードで、テスト全体（await を含む）を
+// 覆う必要がある（tokio マルチスレッドでも所有スレッドは同一タスク内で完結する）。
+#[allow(clippy::await_holding_lock)]
 async fn test_http3_sni_and_cert_reload() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -21560,7 +21564,7 @@ async fn test_grpc_over_http3_flow_control_window_boundary() {
     let mut lpm = Vec::with_capacity(5 + payload_size);
     lpm.push(0u8);
     lpm.extend_from_slice(&(payload_size as u32).to_be_bytes());
-    lpm.extend(std::iter::repeat(b'G').take(payload_size));
+    lpm.extend(std::iter::repeat_n(b'G', payload_size));
 
     let mut chunks: Vec<&[u8]> = Vec::new();
     let mut offset = 0usize;
@@ -22157,8 +22161,8 @@ async fn test_http3_multiplexed_coalesced_responses() {
 
     // 並行近似: 4 接続同時 echo
     let mut handles = Vec::new();
-    for i in 0..4 {
-        let body = uploads[i].clone();
+    for (i, upload) in uploads.iter().take(4).enumerate() {
+        let body = upload.clone();
         handles.push(tokio::spawn(async move {
             let addr: std::net::SocketAddr =
                 format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
@@ -22758,10 +22762,7 @@ async fn test_grpc_web_over_http3_cors_headers() {
             !v.is_empty(),
             "Access-Control-Allow-Origin should be non-empty when present"
         );
-        eprintln!(
-            "test_grpc_web_over_http3_cors_headers: ACAO={}",
-            v
-        );
+        eprintln!("test_grpc_web_over_http3_cors_headers: ACAO={}", v);
     } else {
         eprintln!(
             "test_grpc_web_over_http3_cors_headers: status={} (no ACAO header; controlled)",

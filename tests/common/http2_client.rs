@@ -385,6 +385,8 @@ impl Http2TestClient {
 
 /// HTTP/2 レスポンス（ステータス・ヘッダ・ボディ・トレーラー）
 #[derive(Debug, Clone)]
+// テストヘルパ: 共有 tests/common を含む integration_tests では未使用（e2e_tests では使用）。
+#[allow(dead_code)]
 pub struct Http2Response {
     pub status: u16,
     pub headers: Vec<(String, String)>,
@@ -392,6 +394,8 @@ pub struct Http2Response {
     pub trailers: Vec<(String, String)>,
 }
 
+// テストヘルパ: grpc_status/grpc_message は e2e_tests のみから呼ばれ integration_tests では未使用。
+#[allow(dead_code)]
 impl Http2Response {
     /// gRPC トレーラーまたは初期ヘッダから grpc-status を取得
     pub fn grpc_status(&self) -> Option<u32> {

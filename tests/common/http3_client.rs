@@ -72,12 +72,18 @@ impl Http3TestClient {
 
 /// HTTP/3 レスポンス（ステータス・ヘッダ・ボディ）
 #[derive(Debug, Clone)]
+// テストヘルパ: `headers` は grpc_* アクセサ経由でのみ読まれ、共有 `tests/common` を含む
+// integration_tests 側では未使用になる（e2e_tests では使用）。allow が妥当な理由付き例。
+#[allow(dead_code)]
 pub struct Http3Response {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
 }
 
+// テストヘルパ: grpc_status/grpc_message/header は個別 E2E のみから呼ばれ、
+// integration_tests では未使用（e2e_tests では使用）。
+#[allow(dead_code)]
 impl Http3Response {
     /// ヘッダまたはトレーラーから `grpc-status` を取得（gRPC over H3 用）。
     pub fn grpc_status(&self) -> Option<u32> {
@@ -196,6 +202,8 @@ pub async fn send_http3_request_full(
 ///
 /// `chunks` を順に `send_data` し、チャンク間に任意の `inter_chunk_delay` を挟む。
 /// 終端は `finish()` で FIN を立てる。
+// テストヘルパ: e2e_tests のみから呼ばれ、共有 tests/common を含む integration_tests では未使用。
+#[allow(dead_code)]
 pub async fn send_http3_request_chunked(
     send_request: &mut SendRequest<h3_quinn::OpenStreams, Bytes>,
     method: &str,
@@ -270,6 +278,8 @@ pub async fn send_http3_request_chunked(
 
 /// リクエスト開始後にボディを途中まで送り、ストリームを drop して強制切断する（RST 相当）。
 /// プロキシ生存確認用。エラーは返さず完了のみ。
+// テストヘルパ: e2e_tests のみから呼ばれ、共有 tests/common を含む integration_tests では未使用。
+#[allow(dead_code)]
 pub async fn send_http3_and_reset(
     send_request: &mut SendRequest<h3_quinn::OpenStreams, Bytes>,
     method: &str,
