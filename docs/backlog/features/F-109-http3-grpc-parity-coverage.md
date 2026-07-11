@@ -58,11 +58,11 @@ F-91〜F-107 で大半のエッジ・ストリーミング・DoS を実装済み
 
 ## 受け入れ条件
 
-- [ ] レポート Task 1/2 の全項目が実装または明確に文書化
-- [ ] E2E / container_security / 単体が実行され、失敗は artifacts に切り分け
-- [ ] full / default / no-default / 各 feature でビルド警告・エラーなし
-- [ ] `allow(dead_code)` を理由なしに追加しない
-- [ ] CI 組み込みは行わない（F-110）
+- [x] レポート Task 1/2 の全項目が実装または明確に文書化
+- [x] E2E / container_security / 単体が実行され、失敗は artifacts に切り分け
+- [x] full / default / no-default / 各 feature でビルド警告・エラーなし
+- [x] `allow(dead_code)` を理由なしに追加しない
+- [x] CI 組み込みは行わない（F-110）
 
 ## 依存・リスク
 
@@ -70,7 +70,14 @@ F-91〜F-107 で大半のエッジ・ストリーミング・DoS を実装済み
 - H3 smuggling は HTTP/3 が TE を持たないため CL 重複 / 不正 CL ヘッダ注入が中心
 - Extended CONNECT 未実装時は 4xx/5xx 安全失敗で合格
 - 既知フレーキー E2E は修正対象外
+- harness イメージに `curl --http3` が無い環境では compression/rate_limit/wasm の H3 curl パスは WARN skip（http3-client 経路の smuggling/WS/gRPC-Web は実行）
 
 ## 対応状況
 
-進行中（fix/test）。
+完了（fix/test）。  
+詳細: `docs/artifacts/f109_failed_tests_report.md`  
+検証:
+- 単体 727 / 統合 53 / E2E 510 PASS（F-109 新規 9/9）
+- feature マトリクス warning 0
+- `veil:glibc` 再ビルド + `tools/container_security/run.sh` exit 0
+- F-109 プローブ: h3 smuggling 3 / h3 WS 2 / h3 gRPC-Web status spoof+CORS PASS
