@@ -251,6 +251,9 @@ pub(crate) fn validate_host_header(
 /// # Returns
 /// * `true` - 不一致（400 相当で拒否すべき）
 /// * `false` - 一致、または Host 未指定
+///
+/// HTTP/3 ハンドラと単体テストからのみ参照（http3 feature 無効時はビルド対象外）。
+#[cfg(any(feature = "http3", test))]
 #[inline]
 pub(crate) fn authority_host_mismatch(authority: &[u8], host: Option<&[u8]>) -> bool {
     let Some(host) = host else {
@@ -268,6 +271,7 @@ pub(crate) fn authority_host_mismatch(authority: &[u8], host: Option<&[u8]>) -> 
 }
 
 /// `host:port` / `[ipv6]:port` からホスト部分を取り出す（アロケーションなし）。
+#[cfg(any(feature = "http3", test))]
 #[inline]
 pub(crate) fn strip_host_port(value: &[u8]) -> &[u8] {
     let value = trim_ascii_whitespace(value);
