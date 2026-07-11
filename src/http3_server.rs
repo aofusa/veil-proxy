@@ -18,7 +18,7 @@
 //! - ファイル配信、リダイレクト、メトリクス
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::CString;
 use std::io::{self, Seek, Write as IoWrite};
 use std::net::SocketAddr;
@@ -49,7 +49,10 @@ use crate::config::{
     SecurityConfig, UpstreamGroup, CURRENT_CONFIG, SHUTDOWN_FLAG,
 };
 use crate::logging::log_access;
-use crate::metrics::encode_prometheus_metrics;
+use crate::metrics::{
+    encode_prometheus_metrics, http3_stream_closed, http3_stream_opened, http3_streams_closed_n,
+    Http3ActiveConnGuard,
+};
 use crate::proxy::{check_security, SecurityCheckResult};
 use crate::upstream::find_backend_unified;
 
@@ -361,6 +364,10 @@ struct Http3Handler {
     notify: crate::http3_stream::H3Notify,
     /// バックエンドタスクのスポーナ（F-46: 型付きタスクプール。ワーカースレッドで共有）。
     backend_spawner: crate::http3_stream::BackendSpawner,
+    /// F-99: QUIC 接続ゲージ（Drop で自動 dec。ホットパス無アロケーション）
+    _conn_metric: Http3ActiveConnGuard,
+    /// F-99: メトリクス計上中のリクエストストリーム ID（open/close の二重計上防止）
+    metric_open_streams: HashSet<u64>,
 }
 
 impl Http3Handler {
@@ -382,6 +389,24 @@ impl Http3Handler {
             stream_bodies: HashMap::new(),
             notify,
             backend_spawner,
+            _conn_metric: Http3ActiveConnGuard::new(),
+            metric_open_streams: HashSet::new(),
+        }
+    }
+
+    /// リクエストストリームをメトリクス open として計上（二重 open 防止）
+    #[inline]
+    fn metric_stream_open(&mut self, stream_id: u64) {
+        if self.metric_open_streams.insert(stream_id) {
+            http3_stream_opened();
+        }
+    }
+
+    /// リクエストストリームをメトリクス close として計上
+    #[inline]
+    fn metric_stream_close(&mut self, stream_id: u64) {
+        if self.metric_open_streams.remove(&stream_id) {
+            http3_stream_closed();
         }
     }
 
@@ -402,7 +427,18 @@ impl Http3Handler {
         }
         Ok(())
     }
+}
 
+impl Drop for Http3Handler {
+    fn drop(&mut self) {
+        // 接続破棄時に未 close のストリームゲージを一括補正（リーク防止）
+        let n = self.metric_open_streams.len();
+        self.metric_open_streams.clear();
+        http3_streams_closed_n(n);
+    }
+}
+
+impl Http3Handler {
     /// HTTP/3 イベントを処理（F-32: ストリーミング/バッファ分岐）
     ///
     /// poll で全イベントを収集（Headers 列挙・Data 排出・Finished 記録）した後、
@@ -476,6 +512,8 @@ impl Http3Handler {
 
         // --- 新規 Headers を分類して振り分け ---
         for (stream_id, headers, more_frames) in new_headers {
+            // F-99: リクエストストリーム open をメトリクス計上
+            self.metric_stream_open(stream_id);
             match self.classify(stream_id, &headers, more_frames) {
                 Decision::Stream(params) => {
                     let (req_tx, req_rx) = crate::http3_stream::channel::<Bytes>(REQ_CHAN_CAP);
@@ -504,6 +542,8 @@ impl Http3Handler {
                 }
                 Decision::Handled => {
                     self.stream_bodies.remove(&stream_id);
+                    // 即時応答済み（セキュリティ拒否等）— ストリーム close
+                    self.metric_stream_close(stream_id);
                 }
             }
         }
@@ -521,6 +561,7 @@ impl Http3Handler {
             self.proxy_streams.remove(&stream_id);
             self.buffered_reqs.remove(&stream_id);
             self.stream_bodies.remove(&stream_id);
+            self.metric_stream_close(stream_id);
         }
 
         // --- 完了したバッファ経路リクエストを処理 ---
@@ -538,6 +579,7 @@ impl Http3Handler {
                 .map(|b| b.to_vec())
                 .unwrap_or_default();
             self.handle_request(stream_id, &br.headers, &body).await?;
+            self.metric_stream_close(stream_id);
         }
 
         // 部分的なレスポンスを送信（非ストリーミング経路）。
@@ -568,6 +610,7 @@ impl Http3Handler {
         for stream_id in done {
             debug!("[HTTP/3] streaming proxy stream {} done", stream_id);
             self.proxy_streams.remove(&stream_id);
+            self.metric_stream_close(stream_id);
         }
     }
 

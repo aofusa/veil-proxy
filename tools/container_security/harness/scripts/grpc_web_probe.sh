@@ -67,6 +67,61 @@ c=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 15 \
     "https://${VEIL_HOST}:${VEIL_HTTPS_PORT}/grpc.test.v1.TestService/UnaryCall" 2>/dev/null || echo "000")
 check_no_crash "grpc_web_large_base64_dos" "${c}"
 
+# ---------------------------------------------------------------------------
+# F-99: gRPC-Web over HTTP/3
+# ---------------------------------------------------------------------------
+VEIL_HTTP3_PORT="${VEIL_HTTP3_PORT:-443}"
+run_h3_grpc_web_mode() {
+    local mode="$1"
+    local name="$2"
+    if ! command -v http3-client >/dev/null 2>&1; then
+        log "WARN ${name}: http3-client missing (skip H3 gRPC-Web)"
+        return 0
+    fi
+    export VEIL_HOST
+    export VEIL_SNI="${VEIL_SNI:-${VEIL_HOST}}"
+    export VEIL_HTTP3_PORT
+    export HTTP3_MODE="${mode}"
+    export HTTP3_GRPC_PATH="${HTTP3_GRPC_PATH:-/grpc.test.v1.TestService/UnaryCall}"
+    export HTTP3_REPORT="/results/http3_grpc_web_${mode}_report.txt"
+    set +e
+    HTTP3_MODE="${mode}" http3-client
+    local rc=$?
+    set -e
+    if [[ "${rc}" -eq 0 ]]; then
+        log "PASS ${name}: http3-client mode=${mode}"
+        return 0
+    fi
+    log "WARN ${name}: http3-client mode=${mode} rc=${rc} (continuing; health decides)"
+    return 0
+}
+
+log "F-99: gRPC-Web over HTTP/3 attack phase udp_port=${VEIL_HTTP3_PORT}"
+
+# h3_grpc_web_malformed_body: 5 バイト未満ペイロード
+run_h3_grpc_web_mode grpc_web_malformed "h3_grpc_web_malformed_body"
+
+# h3_grpc_web_large_base64_dos: 巨大 Base64
+run_h3_grpc_web_mode grpc_web_large_b64 "h3_grpc_web_large_base64_dos"
+
+# curl --http3-only があれば追加検証（環境依存・失敗しても非致命）
+if curl --help 2>&1 | grep -q -- '--http3'; then
+    set +e
+    c=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 8 --http3-only \
+        -X POST -H "Content-Type: application/grpc-web" -H "Accept: application/grpc-web" \
+        -d 'bad' \
+        "https://${VEIL_HOST}:${VEIL_HTTP3_PORT}/grpc.test.v1.TestService/UnaryCall" 2>/dev/null || echo "000")
+    set -e
+    # 000 は curl 未対応/QUIC 不通の可能性 — hang 以外は WARN に留める
+    if [[ "${c}" == "000" ]]; then
+        log "WARN h3_grpc_web_malformed_body_curl: no response (curl http3 may be unavailable)"
+    else
+        check_no_crash "h3_grpc_web_malformed_body_curl" "${c}"
+    fi
+else
+    log "WARN curl --http3 not available; skip curl H3 gRPC-Web checks"
+fi
+
 hc=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 \
     "https://${VEIL_HOST}:${VEIL_HTTPS_PORT}/" 2>/dev/null || echo "000")
 if [[ "${hc}" == "200" ]]; then

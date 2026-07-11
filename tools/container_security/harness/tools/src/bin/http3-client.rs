@@ -8,6 +8,8 @@
 //!               | grpc_malformed | grpc_header_spoof | grpc_slowloris | grpc_stream_reset
 //!               | amplification_spoof | max_streams | migration_spoof | qpack_async_ref
 //!               | stream_body_slowloris | qpack_memory_exhaustion
+//!               | grpc_qpack_bomb | grpc_max_streams | grpc_half_closed | grpc_malicious_trailers
+//!               | grpc_web_malformed | grpc_web_large_b64
 //! - HTTP3_REPORT
 //! - HTTP3_GRPC_PATH (default /grpc.test.v1.TestService/UnaryCall)
 //! - AMPLIFICATION_STRICT (default 1): amplification_check で ratio>3 をエラーにする
@@ -98,6 +100,19 @@ fn main() {
         // F-97: :authority と Host 不一致 → 400 期待
         "authority_host_mismatch" => authority_host_mismatch(&host, port, &path)
             .map(|s| format!("authority_host_mismatch {}", s)),
+        // F-99: gRPC over HTTP/3 攻撃モード拡張
+        "grpc_qpack_bomb" => grpc_qpack_bomb(&host, port, &grpc_path)
+            .map(|s| format!("grpc_qpack_bomb done detail={}", s)),
+        "grpc_max_streams" => grpc_max_streams(&host, port, &grpc_path)
+            .map(|s| format!("grpc_max_streams done detail={}", s)),
+        "grpc_half_closed" => grpc_half_closed(&host, port, &grpc_path)
+            .map(|s| format!("grpc_half_closed done detail={}", s)),
+        "grpc_malicious_trailers" => grpc_malicious_trailers(&host, port, &grpc_path)
+            .map(|s| format!("grpc_malicious_trailers done detail={}", s)),
+        "grpc_web_malformed" => grpc_web_malformed(&host, port, &grpc_path)
+            .map(|s| format!("grpc_web_malformed done detail={}", s)),
+        "grpc_web_large_b64" => grpc_web_large_b64(&host, port, &grpc_path)
+            .map(|s| format!("grpc_web_large_b64 done detail={}", s)),
         other => Err(format!("unknown HTTP3_MODE={}", other).into()),
     };
 
@@ -1215,6 +1230,313 @@ fn stream_body_slowloris(
     Ok(format!(
         "sent={} closed={}",
         sent,
+        session.conn.is_closed()
+    ))
+}
+
+/// F-99: gRPC over HTTP/3 経路への QPACK 動的テーブル・巨大ヘッダ連打
+fn grpc_qpack_bomb(
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut session = establish_h3(host, port, 30_000)?;
+    let big = "Q".repeat(2048);
+    let mut opened = 0usize;
+    let mut stopped_err = None;
+    for i in 0..30 {
+        let mut headers = grpc_base_headers(host, path);
+        for j in 0..12 {
+            let name = format!("x-h3-grpc-qpack-{}-{}", i, j);
+            headers.push(quiche::h3::Header::new(name.as_bytes(), big.as_bytes()));
+        }
+        // 最小 LPM
+        let body = [0u8, 0, 0, 0, 2, b'{', b'}'];
+        match session.h3.send_request(&mut session.conn, &headers, false) {
+            Ok(sid) => {
+                opened += 1;
+                let _ = session
+                    .h3
+                    .send_body(&mut session.conn, sid, &body, true);
+            }
+            Err(e) => {
+                stopped_err = Some(format!("{}", e));
+                break;
+            }
+        }
+        if i % 3 == 0 {
+            pump_io(&mut session);
+            let _ = drain_events(&mut session);
+        }
+        if session.conn.is_closed() {
+            break;
+        }
+    }
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(4) {
+        pump_io(&mut session);
+        let _ = drain_events(&mut session);
+        if session.conn.is_closed() {
+            break;
+        }
+    }
+    Ok(format!(
+        "opened={} err={:?} closed={}",
+        opened,
+        stopped_err,
+        session.conn.is_closed()
+    ))
+}
+
+/// F-99: gRPC over HTTP/3 で MAX_CONCURRENT_STREAMS 超バースト
+fn grpc_max_streams(
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut session = establish_h3(host, port, 30_000)?;
+    let body = [0u8, 0, 0, 0, 2, b'{', b'}'];
+    let mut opened = 0usize;
+    let mut stopped_err = None;
+    for _ in 0..80 {
+        let headers = grpc_base_headers(host, path);
+        match session.h3.send_request(&mut session.conn, &headers, false) {
+            Ok(sid) => {
+                opened += 1;
+                let _ = session
+                    .h3
+                    .send_body(&mut session.conn, sid, &body, true);
+            }
+            Err(e) => {
+                stopped_err = Some(format!("{}", e));
+                break;
+            }
+        }
+        if opened % 8 == 0 {
+            pump_io(&mut session);
+            let _ = drain_events(&mut session);
+        }
+        if session.conn.is_closed() {
+            break;
+        }
+    }
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        pump_io(&mut session);
+        let _ = drain_events(&mut session);
+        if session.conn.is_closed() {
+            break;
+        }
+    }
+    Ok(format!(
+        "opened={} err={:?} closed={}",
+        opened,
+        stopped_err,
+        session.conn.is_closed()
+    ))
+}
+
+/// F-99: ヘッダ完了後ボディを送らず長時間保持（half-closed hold）
+fn grpc_half_closed(
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut session = establish_h3(host, port, 30_000)?;
+    let headers = grpc_base_headers(host, path);
+    // fin=false でヘッダのみ送信
+    let stream_id = session
+        .h3
+        .send_request(&mut session.conn, &headers, false)?;
+    pump_io(&mut session);
+    let _ = drain_events(&mut session);
+
+    // ボディを送らず ~8 秒保持
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(8) {
+        pump_io(&mut session);
+        let _ = drain_events(&mut session);
+        if session.conn.is_closed() {
+            return Ok(format!(
+                "conn_closed early stream_id={} held_ms={}",
+                stream_id,
+                start.elapsed().as_millis()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // 最後に部分ボディ + fin
+    let partial = [0u8, 0, 0, 0, 16];
+    let _ = session
+        .h3
+        .send_body(&mut session.conn, stream_id, &partial, true);
+    pump_io(&mut session);
+    let _ = drain_events(&mut session);
+    Ok(format!(
+        "held_ms={} stream_id={} closed={}",
+        start.elapsed().as_millis(),
+        stream_id,
+        session.conn.is_closed()
+    ))
+}
+
+/// F-99: 不正タイミングの trailer 風ヘッダ（初期 HEADERS に grpc-status を混ぜる）
+fn grpc_malicious_trailers(
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut session = establish_h3(host, port, 15_000)?;
+    let mut headers = grpc_base_headers(host, path);
+    // リクエスト HEADERS にレスポンス用 trailer を混入
+    headers.push(quiche::h3::Header::new(b"grpc-status", b"0"));
+    headers.push(quiche::h3::Header::new(b"grpc-message", b"premature-trailer"));
+    headers.push(quiche::h3::Header::new(b"trailer", b"grpc-status,grpc-message"));
+
+    // 不完全 LPM（length 宣言と不一致）
+    let body = [0u8, 0, 0, 0, 0x20, b'P', b'A', b'R', b'T'];
+    let stream_id = session.h3.send_request(&mut session.conn, &headers, false)?;
+    session
+        .h3
+        .send_body(&mut session.conn, stream_id, &body, true)?;
+    pump_io(&mut session);
+
+    let start = Instant::now();
+    let mut last_status = None;
+    while start.elapsed() < Duration::from_secs(8) {
+        pump_io(&mut session);
+        let (st, fin) = drain_events(&mut session);
+        if st.is_some() {
+            last_status = st;
+        }
+        if fin || session.conn.is_closed() {
+            break;
+        }
+    }
+    Ok(format!("status={:?} closed={}", last_status, session.conn.is_closed()))
+}
+
+/// F-99: gRPC-Web over HTTP/3 不正ボディ（5 バイト未満）
+fn grpc_web_malformed(
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut session = establish_h3(host, port, 15_000)?;
+    let headers = vec![
+        quiche::h3::Header::new(b":method", b"POST"),
+        quiche::h3::Header::new(b":path", path.as_bytes()),
+        quiche::h3::Header::new(b":authority", host.as_bytes()),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b"content-type", b"application/grpc-web"),
+        quiche::h3::Header::new(b"accept", b"application/grpc-web"),
+    ];
+    let body = b"bad";
+    let stream_id = session.h3.send_request(&mut session.conn, &headers, false)?;
+    session
+        .h3
+        .send_body(&mut session.conn, stream_id, body, true)?;
+    pump_io(&mut session);
+
+    let start = Instant::now();
+    let mut last_status = None;
+    while start.elapsed() < Duration::from_secs(8) {
+        pump_io(&mut session);
+        let (st, fin) = drain_events(&mut session);
+        if st.is_some() {
+            last_status = st;
+        }
+        if fin || session.conn.is_closed() {
+            break;
+        }
+    }
+    Ok(format!("status={:?}", last_status))
+}
+
+/// F-99: gRPC-Web-Text over HTTP/3 巨大 Base64 DOS
+fn grpc_web_large_b64(
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut session = establish_h3(host, port, 30_000)?;
+    let headers = vec![
+        quiche::h3::Header::new(b":method", b"POST"),
+        quiche::h3::Header::new(b":path", path.as_bytes()),
+        quiche::h3::Header::new(b":authority", host.as_bytes()),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b"content-type", b"application/grpc-web-text"),
+        quiche::h3::Header::new(b"accept", b"application/grpc-web-text"),
+    ];
+    // ~200KB の 'A' を base64 風（有効 alphabet）で送る
+    let raw = vec![b'A'; 200 * 1024];
+    // 簡易 base64（std 無しの環境でも動くよう手動エンコード相当: そのまま 'A' 連打でも
+    // デコーダを刺激する。正式 base64 に近い長さを確保）
+    let b64: String = {
+        // 標準 base64 アルファベットで埋める
+        const ALPH: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity(raw.len() * 4 / 3 + 4);
+        for chunk in raw.chunks(3) {
+            let b0 = chunk[0] as u32;
+            let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+            let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+            let n = (b0 << 16) | (b1 << 8) | b2;
+            out.push(ALPH[((n >> 18) & 63) as usize] as char);
+            out.push(ALPH[((n >> 12) & 63) as usize] as char);
+            if chunk.len() > 1 {
+                out.push(ALPH[((n >> 6) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+            if chunk.len() > 2 {
+                out.push(ALPH[(n & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+        out
+    };
+
+    let stream_id = session.h3.send_request(&mut session.conn, &headers, false)?;
+    // 大きめボディをチャンク送信
+    let bytes = b64.as_bytes();
+    let mut sent = 0usize;
+    const CHUNK: usize = 16 * 1024;
+    while sent < bytes.len() {
+        let end = (sent + CHUNK).min(bytes.len());
+        let fin = end >= bytes.len();
+        match session
+            .h3
+            .send_body(&mut session.conn, stream_id, &bytes[sent..end], fin)
+        {
+            Ok(n) => sent += n,
+            Err(e) => {
+                return Ok(format!("send_stopped sent={} err={}", sent, e));
+            }
+        }
+        pump_io(&mut session);
+        let _ = drain_events(&mut session);
+        if session.conn.is_closed() {
+            break;
+        }
+    }
+
+    let start = Instant::now();
+    let mut last_status = None;
+    while start.elapsed() < Duration::from_secs(10) {
+        pump_io(&mut session);
+        let (st, fin) = drain_events(&mut session);
+        if st.is_some() {
+            last_status = st;
+        }
+        if fin || session.conn.is_closed() {
+            break;
+        }
+    }
+    Ok(format!(
+        "sent={} status={:?} closed={}",
+        sent,
+        last_status,
         session.conn.is_closed()
     ))
 }

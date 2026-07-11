@@ -285,6 +285,26 @@ run_h3_grpc_mode grpc_stream_reset "h3_grpc_stream_reset"
 check_health "post_h3_grpc_stream_reset" || true
 
 # ---------------------------------------------------------------------------
+# F-99: test_coverage_report — gRPC over HTTP/3 攻撃拡張
+# ---------------------------------------------------------------------------
+
+# S-G-H3-05: QPACK 動的テーブル・巨大ヘッダ連打
+run_h3_grpc_mode grpc_qpack_bomb "h3_grpc_qpack_bomb"
+check_health "post_h3_grpc_qpack_bomb" || true
+
+# S-G-H3-06: MAX_CONCURRENT_STREAMS 超バースト
+run_h3_grpc_mode grpc_max_streams "h3_grpc_max_concurrent_streams"
+check_health "post_h3_grpc_max_streams" || true
+
+# S-G-H3-07: ヘッダ後ボディ未送の長時間保持
+run_h3_grpc_mode grpc_half_closed "h3_grpc_half_closed_body_hold"
+check_health "post_h3_grpc_half_closed" || true
+
+# S-G-H3-08: 不正タイミング Trailer / 偽装
+run_h3_grpc_mode grpc_malicious_trailers "h3_grpc_malicious_trailers"
+check_health "post_h3_grpc_malicious_trailers" || true
+
+# ---------------------------------------------------------------------------
 # F-96: レポート §5.2 gRPC セキュリティ
 # ---------------------------------------------------------------------------
 

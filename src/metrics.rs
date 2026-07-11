@@ -15,6 +15,8 @@
 // - http_response_size_bytes: レスポンスボディサイズのヒストグラム
 // - http_active_connections: アクティブな接続数（ホスト別）
 // - http_upstream_health: アップストリームの健康状態
+// - http3_active_connections: HTTP/3 (QUIC) アクティブ接続数（F-99）
+// - http3_active_streams: HTTP/3 アクティブリクエストストリーム数（F-99）
 //
 // metrics feature が無効の場合、全公開 API はノーオップスタブとして提供されます。
 //
@@ -197,6 +199,100 @@ impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         crate::CURRENT_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+// ====================
+// HTTP/3 接続・ストリームゲージ（F-99）
+// ====================
+//
+// ホットパス規則: ラベル無し IntGauge の inc/dec のみ（アロケーション無し）。
+// feature 無効時・ランタイム無効時は完全ノーオップ。
+
+#[cfg(feature = "metrics")]
+/// HTTP/3 (QUIC) アクティブ接続数
+pub(crate) static HTTP3_ACTIVE_CONNECTIONS: Lazy<prometheus::IntGauge> = Lazy::new(|| {
+    let opts = Opts::new(
+        "http3_active_connections",
+        "Number of active HTTP/3 (QUIC) connections",
+    )
+    .namespace("veil_proxy");
+    let gauge = prometheus::IntGauge::with_opts(opts).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+#[cfg(feature = "metrics")]
+/// HTTP/3 アクティブリクエストストリーム数
+pub(crate) static HTTP3_ACTIVE_STREAMS: Lazy<prometheus::IntGauge> = Lazy::new(|| {
+    let opts = Opts::new(
+        "http3_active_streams",
+        "Number of active HTTP/3 request streams",
+    )
+    .namespace("veil_proxy");
+    let gauge = prometheus::IntGauge::with_opts(opts).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+/// HTTP/3 接続メトリクスの RAII ガード（Drop で自動 dec）
+pub(crate) struct Http3ActiveConnGuard {
+    #[cfg(feature = "metrics")]
+    active: bool,
+}
+
+impl Http3ActiveConnGuard {
+    #[inline]
+    pub(crate) fn new() -> Self {
+        #[cfg(feature = "metrics")]
+        {
+            if metrics_runtime_enabled() {
+                HTTP3_ACTIVE_CONNECTIONS.inc();
+                return Self { active: true };
+            }
+            return Self { active: false };
+        }
+        #[cfg(not(feature = "metrics"))]
+        Self {}
+    }
+}
+
+impl Drop for Http3ActiveConnGuard {
+    #[inline]
+    fn drop(&mut self) {
+        #[cfg(feature = "metrics")]
+        if self.active {
+            HTTP3_ACTIVE_CONNECTIONS.dec();
+        }
+    }
+}
+
+/// HTTP/3 リクエストストリームを 1 本 open として計上
+#[inline]
+pub(crate) fn http3_stream_opened() {
+    #[cfg(feature = "metrics")]
+    if metrics_runtime_enabled() {
+        HTTP3_ACTIVE_STREAMS.inc();
+    }
+}
+
+/// HTTP/3 リクエストストリームを 1 本 close として計上
+#[inline]
+pub(crate) fn http3_stream_closed() {
+    #[cfg(feature = "metrics")]
+    if metrics_runtime_enabled() {
+        HTTP3_ACTIVE_STREAMS.dec();
+    }
+}
+
+/// 残存ストリーム数ぶん一括 dec（接続破棄時）
+#[inline]
+pub(crate) fn http3_streams_closed_n(n: usize) {
+    #[cfg(feature = "metrics")]
+    if metrics_runtime_enabled() && n > 0 {
+        HTTP3_ACTIVE_STREAMS.sub(n as i64);
+    }
+    #[cfg(not(feature = "metrics"))]
+    let _ = n;
 }
 
 #[cfg(feature = "metrics")]
@@ -963,6 +1059,35 @@ mod tests {
         record_grpc_request("/svc/Method", "0", "up");
         observe_grpc_stream_duration("/svc/Method", 0.1);
         observe_wasm_filter_duration("auth", "request", 0.001);
+        // F-99: HTTP/3 ゲージも無効時ノーオップ
+        let _g = Http3ActiveConnGuard::new();
+        http3_stream_opened();
+        http3_stream_closed();
+        http3_streams_closed_n(3);
         set_metrics_runtime_enabled(true);
+    }
+
+    /// F-99: HTTP/3 接続ガードが Drop で dec し、ストリーム open/close が対称であること
+    #[test]
+    #[cfg(feature = "metrics")]
+    fn http3_conn_and_stream_gauges_are_symmetric() {
+        set_metrics_runtime_enabled(true);
+        let before_conn = HTTP3_ACTIVE_CONNECTIONS.get();
+        let before_streams = HTTP3_ACTIVE_STREAMS.get();
+
+        {
+            let _g = Http3ActiveConnGuard::new();
+            assert_eq!(HTTP3_ACTIVE_CONNECTIONS.get(), before_conn + 1);
+            http3_stream_opened();
+            http3_stream_opened();
+            assert_eq!(HTTP3_ACTIVE_STREAMS.get(), before_streams + 2);
+            http3_stream_closed();
+            assert_eq!(HTTP3_ACTIVE_STREAMS.get(), before_streams + 1);
+            // 残 1 本を一括 close
+            http3_streams_closed_n(1);
+            assert_eq!(HTTP3_ACTIVE_STREAMS.get(), before_streams);
+        }
+        // Drop で接続ゲージが戻る
+        assert_eq!(HTTP3_ACTIVE_CONNECTIONS.get(), before_conn);
     }
 }
