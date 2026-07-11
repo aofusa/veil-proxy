@@ -14,6 +14,8 @@
 //!               | grpc_oversized | grpc_infinite_streaming | grpc_fragmented_lpm
 //!               | grpc_path_bypass | grpc_wasm_crash
 //!               | control_stream_abuse | cid_exhaustion | token_spoofing
+//!               | grpc_oversized_metadata | grpc_rst_flood
+//!               | grpc_web_text_invalid_b64 | grpc_web_oversized_metadata
 //! - HTTP3_REPORT
 //! - HTTP3_GRPC_PATH (default /grpc.test.v1.TestService/UnaryCall)
 //! - AMPLIFICATION_STRICT (default 1): amplification_check で ratio>3 をエラーにする
@@ -137,6 +139,15 @@ fn main() {
             .map(|s| format!("cid_exhaustion done detail={}", s)),
         "token_spoofing" => token_spoofing(&host, port)
             .map(|s| format!("token_spoofing done detail={}", s)),
+        // F-107: レポート Task 2 — 巨大メタデータ / RST フラッド / gRPC-Web 異常
+        "grpc_oversized_metadata" => grpc_oversized_metadata(&host, port, &grpc_path)
+            .map(|s| format!("grpc_oversized_metadata done detail={}", s)),
+        "grpc_rst_flood" => grpc_rst_flood(&host, port, &grpc_path)
+            .map(|s| format!("grpc_rst_flood done detail={}", s)),
+        "grpc_web_text_invalid_b64" => grpc_web_text_invalid_b64(&host, port, &grpc_path)
+            .map(|s| format!("grpc_web_text_invalid_b64 done detail={}", s)),
+        "grpc_web_oversized_metadata" => grpc_web_oversized_metadata(&host, port, &grpc_path)
+            .map(|s| format!("grpc_web_oversized_metadata done detail={}", s)),
         other => Err(format!("unknown HTTP3_MODE={}", other).into()),
     };
 
@@ -2147,4 +2158,187 @@ fn send_http3_get(host: &str, port: u16, path: &str) -> Result<usize, Box<dyn st
     }
 
     Err("HTTP/3 response timeout".into())
+}
+
+/// F-107 S-G-H3-14: 巨大 grpc-timeout メタデータを HTTP/3 で送りクラッシュしないこと。
+fn grpc_oversized_metadata(
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut session = establish_h3(host, port, 15_000)?;
+    // 4000 桁の "9" を grpc-timeout に付与（H2 h2c_oversized_metadata 相当）
+    let big_timeout = "9".repeat(4000);
+    let mut headers = grpc_base_headers(host, path);
+    headers.push(quiche::h3::Header::new(
+        b"grpc-timeout",
+        big_timeout.as_bytes(),
+    ));
+    // 最小 LPM: flags=0 length=2 body={}
+    let body = [0u8, 0, 0, 0, 2, b'{', b'}'];
+    let stream_id = session.h3.send_request(&mut session.conn, &headers, false)?;
+    session
+        .h3
+        .send_body(&mut session.conn, stream_id, &body, true)?;
+    pump_io(&mut session);
+
+    let start = Instant::now();
+    let mut last_status = None;
+    while start.elapsed() < Duration::from_secs(8) {
+        pump_io(&mut session);
+        let (st, fin) = drain_events(&mut session);
+        if st.is_some() {
+            last_status = st;
+        }
+        if fin || session.conn.is_closed() {
+            break;
+        }
+    }
+    Ok(format!(
+        "status={:?} closed={} timeout_len={}",
+        last_status,
+        session.conn.is_closed(),
+        big_timeout.len()
+    ))
+}
+
+/// F-107 S-G-H3-15: 短命 gRPC over H3 ストリームを大量生成・即リセットする RST フラッド。
+fn grpc_rst_flood(
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut session = establish_h3(host, port, 30_000)?;
+    let headers = grpc_base_headers(host, path);
+    let body = [0u8, 0, 0, 0, 2, b'{', b'}'];
+    let mut opened = 0u32;
+    let mut reset = 0u32;
+    let mut errors = 0u32;
+
+    for _ in 0..40 {
+        match session.h3.send_request(&mut session.conn, &headers, false) {
+            Ok(stream_id) => {
+                opened += 1;
+                let _ = session
+                    .h3
+                    .send_body(&mut session.conn, stream_id, &body, false);
+                // 即 RESET（STOP_SENDING / RESET_STREAM 相当）
+                let _ = session
+                    .conn
+                    .stream_shutdown(stream_id, quiche::Shutdown::Write, 0);
+                let _ = session
+                    .conn
+                    .stream_shutdown(stream_id, quiche::Shutdown::Read, 0);
+                reset += 1;
+            }
+            Err(_) => {
+                errors += 1;
+            }
+        }
+        pump_io(&mut session);
+        let _ = drain_events(&mut session);
+        if session.conn.is_closed() {
+            break;
+        }
+    }
+
+    // 生存確認用に少し drain
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(2) {
+        pump_io(&mut session);
+        let _ = drain_events(&mut session);
+        if session.conn.is_closed() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    Ok(format!(
+        "opened={} reset={} errors={} closed={}",
+        opened,
+        reset,
+        errors,
+        session.conn.is_closed()
+    ))
+}
+
+/// F-107 S-G-H3-16: gRPC-Web-Text 不正 Base64 ボディを HTTP/3 で送る。
+fn grpc_web_text_invalid_b64(
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut session = establish_h3(host, port, 15_000)?;
+    let headers = vec![
+        quiche::h3::Header::new(b":method", b"POST"),
+        quiche::h3::Header::new(b":path", path.as_bytes()),
+        quiche::h3::Header::new(b":authority", host.as_bytes()),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b"content-type", b"application/grpc-web-text"),
+        quiche::h3::Header::new(b"accept", b"application/grpc-web-text"),
+    ];
+    let body = b"!!!not-base64!!!";
+    let stream_id = session.h3.send_request(&mut session.conn, &headers, false)?;
+    session
+        .h3
+        .send_body(&mut session.conn, stream_id, body, true)?;
+    pump_io(&mut session);
+
+    let start = Instant::now();
+    let mut last_status = None;
+    while start.elapsed() < Duration::from_secs(8) {
+        pump_io(&mut session);
+        let (st, fin) = drain_events(&mut session);
+        if st.is_some() {
+            last_status = st;
+        }
+        if fin || session.conn.is_closed() {
+            break;
+        }
+    }
+    Ok(format!("status={:?}", last_status))
+}
+
+/// F-107 S-G-H3-17: gRPC-Web over HTTP/3 で巨大メタデータ（grpc-timeout）を送る。
+fn grpc_web_oversized_metadata(
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut session = establish_h3(host, port, 15_000)?;
+    let big_timeout = "9".repeat(4000);
+    let headers = vec![
+        quiche::h3::Header::new(b":method", b"POST"),
+        quiche::h3::Header::new(b":path", path.as_bytes()),
+        quiche::h3::Header::new(b":authority", host.as_bytes()),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b"content-type", b"application/grpc-web+proto"),
+        quiche::h3::Header::new(b"te", b"trailers"),
+        quiche::h3::Header::new(b"grpc-timeout", big_timeout.as_bytes()),
+    ];
+    let body = [0u8, 0, 0, 0, 2, b'{', b'}'];
+    let stream_id = session.h3.send_request(&mut session.conn, &headers, false)?;
+    session
+        .h3
+        .send_body(&mut session.conn, stream_id, &body, true)?;
+    pump_io(&mut session);
+
+    let start = Instant::now();
+    let mut last_status = None;
+    while start.elapsed() < Duration::from_secs(8) {
+        pump_io(&mut session);
+        let (st, fin) = drain_events(&mut session);
+        if st.is_some() {
+            last_status = st;
+        }
+        if fin || session.conn.is_closed() {
+            break;
+        }
+    }
+    Ok(format!(
+        "status={:?} closed={} timeout_len={}",
+        last_status,
+        session.conn.is_closed(),
+        big_timeout.len()
+    ))
 }

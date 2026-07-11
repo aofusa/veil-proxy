@@ -116,6 +116,12 @@ run_h3_grpc_web_mode grpc_web_malformed "h3_grpc_web_malformed_body"
 # h3_grpc_web_large_base64_dos: 巨大 Base64
 run_h3_grpc_web_mode grpc_web_large_b64 "h3_grpc_web_large_base64_dos"
 
+# F-107 S-G-H3-16: gRPC-Web-Text 不正 Base64 over HTTP/3
+run_h3_grpc_web_mode grpc_web_text_invalid_b64 "h3_grpc_web_text_invalid_b64"
+
+# F-107 S-G-H3-17: gRPC-Web 巨大メタデータ over HTTP/3
+run_h3_grpc_web_mode grpc_web_oversized_metadata "h3_grpc_web_oversized_metadata"
+
 # curl --http3-only があれば追加検証（環境依存・失敗しても非致命）
 if curl --help 2>&1 | grep -q -- '--http3'; then
     set +e
@@ -129,6 +135,33 @@ if curl --help 2>&1 | grep -q -- '--http3'; then
         log "WARN h3_grpc_web_malformed_body_curl: no response (curl http3 may be unavailable)"
     else
         check_no_crash "h3_grpc_web_malformed_body_curl" "${c}"
+    fi
+
+    # F-107: 不正 Base64 / 巨大メタデータを curl --http3-only でも刺激
+    set +e
+    c=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 8 --http3-only \
+        -X POST -H "Content-Type: application/grpc-web-text" -H "Accept: application/grpc-web-text" \
+        -d '!!!not-base64!!!' \
+        "https://${VEIL_HOST}:${VEIL_HTTP3_PORT}/grpc.test.v1.TestService/UnaryCall" 2>/dev/null || echo "000")
+    set -e
+    if [[ "${c}" == "000" ]]; then
+        log "WARN h3_grpc_web_text_invalid_b64_curl: no response (curl http3 may be unavailable)"
+    else
+        check_no_crash "h3_grpc_web_text_invalid_b64_curl" "${c}"
+    fi
+
+    big_timeout=$(printf '9%.0s' {1..4000})
+    set +e
+    c=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 8 --http3-only \
+        -X POST -H "Content-Type: application/grpc-web+proto" -H "TE: trailers" \
+        -H "grpc-timeout: ${big_timeout}" \
+        -d $'\x00\x00\x00\x00\x02{}' \
+        "https://${VEIL_HOST}:${VEIL_HTTP3_PORT}/grpc.test.v1.TestService/UnaryCall" 2>/dev/null || echo "000")
+    set -e
+    if [[ "${c}" == "000" ]]; then
+        log "WARN h3_grpc_web_oversized_metadata_curl: no response (curl http3 may be unavailable)"
+    else
+        check_no_crash "h3_grpc_web_oversized_metadata_curl" "${c}"
     fi
 else
     log "WARN curl --http3 not available; skip curl H3 gRPC-Web checks"

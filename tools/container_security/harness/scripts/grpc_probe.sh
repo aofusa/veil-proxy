@@ -344,6 +344,18 @@ run_h3_grpc_mode grpc_wasm_crash "h3_grpc_wasm_crash_resilience"
 check_health "post_h3_grpc_wasm_crash" || true
 
 # ---------------------------------------------------------------------------
+# F-107: レポート Task 2 — 巨大メタデータ / RST フラッド (H3)
+# ---------------------------------------------------------------------------
+
+# S-G-H3-14: 巨大 grpc-timeout メタデータ over HTTP/3
+run_h3_grpc_mode grpc_oversized_metadata "h3_grpc_oversized_metadata"
+check_health "post_h3_grpc_oversized_metadata" || true
+
+# S-G-H3-15: 短命ストリーム大量生成・即リセット (RST flood)
+run_h3_grpc_mode grpc_rst_flood "h3_grpc_rst_flood"
+check_health "post_h3_grpc_rst_flood" || true
+
+# ---------------------------------------------------------------------------
 # F-96: レポート §5.2 gRPC セキュリティ
 # ---------------------------------------------------------------------------
 
