@@ -66,7 +66,7 @@ A high-performance reverse proxy server using io_uring (custom runtime) and rust
 ### Operations
 - **Graceful Shutdown**: Safe termination via SIGINT/SIGTERM
 - **Graceful Reload**: Hot reload configuration via SIGHUP (zero downtime)
-- **TLS Certificate Hot Reload**: Zero-downtime certificate rotation via mtime detection + ArcSwap; existing connections use old cert, new handshakes pick up new cert automatically
+- **TLS Certificate Hot Reload**: Zero-downtime certificate rotation via mtime detection + ArcSwap; existing connections use old cert, new handshakes pick up new cert automatically. **Covers HTTP/1.1, HTTP/2, and HTTP/3 (QUIC/quiche)**, with private-key plaintext zeroed after all workers apply the update
 - **Panic Recovery**: Connection-level panic catching to recovery worker thread (only affected connection terminates)
 - **Async Logging**: High-performance async logging with ftlog
 - **Config Validation**: Detailed configuration file validation at startup
@@ -1761,6 +1761,7 @@ Zero-downtime certificate rotation without restarting the proxy.
 - **Existing TLS connections** continue using the old certificate (no disruption).
 - **New TLS handshakes** automatically pick up the new certificate.
 - A `SIGHUP` signal also triggers an immediate reload of both config and certificates.
+- **HTTP/1.1, HTTP/2, and HTTP/3 (QUIC/quiche) are all hot-reloadable** (F-105). Because each HTTP/3 worker owns its own `quiche::Config`, the reload thread publishes the raw cert/key PEM atomically via an `ArcSwap`, and each worker swaps them into its config through a `memfd` (Landlock-compatible, no filesystem access) — gated by a cheap per-iteration generation check so the event loop hot path is untouched. Existing QUIC connections keep the old certificate; only new handshakes present the new one. Once every worker has applied the update, the private-key plaintext is zeroed in memory (`secure_zero`).
 
 ### Configuration
 
@@ -3749,7 +3750,7 @@ kill -SIGHUP $(pgrep veil)
 | Routing configuration | ✅ |
 | Security configuration | ✅ |
 | Upstream configuration | ✅ |
-| TLS certificates | ❌ |
+| TLS certificates (HTTP/1.1, HTTP/2, HTTP/3) | ✅ (when `[tls] auto_reload = true`; see "TLS Certificate Hot Reload") |
 | Listen address | ❌ (requires restart) |
 | Worker thread count | ❌ (requires restart) |
 

@@ -268,12 +268,16 @@ ktls_fallback_enabled = true
 #     "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
 # ]
 
-# 証明書の0ダウンタイム自動リロード（F-03）
+# 証明書の0ダウンタイム自動リロード（F-03 / HTTP/3 は F-105）
 # auto_reload = true で証明書/秘密鍵ファイルの mtime 変化を検知し、
 # 新しいハンドシェイクのみ新証明書を使用する（既存接続は影響なし）。
 # SIGHUP でも即時リロードされる。
-# 注意: Landlock サンドボックス有効時は証明書ディレクトリへの read を
-#       許可するか、サンドボックスを無効化する必要がある。
+# HTTP/1.1・HTTP/2 に加え、HTTP/3（QUIC/quiche）の quiche::Config も
+# memfd 経由で無停止差し替えされる（各ワーカーが差分検知時のみ反映。
+# 秘密鍵の平文は全ワーカー適用後にゼロ化）。
+# 注意: Landlock サンドボックス有効時は、リロードスレッドが cert/key ファイルを
+#       再読込するため、証明書ディレクトリを landlock_read_paths に含めるか、
+#       サンドボックスを無効化する必要がある（HTTP/3 も同条件）。
 # auto_reload = false
 # reload_interval_secs = 60
 
