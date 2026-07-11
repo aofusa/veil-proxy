@@ -136,6 +136,8 @@
 | F-100 | P2 | 未着手 | [features/F-100-test-coverage-report-ci.md](features/F-100-test-coverage-report-ci.md) | F-99 追加 E2E/プローブの CI 組み込み（F-99 から分離。**本作業では対象外**） |
 | F-101 | P1 | 完了 | [features/F-101-http3-web-features-flow-control.md](features/F-101-http3-web-features-flow-control.md) | http3_grpc_test_coverage_report: H3 静的/リダイレクト/SNI・cert/oversized/Alt-Svc アップグレード E2E + QUIC フロー制御違反プローブ。**CI は F-102** |
 | F-102 | P2 | 未着手 | [features/F-102-http3-web-features-ci.md](features/F-102-http3-web-features-ci.md) | F-101 追加 E2E/プローブの CI 組み込み（F-101 から分離。**本作業では対象外**） |
+| F-103 | P1 | 進行中 | [features/F-103-http3-grpc-edge-h3-coverage.md](features/F-103-http3-grpc-edge-h3-coverage.md) | レポート: gRPC over H3 エッジ E2E 12 + H3 multiplex coalesce 1 + container_security S-G-H3-09〜13 / S-H3-18〜20。**CI は F-104** |
+| F-104 | P2 | 未着手 | [features/F-104-http3-grpc-edge-h3-ci.md](features/F-104-http3-grpc-edge-h3-ci.md) | F-103 追加 E2E/プローブの CI 組み込み（F-103 から分離。**本作業では対象外**） |
 | F-73 | P1 | 完了 | [features/F-73-http2-send-zerocopy-writeall.md](features/F-73-http2-send-zerocopy-writeall.md) | HTTP/2 送信ホットパスの write_all ゼロコピー化（per-frame の 2 度目の to_vec 確保+コピーを排除）。A/B で **HTTP/2 +11.6%**（1577→1761 req/s、nginx 比 75%→84%）、HTTP/1.1 不変・応答ボディ sha256 一致。レポート `docs/artifacts/performance_report_veil_vs_nginx_v3.md` |
 | F-74 | P1 | 完了 | [features/F-74-http2-send-frame-coalescing.md](features/F-74-http2-send-frame-coalescing.md) | HTTP/2 送信ホットパスのフレーム連結（HEADERS/DATA コアレッシング）。1 レスポンス分のフレームを接続再利用連結バッファ `write_buf`（スレッドローカルプール）へ積み **1 回の書き込み** で送出。`encode_*_into` 追記 API・`send_headers_buffered`・128KB 途中フラッシュ閾値を追加。per-frame 送信システムコールを削減。単体 660 / http2 E2E 11 / gRPC E2E 35 グリーン。F-73 続き |
 | F-11 | P3 | 未着手 | [features/dashboard.md](features/dashboard.md) | ダッシュボード機能 |
