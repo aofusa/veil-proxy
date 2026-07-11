@@ -35,12 +35,24 @@ log "compression_response: code=${code} encoding=${enc:-none}"
 check "response_compression" "[[ '${code}' == '200' ]]"
 
 # E-07: 高圧縮率 gzip（10MB ゼロ）— 413/4xx/切断を許容、プロセス生存を重視
+# curl の非 0 終了（rc=56 等の途中切断）も攻撃耐性の正常経路なので set -e で落とさない
 dd if=/dev/zero bs=1M count=10 2>/dev/null | gzip -9 >"${TMP}/bomb.gz"
+set +e
 bomb_code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 10 \
     -X POST -H "Content-Encoding: gzip" -H "Content-Type: application/octet-stream" \
     --data-binary @"${TMP}/bomb.gz" "https://${VEIL_HOST}:${VEIL_HTTPS_PORT}/" 2>/dev/null)
-bomb_code="${bomb_code:-000}"
-log "gzip_bomb_post: code=${bomb_code}"
+bomb_rc=$?
+set -e
+# 空 or 000 は失敗扱い。接続リセットで body が無くても http_code が取れる場合あり
+if [[ -z "${bomb_code}" ]] || [[ "${bomb_code}" == "000" ]]; then
+    if [[ "${bomb_rc}" -ne 0 ]]; then
+        # 途中切断はクラッシュ無しとして許容（生存は post_bomb_health で確認）
+        bomb_code="reset"
+    else
+        bomb_code="000"
+    fi
+fi
+log "gzip_bomb_post: code=${bomb_code} curl_rc=${bomb_rc}"
 check "gzip_bomb_no_crash" "[[ '${bomb_code}' != '000' ]]"
 hc=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 \
     "https://${VEIL_HOST}:${VEIL_HTTPS_PORT}/" 2>/dev/null || echo "000")
