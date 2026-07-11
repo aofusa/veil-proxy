@@ -47,6 +47,26 @@ c=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 \
     "https://${VEIL_HOST}:${VEIL_HTTPS_PORT}/grpc.test.v1.TestService/UnaryCall" 2>/dev/null || echo "000")
 check_no_crash "grpc_web_oversized_metadata" "${c}"
 
+# F-97: gRPC-Web Large Base64 Decoding DOS（正当だが極端に長い Base64 ペイロード）
+# application/grpc-web-text はボディ全体が Base64。CPU 枯渇耐性とクラッシュ無しを検証。
+log "F-97: grpc_web_large_base64_dos"
+# 256KB 相当の 'A' を base64 風に（有効 alphabet のみ）
+large_b64=$(python3 - <<'PY' 2>/dev/null || true
+import base64
+# ~200KB binary → ~270KB base64
+print(base64.b64encode(b"A" * (200 * 1024)).decode())
+PY
+)
+if [[ -z "${large_b64}" ]]; then
+    # python が無い場合は head/tr で近似
+    large_b64=$(head -c 200000 /dev/zero | base64 -w0 2>/dev/null || head -c 200000 /dev/zero | base64)
+fi
+c=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 15 \
+    -X POST -H "Content-Type: application/grpc-web-text" -H "Accept: application/grpc-web-text" \
+    --data-binary "${large_b64}" \
+    "https://${VEIL_HOST}:${VEIL_HTTPS_PORT}/grpc.test.v1.TestService/UnaryCall" 2>/dev/null || echo "000")
+check_no_crash "grpc_web_large_base64_dos" "${c}"
+
 hc=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 \
     "https://${VEIL_HOST}:${VEIL_HTTPS_PORT}/" 2>/dev/null || echo "000")
 if [[ "${hc}" == "200" ]]; then

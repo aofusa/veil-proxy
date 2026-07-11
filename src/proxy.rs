@@ -405,6 +405,32 @@ fn header_pair_is_grpc(name: &[u8], value: &[u8]) -> bool {
     name.eq_ignore_ascii_case(b"content-type") && value.starts_with(b"application/grpc")
 }
 
+/// 既に組み立てた HTTP リクエストバイト列に `Content-Type: application/grpc` が含まれるか。
+/// ホットパス: ヘッダ終端までの線形スキャンのみ（アロケーションなし）。
+fn request_bytes_indicate_grpc(request: &[u8]) -> bool {
+    let head_end = request
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap_or(request.len());
+    let head = &request[..head_end];
+    let mut i = 0;
+    while i + 13 <= head.len() {
+        if head[i..i + 13].eq_ignore_ascii_case(b"content-type:") {
+            let rest = &head[i + 13..];
+            let line_end = rest
+                .iter()
+                .position(|&b| b == b'\r' || b == b'\n')
+                .unwrap_or(rest.len());
+            let value = rest[..line_end].trim_ascii_start();
+            if value.len() >= 16 && value[..16].eq_ignore_ascii_case(b"application/grpc") {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 fn is_connection_closed_error(e: &std::io::Error) -> bool {
     use std::io::ErrorKind;
 
@@ -1075,12 +1101,8 @@ async fn handle_h2_request_streaming<S>(
         _ => return, // 静的ファイル/リダイレクト等 → バッファ経路
     };
 
-    // バッファリングモードが full ならストリーミングしない
-    if buffering.mode == crate::buffering::BufferingMode::Full {
-        return;
-    }
-
-    // gRPC はトレイラー等の特別処理が必要なため非対象（content-type で判定）
+    // gRPC はトレイラー等の特別処理が必要なため HTTP/2 汎用ストリーミング非対象
+    // （H2C 専用経路で処理。Full バッファリングも H2C 側でバイパスされる）
     let is_grpc = h2_headers_store.iter().any(|(name, value)| {
         name.eq_ignore_ascii_case(b"content-type")
             && value
@@ -1089,6 +1111,11 @@ async fn handle_h2_request_streaming<S>(
                 .unwrap_or(false)
     });
     if is_grpc {
+        return;
+    }
+
+    // バッファリングモードが full ならストリーミングしない（gRPC 以外）
+    if buffering.mode == crate::buffering::BufferingMode::Full {
         return;
     }
 
@@ -1937,8 +1964,42 @@ async fn handle_http2_proxy<S>(
 where
     S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
 {
-    // サーバー選択
-    let server = match upstream_group.select(client_ip) {
+    // サーバー選択（Consistent Hash の header:/cookie: キーをリクエストヘッダから解決）
+    // get_stream の借用を select 完了前に終わらせる（後続の conn 可変借用と衝突しないよう）。
+    let hash_key_owned: Option<String> = conn.get_stream(stream_id).and_then(|stream| {
+        match &upstream_group.algorithm {
+            crate::config::LoadBalanceAlgorithm::ConsistentHash {
+                hash_key: crate::config::HashKey::Header(name),
+            } => stream
+                .request_headers
+                .iter()
+                .find(|h| h.name.eq_ignore_ascii_case(name.as_bytes()))
+                .and_then(|h| std::str::from_utf8(&h.value).ok())
+                .map(|s| s.to_string()),
+            crate::config::LoadBalanceAlgorithm::ConsistentHash {
+                hash_key: crate::config::HashKey::Cookie(name),
+            } => stream
+                .request_headers
+                .iter()
+                .find(|h| h.name.eq_ignore_ascii_case(b"cookie"))
+                .and_then(|h| std::str::from_utf8(&h.value).ok())
+                .and_then(|c| {
+                    c.split(';').find_map(|part| {
+                        let part = part.trim();
+                        part.split_once('=').and_then(|(k, v)| {
+                            if k.trim().eq_ignore_ascii_case(name) {
+                                Some(v.trim().to_string())
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                }),
+            _ => None,
+        }
+    });
+    let server = match upstream_group.select_with_key(client_ip, hash_key_owned.as_deref(), None)
+    {
         Some(s) => s,
         None => {
             let server_guard = get_server_header_guard();
@@ -6040,7 +6101,13 @@ async fn handle_proxy(
     }
 
     // ロードバランシング: UpstreamGroup からサーバーを選択
-    let server = match upstream_group.select(client_ip) {
+    // F-97: Consistent Hash の header:/cookie: をリクエストヘッダから解決
+    let server = match upstream_group.select_with_header_fn(client_ip, |name| {
+        headers
+            .iter()
+            .find(|(n, _)| n.as_ref().eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_ref())
+    }) {
         Some(s) => s,
         None => {
             // 利用可能なサーバーがない
@@ -6479,8 +6546,11 @@ async fn proxy_http_pooled(
     let host_str_for_metrics = &target.host;
 
     // バッファリングが有効かどうか判定
-    let buffering_enabled =
-        buffering_config.is_enabled() && buffering_config.should_buffer(Some(content_length));
+    // F-97: Content-Type: application/grpc は Full バッファをバイパス（リクエスト行に含む）
+    let is_grpc_req = request_bytes_indicate_grpc(&request);
+    let buffering_enabled = !is_grpc_req
+        && buffering_config.is_enabled()
+        && buffering_config.should_buffer(Some(content_length));
 
     // リクエスト送信とレスポンス受信
     // kTLS 有効時は splice(2) を使用してゼロコピー転送
@@ -9027,8 +9097,11 @@ async fn proxy_https_pooled(
     // セキュリティ設定からchunked最大サイズを取得
     let max_chunked = security.max_chunked_body_size as u64;
     // バッファリングが有効かどうか判定
-    let buffering_enabled =
-        buffering_config.is_enabled() && buffering_config.should_buffer(Some(content_length));
+    // F-97: gRPC は Full バッファをバイパス
+    let is_grpc_req = request_bytes_indicate_grpc(&request);
+    let buffering_enabled = !is_grpc_req
+        && buffering_config.is_enabled()
+        && buffering_config.should_buffer(Some(content_length));
 
     // プールから取り出した keep-alive 接続は、バックエンド側の idle タイムアウト等で
     // 既に閉じられていることがある。その場合バックエンドからの最初の read が即座に EOF を
@@ -10546,5 +10619,15 @@ mod path_tests {
         assert!(header_pair_is_grpc(b"Content-Type", b"application/grpc+proto"));
         assert!(!header_pair_is_grpc(b"content-type", b"text/plain"));
         assert!(!header_pair_is_grpc(b"accept", b"application/grpc"));
+    }
+
+    #[test]
+    fn test_request_bytes_indicate_grpc() {
+        let grpc = b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Type: application/grpc\r\n\r\n";
+        assert!(request_bytes_indicate_grpc(grpc));
+        let plain = b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Type: text/plain\r\n\r\n";
+        assert!(!request_bytes_indicate_grpc(plain));
+        let mixed = b"POST /x HTTP/1.1\r\ncontent-type: Application/GRPC+proto\r\n\r\n";
+        assert!(request_bytes_indicate_grpc(mixed));
     }
 }

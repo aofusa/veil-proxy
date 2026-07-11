@@ -242,6 +242,54 @@ pub(crate) fn validate_host_header(
     Ok(())
 }
 
+/// HTTP/2・HTTP/3 の `:authority` と `Host` ヘッダが矛盾していないか検証する。
+///
+/// RFC 9110 / 9114: `Host` が存在する場合は `:authority` と一致すべき。
+/// ポート付き/無しの差は許容し、ホスト部分のみを大文字小文字無視で比較する。
+/// `host` が無い場合は不一致ではない（`:authority` のみで十分）。
+///
+/// # Returns
+/// * `true` - 不一致（400 相当で拒否すべき）
+/// * `false` - 一致、または Host 未指定
+#[inline]
+pub(crate) fn authority_host_mismatch(authority: &[u8], host: Option<&[u8]>) -> bool {
+    let Some(host) = host else {
+        return false;
+    };
+    if host.is_empty() {
+        return false;
+    }
+    let a = strip_host_port(authority);
+    let h = strip_host_port(host);
+    if a.is_empty() || h.is_empty() {
+        return false;
+    }
+    !a.eq_ignore_ascii_case(h)
+}
+
+/// `host:port` / `[ipv6]:port` からホスト部分を取り出す（アロケーションなし）。
+#[inline]
+pub(crate) fn strip_host_port(value: &[u8]) -> &[u8] {
+    let value = trim_ascii_whitespace(value);
+    if value.is_empty() {
+        return value;
+    }
+    // IPv6: [addr] or [addr]:port
+    if value[0] == b'[' {
+        if let Some(end) = value.iter().position(|&b| b == b']') {
+            return &value[..=end];
+        }
+        return value;
+    }
+    // host:port — 最後の ':' 以降がすべて数字ならポートとして除去
+    if let Some(i) = value.iter().rposition(|&b| b == b':') {
+        if i > 0 && value[i + 1..].iter().all(|b| b.is_ascii_digit()) {
+            return &value[..i];
+        }
+    }
+    value
+}
+
 /// Hop-by-hopヘッダーリスト (RFC 7230 Section 6.1)
 ///
 /// これらのヘッダーはプロキシで転送してはならない。
@@ -1856,5 +1904,27 @@ mod stack_fmt_tests {
         let before = buf.clone();
         drain_interim_responses(&mut buf);
         assert_eq!(buf, before);
+    }
+
+    // F-97: :authority と Host の不一致検証
+    #[test]
+    fn authority_host_match_same() {
+        assert!(!authority_host_mismatch(b"localhost", Some(b"localhost")));
+        assert!(!authority_host_mismatch(b"localhost:443", Some(b"localhost")));
+        assert!(!authority_host_mismatch(b"Example.COM", Some(b"example.com")));
+        assert!(!authority_host_mismatch(b"localhost", None));
+    }
+
+    #[test]
+    fn authority_host_mismatch_detected() {
+        assert!(authority_host_mismatch(b"localhost", Some(b"evil.example")));
+        assert!(authority_host_mismatch(b"a.example:443", Some(b"b.example:443")));
+    }
+
+    #[test]
+    fn strip_host_port_ipv6_and_port() {
+        assert_eq!(strip_host_port(b"example.com:8443"), b"example.com");
+        assert_eq!(strip_host_port(b"[::1]:443"), b"[::1]");
+        assert_eq!(strip_host_port(b"[2001:db8::1]"), b"[2001:db8::1]");
     }
 }

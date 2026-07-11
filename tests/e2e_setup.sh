@@ -49,6 +49,7 @@ BACKEND2_PORT=9002
 BACKEND_H2C_TLS_PORT=9013
 BACKEND_H2C_PORT=9003
 BACKEND_GRPC_PORT=9004
+BACKEND_GRPC2_PORT=9014
 BACKEND_WS_PORT=9005
 BACKEND_ERROR_PORT=9006
 BACKEND_BAD_PORT=9009
@@ -504,10 +505,13 @@ servers = [
 ]
 tls_insecure = true
 
+# F-97: gRPC Consistent Hash（x-user-id。無い場合は client_ip フォールバック）
 [upstreams."grpc-pool"]
-algorithm = "round_robin"
+algorithm = "consistent_hash"
+hash_key = "header:x-user-id"
 servers = [
-    "http://127.0.0.1:${BACKEND_GRPC_PORT}"
+    "http://127.0.0.1:${BACKEND_GRPC_PORT}",
+    "http://127.0.0.1:${BACKEND_GRPC2_PORT}"
 ]
 
 [upstreams."weighted-pool"]
@@ -520,6 +524,7 @@ tls_insecure = true
 
 [upstreams."ch-pool"]
 algorithm = "consistent_hash"
+hash_key = "header:X-User-Id"
 servers = [
     "https://127.0.0.1:${BACKEND1_PORT}",
     "https://127.0.0.1:${BACKEND2_PORT}"
@@ -600,11 +605,12 @@ unhealthy_threshold = 3
 use_tls = true
 verify_cert = false
 
-# gRPC ヘルスチェック検証用
+# gRPC ヘルスチェック検証用（健全 + 到達不能でフェイルオーバー）
 [upstreams."grpc-health-pool"]
 algorithm = "round_robin"
 servers = [
-    "http://127.0.0.1:${BACKEND_GRPC_PORT}"
+    "http://127.0.0.1:${BACKEND_GRPC_PORT}",
+    "http://127.0.0.1:19998"
 ]
 
 [upstreams."grpc-health-pool".health_check]
@@ -612,9 +618,9 @@ enabled = true
 check_type = "grpc"
 path = "grpc.health.v1.Health"
 interval_secs = 2
-timeout_secs = 3
+timeout_secs = 2
 healthy_threshold = 1
-unhealthy_threshold = 3
+unhealthy_threshold = 2
 EOF
 
     # ヘルスチェック設定を追加（healthcheckタイプの時のみ有効化）
@@ -1064,9 +1070,11 @@ upstream = "ws-pool"
 EOF
 
     # gRPCルート設定
+    # F-97: Full バッファリング設定でも gRPC は H2C でバイパスされること
     cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
 [[route]]
 # F-94: gRPC + WASM インターセプタ E2E 用（modules は route 直下）
+# F-97: grpc-pool = consistent_hash + x-user-id / Full buffering bypass
 modules = ["header_filter"]
 [route.conditions]
 host = "localhost"
@@ -1075,6 +1083,10 @@ path = "/grpc.test.v1.TestService/*"
 type = "Proxy"
 upstream = "grpc-pool"
 use_h2c = true
+[route.buffering]
+mode = "full"
+max_memory_buffer = 64
+max_disk_buffer = 64
 [route.security]
 add_response_headers = { "X-Proxied-By" = "veil", "X-GRPC-Test" = "true", "X-Fixed-Routing" = "true" }
 
@@ -1087,6 +1099,10 @@ path = "/grpc.test.v1.TestService/*"
 type = "Proxy"
 upstream = "grpc-pool"
 use_h2c = true
+[route.buffering]
+mode = "full"
+max_memory_buffer = 64
+max_disk_buffer = 64
 [route.security]
 add_response_headers = { "X-Proxied-By" = "veil", "X-GRPC-Test" = "true" }
 EOF
@@ -1527,9 +1543,17 @@ start_servers() {
 
     # gRPCバックエンド起動（スタンドアロンEchoサーバー、ビルドは ensure_veil_binary で完了済み）
     log_info "Starting gRPC Echo Backend..."
-    RUST_LOG=debug "${SCRIPT_DIR}/grpc_server/target/debug/grpc-server" > /tmp/grpc_server.log 2>&1 &
+    RUST_LOG=debug GRPC_LISTEN_ADDR="127.0.0.1:${BACKEND_GRPC_PORT}" GRPC_SERVER_ID="grpc-server-1" \
+        "${SCRIPT_DIR}/grpc_server/target/debug/grpc-server" > /tmp/grpc_server.log 2>&1 &
     echo $! >> "$PIDS_FILE"
     log_info "gRPC Echo Backend started on port ${BACKEND_GRPC_PORT} (PID: $!, logs: /tmp/grpc_server.log)"
+
+    # F-97: Consistent Hash 用 第2 gRPC バックエンド
+    log_info "Starting gRPC Echo Backend #2..."
+    RUST_LOG=debug GRPC_LISTEN_ADDR="127.0.0.1:${BACKEND_GRPC2_PORT}" GRPC_SERVER_ID="grpc-server-2" \
+        "${SCRIPT_DIR}/grpc_server/target/debug/grpc-server" > /tmp/grpc_server2.log 2>&1 &
+    echo $! >> "$PIDS_FILE"
+    log_info "gRPC Echo Backend #2 started on port ${BACKEND_GRPC2_PORT} (PID: $!, logs: /tmp/grpc_server2.log)"
 
     # テストバックエンド起動（WebSocket Echo + HTTP 500エラー + chunked ストリーミング）
     # ビルドは ensure_veil_binary で完了済み
@@ -1592,6 +1616,22 @@ start_servers() {
     done
     if [ $grpc_wait_count -ge 30 ]; then
         log_warn "gRPC Echo Backend may not be fully ready, continuing..."
+    fi
+
+    # F-97: 第2 gRPC バックエンド起動待機
+    log_info "Waiting for gRPC Echo Backend #2 to be ready..."
+    local grpc2_wait_count=0
+    while [ $grpc2_wait_count -lt 30 ]; do
+        if check_port_in_use "$BACKEND_GRPC2_PORT"; then
+            log_info "gRPC Echo Backend #2 is ready (port ${BACKEND_GRPC2_PORT} is listening)"
+            sleep 0.5
+            break
+        fi
+        grpc2_wait_count=$((grpc2_wait_count + 1))
+        sleep 0.2
+    done
+    if [ $grpc2_wait_count -ge 30 ]; then
+        log_warn "gRPC Echo Backend #2 may not be fully ready, continuing..."
     fi
     
     log_info "Starting proxy server..."
@@ -1691,7 +1731,7 @@ check_port_conflicts() {
     log_info "Checking for port conflicts..."
     local conflicts=0
     
-    for port in $PROXY_HTTPS_PORT $PROXY_HTTP_PORT $PROXY_H2C_PORT $PROXY_L4_PORT $PROXY_L4_LEAST_CONN_PORT $PROXY_L4_TERMINATE_PORT $BACKEND1_PORT $BACKEND2_PORT $BACKEND_H2C_PORT $BACKEND_GRPC_PORT $BACKEND_WS_PORT $BACKEND_ERROR_PORT $BACKEND_BAD_PORT $BACKEND_CHUNKED_PORT $BACKEND_ECHO_PORT $BACKEND_TLS_ECHO_PORT; do
+    for port in $PROXY_HTTPS_PORT $PROXY_HTTP_PORT $PROXY_H2C_PORT $PROXY_L4_PORT $PROXY_L4_LEAST_CONN_PORT $PROXY_L4_TERMINATE_PORT $BACKEND1_PORT $BACKEND2_PORT $BACKEND_H2C_PORT $BACKEND_GRPC_PORT $BACKEND_GRPC2_PORT $BACKEND_WS_PORT $BACKEND_ERROR_PORT $BACKEND_BAD_PORT $BACKEND_CHUNKED_PORT $BACKEND_ECHO_PORT $BACKEND_TLS_ECHO_PORT; do
         if check_port_in_use "$port"; then
             log_error "Port $port is already in use"
             conflicts=$((conflicts + 1))

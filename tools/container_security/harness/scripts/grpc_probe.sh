@@ -386,6 +386,47 @@ c=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 --http2-prior-knowledge 
 check_no_crash "grpc_malicious_trailers_h2c" "${c}"
 check_health "post_grpc_malicious_trailers_h2c" || true
 
+# ---------------------------------------------------------------------------
+# F-97: レポート §4 フェーズ3 gRPC
+# ---------------------------------------------------------------------------
+
+# S-G-16: gRPC Path Bypass — URL エンコード / パストラバーサル風で認証・ルーティングすり抜けを試みる
+# 期待: クラッシュせず、成功ステータスで本来の gRPC サービスになりすませないこと
+log "F-97: grpc_path_bypass"
+for bypass_path in \
+    "/grpc.test.v1.TestService%2FUnaryCall" \
+    "/grpc.test.v1.TestService/..%2fUnaryCall" \
+    "/./grpc.test.v1.TestService/UnaryCall" \
+    "/%67rpc.test.v1.TestService/UnaryCall"
+do
+    c=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 --http2-prior-knowledge \
+        -X POST -H "Content-Type: application/grpc" -H "TE: trailers" \
+        -d $'\x00\x00\x00\x00\x00' \
+        "http://${VEIL_HOST}:${VEIL_H2C_PORT}${bypass_path}" 2>/dev/null || echo "000")
+    # 000 は hang 疑い FAIL。それ以外（400/404/200/502）はクラッシュ無し PASS
+    check_no_crash "grpc_path_bypass:${bypass_path}" "${c}"
+done
+check_health "post_grpc_path_bypass" || true
+
+# S-G-17: gRPC WASM Crash Resilience — 不正ペイロードで WASM 経路を刺激しプロキシ生存を確認
+# header_filter 等が載っている gRPC ルートへ異常 LPM / 巨大メタデータを送る
+log "F-97: grpc_wasm_crash_resilience"
+c=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 8 --http2-prior-knowledge \
+    -X POST \
+    -H "Content-Type: application/grpc" \
+    -H "TE: trailers" \
+    -H "x-wasm-crash: $(printf 'X%.0s' {1..8000})" \
+    -d $'\x00\xff\xff\xff\xff' \
+    "http://${VEIL_HOST}:${VEIL_H2C_PORT}/grpc.test.v1.TestService/UnaryCall" 2>/dev/null || echo "000")
+check_no_crash "grpc_wasm_crash_resilience" "${c}"
+# 直後の正常リクエストで生存確認
+c2=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 --http2-prior-knowledge \
+    -X POST -H "Content-Type: application/grpc" -H "TE: trailers" \
+    -d $'\x00\x00\x00\x00\x00' \
+    "http://${VEIL_HOST}:${VEIL_H2C_PORT}/grpc.test.v1.TestService/UnaryCall" 2>/dev/null || echo "000")
+check_no_crash "grpc_wasm_post_crash_recovery" "${c2}"
+check_health "post_grpc_wasm_crash" || true
+
 check_health "post_probe_health" || true
 
 if [[ "${fails}" -eq 0 ]]; then

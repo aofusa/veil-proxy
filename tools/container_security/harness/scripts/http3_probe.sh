@@ -151,6 +151,18 @@ check_tls_health "post_h3_migration_spoof" || true
 run_h3_mode qpack_async_ref "h3_qpack_async_ref" || true
 check_tls_health "post_h3_qpack_async_ref" || true
 
+# ---------------------------------------------------------------------------
+# F-97: レポート §4 フェーズ3 HTTP/3
+# ---------------------------------------------------------------------------
+
+# S-H3-14: QUIC Stream Body Slowloris — 接続後ボディを極遅送信
+run_h3_mode stream_body_slowloris "h3_stream_body_slowloris" || true
+check_tls_health "post_h3_stream_body_slowloris" || true
+
+# S-H3-15: QPACK Memory Exhaustion — 巨大ユニークヘッダ連打
+run_h3_mode qpack_memory_exhaustion "h3_qpack_memory_exhaustion" || true
+check_tls_health "post_h3_qpack_memory_exhaustion" || true
+
 # 最終ヘルス
 check_tls_health "post_http3_tls_health" || true
 

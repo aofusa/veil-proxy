@@ -9,22 +9,37 @@ pub mod test_service {
 use test_service::test_service_server::{TestService, TestServiceServer};
 use test_service::{SimpleRequest, SimpleResponse};
 
-#[derive(Debug, Default)]
-pub struct MyTestService {}
+#[derive(Debug, Clone)]
+pub struct MyTestService {
+    /// レスポンスメタデータ `x-server-id`（Consistent Hash E2E 用）
+    server_id: String,
+}
+
+impl MyTestService {
+    fn new(server_id: String) -> Self {
+        Self { server_id }
+    }
+
+    fn apply_server_id<T>(&self, resp: &mut Response<T>) {
+        if let Ok(v) = self.server_id.parse() {
+            resp.metadata_mut().insert("x-server-id", v);
+        }
+    }
+}
 
 #[tonic::async_trait]
 impl TestService for MyTestService {
     async fn test(&self, request: Request<SimpleRequest>) -> Result<Response<SimpleResponse>, Status> {
         let req = request.into_inner();
         let mut resp = Response::new(SimpleResponse { message: req.message });
-        resp.metadata_mut().insert("x-server-id", "grpc-server".parse().unwrap());
+        self.apply_server_id(&mut resp);
         Ok(resp)
     }
 
     async fn unary_call(&self, request: Request<SimpleRequest>) -> Result<Response<SimpleResponse>, Status> {
         let req = request.into_inner();
         let mut resp = Response::new(SimpleResponse { message: req.message });
-        resp.metadata_mut().insert("x-server-id", "grpc-server".parse().unwrap());
+        self.apply_server_id(&mut resp);
         Ok(resp)
     }
 
@@ -42,7 +57,7 @@ impl TestService for MyTestService {
             }
         };
         let mut resp = Response::new(Box::pin(output) as Self::ServerStreamingStream);
-        resp.metadata_mut().insert("x-server-id", "grpc-server".parse().unwrap());
+        self.apply_server_id(&mut resp);
         Ok(resp)
     }
 
@@ -54,7 +69,7 @@ impl TestService for MyTestService {
             last_msg = msg.message;
         }
         let mut resp = Response::new(SimpleResponse { message: format!("Received {} messages, last: {}", count, last_msg) });
-        resp.metadata_mut().insert("x-server-id", "grpc-server".parse().unwrap());
+        self.apply_server_id(&mut resp);
         Ok(resp)
     }
 
@@ -68,15 +83,20 @@ impl TestService for MyTestService {
             }
         };
         let mut resp = Response::new(Box::pin(output) as Self::BidirectionalStreamingStream);
-        resp.metadata_mut().insert("x-server-id", "grpc-server".parse().unwrap());
+        self.apply_server_id(&mut resp);
         Ok(resp)
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr = "127.0.0.1:9004".parse()?;
-    let test_service = MyTestService::default();
+    // F-97: GRPC_LISTEN_ADDR / GRPC_SERVER_ID で複数インスタンス起動可能
+    let addr_str =
+        std::env::var("GRPC_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:9004".to_string());
+    let server_id =
+        std::env::var("GRPC_SERVER_ID").unwrap_or_else(|_| "grpc-server".to_string());
+    let addr: std::net::SocketAddr = addr_str.parse()?;
+    let test_service = MyTestService::new(server_id.clone());
 
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -84,11 +104,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // gRPC Health Checking Protocol（E2E の grpc ヘルスチェック検証用）
     let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
-    health_reporter
-        .set_serving::<TestServiceServer<MyTestService>>()
-        .await;
+    // GRPC_HEALTH_NOT_SERVING=1 で NOT_SERVING を返す（フェイルオーバー E2E 用）
+    if std::env::var("GRPC_HEALTH_NOT_SERVING").ok().as_deref() == Some("1") {
+        health_reporter
+            .set_not_serving::<TestServiceServer<MyTestService>>()
+            .await;
+    } else {
+        health_reporter
+            .set_serving::<TestServiceServer<MyTestService>>()
+            .await;
+    }
 
-    println!("gRPC Test Server listening on {}", addr);
+    println!(
+        "gRPC Test Server listening on {} (server_id={})",
+        addr, server_id
+    );
 
     Server::builder()
         .add_service(health_service)

@@ -227,6 +227,174 @@ pub(crate) fn perform_tcp_health_check(addr: &str, timeout: Duration) -> bool {
 ///
 /// grpc.health.v1.Health/Check を送信し、SERVING ステータスを確認する。
 /// TLS の有無は `use_tls` で制御する。`service_name` が空文字の場合はサーバー全体のチェック。
+/// gRPC Health Checking Protocol 用の LPM リクエストボディを構築する。
+fn build_grpc_health_request_body(service_name: &str) -> Vec<u8> {
+    let service_bytes = service_name.as_bytes();
+    let proto_body: Vec<u8> = if service_bytes.is_empty() {
+        vec![]
+    } else {
+        let mut body = Vec::with_capacity(2 + service_bytes.len());
+        body.push(0x0a); // field 1, wire type 2 (length-delimited)
+        body.push(service_bytes.len() as u8);
+        body.extend_from_slice(service_bytes);
+        body
+    };
+    let mut grpc_frame = Vec::with_capacity(5 + proto_body.len());
+    grpc_frame.push(0u8);
+    let msg_len = proto_body.len() as u32;
+    grpc_frame.extend_from_slice(&msg_len.to_be_bytes());
+    grpc_frame.extend_from_slice(&proto_body);
+    grpc_frame
+}
+
+/// F-97: H2C Prior Knowledge で grpc.health.v1.Health/Check を実行する（コールドパス・同期）。
+///
+/// tonic 等の本物の gRPC サーバは HTTP/2 のみ受け付けるため、HTTP/1.1 フォールバック前に試行する。
+/// 戻り値: Ok(healthy) / Err(()) は接続・ハンドシェイク失敗（H1 へフォールバック可）。
+#[cfg(feature = "http2")]
+#[allow(clippy::disallowed_methods)] // ヘルスチェックスレッド専用の同期 I/O
+fn perform_grpc_health_check_h2c(
+    addr: &str,
+    _service_name: &str,
+    grpc_frame: &[u8],
+    timeout: Duration,
+) -> Result<bool, ()> {
+    use crate::http2::client::CONNECTION_PREFACE;
+    use crate::http2::frame::{Frame, FrameDecoder, FrameEncoder, FrameHeader};
+    use crate::http2::hpack::{HpackDecoder, HpackEncoder};
+    use crate::http2::settings::defaults;
+    use std::io::{Read, Write};
+    use std::net::TcpStream as StdTcpStream;
+
+    let mut stream = StdTcpStream::connect_timeout(
+        &addr
+            .parse()
+            .unwrap_or_else(|_| std::net::SocketAddr::from(([127, 0, 0, 1], 80))),
+        timeout,
+    )
+    .map_err(|_| ())?;
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+
+    let enc = FrameEncoder::new(defaults::MAX_FRAME_SIZE);
+    let mut hpack = HpackEncoder::new(defaults::HEADER_TABLE_SIZE as usize);
+    let decoder = FrameDecoder::new(defaults::MAX_FRAME_SIZE);
+    let mut hpack_dec = HpackDecoder::new(defaults::HEADER_TABLE_SIZE as usize);
+
+    // Preface + SETTINGS
+    stream.write_all(CONNECTION_PREFACE).map_err(|_| ())?;
+    let settings = enc.encode_settings(
+        &[
+            (0x3, defaults::MAX_CONCURRENT_STREAMS),
+            (0x4, defaults::INITIAL_WINDOW_SIZE),
+        ],
+        false,
+    );
+    stream.write_all(&settings).map_err(|_| ())?;
+
+    let host = addr.split(':').next().unwrap_or(addr);
+    let path = b"/grpc.health.v1.Health/Check";
+    let headers: [(&[u8], &[u8], bool); 6] = [
+        (b":method", b"POST", false),
+        (b":path", path, false),
+        (b":scheme", b"http", false),
+        (b":authority", host.as_bytes(), false),
+        (b"content-type", b"application/grpc", false),
+        (b"te", b"trailers", false),
+    ];
+    let block = hpack.encode(&headers).map_err(|_| ())?;
+    let headers_frame = enc.encode_headers(1, &block, false, true, None);
+    stream.write_all(&headers_frame).map_err(|_| ())?;
+    let data_frame = enc.encode_data(1, grpc_frame, true);
+    stream.write_all(&data_frame).map_err(|_| ())?;
+
+    let mut buf = vec![0u8; 16384];
+    let mut filled = 0usize;
+    let mut grpc_status_ok = false;
+    let mut saw_serving = false;
+    let mut saw_not_serving = false;
+    let mut end = false;
+    let deadline = std::time::Instant::now() + timeout;
+
+    while !end && std::time::Instant::now() < deadline {
+        if filled >= buf.len() {
+            break;
+        }
+        match stream.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
+            Err(_) => return Err(()),
+        }
+
+        let mut offset = 0usize;
+        while offset + 9 <= filled {
+            let mut hdr9 = [0u8; 9];
+            hdr9.copy_from_slice(&buf[offset..offset + 9]);
+            let header = FrameHeader::decode(&hdr9);
+            let frame_len = header.length as usize;
+            if offset + 9 + frame_len > filled {
+                break;
+            }
+            let payload = &buf[offset + 9..offset + 9 + frame_len];
+            match decoder.decode(&header, payload) {
+                Ok(Frame::Settings { ack, .. }) => {
+                    if !ack {
+                        let _ = stream.write_all(&enc.encode_settings_ack());
+                    }
+                }
+                Ok(Frame::WindowUpdate { .. }) | Ok(Frame::Ping { .. }) => {}
+                Ok(Frame::Headers {
+                    header_block,
+                    end_stream,
+                    ..
+                }) => {
+                    if let Ok(decoded) = hpack_dec.decode(&header_block) {
+                        for field in decoded {
+                            if field.name.eq_ignore_ascii_case(b"grpc-status") {
+                                grpc_status_ok = field.value == b"0";
+                            }
+                        }
+                    }
+                    if end_stream {
+                        end = true;
+                    }
+                }
+                Ok(Frame::Data {
+                    data, end_stream, ..
+                }) => {
+                    // HealthCheckResponse: field 1 varint status=1 (SERVING) → 0x08 0x01
+                    if data.len() >= 7 {
+                        let msg = &data[5..];
+                        if msg.windows(2).any(|w| w == [0x08, 0x01]) {
+                            saw_serving = true;
+                        }
+                        if msg.windows(2).any(|w| w == [0x08, 0x02]) {
+                            saw_not_serving = true;
+                        }
+                    }
+                    if end_stream {
+                        end = true;
+                    }
+                }
+                Ok(Frame::GoAway { .. }) | Ok(Frame::RstStream { .. }) => return Ok(false),
+                _ => {}
+            }
+            offset += 9 + frame_len;
+        }
+        if offset > 0 {
+            buf.copy_within(offset..filled, 0);
+            filled -= offset;
+        }
+    }
+
+    if saw_not_serving {
+        return Ok(false);
+    }
+    Ok(grpc_status_ok || saw_serving)
+}
+
 // 理由付き allow: 専用ヘルスチェックスレッドから呼ばれる同期プローブ（イベントループ外）。
 #[allow(clippy::disallowed_methods)]
 pub(crate) fn perform_grpc_health_check(
@@ -238,6 +406,19 @@ pub(crate) fn perform_grpc_health_check(
 ) -> bool {
     use std::io::{Read, Write};
     use std::net::TcpStream as StdTcpStream;
+
+    let grpc_frame = build_grpc_health_request_body(service_name);
+
+    // F-97: まず H2C（本物の gRPC サーバ向け）。失敗時のみ H1 モック互換へフォールバック。
+    #[cfg(feature = "http2")]
+    if !use_tls {
+        match perform_grpc_health_check_h2c(addr, service_name, &grpc_frame, timeout) {
+            Ok(healthy) => return healthy,
+            Err(()) => {
+                // H2C 接続/ハンドシェイク失敗 → H1 フォールバック
+            }
+        }
+    }
 
     // TCP 接続
     let mut tcp_stream = match StdTcpStream::connect_timeout(
@@ -252,31 +433,7 @@ pub(crate) fn perform_grpc_health_check(
     let _ = tcp_stream.set_read_timeout(Some(timeout));
     let _ = tcp_stream.set_write_timeout(Some(timeout));
 
-    // gRPC Health Check メッセージを構築
-    // healthpb.HealthCheckRequest { service: service_name } の protobuf エンコード
-    // field 1 (service, string): tag=0x0a, then length-prefixed bytes
-    let service_bytes = service_name.as_bytes();
-    let proto_body: Vec<u8> = if service_bytes.is_empty() {
-        vec![]
-    } else {
-        let mut body = Vec::with_capacity(2 + service_bytes.len());
-        body.push(0x0a); // field 1, wire type 2 (length-delimited)
-        body.push(service_bytes.len() as u8);
-        body.extend_from_slice(service_bytes);
-        body
-    };
-
-    // gRPC フレーム: 1 byte 圧縮フラグ (0) + 4 byte メッセージ長
-    let mut grpc_frame = Vec::with_capacity(5 + proto_body.len());
-    grpc_frame.push(0u8); // 圧縮なし
-    let msg_len = proto_body.len() as u32;
-    grpc_frame.extend_from_slice(&msg_len.to_be_bytes());
-    grpc_frame.extend_from_slice(&proto_body);
-
-    // HTTP/2 の完全実装は重いため、HTTP/1.1 アップグレード不要の gRPC-over-HTTP/1.1
-    // ではなく h2c プリフェース + 最小フレームで直接送信する簡易実装を使用する。
-    // 実用上はバックエンドが HTTP/1.1 の gRPC ヘルスエンドポイントを提供している場合のみ動作。
-    // HTTP/1.1 POST with Content-Type: application/grpc
+    // HTTP/1.1 モック互換パス（単体テスト・簡易バックエンド用）
     let host_header = addr.split(':').next().unwrap_or(addr);
     let request = format!(
         "POST /grpc.health.v1.Health/Check HTTP/1.1\r\n\

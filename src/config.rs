@@ -3748,6 +3748,23 @@ pub enum HashKey {
     Cookie(String),
 }
 
+/// Cookie ヘッダ値から指定名の値を取り出す（アロケーションなし）。
+/// `name=value` を `;` 区切りで走査し、名前一致時に value スライスを返す。
+fn extract_cookie_value<'a>(cookie_header: &'a str, name: &str) -> Option<&'a str> {
+    for part in cookie_header.split(';') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = part.split_once('=') {
+            if k.trim().eq_ignore_ascii_case(name) {
+                return Some(v.trim());
+            }
+        }
+    }
+    None
+}
+
 impl HashKey {
     /// 文字列からパース（`"ip"`, `"header:X-Foo"`, `"cookie:session"`）
     pub fn parse(s: &str) -> Result<Self, String> {
@@ -4208,6 +4225,42 @@ impl UpstreamGroup {
     /// 選択されたサーバーへの参照（健全なサーバーがない場合は None）
     pub fn select(&self, client_ip: &str) -> Option<&UpstreamServer> {
         self.select_with_key(client_ip, None, None)
+    }
+
+    /// リクエストヘッダから Consistent Hash キーを解決してサーバーを選択する。
+    ///
+    /// - `ConsistentHash { Header }` / `Cookie` のときだけ `get_header` を呼ぶ
+    ///   （それ以外のアルゴリズムではヘッダ走査ゼロ — ホットパス最適化）。
+    /// - 値が取れない場合は `client_ip` にフォールバックする。
+    ///
+    /// `get_header` はヘッダ名（小文字比較用バイト列）を受け取り、値のバイト列を返す。
+    /// Cookie 名は `HashKey::Cookie` の名前で `cookie` ヘッダをパースする。
+    pub fn select_with_header_fn<'a, F>(
+        &'a self,
+        client_ip: &str,
+        mut get_header: F,
+    ) -> Option<&'a UpstreamServer>
+    where
+        F: FnMut(&[u8]) -> Option<&'a [u8]>,
+    {
+        match &self.algorithm {
+            LoadBalanceAlgorithm::ConsistentHash {
+                hash_key: HashKey::Header(name),
+            } => {
+                let val = get_header(name.as_bytes())
+                    .and_then(|v| std::str::from_utf8(v).ok());
+                self.select_with_key(client_ip, val, None)
+            }
+            LoadBalanceAlgorithm::ConsistentHash {
+                hash_key: HashKey::Cookie(name),
+            } => {
+                let cookie_hdr = get_header(b"cookie")
+                    .and_then(|v| std::str::from_utf8(v).ok());
+                let val = cookie_hdr.and_then(|c| extract_cookie_value(c, name));
+                self.select_with_key(client_ip, val, None)
+            }
+            _ => self.select(client_ip),
+        }
     }
 
     /// ハッシュキーの値を指定してサーバーを選択する
@@ -6100,6 +6153,61 @@ mod load_balancing_tests {
             HashKey::Cookie("session_id".into())
         );
         assert!(HashKey::parse("garbage").is_err());
+    }
+
+    /// F-97: header キーの Consistent Hash が select_with_header_fn で安定
+    #[test]
+    fn consistent_hash_header_key_via_select_with_header_fn() {
+        let entries = vec![
+            entry("http://10.0.0.1:80", 1),
+            entry("http://10.0.0.2:80", 1),
+        ];
+        let group = UpstreamGroup::new(
+            "ch-hdr".into(),
+            entries,
+            LoadBalanceAlgorithm::ConsistentHash {
+                hash_key: HashKey::Header("x-user-id".into()),
+            },
+            None,
+            false,
+        )
+        .unwrap();
+
+        let headers: Vec<(&[u8], &[u8])> = vec![(b"x-user-id", b"user-stable-1")];
+        let first = group
+            .select_with_header_fn("1.2.3.4", |name| {
+                headers
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                    .map(|(_, v)| *v)
+            })
+            .unwrap()
+            .target
+            .host
+            .clone();
+        for _ in 0..20 {
+            let host = group
+                .select_with_header_fn("9.9.9.9", |name| {
+                    headers
+                        .iter()
+                        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                        .map(|(_, v)| *v)
+                })
+                .unwrap()
+                .target
+                .host
+                .clone();
+            assert_eq!(
+                host, first,
+                "same header value must stick to same backend regardless of client IP"
+            );
+        }
+
+        // Cookie キー
+        assert_eq!(
+            extract_cookie_value("a=1; session_id=abc; b=2", "session_id"),
+            Some("abc")
+        );
     }
 
     #[test]

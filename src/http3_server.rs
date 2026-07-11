@@ -672,8 +672,14 @@ impl Http3Handler {
             _ => return Decision::Buffer,
         };
 
-        // バッファリング full は全バッファ経路。
-        if buffering.mode == crate::buffering::BufferingMode::Full {
+        // gRPC（トレーラー）はバッファ経路。Full バッファでも gRPC は専用経路で処理される。
+        #[cfg(feature = "grpc")]
+        let is_grpc = Self::is_grpc_request(headers);
+        #[cfg(not(feature = "grpc"))]
+        let is_grpc = false;
+
+        // バッファリング full は gRPC 以外で全バッファ経路（F-97: gRPC は Full をバイパス）。
+        if buffering.mode == crate::buffering::BufferingMode::Full && !is_grpc {
             return Decision::Buffer;
         }
         // WASM モジュール適用ありはボディ全体が必要 → バッファ経路。
@@ -681,9 +687,8 @@ impl Http3Handler {
         if _modules.as_deref().map(|m| !m.is_empty()).unwrap_or(false) {
             return Decision::Buffer;
         }
-        // gRPC（トレーラー）はバッファ経路。
-        #[cfg(feature = "grpc")]
-        if Self::is_grpc_request(headers) {
+        // gRPC はトレーラー処理のためバッファ経路（ストリーミング Decision の対象外）
+        if is_grpc {
             return Decision::Buffer;
         }
 
@@ -709,8 +714,13 @@ impl Http3Handler {
             return Decision::Handled;
         }
 
-        // サーバ選択。
-        let server = match upstream_group.select(&self.client_ip) {
+        // サーバ選択（F-97: Consistent Hash header/cookie キー対応）。
+        let server = match upstream_group.select_with_header_fn(&self.client_ip, |name| {
+            headers
+                .iter()
+                .find(|h| h.name().eq_ignore_ascii_case(name))
+                .map(|h| h.value())
+        }) {
             Some(s) => s.clone(),
             None => return Decision::Buffer, // handle_request -> 502
         };
@@ -803,6 +813,36 @@ impl Http3Handler {
             String::from_utf8_lossy(&path),
             stream_id
         );
+
+        // F-97: :authority と Host が矛盾するリクエストを 400 で拒否
+        let host_hdr = headers.iter().find_map(|h| {
+            if h.name().eq_ignore_ascii_case(b"host") {
+                Some(h.value())
+            } else {
+                None
+            }
+        });
+        if crate::http_utils::authority_host_mismatch(&authority, host_hdr) {
+            self.send_error_response(stream_id, 400, b"Bad Request: :authority/Host mismatch")?;
+            let user_agent_slice: &[u8] = if user_agent.is_empty() {
+                &[]
+            } else {
+                &user_agent
+            };
+            log_access(
+                &method,
+                &authority,
+                &path,
+                user_agent_slice,
+                content_length as u64,
+                400,
+                0,
+                start_time,
+                &self.client_ip,
+                "",
+            );
+            return Ok(());
+        }
 
         // gRPC リクエスト検出フラグ
         #[cfg(feature = "grpc")]
@@ -1457,8 +1497,13 @@ impl Http3Handler {
         #[cfg(feature = "wasm")] wasm_modules: Option<&std::sync::Arc<Vec<String>>>,
         #[cfg(feature = "wasm")] wasm_request_headers: Option<&[(Vec<u8>, Vec<u8>)]>,
     ) -> io::Result<(u16, usize)> {
-        // サーバー選択
-        let server = match upstream_group.select(&self.client_ip) {
+        // サーバー選択（F-97: Consistent Hash header/cookie キー対応）
+        let server = match upstream_group.select_with_header_fn(&self.client_ip, |name| {
+            headers
+                .iter()
+                .find(|h| h.name().eq_ignore_ascii_case(name))
+                .map(|h| h.value())
+        }) {
             Some(s) => s,
             None => {
                 self.send_error_response(stream_id, 502, b"Bad Gateway")?;
