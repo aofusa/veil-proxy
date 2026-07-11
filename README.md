@@ -27,7 +27,7 @@ A high-performance reverse proxy server using io_uring (custom runtime) and rust
 - **Fast Routing**: O(log n) path matching with Radix Tree (matchit)
 
 ### Proxy Features
-- **Connection Pool**: Latency reduction through backend connection reuse (HTTP/HTTPS support)
+- **Connection Pool**: Latency reduction through backend connection reuse (HTTP/1.1, HTTPS, and **H2C/HTTP-2** backends; the H2C pool reuses a handshaked HTTP/2 connection across gRPC/H2C requests — F-106)
 - **Load Balancing**: Request distribution to multiple backends (Round Robin/Least Connections/IP Hash/Weighted/Consistent Hash)
 - **Health Check**: Automatic failover with HTTP/TCP/gRPC active health checks (HTTP with status code validation, TCP connect-only, gRPC Health Checking Protocol)
 - **L4 Stream Proxy**: TCP-level load balancing with Round Robin/LeastConn, TLS passthrough, zero-copy `splice(2)` kernel forwarding (no userspace buffer), connection limiting (requires `l4-proxy` feature)
@@ -933,6 +933,8 @@ use_h2c = true
 - Connecting to gRPC backends (internal network)
 - Leverage HTTP/2 multiplexing and header compression for backend communication
 - Uses Prior Knowledge mode (not via Upgrade)
+
+**H2C Backend Connection Pooling (F-106)**: H2C backend connections are pooled and reused across requests (thread-local `H2C_POOL`, keyed by backend `host:port`), just like the HTTP/1.1/HTTPS pools. Successive requests over the same worker skip the per-request TCP connect **and** the H2C handshake (connection preface + SETTINGS exchange), reusing the connection with monotonically increasing stream IDs. Idle connections expire via `idle_connection_timeout_secs` (and are capped by `max_idle_connections_per_host`); a stale pooled connection that fails on first use is transparently retried once on a fresh connection. This is what makes gRPC relaying (`client → veil (TLS h2) → backend (h2c)`) avoid a fresh handshake per call.
 
 > **Note**: H2C cannot be used with HTTPS backends (TLS connections). Use only in environments where TLS is not required, such as gRPC communication within internal networks.
 
