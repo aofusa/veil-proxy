@@ -12,7 +12,8 @@
 //! - 定期チェック（既定 60 秒）: `check_and_reload()` を呼ぶ
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use arc_swap::ArcSwap;
@@ -44,6 +45,146 @@ pub fn init_global_tls_config(config: Arc<ServerConfig>) {
 #[inline]
 pub fn current_global_tls_config() -> Option<Arc<ServerConfig>> {
     GLOBAL_TLS_CONFIG.load().as_ref().clone()
+}
+
+// ============================================================================
+// HTTP/3 (QUIC/quiche) 証明書ホットリロード（F-105）
+// ============================================================================
+//
+// HTTP/1.1・HTTP/2 は上の `GLOBAL_TLS_CONFIG`（rustls `ServerConfig`）で無停止更新できるが、
+// HTTP/3 は各ワーカーが起動時に構築した `quiche::Config`（`Rc<RefCell<..>>`）を保持し続け、
+// 差し替え経路が無かった。ここでは cert/key の生 PEM を **ペアでアトミックに** 配信し、
+// 各 HTTP/3 ワーカーが自前の `quiche::Config` へ memfd 経由で反映する仕組みを提供する。
+//
+// 秘密鍵の平文がグローバルに滞留し続けないよう、配信時に「未適用ワーカー数」を持たせ、
+// 全ワーカーが適用し終えた時点で最後のワーカーが `secure_zero` で平文を破棄する。
+
+/// HTTP/3 証明書マテリアル（cert/key の生 PEM）。
+///
+/// cert と key は常にペアで整合している必要があるため 1 つの `Arc` で束ねてアトミックに配信する。
+/// `generation` はワーカーの差分検知用、`pending_workers` は秘密鍵ゼロ化の同期用。
+pub struct Http3CertMaterial {
+    /// 配信世代（`HTTP3_CERT_GENERATION` と一致）。ワーカーはローカル世代と比較して差分検知する。
+    generation: u64,
+    /// PEM 証明書チェーン（memfd 経由で quiche へロード。適用完了後にゼロ化）。
+    cert_pem: Mutex<Vec<u8>>,
+    /// PEM 秘密鍵（memfd 経由で quiche へロード。適用完了後にゼロ化）。
+    key_pem: Mutex<Vec<u8>>,
+    /// この世代を未だ適用していないワーカー数。0 到達で平文をゼロ化する。
+    pending_workers: AtomicUsize,
+}
+
+impl Http3CertMaterial {
+    /// 配信世代を返す。
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// cert/key PEM をロックしてクロージャに渡す（quiche へのロードに使う）。
+    ///
+    /// ロックはこの世代を初回適用するワーカーのみが取る **コールドパス** の同期であり、
+    /// ホットパス（イベントループの毎周回）には現れない。
+    pub fn load_into<F, T>(&self, f: F) -> T
+    where
+        F: FnOnce(&[u8], &[u8]) -> T,
+    {
+        let cert = self.cert_pem.lock().expect("http3 cert mutex poisoned");
+        let key = self.key_pem.lock().expect("http3 key mutex poisoned");
+        f(&cert, &key)
+    }
+
+    /// このワーカーが本世代を適用完了したことを通知する。
+    ///
+    /// 最後（0 到達）のワーカーが cert/key の平文を `secure_zero` で破棄する。
+    /// `fetch_sub(AcqRel)` により、他ワーカーの `load_into` 読み取りはすべて
+    /// 本ゼロ化に happens-before するため、並行読み取りとの競合は起きない。
+    pub fn worker_applied(&self) {
+        let prev = self.pending_workers.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(prev > 0, "http3 cert pending_workers underflow");
+        if prev == 1 {
+            secure_zero_vec(&mut self.cert_pem.lock().expect("http3 cert mutex poisoned"));
+            secure_zero_vec(&mut self.key_pem.lock().expect("http3 key mutex poisoned"));
+        }
+    }
+}
+
+/// HTTP/3 証明書マテリアルのグローバル配信スロット。
+///
+/// リロードスレッドが `publish_http3_certs` で新マテリアルを格納し、各 HTTP/3 ワーカーが
+/// 世代差分を検知したときのみ `load_http3_material` で参照する。
+pub static GLOBAL_HTTP3_CERTS: once_cell::sync::Lazy<ArcSwap<Option<Arc<Http3CertMaterial>>>> =
+    once_cell::sync::Lazy::new(|| ArcSwap::from_pointee(None));
+
+/// HTTP/3 証明書の配信世代（ワーカーの安価な変更検知ゲート）。
+///
+/// ワーカーは毎周回この u64 を `Acquire` ロードするだけ（x86 では Relaxed と同等コスト）。
+/// ローカル世代と一致すれば ArcSwap には触れず、差分時のみマテリアルを取得する。
+/// `Acquire` ロードは配信側の `Release` ストアと同期し、マテリアル格納の可視性を保証する。
+pub static HTTP3_CERT_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// 登録済み HTTP/3 ワーカー数（起動時に各ワーカーが `register_http3_worker` で加算）。
+///
+/// 配信時に `pending_workers` の初期値として使う。全ワーカーが適用し終えた時点で
+/// 秘密鍵をゼロ化するための基準数。
+pub static HTTP3_WORKER_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// HTTP/3 ワーカーを 1 台登録する（各ワーカーが `run_http3_server_async` 起動時に呼ぶ）。
+#[inline]
+pub fn register_http3_worker() {
+    HTTP3_WORKER_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 現在の HTTP/3 証明書配信世代を返す（ワーカーの変更検知ゲート）。
+#[inline]
+pub fn http3_cert_generation() -> u64 {
+    HTTP3_CERT_GENERATION.load(Ordering::Acquire)
+}
+
+/// 現在の HTTP/3 証明書マテリアルを取得する（差分検知後に呼ぶ）。
+#[inline]
+pub fn load_http3_material() -> Option<Arc<Http3CertMaterial>> {
+    GLOBAL_HTTP3_CERTS.load_full().as_ref().clone()
+}
+
+/// 新しい HTTP/3 証明書 PEM を全ワーカーへ配信する（リロードスレッドから呼ぶ）。
+///
+/// 登録ワーカーが 0 の場合（HTTP/3 無効）は配信せず、秘密鍵の平文を即座にゼロ化して破棄する。
+pub fn publish_http3_certs(mut cert_pem: Vec<u8>, mut key_pem: Vec<u8>) {
+    let workers = HTTP3_WORKER_COUNT.load(Ordering::Relaxed);
+    if workers == 0 {
+        // HTTP/3 ワーカーが居ない → 平文を配信せず即ゼロ化。
+        secure_zero_vec(&mut cert_pem);
+        secure_zero_vec(&mut key_pem);
+        return;
+    }
+
+    let generation = HTTP3_CERT_GENERATION.load(Ordering::Relaxed).wrapping_add(1);
+    let material = Arc::new(Http3CertMaterial {
+        generation,
+        cert_pem: Mutex::new(cert_pem),
+        key_pem: Mutex::new(key_pem),
+        pending_workers: AtomicUsize::new(workers),
+    });
+
+    // 先にマテリアルを格納し、その後で世代を Release ストアする。
+    // ワーカーは世代を Acquire ロードするため、世代の変化を観測した時点でマテリアルの
+    // 格納は必ず可視になっている（happens-before）。
+    GLOBAL_HTTP3_CERTS.store(Arc::new(Some(material)));
+    HTTP3_CERT_GENERATION.store(generation, Ordering::Release);
+}
+
+/// 機密バイト列を volatile 書き込み + フェンスでゼロ化する。
+///
+/// コンパイラのデッドストア削除を防ぐため volatile を用いる（`http3_server::secure_zero` と同方針）。
+fn secure_zero_vec(data: &mut [u8]) {
+    for byte in data.iter_mut() {
+        // SAFETY: `data` は有効な可変スライスであり、各要素への 1 バイト volatile 書き込みは健全。
+        unsafe {
+            std::ptr::write_volatile(byte, 0);
+        }
+    }
+    std::sync::atomic::fence(Ordering::SeqCst);
 }
 
 /// TLS 証明書リローダー
@@ -137,8 +278,27 @@ impl TlsCertReloader {
         self.server_config.store(Arc::new(Some(new_config.clone())));
         // グローバルへも反映（アクセプタが参照）
         init_global_tls_config(new_config);
+        // F-105: HTTP/3 (quiche) ワーカーへも cert/key の生 PEM を配信する。
+        // 登録ワーカーが居るときのみファイルを再読込して配信（無ければ無駄な FS 読込を避ける）。
+        self.reload_http3_certs()?;
         // mtime を更新（再ロードの多重発火を防ぐ）
         self.last_modified = Self::combined_mtime(&self.cert_path, &self.key_path)?;
+        Ok(())
+    }
+
+    /// HTTP/3 (quiche) ワーカーへ新しい cert/key PEM を配信する（F-105）。
+    ///
+    /// HTTP/3 ワーカーが 1 台も登録されていない場合は何もしない。
+    // 理由付き allow: 専用 TLS リロードスレッドから呼ばれる cert/key の再読込（イベントループ外・
+    // 数ヶ月に 1 回のコールドパス）。生 PEM は quiche へ memfd 経由でロードするため生バイトが要る。
+    #[allow(clippy::disallowed_methods)]
+    fn reload_http3_certs(&self) -> anyhow::Result<()> {
+        if HTTP3_WORKER_COUNT.load(Ordering::Relaxed) == 0 {
+            return Ok(());
+        }
+        let cert_pem = std::fs::read(&self.cert_path)?;
+        let key_pem = std::fs::read(&self.key_path)?;
+        publish_http3_certs(cert_pem, key_pem);
         Ok(())
     }
 
@@ -224,6 +384,56 @@ mod tests {
         // 連続呼び出しでは再ロードしない（mtime 更新済み）
         assert!(!reloader.check_and_reload());
         assert_eq!(build_count.load(Ordering::SeqCst), 1);
+    }
+
+    /// HTTP/3 グローバル状態を触るテストは直列化する（プロセス共有の static のため）。
+    static HTTP3_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn http3_publish_advances_generation_and_zeroes_on_last_worker() {
+        let _g = HTTP3_TEST_LOCK.lock().unwrap();
+        // ワーカー 2 台を登録した状態を模擬。
+        HTTP3_WORKER_COUNT.store(2, Ordering::SeqCst);
+
+        let gen_before = HTTP3_CERT_GENERATION.load(Ordering::SeqCst);
+        publish_http3_certs(b"CERTDATA".to_vec(), b"KEYDATA".to_vec());
+        let gen_after = HTTP3_CERT_GENERATION.load(Ordering::SeqCst);
+        assert_eq!(gen_after, gen_before.wrapping_add(1));
+
+        let mat = load_http3_material().expect("material must be stored");
+        assert_eq!(mat.generation(), gen_after);
+        mat.load_into(|c, k| {
+            assert_eq!(c, b"CERTDATA");
+            assert_eq!(k, b"KEYDATA");
+        });
+
+        // 1 台目適用 → まだ最後ではないので平文は保持される。
+        mat.worker_applied();
+        mat.load_into(|c, k| {
+            assert_eq!(c, b"CERTDATA");
+            assert_eq!(k, b"KEYDATA");
+        });
+
+        // 2 台目（最後）適用 → 平文がゼロ化される。
+        mat.worker_applied();
+        mat.load_into(|c, k| {
+            assert!(c.iter().all(|&b| b == 0), "cert must be zeroed");
+            assert!(k.iter().all(|&b| b == 0), "key must be zeroed");
+        });
+
+        HTTP3_WORKER_COUNT.store(0, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn http3_publish_with_no_workers_is_noop() {
+        let _g = HTTP3_TEST_LOCK.lock().unwrap();
+        HTTP3_WORKER_COUNT.store(0, Ordering::SeqCst);
+
+        let gen_before = HTTP3_CERT_GENERATION.load(Ordering::SeqCst);
+        // ワーカー不在時は配信せず（世代を進めない）、平文は関数内で即ゼロ化される。
+        publish_http3_certs(b"CERTDATA".to_vec(), b"KEYDATA".to_vec());
+        let gen_after = HTTP3_CERT_GENERATION.load(Ordering::SeqCst);
+        assert_eq!(gen_after, gen_before, "generation must not advance without workers");
     }
 
     #[test]

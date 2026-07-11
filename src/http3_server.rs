@@ -174,6 +174,49 @@ fn create_memfd_for_pem(name: &str, pem_data: &[u8]) -> io::Result<(std::fs::Fil
     Ok((memfd, proc_path))
 }
 
+/// 稼働中の `quiche::Config` の証明書・秘密鍵を差し替える（F-105 ホットリロード）。
+///
+/// TLS リロードスレッドが配信した新しい cert/key PEM を、既存の `create_memfd_for_pem`
+/// （`/proc/self/fd/<fd>` 経由・ファイルシステム非経由）で memfd に載せ、quiche へロードし直す。
+/// これにより Landlock 有効時も FS を介さず証明書を更新できる。
+///
+/// # ホットパス例外について（AGENTS.md）
+/// 本処理はパース + memfd 書き込みで数 ms ループをブロックするが、証明書更新は数ヶ月に 1 回の
+/// **コールドパス**であり、イベントループ先頭の世代ゲートで差分検知時のみ実行される。ホットパス
+/// 絶対規則の明示的な例外として許容する（既存接続は `quiche::accept` 時に SSL_CTX から複製済みの
+/// ため影響を受けず、以後の新規ハンドシェイクのみ新証明書を提示する）。
+fn reload_quiche_certs(
+    quic_config: &Rc<RefCell<Config>>,
+    material: &crate::tls_reload::Http3CertMaterial,
+) -> io::Result<()> {
+    material.load_into(|cert_pem, key_pem| {
+        let mut cfg = quic_config.borrow_mut();
+
+        // 証明書チェーンを memfd 経由で差し替え。
+        let (cert_memfd, cert_path) = create_memfd_for_pem("tls_cert_reload", cert_pem)?;
+        cfg.load_cert_chain_from_pem_file(&cert_path).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("cert reload error (memfd): {}", e),
+            )
+        })?;
+        // memfd はロード完了後ただちにクローズ（機密の滞留を避ける）。
+        drop(cert_memfd);
+
+        // 秘密鍵を memfd 経由で差し替え。
+        let (key_memfd, key_path) = create_memfd_for_pem("tls_key_reload", key_pem)?;
+        cfg.load_priv_key_from_pem_file(&key_path).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("key reload error (memfd): {}", e),
+            )
+        })?;
+        drop(key_memfd);
+
+        Ok(())
+    })
+}
+
 /// セキュアなバイト配列のゼロ化
 ///
 /// メモリ上の機密データを安全にゼロ化します。
@@ -3264,6 +3307,11 @@ pub async fn run_http3_server_async(
     // 設定を Rc で共有（quiche::Config は Clone できないため）
     let quic_config = Rc::new(RefCell::new(quic_config));
 
+    // F-105: 証明書ホットリロード。本ワーカーを登録し、現在の配信世代をローカルに控える。
+    // 起動直後は上で cert/key をロード済みなので、ローカル世代を現在値に合わせて即時リロードを避ける。
+    crate::tls_reload::register_http3_worker();
+    let mut local_cert_gen = crate::tls_reload::http3_cert_generation();
+
     // UDP ソケットを作成（monoio io_uring ベース）
     // SO_REUSEPORT を設定して複数ワーカーで並列処理を可能に
     // GSO/GRO は config.gso_gro_enabled に基づいて設定
@@ -3355,6 +3403,36 @@ pub async fn run_http3_server_async(
 
             info!("[HTTP/3] Shutdown complete");
             break Ok(());
+        }
+
+        // F-105: 証明書ホットリロードの検知（安価な世代ゲート）。
+        // 毎周回 u64 の atomic load を 1 回行うだけ（x86 では Relaxed 同等コスト）。世代が
+        // 変わっていなければ ArcSwap には触れず即座に抜ける。SIGHUP で TLS リロードスレッドが
+        // `publish_http3_certs` を呼ぶと世代が進み、ここで新 cert/key を quiche へ反映する。
+        {
+            let cur_gen = crate::tls_reload::http3_cert_generation();
+            if cur_gen != local_cert_gen {
+                if let Some(material) = crate::tls_reload::load_http3_material() {
+                    match reload_quiche_certs(&quic_config, &material) {
+                        Ok(()) => {
+                            info!(
+                                "[HTTP/3] Certificate hot-reloaded (generation {})",
+                                material.generation()
+                            );
+                        }
+                        Err(e) => {
+                            error!("[HTTP/3] Certificate hot-reload failed: {}", e);
+                        }
+                    }
+                    // 適用完了を通知（最後のワーカーが平文をゼロ化）。失敗時も次回配信まで
+                    // 再試行しないよう完了扱いにし、平文が滞留しないようにする。
+                    material.worker_applied();
+                    local_cert_gen = material.generation();
+                } else {
+                    // マテリアル未格納（想定外）。世代だけ追従して無限ループを避ける。
+                    local_cert_gen = cur_gen;
+                }
+            }
         }
 
         // 最小タイムアウトを計算
