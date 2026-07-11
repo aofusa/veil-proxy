@@ -4,9 +4,9 @@
 
 use crate::config::{L4LbAlgorithm, L4ListenerConfig, L4TlsMode, CURRENT_CONFIG};
 use crate::runtime::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
+use crate::runtime::offload::offload;
 use crate::runtime::splice::{splice, Pipe};
 use crate::runtime::tcp::TcpStream as IoUringTcpStream;
-use crate::runtime::offload::offload;
 use crate::runtime::time::timeout;
 
 #[cfg(feature = "ktls")]
@@ -136,9 +136,14 @@ pub fn parse_upstream_addrs(config: &L4ListenerConfig) -> Result<Vec<SocketAddr>
         .into_iter()
         .map(|target| match target {
             L4UpstreamTarget::Resolved(addr) => Ok(addr),
-            L4UpstreamTarget::Unresolved(addr) => resolve_upstream_addr_sync(&addr).ok_or_else(|| {
-                format!("failed to parse upstream addr '{}': name resolution failed", addr)
-            }),
+            L4UpstreamTarget::Unresolved(addr) => {
+                resolve_upstream_addr_sync(&addr).ok_or_else(|| {
+                    format!(
+                        "failed to parse upstream addr '{}': name resolution failed",
+                        addr
+                    )
+                })
+            }
         })
         .collect()
 }
@@ -561,12 +566,7 @@ pub async fn handle_l4_connection(
     };
 
     let connect_timeout = Duration::from_secs(config.connect_timeout_secs);
-    let upstream = match timeout(
-        connect_timeout,
-        IoUringTcpStream::connect(socket_addr),
-    )
-    .await
-    {
+    let upstream = match timeout(connect_timeout, IoUringTcpStream::connect(socket_addr)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => {
             warn!(

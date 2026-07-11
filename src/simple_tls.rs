@@ -450,14 +450,7 @@ impl crate::runtime::io::AsyncReadRent for SimpleTlsServerStream {
             {
                 let conn = match self.conn.as_mut() {
                     Some(c) => c,
-                    None => {
-                        return (
-                            Err(io::Error::other(
-                                "TLS connection closed",
-                            )),
-                            buf,
-                        )
-                    }
+                    None => return (Err(io::Error::other("TLS connection closed")), buf),
                 };
                 drain_rustls_into(&mut self.drained_buffer, conn.reader());
             }
@@ -481,14 +474,7 @@ impl crate::runtime::io::AsyncReadRent for SimpleTlsServerStream {
                 Ok(n) => {
                     let conn = match self.conn.as_mut() {
                         Some(c) => c,
-                        None => {
-                            return (
-                                Err(io::Error::other(
-                                    "TLS connection closed",
-                                )),
-                                buf,
-                            )
-                        }
+                        None => return (Err(io::Error::other("TLS connection closed")), buf),
                     };
                     let mut consumed = 0;
                     while consumed < n {
@@ -516,10 +502,7 @@ impl crate::runtime::io::AsyncReadRent for SimpleTlsServerStream {
 
     async fn readv<T: IoVecBufMut>(&mut self, buf: T) -> crate::runtime::io::BufResult<usize, T> {
         // IoVec stub のため未サポート
-        (
-            Err(io::Error::other("readv not supported")),
-            buf,
-        )
+        (Err(io::Error::other("readv not supported")), buf)
     }
 }
 
@@ -532,14 +515,7 @@ impl crate::runtime::io::AsyncWriteRent for SimpleTlsServerStream {
         let slice = unsafe { std::slice::from_raw_parts(buf.read_ptr(), buf.bytes_init()) };
         let conn = match self.conn.as_mut() {
             Some(c) => c,
-            None => {
-                return (
-                    Err(io::Error::other(
-                        "TLS connection closed",
-                    )),
-                    buf,
-                )
-            }
+            None => return (Err(io::Error::other("TLS connection closed")), buf),
         };
 
         let mut wr = conn.writer();
@@ -579,10 +555,7 @@ impl crate::runtime::io::AsyncWriteRent for SimpleTlsServerStream {
 
     async fn writev<T: IoVecBuf>(&mut self, buf: T) -> crate::runtime::io::BufResult<usize, T> {
         // IoVec stub のため未サポート
-        (
-            Err(io::Error::other("writev not supported")),
-            buf,
-        )
+        (Err(io::Error::other("writev not supported")), buf)
     }
 
     async fn flush(&mut self) -> io::Result<()> {
@@ -668,10 +641,7 @@ impl crate::runtime::io::AsyncReadRent for SimpleTlsClientStream {
 
     async fn readv<T: IoVecBufMut>(&mut self, buf: T) -> crate::runtime::io::BufResult<usize, T> {
         // IoVec stub のため未サポート
-        (
-            Err(io::Error::other("readv not supported")),
-            buf,
-        )
+        (Err(io::Error::other("readv not supported")), buf)
     }
 }
 
@@ -716,10 +686,7 @@ impl crate::runtime::io::AsyncWriteRent for SimpleTlsClientStream {
 
     async fn writev<T: IoVecBuf>(&mut self, buf: T) -> crate::runtime::io::BufResult<usize, T> {
         // IoVec stub のため未サポート
-        (
-            Err(io::Error::other("writev not supported")),
-            buf,
-        )
+        (Err(io::Error::other("writev not supported")), buf)
     }
 
     async fn flush(&mut self) -> io::Result<()> {

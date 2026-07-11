@@ -4247,15 +4247,13 @@ impl UpstreamGroup {
             LoadBalanceAlgorithm::ConsistentHash {
                 hash_key: HashKey::Header(name),
             } => {
-                let val = get_header(name.as_bytes())
-                    .and_then(|v| std::str::from_utf8(v).ok());
+                let val = get_header(name.as_bytes()).and_then(|v| std::str::from_utf8(v).ok());
                 self.select_with_key(client_ip, val, None)
             }
             LoadBalanceAlgorithm::ConsistentHash {
                 hash_key: HashKey::Cookie(name),
             } => {
-                let cookie_hdr = get_header(b"cookie")
-                    .and_then(|v| std::str::from_utf8(v).ok());
+                let cookie_hdr = get_header(b"cookie").and_then(|v| std::str::from_utf8(v).ok());
                 let val = cookie_hdr.and_then(|c| extract_cookie_value(c, name));
                 self.select_with_key(client_ip, val, None)
             }

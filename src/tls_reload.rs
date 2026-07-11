@@ -179,7 +179,9 @@ pub fn publish_http3_certs(mut cert_pem: Vec<u8>, mut key_pem: Vec<u8>) {
         return;
     }
 
-    let generation = HTTP3_CERT_GENERATION.load(Ordering::Relaxed).wrapping_add(1);
+    let generation = HTTP3_CERT_GENERATION
+        .load(Ordering::Relaxed)
+        .wrapping_add(1);
     let material = Arc::new(Http3CertMaterial {
         generation,
         cert_pem: Mutex::new(cert_pem),
@@ -453,7 +455,10 @@ mod tests {
         // ワーカー不在時は配信せず（世代を進めない）、平文は関数内で即ゼロ化される。
         publish_http3_certs(b"CERTDATA".to_vec(), b"KEYDATA".to_vec());
         let gen_after = HTTP3_CERT_GENERATION.load(Ordering::SeqCst);
-        assert_eq!(gen_after, gen_before, "generation must not advance without workers");
+        assert_eq!(
+            gen_after, gen_before,
+            "generation must not advance without workers"
+        );
     }
 
     #[test]

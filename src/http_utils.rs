@@ -1914,15 +1914,24 @@ mod stack_fmt_tests {
     #[test]
     fn authority_host_match_same() {
         assert!(!authority_host_mismatch(b"localhost", Some(b"localhost")));
-        assert!(!authority_host_mismatch(b"localhost:443", Some(b"localhost")));
-        assert!(!authority_host_mismatch(b"Example.COM", Some(b"example.com")));
+        assert!(!authority_host_mismatch(
+            b"localhost:443",
+            Some(b"localhost")
+        ));
+        assert!(!authority_host_mismatch(
+            b"Example.COM",
+            Some(b"example.com")
+        ));
         assert!(!authority_host_mismatch(b"localhost", None));
     }
 
     #[test]
     fn authority_host_mismatch_detected() {
         assert!(authority_host_mismatch(b"localhost", Some(b"evil.example")));
-        assert!(authority_host_mismatch(b"a.example:443", Some(b"b.example:443")));
+        assert!(authority_host_mismatch(
+            b"a.example:443",
+            Some(b"b.example:443")
+        ));
     }
 
     #[test]

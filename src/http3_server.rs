@@ -467,10 +467,7 @@ impl Http3Handler {
 
     /// HTTP/3 コネクションを初期化（QUIC 確立後）
     fn init_h3(&mut self) -> io::Result<()> {
-        if self.h3_conn.is_none()
-            && self.conn.is_established()
-            && !self.conn.is_closed()
-        {
+        if self.h3_conn.is_none() && self.conn.is_established() && !self.conn.is_closed() {
             let h3_config = h3::Config::new().map_err(|e| io::Error::other(e.to_string()))?;
             let h3 = h3::Connection::with_transport(&mut self.conn, &h3_config)
                 .map_err(|e| io::Error::other(e.to_string()))?;
@@ -1270,7 +1267,9 @@ impl Http3Handler {
                         crate::wasm::FilterResult::Pause => {
                             warn!("WASM module requested pause, but async operations are not yet supported");
                         }
-                        crate::wasm::FilterResult::Continue { headers: modified, .. } => {
+                        crate::wasm::FilterResult::Continue {
+                            headers: modified, ..
+                        } => {
                             // B-38: 変更後ヘッダを上流リクエストへ反映
                             wasm_request_headers = Some(modified);
                         }
@@ -1612,7 +1611,10 @@ impl Http3Handler {
         if let Err(e) =
             h3_conn.send_additional_headers(&mut self.conn, stream_id, &trailers, true, true)
         {
-            warn!("[HTTP/3] gRPC trailers send_additional_headers error: {}", e);
+            warn!(
+                "[HTTP/3] gRPC trailers send_additional_headers error: {}",
+                e
+            );
             // フォールバック: 空ボディ + fin でストリームを閉じ、クライアントハングを防ぐ
             if let Err(e2) = h3_conn.send_body(&mut self.conn, stream_id, &[], true) {
                 debug!("[HTTP/3] gRPC trailers fin fallback error: {:?}", e2);
@@ -1704,12 +1706,8 @@ impl Http3Handler {
         #[cfg(not(feature = "grpc"))]
         let is_grpc_req = false;
 
-        let final_path_owned = compute_upstream_request_path(
-            path_str,
-            prefix,
-            &target.path_prefix,
-            is_grpc_req,
-        );
+        let final_path_owned =
+            compute_upstream_request_path(path_str, prefix, &target.path_prefix, is_grpc_req);
         let final_path = final_path_owned.as_str();
 
         // B-39: H2C 上流（gRPC 等）
@@ -1783,12 +1781,9 @@ impl Http3Handler {
                 #[cfg(feature = "wasm")]
                 if let Some(modules) = wasm_modules {
                     if !modules.is_empty() {
-                        resp_header_store = apply_h3_wasm_response_headers(
-                            modules,
-                            status_code,
-                            resp_header_store,
-                        )
-                        .await;
+                        resp_header_store =
+                            apply_h3_wasm_response_headers(modules, status_code, resp_header_store)
+                                .await;
                     }
                 }
                 #[cfg(not(feature = "wasm"))]
@@ -4150,31 +4145,21 @@ mod tests {
         ];
 
         let merged = merge_response_headers_and_trailers(&headers, &trailers, false);
-        assert!(
-            merged
-                .iter()
-                .any(|(n, _)| n.eq_ignore_ascii_case(b"connection"))
-                == false
-        );
-        assert!(
-            merged
-                .iter()
-                .any(|(n, v)| n.eq_ignore_ascii_case(b"grpc-status") && v == b"0")
-        );
-        assert!(
-            merged
-                .iter()
-                .any(|(n, v)| n.eq_ignore_ascii_case(b"content-type")
-                    && v == b"application/grpc")
-        );
+        assert!(!merged
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case(b"connection")));
+        assert!(merged
+            .iter()
+            .any(|(n, v)| n.eq_ignore_ascii_case(b"grpc-status") && v == b"0"));
+        assert!(merged
+            .iter()
+            .any(|(n, v)| n.eq_ignore_ascii_case(b"content-type") && v == b"application/grpc"));
 
         // 圧縮時は content-length / content-encoding を落とす
         let compressed = merge_response_headers_and_trailers(&headers, &[], true);
-        assert!(
-            !compressed
-                .iter()
-                .any(|(n, _)| n.eq_ignore_ascii_case(b"content-length"))
-        );
+        assert!(!compressed
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case(b"content-length")));
     }
 
     /// parse_http_response: 正常系と trailers 空
@@ -4238,10 +4223,16 @@ mod tests {
         ];
         let kept: Vec<(&[u8], &[u8])> = filter_h3_grpc_initial_headers(headers).collect();
         assert_eq!(kept.len(), 2);
-        assert!(kept.iter().any(|(n, v)| *n == b"x-server-id" && *v == b"grpc-server"));
+        assert!(kept
+            .iter()
+            .any(|(n, v)| *n == b"x-server-id" && *v == b"grpc-server"));
         assert!(kept.iter().any(|(n, _)| *n == b"date"));
-        assert!(!kept.iter().any(|(n, _)| n.eq_ignore_ascii_case(b"grpc-status")));
-        assert!(!kept.iter().any(|(n, _)| n.eq_ignore_ascii_case(b"content-length")));
+        assert!(!kept
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case(b"grpc-status")));
+        assert!(!kept
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case(b"content-length")));
     }
 
     /// B-39: content-type から gRPC を検出

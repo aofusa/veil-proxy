@@ -3472,13 +3472,7 @@ async fn test_grpc_http2_framing() {
     let lpm3 = encode_grpc_lpm(&msg3);
     let one_byte_chunks: Vec<&[u8]> = lpm3.chunks(1).collect();
     let r3 = client
-        .send_request_chunked(
-            "POST",
-            path,
-            &grpc_headers,
-            &one_byte_chunks,
-            None,
-        )
+        .send_request_chunked("POST", path, &grpc_headers, &one_byte_chunks, None)
         .await
         .expect("byte-split LPM");
     assert_eq!(r3.status, 200, "byte-split LPM should yield HTTP 200");
@@ -3820,7 +3814,10 @@ async fn test_http3_connection_migration() {
     let (st_a2, _) = send_http3_request(&mut sr_a, "GET", "/", &[], None)
         .await
         .expect("conn A after B");
-    assert_eq!(st_a2, 200, "conn A must continue after peer path change sim");
+    assert_eq!(
+        st_a2, 200,
+        "conn A must continue after peer path change sim"
+    );
 
     // 接続 C: 同時多重（別ポート）で並列 GET
     let (_client_c, mut sr_c) = Http3TestClient::new(server_addr, "localhost")
@@ -6304,11 +6301,7 @@ async fn test_grpc_trailer_detailed() {
         ok.headers
     );
     let ok_code = ok_status.unwrap();
-    assert!(
-        ok_code <= 16,
-        "grpc-status must be 0-16, got {}",
-        ok_code
-    );
+    assert!(ok_code <= 16, "grpc-status must be 0-16, got {}", ok_code);
     eprintln!(
         "Unary OK: grpc-status={} grpc-message={:?} trailers={:?}",
         ok_code,
@@ -17900,9 +17893,7 @@ async fn test_e2e_cached_route_hit() {
     let age = get_header_value(&r2, "Age");
     // RR で X-Server-Id が変わり完全一致しないため、ステータスとボディ本体を検証
     assert!(
-        x_cache.is_some()
-            || age.is_some()
-            || (r1.contains("AAAA") && r2.contains("AAAA")),
+        x_cache.is_some() || age.is_some() || (r1.contains("AAAA") && r2.contains("AAAA")),
         "Second cached response should hit cache or return same body payload"
     );
 }
@@ -17993,7 +17984,10 @@ async fn test_e2e_upstream_strict_cert_rejects() {
     }
 
     let resp = send_request(PROXY_PORT, "/strict-cert/", &[]).await;
-    assert!(resp.is_some(), "Strict cert route should return an error response");
+    assert!(
+        resp.is_some(),
+        "Strict cert route should return an error response"
+    );
     let status = get_status_code(&resp.unwrap());
     assert!(
         matches!(status, Some(502) | Some(503) | Some(504)),
@@ -18153,7 +18147,10 @@ async fn test_http3_rate_limiting() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    assert!(success > 0, "HTTP/3 rate-limit route should allow some 200s");
+    assert!(
+        success > 0,
+        "HTTP/3 rate-limit route should allow some 200s"
+    );
     assert!(
         limited > 0,
         "HTTP/3 rate-limit should return 429 (success={}, limited={})",
@@ -18181,15 +18178,10 @@ async fn test_http3_ip_restriction() {
     };
 
     use common::http3_client::send_http3_request;
-    let (status, _) = send_http3_request(
-        &mut send_request,
-        "GET",
-        "/api/ip-restricted/",
-        &[],
-        None,
-    )
-    .await
-    .expect("HTTP/3 ip-restricted request");
+    let (status, _) =
+        send_http3_request(&mut send_request, "GET", "/api/ip-restricted/", &[], None)
+            .await
+            .expect("HTTP/3 ip-restricted request");
     assert_eq!(
         status, 403,
         "HTTP/3 /api/ip-restricted/* should deny 127.0.0.0/8 with 403, got {}",
@@ -18393,7 +18385,10 @@ async fn test_http3_websocket() {
             eprintln!("HTTP/3 WebSocket probe status={}", resp.status);
         }
         Err(e) => {
-            eprintln!("HTTP/3 WebSocket probe error (acceptable if unsupported): {}", e);
+            eprintln!(
+                "HTTP/3 WebSocket probe error (acceptable if unsupported): {}",
+                e
+            );
         }
     }
 
@@ -18563,14 +18558,7 @@ async fn test_http3_chunked_response_streaming() {
             }
         };
 
-        match send_http3_request(
-            &mut send_request,
-            "GET",
-            "/chunked-stream/data",
-            &[],
-            None,
-        )
-        .await
+        match send_http3_request(&mut send_request, "GET", "/chunked-stream/data", &[], None).await
         {
             Ok((status, body)) => {
                 assert_eq!(status, 200, "chunked stream over H3");
@@ -18747,7 +18735,9 @@ async fn test_grpc_over_http3_streaming() {
         .await
         .expect("H3 client for gRPC streaming");
 
-    use common::http3_client::{send_http3_and_reset, send_http3_request_chunked, send_http3_request_full};
+    use common::http3_client::{
+        send_http3_and_reset, send_http3_request_chunked, send_http3_request_full,
+    };
 
     let grpc_headers = [
         ("content-type", "application/grpc"),
@@ -18790,7 +18780,10 @@ async fn test_grpc_over_http3_streaming() {
     // --- Client Streaming: 複数 LPM をチャンク送信 ---
     let mut client_chunks: Vec<Vec<u8>> = Vec::new();
     for i in 0..4 {
-        client_chunks.push(encode_grpc_lpm(&encode_simple_request(&format!("h3-cs-{}", i))));
+        client_chunks.push(encode_grpc_lpm(&encode_simple_request(&format!(
+            "h3-cs-{}",
+            i
+        ))));
     }
     let chunk_refs: Vec<&[u8]> = client_chunks.iter().map(|v| v.as_slice()).collect();
     let cs = send_http3_request_chunked(
@@ -18818,7 +18811,10 @@ async fn test_grpc_over_http3_streaming() {
     // --- Bidirectional ---
     let mut bidi_chunks: Vec<Vec<u8>> = Vec::new();
     for i in 0..3 {
-        bidi_chunks.push(encode_grpc_lpm(&encode_simple_request(&format!("h3-bidi-{}", i))));
+        bidi_chunks.push(encode_grpc_lpm(&encode_simple_request(&format!(
+            "h3-bidi-{}",
+            i
+        ))));
     }
     let bidi_refs: Vec<&[u8]> = bidi_chunks.iter().map(|v| v.as_slice()).collect();
     let bidi = send_http3_request_chunked(
@@ -18942,7 +18938,10 @@ async fn test_grpc_over_http3_metadata() {
 
     // 上流が返す x-server-id が透過される場合は検証（プロキシが strip してもよい）
     if let Some(sid) = r.header("x-server-id") {
-        assert!(!sid.is_empty(), "x-server-id should be non-empty if present");
+        assert!(
+            !sid.is_empty(),
+            "x-server-id should be non-empty if present"
+        );
         eprintln!("H3 metadata: x-server-id={}", sid);
     }
     eprintln!(
@@ -19192,7 +19191,9 @@ async fn test_alt_svc_http3_advertisement() {
         .await
         .expect("HTTP/1.1 GET /");
     assert_eq!(status, 200, "HTTP/1.1 GET / should be 200");
-    let alt_svc_h1 = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("alt-svc"));
+    let alt_svc_h1 = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("alt-svc"));
     assert!(
         alt_svc_h1.is_some(),
         "HTTP/1.1 response must include Alt-Svc when http3_enabled, headers={:?}",
@@ -19287,9 +19288,7 @@ async fn test_http3_udp_unreachable_fallback() {
     // 4) 正規の HTTP/3 ポートは生きていること（プロキシ自体の健全性）
     #[cfg(feature = "http3")]
     {
-        let live: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
-            .parse()
-            .unwrap();
+        let live: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
         let ok = Http3TestClient::new(live, "localhost").await;
         assert!(
             ok.is_ok(),
@@ -19328,10 +19327,7 @@ async fn test_grpc_flow_control_window_boundary() {
     let mut client = Http2TestClient::new("127.0.0.1", PROXY_PORT)
         .await
         .expect("h2 client for gRPC FC");
-    let headers = [
-        ("content-type", "application/grpc"),
-        ("te", "trailers"),
-    ];
+    let headers = [("content-type", "application/grpc"), ("te", "trailers")];
     let result = tokio::time::timeout(
         Duration::from_secs(30),
         client.send_request_chunked(
@@ -19353,11 +19349,7 @@ async fn test_grpc_flow_control_window_boundary() {
                 resp.grpc_status(),
                 resp.body.len()
             );
-            assert!(
-                resp.status < 600,
-                "unexpected HTTP status {}",
-                resp.status
-            );
+            assert!(resp.status < 600, "unexpected HTTP status {}", resp.status);
         }
         Ok(Err(e)) => {
             // ストリームリセット等は許容（プロセス生存が主目的）
@@ -19403,10 +19395,7 @@ async fn test_grpc_wasm_interceptor() {
         .expect("h2 client");
     // 最小 LPM: empty message
     let lpm = [0u8, 0, 0, 0, 0];
-    let headers = [
-        ("content-type", "application/grpc"),
-        ("te", "trailers"),
-    ];
+    let headers = [("content-type", "application/grpc"), ("te", "trailers")];
     let resp = client
         .send_request_full(
             "POST",
@@ -19463,9 +19452,8 @@ async fn test_http3_pmtu_payload_sizes() {
 
     use common::http3_client::send_http3_request_full;
 
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
-        .parse()
-        .unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
     let (_client, mut send_request) = Http3TestClient::new(server_addr, "localhost")
         .await
         .expect("HTTP/3 client for PMTU");
@@ -19488,7 +19476,12 @@ async fn test_http3_pmtu_payload_sizes() {
         .await;
         match result {
             Ok(Ok(resp)) => {
-                eprintln!("PMTU size={} status={} body_len={}", sz, resp.status, resp.body.len());
+                eprintln!(
+                    "PMTU size={} status={} body_len={}",
+                    sz,
+                    resp.status,
+                    resp.body.len()
+                );
                 // 200 または 404/405 等でも「到達・応答」していれば MTU 経路は生存
                 if resp.status < 600 {
                     ok += 1;
@@ -19534,9 +19527,8 @@ async fn test_http3_cid_update_retire_simulation() {
 
     use common::http3_client::send_http3_request_full;
 
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
-        .parse()
-        .unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
 
     // 接続 A
     let (client_a, mut sr_a) = Http3TestClient::new(server_addr, "localhost")
@@ -19585,9 +19577,8 @@ async fn test_http3_quic_keepalive_idle() {
 
     use common::http3_client::send_http3_request_full;
 
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
-        .parse()
-        .unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
     let (_client, mut send_request) = Http3TestClient::new(server_addr, "localhost")
         .await
         .expect("H3 client for keepalive");
@@ -19618,7 +19609,10 @@ async fn test_http3_quic_keepalive_idle() {
         }
         Ok(Err(e)) => {
             // 接続が idle timeout で閉じた場合は再接続できれば合格（意図的タイムアウト設定）
-            eprintln!("HTTP/3 keepalive: conn closed after idle ({}), reconnecting", e);
+            eprintln!(
+                "HTTP/3 keepalive: conn closed after idle ({}), reconnecting",
+                e
+            );
             let (_c, mut sr) = Http3TestClient::new(server_addr, "localhost")
                 .await
                 .expect("reconnect after idle");
@@ -19643,9 +19637,8 @@ async fn test_http3_goaway_graceful_reload() {
 
     use common::http3_client::send_http3_request_full;
 
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
-        .parse()
-        .unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
     let (_client, mut h3_sr) = Http3TestClient::new(server_addr, "localhost")
         .await
         .expect("H3 before reload");
@@ -19708,10 +19701,7 @@ async fn test_grpc_retry_and_hedging() {
     let mut client = Http2TestClient::new("127.0.0.1", PROXY_PORT)
         .await
         .expect("h2 for retry");
-    let headers = [
-        ("content-type", "application/grpc"),
-        ("te", "trailers"),
-    ];
+    let headers = [("content-type", "application/grpc"), ("te", "trailers")];
     let err_body = encode_grpc_lpm(&encode_simple_request("retry-probe"));
     let err = client
         .send_request_full(
@@ -19724,7 +19714,10 @@ async fn test_grpc_retry_and_hedging() {
         .expect("stream reset for retry setup");
     // StreamReset は INTERNAL 等の非 0 を返す想定
     let st = err.grpc_status();
-    eprintln!("gRPC retry setup: status={} grpc_status={:?}", err.status, st);
+    eprintln!(
+        "gRPC retry setup: status={} grpc_status={:?}",
+        err.status, st
+    );
 
     // 直後の Unary リトライが成功すること
     let ok_body = encode_grpc_lpm(&encode_simple_request("retry-ok"));
@@ -19756,10 +19749,7 @@ async fn test_grpc_retry_and_hedging() {
             let mut c = Http2TestClient::new("127.0.0.1", PROXY_PORT)
                 .await
                 .expect("hedge client");
-            let headers = [
-                ("content-type", "application/grpc"),
-                ("te", "trailers"),
-            ];
+            let headers = [("content-type", "application/grpc"), ("te", "trailers")];
             c.send_request_full(
                 "POST",
                 "/grpc.test.v1.TestService/UnaryCall",
@@ -19806,10 +19796,7 @@ async fn test_grpc_keepalive_ping() {
         .expect("h2 for ping");
 
     // ウォームアップ Unary
-    let headers = [
-        ("content-type", "application/grpc"),
-        ("te", "trailers"),
-    ];
+    let headers = [("content-type", "application/grpc"), ("te", "trailers")];
     let body = encode_grpc_lpm(&encode_simple_request("before-ping"));
     let warm = client
         .send_request_full(
@@ -19863,10 +19850,7 @@ async fn test_grpc_server_stream_abnormal_termination() {
     let mut client = Http2TestClient::new("127.0.0.1", PROXY_PORT)
         .await
         .expect("h2 for abnormal term");
-    let headers = [
-        ("content-type", "application/grpc"),
-        ("te", "trailers"),
-    ];
+    let headers = [("content-type", "application/grpc"), ("te", "trailers")];
 
     // 1) バックエンドが明示的に INTERNAL を返す StreamReset
     let body = encode_grpc_lpm(&encode_simple_request("abnormal"));
@@ -19887,7 +19871,10 @@ async fn test_grpc_server_stream_abnormal_termination() {
         resp.trailers
     );
     // HTTP 200 + grpc-status != 0 が正常な gRPC エラー伝播
-    assert_eq!(resp.status, 200, "gRPC errors should be HTTP 200 + trailers");
+    assert_eq!(
+        resp.status, 200,
+        "gRPC errors should be HTTP 200 + trailers"
+    );
     let code = resp.grpc_status().expect("grpc-status must be present");
     // INTERNAL(13) が期待。UNAVAILABLE(14)/UNKNOWN(2)/CANCELLED(1) も許容
     assert!(
@@ -19946,9 +19933,8 @@ async fn test_http3_routing_conditions() {
     }
     use common::http3_client::send_http3_request_full;
 
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
-        .parse()
-        .unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
     let (_client, mut send_request) = Http3TestClient::new(server_addr, "localhost")
         .await
         .expect("HTTP/3 client");
@@ -19967,15 +19953,9 @@ async fn test_http3_routing_conditions() {
     assert_eq!(ok.status, 200, "query conditions should match");
 
     // クエリ条件不一致
-    let miss = send_http3_request_full(
-        &mut send_request,
-        "GET",
-        "/api/query-filter/",
-        &[],
-        None,
-    )
-    .await
-    .expect("query miss request");
+    let miss = send_http3_request_full(&mut send_request, "GET", "/api/query-filter/", &[], None)
+        .await
+        .expect("query miss request");
     eprintln!("HTTP/3 query miss status={}", miss.status);
     assert!(
         miss.status == 404 || miss.status == 400 || miss.status >= 400,
@@ -20008,9 +19988,8 @@ async fn test_http3_buffering_spillover() {
     }
     use common::http3_client::send_http3_request_full;
 
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
-        .parse()
-        .unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
     let (_client, mut send_request) = Http3TestClient::new(server_addr, "localhost")
         .await
         .expect("HTTP/3 client");
@@ -20036,7 +20015,11 @@ async fn test_http3_buffering_spillover() {
                 resp.body.len()
             );
             // 200/413/502 等いずれでもプロキシが応答すればハングなし
-            assert!(resp.status < 600, "should get HTTP status, got {}", resp.status);
+            assert!(
+                resp.status < 600,
+                "should get HTTP status, got {}",
+                resp.status
+            );
         }
         Ok(Err(e)) => {
             eprintln!("HTTP/3 spillover request error (controlled): {}", e);
@@ -20065,9 +20048,8 @@ async fn test_http3_range_requests() {
     }
     use common::http3_client::send_http3_request_full;
 
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
-        .parse()
-        .unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
     let (_client, mut send_request) = Http3TestClient::new(server_addr, "localhost")
         .await
         .expect("HTTP/3 client");
@@ -20123,9 +20105,8 @@ async fn test_http3_pseudo_header_validation() {
     }
     use common::http3_client::send_http3_request_full;
 
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
-        .parse()
-        .unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
     let (_client, mut send_request) = Http3TestClient::new(server_addr, "localhost")
         .await
         .expect("HTTP/3 client");
@@ -20267,10 +20248,7 @@ async fn test_grpc_buffering_bypass() {
 
     // ルートに Full バッファ（max 64）を設定済み。ServerStreaming が完了すればバイパス実証。
     let body = encode_grpc_lpm(&encode_simple_request("stream"));
-    let headers = [
-        ("content-type", "application/grpc"),
-        ("te", "trailers"),
-    ];
+    let headers = [("content-type", "application/grpc"), ("te", "trailers")];
     let start = std::time::Instant::now();
     let resp = client
         .send_request_full(
@@ -20341,10 +20319,7 @@ async fn test_grpc_active_health_check() {
         .send_request_full(
             "POST",
             "/grpc.test.v1.TestService/UnaryCall",
-            &[
-                ("content-type", "application/grpc"),
-                ("te", "trailers"),
-            ],
+            &[("content-type", "application/grpc"), ("te", "trailers")],
             Some(&body),
         )
         .await
@@ -20800,8 +20775,7 @@ async fn test_http3_prometheus_metrics() {
             .join("\n")
     );
     assert!(
-        after.contains("http3_active_streams")
-            || after.contains("veil_proxy_http3_active_streams"),
+        after.contains("http3_active_streams") || after.contains("veil_proxy_http3_active_streams"),
         "should expose http3_active_streams"
     );
     // リクエストカウンタも H3 経由で増加しうる
@@ -20949,9 +20923,8 @@ async fn test_http3_static_file_large() {
     }
     use common::http3_client::send_http3_request_full;
 
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
-        .parse()
-        .unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
     let (_client, mut sr) = Http3TestClient::new(server_addr, "localhost")
         .await
         .expect("H3 client for static large");
@@ -20982,9 +20955,8 @@ async fn test_http3_static_file_etag() {
     }
     use common::http3_client::send_http3_request_full;
 
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
-        .parse()
-        .unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
     let (_client, mut sr) = Http3TestClient::new(server_addr, "localhost")
         .await
         .expect("H3 client for etag");
@@ -21018,9 +20990,8 @@ async fn test_http3_redirect_302() {
     }
     use common::http3_client::send_http3_request_full;
 
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
-        .parse()
-        .unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
     let (_client, mut sr) = Http3TestClient::new(server_addr, "localhost")
         .await
         .expect("H3 client for redirect 302");
@@ -21061,9 +21032,8 @@ async fn test_http3_redirect_307() {
     }
     use common::http3_client::send_http3_request_full;
 
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
-        .parse()
-        .unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
     let (_client, mut sr) = Http3TestClient::new(server_addr, "localhost")
         .await
         .expect("H3 client for redirect 307");
@@ -21103,9 +21073,8 @@ async fn test_http3_sni_and_cert_reload() {
 
     let _guard = RELOAD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
-        .parse()
-        .unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
 
     // (1) SNI=localhost で H3 接続
     let (_c1, mut sr1) = Http3TestClient::new(server_addr, "localhost")
@@ -21147,9 +21116,15 @@ async fn test_http3_sni_and_cert_reload() {
                         i
                     );
                 }
-                Err(e) => panic!("H3 request failed during cert reload (attempt {}): {}", i, e),
+                Err(e) => panic!(
+                    "H3 request failed during cert reload (attempt {}): {}",
+                    i, e
+                ),
             },
-            Err(e) => panic!("H3 connect failed during cert reload (attempt {}): {}", i, e),
+            Err(e) => panic!(
+                "H3 connect failed during cert reload (attempt {}): {}",
+                i, e
+            ),
         }
     }
 
@@ -21180,9 +21155,8 @@ async fn test_http3_oversized_header() {
     }
     use common::http3_client::{send_http3_request, send_http3_request_full};
 
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
-        .parse()
-        .unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
     let (_client, mut sr) = Http3TestClient::new(server_addr, "localhost")
         .await
         .expect("H3 client for oversized header");
@@ -21201,7 +21175,10 @@ async fn test_http3_oversized_header() {
         }
         Err(e) => {
             // ストリーム/接続リセットも防御として許容
-            eprintln!("test_http3_oversized_header: rejected with error (ok): {}", e);
+            eprintln!(
+                "test_http3_oversized_header: rejected with error (ok): {}",
+                e
+            );
         }
     }
 
@@ -21288,10 +21265,7 @@ async fn test_alt_svc_upgrade_flow() {
         assert_eq!(st2, 200);
     }
 
-    eprintln!(
-        "test_alt_svc_upgrade_flow: Alt-Svc={:?} H3 upgrade OK",
-        alt
-    );
+    eprintln!("test_alt_svc_upgrade_flow: Alt-Svc={:?} H3 upgrade OK", alt);
 }
 
 // =============================================================================
@@ -21310,9 +21284,8 @@ async fn test_grpc_over_http3_invalid_frame() {
         return;
     }
 
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
-        .parse()
-        .unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
     let (_c, mut sr) = Http3TestClient::new(server_addr, "localhost")
         .await
         .expect("H3 client for invalid frame");
@@ -21324,10 +21297,7 @@ async fn test_grpc_over_http3_invalid_frame() {
         &mut sr,
         "POST",
         "/grpc.test.v1.TestService/UnaryCall",
-        &[
-            ("content-type", "application/grpc"),
-            ("te", "trailers"),
-        ],
+        &[("content-type", "application/grpc"), ("te", "trailers")],
         Some(invalid_frame),
     )
     .await
@@ -21370,9 +21340,8 @@ async fn test_grpc_over_http3_oversized_message() {
         return;
     }
 
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
-        .parse()
-        .unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
     let (_c, mut sr) = Http3TestClient::new(server_addr, "localhost")
         .await
         .expect("H3 client for oversized");
@@ -21387,10 +21356,7 @@ async fn test_grpc_over_http3_oversized_message() {
             &mut sr,
             "POST",
             "/grpc.test.v1.TestService/UnaryCall",
-            &[
-                ("content-type", "application/grpc"),
-                ("te", "trailers"),
-            ],
+            &[("content-type", "application/grpc"), ("te", "trailers")],
             Some(&large),
         ),
     )
@@ -21450,10 +21416,7 @@ async fn test_grpc_over_http3_oversized_message() {
         &mut sr2,
         "POST",
         "/grpc.test.v1.TestService/UnaryCall",
-        &[
-            ("content-type", "application/grpc"),
-            ("te", "trailers"),
-        ],
+        &[("content-type", "application/grpc"), ("te", "trailers")],
         Some(&encode_grpc_lpm(&encode_simple_request("after-oversized"))),
     )
     .await;
@@ -21475,9 +21438,8 @@ async fn test_grpc_over_http3_malformed_protobuf() {
         return;
     }
 
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
-        .parse()
-        .unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
     let (_c, mut sr) = Http3TestClient::new(server_addr, "localhost")
         .await
         .expect("H3 client for malformed protobuf");
@@ -21490,10 +21452,7 @@ async fn test_grpc_over_http3_malformed_protobuf() {
         &mut sr,
         "POST",
         "/grpc.test.v1.TestService/UnaryCall",
-        &[
-            ("content-type", "application/grpc"),
-            ("te", "trailers"),
-        ],
+        &[("content-type", "application/grpc"), ("te", "trailers")],
         Some(&malformed),
     )
     .await
@@ -21530,9 +21489,8 @@ async fn test_grpc_over_http3_stream_reset() {
         return;
     }
 
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
-        .parse()
-        .unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
     let (_c, mut sr) = Http3TestClient::new(server_addr, "localhost")
         .await
         .expect("H3 client for stream reset");
@@ -21545,10 +21503,7 @@ async fn test_grpc_over_http3_stream_reset() {
         &mut sr,
         "POST",
         "/grpc.test.v1.TestService/UnaryCall",
-        &[
-            ("content-type", "application/grpc"),
-            ("te", "trailers"),
-        ],
+        &[("content-type", "application/grpc"), ("te", "trailers")],
         Some(&partial),
     )
     .await;
@@ -21563,10 +21518,7 @@ async fn test_grpc_over_http3_stream_reset() {
         &mut sr2,
         "POST",
         "/grpc.test.v1.TestService/UnaryCall",
-        &[
-            ("content-type", "application/grpc"),
-            ("te", "trailers"),
-        ],
+        &[("content-type", "application/grpc"), ("te", "trailers")],
         Some(&encode_grpc_lpm(&encode_simple_request("after-reset"))),
     )
     .await
@@ -21596,9 +21548,8 @@ async fn test_grpc_over_http3_flow_control_window_boundary() {
         return;
     }
 
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
-        .parse()
-        .unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
     let (_c, mut sr) = Http3TestClient::new(server_addr, "localhost")
         .await
         .expect("H3 client for gRPC FC");
@@ -21619,10 +21570,7 @@ async fn test_grpc_over_http3_flow_control_window_boundary() {
         offset = end;
     }
 
-    let headers = [
-        ("content-type", "application/grpc"),
-        ("te", "trailers"),
-    ];
+    let headers = [("content-type", "application/grpc"), ("te", "trailers")];
     let result = tokio::time::timeout(
         Duration::from_secs(40),
         send_http3_request_chunked(
@@ -21683,19 +21631,15 @@ async fn test_grpc_over_http3_retry_and_hedging() {
         return;
     }
 
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
-        .parse()
-        .unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
     let (_c, mut sr) = Http3TestClient::new(server_addr, "localhost")
         .await
         .expect("H3 for retry");
 
     use common::http3_client::send_http3_request_full;
 
-    let headers = [
-        ("content-type", "application/grpc"),
-        ("te", "trailers"),
-    ];
+    let headers = [("content-type", "application/grpc"), ("te", "trailers")];
 
     // リトライ setup: StreamReset エラー経路
     let err = send_http3_request_full(
@@ -21735,19 +21679,15 @@ async fn test_grpc_over_http3_retry_and_hedging() {
     let mut handles = Vec::new();
     for i in 0..4 {
         handles.push(tokio::spawn(async move {
-            let addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
-                .parse()
-                .unwrap();
+            let addr: std::net::SocketAddr =
+                format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
             let (_c, mut s) = Http3TestClient::new(addr, "localhost").await?;
             let body = encode_grpc_lpm(&encode_simple_request(&format!("hedge-h3-{}", i)));
             let r = send_http3_request_full(
                 &mut s,
                 "POST",
                 "/grpc.test.v1.TestService/UnaryCall",
-                &[
-                    ("content-type", "application/grpc"),
-                    ("te", "trailers"),
-                ],
+                &[("content-type", "application/grpc"), ("te", "trailers")],
                 Some(&body),
             )
             .await?;
@@ -21786,19 +21726,15 @@ async fn test_grpc_over_http3_keepalive_ping() {
         return;
     }
 
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
-        .parse()
-        .unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
     let (_c, mut sr) = Http3TestClient::new(server_addr, "localhost")
         .await
         .expect("H3 for keepalive");
 
     use common::http3_client::send_http3_request_full;
 
-    let headers = [
-        ("content-type", "application/grpc"),
-        ("te", "trailers"),
-    ];
+    let headers = [("content-type", "application/grpc"), ("te", "trailers")];
     let warm = send_http3_request_full(
         &mut sr,
         "POST",
@@ -21861,19 +21797,15 @@ async fn test_grpc_over_http3_server_stream_abnormal_termination() {
         return;
     }
 
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
-        .parse()
-        .unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
     let (_c, mut sr) = Http3TestClient::new(server_addr, "localhost")
         .await
         .expect("H3 for abnormal term");
 
     use common::http3_client::send_http3_request_full;
 
-    let headers = [
-        ("content-type", "application/grpc"),
-        ("te", "trailers"),
-    ];
+    let headers = [("content-type", "application/grpc"), ("te", "trailers")];
 
     let resp = send_http3_request_full(
         &mut sr,
@@ -21934,9 +21866,8 @@ async fn test_grpc_over_http3_consistent_hashing() {
         return;
     }
 
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
-        .parse()
-        .unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
     let (_c, mut sr) = Http3TestClient::new(server_addr, "localhost")
         .await
         .expect("H3 for CH");
@@ -22038,9 +21969,8 @@ async fn test_grpc_over_http3_active_health_check() {
             .join("\n")
     );
 
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
-        .parse()
-        .unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
     let (_c, mut sr) = Http3TestClient::new(server_addr, "localhost")
         .await
         .expect("H3 for health");
@@ -22051,10 +21981,7 @@ async fn test_grpc_over_http3_active_health_check() {
         &mut sr,
         "POST",
         "/grpc.test.v1.TestService/UnaryCall",
-        &[
-            ("content-type", "application/grpc"),
-            ("te", "trailers"),
-        ],
+        &[("content-type", "application/grpc"), ("te", "trailers")],
         Some(&encode_grpc_lpm(&encode_simple_request("hc-h3"))),
     )
     .await
@@ -22086,9 +22013,8 @@ async fn test_grpc_over_http3_buffering_bypass() {
         return;
     }
 
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
-        .parse()
-        .unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
     let (_c, mut sr) = Http3TestClient::new(server_addr, "localhost")
         .await
         .expect("H3 for buffering bypass");
@@ -22100,10 +22026,7 @@ async fn test_grpc_over_http3_buffering_bypass() {
         &mut sr,
         "POST",
         "/grpc.test.v1.TestService/ServerStreaming",
-        &[
-            ("content-type", "application/grpc"),
-            ("te", "trailers"),
-        ],
+        &[("content-type", "application/grpc"), ("te", "trailers")],
         Some(&encode_grpc_lpm(&encode_simple_request("stream-h3"))),
     )
     .await
@@ -22137,9 +22060,8 @@ async fn test_grpc_over_http3_wasm_interceptor() {
         return;
     }
 
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
-        .parse()
-        .unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
     let (_c, mut sr) = Http3TestClient::new(server_addr, "localhost")
         .await
         .expect("H3 for gRPC WASM");
@@ -22151,10 +22073,7 @@ async fn test_grpc_over_http3_wasm_interceptor() {
         &mut sr,
         "POST",
         "/grpc.test.v1.TestService/UnaryCall",
-        &[
-            ("content-type", "application/grpc"),
-            ("te", "trailers"),
-        ],
+        &[("content-type", "application/grpc"), ("te", "trailers")],
         Some(&lpm),
     )
     .await
@@ -22197,9 +22116,8 @@ async fn test_http3_multiplexed_coalesced_responses() {
         return;
     }
 
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
-        .parse()
-        .unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
 
     let uploads: Vec<Vec<u8>> = (0..8u8)
         .map(|i| {
@@ -22242,9 +22160,8 @@ async fn test_http3_multiplexed_coalesced_responses() {
     for i in 0..4 {
         let body = uploads[i].clone();
         handles.push(tokio::spawn(async move {
-            let addr: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
-                .parse()
-                .unwrap();
+            let addr: std::net::SocketAddr =
+                format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
             let (_c, mut s) = Http3TestClient::new(addr, "localhost").await?;
             let r = send_http3_request_full(
                 &mut s,

@@ -35,9 +35,7 @@ fn ensure_aws_lc_no_prefix() {
         );
     }
 
-    eprintln!(
-        "veil build.rs: applying AWS_LC_SYS_NO_PREFIX=1 for quiche/rustls AWS-LC sharing"
-    );
+    eprintln!("veil build.rs: applying AWS_LC_SYS_NO_PREFIX=1 for quiche/rustls AWS-LC sharing");
 
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let status = std::process::Command::new(cargo)
