@@ -96,7 +96,7 @@ impl Http3CertMaterial {
 
     /// このワーカーが本世代を適用完了したことを通知する。
     ///
-    /// 最後（0 到達）のワーカーが cert/key の平文を `secure_zero` で破棄する。
+    /// 最後（0 到達）のワーカーが cert/key の平文を `secure_zero` で **即座に** 破棄する。
     /// `fetch_sub(AcqRel)` により、他ワーカーの `load_into` 読み取りはすべて
     /// 本ゼロ化に happens-before するため、並行読み取りとの競合は起きない。
     pub fn worker_applied(&self) {
@@ -105,6 +105,26 @@ impl Http3CertMaterial {
         if prev == 1 {
             secure_zero_vec(&mut self.cert_pem.lock().expect("http3 cert mutex poisoned"));
             secure_zero_vec(&mut self.key_pem.lock().expect("http3 key mutex poisoned"));
+        }
+    }
+}
+
+impl Drop for Http3CertMaterial {
+    /// マテリアル破棄時に平文を必ずゼロ化する（安全網）。
+    ///
+    /// 通常は全ワーカー適用後に `worker_applied` で即座にゼロ化されるが、次のような
+    /// 適用未完了のまま破棄されるケースでも平文がヒープに残らないよう保証する:
+    /// - 短時間に SIGHUP が複数回発火し、旧世代のマテリアルが全ワーカー適用前に
+    ///   `GLOBAL_HTTP3_CERTS` から差し替えられて Arc 参照が尽きたとき。
+    /// - HTTP/3 ワーカーが 0 台で配信自体が行われなかったとき（この経路は
+    ///   `publish_http3_certs` 内で先にゼロ化するが、二重ゼロ化は無害）。
+    fn drop(&mut self) {
+        // 既にゼロ化済みでも volatile 書き込みが再度走るだけで無害。
+        if let Ok(mut cert) = self.cert_pem.lock() {
+            secure_zero_vec(&mut cert);
+        }
+        if let Ok(mut key) = self.key_pem.lock() {
+            secure_zero_vec(&mut key);
         }
     }
 }
