@@ -1,0 +1,18 @@
+# container_security 用 gitleaks 設定。
+# ビルド成果物・一時レポートを除外し、target/ 走査による実質ハングを防ぐ。
+title = "veil container_security gitleaks"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Build artifacts, caches, and generated reports"
+paths = [
+  '''(^|/)target/''',
+  '''(^|/)tools/container_security/results/''',
+  '''(^|/)tools/container_security/harness/tools/target/''',
+  '''(^|/)docs/artifacts/''',
+  '''(^|/)\.git/''',
+  '''\.rmeta$''',
+  '''\.rlib$''',
+]

@@ -9,6 +9,7 @@ RESULTS_DIR="${RESULTS_DIR:-${REPO_ROOT}/tools/container_security/results}"
 GITLEAKS_IMAGE="${GITLEAKS_IMAGE:-zricethezav/gitleaks:latest}"
 REPORT="${RESULTS_DIR}/gitleaks_report.txt"
 SARIF="${RESULTS_DIR}/gitleaks_report.sarif"
+GITLEAKS_CFG="${SCRIPT_DIR}/gitleaks.toml"
 
 mkdir -p "${RESULTS_DIR}"
 
@@ -30,12 +31,15 @@ fi
 
 # gitleaks の exit code: 0=検出なし, 1=検出あり, 2=エラー。
 # 非ブロッキング運用のため 1（検出）は警告としてレポートに残し suite を継続する。
+# --config: target/ 等を allowlist してビルド成果物の長時間走査を避ける。
 set +e
 docker run --rm \
     -v "${REPO_ROOT}:/repo:ro" \
     -v "${RESULTS_DIR}:/results:rw" \
+    -v "${GITLEAKS_CFG}:/gitleaks.toml:ro" \
     "${GITLEAKS_IMAGE}" \
     detect --source=/repo \
+    --config=/gitleaks.toml \
     "${extra_args[@]}" \
     --report-format sarif \
     --report-path /results/gitleaks_report.sarif \

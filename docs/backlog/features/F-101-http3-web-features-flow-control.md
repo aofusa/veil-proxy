@@ -45,11 +45,11 @@
 
 ## 受け入れ条件
 
-- [ ] レポート §3 の 8 項目が実装または明確に文書化
-- [ ] E2E / container_security / 単体が実行され、失敗は artifacts に切り分け
-- [ ] full / default / no-default / 各 feature でビルド警告・エラーなし
-- [ ] `allow(dead_code)` を理由なしに追加しない
-- [ ] CI 組み込みは行わない（F-102）
+- [x] レポート §3 の 8 項目が実装または明確に文書化
+- [x] E2E / container_security / 単体が実行され、失敗は artifacts に切り分け
+- [x] full / default / no-default / 各 feature でビルド警告・エラーなし
+- [x] `allow(dead_code)` を理由なしに追加しない
+- [x] CI 組み込みは行わない（F-102）
 
 ## 依存・リスク
 
@@ -60,4 +60,6 @@
 
 ## 対応状況
 
-進行中（fix/test）。
+完了（fix/test）。  
+詳細: `docs/artifacts/f101_failed_tests_report.md`  
+検証: 単体 725 / 統合 53 / E2E 477 PASS（F-101 新規 7） / container_security S-H3-17 PASS / feature マトリクス warning なし。
