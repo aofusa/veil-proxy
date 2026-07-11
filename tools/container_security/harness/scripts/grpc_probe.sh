@@ -305,6 +305,45 @@ run_h3_grpc_mode grpc_malicious_trailers "h3_grpc_malicious_trailers"
 check_health "post_h3_grpc_malicious_trailers" || true
 
 # ---------------------------------------------------------------------------
+# F-103: gRPC over HTTP/3 攻撃拡張（S-G-H3-09〜13）
+# ---------------------------------------------------------------------------
+
+# S-G-H3-09: Oversized Message over HTTP/3
+run_h3_grpc_mode grpc_oversized "h3_grpc_oversized_message"
+check_health "post_h3_grpc_oversized" || true
+
+# S-G-H3-10: Infinite Streaming over HTTP/3
+run_h3_grpc_mode grpc_infinite_streaming "h3_grpc_infinite_streaming"
+check_health "post_h3_grpc_infinite_streaming" || true
+
+# S-G-H3-11: Fragmented LPM over HTTP/3
+run_h3_grpc_mode grpc_fragmented_lpm "h3_grpc_fragmented_lpm"
+check_health "post_h3_grpc_fragmented_lpm" || true
+
+# S-G-H3-12: gRPC Path Bypass over HTTP/3
+run_h3_grpc_mode grpc_path_bypass "h3_grpc_path_bypass"
+# curl --http3-only があれば追加刺激
+if curl --version 2>/dev/null | grep -qi http3; then
+    for bypass_path in \
+        "/grpc.test.v1.TestService%2FUnaryCall" \
+        "/./grpc.test.v1.TestService/UnaryCall"
+    do
+        set +e
+        c=$(curl -sk --http3-only -o /dev/null -w "%{http_code}" --max-time 5 \
+            -X POST -H "Content-Type: application/grpc" -H "TE: trailers" \
+            -d $'\x00\x00\x00\x00\x00' \
+            "https://${VEIL_HOST}:${VEIL_HTTP3_PORT}${bypass_path}" 2>/dev/null || echo "000")
+        set -e
+        check_no_crash "h3_grpc_path_bypass_curl:${bypass_path}" "${c}"
+    done
+fi
+check_health "post_h3_grpc_path_bypass" || true
+
+# S-G-H3-13: WASM Crash Resilience over HTTP/3
+run_h3_grpc_mode grpc_wasm_crash "h3_grpc_wasm_crash_resilience"
+check_health "post_h3_grpc_wasm_crash" || true
+
+# ---------------------------------------------------------------------------
 # F-96: レポート §5.2 gRPC セキュリティ
 # ---------------------------------------------------------------------------
 

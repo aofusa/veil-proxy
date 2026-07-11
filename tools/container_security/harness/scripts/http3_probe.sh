@@ -175,6 +175,22 @@ check_tls_health "post_h3_authority_host_mismatch" || true
 run_h3_mode flow_control_violation "h3_flow_control_violation" || true
 check_tls_health "post_h3_flow_control_violation" || true
 
+# ---------------------------------------------------------------------------
+# F-103: QUIC コントロール層攻撃
+# ---------------------------------------------------------------------------
+
+# S-H3-18: Control / QPACK Stream Abuse
+run_h3_mode control_stream_abuse "h3_control_stream_abuse" || true
+check_tls_health "post_h3_control_stream_abuse" || true
+
+# S-H3-19: CID Exhaustion
+run_h3_mode cid_exhaustion "h3_cid_exhaustion" || true
+check_tls_health "post_h3_cid_exhaustion" || true
+
+# S-H3-20: Retry Packet / Token Spoofing
+run_h3_mode token_spoofing "h3_token_spoofing" || true
+check_tls_health "post_h3_token_spoofing" || true
+
 # 最終ヘルス
 check_tls_health "post_http3_tls_health" || true
 

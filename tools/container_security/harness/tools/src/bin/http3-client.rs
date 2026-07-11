@@ -11,6 +11,9 @@
 //!               | grpc_qpack_bomb | grpc_max_streams | grpc_half_closed | grpc_malicious_trailers
 //!               | grpc_web_malformed | grpc_web_large_b64
 //!               | flow_control_violation
+//!               | grpc_oversized | grpc_infinite_streaming | grpc_fragmented_lpm
+//!               | grpc_path_bypass | grpc_wasm_crash
+//!               | control_stream_abuse | cid_exhaustion | token_spoofing
 //! - HTTP3_REPORT
 //! - HTTP3_GRPC_PATH (default /grpc.test.v1.TestService/UnaryCall)
 //! - AMPLIFICATION_STRICT (default 1): amplification_check で ratio>3 をエラーにする
@@ -117,6 +120,23 @@ fn main() {
         // F-101: QUIC フロー制御（MAX_DATA / MAX_STREAM_DATA）限界突破刺激
         "flow_control_violation" => flow_control_violation(&host, port, &path)
             .map(|s| format!("flow_control_violation done detail={}", s)),
+        // F-103: gRPC over H3 攻撃 + QUIC コントロール層
+        "grpc_oversized" => grpc_oversized(&host, port, &grpc_path)
+            .map(|s| format!("grpc_oversized done detail={}", s)),
+        "grpc_infinite_streaming" => grpc_infinite_streaming(&host, port, &grpc_path)
+            .map(|s| format!("grpc_infinite_streaming done detail={}", s)),
+        "grpc_fragmented_lpm" => grpc_fragmented_lpm(&host, port, &grpc_path)
+            .map(|s| format!("grpc_fragmented_lpm done detail={}", s)),
+        "grpc_path_bypass" => grpc_path_bypass(&host, port)
+            .map(|s| format!("grpc_path_bypass done detail={}", s)),
+        "grpc_wasm_crash" => grpc_wasm_crash(&host, port, &grpc_path)
+            .map(|s| format!("grpc_wasm_crash done detail={}", s)),
+        "control_stream_abuse" => control_stream_abuse(&host, port)
+            .map(|s| format!("control_stream_abuse done detail={}", s)),
+        "cid_exhaustion" => cid_exhaustion(&host, port)
+            .map(|s| format!("cid_exhaustion done detail={}", s)),
+        "token_spoofing" => token_spoofing(&host, port)
+            .map(|s| format!("token_spoofing done detail={}", s)),
         other => Err(format!("unknown HTTP3_MODE={}", other).into()),
     };
 
@@ -1730,6 +1750,322 @@ fn flow_control_violation(
         session.conn.is_closed(),
         stop_reason
     ))
+}
+
+/// F-103 S-G-H3-09: 巨大 gRPC メッセージを HTTP/3 で送り OOM/crash しないこと。
+fn grpc_oversized(
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut session = establish_h3(host, port, 30_000)?;
+    let headers = grpc_base_headers(host, path);
+    // 2 MiB LPM（flags=0 + length + payload）— プロキシのボディ上限/FC を刺激
+    let payload_len = 2 * 1024 * 1024usize;
+    let mut body = Vec::with_capacity(5 + payload_len.min(256 * 1024));
+    body.push(0u8);
+    body.extend_from_slice(&(payload_len as u32).to_be_bytes());
+    // 実送信は 256 KiB までに抑え、宣言長との不一致でも巨大処理を誘発
+    let send_len = 256 * 1024;
+    body.extend(std::iter::repeat(b'O').take(send_len));
+
+    let stream_id = session.h3.send_request(&mut session.conn, &headers, false)?;
+    let mut offset = 0usize;
+    let mut total_sent = 0usize;
+    let mut stall_rounds = 0u32;
+    while offset < body.len() {
+        let end = (offset + 16 * 1024).min(body.len());
+        let fin = end == body.len();
+        match session
+            .h3
+            .send_body(&mut session.conn, stream_id, &body[offset..end], fin)
+        {
+            Ok(n) => {
+                if n == 0 {
+                    stall_rounds += 1;
+                    pump_io(&mut session);
+                    let _ = drain_events(&mut session);
+                    if stall_rounds > 64 || session.conn.is_closed() {
+                        break;
+                    }
+                    continue;
+                }
+                stall_rounds = 0;
+                total_sent += n;
+                offset += n;
+            }
+            Err(quiche::h3::Error::Done) => {
+                stall_rounds += 1;
+                pump_io(&mut session);
+                let _ = drain_events(&mut session);
+                if stall_rounds > 64 || session.conn.is_closed() {
+                    break;
+                }
+            }
+            Err(e) => {
+                return Ok(format!(
+                    "send_stopped err={} sent={} closed={}",
+                    e,
+                    total_sent,
+                    session.conn.is_closed()
+                ));
+            }
+        }
+        if total_sent % (64 * 1024) < 16 * 1024 {
+            pump_io(&mut session);
+            let _ = drain_events(&mut session);
+        }
+        if session.conn.is_closed() {
+            break;
+        }
+    }
+    let start = Instant::now();
+    let mut last_status = None;
+    while start.elapsed() < Duration::from_secs(8) {
+        pump_io(&mut session);
+        let (st, fin) = drain_events(&mut session);
+        if st.is_some() {
+            last_status = st;
+        }
+        if fin || session.conn.is_closed() {
+            break;
+        }
+    }
+    Ok(format!(
+        "sent={} status={:?} closed={}",
+        total_sent,
+        last_status,
+        session.conn.is_closed()
+    ))
+}
+
+/// F-103 S-G-H3-10: Content-Length 極大 + ボディ未送でストリーム保持（Infinite Streaming 近似）。
+fn grpc_infinite_streaming(
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut session = establish_h3(host, port, 30_000)?;
+    let mut headers = grpc_base_headers(host, path);
+    // 極大 Content-Length を宣言しボディはほとんど送らない
+    headers.push(quiche::h3::Header::new(
+        b"content-length",
+        b"999999999",
+    ));
+    let stream_id = session
+        .h3
+        .send_request(&mut session.conn, &headers, false)?;
+    // LPM ヘッダのみ（巨大 length 宣言）
+    let partial = [0u8, 0x3b, 0x9a, 0xca, 0x00]; // length = ~1e9
+    let _ = session
+        .h3
+        .send_body(&mut session.conn, stream_id, &partial, false);
+    pump_io(&mut session);
+    let _ = drain_events(&mut session);
+
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(8) {
+        pump_io(&mut session);
+        let _ = drain_events(&mut session);
+        if session.conn.is_closed() {
+            return Ok(format!(
+                "conn_closed early stream_id={} held_ms={}",
+                stream_id,
+                start.elapsed().as_millis()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // 強制終了
+    let _ = session
+        .conn
+        .stream_shutdown(stream_id, quiche::Shutdown::Write, 0);
+    pump_io(&mut session);
+    Ok(format!(
+        "held_ms={} stream_id={} closed={}",
+        start.elapsed().as_millis(),
+        stream_id,
+        session.conn.is_closed()
+    ))
+}
+
+/// F-103 S-G-H3-11: LPM を 1 バイトずつ遅延送信（Fragmented LPM over QUIC STREAM）。
+fn grpc_fragmented_lpm(
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    // slowloris と同等だが LPM 構造を明示（flags+len+payload 全体を 1B 刻み）
+    grpc_slowloris(host, port, path).map(|s| format!("fragmented:{}", s))
+}
+
+/// F-103 S-G-H3-12: URL エンコード / パストラバーサル風で gRPC パスすり抜けを試行。
+fn grpc_path_bypass(host: &str, port: u16) -> Result<String, Box<dyn std::error::Error>> {
+    let paths = [
+        "/grpc.test.v1.TestService%2FUnaryCall",
+        "/grpc.test.v1.TestService/..%2fUnaryCall",
+        "/./grpc.test.v1.TestService/UnaryCall",
+        "/%67rpc.test.v1.TestService/UnaryCall",
+    ];
+    let mut results = Vec::new();
+    for p in &paths {
+        let mut session = match establish_h3(host, port, 15_000) {
+            Ok(s) => s,
+            Err(e) => {
+                results.push(format!("{}:connect_err={}", p, e));
+                continue;
+            }
+        };
+        let headers = grpc_base_headers(host, p);
+        let body = [0u8, 0, 0, 0, 0];
+        let sid = match session.h3.send_request(&mut session.conn, &headers, false) {
+            Ok(id) => id,
+            Err(e) => {
+                results.push(format!("{}:send_err={}", p, e));
+                continue;
+            }
+        };
+        let _ = session.h3.send_body(&mut session.conn, sid, &body, true);
+        pump_io(&mut session);
+        let start = Instant::now();
+        let mut last_status = None;
+        while start.elapsed() < Duration::from_secs(5) {
+            pump_io(&mut session);
+            let (st, fin) = drain_events(&mut session);
+            if st.is_some() {
+                last_status = st;
+            }
+            if fin || session.conn.is_closed() {
+                break;
+            }
+        }
+        results.push(format!("{}:status={:?}", p, last_status));
+    }
+    Ok(results.join("; "))
+}
+
+/// F-103 S-G-H3-13: 巨大メタデータ + 異常 LPM で WASM 経路を刺激し crash しないこと。
+fn grpc_wasm_crash(
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut session = establish_h3(host, port, 20_000)?;
+    let mut headers = grpc_base_headers(host, path);
+    let bomb = "X".repeat(8000);
+    headers.push(quiche::h3::Header::new(b"x-wasm-crash", bomb.as_bytes()));
+    // 不正 LPM: flags=0 + length=0xffffffff
+    let body = [0u8, 0xff, 0xff, 0xff, 0xff];
+    let stream_id = session.h3.send_request(&mut session.conn, &headers, false)?;
+    session
+        .h3
+        .send_body(&mut session.conn, stream_id, &body, true)?;
+    pump_io(&mut session);
+
+    let start = Instant::now();
+    let mut last_status = None;
+    while start.elapsed() < Duration::from_secs(8) {
+        pump_io(&mut session);
+        let (st, fin) = drain_events(&mut session);
+        if st.is_some() {
+            last_status = st;
+        }
+        if fin || session.conn.is_closed() {
+            break;
+        }
+    }
+    Ok(format!(
+        "status={:?} closed={}",
+        last_status,
+        session.conn.is_closed()
+    ))
+}
+
+/// F-103 S-H3-18: コントロール/QPACK ストリーム相当の乱用（不正フレーム・早期切断刺激）。
+fn control_stream_abuse(host: &str, port: u16) -> Result<String, Box<dyn std::error::Error>> {
+    let mut session = establish_h3(host, port, 15_000)?;
+    // 正常 GET で H3 を確立
+    let headers = vec![
+        quiche::h3::Header::new(b":method", b"GET"),
+        quiche::h3::Header::new(b":path", b"/"),
+        quiche::h3::Header::new(b":authority", host.as_bytes()),
+        quiche::h3::Header::new(b":scheme", b"https"),
+    ];
+    let _ = session.h3.send_request(&mut session.conn, &headers, true);
+    pump_io(&mut session);
+    let _ = drain_events(&mut session);
+
+    // uni 制御ストリーム ID 風に raw シャットダウンを連打（0, 2, 3 は H3 制御系）
+    for sid in [0u64, 2, 3, 6, 7, 10, 11] {
+        let _ = session
+            .conn
+            .stream_shutdown(sid, quiche::Shutdown::Write, 0x010c); // H3_CLOSED_CRITICAL_STREAM 相当
+        let _ = session
+            .conn
+            .stream_shutdown(sid, quiche::Shutdown::Read, 0x010c);
+    }
+    // ゴミ UDP を重ねてプロトコル違反を刺激
+    for _ in 0..30 {
+        let mut junk = [0u8; 64];
+        junk[0] = 0x40;
+        getrandom::getrandom(&mut junk[1..]).ok();
+        let _ = session.socket.send(&junk);
+    }
+    pump_io(&mut session);
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(3) {
+        pump_io(&mut session);
+        let _ = drain_events(&mut session);
+        if session.conn.is_closed() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(format!("closed={}", session.conn.is_closed()))
+}
+
+/// F-103 S-H3-19: 多数の偽 CID / Initial で CID 管理メモリ枯渇を近似。
+fn cid_exhaustion(host: &str, port: u16) -> Result<String, Box<dyn std::error::Error>> {
+    // handshake_flood を大規模化（DCID 毎回変更）
+    let sent = handshake_flood(host, port, 2000)?;
+    // short-header 風も大量送信
+    let spoofed = cid_spoof(host, port)?;
+    Ok(format!("initial_flood={} short_spoof={}", sent, spoofed))
+}
+
+/// F-103 S-H3-20: 不正 Retry / Token 風 Initial を送り安全に破棄されること。
+fn token_spoofing(host: &str, port: u16) -> Result<String, Box<dyn std::error::Error>> {
+    let peer = resolve(host, port)?;
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.set_read_timeout(Some(Duration::from_millis(200)))?;
+    socket.set_write_timeout(Some(Duration::from_secs(2)))?;
+    socket.connect(peer)?;
+
+    let mut sent = 0usize;
+    let mut recv = 0usize;
+    // Retry 風 long header (type bits) + 無効 token 付き Initial 風
+    for i in 0..100 {
+        let mut pkt = vec![0u8; 1200];
+        // Long header: Retry type pattern 0xf0 系 / Initial 0xc0
+        pkt[0] = if i % 2 == 0 { 0xf0 } else { 0xc0 };
+        pkt[1..5].copy_from_slice(&1u32.to_be_bytes());
+        pkt[5] = 8; // DCID len
+        getrandom::getrandom(&mut pkt[6..14]).ok();
+        pkt[14] = 8; // SCID len
+        getrandom::getrandom(&mut pkt[15..23]).ok();
+        // Token length 風 + 乱数 token
+        pkt[23] = 32;
+        getrandom::getrandom(&mut pkt[24..56]).ok();
+        getrandom::getrandom(&mut pkt[56..]).ok();
+        if socket.send(&pkt).is_ok() {
+            sent += 1;
+        }
+        let mut buf = [0u8; 2048];
+        if let Ok(n) = socket.recv(&mut buf) {
+            recv += n;
+        }
+    }
+    Ok(format!("sent={} recv_bytes={}", sent, recv))
 }
 
 fn send_http3_get(host: &str, port: u16, path: &str) -> Result<usize, Box<dyn std::error::Error>> {
