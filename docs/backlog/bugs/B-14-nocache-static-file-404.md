@@ -2,7 +2,7 @@
 
 ## 出典
 
-`docs/artifacts/performance_report_veil_vs_nginx.md` の調査中に発見（feature 別ビルド検証）。
+`docs/perf/reports/performance_report_veil_vs_nginx.md` の調査中に発見（feature 別ビルド検証）。
 
 ## 事象（再現手順）
 

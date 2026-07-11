@@ -2,7 +2,7 @@
 
 ## 出典
 
-`docs/artifacts/performance_report_veil_vs_nginx.md`（コンテナ環境で wrk (HTTP/1.1) が
+`docs/perf/reports/performance_report_veil_vs_nginx.md`（コンテナ環境で wrk (HTTP/1.1) が
 全て Non-2xx、musl 版はファイル配信されず）。
 
 ## 事象（再現手順）

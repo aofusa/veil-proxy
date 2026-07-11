@@ -110,7 +110,7 @@ wasm 構成は `docker/assets/wasm/passthrough_filter.wasm`（`examples/wasm-fil
 `run_perf.sh` が `/etc/veil/wasm:ro` にマウントして使用します。http3 / grpc-full / websocket は
 専用の負荷クライアントが必要なため残件（[F-89](../../docs/backlog/features/F-89-perf-full-features-coverage.md) 参照）。
 
-計測結果とボトルネック分析は [docs/artifacts/perf_full_features_report.md](../../docs/artifacts/perf_full_features_report.md)
+計測結果とボトルネック分析は [docs/perf/reports/perf_full_features_report.md](../../docs/perf/reports/perf_full_features_report.md)
 を参照（要約: **TLS 終端が支配的コスト**で L4 平文は最大 2.2 倍、L7 機能ロジックのオーバーヘッドは
 ノイズ範囲内・全構成 Non-2xx=0、逆プロキシのみバックエンドホップで −15%）。
 

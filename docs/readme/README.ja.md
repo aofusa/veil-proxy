@@ -3454,7 +3454,7 @@ recv/send/accept/timer Future をランダムに Drop する `runtime_cancellati
   ベースへ 1 機能だけを重ねた機能ショーケース構成（compression / cache / buffering / 逆プロキシ /
   **wasm / metrics / access-log / rate-limit / admin / opentelemetry / l4-proxy**、`h2_1_feat_*` /
   `h2_0_feat_l4`）で機能単位のオーバーヘッドを計測する。結果は [docs/perf](../perf/)、機能単位の
-  分析は [docs/artifacts/perf_full_features_report.md](../artifacts/perf_full_features_report.md) を参照
+  分析は [docs/perf/reports/perf_full_features_report.md](../perf/reports/perf_full_features_report.md) を参照
   （TLS 終端が支配的コストで平文 L4 は最大 2.2 倍、L7 機能ロジックはノイズ範囲内・全構成 Non-2xx=0）。
 
 ### テストの実行

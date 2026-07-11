@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 反復計測の生データ（results_raw.tsv）を (target, config, proto) 単位で集計し、
 # Req/s の median±stdev・レイテンシ/CPU/メモリの median・エラー合計を Markdown 表で出力する。
-# docs/artifacts/perf_benchmark/analyze_results.py の shell 版（tools/perf は shell のみ）。
+# docs/perf/reports/perf_benchmark/analyze_results.py の shell 版（tools/perf は shell のみ）。
 #
 # 使い方: bash tools/perf/analyze_results.sh [results_raw.tsv]
 set -euo pipefail

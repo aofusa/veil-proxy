@@ -117,3 +117,11 @@ bash tools/perf/run_perf.sh
 # 生データ:   tools/perf/results/results_raw.tsv
 # 集計サマリ: tools/perf/results/results_summary.md
 ```
+
+---
+
+## 過去の計測レポート・アーカイブ
+
+個別の計測レポート（Veil vs nginx 各版、ECDSA/並列メトリクス、full features 機能別
+オーバーヘッド、`tools/perf` 実装検証など）は [`reports/`](reports/) に集約している
+（旧 `docs/artifacts/` から移設）。一覧は [reports/README.md](reports/README.md) を参照。

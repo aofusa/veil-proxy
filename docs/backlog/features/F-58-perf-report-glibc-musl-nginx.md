@@ -2,7 +2,7 @@
 
 ## 出典
 
-`docs/artifacts/performance_report_veil_vs_nginx.md`（旧レポート。バグ修正前で
+`docs/perf/reports/performance_report_veil_vs_nginx.md`（旧レポート。バグ修正前で
 HTTP/1.1・musl が全滅していたため再測定が必要）。
 
 ## 概要
@@ -27,7 +27,7 @@ B-13 / B-14 / B-15 の修正後、glibc 版・musl 版・nginx(alpine) をコン
 
 ## 対応状況: 完了
 
-- レポート: `docs/artifacts/performance_report_veil_vs_nginx_v2.md`（生データ
+- レポート: `docs/perf/reports/performance_report_veil_vs_nginx_v2.md`（生データ
   `perf_results_v2_raw.tsv`）。全 24 計測 Non-2xx=0。再現ハーネス `tools/perf/`。
 - 主要知見: コンテナでは kTLS 無効が高速 / cbpf は単一クライアント IP を 1 ワーカーに集約 /
   kernel 分散は HTTP/1.1 を伸ばすが HTTP/2 を劣化 / OpenFileCache が静的配信を底上げ /

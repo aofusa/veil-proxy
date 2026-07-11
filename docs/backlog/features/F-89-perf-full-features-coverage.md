@@ -2,7 +2,7 @@
 
 ## 背景・機能説明
 
-[docs/artifacts/perf_measurement_report.md](../../artifacts/perf_measurement_report.md)（tools/perf 実装検証レポート）で、
+[docs/perf/reports/perf_measurement_report.md](../../perf/reports/perf_measurement_report.md)（tools/perf 実装検証レポート）で、
 パフォーマンス計測ハーネス `tools/perf/` の計測対象に以下の不足が指摘された。
 
 - **WASM（Proxy-Wasm）拡張のパフォーマンス計測が一切存在しない**（wasmtime ランタイム呼び出し・コンテキストスイッチのオーバーヘッドが不可視）。
@@ -53,7 +53,7 @@ feat 系構成では既定オフとし、kTLS 自体の影響は直交表 16 構
 - [x] `gen_configs.sh` が上表 7 構成を追加生成する（既存 16+4 構成は不変。合計 27 構成）。
 - [x] `run_perf.sh` で全構成がエラーなく計測完了する（feat 系 9 構成 × HTTP/1.1・HTTP/2 で **Non-2xx=0**、ready 失敗なし）。
 - [x] 計測結果（feat 構成のベースライン比オーバーヘッド）を
-  [docs/artifacts/perf_full_features_report.md](../../artifacts/perf_full_features_report.md) に記録する。
+  [docs/perf/reports/perf_full_features_report.md](../../perf/reports/perf_full_features_report.md) に記録する。
 - [x] 計測で顕著なオーバーヘッドが判明した場合、最適化チケットを起票または同一作業で修正する
   → 計測は **TLS 終端が支配的・L7 機能ロジックはノイズ範囲内**であることを示した。レポート主要関心事の
   WASM ホットパスの冗長な per-request エクスポート解決を同一作業で排除（`src/wasm/engine.rs`）。

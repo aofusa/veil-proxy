@@ -3419,7 +3419,7 @@ configs that layer a single full-only feature on a shared baseline — compressi
 buffering / reverse-proxy / **wasm / metrics / access-log / rate-limit / admin /
 opentelemetry / l4-proxy** (`h2_1_feat_*` / `h2_0_feat_l4`). Full data and a summary are in
 [**docs/perf**](docs/perf/); the per-feature analysis is in
-[docs/artifacts/perf_full_features_report.md](docs/artifacts/perf_full_features_report.md)
+[docs/perf/reports/perf_full_features_report.md](docs/perf/reports/perf_full_features_report.md)
 (TLS termination is the dominant cost — plaintext L4 is up to 2.2× faster — while L7 feature
 logic stays within noise, all configs Non-2xx=0).
 
