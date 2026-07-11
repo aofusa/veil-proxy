@@ -79,6 +79,53 @@ else
     log "PASS cache_poison_host_leak"
 fi
 
+# ---------------------------------------------------------------------------
+# F-109: 同一検証を HTTP/3 経由でも実行（curl --http3-only がある場合）
+# ---------------------------------------------------------------------------
+VEIL_HTTP3_PORT="${VEIL_HTTP3_PORT:-443}"
+if curl --help 2>&1 | grep -q -- '--http3'; then
+    log "F-109: compression/cache over HTTP/3 udp_port=${VEIL_HTTP3_PORT}"
+    set +e
+    h3_code=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 8 --http3-only \
+        -H "Accept-Encoding: gzip" \
+        "https://${VEIL_HOST}:${VEIL_HTTP3_PORT}/" 2>/dev/null || echo "000")
+    set -e
+    if [[ "${h3_code}" == "000" ]]; then
+        log "WARN h3_response_compression: no response (curl http3 may be unavailable)"
+    else
+        log "h3_compression_response: code=${h3_code}"
+        check "h3_response_compression" "[[ '${h3_code}' == '200' ]]"
+    fi
+
+    # キャッシュ経路の安定性（H3）
+    set +e
+    h3_body1=$(curl -sk --max-time 8 --http3-only \
+        "https://${VEIL_HOST}:${VEIL_HTTP3_PORT}${path}" 2>/dev/null || true)
+    h3_body2=$(curl -sk --max-time 8 --http3-only \
+        -H "X-Forwarded-Host: evil.attacker.example" \
+        "https://${VEIL_HOST}:${VEIL_HTTP3_PORT}${path}" 2>/dev/null || true)
+    h3_body3=$(curl -sk --max-time 8 --http3-only \
+        "https://${VEIL_HOST}:${VEIL_HTTP3_PORT}${path}" 2>/dev/null || true)
+    set -e
+    log "h3_cache_body_lens: b1=${#h3_body1} b2=${#h3_body2} b3=${#h3_body3}"
+    if [[ -z "${h3_body1}" && -z "${h3_body3}" ]]; then
+        log "WARN h3_cache_key_stability: empty bodies (http3 may be unavailable)"
+    elif [[ -n "${h3_body1}" ]] && [[ "${h3_body1}" == "${h3_body3}" ]]; then
+        log "PASS h3_cache_key_stability"
+    else
+        log "FAIL h3_cache_key_stability"
+        fails=$((fails + 1))
+    fi
+    if echo "${h3_body3}" | grep -qi "evil.attacker.example"; then
+        log "FAIL h3_cache_poison_host_leak"
+        fails=$((fails + 1))
+    else
+        log "PASS h3_cache_poison_host_leak"
+    fi
+else
+    log "WARN curl --http3 not available; skip H3 compression/cache checks"
+fi
+
 rm -rf "${TMP}"
 
 if [[ "${fails}" -eq 0 ]]; then

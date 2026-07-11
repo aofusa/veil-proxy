@@ -76,6 +76,41 @@ else
     fails=$((fails + 1))
 fi
 
+# ---------------------------------------------------------------------------
+# F-109: WASM フィルタを HTTP/3 経由でも検証
+# ---------------------------------------------------------------------------
+VEIL_HTTP3_PORT="${VEIL_HTTP3_PORT:-443}"
+if curl --help 2>&1 | grep -q -- '--http3'; then
+    log "F-109: wasm over HTTP/3 udp_port=${VEIL_HTTP3_PORT}"
+    set +e
+    h3_headers=$(curl -sk -D - -o /dev/null --max-time 8 --http3-only \
+        "https://${VEIL_HOST}:${VEIL_HTTP3_PORT}/wasm/" 2>/dev/null | tr -d '\r')
+    set -e
+    h3_code=$(printf '%s\n' "${h3_headers}" | awk 'BEGIN{c=0} /^HTTP/{c=$2} END{print c}')
+    h3_wasm_hdr=$(printf '%s\n' "${h3_headers}" | grep -i '^x-veil-processed:' | head -1 | awk '{print $2}' || true)
+    log "h3_wasm_route: code=${h3_code:-000} X-Veil-Processed=${h3_wasm_hdr:-missing}"
+
+    if [[ -z "${h3_code}" ]] || [[ "${h3_code}" == "0" ]]; then
+        log "WARN h3_wasm_route: no response (curl http3 may be unavailable)"
+    else
+        if [[ "${h3_code}" == "200" ]]; then
+            log "PASS h3_wasm_route_responds"
+        else
+            log "FAIL h3_wasm_route_responds: code=${h3_code}"
+            fails=$((fails + 1))
+        fi
+        if [[ "${h3_wasm_hdr}" == "true" ]]; then
+            log "PASS h3_proxy_wasm_header_filter"
+        else
+            # B-38 等で H3 WASM 未配線の場合は FAIL（実装ギャップとして検出）
+            log "FAIL h3_proxy_wasm_header_filter"
+            fails=$((fails + 1))
+        fi
+    fi
+else
+    log "WARN curl --http3 not available; skip H3 wasm checks"
+fi
+
 if [[ "${fails}" -eq 0 ]]; then
     log "wasm_security: ok"
     exit 0

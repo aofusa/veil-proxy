@@ -122,6 +122,10 @@ run_h3_grpc_web_mode grpc_web_text_invalid_b64 "h3_grpc_web_text_invalid_b64"
 # F-107 S-G-H3-17: gRPC-Web 巨大メタデータ over HTTP/3
 run_h3_grpc_web_mode grpc_web_oversized_metadata "h3_grpc_web_oversized_metadata"
 
+# F-109: grpc-status スプーフィング + 不正 Origin CORS（H3 gRPC-Web）
+run_h3_grpc_web_mode grpc_web_status_spoof "h3_grpc_web_status_spoof"
+run_h3_grpc_web_mode grpc_web_cors_origin "h3_grpc_web_cors_origin"
+
 # curl --http3-only があれば追加検証（環境依存・失敗しても非致命）
 if curl --help 2>&1 | grep -q -- '--http3'; then
     set +e

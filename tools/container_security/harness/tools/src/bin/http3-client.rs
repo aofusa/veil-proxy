@@ -16,6 +16,9 @@
 //!               | control_stream_abuse | cid_exhaustion | token_spoofing
 //!               | grpc_oversized_metadata | grpc_rst_flood
 //!               | grpc_web_text_invalid_b64 | grpc_web_oversized_metadata
+//!               | smuggling_cl_te | smuggling_dup_cl | smuggling_te_inject
+//!               | websocket_bad_connect | websocket_missing_protocol
+//!               | grpc_web_status_spoof | grpc_web_cors_origin
 //! - HTTP3_REPORT
 //! - HTTP3_GRPC_PATH (default /grpc.test.v1.TestService/UnaryCall)
 //! - AMPLIFICATION_STRICT (default 1): amplification_check で ratio>3 をエラーにする
@@ -148,6 +151,21 @@ fn main() {
             .map(|s| format!("grpc_web_text_invalid_b64 done detail={}", s)),
         "grpc_web_oversized_metadata" => grpc_web_oversized_metadata(&host, port, &grpc_path)
             .map(|s| format!("grpc_web_oversized_metadata done detail={}", s)),
+        // F-109: H3 smuggling / WS / gRPC-Web CORS・status spoof
+        "smuggling_cl_te" => smuggling_cl_te(&host, port, &path)
+            .map(|s| format!("smuggling_cl_te done detail={}", s)),
+        "smuggling_dup_cl" => smuggling_dup_cl(&host, port, &path)
+            .map(|s| format!("smuggling_dup_cl done detail={}", s)),
+        "smuggling_te_inject" => smuggling_te_inject(&host, port, &path)
+            .map(|s| format!("smuggling_te_inject done detail={}", s)),
+        "websocket_bad_connect" => websocket_bad_connect(&host, port, &path)
+            .map(|s| format!("websocket_bad_connect done detail={}", s)),
+        "websocket_missing_protocol" => websocket_missing_protocol(&host, port, &path)
+            .map(|s| format!("websocket_missing_protocol done detail={}", s)),
+        "grpc_web_status_spoof" => grpc_web_status_spoof(&host, port, &grpc_path)
+            .map(|s| format!("grpc_web_status_spoof done detail={}", s)),
+        "grpc_web_cors_origin" => grpc_web_cors_origin(&host, port, &grpc_path)
+            .map(|s| format!("grpc_web_cors_origin done detail={}", s)),
         other => Err(format!("unknown HTTP3_MODE={}", other).into()),
     };
 
@@ -2341,4 +2359,199 @@ fn grpc_web_oversized_metadata(
         session.conn.is_closed(),
         big_timeout.len()
     ))
+}
+
+/// 共通: リクエスト送信後に status / closed を待つ。
+fn wait_status(
+    session: &mut H3Session,
+    timeout: Duration,
+) -> Result<(Option<u16>, bool), Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    let mut last_status = None;
+    while start.elapsed() < timeout {
+        pump_io(session);
+        let (st, fin) = drain_events(session);
+        if st.is_some() {
+            last_status = st;
+        }
+        if fin || session.conn.is_closed() {
+            break;
+        }
+    }
+    Ok((last_status, session.conn.is_closed()))
+}
+
+/// F-109 S-H3-SMUG: Content-Length と Transfer-Encoding を同時付与（H3→H1 変換時スマグリング刺激）。
+/// HTTP/3 自体に TE は無いが、不正ヘッダを注入してプロキシが拒否/無害化することを検証する。
+fn smuggling_cl_te(
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut session = establish_h3(host, port, 15_000)?;
+    let headers = vec![
+        quiche::h3::Header::new(b":method", b"POST"),
+        quiche::h3::Header::new(b":path", path.as_bytes()),
+        quiche::h3::Header::new(b":authority", host.as_bytes()),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b"content-type", b"application/octet-stream"),
+        quiche::h3::Header::new(b"content-length", b"6"),
+        quiche::h3::Header::new(b"transfer-encoding", b"chunked"),
+    ];
+    let body = b"0\r\n\r\nX";
+    let stream_id = session.h3.send_request(&mut session.conn, &headers, false)?;
+    session
+        .h3
+        .send_body(&mut session.conn, stream_id, body, true)?;
+    pump_io(&mut session);
+    let (st, closed) = wait_status(&mut session, Duration::from_secs(8))?;
+    Ok(format!("status={:?} closed={}", st, closed))
+}
+
+/// F-109: 重複 Content-Length ヘッダ注入。
+fn smuggling_dup_cl(
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut session = establish_h3(host, port, 15_000)?;
+    let headers = vec![
+        quiche::h3::Header::new(b":method", b"POST"),
+        quiche::h3::Header::new(b":path", path.as_bytes()),
+        quiche::h3::Header::new(b":authority", host.as_bytes()),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b"content-type", b"text/plain"),
+        quiche::h3::Header::new(b"content-length", b"5"),
+        quiche::h3::Header::new(b"content-length", b"6"),
+    ];
+    let body = b"hello!";
+    let stream_id = session.h3.send_request(&mut session.conn, &headers, false)?;
+    session
+        .h3
+        .send_body(&mut session.conn, stream_id, body, true)?;
+    pump_io(&mut session);
+    let (st, closed) = wait_status(&mut session, Duration::from_secs(8))?;
+    Ok(format!("status={:?} closed={}", st, closed))
+}
+
+/// F-109: Transfer-Encoding: chunked 単独注入（H3 上の TE ヘッダ）。
+fn smuggling_te_inject(
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut session = establish_h3(host, port, 15_000)?;
+    let headers = vec![
+        quiche::h3::Header::new(b":method", b"POST"),
+        quiche::h3::Header::new(b":path", path.as_bytes()),
+        quiche::h3::Header::new(b":authority", host.as_bytes()),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b"content-type", b"text/plain"),
+        quiche::h3::Header::new(b"transfer-encoding", b"chunked"),
+    ];
+    let body = b"5\r\nhello\r\n0\r\n\r\n";
+    let stream_id = session.h3.send_request(&mut session.conn, &headers, false)?;
+    session
+        .h3
+        .send_body(&mut session.conn, stream_id, body, true)?;
+    pump_io(&mut session);
+    let (st, closed) = wait_status(&mut session, Duration::from_secs(8))?;
+    Ok(format!("status={:?} closed={}", st, closed))
+}
+
+/// F-109 S-H3-WS: Extended CONNECT 風だが :protocol 欠落 / 不正キー。
+fn websocket_bad_connect(
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let ws_path = if path == "/" { "/ws/" } else { path };
+    let mut session = establish_h3(host, port, 15_000)?;
+    let headers = vec![
+        quiche::h3::Header::new(b":method", b"CONNECT"),
+        quiche::h3::Header::new(b":path", ws_path.as_bytes()),
+        quiche::h3::Header::new(b":authority", host.as_bytes()),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b"sec-websocket-version", b"13"),
+        quiche::h3::Header::new(b"sec-websocket-key", b"not-valid-base64!!!"),
+    ];
+    let _stream_id = session.h3.send_request(&mut session.conn, &headers, true)?;
+    pump_io(&mut session);
+    let (st, closed) = wait_status(&mut session, Duration::from_secs(8))?;
+    Ok(format!("status={:?} closed={}", st, closed))
+}
+
+/// F-109: CONNECT に :protocol 欠落のみ（RFC 9220 違反）。
+fn websocket_missing_protocol(
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let ws_path = if path == "/" { "/ws/" } else { path };
+    let mut session = establish_h3(host, port, 15_000)?;
+    let headers = vec![
+        quiche::h3::Header::new(b":method", b"CONNECT"),
+        quiche::h3::Header::new(b":path", ws_path.as_bytes()),
+        quiche::h3::Header::new(b":authority", host.as_bytes()),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b"sec-websocket-version", b"13"),
+        quiche::h3::Header::new(b"sec-websocket-key", b"dGhlIHNhbXBsZSBub25jZQ=="),
+    ];
+    let _stream_id = session.h3.send_request(&mut session.conn, &headers, true)?;
+    pump_io(&mut session);
+    let (st, closed) = wait_status(&mut session, Duration::from_secs(8))?;
+    Ok(format!("status={:?} closed={}", st, closed))
+}
+
+/// F-109 S-G-WEB-H3: gRPC-Web でクライアントが grpc-status をスプーフィング。
+fn grpc_web_status_spoof(
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut session = establish_h3(host, port, 15_000)?;
+    let headers = vec![
+        quiche::h3::Header::new(b":method", b"POST"),
+        quiche::h3::Header::new(b":path", path.as_bytes()),
+        quiche::h3::Header::new(b":authority", host.as_bytes()),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b"content-type", b"application/grpc-web"),
+        quiche::h3::Header::new(b"accept", b"application/grpc-web"),
+        quiche::h3::Header::new(b"grpc-status", b"0"),
+        quiche::h3::Header::new(b"grpc-message", b"spoofed"),
+    ];
+    let body = [0u8, 0, 0, 0, 2, b'{', b'}'];
+    let stream_id = session.h3.send_request(&mut session.conn, &headers, false)?;
+    session
+        .h3
+        .send_body(&mut session.conn, stream_id, &body, true)?;
+    pump_io(&mut session);
+    let (st, closed) = wait_status(&mut session, Duration::from_secs(8))?;
+    Ok(format!("status={:?} closed={}", st, closed))
+}
+
+/// F-109: 不正 Origin 付き gRPC-Web（CORS バイパス刺激）。
+fn grpc_web_cors_origin(
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut session = establish_h3(host, port, 15_000)?;
+    let headers = vec![
+        quiche::h3::Header::new(b":method", b"POST"),
+        quiche::h3::Header::new(b":path", path.as_bytes()),
+        quiche::h3::Header::new(b":authority", host.as_bytes()),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b"content-type", b"application/grpc-web"),
+        quiche::h3::Header::new(b"accept", b"application/grpc-web"),
+        quiche::h3::Header::new(b"origin", b"https://evil.attacker.example"),
+    ];
+    let body = [0u8, 0, 0, 0, 2, b'{', b'}'];
+    let stream_id = session.h3.send_request(&mut session.conn, &headers, false)?;
+    session
+        .h3
+        .send_body(&mut session.conn, stream_id, &body, true)?;
+    pump_io(&mut session);
+    let (st, closed) = wait_status(&mut session, Duration::from_secs(8))?;
+    Ok(format!("status={:?} closed={}", st, closed))
 }
