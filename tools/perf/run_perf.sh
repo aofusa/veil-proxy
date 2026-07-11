@@ -12,10 +12,18 @@ mkdir -p "$LOGDIR"
 
 WRK_IMG=williamyeh/wrk:latest
 H2_IMG=local/h2load:latest
+K6_IMG=grafana/k6:latest            # gRPC / WebSocket 計測クライアント
+GRPC_IMG=moul/grpcbin:latest        # gRPC 上流（h2c :9000）
+WS_IMG=jmalloc/echo-server:latest   # WebSocket エコー上流（:8080, WS は /.ws）
+H3_IMG=local/h2load-h3:latest       # QUIC/HTTP-3 対応 h2load（tools/perf/h2load-http3 でビルド）
+K6DIR="$HERE/k6"                     # k6 スクリプト・proto の所在
 
 # 負荷パラメータ（環境変数で上書き可）
 WRK_ARGS="${WRK_ARGS:--t4 -c100 -d10s --timeout 5s --latency}"
 H2_ARGS="${H2_ARGS:--n 30000 -c100 -m10}"
+H3_ARGS="${H3_ARGS:---alpn-list=h3 -n 30000 -c100 -m10}"  # h2load QUIC モード（HTTP/3）
+K6_VUS="${K6_VUS:-50}"             # k6 並列仮想ユーザ数（gRPC / WebSocket）
+K6_DURATION="${K6_DURATION:-10s}" # k6 計測時間
 ITERATIONS="${ITERATIONS:-3}"      # 各 (config, proto) の反復回数（median±stdev 集計用）
 
 # 計測結果は raw（1 反復 1 行）で保存し、analyze_results.sh で median±stdev に集計する。
@@ -71,8 +79,81 @@ parse_h2load() { # logfile -> "reqps throughput latmean non2xx"
     echo "${reqps:-NA} ${tput:-NA} ${latmean:-NA} ${non2xx:-0}"
 }
 
+# k6 の handleSummary が書いた result.tsv（"reqps<TAB>lat<TAB>fails"）を読む。
+parse_k6() { # result.tsv -> "reqps lat fails"
+    local f="$1" reqps lat fails
+    if [ -s "$f" ]; then
+        read reqps lat fails < "$f"
+    fi
+    echo "${reqps:-NA} ${lat:-NA} ${fails:-0}"
+}
+
+# gRPC 計測: k6(gRPC) → veil(TLS h2) → grpcbin(h2c)。unary SayHello を VUS 並列で反復。
+run_grpc() { # label cfg container
+    local label="$1" cfg="$2" c="$3" iter reqps lat fails cpu mem outdir
+    for iter in $(seq 1 "$ITERATIONS"); do
+        outdir="$LOGDIR/${label}_${cfg}_grpc_${iter}.out"
+        rm -rf "$outdir"; mkdir -p "$outdir"; chmod 777 "$outdir"
+        ( sleep 2; sample_stats "$c" > "$LOGDIR/${label}_${cfg}_grpc_${iter}.stats" ) &
+        docker run --rm --network $NET \
+            -v "$K6DIR:/scripts:ro" -v "$outdir:/out" \
+            -e TARGET="$c:443" -e VUS="$K6_VUS" -e DURATION="$K6_DURATION" \
+            $K6_IMG run /scripts/grpc.js > "$LOGDIR/${label}_${cfg}_grpc_${iter}.log" 2>&1
+        wait
+        read reqps lat fails < <(parse_k6 "$outdir/result.tsv")
+        read cpu mem < "$LOGDIR/${label}_${cfg}_grpc_${iter}.stats" 2>/dev/null || { cpu=NA; mem=NA; }
+        emit "$label" "$cfg" "grpc" "$iter" "$reqps" "NA" "$lat" "NA" "$fails" "$cpu" "$mem"
+    done
+}
+
+# WebSocket 計測: k6(WS) → veil(TLS) → echo-server。1 セッション MSGS 往復のフレーム転送。
+run_ws() { # label cfg container
+    local label="$1" cfg="$2" c="$3" iter reqps lat fails cpu mem outdir
+    for iter in $(seq 1 "$ITERATIONS"); do
+        outdir="$LOGDIR/${label}_${cfg}_ws_${iter}.out"
+        rm -rf "$outdir"; mkdir -p "$outdir"; chmod 777 "$outdir"
+        ( sleep 2; sample_stats "$c" > "$LOGDIR/${label}_${cfg}_ws_${iter}.stats" ) &
+        docker run --rm --network $NET \
+            -v "$K6DIR:/scripts:ro" -v "$outdir:/out" \
+            -e TARGET="wss://$c:443/.ws" -e VUS="$K6_VUS" -e DURATION="$K6_DURATION" \
+            $K6_IMG run /scripts/websocket.js > "$LOGDIR/${label}_${cfg}_ws_${iter}.log" 2>&1
+        wait
+        read reqps lat fails < <(parse_k6 "$outdir/result.tsv")
+        read cpu mem < "$LOGDIR/${label}_${cfg}_ws_${iter}.stats" 2>/dev/null || { cpu=NA; mem=NA; }
+        emit "$label" "$cfg" "websocket" "$iter" "$reqps" "NA" "$lat" "NA" "$fails" "$cpu" "$mem"
+    done
+}
+
+# HTTP/3 計測: QUIC 対応 h2load（local/h2load-h3）の QUIC モード（--alpn-list=h3）で
+# veil の静的配信を UDP/QUIC で叩く。QUIC h2load イメージが無い場合はスキップする
+# （既定の local/h2load は ngtcp2 非搭載で HTTP/3 を計測できない）。
+run_http3() { # label cfg container
+    local label="$1" cfg="$2" c="$3" iter reqps tput latmean non2xx cpu mem
+    if ! docker image inspect "$H3_IMG" >/dev/null 2>&1; then
+        echo "!! $H3_IMG が無いため HTTP/3 計測をスキップ（tools/perf/h2load-http3 でビルド）" >&2
+        emit "$label" "$cfg" "http3" 1 NA NA NA NA NA NA NA
+        return
+    fi
+    docker run --rm --network $NET --entrypoint h2load $H3_IMG $H3_ARGS -n 1000 -c 10 "https://$c:443/" >/dev/null 2>&1
+    for iter in $(seq 1 "$ITERATIONS"); do
+        ( sleep 1; sample_stats "$c" > "$LOGDIR/${label}_${cfg}_h3_${iter}.stats" ) &
+        docker run --rm --network $NET --entrypoint h2load $H3_IMG $H3_ARGS "https://$c:443/" \
+            > "$LOGDIR/${label}_${cfg}_h3_${iter}.log" 2>&1
+        wait
+        read reqps tput latmean non2xx < <(parse_h2load "$LOGDIR/${label}_${cfg}_h3_${iter}.log")
+        read cpu mem < "$LOGDIR/${label}_${cfg}_h3_${iter}.stats" 2>/dev/null || { cpu=NA; mem=NA; }
+        emit "$label" "$cfg" "http3" "$iter" "$reqps" "$tput" "$latmean" "NA" "$non2xx" "$cpu" "$mem"
+    done
+}
+
 run_load() { # target_label config_label container has_http2
     local label="$1" cfg="$2" c="$3" h2="$4" iter reqps transfer latavg latp99 non2xx cpu mem tput latmean
+
+    # 専用クライアントを要する構成は wrk/h2load ではなく専用計測へ委譲する。
+    case "$cfg" in
+        *feat_grpc*)      run_grpc "$label" "$cfg" "$c"; return ;;
+        *feat_websocket*) run_ws   "$label" "$cfg" "$c"; return ;;
+    esac
 
     # compression 構成は Accept-Encoding を送らないと圧縮経路を通らないため付与する。
     local wrk_extra=() h2_extra=()
@@ -117,6 +198,11 @@ run_load() { # target_label config_label container has_http2
             emit "$label" "$cfg" "http2" "$iter" "$reqps" "$tput" "$latmean" "NA" "$non2xx" "$cpu" "$mem"
         done
     fi
+
+    # HTTP/3 (h2load QUIC)。http3_enabled 構成のみ UDP/QUIC で追加計測する。
+    case "$cfg" in
+        *feat_http3*) run_http3 "$label" "$cfg" "$c" ;;
+    esac
 }
 
 start_veil() { # image config_file container_name
@@ -126,14 +212,17 @@ start_veil() { # image config_file container_name
     # 逆プロキシ系（perf-backend を上流に持つ）構成では、Landlock 下の glibc NSS による
     # 実行時 DNS 解決が不安定なため、上流ホスト名を perf-backend の IP へ置換した
     # ランタイム設定を使う（container_security ハーネスと同じ方針）。
+    # 逆プロキシ系（perf-backend / perf-grpc / perf-ws を上流に持つ）構成では、
+    # 上流ホスト名を実 IP へ置換したランタイム設定を使う。
     local mount_cfg="$cfgfile"
-    if grep -q 'perf-backend:80' "$cfgfile" 2>/dev/null; then
-        local be_ip
-        be_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' perf-backend 2>/dev/null || true)
-        if [ -n "$be_ip" ]; then
-            mount_cfg="$LOGDIR/$(basename "$cfgfile" .toml).runtime.toml"
-            sed "s/perf-backend:80/${be_ip}:80/g" "$cfgfile" > "$mount_cfg"
-        fi
+    if grep -qE 'perf-backend:80|perf-grpc:9000|perf-ws:8080' "$cfgfile" 2>/dev/null; then
+        mount_cfg="$LOGDIR/$(basename "$cfgfile" .toml).runtime.toml"
+        cp "$cfgfile" "$mount_cfg"
+        local alias ip
+        for alias in perf-backend perf-grpc perf-ws; do
+            ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$alias" 2>/dev/null || true)
+            [ -n "$ip" ] && sed -i "s/${alias}:/${ip}:/g" "$mount_cfg"
+        done
     fi
 
     docker run -d --rm --network $NET \
@@ -172,6 +261,20 @@ docker run -d --rm --network $NET --network-alias perf-backend \
     --name perf-backend nginx:alpine >/dev/null 2>&1 || \
     echo "!! perf-backend 起動失敗（proxy/buffering 構成はスキップされ得る）" >&2
 
+# ---- gRPC 上流（feat_grpc 用）: grpcbin の h2c gRPC を :9000 で待受 ----
+echo "### perf-grpc (upstream for grpc config)"
+docker rm -f perf-grpc >/dev/null 2>&1
+docker run -d --rm --network $NET --network-alias perf-grpc \
+    --name perf-grpc "$GRPC_IMG" >/dev/null 2>&1 || \
+    echo "!! perf-grpc 起動失敗（grpc 構成はスキップされ得る）" >&2
+
+# ---- WebSocket 上流（feat_websocket 用）: echo-server の WS エコーを :8080 で待受 ----
+echo "### perf-ws (upstream for websocket config)"
+docker rm -f perf-ws >/dev/null 2>&1
+docker run -d --rm --network $NET --network-alias perf-ws \
+    --name perf-ws "$WS_IMG" >/dev/null 2>&1 || \
+    echo "!! perf-ws 起動失敗（websocket 構成はスキップされ得る）" >&2
+
 # ---- nginx baseline ----
 echo "### nginx"
 docker rm -f nginx-perf >/dev/null 2>&1
@@ -203,7 +306,7 @@ for build in glibc musl; do
     done
 done
 
-docker rm -f perf-backend >/dev/null 2>&1
+docker rm -f perf-backend perf-grpc perf-ws >/dev/null 2>&1
 
 echo "=== 生データ: $RESULTS_RAW（${ITERATIONS} 反復/構成）==="
 # median±stdev へ集計してサマリ Markdown を生成

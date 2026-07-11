@@ -1,0 +1,20 @@
+// grpcbin (moul/grpcbin) の hello.HelloService 定義。
+// perf ハーネスの gRPC 計測 (tools/perf/k6/grpc.js) が unary SayHello を呼ぶために使う。
+syntax = "proto3";
+
+package hello;
+
+service HelloService {
+    rpc SayHello(HelloRequest) returns (HelloResponse);
+    rpc LotsOfReplies(HelloRequest) returns (stream HelloResponse);
+    rpc LotsOfGreetings(stream HelloRequest) returns (HelloResponse);
+    rpc BidiHello(stream HelloRequest) returns (stream HelloResponse);
+}
+
+message HelloRequest {
+    string greeting = 1;
+}
+
+message HelloResponse {
+    string reply = 1;
+}

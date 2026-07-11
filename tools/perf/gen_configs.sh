@@ -236,7 +236,7 @@ count=$((count + 1))
 # full features 機能ショーケース第 2 弾（F-89: perf_measurement_report.md 指摘分）。
 # wasm / metrics / access-log / rate-limit / admin / opentelemetry / l4-proxy を
 # それぞれ 1 機能だけベース構成へ重ね、機能単位のオーバーヘッドを計測する。
-# http3 / grpc-full / websocket は専用クライアントが必要なため残件（F-89 参照）。
+# http3 / grpc-full / websocket は専用クライアント（h2load QUIC / k6）を第 3 弾で追加。
 # ============================================================
 
 # wasm: パススルー Proxy-Wasm フィルタ 1 枚（wasmtime 呼び出しの素のオーバーヘッド）。
@@ -417,6 +417,144 @@ tls = "none"
 EOF
 } > "$OUT/h2_0_feat_l4.toml"
 echo "wrote $OUT/h2_0_feat_l4.toml"
+count=$((count + 1))
+
+# ============================================================
+# full features 機能ショーケース第 3 弾（F-89 残件: 専用負荷クライアント導入分）。
+# http3 / grpc-full / websocket を計測する。
+#   - http3    : h2load の QUIC モード（--alpn-list=h3）で veil の静的配信を計測
+#   - grpc     : k6(gRPC) → veil(TLS h2) → grpcbin(h2c) の unary 呼び出し
+#   - websocket: k6(WS)   → veil(TLS)    → echo-server の WS エコー
+# run_perf.sh が構成名から専用クライアント・上流バックエンドを判定する。
+# ============================================================
+
+# http3: HTTP/3 (QUIC) 有効化。UDP 443 で同一静的ファイルを配信し、
+# h2load の QUIC モードで計測する（kTLS は QUIC 非対応のため既定どおりオフ）。
+# feat_base_head は http3_enabled を持たないため server ブロックを個別生成する。
+{
+    cat <<'EOF'
+[server]
+listen = "0.0.0.0:443"
+http = "0.0.0.0:80"
+http2_enabled = true
+http3_enabled = true
+threads = 0
+
+[logging]
+level = "warn"
+
+[security]
+allow_security_failures = false
+drop_privileges_user = "nonroot"
+drop_privileges_group = "nonroot"
+enable_seccomp = true
+enable_landlock = true
+enable_sandbox = false
+seccomp_mode = "filter"
+landlock_read_paths = ["/var/www", "/var/cache/veil", "/var/tmp/veil", "/etc/veil", "/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf", "/lib", "/lib64", "/usr"]
+landlock_write_paths = ["/var/cache/veil", "/var/tmp/veil"]
+
+[performance]
+huge_pages_enabled = false
+reuseport_balancing = "kernel"
+
+[tls]
+cert_path = "/etc/veil/ssl/cert.pem"
+key_path = "/etc/veil/ssl/key.pem"
+ktls_enabled = false
+ktls_fallback_enabled = true
+
+[http3]
+listen = "0.0.0.0:443"
+
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "/var/www/"
+[route.security]
+allowed_methods = ["HEAD", "GET"]
+EOF
+} > "$OUT/h2_1_feat_http3.toml"
+echo "wrote $OUT/h2_1_feat_http3.toml"
+count=$((count + 1))
+
+# grpc: gRPC 逆プロキシ経路（veil で TLS 終端 → h2c で grpcbin へ中継）。
+# k6 の gRPC クライアントが hello.HelloService/SayHello を veil 経由で呼ぶ。
+# 上流 grpcbin は perf-grpc:9000（h2c）。use_h2c=true で HTTP/2 平文中継。
+{
+    feat_base_head
+    cat <<'EOF'
+
+# k6 の gRPC クライアントは完了ストリームごとに RST_STREAM(CANCEL) を送るため、
+# 高 QPS では CVE-2023-44487 対策の RST レート制限（既定 100/s）に達し ENHANCE_YOUR_CALM で
+# 接続が切れる。計測では判定・中継のオーバーヘッドを見たいので上限を大きく引き上げる
+# （feat_rate_limit が 429 を避けるのと同じ方針。既定値の妥当性は本計測の対象外）。
+[http2]
+max_rst_stream_per_second = 100000000
+
+# gRPC 上流（grpcbin の h2c gRPC）。veil は Content-Type: application/grpc を検出すると
+# ルート `/*` プレフィックスを剥がさず完全パス（/hello.HelloService/SayHello）を保持して
+# 中継する（B-40 修正）。use_h2c=true で HTTP/2 平文（h2c）中継。
+[upstreams."perf-grpc"]
+algorithm = "round_robin"
+servers = ["http://perf-grpc:9000/"]
+
+[[route]]
+[route.conditions]
+path = "/hello.HelloService/*"
+[route.action]
+type = "Proxy"
+upstream = "perf-grpc"
+use_h2c = true
+[route.security]
+allowed_methods = ["POST"]
+
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "/var/www/"
+[route.security]
+allowed_methods = ["HEAD", "GET"]
+EOF
+} > "$OUT/h2_1_feat_grpc.toml"
+echo "wrote $OUT/h2_1_feat_grpc.toml"
+count=$((count + 1))
+
+# websocket: WebSocket 逆プロキシ経路（Upgrade 自動検出 → echo-server へ中継）。
+# k6 の WebSocket クライアントが /.ws でエコーサーバとフレームを往復する。
+# 上流 echo-server は perf-ws:8080（平文 HTTP/1.1 + WS Upgrade）。
+{
+    feat_base_head
+    cat <<'EOF'
+
+[upstreams."perf-ws"]
+algorithm = "round_robin"
+servers = ["http://perf-ws:8080/"]
+
+[[route]]
+[route.conditions]
+path = "/.ws"
+[route.action]
+type = "Proxy"
+upstream = "perf-ws"
+[route.security]
+allowed_methods = ["GET"]
+
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "/var/www/"
+[route.security]
+allowed_methods = ["HEAD", "GET"]
+EOF
+} > "$OUT/h2_1_feat_websocket.toml"
+echo "wrote $OUT/h2_1_feat_websocket.toml"
 count=$((count + 1))
 
 echo "生成完了: ${count} バリアント -> $OUT"

@@ -6,3 +6,4 @@ results/results_summary.md
 results/feat_raw.tsv
 results/run.log
 configs/_debug*.toml
+results/smoke/
