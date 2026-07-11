@@ -391,9 +391,72 @@ impl HttpsConnectionPool {
     }
 }
 
+/// H2C（HTTP/2 平文）バックエンド用コネクションプール（F-106）。
+///
+/// gRPC 中継など `use_h2c` バックエンドへの接続を再利用し、リクエストごとの
+/// TCP 接続 + h2c ハンドシェイク（コネクションプリフェース + SETTINGS 往復）を
+/// 排除する。HTTP/1.1 の `HttpConnectionPool` と異なり、HTTP/2 はコネクション上で
+/// ストリーム ID を単調増加させながら複数リクエストを直列に流せる（`H2cClient` の
+/// `next_stream_id` が状態を保持）。プールに返す前に呼び出し側が
+/// `H2cClient::is_reusable()`（ストリーム ID 枯渇前）と応答成功を確認する。
+/// io_uring の `TcpStream` はワーカースレッドの ring に紐づくため、スレッドローカルで
+/// 同一スレッド再利用のみ行う（thread-per-core）。
+#[cfg(feature = "http2")]
+pub(crate) struct H2cConnectionPool {
+    connections: HashMap<String, VecDeque<PooledConnection<crate::http2::H2cClient<TcpStream>>>>,
+}
+
+#[cfg(feature = "http2")]
+impl H2cConnectionPool {
+    pub(crate) fn new() -> Self {
+        Self {
+            connections: HashMap::new(),
+        }
+    }
+
+    /// プールから接続を取得（有効な接続がなければ None）
+    pub(crate) fn get(&mut self, key: &str) -> Option<crate::http2::H2cClient<TcpStream>> {
+        if let Some(queue) = self.connections.get_mut(key) {
+            while let Some(entry) = queue.pop_front() {
+                if entry.is_valid() {
+                    crate::metrics::record_connection_pool_hit(key);
+                    return Some(entry.stream);
+                }
+                // 無効（アイドルタイムアウト超過）な接続は破棄
+            }
+        }
+        crate::metrics::record_connection_pool_miss(key);
+        None
+    }
+
+    /// 接続をプールに返却（`is_reusable()` を満たす健全な接続のみ返す）
+    pub(crate) fn put(
+        &mut self,
+        key: String,
+        client: crate::http2::H2cClient<TcpStream>,
+        max_idle: usize,
+        idle_timeout_secs: u64,
+    ) {
+        let metric_key = key.clone();
+        let queue = self.connections.entry(key).or_default();
+
+        while queue.len() >= max_idle {
+            queue.pop_front();
+        }
+
+        queue.push_back(PooledConnection::new(client, idle_timeout_secs));
+        crate::metrics::set_connection_pool_size(&metric_key, queue.len());
+    }
+}
+
 thread_local! {
     pub(crate) static HTTP_POOL: RefCell<HttpConnectionPool> = RefCell::new(HttpConnectionPool::new());
     pub(crate) static HTTPS_POOL: RefCell<HttpsConnectionPool> = RefCell::new(HttpsConnectionPool::new());
+}
+
+#[cfg(feature = "http2")]
+thread_local! {
+    pub(crate) static H2C_POOL: RefCell<H2cConnectionPool> = RefCell::new(H2cConnectionPool::new());
 }
 
 // kTLS 有効時のスレッドローカル Splice パイプの checkout/return 型プール（B-16）

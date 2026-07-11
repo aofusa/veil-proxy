@@ -1159,12 +1159,8 @@ async fn handle_h2_request_streaming<S>(
             .iter()
             .any(|h| header_pair_is_grpc(&h.name, &h.value))
     });
-    let final_path_owned = compute_upstream_path(
-        path_str,
-        &prefix,
-        &target.path_prefix,
-        preserve_grpc_path,
-    );
+    let final_path_owned =
+        compute_upstream_path(path_str, &prefix, &target.path_prefix, preserve_grpc_path);
     let final_path = final_path_owned.as_str();
 
     let mut request = request_buf_get(1024);
@@ -1403,8 +1399,14 @@ where
         if let Some(ref g) = server_guard {
             h2_headers.push(g.as_header());
         }
-        let body_ref = if body.is_empty() { None } else { Some(body.as_slice()) };
-        let _ = conn.send_response(stream_id, status, &h2_headers, body_ref).await;
+        let body_ref = if body.is_empty() {
+            None
+        } else {
+            Some(body.as_slice())
+        };
+        let _ = conn
+            .send_response(stream_id, status, &h2_headers, body_ref)
+            .await;
         return Some((status, body.len().max(0) as u64));
     }
 
@@ -1459,7 +1461,11 @@ where
     if let Some(ref g) = server_guard {
         h2_headers.push(g.as_header());
     }
-    let body_ref = if body.is_empty() { None } else { Some(body.as_slice()) };
+    let body_ref = if body.is_empty() {
+        None
+    } else {
+        Some(body.as_slice())
+    };
     let _ = conn
         .send_response(stream_id, status, &h2_headers, body_ref)
         .await;
@@ -1864,12 +1870,9 @@ where
                 );
 
                 #[cfg(feature = "wasm")]
-                let header_store = apply_h2_wasm_response_headers(
-                    &wasm_modules_to_apply,
-                    200,
-                    built_headers,
-                )
-                .await;
+                let header_store =
+                    apply_h2_wasm_response_headers(&wasm_modules_to_apply, 200, built_headers)
+                        .await;
                 #[cfg(not(feature = "wasm"))]
                 let header_store = built_headers;
 
@@ -1966,40 +1969,39 @@ where
 {
     // サーバー選択（Consistent Hash の header:/cookie: キーをリクエストヘッダから解決）
     // get_stream の借用を select 完了前に終わらせる（後続の conn 可変借用と衝突しないよう）。
-    let hash_key_owned: Option<String> = conn.get_stream(stream_id).and_then(|stream| {
-        match &upstream_group.algorithm {
-            crate::config::LoadBalanceAlgorithm::ConsistentHash {
-                hash_key: crate::config::HashKey::Header(name),
-            } => stream
-                .request_headers
-                .iter()
-                .find(|h| h.name.eq_ignore_ascii_case(name.as_bytes()))
-                .and_then(|h| std::str::from_utf8(&h.value).ok())
-                .map(|s| s.to_string()),
-            crate::config::LoadBalanceAlgorithm::ConsistentHash {
-                hash_key: crate::config::HashKey::Cookie(name),
-            } => stream
-                .request_headers
-                .iter()
-                .find(|h| h.name.eq_ignore_ascii_case(b"cookie"))
-                .and_then(|h| std::str::from_utf8(&h.value).ok())
-                .and_then(|c| {
-                    c.split(';').find_map(|part| {
-                        let part = part.trim();
-                        part.split_once('=').and_then(|(k, v)| {
-                            if k.trim().eq_ignore_ascii_case(name) {
-                                Some(v.trim().to_string())
-                            } else {
-                                None
-                            }
+    let hash_key_owned: Option<String> =
+        conn.get_stream(stream_id)
+            .and_then(|stream| match &upstream_group.algorithm {
+                crate::config::LoadBalanceAlgorithm::ConsistentHash {
+                    hash_key: crate::config::HashKey::Header(name),
+                } => stream
+                    .request_headers
+                    .iter()
+                    .find(|h| h.name.eq_ignore_ascii_case(name.as_bytes()))
+                    .and_then(|h| std::str::from_utf8(&h.value).ok())
+                    .map(|s| s.to_string()),
+                crate::config::LoadBalanceAlgorithm::ConsistentHash {
+                    hash_key: crate::config::HashKey::Cookie(name),
+                } => stream
+                    .request_headers
+                    .iter()
+                    .find(|h| h.name.eq_ignore_ascii_case(b"cookie"))
+                    .and_then(|h| std::str::from_utf8(&h.value).ok())
+                    .and_then(|c| {
+                        c.split(';').find_map(|part| {
+                            let part = part.trim();
+                            part.split_once('=').and_then(|(k, v)| {
+                                if k.trim().eq_ignore_ascii_case(name) {
+                                    Some(v.trim().to_string())
+                                } else {
+                                    None
+                                }
+                            })
                         })
-                    })
-                }),
-            _ => None,
-        }
-    });
-    let server = match upstream_group.select_with_key(client_ip, hash_key_owned.as_deref(), None)
-    {
+                    }),
+                _ => None,
+            });
+    let server = match upstream_group.select_with_key(client_ip, hash_key_owned.as_deref(), None) {
         Some(s) => s,
         None => {
             let server_guard = get_server_header_guard();
@@ -2030,12 +2032,8 @@ where
             false
         }
     };
-    let final_path_owned = compute_upstream_path(
-        path_str,
-        prefix,
-        &target.path_prefix,
-        preserve_grpc_path,
-    );
+    let final_path_owned =
+        compute_upstream_path(path_str, prefix, &target.path_prefix, preserve_grpc_path);
     let final_path = final_path_owned.as_str();
 
     // リクエストボディを取得。
@@ -2111,6 +2109,7 @@ where
             request_body.to_vec(),
             method,
             final_path.as_bytes(),
+            security,
             #[cfg(feature = "wasm")]
             wasm_modules,
         )
@@ -2147,8 +2146,65 @@ where
     result
 }
 
+/// F-106: h2c バックエンドへ新規接続し HTTP/2 ハンドシェイクまで完了する。
+/// 失敗時は送出すべきステータス（502=接続/ハンドシェイク失敗, 504=接続タイムアウト）を返す。
+#[cfg(feature = "http2")]
+async fn h2c_connect_and_handshake(
+    addr: &str,
+) -> Result<http2::H2cClient<crate::runtime::tcp::TcpStream>, u16> {
+    let connect_result = timeout(CONNECT_TIMEOUT, TcpStream::connect_str(addr)).await;
+    let backend_stream = match connect_result {
+        Ok(Ok(stream)) => {
+            let _ = stream.set_nodelay(true);
+            stream
+        }
+        Ok(Err(e)) => {
+            warn!("[HTTP/2] H2C backend connect error ({}): {}", addr, e);
+            return Err(502);
+        }
+        Err(_) => {
+            warn!("[HTTP/2] H2C backend connect timeout ({})", addr);
+            return Err(504);
+        }
+    };
+    let settings = http2::Http2Settings::default();
+    let mut client = http2::H2cClient::new(backend_stream, settings);
+    if let Err(e) = client.handshake().await {
+        warn!("[HTTP/2] H2C handshake error ({}): {}", addr, e);
+        return Err(502);
+    }
+    Ok(client)
+}
+
+/// F-106: h2c 経路のエラー応答（502/504）をクライアントへ送出し、(status, body_len) を返す。
+#[cfg(feature = "http2")]
+async fn send_h2c_error<S>(
+    conn: &mut http2::Http2Connection<S>,
+    stream_id: u32,
+    status: u16,
+) -> (u16, u64)
+where
+    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
+{
+    let (body, len): (&[u8], u64) = if status == 504 {
+        (b"Gateway Timeout", 15)
+    } else {
+        (b"Bad Gateway", 11)
+    };
+    let server_guard = get_server_header_guard();
+    let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
+    if let Some(ref g) = server_guard {
+        headers.push(g.as_header());
+    }
+    let _ = conn
+        .send_response(stream_id, status, &headers, Some(body))
+        .await;
+    (status, len)
+}
+
 /// HTTP/2 → HTTP/2 プロキシ (H2C)
 #[cfg(feature = "http2")]
+#[allow(clippy::too_many_arguments)]
 async fn handle_http2_proxy_h2c<S>(
     conn: &mut http2::Http2Connection<S>,
     stream_id: u32,
@@ -2157,61 +2213,33 @@ async fn handle_http2_proxy_h2c<S>(
     request_body: Vec<u8>,
     method: &[u8],
     path: &[u8],
+    security: &SecurityConfig,
     #[cfg(feature = "wasm")] wasm_modules: &Arc<Vec<String>>,
 ) -> Option<(u16, u64)>
 where
     S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
 {
-    // バックエンドに接続
-    let connect_result = timeout(CONNECT_TIMEOUT, TcpStream::connect_str(addr)).await;
-
-    let backend_stream = match connect_result {
-        Ok(Ok(stream)) => {
-            let _ = stream.set_nodelay(true);
-            stream
+    // F-106: h2c バックエンド接続をプールから再利用する（リクエストごとの TCP 接続 +
+    // h2c ハンドシェイク〈プリフェース + SETTINGS 往復〉を排除）。プールが空なら新規接続する。
+    // io_uring TcpStream はワーカースレッド ring に紐づくため、H2C_POOL はスレッドローカルで
+    // 同一スレッド内再利用のみ行う（thread-per-core）。プールヒット接続が stale（バックエンドが
+    // アイドル切断）だった場合の初回失敗は、後段で 1 回だけ新規接続としてリトライする。
+    let from_pool;
+    let mut h2c_client = match H2C_POOL.with(|p| p.borrow_mut().get(addr)) {
+        Some(client) => {
+            from_pool = true;
+            client
         }
-        Ok(Err(e)) => {
-            warn!("[HTTP/2] H2C backend connect error ({}): {}", addr, e);
-            let server_guard = get_server_header_guard();
-            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-            if let Some(ref g) = server_guard {
-                headers.push(g.as_header());
+        None => {
+            from_pool = false;
+            match h2c_connect_and_handshake(addr).await {
+                Ok(client) => client,
+                Err(status) => {
+                    return Some(send_h2c_error(conn, stream_id, status).await);
+                }
             }
-            let _ = conn
-                .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
-                .await;
-            return Some((502, 11));
-        }
-        Err(_) => {
-            let server_guard = get_server_header_guard();
-            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-            if let Some(ref g) = server_guard {
-                headers.push(g.as_header());
-            }
-            let _ = conn
-                .send_response(stream_id, 504, &headers, Some(b"Gateway Timeout"))
-                .await;
-            return Some((504, 15));
         }
     };
-
-    // H2Cクライアント作成
-    let settings = http2::Http2Settings::default();
-    let mut h2c_client = http2::H2cClient::new(backend_stream, settings);
-
-    // H2Cハンドシェイク
-    if let Err(e) = h2c_client.handshake().await {
-        warn!("[HTTP/2] H2C handshake error ({}): {}", addr, e);
-        let server_guard = get_server_header_guard();
-        let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-        if let Some(ref g) = server_guard {
-            headers.push(g.as_header());
-        }
-        let _ = conn
-            .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
-            .await;
-        return Some((502, 11));
-    }
 
     // ヘッダーを抽出
     // gRPC は TE: trailers が必須のため除外しない（RFC 9113 でも TE はエンドツーエンド可）。
@@ -2251,11 +2279,39 @@ where
     };
     let authority = target.host.as_bytes();
 
-    match h2c_client
+    // F-106: リクエスト送信。プール由来接続が stale で初回失敗した場合は、新規接続で
+    // 1 回だけリトライする（アイドル中にバックエンドが切断していても要求を落とさない）。
+    let mut send_result = h2c_client
         .send_request(method, path, authority, &headers_vec, body)
-        .await
-    {
+        .await;
+    if send_result.is_err() && from_pool {
+        match h2c_connect_and_handshake(addr).await {
+            Ok(fresh) => {
+                h2c_client = fresh;
+                send_result = h2c_client
+                    .send_request(method, path, authority, &headers_vec, body)
+                    .await;
+            }
+            Err(_) => {
+                // 新規接続も張れない: 下の Err ハンドラで 502 を返す。
+            }
+        }
+    }
+
+    match send_result {
         Ok(h2c_resp) => {
+            // F-106: 応答は所有バッファ。ストリーム ID 枯渇前の健全な接続はプールへ返し、
+            // 次リクエストで TCP 接続 + ハンドシェイクを省く（送信ウィンドウは client.rs の
+            // WINDOW_UPDATE 反映で再利用時も回復する）。
+            if h2c_client.is_reusable() {
+                let max_idle = security.max_idle_connections_per_host;
+                let idle_timeout = security.idle_connection_timeout_secs;
+                H2C_POOL.with(|p| {
+                    p.borrow_mut()
+                        .put(addr.to_string(), h2c_client, max_idle, idle_timeout)
+                });
+            }
+
             // レスポンスヘッダを所有バッファへ（WASM 適用・Server/Alt-Svc 追記用）
             let mut header_store: Vec<(Vec<u8>, Vec<u8>)> = h2c_resp
                 .headers
@@ -2266,12 +2322,9 @@ where
             // F-94: gRPC/H2C 経路でも WASM レスポンスヘッダフィルタを適用
             #[cfg(feature = "wasm")]
             {
-                header_store = apply_h2_wasm_response_headers(
-                    wasm_modules,
-                    h2c_resp.status,
-                    header_store,
-                )
-                .await;
+                header_store =
+                    apply_h2_wasm_response_headers(wasm_modules, h2c_resp.status, header_store)
+                        .await;
             }
 
             let server_guard = get_server_header_guard();
@@ -3396,17 +3449,11 @@ where
     let mime_type = mime_guess::from_path(&file_path).first_or_octet_stream();
     let mime_str = mime_type.as_ref();
 
-    let (built_headers, response_body) = build_h2_compressed_file_response(
-        &data,
-        mime_str,
-        security,
-        compression,
-        client_encoding,
-    );
+    let (built_headers, response_body) =
+        build_h2_compressed_file_response(&data, mime_str, security, compression, client_encoding);
 
     #[cfg(feature = "wasm")]
-    let header_store =
-        apply_h2_wasm_response_headers(wasm_modules, 200, built_headers).await;
+    let header_store = apply_h2_wasm_response_headers(wasm_modules, 200, built_headers).await;
     #[cfg(not(feature = "wasm"))]
     let header_store = built_headers;
 
@@ -6142,15 +6189,9 @@ async fn handle_proxy(
     // リクエストパス構築
     // gRPC はフルパス保持（/* プレフィックス除去で UNIMPLEMENTED → B-40）
     let path_str = std::str::from_utf8(req_path).unwrap_or("/");
-    let preserve_grpc_path = headers
-        .iter()
-        .any(|(n, v)| header_pair_is_grpc(n, v));
-    let final_path_owned = compute_upstream_path(
-        path_str,
-        prefix,
-        &target.path_prefix,
-        preserve_grpc_path,
-    );
+    let preserve_grpc_path = headers.iter().any(|(n, v)| header_pair_is_grpc(n, v));
+    let final_path_owned =
+        compute_upstream_path(path_str, prefix, &target.path_prefix, preserve_grpc_path);
     let final_path = final_path_owned.as_str();
 
     // HTTPリクエスト構築（プール使用）
@@ -10614,7 +10655,10 @@ mod path_tests {
     #[test]
     fn test_header_pair_is_grpc() {
         assert!(header_pair_is_grpc(b"content-type", b"application/grpc"));
-        assert!(header_pair_is_grpc(b"Content-Type", b"application/grpc+proto"));
+        assert!(header_pair_is_grpc(
+            b"Content-Type",
+            b"application/grpc+proto"
+        ));
         assert!(!header_pair_is_grpc(b"content-type", b"text/plain"));
         assert!(!header_pair_is_grpc(b"accept", b"application/grpc"));
     }

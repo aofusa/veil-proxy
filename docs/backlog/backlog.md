@@ -47,6 +47,7 @@
 | F-90 | P1 | 完了 | [features/e2e-coverage-expansion.md](features/e2e-coverage-expansion.md) | e2e_test_coverage.md ギャップ解消（430/430 通過、B-35〜B-37 修正、新規 E2E 11 件、`#[ignore]` 0 件） |
 | F-03 | P1 | 完了 | [features/tls-cert-zero-downtime.md](features/tls-cert-zero-downtime.md) | 0 ダウンタイム TLS 証明書更新 |
 | F-105 | P1 | 完了 | [features/F-105-http3-cert-hot-reload.md](features/F-105-http3-cert-hot-reload.md) | HTTP/3 (quiche) 証明書の無停止ホットリロード（SIGHUP で `quiche::Config` 差し替え・memfd/Landlock 互換・全ワーカー適用後に秘密鍵を secure_zero）。起点: `docs/artifacts/http3_cert_reload_implementation_plan.md` |
+| F-106 | P1 | 完了 | [features/F-106-h2c-backend-connection-pooling.md](features/F-106-h2c-backend-connection-pooling.md) | H2C バックエンド接続プーリング（B-28 残件の解消）。gRPC 中継でリクエストごとの TCP + h2c ハンドシェイクを排除し `H2C_POOL` で接続再利用。再利用で顕在化する送信ウィンドウ枯渇（WINDOW_UPDATE 未反映）も併せて修正 |
 | F-04 | P1 | 未着手 | [features/vds-xds-dynamic-config.md](features/vds-xds-dynamic-config.md) | 動的設定配信 API（VDS / xDS 相当） |
 | F-06 | P1 | 完了 | [features/resilience-outlier-detection.md](features/resilience-outlier-detection.md) | サーキットブレーカー・リトライ・異常検知 |
 | F-09 | P1 | 完了 | [features/prometheus-feature-flags.md](features/prometheus-feature-flags.md) | Prometheus 拡充と feature 無効化 |

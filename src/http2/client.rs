@@ -75,6 +75,36 @@ where
         }
     }
 
+    /// このコネクションをプールで再利用可能か（F-106）。
+    ///
+    /// クライアントストリーム ID は奇数で単調増加し、HTTP/2 の 31bit 上限
+    /// （2^31-1）に達したコネクションは新規ストリームを開けない。上限手前で
+    /// 再利用を打ち切り、次リクエストは新規接続へフォールバックさせる。
+    /// コネクション自体の健全性（GOAWAY/切断）は送受信結果で判定するため、
+    /// ここではストリーム ID の枯渇のみを見る。
+    #[inline]
+    pub fn is_reusable(&self) -> bool {
+        // 0x7000_0000 で十分な余裕を残して切替（実運用で到達しない領域）。
+        self.next_stream_id < 0x7000_0000
+    }
+
+    /// WINDOW_UPDATE を接続レベル送信ウィンドウへ反映する（F-106）。
+    ///
+    /// コネクションを **プールで再利用**すると、送信のたびに減算した
+    /// `conn_send_window` を回復しないと数千リクエストで枯渇し
+    /// 「Send window exhausted」で失敗する。従来は 1 リクエスト 1 接続で
+    /// 毎回リセットされ顕在化しなかったが、再利用では WINDOW_UPDATE を
+    /// 正しく積み増す必要がある。ストリームレベル（stream_id != 0）の更新は
+    /// 送信ゲートが接続レベルのみのため無視する。i32 上限でクランプする。
+    #[inline]
+    fn apply_window_update(&mut self, stream_id: u32, increment: u32) {
+        if stream_id == 0 {
+            self.conn_send_window = self
+                .conn_send_window
+                .saturating_add(increment.min(i32::MAX as u32) as i32);
+        }
+    }
+
     /// 上流へ転送しないリクエストヘッダか。
     ///
     /// 疑似ヘッダ・ホップバイホップ・Host・Expect（B-11 終端）・Content-Length
@@ -376,8 +406,12 @@ where
                         return Ok(response);
                     }
                 }
-                Frame::WindowUpdate { .. } => {
-                    // ウィンドウ更新を処理
+                Frame::WindowUpdate {
+                    stream_id: sid,
+                    increment,
+                } => {
+                    // F-106: 接続再利用時の送信ウィンドウ回復
+                    self.apply_window_update(sid, increment);
                 }
                 Frame::Ping { ack: false, data } => {
                     // PING ACK を送信
@@ -710,7 +744,13 @@ where
                         return Ok(response);
                     }
                 }
-                Frame::WindowUpdate { .. } => {}
+                Frame::WindowUpdate {
+                    stream_id: sid,
+                    increment,
+                } => {
+                    // F-106: 接続再利用時の送信ウィンドウ回復
+                    self.apply_window_update(sid, increment);
+                }
                 Frame::Ping { ack: false, data } => {
                     let ping_ack = self.frame_encoder.encode_ping(&data, true);
                     self.write_all(ping_ack).await?;
@@ -979,5 +1019,75 @@ mod tests {
         let mut client = H2cClient::new(ScriptedStream::new(rst), Http2Settings::default());
         let result = drive(client.send_request(b"GET", b"/", b"b", &[], None));
         assert!(result.is_err(), "RST_STREAM must yield Err");
+    }
+
+    // ====================
+    // F-106: h2c コネクション再利用（プーリング）の検証
+    // ====================
+
+    /// 指定ストリーム ID の応答（HEADERS :status 200 + DATA END_STREAM）を構築する。
+    fn build_response_sid(sid: u32, body: &[u8]) -> Vec<u8> {
+        let mut hpack = HpackEncoder::new(4096);
+        let enc = FrameEncoder::new(16384);
+        let header_block = hpack
+            .encode(&[(b":status", b"200", false)])
+            .expect("encode response headers");
+        let mut out = enc.encode_headers(sid, &header_block, false, true, None);
+        out.extend_from_slice(&enc.encode_data(sid, body, true));
+        out
+    }
+
+    /// プール再利用: 同一 `H2cClient` で 2 リクエストを直列に送ると、ストリーム ID が
+    /// 1 → 3 と単調増加し、両方とも正しくパースできる（接続 + ハンドシェイクの省略が
+    /// 成立する前提の状態保持を検証）。
+    #[test]
+    fn reused_client_uses_monotonic_stream_ids() {
+        let mut script = build_response_sid(1, b"one");
+        script.extend_from_slice(&build_response_sid(3, b"two"));
+        let mut client = H2cClient::new(ScriptedStream::new(script), Http2Settings::default());
+
+        let r1 = drive(client.send_request(b"POST", b"/a", b"b", &[], Some(b"x")))
+            .expect("first request");
+        assert_eq!(r1.status, 200);
+        assert_eq!(r1.body, b"one");
+
+        let r2 = drive(client.send_request(b"POST", b"/b", b"b", &[], Some(b"y")))
+            .expect("second request (reused connection)");
+        assert_eq!(r2.status, 200);
+        assert_eq!(r2.body, b"two");
+
+        // 送出フレームのストリーム ID は 1（HEADERS/DATA）→ 3（HEADERS/DATA）。
+        let frames = parse_frames(&client.stream.written());
+        let sids: Vec<u32> = frames.iter().map(|(_, _, sid, _)| *sid).collect();
+        assert_eq!(
+            sids,
+            vec![1, 1, 3, 3],
+            "stream ids must be 1,1,3,3 got {sids:?}"
+        );
+    }
+
+    /// WINDOW_UPDATE(stream 0) が接続レベル送信ウィンドウを回復する（F-106）。
+    /// 再利用時に送信ごとの減算を回復しないと数千リクエストで枯渇するため、
+    /// stream 0 の WINDOW_UPDATE を積み増すことを白箱で確認する。
+    #[test]
+    fn connection_window_update_replenishes_send_window() {
+        let mut client = H2cClient::new(ScriptedStream::new(Vec::new()), Http2Settings::default());
+        let base = client.conn_send_window;
+
+        // 送信でウィンドウを 100 消費した状態を模す。
+        client.conn_send_window -= 100;
+        // 接続レベル(stream 0) WINDOW_UPDATE +100 で回復。
+        client.apply_window_update(0, 100);
+        assert_eq!(
+            client.conn_send_window, base,
+            "stream0 WU must restore window"
+        );
+
+        // ストリームレベル(stream != 0) は接続送信ウィンドウに影響しない。
+        client.apply_window_update(1, 100);
+        assert_eq!(
+            client.conn_send_window, base,
+            "stream-level WU must not touch connection send window"
+        );
     }
 }
