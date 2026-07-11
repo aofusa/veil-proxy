@@ -55,11 +55,11 @@
 
 ## 受け入れ条件
 
-- [ ] レポート §3 の 13 項目が実装または明確に文書化
-- [ ] E2E / container_security / 単体が実行され、失敗は artifacts に切り分け
-- [ ] full / default / no-default / 各 feature でビルド警告・エラーなし
-- [ ] `allow(dead_code)` を理由なしに追加しない
-- [ ] CI 組み込みは行わない（F-100）
+- [x] レポート §3 の 13 項目が実装または明確に文書化
+- [x] E2E / container_security / 単体が実行され、失敗は artifacts に切り分け
+- [x] full / default / no-default / 各 feature でビルド警告・エラーなし（`http3` cfg で dead_code 回避）
+- [x] `allow(dead_code)` を理由なしに追加しない
+- [x] CI 組み込みは行わない（F-100）
 
 ## 依存・リスク
 
@@ -70,4 +70,7 @@
 
 ## 対応状況
 
-進行中（fix/test）。
+完了（fix/test）。  
+詳細: `docs/artifacts/f99_failed_tests_report.md`  
+検証: 単体 724 / 統合 53 / F-99 E2E 7 PASS / container_security F-99 プローブ 6 PASS。  
+E2E 既知フレーキー 2 件（B-17 504、H3 large body）は据え置き。

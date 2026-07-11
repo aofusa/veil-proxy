@@ -206,9 +206,10 @@ impl Drop for ConnectionGuard {
 // ====================
 //
 // ホットパス規則: ラベル無し IntGauge の inc/dec のみ（アロケーション無し）。
-// feature 無効時・ランタイム無効時は完全ノーオップ。
+// `http3` feature 無効時はシンボル自体を出さない（default / no-default の dead_code 回避）。
+// metrics 無効時・ランタイム無効時は完全ノーオップ。
 
-#[cfg(feature = "metrics")]
+#[cfg(all(feature = "metrics", feature = "http3"))]
 /// HTTP/3 (QUIC) アクティブ接続数
 pub(crate) static HTTP3_ACTIVE_CONNECTIONS: Lazy<prometheus::IntGauge> = Lazy::new(|| {
     let opts = Opts::new(
@@ -221,7 +222,7 @@ pub(crate) static HTTP3_ACTIVE_CONNECTIONS: Lazy<prometheus::IntGauge> = Lazy::n
     gauge
 });
 
-#[cfg(feature = "metrics")]
+#[cfg(all(feature = "metrics", feature = "http3"))]
 /// HTTP/3 アクティブリクエストストリーム数
 pub(crate) static HTTP3_ACTIVE_STREAMS: Lazy<prometheus::IntGauge> = Lazy::new(|| {
     let opts = Opts::new(
@@ -235,11 +236,13 @@ pub(crate) static HTTP3_ACTIVE_STREAMS: Lazy<prometheus::IntGauge> = Lazy::new(|
 });
 
 /// HTTP/3 接続メトリクスの RAII ガード（Drop で自動 dec）
+#[cfg(feature = "http3")]
 pub(crate) struct Http3ActiveConnGuard {
     #[cfg(feature = "metrics")]
     active: bool,
 }
 
+#[cfg(feature = "http3")]
 impl Http3ActiveConnGuard {
     #[inline]
     pub(crate) fn new() -> Self {
@@ -256,6 +259,7 @@ impl Http3ActiveConnGuard {
     }
 }
 
+#[cfg(feature = "http3")]
 impl Drop for Http3ActiveConnGuard {
     #[inline]
     fn drop(&mut self) {
@@ -267,6 +271,7 @@ impl Drop for Http3ActiveConnGuard {
 }
 
 /// HTTP/3 リクエストストリームを 1 本 open として計上
+#[cfg(feature = "http3")]
 #[inline]
 pub(crate) fn http3_stream_opened() {
     #[cfg(feature = "metrics")]
@@ -276,6 +281,7 @@ pub(crate) fn http3_stream_opened() {
 }
 
 /// HTTP/3 リクエストストリームを 1 本 close として計上
+#[cfg(feature = "http3")]
 #[inline]
 pub(crate) fn http3_stream_closed() {
     #[cfg(feature = "metrics")]
@@ -285,6 +291,7 @@ pub(crate) fn http3_stream_closed() {
 }
 
 /// 残存ストリーム数ぶん一括 dec（接続破棄時）
+#[cfg(feature = "http3")]
 #[inline]
 pub(crate) fn http3_streams_closed_n(n: usize) {
     #[cfg(feature = "metrics")]
@@ -1059,17 +1066,20 @@ mod tests {
         record_grpc_request("/svc/Method", "0", "up");
         observe_grpc_stream_duration("/svc/Method", 0.1);
         observe_wasm_filter_duration("auth", "request", 0.001);
-        // F-99: HTTP/3 ゲージも無効時ノーオップ
-        let _g = Http3ActiveConnGuard::new();
-        http3_stream_opened();
-        http3_stream_closed();
-        http3_streams_closed_n(3);
+        // F-99: HTTP/3 ゲージも無効時ノーオップ（http3 feature 時のみシンボルあり）
+        #[cfg(feature = "http3")]
+        {
+            let _g = Http3ActiveConnGuard::new();
+            http3_stream_opened();
+            http3_stream_closed();
+            http3_streams_closed_n(3);
+        }
         set_metrics_runtime_enabled(true);
     }
 
     /// F-99: HTTP/3 接続ガードが Drop で dec し、ストリーム open/close が対称であること
     #[test]
-    #[cfg(feature = "metrics")]
+    #[cfg(all(feature = "metrics", feature = "http3"))]
     fn http3_conn_and_stream_gauges_are_symmetric() {
         set_metrics_runtime_enabled(true);
         let before_conn = HTTP3_ACTIVE_CONNECTIONS.get();
