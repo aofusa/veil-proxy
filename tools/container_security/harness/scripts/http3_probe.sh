@@ -163,6 +163,10 @@ check_tls_health "post_h3_stream_body_slowloris" || true
 run_h3_mode qpack_memory_exhaustion "h3_qpack_memory_exhaustion" || true
 check_tls_health "post_h3_qpack_memory_exhaustion" || true
 
+# S-H3-16 (F-97): :authority と Host 不一致 → 400
+run_h3_mode authority_host_mismatch "h3_authority_host_mismatch" || true
+check_tls_health "post_h3_authority_host_mismatch" || true
+
 # 最終ヘルス
 check_tls_health "post_http3_tls_health" || true
 

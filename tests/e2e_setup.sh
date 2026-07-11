@@ -616,7 +616,8 @@ servers = [
 [upstreams."grpc-health-pool".health_check]
 enabled = true
 check_type = "grpc"
-path = "grpc.health.v1.Health"
+# path は gRPC では HealthCheckRequest.service 名。空 = サーバ全体の SERVING を問い合わせ
+path = ""
 interval_secs = 2
 timeout_secs = 2
 healthy_threshold = 1

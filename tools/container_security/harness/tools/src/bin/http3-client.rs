@@ -95,6 +95,9 @@ fn main() {
             .map(|s| format!("stream_body_slowloris done detail={}", s)),
         "qpack_memory_exhaustion" => qpack_memory_exhaustion(&host, port, &path)
             .map(|s| format!("qpack_memory_exhaustion done detail={}", s)),
+        // F-97: :authority と Host 不一致 → 400 期待
+        "authority_host_mismatch" => authority_host_mismatch(&host, port, &path)
+            .map(|s| format!("authority_host_mismatch {}", s)),
         other => Err(format!("unknown HTTP3_MODE={}", other).into()),
     };
 
@@ -112,6 +115,7 @@ fn main() {
                 || mode.is_empty()
                 || mode == "amplification_check"
                 || mode == "amplification_spoof"
+                || mode == "authority_host_mismatch"
                 || msg.contains("AMPLIFICATION_EXCEEDED")
                 || msg.starts_with("unknown HTTP3_MODE")
             {
@@ -1119,6 +1123,44 @@ fn qpack_async_ref(
         last_status,
         session.conn.is_closed()
     ))
+}
+
+/// F-97: :authority=正常 SNI host、Host=evil.example の不一致を送り 400 を期待
+fn authority_host_mismatch(
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut session = establish_h3(host, port, 15_000)?;
+    let headers = vec![
+        quiche::h3::Header::new(b":method", b"GET"),
+        quiche::h3::Header::new(b":path", path.as_bytes()),
+        quiche::h3::Header::new(b":authority", host.as_bytes()),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b"host", b"evil.example"),
+    ];
+    let stream_id = session
+        .h3
+        .send_request(&mut session.conn, &headers, true)?;
+    pump_io(&mut session);
+    let start = Instant::now();
+    let mut status: Option<u16> = None;
+    while start.elapsed() < Duration::from_secs(8) {
+        pump_io(&mut session);
+        let (st, fin) = drain_events(&mut session);
+        if st.is_some() {
+            status = st;
+        }
+        if fin || session.conn.is_closed() {
+            break;
+        }
+        let _ = stream_id;
+    }
+    match status {
+        Some(400) => Ok(format!("status=400 (expected)")),
+        Some(s) => Err(format!("expected 400 for authority/Host mismatch, got {}", s).into()),
+        None => Err("no status for authority/Host mismatch".into()),
+    }
 }
 
 /// F-97 S-H3-14: 接続確立後にストリームボディを 1 バイトずつ極遅送信（Stream Body Slowloris）
