@@ -36,6 +36,31 @@ health() { # 適用中/後のヘルス確認（応答があれば OK）
         "${HARNESS_IMAGE}" health >/dev/null 2>&1 && echo up || echo down
 }
 
+# F-112: HTTP/3 到達性（UDP）。curl --http3 が無いイメージでは skip。
+# 戻り値: ok / fail / skip
+h3_probe() {
+    docker run --rm --network "${NET_NAME}" \
+        -e "VEIL_HOST=${veil_ip}" \
+        -e "VEIL_HTTP3_PORT=${VEIL_HTTP3_PORT:-443}" \
+        "${HARNESS_IMAGE}" \
+        bash -c '
+            set +e
+            if command -v http3-client >/dev/null 2>&1; then
+                HTTP3_MODE=get HTTP3_PATH=/ HTTP3_REPORT=/tmp/h3_pumba.txt \
+                    timeout 8 http3-client >/dev/null 2>&1
+                rc=$?
+                if [[ $rc -eq 0 ]]; then echo ok; exit 0; fi
+            fi
+            if curl --version 2>/dev/null | grep -qi http3; then
+                code=$(curl -sk --http3-only -o /dev/null -w "%{http_code}" --max-time 6 \
+                    "https://${VEIL_HOST}:${VEIL_HTTP3_PORT}/" 2>/dev/null || echo 000)
+                if [[ "${code}" =~ ^(200|301|302)$ ]]; then echo ok; exit 0; fi
+                echo fail; exit 0
+            fi
+            echo skip
+        ' 2>/dev/null || echo fail
+}
+
 # netem シナリオ: ロス10% → 遅延100ms±20ms → 重複5% → 破損2% → 順序逆転（F-69）。
 for scenario in \
     "netem --duration ${DURATION} loss --percent 10" \
@@ -52,12 +77,21 @@ for scenario in \
     pumba_pid=$!
     sleep 3
     echo "  health during chaos: $(health)" | tee -a "${REPORT}"
+    # F-112: パケットロス/遅延下で HTTP/3 を流し、生存を確認
+    h3_during=$(h3_probe)
+    echo "  http3 during chaos: ${h3_during}" | tee -a "${REPORT}"
     wait "${pumba_pid}" 2>/dev/null || true
     # 回復確認
     ok=down
     for _ in 1 2 3 4 5; do [[ "$(health)" == up ]] && { ok=up; break; }; sleep 2; done
     echo "  health after recovery: ${ok}" | tee -a "${REPORT}"
+    h3_after=$(h3_probe)
+    echo "  http3 after recovery: ${h3_after}" | tee -a "${REPORT}"
     [[ "${ok}" == up ]] || echo "  WARNING: ${scenario} 後にヘルス復帰せず（backlog 起票対象）" | tee -a "${REPORT}"
+    # HTTP/3 は UDP のため netem 下で fail し得る。復帰後 ok または skip なら合格。
+    if [[ "${h3_after}" == "fail" ]]; then
+        echo "  WARNING: ${scenario} 後に HTTP/3 復帰せず（UDP 劣化・要観察）" | tee -a "${REPORT}"
+    fi
 done
 
 # 複合障害（F-69）: loss + delay を **同時** に適用する。pumba の netem サブコマンドは
