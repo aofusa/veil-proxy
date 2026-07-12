@@ -22993,7 +22993,11 @@ async fn test_grpc_over_http3_status_code() {
         ok.status
     );
     if let Some(gs) = ok.grpc_status() {
-        assert!(gs <= 16, "gRPC status code should be valid 0-16, got {}", gs);
+        assert!(
+            gs <= 16,
+            "gRPC status code should be valid 0-16, got {}",
+            gs
+        );
     }
 
     // エラー StreamReset → non-zero grpc-status
@@ -23043,7 +23047,9 @@ async fn test_grpc_over_http3_streaming_detailed() {
         .await
         .expect("H3 client for streaming detailed");
 
-    use common::http3_client::{send_http3_and_reset, send_http3_request_chunked, send_http3_request_full};
+    use common::http3_client::{
+        send_http3_and_reset, send_http3_request_chunked, send_http3_request_full,
+    };
 
     let grpc_headers = [
         ("content-type", "application/grpc"),
@@ -23079,7 +23085,10 @@ async fn test_grpc_over_http3_streaming_detailed() {
     // Client Streaming: 複数 LPM チャンク
     let mut client_chunks: Vec<Vec<u8>> = Vec::new();
     for i in 0..4 {
-        client_chunks.push(encode_grpc_lpm(&encode_simple_request(&format!("cs-h3-{}", i))));
+        client_chunks.push(encode_grpc_lpm(&encode_simple_request(&format!(
+            "cs-h3-{}",
+            i
+        ))));
     }
     let cs_refs: Vec<&[u8]> = client_chunks.iter().map(|v| v.as_slice()).collect();
     let cs = send_http3_request_chunked(
@@ -23101,7 +23110,10 @@ async fn test_grpc_over_http3_streaming_detailed() {
     // Bidirectional
     let mut bidi_chunks: Vec<Vec<u8>> = Vec::new();
     for i in 0..3 {
-        bidi_chunks.push(encode_grpc_lpm(&encode_simple_request(&format!("bidi-h3-{}", i))));
+        bidi_chunks.push(encode_grpc_lpm(&encode_simple_request(&format!(
+            "bidi-h3-{}",
+            i
+        ))));
     }
     let bidi_refs: Vec<&[u8]> = bidi_chunks.iter().map(|v| v.as_slice()).collect();
     let bidi = send_http3_request_chunked(
@@ -23347,10 +23359,7 @@ async fn test_grpc_web_over_http3_cors() {
         &[
             ("origin", "https://example.com"),
             ("access-control-request-method", "POST"),
-            (
-                "access-control-request-headers",
-                "content-type,x-grpc-web",
-            ),
+            ("access-control-request-headers", "content-type,x-grpc-web"),
         ],
         None,
     )
