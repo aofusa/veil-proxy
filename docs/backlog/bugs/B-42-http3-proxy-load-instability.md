@@ -2,7 +2,7 @@
 
 ## 事象
 
-F-112 の網羅計測で新設した `h3_proxy` 構成（HTTP/3 で受け、HTTP/1.1 バックエンド
+F-114 の網羅計測で新設した `h3_proxy` 構成（HTTP/3 で受け、HTTP/1.1 バックエンド
 `perf-backend` へ中継）を h2load QUIC（`--alpn-list=h3 -n 30000 -c100 -m10`）で計測すると、
 `veil:glibc` で **反復間のばらつきが大きく（396/585/651 req/s）非 2xx が混入**
 （iteration 1..3 で 17 / 2 / 425 件）、平均レイテンシ 1.48s と劣化した。
@@ -38,7 +38,7 @@ F-112 の網羅計測で新設した `h3_proxy` 構成（HTTP/3 で受け、HTTP
 
 ## 関連
 
-- 起点計測: `docs/perf/perf_f112_coverage_regression.md`（F-112/F-113）。
+- 起点計測: `docs/perf/perf_f114_coverage_regression.md`（F-114/F-115）。
 - 近縁: [B-39](B-39-http3-grpc-proxy-502.md)（HTTP/3 gRPC 502）、
   [F-32](../features/F-32-http2-http3-streaming-body.md)（HTTP/3 アクターモデル・バックプレッシャ）。
 </content>

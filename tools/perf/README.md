@@ -13,7 +13,7 @@
 | パス | 役割 |
 |------|------|
 | `run_perf.sh` | 計測オーケストレータ（nginx → veil glibc/musl × 全バリアント × 反復）。完了後に集計も実行 |
-| `gen_configs.sh` | 計測用 `config.toml` バリアントを生成（**完全直交 2⁴=16** + full features 機能ショーケース `feat_*` + **全プロトコル×全機能マトリクス**（F-112: `h2_1_proxy_*` / `h3_file_*` / `h3_proxy*` / `grpc_h2_*` / `grpc_h3*`）） |
+| `gen_configs.sh` | 計測用 `config.toml` バリアントを生成（**完全直交 2⁴=16** + full features 機能ショーケース `feat_*` + **全プロトコル×全機能マトリクス**（F-114: `h2_1_proxy_*` / `h3_file_*` / `h3_proxy*` / `grpc_h2_*` / `grpc_h3*`）） |
 | `analyze_results.sh` | 反復生データ（`results_raw.tsv`）を **median±stdev** に集計し Markdown を出力 |
 | `configs/*.toml` | 生成済みバリアント（`gen_configs.sh` で再生成可能） |
 | `nginx/nginx.conf` | 比較対象 nginx の設定（`access_log off` で公平化） |
@@ -141,7 +141,7 @@ http3 / grpc / websocket は専用クライアントで計測します（`run_pe
 を参照（要約: **TLS 終端が支配的コスト**で L4 平文は最大 2.2 倍、L7 機能ロジックのオーバーヘッドは
 ノイズ範囲内・全構成 Non-2xx=0、逆プロキシのみバックエンドホップで −15%）。
 
-### 全プロトコル×全機能 網羅マトリクス（F-112）
+### 全プロトコル×全機能 網羅マトリクス（F-114）
 
 `docs/artifacts/perf_coverage_report.md` の網羅性評価を受け、上記 File+機能 に加えて
 **Proxy / HTTP/3 / gRPC(H2/H3)** へ各機能を重ねた組み合わせを生成します（`gen_configs.sh` の

@@ -3488,13 +3488,13 @@ pub async fn run_http3_server_async(
 
         // パケットを受信した場合のみ処理。
         //
-        // F-113: 1 回の readiness あたり **複数データグラムを非ブロッキングで drain** する。
+        // F-115: 1 回の readiness あたり **複数データグラムを非ブロッキングで drain** する。
         // select_biased! は毎イテレーション負け arm（notify.wait と sleep）を生成し、特に
         // `sleep(timeout_duration)` は io_uring タイマー SQE を arm→cancel する。1 データグラム
         // ごとにこの select + タイマー往復を払うと、Docker veth（カーネル GSO/GRO オフロード
         // 非対応 = 1 データグラム 1 recvmsg）では per-datagram のオーバーヘッドが
         // ワーカーあたりの実効スループット上限を律速する（HTTP/3 は CPU 余地を残して
-        // syscall 往復律速なことを perf で実測: docs/perf/perf_f112_coverage_regression.md）。
+        // syscall 往復律速なことを perf で実測: docs/perf/perf_f114_coverage_regression.md）。
         // 最初の 1 通は select 経由（await でブロック）、以降は `recv_with_gro_sync` で
         // EAGAIN まで（上限 H3_RECV_DRAIN_MAX）非ブロッキングに掻き出し、select/タイマーの
         // 往復を drain バッチ全体で 1 回に償却する。追加確保なし（recv_buf 再利用・既存の
@@ -3809,7 +3809,7 @@ async fn send_pending_packets(
 /// GSO セグメント上限（UDP GSO の一般的な最大セグメント数）
 const MAX_GSO_SEGMENTS: usize = 64;
 
-/// F-113: 1 回の readiness あたり非ブロッキングで掻き出す追加データグラム数の上限。
+/// F-115: 1 回の readiness あたり非ブロッキングで掻き出す追加データグラム数の上限。
 /// select/タイマー往復を drain バッチ全体で 1 回に償却しつつ、送信・タイムアウト・notify を
 /// 過度に遅延させないための上限（Docker veth では 1 データグラム 1 recvmsg のため、この値まで
 /// 連続受信すると 1 回の送信スイープへまとめられる）。

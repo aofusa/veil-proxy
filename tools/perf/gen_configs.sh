@@ -558,7 +558,7 @@ echo "wrote $OUT/h2_1_feat_websocket.toml"
 count=$((count + 1))
 
 # ============================================================
-# F-112: 全プロトコル×全機能 網羅マトリクス（docs/artifacts/perf_coverage_report.md 起点）。
+# F-114: 全プロトコル×全機能 網羅マトリクス（docs/artifacts/perf_coverage_report.md 起点）。
 # 既存の File+機能（第2〜3弾）に加え、以下の欠落組み合わせをヘルパー関数で生成する。
 #   グループA: HTTP/1.1&HTTP/2 + Proxy + 各機能
 #   グループB: HTTP/3 + File / Proxy + 各機能

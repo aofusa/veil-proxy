@@ -1,4 +1,4 @@
-# F-112: perf ハーネスの全プロトコル×全機能 網羅計測
+# F-114: perf ハーネスの全プロトコル×全機能 網羅計測
 
 ## 機能説明
 
@@ -56,6 +56,6 @@
 - 一部機能重ね（otel の実コレクタ非存在など）は既存 feat 構成と同じ前提（干渉のみ計測）。
 - 関連: [F-89](F-89-perf-full-features-coverage.md)（feat 網羅第1〜3弾）、
   [F-111](F-111-perf-regression-check-http3-gso-zerocopy.md)（回帰確認 + H3 GSO ゼロコピー）、
-  [F-113](F-113-http3-recvmmsg-sendmmsg-batching.md)（H3 バッチ syscall 削減）。
+  [F-115](F-115-http3-recvmmsg-sendmmsg-batching.md)（H3 バッチ syscall 削減）。
 </content>
 </invoke>
