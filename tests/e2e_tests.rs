@@ -23212,7 +23212,7 @@ async fn test_grpc_over_http3_wire_protocol() {
             "response body should be valid LPM frames or trailers-only"
         );
         for f in &frames {
-            assert_eq!(f.compressed, false, "identity response frames");
+            assert!(!f.compressed, "identity response frames");
         }
     }
     assert!(
