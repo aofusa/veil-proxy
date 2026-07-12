@@ -2,8 +2,8 @@
 
 ## 出典
 
-`docs/perf/reports/performance_report_veil_vs_nginx.md`（コンテナ環境で wrk (HTTP/1.1) が
-全て Non-2xx、musl 版はファイル配信されず）。
+初回の Veil vs nginx 計測（コンテナ環境で wrk (HTTP/1.1) が
+全て Non-2xx、musl 版はファイル配信されず）。要約は `docs/perf/history.md` §2 を参照。
 
 ## 事象（再現手順）
 

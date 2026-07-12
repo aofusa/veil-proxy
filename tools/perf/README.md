@@ -136,7 +136,7 @@ http3 / grpc / websocket は専用クライアントで計測します（`run_pe
 - **websocket**: `grafana/k6` の WebSocket クライアント（[k6/websocket.js](k6/websocket.js)）が
   `/.ws` でフレームを往復し、上流 `jmalloc/echo-server` がエコー。
 
-計測結果とボトルネック分析は [docs/perf/reports/perf_full_features_report.md](../../docs/perf/reports/perf_full_features_report.md)
+計測結果とボトルネック分析は [docs/perf/protocol_extended_results.md](../../docs/perf/protocol_extended_results.md)
 を参照（要約: **TLS 終端が支配的コスト**で L4 平文は最大 2.2 倍、L7 機能ロジックのオーバーヘッドは
 ノイズ範囲内・全構成 Non-2xx=0、逆プロキシのみバックエンドホップで −15%）。
 

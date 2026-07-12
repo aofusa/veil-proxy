@@ -3425,8 +3425,8 @@ opentelemetry / l4-proxy / http3 / grpc / websocket** (`h2_1_feat_*` / `h2_0_fea
 The HTTP/3 client needs a QUIC-enabled h2load (`docker build -t local/h2load-h3:latest
 tools/perf/h2load-http3`; http3 is skipped if absent); gRPC/WebSocket use `grafana/k6`
 against `moul/grpcbin` / `jmalloc/echo-server` upstreams. Full data and a summary are in
-[**docs/perf**](docs/perf/); the per-feature analysis is in
-[docs/perf/reports/perf_full_features_report.md](docs/perf/reports/perf_full_features_report.md)
+[**docs/perf**](docs/perf/); the per-feature analysis and HTTP/3/gRPC/WebSocket results are in
+[docs/perf/protocol_extended_results.md](docs/perf/protocol_extended_results.md)
 (TLS termination is the dominant cost — plaintext L4 is up to 2.2× faster — while L7 feature
 logic stays within noise, all configs Non-2xx=0).
 

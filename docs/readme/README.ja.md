@@ -3461,8 +3461,8 @@ recv/send/accept/timer Future をランダムに Drop する `runtime_cancellati
   websocket**、`h2_1_feat_*` / `h2_0_feat_l4`）で機能単位のオーバーヘッドを計測する。HTTP/3 は
   QUIC 対応 h2load（`docker build -t local/h2load-h3:latest tools/perf/h2load-http3`。未ビルド時は
   スキップ）、gRPC/WebSocket は `moul/grpcbin` / `jmalloc/echo-server` を上流に `grafana/k6` で計測する。
-  結果は [docs/perf](../perf/)、機能単位の
-  分析は [docs/perf/reports/perf_full_features_report.md](../perf/reports/perf_full_features_report.md) を参照
+  結果は [docs/perf](../perf/)、機能単位・HTTP/3・gRPC・WebSocket の
+  分析は [docs/perf/protocol_extended_results.md](../perf/protocol_extended_results.md) を参照
   （TLS 終端が支配的コストで平文 L4 は最大 2.2 倍、L7 機能ロジックはノイズ範囲内・全構成 Non-2xx=0）。
 
 ### テストの実行
