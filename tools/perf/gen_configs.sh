@@ -557,4 +557,202 @@ EOF
 echo "wrote $OUT/h2_1_feat_websocket.toml"
 count=$((count + 1))
 
+# ============================================================
+# F-112: 全プロトコル×全機能 網羅マトリクス（docs/artifacts/perf_coverage_report.md 起点）。
+# 既存の File+機能（第2〜3弾）に加え、以下の欠落組み合わせをヘルパー関数で生成する。
+#   グループA: HTTP/1.1&HTTP/2 + Proxy + 各機能
+#   グループB: HTTP/3 + File / Proxy + 各機能
+#   グループC: gRPC(over H2/H3) + 各機能
+# 命名規則: h2_1_proxy_<feat> / h3_file_<feat> / h3_proxy[_<feat>] / grpc_h2_<feat> / grpc_h3[_<feat>]
+#   （run_perf.sh がこの命名からクライアント種別・上流を判定する）
+# ※ L4 + metrics/access_log/rate_limit（レポートのグループD）は L4ListenerConfig に
+#   per-listener の該当設定が無く（L7 の [route.*] / グローバル [prometheus] 側の責務）、
+#   設定として表現できないため N/A（L4 ベース 1 種のみを維持）。
+# ============================================================
+
+# server/logging/security/performance/tls 共通ヘッダ（http3 有無を引数化）。$1=http3(0/1)
+gen_srv_head() {
+    local h3="$1" http3_line="" http3_block=""
+    if [ "$h3" = 1 ]; then
+        http3_line=$'http3_enabled = true\n'
+        http3_block=$'\n[http3]\nlisten = "0.0.0.0:443"\n'
+    fi
+    cat <<EOF
+[server]
+listen = "0.0.0.0:443"
+http = "0.0.0.0:80"
+http2_enabled = true
+${http3_line}threads = 0
+
+[logging]
+level = "warn"
+
+[security]
+allow_security_failures = false
+drop_privileges_user = "nonroot"
+drop_privileges_group = "nonroot"
+enable_seccomp = true
+enable_landlock = true
+enable_sandbox = false
+seccomp_mode = "filter"
+landlock_read_paths = ["/var/www", "/var/cache/veil", "/var/tmp/veil", "/etc/veil", "/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf", "/lib", "/lib64", "/usr"]
+landlock_write_paths = ["/var/cache/veil", "/var/tmp/veil"]
+
+[performance]
+huge_pages_enabled = false
+reuseport_balancing = "kernel"
+
+[tls]
+cert_path = "/etc/veil/ssl/cert.pem"
+key_path = "/etc/veil/ssl/key.pem"
+ktls_enabled = false
+ktls_fallback_enabled = true
+EOF
+    printf '%s' "$http3_block"
+}
+
+# 機能ごとのトップレベルセクション（route 外に置く必要があるもの）。$1=feat
+gen_top_section() {
+    case "$1" in
+        wasm)
+            printf '\n[wasm]\nenabled = true\n\n[[wasm.modules]]\nname = "passthrough"\npath = "/etc/veil/wasm/passthrough_filter.wasm"\n\n[wasm.modules.capabilities]\nallow_logging = true\n'
+            ;;
+        metrics)
+            printf '\n[prometheus]\nenabled = true\nallowed_ips = ["127.0.0.1"]\n'
+            ;;
+        access_log)
+            printf '\n[access_log]\nenabled = true\nformat = "json"\nfile_path = "/var/tmp/veil/access.log"\n'
+            ;;
+        admin)
+            printf '\n[admin]\nenabled = true\npath_prefix = "/__admin"\nsecret = "perf-admin-secret"\nallowed_ips = ["127.0.0.1"]\n'
+            ;;
+        otel)
+            printf '\n[prometheus]\nenabled = true\nallowed_ips = ["127.0.0.1"]\n\n[opentelemetry]\nenabled = true\nendpoint = "http://perf-backend:80"\nservice_name = "veil-perf"\nbatch_interval_secs = 5\n'
+            ;;
+    esac
+}
+
+# 1 route ブロックを生成（TOML の table 順序: conditions→action→機能table→security）。
+# $1=action(file|proxy) $2=upstream名 $3=path $4=feat $5=use_h2c(0/1) $6=methods(TOML配列中身)
+gen_route() {
+    local action="$1" upstream="$2" path="$3" feat="$4" h2c="$5" methods="$6"
+    echo ""
+    echo "[[route]]"
+    echo "[route.conditions]"
+    echo "path = \"$path\""
+    echo "[route.action]"
+    if [ "$action" = file ]; then
+        echo 'type = "File"'
+        echo 'path = "/var/www/"'
+    else
+        echo 'type = "Proxy"'
+        echo "upstream = \"$upstream\""
+        [ "$h2c" = 1 ] && echo "use_h2c = true"
+    fi
+    [ "$feat" = wasm ] && echo 'modules = ["passthrough"]'
+    case "$feat" in
+        cache)
+            echo "[route.cache]"
+            echo "enabled = true"
+            echo "default_ttl_secs = 60"
+            echo 'methods = ["GET"]'
+            echo "cacheable_statuses = [200]"
+            ;;
+        compression)
+            echo "[route.compression]"
+            echo "enabled = true"
+            echo 'preferred_encodings = ["zstd", "br", "gzip"]'
+            echo "min_size = 256"
+            ;;
+        buffering)
+            echo "[route.buffering]"
+            echo 'mode = "full"'
+            ;;
+    esac
+    echo "[route.security]"
+    echo "allowed_methods = [$methods]"
+    [ "$feat" = rate_limit ] && echo "rate_limit_requests_per_min = 100000000"
+    return 0
+}
+
+# perf-backend 上流定義（proxy/buffering 用）
+gen_upstream_backend() {
+    printf '\n[upstreams."perf-backend"]\nalgorithm = "round_robin"\nservers = ["http://perf-backend:80/"]\n'
+}
+# perf-grpc 上流定義（gRPC 用）+ RST レート上限緩和（feat_grpc と同方針）
+gen_grpc_prelude() {
+    printf '\n[http2]\nmax_rst_stream_per_second = 100000000\n\n[upstreams."perf-grpc"]\nalgorithm = "round_robin"\nservers = ["http://perf-grpc:9000/"]\n'
+}
+
+emit_cfg() { # $1=path ; body は stdin（パイプ subshell 実行のため親 count は末尾でファイル数から再計算）
+    cat > "$1"
+    echo "wrote $1"
+}
+
+# --- グループA: HTTP/1.1 & HTTP/2 + Proxy + 各機能 ---
+for feat in cache compression wasm metrics access_log rate_limit otel; do
+    {
+        gen_srv_head 0
+        gen_upstream_backend
+        gen_top_section "$feat"
+        gen_route proxy perf-backend "/" "$feat" 0 '"HEAD", "GET"'
+    } | emit_cfg "$OUT/h2_1_proxy_${feat}.toml"
+done
+
+# --- グループB-1: HTTP/3 + File + 各機能 ---
+for feat in cache compression wasm metrics access_log rate_limit admin otel; do
+    {
+        gen_srv_head 1
+        gen_top_section "$feat"
+        gen_route file "" "/" "$feat" 0 '"HEAD", "GET"'
+    } | emit_cfg "$OUT/h3_file_${feat}.toml"
+done
+
+# --- グループB-2: HTTP/3 + Proxy（ベース + 各機能） ---
+{
+    gen_srv_head 1
+    gen_upstream_backend
+    gen_route proxy perf-backend "/" none 0 '"HEAD", "GET"'
+} | emit_cfg "$OUT/h3_proxy.toml"
+for feat in buffering cache compression wasm metrics access_log rate_limit otel; do
+    {
+        gen_srv_head 1
+        gen_upstream_backend
+        gen_top_section "$feat"
+        gen_route proxy perf-backend "/" "$feat" 0 '"HEAD", "GET"'
+    } | emit_cfg "$OUT/h3_proxy_${feat}.toml"
+done
+
+# --- グループC-1: gRPC over HTTP/2 + 各機能 ---
+# gRPC ルート（/hello.HelloService/*, use_h2c）へ機能を重ね、フォールバック File ルートを付す。
+for feat in wasm metrics access_log rate_limit otel; do
+    {
+        gen_srv_head 0
+        gen_grpc_prelude
+        gen_top_section "$feat"
+        gen_route proxy perf-grpc "/hello.HelloService/*" "$feat" 1 '"POST"'
+        gen_route file "" "/" none 0 '"HEAD", "GET"'
+    } | emit_cfg "$OUT/grpc_h2_${feat}.toml"
+done
+
+# --- グループC-2: gRPC over HTTP/3（ベース + 各機能） ---
+# k6 は gRPC over H3 をネイティブ非対応のため run_perf.sh がフェイルセーフで NA を出す。
+# 設定自体は http3_enabled + gRPC ルートで生成しておく（将来クライアント対応時に流用）。
+{
+    gen_srv_head 1
+    gen_grpc_prelude
+    gen_route proxy perf-grpc "/hello.HelloService/*" none 1 '"POST"'
+    gen_route file "" "/" none 0 '"HEAD", "GET"'
+} | emit_cfg "$OUT/grpc_h3.toml"
+for feat in wasm metrics access_log rate_limit otel; do
+    {
+        gen_srv_head 1
+        gen_grpc_prelude
+        gen_top_section "$feat"
+        gen_route proxy perf-grpc "/hello.HelloService/*" "$feat" 1 '"POST"'
+        gen_route file "" "/" none 0 '"HEAD", "GET"'
+    } | emit_cfg "$OUT/grpc_h3_${feat}.toml"
+done
+
+count=$(find "$OUT" -maxdepth 1 -name '*.toml' ! -name '_debug*.toml' | wc -l)
 echo "生成完了: ${count} バリアント -> $OUT"

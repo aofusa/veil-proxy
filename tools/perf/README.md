@@ -13,7 +13,7 @@
 | パス | 役割 |
 |------|------|
 | `run_perf.sh` | 計測オーケストレータ（nginx → veil glibc/musl × 全バリアント × 反復）。完了後に集計も実行 |
-| `gen_configs.sh` | 計測用 `config.toml` バリアントを生成（**完全直交 2⁴=16** + full features 機能ショーケース `feat_*`） |
+| `gen_configs.sh` | 計測用 `config.toml` バリアントを生成（**完全直交 2⁴=16** + full features 機能ショーケース `feat_*` + **全プロトコル×全機能マトリクス**（F-112: `h2_1_proxy_*` / `h3_file_*` / `h3_proxy*` / `grpc_h2_*` / `grpc_h3*`）） |
 | `analyze_results.sh` | 反復生データ（`results_raw.tsv`）を **median±stdev** に集計し Markdown を出力 |
 | `configs/*.toml` | 生成済みバリアント（`gen_configs.sh` で再生成可能） |
 | `nginx/nginx.conf` | 比較対象 nginx の設定（`access_log off` で公平化） |
@@ -83,9 +83,10 @@ bash tools/perf/analyze_results.sh tools/perf/results/results_raw.tsv
 | `H3_ARGS` | `--alpn-list=h3 -n 30000 -c100 -m10` | HTTP/3（h2load QUIC）: ALPN=h3・30000 リクエスト・100 接続・多重化 10 |
 | `K6_VUS` | `50` | gRPC / WebSocket（k6）並列仮想ユーザ数 |
 | `K6_DURATION` | `10s` | gRPC / WebSocket（k6）計測時間 |
+| `CONFIG_GLOB` | `*` | 計測対象 config を絞り込む glob（例: `h3_*` / `grpc_*` / `h2_1_proxy_*`）。既定は全構成 |
 
-> 全 16 構成 × glibc/musl × 反復 のフルスイートは時間がかかります。素早く確認したい場合は
-> `ITERATIONS=1` や、`configs/` を一部だけ残して実行してください。
+> 全構成（65+）× glibc/musl × 反復 のフルスイートは時間がかかります。素早く確認したい場合は
+> `ITERATIONS=1` や `CONFIG_GLOB='h3_*'`（対象構成のみ）で実行してください。
 
 ---
 
@@ -139,6 +140,31 @@ http3 / grpc / websocket は専用クライアントで計測します（`run_pe
 計測結果とボトルネック分析は [docs/perf/protocol_extended_results.md](../../docs/perf/protocol_extended_results.md)
 を参照（要約: **TLS 終端が支配的コスト**で L4 平文は最大 2.2 倍、L7 機能ロジックのオーバーヘッドは
 ノイズ範囲内・全構成 Non-2xx=0、逆プロキシのみバックエンドホップで −15%）。
+
+### 全プロトコル×全機能 網羅マトリクス（F-112）
+
+`docs/artifacts/perf_coverage_report.md` の網羅性評価を受け、上記 File+機能 に加えて
+**Proxy / HTTP/3 / gRPC(H2/H3)** へ各機能を重ねた組み合わせを生成します（`gen_configs.sh` の
+ヘルパー関数でループ生成）。命名からプロトコル・アクション・機能が一意に定まります。
+
+| 命名パターン | プロトコル | アクション | 機能 |
+|--------------|-----------|-----------|------|
+| `h2_1_proxy_<feat>` | HTTP/1.1 & HTTP/2 | Proxy(perf-backend) | cache / compression / wasm / metrics / access_log / rate_limit / otel |
+| `h3_file_<feat>` | HTTP/3(+H1/H2) | File | cache / compression / wasm / metrics / access_log / rate_limit / admin / otel |
+| `h3_proxy[_<feat>]` | HTTP/3(+H1/H2) | Proxy(perf-backend) | （ベース）+ buffering / cache / compression / wasm / metrics / access_log / rate_limit / otel |
+| `grpc_h2_<feat>` | gRPC over H2 | Proxy(perf-grpc, h2c) | wasm / metrics / access_log / rate_limit / otel |
+| `grpc_h3[_<feat>]` | gRPC over H3 | Proxy(perf-grpc, h2c) | （ベース）+ wasm / metrics / access_log / rate_limit / otel |
+
+- `h3_*` 構成は `http2_enabled=true` も併設するため、**同一構成で HTTP/1.1・HTTP/2・HTTP/3** を計測します。
+- **gRPC over HTTP/3（`grpc_h3*`）** は k6 が gRPC over QUIC/H3 をネイティブ非対応のため、
+  `run_perf.sh` が **フェイルセーフでスキップ**し `NA` を出力します（計測全体は停止しません）。
+- **L4 + metrics/access_log/rate_limit**（レポートのグループD）は `L4ListenerConfig` に
+  per-listener の該当設定が無く（L7 の `[route.*]` / グローバル `[prometheus]` の責務）、
+  設定として表現できないため **N/A**（L4 ベース `h2_0_feat_l4` 1 種のみ維持）。
+
+> 網羅マトリクスを加えた全構成（65+）× glibc/musl × 反復 のフルスイートは非常に時間がかかります。
+> `CONFIG_GLOB` 環境変数で対象を絞り込めます（例: `CONFIG_GLOB='h3_*' bash tools/perf/run_perf.sh`
+> で HTTP/3 構成のみ、`CONFIG_GLOB='grpc_*'` で gRPC 構成のみ）。既定は全構成。
 
 主な着目点（[docs/perf/results_summary.md](../../docs/perf/results_summary.md) 参照、2026-07-07 v0.5.0 計測）:
 

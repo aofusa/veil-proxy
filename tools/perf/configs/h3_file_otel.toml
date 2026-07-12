@@ -1,0 +1,52 @@
+[server]
+listen = "0.0.0.0:443"
+http = "0.0.0.0:80"
+http2_enabled = true
+http3_enabled = true
+threads = 0
+
+[logging]
+level = "warn"
+
+[security]
+allow_security_failures = false
+drop_privileges_user = "nonroot"
+drop_privileges_group = "nonroot"
+enable_seccomp = true
+enable_landlock = true
+enable_sandbox = false
+seccomp_mode = "filter"
+landlock_read_paths = ["/var/www", "/var/cache/veil", "/var/tmp/veil", "/etc/veil", "/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf", "/lib", "/lib64", "/usr"]
+landlock_write_paths = ["/var/cache/veil", "/var/tmp/veil"]
+
+[performance]
+huge_pages_enabled = false
+reuseport_balancing = "kernel"
+
+[tls]
+cert_path = "/etc/veil/ssl/cert.pem"
+key_path = "/etc/veil/ssl/key.pem"
+ktls_enabled = false
+ktls_fallback_enabled = true
+
+[http3]
+listen = "0.0.0.0:443"
+
+[prometheus]
+enabled = true
+allowed_ips = ["127.0.0.1"]
+
+[opentelemetry]
+enabled = true
+endpoint = "http://perf-backend:80"
+service_name = "veil-perf"
+batch_interval_secs = 5
+
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "File"
+path = "/var/www/"
+[route.security]
+allowed_methods = ["HEAD", "GET"]

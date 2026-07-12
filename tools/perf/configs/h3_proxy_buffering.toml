@@ -1,0 +1,48 @@
+[server]
+listen = "0.0.0.0:443"
+http = "0.0.0.0:80"
+http2_enabled = true
+http3_enabled = true
+threads = 0
+
+[logging]
+level = "warn"
+
+[security]
+allow_security_failures = false
+drop_privileges_user = "nonroot"
+drop_privileges_group = "nonroot"
+enable_seccomp = true
+enable_landlock = true
+enable_sandbox = false
+seccomp_mode = "filter"
+landlock_read_paths = ["/var/www", "/var/cache/veil", "/var/tmp/veil", "/etc/veil", "/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf", "/lib", "/lib64", "/usr"]
+landlock_write_paths = ["/var/cache/veil", "/var/tmp/veil"]
+
+[performance]
+huge_pages_enabled = false
+reuseport_balancing = "kernel"
+
+[tls]
+cert_path = "/etc/veil/ssl/cert.pem"
+key_path = "/etc/veil/ssl/key.pem"
+ktls_enabled = false
+ktls_fallback_enabled = true
+
+[http3]
+listen = "0.0.0.0:443"
+
+[upstreams."perf-backend"]
+algorithm = "round_robin"
+servers = ["http://perf-backend:80/"]
+
+[[route]]
+[route.conditions]
+path = "/"
+[route.action]
+type = "Proxy"
+upstream = "perf-backend"
+[route.buffering]
+mode = "full"
+[route.security]
+allowed_methods = ["HEAD", "GET"]
