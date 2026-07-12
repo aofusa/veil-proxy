@@ -3486,112 +3486,137 @@ pub async fn run_http3_server_async(
             RecvOutcome::Notified | RecvOutcome::Timeout => None,
         };
 
-        // パケットを受信した場合のみ処理
-        if let Some(gro) = gro_result {
-            let from = gro.from;
-            let total = gro.bytes_received;
-            // GRO セグメントサイズ。None/0（GRO 非適用 = 単発データグラム）の場合は
-            // 受信全体を 1 セグメントとして扱う。
-            let seg_size = gro
-                .gro_segment_size
-                .map(|s| s as usize)
-                .filter(|&s| s > 0)
-                .unwrap_or(total);
-
-            // GRO で集約された各 QUIC データグラムを quiche に供給する。
-            // recv_buf のスライスを quiche::Header::from_slice と conn.recv に直接渡し、
-            // 中間 Vec への 2 回の to_vec コピーを完全に排除する（ゼロコピー受信）。
-            //
-            // F-45: GRO バッチはカーネルが**同一フロー**のデータグラムを集約したものなので、
-            // - `connections` の RefCell 借用はバッチ全体で 1 回だけ取る（従来はセグメント
-            //   ごとに 2 回 borrow_mut していた）。
-            // - 直前セグメントと同じ DCID なら新規接続判定（contains_key + Initial 検査）を
-            //   スキップし、per-segment のオーバーヘッドをルックアップ 1 回に抑える。
-            // quiche の `recv` API は 1 データグラム単位のため呼び出し自体は per-segment。
+        // パケットを受信した場合のみ処理。
+        //
+        // F-113: 1 回の readiness あたり **複数データグラムを非ブロッキングで drain** する。
+        // select_biased! は毎イテレーション負け arm（notify.wait と sleep）を生成し、特に
+        // `sleep(timeout_duration)` は io_uring タイマー SQE を arm→cancel する。1 データグラム
+        // ごとにこの select + タイマー往復を払うと、Docker veth（カーネル GSO/GRO オフロード
+        // 非対応 = 1 データグラム 1 recvmsg）では per-datagram のオーバーヘッドが
+        // ワーカーあたりの実効スループット上限を律速する（HTTP/3 は CPU 余地を残して
+        // syscall 往復律速なことを perf で実測: docs/perf/perf_f112_coverage_regression.md）。
+        // 最初の 1 通は select 経由（await でブロック）、以降は `recv_with_gro_sync` で
+        // EAGAIN まで（上限 H3_RECV_DRAIN_MAX）非ブロッキングに掻き出し、select/タイマーの
+        // 往復を drain バッチ全体で 1 回に償却する。追加確保なし（recv_buf 再利用・既存の
+        // per-segment ゼロコピー処理をそのまま流用）。
+        if let Some(first_gro) = gro_result {
             let mut conns = connections.borrow_mut();
-            let mut prev_cid: Option<ConnectionId<'static>> = None;
-            let mut offset = 0;
-            while offset < total {
-                let start = offset;
-                let end = (offset + seg_size).min(total);
-                offset = end;
+            let mut cur = Some(first_gro);
+            let mut drained = 0usize;
+            while let Some(gro) = cur.take() {
+                let from = gro.from;
+                let total = gro.bytes_received;
+                // GRO セグメントサイズ。None/0（GRO 非適用 = 単発データグラム）の場合は
+                // 受信全体を 1 セグメントとして扱う。
+                let seg_size = gro
+                    .gro_segment_size
+                    .map(|s| s as usize)
+                    .filter(|&s| s > 0)
+                    .unwrap_or(total);
 
-                // パケットヘッダーを解析（同一バッファスライスを後段の conn.recv にも渡す）
-                let hdr = match quiche::Header::from_slice(
-                    &mut recv_buf[start..end],
-                    quiche::MAX_CONN_ID_LEN,
-                ) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!("[HTTP/3] Invalid packet header: {}", e);
-                        // このセグメントのみスキップ。送信処理はループ後に実行。
-                        continue;
-                    }
-                };
+                // GRO で集約された各 QUIC データグラムを quiche に供給する。
+                // recv_buf のスライスを quiche::Header::from_slice と conn.recv に直接渡し、
+                // 中間 Vec への 2 回の to_vec コピーを完全に排除する（ゼロコピー受信）。
+                //
+                // F-45: GRO バッチはカーネルが**同一フロー**のデータグラムを集約したものなので、
+                // - 直前セグメントと同じ DCID なら新規接続判定（contains_key + Initial 検査）を
+                //   スキップし、per-segment のオーバーヘッドをルックアップ 1 回に抑える。
+                // quiche の `recv` API は 1 データグラム単位のため呼び出し自体は per-segment。
+                // （`connections` の borrow は drain バッチ全体で 1 回だけ取得している。）
+                let mut prev_cid: Option<ConnectionId<'static>> = None;
+                let mut offset = 0;
+                while offset < total {
+                    let start = offset;
+                    let end = (offset + seg_size).min(total);
+                    offset = end;
 
-                // コネクションを検索または作成（直前セグメントと同一 DCID なら判定スキップ）
-                let conn_id = match &prev_cid {
-                    Some(prev) if *prev == hdr.dcid => prev.clone(),
-                    _ => {
-                        if !conns.contains_key(&hdr.dcid) {
-                            if hdr.ty != quiche::Type::Initial {
-                                debug!("[HTTP/3] Non-initial packet for unknown connection");
-                                continue;
-                            }
-
-                            // 新規コネクション
-                            let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
-                            rng.fill(&mut scid)
-                                .map_err(|_| io::Error::other("RNG error"))?;
-                            let scid = ConnectionId::from_ref(&scid).into_owned();
-
-                            let mut config_ref = quic_config.borrow_mut();
-                            let conn =
-                                quiche::accept(&scid, None, local_addr, from, &mut config_ref)
-                                    .map_err(|e| io::Error::other(e.to_string()))?;
-
-                            debug!("[HTTP/3] New connection from {}", from);
-
-                            // 最新のルーティング設定を取得
-                            let handler = Http3Handler::new(
-                                conn,
-                                from,
-                                notify.clone(),
-                                backend_spawner.clone(),
-                            );
-                            conns.insert(scid.clone(), handler);
-
-                            prev_cid = Some(scid.clone());
-                            scid
-                        } else {
-                            let cid = hdr.dcid.into_owned();
-                            prev_cid = Some(cid.clone());
-                            cid
+                    // パケットヘッダーを解析（同一バッファスライスを後段の conn.recv にも渡す）
+                    let hdr = match quiche::Header::from_slice(
+                        &mut recv_buf[start..end],
+                        quiche::MAX_CONN_ID_LEN,
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!("[HTTP/3] Invalid packet header: {}", e);
+                            // このセグメントのみスキップ。送信処理はループ後に実行。
+                            continue;
                         }
-                    }
-                };
-
-                // パケットを処理（同一スライスをそのまま渡す。追加コピーなし）
-                if let Some(handler) = conns.get_mut(&conn_id) {
-                    let recv_info = quiche::RecvInfo {
-                        from,
-                        to: local_addr,
                     };
 
-                    match handler.conn.recv(&mut recv_buf[start..end], recv_info) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            warn!("[HTTP/3] recv error: {}", e);
-                            // エラー時も送信処理は続行
+                    // コネクションを検索または作成（直前セグメントと同一 DCID なら判定スキップ）
+                    let conn_id = match &prev_cid {
+                        Some(prev) if *prev == hdr.dcid => prev.clone(),
+                        _ => {
+                            if !conns.contains_key(&hdr.dcid) {
+                                if hdr.ty != quiche::Type::Initial {
+                                    debug!("[HTTP/3] Non-initial packet for unknown connection");
+                                    continue;
+                                }
+
+                                // 新規コネクション
+                                let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
+                                rng.fill(&mut scid)
+                                    .map_err(|_| io::Error::other("RNG error"))?;
+                                let scid = ConnectionId::from_ref(&scid).into_owned();
+
+                                let mut config_ref = quic_config.borrow_mut();
+                                let conn =
+                                    quiche::accept(&scid, None, local_addr, from, &mut config_ref)
+                                        .map_err(|e| io::Error::other(e.to_string()))?;
+
+                                debug!("[HTTP/3] New connection from {}", from);
+
+                                // 最新のルーティング設定を取得
+                                let handler = Http3Handler::new(
+                                    conn,
+                                    from,
+                                    notify.clone(),
+                                    backend_spawner.clone(),
+                                );
+                                conns.insert(scid.clone(), handler);
+
+                                prev_cid = Some(scid.clone());
+                                scid
+                            } else {
+                                let cid = hdr.dcid.into_owned();
+                                prev_cid = Some(cid.clone());
+                                cid
+                            }
+                        }
+                    };
+
+                    // パケットを処理（同一スライスをそのまま渡す。追加コピーなし）
+                    if let Some(handler) = conns.get_mut(&conn_id) {
+                        let recv_info = quiche::RecvInfo {
+                            from,
+                            to: local_addr,
+                        };
+
+                        match handler.conn.recv(&mut recv_buf[start..end], recv_info) {
+                            Ok(_) => {}
+                            Err(e) => {
+                                warn!("[HTTP/3] recv error: {}", e);
+                                // エラー時も送信処理は続行
+                            }
+                        }
+
+                        // B-34: クライアントがハンドシェイク直後に HTTP/3 フレームを送るため、
+                        // 次の recv やメインループ待ちの前に h3 レイヤを確立する（StreamLimit 回避）。
+                        if handler.conn.is_established() {
+                            if let Err(e) = handler.init_h3() {
+                                warn!("[HTTP/3] eager init_h3 error: {}", e);
+                            }
                         }
                     }
+                }
 
-                    // B-34: クライアントがハンドシェイク直後に HTTP/3 フレームを送るため、
-                    // 次の recv やメインループ待ちの前に h3 レイヤを確立する（StreamLimit 回避）。
-                    if handler.conn.is_established() {
-                        if let Err(e) = handler.init_h3() {
-                            warn!("[HTTP/3] eager init_h3 error: {}", e);
-                        }
+                // 追加データグラムを非ブロッキングで drain（上限 H3_RECV_DRAIN_MAX）。
+                // EAGAIN/エラー時は drain を終了し、通常の select ループへ戻って送信・
+                // タイムアウト・notify を処理する（送信を過度に遅延させない上限つき）。
+                if drained < H3_RECV_DRAIN_MAX {
+                    if let Ok(next) = socket.recv_with_gro_sync(&mut recv_buf) {
+                        drained += 1;
+                        cur = Some(next);
                     }
                 }
             }
@@ -3783,6 +3808,12 @@ async fn send_pending_packets(
 
 /// GSO セグメント上限（UDP GSO の一般的な最大セグメント数）
 const MAX_GSO_SEGMENTS: usize = 64;
+
+/// F-113: 1 回の readiness あたり非ブロッキングで掻き出す追加データグラム数の上限。
+/// select/タイマー往復を drain バッチ全体で 1 回に償却しつつ、送信・タイムアウト・notify を
+/// 過度に遅延させないための上限（Docker veth では 1 データグラム 1 recvmsg のため、この値まで
+/// 連続受信すると 1 回の送信スイープへまとめられる）。
+const H3_RECV_DRAIN_MAX: usize = 64;
 
 /// F-60: 送信セグメントサイズの下限クランプ（RFC 9000 の最小 QUIC データグラム 1200B）
 const MIN_UDP_SEND_PAYLOAD: usize = 1200;

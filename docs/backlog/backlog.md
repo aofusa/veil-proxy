@@ -214,6 +214,7 @@
 | B-39 | P1 | 完了 | [bugs/B-39-http3-grpc-proxy-502.md](bugs/B-39-http3-grpc-proxy-502.md) | HTTP/3 gRPC 502 → H2C 上流 + フルパス保持で修正。`test_grpc_over_http3` PASS |
 | B-40 | P1 | 完了 | [bugs/B-40-grpc-path-prefix-stripping.md](bugs/B-40-grpc-path-prefix-stripping.md) | H1/H2 gRPC が `/*` プレフィックス除去で UNIMPLEMENTED/502。フルパス保持 + H2 use_h2c + HPACK 小文字化で修正（F-92） |
 | B-41 | P1 | 完了 | [bugs/B-41-http3-grpc-body-trailers-hang.md](bugs/B-41-http3-grpc-body-trailers-hang.md) | HTTP/3 gRPC ボディあり応答が trailers API 誤用でハング → `send_additional_headers` で修正（F-93） |
+| B-42 | P2 | 未着手 | [bugs/B-42-http3-proxy-load-instability.md](bugs/B-42-http3-proxy-load-instability.md) | HTTP/3 逆プロキシ経路（`h3_proxy`）が高並行 QUIC 負荷でエラー混入・レイテンシ劣化（glibc 17/2/425 件、musl は概ね安定）。HTTP/3 File 経路は 0 エラーで安定のため Proxy ホップ特有。F-112 計測で検出、要再現・切り分け |
 
 ---
 
