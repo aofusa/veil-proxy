@@ -112,6 +112,22 @@ pub fn io_uring_executor_smoke(data: &[u8]) {
     crate::runtime::executor::fuzz_op_table_sequence(data);
 }
 
+/// HTTP/3 フレームワイヤ形式のファジング（F-112、ホットパス外）。
+///
+/// 本番経路は quiche 内部で H3 フレームを解釈する。本エントリは RFC 9114 の
+/// type/length varint レイアウトを純関数で走査し、任意バイト列で panic しないことを検証する。
+pub fn http3_frame_decode_smoke(data: &[u8]) {
+    crate::http3_wire::http3_frame_decode_smoke(data);
+}
+
+/// QPACK 整数/文字列プレフィックスのファジング（F-112、ホットパス外）。
+///
+/// 本番経路は quiche の QPACK に委譲。本エントリは RFC 9204 のプレフィックス整数・
+/// 文字列リテラル・命令先頭の走査を純関数で行い、任意入力で panic しないことを検証する。
+pub fn qpack_decode_smoke(data: &[u8]) {
+    crate::http3_wire::qpack_decode_smoke(data);
+}
+
 #[cfg(test)]
 mod io_uring_executor_tests {
     use super::*;

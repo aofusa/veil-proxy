@@ -78,6 +78,8 @@ pub mod config;
 pub mod tls_reload;
 pub use crate::config::*;
 pub mod fuzz_api;
+/// HTTP/3 / QPACK ワイヤ純関数パーサ（F-112、ホットパス外・ファジング用）。
+pub mod http3_wire;
 pub mod upstream;
 pub use crate::upstream::*;
 pub mod proxy;

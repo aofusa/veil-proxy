@@ -78,3 +78,17 @@ path = "fuzz_targets/grpc_frame_decode.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "http3_frame_decode"
+path = "fuzz_targets/http3_frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "qpack_decode"
+path = "fuzz_targets/qpack_decode.rs"
+test = false
+doc = false
+bench = false
