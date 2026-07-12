@@ -3859,8 +3859,10 @@ fn put_h3_send_scratch(mut scratch: H3SendScratch) {
 
 /// 連結済みバッチ（`offsets` でパケット境界を持つ）を送出する。
 ///
-/// 単一パケットは通常送信、複数パケットは `send_gso_async`（GSO 無効時は個別送信へ
-/// 安全にフォールバック）で 1 回の sendmsg(UDP_SEGMENT) にまとめて送る。
+/// 単一パケットは通常送信、複数パケットは `send_gso_combined_async`（GSO 無効時は
+/// offsets 境界通りの個別送信へ安全にフォールバック）で 1 回の sendmsg(UDP_SEGMENT) に
+/// まとめて送る。`batch` は呼び出し元で既に連結済みのため、パケット参照 Vec や
+/// 再結合 Vec を新規確保せず `batch` をそのまま渡す（完全ゼロコピー）。
 async fn flush_gso_batch(
     socket: &Rc<QuicUdpSocket>,
     batch: &[u8],
@@ -3880,14 +3882,13 @@ async fn flush_gso_batch(
             }
         }
         _ => {
-            // 複数パケット: GSO（send_gso_async は GSO 無効環境では個別送信に
-            // フォールバックするため安全）。スライスはバッチへの参照でアロケーションは
-            // パケット境界ベクタ 1 本のみ。
-            let packets: Vec<&[u8]> = offsets
-                .iter()
-                .map(|&(start, len)| &batch[start..start + len])
-                .collect();
-            if let Err(e) = socket.send_gso_async(&packets, dest).await {
+            // 複数パケット: batch は既に連続領域として構築済みなので、そのまま渡す
+            // （中間 Vec<&[u8]> 確保 + 再結合 Vec<u8> 確保・コピーの二重無駄を排除）。
+            let seg_size = offsets[0].1 as u16;
+            if let Err(e) = socket
+                .send_gso_combined_async(batch, offsets, seg_size, dest)
+                .await
+            {
                 warn!("[HTTP/3] GSO batch send error: {}", e);
             }
         }

@@ -652,35 +652,44 @@ impl QuicUdpSocket {
         Ok(result.bytes_sent)
     }
 
-    /// GSO を使用した非同期送信（EAGAIN 対応）
+    /// 既に連結済みのバッファをそのまま GSO 送信する（非同期・EAGAIN 対応）。
     ///
-    /// monoio は sendmsg を直接サポートしていないため、
-    /// 非ブロッキングソケットで同期 API を使用し、
-    /// EAGAIN/EWOULDBLOCK 時は writable().await で待機します。
+    /// `send_gso_async` は呼び出し側が渡す `&[&[u8]]` を毎回 `combine_packets` で
+    /// 新規 `Vec<u8>` へ再結合していたが、呼び出し元（HTTP/3 送信ループ）は元々
+    /// 送信バッファへ連続追記して `offsets` で境界を記録しているため、その時点で
+    /// 既に連結済みである。本関数は `combined` を **そのまま** `sendmsg` へ渡し、
+    /// GSO 無効時のみ `offsets` を使って境界通りに個別送信する。中間 `Vec` 確保
+    /// （パケット参照 Vec + 再結合 Vec の 2 本）とデータの再コピーを排除する。
     ///
     /// # 引数
-    /// - `packets`: 送信するパケットのスライス
-    /// - `target`: 送信先アドレス
-    ///
-    /// # 戻り値
-    /// - 送信されたバイト数
+    /// - `combined`: 呼び出し元の送信スクラッチに連結済みの全パケットデータ
+    /// - `offsets`: `combined` 内の各パケットの (start, len)（GSO 無効時のみ使用）
+    /// - `segment_size`: GSO セグメントサイズ（最終セグメントのみ短くてよい）
+    /// - `target`: 送信先
     #[cfg(target_os = "linux")]
-    pub async fn send_gso_async(&self, packets: &[&[u8]], target: SocketAddr) -> io::Result<usize> {
-        if !self.gso_enabled || packets.is_empty() {
-            // GSO 無効または空の場合は個別送信
-            return self.send_packets_individually(packets, target).await;
+    pub async fn send_gso_combined_async(
+        &self,
+        combined: &[u8],
+        offsets: &[(usize, usize)],
+        segment_size: u16,
+        target: SocketAddr,
+    ) -> io::Result<usize> {
+        if !self.gso_enabled || combined.is_empty() {
+            // GSO 無効: 元のパケット境界通りに個別送信（追加確保なし）。
+            let mut total = 0;
+            for &(start, len) in offsets {
+                total += self
+                    .send_to_slice_async(&combined[start..start + len], target)
+                    .await?;
+            }
+            return Ok(total);
         }
 
-        // パケットを結合
-        let segment_size = packets.first().map(|p| p.len()).unwrap_or(GSO_SEGMENT_SIZE) as u16;
-        let combined = Self::combine_packets(packets);
-
-        // EAGAIN 対応ループ
+        // EAGAIN 対応ループ（再結合なしで combined をそのまま渡す）
         loop {
-            match self.send_with_gso_sync(&combined, segment_size, target) {
+            match self.send_with_gso_sync(combined, segment_size, target) {
                 Ok(result) => return Ok(result.bytes_sent),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    // ソケットが書き込み可能になるまで待機
                     wait_writable_fd(self.socket.as_raw_fd()).await?;
                 }
                 Err(e) => return Err(e),
@@ -710,31 +719,6 @@ impl QuicUdpSocket {
                 Err(e) => return Err(e),
             }
         }
-    }
-
-    /// パケットを個別に送信（GSO 無効時のフォールバック）
-    async fn send_packets_individually(
-        &self,
-        packets: &[&[u8]],
-        target: SocketAddr,
-    ) -> io::Result<usize> {
-        let mut total = 0;
-        for packet in packets {
-            let buf = packet.to_vec();
-            let (result, _) = self.send_to(buf, target).await;
-            total += result?;
-        }
-        Ok(total)
-    }
-
-    /// パケットを結合
-    fn combine_packets(packets: &[&[u8]]) -> Vec<u8> {
-        let total_len: usize = packets.iter().map(|p| p.len()).sum();
-        let mut combined = Vec::with_capacity(total_len);
-        for packet in packets {
-            combined.extend_from_slice(packet);
-        }
-        combined
     }
 
     /// GSO が有効かどうか
