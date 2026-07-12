@@ -3422,6 +3422,10 @@ HTTP/1.1 (`wrk`), HTTP/2 (`h2load`), **HTTP/3 (QUIC-enabled `h2load`)**, and
 configs that layer a single full-only feature on a shared baseline — compression / cache /
 buffering / reverse-proxy / **wasm / metrics / access-log / rate-limit / admin /
 opentelemetry / l4-proxy / http3 / grpc / websocket** (`h2_1_feat_*` / `h2_0_feat_l4`).
+It also generates a **full protocol × feature matrix** (`h2_1_proxy_*` / `h3_file_*` /
+`h3_proxy*` / `grpc_h2_*` / `grpc_h3*`) layering each feature onto Proxy / HTTP/3 / gRPC
+(over H2/H3) routes; scope a run with `CONFIG_GLOB` (e.g. `CONFIG_GLOB='h3_*'`). gRPC over
+HTTP/3 is failsafe-skipped (`NA`) as k6 lacks a native client.
 The HTTP/3 client needs a QUIC-enabled h2load (`docker build -t local/h2load-h3:latest
 tools/perf/h2load-http3`; http3 is skipped if absent); gRPC/WebSocket use `grafana/k6`
 against `moul/grpcbin` / `jmalloc/echo-server` upstreams. Full data and a summary are in

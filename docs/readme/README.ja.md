@@ -3458,7 +3458,10 @@ recv/send/accept/timer Future をランダムに Drop する `runtime_cancellati
   default+http2 チューニング（2⁴=16 直交表）に加え、ベースへ 1 機能だけを重ねた機能ショーケース構成
   （compression / cache / buffering / 逆プロキシ /
   **wasm / metrics / access-log / rate-limit / admin / opentelemetry / l4-proxy / http3 / grpc /
-  websocket**、`h2_1_feat_*` / `h2_0_feat_l4`）で機能単位のオーバーヘッドを計測する。HTTP/3 は
+  websocket**、`h2_1_feat_*` / `h2_0_feat_l4`）で機能単位のオーバーヘッドを計測する。さらに
+  **全プロトコル×全機能マトリクス**（`h2_1_proxy_*` / `h3_file_*` / `h3_proxy*` / `grpc_h2_*` /
+  `grpc_h3*`）を生成し、Proxy / HTTP/3 / gRPC(over H2/H3) 経路へ各機能を重ねて計測する
+  （`CONFIG_GLOB` で対象を絞り込み可。gRPC over H3 は k6 非対応のためフェイルセーフで `NA`）。HTTP/3 は
   QUIC 対応 h2load（`docker build -t local/h2load-h3:latest tools/perf/h2load-http3`。未ビルド時は
   スキップ）、gRPC/WebSocket は `moul/grpcbin` / `jmalloc/echo-server` を上流に `grafana/k6` で計測する。
   結果は [docs/perf](../perf/)、機能単位・HTTP/3・gRPC・WebSocket の
