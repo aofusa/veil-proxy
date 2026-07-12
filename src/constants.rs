@@ -19,9 +19,6 @@ pub(crate) static ERR_MSG_INSUFFICIENT_STORAGE: &[u8] =
     b"HTTP/1.1 507 Insufficient Storage\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 pub(crate) static ERR_MSG_REQUEST_TOO_LARGE: &[u8] =
     b"HTTP/1.1 413 Request Entity Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-/// RFC 7231 §6.5.13: ネイティブ gRPC (`application/grpc`) を HTTP/1.1 で拒否（F-112）
-pub(crate) static ERR_MSG_UNSUPPORTED_MEDIA_TYPE: &[u8] =
-    b"HTTP/1.1 415 Unsupported Media Type\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 /// RFC 7231: リクエスト URI が長すぎる場合
 pub(crate) static ERR_MSG_URI_TOO_LONG: &[u8] =
     b"HTTP/1.1 414 URI Too Long\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";

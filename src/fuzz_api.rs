@@ -128,6 +128,12 @@ pub fn qpack_decode_smoke(data: &[u8]) {
     crate::http3_wire::qpack_decode_smoke(data);
 }
 
+/// ネイティブ gRPC Content-Type 判定のファジング（F-112、ホットパス外）。
+/// `application/grpc` と `application/grpc-web*` の境界を任意入力で刺激する。
+pub fn native_grpc_content_type_smoke(data: &[u8]) {
+    let _ = crate::proxy::is_native_grpc_content_type(data);
+}
+
 #[cfg(test)]
 mod io_uring_executor_tests {
     use super::*;

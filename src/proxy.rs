@@ -407,11 +407,12 @@ fn header_pair_is_grpc(name: &[u8], value: &[u8]) -> bool {
 }
 
 /// ネイティブ gRPC Content-Type（`application/grpc` / `+proto` 等）かどうか。
-/// gRPC-Web（`application/grpc-web*`）は HTTP/1.1 で正当なため **除外** する（F-112）。
+/// gRPC-Web（`application/grpc-web*`）は除外する（F-112）。
 ///
-/// ホットパス: アロケーションなし・ASCII 大文字小文字無視のプレフィックス比較のみ。
+/// ホットパス外: 単体テスト・fuzz_api から利用。本番 HTTP/1.1 経路は H2C ブリッジのため
+/// 現時点では拒否ポリシーに配線しない（将来切替用の純関数）。
 #[inline]
-fn is_native_grpc_content_type(value: &[u8]) -> bool {
+pub(crate) fn is_native_grpc_content_type(value: &[u8]) -> bool {
     // "application/grpc" = 16 bytes。それ未満は不一致。
     if value.len() < 16 {
         return false;
@@ -4203,21 +4204,6 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                         return;
                     }
                 };
-
-                // F-112: ネイティブ gRPC は HTTP/2 必須。HTTP/1.1 経路では 415 で拒否する。
-                // gRPC-Web（application/grpc-web*）は HTTP/1.1 で正当なため対象外。
-                {
-                    let native_grpc = req.headers.iter().any(|h| {
-                        h.name.eq_ignore_ascii_case("content-type")
-                            && is_native_grpc_content_type(h.value)
-                    });
-                    if native_grpc {
-                        drop(req);
-                        let err_buf = ERR_MSG_UNSUPPORTED_MEDIA_TYPE.to_vec();
-                        let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
-                        return;
-                    }
-                }
 
                 // Connection ヘッダーチェック（Keep-Alive / Upgrade対応）
                 let connection_header: Option<&[u8]> = req
