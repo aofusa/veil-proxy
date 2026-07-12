@@ -400,9 +400,34 @@ fn compute_upstream_path(
 }
 
 /// Content-Type が application/grpc* かどうか（ホップバイホップ転送前の判定用）。
+/// 注意: `application/grpc-web*` も prefix 一致で true（gRPC-Web 経路でも使う）。
 #[inline]
 fn header_pair_is_grpc(name: &[u8], value: &[u8]) -> bool {
     name.eq_ignore_ascii_case(b"content-type") && value.starts_with(b"application/grpc")
+}
+
+/// ネイティブ gRPC Content-Type（`application/grpc` / `+proto` 等）かどうか。
+/// gRPC-Web（`application/grpc-web*`）は HTTP/1.1 で正当なため **除外** する（F-112）。
+///
+/// ホットパス: アロケーションなし・ASCII 大文字小文字無視のプレフィックス比較のみ。
+#[inline]
+fn is_native_grpc_content_type(value: &[u8]) -> bool {
+    // "application/grpc" = 16 bytes。それ未満は不一致。
+    if value.len() < 16 {
+        return false;
+    }
+    if !value[..16].eq_ignore_ascii_case(b"application/grpc") {
+        return false;
+    }
+    // "application/grpc-web..." を除外（16 文字目以降が "-web" で始まる）
+    if value.len() >= 20 && value[16..20].eq_ignore_ascii_case(b"-web") {
+        return false;
+    }
+    // 残りは境界: 終端 / `;` / `+` のみ許可（誤マッチ防止）
+    if value.len() == 16 {
+        return true;
+    }
+    matches!(value[16], b';' | b'+' | b' ' | b'\t')
 }
 
 /// 既に組み立てた HTTP リクエストバイト列に `Content-Type: application/grpc` が含まれるか。
@@ -4178,6 +4203,21 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                         return;
                     }
                 };
+
+                // F-112: ネイティブ gRPC は HTTP/2 必須。HTTP/1.1 経路では 415 で拒否する。
+                // gRPC-Web（application/grpc-web*）は HTTP/1.1 で正当なため対象外。
+                {
+                    let native_grpc = req.headers.iter().any(|h| {
+                        h.name.eq_ignore_ascii_case("content-type")
+                            && is_native_grpc_content_type(h.value)
+                    });
+                    if native_grpc {
+                        drop(req);
+                        let err_buf = ERR_MSG_UNSUPPORTED_MEDIA_TYPE.to_vec();
+                        let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+                        return;
+                    }
+                }
 
                 // Connection ヘッダーチェック（Keep-Alive / Upgrade対応）
                 let connection_header: Option<&[u8]> = req
@@ -10661,6 +10701,24 @@ mod path_tests {
         ));
         assert!(!header_pair_is_grpc(b"content-type", b"text/plain"));
         assert!(!header_pair_is_grpc(b"accept", b"application/grpc"));
+    }
+
+    #[test]
+    fn test_is_native_grpc_content_type() {
+        // ネイティブ gRPC
+        assert!(is_native_grpc_content_type(b"application/grpc"));
+        assert!(is_native_grpc_content_type(b"application/grpc+proto"));
+        assert!(is_native_grpc_content_type(b"application/grpc+json"));
+        assert!(is_native_grpc_content_type(b"Application/GRPC"));
+        assert!(is_native_grpc_content_type(b"application/grpc; charset=utf-8"));
+        // gRPC-Web は除外
+        assert!(!is_native_grpc_content_type(b"application/grpc-web"));
+        assert!(!is_native_grpc_content_type(b"application/grpc-web+proto"));
+        assert!(!is_native_grpc_content_type(b"application/grpc-web-text"));
+        // その他
+        assert!(!is_native_grpc_content_type(b"text/plain"));
+        assert!(!is_native_grpc_content_type(b"application/json"));
+        assert!(!is_native_grpc_content_type(b"application/grp"));
     }
 
     #[test]
