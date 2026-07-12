@@ -7,6 +7,8 @@
 | ファイル | 内容 |
 |----------|------|
 | [perf_http3_grpc_websocket_report.md](perf_http3_grpc_websocket_report.md) | HTTP/3(QUIC)/gRPC/WebSocket 計測（F-89 第 3 弾）。HTTP/3 は HTTP/2 比 約 1/7（userspace QUIC コスト）等。 |
+| [perf_f106_h2c_pooling_report.md](perf_f106_h2c_pooling_report.md) | H2C バックエンド接続プーリング（F-106）。gRPC 中継 +133%（同一セッション A/B）。 |
+| [perf_f111_regression_http3_gso_zerocopy_report.md](perf_f111_regression_http3_gso_zerocopy_report.md) | perf 回帰確認（F-111）。HTTP/1.1・HTTP/2・gRPC(F-106) は退行なし。HTTP/3 GSO 送信のゼロコピー化 + 再調査（ストリーム上限/ペーシング/ワーカー分散はいずれも主因でないことを確認、構造的コストの結論を追認）。 |
 | [perf_full_features_report.md](perf_full_features_report.md) | full features 機能単位オーバーヘッド計測（F-89: wasm/metrics/access-log/rate-limit/admin/otel/l4）。 |
 | [perf_measurement_report.md](perf_measurement_report.md) | `tools/perf` 実装検証レポート（F-89 起点。full/default features・WASM 計測の網羅性評価）。 |
 | [benchmark_summary.md](benchmark_summary.md) | ベンチマーク要約。 |
