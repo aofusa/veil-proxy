@@ -767,7 +767,9 @@ impl QuicUdpSocket {
                 fd,
                 scratch.hdrs.as_mut_ptr(),
                 MMSG_RECV_BATCH as libc::c_uint,
-                libc::MSG_DONTWAIT,
+                // musl は flags が c_uint、glibc は c_int（libc クレートの宣言差異）のため
+                // `as _` で両ターゲットに追従させる。
+                libc::MSG_DONTWAIT as _,
                 std::ptr::null_mut(),
             )
         };
@@ -835,7 +837,8 @@ impl QuicUdpSocket {
                     fd,
                     scratch.hdrs[sent..].as_mut_ptr(),
                     remaining as libc::c_uint,
-                    libc::MSG_DONTWAIT,
+                    // musl は flags が c_uint、glibc は c_int のため `as _` で両対応。
+                    libc::MSG_DONTWAIT as _,
                 )
             };
 
