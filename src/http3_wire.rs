@@ -110,7 +110,11 @@ pub fn decode_qpack_integer(buf: &[u8], prefix_bits: u8) -> Result<(u64, usize),
         let b = buf[i];
         i += 1;
         value = value
-            .checked_add(((b & 0x7f) as u64).checked_shl(m).ok_or(WireError::IntegerOverflow)?)
+            .checked_add(
+                ((b & 0x7f) as u64)
+                    .checked_shl(m)
+                    .ok_or(WireError::IntegerOverflow)?,
+            )
             .ok_or(WireError::IntegerOverflow)?;
         m = m.checked_add(7).ok_or(WireError::IntegerOverflow)?;
         if m > 63 {
@@ -289,9 +293,7 @@ mod tests {
         for _ in 0..128 {
             let mut buf = [0u8; 48];
             for b in &mut buf {
-                state = state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1);
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
                 *b = (state >> 33) as u8;
             }
             http3_frame_decode_smoke(&buf);
@@ -301,14 +303,8 @@ mod tests {
 
     #[test]
     fn truncated_inputs_are_errors_not_panics() {
-        assert_eq!(
-            decode_quic_varint(&[]),
-            Err(WireError::BufferTooShort)
-        );
-        assert_eq!(
-            decode_quic_varint(&[0xc0]),
-            Err(WireError::BufferTooShort)
-        );
+        assert_eq!(decode_quic_varint(&[]), Err(WireError::BufferTooShort));
+        assert_eq!(decode_quic_varint(&[0xc0]), Err(WireError::BufferTooShort));
         assert!(decode_qpack_string_prefix(&[0x05]).is_err());
     }
 }

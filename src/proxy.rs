@@ -10696,7 +10696,9 @@ mod path_tests {
         assert!(is_native_grpc_content_type(b"application/grpc+proto"));
         assert!(is_native_grpc_content_type(b"application/grpc+json"));
         assert!(is_native_grpc_content_type(b"Application/GRPC"));
-        assert!(is_native_grpc_content_type(b"application/grpc; charset=utf-8"));
+        assert!(is_native_grpc_content_type(
+            b"application/grpc; charset=utf-8"
+        ));
         // gRPC-Web は除外
         assert!(!is_native_grpc_content_type(b"application/grpc-web"));
         assert!(!is_native_grpc_content_type(b"application/grpc-web+proto"));

@@ -23544,7 +23544,11 @@ async fn test_http3_load_balancing_least_connections() {
         }
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
-    assert!(ok >= 5, "H3 least-conn path should succeed often, ok={}", ok);
+    assert!(
+        ok >= 5,
+        "H3 least-conn path should succeed often, ok={}",
+        ok
+    );
     eprintln!("test_http3_load_balancing_least_connections: ok={}/10", ok);
 }
 
@@ -23703,7 +23707,10 @@ async fn test_http3_error_handling_413_payload_too_large() {
             }
         }
         Err(e) => {
-            eprintln!("test_http3_error_handling_413: rejected with error (ok): {}", e);
+            eprintln!(
+                "test_http3_error_handling_413: rejected with error (ok): {}",
+                e
+            );
         }
     }
 
@@ -23712,7 +23719,6 @@ async fn test_http3_error_handling_413_payload_too_large() {
         "proxy must survive H3 413 probe"
     );
 }
-
 
 /// レポート: `test_http3_error_handling_431_request_header_fields_too_large`
 #[tokio::test]
@@ -23752,7 +23758,10 @@ async fn test_http3_error_handling_431_request_header_fields_too_large() {
             eprintln!("test_http3_error_handling_431: status={}", r.status);
         }
         Err(e) => {
-            eprintln!("test_http3_error_handling_431: rejected with error (ok): {}", e);
+            eprintln!(
+                "test_http3_error_handling_431: rejected with error (ok): {}",
+                e
+            );
         }
     }
 }
@@ -23912,7 +23921,10 @@ async fn test_grpc_over_http1_rejected() {
     )
     .await;
 
-    assert!(response.is_some(), "should receive HTTP response for misused gRPC GET");
+    assert!(
+        response.is_some(),
+        "should receive HTTP response for misused gRPC GET"
+    );
     let response = response.unwrap();
     let status = get_status_code(&response);
     // GET + application/grpc はメソッド/プロトコルとして不適切 → 4xx またはブリッジ後の 5xx
@@ -23930,7 +23942,6 @@ async fn test_grpc_over_http1_rejected() {
         status
     );
 }
-
 
 /// レポート: `test_grpc_load_balancing_least_connections`
 #[tokio::test]
@@ -24046,10 +24057,7 @@ async fn test_grpc_max_concurrent_streams() {
         .expect("H2 client for max concurrent streams");
 
     let body = encode_grpc_lpm(&encode_simple_request("mcs"));
-    let headers = [
-        ("content-type", "application/grpc"),
-        ("te", "trailers"),
-    ];
+    let headers = [("content-type", "application/grpc"), ("te", "trailers")];
 
     let mut success = 0usize;
     // 並行度は SETTINGS 内の少数ストリーム（逐次発行だが同一接続）
@@ -24063,7 +24071,7 @@ async fn test_grpc_max_concurrent_streams() {
             )
             .await
         {
-            Ok((st, _)) if st == 200 => success += 1,
+            Ok((200, _)) => success += 1,
             Ok((st, _)) => eprintln!("mcs[{}] status={}", i, st),
             Err(e) => eprintln!("mcs[{}] err: {}", i, e),
         }
@@ -24170,7 +24178,10 @@ async fn test_grpc_web_cors_preflight() {
     )
     .await;
 
-    assert!(response.is_some(), "OPTIONS preflight should get a response");
+    assert!(
+        response.is_some(),
+        "OPTIONS preflight should get a response"
+    );
     let response = response.unwrap();
     let status = get_status_code(&response);
     assert!(
