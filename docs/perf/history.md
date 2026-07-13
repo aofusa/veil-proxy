@@ -42,6 +42,13 @@
    thread-per-core + io_uring の設計上想定内のコスト。ゼロアロケーション設計（`mmap`呼び出し
    ごく僅少）を実測で裏付け。SO_REUSEPORT マルチワーカー化を提案し、後日実装済み
   （現行コードは全プロトコルで SO_REUSEPORT 対応済み）。
+10. **HTTP/3 mmsg バッチング + B-43 修正（2026-07-13、[`perf_f115_stage2_b43.md`](perf_f115_stage2_b43.md)）**:
+    F-115 第2段（recvmmsg/sendmmsg で 1 syscall 複数データグラム）と、静的応答の
+    StreamBlocked 後にヘッダ未送出のままストリームが FrameUnexpected で永久スタックする
+    B-43 の修正で、**HTTP/3 が 421→853 req/s（+103%、HTTP/2 比 16%→32%）**・h2load failed=0・
+    h3_proxy のエラー混入も 0 件に。F-111 の「per-packet syscall が主因」という結論は
+    副次要因で、主因は B-43（並行ストリーム初期バーストの失敗 + 30 秒アイドルタイムアウト
+    テール）だった。gRPC は k6→grpcbin 直行との対照で veil 中継オーバーヘッド実質ゼロを確認。
 
 ## 教訓（現行の計測方針に反映済み）
 
@@ -52,3 +59,9 @@
   では cbpf でも自然に分散する。ワークロードに応じて選択。
 - **ホスト負荷（co-tenant のビルド等）が計測ノイズの支配的要因**になり得るため、静穏ウィンドウ
   （1 分 loadavg 目安 < 1.5、理想は <0.5）を確認してから計測する。
+- **h2load の `failed`（ストリームエラー）は Non-2xx に計上されない**。Errors 列 = 0 でも
+  ストリームレベルの失敗が潜み得るため、HTTP/3 の異常低スループット時は h2load の
+  `requests:` 行（succeeded/failed）とサーバ warn ログを必ず確認する（B-43 の教訓）。
+- **Docker seccomp 許可リスト（`docker/assets/security/seccomp.json`）は使用 syscall の
+  追加に追随させる**。defaultAction=ERRNO のため、欠けると EPERM で機能が静かに全滅する
+  （glibc で顕在化・musl は libc フォールバックで隠蔽され得る。F-115 recvmmsg/sendmmsg の教訓）。

@@ -930,6 +930,10 @@ reuseport_balancing = "cbpf"
 #   - 受信は recvmsg(2) + UDP_GRO で同一フローの複数データグラムを集約受信し、受信バッファを
 #     再利用してデータグラム毎のヒープ確保とコピーを排除（ゼロコピー受信）。
 #   - 非対応カーネルでは単発データグラム送受信に自動フォールバックする（false 相当の挙動）。
+#   - 本設定と独立に、HTTP/3 データプレーンは recvmmsg(2)/sendmmsg(2) で複数データグラム
+#     （異なる接続宛も含む）を 1 システムコールにバッチングする（F-115。常時有効）。
+#     コンテナ実行時は seccomp 許可リストに recvmmsg/sendmmsg が必要
+#     （docker/assets/security/seccomp.json は対応済み）。
 #
 # 注意:
 #   - Linux 5.0+ でサポート

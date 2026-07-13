@@ -2502,6 +2502,10 @@ initial_max_streams_uni = 100
 #   - The HTTP/3 receive loop reuses a single buffer and feeds GRO segments to
 #     quiche as slices, eliminating per-datagram heap allocation and copies
 #     (zero-copy receive). Falls back to single-datagram I/O on unsupported kernels.
+#   - Independent of this setting, the HTTP/3 data plane always batches multiple
+#     datagrams (across different connections) into one syscall via
+#     recvmmsg(2)/sendmmsg(2) (F-115). Container deployments need recvmmsg/sendmmsg
+#     in the seccomp allowlist (docker/assets/security/seccomp.json ships with them).
 #
 # Notes:
 #   - Supported on Linux 5.0+
@@ -3433,6 +3437,13 @@ against `moul/grpcbin` / `jmalloc/echo-server` upstreams. Full data and a summar
 [docs/perf/protocol_extended_results.md](docs/perf/protocol_extended_results.md)
 (TLS termination is the dominant cost — plaintext L4 is up to 2.2× faster — while L7 feature
 logic stays within noise, all configs Non-2xx=0).
+Latest results (2026-07-13, [docs/perf/perf_f115_stage2_b43.md](docs/perf/perf_f115_stage2_b43.md)):
+HTTP/1.1 3298 req/s (nginx ×1.4) / HTTP/2 2704 req/s (nginx ×1.1) / **HTTP/3 853 req/s
+(doubled by F-115 recvmmsg/sendmmsg batching + the B-43 StreamBlocked fix — 32% of HTTP/2;
+the remaining gap is the userspace-QUIC per-request CPU cost)** / gRPC relay 1475 req/s
+(a k6→grpcbin control run shows the proxy hop adds effectively zero overhead).
+Note: HTTP/3 mmsg batching requires `recvmmsg`/`sendmmsg` in the Docker seccomp allowlist
+(`docker/assets/security/seccomp.json` ships with them).
 
 ```bash
 # Generate configs, run the comparison, and aggregate (median±stdev)

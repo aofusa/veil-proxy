@@ -14,6 +14,11 @@ docker build -f Dockerfile.musl -t "veil:musl" --build-arg CARGO_FEATURES='full'
 
 io_uringはdockerではデフォルトで禁止されている。そのため [seccomp許可リスト](./assets/security/seccomp.json) を作成しコンテナ実行時に `--security-opt seccomp=<seccomp.json>` で許可する必要がある
 
+> 許可リストには io_uring 系に加え、HTTP/3 データグラムバッチング（F-115）が使う
+> `recvmmsg` / `sendmmsg` も含まれる。独自の seccomp プロファイルを使う場合はこれらを
+> 許可しないと HTTP/3 の送受信が EPERM で全滅する（defaultAction=ERRNO のため無音で失敗する）
+> ので注意。
+
 テスト実行
 ```sh
 # 自己署名証明書を作成

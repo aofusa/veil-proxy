@@ -2498,6 +2498,9 @@ initial_max_streams_uni = 100
 #   - HTTP/3 受信ループは単一バッファを再利用し、GRO セグメントをスライスのまま quiche へ
 #     渡すため、データグラム毎のヒープ確保とコピーを排除（ゼロコピー受信）。非対応カーネルでは
 #     単発データグラム送受信に自動フォールバック。
+#   - 本設定と独立に、HTTP/3 データプレーンは recvmmsg(2)/sendmmsg(2) で複数データグラム
+#     （異なる接続宛も含む）を常時 1 システムコールにバッチングする（F-115）。コンテナ実行時は
+#     seccomp 許可リストに recvmmsg/sendmmsg が必要（docker/assets/security/seccomp.json は対応済み）。
 #
 # 注意:
 #   - Linux 5.0+ でサポート
@@ -3467,6 +3470,13 @@ recv/send/accept/timer Future をランダムに Drop する `runtime_cancellati
   結果は [docs/perf](../perf/)、機能単位・HTTP/3・gRPC・WebSocket の
   分析は [docs/perf/protocol_extended_results.md](../perf/protocol_extended_results.md) を参照
   （TLS 終端が支配的コストで平文 L4 は最大 2.2 倍、L7 機能ロジックはノイズ範囲内・全構成 Non-2xx=0）。
+  最新結果（2026-07-13、[docs/perf/perf_f115_stage2_b43.md](../perf/perf_f115_stage2_b43.md)）:
+  HTTP/1.1 3298 req/s（nginx 比 1.4 倍）/ HTTP/2 2704 req/s（nginx 比 1.1 倍）/
+  **HTTP/3 853 req/s（F-115 recvmmsg/sendmmsg バッチング + B-43 StreamBlocked 修正で 2 倍化。
+  HTTP/2 比 32%、残差はユーザ空間 QUIC の per-request CPU コスト）** / gRPC 中継 1475 req/s
+  （k6→grpcbin 直行の対照計測でプロキシホップのオーバーヘッドは実質ゼロ）。
+  なお HTTP/3 の mmsg バッチングは Docker seccomp 許可リストに `recvmmsg`/`sendmmsg` が必要
+  （`docker/assets/security/seccomp.json` は対応済み）。
 
 ### テストの実行
 
