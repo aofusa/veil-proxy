@@ -214,7 +214,8 @@
 | B-39 | P1 | 完了 | [bugs/B-39-http3-grpc-proxy-502.md](bugs/B-39-http3-grpc-proxy-502.md) | HTTP/3 gRPC 502 → H2C 上流 + フルパス保持で修正。`test_grpc_over_http3` PASS |
 | B-40 | P1 | 完了 | [bugs/B-40-grpc-path-prefix-stripping.md](bugs/B-40-grpc-path-prefix-stripping.md) | H1/H2 gRPC が `/*` プレフィックス除去で UNIMPLEMENTED/502。フルパス保持 + H2 use_h2c + HPACK 小文字化で修正（F-92） |
 | B-41 | P1 | 完了 | [bugs/B-41-http3-grpc-body-trailers-hang.md](bugs/B-41-http3-grpc-body-trailers-hang.md) | HTTP/3 gRPC ボディあり応答が trailers API 誤用でハング → `send_additional_headers` で修正（F-93） |
-| B-42 | P2 | 未着手 | [bugs/B-42-http3-proxy-load-instability.md](bugs/B-42-http3-proxy-load-instability.md) | HTTP/3 逆プロキシ経路（`h3_proxy`）が高並行 QUIC 負荷でエラー混入・レイテンシ劣化（glibc 17/2/425 件、musl は概ね安定）。HTTP/3 File 経路は 0 エラーで安定のため Proxy ホップ特有。F-112 計測で検出、要再現・切り分け |
+| B-42 | P2 | 未着手 | [bugs/B-42-http3-proxy-load-instability.md](bugs/B-42-http3-proxy-load-instability.md) | HTTP/3 逆プロキシ経路（`h3_proxy`）が高並行 QUIC 負荷でエラー混入・レイテンシ劣化（glibc 17/2/425 件、musl は概ね安定）。HTTP/3 File 経路は 0 エラーで安定のため Proxy ホップ特有。F-112 計測で検出、要再現・切り分け。F-115 第2段（sendmmsg バッチング）+ B-43 修正後の再計測ではエラー大幅減（glibc 0 件）を確認、継続観察 |
+| B-43 | P1 | 完了 | [bugs/B-43-http3-static-streamblocked-frameunexpected.md](bugs/B-43-http3-static-streamblocked-frameunexpected.md) | HTTP/3 静的応答の HEADERS が StreamBlocked になるとヘッダ未送出のままボディだけ保留 → 再送が send_body 先行で FrameUnexpected → ストリーム永久スタック（クライアントは idle timeout 30s 待ち）。並行ストリーム（h2load -m10）で 10 本中 9 本失敗し **HTTP/3 低スループット（HTTP/2 比 1/6）の主因**だった。PartialResponse へ head 保持 + try_flush_partial でヘッダ→ボディ順序を一元化して修正。h2load -m10 で failed 0・スループット +73%（443→777 req/s） |
 
 ---
 
