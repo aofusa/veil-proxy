@@ -40,6 +40,10 @@ pub mod http3_stream;
 #[cfg(feature = "http3")]
 pub mod udp;
 
+/// HTTP/2 / HTTP/3 アクターモデル共通の単一スレッドチャネル/Notify（F-116）。
+/// `#![cfg(any(feature = "http2", feature = "http3"))]` で内部を feature ゲートする。
+pub mod stream_channel;
+
 pub mod buffering;
 pub mod cache;
 pub mod routing;
