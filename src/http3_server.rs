@@ -392,6 +392,21 @@ enum Decision {
     Handled,
 }
 
+/// B-43: StreamBlocked で保留した静的応答。head が Some の間はヘッダ未送出。
+///
+/// 従来は `(body, written)` のみを保存しており、HEADERS が StreamBlocked に
+/// なった際にヘッダ未送出のままボディだけ保存 → 再送で `send_body()` を先に
+/// 呼び quiche h3 が `FrameUnexpected` を返す不具合があった。head を持たせ、
+/// 再送側でヘッダ→ボディの順序を守れるようにする。
+struct PartialResponse {
+    /// 未送出のレスポンスヘッダ。Some の間はまだ HEADERS を送っていない。
+    head: Option<Vec<h3::Header>>,
+    /// ボディ。空 = ヘッダのみ応答（リダイレクト等）。
+    body: Vec<u8>,
+    /// 送信済みボディバイト数。
+    written: usize,
+}
+
 /// HTTP/3 コネクションハンドラー
 ///
 /// quiche::Connection と h3::Connection をセットで保持し、
@@ -405,8 +420,8 @@ struct Http3Handler {
     h3_conn: Option<h3::Connection>,
     /// リモートアドレス
     peer_addr: SocketAddr,
-    /// 部分的なレスポンス（ストリーム ID → (ボディ, 書き込み済みバイト数)）
-    partial_responses: HashMap<u64, (Vec<u8>, usize)>,
+    /// 部分的なレスポンス（ストリーム ID → 保留中の応答。B-43 で head を保持）
+    partial_responses: HashMap<u64, PartialResponse>,
     /// クライアントIPアドレス（文字列）
     client_ip: String,
     /// ストリーミングプロキシ中のストリーム（F-32）。
@@ -1444,13 +1459,19 @@ impl Http3Handler {
                 debug!("[HTTP/3] Response headers sent for stream {}", stream_id);
             }
             Err(h3::Error::StreamBlocked) => {
-                // ストリームがブロックされた場合、ボディを部分レスポンスとして保存
-                // 次の send_pending_packets() で送信される
+                // B-43: ヘッダ未送出のまま保留する。従来はボディだけ保存し
+                // 再送で send_body を先に呼んで FrameUnexpected になっていた。
+                // 構築済みヘッダを move で保存し、head=Some の間はヘッダ未送出とみなす。
+                // ボディ無し応答（リダイレクト・エラー）も保存して無言消失を防ぐ。
                 debug!("[HTTP/3] Stream {} blocked, will retry later", stream_id);
-                if let Some(body_data) = body {
-                    self.partial_responses
-                        .insert(stream_id, (body_data.to_vec(), 0));
-                }
+                self.partial_responses.insert(
+                    stream_id,
+                    PartialResponse {
+                        head: Some(h3_headers),
+                        body: body.map(|b| b.to_vec()).unwrap_or_default(),
+                        written: 0,
+                    },
+                );
                 return Ok(());
             }
             Err(e) => {
@@ -1471,20 +1492,32 @@ impl Http3Handler {
                             "[HTTP/3] Response body sent: {} bytes for stream {}",
                             written, stream_id
                         );
-                        // 部分的にしか送信できなかった場合
+                        // 部分的にしか送信できなかった場合（B-43: ヘッダは送出済みなので head=None）
                         if written < body_data.len() {
-                            self.partial_responses
-                                .insert(stream_id, (body_data.to_vec(), written));
+                            self.partial_responses.insert(
+                                stream_id,
+                                PartialResponse {
+                                    head: None,
+                                    body: body_data.to_vec(),
+                                    written,
+                                },
+                            );
                         }
                     }
                     Err(h3::Error::Done) => {
-                        // バッファがいっぱい、後で再送
+                        // バッファがいっぱい、後で再送（B-43: ヘッダは送出済みなので head=None）
                         debug!(
                             "[HTTP/3] Body buffer full for stream {}, queuing for later",
                             stream_id
                         );
-                        self.partial_responses
-                            .insert(stream_id, (body_data.to_vec(), 0));
+                        self.partial_responses.insert(
+                            stream_id,
+                            PartialResponse {
+                                head: None,
+                                body: body_data.to_vec(),
+                                written: 0,
+                            },
+                        );
                     }
                     Err(e) => {
                         warn!("[HTTP/3] send_body error on stream {}: {}", stream_id, e);
@@ -2007,6 +2040,85 @@ impl Http3Handler {
         Ok((status_code, 0))
     }
 
+    /// B-43: 保留中の部分レスポンスを 1 エントリ分だけ再送する共通ヘルパー。
+    ///
+    /// `flush_partial_responses` と `handle_writable_streams` の双方から使い、
+    /// ヘッダ→ボディの送出順序を一元管理する。戻り値 `true` = 完了（エントリ削除可）。
+    ///
+    /// - `pr.head` が Some の間はまだ HEADERS 未送出。まず `send_response` で送る:
+    ///   - Ok → head を None にしてボディ送出フェーズへ続行（ボディ空なら完了）。
+    ///   - StreamBlocked → エントリを保持（`false`）し次回再試行。
+    ///   - その他エラー → warn の上で破棄（`true`）。
+    /// - ボディは既存どおり `send_body(fin=true)`。Ok で written 加算、全量送出で完了。
+    ///   Done は保持、その他エラーは warn の上で破棄。
+    fn try_flush_partial(
+        h3_conn: &mut h3::Connection,
+        conn: &mut quiche::Connection,
+        stream_id: u64,
+        pr: &mut PartialResponse,
+    ) -> bool {
+        // まず未送出ヘッダを送る。
+        if let Some(head) = &pr.head {
+            match h3_conn.send_response(conn, stream_id, head, pr.body.is_empty()) {
+                Ok(()) => {
+                    debug!(
+                        "[HTTP/3] Deferred response headers sent for stream {}",
+                        stream_id
+                    );
+                    pr.head = None;
+                    // ボディ無し応答（リダイレクト等）はヘッダ送出で完了。
+                    if pr.body.is_empty() {
+                        return true;
+                    }
+                    // ボディありなら同一呼び出しで送出フェーズへ続行。
+                }
+                Err(h3::Error::StreamBlocked) => {
+                    // まだ HEADERS を送れない。エントリを保持して次回再試行。
+                    debug!("[HTTP/3] Stream {} still blocked (headers)", stream_id);
+                    return false;
+                }
+                Err(e) => {
+                    warn!(
+                        "[HTTP/3] deferred send_response error on stream {}: {}",
+                        stream_id, e
+                    );
+                    return true;
+                }
+            }
+        }
+
+        // ボディ送出。
+        if pr.written < pr.body.len() {
+            match h3_conn.send_body(conn, stream_id, &pr.body[pr.written..], true) {
+                Ok(sent) => {
+                    pr.written += sent;
+                    debug!(
+                        "[HTTP/3] Deferred body sent for stream {}: {}/{}",
+                        stream_id,
+                        pr.written,
+                        pr.body.len()
+                    );
+                    pr.written >= pr.body.len()
+                }
+                Err(h3::Error::Done) => {
+                    // まだブロックされている。保持して次回再試行。
+                    debug!("[HTTP/3] Stream {} still blocked (body)", stream_id);
+                    false
+                }
+                Err(e) => {
+                    warn!(
+                        "[HTTP/3] deferred send_body error on stream {}: {}",
+                        stream_id, e
+                    );
+                    true
+                }
+            }
+        } else {
+            // ボディ全量送出済み。
+            true
+        }
+    }
+
     /// 部分的なレスポンスをフラッシュ
     fn flush_partial_responses(&mut self) -> io::Result<()> {
         let h3_conn = match &mut self.h3_conn {
@@ -2015,22 +2127,8 @@ impl Http3Handler {
         };
 
         let mut completed = Vec::new();
-        for (&stream_id, (body, written)) in &mut self.partial_responses {
-            if *written < body.len() {
-                match h3_conn.send_body(&mut self.conn, stream_id, &body[*written..], true) {
-                    Ok(sent) => {
-                        *written += sent;
-                        if *written >= body.len() {
-                            completed.push(stream_id);
-                        }
-                    }
-                    Err(h3::Error::Done) => {}
-                    Err(e) => {
-                        warn!("[HTTP/3] send_body error: {}", e);
-                        completed.push(stream_id);
-                    }
-                }
-            } else {
+        for (&stream_id, pr) in &mut self.partial_responses {
+            if Self::try_flush_partial(h3_conn, &mut self.conn, stream_id, pr) {
                 completed.push(stream_id);
             }
         }
@@ -2054,39 +2152,18 @@ impl Http3Handler {
         // 書き込み可能なストリームを収集
         let writable_streams: Vec<u64> = self.conn.writable().collect();
 
+        let mut completed = Vec::new();
         for stream_id in writable_streams {
             // 部分レスポンスがあるかチェック
-            if let Some((body, written)) = self.partial_responses.get_mut(&stream_id) {
-                if *written < body.len() {
-                    match h3_conn.send_body(&mut self.conn, stream_id, &body[*written..], true) {
-                        Ok(sent) => {
-                            debug!(
-                                "[HTTP/3] Writable stream {}: sent {} more bytes ({}/{})",
-                                stream_id,
-                                sent,
-                                *written + sent,
-                                body.len()
-                            );
-                            *written += sent;
-                        }
-                        Err(h3::Error::Done) => {
-                            // まだブロックされている
-                            debug!("[HTTP/3] Stream {} still blocked", stream_id);
-                        }
-                        Err(e) => {
-                            warn!(
-                                "[HTTP/3] send_body error on writable stream {}: {}",
-                                stream_id, e
-                            );
-                        }
-                    }
+            if let Some(pr) = self.partial_responses.get_mut(&stream_id) {
+                if Self::try_flush_partial(h3_conn, &mut self.conn, stream_id, pr) {
+                    completed.push(stream_id);
                 }
             }
         }
-
-        // 完了したストリームを削除
-        self.partial_responses
-            .retain(|_, (body, written)| *written < body.len());
+        for stream_id in completed {
+            self.partial_responses.remove(&stream_id);
+        }
 
         Ok(())
     }
@@ -4235,6 +4312,50 @@ mod tests {
         let config = Http3ServerConfig::default();
         assert_eq!(config.max_idle_timeout, 30000);
         assert_eq!(config.max_udp_payload_size, 1350);
+    }
+
+    /// B-43: PartialResponse の状態表現の不変条件を検証する。
+    ///
+    /// 実際の再送（`try_flush_partial`）は生きた h3::Connection（QUIC ハンドシェイク
+    /// 完了）が必要なため単体では駆動できず、E2E/負荷再現は別途行う。ここでは
+    /// ヘルパーが依存する状態表現（ヘッダのみ応答 vs ボディ応答、残バイトのスライス計算、
+    /// 完了判定）が正しいことを検証する。
+    #[test]
+    fn test_b43_partial_response_state() {
+        // ヘッダのみ応答（リダイレクト等）: head=Some, body 空。
+        // try_flush_partial はヘッダ送出成功時に fin=true（body 空）で即完了する。
+        let redirect = PartialResponse {
+            head: Some(vec![h3::Header::new(b":status", b"302")]),
+            body: Vec::new(),
+            written: 0,
+        };
+        assert!(redirect.head.is_some(), "ヘッダ未送出であること");
+        assert!(redirect.body.is_empty(), "ボディ無し = fin=true で完了扱い");
+
+        // ボディ応答: StreamBlocked で保存された初期状態。
+        let mut pr = PartialResponse {
+            head: Some(vec![h3::Header::new(b":status", b"200")]),
+            body: b"hello world".to_vec(),
+            written: 0,
+        };
+
+        // ヘッダ送出成功を模擬（try_flush_partial の Ok アーム相当）。
+        pr.head = None;
+        assert!(!pr.body.is_empty(), "ボディありなのでボディ送出フェーズへ");
+
+        // 部分送出を模擬し、残バイトのスライス計算と完了判定を検証。
+        let first = 5usize;
+        assert_eq!(&pr.body[pr.written..], b"hello world");
+        pr.written += first;
+        assert_eq!(
+            &pr.body[pr.written..],
+            b" world",
+            "残バイトのみ再送されること"
+        );
+        assert!(pr.written < pr.body.len(), "まだ未完了");
+
+        pr.written += pr.body.len() - pr.written;
+        assert!(pr.written >= pr.body.len(), "全量送出で完了判定");
     }
 
     /// F-101: ヘッダブロックサイズ合計が MAX_HEADER_SIZE 判定に使えること
