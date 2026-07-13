@@ -164,7 +164,7 @@ fn release_h2_write_buf(mut buf: Vec<u8>) {
 
 impl<S> Drop for Http2Connection<S> {
     fn drop(&mut self) {
-        // 接続終了時に読み込みバッファをプールへ返却（再利用）。read_more の最中に
+        // 接続終了時に読み込みバッファをプールへ返却（再利用）。fill_read_buf の最中に
         // drop された場合は read_buf が空（take 済み）のため pool には戻らない。
         release_h2_read_buf(std::mem::take(&mut self.read_buf));
         // 送信連結バッファも同様にプールへ返却する。
@@ -275,7 +275,7 @@ where
 
         // プリフェースを読み込む（初期バッファに既にある場合は再読み込み不要）
         while self.buf_end - self.buf_start < preface_len {
-            self.read_more().await?;
+            self.fill_read_buf().await?;
         }
 
         // プリフェースを確認
@@ -312,10 +312,30 @@ where
     ///
     /// HTTP/2 フレームを1つ読み込んでデコードします。
     /// コネクションがクローズされた場合は ConnectionClosed エラーを返します。
+    ///
+    /// F-116: 同期パース（[`try_read_frame_buffered`](Self::try_read_frame_buffered)）と
+    /// 1 回読み込み（[`fill_read_buf`](Self::fill_read_buf)）の合成として再構成した。
+    /// ハンドシェイク等の既存呼び出しの挙動は従来と同一。
     pub async fn read_frame(&mut self) -> Http2Result<Frame> {
-        // フレームヘッダー (9 bytes) を確保
-        while self.buf_end - self.buf_start < FrameHeader::SIZE {
-            self.read_more().await?;
+        loop {
+            if let Some(frame) = self.try_read_frame_buffered()? {
+                return Ok(frame);
+            }
+            self.fill_read_buf().await?;
+        }
+    }
+
+    /// 読み込みバッファ内のデータから完全フレームを 1 つ同期パースする（await しない）。
+    ///
+    /// `read_buf[buf_start..buf_end]` にフレームヘッダー（9 バイト）+ ペイロード全量が
+    /// 揃っていればデコードして `Ok(Some(frame))` を返し、足りなければ I/O を発行せず
+    /// `Ok(None)` を返す（呼び出し側が [`fill_read_buf`](Self::fill_read_buf) で追加読み込み
+    /// してから再試行する）。HTTP/2 多重化メインループ（F-116）は本 API で「バッファに
+    /// 溜まった複数フレームを I/O なしで連続処理」する。
+    pub fn try_read_frame_buffered(&mut self) -> Http2Result<Option<Frame>> {
+        // フレームヘッダー (9 bytes) が未達なら不完全
+        if self.buf_end - self.buf_start < FrameHeader::SIZE {
+            return Ok(None);
         }
 
         // ヘッダーをデコード
@@ -324,9 +344,9 @@ where
             .decode_header(&self.read_buf[self.buf_start..])?;
         let total_len = FrameHeader::SIZE + header.length as usize;
 
-        // ペイロードを確保
-        while self.buf_end - self.buf_start < total_len {
-            self.read_more().await?;
+        // ペイロードが未達なら不完全
+        if self.buf_end - self.buf_start < total_len {
+            return Ok(None);
         }
 
         // フレームをデコード (安全なスライスアクセス)
@@ -352,11 +372,15 @@ where
             self.compact_buffer();
         }
 
-        Ok(frame)
+        Ok(Some(frame))
     }
 
-    /// 追加データを読み込み
-    async fn read_more(&mut self) -> Http2Result<()> {
+    /// 追加データを読み込みバッファへ 1 回だけ読み込む（読み込んだバイト数を返す）。
+    ///
+    /// `stream.read` をちょうど 1 回発行する。0 バイト（EOF）は従来どおり
+    /// `ConnectionClosed` エラー。バッファ不足時のコンパクト化・拡張（最大フレームサイズ +
+    /// ヘッダー + マージン）は従来の `read_more` と同一。
+    pub async fn fill_read_buf(&mut self) -> Http2Result<usize> {
         // バッファが不足している場合は拡張
         if self.buf_end >= self.read_buf.len() {
             if self.buf_start > 0 {
@@ -395,7 +419,7 @@ where
                 full_buf.extend_from_slice(&returned_tail[..n]);
                 self.read_buf = full_buf;
                 self.buf_end += n;
-                Ok(())
+                Ok(n)
             }
             Err(e) => {
                 self.read_buf = full_buf;
@@ -1961,6 +1985,151 @@ where
     pub fn cleanup_closed(&mut self) {
         self.streams.cleanup_closed();
     }
+
+    /// DATA フレームを送信ウィンドウの許す範囲だけ連結バッファへ積む（await しない、F-116）。
+    ///
+    /// `min(コネクション送信ウィンドウ, ストリーム送信ウィンドウ)` の範囲を
+    /// `max_frame_size` で分割して `write_buf` へ追記し、両ウィンドウを減算して
+    /// **積めたバイト数を返す**。I/O（読み書き）は一切行わず、実際の送出はメインループが
+    /// [`flush_write_buf`](Self::flush_write_buf) で明示的に行う。
+    ///
+    /// - END_STREAM は「`data` の残り全量を積み切った」場合のみ、最終バイトを運ぶフレームに
+    ///   付与する。ウィンドウ不足で途中までしか積めなかった場合は付与せず、呼び出し側が
+    ///   WINDOW_UPDATE 受信後に残りを再度渡す（END_STREAM 遅延）。
+    /// - `data` が空で `end_stream=true` の場合は 0 長の END_STREAM DATA フレームを積む
+    ///   （空ボディの終端クローズ用）。
+    ///
+    /// 既存の [`send_data`](Self::send_data)（ウィンドウ枯渇時に内部で `read_frame` する
+    /// ブロッキング版）はクライアント/非多重化経路用に無改変で残す。
+    pub fn queue_data_frames(
+        &mut self,
+        stream_id: u32,
+        data: &[u8],
+        end_stream: bool,
+    ) -> Http2Result<usize> {
+        // 空ボディ + END_STREAM: 0 長 DATA フレームで終端を伝える（send_data と同挙動）。
+        if data.is_empty() {
+            if end_stream {
+                self.frame_encoder
+                    .encode_data_into(&mut self.write_buf, stream_id, &[], true);
+                if let Some(stream) = self.streams.get(stream_id) {
+                    stream.send_end_stream()?;
+                }
+            }
+            return Ok(0);
+        }
+
+        let max_frame_size = self.remote_settings.max_frame_size as usize;
+        let mut offset = 0;
+
+        while offset < data.len() {
+            // ストリームウィンドウを取得
+            let stream_window = self
+                .streams
+                .get_ref(stream_id)
+                .map(|s| s.send_window)
+                .unwrap_or(0);
+
+            // コネクションとストリームの両方のウィンドウを考慮
+            let available_window = self.conn_send_window.min(stream_window).max(0) as usize;
+            if available_window == 0 {
+                // ウィンドウ枯渇: 待たずに「ここまで積めた」を返す（非ブロッキング）。
+                break;
+            }
+
+            let remaining = data.len() - offset;
+            let chunk_len = remaining.min(max_frame_size).min(available_window);
+            let is_last = offset + chunk_len >= data.len();
+            let chunk = &data[offset..offset + chunk_len];
+            let len = chunk_len as i32;
+
+            // ウィンドウを減少
+            self.conn_send_window -= len;
+            if let Some(stream) = self.streams.get(stream_id) {
+                stream.send_window -= len;
+            }
+
+            // DATA フレームを連結バッファへ追記（per-frame Vec 確保を排除）。
+            // END_STREAM は全量積み切りが確定した最終フレームのみに付与。
+            self.frame_encoder.encode_data_into(
+                &mut self.write_buf,
+                stream_id,
+                chunk,
+                end_stream && is_last,
+            );
+
+            offset += chunk_len;
+        }
+
+        // 全量積み切って END_STREAM を付与した場合のみ状態遷移。
+        if end_stream && offset == data.len() {
+            if let Some(stream) = self.streams.get(stream_id) {
+                stream.send_end_stream()?;
+            }
+        }
+
+        Ok(offset)
+    }
+
+    /// ストリームからリクエスト情報を所有権ごと取り出す（F-116、コピーなし）。
+    ///
+    /// per-stream リクエストタスクへ conn 非依存でリクエストを引き渡すため、
+    /// `Stream` に蓄積された疑似ヘッダー・通常ヘッダー・ボディを `std::mem::take` で
+    /// 移動する（クローンしない）。ストリーム自体は `StreamManager` に残り、
+    /// 状態遷移・フロー制御・`cleanup_closed` は従来どおり機能する。
+    ///
+    /// ストリームが存在しない場合は `None`。`:scheme` 等の抽出対象外の疑似ヘッダーは
+    /// `headers` にそのまま残る（呼び出し側は従来どおり `:` プレフィックスで除外できる）。
+    pub fn take_request_parts(&mut self, stream_id: u32) -> Option<H2RequestParts> {
+        let stream = self.streams.get(stream_id)?;
+        let all_headers = std::mem::take(&mut stream.request_headers);
+        let body = std::mem::take(&mut stream.request_body);
+
+        let mut method = Vec::new();
+        let mut path = Vec::new();
+        let mut authority = None;
+        let mut headers = Vec::with_capacity(all_headers.len());
+        for h in all_headers {
+            match h.name.as_slice() {
+                b":method" => method = h.value,
+                b":path" => path = h.value,
+                b":authority" => authority = Some(h.value),
+                _ => headers.push(h),
+            }
+        }
+
+        Some(H2RequestParts {
+            method,
+            path,
+            authority,
+            headers,
+            body,
+        })
+    }
+}
+
+impl<S: std::os::fd::AsRawFd> Http2Connection<S> {
+    /// 基盤ストリームの生ファイルディスクリプタを取得する（F-116）。
+    ///
+    /// HTTP/2 多重化メインループが `wait_readable_fd`（`POLL_ADD`）でソケット可読を
+    /// 待機するために使う（`ReadFuture` の drop は既読データを破棄するため、
+    /// `read` と notify の `select` は禁止。データ転送を伴わない POLL_ADD で待つ）。
+    pub fn raw_fd(&self) -> std::os::fd::RawFd {
+        self.stream.as_raw_fd()
+    }
+}
+
+impl<S: crate::runtime::io::BufferedReadState> Http2Connection<S> {
+    /// 「POLLIN では通知されない、既に手元にある未消費入力」が残っているか（F-116）。
+    ///
+    /// 読み込みバッファ（`read_buf[buf_start..buf_end]`）の未消化バイト、または基盤
+    /// ストリームの復号済み/先読みバッファ
+    /// （[`BufferedReadState::has_buffered_read_data`]）のいずれかが残っていれば `true`。
+    /// メインループはこれが `false` のときのみ `wait_readable_fd` で待機してよい
+    /// （さもないと既読データが残ったまま POLLIN を待ってデッドロックする）。
+    pub fn has_pending_input(&self) -> bool {
+        self.buf_end > self.buf_start || self.stream.has_buffered_read_data()
+    }
 }
 
 /// 処理済みリクエスト
@@ -1977,6 +2146,28 @@ pub struct ProcessedRequest {
     /// 無視してよく、その場合 DATA は従来どおり `Stream::request_body` に蓄積され、
     /// END_STREAM 受信時に `body_pending: false` の `ProcessedRequest` が返る。
     pub body_pending: bool,
+}
+
+/// ストリームから所有権ごと取り出したリクエスト情報（F-116）。
+///
+/// [`Http2Connection::take_request_parts`] が `Stream` の蓄積状態から `std::mem::take` で
+/// 移動して構築する（クローンなし）。per-stream リクエストタスクは本構造体だけを受け取り、
+/// `Http2Connection` に触れずにルーティング・バックエンド往復を実行できる。
+#[derive(Debug)]
+pub struct H2RequestParts {
+    /// `:method` 疑似ヘッダーの値。
+    pub method: Vec<u8>,
+    /// `:path` 疑似ヘッダーの値。
+    pub path: Vec<u8>,
+    /// `:authority` 疑似ヘッダーの値（無ければ `None`。host ヘッダーへの
+    /// フォールバックは呼び出し側で行う）。
+    pub authority: Option<Vec<u8>>,
+    /// 抽出済み疑似ヘッダー（`:method`/`:path`/`:authority`）以外のヘッダー一覧
+    /// （`:scheme` 等の残余疑似ヘッダーを含む）。
+    pub headers: Vec<crate::http2::hpack::HeaderField>,
+    /// 蓄積済みリクエストボディ（`Stream::request_body` からの移動。
+    /// `freeze()` でゼロコピーに `Bytes` 化できる）。
+    pub body: bytes::BytesMut,
 }
 
 #[cfg(test)]
@@ -2132,6 +2323,13 @@ mod tests {
         async fn read<T: crate::runtime::buf::IoBufMut>(&mut self, buf: T) -> BufResult<usize, T> {
             // 送信専用テストでは読み取りは EOF 扱い（ウィンドウ枯渇待ちに入らせない）。
             (Ok(0), buf)
+        }
+    }
+
+    impl crate::runtime::io::BufferedReadState for RecordingStream {
+        // モックは復号済み/先読みバッファを持たない（has_pending_input テスト用）。
+        fn has_buffered_read_data(&self) -> bool {
+            false
         }
     }
 
@@ -2329,5 +2527,254 @@ mod tests {
             conn.write_buf.capacity() > 0,
             "書き込み後にバッファ容量が再利用のため保持されるべき"
         );
+    }
+
+    // ====================
+    // F-116 Stage 2: 同期フレームパース / 非ブロッキング DATA 送出 / リクエスト取り出し
+    // ====================
+
+    const FRAME_PING: u8 = 0x6;
+
+    /// 読み込みバッファ末尾へバイト列を直接追記する（I/O なしでの受信をシミュレート）。
+    fn feed_read_buf(conn: &mut Http2Connection<RecordingStream>, data: &[u8]) {
+        conn.read_buf[conn.buf_end..conn.buf_end + data.len()].copy_from_slice(data);
+        conn.buf_end += data.len();
+    }
+
+    #[test]
+    fn try_read_frame_buffered_partial_then_complete() {
+        // 部分フレーム → Ok(None)、残りのバイトが揃うと Ok(Some) になること。
+        let ping = FrameEncoder::new(16384).encode_ping(&[0xAB; 8], false);
+        // 先頭 5 バイト（ヘッダー 9 バイトにも満たない）だけ投入。
+        let mut conn = Http2Connection::new_with_initial_buffer(
+            RecordingStream::new(),
+            Http2Settings::default(),
+            ping[..5].to_vec(),
+        );
+        assert!(
+            matches!(conn.try_read_frame_buffered(), Ok(None)),
+            "ヘッダー未達は Ok(None)"
+        );
+
+        // ヘッダーは揃うがペイロードが未達。
+        feed_read_buf(&mut conn, &ping[5..12]);
+        assert!(
+            matches!(conn.try_read_frame_buffered(), Ok(None)),
+            "ペイロード未達は Ok(None)"
+        );
+
+        // 全量揃うとフレームが返る。
+        feed_read_buf(&mut conn, &ping[12..]);
+        let frame = conn
+            .try_read_frame_buffered()
+            .expect("parse")
+            .expect("complete frame");
+        assert!(matches!(frame, Frame::Ping { ack: false, data } if data == [0xAB; 8]));
+        // 消費済み: 次は Ok(None)。
+        assert!(matches!(conn.try_read_frame_buffered(), Ok(None)));
+        // RecordingStream の read は一度も呼ばれていない（同期パースのみ）。
+        assert!(conn.stream.writes.is_empty());
+    }
+
+    #[test]
+    fn try_read_frame_buffered_multiple_frames_without_io() {
+        // 1 バッファに載った複数フレームを I/O なしで連続パースできること。
+        let encoder = FrameEncoder::new(16384);
+        let mut bytes = encoder.encode_ping(&[1u8; 8], false);
+        bytes.extend_from_slice(&encoder.encode_ping(&[2u8; 8], true));
+        bytes.extend_from_slice(&encoder.encode_window_update(0, 1000));
+
+        let mut conn = Http2Connection::new_with_initial_buffer(
+            RecordingStream::new(),
+            Http2Settings::default(),
+            bytes,
+        );
+        let f1 = conn.try_read_frame_buffered().unwrap().expect("frame 1");
+        assert!(matches!(f1, Frame::Ping { ack: false, data } if data == [1u8; 8]));
+        let f2 = conn.try_read_frame_buffered().unwrap().expect("frame 2");
+        assert!(matches!(f2, Frame::Ping { ack: true, data } if data == [2u8; 8]));
+        let f3 = conn.try_read_frame_buffered().unwrap().expect("frame 3");
+        assert!(matches!(
+            f3,
+            Frame::WindowUpdate {
+                stream_id: 0,
+                increment: 1000
+            }
+        ));
+        assert!(matches!(conn.try_read_frame_buffered(), Ok(None)));
+    }
+
+    #[test]
+    fn queue_data_frames_clamps_to_connection_window() {
+        // コネクションウィンドウ < ストリームウィンドウのとき、conn 側で制限されること。
+        let mut conn = conn_with_open_stream(1);
+        conn.conn_send_window = 6; // ストリームは 65535
+        let data = b"0123456789";
+        let queued = conn.queue_data_frames(1, data, true).expect("queue");
+        assert_eq!(queued, 6, "conn ウィンドウ分だけ積まれる");
+        assert_eq!(conn.conn_send_window, 0);
+        assert_eq!(conn.streams.get_ref(1).unwrap().send_window, 65535 - 6);
+
+        let frames = parse_frames(&conn.write_buf);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].0, FRAME_DATA);
+        assert_eq!(frames[0].3, b"012345");
+        // 全量積み切れていないので END_STREAM は付かない（遅延）。
+        assert_eq!(frames[0].1 & FLAG_END_STREAM, 0);
+    }
+
+    #[test]
+    fn queue_data_frames_clamps_to_stream_window() {
+        // ストリームウィンドウ < コネクションウィンドウのとき、ストリーム側で制限されること。
+        let mut conn = conn_with_open_stream(1);
+        conn.streams.get(1).unwrap().send_window = 4;
+        let data = b"0123456789";
+        let queued = conn.queue_data_frames(1, data, true).expect("queue");
+        assert_eq!(queued, 4, "ストリームウィンドウ分だけ積まれる");
+        assert_eq!(conn.streams.get_ref(1).unwrap().send_window, 0);
+        assert_eq!(conn.conn_send_window, 65535 - 4);
+
+        let frames = parse_frames(&conn.write_buf);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].3, b"0123");
+        assert_eq!(frames[0].1 & FLAG_END_STREAM, 0);
+    }
+
+    #[test]
+    fn queue_data_frames_splits_by_max_frame_size() {
+        // max_frame_size で分割され、END_STREAM が最終フレームのみに立つこと。
+        let mut conn = conn_with_open_stream(1);
+        conn.remote_settings.max_frame_size = 4;
+        let data = b"0123456789"; // 10 バイト → 4,4,2
+        let queued = conn.queue_data_frames(1, data, true).expect("queue");
+        assert_eq!(queued, 10, "ウィンドウ内なら全量積まれる");
+
+        let frames = parse_frames(&conn.write_buf);
+        assert_eq!(frames.len(), 3);
+        for f in &frames {
+            assert_eq!(f.0, FRAME_DATA);
+            assert!(f.3.len() <= 4);
+        }
+        assert_eq!(frames[0].1 & FLAG_END_STREAM, 0);
+        assert_eq!(frames[1].1 & FLAG_END_STREAM, 0);
+        assert_eq!(frames[2].1 & FLAG_END_STREAM, FLAG_END_STREAM);
+        let reassembled: Vec<u8> = frames.iter().flat_map(|f| f.3.clone()).collect();
+        assert_eq!(reassembled, data);
+        // 全量 + END_STREAM 送出でストリームはクローズ（HalfClosedRemote → Closed）。
+        assert_eq!(conn.streams.get_ref(1).unwrap().state, StreamState::Closed);
+    }
+
+    #[test]
+    fn queue_data_frames_defers_end_stream_until_fully_queued() {
+        // ウィンドウ枯渇で途中まで → END_STREAM なし。回復後の残量で END_STREAM が立つこと。
+        let mut conn = conn_with_open_stream(1);
+        conn.conn_send_window = 4;
+        let data = b"0123456789";
+        let queued = conn.queue_data_frames(1, data, true).expect("queue");
+        assert_eq!(queued, 4);
+        {
+            let frames = parse_frames(&conn.write_buf);
+            assert_eq!(frames.len(), 1);
+            assert_eq!(
+                frames[0].1 & FLAG_END_STREAM,
+                0,
+                "部分送出に END_STREAM 禁止"
+            );
+        }
+        // まだ END_STREAM を送っていないので状態は据え置き。
+        assert_eq!(
+            conn.streams.get_ref(1).unwrap().state,
+            StreamState::HalfClosedRemote
+        );
+
+        // WINDOW_UPDATE 相当でウィンドウ回復 → 残りを積むと最終フレームに END_STREAM。
+        conn.conn_send_window = 100;
+        conn.write_buf.clear();
+        let queued2 = conn
+            .queue_data_frames(1, &data[queued..], true)
+            .expect("queue rest");
+        assert_eq!(queued2, 6);
+        let frames = parse_frames(&conn.write_buf);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].3, b"456789");
+        assert_eq!(frames[0].1 & FLAG_END_STREAM, FLAG_END_STREAM);
+        assert_eq!(conn.streams.get_ref(1).unwrap().state, StreamState::Closed);
+    }
+
+    #[test]
+    fn queue_data_frames_empty_body_end_stream() {
+        // 空ボディ + END_STREAM は 0 長 END_STREAM DATA フレームを積むこと。
+        let mut conn = conn_with_open_stream(1);
+        let queued = conn.queue_data_frames(1, &[], true).expect("queue");
+        assert_eq!(queued, 0);
+        let frames = parse_frames(&conn.write_buf);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].0, FRAME_DATA);
+        assert!(frames[0].3.is_empty());
+        assert_eq!(frames[0].1 & FLAG_END_STREAM, FLAG_END_STREAM);
+        assert_eq!(conn.streams.get_ref(1).unwrap().state, StreamState::Closed);
+        // ウィンドウは消費されない。
+        assert_eq!(conn.conn_send_window, 65535);
+    }
+
+    #[test]
+    fn queue_data_frames_empty_body_without_end_stream_is_noop() {
+        // 空ボディ + end_stream=false は何も積まない。
+        let mut conn = conn_with_open_stream(1);
+        let queued = conn.queue_data_frames(1, &[], false).expect("queue");
+        assert_eq!(queued, 0);
+        assert!(conn.write_buf.is_empty());
+    }
+
+    #[test]
+    fn take_request_parts_moves_data_and_leaves_stream_reusable() {
+        use crate::http2::hpack::HeaderField;
+
+        let mut conn = conn_with_open_stream(1);
+        {
+            let stream = conn.streams.get(1).unwrap();
+            stream.request_headers = vec![
+                HeaderField::new(b":method".to_vec(), b"POST".to_vec()),
+                HeaderField::new(b":scheme".to_vec(), b"https".to_vec()),
+                HeaderField::new(b":path".to_vec(), b"/api/echo".to_vec()),
+                HeaderField::new(b":authority".to_vec(), b"example.com".to_vec()),
+                HeaderField::new(b"content-type".to_vec(), b"text/plain".to_vec()),
+            ];
+            stream.request_body.extend_from_slice(b"hello body");
+        }
+
+        let parts = conn.take_request_parts(1).expect("parts");
+        assert_eq!(parts.method, b"POST");
+        assert_eq!(parts.path, b"/api/echo");
+        assert_eq!(parts.authority.as_deref(), Some(&b"example.com"[..]));
+        assert_eq!(&parts.body[..], b"hello body");
+        // 抽出対象外（:scheme・通常ヘッダー）は headers に残る。
+        assert_eq!(parts.headers.len(), 2);
+        assert!(parts.headers.iter().any(|h| h.name == b":scheme"));
+        assert!(parts.headers.iter().any(|h| h.name == b"content-type"));
+
+        // ストリーム側は空へ移動済みで、マネージャには残っている（クリーンアップ可能）。
+        let stream = conn.streams.get_ref(1).unwrap();
+        assert!(stream.request_headers.is_empty(), "ヘッダーは移動済み");
+        assert!(stream.request_body.is_empty(), "ボディは移動済み");
+        assert_eq!(stream.state, StreamState::HalfClosedRemote, "状態は不変");
+
+        // 存在しないストリームは None。
+        assert!(conn.take_request_parts(99).is_none());
+    }
+
+    #[test]
+    fn has_pending_input_reflects_read_buf_and_stream_state() {
+        // read_buf の未消化バイトの有無で has_pending_input が変化すること
+        // （RecordingStream は BufferedReadState = false）。
+        let ping = FrameEncoder::new(16384).encode_ping(&[7u8; 8], false);
+        let mut conn = Http2Connection::new_with_initial_buffer(
+            RecordingStream::new(),
+            Http2Settings::default(),
+            ping,
+        );
+        assert!(conn.has_pending_input(), "初期データが未消化なら true");
+        let _ = conn.try_read_frame_buffered().unwrap().expect("frame");
+        assert!(!conn.has_pending_input(), "全消化後は false");
     }
 }

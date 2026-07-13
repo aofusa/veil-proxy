@@ -3600,6 +3600,15 @@ impl<S: AsRawFd> AsRawFd for BufferedStream<S> {
     }
 }
 
+impl<S> crate::runtime::io::BufferedReadState for BufferedStream<S> {
+    /// プロトコル検出時の先読みデータが未消費なら `true`（消費し切ると `buffer` は `None`）。
+    /// F-116: HTTP/2 多重化メインループの可読待機前チェックに使う。
+    #[inline]
+    fn has_buffered_read_data(&self) -> bool {
+        self.buffer.is_some()
+    }
+}
+
 impl<S: AsyncReadRent + Unpin> AsyncReadRent for BufferedStream<S> {
     async fn read<T: IoBufMut>(&mut self, mut buf: T) -> crate::runtime::io::BufResult<usize, T> {
         if let Some(ref b) = self.buffer {

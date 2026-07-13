@@ -121,6 +121,35 @@ pub trait AsyncWriteRentExt: AsyncWriteRent {
 impl<T: AsyncWriteRent> AsyncWriteRentExt for T {}
 
 // ====================
+// 復号済み・先読みバッファの残量問い合わせ（F-116 HTTP/2 多重化）
+// ====================
+
+/// ストリームが「POLLIN では通知されない、既に手元にある未消費バイト」を保持しているか
+/// を問い合わせるトレイト。
+///
+/// HTTP/2 多重化メインループは、完全フレームが読めず・書くものも無いとき
+/// `wait_readable_fd`（`POLL_ADD`）でソケット可読を待つ。しかし TLS ストリーム
+/// （ユーザ空間 rustls）は復号済み平文を内部バッファに退避し得るし、
+/// [`BufferedStream`](crate::proxy::BufferedStream) はプロトコル検出時の先読みデータを
+/// 抱え得る。これらが残っている間は `POLLIN` が発火しない（既にカーネルから読み終えている）
+/// ため、待機前に本メソッドで「未消費データ無し」を確認しないとデッドロックする。
+///
+/// kTLS で受信オフロード済みのストリームはカーネルが復号するため内部退避を持たず、
+/// `false` を返す（`POLLIN` が信頼できる）。
+pub trait BufferedReadState {
+    /// 復号済み／先読み済みで、まだ読み出されていないバイトを保持していれば `true`。
+    fn has_buffered_read_data(&self) -> bool;
+}
+
+impl BufferedReadState for super::tcp::TcpStream {
+    /// 生 TCP は内部退避バッファを持たない（全て `POLLIN` で通知される）。
+    #[inline]
+    fn has_buffered_read_data(&self) -> bool {
+        false
+    }
+}
+
+// ====================
 // 非同期ファイル I/O（monoio::fs 互換）
 // ====================
 

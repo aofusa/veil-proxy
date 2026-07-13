@@ -81,6 +81,15 @@ pub struct SimpleTlsServerStream {
     drained_buffer: Vec<u8>,
 }
 
+impl crate::runtime::io::BufferedReadState for SimpleTlsServerStream {
+    /// ユーザ空間 rustls が復号済みで未消費の平文（ドレインバッファ残量）を保持していれば
+    /// `true`。F-116: HTTP/2 多重化メインループの可読待機前チェックに使う。
+    #[inline]
+    fn has_buffered_read_data(&self) -> bool {
+        !self.drained_buffer.is_empty()
+    }
+}
+
 impl SimpleTlsServerStream {
     pub fn get_ref(&self) -> &TcpStream {
         &self.inner

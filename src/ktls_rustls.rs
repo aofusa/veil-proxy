@@ -72,6 +72,16 @@ pub struct KtlsServerStream {
     drained_buffer: Vec<u8>,
 }
 
+impl crate::runtime::io::BufferedReadState for KtlsServerStream {
+    /// kTLS 受信オフロード済み（`KtlsFull`）ではカーネルが復号するため内部退避を持たず
+    /// `false`。それ以外（rustls / kTLS 送信のみ）は復号済みドレインバッファの残量を返す。
+    /// F-116: HTTP/2 多重化メインループの可読待機前チェックに使う。
+    #[inline]
+    fn has_buffered_read_data(&self) -> bool {
+        !self.is_ktls_recv_enabled() && !self.drained_buffer.is_empty()
+    }
+}
+
 impl KtlsServerStream {
     /// 基盤となる TCP ストリームへの参照を取得
     pub fn get_ref(&self) -> &TcpStream {
