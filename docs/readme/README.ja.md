@@ -3467,10 +3467,10 @@ recv/send/accept/timer Future をランダムに Drop する `runtime_cancellati
   （`CONFIG_GLOB` で対象を絞り込み可。gRPC over H3 は k6 非対応のためフェイルセーフで `NA`）。HTTP/3 は
   QUIC 対応 h2load（`docker build -t local/h2load-h3:latest tools/perf/h2load-http3`。未ビルド時は
   スキップ）、gRPC/WebSocket は `moul/grpcbin` / `jmalloc/echo-server` を上流に `grafana/k6` で計測する。
-  結果は [docs/perf](../perf/)、機能単位・HTTP/3・gRPC・WebSocket の
-  分析は [docs/perf/protocol_extended_results.md](../perf/protocol_extended_results.md) を参照
+  結果のサマリと生データ（TSV）は
+  [docs/perf/README.md](../perf/README.md) / [docs/perf/results_raw.tsv](../perf/results_raw.tsv) を参照
   （TLS 終端が支配的コストで平文 L4 は最大 2.2 倍、L7 機能ロジックはノイズ範囲内・全構成 Non-2xx=0）。
-  最新結果（2026-07-13、[docs/perf/perf_f115_stage2_b43.md](../perf/perf_f115_stage2_b43.md)）:
+  最新結果（2026-07-13、同 README）:
   HTTP/1.1 3298 req/s（nginx 比 1.4 倍）/ HTTP/2 2704 req/s（nginx 比 1.1 倍）/
   **HTTP/3 853 req/s（F-115 recvmmsg/sendmmsg バッチング + B-43 StreamBlocked 修正で 2 倍化。
   HTTP/2 比 32%、残差はユーザ空間 QUIC の per-request CPU コスト）** / gRPC 中継 1475 req/s

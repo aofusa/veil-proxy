@@ -4,7 +4,7 @@
 
 ## 目的
 
-nginx 超えに向けたボトルネック調査（`docs/perf/history.md` §4）で、
+nginx 超えに向けたボトルネック調査（`docs/perf/README.md` 計測履歴 §4）で、
 Veil の **HTTP/2 静的配信スループットが nginx の約 71%** と最大のギャップであることを確認した。
 その一因が HTTP/2 送信経路の **per-frame での二重アロケーション + 二重コピー** である。
 
@@ -49,7 +49,7 @@ runtime の `AsyncWriteRentExt::write_all<T: IoBuf>` は所有バッファを取
 
 nginx 比: HTTP/2 は 75% → **84%** に改善。HTTP/2 応答ボディは改修後も sha256 一致
 （バイト同一）、h2load 90,000 リクエスト全 2xx、h2spec 相当のフレーミング健全性を確認。
-詳細は `docs/perf/history.md` §4。
+詳細は `docs/perf/README.md`（計測履歴）。
 
 ## 残件
 

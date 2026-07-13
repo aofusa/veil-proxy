@@ -38,7 +38,7 @@ F-114 の網羅計測で新設した `h3_proxy` 構成（HTTP/3 で受け、HTTP
 
 ## 関連
 
-- 起点計測: `docs/perf/perf_f114_coverage_regression.md`（F-114/F-115）。
+- 起点計測: `docs/perf/README.md`（F-114/F-115。計測履歴参照）。
 - 近縁: [B-39](B-39-http3-grpc-proxy-502.md)（HTTP/3 gRPC 502）、
   [F-32](../features/F-32-http2-http3-streaming-body.md)（HTTP/3 アクターモデル・バックプレッシャ）。
 </content>

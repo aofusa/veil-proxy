@@ -3575,7 +3575,7 @@ pub async fn run_http3_server_async(
         // `sleep(timeout_duration)` は io_uring タイマー SQE を arm→cancel する。加えて Docker
         // veth（カーネル GSO/GRO オフロード非対応 = 1 データグラム 1 recvmsg）では **syscall 自体**
         // が per-datagram で律速する（HTTP/3 は CPU 余地を残して syscall 往復律速なことを perf で
-        // 実測: docs/perf/perf_f114_coverage_regression.md）。
+        // 実測: docs/perf/README.md）。
         // 第1段で select/タイマー往復は drain バッチ全体で 1 回に償却済み。第2段では recvmmsg(2)
         // で **1 syscall = 最大 MMSG_RECV_BATCH データグラム**（異なるフローも同時に）掻き出し、
         // syscall 往復も償却する。最初の 1 通は従来通り select 経由（await でブロック、通知/

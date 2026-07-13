@@ -3433,11 +3433,11 @@ HTTP/3 is failsafe-skipped (`NA`) as k6 lacks a native client.
 The HTTP/3 client needs a QUIC-enabled h2load (`docker build -t local/h2load-h3:latest
 tools/perf/h2load-http3`; http3 is skipped if absent); gRPC/WebSocket use `grafana/k6`
 against `moul/grpcbin` / `jmalloc/echo-server` upstreams. Full data and a summary are in
-[**docs/perf**](docs/perf/); the per-feature analysis and HTTP/3/gRPC/WebSocket results are in
-[docs/perf/protocol_extended_results.md](docs/perf/protocol_extended_results.md)
+[**docs/perf**](docs/perf/); the summary and raw TSV are in
+[docs/perf/README.md](docs/perf/README.md) / [docs/perf/results_raw.tsv](docs/perf/results_raw.tsv)
 (TLS termination is the dominant cost — plaintext L4 is up to 2.2× faster — while L7 feature
 logic stays within noise, all configs Non-2xx=0).
-Latest results (2026-07-13, [docs/perf/perf_f115_stage2_b43.md](docs/perf/perf_f115_stage2_b43.md)):
+Latest results (2026-07-13, [docs/perf/README.md](docs/perf/README.md)):
 HTTP/1.1 3298 req/s (nginx ×1.4) / HTTP/2 2704 req/s (nginx ×1.1) / **HTTP/3 853 req/s
 (doubled by F-115 recvmmsg/sendmmsg batching + the B-43 StreamBlocked fix — 32% of HTTP/2;
 the remaining gap is the userspace-QUIC per-request CPU cost)** / gRPC relay 1475 req/s

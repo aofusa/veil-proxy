@@ -3,7 +3,7 @@
 ## 出典
 
 初回の Veil vs nginx 計測（コンテナ環境で wrk (HTTP/1.1) が
-全て Non-2xx、musl 版はファイル配信されず）。要約は `docs/perf/history.md` §2 を参照。
+全て Non-2xx、musl 版はファイル配信されず）。要約は `docs/perf/README.md`（計測履歴）を参照。
 
 ## 事象（再現手順）
 

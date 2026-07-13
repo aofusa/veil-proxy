@@ -17,7 +17,7 @@
 | `analyze_results.sh` | 反復生データ（`results_raw.tsv`）を **median±stdev** に集計し Markdown を出力 |
 | `configs/*.toml` | 生成済みバリアント（`gen_configs.sh` で再生成可能） |
 | `nginx/nginx.conf` | 比較対象 nginx の設定（`access_log off` で公平化） |
-| `results/` | 計測結果（`results_raw.tsv` / `results_summary.md` / `logs/` は `.gitignore` 対象） |
+| `results/` | 計測結果（`results_raw.tsv` / `results_summary.md` / `logs/` は `.gitignore` 対象）。公開する生データは [docs/perf/results_raw.tsv](../../docs/perf/results_raw.tsv) へコピーしてコミットする（サマリは [docs/perf/README.md](../../docs/perf/README.md)） |
 
 計測に必要な静的アセットは **`docker/assets/`** を参照します（このディレクトリには複製しません）。
 
@@ -137,7 +137,7 @@ http3 / grpc / websocket は専用クライアントで計測します（`run_pe
 - **websocket**: `grafana/k6` の WebSocket クライアント（[k6/websocket.js](k6/websocket.js)）が
   `/.ws` でフレームを往復し、上流 `jmalloc/echo-server` がエコー。
 
-計測結果とボトルネック分析は [docs/perf/protocol_extended_results.md](../../docs/perf/protocol_extended_results.md)
+計測結果とボトルネック分析は [docs/perf/README.md](../../docs/perf/README.md)
 を参照（要約: **TLS 終端が支配的コスト**で L4 平文は最大 2.2 倍、L7 機能ロジックのオーバーヘッドは
 ノイズ範囲内・全構成 Non-2xx=0、逆プロキシのみバックエンドホップで −15%）。
 
@@ -166,7 +166,8 @@ http3 / grpc / websocket は専用クライアントで計測します（`run_pe
 > `CONFIG_GLOB` 環境変数で対象を絞り込めます（例: `CONFIG_GLOB='h3_*' bash tools/perf/run_perf.sh`
 > で HTTP/3 構成のみ、`CONFIG_GLOB='grpc_*'` で gRPC 構成のみ）。既定は全構成。
 
-主な着目点（[docs/perf/results_summary.md](../../docs/perf/results_summary.md) 参照、2026-07-07 v0.5.0 計測）:
+主な着目点（[docs/perf/README.md](../../docs/perf/README.md) 参照。以下は 2026-07-07 v0.5.0 の
+全直交表計測時の知見。最新の代表値・HTTP/3 2 倍化の内訳は同 README を参照）:
 
 - **最良構成 `h2_1_ktls_0_lb_kernel_ofc_1`**（HTTP/2 有効・kTLS 無効・kernel LB・OFC 有効）で
   **veil は nginx を上回る**（HTTP/1.1 glibc 3124 / musl 3178 vs nginx 2309 = +35〜38%、

@@ -128,7 +128,7 @@ cargo test --bins --test integration_tests --features "full"
 | `docs/artifacts/` | AI 成果物・一時ファイル |
 | `docs/backlog/` | 機能・バグチケット（親は `backlog.md`） |
 | `docker/` | コンテナイメージ（glibc/musl）・共有アセット（`assets/`：ssl/www/seccomp/Landlock） |
-| `tools/` | Docker ベースの外形検証ツール。`tools/perf/` は glibc/musl/nginx 比較のパフォーマンス計測ハーネス（`gen_configs.sh` で 2⁴=16 直交表 + full features 機能ショーケース `feat_*` 構成 + **全プロトコル×全機能マトリクス（F-114: `h2_1_proxy_*`/`h3_file_*`/`h3_proxy*`/`grpc_h2_*`/`grpc_h3*`）** を生成 /`run_perf.sh` で反復計測（`CONFIG_GLOB` で scoped 化・gRPC over H3 はクライアント非対応で NA フェイルセーフ） /`analyze_results.sh` で median±stdev 集計。HTTP/1.1=wrk・HTTP/2=h2load・HTTP/3=QUIC 対応 h2load(`h2load-http3/`)・gRPC/WebSocket=grafana k6(`k6/`) の各クライアントで計測）、`tools/container_security/` はファジング・カオス・h2spec・セキュリティスキャンのオーケストレータ（`run.sh`）。計測結果レポートは `docs/perf/`（過去レポートの要約は `docs/perf/history.md`、詳細な生ログは
+| `tools/` | Docker ベースの外形検証ツール。`tools/perf/` は glibc/musl/nginx 比較のパフォーマンス計測ハーネス（`gen_configs.sh` で 2⁴=16 直交表 + full features 機能ショーケース `feat_*` 構成 + **全プロトコル×全機能マトリクス（F-114: `h2_1_proxy_*`/`h3_file_*`/`h3_proxy*`/`grpc_h2_*`/`grpc_h3*`）** を生成 /`run_perf.sh` で反復計測（`CONFIG_GLOB` で scoped 化・gRPC over H3 はクライアント非対応で NA フェイルセーフ） /`analyze_results.sh` で median±stdev 集計。HTTP/1.1=wrk・HTTP/2=h2load・HTTP/3=QUIC 対応 h2load(`h2load-http3/`)・gRPC/WebSocket=grafana k6(`k6/`) の各クライアントで計測）、`tools/container_security/` はファジング・カオス・h2spec・セキュリティスキャンのオーケストレータ（`run.sh`）。計測結果は `docs/perf/`（サマリ + 計測履歴は `docs/perf/README.md`、生データは `docs/perf/results_raw.tsv` = tools/perf 出力のコピー。詳細な生ログは
 `docs/artifacts/perf_reports/` に git 管理外で保持） |
 
 細かいモジュール対応は `src/lib.rs` の `mod` と README の構成を参照。
