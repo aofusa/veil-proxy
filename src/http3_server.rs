@@ -3346,6 +3346,11 @@ pub async fn run_http3_server_async(
     // 64KB は単一 recvmsg の最大値。GRO 集約時はこのバッファに複数データグラムが詰めて返る。
     let mut recv_buf = vec![0u8; 65536];
 
+    // F-115 第2段: recvmmsg 用スクラッチをワーカーごとに loop 外で 1 回だけ確保し再利用する。
+    // mmsghdr/iovec/sockaddr/cmsg の固定配列（Box 固定アドレス）を保持し、drain のたびに
+    // カーネルが書く長さフィールドのみリセットするため per-sweep のヒープ確保が発生しない。
+    let mut mmsg_scratch = crate::udp::socket::MmsgRecvScratch::new();
+
     // メインループ: パケット受信とディスパッチ
     loop {
         // シャットダウンチェック
@@ -3488,136 +3493,69 @@ pub async fn run_http3_server_async(
 
         // パケットを受信した場合のみ処理。
         //
-        // F-115: 1 回の readiness あたり **複数データグラムを非ブロッキングで drain** する。
+        // F-115 第2段: 1 回の readiness あたり **複数データグラムを recvmmsg で一括 drain** する。
         // select_biased! は毎イテレーション負け arm（notify.wait と sleep）を生成し、特に
-        // `sleep(timeout_duration)` は io_uring タイマー SQE を arm→cancel する。1 データグラム
-        // ごとにこの select + タイマー往復を払うと、Docker veth（カーネル GSO/GRO オフロード
-        // 非対応 = 1 データグラム 1 recvmsg）では per-datagram のオーバーヘッドが
-        // ワーカーあたりの実効スループット上限を律速する（HTTP/3 は CPU 余地を残して
-        // syscall 往復律速なことを perf で実測: docs/perf/perf_f114_coverage_regression.md）。
-        // 最初の 1 通は select 経由（await でブロック）、以降は `recv_with_gro_sync` で
-        // EAGAIN まで（上限 H3_RECV_DRAIN_MAX）非ブロッキングに掻き出し、select/タイマーの
-        // 往復を drain バッチ全体で 1 回に償却する。追加確保なし（recv_buf 再利用・既存の
-        // per-segment ゼロコピー処理をそのまま流用）。
+        // `sleep(timeout_duration)` は io_uring タイマー SQE を arm→cancel する。加えて Docker
+        // veth（カーネル GSO/GRO オフロード非対応 = 1 データグラム 1 recvmsg）では **syscall 自体**
+        // が per-datagram で律速する（HTTP/3 は CPU 余地を残して syscall 往復律速なことを perf で
+        // 実測: docs/perf/perf_f114_coverage_regression.md）。
+        // 第1段で select/タイマー往復は drain バッチ全体で 1 回に償却済み。第2段では recvmmsg(2)
+        // で **1 syscall = 最大 MMSG_RECV_BATCH データグラム**（異なるフローも同時に）掻き出し、
+        // syscall 往復も償却する。最初の 1 通は従来通り select 経由（await でブロック、通知/
+        // タイムアウト arm との多重化は不変）で受け、以降は recv_mmsg_sync を EAGAIN まで
+        // （総 drain 上限 H3_RECV_DRAIN_MAX）反復する。セグメント処理は `process_datagram_segments`
+        // へ抽出し、両経路で共用する（挙動不変・追加確保なし）。
         if let Some(first_gro) = gro_result {
             let mut conns = connections.borrow_mut();
-            let mut cur = Some(first_gro);
+
+            // 最初の 1 通（select 経由で recv_buf に受信済み）を処理。
+            let first_total = first_gro.bytes_received;
+            process_datagram_segments(
+                &mut conns,
+                &mut recv_buf[..first_total],
+                first_gro.from,
+                first_gro.gro_segment_size,
+                &rng,
+                &quic_config,
+                local_addr,
+                &notify,
+                &backend_spawner,
+            )?;
+
+            // 以降は recvmmsg で 1 syscall = 複数データグラムを非ブロッキングに掻き出す。
+            // EAGAIN（WouldBlock）やその他エラーは drain 終了とみなし、通常の select ループへ
+            // 戻って送信・タイムアウト・notify を処理する（送信を過度に遅延させない上限つき）。
             let mut drained = 0usize;
-            while let Some(gro) = cur.take() {
-                let from = gro.from;
-                let total = gro.bytes_received;
-                // GRO セグメントサイズ。None/0（GRO 非適用 = 単発データグラム）の場合は
-                // 受信全体を 1 セグメントとして扱う。
-                let seg_size = gro
-                    .gro_segment_size
-                    .map(|s| s as usize)
-                    .filter(|&s| s > 0)
-                    .unwrap_or(total);
-
-                // GRO で集約された各 QUIC データグラムを quiche に供給する。
-                // recv_buf のスライスを quiche::Header::from_slice と conn.recv に直接渡し、
-                // 中間 Vec への 2 回の to_vec コピーを完全に排除する（ゼロコピー受信）。
-                //
-                // F-45: GRO バッチはカーネルが**同一フロー**のデータグラムを集約したものなので、
-                // - 直前セグメントと同じ DCID なら新規接続判定（contains_key + Initial 検査）を
-                //   スキップし、per-segment のオーバーヘッドをルックアップ 1 回に抑える。
-                // quiche の `recv` API は 1 データグラム単位のため呼び出し自体は per-segment。
-                // （`connections` の borrow は drain バッチ全体で 1 回だけ取得している。）
-                let mut prev_cid: Option<ConnectionId<'static>> = None;
-                let mut offset = 0;
-                while offset < total {
-                    let start = offset;
-                    let end = (offset + seg_size).min(total);
-                    offset = end;
-
-                    // パケットヘッダーを解析（同一バッファスライスを後段の conn.recv にも渡す）
-                    let hdr = match quiche::Header::from_slice(
-                        &mut recv_buf[start..end],
-                        quiche::MAX_CONN_ID_LEN,
-                    ) {
+            while drained < H3_RECV_DRAIN_MAX {
+                let n = match socket.recv_mmsg_sync(&mut mmsg_scratch) {
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                for i in 0..n {
+                    // meta は借用を持たない値のみ返すため、続けて buf_mut を可変借用できる。
+                    let (len, from, gro) = match mmsg_scratch.meta(i) {
                         Ok(v) => v,
                         Err(e) => {
-                            warn!("[HTTP/3] Invalid packet header: {}", e);
-                            // このセグメントのみスキップ。送信処理はループ後に実行。
+                            warn!("[HTTP/3] recvmmsg meta error: {}", e);
                             continue;
                         }
                     };
-
-                    // コネクションを検索または作成（直前セグメントと同一 DCID なら判定スキップ）
-                    let conn_id = match &prev_cid {
-                        Some(prev) if *prev == hdr.dcid => prev.clone(),
-                        _ => {
-                            if !conns.contains_key(&hdr.dcid) {
-                                if hdr.ty != quiche::Type::Initial {
-                                    debug!("[HTTP/3] Non-initial packet for unknown connection");
-                                    continue;
-                                }
-
-                                // 新規コネクション
-                                let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
-                                rng.fill(&mut scid)
-                                    .map_err(|_| io::Error::other("RNG error"))?;
-                                let scid = ConnectionId::from_ref(&scid).into_owned();
-
-                                let mut config_ref = quic_config.borrow_mut();
-                                let conn =
-                                    quiche::accept(&scid, None, local_addr, from, &mut config_ref)
-                                        .map_err(|e| io::Error::other(e.to_string()))?;
-
-                                debug!("[HTTP/3] New connection from {}", from);
-
-                                // 最新のルーティング設定を取得
-                                let handler = Http3Handler::new(
-                                    conn,
-                                    from,
-                                    notify.clone(),
-                                    backend_spawner.clone(),
-                                );
-                                conns.insert(scid.clone(), handler);
-
-                                prev_cid = Some(scid.clone());
-                                scid
-                            } else {
-                                let cid = hdr.dcid.into_owned();
-                                prev_cid = Some(cid.clone());
-                                cid
-                            }
-                        }
-                    };
-
-                    // パケットを処理（同一スライスをそのまま渡す。追加コピーなし）
-                    if let Some(handler) = conns.get_mut(&conn_id) {
-                        let recv_info = quiche::RecvInfo {
-                            from,
-                            to: local_addr,
-                        };
-
-                        match handler.conn.recv(&mut recv_buf[start..end], recv_info) {
-                            Ok(_) => {}
-                            Err(e) => {
-                                warn!("[HTTP/3] recv error: {}", e);
-                                // エラー時も送信処理は続行
-                            }
-                        }
-
-                        // B-34: クライアントがハンドシェイク直後に HTTP/3 フレームを送るため、
-                        // 次の recv やメインループ待ちの前に h3 レイヤを確立する（StreamLimit 回避）。
-                        if handler.conn.is_established() {
-                            if let Err(e) = handler.init_h3() {
-                                warn!("[HTTP/3] eager init_h3 error: {}", e);
-                            }
-                        }
-                    }
+                    process_datagram_segments(
+                        &mut conns,
+                        &mut mmsg_scratch.buf_mut(i)[..len],
+                        from,
+                        gro,
+                        &rng,
+                        &quic_config,
+                        local_addr,
+                        &notify,
+                        &backend_spawner,
+                    )?;
                 }
-
-                // 追加データグラムを非ブロッキングで drain（上限 H3_RECV_DRAIN_MAX）。
-                // EAGAIN/エラー時は drain を終了し、通常の select ループへ戻って送信・
-                // タイムアウト・notify を処理する（送信を過度に遅延させない上限つき）。
-                if drained < H3_RECV_DRAIN_MAX {
-                    if let Ok(next) = socket.recv_with_gro_sync(&mut recv_buf) {
-                        drained += 1;
-                        cur = Some(next);
-                    }
+                drained += n;
+                // n < MMSG_RECV_BATCH はソケットが空になった合図（次回は EAGAIN 確実）。
+                if n < crate::udp::socket::MMSG_RECV_BATCH {
+                    break;
                 }
             }
             drop(conns);
@@ -3688,10 +3626,133 @@ pub async fn run_http3_server_async(
     }
 }
 
+/// F-115 第2段: 受信した 1 データグラム（GRO 集約含む）を quiche へ供給する。
+///
+/// select 経由の最初の 1 通と recvmmsg 経由の各通で共用する（挙動を両経路で一致させるため
+/// クロージャではなく専用 fn へ抽出）。`data` は受信済みデータグラム全体（長さ = 受信バイト数）で、
+/// GRO 適用時は `gro_segment_size` 境界で複数 QUIC パケットへ分割される。
+///
+/// ゼロコピー: `data` のスライスを `quiche::Header::from_slice` と `conn.recv` に直接渡し、
+/// 中間 Vec へのコピーを一切行わない。
+///
+/// F-45: GRO バッチはカーネルが**同一フロー**のデータグラムを集約したものなので、直前セグメントと
+/// 同じ DCID なら新規接続判定（contains_key + Initial 検査）をスキップし、per-segment の
+/// オーバーヘッドをルックアップ 1 回に抑える（`prev_cid` 最適化）。quiche の `recv` API は
+/// 1 データグラム単位のため呼び出し自体は per-segment。
+#[cfg(target_os = "linux")]
+fn process_datagram_segments(
+    conns: &mut HashMap<ConnectionId<'static>, Http3Handler>,
+    data: &mut [u8],
+    from: SocketAddr,
+    gro_segment_size: Option<u16>,
+    rng: &SystemRandom,
+    quic_config: &Rc<RefCell<quiche::Config>>,
+    local_addr: SocketAddr,
+    notify: &crate::http3_stream::H3Notify,
+    backend_spawner: &crate::http3_stream::BackendSpawner,
+) -> io::Result<()> {
+    let total = data.len();
+    // GRO セグメントサイズ。None/0（GRO 非適用 = 単発データグラム）の場合は
+    // 受信全体を 1 セグメントとして扱う。
+    let seg_size = gro_segment_size
+        .map(|s| s as usize)
+        .filter(|&s| s > 0)
+        .unwrap_or(total);
+
+    let mut prev_cid: Option<ConnectionId<'static>> = None;
+    let mut offset = 0;
+    while offset < total {
+        let start = offset;
+        let end = (offset + seg_size).min(total);
+        offset = end;
+
+        // パケットヘッダーを解析（同一バッファスライスを後段の conn.recv にも渡す）
+        let hdr = match quiche::Header::from_slice(&mut data[start..end], quiche::MAX_CONN_ID_LEN) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("[HTTP/3] Invalid packet header: {}", e);
+                // このセグメントのみスキップ。送信処理は呼び出し側ループ後に実行。
+                continue;
+            }
+        };
+
+        // コネクションを検索または作成（直前セグメントと同一 DCID なら判定スキップ）
+        let conn_id = match &prev_cid {
+            Some(prev) if *prev == hdr.dcid => prev.clone(),
+            _ => {
+                if !conns.contains_key(&hdr.dcid) {
+                    if hdr.ty != quiche::Type::Initial {
+                        debug!("[HTTP/3] Non-initial packet for unknown connection");
+                        continue;
+                    }
+
+                    // 新規コネクション
+                    let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
+                    rng.fill(&mut scid)
+                        .map_err(|_| io::Error::other("RNG error"))?;
+                    let scid = ConnectionId::from_ref(&scid).into_owned();
+
+                    let mut config_ref = quic_config.borrow_mut();
+                    let conn = quiche::accept(&scid, None, local_addr, from, &mut config_ref)
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+
+                    debug!("[HTTP/3] New connection from {}", from);
+
+                    let handler =
+                        Http3Handler::new(conn, from, notify.clone(), backend_spawner.clone());
+                    conns.insert(scid.clone(), handler);
+
+                    prev_cid = Some(scid.clone());
+                    scid
+                } else {
+                    let cid = hdr.dcid.into_owned();
+                    prev_cid = Some(cid.clone());
+                    cid
+                }
+            }
+        };
+
+        // パケットを処理（同一スライスをそのまま渡す。追加コピーなし）
+        if let Some(handler) = conns.get_mut(&conn_id) {
+            let recv_info = quiche::RecvInfo {
+                from,
+                to: local_addr,
+            };
+
+            match handler.conn.recv(&mut data[start..end], recv_info) {
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("[HTTP/3] recv error: {}", e);
+                    // エラー時も送信処理は続行
+                }
+            }
+
+            // B-34: クライアントがハンドシェイク直後に HTTP/3 フレームを送るため、
+            // 次の recv やメインループ待ちの前に h3 レイヤを確立する（StreamLimit 回避）。
+            if handler.conn.is_established() {
+                if let Err(e) = handler.init_h3() {
+                    warn!("[HTTP/3] eager init_h3 error: {}", e);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// 保留中のパケットを全コネクションに対して送信
 ///
 /// この関数はメインループで常に呼び出され、タイムアウト時でも
 /// ACKやレスポンスパケットを送信します。
+///
+/// F-115 第2段: 従来は per-connection で GSO バッチを組み、**接続ごとに 1 回以上の
+/// sendmsg/sendto** を発行していた（-c100 では 1 sweep 最大 ~100 syscall）。本実装は
+/// sweep 中に送らずに送信要求を蓄積し（連結バッファ `batch` 内のパケット範囲を指す
+/// `sends` インデックス列）、`MMSG_SEND_BATCH` 件到達 or `batch` バイト上限超過時点で
+/// `sendmmsg` により **1 syscall = 複数メッセージ** で送出する。既存の flush 条件
+/// （宛先変更 / セグメントサイズ不一致 / MAX_GSO_BATCH_BYTES / MAX_GSO_SEGMENTS /
+/// 最終ショートセグメント）は「エントリ確定」に読み替える（即送信しない）。同一接続の
+/// パケット順序は quiche の send 順（= batch 追記順）のまま保たれる（挙動不変）。
 // clippy::await_holding_refcell_ref 許容理由: `connections`（Rc<RefCell<HashMap>>）を
 // 借用するのは本 H3 メインループタスクのみ。バックエンドタスクは Rc チャネル + Notify
 // 経由で通信し RefCell に触れない（F-32 のアクターモデル）ため、await 中に他タスクが
@@ -3704,31 +3765,37 @@ async fn send_pending_packets(
 ) {
     let mut conns = connections.borrow_mut();
 
-    // 送信用スクラッチ（send_buf 1350B + GSO 連結バッファ + パケット境界）を
+    // 送信用スクラッチ（send_buf + 連結バッファ + パケット境界 + 送信エントリ + sendmmsg 配列）を
     // スレッドローカルから払い出して再利用する。thread-per-core のためロック不要。
     // take/replace により .await をまたいでスレッドローカルの borrow を保持しないので、
     // 再入（このループ内での多重呼び出し）でも安全。これにより送信のたびに発生していた
-    // 1350B + バッチの malloc を排除する。
+    // malloc を排除する。
     let mut scratch = take_h3_send_scratch();
     let H3SendScratch {
         send_buf,
         batch,
         offsets,
+        sends,
+        mmsg,
     } = &mut scratch;
+    batch.clear();
+    offsets.clear();
+    sends.clear();
+    let gso_enabled = socket.gso_enabled();
     let mut closed = Vec::new();
 
-    for (cid, handler) in conns.iter_mut() {
-        batch.clear();
-        offsets.clear();
-        let mut seg_size = 0usize;
-        let mut dest: Option<SocketAddr> = None;
+    // sweep 全体で継続する連結バッファのカーソル。「現在構築中のエントリ」は
+    // [cur_batch_start, batch.len()) / offsets[cur_offsets_start..] が表す。
+    let mut cur_batch_start = 0usize;
+    let mut cur_offsets_start = 0usize;
+    let mut seg_size = 0usize;
+    let mut cur_dest: Option<SocketAddr> = None;
 
+    for (cid, handler) in conns.iter_mut() {
         // F-60: GSO セグメントサイズの自動調整。quiche の PMTU 探索結果
         // （`max_send_udp_payload_size`: ハンドシェイク中 1200 → 検証後は
         // 設定上限・経路 MTU の小さい方へ成長）に per-connection で追従し、
         // 下限 MIN_UDP_SEND_PAYLOAD / 上限 send_buf 長でクランプする。
-        // これによりハンドシェイク初期は RFC 準拠の 1200B、検証後は経路が許す
-        // 最大セグメントで GSO バッチが構成される。
         let max_payload = handler
             .conn
             .max_send_udp_payload_size()
@@ -3751,45 +3818,87 @@ async fn send_pending_packets(
                 }
             };
 
-            // 宛先が変わった or セグメントサイズが変わった（均一バッチの境界）場合は
-            // 現在のバッチを先に flush する（GSO は最終セグメント以外を均一サイズ要求）。
-            // B-18: 合計バイトが sendmsg の UDP ペイロード上限を超える場合も先に flush する
-            // （超過すると EMSGSIZE でバッチ全体が破棄される）。
-            let dest_changed = dest.is_some_and(|d| d != send_info.to);
+            // 現在構築中エントリの状態（sweep 全体で継続する batch/offsets の末尾範囲）。
+            let cur_seg_count = offsets.len() - cur_offsets_start;
+            let cur_bytes = batch.len() - cur_batch_start;
+
+            // 宛先変更 / セグメントサイズ不一致 / GSO バッチ上限（B-18: EMSGSIZE 回避）で
+            // 現在エントリを確定する。**即送信せず** sends へ蓄積する（F-115 第2段）。
+            let dest_changed = cur_dest.is_some_and(|d| d != send_info.to);
             if dest_changed
-                || gso_batch_must_flush_before_append(offsets.len(), batch.len(), write, seg_size)
+                || gso_batch_must_flush_before_append(cur_seg_count, cur_bytes, write, seg_size)
             {
-                if let Some(d) = dest {
-                    flush_gso_batch(socket, batch.as_slice(), offsets.as_slice(), d).await;
-                }
-                batch.clear();
-                offsets.clear();
-                seg_size = 0;
+                finalize_send_entry(
+                    sends,
+                    batch.len(),
+                    offsets.as_slice(),
+                    gso_enabled,
+                    &mut cur_batch_start,
+                    &mut cur_offsets_start,
+                    &mut seg_size,
+                    &mut cur_dest,
+                );
             }
 
-            if offsets.is_empty() {
+            if offsets.len() == cur_offsets_start {
+                // 現在エントリの先頭セグメント。
                 seg_size = write;
             }
             let start = batch.len();
             batch.extend_from_slice(&send_buf[..write]);
             offsets.push((start, write));
-            dest = Some(send_info.to);
+            cur_dest = Some(send_info.to);
 
-            // バッチ満杯（GSO セグメント上限）or 最終セグメント（< seg_size）なら flush。
-            if offsets.len() >= MAX_GSO_SEGMENTS || write < seg_size {
-                flush_gso_batch(socket, batch.as_slice(), offsets.as_slice(), send_info.to).await;
-                batch.clear();
-                offsets.clear();
-                seg_size = 0;
-                dest = None;
+            // GSO セグメント上限 or 最終ショートセグメント（< seg_size）→ エントリ確定。
+            if (offsets.len() - cur_offsets_start) >= MAX_GSO_SEGMENTS || write < seg_size {
+                finalize_send_entry(
+                    sends,
+                    batch.len(),
+                    offsets.as_slice(),
+                    gso_enabled,
+                    &mut cur_batch_start,
+                    &mut cur_offsets_start,
+                    &mut seg_size,
+                    &mut cur_dest,
+                );
+                // ここでは現在エントリが空なので、蓄積が閾値を超えたら sendmmsg で送出して
+                // batch/offsets/sends をクリアし継続する（RefCell 借用中の await は既存の
+                // 単一借用者モデルに準拠）。
+                if sends.len() >= crate::udp::socket::MMSG_SEND_BATCH
+                    || batch.len() >= H3_SEND_ACCUM_MAX_BYTES
+                {
+                    send_mmsg_flush(socket, batch.as_slice(), sends.as_slice(), mmsg).await;
+                    batch.clear();
+                    offsets.clear();
+                    sends.clear();
+                    cur_batch_start = 0;
+                    cur_offsets_start = 0;
+                }
             }
         }
 
-        // 残りのバッチを flush
-        if !offsets.is_empty() {
-            if let Some(d) = dest {
-                flush_gso_batch(socket, batch.as_slice(), offsets.as_slice(), d).await;
-            }
+        // 接続末尾: 構築中エントリを確定（送信は閾値到達時 or sweep 末尾）。
+        finalize_send_entry(
+            sends,
+            batch.len(),
+            offsets.as_slice(),
+            gso_enabled,
+            &mut cur_batch_start,
+            &mut cur_offsets_start,
+            &mut seg_size,
+            &mut cur_dest,
+        );
+        // 接続境界でも蓄積が閾値を超えていれば途中送出する（現在エントリは確定済みで空）。
+        // 多接続（各接続が少数パケット）でも蓄積メモリを ~256KB / 16 エントリ以内に抑える。
+        if sends.len() >= crate::udp::socket::MMSG_SEND_BATCH
+            || batch.len() >= H3_SEND_ACCUM_MAX_BYTES
+        {
+            send_mmsg_flush(socket, batch.as_slice(), sends.as_slice(), mmsg).await;
+            batch.clear();
+            offsets.clear();
+            sends.clear();
+            cur_batch_start = 0;
+            cur_offsets_start = 0;
         }
 
         if handler.conn.is_closed() {
@@ -3798,12 +3907,128 @@ async fn send_pending_packets(
         }
     }
 
+    // sweep 末尾: 残りをまとめて送出（現在エントリは上のループで確定済み）。
+    if !sends.is_empty() {
+        send_mmsg_flush(socket, batch.as_slice(), sends.as_slice(), mmsg).await;
+    }
+
     for cid in closed {
         conns.remove(&cid);
     }
 
     // スクラッチをスレッドローカルへ返却し、次回呼び出しで再利用する（malloc 排除）。
     put_h3_send_scratch(scratch);
+}
+
+/// F-115 第2段: 送信エントリ 1 件（`batch` 内の範囲）を表す。`sends` へ蓄積され、
+/// sweep 末尾/閾値到達で sendmmsg によりまとめて送出される。ライフタイムを持たないインデックス
+/// 表現なので、`H3SendScratch` に載せてスイープ間で再利用できる（per-sweep 確保なし）。
+#[cfg(target_os = "linux")]
+struct SendRaw {
+    /// `batch` 内の開始オフセット。
+    batch_start: usize,
+    /// 連結長（= GSO バッチ全体 or 単一パケット長）。
+    len: usize,
+    /// GSO セグメントサイズ。
+    seg_size: u16,
+    /// パケット数（1 なら sendmmsg 側で UDP_SEGMENT cmsg を付けない）。
+    segments: u16,
+    /// 送信先。
+    dest: SocketAddr,
+}
+
+/// 構築中のエントリ（`offsets[cur_offsets_start..]` / `batch[cur_batch_start..batch_len]`）を
+/// 確定し `sends` へ積む。**送信はしない**（sendmmsg は呼び出し側でまとめて行う）。
+///
+/// GSO 無効時は multi-segment エントリをパケット境界ごとの単一パケットエントリへ展開する
+/// （cmsg 無しの純 sendmmsg。設計判断: F-115 第2段 §2「GSO 無効フォールバック」）。確定後は
+/// カーソル（cur_batch_start / cur_offsets_start）を末尾へ進め、seg_size / cur_dest をリセットする。
+#[cfg(target_os = "linux")]
+fn finalize_send_entry(
+    sends: &mut Vec<SendRaw>,
+    batch_len: usize,
+    offsets: &[(usize, usize)],
+    gso_enabled: bool,
+    cur_batch_start: &mut usize,
+    cur_offsets_start: &mut usize,
+    seg_size: &mut usize,
+    cur_dest: &mut Option<SocketAddr>,
+) {
+    let seg_count = offsets.len() - *cur_offsets_start;
+    if seg_count == 0 {
+        // 構築中エントリが空。カーソルだけ現在位置へ揃えてリセット。
+        *cur_batch_start = batch_len;
+        *seg_size = 0;
+        *cur_dest = None;
+        return;
+    }
+    // セグメントがある以上 cur_dest は Some。念のため None は安全側でリセットして戻る。
+    let Some(dest) = *cur_dest else {
+        *cur_batch_start = batch_len;
+        *cur_offsets_start = offsets.len();
+        *seg_size = 0;
+        return;
+    };
+
+    if gso_enabled || seg_count == 1 {
+        // GSO 有効 or 単一パケット: エントリ 1 件（segments>1 は sendmmsg 側で UDP_SEGMENT cmsg）。
+        sends.push(SendRaw {
+            batch_start: *cur_batch_start,
+            len: batch_len - *cur_batch_start,
+            seg_size: *seg_size as u16,
+            segments: seg_count as u16,
+            dest,
+        });
+    } else {
+        // GSO 無効: パケット境界ごとに 1 エントリへ展開（cmsg なしでも per-packet syscall は削減）。
+        for &(off, len) in &offsets[*cur_offsets_start..] {
+            sends.push(SendRaw {
+                batch_start: off,
+                len,
+                seg_size: len as u16,
+                segments: 1,
+                dest,
+            });
+        }
+    }
+
+    *cur_batch_start = batch_len;
+    *cur_offsets_start = offsets.len();
+    *seg_size = 0;
+    *cur_dest = None;
+}
+
+/// 蓄積した送信エントリ `sends`（`batch` 内の範囲を指す）を sendmmsg でまとめて送出する。
+///
+/// `MMSG_SEND_BATCH` ごとにチャンク分割し、各チャンクをスタック配列（`from_fn`: ヒープ確保なし）で
+/// 組み立てて `send_mmsg_async` へ渡す。`sends` は GSO 無効展開により `MMSG_SEND_BATCH` を超え得る
+/// ため、ここでチャンク化して漏れなく送出する。
+#[cfg(target_os = "linux")]
+async fn send_mmsg_flush(
+    socket: &Rc<QuicUdpSocket>,
+    batch: &[u8],
+    sends: &[SendRaw],
+    scratch: &mut crate::udp::socket::MmsgSendScratch,
+) {
+    let mut i = 0;
+    while i < sends.len() {
+        let k = (sends.len() - i).min(crate::udp::socket::MMSG_SEND_BATCH);
+        // k..MMSG_SEND_BATCH は末尾要素の複製で埋め、`[..k]` で捨てる（複製分は送出されない）。
+        let chunk: [crate::udp::socket::SendmmsgEntry; crate::udp::socket::MMSG_SEND_BATCH] =
+            std::array::from_fn(|j| {
+                let s = &sends[i + j.min(k - 1)];
+                crate::udp::socket::SendmmsgEntry {
+                    data: &batch[s.batch_start..s.batch_start + s.len],
+                    seg_size: s.seg_size,
+                    segments: s.segments,
+                    dest: s.dest,
+                }
+            });
+        if let Err(e) = socket.send_mmsg_async(&chunk[..k], scratch).await {
+            warn!("[HTTP/3] sendmmsg flush error: {}", e);
+        }
+        i += k;
+    }
 }
 
 /// GSO セグメント上限（UDP GSO の一般的な最大セグメント数）
@@ -3830,6 +4055,12 @@ const MAX_UDP_SEND_PAYLOAD: usize = 65507;
 /// 従来は MAX_GSO_SEGMENTS(64) × 1350B = 86.4KB まで蓄積し得たため上限超過が起こり得た。
 const MAX_GSO_BATCH_BYTES: usize = 65507;
 
+/// F-115 第2段: 1 sweep の sendmmsg 蓄積バッファ（`batch`）の途中送出しきい値。
+/// エントリ確定（現在エントリが空）のたびにこの値を超えていれば sendmmsg で送出して
+/// batch/offsets/sends をクリアし、蓄積バッファの肥大とレイテンシ増を防ぐ。256KB は
+/// 多接続時でも 1 回の sendmmsg（最大 16 メッセージ）に見合う実務的な上限（設計書 §2）。
+const H3_SEND_ACCUM_MAX_BYTES: usize = 256 * 1024;
+
 /// 次パケット（`write` バイト）をバッチへ追加する**前に** flush が必要か判定する。
 ///
 /// - 均一サイズ要求: バッチ内の既存セグメントサイズ `seg_size` と異なるサイズは同居不可
@@ -3853,10 +4084,14 @@ struct H3SendScratch {
     /// quiche の単一パケット書き出し用バッファ（F-60: 上限クランプ長で確保し、
     /// per-connection の動的セグメントサイズでスライスして使用）
     send_buf: Vec<u8>,
-    /// GSO バッチ連結バッファ
+    /// GSO バッチ連結バッファ（F-115 第2段: sweep 全体で追記し続ける）
     batch: Vec<u8>,
-    /// バッチ内のパケット境界 (offset, len)
+    /// バッチ内のパケット境界 (offset, len)（sweep 全体で保持）
     offsets: Vec<(usize, usize)>,
+    /// F-115 第2段: 確定済み送信エントリ列（`batch` 内範囲のインデックス表現）。
+    sends: Vec<SendRaw>,
+    /// F-115 第2段: sendmmsg 用スクラッチ（Box 固定配列を再利用）。
+    mmsg: crate::udp::socket::MmsgSendScratch,
 }
 
 thread_local! {
@@ -3874,6 +4109,8 @@ fn take_h3_send_scratch() -> H3SendScratch {
             send_buf: vec![0u8; MAX_UDP_SEND_PAYLOAD],
             batch: Vec::new(),
             offsets: Vec::new(),
+            sends: Vec::new(),
+            mmsg: crate::udp::socket::MmsgSendScratch::new(),
         })
 }
 
@@ -3881,49 +4118,12 @@ fn take_h3_send_scratch() -> H3SendScratch {
 fn put_h3_send_scratch(mut scratch: H3SendScratch) {
     scratch.batch.clear();
     scratch.offsets.clear();
+    scratch.sends.clear();
     // バッチが極端に肥大化した場合（>1MB）は確保を手放す。
     if scratch.batch.capacity() > (1 << 20) {
         scratch.batch.shrink_to(64 * 1500);
     }
     H3_SEND_SCRATCH.with(|s| *s.borrow_mut() = Some(scratch));
-}
-
-/// 連結済みバッチ（`offsets` でパケット境界を持つ）を送出する。
-///
-/// 単一パケットは通常送信、複数パケットは `send_gso_combined_async`（GSO 無効時は
-/// offsets 境界通りの個別送信へ安全にフォールバック）で 1 回の sendmsg(UDP_SEGMENT) に
-/// まとめて送る。`batch` は呼び出し元で既に連結済みのため、パケット参照 Vec や
-/// 再結合 Vec を新規確保せず `batch` をそのまま渡す（完全ゼロコピー）。
-async fn flush_gso_batch(
-    socket: &Rc<QuicUdpSocket>,
-    batch: &[u8],
-    offsets: &[(usize, usize)],
-    dest: SocketAddr,
-) {
-    match offsets {
-        [] => {}
-        [(start, len)] => {
-            // 単一パケット: ゼロアロケーション送信（to_vec 不要）。
-            // batch スライスを直接 sendto するため、パケットごとのヒープ確保を排除。
-            if let Err(e) = socket
-                .send_to_slice_async(&batch[*start..*start + *len], dest)
-                .await
-            {
-                warn!("[HTTP/3] send_to error: {}", e);
-            }
-        }
-        _ => {
-            // 複数パケット: batch は既に連続領域として構築済みなので、そのまま渡す
-            // （中間 Vec<&[u8]> 確保 + 再結合 Vec<u8> 確保・コピーの二重無駄を排除）。
-            let seg_size = offsets[0].1 as u16;
-            if let Err(e) = socket
-                .send_gso_combined_async(batch, offsets, seg_size, dest)
-                .await
-            {
-                warn!("[HTTP/3] GSO batch send error: {}", e);
-            }
-        }
-    }
 }
 
 /// HTTP/3 サーバーを起動（同期ラッパー）
