@@ -487,7 +487,11 @@ fn is_connection_closed_error(e: &std::io::Error) -> bool {
 #[cfg(feature = "http2")]
 async fn handle_http2_connection<S>(tls_stream: S, client_ip: &str)
 where
-    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
+    S: crate::runtime::io::AsyncReadRent
+        + crate::runtime::io::AsyncWriteRentExt
+        + AsRawFd
+        + crate::runtime::io::BufferedReadState
+        + Unpin,
 {
     use http2::Http2Connection;
 
@@ -519,7 +523,13 @@ where
     debug!("[HTTP/2] Connection closed from {}", client_ip);
 }
 
-/// HTTP/2 メインループ（カスタムリクエスト処理）
+/// HTTP/2 メインループ（F-116: ストリーム多重化アクターモデル）
+///
+/// コネクション（`Http2Connection`）は本メインループが専有駆動し、リクエストごとの
+/// ルーティング・セキュリティ・WASM・バックエンド往復は per-stream タスク
+/// （[`h2_request_task`]）へ切り出す。タスクは conn に一切触れず、レスポンスは
+/// [`H2RespMsg`] チャネルで、リクエストボディは [`Bytes`] チャネルでメインループと通信する。
+/// これにより遅いバックエンドのストリームが他ストリームの応答送出をブロックしない。
 #[cfg(feature = "http2")]
 async fn handle_http2_requests<S>(
     conn: &mut http2::Http2Connection<S>,
@@ -527,168 +537,2496 @@ async fn handle_http2_requests<S>(
     connection_metric: &mut ActiveConnectionMetric,
 ) -> Result<(), http2::Http2Error>
 where
-    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
+    S: crate::runtime::io::AsyncReadRent
+        + crate::runtime::io::AsyncWriteRentExt
+        + AsRawFd
+        + crate::runtime::io::BufferedReadState
+        + Unpin,
 {
+    use http2::frame::Frame;
     use http2::Http2Error;
-    use std::io;
+
+    let notify = crate::stream_channel::Notify::new();
+    let spawner = h2_task_spawner();
+    let mut streams: std::collections::HashMap<u32, H2ActiveStream> =
+        std::collections::HashMap::new();
 
     loop {
-        // フレームを読み込み
-        let frame = match conn.read_frame().await {
-            Ok(f) => f,
-            Err(Http2Error::ConnectionClosed) => break,
-            Err(Http2Error::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => continue,
-            Err(Http2Error::Io(ref e)) if is_connection_closed_error(e) => {
-                // クライアントが接続を閉じた場合に発生するエラー
-                // kTLS使用時はEIO (os error 5) が発生することがある
-                //
-                // 注意: このエラーはクライアントが正常に接続を閉じた場合の動作であり、
-                // サーバー側の問題ではありません。リクエスト処理は正常に完了しています。
-                // HTTP/2では、クライアントがレスポンス受信後にGOAWAYを送信せずに
-                // 接続を閉じることがあり、その場合に次のフレーム読み込みでこのエラーが発生します。
-                debug!(
-                    "[HTTP/2] Connection closed by client (expected behavior): {} (client: {})",
-                    e, client_ip
-                );
-                break;
-            }
-            Err(e) => {
-                // その他のエラー時は GOAWAY を送信
-                let _ = conn
-                    .send_goaway(e.error_code(), e.to_string().as_bytes())
-                    .await;
-                return Err(e);
-            }
-        };
+        // 1. 各ストリームのレスポンスを送出（HPACK エンコードは送信順にここでのみ行う）。
+        drive_h2_streams(conn, &mut streams).await?;
+        // 2. 1 イテレーション 1 回のフラッシュ（複数ストリームの write_buf 合流を 1 回で送出）。
+        conn.flush_write_buf().await?;
 
-        // フレームを処理
-        match conn.process_frame(frame).await {
-            Ok(Some(req)) if req.body_pending => {
-                // F-32: ヘッダー完了・ボディ継続。ストリーミング適格なら HEADERS 受信時点で
-                // バックエンド接続を開始し DATA フレームを逐次転送する。非適格なら何もせず、
-                // DATA は従来どおり request_body に蓄積され END_STREAM で下の分岐が処理する。
-                //
-                // ストリーミング経路は深い async ネスト（接続→ヘッダ送信→ボディ転送→応答リレー）
-                // を持つため、`Box::pin` でヒープへ退避して呼び出し側 future のサイズ肥大化
-                // （spawn 時のスタック上構築でのオーバーフロー）を防ぐ。確保は 1 リクエストに 1 回。
-                Box::pin(handle_h2_request_streaming(
-                    conn,
-                    req.stream_id,
-                    client_ip,
-                    connection_metric,
-                ))
-                .await;
-            }
-            Ok(Some(req)) => {
-                // リクエストが完了（END_STREAM 受信済み）- HTTP/1.1 と同様のロジックで処理
-                process_completed_h2_request(conn, req.stream_id, client_ip, connection_metric)
-                    .await;
-            }
-            Ok(None) => {
-                // フレーム処理完了、次のフレームへ
-            }
-            Err(e) => {
-                if e.should_goaway() {
+        // 3. 読み込みバッファに溜まった完全フレームを I/O なしで連続処理。
+        loop {
+            let frame = match conn.try_read_frame_buffered() {
+                Ok(Some(f)) => f,
+                Ok(None) => break,
+                Err(e) => {
                     let _ = conn
                         .send_goaway(e.error_code(), e.to_string().as_bytes())
                         .await;
                     return Err(e);
-                } else if let Some(id) = e.rst_stream_id() {
-                    let _ = conn.send_rst_stream(id, e.error_code()).await;
+                }
+            };
+
+            // リクエスト方向ストリーミング中のストリームへの DATA はタスクの req チャネルへ流す。
+            if let Frame::Data {
+                stream_id,
+                end_stream,
+                data,
+            } = frame
+            {
+                let is_streaming = streams
+                    .get(&stream_id)
+                    .map(|s| s.req_streaming && !s.req_eof)
+                    .unwrap_or(false);
+                if is_streaming {
+                    let data_len = data.len();
+                    // フロー制御・状態遷移・WINDOW_UPDATE（recv ウィンドウ補充を含む）。
+                    if let Err(e) = conn
+                        .recv_data_for_streaming(stream_id, end_stream, data_len)
+                        .await
+                    {
+                        if e.should_goaway() {
+                            let _ = conn
+                                .send_goaway(e.error_code(), e.to_string().as_bytes())
+                                .await;
+                            return Err(e);
+                        } else if let Some(id) = e.rst_stream_id() {
+                            let _ = conn.send_rst_stream(id, e.error_code()).await;
+                        }
+                        streams.remove(&stream_id);
+                        continue;
+                    }
+                    if let Some(st) = streams.get_mut(&stream_id) {
+                        st.req_bytes_total = st.req_bytes_total.saturating_add(data_len as u64);
+                        if st.max_request_body > 0 && st.req_bytes_total > st.max_request_body {
+                            // ボディ上限超過: RST_STREAM で打ち切りタスクを停止（チャネル drop）。
+                            conn.flush_write_buf().await?;
+                            let _ = conn
+                                .send_rst_stream(stream_id, http2::Http2ErrorCode::EnhanceYourCalm)
+                                .await;
+                            streams.remove(&stream_id);
+                            continue;
+                        }
+                        if data_len > 0 {
+                            // ゼロコピー: 受信フレームの所有バッファをそのまま Bytes 化して転送。
+                            st.req_pending.push_back(Bytes::from(data));
+                        }
+                        if end_stream {
+                            st.req_eof = true;
+                        }
+                    }
+                    continue;
+                }
+
+                // 通常（バッファ）経路の DATA は process_frame が request_body へ蓄積する。
+                match conn
+                    .process_frame(Frame::Data {
+                        stream_id,
+                        end_stream,
+                        data,
+                    })
+                    .await
+                {
+                    Ok(Some(req)) => {
+                        h2_spawn_for_request(
+                            conn,
+                            req.stream_id,
+                            req.body_pending,
+                            &mut streams,
+                            &notify,
+                            &spawner,
+                            client_ip,
+                            connection_metric,
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        if e.should_goaway() {
+                            let _ = conn
+                                .send_goaway(e.error_code(), e.to_string().as_bytes())
+                                .await;
+                            return Err(e);
+                        } else if let Some(id) = e.rst_stream_id() {
+                            let _ = conn.send_rst_stream(id, e.error_code()).await;
+                            streams.remove(&id);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // RST_STREAM 受信ストリームは streams から除去（チャネル drop でタスク停止）。
+            let rst_target = if let Frame::RstStream { stream_id, .. } = &frame {
+                Some(*stream_id)
+            } else {
+                None
+            };
+            // トレイラー（END_STREAM 付き HEADERS）でリクエスト方向ストリーミングを終端する場合、
+            // req チャネルへ EOF を伝える（DATA+END_STREAM 以外の終端。旧経路の trailer 処理相当）。
+            let trailer_eof = match &frame {
+                Frame::Headers {
+                    stream_id,
+                    end_stream: true,
+                    ..
+                }
+                | Frame::Continuation { stream_id, .. }
+                    if streams
+                        .get(stream_id)
+                        .map(|s| s.req_streaming && !s.req_eof)
+                        .unwrap_or(false) =>
+                {
+                    Some(*stream_id)
+                }
+                _ => None,
+            };
+
+            match conn.process_frame(frame).await {
+                Ok(Some(req)) => {
+                    h2_spawn_for_request(
+                        conn,
+                        req.stream_id,
+                        req.body_pending,
+                        &mut streams,
+                        &notify,
+                        &spawner,
+                        client_ip,
+                        connection_metric,
+                    );
+                }
+                Ok(None) => {
+                    if let Some(id) = trailer_eof {
+                        if let Some(st) = streams.get_mut(&id) {
+                            st.req_eof = true;
+                        }
+                    }
+                    if let Some(id) = rst_target {
+                        streams.remove(&id);
+                    }
+                }
+                Err(e) => {
+                    if e.should_goaway() {
+                        let _ = conn
+                            .send_goaway(e.error_code(), e.to_string().as_bytes())
+                            .await;
+                        return Err(e);
+                    } else if let Some(id) = e.rst_stream_id() {
+                        let _ = conn.send_rst_stream(id, e.error_code()).await;
+                        streams.remove(&id);
+                    }
                 }
             }
         }
 
-        // クリーンアップ
         conn.cleanup_closed();
+
+        // 4. 待機判定: 完全フレーム無し && 先読みバッファ空 && drive で書くものが無い とき。
+        if !conn.has_pending_input() && !h2_streams_have_work(&streams) {
+            let readable = h2_select_readable_or_notify(conn.raw_fd(), &notify).await;
+            if readable {
+                match conn.fill_read_buf().await {
+                    Ok(_) => {}
+                    Err(Http2Error::ConnectionClosed) => break,
+                    Err(Http2Error::Io(ref e)) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(Http2Error::Io(ref e)) if is_connection_closed_error(e) => {
+                        debug!(
+                            "[HTTP/2] Connection closed by client (expected): {} (client: {})",
+                            e, client_ip
+                        );
+                        break;
+                    }
+                    Err(e) => {
+                        let _ = conn
+                            .send_goaway(e.error_code(), e.to_string().as_bytes())
+                            .await;
+                        return Err(e);
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
 }
 
-/// HTTP/2 の完了済みリクエスト（END_STREAM 受信済み）を処理し、アクセスログを出力する。
+/// per-stream タスクからメインループへ送るレスポンス断片（F-116）。
 ///
-/// 通常のバッファ経路（END_STREAM の `ProcessedRequest`）と、リクエストストリーミング中に
-/// 完了した他ストリームの遅延処理の両方から呼ばれる。
+/// ボディ終端は **送信端（[`crate::stream_channel::Sender`]）の drop** で表す
+/// （メインループは EOF を検出して END_STREAM を送出する）。HPACK エンコードは
+/// 接続状態を進めるため、[`H2RespMsg::Head`]/[`H2RespMsg::Trailers`] のエンコードは
+/// **メインループが送信順に**行う（タスクは名前/値ペアのまま渡す）。
 #[cfg(feature = "http2")]
-async fn process_completed_h2_request<S>(
+enum H2RespMsg {
+    /// レスポンス head（ステータス + ヘッダ）。最初に 1 回だけ送られる。
+    Head {
+        status: u16,
+        headers: Vec<(Vec<u8>, Vec<u8>)>,
+        end_stream: bool,
+    },
+    /// レスポンスボディ断片（ゼロコピー）。
+    Body(Bytes),
+    /// gRPC トレイラー等（END_STREAM 付き HEADERS）。gRPC 経路でのみ生成・送出する。
+    #[cfg(feature = "grpc")]
+    Trailers(Vec<(Vec<u8>, Vec<u8>)>),
+    /// head 送出後のバックエンドエラー等でストリームをリセットする（RST_STREAM エラーコード）。
+    Reset(u32),
+}
+
+/// per-stream リクエストタスクへ conn 非依存で引き渡すリクエスト情報（F-116）。
+#[cfg(feature = "http2")]
+struct H2RequestCtx {
+    method: Vec<u8>,
+    path: Vec<u8>,
+    /// `:authority`（無ければ host ヘッダー、いずれも無ければ空）。
+    authority: Vec<u8>,
+    /// 疑似ヘッダー `:method`/`:path`/`:authority` を除いたヘッダー（`:scheme` 等の残余含む）。
+    headers: Vec<crate::http2::hpack::HeaderField>,
+    /// 完了済みリクエストボディ（バッファ経路。ストリーミング経路では空）。
+    body: Bytes,
+    client_ip: Box<str>,
+    start: Instant,
+}
+
+/// メインループ側のストリーム状態（F-116）。
+#[cfg(feature = "http2")]
+struct H2ActiveStream {
+    /// レスポンス断片の受信端。
+    resp_rx: crate::stream_channel::Receiver<H2RespMsg>,
+    /// リクエストボディ断片の送信端（ストリーミング経路のみ。EOF で None）。
+    req_tx: Option<crate::stream_channel::Sender<Bytes>>,
+    /// req チャネルへ未投入のボディ（満杯時の溢れ）。
+    req_pending: std::collections::VecDeque<Bytes>,
+    /// リクエスト方向ストリーミング対象か。
+    req_streaming: bool,
+    /// クライアント END_STREAM 受信済み。
+    req_eof: bool,
+    /// 受信済みリクエストボディ累計（`max_request_body_size` 強制用）。
+    req_bytes_total: u64,
+    /// リクエストボディ上限（0 = 無制限）。
+    max_request_body: u64,
+    /// HEADERS 送出済み。
+    head_sent: bool,
+    /// END_STREAM 送出済み（レスポンス完了）。
+    end_sent: bool,
+    /// フロー制御ウィンドウ待ちの未送信ボディ残 `(buf, 送信済みオフセット)`。
+    pending_body: Option<(Bytes, usize)>,
+}
+
+/// per-stream リクエストタスクのスポーナ型（F-46: 型付きタスクプールで Box 確保を回避）。
+#[cfg(feature = "http2")]
+type H2TaskSpawner = std::rc::Rc<
+    dyn Fn(
+        H2RequestCtx,
+        Option<crate::stream_channel::Receiver<Bytes>>,
+        crate::stream_channel::Sender<H2RespMsg>,
+        crate::stream_channel::Notify,
+    ),
+>;
+
+/// HTTP/2 ワーカースレッド用の per-stream タスクスポーナを作成する。
+#[cfg(feature = "http2")]
+fn h2_task_spawner() -> H2TaskSpawner {
+    let pool = crate::runtime::TaskPool::new();
+    std::rc::Rc::new(move |ctx, req_rx, resp_tx, notify| {
+        pool.spawn(h2_request_task(ctx, req_rx, resp_tx, notify));
+    })
+}
+
+/// `write_buf` がこのサイズを超えたら drive 中に明示フラッシュする（F-116）。
+#[cfg(feature = "http2")]
+const WRITE_BUF_FLUSH_THRESHOLD: usize = 128 * 1024;
+/// レスポンスチャネル容量（HTTP/3 と同水準）。
+#[cfg(feature = "http2")]
+const H2_RESP_CHANNEL_CAP: usize = 4;
+/// リクエストボディチャネル容量。
+#[cfg(feature = "http2")]
+const H2_REQ_CHANNEL_CAP: usize = 4;
+
+/// HEADERS 完了時（`ProcessedRequest`）にストリームタスクを起動する（F-116）。
+///
+/// `body_pending=false` は END_STREAM 済み（バッファ経路）。`body_pending=true` は
+/// ボディ継続で、ストリーミング適格ならリクエストボディチャネル付きで起動する。
+#[cfg(feature = "http2")]
+#[allow(clippy::too_many_arguments)]
+fn h2_spawn_for_request<S>(
     conn: &mut http2::Http2Connection<S>,
     stream_id: u32,
+    body_pending: bool,
+    streams: &mut std::collections::HashMap<u32, H2ActiveStream>,
+    notify: &crate::stream_channel::Notify,
+    spawner: &H2TaskSpawner,
     client_ip: &str,
     connection_metric: &mut ActiveConnectionMetric,
 ) where
     S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
 {
-    // ストリーム情報を取得
-    let (method, path, authority, body_len) = {
-        if let Some(stream) = conn.get_stream(stream_id) {
-            let method = stream
-                .method()
-                .map(|m| m.to_vec())
-                .unwrap_or_else(|| b"GET".to_vec());
-            let path = stream
-                .path()
-                .map(|p| p.to_vec())
-                .unwrap_or_else(|| b"/".to_vec());
-            // :authority を取得、見つからない場合は host ヘッダーにフォールバック
-            let authority = stream
-                .authority()
-                .map(|a| a.to_vec())
-                .or_else(|| {
-                    stream
-                        .request_headers
-                        .iter()
-                        .find(|h| h.name.eq_ignore_ascii_case(b"host"))
-                        .map(|h| h.value.clone())
-                })
-                .unwrap_or_default();
-            let body_len = stream.request_body.len();
-            (method, path, authority, body_len)
-        } else {
-            return;
-        }
+    // 既にタスク起動済みのストリーム（body_pending の二重通知）はスキップ。
+    if streams.contains_key(&stream_id) {
+        return;
+    }
+
+    let streaming = body_pending && h2_body_pending_streaming_eligible(conn, stream_id, client_ip);
+    if body_pending && !streaming {
+        // 非適格: 何もしない。DATA は process_frame が request_body へ蓄積し、
+        // END_STREAM 受信時に body_pending=false の ProcessedRequest で本関数が再度呼ばれる。
+        return;
+    }
+
+    let max_request_body = if streaming {
+        h2_route_max_request_body(conn, stream_id, client_ip)
+    } else {
+        0
     };
 
-    // メトリクス: ホスト名を取得
+    let parts = match conn.take_request_parts(stream_id) {
+        Some(p) => p,
+        None => return,
+    };
+
+    // authority（host フォールバック）を解決。
+    let authority = parts.authority.clone().unwrap_or_else(|| {
+        parts
+            .headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case(b"host"))
+            .map(|h| h.value.clone())
+            .unwrap_or_default()
+    });
+
     if let Ok(host_str) = std::str::from_utf8(&authority) {
         connection_metric.set_host(host_str.to_string());
     } else {
         connection_metric.set_host("unknown".to_string());
     }
 
-    let start_instant = Instant::now();
-
-    let result = handle_http2_single_request(
-        conn, stream_id, &method, &path, &authority, body_len, client_ip,
-    )
-    .await;
-
-    // User-Agent を取得
-    let user_agent: Box<[u8]> = if let Some(stream) = conn.get_stream(stream_id) {
-        stream
-            .request_headers
-            .iter()
-            .find(|h| h.name.eq_ignore_ascii_case(b"user-agent"))
-            .map(|h| Box::from(h.value.clone()))
-            .unwrap_or_else(|| Box::from([] as [u8; 0]))
-    } else {
-        Box::from([] as [u8; 0])
+    let ctx = H2RequestCtx {
+        method: parts.method,
+        path: parts.path,
+        authority,
+        headers: parts.headers,
+        body: parts.body.freeze(),
+        client_ip: Box::from(client_ip),
+        start: Instant::now(),
     };
 
-    let (status, resp_size) = result.unwrap_or((500, 0));
-    log_access(
-        &method,
-        &authority,
-        &path,
-        &user_agent,
-        body_len as u64,
-        status,
-        resp_size,
-        start_instant,
-        client_ip,
-        "",
+    let (resp_tx, resp_rx) = crate::stream_channel::channel::<H2RespMsg>(H2_RESP_CHANNEL_CAP);
+    let (req_tx, req_rx) = if streaming {
+        let (tx, rx) = crate::stream_channel::channel::<Bytes>(H2_REQ_CHANNEL_CAP);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
+    spawner(ctx, req_rx, resp_tx, notify.clone());
+
+    streams.insert(
+        stream_id,
+        H2ActiveStream {
+            resp_rx,
+            req_tx,
+            req_pending: std::collections::VecDeque::new(),
+            req_streaming: streaming,
+            req_eof: false,
+            req_bytes_total: 0,
+            max_request_body,
+            head_sent: false,
+            end_sent: false,
+            pending_body: None,
+        },
     );
 }
+
+/// drive で送出待ち（resp_rx にメッセージあり / pending_body / req 転送待ち）があるか。
+#[cfg(feature = "http2")]
+fn h2_streams_have_work(streams: &std::collections::HashMap<u32, H2ActiveStream>) -> bool {
+    streams.values().any(|s| {
+        s.pending_body.is_some()
+            || !s.req_pending.is_empty()
+            || (s.req_streaming && s.req_eof && s.req_tx.is_some())
+    })
+}
+
+/// 2 つの Future（ソケット可読 / notify）を自前 `poll_fn` で race する（futures 依存を増やさない）。
+///
+/// 戻り値 `true` = 可読、`false` = notify。両 Future ともキャンセル安全
+/// （`wait_readable_fd` は POLL_ADD、`notify.wait` はフラグ待ち）。
+#[cfg(feature = "http2")]
+async fn h2_select_readable_or_notify(fd: RawFd, notify: &crate::stream_channel::Notify) -> bool {
+    use std::future::poll_fn;
+    use std::future::Future;
+    use std::task::Poll;
+
+    let readable = crate::runtime::tcp::wait_readable_fd(fd);
+    let wait = notify.wait();
+    let mut readable = std::pin::pin!(readable);
+    let mut wait = std::pin::pin!(wait);
+    poll_fn(move |cx| {
+        if readable.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(true);
+        }
+        if wait.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(false);
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+/// 全ストリームのレスポンスを 1 回駆動する（F-116）。
+///
+/// 各ストリームで pending_body 再送 → resp_rx を try_recv して
+/// HEADERS/DATA/Trailers/Reset を送出。ウィンドウ枯渇時は pending_body へ保留。
+/// チャネル EOF（sender drop）+ 未完了なら空 END_STREAM DATA でクリーンに閉じる。
+#[cfg(feature = "http2")]
+async fn drive_h2_streams<S>(
+    conn: &mut http2::Http2Connection<S>,
+    streams: &mut std::collections::HashMap<u32, H2ActiveStream>,
+) -> Result<(), http2::Http2Error>
+where
+    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
+{
+    use crate::stream_channel::{TryRecv, TrySendError};
+
+    let mut done: Vec<u32> = Vec::new();
+    let ids: Vec<u32> = streams.keys().copied().collect();
+
+    for sid in ids {
+        // --- リクエストボディを req チャネルへ流す（バックプレッシャ考慮） ---
+        {
+            let st = streams.get_mut(&sid).unwrap();
+            while st.req_tx.is_some() {
+                let item = match st.req_pending.pop_front() {
+                    Some(it) => it,
+                    None => break,
+                };
+                match st.req_tx.as_ref().unwrap().try_send(item) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(it)) => {
+                        st.req_pending.push_front(it);
+                        break;
+                    }
+                    Err(TrySendError::Closed(_)) => {
+                        st.req_pending.clear();
+                        st.req_tx = None;
+                    }
+                }
+            }
+            if st.req_tx.is_some() && st.req_pending.is_empty() && st.req_eof {
+                // クライアント END_STREAM 済み・全量投入済み → sender drop で EOF 伝播。
+                st.req_tx = None;
+            }
+        }
+
+        // --- pending_body（ウィンドウ待ち残）を先に再送 ---
+        {
+            let st = streams.get_mut(&sid).unwrap();
+            if let Some((buf, off)) = st.pending_body.take() {
+                let queued = conn.queue_data_frames(sid, &buf[off..], false)?;
+                let new_off = off + queued;
+                if conn.pending_write_len() > WRITE_BUF_FLUSH_THRESHOLD {
+                    conn.flush_write_buf().await?;
+                }
+                if new_off < buf.len() {
+                    // まだウィンドウ不足 → 再保留してこのストリームは以降スキップ。
+                    st.pending_body = Some((buf, new_off));
+                    continue;
+                }
+            }
+        }
+
+        // --- resp_rx を送出可能な限りドレイン ---
+        loop {
+            let msg = {
+                let st = streams.get_mut(&sid).unwrap();
+                match st.resp_rx.try_recv() {
+                    TryRecv::Item(m) => m,
+                    TryRecv::Empty => break,
+                    TryRecv::Closed => {
+                        // EOF: head 送出済みで END_STREAM 未送なら空 DATA で閉じる。
+                        if st.head_sent && !st.end_sent {
+                            conn.queue_data_frames(sid, &[], true)?;
+                            st.end_sent = true;
+                        }
+                        done.push(sid);
+                        break;
+                    }
+                }
+            };
+
+            match msg {
+                H2RespMsg::Head {
+                    status,
+                    headers,
+                    end_stream,
+                } => {
+                    let hv: Vec<(&[u8], &[u8])> = headers
+                        .iter()
+                        .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                        .collect();
+                    conn.send_headers_buffered_end(sid, status, &hv, end_stream)
+                        .await?;
+                    let st = streams.get_mut(&sid).unwrap();
+                    st.head_sent = true;
+                    if end_stream {
+                        st.end_sent = true;
+                    }
+                }
+                H2RespMsg::Body(bytes) => {
+                    let queued = conn.queue_data_frames(sid, &bytes, false)?;
+                    if conn.pending_write_len() > WRITE_BUF_FLUSH_THRESHOLD {
+                        conn.flush_write_buf().await?;
+                    }
+                    if queued < bytes.len() {
+                        let st = streams.get_mut(&sid).unwrap();
+                        st.pending_body = Some((bytes, queued));
+                        break;
+                    }
+                }
+                #[cfg(feature = "grpc")]
+                H2RespMsg::Trailers(_trailers) => {
+                    // トレイラー送出は write_all を伴うため先に合流バッファをフラッシュ。
+                    conn.flush_write_buf().await?;
+                    {
+                        let mut grpc_status = 0u32;
+                        let mut grpc_message: Option<String> = None;
+                        for (name, value) in &_trailers {
+                            if name == b"grpc-status" {
+                                if let Ok(s) = std::str::from_utf8(value) {
+                                    grpc_status = s.trim().parse().unwrap_or(0);
+                                }
+                            } else if name == b"grpc-message" {
+                                grpc_message =
+                                    std::str::from_utf8(value).ok().map(|s| s.to_string());
+                            }
+                        }
+                        let _ = conn
+                            .send_grpc_trailers(sid, grpc_status, grpc_message.as_deref())
+                            .await;
+                    }
+                    let st = streams.get_mut(&sid).unwrap();
+                    st.head_sent = true;
+                    st.end_sent = true;
+                }
+                H2RespMsg::Reset(code) => {
+                    conn.flush_write_buf().await?;
+                    let _ = conn
+                        .send_rst_stream(sid, http2::Http2ErrorCode::from_u32(code))
+                        .await;
+                    let st = streams.get_mut(&sid).unwrap();
+                    st.end_sent = true;
+                    done.push(sid);
+                    break;
+                }
+            }
+        }
+    }
+
+    for sid in done {
+        streams.remove(&sid);
+    }
+    Ok(())
+}
+
+/// リクエストがストリーミング適格か（F-32 の条件を厳密に踏襲）。
+///
+/// 条件: Proxy バックエンド + WASM モジュール非適用 + 非 gRPC + バッファリング非 Full +
+/// 上流 use_h2c 以外 + セキュリティ許可 + サーバー選択成功。conn は借用のみ（変更しない）。
+#[cfg(feature = "http2")]
+fn h2_body_pending_streaming_eligible<S>(
+    conn: &http2::Http2Connection<S>,
+    stream_id: u32,
+    client_ip: &str,
+) -> bool
+where
+    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
+{
+    let plan = h2_route_streaming_plan(conn, stream_id, client_ip);
+    plan.is_some()
+}
+
+/// ストリーミング適格時の最大リクエストボディサイズを取得する（0 = 無制限）。
+#[cfg(feature = "http2")]
+fn h2_route_max_request_body<S>(
+    conn: &http2::Http2Connection<S>,
+    stream_id: u32,
+    client_ip: &str,
+) -> u64
+where
+    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
+{
+    h2_route_streaming_plan(conn, stream_id, client_ip)
+        .map(|(_, max)| max)
+        .unwrap_or(0)
+}
+
+/// ストリーミング適格判定の共通ルーティング。適格なら `(use_tls, max_request_body)` を返す。
+#[cfg(feature = "http2")]
+fn h2_route_streaming_plan<S>(
+    conn: &http2::Http2Connection<S>,
+    stream_id: u32,
+    client_ip: &str,
+) -> Option<(bool, u64)>
+where
+    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
+{
+    let stream = conn.get_stream(stream_id)?;
+    let method = stream
+        .method()
+        .map(|m| m.to_vec())
+        .unwrap_or_else(|| b"GET".to_vec());
+    let path = stream
+        .path()
+        .map(|p| p.to_vec())
+        .unwrap_or_else(|| b"/".to_vec());
+    let authority = stream
+        .authority()
+        .map(|a| a.to_vec())
+        .or_else(|| {
+            stream
+                .request_headers
+                .iter()
+                .find(|h| h.name.eq_ignore_ascii_case(b"host"))
+                .map(|h| h.value.clone())
+        })
+        .unwrap_or_default();
+
+    let h2_headers_store: Vec<(Vec<u8>, Vec<u8>)> = stream
+        .request_headers
+        .iter()
+        .map(|h| (h.name.clone(), h.value.clone()))
+        .collect();
+    let headers_raw: Vec<(&[u8], &[u8])> = h2_headers_store
+        .iter()
+        .map(|(k, v)| (k.as_slice(), v.as_slice()))
+        .collect();
+
+    let config = CURRENT_CONFIG.load();
+    let query_start = path.iter().position(|&b| b == b'?');
+    let raw_query: &[u8] = query_start.map(|i| &path[i + 1..]).unwrap_or(b"");
+    let path_wo_query = query_start.map(|i| &path[..i]).unwrap_or(&path[..]);
+
+    let client_socket_addr = h2_client_socket_addr(client_ip);
+
+    let backend_result = find_backend_unified(
+        &authority,
+        path_wo_query,
+        &method,
+        &headers_raw,
+        raw_query,
+        &client_socket_addr,
+        config.route.as_slice(),
+        &config.upstream_groups,
+    )
+    .or_else(|| {
+        if !authority.is_empty() {
+            find_backend_unified(
+                b"",
+                path_wo_query,
+                &method,
+                &headers_raw,
+                raw_query,
+                &client_socket_addr,
+                config.route.as_slice(),
+                &config.upstream_groups,
+            )
+        } else {
+            None
+        }
+    });
+
+    let (_prefix, backend, _rc) = backend_result?;
+    let (upstream_group, security, buffering) = match &backend {
+        Backend::Proxy(ug, sec, _comp, buf, _cache, modules) => {
+            if modules.as_ref().is_some_and(|m| !m.is_empty()) {
+                return None;
+            }
+            (ug.clone(), sec.clone(), buf.clone())
+        }
+        _ => return None,
+    };
+
+    // gRPC はトレイラー処理のため専用経路（非ストリーミング）。
+    let is_grpc = h2_headers_store.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case(b"content-type")
+            && value
+                .get(..16)
+                .map(|p| p.eq_ignore_ascii_case(b"application/grpc"))
+                .unwrap_or(false)
+    });
+    if is_grpc {
+        return None;
+    }
+    if buffering.mode == crate::buffering::BufferingMode::Full {
+        return None;
+    }
+    if check_security(&security, client_ip, &method, 0, true) != SecurityCheckResult::Allowed {
+        return None;
+    }
+    let server = upstream_group.select(client_ip)?;
+    if server.target.use_h2c {
+        return None;
+    }
+    Some((server.target.use_tls, security.max_request_body_size as u64))
+}
+
+/// クライアント IP 文字列を `SocketAddr` に変換する（ルーティング入力）。
+#[cfg(feature = "http2")]
+fn h2_client_socket_addr(client_ip: &str) -> SocketAddr {
+    if let Ok(addr) = client_ip.parse::<SocketAddr>() {
+        addr
+    } else if let Ok(ip) = client_ip.parse::<std::net::IpAddr>() {
+        SocketAddr::new(ip, 80)
+    } else {
+        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 0)
+    }
+}
+
+/// per-stream リクエストタスク本体（F-116）。conn には一切触れない。
+#[cfg(feature = "http2")]
+async fn h2_request_task(
+    ctx: H2RequestCtx,
+    req_rx: Option<crate::stream_channel::Receiver<Bytes>>,
+    resp_tx: crate::stream_channel::Sender<H2RespMsg>,
+    notify: crate::stream_channel::Notify,
+) {
+    let user_agent: Vec<u8> = ctx
+        .headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case(b"user-agent"))
+        .map(|h| h.value.clone())
+        .unwrap_or_default();
+
+    let (status, resp_size, req_size) = if let Some(rx) = req_rx {
+        h2_serve_streaming(&ctx, &rx, &resp_tx, &notify).await
+    } else {
+        h2_serve_buffered(&ctx, &resp_tx, &notify).await
+    };
+
+    if status != 0 {
+        log_access(
+            &ctx.method,
+            &ctx.authority,
+            &ctx.path,
+            &user_agent,
+            req_size,
+            status,
+            resp_size,
+            ctx.start,
+            &ctx.client_ip,
+            "",
+        );
+    }
+    // resp_tx / req_rx はここで drop → メインループへ EOF 伝播。
+    notify.notify();
+}
+
+/// レスポンスチャネルへ送り、メインループへ通知する。receiver 切断時は `Err(())`。
+#[cfg(feature = "http2")]
+#[inline]
+async fn h2_send(
+    resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
+    notify: &crate::stream_channel::Notify,
+    msg: H2RespMsg,
+) -> Result<(), ()> {
+    let r = resp_tx.send(msg).await;
+    notify.notify();
+    r
+}
+
+/// サーバー/Alt-Svc 等の共通レスポンスヘッダを所有ベクタで構築する。
+#[cfg(feature = "http2")]
+fn h2_base_headers(add_alt_svc: bool) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut headers: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(4);
+    if let Some(ref g) = get_server_header_guard() {
+        let (n, v) = g.as_header();
+        headers.push((n.to_vec(), v.to_vec()));
+    }
+    if add_alt_svc {
+        if let Some(g) = get_alt_svc_guard() {
+            let (n, v) = g.as_header();
+            headers.push((n.to_vec(), v.to_vec()));
+        }
+    }
+    headers
+}
+
+/// 完結した（頭+本体一括の）レスポンスをメッセージ化して送る。戻り値 `(status, body_len)`。
+#[cfg(feature = "http2")]
+async fn h2_emit_full(
+    resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
+    notify: &crate::stream_channel::Notify,
+    status: u16,
+    headers: Vec<(Vec<u8>, Vec<u8>)>,
+    body: Vec<u8>,
+) -> (u16, u64) {
+    let len = body.len() as u64;
+    let empty = body.is_empty();
+    if h2_send(
+        resp_tx,
+        notify,
+        H2RespMsg::Head {
+            status,
+            headers,
+            end_stream: empty,
+        },
+    )
+    .await
+    .is_err()
+    {
+        return (status, len);
+    }
+    if !empty {
+        let _ = h2_send(resp_tx, notify, H2RespMsg::Body(Bytes::from(body))).await;
+    }
+    (status, len)
+}
+
+/// エラー応答（Server ヘッダ付き）をメッセージ化して送る。戻り値 `(status, body_len)`。
+#[cfg(feature = "http2")]
+async fn h2_emit_error(
+    resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
+    notify: &crate::stream_channel::Notify,
+    status: u16,
+    msg: &[u8],
+) -> (u16, u64) {
+    h2_emit_full(
+        resp_tx,
+        notify,
+        status,
+        h2_base_headers(false),
+        msg.to_vec(),
+    )
+    .await
+}
+
+/// バッファ経路（END_STREAM 済み）の 1 リクエストを処理してレスポンスを送出する（F-116）。
+///
+/// 戻り値 `(status, resp_size, req_size)`。`status == 0` はクライアント切断（ログ不要）。
+#[cfg(feature = "http2")]
+async fn h2_serve_buffered(
+    ctx: &H2RequestCtx,
+    resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
+    notify: &crate::stream_channel::Notify,
+) -> (u16, u64, u64) {
+    let req_size = ctx.body.len() as u64;
+    let (status, resp_size) = h2_dispatch(ctx, resp_tx, notify).await;
+    (status, resp_size, req_size)
+}
+
+/// バッファ経路のルーティング + ディスパッチ。戻り値 `(status, resp_size)`。
+#[cfg(feature = "http2")]
+async fn h2_dispatch(
+    ctx: &H2RequestCtx,
+    resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
+    notify: &crate::stream_channel::Notify,
+) -> (u16, u64) {
+    let method = &ctx.method[..];
+    let path = &ctx.path[..];
+    let client_ip: &str = &ctx.client_ip;
+
+    // 非疑似ヘッダーのみ（ルーティング・転送用）。
+    let headers_raw: Vec<(&[u8], &[u8])> = ctx
+        .headers
+        .iter()
+        .filter(|h| !h.name.starts_with(b":"))
+        .map(|h| (h.name.as_slice(), h.value.as_slice()))
+        .collect();
+
+    // メトリクスエンドポイント。
+    {
+        let config = CURRENT_CONFIG.load();
+        let prom = &config.prometheus_config;
+        let path_str = std::str::from_utf8(path).unwrap_or("/");
+        if prom.enabled && path_str == prom.path && method == b"GET" {
+            if !prom.is_ip_allowed(client_ip) {
+                return h2_emit_error(resp_tx, notify, 403, b"Forbidden").await;
+            }
+            let body = encode_prometheus_metrics();
+            let mut headers = h2_base_headers(false);
+            headers.push((
+                b"content-type".to_vec(),
+                b"text/plain; version=0.0.4; charset=utf-8".to_vec(),
+            ));
+            return h2_emit_full(resp_tx, notify, 200, headers, body).await;
+        }
+    }
+
+    // 管理 API（B-29）。
+    #[cfg(feature = "admin")]
+    if let Some((status, headers, body)) = h2_admin_response(method, path, client_ip, &headers_raw)
+    {
+        return h2_emit_full(resp_tx, notify, status, headers, body).await;
+    }
+
+    let config = CURRENT_CONFIG.load();
+    let query_start = path.iter().position(|&b| b == b'?');
+    let raw_query: &[u8] = query_start.map(|i| &path[i + 1..]).unwrap_or(b"");
+    let path_wo_query = query_start.map(|i| &path[..i]).unwrap_or(path);
+    let client_socket_addr = h2_client_socket_addr(client_ip);
+    let authority = &ctx.authority[..];
+
+    let backend_result = find_backend_unified(
+        authority,
+        path_wo_query,
+        method,
+        &headers_raw,
+        raw_query,
+        &client_socket_addr,
+        config.route.as_slice(),
+        &config.upstream_groups,
+    )
+    .or_else(|| {
+        if !authority.is_empty() {
+            find_backend_unified(
+                b"",
+                path_wo_query,
+                method,
+                &headers_raw,
+                raw_query,
+                &client_socket_addr,
+                config.route.as_slice(),
+                &config.upstream_groups,
+            )
+        } else {
+            None
+        }
+    });
+
+    let (prefix, backend, route_compression) = match backend_result {
+        Some(b) => b,
+        None => {
+            return h2_emit_error(resp_tx, notify, 404, b"Not Found").await;
+        }
+    };
+
+    // セキュリティチェック。
+    let security = backend.security();
+    let check_result = check_security(security, client_ip, method, ctx.body.len(), false);
+    if check_result != SecurityCheckResult::Allowed {
+        let status = check_result.status_code();
+        let msg = check_result.message();
+        return h2_emit_error(resp_tx, notify, status, msg).await;
+    }
+
+    // WASM リクエストフィルタ。
+    #[cfg(feature = "wasm")]
+    let wasm_modules_to_apply: Arc<Vec<String>> = {
+        let config = CURRENT_CONFIG.load();
+        if let Some(ref wasm_engine) = config.wasm_filter_engine {
+            let path_str = std::str::from_utf8(path).unwrap_or("/");
+            let method_str = std::str::from_utf8(method).unwrap_or("GET");
+            let modules_to_apply = if let Some(backend_modules) = backend.modules_arc() {
+                backend_modules.clone()
+            } else {
+                crate::wasm::empty_wasm_modules()
+            };
+            if !modules_to_apply.is_empty() {
+                let headers_vec: Vec<(Vec<u8>, Vec<u8>)> = ctx
+                    .headers
+                    .iter()
+                    .map(|h| (h.name.clone(), h.value.clone()))
+                    .collect();
+                let wasm_result = wasm_engine
+                    .clone()
+                    .on_request_headers_with_modules_async(
+                        modules_to_apply.clone(),
+                        Arc::from(path_str),
+                        Arc::from(method_str),
+                        headers_vec,
+                        Arc::from(client_ip),
+                        ctx.body.is_empty(),
+                    )
+                    .await;
+                match wasm_result {
+                    crate::wasm::FilterResult::LocalResponse(resp) => {
+                        let mut headers: Vec<(Vec<u8>, Vec<u8>)> = resp
+                            .headers
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect();
+                        for (n, v) in h2_base_headers(false) {
+                            headers.push((n, v));
+                        }
+                        let (st, sz) =
+                            h2_emit_full(resp_tx, notify, resp.status_code, headers, resp.body)
+                                .await;
+                        crate::wasm::on_request_complete_async(
+                            wasm_engine.clone(),
+                            modules_to_apply.clone(),
+                        )
+                        .await;
+                        return (st, sz);
+                    }
+                    crate::wasm::FilterResult::Pause => {
+                        warn!("WASM module requested pause, but async operations are not yet supported");
+                    }
+                    crate::wasm::FilterResult::Continue { .. } => {}
+                }
+            }
+            modules_to_apply
+        } else {
+            crate::wasm::empty_wasm_modules()
+        }
+    };
+
+    // Accept-Encoding。
+    let client_encoding = ctx
+        .headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case(b"accept-encoding"))
+        .map(|h| AcceptedEncoding::parse(&h.value))
+        .unwrap_or(AcceptedEncoding::Identity);
+
+    let result = match backend {
+        Backend::Proxy(upstream_group, security, compression, _buffering, _cache, _) => {
+            h2_proxy(
+                ctx,
+                &upstream_group,
+                &compression,
+                client_encoding,
+                &prefix,
+                &security,
+                #[cfg(feature = "wasm")]
+                &wasm_modules_to_apply,
+                resp_tx,
+                notify,
+            )
+            .await
+        }
+        Backend::MemoryFile(data, mime_type, security, _) => {
+            let path_str = std::str::from_utf8(path).unwrap_or("/");
+            let prefix_str = std::str::from_utf8(&prefix).unwrap_or("");
+            let remainder = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
+                &path_str[prefix_str.len()..]
+            } else {
+                ""
+            };
+            if !remainder.trim_matches('/').is_empty() {
+                h2_emit_error(resp_tx, notify, 404, b"Not Found").await
+            } else {
+                let (built_headers, response_body) = build_h2_compressed_file_response(
+                    &data,
+                    mime_type.as_ref(),
+                    &security,
+                    &route_compression,
+                    client_encoding,
+                );
+                #[cfg(feature = "wasm")]
+                let header_store =
+                    apply_h2_wasm_response_headers(&wasm_modules_to_apply, 200, built_headers)
+                        .await;
+                #[cfg(not(feature = "wasm"))]
+                let header_store = built_headers;
+                h2_emit_full(resp_tx, notify, 200, header_store, response_body).await
+            }
+        }
+        Backend::SendFile(base_path, is_dir, index_file, security, _cache, _ofc, _) => {
+            h2_sendfile(
+                ctx,
+                &base_path,
+                is_dir,
+                index_file.as_deref(),
+                &prefix,
+                &security,
+                &route_compression,
+                client_encoding,
+                #[cfg(feature = "wasm")]
+                &wasm_modules_to_apply,
+                resp_tx,
+                notify,
+            )
+            .await
+        }
+        Backend::Redirect(redirect_url, status_code, preserve_path, _) => {
+            h2_redirect(
+                ctx,
+                &redirect_url,
+                status_code,
+                preserve_path,
+                &prefix,
+                resp_tx,
+                notify,
+            )
+            .await
+        }
+    };
+
+    #[cfg(feature = "wasm")]
+    {
+        if !wasm_modules_to_apply.is_empty() {
+            let config = CURRENT_CONFIG.load();
+            if let Some(ref wasm_engine) = config.wasm_filter_engine {
+                crate::wasm::on_request_complete_async(
+                    wasm_engine.clone(),
+                    wasm_modules_to_apply.clone(),
+                )
+                .await;
+            }
+        }
+    }
+
+    result
+}
+
+/// バッファ経路の Proxy 処理（H1/HTTPS/H2C バックエンド）。戻り値 `(status, resp_size)`。
+#[cfg(feature = "http2")]
+#[allow(clippy::too_many_arguments)]
+async fn h2_proxy(
+    ctx: &H2RequestCtx,
+    upstream_group: &Arc<UpstreamGroup>,
+    compression: &CompressionConfig,
+    client_encoding: AcceptedEncoding,
+    prefix: &[u8],
+    security: &SecurityConfig,
+    #[cfg(feature = "wasm")] wasm_modules: &Arc<Vec<String>>,
+    resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
+    notify: &crate::stream_channel::Notify,
+) -> (u16, u64) {
+    let method = &ctx.method[..];
+    let req_path = &ctx.path[..];
+    let client_ip: &str = &ctx.client_ip;
+
+    // Consistent Hash キー解決。
+    let hash_key_owned: Option<String> = match &upstream_group.algorithm {
+        crate::config::LoadBalanceAlgorithm::ConsistentHash {
+            hash_key: crate::config::HashKey::Header(name),
+        } => ctx
+            .headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case(name.as_bytes()))
+            .and_then(|h| std::str::from_utf8(&h.value).ok())
+            .map(|s| s.to_string()),
+        crate::config::LoadBalanceAlgorithm::ConsistentHash {
+            hash_key: crate::config::HashKey::Cookie(name),
+        } => ctx
+            .headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case(b"cookie"))
+            .and_then(|h| std::str::from_utf8(&h.value).ok())
+            .and_then(|c| {
+                c.split(';').find_map(|part| {
+                    let part = part.trim();
+                    part.split_once('=').and_then(|(k, v)| {
+                        if k.trim().eq_ignore_ascii_case(name) {
+                            Some(v.trim().to_string())
+                        } else {
+                            None
+                        }
+                    })
+                })
+            }),
+        _ => None,
+    };
+
+    let server = match upstream_group.select_with_key(client_ip, hash_key_owned.as_deref(), None) {
+        Some(s) => s,
+        None => return h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await,
+    };
+    server.acquire();
+    let target = &server.target;
+
+    let path_str = std::str::from_utf8(req_path).unwrap_or("/");
+    let preserve_grpc_path = ctx
+        .headers
+        .iter()
+        .any(|h| header_pair_is_grpc(&h.name, &h.value));
+    let final_path_owned =
+        compute_upstream_path(path_str, prefix, &target.path_prefix, preserve_grpc_path);
+    let final_path = final_path_owned.as_str();
+
+    // H2C バックエンドは HPACK 応答のため専用処理。
+    if target.use_h2c || upstream_group.use_h2c() {
+        let addr = HostPortStr::new(&target.host, target.port);
+        let addr = addr.as_str();
+        let result = h2_proxy_h2c(
+            ctx,
+            addr,
+            target,
+            method,
+            final_path.as_bytes(),
+            security,
+            #[cfg(feature = "wasm")]
+            wasm_modules,
+            resp_tx,
+            notify,
+        )
+        .await;
+        server.release();
+        return result;
+    }
+
+    // H1/HTTPS バックエンドへの HTTP/1.1 リクエストを構築。
+    let mut request = request_buf_get(1024);
+    request.extend_from_slice(method);
+    request.extend_from_slice(b" ");
+    request.extend_from_slice(final_path.as_bytes());
+    request.extend_from_slice(b" HTTP/1.1\r\nHost: ");
+    request.extend_from_slice(target.host.as_bytes());
+    if !target.is_default_port() {
+        request.extend_from_slice(b":");
+        let mut port_buf = itoa::Buffer::new();
+        request.extend_from_slice(port_buf.format(target.port).as_bytes());
+    }
+    request.extend_from_slice(b"\r\n");
+    for header in ctx.headers.iter() {
+        if header.name.starts_with(b":") {
+            continue;
+        }
+        if header.name.eq_ignore_ascii_case(b"connection")
+            || header.name.eq_ignore_ascii_case(b"keep-alive")
+            || header.name.eq_ignore_ascii_case(b"transfer-encoding")
+        {
+            continue;
+        }
+        request.extend_from_slice(&header.name);
+        request.extend_from_slice(b": ");
+        request.extend_from_slice(&header.value);
+        request.extend_from_slice(b"\r\n");
+    }
+    if !ctx.body.is_empty() {
+        request.extend_from_slice(b"Content-Length: ");
+        let mut len_buf = itoa::Buffer::new();
+        request.extend_from_slice(len_buf.format(ctx.body.len()).as_bytes());
+        request.extend_from_slice(b"\r\n");
+    }
+    request.extend_from_slice(b"Connection: keep-alive\r\n\r\n");
+    request.extend_from_slice(&ctx.body);
+
+    let addr = HostPortStr::new(&target.host, target.port);
+    let addr = addr.as_str();
+
+    let result = if target.use_tls {
+        h2_proxy_https(
+            ctx,
+            addr,
+            target.sni(),
+            request,
+            compression,
+            client_encoding,
+            security,
+            upstream_group.tls_insecure(),
+            resp_tx,
+            notify,
+        )
+        .await
+    } else {
+        h2_proxy_http(
+            ctx,
+            addr,
+            request,
+            compression,
+            client_encoding,
+            security,
+            resp_tx,
+            notify,
+        )
+        .await
+    };
+    server.release();
+    result
+}
+
+/// H1 バックエンド（平文）へのプロキシ（プール再利用付き、B-28）。
+#[cfg(feature = "http2")]
+#[allow(clippy::too_many_arguments)]
+async fn h2_proxy_http(
+    _ctx: &H2RequestCtx,
+    addr: &str,
+    request: Vec<u8>,
+    compression: &CompressionConfig,
+    client_encoding: AcceptedEncoding,
+    security: &SecurityConfig,
+    resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
+    notify: &crate::stream_channel::Notify,
+) -> (u16, u64) {
+    let mut backend = match HTTP_POOL.with(|p| p.borrow_mut().get(addr)) {
+        Some(stream) => stream,
+        None => match timeout(CONNECT_TIMEOUT, TcpStream::connect_str(addr)).await {
+            Ok(Ok(stream)) => {
+                let _ = stream.set_nodelay(true);
+                stream
+            }
+            Ok(Err(e)) => {
+                warn!("[HTTP/2] Backend connect error: {}", e);
+                let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
+                return (s, sz);
+            }
+            Err(_) => {
+                let (s, sz) = h2_emit_error(resp_tx, notify, 504, b"Gateway Timeout").await;
+                return (s, sz);
+            }
+        },
+    };
+
+    let (write_res, returned_request) = backend.write_all(request).await;
+    request_buf_put(returned_request);
+    if write_res.is_err() {
+        return h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
+    }
+
+    let (status, sent, reusable) =
+        h2_relay_backend_response(&mut backend, compression, client_encoding, resp_tx, notify)
+            .await;
+    if reusable {
+        HTTP_POOL.with(|p| {
+            p.borrow_mut().put(
+                addr.to_string(),
+                backend,
+                security.max_idle_connections_per_host,
+                security.idle_connection_timeout_secs,
+            )
+        });
+    }
+    (status, sent)
+}
+
+/// HTTPS バックエンドへのプロキシ（TLS プール再利用付き、B-28）。
+#[cfg(feature = "http2")]
+#[allow(clippy::too_many_arguments)]
+async fn h2_proxy_https(
+    _ctx: &H2RequestCtx,
+    addr: &str,
+    sni: &str,
+    request: Vec<u8>,
+    compression: &CompressionConfig,
+    client_encoding: AcceptedEncoding,
+    security: &SecurityConfig,
+    tls_insecure: bool,
+    resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
+    notify: &crate::stream_channel::Notify,
+) -> (u16, u64) {
+    let pool_key = format!(
+        "{}:{}:{}",
+        addr,
+        sni,
+        if tls_insecure { "insecure" } else { "verify" }
+    );
+
+    let mut backend = match HTTPS_POOL.with(|p| p.borrow_mut().get(&pool_key)) {
+        Some(stream) => stream,
+        None => {
+            let backend_tcp = match timeout(CONNECT_TIMEOUT, TcpStream::connect_str(addr)).await {
+                Ok(Ok(stream)) => {
+                    let _ = stream.set_nodelay(true);
+                    stream
+                }
+                Ok(Err(e)) => {
+                    warn!("[HTTP/2] Backend connect error: {}", e);
+                    return h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
+                }
+                Err(_) => {
+                    return h2_emit_error(resp_tx, notify, 504, b"Gateway Timeout").await;
+                }
+            };
+            let tls_result = if tls_insecure {
+                let connector = get_tls_connector_insecure();
+                timeout(CONNECT_TIMEOUT, connector.connect(backend_tcp, sni)).await
+            } else {
+                let connector = get_tls_connector();
+                timeout(CONNECT_TIMEOUT, connector.connect(backend_tcp, sni)).await
+            };
+            match tls_result {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => {
+                    warn!("[HTTP/2] TLS handshake error: {}", e);
+                    return h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
+                }
+                Err(_) => {
+                    return h2_emit_error(resp_tx, notify, 504, b"Gateway Timeout").await;
+                }
+            }
+        }
+    };
+
+    let (write_res, returned_request) = backend.write_all(request).await;
+    request_buf_put(returned_request);
+    if write_res.is_err() {
+        return h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
+    }
+
+    let (status, sent, reusable) =
+        h2_relay_backend_response(&mut backend, compression, client_encoding, resp_tx, notify)
+            .await;
+    if reusable {
+        HTTPS_POOL.with(|p| {
+            p.borrow_mut().put(
+                pool_key,
+                backend,
+                security.max_idle_connections_per_host,
+                security.idle_connection_timeout_secs,
+            )
+        });
+    }
+    (status, sent)
+}
+
+/// H2C バックエンドへのプロキシ（F-106 プール再利用 + gRPC トレイラー）。
+#[cfg(feature = "http2")]
+#[allow(clippy::too_many_arguments)]
+async fn h2_proxy_h2c(
+    _ctx: &H2RequestCtx,
+    addr: &str,
+    target: &ProxyTarget,
+    method: &[u8],
+    path: &[u8],
+    security: &SecurityConfig,
+    #[cfg(feature = "wasm")] wasm_modules: &Arc<Vec<String>>,
+    resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
+    notify: &crate::stream_channel::Notify,
+) -> (u16, u64) {
+    let ctx = _ctx;
+    let from_pool;
+    let mut h2c_client = match H2C_POOL.with(|p| p.borrow_mut().get(addr)) {
+        Some(client) => {
+            from_pool = true;
+            client
+        }
+        None => {
+            from_pool = false;
+            match h2c_connect_and_handshake(addr).await {
+                Ok(client) => client,
+                Err(status) => {
+                    let msg: &[u8] = if status == 504 {
+                        b"Gateway Timeout"
+                    } else {
+                        b"Bad Gateway"
+                    };
+                    return h2_emit_error(resp_tx, notify, status, msg).await;
+                }
+            }
+        }
+    };
+
+    let is_grpc_upstream = ctx
+        .headers
+        .iter()
+        .any(|h| header_pair_is_grpc(&h.name, &h.value));
+    let headers_vec: Vec<(&[u8], &[u8])> = ctx
+        .headers
+        .iter()
+        .filter(|h| !h.name.starts_with(b":"))
+        .filter(|h| {
+            !h.name.eq_ignore_ascii_case(b"connection")
+                && !h.name.eq_ignore_ascii_case(b"keep-alive")
+                && !h.name.eq_ignore_ascii_case(b"proxy-connection")
+                && !h.name.eq_ignore_ascii_case(b"transfer-encoding")
+                && !h.name.eq_ignore_ascii_case(b"upgrade")
+                && (is_grpc_upstream || !h.name.eq_ignore_ascii_case(b"te"))
+        })
+        .map(|h| (h.name.as_slice(), h.value.as_slice()))
+        .collect();
+
+    let body: Option<&[u8]> = if ctx.body.is_empty() {
+        None
+    } else {
+        Some(&ctx.body)
+    };
+    let authority = target.host.as_bytes();
+
+    let mut send_result = h2c_client
+        .send_request(method, path, authority, &headers_vec, body)
+        .await;
+    if send_result.is_err() && from_pool {
+        if let Ok(fresh) = h2c_connect_and_handshake(addr).await {
+            h2c_client = fresh;
+            send_result = h2c_client
+                .send_request(method, path, authority, &headers_vec, body)
+                .await;
+        }
+    }
+
+    match send_result {
+        Ok(h2c_resp) => {
+            if h2c_client.is_reusable() {
+                let max_idle = security.max_idle_connections_per_host;
+                let idle_timeout = security.idle_connection_timeout_secs;
+                H2C_POOL.with(|p| {
+                    p.borrow_mut()
+                        .put(addr.to_string(), h2c_client, max_idle, idle_timeout)
+                });
+            }
+
+            let mut header_store: Vec<(Vec<u8>, Vec<u8>)> = h2c_resp
+                .headers
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            #[cfg(feature = "wasm")]
+            {
+                header_store =
+                    apply_h2_wasm_response_headers(wasm_modules, h2c_resp.status, header_store)
+                        .await;
+            }
+            for (n, v) in h2_base_headers(true) {
+                header_store.push((n, v));
+            }
+
+            let has_body = !h2c_resp.body.is_empty();
+            let has_trailers = !h2c_resp.trailers.is_empty();
+            let status = h2c_resp.status;
+            let body_len = h2c_resp.body.len() as u64;
+
+            if h2_send(
+                resp_tx,
+                notify,
+                H2RespMsg::Head {
+                    status,
+                    headers: header_store,
+                    end_stream: !has_body && !has_trailers,
+                },
+            )
+            .await
+            .is_err()
+            {
+                return (status, 0);
+            }
+
+            if has_body
+                && h2_send(resp_tx, notify, H2RespMsg::Body(Bytes::from(h2c_resp.body)))
+                    .await
+                    .is_err()
+            {
+                return (status, body_len);
+            }
+
+            if has_trailers {
+                #[cfg(feature = "grpc")]
+                {
+                    let mut grpc_status = 0u32;
+                    for (name, value) in &h2c_resp.trailers {
+                        if name == b"grpc-status" {
+                            if let Ok(s) = std::str::from_utf8(value) {
+                                grpc_status = s.trim().parse().unwrap_or(0);
+                            }
+                        }
+                    }
+                    // F-09: gRPC リクエストメトリクスを記録。
+                    let grpc_method = std::str::from_utf8(path).unwrap_or("");
+                    let mut status_buf = itoa::Buffer::new();
+                    let status_str = status_buf.format(grpc_status);
+                    crate::metrics::record_grpc_request(grpc_method, status_str, &target.host);
+                    let _ = h2_send(resp_tx, notify, H2RespMsg::Trailers(h2c_resp.trailers)).await;
+                }
+                #[cfg(not(feature = "grpc"))]
+                {
+                    // gRPC feature 無効時はトレイラーをスキップ。
+                    let _ = &h2c_resp.trailers;
+                }
+            }
+
+            (status, body_len)
+        }
+        Err(e) => {
+            warn!("[HTTP/2] H2C request error ({}): {}", addr, e);
+            h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await
+        }
+    }
+}
+
+/// バックエンド HTTP/1.1 レスポンスを受信して [`H2RespMsg`] としてメインループへ流す（F-116）。
+///
+/// 戻り値 `(status, sent, reusable)`。`reusable` はバックエンド接続をプールへ返せるか
+/// （CL 全量消費 + 非 `Connection: close`。chunked/EOF/エラーは false）。
+#[cfg(feature = "http2")]
+async fn h2_relay_backend_response<B>(
+    backend: &mut B,
+    compression: &CompressionConfig,
+    client_encoding: AcceptedEncoding,
+    resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
+    notify: &crate::stream_channel::Notify,
+) -> (u16, u64, bool)
+where
+    B: crate::runtime::io::AsyncReadRent + Unpin,
+{
+    let mut response_buf = Vec::with_capacity(BUF_SIZE);
+
+    loop {
+        let buf = buf_get();
+        let read_result = timeout(READ_TIMEOUT, backend.read(buf)).await;
+        let (res, mut returned_buf) = match read_result {
+            Ok(r) => r,
+            Err(_) => {
+                let (s, sz) = h2_emit_error(resp_tx, notify, 504, b"Gateway Timeout").await;
+                return (s, sz, false);
+            }
+        };
+        let n = match res {
+            Ok(0) => {
+                buf_put(returned_buf);
+                break;
+            }
+            Ok(n) => n,
+            Err(_) => {
+                buf_put(returned_buf);
+                let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
+                return (s, sz, false);
+            }
+        };
+        returned_buf.set_valid_len(n);
+        response_buf.extend_from_slice(returned_buf.as_valid_slice());
+        buf_put(returned_buf);
+
+        if let Some(parsed) = parse_http_response(&response_buf) {
+            let status = parsed.status_code;
+            let body_start = parsed.header_len;
+            let body = &response_buf[body_start..];
+
+            let mut headers_storage = [httparse::EMPTY_HEADER; 64];
+            let mut resp = httparse::Response::new(&mut headers_storage);
+            let _ = resp.parse(&response_buf);
+            let content_type = resp
+                .headers
+                .iter()
+                .find(|h| h.name.eq_ignore_ascii_case("content-type"))
+                .map(|h| h.value);
+            let existing_encoding = resp
+                .headers
+                .iter()
+                .find(|h| h.name.eq_ignore_ascii_case("content-encoding"))
+                .map(|h| h.value);
+
+            let stream_compress_hint = compression.should_compress(
+                client_encoding,
+                content_type,
+                parsed.content_length,
+                existing_encoding,
+            );
+
+            // 非圧縮 + CL 既知 + 非 chunked → 逐次ストリーミング。
+            if stream_compress_hint.is_none() && !parsed.is_chunked {
+                if let Some(content_len) = parsed.content_length {
+                    let mut headers = h2_base_headers(true);
+                    for header in resp.headers.iter() {
+                        if header.name.is_empty() {
+                            continue;
+                        }
+                        if header.name.eq_ignore_ascii_case("connection")
+                            || header.name.eq_ignore_ascii_case("keep-alive")
+                            || header.name.eq_ignore_ascii_case("transfer-encoding")
+                            || header.name.eq_ignore_ascii_case("upgrade")
+                        {
+                            continue;
+                        }
+                        headers.push((header.name.as_bytes().to_vec(), header.value.to_vec()));
+                    }
+                    let (sent, ok) = h2_stream_body_cl(
+                        resp_tx,
+                        notify,
+                        status,
+                        headers,
+                        backend,
+                        body,
+                        content_len,
+                    )
+                    .await;
+                    let reusable = ok && sent == content_len as u64 && !parsed.is_connection_close;
+                    return (status, sent, reusable);
+                }
+            }
+
+            // 非圧縮 + chunked → ゼロコピー逐次デコード転送。
+            if stream_compress_hint.is_none() && parsed.is_chunked {
+                let mut headers = h2_base_headers(true);
+                for header in resp.headers.iter() {
+                    if header.name.is_empty() {
+                        continue;
+                    }
+                    if header.name.eq_ignore_ascii_case("connection")
+                        || header.name.eq_ignore_ascii_case("keep-alive")
+                        || header.name.eq_ignore_ascii_case("transfer-encoding")
+                        || header.name.eq_ignore_ascii_case("upgrade")
+                        || header.name.eq_ignore_ascii_case("content-length")
+                    {
+                        continue;
+                    }
+                    headers.push((header.name.as_bytes().to_vec(), header.value.to_vec()));
+                }
+                let sent =
+                    h2_stream_body_chunked(resp_tx, notify, status, headers, backend, body).await;
+                return (status, sent, false);
+            }
+
+            // 圧縮あり / 長さ不明 → 全読み込み後に（必要なら圧縮して）送信。
+            let mut backend_reusable = false;
+            let final_body = if parsed.is_chunked {
+                let mut decoder = ChunkedDecoder::new_unlimited();
+                let mut full_body = body.to_vec();
+                decoder.feed(body);
+                while !decoder.is_complete() {
+                    let buf = buf_get();
+                    let (res, mut returned_buf) =
+                        match timeout(READ_TIMEOUT, backend.read(buf)).await {
+                            Ok(r) => r,
+                            Err(_) => break,
+                        };
+                    let n = match res {
+                        Ok(0) => {
+                            buf_put(returned_buf);
+                            break;
+                        }
+                        Ok(n) => n,
+                        Err(_) => {
+                            buf_put(returned_buf);
+                            break;
+                        }
+                    };
+                    returned_buf.set_valid_len(n);
+                    full_body.extend_from_slice(returned_buf.as_valid_slice());
+                    decoder.feed(returned_buf.as_valid_slice());
+                    buf_put(returned_buf);
+                }
+                decode_chunked_body(&full_body)
+            } else if let Some(content_len) = parsed.content_length {
+                let mut full_body = body.to_vec();
+                while full_body.len() < content_len {
+                    let buf = buf_get();
+                    let (res, mut returned_buf) =
+                        match timeout(READ_TIMEOUT, backend.read(buf)).await {
+                            Ok(r) => r,
+                            Err(_) => break,
+                        };
+                    let n = match res {
+                        Ok(0) => {
+                            buf_put(returned_buf);
+                            break;
+                        }
+                        Ok(n) => n,
+                        Err(_) => {
+                            buf_put(returned_buf);
+                            break;
+                        }
+                    };
+                    returned_buf.set_valid_len(n);
+                    full_body.extend_from_slice(returned_buf.as_valid_slice());
+                    buf_put(returned_buf);
+                }
+                backend_reusable = full_body.len() == content_len;
+                full_body
+            } else {
+                body.to_vec()
+            };
+
+            let should_compress = compression.should_compress(
+                client_encoding,
+                content_type,
+                Some(final_body.len()),
+                existing_encoding,
+            );
+
+            let mut headers = h2_base_headers(true);
+            if let Some(enc) = should_compress {
+                let encoding_name: &'static [u8] = match enc {
+                    AcceptedEncoding::Zstd => b"zstd",
+                    AcceptedEncoding::Brotli => b"br",
+                    AcceptedEncoding::Gzip => b"gzip",
+                    AcceptedEncoding::Deflate => b"deflate",
+                    AcceptedEncoding::Identity => b"",
+                };
+                if !encoding_name.is_empty() {
+                    headers.push((b"content-encoding".to_vec(), encoding_name.to_vec()));
+                    headers.push((b"vary".to_vec(), b"Accept-Encoding".to_vec()));
+                }
+            }
+            for header in resp.headers.iter() {
+                if header.name.is_empty() {
+                    continue;
+                }
+                if header.name.eq_ignore_ascii_case("connection")
+                    || header.name.eq_ignore_ascii_case("keep-alive")
+                    || header.name.eq_ignore_ascii_case("transfer-encoding")
+                    || header.name.eq_ignore_ascii_case("upgrade")
+                {
+                    continue;
+                }
+                if should_compress.is_some()
+                    && (header.name.eq_ignore_ascii_case("content-length")
+                        || header.name.eq_ignore_ascii_case("content-encoding"))
+                {
+                    continue;
+                }
+                headers.push((header.name.as_bytes().to_vec(), header.value.to_vec()));
+            }
+
+            let response_body = if let Some(enc) = should_compress {
+                compress_body_h2(&final_body, enc, compression)
+            } else {
+                final_body
+            };
+            let (status2, sent) =
+                h2_emit_full(resp_tx, notify, status, headers, response_body).await;
+            return (
+                status2,
+                sent,
+                backend_reusable && !parsed.is_connection_close,
+            );
+        }
+
+        if response_buf.len() > MAX_HEADER_SIZE {
+            let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
+            return (s, sz, false);
+        }
+    }
+
+    let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
+    (s, sz, false)
+}
+
+/// 非圧縮・CL 既知ボディを [`H2RespMsg::Body`] として逐次転送する。戻り値 `(sent, ok)`。
+#[cfg(feature = "http2")]
+#[allow(clippy::too_many_arguments)]
+async fn h2_stream_body_cl<B>(
+    resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
+    notify: &crate::stream_channel::Notify,
+    status: u16,
+    headers: Vec<(Vec<u8>, Vec<u8>)>,
+    backend: &mut B,
+    initial_body: &[u8],
+    content_length: usize,
+) -> (u64, bool)
+where
+    B: crate::runtime::io::AsyncReadRent + Unpin,
+{
+    let empty = content_length == 0;
+    if h2_send(
+        resp_tx,
+        notify,
+        H2RespMsg::Head {
+            status,
+            headers,
+            end_stream: empty,
+        },
+    )
+    .await
+    .is_err()
+    {
+        return (0, false);
+    }
+    if empty {
+        return (0, true);
+    }
+
+    let mut remaining = content_length;
+    let init_len = initial_body.len().min(remaining);
+    if init_len > 0 {
+        if h2_send(
+            resp_tx,
+            notify,
+            H2RespMsg::Body(Bytes::copy_from_slice(&initial_body[..init_len])),
+        )
+        .await
+        .is_err()
+        {
+            return ((content_length - remaining) as u64, false);
+        }
+        remaining -= init_len;
+    }
+
+    while remaining > 0 {
+        let buf = buf_get();
+        let (res, mut returned_buf) = match timeout(READ_TIMEOUT, backend.read(buf)).await {
+            Ok(r) => r,
+            Err(_) => {
+                // タイムアウト: HEADERS 送出済みのため RST_STREAM で打ち切る（旧 send_rst_stream 相当）。
+                let _ = h2_send(resp_tx, notify, H2RespMsg::Reset(2)).await;
+                return ((content_length - remaining) as u64, false);
+            }
+        };
+        let n = match res {
+            Ok(0) => {
+                // content-length 未達でバックエンド切断: 空 END_STREAM で閉じる（graceful）。
+                buf_put(returned_buf);
+                return ((content_length - remaining) as u64, false);
+            }
+            Ok(n) => n,
+            Err(_) => {
+                buf_put(returned_buf);
+                let _ = h2_send(resp_tx, notify, H2RespMsg::Reset(2)).await;
+                return ((content_length - remaining) as u64, false);
+            }
+        };
+        returned_buf.set_valid_len(n);
+        let take = n.min(remaining);
+        let chunk = Bytes::copy_from_slice(&returned_buf.as_valid_slice()[..take]);
+        buf_put(returned_buf);
+        if h2_send(resp_tx, notify, H2RespMsg::Body(chunk))
+            .await
+            .is_err()
+        {
+            return ((content_length - remaining) as u64, false);
+        }
+        remaining -= take;
+    }
+    (content_length as u64, true)
+}
+
+/// 非圧縮・chunked ボディを `next_data_span` でデコードしつつ逐次転送する。戻り値 `sent`。
+#[cfg(feature = "http2")]
+async fn h2_stream_body_chunked<B>(
+    resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
+    notify: &crate::stream_channel::Notify,
+    status: u16,
+    headers: Vec<(Vec<u8>, Vec<u8>)>,
+    backend: &mut B,
+    initial_body: &[u8],
+) -> u64
+where
+    B: crate::runtime::io::AsyncReadRent + Unpin,
+{
+    if h2_send(
+        resp_tx,
+        notify,
+        H2RespMsg::Head {
+            status,
+            headers,
+            end_stream: false,
+        },
+    )
+    .await
+    .is_err()
+    {
+        return 0;
+    }
+
+    let mut decoder = crate::http_utils::ChunkedDecoder::new_unlimited();
+    let mut sent: u64 = 0;
+
+    match h2_drain_chunked_to_msg(resp_tx, notify, &mut decoder, initial_body, &mut sent).await {
+        H2ChunkDrain::Done => return sent,
+        H2ChunkDrain::NeedMore => {}
+    }
+
+    loop {
+        let buf = buf_get();
+        let (res, mut returned_buf) = match timeout(READ_TIMEOUT, backend.read(buf)).await {
+            Ok(r) => r,
+            Err(_) => {
+                let _ = h2_send(resp_tx, notify, H2RespMsg::Reset(2)).await;
+                return sent;
+            }
+        };
+        let n = match res {
+            Ok(0) => {
+                // 終端チャンク前に切断: 空 END_STREAM で閉じる（graceful）。
+                buf_put(returned_buf);
+                return sent;
+            }
+            Ok(n) => n,
+            Err(_) => {
+                buf_put(returned_buf);
+                let _ = h2_send(resp_tx, notify, H2RespMsg::Reset(2)).await;
+                return sent;
+            }
+        };
+        returned_buf.set_valid_len(n);
+        let drain = h2_drain_chunked_to_msg(
+            resp_tx,
+            notify,
+            &mut decoder,
+            returned_buf.as_valid_slice(),
+            &mut sent,
+        )
+        .await;
+        buf_put(returned_buf);
+        match drain {
+            H2ChunkDrain::Done => return sent,
+            H2ChunkDrain::NeedMore => {}
+        }
+    }
+}
+
+/// chunked デコード 1 バッファ分の結果。
+#[cfg(feature = "http2")]
+enum H2ChunkDrain {
+    NeedMore,
+    Done,
+}
+
+/// 1 入力バッファ分の chunked をデコードして [`H2RespMsg::Body`] として送出する。
+#[cfg(feature = "http2")]
+async fn h2_drain_chunked_to_msg(
+    resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
+    notify: &crate::stream_channel::Notify,
+    decoder: &mut crate::http_utils::ChunkedDecoder,
+    data: &[u8],
+    sent: &mut u64,
+) -> H2ChunkDrain {
+    let mut pos = 0;
+    while pos < data.len() {
+        let span = decoder.next_data_span(&data[pos..]);
+        if span.data_len > 0 {
+            let start = pos + span.data_start;
+            let chunk = Bytes::copy_from_slice(&data[start..start + span.data_len]);
+            if h2_send(resp_tx, notify, H2RespMsg::Body(chunk))
+                .await
+                .is_err()
+            {
+                return H2ChunkDrain::Done;
+            }
+            *sent += span.data_len as u64;
+        }
+        pos += span.consumed;
+        if span.complete || span.limit_exceeded {
+            return H2ChunkDrain::Done;
+        }
+        if span.consumed == 0 {
+            break;
+        }
+    }
+    H2ChunkDrain::NeedMore
+}
+
+/// SendFile バックエンドのファイル配信をメッセージ化する（F-116）。
+#[cfg(feature = "http2")]
+#[allow(clippy::too_many_arguments)]
+async fn h2_sendfile(
+    ctx: &H2RequestCtx,
+    base_path: &Path,
+    is_dir: bool,
+    index_file: Option<&str>,
+    prefix: &[u8],
+    security: &SecurityConfig,
+    compression: &CompressionConfig,
+    client_encoding: AcceptedEncoding,
+    #[cfg(feature = "wasm")] wasm_modules: &Arc<Vec<String>>,
+    resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
+    notify: &crate::stream_channel::Notify,
+) -> (u16, u64) {
+    let path_str_raw = std::str::from_utf8(&ctx.path).unwrap_or("/");
+    let path_str = if let Some(qpos) = path_str_raw.find('?') {
+        &path_str_raw[..qpos]
+    } else {
+        path_str_raw
+    };
+    let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
+    let sub_path = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
+        &path_str[prefix_str.len()..]
+    } else {
+        path_str
+    };
+    let clean_sub = sub_path.trim_start_matches('/');
+
+    if clean_sub.contains("..") {
+        return h2_emit_error(resp_tx, notify, 403, b"Forbidden").await;
+    }
+
+    let file_path = if is_dir {
+        let mut p = base_path.to_path_buf();
+        if clean_sub.is_empty() || clean_sub == "/" {
+            p.push(index_file.unwrap_or("index.html"));
+        } else {
+            p.push(clean_sub);
+            if p.is_dir() {
+                p.push(index_file.unwrap_or("index.html"));
+            }
+        }
+        p
+    } else {
+        if !clean_sub.is_empty() {
+            return h2_emit_error(resp_tx, notify, 404, b"Not Found").await;
+        }
+        base_path.to_path_buf()
+    };
+
+    let data = match crate::runtime::io::read(&file_path).await {
+        Ok(d) => d,
+        Err(_) => return h2_emit_error(resp_tx, notify, 404, b"Not Found").await,
+    };
+
+    let mime_type = mime_guess::from_path(&file_path).first_or_octet_stream();
+    let (built_headers, response_body) = build_h2_compressed_file_response(
+        &data,
+        mime_type.as_ref(),
+        security,
+        compression,
+        client_encoding,
+    );
+    #[cfg(feature = "wasm")]
+    let header_store = apply_h2_wasm_response_headers(wasm_modules, 200, built_headers).await;
+    #[cfg(not(feature = "wasm"))]
+    let header_store = built_headers;
+    h2_emit_full(resp_tx, notify, 200, header_store, response_body).await
+}
+
+/// リダイレクトレスポンスをメッセージ化する（F-116）。
+#[cfg(feature = "http2")]
+async fn h2_redirect(
+    ctx: &H2RequestCtx,
+    redirect_url: &str,
+    status_code: u16,
+    preserve_path: bool,
+    prefix: &[u8],
+    resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
+    notify: &crate::stream_channel::Notify,
+) -> (u16, u64) {
+    let path_str = std::str::from_utf8(&ctx.path).unwrap_or("/");
+    let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
+    let sub_path = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
+        &path_str[prefix_str.len()..]
+    } else {
+        path_str
+    };
+    let mut final_url = redirect_url
+        .replace("$request_uri", path_str)
+        .replace("$path", sub_path);
+    if preserve_path && !sub_path.is_empty() {
+        if final_url.ends_with('/') && sub_path.starts_with('/') {
+            final_url.push_str(&sub_path[1..]);
+        } else if !final_url.ends_with('/') && !sub_path.starts_with('/') {
+            final_url.push('/');
+            final_url.push_str(sub_path);
+        } else {
+            final_url.push_str(sub_path);
+        }
+    }
+
+    let mut headers = h2_base_headers(false);
+    headers.push((b"location".to_vec(), final_url.into_bytes()));
+    if h2_send(
+        resp_tx,
+        notify,
+        H2RespMsg::Head {
+            status: status_code,
+            headers,
+            end_stream: true,
+        },
+    )
+    .await
+    .is_err()
+    {
+        return (status_code, 0);
+    }
+    (status_code, 0)
+}
+
+/// リクエスト方向ストリーミング経路（F-32 統合）。戻り値 `(status, resp_size, req_size)`。
+///
+/// メインループから `req_rx` 経由で流れてくるボディを chunked でバックエンドへゼロコピー
+/// 転送しつつ、レスポンスを [`H2RespMsg`] としてメインループへ流す。`status == 0` は
+/// クライアント切断（ログ不要）。
+#[cfg(feature = "http2")]
+async fn h2_serve_streaming(
+    ctx: &H2RequestCtx,
+    req_rx: &crate::stream_channel::Receiver<Bytes>,
+    resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
+    notify: &crate::stream_channel::Notify,
+) -> (u16, u64, u64) {
+    // ルーティング（メインループで適格判定済み。ここでサーバー/パスを解決）。
+    let method = &ctx.method[..];
+    let path = &ctx.path[..];
+    let client_ip: &str = &ctx.client_ip;
+
+    let headers_raw: Vec<(&[u8], &[u8])> = ctx
+        .headers
+        .iter()
+        .filter(|h| !h.name.starts_with(b":"))
+        .map(|h| (h.name.as_slice(), h.value.as_slice()))
+        .collect();
+
+    let config = CURRENT_CONFIG.load();
+    let query_start = path.iter().position(|&b| b == b'?');
+    let raw_query: &[u8] = query_start.map(|i| &path[i + 1..]).unwrap_or(b"");
+    let path_wo_query = query_start.map(|i| &path[..i]).unwrap_or(path);
+    let client_socket_addr = h2_client_socket_addr(client_ip);
+    let authority = &ctx.authority[..];
+
+    let backend_result = find_backend_unified(
+        authority,
+        path_wo_query,
+        method,
+        &headers_raw,
+        raw_query,
+        &client_socket_addr,
+        config.route.as_slice(),
+        &config.upstream_groups,
+    )
+    .or_else(|| {
+        if !authority.is_empty() {
+            find_backend_unified(
+                b"",
+                path_wo_query,
+                method,
+                &headers_raw,
+                raw_query,
+                &client_socket_addr,
+                config.route.as_slice(),
+                &config.upstream_groups,
+            )
+        } else {
+            None
+        }
+    });
+
+    // 適格判定が外れる（config 再読込レース等）場合は req をドレインして 502。
+    let (prefix, upstream_group, compression, security) = match backend_result {
+        Some((prefix, Backend::Proxy(ug, sec, comp, _buf, _cache, _mods), _rc)) => {
+            (prefix, ug, comp, sec)
+        }
+        _ => {
+            while req_rx.recv().await.is_some() {}
+            let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
+            return (s, sz, 0);
+        }
+    };
+
+    let server = match upstream_group.select(client_ip) {
+        Some(s) => s,
+        None => {
+            while req_rx.recv().await.is_some() {}
+            let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
+            return (s, sz, 0);
+        }
+    };
+
+    let client_encoding = ctx
+        .headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case(b"accept-encoding"))
+        .map(|h| AcceptedEncoding::parse(&h.value))
+        .unwrap_or(AcceptedEncoding::Identity);
+
+    server.acquire();
+    let target = &server.target;
+    let use_tls = target.use_tls;
+    let sni = target.sni().to_string();
+    let tls_insecure = upstream_group.tls_insecure();
+    let addr = HostPortStr::new(&target.host, target.port);
+    let addr = addr.as_str();
+
+    // chunked リクエストヘッダ構築。
+    let path_str = std::str::from_utf8(path).unwrap_or("/");
+    let preserve_grpc_path = ctx
+        .headers
+        .iter()
+        .any(|h| header_pair_is_grpc(&h.name, &h.value));
+    let final_path_owned =
+        compute_upstream_path(path_str, &prefix, &target.path_prefix, preserve_grpc_path);
+    let final_path = final_path_owned.as_str();
+
+    let mut request = request_buf_get(1024);
+    request.extend_from_slice(method);
+    request.extend_from_slice(b" ");
+    request.extend_from_slice(final_path.as_bytes());
+    request.extend_from_slice(b" HTTP/1.1\r\nHost: ");
+    request.extend_from_slice(target.host.as_bytes());
+    if !target.is_default_port() {
+        request.extend_from_slice(b":");
+        let mut port_buf = itoa::Buffer::new();
+        request.extend_from_slice(port_buf.format(target.port).as_bytes());
+    }
+    request.extend_from_slice(b"\r\n");
+    for header in ctx.headers.iter() {
+        if header.name.starts_with(b":") {
+            continue;
+        }
+        if header.name.eq_ignore_ascii_case(b"connection")
+            || header.name.eq_ignore_ascii_case(b"keep-alive")
+            || header.name.eq_ignore_ascii_case(b"transfer-encoding")
+            || header.name.eq_ignore_ascii_case(b"content-length")
+        {
+            continue;
+        }
+        request.extend_from_slice(&header.name);
+        request.extend_from_slice(b": ");
+        request.extend_from_slice(&header.value);
+        request.extend_from_slice(b"\r\n");
+    }
+    request.extend_from_slice(b"Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n");
+
+    // バックエンド接続。
+    let backend_tcp = match timeout(CONNECT_TIMEOUT, TcpStream::connect_str(addr)).await {
+        Ok(Ok(s)) => s,
+        _ => {
+            server.release();
+            request_buf_put(request);
+            while req_rx.recv().await.is_some() {}
+            let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
+            return (s, sz, 0);
+        }
+    };
+
+    let (status, resp_size, req_size) = if use_tls {
+        let tls_result = if tls_insecure {
+            let connector = get_tls_connector_insecure();
+            timeout(CONNECT_TIMEOUT, connector.connect(backend_tcp, &sni)).await
+        } else {
+            let connector = get_tls_connector();
+            timeout(CONNECT_TIMEOUT, connector.connect(backend_tcp, &sni)).await
+        };
+        match tls_result {
+            Ok(Ok(mut backend)) => {
+                h2_run_streaming_upload(
+                    &mut backend,
+                    request,
+                    req_rx,
+                    &compression,
+                    client_encoding,
+                    resp_tx,
+                    notify,
+                )
+                .await
+            }
+            _ => {
+                request_buf_put(request);
+                while req_rx.recv().await.is_some() {}
+                let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
+                (s, sz, 0)
+            }
+        }
+    } else {
+        let mut backend = backend_tcp;
+        h2_run_streaming_upload(
+            &mut backend,
+            request,
+            req_rx,
+            &compression,
+            client_encoding,
+            resp_tx,
+            notify,
+        )
+        .await
+    };
+    let _ = &security;
+    server.release();
+    (status, resp_size, req_size)
+}
+
+/// chunked リクエストヘッド送出 → req チャネルのボディ逐次転送 → レスポンスリレー。
+#[cfg(feature = "http2")]
+#[allow(clippy::too_many_arguments)]
+async fn h2_run_streaming_upload<B>(
+    backend: &mut B,
+    request: Vec<u8>,
+    req_rx: &crate::stream_channel::Receiver<Bytes>,
+    compression: &CompressionConfig,
+    client_encoding: AcceptedEncoding,
+    resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
+    notify: &crate::stream_channel::Notify,
+) -> (u16, u64, u64)
+where
+    B: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
+{
+    // ヘッダ送出。
+    let (write_res, returned_request) = backend.write_all(request).await;
+    request_buf_put(returned_request);
+    if write_res.is_err() {
+        while req_rx.recv().await.is_some() {}
+        let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
+        return (s, sz, 0);
+    }
+
+    // リクエストボディを chunked で逐次転送。
+    let mut req_size: u64 = 0;
+    while let Some(chunk) = req_rx.recv().await {
+        req_size = req_size.saturating_add(chunk.len() as u64);
+        if send_backend_chunk(backend, chunk).await.is_err() {
+            let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
+            return (s, sz, req_size);
+        }
+    }
+    // 終端チャンク。
+    if backend_write_all_bytes(backend, Bytes::from_static(b"0\r\n\r\n"))
+        .await
+        .is_err()
+    {
+        let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
+        return (s, sz, req_size);
+    }
+
+    let (status, sent, _reusable) =
+        h2_relay_backend_response(backend, compression, client_encoding, resp_tx, notify).await;
+    (status, sent, req_size)
+}
+
+/// HTTP/2 管理 API（B-29）。conn 非依存で `(status, headers, body)` を返す。
+#[cfg(all(feature = "http2", feature = "admin"))]
+fn h2_admin_response(
+    method: &[u8],
+    path: &[u8],
+    client_ip: &str,
+    headers_raw: &[(&[u8], &[u8])],
+) -> Option<(u16, Vec<(Vec<u8>, Vec<u8>)>, Vec<u8>)> {
+    let config = CURRENT_CONFIG.load();
+    let admin_config = &config.admin_config;
+    if !admin_config.enabled {
+        return None;
+    }
+    let path_str = std::str::from_utf8(path).unwrap_or("/");
+    let auth = headers_raw.iter().find_map(|(name, value)| {
+        if name.eq_ignore_ascii_case(b"authorization") {
+            std::str::from_utf8(value).ok()
+        } else {
+            None
+        }
+    });
+
+    let is_purge_method = method == b"PURGE";
+    let is_admin_purge_path = path_str.starts_with(&admin_config.cache_purge_prefix);
+
+    if is_purge_method || is_admin_purge_path {
+        let (status, body) = if !admin_config.is_ip_allowed(client_ip) {
+            (403, Vec::new())
+        } else if !admin_config.check_auth(auth) {
+            (401, Vec::new())
+        } else {
+            let resp = handle_cache_purge(path_str, is_purge_method);
+            parse_http1_admin_response(&resp)
+        };
+        return Some((status, h2_base_headers(false), body));
+    }
+
+    if !path_str.starts_with(&admin_config.path_prefix)
+        || method == b"PURGE"
+        || path_str.starts_with(&admin_config.cache_purge_prefix)
+    {
+        return None;
+    }
+
+    let path_suffix = &path_str[admin_config.path_prefix.len()..];
+    let is_known_endpoint = matches!(
+        (method, path_suffix),
+        (b"GET", "/config") | (b"GET", "/stats") | (b"POST", "/reload") | (b"POST", "/tls/reload")
+    );
+    if !is_known_endpoint {
+        return None;
+    }
+
+    let (status, body) = if !admin_config.is_ip_allowed(client_ip) {
+        (403, b"{\"error\":\"403\"}".to_vec())
+    } else if !admin_config.check_auth(auth) {
+        (401, b"{\"error\":\"401\"}".to_vec())
+    } else {
+        match (method, path_suffix) {
+            (b"GET", "/config") => {
+                let json = build_admin_config_json(&config);
+                (200, json.into_bytes())
+            }
+            (b"GET", "/stats") => {
+                let uptime_secs = PROXY_START_TIME.elapsed().as_secs();
+                let json = format!("{{\"uptime_secs\":{}}}", uptime_secs);
+                (200, json.into_bytes())
+            }
+            (b"POST", "/reload") => {
+                use std::sync::atomic::Ordering;
+                RELOAD_FLAG.store(true, Ordering::Relaxed);
+                (200, b"{\"ok\":true}".to_vec())
+            }
+            (b"POST", "/tls/reload") => {
+                use std::sync::atomic::Ordering;
+                TLS_RELOAD_FLAG.store(true, Ordering::Relaxed);
+                (200, b"{\"ok\":true}".to_vec())
+            }
+            _ => (404, Vec::new()),
+        }
+    };
+
+    let mut headers = h2_base_headers(false);
+    headers.push((b"content-type".to_vec(), b"application/json".to_vec()));
+    Some((status, headers, body))
+}
+
+// ===== F-116: 再利用ヘルパー（従来実装を維持） =====
 
 // ====================
 // F-32: HTTP/2 リクエスト方向ストリーミング
@@ -773,588 +3111,6 @@ where
     Ok(())
 }
 
-/// リクエストボディストリーミングの結果。
-#[cfg(feature = "http2")]
-enum ReqStreamOutcome {
-    /// END_STREAM（または末尾トレーラー）を受信し終端チャンクを送出した（応答リレーへ）。
-    Complete,
-    /// クライアントが RST_STREAM 等で対象ストリームを閉じた。
-    ClientReset,
-    /// 受信ボディが `max_request_body_size` を超過した。
-    TooLarge,
-    /// バックエンド書き込みエラー。
-    BackendError,
-    /// 接続レベルのプロトコルエラー（呼び出し側で GOAWAY）。
-    ConnError(http2::Http2Error),
-    /// 接続が閉じられた。
-    ConnClosed,
-}
-
-/// HEADERS 受信後のリクエストボディ（DATA フレーム）を chunked でバックエンドへ
-/// ゼロコピー逐次転送する（F-32 リクエスト方向ストリーミングの中核）。
-///
-/// 各 DATA フレームは `recv_data_for_streaming` でフロー制御・WINDOW_UPDATE・content-length
-/// 検証を処理しつつ **`request_body` へはバッファせず**、所有バッファのまま
-/// `send_backend_chunk` で送出する。バックエンド書き込みが完了するまで次フレームを読まない
-/// ため、クライアント → プロキシ → バックエンドのバックプレッシャが自然に伝播し、RSS は
-/// ペイロードサイズに比例しない（保持は最大 1 フレーム分）。
-///
-/// 転送中に**他ストリーム**が完了した場合はその `ProcessedRequest` を `deferred` に収集して返し、
-/// 呼び出し側が逐次処理する（現行の単一リクエスト直列モデルと整合）。
-#[cfg(feature = "http2")]
-async fn stream_h2_request_body_to_backend<S, B>(
-    conn: &mut http2::Http2Connection<S>,
-    target_stream: u32,
-    backend: &mut B,
-    max_body_size: usize,
-    body_bytes: &mut u64,
-) -> (ReqStreamOutcome, Vec<http2::ProcessedRequest>)
-where
-    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
-    B: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRent + Unpin,
-{
-    use http2::frame::Frame;
-
-    // 転送した（デコード済み）ボディ総バイト数を呼び出し側へ返す（アクセスログ用）。
-    // どの分岐で return しても呼び出し側が値を読めるよう `&mut u64` で逐次更新する。
-    let mut deferred: Vec<http2::ProcessedRequest> = Vec::new();
-
-    loop {
-        let frame = match conn.read_frame().await {
-            Ok(f) => f,
-            Err(http2::Http2Error::ConnectionClosed) => {
-                return (ReqStreamOutcome::ConnClosed, deferred)
-            }
-            Err(e) => return (ReqStreamOutcome::ConnError(e), deferred),
-        };
-
-        match frame {
-            Frame::Data {
-                stream_id,
-                end_stream,
-                data,
-            } if stream_id == target_stream => {
-                let data_len = data.len();
-                // フロー制御・状態遷移・content-length 検証（バッファリングなし）
-                if let Err(e) = conn
-                    .recv_data_for_streaming(target_stream, end_stream, data_len)
-                    .await
-                {
-                    return (ReqStreamOutcome::ConnError(e), deferred);
-                }
-                *body_bytes = body_bytes.saturating_add(data_len as u64);
-                if *body_bytes > max_body_size as u64 {
-                    return (ReqStreamOutcome::TooLarge, deferred);
-                }
-                if data_len > 0 {
-                    // ゼロコピー: 受信フレームの所有バッファをそのまま chunked 送出
-                    if send_backend_chunk(backend, Bytes::from(data))
-                        .await
-                        .is_err()
-                    {
-                        return (ReqStreamOutcome::BackendError, deferred);
-                    }
-                }
-                if end_stream {
-                    // 終端チャンク
-                    if backend_write_all_bytes(backend, Bytes::from_static(b"0\r\n\r\n"))
-                        .await
-                        .is_err()
-                    {
-                        return (ReqStreamOutcome::BackendError, deferred);
-                    }
-                    return (ReqStreamOutcome::Complete, deferred);
-                }
-            }
-            other => {
-                // 制御フレーム・他ストリーム・対象ストリームのトレーラーは通常処理に委譲
-                match conn.process_frame(other).await {
-                    Ok(Some(req)) => {
-                        if req.stream_id == target_stream {
-                            if !req.body_pending {
-                                // トレーラー（HEADERS with END_STREAM）等で終了
-                                if backend_write_all_bytes(
-                                    backend,
-                                    Bytes::from_static(b"0\r\n\r\n"),
-                                )
-                                .await
-                                .is_err()
-                                {
-                                    return (ReqStreamOutcome::BackendError, deferred);
-                                }
-                                return (ReqStreamOutcome::Complete, deferred);
-                            }
-                            // 対象ストリームの body_pending:true は起こらない想定（既に開始済み）
-                        } else if !req.body_pending {
-                            // 他ストリームが完了 → 遅延処理キューへ（直列処理）
-                            deferred.push(req);
-                        }
-                        // 他ストリームの body_pending:true は無視（DATA は process_frame が蓄積）
-                    }
-                    Ok(None) => {}
-                    Err(e) => return (ReqStreamOutcome::ConnError(e), deferred),
-                }
-                // クライアントが対象ストリームを閉じた（RST_STREAM 等）
-                if conn.get_stream(target_stream).is_none() {
-                    return (ReqStreamOutcome::ClientReset, deferred);
-                }
-            }
-        }
-    }
-}
-
-/// ストリーミングしたリクエストボディをバックエンドへ送り、応答をクライアントへリレーする
-/// 内部処理（バックエンド接続種別 `B` に非依存で総称化）。
-///
-/// 1. リクエストヘッダー（`Transfer-Encoding: chunked`）を送信
-/// 2. `stream_h2_request_body_to_backend` でボディを逐次転送
-/// 3. `relay_h2_response` で応答をリレー
-///
-/// 戻り値: `(status, resp_size, req_body_size, deferred)`。`status == 0` は応答不要
-/// （クライアント RST 等）を示す。
-#[cfg(feature = "http2")]
-#[allow(clippy::too_many_arguments)]
-async fn run_h2_request_streaming<S, B>(
-    conn: &mut http2::Http2Connection<S>,
-    stream_id: u32,
-    backend: &mut B,
-    request_headers: Vec<u8>,
-    compression: &CompressionConfig,
-    client_encoding: AcceptedEncoding,
-    max_body_size: usize,
-) -> (u16, u64, u64, Vec<http2::ProcessedRequest>)
-where
-    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
-    B: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRent + Unpin,
-{
-    use http2::Http2ErrorCode;
-
-    // リクエストヘッダー送信（ヘッダーは小さいため write_all で十分）
-    let (write_res, returned_request) = backend.write_all(request_headers).await;
-    request_buf_put(returned_request);
-    if write_res.is_err() {
-        let server_guard = get_server_header_guard();
-        let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-        if let Some(ref g) = server_guard {
-            headers.push(g.as_header());
-        }
-        // ヘッダー送信前にボディを送れていないため、応答は返せるがクライアントは
-        // まだボディ送信中。502 + RST で打ち切る。
-        let _ = conn
-            .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
-            .await;
-        let _ = conn
-            .send_rst_stream(stream_id, Http2ErrorCode::InternalError)
-            .await;
-        return (502, 11, 0, Vec::new());
-    }
-
-    // リクエストボディを逐次転送（転送した総バイト数を req_body_size に得る）
-    let mut req_body_size: u64 = 0;
-    let (outcome, deferred) = stream_h2_request_body_to_backend(
-        conn,
-        stream_id,
-        backend,
-        max_body_size,
-        &mut req_body_size,
-    )
-    .await;
-
-    match outcome {
-        ReqStreamOutcome::Complete => {
-            // 応答をリレー（この経路のバックエンドはリクエストを chunked 送信した専用接続の
-            // ため、再利用フラグは使わずクローズする）
-            let (status, resp_size, _reusable) =
-                relay_h2_response(conn, stream_id, backend, compression, client_encoding)
-                    .await
-                    .unwrap_or((502, 11, false));
-            (status, resp_size, req_body_size, deferred)
-        }
-        ReqStreamOutcome::TooLarge => {
-            // ボディ上限超過: 413 + RST。バックエンドは終端チャンク未送のまま切断される。
-            let server_guard = get_server_header_guard();
-            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-            if let Some(ref g) = server_guard {
-                headers.push(g.as_header());
-            }
-            let _ = conn
-                .send_response(stream_id, 413, &headers, Some(b"Payload Too Large"))
-                .await;
-            let _ = conn
-                .send_rst_stream(stream_id, Http2ErrorCode::EnhanceYourCalm)
-                .await;
-            (413, 17, req_body_size, deferred)
-        }
-        ReqStreamOutcome::BackendError => {
-            let server_guard = get_server_header_guard();
-            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-            if let Some(ref g) = server_guard {
-                headers.push(g.as_header());
-            }
-            let _ = conn
-                .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
-                .await;
-            (502, 11, req_body_size, deferred)
-        }
-        ReqStreamOutcome::ClientReset | ReqStreamOutcome::ConnClosed => {
-            // クライアントが打ち切ったため応答不要
-            (0, 0, req_body_size, deferred)
-        }
-        ReqStreamOutcome::ConnError(e) => {
-            // 接続レベルエラー: GOAWAY を送って接続を終了させる
-            let _ = conn
-                .send_goaway(e.error_code(), e.to_string().as_bytes())
-                .await;
-            (0, 0, req_body_size, deferred)
-        }
-    }
-}
-
-/// HEADERS 完了（`body_pending`）時点で呼ばれ、リクエストがストリーミング適格なら
-/// HEADERS 受信時点でバックエンド接続を開始しボディ（DATA フレーム）を逐次転送する。
-///
-/// 非適格（プロキシ以外 / h2c バックエンド / WASM モジュール適用 / gRPC / バッファリング
-/// `full` / セキュリティ非許可）の場合は**何もしない**。呼び出し側ループは継続し、DATA は
-/// 従来どおり `request_body` に蓄積され、END_STREAM 受信時に `process_completed_h2_request`
-/// が処理する（回帰なしのフォールバック）。
-#[cfg(feature = "http2")]
-async fn handle_h2_request_streaming<S>(
-    conn: &mut http2::Http2Connection<S>,
-    stream_id: u32,
-    client_ip: &str,
-    connection_metric: &mut ActiveConnectionMetric,
-) where
-    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
-{
-    // --- リクエストライン/ヘッダー情報を取得 ---
-    let (method, path, authority) = {
-        if let Some(stream) = conn.get_stream(stream_id) {
-            let method = stream
-                .method()
-                .map(|m| m.to_vec())
-                .unwrap_or_else(|| b"GET".to_vec());
-            let path = stream
-                .path()
-                .map(|p| p.to_vec())
-                .unwrap_or_else(|| b"/".to_vec());
-            let authority = stream
-                .authority()
-                .map(|a| a.to_vec())
-                .or_else(|| {
-                    stream
-                        .request_headers
-                        .iter()
-                        .find(|h| h.name.eq_ignore_ascii_case(b"host"))
-                        .map(|h| h.value.clone())
-                })
-                .unwrap_or_default();
-            (method, path, authority)
-        } else {
-            return;
-        }
-    };
-
-    // --- ルーティング ---
-    let config = CURRENT_CONFIG.load();
-    let h2_headers_store: Vec<(Vec<u8>, Vec<u8>)> = if let Some(stream) = conn.get_stream(stream_id)
-    {
-        stream
-            .request_headers
-            .iter()
-            .map(|h| (h.name.clone(), h.value.clone()))
-            .collect()
-    } else {
-        return;
-    };
-    let headers_raw: Vec<(&[u8], &[u8])> = h2_headers_store
-        .iter()
-        .map(|(k, v)| (k.as_slice(), v.as_slice()))
-        .collect();
-
-    let query_start_pos = path.iter().position(|&b| b == b'?');
-    let raw_query: &[u8] = query_start_pos.map(|i| &path[i + 1..]).unwrap_or(b"");
-    let path_without_query = query_start_pos.map(|i| &path[..i]).unwrap_or(&path[..]);
-
-    let client_socket_addr = if let Ok(addr) = client_ip.parse::<SocketAddr>() {
-        addr
-    } else if let Ok(ip) = client_ip.parse::<std::net::IpAddr>() {
-        SocketAddr::new(ip, 80)
-    } else {
-        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 0)
-    };
-
-    let backend_result = find_backend_unified(
-        &authority,
-        path_without_query,
-        &method,
-        &headers_raw,
-        raw_query,
-        &client_socket_addr,
-        config.route.as_slice(),
-        &config.upstream_groups,
-    )
-    .or_else(|| {
-        if !authority.is_empty() {
-            find_backend_unified(
-                b"",
-                path_without_query,
-                &method,
-                &headers_raw,
-                raw_query,
-                &client_socket_addr,
-                config.route.as_slice(),
-                &config.upstream_groups,
-            )
-        } else {
-            None
-        }
-    });
-
-    let (prefix, backend, _route_compression) = match backend_result {
-        Some(b) => b,
-        None => return, // ルート無し → バッファ経路（404）にフォールバック
-    };
-
-    // Proxy バックエンドのみストリーミング対象
-    let (upstream_group, security, compression, buffering) = match &backend {
-        Backend::Proxy(ug, sec, comp, buf, _cache, modules) => {
-            // WASM モジュール適用ルートはボディフィルタが全ボディを要求しうるため非対象
-            if modules.as_ref().is_some_and(|m| !m.is_empty()) {
-                return;
-            }
-            (ug.clone(), sec.clone(), comp.clone(), buf.clone())
-        }
-        _ => return, // 静的ファイル/リダイレクト等 → バッファ経路
-    };
-
-    // gRPC はトレイラー等の特別処理が必要なため HTTP/2 汎用ストリーミング非対象
-    // （H2C 専用経路で処理。Full バッファリングも H2C 側でバイパスされる）
-    let is_grpc = h2_headers_store.iter().any(|(name, value)| {
-        name.eq_ignore_ascii_case(b"content-type")
-            && value
-                .get(..16)
-                .map(|p| p.eq_ignore_ascii_case(b"application/grpc"))
-                .unwrap_or(false)
-    });
-    if is_grpc {
-        return;
-    }
-
-    // バッファリングモードが full ならストリーミングしない（gRPC 以外）
-    if buffering.mode == crate::buffering::BufferingMode::Full {
-        return;
-    }
-
-    // セキュリティ（IP/メソッド/レート）。ボディサイズは転送中に強制するため is_chunked=true。
-    if check_security(&security, client_ip, &method, 0, true) != SecurityCheckResult::Allowed {
-        // 非許可は拒否ロジックを一本化するためバッファ経路に委ねる
-        return;
-    }
-
-    // サーバー選択 + h2c 判定（h2c バックエンドへのストリーミングは未対応）
-    let server = match upstream_group.select(client_ip) {
-        Some(s) => s,
-        None => return,
-    };
-    if server.target.use_h2c {
-        return;
-    }
-
-    // Accept-Encoding（応答圧縮判定用）
-    let client_encoding = h2_headers_store
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case(b"accept-encoding"))
-        .map(|(_, v)| AcceptedEncoding::parse(v))
-        .unwrap_or(AcceptedEncoding::Identity);
-
-    let max_body_size = security.max_request_body_size;
-
-    server.acquire();
-    let target = &server.target;
-    let use_tls = target.use_tls;
-    let sni = target.sni().to_string();
-    let addr = HostPortStr::new(&target.host, target.port); // F-41: スタック上に構築（ヒープ確保なし）
-    let addr = addr.as_str();
-
-    // --- リクエストヘッダー（Transfer-Encoding: chunked）を構築 ---
-    // gRPC はフルパス保持（B-40）。ストリーミング経路は通常 gRPC 非対象だが一貫させる。
-    let path_str = std::str::from_utf8(&path).unwrap_or("/");
-    let preserve_grpc_path = conn.get_stream(stream_id).is_some_and(|stream| {
-        stream
-            .request_headers
-            .iter()
-            .any(|h| header_pair_is_grpc(&h.name, &h.value))
-    });
-    let final_path_owned =
-        compute_upstream_path(path_str, &prefix, &target.path_prefix, preserve_grpc_path);
-    let final_path = final_path_owned.as_str();
-
-    let mut request = request_buf_get(1024);
-    request.extend_from_slice(&method);
-    request.extend_from_slice(b" ");
-    request.extend_from_slice(final_path.as_bytes());
-    request.extend_from_slice(b" HTTP/1.1\r\nHost: ");
-    request.extend_from_slice(target.host.as_bytes());
-    if !target.is_default_port() {
-        request.extend_from_slice(b":");
-        let mut port_buf = itoa::Buffer::new();
-        request.extend_from_slice(port_buf.format(target.port).as_bytes());
-    }
-    request.extend_from_slice(b"\r\n");
-    if let Some(stream) = conn.get_stream(stream_id) {
-        for header in &stream.request_headers {
-            if header.name.starts_with(b":") {
-                continue;
-            }
-            if header.name.eq_ignore_ascii_case(b"connection")
-                || header.name.eq_ignore_ascii_case(b"keep-alive")
-                || header.name.eq_ignore_ascii_case(b"transfer-encoding")
-                || header.name.eq_ignore_ascii_case(b"content-length")
-            {
-                continue;
-            }
-            request.extend_from_slice(&header.name);
-            request.extend_from_slice(b": ");
-            request.extend_from_slice(&header.value);
-            request.extend_from_slice(b"\r\n");
-        }
-    }
-    request.extend_from_slice(b"Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n");
-
-    if let Ok(host_str) = std::str::from_utf8(&authority) {
-        connection_metric.set_host(host_str.to_string());
-    }
-    let start_instant = Instant::now();
-
-    // --- バックエンド接続 + ストリーミング ---
-    let connect_result = timeout(CONNECT_TIMEOUT, TcpStream::connect_str(addr)).await;
-    let backend_tcp = match connect_result {
-        Ok(Ok(s)) => s,
-        _ => {
-            server.release();
-            let server_guard = get_server_header_guard();
-            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-            if let Some(ref g) = server_guard {
-                headers.push(g.as_header());
-            }
-            let _ = conn
-                .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
-                .await;
-            request_buf_put(request);
-            log_streamed_access(
-                &method,
-                &authority,
-                &path,
-                0,
-                502,
-                11,
-                start_instant,
-                client_ip,
-            );
-            return;
-        }
-    };
-    // ストリーミングアップロードはスループット優先のため Nagle を有効のままにする
-    // （チャンクヘッダ/ペイロード/CRLF の小書き込みをカーネルが結合する）
-
-    let tls_insecure = upstream_group.tls_insecure();
-    let (status, resp_size, req_body_size, deferred) = if use_tls {
-        let tls_result = if tls_insecure {
-            let connector = get_tls_connector_insecure();
-            timeout(CONNECT_TIMEOUT, connector.connect(backend_tcp, &sni)).await
-        } else {
-            let connector = get_tls_connector();
-            timeout(CONNECT_TIMEOUT, connector.connect(backend_tcp, &sni)).await
-        };
-        match tls_result {
-            Ok(Ok(mut backend)) => {
-                run_h2_request_streaming(
-                    conn,
-                    stream_id,
-                    &mut backend,
-                    request,
-                    &compression,
-                    client_encoding,
-                    max_body_size,
-                )
-                .await
-            }
-            _ => {
-                request_buf_put(request);
-                let server_guard = get_server_header_guard();
-                let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-                if let Some(ref g) = server_guard {
-                    headers.push(g.as_header());
-                }
-                let _ = conn
-                    .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
-                    .await;
-                (502, 11, 0, Vec::new())
-            }
-        }
-    } else {
-        let mut backend = backend_tcp;
-        run_h2_request_streaming(
-            conn,
-            stream_id,
-            &mut backend,
-            request,
-            &compression,
-            client_encoding,
-            max_body_size,
-        )
-        .await
-    };
-
-    server.release();
-
-    // アクセスログ（status==0 は応答不要のため記録しない）
-    if status != 0 {
-        log_streamed_access(
-            &method,
-            &authority,
-            &path,
-            req_body_size,
-            status,
-            resp_size,
-            start_instant,
-            client_ip,
-        );
-    }
-
-    // 転送中に完了した他ストリームを逐次処理
-    for dreq in deferred {
-        process_completed_h2_request(conn, dreq.stream_id, client_ip, connection_metric).await;
-    }
-}
-
-/// ストリーミング経路用のアクセスログ出力ヘルパー（User-Agent はストリーム未保持のため省略）。
-#[cfg(feature = "http2")]
-#[allow(clippy::too_many_arguments)]
-fn log_streamed_access(
-    method: &[u8],
-    authority: &[u8],
-    path: &[u8],
-    req_body_size: u64,
-    status: u16,
-    resp_size: u64,
-    start_instant: Instant,
-    client_ip: &str,
-) {
-    log_access(
-        method,
-        authority,
-        path,
-        &[],
-        req_body_size,
-        status,
-        resp_size,
-        start_instant,
-        client_ip,
-        "",
-    );
-}
-
 /// HTTP/1.1 レスポンスバイト列からステータスコードとボディを抽出（管理 API Purge 用）
 #[cfg(all(feature = "http2", feature = "admin"))]
 fn parse_http1_admin_response(resp: &[u8]) -> (u16, Vec<u8>) {
@@ -1377,125 +3133,6 @@ fn parse_http1_admin_response(resp: &[u8]) -> (u16, Vec<u8>) {
         .map(|i| resp[i + 4..].to_vec())
         .unwrap_or_default();
     (status, body)
-}
-
-/// HTTP/2 管理 API 処理（B-29: HTTP/1.1 経路と同等の admin / cache purge）
-#[cfg(all(feature = "http2", feature = "admin"))]
-async fn handle_http2_admin_request<S>(
-    conn: &mut http2::Http2Connection<S>,
-    stream_id: u32,
-    method: &[u8],
-    path: &[u8],
-    client_ip: &str,
-    headers_raw: &[(&[u8], &[u8])],
-) -> Option<(u16, u64)>
-where
-    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
-{
-    let config = CURRENT_CONFIG.load();
-    let admin_config = &config.admin_config;
-    if !admin_config.enabled {
-        return None;
-    }
-
-    let path_str = std::str::from_utf8(path).unwrap_or("/");
-    let auth = headers_raw.iter().find_map(|(name, value)| {
-        if name.eq_ignore_ascii_case(b"authorization") {
-            std::str::from_utf8(value).ok()
-        } else {
-            None
-        }
-    });
-
-    let is_purge_method = method == b"PURGE";
-    let is_admin_purge_path = path_str.starts_with(&admin_config.cache_purge_prefix);
-
-    if is_purge_method || is_admin_purge_path {
-        let (status, body) = if !admin_config.is_ip_allowed(client_ip) {
-            (403, Vec::new())
-        } else if !admin_config.check_auth(auth) {
-            (401, Vec::new())
-        } else {
-            let resp = handle_cache_purge(path_str, is_purge_method);
-            parse_http1_admin_response(&resp)
-        };
-
-        let server_guard = get_server_header_guard();
-        let mut h2_headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-        if let Some(ref g) = server_guard {
-            h2_headers.push(g.as_header());
-        }
-        let body_ref = if body.is_empty() {
-            None
-        } else {
-            Some(body.as_slice())
-        };
-        let _ = conn
-            .send_response(stream_id, status, &h2_headers, body_ref)
-            .await;
-        return Some((status, body.len().max(0) as u64));
-    }
-
-    if !path_str.starts_with(&admin_config.path_prefix)
-        || method == b"PURGE"
-        || path_str.starts_with(&admin_config.cache_purge_prefix)
-    {
-        return None;
-    }
-
-    let path_suffix = &path_str[admin_config.path_prefix.len()..];
-    let is_known_endpoint = matches!(
-        (method, path_suffix),
-        (b"GET", "/config") | (b"GET", "/stats") | (b"POST", "/reload") | (b"POST", "/tls/reload")
-    );
-    if !is_known_endpoint {
-        return None;
-    }
-
-    let (status, body) = if !admin_config.is_ip_allowed(client_ip) {
-        (403, b"{\"error\":\"403\"}".to_vec())
-    } else if !admin_config.check_auth(auth) {
-        (401, b"{\"error\":\"401\"}".to_vec())
-    } else {
-        match (method, path_suffix) {
-            (b"GET", "/config") => {
-                let json = build_admin_config_json(&config);
-                (200, json.into_bytes())
-            }
-            (b"GET", "/stats") => {
-                let uptime_secs = PROXY_START_TIME.elapsed().as_secs();
-                let json = format!("{{\"uptime_secs\":{}}}", uptime_secs);
-                (200, json.into_bytes())
-            }
-            (b"POST", "/reload") => {
-                use std::sync::atomic::Ordering;
-                RELOAD_FLAG.store(true, Ordering::Relaxed);
-                (200, b"{\"ok\":true}".to_vec())
-            }
-            (b"POST", "/tls/reload") => {
-                use std::sync::atomic::Ordering;
-                TLS_RELOAD_FLAG.store(true, Ordering::Relaxed);
-                (200, b"{\"ok\":true}".to_vec())
-            }
-            _ => (404, Vec::new()),
-        }
-    };
-
-    let server_guard = get_server_header_guard();
-    let mut h2_headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(3);
-    h2_headers.push((b"content-type", b"application/json"));
-    if let Some(ref g) = server_guard {
-        h2_headers.push(g.as_header());
-    }
-    let body_ref = if body.is_empty() {
-        None
-    } else {
-        Some(body.as_slice())
-    };
-    let _ = conn
-        .send_response(stream_id, status, &h2_headers, body_ref)
-        .await;
-    Some((status, body.len() as u64))
 }
 
 /// HTTP/2 応答ヘッダーへ WASM レスポンスフィルタを適用（B-30）
@@ -1584,594 +3221,6 @@ fn build_h2_compressed_file_response(
     (header_store, response_body)
 }
 
-/// HTTP/2 単一リクエスト処理
-#[cfg(feature = "http2")]
-async fn handle_http2_single_request<S>(
-    conn: &mut http2::Http2Connection<S>,
-    stream_id: u32,
-    method: &[u8],
-    path: &[u8],
-    authority: &[u8],
-    body_len: usize,
-    client_ip: &str,
-) -> Option<(u16, u64)>
-where
-    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
-{
-    // メトリクスエンドポイントの処理（設定可能なパス）
-    {
-        let config = CURRENT_CONFIG.load();
-        let prom_config = &config.prometheus_config;
-
-        let path_str = std::str::from_utf8(path).unwrap_or("/");
-        if prom_config.enabled && path_str == prom_config.path && method == b"GET" {
-            // IPアドレス制限チェック
-            if !prom_config.is_ip_allowed(client_ip) {
-                let server_guard = get_server_header_guard();
-                let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-                if let Some(ref g) = server_guard {
-                    headers.push(g.as_header());
-                }
-                let _ = conn
-                    .send_response(stream_id, 403, &headers, Some(b"Forbidden"))
-                    .await;
-                return Some((403, 9));
-            }
-
-            let body = encode_prometheus_metrics();
-            let server_guard = get_server_header_guard();
-            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(3);
-            headers.push((b"content-type", b"text/plain; version=0.0.4; charset=utf-8"));
-            if let Some(ref g) = server_guard {
-                headers.push(g.as_header());
-            }
-            if let Err(e) = conn
-                .send_response(stream_id, 200, &headers, Some(&body))
-                .await
-            {
-                warn!("[HTTP/2] Metrics response error: {}", e);
-                return None;
-            }
-            return Some((200, body.len() as u64));
-        }
-    }
-
-    // Backend選択（統合ルーティング）
-    let config = CURRENT_CONFIG.load();
-
-    // HTTP/2 ヘッダーをバイト列ペアとして収集
-    // conn の borrow 解放のため Vec<u8> にコピー（String アロケーション・HashMap 不要）
-    let h2_headers_store: Vec<(Vec<u8>, Vec<u8>)> = if let Some(stream) = conn.get_stream(stream_id)
-    {
-        stream
-            .request_headers
-            .iter()
-            .map(|h| (h.name.clone(), h.value.clone()))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let headers_raw: Vec<(&[u8], &[u8])> = h2_headers_store
-        .iter()
-        .map(|(k, v)| (k.as_slice(), v.as_slice()))
-        .collect();
-
-    // 管理 API（B-29: HTTP/2 経路でも /__admin へ到達可能にする）
-    #[cfg(feature = "admin")]
-    if let Some(result) =
-        handle_http2_admin_request(conn, stream_id, method, path, client_ip, &headers_raw).await
-    {
-        return Some(result);
-    }
-
-    // パス/クエリ分離（スキャンを1回に統一）
-    let query_start_pos = path.iter().position(|&b| b == b'?');
-    let raw_query: &[u8] = query_start_pos.map(|i| &path[i + 1..]).unwrap_or(b"");
-    // パスからクエリ部分を除去
-    let path_without_query = query_start_pos.map(|i| &path[..i]).unwrap_or(path);
-
-    // クライアントIPをSocketAddrに変換
-    let client_socket_addr = if let Ok(addr) = client_ip.parse::<SocketAddr>() {
-        addr
-    } else {
-        // IPアドレスのみの場合、ポート80を仮定
-        if let Ok(ip) = client_ip.parse::<std::net::IpAddr>() {
-            SocketAddr::new(ip, 80)
-        } else {
-            // パースに失敗した場合はデフォルト
-            SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 0)
-        }
-    };
-
-    let backend_result = find_backend_unified(
-        authority,
-        path_without_query,
-        method,
-        &headers_raw,
-        raw_query,
-        &client_socket_addr,
-        config.route.as_slice(),
-        &config.upstream_groups,
-    )
-    .or_else(|| {
-        // authority が空でない場合、デフォルトルートを検索
-        if !authority.is_empty() {
-            debug!(
-                "[HTTP/2] No route found for authority '{}', trying default routes",
-                String::from_utf8_lossy(authority)
-            );
-            find_backend_unified(
-                b"",
-                path_without_query,
-                method,
-                &headers_raw,
-                raw_query,
-                &client_socket_addr,
-                config.route.as_slice(),
-                &config.upstream_groups,
-            )
-        } else {
-            None
-        }
-    });
-
-    let (prefix, backend, route_compression) = match backend_result {
-        Some(b) => b,
-        None => {
-            warn!(
-                "[HTTP/2] No backend found for authority='{}' path='{}'",
-                String::from_utf8_lossy(authority),
-                String::from_utf8_lossy(path)
-            );
-            let server_guard = get_server_header_guard();
-            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-            if let Some(ref g) = server_guard {
-                headers.push(g.as_header());
-            }
-            let _ = conn
-                .send_response(stream_id, 404, &headers, Some(b"Not Found"))
-                .await;
-            return Some((404, 9));
-        }
-    };
-
-    // セキュリティチェック（共通関数を使用）
-    let security = backend.security();
-    let check_result = check_security(security, client_ip, method, body_len, false);
-
-    if check_result != SecurityCheckResult::Allowed {
-        let status = check_result.status_code();
-        let msg = check_result.message();
-        let server_guard = get_server_header_guard();
-        let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-        if let Some(ref g) = server_guard {
-            headers.push(g.as_header());
-        }
-        let _ = conn
-            .send_response(stream_id, status, &headers, Some(msg))
-            .await;
-        return Some((status, msg.len() as u64));
-    }
-
-    // WASMモジュールの適用
-    #[cfg(feature = "wasm")]
-    let wasm_modules_to_apply: Arc<Vec<String>> = {
-        let config = CURRENT_CONFIG.load();
-        if let Some(ref wasm_engine) = config.wasm_filter_engine {
-            let path_str = std::str::from_utf8(path).unwrap_or("/");
-            let method_str = std::str::from_utf8(method).unwrap_or("GET");
-
-            // F-43: モジュールリストは Arc 共有（リクエストごとの Vec<String> deep copy 排除）
-            let modules_to_apply = if let Some(backend_modules) = backend.modules_arc() {
-                backend_modules.clone()
-            } else {
-                // ルートレベルのmodulesが指定されていない場合は、WASMモジュールを適用しない
-                crate::wasm::empty_wasm_modules()
-            };
-
-            if !modules_to_apply.is_empty() {
-                // HTTP/2のヘッダーを取得
-                let headers_vec: Vec<(Vec<u8>, Vec<u8>)> =
-                    if let Some(stream) = conn.get_stream(stream_id) {
-                        stream
-                            .request_headers
-                            .iter()
-                            .map(|h| (h.name.clone(), h.value.clone()))
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-
-                let wasm_result = wasm_engine
-                    .clone()
-                    .on_request_headers_with_modules_async(
-                        modules_to_apply.clone(),
-                        Arc::from(path_str),
-                        Arc::from(method_str),
-                        headers_vec,
-                        Arc::from(client_ip),
-                        body_len == 0, // end_of_stream
-                    )
-                    .await;
-
-                match wasm_result {
-                    crate::wasm::FilterResult::LocalResponse(resp) => {
-                        // ローカルレスポンスを返送
-                        let server_guard = get_server_header_guard();
-                        let mut headers: Vec<(&[u8], &[u8])> = resp
-                            .headers
-                            .iter()
-                            .map(|(k, v)| (k.as_slice(), v.as_slice()))
-                            .collect();
-                        if let Some(ref g) = server_guard {
-                            headers.push(g.as_header());
-                        }
-
-                        let _ = conn
-                            .send_response(stream_id, resp.status_code, &headers, Some(&resp.body))
-                            .await;
-                        // ライフサイクルコールバック: リクエスト完了
-                        crate::wasm::on_request_complete_async(
-                            wasm_engine.clone(),
-                            modules_to_apply.clone(),
-                        )
-                        .await;
-                        return Some((resp.status_code, resp.body.len() as u64));
-                    }
-                    crate::wasm::FilterResult::Pause => {
-                        warn!("WASM module requested pause, but async operations are not yet supported");
-                    }
-                    crate::wasm::FilterResult::Continue { .. } => {
-                        // ヘッダー変更はHTTP/2では複雑なため、現時点ではスキップ
-                        // 将来的に実装可能
-                    }
-                }
-            }
-            modules_to_apply
-        } else {
-            crate::wasm::empty_wasm_modules()
-        }
-    };
-
-    // Accept-Encoding を取得
-    let client_encoding = if let Some(stream) = conn.get_stream(stream_id) {
-        stream
-            .request_headers
-            .iter()
-            .find(|h| h.name.eq_ignore_ascii_case(b"accept-encoding"))
-            .map(|h| AcceptedEncoding::parse(&h.value))
-            .unwrap_or(AcceptedEncoding::Identity)
-    } else {
-        AcceptedEncoding::Identity
-    };
-
-    // Backend処理
-    let result = match backend {
-        Backend::Proxy(upstream_group, security, compression, _buffering, _cache, _) => {
-            handle_http2_proxy(
-                conn,
-                stream_id,
-                &upstream_group,
-                &compression,
-                client_encoding,
-                method,
-                path,
-                &prefix,
-                client_ip,
-                &security,
-                #[cfg(feature = "wasm")]
-                &wasm_modules_to_apply,
-            )
-            .await
-        }
-        Backend::MemoryFile(data, mime_type, security, _) => {
-            // ファイル完全一致チェック
-            let path_str = std::str::from_utf8(path).unwrap_or("/");
-            let prefix_str = std::str::from_utf8(&prefix).unwrap_or("");
-
-            let remainder = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
-                &path_str[prefix_str.len()..]
-            } else {
-                ""
-            };
-
-            let clean_remainder = remainder.trim_matches('/');
-            if !clean_remainder.is_empty() {
-                let server_guard = get_server_header_guard();
-                let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-                if let Some(ref g) = server_guard {
-                    headers.push(g.as_header());
-                }
-                let _ = conn
-                    .send_response(stream_id, 404, &headers, Some(b"Not Found"))
-                    .await;
-                Some((404, 9))
-            } else {
-                let (built_headers, response_body) = build_h2_compressed_file_response(
-                    &data,
-                    mime_type.as_ref(),
-                    &security,
-                    &route_compression,
-                    client_encoding,
-                );
-
-                #[cfg(feature = "wasm")]
-                let header_store =
-                    apply_h2_wasm_response_headers(&wasm_modules_to_apply, 200, built_headers)
-                        .await;
-                #[cfg(not(feature = "wasm"))]
-                let header_store = built_headers;
-
-                let headers: Vec<(&[u8], &[u8])> = header_store
-                    .iter()
-                    .map(|(k, v)| (k.as_slice(), v.as_slice()))
-                    .collect();
-
-                if let Err(e) = conn
-                    .send_response(stream_id, 200, &headers, Some(&response_body))
-                    .await
-                {
-                    warn!("[HTTP/2] Memory file response error: {}", e);
-                    None
-                } else {
-                    Some((200, response_body.len() as u64))
-                }
-            }
-        }
-        Backend::SendFile(
-            base_path,
-            is_dir,
-            index_file,
-            security,
-            _cache,
-            _open_file_cache_config,
-            _,
-        ) => {
-            handle_http2_sendfile(
-                conn,
-                stream_id,
-                &base_path,
-                is_dir,
-                index_file.as_deref(),
-                path,
-                &prefix,
-                &security,
-                &route_compression,
-                client_encoding,
-                #[cfg(feature = "wasm")]
-                &wasm_modules_to_apply,
-            )
-            .await
-        }
-        Backend::Redirect(redirect_url, status_code, preserve_path, _) => {
-            handle_http2_redirect(
-                conn,
-                stream_id,
-                &redirect_url,
-                status_code,
-                preserve_path,
-                path,
-                &prefix,
-            )
-            .await
-        }
-    };
-
-    // WASMライフサイクルコールバック: リクエスト完了
-    #[cfg(feature = "wasm")]
-    {
-        if !wasm_modules_to_apply.is_empty() {
-            let config = CURRENT_CONFIG.load();
-            if let Some(ref wasm_engine) = config.wasm_filter_engine {
-                crate::wasm::on_request_complete_async(
-                    wasm_engine.clone(),
-                    wasm_modules_to_apply.clone(),
-                )
-                .await;
-            }
-        }
-    }
-
-    result
-}
-
-/// HTTP/2 プロキシ処理（HTTP/1.1バックエンドへ変換）
-#[cfg(feature = "http2")]
-async fn handle_http2_proxy<S>(
-    conn: &mut http2::Http2Connection<S>,
-    stream_id: u32,
-    upstream_group: &Arc<UpstreamGroup>,
-    compression: &CompressionConfig,
-    client_encoding: AcceptedEncoding,
-    method: &[u8],
-    req_path: &[u8],
-    prefix: &[u8],
-    client_ip: &str,
-    security: &SecurityConfig,
-    #[cfg(feature = "wasm")] wasm_modules: &Arc<Vec<String>>,
-) -> Option<(u16, u64)>
-where
-    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
-{
-    // サーバー選択（Consistent Hash の header:/cookie: キーをリクエストヘッダから解決）
-    // get_stream の借用を select 完了前に終わらせる（後続の conn 可変借用と衝突しないよう）。
-    let hash_key_owned: Option<String> =
-        conn.get_stream(stream_id)
-            .and_then(|stream| match &upstream_group.algorithm {
-                crate::config::LoadBalanceAlgorithm::ConsistentHash {
-                    hash_key: crate::config::HashKey::Header(name),
-                } => stream
-                    .request_headers
-                    .iter()
-                    .find(|h| h.name.eq_ignore_ascii_case(name.as_bytes()))
-                    .and_then(|h| std::str::from_utf8(&h.value).ok())
-                    .map(|s| s.to_string()),
-                crate::config::LoadBalanceAlgorithm::ConsistentHash {
-                    hash_key: crate::config::HashKey::Cookie(name),
-                } => stream
-                    .request_headers
-                    .iter()
-                    .find(|h| h.name.eq_ignore_ascii_case(b"cookie"))
-                    .and_then(|h| std::str::from_utf8(&h.value).ok())
-                    .and_then(|c| {
-                        c.split(';').find_map(|part| {
-                            let part = part.trim();
-                            part.split_once('=').and_then(|(k, v)| {
-                                if k.trim().eq_ignore_ascii_case(name) {
-                                    Some(v.trim().to_string())
-                                } else {
-                                    None
-                                }
-                            })
-                        })
-                    }),
-                _ => None,
-            });
-    let server = match upstream_group.select_with_key(client_ip, hash_key_owned.as_deref(), None) {
-        Some(s) => s,
-        None => {
-            let server_guard = get_server_header_guard();
-            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-            if let Some(ref g) = server_guard {
-                headers.push(g.as_header());
-            }
-            let _ = conn
-                .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
-                .await;
-            return Some((502, 11));
-        }
-    };
-
-    server.acquire();
-    let target = &server.target;
-
-    // リクエストパス構築
-    // gRPC はサービス/メソッドのフルパス必須（/* プレフィックス除去で UNIMPLEMENTED → B-40）
-    let path_str = std::str::from_utf8(req_path).unwrap_or("/");
-    let preserve_grpc_path = {
-        if let Some(stream) = conn.get_stream(stream_id) {
-            stream
-                .request_headers
-                .iter()
-                .any(|h| header_pair_is_grpc(&h.name, &h.value))
-        } else {
-            false
-        }
-    };
-    let final_path_owned =
-        compute_upstream_path(path_str, prefix, &target.path_prefix, preserve_grpc_path);
-    let final_path = final_path_owned.as_str();
-
-    // リクエストボディを取得。
-    // BytesMut の deep clone（ボディ全体の memcpy）を避け、所有権ごとゼロコピーで
-    // 取り出して Bytes 化する（参照カウント共有。HTTP/2 → バックエンド転送用）。
-    let request_body = if let Some(stream) = conn.get_stream_mut(stream_id) {
-        std::mem::take(&mut stream.request_body).freeze()
-    } else {
-        Bytes::new()
-    };
-
-    // HTTP/1.1 リクエスト構築（プール使用）
-    let mut request = request_buf_get(1024);
-    request.extend_from_slice(method);
-    request.extend_from_slice(b" ");
-    request.extend_from_slice(final_path.as_bytes());
-    request.extend_from_slice(b" HTTP/1.1\r\nHost: ");
-    request.extend_from_slice(target.host.as_bytes());
-
-    if !target.is_default_port() {
-        request.extend_from_slice(b":");
-        let mut port_buf = itoa::Buffer::new();
-        request.extend_from_slice(port_buf.format(target.port).as_bytes());
-    }
-
-    request.extend_from_slice(b"\r\n");
-
-    // リクエストヘッダーを追加（疑似ヘッダー以外）
-    if let Some(stream) = conn.get_stream(stream_id) {
-        for header in &stream.request_headers {
-            // 疑似ヘッダーをスキップ
-            if header.name.starts_with(b":") {
-                continue;
-            }
-            // ホップバイホップヘッダーをスキップ
-            if header.name.eq_ignore_ascii_case(b"connection")
-                || header.name.eq_ignore_ascii_case(b"keep-alive")
-                || header.name.eq_ignore_ascii_case(b"transfer-encoding")
-            {
-                continue;
-            }
-            request.extend_from_slice(&header.name);
-            request.extend_from_slice(b": ");
-            request.extend_from_slice(&header.value);
-            request.extend_from_slice(b"\r\n");
-        }
-    }
-
-    // Content-Length追加（ボディがある場合）
-    if !request_body.is_empty() {
-        request.extend_from_slice(b"Content-Length: ");
-        let mut len_buf = itoa::Buffer::new();
-        request.extend_from_slice(len_buf.format(request_body.len()).as_bytes());
-        request.extend_from_slice(b"\r\n");
-    }
-
-    request.extend_from_slice(b"Connection: keep-alive\r\n\r\n");
-    request.extend_from_slice(&request_body);
-
-    // バックエンドに接続して転送
-    let addr = HostPortStr::new(&target.host, target.port); // F-41: スタック上に構築（ヒープ確保なし）
-    let addr = addr.as_str();
-
-    // ルートの use_h2c は UpstreamGroup に載る（target 単体はサーバー URL 由来で false のまま）。
-    // H1 経路と同様 group.use_h2c() も見る（B-40: H2 クライアント gRPC が H1 バックエンド誤接続で 502 になっていた）。
-    let result = if target.use_h2c || upstream_group.use_h2c() {
-        // H2C (Prior Knowledge) プロキシ
-        handle_http2_proxy_h2c(
-            conn,
-            stream_id,
-            addr,
-            target,
-            request_body.to_vec(),
-            method,
-            final_path.as_bytes(),
-            security,
-            #[cfg(feature = "wasm")]
-            wasm_modules,
-        )
-        .await
-    } else if target.use_tls {
-        // HTTP/2 → HTTPS (HTTP/1.1)
-        handle_http2_proxy_https(
-            conn,
-            stream_id,
-            addr,
-            target.sni(),
-            request,
-            compression,
-            client_encoding,
-            security,
-            upstream_group.tls_insecure(),
-        )
-        .await
-    } else {
-        // HTTP/2 → HTTP (HTTP/1.1)
-        handle_http2_proxy_http(
-            conn,
-            stream_id,
-            addr,
-            request,
-            compression,
-            client_encoding,
-            security,
-        )
-        .await
-    };
-
-    server.release();
-    result
-}
-
 /// F-106: h2c バックエンドへ新規接続し HTTP/2 ハンドシェイクまで完了する。
 /// 失敗時は送出すべきステータス（502=接続/ハンドシェイク失敗, 504=接続タイムアウト）を返す。
 #[cfg(feature = "http2")]
@@ -2200,1119 +3249,6 @@ async fn h2c_connect_and_handshake(
         return Err(502);
     }
     Ok(client)
-}
-
-/// F-106: h2c 経路のエラー応答（502/504）をクライアントへ送出し、(status, body_len) を返す。
-#[cfg(feature = "http2")]
-async fn send_h2c_error<S>(
-    conn: &mut http2::Http2Connection<S>,
-    stream_id: u32,
-    status: u16,
-) -> (u16, u64)
-where
-    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
-{
-    let (body, len): (&[u8], u64) = if status == 504 {
-        (b"Gateway Timeout", 15)
-    } else {
-        (b"Bad Gateway", 11)
-    };
-    let server_guard = get_server_header_guard();
-    let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-    if let Some(ref g) = server_guard {
-        headers.push(g.as_header());
-    }
-    let _ = conn
-        .send_response(stream_id, status, &headers, Some(body))
-        .await;
-    (status, len)
-}
-
-/// HTTP/2 → HTTP/2 プロキシ (H2C)
-#[cfg(feature = "http2")]
-#[allow(clippy::too_many_arguments)]
-async fn handle_http2_proxy_h2c<S>(
-    conn: &mut http2::Http2Connection<S>,
-    stream_id: u32,
-    addr: &str,
-    target: &ProxyTarget,
-    request_body: Vec<u8>,
-    method: &[u8],
-    path: &[u8],
-    security: &SecurityConfig,
-    #[cfg(feature = "wasm")] wasm_modules: &Arc<Vec<String>>,
-) -> Option<(u16, u64)>
-where
-    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
-{
-    // F-106: h2c バックエンド接続をプールから再利用する（リクエストごとの TCP 接続 +
-    // h2c ハンドシェイク〈プリフェース + SETTINGS 往復〉を排除）。プールが空なら新規接続する。
-    // io_uring TcpStream はワーカースレッド ring に紐づくため、H2C_POOL はスレッドローカルで
-    // 同一スレッド内再利用のみ行う（thread-per-core）。プールヒット接続が stale（バックエンドが
-    // アイドル切断）だった場合の初回失敗は、後段で 1 回だけ新規接続としてリトライする。
-    let from_pool;
-    let mut h2c_client = match H2C_POOL.with(|p| p.borrow_mut().get(addr)) {
-        Some(client) => {
-            from_pool = true;
-            client
-        }
-        None => {
-            from_pool = false;
-            match h2c_connect_and_handshake(addr).await {
-                Ok(client) => client,
-                Err(status) => {
-                    return Some(send_h2c_error(conn, stream_id, status).await);
-                }
-            }
-        }
-    };
-
-    // ヘッダーを抽出
-    // gRPC は TE: trailers が必須のため除外しない（RFC 9113 でも TE はエンドツーエンド可）。
-    let is_grpc_upstream = if let Some(stream) = conn.get_stream(stream_id) {
-        stream
-            .request_headers
-            .iter()
-            .any(|h| header_pair_is_grpc(&h.name, &h.value))
-    } else {
-        false
-    };
-    let headers_vec: Vec<(&[u8], &[u8])> = if let Some(stream) = conn.get_stream(stream_id) {
-        stream
-            .request_headers
-            .iter()
-            .filter(|h| !h.name.starts_with(b":")) // 疑似ヘッダーを除外
-            .filter(|h| {
-                // ホップバイホップヘッダーを除外（gRPC 時は te を残す）
-                !h.name.eq_ignore_ascii_case(b"connection")
-                    && !h.name.eq_ignore_ascii_case(b"keep-alive")
-                    && !h.name.eq_ignore_ascii_case(b"proxy-connection")
-                    && !h.name.eq_ignore_ascii_case(b"transfer-encoding")
-                    && !h.name.eq_ignore_ascii_case(b"upgrade")
-                    && (is_grpc_upstream || !h.name.eq_ignore_ascii_case(b"te"))
-            })
-            .map(|h| (h.name.as_ref(), h.value.as_ref()))
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    // リクエスト送信
-    let body = if request_body.is_empty() {
-        None
-    } else {
-        Some(request_body.as_slice())
-    };
-    let authority = target.host.as_bytes();
-
-    // F-106: リクエスト送信。プール由来接続が stale で初回失敗した場合は、新規接続で
-    // 1 回だけリトライする（アイドル中にバックエンドが切断していても要求を落とさない）。
-    let mut send_result = h2c_client
-        .send_request(method, path, authority, &headers_vec, body)
-        .await;
-    if send_result.is_err() && from_pool {
-        match h2c_connect_and_handshake(addr).await {
-            Ok(fresh) => {
-                h2c_client = fresh;
-                send_result = h2c_client
-                    .send_request(method, path, authority, &headers_vec, body)
-                    .await;
-            }
-            Err(_) => {
-                // 新規接続も張れない: 下の Err ハンドラで 502 を返す。
-            }
-        }
-    }
-
-    match send_result {
-        Ok(h2c_resp) => {
-            // F-106: 応答は所有バッファ。ストリーム ID 枯渇前の健全な接続はプールへ返し、
-            // 次リクエストで TCP 接続 + ハンドシェイクを省く（送信ウィンドウは client.rs の
-            // WINDOW_UPDATE 反映で再利用時も回復する）。
-            if h2c_client.is_reusable() {
-                let max_idle = security.max_idle_connections_per_host;
-                let idle_timeout = security.idle_connection_timeout_secs;
-                H2C_POOL.with(|p| {
-                    p.borrow_mut()
-                        .put(addr.to_string(), h2c_client, max_idle, idle_timeout)
-                });
-            }
-
-            // レスポンスヘッダを所有バッファへ（WASM 適用・Server/Alt-Svc 追記用）
-            let mut header_store: Vec<(Vec<u8>, Vec<u8>)> = h2c_resp
-                .headers
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-
-            // F-94: gRPC/H2C 経路でも WASM レスポンスヘッダフィルタを適用
-            #[cfg(feature = "wasm")]
-            {
-                header_store =
-                    apply_h2_wasm_response_headers(wasm_modules, h2c_resp.status, header_store)
-                        .await;
-            }
-
-            let server_guard = get_server_header_guard();
-            if let Some(ref g) = server_guard {
-                let (n, v) = g.as_header();
-                header_store.push((n.to_vec(), v.to_vec()));
-            }
-            // F-94: HTTP/3 広告（Alt-Svc）
-            if let Some(g) = get_alt_svc_guard() {
-                let (n, v) = g.as_header();
-                header_store.push((n.to_vec(), v.to_vec()));
-            }
-
-            let headers: Vec<(&[u8], &[u8])> = header_store
-                .iter()
-                .map(|(k, v)| (k.as_slice(), v.as_slice()))
-                .collect();
-
-            let has_body = !h2c_resp.body.is_empty();
-            let has_trailers = !h2c_resp.trailers.is_empty();
-
-            // ヘッダーを送信
-            if let Err(e) = conn
-                .send_headers(
-                    stream_id,
-                    h2c_resp.status,
-                    &headers,
-                    !has_body && !has_trailers,
-                )
-                .await
-            {
-                warn!(
-                    "[HTTP/2] H2C send headers error (stream_id={}): {}",
-                    stream_id, e
-                );
-                return None;
-            }
-
-            // ボディを送信
-            if has_body {
-                if let Err(e) = conn
-                    .send_data(stream_id, &h2c_resp.body, !has_trailers)
-                    .await
-                {
-                    warn!(
-                        "[HTTP/2] H2C send data error (stream_id={}): {}",
-                        stream_id, e
-                    );
-                    return None;
-                }
-            }
-
-            // トレイラーを送信
-            if has_trailers {
-                // 特別に gRPC トレイラーを送信
-                #[cfg(feature = "grpc")]
-                {
-                    let mut grpc_status = 0;
-                    let mut grpc_message = None;
-
-                    for (name, value) in &h2c_resp.trailers {
-                        if name == b"grpc-status" {
-                            if let Ok(status_str) = std::str::from_utf8(value) {
-                                grpc_status = status_str.parse().unwrap_or(0);
-                            }
-                        } else if name == b"grpc-message" {
-                            grpc_message = std::str::from_utf8(value).ok();
-                        }
-                    }
-
-                    if let Err(e) = conn
-                        .send_grpc_trailers(stream_id, grpc_status, grpc_message)
-                        .await
-                    {
-                        warn!(
-                            "[HTTP/2] H2C send trailers error (stream_id={}): {}",
-                            stream_id, e
-                        );
-                        return None;
-                    }
-
-                    // F-09: gRPC リクエストメトリクスを記録
-                    {
-                        let grpc_method = std::str::from_utf8(path).unwrap_or("");
-                        let mut status_buf = itoa::Buffer::new();
-                        let status_str = status_buf.format(grpc_status);
-                        crate::metrics::record_grpc_request(grpc_method, status_str, &target.host);
-                    }
-                }
-                #[cfg(not(feature = "grpc"))]
-                {
-                    // gRPC feature なしの場合、トレイラーをスキップ
-                    let _ = &h2c_resp.trailers;
-                }
-            }
-
-            Some((h2c_resp.status, h2c_resp.body.len() as u64))
-        }
-        Err(e) => {
-            warn!("[HTTP/2] H2C request error ({}): {}", addr, e);
-            let server_guard = get_server_header_guard();
-            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-            if let Some(ref g) = server_guard {
-                headers.push(g.as_header());
-            }
-            let _ = conn
-                .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
-                .await;
-            Some((502, 11))
-        }
-    }
-}
-
-/// HTTP/2 → HTTP/1.1 プロキシ（HTTPバックエンド）
-#[cfg(feature = "http2")]
-/// バックエンド HTTP/1.1 レスポンス（content-length 既知・非 chunked・非圧縮）のボディを
-/// HTTP/2 DATA フレームとしてストリーミング転送する（全バッファリングを排除、F-32）。
-///
-/// ヘッダはまだ送信していない状態で呼ぶこと。本関数がヘッダ（ボディ無しなら END_STREAM）と
-/// ボディ DATA フレームを送出する。各 `send_data` は HTTP/2 フロー制御（conn/stream ウィンドウ
-/// と WINDOW_UPDATE 待ち）に従うため、クライアントの受信速度に応じたバックプレッシャが効き、
-/// レスポンス全体をメモリに溜めない（RSS がペイロードサイズに比例しない）。
-///
-/// 戻り値: 送信したボディバイト数。
-#[allow(clippy::too_many_arguments)]
-async fn stream_h2_response_body_cl<S, R>(
-    conn: &mut http2::Http2Connection<S>,
-    stream_id: u32,
-    status: u16,
-    h2_headers: &[(&[u8], &[u8])],
-    backend: &mut R,
-    initial_body: &[u8],
-    content_length: usize,
-) -> http2::error::Http2Result<u64>
-where
-    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
-    R: crate::runtime::io::AsyncReadRent + Unpin,
-{
-    use http2::Http2ErrorCode;
-
-    if content_length == 0 {
-        // ボディ無し: HEADERS を END_STREAM 付きで即送出。
-        conn.send_headers(stream_id, status, h2_headers, true)
-            .await?;
-        return Ok(0);
-    }
-
-    let mut remaining = content_length;
-
-    // ヘッダ直後に既読のボディ断片を送る（追加コピーなし、スライス直送）
-    let init_len = initial_body.len().min(remaining);
-    if init_len > 0 {
-        // HEADERS を連結バッファへ積み、続く send_data と 1 回の書き込みにまとめる
-        // （送信ホットパスのシステムコール削減）。send_data 末尾で両者をフラッシュする。
-        conn.send_headers_buffered(stream_id, status, h2_headers)
-            .await?;
-        let last = init_len >= remaining;
-        conn.send_data(stream_id, &initial_body[..init_len], last)
-            .await?;
-        remaining -= init_len;
-    } else {
-        // 既読断片が無い場合は HEADERS を即送出（後続の read で RST を挟む可能性があるため
-        // 連結バッファに残さない）。
-        conn.send_headers(stream_id, status, h2_headers, false)
-            .await?;
-    }
-
-    // 残りをバックエンドから読みつつ逐次転送する（全バッファリングなし）
-    while remaining > 0 {
-        let buf = buf_get();
-        let read_result = timeout(READ_TIMEOUT, backend.read(buf)).await;
-        let (res, mut returned_buf) = match read_result {
-            Ok(r) => r,
-            Err(_) => {
-                // タイムアウト: ヘッダ送信済みのため RST_STREAM で打ち切る
-                let _ = conn
-                    .send_rst_stream(stream_id, Http2ErrorCode::InternalError)
-                    .await;
-                return Ok((content_length - remaining) as u64);
-            }
-        };
-        let n = match res {
-            Ok(0) => {
-                // content-length 未達でバックエンドが切断: END_STREAM で閉じる
-                buf_put(returned_buf);
-                conn.send_data(stream_id, &[], true).await?;
-                return Ok((content_length - remaining) as u64);
-            }
-            Ok(n) => n,
-            Err(_) => {
-                buf_put(returned_buf);
-                let _ = conn
-                    .send_rst_stream(stream_id, Http2ErrorCode::InternalError)
-                    .await;
-                return Ok((content_length - remaining) as u64);
-            }
-        };
-        returned_buf.set_valid_len(n);
-        let take = n.min(remaining);
-        let last = take >= remaining;
-        conn.send_data(stream_id, &returned_buf.as_valid_slice()[..take], last)
-            .await?;
-        buf_put(returned_buf);
-        remaining -= take;
-    }
-
-    Ok(content_length as u64)
-}
-
-/// chunked ストリーミング 1 バッファ分の処理結果。
-#[cfg(feature = "http2")]
-enum ChunkedDrain {
-    /// まだ終端に達していない（次の read が必要）。
-    NeedMore,
-    /// 終端チャンクを検出し END_STREAM を送出した（完了）。
-    Complete,
-    /// サイズ制限超過等で RST_STREAM を送り打ち切った。
-    Aborted,
-}
-
-/// 読み取りバッファ 1 つ分の chunked データを `ChunkedDecoder::next_data_span` で
-/// ゼロコピーにデコードし、各データ run を HTTP/2 DATA フレームとして逐次送出する。
-///
-/// `data` のサブスライスをそのまま `send_data` へ渡すため、デコード済みボディの中間
-/// バッファ（`Vec`）を一切確保しない。終端チャンク検出時は END_STREAM 付き 0 長 DATA を
-/// 送ってクライアントへ完了を伝える。
-#[cfg(feature = "http2")]
-async fn h2_drain_chunked_spans<S>(
-    conn: &mut http2::Http2Connection<S>,
-    stream_id: u32,
-    decoder: &mut crate::http_utils::ChunkedDecoder,
-    data: &[u8],
-    sent: &mut u64,
-) -> http2::error::Http2Result<ChunkedDrain>
-where
-    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
-{
-    use http2::Http2ErrorCode;
-
-    let mut pos = 0;
-    while pos < data.len() {
-        let span = decoder.next_data_span(&data[pos..]);
-        if span.data_len > 0 {
-            let start = pos + span.data_start;
-            // ゼロコピー: 読み取りバッファのサブスライスを直接 DATA フレーム化する
-            conn.send_data(stream_id, &data[start..start + span.data_len], false)
-                .await?;
-            *sent += span.data_len as u64;
-        }
-        pos += span.consumed;
-        if span.complete {
-            // 終端: END_STREAM 付き 0 長 DATA でストリームを閉じる
-            conn.send_data(stream_id, &[], true).await?;
-            return Ok(ChunkedDrain::Complete);
-        }
-        if span.limit_exceeded {
-            let _ = conn
-                .send_rst_stream(stream_id, Http2ErrorCode::InternalError)
-                .await;
-            return Ok(ChunkedDrain::Aborted);
-        }
-        if span.consumed == 0 {
-            // 非空入力なら必ず進むはずだが、防御的に無限ループを防ぐ
-            break;
-        }
-    }
-    Ok(ChunkedDrain::NeedMore)
-}
-
-/// バックエンド HTTP/1.1 の **chunked**（非圧縮）レスポンスボディを HTTP/2 DATA フレーム
-/// としてストリーミング転送する（全バッファリングを排除、F-32 第2フェーズ）。
-///
-/// 従来はレスポンス全体を `full_body: Vec<u8>` に溜め `decode_chunked_body` で再アロケート
-/// していたが、本関数は `ChunkedDecoder::next_data_span` でゼロコピーに各チャンクの
-/// データ範囲（読み取りバッファのサブスライス）を取り出し、`send_data` で逐次送出する。
-/// 各 `send_data` は HTTP/2 フロー制御（conn/stream 送信ウィンドウ + WINDOW_UPDATE 待ち）に
-/// 従うため、**クライアントの受信速度に応じたバックプレッシャ**が効き、レスポンス全体を
-/// メモリに溜めない（RSS がペイロードサイズに比例しない）。トレーラーはボディに含めない。
-///
-/// ヘッダはまだ送信していない状態で呼ぶこと（本関数がヘッダと DATA フレームを送出する）。
-/// 戻り値: 送信したデコード済みボディバイト数。
-#[cfg(feature = "http2")]
-#[allow(clippy::too_many_arguments)]
-async fn stream_h2_response_body_chunked<S, R>(
-    conn: &mut http2::Http2Connection<S>,
-    stream_id: u32,
-    status: u16,
-    h2_headers: &[(&[u8], &[u8])],
-    backend: &mut R,
-    initial_body: &[u8],
-) -> http2::error::Http2Result<u64>
-where
-    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
-    R: crate::runtime::io::AsyncReadRent + Unpin,
-{
-    use http2::Http2ErrorCode;
-
-    // ヘッダ送信（END_STREAM は終端 DATA フレームで送るため false）
-    conn.send_headers(stream_id, status, h2_headers, false)
-        .await?;
-
-    let mut decoder = crate::http_utils::ChunkedDecoder::new_unlimited();
-    let mut sent: u64 = 0;
-
-    // ヘッダ直後に既読のボディ断片（chunked 生データ）をまず処理する
-    match h2_drain_chunked_spans(conn, stream_id, &mut decoder, initial_body, &mut sent).await? {
-        ChunkedDrain::Complete | ChunkedDrain::Aborted => return Ok(sent),
-        ChunkedDrain::NeedMore => {}
-    }
-
-    // 残りをバックエンドから読みつつ逐次デコード・転送する（全バッファリングなし）
-    loop {
-        let buf = buf_get();
-        let read_result = timeout(READ_TIMEOUT, backend.read(buf)).await;
-        let (res, mut returned_buf) = match read_result {
-            Ok(r) => r,
-            Err(_) => {
-                // タイムアウト: ヘッダ送信済みのため RST_STREAM で打ち切る
-                let _ = conn
-                    .send_rst_stream(stream_id, Http2ErrorCode::InternalError)
-                    .await;
-                return Ok(sent);
-            }
-        };
-        let n = match res {
-            Ok(0) => {
-                // 終端チャンク前にバックエンドが切断: END_STREAM で閉じる
-                buf_put(returned_buf);
-                conn.send_data(stream_id, &[], true).await?;
-                return Ok(sent);
-            }
-            Ok(n) => n,
-            Err(_) => {
-                buf_put(returned_buf);
-                let _ = conn
-                    .send_rst_stream(stream_id, Http2ErrorCode::InternalError)
-                    .await;
-                return Ok(sent);
-            }
-        };
-        returned_buf.set_valid_len(n);
-        // 借用は drain の await 完了で解放されるため、その後に buf_put する
-        let drain = h2_drain_chunked_spans(
-            conn,
-            stream_id,
-            &mut decoder,
-            returned_buf.as_valid_slice(),
-            &mut sent,
-        )
-        .await?;
-        buf_put(returned_buf);
-        match drain {
-            ChunkedDrain::Complete | ChunkedDrain::Aborted => return Ok(sent),
-            ChunkedDrain::NeedMore => {}
-        }
-    }
-}
-
-/// バックエンド HTTP/1.1 レスポンスを受信し HTTP/2 クライアントへリレーする共通処理。
-///
-/// HTTP / HTTPS バックエンド双方の応答処理（旧 `handle_http2_proxy_http` /
-/// `handle_http2_proxy_https` で重複していた約 320 行）を一本化したもの。バックエンドの
-/// 接続種別（平文 TCP / TLS）に依存せず `B: AsyncReadRent` で総称化しているため、
-/// リクエスト方向ストリーミング経路（F-32）からも再利用できる。
-///
-/// 内部で以下を判定して最適な転送経路を選ぶ:
-/// - **非圧縮 + content-length 既知 + 非 chunked** → `stream_h2_response_body_cl` で逐次転送
-/// - **非圧縮 + chunked** → `stream_h2_response_body_chunked` でゼロコピー逐次デコード転送
-/// - **圧縮あり / 長さ不明** → 全バッファ後に（必要なら圧縮して）送信
-///
-/// 呼び出し前にバックエンドへリクエストを送信済みであること。
-///
-/// 戻り値の第 3 要素は **バックエンド接続の再利用可否**（B-28）。レスポンスを境界まで
-/// 正確に消費し（Content-Length 全量 / 0 長）、かつ `Connection: close` でない場合のみ
-/// `true`。chunked・EOF 終端・エラー・打ち切りは残データ混入の恐れがあるため `false`。
-#[cfg(feature = "http2")]
-async fn relay_h2_response<S, B>(
-    conn: &mut http2::Http2Connection<S>,
-    stream_id: u32,
-    backend: &mut B,
-    compression: &CompressionConfig,
-    client_encoding: AcceptedEncoding,
-) -> Option<(u16, u64, bool)>
-where
-    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
-    B: crate::runtime::io::AsyncReadRent + Unpin,
-{
-    // レスポンス受信
-    let mut response_buf = Vec::with_capacity(BUF_SIZE);
-
-    loop {
-        let buf = buf_get();
-        let read_result = timeout(READ_TIMEOUT, backend.read(buf)).await;
-
-        let (res, mut returned_buf) = match read_result {
-            Ok(r) => r,
-            Err(_) => {
-                let server_guard = get_server_header_guard();
-                let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-                if let Some(ref g) = server_guard {
-                    headers.push(g.as_header());
-                }
-                let _ = conn
-                    .send_response(stream_id, 504, &headers, Some(b"Gateway Timeout"))
-                    .await;
-                return Some((504, 15, false));
-            }
-        };
-
-        let n = match res {
-            Ok(0) => {
-                buf_put(returned_buf);
-                break;
-            }
-            Ok(n) => n,
-            Err(_) => {
-                buf_put(returned_buf);
-                let server_guard = get_server_header_guard();
-                let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-                if let Some(ref g) = server_guard {
-                    headers.push(g.as_header());
-                }
-                let _ = conn
-                    .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
-                    .await;
-                return Some((502, 11, false));
-            }
-        };
-
-        returned_buf.set_valid_len(n);
-        response_buf.extend_from_slice(returned_buf.as_valid_slice());
-        buf_put(returned_buf);
-
-        // ヘッダーが完了したかチェック
-        if let Some(parsed) = parse_http_response(&response_buf) {
-            // HTTP/1.1 レスポンスを HTTP/2 に変換
-            let status = parsed.status_code;
-            let body_start = parsed.header_len;
-            let body = &response_buf[body_start..];
-
-            // レスポンスヘッダーを解析
-            let mut headers_storage = [httparse::EMPTY_HEADER; 64];
-            let mut resp = httparse::Response::new(&mut headers_storage);
-            let _ = resp.parse(&response_buf);
-
-            // Content-Type と Content-Encoding を取得
-            let content_type = resp
-                .headers
-                .iter()
-                .find(|h| h.name.eq_ignore_ascii_case("content-type"))
-                .map(|h| h.value);
-            let existing_encoding = resp
-                .headers
-                .iter()
-                .find(|h| h.name.eq_ignore_ascii_case("content-encoding"))
-                .map(|h| h.value);
-
-            // === F-32 ストリーミング経路 ===
-            // 圧縮なし + content-length 既知 + 非 chunked の場合、レスポンスボディを
-            // 全バッファリングせず DATA フレームとして逐次転送する（大容量ダウンロードの
-            // OOM 耐性。フロー制御で受信速度に追従し RSS をペイロードに比例させない）。
-            let stream_compress_hint = compression.should_compress(
-                client_encoding,
-                content_type,
-                parsed.content_length,
-                existing_encoding,
-            );
-            if stream_compress_hint.is_none() && !parsed.is_chunked {
-                if let Some(content_len) = parsed.content_length {
-                    let server_guard = get_server_header_guard();
-                    let alt_svc_guard = get_alt_svc_guard();
-                    let mut h2_headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(16);
-                    if let Some(ref g) = server_guard {
-                        h2_headers.push(g.as_header());
-                    }
-                    if let Some(ref g) = alt_svc_guard {
-                        h2_headers.push(g.as_header());
-                    }
-                    for header in resp.headers.iter() {
-                        if header.name.is_empty() {
-                            continue;
-                        }
-                        if header.name.eq_ignore_ascii_case("connection")
-                            || header.name.eq_ignore_ascii_case("keep-alive")
-                            || header.name.eq_ignore_ascii_case("transfer-encoding")
-                            || header.name.eq_ignore_ascii_case("upgrade")
-                        {
-                            continue;
-                        }
-                        h2_headers.push((header.name.as_bytes(), header.value));
-                    }
-                    let sent = match stream_h2_response_body_cl(
-                        conn,
-                        stream_id,
-                        status,
-                        &h2_headers,
-                        backend,
-                        body,
-                        content_len,
-                    )
-                    .await
-                    {
-                        Ok(n) => n,
-                        Err(e) => {
-                            warn!("[HTTP/2] Response stream error: {}", e);
-                            return None;
-                        }
-                    };
-                    // B-28: Content-Length 全量を消費できた場合のみ接続を再利用可能
-                    let reusable = sent == content_len as u64 && !parsed.is_connection_close;
-                    return Some((status, sent, reusable));
-                }
-            }
-
-            // === F-32 chunked ストリーミング経路 ===
-            // 圧縮なし + chunked の場合、レスポンス全体を full_body に溜めて
-            // decode_chunked_body で再アロケートする従来経路を避け、next_data_span で
-            // ゼロコピーにデコードしながら DATA フレームを逐次転送する（OOM 耐性 +
-            // バックプレッシャ）。トレーラーは破棄、content-length/transfer-encoding は除外。
-            if stream_compress_hint.is_none() && parsed.is_chunked {
-                let server_guard = get_server_header_guard();
-                let alt_svc_guard = get_alt_svc_guard();
-                let mut h2_headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(16);
-                if let Some(ref g) = server_guard {
-                    h2_headers.push(g.as_header());
-                }
-                if let Some(ref g) = alt_svc_guard {
-                    h2_headers.push(g.as_header());
-                }
-                for header in resp.headers.iter() {
-                    if header.name.is_empty() {
-                        continue;
-                    }
-                    if header.name.eq_ignore_ascii_case("connection")
-                        || header.name.eq_ignore_ascii_case("keep-alive")
-                        || header.name.eq_ignore_ascii_case("transfer-encoding")
-                        || header.name.eq_ignore_ascii_case("upgrade")
-                        || header.name.eq_ignore_ascii_case("content-length")
-                    {
-                        continue;
-                    }
-                    h2_headers.push((header.name.as_bytes(), header.value));
-                }
-                let sent = match stream_h2_response_body_chunked(
-                    conn,
-                    stream_id,
-                    status,
-                    &h2_headers,
-                    backend,
-                    body,
-                )
-                .await
-                {
-                    Ok(n) => n,
-                    Err(e) => {
-                        warn!("[HTTP/2] Response chunked stream error: {}", e);
-                        return None;
-                    }
-                };
-                // B-28: chunked はトレーラー等の残データ混入の恐れがあるため再利用しない
-                return Some((status, sent, false));
-            }
-
-            // B-28: バッファリング経路の接続再利用可否（CL 全量読取時のみ true にする）
-            let mut backend_reusable = false;
-            // Content-Length が chunked の場合は計算
-            let final_body = if parsed.is_chunked {
-                // Chunked レスポンスの場合、終端検出しながら読み込み
-                let mut decoder = ChunkedDecoder::new_unlimited();
-                let mut full_body = body.to_vec();
-                decoder.feed(body);
-
-                while !decoder.is_complete() {
-                    let buf = buf_get();
-                    let read_result = timeout(READ_TIMEOUT, backend.read(buf)).await;
-                    let (res, mut returned_buf) = match read_result {
-                        Ok(r) => r,
-                        Err(_) => break,
-                    };
-
-                    let n = match res {
-                        Ok(0) => {
-                            buf_put(returned_buf);
-                            break;
-                        }
-                        Ok(n) => n,
-                        Err(_) => {
-                            buf_put(returned_buf);
-                            break;
-                        }
-                    };
-
-                    returned_buf.set_valid_len(n);
-                    full_body.extend_from_slice(returned_buf.as_valid_slice());
-                    decoder.feed(returned_buf.as_valid_slice());
-                    buf_put(returned_buf);
-                }
-                // Chunkedデコード: 生のボディを抽出
-                decode_chunked_body(&full_body)
-            } else if let Some(content_len) = parsed.content_length {
-                // 残りのボディを読む
-                let mut full_body = body.to_vec();
-                while full_body.len() < content_len {
-                    let buf = buf_get();
-                    let read_result = timeout(READ_TIMEOUT, backend.read(buf)).await;
-                    let (res, mut returned_buf) = match read_result {
-                        Ok(r) => r,
-                        Err(_) => break,
-                    };
-
-                    let n = match res {
-                        Ok(0) => {
-                            buf_put(returned_buf);
-                            break;
-                        }
-                        Ok(n) => n,
-                        Err(_) => {
-                            buf_put(returned_buf);
-                            break;
-                        }
-                    };
-
-                    returned_buf.set_valid_len(n);
-                    full_body.extend_from_slice(returned_buf.as_valid_slice());
-                    buf_put(returned_buf);
-                }
-                // B-28: CL 全量をちょうど消費できた場合のみ再利用可能
-                backend_reusable = full_body.len() == content_len;
-                full_body
-            } else {
-                body.to_vec()
-            };
-
-            // 圧縮すべきかどうかを判定
-            let should_compress = compression.should_compress(
-                client_encoding,
-                content_type,
-                Some(final_body.len()),
-                existing_encoding,
-            );
-
-            // HTTP/2用のヘッダーを構築（ホップバイホップヘッダー除外）
-            let server_guard = get_server_header_guard();
-            let alt_svc_guard = get_alt_svc_guard();
-            let mut h2_headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(16);
-            if let Some(ref g) = server_guard {
-                h2_headers.push(g.as_header());
-            }
-            if let Some(ref g) = alt_svc_guard {
-                h2_headers.push(g.as_header());
-            }
-
-            // 圧縮が有効な場合は Content-Encoding を追加（静的スライス、ゼロアロケーション）
-            if let Some(enc) = should_compress {
-                let encoding_name: &'static [u8] = match enc {
-                    AcceptedEncoding::Zstd => b"zstd",
-                    AcceptedEncoding::Brotli => b"br",
-                    AcceptedEncoding::Gzip => b"gzip",
-                    AcceptedEncoding::Deflate => b"deflate",
-                    AcceptedEncoding::Identity => b"",
-                };
-                if !encoding_name.is_empty() {
-                    h2_headers.push((b"content-encoding", encoding_name));
-                    h2_headers.push((b"vary", b"Accept-Encoding"));
-                }
-            }
-
-            for header in resp.headers.iter() {
-                if header.name.is_empty() {
-                    continue;
-                }
-                // ホップバイホップヘッダーを除外
-                if header.name.eq_ignore_ascii_case("connection")
-                    || header.name.eq_ignore_ascii_case("keep-alive")
-                    || header.name.eq_ignore_ascii_case("transfer-encoding")
-                    || header.name.eq_ignore_ascii_case("upgrade")
-                {
-                    continue;
-                }
-                // 圧縮時は Content-Length と Content-Encoding をスキップ
-                if should_compress.is_some()
-                    && (header.name.eq_ignore_ascii_case("content-length")
-                        || header.name.eq_ignore_ascii_case("content-encoding"))
-                {
-                    continue;
-                }
-                h2_headers.push((header.name.as_bytes(), header.value));
-            }
-
-            // 圧縮処理
-            let response_body = if let Some(enc) = should_compress {
-                compress_body_h2(&final_body, enc, compression)
-            } else {
-                final_body
-            };
-
-            // HTTP/2 レスポンス送信
-            if let Err(e) = conn
-                .send_response(stream_id, status, &h2_headers, Some(&response_body))
-                .await
-            {
-                warn!("[HTTP/2] Response send error: {}", e);
-                return None;
-            }
-
-            return Some((
-                status,
-                response_body.len() as u64,
-                backend_reusable && !parsed.is_connection_close,
-            ));
-        }
-
-        // ヘッダーが大きすぎる
-        if response_buf.len() > MAX_HEADER_SIZE {
-            let server_guard = get_server_header_guard();
-            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-            if let Some(ref g) = server_guard {
-                headers.push(g.as_header());
-            }
-            let _ = conn
-                .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
-                .await;
-            return Some((502, 11, false));
-        }
-    }
-
-    // ストリーム終了（空レスポンス）
-    let server_guard = get_server_header_guard();
-    let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-    if let Some(ref g) = server_guard {
-        headers.push(g.as_header());
-    }
-    let _ = conn
-        .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
-        .await;
-    Some((502, 11, false))
-}
-
-#[cfg(feature = "http2")]
-async fn handle_http2_proxy_http<S>(
-    conn: &mut http2::Http2Connection<S>,
-    stream_id: u32,
-    addr: &str,
-    request: Vec<u8>,
-    compression: &CompressionConfig,
-    client_encoding: AcceptedEncoding,
-    security: &SecurityConfig,
-) -> Option<(u16, u64)>
-where
-    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
-{
-    // B-28: バックエンド接続をプールから再利用する（HTTP/1.1 経路と同じ HTTP_POOL・
-    // 同じ "host:port" キーを共有）。従来はリクエスト毎に新規接続 + クローズだったため、
-    // 高負荷時に veil 側 TIME_WAIT が積み上がりエフェメラルポート枯渇
-    // （EADDRNOTAVAIL → 502）を起こしていた。
-    let mut backend = match HTTP_POOL.with(|p| p.borrow_mut().get(addr)) {
-        Some(stream) => stream,
-        None => {
-            let connect_result = timeout(CONNECT_TIMEOUT, TcpStream::connect_str(addr)).await;
-            match connect_result {
-                Ok(Ok(stream)) => {
-                    let _ = stream.set_nodelay(true);
-                    stream
-                }
-                Ok(Err(e)) => {
-                    warn!("[HTTP/2] Backend connect error: {}", e);
-                    let server_guard = get_server_header_guard();
-                    let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-                    if let Some(ref g) = server_guard {
-                        headers.push(g.as_header());
-                    }
-                    let _ = conn
-                        .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
-                        .await;
-                    return Some((502, 11));
-                }
-                Err(_) => {
-                    let server_guard = get_server_header_guard();
-                    let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-                    if let Some(ref g) = server_guard {
-                        headers.push(g.as_header());
-                    }
-                    let _ = conn
-                        .send_response(stream_id, 504, &headers, Some(b"Gateway Timeout"))
-                        .await;
-                    return Some((504, 15));
-                }
-            }
-        }
-    };
-
-    // リクエスト送信
-    let (write_res, returned_request) = backend.write_all(request).await;
-    request_buf_put(returned_request);
-    if write_res.is_err() {
-        let server_guard = get_server_header_guard();
-        let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-        if let Some(ref g) = server_guard {
-            headers.push(g.as_header());
-        }
-        let _ = conn
-            .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
-            .await;
-        return Some((502, 11));
-    }
-
-    // レスポンス受信・HTTP/2 へリレー（ストリーミング/バッファリング判定込み、共通処理）
-    let result =
-        relay_h2_response(conn, stream_id, &mut backend, compression, client_encoding).await;
-
-    // B-28: 境界まで正確に消費できた接続はプールへ返却して再利用する
-    if let Some((status, sent, reusable)) = result {
-        if reusable {
-            HTTP_POOL.with(|p| {
-                p.borrow_mut().put(
-                    addr.to_string(),
-                    backend,
-                    security.max_idle_connections_per_host,
-                    security.idle_connection_timeout_secs,
-                )
-            });
-        }
-        Some((status, sent))
-    } else {
-        None
-    }
-}
-
-/// HTTP/2 → HTTP/1.1 プロキシ（HTTPSバックエンド）
-#[cfg(feature = "http2")]
-async fn handle_http2_proxy_https<S>(
-    conn: &mut http2::Http2Connection<S>,
-    stream_id: u32,
-    addr: &str,
-    sni: &str,
-    request: Vec<u8>,
-    compression: &CompressionConfig,
-    client_encoding: AcceptedEncoding,
-    security: &SecurityConfig,
-    tls_insecure: bool,
-) -> Option<(u16, u64)>
-where
-    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
-{
-    // B-28: TLS 済みバックエンド接続をプールから再利用する（TLS ハンドシェイク削減 +
-    // TIME_WAIT によるエフェメラルポート枯渇の防止）。SNI と tls_insecure 毎に別プールとする。
-    let pool_key = format!(
-        "{}:{}:{}",
-        addr,
-        sni,
-        if tls_insecure { "insecure" } else { "verify" }
-    );
-
-    let mut backend = match HTTPS_POOL.with(|p| p.borrow_mut().get(&pool_key)) {
-        Some(stream) => stream,
-        None => {
-            // バックエンドに TCP 接続
-            let connect_result = timeout(CONNECT_TIMEOUT, TcpStream::connect_str(addr)).await;
-
-            let backend_tcp = match connect_result {
-                Ok(Ok(stream)) => {
-                    let _ = stream.set_nodelay(true);
-                    stream
-                }
-                Ok(Err(e)) => {
-                    warn!("[HTTP/2] Backend connect error: {}", e);
-                    let server_guard = get_server_header_guard();
-                    let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-                    if let Some(ref g) = server_guard {
-                        headers.push(g.as_header());
-                    }
-                    let _ = conn
-                        .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
-                        .await;
-                    return Some((502, 11));
-                }
-                Err(_) => {
-                    let server_guard = get_server_header_guard();
-                    let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-                    if let Some(ref g) = server_guard {
-                        headers.push(g.as_header());
-                    }
-                    let _ = conn
-                        .send_response(stream_id, 504, &headers, Some(b"Gateway Timeout"))
-                        .await;
-                    return Some((504, 15));
-                }
-            };
-
-            // TLS ハンドシェイク（tls_insecure 時は自己署名証明書を許可）
-            let tls_result = if tls_insecure {
-                let connector = get_tls_connector_insecure();
-                timeout(CONNECT_TIMEOUT, connector.connect(backend_tcp, sni)).await
-            } else {
-                let connector = get_tls_connector();
-                timeout(CONNECT_TIMEOUT, connector.connect(backend_tcp, sni)).await
-            };
-
-            match tls_result {
-                Ok(Ok(stream)) => stream,
-                Ok(Err(e)) => {
-                    warn!("[HTTP/2] TLS handshake error: {}", e);
-                    let server_guard = get_server_header_guard();
-                    let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-                    if let Some(ref g) = server_guard {
-                        headers.push(g.as_header());
-                    }
-                    let _ = conn
-                        .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
-                        .await;
-                    return Some((502, 11));
-                }
-                Err(_) => {
-                    let server_guard = get_server_header_guard();
-                    let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-                    if let Some(ref g) = server_guard {
-                        headers.push(g.as_header());
-                    }
-                    let _ = conn
-                        .send_response(stream_id, 504, &headers, Some(b"Gateway Timeout"))
-                        .await;
-                    return Some((504, 15));
-                }
-            }
-        }
-    };
-
-    // リクエスト送信
-    let (write_res, returned_request) = backend.write_all(request).await;
-    request_buf_put(returned_request);
-    if write_res.is_err() {
-        let server_guard = get_server_header_guard();
-        let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-        if let Some(ref g) = server_guard {
-            headers.push(g.as_header());
-        }
-        let _ = conn
-            .send_response(stream_id, 502, &headers, Some(b"Bad Gateway"))
-            .await;
-        return Some((502, 11));
-    }
-
-    // レスポンス受信・HTTP/2 へリレー（ストリーミング/バッファリング判定込み、共通処理）
-    let result =
-        relay_h2_response(conn, stream_id, &mut backend, compression, client_encoding).await;
-
-    // B-28: 境界まで正確に消費できた接続はプールへ返却して再利用する
-    if let Some((status, sent, reusable)) = result {
-        if reusable {
-            HTTPS_POOL.with(|p| {
-                p.borrow_mut().put(
-                    pool_key,
-                    backend,
-                    security.max_idle_connections_per_host,
-                    security.idle_connection_timeout_secs,
-                )
-            });
-        }
-        Some((status, sent))
-    } else {
-        None
-    }
 }
 
 /// HTTP/2 用レスポンスボディ圧縮ヘルパー関数
@@ -3378,183 +3314,6 @@ fn compress_body_h2(
     _compression: &CompressionConfig,
 ) -> Vec<u8> {
     body.to_vec()
-}
-
-/// HTTP/2 ファイル配信
-#[cfg(feature = "http2")]
-async fn handle_http2_sendfile<S>(
-    conn: &mut http2::Http2Connection<S>,
-    stream_id: u32,
-    base_path: &Path,
-    is_dir: bool,
-    index_file: Option<&str>,
-    req_path: &[u8],
-    prefix: &[u8],
-    security: &SecurityConfig,
-    compression: &CompressionConfig,
-    client_encoding: AcceptedEncoding,
-    #[cfg(feature = "wasm")] wasm_modules: &Arc<Vec<String>>,
-) -> Option<(u16, u64)>
-where
-    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
-{
-    let path_str_raw = std::str::from_utf8(req_path).unwrap_or("/");
-    // クエリ文字列を除去してファイルパス解決に使用するパスのみを取り出す
-    let path_str = if let Some(qpos) = path_str_raw.find('?') {
-        &path_str_raw[..qpos]
-    } else {
-        path_str_raw
-    };
-    let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
-
-    // プレフィックス除去後のサブパス
-    let sub_path = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
-        &path_str[prefix_str.len()..]
-    } else {
-        path_str
-    };
-
-    let clean_sub = sub_path.trim_start_matches('/');
-
-    // パストラバーサル防止
-    if clean_sub.contains("..") {
-        let server_guard = get_server_header_guard();
-        let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-        if let Some(ref g) = server_guard {
-            headers.push(g.as_header());
-        }
-        let _ = conn
-            .send_response(stream_id, 403, &headers, Some(b"Forbidden"))
-            .await;
-        return Some((403, 9));
-    }
-
-    // ファイルパス構築
-    let file_path = if is_dir {
-        let mut p = base_path.to_path_buf();
-        if clean_sub.is_empty() || clean_sub == "/" {
-            p.push(index_file.unwrap_or("index.html"));
-        } else {
-            p.push(clean_sub);
-            if p.is_dir() {
-                p.push(index_file.unwrap_or("index.html"));
-            }
-        }
-        p
-    } else {
-        if !clean_sub.is_empty() {
-            let server_guard = get_server_header_guard();
-            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-            if let Some(ref g) = server_guard {
-                headers.push(g.as_header());
-            }
-            let _ = conn
-                .send_response(stream_id, 404, &headers, Some(b"Not Found"))
-                .await;
-            return Some((404, 9));
-        }
-        base_path.to_path_buf()
-    };
-
-    // ファイル読み込み（io_uring による非同期I/O でワーカースレッドをブロックしない）
-    let data = match crate::runtime::io::read(&file_path).await {
-        Ok(d) => d,
-        Err(_) => {
-            let server_guard = get_server_header_guard();
-            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
-            if let Some(ref g) = server_guard {
-                headers.push(g.as_header());
-            }
-            let _ = conn
-                .send_response(stream_id, 404, &headers, Some(b"Not Found"))
-                .await;
-            return Some((404, 9));
-        }
-    };
-
-    let mime_type = mime_guess::from_path(&file_path).first_or_octet_stream();
-    let mime_str = mime_type.as_ref();
-
-    let (built_headers, response_body) =
-        build_h2_compressed_file_response(&data, mime_str, security, compression, client_encoding);
-
-    #[cfg(feature = "wasm")]
-    let header_store = apply_h2_wasm_response_headers(wasm_modules, 200, built_headers).await;
-    #[cfg(not(feature = "wasm"))]
-    let header_store = built_headers;
-
-    let headers: Vec<(&[u8], &[u8])> = header_store
-        .iter()
-        .map(|(k, v)| (k.as_slice(), v.as_slice()))
-        .collect();
-
-    if let Err(e) = conn
-        .send_response(stream_id, 200, &headers, Some(&response_body))
-        .await
-    {
-        warn!("[HTTP/2] File response error: {}", e);
-        return None;
-    }
-
-    Some((200, response_body.len() as u64))
-}
-
-/// HTTP/2 リダイレクト処理
-#[cfg(feature = "http2")]
-async fn handle_http2_redirect<S>(
-    conn: &mut http2::Http2Connection<S>,
-    stream_id: u32,
-    redirect_url: &str,
-    status_code: u16,
-    preserve_path: bool,
-    req_path: &[u8],
-    prefix: &[u8],
-) -> Option<(u16, u64)>
-where
-    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
-{
-    let path_str = std::str::from_utf8(req_path).unwrap_or("/");
-    let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
-
-    // パス部分（prefix除去後）
-    let sub_path = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
-        &path_str[prefix_str.len()..]
-    } else {
-        path_str
-    };
-
-    // 変数置換とパス追加
-    let mut final_url = redirect_url
-        .replace("$request_uri", path_str)
-        .replace("$path", sub_path);
-
-    if preserve_path && !sub_path.is_empty() {
-        if final_url.ends_with('/') && sub_path.starts_with('/') {
-            final_url.push_str(&sub_path[1..]);
-        } else if !final_url.ends_with('/') && !sub_path.starts_with('/') {
-            final_url.push('/');
-            final_url.push_str(sub_path);
-        } else {
-            final_url.push_str(sub_path);
-        }
-    }
-
-    let server_guard = get_server_header_guard();
-    let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(3);
-    headers.push((b"location", final_url.as_bytes()));
-    if let Some(ref g) = server_guard {
-        headers.push(g.as_header());
-    }
-
-    if let Err(e) = conn
-        .send_response(stream_id, status_code, &headers, None)
-        .await
-    {
-        warn!("[HTTP/2] Redirect response error: {}", e);
-        return None;
-    }
-
-    Some((status_code, 0))
 }
 
 // ====================

@@ -483,7 +483,10 @@ where
     ///
     /// 送信ホットパスの HEADERS/DATA/トレイラーを 1 本にまとめて io_uring 書き込み回数を
     /// 削減する。バッファは書き込み後に空にして容量を再利用する。
-    async fn flush_write_buf(&mut self) -> Http2Result<()> {
+    ///
+    /// F-116: 多重化メインループが `drive_streams` 後に 1 イテレーション 1 回、および
+    /// `queue_data_frames` で `write_buf` が閾値超過した際に明示フラッシュするため `pub`。
+    pub async fn flush_write_buf(&mut self) -> Http2Result<()> {
         if self.write_buf.is_empty() {
             return Ok(());
         }
@@ -1366,6 +1369,47 @@ where
             true,
         )
         .await
+    }
+
+    /// ヘッダーを連結バッファへ積む（`end_stream` 指定可能）。即送出しない（F-116）。
+    ///
+    /// 多重化メインループの `drive_streams` が、複数ストリームの HEADERS/DATA を
+    /// `write_buf` へ合流させ 1 回の書き込みでフラッシュするために使う。`end_stream=true` で
+    /// ボディ無し応答（リダイレクト・304 等）の HEADERS に END_STREAM を付与する。
+    pub async fn send_headers_buffered_end(
+        &mut self,
+        stream_id: u32,
+        status: u16,
+        headers: &[(&[u8], &[u8])],
+        end_stream: bool,
+    ) -> Http2Result<()> {
+        let mut lowercase_names: Vec<Vec<u8>> = Vec::with_capacity(headers.len());
+        for &(name, _) in headers {
+            lowercase_names.push(name.to_ascii_lowercase());
+        }
+        self.send_headers_internal(
+            stream_id,
+            status,
+            headers,
+            &lowercase_names,
+            end_stream,
+            false,
+        )
+        .await
+    }
+
+    /// 連結バッファ `write_buf` に現在積まれているバイト数（F-116）。
+    ///
+    /// `queue_data_frames` は決してフラッシュしないため、メインループは本値が
+    /// フラッシュ閾値（128KB）を超えたら明示的に `flush_write_buf` する。
+    pub fn pending_write_len(&self) -> usize {
+        self.write_buf.len()
+    }
+
+    /// リクエスト方向ストリーミング（F-116/F-32）で、メインループが DATA をチャネルへ
+    /// 移した時点で recv ウィンドウを補充するための公開ラッパー。
+    pub async fn replenish_recv_window(&mut self, stream_id: u32) -> Http2Result<()> {
+        self.maybe_send_window_update(stream_id).await
     }
 
     /// ヘッダーを連結バッファへ積むだけで即送出しない（ストリーミング応答の HEADERS +
