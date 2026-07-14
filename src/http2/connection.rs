@@ -1406,12 +1406,6 @@ where
         self.write_buf.len()
     }
 
-    /// リクエスト方向ストリーミング（F-116/F-32）で、メインループが DATA をチャネルへ
-    /// 移した時点で recv ウィンドウを補充するための公開ラッパー。
-    pub async fn replenish_recv_window(&mut self, stream_id: u32) -> Http2Result<()> {
-        self.maybe_send_window_update(stream_id).await
-    }
-
     /// ヘッダーを連結バッファへ積むだけで即送出しない（ストリーミング応答の HEADERS +
     /// 最初の DATA 連結用）。
     ///
@@ -2173,6 +2167,16 @@ impl<S: crate::runtime::io::BufferedReadState> Http2Connection<S> {
     /// （さもないと既読データが残ったまま POLLIN を待ってデッドロックする）。
     pub fn has_pending_input(&self) -> bool {
         self.buf_end > self.buf_start || self.stream.has_buffered_read_data()
+    }
+
+    /// 基盤ストリームに復号済み/先読みバッファが残っているか（F-116）。
+    ///
+    /// TLS フォールバック経路では復号済み平文がストリーム内部に滞留し、POLLIN では
+    /// 通知されない。メインループはこれが `true` の間 `wait_readable_fd` を当てにできず、
+    /// `fill_read_buf` で能動的に読み出す必要がある（`read_buf` の未消化バイト＝分割フレーム
+    /// 待ちとは区別する。後者は POLLIN が発火するため通常の待機で拾える）。
+    pub fn has_stream_buffered_read_data(&self) -> bool {
+        self.stream.has_buffered_read_data()
     }
 }
 

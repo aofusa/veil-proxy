@@ -558,9 +558,13 @@ where
         conn.flush_write_buf().await?;
 
         // 3. 読み込みバッファに溜まった完全フレームを I/O なしで連続処理。
+        let mut processed_any = false;
         loop {
             let frame = match conn.try_read_frame_buffered() {
-                Ok(Some(f)) => f,
+                Ok(Some(f)) => {
+                    processed_any = true;
+                    f
+                }
                 Ok(None) => break,
                 Err(e) => {
                     let _ = conn
@@ -722,27 +726,42 @@ where
 
         conn.cleanup_closed();
 
-        // 4. 待機判定: 完全フレーム無し && 先読みバッファ空 && drive で書くものが無い とき。
-        if !conn.has_pending_input() && !h2_streams_have_work(&streams) {
-            let readable = h2_select_readable_or_notify(conn.raw_fd(), &notify).await;
-            if readable {
-                match conn.fill_read_buf().await {
-                    Ok(_) => {}
-                    Err(Http2Error::ConnectionClosed) => break,
-                    Err(Http2Error::Io(ref e)) if e.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(Http2Error::Io(ref e)) if is_connection_closed_error(e) => {
-                        debug!(
-                            "[HTTP/2] Connection closed by client (expected): {} (client: {})",
-                            e, client_ip
-                        );
-                        break;
-                    }
-                    Err(e) => {
-                        let _ = conn
-                            .send_goaway(e.error_code(), e.to_string().as_bytes())
-                            .await;
-                        return Err(e);
-                    }
+        // 4. 入力取得 / 待機。
+        //
+        // (a) TLS 復号済み平文がストリーム内部に滞留している場合は POLLIN では通知されないため、
+        //     待機せず `fill_read_buf` で能動的に読み出して再ループする（さもないと既読データが
+        //     残ったまま POLLIN を待ってデッドロック / CPU スピンする）。
+        // (b) 本周でフレームを処理した場合（WINDOW_UPDATE で送信ウィンドウが回復した等）は待機せず
+        //     drive へ戻り、回復したウィンドウで pending_body を直ちに送出する。
+        // (c) それ以外（idle / `read_buf` 内の分割フレーム待ち）は `select2` で待機する。分割フレーム
+        //     の続きは POLLIN で発火し、タスク出力は notify で発火する（Notify は取りこぼさない）。
+        let need_fill = if conn.has_stream_buffered_read_data() {
+            true
+        } else if processed_any {
+            // 進捗ありだが追加入力はまだ。drive へ戻る（fill しない）。
+            continue;
+        } else {
+            // idle: 可読 or notify を待つ。可読なら fill する。
+            h2_select_readable_or_notify(conn.raw_fd(), &notify).await
+        };
+
+        if need_fill {
+            match conn.fill_read_buf().await {
+                Ok(_) => {}
+                Err(Http2Error::ConnectionClosed) => break,
+                Err(Http2Error::Io(ref e)) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(Http2Error::Io(ref e)) if is_connection_closed_error(e) => {
+                    debug!(
+                        "[HTTP/2] Connection closed by client (expected): {} (client: {})",
+                        e, client_ip
+                    );
+                    break;
+                }
+                Err(e) => {
+                    let _ = conn
+                        .send_goaway(e.error_code(), e.to_string().as_bytes())
+                        .await;
+                    return Err(e);
                 }
             }
         }
@@ -936,16 +955,6 @@ fn h2_spawn_for_request<S>(
             pending_body: None,
         },
     );
-}
-
-/// drive で送出待ち（resp_rx にメッセージあり / pending_body / req 転送待ち）があるか。
-#[cfg(feature = "http2")]
-fn h2_streams_have_work(streams: &std::collections::HashMap<u32, H2ActiveStream>) -> bool {
-    streams.values().any(|s| {
-        s.pending_body.is_some()
-            || !s.req_pending.is_empty()
-            || (s.req_streaming && s.req_eof && s.req_tx.is_some())
-    })
 }
 
 /// 2 つの Future（ソケット可読 / notify）を自前 `poll_fn` で race する（futures 依存を増やさない）。
@@ -2916,7 +2925,9 @@ where
         return (s, sz, 0);
     }
 
-    // リクエストボディを chunked で逐次転送。
+    // リクエストボディを chunked で逐次転送。チャネルを消費したら notify で
+    // メインループを起こし、req_pending の残りをチャネルへ補充させる（HTTP/3 と同方針。
+    // これが無いとチャネル満杯 + メインループ待機で残ボディが流れずデッドロックする）。
     let mut req_size: u64 = 0;
     while let Some(chunk) = req_rx.recv().await {
         req_size = req_size.saturating_add(chunk.len() as u64);
@@ -2924,6 +2935,7 @@ where
             let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
             return (s, sz, req_size);
         }
+        notify.notify();
     }
     // 終端チャンク。
     if backend_write_all_bytes(backend, Bytes::from_static(b"0\r\n\r\n"))

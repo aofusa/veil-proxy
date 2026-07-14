@@ -967,10 +967,28 @@ impl crate::runtime::io::AsyncWriteRent for KtlsServerStream {
         let slice = unsafe { std::slice::from_raw_parts(buf.read_ptr(), buf.bytes_init()) };
 
         // データを TLS レコードにエンコード
-        let mut wr = conn.writer();
-        if let Err(e) = std::io::Write::write_all(&mut wr, slice) {
-            return (Err(e), buf);
-        }
+        // rustls の送信平文バッファ（既定 64KB）には上限があり、巨大 slice を
+        // `write_all` すると受理不能時に WriteZero（"failed to write whole buffer"）で
+        // 失敗する（F-116: HTTP/2 多重化の連結送出は 64KB を超えうる）。`write` は
+        // 部分書き込みを返してよい契約のため、rustls が受理できた分だけ書き込み、
+        // TLS レコードを送出して受理バイト数を返す（呼び出し側の
+        // `AsyncWriteRentExt::write_all`〈B-27 SlicedIoBuf〉が残りを継続する）。
+        let accepted = {
+            let mut wr = conn.writer();
+            match std::io::Write::write(&mut wr, slice) {
+                Ok(0) if !slice.is_empty() => {
+                    return (
+                        Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "rustls writer accepted 0 bytes",
+                        )),
+                        buf,
+                    );
+                }
+                Ok(n) => n,
+                Err(e) => return (Err(e), buf),
+            }
+        };
 
         // TLS レコードを送信
         let fd = self.inner.as_raw_fd();
@@ -1000,7 +1018,7 @@ impl crate::runtime::io::AsyncWriteRent for KtlsServerStream {
             }
         }
 
-        (Ok(slice.len()), buf)
+        (Ok(accepted), buf)
     }
 
     async fn writev<T: IoVecBuf>(&mut self, buf: T) -> crate::runtime::io::BufResult<usize, T> {
@@ -1116,10 +1134,28 @@ impl crate::runtime::io::AsyncWriteRent for KtlsClientStream {
 
         let slice = unsafe { std::slice::from_raw_parts(buf.read_ptr(), buf.bytes_init()) };
 
-        let mut wr = conn.writer();
-        if let Err(e) = std::io::Write::write_all(&mut wr, slice) {
-            return (Err(e), buf);
-        }
+        // rustls の送信平文バッファ（既定 64KB）には上限があり、巨大 slice を
+        // `write_all` すると受理不能時に WriteZero（"failed to write whole buffer"）で
+        // 失敗する（F-116: HTTP/2 多重化の連結送出は 64KB を超えうる）。`write` は
+        // 部分書き込みを返してよい契約のため、rustls が受理できた分だけ書き込み、
+        // TLS レコードを送出して受理バイト数を返す（呼び出し側の
+        // `AsyncWriteRentExt::write_all`〈B-27 SlicedIoBuf〉が残りを継続する）。
+        let accepted = {
+            let mut wr = conn.writer();
+            match std::io::Write::write(&mut wr, slice) {
+                Ok(0) if !slice.is_empty() => {
+                    return (
+                        Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "rustls writer accepted 0 bytes",
+                        )),
+                        buf,
+                    );
+                }
+                Ok(n) => n,
+                Err(e) => return (Err(e), buf),
+            }
+        };
 
         let fd = self.inner.as_raw_fd();
         while conn.wants_write() {
@@ -1148,7 +1184,7 @@ impl crate::runtime::io::AsyncWriteRent for KtlsClientStream {
             }
         }
 
-        (Ok(slice.len()), buf)
+        (Ok(accepted), buf)
     }
 
     async fn writev<T: IoVecBuf>(&mut self, buf: T) -> crate::runtime::io::BufResult<usize, T> {
