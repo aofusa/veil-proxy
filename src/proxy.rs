@@ -587,11 +587,9 @@ where
                     .unwrap_or(false);
                 if is_streaming {
                     let data_len = data.len();
-                    // フロー制御・状態遷移・WINDOW_UPDATE（recv ウィンドウ補充を含む）。
-                    if let Err(e) = conn
-                        .recv_data_for_streaming(stream_id, end_stream, data_len)
-                        .await
-                    {
+                    // フロー制御・状態遷移・content-length 検証（recv ウィンドウの補充は
+                    // しない。補充は drive が req チャネルへ転送できた消費連動で行う）。
+                    if let Err(e) = conn.recv_data_for_streaming(stream_id, end_stream, data_len) {
                         if e.should_goaway() {
                             let _ = conn
                                 .send_goaway(e.error_code(), e.to_string().as_bytes())
@@ -601,6 +599,11 @@ where
                             let _ = conn.send_rst_stream(id, e.error_code()).await;
                         }
                         streams.remove(&stream_id);
+                        // 未転送分のクレジットが conn レベルに残らないよう補充する。
+                        conn.replenish_recv_window(stream_id);
+                        // 直後の process_frame が write_all（write_buf 空の不変条件）を使うため、
+                        // 積んだ WINDOW_UPDATE を先に送出する。
+                        conn.flush_write_buf().await?;
                         continue;
                     }
                     if let Some(st) = streams.get_mut(&stream_id) {
@@ -612,6 +615,11 @@ where
                                 .send_rst_stream(stream_id, http2::Http2ErrorCode::EnhanceYourCalm)
                                 .await;
                             streams.remove(&stream_id);
+                            // 打ち切りで消費されないクレジットを conn レベルへ返す。
+                            conn.replenish_recv_window(stream_id);
+                            // 直後の process_frame が write_all（write_buf 空の不変条件）を使うため、
+                            // 積んだ WINDOW_UPDATE を先に送出する。
+                            conn.flush_write_buf().await?;
                             continue;
                         }
                         if data_len > 0 {
@@ -668,46 +676,42 @@ where
             } else {
                 None
             };
-            // トレイラー（END_STREAM 付き HEADERS）でリクエスト方向ストリーミングを終端する場合、
-            // req チャネルへ EOF を伝える（DATA+END_STREAM 以外の終端。旧経路の trailer 処理相当）。
-            let trailer_eof = match &frame {
-                Frame::Headers {
-                    stream_id,
-                    end_stream: true,
-                    ..
-                }
-                | Frame::Continuation { stream_id, .. }
-                    if streams
-                        .get(stream_id)
-                        .map(|s| s.req_streaming && !s.req_eof)
-                        .unwrap_or(false) =>
-                {
-                    Some(*stream_id)
-                }
-                _ => None,
-            };
 
             match conn.process_frame(frame).await {
                 Ok(Some(req)) => {
-                    h2_spawn_for_request(
-                        conn,
-                        req.stream_id,
-                        req.body_pending,
-                        &mut streams,
-                        &notify,
-                        &spawner,
-                        client_ip,
-                        connection_metric,
-                    );
-                }
-                Ok(None) => {
-                    if let Some(id) = trailer_eof {
-                        if let Some(st) = streams.get_mut(&id) {
+                    if let Some(st) = streams.get_mut(&req.stream_id) {
+                        // 既にタスク起動済みのストリーム: リクエスト方向ストリーミング中に
+                        // トレイラー（END_STREAM 付き HEADERS / CONTINUATION 完了）で終端した
+                        // 場合、process_frame は body_pending=false の ProcessedRequest を返す。
+                        // 新規タスクは起動せず、req チャネルの EOF（sender drop）へ変換する
+                        // （さもないとバックエンドが終端チャンクを受け取れずハングする）。
+                        if st.req_streaming && !req.body_pending {
                             st.req_eof = true;
                         }
+                    } else {
+                        h2_spawn_for_request(
+                            conn,
+                            req.stream_id,
+                            req.body_pending,
+                            &mut streams,
+                            &notify,
+                            &spawner,
+                            client_ip,
+                            connection_metric,
+                        );
                     }
+                }
+                Ok(None) => {
                     if let Some(id) = rst_target {
-                        streams.remove(&id);
+                        if let Some(st) = streams.remove(&id) {
+                            // ストリーミング中の打ち切りは未転送クレジットを conn レベルへ返す。
+                            if st.req_streaming {
+                                conn.replenish_recv_window(id);
+                                // 直後の process_frame が write_all（write_buf 空の不変条件）を
+                                // 使うため、積んだ WINDOW_UPDATE を先に送出する。
+                                conn.flush_write_buf().await?;
+                            }
+                        }
                     }
                 }
                 Err(e) => {
@@ -718,7 +722,14 @@ where
                         return Err(e);
                     } else if let Some(id) = e.rst_stream_id() {
                         let _ = conn.send_rst_stream(id, e.error_code()).await;
-                        streams.remove(&id);
+                        if let Some(st) = streams.remove(&id) {
+                            if st.req_streaming {
+                                conn.replenish_recv_window(id);
+                                // 直後の process_frame が write_all（write_buf 空の不変条件）を
+                                // 使うため、積んだ WINDOW_UPDATE を先に送出する。
+                                conn.flush_write_buf().await?;
+                            }
+                        }
                     }
                 }
             }
@@ -886,18 +897,20 @@ fn h2_spawn_for_request<S>(
         return;
     }
 
-    let streaming = body_pending && h2_body_pending_streaming_eligible(conn, stream_id, client_ip);
+    // ストリーミング適格判定 + リクエストボディ上限をルーティング 1 回で取得する
+    // （適格判定と上限取得で find_backend_unified を二重実行しない）。
+    let plan = if body_pending {
+        h2_route_streaming_plan(conn, stream_id, client_ip)
+    } else {
+        None
+    };
+    let streaming = plan.is_some();
     if body_pending && !streaming {
         // 非適格: 何もしない。DATA は process_frame が request_body へ蓄積し、
         // END_STREAM 受信時に body_pending=false の ProcessedRequest で本関数が再度呼ばれる。
         return;
     }
-
-    let max_request_body = if streaming {
-        h2_route_max_request_body(conn, stream_id, client_ip)
-    } else {
-        0
-    };
+    let max_request_body = plan.unwrap_or(0);
 
     let parts = match conn.take_request_parts(stream_id) {
         Some(p) => p,
@@ -1005,13 +1018,14 @@ where
         // --- リクエストボディを req チャネルへ流す（バックプレッシャ考慮） ---
         {
             let st = streams.get_mut(&sid).unwrap();
+            let mut transferred = false;
             while st.req_tx.is_some() {
                 let item = match st.req_pending.pop_front() {
                     Some(it) => it,
                     None => break,
                 };
                 match st.req_tx.as_ref().unwrap().try_send(item) {
-                    Ok(()) => {}
+                    Ok(()) => transferred = true,
                     Err(TrySendError::Full(it)) => {
                         st.req_pending.push_front(it);
                         break;
@@ -1025,6 +1039,13 @@ where
             if st.req_tx.is_some() && st.req_pending.is_empty() && st.req_eof {
                 // クライアント END_STREAM 済み・全量投入済み → sender drop で EOF 伝播。
                 st.req_tx = None;
+            }
+            // recv ウィンドウの消費連動補充（F-116 バックプレッシャ）: req チャネルへ転送
+            // できた分だけクライアントへ新規クレジットを渡す。受信時に即補充すると
+            // バックエンドが遅い場合に req_pending が際限なく成長する（旧 F-32 経路の
+            // 「バックエンド書き込み後に補充」と同じ消費連動タイミング）。
+            if transferred {
+                conn.replenish_recv_window(sid);
             }
         }
 
@@ -1047,20 +1068,29 @@ where
 
         // --- resp_rx を送出可能な限りドレイン ---
         loop {
-            let msg = {
+            let recv = {
                 let st = streams.get_mut(&sid).unwrap();
-                match st.resp_rx.try_recv() {
-                    TryRecv::Item(m) => m,
-                    TryRecv::Empty => break,
-                    TryRecv::Closed => {
+                st.resp_rx.try_recv()
+            };
+            let msg = match recv {
+                TryRecv::Item(m) => m,
+                TryRecv::Empty => break,
+                TryRecv::Closed => {
+                    let st = streams.get_mut(&sid).unwrap();
+                    if st.head_sent && !st.end_sent {
                         // EOF: head 送出済みで END_STREAM 未送なら空 DATA で閉じる。
-                        if st.head_sent && !st.end_sent {
-                            conn.queue_data_frames(sid, &[], true)?;
-                            st.end_sent = true;
-                        }
-                        done.push(sid);
-                        break;
+                        conn.queue_data_frames(sid, &[], true)?;
+                        st.end_sent = true;
+                    } else if !st.head_sent {
+                        // タスクが Head を送らずに終了（想定外の異常終了）: クライアントを
+                        // 宙吊りにしないよう RST_STREAM で明示的に打ち切る。
+                        conn.flush_write_buf().await?;
+                        let _ = conn
+                            .send_rst_stream(sid, http2::Http2ErrorCode::InternalError)
+                            .await;
                     }
+                    done.push(sid);
+                    break;
                 }
             };
 
@@ -1133,50 +1163,28 @@ where
     }
 
     for sid in done {
-        streams.remove(&sid);
+        if let Some(st) = streams.remove(&sid) {
+            // タスクが早期終了したストリーミングストリームは req_pending が未転送のまま
+            // 残り得る。そのクレジットが conn レベルに滞留しないよう補充する。
+            if st.req_streaming {
+                conn.replenish_recv_window(sid);
+            }
+        }
     }
     Ok(())
 }
 
-/// リクエストがストリーミング適格か（F-32 の条件を厳密に踏襲）。
+/// リクエスト方向ストリーミングの適格判定（F-32 の条件を厳密に踏襲）。
 ///
 /// 条件: Proxy バックエンド + WASM モジュール非適用 + 非 gRPC + バッファリング非 Full +
 /// 上流 use_h2c 以外 + セキュリティ許可 + サーバー選択成功。conn は借用のみ（変更しない）。
-#[cfg(feature = "http2")]
-fn h2_body_pending_streaming_eligible<S>(
-    conn: &http2::Http2Connection<S>,
-    stream_id: u32,
-    client_ip: &str,
-) -> bool
-where
-    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
-{
-    let plan = h2_route_streaming_plan(conn, stream_id, client_ip);
-    plan.is_some()
-}
-
-/// ストリーミング適格時の最大リクエストボディサイズを取得する（0 = 無制限）。
-#[cfg(feature = "http2")]
-fn h2_route_max_request_body<S>(
-    conn: &http2::Http2Connection<S>,
-    stream_id: u32,
-    client_ip: &str,
-) -> u64
-where
-    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
-{
-    h2_route_streaming_plan(conn, stream_id, client_ip)
-        .map(|(_, max)| max)
-        .unwrap_or(0)
-}
-
-/// ストリーミング適格判定の共通ルーティング。適格なら `(use_tls, max_request_body)` を返す。
+/// 適格なら `Some(max_request_body)`（0 = 無制限）を返す。
 #[cfg(feature = "http2")]
 fn h2_route_streaming_plan<S>(
     conn: &http2::Http2Connection<S>,
     stream_id: u32,
     client_ip: &str,
-) -> Option<(bool, u64)>
+) -> Option<u64>
 where
     S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
 {
@@ -1277,7 +1285,7 @@ where
     if server.target.use_h2c {
         return None;
     }
-    Some((server.target.use_tls, security.max_request_body_size as u64))
+    Some(security.max_request_body_size as u64)
 }
 
 /// クライアント IP 文字列を `SocketAddr` に変換する（ルーティング入力）。

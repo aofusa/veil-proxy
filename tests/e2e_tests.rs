@@ -1755,6 +1755,89 @@ async fn test_http2_multiplexed_coalesced_responses() {
     );
 }
 
+/// F-116: 同一 HTTP/2 コネクション上の「遅いストリーム」と「速いストリーム」の多重化検証。
+///
+/// 遅延バックエンド（echo サーバーの `x-delay-ms` ヘッダーで応答を 1500ms 遅らせる）への
+/// リクエストと、遅延なしの高速リクエストを同一コネクションで並行発行し、**速い側が遅い側の
+/// 完了を待たずに先に応答を受け取れる**ことを完了時刻の計測で検証する。旧直列実装
+/// （1 コネクション 1 リクエストずつ処理）では速い側も遅延分待たされるため本テストは落ち、
+/// アクターモデル（per-stream タスク + メインループ多重送出）で初めて通る。
+#[tokio::test]
+#[ntest::timeout(15000)]
+#[cfg(feature = "http2")]
+async fn test_http2_multiplexing_slow_stream_does_not_block_fast() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    const DELAY_MS: u64 = 1500;
+    let slow_body = b"slow-stream-body";
+
+    let mut client = match common::http2_client::Http2TestClient::new("127.0.0.1", PROXY_PORT).await
+    {
+        Ok(c) => c,
+        Err(e) => panic!("Failed to establish HTTP/2 connection to proxy: {}", e),
+    };
+
+    // 遅いストリームを先に発行し、その後に速いストリームを発行する（発行順でも速い側が先に完了する
+    // ことを確認する）。両方 echo バックエンド行きで、遅延の有無のみが異なる。
+    let slow_headers: &[(&str, &str)] = &[("x-delay-ms", "1500")];
+    let fast_headers: &[(&str, &str)] = &[];
+    let reqs: &[(&str, &str, &[(&str, &str)], Option<&[u8]>)] = &[
+        (
+            "POST",
+            "/echo-upload/slow",
+            slow_headers,
+            Some(slow_body.as_slice()),
+        ),
+        ("GET", "/echo-upload/fast", fast_headers, None),
+    ];
+
+    let results = client
+        .send_concurrent_timed(reqs)
+        .await
+        .expect("HTTP/2 slow/fast multiplexed requests failed");
+    assert_eq!(results.len(), 2);
+
+    let (slow_status, slow_resp, slow_elapsed) = &results[0];
+    let (fast_status, _fast_resp, fast_elapsed) = &results[1];
+
+    // 双方正常応答。遅い側はボディが往復一致し、遅延分以上かかっている。
+    assert_eq!(*slow_status, 200, "slow stream should return 200");
+    assert_eq!(
+        slow_resp.as_slice(),
+        slow_body,
+        "slow stream body should echo byte-exact"
+    );
+    assert!(
+        slow_elapsed.as_millis() as u64 >= DELAY_MS - 100,
+        "slow stream should take at least the backend delay (elapsed {:?})",
+        slow_elapsed
+    );
+    assert_eq!(*fast_status, 200, "fast stream should return 200");
+
+    // 核心: 速い側は遅い側の完了（>=1500ms）を待たずに完了する。直列実装では
+    // fast_elapsed >= DELAY_MS となり失敗する。負荷余裕を見て 1000ms を閾値とする。
+    assert!(
+        (fast_elapsed.as_millis() as u64) < DELAY_MS - 500,
+        "fast stream must complete before the slow stream's backend delay \
+         (fast: {:?}, slow: {:?}) — connection-level head-of-line blocking detected",
+        fast_elapsed,
+        slow_elapsed
+    );
+    assert!(
+        fast_elapsed < slow_elapsed,
+        "fast stream should finish before slow stream (fast: {:?}, slow: {:?})",
+        fast_elapsed,
+        slow_elapsed
+    );
+    eprintln!(
+        "HTTP/2 multiplexing: fast stream completed in {:?} while slow stream took {:?} on one connection",
+        fast_elapsed, slow_elapsed
+    );
+}
+
 // ====================
 // セキュリティ機能 E2Eテスト（優先度: 中）
 // ====================

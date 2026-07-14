@@ -1189,13 +1189,19 @@ where
     /// ストリーミング転送用の DATA 受信処理（F-32 リクエスト方向ストリーミング）
     ///
     /// 通常の DATA 処理（`process_frame` → `handle_data`）と同等のフロー制御・
-    /// WINDOW_UPDATE・状態遷移・content-length 検証を行うが、受信データを
-    /// `Stream::request_body` へ**バッファしない**。呼び出し側（proxy）は受信した DATA
-    /// フレームの所有バッファをそのままゼロコピーでバックエンドへ転送できる。
+    /// 状態遷移・content-length 検証を行うが、受信データを `Stream::request_body` へ
+    /// **バッファしない**。呼び出し側（proxy）は受信した DATA フレームの所有バッファを
+    /// そのままゼロコピーでバックエンドへ転送できる。
+    ///
+    /// **WINDOW_UPDATE（recv ウィンドウ補充）は行わない**（F-116）。受信時に即補充すると
+    /// クライアントが常に新規クレジットを得て送信し続けられ、バックエンドが遅い場合に
+    /// 未転送ボディが際限なく滞留する（バックプレッシャ喪失）。補充は呼び出し側が
+    /// **下流へ消費できたタイミング**で [`replenish_recv_window`](Self::replenish_recv_window)
+    /// により行うこと（旧 F-32 経路の「バックエンド書き込み後に補充」と同方針）。
     ///
     /// `data_len` には受信した DATA ペイロード長を渡す。`process_frame` の DATA アーム
     /// と同じ事前検証（ヘッダーブロック受信中でないこと・idle ストリームでないこと）を行う。
-    pub async fn recv_data_for_streaming(
+    pub fn recv_data_for_streaming(
         &mut self,
         stream_id: u32,
         end_stream: bool,
@@ -1228,10 +1234,51 @@ where
         stream.update_activity();
         stream.recv_data_accounting(data_len, end_stream)?;
 
-        // WINDOW_UPDATE を送信 (必要に応じて)
-        self.maybe_send_window_update(stream_id).await?;
-
         Ok(())
+    }
+
+    /// recv ウィンドウの消費連動補充（F-116。必要に応じて WINDOW_UPDATE を **write_buf へ積む**）。
+    ///
+    /// [`recv_data_for_streaming`](Self::recv_data_for_streaming) で消費した recv ウィンドウを、
+    /// 受信ボディを下流（req チャネル→バックエンド）へ転送できたタイミングで補充する。
+    /// 閾値（ウィンドウ半分超の消費）は `maybe_send_window_update` と同一。ストリームが既に
+    /// 存在しない場合はコネクションレベルのみ補充する（ストリーム打ち切り時のクレジット
+    /// リーク防止に使える）。
+    ///
+    /// `write_all` ではなく連結バッファ `write_buf` へ追記する（await しない）。多重化
+    /// メインループの drive 中は `write_buf` に他ストリームのフレームが積まれていることが
+    /// あり、直接 `write_all` すると順序が壊れるため。送出は次回の `flush_write_buf` で行われる。
+    pub fn replenish_recv_window(&mut self, stream_id: u32) {
+        // コネクションレベル
+        let conn_increment = defaults::CONNECTION_WINDOW_SIZE as i32 - self.conn_recv_window;
+        if conn_increment > (defaults::CONNECTION_WINDOW_SIZE as i32 / 2) {
+            let frame = self
+                .frame_encoder
+                .encode_window_update(0, conn_increment as u32);
+            self.write_buf.extend_from_slice(&frame);
+            self.conn_recv_window += conn_increment;
+        }
+
+        // ストリームレベル（ストリーム消滅後はスキップ）
+        let stream_increment = if let Some(stream) = self.streams.get(stream_id) {
+            let increment = self.local_settings.initial_window_size as i32 - stream.recv_window;
+            if increment > (self.local_settings.initial_window_size as i32 / 2) {
+                Some(increment)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(increment) = stream_increment {
+            let frame = self
+                .frame_encoder
+                .encode_window_update(stream_id, increment as u32);
+            self.write_buf.extend_from_slice(&frame);
+            if let Some(stream) = self.streams.get(stream_id) {
+                stream.update_recv_window(increment);
+            }
+        }
     }
 
     /// WINDOW_UPDATE を送信 (必要に応じて)
@@ -2824,5 +2871,46 @@ mod tests {
         assert!(conn.has_pending_input(), "初期データが未消化なら true");
         let _ = conn.try_read_frame_buffered().unwrap().expect("frame");
         assert!(!conn.has_pending_input(), "全消化後は false");
+    }
+
+    #[test]
+    fn recv_data_for_streaming_defers_window_update_until_replenish() {
+        // F-116 バックプレッシャ: recv_data_for_streaming は WINDOW_UPDATE を送らず
+        // （受信即補充だとバックエンドが遅い場合に未転送ボディが際限なく滞留する）、
+        // replenish_recv_window（下流への消費連動）で初めて write_buf へ積まれること。
+        const FRAME_WINDOW_UPDATE: u8 = 0x8;
+        let mut conn = Http2Connection::new(RecordingStream::new(), Http2Settings::default());
+        let stream = conn.streams.get_or_create_client_stream(1).expect("create");
+        stream.recv_headers(false).expect("recv_headers"); // ボディ継続（Open）
+
+        // conn/stream 両ウィンドウ（初期 65535）の過半を消費する。
+        conn.recv_data_for_streaming(1, false, 40000).expect("recv");
+        assert_eq!(conn.conn_recv_window, 65535 - 40000);
+        assert_eq!(conn.streams.get_ref(1).unwrap().recv_window, 65535 - 40000);
+        // 受信時点では WINDOW_UPDATE を送らない（write_buf にも直接書き込みにも出ない）。
+        assert!(
+            conn.write_buf.is_empty(),
+            "受信時に WINDOW_UPDATE を積まない"
+        );
+        assert!(conn.stream.writes.is_empty(), "受信時に直接送信しない");
+
+        // 消費連動の補充: conn（stream 0）/ stream 1 両レベルの WINDOW_UPDATE が
+        // write_buf へ積まれ、ウィンドウが回復すること（送出は次回 flush）。
+        conn.replenish_recv_window(1);
+        let frames = parse_frames(&conn.write_buf);
+        assert_eq!(frames.len(), 2, "conn + stream の WINDOW_UPDATE");
+        assert!(frames
+            .iter()
+            .all(|(t, _, _, payload)| *t == FRAME_WINDOW_UPDATE && payload.len() == 4));
+        assert!(frames.iter().any(|(_, _, sid, _)| *sid == 0));
+        assert!(frames.iter().any(|(_, _, sid, _)| *sid == 1));
+        assert_eq!(conn.conn_recv_window, 65535);
+        assert_eq!(conn.streams.get_ref(1).unwrap().recv_window, 65535);
+
+        // 消費が閾値（半分）未満なら何も積まれない（スパムしない）。
+        conn.write_buf.clear();
+        conn.recv_data_for_streaming(1, false, 100).expect("recv 2");
+        conn.replenish_recv_window(1);
+        assert!(conn.write_buf.is_empty(), "閾値未満では補充しない");
     }
 }

@@ -373,6 +373,13 @@ where
         .nth(1)
         .and_then(|s| s.split("\r\n").next())
         .and_then(|s| s.trim().parse().ok());
+    // F-116 多重化 E2E 用: `x-delay-ms` ヘッダーがあれば応答前に指定ミリ秒待つ
+    // （遅いバックエンドが同一コネクション上の他ストリームをブロックしないことの検証用）。
+    let delay_ms: Option<u64> = header_str
+        .split("x-delay-ms:")
+        .nth(1)
+        .and_then(|s| s.split("\r\n").next())
+        .and_then(|s| s.trim().parse().ok());
 
     // ボディを読み取り、デコードして echo 用バッファへ
     let mut body: Vec<u8> = Vec::new();
@@ -423,6 +430,11 @@ where
     } else {
         // ボディ無し
         body.extend_from_slice(&rest);
+    }
+
+    // 遅延指定があれば応答前に待つ（F-116 多重化 E2E 用）。
+    if let Some(ms) = delay_ms {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
     }
 
     // echo レスポンス

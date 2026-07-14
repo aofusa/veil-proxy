@@ -113,6 +113,60 @@ impl Http2TestClient {
         Ok((status, body_data))
     }
 
+    /// 同一 HTTP/2 接続で複数リクエストを**多重化して並行送信**し、各レスポンスの
+    /// `(status, body, 発行からの完了時間)` を要求順で返す（F-116 多重化検証用）。
+    ///
+    /// `send_concurrent` と異なり各 response future を **並行に await**（`join_all`）して
+    /// それぞれの完了時刻を計測するため、「遅いストリームが速いストリームの完了を
+    /// ブロックしない」ことを検証できる。ヘッダーは `(name, value)` ペアで指定する。
+    pub async fn send_concurrent_timed(
+        &mut self,
+        reqs: &[(&str, &str, &[(&str, &str)], Option<&[u8]>)],
+    ) -> Result<Vec<(u16, Vec<u8>, std::time::Duration)>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        let mut response_futures = Vec::with_capacity(reqs.len());
+        let start = std::time::Instant::now();
+        for (method, path, headers, body) in reqs {
+            let mut builder = Request::builder()
+                .method(*method)
+                .uri(*path)
+                .header("host", "localhost");
+            for (name, value) in headers.iter() {
+                builder = builder.header(*name, *value);
+            }
+            let request = builder.body(())?;
+            let end_of_stream = body.is_none();
+            let (response_future, mut send_body) =
+                self.sender.send_request(request, end_of_stream)?;
+            if let Some(body_data) = body {
+                send_body.send_data(Bytes::copy_from_slice(body_data), true)?;
+            }
+            response_futures.push(response_future);
+        }
+
+        // 各レスポンスを並行に受信し、それぞれの完了時刻（発行時点からの経過）を記録する。
+        let handles = response_futures
+            .into_iter()
+            .map(|response_future| async move {
+                let response = response_future.await?;
+                let status = response.status().as_u16();
+                let mut body_data = Vec::new();
+                let mut body_stream = response.into_body();
+                while let Some(chunk) = body_stream.data().await {
+                    let data = chunk?;
+                    body_data.extend_from_slice(&data);
+                    body_stream.flow_control().release_capacity(data.len())?;
+                }
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
+                    status,
+                    body_data,
+                    start.elapsed(),
+                ))
+            });
+        let results = futures::future::join_all(handles).await;
+        results.into_iter().collect()
+    }
+
     /// 同一 HTTP/2 接続で複数リクエストを**多重化して並行送信**し、各レスポンスを
     /// `(status, body)` の配列で返す（要求順に対応）。
     ///
