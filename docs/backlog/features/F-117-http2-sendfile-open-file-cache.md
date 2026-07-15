@@ -68,3 +68,7 @@ HTTP/2 の File 配信（`src/proxy.rs` の `h2_sendfile`）が HTTP/1.1（`hand
 - `cargo test --lib --features full`: 752 passed / 0 failed（`src/http2/connection.rs` の
   `FRAME_PING` dead_code 警告は本チケット変更前の main 由来で無関係）。
 - `./tests/e2e_setup.sh test`: 530 passed / 0 failed（回帰なし）。
+- perf（`h2_1_ktls_0_lb_kernel_ofc_1`、F-116 実測との比較）: HTTP/2 スループット
+  非劣化〜微改善（h2load `-t4`: glibc 3646.2 → 3662.5 ± 143.5、musl 3446.5 → 3589.8 ± 58.4）、
+  HTTP/1.1 不変。HTTP/2 の CPU 使用率が低下（t4: 168→159%、t1: 144→125%。
+  per-request の metadata/mime 系 syscall 削減による）。詳細 `docs/perf/README.md`。

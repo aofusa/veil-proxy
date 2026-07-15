@@ -52,6 +52,8 @@ HTTP/2 サーバ経路へ移植する。
 - 単体 751 件 / E2E フルスイート **530 passed / 0 failed**（新規
   `test_http2_multiplexing_slow_stream_does_not_block_fast` 含む。同一コネクションで
   遅延 1.5s ストリームと並行の高速ストリームが遅延を待たず完了することを実測）
+- h2spec（`tools/container_security/run_h2spec.sh`）: TLS / H2C 両ゲート **52/52 passed, 0 failed**
+  （2026-07-15、F-117 適用後のビルドで実施）
 - 全 feature 組み合わせ（full / default / no-default / http2 / http2,grpc-full）ビルド警告 0、
   `clippy -D warnings` / `cargo fmt` クリーン、`allow(dead_code)` 不使用
 - perf A/B（同日・同一環境、main / 本ブランチをイメージ再ビルドの上で連続計測）:
