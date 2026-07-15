@@ -2628,8 +2628,6 @@ mod tests {
     // F-116 Stage 2: 同期フレームパース / 非ブロッキング DATA 送出 / リクエスト取り出し
     // ====================
 
-    const FRAME_PING: u8 = 0x6;
-
     /// 読み込みバッファ末尾へバイト列を直接追記する（I/O なしでの受信をシミュレート）。
     fn feed_read_buf(conn: &mut Http2Connection<RecordingStream>, data: &[u8]) {
         conn.read_buf[conn.buf_end..conn.buf_end + data.len()].copy_from_slice(data);
