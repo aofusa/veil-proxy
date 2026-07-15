@@ -134,9 +134,9 @@ docker run --rm -it -v $(pwd):/io -w /io messense/cargo-zigbuild \
 
 The binary is generated at `target/x86_64-unknown-linux-gnu/release/veil`.
 
-### Linux Packages (.deb / .rpm)
+### Linux Packages (.deb / .rpm) and binary tarballs
 
-Build Debian/Ubuntu (`.deb`) and Amazon Linux 2023 (`.rpm`) install packages with all features enabled (`--features full`):
+Build Debian/Ubuntu (`.deb`) and Amazon Linux 2023 (`.rpm`) install packages, plus standalone glibc/musl binary tarballs, with all features enabled (`--features full`):
 
 ```bash
 ./packaging/scripts/build.sh
@@ -147,12 +147,14 @@ Outputs:
 ```
 packaging/output/veil_<version>_<arch>.deb
 packaging/output/veil-<version>-1.<arch>.rpm
+packaging/output/veil-<version>-x86_64-unknown-linux-gnu.tar.gz
+packaging/output/veil-<version>-x86_64-unknown-linux-musl.tar.gz
 ```
 
-Build inside Docker (same approach as [docker/Dockerfile.glibc](docker/Dockerfile.glibc), using `messense/cargo-zigbuild` for glibc 2.28-compatible binaries):
+Build inside Docker ([docker/Dockerfile.glibc](docker/Dockerfile.glibc) for glibc 2.28-compatible binaries via `messense/cargo-zigbuild`, and [docker/Dockerfile.musl](docker/Dockerfile.musl) for musl):
 
 ```bash
-# Build binary and packages entirely inside Docker
+# Build binaries and packages entirely inside Docker
 ./packaging/scripts/build.sh --docker
 ```
 
