@@ -1,7 +1,7 @@
 # F-116: HTTP/2 ストリーム多重化（コネクション内並行処理）
 
 - 優先度: P1
-- 状態: 進行中
+- 状態: 完了（2026-07-15）
 - 起点: [docs/artifacts/h2_performance_analysis.md](../../artifacts/h2_performance_analysis.md)（HTTP/2 パフォーマンス低下の原因調査）
 
 ## 機能説明（事象）
@@ -46,3 +46,19 @@ HTTP/2 サーバ経路へ移植する。
 - E2E: 既存 http2 テスト群 + 多重化並行性テスト（遅い応答が他ストリームを塞がないこと）
 - h2spec（`tools/container_security/run_h2spec.sh`）
 - perf: `CONFIG_GLOB='h2_1_ktls_0_lb_kernel_ofc_1'` で HTTP/2 改善・HTTP/1.1 非劣化を実測
+
+## 検証結果（2026-07-15 完了時）
+
+- 単体 751 件 / E2E フルスイート **530 passed / 0 failed**（新規
+  `test_http2_multiplexing_slow_stream_does_not_block_fast` 含む。同一コネクションで
+  遅延 1.5s ストリームと並行の高速ストリームが遅延を待たず完了することを実測）
+- 全 feature 組み合わせ（full / default / no-default / http2 / http2,grpc-full）ビルド警告 0、
+  `clippy -D warnings` / `cargo fmt` クリーン、`allow(dead_code)` 不使用
+- perf A/B（同日・同一環境、main / 本ブランチをイメージ再ビルドの上で連続計測）:
+  **HTTP/2 +16.1%（3140.6 → 3646.2 req/s、glibc、h2load `-t4`）で HTTP/1.1（3214）超え・
+  nginx 比 1.47 倍**。musl +9.6%。HTTP/1.1 は ±0（非劣化）。h2load 既定 1 スレッドは
+  クライアント律速（+6.5% に見える）ため `-t4` 併用（`docs/perf/README.md` 参照）
+- レビュー修正: アップロード recv ウィンドウ補充の消費連動化（受信即補充による
+  バックプレッシャ喪失 = メモリ DoS 退行の防止）、トレイラー終端の req チャネル EOF、
+  Head 未送出タスク終了時の RST_STREAM(INTERNAL_ERROR)、ストリーム打ち切り時の
+  conn ウィンドウクレジットリーク防止

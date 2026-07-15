@@ -41,7 +41,9 @@ h3_proxy の http1.1/http2、musl の残り行も同 tsv に含まれる）
 
 **要点:**
 
-- **HTTP/1.1: nginx 比 1.40 倍、HTTP/2: 1.11 倍**。ボトルネックは TLS 終端
+- **HTTP/1.1: nginx 比 1.40 倍、HTTP/2: 1.11 倍**（2026-07-13 時点。**F-116 の
+  ストリーム多重化後は HTTP/2 3646 req/s = nginx 比 1.47 倍・HTTP/1.1 超え**。
+  下記「HTTP/2 多重化の A/B」）。ボトルネックは TLS 終端
   （平文 L4 素通しは TLS 経由の最大 2.2 倍）で、L7 機能ロジック
   （wasm/metrics/access-log/rate-limit/admin/otel）はノイズ範囲内（±5%）。
 - **HTTP/3: 853 req/s（HTTP/2 比 32%）**。F-115 mmsg バッチング + B-43 修正で
@@ -79,6 +81,43 @@ h3_proxy の http1.1/http2、musl の残り行も同 tsv に含まれる）
   [B-43](../backlog/bugs/B-43-http3-static-streamblocked-frameunexpected.md) /
   [B-42](../backlog/bugs/B-42-http3-proxy-load-instability.md)
 
+## HTTP/2 多重化の A/B（2026-07-15、F-116）
+
+`docs/artifacts/h2_performance_analysis.md` の調査（HTTP/2 フレームループがリクエスト成立
+ごとにバックエンド往復を `await` する直列処理 = アプリ層 Head-of-Line Blocking）を受け、
+HTTP/3 と同型のアクターモデル（per-stream タスク + 有界チャネル + Notify + `POLL_ADD`
+readiness 待ち）へ移行した F-116 の同日・同一環境 A/B（`h2_1_ktls_0_lb_kernel_ofc_1`、
+main / feat/h2-multiplexing を各イメージ再ビルドの上で連続計測、ITERATIONS=3）。
+
+**標準負荷（h2load 既定 = 1 スレッド、`-n 30000 -c100 -m10`）:**
+
+| Target | Proto | main | F-116 | 変化 |
+|---|---|---|---|---|
+| veil_glibc | http2 | 2628.5 ± 47.7 | **2798.7 ± 31.6** | **+6.5%** |
+| veil_musl | http2 | 2628.6 ± 76.7 | 2751.5 ± 48.1 | +4.7% |
+| veil_glibc | http1.1 | 3214.8 ± 6.8 | 3212.6 ± 8.5 | ±0（非劣化） |
+| veil_musl | http1.1 | 3174.5 ± 20.7 | 3157.2 ± 5.3 | −0.5%（誤差内） |
+
+ただしこの構成では **veil の CPU が 135〜145%/400% と飽和せず、h2load（既定 1 スレッド）
+がクライアント律速**（nginx http2 も 2400〜2500 で頭打ち・同様に低 CPU）。
+
+**クライアント律速を解消した負荷（`-n 60000 -c100 -m10 -t4`）:**
+
+| Target | Proto | main | F-116 | 変化 |
+|---|---|---|---|---|
+| veil_glibc | http2 | 3140.6 ± 77.8 | **3646.2 ± 27.8** | **+16.1%** |
+| veil_musl | http2 | 3145.1 ± 50.9 | 3446.5 ± 77.9 | +9.6% |
+| veil_glibc | http1.1 | 3217.2 ± 4.0 | 3214.5 ± 9.6 | ±0（非劣化） |
+| nginx | http2 | 2501.9 ± 44.0 | 2481.1 ± 127.6 | （環境正規化用） |
+
+- **HTTP/2 が HTTP/1.1 を初めて上回った**（3646 vs 3214、+13%。従来は h2 が h1.1 比 −18%）。
+  nginx http2 比 **1.47 倍**。全計測 Non-2xx=0・h2load failed=0。
+- 機能面の裏付け: 同一コネクション上で遅延 1.5s のストリームと並行発行した高速ストリームが
+  遅延を待たずに完了する E2E（`test_http2_multiplexing_slow_stream_does_not_block_fast`）を追加。
+  旧直列実装ではこのテストは失敗する。
+- 生データ（4 計測分の raw tsv）は `docs/artifacts/perf_reports/f116_ab/`（git 管理外）に保持。
+- 関連チケット: [F-116](../backlog/features/F-116-http2-stream-multiplexing.md)
+
 ## 計測履歴（時系列サマリ）
 
 1. **初期ベンチマーク**: kTLS 無効時に nginx 超えを最初に確認。glibc ≧ musl、
@@ -98,7 +137,10 @@ h3_proxy の http1.1/http2、musl の残り行も同 tsv に含まれる）
 8. **F-114 全プロトコル×全機能マトリクス**: `h2_1_proxy_*`/`h3_file_*`/`h3_proxy*`/
    `grpc_h2_*`/`grpc_h3*` を追加（65+ 構成、`CONFIG_GLOB` で scoped 計測）。
 9. **F-115 第1段（受信 drain バッチ）**: select/タイマー往復の償却で +2.6%。
-10. **F-115 第2段 + B-43（2026-07-13、最新）**: HTTP/3 853 req/s へ倍増（上記）。
+10. **F-115 第2段 + B-43（2026-07-13）**: HTTP/3 853 req/s へ倍増（上記）。
+11. **F-116 HTTP/2 ストリーム多重化（2026-07-15、最新）**: 直列フレームループを
+    アクターモデル化し HTTP/2 +16.1%（3646 req/s、HTTP/1.1 超え・nginx 比 1.47 倍）。
+    HTTP/1.1 非劣化（上記 A/B）。
 
 ## 教訓（計測方針に反映済み）
 
@@ -110,6 +152,12 @@ h3_proxy の http1.1/http2、musl の残り行も同 tsv に含まれる）
   異常低スループット時は h2load の `requests:` 行とサーバ warn ログを確認する（B-43 の教訓）。
 - **Docker seccomp 許可リストは使用 syscall の追加に追随させる**。defaultAction=ERRNO の
   ため欠けると機能が無音で全滅する（F-115 recvmmsg/sendmmsg の教訓）。
+- **h2load は既定 1 スレッドでクライアント律速になり得る**（サーバ CPU 非飽和 +
+  nginx/veil が同水準で頭打ちなら疑う）。HTTP/2 で 2800 req/s 級以上を計測する際は
+  `H2_ARGS='-n 60000 -c100 -m10 -t4'` を併用する（F-116 の教訓）。
+- **git worktree から tools/perf を実行する場合、git 管理外の生成物
+  （`docker/assets/ssl/*.pem` 等）を本体ツリーからコピーする**。欠けると nginx/veil
+  全コンテナが起動即死し全行 NA になる（F-116 A/B の教訓）。
 
 ## 再現手順
 
