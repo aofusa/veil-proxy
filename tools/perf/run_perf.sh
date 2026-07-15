@@ -252,12 +252,19 @@ start_veil() { # image config_file container_name
         --name "$name" "$img" >/dev/null
 }
 
-wait_ready() { # container
-    local c="$1" i
+wait_ready() { # container [cfg]
+    local c="$1" cfg="${2:-}" i
     for i in $(seq 1 20); do
         if docker run --rm --network $NET curlimages/curl:latest -sk -o /dev/null \
              -w '%{http_code}' "https://$c:443/" 2>/dev/null | grep -q 200; then
-            return 0
+            # L4 構成は実際に計測する平文 9080 リスナーの疎通も確認する
+            case "$cfg" in
+                *feat_l4*)
+                    docker run --rm --network $NET curlimages/curl:latest -s -o /dev/null \
+                        -w '%{http_code}' "http://$c:9080/" 2>/dev/null | grep -q 200 && return 0
+                    ;;
+                *) return 0 ;;
+            esac
         fi
         sleep 0.5
     done
@@ -291,6 +298,8 @@ docker run -d --rm --network $NET --network-alias perf-ws \
     echo "!! perf-ws 起動失敗（websocket 構成はスキップされ得る）" >&2
 
 # ---- nginx baseline ----
+# results_raw.tsv の行順は (1) nginx ベースライン → (2) veil_glibc 各構成 →
+# (3) veil_musl 各構成 の順であることが要件（このブロックを先頭に保つ）。
 echo "### nginx"
 docker rm -f nginx-perf >/dev/null 2>&1
 docker run -d --rm --network $NET \
@@ -304,6 +313,8 @@ fi
 docker rm -f nginx-perf >/dev/null 2>&1
 
 # ---- veil glibc / musl x configs ----
+# glibc → musl の順でループする（TSV 行順要件: nginx → veil_glibc → veil_musl）。
+# 将来の並列化・リオーダはこの順序を崩すため行わないこと。
 for build in glibc musl; do
     img="veil:$build"
     for cfgfile in "$HERE"/configs/$CONFIG_GLOB.toml; do
@@ -314,7 +325,7 @@ for build in glibc musl; do
         case "$name" in h2_1_*|h3_*) h2=1 ;; *) h2=0 ;; esac
         echo "### veil:$build / $name"
         start_veil "$img" "$cfgfile" veil-container
-        if wait_ready veil-container; then
+        if wait_ready veil-container "$name"; then
             run_load "veil_$build" "$name" veil-container "$h2"
         else
             emit "veil_$build" "$name" "http1.1" 1 NA NA NA NA NA NA NA

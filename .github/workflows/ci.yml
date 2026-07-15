@@ -83,6 +83,10 @@ jobs:
 
   e2e:
     name: e2e (features full)
+    # E2E はローカルで ./tests/e2e_setup.sh test を運用しているため、この workflow では
+    # 実行しない（コンテナ/ネットワーク前提の重いセットアップで CI ランナーに不向き）。
+    # 再有効化する場合はこの if 行を削除する。
+    if: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
