@@ -1639,7 +1639,15 @@ async fn h2_dispatch(
                 h2_emit_full(resp_tx, notify, 200, header_store, response_body).await
             }
         }
-        Backend::SendFile(base_path, is_dir, index_file, security, _cache, _ofc, _) => {
+        Backend::SendFile(
+            base_path,
+            is_dir,
+            index_file,
+            security,
+            _cache,
+            open_file_cache_config,
+            _,
+        ) => {
             h2_sendfile(
                 ctx,
                 &base_path,
@@ -1649,6 +1657,7 @@ async fn h2_dispatch(
                 &security,
                 &route_compression,
                 client_encoding,
+                open_file_cache_config.as_deref(),
                 #[cfg(feature = "wasm")]
                 &wasm_modules_to_apply,
                 resp_tx,
@@ -2606,6 +2615,7 @@ async fn h2_sendfile(
     security: &SecurityConfig,
     compression: &CompressionConfig,
     client_encoding: AcceptedEncoding,
+    open_file_cache_config: Option<&cache::OpenFileCacheConfig>,
     #[cfg(feature = "wasm")] wasm_modules: &Arc<Vec<String>>,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
@@ -2617,44 +2627,82 @@ async fn h2_sendfile(
         path_str_raw
     };
     let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
-    let sub_path = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
+    let remainder: &str = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
         &path_str[prefix_str.len()..]
     } else {
         path_str
     };
-    let clean_sub = sub_path.trim_start_matches('/');
 
-    if clean_sub.contains("..") {
+    if remainder.contains("..") {
         return h2_emit_error(resp_tx, notify, 403, b"Forbidden").await;
     }
 
-    let file_path = if is_dir {
+    let full_path = if is_dir {
+        let sub_path = remainder.trim_start_matches('/');
         let mut p = base_path.to_path_buf();
-        if clean_sub.is_empty() || clean_sub == "/" {
-            p.push(index_file.unwrap_or("index.html"));
-        } else {
-            p.push(clean_sub);
-            if p.is_dir() {
-                p.push(index_file.unwrap_or("index.html"));
-            }
+        if !sub_path.is_empty() {
+            p.push(sub_path);
         }
         p
     } else {
-        if !clean_sub.is_empty() {
+        let clean_remainder = remainder.trim_matches('/');
+        if !clean_remainder.is_empty() {
             return h2_emit_error(resp_tx, notify, 404, b"Not Found").await;
         }
         base_path.to_path_buf()
     };
 
-    let data = match crate::runtime::io::read(&file_path).await {
-        Ok(d) => d,
-        Err(_) => return h2_emit_error(resp_tx, notify, 404, b"Not Found").await,
+    // OpenFileCache経由でファイル情報を取得（canonicalize/metadata/mime_guessをキャッシュ、
+    // HTTP/1.1 の handle_sendfile と同一経路。キャッシュミス時は offload でブロッキング解決）。
+    let file_info = match cache::get_file_info_with_config(&full_path, open_file_cache_config).await
+    {
+        Some(info) => info,
+        None => return h2_emit_error(resp_tx, notify, 404, b"Not Found").await,
     };
 
-    let mime_type = mime_guess::from_path(&file_path).first_or_octet_stream();
+    // ディレクトリルートの場合は base_path からの canonical パス封じ込め検査。
+    if is_dir {
+        if let Some(base_info) =
+            cache::get_file_info_with_config(base_path, open_file_cache_config).await
+        {
+            if !file_info
+                .canonical_path
+                .starts_with(&base_info.canonical_path)
+            {
+                return h2_emit_error(resp_tx, notify, 403, b"Forbidden").await;
+            }
+        }
+    }
+
+    // ディレクトリの場合はインデックスファイルを解決する。
+    let (final_path, mime_type) = if !file_info.is_file {
+        let filename = index_file.unwrap_or("index.html");
+        let index_path = file_info.canonical_path.join(filename);
+        match cache::get_file_info_with_config(&index_path, open_file_cache_config).await {
+            Some(idx_info) if idx_info.is_file => {
+                (idx_info.canonical_path.clone(), idx_info.mime_type.clone())
+            }
+            _ => return h2_emit_error(resp_tx, notify, 403, b"Forbidden").await,
+        }
+    } else {
+        (
+            file_info.canonical_path.clone(),
+            file_info.mime_type.clone(),
+        )
+    };
+
+    let data = match crate::runtime::io::read(&final_path).await {
+        Ok(d) => d,
+        Err(_) => {
+            // ファイルが開けない場合はキャッシュを無効化（HTTP/1.1 と同様）。
+            cache::invalidate_file_cache(&full_path);
+            return h2_emit_error(resp_tx, notify, 404, b"Not Found").await;
+        }
+    };
+
     let (built_headers, response_body) = build_h2_compressed_file_response(
         &data,
-        mime_type.as_ref(),
+        &mime_type,
         security,
         compression,
         client_encoding,

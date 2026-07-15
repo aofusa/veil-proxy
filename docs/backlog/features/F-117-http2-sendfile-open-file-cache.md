@@ -1,7 +1,7 @@
 # F-117: HTTP/2 File 配信の open_file_cache 対応（HTTP/1.1 との経路統一）
 
 - 優先度: P2
-- 状態: 進行中
+- 状態: 完了
 - 起点: F-116 レビュー時に発見した HTTP/1.1 / HTTP/2 の File 配信経路差
 
 ## 機能説明（事象）
@@ -54,4 +54,17 @@ HTTP/2 の File 配信（`src/proxy.rs` の `h2_sendfile`）が HTTP/1.1（`hand
 
 ## 検証結果
 
-（完了時に記載）
+- 実装: `h2_sendfile`（`src/proxy.rs`）のパス解決を `handle_sendfile` と同じ
+  `cache::get_file_info_with_config` 経由に統一。イベントループ上の同期
+  `Path::is_dir()` と毎リクエスト `mime_guess` 呼び出しを排除。ディレクトリルートの
+  canonical 封じ込め検査・index ファイル解決の欠如を解消（HTTP/1.1 と同一挙動）。
+  `h2_dispatch` の `Backend::SendFile` アームで無視していた `open_file_cache_config` を
+  `h2_sendfile` へ配線。
+- `cargo fmt` / `cargo fmt --check`: 問題なし。
+- `cargo build --features full`: 警告 0（2m46s）。
+- `cargo build`（default）/ `cargo build --no-default-features` / `cargo build --features http2` /
+  `cargo build --features "http2,grpc-full"`: いずれも警告 0。
+- `cargo clippy --features full -- -D warnings`: エラー・警告 0。
+- `cargo test --lib --features full`: 752 passed / 0 failed（`src/http2/connection.rs` の
+  `FRAME_PING` dead_code 警告は本チケット変更前の main 由来で無関係）。
+- `./tests/e2e_setup.sh test`: 530 passed / 0 failed（回帰なし）。
