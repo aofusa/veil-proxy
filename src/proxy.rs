@@ -1895,6 +1895,172 @@ async fn connect_backend_with_retry(addr: &str) -> io::Result<TcpStream> {
     }
 }
 
+/// ホストごとの新規 connect 並行数の上限（スレッドごと、B-44 第3段）。
+#[cfg(feature = "http2")]
+const MAX_CONCURRENT_CONNECTS_PER_HOST: usize = 64;
+
+/// ホストごとの新規 connect 並行数ゲート（B-44 第3段）。
+///
+/// 第2段のリトライ（10/40/160ms、最大 4 試行）で 5xx は約 1/3 に減ったが根絶できなかった。
+/// h2load の反復切り替え時に in-flight だった ~900 接続がタスクキャンセルで破棄され、
+/// 次反復の冒頭で数百規模の connect ストームが再発する。失敗 → 502 → クライアントが即座に
+/// 次リクエストを発行、の自己持続でストームが数秒継続し、バックオフ合計 210ms では
+/// 吸収できない。そこで **バックエンドへの新規 connect の同時実行数をホストごとに制限**する
+/// 構造的修正を行う（Envoy の upstream circuit breaker `max_connections`/pending queue 相当）。
+/// 新規 connect は 64/スレッドの波で進み、完了したリクエストの接続が返却され次第、
+/// 待機ストリームは再利用側で満たされるため、EADDRNOTAVAIL の発生源
+/// （数百規模の一斉 connect）自体が消える。
+///
+/// ゲートは **プールミス時のみ** 作動するコールドパスであり、プールヒット
+/// （ホットパス）はゲートに一切触れない（ホットパス絶対規則に反しない）。
+/// thread-per-core 構成のためスレッドローカルでロック不要。
+#[cfg(feature = "http2")]
+struct ConnectGate {
+    /// このスレッド上で進行中の新規 connect 数。
+    in_flight: std::cell::Cell<usize>,
+    /// スロット解放・プール返却を待つ待機者（待機者ごとの `Notify` を積む）。
+    ///
+    /// 設計原案はゲート共有の単一 `Notify` だったが、`Notify` は waker を 1 つしか
+    /// 保持しないため、複数待機者では後着の poll が先着の waker を上書きし、
+    /// 起こされない待機者が永久に停止する（lost wakeup）。待機者ごとに `Notify` を
+    /// 積み、解放時に全員へブロードキャストする方式とする（キャンセル済み待機者の
+    /// エントリが残っていても他の待機者を巻き込まない）。
+    waiters: std::cell::RefCell<std::collections::VecDeque<crate::stream_channel::Notify>>,
+}
+
+#[cfg(feature = "http2")]
+impl ConnectGate {
+    fn new() -> Self {
+        Self {
+            in_flight: std::cell::Cell::new(0),
+            waiters: std::cell::RefCell::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    /// 待機者全員を起こす（ブロードキャスト）。待機者はループ先頭でプール再取得を
+    /// 試みるため、新規 connect ではなく返却された接続の再利用が優先される。
+    fn notify_waiters(&self) {
+        // wake() によるタスク再スケジュールが RefCell の再入借用と衝突しないよう、
+        // キューを取り出してから借用を解放して通知する。
+        let drained = std::mem::take(&mut *self.waiters.borrow_mut());
+        for waiter in drained {
+            waiter.notify();
+        }
+    }
+}
+
+/// [`ConnectGate`] の in_flight スロットを保持する RAII ガード（B-44 第3段）。
+///
+/// connect の成功・失敗・タイムアウト・タスクキャンセル（Future drop）のいずれの経路でも
+/// Drop で必ずスロットを解放し、待機者を起こす（解放漏れなし）。
+#[cfg(feature = "http2")]
+struct ConnectPermit {
+    gate: std::rc::Rc<ConnectGate>,
+}
+
+#[cfg(feature = "http2")]
+impl ConnectPermit {
+    /// 空きスロットがあれば確保して permit を返す。満杯なら `None`。
+    fn try_acquire(gate: &std::rc::Rc<ConnectGate>) -> Option<Self> {
+        if gate.in_flight.get() < MAX_CONCURRENT_CONNECTS_PER_HOST {
+            gate.in_flight.set(gate.in_flight.get() + 1);
+            Some(Self { gate: gate.clone() })
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(feature = "http2")]
+impl Drop for ConnectPermit {
+    fn drop(&mut self) {
+        self.gate.in_flight.set(self.gate.in_flight.get() - 1);
+        self.gate.notify_waiters();
+    }
+}
+
+#[cfg(feature = "http2")]
+thread_local! {
+    /// 接続先ホスト（addr）→ 新規 connect ゲート（B-44 第3段）。
+    /// エントリは初回のプールミス時に生成される（コールドパス）。
+    static CONNECT_GATES: std::cell::RefCell<
+        std::collections::HashMap<String, std::rc::Rc<ConnectGate>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// ホストのゲートを取得する（なければ生成、コールドパス）。
+/// `Rc` クローンはゲート取得時のみで、プールヒット経路はここに到達しない。
+#[cfg(feature = "http2")]
+fn connect_gate(host: &str) -> std::rc::Rc<ConnectGate> {
+    CONNECT_GATES.with(|g| {
+        let mut map = g.borrow_mut();
+        if let Some(gate) = map.get(host) {
+            gate.clone()
+        } else {
+            let gate = std::rc::Rc::new(ConnectGate::new());
+            map.insert(host.to_string(), gate.clone());
+            gate
+        }
+    })
+}
+
+/// プール返却直後にゲート待機者を起こし、再利用の機会を与える（B-44 第3段）。
+///
+/// ゲート未生成（そのホストで新規 connect の競合が起きていない）または待機者ゼロなら
+/// ハッシュ参照のみの no-op。`CONNECT_GATES` の借用は `Rc` クローンの同期区間で解放し、
+/// 起こされたタスク側の再入借用と衝突しない。
+#[cfg(feature = "http2")]
+fn notify_connect_gate_waiters(host: &str) {
+    let gate = CONNECT_GATES.with(|g| g.borrow().get(host).cloned());
+    if let Some(gate) = gate {
+        gate.notify_waiters();
+    }
+}
+
+/// ゲート付きバックエンド接続取得の結果（B-44 第3段）。
+#[cfg(feature = "http2")]
+enum GateAcquire<P> {
+    /// ゲート通過待ちの間にプールへ返却された接続を再利用した。
+    Pooled(P),
+    /// ゲートを通過して新規に確立した接続。
+    Fresh(TcpStream),
+}
+
+/// プールミス時のバックエンド接続取得（新規 connect 並行数ゲート付き、B-44 第3段）。
+///
+/// ループ先頭で毎回プール（`pool_get`）を再試行し、ゲート通過待ちの間に返却された
+/// 接続があれば新規 connect よりも優先して再利用する（これがストームを構造的に消す本質）。
+/// プールミスかつ in_flight < [`MAX_CONCURRENT_CONNECTS_PER_HOST`] ならスロットを確保して
+/// [`connect_backend_with_retry`]（第2段のリトライは安全網として維持）へ進み、満杯なら
+/// スロット解放またはプール返却の通知を待って再ループする。
+///
+/// `RefCell` の借用はいずれも同期区間のみで、`.await` を跨いで保持しない。
+/// 待機者の `Notify` 確保（`Rc` 1 個）は初回待機時のみで、以降の再待機では再利用する。
+#[cfg(feature = "http2")]
+async fn acquire_backend_conn<P>(
+    addr: &str,
+    mut pool_get: impl FnMut() -> Option<P>,
+) -> io::Result<GateAcquire<P>> {
+    let gate = connect_gate(addr);
+    let mut waiter: Option<crate::stream_channel::Notify> = None;
+    loop {
+        // ゲート通過待ちの間に返却された接続の再利用を最優先する
+        if let Some(stream) = pool_get() {
+            return Ok(GateAcquire::Pooled(stream));
+        }
+        if let Some(_permit) = ConnectPermit::try_acquire(&gate) {
+            // 成功・失敗・キャンセルのすべての経路で permit の Drop がスロットを解放する
+            return connect_backend_with_retry(addr)
+                .await
+                .map(GateAcquire::Fresh);
+        }
+        // 満杯: スロット解放かプール返却を待つ
+        let w = waiter.get_or_insert_with(crate::stream_channel::Notify::new);
+        gate.waiters.borrow_mut().push_back(w.clone());
+        w.wait().await;
+    }
+}
+
 /// H1 バックエンド（平文）へのプロキシ（プール再利用付き、B-28）。
 #[cfg(feature = "http2")]
 #[allow(clippy::too_many_arguments)]
@@ -1910,18 +2076,22 @@ async fn h2_proxy_http(
 ) -> (u16, u64) {
     let mut backend = match HTTP_POOL.with(|p| p.borrow_mut().get(addr)) {
         Some(stream) => stream,
-        None => match connect_backend_with_retry(addr).await {
-            Ok(stream) => stream,
-            Err(e) if e.kind() == io::ErrorKind::TimedOut => {
-                let (s, sz) = h2_emit_error(resp_tx, notify, 504, b"Gateway Timeout").await;
-                return (s, sz);
+        None => {
+            // プールミス: 新規 connect 並行数ゲート経由で取得（B-44 第3段）
+            match acquire_backend_conn(addr, || HTTP_POOL.with(|p| p.borrow_mut().get(addr))).await
+            {
+                Ok(GateAcquire::Pooled(stream) | GateAcquire::Fresh(stream)) => stream,
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                    let (s, sz) = h2_emit_error(resp_tx, notify, 504, b"Gateway Timeout").await;
+                    return (s, sz);
+                }
+                Err(e) => {
+                    warn!("[HTTP/2] Backend connect error: {}", e);
+                    let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
+                    return (s, sz);
+                }
             }
-            Err(e) => {
-                warn!("[HTTP/2] Backend connect error: {}", e);
-                let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
-                return (s, sz);
-            }
-        },
+        }
     };
 
     let (write_res, returned_request) = backend.write_all(request).await;
@@ -1942,6 +2112,8 @@ async fn h2_proxy_http(
                 security.idle_connection_timeout_secs,
             )
         });
+        // 返却した接続をゲート待機者に再利用させる（B-44 第3段）
+        notify_connect_gate_waiters(addr);
     }
     (status, sent)
 }
@@ -1971,8 +2143,13 @@ async fn h2_proxy_https(
     let mut backend = match HTTPS_POOL.with(|p| p.borrow_mut().get(&pool_key)) {
         Some(stream) => stream,
         None => {
-            let backend_tcp = match connect_backend_with_retry(addr).await {
-                Ok(stream) => stream,
+            // プールミス: 新規 connect 並行数ゲート経由で取得（B-44 第3段）
+            let acquired = match acquire_backend_conn(addr, || {
+                HTTPS_POOL.with(|p| p.borrow_mut().get(&pool_key))
+            })
+            .await
+            {
+                Ok(acquired) => acquired,
                 Err(e) if e.kind() == io::ErrorKind::TimedOut => {
                     return h2_emit_error(resp_tx, notify, 504, b"Gateway Timeout").await;
                 }
@@ -1981,21 +2158,26 @@ async fn h2_proxy_https(
                     return h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
                 }
             };
-            let tls_result = if tls_insecure {
-                let connector = get_tls_connector_insecure();
-                timeout(CONNECT_TIMEOUT, connector.connect(backend_tcp, sni)).await
-            } else {
-                let connector = get_tls_connector();
-                timeout(CONNECT_TIMEOUT, connector.connect(backend_tcp, sni)).await
-            };
-            match tls_result {
-                Ok(Ok(stream)) => stream,
-                Ok(Err(e)) => {
-                    warn!("[HTTP/2] TLS handshake error: {}", e);
-                    return h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
-                }
-                Err(_) => {
-                    return h2_emit_error(resp_tx, notify, 504, b"Gateway Timeout").await;
+            match acquired {
+                GateAcquire::Pooled(stream) => stream,
+                GateAcquire::Fresh(backend_tcp) => {
+                    let tls_result = if tls_insecure {
+                        let connector = get_tls_connector_insecure();
+                        timeout(CONNECT_TIMEOUT, connector.connect(backend_tcp, sni)).await
+                    } else {
+                        let connector = get_tls_connector();
+                        timeout(CONNECT_TIMEOUT, connector.connect(backend_tcp, sni)).await
+                    };
+                    match tls_result {
+                        Ok(Ok(stream)) => stream,
+                        Ok(Err(e)) => {
+                            warn!("[HTTP/2] TLS handshake error: {}", e);
+                            return h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
+                        }
+                        Err(_) => {
+                            return h2_emit_error(resp_tx, notify, 504, b"Gateway Timeout").await;
+                        }
+                    }
                 }
             }
         }
@@ -2019,6 +2201,8 @@ async fn h2_proxy_https(
                 security.idle_connection_timeout_secs,
             )
         });
+        // 返却した接続をゲート待機者に再利用させる（ゲートは addr 単位、B-44 第3段）
+        notify_connect_gate_waiters(addr);
     }
     (status, sent)
 }
@@ -10588,5 +10772,83 @@ mod path_tests {
         assert!(!request_bytes_indicate_grpc(plain));
         let mixed = b"POST /x HTTP/1.1\r\ncontent-type: Application/GRPC+proto\r\n\r\n";
         assert!(request_bytes_indicate_grpc(mixed));
+    }
+}
+
+#[cfg(all(test, feature = "http2"))]
+mod connect_gate_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// ConnectPermit の Drop が in_flight を確実に減算し、待機者へ通知すること（B-44 第3段）。
+    #[test]
+    fn test_connect_permit_drop_releases_and_notifies() {
+        let gate = Rc::new(ConnectGate::new());
+        let waiter = crate::stream_channel::Notify::new();
+        gate.waiters.borrow_mut().push_back(waiter.clone());
+
+        let permit = ConnectPermit::try_acquire(&gate).expect("must acquire on empty gate");
+        assert_eq!(gate.in_flight.get(), 1);
+
+        drop(permit);
+        assert_eq!(gate.in_flight.get(), 0, "Drop must decrement in_flight");
+        assert!(
+            gate.waiters.borrow().is_empty(),
+            "Drop must drain and notify waiters"
+        );
+        // 通知フラグが立っている = wait() が即 Ready になる
+        crate::runtime::block_on(async move {
+            waiter.wait().await;
+        });
+    }
+
+    /// 同時 65 個目の取得は wait に入り、スロット解放（permit Drop）後に進むこと（B-44 第3段）。
+    #[test]
+    fn test_gate_blocks_at_capacity_and_resumes_after_release() {
+        crate::runtime::block_on(async {
+            let gate = Rc::new(ConnectGate::new());
+            // 64 スロットをすべて占有する
+            let mut permits: Vec<ConnectPermit> = (0..MAX_CONCURRENT_CONNECTS_PER_HOST)
+                .map(|_| ConnectPermit::try_acquire(&gate).expect("slot must be available"))
+                .collect();
+            assert_eq!(gate.in_flight.get(), MAX_CONCURRENT_CONNECTS_PER_HOST);
+            assert!(
+                ConnectPermit::try_acquire(&gate).is_none(),
+                "65th acquisition must be rejected while the gate is full"
+            );
+
+            // 65 個目の取得タスク: acquire_backend_conn と同じ待機ループを実行する
+            let progressed = Rc::new(Cell::new(false));
+            let gate_task = gate.clone();
+            let progressed_task = progressed.clone();
+            crate::runtime::executor::spawn(async move {
+                let mut waiter: Option<crate::stream_channel::Notify> = None;
+                loop {
+                    if let Some(_permit) = ConnectPermit::try_acquire(&gate_task) {
+                        progressed_task.set(true);
+                        return;
+                    }
+                    let w = waiter.get_or_insert_with(crate::stream_channel::Notify::new);
+                    gate_task.waiters.borrow_mut().push_back(w.clone());
+                    w.wait().await;
+                }
+            });
+
+            // スポーンしたタスクに実行機会を与える（単一スレッドなので決定的）
+            crate::runtime::timer::sleep(Duration::from_millis(10)).await;
+            assert!(
+                !progressed.get(),
+                "the 65th acquirer must wait while the gate is full"
+            );
+
+            // 1 スロット解放 → permit の Drop が待機者を起こす
+            permits.pop();
+            crate::runtime::timer::sleep(Duration::from_millis(10)).await;
+            assert!(
+                progressed.get(),
+                "the 65th acquirer must resume after a slot is released"
+            );
+        });
     }
 }
