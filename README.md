@@ -1296,7 +1296,7 @@ Add a `security` subsection to each route for fine-grained security settings.
 | | `rate_limit_requests_per_min` | Request limit per minute | 0 (unlimited) |
 | | `allowed_ips` | Allowed IP/CIDR (array) | all allowed |
 | | `denied_ips` | Denied IP/CIDR (array, takes priority) | none |
-| Connection Pool | `max_idle_connections_per_host` | Max idle connections per host | 8 |
+| Connection Pool | `max_idle_connections_per_host` | Max idle connections per host | 256 |
 | | `idle_connection_timeout_secs` | Idle connection timeout | 30s |
 | Header Manipulation | `add_request_headers` | Headers to add before forwarding to backend | none |
 | | `remove_request_headers` | Headers to remove before forwarding to backend | none |

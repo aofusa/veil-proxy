@@ -295,6 +295,15 @@ async fn forward_direction(
         unsafe { b.set_len(BUF_SIZE) };
         buf = b;
     }
+
+    // B-45: 転送ループを抜けるすべての経路（src EOF・read/write エラー・アイドル
+    // タイムアウト）で dst へ半クローズ（FIN）を伝搬する。これにより対向方向の
+    // 転送ループもアイドルタイムアウトを待たずに即座に EOF で終了し、セッションの
+    // fd（ソケット 2 本）が速やかに解放される（TCP 半クローズ意味論は保持: dst の
+    // 送信方向を止めるだけで、dst からの受信＝逆方向の src には影響しない）。
+    // shutdown(2) はノンブロッキングな syscall で io_uring の新規オペコードを要さず、
+    // 戻り値は無視してよい（対向がすでにクローズ済みの ENOTCONN 等は無害）。
+    let _ = unsafe { libc::shutdown(dst.as_raw_fd(), libc::SHUT_WR) };
     total
 }
 
@@ -398,6 +407,16 @@ async fn forward_direction_splice(
             total += n;
         }
     }
+
+    // B-45: 転送ループを抜けるすべての経路（src EOF・splice エラー・アイドル
+    // タイムアウト）で dst へ半クローズ（FIN）を伝搬する。これにより対向方向の
+    // 転送ループもアイドルタイムアウトを待たずに即座に EOF で終了し、セッションの
+    // fd（ソケット 2 本 + splice パイプ 2 本）が速やかに解放される（TCP 半クローズ
+    // 意味論は保持: dst の送信方向を止めるだけで、dst からの受信＝逆方向の src には
+    // 影響しない）。shutdown(2) はノンブロッキングな syscall で io_uring の新規
+    // オペコードを要さず、戻り値は無視してよい（対向がすでにクローズ済みの
+    // ENOTCONN 等は無害）。
+    let _ = unsafe { libc::shutdown(dst_fd, libc::SHUT_WR) };
     total
 }
 
@@ -1325,5 +1344,89 @@ mod tests {
         }
         let pooled = L4_PIPE_POOL.with(|p| p.borrow().len());
         assert_eq!(pooled, L4_PIPE_POOL_MAX);
+    }
+
+    // ====================
+    // B-45: 半クローズ伝搬の回帰テスト
+    // ====================
+    //
+    // io_uring を許可しない環境（Docker ビルドサンドボックス・古いカーネル等）では
+    // リング生成が失敗するため、実 I/O を伴う本テストはスキップする（E2E で網羅）。
+    fn io_uring_available() -> bool {
+        crate::runtime::ring::IoUring::new(8, 0).is_ok()
+    }
+
+    /// `forward_direction_splice` が src の EOF でループを抜けた際、dst へ
+    /// `shutdown(SHUT_WR)` を発行して半クローズ（FIN）を対向へ伝搬すること。
+    ///
+    /// 修正前は src の EOF で自方向のみ終了し dst には何も伝搬しなかったため、
+    /// 対向側（dst の実体を保持するピア）はデータも FIN も受け取れず、
+    /// アイドルタイムアウトまで fd を保持し続けていた（B-45）。
+    #[test]
+    fn test_forward_direction_splice_propagates_half_close_on_src_eof() {
+        if !io_uring_available() {
+            eprintln!(
+                "io_uring unavailable; skipping test_forward_direction_splice_propagates_half_close_on_src_eof"
+            );
+            return;
+        }
+
+        // src 側: accept 直後に書き込み方向を閉じ、こちら側の TcpStream に EOF を送る。
+        let src_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind src");
+        let src_addr = src_listener.local_addr().expect("src addr");
+        let src_peer_handle = std::thread::spawn(move || {
+            let (peer, _) = src_listener.accept().expect("accept src peer");
+            peer.shutdown(std::net::Shutdown::Write)
+                .expect("shutdown write");
+            // スレッド終了までピアを保持し、テスト側の shutdown(SHUT_WR) を観測できるようにする。
+            // 別 OS スレッド上のテストコードでイベントループはブロックしないため許容。
+            #[allow(clippy::disallowed_methods)]
+            std::thread::sleep(Duration::from_millis(500));
+        });
+
+        // dst 側: accept 後、read() が 0 (EOF) を返すまで待つ（FIN 到達の検知）。
+        let dst_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind dst");
+        let dst_addr = dst_listener.local_addr().expect("dst addr");
+        let (eof_tx, eof_rx) = std::sync::mpsc::channel::<()>();
+        let dst_peer_handle = std::thread::spawn(move || {
+            use std::io::Read;
+            let (mut peer, _) = dst_listener.accept().expect("accept dst peer");
+            let mut buf = [0u8; 16];
+            loop {
+                match peer.read(&mut buf) {
+                    Ok(0) => {
+                        let _ = eof_tx.send(());
+                        break;
+                    }
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+
+        crate::runtime::block_on(async move {
+            let src = IoUringTcpStream::connect(src_addr)
+                .await
+                .expect("connect src");
+            let dst = IoUringTcpStream::connect(dst_addr)
+                .await
+                .expect("connect dst");
+            let pipe = Pipe::new().expect("pipe");
+
+            // idle_timeout はあえて長め（30秒）にし、EOF 検知が
+            // タイムアウト待ちではなく即座の shutdown 伝搬によることを保証する。
+            let total =
+                forward_direction_splice(&src, &dst, &pipe, Duration::from_secs(30), "test-b45")
+                    .await;
+            assert_eq!(total, 0, "no data was transferred before src EOF");
+        });
+
+        // dst 側ピアが FIN を受け取ったことを短時間（idle_timeout の 30 秒よりずっと短い）で確認する。
+        eof_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("dst peer must observe EOF promptly (half-close propagation)");
+
+        src_peer_handle.join().expect("join src peer thread");
+        dst_peer_handle.join().expect("join dst peer thread");
     }
 }

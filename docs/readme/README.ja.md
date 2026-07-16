@@ -1292,7 +1292,7 @@ sandbox_tmpfs_mounts = ["/tmp"]
 | | `rate_limit_requests_per_min` | 分間リクエスト数上限 | 0（無制限） |
 | | `allowed_ips` | 許可するIP/CIDR（配列） | すべて許可 |
 | | `denied_ips` | 拒否するIP/CIDR（配列、優先） | なし |
-| コネクションプール | `max_idle_connections_per_host` | ホストごとの最大アイドル接続数 | 8 |
+| コネクションプール | `max_idle_connections_per_host` | ホストごとの最大アイドル接続数 | 256 |
 | | `idle_connection_timeout_secs` | アイドル接続の維持時間 | 30秒 |
 | ヘッダー操作 | `add_request_headers` | バックエンドに転送前に追加するヘッダー | なし |
 | | `remove_request_headers` | バックエンドに転送前に削除するヘッダー | なし |

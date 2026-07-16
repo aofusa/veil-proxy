@@ -253,7 +253,13 @@ pub(crate) const BACKEND_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const MAX_RESPONSE_HEADER_SIZE: usize = 64 * 1024;
 
 // バックエンドコネクションプール設定（デフォルト値）
-pub(crate) const BACKEND_POOL_MAX_IDLE_PER_HOST: usize = 8; // ホストあたりの最大アイドル接続数
+// B-44: F-116 のストリーム多重化により 1 スレッドあたり同時 ~250 ストリームが
+// 独立にバックエンド接続を get/put するようになったため、8 では完了波のたびに
+// 超過分がクローズされて TIME_WAIT が蓄積し、エフェメラルポート枯渇（EADDRNOTAVAIL）
+// を招いていた。スレッドあたり同時ストリーム数を吸収できる 256 に引き上げる
+// （アイドル接続は BACKEND_POOL_IDLE_TIMEOUT_SECS で回収されるため定常的な
+// fd 保持は一時的。Envoy の upstream 接続上限既定 1024 と同水準）。
+pub(crate) const BACKEND_POOL_MAX_IDLE_PER_HOST: usize = 256; // ホストあたりの最大アイドル接続数
 pub(crate) const BACKEND_POOL_IDLE_TIMEOUT_SECS: u64 = 30; // アイドル接続のタイムアウト（秒）
 
 // ====================
@@ -1183,6 +1189,60 @@ mod tests {
                 .collect();
             drop(guards);
             assert_eq!(pool_len(), SPLICE_PIPE_POOL_MAX);
+        }
+    }
+
+    // B-44: バックエンドコネクションプールが max_idle まで保持し、それ以上は
+    // 最古のものから破棄することの回帰テスト（BACKEND_POOL_MAX_IDLE_PER_HOST = 256）。
+    mod http_connection_pool {
+        use super::super::*;
+
+        /// テスト用のダミー TcpStream を作る（socketpair の片端を io_uring TcpStream として
+        /// ラップする）。put/get の保持数検証のみが目的でデータの送受信は行わない。
+        fn dummy_tcp_stream() -> TcpStream {
+            let mut fds = [0 as std::os::unix::io::RawFd; 2];
+            let ret =
+                unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+            assert_eq!(ret, 0, "socketpair failed");
+            // 片方はテスト側で即座にクローズし、もう片方を TcpStream にラップする。
+            unsafe { libc::close(fds[1]) };
+            unsafe { TcpStream::from_raw_fd(fds[0]) }
+        }
+
+        #[test]
+        fn test_put_respects_max_idle_256() {
+            let mut pool = HttpConnectionPool::new();
+            let key = "example.test:80";
+            for _ in 0..(BACKEND_POOL_MAX_IDLE_PER_HOST + 8) {
+                pool.put(
+                    key.to_string(),
+                    dummy_tcp_stream(),
+                    BACKEND_POOL_MAX_IDLE_PER_HOST,
+                    BACKEND_POOL_IDLE_TIMEOUT_SECS,
+                );
+            }
+            let len = pool.connections.get(key).map(|q| q.len()).unwrap_or(0);
+            assert_eq!(
+                len, BACKEND_POOL_MAX_IDLE_PER_HOST,
+                "pool should retain exactly max_idle (256) connections, discarding oldest"
+            );
+        }
+
+        #[test]
+        fn test_put_below_max_idle_retains_all() {
+            let mut pool = HttpConnectionPool::new();
+            let key = "example.test:80";
+            let n = 10;
+            for _ in 0..n {
+                pool.put(
+                    key.to_string(),
+                    dummy_tcp_stream(),
+                    BACKEND_POOL_MAX_IDLE_PER_HOST,
+                    BACKEND_POOL_IDLE_TIMEOUT_SECS,
+                );
+            }
+            let len = pool.connections.get(key).map(|q| q.len()).unwrap_or(0);
+            assert_eq!(len, n, "below max_idle, all connections should be retained");
         }
     }
 }

@@ -1420,7 +1420,7 @@ reuseport_balancing = "cbpf"
 #
 # バックエンド接続プール: ホストごとの最大アイドル接続数
 # （HTTP/1.1・HTTPS に加え、F-106 で H2C/HTTP-2 バックエンド〈gRPC 中継等〉のプールにも適用）
-# max_idle_connections_per_host = 8
+# max_idle_connections_per_host = 256
 #
 # バックエンド接続プール: アイドル接続の維持時間（秒）
 # （HTTP/1.1・HTTPS・H2C 共通。この時間を超えたアイドル接続は再利用せず破棄）
