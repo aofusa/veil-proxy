@@ -220,6 +220,8 @@
 | B-41 | P1 | 完了 | [bugs/B-41-http3-grpc-body-trailers-hang.md](bugs/B-41-http3-grpc-body-trailers-hang.md) | HTTP/3 gRPC ボディあり応答が trailers API 誤用でハング → `send_additional_headers` で修正（F-93） |
 | B-42 | P2 | 未着手 | [bugs/B-42-http3-proxy-load-instability.md](bugs/B-42-http3-proxy-load-instability.md) | HTTP/3 逆プロキシ経路（`h3_proxy`）が高並行 QUIC 負荷でエラー混入・レイテンシ劣化（glibc 17/2/425 件、musl は概ね安定）。HTTP/3 File 経路は 0 エラーで安定のため Proxy ホップ特有。F-112 計測で検出、要再現・切り分け。F-115 第2段（sendmmsg バッチング）+ B-43 修正後の再計測ではエラー大幅減（glibc 0 件）を確認、継続観察 |
 | B-43 | P1 | 完了 | [bugs/B-43-http3-static-streamblocked-frameunexpected.md](bugs/B-43-http3-static-streamblocked-frameunexpected.md) | HTTP/3 静的応答の HEADERS が StreamBlocked になるとヘッダ未送出のままボディだけ保留 → 再送が send_body 先行で FrameUnexpected → ストリーム永久スタック（クライアントは idle timeout 30s 待ち）。並行ストリーム（h2load -m10）で 10 本中 9 本失敗し **HTTP/3 低スループット（HTTP/2 比 1/6）の主因**だった。PartialResponse へ head 保持 + try_flush_partial でヘッダ→ボディ順序を一元化して修正。h2load -m10 で failed 0・スループット +73%（443→777 req/s） |
+| B-44 | P1 | 進行中 | [bugs/B-44-h2-proxy-backend-conn-churn-port-exhaustion.md](bugs/B-44-h2-proxy-backend-conn-churn-port-exhaustion.md) | HTTP/2 プロキシが F-116 多重化後にバックエンド接続チャーン（プールのアイドル上限 8 << 同時ストリーム ~250/スレッド）でエフェメラルポート枯渇（EADDRNOTAVAIL → 502 混入・~590 req/s へ −73% 退行）。`BACKEND_POOL_MAX_IDLE_PER_HOST` 8 → 256 で修正。F-118 perf 計測で検出 |
+| B-45 | P1 | 進行中 | [bugs/B-45-l4-half-close-fd-exhaustion.md](bugs/B-45-l4-half-close-fd-exhaustion.md) | L4 プロキシが片方向 EOF 時に `shutdown(SHUT_WR)` を対向へ伝搬せず、クローズ済み接続が 4 fd（ソケット2 + パイプ2）をアイドルタイムアウトまで滞留 → 接続チャーンで EMFILE → accept/connect 全滅（wrk 3 回目で 0 req/s）。転送ループ離脱時の半クローズ伝搬で修正。F-118 perf 計測で検出 |
 
 ---
 
