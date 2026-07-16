@@ -10781,9 +10781,23 @@ mod connect_gate_tests {
     use std::cell::Cell;
     use std::rc::Rc;
 
+    // io_uring を許可しない環境（Docker ビルドサンドボックス・古いカーネル等）では
+    // リング生成が失敗し `block_on` が panic するため、ランタイムを要するテストは
+    // スキップする（`src/l4/proxy.rs` の tests と同じパターン）。
+    fn io_uring_available() -> bool {
+        crate::runtime::ring::IoUring::new(8, 0).is_ok()
+    }
+
     /// ConnectPermit の Drop が in_flight を確実に減算し、待機者へ通知すること（B-44 第3段）。
     #[test]
     fn test_connect_permit_drop_releases_and_notifies() {
+        if !io_uring_available() {
+            eprintln!(
+                "io_uring unavailable; skipping test_connect_permit_drop_releases_and_notifies"
+            );
+            return;
+        }
+
         let gate = Rc::new(ConnectGate::new());
         let waiter = crate::stream_channel::Notify::new();
         gate.waiters.borrow_mut().push_back(waiter.clone());
@@ -10806,6 +10820,13 @@ mod connect_gate_tests {
     /// 同時 65 個目の取得は wait に入り、スロット解放（permit Drop）後に進むこと（B-44 第3段）。
     #[test]
     fn test_gate_blocks_at_capacity_and_resumes_after_release() {
+        if !io_uring_available() {
+            eprintln!(
+                "io_uring unavailable; skipping test_gate_blocks_at_capacity_and_resumes_after_release"
+            );
+            return;
+        }
+
         crate::runtime::block_on(async {
             let gate = Rc::new(ConnectGate::new());
             // 64 スロットをすべて占有する
