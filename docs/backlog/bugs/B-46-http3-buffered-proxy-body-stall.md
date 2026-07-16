@@ -38,6 +38,28 @@ h2load --alpn-list=h3 -n 10 -c 1 -m10 https://<veil>:443/
 # → 2xx ヘッダのみでボディ 0B、failed/errored
 ```
 
+## 根本原因（確定: 2026-07-16）
+
+最小再現（h2load QUIC `-n3 -c1 -m1`）+ debug ログで確定:
+
+```
+[HTTP/3] Response body sent: 13356 bytes for stream 0     ← 部分送信は始まる
+[HTTP/3] deferred send_body error on stream 0: TransportError(StreamStopped(270))
+```
+
+- `StreamStopped(270)` = クライアントが **H3_MESSAGE_ERROR (0x10E)** で STOP_SENDING。
+- バッファ経路の `send_response` は **body が Some なら無条件に `content-length` を
+  追加**するが、プロキシ応答では `merge_response_headers_and_trailers` が
+  バックエンド（nginx）の `content-length` を残すため（圧縮時のみ除去）、
+  **content-length が重複**する。nghttp3 は重複 content-length を malformed
+  message として拒否し（RFC 9110/9114 の厳格実装）、ヘッダ受信直後に
+  ストリームを H3_MESSAGE_ERROR で停止する → 2xx ヘッダのみ・DATA 0B・全エラー。
+- fd 上限（B-44）とは無関係（B-44 修正後イメージでも再現）。
+- File 配信・エラー応答・メトリクス応答はヘッダを自前構築（content-length なし）
+  のため重複せず影響なし。streaming 経路（バッファリングなしの Proxy）も別実装で影響なし。
+  wasm 構成（`h3_proxy_wasm`）は実測値がストリーミング経路と同一（~655 req/s）で
+  バッファ経路を通っていない。
+
 ## 改修案
 
 1. B-43 の再現手法（`-n10 -c1 -m10`）でバッファ経路の送出をトレースし、

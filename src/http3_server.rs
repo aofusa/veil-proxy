@@ -1439,17 +1439,31 @@ impl Http3Handler {
         let status_str = status_buf.format(status);
         let mut h3_headers = vec![h3::Header::new(b":status", status_str.as_bytes())];
 
+        // B-46: headers に既に content-length が含まれるか、既存のヘッダー走査
+        // ループに検査を織り込んで判定する（追加の走査を増やさない）。
+        let mut has_content_length = false;
         for (name, value) in headers {
             if *name != b":status" {
+                if name.eq_ignore_ascii_case(b"content-length") {
+                    has_content_length = true;
+                }
                 h3_headers.push(h3::Header::new(name, value));
             }
         }
 
-        // Content-Length を追加（itoa::Buffer使用）
-        if let Some(body_data) = body {
-            let mut len_buf = itoa::Buffer::new();
-            let len_str = len_buf.format(body_data.len());
-            h3_headers.push(h3::Header::new(b"content-length", len_str.as_bytes()));
+        // Content-Length を追加（itoa::Buffer使用）。
+        // B-46: プロキシ応答では merge_response_headers_and_trailers が
+        // バックエンド（例: nginx）由来の content-length を残すため、ここで
+        // 無条件に追加すると content-length が重複する。nghttp3 は重複
+        // content-length を malformed message として H3_MESSAGE_ERROR で
+        // 拒否し、ヘッダ受信直後にストリームを停止する（ボディ 0 バイト・
+        // 全リクエスト失敗）。headers に既に含まれる場合は追加しない。
+        if !has_content_length {
+            if let Some(body_data) = body {
+                let mut len_buf = itoa::Buffer::new();
+                let len_str = len_buf.format(body_data.len());
+                h3_headers.push(h3::Header::new(b"content-length", len_str.as_bytes()));
+            }
         }
 
         // ヘッダー送信

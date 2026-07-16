@@ -20120,6 +20120,58 @@ async fn test_http3_buffering_spillover() {
     );
 }
 
+/// B-46 回帰: HTTP/3 + `[route.buffering] mode = "full"` の Proxy 応答で
+/// レスポンスボディが上流（backend-pool）の内容と完全一致すること。
+///
+/// バッファ経路の `send_response`（src/http3_server.rs）は body が Some
+/// なら無条件で content-length を付与していたため、プロキシ応答で
+/// バックエンド由来の content-length と重複し、nghttp3 が
+/// H3_MESSAGE_ERROR でストリームを拒否してボディ 0 バイトになっていた
+/// （2xx ヘッダのみ届き DATA が届かない）。`/full/*` ルートは
+/// `[route.buffering] mode = "full"` の Proxy で、バックエンドは
+/// `tests/fixtures/backend1(2)/large.txt`（10000 バイトの 'A' 埋め）を
+/// 返す File 配信サーバー。ヘッダのみでなくボディ内容まで検証する。
+#[tokio::test]
+#[ntest::timeout(30000)]
+#[cfg(feature = "http3")]
+async fn test_http3_buffering_full_proxy_body_intact() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    use common::http3_client::send_http3_request_full;
+
+    let server_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
+    let (_client, mut send_request) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("HTTP/3 client");
+
+    let resp = send_http3_request_full(&mut send_request, "GET", "/full/large.txt", &[], None)
+        .await
+        .expect("http3 buffering full proxy request");
+
+    eprintln!(
+        "HTTP/3 buffering full proxy status={} body_len={}",
+        resp.status,
+        resp.body.len()
+    );
+    assert_eq!(resp.status, 200, "buffering full proxy should return 200");
+
+    // 上流（backend1/backend2）の large.txt と同一内容: 10000 バイトの 'A'。
+    let expected = vec![b'A'; 10000];
+    assert_eq!(
+        resp.body.len(),
+        expected.len(),
+        "response body length must match upstream large.txt (B-46 regression: \
+         content-length duplication caused 0-byte body)"
+    );
+    assert_eq!(
+        resp.body, expected,
+        "response body content must exactly match upstream large.txt"
+    );
+}
+
 /// E-H3-F97-03: HTTP/3 Range → 206 Partial Content
 #[tokio::test]
 #[ntest::timeout(30000)]
