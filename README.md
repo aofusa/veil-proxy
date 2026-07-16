@@ -3346,6 +3346,8 @@ If Huge Pages are unavailable, automatically falls back to regular 4KB pages.
 
 ### System Configuration
 
+At startup, veil automatically raises the soft limit of `RLIMIT_NOFILE` up to the hard limit (equivalent to nginx's `worker_rlimit_nofile`). Control the hard limit via systemd's `LimitNOFILE` or docker's `--ulimit nofile` to manage the effective file descriptor ceiling.
+
 ```bash
 # File descriptor limit
 ulimit -n 65535

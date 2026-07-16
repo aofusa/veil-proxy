@@ -91,6 +91,11 @@ pub fn run() {
     // 追加の非同期化層（tokio::sync::mpsc等）は不要
     let _guard = init_logging(&logging_config);
 
+    // B-44 第4段: RLIMIT_NOFILE の soft limit を hard limit まで引き上げる
+    // （nginx の worker_rlimit_nofile 相当。F-116 多重化後の同時 fd 需要 ~1100 が
+    //   コンテナ既定 soft 1024 を超えるため。ワーカー起動・seccomp 適用より前に実行）
+    crate::system::raise_nofile_limit();
+
     #[cfg(feature = "http3")]
     let mut loaded_config = match load_config(&config_path) {
         Ok(c) => c,

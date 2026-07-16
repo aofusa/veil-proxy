@@ -58,6 +58,22 @@ docker logs <veil> | grep 'Backend connect error'
 最大 3 試行）のリトライで吸収**する（nginx `proxy_next_upstream` 相当の一時的失敗リトライ。
 設計は `docs/artifacts/f118_perf_improvement_design.md` 追補参照）。
 
+## 追加調査（第3段・第4段: 真因の確定）
+
+- **第3段**: ホストごとの新規 connect 並行数ゲート（64/スレッド、プールミス時のみ作動、
+  RAII permit + 待機者ごと Notify ブロードキャスト。Envoy upstream circuit breaker 相当）を
+  実装。ストームは平滑化されたがエラーは残存。
+- **第4段（真因）**: 残存エラーのログ精査で実体は **EMFILE（os error 24）** と判明。
+  真因は **veil が起動時に RLIMIT_NOFILE の soft limit（コンテナ既定 1024）を
+  引き上げていない**こと。F-116 多重化後は同時 1000 ストリームでクライアント側 100 +
+  バックエンド側 ~1000 + ring/eventfd 等で **~1100 fd** を要求し soft 1024 を構造的に
+  超過する（F-116 以前は同時 ~100 → ~200 fd で顕在化せず）。初期観測の EADDRNOTAVAIL も
+  fd 上限近傍での io_uring CONNECT の失敗表面化と整合。
+  → `system::raise_nofile_limit()`（nginx `worker_rlimit_nofile` 相当、起動時に
+  soft → hard へ自動引き上げ、fail-open）を追加して解消。
+  第1〜3段（プール上限 256・EADDRNOTAVAIL リトライ・connect ゲート）は多重化時代の
+  接続効率・ストーム平滑化として維持。
+
 ## 受け入れ条件
 
 - [ ] h2load `-n 30000 -c100 -m10` 連続 3 回で Non-2xx=0・`Backend connect error` なし。

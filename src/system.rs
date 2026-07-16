@@ -136,6 +136,60 @@ pub(crate) fn configure_huge_pages(enabled: bool) {
 }
 
 // ====================
+// RLIMIT_NOFILE 引き上げ（B-44 第4段）
+// ====================
+
+/// 起動時に RLIMIT_NOFILE の soft limit を hard limit まで引き上げる（B-44 第4段）。
+///
+/// nginx の `worker_rlimit_nofile` に相当する起動時処理。F-116 の HTTP/2 ストリーム
+/// 多重化により、同時 1000 ストリーム（h2load `-c100 -m10` 相当）ではクライアント側
+/// 100 fd + バックエンド側 ~1000 fd + ring/eventfd/リスナー等で **~1100 fd** を要求し、
+/// コンテナ既定の soft limit 1024 を超過して EMFILE（Too many open files）が発生する
+/// （hard は 524288 等で十分に大きいが、veil が soft を引き上げていなかった）。
+/// soft を hard まで自動で引き上げることで、運用側は systemd の `LimitNOFILE` /
+/// docker `--ulimit nofile` による hard の制御だけで fd 上限を管理できる。
+///
+/// 失敗時は warn ログを出して続行する（fail-open。権限がない環境でも起動は継続）。
+/// ワーカー起動・seccomp 適用より前のコールドパスで 1 回だけ呼ぶこと
+/// （`prlimit64` は seccomp 許可リストに含まれるが、起動時に完結させる）。
+pub fn raise_nofile_limit() {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: lim は有効なスタック上の rlimit 構造体で、getrlimit はそこへ書き込むのみ。
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        warn!(
+            "RLIMIT_NOFILE: getrlimit failed: {} (continuing with current limit)",
+            io::Error::last_os_error()
+        );
+        return;
+    }
+    if lim.rlim_cur >= lim.rlim_max {
+        info!(
+            "RLIMIT_NOFILE: soft limit already at hard limit ({})",
+            lim.rlim_cur
+        );
+        return;
+    }
+    let old_soft = lim.rlim_cur;
+    lim.rlim_cur = lim.rlim_max;
+    // SAFETY: lim は初期化済みの rlimit 構造体で、setrlimit はそれを読み取るのみ。
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) } != 0 {
+        warn!(
+            "RLIMIT_NOFILE: setrlimit failed: {} (continuing with soft limit {})",
+            io::Error::last_os_error(),
+            old_soft
+        );
+        return;
+    }
+    info!(
+        "raised RLIMIT_NOFILE soft: {} -> {}",
+        old_soft, lim.rlim_cur
+    );
+}
+
+// ====================
 // Task-Level Panic Recovery (Layer 1)
 // ====================
 //
@@ -584,4 +638,42 @@ pub(crate) fn attach_reuseport_cbpf(fd: i32, num_workers: usize) -> io::Result<(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// raise_nofile_limit が panic せず、soft limit が呼び出し前以上・hard 以下に
+    /// なること（B-44 第4段）。到達値は環境（コンテナ/権限）依存のため、
+    /// 非減少と上限内のみを検証する。
+    #[test]
+    fn test_raise_nofile_limit_non_decreasing() {
+        let mut before = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: 有効なスタック上の rlimit 構造体への書き込みのみ。
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut before) },
+            0
+        );
+
+        raise_nofile_limit();
+
+        let mut after = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: 同上。
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut after) },
+            0
+        );
+        assert!(
+            after.rlim_cur >= before.rlim_cur,
+            "soft limit must not decrease"
+        );
+        assert!(after.rlim_cur <= after.rlim_max);
+    }
 }
