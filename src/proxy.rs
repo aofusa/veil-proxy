@@ -1854,6 +1854,47 @@ async fn h2_proxy(
     result
 }
 
+/// バックエンド接続の EADDRNOTAVAIL 一時的失敗を指数バックオフでリトライして吸収する（B-44 第2段）。
+///
+/// F-116 のストリーム多重化により、スレッドあたり同時 ~250 ストリームが独立にバックエンド
+/// 接続を新規 connect するようになった。プール上限引き上げ（B-44 第1段）後も、
+/// コールドスタート/構成切り替え直後の**接続ストーム**（同時 ~1000 ストリームの一斉新規
+/// connect）では `EADDRNOTAVAIL` が数秒間バースト的に発生し 502 化する。切り分けの結果、
+/// 素の `connect(2)`（Python 実測）では同一条件で再現せず、TIME_WAIT も枯渇水準に達して
+/// いない（カーネルのポート枯渇ではない）ため、veil の io_uring CONNECT 経路特有の事象
+/// （バックエンド nginx の SYN/accept キュー飽和時の失敗が `EADDRNOTAVAIL` として表面化）
+/// と推定している。nginx の `proxy_next_upstream` 相当の一時的失敗リトライとして、
+/// `EADDRNOTAVAIL` の場合のみ 10ms → 40ms → 160ms の指数バックオフを挟み最大 4 試行
+/// （リトライ 3 回）する（それ以外の connect エラーは従来どおり即時返却）。
+///
+/// このリトライは **接続失敗時のみ実行されるコールドパス**（ホットパスは初回 connect の
+/// 成功経路）であり、追加アロケーションなし・待機は既存の io_uring タイマー
+/// （`crate::runtime::timer::sleep`）による非同期待機のため、ホットパス絶対規則
+/// （同期待機禁止・不要なアロケーション禁止）に反しない。
+///
+/// 戻り値: 接続成功で `Ok(TcpStream)`（成功時に `set_nodelay(true)` 済み）。
+/// `timeout` 到達時は呼び出し側で 504 に区別できるよう `io::ErrorKind::TimedOut` を返す。
+/// それ以外の connect エラー（最終リトライ失敗を含む）はそのまま返す（呼び出し側で 502）。
+#[cfg(feature = "http2")]
+async fn connect_backend_with_retry(addr: &str) -> io::Result<TcpStream> {
+    const BACKOFF_MS: [u64; 3] = [10, 40, 160];
+    let mut attempt = 0usize;
+    loop {
+        match timeout(CONNECT_TIMEOUT, TcpStream::connect_str(addr)).await {
+            Ok(Ok(stream)) => {
+                let _ = stream.set_nodelay(true);
+                return Ok(stream);
+            }
+            Ok(Err(e)) if e.raw_os_error() == Some(libc::EADDRNOTAVAIL) && attempt < 3 => {
+                crate::runtime::timer::sleep(Duration::from_millis(BACKOFF_MS[attempt])).await;
+                attempt += 1;
+            }
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err(io::Error::from(io::ErrorKind::TimedOut)),
+        }
+    }
+}
+
 /// H1 バックエンド（平文）へのプロキシ（プール再利用付き、B-28）。
 #[cfg(feature = "http2")]
 #[allow(clippy::too_many_arguments)]
@@ -1869,18 +1910,15 @@ async fn h2_proxy_http(
 ) -> (u16, u64) {
     let mut backend = match HTTP_POOL.with(|p| p.borrow_mut().get(addr)) {
         Some(stream) => stream,
-        None => match timeout(CONNECT_TIMEOUT, TcpStream::connect_str(addr)).await {
-            Ok(Ok(stream)) => {
-                let _ = stream.set_nodelay(true);
-                stream
-            }
-            Ok(Err(e)) => {
-                warn!("[HTTP/2] Backend connect error: {}", e);
-                let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
+        None => match connect_backend_with_retry(addr).await {
+            Ok(stream) => stream,
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                let (s, sz) = h2_emit_error(resp_tx, notify, 504, b"Gateway Timeout").await;
                 return (s, sz);
             }
-            Err(_) => {
-                let (s, sz) = h2_emit_error(resp_tx, notify, 504, b"Gateway Timeout").await;
+            Err(e) => {
+                warn!("[HTTP/2] Backend connect error: {}", e);
+                let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
                 return (s, sz);
             }
         },
@@ -1933,17 +1971,14 @@ async fn h2_proxy_https(
     let mut backend = match HTTPS_POOL.with(|p| p.borrow_mut().get(&pool_key)) {
         Some(stream) => stream,
         None => {
-            let backend_tcp = match timeout(CONNECT_TIMEOUT, TcpStream::connect_str(addr)).await {
-                Ok(Ok(stream)) => {
-                    let _ = stream.set_nodelay(true);
-                    stream
+            let backend_tcp = match connect_backend_with_retry(addr).await {
+                Ok(stream) => stream,
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                    return h2_emit_error(resp_tx, notify, 504, b"Gateway Timeout").await;
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     warn!("[HTTP/2] Backend connect error: {}", e);
                     return h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
-                }
-                Err(_) => {
-                    return h2_emit_error(resp_tx, notify, 504, b"Gateway Timeout").await;
                 }
             };
             let tls_result = if tls_insecure {
