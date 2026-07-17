@@ -1002,13 +1002,36 @@ mod tests {
         // 全 0 短列は '0' をいくつか出した後パディング不正か未完
         assert!(huffman_decode(&[0x00]).is_err());
 
-        // EOS っぽい長い全1 はデータ中に EOS 葉へ到達し得る → Err
-        assert!(huffman_decode(&[0xff; 8]).is_err() || huffman_decode(&[0xff; 8]).is_ok());
-        // 極性は線形と一致していればよい
+        // 長い全1 はデータ中に EOS 葉へ到達 → 必ず Err（出力しない）
         let all_ff = [0xffu8; 8];
-        assert_eq!(
-            huffman_decode(&all_ff).is_ok(),
-            huffman_decode_linear(&all_ff).is_ok()
+        assert!(
+            huffman_decode(&all_ff).is_err(),
+            "mid-stream EOS path of all-ones must be HuffmanDecodeError"
+        );
+        assert!(
+            huffman_decode_linear(&all_ff).is_err(),
+            "linear oracle must also reject mid-stream EOS"
+        );
+
+        // 正当な 0x02 符号化を 1 バイト短く切ると未完 → Err
+        let enc02 = huffman_encode(&[0x02]);
+        assert!(enc02.len() >= 2, "0x02 encodes to multiple bytes");
+        assert!(huffman_decode(&enc02[..enc02.len() - 1]).is_err());
+
+        // 正当な符号化の最終バイトの LSB を 0 にしてパディングを壊す → Err
+        let mut bad_pad = valid.clone();
+        if let Some(last) = bad_pad.last_mut() {
+            *last &= !1; // clear LSB so trailing bits are not all-ones when pad>0
+        }
+        // pad==0 の入力では壊せないことがあるので、pad 付きケースを明示
+        let enc_bang = huffman_encode(b"!"); // 符号長 10 → pad 6
+        let mut bad_bang = enc_bang.clone();
+        if let Some(last) = bad_bang.last_mut() {
+            *last &= 0xC0; // clear lower pad bits
+        }
+        assert!(
+            huffman_decode(&bad_bang).is_err(),
+            "non all-ones padding must fail: {bad_bang:?}"
         );
     }
 }
