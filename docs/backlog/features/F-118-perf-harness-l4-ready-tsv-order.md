@@ -33,11 +33,11 @@
 
 ## 受け入れ条件
 
-- [ ] `h2_0_feat_l4` の計測開始前に 9080 の疎通確認が行われる（未起動なら NA を emit）。
-- [ ] `results_raw.tsv` の行順が nginx → veil_glibc → veil_musl である。
-- [ ] nginx ベースラインは従来どおり `base` 構成（http1.1 / http2）のみ。
-- [ ] `grpc_h1*` 構成は存在しない。
-- [ ] http1.1・http2・http3・grpc/h2・grpc/h3・l4 × 各機能の生 TSV を取得し、
+- [x] `h2_0_feat_l4` の計測開始前に 9080 の疎通確認が行われる（未起動なら NA を emit）。
+- [x] `results_raw.tsv` の行順が nginx → veil_glibc → veil_musl である。
+- [x] nginx ベースラインは従来どおり `base` 構成（http1.1 / http2）のみ。
+- [x] `grpc_h1*` 構成は存在しない。
+- [x] http1.1・http2・http3・grpc/h2・grpc/h3・l4 × 各機能の生 TSV を取得し、
       `docs/perf/README.md` にサマリ、`docs/perf/results_raw.tsv` に生データを反映。
 
 ## 関連
@@ -45,3 +45,11 @@
 - 設計: `docs/artifacts/f118_perf_improvement_design.md`
 - 起点: `docs/artifacts/perf_improvement_plan.md`
 - 先行: F-114（全プロトコル×全機能マトリクス）、F-89（full features 網羅）
+
+## 完了（2026-07-17）
+
+- フルスイート実測（2026-07-16）: 全 105 (target, config, proto) × 3 反復で Non-2xx=0。
+  `docs/perf/README.md` / `docs/perf/results_raw.tsv` を v0.5.0 向けに更新。
+- 計測起点で B-44（RLIMIT_NOFILE / 接続チャーン）・B-45（L4 半クローズ未伝搬）・
+  B-46（HTTP/3 content-length 重複）を検出・修正（各チケット参照）。
+- 追加で HTTP/3 の `--net=host` + GSO/GRO 参考値も計測（docs/perf/README.md）。

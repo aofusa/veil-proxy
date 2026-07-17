@@ -3442,11 +3442,16 @@ against `moul/grpcbin` / `jmalloc/echo-server` upstreams. Full data and a summar
 [docs/perf/README.md](docs/perf/README.md) / [docs/perf/results_raw.tsv](docs/perf/results_raw.tsv)
 (TLS termination is the dominant cost — plaintext L4 is up to 2.2× faster — while L7 feature
 logic stays within noise, all configs Non-2xx=0).
-Latest results (2026-07-13, [docs/perf/README.md](docs/perf/README.md)):
-HTTP/1.1 3298 req/s (nginx ×1.4) / HTTP/2 2704 req/s (nginx ×1.1) / **HTTP/3 853 req/s
-(doubled by F-115 recvmmsg/sendmmsg batching + the B-43 StreamBlocked fix — 32% of HTTP/2;
-the remaining gap is the userspace-QUIC per-request CPU cost)** / gRPC relay 1475 req/s
-(a k6→grpcbin control run shows the proxy hop adds effectively zero overhead).
+Latest results (2026-07-16 full-suite for v0.5.0, all 105 config×proto rows Non-2xx=0,
+[docs/perf/README.md](docs/perf/README.md)):
+HTTP/1.1 3213 req/s (nginx ×1.47) / HTTP/2 2763 req/s (nginx ×1.18; 3646 req/s with a
+multi-threaded h2load — HTTP/2 now beats HTTP/1.1 thanks to the F-116 stream multiplexing) /
+**HTTP/3 835 req/s (doubled by F-115 recvmmsg/sendmmsg batching + the B-43 StreamBlocked
+fix; ~906 req/s as a host-network reference)** / gRPC relay 1609 req/s (a k6→grpcbin control
+run shows the proxy hop adds effectively zero overhead) / plaintext L4 passthrough 5074 req/s.
+The v0.5.0 full-suite run also uncovered and fixed B-44 (startup RLIMIT_NOFILE raise +
+backend-connection churn), B-45 (L4 half-close propagation) and B-46 (HTTP/3 buffered-proxy
+duplicate content-length).
 Note: HTTP/3 mmsg batching requires `recvmmsg`/`sendmmsg` in the Docker seccomp allowlist
 (`docker/assets/security/seccomp.json` ships with them).
 

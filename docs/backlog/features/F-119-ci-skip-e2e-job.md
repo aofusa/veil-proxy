@@ -14,5 +14,5 @@ v0.5.0 リリース準備の一環。PR / push ゲート CI（`.github/workflows
 
 ## 受け入れ条件
 
-- [ ] push / pull_request で `e2e` ジョブが実行されない（スキップ扱い）。
-- [ ] 他ジョブの動作は変更なし。
+- [x] push / pull_request で `e2e` ジョブが実行されない（スキップ扱い）。
+- [x] 他ジョブの動作は変更なし。

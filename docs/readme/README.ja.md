@@ -3475,11 +3475,16 @@ recv/send/accept/timer Future をランダムに Drop する `runtime_cancellati
   結果のサマリと生データ（TSV）は
   [docs/perf/README.md](../perf/README.md) / [docs/perf/results_raw.tsv](../perf/results_raw.tsv) を参照
   （TLS 終端が支配的コストで平文 L4 は最大 2.2 倍、L7 機能ロジックはノイズ範囲内・全構成 Non-2xx=0）。
-  最新結果（2026-07-13、同 README）:
-  HTTP/1.1 3298 req/s（nginx 比 1.4 倍）/ HTTP/2 2704 req/s（nginx 比 1.1 倍）/
-  **HTTP/3 853 req/s（F-115 recvmmsg/sendmmsg バッチング + B-43 StreamBlocked 修正で 2 倍化。
-  HTTP/2 比 32%、残差はユーザ空間 QUIC の per-request CPU コスト）** / gRPC 中継 1475 req/s
-  （k6→grpcbin 直行の対照計測でプロキシホップのオーバーヘッドは実質ゼロ）。
+  最新結果（2026-07-16、v0.5.0 向けフルスイート。全 105 構成×プロトコルで Non-2xx=0、同 README）:
+  HTTP/1.1 3213 req/s（nginx 比 1.47 倍）/ HTTP/2 2763 req/s（nginx 比 1.18 倍。
+  マルチスレッド h2load では 3646 req/s で **F-116 多重化により HTTP/1.1 超え**）/
+  **HTTP/3 835 req/s（F-115 recvmmsg/sendmmsg バッチング + B-43 StreamBlocked 修正で 2 倍化。
+  `--net=host` 参考値 ~906 req/s）** / gRPC 中継 1609 req/s
+  （k6→grpcbin 直行の対照計測でプロキシホップのオーバーヘッドは実質ゼロ）/
+  L4 平文素通し 5074 req/s。
+  v0.5.0 フルスイート計測では B-44（起動時 RLIMIT_NOFILE 引き上げ + バックエンド接続
+  チャーン）・B-45（L4 半クローズ伝搬）・B-46（HTTP/3 バッファ経路の content-length 重複）も
+  検出・修正した。
   なお HTTP/3 の mmsg バッチングは Docker seccomp 許可リストに `recvmmsg`/`sendmmsg` が必要
   （`docker/assets/security/seccomp.json` は対応済み）。
 
