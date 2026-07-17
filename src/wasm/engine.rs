@@ -749,16 +749,24 @@ impl FilterEngine {
                 let body_size = response.body.len() as i32;
                 let num_trailers = response.trailers.len() as i32;
 
-                if let Err(e) = func.call(
-                    &mut store,
-                    (
-                        http_context_id,
-                        token as i32,
-                        num_headers,
-                        body_size,
-                        num_trailers,
-                    ),
-                ) {
+                // 本 Store は fuel_async_yield_interval を設定した async store のため、
+                // 同期 `call` は wasmtime が "must use `call_async` with async stores" で
+                // panic する（tick スレッドから本経路に入った場合に tick スレッドが死に、
+                // 取得済み pending コールが失われて対象リクエストがハングする。
+                // F-120 Phase 2 の E2E で顕在化した既存バグ）。必ず call_async を使う。
+                if let Err(e) = func
+                    .call_async(
+                        &mut store,
+                        (
+                            http_context_id,
+                            token as i32,
+                            num_headers,
+                            body_size,
+                            num_trailers,
+                        ),
+                    )
+                    .await
+                {
                     ftlog::debug!(
                         "[wasm:{}] proxy_on_http_call_response returned: {}",
                         module.name,
