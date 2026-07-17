@@ -24,9 +24,23 @@ use std::time::Duration;
 
 use veil::runtime::{self, time::timeout, TcpListener, TcpStream};
 
-/// io_uring が利用可能か（生成できるか）。不可の環境ではテストをスキップする。
+/// ランタイムドライバ（io_uring リング、または epoll poller）が利用可能か。
+/// 不可の環境ではテストをスキップする。
+#[cfg(veil_rt_uring)]
 fn io_uring_available() -> bool {
     veil::runtime::IoUring::new(8, 0).is_ok()
+}
+
+/// reactor（epoll）ビルドでは `epoll_create1` の成否を代替指標とする。
+#[cfg(veil_rt_reactor)]
+fn io_uring_available() -> bool {
+    let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+    if fd >= 0 {
+        unsafe { libc::close(fd) };
+        true
+    } else {
+        false
+    }
 }
 
 /// 決定的な擬似乱数（LCG）。失敗再現のためシードを固定できる。

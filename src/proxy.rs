@@ -10781,11 +10781,24 @@ mod connect_gate_tests {
     use std::cell::Cell;
     use std::rc::Rc;
 
-    // io_uring を許可しない環境（Docker ビルドサンドボックス・古いカーネル等）では
-    // リング生成が失敗し `block_on` が panic するため、ランタイムを要するテストは
-    // スキップする（`src/l4/proxy.rs` の tests と同じパターン）。
+    // io_uring/epoll を許可しない環境（Docker ビルドサンドボックス・古いカーネル等）では
+    // ランタイムドライバの生成が失敗し `block_on` が panic するため、ランタイムを要する
+    // テストはスキップする（`src/l4/proxy.rs` の tests と同じパターン）。
+    #[cfg(veil_rt_uring)]
     fn io_uring_available() -> bool {
         crate::runtime::ring::IoUring::new(8, 0).is_ok()
+    }
+
+    /// reactor（epoll）ビルドでは `epoll_create1` の成否をランタイム可用性の代替指標とする。
+    #[cfg(veil_rt_reactor)]
+    fn io_uring_available() -> bool {
+        let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+            true
+        } else {
+            false
+        }
     }
 
     /// ConnectPermit の Drop が in_flight を確実に減算し、待機者へ通知すること（B-44 第3段）。

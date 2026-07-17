@@ -25,29 +25,48 @@
 //!
 //! バックエンドの選択は build.rs が発行する cfg（`veil_rt_uring` /
 //! `veil_rt_reactor`）で行い、`runtime::tcp` 等の公開パスはどちらの
-//! バックエンドでも不変に保つ（F-120 Phase 1。reactor バックエンドは
-//! 未実装で今後追加予定）。
+//! バックエンドでも不変に保つ（F-120）。`veil_rt_reactor`（Linux では
+//! `--features epoll`）は readiness ベースの `reactor` バックエンドへ切り替える
+//! （Phase 2。poller は現状 epoll のみ、kqueue は Phase 4 で追加予定）。
 
 pub mod buf;
 pub mod io;
 pub mod offload;
 
+#[cfg(veil_rt_reactor)]
+mod reactor;
 #[cfg(veil_rt_uring)]
 mod uring;
 
+#[cfg(veil_rt_reactor)]
+pub use reactor::{executor, splice, tcp, timer};
 #[cfg(veil_rt_uring)]
 pub use uring::{executor, ring, splice, tcp, timer};
 
 // 公開 API の再エクスポート
 pub use buf::{IoBuf, IoBufMut};
-#[cfg(veil_rt_uring)]
 pub use executor::{spawn, yield_now, Executor, TaskPool};
 #[cfg(veil_rt_uring)]
 pub use ring::IoUring;
-#[cfg(veil_rt_uring)]
 pub use tcp::{TcpListener, TcpStream};
-#[cfg(veil_rt_uring)]
 pub use timer::{sleep, timeout, Elapsed};
+
+/// 現在のスレッドにランタイムドライバ（io_uring リング、または reactor の poller）が
+/// 初期化済みかを判定する、バックエンド中立な API。
+///
+/// `runtime::offload`（F-29）が、ドライバのあるワーカースレッドでは非同期待機を、
+/// ドライバの無いコンテキスト（単体テスト等）では同期インライン実行をするための
+/// 分岐に使う。
+#[cfg(veil_rt_uring)]
+pub fn has_driver() -> bool {
+    executor::has_ring()
+}
+
+/// `has_driver` の reactor 版（epoll poller の初期化有無で判定する）。
+#[cfg(veil_rt_reactor)]
+pub fn has_driver() -> bool {
+    executor::has_driver()
+}
 
 use std::future::Future;
 
@@ -142,6 +161,23 @@ where
     // 別途 Executor::new() で作ったエグゼキュータを使うと、spawn() されたタスクが
     // スレッドローカル側のキューに積まれて永遠にポーリングされない（接続を accept
     // しても handle_connection が動かず応答できなくなる）。
+    let exec = executor::current_executor();
+    exec.block_on(future)
+}
+
+/// バックエンド依存の `block_on_with_config` 実装（reactor 版）。
+///
+/// `config.ring_entries` / `config.sqpoll` は reactor では無視する（io_uring 固有設定の
+/// ため）。poller（epoll インスタンス）の初期化のみ行う。
+#[cfg(veil_rt_reactor)]
+fn block_on_with_config_backend<F, R>(future: F, _config: &RuntimeConfig) -> R
+where
+    F: Future<Output = R> + 'static,
+    R: 'static,
+{
+    executor::init_reactor().expect("Failed to initialize reactor poller (epoll_create1)");
+    executor::init_executor();
+
     let exec = executor::current_executor();
     exec.block_on(future)
 }

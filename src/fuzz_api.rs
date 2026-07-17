@@ -102,15 +102,26 @@ pub fn wasm_host_abi_map_smoke(bytes: &[u8]) {
 
 /// io_uring executor への擬似 CQE 注入ファジング（F-84、ホットパス外）。
 ///
-/// コアランタイム（`src/runtime/executor.rs`）の op テーブル・完了ディスパッチ経路を、
+/// コアランタイム（`src/runtime/uring/executor.rs`）の op テーブル・完了ディスパッチ経路を、
 /// 実リング（カーネル）を介さずに Fuzzer 生成の操作列で駆動する。異常な `res` 値、
 /// `user_data` の偽造・stale 世代、完了順序の逆転・重複到着に対して panic せず、
 /// detach ガードの exactly-once 実行（B-07 の UAF/リーク対策の意味論）と
 /// スロット非リークを不変条件として検査する。詳細は
 /// `runtime::executor::fuzz_op_table_sequence` の doc コメントを参照。
+///
+/// io_uring 固有の op テーブル実装が対象のため、reactor（`--features epoll`）ビルドでは
+/// 該当する完了ディスパッチ経路自体が存在しない（readiness モデルのため op テーブル・
+/// detach ガードの概念が構造的に無い。`src/runtime/reactor/mod.rs` の doc 参照）。
+/// そのビルドでは no-op にする（fuzz クレートは既定で uring バックエンドを使用するため
+/// 通常はこの分岐へ到達しない）。
+#[cfg(veil_rt_uring)]
 pub fn io_uring_executor_smoke(data: &[u8]) {
     crate::runtime::executor::fuzz_op_table_sequence(data);
 }
+
+/// reactor ビルド向け no-op（上記 doc 参照）。
+#[cfg(veil_rt_reactor)]
+pub fn io_uring_executor_smoke(_data: &[u8]) {}
 
 /// HTTP/3 フレームワイヤ形式のファジング（F-112、ホットパス外）。
 ///

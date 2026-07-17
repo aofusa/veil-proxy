@@ -1350,10 +1350,24 @@ mod tests {
     // B-45: 半クローズ伝搬の回帰テスト
     // ====================
     //
-    // io_uring を許可しない環境（Docker ビルドサンドボックス・古いカーネル等）では
-    // リング生成が失敗するため、実 I/O を伴う本テストはスキップする（E2E で網羅）。
+    // io_uring/epoll を許可しない環境（Docker ビルドサンドボックス・古いカーネル等）では
+    // ランタイムドライバの生成が失敗するため、実 I/O を伴う本テストはスキップする
+    // （E2E で網羅）。
+    #[cfg(veil_rt_uring)]
     fn io_uring_available() -> bool {
         crate::runtime::ring::IoUring::new(8, 0).is_ok()
+    }
+
+    /// reactor（epoll）ビルドでは `epoll_create1` の成否をランタイム可用性の代替指標とする。
+    #[cfg(veil_rt_reactor)]
+    fn io_uring_available() -> bool {
+        let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+            true
+        } else {
+            false
+        }
     }
 
     /// `forward_direction_splice` が src の EOF でループを抜けた際、dst へ
