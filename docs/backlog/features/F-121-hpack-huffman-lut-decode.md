@@ -23,9 +23,11 @@
    256 状態 × 16 peek、エントリはパック `u32`（`flags|sym<<8|bits<<16|next<<24`）。
    `.rodata` **16 KiB**（L1D 常駐目標）。8-bit は設計上 Phase 2。
 
-2. **生成器**  
-   `tools/gen_huffman_decode_table.py` が `HUFFMAN_ENCODE_TABLE` をパースし
-   `src/http2/hpack/huffman_decode_table.rs`（`@generated`）を出力。encode 表が SoT。
+2. **生成器（ビルド非依存・git 非管理）**  
+   当初 `tools/gen_huffman_decode_table.py` で `HUFFMAN_ENCODE_TABLE` から
+   `huffman_decode_table.rs`（`@generated`）を生成しコミット。RFC 7541 固定符号のため
+   日常のビルド/CI では再生成不要。スクリプトは `docs/artifacts/gen_huffman_decode_table.py`
+   に移し git 管理外とした（encode 表変更時の手元再生成用）。
 
 3. **終端契約 I3–I6**  
    root で `bits_left < 5` または `bits_left ≤ 7` 全1 のとき NEED しない
@@ -62,4 +64,4 @@
 
 - **依存**: なし（`http2` feature 内の純アルゴリズム変更）
 - **関連**: B-21、F-26/F-116
-- **再生成**: `python3 tools/gen_huffman_decode_table.py --stride 4 --huffman-rs src/http2/hpack/huffman.rs --out src/http2/hpack/huffman_decode_table.rs`
+- **再生成**（任意・手元）: `python3 docs/artifacts/gen_huffman_decode_table.py --stride 4 --parse-from src/http2/hpack/huffman.rs --out src/http2/hpack/huffman_decode_table.rs`
