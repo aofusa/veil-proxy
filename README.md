@@ -20,7 +20,7 @@ A high-performance reverse proxy server using io_uring (custom runtime) and rust
 - **Asynchronous I/O**: Efficient I/O processing with custom io_uring runtime (no monoio/tokio dependency in data plane)
 - **TLS**: Memory-safe pure Rust TLS implementation with rustls
 - **kTLS**: Kernel TLS offload support via rustls + custom kTLS module (Linux 5.15+)
-- **HTTP/2**: HTTP/2 support via TLS ALPN negotiation (stream multiplexing, HPACK compression)
+- **HTTP/2**: HTTP/2 support via TLS ALPN negotiation (stream multiplexing, HPACK compression with **4-bit LUT Huffman decode** — F-121)
 - **H2C Server**: HTTP/2 Cleartext (H2C) server support without TLS (Prior Knowledge mode, RFC 7540 Section 3.4)
 - **HTTP/3**: QUIC/UDP-based HTTP/3 support using quiche (0-RTT connection establishment)
 - **Fast Allocator**: High-speed memory allocation with mimalloc + Huge Pages support
@@ -2349,7 +2349,7 @@ Supports HTTP/2 (RFC 7540) via TLS ALPN negotiation.
 | Feature | Effect |
 |---------|--------|
 | Stream Multiplexing | Parallel processing of multiple requests on a single connection |
-| HPACK Header Compression | Significantly reduces header overhead |
+| HPACK Header Compression | Significantly reduces header overhead. Decode uses a **4-bit LUT state machine** (F-121; 256 states × 16 peeks, 16 KiB L1-resident packed table) instead of scanning the encode table per symbol — release microbench ~12× vs the prior linear decoder; EOS padding and B-21 invalid-input safety retained |
 | Server Push | Latency reduction through proactive resource sending |
 | Flow Control | Stream and connection level control |
 

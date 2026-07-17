@@ -752,6 +752,8 @@ reuseport_balancing = "cbpf"
 #
 [http2]
 # SETTINGS_HEADER_TABLE_SIZE (HPACK動的テーブルサイズ)
+# 注: Huffman デコード自体は RFC 7541 固定符号の 4-bit LUT（F-121）で行い、
+# 本設定は動的テーブル（文字列リテラルの参照圧縮）のサイズ上限を制御する。
 # デフォルト: 65536 (64KB) - high-performance設定
 # RFC 7540標準: 4096 (4KB)
 # header_table_size = 65536

@@ -1034,4 +1034,58 @@ mod tests {
             "non all-ones padding must fail: {bad_bang:?}"
         );
     }
+
+    /// マイクロベンチ: LUT が線形 oracle より高速であること（release で意味あり）。
+    /// CI では環境差があるため厳密な倍率は要求せず、計測結果を表示する。
+    #[test]
+    fn test_huffman_lut_faster_than_linear_microbench() {
+        use std::time::Instant;
+        // 代表的ヘッダ値（ASCII 多め）と全バイト混在を混ぜる
+        let mut samples: Vec<Vec<u8>> = Vec::new();
+        for s in [
+            b"www.example.com".as_slice(),
+            b"application/json",
+            b"text/html; charset=utf-8",
+            b"/api/v1/users/12345",
+            b"Bearer abcdefghijklmnopqrstuvwxyz0123456789",
+            b"custom-key",
+            b"custom-value",
+        ] {
+            samples.push(huffman_encode(s));
+        }
+        // 256 単一バイトも追加
+        for b in 0u8..=255 {
+            samples.push(huffman_encode(&[b]));
+        }
+        // ウォームアップ
+        for enc in &samples {
+            let _ = huffman_decode(enc);
+            let _ = huffman_decode_linear(enc);
+        }
+        const ROUNDS: usize = 200;
+        let t0 = Instant::now();
+        for _ in 0..ROUNDS {
+            for enc in &samples {
+                let _ = huffman_decode(enc).unwrap();
+            }
+        }
+        let lut_ns = t0.elapsed().as_nanos();
+        let t1 = Instant::now();
+        for _ in 0..ROUNDS {
+            for enc in &samples {
+                let _ = huffman_decode_linear(enc).unwrap();
+            }
+        }
+        let lin_ns = t1.elapsed().as_nanos();
+        let speedup = lin_ns as f64 / lut_ns as f64;
+        eprintln!(
+            "huffman microbench: LUT={lut_ns}ns linear={lin_ns}ns speedup={speedup:.2}x (rounds={ROUNDS}, samples={})",
+            samples.len()
+        );
+        // デバッグビルドでも通常 LUT が勝つが、極端なノイズ時は緩い下限
+        assert!(
+            speedup > 1.0,
+            "LUT should be faster than linear: speedup={speedup:.2}x lut={lut_ns} lin={lin_ns}"
+        );
+    }
 }
