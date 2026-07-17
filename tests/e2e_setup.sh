@@ -36,6 +36,9 @@ PIDS_FILE="${FIXTURES_DIR}/pids.txt"
 RUN_MODE="host"
 VEIL_IMAGE="veil:glibc"
 VEIL_PROXY_CONTAINER="veil-e2e-proxy"
+# F-120 Phase 3: arm64 イメージ（veil:glibc-aarch64 / veil:musl-aarch64）指定時のみ
+# `docker run --platform linux/arm64` を付与する（QEMU user-mode 実行）。
+DOCKER_PLATFORM=""
 
 # ポート設定
 PROXY_HTTPS_PORT=8443
@@ -1494,7 +1497,18 @@ start_proxy_host() {
 
 start_proxy_container() {
     local seccomp="${PROJECT_DIR}/docker/assets/security/seccomp.json"
-    if [ ! -f "$seccomp" ]; then
+    # F-120 Phase 3: aarch64 イメージは QEMU user-mode（binfmt）で実行される。
+    # このときコンテナの seccomp プロファイルが制限するのはエミュレータ
+    # （qemu-aarch64-static、x86_64 プロセス）自身の syscall であり、veil 用の
+    # 最小 allowlist では qemu が必要とする syscall（membarrier 等）まで塞いで
+    # 即 abort する。QEMU 実行時は Docker デフォルトプロファイルを使う
+    # （カスタムプロファイルは実 aarch64 ホスト向け。また qemu-aarch64 は
+    # io_uring 系 syscall 未実装（ENOSYS）のため、QEMU で動かす aarch64 イメージは
+    # `--features full,epoll` ビルドが前提）。
+    local seccomp_opts=(--security-opt "seccomp=${seccomp}")
+    if [ -n "${DOCKER_PLATFORM}" ]; then
+        seccomp_opts=()
+    elif [ ! -f "$seccomp" ]; then
         log_error "seccomp プロファイルが見つかりません: $seccomp"
         exit 1
     fi
@@ -1504,18 +1518,22 @@ start_proxy_container() {
         exit 1
     fi
 
-    log_info "Starting veil proxy (container mode, image: ${VEIL_IMAGE}, --network host)..."
+    log_info "Starting veil proxy (container mode, image: ${VEIL_IMAGE}, --network host${DOCKER_PLATFORM:+, platform: $DOCKER_PLATFORM})..."
     docker rm -f "${VEIL_PROXY_CONTAINER}" >/dev/null 2>&1 || true
     mkdir -p /tmp/veil_buffer
 
     # アタッチ実行（-d ではない）をバックグラウンド起動し、docker クライアント PID を
     # proxy.pid に記録する。docker のシグナルプロキシにより kill -HUP <client-pid> が
     # コンテナ内 veil(PID1) へ転送され、F-49 の証明書リロードテストが機能する。
+    # F-120 Phase 3: arm64 イメージの場合は --platform linux/arm64 を付与し
+    # binfmt_misc 登録済みの qemu-aarch64 user-mode エミュレーションで実行する。
+    # shellcheck disable=SC2086
     docker run --rm --name "${VEIL_PROXY_CONTAINER}" \
+        ${DOCKER_PLATFORM:+--platform "$DOCKER_PLATFORM"} \
         --network host \
         --user "$(id -u):$(id -g)" \
         -e VEIL_TLS_INSECURE=1 \
-        --security-opt "seccomp=${seccomp}" \
+        "${seccomp_opts[@]}" \
         -v "${FIXTURES_DIR}:${FIXTURES_DIR}:rw" \
         -v /tmp/veil_buffer:/tmp/veil_buffer:rw \
         "${VEIL_IMAGE}" \
@@ -2038,9 +2056,20 @@ for arg in "$@"; do
             ;;
         glibc)
             VEIL_IMAGE="veil:glibc"
+            DOCKER_PLATFORM=""
             ;;
         musl)
             VEIL_IMAGE="veil:musl"
+            DOCKER_PLATFORM=""
+            ;;
+        glibc-aarch64)
+            # F-120 Phase 3: aarch64 クロスビルドイメージ（QEMU user-mode で実行）
+            VEIL_IMAGE="veil:glibc-aarch64"
+            DOCKER_PLATFORM="linux/arm64"
+            ;;
+        musl-aarch64)
+            VEIL_IMAGE="veil:musl-aarch64"
+            DOCKER_PLATFORM="linux/arm64"
             ;;
         default|cache|buffering|healthcheck|least_conn|ip_hash|wasm|security|ktls)
             CONFIG_TYPE="$arg"
@@ -2136,7 +2165,7 @@ case "${COMMAND}" in
         cleanup
         ;;
     *)
-        echo "Usage: $0 {start|stop|restart|health|test|clean} [config_type] [container [glibc|musl]]"
+        echo "Usage: $0 {start|stop|restart|health|test|clean} [config_type] [container [glibc|musl|glibc-aarch64|musl-aarch64]]"
         echo ""
         echo "Commands:"
         echo "  start   - Start all servers"
@@ -2162,6 +2191,9 @@ case "${COMMAND}" in
         echo "                     same composition/config/tests run in the container environment."
         echo "  container glibc  - Use the veil:glibc image (default)."
         echo "  container musl   - Use the veil:musl image."
+        echo "  container glibc-aarch64 - Use the veil:glibc-aarch64 image (F-120 Phase 3,"
+        echo "                     QEMU user-mode via 'docker run --platform linux/arm64')."
+        echo "  container musl-aarch64  - Use the veil:musl-aarch64 image (same as above)."
         echo "  (omit 'container' to run the proxy as a host binary, as before)"
         echo ""
         echo "  Examples:"

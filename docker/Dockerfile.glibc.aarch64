@@ -1,0 +1,127 @@
+# syntax=docker/dockerfile:1
+# glibc 2.28 向け aarch64 クロスビルド + distroless/base-nossl ランタイム
+#
+# F-120 Phase 3: Dockerfile.glibc をベースに aarch64-unknown-linux-gnu 向けの
+# クロスコンパイル差分のみを適用したもの（builder は x86_64 イメージ上で
+# cargo-zigbuild により aarch64 バイナリを生成する）。
+#
+# Dockerfile.glibc との主な差分:
+#   - RUST_TARGET のデフォルトを aarch64-unknown-linux-gnu に変更
+#   - `rustup target add aarch64-unknown-linux-gnu` を追加
+#   - `cargo test --bins --no-run --target ...` / `cargo test --lib --target ...`
+#     を省略する（理由: cargo-zigbuild が差し替えるのは `cargo zigbuild` コマンドの
+#     リンカ選択のみであり、素の `cargo test --target aarch64-unknown-linux-gnu`
+#     はホストの `cc`（x86_64 用リンカ）を使おうとしてリンクに失敗する。
+#     加えて、たとえリンクできたとしても x86_64 ビルダー上で aarch64 テスト
+#     バイナリを実行することはできない。x86_64 ビルド（Dockerfile.glibc）側で
+#     すでにユニットテストは実行されているため、aarch64 版では省略する）
+#   - ランタイムステージのベースイメージに `--platform=linux/arm64` を指定
+
+# ==========================================
+# 1. 最小設定ファイルやツールを用意する共通ステージ
+# ==========================================
+FROM messense/cargo-zigbuild AS tool-builder
+
+WORKDIR /app
+
+# 依存パッケージのインストール
+RUN apt-get update -y \
+    && apt-get install -y --no-install-recommends \
+        nasm \
+        cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+# aarch64 クロスビルド用ターゲットを追加（x86_64 ビルダー上でのクロスコンパイル用）
+RUN rustup target add aarch64-unknown-linux-gnu
+
+# キャッシュディレクトリの事前準備
+RUN mkdir -p /var/cache/veil /var/tmp/veil
+
+# ==========================================
+# 2. 依存ライブラリの事前ビルドステージ
+# ==========================================
+FROM tool-builder AS cacher
+
+ARG CARGO_FEATURES=full
+ARG RUST_TARGET=aarch64-unknown-linux-gnu
+ARG LIBC_VERSION=.2.28
+
+# Cargo.toml と Cargo.lock、および fuzz ワークスペースメンバのマニフェストを先にコピー
+# （[workspace] members = [".", "fuzz"] のため、fuzz/Cargo.toml が無いとワークスペース解決に失敗する）
+COPY Cargo.toml Cargo.lock /app/
+COPY .cargo/config.toml /app/.cargo/config.toml
+COPY build.rs /app/build.rs
+COPY fuzz/Cargo.toml /app/fuzz/Cargo.toml
+
+# 空の main.rs を作り、依存関係「だけ」を先にコンパイルしてキャッシュ化する
+# fuzz メンバはワークスペース解決のためにスタブのターゲットだけ用意し、本体はビルドしない
+#
+# 注: cargo-zigbuild は `cargo zigbuild` コマンドでのみクロスリンクを担うため、
+# `cargo test --no-run` によるテストバイナリの事前キャッシュ（x86_64 版で実施）は
+# aarch64 では行わない（上記コメント参照）。依存キャッシュは `cargo zigbuild` の
+# 成果物のみで賄う。
+RUN mkdir src benches \
+    && echo "fn main() {}" > src/main.rs \
+    # 本クレートは lib + bin 構成（src/lib.rs）。--bins ビルドでも lib ターゲットが
+    # コンパイルされるため、依存キャッシュ段では空の lib スタブが必要。
+    && echo "" > src/lib.rs \
+    # Cargo.toml から name = "xxx"（ベンチマーク名）を抽出して、自動的にダミーファイルを一括作成
+    && awk -F'"' '/^\[\[bench\]\]/{p=1} p && /name =/{print $2; p=0}' Cargo.toml \
+       | xargs -I {} touch benches/{}.rs \
+    # fuzz/Cargo.toml の [[bin]] path = "..." を抽出し、スタブソースを生成
+    && awk -F'"' '/^path =/{print $2}' fuzz/Cargo.toml \
+       | while read -r p; do mkdir -p "fuzz/$(dirname "$p")" && echo "fn main() {}" > "fuzz/$p"; done \
+    && cargo zigbuild --release --target "${RUST_TARGET}${LIBC_VERSION}" --features "${CARGO_FEATURES}" --locked \
+    && rm -rf src/
+
+
+# ==========================================
+# 3. アプリケーションコードのビルドステージ
+# ==========================================
+FROM tool-builder AS builder
+
+ARG CARGO_FEATURES=full
+ARG RUST_TARGET=aarch64-unknown-linux-gnu
+ARG LIBC_VERSION=.2.28
+
+# cacher ステージから「ビルド済みの依存関係アセット（target/）」をコピー
+COPY --from=cacher /usr/local/cargo /usr/local/cargo
+COPY --from=cacher /app/target /app/target
+COPY --from=cacher /app/benches /app/benches
+COPY Cargo.toml Cargo.lock /app/
+COPY .cargo/config.toml /app/.cargo/config.toml
+COPY build.rs /app/build.rs
+
+# ソースコードをコピー
+COPY . /app
+
+# ビルド（aarch64 バイナリは x86_64 ビルダー上で実行できないため、ユニットテストは
+# 実行しない。x86_64 ビルド（Dockerfile.glibc）側で同一ソースのテストが実行されている）。
+#
+# cacher 段はスタブの src/main.rs / src/lib.rs で release プロファイルの成果物をキャッシュする。
+# 実ソースへ差し替えた後は全 .rs の mtime を更新して cargo に再コンパイルを強制する
+# （main.rs だけ touch すると lib のスタブ成果物が最新と誤判定され veil::run 未定義になる）。
+RUN find src -name '*.rs' -exec touch {} + \
+    && cargo zigbuild --release --target "${RUST_TARGET}${LIBC_VERSION}" --features "${CARGO_FEATURES}" --locked
+
+
+# ==========================================
+# 4. 最終実行用ランタイム（distroless/base-nossl、arm64）
+# ==========================================
+FROM --platform=linux/arm64 gcr.io/distroless/base-nossl-debian13 AS runtime
+
+ARG RUST_TARGET=aarch64-unknown-linux-gnu
+ARG LIBC_VERSION=.2.28
+
+# ディスク書き込みが発生するディレクトリの構造と所有権の持込
+COPY --from=builder --chown=65532:65532 /var/cache/veil /var/cache/veil
+COPY --from=builder --chown=65532:65532 /var/tmp/veil /var/tmp/veil
+
+# アプリケーションバイナリと設定アセット
+COPY --from=builder /app/target/${RUST_TARGET}/release/veil /veil
+COPY --from=builder /app/docker/assets/conf.d/config.toml /etc/veil/conf.d/config.toml
+COPY --from=builder /app/docker/assets/www/index.html /var/www/index.html
+
+EXPOSE 80/tcp 443/tcp
+
+CMD ["./veil", "-c", "/etc/veil/conf.d/config.toml"]

@@ -36,6 +36,34 @@ epoll 系 syscall を許可しない（最小権限）。
 - [x] 設計ドキュメント
 - [x] Phase 1: runtime uring 分離（無挙動変更）
 - [x] Phase 2: epoll バックエンド + seccomp 分割
+- [x] Phase 3: aarch64 クロスビルド + QEMU 確認
+- [ ] Phase 4: FreeBSD（kqueue + capsicum + jail）
+- [ ] Phase 5: OpenBSD（pledge + unveil）
+- [ ] Phase 6: packaging
+- [ ] Phase 7: 最終検証・ドキュメント
+
+## Phase 3 の知見（QEMU user-mode 検証）
+
+- **qemu-aarch64（user-mode）は io_uring 系 syscall（425-427）未実装（ENOSYS）**。
+  QEMU での動作確認は `--features full,epoll`（epoll バックエンド）ビルドで行う。
+  実 aarch64 ハードウェアではデフォルト（io_uring）ビルドをそのまま使える。
+- **コンテナ seccomp プロファイルは QEMU ではエミュレータ自身を制限する**ため、
+  veil 用最小 allowlist だと qemu 必須 syscall（membarrier 等）まで塞ぎ即 abort。
+  QEMU 実行時は Docker デフォルトプロファイルを使い、カスタムプロファイル
+  （`SCMP_ARCH_AARCH64` 宣言を追加済み）は実 aarch64 ホスト用とする。
+- アプリ内 seccomp/Landlock も qemu が該当 syscall をエミュレートしないため適用不可
+  （QEMU 検証時は無効化 or `allow_security_failures = true`）。
+- **E2E 実測（QEMU user-mode、glibc-aarch64/musl-aarch64 コンテナ）**: フル E2E 約 90 秒で
+  **530/531 通過**。`test_concurrent_connection_stress`（200 並行 TLS・5s タイムアウト）のみ
+  エミュレーションのスループット不足で恒常失敗するため QEMU 合格基準から除外
+  （ネイティブ x86_64 epoll ビルドは同テスト含め 531/531）。単体直接実行
+  （`qemu-aarch64-static veil-musl-aarch64 --config ...`）でも HTTPS 200 を確認。
+- musl-aarch64 イメージは `docker build --platform linux/arm64` でビルドすること
+  （イメージメタデータを arm64 で記録するため。Dockerfile 内コメント参照）。
+- messense/rust-musl-cross:aarch64-musl は同梱 rustc 1.88 が wasmtime の MSRV(1.89) を
+  満たさず、`rustup update stable` もイメージ側の docs 削除で失敗するため、
+  バージョン固定 `rustup toolchain install 1.89.0` を並置。aws-lc-sys の bindgen には
+  `BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_musl` でクロス sysroot 指定が必須。
 
 ## Phase 2 で発見・修正したバグ
 
@@ -58,8 +86,3 @@ readiness モデル移行で顕在化した 4 件（レビュー・E2E デバッ
    同期 `TypedFunc::call` を使用しており "must use call_async with async stores" panic で
    tick スレッドが死亡、取得済み pending HTTP コールが失われる。uring ではインライン解決が
    常に先行するため潜在化していたが、epoll のタイミングで顕在化。`call_async` へ修正。
-- [ ] Phase 3: aarch64 クロスビルド + QEMU 確認
-- [ ] Phase 4: FreeBSD（kqueue + capsicum + jail）
-- [ ] Phase 5: OpenBSD（pledge + unveil）
-- [ ] Phase 6: packaging
-- [ ] Phase 7: 最終検証・ドキュメント

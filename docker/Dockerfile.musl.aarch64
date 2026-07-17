@@ -1,0 +1,158 @@
+# syntax=docker/dockerfile:1
+# musl 向け aarch64 クロスビルド + scratch ランタイム
+#
+# F-120 Phase 3: Dockerfile.musl をベースに aarch64-unknown-linux-musl 向けの
+# クロスコンパイル差分のみを適用したもの。ベースイメージを
+# messense/rust-musl-cross:x86_64-musl から同シリーズの aarch64-musl タグへ
+# 差し替える（aarch64 用クロス gcc/musl ツールチェーンと
+# `.cargo/config.toml` の linker 設定が同梱済みで、`CARGO_BUILD_TARGET` の
+# デフォルトも aarch64-unknown-linux-musl になっている）。
+#
+# Dockerfile.musl との主な差分:
+#   - ベースイメージを messense/rust-musl-cross:aarch64-musl に変更
+#   - RUST_TARGET のデフォルトを aarch64-unknown-linux-musl に変更
+#   - builder ステージの `cargo test --lib`（テスト実行）を省略する
+#     （理由: aarch64 バイナリは x86_64 ビルダー上で実行できないため。
+#     x86_64 ビルド（Dockerfile.musl）側で同一ソースのテストが実行されている）。
+#     cacher ステージの `cargo test --bins --no-run --target ...` は
+#     コンパイルのみ（実行なし）であり、aarch64-musl イメージ同梱の
+#     クロスリンカで正しくリンクできるため、依存キャッシュ用途としてそのまま流用する。
+#   - ランタイムステージのベースイメージ（scratch）はアーキテクチャ非依存の
+#     空イメージのため `--platform` 指定は不要（バイナリ自体が aarch64 ELF）。
+
+# ==========================================
+# 1. 最小設定ファイルやツールを用意する共通ステージ
+# ==========================================
+# ビルダーは x86_64 ホストで実行する（--platform linux/arm64 での docker build 時にも
+# arm64 変種を pull しに行かないよう明示的に amd64 を指定する）
+FROM --platform=linux/amd64 messense/rust-musl-cross:aarch64-musl AS tool-builder
+
+WORKDIR /app
+
+# イメージ同梱の rustc が古い場合に備えて新しいツールチェーンを導入する
+# （aarch64-musl タグ同梱の rustc 1.88.0 では wasmtime/cranelift 系依存
+# （requires rustc 1.89.0）がビルドできないため）。
+# `rustup update stable` はイメージ側で docs を削って配布している既存 stable の
+# コンポーネント削除に失敗する（"failure removing component 'clippy-preview...'"）ため、
+# 既存 stable には触れずバージョン固定の新規ツールチェーンを並置してデフォルト化する。
+RUN rustup toolchain install 1.89.0 --profile minimal \
+    && rustup default 1.89.0 \
+    && rustup target add aarch64-unknown-linux-musl
+
+# aws-lc-sys（rustls/quiche の AWS-LC）はビルド時に bindgen（libclang）で
+# バインディングを生成する。ホスト clang は aarch64-musl のヘッダ位置を知らないため、
+# クロス sysroot（イメージ同梱の musl ツールチェーン）を明示しないと
+# 「bits/libc-header-start.h が見つからない」でビルドに失敗する。
+ENV BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_musl="--sysroot=/usr/local/musl/aarch64-unknown-linux-musl -isystem /usr/local/musl/aarch64-unknown-linux-musl/include"
+
+# 依存パッケージのインストール
+RUN apt-get update -y \
+    && apt-get install -y --no-install-recommends \
+        nasm \
+        cmake \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# 最小設定ファイルとキャッシュディレクトリのオンデマンド生成
+RUN mkdir -p /etc_minimal/etc \
+    && echo "root:x:0:0:root:/root:/sbin/nologin" > /etc_minimal/etc/passwd \
+    && echo "nonroot:x:65532:65532:nonroot:/home/nonroot:/sbin/nologin" >> /etc_minimal/etc/passwd \
+    && echo "root:x:0:" > /etc_minimal/etc/group \
+    && echo "nonroot:x:65532:" >> /etc_minimal/etc/group \
+    && printf 'passwd: files\ngroup: files\nhosts: files dns\n' > /etc_minimal/etc/nsswitch.conf \
+    && echo "multi on" > /etc_minimal/etc/host.conf \
+    && echo "127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback" > /etc_minimal/etc/hosts \
+    && mkdir -p /var/cache/veil /var/tmp/veil
+
+# ==========================================
+# 2. 依存ライブラリの事前ビルドステージ
+# ==========================================
+FROM tool-builder AS cacher
+
+ARG CARGO_FEATURES=full
+ARG RUST_TARGET=aarch64-unknown-linux-musl
+
+# Cargo.toml と Cargo.lock、および fuzz ワークスペースメンバのマニフェストを先にコピー
+# （[workspace] members = [".", "fuzz"] のため、fuzz/Cargo.toml が無いとワークスペース解決に失敗する）
+COPY Cargo.toml Cargo.lock /app/
+COPY .cargo/config.toml /app/.cargo/config.toml
+COPY build.rs /app/build.rs
+COPY fuzz/Cargo.toml /app/fuzz/Cargo.toml
+
+# 空の main.rs を作り、依存関係「だけ」を先にコンパイルしてキャッシュ化する
+# fuzz メンバはワークスペース解決のためにスタブのターゲットだけ用意し、本体はビルドしない
+RUN mkdir src benches \
+    && echo "fn main() {}" > src/main.rs \
+    # 本クレートは lib + bin 構成（src/lib.rs）。--bins ビルドでも lib ターゲットが
+    # コンパイルされるため、依存キャッシュ段では空の lib スタブが必要。
+    && echo "" > src/lib.rs \
+    # Cargo.toml から name = "xxx"（ベンチマーク名）を抽出して、自動的にダミーファイルを一括作成
+    && awk -F'"' '/^\[\[bench\]\]/{p=1} p && /name =/{print $2; p=0}' Cargo.toml \
+       | xargs -I {} touch benches/{}.rs \
+    # fuzz/Cargo.toml の [[bin]] path = "..." を抽出し、スタブソースを生成
+    && awk -F'"' '/^path =/{print $2}' fuzz/Cargo.toml \
+       | while read -r p; do mkdir -p "fuzz/$(dirname "$p")" && echo "fn main() {}" > "fuzz/$p"; done \
+    # --no-run はコンパイルのみで実行しない。aarch64-musl クロスリンカでリンクできる
+    # ため依存キャッシュ用途としてそのまま実施する（x86_64 版と同一手順）。
+    && cargo test --bins --no-run --target "${RUST_TARGET}" --features "${CARGO_FEATURES}" --locked \
+    && cargo build --release --target "${RUST_TARGET}" --features "${CARGO_FEATURES}" --locked \
+    && rm -rf src/
+
+
+# ==========================================
+# 3. アプリケーションコードのビルドステージ
+# ==========================================
+FROM tool-builder AS builder
+
+ARG CARGO_FEATURES=full
+ARG RUST_TARGET=aarch64-unknown-linux-musl
+
+# cacher ステージから「ビルド済みの依存関係アセット（target/）」をコピー
+COPY --from=cacher /root/.cargo /root/.cargo
+COPY --from=cacher /app/target /app/target
+COPY --from=cacher /app/benches /app/benches
+COPY Cargo.toml Cargo.lock /app/
+COPY .cargo/config.toml /app/.cargo/config.toml
+COPY build.rs /app/build.rs
+
+# ソースコードをコピー
+COPY . /app
+
+# ビルド（aarch64 バイナリは x86_64 ビルダー上で実行できないため、ユニットテストは
+# 実行しない。x86_64 ビルド（Dockerfile.musl）側で同一ソースのテストが実行されている）。
+#
+# cacher 段はスタブの src/main.rs / src/lib.rs で release プロファイルの成果物をキャッシュする。
+# 実ソースへ差し替えた後は全 .rs の mtime を更新して cargo に再コンパイルを強制する
+# （main.rs だけ touch すると lib のスタブ成果物が最新と誤判定され veil::run 未定義になる）。
+RUN find src -name '*.rs' -exec touch {} + \
+    && cargo build --release --target "${RUST_TARGET}" --features "${CARGO_FEATURES}" --locked
+
+
+# ==========================================
+# 4. 最終実行用ランタイム（scratch、arm64）
+# ==========================================
+# イメージのアーキテクチャメタデータは `docker build --platform linux/arm64` で
+# arm64 として記録する（README 参照。付けないとビルドホストの amd64 で記録され、
+# `docker run --platform linux/arm64` がローカルイメージを解決できない）。
+FROM scratch AS runtime
+
+ARG RUST_TARGET=aarch64-unknown-linux-musl
+
+# ユーザー・グループ情報・ドメイン名でのネットワーク解決（DNS）を安定させるための設定ファイル
+COPY --from=builder /etc_minimal/etc/. /etc/
+
+# TLS通信用のCAルート証明書
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
+# ディスク書き込みが発生するディレクトリの構造と所有権の持込
+COPY --from=builder --chown=65532:65532 /var/cache/veil /var/cache/veil
+COPY --from=builder --chown=65532:65532 /var/tmp/veil /var/tmp/veil
+
+# アプリケーションバイナリと設定アセット
+COPY --from=builder /app/target/${RUST_TARGET}/release/veil /veil
+COPY --from=builder /app/docker/assets/conf.d/config.toml /etc/veil/conf.d/config.toml
+COPY --from=builder /app/docker/assets/www/index.html /var/www/index.html
+
+EXPOSE 80/tcp 443/tcp
+
+CMD ["/veil", "-c", "/etc/veil/conf.d/config.toml"]
