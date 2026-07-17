@@ -34,7 +34,7 @@ epoll 系 syscall を許可しない（最小権限）。
 ## 進捗
 
 - [x] 設計ドキュメント
-- [ ] Phase 1: runtime uring 分離（無挙動変更）
+- [x] Phase 1: runtime uring 分離（無挙動変更）
 - [ ] Phase 2: epoll バックエンド + seccomp 分割
 - [ ] Phase 3: aarch64 クロスビルド + QEMU 確認
 - [ ] Phase 4: FreeBSD（kqueue + capsicum + jail）

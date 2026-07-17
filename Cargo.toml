@@ -46,6 +46,14 @@ http2 = []
 # build.rs が libssl をリンクするため dep:aws-lc-sys が必要。
 http3 = ["dep:quiche", "dep:aws-lc-sys"]
 
+# epoll ベースの readiness ランタイム（F-120 クロスプラットフォーム対応）
+# デフォルトの io_uring 完了ベースランタイムの代わりに epoll ベースの
+# reactor ランタイムを使う。Linux 専用（非 Linux では指定不要・
+# 自動で kqueue ベースの reactor が選択される。build.rs 参照）。
+# デフォルト機能構成は変更しない（default はこの feature を含まない）。
+# ビルド方法: cargo build --features epoll
+epoll = []
+
 # WASM Extension サポート (Proxy-Wasm v0.2.1)
 # Wasmtime ランタイムによる WebAssembly フィルタ
 # AOT コンパイル、Pooling Allocator、InstancePre 使用

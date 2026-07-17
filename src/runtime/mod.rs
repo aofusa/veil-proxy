@@ -13,26 +13,40 @@
 //!
 //! ## モジュール構成
 //!
-//! - `ring` - io_uring リング管理（setup/enter/register、SQE/CQE raw 操作）
-//! - `executor` - シングルスレッド非同期エグゼキュータ
-//! - `tcp` - 非同期 TcpListener/TcpStream
-//! - `timer` - タイムアウト管理
-//! - `buf` - IoBuf/IoBufMut トレイト
+//! - `buf` - IoBuf/IoBufMut トレイト（バックエンド共有）
+//! - `io` - I/O トレイト・File（バックエンド共有）
+//! - `offload` - ブロッキング処理のワーカースレッド退避（バックエンド共有）
+//! - `uring` - io_uring バックエンド（`veil_rt_uring`）:
+//!   - `ring` - io_uring リング管理（setup/enter/register、SQE/CQE raw 操作）
+//!   - `executor` - シングルスレッド非同期エグゼキュータ
+//!   - `tcp` - 非同期 TcpListener/TcpStream
+//!   - `timer` - タイムアウト管理
+//!   - `splice` - splice(2) 経由のゼロコピー転送
+//!
+//! バックエンドの選択は build.rs が発行する cfg（`veil_rt_uring` /
+//! `veil_rt_reactor`）で行い、`runtime::tcp` 等の公開パスはどちらの
+//! バックエンドでも不変に保つ（F-120 Phase 1。reactor バックエンドは
+//! 未実装で今後追加予定）。
 
 pub mod buf;
-pub mod executor;
 pub mod io;
 pub mod offload;
-pub mod ring;
-pub mod splice;
-pub mod tcp;
-pub mod timer;
+
+#[cfg(veil_rt_uring)]
+mod uring;
+
+#[cfg(veil_rt_uring)]
+pub use uring::{executor, ring, splice, tcp, timer};
 
 // 公開 API の再エクスポート
 pub use buf::{IoBuf, IoBufMut};
+#[cfg(veil_rt_uring)]
 pub use executor::{spawn, yield_now, Executor, TaskPool};
+#[cfg(veil_rt_uring)]
 pub use ring::IoUring;
+#[cfg(veil_rt_uring)]
 pub use tcp::{TcpListener, TcpStream};
+#[cfg(veil_rt_uring)]
 pub use timer::{sleep, timeout, Elapsed};
 
 use std::future::Future;
@@ -94,6 +108,20 @@ where
 
 /// 設定付きでランタイムを初期化して Future を実行する
 pub fn block_on_with_config<F, R>(future: F, config: &RuntimeConfig) -> R
+where
+    F: Future<Output = R> + 'static,
+    R: 'static,
+{
+    block_on_with_config_backend(future, config)
+}
+
+/// バックエンド依存の `block_on_with_config` 実装（io_uring 版）。
+///
+/// `ring::IORING_SETUP_SQPOLL` 等、io_uring 固有のセットアップはここに閉じ込め、
+/// reactor バックエンド追加時（Phase 2）はここに同名の reactor 版を追加する
+/// （`config.ring_entries` / `config.sqpoll` は reactor では無視する契約）。
+#[cfg(veil_rt_uring)]
+fn block_on_with_config_backend<F, R>(future: F, config: &RuntimeConfig) -> R
 where
     F: Future<Output = R> + 'static,
     R: 'static,
