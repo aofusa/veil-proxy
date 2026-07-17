@@ -35,7 +35,29 @@ epoll 系 syscall を許可しない（最小権限）。
 
 - [x] 設計ドキュメント
 - [x] Phase 1: runtime uring 分離（無挙動変更）
-- [ ] Phase 2: epoll バックエンド + seccomp 分割
+- [x] Phase 2: epoll バックエンド + seccomp 分割
+
+## Phase 2 で発見・修正したバグ
+
+readiness モデル移行で顕在化した 4 件（レビュー・E2E デバッグで検出、いずれも修正済み）:
+
+1. **EPOLLONESHOT の ADD/MOD 判定**: oneshot 発火は interest を無効化するだけで監視対象
+   リストから fd を除去しない。`armed == 0` を ADD/MOD 判定に使うと EEXIST → 再武装不能で
+   accept ループがハング。`known_to_kernel` フラグで判定（実装エージェントが検出・修正）。
+2. **Connect の spurious wake 誤判定**: `timeout(CONNECT_TIMEOUT, connect)` はタイマー起床でも
+   内側 Future を再 poll する。登録済み＝起床＝完了と見なして SO_ERROR（未完了時は 0）だけを
+   見ると **未接続ソケットを接続成功として返す**。POLLOUT 確認後に SO_ERROR を読むよう修正
+   （レビューで検出）。
+3. **offload 共有 eventfd の通知横取り**: eventfd カウンタは全 completions 合算の 1 本の
+   レベル信号のため、あるタスクの try-first drain が他タスク宛てシグナルを消費すると、
+   EPOLLONESHOT イベントは epoll_wait 時点のレベル再評価で蒸発し、待機タスクは done=true
+   でも永久に起床しない（io_uring は POLL_ADD 完了が write 時点で CQE 記録されるため免疫）。
+   done 検査つき専用 Future（`OffloadWait`）+ drain 者による `wake_all_readers` 再配布で修正
+   （E2E `test_f62_wasm_http_call_concurrent_requests` のハングをトレースで特定）。
+4. **wasm tick スレッドの wasmtime API 誤用（既存バグ）**: async store（fuel_async_yield）に
+   同期 `TypedFunc::call` を使用しており "must use call_async with async stores" panic で
+   tick スレッドが死亡、取得済み pending HTTP コールが失われる。uring ではインライン解決が
+   常に先行するため潜在化していたが、epoll のタイミングで顕在化。`call_async` へ修正。
 - [ ] Phase 3: aarch64 クロスビルド + QEMU 確認
 - [ ] Phase 4: FreeBSD（kqueue + capsicum + jail）
 - [ ] Phase 5: OpenBSD（pledge + unveil）

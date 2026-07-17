@@ -19,6 +19,10 @@ io_uringはdockerではデフォルトで禁止されている。そのため [s
 > 許可しないと HTTP/3 の送受信が EPERM で全滅する（defaultAction=ERRNO のため無音で失敗する）
 > ので注意。
 
+`--features epoll`（reactor バックエンド、F-120 Phase 2）でビルドしたイメージには io_uring
+系 3 syscall を含まない [seccomp-epoll.json](./assets/security/seccomp-epoll.json) を使う
+（`--security-opt seccomp=./assets/security/seccomp-epoll.json`）。
+
 テスト実行
 ```sh
 # 自己署名証明書を作成

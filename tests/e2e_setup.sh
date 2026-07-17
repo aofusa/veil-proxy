@@ -106,15 +106,18 @@ wait_for_binary_ready() {
 }
 
 # E2E に必要な全バイナリをビルドし、完了を確認してから次フェーズへ進む
-# features: full（全機能有効）
+# features: full（全機能有効）。VEIL_E2E_FEATURES 環境変数で上書き可能
+# （F-120 Phase 2: reactor（epoll）バックエンドの E2E 検証を
+# `VEIL_E2E_FEATURES="full,epoll" ./tests/e2e_setup.sh test` で実行するため）。
+VEIL_E2E_FEATURES="${VEIL_E2E_FEATURES:-full}"
 ensure_veil_binary() {
     local grpc_bin="${SCRIPT_DIR}/grpc_server/target/debug/grpc-server"
     local backends_bin="${SCRIPT_DIR}/test_backends/target/debug/test-backends"
 
-    log_info "Building all E2E binaries (veil + grpc-server + test-backends) with features full..."
+    log_info "Building all E2E binaries (veil + grpc-server + test-backends) with features ${VEIL_E2E_FEATURES}..."
     cd "$PROJECT_DIR"
-    if ! cargo build --features 'full'; then
-        log_error "cargo build --features full failed"
+    if ! cargo build --features "${VEIL_E2E_FEATURES}"; then
+        log_error "cargo build --features ${VEIL_E2E_FEATURES} failed"
         exit 1
     fi
     if ! (cd "${SCRIPT_DIR}/grpc_server" && cargo build --quiet); then
@@ -1991,15 +1994,15 @@ run_tests() {
     # デバッグ: 実際に実行されるコマンドを確認
     if [ -n "${TEST_FILTER:-}" ]; then
         log_info "Running filtered tests: ${TEST_FILTER}"
-        log_info "Command: cargo test --test e2e_tests --features 'full' -- ${TEST_FILTER} --test-threads=${TEST_THREADS} --nocapture"
-        
+        log_info "Command: cargo test --test e2e_tests --features '${VEIL_E2E_FEATURES}' -- ${TEST_FILTER} --test-threads=${TEST_THREADS} --nocapture"
+
         # テスト実行
-        cargo test --test e2e_tests --features 'full' -- "${TEST_FILTER}" --test-threads=${TEST_THREADS} --nocapture
+        cargo test --test e2e_tests --features "${VEIL_E2E_FEATURES}" -- "${TEST_FILTER}" --test-threads=${TEST_THREADS} --nocapture
     else
-        log_info "Command: cargo test --test e2e_tests --features 'full' -- --test-threads=${TEST_THREADS}"
-        
+        log_info "Command: cargo test --test e2e_tests --features '${VEIL_E2E_FEATURES}' -- --test-threads=${TEST_THREADS}"
+
         # テスト実行
-        cargo test --test e2e_tests --features 'full' -- --test-threads=${TEST_THREADS}
+        cargo test --test e2e_tests --features "${VEIL_E2E_FEATURES}" -- --test-threads=${TEST_THREADS}
     fi
     
     log_info "E2E tests completed"

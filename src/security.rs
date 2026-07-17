@@ -125,11 +125,18 @@ sched_getaffinity
 # prctl, ioctl, getrandom, fcntl
 "#;
 
-/// 許可するシステムコールのリスト (x86_64)
+/// 許可するシステムコールのリスト (x86_64、io_uring バックエンド)
 ///
 /// 最小限のシステムコールのみを含みます。
 /// fork, execve, wait4 等の外部プロセス管理は不要なため除外。
-#[cfg(target_arch = "x86_64")]
+///
+/// F-120 Phase 2: バックエンド別に許可リストを分割する（最小権限の原則）。
+/// io_uring バックエンドは epoll 系 syscall を一切使わない（データプレーンの
+/// readiness 待機は `IORING_OP_POLL_ADD` で完結する）ことを、
+/// `strace -f -e trace=epoll_create1,epoll_ctl,epoll_wait,epoll_pwait` で
+/// デフォルトビルド起動時に確認した上で除外している
+/// （`docs/backlog/features/F-120-cross-platform-epoll-kqueue-bsd.md` 参照）。
+#[cfg(all(target_arch = "x86_64", veil_rt_uring))]
 pub const ALLOWED_SYSCALLS: &[i64] = &[
     // ============================================
     // io_uring 関連（カスタム io_uring ランタイム必須）
@@ -255,9 +262,149 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     302, // prlimit64
     318, // getrandom (TLS 乱数生成)
     // ============================================
-    // epoll (io_uring 非対応環境のフォールバック・補助 I/O)
+    // ログファイル操作
     // ============================================
-    213, // epoll_create (レガシー)
+    74,  // fsync
+    75,  // fdatasync
+    77,  // ftruncate
+    285, // fallocate
+    // ============================================
+    // イベント・タイマー（io_uring ランタイム・offload 必須）
+    // ============================================
+    283, // timerfd_create (未使用だが将来のタイマー機構用に予約)
+    286, // timerfd_settime
+    287, // timerfd_gettime
+    290, // eventfd2 (io_uring イベント通知)
+    293, // pipe2 (内部通信)
+];
+
+/// 許可するシステムコールのリスト (x86_64、reactor/epoll バックエンド、`--features epoll`)
+///
+/// io_uring 系 3 syscall（io_uring_setup/enter/register）を除外し、epoll 系
+/// （epoll_create1/epoll_ctl/epoll_wait/epoll_pwait）を許可する。それ以外は
+/// io_uring バックエンドと共通（ネットワーク・ファイル I/O・メモリ管理等）。
+#[cfg(all(target_arch = "x86_64", veil_rt_reactor))]
+pub const ALLOWED_SYSCALLS: &[i64] = &[
+    // ============================================
+    // ファイル I/O（設定、証明書、ログ）
+    // ============================================
+    0,   // read
+    1,   // write
+    2, // open (musl の canonicalize/ファイルオープンが openat でなく open を使用。未許可だと static 配信が 404 になる)
+    3, // close
+    4, // stat (DNS解決: /etc/resolv.conf等)
+    5, // fstat
+    6, // lstat (DNS解決: シンボリックリンク確認)
+    8, // lseek
+    17, // pread64
+    18, // pwrite64
+    19, // readv
+    20, // writev
+    21, // access (DNS解決: ファイルアクセス権確認)
+    40, // sendfile (kTLS ゼロコピー転送)
+    72, // fcntl
+    79, // getcwd (canonicalize() で使用)
+    89, // readlink (canonicalize() で使用)
+    257, // openat
+    262, // newfstatat
+    269, // faccessat (新しめの libc がファイルアクセス確認で使用)
+    275, // splice (kTLS ゼロコピー転送、reactor の非ブロッキング splice(2) 転送)
+    332, // statx (非同期ファイル I/O offload で使用)
+    439, // faccessat2 (glibc 2.33+/musl のファイル存在・権限確認。未許可だと静的配信が 404 になる)
+    // ============================================
+    // DNS名前解決 (getaddrinfo)
+    // ============================================
+    7,  // poll (DNS応答待機 + reactor の readiness try-first チェック)
+    53, // socketpair (NSS内部通信)
+    // ============================================
+    // ネットワーク（TCP/UDP ソケット）
+    // ============================================
+    41,  // socket
+    42,  // connect
+    43,  // accept
+    44,  // sendto
+    45,  // recvfrom
+    46,  // sendmsg
+    47,  // recvmsg
+    48,  // shutdown
+    49,  // bind
+    50,  // listen
+    51,  // getsockname
+    52,  // getpeername
+    54,  // setsockopt
+    55,  // getsockopt
+    288, // accept4
+    299, // recvmmsg (DNS解決 + HTTP/3 データグラム一括受信: F-115)
+    307, // sendmmsg (DNS解決 + HTTP/3 データグラム一括送信: F-115)
+    // ============================================
+    // メモリ管理（mimalloc、Huge Pages）
+    // ============================================
+    9,   // mmap
+    10,  // mprotect
+    11,  // munmap
+    12,  // brk
+    25,  // mremap (mimalloc)
+    28,  // madvise (mimalloc)
+    149, // mlock
+    150, // munlock
+    151, // mlockall
+    152, // munlockall
+    325, // mlock2
+    319, // memfd_create (HTTP/3 TLS証明書のLandlock対応用)
+    // ============================================
+    // スレッド・プロセス管理
+    // ============================================
+    24,  // sched_yield (スレッドスケジューリング)
+    56,  // clone (スレッド作成)
+    60,  // exit
+    186, // gettid
+    202, // futex (同期プリミティブ)
+    203, // sched_setaffinity (CPUピンニング)
+    204, // sched_getaffinity
+    218, // set_tid_address
+    231, // exit_group
+    234, // tgkill
+    273, // set_robust_list
+    309, // getcpu
+    334, // rseq (Restartable Sequences)
+    435, // clone3
+    // ============================================
+    // シグナル処理（Graceful Shutdown、Hot Reload）
+    // ============================================
+    13,  // rt_sigaction
+    14,  // rt_sigprocmask
+    15,  // rt_sigreturn
+    131, // sigaltstack
+    // ============================================
+    // ユーザー・権限管理（権限降格用）
+    // ============================================
+    102, // getuid
+    104, // getgid
+    105, // setuid
+    106, // setgid
+    107, // geteuid
+    108, // getegid
+    110, // getppid
+    116, // setgroups
+    // ============================================
+    // 時間・タイマー
+    // ============================================
+    35,  // nanosleep
+    228, // clock_gettime
+    230, // clock_nanosleep
+    // ============================================
+    // その他必須
+    // ============================================
+    16,  // ioctl (ソケット、kTLS 設定)
+    39,  // getpid
+    63,  // uname (カーネルバージョン検出)
+    147, // prctl (PR_SET_NAME、seccomp)
+    158, // arch_prctl
+    302, // prlimit64
+    318, // getrandom (TLS 乱数生成)
+    // ============================================
+    // epoll（reactor バックエンドの readiness ランタイム本体）
+    // ============================================
     232, // epoll_wait
     233, // epoll_ctl
     281, // epoll_pwait
@@ -270,17 +417,14 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     77,  // ftruncate
     285, // fallocate
     // ============================================
-    // イベント・タイマー（io_uring ランタイム・offload 必須）
+    // イベント（offload 完了通知）
     // ============================================
-    283, // timerfd_create (ランタイムのタイマー機構で使用)
-    286, // timerfd_settime
-    287, // timerfd_gettime
-    290, // eventfd2 (io_uring イベント通知)
-    293, // pipe2 (内部通信)
+    290, // eventfd2 (offload 完了通知。両バックエンド共通)
+    293, // pipe2 (内部通信、splice 中継パイプ)
 ];
 
-/// 許可するシステムコールのリスト (aarch64)
-#[cfg(target_arch = "aarch64")]
+/// 許可するシステムコールのリスト (aarch64、io_uring バックエンド)
+#[cfg(all(target_arch = "aarch64", veil_rt_uring))]
 pub const ALLOWED_SYSCALLS: &[i64] = &[
     // ============================================
     // io_uring 関連（カスタム io_uring ランタイム必須）
@@ -397,7 +541,138 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     261, // prlimit64
     278, // getrandom
     // ============================================
-    // epoll
+    // ログファイル操作
+    // ============================================
+    82, // fsync
+    83, // fdatasync
+    46, // ftruncate
+    47, // fallocate
+    // ============================================
+    // イベント・タイマー（io_uring ランタイム・offload 必須）
+    // ============================================
+    85, // timerfd_create (未使用だが将来のタイマー機構用に予約)
+    86, // timerfd_settime
+    87, // timerfd_gettime
+    19, // eventfd2 (io_uring イベント通知)
+    59, // pipe2 (内部通信)
+];
+
+/// 許可するシステムコールのリスト (aarch64、reactor/epoll バックエンド、`--features epoll`)
+///
+/// io_uring 系 3 syscall を除外し、epoll 系（epoll_create1/epoll_ctl/epoll_pwait）を許可する。
+/// それ以外は io_uring バックエンドと共通。
+#[cfg(all(target_arch = "aarch64", veil_rt_reactor))]
+pub const ALLOWED_SYSCALLS: &[i64] = &[
+    // ============================================
+    // ファイル I/O
+    // ============================================
+    17,  // getcwd (canonicalize() で使用)
+    48,  // faccessat (DNS解決: ファイルアクセス権確認)
+    56,  // openat
+    57,  // close
+    62,  // lseek
+    63,  // read
+    64,  // write
+    65,  // readv
+    66,  // writev
+    67,  // pread64
+    68,  // pwrite64
+    71,  // sendfile (kTLS ゼロコピー転送)
+    73,  // ppoll (DNS応答待機 + reactor の readiness try-first チェック)
+    76,  // splice (kTLS ゼロコピー転送、reactor の非ブロッキング splice(2) 転送)
+    78,  // readlinkat (canonicalize() で使用)
+    79,  // fstatat
+    80,  // fstat
+    291, // statx (非同期ファイル I/O offload で使用)
+    439, // faccessat2 (glibc 2.33+/musl のファイル存在・権限確認。未許可だと静的配信が 404 になる)
+    199, // socketpair (NSS内部通信)
+    // ============================================
+    // ネットワーク
+    // ============================================
+    198, // socket
+    200, // bind
+    201, // listen
+    202, // accept
+    203, // connect
+    204, // getsockname
+    205, // getpeername
+    206, // sendto
+    207, // recvfrom
+    208, // setsockopt
+    209, // getsockopt
+    210, // shutdown
+    211, // sendmsg
+    212, // recvmsg
+    242, // accept4
+    243, // recvmmsg (DNS解決 + HTTP/3 データグラム一括受信: F-115)
+    269, // sendmmsg (DNS解決 + HTTP/3 データグラム一括送信: F-115)
+    // ============================================
+    // メモリ管理
+    // ============================================
+    214, // brk
+    215, // munmap
+    222, // mmap
+    226, // mprotect
+    227, // mremap
+    233, // madvise
+    228, // mlock
+    229, // munlock
+    230, // mlockall
+    231, // munlockall
+    279, // memfd_create (HTTP/3 TLS証明書のLandlock対応用)
+    // ============================================
+    // スレッド・プロセス管理
+    // ============================================
+    93,  // exit
+    94,  // exit_group
+    96,  // set_tid_address
+    98,  // futex
+    99,  // set_robust_list
+    122, // sched_setaffinity
+    123, // sched_getaffinity
+    131, // tgkill
+    178, // gettid
+    220, // clone
+    435, // clone3
+    // ============================================
+    // シグナル処理
+    // ============================================
+    132, // sigaltstack
+    134, // rt_sigaction
+    135, // rt_sigprocmask
+    139, // rt_sigreturn
+    // ============================================
+    // ユーザー・権限管理
+    // ============================================
+    146, // setresuid
+    147, // getresuid
+    148, // setresgid
+    149, // getresgid
+    172, // getpid
+    173, // getppid
+    174, // getuid
+    175, // geteuid
+    176, // getgid
+    177, // getegid
+    159, // setgroups
+    // ============================================
+    // 時間・タイマー
+    // ============================================
+    101, // nanosleep
+    113, // clock_gettime
+    115, // clock_nanosleep
+    // ============================================
+    // その他必須
+    // ============================================
+    25,  // fcntl
+    29,  // ioctl
+    63,  // uname
+    160, // uname (alias)
+    167, // prctl
+    261, // prlimit64
+    278, // getrandom
+    // ============================================
+    // epoll（reactor バックエンドの readiness ランタイム本体）
     // ============================================
     20, // epoll_create1
     21, // epoll_ctl
@@ -410,13 +685,10 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     46, // ftruncate
     47, // fallocate
     // ============================================
-    // イベント・タイマー（io_uring ランタイム・offload 必須）
+    // イベント（offload 完了通知）
     // ============================================
-    85, // timerfd_create (ランタイムのタイマー機構で使用)
-    86, // timerfd_settime
-    87, // timerfd_gettime
-    19, // eventfd2 (io_uring イベント通知)
-    59, // pipe2 (内部通信)
+    19, // eventfd2 (offload 完了通知。両バックエンド共通)
+    59, // pipe2 (内部通信、splice 中継パイプ)
 ];
 
 // ====================
@@ -599,7 +871,11 @@ pub fn apply_security_restrictions(config: &SecurityConfig) -> io::Result<()> {
     //
     // IORING_REGISTER_RESTRICTIONS はリングごとの機構のため、各ワーカースレッドが
     // リング生成時（runtime::executor::init_ring）に PROXY_ALLOWED_OPCODES で適用する。
-    // ここではカーネルサポート状況の報告のみ行う。
+    // ここではカーネルサポート状況の報告のみ行う。reactor（epoll）バックエンドは
+    // io_uring リング自体を持たないため、フラグが立っていても適用対象が無い旨を
+    // 警告する（F-120 Phase 2: バックエンド別 syscall 許可リストは security.rs 内の
+    // ALLOWED_SYSCALLS 側で分割済み）。
+    #[cfg(veil_rt_uring)]
     if config.enable_io_uring_restrictions {
         if kernel.supports_uring_restrictions() {
             info!(
@@ -612,6 +888,13 @@ pub fn apply_security_restrictions(config: &SecurityConfig) -> io::Result<()> {
                 kernel
             );
         }
+    }
+    #[cfg(veil_rt_reactor)]
+    if config.enable_io_uring_restrictions {
+        warn!(
+            "enable_io_uring_restrictions is set but this build uses the reactor (epoll) \
+             runtime backend, which has no io_uring ring to restrict; ignoring"
+        );
     }
 
     // 2. Landlock
@@ -2382,13 +2665,32 @@ mod tests {
 
     #[test]
     fn test_allowed_syscalls_contains_io_uring() {
-        // io_uringシステムコールが含まれている
-        #[cfg(target_arch = "x86_64")]
+        // io_uring バックエンドでは io_uring 系 syscall が含まれ、epoll 系は含まれない
+        // （F-120 Phase 2: 最小権限のためバックエンド別に分割済み）。
+        #[cfg(all(target_arch = "x86_64", veil_rt_uring))]
         {
             assert!(ALLOWED_SYSCALLS.contains(&425)); // io_uring_setup
             assert!(ALLOWED_SYSCALLS.contains(&426)); // io_uring_enter
             assert!(ALLOWED_SYSCALLS.contains(&427)); // io_uring_register
+            assert!(!ALLOWED_SYSCALLS.contains(&291)); // epoll_create1 は不要
+            assert!(!ALLOWED_SYSCALLS.contains(&232)); // epoll_wait は不要
         }
+    }
+
+    /// reactor（epoll）バックエンドでは epoll 系 syscall が含まれ、io_uring 系は
+    /// 含まれないこと（F-120 Phase 2）。
+    #[test]
+    #[cfg(all(target_arch = "x86_64", veil_rt_reactor))]
+    fn test_allowed_syscalls_reactor_contains_epoll_not_io_uring() {
+        assert!(ALLOWED_SYSCALLS.contains(&291)); // epoll_create1
+        assert!(ALLOWED_SYSCALLS.contains(&232)); // epoll_wait
+        assert!(ALLOWED_SYSCALLS.contains(&233)); // epoll_ctl
+        assert!(ALLOWED_SYSCALLS.contains(&281)); // epoll_pwait
+        assert!(!ALLOWED_SYSCALLS.contains(&425)); // io_uring_setup
+        assert!(!ALLOWED_SYSCALLS.contains(&426)); // io_uring_enter
+        assert!(!ALLOWED_SYSCALLS.contains(&427)); // io_uring_register
+                                                   // eventfd2 は offload 用に両バックエンド共通で許可される。
+        assert!(ALLOWED_SYSCALLS.contains(&290));
     }
 
     #[test]
