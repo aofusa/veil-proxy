@@ -104,13 +104,48 @@ cargo build --release --features full
 #   --binary-musl target/x86_64-unknown-linux-musl/release/veil
 ```
 
+### aarch64（arm64）向けパッケージ（F-120 Phase 3/6）
+
+`RUST_TARGET` に aarch64 ターゲットを指定すると、`ARCH` が自動的に `aarch64` へ
+追従し deb は `arm64`・rpm は `aarch64` として出力される。Docker ビルドは
+aarch64 専用 Dockerfile（`docker/Dockerfile.{glibc,musl}.aarch64`）と
+`--platform linux/arm64` を自動選択する。
+
+```bash
+# aarch64 の .deb / .rpm / tar.gz（Docker クロスビルド）
+RUST_TARGET=aarch64-unknown-linux-gnu ./packaging/scripts/build.sh --docker
+```
+
+### FreeBSD / OpenBSD 向けパッケージ（F-120 Phase 6）
+
+FreeBSD/OpenBSD は Rust Tier 2/3 かつクロスビルドが困難なため、バイナリは
+**QEMU VM 内でネイティブビルド**したものを取り出し、専用スクリプトで
+rc.d サービススクリプト・設定リファレンス・（FreeBSD は）jail.conf サンプルを
+同梱した tar.gz を生成する（deb/rpm は Linux 専用のため BSD は tar.gz のみ）。
+
+```bash
+# VM でビルドしたバイナリを host へ持ち出してから:
+./packaging/scripts/build-bsd.sh --os freebsd --arch x86_64 --binary ./veil-freebsd-amd64
+./packaging/scripts/build-bsd.sh --os openbsd --arch x86_64 --binary ./veil-openbsd-amd64
+# aarch64 も --arch aarch64 で対応（VM 内 aarch64 ネイティブビルドが前提）
+```
+
+tar.gz には `veil` バイナリ・`rc.d/veil`（サービススクリプト）・`config.toml.default`・
+`www/index.html`・`INSTALL.txt`（+ FreeBSD は `jail.conf.sample`）を同梱する。
+FreeBSD は capsicum（`[security] enable_capsicum`）・jail と、OpenBSD は
+pledge/unveil（`[security] enable_pledge` / `enable_unveil`）と併用できる。
+> OpenBSD の HTTPS(TLS) は現状 aws-lc-rs の OpenBSD 制約でハンドシェイクが
+> 完了しない（`docs/backlog/features/F-122`）。本番 HTTPS 用途は F-122 解消まで非推奨。
+
 ### 成果物
 
 ```
-packaging/output/veil_<version>_<deb_arch>.deb
-packaging/output/veil-<version>-1.<rpm_arch>.rpm
+packaging/output/veil_<version>_<deb_arch>.deb          # deb_arch: amd64 / arm64
+packaging/output/veil-<version>-1.<rpm_arch>.rpm        # rpm_arch: x86_64 / aarch64
 packaging/output/veil-<version>-x86_64-unknown-linux-gnu.tar.gz
 packaging/output/veil-<version>-x86_64-unknown-linux-musl.tar.gz
+packaging/output/veil-<version>-<arch>-unknown-freebsd.tar.gz   # build-bsd.sh
+packaging/output/veil-<version>-<arch>-unknown-openbsd.tar.gz   # build-bsd.sh
 ```
 
 `<version>` は **`Cargo.toml` の `[package] version` からビルド時に自動取得**され、

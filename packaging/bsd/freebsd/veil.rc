@@ -1,0 +1,51 @@
+#!/bin/sh
+#
+# FreeBSD rc.d サービススクリプト（veil、F-120 Phase 6）
+#
+# インストール:
+#   install -m 0555 veil.rc /usr/local/etc/rc.d/veil
+#   sysrc veil_enable=YES
+#   service veil start
+#
+# 設定ファイル: /usr/local/etc/veil/config.toml（veil_config で変更可）
+#
+# PROVIDE: veil
+# REQUIRE: LOGIN cleanvar
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="veil"
+rcvar="veil_enable"
+
+load_rc_config "$name"
+
+: ${veil_enable:="NO"}
+: ${veil_config:="/usr/local/etc/veil/config.toml"}
+: ${veil_user:="root"}
+
+pidfile="/var/run/${name}.pid"
+command="/usr/sbin/daemon"
+procname="/usr/local/bin/veil"
+command_args="-P ${pidfile} -r -f ${procname} -c ${veil_config}"
+
+# 設定リロード（SIGHUP でホットリロード）
+extra_commands="reload configtest"
+reload_cmd="veil_reload"
+configtest_cmd="veil_configtest"
+
+veil_reload()
+{
+    if [ -f "${pidfile}" ]; then
+        kill -HUP "$(cat "${pidfile}")" && echo "veil: reloaded"
+    else
+        echo "veil: not running"
+    fi
+}
+
+veil_configtest()
+{
+    ${procname} -t -c "${veil_config}"
+}
+
+run_rc_command "$1"

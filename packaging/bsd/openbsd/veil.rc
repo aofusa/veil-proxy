@@ -1,0 +1,34 @@
+#!/bin/ksh
+#
+# OpenBSD rc.d サービススクリプト（veil、F-120 Phase 6）
+#
+# インストール:
+#   install -m 0555 veil.rc /etc/rc.d/veil
+#   rcctl enable veil
+#   rcctl start veil
+#
+# 設定ファイル: /etc/veil/config.toml
+#
+# 注意: veil のアプリ内 pledge/unveil（[security] enable_pledge / enable_unveil）は
+# veil 自身のプロセスを制限する。OpenBSD ネイティブのセキュリティを最大限使うには
+# config.toml で enable_pledge = true / enable_unveil = true を設定すること。
+# TLS（HTTPS）は現状 aws-lc-rs の OpenBSD 制約でハンドシェイクが完了しない
+# （docs/backlog/features/F-122 参照）ため、本番 HTTPS 用途は F-122 解消まで非推奨。
+
+daemon="/usr/local/bin/veil"
+daemon_flags="-c /etc/veil/config.toml"
+daemon_user="root"
+
+. /etc/rc.d/rc.subr
+
+pexp="${daemon}.*"
+
+rc_reload() {
+    pkill -HUP -xf "${daemon} ${daemon_flags}"
+}
+
+rc_check() {
+    pgrep -xf "${daemon} ${daemon_flags}" >/dev/null
+}
+
+rc_cmd $1

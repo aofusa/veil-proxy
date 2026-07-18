@@ -91,6 +91,13 @@ default_musl_target() {
 GNU_TARGET="${RUST_TARGET:-x86_64-unknown-linux-gnu}"
 MUSL_TARGET="$(default_musl_target)"
 
+# ARCH は既定でホスト（uname -m）だが、RUST_TARGET が指定されていればその
+# アーキ接頭辞を優先する（クロスターゲット時に deb_arch/rpm_arch を正しく導出するため。
+# 例: RUST_TARGET=aarch64-unknown-linux-gnu → ARCH=aarch64 → deb=arm64/rpm=aarch64）。
+if [[ -n "${RUST_TARGET:-}" ]]; then
+    ARCH="${RUST_TARGET%%-*}"
+fi
+
 DEB_ARCH="$(deb_arch)"
 RPM_ARCH="$(rpm_arch)"
 DEB_NAME="veil_${VERSION}_${DEB_ARCH}.deb"
@@ -138,15 +145,24 @@ build_binary_glibc_docker() {
     local target="${GNU_TARGET}"
     local libc="${LIBC_VERSION:-.2.28}"
     mkdir -p "${BUILD_DIR}"
-    docker build -f "${ROOT}/docker/Dockerfile.glibc" \
+    # aarch64 ターゲットは専用の cross Dockerfile（F-120 Phase 3）を使う。
+    # ランタイムステージが arm64 イメージのため、docker build にも
+    # --platform linux/arm64 を渡してメタデータを arm64 に揃える。
+    local dockerfile="${ROOT}/docker/Dockerfile.glibc"
+    local platform_arg=()
+    if [[ "${ARCH}" == "aarch64" ]]; then
+        dockerfile="${ROOT}/docker/Dockerfile.glibc.aarch64"
+        platform_arg=(--platform linux/arm64)
+    fi
+    docker build "${platform_arg[@]}" -f "${dockerfile}" \
         --build-arg CARGO_FEATURES="${features}" \
         --build-arg RUST_TARGET="${target}" \
         --build-arg LIBC_VERSION="${libc}" \
-        -t veil:glibc \
+        -t "veil:glibc-${ARCH}" \
         "${ROOT}"
 
     local cid
-    cid=$(docker create veil:glibc)
+    cid=$(docker create "${platform_arg[@]}" "veil:glibc-${ARCH}")
     docker cp "${cid}:/veil" "${BUILD_DIR}/veil-glibc"
     docker rm "${cid}"
 
@@ -159,14 +175,20 @@ build_binary_musl_docker() {
     local features="${CARGO_FEATURES:-full}"
     local target="${MUSL_TARGET}"
     mkdir -p "${BUILD_DIR}"
-    docker build -f "${ROOT}/docker/Dockerfile.musl" \
+    local dockerfile="${ROOT}/docker/Dockerfile.musl"
+    local platform_arg=()
+    if [[ "${ARCH}" == "aarch64" ]]; then
+        dockerfile="${ROOT}/docker/Dockerfile.musl.aarch64"
+        platform_arg=(--platform linux/arm64)
+    fi
+    docker build "${platform_arg[@]}" -f "${dockerfile}" \
         --build-arg CARGO_FEATURES="${features}" \
         --build-arg RUST_TARGET="${target}" \
-        -t veil:musl \
+        -t "veil:musl-${ARCH}" \
         "${ROOT}"
 
     local cid
-    cid=$(docker create veil:musl)
+    cid=$(docker create "${platform_arg[@]}" "veil:musl-${ARCH}")
     docker cp "${cid}:/veil" "${BUILD_DIR}/veil-musl"
     docker rm "${cid}"
 

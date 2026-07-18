@@ -1,0 +1,42 @@
+# FreeBSD jail 設定サンプル（veil、F-120 Phase 6）
+#
+# veil を jail 内で稼働させるための最小サンプル。veil はアプリ内 capsicum
+# （[security] enable_capsicum）と併用でき、jail による名前空間隔離 + capsicum に
+# よる fd 単位の権利制限で多層防御になる。
+#
+# 使い方:
+#   1. jail 用の root を用意（例: bsdinstall jail /jail/veil、または pkg で最小構成）
+#   2. veil バイナリと設定を jail 内へ配置
+#        /jail/veil/usr/local/bin/veil
+#        /jail/veil/usr/local/etc/veil/config.toml
+#   3. 本ファイルを /etc/jail.conf.d/veil.conf として配置し
+#        service jail start veil
+#
+# アプリ内 [security] jail_name = "veil" を設定すると、veil 起動時に
+# jail_attach(2) で当該 jail へ自己アタッチする経路も使える（rc.d 経由で jail 内
+# 起動する場合は不要）。
+
+veil {
+    # jail 名（veil の [security] jail_name と一致させる場合はこの名前を使う）
+    host.hostname = "veil.local";
+
+    # jail ルートディレクトリ
+    path = "/jail/veil";
+
+    # ネットワーク: ホストの IP を共有する場合は ip4/ip6 を指定
+    # （VNET を使う場合は vnet; を有効化し別途 epair/bridge を用意する）
+    ip4.addr = "127.0.0.1";
+    # ip6.addr = "::1";
+
+    # 起動・停止コマンド（rc.d 経由で jail 内の veil を起動）
+    exec.start = "/bin/sh /etc/rc";
+    exec.stop = "/bin/sh /etc/rc.shutdown";
+
+    # 権限・制限
+    allow.raw_sockets = 0;
+    allow.chflags = 0;
+    devfs_ruleset = 4;
+
+    mount.devfs;
+    persist;
+}
