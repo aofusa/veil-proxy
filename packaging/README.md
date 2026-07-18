@@ -126,14 +126,18 @@ rc.d サービススクリプト・設定リファレンス・（FreeBSD は）j
 同梱した tar.gz を生成する（deb/rpm は Linux 専用のため BSD は tar.gz のみ）。
 
 ```bash
-# VM でビルドしたバイナリを host へ持ち出してから:
-./packaging/scripts/build-bsd.sh --os freebsd --arch x86_64 --binary ./veil-freebsd-amd64
-./packaging/scripts/build-bsd.sh --os openbsd --arch x86_64 --binary ./veil-openbsd-amd64
+# VM でビルドしたバイナリを host へ持ち出してから（--os-version でビルド OS バージョンを明記）:
+./packaging/scripts/build-bsd.sh --os freebsd --arch x86_64 --binary ./veil-freebsd-amd64 --os-version 14.3-RELEASE
+./packaging/scripts/build-bsd.sh --os openbsd --arch x86_64 --binary ./veil-openbsd-amd64 --os-version 7.6
 # aarch64 も --arch aarch64 で対応（VM 内 aarch64 ネイティブビルドが前提）
+# 対象 OS の VM 内で直接実行する場合は --os-version 省略で uname -r から自動検出される。
 ```
 
 tar.gz には `veil` バイナリ・`rc.d/veil`（サービススクリプト）・`config.toml.default`・
-`www/index.html`・`INSTALL.txt`（+ FreeBSD は `jail.conf.sample`）を同梱する。
+`www/index.html`・`INSTALL.txt`・`BUILD_INFO.txt`（+ FreeBSD は `jail.conf.sample`）を
+同梱する。`BUILD_INFO.txt` / `INSTALL.txt` には **ビルドした OS のバージョン**
+（例 FreeBSD 14.3-RELEASE / OpenBSD 7.6）・ビルド日時・rustc バージョンを明記する
+（ABI 互換の目安。大きく異なる OS バージョンでは再ビルド推奨）。
 FreeBSD は capsicum（`[security] enable_capsicum`）・jail と、OpenBSD は
 pledge/unveil（`[security] enable_pledge` / `enable_unveil`）と併用できる。
 OpenBSD の TLS は rustls の ring プロバイダを使用し（F-122）、静的配信/プロキシとも

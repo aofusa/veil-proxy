@@ -134,7 +134,7 @@ exec qemu-system-aarch64 \
   -drive if=pflash,format=raw,file=varstore.img \
   -drive if=virtio,format=qcow2,file=vm.img \
   -drive if=virtio,format=raw,file=seed.img \
-  -netdev user,id=net0,hostfwd=tcp::2222-:22 \
+  -netdev user,id=net0,hostfwd=tcp:0.0.0.0:2222-:22 \
   -device virtio-net-pci,netdev=net0,romfile=
 BOOT
 
