@@ -515,6 +515,36 @@ reuseport_balancing = "cbpf"
 # landlock_write_paths = ["/var/log/veil", "/var/cache/veil", "/var/tmp/veil"]
 
 # ============================================
+# capsicum設定 (FreeBSD専用、F-120 Phase 4)
+# ============================================
+#
+# FreeBSD の capability mode + fd 単位の権利制限（Linux の seccomp/Landlock 相当）。
+# 本キーは全 OS で受理されるが、FreeBSD 以外では警告ログのみで無視される。
+#
+# enable_capsicum = true にすると:
+#   - リスナー/接続 fd へ cap_rights_limit(2) で必要最小の権利を適用する
+#     （CAP_ACCEPT/CAP_READ/CAP_WRITE/CAP_EVENT/CAP_SETSOCKOPT/CAP_GETPEERNAME 等）。
+#
+# enable_capsicum = true
+
+# capability mode（cap_enter(2)、不可逆）への降格（FreeBSD専用、オプトイン）。
+# capability mode ではグローバル名前空間操作（bind/connect/パス指定の open 等）が
+# 全面禁止されるため、次をすべて満たす構成でのみ適用される（満たさない場合は
+# 警告ログを出して rights 制限のみに留まる）:
+#   - プロキシ/upstream・L4 リスナーが無い（connect 不要）
+#   - h2c / HTTP/3 / HTTP→HTTPS リダイレクトの追加リスナーが無い
+# 適用タイミングは全ワーカーの listener bind 完了後（bind は capability mode で不可）。
+# 注意: リクエスト時にパス指定 open(2) を行う静的ファイル配信は capability mode では
+# 失敗する（キャッシュ済み応答のみ返せる）。openat(2) 相対化による完全対応は
+# バックログ参照。
+# capsicum_capability_mode = true
+
+# 起動時に attach する jail 名（FreeBSD専用、root 前提）。
+# 未設定なら jail_attach は行わない。失敗時は明確なエラーで起動を中止する。
+# jail.conf / rc.d 連携のサンプルは packaging（F-120 Phase 6）で提供予定。
+# jail_name = "veil-jail"
+
+# ============================================
 # 本番環境向け推奨設定
 # ============================================
 #

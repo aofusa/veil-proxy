@@ -29,7 +29,10 @@
 //! リバースプロキシに必要な最小限のシステムコールのみを許可し、
 //! その他のシステムコールは拒否します。
 
-use ftlog::{debug, info, warn};
+use ftlog::{info, warn};
+// debug は Linux 専用経路（seccomp/Landlock/namespace）でのみ使用する。
+#[cfg(target_os = "linux")]
+use ftlog::debug;
 use std::io;
 
 // ====================
@@ -136,6 +139,8 @@ sched_getaffinity
 /// `strace -f -e trace=epoll_create1,epoll_ctl,epoll_wait,epoll_pwait` で
 /// デフォルトビルド起動時に確認した上で除外している
 /// （`docs/backlog/features/F-120-cross-platform-epoll-kqueue-bsd.md` 参照）。
+// veil_rt_uring は build.rs 上 Linux 限定のため target_os 条件は冗長だが明示しない
+// （cfg エイリアスの単一情報源は build.rs）。
 #[cfg(all(target_arch = "x86_64", veil_rt_uring))]
 pub const ALLOWED_SYSCALLS: &[i64] = &[
     // ============================================
@@ -283,7 +288,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
 /// io_uring 系 3 syscall（io_uring_setup/enter/register）を除外し、epoll 系
 /// （epoll_create1/epoll_ctl/epoll_wait/epoll_pwait）を許可する。それ以外は
 /// io_uring バックエンドと共通（ネットワーク・ファイル I/O・メモリ管理等）。
-#[cfg(all(target_arch = "x86_64", veil_rt_reactor))]
+#[cfg(all(target_arch = "x86_64", veil_rt_reactor, target_os = "linux"))]
 pub const ALLOWED_SYSCALLS: &[i64] = &[
     // ============================================
     // ファイル I/O（設定、証明書、ログ）
@@ -561,7 +566,9 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
 ///
 /// io_uring 系 3 syscall を除外し、epoll 系（epoll_create1/epoll_ctl/epoll_pwait）を許可する。
 /// それ以外は io_uring バックエンドと共通。
-#[cfg(all(target_arch = "aarch64", veil_rt_reactor))]
+// 表は Linux syscall 番号のため target_os = "linux" 限定（FreeBSD/OpenBSD の
+// kqueue reactor ビルドでは seccomp 自体が存在せず、この表は使われない。F-120 Phase 4）。
+#[cfg(all(target_arch = "aarch64", veil_rt_reactor, target_os = "linux"))]
 pub const ALLOWED_SYSCALLS: &[i64] = &[
     // ============================================
     // ファイル I/O
@@ -2332,6 +2339,261 @@ pub fn report_sandbox_support() {
     }
 }
 
+// ====================
+// FreeBSD: capsicum（F-120 Phase 4）
+// ====================
+//
+// FreeBSD の capability mode（`cap_enter(2)`）+ fd 単位の権利制限（`cap_rights_limit(2)`）。
+// Linux の seccomp/Landlock に相当する OS ネイティブサンドボックス機構。
+//
+// - `cap_rights_limit`: 長寿命 fd（リスナー・アクセスログ・静的ファイルディレクトリ）へ
+//   必要最小の権利を割り当てる。一度制限すると **拡大方向の変更はできない**
+//   （capsicum の設計上の不変条件）。
+// - `cap_enter`: プロセス全体を capability mode へ落とす。capability mode 中は
+//   グローバル名前空間操作（`connect(2)`、`open(2)` の絶対パス等）が一切できなくなるため、
+//   バックエンドへ `connect(2)` する構成（プロキシ/upstream あり）では使えない
+//   （設計ドキュメント 4.2 節）。静的ファイル配信のみの構成でのみ自動適用する。
+#[cfg(target_os = "freebsd")]
+pub mod capsicum {
+    use ftlog::info;
+    use std::io;
+    use std::os::unix::io::RawFd;
+
+    /// `struct cap_rights`（`CAP_RIGHTS_VERSION` = 0、`cr_rights[2]`）。
+    ///
+    /// FreeBSD `<sys/caprights.h>` のレイアウトそのもの
+    /// （`uint64_t cr_rights[CAP_RIGHTS_VERSION + 2]`、version 0 なので要素数 2）。
+    /// `libc` クレートはこの型を公開していないため、ここで直接レイアウトを再現する。
+    #[repr(C)]
+    struct CapRights {
+        cr_rights: [u64; 2],
+    }
+
+    /// `CAPRIGHT(idx, bit)` マクロ（`<sys/capsicum.h>`）: 上位ビットに配列インデックスを
+    /// エンコードした「1 タグ + 権利ビット」の合成値。
+    const fn capright(idx: u64, bit: u64) -> u64 {
+        (1u64 << (57 + idx)) | bit
+    }
+
+    // 個別の権利定数（`<sys/capsicum.h>` から必要な分のみ転記）。
+    const CAP_READ: u64 = capright(0, 0x0000_0000_0000_0001);
+    const CAP_WRITE: u64 = capright(0, 0x0000_0000_0000_0002);
+    const CAP_SEEK_TELL: u64 = capright(0, 0x0000_0000_0000_0004);
+    const CAP_SEEK: u64 = CAP_SEEK_TELL | 0x0000_0000_0000_0008;
+    const CAP_MMAP: u64 = capright(0, 0x0000_0000_0000_0010);
+    const CAP_MMAP_R: u64 = CAP_MMAP | CAP_SEEK | CAP_READ;
+    const CAP_LOOKUP: u64 = capright(0, 0x0000_0000_0000_0400);
+    const CAP_FCNTL: u64 = capright(0, 0x0000_0000_0000_8000);
+    const CAP_FSTAT: u64 = capright(0, 0x0000_0000_0008_0000);
+    const CAP_ACCEPT: u64 = capright(0, 0x0000_0000_2000_0000);
+    const CAP_GETPEERNAME: u64 = capright(0, 0x0000_0001_0000_0000);
+    const CAP_GETSOCKNAME: u64 = capright(0, 0x0000_0002_0000_0000);
+    const CAP_SETSOCKOPT: u64 = capright(0, 0x0000_0020_0000_0000);
+    const CAP_SHUTDOWN: u64 = capright(0, 0x0000_0040_0000_0000);
+    /// index 1（`CAPRIGHT(1, ..)`）: `select(2)`/`poll(2)`/kqueue の readiness 待ちに必要。
+    const CAP_EVENT: u64 = capright(1, 0x0000_0000_0000_0020);
+
+    // `cap_rights_limit`/`cap_enter`/`cap_sandboxed` は libc.so の非バリアディック関数
+    // （バリアディックな `cap_rights_init`/`cap_rights_set` はヘッダマクロ経由でのみ
+    // 呼べるため使わず、`CapRights` の各配列要素を直接組み立てて渡す）。
+    //
+    // # 不変条件
+    // - `CapRights` のメモリレイアウトは FreeBSD `<sys/caprights.h>` の `struct cap_rights`
+    //   と一致させる（`repr(C)`、`u64` 2 要素）。ABI が変わる将来のバージョン
+    //   （`CAP_RIGHTS_VERSION` > 0）には対応しない（現行 FreeBSD 14.x は version 0 固定）。
+    // - `cap_rights_limit` に渡す fd は呼び出し時点で有効である必要がある。
+    unsafe extern "C" {
+        fn cap_rights_limit(fd: RawFd, rights: *const CapRights) -> libc::c_int;
+        fn cap_enter() -> libc::c_int;
+        fn cap_sandboxed() -> libc::c_int;
+    }
+
+    /// 複数の権利ビットから `CapRights` を組み立てる（`CAP_NONE` に各ビットを OR する
+    /// 実装で、`cap_rights_set`/`__cap_rights_set` と等価な結果になる）。
+    fn build_rights(bits: &[u64]) -> CapRights {
+        // CAP_NONE 相当の初期値: 各要素の「バージョン/インデックスタグ」ビットのみ立てる。
+        let mut cr = CapRights {
+            cr_rights: [1u64 << 57, 1u64 << 58],
+        };
+        for &bit in bits {
+            let idx = ((bit >> 57) & 0x1F) as usize - 1; // capright() は 57+idx にタグを置く
+            cr.cr_rights[idx] |= bit;
+        }
+        cr
+    }
+
+    /// 指定した fd へ権利を制限する（不可逆: 拡大方向の再設定はできない）。
+    fn limit(fd: RawFd, bits: &[u64]) -> io::Result<()> {
+        let rights = build_rights(bits);
+        let ret = unsafe { cap_rights_limit(fd, &rights as *const CapRights) };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// リスナー fd（`accept(2)` 前）へ権利を制限する。
+    ///
+    /// `CAP_ACCEPT`（accept4 含む）・`CAP_EVENT`（kqueue readiness 待ち）・
+    /// `CAP_SETSOCKOPT`（accept 後の TCP_NODELAY 等）・
+    /// `CAP_GETPEERNAME`/`CAP_GETSOCKNAME` に加え、
+    /// `CAP_READ`/`CAP_WRITE`/`CAP_SHUTDOWN` を許可する。
+    ///
+    /// FreeBSD では **accept された接続 fd はリスナーの rights を継承**する
+    /// （capsicum(4)。継承 rights のさらなる縮小は可能だが拡大は不可）。そのため
+    /// リスナー rights には「接続 fd が必要とする権利」も含める必要がある。
+    /// これを欠くと TLS ハンドシェイクの read/write が `ENOTCAPABLE`（os error 93）で
+    /// 全滅する（F-120 Phase 4 の VM 検証で発見）。接続 fd ごとの追加の
+    /// `cap_rights_limit` 呼び出しは per-accept の syscall 増となるため行わない
+    /// （継承により上記セットへ既に制限されている）。
+    pub fn limit_listener_rights(fd: RawFd) -> io::Result<()> {
+        limit(
+            fd,
+            &[
+                CAP_ACCEPT,
+                CAP_EVENT,
+                CAP_SETSOCKOPT,
+                CAP_GETPEERNAME,
+                CAP_GETSOCKNAME,
+                CAP_READ,
+                CAP_WRITE,
+                CAP_SHUTDOWN,
+            ],
+        )
+    }
+
+    /// accept 済み接続 fd へ権利を制限する。
+    ///
+    /// `CAP_READ`/`CAP_WRITE`（send/recv）・`CAP_EVENT`（readiness 待ち）・
+    /// `CAP_SHUTDOWN`・`CAP_GETPEERNAME`/`CAP_GETSOCKNAME` を許可する。
+    pub fn limit_connection_rights(fd: RawFd) -> io::Result<()> {
+        limit(
+            fd,
+            &[
+                CAP_READ,
+                CAP_WRITE,
+                CAP_EVENT,
+                CAP_SHUTDOWN,
+                CAP_GETPEERNAME,
+                CAP_GETSOCKNAME,
+            ],
+        )
+    }
+
+    /// アクセスログ fd へ権利を制限する（追記書き込みのみ）。
+    pub fn limit_log_rights(fd: RawFd) -> io::Result<()> {
+        limit(fd, &[CAP_WRITE, CAP_SEEK, CAP_FCNTL])
+    }
+
+    /// 静的ファイル配信用ディレクトリ fd へ権利を制限する。
+    ///
+    /// `CAP_LOOKUP` により `openat(2)` 等でこの fd 配下の相対パス解決のみを許可する
+    /// （capability mode では絶対パスの解決ができないため、静的ファイル配信は
+    /// ディレクトリ fd 経由の `*at()` 系 syscall へ切り替える必要がある。呼び出し側の
+    /// ファイル配信経路が `openat` ベースであることが前提）。
+    pub fn limit_static_dir_rights(fd: RawFd) -> io::Result<()> {
+        limit(
+            fd,
+            &[
+                CAP_READ, CAP_LOOKUP, CAP_FSTAT, CAP_SEEK, CAP_MMAP_R, CAP_FCNTL,
+            ],
+        )
+    }
+
+    /// プロセスを capability mode（`cap_enter(2)`）へ落とす。
+    ///
+    /// capability mode に入ると `connect(2)`・絶対パスの `open(2)` 等グローバル名前空間
+    /// 操作が一切できなくなる（不可逆）。呼び出し元は「プロキシ/upstream を使わない
+    /// 静的ファイル配信のみの構成」であることを事前に確認していること
+    /// （設計ドキュメント 4.2 節）。
+    pub fn enter_capability_mode() -> io::Result<()> {
+        let ret = unsafe { cap_enter() };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        info!("capsicum: entered capability mode (cap_enter)");
+        Ok(())
+    }
+
+    /// 現在のプロセスが capability mode 内にいるか判定する。
+    pub fn is_capability_mode() -> bool {
+        unsafe { cap_sandboxed() != 0 }
+    }
+
+    /// jail 名から jid を解決し `jail_attach(2)` する（root 前提）。
+    ///
+    /// `jail_get(2)`（`<sys/jail.h>`）へ `{"name", jail_name}` の iovec ペアを渡して jid を
+    /// 引かせ、続けて `jail_attach(jid)` する。libjail（`-ljail`）へのリンクを避けるため
+    /// 生の `jail_get`/`jail_attach` syscall ラッパを直接 FFI 宣言する。
+    ///
+    /// # 不変条件
+    /// - `iovec` 配列は `jail_get` 呼び出し中のみ有効な借用（`name`/`nameval` の
+    ///   `CString`/バッファは呼び出しが完了するまでスコープ内で生存させる）。
+    /// - 失敗（jail 未存在・権限不足等）は呼び出し元に明確なエラーとして伝播する
+    ///   （設計ドキュメント 4.2 節: 「失敗時は明確なエラー」）。
+    pub fn attach_jail(jail_name: &str) -> io::Result<()> {
+        unsafe extern "C" {
+            fn jail_get(
+                iov: *mut libc::iovec,
+                niov: libc::c_uint,
+                flags: libc::c_int,
+            ) -> libc::c_int;
+            fn jail_attach(jid: libc::c_int) -> libc::c_int;
+        }
+
+        let name_key = std::ffi::CString::new("name").expect("no interior NUL");
+        let name_val = std::ffi::CString::new(jail_name)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "jail_name has NUL byte"))?;
+        let errmsg_key = std::ffi::CString::new("errmsg").expect("no interior NUL");
+        let mut errbuf = vec![0u8; 256];
+
+        let mut iov = [
+            libc::iovec {
+                iov_base: name_key.as_ptr() as *mut libc::c_void,
+                iov_len: name_key.as_bytes_with_nul().len(),
+            },
+            libc::iovec {
+                iov_base: name_val.as_ptr() as *mut libc::c_void,
+                iov_len: name_val.as_bytes_with_nul().len(),
+            },
+            libc::iovec {
+                iov_base: errmsg_key.as_ptr() as *mut libc::c_void,
+                iov_len: errmsg_key.as_bytes_with_nul().len(),
+            },
+            libc::iovec {
+                iov_base: errbuf.as_mut_ptr() as *mut libc::c_void,
+                iov_len: errbuf.len(),
+            },
+        ];
+
+        // SAFETY: iov の各 iov_base は上記ローカル変数（CString/Vec）を指し、この
+        // unsafe ブロック内で jail_get 呼び出しが完了するまで生存している。
+        let jid = unsafe { jail_get(iov.as_mut_ptr(), iov.len() as libc::c_uint, 0) };
+        if jid < 0 {
+            let errmsg = std::ffi::CStr::from_bytes_until_nul(&errbuf)
+                .map(|c| c.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            return Err(io::Error::other(format!(
+                "jail_get(\"{}\") failed: {} ({})",
+                jail_name,
+                io::Error::last_os_error(),
+                errmsg
+            )));
+        }
+
+        // SAFETY: jid は直前の jail_get が返した有効な jail ID。
+        let ret = unsafe { jail_attach(jid) };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        info!(
+            "capsicum/jail: attached to jail \"{}\" (jid={})",
+            jail_name, jid
+        );
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2680,7 +2942,7 @@ mod tests {
     /// reactor（epoll）バックエンドでは epoll 系 syscall が含まれ、io_uring 系は
     /// 含まれないこと（F-120 Phase 2）。
     #[test]
-    #[cfg(all(target_arch = "x86_64", veil_rt_reactor))]
+    #[cfg(all(target_arch = "x86_64", veil_rt_reactor, target_os = "linux"))]
     fn test_allowed_syscalls_reactor_contains_epoll_not_io_uring() {
         assert!(ALLOWED_SYSCALLS.contains(&291)); // epoll_create1
         assert!(ALLOWED_SYSCALLS.contains(&232)); // epoll_wait
@@ -2693,7 +2955,10 @@ mod tests {
         assert!(ALLOWED_SYSCALLS.contains(&290));
     }
 
+    // ALLOWED_SYSCALLS は Linux syscall 番号表のため、参照するテストは Linux 限定
+    // （F-120 Phase 4: FreeBSD ビルドでは表自体がコンパイルされない）。
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_allowed_syscalls_contains_network() {
         // ネットワークシステムコールが含まれている
         #[cfg(target_arch = "x86_64")]
@@ -2706,6 +2971,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_allowed_syscalls_contains_file_access() {
         // faccessat2 (439) は glibc 2.33+/musl のファイル存在・権限確認で使用される。
         // 未許可だと seccomp が EPERM を返し、静的ファイル配信が 404 になる回帰を防ぐ。
@@ -2733,6 +2999,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_allowed_syscalls_no_dangerous() {
         // 危険なシステムコールは含まれていない
         #[cfg(target_arch = "x86_64")]

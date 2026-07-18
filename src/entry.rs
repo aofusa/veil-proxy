@@ -17,7 +17,7 @@ use std::thread;
 use std::time::Duration;
 
 // ktls_rustls（kTLS 対応）
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 use crate::ktls_rustls::RustlsAcceptor;
 
 pub use crate::config::*;
@@ -113,6 +113,24 @@ pub fn run() {
         }
     };
 
+    // FreeBSD: jail_name が設定されていれば起動最初期に jail_attach する（F-120 Phase 4）。
+    // root 前提・失敗は明確なエラーで起動中止する（サンドボックス/権限降格より前に行う:
+    // jail 内へ移った後でこそ以降のセキュリティ処理が正しいコンテキストで動く）。
+    #[cfg(target_os = "freebsd")]
+    if let Some(jail_name) = loaded_config.global_security.jail_name.as_deref() {
+        match crate::security::capsicum::attach_jail(jail_name) {
+            Ok(()) => info!("attached to jail \"{}\"", jail_name),
+            Err(e) => {
+                error!("failed to attach to jail \"{}\": {}", jail_name, e);
+                return;
+            }
+        }
+    }
+    #[cfg(not(target_os = "freebsd"))]
+    if loaded_config.global_security.jail_name.is_some() {
+        warn!("jail_name is set but this build does not target FreeBSD; ignoring");
+    }
+
     // Huge Pages (Large OS Pages) 設定
     // mimallocでHuge Pagesを有効化し、TLBミスを削減
     // 注: グローバルアロケータは静的初期化されるため、
@@ -144,13 +162,13 @@ pub fn run() {
     }
 
     // TLS アクセプターを作成
-    #[cfg(feature = "ktls")]
+    #[cfg(veil_ktls)]
     let acceptor = RustlsAcceptor::new(loaded_config.tls_config.clone())
         .with_ktls(loaded_config.ktls_config.enabled)
         .with_fallback(loaded_config.ktls_config.fallback_enabled)
         .with_tcp_cork(loaded_config.ktls_config.tcp_cork_enabled);
 
-    #[cfg(not(feature = "ktls"))]
+    #[cfg(not(veil_ktls))]
     let acceptor = crate::simple_tls::SimpleTlsAcceptor::new(loaded_config.tls_config.clone())
         .with_ktls(loaded_config.ktls_config.enabled);
 
@@ -576,6 +594,61 @@ pub fn run() {
         }
     }
 
+    // FreeBSD: capsicum（F-120 Phase 4）。
+    //
+    // リスナー fd の rights 制限（`enable_capsicum`）は `server::create_listener`
+    // （各ワーカーの listener 作成経路）で個別に適用済み。
+    //
+    // capability mode（`capsicum_capability_mode`、オプトイン）はここでは適用**しない**:
+    // `cap_enter(2)` はプロセス全体へ即時に効き、capability mode 中は `bind(2)` が
+    // 禁止されるため、各ワーカースレッドが SO_REUSEPORT_LB listener を bind し終える
+    // **前に** 入ると全ワーカーが Bind error で死ぬ（F-120 Phase 4 の VM 検証で発見）。
+    // 適用は全 TLS ワーカーの listener bind 完了をバリアで待ってから行う（後段参照）。
+    #[cfg(target_os = "freebsd")]
+    let capsicum_capability_mode_requested = {
+        let sec = &loaded_config.global_security;
+        if sec.capsicum_capability_mode {
+            let no_upstreams = loaded_config.upstream_groups.is_empty();
+            #[cfg(feature = "l4-proxy")]
+            let no_l4 = loaded_config.l4_listeners.is_empty();
+            #[cfg(not(feature = "l4-proxy"))]
+            let no_l4 = true;
+            #[cfg(feature = "http2")]
+            let no_h2c = !loaded_config.h2c_enabled;
+            #[cfg(not(feature = "http2"))]
+            let no_h2c = true;
+            #[cfg(feature = "http3")]
+            let no_h3 = !loaded_config.http3_enabled;
+            #[cfg(not(feature = "http3"))]
+            let no_h3 = true;
+            // metrics（Prometheus）はメインリスナーのルートとして配信されるため
+            // 追加リスナーは無く、capability mode の妨げにならない。
+            // HTTP→HTTPS リダイレクトリスナーは cap_enter 後の bind になるため不可。
+            let no_http_redirect = loaded_config.listen_http_addr.is_none();
+            let eligible = no_upstreams && no_l4 && no_h2c && no_h3 && no_http_redirect;
+            if !eligible {
+                warn!(
+                    "capsicum: capability mode requested but configuration requires global \
+                     namespace operations (proxy/l4/h2c/http3); staying in \
+                     rights-limited mode"
+                );
+            }
+            eligible
+        } else {
+            false
+        }
+    };
+    #[cfg(target_os = "freebsd")]
+    if loaded_config.global_security.enable_capsicum {
+        info!("capsicum: cap_rights_limit enforcement enabled for long-lived fds");
+    }
+    #[cfg(not(target_os = "freebsd"))]
+    if loaded_config.global_security.enable_capsicum
+        || loaded_config.global_security.capsicum_capability_mode
+    {
+        warn!("enable_capsicum / capsicum_capability_mode is set but this build does not target FreeBSD; ignoring");
+    }
+
     // 同時接続数制限
     let max_connections = loaded_config.global_security.max_concurrent_connections;
 
@@ -588,6 +661,13 @@ pub fn run() {
 
     #[cfg(not(feature = "http2"))]
     let is_h2c_only_server = false;
+
+    // FreeBSD capability mode 用の bind 完了バリア。
+    // 各 TLS ワーカーが listener bind に成功したらカウントを進め、全ワーカー分
+    // 揃ってから `cap_enter(2)` する（capability mode 中は bind 不可のため、
+    // 先に入ると全ワーカーが Bind error で死ぬ）。
+    #[cfg(target_os = "freebsd")]
+    let listeners_ready = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     // 通常のTLSリスナーを起動（H2C専用サーバーの場合はスキップ）
     if !is_h2c_only_server {
@@ -605,6 +685,8 @@ pub fn run() {
             let balancing = reuseport_balancing;
             let workers = num_threads;
             let max_conn = max_connections;
+            #[cfg(target_os = "freebsd")]
+            let listeners_ready = std::sync::Arc::clone(&listeners_ready);
 
             // このスレッドに割り当てるコアIDを決定
             // コア数よりスレッド数が多い場合はモジュロ演算でラップアラウンド
@@ -635,6 +717,9 @@ pub fn run() {
                             return;
                         }
                     };
+                    // capability mode バリア: bind 完了を通知（FreeBSD、コールドパス）。
+                    #[cfg(target_os = "freebsd")]
+                    listeners_ready.fetch_add(1, std::sync::atomic::Ordering::Release);
 
                     info!("[Thread {}] Worker started", thread_id);
 
@@ -703,6 +788,43 @@ pub fn run() {
                 });
             });
             handles.push(handle);
+        }
+
+        // FreeBSD capability mode（オプトイン）: 全 TLS ワーカーの bind 完了を待って
+        // `cap_enter(2)` する。cap_enter はプロセス全体に即時に効くため、bind が
+        // 終わる前に入ると全ワーカーが Bind error で死ぬ（バリアの根拠は前段コメント）。
+        #[cfg(target_os = "freebsd")]
+        if capsicum_capability_mode_requested {
+            let listeners_ready = std::sync::Arc::clone(&listeners_ready);
+            let expected = num_threads;
+            std::thread::Builder::new()
+                .name("veil-cap-enter".to_string())
+                .spawn(move || {
+                    use std::sync::atomic::Ordering;
+                    // 起動時コールドパスの専用監視スレッド（イベントループ外）のため
+                    // ポーリング sleep でよい。最大 ~30 秒待つ。
+                    for _ in 0..3000 {
+                        if listeners_ready.load(Ordering::Acquire) >= expected {
+                            match crate::security::capsicum::enter_capability_mode() {
+                                Ok(()) => info!(
+                                    "capsicum: capability mode active ({} listeners bound)",
+                                    expected
+                                ),
+                                Err(e) => error!("capsicum: cap_enter failed: {}", e),
+                            }
+                            return;
+                        }
+                        // 理由付き allow: 起動時コールドパスの専用スレッド。イベントループを
+                        // ブロックしない。
+                        #[allow(clippy::disallowed_methods)]
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    error!(
+                        "capsicum: timed out waiting for {} listeners; capability mode NOT applied",
+                        expected
+                    );
+                })
+                .expect("failed to spawn veil-cap-enter thread");
         }
     } else {
         info!("Skipping TLS listener (H2C-only server detected)");

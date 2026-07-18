@@ -37,7 +37,7 @@ epoll 系 syscall を許可しない（最小権限）。
 - [x] Phase 1: runtime uring 分離（無挙動変更）
 - [x] Phase 2: epoll バックエンド + seccomp 分割
 - [x] Phase 3: aarch64 クロスビルド + QEMU 確認
-- [ ] Phase 4: FreeBSD（kqueue + capsicum + jail）
+- [x] Phase 4: FreeBSD（kqueue + capsicum + jail_attach、x86_64）
 - [ ] Phase 5: OpenBSD（pledge + unveil）
 - [ ] Phase 6: packaging
 - [ ] Phase 7: 最終検証・ドキュメント
@@ -64,6 +64,39 @@ epoll 系 syscall を許可しない（最小権限）。
   満たさず、`rustup update stable` もイメージ側の docs 削除で失敗するため、
   バージョン固定 `rustup toolchain install 1.89.0` を並置。aws-lc-sys の bindgen には
   `BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_musl` でクロス sysroot 指定が必須。
+
+## Phase 4 の記録（FreeBSD 14.3 VM 検証）
+
+### OS 別 feature 対応表（FreeBSD x86_64、warning 0 でビルド確認）
+
+| feature | FreeBSD | 備考 |
+|---|---|---|
+| http2 / http3 / grpc-full / wasm / opentelemetry / compression / cache / metrics / websocket / rate-limit / buffering / mimalloc / admin / access-log / l4-proxy | ✅ | ktls を除く全機能セットで warning 0 |
+| ktls | ❌（設計どおり） | kTLS は Linux 専用（`veil_ktls` cfg）。非 Linux は simple_tls（ユーザ空間 rustls）へ自動フォールバック |
+| epoll feature | ❌（build.rs でエラー） | BSD は kqueue が自動選択 |
+
+- HTTP/3 は `udp/socket.rs` の**非 Linux 逐次エミュレーション**（recvmmsg/sendmmsg/GSO API と
+  同一シグネチャを単発 sendto/recvfrom で提供、GSO/GRO 無効）で http3_server.rs 無変更のまま対応。
+- UDP の SO_REUSEPORT_LB（FreeBSD、カーネル分散）は TCP リスナーと同方針で適用。
+- 実機検証（VM 14.3-RELEASE / rustc 1.96.1）: 静的配信 HTTPS/HTTP2 200、
+  veil→veil プロキシ経路 200、capsicum rights-limited で全経路動作、
+  capability mode（オプトイン）は barrier 後 cap_enter 成功・accept/TLS 動作・
+  パス open は fail-closed 404（F-123 参照）。lib テストは VM で実行。
+- FreeBSD **aarch64** は rustc Tier 3（クロス不可）+ ホストに qemu-system-aarch64 が無く
+  未検証（コードは target_os = "freebsd" で arch 非依存。ビルド手順は amd64 と同一の
+  VM 内ネイティブビルド）。
+
+### Phase 4 で発見・修正したバグ（VM 検証で検出）
+
+1. **cap_enter がワーカー bind 前に適用され全ワーカー Bind error**: capability mode では
+   `bind(2)` 禁止のため、全 TLS ワーカーの listener bind 完了を AtomicUsize バリアで
+   待ってから cap_enter する方式へ変更。あわせて capability mode を独立キー
+   `capsicum_capability_mode`（オプトイン）に分離。
+2. **accept 済み接続 fd の rights 不足で TLS handshake が ENOTCAPABLE**: FreeBSD では
+   accept された fd は**リスナーの rights を継承**するため、リスナー rights に
+   CAP_READ/CAP_WRITE/CAP_SHUTDOWN を含める必要がある（per-accept の cap_rights_limit
+   追加はホットパス syscall 増のため行わない）。
+3. wasmtime の MSRV / bindgen sysroot 等のビルド環境問題（Phase 3 の musl と同種）。
 
 ## Phase 2 で発見・修正したバグ
 

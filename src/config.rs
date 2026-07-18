@@ -24,16 +24,15 @@ use std::io;
 use std::io::BufReader;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "linux")]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 use crate::ktls_rustls::{KtlsClientStream, KtlsServerStream, RustlsConnector};
 
-#[cfg(not(feature = "ktls"))]
+#[cfg(not(veil_ktls))]
 use crate::simple_tls;
 
 #[cfg(feature = "http2")]
@@ -1231,6 +1230,38 @@ pub struct GlobalSecurityConfig {
     /// true: 失敗時も警告を出して起動を続行（開発・デバッグ用）
     #[serde(default = "default_allow_security_failures")]
     pub allow_security_failures: bool,
+
+    // ====================
+    // FreeBSD: capsicum（F-120 Phase 4）
+    // ====================
+    //
+    // 非対象 OS（Linux/OpenBSD）でもキー自体は受理し、未知キー拒否にはしない
+    // （設計ドキュメント 4.4 節）。適用時に警告ログを出して無視する。
+    /// capsicum を有効化（FreeBSD 専用）。
+    ///
+    /// リスナー/接続/静的ファイル fd への `cap_rights_limit(2)` を適用する。
+    #[serde(default)]
+    pub enable_capsicum: bool,
+
+    /// capability mode（`cap_enter(2)`）へ降格する（FreeBSD 専用・オプトイン）。
+    ///
+    /// capability mode ではグローバル名前空間操作（`bind(2)`/`connect(2)`/パス指定の
+    /// `open(2)` 等）が全面禁止されるため、次の制約を **すべて** 満たす構成でのみ
+    /// 適用できる（満たさない場合は警告を出して適用しない）:
+    /// - プロキシ/upstream・L4 リスナーが無い（`connect(2)` 不要）
+    /// - h2c / HTTP/3 / metrics の追加リスナーが無い
+    ///
+    /// 適用は全ワーカーの listener bind 完了後（bind は capability mode で不可のため）。
+    /// 注意: 現状、リクエスト時のパス指定 `open(2)` を伴う静的ファイル配信は
+    /// capability mode では失敗する（キャッシュ済み応答のみ返せる）。ディレクトリ fd +
+    /// `openat(2)` 相対化による完全対応はフォローアップ（backlog 参照）。
+    #[serde(default)]
+    pub capsicum_capability_mode: bool,
+
+    /// 起動時に attach する jail 名（FreeBSD 専用、root 前提）。
+    /// 未設定なら jail_attach は行わない。
+    #[serde(default)]
+    pub jail_name: Option<String>,
 }
 
 fn default_allow_security_failures() -> bool {
@@ -1853,7 +1884,7 @@ pub fn check_rate_limit(client_ip: &str, limit: u64) -> bool {
 
 // rustls 用の TLS コネクター（kTLS 有効時は ktls_rustls を使用）
 // kTLSフィーチャー有効時はシークレット抽出を有効化し、kTLS利用可能な状態にする
-#[cfg(all(feature = "ktls", feature = "http2"))]
+#[cfg(all(veil_ktls, feature = "http2"))]
 thread_local! {
     static TLS_CONNECTOR: RustlsConnector = {
         // 設定ファイルから kTLS 有効化、ktls_fallback_enabled, tcp_cork_enabled を読み込み
@@ -1874,7 +1905,7 @@ thread_local! {
 }
 
 // kTLS あり・HTTP/2 なしの場合のコネクター
-#[cfg(all(feature = "ktls", not(feature = "http2")))]
+#[cfg(all(veil_ktls, not(feature = "http2")))]
 thread_local! {
     static TLS_CONNECTOR: RustlsConnector = {
         let config_guard = CURRENT_CONFIG.load();
@@ -1892,7 +1923,7 @@ thread_local! {
 }
 
 // 証明書検証をスキップする TLS コネクター（kTLS 有効時・自己署名証明書用）
-#[cfg(all(feature = "ktls", feature = "http2"))]
+#[cfg(all(veil_ktls, feature = "http2"))]
 thread_local! {
     static TLS_CONNECTOR_INSECURE: RustlsConnector = {
         // 証明書検証をスキップするクライアント設定
@@ -1913,7 +1944,7 @@ thread_local! {
 }
 
 // kTLS あり・HTTP/2 なしの場合の insecure コネクター
-#[cfg(all(feature = "ktls", not(feature = "http2")))]
+#[cfg(all(veil_ktls, not(feature = "http2")))]
 thread_local! {
     static TLS_CONNECTOR_INSECURE: RustlsConnector = {
         let config_guard = CURRENT_CONFIG.load();
@@ -1931,7 +1962,7 @@ thread_local! {
 }
 
 // rustls 用の TLS コネクター（kTLS 無効時は simple_tls を使用）
-#[cfg(all(not(feature = "ktls"), feature = "http2"))]
+#[cfg(all(not(veil_ktls), feature = "http2"))]
 thread_local! {
     static TLS_CONNECTOR: simple_tls::SimpleTlsConnector = {
         let config = (*simple_tls::default_client_config()).clone();
@@ -1941,7 +1972,7 @@ thread_local! {
 }
 
 // HTTP/2 なし・kTLS なしの場合のコネクター
-#[cfg(all(not(feature = "ktls"), not(feature = "http2")))]
+#[cfg(all(not(veil_ktls), not(feature = "http2")))]
 thread_local! {
     static TLS_CONNECTOR: simple_tls::SimpleTlsConnector = {
         let config = (*simple_tls::default_client_config()).clone();
@@ -1950,7 +1981,7 @@ thread_local! {
 }
 
 // 証明書検証をスキップする TLS コネクター（自己署名証明書用）
-#[cfg(all(not(feature = "ktls"), feature = "http2"))]
+#[cfg(all(not(veil_ktls), feature = "http2"))]
 thread_local! {
     static TLS_CONNECTOR_INSECURE: simple_tls::SimpleTlsConnector = {
         let config = (*simple_tls::insecure_client_config()).clone();
@@ -1960,7 +1991,7 @@ thread_local! {
 }
 
 // HTTP/2 なし・kTLS なしの場合の insecure コネクター
-#[cfg(all(not(feature = "ktls"), not(feature = "http2")))]
+#[cfg(all(not(veil_ktls), not(feature = "http2")))]
 thread_local! {
     static TLS_CONNECTOR_INSECURE: simple_tls::SimpleTlsConnector = {
         let config = (*simple_tls::insecure_client_config()).clone();
@@ -1973,25 +2004,25 @@ thread_local! {
 // ====================
 
 /// TLS コネクタを取得（通常接続用）
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 pub fn get_tls_connector() -> RustlsConnector {
     TLS_CONNECTOR.with(|c| c.clone())
 }
 
 /// TLS コネクタを取得（証明書検証スキップ用）
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 pub fn get_tls_connector_insecure() -> RustlsConnector {
     TLS_CONNECTOR_INSECURE.with(|c| c.clone())
 }
 
 /// TLS コネクタを取得（通常接続用）
-#[cfg(not(feature = "ktls"))]
+#[cfg(not(veil_ktls))]
 pub fn get_tls_connector() -> crate::simple_tls::SimpleTlsConnector {
     TLS_CONNECTOR.with(|c| c.clone())
 }
 
 /// TLS コネクタを取得（証明書検証スキップ用）
-#[cfg(not(feature = "ktls"))]
+#[cfg(not(veil_ktls))]
 pub fn get_tls_connector_insecure() -> crate::simple_tls::SimpleTlsConnector {
     TLS_CONNECTOR_INSECURE.with(|c| c.clone())
 }
@@ -3197,7 +3228,7 @@ pub struct PerformanceConfigSection {
     ///   - 1MB超: 1MB
     /// - "manual": 固定チャンクサイズを使用
     #[serde(default = "default_chunk_size_mode")]
-    #[cfg_attr(not(feature = "ktls"), allow(dead_code))]
+    #[cfg_attr(not(veil_ktls), allow(dead_code))]
     pub chunk_size_mode: ChunkSizeMode,
 
     /// 手動チャンクサイズ（バイト）
@@ -3205,7 +3236,7 @@ pub struct PerformanceConfigSection {
     /// chunk_size_mode = "manual" 時に使用します。
     /// デフォルト: 1048576 (1MB)
     #[serde(default = "default_manual_chunk_size")]
-    #[cfg_attr(not(feature = "ktls"), allow(dead_code))]
+    #[cfg_attr(not(veil_ktls), allow(dead_code))]
     pub manual_chunk_size: usize,
 
     // ====================
@@ -3220,7 +3251,7 @@ pub struct PerformanceConfigSection {
     ///
     /// 高並行性環境（同時接続数1000+）ではtrueを推奨します。
     #[serde(default)]
-    #[cfg_attr(not(feature = "ktls"), allow(dead_code))]
+    #[cfg_attr(not(veil_ktls), allow(dead_code))]
     pub per_stream_pipe_enabled: bool,
 
     // ====================
@@ -4464,7 +4495,7 @@ impl AsyncWriter for TcpStream {
 }
 
 // KtlsServerStream用の実装（rustls + ktls2）
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 impl AsyncReader for KtlsServerStream {
     async fn read_buf(&mut self, buf: SafeReadBuffer) -> (io::Result<usize>, SafeReadBuffer) {
         use crate::runtime::io::AsyncReadRent;
@@ -4472,7 +4503,7 @@ impl AsyncReader for KtlsServerStream {
     }
 }
 
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 impl AsyncWriter for KtlsServerStream {
     async fn write_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
         self.write_all(buf).await
@@ -4480,7 +4511,7 @@ impl AsyncWriter for KtlsServerStream {
 }
 
 // KtlsClientStream用の実装（rustls + ktls2）
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 impl AsyncReader for KtlsClientStream {
     async fn read_buf(&mut self, buf: SafeReadBuffer) -> (io::Result<usize>, SafeReadBuffer) {
         use crate::runtime::io::AsyncReadRent;
@@ -4488,7 +4519,7 @@ impl AsyncReader for KtlsClientStream {
     }
 }
 
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 impl AsyncWriter for KtlsClientStream {
     async fn write_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
         self.write_all(buf).await
@@ -4496,7 +4527,7 @@ impl AsyncWriter for KtlsClientStream {
 }
 
 // SimpleTlsServerStream用の実装（rustls のみ）
-#[cfg(not(feature = "ktls"))]
+#[cfg(not(veil_ktls))]
 impl AsyncReader for crate::simple_tls::SimpleTlsServerStream {
     async fn read_buf(&mut self, buf: SafeReadBuffer) -> (io::Result<usize>, SafeReadBuffer) {
         use crate::runtime::io::AsyncReadRent;
@@ -4504,7 +4535,7 @@ impl AsyncReader for crate::simple_tls::SimpleTlsServerStream {
     }
 }
 
-#[cfg(not(feature = "ktls"))]
+#[cfg(not(veil_ktls))]
 impl AsyncWriter for crate::simple_tls::SimpleTlsServerStream {
     async fn write_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
         self.write_all(buf).await
@@ -4512,7 +4543,7 @@ impl AsyncWriter for crate::simple_tls::SimpleTlsServerStream {
 }
 
 // SimpleTlsClientStream用の実装（rustls のみ）
-#[cfg(not(feature = "ktls"))]
+#[cfg(not(veil_ktls))]
 impl AsyncReader for crate::simple_tls::SimpleTlsClientStream {
     async fn read_buf(&mut self, buf: SafeReadBuffer) -> (io::Result<usize>, SafeReadBuffer) {
         use crate::runtime::io::AsyncReadRent;
@@ -4520,7 +4551,7 @@ impl AsyncReader for crate::simple_tls::SimpleTlsClientStream {
     }
 }
 
-#[cfg(not(feature = "ktls"))]
+#[cfg(not(veil_ktls))]
 impl AsyncWriter for crate::simple_tls::SimpleTlsClientStream {
     async fn write_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
         self.write_all(buf).await
@@ -4832,7 +4863,7 @@ fn load_tls_config(
     // kTLS 互換性チェック: kTLS は AES-GCM 系のみオフロード可能。
     // 非互換スイートが指定されている場合は警告する（該当接続は rustls フォールバック、
     // ktls_fallback_enabled = false ならハンドシェイク後に拒否される）。
-    #[cfg(feature = "ktls")]
+    #[cfg(veil_ktls)]
     if ktls_enabled {
         if let Some(ref suites) = custom_suites {
             let compat = crate::ktls::ktls_compatible_cipher_suites();
@@ -4856,7 +4887,7 @@ fn load_tls_config(
     // kTLS 有効時のみ config を変更するため、条件付きで mut を使用
     #[allow(unused_mut)]
     let mut config = {
-        #[cfg(not(feature = "ktls"))]
+        #[cfg(not(veil_ktls))]
         let _ = ktls_enabled;
 
         let mut provider = rustls::crypto::aws_lc_rs::default_provider();
@@ -4879,7 +4910,7 @@ fn load_tls_config(
 
     // kTLS が有効な場合のみシークレット抽出を有効化
     // これにより dangerous_extract_secrets() が使用可能になる
-    #[cfg(feature = "ktls")]
+    #[cfg(veil_ktls)]
     if ktls_enabled {
         config.enable_secret_extraction = true;
         info!("TLS secret extraction enabled for kTLS support");

@@ -698,6 +698,23 @@ pub fn create_listener(
     // SO_REUSEPORT を有効にして listen する（カスタム io_uring 実装）
     let listener = TcpListener::bind_reuse_port(addr)?;
 
+    // FreeBSD: capsicum が有効なら、このリスナー fd を最小権利へ制限する（F-120 Phase 4）。
+    // 全リスナー作成経路（HTTP/H2C/L4）がこの関数を通るため、ここが単一の適用ポイント。
+    #[cfg(target_os = "freebsd")]
+    if CURRENT_CONFIG.load().global_security.enable_capsicum {
+        if let Err(e) = crate::security::capsicum::limit_listener_rights(listener.as_raw_fd()) {
+            warn!(
+                "[Worker {}] capsicum: failed to limit listener rights for {}: {}",
+                worker_id, addr, e
+            );
+        } else {
+            debug!(
+                "[Worker {}] capsicum: listener rights limited (CAP_ACCEPT|CAP_EVENT|...) for {}",
+                worker_id, addr
+            );
+        }
+    }
+
     // Linux環境でCBPF振り分けが有効な場合、最初のワーカーのみCBPFプログラムをアタッチ
     // 後続のワーカーはreuseportグループに参加し、自動的にBPFプログラムを継承する
     #[cfg(target_os = "linux")]
