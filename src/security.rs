@@ -2594,6 +2594,99 @@ pub mod capsicum {
     }
 }
 
+// ====================
+// OpenBSD: pledge + unveil（F-120 Phase 5）
+// ====================
+//
+// OpenBSD ネイティブのプロセスサンドボックス機構。Linux の seccomp/Landlock、
+// FreeBSD の capsicum + jail に相当する。
+//
+// - `unveil(2)`: プロセスが以降アクセス可能なファイルシステムパスをホワイトリスト化する。
+//   一度も unveil を呼んでいない間は全パスにアクセス可能（Linux/FreeBSD と同じ既定挙動）。
+//   最初に unveil を呼んだ瞬間から、明示的に unveil していないパスへのアクセスは
+//   `ENOENT` で拒否されるようになる。`unveil(NULL, NULL)` を呼ぶと以降の unveil 自体が
+//   禁止される（新規パス追加ができなくなる不可逆操作）。
+// - `pledge(2)`: プロセスが以降利用できるシステムコール群を "promise" 文字列
+//   （空白区切りのカテゴリ名）で宣言する。宣言に含まれないシステムコールを呼ぶと
+//   即座に `SIGABRT` でプロセスが終了する。再度 pledge して promise を**縮小**する
+//   ことは可能（拡大は不可）。
+//
+// `libc` クレートは OpenBSD 向けの `pledge`/`unveil` を公開していない
+// （2026-07 時点、libc 0.2.186 で未実装）ため、capsicum 同様に生の libc シンボルを
+// 直接 FFI 宣言する（`<unistd.h>` 由来、追加リンクは不要）。
+#[cfg(target_os = "openbsd")]
+pub mod pledge_unveil {
+    use ftlog::info;
+    use std::ffi::CString;
+    use std::io;
+    use std::path::Path;
+
+    // `int pledge(const char *promises, const char *execpromises);`
+    // `int unveil(const char *path, const char *permissions);`
+    //
+    // # 不変条件
+    // - `pledge`/`unveil` は OpenBSD libc（`<unistd.h>`）のシンボルであり、追加の
+    //   ライブラリリンクは不要。
+    // - 呼び出し側は渡す `CString` を呼び出し完了までスコープ内で生存させること。
+    unsafe extern "C" {
+        fn pledge(promises: *const libc::c_char, execpromises: *const libc::c_char) -> libc::c_int;
+        fn unveil(path: *const libc::c_char, permissions: *const libc::c_char) -> libc::c_int;
+    }
+
+    /// 指定パスを `permissions`（unveil(2) の権限文字列。例: `"r"`/`"rwc"`）で unveil する。
+    ///
+    /// パスが存在しない場合は unveil(2) 自体が `ENOENT` を返すため、呼び出し前に
+    /// 存在確認を行い、存在しないパスは何もせず `Ok(())` を返す（呼び出し元でログ出力する
+    /// 判断に委ねる。任意コンポーネント未使用によるパス欠如は致命的ではない）。
+    pub fn unveil_path(path: &Path, permissions: &str) -> io::Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        let path_c = CString::new(path.as_os_str().as_encoded_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path has NUL byte"))?;
+        let perm_c = CString::new(permissions)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "permissions has NUL byte"))?;
+        // SAFETY: path_c/perm_c はこの呼び出しが完了するまで生存する有効な NUL 終端バッファ。
+        let ret = unsafe { unveil(path_c.as_ptr(), perm_c.as_ptr()) };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// unveil をロックする（`unveil(NULL, NULL)`）。以降 unveil 呼び出し自体が失敗するようになる。
+    ///
+    /// 設定から導出した全パスの unveil が完了した後、初期化の最後に必ず 1 回呼ぶこと
+    /// （呼ばないと unveil は「宣言済みパス以外へのアクセス拒否」を強制しない）。
+    pub fn lock_unveil() -> io::Result<()> {
+        // SAFETY: NULL/NULL は unveil(2) がロック要求として定義する呼び出し形式。
+        let ret = unsafe { unveil(std::ptr::null(), std::ptr::null()) };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        info!("unveil: locked (no further unveil calls permitted)");
+        Ok(())
+    }
+
+    /// プロセスの promise 集合を pledge する。
+    ///
+    /// `execpromises` は常に `NULL`（veil は `exec(2)` 系を一切使わないため execpromises
+    /// 自体が不要）。再度呼んで promise を縮小することはできるが拡大はできない
+    /// （拡大しようとすると `EPERM`）。
+    pub fn pledge_promises(promises: &str) -> io::Result<()> {
+        let promises_c = CString::new(promises)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "promises has NUL byte"))?;
+        // SAFETY: promises_c はこの呼び出しが完了するまで生存する有効な NUL 終端バッファ。
+        // execpromises は NULL（exec 系を使わないため execpromises の宣言自体が不要）。
+        let ret = unsafe { pledge(promises_c.as_ptr(), std::ptr::null()) };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        info!("pledge: promises restricted to \"{}\"", promises);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1262,6 +1262,26 @@ pub struct GlobalSecurityConfig {
     /// 未設定なら jail_attach は行わない。
     #[serde(default)]
     pub jail_name: Option<String>,
+
+    // ====================
+    // OpenBSD: pledge / unveil（F-120 Phase 5）
+    // ====================
+    //
+    // 非対象 OS（Linux/FreeBSD）でもキー自体は受理し、未知キー拒否にはしない
+    // （設計ドキュメント 4.4 節）。適用時に警告ログを出して無視する。
+    /// unveil(2) を有効化（OpenBSD 専用）。
+    ///
+    /// 設定ファイル・TLS 証明書/鍵・静的ファイルルート・アクセスログ/アプリログの
+    /// ディレクトリ・ディスクキャッシュディレクトリ・WASM モジュールパスを
+    /// 必要権限（"r" / "rwc"）で unveil し、最後に `unveil(NULL, NULL)` でロックする。
+    #[serde(default)]
+    pub enable_unveil: bool,
+
+    /// pledge(2) を有効化（OpenBSD 専用）。
+    ///
+    /// 全 TLS ワーカーの listener bind 完了後に最小 promise 集合へ降格する。
+    #[serde(default)]
+    pub enable_pledge: bool,
 }
 
 fn default_allow_security_failures() -> bool {
@@ -1327,6 +1347,103 @@ fn default_landlock_read_paths() -> Vec<String> {
 
 fn default_landlock_write_paths() -> Vec<String> {
     vec!["/var/log".to_string(), "/tmp".to_string()]
+}
+
+// ====================
+// OpenBSD: unveil 対象パス収集（F-120 Phase 5）
+// ====================
+
+/// OpenBSD unveil(2) に渡すパス集合。
+#[cfg(target_os = "openbsd")]
+pub struct UnveilPaths {
+    /// 読み取り専用で unveil するパス（"r"）: 設定ファイル・TLS証明書/鍵・静的ファイル
+    /// ルート・WASM モジュール。
+    pub read_only: Vec<PathBuf>,
+    /// 読み書き・作成を伴う unveil するパス（"rwc"）: アクセスログ/アプリログの
+    /// ディレクトリ・ディスクキャッシュディレクトリ。
+    pub read_write_create: Vec<PathBuf>,
+}
+
+/// 設定ファイルを軽量に再パースし、unveil(2) に必要なパス集合を導出する（OpenBSD 専用）。
+///
+/// `load_config` が返す `LoadedConfig` は WASM エンジン構築・TLS 証明書読み込み等で
+/// 個々のパス文字列を消費済みで再取得できないフィールドがあるため、unveil 専用に
+/// 設定ファイルをもう一度パースする（起動時コールドパスで 1 回のみ・ホットパス無関係）。
+#[cfg(target_os = "openbsd")]
+pub fn collect_unveil_paths(config_path: &Path) -> io::Result<UnveilPaths> {
+    let config_str = fs::read_to_string(config_path)?;
+    let config: Config = toml::from_str(&config_str).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("TOML parse error: {}", e),
+        )
+    })?;
+
+    let mut read_only = vec![config_path.to_path_buf()];
+    let mut read_write_create = Vec::new();
+
+    read_only.push(PathBuf::from(&config.tls.cert_path));
+    read_only.push(PathBuf::from(&config.tls.key_path));
+
+    // プロキシ経路の名前解決（getaddrinfo）と upstream TLS 検証に必要なシステムファイル。
+    // 静的配信のみの構成では未使用だが、存在すれば読み取り許可しておく（unveil_path は
+    // 不存在パスをスキップするため、無害）。Landlock のデフォルト読み取りパスと同方針。
+    for sys_path in [
+        "/etc/resolv.conf",
+        "/etc/hosts",
+        "/etc/ssl/cert.pem", // OpenBSD のシステム信頼ストア
+        "/etc/ssl",
+    ] {
+        read_only.push(PathBuf::from(sys_path));
+    }
+
+    if let Some(routes) = &config.route {
+        for route in routes {
+            if let BackendConfig::File { path, .. } = &route.action {
+                read_only.push(PathBuf::from(path));
+            }
+            if let Some(cache_cfg) = &route.cache {
+                if let Some(disk_path) = &cache_cfg.disk_path {
+                    read_write_create.push(disk_path.clone());
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "wasm")]
+    if let Some(wasm_cfg) = &config.wasm {
+        for module in &wasm_cfg.modules {
+            read_only.push(PathBuf::from(&module.path));
+        }
+    }
+
+    #[cfg(feature = "access-log")]
+    if let Some(file_path) = &config.access_log.file_path {
+        push_unveil_parent_dir(&mut read_write_create, file_path);
+    }
+
+    if let Some(file_path) = &config.logging.app_file_path {
+        push_unveil_parent_dir(&mut read_write_create, file_path);
+    }
+    if let Some(file_path) = &config.logging.error_file_path {
+        push_unveil_parent_dir(&mut read_write_create, file_path);
+    }
+
+    Ok(UnveilPaths {
+        read_only,
+        read_write_create,
+    })
+}
+
+/// ログ/アクセスログファイルパスの親ディレクトリ（ローテーション・新規作成に必要）を
+/// rwc 対象へ追加する。親ディレクトリが取得できない場合はファイルパス自体を追加する。
+#[cfg(target_os = "openbsd")]
+fn push_unveil_parent_dir(paths: &mut Vec<PathBuf>, file_path: &str) {
+    let p = Path::new(file_path);
+    match p.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => paths.push(parent.to_path_buf()),
+        _ => paths.push(p.to_path_buf()),
+    }
 }
 
 // ====================

@@ -545,6 +545,31 @@ reuseport_balancing = "cbpf"
 # jail_name = "veil-jail"
 
 # ============================================
+# pledge / unveil 設定 (OpenBSD専用、F-120 Phase 5)
+# ============================================
+#
+# OpenBSD ネイティブのプロセスサンドボックス（Linux の seccomp/Landlock、FreeBSD の
+# capsicum + jail 相当）。本キーは全 OS で受理されるが、OpenBSD 以外では警告ログの
+# みで無視される。kTLS は非対応（OpenBSD ビルドは常に simple_tls = ユーザ空間 rustls）。
+#
+# enable_unveil = true にすると:
+#   - 設定ファイル・TLS証明書/鍵・静的ファイルルート・WASM モジュールを読み取り専用
+#     （"r"）で、アクセスログ/アプリログのディレクトリ・ディスクキャッシュディレクトリを
+#     読み書き・作成可能（"rwc"）で unveil(2) し、最後に unveil(NULL, NULL) でロックする。
+#   - ロック後は、ここで unveil していないパスへのアクセスは全て拒否される
+#     （ホットリロードで新しいパスを設定に追加した場合、そのパスへのアクセスは失敗する
+#     点に注意。ロールバック用に旧パスも設定に残すか、プロセスを再起動すること）。
+#
+# enable_unveil = true
+
+# pledge(2) による最小 promise 集合への降格（OpenBSD専用、オプトイン）。
+# 全 TLS ワーカーの listener bind 完了後に適用される。promise に含まれない
+# システムコールを呼ぶとプロセスは即座に SIGABRT で終了する（不可逆、再 pledge に
+# よる縮小のみ可能）。実証済みの最小構成は `src/entry.rs` の `PLEDGE_PROMISES`
+# （"stdio rpath wpath cpath inet dns flock"）を参照。
+# enable_pledge = true
+
+# ============================================
 # 本番環境向け推奨設定
 # ============================================
 #

@@ -38,9 +38,32 @@ epoll 系 syscall を許可しない（最小権限）。
 - [x] Phase 2: epoll バックエンド + seccomp 分割
 - [x] Phase 3: aarch64 クロスビルド + QEMU 確認
 - [x] Phase 4: FreeBSD（kqueue + capsicum + jail_attach、x86_64）
-- [ ] Phase 5: OpenBSD（pledge + unveil）
+- [x] Phase 5: OpenBSD（ビルド + kqueue + pledge + unveil、kTLS 非対応。
+  ただし TLS は aws-lc-rs の OpenBSD 制約でハンドシェイク未完 → **F-122**）
 - [ ] Phase 6: packaging
 - [ ] Phase 7: 最終検証・ドキュメント
+
+## Phase 5 の記録（OpenBSD 7.9 VM 検証）
+
+### 状態: コード完成・build/kqueue/pledge/unveil 動作、TLS は aws-lc-rs 制約でブロック
+
+| 項目 | OpenBSD 7.9 amd64 | 備考 |
+|---|---|---|
+| ビルド（http2,mimalloc / + http3,grpc-full,compression,cache,metrics,websocket,rate-limit,buffering,admin,access-log,l4-proxy） | ✅ warning 0 | libclang パス（`LIBCLANG_PATH=/usr/local/llvm19/lib`）が bindgen に必要。VM は datasize-cur=1536M のため rustc がメモリ超過で killed → `ulimit -d unlimited`・`CARGO_PROFILE_DEV_DEBUG=0`・nohup ではなく tmux で回避（nohup は ssh セッション終了時の SIGTERM を防げない） |
+| kqueue reactor（accept/read/イベント配送） | ✅ | ktrace で accept4→kevent 配送→read(ClientHello 1519B) を確認 |
+| pledge / unveil | ✅ | 起動時 `unveil: locked` / `pledge: promises restricted to "stdio rpath wpath cpath inet dns flock"` を確認 |
+| kTLS | ❌（設計どおり） | OpenBSD は kTLS 非対応。simple_tls（ユーザ空間 rustls）へフォールバック |
+| **TLS ハンドシェイク（HTTPS 応答）** | ❌ **F-122** | ClientHello 受信後 ServerHello を生成せず（write(7) 0 回）。**aws-lc-rs（AWS-LC C 暗号）が OpenBSD でハンドシェイク暗号を完了できない**。Linux/FreeBSD の同一 aws-lc-rs は正常のため OpenBSD Tier-3 の暗号ライブラリ問題。ring provider 等で解消予定（F-122） |
+
+- **memfd フォールバック**: `memfd_create(2)` は OpenBSD に無いため、HTTP/3 証明書ホット
+  リロードの `create_memfd_for_pem` を OpenBSD では 0600 の一時ファイル（Drop で unlink）へ
+  フォールバック（Linux/FreeBSD は memfd + /proc/self/fd を維持）。
+- **SO_REUSEPORT**: OpenBSD は SO_REUSEPORT_LB 非搭載のため `not(freebsd)` 分岐の
+  SO_REUSEPORT を使用（既存コードでカバー）。
+- **VM 検証の教訓**: nohup+`&` は OpenBSD で ssh セッション切断時に SIGTERM を受けて
+  ビルドが死ぬ。tmux セッションで実行すると独立して完走する。ソース同期は rsync だが
+  `-a`（mtime 保持）だと VM のキャッシュ済み .rlib より古い mtime で cargo が再コンパイルを
+  スキップするため、確実な再ビルドには VM 側で `touch src/**` するか mtime に注意。
 
 ## Phase 3 の知見（QEMU user-mode 検証）
 

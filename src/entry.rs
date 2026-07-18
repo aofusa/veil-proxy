@@ -24,6 +24,20 @@ pub use crate::config::*;
 use crate::proxy::*;
 use crate::server::*;
 
+/// OpenBSD pledge(2) の promise 集合（F-120 Phase 5）。
+///
+/// VM E2E での実証（`docs/backlog/features/F-120-cross-platform-epoll-kqueue-bsd.md`
+/// の Phase 5 記録を参照）に基づく最小構成:
+/// - `stdio`: 既に開いている fd への read/write（accept 済み接続・ログ出力）。
+/// - `rpath`: TLS 証明書/鍵・静的ファイル・WASM モジュールの読み取り。
+/// - `wpath`/`cpath`: アクセスログ/アプリログのローテーション・ディスクキャッシュの
+///   新規ファイル作成。
+/// - `inet`: TCP/UDP ソケット（bind/listen/accept/connect を含む）。
+/// - `dns`: upstream ホスト名解決（`getaddrinfo`）。
+/// - `flock`: ログライブラリ（ftlog）のファイルロック。
+#[cfg(target_os = "openbsd")]
+const PLEDGE_PROMISES: &str = "stdio rpath wpath cpath inet dns flock";
+
 // ====================
 // ワーカースレッド
 // ====================
@@ -129,6 +143,70 @@ pub fn run() {
     #[cfg(not(target_os = "freebsd"))]
     if loaded_config.global_security.jail_name.is_some() {
         warn!("jail_name is set but this build does not target FreeBSD; ignoring");
+    }
+
+    // OpenBSD: unveil(2)（F-120 Phase 5）。
+    //
+    // 設定パスが確定した直後（TLS 証明書/鍵・WASM モジュールは load_config 内で既に
+    // 読み込み済み・静的ファイルルートやログ/キャッシュディレクトリはこれから使う）に、
+    // 設定から導出したパス集合のみへアクセスを制限する。unveil は最初の呼び出し以降
+    // 明示的に unveil していないパスを ENOENT で拒否するため、最後に必ず
+    // `unveil(NULL, NULL)` でロックする（ロードパスに漏れがあると以降の全アクセスが
+    // 失敗し得るため、`allow_security_failures` に応じて起動可否を判断する）。
+    #[cfg(target_os = "openbsd")]
+    if loaded_config.global_security.enable_unveil {
+        match crate::config::collect_unveil_paths(&config_path) {
+            Ok(paths) => {
+                let mut all_ok = true;
+                for p in &paths.read_only {
+                    if let Err(e) = crate::security::pledge_unveil::unveil_path(p, "r") {
+                        warn!("unveil: failed to unveil '{}' (r): {}", p.display(), e);
+                        all_ok = false;
+                    }
+                }
+                for p in &paths.read_write_create {
+                    // ディスクキャッシュ/ログディレクトリは初回書き込み時に自動作成される
+                    // 実装だが、unveil は不存在パスに対する効果を保証しないため、
+                    // ここで事前に作成しておく（起動時コールドパスの同期 fs 操作）。
+                    if let Err(e) = std::fs::create_dir_all(p) {
+                        warn!(
+                            "unveil: failed to create directory '{}': {}",
+                            p.display(),
+                            e
+                        );
+                    }
+                    if let Err(e) = crate::security::pledge_unveil::unveil_path(p, "rwc") {
+                        warn!("unveil: failed to unveil '{}' (rwc): {}", p.display(), e);
+                        all_ok = false;
+                    }
+                }
+                match crate::security::pledge_unveil::lock_unveil() {
+                    Ok(()) => info!(
+                        "unveil: locked ({} read-only, {} read-write-create paths)",
+                        paths.read_only.len(),
+                        paths.read_write_create.len()
+                    ),
+                    Err(e) => {
+                        error!("unveil: failed to lock: {}", e);
+                        all_ok = false;
+                    }
+                }
+                if !all_ok && !loaded_config.global_security.allow_security_failures {
+                    error!("unveil: one or more steps failed; aborting startup (set allow_security_failures = true to continue)");
+                    return;
+                }
+            }
+            Err(e) => {
+                error!("unveil: failed to collect paths from config: {}", e);
+                if !loaded_config.global_security.allow_security_failures {
+                    return;
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "openbsd"))]
+    if loaded_config.global_security.enable_unveil {
+        warn!("enable_unveil is set but this build does not target OpenBSD; ignoring");
     }
 
     // Huge Pages (Large OS Pages) 設定
@@ -648,6 +726,10 @@ pub fn run() {
     {
         warn!("enable_capsicum / capsicum_capability_mode is set but this build does not target FreeBSD; ignoring");
     }
+    #[cfg(not(target_os = "openbsd"))]
+    if loaded_config.global_security.enable_pledge {
+        warn!("enable_pledge is set but this build does not target OpenBSD; ignoring");
+    }
 
     // 同時接続数制限
     let max_connections = loaded_config.global_security.max_concurrent_connections;
@@ -669,6 +751,14 @@ pub fn run() {
     #[cfg(target_os = "freebsd")]
     let listeners_ready = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
+    // OpenBSD pledge(2) 用の bind 完了バリア。
+    // pledge の "inet" promise は bind(2)/connect(2)/accept(2) を許すため FreeBSD の
+    // capability mode ほど厳密なバリアは不要という見立てだが、適用順序を保守的に
+    // 揃えるため FreeBSD と同じ「全ワーカー bind 完了後」に pledge する
+    // （設計ドキュメント 4.3 節、E2E で実証の上 Phase 5 メモに記録）。
+    #[cfg(target_os = "openbsd")]
+    let listeners_ready = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
     // 通常のTLSリスナーを起動（H2C専用サーバーの場合はスキップ）
     if !is_h2c_only_server {
         info!("============================================");
@@ -686,6 +776,8 @@ pub fn run() {
             let workers = num_threads;
             let max_conn = max_connections;
             #[cfg(target_os = "freebsd")]
+            let listeners_ready = std::sync::Arc::clone(&listeners_ready);
+            #[cfg(target_os = "openbsd")]
             let listeners_ready = std::sync::Arc::clone(&listeners_ready);
 
             // このスレッドに割り当てるコアIDを決定
@@ -719,6 +811,9 @@ pub fn run() {
                     };
                     // capability mode バリア: bind 完了を通知（FreeBSD、コールドパス）。
                     #[cfg(target_os = "freebsd")]
+                    listeners_ready.fetch_add(1, std::sync::atomic::Ordering::Release);
+                    // pledge バリア: bind 完了を通知（OpenBSD、コールドパス）。
+                    #[cfg(target_os = "openbsd")]
                     listeners_ready.fetch_add(1, std::sync::atomic::Ordering::Release);
 
                     info!("[Thread {}] Worker started", thread_id);
@@ -825,6 +920,49 @@ pub fn run() {
                     );
                 })
                 .expect("failed to spawn veil-cap-enter thread");
+        }
+
+        // OpenBSD pledge（オプトイン）: 全 TLS ワーカーの bind 完了を待って pledge する
+        // （バリアの根拠は前段コメント。promise 集合は E2E で実証した最小構成
+        //   — docs/backlog/features/F-120 の Phase 5 記録を参照）。
+        #[cfg(target_os = "openbsd")]
+        if loaded_config.global_security.enable_pledge {
+            let listeners_ready = std::sync::Arc::clone(&listeners_ready);
+            let expected = num_threads;
+            let allow_failures = loaded_config.global_security.allow_security_failures;
+            std::thread::Builder::new()
+                .name("veil-pledge".to_string())
+                .spawn(move || {
+                    use std::sync::atomic::Ordering;
+                    // 起動時コールドパスの専用監視スレッド（イベントループ外）のため
+                    // ポーリング sleep でよい。最大 ~30 秒待つ。
+                    for _ in 0..3000 {
+                        if listeners_ready.load(Ordering::Acquire) >= expected {
+                            match crate::security::pledge_unveil::pledge_promises(PLEDGE_PROMISES) {
+                                Ok(()) => info!(
+                                    "pledge: promises restricted ({} listeners bound)",
+                                    expected
+                                ),
+                                Err(e) => {
+                                    error!("pledge: failed to apply: {}", e);
+                                    if !allow_failures {
+                                        std::process::exit(1);
+                                    }
+                                }
+                            }
+                            return;
+                        }
+                        // 理由付き allow: 起動時コールドパスの専用スレッド。イベントループを
+                        // ブロックしない。
+                        #[allow(clippy::disallowed_methods)]
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    error!(
+                        "pledge: timed out waiting for {} listeners; pledge NOT applied",
+                        expected
+                    );
+                })
+                .expect("failed to spawn veil-pledge thread");
         }
     } else {
         info!("Skipping TLS listener (H2C-only server detected)");
