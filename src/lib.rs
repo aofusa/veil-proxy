@@ -34,11 +34,17 @@ pub mod protocol;
 #[cfg(feature = "http2")]
 pub mod http2;
 
+/// HTTP/3 サーバ（ngtcp2 / quiche バックエンド切替。`build.rs` の cfg 参照）
 #[cfg(feature = "http3")]
-pub mod http3_server;
+pub mod http3;
 
+/// 後方互換エイリアス（`entry` / `config` / 既存テストが `http3_server::` を参照）
 #[cfg(feature = "http3")]
-pub mod http3_stream;
+pub use http3 as http3_server;
+
+/// 後方互換エイリアス（ストリーミングアクター）
+#[cfg(feature = "http3")]
+pub use http3::stream as http3_stream;
 
 #[cfg(feature = "http3")]
 pub mod udp;

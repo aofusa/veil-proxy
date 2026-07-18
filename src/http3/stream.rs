@@ -6,7 +6,7 @@
 //! ## アクターモデル（thread-per-core・ロックフリー）
 //!
 //! quiche の `Connection` / `h3::Connection` は `Send` でなく、UDP I/O・ACK・フロー制御を
-//! 単一スレッドの **メインループ**（[`crate::http3_server`] の `run_http3_server_async`）が
+//! 単一スレッドの **メインループ**（[`crate::http3`] の `run_http3_server_async`）が
 //! 専有して駆動する。そのため「バックエンドへの TCP I/O」をメインループ内で同期的に行うと
 //! QUIC コネクション全体（他ストリームの ACK 含む）が停止してしまう。
 //!
@@ -935,7 +935,7 @@ async fn stream_response_compressed(
         }
     }
 
-    let compressed = crate::http3_server::compress_body_h3(&body, enc, compression);
+    let compressed = crate::http3::compress_body_h3(&body, enc, compression);
 
     // ヘッダ調整: content-length / content-encoding を差し替え。
     let mut headers = parsed.headers;

@@ -33,7 +33,9 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::http3::common::{compress_body_h3, secure_zero, BackendProxyResult, Http3ServerConfig};
 use crate::udp::QuicUdpSocket;
+
 // F-122: RNG は OpenBSD では ring、他は aws-lc-rs（crate::tls_provider で選択）。
 use crate::tls_provider::{SecureRandom, SystemRandom};
 use bytes::{BufMut, Bytes, BytesMut};
@@ -297,78 +299,6 @@ fn reload_quiche_certs(
 /// メモリ上の機密データを安全にゼロ化します。
 /// コンパイラによる最適化（デッドストア削除）を防ぐため、
 /// volatile 書き込みを使用します。
-fn secure_zero(data: &mut [u8]) {
-    // volatile 書き込みで最適化を防止
-    for byte in data.iter_mut() {
-        unsafe {
-            std::ptr::write_volatile(byte, 0);
-        }
-    }
-    // メモリバリアで確実に書き込みを完了
-    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-}
-
-/// HTTP/3 サーバー設定
-#[derive(Clone)]
-pub struct Http3ServerConfig {
-    /// TLS 証明書パス（後方互換性のため残す、cert_pem優先）
-    pub cert_path: String,
-    /// TLS 秘密鍵パス（後方互換性のため残す、key_pem優先）
-    pub key_path: String,
-    /// TLS 証明書（PEM形式、事前読み込み済み）
-    ///
-    /// Landlock適用前に読み込まれた証明書バイト列。
-    /// 設定されている場合、cert_pathより優先される。
-    ///
-    /// 注意: 使用後にセキュアにゼロ化されます。
-    pub cert_pem: Option<Vec<u8>>,
-    /// TLS 秘密鍵（PEM形式、事前読み込み済み）
-    ///
-    /// Landlock適用前に読み込まれた秘密鍵バイト列。
-    /// 設定されている場合、key_pathより優先される。
-    ///
-    /// 注意: 使用後にセキュアにゼロ化されます。
-    pub key_pem: Option<Vec<u8>>,
-    /// 最大アイドルタイムアウト（ミリ秒）
-    pub max_idle_timeout: u64,
-    /// 最大 UDP ペイロードサイズ
-    pub max_udp_payload_size: u64,
-    /// 初期最大データサイズ
-    pub initial_max_data: u64,
-    /// 初期最大ストリームデータサイズ（双方向）
-    pub initial_max_stream_data_bidi_local: u64,
-    /// 初期最大ストリームデータサイズ（双方向リモート）
-    pub initial_max_stream_data_bidi_remote: u64,
-    /// 初期最大ストリームデータサイズ（単方向）
-    pub initial_max_stream_data_uni: u64,
-    /// 初期最大双方向ストリーム数
-    pub initial_max_streams_bidi: u64,
-    /// 初期最大単方向ストリーム数
-    pub initial_max_streams_uni: u64,
-    /// GSO/GRO を有効化するかどうか（デフォルト: false）
-    pub gso_gro_enabled: bool,
-}
-
-impl Default for Http3ServerConfig {
-    fn default() -> Self {
-        Self {
-            cert_path: String::new(),
-            key_path: String::new(),
-            cert_pem: None,
-            key_pem: None,
-            max_idle_timeout: 30000,
-            max_udp_payload_size: 1350,
-            initial_max_data: 10_000_000,
-            initial_max_stream_data_bidi_local: 1_000_000,
-            initial_max_stream_data_bidi_remote: 1_000_000,
-            initial_max_stream_data_uni: 1_000_000,
-            initial_max_streams_bidi: 100,
-            initial_max_streams_uni: 100,
-            gso_gro_enabled: false,
-        }
-    }
-}
-
 /// リクエスト 1 件のストリーミング状態（メインループ側、F-32）。
 ///
 /// バックエンドタスクとはチャネル経由で接続される。本構造体はメインループのみが
@@ -377,11 +307,11 @@ impl Default for Http3ServerConfig {
 struct ProxyStream {
     // ---- レスポンス方向（バックエンドタスク → メインループ） ----
     /// レスポンス断片の受信端。
-    resp_rx: crate::http3_stream::Receiver<crate::http3_stream::RespMsg>,
+    resp_rx: crate::http3::stream::Receiver<crate::http3::stream::RespMsg>,
     /// `send_response`（head）送出済みか。
     resp_started: bool,
     /// StreamBlocked で送出保留中の head（次回 drive で再送）。
-    head_pending: Option<(u16, crate::http3_stream::RespHeaders)>,
+    head_pending: Option<(u16, crate::http3::stream::RespHeaders)>,
     /// フロー制御で部分送信になったボディ断片（`(buf, 送信済みオフセット)`）。
     body_pending: Option<(Bytes, usize)>,
     /// レスポンス終端（EOF）を受信し、fin 送出が必要（フロー制御で保留中）。
@@ -391,7 +321,7 @@ struct ProxyStream {
 
     // ---- リクエスト方向（メインループ → バックエンドタスク） ----
     /// リクエストボディ断片の送信端（クライアント END_STREAM で None にして EOF 伝播）。
-    req_tx: Option<crate::http3_stream::Sender<Bytes>>,
+    req_tx: Option<crate::http3::stream::Sender<Bytes>>,
     /// チャネルへ未投入のボディ（初回バッチ分／満杯時の溢れ）。
     req_pending: VecDeque<Bytes>,
     /// quiche にリクエストボディの読み取り可能データがある（Data イベントで true）。
@@ -408,8 +338,8 @@ struct ProxyStream {
 
 impl ProxyStream {
     fn new(
-        resp_rx: crate::http3_stream::Receiver<crate::http3_stream::RespMsg>,
-        req_tx: crate::http3_stream::Sender<Bytes>,
+        resp_rx: crate::http3::stream::Receiver<crate::http3::stream::RespMsg>,
+        req_tx: crate::http3::stream::Sender<Bytes>,
         has_body: bool,
         max_request_body: u64,
     ) -> Self {
@@ -460,7 +390,7 @@ enum RecvOutcome {
 #[allow(clippy::large_enum_variant)]
 enum Decision {
     /// ストリーミング適格 → バックエンドタスクを spawn。
-    Stream(crate::http3_stream::BackendTaskParams),
+    Stream(crate::http3::stream::BackendTaskParams),
     /// 非適格 → バッファ経路（`handle_request`）。
     Buffer,
     /// classify が即時応答済み（セキュリティ拒否など）。
@@ -506,9 +436,9 @@ struct Http3Handler {
     /// ストリームごとのリクエストボディ蓄積（バッファ経路 + ストリーミング初回バッチ）。
     stream_bodies: HashMap<u64, BytesMut>,
     /// バックエンドタスク → メインループの起床通知（F-32）。
-    notify: crate::http3_stream::H3Notify,
+    notify: crate::http3::stream::H3Notify,
     /// バックエンドタスクのスポーナ（F-46: 型付きタスクプール。ワーカースレッドで共有）。
-    backend_spawner: crate::http3_stream::BackendSpawner,
+    backend_spawner: crate::http3::stream::BackendSpawner,
     /// F-99: QUIC 接続ゲージ（Drop で自動 dec。ホットパス無アロケーション）
     _conn_metric: Http3ActiveConnGuard,
     /// F-99: メトリクス計上中のリクエストストリーム ID（open/close の二重計上防止）
@@ -520,8 +450,8 @@ impl Http3Handler {
     fn new(
         conn: quiche::Connection,
         peer_addr: SocketAddr,
-        notify: crate::http3_stream::H3Notify,
-        backend_spawner: crate::http3_stream::BackendSpawner,
+        notify: crate::http3::stream::H3Notify,
+        backend_spawner: crate::http3::stream::BackendSpawner,
     ) -> Self {
         Self {
             conn,
@@ -658,9 +588,10 @@ impl Http3Handler {
             self.metric_stream_open(stream_id);
             match self.classify(stream_id, &headers, more_frames) {
                 Decision::Stream(params) => {
-                    let (req_tx, req_rx) = crate::http3_stream::channel::<Bytes>(REQ_CHAN_CAP);
-                    let (resp_tx, resp_rx) =
-                        crate::http3_stream::channel::<crate::http3_stream::RespMsg>(RESP_CHAN_CAP);
+                    let (req_tx, req_rx) = crate::http3::stream::channel::<Bytes>(REQ_CHAN_CAP);
+                    let (resp_tx, resp_rx) = crate::http3::stream::channel::<
+                        crate::http3::stream::RespMsg,
+                    >(RESP_CHAN_CAP);
                     let mut ps =
                         ProxyStream::new(resp_rx, req_tx, more_frames, params.max_request_body);
                     // 初回バッチで届いていたボディを取り込む。
@@ -953,7 +884,7 @@ impl Http3Handler {
         let sni = server.target.sni().to_string();
         let tls_insecure = upstream_group.tls_insecure();
 
-        Decision::Stream(crate::http3_stream::BackendTaskParams {
+        Decision::Stream(crate::http3::stream::BackendTaskParams {
             server,
             request_head,
             has_request_body: more_frames,
@@ -2445,7 +2376,7 @@ fn drive_request_pump(
     stream_id: u64,
     ps: &mut ProxyStream,
 ) {
-    use crate::http3_stream::TrySendError;
+    use crate::http3::stream::TrySendError;
     let tx = match &ps.req_tx {
         Some(t) => t,
         None => return,
@@ -2545,7 +2476,7 @@ fn drive_response_flush(
     stream_id: u64,
     ps: &mut ProxyStream,
 ) {
-    use crate::http3_stream::{RespMsg, TryRecv};
+    use crate::http3::stream::{RespMsg, TryRecv};
 
     if ps.resp_fin_sent {
         return;
@@ -2783,19 +2714,7 @@ fn send_simple_h3_error(
 // 非同期バックエンドプロキシ（monoio TcpStream 使用）
 // ====================
 
-/// バックエンドプロキシ結果
-pub struct BackendProxyResult {
-    /// HTTPステータスコード
-    pub status_code: u16,
-    /// レスポンスボディ
-    pub body: Vec<u8>,
-    /// レスポンスヘッダー（(name, value) のペア）
-    pub headers: Vec<(Vec<u8>, Vec<u8>)>,
-    /// HTTP/2 trailers（H2C/gRPC 用。H1 バックエンドでは空）
-    pub trailers: Vec<(Vec<u8>, Vec<u8>)>,
-}
-
-pub(crate) async fn proxy_to_backend_async_with_tls(
+async fn proxy_to_backend_async_with_tls(
     target: &ProxyTarget,
     request: Vec<u8>,
     timeout_secs: u64,
@@ -3497,9 +3416,9 @@ pub async fn run_http3_server_async(
     let connections: ConnectionMap = Rc::new(RefCell::new(HashMap::new()));
 
     // F-32: バックエンドタスク → メインループの起床通知（全ハンドラ/タスクで共有）。
-    let notify = crate::http3_stream::H3Notify::new();
+    let notify = crate::http3::stream::H3Notify::new();
     // F-46: バックエンドタスクの型付きプール（本ワーカースレッドの全接続で共有）。
-    let backend_spawner = crate::http3_stream::backend_task_spawner();
+    let backend_spawner = crate::http3::stream::backend_task_spawner();
 
     // 乱数生成器
     let rng = SystemRandom::new();
@@ -3813,8 +3732,8 @@ fn process_datagram_segments(
     rng: &SystemRandom,
     quic_config: &Rc<RefCell<quiche::Config>>,
     local_addr: SocketAddr,
-    notify: &crate::http3_stream::H3Notify,
-    backend_spawner: &crate::http3_stream::BackendSpawner,
+    notify: &crate::http3::stream::H3Notify,
+    backend_spawner: &crate::http3::stream::BackendSpawner,
 ) -> io::Result<()> {
     let total = data.len();
     // GRO セグメントサイズ。None/0（GRO 非適用 = 単発データグラム）の場合は
@@ -4299,71 +4218,6 @@ pub fn run_http3_server(bind_addr: SocketAddr, config: Http3ServerConfig) -> io:
 // ====================
 // ヘルパー関数
 // ====================
-
-/// HTTP/3 用レスポンスボディ圧縮ヘルパー関数
-///
-/// バイト配列を受け取り、指定されたエンコーディングで圧縮して返します。
-/// 圧縮に失敗した場合は元のデータをそのまま返します。
-#[cfg(feature = "compression")]
-pub(crate) fn compress_body_h3(
-    body: &[u8],
-    encoding: AcceptedEncoding,
-    compression: &CompressionConfig,
-) -> Vec<u8> {
-    use flate2::write::GzEncoder;
-    use flate2::Compression;
-    use std::io::Write;
-
-    match encoding {
-        AcceptedEncoding::Zstd => {
-            match zstd::encode_all(std::io::Cursor::new(body), compression.zstd_level) {
-                Ok(compressed) => compressed,
-                Err(_) => body.to_vec(),
-            }
-        }
-        AcceptedEncoding::Gzip => {
-            let level = Compression::new(compression.gzip_level);
-            let mut encoder = GzEncoder::new(Vec::with_capacity(body.len()), level);
-            if encoder.write_all(body).is_err() {
-                return body.to_vec();
-            }
-            encoder.finish().unwrap_or_else(|_| body.to_vec())
-        }
-        AcceptedEncoding::Brotli => {
-            let mut compressed = Vec::with_capacity(body.len());
-            let params = brotli::enc::BrotliEncoderParams {
-                quality: compression.brotli_level as i32,
-                ..Default::default()
-            };
-            let mut input = std::io::Cursor::new(body);
-            if brotli::BrotliCompress(&mut input, &mut compressed, &params).is_err() {
-                return body.to_vec();
-            }
-            compressed
-        }
-        AcceptedEncoding::Deflate => {
-            use flate2::write::DeflateEncoder;
-            let level = Compression::new(compression.gzip_level);
-            let mut encoder = DeflateEncoder::new(Vec::with_capacity(body.len()), level);
-            if encoder.write_all(body).is_err() {
-                return body.to_vec();
-            }
-            encoder.finish().unwrap_or_else(|_| body.to_vec())
-        }
-        AcceptedEncoding::Identity => body.to_vec(),
-    }
-}
-
-/// compression feature 無効時のスタブ
-#[cfg(not(feature = "compression"))]
-#[inline]
-pub(crate) fn compress_body_h3(
-    body: &[u8],
-    _encoding: AcceptedEncoding,
-    _compression: &CompressionConfig,
-) -> Vec<u8> {
-    body.to_vec()
-}
 
 /// HTTPレスポンスのヘッダー終端（\r\n\r\n）を探す
 fn find_header_end(data: &[u8]) -> Option<usize> {
