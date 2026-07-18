@@ -32,6 +32,10 @@
 pub mod buf;
 pub mod io;
 pub mod offload;
+// L4 UDP プロキシ専用の汎用 UDP ソケット（F-124）。`l4-proxy` feature でのみ使用するため
+// dead_code 警告を避けるべくゲートする。
+#[cfg(feature = "l4-proxy")]
+pub mod udp;
 
 #[cfg(veil_rt_reactor)]
 mod reactor;
@@ -55,6 +59,8 @@ pub use executor::{spawn, yield_now, Executor, TaskPool};
 pub use ring::IoUring;
 pub use tcp::{TcpListener, TcpStream};
 pub use timer::{sleep, timeout, Elapsed};
+#[cfg(feature = "l4-proxy")]
+pub use udp::UdpSocket;
 
 /// 現在のスレッドにランタイムドライバ（io_uring リング、または reactor の poller）が
 /// 初期化済みかを判定する、バックエンド中立な API。

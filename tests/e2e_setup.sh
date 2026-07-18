@@ -47,6 +47,7 @@ PROXY_H2C_PORT=8081
 PROXY_L4_PORT=8444
 PROXY_L4_LEAST_CONN_PORT=8445
 PROXY_L4_TERMINATE_PORT=8446
+PROXY_L4_UDP_PORT=8447
 BACKEND1_PORT=9001
 BACKEND2_PORT=9002
 BACKEND_H2C_TLS_PORT=9013
@@ -59,6 +60,7 @@ BACKEND_BAD_PORT=9009
 BACKEND_CHUNKED_PORT=9007
 BACKEND_ECHO_PORT=9008
 BACKEND_TLS_ECHO_PORT=9018
+BACKEND_UDP_ECHO_PORT=9019
 
 # 色付き出力
 RED='\033[0;31m'
@@ -481,6 +483,17 @@ tls = "terminate"
 
   [[l4.upstreams]]
   addr = "127.0.0.1:${BACKEND_ECHO_PORT}"
+
+# L4 UDP プロキシ（セッションテーブル方式、F-124）
+[[l4]]
+name = "l4-udp-echo"
+listen = "127.0.0.1:${PROXY_L4_UDP_PORT}"
+protocol = "udp"
+lb = "round_robin"
+idle_timeout_secs = 10
+
+  [[l4.upstreams]]
+  addr = "127.0.0.1:${BACKEND_UDP_ECHO_PORT}"
 
 [upstreams."backend-pool"]
 algorithm = "${algorithm}"
@@ -1582,15 +1595,16 @@ start_servers() {
     log_info "Starting Rust test backends (WS echo + HTTP error + chunked + body-echo)..."
     WS_PORT="${BACKEND_WS_PORT}" ERROR_PORT="${BACKEND_ERROR_PORT}" BAD_PORT="${BACKEND_BAD_PORT}" CHUNKED_PORT="${BACKEND_CHUNKED_PORT}" ECHO_PORT="${BACKEND_ECHO_PORT}" \
         TLS_ECHO_PORT="${BACKEND_TLS_ECHO_PORT}" TLS_CERT_PATH="${FIXTURES_DIR}/cert.pem" TLS_KEY_PATH="${FIXTURES_DIR}/key.pem" \
+        UDP_ECHO_PORT="${BACKEND_UDP_ECHO_PORT}" \
         RUST_LOG=info "${SCRIPT_DIR}/test_backends/target/debug/test-backends" \
         > /tmp/test_backends.log 2>&1 &
     echo $! >> "$PIDS_FILE"
-    log_info "Test backends started (WS: ${BACKEND_WS_PORT}, error: ${BACKEND_ERROR_PORT}, chunked: ${BACKEND_CHUNKED_PORT}, echo: ${BACKEND_ECHO_PORT}, PID: $!, logs: /tmp/test_backends.log)"
+    log_info "Test backends started (WS: ${BACKEND_WS_PORT}, error: ${BACKEND_ERROR_PORT}, chunked: ${BACKEND_CHUNKED_PORT}, echo: ${BACKEND_ECHO_PORT}, udp-echo: ${BACKEND_UDP_ECHO_PORT}, PID: $!, logs: /tmp/test_backends.log)"
 
     # test_backendsの起動待機（全ポートがリッスン状態になるまで）
     local tb_wait=0
     while [ $tb_wait -lt 30 ]; do
-        if check_port_in_use "$BACKEND_WS_PORT" && check_port_in_use "$BACKEND_ERROR_PORT" && check_port_in_use "$BACKEND_CHUNKED_PORT" && check_port_in_use "$BACKEND_ECHO_PORT" && check_port_in_use "$BACKEND_TLS_ECHO_PORT" && check_port_in_use "$BACKEND_BAD_PORT"; then
+        if check_port_in_use "$BACKEND_WS_PORT" && check_port_in_use "$BACKEND_ERROR_PORT" && check_port_in_use "$BACKEND_CHUNKED_PORT" && check_port_in_use "$BACKEND_ECHO_PORT" && check_port_in_use "$BACKEND_TLS_ECHO_PORT" && check_port_in_use "$BACKEND_BAD_PORT" && check_port_in_use "$BACKEND_UDP_ECHO_PORT"; then
             sleep 0.2
             break
         fi
@@ -1753,7 +1767,7 @@ check_port_conflicts() {
     log_info "Checking for port conflicts..."
     local conflicts=0
     
-    for port in $PROXY_HTTPS_PORT $PROXY_HTTP_PORT $PROXY_H2C_PORT $PROXY_L4_PORT $PROXY_L4_LEAST_CONN_PORT $PROXY_L4_TERMINATE_PORT $BACKEND1_PORT $BACKEND2_PORT $BACKEND_H2C_PORT $BACKEND_GRPC_PORT $BACKEND_GRPC2_PORT $BACKEND_WS_PORT $BACKEND_ERROR_PORT $BACKEND_BAD_PORT $BACKEND_CHUNKED_PORT $BACKEND_ECHO_PORT $BACKEND_TLS_ECHO_PORT; do
+    for port in $PROXY_HTTPS_PORT $PROXY_HTTP_PORT $PROXY_H2C_PORT $PROXY_L4_PORT $PROXY_L4_LEAST_CONN_PORT $PROXY_L4_TERMINATE_PORT $PROXY_L4_UDP_PORT $BACKEND1_PORT $BACKEND2_PORT $BACKEND_H2C_PORT $BACKEND_GRPC_PORT $BACKEND_GRPC2_PORT $BACKEND_WS_PORT $BACKEND_ERROR_PORT $BACKEND_BAD_PORT $BACKEND_CHUNKED_PORT $BACKEND_ECHO_PORT $BACKEND_TLS_ECHO_PORT $BACKEND_UDP_ECHO_PORT; do
         if check_port_in_use "$port"; then
             log_error "Port $port is already in use"
             conflicts=$((conflicts + 1))

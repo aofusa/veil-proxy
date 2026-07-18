@@ -30,7 +30,7 @@ A high-performance reverse proxy server using io_uring (custom runtime) and rust
 - **Connection Pool**: Latency reduction through backend connection reuse (HTTP/1.1, HTTPS, and **H2C/HTTP-2** backends; the H2C pool reuses a handshaked HTTP/2 connection across gRPC/H2C requests — F-106)
 - **Load Balancing**: Request distribution to multiple backends (Round Robin/Least Connections/IP Hash/Weighted/Consistent Hash)
 - **Health Check**: Automatic failover with HTTP/TCP/gRPC active health checks (HTTP with status code validation, TCP connect-only, gRPC Health Checking Protocol)
-- **L4 Stream Proxy**: TCP-level load balancing with Round Robin/LeastConn, TLS passthrough, zero-copy `splice(2)` kernel forwarding (no userspace buffer), connection limiting (requires `l4-proxy` feature)
+- **L4 Stream Proxy**: TCP and UDP load balancing with Round Robin/LeastConn, TLS passthrough (TCP), zero-copy `splice(2)` kernel forwarding for TCP (no userspace buffer), UDP session-table forwarding with idle-timeout eviction, connection/session limiting (requires `l4-proxy` feature)
 - **Circuit Breaker**: Per-server circuit breaker (Closed→Open→HalfOpen), outlier detection/ejection, EWMA latency tracking (requires `metrics` feature; request retry is not implemented)
 - **Proxy Cache**: Memory and disk-based response caching (ETag/304, stale-while-revalidate, stale-if-error)
 - **Cache Purge Admin API**: Cache invalidation via HTTP (`PURGE` method or `POST /__admin/cache/purge`) with exact/prefix/glob/all modes and Bearer token auth
@@ -1609,18 +1609,30 @@ Health status changes are logged:
 
 ## L4 Stream Proxy
 
-TCP-level (L4) load balancing proxy. Unlike the HTTP proxy, it forwards raw TCP streams without inspecting protocol payloads. Useful for databases, message brokers, Redis, SMTP, and any non-HTTP binary protocol.
+TCP/UDP-level (L4) load balancing proxy. Unlike the HTTP proxy, it forwards raw streams/datagrams without inspecting protocol payloads. Useful for databases, message brokers, Redis, SMTP, DNS, and any non-HTTP protocol.
 
 > **Requires**: build with `--features l4-proxy` (included in `--features full`)
 
 ### Features
 
-- **Round Robin / LeastConn** load balancing across upstream TCP servers
-- **TLS Passthrough**: forward encrypted TLS without termination (SNI routing is not yet implemented)
-- **Connection Limiting**: reject connections when `max_connections` is reached
-- **Connect Timeout**: configurable upstream connection timeout
-- **Health Check Integration**: TCP or gRPC health checks per L4 listener
+- **Round Robin / LeastConn** load balancing across upstream servers
+- **TCP and UDP**: set `protocol = "tcp"` (default) or `protocol = "udp"` per listener
+- **TLS Passthrough**: forward encrypted TLS without termination (SNI routing is not yet implemented; TCP only — UDP has no TLS/DTLS support)
+- **Connection Limiting**: reject connections when `max_connections` is reached (for UDP this caps the number of concurrent client sessions)
+- **Connect Timeout**: configurable upstream connection timeout (TCP only)
+- **Health Check Integration**: TCP or gRPC health checks per L4 listener (UDP backends reuse the same TCP-connect-based health check; UDP reachability itself is out of scope)
 - **Independent threads**: each L4 listener runs in its own thread on the io_uring runtime
+
+### UDP Session Table
+
+UDP is connectionless, so the UDP path uses a session-table design similar to nginx stream UDP / Envoy UDP proxy:
+
+- A single listener UDP socket is shared across all sessions; `recvfrom` demultiplexes incoming datagrams by client address.
+- On a new client address, an upstream is chosen via the configured load-balancing algorithm and a dedicated UDP socket is `connect()`-ed to it, then registered in the session table.
+- Client → upstream: forwarded directly from the listener's receive loop.
+- Upstream → client: a per-session task receives from the upstream socket and sends back through the shared listener socket.
+- Sessions are evicted after `idle_timeout_secs` of no traffic in either direction.
+- The custom async UDP socket (`runtime/udp.rs`) works identically on both the io_uring and reactor (epoll/kqueue) backends and adds **no new io_uring opcodes** — it does try-first `recvfrom`/`sendto`/`send`/`recv` and falls back to the existing generic-fd readiness wait (`wait_readable_fd`/`wait_writable_fd`) on `EAGAIN`.
 
 ### Configuration
 
@@ -1688,16 +1700,34 @@ max_connections = 500
   timeout_secs = 5
 ```
 
+```toml
+# UDP proxy for DNS (session-table forwarding, requires --features l4-proxy)
+[[l4]]
+name = "dns-udp-proxy"
+listen = "0.0.0.0:53"
+protocol = "udp"                # "tcp" (default) or "udp"
+lb = "round_robin"
+idle_timeout_secs = 30          # evict a client session after 30s of no traffic
+
+  [[l4.upstreams]]
+  addr = "10.0.0.1:53"
+
+  [[l4.upstreams]]
+  addr = "10.0.0.2:53"
+```
+
 ### Configuration Reference
 
 | Option | Description | Default |
 |--------|-------------|---------|
 | `name` | Listener name (appears in logs) | required |
 | `listen` | Bind address (e.g. `"0.0.0.0:3306"`) | required |
+| `protocol` | Transport protocol: `tcp` or `udp` | `tcp` |
 | `lb` | Load balancing: `round_robin` or `least_conn` | `round_robin` |
-| `tls` | TLS mode: `none`, `passthrough`, or `terminate` | `none` |
-| `max_connections` | Max simultaneous connections (0 = unlimited) | `0` |
-| `connect_timeout_secs` | Upstream connect timeout in seconds | `10` |
+| `tls` | TLS mode: `none`, `passthrough`, or `terminate` (TCP only; ignored with a warning for `udp`) | `none` |
+| `max_connections` | Max simultaneous connections/sessions (0 = unlimited) | `0` |
+| `connect_timeout_secs` | Upstream connect timeout in seconds (TCP only) | `10` |
+| `idle_timeout_secs` | Idle timeout in seconds before closing a connection/session | `600` |
 | `upstreams[].addr` | Upstream address (`"host:port"`) | required |
 | `upstreams[].weight` | Weight (reserved for weighted RR) | `1` |
 | `health_check` | Optional health check config (same as upstream health_check) | none |
@@ -1707,6 +1737,8 @@ max_connections = 500
 - L4 listeners bind ports at startup. **SIGHUP does not reload L4 configuration**.
 - HTTP proxy and L4 proxy can coexist — they listen on different ports.
 - TLS termination (`tls = "terminate"`) is reserved for future implementation; currently treated as passthrough.
+- `protocol = "udp"` does not support TLS/DTLS. A UDP listener with `tls` set to anything other than `none` logs a startup warning and is forced to `none`.
+- UDP health checks reuse the existing TCP-connect-based check; verifying actual UDP reachability is out of scope (protocol-dependent and not generally meaningful for connectionless traffic).
 
 ## Circuit Breaker & Resilience
 

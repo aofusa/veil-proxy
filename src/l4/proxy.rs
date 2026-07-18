@@ -123,7 +123,9 @@ fn resolve_upstream_addr_sync(addr: &str) -> Option<SocketAddr> {
 }
 
 /// 接続時に上流 `SocketAddr` を解決する（未解決ホスト名は offload で DNS 解決）
-async fn resolve_upstream_target(target: &L4UpstreamTarget) -> Option<SocketAddr> {
+///
+/// `pub(crate)`: L4 UDP セッション確立（`crate::l4::udp`）からも利用する。
+pub(crate) async fn resolve_upstream_target(target: &L4UpstreamTarget) -> Option<SocketAddr> {
     match target {
         L4UpstreamTarget::Resolved(addr) => Some(*addr),
         L4UpstreamTarget::Unresolved(addr) => {
@@ -898,6 +900,7 @@ mod tests {
                     weight: w,
                 })
                 .collect(),
+            protocol: crate::config::L4Protocol::Tcp,
             lb,
             tls: L4TlsMode::None,
             max_connections: 0,

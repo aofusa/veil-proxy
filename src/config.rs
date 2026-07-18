@@ -2592,6 +2592,19 @@ struct Config {
 // L4 (TCP/UDP) ストリームプロキシ設定（F-18）
 // ====================
 
+/// L4 リスナーのトランスポートプロトコル（F-124）
+///
+/// TOML では `protocol = "tcp"` / `"udp"`。省略時は後方互換のため `Tcp`。
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum L4Protocol {
+    /// TCP（バイダイレクショナルストリーム転送、既存動作）
+    #[default]
+    Tcp,
+    /// UDP（セッションテーブル方式のデータグラム転送、F-124）
+    Udp,
+}
+
 /// L4 TLS モード
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -2641,6 +2654,9 @@ pub struct L4ListenerConfig {
     pub listen: String,
     /// upstream バックエンド一覧
     pub upstreams: Vec<L4UpstreamEntry>,
+    /// トランスポートプロトコル（tcp / udp）。省略時は後方互換で tcp（F-124）。
+    #[serde(default)]
+    pub protocol: L4Protocol,
     /// ロードバランシングアルゴリズム
     #[serde(default)]
     pub lb: L4LbAlgorithm,
@@ -6907,12 +6923,62 @@ listen = "0.0.0.0:9000"
 addr = "127.0.0.1:9001"
 "#;
         let cfg: L4ListenerConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.protocol, L4Protocol::Tcp);
         assert_eq!(cfg.lb, L4LbAlgorithm::RoundRobin);
         assert_eq!(cfg.tls, L4TlsMode::None);
         assert_eq!(cfg.max_connections, 0);
         assert_eq!(cfg.connect_timeout_secs, 10);
         assert_eq!(cfg.idle_timeout_secs, 600);
         assert_eq!(cfg.upstreams[0].weight, 1);
+    }
+
+    // ====================
+    // F-124: L4Protocol（UDP 対応）
+    // ====================
+
+    #[test]
+    fn test_l4_protocol_default_is_tcp() {
+        assert_eq!(L4Protocol::default(), L4Protocol::Tcp);
+    }
+
+    #[test]
+    fn test_l4_protocol_deser_tcp_and_udp() {
+        #[derive(Deserialize)]
+        struct ProtoWrapper {
+            t: L4Protocol,
+        }
+        let tcp: ProtoWrapper = toml::from_str("t = \"tcp\"").unwrap();
+        let udp: ProtoWrapper = toml::from_str("t = \"udp\"").unwrap();
+        assert_eq!(tcp.t, L4Protocol::Tcp);
+        assert_eq!(udp.t, L4Protocol::Udp);
+    }
+
+    #[test]
+    fn test_l4_listener_config_protocol_udp_deser() {
+        let toml = r#"
+name = "dns-proxy"
+listen = "0.0.0.0:53"
+protocol = "udp"
+
+[[upstreams]]
+addr = "10.0.0.1:53"
+"#;
+        let cfg: L4ListenerConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.protocol, L4Protocol::Udp);
+    }
+
+    #[test]
+    fn test_l4_listener_config_protocol_omitted_is_tcp() {
+        // 既存 TCP 構成の後方互換: protocol 省略時は Tcp のまま。
+        let toml = r#"
+name = "legacy"
+listen = "0.0.0.0:9000"
+
+[[upstreams]]
+addr = "127.0.0.1:9001"
+"#;
+        let cfg: L4ListenerConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.protocol, L4Protocol::Tcp);
     }
 
     #[test]

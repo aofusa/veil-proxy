@@ -115,6 +115,7 @@ mod tests {
                     weight: 1,
                 })
                 .collect(),
+            protocol: crate::config::L4Protocol::Tcp,
             lb: L4LbAlgorithm::RoundRobin,
             tls: crate::config::L4TlsMode::None,
             max_connections: 0,
@@ -157,6 +158,7 @@ mod tests {
                 addr: "127.0.0.1:8001".to_string(),
                 weight: 1,
             }],
+            protocol: crate::config::L4Protocol::Tcp,
             lb: L4LbAlgorithm::RoundRobin,
             tls: crate::config::L4TlsMode::None,
             max_connections: 0,

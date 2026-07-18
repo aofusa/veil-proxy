@@ -8,8 +8,29 @@
 use futures_util::{SinkExt, StreamExt};
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tracing::{debug, error, info};
+
+/// UDP Echoサーバー: 受信データグラムをそのまま送信元へ返送する（F-124 L4 UDP E2E 用）。
+async fn run_udp_echo_server(addr: SocketAddr) {
+    let socket = UdpSocket::bind(addr)
+        .await
+        .unwrap_or_else(|e| panic!("Failed to bind UDP echo server on {}: {}", addr, e));
+    info!("UDP echo server listening on {}", addr);
+
+    let mut buf = [0u8; 65536];
+    loop {
+        match socket.recv_from(&mut buf).await {
+            Ok((n, peer)) => {
+                debug!("UDP echo: {} bytes from {}", n, peer);
+                if let Err(e) = socket.send_to(&buf[..n], peer).await {
+                    error!("UDP echo send_to error: {}", e);
+                }
+            }
+            Err(e) => error!("UDP echo recv_from error: {}", e),
+        }
+    }
+}
 
 /// WebSocket Echoサーバー: 受信メッセージをそのまま返送する
 async fn run_ws_echo_server(addr: SocketAddr) {
@@ -485,6 +506,10 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(9018);
+    let udp_echo_port: u16 = std::env::var("UDP_ECHO_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9019);
     let tls_cert = std::env::var("TLS_CERT_PATH").unwrap_or_else(|_| "cert.pem".to_string());
     let tls_key = std::env::var("TLS_KEY_PATH").unwrap_or_else(|_| "key.pem".to_string());
 
@@ -494,10 +519,11 @@ async fn main() {
     let chunked_addr: SocketAddr = format!("127.0.0.1:{}", chunked_port).parse().unwrap();
     let echo_addr: SocketAddr = format!("127.0.0.1:{}", echo_port).parse().unwrap();
     let tls_echo_addr: SocketAddr = format!("127.0.0.1:{}", tls_echo_port).parse().unwrap();
+    let udp_echo_addr: SocketAddr = format!("127.0.0.1:{}", udp_echo_port).parse().unwrap();
 
     info!(
-        "Starting test-backends: WS={}, HTTP-error={}, chunked={}, echo={}, tls-echo={}, bad={}",
-        ws_addr, error_addr, chunked_addr, echo_addr, tls_echo_addr, bad_addr
+        "Starting test-backends: WS={}, HTTP-error={}, chunked={}, echo={}, tls-echo={}, udp-echo={}, bad={}",
+        ws_addr, error_addr, chunked_addr, echo_addr, tls_echo_addr, udp_echo_addr, bad_addr
     );
 
     tokio::join!(
@@ -506,6 +532,7 @@ async fn main() {
         run_chunked_server(chunked_addr),
         run_echo_server(echo_addr),
         run_tls_echo_server(tls_echo_addr, tls_cert, tls_key),
+        run_udp_echo_server(udp_echo_addr),
         run_bad_backend_server(bad_addr),
     );
 }
