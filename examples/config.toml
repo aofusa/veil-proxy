@@ -32,6 +32,9 @@ http = "127.0.0.1:80"
 # 各プロトコルを使用するには対応するフィーチャーでビルドする必要があります:
 #   HTTP/2: cargo build --features http2
 #   HTTP/3: cargo build --features http3
+#     - Linux/FreeBSD/macOS 既定: ngtcp2 + nghttp3 + aws-lc-sys
+#     - OpenBSD/Windows 既定: quiche
+#     - quiche 強制: cargo build --features "http3,http3-quiche"
 
 # HTTP/2 を有効化（TLS ALPN ネゴシエーション）
 #
@@ -896,7 +899,10 @@ reuseport_balancing = "cbpf"
 # 注意:
 #   - --features http3 でビルドする必要があります
 #   - HTTP/3 は UDP ベースのため kTLS は使用不可
-#   - quiche (Cloudflare製) を使用
+#   - QUIC 実装バックエンド（ビルド時選択）:
+#       Linux / FreeBSD / macOS: ngtcp2 + nghttp3（公式 C ライブラリ、TLS は aws-lc-sys 共有）
+#       OpenBSD / Windows: quiche
+#       強制 quiche: --features "http3,http3-quiche"
 #
 [http3]
 # HTTP/3リッスンアドレス（UDP）

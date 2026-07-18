@@ -22,7 +22,7 @@ A high-performance reverse proxy server using io_uring (custom runtime) and rust
 - **kTLS**: Kernel TLS offload support via rustls + custom kTLS module (Linux 5.15+)
 - **HTTP/2**: HTTP/2 support via TLS ALPN negotiation (stream multiplexing, HPACK compression with **4-bit LUT Huffman decode** — F-121)
 - **H2C Server**: HTTP/2 Cleartext (H2C) server support without TLS (Prior Knowledge mode, RFC 7540 Section 3.4)
-- **HTTP/3**: QUIC/UDP-based HTTP/3 support using quiche (0-RTT connection establishment)
+- **HTTP/3**: QUIC/UDP-based HTTP/3 (RFC 9114). Default backend on Linux/FreeBSD/macOS is **ngtcp2 + nghttp3** (official C libraries, linked with shared **aws-lc-sys** for TLS). OpenBSD/Windows default to **quiche**; force quiche anywhere with `--features "http3,http3-quiche"`
 - **Fast Allocator**: High-speed memory allocation with mimalloc + Huge Pages support
 - **Fast Routing**: O(log n) path matching with Radix Tree (matchit)
 
@@ -2461,7 +2461,20 @@ Clients that don't support HTTP/2 automatically fall back to HTTP/1.1.
 
 ## HTTP/3 Support
 
-Supports HTTP/3 (RFC 9114) based on QUIC/UDP. Uses Cloudflare's [quiche](https://github.com/cloudflare/quiche).
+Supports HTTP/3 (RFC 9114) based on QUIC/UDP.
+
+**QUIC backends** (selected at compile time by `build.rs`):
+
+| Platform | Default | Force quiche |
+|----------|---------|--------------|
+| Linux, FreeBSD, macOS | **ngtcp2 + nghttp3** + aws-lc-sys | `--features "http3,http3-quiche"` |
+| OpenBSD, Windows | **quiche** + aws-lc-sys | (already default) |
+
+- ngtcp2: <https://github.com/ngtcp2/ngtcp2>
+- nghttp3: <https://github.com/ngtcp2/nghttp3>
+- quiche (optional/legacy path): <https://github.com/cloudflare/quiche>
+
+In-tree FFI crates: `crates/ngtcp2-sys`, `crates/nghttp3-sys` (static build of the C libraries against aws-lc-sys).
 
 ### Features
 
@@ -2476,7 +2489,11 @@ Supports HTTP/3 (RFC 9114) based on QUIC/UDP. Uses Cloudflare's [quiche](https:/
 
 ```bash
 # Build with HTTP/3 feature
+# Default backend (ngtcp2+nghttp3 on Linux/FreeBSD/macOS)
 cargo build --release --features http3
+
+# Force Cloudflare quiche on any platform
+cargo build --release --features "http3,http3-quiche"
 ```
 
 ```toml
@@ -4132,7 +4149,8 @@ When a panic is caught:
 - [rustls](https://github.com/rustls/rustls): Pure Rust TLS implementation
 - [kTLS (custom)](https://docs.kernel.org/networking/tls.html): Custom kernel TLS module implemented in `src/ktls.rs` and `src/ktls_rustls.rs`
 - [httparse](https://crates.io/crates/httparse): Fast HTTP parser
-- [quiche](https://github.com/cloudflare/quiche): Cloudflare's QUIC/HTTP/3 implementation
+- [ngtcp2](https://github.com/ngtcp2/ngtcp2) / [nghttp3](https://github.com/ngtcp2/nghttp3): Default QUIC/HTTP/3 stack (Linux/FreeBSD/macOS)
+- [quiche](https://github.com/cloudflare/quiche): Optional QUIC/HTTP/3 backend (`http3-quiche`; default on OpenBSD/Windows)
 
 ### Performance
 
