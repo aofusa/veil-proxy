@@ -8,7 +8,7 @@ resolver = "2"
 
 [package]
 name = "veil"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "High-performance reverse proxy server using io_uring and rustls"
 license = "Apache-2.0 OR MIT"

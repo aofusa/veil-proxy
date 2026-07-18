@@ -643,10 +643,8 @@ mod tests {
                         new_id
                     };
                     // 途中で葉にぶつかったら、最終段でなければ衝突
-                    if i > 0 {
-                        if matches!(nodes[next], OracleNode::Leaf { .. }) {
-                            panic!("prefix conflict mid-path sym={sym}");
-                        }
+                    if i > 0 && matches!(nodes[next], OracleNode::Leaf { .. }) {
+                        panic!("prefix conflict mid-path sym={sym}");
                     }
                     cur = next;
                 }
@@ -709,7 +707,7 @@ mod tests {
                             return 0x02; // EOS → ERROR
                         }
                         // ACCEPT: flags=1, sym, bits=consumed, next=0
-                        return 0x01 | ((*sym as u32) << 8) | ((consumed as u32) << 16);
+                        return 0x01 | ((*sym as u32) << 8) | (consumed << 16);
                     }
                     OracleNode::Internal { .. } => {
                         cur = child;
@@ -915,10 +913,13 @@ mod tests {
         let trie = OracleTrie::from_encode_table();
         let stride = HUFFMAN_DECODE_STRIDE;
         let mut mismatches = 0u32;
-        for state in 0..HUFFMAN_DECODE_STATE_COUNT {
-            for peek in 0..HUFFMAN_DECODE_PEEK_COUNT {
+        for (state, row) in HUFFMAN_DECODE_TABLE_PACKED
+            .iter()
+            .enumerate()
+            .take(HUFFMAN_DECODE_STATE_COUNT)
+        {
+            for (peek, &actual) in row.iter().enumerate().take(HUFFMAN_DECODE_PEEK_COUNT) {
                 let expected = trie.expected_packed(state, peek, stride);
-                let actual = HUFFMAN_DECODE_TABLE_PACKED[state][peek];
                 if expected != actual {
                     mismatches += 1;
                     if mismatches <= 8 {
