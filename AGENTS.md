@@ -34,9 +34,10 @@ AI エージェントおよびコントリビュータ向けの **最小指針**
 
 変更時は **上記の設計哲学・ホットパス絶対規則** および次の箇条書きに反しないか確認する。
 
-- **データプレーンは tokio / monoio に依存しない**（テスト・クライアント用途の tokio は別）。io_uring 非同期ランタイムは `src/runtime/` の独自実装を使用する。
+- **データプレーンは tokio / monoio に依存しない**（テスト・クライアント用途の tokio は別）。ランタイムは `src/runtime/` の独自実装を使用する。
 - **`cfg(feature = "...")` を壊さない** — `default = []` のまま、無効 feature でもコンパイル可能に保つ。
-- **Linux / カーネル前提**（io_uring、kTLS、seccomp、Landlock、CBPF 等）— README の前提と矛盾させない。
+- **ランタイムバックエンドは build.rs 発行の cfg で切替（F-120）** — デフォルトは Linux io_uring（`veil_rt_uring` = `src/runtime/uring/`、`default` 不変・性能非劣化）。`--features epoll`（Linux）と BSD（FreeBSD/OpenBSD）は readiness reactor（`veil_rt_reactor` = `src/runtime/reactor/`、poller は `veil_poller_epoll` / `veil_poller_kqueue`）。**io_uring パスのロジックは変えない**（reactor 追加でも uring 生成コードを等価に保つ）。公開パス `runtime::tcp` 等はファサード re-export で不変に保つ。
+- **プラットフォーム別セキュリティ／kTLS は `target_os` で分岐**（F-120） — Linux: seccomp（バックエンド別に許可 syscall 分割・最小権限）/Landlock/CBPF、kTLS（`veil_ktls` = `feature="ktls"` かつ linux）。FreeBSD: capsicum（cap_rights_limit / cap_enter / jail）。OpenBSD: pledge / unveil（kTLS 非対応、simple_tls フォールバック）。非対象 OS 用の設定キーは受理し警告して無視する。README の前提と矛盾させない。
 - **ホットパス**でヒープ割り当て・不要なロック・コピー・同期呼び出しを増やさない（詳細は上の **ホットパス絶対規則**）。
 - **動的設定**は ArcSwap とリロード経路の不変条件を維持する。
 - **`unsafe` は最小限** — 拡大時は不変条件をコメントで明示。
@@ -121,7 +122,7 @@ cargo test --bins --test integration_tests --features "full"
 | `src/main.rs` | 薄いバイナリエントリ（`veil::run()` を呼ぶだけ） |
 | `src/lib.rs` | クレートルート・mod 宣言・公開 API（`cargo fuzz`・統合テスト向け） |
 | `src/entry.rs` | サーバ起動配線（`run()`：ワーカースレッド・accept ループなど） |
-| `src/runtime/` | 独自 io_uring ランタイム（ring.rs/executor.rs/tcp.rs/timer.rs/buf.rs/io.rs/splice.rs/offload.rs） |
+| `src/runtime/` | 独自ランタイム。共有（buf.rs/io.rs/offload.rs）+ `uring/`（io_uring: ring/executor/tcp/timer/splice、`veil_rt_uring`）+ `reactor/`（epoll/kqueue readiness: poller/epoll/kqueue/executor/tcp/timer/splice、`veil_rt_reactor`）。バックエンドは build.rs 発行 cfg で選択、公開パスはファサードで不変（F-120） |
 | `tests/`、`benches/` | 統合・E2E・ベンチ（`cargo test` が拾うホワイトボックス） |
 | `examples/config.toml` | 設定リファレンス（全キー網羅・`src/config.rs` 同期） |
 | `docs/readme/` | 日本語 README（`README.ja.md`） |

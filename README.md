@@ -85,6 +85,28 @@ A high-performance reverse proxy server using io_uring (custom runtime) and rust
 - **Landlock Sandbox**: Filesystem access restriction (Linux 5.13+)
 - **systemd Sandbox**: Namespace isolation and system call restriction support
 
+## Platform Support & Runtime Backends (F-120)
+
+The data-plane runtime backend is selected at **compile time** (no runtime dispatch, no
+hot-path cost). The default is unchanged (Linux io_uring).
+
+| Platform | Runtime backend | Native security | kTLS | Notes |
+|----------|-----------------|-----------------|------|-------|
+| **Linux (default)** | io_uring (`src/runtime/uring/`) | seccomp + Landlock + CBPF | ✅ (Linux 5.15+) | Default features unchanged; performance non-regressed |
+| **Linux `--features epoll`** | epoll readiness reactor (`src/runtime/reactor/`) | seccomp (epoll syscalls; io_uring syscalls dropped) + Landlock | ✅ | Fallback for hosts without io_uring |
+| **FreeBSD (x86_64/aarch64)** | kqueue readiness reactor | capsicum (`cap_rights_limit` / `cap_enter`) + jail | ✗ (userspace rustls) | `[security] enable_capsicum`, `capsicum_capability_mode`, `jail_name` |
+| **OpenBSD (x86_64/aarch64)** | kqueue readiness reactor | pledge + unveil | ✗ (userspace rustls) | `[security] enable_pledge`, `enable_unveil`. HTTPS/TLS currently blocked by an aws-lc-rs OpenBSD limitation (see backlog **F-122**) |
+
+- The backend is chosen by `build.rs`-emitted cfgs (`veil_rt_uring` / `veil_rt_reactor` and
+  `veil_poller_epoll` / `veil_poller_kqueue`). The public runtime API paths
+  (`runtime::tcp`, `runtime::executor`, `runtime::timer`, …) are identical across backends.
+- `--features epoll` is Linux-only (build.rs errors on other targets, where kqueue is
+  selected automatically). Non-target security keys are accepted and ignored with a warning.
+- **aarch64-linux**: cross-built via `docker/Dockerfile.{glibc,musl}.aarch64`
+  (QEMU user-mode verified; QEMU lacks io_uring, so QEMU runs use the `epoll` build).
+- FreeBSD/OpenBSD are built natively inside a matching VM (Rust Tier 2/3; cross-build not
+  supported). See `packaging/scripts/build-bsd.sh` for tar.gz packaging with rc.d/jail.conf.
+
 ## Build
 
 ### Dependencies
