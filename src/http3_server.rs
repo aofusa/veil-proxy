@@ -34,7 +34,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::udp::QuicUdpSocket;
-use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+// F-122: RNG は OpenBSD では ring、他は aws-lc-rs（crate::tls_provider で選択）。
+use crate::tls_provider::{SecureRandom, SystemRandom};
 use bytes::{BufMut, Bytes, BytesMut};
 use quiche::h3::NameValue;
 use quiche::{h3, Config, ConnectionId};
@@ -2949,7 +2950,7 @@ async fn proxy_to_tls_backend_async(
                 Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
             }
             fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-                rustls::crypto::aws_lc_rs::default_provider()
+                crate::tls_provider::provider::default_provider()
                     .signature_verification_algorithms
                     .supported_schemes()
                     .to_vec()
@@ -3086,7 +3087,7 @@ async fn proxy_to_tls_backend_async(
                 Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
             }
             fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-                rustls::crypto::aws_lc_rs::default_provider()
+                crate::tls_provider::provider::default_provider()
                     .signature_verification_algorithms
                     .supported_schemes()
                     .to_vec()

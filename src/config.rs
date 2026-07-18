@@ -4900,7 +4900,7 @@ pub fn build_server_config_from_paths(
 /// 配列の順序を保持する（記載順 = サーバ優先度順）。不明な名前・重複はエラー。
 /// 設定読み込み時（非ホットパス）にのみ呼ばれるため、ここでのアロケーションは許容される。
 pub fn resolve_cipher_suites(names: &[String]) -> io::Result<Vec<rustls::SupportedCipherSuite>> {
-    use rustls::crypto::aws_lc_rs::ALL_CIPHER_SUITES;
+    use crate::tls_provider::provider::ALL_CIPHER_SUITES;
 
     let mut out: Vec<rustls::SupportedCipherSuite> = Vec::with_capacity(names.len());
     for name in names {
@@ -5007,7 +5007,7 @@ fn load_tls_config(
         #[cfg(not(veil_ktls))]
         let _ = ktls_enabled;
 
-        let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+        let mut provider = crate::tls_provider::provider::default_provider();
         if let Some(suites) = custom_suites {
             provider.cipher_suites = suites;
         }

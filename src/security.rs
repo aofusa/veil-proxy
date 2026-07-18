@@ -2635,13 +2635,16 @@ pub mod pledge_unveil {
 
     /// 指定パスを `permissions`（unveil(2) の権限文字列。例: `"r"`/`"rwc"`）で unveil する。
     ///
-    /// パスが存在しない場合は unveil(2) 自体が `ENOENT` を返すため、呼び出し前に
-    /// 存在確認を行い、存在しないパスは何もせず `Ok(())` を返す（呼び出し元でログ出力する
-    /// 判断に委ねる。任意コンポーネント未使用によるパス欠如は致命的ではない）。
+    /// **`std::path::Path::exists()` による事前存在確認はしてはならない。** unveil は
+    /// 最初の呼び出しの時点でファイルシステムのビューを「これまで unveil したパスのみ」に
+    /// 制限する（未 unveil のパスは `stat` が `ENOENT` を返し、あたかも存在しないかのように
+    /// 見える）。そのため 2 番目以降のパスに対して `exists()` を呼ぶと、既に unveil 済みで
+    /// ない限り false になり、本来 unveil すべきパス（静的ファイルルート等）が unveil されず
+    /// アクセス不能（`ENOENT` で 404）になる（F-122 の OpenBSD VM 検証で発見した実装バグ）。
+    ///
+    /// 代わりに unveil(2) を直接呼び、`ENOENT`（実在しない任意パス。未使用のキャッシュ/ログ
+    /// ディレクトリ等）のみ非致命として無視する。それ以外のエラーは呼び出し元へ返す。
     pub fn unveil_path(path: &Path, permissions: &str) -> io::Result<()> {
-        if !path.exists() {
-            return Ok(());
-        }
         let path_c = CString::new(path.as_os_str().as_encoded_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path has NUL byte"))?;
         let perm_c = CString::new(permissions)
@@ -2649,7 +2652,12 @@ pub mod pledge_unveil {
         // SAFETY: path_c/perm_c はこの呼び出しが完了するまで生存する有効な NUL 終端バッファ。
         let ret = unsafe { unveil(path_c.as_ptr(), perm_c.as_ptr()) };
         if ret != 0 {
-            return Err(io::Error::last_os_error());
+            let e = io::Error::last_os_error();
+            // ENOENT: パスが実在しない（未使用の任意コンポーネント）。非致命として無視する。
+            if e.raw_os_error() == Some(libc::ENOENT) {
+                return Ok(());
+            }
+            return Err(e);
         }
         Ok(())
     }

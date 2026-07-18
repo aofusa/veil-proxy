@@ -343,7 +343,7 @@ mod tests {
         use std::sync::Once;
         static ONCE: Once = Once::new();
         ONCE.call_once(|| {
-            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            let _ = crate::tls_provider::provider::default_provider().install_default();
         });
     }
 

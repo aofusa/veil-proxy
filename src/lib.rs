@@ -81,6 +81,9 @@ pub mod l4;
 #[cfg(not(veil_ktls))]
 pub mod simple_tls;
 
+/// rustls 暗号プロバイダ選択（F-122: OpenBSD は ring、他は aws_lc_rs）。
+pub mod tls_provider;
+
 pub mod config;
 pub mod tls_reload;
 pub use crate::config::*;

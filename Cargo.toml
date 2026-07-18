@@ -1,5 +1,10 @@
 [workspace]
 members = [".", "fuzz"]
+# resolver v2: dev-dependencies の feature を通常ビルド（`cargo build`）へ統合しない。
+# これにより OpenBSD 本体ビルドがテスト用 dev-deps（hyper-rustls/quinn/tokio-rustls/rcgen
+# の aws_lc_rs）に引きずられて aws-lc-sys を要求することを防ぎ、ring のみでビルドできる
+# （F-122）。edition 2021 パッケージ既定と一致。
+resolver = "2"
 
 [package]
 name = "veil"
@@ -174,11 +179,13 @@ full = [
 
 [dependencies]
 # monoio 削除: カスタム io_uring 実装 (src/runtime/) に完全移行
-# rustls を直接使用（ハンドシェイク後に kTLS へオフロード）
-rustls = { version = "0.23.35", features = ["tls12", "aws_lc_rs"] }
-# bindgen: AWS_LC_SYS_NO_PREFIX 時に aws-lc-sys がバインディング生成するため必要
-aws-lc-rs = { version = "1.15.2", features = ["bindgen"] }
-# http3 有効時のみ: ssl ライブラリをビルドし quiche と rustls で共有
+# rustls を直接使用（ハンドシェイク後に kTLS へオフロード）。
+# 暗号プロバイダは target 別に選択する（F-122、src/tls_provider.rs 参照）:
+#   - 非 OpenBSD（Linux/FreeBSD）: aws_lc_rs（kTLS・quiche と AWS-LC 共有）
+#   - OpenBSD: ring（aws-lc-rs は OpenBSD で TLS ハンドシェイクを完了できないため）
+# provider feature は下の [target.*] で付与し、ここでは共通 feature のみ指定する。
+rustls = { version = "0.23.35", default-features = false, features = ["std", "tls12", "logging"] }
+# http3 有効時のみ: ssl ライブラリをビルドし quiche と rustls(aws_lc_rs) で共有
 aws-lc-sys = { version = "0.41", features = ["ssl", "bindgen"], optional = true }
 webpki-roots = "1.0.4"
 rustls-pki-types = "1.13.2"
@@ -294,6 +301,26 @@ xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 glob = { version = "0.3.3", optional = true }
 rayon = "1.12.0"
 futures = "0.3.31"
+
+# ====================
+# rustls 暗号プロバイダの target 別選択（F-122、src/tls_provider.rs 参照）
+# ====================
+# 非 OpenBSD（Linux/FreeBSD）: aws_lc_rs。kTLS（ktls_rustls）・quiche(http3) と
+# AWS-LC を共有し、アセンブリ最適化が効く。http3_server の RNG（aws_lc_rs::rand）にも使う。
+[target.'cfg(not(target_os = "openbsd"))'.dependencies]
+# default-features = false は base の [dependencies] rustls と一致させる（default に含まれる
+# aws_lc_rs をここで暗黙有効化しないため。provider は features で明示する）。
+rustls = { version = "0.23.35", default-features = false, features = ["aws_lc_rs"] }
+# bindgen: AWS_LC_SYS_NO_PREFIX 時に aws-lc-sys がバインディング生成するため必要
+aws-lc-rs = { version = "1.15.2", features = ["bindgen"] }
+
+# OpenBSD: ring。aws-lc-rs は OpenBSD で TLS ハンドシェイクを完了できない（F-122）ため、
+# rustls の暗号プロバイダに ring を使う。http3_server の RNG（ring::rand）にも使う。
+# default-features = false 必須: rustls の default feature は aws_lc_rs を含むため、
+# これを付けないと OpenBSD 本体が aws-lc-rs/aws-lc-sys を引いてしまう。
+[target.'cfg(target_os = "openbsd")'.dependencies]
+rustls = { version = "0.23.35", default-features = false, features = ["ring"] }
+ring = "0.17"
 
 [dev-dependencies]
 # テスト用一時ディレクトリ

@@ -92,7 +92,8 @@ pub fn run() {
     }
 
     // プロセスレベルで暗号プロバイダーをインストール（aws-lc-rs使用）
-    CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+    // F-122: OpenBSD は ring、他は aws_lc_rs（`crate::tls_provider` で選択）。
+    CryptoProvider::install_default(crate::tls_provider::provider::default_provider())
         .expect("Failed to install rustls crypto provider");
 
     // ログ設定を先に読み込む（ログ初期化前）
