@@ -19,9 +19,13 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
+// CString / AsRawFd / FromRawFd は memfd 経由の証明書リロード（Linux / FreeBSD）でのみ
+// 使用する。OpenBSD は一時ファイルフォールバックのため不要（`create_memfd_for_pem` 参照）。
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use std::ffi::CString;
 use std::io::{self, Seek, Write as IoWrite};
 use std::net::SocketAddr;
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::Path;
 use std::rc::Rc;
@@ -77,6 +81,11 @@ fn h3_request_header_block_size(headers: &[h3::Header]) -> usize {
 /// ## セキュリティ対策
 /// - MFD_CLOEXEC: exec() 時に自動的に閉じる（fd リーク防止）
 /// - MFD_ALLOW_SEALING: 書き込み後にシールを適用可能にする
+///
+/// `memfd_create(2)` は Linux / FreeBSD 13+ にあるが OpenBSD には無い。OpenBSD では
+/// `create_memfd_for_pem` が一時ファイルフォールバック（Drop で unlink）を使うため、
+/// 本関数は memfd を持つターゲットでのみコンパイルする。
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn memfd_create_secure(name: &str) -> io::Result<std::fs::File> {
     let c_name = CString::new(name).map_err(|e| {
         io::Error::new(
@@ -104,6 +113,11 @@ fn memfd_create_secure(name: &str) -> io::Result<std::fs::File> {
 /// シールを適用することで、memfd の内容が改ざんされることを防ぎます。
 /// これにより、攻撃者が memfd の内容を書き換えて不正な証明書を
 /// 注入することを防止できます。
+///
+/// memfd を持つターゲット（Linux / FreeBSD 13+）でのみコンパイルする。
+/// FreeBSD ではファイルシーリングが非対応で `fcntl(F_ADD_SEALS)` が失敗し得るが、
+/// 呼び出し側はシール失敗を警告のみで許容する（致命的でない）。
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn apply_memfd_seals(fd: i32) -> io::Result<()> {
     // F_ADD_SEALS = 1033
     // F_SEAL_SEAL = 1 (これ以上シールを追加できなくする)
@@ -144,7 +158,32 @@ fn apply_memfd_seals(fd: i32) -> io::Result<()> {
 /// ## 注意
 /// 戻り値の File オブジェクトはスコープ内で保持し続ける必要があります。
 /// ドロップされると fd が閉じられ、パスが無効になります。
-fn create_memfd_for_pem(name: &str, pem_data: &[u8]) -> io::Result<(std::fs::File, String)> {
+/// PEM を載せたファイルと、quiche がそれを読むためのパスのラッパ。
+///
+/// - Linux / FreeBSD: `memfd`（`/proc/self/fd/<fd>` 経由・FS 非経由）。Drop は fd を
+///   閉じるだけ（匿名メモリのため後始末不要）。
+/// - OpenBSD: `memfd_create(2)` が無いため 0600 権限の一時ファイルへフォールバックし、
+///   **Drop で必ず unlink** して機密がディスクに滞留しないようにする。
+struct PemBackedFile {
+    _file: std::fs::File,
+    /// OpenBSD の一時ファイルのみ Drop で unlink 対象として保持する。
+    #[cfg(target_os = "openbsd")]
+    temp_path: std::path::PathBuf,
+}
+
+impl Drop for PemBackedFile {
+    fn drop(&mut self) {
+        #[cfg(target_os = "openbsd")]
+        {
+            // 機密（秘密鍵/証明書）をディスクに残さない。close 前の unlink で
+            // 名前を外し、fd クローズ時に実体が解放される。
+            let _ = std::fs::remove_file(&self.temp_path);
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn create_memfd_for_pem(name: &str, pem_data: &[u8]) -> io::Result<(PemBackedFile, String)> {
     // memfd を作成（セキュリティフラグ付き）
     let mut memfd = memfd_create_secure(name)?;
 
@@ -171,7 +210,42 @@ fn create_memfd_for_pem(name: &str, pem_data: &[u8]) -> io::Result<(std::fs::Fil
         debug!("[HTTP/3] memfd seals applied: WRITE|SHRINK|GROW|SEAL");
     }
 
-    Ok((memfd, proc_path))
+    Ok((PemBackedFile { _file: memfd }, proc_path))
+}
+
+/// OpenBSD 版: `memfd_create(2)` が無いため 0600 権限の一時ファイルへ PEM を書き込み、
+/// その実パスを返す（Drop で unlink）。証明書ホットリロードは数ヶ月に 1 回のコールドパス
+/// のため一時ファイル経由でも性能影響はない。`unveil` 有効時は一時ディレクトリが
+/// unveil 対象外だと作成に失敗し得るが、その場合リロードは警告付きでスキップされ既存
+/// 証明書のまま稼働を継続する（非致命）。
+#[cfg(target_os = "openbsd")]
+fn create_memfd_for_pem(name: &str, pem_data: &[u8]) -> io::Result<(PemBackedFile, String)> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // 衝突しにくい一意名（pid + 単調カウンタ）。O_EXCL で既存ファイルを掴まない。
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut temp_path = std::env::temp_dir();
+    temp_path.push(format!("veil-{}-{}-{}.pem", name, std::process::id(), seq));
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true) // O_EXCL: 既存ファイルを掴まない
+        .mode(0o600) // 所有者のみ読み書き
+        .open(&temp_path)?;
+
+    file.write_all(pem_data)?;
+    file.seek(io::SeekFrom::Start(0))?;
+
+    let path_str = temp_path.to_string_lossy().into_owned();
+    Ok((
+        PemBackedFile {
+            _file: file,
+            temp_path,
+        },
+        path_str,
+    ))
 }
 
 /// 稼働中の `quiche::Config` の証明書・秘密鍵を差し替える（F-105 ホットリロード）。

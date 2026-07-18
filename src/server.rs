@@ -21,7 +21,9 @@ use crate::system::*;
 use crate::upstream::*;
 
 use crate::cache;
-#[cfg(unix)]
+// AsRawFd は Linux（CBPF reuseport）と FreeBSD（capsicum rights 制限）の
+// リスナー fd 取得でのみ使用する。OpenBSD 等では未使用のため cfg でゲートする。
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use std::os::unix::io::AsRawFd;
 
 // log_ktls_status は crate::logging モジュールに移動しました。
