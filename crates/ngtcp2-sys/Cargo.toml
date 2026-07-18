@@ -1,0 +1,26 @@
+[package]
+name = "ngtcp2-sys"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+build = "build.rs"
+links = "ngtcp2"
+publish = false
+description = "FFI bindings for ngtcp2 (QUIC) built against aws-lc-sys"
+license = "MIT OR Apache-2.0"
+
+[lib]
+doctest = false
+
+[dependencies]
+# SSL_CTX / SSL 型と libssl を aws-lc から共有する
+aws-lc-sys = { version = "0.41", features = ["ssl"] }
+libc = "0.2"
+
+[build-dependencies]
+cmake = "0.1"
+bindgen = { version = "0.72", optional = true }
+
+[features]
+# bindings.rs を再生成する（libclang 必須）。通常ビルドはコミット済み bindings を使用。
+overwrite = ["dep:bindgen"]

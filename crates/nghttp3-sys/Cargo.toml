@@ -1,0 +1,24 @@
+[package]
+name = "nghttp3-sys"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+build = "build.rs"
+links = "nghttp3"
+publish = false
+description = "FFI bindings for nghttp3 (HTTP/3 + QPACK)"
+license = "MIT OR Apache-2.0"
+
+[lib]
+doctest = false
+
+[dependencies]
+libc = "0.2"
+
+[build-dependencies]
+cmake = "0.1"
+bindgen = { version = "0.72", optional = true }
+
+[features]
+# bindings.rs を再生成する（libclang 必須）。通常ビルドはコミット済み bindings を使用。
+overwrite = ["dep:bindgen"]
