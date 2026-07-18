@@ -570,6 +570,27 @@ reuseport_balancing = "cbpf"
 # enable_pledge = true
 
 # ============================================
+# sandbox_init / Seatbelt 設定 (macOS専用、F-125)
+# ============================================
+#
+# macOS ネイティブのプロセスサンドボックス（Linux の seccomp/Landlock、FreeBSD の
+# capsicum、OpenBSD の pledge/unveil 相当）。本キーは全 OS で受理されるが、macOS 以外
+# では警告ログのみで無視される。kTLS は非対応（macOS ビルドは常に simple_tls =
+# ユーザ空間 rustls、暗号プロバイダは ring。F-125: aws-lc-sys は zig クロスリンク不可）。
+#
+# enable_sandbox_macos = true にすると:
+#   - 設定から導出した静的ファイルルート・TLS証明書/鍵・アクセスログ/アプリログの
+#     ディレクトリ・ディスクキャッシュディレクトリを基に SBPL プロファイルを生成し、
+#     全 TLS ワーカーの listener bind 完了後に sandbox_init(3) で適用する（不可逆）。
+#   - 実機での動作検証ができないため、保守的な最小プロファイルを採用している:
+#     ネットワーク（network*）とファイル読み取り（file-read*）は無条件許可し、
+#     ファイル**書き込み**のみ上記ログ/キャッシュディレクトリの subpath に限定する
+#     （`(deny default)` 起点。詳細は src/security.rs の `macos_sandbox` モジュール参照）。
+#   - sandbox_init 失敗時の挙動は allow_security_failures に従う。
+#
+# enable_sandbox_macos = true
+
+# ============================================
 # 本番環境向け推奨設定
 # ============================================
 #

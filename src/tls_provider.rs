@@ -9,6 +9,11 @@
 //!   完了できない（ClientHello 受信後 ServerHello を生成せずスタックする。Rust Tier 3 +
 //!   AWS-LC の OpenBSD サポート不足。F-122 で ktrace により確定）。`ring` は OpenBSD で
 //!   実績があり、HTTPS 終端に必要な TLS1.2/1.3 の AEAD スイートを提供する。
+//! - **macOS**: `ring`（F-125）。Docker（cargo-zigbuild）での universal2 クロスビルドでは
+//!   aws-lc-sys の手書きアセンブリ `.S.o` を zig リンカが解釈できずリンク失敗し
+//!   （`unknown cpu architecture`）、`AWS_LC_SYS_NO_ASM` も release ビルドでは禁止される。
+//!   `ring` は cargo-zigbuild での apple-darwin クロスビルド実績があり、これを採用する。
+//!   macOS は kTLS・http3 とも非対応のため AWS-LC 共有の利点も無く、ring で完結する。
 //!
 //! rustls の `aws_lc_rs` / `ring` は同一の公開 API（`default_provider()` /
 //! `ALL_CIPHER_SUITES` / `cipher_suite`）を持つモジュールのため、`pub use ... as`
@@ -22,16 +27,19 @@
 /// このプラットフォームで使う rustls 暗号プロバイダモジュール。
 ///
 /// `provider::default_provider()` / `provider::ALL_CIPHER_SUITES` の形で参照する。
-#[cfg(not(target_os = "openbsd"))]
+#[cfg(not(any(target_os = "openbsd", target_os = "macos")))]
 pub use rustls::crypto::aws_lc_rs as provider;
-#[cfg(target_os = "openbsd")]
+#[cfg(any(target_os = "openbsd", target_os = "macos"))]
 pub use rustls::crypto::ring as provider;
 
 /// HTTP/3（quiche）の乱数生成に使う `SecureRandom` 実装。
 ///
 /// 非 OpenBSD は aws-lc-rs、OpenBSD は ring の `SystemRandom` を用いる
 /// （どちらも `rustls`/`quiche` とは独立した RNG API）。http3 feature 有効時のみ使用。
-#[cfg(all(feature = "http3", not(target_os = "openbsd")))]
+#[cfg(all(
+    feature = "http3",
+    not(any(target_os = "openbsd", target_os = "macos"))
+))]
 pub use aws_lc_rs::rand::{SecureRandom, SystemRandom};
-#[cfg(all(feature = "http3", target_os = "openbsd"))]
+#[cfg(all(feature = "http3", any(target_os = "openbsd", target_os = "macos")))]
 pub use ring::rand::{SecureRandom, SystemRandom};

@@ -71,6 +71,22 @@ fn storage_to_sockaddr(storage: &libc::sockaddr_storage) -> io::Result<SocketAdd
 }
 
 fn new_nonblocking_dgram_socket(domain: libc::c_int) -> io::Result<RawFd> {
+    // macOS は `socket(2)` の type に `SOCK_NONBLOCK`/`SOCK_CLOEXEC` を受け付けない
+    // （libc にも定義が無い）。生の `SOCK_DGRAM` で作成し `fcntl` で 2 段設定する
+    // （TCP 側 `reactor/tcp.rs::create_nonblocking_socket` と同じ理由）。
+    #[cfg(target_os = "macos")]
+    let fd = {
+        let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM, 0) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+        fd
+    };
+    #[cfg(not(target_os = "macos"))]
     let fd = unsafe {
         libc::socket(
             domain,
@@ -80,6 +96,22 @@ fn new_nonblocking_dgram_socket(domain: libc::c_int) -> io::Result<RawFd> {
     };
     if fd < 0 {
         return Err(io::Error::last_os_error());
+    }
+    // macOS には `MSG_NOSIGNAL` が無いため `SO_NOSIGPIPE` で代替する（TCP 側の
+    // `reactor/tcp.rs::create_nonblocking_socket` と同じ理由。UDP は connect(2) 後の
+    // send(2) が対象で、connect 前は SIGPIPE を発生させないが保守的に統一する）。
+    #[cfg(target_os = "macos")]
+    {
+        let optval: libc::c_int = 1;
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_NOSIGPIPE,
+                &optval as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
     }
     Ok(fd)
 }
@@ -270,16 +302,22 @@ mod tests {
         {
             crate::runtime::ring::IoUring::new(8, 0).is_ok()
         }
-        #[cfg(veil_rt_reactor)]
+        // Linux epoll reactor: epoll fd を作れるかで判定する。`epoll_create1` は
+        // Linux 専用 libc シンボルのため、Linux 以外の reactor（FreeBSD/OpenBSD/macOS の
+        // kqueue reactor）では参照せず常に利用可能とみなす（epoll は存在しない）。
+        #[cfg(all(veil_rt_reactor, target_os = "linux"))]
         {
             let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
             if fd >= 0 {
                 unsafe { libc::close(fd) };
                 true
             } else {
-                // BSD kqueue reactor: epoll は無いので常に利用可能とみなす
-                cfg!(not(target_os = "linux"))
+                false
             }
+        }
+        #[cfg(all(veil_rt_reactor, not(target_os = "linux")))]
+        {
+            true
         }
     }
 

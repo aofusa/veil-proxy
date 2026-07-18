@@ -107,7 +107,27 @@ fn current_thread_notify_fds() -> Option<(RawFd, RawFd)> {
             cell.set((fd, fd));
             Some((fd, fd))
         }
-        #[cfg(not(target_os = "linux"))]
+        // macOS には `pipe2(2)` が無いため `pipe(2)` + `fcntl(F_SETFL, O_NONBLOCK)` +
+        // `fcntl(F_SETFD, FD_CLOEXEC)` の 2 段構えへフォールバックする（F-125、設計
+        // docs/artifacts/f125_windows_macos_design.md の macOS 節 7）。他 BSD
+        // （FreeBSD/OpenBSD）は pipe2 のまま。
+        #[cfg(target_os = "macos")]
+        {
+            let mut fds = [0 as RawFd; 2];
+            let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
+            if ret < 0 {
+                return None;
+            }
+            for fd in fds {
+                unsafe {
+                    libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                }
+            }
+            cell.set((fds[0], fds[1]));
+            Some((fds[0], fds[1]))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let mut fds = [0 as RawFd; 2];
             let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };

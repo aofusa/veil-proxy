@@ -2695,6 +2695,163 @@ pub mod pledge_unveil {
     }
 }
 
+// ====================
+// macOS: sandbox_init（Seatbelt）（F-125）
+// ====================
+//
+// macOS ネイティブのプロセスサンドボックス機構（Seatbelt）。Linux の
+// seccomp/Landlock、FreeBSD の capsicum、OpenBSD の pledge/unveil に相当する。
+//
+// `sandbox_init(3)` は Apple により deprecated 指定されているが、libSystem に
+// 現在も存在し機能する（Apple 自身の一部システムデーモンも内部で使用し続けている）。
+// SBPL（Scheme 風 DSL）でプロファイル文字列を渡し、プロセス全体へ適用する
+// （一度適用すると解除できない不可逆操作。pledge/capsicum と同様）。
+//
+// # 設計判断（実機検証不可のため保守的に）
+//
+// - ネットワークは `(allow network*)` で無条件許可する。プロキシ/upstream 構成の
+//   把握（listen/connect 先の網羅）を静的にはできず、誤って絞ると起動不能になる
+//   リスクの方が高いため、ネットワーク面はサンドボックスの対象外とする。
+// - ファイル読み取りは `(allow file-read*)` で無条件許可する。TLS 証明書・設定・
+//   WASM モジュール・共有ライブラリ等の読み取りパスを実行時に完全列挙するのは
+//   困難（動的リンカや DNS 解決ライブラリが参照する暗黙のパスを含む）で、
+//   誤って絞ると起動不能または TLS ハンドシェイク失敗を招く。
+// - ファイル**書き込み**のみ、設定から導出したログ/ディスクキャッシュディレクトリの
+//   `subpath` に限定する（`(deny default)` の恩恵が最も大きく、かつ誤検知リスクが
+//   低い面）。静的ファイルルート・証明書/鍵は読み取り専用のため明示 allow は不要
+//   （`file-read*` が既に無条件許可のため）だが、将来ここを絞る際の参照点として
+//   `static_roots`/`read_only` もプロファイルへ明示コメントとして残す。
+// - `process*`（fork/exec 監視外の意）・`signal (target self)`・`mach-lookup`
+//   （XPC・システムサービス解決に必要）・`system-socket` を許可し、通常起動を
+//   妨げないようにする。
+#[cfg(target_os = "macos")]
+pub mod macos_sandbox {
+    use ftlog::info;
+    use std::ffi::CString;
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    // `int sandbox_init(const char *profile, uint64_t flags, char **errorbuf);`
+    // `void sandbox_free_error(char *errorbuf);`
+    //
+    // # 不変条件
+    // - libSystem のシンボルであり、追加のライブラリリンクは不要（capsicum/pledge と
+    //   同様、生の FFI 宣言のみで解決する）。
+    // - `profile` は呼び出しが完了するまで生存する有効な NUL 終端バッファであること。
+    // - `errorbuf` が非 NULL で返った場合、呼び出し元は `sandbox_free_error` で解放する
+    //   責任を負う（Apple のドキュメント上の契約。C 文字列は sandbox_init が確保する）。
+    unsafe extern "C" {
+        fn sandbox_init(
+            profile: *const libc::c_char,
+            flags: u64,
+            errorbuf: *mut *mut libc::c_char,
+        ) -> libc::c_int;
+        fn sandbox_free_error(errorbuf: *mut libc::c_char);
+    }
+
+    /// `sandbox_init` の `flags` 引数。プロファイル文字列を SBPL リテラルとして渡す場合は
+    /// 0（`SANDBOX_NAMED` = 1 は `/usr/share/sandbox/*.sb` の名前付きプロファイル参照用で
+    /// 今回は使わない）。
+    const SANDBOX_LITERAL_PROFILE: u64 = 0;
+
+    /// プロファイル生成に使う設定由来のパス集合。
+    #[derive(Debug, Clone, Default)]
+    pub struct SandboxPaths {
+        /// 静的ファイル配信のルートディレクトリ（読み取り専用。現行プロファイルでは
+        /// `file-read*` を無条件許可するため実効的には冗長だが、将来の tightening の
+        /// 参照点としてプロファイルへ明示コメント出力する）。
+        pub static_roots: Vec<PathBuf>,
+        /// TLS 証明書・秘密鍵ファイル（読み取り専用。上記と同じ理由で現状は冗長）。
+        pub read_only: Vec<PathBuf>,
+        /// アクセスログ/アプリログ・ディスクキャッシュのディレクトリ（読み書き許可）。
+        pub read_write: Vec<PathBuf>,
+    }
+
+    /// SBPL 文字列リテラル内へ安全に埋め込めるようエスケープする（`\` と `"` のみ）。
+    fn escape_sbpl_string(path: &Path) -> String {
+        path.to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+    }
+
+    /// 設定から導出したパス集合から SBPL プロファイル文字列を生成する。
+    ///
+    /// 最小構成: `(deny default)` を基点に `process*`/`network*`/`file-read*` を
+    /// 無条件許可し、書き込みのみ `read_write` の `subpath` に限定する（モジュール
+    /// 冒頭の設計判断コメント参照）。
+    pub fn build_profile(paths: &SandboxPaths) -> String {
+        let mut profile = String::from(
+            "(version 1)\n\
+             (deny default)\n\
+             (allow process-fork)\n\
+             (allow process-exec)\n\
+             (allow signal (target self))\n\
+             (allow mach-lookup)\n\
+             (allow system-socket)\n\
+             (allow network*)\n\
+             (allow file-read*)\n",
+        );
+
+        if paths.read_write.is_empty() {
+            profile.push_str("; no read-write subpaths configured\n");
+        } else {
+            profile.push_str("(allow file-write*\n");
+            for p in &paths.read_write {
+                profile.push_str(&format!("  (subpath \"{}\")\n", escape_sbpl_string(p)));
+            }
+            profile.push_str(")\n");
+        }
+
+        // 現状 file-read* が無条件許可のため以下は実効的に冗長だが、将来
+        // file-read* を絞る際の対象パスとして明示しておく（保守目的のコメント）。
+        if !paths.static_roots.is_empty() || !paths.read_only.is_empty() {
+            profile.push_str("; read-only paths (informational; already covered by file-read*):\n");
+            for p in paths.static_roots.iter().chain(paths.read_only.iter()) {
+                profile.push_str(&format!(
+                    "; (allow file-read* (subpath \"{}\"))\n",
+                    escape_sbpl_string(p)
+                ));
+            }
+        }
+
+        profile
+    }
+
+    /// 生成したプロファイル文字列を `sandbox_init(3)` で適用する（不可逆）。
+    pub fn apply(profile: &str) -> io::Result<()> {
+        let c_profile = CString::new(profile)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        let mut errorbuf: *mut libc::c_char = std::ptr::null_mut();
+        // SAFETY: c_profile は呼び出し完了まで生存する。errorbuf は非 NULL で返った
+        // 場合のみ後段で sandbox_free_error に渡す。
+        let ret = unsafe {
+            sandbox_init(
+                c_profile.as_ptr(),
+                SANDBOX_LITERAL_PROFILE,
+                &mut errorbuf as *mut *mut libc::c_char,
+            )
+        };
+        if ret != 0 {
+            let message = if errorbuf.is_null() {
+                "sandbox_init failed (no error detail)".to_string()
+            } else {
+                // SAFETY: errorbuf は sandbox_init が確保した NUL 終端 C 文字列。
+                let msg = unsafe { std::ffi::CStr::from_ptr(errorbuf) }
+                    .to_string_lossy()
+                    .into_owned();
+                unsafe { sandbox_free_error(errorbuf) };
+                msg
+            };
+            return Err(io::Error::other(format!(
+                "sandbox_init failed: {}",
+                message
+            )));
+        }
+        info!("macos sandbox: sandbox_init applied (Seatbelt, deny-default + limited file-write)");
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3337,5 +3494,44 @@ mod tests {
             libc::SIGSYS,
             "Strict mode: process must be killed by SIGSYS on a disallowed syscall"
         );
+    }
+
+    // ====================
+    // macOS sandbox_init プロファイル生成テスト（F-125）
+    // ====================
+    // ビルド確認のみ（macOS 実機での sandbox_init 適用検証は不可のため、生成される
+    // SBPL 文字列の構造がプロファイル記法として妥当かを純関数レベルで確認する）。
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_macos_sandbox_build_profile_contains_deny_default_and_paths() {
+        use super::macos_sandbox::{build_profile, SandboxPaths};
+        use std::path::PathBuf;
+
+        let paths = SandboxPaths {
+            static_roots: vec![PathBuf::from("/srv/www")],
+            read_only: vec![PathBuf::from("/etc/veil/tls/cert.pem")],
+            read_write: vec![
+                PathBuf::from("/var/log/veil"),
+                PathBuf::from("/var/cache/veil"),
+            ],
+        };
+        let profile = build_profile(&paths);
+
+        assert!(profile.starts_with("(version 1)"));
+        assert!(profile.contains("(deny default)"));
+        assert!(profile.contains("(allow network*)"));
+        assert!(profile.contains("(allow file-read*)"));
+        assert!(profile.contains("(subpath \"/var/log/veil\")"));
+        assert!(profile.contains("(subpath \"/var/cache/veil\")"));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_macos_sandbox_build_profile_empty_read_write_is_valid() {
+        use super::macos_sandbox::{build_profile, SandboxPaths};
+
+        let profile = build_profile(&SandboxPaths::default());
+        assert!(profile.contains("(deny default)"));
+        assert!(!profile.contains("(allow file-write*"));
     }
 }

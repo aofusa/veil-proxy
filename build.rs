@@ -35,9 +35,10 @@ fn feature_enabled(name: &str) -> bool {
 /// | cfg | 条件 | 意味 |
 /// |-----|------|------|
 /// | `veil_rt_uring` | `target_os = "linux"` かつ `not(feature = "epoll")` | io_uring 完了ベースランタイム |
-/// | `veil_rt_reactor` | 上記以外（linux+epoll、freebsd、openbsd） | readiness ベースランタイム |
+/// | `veil_rt_reactor` | 上記以外（linux+epoll、freebsd、openbsd、macos、windows） | readiness ベースランタイム |
 /// | `veil_poller_epoll` | `target_os = "linux"` かつ `feature = "epoll"` | reactor の poller = epoll |
-/// | `veil_poller_kqueue` | `target_os = "freebsd"` または `"openbsd"` | reactor の poller = kqueue |
+/// | `veil_poller_kqueue` | `target_os = "freebsd"`、`"openbsd"`、`"macos"` | reactor の poller = kqueue |
+/// | `veil_poller_wsapoll` | `target_os = "windows"` | reactor の poller = WSAPoll（F-125、cfg 発行のみ。実装は別作業） |
 /// | `veil_ktls` | `feature = "ktls"` かつ `target_os = "linux"` | kTLS カーネルオフロード経路 |
 ///
 /// `cargo::rustc-check-cfg` も併せて発行し、`unexpected_cfgs` 警告を防ぐ。
@@ -47,6 +48,7 @@ fn emit_runtime_backend_cfg() {
     println!("cargo::rustc-check-cfg=cfg(veil_rt_reactor)");
     println!("cargo::rustc-check-cfg=cfg(veil_poller_epoll)");
     println!("cargo::rustc-check-cfg=cfg(veil_poller_kqueue)");
+    println!("cargo::rustc-check-cfg=cfg(veil_poller_wsapoll)");
     println!("cargo::rustc-check-cfg=cfg(veil_ktls)");
 
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
@@ -62,7 +64,7 @@ fn emit_runtime_backend_cfg() {
                 println!("cargo::rustc-cfg=veil_rt_uring");
             }
         }
-        "freebsd" | "openbsd" => {
+        "freebsd" | "openbsd" | "macos" => {
             if epoll {
                 panic!(
                     "veil build.rs: --features epoll is only meaningful on Linux \
@@ -74,10 +76,28 @@ fn emit_runtime_backend_cfg() {
             println!("cargo::rustc-cfg=veil_rt_reactor");
             println!("cargo::rustc-cfg=veil_poller_kqueue");
         }
+        "windows" => {
+            if epoll {
+                panic!(
+                    "veil build.rs: --features epoll is only meaningful on Linux \
+                     (target_os = \"linux\"); on target_os = \"windows\" the WSAPoll \
+                     reactor is selected automatically. Remove the epoll feature for \
+                     this target."
+                );
+            }
+            // F-125: cfg 発行のみ。WSAPoll reactor 本体（reactor/wsapoll.rs 等）は
+            // 別作業で実装する（現時点では veil_rt_reactor 選択時に他 OS 向け reactor
+            // コードがそのまま Windows 向けにコンパイルされるわけではなく、reactor
+            // 内部の Unix 専用コードは Windows では別途 cfg 分岐が必要になる。今回の
+            // 変更はビルドバックエンド選択の cfg 発行のみで、Windows 実装は含まない）。
+            println!("cargo::rustc-cfg=veil_rt_reactor");
+            println!("cargo::rustc-cfg=veil_poller_wsapoll");
+        }
         other => {
             panic!(
                 "veil build.rs: unsupported target_os \"{other}\" — veil currently \
-                 supports target_os = \"linux\", \"freebsd\", \"openbsd\" only (F-120)"
+                 supports target_os = \"linux\", \"freebsd\", \"openbsd\", \"macos\", \
+                 \"windows\" only (F-120/F-125)"
             );
         }
     }

@@ -85,7 +85,7 @@ A high-performance reverse proxy server using io_uring (custom runtime) and rust
 - **Landlock Sandbox**: Filesystem access restriction (Linux 5.13+)
 - **systemd Sandbox**: Namespace isolation and system call restriction support
 
-## Platform Support & Runtime Backends (F-120)
+## Platform Support & Runtime Backends (F-120 / F-125)
 
 The data-plane runtime backend is selected at **compile time** (no runtime dispatch, no
 hot-path cost). The default is unchanged (Linux io_uring).
@@ -96,6 +96,7 @@ hot-path cost). The default is unchanged (Linux io_uring).
 | **Linux `--features epoll`** | epoll readiness reactor (`src/runtime/reactor/`) | seccomp (epoll syscalls; io_uring syscalls dropped) + Landlock | ✅ | Fallback for hosts without io_uring |
 | **FreeBSD (x86_64/aarch64)** | kqueue readiness reactor | capsicum (`cap_rights_limit` / `cap_enter`) + jail | ✗ (userspace rustls) | `[security] enable_capsicum`, `capsicum_capability_mode`, `jail_name` |
 | **OpenBSD (x86_64/aarch64)** | kqueue readiness reactor | pledge + unveil | ✗ (userspace rustls) | `[security] enable_pledge`, `enable_unveil`. TLS uses the **ring** rustls provider (aws-lc-rs can't complete handshakes on OpenBSD; F-122). HTTPS static/proxy serving verified 200 |
+| **macOS (x86_64/aarch64, universal2)** | kqueue readiness reactor (reused from FreeBSD/OpenBSD) | `sandbox_init` (Seatbelt) | ✗ (userspace rustls) | `[security] enable_sandbox_macos`. TLS uses the **ring** rustls provider (aws-lc-sys can't cross-link under zig; F-125). Cross-built with `cargo zigbuild --target universal2-apple-darwin`; QEMU/real-hardware testing not performed — see caveats below |
 
 - The backend is chosen by `build.rs`-emitted cfgs (`veil_rt_uring` / `veil_rt_reactor` and
   `veil_poller_epoll` / `veil_poller_kqueue`). The public runtime API paths
@@ -106,9 +107,19 @@ hot-path cost). The default is unchanged (Linux io_uring).
   (QEMU user-mode verified; QEMU lacks io_uring, so QEMU runs use the `epoll` build).
 - FreeBSD/OpenBSD are built natively inside a matching VM (Rust Tier 2/3; cross-build not
   supported). See `packaging/scripts/build-bsd.sh` for tar.gz packaging with rc.d/jail.conf.
-- **TLS crypto provider** is selected per target in `src/tls_provider.rs` (F-122): OpenBSD
-  uses rustls's `ring` provider (aws-lc-rs cannot complete TLS handshakes on OpenBSD),
-  while Linux/FreeBSD use `aws_lc_rs` (shared AWS-LC build with kTLS and quiche/HTTP/3).
+- **macOS (F-125)**: cross-built only, via Docker (`messense/cargo-zigbuild`) — see
+  `packaging/scripts/build-cross.sh --target macos`. macOS lacks
+  `accept4`/`MSG_NOSIGNAL`/`pipe2`/`SOCK_NONBLOCK|SOCK_CLOEXEC`; `reactor/tcp.rs` and
+  `runtime/udp.rs` fall back to plain `socket`/`accept` + `fcntl` and `SO_NOSIGPIPE`, and
+  `runtime/offload.rs` falls back to `pipe` + `fcntl`. No real-hardware or QEMU verification
+  was performed — cross-build success is the only acceptance bar per the F-125 design doc.
+  `http3`/`wasm` features are not yet verified on macOS cross-builds (excluded from the
+  default `build-cross.sh` feature set).
+- **TLS crypto provider** is selected per target in `src/tls_provider.rs` (F-122/F-125):
+  OpenBSD **and macOS** use rustls's `ring` provider (aws-lc-rs cannot complete TLS
+  handshakes on OpenBSD; aws-lc-sys's hand-written assembly cannot be linked by zig for the
+  macOS cross-build, and `AWS_LC_SYS_NO_ASM` is forbidden in release builds), while
+  Linux/FreeBSD use `aws_lc_rs` (shared AWS-LC build with kTLS and quiche/HTTP/3).
   `Cargo.toml` splits the provider via target-specific dependencies plus `resolver = "2"`.
 
 ## Build

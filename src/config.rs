@@ -1282,6 +1282,21 @@ pub struct GlobalSecurityConfig {
     /// 全 TLS ワーカーの listener bind 完了後に最小 promise 集合へ降格する。
     #[serde(default)]
     pub enable_pledge: bool,
+
+    // ====================
+    // macOS: sandbox_init / Seatbelt（F-125）
+    // ====================
+    //
+    // 非対象 OS（Linux/FreeBSD/OpenBSD）でもキー自体は受理し、未知キー拒否にはしない
+    // （既存の capsicum/pledge と同じ方針）。適用時に警告ログを出して無視する。
+    /// sandbox_init(3)（Seatbelt）を有効化（macOS 専用）。
+    ///
+    /// 設定から導出した静的ファイルルート・TLS 証明書/鍵・ログ/ディスクキャッシュ
+    /// ディレクトリを基に SBPL プロファイルを生成し、全 TLS ワーカーの listener bind
+    /// 完了後に適用する（実機検証ができないため保守的な最小プロファイル。
+    /// `crate::security::macos_sandbox` 参照）。
+    #[serde(default)]
+    pub enable_sandbox_macos: bool,
 }
 
 fn default_allow_security_failures() -> bool {
@@ -1433,6 +1448,95 @@ pub fn collect_unveil_paths(config_path: &Path) -> io::Result<UnveilPaths> {
         read_only,
         read_write_create,
     })
+}
+
+// ====================
+// macOS: sandbox_init 対象パス収集（F-125）
+// ====================
+
+/// 設定ファイルを軽量に再パースし、`sandbox_init(3)`（Seatbelt）の SBPL プロファイル生成に
+/// 必要なパス集合を導出する（macOS 専用）。`collect_unveil_paths`（OpenBSD）と同じ理由
+/// （`LoadedConfig` はパス文字列を消費済みで再取得できないフィールドがある）で、起動時
+/// コールドパスにおいて設定ファイルをもう一度パースする。
+#[cfg(target_os = "macos")]
+pub fn collect_macos_sandbox_paths(
+    config_path: &Path,
+) -> io::Result<crate::security::macos_sandbox::SandboxPaths> {
+    use crate::security::macos_sandbox::SandboxPaths;
+
+    let config_str = fs::read_to_string(config_path)?;
+    let config: Config = toml::from_str(&config_str).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("TOML parse error: {}", e),
+        )
+    })?;
+
+    let mut static_roots = Vec::new();
+    // `read_only` は wasm feature 有効時のみ変更されるため、mut 修飾を feature で分岐する
+    // （wasm 無効ビルドで `unused_mut` 警告を出さないため。allow は使わない）。
+    #[cfg(feature = "wasm")]
+    let mut read_only = vec![
+        PathBuf::from(&config.tls.cert_path),
+        PathBuf::from(&config.tls.key_path),
+    ];
+    #[cfg(not(feature = "wasm"))]
+    let read_only = vec![
+        PathBuf::from(&config.tls.cert_path),
+        PathBuf::from(&config.tls.key_path),
+    ];
+    let mut read_write = Vec::new();
+
+    if let Some(routes) = &config.route {
+        for route in routes {
+            if let BackendConfig::File { path, .. } = &route.action {
+                static_roots.push(PathBuf::from(path));
+            }
+            if let Some(cache_cfg) = &route.cache {
+                if let Some(disk_path) = &cache_cfg.disk_path {
+                    read_write.push(disk_path.clone());
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "wasm")]
+    if let Some(wasm_cfg) = &config.wasm {
+        for module in &wasm_cfg.modules {
+            read_only.push(PathBuf::from(&module.path));
+        }
+    }
+
+    #[cfg(feature = "access-log")]
+    if let Some(file_path) = &config.access_log.file_path {
+        push_sandbox_parent_dir(&mut read_write, file_path);
+    }
+
+    if let Some(file_path) = &config.logging.app_file_path {
+        push_sandbox_parent_dir(&mut read_write, file_path);
+    }
+    if let Some(file_path) = &config.logging.error_file_path {
+        push_sandbox_parent_dir(&mut read_write, file_path);
+    }
+
+    Ok(SandboxPaths {
+        static_roots,
+        read_only,
+        read_write,
+    })
+}
+
+/// ログ/アクセスログファイルパスの親ディレクトリ（ローテーション・新規作成に必要）を
+/// 書き込み許可対象へ追加する。親ディレクトリが取得できない場合はファイルパス自体を
+/// 追加する（`push_unveil_parent_dir` と同じロジック。OpenBSD/macOS で cfg が異なるため
+/// 個別に定義する）。
+#[cfg(target_os = "macos")]
+fn push_sandbox_parent_dir(paths: &mut Vec<PathBuf>, file_path: &str) {
+    let p = Path::new(file_path);
+    match p.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => paths.push(parent.to_path_buf()),
+        _ => paths.push(p.to_path_buf()),
+    }
 }
 
 /// ログ/アクセスログファイルパスの親ディレクトリ（ローテーション・新規作成に必要）を

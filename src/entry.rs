@@ -731,6 +731,10 @@ pub fn run() {
     if loaded_config.global_security.enable_pledge {
         warn!("enable_pledge is set but this build does not target OpenBSD; ignoring");
     }
+    #[cfg(not(target_os = "macos"))]
+    if loaded_config.global_security.enable_sandbox_macos {
+        warn!("enable_sandbox_macos is set but this build does not target macOS; ignoring");
+    }
 
     // 同時接続数制限
     let max_connections = loaded_config.global_security.max_concurrent_connections;
@@ -760,6 +764,12 @@ pub fn run() {
     #[cfg(target_os = "openbsd")]
     let listeners_ready = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
+    // macOS sandbox_init(3) 用の bind 完了バリア（F-125）。プロファイルはネットワークを
+    // 無条件許可するため FreeBSD/OpenBSD ほど bind 順序への依存は無いが、適用順序を
+    // 保守的に揃えるため同じく「全ワーカー bind 完了後」に適用する。
+    #[cfg(target_os = "macos")]
+    let listeners_ready = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
     // 通常のTLSリスナーを起動（H2C専用サーバーの場合はスキップ）
     if !is_h2c_only_server {
         info!("============================================");
@@ -779,6 +789,8 @@ pub fn run() {
             #[cfg(target_os = "freebsd")]
             let listeners_ready = std::sync::Arc::clone(&listeners_ready);
             #[cfg(target_os = "openbsd")]
+            let listeners_ready = std::sync::Arc::clone(&listeners_ready);
+            #[cfg(target_os = "macos")]
             let listeners_ready = std::sync::Arc::clone(&listeners_ready);
 
             // このスレッドに割り当てるコアIDを決定
@@ -815,6 +827,9 @@ pub fn run() {
                     listeners_ready.fetch_add(1, std::sync::atomic::Ordering::Release);
                     // pledge バリア: bind 完了を通知（OpenBSD、コールドパス）。
                     #[cfg(target_os = "openbsd")]
+                    listeners_ready.fetch_add(1, std::sync::atomic::Ordering::Release);
+                    // sandbox_init バリア: bind 完了を通知（macOS、コールドパス）。
+                    #[cfg(target_os = "macos")]
                     listeners_ready.fetch_add(1, std::sync::atomic::Ordering::Release);
 
                     info!("[Thread {}] Worker started", thread_id);
@@ -964,6 +979,58 @@ pub fn run() {
                     );
                 })
                 .expect("failed to spawn veil-pledge thread");
+        }
+
+        // macOS sandbox_init（オプトイン）: 全 TLS ワーカーの bind 完了を待って適用する
+        // （バリアの根拠は前段コメント。プロファイル生成は `crate::security::macos_sandbox`、
+        // 設定から導出するパス集合は `crate::config::collect_macos_sandbox_paths`）。
+        #[cfg(target_os = "macos")]
+        if loaded_config.global_security.enable_sandbox_macos {
+            let listeners_ready = std::sync::Arc::clone(&listeners_ready);
+            let expected = num_threads;
+            let allow_failures = loaded_config.global_security.allow_security_failures;
+            let config_path_for_sandbox = config_path.clone();
+            std::thread::Builder::new()
+                .name("veil-macos-sandbox".to_string())
+                .spawn(move || {
+                    use std::sync::atomic::Ordering;
+                    // 起動時コールドパスの専用監視スレッド（イベントループ外）のため
+                    // ポーリング sleep でよい。最大 ~30 秒待つ。
+                    for _ in 0..3000 {
+                        if listeners_ready.load(Ordering::Acquire) >= expected {
+                            let result = crate::config::collect_macos_sandbox_paths(
+                                &config_path_for_sandbox,
+                            )
+                            .and_then(|paths| {
+                                let profile =
+                                    crate::security::macos_sandbox::build_profile(&paths);
+                                crate::security::macos_sandbox::apply(&profile)
+                            });
+                            match result {
+                                Ok(()) => info!(
+                                    "macos sandbox: sandbox_init applied ({} listeners bound)",
+                                    expected
+                                ),
+                                Err(e) => {
+                                    error!("macos sandbox: failed to apply: {}", e);
+                                    if !allow_failures {
+                                        std::process::exit(1);
+                                    }
+                                }
+                            }
+                            return;
+                        }
+                        // 理由付き allow: 起動時コールドパスの専用スレッド。イベントループを
+                        // ブロックしない。
+                        #[allow(clippy::disallowed_methods)]
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    error!(
+                        "macos sandbox: timed out waiting for {} listeners; sandbox_init NOT applied",
+                        expected
+                    );
+                })
+                .expect("failed to spawn veil-macos-sandbox thread");
         }
     } else {
         info!("Skipping TLS listener (H2C-only server detected)");

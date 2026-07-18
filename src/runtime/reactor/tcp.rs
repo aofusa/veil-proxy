@@ -78,7 +78,30 @@ fn storage_to_sockaddr(storage: &libc::sockaddr_storage) -> io::Result<SocketAdd
 }
 
 /// ノンブロッキングソケットを作成する（`O_NONBLOCK | O_CLOEXEC`）。
+///
+/// macOS は send(2) の `MSG_NOSIGNAL` を持たないため、代わりにソケット単位の
+/// `SO_NOSIGPIPE` を生成直後に設定する（`WriteFuture`/`SendMsgFuture` 側は
+/// macOS では send フラグを 0 にする。設計 docs/artifacts/f125_windows_macos_design.md
+/// の macOS 節 2 を参照）。設定失敗は非致命（SIGPIPE は既定で無視されない環境もあるが、
+/// プロセス全体で `signal(SIGPIPE, SIG_IGN)` する既存挙動と重複しても害はない）。
 fn create_nonblocking_socket(domain: libc::c_int) -> io::Result<RawFd> {
+    // macOS は `socket(2)` の type 引数に `SOCK_NONBLOCK`/`SOCK_CLOEXEC` を受け付けない
+    // （libc にも定義が無い）。生の `SOCK_STREAM` で作成し `fcntl` で 2 段設定する
+    // （accept 側フォールバックと同じ理由。設計 docs/artifacts/f125_windows_macos_design.md
+    // の macOS 節 1）。他 OS は 1 syscall で完結させる。
+    #[cfg(target_os = "macos")]
+    let fd = {
+        let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, 0) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+        fd
+    };
+    #[cfg(not(target_os = "macos"))]
     let fd = unsafe {
         libc::socket(
             domain,
@@ -89,7 +112,26 @@ fn create_nonblocking_socket(domain: libc::c_int) -> io::Result<RawFd> {
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
+    #[cfg(target_os = "macos")]
+    set_so_nosigpipe(fd);
     Ok(fd)
+}
+
+/// `SO_NOSIGPIPE` を設定する（macOS 専用）。send(2) 時の `MSG_NOSIGNAL` 相当を
+/// ソケットオプションとして事前設定し、対向クローズ済みソケットへの書き込みで
+/// プロセスが SIGPIPE を受け取らないようにする。
+#[cfg(target_os = "macos")]
+fn set_so_nosigpipe(fd: RawFd) {
+    let optval: libc::c_int = 1;
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_NOSIGPIPE,
+            &optval as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
 }
 
 /// `EAGAIN`/`EWOULDBLOCK` か判定する。
@@ -233,6 +275,19 @@ impl<'a> Future for Accept<'a> {
         loop {
             let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
             let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            // macOS には `accept4(2)` が無いため、`accept(2)` +
+            // `fcntl(F_SETFL, O_NONBLOCK)` + `fcntl(F_SETFD, FD_CLOEXEC)` へフォールバック
+            // する（設計 docs/artifacts/f125_windows_macos_design.md の macOS 節 1）。
+            // 他 OS は従来どおり `accept4` 1 syscall で完結させる。
+            #[cfg(target_os = "macos")]
+            let fd = unsafe {
+                libc::accept(
+                    self.listener_fd,
+                    &mut storage as *mut _ as *mut libc::sockaddr,
+                    &mut len,
+                )
+            };
+            #[cfg(not(target_os = "macos"))]
             let fd = unsafe {
                 libc::accept4(
                     self.listener_fd,
@@ -242,6 +297,14 @@ impl<'a> Future for Accept<'a> {
                 )
             };
             if fd >= 0 {
+                #[cfg(target_os = "macos")]
+                {
+                    unsafe {
+                        libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+                        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                    }
+                    set_so_nosigpipe(fd);
+                }
                 // 先に TcpStream を構築する: アドレス変換が失敗しても Drop 経由で
                 // fd がクローズされ、リークしない。
                 let stream = TcpStream { fd };
@@ -677,12 +740,18 @@ impl<T: IoBuf> Future for WriteFuture<T> {
                 .buf
                 .as_ref()
                 .expect("WriteFuture polled after completion");
+            // macOS には `MSG_NOSIGNAL` が無い（SIGPIPE 抑止は生成時の `SO_NOSIGPIPE` で
+            // 代替済み）ため send フラグを 0 にする。他 OS は従来どおり。
+            #[cfg(target_os = "macos")]
+            const SEND_FLAGS: libc::c_int = 0;
+            #[cfg(not(target_os = "macos"))]
+            const SEND_FLAGS: libc::c_int = libc::MSG_NOSIGNAL;
             let ret = unsafe {
                 libc::send(
                     this.fd,
                     buf.read_ptr() as *const libc::c_void,
                     buf.bytes_init(),
-                    libc::MSG_NOSIGNAL,
+                    SEND_FLAGS,
                 )
             };
             if ret >= 0 {
@@ -760,7 +829,13 @@ impl<A: IoBuf, B: IoBuf> Future for SendMsgFuture<A, B> {
             msghdr.msg_iov = iovecs.as_mut_ptr();
             msghdr.msg_iovlen = iov_count as _;
 
-            let ret = unsafe { libc::sendmsg(this.fd, &msghdr, libc::MSG_NOSIGNAL) };
+            // macOS には `MSG_NOSIGNAL` が無いため send フラグを 0 にする（`WriteFuture` と
+            // 同じ理由。生成時の `SO_NOSIGPIPE` で SIGPIPE 抑止済み）。
+            #[cfg(target_os = "macos")]
+            const SENDMSG_FLAGS: libc::c_int = 0;
+            #[cfg(not(target_os = "macos"))]
+            const SENDMSG_FLAGS: libc::c_int = libc::MSG_NOSIGNAL;
+            let ret = unsafe { libc::sendmsg(this.fd, &msghdr, SENDMSG_FLAGS) };
             if ret >= 0 {
                 let (a, b) = this.bufs.take().expect("buffers present at completion");
                 return Poll::Ready((Ok(ret as usize), a, b));

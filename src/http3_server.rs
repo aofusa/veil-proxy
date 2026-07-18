@@ -163,18 +163,18 @@ fn apply_memfd_seals(fd: i32) -> io::Result<()> {
 ///
 /// - Linux / FreeBSD: `memfd`（`/proc/self/fd/<fd>` 経由・FS 非経由）。Drop は fd を
 ///   閉じるだけ（匿名メモリのため後始末不要）。
-/// - OpenBSD: `memfd_create(2)` が無いため 0600 権限の一時ファイルへフォールバックし、
-///   **Drop で必ず unlink** して機密がディスクに滞留しないようにする。
+/// - OpenBSD / macOS: `memfd_create(2)` が無いため 0600 権限の一時ファイルへフォールバックし、
+///   **Drop で必ず unlink** して機密がディスクに滞留しないようにする（F-125）。
 struct PemBackedFile {
     _file: std::fs::File,
-    /// OpenBSD の一時ファイルのみ Drop で unlink 対象として保持する。
-    #[cfg(target_os = "openbsd")]
+    /// OpenBSD/macOS の一時ファイルのみ Drop で unlink 対象として保持する。
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     temp_path: std::path::PathBuf,
 }
 
 impl Drop for PemBackedFile {
     fn drop(&mut self) {
-        #[cfg(target_os = "openbsd")]
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
         {
             // 機密（秘密鍵/証明書）をディスクに残さない。close 前の unlink で
             // 名前を外し、fd クローズ時に実体が解放される。
@@ -214,12 +214,14 @@ fn create_memfd_for_pem(name: &str, pem_data: &[u8]) -> io::Result<(PemBackedFil
     Ok((PemBackedFile { _file: memfd }, proc_path))
 }
 
-/// OpenBSD 版: `memfd_create(2)` が無いため 0600 権限の一時ファイルへ PEM を書き込み、
-/// その実パスを返す（Drop で unlink）。証明書ホットリロードは数ヶ月に 1 回のコールドパス
-/// のため一時ファイル経由でも性能影響はない。`unveil` 有効時は一時ディレクトリが
-/// unveil 対象外だと作成に失敗し得るが、その場合リロードは警告付きでスキップされ既存
-/// 証明書のまま稼働を継続する（非致命）。
-#[cfg(target_os = "openbsd")]
+/// OpenBSD / macOS 版: `memfd_create(2)` が無いため 0600 権限の一時ファイルへ PEM を
+/// 書き込み、その実パスを返す（Drop で unlink）。証明書ホットリロードは数ヶ月に 1 回の
+/// コールドパスのため一時ファイル経由でも性能影響はない。OpenBSD の `unveil` 有効時は
+/// 一時ディレクトリが unveil 対象外だと作成に失敗し得るが、その場合リロードは警告付きで
+/// スキップされ既存証明書のまま稼働を継続する（非致命）。macOS には unveil 相当の制約は
+/// 無い（F-125: sandbox_init は `(allow file-write* (subpath tmp))` を許可する保守的な
+/// プロファイルのため、一時ファイル書き込みは通常ブロックされない）。
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 fn create_memfd_for_pem(name: &str, pem_data: &[u8]) -> io::Result<(PemBackedFile, String)> {
     use std::os::unix::fs::OpenOptionsExt;
 
