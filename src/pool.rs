@@ -6,10 +6,10 @@
 // kTLS 有効時は ktls_rustls モジュールの型を使用し、
 // 無効時はシンプルな rustls ラッパーを使用します。
 
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 pub(crate) use crate::ktls_rustls::KtlsClientStream as ClientTls;
 
-#[cfg(not(feature = "ktls"))]
+#[cfg(not(veil_ktls))]
 pub(crate) use crate::simple_tls::SimpleTlsClientStream as ClientTls;
 
 // ====================
@@ -23,12 +23,12 @@ use once_cell::sync::Lazy;
 use serde::Deserialize;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 use crate::ktls_rustls;
 
 // バッファサイズ（ページアライン・L2キャッシュ最適化）
@@ -475,7 +475,7 @@ thread_local! {
 // 本実装は L4 パイプツール（F-40）と同じ checkout/return 方式:
 // 取得時にプールから所有権ごと取り出し（借用を await 跨ぎで保持しない）、
 // Drop 時に FIONREAD で空を確認できた場合のみプールへ返却する。
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 thread_local! {
     static SPLICE_PIPE_POOL: RefCell<Vec<ktls_rustls::SplicePipe>> =
         const { RefCell::new(Vec::new()) };
@@ -483,7 +483,7 @@ thread_local! {
 
 /// プールに保持するパイプ本数の上限（スレッドごと）。
 /// kTLS splice 経路は 1 リクエストあたり 1 本使用するため、同時 64 リクエスト分をカバーする。
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 const SPLICE_PIPE_POOL_MAX: usize = 64;
 
 /// プールから取得した splice パイプの RAII ガード。
@@ -492,12 +492,12 @@ const SPLICE_PIPE_POOL_MAX: usize = 64;
 /// Drop 時、パイプに残データが無い（FIONREAD == 0）場合のみプールへ返却する。
 /// 残データがあるパイプを再利用すると次のリクエストへデータが混線するため、
 /// それ以外（残データあり・ioctl 失敗・プール満杯）は破棄する（fd クローズ）。
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 pub(crate) struct PooledSplicePipe {
     pipe: Option<ktls_rustls::SplicePipe>,
 }
 
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 impl std::ops::Deref for PooledSplicePipe {
     type Target = ktls_rustls::SplicePipe;
 
@@ -507,7 +507,7 @@ impl std::ops::Deref for PooledSplicePipe {
     }
 }
 
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 impl Drop for PooledSplicePipe {
     fn drop(&mut self) {
         let Some(pipe) = self.pipe.take() else {
@@ -533,7 +533,7 @@ impl Drop for PooledSplicePipe {
 ///
 /// プールが空の場合は新規作成（`pipe2(2)`）にフォールバックする。
 /// 作成に失敗した場合は `None` を返す（呼び出し側は通常転送へフォールバック）。
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 pub(crate) fn get_splice_pipe() -> Option<PooledSplicePipe> {
     if let Some(pipe) = SPLICE_PIPE_POOL.with(|pool| pool.borrow_mut().pop()) {
         return Some(PooledSplicePipe { pipe: Some(pipe) });
@@ -557,7 +557,7 @@ pub(crate) fn get_splice_pipe() -> Option<PooledSplicePipe> {
 // ====================
 
 /// libc::read のラッパー（ノンブロッキング対応）
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 #[inline]
 pub(crate) fn raw_read(fd: std::os::unix::io::RawFd, buf: &mut [u8]) -> io::Result<usize> {
     let result = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
@@ -569,7 +569,7 @@ pub(crate) fn raw_read(fd: std::os::unix::io::RawFd, buf: &mut [u8]) -> io::Resu
 }
 
 /// libc::write のラッパー（ノンブロッキング対応）
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 #[inline]
 pub(crate) fn raw_write(fd: std::os::unix::io::RawFd, buf: &[u8]) -> io::Result<usize> {
     let result = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
@@ -584,7 +584,7 @@ pub(crate) fn raw_write(fd: std::os::unix::io::RawFd, buf: &[u8]) -> io::Result<
 ///
 /// libc::read を直接使用。
 /// WouldBlock の場合は readable() で待機してリトライ。
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 pub(crate) async fn async_raw_read(stream: &TcpStream, buf: &mut [u8]) -> io::Result<usize> {
     use std::os::unix::io::AsRawFd;
     let fd = stream.as_raw_fd();
@@ -605,7 +605,7 @@ pub(crate) async fn async_raw_read(stream: &TcpStream, buf: &mut [u8]) -> io::Re
 ///
 /// libc::write を直接使用。
 /// WouldBlock の場合は writable() で待機してリトライ。
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 pub(crate) async fn async_raw_write(stream: &TcpStream, buf: &[u8]) -> io::Result<usize> {
     use std::os::unix::io::AsRawFd;
     let fd = stream.as_raw_fd();
@@ -627,7 +627,7 @@ pub(crate) async fn async_raw_write(stream: &TcpStream, buf: &[u8]) -> io::Resul
 }
 
 /// 非同期 raw write all（全バイト書き込み完了まで）
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 pub(crate) async fn async_raw_write_all(stream: &TcpStream, buf: &[u8]) -> io::Result<()> {
     let written = async_raw_write(stream, buf).await?;
     if written < buf.len() {
@@ -1131,7 +1131,7 @@ mod alt_svc_tests {
 mod tests {
     // B-16: splice パイプの checkout/return プールの回帰テスト。
     // 各テストは独立スレッドで実行されるため thread_local プールは常に空から始まる。
-    #[cfg(feature = "ktls")]
+    #[cfg(veil_ktls)]
     mod splice_pipe_pool {
         use super::super::*;
 

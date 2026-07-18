@@ -79,28 +79,86 @@ static POOL: Lazy<Arc<OffloadPool>> = Lazy::new(|| {
 });
 
 thread_local! {
-    /// 起点スレッド（io_uring ワーカー）の完了通知用 eventfd。初回オフロード時に遅延生成。
-    static OFFLOAD_EVENTFD: Cell<RawFd> = const { Cell::new(-1) };
+    /// 起点スレッドの完了通知用 fd ペア（読み取り fd, 書き込み fd）。初回オフロード時に
+    /// 遅延生成する。Linux は eventfd（読み書き同一 fd）、非 Linux（BSD）は
+    /// `pipe2(O_NONBLOCK|O_CLOEXEC)` の読み/書き端（F-120 Phase 4: eventfd は Linux 専用
+    /// のため、BSD では通知抽象をパイプへ差し替える。設計 3.3 節）。
+    static OFFLOAD_NOTIFY: Cell<(RawFd, RawFd)> = const { Cell::new((-1, -1)) };
 }
 
-/// 現在のスレッドのオフロード用 eventfd を取得する（ランタイムドライバがある場合のみ）。
-fn current_thread_eventfd() -> Option<RawFd> {
+/// 現在のスレッドのオフロード用通知 fd ペア（読み取り fd, 書き込み fd）を取得する
+/// （ランタイムドライバがある場合のみ）。Linux では両者は同一の eventfd。
+fn current_thread_notify_fds() -> Option<(RawFd, RawFd)> {
     if !has_driver() {
         return None;
     }
-    OFFLOAD_EVENTFD.with(|cell| {
-        let fd = cell.get();
-        if fd >= 0 {
-            return Some(fd);
+    OFFLOAD_NOTIFY.with(|cell| {
+        let (r, w) = cell.get();
+        if r >= 0 {
+            return Some((r, w));
         }
-        // EFD_NONBLOCK: ドレイン read が即時に返る。EFD_CLOEXEC: exec で漏らさない。
-        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-        if fd < 0 {
-            return None;
+        #[cfg(target_os = "linux")]
+        {
+            // EFD_NONBLOCK: ドレイン read が即時に返る。EFD_CLOEXEC: exec で漏らさない。
+            let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+            if fd < 0 {
+                return None;
+            }
+            cell.set((fd, fd));
+            Some((fd, fd))
         }
-        cell.set(fd);
-        Some(fd)
+        #[cfg(not(target_os = "linux"))]
+        {
+            let mut fds = [0 as RawFd; 2];
+            let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
+            if ret < 0 {
+                return None;
+            }
+            cell.set((fds[0], fds[1]));
+            Some((fds[0], fds[1]))
+        }
     })
+}
+
+/// 通知 fd の完了シグナルをドレインする（best-effort）。
+///
+/// Linux（eventfd）は 8 バイト固定の 64bit カウンタ読み取りで全完了分を一括ドレインできる。
+/// 非 Linux（パイプ）は完了ごとに 1 バイト書き込まれるため、複数完了が溜まっている場合に
+/// 備えてまとまった読み取りバッファでドレインする（読み残しがあっても次回 poll で `done`
+/// を再検査するため正当性には影響しない。詳細は `OffloadWait::poll` のコメント参照）。
+/// ドレインを実行し、1 バイト以上読み取れたら `true` を返す。
+#[inline]
+fn drain_notify(read_fd: RawFd) -> bool {
+    #[cfg(target_os = "linux")]
+    let ret = {
+        let mut buf = [0u8; 8];
+        unsafe { libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, 8) }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let ret = {
+        let mut buf = [0u8; 256];
+        unsafe { libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) }
+    };
+    ret > 0
+}
+
+/// 完了通知を書き込む（ワーカースレッドから起点スレッドへ）。
+///
+/// # Safety
+/// `write_fd` は呼び出し時点で有効な fd であること（起点スレッドが `offload()` 呼び出し中
+/// 保持し続けるため、ジョブ実行完了までクローズされない）。
+#[inline]
+unsafe fn signal_notify(write_fd: RawFd) {
+    #[cfg(target_os = "linux")]
+    {
+        let val: u64 = 1;
+        libc::write(write_fd, &val as *const u64 as *const libc::c_void, 8);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let val: u8 = 1;
+        libc::write(write_fd, &val as *const u8 as *const libc::c_void, 1);
+    }
 }
 
 /// ブロッキングなクロージャ `f` を専用スレッドで実行し、結果を非同期に受け取る。
@@ -112,8 +170,8 @@ where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    let eventfd = match current_thread_eventfd() {
-        Some(fd) => fd,
+    let (read_fd, write_fd) = match current_thread_notify_fds() {
+        Some(fds) => fds,
         // ドライバ無し: 同期実行（このパスは単体テスト等のみ）
         None => return f(),
     };
@@ -126,12 +184,12 @@ where
     POOL.submit(Box::new(move || {
         let result = f();
         *slot_w.lock().unwrap() = Some(result);
-        // 結果格納を Release で公開してから eventfd を叩く（起点スレッドは Acquire で読む）。
+        // 結果格納を Release で公開してから通知 fd を叩く（起点スレッドは Acquire で読む）。
         done_w.store(true, Ordering::Release);
-        let val: u64 = 1;
-        // SAFETY: eventfd は 8 バイト書き込み。fd は起点スレッドが保持し続けている。
+        // SAFETY: write_fd は起点スレッドが `offload()` 呼び出しの間ずっと保持し続ける
+        // （関数末尾までクローズされない）。
         unsafe {
-            libc::write(eventfd, &val as *const u64 as *const libc::c_void, 8);
+            signal_notify(write_fd);
         }
     }));
 
@@ -140,6 +198,8 @@ where
     // POLL_ADD の完了は eventfd への write 時点で CQE として **各待機者に個別に** 記録される
     // （後から他タスクがカウンタを drain しても、既に発行された完了は失われない）。
     // そのため「wait → drain → done 再確認」の素朴なループで取りこぼしが無い。
+    // veil_rt_uring は target_os = "linux" 限定（build.rs）のため read_fd/write_fd は
+    // 常に同一の eventfd。
     #[cfg(veil_rt_uring)]
     loop {
         if done.load(Ordering::Acquire) {
@@ -150,12 +210,8 @@ where
                 .expect("offload result must be present once done");
         }
         // eventfd が読み取り可能（=どれかのオフロードが完了）になるまで待つ。
-        let _ = wait_readable_fd(eventfd).await;
-        // カウンタをドレイン（複数オフロードで共有するため best-effort、EAGAIN は無視）。
-        let mut buf = [0u8; 8];
-        unsafe {
-            libc::read(eventfd, buf.as_mut_ptr() as *mut libc::c_void, 8);
-        }
+        let _ = wait_readable_fd(read_fd).await;
+        drain_notify(read_fd);
     }
 
     // ===== reactor（readiness）バックエンド: done 検査つき専用 Future で待機 =====
@@ -176,7 +232,7 @@ where
     #[cfg(veil_rt_reactor)]
     {
         struct OffloadWait {
-            eventfd: RawFd,
+            read_fd: RawFd,
             done: Arc<AtomicBool>,
         }
 
@@ -193,25 +249,22 @@ where
                 }
                 // try-first: 既に readable なら drain して他の待機者へ再配布する。
                 let mut pfd = libc::pollfd {
-                    fd: self.eventfd,
+                    fd: self.read_fd,
                     events: libc::POLLIN,
                     revents: 0,
                 };
                 let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
                 if ret > 0 && pfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
-                    let mut buf = [0u8; 8];
-                    let rret = unsafe {
-                        libc::read(self.eventfd, buf.as_mut_ptr() as *mut libc::c_void, 8)
-                    };
+                    let drained = drain_notify(self.read_fd);
                     // (2) drain したシグナルは他タスク宛てかもしれない。全読者を起こして
                     // 各自の done を再確認させる（起こされた側は本 poll の (1) で観測する）。
-                    if rret > 0 {
-                        crate::runtime::executor::wake_all_readers(self.eventfd);
+                    if drained {
+                        crate::runtime::executor::wake_all_readers(self.read_fd);
                     }
                     // 呼び出し元ループで done を再確認させる（自分宛てだったかは分からない）。
                     return std::task::Poll::Ready(());
                 }
-                crate::runtime::executor::register_read(self.eventfd, cx.waker().clone());
+                crate::runtime::executor::register_read(self.read_fd, cx.waker().clone());
                 std::task::Poll::Pending
             }
         }
@@ -225,7 +278,7 @@ where
                     .expect("offload result must be present once done");
             }
             OffloadWait {
-                eventfd,
+                read_fd,
                 done: Arc::clone(&done),
             }
             .await;

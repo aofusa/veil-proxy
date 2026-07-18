@@ -19,10 +19,13 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
-#[cfg(feature = "ktls")]
+// kTLS はカーネルオフロード実装のため Linux 専用（F-120 設計 2 節）。`ktls` feature が
+// 有効でも非 Linux では `veil_ktls` が立たず、下の `simple_tls`（ユーザ空間 rustls）へ
+// 自動フォールバックする。
+#[cfg(veil_ktls)]
 pub mod ktls;
 
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 pub mod ktls_rustls;
 
 #[cfg(feature = "http2")]
@@ -75,7 +78,7 @@ pub mod access_log;
 #[cfg(feature = "l4-proxy")]
 pub mod l4;
 
-#[cfg(not(feature = "ktls"))]
+#[cfg(not(veil_ktls))]
 pub mod simple_tls;
 
 pub mod config;

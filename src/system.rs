@@ -305,7 +305,9 @@ pub(crate) fn spawn_pooled_with_panic_catch<F>(
 // ====================
 
 /// ユーザー名からUIDを取得
-#[cfg(target_os = "linux")]
+///
+/// `getpwnam(3)` は POSIX のため Linux/FreeBSD/OpenBSD 共通で使える（F-120 Phase 4 で
+/// Linux 限定 cfg を撤去）。
 pub(crate) fn get_uid_by_name(username: &str) -> Option<u32> {
     use std::ffi::CString;
 
@@ -321,8 +323,7 @@ pub(crate) fn get_uid_by_name(username: &str) -> Option<u32> {
     }
 }
 
-/// グループ名からGIDを取得
-#[cfg(target_os = "linux")]
+/// グループ名からGIDを取得（POSIX、全対応 OS 共通）
 pub(crate) fn get_gid_by_name(groupname: &str) -> Option<u32> {
     use std::ffi::CString;
 
@@ -340,8 +341,9 @@ pub(crate) fn get_gid_by_name(groupname: &str) -> Option<u32> {
 
 /// 権限降格を実行
 ///
-/// グループ→ユーザーの順で降格する（逆順では失敗する可能性あり）
-#[cfg(target_os = "linux")]
+/// グループ→ユーザーの順で降格する（逆順では失敗する可能性あり）。
+/// `setgid`/`setgroups`/`setuid` は POSIX のため Linux/FreeBSD/OpenBSD 共通で動作する
+/// （F-120 Phase 4 で Linux 限定 cfg とスタブを撤去）。
 pub(crate) fn drop_privileges(security: &crate::GlobalSecurityConfig) -> io::Result<()> {
     // rootでない場合は何もしない
     if unsafe { libc::getuid() } != 0 {
@@ -404,13 +406,6 @@ pub(crate) fn drop_privileges(security: &crate::GlobalSecurityConfig) -> io::Res
         }
     }
 
-    Ok(())
-}
-
-/// Linux以外のプラットフォーム用のスタブ
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn drop_privileges(_security: &crate::GlobalSecurityConfig) -> io::Result<()> {
-    warn!("Privilege dropping is only supported on Linux");
     Ok(())
 }
 

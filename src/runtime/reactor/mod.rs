@@ -5,7 +5,7 @@
 //! 使わずコンパイル時に 1 実装へ確定させる）:
 //!
 //! - `veil_poller_epoll`（Linux + `--features epoll`）: [`epoll`] モジュール
-//! - `veil_poller_kqueue`（FreeBSD/OpenBSD）: F-120 Phase 4 で追加予定（本 Phase では未実装）
+//! - `veil_poller_kqueue`（FreeBSD/OpenBSD）: [`kqueue`] モジュール（F-120 Phase 4）
 //!
 //! ## 設計要点
 //!
@@ -22,9 +22,14 @@
 #[cfg(veil_poller_epoll)]
 pub(crate) mod epoll;
 
+#[cfg(veil_poller_kqueue)]
+pub(crate) mod kqueue;
+
 pub(crate) mod poller;
 
 pub mod executor;
+/// splice(2) は Linux 専用（BSD は呼び出し側で read/write 転送へフォールバック。設計 3.3 節）。
+#[cfg(target_os = "linux")]
 pub mod splice;
 pub mod tcp;
 pub mod timer;

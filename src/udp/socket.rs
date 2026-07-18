@@ -20,17 +20,18 @@ use std::os::unix::io::AsRawFd;
 use crate::runtime::tcp::{wait_readable_fd, wait_writable_fd};
 use std::net::UdpSocket;
 
-// F-115 第2段: sendmmsg の先頭メッセージ恒久エラーを skip する際の warn ログに使用。
-#[cfg(target_os = "linux")]
+// F-115 第2段: sendmmsg（非 Linux は逐次エミュレーション）の恒久エラー skip 時の warn に使用。
 use ftlog::warn;
 
-/// GSO セグメントサイズ（QUIC パケットの典型的なサイズ）
+/// GSO セグメントサイズ（QUIC パケットの典型的なサイズ。GSO は Linux 専用）
+#[cfg(target_os = "linux")]
 const GSO_SEGMENT_SIZE: usize = 1200;
 
 /// 受信バッファサイズ
 const RECV_BUFFER_SIZE: usize = 65536;
 
-/// CMSG バッファサイズ（UDP_SEGMENT + UDP_GRO 用）
+/// CMSG バッファサイズ（UDP_SEGMENT + UDP_GRO 用。cmsg は Linux 専用経路のみ）
+#[cfg(target_os = "linux")]
 const CMSG_BUFFER_SIZE: usize = 128;
 
 /// F-115 第2段: 1 回の recvmmsg で受ける最大データグラム数。
@@ -1138,7 +1139,6 @@ fn parse_gro_cmsg(msg: &libc::msghdr) -> Option<u16> {
 // ====================
 
 /// SocketAddr を libc sockaddr に変換
-#[cfg(target_os = "linux")]
 fn socket_addr_to_raw(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
 
@@ -1173,7 +1173,6 @@ fn socket_addr_to_raw(addr: SocketAddr) -> (libc::sockaddr_storage, libc::sockle
 }
 
 /// libc sockaddr_storage を SocketAddr に変換
-#[cfg(target_os = "linux")]
 fn raw_to_socket_addr(storage: &libc::sockaddr_storage) -> io::Result<SocketAddr> {
     match storage.ss_family as libc::c_int {
         libc::AF_INET => {
@@ -1205,6 +1204,347 @@ fn raw_to_socket_addr(storage: &libc::sockaddr_storage) -> io::Result<SocketAddr
 /// 受信バッファを作成
 pub fn create_recv_buffer() -> Vec<u8> {
     vec![0u8; RECV_BUFFER_SIZE]
+}
+
+// ====================
+// 非 Linux（FreeBSD/OpenBSD）: mmsg/GSO API の逐次エミュレーション（F-120 Phase 4）
+// ====================
+//
+// HTTP/3 サーバのバッチング経路（F-115: recvmmsg/sendmmsg/GSO/GRO）を cfg 分岐なしで
+// 動かすため、Linux 専用 API と**同一シグネチャ**を単発 sendto/recvfrom の逐次実行で
+// 提供する。GSO/GRO は常に無効（`gso_enabled()`/`gro_enabled()` が false）のため:
+//
+// - 送信側: `finalize_send_entry` の GSO 無効フォールバックにより、multi-segment
+//   エントリはパケット境界ごとの単一パケットエントリへ展開されてから届く
+//   （`segments == 1`）。防御的に `segments > 1` はセグメント分割送信で処理する。
+// - 受信側: GRO 集約が発生しないため 1 データグラム = 1 QUIC パケット列。
+//
+// ホットパス規則: スクラッチはスレッドローカルで再利用され（呼び出し側の設計は Linux と
+// 共通）、本エミュレーションもリクエスト毎のヒープ確保を行わない。
+
+/// 非 Linux 版 `bind_reuseport`（FreeBSD: `SO_REUSEPORT_LB`（カーネル分散）、
+/// その他 BSD: `SO_REUSEPORT`）。GSO/GRO は非対応のため常に無効。
+#[cfg(not(target_os = "linux"))]
+impl QuicUdpSocket {
+    pub fn bind_reuseport(addr: SocketAddr) -> io::Result<Self> {
+        use std::os::unix::io::FromRawFd;
+
+        let domain = if addr.is_ipv4() {
+            libc::AF_INET
+        } else {
+            libc::AF_INET6
+        };
+
+        let fd = unsafe {
+            libc::socket(
+                domain,
+                libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                0,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let optval: libc::c_int = 1;
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
+                &optval as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if ret < 0 {
+            unsafe { libc::close(fd) };
+            return Err(io::Error::last_os_error());
+        }
+
+        // FreeBSD: SO_REUSEPORT はバインド共存のみでカーネル分散を行わない。
+        // thread-per-core のフロー分散には SO_REUSEPORT_LB（FreeBSD 12+）が必要
+        // （TCP リスナー側 `reactor::tcp::bind_reuse_port` と同方針）。
+        #[cfg(target_os = "freebsd")]
+        let reuseport_opt = libc::SO_REUSEPORT_LB;
+        #[cfg(not(target_os = "freebsd"))]
+        let reuseport_opt = libc::SO_REUSEPORT;
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                reuseport_opt,
+                &optval as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if ret < 0 {
+            unsafe { libc::close(fd) };
+            return Err(io::Error::last_os_error());
+        }
+
+        let (storage, len) = socket_addr_to_raw(addr);
+        let ret = unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, len) };
+        if ret < 0 {
+            unsafe { libc::close(fd) };
+            return Err(io::Error::last_os_error());
+        }
+
+        // 高スループット向けにソケットバッファを拡大（Linux 版 configure_gso_gro と同方針。
+        // 失敗してもエラーにしない）。
+        let buf_size: libc::c_int = 2 * 1024 * 1024;
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &buf_size as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &buf_size as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+
+        let socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
+        socket.set_nonblocking(true)?;
+        let local_addr = socket.local_addr()?;
+
+        Ok(Self {
+            socket,
+            gso_enabled: false,
+            gro_enabled: false,
+            local_addr,
+        })
+    }
+
+    /// 非 Linux 版 `bind_reuseport_with_gso`（GSO/GRO 非対応のため要求は無視して
+    /// `bind_reuseport` に委譲する）。
+    pub fn bind_reuseport_with_gso(addr: SocketAddr, _enable_gso_gro: bool) -> io::Result<Self> {
+        Self::bind_reuseport(addr)
+    }
+
+    /// 非 Linux 版 `send_with_gso_sync`: `segment_size` 境界で分割した単発 `sendto` の
+    /// 逐次実行（GSO 無効のため `gso_used` は常に false）。
+    pub fn send_with_gso_sync(
+        &self,
+        data: &[u8],
+        segment_size: u16,
+        target: SocketAddr,
+    ) -> io::Result<GsoSendResult> {
+        let fd = self.socket.as_raw_fd();
+        let (sockaddr, sockaddr_len) = socket_addr_to_raw(target);
+        let seg = (segment_size as usize).max(1);
+        let mut sent_total = 0usize;
+        for chunk in data.chunks(seg) {
+            let ret = unsafe {
+                libc::sendto(
+                    fd,
+                    chunk.as_ptr() as *const libc::c_void,
+                    chunk.len(),
+                    0,
+                    &sockaddr as *const _ as *const libc::sockaddr,
+                    sockaddr_len,
+                )
+            };
+            if ret < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            sent_total += ret as usize;
+        }
+        Ok(GsoSendResult {
+            bytes_sent: sent_total,
+            gso_used: false,
+        })
+    }
+
+    /// 非 Linux 版 `recv_with_gro_sync`: 単発 `recvfrom`（GRO 集約なし）。
+    pub fn recv_with_gro_sync(&self, buf: &mut [u8]) -> io::Result<GroRecvResult> {
+        let fd = self.socket.as_raw_fd();
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut addr_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        let ret = unsafe {
+            libc::recvfrom(
+                fd,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+                0,
+                &mut storage as *mut _ as *mut libc::sockaddr,
+                &mut addr_len,
+            )
+        };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(GroRecvResult {
+            bytes_received: ret as usize,
+            from: raw_to_socket_addr(&storage)?,
+            gro_segment_size: None,
+        })
+    }
+
+    /// 非 Linux 版 `recv_gro_async`: 読み込み可能待ち + 単発 `recvfrom`
+    /// （Linux 版と同一の契約。GRO 集約は発生しない）。
+    pub async fn recv_gro_async(&self, buf: &mut [u8]) -> io::Result<GroRecvResult> {
+        loop {
+            match self.recv_with_gro_sync(buf) {
+                Ok(result) => return Ok(result),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    wait_readable_fd(self.socket.as_raw_fd()).await?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// 非 Linux 版 `recv_mmsg_sync`: 単発 `recvfrom` を最大 `MMSG_RECV_BATCH` 回まで
+    /// 非ブロッキングで繰り返す（1 件も受信できなければ `WouldBlock` を返す =
+    /// Linux 版 recvmmsg と同じ契約）。
+    pub fn recv_mmsg_sync(&self, scratch: &mut MmsgRecvScratch) -> io::Result<usize> {
+        let fd = self.socket.as_raw_fd();
+        let mut count = 0usize;
+        while count < MMSG_RECV_BATCH {
+            let start = count * RECV_BUFFER_SIZE;
+            let buf = &mut scratch.bufs[start..start + RECV_BUFFER_SIZE];
+            let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+            let mut addr_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            let ret = unsafe {
+                libc::recvfrom(
+                    fd,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                    0,
+                    &mut storage as *mut _ as *mut libc::sockaddr,
+                    &mut addr_len,
+                )
+            };
+            if ret < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::WouldBlock && count > 0 {
+                    break; // 受信済み分を返す
+                }
+                return Err(e);
+            }
+            scratch.metas[count] = (ret as usize, storage);
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// 非 Linux 版 `send_mmsg_async`: エントリごとの単発 `sendto` の逐次実行。
+    /// `EAGAIN` は書き込み可能待ちで再開し、恒久エラーは当該エントリのみ skip する
+    /// （QUIC 再送で回復する。Linux 版 sendmmsg と同じ契約）。
+    pub async fn send_mmsg_async(
+        &self,
+        entries: &[SendmmsgEntry<'_>],
+        _scratch: &mut MmsgSendScratch,
+    ) -> io::Result<()> {
+        let fd = self.socket.as_raw_fd();
+        for e in entries.iter().take(MMSG_SEND_BATCH) {
+            let (sockaddr, sockaddr_len) = socket_addr_to_raw(e.dest);
+            // GSO 無効フォールバック（finalize_send_entry）により通常 segments == 1。
+            // 防御的に multi-segment はセグメント境界で分割して個別送信する。
+            let seg = if e.segments > 1 {
+                (e.seg_size as usize).max(1)
+            } else {
+                e.data.len().max(1)
+            };
+            for chunk in e.data.chunks(seg) {
+                loop {
+                    let ret = unsafe {
+                        libc::sendto(
+                            fd,
+                            chunk.as_ptr() as *const libc::c_void,
+                            chunk.len(),
+                            0,
+                            &sockaddr as *const _ as *const libc::sockaddr,
+                            sockaddr_len,
+                        )
+                    };
+                    if ret >= 0 {
+                        break;
+                    }
+                    let err = io::Error::last_os_error();
+                    if err.kind() == io::ErrorKind::WouldBlock {
+                        // 送信バッファ満杯: 書き込み可能を待って同一チャンクを再送する。
+                        wait_writable_fd(fd).await?;
+                        continue;
+                    }
+                    warn!("[HTTP/3] send entry skipped: {}", err);
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 非 Linux 版 recvmmsg スクラッチ（受信バッファ + per-msg メタ情報のみ。
+/// Linux 版と同一の公開 API: `new` / `meta` / `buf_mut`）。
+#[cfg(not(target_os = "linux"))]
+pub struct MmsgRecvScratch {
+    /// MMSG_RECV_BATCH × RECV_BUFFER_SIZE の連続バッファ（Linux 版と同レイアウト）。
+    bufs: Box<[u8]>,
+    /// 受信メタ情報（受信バイト数, 送信元 sockaddr）。`recv_mmsg_sync` が書き込む。
+    metas: Box<[(usize, libc::sockaddr_storage); MMSG_RECV_BATCH]>,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl MmsgRecvScratch {
+    pub fn new() -> Self {
+        Self {
+            bufs: vec![0u8; MMSG_RECV_BATCH * RECV_BUFFER_SIZE].into_boxed_slice(),
+            // 安全性: sockaddr_storage は POD（全ビットゼロが有効表現）。
+            metas: Box::new(unsafe { std::mem::zeroed() }),
+        }
+    }
+
+    /// i 番目の受信メタ情報（受信バイト数・送信元・GRO セグメントサイズ = 常に None）。
+    pub fn meta(&self, i: usize) -> io::Result<(usize, SocketAddr, Option<u16>)> {
+        let (len, ref storage) = self.metas[i];
+        Ok((len, raw_to_socket_addr(storage)?, None))
+    }
+
+    /// i 番目の受信バッファ（全域スライス）。
+    pub fn buf_mut(&mut self, i: usize) -> &mut [u8] {
+        let start = i * RECV_BUFFER_SIZE;
+        &mut self.bufs[start..start + RECV_BUFFER_SIZE]
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Default for MmsgRecvScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 非 Linux 版 sendmmsg 送信ディスクリプタ（Linux 版と同一フィールド）。
+#[cfg(not(target_os = "linux"))]
+pub struct SendmmsgEntry<'a> {
+    /// 連結済みパケット列（batch のスライス）。
+    pub data: &'a [u8],
+    /// GSO セグメントサイズ（非 Linux では分割送信の境界にのみ使用）。
+    pub seg_size: u16,
+    /// パケット数。
+    pub segments: u16,
+    /// 送信先。
+    pub dest: SocketAddr,
+}
+
+/// 非 Linux 版 sendmmsg スクラッチ（逐次 sendto のため保持状態なし。API 互換のみ）。
+#[cfg(not(target_os = "linux"))]
+#[derive(Default)]
+pub struct MmsgSendScratch {}
+
+#[cfg(not(target_os = "linux"))]
+impl MmsgSendScratch {
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 #[cfg(test)]

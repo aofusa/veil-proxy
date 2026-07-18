@@ -5,15 +5,20 @@
 use crate::config::{L4LbAlgorithm, L4ListenerConfig, L4TlsMode, CURRENT_CONFIG};
 use crate::runtime::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
 use crate::runtime::offload::offload;
+// splice(2) は Linux 専用（設計ドキュメント 3.3 節）。BSD は forward_direction の
+// ユーザースペース read/write 転送へフォールバックするため splice/Pipe は使わない。
+#[cfg(target_os = "linux")]
 use crate::runtime::splice::{splice, Pipe};
 use crate::runtime::tcp::TcpStream as IoUringTcpStream;
 use crate::runtime::time::timeout;
 
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 use crate::ktls_rustls::{KtlsServerStream, RustlsAcceptor};
-#[cfg(not(feature = "ktls"))]
+#[cfg(not(veil_ktls))]
 use crate::simple_tls::{SimpleTlsAcceptor, SimpleTlsServerStream};
 use ftlog::{debug, info, warn};
+// std::io は splice 転送（Linux 専用経路）でのみ使用する。
+#[cfg(target_os = "linux")]
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::os::unix::io::AsRawFd;
@@ -316,6 +321,7 @@ async fn forward_direction(
 // パイプに残データがあるまま再利用すると**次の接続へデータが混線する**ため、
 // 返却時に FIONREAD で空であることを確認できた場合のみプールへ戻す（それ以外は破棄）。
 
+#[cfg(target_os = "linux")]
 thread_local! {
     static L4_PIPE_POOL: std::cell::RefCell<Vec<Pipe>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -323,9 +329,11 @@ thread_local! {
 
 /// プールに保持するパイプ本数の上限（スレッドごと）。
 /// 1 接続あたり 2 本（上り/下り）使うため、同時 32 接続分をカバーする。
+#[cfg(target_os = "linux")]
 const L4_PIPE_POOL_MAX: usize = 64;
 
 /// プールからパイプを取得する。空ならば新規作成（`pipe2(2)`）にフォールバック。
+#[cfg(target_os = "linux")]
 fn acquire_pipe() -> io::Result<Pipe> {
     if let Some(p) = L4_PIPE_POOL.with(|pool| pool.borrow_mut().pop()) {
         return Ok(p);
@@ -338,6 +346,7 @@ fn acquire_pipe() -> io::Result<Pipe> {
 /// 残データがあるパイプを再利用すると次接続へデータが漏れる（混線する）ため、
 /// FIONREAD で空を確認できた場合のみ返却し、それ以外（残データあり・ioctl 失敗・
 /// プール満杯）は Drop に任せて破棄する。
+#[cfg(target_os = "linux")]
 fn release_pipe(pipe: Pipe) {
     let mut pending: libc::c_int = 0;
     let ret = unsafe { libc::ioctl(pipe.read_fd, libc::FIONREAD, &mut pending) };
@@ -359,6 +368,7 @@ fn release_pipe(pipe: Pipe) {
 /// `src(socket) → pipe → dst(socket)` の 2 段 splice でカーネル内転送する。ユーザースペースの
 /// バッファを一切経由しない（メモリコピー・ヒープ確保なし）。`readable()`/`writable()`
 /// （POLL_ADD）で待機し、ノンブロッキング splice をドレインループで回す（エッジトリガ）。
+#[cfg(target_os = "linux")]
 async fn forward_direction_splice(
     src: &IoUringTcpStream,
     dst: &IoUringTcpStream,
@@ -431,9 +441,27 @@ pub async fn bidirectional_forward(
     idle_timeout: Duration,
     listener_name: &str,
 ) {
+    // BSD（`splice(2)` 非搭載）: 設計ドキュメント 3.3 節のとおり、splice/パイプ経路は
+    // Linux 専用のため使わず、常にユーザースペース read/write 転送（`forward_direction`。
+    // コネクション確立時に一度だけバッファを確保しリクエストごとの再確保は発生しない）
+    // へフォールバックする。
+    #[cfg(not(target_os = "linux"))]
+    {
+        let (c2u_bytes, u2c_bytes) = futures::join!(
+            forward_direction(&client, &upstream, idle_timeout, listener_name),
+            forward_direction(&upstream, &client, idle_timeout, listener_name)
+        );
+        debug!(
+            "[L4:{}] connection closed: c→u {} bytes, u→c {} bytes",
+            listener_name, c2u_bytes, u2c_bytes
+        );
+        return;
+    }
+
     // futures::join! は両 Future を同一タスク内でインターリーブするため、
     // &TcpStream / &Pipe の同時借用は安全。
     // パイプはスレッドローカルプール（F-40）から取得し、接続ごとの pipe2(2) を排除する。
+    #[cfg(target_os = "linux")]
     match (acquire_pipe(), acquire_pipe()) {
         (Ok(c2u_pipe), Ok(u2c_pipe)) => {
             let (c2u_bytes, u2c_bytes) = futures::join!(
@@ -626,7 +654,7 @@ fn l4_server_tls_config() -> Option<std::sync::Arc<rustls::ServerConfig>> {
 }
 
 /// クライアント側 TLS ハンドシェイクを完了し、平文ストリームへ復号する。
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 async fn accept_l4_tls_client(
     client: IoUringTcpStream,
     handshake_timeout: Duration,
@@ -659,7 +687,7 @@ async fn accept_l4_tls_client(
     }
 }
 
-#[cfg(not(feature = "ktls"))]
+#[cfg(not(veil_ktls))]
 async fn accept_l4_tls_client(
     client: IoUringTcpStream,
     handshake_timeout: Duration,
@@ -1283,6 +1311,7 @@ mod tests {
     // ====================
 
     /// 空のパイプは返却後に再利用される（同じ fd が返る = pipe2(2) が発行されない）。
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_pipe_pool_reuses_clean_pipe() {
         let pipe = acquire_pipe().expect("pipe");
@@ -1299,6 +1328,7 @@ mod tests {
     }
 
     /// 残データのあるパイプは返却時に破棄され、次の接続へデータが混線しない。
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_pipe_pool_discards_dirty_pipe() {
         // プールを空にしてから開始（他テストの影響を排除）
@@ -1332,6 +1362,7 @@ mod tests {
     }
 
     /// プール上限を超えた返却は破棄される（fd リークなし・無制限成長なし）。
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_pipe_pool_respects_max() {
         L4_PIPE_POOL.with(|p| p.borrow_mut().clear());
@@ -1353,13 +1384,17 @@ mod tests {
     // io_uring/epoll を許可しない環境（Docker ビルドサンドボックス・古いカーネル等）では
     // ランタイムドライバの生成が失敗するため、実 I/O を伴う本テストはスキップする
     // （E2E で網羅）。
-    #[cfg(veil_rt_uring)]
+    // `forward_direction_splice`/`Pipe` が Linux 専用のため、本ヘルパーも呼び出し元の
+    // テストと同じく Linux 限定にする（`veil_rt_reactor` は kqueue（FreeBSD）でも
+    // 立つため、`target_os = "linux"` を明示しないと `libc::epoll_create1` が
+    // FreeBSD ビルドでコンパイルエラーになる）。
+    #[cfg(all(veil_rt_uring, target_os = "linux"))]
     fn io_uring_available() -> bool {
         crate::runtime::ring::IoUring::new(8, 0).is_ok()
     }
 
     /// reactor（epoll）ビルドでは `epoll_create1` の成否をランタイム可用性の代替指標とする。
-    #[cfg(veil_rt_reactor)]
+    #[cfg(all(veil_rt_reactor, target_os = "linux"))]
     fn io_uring_available() -> bool {
         let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         if fd >= 0 {
@@ -1376,6 +1411,10 @@ mod tests {
     /// 修正前は src の EOF で自方向のみ終了し dst には何も伝搬しなかったため、
     /// 対向側（dst の実体を保持するピア）はデータも FIN も受け取れず、
     /// アイドルタイムアウトまで fd を保持し続けていた（B-45）。
+    ///
+    /// `forward_direction_splice`/`Pipe` は Linux 専用（splice(2)）のため本テストも
+    /// Linux 限定。BSD の半クローズ伝搬（`forward_direction` 経由）は E2E で確認する。
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_forward_direction_splice_propagates_half_close_on_src_eof() {
         if !io_uring_available() {

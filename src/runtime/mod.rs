@@ -39,7 +39,12 @@ mod reactor;
 mod uring;
 
 #[cfg(veil_rt_reactor)]
-pub use reactor::{executor, splice, tcp, timer};
+pub use reactor::{executor, tcp, timer};
+// splice(2) は Linux 専用。BSD（kqueue reactor）では `runtime::splice` パス自体を提供せず、
+// 消費側（L4 / kTLS proxy）が `cfg(target_os = "linux")` でバッファプール経由の
+// read/write 転送へフォールバックする（F-120 設計 3.3 節）。
+#[cfg(all(veil_rt_reactor, target_os = "linux"))]
+pub use reactor::splice;
 #[cfg(veil_rt_uring)]
 pub use uring::{executor, ring, splice, tcp, timer};
 

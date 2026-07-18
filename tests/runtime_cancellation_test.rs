@@ -32,9 +32,21 @@ fn io_uring_available() -> bool {
 }
 
 /// reactor（epoll）ビルドでは `epoll_create1` の成否を代替指標とする。
-#[cfg(veil_rt_reactor)]
+#[cfg(veil_poller_epoll)]
 fn io_uring_available() -> bool {
     let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+    if fd >= 0 {
+        unsafe { libc::close(fd) };
+        true
+    } else {
+        false
+    }
+}
+
+/// reactor（kqueue）ビルドでは `kqueue()` の成否を代替指標とする。
+#[cfg(veil_poller_kqueue)]
+fn io_uring_available() -> bool {
+    let fd = unsafe { libc::kqueue() };
     if fd >= 0 {
         unsafe { libc::close(fd) };
         true

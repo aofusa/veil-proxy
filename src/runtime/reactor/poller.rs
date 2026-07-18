@@ -51,9 +51,16 @@ pub(crate) struct FdRecord {
     pub write_wakers: Vec<Waker>,
     /// カーネルへ現在有効化されている interest ビット（0 = 現在は無反応。fd 自体は
     /// `known_to_kernel` が true なら epoll 監視対象リストに残っている）。
+    /// kqueue バックエンドでは「現在 `EV_ADD|EV_ONESHOT` で登録済みと認識している
+    /// フィルタ（READ/WRITE）」の意味で同じフィールドを使う（`kqueue::KqueuePoller::update`
+    /// の `prev_mask` 引数に渡し、ビットが立たなくなった方向を `EV_DELETE` する判定に使う）。
     pub armed: u32,
     /// この fd に対して `EPOLL_CTL_ADD` を一度でも実行済みか（`EPOLL_CTL_DEL` するまで
     /// true のまま。ADD/MOD の選択に使う唯一の正）。
+    ///
+    /// epoll 専用: kqueue の `EV_ADD` は EEXIST を返さず冪等なため、この判定自体が
+    /// 不要（常に `EV_ADD` でよい）。
+    #[cfg(veil_poller_epoll)]
     pub known_to_kernel: bool,
 }
 

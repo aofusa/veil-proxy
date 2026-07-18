@@ -141,10 +141,18 @@ impl TcpListener {
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             );
             if reuse_port {
+                // FreeBSD の `SO_REUSEPORT` は複数 bind を許すのみでカーネル分散を行わない
+                // （Linux の `SO_REUSEPORT` 相当の負荷分散は `SO_REUSEPORT_LB`、FreeBSD 12+）。
+                // thread-per-core の accept 分散を成立させるには LB 版が必要なため、
+                // FreeBSD では `SO_REUSEPORT_LB` を使う（設計ドキュメント 3.3 節）。
+                #[cfg(target_os = "freebsd")]
+                let reuseport_opt = libc::SO_REUSEPORT_LB;
+                #[cfg(not(target_os = "freebsd"))]
+                let reuseport_opt = libc::SO_REUSEPORT;
                 libc::setsockopt(
                     fd,
                     libc::SOL_SOCKET,
-                    libc::SO_REUSEPORT,
+                    reuseport_opt,
                     &optval as *const _ as *const libc::c_void,
                     std::mem::size_of::<libc::c_int>() as libc::socklen_t,
                 );

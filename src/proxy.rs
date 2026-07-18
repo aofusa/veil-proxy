@@ -35,15 +35,15 @@ use crate::server::spawn_background_revalidation;
 
 #[cfg(feature = "http2")]
 use crate::http2;
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 use crate::ktls_rustls::{KtlsServerStream, RustlsAcceptor, SplicePipe};
-#[cfg(not(feature = "ktls"))]
+#[cfg(not(veil_ktls))]
 use crate::simple_tls;
 
 // ServerTls型エイリアス（main.rsから再エクスポート）
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 use crate::ktls_rustls::KtlsServerStream as ServerTls;
-#[cfg(not(feature = "ktls"))]
+#[cfg(not(veil_ktls))]
 use crate::simple_tls::SimpleTlsServerStream as ServerTls;
 
 // ====================
@@ -3851,7 +3851,7 @@ pub async fn handle_h2c_connection(stream: TcpStream, client_ip: &str, initial_d
 }
 
 // kTLS 有効時の接続処理（rustls + ktls2）
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 pub async fn handle_connection(
     #[cfg_attr(not(feature = "http2"), allow(unused_mut))] mut stream: TcpStream,
     acceptor: RustlsAcceptor,
@@ -3947,7 +3947,7 @@ pub async fn handle_connection(
 }
 
 // kTLS 無効時の接続処理（rustls のみ）
-#[cfg(not(feature = "ktls"))]
+#[cfg(not(veil_ktls))]
 #[cfg_attr(not(feature = "http2"), allow(unused_mut))]
 pub async fn handle_connection(
     mut stream: TcpStream,
@@ -6676,7 +6676,7 @@ async fn proxy_http_pooled(
     // リクエスト送信とレスポンス受信
     // kTLS 有効時は splice(2) を使用してゼロコピー転送
     // ただし、圧縮有効、キャッシュ保存が必要、またはバッファリング有効な場合はkTLSを迂回
-    #[cfg(feature = "ktls")]
+    #[cfg(veil_ktls)]
     let result = {
         // キャッシュ保存が必要かどうか
         // キャッシュ保存が必要な場合はsplice転送を使用できない（ユーザー空間でボディをキャプチャする必要がある）
@@ -6772,7 +6772,7 @@ async fn proxy_http_pooled(
         }
     };
 
-    #[cfg(not(feature = "ktls"))]
+    #[cfg(not(veil_ktls))]
     let result = if buffering_enabled && !compression_enabled {
         // バッファリング有効時（圧縮無効の場合のみ）
         record_buffering_used(host_str_for_metrics);
@@ -8756,7 +8756,7 @@ async fn transfer_exact_bytes_from_backend_with_cache(
 ///
 /// pipe に取り込んだ n バイトは dst のバックプレッシャに追従して**必ず全量ドレイン**
 /// してから次のチャンクへ進む（pipe 内残データと `remaining` のずれによるデータ損失を防ぐ）。
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 async fn splice_body_transfer(
     src_stream: &TcpStream,
     dst_stream: &TcpStream,
@@ -8861,7 +8861,7 @@ async fn splice_body_transfer(
 ///
 /// Content-Length が指定されている場合はボディ転送に splice を使用。
 /// Chunked 転送の場合は通常の転送を使用。
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 async fn proxy_http_request_splice(
     client_stream: &KtlsServerStream,
     backend_stream: &TcpStream,
@@ -8963,7 +8963,7 @@ async fn proxy_http_request_splice(
 /// バックエンド(TCP) からヘッダーを読み取り、パースしてクライアント(kTLS)に送信。
 /// ボディは Content-Length の場合は splice、Chunked の場合は通常転送。
 /// 戻り値: (ステータス, 転送バイト数, backend_wants_keep_alive, client_must_close)
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 async fn splice_transfer_response_ktls(
     backend_stream: &TcpStream,
     client_stream: &KtlsServerStream,
@@ -10516,7 +10516,7 @@ async fn handle_sendfile(
     };
 
     // kTLS が有効な場合は sendfile によるゼロコピー送信を使用
-    #[cfg(feature = "ktls")]
+    #[cfg(veil_ktls)]
     {
         if tls_stream.is_ktls_send_enabled() {
             return handle_sendfile_zerocopy(
@@ -10547,7 +10547,7 @@ async fn handle_sendfile(
 ///
 /// kTLS が有効な場合に使用されます。
 /// ファイルの内容をカーネル空間で直接 TLS 暗号化して送信します。
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 async fn handle_sendfile_zerocopy(
     tls_stream: ServerTls,
     file: &crate::runtime::io::File,
@@ -10790,9 +10790,21 @@ mod connect_gate_tests {
     }
 
     /// reactor（epoll）ビルドでは `epoll_create1` の成否をランタイム可用性の代替指標とする。
-    #[cfg(veil_rt_reactor)]
+    #[cfg(veil_poller_epoll)]
     fn io_uring_available() -> bool {
         let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+            true
+        } else {
+            false
+        }
+    }
+
+    /// reactor（kqueue）ビルドでは `kqueue()` の成否をランタイム可用性の代替指標とする。
+    #[cfg(veil_poller_kqueue)]
+    fn io_uring_available() -> bool {
+        let fd = unsafe { libc::kqueue() };
         if fd >= 0 {
             unsafe { libc::close(fd) };
             true

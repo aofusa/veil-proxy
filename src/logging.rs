@@ -457,7 +457,7 @@ pub(crate) fn init_logging(config: &LoggingConfigSection) -> ftlog::LoggerGuard 
 pub(crate) fn log_ktls_status(ktls_config: &crate::KtlsConfig) {
     if ktls_config.enabled {
         // rustls + ktls2 使用時
-        #[cfg(feature = "ktls")]
+        #[cfg(veil_ktls)]
         {
             if crate::ktls_rustls::is_ktls_available() {
                 info!(
@@ -482,7 +482,7 @@ pub(crate) fn log_ktls_status(ktls_config: &crate::KtlsConfig) {
             }
         }
         // kTLS フィーチャー無効時
-        #[cfg(not(feature = "ktls"))]
+        #[cfg(not(veil_ktls))]
         {
             warn!("kTLS: Enabled in config but ktls feature is not enabled");
             warn!("kTLS: Rebuild with: cargo build --features ktls for kTLS support");

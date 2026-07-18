@@ -336,7 +336,7 @@ fn raw_fd_write(fd: std::os::fd::RawFd, buf: &[u8]) -> io::Result<usize> {
 /// kTLS ビルドでは `RustlsConnector`（設定に応じて kTLS 移行を試行）、非 kTLS ビルドでは
 /// `SimpleTlsConnector` を使う。`insecure` はアップストリーム設定 `tls_insecure` に対応する。
 async fn tls_connect(tcp: TcpStream, sni: &str, insecure: bool) -> io::Result<BackendIo> {
-    #[cfg(feature = "ktls")]
+    #[cfg(veil_ktls)]
     {
         let connector = if insecure {
             crate::config::get_tls_connector_insecure()
@@ -349,7 +349,7 @@ async fn tls_connect(tcp: TcpStream, sni: &str, insecure: bool) -> io::Result<Ba
             inner, session, drained,
         ))))
     }
-    #[cfg(not(feature = "ktls"))]
+    #[cfg(not(veil_ktls))]
     {
         let connector = if insecure {
             crate::config::get_tls_connector_insecure()

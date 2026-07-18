@@ -31,6 +31,6 @@ mod handler;
 
 pub use config::{BufferingConfig, BufferingMode};
 
-// ディスクバッファ操作を公開（Linux限定）
-#[cfg(target_os = "linux")]
+// ディスクバッファ操作を公開（実装は `runtime::offload` + std::fs のみで OS 非依存。
+// F-120 Phase 4: FreeBSD ビルド対応のため旧来の Linux 限定 cfg を撤去）
 pub use handler::disk_buffer;

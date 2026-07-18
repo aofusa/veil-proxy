@@ -2818,7 +2818,7 @@ pub(crate) async fn proxy_to_backend_async_with_tls(
 
 /// TLSバックエンドへの非同期プロキシ処理（kTLS版）
 /// kTLS/rustlsフォールバック問題を回避するため spawn_blocking で std TLS 接続を使用
-#[cfg(feature = "ktls")]
+#[cfg(veil_ktls)]
 // 理由付き allow: 同期 connect/TLS は std::thread::spawn した専用スレッド内で実行し、結果を mpsc + ポーリングで受け取る（イベントループ非ブロック）。
 #[allow(clippy::disallowed_methods)]
 async fn proxy_to_tls_backend_async(
@@ -2955,7 +2955,7 @@ async fn proxy_to_tls_backend_async(
 
 /// TLSバックエンドへの非同期プロキシ処理（non-kTLS）
 /// 別スレッドでブロッキング TLS 通信を行う
-#[cfg(not(feature = "ktls"))]
+#[cfg(not(veil_ktls))]
 // 理由付き allow: 同期 connect/TLS は std::thread::spawn した専用スレッド内で実行し、結果を mpsc + ポーリングで受け取る（イベントループ非ブロック）。
 #[allow(clippy::disallowed_methods)]
 async fn proxy_to_tls_backend_async(
@@ -3730,7 +3730,6 @@ pub async fn run_http3_server_async(
 /// 同じ DCID なら新規接続判定（contains_key + Initial 検査）をスキップし、per-segment の
 /// オーバーヘッドをルックアップ 1 回に抑える（`prev_cid` 最適化）。quiche の `recv` API は
 /// 1 データグラム単位のため呼び出し自体は per-segment。
-#[cfg(target_os = "linux")]
 fn process_datagram_segments(
     conns: &mut HashMap<ConnectionId<'static>, Http3Handler>,
     data: &mut [u8],
@@ -4014,7 +4013,6 @@ async fn send_pending_packets(
 /// F-115 第2段: 送信エントリ 1 件（`batch` 内の範囲）を表す。`sends` へ蓄積され、
 /// sweep 末尾/閾値到達で sendmmsg によりまとめて送出される。ライフタイムを持たないインデックス
 /// 表現なので、`H3SendScratch` に載せてスイープ間で再利用できる（per-sweep 確保なし）。
-#[cfg(target_os = "linux")]
 struct SendRaw {
     /// `batch` 内の開始オフセット。
     batch_start: usize,
@@ -4034,7 +4032,6 @@ struct SendRaw {
 /// GSO 無効時は multi-segment エントリをパケット境界ごとの単一パケットエントリへ展開する
 /// （cmsg 無しの純 sendmmsg。設計判断: F-115 第2段 §2「GSO 無効フォールバック」）。確定後は
 /// カーソル（cur_batch_start / cur_offsets_start）を末尾へ進め、seg_size / cur_dest をリセットする。
-#[cfg(target_os = "linux")]
 fn finalize_send_entry(
     sends: &mut Vec<SendRaw>,
     batch_len: usize,
@@ -4094,7 +4091,6 @@ fn finalize_send_entry(
 /// `MMSG_SEND_BATCH` ごとにチャンク分割し、各チャンクをスタック配列（`from_fn`: ヒープ確保なし）で
 /// 組み立てて `send_mmsg_async` へ渡す。`sends` は GSO 無効展開により `MMSG_SEND_BATCH` を超え得る
 /// ため、ここでチャンク化して漏れなく送出する。
-#[cfg(target_os = "linux")]
 async fn send_mmsg_flush(
     socket: &Rc<QuicUdpSocket>,
     batch: &[u8],

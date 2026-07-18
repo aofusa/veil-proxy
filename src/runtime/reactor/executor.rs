@@ -26,6 +26,9 @@ use super::poller::{FdTable, Interest};
 #[cfg(veil_poller_epoll)]
 use super::epoll::{EpollPoller, ERR_HUP, READ, WRITE};
 
+#[cfg(veil_poller_kqueue)]
+use super::kqueue::{KqueuePoller, READ, WRITE};
+
 // ====================
 // reactor ドライバ（poller + fd テーブル）
 // ====================
@@ -33,6 +36,8 @@ use super::epoll::{EpollPoller, ERR_HUP, READ, WRITE};
 thread_local! {
     #[cfg(veil_poller_epoll)]
     static POLLER: RefCell<Option<EpollPoller>> = const { RefCell::new(None) };
+    #[cfg(veil_poller_kqueue)]
+    static POLLER: RefCell<Option<KqueuePoller>> = const { RefCell::new(None) };
     static FD_TABLE: RefCell<FdTable> = RefCell::new(FdTable::new());
 }
 
@@ -44,12 +49,20 @@ pub fn init_reactor() -> std::io::Result<()> {
     Ok(())
 }
 
+/// このスレッドの poller（kqueue インスタンス）を初期化する。
+#[cfg(veil_poller_kqueue)]
+pub fn init_reactor() -> std::io::Result<()> {
+    let poller = KqueuePoller::new()?;
+    POLLER.with(|p| *p.borrow_mut() = Some(poller));
+    Ok(())
+}
+
 /// このスレッドに reactor ドライバ（poller）が初期化済みか判定する。
 ///
 /// `runtime::offload`（F-29）が、ドライバのあるワーカースレッドでは fd readiness
 /// ベースの非同期待機を、ドライバの無いコンテキスト（単体テスト等）では同期インライン
 /// 実行をするための分岐に使う（uring 版の `has_ring()` に相当）。
-#[cfg(veil_poller_epoll)]
+#[cfg(any(veil_poller_epoll, veil_poller_kqueue))]
 pub fn has_driver() -> bool {
     POLLER.with(|p| p.borrow().is_some())
 }
@@ -65,14 +78,25 @@ fn with_poller<R>(f: impl FnOnce(&EpollPoller) -> R) -> R {
     })
 }
 
+#[cfg(veil_poller_kqueue)]
+fn with_poller<R>(f: impl FnOnce(&KqueuePoller) -> R) -> R {
+    POLLER.with(|p| {
+        let b = p.borrow();
+        let poller = b
+            .as_ref()
+            .expect("reactor poller not initialized for this thread");
+        f(poller)
+    })
+}
+
 /// fd の読み取り可能待ちを（再）登録する（oneshot）。
-#[cfg(veil_poller_epoll)]
+#[cfg(any(veil_poller_epoll, veil_poller_kqueue))]
 pub(crate) fn register_read(fd: RawFd, waker: Waker) {
     register(fd, Interest::Read, waker);
 }
 
 /// fd の書き込み可能待ちを（再）登録する（oneshot）。
-#[cfg(veil_poller_epoll)]
+#[cfg(any(veil_poller_epoll, veil_poller_kqueue))]
 pub(crate) fn register_write(fd: RawFd, waker: Waker) {
     register(fd, Interest::Write, waker);
 }
@@ -128,6 +152,39 @@ fn register(fd: RawFd, interest: Interest, waker: Waker) {
         Err(e) => {
             ftlog::error!("reactor: epoll register failed for fd {}: {}", fd, e);
         }
+    }
+}
+
+/// fd の interest（READ/WRITE いずれか）を oneshot で（再）登録する（kqueue 版）。
+///
+/// kqueue は `EVFILT_READ`/`EVFILT_WRITE` が独立フィルタなので、epoll のような
+/// ADD/MOD 判定（`known_to_kernel`）は不要で `EV_ADD|EV_ONESHOT` を常に使う。
+/// `armed`（登録済みとして追跡しているビット）は `KqueuePoller::update` の
+/// `prev_mask` 引数として渡し、直前まで登録していてビットが落ちた方向のみ
+/// `EV_DELETE` する判定に使う（`register()` 呼び出しは新規待機のみで発生し、
+/// 「既に armed 済みの方向を down する」ことはないため、prev_mask == new_mask の
+/// 場合は update 内で ADD が再発行されるだけで実害は無い）。
+#[cfg(veil_poller_kqueue)]
+fn register(fd: RawFd, interest: Interest, waker: Waker) {
+    let (prev_mask, new_mask) = FD_TABLE.with(|t| {
+        let mut t = t.borrow_mut();
+        let rec = t.get_or_insert(fd);
+        let prev = rec.armed;
+        let bit = match interest {
+            Interest::Read => {
+                rec.read_wakers.push(waker);
+                READ
+            }
+            Interest::Write => {
+                rec.write_wakers.push(waker);
+                WRITE
+            }
+        };
+        rec.armed |= bit;
+        (prev, rec.armed)
+    });
+    if let Err(e) = with_poller(|p| p.update(fd, new_mask, prev_mask)) {
+        ftlog::error!("reactor: kqueue register failed for fd {}: {}", fd, e);
     }
 }
 
@@ -187,7 +244,26 @@ pub(crate) fn unregister(fd: RawFd) {
     }
 }
 
-/// epoll_wait のイベントバッファ最大件数（事前確保しホットパスで再アロケーションしない）。
+/// fd の登録を破棄する（close 直前に呼ぶ、kqueue 版）。
+///
+/// epoll 版と異なり、`delete` には現在 armed 済みのビット（どのフィルタが
+/// 登録されているか）を渡す必要がある（kqueue は fd 単位ではなくフィルタ単位で
+/// 個別に `EV_DELETE` するため）。
+#[cfg(veil_poller_kqueue)]
+pub(crate) fn unregister(fd: RawFd) {
+    let armed = FD_TABLE
+        .try_with(|t| t.borrow_mut().remove(fd).map(|rec| rec.armed))
+        .unwrap_or(None);
+    if let Some(armed) = armed {
+        let _ = POLLER.try_with(|p| {
+            if let Some(poller) = p.borrow().as_ref() {
+                poller.delete(fd, armed);
+            }
+        });
+    }
+}
+
+/// poller wait のイベントバッファ最大件数（事前確保しホットパスで再アロケーションしない）。
 const EVENT_BATCH: usize = 256;
 
 /// 1 回分の poller wait + イベント/タイマー処理。
@@ -253,6 +329,78 @@ fn dispatch_event(fd: RawFd, flags: u32) {
         // EPOLLONESHOT により fd 全体の interest が disarm されているため、まだ待ち手が
         // 残っている方向（読み書きどちらか一方のみ起床した場合）を再武装する。
         let _ = with_poller(|p| p.modify(fd, remaining));
+    }
+}
+
+/// kqueue バージョンの 1 回分の poller wait + イベント/タイマー処理。
+#[cfg(veil_poller_kqueue)]
+fn park(timeout_ms: i32) {
+    thread_local! {
+        static EVENT_BUF: RefCell<Vec<libc::kevent>> =
+            RefCell::new(vec![unsafe { std::mem::zeroed() }; EVENT_BATCH]);
+    }
+    let n = EVENT_BUF.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        match with_poller(|p| p.wait(&mut buf, timeout_ms)) {
+            Ok(n) => n,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::Interrupted {
+                    ftlog::error!("reactor: kevent wait error: {}", e);
+                }
+                0
+            }
+        }
+    });
+    if n > 0 {
+        EVENT_BUF.with(|buf| {
+            let buf = buf.borrow();
+            for ev in buf.iter().take(n) {
+                let fd = ev.ident as RawFd;
+                // EVFILT_READ/EVFILT_WRITE はフィルタごとに独立したイベントとして届く
+                // （epoll のように 1 fd 1 イベントへ両方向がまとめられない）ため、
+                // フィルタ種別を READ/WRITE ビットへ変換して dispatch_event へ渡す。
+                let bit = if ev.filter == libc::EVFILT_READ {
+                    READ
+                } else if ev.filter == libc::EVFILT_WRITE {
+                    WRITE
+                } else {
+                    continue;
+                };
+                dispatch_event(fd, bit);
+            }
+        });
+    }
+    super::timer::fire_expired(Instant::now());
+}
+
+#[cfg(veil_poller_kqueue)]
+fn dispatch_event(fd: RawFd, flags: u32) {
+    // kqueue は EV_ONESHOT 発火時にカーネル側フィルタを自動削除するため、epoll のように
+    // 「片方だけ起きたらもう片方を再武装する」再武装処理（epoll_ctl(MOD)）は不要。
+    // 起きた方向のビットを armed から落とすだけでよい（次回 register 時に改めて
+    // EV_ADD|EV_ONESHOT される）。
+    let (read_wakers, write_wakers) = FD_TABLE.with(|t| {
+        let mut t = t.borrow_mut();
+        let Some(rec) = t.get_mut(fd) else {
+            return (Vec::new(), Vec::new());
+        };
+        let mut rw = Vec::new();
+        let mut ww = Vec::new();
+        if flags & READ != 0 && !rec.read_wakers.is_empty() {
+            rw = std::mem::take(&mut rec.read_wakers);
+            rec.armed &= !READ;
+        }
+        if flags & WRITE != 0 && !rec.write_wakers.is_empty() {
+            ww = std::mem::take(&mut rec.write_wakers);
+            rec.armed &= !WRITE;
+        }
+        (rw, ww)
+    });
+    for w in read_wakers {
+        w.wake();
+    }
+    for w in write_wakers {
+        w.wake();
     }
 }
 
@@ -494,12 +642,12 @@ impl Executor {
             }
 
             let timeout_ms = next_timeout_ms();
-            #[cfg(veil_poller_epoll)]
+            #[cfg(any(veil_poller_epoll, veil_poller_kqueue))]
             park(timeout_ms);
-            #[cfg(not(veil_poller_epoll))]
+            #[cfg(not(any(veil_poller_epoll, veil_poller_kqueue)))]
             {
-                // kqueue（Phase 4）未実装ビルドがここへ到達することは cfg 上あり得ない
-                // （veil_rt_reactor は必ずどちらかの poller cfg を伴う）。
+                // veil_rt_reactor は必ずどちらかの poller cfg を伴う（build.rs）ため、
+                // ここへ到達することは cfg 上あり得ない。
                 let _ = timeout_ms;
                 unreachable!("reactor backend without a poller cfg");
             }

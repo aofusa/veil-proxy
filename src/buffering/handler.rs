@@ -36,7 +36,10 @@ pub fn key_to_path(base_path: &std::path::Path, key: &[u8]) -> PathBuf {
 /// システムコールのため、`runtime::offload`（専用スレッドプール + スレッドごと
 /// eventfd の POLL_ADD で完了待機）でワーカースレッドへ退避し、**イベントループを
 /// 決してブロックしない**（新規 io_uring オペコードは追加しない）。
-#[cfg(target_os = "linux")]
+///
+/// F-120 Phase 4: 実装は `runtime::offload` + `std::fs` のみで OS 非依存のため、
+/// 旧来の Linux 限定 cfg は撤去した（FreeBSD でもそのまま動作する。offload の通知 fd は
+/// 非 Linux ではパイプへ自動的に切り替わる）。
 pub mod disk_buffer {
     use std::io;
     use std::path::Path;
