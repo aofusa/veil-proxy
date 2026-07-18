@@ -134,8 +134,8 @@ tar.gz には `veil` バイナリ・`rc.d/veil`（サービススクリプト）
 `www/index.html`・`INSTALL.txt`（+ FreeBSD は `jail.conf.sample`）を同梱する。
 FreeBSD は capsicum（`[security] enable_capsicum`）・jail と、OpenBSD は
 pledge/unveil（`[security] enable_pledge` / `enable_unveil`）と併用できる。
-> OpenBSD の HTTPS(TLS) は現状 aws-lc-rs の OpenBSD 制約でハンドシェイクが
-> 完了しない（`docs/backlog/features/F-122`）。本番 HTTPS 用途は F-122 解消まで非推奨。
+OpenBSD の TLS は rustls の ring プロバイダを使用し（F-122）、静的配信/プロキシとも
+HTTPS 200 で動作する（pledge+unveil 有効のまま）。
 
 ### 成果物
 

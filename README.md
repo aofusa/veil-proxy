@@ -95,7 +95,7 @@ hot-path cost). The default is unchanged (Linux io_uring).
 | **Linux (default)** | io_uring (`src/runtime/uring/`) | seccomp + Landlock + CBPF | ✅ (Linux 5.15+) | Default features unchanged; performance non-regressed |
 | **Linux `--features epoll`** | epoll readiness reactor (`src/runtime/reactor/`) | seccomp (epoll syscalls; io_uring syscalls dropped) + Landlock | ✅ | Fallback for hosts without io_uring |
 | **FreeBSD (x86_64/aarch64)** | kqueue readiness reactor | capsicum (`cap_rights_limit` / `cap_enter`) + jail | ✗ (userspace rustls) | `[security] enable_capsicum`, `capsicum_capability_mode`, `jail_name` |
-| **OpenBSD (x86_64/aarch64)** | kqueue readiness reactor | pledge + unveil | ✗ (userspace rustls) | `[security] enable_pledge`, `enable_unveil`. HTTPS/TLS currently blocked by an aws-lc-rs OpenBSD limitation (see backlog **F-122**) |
+| **OpenBSD (x86_64/aarch64)** | kqueue readiness reactor | pledge + unveil | ✗ (userspace rustls) | `[security] enable_pledge`, `enable_unveil`. TLS uses the **ring** rustls provider (aws-lc-rs can't complete handshakes on OpenBSD; F-122). HTTPS static/proxy serving verified 200 |
 
 - The backend is chosen by `build.rs`-emitted cfgs (`veil_rt_uring` / `veil_rt_reactor` and
   `veil_poller_epoll` / `veil_poller_kqueue`). The public runtime API paths
@@ -106,6 +106,10 @@ hot-path cost). The default is unchanged (Linux io_uring).
   (QEMU user-mode verified; QEMU lacks io_uring, so QEMU runs use the `epoll` build).
 - FreeBSD/OpenBSD are built natively inside a matching VM (Rust Tier 2/3; cross-build not
   supported). See `packaging/scripts/build-bsd.sh` for tar.gz packaging with rc.d/jail.conf.
+- **TLS crypto provider** is selected per target in `src/tls_provider.rs` (F-122): OpenBSD
+  uses rustls's `ring` provider (aws-lc-rs cannot complete TLS handshakes on OpenBSD),
+  while Linux/FreeBSD use `aws_lc_rs` (shared AWS-LC build with kTLS and quiche/HTTP/3).
+  `Cargo.toml` splits the provider via target-specific dependencies plus `resolver = "2"`.
 
 ## Build
 

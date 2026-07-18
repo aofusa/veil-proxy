@@ -133,8 +133,8 @@ else
 
   # OpenBSD ネイティブのセキュリティ:
   #   config.toml で enable_pledge = true / enable_unveil = true を設定
-  # 注意: HTTPS(TLS) は現状 aws-lc-rs の OpenBSD 制約でハンドシェイク未完
-  #   （F-122）。本番 HTTPS 用途は F-122 解消まで非推奨。
+  # TLS は rustls の ring プロバイダで動作（F-122）。HTTPS 静的配信/プロキシとも
+  #   pledge+unveil 有効のまま 200 で動作することを検証済み。
 EOF
 fi
 
