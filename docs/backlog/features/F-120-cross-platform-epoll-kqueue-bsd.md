@@ -1,7 +1,7 @@
 # F-120: クロスプラットフォーム対応（epoll フォールバック / aarch64 / FreeBSD / OpenBSD）
 
 - 優先度: P1
-- ステータス: 対応中
+- ステータス: 完了（OpenBSD の TLS のみ F-122 へ切り出し）
 - 設計: [docs/artifacts/f120_cross_platform_design.md](../../artifacts/f120_cross_platform_design.md)
 
 ## 機能説明
@@ -40,8 +40,22 @@ epoll 系 syscall を許可しない（最小権限）。
 - [x] Phase 4: FreeBSD（kqueue + capsicum + jail_attach、x86_64）
 - [x] Phase 5: OpenBSD（ビルド + kqueue + pledge + unveil、kTLS 非対応。
   ただし TLS は aws-lc-rs の OpenBSD 制約でハンドシェイク未完 → **F-122**）
-- [ ] Phase 6: packaging
-- [ ] Phase 7: 最終検証・ドキュメント
+- [x] Phase 6: packaging（aarch64 arch 導出 / BSD tar.gz + rc.d + jail.conf）
+- [x] Phase 7: 最終検証・ドキュメント
+
+## Phase 7 最終検証結果
+
+- **ビルドマトリクス warning 0**: default / no-default-features / full / full,epoll、
+  および各 feature 単体（ktls・http2・http3・wasm・grpc-full・compression・cache・
+  metrics・websocket・rate-limit・buffering・opentelemetry・admin・access-log・
+  l4-proxy・jemalloc・system-allocator・epoll）すべて warning 0（`#[allow(dead_code)]`
+  不使用）。
+- **clippy**: `--features full` / `--features "full,epoll"` ともに 0。
+- **cargo fmt**: 差分なし。
+- **テスト**: lib 758 / integration 53 / runtime_cancellation 2 すべて通過。
+- **E2E**: io_uring（デフォルト）531/531・epoll 531/531 全通過。
+- **BSD/aarch64**: FreeBSD VM で lib 449 通過・serving 200、aarch64 QEMU で E2E 530/531、
+  OpenBSD は build/kqueue/pledge/unveil 動作（TLS のみ F-122）。
 
 ## Phase 5 の記録（OpenBSD 7.9 VM 検証）
 
