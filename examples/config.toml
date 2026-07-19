@@ -592,6 +592,24 @@ reuseport_balancing = "cbpf"
 # enable_sandbox_macos = true
 
 # ============================================
+# Job Object 設定 (Windows専用、v0.6.0)
+# ============================================
+#
+# Windows ネイティブのプロセス制限機構（Linux の seccomp/Landlock、FreeBSD の
+# capsicum、OpenBSD の pledge/unveil、macOS の sandbox_init 相当の best-effort 版）。
+# 本キーは全 OS で受理されるが、Windows 以外では警告ログのみで無視される。
+# kTLS は非対応（Windows ビルドは常に simple_tls = ユーザ空間 rustls、暗号プロバイダは
+# ring。cargo-xwin コンテナに NASM が無く aws-lc-sys がビルド不可のため）。
+#
+# enable_job_object_windows = true にすると:
+#   - CreateJobObject + SetInformationJobObject でプロセス数・メモリ等の制限を設定し、
+#     AssignProcessToJobObject で現プロセスを Job へ割り当てる（best-effort）。
+#   - 実機検証ができないため保守的な最小設定に留める（詳細は src/security.rs の
+#     `windows_security` モジュール参照）。restricted token / AppContainer は将来課題。
+#
+# enable_job_object_windows = true
+
+# ============================================
 # 本番環境向け推奨設定
 # ============================================
 #
