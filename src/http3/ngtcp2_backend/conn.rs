@@ -26,6 +26,10 @@ pub struct ConnRef {
 
 struct ConnUserData {
     stream_queue: VecDeque<StreamData>,
+    /// get_new_connection_id で発行した SCID（ConnMap エイリアス登録用）
+    new_scids: VecDeque<Vec<u8>>,
+    /// 退役した SCID
+    retired_scids: VecDeque<Vec<u8>>,
 }
 
 /// サーバ側 QUIC 接続
@@ -95,6 +99,8 @@ impl QuicConn {
 
         let mut user_data = Box::new(ConnUserData {
             stream_queue: VecDeque::new(),
+            new_scids: VecDeque::new(),
+            retired_scids: VecDeque::new(),
         });
         let user_ptr = &mut *user_data as *mut ConnUserData as *mut c_void;
 
@@ -285,10 +291,12 @@ impl QuicConn {
             user_data: ptr::null_mut(),
         };
         let mut pdatalen: ngtcp2_ssize = -1;
+        // FIN 時は FIN のみ。非 fin でも MORE は付けない（パケットを都度確定させ、
+        // 部分書き込みでフレームが欠けるのを防ぐ）。連続書き込みは呼び出し側ループで行う。
         let flags = if fin {
             NGTCP2_WRITE_STREAM_FLAG_FIN
         } else {
-            NGTCP2_WRITE_STREAM_FLAG_MORE
+            NGTCP2_WRITE_STREAM_FLAG_NONE
         };
         let rv = unsafe {
             ngtcp2_conn_writev_stream_versioned(
@@ -362,6 +370,16 @@ impl QuicConn {
         self.user_data.stream_queue.pop_front()
     }
 
+    /// 新規発行 SCID を drain（ConnMap エイリアス登録用）
+    pub fn poll_new_scid(&mut self) -> Option<Vec<u8>> {
+        self.user_data.new_scids.pop_front()
+    }
+
+    /// 退役 SCID を drain（ConnMap から除去用）
+    pub fn poll_retired_scid(&mut self) -> Option<Vec<u8>> {
+        self.user_data.retired_scids.pop_front()
+    }
+
     pub fn extend_max_stream_offset(&mut self, stream_id: i64, datalen: u64) {
         unsafe {
             let _ = ngtcp2_conn_extend_max_stream_offset(self.inner, stream_id, datalen);
@@ -429,6 +447,7 @@ fn server_callbacks() -> ngtcp2_callbacks {
     cb.recv_stream_data = Some(recv_stream_data_cb);
     cb.rand = Some(rand_cb);
     cb.get_new_connection_id = Some(get_new_connection_id_cb);
+    cb.remove_connection_id = Some(remove_connection_id_cb);
     cb
 }
 
@@ -446,7 +465,7 @@ unsafe extern "C" fn get_new_connection_id_cb(
     cid: *mut ngtcp2_cid,
     token: *mut u8,
     cidlen: usize,
-    _user_data: *mut c_void,
+    user_data: *mut c_void,
 ) -> c_int {
     let cid_slice = std::slice::from_raw_parts_mut((*cid).data.as_mut_ptr(), cidlen);
     if aws_lc_rs::rand::fill(cid_slice).is_err() {
@@ -458,6 +477,26 @@ unsafe extern "C" fn get_new_connection_id_cb(
     if aws_lc_rs::rand::fill(token_slice).is_err() {
         return NGTCP2_ERR_CALLBACK_FAILURE;
     }
+    if !user_data.is_null() {
+        let ud = &mut *(user_data as *mut ConnUserData);
+        ud.new_scids.push_back(cid_slice[..cidlen].to_vec());
+    }
+    0
+}
+
+unsafe extern "C" fn remove_connection_id_cb(
+    _conn: *mut ngtcp2_conn,
+    cid: *const ngtcp2_cid,
+    user_data: *mut c_void,
+) -> c_int {
+    if user_data.is_null() || cid.is_null() {
+        return 0;
+    }
+    let ud = &mut *(user_data as *mut ConnUserData);
+    let len = (*cid).datalen;
+    let data_ptr = (*cid).data.as_ptr();
+    let bytes = std::slice::from_raw_parts(data_ptr, len).to_vec();
+    ud.retired_scids.push_back(bytes);
     0
 }
 
@@ -501,20 +540,25 @@ pub fn accept_packet(pkt: &[u8]) -> Option<(u32, Vec<u8>, Vec<u8>)> {
     Some((hd.version, dcid, scid))
 }
 
+/// サーバが使う SCID 長（新規接続時に生成する長さと一致させること）
+pub const SERVER_SCID_LEN: usize = 16;
+
 /// 任意パケットから DCID を取り出す（接続ルックアップ用）
+///
+/// Short header は DCID 長をワイヤに持たないため、サーバ SCID 長を既知として渡す。
 pub fn extract_dcid(pkt: &[u8]) -> Option<Vec<u8>> {
     if pkt.is_empty() {
         return None;
     }
     let mut hd: ngtcp2_pkt_hd = unsafe { std::mem::zeroed() };
-    // short header / long header 両対応: decode を試みる
-    let rv = unsafe {
-        ngtcp2_pkt_decode_hd_short(&mut hd, pkt.as_ptr(), pkt.len(), NGTCP2_MAX_CIDLEN as usize)
-    };
+    // long header を先に試す（Initial 等）
+    let rv = unsafe { ngtcp2_pkt_decode_hd_long(&mut hd, pkt.as_ptr(), pkt.len()) };
     if rv >= 0 {
         return Some(hd.dcid.data[..hd.dcid.datalen].to_vec());
     }
-    let rv = unsafe { ngtcp2_pkt_decode_hd_long(&mut hd, pkt.as_ptr(), pkt.len()) };
+    // short header: サーバ SCID 長で DCID を切る
+    let rv =
+        unsafe { ngtcp2_pkt_decode_hd_short(&mut hd, pkt.as_ptr(), pkt.len(), SERVER_SCID_LEN) };
     if rv >= 0 {
         return Some(hd.dcid.data[..hd.dcid.datalen].to_vec());
     }

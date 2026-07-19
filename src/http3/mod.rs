@@ -13,15 +13,8 @@
 
 pub mod common;
 
-/// F-32 ストリーミングアクター（現状 quiche バックエンドが利用）。
-/// ngtcp2 経路はサーバ内バッファプロキシを使用し、段階的に本モジュールへ統合する。
-#[cfg(veil_http3_quiche)]
+/// F-32 ストリーミングアクター（ngtcp2 / quiche 両バックエンドで共有）。
 pub mod stream;
-
-#[cfg(veil_http3_ngtcp2)]
-pub mod stream {
-    //! ngtcp2 経路向けプレースホルダ（ストリーミング統合までは空）。
-}
 
 #[cfg(veil_http3_quiche)]
 mod quiche_backend;

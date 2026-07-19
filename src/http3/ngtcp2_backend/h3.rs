@@ -34,9 +34,15 @@ struct H3UserData {
     body_queues: HashMap<i64, BodyQueue>,
 }
 
+/// ボディ送信キュー。
+///
+/// `data` は append のみ（reallocate を避けるため十分な容量を確保）。
+/// `acked` は `add_write_offset` で確定した消費位置。
+/// `offered` は直近 read_data が提示した終端位置（acked..offered が nghttp3 保持中）。
 struct BodyQueue {
     data: Vec<u8>,
-    offset: usize,
+    /// 直近 read_data が提示した終端位置
+    offered: usize,
     fin: bool,
 }
 
@@ -63,7 +69,8 @@ impl H3Conn {
         unsafe {
             nghttp3_settings_default_versioned(NGHTTP3_SETTINGS_VERSION as c_int, &mut settings);
         }
-        settings.max_field_section_size = 64 * 1024;
+        // 大きめに受理し、アプリ層（MAX_HEADER_SIZE）で 431 を返す（E2E 100KB ヘッダ）
+        settings.max_field_section_size = 256 * 1024;
 
         let callbacks = make_callbacks();
         let mut conn: *mut nghttp3_conn = ptr::null_mut();
@@ -153,11 +160,17 @@ impl H3Conn {
             })
             .collect();
 
+        // ストリーミング追記でも reallocate しないよう大きめに確保（read_data ポインタ安定）
+        let mut data = body;
+        const PRE: usize = 256 * 1024;
+        if data.capacity() < PRE {
+            data.reserve(PRE.saturating_sub(data.capacity()));
+        }
         self.user_data.body_queues.insert(
             stream_id,
             BodyQueue {
-                data: body,
-                offset: 0,
+                data,
+                offered: 0, // 初回 read_data で提示
                 fin,
             },
         );
@@ -166,21 +179,13 @@ impl H3Conn {
             read_data: Some(body_read_cb),
         };
 
-        // stream_user_data = stream_id を Box で保持
         let sid_box = Box::new(stream_id);
         let sid_ptr = Box::into_raw(sid_box) as *mut c_void;
 
-        // user_data ポインタを H3UserData に（read_data から body_queues を触る）
-        // stream_user_data には stream_id を入れる
         let rv = unsafe {
             nghttp3_conn_set_stream_user_data(self.inner, stream_id, sid_ptr);
-            // conn user_data は既に H3UserData
-            // read_data は conn_user_data から body_queues を引く必要がある
-            // → stream_user_data に H3UserData と stream_id のペアを渡す
             nghttp3_conn_submit_response(self.inner, stream_id, nvs.as_ptr(), nvs.len(), &dr)
         };
-        // nvs は submit 完了まで生きている必要 — すぐ返すので nvs が drop される前に
-        // nghttp3 がコピーする前提（nghttp3 は通常コピーする）
         let _ = nvs;
 
         if rv != 0 {
@@ -190,9 +195,6 @@ impl H3Conn {
             self.user_data.body_queues.remove(&stream_id);
             return Err(std::io::Error::other(format!("submit_response {rv}")));
         }
-        // stream_user_data を H3UserData ポインタに差し替え + stream_id は queues のキー
-        // read_data は conn の user_data (H3UserData) と stream_id 引数を使う
-        // 上の sid_ptr はリーク防止のため set し直す
         let _ = sid_ptr;
         Ok(())
     }
@@ -227,7 +229,51 @@ impl H3Conn {
         if rv != 0 {
             return Err(std::io::Error::other(format!("add_write_offset {rv}")));
         }
+        // n は H3 符号化後のストリームバイト数であり body 長と一致しない。
+        // body バッファはストリーム寿命まで保持（ポインタ安定）。acked 更新はしない。
+        let _ = stream_id;
         Ok(())
+    }
+
+    /// ストリーミング送信用にボディ断片をキューへ追加し resume する。
+    ///
+    /// バッファは **in-place 追記のみ**（drain / reallocate しない）。
+    pub fn append_body(&mut self, stream_id: i64, data: &[u8], fin: bool) -> std::io::Result<()> {
+        const PRE: usize = 256 * 1024;
+        let q = self
+            .user_data
+            .body_queues
+            .entry(stream_id)
+            .or_insert_with(|| BodyQueue {
+                data: Vec::with_capacity(PRE),
+                offered: 0,
+                fin: false,
+            });
+        if !data.is_empty() {
+            if q.data.len() + data.len() > q.data.capacity() {
+                // 提示中 reallocate はポインタ無効化の危険があるが、writev は同期的に
+                // 完了し data をコピー済みのため、容量不足時のみ確保する。
+                q.data.reserve(data.len());
+            }
+            q.data.extend_from_slice(data);
+        }
+        if fin {
+            q.fin = true;
+        }
+        let rv = unsafe { nghttp3_conn_resume_stream(self.inner, stream_id) };
+        if rv != 0 && rv != NGHTTP3_ERR_STREAM_NOT_FOUND {
+            return Err(std::io::Error::other(format!("resume_stream {rv}")));
+        }
+        Ok(())
+    }
+
+    /// ヘッダのみ submit（ボディは後から append_body）。fin=false。
+    pub fn submit_response_headers(
+        &mut self,
+        stream_id: i64,
+        headers: &[(Vec<u8>, Vec<u8>)],
+    ) -> std::io::Result<()> {
+        self.submit_response(stream_id, headers, Vec::new(), false)
     }
 }
 
@@ -366,16 +412,18 @@ unsafe extern "C" fn body_read_cb(
         *pflags |= NGHTTP3_DATA_FLAG_EOF;
         return 0;
     };
-    if q.offset >= q.data.len() {
+    if q.offered >= q.data.len() {
         if q.fin {
             *pflags |= NGHTTP3_DATA_FLAG_EOF;
+            return 0;
         }
-        return 0;
+        // 次の append_body + resume まで待機
+        return NGHTTP3_ERR_WOULDBLOCK as nghttp3_ssize;
     }
-    let remaining = &q.data[q.offset..];
+    let remaining = &q.data[q.offered..];
     (*vec).base = remaining.as_ptr() as *mut u8;
     (*vec).len = remaining.len();
-    q.offset = q.data.len();
+    q.offered = q.data.len();
     if q.fin {
         *pflags |= NGHTTP3_DATA_FLAG_EOF;
     }

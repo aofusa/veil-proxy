@@ -405,6 +405,9 @@ pub(crate) struct BackendTaskParams {
     /// 接続/読み取りタイムアウト秒。
     pub timeout_secs: u64,
     /// リクエストボディ上限（0 = 無制限）。メインループ側の `ProxyStream` が強制する。
+    /// （stream タスク本体では未使用。呼び出し側の分類・メトリクス用に保持）
+    #[allow(dead_code)]
+    // 理由: メインループが上限 enforcement に使う予定の契約フィールド。F-32 API 安定性のため保持。
     pub max_request_body: u64,
     /// TLS バックエンドか（F-44: `https://` アップストリーム）。
     pub use_tls: bool,
