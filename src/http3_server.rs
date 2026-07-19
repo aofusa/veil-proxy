@@ -349,6 +349,16 @@ pub struct Http3ServerConfig {
     pub initial_max_streams_uni: u64,
     /// GSO/GRO を有効化するかどうか（デフォルト: false）
     pub gso_gro_enabled: bool,
+    /// QUIC 輻輳制御アルゴリズム名（quiche `set_cc_algorithm_name`）。デフォルト: `"bbr"`
+    pub cc_algorithm: String,
+    /// Packet Pacing を有効にするか（quiche `enable_pacing`）。デフォルト: true
+    pub pacing: bool,
+    /// 最大 pacing レート（バイト/秒）。`None` は制限なし
+    pub max_pacing_rate: Option<u64>,
+    /// HyStart++ を有効にするか（quiche `enable_hystart`）。デフォルト: true
+    pub hystart: bool,
+    /// UDP mmsg / multishot バッチ幅（1..=128）。デフォルト: 64
+    pub mmsg_batch_size: usize,
 }
 
 impl Default for Http3ServerConfig {
@@ -367,6 +377,11 @@ impl Default for Http3ServerConfig {
             initial_max_streams_bidi: 100,
             initial_max_streams_uni: 100,
             gso_gro_enabled: false,
+            cc_algorithm: "bbr".to_string(),
+            pacing: true,
+            max_pacing_rate: None,
+            hystart: true,
+            mmsg_batch_size: crate::udp::socket::MMSG_BATCH_DEFAULT,
         }
     }
 }
@@ -3464,6 +3479,25 @@ pub async fn run_http3_server_async(
     quic_config.set_disable_active_migration(true);
     quic_config.enable_early_data();
 
+    // F-124: 輻輳制御 / Pacing / HyStart++（quiche 低レベル Config API）
+    let cc_name = config.cc_algorithm.trim();
+    if let Err(e) = quic_config.set_cc_algorithm_name(cc_name) {
+        warn!(
+            "[HTTP/3] unknown cc_algorithm '{}': {}; falling back to bbr",
+            cc_name, e
+        );
+        let _ = quic_config.set_cc_algorithm_name("bbr");
+    }
+    quic_config.enable_pacing(config.pacing);
+    if let Some(rate) = config.max_pacing_rate {
+        quic_config.set_max_pacing_rate(rate);
+    }
+    quic_config.enable_hystart(config.hystart);
+    info!(
+        "[HTTP/3] quiche transport: cc={} pacing={} hystart={} mmsg_batch={}",
+        cc_name, config.pacing, config.hystart, config.mmsg_batch_size
+    );
+
     // HTTP/3 用の ALPN を設定
     quic_config
         .set_application_protos(h3::APPLICATION_PROTOCOL)
@@ -3508,16 +3542,34 @@ pub async fn run_http3_server_async(
 
     // ルーティング設定を CURRENT_CONFIG から取得（ホットリロード対応）
 
-    // F-33: 受信バッファを loop 外で一度だけ確保し再利用する。
-    // 旧実装はデータグラム毎に 64KB の Vec を確保（さらに 2 回の to_vec コピー）していたが、
-    // GRO 受信（recv_gro_async）+ スライス直渡しでヒープ確保とコピーを完全に排除する。
-    // 64KB は単一 recvmsg の最大値。GRO 集約時はこのバッファに複数データグラムが詰めて返る。
+    // F-33: 受信バッファを loop 外で一度だけ確保し再利用する（reactor / multishot 未使用時の
+    // フォールバック経路用）。64KB は単一 recvmsg の最大値。
     let mut recv_buf = vec![0u8; 65536];
 
-    // F-115 第2段: recvmmsg 用スクラッチをワーカーごとに loop 外で 1 回だけ確保し再利用する。
-    // mmsghdr/iovec/sockaddr/cmsg の固定配列（Box 固定アドレス）を保持し、drain のたびに
-    // カーネルが書く長さフィールドのみリセットするため per-sweep のヒープ確保が発生しない。
-    let mut mmsg_scratch = crate::udp::socket::MmsgRecvScratch::new();
+    // F-115 第2段 / F-124: recvmmsg 用スクラッチ（reactor フォールバック・drain 補助）。
+    // バッチ幅は `[http3].mmsg_batch_size`（既定 64）。
+    let mmsg_batch = crate::udp::socket::clamp_mmsg_batch(config.mmsg_batch_size);
+    let mut mmsg_scratch = crate::udp::socket::MmsgRecvScratch::with_batch(mmsg_batch);
+
+    // F-124: io_uring multishot RECVMSG（Linux uring バックエンド）。失敗時は従来経路へ。
+    #[cfg(all(target_os = "linux", veil_rt_uring))]
+    let mut ms_recv =
+        match crate::runtime::udp_recv::MultishotUdpRecv::new(socket.as_raw_fd(), mmsg_batch) {
+            Ok(m) => {
+                info!(
+                    "[HTTP/3] io_uring RECVMSG multishot enabled (batch={})",
+                    m.batch_size()
+                );
+                Some(m)
+            }
+            Err(e) => {
+                warn!(
+                    "[HTTP/3] multishot RECVMSG unavailable ({}), using POLL+recvmmsg fallback",
+                    e
+                );
+                None
+            }
+        };
 
     // メインループ: パケット受信とディスパッチ
     loop {
@@ -3615,123 +3667,184 @@ pub async fn run_http3_server_async(
                 .unwrap_or(Duration::from_millis(100))
         };
 
-        // パケット受信・バックエンドタスク通知・タイムアウトの 3 者を多重化（F-32 + F-33）。
-        // recv_gro_async は recvmsg(2) + UDP_GRO CMSG で同一フローの複数データグラムを
-        // カーネルで集約受信し、per-datagram の syscall を削減する。GRO 非対応カーネルでは
-        // 単発データグラムとして安全にフォールバックする（cmsg 無し → セグメント分割なし）。
-        // バッファは loop 外で再利用するため、データグラム毎の 64KB ヒープ確保を排除。
-        // io_uring の新規オペコードは増やさず、EAGAIN 時は POLL_ADD（wait_readable_fd）で待機。
-        // F-32: バックエンドタスクがレスポンス断片を生成 or リクエストボディを消化したら
-        // notify でメインループを起こし、低遅延でストリーミングを駆動する（負け arm の
-        // recv_gro_async drop は既存 timeout と同じく cancel-safe）。
-        let recv_outcome = futures::select_biased! {
-            r = futures::FutureExt::fuse(socket.recv_gro_async(&mut recv_buf)) => RecvOutcome::Packet(r),
-            _ = futures::FutureExt::fuse(notify.wait()) => RecvOutcome::Notified,
-            _ = futures::FutureExt::fuse(crate::runtime::time::sleep(timeout_duration)) => RecvOutcome::Timeout,
-        };
-
-        // タイムアウト処理（常に実行）
-        {
-            let mut conns = connections.borrow_mut();
-            let mut closed = Vec::new();
-            for (cid, handler) in conns.iter_mut() {
-                handler.conn.on_timeout();
-                if handler.conn.is_closed() {
-                    closed.push(cid.clone());
-                }
-            }
-            for cid in closed {
-                debug!("[HTTP/3] Connection closed (timeout)");
-                conns.remove(&cid);
-            }
-        }
-
-        // パケット受信結果を処理（通知/タイムアウト時も以降の drive + 送信処理は実行する）
-        let gro_result = match recv_outcome {
-            RecvOutcome::Packet(Ok(r)) => Some(r),
-            RecvOutcome::Packet(Err(e)) => {
-                if e.kind() != io::ErrorKind::WouldBlock {
-                    error!("[HTTP/3] recv_gro error: {}", e);
-                }
-                None
-            }
-            // 通知 or タイムアウト - パケット受信なし、drive + 送信処理は続行
-            RecvOutcome::Notified | RecvOutcome::Timeout => None,
-        };
-
-        // パケットを受信した場合のみ処理。
+        // パケット受信・バックエンドタスク通知・タイムアウトの 3 者を多重化（F-32 + F-124）。
         //
-        // F-115 第2段: 1 回の readiness あたり **複数データグラムを recvmmsg で一括 drain** する。
-        // select_biased! は毎イテレーション負け arm（notify.wait と sleep）を生成し、特に
-        // `sleep(timeout_duration)` は io_uring タイマー SQE を arm→cancel する。加えて Docker
-        // veth（カーネル GSO/GRO オフロード非対応 = 1 データグラム 1 recvmsg）では **syscall 自体**
-        // が per-datagram で律速する（HTTP/3 は CPU 余地を残して syscall 往復律速なことを perf で
-        // 実測: docs/perf/README.md）。
-        // 第1段で select/タイマー往復は drain バッチ全体で 1 回に償却済み。第2段では recvmmsg(2)
-        // で **1 syscall = 最大 MMSG_RECV_BATCH データグラム**（異なるフローも同時に）掻き出し、
-        // syscall 往復も償却する。最初の 1 通は従来通り select 経由（await でブロック、通知/
-        // タイムアウト arm との多重化は不変）で受け、以降は recv_mmsg_sync を EAGAIN まで
-        // （総 drain 上限 H3_RECV_DRAIN_MAX）反復する。セグメント処理は `process_datagram_segments`
-        // へ抽出し、両経路で共用する（挙動不変・追加確保なし）。
-        if let Some(first_gro) = gro_result {
-            let mut conns = connections.borrow_mut();
+        // **F-124 (io_uring)**: `IORING_OP_RECVMSG` + `IORING_RECV_MULTISHOT` + provided
+        // buffers。POLL_ADD + 同期 recvmmsg の二重往復を廃し、CQE 経由でデータグラムを
+        // 取り出す。ペイロードは提供バッファ内スライスを quiche 低レベル `recv` へ直渡し。
+        //
+        // **フォールバック (reactor / multishot 不可)**: 従来の recv_gro_async + recvmmsg drain。
+        // F-32: バックエンド notify でメインループを起こしストリーミングを駆動する。
 
-            // 最初の 1 通（select 経由で recv_buf に受信済み）を処理。
-            let first_total = first_gro.bytes_received;
-            process_datagram_segments(
-                &mut conns,
-                &mut recv_buf[..first_total],
-                first_gro.from,
-                first_gro.gro_segment_size,
-                &rng,
-                &quic_config,
-                local_addr,
-                &notify,
-                &backend_spawner,
-            )?;
+        // タイムアウト処理は受信の前後どちらでもよいが、従来通り受信 select の後に行う。
+        // （下で select 後に実行）
 
-            // 以降は recvmmsg で 1 syscall = 複数データグラムを非ブロッキングに掻き出す。
-            // EAGAIN（WouldBlock）やその他エラーは drain 終了とみなし、通常の select ループへ
-            // 戻って送信・タイムアウト・notify を処理する（送信を過度に遅延させない上限つき）。
-            let mut drained = 0usize;
-            while drained < H3_RECV_DRAIN_MAX {
-                let n = match socket.recv_mmsg_sync(&mut mmsg_scratch) {
-                    Ok(n) => n,
-                    Err(_) => break,
-                };
-                for i in 0..n {
-                    // meta は借用を持たない値のみ返すため、続けて buf_mut を可変借用できる。
-                    let (len, from, gro) = match mmsg_scratch.meta(i) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            warn!("[HTTP/3] recvmmsg meta error: {}", e);
-                            continue;
-                        }
-                    };
-                    process_datagram_segments(
-                        &mut conns,
-                        &mut mmsg_scratch.buf_mut(i)[..len],
-                        from,
-                        gro,
-                        &rng,
-                        &quic_config,
-                        local_addr,
-                        &notify,
-                        &backend_spawner,
-                    )?;
+        #[cfg(all(target_os = "linux", veil_rt_uring))]
+        let used_multishot = ms_recv.is_some();
+        #[cfg(not(all(target_os = "linux", veil_rt_uring)))]
+        let used_multishot = false;
+
+        let mut got_packet = false;
+
+        if used_multishot {
+            #[cfg(all(target_os = "linux", veil_rt_uring))]
+            {
+                let ms = ms_recv.as_mut().expect("multishot present");
+                enum MsOutcome {
+                    Dg(io::Result<crate::runtime::udp_recv::MultishotDatagram>),
+                    Notified,
+                    Timeout,
                 }
-                drained += n;
-                // n < MMSG_RECV_BATCH はソケットが空になった合図（次回は EAGAIN 確実）。
-                if n < crate::udp::socket::MMSG_RECV_BATCH {
-                    break;
+                let outcome = futures::select_biased! {
+                    r = futures::FutureExt::fuse(ms.recv_one()) => MsOutcome::Dg(r),
+                    _ = futures::FutureExt::fuse(notify.wait()) => MsOutcome::Notified,
+                    _ = futures::FutureExt::fuse(crate::runtime::time::sleep(timeout_duration)) => MsOutcome::Timeout,
+                };
+
+                // タイムアウト処理
+                {
+                    let mut conns = connections.borrow_mut();
+                    let mut closed = Vec::new();
+                    for (cid, handler) in conns.iter_mut() {
+                        handler.conn.on_timeout();
+                        if handler.conn.is_closed() {
+                            closed.push(cid.clone());
+                        }
+                    }
+                    for cid in closed {
+                        debug!("[HTTP/3] Connection closed (timeout)");
+                        conns.remove(&cid);
+                    }
+                }
+
+                if let MsOutcome::Dg(result) = outcome {
+                    match result {
+                        Ok(first) => {
+                            got_packet = true;
+                            let mut conns = connections.borrow_mut();
+                            let mut drained = 0usize;
+                            // 先頭 + try_recv で ready キューを drain（上限付き）。
+                            let mut current = Some(first);
+                            while let Some(dg) = current {
+                                let from = dg.from;
+                                let gro = dg.gro_segment_size;
+                                process_datagram_segments(
+                                    &mut conns,
+                                    ms.payload_mut(&dg),
+                                    from,
+                                    gro,
+                                    &rng,
+                                    &quic_config,
+                                    local_addr,
+                                    &notify,
+                                    &backend_spawner,
+                                )?;
+                                ms.release(&dg);
+                                drained += 1;
+                                if drained >= H3_RECV_DRAIN_MAX {
+                                    break;
+                                }
+                                current = ms.try_recv();
+                            }
+                            drop(conns);
+                            send_pending_packets(&connections, &socket, local_addr, mmsg_batch)
+                                .await;
+                        }
+                        Err(e) if e.kind() != io::ErrorKind::WouldBlock => {
+                            error!("[HTTP/3] multishot recv error: {}", e);
+                        }
+                        Err(_) => {}
+                    }
                 }
             }
-            drop(conns);
+        } else {
+            // フォールバック: POLL_ADD + recvmsg/recvmmsg（F-33/F-115）
+            let recv_outcome = futures::select_biased! {
+                r = futures::FutureExt::fuse(socket.recv_gro_async(&mut recv_buf)) => RecvOutcome::Packet(r),
+                _ = futures::FutureExt::fuse(notify.wait()) => RecvOutcome::Notified,
+                _ = futures::FutureExt::fuse(crate::runtime::time::sleep(timeout_duration)) => RecvOutcome::Timeout,
+            };
 
-            // ハンドシェイクパケット送信（H3初期化前に送信することでCryptoFail回避）
-            // recv()後、is_established()がtrueになる前にServer Helloを送信する必要がある
-            send_pending_packets(&connections, &socket, local_addr).await;
+            {
+                let mut conns = connections.borrow_mut();
+                let mut closed = Vec::new();
+                for (cid, handler) in conns.iter_mut() {
+                    handler.conn.on_timeout();
+                    if handler.conn.is_closed() {
+                        closed.push(cid.clone());
+                    }
+                }
+                for cid in closed {
+                    debug!("[HTTP/3] Connection closed (timeout)");
+                    conns.remove(&cid);
+                }
+            }
+
+            let gro_result = match recv_outcome {
+                RecvOutcome::Packet(Ok(r)) => Some(r),
+                RecvOutcome::Packet(Err(e)) => {
+                    if e.kind() != io::ErrorKind::WouldBlock {
+                        error!("[HTTP/3] recv_gro error: {}", e);
+                    }
+                    None
+                }
+                RecvOutcome::Notified | RecvOutcome::Timeout => None,
+            };
+
+            if let Some(first_gro) = gro_result {
+                got_packet = true;
+                let mut conns = connections.borrow_mut();
+                let first_total = first_gro.bytes_received;
+                process_datagram_segments(
+                    &mut conns,
+                    &mut recv_buf[..first_total],
+                    first_gro.from,
+                    first_gro.gro_segment_size,
+                    &rng,
+                    &quic_config,
+                    local_addr,
+                    &notify,
+                    &backend_spawner,
+                )?;
+
+                let mut drained = 0usize;
+                while drained < H3_RECV_DRAIN_MAX {
+                    let n = match socket.recv_mmsg_sync(&mut mmsg_scratch) {
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    for i in 0..n {
+                        let (len, from, gro) = match mmsg_scratch.meta(i) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                warn!("[HTTP/3] recvmmsg meta error: {}", e);
+                                continue;
+                            }
+                        };
+                        process_datagram_segments(
+                            &mut conns,
+                            &mut mmsg_scratch.buf_mut(i)[..len],
+                            from,
+                            gro,
+                            &rng,
+                            &quic_config,
+                            local_addr,
+                            &notify,
+                            &backend_spawner,
+                        )?;
+                    }
+                    drained += n;
+                    if n < mmsg_scratch.batch_size() {
+                        break;
+                    }
+                }
+                drop(conns);
+                send_pending_packets(&connections, &socket, local_addr, mmsg_batch).await;
+            }
         }
+
+        // got_packet は今後の分岐用（現状は送信を上で実施済み）。未使用警告回避。
+        let _ = got_packet;
 
         // H3初期化とイベント処理（B-12: パケット受信時だけでなく**毎イテレーション**実行する）。
         //
@@ -3784,7 +3897,7 @@ pub async fn run_http3_server_async(
         }
 
         // 送信処理（常に実行 - タイムアウト時も送信が必要）
-        send_pending_packets(&connections, &socket, local_addr).await;
+        send_pending_packets(&connections, &socket, local_addr, mmsg_batch).await;
 
         // F-44: 協調的 yield。パケットが連続して到着すると select の recv arm が
         // 即 Ready になり続け、本タスクが単一 poll 内でループし続けて同一スレッドの
@@ -3929,6 +4042,7 @@ async fn send_pending_packets(
     connections: &ConnectionMap,
     socket: &Rc<QuicUdpSocket>,
     _local_addr: SocketAddr,
+    mmsg_batch: usize,
 ) {
     let mut conns = connections.borrow_mut();
 
@@ -3936,8 +4050,8 @@ async fn send_pending_packets(
     // スレッドローカルから払い出して再利用する。thread-per-core のためロック不要。
     // take/replace により .await をまたいでスレッドローカルの borrow を保持しないので、
     // 再入（このループ内での多重呼び出し）でも安全。これにより送信のたびに発生していた
-    // malloc を排除する。
-    let mut scratch = take_h3_send_scratch();
+    // malloc を排除する。mmsg バッチ幅は `[http3].mmsg_batch_size`（初回確保時に固定）。
+    let mut scratch = take_h3_send_scratch(mmsg_batch);
     let H3SendScratch {
         send_buf,
         batch,
@@ -4031,9 +4145,7 @@ async fn send_pending_packets(
                 // ここでは現在エントリが空なので、蓄積が閾値を超えたら sendmmsg で送出して
                 // batch/offsets/sends をクリアし継続する（RefCell 借用中の await は既存の
                 // 単一借用者モデルに準拠）。
-                if sends.len() >= crate::udp::socket::MMSG_SEND_BATCH
-                    || batch.len() >= H3_SEND_ACCUM_MAX_BYTES
-                {
+                if sends.len() >= mmsg.batch_size() || batch.len() >= H3_SEND_ACCUM_MAX_BYTES {
                     send_mmsg_flush(socket, batch.as_slice(), sends.as_slice(), mmsg).await;
                     batch.clear();
                     offsets.clear();
@@ -4056,10 +4168,8 @@ async fn send_pending_packets(
             &mut cur_dest,
         );
         // 接続境界でも蓄積が閾値を超えていれば途中送出する（現在エントリは確定済みで空）。
-        // 多接続（各接続が少数パケット）でも蓄積メモリを ~256KB / 16 エントリ以内に抑える。
-        if sends.len() >= crate::udp::socket::MMSG_SEND_BATCH
-            || batch.len() >= H3_SEND_ACCUM_MAX_BYTES
-        {
+        // 多接続（各接続が少数パケット）でも蓄積メモリを ~256KB / batch エントリ以内に抑える。
+        if sends.len() >= mmsg.batch_size() || batch.len() >= H3_SEND_ACCUM_MAX_BYTES {
             send_mmsg_flush(socket, batch.as_slice(), sends.as_slice(), mmsg).await;
             batch.clear();
             offsets.clear();
@@ -4165,20 +4275,21 @@ fn finalize_send_entry(
 
 /// 蓄積した送信エントリ `sends`（`batch` 内の範囲を指す）を sendmmsg でまとめて送出する。
 ///
-/// `MMSG_SEND_BATCH` ごとにチャンク分割し、各チャンクをスタック配列（`from_fn`: ヒープ確保なし）で
-/// 組み立てて `send_mmsg_async` へ渡す。`sends` は GSO 無効展開により `MMSG_SEND_BATCH` を超え得る
-/// ため、ここでチャンク化して漏れなく送出する。
+/// `scratch.batch_size()` ごとにチャンク分割し、各チャンクをスタック配列（`MMSG_BATCH_MAX` 上限、
+/// ヒープ確保なし）で組み立てて `send_mmsg_async` へ渡す。`sends` は GSO 無効展開により
+/// バッチ幅を超え得るため、ここでチャンク化して漏れなく送出する。
 async fn send_mmsg_flush(
     socket: &Rc<QuicUdpSocket>,
     batch: &[u8],
     sends: &[SendRaw],
     scratch: &mut crate::udp::socket::MmsgSendScratch,
 ) {
+    let batch_n = scratch.batch_size();
     let mut i = 0;
     while i < sends.len() {
-        let k = (sends.len() - i).min(crate::udp::socket::MMSG_SEND_BATCH);
-        // k..MMSG_SEND_BATCH は末尾要素の複製で埋め、`[..k]` で捨てる（複製分は送出されない）。
-        let chunk: [crate::udp::socket::SendmmsgEntry; crate::udp::socket::MMSG_SEND_BATCH] =
+        let k = (sends.len() - i).min(batch_n);
+        // k..MMSG_BATCH_MAX は末尾要素の複製で埋め、`[..k]` で捨てる（複製分は送出されない）。
+        let chunk: [crate::udp::socket::SendmmsgEntry; crate::udp::socket::MMSG_BATCH_MAX] =
             std::array::from_fn(|j| {
                 let s = &sends[i + j.min(k - 1)];
                 crate::udp::socket::SendmmsgEntry {
@@ -4266,7 +4377,9 @@ thread_local! {
 
 /// スクラッチを払い出す（無ければ新規確保）。take してから返すため、.await をまたいで
 /// スレッドローカルの borrow を保持しない（再入安全）。
-fn take_h3_send_scratch() -> H3SendScratch {
+///
+/// `mmsg_batch` は初回確保時のみ効く（既存スクラッチのバッチ幅は維持）。
+fn take_h3_send_scratch(mmsg_batch: usize) -> H3SendScratch {
     H3_SEND_SCRATCH
         .with(|s| s.borrow_mut().take())
         .unwrap_or_else(|| H3SendScratch {
@@ -4274,7 +4387,7 @@ fn take_h3_send_scratch() -> H3SendScratch {
             batch: Vec::new(),
             offsets: Vec::new(),
             sends: Vec::new(),
-            mmsg: crate::udp::socket::MmsgSendScratch::new(),
+            mmsg: crate::udp::socket::MmsgSendScratch::with_batch(mmsg_batch),
         })
 }
 

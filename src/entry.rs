@@ -1180,12 +1180,19 @@ pub fn run() {
         info!("TLS loading method: memfd (Landlock compatible)");
         info!("============================================");
 
+        // [http3] セクションの quiche 輸送パラメータ・GSO/GRO・バッチ幅などをワーカーへ渡す。
+        // 証明書は memfd 経由で渡すため cert_path/key_path は空のまま、PEM バイトを差し込む。
+        let http3_server_base = loaded_config
+            .http3_config
+            .to_http3_config(&tls_cert_path, &tls_key_path);
+
         // TCP/HTTP/2 と同様に thread-per-core: 各ワーカーが SO_REUSEPORT UDP ソケットを持ち、
         // カーネルがフロー（5-tuple）単位でパケットを分散する。QUIC 状態はワーカー内で完結。
         for thread_id in 0..num_threads {
             let cert_pem = tls_cert_pem.clone();
             let key_pem = tls_key_pem.clone();
             let addr = http3_addr;
+            let mut worker_h3_config = http3_server_base.clone();
 
             // CPUコアにピンニング
             let assigned_core = core_ids.as_ref().map(|ids| {
@@ -1222,17 +1229,14 @@ pub fn run() {
                 drop(cert_pem);
                 drop(key_pem);
 
-                let config = crate::http3_server::Http3ServerConfig {
-                    cert_path: String::new(), // memfd使用時は不要
-                    key_path: String::new(),  // memfd使用時は不要
-                    cert_pem: Some(cert_data),
-                    key_pem: Some(key_data),
-                    ..Default::default()
-                };
+                worker_h3_config.cert_path = String::new(); // memfd使用時は不要
+                worker_h3_config.key_path = String::new(); // memfd使用時は不要
+                worker_h3_config.cert_pem = Some(cert_data);
+                worker_h3_config.key_pem = Some(key_data);
 
                 info!("[HTTP/3 Worker {}] Starting...", thread_id);
 
-                if let Err(e) = crate::http3_server::run_http3_server(addr, config) {
+                if let Err(e) = crate::http3_server::run_http3_server(addr, worker_h3_config) {
                     error!("[HTTP/3 Worker {}] Server error: {}", thread_id, e);
                 }
 

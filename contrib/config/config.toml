@@ -885,6 +885,26 @@ sandbox_keep_capabilities = ["CAP_NET_BIND_SERVICE"]
 # initial_max_streams_uni = 100
 
 # ------------------------------------------
+# quiche 輻輳制御 / Pacing / バッチ（F-124）
+# ------------------------------------------
+# QUIC 輻輳制御アルゴリズム（quiche set_cc_algorithm_name）
+# 受け付ける値: "reno" | "cubic" | "bbr" | "bbr2" | "bbr2_gcongestion"
+# デフォルト: "bbr"
+# cc_algorithm = "bbr"
+
+# Packet Pacing（quiche enable_pacing）。デフォルト: true
+# pacing = true
+
+# 最大 pacing レート（バイト/秒）。未指定時は制限なし。
+# max_pacing_rate = 125000000
+
+# HyStart++（quiche enable_hystart）。デフォルト: true
+# hystart = true
+
+# UDP mmsg / io_uring multishot 提供バッファのバッチ幅（1..=128）。デフォルト: 64
+# mmsg_batch_size = 64
+
+# ------------------------------------------
 # HTTP/3 専用圧縮設定
 # ------------------------------------------
 # HTTP/3接続時のみ圧縮を常に有効化できます。

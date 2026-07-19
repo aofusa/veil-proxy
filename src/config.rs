@@ -3123,6 +3123,49 @@ pub struct Http3ConfigSection {
     pub gso_gro_enabled: bool,
 
     // ====================
+    // quiche::Config 輻輳制御 / Pacing / バッチ（F-124）
+    // ====================
+    /// QUIC 輻輳制御アルゴリズム（quiche `set_cc_algorithm_name`）
+    ///
+    /// 受け付ける値（大小無視）:
+    /// - `"reno"` / `"cubic"` / `"bbr"` / `"bbr2"` / `"bbr2_gcongestion"`
+    ///
+    /// リバースプロキシの短時間バーストでは CUBIC のスロースタートが RPS を抑えやすいため、
+    /// 既定は `"bbr"`。未知の値は起動時に警告して `"bbr"` にフォールバックする。
+    ///
+    /// デフォルト: `"bbr"`
+    #[serde(default = "default_h3_cc_algorithm")]
+    pub cc_algorithm: String,
+
+    /// Packet Pacing を有効にするか（quiche `enable_pacing`）
+    ///
+    /// 有効時は送信間隔をならしパケットロスを減らす。quiche 自体の既定も true。
+    /// デフォルト: `true`
+    #[serde(default = "default_true")]
+    pub pacing: bool,
+
+    /// 最大 pacing レート（バイト/秒）。未指定時は制限なし（quiche `set_max_pacing_rate`）
+    ///
+    /// デフォルト: なし（`None`）
+    #[serde(default)]
+    pub max_pacing_rate: Option<u64>,
+
+    /// HyStart++ を有効にするか（quiche `enable_hystart`）
+    ///
+    /// デフォルト: `true`
+    #[serde(default = "default_true")]
+    pub hystart: bool,
+
+    /// UDP データグラム送受信バッチ幅（`recvmmsg` / `sendmmsg` / multishot 提供バッファ数）
+    ///
+    /// 1 回の syscall / 1 本の multishot アームで扱う最大データグラム数。
+    /// 範囲: 1..=128。範囲外はクランプする。
+    ///
+    /// デフォルト: `64`
+    #[serde(default = "default_h3_mmsg_batch_size")]
+    pub mmsg_batch_size: usize,
+
+    // ====================
     // Alt-Svc（HTTP/3 広告、F-94）— すべて [http3] に集約
     // ====================
     /// HTTP/1.1・HTTP/2 応答へ `Alt-Svc` ヘッダーを付与するか
@@ -3162,6 +3205,12 @@ fn default_h3_max_streams() -> u64 {
 fn default_h3_alt_svc_ma() -> u64 {
     86400
 }
+fn default_h3_cc_algorithm() -> String {
+    "bbr".to_string()
+}
+fn default_h3_mmsg_batch_size() -> usize {
+    64
+}
 
 impl Default for Http3ConfigSection {
     fn default() -> Self {
@@ -3178,6 +3227,11 @@ impl Default for Http3ConfigSection {
             compression_enabled: false,
             compression: Http3CompressionConfig::default(),
             gso_gro_enabled: false,
+            cc_algorithm: default_h3_cc_algorithm(),
+            pacing: true,
+            max_pacing_rate: None,
+            hystart: true,
+            mmsg_batch_size: default_h3_mmsg_batch_size(),
             alt_svc_enabled: true,
             alt_svc: None,
             alt_svc_ma_secs: default_h3_alt_svc_ma(),
@@ -3207,6 +3261,13 @@ impl Http3ConfigSection {
             initial_max_streams_bidi: self.initial_max_streams_bidi,
             initial_max_streams_uni: self.initial_max_streams_uni,
             gso_gro_enabled: self.gso_gro_enabled,
+            cc_algorithm: self.cc_algorithm.clone(),
+            pacing: self.pacing,
+            max_pacing_rate: self.max_pacing_rate,
+            hystart: self.hystart,
+            mmsg_batch_size: self
+                .mmsg_batch_size
+                .clamp(1, crate::udp::socket::MMSG_BATCH_MAX),
         }
     }
 }
