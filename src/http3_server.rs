@@ -3551,25 +3551,36 @@ pub async fn run_http3_server_async(
     let mmsg_batch = crate::udp::socket::clamp_mmsg_batch(config.mmsg_batch_size);
     let mut mmsg_scratch = crate::udp::socket::MmsgRecvScratch::with_batch(mmsg_batch);
 
-    // F-124: io_uring multishot RECVMSG（Linux uring バックエンド）。失敗時は従来経路へ。
+    // F-124: io_uring multishot RECVMSG（Linux uring バックエンド）。
+    // 既定で有効化し、初期化失敗時のみ POLL+recvmmsg へフォールバックする。
+    // デバッグで無効化する場合は VEIL_H3_MULTISHOT=0。
     #[cfg(all(target_os = "linux", veil_rt_uring))]
-    let mut ms_recv =
-        match crate::runtime::udp_recv::MultishotUdpRecv::new(socket.as_raw_fd(), mmsg_batch) {
-            Ok(m) => {
-                info!(
-                    "[HTTP/3] io_uring RECVMSG multishot enabled (batch={})",
-                    m.batch_size()
-                );
-                Some(m)
+    let mut ms_recv = {
+        let disabled = std::env::var_os("VEIL_H3_MULTISHOT")
+            .map(|v| v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            .unwrap_or(false);
+        if disabled {
+            info!("[HTTP/3] multishot RECVMSG disabled via VEIL_H3_MULTISHOT=0");
+            None
+        } else {
+            match crate::runtime::udp_recv::MultishotUdpRecv::new(socket.as_raw_fd(), mmsg_batch) {
+                Ok(m) => {
+                    info!(
+                        "[HTTP/3] io_uring RECVMSG multishot enabled (batch={})",
+                        m.batch_size()
+                    );
+                    Some(m)
+                }
+                Err(e) => {
+                    warn!(
+                        "[HTTP/3] multishot RECVMSG unavailable ({}), using POLL+recvmmsg fallback",
+                        e
+                    );
+                    None
+                }
             }
-            Err(e) => {
-                warn!(
-                    "[HTTP/3] multishot RECVMSG unavailable ({}), using POLL+recvmmsg fallback",
-                    e
-                );
-                None
-            }
-        };
+        }
+    };
 
     // メインループ: パケット受信とディスパッチ
     loop {
@@ -3722,36 +3733,60 @@ pub async fn run_http3_server_async(
                         Ok(first) => {
                             got_packet = true;
                             let mut conns = connections.borrow_mut();
-                            let mut drained = 0usize;
-                            // 先頭 + try_recv で ready キューを drain（上限付き）。
-                            let mut current = Some(first);
-                            while let Some(dg) = current {
-                                let from = dg.from;
-                                let gro = dg.gro_segment_size;
-                                process_datagram_segments(
-                                    &mut conns,
-                                    ms.payload_mut(&dg),
-                                    from,
-                                    gro,
-                                    &rng,
-                                    &quic_config,
-                                    local_addr,
-                                    &notify,
-                                    &backend_spawner,
-                                )?;
-                                ms.release(&dg);
-                                drained += 1;
-                                if drained >= H3_RECV_DRAIN_MAX {
+                            // 先頭 1 通（IORING_OP_RECVMSG）。
+                            let from = first.from;
+                            let gro = first.gro_segment_size;
+                            process_datagram_segments(
+                                &mut conns,
+                                ms.payload_mut(&first),
+                                from,
+                                gro,
+                                &rng,
+                                &quic_config,
+                                local_addr,
+                                &notify,
+                                &backend_spawner,
+                            )?;
+                            ms.release(&first);
+
+                            // 継続 drain: recvmmsg でバッチ幅分を一括掻き出し（F-115 + F-124）。
+                            let mut drained = 1usize;
+                            while drained < H3_RECV_DRAIN_MAX {
+                                let n = match socket.recv_mmsg_sync(&mut mmsg_scratch) {
+                                    Ok(n) => n,
+                                    Err(_) => break,
+                                };
+                                for i in 0..n {
+                                    let (len, from, gro) = match mmsg_scratch.meta(i) {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            warn!("[HTTP/3] recvmmsg meta error: {}", e);
+                                            continue;
+                                        }
+                                    };
+                                    process_datagram_segments(
+                                        &mut conns,
+                                        &mut mmsg_scratch.buf_mut(i)[..len],
+                                        from,
+                                        gro,
+                                        &rng,
+                                        &quic_config,
+                                        local_addr,
+                                        &notify,
+                                        &backend_spawner,
+                                    )?;
+                                }
+                                drained += n;
+                                if n < mmsg_scratch.batch_size() {
                                     break;
                                 }
-                                current = ms.try_recv();
                             }
                             drop(conns);
                             send_pending_packets(&connections, &socket, local_addr, mmsg_batch)
                                 .await;
                         }
                         Err(e) if e.kind() != io::ErrorKind::WouldBlock => {
-                            error!("[HTTP/3] multishot recv error: {}", e);
+                            error!("[HTTP/3] RECVMSG error: {}", e);
                         }
                         Err(_) => {}
                     }
