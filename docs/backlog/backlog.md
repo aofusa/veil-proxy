@@ -173,9 +173,9 @@
 | ID | 優先度 | 対応状況 | ドキュメント | 概要 |
 |----|--------|----------|--------------|------|
 | F-14 | P3 | 完了 | [features/post-stability-containerization.md](features/post-stability-containerization.md) | コンテナ化（`docker/` glibc/musl・seccomp・非 root。env 上書きは F-07 残件） |
-| F-15 | P3 | 未着手 | [features/post-stability-aarch64.md](features/post-stability-aarch64.md) | aarch64 対応 |
-| F-16 | P3 | 未着手 | [features/freebsd-support.md](features/freebsd-support.md) | FreeBSD 対応 (kqueue, kTLS, Capsicum 等) |
-| F-17 | P3 | 未着手 | [features/openbsd-support.md](features/openbsd-support.md) | OpenBSD 対応 (pledge, unveil 等) |
+| F-15 | P3 | 完了 | [features/post-stability-aarch64.md](features/post-stability-aarch64.md) | aarch64 対応。**F-120 で達成**（`docker/Dockerfile.{glibc,musl}.aarch64` クロスビルド + QEMU 検証、reactor/epoll フォールバック）。io_uring は full-system QEMU 検証環境 `tools/qemu/`（F-128）を整備 |
+| F-16 | P3 | 完了 | [features/freebsd-support.md](features/freebsd-support.md) | FreeBSD 対応 (kqueue, kTLS, Capsicum 等)。**F-120（kqueue reactor + capsicum + jail）・F-126（kTLS 送受信オフロード + sendfile）・F-127（POSIX AIO オプトイン）で達成** |
+| F-17 | P3 | 完了 | [features/openbsd-support.md](features/openbsd-support.md) | OpenBSD 対応 (pledge, unveil 等)。**F-120（kqueue reactor + pledge + unveil）・F-122（ring TLS プロバイダ）で達成**（kTLS はカーネル非対応のため simple_tls） |
 
 ---
 
