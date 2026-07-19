@@ -223,9 +223,7 @@ impl File {
     #[cfg(windows)]
     pub async fn read_at<T: IoBufMut>(&self, mut buf: T, offset: u64) -> BufResult<usize, T> {
         use std::os::windows::fs::FileExt;
-        let slice = unsafe {
-            std::slice::from_raw_parts_mut(buf.write_ptr(), buf.bytes_total())
-        };
+        let slice = unsafe { std::slice::from_raw_parts_mut(buf.write_ptr(), buf.bytes_total()) };
         match self.inner.seek_read(slice, offset) {
             Ok(n) => {
                 unsafe {
@@ -274,9 +272,8 @@ impl File {
         let total = buf.bytes_total();
         let mut read = 0usize;
         while read < total {
-            let slice = unsafe {
-                std::slice::from_raw_parts_mut(buf.write_ptr().add(read), total - read)
-            };
+            let slice =
+                unsafe { std::slice::from_raw_parts_mut(buf.write_ptr().add(read), total - read) };
             match self.inner.seek_read(slice, offset + read as u64) {
                 Ok(0) => break, // EOF
                 Ok(n) => read += n,

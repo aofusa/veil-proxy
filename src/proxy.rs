@@ -27,8 +27,8 @@ use crate::http_utils::*;
 use crate::logging::*;
 use crate::metrics::*;
 use crate::pool::*;
-use crate::upstream::*;
 use crate::runtime::handle::{AsRawFd, RawFd};
+use crate::upstream::*;
 
 use crate::server::spawn_background_revalidation;
 

@@ -15,7 +15,9 @@
 use std::io;
 
 use crate::runtime::handle::{win, RawFd};
-use windows_sys::Win32::Networking::WinSock::{WSAPoll, POLLERR, POLLHUP, POLLRDNORM, POLLWRNORM, WSAPOLLFD};
+use windows_sys::Win32::Networking::WinSock::{
+    WSAPoll, POLLERR, POLLHUP, POLLRDNORM, POLLWRNORM, WSAPOLLFD,
+};
 
 /// 読み取り可能 interest ビット（`POLLRDNORM` 相当）。
 pub const READ: u32 = 0b01;

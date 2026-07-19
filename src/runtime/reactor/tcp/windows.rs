@@ -184,8 +184,7 @@ impl TcpListener {
         set_reuseaddr(sock);
 
         let (storage, len) = sockaddr_to_storage(&addr);
-        let ret =
-            unsafe { WinSock::bind(sock, storage.as_ptr() as *const SOCKADDR, len) };
+        let ret = unsafe { WinSock::bind(sock, storage.as_ptr() as *const SOCKADDR, len) };
         if ret == SOCKET_ERROR {
             let e = last_wsa_error();
             unsafe { closesocket(sock) };
@@ -248,7 +247,8 @@ impl<'a> Future for Accept<'a> {
         let listener_sock = win::to_socket(self.listener_fd);
         let mut buf = [0u8; 128];
         let mut len = buf.len() as i32;
-        let accepted = unsafe { WinSock::accept(listener_sock, buf.as_mut_ptr() as *mut SOCKADDR, &mut len) };
+        let accepted =
+            unsafe { WinSock::accept(listener_sock, buf.as_mut_ptr() as *mut SOCKADDR, &mut len) };
         if accepted != INVALID_SOCKET {
             let fd = win::from_socket(accepted);
             let mut nonblocking: u32 = 1;
@@ -387,8 +387,13 @@ impl TcpStream {
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         let mut buf = [0u8; 128];
         let mut len = buf.len() as i32;
-        let ret =
-            unsafe { getpeername(win::to_socket(self.fd), buf.as_mut_ptr() as *mut SOCKADDR, &mut len) };
+        let ret = unsafe {
+            getpeername(
+                win::to_socket(self.fd),
+                buf.as_mut_ptr() as *mut SOCKADDR,
+                &mut len,
+            )
+        };
         if ret == SOCKET_ERROR {
             return Err(last_wsa_error());
         }
@@ -398,8 +403,13 @@ impl TcpStream {
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         let mut buf = [0u8; 128];
         let mut len = buf.len() as i32;
-        let ret =
-            unsafe { getsockname(win::to_socket(self.fd), buf.as_mut_ptr() as *mut SOCKADDR, &mut len) };
+        let ret = unsafe {
+            getsockname(
+                win::to_socket(self.fd),
+                buf.as_mut_ptr() as *mut SOCKADDR,
+                &mut len,
+            )
+        };
         if ret == SOCKET_ERROR {
             return Err(last_wsa_error());
         }
@@ -492,7 +502,11 @@ impl Future for Connect {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.fd < 0 {
-            let domain = if self.addr.is_ipv6() { AF_INET6 } else { AF_INET };
+            let domain = if self.addr.is_ipv6() {
+                AF_INET6
+            } else {
+                AF_INET
+            };
             let fd = match create_nonblocking_socket(domain as i32) {
                 Ok(fd) => fd,
                 Err(e) => return Poll::Ready(Err(e)),

@@ -33,7 +33,10 @@ pub use std::os::unix::io::RawFd;
 #[cfg(windows)]
 pub type RawFd = isize;
 
-/// `RawFd` を保持しない状態を表す値（Unix: `-1`、Windows: `INVALID_SOCKET` 相当）。
+/// `RawFd` を保持しない状態を表す値（Windows: `INVALID_SOCKET` 相当のビットパターン）。
+/// 現状 Windows の `reactor/tcp/windows.rs` でのみセンチネルとして使用するため
+/// `#[cfg(windows)]` に限定する（Unix 経路では未使用のため dead_code を避ける）。
+#[cfg(windows)]
 pub(crate) const INVALID_FD: RawFd = -1;
 
 #[cfg(unix)]
