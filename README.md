@@ -22,7 +22,7 @@ A high-performance reverse proxy server using io_uring (custom runtime) and rust
 - **kTLS**: Kernel TLS offload support via rustls + custom kTLS module (Linux 5.15+)
 - **HTTP/2**: HTTP/2 support via TLS ALPN negotiation (stream multiplexing, HPACK compression with **4-bit LUT Huffman decode** — F-121)
 - **H2C Server**: HTTP/2 Cleartext (H2C) server support without TLS (Prior Knowledge mode, RFC 7540 Section 3.4)
-- **HTTP/3**: QUIC/UDP-based HTTP/3 (RFC 9114). Feature `http3` builds **ngtcp2 + nghttp3 only** (official C libraries, shared **aws-lc-sys** TLS) — **Cloudflare quiche is not a dependency** on this path. Enable quiche with `--features "http3,http3-quiche"` (recommended on OpenBSD/Windows)
+- **HTTP/3**: QUIC/UDP-based HTTP/3 (RFC 9114). Feature `http3` builds **ngtcp2 + nghttp3 only** (official C libraries, shared **aws-lc-sys** TLS) — **Cloudflare quiche is not a dependency** on this path. Enable quiche with `--features http3-quiche` only (no ngtcp2/nghttp3; recommended on OpenBSD/Windows)
 - **Fast Allocator**: High-speed memory allocation with mimalloc + Huge Pages support
 - **Fast Routing**: O(log n) path matching with Radix Tree (matchit)
 
@@ -2468,9 +2468,9 @@ Supports HTTP/3 (RFC 9114) based on QUIC/UDP.
 | Features | Dependency graph | Runtime backend |
 |----------|------------------|-----------------|
 | `http3` | **ngtcp2-sys + nghttp3-sys + aws-lc-sys only** (**no quiche**) | ngtcp2 + nghttp3 (`veil_http3_ngtcp2`) |
-| `http3,http3-quiche` | above **plus quiche** | quiche (`veil_http3_quiche`) |
+| `http3-quiche` | **aws-lc-sys + quiche only** (**no ngtcp2/nghttp3**) | quiche (`veil_http3_quiche`) |
 
-OpenBSD/Windows: prefer `http3,http3-quiche` (quiche). Plain `http3` does not pull the quiche crate.
+OpenBSD/Windows: use `http3-quiche` only (quiche; ngtcp2/nghttp3 are not in the graph on these targets). Do not combine with plain `http3` if you want quiche-only.
 
 - ngtcp2: <https://github.com/ngtcp2/ngtcp2>
 - nghttp3: <https://github.com/ngtcp2/nghttp3>
@@ -2494,7 +2494,7 @@ In-tree FFI crates: `crates/ngtcp2-sys`, `crates/nghttp3-sys` (static build of t
 cargo build --release --features http3
 
 # Cloudflare quiche backend (adds quiche to the dependency graph)
-cargo build --release --features "http3,http3-quiche"
+cargo build --release --features http3-quiche
 ```
 
 ```toml

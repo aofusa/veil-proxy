@@ -54,24 +54,25 @@ http2 = []
 # 注意: HTTP/3 は UDP ベースのため kTLS は使用不可
 # GSO/GRO による高パフォーマンス UDP 処理
 #
-# バックエンド選択（build.rs が `veil_http3_ngtcp2` / `veil_http3_quiche` cfg を発行）:
-#   - Linux / FreeBSD / macOS（既定）: ngtcp2 + nghttp3 のみ（`http3` feature）
-#   - OpenBSD / Windows: `--features "http3,http3-quiche"` で quiche
-#     （`http3` 単体では ngtcp2 を引き OpenBSD では非推奨。ビルド時に案内する）
-#   - 全 OS で quiche を強制: `--features "http3,http3-quiche"`
+# バックエンドは **排他**（依存グラフも分かれる）:
+#   - `http3`          → aws-lc-sys + **ngtcp2-sys + nghttp3-sys のみ**（quiche なし）
+#                        Linux / FreeBSD / macOS の既定。build.rs → `veil_http3_ngtcp2`
+#   - `http3-quiche`   → aws-lc-sys + **quiche のみ**（ngtcp2/nghttp3 なし）
+#                        OpenBSD / Windows 推奨。build.rs → `veil_http3_quiche`
+#                        実装コードの feature ゲートは `any(http3, http3-quiche)`。
 #
-# 依存グラフ:
-#   - `http3` → aws-lc-sys + ngtcp2-sys + nghttp3-sys（**quiche は含めない**）
-#   - `http3-quiche` → 上記に加え quiche を有効化（実装パスは cfg で quiche 側のみ）
+# OpenBSD / Windows では ngtcp2-sys / nghttp3-sys 自体を target 依存から外す
+# （`[target.'cfg(not(any(openbsd, windows)))'.dependencies]`）。
+# 当該 OS で `http3` を指定すると build.rs が quiche 利用を要求してエラーにする。
+#
 # TLS は aws-lc-sys（rustls と同一の AWS-LC ビルド）を共有。
-# quiche 利用時は build.rs が AWS_LC_SYS_NO_PREFIX=1 を適用する。
+# HTTP/3 有効時は build.rs が AWS_LC_SYS_NO_PREFIX=1 を適用する。
 http3 = ["dep:aws-lc-sys", "dep:ngtcp2-sys", "dep:nghttp3-sys"]
 
-# HTTP/3 で Cloudflare quiche バックエンドを有効にする
-# （Linux / FreeBSD / macOS で ngtcp2 の代わりに quiche を使う場合、および
-#  OpenBSD / Windows の既定パス）。実装は build.rs の `veil_http3_quiche` cfg。
-# ビルド方法: cargo build --features "http3,http3-quiche"
-http3-quiche = ["http3", "dep:quiche"]
+# HTTP/3 で Cloudflare quiche バックエンドのみを有効にする（ngtcp2/nghttp3 は依存に含めない）
+# ビルド方法: cargo build --features http3-quiche
+# （旧ドキュメントの `http3,http3-quiche` 併用は不要。併用すると http3 側の ngtcp2 も乗る）
+http3-quiche = ["dep:aws-lc-sys", "dep:quiche"]
 
 # epoll ベースの readiness ランタイム（F-120 クロスプラットフォーム対応）
 # デフォルトの io_uring 完了ベースランタイムの代わりに epoll ベースの
@@ -257,13 +258,8 @@ clap = { version = "4.5.53", features = ["derive"] }
 
 # HTTP/3 用 QUIC 実装（Cloudflare quiche）
 # default-features = false で内蔵 BoringSSL ビルドを抑制し、aws-lc-sys と共有
-# **`http3-quiche` feature 時のみ** Cargo 依存に乗る（plain `http3` ではビルドされない）
+# **`http3-quiche` feature 時のみ** Cargo 依存に乗る（`http3` ではビルドされない）
 quiche = { version = "0.24.6", default-features = false, optional = true }
-
-# HTTP/3 用 ngtcp2 / nghttp3 自前 FFI（公式 C ライブラリを aws-lc-sys と静的リンク）
-# plain `http3` feature の既定バックエンド（Linux / FreeBSD / macOS）
-ngtcp2-sys = { path = "crates/ngtcp2-sys", optional = true }
-nghttp3-sys = { path = "crates/nghttp3-sys", optional = true }
 
 # Wasmtime: WebAssembly ランタイム (Proxy-Wasm v0.2.1)
 # - pooling-allocator: 高速インスタンス化
@@ -349,6 +345,13 @@ aws-lc-rs = { version = "1.15.2", features = ["bindgen"] }
 [target.'cfg(target_os = "openbsd")'.dependencies]
 rustls = { version = "0.23.35", default-features = false, features = ["ring"] }
 ring = "0.17"
+
+# HTTP/3 ngtcp2 / nghttp3 FFI（公式 C ライブラリを aws-lc-sys と静的リンク）
+# OpenBSD / Windows では依存グラフに載せない（quiche 経路のみ）。
+# Linux / FreeBSD / macOS で `http3` feature 時のみ有効。
+[target.'cfg(not(any(target_os = "openbsd", target_os = "windows")))'.dependencies]
+ngtcp2-sys = { path = "crates/ngtcp2-sys", optional = true }
+nghttp3-sys = { path = "crates/nghttp3-sys", optional = true }
 
 [dev-dependencies]
 # テスト用一時ディレクトリ

@@ -17,7 +17,7 @@
 //!   プロセスのヒープ保持は「並行ストリーム数 × 1 ストリームあたり有界バッファ」に収まり、
 //!   **RSS は総ペイロードサイズに比例しない**。
 
-#![cfg(any(feature = "http2", feature = "http3"))]
+#![cfg(any(feature = "http2", feature = "http3", feature = "http3-quiche"))]
 
 use std::cell::RefCell;
 use std::collections::VecDeque;

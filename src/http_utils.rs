@@ -253,7 +253,7 @@ pub(crate) fn validate_host_header(
 /// * `false` - 一致、または Host 未指定
 ///
 /// HTTP/3 ハンドラと単体テストからのみ参照（http3 feature 無効時はビルド対象外）。
-#[cfg(any(feature = "http3", test))]
+#[cfg(any(feature = "http3", feature = "http3-quiche", test))]
 #[inline]
 pub(crate) fn authority_host_mismatch(authority: &[u8], host: Option<&[u8]>) -> bool {
     let Some(host) = host else {
@@ -271,7 +271,7 @@ pub(crate) fn authority_host_mismatch(authority: &[u8], host: Option<&[u8]>) -> 
 }
 
 /// `host:port` / `[ipv6]:port` からホスト部分を取り出す（アロケーションなし）。
-#[cfg(any(feature = "http3", test))]
+#[cfg(any(feature = "http3", feature = "http3-quiche", test))]
 #[inline]
 pub(crate) fn strip_host_port(value: &[u8]) -> &[u8] {
     let value = trim_ascii_whitespace(value);
@@ -1013,7 +1013,10 @@ pub(crate) enum ChunkedFeedResult {
 /// スカラのみで表す（ヒープ確保なし・`Copy`）。ストリーミング転送（F-32）で、読み取り
 /// バッファのサブスライスを中間 `Vec` なしに下流へそのまま送出するために使う。
 // ストリーミング転送（F-32）は http2 / http3 経路でのみ使用する
-#[cfg_attr(not(any(feature = "http2", feature = "http3")), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "http2", feature = "http3", feature = "http3-quiche")),
+    allow(dead_code)
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ChunkedSpan {
     /// 入力スライス内のボディデータ開始オフセット。
@@ -1254,7 +1257,10 @@ impl ChunkedDecoder {
     /// 呼び出し側は `consumed` バイトを処理済みとして `input[consumed..]` で再呼び出しし、
     /// `consumed == input.len()` になるまでループする。`complete`/`limit_exceeded` が立った
     /// 時点でループを終える。
-    #[cfg_attr(not(any(feature = "http2", feature = "http3")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(feature = "http2", feature = "http3", feature = "http3-quiche")),
+        allow(dead_code)
+    )]
     pub(crate) fn next_data_span(&mut self, input: &[u8]) -> ChunkedSpan {
         // 既に終端・制限超過に達していれば、これ以上入力を消費しない。
         match self.state {

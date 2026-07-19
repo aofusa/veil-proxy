@@ -35,22 +35,22 @@ pub mod protocol;
 pub mod http2;
 
 /// HTTP/3 サーバ（ngtcp2 / quiche バックエンド切替。`build.rs` の cfg 参照）
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 pub mod http3;
 
 /// 後方互換エイリアス（`entry` / `config` / 既存テストが `http3_server::` を参照）
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 pub use http3 as http3_server;
 
 /// 後方互換エイリアス（ストリーミングアクター）
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 pub use http3::stream as http3_stream;
 
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 pub mod udp;
 
 /// HTTP/2 / HTTP/3 アクターモデル共通の単一スレッドチャネル/Notify（F-116）。
-/// `#![cfg(any(feature = "http2", feature = "http3"))]` で内部を feature ゲートする。
+/// `#![cfg(any(feature = "http2", feature = "http3", feature = "http3-quiche"))]` で内部を feature ゲートする。
 pub mod stream_channel;
 
 pub mod buffering;

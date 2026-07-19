@@ -260,7 +260,7 @@ fn handle_cache_purge(path_with_query: &str, is_purge_method: bool) -> Vec<u8> {
 /// ## パフォーマンス
 /// 設定がデフォルトの場合、has_security_checks() で早期リターンし、
 /// オーバーヘッドを最小化。
-#[cfg(any(feature = "http2", feature = "http3"))]
+#[cfg(any(feature = "http2", feature = "http3", feature = "http3-quiche"))]
 #[inline]
 pub fn check_security(
     security: &SecurityConfig,

@@ -111,7 +111,7 @@ pub fn run() {
     //   コンテナ既定 soft 1024 を超えるため。ワーカー起動・seccomp 適用より前に実行）
     crate::system::raise_nofile_limit();
 
-    #[cfg(feature = "http3")]
+    #[cfg(any(feature = "http3", feature = "http3-quiche"))]
     let mut loaded_config = match load_config(&config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -119,7 +119,7 @@ pub fn run() {
             return;
         }
     };
-    #[cfg(not(feature = "http3"))]
+    #[cfg(not(any(feature = "http3", feature = "http3-quiche")))]
     let loaded_config = match load_config(&config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -339,7 +339,7 @@ pub fn run() {
         http2_enabled: loaded_config.http2_enabled,
         #[cfg(feature = "http2")]
         http2_config: loaded_config.http2_config.clone(),
-        #[cfg(feature = "http3")]
+        #[cfg(any(feature = "http3", feature = "http3-quiche"))]
         http3_config: loaded_config.http3_config.clone(),
         #[cfg(feature = "http2")]
         h2c_enabled: loaded_config.h2c_enabled,
@@ -388,7 +388,7 @@ pub fn run() {
             .unwrap_or(&loaded_config.listen_addr);
         info!("H2C (HTTP/2 Cleartext) enabled (listener: {})", h2c_addr);
     }
-    #[cfg(feature = "http3")]
+    #[cfg(any(feature = "http3", feature = "http3-quiche"))]
     if loaded_config.http3_enabled {
         info!(
             "HTTP/3 enabled (UDP listener: {})",
@@ -696,9 +696,9 @@ pub fn run() {
             let no_h2c = !loaded_config.h2c_enabled;
             #[cfg(not(feature = "http2"))]
             let no_h2c = true;
-            #[cfg(feature = "http3")]
+            #[cfg(any(feature = "http3", feature = "http3-quiche"))]
             let no_h3 = !loaded_config.http3_enabled;
-            #[cfg(not(feature = "http3"))]
+            #[cfg(not(any(feature = "http3", feature = "http3-quiche")))]
             let no_h3 = true;
             // metrics（Prometheus）はメインリスナーのルートとして配信されるため
             // 追加リスナーは無く、capability mode の妨げにならない。
@@ -1047,7 +1047,7 @@ pub fn run() {
     //
     // 注意: quicheはファイルパスからの証明書読み込みのみサポートしているため、
     // HTTP/3を使用する場合はLandlock設定で証明書パスを許可する必要があります。
-    #[cfg(feature = "http3")]
+    #[cfg(any(feature = "http3", feature = "http3-quiche"))]
     if loaded_config.http3_enabled {
         let http3_addr_str = loaded_config
             .http3_listen
@@ -1327,7 +1327,7 @@ pub fn run() {
 
     // HTTP/3 ワーカーが証明書データをクローンするまで短時間待機
     // その後、LoadedConfig の証明書データをセキュアにゼロ化
-    #[cfg(feature = "http3")]
+    #[cfg(any(feature = "http3", feature = "http3-quiche"))]
     if loaded_config.http3_enabled {
         // ワーカースレッドが Arc 参照をドロップするまで少し待機
         // 理由付き allow: メインスレッドで一度だけ実行する起動後の待機（ワーカーの Arc ドロップ待ち）。イベントループ外。

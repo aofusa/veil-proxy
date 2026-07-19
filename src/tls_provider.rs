@@ -31,7 +31,13 @@ pub use rustls::crypto::ring as provider;
 ///
 /// 非 OpenBSD は aws-lc-rs、OpenBSD は ring の `SystemRandom` を用いる
 /// （どちらも `rustls`/`quiche` とは独立した RNG API）。http3 feature 有効時のみ使用。
-#[cfg(all(feature = "http3", not(target_os = "openbsd")))]
+#[cfg(all(
+    any(feature = "http3", feature = "http3-quiche"),
+    not(target_os = "openbsd")
+))]
 pub use aws_lc_rs::rand::{SecureRandom, SystemRandom};
-#[cfg(all(feature = "http3", target_os = "openbsd"))]
+#[cfg(all(
+    any(feature = "http3", feature = "http3-quiche"),
+    target_os = "openbsd"
+))]
 pub use ring::rand::{SecureRandom, SystemRandom};

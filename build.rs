@@ -1,17 +1,15 @@
 //! veil のビルドスクリプト。
 //!
 //! ## HTTP/3
-//! `http3` フィーチャー有効時、バックエンドを選択して cfg を発行する:
-//! - `veil_http3_ngtcp2`: `http3` のみ（依存: ngtcp2-sys + nghttp3-sys。**quiche はビルドしない**）
-//! - `veil_http3_quiche`: `http3-quiche` feature 指定時（依存に quiche を追加）
+//! `http3` / `http3-quiche` フィーチャー有効時、バックエンドを選択して cfg を発行する:
+//! - `veil_http3_ngtcp2`: feature `http3`（依存: ngtcp2-sys + nghttp3-sys のみ。**quiche なし**）
+//! - `veil_http3_quiche`: feature `http3-quiche`（依存: quiche のみ。**ngtcp2/nghttp3 なし**）
 //!
-//! OpenBSD / Windows では quiche バックエンドを推奨する（`--features http3,http3-quiche`）。
-//! `http3` のみでも ngtcp2 経路の cfg になるが、当該 OS では quiche 利用を案内する。
+//! OpenBSD / Windows では ngtcp2 を target 依存から外しており、`http3-quiche` が必須。
+//! 両 feature を同時に有効にすると ngtcp2 も乗るため、quiche 専用時は **`http3-quiche` のみ** を指定する。
 //!
-//! quiche 利用時は BoringSSL 互換（非プレフィックス）シンボルを rustls と共有するため
-//! `AWS_LC_SYS_NO_PREFIX=1` を自動適用する。ngtcp2 の crypto_boringssl も AWS-LC を
-//! 共有するため、HTTP/3 有効時は常に NO_PREFIX を適用する。
-//! libssl / libcrypto のリンクは aws-lc-sys（`http3` で `ssl` フィーチャー有効）が担う。
+//! quiche / ngtcp2_crypto_boringssl は BoringSSL 互換（非プレフィックス）シンボルを rustls と
+//! 共有するため、HTTP/3 有効時は `AWS_LC_SYS_NO_PREFIX=1` を自動適用する。
 //!
 //! ## ランタイム（F-120）
 //! target_os / feature の組み合わせから `veil_rt_uring` / `veil_rt_reactor` /
@@ -29,7 +27,7 @@ fn main() {
     emit_runtime_backend_cfg();
     emit_http3_backend_cfg();
 
-    if feature_enabled("HTTP3") {
+    if feature_enabled("HTTP3") || feature_enabled("HTTP3_QUICHE") {
         ensure_aws_lc_no_prefix();
     }
 }
@@ -40,42 +38,53 @@ fn feature_enabled(name: &str) -> bool {
 
 /// HTTP/3 QUIC バックエンド選択用の cfg を発行する。
 ///
-/// | cfg | 条件 |
-/// |-----|------|
-/// | `veil_http3_quiche` | `feature = "http3-quiche"`（依存グラフに quiche を含める） |
-/// | `veil_http3_ngtcp2` | `feature = "http3"` かつ **http3-quiche なし** |
+/// | cfg | 条件 | 依存 |
+/// |-----|------|------|
+/// | `veil_http3_quiche` | `feature = "http3-quiche"` | quiche のみ |
+/// | `veil_http3_ngtcp2` | `feature = "http3"` かつ **http3-quiche なし** | ngtcp2+nghttp3 のみ |
 ///
-/// 依存: `http3` は ngtcp2/nghttp3 のみ。`http3-quiche` が quiche を追加する。
-/// OpenBSD/Windows では quiche を推奨し、http3-quiche 未指定時は警告する。
+/// OpenBSD / Windows で `http3` のみ（quiche なし）はエラー。
+/// 両 feature 同時指定時は quiche を選び、ngtcp2 が依存に乗ることを警告する。
 fn emit_http3_backend_cfg() {
     println!("cargo::rustc-check-cfg=cfg(veil_http3_quiche)");
     println!("cargo::rustc-check-cfg=cfg(veil_http3_ngtcp2)");
 
-    if !feature_enabled("HTTP3") {
+    let want_http3 = feature_enabled("HTTP3");
+    let want_quiche = feature_enabled("HTTP3_QUICHE");
+    if !want_http3 && !want_quiche {
         return;
     }
 
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    let force_quiche = feature_enabled("HTTP3_QUICHE");
-    let platform_prefers_quiche = matches!(target_os.as_str(), "openbsd" | "windows");
+    let platform_quiche_only = matches!(target_os.as_str(), "openbsd" | "windows");
 
-    if force_quiche {
+    if want_quiche {
+        if want_http3 {
+            eprintln!(
+                "veil build.rs: warning: both `http3` and `http3-quiche` are enabled; \
+                 ngtcp2/nghttp3 will also be pulled by `http3`. \
+                 For quiche-only (no ngtcp2/nghttp3), use `--features http3-quiche` alone."
+            );
+        }
         println!("cargo::rustc-cfg=veil_http3_quiche");
         eprintln!(
             "veil build.rs: HTTP/3 backend = quiche \
              (feature http3-quiche, target_os={target_os})"
         );
-    } else {
-        if platform_prefers_quiche {
-            eprintln!(
-                "veil build.rs: warning: target_os={target_os} prefers quiche; \
-                 enable `--features http3-quiche` (plain `http3` builds ngtcp2/nghttp3 only, \
-                 without quiche in the dependency graph)"
-            );
-        }
-        println!("cargo::rustc-cfg=veil_http3_ngtcp2");
-        eprintln!("veil build.rs: HTTP/3 backend = ngtcp2+nghttp3 (target_os={target_os})");
+        return;
     }
+
+    // http3 only
+    if platform_quiche_only {
+        panic!(
+            "veil build.rs: target_os={target_os} does not include ngtcp2/nghttp3 in the \
+             dependency graph. Enable Cloudflare quiche with `--features http3-quiche` \
+             (do not use plain `http3` on this platform)."
+        );
+    }
+
+    println!("cargo::rustc-cfg=veil_http3_ngtcp2");
+    eprintln!("veil build.rs: HTTP/3 backend = ngtcp2+nghttp3 (target_os={target_os})");
 }
 
 /// ランタイムバックエンド選択用の cfg エイリアスを発行する（F-120 Phase 1）。

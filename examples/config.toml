@@ -33,7 +33,7 @@ http = "127.0.0.1:80"
 #   HTTP/2: cargo build --features http2
 #   HTTP/3: cargo build --features http3
 #     - 依存: ngtcp2-sys + nghttp3-sys + aws-lc-sys のみ（quiche はビルドしない）
-#     - quiche バックエンド: cargo build --features "http3,http3-quiche"
+#     - quiche バックエンド: cargo build --features http3-quiche（ngtcp2/nghttp3 なし）
 #       （OpenBSD/Windows ではこちらを推奨）
 
 # HTTP/2 を有効化（TLS ALPN ネゴシエーション）
@@ -901,7 +901,7 @@ reuseport_balancing = "cbpf"
 #   - HTTP/3 は UDP ベースのため kTLS は使用不可
 #   - QUIC 実装バックエンド（ビルド時選択）:
 #       http3: ngtcp2 + nghttp3 のみ（quiche 非依存）
-#       http3,http3-quiche: quiche バックエンド（OpenBSD/Windows 推奨）
+#       http3-quiche: quiche のみ（ngtcp2/nghttp3 なし。OpenBSD/Windows 推奨）
 #
 [http3]
 # HTTP/3リッスンアドレス（UDP）

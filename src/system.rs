@@ -490,7 +490,7 @@ pub(crate) fn build_sandbox_config(
 /// メモリ上の機密データを安全にゼロ化します。
 /// コンパイラによる最適化（デッドストア削除）を防ぐため、
 /// volatile 書き込みを使用します。
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 pub(crate) fn secure_zero(data: &mut [u8]) {
     // volatile 書き込みで最適化を防止
     for byte in data.iter_mut() {
@@ -507,7 +507,7 @@ pub(crate) fn secure_zero(data: &mut [u8]) {
 /// Arc の参照カウントが 1（自分だけ）の場合、
 /// 内部の Vec をゼロ化してからドロップします。
 /// 参照カウントが 2 以上の場合は警告を出力します。
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 pub(crate) fn secure_clear_arc_vec(arc: &mut Arc<Vec<u8>>, name: &str) {
     match Arc::get_mut(arc) {
         Some(vec) => {

@@ -9,7 +9,7 @@
 //!
 //! 公開 API（`Http3ServerConfig` / `run_http3_server` 等）は両バックエンドで同一。
 
-#![cfg(feature = "http3")]
+#![cfg(any(feature = "http3", feature = "http3-quiche"))]
 
 pub mod common;
 

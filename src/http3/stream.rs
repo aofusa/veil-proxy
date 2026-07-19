@@ -30,7 +30,7 @@
 //! ボディは [`bytes::Bytes`]（参照カウント）でアクター境界を越えて受け渡し、ディープコピーを
 //! しない（quiche の `send_body`/`recv_body` が内部で行うコピーは quiche API 由来の不可避分のみ）。
 
-#![cfg(feature = "http3")]
+#![cfg(any(feature = "http3", feature = "http3-quiche"))]
 
 use std::cell::RefCell;
 use std::io;

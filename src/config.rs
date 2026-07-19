@@ -42,7 +42,7 @@ use crate::buffering;
 use crate::cache;
 #[cfg(feature = "http2")]
 use crate::http2;
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 use crate::http3_server;
 use crate::routing;
 // ====================
@@ -2569,7 +2569,10 @@ struct Config {
     http2: Http2ConfigSection,
     /// HTTP/3 設定セクション
     #[serde(default)]
-    #[cfg_attr(not(feature = "http3"), allow(dead_code))]
+    #[cfg_attr(
+        not(any(feature = "http3", feature = "http3-quiche")),
+        allow(dead_code)
+    )]
     http3: Http3ConfigSection,
     /// Upstream グループ定義（ロードバランシング用）
     #[serde(default)]
@@ -3050,7 +3053,7 @@ impl Default for Http3ConfigSection {
     }
 }
 
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 impl Http3ConfigSection {
     /// HTTP/3 設定を Http3ServerConfig に変換
     pub fn to_http3_config(
@@ -3144,7 +3147,10 @@ pub struct ServerConfigSection {
     /// - GSO/GRO による高パフォーマンス UDP 処理を使用
     /// - リッスンアドレスは [http3].listen で設定
     #[serde(default)]
-    #[cfg_attr(not(feature = "http3"), allow(dead_code))]
+    #[cfg_attr(
+        not(any(feature = "http3", feature = "http3-quiche")),
+        allow(dead_code)
+    )]
     pub http3_enabled: bool,
 
     // ====================
@@ -4681,7 +4687,7 @@ impl AsyncWriter for crate::simple_tls::SimpleTlsClientStream {
 /// `[http3].alt_svc` 明示値、または listen ポートから自動生成した値を登録する。
 /// Alt-Svc 関連キーはすべて `[http3]` に集約する。
 fn apply_alt_svc_from_config(config: &Config) {
-    #[cfg(feature = "http3")]
+    #[cfg(any(feature = "http3", feature = "http3-quiche"))]
     {
         let enabled = config.server.http3_enabled && config.http3.alt_svc_enabled;
         let value = if enabled {
@@ -4700,7 +4706,7 @@ fn apply_alt_svc_from_config(config: &Config) {
         };
         crate::pool::init_alt_svc(enabled, &value);
     }
-    #[cfg(not(feature = "http3"))]
+    #[cfg(not(any(feature = "http3", feature = "http3-quiche")))]
     {
         let _ = config;
         crate::pool::init_alt_svc(false, "");
@@ -5050,10 +5056,16 @@ pub struct LoadedConfig {
     pub listen_http_addr: Option<SocketAddr>,
     pub tls_config: Arc<ServerConfig>,
     /// TLS証明書パス（ログ・表示用）
-    #[cfg_attr(not(feature = "http3"), allow(dead_code))]
+    #[cfg_attr(
+        not(any(feature = "http3", feature = "http3-quiche")),
+        allow(dead_code)
+    )]
     pub tls_cert_path: String,
     /// TLS秘密鍵パス（ログ・表示用）
-    #[cfg_attr(not(feature = "http3"), allow(dead_code))]
+    #[cfg_attr(
+        not(any(feature = "http3", feature = "http3-quiche")),
+        allow(dead_code)
+    )]
     pub tls_key_path: String,
     /// 証明書の自動リロードを有効にするか（F-03）
     pub tls_auto_reload: bool,
@@ -5066,13 +5078,19 @@ pub struct LoadedConfig {
     /// Landlock適用前に読み込まれた証明書データ。
     /// HTTP/3ではmemfd経由でquicheに渡すことで、
     /// Landlockによるファイルシステム制限下でも動作可能。
-    #[cfg_attr(not(feature = "http3"), allow(dead_code))]
+    #[cfg_attr(
+        not(any(feature = "http3", feature = "http3-quiche")),
+        allow(dead_code)
+    )]
     pub tls_cert_pem: Arc<Vec<u8>>,
     /// TLS秘密鍵（PEM形式、事前読み込み済み）
     ///
     /// Landlock適用前に読み込まれた秘密鍵データ。
     /// HTTP/3ではmemfd経由でquicheに渡す。
-    #[cfg_attr(not(feature = "http3"), allow(dead_code))]
+    #[cfg_attr(
+        not(any(feature = "http3", feature = "http3-quiche")),
+        allow(dead_code)
+    )]
     pub tls_key_pem: Arc<Vec<u8>>,
     /// 統合ルーティング（唯一のルーティング方式）
     pub route: Arc<Vec<Route>>,
@@ -5103,16 +5121,16 @@ pub struct LoadedConfig {
     #[cfg(feature = "http2")]
     pub http2_enabled: bool,
     /// HTTP/3 を有効化するかどうか
-    #[cfg(feature = "http3")]
+    #[cfg(any(feature = "http3", feature = "http3-quiche"))]
     pub http3_enabled: bool,
     /// HTTP/3 リスナーアドレス (UDP)
-    #[cfg(feature = "http3")]
+    #[cfg(any(feature = "http3", feature = "http3-quiche"))]
     pub http3_listen: Option<String>,
     /// HTTP/2 設定（詳細設定）
     #[cfg(feature = "http2")]
     pub http2_config: Http2ConfigSection,
     /// HTTP/3 設定（詳細設定）
-    #[cfg(feature = "http3")]
+    #[cfg(any(feature = "http3", feature = "http3-quiche"))]
     pub http3_config: Http3ConfigSection,
     /// H2C (HTTP/2 Cleartext) を有効化するかどうか
     #[cfg(feature = "http2")]
@@ -5185,7 +5203,7 @@ pub struct RuntimeConfig {
     #[cfg(feature = "http2")]
     pub http2_config: Http2ConfigSection,
     /// HTTP/3 設定（圧縮設定の解決に使用）
-    #[cfg(feature = "http3")]
+    #[cfg(any(feature = "http3", feature = "http3-quiche"))]
     pub http3_config: Http3ConfigSection,
     /// H2C (HTTP/2 Cleartext) を有効化するかどうか
     #[cfg(feature = "http2")]
@@ -5222,7 +5240,7 @@ impl Default for RuntimeConfig {
             http2_enabled: false,
             #[cfg(feature = "http2")]
             http2_config: Http2ConfigSection::default(),
-            #[cfg(feature = "http3")]
+            #[cfg(any(feature = "http3", feature = "http3-quiche"))]
             http3_config: Http3ConfigSection::default(),
             #[cfg(feature = "http2")]
             h2c_enabled: false,
@@ -5296,7 +5314,7 @@ pub fn reload_config(path: &Path) -> io::Result<()> {
         http2_enabled: loaded.http2_enabled,
         #[cfg(feature = "http2")]
         http2_config: loaded.http2_config,
-        #[cfg(feature = "http3")]
+        #[cfg(any(feature = "http3", feature = "http3-quiche"))]
         http3_config: loaded.http3_config,
         #[cfg(feature = "http2")]
         h2c_enabled: loaded.h2c_enabled,
@@ -5338,7 +5356,7 @@ pub struct LoadedConfigWithoutTls {
     pub http2_enabled: bool,
     #[cfg(feature = "http2")]
     pub http2_config: Http2ConfigSection,
-    #[cfg(feature = "http3")]
+    #[cfg(any(feature = "http3", feature = "http3-quiche"))]
     pub http3_config: Http3ConfigSection,
     #[cfg(feature = "http2")]
     pub h2c_enabled: bool,
@@ -5370,7 +5388,7 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
     let http2_enabled = config.server.http2_enabled;
     #[cfg(feature = "http2")]
     let http2_config = config.http2.clone();
-    #[cfg(feature = "http3")]
+    #[cfg(any(feature = "http3", feature = "http3-quiche"))]
     let http3_config = config.http3.clone();
     #[cfg(feature = "http2")]
     let h2c_enabled = config.server.h2c_enabled;
@@ -5461,7 +5479,7 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
         http2_enabled,
         #[cfg(feature = "http2")]
         http2_config,
-        #[cfg(feature = "http3")]
+        #[cfg(any(feature = "http3", feature = "http3-quiche"))]
         http3_config,
         #[cfg(feature = "http2")]
         h2c_enabled,
@@ -5534,13 +5552,13 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     // 有効化フラグは server セクションで管理、詳細設定は [http2]/[http3] セクション
     #[cfg(feature = "http2")]
     let http2_enabled = config.server.http2_enabled;
-    #[cfg(feature = "http3")]
+    #[cfg(any(feature = "http3", feature = "http3-quiche"))]
     let http3_enabled = config.server.http3_enabled;
     #[cfg(feature = "http2")]
     let http2_config = config.http2.clone();
-    #[cfg(feature = "http3")]
+    #[cfg(any(feature = "http3", feature = "http3-quiche"))]
     let http3_config = config.http3.clone();
-    #[cfg(feature = "http3")]
+    #[cfg(any(feature = "http3", feature = "http3-quiche"))]
     let http3_listen = http3_config.listen.clone();
     #[cfg(feature = "http2")]
     let h2c_enabled = config.server.h2c_enabled;
@@ -5743,13 +5761,13 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         upstream_groups: Arc::new(upstream_groups),
         #[cfg(feature = "http2")]
         http2_enabled,
-        #[cfg(feature = "http3")]
+        #[cfg(any(feature = "http3", feature = "http3-quiche"))]
         http3_enabled,
-        #[cfg(feature = "http3")]
+        #[cfg(any(feature = "http3", feature = "http3-quiche"))]
         http3_listen,
         #[cfg(feature = "http2")]
         http2_config,
-        #[cfg(feature = "http3")]
+        #[cfg(any(feature = "http3", feature = "http3-quiche"))]
         http3_config,
         #[cfg(feature = "http2")]
         h2c_enabled,

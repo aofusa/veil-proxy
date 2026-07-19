@@ -2000,7 +2000,7 @@ async fn test_grpc_basic_request() {
 /// - 接続確立後にリクエストを送信できること
 #[tokio::test]
 #[ntest::timeout(15000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_basic_connection() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -2056,7 +2056,7 @@ async fn test_http3_basic_connection() {
 /// - レスポンスボディが受信されること
 #[tokio::test]
 #[ntest::timeout(15000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_get_request() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -2104,7 +2104,7 @@ async fn test_http3_get_request() {
 
 #[tokio::test]
 #[ntest::timeout(15000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_post_request() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -2163,7 +2163,7 @@ async fn test_http3_post_request() {
 
 #[tokio::test]
 #[ntest::timeout(15000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_configuration_check() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -2191,7 +2191,7 @@ async fn test_http3_configuration_check() {
 
 #[tokio::test]
 #[ntest::timeout(15000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_multiple_streams() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -2263,7 +2263,7 @@ async fn test_http3_multiple_streams() {
 
 #[tokio::test]
 #[ntest::timeout(15000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_proxy_forwarding() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -2318,7 +2318,7 @@ async fn test_http3_proxy_forwarding() {
 
 #[tokio::test]
 #[ntest::timeout(15000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_proxy_compression() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -2368,7 +2368,7 @@ async fn test_http3_proxy_compression() {
 
 #[tokio::test]
 #[ntest::timeout(15000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_connection_timeout() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -2394,7 +2394,7 @@ async fn test_http3_connection_timeout() {
 
 #[tokio::test]
 #[ntest::timeout(15000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_stream_priority() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -2436,7 +2436,7 @@ async fn test_http3_stream_priority() {
 
 #[tokio::test]
 #[ntest::timeout(15000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_stream_cancellation() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -2481,7 +2481,7 @@ async fn test_http3_stream_cancellation() {
 
 #[tokio::test]
 #[ntest::timeout(15000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_bidirectional_streams() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -2528,7 +2528,7 @@ async fn test_http3_bidirectional_streams() {
 
 #[tokio::test]
 #[ntest::timeout(15000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_proxy_header_manipulation() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -2589,7 +2589,7 @@ async fn test_http3_proxy_header_manipulation() {
 
 #[tokio::test]
 #[ntest::timeout(15000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_proxy_load_balancing() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -2635,7 +2635,7 @@ async fn test_http3_proxy_load_balancing() {
 
 #[tokio::test]
 #[ntest::timeout(15000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_stream_timeout() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -2673,7 +2673,7 @@ async fn test_http3_stream_timeout() {
 
 #[tokio::test]
 #[ntest::timeout(15000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_invalid_frame() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -2709,7 +2709,7 @@ async fn test_http3_invalid_frame() {
 
 #[tokio::test]
 #[ntest::timeout(15000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_backend_failure() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -2751,7 +2751,7 @@ async fn test_http3_backend_failure() {
 
 #[tokio::test]
 #[ntest::timeout(15000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_tls_handshake() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -2789,7 +2789,7 @@ async fn test_http3_tls_handshake() {
 
 #[tokio::test]
 #[ntest::timeout(15000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_0rtt_connection() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -2841,7 +2841,7 @@ async fn test_http3_0rtt_connection() {
 
 #[tokio::test]
 #[ntest::timeout(15000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_connection_close() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -2878,7 +2878,7 @@ async fn test_http3_connection_close() {
 // 負荷では CPU 競合で遅くなり得るため、test_http3_request_body_streaming と同じ
 // レジリエンス方針を取る。
 #[ntest::timeout(60000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_large_request_body() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -2947,7 +2947,7 @@ async fn test_http3_large_request_body() {
 
 #[tokio::test]
 #[ntest::timeout(15000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_large_response_body() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -2988,7 +2988,7 @@ async fn test_http3_large_response_body() {
 
 #[tokio::test]
 #[ntest::timeout(15000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_chunked_response() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -3041,7 +3041,7 @@ async fn test_http3_chunked_response() {
 // タイムアウトは大きめ（60s）に取る。1MB 超の往復（up+down）は単一 H3 ワーカー + co-tenant
 // 負荷の重い並列スイートでは CPU 競合で遅くなり得るため（処理自体は分離タスクで安定）。
 #[ntest::timeout(60000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_request_body_streaming() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -3128,7 +3128,7 @@ async fn test_http3_request_body_streaming() {
 /// POST し、往復のバイト単位完全一致で「TLS 経由でも全量バッファせず逐次転送」を検証する。
 #[tokio::test]
 #[ntest::timeout(60000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_request_body_streaming_tls_backend() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -3204,7 +3204,7 @@ async fn test_http3_request_body_streaming_tls_backend() {
 /// F-44: HTTP/3 × TLS バックエンド（小ボディ・単一 DATA 経路）。
 #[tokio::test]
 #[ntest::timeout(15000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_request_body_streaming_tls_backend_small() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -3245,7 +3245,7 @@ async fn test_http3_request_body_streaming_tls_backend_small() {
 /// F-32: HTTP/3 リクエスト方向ストリーミング（小ボディ・単一 DATA 経路）。
 #[tokio::test]
 #[ntest::timeout(15000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_request_body_streaming_small() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -3288,7 +3288,7 @@ async fn test_http3_request_body_streaming_small() {
 /// 実 h3 クライアントが全ボディを **バイト単位まで正確に** 再構成できることを確認する。
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_response_body_streaming() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -3361,7 +3361,7 @@ async fn test_http3_response_body_streaming() {
 
 #[tokio::test]
 #[ntest::timeout(15000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_throughput() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -3423,7 +3423,7 @@ async fn test_http3_throughput() {
 
 #[tokio::test]
 #[ntest::timeout(15000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_latency() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -3754,7 +3754,7 @@ async fn test_grpc_streaming_detailed() {
 /// 同一接続で同一ヘッダ連打（動的テーブル利用）と巨大ヘッダの制御された処理を検証。
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_qpack_compression() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -3856,7 +3856,7 @@ async fn test_http3_qpack_compression() {
 /// 複数 UDP エンドポイントでのストリーム継続・クラッシュなしを合格条件とする。
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_connection_migration() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -3932,7 +3932,7 @@ async fn test_http3_connection_migration() {
 
 #[tokio::test]
 #[ntest::timeout(15000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_concurrent_connections() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -18197,7 +18197,10 @@ async fn test_e2e_ktls_enabled_handshake() {
 /// E-H3-10: HTTP/3 経由で /rate-limited/* に連打し 429 が返ること
 #[tokio::test]
 #[ntest::timeout(45000)]
-#[cfg(all(feature = "http3", feature = "rate-limit"))]
+#[cfg(all(
+    any(feature = "http3", feature = "http3-quiche"),
+    feature = "rate-limit"
+))]
 async fn test_http3_rate_limiting() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -18245,7 +18248,7 @@ async fn test_http3_rate_limiting() {
 /// E-H3-11: HTTP/3 経由で /api/ip-restricted/* が 403 になること
 #[tokio::test]
 #[ntest::timeout(15000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_ip_restriction() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -18275,7 +18278,7 @@ async fn test_http3_ip_restriction() {
 /// E-H3-12: HTTP/3 経由で /wasm/* に WASM フィルタが適用されること
 #[tokio::test]
 #[ntest::timeout(20000)]
-#[cfg(all(feature = "http3", feature = "wasm"))]
+#[cfg(all(any(feature = "http3", feature = "http3-quiche"), feature = "wasm"))]
 async fn test_http3_wasm_integration() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -18314,7 +18317,7 @@ async fn test_http3_wasm_integration() {
 /// E-H3-13: HTTP/3 経由の /cached/* でキャッシュ hit/miss 相当の挙動
 #[tokio::test]
 #[ntest::timeout(20000)]
-#[cfg(all(feature = "http3", feature = "cache"))]
+#[cfg(all(any(feature = "http3", feature = "http3-quiche"), feature = "cache"))]
 async fn test_http3_cache_hit_miss() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -18367,7 +18370,7 @@ async fn test_http3_cache_hit_miss() {
 /// E-H3-14: 0-RTT / early data で非べき等 POST が安全に扱われること
 #[tokio::test]
 #[ntest::timeout(20000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_early_data_0rtt_security() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -18425,7 +18428,10 @@ async fn test_http3_early_data_0rtt_security() {
 /// E-H3-15: WebSocket over HTTP/3 (RFC 9220) — 対応時は確立、未対応時は安全な失敗
 #[tokio::test]
 #[ntest::timeout(15000)]
-#[cfg(all(feature = "http3", feature = "websocket"))]
+#[cfg(all(
+    any(feature = "http3", feature = "http3-quiche"),
+    feature = "websocket"
+))]
 async fn test_http3_websocket() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -18542,7 +18548,7 @@ async fn test_grpc_http2_framing_malformed_data() {
 /// E-G-06: HTTP/3 上の gRPC Unary（成功時は 200 + grpc-status/ボディ）
 #[tokio::test]
 #[ntest::timeout(20000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -18612,7 +18618,7 @@ async fn test_grpc_over_http3() {
 /// （既存 `test_http3_response_body_streaming` と同等の経路。レポート名で明示。）
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_chunked_response_streaming() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -18677,7 +18683,7 @@ async fn test_http3_chunked_response_streaming() {
 /// 複数の独立リクエストが同一 QUIC コネクション（同一 SendRequest）で処理されること。
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_connection_reuse() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -18734,7 +18740,7 @@ async fn test_http3_connection_reuse() {
 /// 0-RTT / early data 相当の再接続後リクエストが安全に完了（または安全に拒否）されること。
 #[tokio::test]
 #[ntest::timeout(20000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_early_data() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -18804,7 +18810,7 @@ async fn test_http3_early_data() {
 /// サーバ/クライアント/双方向ストリーミングが QUIC 上で動作すること。
 #[tokio::test]
 #[ntest::timeout(45000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3_streaming() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -18974,7 +18980,7 @@ async fn test_grpc_over_http3_streaming() {
 /// カスタムメタデータと grpc トレーラーが QUIC HEADERS として透過されること。
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3_metadata() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -19037,7 +19043,7 @@ async fn test_grpc_over_http3_metadata() {
 /// バックエンドエラー時に適切な gRPC ステータスが QUIC トレーラーとして返ること。
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3_error_handling() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -19369,7 +19375,7 @@ async fn test_http3_udp_unreachable_fallback() {
     }
 
     // 4) 正規の HTTP/3 ポートは生きていること（プロキシ自体の健全性）
-    #[cfg(feature = "http3")]
+    #[cfg(any(feature = "http3", feature = "http3-quiche"))]
     {
         let live: std::net::SocketAddr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT).parse().unwrap();
         let ok = Http3TestClient::new(live, "localhost").await;
@@ -19526,7 +19532,7 @@ async fn test_grpc_wasm_interceptor() {
 /// リクエストボディを複数サイズで送り、プロキシがクラッシュせず処理することを確認する。
 #[tokio::test]
 #[ntest::timeout(60000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_pmtu_payload_sizes() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -19601,7 +19607,7 @@ async fn test_http3_pmtu_payload_sizes() {
 /// 接続 drop → 再接続（新 SCID）→ 正常リクエスト で追従性を検証する。
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_cid_update_retire_simulation() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -19651,7 +19657,7 @@ async fn test_http3_cid_update_retire_simulation() {
 /// E-H3-F96-03: QUIC Keep-Alive — アイドル後も接続が意図せず切れないこと。
 #[tokio::test]
 #[ntest::timeout(45000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_quic_keepalive_idle() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -19711,7 +19717,7 @@ async fn test_http3_quic_keepalive_idle() {
 /// E-H3-F96-04: GOAWAY / Graceful — SIGHUP リロード中も H3 がドレインされ新規接続可能。
 #[tokio::test]
 #[ntest::timeout(45000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_goaway_graceful_reload() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -20008,7 +20014,7 @@ async fn test_grpc_server_stream_abnormal_termination() {
 /// E-H3-F97-01: HTTP/3 経由のクエリ・ヘッダ条件ルーティング
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_routing_conditions() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -20063,7 +20069,7 @@ async fn test_http3_routing_conditions() {
 /// E-H3-F97-02: HTTP/3 大容量ボディでバッファ制限・スピルオーバー経路が生存
 #[tokio::test]
 #[ntest::timeout(60000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_buffering_spillover() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -20133,7 +20139,7 @@ async fn test_http3_buffering_spillover() {
 /// 返す File 配信サーバー。ヘッダのみでなくボディ内容まで検証する。
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_buffering_full_proxy_body_intact() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -20175,7 +20181,7 @@ async fn test_http3_buffering_full_proxy_body_intact() {
 /// E-H3-F97-03: HTTP/3 Range → 206 Partial Content
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_range_requests() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -20232,7 +20238,7 @@ async fn test_http3_range_requests() {
 /// ここでは一致時の正常応答と、不正 authority でルート不一致になることを確認する。
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_pseudo_header_validation() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -20485,7 +20491,7 @@ async fn test_grpc_active_health_check() {
 /// HTTP/3 経由での `grpc-timeout` ヒントが転送され、Unary が完了すること。
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3_timeout_header() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -20536,7 +20542,7 @@ async fn test_grpc_over_http3_timeout_header() {
 /// gzip / deflate の grpc-encoding / grpc-accept-encoding が HTTP/3 経由で受理されること。
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3_compression() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -20608,7 +20614,7 @@ async fn test_grpc_over_http3_compression() {
 /// 正常・エラー時の Trailers（grpc-status / grpc-message）が QUIC 上で詳細に透過されること。
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3_trailer_detailed() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -20710,7 +20716,7 @@ async fn test_grpc_over_http3_trailer_detailed() {
 /// 複数 Unary を HTTP/3 経由で送り、ロードバランシング経路が生存すること。
 #[tokio::test]
 #[ntest::timeout(45000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3_proxy_load_balancing() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -20786,7 +20792,7 @@ async fn test_grpc_over_http3_proxy_load_balancing() {
 /// application/grpc-web / application/grpc-web-text が HTTP/3 経由で機能すること。
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(all(feature = "grpc-web", feature = "http3"))]
+#[cfg(all(feature = "grpc-web", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_web_over_http3() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -20864,7 +20870,7 @@ async fn test_grpc_web_over_http3() {
 /// HTTP/3 リクエスト後に Prometheus に接続/ストリーム/リクエストが計上されること。
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(all(feature = "http3", feature = "metrics"))]
+#[cfg(all(any(feature = "http3", feature = "http3-quiche"), feature = "metrics"))]
 async fn test_http3_prometheus_metrics() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -20926,7 +20932,7 @@ async fn test_http3_prometheus_metrics() {
 /// HTTP/3 接続確立でゲージが増え、切断後に減少すること。
 #[tokio::test]
 #[ntest::timeout(45000)]
-#[cfg(all(feature = "http3", feature = "metrics"))]
+#[cfg(all(any(feature = "http3", feature = "http3-quiche"), feature = "metrics"))]
 async fn test_http3_active_connections_metric() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -21050,7 +21056,7 @@ async fn test_http3_active_connections_metric() {
 /// F-101: HTTP/3 経由の大容量静的ファイル提供
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_static_file_large() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -21082,7 +21088,7 @@ async fn test_http3_static_file_large() {
 /// F-101: HTTP/3 経由の ETag（存在すれば quoted 形式）
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_static_file_etag() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -21117,7 +21123,7 @@ async fn test_http3_static_file_etag() {
 /// F-101: HTTP/3 経由の 302 リダイレクト + Location
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_redirect_302() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -21159,7 +21165,7 @@ async fn test_http3_redirect_302() {
 /// F-101: HTTP/3 経由の 307 リダイレクト
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_redirect_307() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -21198,7 +21204,7 @@ async fn test_http3_redirect_307() {
 /// クラッシュせずリクエストを処理し続けられることを検証する。
 #[tokio::test]
 #[ntest::timeout(60000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 // clippy::await_holding_lock 許容理由: RELOAD_TEST_LOCK は SIGHUP リロード系テストを
 // テストプロセス内で直列化するための意図的なガードで、テスト全体（await を含む）を
 // 覆う必要がある（tokio マルチスレッドでも所有スレッドは同一タスク内で完結する）。
@@ -21286,7 +21292,7 @@ async fn test_http3_sni_and_cert_reload() {
 /// F-101: HTTP/3 (QPACK) 巨大ヘッダは 431 または接続/ストリーム切断で拒否
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_oversized_header() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -21336,7 +21342,7 @@ async fn test_http3_oversized_header() {
 /// F-101: Alt-Svc 広告を受け取り HTTP/3 へ接続を切り替えるフロー
 #[tokio::test]
 #[ntest::timeout(45000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_alt_svc_upgrade_flow() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -21416,7 +21422,7 @@ async fn test_alt_svc_upgrade_flow() {
 /// HTTP/3 上で不正 gRPC LPM（長さ不足・フラグ異常）を送り耐性を検証する。
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3_invalid_frame() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -21472,7 +21478,7 @@ async fn test_grpc_over_http3_invalid_frame() {
 /// 制限超の巨大 gRPC メッセージを HTTP/3 で送り拒否または制御されること。
 #[tokio::test]
 #[ntest::timeout(45000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3_oversized_message() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -21570,7 +21576,7 @@ async fn test_grpc_over_http3_oversized_message() {
 /// パース不能な protobuf を HTTP/3 gRPC で送りエラーハンドリングを検証。
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3_malformed_protobuf() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -21621,7 +21627,7 @@ async fn test_grpc_over_http3_malformed_protobuf() {
 /// 通信途中で HTTP/3 ストリームをリセットし、プロキシがリソース解放・生存すること。
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3_stream_reset() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -21680,7 +21686,7 @@ async fn test_grpc_over_http3_stream_reset() {
 /// QUIC/HTTP3 フロー制御ウィンドウ境界で gRPC データがデッドロックしないこと。
 #[tokio::test]
 #[ntest::timeout(60000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3_flow_control_window_boundary() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -21763,7 +21769,7 @@ async fn test_grpc_over_http3_flow_control_window_boundary() {
 /// HTTP/3 経由のエラー後リトライと並行ヘッジ RPC が完了すること。
 #[tokio::test]
 #[ntest::timeout(60000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3_retry_and_hedging() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -21858,7 +21864,7 @@ async fn test_grpc_over_http3_retry_and_hedging() {
 /// アイドル後も QUIC 接続上で gRPC Unary が通ること（QUIC PING 相互作用の近似）。
 #[tokio::test]
 #[ntest::timeout(45000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3_keepalive_ping() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -21929,7 +21935,7 @@ async fn test_grpc_over_http3_keepalive_ping() {
 /// サーバ異常終了（INTERNAL 等）が HTTP/3 上で gRPC ステータスに伝播すること。
 #[tokio::test]
 #[ntest::timeout(45000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3_server_stream_abnormal_termination() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -21998,7 +22004,7 @@ async fn test_grpc_over_http3_server_stream_abnormal_termination() {
 /// HTTP/3 gRPC に対する x-user-id コンシステントハッシュ sticky を検証。
 #[tokio::test]
 #[ntest::timeout(45000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3_consistent_hashing() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -22086,7 +22092,7 @@ async fn test_grpc_over_http3_consistent_hashing() {
 /// gRPC active health サイクル後も HTTP/3 gRPC が健全側へルーティングできること。
 #[tokio::test]
 #[ntest::timeout(45000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3_active_health_check() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -22145,7 +22151,7 @@ async fn test_grpc_over_http3_active_health_check() {
 /// Full バッファリング設定下でも gRPC ServerStreaming が HTTP/3 で成立すること。
 #[tokio::test]
 #[ntest::timeout(45000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3_buffering_bypass() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -22192,7 +22198,11 @@ async fn test_grpc_over_http3_buffering_bypass() {
 /// HTTP/3 gRPC 経路で WASM インターセプタが応答ヘッダを付与できること。
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(all(feature = "grpc", feature = "http3", feature = "wasm"))]
+#[cfg(all(
+    feature = "grpc",
+    any(feature = "http3", feature = "http3-quiche"),
+    feature = "wasm"
+))]
 async fn test_grpc_over_http3_wasm_interceptor() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -22248,7 +22258,7 @@ async fn test_grpc_over_http3_wasm_interceptor() {
 /// 複数 HTTP/3 ストリームの echo が同一接続でバイト一致すること（多重化/coalesce 耐性）。
 #[tokio::test]
 #[ntest::timeout(45000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_multiplexed_coalesced_responses() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -22334,7 +22344,7 @@ async fn test_http3_multiplexed_coalesced_responses() {
 /// 複数 LPM をチャンク送信し ClientStreaming が HTTP/3 で完了すること。
 #[tokio::test]
 #[ntest::timeout(45000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3_client_streaming() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -22393,7 +22403,7 @@ async fn test_grpc_over_http3_client_streaming() {
 /// ServerStreaming が複数 LPM または grpc-status を HTTP/3 で返すこと。
 #[tokio::test]
 #[ntest::timeout(45000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3_server_streaming() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -22451,7 +22461,7 @@ async fn test_grpc_over_http3_server_streaming() {
 /// BidirectionalStreaming が HTTP/3 で完了すること。
 #[tokio::test]
 #[ntest::timeout(45000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3_bidirectional_streaming() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -22510,7 +22520,7 @@ async fn test_grpc_over_http3_bidirectional_streaming() {
 /// grpc-encoding / grpc-accept-encoding=gzip が HTTP/3 で受理されること。
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3_gzip_compression() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -22561,7 +22571,7 @@ async fn test_grpc_over_http3_gzip_compression() {
 /// grpc-encoding / grpc-accept-encoding=deflate が HTTP/3 で受理されること。
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3_deflate_compression() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -22609,7 +22619,7 @@ async fn test_grpc_over_http3_deflate_compression() {
 /// grpc-accept-encoding に複数アルゴリズムを通知しても HTTP/3 Unary が成立すること。
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3_compression_negotiation() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -22662,7 +22672,7 @@ async fn test_grpc_over_http3_compression_negotiation() {
 /// grpc-encoding=gzip ヘッダが HTTP/3 経由で透過・受理されること。
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3_encoding_header() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -22709,7 +22719,7 @@ async fn test_grpc_over_http3_encoding_header() {
 /// grpc-accept-encoding ヘッダが HTTP/3 経由で受理されること。
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3_accept_encoding_header() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -22756,7 +22766,7 @@ async fn test_grpc_over_http3_accept_encoding_header() {
 /// application/grpc-web が HTTP/3 経由で制御された応答を返すこと。
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(all(feature = "grpc-web", feature = "http3"))]
+#[cfg(all(feature = "grpc-web", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_web_over_http3_binary_format() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -22802,7 +22812,7 @@ async fn test_grpc_web_over_http3_binary_format() {
 /// application/grpc-web-text（Base64 ボディ）が HTTP/3 経由で制御された応答を返すこと。
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(all(feature = "grpc-web", feature = "http3"))]
+#[cfg(all(feature = "grpc-web", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_web_over_http3_text_format() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -22850,7 +22860,7 @@ async fn test_grpc_web_over_http3_text_format() {
 /// Origin 付き gRPC-Web が HTTP/3 経由で制御された応答を返すこと。
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(all(feature = "grpc-web", feature = "http3"))]
+#[cfg(all(feature = "grpc-web", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_web_over_http3_cors_headers() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -22914,7 +22924,7 @@ async fn test_grpc_web_over_http3_cors_headers() {
 /// QUIC トランスポート + HTTP/3 SETTINGS 交換後に通常 GET が成立すること。
 #[tokio::test]
 #[ntest::timeout(20000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_settings_negotiation() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -22946,7 +22956,7 @@ async fn test_http3_settings_negotiation() {
 /// 大きめ静的ファイル取得で QUIC/H3 フロー制御経路が破綻しないこと。
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_flow_control() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -22991,7 +23001,7 @@ async fn test_http3_flow_control() {
 /// 加えて ALPN 不一致クライアントは接続失敗することを確認する。
 #[tokio::test]
 #[ntest::timeout(20000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_handshake_failure() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -23034,7 +23044,7 @@ async fn test_http3_handshake_failure() {
 /// `grpc-timeout` ヒント付き Unary が HTTP/3 経由で完了すること。
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3_proxy_timeout() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -23089,7 +23099,7 @@ async fn test_grpc_over_http3_proxy_timeout() {
 /// バックエンドの gRPC ステータスが HTTP/3 Trailer として伝播すること。
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3_status_code() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -23168,7 +23178,7 @@ async fn test_grpc_over_http3_status_code() {
 /// Server/Client/Bidi ストリーミングの LPM 断片化・再結合を HTTP/3 上で詳細確認。
 #[tokio::test]
 #[ntest::timeout(45000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3_streaming_detailed() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -23295,7 +23305,7 @@ async fn test_grpc_over_http3_streaming_detailed() {
 /// LPM バイナリフォーマットが HTTP/3 上で仕様通りに送受信されること。
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3_wire_protocol() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -23367,7 +23377,7 @@ async fn test_grpc_over_http3_wire_protocol() {
 /// HTTP/3 上で LPM を極端に遅く送り、プロキシが生存すること。
 #[tokio::test]
 #[ntest::timeout(45000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3_client_slowloris() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -23470,7 +23480,7 @@ async fn test_grpc_over_http3_client_slowloris() {
 /// OPTIONS プリフライトから POST までの CORS フローが HTTP/3 上で機能すること。
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(all(feature = "grpc-web", feature = "http3"))]
+#[cfg(all(feature = "grpc-web", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_web_over_http3_cors() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -23555,7 +23565,7 @@ async fn test_grpc_web_over_http3_cors() {
 /// レポート: `test_http3_cache_stale_while_revalidate`
 #[tokio::test]
 #[ntest::timeout(20000)]
-#[cfg(all(feature = "http3", feature = "cache"))]
+#[cfg(all(any(feature = "http3", feature = "http3-quiche"), feature = "cache"))]
 async fn test_http3_cache_stale_while_revalidate() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -23593,7 +23603,7 @@ async fn test_http3_cache_stale_while_revalidate() {
 /// レポート: `test_http3_cache_stale_if_error`
 #[tokio::test]
 #[ntest::timeout(20000)]
-#[cfg(all(feature = "http3", feature = "cache"))]
+#[cfg(all(any(feature = "http3", feature = "http3-quiche"), feature = "cache"))]
 async fn test_http3_cache_stale_if_error() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -23623,7 +23633,7 @@ async fn test_http3_cache_stale_if_error() {
 /// レポート: `test_http3_cache_invalidation`
 #[tokio::test]
 #[ntest::timeout(20000)]
-#[cfg(all(feature = "http3", feature = "cache"))]
+#[cfg(all(any(feature = "http3", feature = "http3-quiche"), feature = "cache"))]
 async fn test_http3_cache_invalidation() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -23654,7 +23664,7 @@ async fn test_http3_cache_invalidation() {
 /// レポート: `test_http3_load_balancing_least_connections`
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_load_balancing_least_connections() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -23690,7 +23700,7 @@ async fn test_http3_load_balancing_least_connections() {
 /// レポート: `test_http3_load_balancing_ip_hash`
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_load_balancing_ip_hash() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -23733,7 +23743,7 @@ async fn test_http3_load_balancing_ip_hash() {
 /// レポート: `test_http3_health_check_failover`
 #[tokio::test]
 #[ntest::timeout(20000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_health_check_failover() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -23767,7 +23777,7 @@ async fn test_http3_health_check_failover() {
 /// レポート: `test_http3_health_check_recovery`
 #[tokio::test]
 #[ntest::timeout(20000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_health_check_recovery() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -23793,7 +23803,7 @@ async fn test_http3_health_check_recovery() {
 /// レポート: `test_http3_error_handling_413_payload_too_large`
 #[tokio::test]
 #[ntest::timeout(30000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_error_handling_413_payload_too_large() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -23858,7 +23868,7 @@ async fn test_http3_error_handling_413_payload_too_large() {
 /// レポート: `test_http3_error_handling_431_request_header_fields_too_large`
 #[tokio::test]
 #[ntest::timeout(20000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_error_handling_431_request_header_fields_too_large() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -23904,7 +23914,10 @@ async fn test_http3_error_handling_431_request_header_fields_too_large() {
 /// レポート: `test_http3_compression_brotli`
 #[tokio::test]
 #[ntest::timeout(20000)]
-#[cfg(all(feature = "http3", feature = "compression"))]
+#[cfg(all(
+    any(feature = "http3", feature = "http3-quiche"),
+    feature = "compression"
+))]
 async fn test_http3_compression_brotli() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -23940,7 +23953,10 @@ async fn test_http3_compression_brotli() {
 /// レポート: `test_http3_compression_zstd`
 #[tokio::test]
 #[ntest::timeout(20000)]
-#[cfg(all(feature = "http3", feature = "compression"))]
+#[cfg(all(
+    any(feature = "http3", feature = "http3-quiche"),
+    feature = "compression"
+))]
 async fn test_http3_compression_zstd() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -23977,7 +23993,7 @@ async fn test_http3_compression_zstd() {
 /// HTTP/3 は TE を持たないため、重複 CL / 不正 content-length を中心に拒否を確認する。
 #[tokio::test]
 #[ntest::timeout(20000)]
-#[cfg(feature = "http3")]
+#[cfg(any(feature = "http3", feature = "http3-quiche"))]
 async fn test_http3_request_smuggling_cl_te_rejected() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -24223,7 +24239,7 @@ async fn test_grpc_max_concurrent_streams() {
 /// レポート: `test_grpc_over_http3_max_concurrent_streams`
 #[tokio::test]
 #[ntest::timeout(60000)]
-#[cfg(all(feature = "grpc", feature = "http3"))]
+#[cfg(all(feature = "grpc", any(feature = "http3", feature = "http3-quiche")))]
 async fn test_grpc_over_http3_max_concurrent_streams() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
