@@ -239,7 +239,8 @@ impl H3Conn {
     ///
     /// バッファは **in-place 追記のみ**（drain / reallocate しない）。
     pub fn append_body(&mut self, stream_id: i64, data: &[u8], fin: bool) -> std::io::Result<()> {
-        const PRE: usize = 256 * 1024;
+        // 小レスポンスでは過剰確保を避け、必要時のみ extend で伸ばす
+        const PRE: usize = 4 * 1024;
         let q = self
             .user_data
             .body_queues

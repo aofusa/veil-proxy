@@ -37,17 +37,52 @@ use crate::proxy::{check_security, SecurityCheckResult};
 use crate::udp::QuicUdpSocket;
 use crate::upstream::find_backend_unified;
 
-use super::conn::{accept_packet, extract_dcid, timestamp_ns, QuicConn, QUIC_V1, SERVER_SCID_LEN};
+use super::conn::{
+    accept_packet, extract_dcid, timestamp_ns, CidKey, QuicConn, QUIC_V1, SERVER_SCID_LEN,
+};
 use super::crypto::TlsContext;
 use super::h3::{H3Conn, H3Event};
 
 // 大容量ボディの往復でバックエンドが詰まらないよう、有界だが十分な深さにする
 const REQ_CHAN_CAP: usize = 64;
 const RESP_CHAN_CAP: usize = 64;
+/// QUIC パケットスクラッチ容量（MTU 近傍）
+const PKT_CAP: usize = 1350;
 
-type ConnMap = Rc<RefCell<HashMap<Vec<u8>, Handler>>>;
+type ConnMap = Rc<RefCell<HashMap<CidKey, Handler>>>;
 /// NEW_CONNECTION_ID で発行された SCID → 初期 SCID（主キー）
-type CidAliasMap = Rc<RefCell<HashMap<Vec<u8>, Vec<u8>>>>;
+type CidAliasMap = Rc<RefCell<HashMap<CidKey, CidKey>>>;
+
+// ホットパス用: 送信パケットバッファのスレッドローカルプール
+thread_local! {
+    static PKT_BUF_POOL: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+}
+
+#[inline]
+fn pkt_buf_get() -> Vec<u8> {
+    PKT_BUF_POOL.with(|p| {
+        let mut pool = p.borrow_mut();
+        let mut v = pool.pop().unwrap_or_else(|| Vec::with_capacity(PKT_CAP));
+        v.clear();
+        if v.capacity() < PKT_CAP {
+            v.reserve(PKT_CAP);
+        }
+        v
+    })
+}
+
+#[inline]
+fn pkt_buf_put(mut v: Vec<u8>) {
+    v.clear();
+    if v.capacity() >= PKT_CAP && v.capacity() <= PKT_CAP * 2 {
+        PKT_BUF_POOL.with(|p| {
+            let mut pool = p.borrow_mut();
+            if pool.len() < 64 {
+                pool.push(v);
+            }
+        });
+    }
+}
 
 /// ストリーミングプロキシ状態（メインループ側）
 struct ProxyStream {
@@ -167,7 +202,8 @@ impl Handler {
                         pending_headers.push((stream_id, headers));
                     }
                     H3Event::Data { stream_id, data } => {
-                        pending_data.push((stream_id, data));
+                        // h3 側が Vec で渡す → Bytes 化（以降ゼロコピー共有）
+                        pending_data.push((stream_id, Bytes::from(data)));
                     }
                     H3Event::DataEnd { stream_id } => finished.push(stream_id),
                     H3Event::Reset { stream_id } => {
@@ -202,6 +238,7 @@ impl Handler {
                         }
                     }
                 }
+                // Buffer / Handled は下の match で処理
                 Classify::Buffer => {
                     self.headers.insert(sid, headers);
                 }
@@ -215,9 +252,12 @@ impl Handler {
 
         for (sid, data) in pending_data {
             if self.proxy_streams.contains_key(&sid) {
-                self.enqueue_req_body(sid, Bytes::from(data));
+                self.enqueue_req_body(sid, data);
             } else {
-                self.bodies.entry(sid).or_default().extend_from_slice(&data);
+                self.bodies
+                    .entry(sid)
+                    .or_default()
+                    .extend_from_slice(data.as_ref());
             }
         }
 
@@ -818,78 +858,92 @@ impl Handler {
                 } else {
                     base.as_ref().clone()
                 };
-                // ファイル応答はコールドパス: offload せず同期 read（イベントループは
-                // ファイル I/O の間ブロックしうるが、E2E の静的ファイルは小さい）。
-                #[allow(clippy::disallowed_methods)]
-                // 理由: 同期駆動イベントループ内の小ファイル配信
-                let file_res = std::fs::read(&file_path);
-                match file_res {
-                    Ok(mut data) => {
-                        let mut h = vec![
-                            (b":status".to_vec(), b"200".to_vec()),
-                            (
-                                b"content-type".to_vec(),
-                                mime_guess::from_path(&file_path)
-                                    .first_or_octet_stream()
-                                    .essence_str()
-                                    .as_bytes()
-                                    .to_vec(),
-                            ),
-                        ];
-                        if let Some(ae) = header_value(&headers, b"accept-encoding") {
-                            let enc = AcceptedEncoding::parse(ae);
-                            if !matches!(enc, AcceptedEncoding::Identity) {
-                                let comp = resolve_http3_compression_config(
-                                    &route_comp,
-                                    &cfg.http3_config,
-                                );
-                                if comp.enabled {
-                                    let compressed = compress_body_h3(&data, enc, &comp);
-                                    if compressed.len() < data.len() {
-                                        h.push((
-                                            b"content-encoding".to_vec(),
-                                            enc.as_header_value().to_vec(),
-                                        ));
-                                        data = compressed;
+                // 非同期: offload 経由の `runtime::io::read` を spawn し、イベントループを塞がない。
+                // 完了後は ProxyStream チャネル経由で HEADERS/DATA を投入（F-32 と同型）。
+                let ae = header_value(&headers, b"accept-encoding")
+                    .map(|v| v.to_vec())
+                    .unwrap_or_default();
+                let route_comp = (*route_comp).clone();
+                let http3_cfg = cfg.http3_config.clone();
+                let (resp_tx, resp_rx) = h3_stream::channel::<RespMsg>(RESP_CHAN_CAP);
+                let notify = self.notify.clone();
+                self.proxy_streams.insert(
+                    stream_id,
+                    ProxyStream {
+                        resp_rx,
+                        resp_started: false,
+                        head_pending: None,
+                        body_pending: None,
+                        need_fin: false,
+                        resp_fin_sent: false,
+                        req_tx: None,
+                        req_pending: VecDeque::new(),
+                        req_finished: true,
+                        inject_wasm_header: false,
+                    },
+                );
+                crate::runtime::spawn(async move {
+                    match crate::runtime::io::read(&file_path).await {
+                        Ok(mut data) => {
+                            let mime = mime_guess::from_path(&file_path)
+                                .first_or_octet_stream()
+                                .essence_str()
+                                .as_bytes()
+                                .to_vec();
+                            let mut headers: h3_stream::RespHeaders = Vec::with_capacity(4);
+                            headers.push((
+                                bytes::Bytes::from_static(b"content-type"),
+                                Bytes::from(mime),
+                            ));
+                            if !ae.is_empty() {
+                                let enc = AcceptedEncoding::parse(&ae);
+                                if !matches!(enc, AcceptedEncoding::Identity) {
+                                    let comp =
+                                        resolve_http3_compression_config(&route_comp, &http3_cfg);
+                                    if comp.enabled {
+                                        let compressed = compress_body_h3(&data, enc, &comp);
+                                        if compressed.len() < data.len() {
+                                            headers.push((
+                                                bytes::Bytes::from_static(b"content-encoding"),
+                                                Bytes::copy_from_slice(enc.as_header_value()),
+                                            ));
+                                            data = compressed;
+                                        }
                                     }
                                 }
                             }
+                            let mut cl = itoa::Buffer::new();
+                            let cl_s = cl.format(data.len()).as_bytes().to_vec();
+                            headers.push((
+                                bytes::Bytes::from_static(b"content-length"),
+                                Bytes::from(cl_s),
+                            ));
+                            let _ = resp_tx
+                                .send(RespMsg::Head {
+                                    status: 200,
+                                    headers,
+                                })
+                                .await;
+                            let _ = resp_tx.send(RespMsg::Body(Bytes::from(data))).await;
                         }
-                        h.push((
-                            b"content-length".to_vec(),
-                            data.len().to_string().into_bytes(),
-                        ));
-                        let blen = data.len() as u64;
-                        self.send_response(stream_id, h, data)?;
-                        log_access(
-                            method,
-                            authority,
-                            path,
-                            user_agent,
-                            content_length,
-                            200,
-                            blen,
-                            start,
-                            &self.client_ip,
-                            "",
-                        );
+                        Err(_) => {
+                            let _ = resp_tx.send(RespMsg::Error { status: 404 }).await;
+                        }
                     }
-                    Err(_) => {
-                        self.send_error(stream_id, 404, b"Not Found")?;
-                        log_access(
-                            method,
-                            authority,
-                            path,
-                            user_agent,
-                            content_length,
-                            404,
-                            9,
-                            start,
-                            &self.client_ip,
-                            "",
-                        );
-                    }
-                }
+                    notify.notify();
+                });
+                log_access(
+                    method,
+                    authority,
+                    path,
+                    user_agent,
+                    content_length,
+                    200,
+                    0,
+                    start,
+                    &self.client_ip,
+                    "",
+                );
             }
             Backend::Redirect(url, status, _preserve, _) => {
                 let h = vec![
@@ -947,23 +1001,41 @@ impl Handler {
         // 1 回の flush で無限にパケットを積まず、イベントループに戻って
         // ACK / MAX_STREAM_DATA を処理できるようにする（大容量ボディのデッドロック防止）。
         const MAX_PKTS_PER_FLUSH: usize = 32;
-        let mut pkts_this_flush = 0usize;
-        let mut h3_iters = 0usize;
         const MAX_H3_ITERS: usize = 64;
+        let mut pkts_this_flush = 0usize;
 
-        while h3_iters < MAX_H3_ITERS && pkts_this_flush < MAX_PKTS_PER_FLUSH {
-            h3_iters += 1;
+        for _ in 0..MAX_H3_ITERS {
+            if pkts_this_flush >= MAX_PKTS_PER_FLUSH {
+                break;
+            }
             let mut vecs = [nghttp3_vec {
                 base: ptr::null_mut(),
                 len: 0,
             }; 16];
-            let Some((sid, data, fin)) = ({
+
+            // 1) nghttp3 writev → 所有バッファへコピー（ポインタは次呼び出しで無効）
+            let (sid, fin, data) = {
                 let Some(h3) = self.h3.as_mut() else {
                     break;
                 };
                 match h3.write_stream(&mut vecs)? {
+                    None => break,
                     Some((sid, fin, nvec)) => {
-                        let mut data = Vec::new();
+                        let mut total = 0usize;
+                        for v in vecs.iter().take(nvec) {
+                            if !v.base.is_null() && v.len > 0 {
+                                total = total.saturating_add(v.len);
+                            }
+                        }
+                        let mut data = if total <= 2048 {
+                            // 小フレーム: 後でスタック相当の小さな Vec（プールから）
+                            let mut v = pkt_buf_get();
+                            v.clear();
+                            v.reserve(total.max(64));
+                            v
+                        } else {
+                            Vec::with_capacity(total)
+                        };
                         for v in vecs.iter().take(nvec) {
                             if !v.base.is_null() && v.len > 0 {
                                 data.extend_from_slice(unsafe {
@@ -971,15 +1043,11 @@ impl Handler {
                                 });
                             }
                         }
-                        Some((sid, data, fin))
+                        (sid, fin, data)
                     }
-                    None => None,
                 }
-            }) else {
-                break;
             };
 
-            // 空データかつ非 fin → 進まない（無限ループ防止）
             if data.is_empty() && !fin {
                 if let Some(h3) = self.h3.as_mut() {
                     let _ = h3.add_write_offset(sid, 0);
@@ -987,7 +1055,8 @@ impl Handler {
                 break;
             }
 
-            let mut off = 0;
+            // 2) QUIC へ載せる（H3 借用は解放済み）
+            let mut off = 0usize;
             let mut blocked = false;
             while off < data.len() || (fin && off == data.len()) {
                 if pkts_this_flush >= MAX_PKTS_PER_FLUSH {
@@ -1000,8 +1069,12 @@ impl Handler {
                     &[][..]
                 };
                 let is_fin = fin && off + chunk.len() >= data.len();
-                let mut buf = vec![0u8; 1350];
-                match self.quic.write_stream(&mut buf, sid, chunk, is_fin, ts) {
+                let mut buf = pkt_buf_get();
+                buf.resize(PKT_CAP, 0);
+                match self
+                    .quic
+                    .write_stream(buf.as_mut_slice(), sid, chunk, is_fin, ts)
+                {
                     Ok((pkt_len, accepted)) => {
                         if accepted > 0 {
                             off += accepted;
@@ -1010,8 +1083,11 @@ impl Handler {
                             }
                         }
                         if pkt_len > 0 {
-                            out_pkts.push((peer, buf[..pkt_len].to_vec()));
+                            buf.truncate(pkt_len);
+                            out_pkts.push((peer, buf));
                             pkts_this_flush += 1;
+                        } else {
+                            pkt_buf_put(buf);
                         }
                         if accepted == 0 && chunk.is_empty() {
                             if let Some(h3) = self.h3.as_mut() {
@@ -1029,28 +1105,36 @@ impl Handler {
                     }
                     Err(e) => {
                         warn!("[HTTP/3/ngtcp2] write_stream: {e}");
+                        pkt_buf_put(buf);
                         blocked = true;
                         break;
                     }
                 }
             }
-            if blocked {
-                break;
+            // data が小バッファ由来なら返却
+            if data.capacity() <= PKT_CAP * 2 {
+                pkt_buf_put(data);
             }
-            // writev で提示したのに 1 バイトも QUIC に渡せなかった → 次回
-            if off == 0 && !data.is_empty() {
+            if blocked || off == 0 {
                 break;
             }
         }
-        let mut pkt_iters = 0usize;
-        while pkt_iters < MAX_PKTS_PER_FLUSH {
-            pkt_iters += 1;
-            let mut buf = vec![0u8; 1350];
-            match self.quic.write_pkt(&mut buf, ts) {
-                Ok(0) => break,
-                Ok(n) => out_pkts.push((peer, buf[..n].to_vec())),
+
+        for _ in 0..MAX_PKTS_PER_FLUSH {
+            let mut buf = pkt_buf_get();
+            buf.resize(PKT_CAP, 0);
+            match self.quic.write_pkt(buf.as_mut_slice(), ts) {
+                Ok(0) => {
+                    pkt_buf_put(buf);
+                    break;
+                }
+                Ok(n) => {
+                    buf.truncate(n);
+                    out_pkts.push((peer, buf));
+                }
                 Err(e) => {
                     debug!("[HTTP/3/ngtcp2] write_pkt: {e}");
+                    pkt_buf_put(buf);
                     break;
                 }
             }
@@ -1201,7 +1285,7 @@ pub async fn run_http3_server_async(
                         let _ = h.quic.handle_expiry(now);
                     }
                     if h.quic.is_draining() || h.quic.is_closing() {
-                        dead.push(cid.clone());
+                        dead.push(*cid);
                     }
                 }
                 for c in &dead {
@@ -1238,7 +1322,8 @@ pub async fn run_http3_server_async(
                             &backend_spawner,
                         )?;
                         for pkt in immediate {
-                            let (_r, _) = socket.send_to(pkt, from).await;
+                            let (_r, returned) = socket.send_to(pkt, from).await;
+                            pkt_buf_put(returned);
                         }
                         off = end;
                     }
@@ -1255,7 +1340,8 @@ pub async fn run_http3_server_async(
                         &backend_spawner,
                     )?;
                     for pkt in immediate {
-                        let (_r, _) = socket.send_to(pkt, from).await;
+                        let (_r, returned) = socket.send_to(pkt, from).await;
+                        pkt_buf_put(returned);
                     }
                 }
             }
@@ -1272,14 +1358,14 @@ pub async fn run_http3_server_async(
         {
             let mut conns = connections.borrow_mut();
             let mut aliases = cid_aliases.borrow_mut();
-            let cids: Vec<Vec<u8>> = conns.keys().cloned().collect();
+            let cids: Vec<CidKey> = conns.keys().copied().collect();
             for primary in cids {
                 let Some(h) = conns.get_mut(&primary) else {
                     continue;
                 };
                 // NEW_CONNECTION_ID / RETIRE_CONNECTION_ID を ConnMap に反映
                 while let Some(scid) = h.quic.poll_new_scid() {
-                    aliases.insert(scid, primary.clone());
+                    aliases.insert(scid, primary);
                 }
                 while let Some(scid) = h.quic.poll_retired_scid() {
                     aliases.remove(&scid);
@@ -1296,7 +1382,8 @@ pub async fn run_http3_server_async(
         }
 
         for (to, pkt) in out_pkts {
-            let (_res, _) = socket.send_to(pkt, to).await;
+            let (_res, returned) = socket.send_to(pkt, to).await;
+            pkt_buf_put(returned);
         }
     }
     Ok(())
@@ -1327,24 +1414,34 @@ fn process_packet(
         }
         let ts = timestamp_ns();
         loop {
-            let mut buf = vec![0u8; 1350];
-            match h.quic.write_pkt(&mut buf, ts) {
-                Ok(0) => break,
-                Ok(n) => out.push(buf[..n].to_vec()),
-                Err(_) => break,
+            let mut buf = pkt_buf_get();
+            buf.resize(PKT_CAP, 0);
+            match h.quic.write_pkt(buf.as_mut_slice(), ts) {
+                Ok(0) => {
+                    pkt_buf_put(buf);
+                    break;
+                }
+                Ok(n) => {
+                    buf.truncate(n);
+                    out.push(buf);
+                }
+                Err(_) => {
+                    pkt_buf_put(buf);
+                    break;
+                }
             }
         }
     }
 
-    fn lookup_primary(dcid: &[u8], aliases: &CidAliasMap) -> Option<Vec<u8>> {
-        aliases.borrow().get(dcid).cloned()
+    fn lookup_primary(dcid: &CidKey, aliases: &CidAliasMap) -> Option<CidKey> {
+        aliases.borrow().get(dcid).copied()
     }
 
     if let Some(dcid) = extract_dcid(data) {
         let mut conns = connections.borrow_mut();
         // 主キー or エイリアス CID で検索
         let key = if conns.contains_key(&dcid) {
-            Some(dcid.clone())
+            Some(dcid)
         } else {
             lookup_primary(&dcid, cid_aliases)
         };
@@ -1356,7 +1453,7 @@ fn process_packet(
                     {
                         let mut aliases = cid_aliases.borrow_mut();
                         while let Some(scid) = h.quic.poll_new_scid() {
-                            aliases.insert(scid, key.clone());
+                            aliases.insert(scid, key);
                         }
                         while let Some(scid) = h.quic.poll_retired_scid() {
                             aliases.remove(&scid);
@@ -1377,7 +1474,7 @@ fn process_packet(
                 {
                     let mut aliases = cid_aliases.borrow_mut();
                     while let Some(scid) = h.quic.poll_new_scid() {
-                        aliases.insert(scid, primary.clone());
+                        aliases.insert(scid, *primary);
                     }
                     while let Some(scid) = h.quic.poll_retired_scid() {
                         aliases.remove(&scid);
@@ -1396,9 +1493,9 @@ fn process_packet(
         let _ = aws_lc_rs::rand::fill(&mut new_scid);
         let tls = tls_ctx.create_session()?;
         let quic = QuicConn::server_new(
-            &client_scid,
+            client_scid.as_slice(),
             &new_scid,
-            &client_dcid,
+            client_dcid.as_slice(),
             local,
             from,
             if version == 0 { QUIC_V1 } else { version },
@@ -1418,15 +1515,15 @@ fn process_packet(
             return Ok(out);
         }
         // 初回でも NEW_CONNECTION_ID が出ることがある
+        let primary = CidKey::from_slice(&new_scid);
         {
-            let primary = new_scid.to_vec();
             let mut aliases = cid_aliases.borrow_mut();
             while let Some(scid) = handler.quic.poll_new_scid() {
-                aliases.insert(scid, primary.clone());
+                aliases.insert(scid, primary);
             }
         }
         drain_writes(&mut handler, &mut out);
-        connections.borrow_mut().insert(new_scid.to_vec(), handler);
+        connections.borrow_mut().insert(primary, handler);
         return Ok(out);
     }
 
@@ -1436,7 +1533,7 @@ fn process_packet(
             {
                 let mut aliases = cid_aliases.borrow_mut();
                 while let Some(scid) = h.quic.poll_new_scid() {
-                    aliases.insert(scid, primary.clone());
+                    aliases.insert(scid, *primary);
                 }
                 while let Some(scid) = h.quic.poll_retired_scid() {
                     aliases.remove(&scid);

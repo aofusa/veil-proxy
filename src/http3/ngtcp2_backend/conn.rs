@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::os::raw::c_int;
 use std::ptr;
 
+use bytes::Bytes;
 use ngtcp2_sys::*;
 
 use super::crypto::TlsSession;
@@ -13,10 +14,35 @@ use super::crypto::TlsSession;
 /// QUIC v1
 pub const QUIC_V1: u32 = 0x0000_0001;
 
-/// 受信ストリーム断片
+/// 接続マップ用固定長 CID キー（ホットパスで `Vec<u8>` をキーにしない）
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CidKey {
+    len: u8,
+    data: [u8; NGTCP2_MAX_CIDLEN as usize],
+}
+
+impl CidKey {
+    #[inline]
+    pub fn from_slice(s: &[u8]) -> Self {
+        let mut data = [0u8; NGTCP2_MAX_CIDLEN as usize];
+        let len = s.len().min(NGTCP2_MAX_CIDLEN as usize);
+        data[..len].copy_from_slice(&s[..len]);
+        Self {
+            len: len as u8,
+            data,
+        }
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data[..self.len as usize]
+    }
+}
+
+/// 受信ストリーム断片（FFI から 1 回コピー後は `Bytes` で共有）
 pub struct StreamData {
     pub stream_id: i64,
-    pub data: Vec<u8>,
+    pub data: Bytes,
     pub fin: bool,
 }
 
@@ -27,9 +53,9 @@ pub struct ConnRef {
 struct ConnUserData {
     stream_queue: VecDeque<StreamData>,
     /// get_new_connection_id で発行した SCID（ConnMap エイリアス登録用）
-    new_scids: VecDeque<Vec<u8>>,
+    new_scids: VecDeque<CidKey>,
     /// 退役した SCID
-    retired_scids: VecDeque<Vec<u8>>,
+    retired_scids: VecDeque<CidKey>,
 }
 
 /// サーバ側 QUIC 接続
@@ -371,12 +397,12 @@ impl QuicConn {
     }
 
     /// 新規発行 SCID を drain（ConnMap エイリアス登録用）
-    pub fn poll_new_scid(&mut self) -> Option<Vec<u8>> {
+    pub fn poll_new_scid(&mut self) -> Option<CidKey> {
         self.user_data.new_scids.pop_front()
     }
 
     /// 退役 SCID を drain（ConnMap から除去用）
-    pub fn poll_retired_scid(&mut self) -> Option<Vec<u8>> {
+    pub fn poll_retired_scid(&mut self) -> Option<CidKey> {
         self.user_data.retired_scids.pop_front()
     }
 
@@ -479,7 +505,8 @@ unsafe extern "C" fn get_new_connection_id_cb(
     }
     if !user_data.is_null() {
         let ud = &mut *(user_data as *mut ConnUserData);
-        ud.new_scids.push_back(cid_slice[..cidlen].to_vec());
+        ud.new_scids
+            .push_back(CidKey::from_slice(&cid_slice[..cidlen]));
     }
     0
 }
@@ -495,8 +522,8 @@ unsafe extern "C" fn remove_connection_id_cb(
     let ud = &mut *(user_data as *mut ConnUserData);
     let len = (*cid).datalen;
     let data_ptr = (*cid).data.as_ptr();
-    let bytes = std::slice::from_raw_parts(data_ptr, len).to_vec();
-    ud.retired_scids.push_back(bytes);
+    let slice = std::slice::from_raw_parts(data_ptr, len);
+    ud.retired_scids.push_back(CidKey::from_slice(slice));
     0
 }
 
@@ -515,9 +542,10 @@ unsafe extern "C" fn recv_stream_data_cb(
     }
     let ud = &mut *(user_data as *mut ConnUserData);
     let bytes = if datalen > 0 && !data.is_null() {
-        std::slice::from_raw_parts(data, datalen).to_vec()
+        // FFI バッファはコールバック後に無効 → 1 回だけコピーして Bytes 化
+        Bytes::copy_from_slice(std::slice::from_raw_parts(data, datalen))
     } else {
-        Vec::new()
+        Bytes::new()
     };
     let fin = (flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0;
     ud.stream_queue.push_back(StreamData {
@@ -529,14 +557,14 @@ unsafe extern "C" fn recv_stream_data_cb(
 }
 
 /// 初期パケットの Destination CID 等をデコード
-pub fn accept_packet(pkt: &[u8]) -> Option<(u32, Vec<u8>, Vec<u8>)> {
+pub fn accept_packet(pkt: &[u8]) -> Option<(u32, CidKey, CidKey)> {
     let mut hd: ngtcp2_pkt_hd = unsafe { std::mem::zeroed() };
     let rv = unsafe { ngtcp2_accept(&mut hd, pkt.as_ptr(), pkt.len()) };
     if rv != 0 {
         return None;
     }
-    let dcid = hd.dcid.data[..hd.dcid.datalen].to_vec();
-    let scid = hd.scid.data[..hd.scid.datalen].to_vec();
+    let dcid = CidKey::from_slice(&hd.dcid.data[..hd.dcid.datalen]);
+    let scid = CidKey::from_slice(&hd.scid.data[..hd.scid.datalen]);
     Some((hd.version, dcid, scid))
 }
 
@@ -546,7 +574,7 @@ pub const SERVER_SCID_LEN: usize = 16;
 /// 任意パケットから DCID を取り出す（接続ルックアップ用）
 ///
 /// Short header は DCID 長をワイヤに持たないため、サーバ SCID 長を既知として渡す。
-pub fn extract_dcid(pkt: &[u8]) -> Option<Vec<u8>> {
+pub fn extract_dcid(pkt: &[u8]) -> Option<CidKey> {
     if pkt.is_empty() {
         return None;
     }
@@ -554,13 +582,13 @@ pub fn extract_dcid(pkt: &[u8]) -> Option<Vec<u8>> {
     // long header を先に試す（Initial 等）
     let rv = unsafe { ngtcp2_pkt_decode_hd_long(&mut hd, pkt.as_ptr(), pkt.len()) };
     if rv >= 0 {
-        return Some(hd.dcid.data[..hd.dcid.datalen].to_vec());
+        return Some(CidKey::from_slice(&hd.dcid.data[..hd.dcid.datalen]));
     }
     // short header: サーバ SCID 長で DCID を切る
     let rv =
         unsafe { ngtcp2_pkt_decode_hd_short(&mut hd, pkt.as_ptr(), pkt.len(), SERVER_SCID_LEN) };
     if rv >= 0 {
-        return Some(hd.dcid.data[..hd.dcid.datalen].to_vec());
+        return Some(CidKey::from_slice(&hd.dcid.data[..hd.dcid.datalen]));
     }
     None
 }
