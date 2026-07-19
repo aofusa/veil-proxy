@@ -6,7 +6,7 @@
 //!
 //! F-120: クロスプラットフォーム対応（Phase 1）向けに、target_os / feature の
 //! 組み合わせから `veil_rt_uring` / `veil_rt_reactor` / `veil_poller_epoll` /
-//! `veil_poller_kqueue` / `veil_ktls` の cfg エイリアスを発行する。判定が
+//! `veil_poller_kqueue` / `veil_ktls` / `veil_aio`(F-127) の cfg エイリアスを発行する。判定が
 //! 各所に散らばるのを防ぎ、`src/runtime/` 等はこれらのエイリアスのみを見ればよい。
 
 fn main() {
@@ -16,6 +16,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_OS");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_EPOLL");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_KTLS");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_AIO");
 
     emit_runtime_backend_cfg();
 
@@ -40,6 +41,7 @@ fn feature_enabled(name: &str) -> bool {
 /// | `veil_poller_kqueue` | `target_os = "freebsd"`、`"openbsd"`、`"macos"` | reactor の poller = kqueue |
 /// | `veil_poller_wsapoll` | `target_os = "windows"` | reactor の poller = WSAPoll（F-125、cfg 発行のみ。実装は別作業） |
 /// | `veil_ktls` | `feature = "ktls"` かつ (`target_os = "linux"` または `"freebsd"`) | kTLS カーネルオフロード経路（F-126: FreeBSD 対応追加。OpenBSD は非対応のまま） |
+/// | `veil_aio` | `feature = "aio"` かつ `target_os = "freebsd"` | POSIX AIO（`aio_read`/`aio_write` + `EVFILT_AIO`）による TCP read/write 経路（F-127。FreeBSD 専用、既定オフ） |
 ///
 /// `cargo::rustc-check-cfg` も併せて発行し、`unexpected_cfgs` 警告を防ぐ。
 fn emit_runtime_backend_cfg() {
@@ -50,10 +52,12 @@ fn emit_runtime_backend_cfg() {
     println!("cargo::rustc-check-cfg=cfg(veil_poller_kqueue)");
     println!("cargo::rustc-check-cfg=cfg(veil_poller_wsapoll)");
     println!("cargo::rustc-check-cfg=cfg(veil_ktls)");
+    println!("cargo::rustc-check-cfg=cfg(veil_aio)");
 
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let epoll = feature_enabled("EPOLL");
     let ktls = feature_enabled("KTLS");
+    let aio = feature_enabled("AIO");
 
     match target_os.as_str() {
         "linux" => {
@@ -104,6 +108,21 @@ fn emit_runtime_backend_cfg() {
 
     if ktls && (target_os == "linux" || target_os == "freebsd") {
         println!("cargo::rustc-cfg=veil_ktls");
+    }
+
+    // F-127: POSIX AIO(FreeBSD の aio_read/aio_write + EVFILT_AIO)は FreeBSD 専用。
+    // epoll/wsapoll と同様、対象外ターゲットで指定された場合は明確な panic とする
+    // (`--features aio` の誤用をビルド時に検出する)。
+    if aio {
+        if target_os == "freebsd" {
+            println!("cargo::rustc-cfg=veil_aio");
+        } else {
+            panic!(
+                "veil build.rs: --features aio is only meaningful on FreeBSD \
+                 (target_os = \"freebsd\"); on target_os = \"{target_os}\" POSIX AIO is not \
+                 available. Remove the aio feature for this target."
+            );
+        }
     }
 }
 

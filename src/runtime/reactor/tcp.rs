@@ -365,6 +365,11 @@ impl TcpStream {
     }
 
     /// バッファに非同期で読み込む。バッファの所有権を取り、完了時に `(Result<usize>, T)` を返す。
+    ///
+    /// `veil_aio`（F-127、FreeBSD `--features aio`）有効時は POSIX AIO（`aio_read` +
+    /// `EVFILT_AIO` 完了通知）経路を使う（`reactor::aio::AioReadFuture`）。無効時は
+    /// 現行の readiness（try-first `read(2)`）経路のまま、無改変・ゼロコストで動作する。
+    #[cfg(not(veil_aio))]
     pub fn read<T: IoBufMut>(&self, buf: T) -> ReadFuture<T> {
         ReadFuture {
             fd: self.fd,
@@ -372,12 +377,27 @@ impl TcpStream {
         }
     }
 
+    /// バッファに非同期で読み込む（AIO 版。上の `veil_aio` 節参照）。
+    #[cfg(veil_aio)]
+    pub fn read<T: IoBufMut>(&self, buf: T) -> super::aio::AioReadFuture<T> {
+        super::aio::AioReadFuture::new(self.fd, buf)
+    }
+
     /// バッファを非同期で書き込む。バッファの所有権を取り、完了時に `(Result<usize>, T)` を返す。
+    ///
+    /// `veil_aio` 有効時は POSIX AIO（`aio_write` + `EVFILT_AIO`）経路を使う。
+    #[cfg(not(veil_aio))]
     pub fn write<T: IoBuf>(&self, buf: T) -> WriteFuture<T> {
         WriteFuture {
             fd: self.fd,
             buf: Some(buf),
         }
+    }
+
+    /// バッファを非同期で書き込む（AIO 版。上の `veil_aio` 節参照）。
+    #[cfg(veil_aio)]
+    pub fn write<T: IoBuf>(&self, buf: T) -> super::aio::AioWriteFuture<T> {
+        super::aio::AioWriteFuture::new(self.fd, buf)
     }
 
     /// 2 つの不連続バッファを 1 回の `sendmsg`（scatter-gather）で書き込む（F-59 互換）。
@@ -508,6 +528,7 @@ impl TcpStream {
 // ====================
 
 impl crate::runtime::io::AsyncReadRent for TcpStream {
+    #[cfg(not(veil_aio))]
     fn read<T: crate::runtime::buf::IoBufMut>(
         &mut self,
         buf: T,
@@ -515,15 +536,32 @@ impl crate::runtime::io::AsyncReadRent for TcpStream {
         let fd = self.fd;
         ReadFuture { fd, buf: Some(buf) }
     }
+
+    #[cfg(veil_aio)]
+    fn read<T: crate::runtime::buf::IoBufMut>(
+        &mut self,
+        buf: T,
+    ) -> impl std::future::Future<Output = crate::runtime::io::BufResult<usize, T>> {
+        super::aio::AioReadFuture::new(self.fd, buf)
+    }
 }
 
 impl crate::runtime::io::AsyncWriteRent for TcpStream {
+    #[cfg(not(veil_aio))]
     fn write<T: crate::runtime::buf::IoBuf>(
         &mut self,
         buf: T,
     ) -> impl std::future::Future<Output = crate::runtime::io::BufResult<usize, T>> {
         let fd = self.fd;
         WriteFuture { fd, buf: Some(buf) }
+    }
+
+    #[cfg(veil_aio)]
+    fn write<T: crate::runtime::buf::IoBuf>(
+        &mut self,
+        buf: T,
+    ) -> impl std::future::Future<Output = crate::runtime::io::BufResult<usize, T>> {
+        super::aio::AioWriteFuture::new(self.fd, buf)
     }
 
     fn shutdown(&mut self) -> impl std::future::Future<Output = std::io::Result<()>> {

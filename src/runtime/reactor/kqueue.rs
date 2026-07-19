@@ -46,6 +46,13 @@ impl KqueuePoller {
         Ok(Self { kq })
     }
 
+    /// 生の kq fd を取得する（F-127 AIO の `SIGEV_KEVENT` 通知先設定に使う。
+    /// AIO 経路のみが必要とするため `veil_aio` でガードする）。
+    #[cfg(veil_aio)]
+    pub(crate) fn raw_fd(&self) -> RawFd {
+        self.kq
+    }
+
     /// fd の interest ビット（`READ`/`WRITE` の組み合わせ）を oneshot で（再）登録する。
     ///
     /// 立っているビットは `EV_ADD|EV_ONESHOT` で登録し、立っていないビットのうち

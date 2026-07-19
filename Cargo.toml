@@ -59,6 +59,13 @@ http3 = ["dep:quiche", "dep:aws-lc-sys"]
 # ビルド方法: cargo build --features epoll
 epoll = []
 
+# FreeBSD 専用: POSIX AIO（aio_read/aio_write + EVFILT_AIO）による TCP read/write
+# 完了通知ベース経路（F-127）。既定オフ。FreeBSD 以外で指定すると build.rs が panic する
+# （epoll feature の非対応ターゲット扱いと同様）。既存の kqueue readiness 経路は
+# このフィーチャー未指定時そのまま維持される（オプトイン、ゼロコスト）。
+# ビルド方法（FreeBSD のみ）: cargo build --features aio
+aio = []
+
 # WASM Extension サポート (Proxy-Wasm v0.2.1)
 # Wasmtime ランタイムによる WebAssembly フィルタ
 # AOT コンパイル、Pooling Allocator、InstancePre 使用

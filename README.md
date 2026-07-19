@@ -94,7 +94,7 @@ hot-path cost). The default is unchanged (Linux io_uring).
 |----------|-----------------|-----------------|------|-------|
 | **Linux (default)** | io_uring (`src/runtime/uring/`) | seccomp + Landlock + CBPF | ✅ (Linux 5.15+) | Default features unchanged; performance non-regressed |
 | **Linux `--features epoll`** | epoll readiness reactor (`src/runtime/reactor/`) | seccomp (epoll syscalls; io_uring syscalls dropped) + Landlock | ✅ | Fallback for hosts without io_uring |
-| **FreeBSD (x86_64/aarch64)** | kqueue readiness reactor | capsicum (`cap_rights_limit` / `cap_enter`) + jail | ✅ (FreeBSD 13.0+, `TCP_TXTLS_ENABLE`/`TCP_RXTLS_ENABLE`; F-126) | `[security] enable_capsicum`, `capsicum_capability_mode`, `jail_name` |
+| **FreeBSD (x86_64/aarch64)** | kqueue readiness reactor (optionally POSIX AIO with `--features aio`, F-127) | capsicum (`cap_rights_limit` / `cap_enter`) + jail | ✅ (FreeBSD 13.0+, `TCP_TXTLS_ENABLE`/`TCP_RXTLS_ENABLE`; F-126) | `[security] enable_capsicum`, `capsicum_capability_mode`, `jail_name` |
 | **OpenBSD (x86_64/aarch64)** | kqueue readiness reactor | pledge + unveil | ✗ (userspace rustls) | `[security] enable_pledge`, `enable_unveil`. TLS uses the **ring** rustls provider (aws-lc-rs can't complete handshakes on OpenBSD; F-122). HTTPS static/proxy serving verified 200 |
 | **macOS (x86_64/aarch64, universal2)** | kqueue readiness reactor (reused from FreeBSD/OpenBSD) | `sandbox_init` (Seatbelt) | ✗ (userspace rustls) | `[security] enable_sandbox_macos`. TLS uses the **ring** rustls provider (aws-lc-sys can't cross-link under zig; F-125). Cross-built with `cargo zigbuild --target universal2-apple-darwin`; QEMU/real-hardware testing not performed — see caveats below |
 
@@ -107,6 +107,14 @@ hot-path cost). The default is unchanged (Linux io_uring).
   (QEMU user-mode verified; QEMU lacks io_uring, so QEMU runs use the `epoll` build).
 - FreeBSD/OpenBSD are built natively inside a matching VM (Rust Tier 2/3; cross-build not
   supported). See `packaging/scripts/build-bsd.sh` for tar.gz packaging with rc.d/jail.conf.
+- **FreeBSD POSIX AIO (`--features aio`, F-127)**: opt-in build-time switch (FreeBSD only;
+  build.rs panics on other targets, same pattern as `epoll`). Replaces the default kqueue
+  readiness `TcpStream::read`/`write` with `aio_read(2)`/`aio_write(2)` completion-based I/O,
+  with completions delivered through the same kqueue loop via `EVFILT_AIO`
+  (`aio_sigevent.sigev_notify = SIGEV_KEVENT`). Falls back to the readiness path per-call on
+  `EAGAIN` (AIO daemon pool/queue limits). Not part of `--features full`; see
+  `docs/backlog/features/F-127-freebsd-aio.md` and
+  `docs/artifacts/f127_freebsd_aio_design.md` for the design and verification notes.
 - **macOS (F-125)**: cross-built only, via Docker (`messense/cargo-zigbuild`) — see
   `packaging/scripts/build-cross.sh --target macos`. macOS lacks
   `accept4`/`MSG_NOSIGNAL`/`pipe2`/`SOCK_NONBLOCK|SOCK_CLOEXEC`; `reactor/tcp.rs` and

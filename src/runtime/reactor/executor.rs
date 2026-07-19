@@ -67,6 +67,14 @@ pub fn has_driver() -> bool {
     POLLER.with(|p| p.borrow().is_some())
 }
 
+/// このスレッドの kqueue fd を取得する（F-127 AIO の `SIGEV_KEVENT` 通知先設定に使う）。
+/// reactor 未初期化のスレッド（単体テスト等）では `None` を返し、呼び出し側
+/// （`reactor::aio`）は readiness フォールバックへ切り替える。
+#[cfg(veil_aio)]
+pub(crate) fn current_kqueue_fd() -> Option<RawFd> {
+    POLLER.with(|p| p.borrow().as_ref().map(|poller| poller.raw_fd()))
+}
+
 #[cfg(veil_poller_epoll)]
 fn with_poller<R>(f: impl FnOnce(&EpollPoller) -> R) -> R {
     POLLER.with(|p| {
@@ -355,6 +363,16 @@ fn park(timeout_ms: i32) {
         EVENT_BUF.with(|buf| {
             let buf = buf.borrow();
             for ev in buf.iter().take(n) {
+                // F-127: AIO 完了通知（`SIGEV_KEVENT`）は `EVFILT_AIO` として届く。
+                // `ident` は aiocb ポインタ（本実装では未使用）、`udata` に
+                // `aio_sigevent.sigev_value` で埋め込んだ op token が入る
+                // （`reactor::aio` 参照）。`veil_aio` 未設定時はこの分岐自体が
+                // 存在せず、既存の READ/WRITE 分岐のみがコンパイルされる。
+                #[cfg(veil_aio)]
+                if ev.filter == libc::EVFILT_AIO {
+                    super::aio::handle_completion(ev.udata as u64);
+                    continue;
+                }
                 let fd = ev.ident as RawFd;
                 // EVFILT_READ/EVFILT_WRITE はフィルタごとに独立したイベントとして届く
                 // （epoll のように 1 fd 1 イベントへ両方向がまとめられない）ため、
