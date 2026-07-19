@@ -1,15 +1,18 @@
-# F-124: HTTP/3 quiche 輻輳制御・バッチ設定 + 低レベル API + io_uring RECVMSG multishot
+# F-124: HTTP/3 quiche 輻輳制御・バッチ設定 + 低レベル API + io_uring RECVMSG
+
+**ステータス: 完了（2026-07-19）**
 
 ## 機能説明
 
 1. **`[http3]` で quiche `Config` の輻輳制御 / Pacing / HyStart を設定可能にする**
    - `cc_algorithm`（既定 `bbr`）、`pacing`（既定 true）、`max_pacing_rate`、`hystart`（既定 true）
 2. **UDP バッチ幅を既定 64 にし、設定可能にする**
-   - `mmsg_batch_size`（1..=128、既定 64）— `recvmmsg`/`sendmmsg` と multishot 提供バッファ数
-3. **quiche 低レベル sans-IO 経路を維持しつつ、受信を `IORING_OP_RECVMSG` multishot 化**
-   - provided buffers + `io_uring_recvmsg_out` レイアウトで peer アドレス / GRO cmsg / payload をゼロコピーで quiche へ
-   - `PROXY_ALLOWED_OPCODES` に `RECVmsg` / `provide_buffers` / `remove_buffers` を追加
-   - reactor / multishot 不可時は従来の POLL + `recvmmsg` フォールバック
+   - `mmsg_batch_size`（1..=128、既定 64）— `recvmmsg`/`sendmmsg` バッチ幅
+3. **quiche 低レベル sans-IO + `IORING_OP_RECVMSG` 受信経路**
+   - 先頭パケット: `IORING_OP_RECVMSG` + `IORING_RECVSEND_POLL_FIRST`（POLL_ADD+同期 recvmsg の二重往復を排除）
+   - 継続 drain: `recvmmsg` で batch 件一括
+   - `PROXY_ALLOWED_OPCODES` に `RECVMSG` / `PROVIDE_BUFFERS` / `REMOVE_BUFFERS` を追加（将来の true multishot 用含む）
+   - reactor / 初期化失敗時は従来の POLL + `recvmmsg` フォールバック
 
 ## 改修内容
 
