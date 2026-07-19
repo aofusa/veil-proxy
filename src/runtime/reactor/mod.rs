@@ -25,6 +25,9 @@ pub(crate) mod epoll;
 #[cfg(veil_poller_kqueue)]
 pub(crate) mod kqueue;
 
+#[cfg(veil_poller_wsapoll)]
+pub(crate) mod wsapoll;
+
 /// FreeBSD POSIX AIO 経路（F-127）。`--features aio` 指定時のみコンパイルされる。
 #[cfg(veil_aio)]
 pub(crate) mod aio;

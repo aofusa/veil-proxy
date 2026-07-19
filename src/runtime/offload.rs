@@ -22,9 +22,10 @@
 
 use std::cell::Cell;
 use std::collections::VecDeque;
-use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+
+use crate::runtime::handle::RawFd;
 
 use once_cell::sync::Lazy;
 
@@ -127,7 +128,7 @@ fn current_thread_notify_fds() -> Option<(RawFd, RawFd)> {
             cell.set((fds[0], fds[1]));
             Some((fds[0], fds[1]))
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
             let mut fds = [0 as RawFd; 2];
             let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
@@ -137,7 +138,56 @@ fn current_thread_notify_fds() -> Option<(RawFd, RawFd)> {
             cell.set((fds[0], fds[1]));
             Some((fds[0], fds[1]))
         }
+        // Windows には eventfd/pipe2 相当が無いため、ループバック TCP ソケットペアで
+        // 自己パイプ相当を実装する（F-125 設計ドキュメント参照）。読み取り fd/書き込み fd
+        // は別ソケット（accept 側/connect 側）になる。
+        #[cfg(windows)]
+        {
+            let (r, w) = windows_notify_pair()?;
+            cell.set((r, w));
+            Some((r, w))
+        }
     })
+}
+
+/// Windows 版の自己パイプ相当（ループバック TCP ソケットペア）を生成する。
+///
+/// `127.0.0.1` にバインドした一時リスナーへ即座に接続し、accept 側を読み取り fd、
+/// connect 側を書き込み fd として使う。生成はスレッド初回オフロード時のみのコールド
+/// パスのため、ブロッキング呼び出し（bind/listen/connect/accept）を使って単純化する
+/// （生成後は両ソケットとも非ブロッキングへ切り替える）。
+#[cfg(windows)]
+// 理由付き allow: スレッド初回オフロード時 1 回だけのコールドパス初期化（eventfd/pipe2
+// 生成の Windows 版代替）であり、リクエストごとのホットパスでは呼ばれない。
+#[allow(clippy::disallowed_methods)]
+fn windows_notify_pair() -> Option<(RawFd, RawFd)> {
+    use std::net::{TcpListener, TcpStream};
+
+    let listener = TcpListener::bind("127.0.0.1:0").ok()?;
+    let addr = listener.local_addr().ok()?;
+    let client = TcpStream::connect(addr).ok()?;
+    let (accepted, _) = listener.accept().ok()?;
+
+    // std の TcpStream/TcpListener は Drop で close するため、生ソケットの所有権を
+    // こちら側へ移した上で `into_raw_socket()` で取り出す（Drop による二重 close を防ぐ）。
+    use std::os::windows::io::IntoRawSocket;
+    let read_sock = accepted.into_raw_socket();
+    let write_sock = client.into_raw_socket();
+
+    let mut nonblocking: u32 = 1;
+    unsafe {
+        windows_sys::Win32::Networking::WinSock::ioctlsocket(
+            read_sock as windows_sys::Win32::Networking::WinSock::SOCKET,
+            windows_sys::Win32::Networking::WinSock::FIONBIO,
+            &mut nonblocking,
+        );
+        windows_sys::Win32::Networking::WinSock::ioctlsocket(
+            write_sock as windows_sys::Win32::Networking::WinSock::SOCKET,
+            windows_sys::Win32::Networking::WinSock::FIONBIO,
+            &mut nonblocking,
+        );
+    }
+    Some((read_sock as RawFd, write_sock as RawFd))
 }
 
 /// 通知 fd の完了シグナルをドレインする（best-effort）。
@@ -148,6 +198,7 @@ fn current_thread_notify_fds() -> Option<(RawFd, RawFd)> {
 /// を再検査するため正当性には影響しない。詳細は `OffloadWait::poll` のコメント参照）。
 /// ドレインを実行し、1 バイト以上読み取れたら `true` を返す。
 #[inline]
+#[cfg(not(windows))]
 fn drain_notify(read_fd: RawFd) -> bool {
     #[cfg(target_os = "linux")]
     let ret = {
@@ -162,12 +213,30 @@ fn drain_notify(read_fd: RawFd) -> bool {
     ret > 0
 }
 
+/// 通知シグナルをドレインする（Windows 版: ループバックソケットからの `recv`）。
+#[inline]
+#[cfg(windows)]
+fn drain_notify(read_fd: RawFd) -> bool {
+    use crate::runtime::handle::win;
+    let mut buf = [0u8; 256];
+    let ret = unsafe {
+        windows_sys::Win32::Networking::WinSock::recv(
+            win::to_socket(read_fd),
+            buf.as_mut_ptr(),
+            buf.len() as i32,
+            0,
+        )
+    };
+    ret > 0
+}
+
 /// 完了通知を書き込む（ワーカースレッドから起点スレッドへ）。
 ///
 /// # Safety
 /// `write_fd` は呼び出し時点で有効な fd であること（起点スレッドが `offload()` 呼び出し中
 /// 保持し続けるため、ジョブ実行完了までクローズされない）。
 #[inline]
+#[cfg(not(windows))]
 unsafe fn signal_notify(write_fd: RawFd) {
     #[cfg(target_os = "linux")]
     {
@@ -179,6 +248,23 @@ unsafe fn signal_notify(write_fd: RawFd) {
         let val: u8 = 1;
         libc::write(write_fd, &val as *const u8 as *const libc::c_void, 1);
     }
+}
+
+/// 完了通知を書き込む（Windows 版: ループバックソケットへの `send`）。
+///
+/// # Safety
+/// `write_fd` は呼び出し時点で有効なソケットハンドルであること。
+#[inline]
+#[cfg(windows)]
+unsafe fn signal_notify(write_fd: RawFd) {
+    use crate::runtime::handle::win;
+    let val: u8 = 1;
+    windows_sys::Win32::Networking::WinSock::send(
+        win::to_socket(write_fd),
+        &val as *const u8,
+        1,
+        0,
+    );
 }
 
 /// ブロッキングなクロージャ `f` を専用スレッドで実行し、結果を非同期に受け取る。
@@ -268,13 +354,31 @@ where
                     return std::task::Poll::Ready(());
                 }
                 // try-first: 既に readable なら drain して他の待機者へ再配布する。
-                let mut pfd = libc::pollfd {
-                    fd: self.read_fd,
-                    events: libc::POLLIN,
-                    revents: 0,
+                #[cfg(not(windows))]
+                let now_readable = {
+                    let mut pfd = libc::pollfd {
+                        fd: self.read_fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
+                    ret > 0 && pfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0
                 };
-                let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
-                if ret > 0 && pfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
+                #[cfg(windows)]
+                let now_readable = {
+                    use crate::runtime::handle::win;
+                    use windows_sys::Win32::Networking::WinSock::{
+                        WSAPoll, POLLERR, POLLHUP, POLLRDNORM, WSAPOLLFD,
+                    };
+                    let mut pfd = WSAPOLLFD {
+                        fd: win::to_socket(self.read_fd),
+                        events: POLLRDNORM as i16,
+                        revents: 0,
+                    };
+                    let ret = unsafe { WSAPoll(&mut pfd, 1, 0) };
+                    ret > 0 && pfd.revents & ((POLLRDNORM | POLLERR | POLLHUP) as i16) != 0
+                };
+                if now_readable {
                     let drained = drain_notify(self.read_fd);
                     // (2) drain したシグナルは他タスク宛てかもしれない。全読者を起こして
                     // 各自の done を再確認させる（起こされた側は本 poll の (1) で観測する）。

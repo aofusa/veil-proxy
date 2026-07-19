@@ -14,11 +14,16 @@
 //!   （`unknown cpu architecture`）、`AWS_LC_SYS_NO_ASM` も release ビルドでは禁止される。
 //!   `ring` は cargo-zigbuild での apple-darwin クロスビルド実績があり、これを採用する。
 //!   macOS は kTLS・http3 とも非対応のため AWS-LC 共有の利点も無く、ring で完結する。
+//! - **Windows**（v0.6.0）: `ring`。aws-lc-sys のビルドは cmake + NASM を要求し、
+//!   `messense/cargo-xwin` コンテナには NASM が無いため `x86_64-pc-windows-msvc`
+//!   クロスビルドが通らない。Windows も kTLS・http3 非対応のため AWS-LC 共有の利点が
+//!   無く、macOS/OpenBSD と同じ ring 経路に合流させる。
 //!
 //! rustls の `aws_lc_rs` / `ring` は同一の公開 API（`default_provider()` /
 //! `ALL_CIPHER_SUITES` / `cipher_suite`）を持つモジュールのため、`pub use ... as`
 //! の別名再エクスポートで呼び出し側を単一化する。Cargo 側では target 別依存で
-//! 非 OpenBSD は `aws_lc_rs` のみ・OpenBSD は `ring` のみをリンクする（Linux ビルドは不変）。
+//! 非 OpenBSD/macOS/Windows は `aws_lc_rs` のみ・OpenBSD/macOS/Windows は `ring` のみを
+//! リンクする（Linux ビルドは不変）。
 //!
 //! kTLS 経路（`src/ktls.rs` / `src/ktls_rustls.rs` / `src/ktls_freebsd.rs`）は
 //! `veil_ktls`（Linux/FreeBSD 限定、F-126）でのみコンパイルされ AWS-LC 固有 API
@@ -28,9 +33,9 @@
 /// このプラットフォームで使う rustls 暗号プロバイダモジュール。
 ///
 /// `provider::default_provider()` / `provider::ALL_CIPHER_SUITES` の形で参照する。
-#[cfg(not(any(target_os = "openbsd", target_os = "macos")))]
+#[cfg(not(any(target_os = "openbsd", target_os = "macos", target_os = "windows")))]
 pub use rustls::crypto::aws_lc_rs as provider;
-#[cfg(any(target_os = "openbsd", target_os = "macos"))]
+#[cfg(any(target_os = "openbsd", target_os = "macos", target_os = "windows"))]
 pub use rustls::crypto::ring as provider;
 
 /// HTTP/3（quiche）の乱数生成に使う `SecureRandom` 実装。
@@ -39,8 +44,11 @@ pub use rustls::crypto::ring as provider;
 /// （どちらも `rustls`/`quiche` とは独立した RNG API）。http3 feature 有効時のみ使用。
 #[cfg(all(
     feature = "http3",
-    not(any(target_os = "openbsd", target_os = "macos"))
+    not(any(target_os = "openbsd", target_os = "macos", target_os = "windows"))
 ))]
 pub use aws_lc_rs::rand::{SecureRandom, SystemRandom};
-#[cfg(all(feature = "http3", any(target_os = "openbsd", target_os = "macos")))]
+#[cfg(all(
+    feature = "http3",
+    any(target_os = "openbsd", target_os = "macos", target_os = "windows")
+))]
 pub use ring::rand::{SecureRandom, SystemRandom};

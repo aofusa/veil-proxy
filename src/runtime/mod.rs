@@ -30,6 +30,11 @@
 //! （Phase 2。poller は現状 epoll のみ、kqueue は Phase 4 で追加予定）。
 
 pub mod buf;
+/// クロスプラットフォームな FD/ソケットハンドル型（F-125、Windows 対応）。
+///
+/// `pub`（`pub(crate)` ではない）にする理由は `handle.rs` のモジュール doc 参照
+/// （`private_bounds`/`private_interfaces` lint 回避）。
+pub mod handle;
 pub mod io;
 pub mod offload;
 // L4 UDP プロキシ専用の汎用 UDP ソケット（F-124）。`l4-proxy` feature でのみ使用するため

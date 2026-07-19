@@ -2193,13 +2193,14 @@ where
     }
 }
 
-impl<S: std::os::fd::AsRawFd> Http2Connection<S> {
-    /// 基盤ストリームの生ファイルディスクリプタを取得する（F-116）。
+impl<S: crate::runtime::handle::AsRawFd> Http2Connection<S> {
+    /// 基盤ストリームの生ファイルディスクリプタ（Windows はソケットハンドル）を取得する
+    /// （F-116）。
     ///
     /// HTTP/2 多重化メインループが `wait_readable_fd`（`POLL_ADD`）でソケット可読を
     /// 待機するために使う（`ReadFuture` の drop は既読データを破棄するため、
     /// `read` と notify の `select` は禁止。データ転送を伴わない POLL_ADD で待つ）。
-    pub fn raw_fd(&self) -> std::os::fd::RawFd {
+    pub fn raw_fd(&self) -> crate::runtime::handle::RawFd {
         self.stream.as_raw_fd()
     }
 }

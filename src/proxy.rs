@@ -28,8 +28,7 @@ use crate::logging::*;
 use crate::metrics::*;
 use crate::pool::*;
 use crate::upstream::*;
-#[cfg(unix)]
-use std::os::unix::io::{AsRawFd, RawFd};
+use crate::runtime::handle::{AsRawFd, RawFd};
 
 use crate::server::spawn_background_revalidation;
 
@@ -1889,7 +1888,10 @@ async fn connect_backend_with_retry(addr: &str) -> io::Result<TcpStream> {
                 let _ = stream.set_nodelay(true);
                 return Ok(stream);
             }
-            Ok(Err(e)) if e.raw_os_error() == Some(libc::EADDRNOTAVAIL) && attempt < 3 => {
+            // `ErrorKind::AddrNotAvailable` は Unix の `EADDRNOTAVAIL` / Windows の
+            // `WSAEADDRNOTAVAIL` の両方へ標準ライブラリがマップするため、raw errno 比較
+            // より移植性が高い（libc クレートは Windows 向けに errno 定数を定義しない）。
+            Ok(Err(e)) if e.kind() == io::ErrorKind::AddrNotAvailable && attempt < 3 => {
                 crate::runtime::timer::sleep(Duration::from_millis(BACKOFF_MS[attempt])).await;
                 attempt += 1;
             }
@@ -3756,6 +3758,9 @@ pub async fn detect_protocol_with_buffer(stream: &mut TcpStream) -> (ProtocolTyp
         }
 
         // 消費せずに覗き見る（毎回ソケットバッファの先頭から最大 24 バイト）。
+        // Windows には `MSG_DONTWAIT` が無いが、ソケット自体が非ブロッキングのため
+        // `MSG_PEEK` 単独で同等に動作する。
+        #[cfg(unix)]
         let ret = unsafe {
             libc::recv(
                 fd,
@@ -3764,9 +3769,26 @@ pub async fn detect_protocol_with_buffer(stream: &mut TcpStream) -> (ProtocolTyp
                 libc::MSG_PEEK | libc::MSG_DONTWAIT,
             )
         };
+        #[cfg(windows)]
+        let ret = unsafe {
+            windows_sys::Win32::Networking::WinSock::recv(
+                crate::runtime::handle::win::to_socket(fd),
+                peeked.as_mut_ptr(),
+                peeked.len() as i32,
+                windows_sys::Win32::Networking::WinSock::MSG_PEEK,
+            )
+        };
+        #[cfg(windows)]
+        let last_err = || {
+            io::Error::from_raw_os_error(unsafe {
+                windows_sys::Win32::Networking::WinSock::WSAGetLastError()
+            })
+        };
+        #[cfg(unix)]
+        let last_err = io::Error::last_os_error;
         if ret < 0 {
             // 偽の readable 通知（EAGAIN）なら再試行、その他はフォールバック。
-            if io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock {
+            if last_err().kind() == io::ErrorKind::WouldBlock {
                 continue;
             }
             break;

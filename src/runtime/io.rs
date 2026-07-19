@@ -197,7 +197,8 @@ impl File {
         self.inner.read_to_end(buf)
     }
 
-    /// オフセット位置から読み取る（pread 使用、コールドパスのみ）
+    /// オフセット位置から読み取る（Unix: `pread`、Windows: `seek_read`。コールドパスのみ）
+    #[cfg(unix)]
     pub async fn read_at<T: IoBufMut>(&self, mut buf: T, offset: u64) -> BufResult<usize, T> {
         use std::os::unix::io::AsRawFd;
         let fd = self.inner.as_raw_fd();
@@ -218,7 +219,26 @@ impl File {
         (Ok(ret as usize), buf)
     }
 
-    /// オフセット位置からバッファを全部読む（pread ループ）
+    /// オフセット位置から読み取る（Windows 版: `FileExt::seek_read`）。
+    #[cfg(windows)]
+    pub async fn read_at<T: IoBufMut>(&self, mut buf: T, offset: u64) -> BufResult<usize, T> {
+        use std::os::windows::fs::FileExt;
+        let slice = unsafe {
+            std::slice::from_raw_parts_mut(buf.write_ptr(), buf.bytes_total())
+        };
+        match self.inner.seek_read(slice, offset) {
+            Ok(n) => {
+                unsafe {
+                    buf.set_init(n);
+                }
+                (Ok(n), buf)
+            }
+            Err(e) => (Err(e), buf),
+        }
+    }
+
+    /// オフセット位置からバッファを全部読む（Unix: pread ループ）
+    #[cfg(unix)]
     pub async fn read_exact_at<T: IoBufMut>(&self, mut buf: T, offset: u64) -> BufResult<usize, T> {
         use std::os::unix::io::AsRawFd;
         let fd = self.inner.as_raw_fd();
@@ -246,11 +266,41 @@ impl File {
         }
         (Ok(read), buf)
     }
+
+    /// オフセット位置からバッファを全部読む（Windows 版: `seek_read` ループ）。
+    #[cfg(windows)]
+    pub async fn read_exact_at<T: IoBufMut>(&self, mut buf: T, offset: u64) -> BufResult<usize, T> {
+        use std::os::windows::fs::FileExt;
+        let total = buf.bytes_total();
+        let mut read = 0usize;
+        while read < total {
+            let slice = unsafe {
+                std::slice::from_raw_parts_mut(buf.write_ptr().add(read), total - read)
+            };
+            match self.inner.seek_read(slice, offset + read as u64) {
+                Ok(0) => break, // EOF
+                Ok(n) => read += n,
+                Err(e) => return (Err(e), buf),
+            }
+        }
+        unsafe {
+            buf.set_init(read);
+        }
+        (Ok(read), buf)
+    }
 }
 
+#[cfg(unix)]
 impl std::os::unix::io::AsRawFd for File {
     fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
         self.inner.as_raw_fd()
+    }
+}
+
+#[cfg(windows)]
+impl std::os::windows::io::AsRawHandle for File {
+    fn as_raw_handle(&self) -> std::os::windows::io::RawHandle {
+        std::os::windows::io::AsRawHandle::as_raw_handle(&self.inner)
     }
 }
 

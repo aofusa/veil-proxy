@@ -152,6 +152,7 @@ pub(crate) fn configure_huge_pages(enabled: bool) {
 /// 失敗時は warn ログを出して続行する（fail-open。権限がない環境でも起動は継続）。
 /// ワーカー起動・seccomp 適用より前のコールドパスで 1 回だけ呼ぶこと
 /// （`prlimit64` は seccomp 許可リストに含まれるが、起動時に完結させる）。
+#[cfg(unix)]
 pub fn raise_nofile_limit() {
     let mut lim = libc::rlimit {
         rlim_cur: 0,
@@ -187,6 +188,14 @@ pub fn raise_nofile_limit() {
         "raised RLIMIT_NOFILE soft: {} -> {}",
         old_soft, lim.rlim_cur
     );
+}
+
+/// Windows には `RLIMIT_NOFILE`/`getrlimit`/`setrlimit` に相当する概念が無い
+/// （ハンドル数上限はプロセス単位の固定値ではなく、システムリソースに応じて動的に
+/// 変化する）。呼び出し側の起動シーケンスを崩さないよう no-op として提供する。
+#[cfg(windows)]
+pub fn raise_nofile_limit() {
+    info!("RLIMIT_NOFILE: not applicable on Windows (no-op)");
 }
 
 // ====================
@@ -308,6 +317,7 @@ pub(crate) fn spawn_pooled_with_panic_catch<F>(
 ///
 /// `getpwnam(3)` は POSIX のため Linux/FreeBSD/OpenBSD 共通で使える（F-120 Phase 4 で
 /// Linux 限定 cfg を撤去）。
+#[cfg(unix)]
 pub(crate) fn get_uid_by_name(username: &str) -> Option<u32> {
     use std::ffi::CString;
 
@@ -324,6 +334,7 @@ pub(crate) fn get_uid_by_name(username: &str) -> Option<u32> {
 }
 
 /// グループ名からGIDを取得（POSIX、全対応 OS 共通）
+#[cfg(unix)]
 pub(crate) fn get_gid_by_name(groupname: &str) -> Option<u32> {
     use std::ffi::CString;
 
@@ -344,6 +355,7 @@ pub(crate) fn get_gid_by_name(groupname: &str) -> Option<u32> {
 /// グループ→ユーザーの順で降格する（逆順では失敗する可能性あり）。
 /// `setgid`/`setgroups`/`setuid` は POSIX のため Linux/FreeBSD/OpenBSD 共通で動作する
 /// （F-120 Phase 4 で Linux 限定 cfg とスタブを撤去）。
+#[cfg(unix)]
 pub(crate) fn drop_privileges(security: &crate::GlobalSecurityConfig) -> io::Result<()> {
     // rootでない場合は何もしない
     if unsafe { libc::getuid() } != 0 {
@@ -406,6 +418,20 @@ pub(crate) fn drop_privileges(security: &crate::GlobalSecurityConfig) -> io::Res
         }
     }
 
+    Ok(())
+}
+
+/// Windows には POSIX の uid/gid モデルが無いため、`drop_privileges_user`/
+/// `drop_privileges_group` 設定は無視して警告のみ出す（best-effort。実機検証不可のため
+/// 保守的に no-op とする。将来的には制限付きトークン/AppContainer での実装が課題）。
+#[cfg(windows)]
+pub(crate) fn drop_privileges(security: &crate::GlobalSecurityConfig) -> io::Result<()> {
+    if security.drop_privileges_user.is_some() || security.drop_privileges_group.is_some() {
+        warn!(
+            "drop_privileges_user/drop_privileges_group are not supported on Windows \
+             (no POSIX uid/gid model); ignoring"
+        );
+    }
     Ok(())
 }
 

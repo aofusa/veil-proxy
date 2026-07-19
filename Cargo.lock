@@ -3636,6 +3636,7 @@ dependencies = [
  "tonic-h3",
  "wasmtime",
  "webpki-roots",
+ "windows-sys 0.59.0",
  "xxhash-rust",
  "zstd",
 ]

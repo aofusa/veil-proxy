@@ -15,11 +15,12 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::Future;
-use std::os::unix::io::RawFd;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::time::Instant;
+
+use crate::runtime::handle::RawFd;
 
 use super::poller::{FdTable, Interest};
 
@@ -28,6 +29,9 @@ use super::epoll::{EpollPoller, ERR_HUP, READ, WRITE};
 
 #[cfg(veil_poller_kqueue)]
 use super::kqueue::{KqueuePoller, READ, WRITE};
+
+#[cfg(veil_poller_wsapoll)]
+use super::wsapoll::{WsaPollPoller, ERR_HUP, READ, WRITE};
 
 // ====================
 // reactor ドライバ（poller + fd テーブル）
@@ -38,6 +42,8 @@ thread_local! {
     static POLLER: RefCell<Option<EpollPoller>> = const { RefCell::new(None) };
     #[cfg(veil_poller_kqueue)]
     static POLLER: RefCell<Option<KqueuePoller>> = const { RefCell::new(None) };
+    #[cfg(veil_poller_wsapoll)]
+    static POLLER: RefCell<Option<WsaPollPoller>> = const { RefCell::new(None) };
     static FD_TABLE: RefCell<FdTable> = RefCell::new(FdTable::new());
 }
 
@@ -57,12 +63,20 @@ pub fn init_reactor() -> std::io::Result<()> {
     Ok(())
 }
 
+/// このスレッドの poller（WSAPoll インスタンス）を初期化する（Windows）。
+#[cfg(veil_poller_wsapoll)]
+pub fn init_reactor() -> std::io::Result<()> {
+    let poller = WsaPollPoller::new()?;
+    POLLER.with(|p| *p.borrow_mut() = Some(poller));
+    Ok(())
+}
+
 /// このスレッドに reactor ドライバ（poller）が初期化済みか判定する。
 ///
 /// `runtime::offload`（F-29）が、ドライバのあるワーカースレッドでは fd readiness
 /// ベースの非同期待機を、ドライバの無いコンテキスト（単体テスト等）では同期インライン
 /// 実行をするための分岐に使う（uring 版の `has_ring()` に相当）。
-#[cfg(any(veil_poller_epoll, veil_poller_kqueue))]
+#[cfg(any(veil_poller_epoll, veil_poller_kqueue, veil_poller_wsapoll))]
 pub fn has_driver() -> bool {
     POLLER.with(|p| p.borrow().is_some())
 }
@@ -98,13 +112,13 @@ fn with_poller<R>(f: impl FnOnce(&KqueuePoller) -> R) -> R {
 }
 
 /// fd の読み取り可能待ちを（再）登録する（oneshot）。
-#[cfg(any(veil_poller_epoll, veil_poller_kqueue))]
+#[cfg(any(veil_poller_epoll, veil_poller_kqueue, veil_poller_wsapoll))]
 pub(crate) fn register_read(fd: RawFd, waker: Waker) {
     register(fd, Interest::Read, waker);
 }
 
 /// fd の書き込み可能待ちを（再）登録する（oneshot）。
-#[cfg(any(veil_poller_epoll, veil_poller_kqueue))]
+#[cfg(any(veil_poller_epoll, veil_poller_kqueue, veil_poller_wsapoll))]
 pub(crate) fn register_write(fd: RawFd, waker: Waker) {
     register(fd, Interest::Write, waker);
 }
@@ -196,6 +210,31 @@ fn register(fd: RawFd, interest: Interest, waker: Waker) {
     }
 }
 
+/// fd の interest（READ/WRITE いずれか）を登録する（WSAPoll 版、Windows）。
+///
+/// `WSAPoll` はカーネル側に登録状態を持たない（`super::wsapoll` のドキュメント参照）ため、
+/// ここでは `FD_TABLE` の armed ビットと Waker キューを更新するのみで、poller への
+/// syscall は発行しない。実際の `WSAPoll` 呼び出しは次回の `park()` が `FD_TABLE` から
+/// 全 armed エントリを毎回組み立てて行う。
+#[cfg(veil_poller_wsapoll)]
+fn register(fd: RawFd, interest: Interest, waker: Waker) {
+    FD_TABLE.with(|t| {
+        let mut t = t.borrow_mut();
+        let rec = t.get_or_insert(fd);
+        let bit = match interest {
+            Interest::Read => {
+                rec.read_wakers.push(waker);
+                READ
+            }
+            Interest::Write => {
+                rec.write_wakers.push(waker);
+                WRITE
+            }
+        };
+        rec.armed |= bit;
+    });
+}
+
 /// fd の読み取り待機者 **全員** を起こす（readiness 通知の「横取り」再配布用）。
 ///
 /// 共有 fd（`runtime::offload` のスレッドごと eventfd）では、複数タスクが同一 fd の
@@ -269,6 +308,14 @@ pub(crate) fn unregister(fd: RawFd) {
             }
         });
     }
+}
+
+/// fd の登録を破棄する（WSAPoll 版、Windows）。
+///
+/// カーネル側に登録状態を持たないため `FD_TABLE` からエントリを除去するのみでよい。
+#[cfg(veil_poller_wsapoll)]
+pub(crate) fn unregister(fd: RawFd) {
+    let _ = FD_TABLE.try_with(|t| t.borrow_mut().remove(fd));
 }
 
 /// poller wait のイベントバッファ最大件数（事前確保しホットパスで再アロケーションしない）。
@@ -409,6 +456,81 @@ fn dispatch_event(fd: RawFd, flags: u32) {
             rec.armed &= !READ;
         }
         if flags & WRITE != 0 && !rec.write_wakers.is_empty() {
+            ww = std::mem::take(&mut rec.write_wakers);
+            rec.armed &= !WRITE;
+        }
+        (rw, ww)
+    });
+    for w in read_wakers {
+        w.wake();
+    }
+    for w in write_wakers {
+        w.wake();
+    }
+}
+
+#[cfg(veil_poller_wsapoll)]
+fn with_poller<R>(f: impl FnOnce(&WsaPollPoller) -> R) -> R {
+    POLLER.with(|p| {
+        let b = p.borrow();
+        let poller = b
+            .as_ref()
+            .expect("reactor poller not initialized for this thread");
+        f(poller)
+    })
+}
+
+/// WSAPoll バージョンの 1 回分の poller wait + イベント/タイマー処理（Windows）。
+///
+/// `FD_TABLE` から現在 armed な全エントリを毎回列挙して `WSAPoll` へ渡す
+/// （`super::wsapoll` のドキュメント参照。カーネル側に登録状態を持たないため
+/// epoll/kqueue のような差分登録ができない）。
+#[cfg(veil_poller_wsapoll)]
+fn park(timeout_ms: i32) {
+    thread_local! {
+        static EVENT_BUF: RefCell<Vec<(RawFd, u32)>> = RefCell::new(Vec::with_capacity(EVENT_BATCH));
+    }
+    let entries = FD_TABLE.with(|t| t.borrow().armed_entries());
+    let n = EVENT_BUF.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        match with_poller(|p| p.wait(&entries, &mut buf, timeout_ms)) {
+            Ok(n) => n,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::Interrupted {
+                    ftlog::error!("reactor: WSAPoll error: {}", e);
+                }
+                0
+            }
+        }
+    });
+    if n > 0 {
+        EVENT_BUF.with(|buf| {
+            let buf = buf.borrow();
+            for (fd, bits) in buf.iter() {
+                dispatch_event(*fd, *bits);
+            }
+        });
+    }
+    super::timer::fire_expired(Instant::now());
+}
+
+#[cfg(veil_poller_wsapoll)]
+fn dispatch_event(fd: RawFd, flags: u32) {
+    // WSAPoll はレベルトリガのため、次回 park() で armed なエントリのみ再度渡す形で
+    // oneshot 相当を表現する。ここでは発火した方向の armed ビットを落とし、対応する
+    // Waker を起こすのみでよい（次回の待機は register() による再武装で行われる）。
+    let (read_wakers, write_wakers) = FD_TABLE.with(|t| {
+        let mut t = t.borrow_mut();
+        let Some(rec) = t.get_mut(fd) else {
+            return (Vec::new(), Vec::new());
+        };
+        let mut rw = Vec::new();
+        let mut ww = Vec::new();
+        if flags & (READ | ERR_HUP) != 0 && !rec.read_wakers.is_empty() {
+            rw = std::mem::take(&mut rec.read_wakers);
+            rec.armed &= !READ;
+        }
+        if flags & (WRITE | ERR_HUP) != 0 && !rec.write_wakers.is_empty() {
             ww = std::mem::take(&mut rec.write_wakers);
             rec.armed &= !WRITE;
         }
@@ -660,9 +782,9 @@ impl Executor {
             }
 
             let timeout_ms = next_timeout_ms();
-            #[cfg(any(veil_poller_epoll, veil_poller_kqueue))]
+            #[cfg(any(veil_poller_epoll, veil_poller_kqueue, veil_poller_wsapoll))]
             park(timeout_ms);
-            #[cfg(not(any(veil_poller_epoll, veil_poller_kqueue)))]
+            #[cfg(not(any(veil_poller_epoll, veil_poller_kqueue, veil_poller_wsapoll)))]
             {
                 // veil_rt_reactor は必ずどちらかの poller cfg を伴う（build.rs）ため、
                 // ここへ到達することは cfg 上あり得ない。

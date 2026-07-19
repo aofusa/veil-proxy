@@ -808,7 +808,8 @@ pub struct KernelVersion {
 }
 
 impl KernelVersion {
-    /// 現在のカーネルバージョンを取得
+    /// 現在のカーネルバージョンを取得（Unix 版: `uname(2)`）
+    #[cfg(unix)]
     pub fn current() -> io::Result<Self> {
         let uname = nix::sys::utsname::uname().map_err(|e| io::Error::other(e.to_string()))?;
         let release = uname.release().to_string_lossy();
@@ -824,6 +825,22 @@ impl KernelVersion {
             major,
             minor,
             patch,
+        })
+    }
+
+    /// 現在の OS バージョンを取得（Windows 版）。
+    ///
+    /// `supports_uring_restrictions`/`supports_seccomp`/`supports_landlock` は
+    /// いずれも Linux 固有機能の可否判定のため、Windows では常に `false` を返せば十分
+    /// （呼び出し側 `apply_security_restrictions` はこれらの feature が有効な場合のみ
+    /// バージョンを参照し、Windows では該当 feature 自体を利用しない）。バージョン
+    /// 番号そのものは意味を持たないため `0.0.0` を返す。
+    #[cfg(windows)]
+    pub fn current() -> io::Result<Self> {
+        Ok(Self {
+            major: 0,
+            minor: 0,
+            patch: 0,
         })
     }
 

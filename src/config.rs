@@ -1297,6 +1297,21 @@ pub struct GlobalSecurityConfig {
     /// `crate::security::macos_sandbox` 参照）。
     #[serde(default)]
     pub enable_sandbox_macos: bool,
+
+    // ====================
+    // Windows: Job Object（v0.6.0/F-125）
+    // ====================
+    //
+    // 非対象 OS でもキー自体は受理し、未知キー拒否にはしない（capsicum/pledge/macOS
+    // sandbox と同じ方針）。適用時に警告ログを出して無視する。
+    /// Job Object によるプロセスリソース制限を有効化（Windows 専用、best-effort）。
+    ///
+    /// `CreateJobObjectW` + `SetInformationJobObject`（`JOBOBJECT_EXTENDED_LIMIT_INFORMATION`
+    /// の `JOB_OBJECT_LIMIT_ACTIVE_PROCESS`/`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 等）で
+    /// プロセスを制限し `AssignProcessToJobObject` する。実機検証ができないため保守的な
+    /// 最小構成（`crate::security::windows_security` 参照）。
+    #[serde(default)]
+    pub enable_job_object_windows: bool,
 }
 
 fn default_allow_security_failures() -> bool {

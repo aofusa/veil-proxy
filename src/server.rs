@@ -10,6 +10,9 @@ use ftlog::{debug, error, info, warn};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
+// Arc::clone は SIGHUP ハンドラ登録（Unix 専用）でのみ使う。Windows には SIGHUP が無い
+// ため未使用 import 警告になる。
+#[cfg(unix)]
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;

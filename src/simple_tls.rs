@@ -4,8 +4,9 @@
 //! monoio の AsyncReadRent/AsyncWriteRent を実装します.
 
 use std::io;
-use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
+
+use crate::runtime::handle::{AsRawFd, RawFd};
 
 use crate::runtime::buf::{IoBuf, IoBufMut};
 use crate::runtime::io::{IoVecBuf, IoVecBufMut};
@@ -30,6 +31,7 @@ pub enum TlsMode {
 // ====================
 
 #[inline]
+#[cfg(unix)]
 fn raw_read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     let result = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
     if result < 0 {
@@ -40,10 +42,55 @@ fn raw_read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
 }
 
 #[inline]
+#[cfg(unix)]
 fn raw_write(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
     let result = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
     if result < 0 {
         Err(io::Error::last_os_error())
+    } else {
+        Ok(result as usize)
+    }
+}
+
+/// Winsock 版の同期 recv（`WSAGetLastError()` を見る必要がある点が Unix 版と異なる）。
+#[inline]
+#[cfg(windows)]
+fn raw_read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
+    use crate::runtime::handle::win;
+    let result = unsafe {
+        windows_sys::Win32::Networking::WinSock::recv(
+            win::to_socket(fd),
+            buf.as_mut_ptr(),
+            buf.len() as i32,
+            0,
+        )
+    };
+    if result < 0 {
+        Err(io::Error::from_raw_os_error(unsafe {
+            windows_sys::Win32::Networking::WinSock::WSAGetLastError()
+        }))
+    } else {
+        Ok(result as usize)
+    }
+}
+
+/// Winsock 版の同期 send。
+#[inline]
+#[cfg(windows)]
+fn raw_write(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
+    use crate::runtime::handle::win;
+    let result = unsafe {
+        windows_sys::Win32::Networking::WinSock::send(
+            win::to_socket(fd),
+            buf.as_ptr(),
+            buf.len() as i32,
+            0,
+        )
+    };
+    if result < 0 {
+        Err(io::Error::from_raw_os_error(unsafe {
+            windows_sys::Win32::Networking::WinSock::WSAGetLastError()
+        }))
     } else {
         Ok(result as usize)
     }

@@ -10,6 +10,8 @@
 
 use std::task::Waker;
 
+use crate::runtime::handle::RawFd;
+
 /// 待機方向。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Interest {
@@ -64,11 +66,18 @@ pub(crate) struct FdRecord {
     pub known_to_kernel: bool,
 }
 
-/// fd 番号でインデックスする登録テーブル。
+/// fd 番号でインデックスする登録テーブル（Unix: `Vec` ベース）。
+///
+/// Windows は `RawFd`（`isize` に再解釈した `SOCKET`）が小さい連番であることを
+/// 保証されないため、同じ `Vec` インデックス方式を使うとハンドル値次第で巨大な
+/// アロケーションが発生し得る。そのため Windows のみ `HashMap` ベースの実装に
+/// 切り替える（公開 API・呼び出し側は不変。`veil_poller_wsapoll` 参照）。
+#[cfg(not(windows))]
 pub(crate) struct FdTable {
     slots: Vec<Option<FdRecord>>,
 }
 
+#[cfg(not(windows))]
 impl FdTable {
     /// 典型的な同時接続数を見込んで事前確保する（成長はコールドパスの償却のみ）。
     const PREALLOC: usize = 1024;
@@ -81,7 +90,7 @@ impl FdTable {
 
     /// fd スロットを確保する（未到達の index までベクタを伸長する。伸長はコールドパスの
     /// 償却のみで、定常状態の fd 番号レンジに収まればアロケーションは発生しない）。
-    fn ensure(&mut self, fd: i32) -> &mut Option<FdRecord> {
+    fn ensure(&mut self, fd: RawFd) -> &mut Option<FdRecord> {
         let idx = fd as usize;
         if idx >= self.slots.len() {
             self.slots.resize_with(idx + 1, || None);
@@ -90,12 +99,12 @@ impl FdTable {
     }
 
     /// fd のレコードを取得する（無ければ新規作成する）。
-    pub fn get_or_insert(&mut self, fd: i32) -> &mut FdRecord {
+    pub fn get_or_insert(&mut self, fd: RawFd) -> &mut FdRecord {
         self.ensure(fd).get_or_insert_with(FdRecord::default)
     }
 
     /// fd のレコードを取得する（存在しなければ `None`）。
-    pub fn get_mut(&mut self, fd: i32) -> Option<&mut FdRecord> {
+    pub fn get_mut(&mut self, fd: RawFd) -> Option<&mut FdRecord> {
         self.slots.get_mut(fd as usize).and_then(|s| s.as_mut())
     }
 
@@ -104,7 +113,51 @@ impl FdTable {
     /// ソケット/パイプの close 直前に必ず呼ぶこと。fd 番号は OS により即座に再利用される
     /// ため、呼ばないと新しい fd が古い Waker・armed 状態を誤って引き継ぐ（stale wake の
     /// 原因になる）。
-    pub fn remove(&mut self, fd: i32) -> Option<FdRecord> {
+    pub fn remove(&mut self, fd: RawFd) -> Option<FdRecord> {
         self.slots.get_mut(fd as usize).and_then(|s| s.take())
+    }
+}
+
+/// fd 番号でインデックスする登録テーブル（Windows: `HashMap` ベース）。
+///
+/// API は Unix 版（`Vec` ベース）と同一。ソケットハンドル値が小さい連番である
+/// 保証が無いため `HashMap` を使う。
+#[cfg(windows)]
+pub(crate) struct FdTable {
+    slots: std::collections::HashMap<RawFd, FdRecord>,
+}
+
+#[cfg(windows)]
+impl FdTable {
+    pub fn new() -> Self {
+        Self {
+            slots: std::collections::HashMap::new(),
+        }
+    }
+
+    /// fd のレコードを取得する（無ければ新規作成する）。
+    pub fn get_or_insert(&mut self, fd: RawFd) -> &mut FdRecord {
+        self.slots.entry(fd).or_default()
+    }
+
+    /// fd のレコードを取得する（存在しなければ `None`）。
+    pub fn get_mut(&mut self, fd: RawFd) -> Option<&mut FdRecord> {
+        self.slots.get_mut(&fd)
+    }
+
+    /// fd のレコードを破棄する。
+    pub fn remove(&mut self, fd: RawFd) -> Option<FdRecord> {
+        self.slots.remove(&fd)
+    }
+
+    /// 現在 armed（待機中）なエントリの `(fd, armed)` 一覧を返す（WSAPoll 用: poll
+    /// 対象配列は毎回このテーブルから構築するため、Vec ベース版と異なりカーネル側の
+    /// 監視対象リストを別途持たない）。
+    pub(crate) fn armed_entries(&self) -> Vec<(RawFd, u32)> {
+        self.slots
+            .iter()
+            .filter(|(_, rec)| rec.armed != 0)
+            .map(|(fd, rec)| (*fd, rec.armed))
+            .collect()
     }
 }
