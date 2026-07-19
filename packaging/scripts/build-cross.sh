@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
-# veil クロスプラットフォームバイナリ tar.gz パッケージング（F-125）
+# veil クロスプラットフォームバイナリ tar.gz/zip パッケージング（F-125）
 #
 # macOS（universal2-apple-darwin: x86_64 + aarch64 fat binary）を Docker
-# （messense/cargo-zigbuild）でクロスビルドし、単体バイナリ tar.gz を
+# （messense/cargo-zigbuild）で、Windows（x86_64-pc-windows-msvc）を Docker
+# （messense/cargo-xwin）でクロスビルドし、単体バイナリ tar.gz/zip を
 # packaging/output/ へ出力する。QEMU 実行・テストは行わない
 # （クロスビルドが通ることのみを検証する。ユーザ指示: docs/artifacts/f125_windows_macos_design.md）。
 #
 # 使い方:
 #   ./packaging/scripts/build-cross.sh --target macos
+#   ./packaging/scripts/build-cross.sh --target windows
 #
 # 環境変数:
 #   CARGO_FEATURES  ビルドする feature セット
-#                   （デフォルト: F-125 でクロスビルドが通ることを確認済みの最大セット。
-#                    http3/wasm は quiche/wasmtime の macOS クロス対応が未検証のため
-#                    既定では含めない。macOS の TLS 暗号は ring プロバイダを使う）
+#                   （デフォルト: それぞれのクロスビルドが通ることを確認済みの最大セット。
+#                    http3/wasm/ktls は除く。macOS/Windows の TLS 暗号は ring プロバイダを使う）
+#   XWIN_CACHE_DIR  windows ターゲットの xwin SDK キャッシュ（ホスト側ディレクトリ、
+#                   デフォルト: ~/.xwin-cache）
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,28 +30,36 @@ VERSION="$(awk -F'"' '/^version = / { print $2; exit }' "${ROOT}/Cargo.toml")"
 # 設計 docs/artifacts/f125_windows_macos_design.md 参照）。
 DEFAULT_MACOS_FEATURES="http2,mimalloc,compression,cache,metrics,websocket,rate-limit,buffering,admin,access-log,l4-proxy"
 
+# v0.6.0 で確認済みの Windows クロスビルド最大 feature セット（http3/wasm/ktls/l4-proxy 除く。
+# l4-proxy は runtime::udp が Unix ソケット API 前提のため今回は未対応。
+# 詳細は docs/artifacts/f125_windows_macos_design.md の Windows 節を参照）。
+DEFAULT_WINDOWS_FEATURES="http2,mimalloc,compression,cache,metrics,grpc,grpc-web,websocket,rate-limit,buffering,admin,access-log,opentelemetry"
+
 TARGET_OS=""
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") --target macos
+Usage: $(basename "$0") --target <macos|windows>
 
-Build a standalone veil binary tarball for a cross-compiled non-Linux
-target using Docker. Currently only 'macos' (universal2-apple-darwin,
-via messense/cargo-zigbuild) is supported (F-125). Windows cross-build
-(cargo-xwin) is a follow-up (F-125 tracks macOS only for the runtime
-implementation; Windows currently only gets build.rs cfg names).
+Build a standalone veil binary tarball/zip for a cross-compiled non-Linux
+target using Docker: 'macos' (universal2-apple-darwin, via
+messense/cargo-zigbuild) or 'windows' (x86_64-pc-windows-msvc, via
+messense/cargo-xwin).
 
 Options:
-  --target TARGET   Cross-build target: macos (required)
+  --target TARGET   Cross-build target: macos | windows (required)
   -h, --help        Show this help
 
 Environment:
   CARGO_FEATURES    Cargo features to build with
-                     (default: "${DEFAULT_MACOS_FEATURES}")
+                     (default: "${DEFAULT_MACOS_FEATURES}" for macos,
+                      "${DEFAULT_WINDOWS_FEATURES}" for windows)
+  XWIN_CACHE_DIR    Host directory used to cache the xwin Windows SDK
+                     (windows target only; default: ~/.xwin-cache)
 
 Output:
   packaging/output/veil-\${VERSION}-universal2-apple-darwin.tar.gz
+  packaging/output/veil-\${VERSION}-x86_64-pc-windows-msvc.zip
 EOF
 }
 
@@ -60,8 +71,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "${TARGET_OS}" != "macos" ]]; then
-    echo "ERROR: --target must be 'macos' (Windows cross-build is a follow-up)" >&2
+if [[ "${TARGET_OS}" != "macos" && "${TARGET_OS}" != "windows" ]]; then
+    echo "ERROR: --target must be 'macos' or 'windows'" >&2
     usage >&2
     exit 1
 fi
@@ -141,4 +152,79 @@ EOF
     echo "==> Created ${OUTPUT_DIR}/${archive_name}"
 }
 
-build_macos
+build_windows() {
+    local features="${CARGO_FEATURES:-${DEFAULT_WINDOWS_FEATURES}}"
+    local rust_target="x86_64-pc-windows-msvc"
+    local archive_name="veil-${VERSION}-${rust_target}.zip"
+    local xwin_cache="${XWIN_CACHE_DIR:-${HOME}/.xwin-cache}"
+
+    echo "==> Building veil binary for ${rust_target} in Docker (messense/cargo-xwin)"
+    echo "==> Features: ${features}"
+
+    mkdir -p "${xwin_cache}"
+
+    # Windows は rustls の暗号プロバイダに ring を使う（Cargo.toml の target 別依存）。
+    # aws-lc-sys のビルドは cmake + NASM を要求し、cargo-xwin コンテナに NASM が無いため
+    # クロスビルドが通らない（src/tls_provider.rs 参照）。Windows も kTLS/http3 非対応の
+    # ため AWS-LC 共有の利点が無く、macOS/OpenBSD と同じ ring 経路に合流させている。
+    # target/ をホストと共有する都合上、ホスト側の他の cargo ビルドと同時に走らせないこと
+    # （AGENTS.md 検証手順: 1 つずつ実行。target 競合を避けるため）。
+    docker run --rm \
+        -e XWIN_CACHE_DIR=/xwincache \
+        -v "${xwin_cache}:/xwincache" \
+        -v "${ROOT}:/io" \
+        -w /io \
+        messense/cargo-xwin \
+        cargo xwin build --release --target "${rust_target}" --no-default-features --features "${features}"
+
+    local binary_path="${ROOT}/target/${rust_target}/release/veil.exe"
+    if [[ ! -f "${binary_path}" ]]; then
+        echo "ERROR: expected binary not found: ${binary_path}" >&2
+        exit 1
+    fi
+
+    mkdir -p "${OUTPUT_DIR}"
+    local stage_parent="${BUILD_DIR}/zip-${rust_target}"
+    local dir_name="veil-${VERSION}-${rust_target}"
+    rm -rf "${stage_parent}"
+    mkdir -p "${stage_parent}/${dir_name}/www"
+
+    install -m 0755 "${binary_path}" "${stage_parent}/${dir_name}/veil.exe"
+    install -m 0644 "${ROOT}/contrib/config/config.toml" "${stage_parent}/${dir_name}/config.toml.default"
+    install -m 0644 "${ROOT}/docker/assets/www/index.html" "${stage_parent}/${dir_name}/www/index.html"
+
+    cat > "${stage_parent}/${dir_name}/INSTALL.txt" <<EOF
+veil ${VERSION} — ${rust_target}
+
+x86_64 Windows バイナリ（cargo-xwin クロスビルド）。
+QEMU/実機検証は行っていません（Docker クロスビルドが通ることのみ確認済み。
+docs/artifacts/f125_windows_macos_design.md の Windows 節）。
+
+インストール手順:
+
+  1. veil.exe を任意のディレクトリへコピー
+  2. config.toml.default を config.toml としてコピーし、必要に応じて編集
+  3. veil.exe --config config.toml を実行
+
+Windows ネイティブのセキュリティ（Job Object、best-effort）:
+  config.toml で [security] enable_job_object_windows = true を設定すると、
+  CreateJobObjectW + SetInformationJobObject でプロセスに最小限のリソース制限
+  （ACTIVE_PROCESS=1、KILL_ON_JOB_CLOSE）を適用します。seccomp/Landlock相当の
+  システムコールフィルタではなく、粗粒度のプロセス制限にとどまります
+  （実機検証不可のため保守的な最小構成）。
+
+含まれる feature: ${features}
+（http3/wasm/ktls/l4-proxy はこのビルドに含まれていません。aws-lc-sys が
+  cargo-xwin で NASM 不足によりビルドできない、または Unix ソケット API 前提の
+  実装が未移植のため。TLS 暗号は ring プロバイダを使用します）
+EOF
+
+    (cd "${stage_parent}" && zip -r "${OUTPUT_DIR}/${archive_name}" "${dir_name}" >/dev/null)
+    rm -rf "${stage_parent}"
+    echo "==> Created ${OUTPUT_DIR}/${archive_name}"
+}
+
+case "${TARGET_OS}" in
+    macos) build_macos ;;
+    windows) build_windows ;;
+esac

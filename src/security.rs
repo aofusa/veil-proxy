@@ -2869,6 +2869,93 @@ pub mod macos_sandbox {
     }
 }
 
+// ====================
+// Windows: Job Object（v0.6.0/F-125、best-effort）
+// ====================
+//
+// Windows には seccomp/Landlock/capsicum/pledge/sandbox_init に相当するシステムコール
+// フィルタリング機構が無い。代わりに Job Object（`CreateJobObjectW` +
+// `SetInformationJobObject`）でプロセス全体にリソース制限を課す。これはシステムコール
+// 単位のフィルタではなく、プロセス数・UI 操作・ジョブクローズ時の道連れ終了といった
+// 粗粒度の制限にとどまる（実機検証不可のため、意図的に保守的な最小構成とする）。
+//
+// # 設計判断
+//
+// - `JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 1`: 子プロセスを生成しない veil の実行モデルと
+//   一致する（fork/exec 相当を使わないため、誤って起動を妨げるリスクが低い）。
+// - `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`: プロセスが Job Object から外れる（ハンドルが
+//   閉じられる）際にプロセスも終了する。異常終了時の子プロセス/ハンドルリークを防ぐ。
+// - `JOBOBJECT_BASIC_UI_RESTRICTIONS`（`JOB_OBJECT_UILIMIT_HANDLES` 等）は今回は適用
+//   しない: リバースプロキシは対話 UI を持たないため通常は無害だが、コンソール
+//   ハンドル操作（Ctrl+C ハンドラ等）に予期せぬ干渉をする可能性があり、実機検証が
+//   できない現状では見送る（将来の課題）。
+// - メモリ/CPU の定量的な上限は設定ファイルに対応するキーが無いため設定しない
+//   （config.toml から導出できる値が無いまま固定値を入れると環境依存の誤動作が
+//   起きやすい）。
+#[cfg(windows)]
+pub mod windows_security {
+    use ftlog::info;
+    use std::io;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+        JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    /// 現在のプロセスに Job Object を割り当て、最小限のリソース制限を適用する。
+    ///
+    /// 呼び出しは起動シーケンスのコールドパスで 1 回だけ行うこと。失敗しても
+    /// プロセス自体は起動を継続できるよう、呼び出し側は `allow_security_failures`
+    /// 設定に従ってエラーの扱いを決める。
+    pub fn apply() -> io::Result<()> {
+        // SAFETY: `CreateJobObjectW` は NULL の security attributes / name を許容し
+        // （無名 Job Object を作成）、失敗時は NULL ハンドルを返す（GetLastError で
+        // 詳細取得可能）。
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if job.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        info.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        info.BasicLimitInformation.ActiveProcessLimit = 1;
+
+        // SAFETY: `info` はスタック上で完全に初期化済みの有効な構造体で、
+        // `SetInformationJobObject` はその内容を読み取るのみ。
+        let ret = unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const std::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if ret == 0 {
+            let e = io::Error::last_os_error();
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(job) };
+            return Err(e);
+        }
+
+        // SAFETY: `GetCurrentProcess()` は擬似ハンドル（常に有効、クローズ不要）。
+        let ret = unsafe { AssignProcessToJobObject(job, GetCurrentProcess()) };
+        if ret == 0 {
+            let e = io::Error::last_os_error();
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(job) };
+            return Err(e);
+        }
+
+        // Job Object ハンドル自体は意図的にリークする（プロセス生涯にわたり有効で
+        // あるべきため。プロセス終了時に OS がハンドルを回収する）。
+        info!(
+            "windows job object: applied (ACTIVE_PROCESS=1, KILL_ON_JOB_CLOSE) \
+             — best-effort, no syscall-level filtering equivalent to seccomp/Landlock"
+        );
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

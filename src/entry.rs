@@ -735,6 +735,25 @@ pub fn run() {
     if loaded_config.global_security.enable_sandbox_macos {
         warn!("enable_sandbox_macos is set but this build does not target macOS; ignoring");
     }
+    #[cfg(not(windows))]
+    if loaded_config.global_security.enable_job_object_windows {
+        warn!("enable_job_object_windows is set but this build does not target Windows; ignoring");
+    }
+    // Windows Job Object（best-effort、v0.6.0/F-125）: pledge/macOS sandbox と異なり
+    // listener bind のバリアを必要としない（プロセス数/道連れ終了の粗粒度制限のため、
+    // 早期に適用しても以降の bind/connect を妨げない）。起動直後のコールドパスで適用する。
+    #[cfg(windows)]
+    if loaded_config.global_security.enable_job_object_windows {
+        match crate::security::windows_security::apply() {
+            Ok(()) => {}
+            Err(e) => {
+                error!("windows job object: failed to apply: {}", e);
+                if !loaded_config.global_security.allow_security_failures {
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
 
     // 同時接続数制限
     let max_connections = loaded_config.global_security.max_concurrent_connections;
