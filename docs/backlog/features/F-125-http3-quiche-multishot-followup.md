@@ -1,9 +1,10 @@
-# F-125: HTTP/3 quiche / io_uring 受信の後続（F-124 引き継ぎ）
+# F-125: HTTP/3 quiche / io_uring 受信の後続 + UDP/HTTP3 極限 io_uring 化（F-124 引き継ぎ）
 
-**ステータス: 未着手（引き継ぎ用・2026-07-19 時点の現状固定）**  
+**ステータス: 未着手（引き継ぎ用・2026-07-19 時点の現状固定、§14 は同日追記）**  
 **優先度: P1**  
 **親・前提: [F-124](F-124-http3-quiche-cc-multishot.md)（完了・部分達成）**  
-**ブランチ参考: `feat/http3-quiche`（base 付近 `5b55ec8` から F-124 コミット群）**
+**ブランチ参考: `feat/http3-quiche`（base 付近 `5b55ec8` から F-124 コミット群）**  
+**ユーザー追加指示（2026-07-19）: UDP / HTTP/3 データプレーンを可能な限り io_uring 化し、極限パフォーマンスを突き詰める。調査と実装を本チケットの委譲範囲に含める。**
 
 ---
 
@@ -17,6 +18,7 @@
 4. **残りタスク**（必須 / 推奨 / 任意）と受け入れ条件
 5. **やってはいけないこと**（AGENTS.md ホットパス規則・feature 方針）
 6. 検証・perf の既存結果と注意点
+7. **UDP / HTTP/3 の io_uring 化は可能か**、現状どこまで io_uring か、**極限性能のための設計・実装フェーズ**（§14）
 
 **ビルドやテストは本チケット作成時点では実行不要**（委譲先が実装時に実施する）。
 
@@ -281,20 +283,33 @@ loop:
 4. **AGENTS.md** に HTTP/3 受信経路・`[http3]` 新キー・batch 既定 64 を追記。
 5. F-124 を「部分完了・受信は RECVMSG 単発+recvmmsg」と履歴として正確化（本 F-125 が後続）。
 
-### 方針 A/B 共通の推奨タスク
+### 方針 C — UDP / HTTP/3 データプレーンの極限 io_uring 化（**ユーザー明示の追加要求・最優先で調査・実装**）
+
+詳細は **§14**。要約:
+
+- **可能である**（受信・送信の completion 型 I/O、真 Multishot、送信 SENDMSG、固定バッファ等）。
+- quiche 本体の暗号化・ステートマシンは **ユーザー空間 CPU** のまま（「HTTP/3 処理全体をカーネルに載せる」は不可能）。極限性能は **syscall/CQE 往復とコピーの最小化 + CC/GSO** で詰める。
+- 方針 A は方針 C の **受信 half** と強く重複する。**方針 C を採る場合は A を内包**し、B の命名整理は C の完了後に行うか、C 実装と同時に命名を正す。
+- 実装は **フェーズ分割 + 各フェーズで perf A/B**（退行したら戻す）。AGENTS ホットパス規則を厳守。
+
+### 方針 A/B/C 共通の推奨タスク
 
 | ID | タスク | 優先 |
 |----|--------|------|
-| T1 | AGENTS.md 更新 | 高 |
+| T0 | **§14 の調査メモを実装前に短く確定**（採用する I/O 形態・kernel 前提・フォールバック） | 最高（ユーザー要求） |
+| T1 | AGENTS.md 更新（HTTP/3 受信経路・設定・io_uring 方針） | 高 |
 | T2 | F-124 / backlog 一行 / executor コメントの事実同期 | 高 |
 | T3 | tools/perf: 現行ソースで `veil:glibc`（必要なら musl）再ビルド → `CONFIG_GLOB='h2_1_feat_http3'`（ITERATIONS は環境に応じ 1〜3）→ `docs/perf` に結果メモ | 高（依頼にあった） |
 | T4 | E2E フレーク切り分け（`test_config_reload_adds_route_via_sighup` / large body） | 中 |
 | T5 | 単体テスト: RECVMSG 経路の配線・batch clamp・CC 名フォールバック | 中 |
 | T6 | reactor（epoll）ビルドで HTTP/3 が従来経路で通ること確認 | 中 |
+| T7 | **§14 フェーズ実装**（受信フル io_uring → 送信 io_uring → multishot/buffer ring → 固定バッファ等） | 最高（ユーザー要求） |
 
 ### 受け入れ条件（F-125 完了の定義）
 
-**方針 B を採る場合**（最小完了）:
+**方針 B のみ**を採る場合は最小完了だが、**ユーザーは方針 C（極限 io_uring 化）を明示要求している**ため、委譲先のデフォルト完了条件は **方針 C のフェーズ 1 以上 + ドキュメント整合** とする。B 単独完了はユーザーが「整理だけ」と指示した場合に限る。
+
+**方針 B を採る場合**（最小完了・整理のみ）:
 
 - [ ] 命名・コメント・AGENTS・F-124 記述が実装と一致
 - [ ] 未使用 multishot OpTable / 不要 opcode 許可の整理が完了（削除 or 正当な理由付き保持）
@@ -303,13 +318,24 @@ loop:
 - [ ] E2E（少なくとも HTTP/3 関連）が安定して通る
 - [ ] tools/perf 代表 1 本の結果を docs（perf または artifacts）に記録し、旧 ~835 との **同一条件**比較メモがある
 
-**方針 A を採る場合**（完全完了）:
+**方針 A を採る場合**（真 Multishot のみ）:
 
 - 上記に加え:
 - [ ] ホットパスで **実際に** `IORING_RECV_MULTISHOT`（+ provided buffers または buffer ring）が動作
 - [ ] multi-peer で peer アドレス誤りがない（E2E / 専用テスト）
 - [ ] ENOBUFS 時にイベントループをブロックせず回復
 - [ ] Docker GSO on/off・seccomp プロファイルで破綻しない
+
+**方針 C を採る場合**（ユーザー要求のデフォルト・極限 io_uring 化）— §14 参照:
+
+- [ ] §14.5 フェーズ 0 調査結果をチケット or `docs/artifacts/` に短く記録
+- [ ] **受信**: ホットパスで libc `recvmmsg` / `POLL_ADD`+同期 recv に依存しない（真 Multishot または pipelined `IORING_OP_RECVMSG` 複数 in-flight）。EAGAIN 待ち専用の POLL は「フォールバック」に限定
+- [ ] **送信**: ホットパスで libc `sendmmsg` に依存しない（`IORING_OP_SENDMSG` + GSO cmsg、必要なら複数 SQE）。writable 待ちは POLL または SENDMSG の非同期完了で扱う
+- [ ] quiche は引き続き sans-IO（`recv`/`send`）。暗号化をカーネルに移す幻覚はしない
+- [ ] `PROXY_ALLOWED_OPCODES` / seccomp / docker seccomp を必要 opcode に合わせて更新
+- [ ] 各フェーズで host または tools/perf の **同一条件 A/B**（変更前 vs 後）を記録。退行時は原因切り分け
+- [ ] AGENTS.md / README / config コメントを更新
+- [ ] full features ビルド・HTTP/3 E2E・Docker `--net=host` GSO on/off
 
 ---
 
@@ -327,13 +353,14 @@ loop:
 
 ## 10. 推奨作業手順（委譲先）
 
-1. 本ファイル §8 で **方針 A or B** を決める（ユーザー指示があればそれに従う。無ければ **方針 B を先に綺麗にしてから A を別チケット**でも可）。
-2. 現状ブランチ `feat/http3-quiche` または main 取り込み後の差分を `git log` / 本ファイル §3 と照合。
-3. 実装 → `cargo fmt` / clippy / feature マトリクス build → `cargo test` / `./tests/e2e_setup.sh test`。
-4. Docker `--net=host` で GSO on/off。
-5. tools/perf HTTP/3 代表 1 本（イメージは現行ソース）。
-6. AGENTS / README / config / backlog を同期。
-7. F-125 の受け入れチェックリストを埋め、`backlog.md` の対応状況を **完了** に。
+1. **ユーザーは方針 C（極限 io_uring 化）を明示要求している。** 特に指示がなければ **§14 に従い方針 C を主軸**とし、方針 A は C の受信フェーズとして内包する。方針 B（整理のみ）はユーザーが明示した場合のみ単独完了とする。
+2. §14.3 **フェーズ 0**（調査・設計の短文固定）を先に書く（`docs/artifacts/` 可）。
+3. 現状ブランチ `feat/http3-quiche` または main 取り込み後の差分を `git log` / 本ファイル §3 と照合。
+4. §14 の **フェーズ 1 → 2 → …** を順に実装。各フェーズで fmt / clippy / HTTP/3 関連 test・E2E の一部、perf A/B。
+5. Docker `--net=host` で GSO on/off。
+6. tools/perf HTTP/3 代表 1 本（イメージは現行ソース）。
+7. AGENTS / README / config / backlog を同期。命名・デッドコードは C 実装に合わせて整理（B の内容を吸収）。
+8. F-125 の受け入れチェックリストを埋め、`backlog.md` の対応状況を **完了** に。
 
 ---
 
@@ -366,8 +393,196 @@ loop:
 
 ---
 
+## 14. UDP / HTTP/3 の io_uring 化は可能か・極限性能の突き詰め（委譲必須）
+
+### 14.1 ユーザーへの回答（要約）
+
+| 問い | 答え |
+|------|------|
+| UDP を io_uring 化できるか | **可能**。既にイベントループと「先頭 RECVMSG」はある。**drain の recvmmsg / 送信の sendmmsg を completion 型に載せる**のが次の本丸。 |
+| HTTP/3「処理」全体を io_uring 化できるか | **I/O 境界のみ可能**。quiche の TLS/QUIC 暗号化・ACK・フロー制御・h3 フレーム処理は **ユーザー空間 CPU**。カーネルに HTTP/3 エンジンを載せる魔法はない。 |
+| 以前は io_uring を使っていなかったのか | **使っていた**。ただし UDP は主に **`IORING_OP_POLL_ADD`（readiness）+ 同期 libc mmsg**。TCP ほど `IORING_OP_RECV/SEND` 直叩きではなかった。詳細は下記 §14.2。 |
+| 委譲先がすべきこと | **調査（フェーズ 0）のうえ、方針 C で段階実装し perf で極限を詰める。** 本 §14 が指示書。 |
+
+### 14.2 現状の「どこまで io_uring か」（正確な層分け）
+
+```
+【以前〜現在共通】
+  ワーカー = 独自 io_uring ring + executor（TCP は RECV/SEND/ACCEPT 等）
+
+【UDP 受信・以前】
+  wait:  IORING_OP_POLL_ADD (readable)
+  data:  libc recvmsg / recvmmsg（同期・非ブロッキング）
+
+【UDP 受信・F-124 後（既定）】
+  先頭 wait+data: IORING_OP_RECVMSG + POLL_FIRST（1 SQE）
+  drain data:     libc recvmmsg（同期）← まだここが syscall 往復の塊
+  フォールバック: POLL_ADD + recv_gro_async
+
+【UDP 送信・ほぼ未変更】
+  data:  libc sendmsg/sendmmsg + GSO cmsg
+  wait:  EAGAIN 時 IORING_OP_POLL_ADD (writable)
+
+【HTTP/3 ロジック】
+  quiche::Connection::recv/send, h3::poll, ルーティング, バックエンド TCP…
+  → すべてユーザー空間。io_uring 化の対象は「UDP/TCP の待ちとデータ移動」
+```
+
+**極限性能のボトルネック候補（優先度の目安）**
+
+1. **per-datagram / per-batch の syscall 往復**（drain の recvmmsg、送信 sendmmsg、POLL との二重）
+2. **select_biased 負け arm の timer arm/cancel**（F-115 で一部償却済み）
+3. **quiche の per-packet 暗号化・状態更新（CPU）** — I/O 化では消えない
+4. **コピー**（GSO 連結バッファ、GRO 分解、提供バッファと quiche 間）
+5. **Docker veth で GSO/GRO 無効** — 計測は host net と bridge を分ける
+
+F-111/F-115 の知見: HTTP/3 は CPU 余地を残して **syscall 律速**になりやすい → **I/O 経路の io_uring 化の ROI は高い**。
+
+### 14.3 可能な io_uring 化メニューと難易度
+
+| # | 施策 | 内容 | 期待効果 | 難易度 | 備考 |
+|---|------|------|----------|--------|------|
+| C0 | 調査・設計固定 | kernel 機能、ABI、フォールバック、測定計画 | 手戻り防止 | 低 | **最初に必須** |
+| C1 | 受信 drain の io_uring 化 | 先頭以外も `IORING_OP_RECVMSG`（複数 in-flight または連続 submit）に。libc `recvmmsg` をホットパスから外す | 高 | 中 | multi-peer は **msghdr をスロットごと**に持つ |
+| C2 | 真 Multishot 受信 | `IORING_RECV_MULTISHOT` + provided buffers / **buffer ring** + `io_uring_recvmsg_out` | 最高（理想） | **高** | 方針 A と同一。kernel 6.0+ |
+| C3 | 送信の io_uring 化 | `IORING_OP_SENDMSG`（GSO: `UDP_SEGMENT` cmsg を msghdr に付与）。複数宛先は複数 SQE を 1 `io_uring_enter` で submit | 高 | 中 | 既存 TCP SENDMSG 実装（F-59）を参考 |
+| C4 | 送信 Multishot / バッチ | 可能な範囲で linked SQE や複数 SENDMSG を一括 submit。`sendmmsg` 相当を ring 上で再現 | 中〜高 | 中 | セマンティクス（部分送信）に注意 |
+| C5 | fixed buffers / registered buffers | `IORING_REGISTER_BUFFERS` または buffer ring で pin。CQE から bid で参照 | 中（コピー・ピン削減） | 中〜高 | セキュリティ・制限との兼ね合い |
+| C6 | メインループ再設計 | notify/timeout と UDP CQE を **単一 poll 完了経路**に寄せ、select_biased の無駄 cancel を減らす | 中 | 中 | 既存 F-32 actor モデルを壊さない |
+| C7 | quiche 側 | 既に sans-IO。CC=BBR・大きな window・pacing は F-124 済み。追加は計測駆動のパラメータ | 中（ワークロード依存） | 低 | 「quiche を io_uring 化」は誤解 |
+
+**やっても無駄・幻覚になりやすいもの**
+
+- quiche の暗号化をゼロにする「kernel HTTP/3」
+- Cargo feature `zero-copy` / `gcongestion` という架空の銀弾（`Bbr2Gcongestion` は enum として存在し得るが feature 魔法ではない）
+- Multishot を shared `msg_name` だけで multi-peer に使う（アドレス破壊）
+
+### 14.4 推奨アーキテクチャ（方針 C の到達像）
+
+```
+                    io_uring SQ/CQ
+                         │
+     ┌───────────────────┼───────────────────┐
+     │                   │                   │
+ RECVMSG×N or        SENDMSG×M           TIMEOUT/POLL
+ Multishot+pbuf      (+UDP_SEGMENT)      (timer/notify 補助)
+     │                   │
+     ▼                   ▲
+  provided/fixed      GSO 連結済み
+  buffers             batch (thread-local)
+     │                   │
+     └────► quiche recv/send (userspace) ◄───┘
+                 │
+            h3 / proxy / file …
+```
+
+**不変条件**
+
+- quiche の `Connection` / `h3::Connection` は **単一スレッド・非 Send**（既存 actor モデル維持）
+- ホットパスで **ブロッキング syscall 待ちをしない**（io_uring 完了待ちのみ）
+- バッファはワーカー起動時確保・再利用。リクエスト毎 `Vec` 新規禁止
+- reactor（epoll）ビルドでは **libc mmsg フォールバック**を残しコンパイル可能に
+
+### 14.5 実装フェーズ（委譲先はこの順で進める）
+
+#### フェーズ 0 — 調査・設計メモ（半日〜1 日、コード前に必須）
+
+成果物: `docs/artifacts/f125_udp_iouring_design.md`（または本チケット追記）
+
+含める内容:
+
+1. ターゲット kernel（開発機 / 本番想定）。Multishot・buffer ring の可否
+2. 受信: Multishot+pbuf vs pipelined 単発 RECVMSG×N の比較表と **採用案**
+3. 送信: SENDMSG + GSO cmsg の SQE レイアウト（既存 `send_mmsg` の cmsg と等価）
+4. OpTable: 現行単発 vs multishot キュー（既に残骸あり）の利用方針
+5. フォールバック条件（ENOSYS / 制限 ring / reactor）
+6. 測定計画: host net + tools/perf bridge、指標は req/s・p99・CPU・non-2xx
+
+#### フェーズ 1 — 受信フル io_uring（libc recvmmsg をホットパスから除去）
+
+**目標**: `process_datagram_segments` に渡すデータグラムを、**すべて** `IORING_OP_RECVMSG` 完了から得る。
+
+実装案（どちらか、または段階）:
+
+- **1a（比較的安全）**: N スロット（`mmsg_batch_size`）の msghdr/buf/cmsg を保持し、常に最大 N 個の RECVMSG を in-flight。完了したスロットを処理して再 arm（**ソフトウェアパイプライン Multishot**）。
+- **1b（本命）**: `IORING_RECV_MULTISHOT` + provided buffers / buffer ring + `io_uring_recvmsg_out` で peer/GRO/payload をバッファ内に格納。
+
+変更候補:
+
+- `src/runtime/uring/udp_recv.rs`（全面書き換え）
+- `src/http3_server.rs` メインループ（`recv_mmsg_sync` ループ削除またはフォールバック専用化）
+- `executor.rs` の multishot 完了経路を **実使用** またはパイプライン用に簡略化
+- 許可 opcode のコメントを実態に合わせる
+
+受け入れ:
+
+- HTTP/3 E2E pass
+- ホットパスに `libc::recvmmsg` が残らないこと（フォールバック cfg 以外）を grep で確認
+- perf が F-124 比で **非退行**（理想は向上）
+
+#### フェーズ 2 — 送信フル io_uring（libc sendmmsg をホットパスから除去）
+
+**目標**: `send_pending_packets` の送出を `IORING_OP_SENDMSG` に。
+
+実装案:
+
+- 既存 `MmsgSendScratch` の addr/iov/cmsg レイアウトを **SQE 用に固定**し、1 エントリ = 1 SENDMSG SQE
+- 複数エントリを **1 回の submit（複数 SQE）** で投げ、CQE で部分失敗を処理（現行 sendmmsg の skip セマンティクスを踏襲）
+- EAGAIN 相当は CQE の `-EAGAIN` / 内部 poll。`wait_writable_fd` への依存を減らす
+- GSO: `UDP_SEGMENT` cmsg を従来どおり構築
+
+変更候補:
+
+- `src/udp/socket.rs` に `send_mmsg_uring` 系、または `runtime/uring` に UDP send ヘルパ
+- `http3_server.rs` の `send_mmsg_flush`
+- TCP の `SendMsgFuture`（F-59）を参考に cancel-safety / detach ガード
+
+受け入れ:
+
+- GSO on/off で E2E・h2load 成功
+- ホットパスから `libc::sendmmsg` 除去（フォールバック除く）
+- perf 非退行
+
+#### フェーズ 3 — 真 Multishot 最適化（フェーズ 1a 採用時の昇格）
+
+- buffer ring（`IORING_SETUP` / register pbuf ring）へ
+- ENOBUFS 時の再 provide を非ブロックで
+- CQE バッチ処理と quiche への供給をゼロコピーのまま
+
+#### フェーズ 4 — ループと CPU 側の詰め
+
+- timer/notify と UDP CQE の多重化コスト削減
+- CC / window / batch の計測駆動チューニング（設定は F-124 済み）
+- （任意）送信スクラッチと固定バッファの統合
+
+### 14.6 セキュリティ・feature チェックリスト（方針 C）
+
+- [ ] `PROXY_ALLOWED_OPCODES`: 使う opcode のみ。PROVIDE/REMOVE は **使うなら**残し、使わないなら削除検討
+- [ ] docker `assets/security/seccomp.json` / epoll 用: `io_uring_*` は既存前提。UDP は既に sendmmsg/recvmmsg 許可 — **io_uring 化後は recvmmsg をデータパスから外しても、DNS 等で残るなら seccomp からは消さない**
+- [ ] Landlock / 制限 ring 有効時の動作確認
+- [ ] `veil_rt_reactor` では従来 libc 経路を維持（cfg 分岐）
+
+### 14.7 測定の作法（極限を語るために必須）
+
+1. **同一条件**で before/after（コミット直前との比較、または feature flag で新旧切替）
+2. 最低 2 環境:
+   - **host net + GSO on**（上限の参考）
+   - **tools/perf / Docker bridge**（ドキュメント上の 835 と比較可能）
+3. 記録: req/s median、p99、CPU%、non-2xx、UDP datagram sent/received（h2load）
+4. 結果は `docs/perf/` または `docs/artifacts/` に残し、README 計測履歴に 1 行追記
+
+### 14.8 委譲先への明確な指令文
+
+> **UDP と HTTP/3 のデータプレーン I/O を、AGENTS.md のホットパス規則の範囲で極限まで io_uring 化せよ。**  
+> quiche は sans-IO のまま駆動する。libc の `recvmmsg`/`sendmmsg` をホットパスの主経路から外し、`IORING_OP_RECVMSG`（可能なら Multishot + provided/buffer ring）と `IORING_OP_SENDMSG`（GSO cmsg 付き）を主経路にせよ。  
+> 実装は §14.5 のフェーズ順。各フェーズで E2E と perf A/B を行い、退行させない。  
+> 完了時は AGENTS.md / README / config / 本チケット / backlog.md を実装に合わせて更新せよ。
+
+---
+
 ## 13. 変更履歴（本チケット）
 
 | 日付 | 内容 |
 |------|------|
 | 2026-07-19 | F-124 実装レビューに基づき引き継ぎドキュメントとして新設。現状・ギャップ・残りタスクを固定。 |
+| 2026-07-19 | §14 追加: UDP/HTTP3 io_uring 化の可否・現状層分け・極限性能フェーズ・委譲指令。方針 C をユーザー要求としてデフォルト完了条件に。 |
