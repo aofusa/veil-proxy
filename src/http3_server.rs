@@ -3566,7 +3566,7 @@ pub async fn run_http3_server_async(
             match crate::runtime::udp_recv::MultishotUdpRecv::new(socket.as_raw_fd(), mmsg_batch) {
                 Ok(m) => {
                     info!(
-                        "[HTTP/3] io_uring RECVMSG multishot enabled (batch={})",
+                        "[HTTP/3] io_uring RECVMSG enabled (POLL_FIRST + recvmmsg drain, batch={})",
                         m.batch_size()
                     );
                     Some(m)
