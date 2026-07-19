@@ -22,7 +22,7 @@ A high-performance reverse proxy server using io_uring (custom runtime) and rust
 - **kTLS**: Kernel TLS offload support via rustls + custom kTLS module (Linux 5.15+, FreeBSD 13.0+ — F-126)
 - **HTTP/2**: HTTP/2 support via TLS ALPN negotiation (stream multiplexing, HPACK compression with **4-bit LUT Huffman decode** — F-121)
 - **H2C Server**: HTTP/2 Cleartext (H2C) server support without TLS (Prior Knowledge mode, RFC 7540 Section 3.4)
-- **HTTP/3**: QUIC/UDP-based HTTP/3 support using quiche (0-RTT connection establishment)
+- **HTTP/3**: QUIC/UDP-based HTTP/3 support using quiche's low-level sans-IO API (`Connection::recv`/`send`, configurable congestion control/pacing). On the Linux io_uring backend, datagram receive uses **`IORING_OP_RECVMSG` multishot + provided buffers** (F-124; falls back to POLL + `recvmmsg` on reactor builds or when multishot is unavailable). 0-RTT connection establishment
 - **Fast Allocator**: High-speed memory allocation with mimalloc + Huge Pages support
 - **Fast Routing**: O(log n) path matching with Radix Tree (matchit)
 
@@ -427,6 +427,11 @@ The following table lists default values for major configuration options:
 | `[http3]` | `initial_max_stream_data_uni` | `1000000` | Stream data uni (1MB) |
 | `[http3]` | `initial_max_streams_bidi` | `100` | Max bidirectional streams |
 | `[http3]` | `initial_max_streams_uni` | `100` | Max unidirectional streams |
+| `[http3]` | `cc_algorithm` | `"bbr"` | QUIC congestion control (`reno`/`cubic`/`bbr`/`bbr2`/`bbr2_gcongestion`) |
+| `[http3]` | `pacing` | `true` | Enable packet pacing |
+| `[http3]` | `max_pacing_rate` | *(none)* | Max pacing rate (bytes/s); omit for unlimited |
+| `[http3]` | `hystart` | `true` | Enable HyStart++ |
+| `[http3]` | `mmsg_batch_size` | `64` | UDP mmsg / io_uring multishot batch width (1..=128) |
 | `[http3]` | `compression_enabled` | `false` | Enable compression |
 | `[http3]` | `gso_gro_enabled` | `false` | Enable GSO/GRO |
 | `[http3]` | `alt_svc_enabled` | `true` | Advertise HTTP/3 via Alt-Svc on H1/H2 responses (when `server.http3_enabled`) |
@@ -2522,7 +2527,9 @@ Supports HTTP/3 (RFC 9114) based on QUIC/UDP. Uses Cloudflare's [quiche](https:/
 | 0-RTT Connection Establishment | Instant communication without TLS handshake |
 | Head-of-Line Blocking Elimination | Packet loss doesn't affect other streams |
 | Connection Migration | Maintains connection during network switches |
-| GSO/GRO Optimization | High-performance UDP processing |
+| GSO/GRO Optimization | High-performance UDP processing (UDP_SEGMENT / UDP_GRO) |
+| Congestion control / pacing | Configurable via `[http3]` (`cc_algorithm`, `pacing`, `hystart`, …); default BBR + pacing |
+| io_uring multishot recv | `IORING_OP_RECVMSG` + provided buffers (batch via `mmsg_batch_size`, default 64) |
 
 ### Enabling
 
@@ -2585,7 +2592,9 @@ initial_max_streams_uni = 100
 #     (zero-copy receive). Falls back to single-datagram I/O on unsupported kernels.
 #   - Independent of this setting, the HTTP/3 data plane always batches multiple
 #     datagrams (across different connections) into one syscall via
-#     recvmmsg(2)/sendmmsg(2) (F-115). Container deployments need recvmmsg/sendmmsg
+#     recvmmsg(2)/sendmmsg(2) (F-115) and, on io_uring, IORING_OP_RECVMSG multishot
+#     with provided buffers (F-124; batch size = mmsg_batch_size, default 64).
+#     Container deployments need recvmmsg/sendmmsg
 #     in the seccomp allowlist (docker/assets/security/seccomp.json ships with them).
 #
 # Notes:
