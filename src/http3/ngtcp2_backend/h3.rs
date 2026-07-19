@@ -160,9 +160,9 @@ impl H3Conn {
             })
             .collect();
 
-        // ストリーミング追記でも reallocate しないよう大きめに確保（read_data ポインタ安定）
+        // ストリーミング追記用の余裕（read_data ポインタ安定のため in-place extend）
         let mut data = body;
-        const PRE: usize = 256 * 1024;
+        const PRE: usize = 4 * 1024;
         if data.capacity() < PRE {
             data.reserve(PRE.saturating_sub(data.capacity()));
         }
