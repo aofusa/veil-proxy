@@ -498,8 +498,10 @@ impl Handler {
                 ps.resp_started = true;
             }
             if let Some((buf, _off)) = ps.body_pending.take() {
-                if !self.send_stream_body(sid, &buf, 0, false) {
-                    ps.body_pending = Some((buf, 0));
+                // Bytes clone は参照カウント増のみ（失敗時の再 pending 用）
+                let retry = buf.clone();
+                if !self.send_stream_body(sid, buf, false) {
+                    ps.body_pending = Some((retry, 0));
                     self.proxy_streams.insert(sid, ps);
                     continue;
                 }
@@ -520,8 +522,9 @@ impl Handler {
                         ps.resp_started = true;
                     }
                     TryRecv::Item(RespMsg::Body(b)) => {
-                        if !self.send_stream_body(sid, &b, 0, false) {
-                            ps.body_pending = Some((b, 0));
+                        let retry = b.clone();
+                        if !self.send_stream_body(sid, b, false) {
+                            ps.body_pending = Some((retry, 0));
                             break;
                         }
                     }
@@ -536,7 +539,7 @@ impl Handler {
                 }
             }
 
-            if ps.need_fin && !ps.resp_fin_sent && self.send_stream_body(sid, &[], 0, true) {
+            if ps.need_fin && !ps.resp_fin_sent && self.send_stream_body(sid, Bytes::new(), true) {
                 ps.resp_fin_sent = true;
             }
 
@@ -579,8 +582,9 @@ impl Handler {
         }
     }
 
-    fn send_stream_body(&mut self, stream_id: i64, data: &[u8], _off: usize, fin: bool) -> bool {
+    fn send_stream_body(&mut self, stream_id: i64, data: Bytes, fin: bool) -> bool {
         match self.h3.as_mut() {
+            // Bytes をそのまま push（再確保なし・ホットパスゼロコピー）
             Some(h3) => h3.append_body(stream_id, data, fin).is_ok(),
             None => false,
         }
@@ -1013,7 +1017,8 @@ impl Handler {
                 len: 0,
             }; 16];
 
-            // 1) nghttp3 writev → 所有バッファへコピー（ポインタは次呼び出しで無効）
+            // 1) nghttp3 writev → 所有バッファへコピー（ポインタは次呼び出しで無効）。
+            // パケット暗号化バッファプールとは分離（ソース/宛先のエイリアス防止）。
             let (sid, fin, data) = {
                 let Some(h3) = self.h3.as_mut() else {
                     break;
@@ -1027,15 +1032,7 @@ impl Handler {
                                 total = total.saturating_add(v.len);
                             }
                         }
-                        let mut data = if total <= 2048 {
-                            // 小フレーム: 後でスタック相当の小さな Vec（プールから）
-                            let mut v = pkt_buf_get();
-                            v.clear();
-                            v.reserve(total.max(64));
-                            v
-                        } else {
-                            Vec::with_capacity(total)
-                        };
+                        let mut data = Vec::with_capacity(total.max(64));
                         for v in vecs.iter().take(nvec) {
                             if !v.base.is_null() && v.len > 0 {
                                 data.extend_from_slice(unsafe {
@@ -1087,6 +1084,7 @@ impl Handler {
                             out_pkts.push((peer, buf));
                             pkts_this_flush += 1;
                         } else {
+                            // WRITE_MORE 等: dest 内容は次呼び出しで作り直されるため返却可
                             pkt_buf_put(buf);
                         }
                         if accepted == 0 && chunk.is_empty() {
@@ -1111,11 +1109,11 @@ impl Handler {
                     }
                 }
             }
-            // data が小バッファ由来なら返却
-            if data.capacity() <= PKT_CAP * 2 {
-                pkt_buf_put(data);
+            if blocked {
+                break;
             }
-            if blocked || off == 0 {
+            // writev で提示したのに 1 バイトも QUIC に渡せなかった → 次回
+            if off == 0 && !data.is_empty() {
                 break;
             }
         }

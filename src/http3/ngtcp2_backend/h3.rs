@@ -5,6 +5,7 @@ use std::ffi::c_void;
 use std::os::raw::c_int;
 use std::ptr;
 
+use bytes::Bytes;
 use nghttp3_sys::*;
 
 /// H3 イベント
@@ -36,14 +37,68 @@ struct H3UserData {
 
 /// ボディ送信キュー。
 ///
-/// `data` は append のみ（reallocate を避けるため十分な容量を確保）。
-/// `acked` は `add_write_offset` で確定した消費位置。
-/// `offered` は直近 read_data が提示した終端位置（acked..offered が nghttp3 保持中）。
+/// ホットパス規則: 提示済みバッファを再確保しない。
+/// `chunks` は append のみ（`Bytes` は参照カウントでメモリ固定）。
+/// `body_read_cb` が返したポインタは、対応する `Bytes` がキューに残る限り有効。
+///
+/// - `offered`: 累計で nghttp3 に提示済みのボディバイト数
+/// - `total_len`: 全チャンク長の合計
 struct BodyQueue {
-    data: Vec<u8>,
-    /// 直近 read_data が提示した終端位置
+    chunks: VecDeque<Bytes>,
+    total_len: usize,
     offered: usize,
     fin: bool,
+}
+
+impl BodyQueue {
+    fn empty(fin: bool) -> Self {
+        Self {
+            chunks: VecDeque::new(),
+            total_len: 0,
+            offered: 0,
+            fin,
+        }
+    }
+
+    fn from_body(body: Vec<u8>, fin: bool) -> Self {
+        if body.is_empty() {
+            return Self::empty(fin);
+        }
+        let len = body.len();
+        let mut chunks = VecDeque::with_capacity(1);
+        chunks.push_back(Bytes::from(body));
+        Self {
+            chunks,
+            total_len: len,
+            offered: 0,
+            fin,
+        }
+    }
+
+    fn append(&mut self, data: Bytes, fin: bool) {
+        if !data.is_empty() {
+            self.total_len = self.total_len.saturating_add(data.len());
+            self.chunks.push_back(data);
+        }
+        if fin {
+            self.fin = true;
+        }
+    }
+
+    /// `offered` 位置から次の連続スライスを返す（単一 `Bytes` 内のみ）。
+    fn next_offer_slice(&self) -> Option<&[u8]> {
+        if self.offered >= self.total_len {
+            return None;
+        }
+        let mut skip = self.offered;
+        for chunk in &self.chunks {
+            if skip < chunk.len() {
+                return Some(&chunk[skip..]);
+            }
+            skip -= chunk.len();
+        }
+        None
+    }
 }
 
 /// サーバ側 HTTP/3 接続
@@ -160,20 +215,9 @@ impl H3Conn {
             })
             .collect();
 
-        // ストリーミング追記用の余裕（read_data ポインタ安定のため in-place extend）
-        let mut data = body;
-        const PRE: usize = 4 * 1024;
-        if data.capacity() < PRE {
-            data.reserve(PRE.saturating_sub(data.capacity()));
-        }
-        self.user_data.body_queues.insert(
-            stream_id,
-            BodyQueue {
-                data,
-                offered: 0, // 初回 read_data で提示
-                fin,
-            },
-        );
+        self.user_data
+            .body_queues
+            .insert(stream_id, BodyQueue::from_body(body, fin));
 
         let dr = nghttp3_data_reader {
             read_data: Some(body_read_cb),
@@ -230,39 +274,32 @@ impl H3Conn {
             return Err(std::io::Error::other(format!("add_write_offset {rv}")));
         }
         // n は H3 符号化後のストリームバイト数であり body 長と一致しない。
-        // body バッファはストリーム寿命まで保持（ポインタ安定）。acked 更新はしない。
+        // body チャンクはストリーム寿命まで保持（ポインタ安定）。
         let _ = stream_id;
         Ok(())
     }
 
     /// ストリーミング送信用にボディ断片をキューへ追加し resume する。
     ///
-    /// バッファは **in-place 追記のみ**（drain / reallocate しない）。
-    pub fn append_body(&mut self, stream_id: i64, data: &[u8], fin: bool) -> std::io::Result<()> {
-        // 小レスポンスでは過剰確保を避け、必要時のみ extend で伸ばす
-        const PRE: usize = 4 * 1024;
+    /// `Bytes` を push するだけ（既存チャンクの再確保・コピーなし）。
+    /// resume が失敗した場合は追加分をロールバックし、呼び出し側が再試行できるようにする。
+    pub fn append_body(&mut self, stream_id: i64, data: Bytes, fin: bool) -> std::io::Result<()> {
         let q = self
             .user_data
             .body_queues
             .entry(stream_id)
-            .or_insert_with(|| BodyQueue {
-                data: Vec::with_capacity(PRE),
-                offered: 0,
-                fin: false,
-            });
-        if !data.is_empty() {
-            if q.data.len() + data.len() > q.data.capacity() {
-                // 提示中 reallocate はポインタ無効化の危険があるが、writev は同期的に
-                // 完了し data をコピー済みのため、容量不足時のみ確保する。
-                q.data.reserve(data.len());
-            }
-            q.data.extend_from_slice(data);
-        }
-        if fin {
-            q.fin = true;
-        }
+            .or_insert_with(|| BodyQueue::empty(false));
+        let prev_chunks = q.chunks.len();
+        let prev_total = q.total_len;
+        let prev_fin = q.fin;
+        q.append(data, fin);
         let rv = unsafe { nghttp3_conn_resume_stream(self.inner, stream_id) };
         if rv != 0 && rv != NGHTTP3_ERR_STREAM_NOT_FOUND {
+            while q.chunks.len() > prev_chunks {
+                q.chunks.pop_back();
+            }
+            q.total_len = prev_total;
+            q.fin = prev_fin;
             return Err(std::io::Error::other(format!("resume_stream {rv}")));
         }
         Ok(())
@@ -413,19 +450,19 @@ unsafe extern "C" fn body_read_cb(
         *pflags |= NGHTTP3_DATA_FLAG_EOF;
         return 0;
     };
-    if q.offered >= q.data.len() {
+    let Some(remaining) = q.next_offer_slice() else {
         if q.fin {
             *pflags |= NGHTTP3_DATA_FLAG_EOF;
             return 0;
         }
         // 次の append_body + resume まで待機
         return NGHTTP3_ERR_WOULDBLOCK as nghttp3_ssize;
-    }
-    let remaining = &q.data[q.offered..];
+    };
+    let len = remaining.len();
     (*vec).base = remaining.as_ptr() as *mut u8;
-    (*vec).len = remaining.len();
-    q.offered = q.data.len();
-    if q.fin {
+    (*vec).len = len;
+    q.offered = q.offered.saturating_add(len);
+    if q.fin && q.offered >= q.total_len {
         *pflags |= NGHTTP3_DATA_FLAG_EOF;
     }
     1
