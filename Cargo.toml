@@ -55,24 +55,23 @@ http2 = []
 # GSO/GRO による高パフォーマンス UDP 処理
 #
 # バックエンド選択（build.rs が `veil_http3_ngtcp2` / `veil_http3_quiche` cfg を発行）:
-#   - Linux / FreeBSD / macOS（既定）: ngtcp2 + nghttp3（ゼロコピー向き・sans-IO）
-#   - OpenBSD / Windows（既定）: quiche
+#   - Linux / FreeBSD / macOS（既定）: ngtcp2 + nghttp3 のみ（`http3` feature）
+#   - OpenBSD / Windows: `--features "http3,http3-quiche"` で quiche
+#     （`http3` 単体では ngtcp2 を引き OpenBSD では非推奨。ビルド時に案内する）
 #   - 全 OS で quiche を強制: `--features "http3,http3-quiche"`
 #
-# 依存は両バックエンド分を optional で引き（ターゲット横断の feature 制約回避）、
-# 実際にリンク・コンパイルされる実装パスは上記 cfg で完全に分離する。
+# 依存グラフ:
+#   - `http3` → aws-lc-sys + ngtcp2-sys + nghttp3-sys（**quiche は含めない**）
+#   - `http3-quiche` → 上記に加え quiche を有効化（実装パスは cfg で quiche 側のみ）
 # TLS は aws-lc-sys（rustls と同一の AWS-LC ビルド）を共有。
 # quiche 利用時は build.rs が AWS_LC_SYS_NO_PREFIX=1 を適用する。
-# 依存: aws-lc-sys（TLS）+ 自前 ngtcp2-sys/nghttp3-sys。
-# quiche は OpenBSD/Windows 既定および http3-quiche 強制時に使用（常に optional で引き、
-# 実装パスは build.rs の cfg で分離）。
-http3 = ["dep:aws-lc-sys", "dep:ngtcp2-sys", "dep:nghttp3-sys", "dep:quiche"]
+http3 = ["dep:aws-lc-sys", "dep:ngtcp2-sys", "dep:nghttp3-sys"]
 
-# HTTP/3 で Cloudflare quiche バックエンドを強制する
-# Linux / FreeBSD / macOS でも現行 quiche 実装を使う。
-# OpenBSD / Windows では http3 だけで quiche が選ばれるが、明示指定も可。
+# HTTP/3 で Cloudflare quiche バックエンドを有効にする
+# （Linux / FreeBSD / macOS で ngtcp2 の代わりに quiche を使う場合、および
+#  OpenBSD / Windows の既定パス）。実装は build.rs の `veil_http3_quiche` cfg。
 # ビルド方法: cargo build --features "http3,http3-quiche"
-http3-quiche = ["http3"]
+http3-quiche = ["http3", "dep:quiche"]
 
 # epoll ベースの readiness ランタイム（F-120 クロスプラットフォーム対応）
 # デフォルトの io_uring 完了ベースランタイムの代わりに epoll ベースの
@@ -258,11 +257,11 @@ clap = { version = "4.5.53", features = ["derive"] }
 
 # HTTP/3 用 QUIC 実装（Cloudflare quiche）
 # default-features = false で内蔵 BoringSSL ビルドを抑制し、aws-lc-sys と共有
-# `http3-quiche` feature、または OpenBSD/Windows の既定バックエンドで有効化
+# **`http3-quiche` feature 時のみ** Cargo 依存に乗る（plain `http3` ではビルドされない）
 quiche = { version = "0.24.6", default-features = false, optional = true }
 
 # HTTP/3 用 ngtcp2 / nghttp3 自前 FFI（公式 C ライブラリを aws-lc-sys と静的リンク）
-# Linux / FreeBSD / macOS の既定バックエンド。
+# plain `http3` feature の既定バックエンド（Linux / FreeBSD / macOS）
 ngtcp2-sys = { path = "crates/ngtcp2-sys", optional = true }
 nghttp3-sys = { path = "crates/nghttp3-sys", optional = true }
 
@@ -377,9 +376,8 @@ base64 = "0.22.1"
 # HTTP/3 ベンチマーク用乱数（benches/http3.rs。quiche 経由で依存済みのため追加コストなし）
 ring = "0.17"
 
-# HTTP/3 E2Eテスト用（quicheクライアント）
-# 注意: quicheは既にメインの依存関係にoptionalとして追加されているため、
-# dev-dependenciesでは通常の依存関係として追加（http3 featureが有効な場合のみ使用）
+# HTTP/3 E2E テストクライアントは h3-quinn / quinn を使用（下記）。
+# サーバ実装の quiche は `http3-quiche` feature 時のみ本体依存に含まれる。
 
 # ========================================
 # 新規追加: HTTP/2・HTTP/3・gRPC テスト基盤

@@ -2,8 +2,11 @@
 //!
 //! ## HTTP/3
 //! `http3` フィーチャー有効時、バックエンドを選択して cfg を発行する:
-//! - `veil_http3_ngtcp2`: Linux / FreeBSD / macOS の既定（ngtcp2 + nghttp3）
-//! - `veil_http3_quiche`: OpenBSD / Windows の既定、または `http3-quiche` feature 指定時
+//! - `veil_http3_ngtcp2`: `http3` のみ（依存: ngtcp2-sys + nghttp3-sys。**quiche はビルドしない**）
+//! - `veil_http3_quiche`: `http3-quiche` feature 指定時（依存に quiche を追加）
+//!
+//! OpenBSD / Windows では quiche バックエンドを推奨する（`--features http3,http3-quiche`）。
+//! `http3` のみでも ngtcp2 経路の cfg になるが、当該 OS では quiche 利用を案内する。
 //!
 //! quiche 利用時は BoringSSL 互換（非プレフィックス）シンボルを rustls と共有するため
 //! `AWS_LC_SYS_NO_PREFIX=1` を自動適用する。ngtcp2 の crypto_boringssl も AWS-LC を
@@ -39,8 +42,11 @@ fn feature_enabled(name: &str) -> bool {
 ///
 /// | cfg | 条件 |
 /// |-----|------|
-/// | `veil_http3_quiche` | `feature = "http3-quiche"`、または target_os が openbsd / windows |
-/// | `veil_http3_ngtcp2` | 上記以外で `feature = "http3"`（linux / freebsd / macos 既定） |
+/// | `veil_http3_quiche` | `feature = "http3-quiche"`（依存グラフに quiche を含める） |
+/// | `veil_http3_ngtcp2` | `feature = "http3"` かつ **http3-quiche なし** |
+///
+/// 依存: `http3` は ngtcp2/nghttp3 のみ。`http3-quiche` が quiche を追加する。
+/// OpenBSD/Windows では quiche を推奨し、http3-quiche 未指定時は警告する。
 fn emit_http3_backend_cfg() {
     println!("cargo::rustc-check-cfg=cfg(veil_http3_quiche)");
     println!("cargo::rustc-check-cfg=cfg(veil_http3_ngtcp2)");
@@ -51,15 +57,22 @@ fn emit_http3_backend_cfg() {
 
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let force_quiche = feature_enabled("HTTP3_QUICHE");
-    let platform_quiche = matches!(target_os.as_str(), "openbsd" | "windows");
+    let platform_prefers_quiche = matches!(target_os.as_str(), "openbsd" | "windows");
 
-    if force_quiche || platform_quiche {
+    if force_quiche {
         println!("cargo::rustc-cfg=veil_http3_quiche");
         eprintln!(
             "veil build.rs: HTTP/3 backend = quiche \
-             (force_quiche={force_quiche}, target_os={target_os})"
+             (feature http3-quiche, target_os={target_os})"
         );
     } else {
+        if platform_prefers_quiche {
+            eprintln!(
+                "veil build.rs: warning: target_os={target_os} prefers quiche; \
+                 enable `--features http3-quiche` (plain `http3` builds ngtcp2/nghttp3 only, \
+                 without quiche in the dependency graph)"
+            );
+        }
         println!("cargo::rustc-cfg=veil_http3_ngtcp2");
         eprintln!("veil build.rs: HTTP/3 backend = ngtcp2+nghttp3 (target_os={target_os})");
     }
