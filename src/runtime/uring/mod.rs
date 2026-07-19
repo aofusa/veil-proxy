@@ -14,3 +14,5 @@ pub mod ring;
 pub mod splice;
 pub mod tcp;
 pub mod timer;
+/// HTTP/3 向け `IORING_OP_RECVMSG` multishot 受信（F-124）。
+pub mod udp_recv;

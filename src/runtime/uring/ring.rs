@@ -111,6 +111,8 @@ pub const IORING_OP_EPOLL_CTL: u8 = 29;
 pub const IORING_OP_SPLICE: u8 = 30;
 pub const IORING_OP_PROVIDE_BUFFERS: u8 = 31;
 pub const IORING_OP_REMOVE_BUFFERS: u8 = 32;
+// IORING_OP_RECVMSG は上で定義済み（= 10）。MULTISHOT は opcode ではなく
+// SQE.ioprio の IORING_RECV_MULTISHOT フラグで有効化する（kernel 6.0+）。
 pub const IORING_OP_TEE: u8 = 33;
 pub const IORING_OP_SHUTDOWN: u8 = 34;
 pub const IORING_OP_RENAMEAT: u8 = 35;
@@ -154,6 +156,18 @@ pub const IOSQE_BUFFER_SELECT: u8 = 1 << 5;
 
 pub const IORING_CQE_F_BUFFER: u32 = 1 << 0;
 pub const IORING_CQE_F_MORE: u32 = 1 << 1;
+
+// ====================
+// RECV / RECVMSG 修飾フラグ（SQE.ioprio、kernel 5.19+ / multishot は 6.0+）
+// ====================
+
+/// 初回の同期 recv 試行を飛ばし、内部 poll から開始する。
+pub const IORING_RECVSEND_POLL_FIRST: u16 = 1 << 0;
+/// Multishot recv/recvmsg。完了 CQE に `IORING_CQE_F_MORE` が付く限り継続。
+pub const IORING_RECV_MULTISHOT: u16 = 1 << 1;
+
+/// CQE.flags から provided buffer ID を取り出すシフト量。
+pub const IORING_CQE_BUFFER_SHIFT: u32 = 16;
 
 // ====================
 // io_uring_params 構造体

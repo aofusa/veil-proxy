@@ -34,12 +34,26 @@ const RECV_BUFFER_SIZE: usize = 65536;
 #[cfg(target_os = "linux")]
 const CMSG_BUFFER_SIZE: usize = 128;
 
-/// F-115 第2段: 1 回の recvmmsg で受ける最大データグラム数。
-/// 多接続（-c100）で異なるフローもまとめて 1 syscall で掻き出すためのバッチ幅。
-pub const MMSG_RECV_BATCH: usize = 16;
+/// F-124: UDP mmsg / multishot 提供バッファの既定バッチ幅。
+///
+/// レポートおよび quiche 低レベル経路の推奨に合わせ 16 → **64** へ引き上げ。
+/// `[http3].mmsg_batch_size` で実行時に変更可能（1..=`MMSG_BATCH_MAX`）。
+pub const MMSG_BATCH_DEFAULT: usize = 64;
 
-/// F-115 第2段: 1 回の sendmmsg に載せる最大メッセージ数（GSO バッチ = 1 メッセージ）。
-pub const MMSG_SEND_BATCH: usize = 16;
+/// バッチ幅の上限（スクラッチ確保・提供バッファ数の安全上限）。
+pub const MMSG_BATCH_MAX: usize = 128;
+
+/// 後方互換エイリアス（既定バッチ幅）。実行時サイズは `Mmsg*Scratch::batch_size()` を使う。
+pub const MMSG_RECV_BATCH: usize = MMSG_BATCH_DEFAULT;
+
+/// 後方互換エイリアス（既定バッチ幅）。
+pub const MMSG_SEND_BATCH: usize = MMSG_BATCH_DEFAULT;
+
+/// バッチ幅を 1..=`MMSG_BATCH_MAX` にクランプする。
+#[inline]
+pub fn clamp_mmsg_batch(n: usize) -> usize {
+    n.clamp(1, MMSG_BATCH_MAX)
+}
 
 /// GSO 送信結果
 #[derive(Debug)]
@@ -733,26 +747,24 @@ impl QuicUdpSocket {
         }
     }
 
-    /// F-115 第2段: 非ブロッキング recvmmsg。1 syscall で最大 `MMSG_RECV_BATCH` 件の
-    /// データグラムを掻き出し、受信できた件数を返す。
+    /// F-115 第2段 / F-124: 非ブロッキング recvmmsg。1 syscall で最大 `scratch.batch_size()`
+    /// 件のデータグラムを掻き出し、受信できた件数を返す。
     ///
     /// - `flags = MSG_DONTWAIT`・`timeout = NULL` で呼ぶため、受信できるものが無ければ
     ///   EAGAIN（`WouldBlock`）を `Err` で返す（0 件は返らない）。呼び出し側は EAGAIN で
-    ///   drain を打ち切り、既存の POLL_ADD（`wait_readable_fd`）待機に戻る。**新規 io_uring
-    ///   オペコードは追加しない**（ホットパス絶対規則）。
+    ///   drain を打ち切る。
     /// - カーネルが書き換える `msg_namelen` / `msg_controllen` / `msg_flags` / `msg_len` のみ
-    ///   毎回リセットする（N=16 の書き込みのみ、ヒープ確保なし）。iovec/ポインタ配線は
-    ///   `MmsgRecvScratch::new()` で 1 回だけ済ませてある。
-    /// - i 番目の結果は `scratch.meta(i)`（長さ・送信元・GRO セグメントサイズ）と
-    ///   `scratch.buf_mut(i)`（ゼロコピーで quiche へ渡すバッファ）で取り出す。
+    ///   毎回リセットする（ヒープ確保なし）。iovec/ポインタ配線は `with_batch()` で 1 回だけ。
+    /// - i 番目の結果は `scratch.meta(i)` と `scratch.buf_mut(i)` で取り出す。
     #[cfg(target_os = "linux")]
     pub fn recv_mmsg_sync(&self, scratch: &mut MmsgRecvScratch) -> io::Result<usize> {
         let fd = self.socket.as_raw_fd();
+        let batch = scratch.batch_size();
 
         // カーネルが上書きするフィールドのみ毎回リセット（確保なし）。
-        // 不変条件: msg_name/msg_iov/msg_control のポインタは new() で Box 固定アドレスへ
+        // 不変条件: msg_name/msg_iov/msg_control のポインタは with_batch() で Box 固定アドレスへ
         // 配線済みなので触らない。長さフィールドだけカーネル入力上限へ戻す。
-        for i in 0..MMSG_RECV_BATCH {
+        for i in 0..batch {
             let hdr = &mut scratch.hdrs[i].msg_hdr;
             hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
             hdr.msg_controllen = CMSG_BUFFER_SIZE as _;
@@ -760,14 +772,13 @@ impl QuicUdpSocket {
             scratch.hdrs[i].msg_len = 0;
         }
 
-        // 安全性: hdrs は Box<[mmsghdr; N]> の固定アドレス。各 mmsghdr のポインタ群は
-        // 同一 scratch 内の Box（bufs/addrs/iovecs/cmsg_bufs）を指し、いずれも有効。
-        // MSG_DONTWAIT なのでブロッキングしない。
+        // 安全性: hdrs は Box 固定アドレス。各 mmsghdr のポインタ群は同一 scratch 内の
+        // Box（bufs/addrs/iovecs/cmsg_bufs）を指し、いずれも有効。MSG_DONTWAIT で非ブロック。
         let n = unsafe {
             libc::recvmmsg(
                 fd,
                 scratch.hdrs.as_mut_ptr(),
-                MMSG_RECV_BATCH as libc::c_uint,
+                batch as libc::c_uint,
                 // musl は flags が c_uint、glibc は c_int（libc クレートの宣言差異）のため
                 // `as _` で両ターゲットに追従させる。
                 libc::MSG_DONTWAIT as _,
@@ -778,7 +789,7 @@ impl QuicUdpSocket {
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
-        // n は 1..=MMSG_RECV_BATCH（EAGAIN は上で Err 済み）。
+        // n は 1..=batch（EAGAIN は上で Err 済み）。
         Ok(n as usize)
     }
 
@@ -800,7 +811,7 @@ impl QuicUdpSocket {
         entries: &[SendmmsgEntry<'_>],
         scratch: &mut MmsgSendScratch,
     ) -> io::Result<()> {
-        let count = entries.len().min(MMSG_SEND_BATCH);
+        let count = entries.len().min(scratch.batch_size());
         if count == 0 {
             return Ok(());
         }
@@ -818,7 +829,11 @@ impl QuicUdpSocket {
             hdr.msg_namelen = sockaddr_len;
             if e.segments > 1 {
                 // GSO: UDP_SEGMENT cmsg を per-entry バッファへ構築。
-                let cmsg_len = build_gso_cmsg(&mut scratch.cmsg_bufs[i], e.seg_size)?;
+                let cmsg_start = i * CMSG_BUFFER_SIZE;
+                let cmsg_len = build_gso_cmsg(
+                    &mut scratch.cmsg_bufs[cmsg_start..cmsg_start + CMSG_BUFFER_SIZE],
+                    e.seg_size,
+                )?;
                 hdr.msg_controllen = cmsg_len as _;
             } else {
                 // 単一パケット: cmsg なし（controllen=0 で control 領域を無視させる）。
@@ -896,68 +911,70 @@ impl QuicUdpSocket {
 // F-115 第2段: recvmmsg / sendmmsg スクラッチ
 // ====================
 
-/// F-115 第2段: recvmmsg 用スクラッチ。
+/// F-115 第2段 / F-124: recvmmsg 用スクラッチ。
 ///
 /// mmsghdr / iovec / sockaddr_storage / cmsg バッファを **Box で固定アドレス化**し、
-/// 各 mmsghdr のポインタ配線（msg_name/msg_iov/msg_control）は `new()` で 1 回だけ行う。
+/// 各 mmsghdr のポインタ配線（msg_name/msg_iov/msg_control）は `with_batch()` で 1 回だけ行う。
 /// 以降の `recv_mmsg_sync` はカーネルが書き換える長さ/フラグフィールドのみリセットするため、
 /// per-sweep のヒープ確保が発生しない（ホットパス絶対規則）。
+///
+/// バッチ幅は `[http3].mmsg_batch_size`（既定 64）で構築時に決定する。
 ///
 /// 不変条件: 本構造体を move してもポインタは有効。Box の move はスタック上のポインタ値
 /// （fat/thin）だけを移すもので、ヒープ確保の実アドレスは変わらないため、mmsghdr が保持する
 /// 内部ポインタ（別 Box のヒープ領域を指す）は移動後も同じ有効アドレスを指す。
 #[cfg(target_os = "linux")]
 pub struct MmsgRecvScratch {
-    /// MMSG_RECV_BATCH × RECV_BUFFER_SIZE(65536) の連続バッファ（GRO 集約対応）。
+    /// バッチ幅（1..=MMSG_BATCH_MAX）。
+    batch: usize,
+    /// batch × RECV_BUFFER_SIZE(65536) の連続バッファ（GRO 集約対応）。
     bufs: Box<[u8]>,
     /// 送信元アドレス（per-msg）。
-    addrs: Box<[libc::sockaddr_storage; MMSG_RECV_BATCH]>,
+    addrs: Box<[libc::sockaddr_storage]>,
     /// 各 msg の iovec（bufs 内の自分の区画を指す）。
-    iovecs: Box<[libc::iovec; MMSG_RECV_BATCH]>,
-    /// 各 msg の cmsg 受信バッファ（UDP_GRO を per-msg で受ける）。
-    cmsg_bufs: Box<[[u8; CMSG_BUFFER_SIZE]; MMSG_RECV_BATCH]>,
+    /// mmsghdr.msg_iov が指すバッキングストアのため、Rust 側の直接読みは不要だが Drop まで生存必須。
+    #[allow(dead_code)] // 理由: FFI 生ポインタ（hdrs[i].msg_iov）のバッキングストア
+    iovecs: Box<[libc::iovec]>,
+    /// 各 msg の cmsg 受信バッファ（UDP_GRO を per-msg で受ける）。連続領域。
+    /// mmsghdr.msg_control が指すバッキングストア。
+    #[allow(dead_code)] // 理由: FFI 生ポインタ（hdrs[i].msg_control）のバッキングストア
+    cmsg_bufs: Box<[u8]>,
     /// recvmmsg へ渡す mmsghdr 配列。
-    hdrs: Box<[libc::mmsghdr; MMSG_RECV_BATCH]>,
+    hdrs: Box<[libc::mmsghdr]>,
 }
 
 #[cfg(target_os = "linux")]
 impl MmsgRecvScratch {
-    /// スクラッチを確保し、mmsghdr のポインタ配線を 1 回だけ行う。
+    /// 既定バッチ幅（`MMSG_BATCH_DEFAULT`）でスクラッチを確保する。
     pub fn new() -> Self {
-        let bufs = vec![0u8; MMSG_RECV_BATCH * RECV_BUFFER_SIZE].into_boxed_slice();
-        // 安全性: sockaddr_storage / iovec / mmsghdr はすべて POD（全ビットゼロが有効表現）。
-        let addrs: Box<[libc::sockaddr_storage; MMSG_RECV_BATCH]> =
-            Box::new(unsafe { std::mem::zeroed() });
-        let iovecs: Box<[libc::iovec; MMSG_RECV_BATCH]> = Box::new(unsafe { std::mem::zeroed() });
-        let cmsg_bufs: Box<[[u8; CMSG_BUFFER_SIZE]; MMSG_RECV_BATCH]> =
-            Box::new([[0u8; CMSG_BUFFER_SIZE]; MMSG_RECV_BATCH]);
-        let hdrs: Box<[libc::mmsghdr; MMSG_RECV_BATCH]> = Box::new(unsafe { std::mem::zeroed() });
-
-        let mut scratch = Self {
-            bufs,
-            addrs,
-            iovecs,
-            cmsg_bufs,
-            hdrs,
-        };
-        scratch.wire_pointers();
-        scratch
+        Self::with_batch(MMSG_BATCH_DEFAULT)
     }
 
-    /// mmsghdr / iovec を Box 固定アドレスへ配線する（new() から 1 回だけ呼ぶ）。
-    fn wire_pointers(&mut self) {
-        for i in 0..MMSG_RECV_BATCH {
-            // 生ポインタは即座に借用を手放すため、フィールド間の可変借用衝突は起きない。
+    /// 指定バッチ幅でスクラッチを確保し、mmsghdr のポインタ配線を 1 回だけ行う。
+    pub fn with_batch(batch: usize) -> Self {
+        let batch = clamp_mmsg_batch(batch);
+        let mut bufs = vec![0u8; batch * RECV_BUFFER_SIZE].into_boxed_slice();
+        // 安全性: sockaddr_storage / iovec / mmsghdr はすべて POD（全ビットゼロが有効表現）。
+        let mut addrs =
+            vec![unsafe { std::mem::zeroed::<libc::sockaddr_storage>() }; batch].into_boxed_slice();
+        let mut iovecs =
+            vec![unsafe { std::mem::zeroed::<libc::iovec>() }; batch].into_boxed_slice();
+        let mut cmsg_bufs = vec![0u8; batch * CMSG_BUFFER_SIZE].into_boxed_slice();
+        let mut hdrs =
+            vec![unsafe { std::mem::zeroed::<libc::mmsghdr>() }; batch].into_boxed_slice();
+
+        for i in 0..batch {
             let buf_ptr =
-                unsafe { self.bufs.as_mut_ptr().add(i * RECV_BUFFER_SIZE) } as *mut libc::c_void;
-            let addr_ptr = (&mut self.addrs[i] as *mut libc::sockaddr_storage) as *mut libc::c_void;
-            let iov_ptr = &mut self.iovecs[i] as *mut libc::iovec;
-            let cmsg_ptr = self.cmsg_bufs[i].as_mut_ptr() as *mut libc::c_void;
+                unsafe { bufs.as_mut_ptr().add(i * RECV_BUFFER_SIZE) } as *mut libc::c_void;
+            let addr_ptr = (&mut addrs[i] as *mut libc::sockaddr_storage) as *mut libc::c_void;
+            let iov_ptr = &mut iovecs[i] as *mut libc::iovec;
+            let cmsg_ptr =
+                unsafe { cmsg_bufs.as_mut_ptr().add(i * CMSG_BUFFER_SIZE) } as *mut libc::c_void;
 
-            self.iovecs[i].iov_base = buf_ptr;
-            self.iovecs[i].iov_len = RECV_BUFFER_SIZE;
+            iovecs[i].iov_base = buf_ptr;
+            iovecs[i].iov_len = RECV_BUFFER_SIZE;
 
-            let hdr = &mut self.hdrs[i].msg_hdr;
+            let hdr = &mut hdrs[i].msg_hdr;
             hdr.msg_name = addr_ptr;
             hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
             hdr.msg_iov = iov_ptr;
@@ -966,6 +983,21 @@ impl MmsgRecvScratch {
             hdr.msg_controllen = CMSG_BUFFER_SIZE as _;
             hdr.msg_flags = 0;
         }
+
+        Self {
+            batch,
+            bufs,
+            addrs,
+            iovecs,
+            cmsg_bufs,
+            hdrs,
+        }
+    }
+
+    /// 構築時のバッチ幅。
+    #[inline]
+    pub fn batch_size(&self) -> usize {
+        self.batch
     }
 
     /// i 番目の受信メタ情報（受信バイト数・送信元・GRO セグメントサイズ）を返す。
@@ -1010,54 +1042,51 @@ pub struct SendmmsgEntry<'a> {
     pub dest: SocketAddr,
 }
 
-/// F-115 第2段: sendmmsg 用スクラッチ。
+/// F-115 第2段 / F-124: sendmmsg 用スクラッチ。
 ///
 /// `MmsgRecvScratch` 同様、iovec/sockaddr/cmsg/mmsghdr を Box で固定アドレス化し、ポインタ配線を
-/// `new()` で 1 回だけ行う。送信ごとに変わるのは addr の中身・iovec の指す先・cmsg 長のみで、
+/// `with_batch()` で 1 回だけ行う。送信ごとに変わるのは addr の中身・iovec の指す先・cmsg 長のみで、
 /// `send_mmsg_async` がそれらを in-place に更新する（per-sweep のヒープ確保なし）。
 #[cfg(target_os = "linux")]
 pub struct MmsgSendScratch {
+    /// バッチ幅（1..=MMSG_BATCH_MAX）。
+    batch: usize,
     /// 送信先アドレス（per-entry）。
-    addrs: Box<[libc::sockaddr_storage; MMSG_SEND_BATCH]>,
+    addrs: Box<[libc::sockaddr_storage]>,
     /// 各エントリの iovec（entries[i].data を指す）。
-    iovecs: Box<[libc::iovec; MMSG_SEND_BATCH]>,
-    /// 各エントリの UDP_SEGMENT cmsg バッファ。
-    cmsg_bufs: Box<[[u8; CMSG_BUFFER_SIZE]; MMSG_SEND_BATCH]>,
+    iovecs: Box<[libc::iovec]>,
+    /// 各エントリの UDP_SEGMENT cmsg バッファ（連続領域）。
+    cmsg_bufs: Box<[u8]>,
     /// sendmmsg へ渡す mmsghdr 配列。
-    hdrs: Box<[libc::mmsghdr; MMSG_SEND_BATCH]>,
+    hdrs: Box<[libc::mmsghdr]>,
 }
 
 #[cfg(target_os = "linux")]
 impl MmsgSendScratch {
-    /// スクラッチを確保し、mmsghdr のポインタ配線を 1 回だけ行う。
+    /// 既定バッチ幅でスクラッチを確保する。
     pub fn new() -> Self {
-        // 安全性: いずれも POD（全ビットゼロが有効表現）。
-        let addrs: Box<[libc::sockaddr_storage; MMSG_SEND_BATCH]> =
-            Box::new(unsafe { std::mem::zeroed() });
-        let iovecs: Box<[libc::iovec; MMSG_SEND_BATCH]> = Box::new(unsafe { std::mem::zeroed() });
-        let cmsg_bufs: Box<[[u8; CMSG_BUFFER_SIZE]; MMSG_SEND_BATCH]> =
-            Box::new([[0u8; CMSG_BUFFER_SIZE]; MMSG_SEND_BATCH]);
-        let hdrs: Box<[libc::mmsghdr; MMSG_SEND_BATCH]> = Box::new(unsafe { std::mem::zeroed() });
-
-        let mut scratch = Self {
-            addrs,
-            iovecs,
-            cmsg_bufs,
-            hdrs,
-        };
-        scratch.wire_pointers();
-        scratch
+        Self::with_batch(MMSG_BATCH_DEFAULT)
     }
 
-    /// mmsghdr のポインタを Box 固定アドレスへ配線する（new() から 1 回だけ）。
-    /// msg_namelen / iov 内容 / cmsg 長 / addr 内容は送信ごとに `send_mmsg_async` が更新する。
-    fn wire_pointers(&mut self) {
-        for i in 0..MMSG_SEND_BATCH {
-            let addr_ptr = (&mut self.addrs[i] as *mut libc::sockaddr_storage) as *mut libc::c_void;
-            let iov_ptr = &mut self.iovecs[i] as *mut libc::iovec;
-            let cmsg_ptr = self.cmsg_bufs[i].as_mut_ptr() as *mut libc::c_void;
+    /// 指定バッチ幅でスクラッチを確保し、mmsghdr のポインタ配線を 1 回だけ行う。
+    pub fn with_batch(batch: usize) -> Self {
+        let batch = clamp_mmsg_batch(batch);
+        // 安全性: いずれも POD（全ビットゼロが有効表現）。
+        let mut addrs =
+            vec![unsafe { std::mem::zeroed::<libc::sockaddr_storage>() }; batch].into_boxed_slice();
+        let mut iovecs =
+            vec![unsafe { std::mem::zeroed::<libc::iovec>() }; batch].into_boxed_slice();
+        let mut cmsg_bufs = vec![0u8; batch * CMSG_BUFFER_SIZE].into_boxed_slice();
+        let mut hdrs =
+            vec![unsafe { std::mem::zeroed::<libc::mmsghdr>() }; batch].into_boxed_slice();
 
-            let hdr = &mut self.hdrs[i].msg_hdr;
+        for i in 0..batch {
+            let addr_ptr = (&mut addrs[i] as *mut libc::sockaddr_storage) as *mut libc::c_void;
+            let iov_ptr = &mut iovecs[i] as *mut libc::iovec;
+            let cmsg_ptr =
+                unsafe { cmsg_bufs.as_mut_ptr().add(i * CMSG_BUFFER_SIZE) } as *mut libc::c_void;
+
+            let hdr = &mut hdrs[i].msg_hdr;
             hdr.msg_name = addr_ptr;
             hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
             hdr.msg_iov = iov_ptr;
@@ -1066,6 +1095,20 @@ impl MmsgSendScratch {
             hdr.msg_controllen = 0;
             hdr.msg_flags = 0;
         }
+
+        Self {
+            batch,
+            addrs,
+            iovecs,
+            cmsg_bufs,
+            hdrs,
+        }
+    }
+
+    /// 構築時のバッチ幅。
+    #[inline]
+    pub fn batch_size(&self) -> usize {
+        self.batch
     }
 }
 
@@ -1400,13 +1443,14 @@ impl QuicUdpSocket {
         }
     }
 
-    /// 非 Linux 版 `recv_mmsg_sync`: 単発 `recvfrom` を最大 `MMSG_RECV_BATCH` 回まで
+    /// 非 Linux 版 `recv_mmsg_sync`: 単発 `recvfrom` を最大 `scratch.batch_size()` 回まで
     /// 非ブロッキングで繰り返す（1 件も受信できなければ `WouldBlock` を返す =
     /// Linux 版 recvmmsg と同じ契約）。
     pub fn recv_mmsg_sync(&self, scratch: &mut MmsgRecvScratch) -> io::Result<usize> {
         let fd = self.socket.as_raw_fd();
         let mut count = 0usize;
-        while count < MMSG_RECV_BATCH {
+        let batch = scratch.batch_size();
+        while count < batch {
             let start = count * RECV_BUFFER_SIZE;
             let buf = &mut scratch.bufs[start..start + RECV_BUFFER_SIZE];
             let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
@@ -1440,10 +1484,10 @@ impl QuicUdpSocket {
     pub async fn send_mmsg_async(
         &self,
         entries: &[SendmmsgEntry<'_>],
-        _scratch: &mut MmsgSendScratch,
+        scratch: &mut MmsgSendScratch,
     ) -> io::Result<()> {
         let fd = self.socket.as_raw_fd();
-        for e in entries.iter().take(MMSG_SEND_BATCH) {
+        for e in entries.iter().take(scratch.batch_size()) {
             let (sockaddr, sockaddr_len) = socket_addr_to_raw(e.dest);
             // GSO 無効フォールバック（finalize_send_entry）により通常 segments == 1。
             // 防御的に multi-segment はセグメント境界で分割して個別送信する。
@@ -1483,23 +1527,35 @@ impl QuicUdpSocket {
 }
 
 /// 非 Linux 版 recvmmsg スクラッチ（受信バッファ + per-msg メタ情報のみ。
-/// Linux 版と同一の公開 API: `new` / `meta` / `buf_mut`）。
+/// Linux 版と同一の公開 API: `new` / `with_batch` / `batch_size` / `meta` / `buf_mut`）。
 #[cfg(not(target_os = "linux"))]
 pub struct MmsgRecvScratch {
-    /// MMSG_RECV_BATCH × RECV_BUFFER_SIZE の連続バッファ（Linux 版と同レイアウト）。
+    batch: usize,
+    /// batch × RECV_BUFFER_SIZE の連続バッファ（Linux 版と同レイアウト）。
     bufs: Box<[u8]>,
     /// 受信メタ情報（受信バイト数, 送信元 sockaddr）。`recv_mmsg_sync` が書き込む。
-    metas: Box<[(usize, libc::sockaddr_storage); MMSG_RECV_BATCH]>,
+    metas: Box<[(usize, libc::sockaddr_storage)]>,
 }
 
 #[cfg(not(target_os = "linux"))]
 impl MmsgRecvScratch {
     pub fn new() -> Self {
+        Self::with_batch(MMSG_BATCH_DEFAULT)
+    }
+
+    pub fn with_batch(batch: usize) -> Self {
+        let batch = clamp_mmsg_batch(batch);
         Self {
-            bufs: vec![0u8; MMSG_RECV_BATCH * RECV_BUFFER_SIZE].into_boxed_slice(),
+            batch,
+            bufs: vec![0u8; batch * RECV_BUFFER_SIZE].into_boxed_slice(),
             // 安全性: sockaddr_storage は POD（全ビットゼロが有効表現）。
-            metas: Box::new(unsafe { std::mem::zeroed() }),
+            metas: vec![(0, unsafe { std::mem::zeroed() }); batch].into_boxed_slice(),
         }
+    }
+
+    #[inline]
+    pub fn batch_size(&self) -> usize {
+        self.batch
     }
 
     /// i 番目の受信メタ情報（受信バイト数・送信元・GRO セグメントサイズ = 常に None）。
@@ -1535,15 +1591,34 @@ pub struct SendmmsgEntry<'a> {
     pub dest: SocketAddr,
 }
 
-/// 非 Linux 版 sendmmsg スクラッチ（逐次 sendto のため保持状態なし。API 互換のみ）。
+/// 非 Linux 版 sendmmsg スクラッチ（逐次 sendto のため保持状態はバッチ幅のみ。API 互換）。
 #[cfg(not(target_os = "linux"))]
-#[derive(Default)]
-pub struct MmsgSendScratch {}
+pub struct MmsgSendScratch {
+    batch: usize,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Default for MmsgSendScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[cfg(not(target_os = "linux"))]
 impl MmsgSendScratch {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_batch(MMSG_BATCH_DEFAULT)
+    }
+
+    pub fn with_batch(batch: usize) -> Self {
+        Self {
+            batch: clamp_mmsg_batch(batch),
+        }
+    }
+
+    #[inline]
+    pub fn batch_size(&self) -> usize {
+        self.batch
     }
 }
 
@@ -1695,7 +1770,7 @@ mod tests {
             attempts += 1;
             match server.recv_mmsg_sync(&mut scratch) {
                 Ok(n) => {
-                    assert!((1..=MMSG_RECV_BATCH).contains(&n));
+                    assert!((1..=scratch.batch_size()).contains(&n));
                     for i in 0..n {
                         let (len, from, _gro) = scratch.meta(i).expect("meta");
                         // 送信元は client（localhost）。
@@ -1720,19 +1795,21 @@ mod tests {
     #[test]
     fn test_mmsg_send_scratch_wiring() {
         let scratch = MmsgSendScratch::new();
-        for i in 0..MMSG_SEND_BATCH {
+        assert_eq!(scratch.batch_size(), MMSG_BATCH_DEFAULT);
+        for i in 0..scratch.batch_size() {
             let hdr = &scratch.hdrs[i].msg_hdr;
             // 配線先はいずれも自分の Box 固定領域を指す（非 NULL）。
             assert!(!hdr.msg_name.is_null());
             assert!(!hdr.msg_iov.is_null());
             assert!(!hdr.msg_control.is_null());
             assert_eq!(hdr.msg_iovlen, 1);
-            // msg_name が addrs[i]、msg_control が cmsg_bufs[i] を指すこと。
+            // msg_name が addrs[i]、msg_control が cmsg 連続領域の i 番目を指すこと。
             assert_eq!(
                 hdr.msg_name as *const libc::sockaddr_storage,
                 &scratch.addrs[i] as *const libc::sockaddr_storage
             );
-            assert_eq!(hdr.msg_control as *const u8, scratch.cmsg_bufs[i].as_ptr());
+            let expected_cmsg = scratch.cmsg_bufs[i * CMSG_BUFFER_SIZE..].as_ptr();
+            assert_eq!(hdr.msg_control as *const u8, expected_cmsg);
         }
     }
 
@@ -1741,7 +1818,8 @@ mod tests {
     #[test]
     fn test_mmsg_recv_scratch_wiring() {
         let scratch = MmsgRecvScratch::new();
-        for i in 0..MMSG_RECV_BATCH {
+        assert_eq!(scratch.batch_size(), MMSG_BATCH_DEFAULT);
+        for i in 0..scratch.batch_size() {
             let iov = &scratch.iovecs[i];
             assert_eq!(iov.iov_len, RECV_BUFFER_SIZE);
             let expected = scratch.bufs[i * RECV_BUFFER_SIZE..].as_ptr();

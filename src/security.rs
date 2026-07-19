@@ -198,7 +198,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     54,  // setsockopt
     55,  // getsockopt
     288, // accept4
-    299, // recvmmsg (DNS解決 + HTTP/3 データグラム一括受信: F-115)
+    299, // recvmmsg (DNS解決 + HTTP/3 データグラム一括受信: F-115 / multishot フォールバック F-124)
     307, // sendmmsg (DNS解決 + HTTP/3 データグラム一括送信: F-115)
     // ============================================
     // メモリ管理（mimalloc、Huge Pages、io_uring）
@@ -339,7 +339,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     54,  // setsockopt
     55,  // getsockopt
     288, // accept4
-    299, // recvmmsg (DNS解決 + HTTP/3 データグラム一括受信: F-115)
+    299, // recvmmsg (DNS解決 + HTTP/3 データグラム一括受信: F-115 / multishot フォールバック F-124)
     307, // sendmmsg (DNS解決 + HTTP/3 データグラム一括送信: F-115)
     // ============================================
     // メモリ管理（mimalloc、Huge Pages）
@@ -478,7 +478,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     211, // sendmsg
     212, // recvmsg
     242, // accept4
-    243, // recvmmsg (DNS解決 + HTTP/3 データグラム一括受信: F-115)
+    243, // recvmmsg (DNS解決 + HTTP/3 データグラム一括受信: F-115 / multishot フォールバック F-124)
     269, // sendmmsg (DNS解決 + HTTP/3 データグラム一括送信: F-115)
     // ============================================
     // メモリ管理
@@ -611,7 +611,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     211, // sendmsg
     212, // recvmsg
     242, // accept4
-    243, // recvmmsg (DNS解決 + HTTP/3 データグラム一括受信: F-115)
+    243, // recvmmsg (DNS解決 + HTTP/3 データグラム一括受信: F-115 / multishot フォールバック F-124)
     269, // sendmmsg (DNS解決 + HTTP/3 データグラム一括送信: F-115)
     // ============================================
     // メモリ管理

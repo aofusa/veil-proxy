@@ -18,7 +18,8 @@ use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crate::runtime::ring::{
     IoUring, IoUringCqe, IORING_OP_ACCEPT, IORING_OP_ASYNC_CANCEL, IORING_OP_CLOSE,
-    IORING_OP_CONNECT, IORING_OP_NOP, IORING_OP_POLL_ADD, IORING_OP_POLL_REMOVE, IORING_OP_RECV,
+    IORING_OP_CONNECT, IORING_OP_NOP, IORING_OP_POLL_ADD, IORING_OP_POLL_REMOVE,
+    IORING_OP_PROVIDE_BUFFERS, IORING_OP_RECV, IORING_OP_RECVMSG, IORING_OP_REMOVE_BUFFERS,
     IORING_OP_SEND, IORING_OP_SENDMSG, IORING_OP_SPLICE, IORING_OP_TIMEOUT,
     IORING_SETUP_R_DISABLED,
 };
@@ -33,6 +34,10 @@ use crate::runtime::ring::{
 /// scatter-gather 送信（ゼロコピー）で送出するために使用する。セキュリティサーフェスの
 /// 拡大（restriction 許可リスト +1）は、レスポンス送出ホットパスの syscall/SQE 半減の
 /// 利得を優先して許容する（`docs/backlog/features/F-59` 参照）。
+///
+/// F-124: HTTP/3 UDP 受信を `IORING_OP_RECVMSG` + `IORING_RECV_MULTISHOT` +
+/// provided buffers（`IORING_OP_PROVIDE_BUFFERS` / `REMOVE_BUFFERS`）へ移行。
+/// 従来の POLL_ADD + 同期 recvmmsg の二重往復を廃し、sans-IO quiche 経路と整合させる。
 pub const PROXY_ALLOWED_OPCODES: &[u8] = &[
     IORING_OP_NOP,
     IORING_OP_POLL_ADD,
@@ -44,6 +49,9 @@ pub const PROXY_ALLOWED_OPCODES: &[u8] = &[
     IORING_OP_RECV,
     IORING_OP_SEND,
     IORING_OP_SENDMSG,
+    IORING_OP_RECVMSG,
+    IORING_OP_PROVIDE_BUFFERS,
+    IORING_OP_REMOVE_BUFFERS,
     IORING_OP_CLOSE,
     IORING_OP_SPLICE,
 ];
@@ -109,13 +117,29 @@ const CANCEL_SENTINEL_USER_DATA: u64 = u64::MAX;
 /// 事前確保する in-flight op スロット数（典型的な同時 in-flight op 数を見込む）。
 const OP_TABLE_PREALLOC: usize = 256;
 
+/// Multishot op の完了キュー（F-124: `IORING_RECV_MULTISHOT`）。
+///
+/// 同一 user_data に対して複数 CQE が届くため、`(res, flags)` を FIFO で溜め、
+/// `F_MORE` が落ちるか負の res で終端するまでスロットを解放しない。
+struct MultishotQueue {
+    /// 未消費 CQE（res, flags）。
+    queue: std::collections::VecDeque<(i32, u32)>,
+    /// multishot アームが終了したか（再 arm が必要）。
+    finished: bool,
+}
+
 /// op スロットの状態。
 enum OpSlotState {
     /// 空きスロット（free-list に登録済み）。
     Free,
-    /// Future 生存中の op。
+    /// Future 生存中の op（単発）。
     Active {
         result: OpResult,
+        waker: Option<Waker>,
+    },
+    /// Future 生存中の multishot op（複数 CQE）。
+    MultishotActive {
+        ms: MultishotQueue,
         waker: Option<Waker>,
     },
     /// Future がドロップされ detach された op（完了/キャンセルの CQE 待ち）。
@@ -161,9 +185,9 @@ impl OpTable {
         Self { slots, free }
     }
 
-    /// スロットを確保して user_data（index + 世代パック）を返す。
-    fn alloc(&mut self) -> u64 {
-        let index = match self.free.pop() {
+    /// 空きスロット index を確保する（状態は呼び出し側が設定）。
+    fn alloc_index(&mut self) -> u32 {
+        match self.free.pop() {
             Some(i) => i,
             None => {
                 let i = self.slots.len() as u32;
@@ -173,10 +197,29 @@ impl OpTable {
                 });
                 i
             }
-        };
+        }
+    }
+
+    /// スロットを確保して user_data（index + 世代パック）を返す。
+    fn alloc(&mut self) -> u64 {
+        let index = self.alloc_index();
         let slot = &mut self.slots[index as usize];
         slot.state = OpSlotState::Active {
             result: OpResult::Pending,
+            waker: None,
+        };
+        pack_op(index, slot.generation)
+    }
+
+    /// Multishot 用スロットを確保する（F-124）。
+    fn alloc_multishot(&mut self) -> u64 {
+        let index = self.alloc_index();
+        let slot = &mut self.slots[index as usize];
+        slot.state = OpSlotState::MultishotActive {
+            ms: MultishotQueue {
+                queue: std::collections::VecDeque::with_capacity(64),
+                finished: false,
+            },
             waker: None,
         };
         pack_op(index, slot.generation)
@@ -207,14 +250,20 @@ impl OpTable {
     /// Waker を設定する
     fn set_waker(&mut self, user_data: u64, waker: Waker) {
         if let Some(i) = self.resolve(user_data) {
-            if let OpSlotState::Active { waker: w, .. } = &mut self.slots[i].state {
-                *w = Some(waker);
+            match &mut self.slots[i].state {
+                OpSlotState::Active { waker: w, .. }
+                | OpSlotState::MultishotActive { waker: w, .. } => {
+                    *w = Some(waker);
+                }
+                _ => {}
             }
         }
     }
 
     /// CQE を処理して対応する Waker を wake する
     fn on_cqe(&mut self, cqe: &IoUringCqe) -> bool {
+        use crate::runtime::ring::IORING_CQE_F_MORE;
+
         let Some(i) = self.resolve(cqe.user_data) else {
             // 未知/stale な user_data（ASYNC_CANCEL 自身の CQE 等）→ 無視。
             return false;
@@ -227,8 +276,24 @@ impl OpTable {
                 }
                 true
             }
+            OpSlotState::MultishotActive { ms, waker } => {
+                // Multishot: キューへ積み、F_MORE 無し or エラーで終端。スロットは take まで残す。
+                ms.queue.push_back((cqe.res, cqe.flags));
+                if cqe.res < 0 || (cqe.flags & IORING_CQE_F_MORE) == 0 {
+                    ms.finished = true;
+                }
+                if let Some(w) = waker.take() {
+                    w.wake();
+                }
+                true
+            }
             OpSlotState::Detached(_) => {
                 // detach 済み op が完了/キャンセルした。ここで初めてバッファ解放・fd クローズを行う。
+                // Multishot で F_MORE 付きの中間 CQE が来ても Detached では毎回ガードを走らせない
+                // （最終 CQE / cancel で 1 回）。F_MORE 中間はスロットを残す。
+                if (cqe.flags & IORING_CQE_F_MORE) != 0 && cqe.res >= 0 {
+                    return true;
+                }
                 let state = std::mem::replace(&mut self.slots[i].state, OpSlotState::Free);
                 self.free_slot(i);
                 if let OpSlotState::Detached(guard) = state {
@@ -269,6 +334,18 @@ impl OpTable {
                 self.slots[i].state = OpSlotState::Detached(guard);
                 true
             }
+            OpSlotState::MultishotActive { ms, .. } => {
+                if ms.finished && ms.queue.is_empty() {
+                    // 既に終端済みで未消費なし → 即後始末。
+                    self.free_slot(i);
+                    guard.run(0);
+                    false
+                } else {
+                    // 進行中 or 未消費あり。キャンセルしてガードで延命。
+                    self.slots[i].state = OpSlotState::Detached(guard);
+                    true
+                }
+            }
             _ => false,
         }
     }
@@ -285,6 +362,28 @@ impl OpTable {
             return Some(res);
         }
         None
+    }
+
+    /// Multishot CQE を 1 件取り出す（スロットは finished かつ空になるまで残す）。
+    ///
+    /// 戻り値: `Some((res, flags))` / キュー空で未終端なら `None`（Pending）/
+    /// 終端かつ空なら `Some` ではなくスロット解放して呼び出し側へ終端を示すため
+    /// `take_multishot` は `(Option<(i32,u32)>, finished)` を返す。
+    fn take_multishot(&mut self, user_data: u64) -> (Option<(i32, u32)>, bool) {
+        let Some(i) = self.resolve(user_data) else {
+            return (None, true);
+        };
+        match &mut self.slots[i].state {
+            OpSlotState::MultishotActive { ms, .. } => {
+                let item = ms.queue.pop_front();
+                let finished = ms.finished;
+                if finished && ms.queue.is_empty() {
+                    self.free_slot(i);
+                }
+                (item, finished)
+            }
+            _ => (None, true),
+        }
     }
 
     /// 操作の結果を取得する（スロットを解放しない）
@@ -579,6 +678,23 @@ where
 #[inline]
 pub fn alloc_op() -> u64 {
     OP_TABLE.with(|t| t.borrow_mut().alloc())
+}
+
+/// Multishot 用スロットを確保する（F-124: `IORING_RECV_MULTISHOT`）。
+///
+/// 同一 user_data に複数 CQE が届き、`take_multishot_cqe` で 1 件ずつ取り出す。
+#[inline]
+pub fn alloc_multishot_op() -> u64 {
+    OP_TABLE.with(|t| t.borrow_mut().alloc_multishot())
+}
+
+/// Multishot CQE を 1 件取り出す。
+///
+/// 戻り値: `(Some((res, flags)), finished)` / キュー空なら `(None, finished)`。
+/// `finished && item.is_none()` のときスロットは解放済みで、呼び出し側は再 arm する。
+#[inline]
+pub fn take_multishot_cqe(user_data: u64) -> (Option<(i32, u32)>, bool) {
+    OP_TABLE.with(|t| t.borrow_mut().take_multishot(user_data))
 }
 
 /// 操作の Waker を設定する
