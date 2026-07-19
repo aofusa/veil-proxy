@@ -41,9 +41,15 @@ pub struct QuicConn {
 
 impl QuicConn {
     /// 新規サーバ接続を作成
+    ///
+    /// * `client_scid` — Initial の SCID（サーバから見た DCID）
+    /// * `server_scid` — サーバが選ぶ SCID
+    /// * `original_dcid` — Initial の DCID（transport params 必須）
+    #[allow(clippy::too_many_arguments)]
     pub fn server_new(
-        dcid: &[u8],
-        scid: &[u8],
+        client_scid: &[u8],
+        server_scid: &[u8],
+        original_dcid: &[u8],
         local: SocketAddr,
         remote: SocketAddr,
         version: u32,
@@ -79,17 +85,21 @@ impl QuicConn {
         params.initial_max_stream_data_uni = initial_max_stream_uni;
         params.initial_max_streams_bidi = initial_max_streams_bidi;
         params.initial_max_streams_uni = initial_max_streams_uni;
-        // idle timeout: nanoseconds in some versions - check. ngtcp2 uses nanoseconds for max_idle_timeout
+        // idle timeout: nanoseconds
         params.max_idle_timeout = max_idle_ms.saturating_mul(1_000_000);
         params.active_connection_id_limit = 4;
+        // サーバは Initial の DCID を original_dcid として必須設定
+        // （ngtcp2 assert: server && params->original_dcid_present）
+        params.original_dcid = cid_from_slice(original_dcid);
+        params.original_dcid_present = 1;
 
         let mut user_data = Box::new(ConnUserData {
             stream_queue: VecDeque::new(),
         });
         let user_ptr = &mut *user_data as *mut ConnUserData as *mut c_void;
 
-        let dcid_raw = cid_from_slice(dcid);
-        let scid_raw = cid_from_slice(scid);
+        let dcid_raw = cid_from_slice(client_scid);
+        let scid_raw = cid_from_slice(server_scid);
 
         let (local_ss, local_len) = sockaddr_to_raw(&local);
         let (remote_ss, remote_len) = sockaddr_to_raw(&remote);
@@ -289,7 +299,7 @@ impl QuicConn {
                 buf.as_mut_ptr(),
                 buf.len(),
                 &mut pdatalen,
-                flags as u32,
+                flags,
                 stream_id,
                 &ngtcp2_vec {
                     base: data.as_ptr() as *mut u8,
@@ -489,6 +499,26 @@ pub fn accept_packet(pkt: &[u8]) -> Option<(u32, Vec<u8>, Vec<u8>)> {
     let dcid = hd.dcid.data[..hd.dcid.datalen].to_vec();
     let scid = hd.scid.data[..hd.scid.datalen].to_vec();
     Some((hd.version, dcid, scid))
+}
+
+/// 任意パケットから DCID を取り出す（接続ルックアップ用）
+pub fn extract_dcid(pkt: &[u8]) -> Option<Vec<u8>> {
+    if pkt.is_empty() {
+        return None;
+    }
+    let mut hd: ngtcp2_pkt_hd = unsafe { std::mem::zeroed() };
+    // short header / long header 両対応: decode を試みる
+    let rv = unsafe {
+        ngtcp2_pkt_decode_hd_short(&mut hd, pkt.as_ptr(), pkt.len(), NGTCP2_MAX_CIDLEN as usize)
+    };
+    if rv >= 0 {
+        return Some(hd.dcid.data[..hd.dcid.datalen].to_vec());
+    }
+    let rv = unsafe { ngtcp2_pkt_decode_hd_long(&mut hd, pkt.as_ptr(), pkt.len()) };
+    if rv >= 0 {
+        return Some(hd.dcid.data[..hd.dcid.datalen].to_vec());
+    }
+    None
 }
 
 pub fn timestamp_ns() -> u64 {

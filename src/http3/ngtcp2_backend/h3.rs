@@ -43,6 +43,8 @@ struct BodyQueue {
 /// サーバ側 HTTP/3 接続
 pub struct H3Conn {
     inner: *mut nghttp3_conn,
+    /// ヒープ固定: H3UserData.events が指す先。H3Conn の move でポインタが無効にならないよう Box。
+    #[allow(clippy::box_collection)] // 理由: FFI user_data が指すイベントキューのアドレス固定
     events: Box<VecDeque<H3Event>>,
     user_data: Box<H3UserData>,
 }

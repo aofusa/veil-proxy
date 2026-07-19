@@ -155,7 +155,7 @@ unsafe extern "C" fn alpn_select_cb(
     if wire.len() >= 3 {
         *out = wire.as_ptr().add(1);
         *outlen = wire[0];
-        return aws_lc_sys::SSL_TLSEXT_ERR_OK as i32;
+        return aws_lc_sys::SSL_TLSEXT_ERR_OK;
     }
-    aws_lc_sys::SSL_TLSEXT_ERR_NOACK as i32
+    aws_lc_sys::SSL_TLSEXT_ERR_NOACK
 }

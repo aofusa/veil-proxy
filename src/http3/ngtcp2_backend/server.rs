@@ -16,13 +16,15 @@ use nghttp3_sys::nghttp3_vec;
 use crate::config::{Backend, CURRENT_CONFIG, SHUTDOWN_FLAG};
 use crate::http3::common::{secure_zero, Http3ServerConfig};
 use crate::logging::log_access;
-use crate::metrics::{http3_stream_closed, http3_stream_opened, Http3ActiveConnGuard};
+use crate::metrics::{
+    http3_stream_closed, http3_stream_opened, http3_streams_closed_n, Http3ActiveConnGuard,
+};
 use crate::pool::MAX_HEADER_SIZE;
 use crate::proxy::{check_security, SecurityCheckResult};
 use crate::udp::QuicUdpSocket;
 use crate::upstream::find_backend_unified;
 
-use super::conn::{accept_packet, timestamp_ns, QuicConn, QUIC_V1};
+use super::conn::{accept_packet, extract_dcid, timestamp_ns, QuicConn, QUIC_V1};
 use super::crypto::TlsContext;
 use super::h3::{H3Conn, H3Event};
 
@@ -35,7 +37,18 @@ struct Handler {
     client_ip: String,
     bodies: HashMap<i64, Vec<u8>>,
     headers: HashMap<i64, Vec<(Vec<u8>, Vec<u8>)>>,
+    /// メトリクス open 中のストリーム数（Drop で一括 close）
+    open_streams: usize,
     _metric: Http3ActiveConnGuard,
+}
+
+impl Drop for Handler {
+    fn drop(&mut self) {
+        if self.open_streams > 0 {
+            http3_streams_closed_n(self.open_streams);
+            self.open_streams = 0;
+        }
+    }
 }
 
 impl Handler {
@@ -47,6 +60,7 @@ impl Handler {
             peer,
             bodies: HashMap::new(),
             headers: HashMap::new(),
+            open_streams: 0,
             _metric: Http3ActiveConnGuard::new(),
         }
     }
@@ -115,6 +129,7 @@ impl Handler {
                 continue;
             }
             http3_stream_opened();
+            self.open_streams = self.open_streams.saturating_add(1);
             self.headers.insert(sid, headers);
         }
         for sid in finished {
@@ -122,6 +137,7 @@ impl Handler {
                 let body = self.bodies.remove(&sid).unwrap_or_default();
                 self.handle_request(sid, headers, body).await?;
                 http3_stream_closed();
+                self.open_streams = self.open_streams.saturating_sub(1);
             }
         }
         Ok(())
@@ -695,7 +711,8 @@ fn parse_http_response(response: &[u8]) -> (u16, Vec<(Vec<u8>, Vec<u8>)>, Vec<u8
 
 async fn read_file_offload(path: &Path) -> io::Result<Vec<u8>> {
     let path = path.to_path_buf();
-    // コールド/低頻度: offload でイベントループをブロックしない
+    // 理由: 同期 FS は offload 閉包内（専用ワーカースレッド）で実行され、イベントループを塞がない。
+    #[allow(clippy::disallowed_methods)]
     crate::runtime::offload::offload(move || std::fs::read(&path)).await
 }
 
@@ -705,6 +722,9 @@ struct TempPem {
 
 impl Drop for TempPem {
     fn drop(&mut self) {
+        // Drop は同期コンテキスト。証明書一時ファイル削除は起動/終了のコールドパスのみ。
+        #[allow(clippy::disallowed_methods)]
+        // 理由: Drop トレイトは async 不可。一時 PEM の unlink のみ。
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -716,6 +736,8 @@ fn write_temp_pem(name: &str, data: &[u8]) -> io::Result<TempPem> {
         std::process::id(),
         timestamp_ns()
     ));
+    // 起動時コールドパス: TLS コンテキスト構築用の一時 PEM 書き込み
+    #[allow(clippy::disallowed_methods)] // 理由: サーバ起動時のみ。ランタイム event loop 前。
     {
         let mut f = std::fs::File::create(&path)?;
         f.write_all(data)?;
@@ -795,7 +817,11 @@ pub async fn run_http3_server_async(
             Ok((Ok((n, from)), buf)) => {
                 recv_buf = buf;
                 let data = &recv_buf[..n];
-                process_packet(data, from, bind_addr, &connections, &tls_ctx, &config).await?;
+                let immediate =
+                    process_packet(data, from, bind_addr, &connections, &tls_ctx, &config).await?;
+                for pkt in immediate {
+                    let (_r, _) = socket.send_to(pkt, from).await;
+                }
             }
             Ok((Err(e), buf)) => {
                 recv_buf = buf;
@@ -814,10 +840,8 @@ pub async fn run_http3_server_async(
                     let mut conns = connections.borrow_mut();
                     for (cid, h) in conns.iter_mut() {
                         let exp = h.quic.get_expiry();
-                        if exp != u64::MAX && exp <= now {
-                            if h.quic.handle_expiry(now).is_err() {
-                                dead.push(cid.clone());
-                            }
+                        if exp != u64::MAX && exp <= now && h.quic.handle_expiry(now).is_err() {
+                            dead.push(cid.clone());
                         }
                         if h.quic.is_draining() || h.quic.is_closing() {
                             dead.push(cid.clone());
@@ -830,22 +854,34 @@ pub async fn run_http3_server_async(
             }
         }
 
-        // drive connections
+        // drive connections（await を RefCell 借用と跨がない）
         let cids: Vec<Vec<u8>> = connections.borrow().keys().cloned().collect();
         let mut out_pkts = Vec::new();
         for cid in cids {
-            let mut conns = connections.borrow_mut();
-            let Some(h) = conns.get_mut(&cid) else {
-                continue;
+            // 同期処理
+            {
+                let mut conns = connections.borrow_mut();
+                let Some(h) = conns.get_mut(&cid) else {
+                    continue;
+                };
+                let _ = h.try_init_h3();
+                let _ = h.feed_stream_data();
+            }
+            // Handler を一時的に取り出す（await と RefCell 借用を跨がない）
+            let mut handler = {
+                let mut conns = connections.borrow_mut();
+                match conns.remove(&cid) {
+                    Some(h) => h,
+                    None => continue,
+                }
             };
-            let _ = h.try_init_h3();
-            let _ = h.feed_stream_data();
-            if let Err(e) = h.process_h3_events().await {
+            if let Err(e) = handler.process_h3_events().await {
                 warn!("h3 events: {e}");
             }
-            if let Err(e) = h.flush_h3_to_quic(&mut out_pkts) {
+            if let Err(e) = handler.flush_h3_to_quic(&mut out_pkts) {
                 warn!("flush: {e}");
             }
+            connections.borrow_mut().insert(cid, handler);
         }
 
         for (to, pkt) in out_pkts {
@@ -855,6 +891,7 @@ pub async fn run_http3_server_async(
     Ok(())
 }
 
+/// 受信パケットを処理し、即座に送出すべき UDP ペイロードを返す。
 async fn process_packet(
     data: &[u8],
     from: SocketAddr,
@@ -862,26 +899,62 @@ async fn process_packet(
     connections: &ConnMap,
     tls_ctx: &Rc<TlsContext>,
     config: &Http3ServerConfig,
-) -> io::Result<()> {
+) -> io::Result<Vec<Vec<u8>>> {
     let ts = timestamp_ns();
+    let mut out = Vec::new();
 
-    // 同一 peer の既存接続を優先
-    {
-        let mut conns = connections.borrow_mut();
-        for h in conns.values_mut() {
-            if h.peer == from && h.quic.read_pkt(local, from, data, ts).is_ok() {
-                return Ok(());
+    fn drain_writes(h: &mut Handler, out: &mut Vec<Vec<u8>>) {
+        // H3 制御ストリーム / レスポンスを QUIC に載せる
+        let mut tmp = Vec::new();
+        let _ = h.flush_h3_to_quic(&mut tmp);
+        for (_peer, pkt) in tmp {
+            out.push(pkt);
+        }
+        let ts = timestamp_ns();
+        loop {
+            let mut buf = vec![0u8; 1350];
+            match h.quic.write_pkt(&mut buf, ts) {
+                Ok(0) => break,
+                Ok(n) => out.push(buf[..n].to_vec()),
+                Err(_) => break,
             }
         }
     }
 
-    if let Some((version, _dcid, scid)) = accept_packet(data) {
+    // DCID で接続を特定（並行テストで peer IP が同一のため必須）
+    if let Some(dcid) = extract_dcid(data) {
+        let mut conns = connections.borrow_mut();
+        if let Some(h) = conns.get_mut(&dcid) {
+            if h.quic.read_pkt(local, from, data, ts).is_ok() {
+                h.peer = from;
+                let _ = h.try_init_h3();
+                let _ = h.feed_stream_data();
+                drain_writes(h, &mut out);
+                return Ok(out);
+            }
+        }
+    }
+    // フォールバック: 同一 peer
+    {
+        let mut conns = connections.borrow_mut();
+        for h in conns.values_mut() {
+            if h.peer == from && h.quic.read_pkt(local, from, data, ts).is_ok() {
+                let _ = h.try_init_h3();
+                let _ = h.feed_stream_data();
+                drain_writes(h, &mut out);
+                return Ok(out);
+            }
+        }
+    }
+
+    if let Some((version, client_dcid, client_scid)) = accept_packet(data) {
         let mut new_scid = [0u8; 16];
         let _ = aws_lc_rs::rand::fill(&mut new_scid);
         let tls = tls_ctx.create_session()?;
         let quic = QuicConn::server_new(
-            &scid,
+            &client_scid,
             &new_scid,
+            &client_dcid,
             local,
             from,
             if version == 0 { QUIC_V1 } else { version },
@@ -898,18 +971,22 @@ async fn process_packet(
         let mut handler = Handler::new(quic, from);
         if let Err(e) = handler.quic.read_pkt(local, from, data, ts) {
             error!("[HTTP/3/ngtcp2] first read_pkt: {e}");
-            return Ok(());
+            return Ok(out);
         }
+        drain_writes(&mut handler, &mut out);
         connections.borrow_mut().insert(new_scid.to_vec(), handler);
-        return Ok(());
+        return Ok(out);
     }
 
     // フォールバック: 全接続試行
     let mut conns = connections.borrow_mut();
     for h in conns.values_mut() {
         if h.quic.read_pkt(local, from, data, ts).is_ok() {
+            let _ = h.try_init_h3();
+            let _ = h.feed_stream_data();
+            drain_writes(h, &mut out);
             break;
         }
     }
-    Ok(())
+    Ok(out)
 }

@@ -40,7 +40,7 @@ fn main() {
         .define("BORINGSSL_INCLUDE_DIR", &aws_include)
         .define(
             "BORINGSSL_LIBRARIES",
-            &format!(
+            format!(
                 "{};{}",
                 path_for_cmake(&ssl_lib),
                 path_for_cmake(&crypto_lib)
