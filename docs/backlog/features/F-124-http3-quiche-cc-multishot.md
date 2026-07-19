@@ -1,35 +1,43 @@
-# F-124: HTTP/3 quiche 輻輳制御・バッチ設定 + 低レベル API + io_uring RECVMSG
+# F-124: HTTP/3 quiche 輻輳制御・バッチ設定 + IORING_OP_RECVMSG 受信経路
 
-**ステータス: 完了（2026-07-19）**
+**ステータス: 完了（2026-07-19）— ただし真 Multishot は未達。後続は [F-125](F-125-http3-quiche-multishot-followup.md)**
 
-## 機能説明
+---
 
-1. **`[http3]` で quiche `Config` の輻輳制御 / Pacing / HyStart を設定可能にする**
+## 機能説明（実施内容）
+
+1. **`[http3]` で quiche `Config` の輻輳制御 / Pacing / HyStart を設定可能**
    - `cc_algorithm`（既定 `bbr`）、`pacing`（既定 true）、`max_pacing_rate`、`hystart`（既定 true）
-2. **UDP バッチ幅を既定 64 にし、設定可能にする**
-   - `mmsg_batch_size`（1..=128、既定 64）— `recvmmsg`/`sendmmsg` バッチ幅
-3. **quiche 低レベル sans-IO + `IORING_OP_RECVMSG` 受信経路**
-   - 先頭パケット: `IORING_OP_RECVMSG` + `IORING_RECVSEND_POLL_FIRST`（POLL_ADD+同期 recvmsg の二重往復を排除）
-   - 継続 drain: `recvmmsg` で batch 件一括
-   - `PROXY_ALLOWED_OPCODES` に `RECVMSG` / `PROVIDE_BUFFERS` / `REMOVE_BUFFERS` を追加（将来の true multishot 用含む）
-   - reactor / 初期化失敗時は従来の POLL + `recvmmsg` フォールバック
+2. **UDP mmsg バッチ幅を既定 64 にし、設定可能**
+   - `mmsg_batch_size`（1..=128）
+3. **受信待機を `IORING_OP_RECVMSG`（単発 + `POLL_FIRST`）へ**し、継続は `recvmmsg` drain
+   - 当初目標だった **`IORING_RECV_MULTISHOT` + provided buffers は試作後に後退**（multi-peer UDP で不安定）
+   - 詳細・残り作業は **F-125 を正** とする
 
 ## 改修内容
 
-- `src/config.rs` / `Http3ServerConfig` / `entry.rs`（TOML → ワーカーへ正しい輸送パラメータを渡す）
-- `src/udp/socket.rs`（バッチ幅ランタイム化、既定 64）
-- `src/runtime/uring/{ring,executor,udp_recv}.rs`（multishot 受信）
-- `src/http3_server.rs`（CC 適用、multishot メインループ）
+- `src/config.rs` / `Http3ServerConfig` / `entry.rs`（TOML → ワーカー配線修正含む）
+- `src/udp/socket.rs`（batch 既定 64・`with_batch`）
+- `src/runtime/uring/udp_recv.rs`（RECVMSG 単発 Future）
+- `src/runtime/uring/executor.rs` / `ring.rs`（RECVMSG 許可。multishot OpTable は残骸として残存 → F-125）
+- `src/http3_server.rs`（CC 適用・受信分岐）
 - `examples/config.toml` / `contrib/config/config.toml` / README / README.ja
 
-## 受け入れ条件
+## 受け入れ条件（F-124 時点で満たしたもの）
 
-- `cargo build`（full / default / no-default-features / 主要 features）で warning なし（正当な `dead_code` allow は理由付きのみ）
-- HTTP/3 関連ユニット・統合・E2E が通る
-- Docker `--net=host` で GSO/GRO on/off の双方が動作
-- tools/perf で HTTP/3 代表 1 構成のスループットを記録
+- [x] CC/Pacing/batch の TOML 設定
+- [x] 既定 batch 64
+- [x] POLL_ADD+同期 recvmsg の先頭待機を IORING_OP_RECVMSG に置換
+- [x] 主要 build / unit test / E2E おおむね通過、Docker GSO on/off
+- [ ] ~~真 Multishot~~ → **F-125**
+- [ ] ~~AGENTS.md / コメント整合 / tools/perf 公式~~ → **F-125**
 
 ## 依存・リスク
 
-- multishot RECVMSG は kernel 6.0+。それ未満ではフォールバック
-- provided buffer 枯渇（ENOBUFS）時は再提供 + rearm
+- 真 Multishot 未実装。命名（`MultishotUdpRecv` / `VEIL_H3_MULTISHOT`）が実態とずれる
+- executor に未使用の multishot 完了キュー・PROVIDE 許可が残る（security surface）
+
+## 関連
+
+- 後続: [F-125](F-125-http3-quiche-multishot-followup.md)（**委譲用フル引き継ぎドキュメント**）
+- 前提: [F-115](F-115-http3-recvmmsg-sendmmsg-batching.md)、[F-33](F-33-http3-gso-gro-offload.md)
