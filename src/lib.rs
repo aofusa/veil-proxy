@@ -19,14 +19,19 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
-// kTLS はカーネルオフロード実装のため Linux 専用（F-120 設計 2 節）。`ktls` feature が
-// 有効でも非 Linux では `veil_ktls` が立たず、下の `simple_tls`（ユーザ空間 rustls）へ
-// 自動フォールバックする。
+// kTLS はカーネルオフロード実装のため Linux/FreeBSD 専用（F-120 設計 2 節 / F-126）。
+// `ktls` feature が有効でも非対応 OS（OpenBSD）では `veil_ktls` が立たず、下の
+// `simple_tls`（ユーザ空間 rustls）へ自動フォールバックする。
 #[cfg(veil_ktls)]
 pub mod ktls;
 
 #[cfg(veil_ktls)]
 pub mod ktls_rustls;
+
+/// FreeBSD kTLS 送受信オフロード実装（F-126）。Linux 経路（`src/ktls.rs` の
+/// Linux 専用構造体・setsockopt 呼び出し）とは完全に分離されたモジュール。
+#[cfg(all(veil_ktls, target_os = "freebsd"))]
+pub mod ktls_freebsd;
 
 #[cfg(feature = "http2")]
 pub mod protocol;

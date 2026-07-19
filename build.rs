@@ -39,7 +39,7 @@ fn feature_enabled(name: &str) -> bool {
 /// | `veil_poller_epoll` | `target_os = "linux"` かつ `feature = "epoll"` | reactor の poller = epoll |
 /// | `veil_poller_kqueue` | `target_os = "freebsd"`、`"openbsd"`、`"macos"` | reactor の poller = kqueue |
 /// | `veil_poller_wsapoll` | `target_os = "windows"` | reactor の poller = WSAPoll（F-125、cfg 発行のみ。実装は別作業） |
-/// | `veil_ktls` | `feature = "ktls"` かつ `target_os = "linux"` | kTLS カーネルオフロード経路 |
+/// | `veil_ktls` | `feature = "ktls"` かつ (`target_os = "linux"` または `"freebsd"`) | kTLS カーネルオフロード経路（F-126: FreeBSD 対応追加。OpenBSD は非対応のまま） |
 ///
 /// `cargo::rustc-check-cfg` も併せて発行し、`unexpected_cfgs` 警告を防ぐ。
 fn emit_runtime_backend_cfg() {
@@ -102,7 +102,7 @@ fn emit_runtime_backend_cfg() {
         }
     }
 
-    if ktls && target_os == "linux" {
+    if ktls && (target_os == "linux" || target_os == "freebsd") {
         println!("cargo::rustc-cfg=veil_ktls");
     }
 }

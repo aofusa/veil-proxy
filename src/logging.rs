@@ -472,7 +472,10 @@ pub(crate) fn log_ktls_status(ktls_config: &crate::KtlsConfig) {
                 }
             } else {
                 warn!("kTLS: Requested but kernel support not available");
+                #[cfg(target_os = "linux")]
                 warn!("kTLS: Ensure 'modprobe tls' has been run and kernel 5.15+ is used");
+                #[cfg(target_os = "freebsd")]
+                warn!("kTLS: Ensure 'sysctl kern.ipc.tls.enable=1' is set (FreeBSD 13.0+)");
                 if ktls_config.fallback_enabled {
                     warn!("kTLS: Falling back to userspace TLS via rustls");
                 } else {

@@ -19,7 +19,7 @@ A high-performance reverse proxy server using io_uring (custom runtime) and rust
 ### Core Features
 - **Asynchronous I/O**: Efficient I/O processing with custom io_uring runtime (no monoio/tokio dependency in data plane)
 - **TLS**: Memory-safe pure Rust TLS implementation with rustls
-- **kTLS**: Kernel TLS offload support via rustls + custom kTLS module (Linux 5.15+)
+- **kTLS**: Kernel TLS offload support via rustls + custom kTLS module (Linux 5.15+, FreeBSD 13.0+ — F-126)
 - **HTTP/2**: HTTP/2 support via TLS ALPN negotiation (stream multiplexing, HPACK compression with **4-bit LUT Huffman decode** — F-121)
 - **H2C Server**: HTTP/2 Cleartext (H2C) server support without TLS (Prior Knowledge mode, RFC 7540 Section 3.4)
 - **HTTP/3**: QUIC/UDP-based HTTP/3 support using quiche (0-RTT connection establishment)
@@ -94,7 +94,7 @@ hot-path cost). The default is unchanged (Linux io_uring).
 |----------|-----------------|-----------------|------|-------|
 | **Linux (default)** | io_uring (`src/runtime/uring/`) | seccomp + Landlock + CBPF | ✅ (Linux 5.15+) | Default features unchanged; performance non-regressed |
 | **Linux `--features epoll`** | epoll readiness reactor (`src/runtime/reactor/`) | seccomp (epoll syscalls; io_uring syscalls dropped) + Landlock | ✅ | Fallback for hosts without io_uring |
-| **FreeBSD (x86_64/aarch64)** | kqueue readiness reactor | capsicum (`cap_rights_limit` / `cap_enter`) + jail | ✗ (userspace rustls) | `[security] enable_capsicum`, `capsicum_capability_mode`, `jail_name` |
+| **FreeBSD (x86_64/aarch64)** | kqueue readiness reactor | capsicum (`cap_rights_limit` / `cap_enter`) + jail | ✅ (FreeBSD 13.0+, `TCP_TXTLS_ENABLE`/`TCP_RXTLS_ENABLE`; F-126) | `[security] enable_capsicum`, `capsicum_capability_mode`, `jail_name` |
 | **OpenBSD (x86_64/aarch64)** | kqueue readiness reactor | pledge + unveil | ✗ (userspace rustls) | `[security] enable_pledge`, `enable_unveil`. TLS uses the **ring** rustls provider (aws-lc-rs can't complete handshakes on OpenBSD; F-122). HTTPS static/proxy serving verified 200 |
 | **macOS (x86_64/aarch64, universal2)** | kqueue readiness reactor (reused from FreeBSD/OpenBSD) | `sandbox_init` (Seatbelt) | ✗ (userspace rustls) | `[security] enable_sandbox_macos`. TLS uses the **ring** rustls provider (aws-lc-sys can't cross-link under zig; F-125). Cross-built with `cargo zigbuild --target universal2-apple-darwin`; QEMU/real-hardware testing not performed — see caveats below |
 
@@ -522,7 +522,7 @@ huge_pages_enabled = true
 [tls]
 cert_path = "/path/to/cert.pem"
 key_path = "/path/to/key.pem"
-ktls_enabled = true         # Enable kTLS (Linux 5.15+, requires feature flag)
+ktls_enabled = true         # Enable kTLS (Linux 5.15+ or FreeBSD 13.0+, requires feature flag; F-126)
 ktls_fallback_enabled = true # Fallback to rustls on kTLS failure (default: true)
 tcp_cork_enabled = true     # Use TCP_CORK during kTLS setup (default: true)
 

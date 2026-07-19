@@ -217,7 +217,8 @@ level = "info"
 cert_path = "/path/to/cert.pem"
 key_path = "/path/to/key.pem"
 
-# kTLS有効化（Linux 5.15+、feature flag必須）
+# kTLS有効化（Linux 5.15+ または FreeBSD 13.0+、feature flag必須。F-126）
+# FreeBSD では別途 `sysctl kern.ipc.tls.enable=1` が必要（既定 0）。
 ktls_enabled = true
 
 # kTLS有効化失敗時にrustlsへフォールバックするかどうか
@@ -225,7 +226,7 @@ ktls_enabled = true
 # true: kTLS失敗時はrustlsで継続（デフォルト）
 ktls_fallback_enabled = true
 
-# kTLS有効時にTCP_CORKを使用するかどうか
+# kTLS有効時にTCP_CORKを使用するかどうか（Linux のみ有効。FreeBSD では no-op）
 #
 # TCP_CORKはkTLS設定中に小さなTCPパケットの送信を遅延し、
 # パケット結合により効率的なネットワーク転送を実現します。

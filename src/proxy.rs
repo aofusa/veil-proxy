@@ -36,7 +36,11 @@ use crate::server::spawn_background_revalidation;
 #[cfg(feature = "http2")]
 use crate::http2;
 #[cfg(veil_ktls)]
-use crate::ktls_rustls::{KtlsServerStream, RustlsAcceptor, SplicePipe};
+use crate::ktls_rustls::{KtlsServerStream, RustlsAcceptor};
+// SplicePipe は splice(2)（Linux 専用）用。FreeBSD kTLS は splice を使わずバッファ転送へ
+// フォールバックするため Linux 限定で import する（F-126）。
+#[cfg(all(veil_ktls, target_os = "linux"))]
+use crate::ktls_rustls::SplicePipe;
 #[cfg(not(veil_ktls))]
 use crate::simple_tls;
 
@@ -6700,7 +6704,7 @@ async fn proxy_http_pooled(
             && !buffering_enabled
             && !wasm_modules_active
         {
-            let splice_result = proxy_http_request_splice(
+            let splice_result = try_splice_proxy(
                 &client_stream,
                 &backend_stream,
                 &request,
@@ -8756,7 +8760,7 @@ async fn transfer_exact_bytes_from_backend_with_cache(
 ///
 /// pipe に取り込んだ n バイトは dst のバックプレッシャに追従して**必ず全量ドレイン**
 /// してから次のチャンクへ進む（pipe 内残データと `remaining` のずれによるデータ損失を防ぐ）。
-#[cfg(veil_ktls)]
+#[cfg(all(veil_ktls, target_os = "linux"))]
 async fn splice_body_transfer(
     src_stream: &TcpStream,
     dst_stream: &TcpStream,
@@ -8861,7 +8865,47 @@ async fn splice_body_transfer(
 ///
 /// Content-Length が指定されている場合はボディ転送に splice を使用。
 /// Chunked 転送の場合は通常の転送を使用。
-#[cfg(veil_ktls)]
+/// splice ベースの kTLS プロキシ転送を試みる（F-126 クロスプラットフォーム分岐点）。
+///
+/// splice(2) は Linux 専用のため、Linux では [`proxy_http_request_splice`] を呼ぶ。
+/// FreeBSD 等の非 Linux では `None` を返し、呼び出し側のバッファ転送
+/// （`proxy_http_request_with_compression`）へフォールバックさせる。FreeBSD kTLS は
+/// カーネル暗号化自体は有効だが、プロキシのデータ転送は通常の write 経路を用いる。
+#[cfg(all(veil_ktls, target_os = "linux"))]
+async fn try_splice_proxy(
+    client_stream: &KtlsServerStream,
+    backend_stream: &TcpStream,
+    request: &[u8],
+    content_length: usize,
+    is_chunked: bool,
+    initial_body: &[u8],
+) -> Option<(u16, u64, bool, bool)> {
+    proxy_http_request_splice(
+        client_stream,
+        backend_stream,
+        request,
+        content_length,
+        is_chunked,
+        initial_body,
+    )
+    .await
+}
+
+/// splice 非対応プラットフォーム（FreeBSD 等）向けのフォールバック: 常に `None` を返し
+/// 呼び出し側のバッファ転送経路へ委ねる（F-126）。
+#[cfg(all(veil_ktls, not(target_os = "linux")))]
+async fn try_splice_proxy(
+    _client_stream: &KtlsServerStream,
+    _backend_stream: &TcpStream,
+    _request: &[u8],
+    _content_length: usize,
+    _is_chunked: bool,
+    _initial_body: &[u8],
+) -> Option<(u16, u64, bool, bool)> {
+    None
+}
+
+#[cfg(all(veil_ktls, target_os = "linux"))]
 async fn proxy_http_request_splice(
     client_stream: &KtlsServerStream,
     backend_stream: &TcpStream,
@@ -8963,7 +9007,7 @@ async fn proxy_http_request_splice(
 /// バックエンド(TCP) からヘッダーを読み取り、パースしてクライアント(kTLS)に送信。
 /// ボディは Content-Length の場合は splice、Chunked の場合は通常転送。
 /// 戻り値: (ステータス, 転送バイト数, backend_wants_keep_alive, client_must_close)
-#[cfg(veil_ktls)]
+#[cfg(all(veil_ktls, target_os = "linux"))]
 async fn splice_transfer_response_ktls(
     backend_stream: &TcpStream,
     client_stream: &KtlsServerStream,

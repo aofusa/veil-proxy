@@ -20,9 +20,10 @@
 //! の別名再エクスポートで呼び出し側を単一化する。Cargo 側では target 別依存で
 //! 非 OpenBSD は `aws_lc_rs` のみ・OpenBSD は `ring` のみをリンクする（Linux ビルドは不変）。
 //!
-//! kTLS 経路（`src/ktls.rs` / `src/ktls_rustls.rs`）は `veil_ktls`（Linux 限定）でのみ
-//! コンパイルされ AWS-LC 固有 API（cipher_suite 定数）に依存するため、本モジュールでは
-//! 抽象化せず各所で直接 `aws_lc_rs` を参照する（OpenBSD では非コンパイル）。
+//! kTLS 経路（`src/ktls.rs` / `src/ktls_rustls.rs` / `src/ktls_freebsd.rs`）は
+//! `veil_ktls`（Linux/FreeBSD 限定、F-126）でのみコンパイルされ AWS-LC 固有 API
+//! （cipher_suite 定数）に依存するため、本モジュールでは抽象化せず各所で直接
+//! `aws_lc_rs` を参照する（OpenBSD/macOS では非コンパイル）。
 
 /// このプラットフォームで使う rustls 暗号プロバイダモジュール。
 ///

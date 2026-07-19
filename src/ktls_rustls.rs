@@ -607,7 +607,7 @@ fn try_enable_ktls_client(
     }
 }
 
-/// ULP設定後のkTLS設定（シークレット抽出とTX/RX設定）
+/// ULP設定後のkTLS設定（シークレット抽出とTX/RX設定） (Linux)
 ///
 /// 自前実装の ktls モジュールを使用して以下を行います：
 /// 1. TCP_CORK を有効化（パケット結合最適化）
@@ -616,7 +616,7 @@ fn try_enable_ktls_client(
 /// 4. setsockopt でカーネルに設定
 /// 5. 鍵情報をセキュアにゼロ化
 /// 6. TCP_CORK を無効化
-#[cfg(feature = "ktls")]
+#[cfg(all(feature = "ktls", target_os = "linux"))]
 fn setup_ktls_after_ulp(
     fd: RawFd,
     conn: rustls::Connection,
@@ -658,6 +658,47 @@ fn setup_ktls_after_ulp(
             ftlog::debug!("TCP_CORK disable failed (non-fatal): {}", e);
         }
     }
+
+    Ok(())
+}
+
+/// ULP設定後のkTLS設定（シークレット抽出とTX/RX設定） (FreeBSD, F-126)
+///
+/// FreeBSD には ULP という概念が無く（前段の `setup_ulp` は no-op）、
+/// `TCP_TXTLS_ENABLE` / `TCP_RXTLS_ENABLE` の setsockopt がフレーミング設定と
+/// 鍵設定を同時に行う（`src/ktls_freebsd.rs::enable_tx/enable_rx`）。
+/// TCP_CORK は Linux 固有のためここでは使用しない（`tcp_cork_enabled` は
+/// FreeBSD では常に no-op、kTLS 有効化で送信境界が変わるため保守的に無効化）。
+#[cfg(all(feature = "ktls", target_os = "freebsd"))]
+fn setup_ktls_after_ulp(
+    fd: RawFd,
+    conn: rustls::Connection,
+    _cipher_suite: rustls::SupportedCipherSuite,
+    tcp_cork_enabled: bool,
+) -> io::Result<()> {
+    use crate::ktls::extract_tx_rx_material;
+
+    let _ = tcp_cork_enabled; // FreeBSD では TCP_CORK 相当の最適化は行わない（設計方針）
+
+    // プロトコルバージョンを取得
+    let protocol_version = conn.protocol_version();
+
+    // シークレットを抽出
+    let secrets = conn
+        .dangerous_extract_secrets()
+        .map_err(|e| io::Error::other(format!("Failed to extract secrets: {:?}", e)))?;
+
+    // TX/RX バッチ抽出（生鍵マテリアル、CryptoInfo は経由しない）
+    let (mut tx, mut rx) = extract_tx_rx_material(secrets, protocol_version)
+        .map_err(|e| io::Error::other(format!("Failed to build key material: {}", e)))?;
+
+    // TX 設定
+    crate::ktls_freebsd::enable_tx(fd, &tx)?;
+    tx.secure_clear(); // 鍵をセキュアにゼロ化
+
+    // RX 設定
+    crate::ktls_freebsd::enable_rx(fd, &rx)?;
+    rx.secure_clear(); // 鍵をセキュアにゼロ化
 
     Ok(())
 }
@@ -1353,7 +1394,11 @@ impl RustlsConnector {
 // sendfile サポート（kTLS 有効時）
 // ====================
 
-/// kTLS が有効なソケットに対して sendfile システムコールを実行
+/// kTLS が有効なソケットに対して sendfile システムコールを実行（Linux）
+///
+/// Linux の `sendfile(2)` は `sendfile(out_fd=socket, in_fd=file, offset, count)` の
+/// 4 引数で、送信バイト数を返し `offset` ポインタを進める。
+#[cfg(target_os = "linux")]
 pub fn sendfile_ktls(
     socket_fd: RawFd,
     file_fd: RawFd,
@@ -1366,6 +1411,52 @@ pub fn sendfile_ktls(
         Err(io::Error::last_os_error())
     } else {
         Ok(result as usize)
+    }
+}
+
+/// kTLS が有効なソケットに対して sendfile システムコールを実行（FreeBSD、F-126）
+///
+/// FreeBSD の `sendfile(2)` は Linux と引数順・戻り値が異なる 7 引数 API:
+/// `sendfile(fd=file, s=socket, offset, nbytes, hdtr, sbytes, flags)`。
+/// 戻り値は 0/-1 で、実際に送信したバイト数は `sbytes`（OUT）へ書かれる。offset は
+/// 入力のみで進まないため、送信バイト数分だけ呼び出し側の `offset` を進める。
+/// FreeBSD の sendfile は **kTLS 対応**（ソケットが kTLS 有効ならカーネル内で暗号化）で、
+/// 静的ファイル配信のゼロコピー送信に有効。EAGAIN でも部分送信済みバイトが `sbytes` に
+/// 反映されるため、その分を進めて返す（`WouldBlock` は sbytes==0 のときのみ）。
+#[cfg(target_os = "freebsd")]
+pub fn sendfile_ktls(
+    socket_fd: RawFd,
+    file_fd: RawFd,
+    offset: &mut i64,
+    count: usize,
+) -> io::Result<usize> {
+    let mut sbytes: libc::off_t = 0;
+    // SAFETY: file_fd/socket_fd は有効な fd、hdtr は NULL、sbytes は有効なスタック変数。
+    // sendfile は呼び出し中のみこれらを参照する。
+    let ret = unsafe {
+        libc::sendfile(
+            file_fd,
+            socket_fd,
+            *offset,
+            count,
+            std::ptr::null_mut(),
+            &mut sbytes,
+            0,
+        )
+    };
+
+    if ret == 0 {
+        *offset += sbytes;
+        Ok(sbytes as usize)
+    } else {
+        let err = io::Error::last_os_error();
+        // FreeBSD は EAGAIN でも sbytes に部分送信済みバイトを返す。
+        if sbytes > 0 {
+            *offset += sbytes;
+            Ok(sbytes as usize)
+        } else {
+            Err(err)
+        }
     }
 }
 
@@ -1396,13 +1487,18 @@ impl KtlsClientStream {
 }
 
 // ====================
-// splice サポート
+// splice サポート（Linux 専用）
 // ====================
 //
 // splice(2) の発行自体は io_uring（`crate::runtime::splice`、IORING_OP_SPLICE）で
 // 非同期に行う（F-39）。本モジュールはパイプ（中継バッファ）の管理のみを担う。
+//
+// splice(2) と `F_SETPIPE_SZ`（パイプ容量変更）は Linux 専用のため、パイプ管理一式を
+// `target_os = "linux"` に限定する。FreeBSD/OpenBSD/macOS の kTLS/プロキシは splice を
+// 使わずバッファ経由の read/write へフォールバックする（設計 3.3 節 / F-126）。
 
-/// パイプを作成
+/// パイプを作成（Linux 専用）
+#[cfg(target_os = "linux")]
 pub fn create_pipe() -> io::Result<(RawFd, RawFd)> {
     let mut fds: [libc::c_int; 2] = [0; 2];
     let result = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
@@ -1414,7 +1510,8 @@ pub fn create_pipe() -> io::Result<(RawFd, RawFd)> {
     }
 }
 
-/// パイプを閉じる
+/// パイプを閉じる（Linux 専用）
+#[cfg(target_os = "linux")]
 pub fn close_pipe(read_fd: RawFd, write_fd: RawFd) {
     unsafe {
         libc::close(read_fd);
@@ -1422,7 +1519,8 @@ pub fn close_pipe(read_fd: RawFd, write_fd: RawFd) {
     }
 }
 
-/// パイプのバッファサイズを設定
+/// パイプのバッファサイズを設定（Linux 専用、`F_SETPIPE_SZ`）
+#[cfg(target_os = "linux")]
 pub fn set_pipe_size(pipe_fd: RawFd, size: i32) -> io::Result<i32> {
     let result = unsafe { libc::fcntl(pipe_fd, libc::F_SETPIPE_SZ, size) };
 
@@ -1433,12 +1531,14 @@ pub fn set_pipe_size(pipe_fd: RawFd, size: i32) -> io::Result<i32> {
     }
 }
 
-/// 再利用可能なパイプペアを管理する構造体
+/// 再利用可能なパイプペアを管理する構造体（Linux 専用）
+#[cfg(target_os = "linux")]
 pub struct SplicePipe {
     read_fd: RawFd,
     write_fd: RawFd,
 }
 
+#[cfg(target_os = "linux")]
 impl SplicePipe {
     /// 新しいパイプペアを作成
     pub fn new() -> io::Result<Self> {
@@ -1457,12 +1557,14 @@ impl SplicePipe {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for SplicePipe {
     fn drop(&mut self) {
         close_pipe(self.read_fd, self.write_fd);
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Default for SplicePipe {
     fn default() -> Self {
         Self::new().expect("Failed to create splice pipe")
@@ -1473,8 +1575,9 @@ impl Default for SplicePipe {
 // kTLS サポートチェック
 // ====================
 
-/// kTLS が利用可能かどうかをチェック
+/// kTLS が利用可能かどうかをチェック (Linux)
 // 理由付き allow: 起動時に一度だけ /proc を読む可用性プローブ（コールドパス）。
+#[cfg(target_os = "linux")]
 #[allow(clippy::disallowed_methods)]
 pub fn is_ktls_available() -> bool {
     // /proc/modules で tls モジュールがロードされているか確認
@@ -1505,6 +1608,33 @@ pub fn is_ktls_available() -> bool {
     }
 
     true
+}
+
+/// kTLS が利用可能かどうかをチェック (FreeBSD, F-126)
+///
+/// `kern.ipc.tls.enable` sysctl（既定 0）を確認する。0 の場合、
+/// `setsockopt(TCP_TXTLS_ENABLE/...)` は失敗し rustls へフォールバックする
+/// （`try_enable_ktls_server`/`_client` が実際のゲート）。本関数は起動時の
+/// 情報ログ用途のみで、実際の有効化可否は setsockopt の成否で決まる。
+#[cfg(target_os = "freebsd")]
+pub fn is_ktls_available() -> bool {
+    let mut value: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>();
+    let name = c"kern.ipc.tls.enable";
+
+    // SAFETY: name は NUL 終端の静的文字列、value/len は有効なスタック変数への
+    // ポインタで sysctlbyname の呼び出し中のみ借用される。
+    let result = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            &mut value as *mut _ as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+
+    result == 0 && value != 0
 }
 
 // ====================

@@ -461,12 +461,103 @@ pub fn extract_tx_rx(
 }
 
 // ====================
+// FreeBSD 向け生鍵マテリアル（F-126）
+// ====================
+//
+// FreeBSD の `struct tls_enable`（`src/ktls_freebsd.rs`）は Linux の
+// `tls12_crypto_info_*` とレイアウトが異なるため、上記の `CryptoInfo` を
+// 経由せず OS 非依存の生バイト列（固定長・ヒープ確保なし）で鍵マテリアルを
+// 受け渡す。Linux 専用の `CryptoInfo`/`extract_tx_rx` はそのまま変更しない。
+
+/// FreeBSD `TlsEnable` 構築に使う生鍵マテリアル（F-126）。
+#[cfg(target_os = "freebsd")]
+pub struct TlsKeyMaterial {
+    /// 暗号鍵（16 or 32 バイトを使用、残りは未使用）
+    pub key: [u8; 32],
+    /// 実際に使用する鍵長（16 = AES-128-GCM / 32 = AES-256-GCM）
+    pub key_len: usize,
+    /// Salt（implicit IV、rustls IV[0..4]）
+    pub salt: [u8; 4],
+    /// Explicit IV（rustls IV[4..12]）
+    pub iv: [u8; 8],
+    /// レコードシーケンス番号（ビッグエンディアン）
+    pub rec_seq: [u8; 8],
+    /// TLS バージョン（`TLS_1_2_VERSION` / `TLS_1_3_VERSION`）
+    pub version: u16,
+}
+
+#[cfg(target_os = "freebsd")]
+impl TlsKeyMaterial {
+    /// 鍵データをセキュアにゼロ化
+    pub fn secure_clear(&mut self) {
+        secure_zero(&mut self.key);
+        secure_zero(&mut self.salt);
+        secure_zero(&mut self.iv);
+        secure_zero(&mut self.rec_seq);
+    }
+}
+
+/// 単一方向の生鍵マテリアルを抽出（FreeBSD）
+#[cfg(target_os = "freebsd")]
+fn extract_single_material(
+    secrets: (u64, ConnectionTrafficSecrets),
+    tls_version: u16,
+) -> Result<TlsKeyMaterial, KtlsError> {
+    let (seq_num, traffic_secrets) = secrets;
+
+    let (key_slice, iv_full): (&[u8], &[u8]) = match &traffic_secrets {
+        ConnectionTrafficSecrets::Aes128Gcm { key, iv } => (key.as_ref(), iv.as_ref()),
+        ConnectionTrafficSecrets::Aes256Gcm { key, iv } => (key.as_ref(), iv.as_ref()),
+        _ => return Err(KtlsError::UnsupportedCipher),
+    };
+
+    if iv_full.len() != 12 {
+        return Err(KtlsError::InvalidIvLength);
+    }
+    let key_len = key_slice.len();
+    if key_len != 16 && key_len != 32 {
+        return Err(KtlsError::InvalidKeyLength);
+    }
+
+    let mut material = TlsKeyMaterial {
+        key: [0u8; 32],
+        key_len,
+        salt: [0u8; 4],
+        iv: [0u8; 8],
+        rec_seq: seq_num.to_be_bytes(),
+        version: tls_version,
+    };
+    material.key[..key_len].copy_from_slice(key_slice);
+    material.salt.copy_from_slice(&iv_full[0..4]);
+    material.iv.copy_from_slice(&iv_full[4..12]);
+
+    Ok(material)
+}
+
+/// TX/RX 両方の生鍵マテリアルをバッチ抽出（FreeBSD）
+///
+/// Linux の [`extract_tx_rx`] に相当する FreeBSD 向け API。
+#[cfg(target_os = "freebsd")]
+pub fn extract_tx_rx_material(
+    secrets: ExtractedSecrets,
+    protocol_version: Option<ProtocolVersion>,
+) -> Result<(TlsKeyMaterial, TlsKeyMaterial), KtlsError> {
+    let tls_version = get_tls_version(protocol_version)?;
+
+    let tx = extract_single_material(secrets.tx, tls_version)?;
+    let rx = extract_single_material(secrets.rx, tls_version)?;
+
+    Ok((tx, rx))
+}
+
+// ====================
 // setsockopt ヘルパー
 // ====================
 
-/// TLS ULP を設定
+/// TLS ULP を設定 (Linux)
 ///
 /// kTLS を有効化する前に必ず呼び出す必要があります。
+#[cfg(target_os = "linux")]
 pub fn setup_ulp(fd: RawFd) -> io::Result<()> {
     const SOL_TCP: libc::c_int = 6;
 
@@ -484,6 +575,44 @@ pub fn setup_ulp(fd: RawFd) -> io::Result<()> {
         Err(io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+/// TLS ULP を設定 (FreeBSD, F-126)
+///
+/// FreeBSD には Linux の TCP ULP に相当する概念が無く、`TCP_TXTLS_ENABLE` /
+/// `TCP_RXTLS_ENABLE`（`src/ktls_freebsd.rs`）がフレーミング設定と鍵設定を同時に行うため、
+/// 本来 ULP 設定は不要。ただし**フォールバック経路の早期化**のために、ここで
+/// `kern.ipc.tls.enable`（既定 0）を確認し、kTLS がカーネルで無効なら `ENOTSUP` を返す。
+///
+/// 理由: Linux では `setup_ulp`（`TCP_ULP` 設定）が kTLS 無効時に接続を**消費する前**に
+/// 失敗し、呼び出し側（`try_enable_ktls_server`/`_client`）が rustls へグレースフルに
+/// フォールバックする。FreeBSD で ULP を無条件成功にすると、kTLS 無効時の失敗が
+/// シークレット抽出後（接続消費後）の `TCP_TXTLS_ENABLE` setsockopt まで遅れ、
+/// 復旧不能な致命的エラー（接続切断）になってしまう。ここで sysctl を先読みして
+/// 早期に失敗させることで、Linux と同じ「消費前フォールバック」を実現する。
+#[cfg(target_os = "freebsd")]
+pub fn setup_ulp(_fd: RawFd) -> io::Result<()> {
+    let mut value: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>();
+    let name = c"kern.ipc.tls.enable";
+    // SAFETY: name は NUL 終端の静的文字列、value/len は有効なスタック変数への
+    // ポインタで呼び出し中のみ借用される。
+    let ret = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            &mut value as *mut _ as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret == 0 && value != 0 {
+        Ok(())
+    } else {
+        // kTLS がカーネルで無効（sysctl 取得失敗 or enable=0）。ENOTSUP を返して
+        // 接続消費前に rustls フォールバックへ導く。
+        Err(io::Error::from_raw_os_error(libc::ENOTSUP))
     }
 }
 
