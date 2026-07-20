@@ -216,3 +216,18 @@ CONFIG_GLOB='h2_0_feat_l4'                bash tools/perf/run_perf.sh   # L4
 # h3_proxy_buffering 構成の veil に対して:
 h2load --alpn-list=h3 -n 100 -c 10 -m10 https://<veil>:443/
 ```
+
+## HTTP/3 A/B: F-129（RECVMSG+CC/pacing）vs F-115（POLL+recvmmsg）（2026-07-20、host-net h2load）
+
+同一ホスト・同一構成（release full features、GSO on、静的配信、h2load `--alpn-list=h3 -n30000 -c100 -m10` ×3、全 2xx）で
+**以前実装（F-115: `POLL_ADD`+libc `recvmmsg`・quiche 既定 CUBIC）** と
+**新実装（F-129: 先頭 `IORING_OP_RECVMSG`+`POLL_FIRST` 単発 + recvmmsg drain・BBR+pacing+hystart・mmsg batch 64）** を比較:
+
+| 実装 | HTTP/3 Req/s（iter1/2/3, median） | 備考 |
+|---|---|---|
+| OLD（F-115） | 7364 / 6666 / 6931（median **6931**） | POLL+recvmmsg・CUBIC |
+| NEW（F-129） | 8525 / 7588 / 8393（median **8393**） | RECVMSG+POLL_FIRST・BBR/pacing/hystart |
+
+**F-129 は F-115 比 +21%（8393/6931 = 1.21×）** の HTTP/3 スループット改善。主因は
+quiche CC の CUBIC→BBR + pacing/hystart と、先頭データグラム受信の io_uring 化（POLL 二重往復排除）。
+これを基準に F-130（極限 io_uring 化: 受信 drain / 送信の io_uring 化・真 multishot）で更に詰める。
