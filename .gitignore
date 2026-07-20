@@ -55,3 +55,4 @@ tools/container_security/results/
 # fuzz 実行時の target 隔離（run_libfuzzer.sh）
 tools/container_security/results/cargo-target/
 
+tools/perf/results/

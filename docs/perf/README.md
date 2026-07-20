@@ -251,3 +251,20 @@ HTTP/3 が host-net h2load で ~7500 req/s だったため、HTTP/2 も同一ホ
 2. **host-net + GSO 有効では HTTP/3(~7547) > HTTP/2(~4150)**。HTTP/3 は QUIC の GSO バッチ送出
    （1 syscall で複数データグラム）と io_uring 受信の効果で、TCP/HTTP2 を上回る。docker bridge
    （GSO/GRO 無効）では逆に HTTP/3 が不利（~835）になるため、計測は host net と bridge を分ける。
+
+## F-130 極限 io_uring 化 A/B: F-130（C1+C3）vs F-129（2026-07-20、host-net、back-to-back 交互 4 反復）
+
+同一ホストで F-129 と F-130 を **交互 4 反復**（ホスト変動キャンセル）で計測（release full、GSO on、h2load h3 `-n30000 -c100 -m10`、全 2xx）:
+
+| iter | F-129 (RECVMSG単発+libc recvmmsg/sendmmsg) | F-130 (パイプライン RECVMSG×N + SENDMSG io_uring) |
+|---|---|---|
+| 1 | 7180 | 7553 |
+| 2 | 6411 | 7315 |
+| 3 | 6925 | 7111 |
+| 4 | 6986 | 7322 |
+| **median** | **~6955** | **~7318（+5.2%）** |
+
+**F-130 が全 4 反復で F-129 を上回り +5.2%**。ホットパスから libc `recvmmsg`/`sendmmsg` を排除し、
+受信は N 本の独立 `IORING_OP_RECVMSG` を常時 in-flight（per-slot 固定 msghdr で peer 安全）、
+送信は `IORING_OP_SENDMSG`（GSO cmsg）を複数 SQE で 1 submit した効果。真 multishot（C2）は
+kernel 6.0+ 依存・multi-peer 安全性の実装コストと F-129 での不安定化実績から次段送り（フォールバック維持）。

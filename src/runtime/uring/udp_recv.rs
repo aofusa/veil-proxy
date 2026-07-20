@@ -209,13 +209,7 @@ impl PipelinedUdpRecv {
         self.ready_len
     }
 
-    /// 直近の `recv_batch()` 完了で見つかったスロット数。
-    #[inline]
-    pub fn ready_count(&self) -> usize {
-        self.ready_len
-    }
-
-    /// `ready` の i 番目のスロット index を返す（0 <= i < ready_count()）。
+    /// `ready` の i 番目のスロット index を返す（0 <= i < 直近 `recv_batch()` の戻り値）。
     #[inline]
     pub fn ready_slot(&self, i: usize) -> usize {
         self.ready[i] as usize
@@ -234,20 +228,30 @@ impl PipelinedUdpRecv {
         &mut self.slots[idx].buf[..len.min(PAYLOAD_CAP)]
     }
 
-    /// 直近 `recv_batch()` で消費した ready スロットへ RECVMSG を再アームし、
-    /// **1 回の submit** でまとめて投入する。呼び出し側は `ready` の全件を処理し終えた後に
-    /// 呼ぶこと（未処理のまま呼ぶと `result` が上書きされずに残っている分は次回 scan まで
-    /// 無視される点に注意 — 通常フローでは常に処理直後に呼ばれる）。
+    /// パイプラインを満杯まで補充する（`recv_batch()` の全件処理後に呼ぶ）。
+    ///
+    /// 「未提出かつ未消費結果を持たない」スロットすべてに RECVMSG を再アームし、**1 回の
+    /// submit** でまとめて投入する。直近で消費した ready スロットに加え、万一 SQ 満杯等で
+    /// 過去に再アームできなかったスロットがあってもここで拾い直すため、in-flight 本数が
+    /// 目減りせず自己修復する（パイプライン不変条件: 常に最大 `batch` 本を in-flight）。
+    ///
+    /// 呼び出し側は `ready` の全件を `take_result` で処理し終えた後に呼ぶこと。
     pub fn rearm_ready(&mut self) -> io::Result<()> {
-        for i in 0..self.ready_len {
-            let idx = self.ready[i] as usize;
-            let slot = &mut self.slots[idx];
-            if !slot.submitted {
-                slot.arm_no_submit(self.fd)?;
+        let fd = self.fd;
+        let mut armed_any = false;
+        for slot in self.slots.iter_mut() {
+            if !slot.submitted && slot.result.is_none() {
+                // arm 失敗（極めて稀な SQ 満杯）は当該スロットのみ諦め、次回 rearm で再挑戦する。
+                if slot.arm_no_submit(fd).is_ok() {
+                    armed_any = true;
+                }
             }
         }
         self.ready_len = 0;
-        submit_sqes()
+        if armed_any {
+            submit_sqes()?;
+        }
+        Ok(())
     }
 }
 
