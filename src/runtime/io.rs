@@ -304,12 +304,18 @@ impl std::os::windows::io::AsRawHandle for File {
 /// OpenOptions（monoio::fs::OpenOptions 互換）
 pub struct OpenOptions {
     inner: std::fs::OpenOptions,
+    // F-123: FreeBSD capability mode 下で読み取り専用 open を dirfd 相対 openat へ
+    // 切り替えるため、書き込み系フラグの有無を追跡する（読み取り専用のみ相対化対象）。
+    #[cfg(target_os = "freebsd")]
+    write_like: bool,
 }
 
 impl OpenOptions {
     pub fn new() -> Self {
         Self {
             inner: std::fs::OpenOptions::new(),
+            #[cfg(target_os = "freebsd")]
+            write_like: false,
         }
     }
 
@@ -320,20 +326,42 @@ impl OpenOptions {
 
     pub fn write(mut self, write: bool) -> Self {
         self.inner.write(write);
+        #[cfg(target_os = "freebsd")]
+        {
+            self.write_like |= write;
+        }
         self
     }
 
     pub fn create(mut self, create: bool) -> Self {
         self.inner.create(create);
+        #[cfg(target_os = "freebsd")]
+        {
+            self.write_like |= create;
+        }
         self
     }
 
     pub fn append(mut self, append: bool) -> Self {
         self.inner.append(append);
+        #[cfg(target_os = "freebsd")]
+        {
+            self.write_like |= append;
+        }
         self
     }
 
     pub async fn open(self, path: impl AsRef<std::path::Path>) -> io::Result<File> {
+        let path = path.as_ref();
+        // F-123: FreeBSD capability mode 下では絶対パス open が禁止されるため、読み取り
+        // 専用 open は登録済みルート dirfd 相対の openat へ切り替える（非該当・非 cap-mode
+        // 時は下の通常経路。Linux/その他 OS はこのブロック自体がコンパイルされない）。
+        #[cfg(target_os = "freebsd")]
+        if !self.write_like {
+            if let Some(res) = crate::security::capsicum::open_static_ro(path) {
+                return res.map(|inner| File { inner });
+            }
+        }
         let inner = self.inner.open(path)?;
         Ok(File { inner })
     }

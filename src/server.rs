@@ -31,6 +31,49 @@ use std::os::unix::io::AsRawFd;
 
 // log_ktls_status は crate::logging モジュールに移動しました。
 
+/// capability mode（FreeBSD capsicum）セーフなスリープ。
+///
+/// FreeBSD の capability mode（`cap_enter(2)`）下では `std::thread::sleep` が内部で
+/// 使う `clock_nanosleep(CLOCK_MONOTONIC)` が `ECAPMODE`（os error 94）で失敗し、
+/// std 内部のアサーションで panic する（F-123 の VM 検証で発見）。設定/TLS リロード
+/// 等の背景監視スレッドは capability mode 内でも周期スリープするため、capsicum セーフ
+/// な `select(2)` タイムアウト（fd 集合なし = 権利不要）で代替する。他 OS では
+/// `std::thread::sleep` に委譲し挙動を変えない。
+// 理由付き allow: 非 FreeBSD 経路は従来どおり std スリープ（イベントループ外の
+// 背景スレッド用ラッパ）。
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn cap_safe_sleep(dur: Duration) {
+    #[cfg(target_os = "freebsd")]
+    {
+        let mut tv = libc::timeval {
+            tv_sec: dur.as_secs() as libc::time_t,
+            tv_usec: dur.subsec_micros() as libc::suseconds_t,
+        };
+        loop {
+            let ret = unsafe {
+                libc::select(
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut tv,
+                )
+            };
+            if ret >= 0 {
+                break;
+            }
+            if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                break;
+            }
+            // EINTR: FreeBSD の select は tv に残余時間を書き戻すため、そのまま継続。
+        }
+    }
+    #[cfg(not(target_os = "freebsd"))]
+    {
+        std::thread::sleep(dur);
+    }
+}
+
 /// シグナルハンドラのセットアップ
 pub fn setup_signal_handler() {
     // SIGINT, SIGTERM をキャッチしてシャットダウンフラグを設定
@@ -73,7 +116,7 @@ pub fn spawn_reload_thread() {
         info!("Configuration reload thread started");
 
         loop {
-            thread::sleep(Duration::from_millis(500));
+            cap_safe_sleep(Duration::from_millis(500));
 
             // シャットダウン中はリロードしない
             if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
@@ -126,7 +169,7 @@ pub fn spawn_tls_reloader(mut reloader: crate::tls_reload::TlsCertReloader, inte
         info!("TLS certificate reload thread started");
         let mut elapsed: u64 = 0;
         loop {
-            thread::sleep(Duration::from_millis(500));
+            cap_safe_sleep(Duration::from_millis(500));
             if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
                 break;
             }
@@ -434,7 +477,7 @@ pub fn spawn_cache_cleanup_thread() {
 
         loop {
             // 60秒ごとにクリーンアップを実行
-            thread::sleep(Duration::from_secs(60));
+            cap_safe_sleep(Duration::from_secs(60));
 
             // シャットダウン中は終了
             if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
@@ -503,7 +546,7 @@ pub fn spawn_wasm_tick_thread() {
         debug!("WASM tick interval: {:?}", tick_interval);
 
         loop {
-            thread::sleep(tick_interval);
+            cap_safe_sleep(tick_interval);
 
             // シャットダウン中は終了
             if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
@@ -673,7 +716,7 @@ pub fn spawn_health_check_thread() {
                 if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
                     break;
                 }
-                thread::sleep(Duration::from_millis(500));
+                cap_safe_sleep(Duration::from_millis(500));
             }
         }
 
