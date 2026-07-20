@@ -535,9 +535,12 @@ reuseport_balancing = "cbpf"
 #   - プロキシ/upstream・L4 リスナーが無い（connect 不要）
 #   - h2c / HTTP/3 / HTTP→HTTPS リダイレクトの追加リスナーが無い
 # 適用タイミングは全ワーカーの listener bind 完了後（bind は capability mode で不可）。
-# 注意: リクエスト時にパス指定 open(2) を行う静的ファイル配信は capability mode では
-# 失敗する（キャッシュ済み応答のみ返せる）。openat(2) 相対化による完全対応は
-# バックログ参照。
+# 静的ファイル配信（F-123）: capability mode 下でも完全動作する。起動時（cap_enter 前）
+# に各 File ルートのディレクトリ fd を確保し、配信時の open/stat を fd 相対の
+# openat(2)/fstatat(2) + O_RESOLVE_BENEATH（FreeBSD 13+、パストラバーサル封じ込め）へ
+# 切り替えるため、絶対パス open が禁止される capability mode でも 404 にならない。
+# 制約: ホットリロードで File ルートを増やしても capability mode 中は dirfd を追加でき
+# ないため、起動時に存在した File ルートのみ配信できる（新規ルートは警告して無視）。
 # capsicum_capability_mode = true
 
 # 起動時に attach する jail 名（FreeBSD専用、root 前提）。
