@@ -15,6 +15,9 @@ pub mod splice;
 pub mod tcp;
 pub mod timer;
 /// HTTP/3 向けパイプライン化 `IORING_OP_RECVMSG` 受信（F-124 → F-130 C1）。
+/// HTTP/3 専用（`udp_send` は `crate::udp` を参照）のため http3 ゲート。
+#[cfg(feature = "http3")]
 pub mod udp_recv;
 /// HTTP/3 向けパイプライン化 `IORING_OP_SENDMSG` 送信（F-130 C3）。
+#[cfg(feature = "http3")]
 pub mod udp_send;
