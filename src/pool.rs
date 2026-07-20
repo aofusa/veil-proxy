@@ -1132,7 +1132,10 @@ mod alt_svc_tests {
 mod tests {
     // B-16: splice パイプの checkout/return プールの回帰テスト。
     // 各テストは独立スレッドで実行されるため thread_local プールは常に空から始まる。
-    #[cfg(veil_ktls)]
+    // splice プール（SPLICE_PIPE_POOL / get_splice_pipe 等）は Linux 専用
+    // （`all(veil_ktls, target_os = "linux")`）のため、テストも同じ cfg でゲートする
+    // （FreeBSD kTLS では veil_ktls は立つが splice は無く、以前はテストビルドが壊れた）。
+    #[cfg(all(veil_ktls, target_os = "linux"))]
     mod splice_pipe_pool {
         use super::super::*;
 
