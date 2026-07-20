@@ -3551,29 +3551,30 @@ pub async fn run_http3_server_async(
     let mmsg_batch = crate::udp::socket::clamp_mmsg_batch(config.mmsg_batch_size);
     let mut mmsg_scratch = crate::udp::socket::MmsgRecvScratch::with_batch(mmsg_batch);
 
-    // F-124: io_uring multishot RECVMSG（Linux uring バックエンド）。
+    // F-130 C1: パイプライン化 io_uring RECVMSG（Linux uring バックエンド）。
+    // 常に mmsg_batch 個の RECVMSG を in-flight に保ち、libc recvmmsg をホットパスから排除する。
     // 既定で有効化し、初期化失敗時のみ POLL+recvmmsg へフォールバックする。
-    // デバッグで無効化する場合は VEIL_H3_MULTISHOT=0。
+    // デバッグで無効化する場合は VEIL_H3_MULTISHOT=0（環境変数名は F-124/F-129 からの互換名）。
     #[cfg(all(target_os = "linux", veil_rt_uring))]
     let mut ms_recv = {
         let disabled = std::env::var_os("VEIL_H3_MULTISHOT")
             .map(|v| v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
             .unwrap_or(false);
         if disabled {
-            info!("[HTTP/3] multishot RECVMSG disabled via VEIL_H3_MULTISHOT=0");
+            info!("[HTTP/3] pipelined io_uring RECVMSG disabled via VEIL_H3_MULTISHOT=0");
             None
         } else {
-            match crate::runtime::udp_recv::MultishotUdpRecv::new(socket.as_raw_fd(), mmsg_batch) {
+            match crate::runtime::udp_recv::PipelinedUdpRecv::new(socket.as_raw_fd(), mmsg_batch) {
                 Ok(m) => {
                     info!(
-                        "[HTTP/3] io_uring RECVMSG enabled (POLL_FIRST + recvmmsg drain, batch={})",
+                        "[HTTP/3] pipelined io_uring RECVMSG enabled ({} slots in-flight, no libc recvmmsg on hot path)",
                         m.batch_size()
                     );
                     Some(m)
                 }
                 Err(e) => {
                     warn!(
-                        "[HTTP/3] multishot RECVMSG unavailable ({}), using POLL+recvmmsg fallback",
+                        "[HTTP/3] pipelined RECVMSG unavailable ({}), using POLL+recvmmsg fallback",
                         e
                     );
                     None
@@ -3581,6 +3582,22 @@ pub async fn run_http3_server_async(
             }
         }
     };
+
+    // F-130 C3: パイプライン化 io_uring SENDMSG。受信側と同じ有効/無効判断（disabled 判定）に
+    // 揃え、`VEIL_H3_MULTISHOT=0` で送信側も従来 sendmmsg 経路へ揃って戻す。
+    #[cfg(all(target_os = "linux", veil_rt_uring))]
+    {
+        if ms_recv.is_some() {
+            put_uring_udp_send(crate::runtime::udp_send::UringUdpSend::new(
+                socket.as_raw_fd(),
+                mmsg_batch,
+            ));
+            info!(
+                "[HTTP/3] pipelined io_uring SENDMSG enabled ({} slots, no libc sendmmsg on hot path)",
+                mmsg_batch
+            );
+        }
+    }
 
     // メインループ: パケット受信とディスパッチ
     loop {
@@ -3702,12 +3719,12 @@ pub async fn run_http3_server_async(
             {
                 let ms = ms_recv.as_mut().expect("multishot present");
                 enum MsOutcome {
-                    Dg(io::Result<crate::runtime::udp_recv::MultishotDatagram>),
+                    Batch(io::Result<usize>),
                     Notified,
                     Timeout,
                 }
                 let outcome = futures::select_biased! {
-                    r = futures::FutureExt::fuse(ms.recv_one()) => MsOutcome::Dg(r),
+                    r = futures::FutureExt::fuse(ms.recv_batch()) => MsOutcome::Batch(r),
                     _ = futures::FutureExt::fuse(notify.wait()) => MsOutcome::Notified,
                     _ = futures::FutureExt::fuse(crate::runtime::time::sleep(timeout_duration)) => MsOutcome::Timeout,
                 };
@@ -3728,67 +3745,47 @@ pub async fn run_http3_server_async(
                     }
                 }
 
-                if let MsOutcome::Dg(result) = outcome {
+                if let MsOutcome::Batch(result) = outcome {
                     match result {
-                        Ok(first) => {
+                        Ok(n) => {
                             got_packet = true;
                             let mut conns = connections.borrow_mut();
-                            // 先頭 1 通（IORING_OP_RECVMSG）。
-                            let from = first.from;
-                            let gro = first.gro_segment_size;
-                            process_datagram_segments(
-                                &mut conns,
-                                ms.payload_mut(&first),
-                                from,
-                                gro,
-                                &rng,
-                                &quic_config,
-                                local_addr,
-                                &notify,
-                                &backend_spawner,
-                            )?;
-                            ms.release(&first);
-
-                            // 継続 drain: recvmmsg でバッチ幅分を一括掻き出し（F-115 + F-124）。
-                            let mut drained = 1usize;
-                            while drained < H3_RECV_DRAIN_MAX {
-                                let n = match socket.recv_mmsg_sync(&mut mmsg_scratch) {
-                                    Ok(n) => n,
-                                    Err(_) => break,
-                                };
-                                for i in 0..n {
-                                    let (len, from, gro) = match mmsg_scratch.meta(i) {
-                                        Ok(v) => v,
-                                        Err(e) => {
-                                            warn!("[HTTP/3] recvmmsg meta error: {}", e);
-                                            continue;
-                                        }
-                                    };
-                                    process_datagram_segments(
-                                        &mut conns,
-                                        &mut mmsg_scratch.buf_mut(i)[..len],
-                                        from,
-                                        gro,
-                                        &rng,
-                                        &quic_config,
-                                        local_addr,
-                                        &notify,
-                                        &backend_spawner,
-                                    )?;
+                            // F-130 C1: recv_batch() が今回完了を見つけた全スロット
+                            // （n 件、複数同時のことがある）を処理する。libc recvmmsg は
+                            // ホットパスに登場しない（完了データはすべて RECVMSG の CQE 由来）。
+                            for i in 0..n {
+                                let idx = ms.ready_slot(i);
+                                match ms.take_result(idx) {
+                                    Ok(meta) => {
+                                        let payload = ms.payload_mut(idx, meta.payload_len);
+                                        process_datagram_segments(
+                                            &mut conns,
+                                            payload,
+                                            meta.from,
+                                            meta.gro_segment_size,
+                                            &rng,
+                                            &quic_config,
+                                            local_addr,
+                                            &notify,
+                                            &backend_spawner,
+                                        )?;
+                                    }
+                                    Err(e) if e.kind() != io::ErrorKind::WouldBlock => {
+                                        error!("[HTTP/3] RECVMSG error: {}", e);
+                                    }
+                                    Err(_) => {}
                                 }
-                                drained += n;
-                                if n < mmsg_scratch.batch_size() {
-                                    break;
-                                }
+                            }
+                            if let Err(e) = ms.rearm_ready() {
+                                error!("[HTTP/3] RECVMSG re-arm failed: {}", e);
                             }
                             drop(conns);
                             send_pending_packets(&connections, &socket, local_addr, mmsg_batch)
                                 .await;
                         }
-                        Err(e) if e.kind() != io::ErrorKind::WouldBlock => {
-                            error!("[HTTP/3] RECVMSG error: {}", e);
+                        Err(e) => {
+                            error!("[HTTP/3] pipelined RECVMSG error: {}", e);
                         }
-                        Err(_) => {}
                     }
                 }
             }
@@ -4319,6 +4316,37 @@ async fn send_mmsg_flush(
     sends: &[SendRaw],
     scratch: &mut crate::udp::socket::MmsgSendScratch,
 ) {
+    // F-130 C3: パイプライン化 io_uring SENDMSG が有効なら、libc sendmmsg を使わずに
+    // `IORING_OP_SENDMSG` を複数 SQE / 1 submit でまとめて送出する。
+    #[cfg(all(target_os = "linux", veil_rt_uring))]
+    {
+        if let Some(mut send) = take_uring_udp_send() {
+            let batch_n = send.capacity();
+            let mut i = 0;
+            while i < sends.len() {
+                let k = (sends.len() - i).min(batch_n);
+                // k..MMSG_BATCH_MAX は末尾要素の複製で埋め、`[..k]` で捨てる（複製分は送出されない）。
+                let chunk: [crate::udp::socket::SendmmsgEntry; crate::udp::socket::MMSG_BATCH_MAX] =
+                    std::array::from_fn(|j| {
+                        let s = &sends[i + j.min(k - 1)];
+                        crate::udp::socket::SendmmsgEntry {
+                            data: &batch[s.batch_start..s.batch_start + s.len],
+                            seg_size: s.seg_size,
+                            segments: s.segments,
+                            dest: s.dest,
+                        }
+                    });
+                if let Err(e) = send.send_batch(&chunk[..k]).await {
+                    warn!("[HTTP/3] io_uring sendmsg flush error: {}", e);
+                }
+                i += k;
+            }
+            put_uring_udp_send(send);
+            return;
+        }
+    }
+
+    // フォールバック（reactor ビルド / io_uring パイプライン無効時）: 従来の libc sendmmsg。
     let batch_n = scratch.batch_size();
     let mut i = 0;
     while i < sends.len() {
@@ -4408,6 +4436,25 @@ thread_local! {
     /// 送信スクラッチのスレッドローカル保管庫。thread-per-core のためロック不要。
     static H3_SEND_SCRATCH: std::cell::RefCell<Option<H3SendScratch>> =
         const { std::cell::RefCell::new(None) };
+}
+
+// F-130 C3: パイプライン化 io_uring SENDMSG ハンドル（Linux uring バックエンドのみ）。
+// `run_http3_server_async` が起動時に 1 回だけ設定し、`send_mmsg_flush` が take/put で
+// 払い出す（.await をまたいで RefCell borrow を保持しないため H3_SEND_SCRATCH と同方針）。
+#[cfg(all(target_os = "linux", veil_rt_uring))]
+thread_local! {
+    static URING_UDP_SEND: std::cell::RefCell<Option<crate::runtime::udp_send::UringUdpSend>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(target_os = "linux", veil_rt_uring))]
+fn take_uring_udp_send() -> Option<crate::runtime::udp_send::UringUdpSend> {
+    URING_UDP_SEND.with(|c| c.borrow_mut().take())
+}
+
+#[cfg(all(target_os = "linux", veil_rt_uring))]
+fn put_uring_udp_send(send: crate::runtime::udp_send::UringUdpSend) {
+    URING_UDP_SEND.with(|c| *c.borrow_mut() = Some(send));
 }
 
 /// スクラッチを払い出す（無ければ新規確保）。take してから返すため、.await をまたいで

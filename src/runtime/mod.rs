@@ -55,7 +55,7 @@ pub use reactor::{executor, tcp, timer};
 #[cfg(all(veil_rt_reactor, target_os = "linux"))]
 pub use reactor::splice;
 #[cfg(veil_rt_uring)]
-pub use uring::{executor, ring, splice, tcp, timer, udp_recv};
+pub use uring::{executor, ring, splice, tcp, timer, udp_recv, udp_send};
 
 // 公開 API の再エクスポート
 pub use buf::{IoBuf, IoBufMut};

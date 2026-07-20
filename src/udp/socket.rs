@@ -1127,8 +1127,9 @@ impl Default for MmsgSendScratch {
 ///
 /// sendmsg(2) で使用する制御メッセージを構築します。
 /// カーネルはこのセグメントサイズでデータを分割して送信します。
+// F-130 C3: `runtime::uring::udp_send` の io_uring SENDMSG 経路からも再利用するため pub(crate)。
 #[cfg(target_os = "linux")]
-fn build_gso_cmsg(buf: &mut [u8], segment_size: u16) -> io::Result<usize> {
+pub(crate) fn build_gso_cmsg(buf: &mut [u8], segment_size: u16) -> io::Result<usize> {
     // CMSG ヘッダサイズの計算
     let cmsg_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) as usize };
 
@@ -1182,7 +1183,8 @@ fn parse_gro_cmsg(msg: &libc::msghdr) -> Option<u16> {
 // ====================
 
 /// SocketAddr を libc sockaddr に変換
-fn socket_addr_to_raw(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+// F-130 C3: `runtime::uring::udp_send` からも再利用するため pub(crate)。
+pub(crate) fn socket_addr_to_raw(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
 
     match addr {

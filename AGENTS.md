@@ -39,6 +39,7 @@ AI エージェントおよびコントリビュータ向けの **最小指針**
 - **ランタイムバックエンドは build.rs 発行の cfg で切替（F-120/F-125/F-127）** — デフォルトは Linux io_uring（`veil_rt_uring` = `src/runtime/uring/`、`default` 不変・性能非劣化）。`--features epoll`（Linux）と BSD（FreeBSD/OpenBSD）・**macOS** は readiness reactor（`veil_rt_reactor` = `src/runtime/reactor/`、poller は `veil_poller_epoll` / `veil_poller_kqueue`。macOS は BSD と同じ kqueue poller を再利用）。Windows は `veil_poller_wsapoll` の cfg 名のみ発行済み（実装は未着手）。FreeBSD は追加で `--features aio`（`veil_aio`）により `TcpStream::read`/`write` を POSIX AIO（`aio_read`/`aio_write` + `EVFILT_AIO` 完了通知）へ切替可能（既定オフ、`src/runtime/reactor/aio.rs`。既存 kqueue readiness 経路は無改変・ゼロコストで維持）。**io_uring パスのロジックは変えない**（reactor 追加でも uring 生成コードを等価に保つ）。公開パス `runtime::tcp` 等はファサード re-export で不変に保つ。
 - **プラットフォーム別セキュリティ／kTLS は `target_os` で分岐**（F-120/F-125/F-126） — Linux: seccomp（バックエンド別に許可 syscall 分割・最小権限）/Landlock/CBPF、kTLS（`veil_ktls` = `feature="ktls"` かつ linux/freebsd。Linux 経路は `src/ktls.rs`/`src/ktls_rustls.rs`、FreeBSD 経路は `src/ktls_freebsd.rs` に完全分離し Linux ロジックは無変更）。FreeBSD: capsicum（cap_rights_limit / cap_enter / jail）+ kTLS 対応（`TCP_TXTLS_ENABLE`/`TCP_RXTLS_ENABLE`、F-126）。OpenBSD: pledge / unveil（kTLS 非対応、simple_tls フォールバック）。**macOS**: `sandbox_init`（Seatbelt、`src/security.rs` の `macos_sandbox` モジュール。実機検証不可のため保守的な deny-default + 書き込みのみ制限プロファイル、kTLS 非対応・simple_tls フォールバック）。非対象 OS 用の設定キーは受理し警告して無視する。README の前提と矛盾させない。
 - **ホットパス**でヒープ割り当て・不要なロック・コピー・同期呼び出しを増やさない（詳細は上の **ホットパス絶対規則**）。
+- **HTTP/3 UDP データプレーンは io_uring パイプライン化済み（F-130）** — 受信は `runtime::uring::udp_recv::PipelinedUdpRecv`（`[http3].mmsg_batch_size` 本の `IORING_OP_RECVMSG` を常時 in-flight に保つソフトウェアパイプライン。1 回の `recv_batch()` 完了で複数データグラムをまとめて拾い、消費後は `rearm_ready()` で 1 回の submit にまとめて再投入）、送信は `runtime::uring::udp_send::UringUdpSend`（`IORING_OP_SENDMSG` を GSO `UDP_SEGMENT` cmsg 付きで複数 SQE 同時 submit）。ホットパスに libc `recvmmsg`/`sendmmsg` は登場しない。**真の `IORING_RECV_MULTISHOT` + provided buffers/buffer ring（C2）は未実装**（unconnected multi-peer UDP のアドレス安全性・ENOBUFS 耐性の課題が残るため見送り。`executor.rs` の `alloc_multishot_op`/`take_multishot_cqe` は将来 C2 用に未使用のまま残置）。`recvmmsg`/`sendmmsg` は DNS 解決と `VEIL_H3_MULTISHOT=0`/reactor ビルド時のフォールバック経路にのみ残る。
 - **動的設定**は ArcSwap とリロード経路の不変条件を維持する。
 - **`unsafe` は最小限** — 拡大時は不変条件をコメントで明示。
 
@@ -122,7 +123,7 @@ cargo test --bins --test integration_tests --features "full"
 | `src/main.rs` | 薄いバイナリエントリ（`veil::run()` を呼ぶだけ） |
 | `src/lib.rs` | クレートルート・mod 宣言・公開 API（`cargo fuzz`・統合テスト向け） |
 | `src/entry.rs` | サーバ起動配線（`run()`：ワーカースレッド・accept ループなど） |
-| `src/runtime/` | 独自ランタイム。共有（buf.rs/io.rs/offload.rs）+ `uring/`（io_uring: ring/executor/tcp/timer/splice、`veil_rt_uring`）+ `reactor/`（epoll/kqueue readiness: poller/epoll/kqueue/executor/tcp/timer/splice、`veil_rt_reactor`）。バックエンドは build.rs 発行 cfg で選択、公開パスはファサードで不変（F-120） |
+| `src/runtime/` | 独自ランタイム。共有（buf.rs/io.rs/offload.rs）+ `uring/`（io_uring: ring/executor/tcp/timer/splice、`veil_rt_uring`。HTTP/3 UDP はパイプライン化 `IORING_OP_RECVMSG`（`udp_recv.rs` の `PipelinedUdpRecv`）/ `IORING_OP_SENDMSG`（`udp_send.rs` の `UringUdpSend`）= F-130）+ `reactor/`（epoll/kqueue readiness: poller/epoll/kqueue/executor/tcp/timer/splice、`veil_rt_reactor`）。バックエンドは build.rs 発行 cfg で選択、公開パスはファサードで不変（F-120） |
 | `tests/`、`benches/` | 統合・E2E・ベンチ（`cargo test` が拾うホワイトボックス） |
 | `examples/config.toml` | 設定リファレンス（全キー網羅・`src/config.rs` 同期） |
 | `docs/readme/` | 日本語 README（`README.ja.md`） |

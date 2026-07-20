@@ -22,7 +22,7 @@ A high-performance reverse proxy server using io_uring (custom runtime) and rust
 - **kTLS**: Kernel TLS offload support via rustls + custom kTLS module (Linux 5.15+, FreeBSD 13.0+ — F-126)
 - **HTTP/2**: HTTP/2 support via TLS ALPN negotiation (stream multiplexing, HPACK compression with **4-bit LUT Huffman decode** — F-121)
 - **H2C Server**: HTTP/2 Cleartext (H2C) server support without TLS (Prior Knowledge mode, RFC 7540 Section 3.4)
-- **HTTP/3**: QUIC/UDP-based HTTP/3 support using quiche's low-level sans-IO API (`Connection::recv`/`send`, configurable congestion control/pacing). On the Linux io_uring backend, datagram receive uses **`IORING_OP_RECVMSG` multishot + provided buffers** (F-124; falls back to POLL + `recvmmsg` on reactor builds or when multishot is unavailable). 0-RTT connection establishment
+- **HTTP/3**: QUIC/UDP-based HTTP/3 support using quiche's low-level sans-IO API (`Connection::recv`/`send`, configurable congestion control/pacing). On the Linux io_uring backend, the UDP datapath is pipelined: receive keeps `mmsg_batch_size` independent **`IORING_OP_RECVMSG`** ops in flight and send batches **`IORING_OP_SENDMSG`** (with GSO `UDP_SEGMENT` cmsg) across multiple SQEs per `io_uring_enter` — no libc `recvmmsg`/`sendmmsg` on the hot path (F-130; falls back to POLL + `recvmmsg`/`sendmmsg` on reactor builds or via `VEIL_H3_MULTISHOT=0`). 0-RTT connection establishment
 - **Fast Allocator**: High-speed memory allocation with mimalloc + Huge Pages support
 - **Fast Routing**: O(log n) path matching with Radix Tree (matchit)
 
@@ -431,7 +431,7 @@ The following table lists default values for major configuration options:
 | `[http3]` | `pacing` | `true` | Enable packet pacing |
 | `[http3]` | `max_pacing_rate` | *(none)* | Max pacing rate (bytes/s); omit for unlimited |
 | `[http3]` | `hystart` | `true` | Enable HyStart++ |
-| `[http3]` | `mmsg_batch_size` | `64` | UDP mmsg / io_uring multishot batch width (1..=128) |
+| `[http3]` | `mmsg_batch_size` | `64` | UDP mmsg / io_uring pipelined RECVMSG/SENDMSG batch width (1..=128) |
 | `[http3]` | `compression_enabled` | `false` | Enable compression |
 | `[http3]` | `gso_gro_enabled` | `false` | Enable GSO/GRO |
 | `[http3]` | `alt_svc_enabled` | `true` | Advertise HTTP/3 via Alt-Svc on H1/H2 responses (when `server.http3_enabled`) |
@@ -2529,7 +2529,7 @@ Supports HTTP/3 (RFC 9114) based on QUIC/UDP. Uses Cloudflare's [quiche](https:/
 | Connection Migration | Maintains connection during network switches |
 | GSO/GRO Optimization | High-performance UDP processing (UDP_SEGMENT / UDP_GRO) |
 | Congestion control / pacing | Configurable via `[http3]` (`cc_algorithm`, `pacing`, `hystart`, …); default BBR + pacing |
-| io_uring multishot recv | `IORING_OP_RECVMSG` + provided buffers (batch via `mmsg_batch_size`, default 64) |
+| io_uring pipelined UDP I/O | Receive/send hot path uses pipelined `IORING_OP_RECVMSG`/`IORING_OP_SENDMSG` (batch via `mmsg_batch_size`, default 64); no libc `recvmmsg`/`sendmmsg` on the hot path (F-130) |
 
 ### Enabling
 
@@ -2591,11 +2591,15 @@ initial_max_streams_uni = 100
 #     quiche as slices, eliminating per-datagram heap allocation and copies
 #     (zero-copy receive). Falls back to single-datagram I/O on unsupported kernels.
 #   - Independent of this setting, the HTTP/3 data plane always batches multiple
-#     datagrams (across different connections) into one syscall via
-#     recvmmsg(2)/sendmmsg(2) (F-115) and, on io_uring, IORING_OP_RECVMSG multishot
-#     with provided buffers (F-124; batch size = mmsg_batch_size, default 64).
-#     Container deployments need recvmmsg/sendmmsg
-#     in the seccomp allowlist (docker/assets/security/seccomp.json ships with them).
+#     datagrams (across different connections) via pipelined io_uring ops on the
+#     default backend: `mmsg_batch_size` IORING_OP_RECVMSG ops kept in flight for
+#     receive, and multiple IORING_OP_SENDMSG SQEs per io_uring_enter for send
+#     (F-130; batch size = mmsg_batch_size, default 64). Falls back to a single
+#     recvmmsg(2)/sendmmsg(2) syscall per sweep (F-115) on reactor builds or when
+#     the io_uring pipeline is disabled (VEIL_H3_MULTISHOT=0).
+#     Container deployments need recvmmsg/sendmmsg in the seccomp allowlist for
+#     this fallback path and for DNS resolution
+#     (docker/assets/security/seccomp.json ships with them).
 #
 # Notes:
 #   - Supported on Linux 5.0+

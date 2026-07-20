@@ -14,5 +14,7 @@ pub mod ring;
 pub mod splice;
 pub mod tcp;
 pub mod timer;
-/// HTTP/3 向け `IORING_OP_RECVMSG` multishot 受信（F-124）。
+/// HTTP/3 向けパイプライン化 `IORING_OP_RECVMSG` 受信（F-124 → F-130 C1）。
 pub mod udp_recv;
+/// HTTP/3 向けパイプライン化 `IORING_OP_SENDMSG` 送信（F-130 C3）。
+pub mod udp_send;
