@@ -36,8 +36,12 @@ if [[ -n "${CARGO_FEATURES:-}" ]]; then
 else
     FEAT_ARGS=()  # 既定 feature（ktls,http2,mimalloc = io_uring）
 fi
-docker run --rm -v "${ROOT}:/io" -w /io messense/cargo-zigbuild \
-    cargo zigbuild --release --target "${RUST_TARGET}" "${FEAT_ARGS[@]}"
+# aarch64-unknown-linux-gnu は aws-lc-sys が prebuilt asm ではなく cmake ビルダー経路に
+# なるため、zigbuild イメージに cmake を導入してからビルドする（無いと
+# 「Missing dependency: cmake」で失敗する。F-128/v0.6.0 検証で確認）。
+docker run --rm -v "${ROOT}:/io" -v veil-zig-cargo:/root/.cargo/registry -w /io messense/cargo-zigbuild \
+    bash -c "command -v cmake >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq cmake >/dev/null 2>&1); \
+             cargo zigbuild --release --target ${RUST_TARGET} ${FEAT_ARGS[*]}"
 
 BIN="${ROOT}/target/${RUST_TARGET}/release/veil"
 [[ -f "${BIN}" ]] || die "ビルド成果物が見つかりません: ${BIN}"
