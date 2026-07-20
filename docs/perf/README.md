@@ -231,3 +231,23 @@ h2load --alpn-list=h3 -n 100 -c 10 -m10 https://<veil>:443/
 **F-129 は F-115 比 +21%（8393/6931 = 1.21×）** の HTTP/3 スループット改善。主因は
 quiche CC の CUBIC→BBR + pacing/hystart と、先頭データグラム受信の io_uring 化（POLL 二重往復排除）。
 これを基準に F-130（極限 io_uring 化: 受信 drain / 送信の io_uring 化・真 multishot）で更に詰める。
+
+## HTTP/2 kTLS ホストベンチ（2026-07-20、HTTP/3 と同条件で比較）
+
+HTTP/3 が host-net h2load で ~7500 req/s だったため、HTTP/2 も同一ホスト・同一構成
+（release full、静的配信、h2load `-n30000 -c100 -m10` ×3、全 2xx、GSO 環境）で kTLS 有効/無効を測定:
+
+| 構成 | HTTP/2 Req/s（iter1/2/3, median） | 備考 |
+|---|---|---|
+| HTTP/2 + kTLS（`ktls_enabled=true`） | 4153 / 4225 / 4125（median **4153**） | kTLS 有効化はログ確認（AES-GCM offload available） |
+| HTTP/2 rustls（kTLS 無効） | 4162 / 4175 / 4357（median **4175**） | ユーザ空間 rustls |
+| （参考）HTTP/3 QUIC | 7489 / 7868 / 7547（median **~7547**） | 同ホスト・同 h2load params |
+
+**発見**:
+1. **ループバック（127.0.0.1）では kTLS の効果はほぼ無い**（4153 ≈ 4175）。kTLS は実 NIC の
+   ハードウェア暗号オフロードで効くもので、loopback では in-kernel 暗号のままユーザ空間 rustls と
+   スループット差が出ない（`docs/perf` の「kTLS は veth/コンテナと相性が悪い」と整合。ベアメタル
+   実 NIC 環境向け）。
+2. **host-net + GSO 有効では HTTP/3(~7547) > HTTP/2(~4150)**。HTTP/3 は QUIC の GSO バッチ送出
+   （1 syscall で複数データグラム）と io_uring 受信の効果で、TCP/HTTP2 を上回る。docker bridge
+   （GSO/GRO 無効）では逆に HTTP/3 が不利（~835）になるため、計測は host net と bridge を分ける。
