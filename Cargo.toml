@@ -304,27 +304,34 @@ futures = "0.3.31"
 # ====================
 # rustls 暗号プロバイダの target 別選択（F-122、src/tls_provider.rs 参照）
 # ====================
-# 非 OpenBSD/非 macOS/非 Windows（Linux/FreeBSD）: aws_lc_rs。kTLS（ktls_rustls）・
-# quiche(http3) と AWS-LC を共有し、アセンブリ最適化が効く。
-# http3_server の RNG（aws_lc_rs::rand）にも使う。
-[target.'cfg(not(any(target_os = "openbsd", target_os = "macos", target_os = "windows")))'.dependencies]
+# aws_lc_rs を使う target:
+#   - 非 OpenBSD/非 macOS/非 Windows（Linux/FreeBSD）: kTLS（ktls_rustls）・quiche(http3) と
+#     AWS-LC を共有し、アセンブリ最適化が効く。http3_server の RNG（aws_lc_rs::rand）にも使う。
+#   - Windows/aarch64（v0.6.0）: aarch64 の aws-lc は ARM アセンブリを使い **NASM 不要**
+#     （NASM は x86 用）。cargo-xwin コンテナに cmake を入れれば aws-lc-sys が
+#     cmake ビルダー経路でクロスビルドできる。一方 ring 0.17 は aarch64-pc-windows-msvc
+#     の prebuilt asm を持たず、ソースコンパイルが cargo-xwin の `/imsvc` フラグ handling で
+#     失敗するため、aarch64-windows は aws_lc_rs を使う（x86_64-windows は逆に aws-lc が
+#     NASM を要求するため ring のまま）。
+[target.'cfg(any(not(any(target_os = "openbsd", target_os = "macos", target_os = "windows")), all(target_os = "windows", target_arch = "aarch64")))'.dependencies]
 # default-features = false は base の [dependencies] rustls と一致させる（default に含まれる
 # aws_lc_rs をここで暗黙有効化しないため。provider は features で明示する）。
 rustls = { version = "0.23.35", default-features = false, features = ["aws_lc_rs"] }
 # bindgen: AWS_LC_SYS_NO_PREFIX 時に aws-lc-sys がバインディング生成するため必要
 aws-lc-rs = { version = "1.15.2", features = ["bindgen"] }
 
-# OpenBSD / macOS / Windows: ring。
+# ring を使う target:
 #   - OpenBSD: aws-lc-rs は TLS ハンドシェイクを完了できない（F-122）。
 #   - macOS（F-125）: Docker（cargo-zigbuild）での universal2 クロスビルドで aws-lc-sys の
 #     手書きアセンブリを zig リンカが解釈できずリンク失敗し、release では NO_ASM も禁止。
 #     ring は apple-darwin クロスビルド実績があり、macOS は kTLS/http3 非対応のため
 #     AWS-LC 共有の利点も無い。
-#   - Windows（v0.6.0）: aws-lc-sys のビルドが cmake + NASM を要求し、cargo-xwin
+#   - Windows/x86_64（v0.6.0）: aws-lc-sys のビルドが x86 では NASM を要求し、cargo-xwin
 #     コンテナに NASM が無いためクロスビルドが通らない。Windows も kTLS/http3 非対応。
+#     （aarch64-windows は NASM 不要なので上の aws_lc_rs ブロック側に振り分ける）。
 # default-features = false 必須: rustls の default feature は aws_lc_rs を含むため、
 # これを付けないと OpenBSD/macOS/Windows 本体が aws-lc-rs/aws-lc-sys を引いてしまう。
-[target.'cfg(any(target_os = "openbsd", target_os = "macos", target_os = "windows"))'.dependencies]
+[target.'cfg(any(target_os = "openbsd", target_os = "macos", all(target_os = "windows", not(target_arch = "aarch64"))))'.dependencies]
 rustls = { version = "0.23.35", default-features = false, features = ["ring"] }
 ring = "0.17"
 

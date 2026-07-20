@@ -33,9 +33,19 @@
 /// このプラットフォームで使う rustls 暗号プロバイダモジュール。
 ///
 /// `provider::default_provider()` / `provider::ALL_CIPHER_SUITES` の形で参照する。
-#[cfg(not(any(target_os = "openbsd", target_os = "macos", target_os = "windows")))]
+// aarch64-windows は aws_lc_rs（ARM asm・NASM 不要、cmake でクロスビルド可。ring 0.17 は
+// aarch64-pc-windows-msvc の prebuilt asm を持たず cargo-xwin でビルド不能）。
+// x86_64-windows/macOS/OpenBSD は ring。Cargo.toml の provider target 分割と一致させること。
+#[cfg(any(
+    not(any(target_os = "openbsd", target_os = "macos", target_os = "windows")),
+    all(target_os = "windows", target_arch = "aarch64")
+))]
 pub use rustls::crypto::aws_lc_rs as provider;
-#[cfg(any(target_os = "openbsd", target_os = "macos", target_os = "windows"))]
+#[cfg(any(
+    target_os = "openbsd",
+    target_os = "macos",
+    all(target_os = "windows", not(target_arch = "aarch64"))
+))]
 pub use rustls::crypto::ring as provider;
 
 /// HTTP/3（quiche）の乱数生成に使う `SecureRandom` 実装。
@@ -44,11 +54,18 @@ pub use rustls::crypto::ring as provider;
 /// （どちらも `rustls`/`quiche` とは独立した RNG API）。http3 feature 有効時のみ使用。
 #[cfg(all(
     feature = "http3",
-    not(any(target_os = "openbsd", target_os = "macos", target_os = "windows"))
+    any(
+        not(any(target_os = "openbsd", target_os = "macos", target_os = "windows")),
+        all(target_os = "windows", target_arch = "aarch64")
+    )
 ))]
 pub use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 #[cfg(all(
     feature = "http3",
-    any(target_os = "openbsd", target_os = "macos", target_os = "windows")
+    any(
+        target_os = "openbsd",
+        target_os = "macos",
+        all(target_os = "windows", not(target_arch = "aarch64"))
+    )
 ))]
 pub use ring::rand::{SecureRandom, SystemRandom};

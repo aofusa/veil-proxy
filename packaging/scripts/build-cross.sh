@@ -2,7 +2,7 @@
 # veil クロスプラットフォームバイナリ tar.gz/zip パッケージング（F-125）
 #
 # macOS（universal2-apple-darwin: x86_64 + aarch64 fat binary）を Docker
-# （messense/cargo-zigbuild）で、Windows（x86_64-pc-windows-msvc）を Docker
+# （messense/cargo-zigbuild）で、Windows（x86_64-pc-windows-msvc=ring / aarch64-pc-windows-msvc=aws_lc_rs）を Docker
 # （messense/cargo-xwin）でクロスビルドし、単体バイナリ tar.gz/zip を
 # packaging/output/ へ出力する。QEMU 実行・テストは行わない
 # （クロスビルドが通ることのみを検証する。ユーザ指示: docs/artifacts/f125_windows_macos_design.md）。
@@ -43,7 +43,7 @@ Usage: $(basename "$0") --target <macos|windows>
 
 Build a standalone veil binary tarball/zip for a cross-compiled non-Linux
 target using Docker: 'macos' (universal2-apple-darwin, via
-messense/cargo-zigbuild) or 'windows' (x86_64-pc-windows-msvc, via
+messense/cargo-zigbuild) or 'windows' (x86_64=ring + aarch64=aws_lc_rs, via
 messense/cargo-xwin).
 
 Options:
@@ -59,7 +59,7 @@ Environment:
 
 Output:
   packaging/output/veil-\${VERSION}-universal2-apple-darwin.tar.gz
-  packaging/output/veil-\${VERSION}-x86_64-pc-windows-msvc.zip
+  packaging/output/veil-\${VERSION}-{x86_64,aarch64}-pc-windows-msvc.zip
 EOF
 }
 
@@ -152,21 +152,28 @@ EOF
     echo "==> Created ${OUTPUT_DIR}/${archive_name}"
 }
 
-build_windows() {
+# 1 つの Windows ターゲット（x86_64 または aarch64）をビルドして zip 化する。
+# 暗号プロバイダは arch により異なる（Cargo.toml の target 別依存と一致）:
+#   - x86_64-pc-windows-msvc: ring（aws-lc-sys は x86 で NASM を要求し cargo-xwin に無い）
+#   - aarch64-pc-windows-msvc: aws_lc_rs（ARM asm・NASM 不要。cmake を入れれば aws-lc-sys が
+#     クロスビルドできる。逆に ring 0.17 は aarch64-windows の prebuilt asm を持たず
+#     cargo-xwin の /imsvc フラグ handling で C コンパイルに失敗する）
+_build_one_windows() {
+    local rust_target="$1"
     local features="${CARGO_FEATURES:-${DEFAULT_WINDOWS_FEATURES}}"
-    local rust_target="x86_64-pc-windows-msvc"
     local archive_name="veil-${VERSION}-${rust_target}.zip"
     local xwin_cache="${XWIN_CACHE_DIR:-${HOME}/.xwin-cache}"
+    local provider="ring" setup=":"
+    if [[ "${rust_target}" == aarch64-* ]]; then
+        provider="aws_lc_rs"
+        # aarch64 の aws-lc-sys は cmake ビルダー経路（NASM 不要）。コンテナに cmake を導入。
+        setup='command -v cmake >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq cmake >/dev/null 2>&1; }'
+    fi
 
-    echo "==> Building veil binary for ${rust_target} in Docker (messense/cargo-xwin)"
+    echo "==> Building veil binary for ${rust_target} (provider=${provider}) in Docker (messense/cargo-xwin)"
     echo "==> Features: ${features}"
-
     mkdir -p "${xwin_cache}"
 
-    # Windows は rustls の暗号プロバイダに ring を使う（Cargo.toml の target 別依存）。
-    # aws-lc-sys のビルドは cmake + NASM を要求し、cargo-xwin コンテナに NASM が無いため
-    # クロスビルドが通らない（src/tls_provider.rs 参照）。Windows も kTLS/http3 非対応の
-    # ため AWS-LC 共有の利点が無く、macOS/OpenBSD と同じ ring 経路に合流させている。
     # target/ をホストと共有する都合上、ホスト側の他の cargo ビルドと同時に走らせないこと
     # （AGENTS.md 検証手順: 1 つずつ実行。target 競合を避けるため）。
     docker run --rm \
@@ -175,7 +182,7 @@ build_windows() {
         -v "${ROOT}:/io" \
         -w /io \
         messense/cargo-xwin \
-        cargo xwin build --release --target "${rust_target}" --no-default-features --features "${features}"
+        bash -c "${setup}; cargo xwin build --release --target ${rust_target} --no-default-features --features ${features}"
 
     local binary_path="${ROOT}/target/${rust_target}/release/veil.exe"
     if [[ ! -f "${binary_path}" ]]; then
@@ -196,7 +203,7 @@ build_windows() {
     cat > "${stage_parent}/${dir_name}/INSTALL.txt" <<EOF
 veil ${VERSION} — ${rust_target}
 
-x86_64 Windows バイナリ（cargo-xwin クロスビルド）。
+Windows バイナリ（cargo-xwin クロスビルド、TLS プロバイダ=${provider}）。
 QEMU/実機検証は行っていません（Docker クロスビルドが通ることのみ確認済み。
 docs/artifacts/f125_windows_macos_design.md の Windows 節）。
 
@@ -214,14 +221,19 @@ Windows ネイティブのセキュリティ（Job Object、best-effort）:
   （実機検証不可のため保守的な最小構成）。
 
 含まれる feature: ${features}
-（http3/wasm/ktls/l4-proxy はこのビルドに含まれていません。aws-lc-sys が
-  cargo-xwin で NASM 不足によりビルドできない、または Unix ソケット API 前提の
-  実装が未移植のため。TLS 暗号は ring プロバイダを使用します）
+（http3/wasm/ktls/l4-proxy はこのビルドに含まれていません。Unix ソケット API 前提の
+  実装が未移植のため。TLS 暗号は ${provider} プロバイダを使用します）
 EOF
 
     (cd "${stage_parent}" && zip -r "${OUTPUT_DIR}/${archive_name}" "${dir_name}" >/dev/null)
     rm -rf "${stage_parent}"
     echo "==> Created ${OUTPUT_DIR}/${archive_name}"
+}
+
+build_windows() {
+    # x86_64（ring）と aarch64（aws_lc_rs）の両方をビルドする。
+    _build_one_windows x86_64-pc-windows-msvc
+    _build_one_windows aarch64-pc-windows-msvc
 }
 
 case "${TARGET_OS}" in
