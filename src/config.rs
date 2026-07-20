@@ -6091,7 +6091,7 @@ pub fn load_backend(
             // Routeレベルの設定のみを使用
             let security = route.security.clone().unwrap_or_default();
             let cache = route.cache.clone().unwrap_or_default();
-            let metadata = fs::metadata(path).map_err(|e| {
+            let access_err = |e: io::Error| {
                 let error_msg = format!(
                     "Failed to access file '{}': {} (error code: {})",
                     path,
@@ -6099,8 +6099,20 @@ pub fn load_backend(
                     e.raw_os_error().unwrap_or(-1)
                 );
                 io::Error::new(e.kind(), error_msg)
-            })?;
-            let is_dir = metadata.is_dir();
+            };
+            // F-123: FreeBSD capability mode 下では絶対パス `fs::metadata` が禁止される
+            // ため、登録済みルート dirfd 相対の `fstatat` で is_dir を判定する
+            // （File ルート自身は登録ルートなので rel="." で解決される）。
+            #[cfg(target_os = "freebsd")]
+            let is_dir = if let Some(res) =
+                crate::security::capsicum::stat_static(std::path::Path::new(path))
+            {
+                res.map_err(access_err)?.is_dir
+            } else {
+                fs::metadata(path).map_err(access_err)?.is_dir()
+            };
+            #[cfg(not(target_os = "freebsd"))]
+            let is_dir = fs::metadata(path).map_err(access_err)?.is_dir();
             // インデックスファイル名を Arc<str> に変換（None = デフォルトで "index.html"）
             let index_file: Option<Arc<str>> = index.as_ref().map(|s| Arc::from(s.as_str()));
             let security = Arc::new(security.clone());

@@ -79,6 +79,16 @@ static POOL: Lazy<Arc<OffloadPool>> = Lazy::new(|| {
     pool
 });
 
+/// オフロードワーカープールを事前生成する（スレッド spawn を前倒しする）。
+///
+/// FreeBSD capability mode（`cap_enter(2)`）へ入った後に初めてオフロードを使うと、
+/// その時点でワーカースレッドの遅延生成が走る。cap_enter 後のスレッド生成はスタック
+/// ガード設定等で失敗し得るため、**cap_enter 前** に本関数でプールを暖機しておく。
+/// 冪等（`Lazy` の初回参照のみが生成を行う）。
+pub fn warmup() {
+    Lazy::force(&POOL);
+}
+
 thread_local! {
     /// 起点スレッドの完了通知用 fd ペア（読み取り fd, 書き込み fd）。初回オフロード時に
     /// 遅延生成する。Linux は eventfd（読み書き同一 fd）、非 Linux（BSD）は

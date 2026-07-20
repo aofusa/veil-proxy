@@ -55,7 +55,11 @@ pub use reactor::{executor, tcp, timer};
 #[cfg(all(veil_rt_reactor, target_os = "linux"))]
 pub use reactor::splice;
 #[cfg(veil_rt_uring)]
-pub use uring::{executor, ring, splice, tcp, timer, udp_recv, udp_send};
+pub use uring::{executor, ring, splice, tcp, timer};
+// udp_recv/udp_send は HTTP/3 io_uring 送受信専用（crate::udp を参照）。http3 無効時は
+// 消費者（http3_server）ごと除外されるため、モジュールも http3 ゲートする。
+#[cfg(all(veil_rt_uring, feature = "http3"))]
+pub use uring::{udp_recv, udp_send};
 
 // 公開 API の再エクスポート
 pub use buf::{IoBuf, IoBufMut};

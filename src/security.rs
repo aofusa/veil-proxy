@@ -2372,7 +2372,7 @@ pub fn report_sandbox_support() {
 //   （設計ドキュメント 4.2 節）。静的ファイル配信のみの構成でのみ自動適用する。
 #[cfg(target_os = "freebsd")]
 pub mod capsicum {
-    use ftlog::info;
+    use ftlog::{info, warn};
     use std::io;
     use std::os::unix::io::RawFd;
 
@@ -2535,6 +2535,164 @@ pub mod capsicum {
     /// 現在のプロセスが capability mode 内にいるか判定する。
     pub fn is_capability_mode() -> bool {
         unsafe { cap_sandboxed() != 0 }
+    }
+
+    // ------------------------------------------------------------------
+    // F-123: capability mode 下の静的ファイル配信（ディレクトリ fd + `openat`/
+    // `fstatat` 相対化 + `O_RESOLVE_BENEATH`/`AT_RESOLVE_BENEATH`）
+    //
+    // capability mode（`cap_enter`）では絶対パスの `open`/`stat`/`realpath` が禁止
+    // されるため、File ルートのルートディレクトリを **cap_enter 前** に open して
+    // ディレクトリ fd を保持し（`limit_static_dir_rights` で CAP_LOOKUP/CAP_READ 等へ
+    // 制限）、配信時の open/stat をその fd 相対の `*at()` へ切り替える。パストラバーサル
+    // 封じ込めは `O_RESOLVE_BENEATH`（FreeBSD 13+）が担う（`..`/シンボリックリンクで
+    // ルート外へ抜ける解決を EACCES で拒否。capability mode 自体の beneath 強制と多重化）。
+    // ------------------------------------------------------------------
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::FromRawFd;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::OnceLock;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    /// `O_RESOLVE_BENEATH`（`<sys/fcntl.h>`、FreeBSD 13+）。`openat` の flags に付与すると
+    /// 解決経路が開始 fd の配下を逸脱した時点で失敗する。`libc` クレート未公開のため定義。
+    const O_RESOLVE_BENEATH: libc::c_int = 0x0080_0000;
+    /// `AT_RESOLVE_BENEATH`（`<sys/fcntl.h>`、FreeBSD 13+）。`fstatat` 等の at-flags 版。
+    const AT_RESOLVE_BENEATH: libc::c_int = 0x2000;
+
+    /// 登録済み静的ルート（config の File パス（プレフィックス照合用）→ ディレクトリ fd）。
+    static STATIC_DIRS: OnceLock<Vec<(PathBuf, RawFd)>> = OnceLock::new();
+    /// 静的配信の openat 相対化が有効か（`init_static_dirfds` 成功後に true）。
+    static STATIC_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+    /// `fstatat` から得た配信判断に必要な最小メタデータ。
+    pub struct StaticStat {
+        pub len: u64,
+        pub mtime: Option<SystemTime>,
+        pub is_file: bool,
+        pub is_dir: bool,
+    }
+
+    /// File ルートのルートディレクトリ群を open し、ディレクトリ fd を登録する
+    /// （**`cap_enter` 前** に呼ぶこと。以降 openat/fstatat 相対化が有効化される）。
+    ///
+    /// 各 fd は `limit_static_dir_rights` で CAP_LOOKUP/CAP_READ/CAP_FSTAT/CAP_SEEK/
+    /// CAP_MMAP_R/CAP_FCNTL へ制限する。canonicalize は絶対パス操作のため cap_enter 前に
+    /// 済ませる（dirfd を開くためだけに使用。プレフィックス照合は config パス原形で行う）。
+    pub fn init_static_dirfds(roots: &[PathBuf]) -> io::Result<()> {
+        let mut dirs: Vec<(PathBuf, RawFd)> = Vec::new();
+        for root in roots {
+            // 照合キーは config に書かれたパス原形（配信側はこの原形を prefix に絶対パスを
+            // 構築するため）。dirfd を開くためだけ canonicalize する。
+            let canonical = match root.canonicalize() {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(
+                        "capsicum: static root {:?} を canonicalize できず登録をスキップ: {}",
+                        root, e
+                    );
+                    continue;
+                }
+            };
+            if dirs.iter().any(|(p, _)| p == root) {
+                continue;
+            }
+            let cpath = CString::new(canonical.as_os_str().as_bytes())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+            let fd = unsafe {
+                libc::open(
+                    cpath.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            limit_static_dir_rights(fd)?;
+            info!(
+                "capsicum: 静的ルート dirfd={} を登録（{:?} → canonical {:?}）",
+                fd, root, canonical
+            );
+            dirs.push((root.clone(), fd));
+        }
+        let _ = STATIC_DIRS.set(dirs);
+        STATIC_ACTIVE.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// 静的配信の openat 相対化が有効か（ホットパスでの単一 relaxed-acquire ロード）。
+    #[inline]
+    pub fn static_serving_active() -> bool {
+        STATIC_ACTIVE.load(Ordering::Acquire)
+    }
+
+    /// 絶対パスを登録ルート配下の相対 `CString` + ルート dirfd へ解決する。
+    /// 有効化されていない / どのルート配下でもない場合は `None`（呼び出し側は通常経路へ）。
+    fn resolve_root(abs: &Path) -> Option<(RawFd, CString)> {
+        if !static_serving_active() {
+            return None;
+        }
+        let dirs = STATIC_DIRS.get()?;
+        for (root, fd) in dirs {
+            if let Ok(rel) = abs.strip_prefix(root) {
+                let rel_c = if rel.as_os_str().is_empty() {
+                    CString::new(".").ok()?
+                } else {
+                    CString::new(rel.as_os_str().as_bytes()).ok()?
+                };
+                return Some((*fd, rel_c));
+            }
+        }
+        None
+    }
+
+    /// capability mode 下でルート dirfd 相対に読み取り専用 open する。
+    /// `None` = 相対化対象外（通常の絶対パス open にフォールバック）。
+    /// `Some(Err)` = 相対化対象だが openat 失敗（404 相当）。
+    pub fn open_static_ro(abs: &Path) -> Option<io::Result<std::fs::File>> {
+        let (dirfd, rel) = resolve_root(abs)?;
+        let fd = unsafe {
+            libc::openat(
+                dirfd,
+                rel.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | O_RESOLVE_BENEATH,
+            )
+        };
+        if fd < 0 {
+            Some(Err(io::Error::last_os_error()))
+        } else {
+            // SAFETY: openat が返した所有権のある有効な fd。
+            Some(Ok(unsafe { std::fs::File::from_raw_fd(fd) }))
+        }
+    }
+
+    /// capability mode 下でルート dirfd 相対に `fstatat` する（`canonicalize`+`metadata` 代替）。
+    pub fn stat_static(abs: &Path) -> Option<io::Result<StaticStat>> {
+        let (dirfd, rel) = resolve_root(abs)?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let ret = unsafe { libc::fstatat(dirfd, rel.as_ptr(), &mut st, AT_RESOLVE_BENEATH) };
+        if ret != 0 {
+            return Some(Err(io::Error::last_os_error()));
+        }
+        let is_file = (st.st_mode & libc::S_IFMT) == libc::S_IFREG;
+        let is_dir = (st.st_mode & libc::S_IFMT) == libc::S_IFDIR;
+        let mtime = {
+            let secs = st.st_mtime;
+            let nsecs = st.st_mtime_nsec;
+            if secs >= 0 {
+                Some(UNIX_EPOCH + Duration::new(secs as u64, nsecs as u32))
+            } else {
+                None
+            }
+        };
+        Some(Ok(StaticStat {
+            len: st.st_size as u64,
+            mtime,
+            is_file,
+            is_dir,
+        }))
     }
 
     /// jail 名から jid を解決し `jail_attach(2)` する（root 前提）。

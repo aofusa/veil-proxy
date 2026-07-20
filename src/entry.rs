@@ -927,6 +927,19 @@ pub fn run() {
         if capsicum_capability_mode_requested {
             let listeners_ready = std::sync::Arc::clone(&listeners_ready);
             let expected = num_threads;
+            // F-123: capability mode 下でも静的配信を動作させるため、File ルートの
+            // ルートディレクトリ fd を **cap_enter 前** に開いて登録する。config の
+            // File アクションからルートパスを列挙（Landlock の read_only 列挙と同じ経路）。
+            let static_roots: Vec<std::path::PathBuf> = loaded_config
+                .route
+                .iter()
+                .filter_map(|r| match &r.action {
+                    crate::config::BackendConfig::File { path, .. } => {
+                        Some(std::path::PathBuf::from(path))
+                    }
+                    _ => None,
+                })
+                .collect();
             std::thread::Builder::new()
                 .name("veil-cap-enter".to_string())
                 .spawn(move || {
@@ -935,6 +948,21 @@ pub fn run() {
                     // ポーリング sleep でよい。最大 ~30 秒待つ。
                     for _ in 0..3000 {
                         if listeners_ready.load(Ordering::Acquire) >= expected {
+                            // cap_enter 後の初回オフロードでワーカースレッドを遅延生成
+                            // すると、capability mode 下のスレッド生成がスタックガード設定
+                            // 等で失敗し得る。cap_enter 前にプールを暖機しておく（F-123）。
+                            crate::runtime::offload::warmup();
+                            // cap_enter 前に静的ルート dirfd を登録（絶対パス open/
+                            // canonicalize がまだ許可されているうちに）。
+                            if let Err(e) =
+                                crate::security::capsicum::init_static_dirfds(&static_roots)
+                            {
+                                error!(
+                                    "capsicum: 静的ルート dirfd 登録に失敗（capability mode 下で\
+                                     静的配信が 404 になる可能性）: {}",
+                                    e
+                                );
+                            }
                             match crate::security::capsicum::enter_capability_mode() {
                                 Ok(()) => info!(
                                     "capsicum: capability mode active ({} listeners bound)",

@@ -244,6 +244,23 @@ pub fn get_file_cache() -> Option<std::sync::Arc<()>> {
 async fn fetch_file_info_uncached(path: &std::path::Path) -> Option<CachedFileInfo> {
     let path = path.to_path_buf();
     crate::runtime::offload::offload(move || {
+        // F-123: FreeBSD capability mode 下では canonicalize（絶対パス realpath）が
+        // 禁止されるため、登録済みルート dirfd 相対の fstatat で代替する（O_RESOLVE_BENEATH
+        // が封じ込めを担保。canonical_path は原パスのまま = 配信 open も同経路で相対化）。
+        #[cfg(target_os = "freebsd")]
+        if let Some(res) = crate::security::capsicum::stat_static(&path) {
+            let st = res.ok()?;
+            let mime_type = mime_guess::from_path(&path)
+                .first_or_octet_stream()
+                .to_string();
+            return Some(CachedFileInfo {
+                canonical_path: path,
+                file_size: st.len,
+                mime_type,
+                last_modified: st.mtime,
+                is_file: st.is_file,
+            });
+        }
         let canonical = path.canonicalize().ok()?;
         // 理由付き allow: offload の専用ワーカースレッド内であり、イベントループを
         // ブロックしない（AGENTS.md がホットパス外の正当な同期 FS 利用として許可）。

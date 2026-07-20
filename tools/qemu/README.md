@@ -22,6 +22,20 @@ veil の **io_uring バックエンド**を実 aarch64 カーネル上で E2E / 
 - x86_64 ホスト上の aarch64 full-system は **TCG（ソフトウェアエミュレーション）** で
   動くため非常に低速。**VM 内でのフルビルドは避け**、ホストでクロスコンパイルした
   バイナリのみを VM へ転送して実行する。
+- **既知の環境制約（重要）**: KVM が使えない（クロスアーチ）ホストでは TCG のみとなり、
+  汎用クラウドイメージ（Ubuntu cloud image / Alpine cloud image いずれも）は
+  systemd/OpenRC の初期化やサービス依存解決の段階で `hrtimer: interrupt took ...` を
+  伴い実用不能なほど遅く（`soft lockup CPU#0 stuck` に至る場合もある）、SSH 到達前に
+  停滞することがある。この場合、**フルシステムの対話的 E2E は当該ホストでは成立しない**。
+  aarch64 の妥当性確認は次の 2 点で代替する:
+  1. 現行コードの **aarch64 クロスビルド成功**（`messense/rust-musl-cross:aarch64-musl`
+     で `aws-lc-sys` の bindgen に `BINDGEN_EXTRA_CLANG_ARGS=--sysroot=...` を渡す。
+     成果物は実 aarch64 ELF・静的リンク）。
+  2. io_uring 経路は **アーキテクチャ非依存**（カーネル io_uring ABI は LE 全アーチで
+     同一、SQE/CQE の struct レイアウトも共通）であることのコードレベル論証。
+
+  KVM 対応（ネイティブ aarch64 ホスト or ネスト仮想化）が使えるホストでは、上記
+  `up`→`wait`→`run-e2e-aarch64.sh` がそのまま実 io_uring E2E として機能する。
 
 ## 使い方
 
