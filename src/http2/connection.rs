@@ -2056,6 +2056,21 @@ where
         self.streams.get_ref(stream_id)
     }
 
+    /// 現在の利用可能送信ウィンドウ（コネクション/ストリームの小さい方）を返す（F-131）。
+    ///
+    /// メインループのインラインファストパスが、`streams`（`H2ActiveStream`）マップの
+    /// `pending_body` によるウィンドウ待ち保留機構を経由せずに応答を送出する前に、
+    /// 全量を積み切れるか確認するために使う（積み切れない場合は spawn 経路へフォールバック
+    /// させ、ウィンドウ枯渇時のデータ消失を防ぐ）。
+    pub fn available_send_window(&self, stream_id: u32) -> usize {
+        let stream_window = self
+            .streams
+            .get_ref(stream_id)
+            .map(|s| s.send_window)
+            .unwrap_or(0);
+        self.conn_send_window.min(stream_window).max(0) as usize
+    }
+
     /// ストリームを可変で取得
     pub fn get_stream_mut(&mut self, stream_id: u32) -> Option<&mut Stream> {
         self.streams.get(stream_id)

@@ -655,7 +655,8 @@ where
                             &spawner,
                             client_ip,
                             connection_metric,
-                        );
+                        )
+                        .await?;
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -701,7 +702,8 @@ where
                             &spawner,
                             client_ip,
                             connection_metric,
-                        );
+                        )
+                        .await?;
                     }
                 }
                 Ok(None) => {
@@ -820,6 +822,13 @@ struct H2RequestCtx {
     body: Bytes,
     client_ip: Box<str>,
     start: Instant,
+    /// `h2_try_fast_path` が解決済みのルーティング結果（F-131）。
+    ///
+    /// ファストパス対象外と判定した際、`find_backend_unified` を `h2_dispatch` 側で
+    /// 呼び直さずに済むよう、解決済みの `(prefix, backend, route_compression)` を
+    /// ここへ引き継ぐ。`Backend` は `#[derive(Clone)]` のため安全に clone できる。
+    /// `None` の場合は `h2_dispatch` が従来どおりルーティングを行う。
+    resolved_route: Option<(Box<[u8]>, Backend, Arc<CompressionConfig>)>,
 }
 
 /// メインループ側のストリーム状態（F-116）。
@@ -883,7 +892,7 @@ const H2_REQ_CHANNEL_CAP: usize = 4;
 /// ボディ継続で、ストリーミング適格ならリクエストボディチャネル付きで起動する。
 #[cfg(feature = "http2")]
 #[allow(clippy::too_many_arguments)]
-fn h2_spawn_for_request<S>(
+async fn h2_spawn_for_request<S>(
     conn: &mut http2::Http2Connection<S>,
     stream_id: u32,
     body_pending: bool,
@@ -892,12 +901,13 @@ fn h2_spawn_for_request<S>(
     spawner: &H2TaskSpawner,
     client_ip: &str,
     connection_metric: &mut ActiveConnectionMetric,
-) where
+) -> http2::error::Http2Result<()>
+where
     S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
 {
     // 既にタスク起動済みのストリーム（body_pending の二重通知）はスキップ。
     if streams.contains_key(&stream_id) {
-        return;
+        return Ok(());
     }
 
     // ストリーミング適格判定 + リクエストボディ上限をルーティング 1 回で取得する
@@ -911,13 +921,13 @@ fn h2_spawn_for_request<S>(
     if body_pending && !streaming {
         // 非適格: 何もしない。DATA は process_frame が request_body へ蓄積し、
         // END_STREAM 受信時に body_pending=false の ProcessedRequest で本関数が再度呼ばれる。
-        return;
+        return Ok(());
     }
     let max_request_body = plan.unwrap_or(0);
 
     let parts = match conn.take_request_parts(stream_id) {
         Some(p) => p,
-        None => return,
+        None => return Ok(()),
     };
 
     // authority（host フォールバック）を解決。
@@ -936,7 +946,7 @@ fn h2_spawn_for_request<S>(
         connection_metric.set_host("unknown".to_string());
     }
 
-    let ctx = H2RequestCtx {
+    let mut ctx = H2RequestCtx {
         method: parts.method,
         path: parts.path,
         authority,
@@ -944,7 +954,22 @@ fn h2_spawn_for_request<S>(
         body: parts.body.freeze(),
         client_ip: Box::from(client_ip),
         start: Instant::now(),
+        resolved_route: None,
     };
+
+    // F-131: バックエンド I/O・WASM 実行を伴わない同期完結の応答（メトリクス/管理API/
+    // 404/リダイレクト）は、タスク spawn・チャネル・Notify を経由せずメインループから
+    // 直接書き込む。`streaming`（Backend::Proxy 確定済み）は対象外。ルーティング解決済み
+    // （`Backend::Proxy`/`MemoryFile`/`SendFile` 等）の場合は `ctx.resolved_route` に
+    // 結果を残し、spawn 経路の `h2_dispatch` が `find_backend_unified` を呼び直さずに
+    // 済むようにする（`check_security` の二重呼び出し＝レートリミット二重消費も避ける）。
+    if !streaming
+        && h2_try_fast_path(conn, stream_id, &mut ctx, client_ip)
+            .await?
+            .is_some()
+    {
+        return Ok(());
+    }
 
     let (resp_tx, resp_rx) = crate::stream_channel::channel::<H2RespMsg>(H2_RESP_CHANNEL_CAP);
     let (req_tx, req_rx) = if streaming {
@@ -971,6 +996,354 @@ fn h2_spawn_for_request<S>(
             pending_body: None,
         },
     );
+    Ok(())
+}
+
+/// `h2_try_fast_path` がバックエンド解決後に `check_security` をこの場で呼んで良いか
+/// （＝ Backend::Redirect かつ WASM 非適用でインライン完結させる場合か）を判定する
+/// （F-131: レートリミッタの二重消費防止）。
+///
+/// `check_security` は `check_rate_limit` 経由でレートリミッタのカウンタを消費する
+/// 副作用を持つため、1 リクエストにつき合計で必ず 1 回だけ呼ばれなければならない。
+/// この判定が `false` を返すケース（Proxy/MemoryFile/SendFile、または WASM 適用され
+/// 得る Redirect）では `h2_try_fast_path` は `check_security` を呼ばずに `Ok(None)` を
+/// 返し、spawn 経路（`h2_dispatch`）側の唯一の呼び出しに委ねる。
+#[cfg(feature = "http2")]
+fn h2_fast_path_should_check_security_inline(backend: &Backend, wasm_applicable: bool) -> bool {
+    matches!(backend, Backend::Redirect(..)) && !wasm_applicable
+}
+
+/// メインループから直接応答を書き込むインラインファストパス（F-131）。
+///
+/// 対象: Prometheus メトリクス・管理 API・404・`Backend::Redirect`（WASM フィルタが
+/// 適用され得る場合を除く）でのセキュリティチェック拒否/成功応答。判定ロジック・
+/// ヘッダ組み立ては `h2_dispatch` の該当ブランチ（`h2_admin_response`/`h2_base_headers`/
+/// `h2_build_redirect_headers` 等）をそのまま流用し、二重実装を避ける。
+///
+/// **`check_security`（内部でレートリミッタのカウンタを消費する副作用を持つ）は、
+/// 本関数がインラインで応答を完結させる場合（＝ `Backend::Redirect` かつ WASM 非適用の
+/// 場合）のみ呼ぶ。** それ以外の一致バックエンド（`Proxy`/`MemoryFile`/`SendFile`、
+/// および WASM 適用され得る `Redirect`）は `check_security` を呼ばずに `Ok(None)` を
+/// 返し、現行の spawn 経路（`h2_dispatch`）に唯一の `check_security` 呼び出しを委ねる
+/// （1 リクエストにつき合計で必ず 1 回だけ呼ばれることを保証する）。
+///
+/// ルーティング解決結果は、ファストパス非該当と判定した時点で `ctx.resolved_route` へ
+/// 保存する。`h2_dispatch` はこれを見て `find_backend_unified` を呼び直さない
+/// （Proxy 等の主要トラフィックでルーティングコストが 2 倍化しないようにするため）。
+///
+/// `Ok(Some((status, resp_size)))` はファストパスで処理済み（`log_access` 呼び出し済み）。
+/// `Ok(None)` は対象外、または送信ウィンドウ不足で全量を積み切れないため
+/// 呼び出し元が現行の spawn 経路へフォールバックすべきことを示す。
+#[cfg(feature = "http2")]
+async fn h2_try_fast_path<S>(
+    conn: &mut http2::Http2Connection<S>,
+    stream_id: u32,
+    ctx: &mut H2RequestCtx,
+    client_ip: &str,
+) -> http2::error::Http2Result<Option<(u16, u64)>>
+where
+    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
+{
+    let method = &ctx.method[..];
+    let path = &ctx.path[..];
+
+    // 非疑似ヘッダーのみ（ルーティング用）。h2_dispatch と同じロジック。
+    let headers_raw: Vec<(&[u8], &[u8])> = ctx
+        .headers
+        .iter()
+        .filter(|h| !h.name.starts_with(b":"))
+        .map(|h| (h.name.as_slice(), h.value.as_slice()))
+        .collect();
+
+    // メトリクスエンドポイント（バックエンドルーティングを経由しないため
+    // check_security は元々呼ばれない。他フィールドの借用のため ctx は &* で不変再借用）。
+    {
+        let config = CURRENT_CONFIG.load();
+        let prom = &config.prometheus_config;
+        let path_str = std::str::from_utf8(path).unwrap_or("/");
+        if prom.enabled && path_str == prom.path && method == b"GET" {
+            if !prom.is_ip_allowed(client_ip) {
+                return h2_fast_finish(
+                    conn,
+                    stream_id,
+                    &*ctx,
+                    403,
+                    h2_base_headers(false),
+                    b"Forbidden".to_vec(),
+                )
+                .await;
+            }
+            let body = encode_prometheus_metrics();
+            let mut headers = h2_base_headers(false);
+            headers.push((
+                b"content-type".to_vec(),
+                b"text/plain; version=0.0.4; charset=utf-8".to_vec(),
+            ));
+            return h2_fast_finish(conn, stream_id, &*ctx, 200, headers, body).await;
+        }
+    }
+
+    // 管理 API（B-29）。同じく backend.security() を経由しないので check_security 対象外。
+    #[cfg(feature = "admin")]
+    if let Some((status, headers, body)) = h2_admin_response(method, path, client_ip, &headers_raw)
+    {
+        return h2_fast_finish(conn, stream_id, &*ctx, status, headers, body).await;
+    }
+
+    let config = CURRENT_CONFIG.load();
+    let query_start = path.iter().position(|&b| b == b'?');
+    let raw_query: &[u8] = query_start.map(|i| &path[i + 1..]).unwrap_or(b"");
+    let path_wo_query = query_start.map(|i| &path[..i]).unwrap_or(path);
+    let client_socket_addr = h2_client_socket_addr(client_ip);
+    let authority = &ctx.authority[..];
+
+    let backend_result = find_backend_unified(
+        authority,
+        path_wo_query,
+        method,
+        &headers_raw,
+        raw_query,
+        &client_socket_addr,
+        config.route.as_slice(),
+        &config.upstream_groups,
+    )
+    .or_else(|| {
+        if !authority.is_empty() {
+            find_backend_unified(
+                b"",
+                path_wo_query,
+                method,
+                &headers_raw,
+                raw_query,
+                &client_socket_addr,
+                config.route.as_slice(),
+                &config.upstream_groups,
+            )
+        } else {
+            None
+        }
+    });
+
+    let (prefix, backend, route_compression) = match backend_result {
+        Some(b) => b,
+        None => {
+            return h2_fast_finish(
+                conn,
+                stream_id,
+                &*ctx,
+                404,
+                h2_base_headers(false),
+                b"Not Found".to_vec(),
+            )
+            .await;
+        }
+    };
+
+    // Backend::Redirect かつ WASM 非適用の場合のみ、ここでインライン完結させる
+    // （check_security もこの分岐でのみ呼ぶ）。それ以外は check_security を呼ばずに
+    // ルーティング結果だけ引き継いで spawn 経路（h2_dispatch）へフォールバックする。
+    #[cfg(feature = "wasm")]
+    let wasm_applicable =
+        config.wasm_filter_engine.is_some() && backend.modules_arc().is_some_and(|m| !m.is_empty());
+    #[cfg(not(feature = "wasm"))]
+    let wasm_applicable = false;
+
+    if !h2_fast_path_should_check_security_inline(&backend, wasm_applicable) {
+        // Proxy / MemoryFile / SendFile、または WASM 適用され得る Redirect:
+        // check_security は呼ばず、解決済みルーティングだけ ctx に残して spawn 経路へ。
+        ctx.resolved_route = Some((prefix, backend, route_compression));
+        return Ok(None);
+    }
+
+    // ここに到達するのは Backend::Redirect かつ WASM 非適用の場合のみ。
+    // check_security は本関数内で唯一この分岐からのみ呼ばれる。
+    let security = backend.security();
+    let check_result = check_security(security, client_ip, method, ctx.body.len(), false);
+    if check_result != SecurityCheckResult::Allowed {
+        let status = check_result.status_code();
+        let msg = check_result.message();
+        return h2_fast_finish(
+            conn,
+            stream_id,
+            &*ctx,
+            status,
+            h2_base_headers(false),
+            msg.to_vec(),
+        )
+        .await;
+    }
+
+    let Backend::Redirect(redirect_url, status_code, preserve_path, _modules) = &backend else {
+        unreachable!(
+            "h2_fast_path_should_check_security_inline() で Backend::Redirect であることを確認済み"
+        );
+    };
+    let headers = h2_build_redirect_headers(&*ctx, redirect_url, *preserve_path, &prefix);
+    h2_fast_finish(conn, stream_id, &*ctx, *status_code, headers, Vec::new()).await
+}
+
+/// ファストパス応答をメインループから直接書き込み、`log_access` まで完了する（F-131）。
+///
+/// 送信ウィンドウが不足していて全量を積み切れない場合は一切書き込まず `Ok(None)` を返す
+/// （`streams` マップの `pending_body` によるウィンドウ待ち保留機構を持たないため）。
+/// 呼び出し元は `Ok(None)` を現行の spawn 経路へのフォールバック指示として扱う。
+#[cfg(feature = "http2")]
+async fn h2_fast_finish<S>(
+    conn: &mut http2::Http2Connection<S>,
+    stream_id: u32,
+    ctx: &H2RequestCtx,
+    status: u16,
+    headers: Vec<(Vec<u8>, Vec<u8>)>,
+    body: Vec<u8>,
+) -> http2::error::Http2Result<Option<(u16, u64)>>
+where
+    S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
+{
+    if !body.is_empty() && body.len() > conn.available_send_window(stream_id) {
+        return Ok(None);
+    }
+
+    let hv: Vec<(&[u8], &[u8])> = headers
+        .iter()
+        .map(|(k, v)| (k.as_slice(), v.as_slice()))
+        .collect();
+    let empty = body.is_empty();
+    conn.send_headers_buffered_end(stream_id, status, &hv, empty)
+        .await?;
+    if !empty {
+        conn.queue_data_frames(stream_id, &body, true)?;
+        if conn.pending_write_len() > WRITE_BUF_FLUSH_THRESHOLD {
+            conn.flush_write_buf().await?;
+        }
+    }
+
+    let resp_size = body.len() as u64;
+    let user_agent: Vec<u8> = ctx
+        .headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case(b"user-agent"))
+        .map(|h| h.value.clone())
+        .unwrap_or_default();
+    log_access(
+        &ctx.method,
+        &ctx.authority,
+        &ctx.path,
+        &user_agent,
+        ctx.body.len() as u64,
+        status,
+        resp_size,
+        ctx.start,
+        &ctx.client_ip,
+        "",
+    );
+    Ok(Some((status, resp_size)))
+}
+
+/// F-131 ファストパスの `check_security` 二重呼び出し（レートリミット二重消費）
+/// リグレッションを防ぐテスト（コードレビュー指摘対応）。
+#[cfg(all(test, feature = "http2"))]
+mod f131_fast_path_security_gate_tests {
+    use super::*;
+
+    fn dummy_redirect_backend() -> Backend {
+        Backend::Redirect(
+            Arc::from("https://example.com$request_uri"),
+            301,
+            false,
+            None,
+        )
+    }
+
+    fn dummy_memory_file_backend() -> Backend {
+        Backend::MemoryFile(
+            Arc::new(Vec::new()),
+            Arc::from("text/plain"),
+            Arc::new(SecurityConfig::default()),
+            None,
+        )
+    }
+
+    /// Backend::Redirect かつ WASM 非適用: インラインで check_security を呼んでよい
+    /// （それがファストパスで唯一の check_security 呼び出しになる）。
+    #[test]
+    fn test_security_gate_true_for_redirect_without_wasm() {
+        let backend = dummy_redirect_backend();
+        assert!(h2_fast_path_should_check_security_inline(&backend, false));
+    }
+
+    /// Backend::Redirect だが WASM フィルタが適用され得る場合: インラインで
+    /// check_security を呼んではならない（spawn 経路の h2_dispatch に一本化する）。
+    #[test]
+    fn test_security_gate_false_for_redirect_with_wasm_applicable() {
+        let backend = dummy_redirect_backend();
+        assert!(!h2_fast_path_should_check_security_inline(&backend, true));
+    }
+
+    /// Backend::Proxy/MemoryFile/SendFile（ここでは MemoryFile で代表）: バックエンド
+    /// I/O を伴うため常に spawn 経路（h2_dispatch）へ委ね、ファストパス側で
+    /// check_security を呼んではならない。呼んでしまうと `h2_dispatch` 側の呼び出しと
+    /// 合わせて 1 リクエストにつき check_rate_limit が 2 回消費される
+    /// （設定したレートリミットが実質半分になる）リグレッションになる。
+    #[test]
+    fn test_security_gate_false_for_non_redirect_backend() {
+        let backend = dummy_memory_file_backend();
+        assert!(!h2_fast_path_should_check_security_inline(&backend, false));
+    }
+
+    /// F-131 問題2対応の回帰テスト: `ctx.resolved_route` が設定済みの場合、
+    /// `h2_dispatch` は `find_backend_unified`（グローバル `CURRENT_CONFIG` 依存の
+    /// ルーティング）を呼び直さず、引き継がれた `Backend::Redirect` をそのまま使って
+    /// リダイレクト応答を返すことを検証する。
+    #[test]
+    fn test_h2_dispatch_reuses_resolved_route_without_reroute() {
+        crate::runtime::block_on(async move {
+            let ctx = H2RequestCtx {
+                method: b"GET".to_vec(),
+                path: b"/anything-not-routed-anywhere".to_vec(),
+                authority: b"example.invalid".to_vec(),
+                headers: Vec::new(),
+                body: Bytes::new(),
+                client_ip: Box::from("127.0.0.1:12345"),
+                start: Instant::now(),
+                resolved_route: Some((
+                    Box::from(b"".as_slice()),
+                    dummy_redirect_backend(),
+                    Arc::new(CompressionConfig::default()),
+                )),
+            };
+
+            let (resp_tx, resp_rx) =
+                crate::stream_channel::channel::<H2RespMsg>(H2_RESP_CHANNEL_CAP);
+            let notify = crate::stream_channel::Notify::new();
+
+            let (status, _size) = h2_dispatch(&ctx, &resp_tx, &notify).await;
+            assert_eq!(status, 301, "resolved_route の Redirect がそのまま使われる");
+
+            match resp_rx.try_recv() {
+                crate::stream_channel::TryRecv::Item(H2RespMsg::Head {
+                    status: head_status,
+                    headers,
+                    ..
+                }) => {
+                    assert_eq!(head_status, 301);
+                    assert!(
+                        headers.iter().any(|(k, v)| k == b"location"
+                            && v == b"https://example.com/anything-not-routed-anywhere"),
+                        "location ヘッダーが resolved_route の Redirect から組み立てられている"
+                    );
+                }
+                crate::stream_channel::TryRecv::Item(_) => {
+                    panic!("Head メッセージを期待したが別種のメッセージだった")
+                }
+                crate::stream_channel::TryRecv::Empty => {
+                    panic!("Head メッセージを期待したがチャネルが空だった")
+                }
+                crate::stream_channel::TryRecv::Closed => {
+                    panic!("Head メッセージを期待したがチャネルが閉じていた")
+                }
+            }
+        });
+    }
 }
 
 /// 2 つの Future（ソケット可読 / notify）を自前 `poll_fn` で race する（futures 依存を増やさない）。
@@ -1454,74 +1827,84 @@ async fn h2_dispatch(
         .map(|h| (h.name.as_slice(), h.value.as_slice()))
         .collect();
 
-    // メトリクスエンドポイント。
-    {
-        let config = CURRENT_CONFIG.load();
-        let prom = &config.prometheus_config;
-        let path_str = std::str::from_utf8(path).unwrap_or("/");
-        if prom.enabled && path_str == prom.path && method == b"GET" {
-            if !prom.is_ip_allowed(client_ip) {
-                return h2_emit_error(resp_tx, notify, 403, b"Forbidden").await;
+    // F-131: h2_try_fast_path が既にルーティング解決済みなら、find_backend_unified を
+    // 呼び直さない（Proxy 等の主要トラフィックでルーティングコストが 2 倍化しないため）。
+    // resolved_route が Some の場合、ファストパス側で「メトリクス/管理API には一致しない
+    // パスだった」ことは確認済みなので、以下のメトリクス/管理API判定は自然に no-op になる。
+    let (prefix, backend, route_compression) = if let Some(resolved) = ctx.resolved_route.clone() {
+        resolved
+    } else {
+        // メトリクスエンドポイント。
+        {
+            let config = CURRENT_CONFIG.load();
+            let prom = &config.prometheus_config;
+            let path_str = std::str::from_utf8(path).unwrap_or("/");
+            if prom.enabled && path_str == prom.path && method == b"GET" {
+                if !prom.is_ip_allowed(client_ip) {
+                    return h2_emit_error(resp_tx, notify, 403, b"Forbidden").await;
+                }
+                let body = encode_prometheus_metrics();
+                let mut headers = h2_base_headers(false);
+                headers.push((
+                    b"content-type".to_vec(),
+                    b"text/plain; version=0.0.4; charset=utf-8".to_vec(),
+                ));
+                return h2_emit_full(resp_tx, notify, 200, headers, body).await;
             }
-            let body = encode_prometheus_metrics();
-            let mut headers = h2_base_headers(false);
-            headers.push((
-                b"content-type".to_vec(),
-                b"text/plain; version=0.0.4; charset=utf-8".to_vec(),
-            ));
-            return h2_emit_full(resp_tx, notify, 200, headers, body).await;
         }
-    }
 
-    // 管理 API（B-29）。
-    #[cfg(feature = "admin")]
-    if let Some((status, headers, body)) = h2_admin_response(method, path, client_ip, &headers_raw)
-    {
-        return h2_emit_full(resp_tx, notify, status, headers, body).await;
-    }
-
-    let config = CURRENT_CONFIG.load();
-    let query_start = path.iter().position(|&b| b == b'?');
-    let raw_query: &[u8] = query_start.map(|i| &path[i + 1..]).unwrap_or(b"");
-    let path_wo_query = query_start.map(|i| &path[..i]).unwrap_or(path);
-    let client_socket_addr = h2_client_socket_addr(client_ip);
-    let authority = &ctx.authority[..];
-
-    let backend_result = find_backend_unified(
-        authority,
-        path_wo_query,
-        method,
-        &headers_raw,
-        raw_query,
-        &client_socket_addr,
-        config.route.as_slice(),
-        &config.upstream_groups,
-    )
-    .or_else(|| {
-        if !authority.is_empty() {
-            find_backend_unified(
-                b"",
-                path_wo_query,
-                method,
-                &headers_raw,
-                raw_query,
-                &client_socket_addr,
-                config.route.as_slice(),
-                &config.upstream_groups,
-            )
-        } else {
-            None
+        // 管理 API（B-29）。
+        #[cfg(feature = "admin")]
+        if let Some((status, headers, body)) =
+            h2_admin_response(method, path, client_ip, &headers_raw)
+        {
+            return h2_emit_full(resp_tx, notify, status, headers, body).await;
         }
-    });
 
-    let (prefix, backend, route_compression) = match backend_result {
-        Some(b) => b,
-        None => {
-            return h2_emit_error(resp_tx, notify, 404, b"Not Found").await;
+        let config = CURRENT_CONFIG.load();
+        let query_start = path.iter().position(|&b| b == b'?');
+        let raw_query: &[u8] = query_start.map(|i| &path[i + 1..]).unwrap_or(b"");
+        let path_wo_query = query_start.map(|i| &path[..i]).unwrap_or(path);
+        let client_socket_addr = h2_client_socket_addr(client_ip);
+        let authority = &ctx.authority[..];
+
+        let backend_result = find_backend_unified(
+            authority,
+            path_wo_query,
+            method,
+            &headers_raw,
+            raw_query,
+            &client_socket_addr,
+            config.route.as_slice(),
+            &config.upstream_groups,
+        )
+        .or_else(|| {
+            if !authority.is_empty() {
+                find_backend_unified(
+                    b"",
+                    path_wo_query,
+                    method,
+                    &headers_raw,
+                    raw_query,
+                    &client_socket_addr,
+                    config.route.as_slice(),
+                    &config.upstream_groups,
+                )
+            } else {
+                None
+            }
+        });
+
+        match backend_result {
+            Some(b) => b,
+            None => {
+                return h2_emit_error(resp_tx, notify, 404, b"Not Found").await;
+            }
         }
     };
 
-    // セキュリティチェック。
+    // セキュリティチェック（h2_try_fast_path がルーティングのみ解決し委譲したケースを
+    // 含め、check_security は本関数のこの 1 箇所でのみ呼ぶ）。
     let security = backend.security();
     let check_result = check_security(security, client_ip, method, ctx.body.len(), false);
     if check_result != SecurityCheckResult::Allowed {
@@ -2950,6 +3333,34 @@ async fn h2_redirect(
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
 ) -> (u16, u64) {
+    let headers = h2_build_redirect_headers(ctx, redirect_url, preserve_path, prefix);
+    if h2_send(
+        resp_tx,
+        notify,
+        H2RespMsg::Head {
+            status: status_code,
+            headers,
+            end_stream: true,
+        },
+    )
+    .await
+    .is_err()
+    {
+        return (status_code, 0);
+    }
+    (status_code, 0)
+}
+
+/// リダイレクト応答のヘッダーを構築する（`h2_redirect`/`h2_try_fast_path` 共通、F-131）。
+///
+/// conn 非依存の純粋計算のみで、I/O・チャネル送信は行わない。
+#[cfg(feature = "http2")]
+fn h2_build_redirect_headers(
+    ctx: &H2RequestCtx,
+    redirect_url: &str,
+    preserve_path: bool,
+    prefix: &[u8],
+) -> Vec<(Vec<u8>, Vec<u8>)> {
     let path_str = std::str::from_utf8(&ctx.path).unwrap_or("/");
     let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
     let sub_path = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
@@ -2973,21 +3384,7 @@ async fn h2_redirect(
 
     let mut headers = h2_base_headers(false);
     headers.push((b"location".to_vec(), final_url.into_bytes()));
-    if h2_send(
-        resp_tx,
-        notify,
-        H2RespMsg::Head {
-            status: status_code,
-            headers,
-            end_stream: true,
-        },
-    )
-    .await
-    .is_err()
-    {
-        return (status_code, 0);
-    }
-    (status_code, 0)
+    headers
 }
 
 /// リクエスト方向ストリーミング経路（F-32 統合）。戻り値 `(status, resp_size, req_size)`。
