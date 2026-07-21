@@ -124,6 +124,12 @@ hot-path cost). The default is unchanged (Linux io_uring).
   was performed — cross-build success is the only acceptance bar per the F-125 design doc.
   `http3`/`wasm` features are not yet verified on macOS cross-builds (excluded from the
   default `build-cross.sh` feature set).
+- **Windows (F-125, v0.6.0)**: cross-built only, via Docker (`messense/cargo-xwin`) — see
+  `packaging/scripts/build-cross.sh --target windows`, which builds both
+  x86_64-pc-windows-msvc and aarch64-pc-windows-msvc. No real-hardware or QEMU
+  verification was performed. `http3`/`wasm`/`ktls`/`l4-proxy` features are not part of
+  the default feature set (`l4-proxy` is excluded because `runtime::udp` assumes Unix
+  socket APIs).
 - **TLS crypto provider** is selected per target **and, for Windows, per arch** in
   `src/tls_provider.rs` (F-122/F-125): OpenBSD, macOS, and **x86_64-pc-windows-msvc**
   use rustls's `ring` provider (aws-lc-rs cannot complete TLS handshakes on OpenBSD;
