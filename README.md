@@ -97,7 +97,7 @@ hot-path cost). The default is unchanged (Linux io_uring).
 | **FreeBSD (x86_64/aarch64)** | kqueue readiness reactor (optionally POSIX AIO with `--features aio`, F-127) | capsicum (`cap_rights_limit` / `cap_enter`) + jail | ✅ (FreeBSD 13.0+, `TCP_TXTLS_ENABLE`/`TCP_RXTLS_ENABLE`; F-126) | `[security] enable_capsicum`, `capsicum_capability_mode`, `jail_name` |
 | **OpenBSD (x86_64/aarch64)** | kqueue readiness reactor | pledge + unveil | ✗ (userspace rustls) | `[security] enable_pledge`, `enable_unveil`. TLS uses the **ring** rustls provider (aws-lc-rs can't complete handshakes on OpenBSD; F-122). HTTPS static/proxy serving verified 200 |
 | **macOS (x86_64/aarch64, universal2)** | kqueue readiness reactor (reused from FreeBSD/OpenBSD) | `sandbox_init` (Seatbelt) | ✗ (userspace rustls) | `[security] enable_sandbox_macos`. TLS uses the **ring** rustls provider (aws-lc-sys can't cross-link under zig; F-125). Cross-built with `cargo zigbuild --target universal2-apple-darwin`; QEMU/real-hardware testing not performed — see caveats below |
-| **Windows (x86_64-pc-windows-msvc)** | WSAPoll readiness reactor (`src/runtime/reactor/wsapoll.rs`, `src/runtime/reactor/tcp/windows.rs`, Winsock) | Job Object (best-effort) | ✗ (userspace rustls) | `[security] enable_job_object_windows`. TLS uses the **ring** rustls provider (aws-lc-sys needs NASM, unavailable in the cargo-xwin container; v0.6.0). Cross-built with `cargo xwin build --target x86_64-pc-windows-msvc`; QEMU/real-hardware testing not performed — see caveats below |
+| **Windows (x86_64-pc-windows-msvc / aarch64-pc-windows-msvc)** | WSAPoll readiness reactor (`src/runtime/reactor/wsapoll.rs`, `src/runtime/reactor/tcp/windows.rs`, Winsock) | Job Object (best-effort) | ✗ (userspace rustls) | `[security] enable_job_object_windows`. TLS provider is split **per arch**: x86_64 uses **ring** (aws-lc-sys needs NASM, unavailable in the cargo-xwin container), aarch64 uses **aws_lc_rs** (ARM asm needs no NASM; cross-buildable via cmake — ring 0.17 has no prebuilt asm for aarch64-pc-windows-msvc and fails under cargo-xwin's `/imsvc` handling; v0.6.0). Cross-built with `cargo xwin build --target <target>` (`packaging/scripts/build-cross.sh --target windows` builds both archs); QEMU/real-hardware testing not performed — see caveats below |
 
 - The backend is chosen by `build.rs`-emitted cfgs (`veil_rt_uring` / `veil_rt_reactor` and
   `veil_poller_epoll` / `veil_poller_kqueue`). The public runtime API paths
@@ -124,12 +124,18 @@ hot-path cost). The default is unchanged (Linux io_uring).
   was performed — cross-build success is the only acceptance bar per the F-125 design doc.
   `http3`/`wasm` features are not yet verified on macOS cross-builds (excluded from the
   default `build-cross.sh` feature set).
-- **TLS crypto provider** is selected per target in `src/tls_provider.rs` (F-122/F-125):
-  OpenBSD **and macOS** use rustls's `ring` provider (aws-lc-rs cannot complete TLS
-  handshakes on OpenBSD; aws-lc-sys's hand-written assembly cannot be linked by zig for the
-  macOS cross-build, and `AWS_LC_SYS_NO_ASM` is forbidden in release builds), while
-  Linux/FreeBSD use `aws_lc_rs` (shared AWS-LC build with kTLS and quiche/HTTP/3).
-  `Cargo.toml` splits the provider via target-specific dependencies plus `resolver = "2"`.
+- **TLS crypto provider** is selected per target **and, for Windows, per arch** in
+  `src/tls_provider.rs` (F-122/F-125): OpenBSD, macOS, and **x86_64-pc-windows-msvc**
+  use rustls's `ring` provider (aws-lc-rs cannot complete TLS handshakes on OpenBSD;
+  aws-lc-sys's hand-written assembly cannot be linked by zig for the macOS cross-build,
+  and `AWS_LC_SYS_NO_ASM` is forbidden in release builds; aws-lc-sys needs NASM on
+  x86_64-Windows, unavailable in the cargo-xwin container), while Linux/FreeBSD and
+  **aarch64-pc-windows-msvc** use `aws_lc_rs` (shared AWS-LC build with kTLS and
+  quiche/HTTP/3 on Linux/FreeBSD; aarch64's aws-lc uses ARM assembly and needs no NASM,
+  cross-buildable via cmake — ring 0.17 ships no prebuilt asm for aarch64-pc-windows-msvc
+  and fails to build from source under cargo-xwin's `/imsvc` handling).
+  `Cargo.toml` splits the provider via target-and-arch-specific dependencies plus
+  `resolver = "2"`.
 
 ## Build
 

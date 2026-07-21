@@ -174,6 +174,42 @@ tar.gz には `veil` バイナリ（universal2 fat binary）・`config.toml.defa
 書き込みのみログ/キャッシュディレクトリへ限定）を採用している
 （`src/security.rs` の `macos_sandbox` モジュール参照）。
 
+### Windows 向けパッケージ（F-125、v0.6.0、Docker クロスビルド）
+
+Windows は Docker（`messense/cargo-xwin`）で **x86_64-pc-windows-msvc** と
+**aarch64-pc-windows-msvc** を個別にクロスビルドできる（FreeBSD/OpenBSD と異なり
+VM ネイティブビルドは不要）。QEMU 実行・実機検証は行っていない
+（クロスビルドが通ることのみを合格基準とする。設計は
+`docs/artifacts/f125_windows_macos_design.md`）。
+
+```bash
+./packaging/scripts/build-cross.sh --target windows
+# feature を変える場合（既定は http3/wasm/ktls/l4-proxy 除く。l4-proxy は
+# runtime::udp が Unix ソケット API 前提のため今回は未対応）:
+CARGO_FEATURES="http2,mimalloc,compression,cache,metrics,grpc,grpc-web,websocket,rate-limit,buffering,admin,access-log,opentelemetry" \
+  ./packaging/scripts/build-cross.sh --target windows
+```
+
+内部では `messense/cargo-xwin` イメージで `cargo xwin build --release --target
+<target> --no-default-features --features <features>` を x86_64/aarch64 両方に
+対して実行し、それぞれ zip を出力する。rustls の暗号プロバイダは **arch により
+異なる**（`Cargo.toml` の target 別依存、v0.6.0）:
+
+- **x86_64-pc-windows-msvc**: `ring`（aws-lc-sys のビルドは x86 で NASM を要求
+  するが cargo-xwin コンテナに NASM が無いためクロスビルド不可）。
+- **aarch64-pc-windows-msvc**: `aws_lc_rs`（aarch64 の aws-lc は ARM アセンブリを
+  使い NASM 不要。コンテナに `cmake` を導入すれば cmake ビルダー経路でクロス
+  ビルドできる。逆に ring 0.17 は aarch64-pc-windows-msvc 向けの prebuilt asm を
+  持たず、cargo-xwin の `/imsvc` フラグ handling でソースコンパイルが失敗する
+  ため使えない）。
+
+zip には `veil.exe`・`config.toml.default`・`www/index.html`・`INSTALL.txt` を
+同梱する。Windows ネイティブのセキュリティは Job Object（best-effort、
+`[security] enable_job_object_windows`）。`CreateJobObjectW` +
+`SetInformationJobObject` でプロセスに最小限のリソース制限
+（`ACTIVE_PROCESS=1`、`KILL_ON_JOB_CLOSE`）を適用するのみで、seccomp/Landlock
+相当のシステムコールフィルタではない。
+
 **注意**: Docker ビルドはリポジトリを `/io` としてマウントし `target/` を共有する
 ため、ホスト側の他の `cargo build` と同時に実行しないこと（target 競合）。
 
@@ -187,6 +223,8 @@ packaging/output/veil-<version>-x86_64-unknown-linux-musl.tar.gz
 packaging/output/veil-<version>-<arch>-unknown-freebsd.tar.gz   # build-bsd.sh
 packaging/output/veil-<version>-<arch>-unknown-openbsd.tar.gz   # build-bsd.sh
 packaging/output/veil-<version>-universal2-apple-darwin.tar.gz # build-cross.sh --target macos
+packaging/output/veil-<version>-x86_64-pc-windows-msvc.zip      # build-cross.sh --target windows
+packaging/output/veil-<version>-aarch64-pc-windows-msvc.zip     # build-cross.sh --target windows
 ```
 
 `<version>` は **`Cargo.toml` の `[package] version` からビルド時に自動取得**され、
