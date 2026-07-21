@@ -1296,7 +1296,11 @@ mod f131_fast_path_security_gate_tests {
     /// リダイレクト応答を返すことを検証する。
     #[test]
     fn test_h2_dispatch_reuses_resolved_route_without_reroute() {
-        crate::runtime::block_on(async move {
+        // h2_dispatch はここでは conn/実ソケットに触れず channel 送信のみのため、
+        // io_uring リング初期化を伴う crate::runtime::block_on ではなく軽量な
+        // futures::executor::block_on を使う（並列テスト実行時の io_uring リング
+        // 資源枯渇によるフレーキー失敗を避けるため）。
+        futures::executor::block_on(async move {
             let ctx = H2RequestCtx {
                 method: b"GET".to_vec(),
                 path: b"/anything-not-routed-anywhere".to_vec(),
