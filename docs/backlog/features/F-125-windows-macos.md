@@ -1,4 +1,4 @@
-# F-125: macOS 対応（Windows は後続）
+# F-125: macOS / Windows 対応
 
 ## 目的
 
@@ -6,8 +6,11 @@ veil を macOS（x86_64 / aarch64、`universal2-apple-darwin`）向けに Docker
 クロスビルドできるようにする。QEMU 実行・実機テストは不可のため、**クロス
 ビルドが通ることをもってビルド対応とする**（設計:
 [docs/artifacts/f125_windows_macos_design.md](../../artifacts/f125_windows_macos_design.md)）。
-Windows（`*-pc-windows-msvc`、WSAPoll reactor）は設計・build.rs の cfg 名発行
-のみ本チケットで扱い、実装本体は後続チケットに分離する。
+Windows（`*-pc-windows-msvc`、WSAPoll reactor）は当初は設計・build.rs の cfg
+名発行のみを本チケットで扱い実装本体を後続に分離する計画だったが、v0.6.0 で
+x86_64-pc-windows-msvc の WSAPoll reactor/Winsock ソケット層 + Job Object
+セキュリティ、および aarch64-pc-windows-msvc クロスビルド（aws_lc_rs）まで
+同チケット継続作業として完了した（下記「現状（実装済み・Windows 分）」参照）。
 
 ## 現状（実装済み・macOS 分）
 
@@ -133,10 +136,14 @@ docker run --rm -v $(pwd):/io -w /io messense/cargo-zigbuild \
 - [x] macOS ネイティブセキュリティ（sandbox_init/Seatbelt）を実装し、
       config キー・entry.rs 配線・examples/config.toml を整備。
 - [x] packaging（`build-cross.sh`）で universal2 tar.gz を生成できる。
-- [ ] Windows（WSAPoll reactor 本体・Winsock ソケット層・Job Object）は
-      本チケットの scope 外。build.rs の cfg 名発行のみ実施済み。後続チケット
-      で分離対応する。
+- [x] Windows（WSAPoll reactor 本体・Winsock ソケット層・Job Object）を
+      x86_64-pc-windows-msvc 向けに実装（v0.6.0、`cargo xwin build`
+      クロスビルド、TLS 暗号プロバイダは ring）。
+- [x] aarch64-pc-windows-msvc クロスビルド対応（aws_lc_rs、cmake クロス
+      ビルド可・ring は aarch64-windows 向け prebuilt asm 非対応のため）。
 - [ ] macOS の http3/wasm feature 対応は未検証（フォローアップ）。
+- [ ] Windows/macOS の QEMU・実機検証は未実施（クロスビルド成功のみを合格
+      基準とする、フォローアップ）。
 
 ## 依存・リスク
 
