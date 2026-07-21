@@ -56,3 +56,7 @@ tools/container_security/results/
 tools/container_security/results/cargo-target/
 
 tools/perf/results/
+
+# Python バイトコードキャッシュ（tools/qemu の provision スクリプト等）
+__pycache__/
+*.pyc
