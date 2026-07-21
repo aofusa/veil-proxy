@@ -694,6 +694,55 @@ sandbox_keep_capabilities = ["CAP_NET_BIND_SERVICE"]
 # enable_seccomp = true
 # seccomp_mode = "filter"
 
+# ============================================
+# capsicum設定 (FreeBSD専用、F-120 Phase 4)
+# ============================================
+#
+# FreeBSD の capability mode + fd 単位の権利制限（Linux の seccomp/Landlock 相当）。
+# 本キーは全 OS で受理されるが、FreeBSD 以外では警告ログのみで無視される。
+#
+# enable_capsicum = true にすると:
+#   - リスナー/接続 fd へ cap_rights_limit(2) で必要最小の権利を適用する
+#     （CAP_ACCEPT/CAP_READ/CAP_WRITE/CAP_EVENT/CAP_SETSOCKOPT/CAP_GETPEERNAME 等）。
+#
+# enable_capsicum = true
+
+# capability mode（cap_enter(2)、不可逆）への降格（FreeBSD専用、オプトイン）。
+# capsicum_capability_mode = true
+
+# 起動時に attach する jail 名（FreeBSD専用、root 前提）。
+# jail_name = "veil-jail"
+
+# ============================================
+# pledge / unveil 設定 (OpenBSD専用、F-120 Phase 5)
+# ============================================
+#
+# OpenBSD ネイティブのプロセスサンドボックス（kTLS は非対応、simple_tls フォールバック）。
+# 本キーは全 OS で受理されるが、OpenBSD 以外では警告ログのみで無視される。
+#
+# enable_unveil = true
+# enable_pledge = true
+
+# ============================================
+# sandbox_init / Seatbelt 設定 (macOS専用、F-125)
+# ============================================
+#
+# macOS ネイティブのプロセスサンドボックス。本キーは全 OS で受理されるが、macOS
+# 以外では警告ログのみで無視される（kTLS 非対応、simple_tls フォールバック）。
+#
+# enable_sandbox_macos = true
+
+# ============================================
+# Job Object 設定 (Windows専用、v0.6.0)
+# ============================================
+#
+# Windows ネイティブのプロセス制限機構（best-effort）。本キーは全 OS で受理される
+# が、Windows 以外では警告ログのみで無視される（kTLS 非対応、simple_tls フォールバック）。
+#
+# enable_job_object_windows = true
+
+# 詳細（各キーの効果・制約・適用タイミング）は examples/config.toml を参照。
+
 
 
 # ==========================================
@@ -1894,11 +1943,11 @@ sandbox_keep_capabilities = ["CAP_NET_BIND_SERVICE"]
 # use_h2c = true  # gRPC は H2C が必要
 
 # ==========================================
-# L4 ストリームプロキシ設定（F-18）
+# L4 ストリームプロキシ設定（F-18、UDP は F-124）
 # ==========================================
 #
-# TCPレイヤーのロードバランシングプロキシ。
-# データベース、Redis、SMTP などの非HTTPバイナリプロトコルを透過転送します。
+# TCP/UDPレイヤーのロードバランシングプロキシ。
+# データベース、Redis、SMTP、DNS などの非HTTPプロトコルを透過転送します。
 #
 # 注意: --features l4-proxy でビルドする必要があります（full に含まれます）
 # 注意: L4リスナーは起動時にバインドするため SIGHUP でのホットリロードは不可
@@ -1906,15 +1955,25 @@ sandbox_keep_capabilities = ["CAP_NET_BIND_SERVICE"]
 # 設定項目:
 #   name: リスナー名（ログ・メトリクス識別用）
 #   listen: バインドアドレス（例: "0.0.0.0:3306"）
+#   protocol: トランスポートプロトコル（"tcp"（デフォルト）/ "udp"、F-124）
+#     省略時は既存構成との後方互換のため "tcp" のまま。
 #   lb: ロードバランシング方式（"round_robin"（デフォルト）/ "least_conn"）
 #   tls: TLSモード（"none"（デフォルト）/ "passthrough" / "terminate"）
-#   max_connections: 最大同時接続数（0 = 無制限、デフォルト: 0）
-#   connect_timeout_secs: upstream接続タイムアウト秒数（デフォルト: 10）
-#   idle_timeout_secs: アイドルタイムアウト秒数。この時間データ転送がなければ接続を切断（デフォルト: 600）
+#     注意: protocol = "udp" では TLS 非対応（DTLS 未実装）。tls を none 以外に
+#     設定した UDP リスナーは起動時に警告を出し none 扱いに強制されます。
+#   max_connections: 最大同時接続数（0 = 無制限、デフォルト: 0）。
+#     UDP では「同時セッション数」の上限として扱われます（セッションはクライアント
+#     アドレスごとに管理され、idle_timeout_secs 無通信で自動的に退去します）。
+#   connect_timeout_secs: upstream接続タイムアウト秒数（デフォルト: 10、UDPでは未使用）
+#   idle_timeout_secs: アイドルタイムアウト秒数。この時間データ転送がなければ
+#     接続/セッションを切断（デフォルト: 600）
 #   [[l4.upstreams]]: upstreamバックエンド一覧
 #     addr: バックエンドアドレス（"host:port"）
 #     weight: 重み（デフォルト: 1）
 #   [l4.health_check]: ヘルスチェック設定（upstreamと同形式、オプション）
+#     注意: UDPリスナーでもヘルスチェック自体は既存のTCP connectベースのまま
+#     （UDPの到達性そのものの確認は非対応。コネクションレスなプロトコルの
+#     到達性はチェックタイプに依存するため scope 外）。
 
 # ------------------------------------------
 # 例1: PostgreSQL TCPプロキシ
@@ -1993,6 +2052,24 @@ sandbox_keep_capabilities = ["CAP_NET_BIND_SERVICE"]
 #
 #   [[l4.upstreams]]
 #   addr = "mysql2.internal:3306"
+
+# ------------------------------------------
+# 例5: DNS UDPプロキシ（F-124）
+# ------------------------------------------
+# UDPはセッションテーブル方式（クライアントアドレスをキーにした疑似セッション）で
+# 転送します。idle_timeout_secs 無通信でセッションを自動的に退去します。
+# [[l4]]
+# name = "dns-udp-proxy"
+# listen = "0.0.0.0:53"
+# protocol = "udp"
+# lb = "round_robin"
+# idle_timeout_secs = 30
+#
+#   [[l4.upstreams]]
+#   addr = "10.0.0.1:53"
+#
+#   [[l4.upstreams]]
+#   addr = "10.0.0.2:53"
 
 # ------------------------------------------
 # ルートパス
