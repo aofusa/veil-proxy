@@ -118,7 +118,10 @@ pub struct Stream {
 impl Stream {
     /// 新しいストリームを作成
     pub fn new(id: u32, send_window_size: i32, recv_window_size: i32) -> Self {
-        Self {
+        // バッファ系フィールド（Vec/BytesMut）はここでのみ空で確保し、スカラー系の
+        // 初期値は `reset_scalar_fields` に一本化する（F-131: free-list 再利用時の
+        // `reset()` と初期値がフィールド追加時にズレないようにするため）。
+        let mut s = Self {
             id,
             state: StreamState::Idle,
             send_window: send_window_size,
@@ -139,7 +142,47 @@ impl Stream {
             grpc_mode: false,
             #[cfg(feature = "grpc")]
             grpc_stream_state: None,
+        };
+        s.reset_scalar_fields(id, send_window_size, recv_window_size);
+        s
+    }
+
+    /// スカラー系フィールドを `Stream::new()` と同じ初期値へ戻す（F-131）。
+    ///
+    /// `request_headers`/`request_body`/`response_headers`/`response_body`/
+    /// `pending_headers` の各バッファはここでは触らない（呼び出し側が用途に応じて
+    /// `.clear()` するか、新規作成時は空で初期化済みのため）。
+    fn reset_scalar_fields(&mut self, id: u32, send_window_size: i32, recv_window_size: i32) {
+        self.id = id;
+        self.state = StreamState::Idle;
+        self.send_window = send_window_size;
+        self.recv_window = recv_window_size;
+        self.dependency = 0;
+        self.weight = 16;
+        self.exclusive = false;
+        self.receiving_headers = false;
+        self.content_length = None;
+        self.received_body_size = 0;
+        self.last_activity = std::time::Instant::now();
+        #[cfg(feature = "grpc")]
+        {
+            self.grpc_mode = false;
+            self.grpc_stream_state = None;
         }
+    }
+
+    /// クローズ済みストリームを再利用のためリセットする（F-131: free-list 再利用）。
+    ///
+    /// `request_body`/`response_body` 等（`bytes::BytesMut`/`Vec`）は `.clear()` のみ行い
+    /// 容量を保持したままゼロコピーで再利用する。他フィールドは `reset_scalar_fields`
+    /// 経由で `Stream::new()` と完全に同じ初期値へ戻す。
+    pub fn reset(&mut self, id: u32, send_window_size: i32, recv_window_size: i32) {
+        self.request_headers.clear();
+        self.request_body.clear();
+        self.response_headers.clear();
+        self.response_body.clear();
+        self.pending_headers.clear();
+        self.reset_scalar_fields(id, send_window_size, recv_window_size);
     }
 
     /// HEADERS 受信
@@ -489,6 +532,13 @@ pub struct StreamManager {
     receiving_headers_stream: Option<u32>,
     /// GOAWAY で受信した last_stream_id (RFC 7540 Section 6.8)
     goaway_last_stream_id: Option<u32>,
+    /// クローズ済み `Stream` の再利用プール（F-131: free-list によるアロケータ負荷軽減）。
+    /// `request_body`/`response_body` 等のバッファ容量を保持したまま次のストリーム作成に
+    /// 使い回す。上限は `max_concurrent_streams` 程度に cap し、無制限のメモリ保持を避ける。
+    free_streams: Vec<Stream>,
+    /// `cleanup_closed` 用のスクラッチバッファ（F-131）。クローズ済みストリーム ID を
+    /// 毎回新規確保せず使い回すため、容量を保持したまま `.clear()` して再利用する。
+    closed_scratch: Vec<u32>,
 }
 
 impl StreamManager {
@@ -503,6 +553,8 @@ impl StreamManager {
             peer_initial_window_size: 65535, // RFC 7540 initial window size
             receiving_headers_stream: None,
             goaway_last_stream_id: None,
+            free_streams: Vec::new(),
+            closed_scratch: Vec::new(),
         }
     }
 
@@ -558,14 +610,23 @@ impl StreamManager {
         }
 
         self.max_client_stream_id = id;
-        self.streams.insert(
-            id,
+        // F-131: free-list に再利用可能なストリームがあればそれを reset して使い回し、
+        // なければ新規確保する（バッファ容量保持によるアロケータ負荷軽減）。
+        let stream = if let Some(mut reused) = self.free_streams.pop() {
+            reused.reset(
+                id,
+                self.peer_initial_window_size,
+                self.local_initial_window_size,
+            );
+            reused
+        } else {
             Stream::new(
                 id,
                 self.peer_initial_window_size,
                 self.local_initial_window_size,
-            ),
-        );
+            )
+        };
+        self.streams.insert(id, stream);
 
         self.streams.get_mut(&id).ok_or_else(|| {
             Http2Error::stream_error(id, Http2ErrorCode::StreamClosed, "Stream not found")
@@ -588,8 +649,30 @@ impl StreamManager {
     }
 
     /// クローズ済みストリームをクリーンアップ
+    ///
+    /// F-131: 破棄する前に `free_streams` へ push し、次のストリーム作成で再利用する
+    /// （`request_body`/`response_body` 等のバッファ容量を保持したままゼロコピー再利用）。
+    /// `free_streams` は `max_concurrent_streams` 程度に cap し、超過分は破棄する。
     pub fn cleanup_closed(&mut self) {
-        self.streams.retain(|_, s| s.state != StreamState::Closed);
+        // クローズ済み ID を一旦スクラッチへ集める（HashMap::retain は値の所有権を
+        // 取れず free_streams へ move できないため）。scratch は容量保持で使い回す。
+        self.closed_scratch.clear();
+        self.closed_scratch.extend(
+            self.streams
+                .iter()
+                .filter(|(_, s)| s.state == StreamState::Closed)
+                .map(|(id, _)| *id),
+        );
+
+        let cap = self.max_concurrent_streams as usize;
+        for id in self.closed_scratch.drain(..) {
+            if let Some(stream) = self.streams.remove(&id) {
+                if self.free_streams.len() < cap {
+                    self.free_streams.push(stream);
+                }
+                // cap 超過分はここで drop（無制限のメモリ保持を避ける）。
+            }
+        }
     }
 
     /// アイドルタイムアウトを超過したストリーム ID を取得
@@ -897,6 +980,102 @@ mod tests {
         // エラーメッセージを確認
         if let Err(e) = result {
             assert!(e.to_string().contains("GOAWAY"));
+        }
+    }
+
+    #[test]
+    fn test_free_streams_pool_retains_buffer_capacity() {
+        // F-131: クローズ済みストリームを cleanup_closed で free-list に戻し再利用した際、
+        // request_body/response_body のバッファ容量が維持される（0 に戻らない）ことを
+        // 検証する回帰テスト。
+        let mut manager = StreamManager::new(10, 65535);
+
+        let (req_cap_before, resp_cap_before) = {
+            let stream = manager.get_or_create_client_stream(1).unwrap();
+            stream.recv_headers(false).unwrap();
+            // 十分な量のデータを蓄積してバッファを成長させる。
+            stream.request_body.extend_from_slice(&[0u8; 4096]);
+            stream.response_body.extend_from_slice(&[0u8; 4096]);
+            let caps = (
+                stream.request_body.capacity(),
+                stream.response_body.capacity(),
+            );
+            assert!(caps.0 >= 4096);
+            assert!(caps.1 >= 4096);
+            // クローズ状態へ遷移させ cleanup_closed の対象にする。
+            stream.state = StreamState::Closed;
+            caps
+        };
+
+        manager.cleanup_closed();
+        assert_eq!(manager.active_stream_count(), 0);
+
+        // 新規ストリームを作成 → free-list から再利用されるはず。
+        let stream = manager.get_or_create_client_stream(3).unwrap();
+        assert!(
+            stream.request_body.capacity() >= req_cap_before,
+            "request_body の容量が再利用後も維持されている（{} >= {}）",
+            stream.request_body.capacity(),
+            req_cap_before
+        );
+        assert!(
+            stream.response_body.capacity() >= resp_cap_before,
+            "response_body の容量が再利用後も維持されている（{} >= {}）",
+            stream.response_body.capacity(),
+            resp_cap_before
+        );
+        assert!(
+            stream.request_body.is_empty(),
+            "再利用直後は内容がクリアされている"
+        );
+        assert!(
+            stream.response_body.is_empty(),
+            "再利用直後は内容がクリアされている"
+        );
+    }
+
+    #[test]
+    fn test_free_streams_pool_resets_state() {
+        // F-131: free-list から再利用したストリームがクローズ前の状態を誤って
+        // 引き継がず、Stream::new() 相当の初期値に戻っていることを検証する。
+        let mut manager = StreamManager::new(10, 65535);
+
+        {
+            let stream = manager.get_or_create_client_stream(1).unwrap();
+            stream.recv_headers(false).unwrap();
+            stream.content_length = Some(100);
+            stream.received_body_size = 50;
+            stream.dependency = 7;
+            stream.weight = 200;
+            stream.exclusive = true;
+            stream
+                .request_headers
+                .push(HeaderField::new(b"x-foo".to_vec(), b"bar".to_vec()));
+            stream
+                .response_headers
+                .push(HeaderField::new(b"x-bar".to_vec(), b"baz".to_vec()));
+            #[cfg(feature = "grpc")]
+            {
+                stream.grpc_mode = true;
+            }
+            stream.state = StreamState::Closed;
+        }
+        manager.cleanup_closed();
+
+        let stream = manager.get_or_create_client_stream(3).unwrap();
+        assert_eq!(stream.id, 3);
+        assert_eq!(stream.state, StreamState::Idle);
+        assert_eq!(stream.content_length, None);
+        assert_eq!(stream.received_body_size, 0);
+        assert_eq!(stream.dependency, 0);
+        assert_eq!(stream.weight, 16);
+        assert!(!stream.exclusive);
+        assert!(stream.request_headers.is_empty());
+        assert!(stream.response_headers.is_empty());
+        #[cfg(feature = "grpc")]
+        {
+            assert!(!stream.grpc_mode);
+            assert!(stream.grpc_stream_state.is_none());
         }
     }
 }
