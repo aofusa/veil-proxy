@@ -6,6 +6,7 @@
 |--------------|------|------|
 | [`perf/`](perf/) | パフォーマンス計測 | `veil:glibc` / `veil:musl` と `nginx:alpine` をコンテナ間通信で比較し、HTTP/1.1・HTTP/2 のスループット / レイテンシ / CPU / メモリを TSV に集約するハーネス |
 | [`container_security/`](container_security/) | セキュリティ検証 | Veil の Docker イメージを対象にファジング・カオスエンジニアリング・HTTP/2 準拠（h2spec）・セキュリティスキャン（Trivy / cargo-audit / cargo-deny / testssl）を実行するオーケストレータ |
+| [`qemu/`](qemu/) | プラットフォーム×arch 検証 | full-system QEMU で **他アーキ/他 OS の実カーネル**上でのビルド・E2E・perf を検証（Docker ヘルパ経由）。Linux aarch64 io_uring（`aarch64-vm.sh` + `run-e2e-aarch64.sh`）、**FreeBSD arm64 のネイティブビルド + 動作確認**（`fbsd-arm64-vm.sh`。TCG でも実用起動）。詳細は [`qemu/README.md`](qemu/README.md) |
 
 ---
 
