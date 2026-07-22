@@ -21,7 +21,8 @@ use ftlog::{debug, info, warn};
 #[cfg(target_os = "linux")]
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::os::unix::io::AsRawFd;
+#[allow(unused_imports)]
+use crate::runtime::handle::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -310,7 +311,7 @@ async fn forward_direction(
     // 送信方向を止めるだけで、dst からの受信＝逆方向の src には影響しない）。
     // shutdown(2) はノンブロッキングな syscall で io_uring の新規オペコードを要さず、
     // 戻り値は無視してよい（対向がすでにクローズ済みの ENOTCONN 等は無害）。
-    let _ = unsafe { libc::shutdown(dst.as_raw_fd(), libc::SHUT_WR) };
+    let _ = dst.shutdown(std::net::Shutdown::Write);
     total
 }
 

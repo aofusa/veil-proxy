@@ -27,7 +27,7 @@ use windows_sys::Win32::Networking::WinSock::{
     recv as ws_recv, recvfrom as ws_recvfrom, send as ws_send, sendto as ws_sendto,
     setsockopt as ws_setsockopt, socket as ws_socket, WSAGetLastError, WSAStartup, AF_INET,
     AF_INET6, FIONBIO, INVALID_SOCKET, IPPROTO_UDP, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6,
-    SOCKET_ERROR, SOCK_DGRAM, SOL_SOCKET, SO_REUSEADDR, WSADATA, WSAEWOULDBLOCK,
+    SOCKET_ERROR, SOCK_DGRAM, SOL_SOCKET, SO_REUSEADDR, WSADATA,
 };
 
 #[cfg(unix)]
