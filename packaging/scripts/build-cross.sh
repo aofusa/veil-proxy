@@ -26,14 +26,14 @@ OUTPUT_DIR="${PKG_ROOT}/output"
 BUILD_DIR="${PKG_ROOT}/build"
 VERSION="$(awk -F'"' '/^version = / { print $2; exit }' "${ROOT}/Cargo.toml")"
 
-# F-125 で確認済みの macOS クロスビルド最大 feature セット（http3/wasm 除く。
-# 設計 docs/artifacts/f125_windows_macos_design.md 参照）。
-DEFAULT_MACOS_FEATURES="http2,mimalloc,compression,cache,metrics,websocket,rate-limit,buffering,admin,access-log,l4-proxy"
+# F-125 / F-131 で確認済みの macOS クロスビルド最大 feature セット（http3/wasm/ktls 除く。
+# TLS 暗号は aws_lc_rs プロバイダを使用）。
+DEFAULT_MACOS_FEATURES="http2,mimalloc,compression,cache,metrics,grpc,grpc-web,websocket,rate-limit,buffering,admin,access-log,opentelemetry,l4-proxy"
 
-# v0.6.0 で確認済みの Windows クロスビルド最大 feature セット（http3/wasm/ktls/l4-proxy 除く。
-# l4-proxy は runtime::udp が Unix ソケット API 前提のため今回は未対応。
-# 詳細は docs/artifacts/f125_windows_macos_design.md の Windows 節を参照）。
-DEFAULT_WINDOWS_FEATURES="http2,mimalloc,compression,cache,metrics,grpc,grpc-web,websocket,rate-limit,buffering,admin,access-log,opentelemetry"
+# v0.6.0 / F-131 で確認済みの Windows クロスビルド最大 feature セット（http3/wasm/ktls 除く。
+# L4 UDP プロキシ(l4-proxy)は Windows (Winsock) 対応済み。
+# TLS 暗号は x86_64 / aarch64 ともに aws_lc_rs プロバイダを使用）。
+DEFAULT_WINDOWS_FEATURES="http2,mimalloc,compression,cache,metrics,grpc,grpc-web,websocket,rate-limit,buffering,admin,access-log,opentelemetry,l4-proxy"
 
 TARGET_OS=""
 
@@ -85,18 +85,13 @@ build_macos() {
     echo "==> Building veil binary for ${rust_target} in Docker (messense/cargo-zigbuild)"
     echo "==> Features: ${features}"
 
-    # macOS は rustls の暗号プロバイダに ring を使う（Cargo.toml の target 別依存、F-125）。
-    # aws-lc-sys の手書きアセンブリ .S.o を zig リンカが解釈できずリンク失敗し
-    # （unknown cpu architecture）、release では AWS_LC_SYS_NO_ASM も禁止されるため、
-    # apple-darwin クロスビルド実績のある ring に切り替えている（src/tls_provider.rs 参照）。
-    # ring は cc ベースでビルドでき、aws-lc-sys の cmake は不要。
-    # target/ をホストと共有する都合上、ホスト側の他の cargo ビルドと同時に走らせないこと
-    # （AGENTS.md 検証手順: 1 つずつ実行。target 競合を避けるため）。
+    # macOS は rustls の暗号プロバイダに aws_lc_rs を使用する（Cargo.toml の target 別依存、F-131）。
+    # aws-lc-sys は cmake をコンテナへ導入することでビルド可能。
     docker run --rm \
         -v "${ROOT}:/io" \
         -w /io \
         messense/cargo-zigbuild \
-        cargo zigbuild --release --target "${rust_target}" --features "${features}"
+        bash -c "apt-get update -qq && apt-get install -y -qq cmake >/dev/null 2>&1; cargo zigbuild --release --target ${rust_target} --no-default-features --features ${features}"
 
     local binary_path="${ROOT}/target/${rust_target}/release/veil"
     if [[ ! -f "${binary_path}" ]]; then
@@ -153,22 +148,15 @@ EOF
 }
 
 # 1 つの Windows ターゲット（x86_64 または aarch64）をビルドして zip 化する。
-# 暗号プロバイダは arch により異なる（Cargo.toml の target 別依存と一致）:
-#   - x86_64-pc-windows-msvc: ring（aws-lc-sys は x86 で NASM を要求し cargo-xwin に無い）
-#   - aarch64-pc-windows-msvc: aws_lc_rs（ARM asm・NASM 不要。cmake を入れれば aws-lc-sys が
-#     クロスビルドできる。逆に ring 0.17 は aarch64-windows の prebuilt asm を持たず
-#     cargo-xwin の /imsvc フラグ handling で C コンパイルに失敗する）
+# TLS 暗号プロバイダは x86_64 / aarch64 ともに aws_lc_rs を使用（F-131）。
+# cmake + nasm をコンテナへ導入することで aws-lc-sys をビルドする。
 _build_one_windows() {
     local rust_target="$1"
     local features="${CARGO_FEATURES:-${DEFAULT_WINDOWS_FEATURES}}"
     local archive_name="veil-${VERSION}-${rust_target}.zip"
     local xwin_cache="${XWIN_CACHE_DIR:-${HOME}/.xwin-cache}"
-    local provider="ring" setup=":"
-    if [[ "${rust_target}" == aarch64-* ]]; then
-        provider="aws_lc_rs"
-        # aarch64 の aws-lc-sys は cmake ビルダー経路（NASM 不要）。コンテナに cmake を導入。
-        setup='command -v cmake >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq cmake >/dev/null 2>&1; }'
-    fi
+    local provider="aws_lc_rs"
+    local setup='command -v cmake >/dev/null 2>&1 && command -v nasm >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq cmake nasm >/dev/null 2>&1; }'
 
     echo "==> Building veil binary for ${rust_target} (provider=${provider}) in Docker (messense/cargo-xwin)"
     echo "==> Features: ${features}"

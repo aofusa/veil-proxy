@@ -13,7 +13,7 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::os::unix::io::AsRawFd;
+use crate::runtime::handle::AsRawFd;
 
 // 非ブロッキング UDP ソケット（std::net::UdpSocket ラッパー）
 // monoio::net::udp::UdpSocket を削除し、std を使用する
@@ -1280,6 +1280,19 @@ impl QuicUdpSocket {
             libc::AF_INET6
         };
 
+        #[cfg(target_os = "macos")]
+        let fd = {
+            let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM, 0) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            unsafe {
+                libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+            fd
+        };
+        #[cfg(not(target_os = "macos"))]
         let fd = unsafe {
             libc::socket(
                 domain,
