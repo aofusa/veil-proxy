@@ -153,19 +153,14 @@ fat binary）をクロスビルド**できる。FreeBSD/OpenBSD と異なり VM 
 ```bash
 ./packaging/scripts/build-cross.sh --target macos
 # feature を変える場合:
-CARGO_FEATURES="http2,mimalloc,compression,cache,metrics,websocket,rate-limit,buffering,admin,access-log,l4-proxy" \
+CARGO_FEATURES="http2,mimalloc,compression,cache,metrics,grpc,grpc-web,websocket,rate-limit,buffering,admin,access-log,opentelemetry,l4-proxy" \
   ./packaging/scripts/build-cross.sh --target macos
 ```
 
-内部では `messense/cargo-zigbuild` イメージで
+内部では `messense/cargo-zigbuild` イメージ内で `cmake` を導入し、
 `cargo zigbuild --release --target universal2-apple-darwin` を実行する。macOS は
-rustls の暗号プロバイダに **ring** を使う（`Cargo.toml` の target 別依存、F-125）。
-aws-lc-sys の手書きアセンブリ `.S.o` を zig リンカが解釈できずリンク失敗し
-（`unknown cpu architecture`）、release ビルドでは `AWS_LC_SYS_NO_ASM` も禁止されるため、
-apple-darwin クロスビルド実績のある ring に切り替えている（`src/tls_provider.rs` 参照）。
-ring は `cc` ベースでビルドでき、aws-lc-sys の cmake/nasm 依存は不要。
-`http3`/`wasm` feature は macOS クロスビルドでの動作が未検証のため、既定の
-feature セットには含めていない（`CARGO_FEATURES` で追加指定して個別に検証可能）。
+rustls の暗号プロバイダに **aws_lc_rs** を使う（`Cargo.toml` の target 別依存、F-131）。
+`http3` (quiche) は内蔵 BoringSSL (`boring`) を使用する。
 
 tar.gz には `veil` バイナリ（universal2 fat binary）・`config.toml.default`・
 `www/index.html`・`INSTALL.txt` を同梱する。macOS ネイティブのセキュリティは
@@ -186,22 +181,14 @@ VM ネイティブビルドは不要）。QEMU 実行・実機検証は行って
 ./packaging/scripts/build-cross.sh --target windows
 # feature を変える場合（既定は http3/wasm/ktls/l4-proxy 除く。l4-proxy は
 # runtime::udp が Unix ソケット API 前提のため今回は未対応）:
-CARGO_FEATURES="http2,mimalloc,compression,cache,metrics,grpc,grpc-web,websocket,rate-limit,buffering,admin,access-log,opentelemetry" \
+CARGO_FEATURES="http2,mimalloc,compression,cache,metrics,grpc,grpc-web,websocket,rate-limit,buffering,admin,access-log,opentelemetry,l4-proxy" \
   ./packaging/scripts/build-cross.sh --target windows
 ```
 
-内部では `messense/cargo-xwin` イメージで `cargo xwin build --release --target
-<target> --no-default-features --features <features>` を x86_64/aarch64 両方に
-対して実行し、それぞれ zip を出力する。rustls の暗号プロバイダは **arch により
-異なる**（`Cargo.toml` の target 別依存、v0.6.0）:
-
-- **x86_64-pc-windows-msvc**: `ring`（aws-lc-sys のビルドは x86 で NASM を要求
-  するが cargo-xwin コンテナに NASM が無いためクロスビルド不可）。
-- **aarch64-pc-windows-msvc**: `aws_lc_rs`（aarch64 の aws-lc は ARM アセンブリを
-  使い NASM 不要。コンテナに `cmake` を導入すれば cmake ビルダー経路でクロス
-  ビルドできる。逆に ring 0.17 は aarch64-pc-windows-msvc 向けの prebuilt asm を
-  持たず、cargo-xwin の `/imsvc` フラグ handling でソースコンパイルが失敗する
-  ため使えない）。
+内部では `messense/cargo-xwin` イメージ内で `cmake` + `nasm` を自動セットアップし、
+`cargo xwin build --release --target <target>` を x86_64/aarch64 両方に
+対して実行し、それぞれ zip を出力する。rustls の暗号プロバイダは **x86_64 / aarch64 ともに aws_lc_rs**
+を使用する（`Cargo.toml` の target 別依存、F-131）。`l4-proxy`（Winsock 非同期 UDP）も対応済みである。
 
 zip には `veil.exe`・`config.toml.default`・`www/index.html`・`INSTALL.txt` を
 同梱する。Windows ネイティブのセキュリティは Job Object（best-effort、
