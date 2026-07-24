@@ -902,7 +902,7 @@ impl QuicUdpSocket {
     }
 
     /// 内部ソケットの raw fd を取得
-    pub fn as_raw_fd(&self) -> i32 {
+    pub fn as_raw_fd(&self) -> crate::runtime::handle::RawFd {
         self.socket.as_raw_fd()
     }
 }
@@ -1184,6 +1184,7 @@ fn parse_gro_cmsg(msg: &libc::msghdr) -> Option<u16> {
 
 /// SocketAddr を libc sockaddr に変換
 // F-130 C3: `runtime::uring::udp_send` からも再利用するため pub(crate)。
+#[cfg(unix)]
 pub(crate) fn socket_addr_to_raw(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
 
@@ -1218,6 +1219,7 @@ pub(crate) fn socket_addr_to_raw(addr: SocketAddr) -> (libc::sockaddr_storage, l
 }
 
 /// libc sockaddr_storage を SocketAddr に変換
+#[cfg(unix)]
 fn raw_to_socket_addr(storage: &libc::sockaddr_storage) -> io::Result<SocketAddr> {
     match storage.ss_family as libc::c_int {
         libc::AF_INET => {
@@ -1269,7 +1271,7 @@ pub fn create_recv_buffer() -> Vec<u8> {
 
 /// 非 Linux 版 `bind_reuseport`（FreeBSD: `SO_REUSEPORT_LB`（カーネル分散）、
 /// その他 BSD: `SO_REUSEPORT`）。GSO/GRO は非対応のため常に無効。
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), unix))]
 impl QuicUdpSocket {
     pub fn bind_reuseport(addr: SocketAddr) -> io::Result<Self> {
         use std::os::unix::io::FromRawFd;
@@ -1541,9 +1543,122 @@ impl QuicUdpSocket {
     }
 }
 
+/// Windows 版 `QuicUdpSocket` 実装。
+#[cfg(target_os = "windows")]
+impl QuicUdpSocket {
+    pub fn bind_reuseport(addr: SocketAddr) -> io::Result<Self> {
+        let socket = std::net::UdpSocket::bind(addr)?;
+        socket.set_nonblocking(true)?;
+        let local_addr = socket.local_addr()?;
+
+        Ok(Self {
+            socket,
+            gso_enabled: false,
+            gro_enabled: false,
+            local_addr,
+        })
+    }
+
+    pub fn bind_reuseport_with_gso(addr: SocketAddr, _enable_gso_gro: bool) -> io::Result<Self> {
+        Self::bind_reuseport(addr)
+    }
+
+    pub fn send_with_gso_sync(
+        &self,
+        data: &[u8],
+        segment_size: u16,
+        target: SocketAddr,
+    ) -> io::Result<GsoSendResult> {
+        let seg = (segment_size as usize).max(1);
+        let mut sent_total = 0usize;
+        for chunk in data.chunks(seg) {
+            let ret = self.socket.send_to(chunk, target)?;
+            sent_total += ret;
+        }
+        Ok(GsoSendResult {
+            bytes_sent: sent_total,
+            gso_used: false,
+        })
+    }
+
+    pub fn recv_with_gro_sync(&self, buf: &mut [u8]) -> io::Result<GroRecvResult> {
+        let (bytes, from) = self.socket.recv_from(buf)?;
+        Ok(GroRecvResult {
+            bytes_received: bytes,
+            from,
+            gro_segment_size: None,
+        })
+    }
+
+    pub async fn recv_gro_async(&self, buf: &mut [u8]) -> io::Result<GroRecvResult> {
+        loop {
+            match self.recv_with_gro_sync(buf) {
+                Ok(result) => return Ok(result),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    wait_readable_fd(self.socket.as_raw_fd()).await?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    pub fn recv_mmsg_sync(&self, scratch: &mut MmsgRecvScratch) -> io::Result<usize> {
+        let mut count = 0usize;
+        let batch = scratch.batch_size();
+        while count < batch {
+            let start = count * RECV_BUFFER_SIZE;
+            let buf = &mut scratch.bufs[start..start + RECV_BUFFER_SIZE];
+            match self.socket.recv_from(buf) {
+                Ok((bytes, addr)) => {
+                    scratch.metas[count] = (bytes, addr);
+                    count += 1;
+                }
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::WouldBlock && count > 0 {
+                        break;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    pub async fn send_mmsg_async(
+        &self,
+        entries: &[SendmmsgEntry<'_>],
+        scratch: &mut MmsgSendScratch,
+    ) -> io::Result<()> {
+        for e in entries.iter().take(scratch.batch_size()) {
+            let seg = if e.segments > 1 {
+                (e.seg_size as usize).max(1)
+            } else {
+                e.data.len().max(1)
+            };
+            for chunk in e.data.chunks(seg) {
+                loop {
+                    match self.socket.send_to(chunk, e.dest) {
+                        Ok(_) => break,
+                        Err(err) => {
+                            if err.kind() == io::ErrorKind::WouldBlock {
+                                wait_writable_fd(self.socket.as_raw_fd()).await?;
+                                continue;
+                            }
+                            warn!("[HTTP/3] send entry skipped: {}", err);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// 非 Linux 版 recvmmsg スクラッチ（受信バッファ + per-msg メタ情報のみ。
 /// Linux 版と同一の公開 API: `new` / `with_batch` / `batch_size` / `meta` / `buf_mut`）。
-#[cfg(not(target_os = "linux"))]
+/// 非 Linux Unix 版 recvmmsg スクラッチ
+#[cfg(all(not(target_os = "linux"), unix))]
 pub struct MmsgRecvScratch {
     batch: usize,
     /// batch × RECV_BUFFER_SIZE の連続バッファ（Linux 版と同レイアウト）。
@@ -1552,7 +1667,7 @@ pub struct MmsgRecvScratch {
     metas: Box<[(usize, libc::sockaddr_storage)]>,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), unix))]
 impl MmsgRecvScratch {
     pub fn new() -> Self {
         Self::with_batch(MMSG_BATCH_DEFAULT)
@@ -1586,7 +1701,53 @@ impl MmsgRecvScratch {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), unix))]
+impl Default for MmsgRecvScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Windows 版 recvmmsg スクラッチ
+#[cfg(target_os = "windows")]
+pub struct MmsgRecvScratch {
+    batch: usize,
+    bufs: Box<[u8]>,
+    metas: Box<[(usize, SocketAddr)]>,
+}
+
+#[cfg(target_os = "windows")]
+impl MmsgRecvScratch {
+    pub fn new() -> Self {
+        Self::with_batch(MMSG_BATCH_DEFAULT)
+    }
+
+    pub fn with_batch(batch: usize) -> Self {
+        let batch = clamp_mmsg_batch(batch);
+        Self {
+            batch,
+            bufs: vec![0u8; batch * RECV_BUFFER_SIZE].into_boxed_slice(),
+            metas: vec![(0, SocketAddr::V4(std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0))); batch].into_boxed_slice(),
+        }
+    }
+
+    #[inline]
+    pub fn batch_size(&self) -> usize {
+        self.batch
+    }
+
+    pub fn meta(&self, i: usize) -> io::Result<(usize, SocketAddr, Option<u16>)> {
+        let (len, addr) = self.metas[i];
+        Ok((len, addr, None))
+    }
+
+    pub fn buf_mut(&mut self, i: usize) -> &mut [u8] {
+        let start = i * RECV_BUFFER_SIZE;
+        &mut self.bufs[start..start + RECV_BUFFER_SIZE]
+    }
+}
+
+#[cfg(target_os = "windows")]
 impl Default for MmsgRecvScratch {
     fn default() -> Self {
         Self::new()

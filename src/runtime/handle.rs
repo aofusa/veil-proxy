@@ -48,6 +48,13 @@ pub trait AsRawFd {
     fn as_raw_fd(&self) -> RawFd;
 }
 
+#[cfg(windows)]
+impl<T: std::os::windows::io::AsRawSocket> AsRawFd for T {
+    fn as_raw_fd(&self) -> RawFd {
+        self.as_raw_socket() as isize
+    }
+}
+
 /// `RawFd`（`isize`）と Winsock `SOCKET`（`u64`）の相互変換ヘルパー（Windows 専用）。
 #[cfg(windows)]
 pub(crate) mod win {

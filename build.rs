@@ -24,7 +24,10 @@ fn main() {
         return;
     }
 
-    ensure_aws_lc_no_prefix();
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os == "linux" || target_os == "freebsd" {
+        ensure_aws_lc_no_prefix();
+    }
 }
 
 fn feature_enabled(name: &str) -> bool {

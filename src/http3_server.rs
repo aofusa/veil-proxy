@@ -19,6 +19,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use crate::runtime::handle::AsRawFd;
 // CString / AsRawFd / FromRawFd は memfd 経由の証明書リロード（Linux / FreeBSD）でのみ
 // 使用する。OpenBSD は一時ファイルフォールバックのため不要（`create_memfd_for_pem` 参照）。
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -26,7 +27,7 @@ use std::ffi::CString;
 use std::io::{self, Seek, Write as IoWrite};
 use std::net::SocketAddr;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::FromRawFd;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
@@ -223,6 +224,7 @@ fn create_memfd_for_pem(name: &str, pem_data: &[u8]) -> io::Result<(PemBackedFil
 /// プロファイルのため、一時ファイル書き込みは通常ブロックされない）。
 #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 fn create_memfd_for_pem(name: &str, pem_data: &[u8]) -> io::Result<(PemBackedFile, String)> {
+    #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
 
     // 衝突しにくい一意名（pid + 単調カウンタ）。O_EXCL で既存ファイルを掴まない。
@@ -231,12 +233,14 @@ fn create_memfd_for_pem(name: &str, pem_data: &[u8]) -> io::Result<(PemBackedFil
     let mut temp_path = std::env::temp_dir();
     temp_path.push(format!("veil-{}-{}-{}.pem", name, std::process::id(), seq));
 
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true) // O_EXCL: 既存ファイルを掴まない
-        .mode(0o600) // 所有者のみ読み書き
-        .open(&temp_path)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(&temp_path)?;
 
     file.write_all(pem_data)?;
     file.seek(io::SeekFrom::Start(0))?;
@@ -2819,7 +2823,7 @@ pub(crate) async fn proxy_to_backend_async_with_tls(
     tls_insecure: bool,
 ) -> io::Result<BackendProxyResult> {
     use crate::runtime::tcp::TcpStream;
-    use std::os::unix::io::AsRawFd;
+    use crate::runtime::handle::AsRawFd;
 
     let addr = format!("{}:{}", target.host, target.port);
     debug!("[HTTP/3] Async connecting to backend {}", addr);
@@ -3174,8 +3178,8 @@ async fn proxy_to_tls_backend_async(
 }
 
 #[inline]
-fn read_nonblocking(fd: i32, buf: &mut [u8]) -> io::Result<usize> {
-    let result = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+fn read_nonblocking(fd: crate::runtime::handle::RawFd, buf: &mut [u8]) -> io::Result<usize> {
+    let result = unsafe { libc::read(fd as libc::c_int, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as _) };
     if result < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -3184,8 +3188,8 @@ fn read_nonblocking(fd: i32, buf: &mut [u8]) -> io::Result<usize> {
 }
 
 #[inline]
-fn write_nonblocking(fd: i32, buf: &[u8]) -> io::Result<usize> {
-    let result = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
+fn write_nonblocking(fd: crate::runtime::handle::RawFd, buf: &[u8]) -> io::Result<usize> {
+    let result = unsafe { libc::write(fd as libc::c_int, buf.as_ptr() as *const libc::c_void, buf.len() as _) };
     if result < 0 {
         Err(io::Error::last_os_error())
     } else {

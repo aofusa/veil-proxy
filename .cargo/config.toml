@@ -1,4 +1,1 @@
-# http3/quiche と rustls が同一 AWS-LC（非プレフィックス）を共有する。
-# build.rs の bootstrap 再実行と併用し、初回ビルドから正しい aws-lc-sys を生成する。
-[env]
-AWS_LC_SYS_NO_PREFIX = { value = "1", force = true }
+# http3/quiche と rustls が同一 AWS-LC（非プレフィックス）を共有する設定は build.rs で target_os 別に適用

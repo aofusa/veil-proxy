@@ -33,8 +33,8 @@
 #![cfg(feature = "http3")]
 
 use std::cell::RefCell;
+use crate::runtime::handle::AsRawFd;
 use std::io;
-use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -124,11 +124,14 @@ impl TlsBackend {
     fn new(inner: TcpStream, session: Option<rustls::ClientConnection>, drained: Vec<u8>) -> Self {
         // 生 read/write（ノンブロッキング前提）を行うため O_NONBLOCK を保証する
         // （io_uring の CONNECT は O_NONBLOCK を保証しない。ktls_rustls::connect と同方針）。
-        let fd = inner.as_raw_fd();
-        unsafe {
-            let flags = libc::fcntl(fd, libc::F_GETFL, 0);
-            if flags >= 0 && (flags & libc::O_NONBLOCK) == 0 {
-                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        #[cfg(unix)]
+        {
+            let fd = inner.as_raw_fd();
+            unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+                if flags >= 0 && (flags & libc::O_NONBLOCK) == 0 {
+                    libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                }
             }
         }
         Self {
@@ -312,8 +315,8 @@ fn drain_plaintext(dst: &mut Vec<u8>, rd: &mut dyn std::io::Read) {
 }
 
 /// `libc::read` ラッパー（ノンブロッキング fd 用）。
-fn raw_fd_read(fd: std::os::fd::RawFd, buf: &mut [u8]) -> io::Result<usize> {
-    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+fn raw_fd_read(fd: crate::runtime::handle::RawFd, buf: &mut [u8]) -> io::Result<usize> {
+    let n = unsafe { libc::read(fd as libc::c_int, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as _) };
     if n < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -322,8 +325,8 @@ fn raw_fd_read(fd: std::os::fd::RawFd, buf: &mut [u8]) -> io::Result<usize> {
 }
 
 /// `libc::write` ラッパー（ノンブロッキング fd 用）。
-fn raw_fd_write(fd: std::os::fd::RawFd, buf: &[u8]) -> io::Result<usize> {
-    let n = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
+fn raw_fd_write(fd: crate::runtime::handle::RawFd, buf: &[u8]) -> io::Result<usize> {
+    let n = unsafe { libc::write(fd as libc::c_int, buf.as_ptr() as *const libc::c_void, buf.len() as _) };
     if n < 0 {
         Err(io::Error::last_os_error())
     } else {

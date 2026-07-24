@@ -140,8 +140,7 @@ tar.gz には `veil` バイナリ・`rc.d/veil`（サービススクリプト）
 （ABI 互換の目安。大きく異なる OS バージョンでは再ビルド推奨）。
 FreeBSD は capsicum（`[security] enable_capsicum`）・jail と、OpenBSD は
 pledge/unveil（`[security] enable_pledge` / `enable_unveil`）と併用できる。
-OpenBSD の TLS は rustls の ring プロバイダを使用し（F-122）、静的配信/プロキシとも
-HTTPS 200 で動作する（pledge+unveil 有効のまま）。
+OpenBSD の TLS は rustls の ring プロバイダを使用し（F-122）、`full` フィーチャー（HTTP/3 + WASM 含む全機能）でのビルドに対応している。静的配信/プロキシとも HTTPS 200 で動作する（pledge+unveil 有効のまま）。
 
 ### macOS 向けパッケージ（F-125、Docker クロスビルド）
 
@@ -149,18 +148,16 @@ macOS は Docker（`messense/cargo-zigbuild`）で **universal2（x86_64 + aarch
 fat binary）をクロスビルド**できる。FreeBSD/OpenBSD と異なり VM ネイティブビルドは
 不要。QEMU 実行・実機検証は行っていない（クロスビルドが通ることのみを合格基準と
 する。設計は `docs/artifacts/f125_windows_macos_design.md`）。
+デフォルトで `--features full`（HTTP/3 + WASM 含む全機能）でビルドされる。
 
 ```bash
 ./packaging/scripts/build-cross.sh --target macos
-# feature を変える場合:
-CARGO_FEATURES="http2,mimalloc,compression,cache,metrics,grpc,grpc-web,websocket,rate-limit,buffering,admin,access-log,opentelemetry,l4-proxy" \
-  ./packaging/scripts/build-cross.sh --target macos
 ```
 
-内部では `messense/cargo-zigbuild` イメージ内で `cmake` を導入し、
-`cargo zigbuild --release --target universal2-apple-darwin` を実行する。macOS は
-rustls の暗号プロバイダに **aws_lc_rs** を使う（`Cargo.toml` の target 別依存、F-131）。
-`http3` (quiche) は内蔵 BoringSSL (`boring`) を使用する。
+内部では `messense/cargo-zigbuild` イメージ内で `cmake` + `nasm` を導入し、
+`cargo zigbuild --release --target universal2-apple-darwin --features full` を実行する。macOS は
+rustls の暗号プロバイダに **aws_lc_rs** を使い（`Cargo.toml` の target 別依存、F-131）、
+`http3` (quiche) は内蔵 BoringSSL (`boring-sys`) を独立して使用しシンボル分離されている。
 
 tar.gz には `veil` バイナリ（universal2 fat binary）・`config.toml.default`・
 `www/index.html`・`INSTALL.txt` を同梱する。macOS ネイティブのセキュリティは
@@ -176,19 +173,17 @@ Windows は Docker（`messense/cargo-xwin`）で **x86_64-pc-windows-msvc** と
 VM ネイティブビルドは不要）。QEMU 実行・実機検証は行っていない
 （クロスビルドが通ることのみを合格基準とする。設計は
 `docs/artifacts/f125_windows_macos_design.md`）。
+デフォルトで `--features full`（HTTP/3 + WASM 含む全機能）でビルドされる。
 
 ```bash
 ./packaging/scripts/build-cross.sh --target windows
-# feature を変える場合（既定は http3/wasm/ktls/l4-proxy 除く。l4-proxy は
-# runtime::udp が Unix ソケット API 前提のため今回は未対応）:
-CARGO_FEATURES="http2,mimalloc,compression,cache,metrics,grpc,grpc-web,websocket,rate-limit,buffering,admin,access-log,opentelemetry,l4-proxy" \
-  ./packaging/scripts/build-cross.sh --target windows
 ```
 
 内部では `messense/cargo-xwin` イメージ内で `cmake` + `nasm` を自動セットアップし、
-`cargo xwin build --release --target <target>` を x86_64/aarch64 両方に
+`cargo xwin build --release --target <target> --features full` を x86_64/aarch64 両方に
 対して実行し、それぞれ zip を出力する。rustls の暗号プロバイダは **x86_64 / aarch64 ともに aws_lc_rs**
-を使用する（`Cargo.toml` の target 別依存、F-131）。`l4-proxy`（Winsock 非同期 UDP）も対応済みである。
+を使用し（`Cargo.toml` の target 別依存、F-131）、`http3` (quiche) には BoringSSL (`boring-sys`) を、
+UDP ソケットには Windows Winsock 互換（`QuicUdpSocket`）が適用されている。`l4-proxy` も対応済みである。
 
 zip には `veil.exe`・`config.toml.default`・`www/index.html`・`INSTALL.txt` を
 同梱する。Windows ネイティブのセキュリティは Job Object（best-effort、

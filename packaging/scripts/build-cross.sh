@@ -2,7 +2,7 @@
 # veil クロスプラットフォームバイナリ tar.gz/zip パッケージング（F-125）
 #
 # macOS（universal2-apple-darwin: x86_64 + aarch64 fat binary）を Docker
-# （messense/cargo-zigbuild）で、Windows（x86_64-pc-windows-msvc=ring / aarch64-pc-windows-msvc=aws_lc_rs）を Docker
+# （messense/cargo-zigbuild）で、Windows（x86_64-pc-windows-msvc / aarch64-pc-windows-msvc=aws_lc_rs）を Docker
 # （messense/cargo-xwin）でクロスビルドし、単体バイナリ tar.gz/zip を
 # packaging/output/ へ出力する。QEMU 実行・テストは行わない
 # （クロスビルドが通ることのみを検証する。ユーザ指示: docs/artifacts/f125_windows_macos_design.md）。
@@ -12,9 +12,7 @@
 #   ./packaging/scripts/build-cross.sh --target windows
 #
 # 環境変数:
-#   CARGO_FEATURES  ビルドする feature セット
-#                   （デフォルト: それぞれのクロスビルドが通ることを確認済みの最大セット。
-#                    http3/wasm/ktls は除く。macOS/Windows の TLS 暗号は ring プロバイダを使う）
+#   CARGO_FEATURES  ビルドする feature セット（デフォルト: "full"（http3, wasm 含む全機能））
 #   XWIN_CACHE_DIR  windows ターゲットの xwin SDK キャッシュ（ホスト側ディレクトリ、
 #                   デフォルト: ~/.xwin-cache）
 set -euo pipefail
@@ -26,14 +24,12 @@ OUTPUT_DIR="${PKG_ROOT}/output"
 BUILD_DIR="${PKG_ROOT}/build"
 VERSION="$(awk -F'"' '/^version = / { print $2; exit }' "${ROOT}/Cargo.toml")"
 
-# F-125 / F-131 で確認済みの macOS クロスビルド最大 feature セット（http3/wasm/ktls 除く。
-# TLS 暗号は aws_lc_rs プロバイダを使用）。
-DEFAULT_MACOS_FEATURES="http2,mimalloc,compression,cache,metrics,grpc,grpc-web,websocket,rate-limit,buffering,admin,access-log,opentelemetry,l4-proxy"
+# macOS / Windows クロスビルドデフォルト feature セット（full: http3, wasm 含む全機能。
+# TLS 暗号は aws_lc_rs プロバイダを使用、quiche には BoringSSL を使用）。
+DEFAULT_MACOS_FEATURES="full"
 
-# v0.6.0 / F-131 で確認済みの Windows クロスビルド最大 feature セット（http3/wasm/ktls 除く。
-# L4 UDP プロキシ(l4-proxy)は Windows (Winsock) 対応済み。
-# TLS 暗号は x86_64 / aarch64 ともに aws_lc_rs プロバイダを使用）。
-DEFAULT_WINDOWS_FEATURES="http2,mimalloc,compression,cache,metrics,grpc,grpc-web,websocket,rate-limit,buffering,admin,access-log,opentelemetry,l4-proxy"
+# Windows クロスビルドデフォルト feature セット（full: http3, wasm 含む全機能）。
+DEFAULT_WINDOWS_FEATURES="full"
 
 TARGET_OS=""
 
@@ -88,10 +84,13 @@ build_macos() {
     # macOS は rustls の暗号プロバイダに aws_lc_rs を使用する（Cargo.toml の target 別依存、F-131）。
     # aws-lc-sys は cmake をコンテナへ導入することでビルド可能。
     docker run --rm \
+        -e CMAKE_SYSTEM_NAME="Darwin" \
+        -e BORING_BSSL_NO_ASM=1 \
+        -e AWS_LC_SYS_NO_PREFIX="" \
         -v "${ROOT}:/io" \
         -w /io \
         messense/cargo-zigbuild \
-        bash -c "apt-get update -qq && apt-get install -y -qq cmake >/dev/null 2>&1; cargo zigbuild --release --target ${rust_target} --no-default-features --features ${features}"
+        bash -c "unset AWS_LC_SYS_NO_PREFIX; apt-get update -qq && apt-get install -y -qq cmake nasm yasm perl golang-go >/dev/null 2>&1; printf '#!/bin/sh\necho /opt/MacOSX11.3.sdk\n' > /usr/local/bin/xcrun && chmod +x /usr/local/bin/xcrun; cargo zigbuild --release --target ${rust_target} --no-default-features --features ${features}"
 
     local binary_path="${ROOT}/target/${rust_target}/release/veil"
     if [[ ! -f "${binary_path}" ]]; then
@@ -156,7 +155,7 @@ _build_one_windows() {
     local archive_name="veil-${VERSION}-${rust_target}.zip"
     local xwin_cache="${XWIN_CACHE_DIR:-${HOME}/.xwin-cache}"
     local provider="aws_lc_rs"
-    local setup='command -v cmake >/dev/null 2>&1 && command -v nasm >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq cmake nasm >/dev/null 2>&1; }'
+    local setup='command -v cmake >/dev/null 2>&1 && command -v nasm >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq cmake nasm yasm perl golang-go >/dev/null 2>&1; }'
 
     echo "==> Building veil binary for ${rust_target} (provider=${provider}) in Docker (messense/cargo-xwin)"
     echo "==> Features: ${features}"
@@ -165,12 +164,23 @@ _build_one_windows() {
     # target/ をホストと共有する都合上、ホスト側の他の cargo ビルドと同時に走らせないこと
     # （AGENTS.md 検証手順: 1 つずつ実行。target 競合を避けるため）。
     docker run --rm \
+        -e CMAKE_SYSTEM_NAME="Windows" \
+        -e CC_x86_64_pc_windows_msvc="clang-cl" \
+        -e CXX_x86_64_pc_windows_msvc="clang-cl" \
+        -e AR_x86_64_pc_windows_msvc="llvm-ar" \
+        -e CC_aarch64_pc_windows_msvc="clang-cl" \
+        -e CXX_aarch64_pc_windows_msvc="clang-cl" \
+        -e AR_aarch64_pc_windows_msvc="llvm-ar" \
+        -e CFLAGS="-DOPENSSL_NO_ASM" \
+        -e CXXFLAGS="-DOPENSSL_NO_ASM" \
+        -e BORING_BSSL_NO_ASM=1 \
+        -e AWS_LC_SYS_NO_PREFIX="" \
         -e XWIN_CACHE_DIR=/xwincache \
         -v "${xwin_cache}:/xwincache" \
         -v "${ROOT}:/io" \
         -w /io \
         messense/cargo-xwin \
-        bash -c "${setup}; cargo xwin build --release --target ${rust_target} --no-default-features --features ${features}"
+        bash -c "unset AWS_LC_SYS_NO_PREFIX; ${setup}; cargo xwin build --release --target ${rust_target} --no-default-features --features ${features}"
 
     local binary_path="${ROOT}/target/${rust_target}/release/veil.exe"
     if [[ ! -f "${binary_path}" ]]; then
@@ -209,8 +219,7 @@ Windows ネイティブのセキュリティ（Job Object、best-effort）:
   （実機検証不可のため保守的な最小構成）。
 
 含まれる feature: ${features}
-（http3/wasm/ktls/l4-proxy はこのビルドに含まれていません。Unix ソケット API 前提の
-  実装が未移植のため。TLS 暗号は ${provider} プロバイダを使用します）
+（TLS 暗号は ${provider} プロバイダ、HTTP/3 には BoringSSL を使用します）
 EOF
 
     (cd "${stage_parent}" && zip -r "${OUTPUT_DIR}/${archive_name}" "${dir_name}" >/dev/null)
