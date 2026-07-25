@@ -34,6 +34,8 @@ FROM tool-builder AS cacher
 
 ARG CARGO_FEATURES=full
 ARG RUST_TARGET=x86_64-unknown-linux-musl
+ENV AWS_LC_SYS_NO_PREFIX=1
+
 
 # Cargo.toml と Cargo.lock、および fuzz ワークスペースメンバのマニフェストを先にコピー
 # （[workspace] members = [".", "fuzz"] のため、fuzz/Cargo.toml が無いとワークスペース解決に失敗する）
