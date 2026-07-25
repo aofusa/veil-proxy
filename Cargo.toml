@@ -47,8 +47,11 @@ http2 = []
 # UDP/QUIC を使用した HTTP/3 プロトコル
 # 注意: HTTP/3 は UDP ベースのため kTLS は使用不可
 # GSO/GRO による高パフォーマンス UDP 処理
-# quiche の TLS は aws-lc-sys（rustls と同一の AWS-LC ビルド）を共有する。
-# build.rs が libssl をリンクするため dep:aws-lc-sys が必要。
+#
+# ターゲット別 TLS バックエンド（build.rs が AWS_LC_SYS_NO_PREFIX を制御）:
+#   - linux / freebsd : quiche (default-features=false) + 共有 aws-lc-sys (NO_PREFIX=1)
+#   - windows / macos : quiche (boring) + rustls 側の aws-lc-rs (NO_PREFIX=0 で共存)
+#   - openbsd         : quiche (boring) + rustls 側の ring（aws-lc-* は一切依存しない）
 http3 = ["dep:quiche"]
 
 # epoll ベースの readiness ランタイム（F-120 クロスプラットフォーム対応）
@@ -466,7 +469,7 @@ harness = false
 # OpenBSD/Windows/macOS は quiche 内蔵 BoringSSL (boring) を使用
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 quiche = { version = "0.24.9", default-features = false, optional = true }
-aws-lc-sys = { version = "0.41", features = ["ssl", "bindgen"], optional = true }
+aws-lc-sys = { version = "0.41", features = ["ssl", "bindgen"] }
 
 [target.'cfg(not(any(target_os = "linux", target_os = "freebsd")))'.dependencies]
 quiche = { version = "0.24.9", default-features = false, features = ["boring"], optional = true }

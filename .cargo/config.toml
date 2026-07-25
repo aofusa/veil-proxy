@@ -1,1 +1,41 @@
-# http3/quiche と rustls が同一 AWS-LC（非プレフィックス）を共有する設定は build.rs で target_os 別に適用
+# http3/quiche の AWS_LC_SYS_NO_PREFIX をターゲットトリプル別に適用
+# Linux / FreeBSD: quiche と aws-lc-rs で同一 aws-lc-sys を共有するため AWS_LC_SYS_NO_PREFIX=1
+[target.x86_64-unknown-linux-gnu.env]
+AWS_LC_SYS_NO_PREFIX = "1"
+
+[target.x86_64-unknown-linux-musl.env]
+AWS_LC_SYS_NO_PREFIX = "1"
+
+[target.aarch64-unknown-linux-gnu.env]
+AWS_LC_SYS_NO_PREFIX = "1"
+
+[target.aarch64-unknown-linux-musl.env]
+AWS_LC_SYS_NO_PREFIX = "1"
+
+[target.x86_64-unknown-freebsd.env]
+AWS_LC_SYS_NO_PREFIX = "1"
+
+[target.aarch64-unknown-freebsd.env]
+AWS_LC_SYS_NO_PREFIX = "1"
+
+# Windows / macOS / OpenBSD: quiche 内蔵 BoringSSL (boring) と aws-lc-rs/ring の共存のため AWS_LC_SYS_NO_PREFIX=0
+[target.x86_64-pc-windows-msvc.env]
+AWS_LC_SYS_NO_PREFIX = "0"
+
+[target.aarch64-pc-windows-msvc.env]
+AWS_LC_SYS_NO_PREFIX = "0"
+
+[target.universal2-apple-darwin.env]
+AWS_LC_SYS_NO_PREFIX = "0"
+
+[target.x86_64-apple-darwin.env]
+AWS_LC_SYS_NO_PREFIX = "0"
+
+[target.aarch64-apple-darwin.env]
+AWS_LC_SYS_NO_PREFIX = "0"
+
+[target.x86_64-unknown-openbsd.env]
+AWS_LC_SYS_NO_PREFIX = "0"
+
+[target.aarch64-unknown-openbsd.env]
+AWS_LC_SYS_NO_PREFIX = "0"

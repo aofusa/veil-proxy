@@ -1,8 +1,10 @@
 //! veil のビルドスクリプト。
 //!
-//! `http3` フィーチャー有効時、quiche が要求する BoringSSL 互換（非プレフィックス）
-//! シンボルを rustls と共有するため `AWS_LC_SYS_NO_PREFIX=1` を自動適用する。
-//! libssl / libcrypto のリンクは aws-lc-sys（`http3` で `ssl` フィーチャー有効）が担う。
+//! `http3` フィーチャー有効時、Linux / FreeBSD では quiche が要求する BoringSSL 互換（非プレフィックス）
+//! シンボルを rustls と共有するため `AWS_LC_SYS_NO_PREFIX=1` を適用する。
+//! （Windows / macOS / OpenBSD では quiche の内蔵 BoringSSL と aws-lc-rs/ring の共存のため `AWS_LC_SYS_NO_PREFIX=0` となる）
+//! libssl / libcrypto のリンクは aws-lc-sys（Linux/FreeBSD `http3` で `ssl` フィーチャー有効）が担う。
+
 //!
 //! F-120: クロスプラットフォーム対応（Phase 1）向けに、target_os / feature の
 //! 組み合わせから `veil_rt_uring` / `veil_rt_reactor` / `veil_poller_epoll` /
