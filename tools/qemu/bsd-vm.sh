@@ -610,6 +610,20 @@ cmd_toolchain() {
         cmd_ssh 'env IGNORE_OSVERSION=yes ASSUME_ALWAYS_YES=yes pkg install -y rust cmake llvm gmake protobuf bash curl nasm git pkgconf >/tmp/pkg.log 2>&1 || { tail -20 /tmp/pkg.log; exit 1; }'
     else
         # OpenBSD も同様に protobuf（protoc）と gmake が要る
+        log "OpenBSD 用 cc ラッパを設置（C ファイルのみ -include pthread.h）"
+        cmd_ssh 'cat > /usr/local/bin/veil-cc <<'"'"'WRAP'"'"'
+#!/bin/sh
+# BoringSSL(boring-sys) は pthread_rwlock_t が <sys/types.h> から見える前提だが、
+# OpenBSD では <pthread.h> にしかない。C ファイルのときだけ pthread.h を先に読ませる。
+# アセンブリ(.S/.s) には付けない（付けると zstd-sys 等のアセンブルが壊れる）。
+for a in "$@"; do
+  case "$a" in
+    *.S|*.s) exec /usr/bin/cc "$@" ;;
+  esac
+done
+exec /usr/bin/cc -include pthread.h "$@"
+WRAP
+chmod +x /usr/local/bin/veil-cc'
         log "pkg_add rust cmake llvm gmake protobuf bash curl git"
         cmd_ssh 'PKG_PATH=https://cdn.openbsd.org/pub/OpenBSD/$(uname -r)/packages/$(uname -m)/ pkg_add -I rust cmake llvm gmake protobuf bash curl git >/tmp/pkg.log 2>&1 || { tail -20 /tmp/pkg.log; exit 1; }'
     fi
@@ -637,6 +651,17 @@ _guest_env_prefix() {
         # CARGO_HOME（/root/.cargo）にレジストリを展開すると溢れる。
         # 大きい /usr/obj へ逃がす（GUEST_ROOT も同じ理由で /usr/obj 配下）。
         pre="${pre} CARGO_HOME=/usr/obj/cargo"
+        # quiche が使う BoringSSL（boring-sys）は `pthread_rwlock_t` が
+        # <sys/types.h> から見えることを前提にしている（glibc/FreeBSD/macOS では真）。
+        # OpenBSD では <pthread.h> にしかないため
+        #   openssl/thread.h:81: error: unknown type name 'pthread_rwlock_t'
+        # で C ビルドが失敗する。
+        #
+        # `CFLAGS_<target>` に `-include pthread.h` を足すと **アセンブリ(.S) にも**
+        # 適用されて zstd-sys 等が壊れるため、**C ファイルのときだけ** `-include` する
+        # cc ラッパ（toolchain で設置）を CC として使う。
+        pre="${pre} CC_x86_64_unknown_openbsd=/usr/local/bin/veil-cc"
+        pre="${pre} CC_aarch64_unknown_openbsd=/usr/local/bin/veil-cc"
     fi
     echo "${pre}"
 }
