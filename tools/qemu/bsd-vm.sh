@@ -624,8 +624,20 @@ done
 exec /usr/bin/cc -include pthread.h "$@"
 WRAP
 chmod +x /usr/local/bin/veil-cc'
-        log "pkg_add rust cmake llvm gmake protobuf bash curl git"
-        cmd_ssh 'PKG_PATH=https://cdn.openbsd.org/pub/OpenBSD/$(uname -r)/packages/$(uname -m)/ pkg_add -I rust cmake llvm gmake protobuf bash curl git >/tmp/pkg.log 2>&1 || { tail -20 /tmp/pkg.log; exit 1; }'
+        # NOTE: OpenBSD には llvm-19/20/21 が並存するため、曖昧な `llvm` を
+        # `pkg_add -I`（非対話）で指定すると**黙って入らない**。
+        # bindgen（aws-lc-rs / boring-sys）が libclang を要求するので、
+        # 利用可能な llvm から 1 つを選んで明示的に入れる。
+        log "pkg_add rust cmake gmake protobuf bash curl git + llvm（バージョン明示）"
+        cmd_ssh 'set -e
+P="PKG_PATH=https://cdn.openbsd.org/pub/OpenBSD/$(uname -r)/packages/$(uname -m)/"
+env $P pkg_add -I rust cmake gmake protobuf bash curl git >/tmp/pkg.log 2>&1 || { tail -20 /tmp/pkg.log; exit 1; }
+if ! find /usr/local -name "libclang*so*" 2>/dev/null | grep -q .; then
+  LLVM=$(env $P pkg_info -Q llvm 2>/dev/null | grep -E "^llvm-[0-9]" | sort -V | tail -1)
+  [ -n "$LLVM" ] || { echo "no llvm package found"; exit 1; }
+  echo "installing $LLVM"
+  env $P pkg_add -I "$LLVM" >>/tmp/pkg.log 2>&1 || { tail -20 /tmp/pkg.log; exit 1; }
+fi'
     fi
     cmd_ssh 'cargo --version; cmake --version | head -1; gmake --version 2>/dev/null | head -1; protoc --version 2>/dev/null'
 }
@@ -645,7 +657,8 @@ cmd_sync() {
 
 # aws-lc-sys の bindgen が libclang を要求するため、VM 内での LIBCLANG_PATH を解決する
 _guest_env_prefix() {
-    local pre='LIBCLANG_PATH=$(find /usr/local -name libclang.so\* 2>/dev/null | head -1 | xargs dirname)'
+    # bindgen 用。OpenBSD は /usr/local/llvmNN/lib、FreeBSD は /usr/local/llvm-NN/lib に入る。
+    local pre='LIBCLANG_PATH=$(find /usr/local -name "libclang.so*" 2>/dev/null | head -1 | xargs dirname)'
     if [[ "${OS_NAME}" == "openbsd" ]]; then
         # OpenBSD は autoinstall の auto layout で `/` が ~628M しかなく、既定の
         # CARGO_HOME（/root/.cargo）にレジストリを展開すると溢れる。
