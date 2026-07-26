@@ -111,10 +111,13 @@ io_uring（独自実装ランタイム）と rustls を使用した高性能リ�
   `tests/e2e_setup.sh test` → バイナリ取得までを一括で扱う（x86_64 ゲストはホストに
   `/dev/kvm` があれば KVM 加速される）。tar.gz + rc.d/jail.conf のパッケージングは
   `packaging/scripts/build-bsd.sh` 参照。
-  **`x86_64-unknown-freebsd` は Docker クロスビルドも可能**（`docker/Dockerfile.freebsd`。
-  zig が FreeBSD libc を同梱しており Rust Tier 2 のため）。その場合 VM は E2E 実行のみに
-  使う（`tools/qemu/bsd-vm.sh freebsd x86_64 e2e --prebuilt <バイナリ>`）。
-  `aarch64-unknown-freebsd` は Rust Tier 3（prebuilt std 無し）のため VM 内ビルド必須。
+  `x86_64-unknown-freebsd` 向けに `docker/Dockerfile.freebsd` を用意しているが
+  （zig が FreeBSD libc を同梱しており Rust Tier 2）、**現在リンク段で失敗する**。
+  aws-lc-sys の s2n-bignum アセンブリが FreeBSD クロス構成で 1 つも組み立てられず
+  `undefined symbol: curve25519_x25519_byte` などが多数出るため
+  （`docs/backlog/bugs/B-49-...`、未解決）。解決するまで FreeBSD は x86_64 / aarch64 とも
+  VM 内ネイティブビルドを使う。`aarch64-unknown-freebsd` は Rust Tier 3
+  （prebuilt std 無し）のため、いずれにせよ VM 内ビルド必須。
 - **FreeBSD POSIX AIO（`--features aio`、F-127）**: ビルド時オプトイン切替（FreeBSD 専用。
   他ターゲットで指定すると `epoll` と同様 build.rs がエラーにする）。既定の kqueue
   readiness 経路の代わりに `TcpStream::read`/`write` を `aio_read(2)`/`aio_write(2)` の

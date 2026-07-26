@@ -39,7 +39,7 @@ cargo には**ターゲット別の環境変数設定が存在しない**（`[ta
 |---|---|---|
 | `Dockerfile.macos` | `universal2-apple-darwin`（x86_64 + aarch64 fat） | `messense/cargo-zigbuild` |
 | `Dockerfile.windows` | `x86_64-pc-windows-msvc` / `aarch64-pc-windows-msvc` | `messense/cargo-xwin` |
-| `Dockerfile.freebsd` | `x86_64-unknown-freebsd` | `messense/cargo-zigbuild` |
+| `Dockerfile.freebsd` | `x86_64-unknown-freebsd` ※**現在リンクに失敗（B-49）** | `messense/cargo-zigbuild` |
 
 いずれもランタイムステージを持たない（生成物を Linux コンテナで実行できないため）。
 最終ステージ `artifact` は scratch にバイナリだけを置くので、`--output type=local` で
@@ -56,8 +56,10 @@ docker build -f Dockerfile.windows --target artifact \
 通常は `packaging/scripts/build-cross.sh --target {macos|windows|freebsd}` から
 呼び出す（tar.gz / zip 化まで行う）。
 
-`aarch64-unknown-freebsd` は Rust Tier 3（prebuilt std 無し）のため Docker では扱わず、
-`tools/qemu/bsd-vm.sh freebsd aarch64 build` で VM 内ネイティブビルドする。
+**FreeBSD は現在 Docker クロスビルドが通らない**（B-49: aws-lc-sys の s2n-bignum
+アセンブリが組み立てられずリンクエラー）。`aarch64-unknown-freebsd` はそもそも
+Rust Tier 3（prebuilt std 無し）で Docker では扱えない。FreeBSD は x86_64 / aarch64 とも
+`tools/qemu/bsd-vm.sh freebsd <arch> build` の VM 内ネイティブビルドを使う。
 OpenBSD も同様に `tools/qemu/bsd-vm.sh openbsd {x86_64,aarch64}` を使う。
 
 ### aarch64-unknown-linux クロスビルド（F-120 Phase 3）

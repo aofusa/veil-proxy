@@ -61,17 +61,37 @@ $ nm f.o
 0000000000000000 T bignum_madd_n25519      # ← linux ターゲットと同一に定義される
 ```
 
-## 修正
+## 試したこと（いずれも解決せず）
 
-`docker/Dockerfile.freebsd` で **cc ビルダを明示的に強制**する。
+| 試行 | 結果 |
+|---|---|
+| `AWS_LC_SYS_CMAKE_BUILDER=0`（cc ビルダを強制） | **不可**。`panicked: "cc_builder for libssl not supported"`。veil は quiche とシンボルを共有するため `aws-lc-sys = { features = ["ssl"] }` が必須で、cc ビルダは libssl を作れない |
+| `CMAKE_SYSTEM_NAME=FreeBSD` を外し cmake-rs に TARGET から導出させる | **効果なし**。同じ undefined symbol 群で失敗 |
+| `AWS_LC_SYS_NO_ASM=1` | **不可**。aws-lc-sys が `AWS_LC_SYS_NO_ASM only allowed for debug builds!` で panic する（release ビルドでは使えない） |
 
-```dockerfile
-ENV AWS_LC_SYS_CMAKE_BUILDER=0
-```
+補足: 未定義シンボルには `curve25519_x25519_byte` のように
+`builder/cc_builder/linux_x86_64.rs` の一覧に**そもそも載っていない**（arm 側にしか
+`.S` が無い）ものも含まれる。つまり「x86_64 用 asm が組み立てられなかった」だけでなく、
+FreeBSD ターゲットでの C 側のコード選択と aws-lc-sys が用意する asm の対応自体が
+噛み合っていない可能性が高い。aws-lc-sys 側の対応が要る。
 
-`get_builder` は `AWS_LC_SYS_CMAKE_BUILDER` が明示指定されていればその値に従う
-（`Some(false)` → cc ビルダ）ため、cmake へのフォールバックを回避できる。
-cc ビルダは `cc` クレート経由で `.S` を `zig cc` に渡すので正しく組み立てられる。
+## 状態: 未解決（保留）
+
+`x86_64-unknown-freebsd` の **Docker クロスビルドは現状できない**。
+`docker/Dockerfile.freebsd` と `packaging/scripts/build-cross.sh --target freebsd` は
+残してあるが、実行すると上記のリンクエラーで失敗する（スクリプト冒頭で警告を出す）。
+
+**FreeBSD の公式なビルド経路は QEMU VM 内のネイティブビルド**
+（`tools/qemu/bsd-vm.sh freebsd {x86_64,aarch64} build`）であり、そちらは
+ネイティブ clang が `.S` を組み立てるため本問題の影響を受けない。
+
+### 次に試す価値がある案
+
+- aws-lc-sys を新しめのバージョンへ上げて FreeBSD クロス対応の改善を確認する。
+- cmake ビルダへ明示的に `-DCMAKE_ASM_COMPILER` / `enable_language(ASM)` 相当を
+  渡せるか（`AWS_LC_SYS_CMAKE_*` 系の追加 env）を調べる。
+- FreeBSD の base.txz から sysroot を用意し、zig ではなくネイティブ clang +
+  `--sysroot` でクロスする（cmake のアーキ判定が素直に通る可能性）。
 
 ## 影響範囲
 

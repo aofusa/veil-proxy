@@ -7,6 +7,9 @@
 #   macos    universal2-apple-darwin（x86_64 + aarch64 fat binary） / cargo-zigbuild
 #   windows  x86_64-pc-windows-msvc + aarch64-pc-windows-msvc      / cargo-xwin
 #   freebsd  x86_64-unknown-freebsd                                 / cargo-zigbuild
+#            ※ B-49 により**現在ビルドが通らない**（aws-lc-sys の s2n-bignum asm が
+#              FreeBSD クロスで組み立てられずリンクに失敗する）。FreeBSD は
+#              tools/qemu/bsd-vm.sh の VM 内ネイティブビルドを使うこと。
 #
 # BSD 向けは `full` ではなく `full-freebsd`（jemalloc + POSIX AIO）を既定にする。
 # OpenBSD（VM ネイティブビルド）は `full-openbsd`（システムアロケータ）を使う。
@@ -17,10 +20,10 @@
 #
 # macOS / Windows は QEMU 実行・実機検証を本スクリプトでは行わない
 # （クロスビルドが通ることのみを検証する。docs/artifacts/f125_windows_macos_design.md）。
-# FreeBSD x86_64 は生成したバイナリを QEMU VM へ渡して E2E できる:
-#   tools/qemu/bsd-vm.sh freebsd x86_64 e2e --prebuilt packaging/build/artifact-x86_64-unknown-freebsd/veil
-# aarch64-unknown-freebsd は Rust Tier 3（prebuilt std 無し）のため QEMU VM 内
-# ネイティブビルド（tools/qemu/bsd-vm.sh freebsd aarch64 build）を使う。
+# FreeBSD は x86_64 / aarch64 とも QEMU VM 内ネイティブビルドが公式経路:
+#   tools/qemu/bsd-vm.sh freebsd <arch> build → e2e → fetch
+# （B-49 が解決すれば x86_64 は Docker クロスビルド + VM で E2E だけ、にできる:
+#   tools/qemu/bsd-vm.sh freebsd x86_64 e2e --prebuilt <クロスビルドした veil>）
 #
 # 使い方:
 #   ./packaging/scripts/build-cross.sh --target macos
@@ -253,6 +256,23 @@ build_windows() {
 # prebuilt std があるため Docker だけで完結する（aarch64 は Tier 3 のため QEMU ネイティブ）。
 # 生成物は tools/qemu/bsd-vm.sh の `e2e --prebuilt` で実 FreeBSD 上の E2E に掛けられる。
 build_freebsd() {
+    cat >&2 <<'WARN'
+!! WARNING: FreeBSD の Docker クロスビルドは現在ビルドが通りません（B-49、未解決）。
+!!   aws-lc-sys の s2n-bignum アセンブリが FreeBSD クロス構成で組み立てられず、
+!!   リンク段で `undefined symbol: curve25519_x25519_byte` などが多数発生します。
+!!   詳細と試行済みの回避策:
+!!     docs/backlog/bugs/B-49-awslc-freebsd-cross-missing-s2n-bignum-asm.md
+!!
+!! FreeBSD の公式なビルド経路は QEMU VM 内のネイティブビルドです:
+!!   tools/qemu/bsd-vm.sh freebsd x86_64 build   # amd64
+!!   tools/qemu/bsd-vm.sh freebsd aarch64 build  # arm64（Rust Tier 3 のため VM 必須）
+!!   tools/qemu/bsd-vm.sh freebsd <arch> fetch   # → packaging/build/veil-freebsd-<arch>
+!!   ./packaging/scripts/build-bsd.sh --os freebsd --arch <arch> --binary <上記>
+!!
+!! それでも続行する場合は 5 秒後に開始します（Ctrl-C で中断）。
+WARN
+    sleep 5
+
     local features="${CARGO_FEATURES:-${DEFAULT_FREEBSD_FEATURES}}"
     local rust_target="x86_64-unknown-freebsd"
     local archive_name="veil-${VERSION}-${rust_target}.tar.gz"

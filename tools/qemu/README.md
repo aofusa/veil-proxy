@@ -69,10 +69,14 @@ tools/qemu/bsd-vm.sh freebsd x86_64 down
   --os-version "$(cat packaging/build/veil-freebsd-x86_64.os-version)"
 ```
 
-### FreeBSD x86_64 は Docker クロスビルドでも良い
+### FreeBSD x86_64 の Docker クロスビルドは現在使えない（B-49）
 
-Zig が FreeBSD の libc を同梱しており `x86_64-unknown-freebsd` は Rust Tier 2 なので、
-`docker/Dockerfile.freebsd` でクロスビルドしてから VM では **E2E だけ**回せる
+Zig が FreeBSD の libc を同梱しており `x86_64-unknown-freebsd` は Rust Tier 2 なので
+`docker/Dockerfile.freebsd` を用意してあるが、**aws-lc-sys の s2n-bignum アセンブリが
+FreeBSD クロス構成で組み立てられず、リンク段で失敗する**（B-49、未解決）。
+当面は x86_64 も上記の VM 内ネイティブビルドを使うこと。
+
+B-49 が解決すれば、クロスビルドしてから VM では **E2E だけ**回す運用にできる
 （VM 内フルビルドを省ける）。
 
 ```bash

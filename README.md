@@ -109,11 +109,13 @@ hot-path cost). The default is unchanged (Linux io_uring).
 - **FreeBSD/OpenBSD** are built inside a matching QEMU VM — `tools/qemu/bsd-vm.sh <os> <arch>`
   covers FreeBSD/OpenBSD × x86_64/aarch64 (setup → build → `tests/e2e_setup.sh test` →
   fetch the binary), and `packaging/scripts/build-bsd.sh` turns the binary into a tar.gz with
-  rc.d/jail.conf. **`x86_64-unknown-freebsd` can also be cross-built with Docker**
-  (`docker/Dockerfile.freebsd`; zig bundles FreeBSD libc and the target is Rust Tier 2), in
-  which case the VM is only used to run the E2E suite
-  (`tools/qemu/bsd-vm.sh freebsd x86_64 e2e --prebuilt <binary>`).
-  `aarch64-unknown-freebsd` is Rust Tier 3 (no prebuilt std) and must be built in the VM.
+  rc.d/jail.conf. A `docker/Dockerfile.freebsd` exists for `x86_64-unknown-freebsd`
+  (zig bundles FreeBSD libc and the target is Rust Tier 2), but it **currently fails at link
+  time** — `aws-lc-sys` assembles none of its s2n-bignum `.S` files under a FreeBSD cross
+  configuration, producing many `undefined symbol: curve25519_x25519_byte`-style errors
+  (see `docs/backlog/bugs/B-49-...`, unresolved). Until that is fixed, build FreeBSD in the
+  VM for both architectures. `aarch64-unknown-freebsd` is Rust Tier 3 (no prebuilt std) and
+  must be built in the VM regardless.
 - **FreeBSD POSIX AIO (`--features aio`, F-127)**: opt-in build-time switch (FreeBSD only;
   build.rs panics on other targets, same pattern as `epoll`). Replaces the default kqueue
   readiness `TcpStream::read`/`write` with `aio_read(2)`/`aio_write(2)` completion-based I/O,

@@ -56,18 +56,17 @@ RUN ZL="$(dirname "$(readlink -f "$(command -v zig)")")/lib" \
     && cp -a "$ZL/libc/include/x86_64-freebsd-none" /zig-freebsd-includes/ \
     && ls /zig-freebsd-includes
 
-# AWS_LC_SYS_CMAKE_BUILDER=0: aws-lc-sys に **cc ベースのビルダ**を強制する（B-49）。
-# 既定では `bindgen` フィーチャー有効時に cmake ビルダが選ばれるが、FreeBSD への
-# クロスビルドでは cmake が ASM 言語を有効化できず s2n-bignum の `.S`
-# （curve25519 / edwards25519 / bignum_*）が 1 つも組み立てられない。
-# 一方 aws-lc の C 側は FreeBSD でも `OPENSSL_FREEBSD` により
-# `CURVE25519_S2N_BIGNUM_CAPABLE` を立ててこれらを呼ぶため、リンク時に
-# `undefined symbol: curve25519_x25519_byte` などが多数出る。
-# cc ビルダは cc クレート経由で `zig cc` に `.S` を渡すため正しく組み立てられる
-# （`zig cc -target x86_64-freebsd-none` が該当シンボルを定義することを実測で確認済み）。
-ENV CMAKE_SYSTEM_NAME=FreeBSD \
-    AWS_LC_SYS_CMAKE_BUILDER=0 \
-    BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_freebsd="--target=x86_64-unknown-freebsd -isystem /zig-freebsd-includes/x86_64-freebsd-none -isystem /zig-freebsd-includes/generic-freebsd"
+# CMAKE_SYSTEM_NAME は **あえて設定しない**（B-49）。
+# aws-lc-sys は cmake ビルダを使う（`ssl` フィーチャーが必要で、cc ビルダは
+# "cc_builder for libssl not supported" になるため cmake 一択）。その cmake 設定は
+# cmake-rs が TARGET から CMAKE_SYSTEM_NAME と **CMAKE_SYSTEM_PROCESSOR** を
+# 揃えて導出する。ここで CMAKE_SYSTEM_NAME だけを手で与えると PROCESSOR が
+# 伴わず、aws-lc の CMakeLists がアーキテクチャを判定できずアセンブリを無効化し、
+# s2n-bignum の `.S`（curve25519 / edwards25519 / bignum_*）が 1 つも組み立てられない。
+# 一方 aws-lc の C 側は `OPENSSL_FREEBSD` により `CURVE25519_S2N_BIGNUM_CAPABLE` を
+# 立ててこれらを呼ぶため、リンク時に `undefined symbol: curve25519_x25519_byte` などが
+# 多数出る。導出を cmake-rs に任せることで整合させる。
+ENV BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_freebsd="--target=x86_64-unknown-freebsd -isystem /zig-freebsd-includes/x86_64-freebsd-none -isystem /zig-freebsd-includes/generic-freebsd"
 
 # ==========================================
 # 2. 依存ライブラリの事前ビルドステージ

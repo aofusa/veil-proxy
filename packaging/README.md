@@ -168,18 +168,30 @@ FreeBSD 専用 I/O 経路だけが異なる**。cargo にはターゲット別�
 通常の `cargo build --features full` の挙動は従来どおり（mimalloc・AIO 無効）で変わらない。
 `CARGO_FEATURES` 環境変数で上書きもできる。
 
-**FreeBSD x86_64 は Docker クロスビルドも可能**（`docker/Dockerfile.freebsd`、
-`cargo-zigbuild` が FreeBSD libc を同梱しており `x86_64-unknown-freebsd` は Rust Tier 2）。
-VM 内フルビルドを省いて E2E だけ VM で回せる:
+> **FreeBSD の Docker クロスビルドは現在通りません（B-49、未解決）**
+>
+> `docker/Dockerfile.freebsd` と `build-cross.sh --target freebsd` は用意してあり、
+> Rust のコンパイルまでは通る（`cargo-zigbuild` は FreeBSD libc を同梱し
+> `x86_64-unknown-freebsd` は Rust Tier 2）が、**リンク段で失敗する**。
+> aws-lc-sys の s2n-bignum アセンブリが FreeBSD クロス構成で 1 つも組み立てられず、
+> `undefined symbol: curve25519_x25519_byte` などが多数出る。
+> cc ビルダ強制（libssl 非対応）・`CMAKE_SYSTEM_NAME` の調整・`AWS_LC_SYS_NO_ASM`
+> （release では禁止）をいずれも試したが未解決で、aws-lc-sys 側の対応が要る。
+> 詳細は [B-49](../docs/backlog/bugs/B-49-awslc-freebsd-cross-missing-s2n-bignum-asm.md)。
+>
+> **FreeBSD は x86_64 / aarch64 とも上記の QEMU VM 内ネイティブビルドを使うこと**
+> （VM 内はネイティブ clang が `.S` を組み立てるため本問題の影響を受けない）。
+> B-49 が解決すれば、x86_64 は Docker クロスビルド + VM で E2E だけ、という運用に
+> 切り替えられる:
+>
+> ```bash
+> ./packaging/scripts/build-cross.sh --target freebsd
+> tools/qemu/bsd-vm.sh freebsd x86_64 e2e \
+>   --prebuilt packaging/build/artifact-x86_64-unknown-freebsd/veil
+> ```
 
-```bash
-./packaging/scripts/build-cross.sh --target freebsd
-tools/qemu/bsd-vm.sh freebsd x86_64 e2e \
-  --prebuilt packaging/build/artifact-x86_64-unknown-freebsd/veil
-```
-
-`aarch64-unknown-freebsd` は Rust Tier 3（prebuilt std 無し）のため VM 内ネイティブ
-ビルドのみ。
+`aarch64-unknown-freebsd` は Rust Tier 3（prebuilt std 無し）のため、B-49 の解決有無に
+かかわらず VM 内ネイティブビルドのみ。
 
 tar.gz には `veil` バイナリ・`rc.d/veil`（サービススクリプト）・`config.toml.default`・
 `www/index.html`・`INSTALL.txt`・`BUILD_INFO.txt`（+ FreeBSD は `jail.conf.sample`）を
@@ -268,7 +280,7 @@ packaging/output/veil-<version>-x86_64-unknown-linux-gnu.tar.gz
 packaging/output/veil-<version>-x86_64-unknown-linux-musl.tar.gz
 packaging/output/veil-<version>-<arch>-unknown-freebsd.tar.gz   # build-bsd.sh
 packaging/output/veil-<version>-<arch>-unknown-openbsd.tar.gz   # build-bsd.sh
-packaging/output/veil-<version>-x86_64-unknown-freebsd.tar.gz   # build-cross.sh --target freebsd
+packaging/output/veil-<version>-x86_64-unknown-freebsd.tar.gz   # build-cross.sh --target freebsd（B-49 により現在失敗）
 packaging/output/veil-<version>-universal2-apple-darwin.tar.gz # build-cross.sh --target macos
 packaging/output/veil-<version>-x86_64-pc-windows-msvc.zip      # build-cross.sh --target windows
 packaging/output/veil-<version>-aarch64-pc-windows-msvc.zip     # build-cross.sh --target windows
