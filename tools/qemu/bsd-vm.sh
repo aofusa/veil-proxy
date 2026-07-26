@@ -581,13 +581,16 @@ cmd_toolchain() {
     if [[ "${OS_NAME}" == "freebsd" ]]; then
         # gmake は tikv-jemalloc-sys（`full-freebsd` の jemalloc）のビルドに必須。
         # 無いと `failed to execute command: No such file or directory` で落ちる。
-        log "pkg install rust cmake llvm gmake bash curl nasm git pkgconf"
-        cmd_ssh 'env IGNORE_OSVERSION=yes ASSUME_ALWAYS_YES=yes pkg install -y rust cmake llvm gmake bash curl nasm git pkgconf >/tmp/pkg.log 2>&1 || { tail -20 /tmp/pkg.log; exit 1; }'
+        # gmake  : tikv-jemalloc-sys（`full-freebsd` の jemalloc）のビルドに必須
+        # protobuf: tests/grpc_server の prost-build が protoc を要求する（E2E に必要）
+        log "pkg install rust cmake llvm gmake protobuf bash curl nasm git pkgconf"
+        cmd_ssh 'env IGNORE_OSVERSION=yes ASSUME_ALWAYS_YES=yes pkg install -y rust cmake llvm gmake protobuf bash curl nasm git pkgconf >/tmp/pkg.log 2>&1 || { tail -20 /tmp/pkg.log; exit 1; }'
     else
-        log "pkg_add rust cmake llvm bash curl"
-        cmd_ssh 'PKG_PATH=https://cdn.openbsd.org/pub/OpenBSD/$(uname -r)/packages/$(uname -m)/ pkg_add -I rust cmake llvm bash curl git >/tmp/pkg.log 2>&1 || { tail -20 /tmp/pkg.log; exit 1; }'
+        # OpenBSD も同様に protobuf（protoc）と gmake が要る
+        log "pkg_add rust cmake llvm gmake protobuf bash curl git"
+        cmd_ssh 'PKG_PATH=https://cdn.openbsd.org/pub/OpenBSD/$(uname -r)/packages/$(uname -m)/ pkg_add -I rust cmake llvm gmake protobuf bash curl git >/tmp/pkg.log 2>&1 || { tail -20 /tmp/pkg.log; exit 1; }'
     fi
-    cmd_ssh 'cargo --version; cmake --version | head -1; gmake --version 2>/dev/null | head -1'
+    cmd_ssh 'cargo --version; cmake --version | head -1; gmake --version 2>/dev/null | head -1; protoc --version 2>/dev/null'
 }
 
 cmd_sync() {
