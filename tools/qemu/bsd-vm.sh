@@ -628,6 +628,17 @@ chmod +x /usr/local/bin/veil-cc'
         # `pkg_add -I`（非対話）で指定すると**黙って入らない**。
         # bindgen（aws-lc-rs / boring-sys）が libclang を要求するので、
         # 利用可能な llvm から 1 つを選んで明示的に入れる。
+        # boring-sys は非 Apple ターゲットで `-lstdc++` を要求するが、OpenBSD の
+        # C++ 標準ライブラリは **libc++**（libstdc++ は存在しない）。
+        # /usr/local/lib に libstdc++.so → libc++.so.N の互換リンクを置き、
+        # ビルド時に `-L/usr/local/lib` を渡して解決する。
+        log "libstdc++ → libc++ 互換リンクを設置（boring-sys の -lstdc++ 対策）"
+        cmd_ssh 'set -e
+mkdir -p /usr/local/lib
+LIBCXX=$(ls -1 /usr/lib/libc++.so.* 2>/dev/null | sort -V | tail -1)
+[ -n "$LIBCXX" ] || { echo "libc++ not found"; exit 1; }
+ln -sf "$LIBCXX" /usr/local/lib/libstdc++.so
+ls -l /usr/local/lib/libstdc++.so'
         log "pkg_add rust cmake gmake protobuf bash curl git + llvm（バージョン明示）"
         cmd_ssh 'set -e
 P="PKG_PATH=https://cdn.openbsd.org/pub/OpenBSD/$(uname -r)/packages/$(uname -m)/"
@@ -675,6 +686,13 @@ _guest_env_prefix() {
         # cc ラッパ（toolchain で設置）を CC として使う。
         pre="${pre} CC_x86_64_unknown_openbsd=/usr/local/bin/veil-cc"
         pre="${pre} CC_aarch64_unknown_openbsd=/usr/local/bin/veil-cc"
+        # bindgen は cc ラッパを経由せず自前の clang でヘッダを解析するため、
+        # 同じ `-include pthread.h` を bindgen 側にも渡す必要がある
+        # （C ビルドが通っても bindgen が同じ thread.h:81 で落ちる）。
+        pre="${pre} BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_openbsd='-include pthread.h'"
+        pre="${pre} BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_openbsd='-include pthread.h'"
+        # 上記 libstdc++ 互換リンクを見つけさせる
+        pre="${pre} RUSTFLAGS='-L /usr/local/lib'"
     fi
     echo "${pre}"
 }
