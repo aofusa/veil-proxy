@@ -130,27 +130,40 @@ VM の作成からビルド・E2E・バイナリ取得までは
 あれば KVM 加速される）。
 
 ```bash
-# 例: FreeBSD amd64（setup 〜 fetch まで）
-tools/qemu/bsd-vm.sh freebsd x86_64 setup
-tools/qemu/bsd-vm.sh freebsd x86_64 up
-tools/qemu/bsd-vm.sh freebsd x86_64 grow
-tools/qemu/bsd-vm.sh freebsd x86_64 provision
-tools/qemu/bsd-vm.sh freebsd x86_64 wait
-tools/qemu/bsd-vm.sh freebsd x86_64 toolchain
-tools/qemu/bsd-vm.sh freebsd x86_64 build      # --features full
+# setup → provision → toolchain → build → e2e → fetch を一括
+# （4 通り: freebsd|openbsd × x86_64|aarch64。すべて同じ形）
+tools/qemu/bsd-vm.sh freebsd x86_64 all
+tools/qemu/bsd-vm.sh freebsd aarch64 all
+tools/qemu/bsd-vm.sh openbsd x86_64 all
+tools/qemu/bsd-vm.sh openbsd aarch64 all
+
+# 取り出したバイナリ（packaging/build/veil-<os>-<arch>）を tar.gz 化。
+# --from-qemu は .os-version も自動で拾うので --binary / --os-version は不要。
+./packaging/scripts/build-bsd.sh --os freebsd --arch x86_64 --from-qemu
+
+# 取得済みのものをまとめて（存在する組み合わせだけ処理する）
+./packaging/scripts/build-bsd.sh --all
+```
+
+段階を分けて実行することもできる（失敗時はその段階から再開できる）:
+
+```bash
+tools/qemu/bsd-vm.sh freebsd x86_64 setup      # イメージ取得 + シード/応答ファイル生成
+tools/qemu/bsd-vm.sh freebsd x86_64 provision  # SSH 鍵注入まで
+tools/qemu/bsd-vm.sh freebsd x86_64 toolchain  # rust / cmake / llvm / gmake / protobuf
+tools/qemu/bsd-vm.sh freebsd x86_64 build      # --no-default-features --features full-freebsd
 tools/qemu/bsd-vm.sh freebsd x86_64 e2e        # tests/e2e_setup.sh test
 tools/qemu/bsd-vm.sh freebsd x86_64 fetch      # → packaging/build/veil-freebsd-x86_64
-
-# 取り出したバイナリを tar.gz 化（--os-version でビルド OS バージョンを明記）
-./packaging/scripts/build-bsd.sh --os freebsd --arch x86_64 \
-  --binary packaging/build/veil-freebsd-x86_64 \
-  --os-version "$(cat packaging/build/veil-freebsd-x86_64.os-version)"
-./packaging/scripts/build-bsd.sh --os openbsd --arch x86_64 \
-  --binary packaging/build/veil-openbsd-x86_64 \
-  --os-version "$(cat packaging/build/veil-openbsd-x86_64.os-version)"
-# aarch64 も --arch aarch64 で同様
-# 対象 OS の VM 内で直接実行する場合は --os-version 省略で uname -r から自動検出される。
+tools/qemu/bsd-vm.sh freebsd x86_64 reset      # 初期状態へ（再ダウンロード不要）
 ```
+
+**所要時間の目安**（4 コア / KVM 有効ホスト）: x86_64 ゲストは KVM で加速されるため
+実用的で、FreeBSD amd64 の `full-freebsd` リリースビルドは**実測 約 30 分**。
+aarch64 ゲストは x86_64 ホストでは TCG なので数倍〜十数倍かかる。
+落とし穴と検証状況は [tools/qemu/README.md](../tools/qemu/README.md) に詳しくまとめてある。
+
+対象 OS の VM 内で `build-bsd.sh` を直接実行する場合は `--os-version` 省略で
+`uname -r` から自動検出される。
 
 ### BSD 向けの feature セット（`full-freebsd` / `full-openbsd`）
 
@@ -278,8 +291,10 @@ packaging/output/veil_<version>_<deb_arch>.deb          # deb_arch: amd64 / arm6
 packaging/output/veil-<version>-1.<rpm_arch>.rpm        # rpm_arch: x86_64 / aarch64
 packaging/output/veil-<version>-x86_64-unknown-linux-gnu.tar.gz
 packaging/output/veil-<version>-x86_64-unknown-linux-musl.tar.gz
-packaging/output/veil-<version>-<arch>-unknown-freebsd.tar.gz   # build-bsd.sh
-packaging/output/veil-<version>-<arch>-unknown-openbsd.tar.gz   # build-bsd.sh
+packaging/output/veil-<version>-x86_64-unknown-freebsd.tar.gz    # build-bsd.sh（QEMU VM ビルド）
+packaging/output/veil-<version>-aarch64-unknown-freebsd.tar.gz   # build-bsd.sh（QEMU VM ビルド）
+packaging/output/veil-<version>-x86_64-unknown-openbsd.tar.gz    # build-bsd.sh（QEMU VM ビルド）
+packaging/output/veil-<version>-aarch64-unknown-openbsd.tar.gz   # build-bsd.sh（QEMU VM ビルド）
 packaging/output/veil-<version>-x86_64-unknown-freebsd.tar.gz   # build-cross.sh --target freebsd（B-49 により現在失敗）
 packaging/output/veil-<version>-universal2-apple-darwin.tar.gz # build-cross.sh --target macos
 packaging/output/veil-<version>-x86_64-pc-windows-msvc.zip      # build-cross.sh --target windows
@@ -412,5 +427,6 @@ sudo tail -50 /var/log/veil/veil.error-*.log
 | [docker/Dockerfile.macos](../docker/Dockerfile.macos) | macOS universal2 クロスビルド（キャッシュ有効） |
 | [docker/Dockerfile.windows](../docker/Dockerfile.windows) | Windows x86_64/aarch64 クロスビルド（キャッシュ有効） |
 | [docker/Dockerfile.freebsd](../docker/Dockerfile.freebsd) | FreeBSD x86_64 クロスビルド（キャッシュ有効） |
-| [tools/qemu/bsd-vm.sh](../tools/qemu/README.md) | FreeBSD/OpenBSD × x86_64/aarch64 の VM ビルド・E2E・バイナリ取得 |
+| [tools/qemu/bsd-vm.sh](../tools/qemu/README.md) | FreeBSD/OpenBSD × x86_64/aarch64 の VM ビルド・E2E・バイナリ取得（`<os> <arch> all` で一括） |
+| [packaging/scripts/build-bsd.sh](scripts/build-bsd.sh) | 上記の取得物を tar.gz 化（`--from-qemu` / `--all`） |
 | [examples/config.toml](../examples/config.toml) | 設定リファレンス |
