@@ -124,7 +124,7 @@ tools/qemu/bsd-vm.sh freebsd x86_64 all
 | FreeBSD x86_64: `toolchain` | **成功**（cargo 1.96.1 / cmake 3.31.12 / GNU Make 4.4.1） |
 | FreeBSD x86_64: `build`（`full-freebsd`） | **成功**（29分42秒。http3(quiche+共有 aws-lc-sys) / jemalloc / **aio** を含む） |
 | FreeBSD x86_64: `fetch` → `build-bsd.sh` | **成功**（`veil-0.6.0-x86_64-unknown-freebsd.tar.gz` を生成） |
-| FreeBSD x86_64: `e2e` | 実行中 |
+| FreeBSD x86_64: `e2e` | **実行完了: 416 passed / 117 failed**。失敗は**全て HTTP/3**（QUIC の UDP ポートが bind されない = **B-50** として起票）。HTTP/1.1・HTTP/2・gRPC・WebSocket・L4 は通過 |
 | FreeBSD aarch64 | **未実行**（スクリプトは同経路で対応済み。TCG のため長時間） |
 | OpenBSD x86_64 / aarch64 | **未実行**（`openbsd-autoinstall.py` はインストーラの対話文言に依存するため追従が要る可能性がある） |
 | `linux-aarch64-e2e.sh` | **未実行**（KVM 非対応ホストでは TCG が実用不能） |
