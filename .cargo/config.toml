@@ -29,26 +29,34 @@
 #
 # 非接尾辞の `AWS_LC_SYS_NO_PREFIX` は**意図的に定義しない**。定義すると全ターゲットへ
 # 一律に適用され、ターゲット別の値と食い違ったときに原因が分かりにくくなるため。
+#
+# `force = true` にしている理由:
+#   (1) シェルに古い `AWS_LC_SYS_NO_PREFIX_*` が残っていてもターゲットに対して
+#       正しい値が必ず勝つようにする（B-47 の失敗モードそのものを防ぐ）。
+#   (2) 子ワークスペース（tests/test_backends・tests/grpc_server）の
+#       `.cargo/config.toml` が同じキーを**テーブル形式**で上書きするため、
+#       親も同じ形式にしておかないと cargo が
+#       「expected table, but found string」でマージに失敗する。
 
 [env]
 # --- Linux: quiche と aws-lc-rs で aws-lc-sys を共有する（非プレフィックス） ---
-AWS_LC_SYS_NO_PREFIX_x86_64_unknown_linux_gnu = "1"
-AWS_LC_SYS_NO_PREFIX_x86_64_unknown_linux_musl = "1"
-AWS_LC_SYS_NO_PREFIX_aarch64_unknown_linux_gnu = "1"
-AWS_LC_SYS_NO_PREFIX_aarch64_unknown_linux_musl = "1"
+AWS_LC_SYS_NO_PREFIX_x86_64_unknown_linux_gnu = { value = "1", force = true }
+AWS_LC_SYS_NO_PREFIX_x86_64_unknown_linux_musl = { value = "1", force = true }
+AWS_LC_SYS_NO_PREFIX_aarch64_unknown_linux_gnu = { value = "1", force = true }
+AWS_LC_SYS_NO_PREFIX_aarch64_unknown_linux_musl = { value = "1", force = true }
 
 # --- FreeBSD: Linux と同じく aws-lc-sys 共有 ---
-AWS_LC_SYS_NO_PREFIX_x86_64_unknown_freebsd = "1"
-AWS_LC_SYS_NO_PREFIX_aarch64_unknown_freebsd = "1"
+AWS_LC_SYS_NO_PREFIX_x86_64_unknown_freebsd = { value = "1", force = true }
+AWS_LC_SYS_NO_PREFIX_aarch64_unknown_freebsd = { value = "1", force = true }
 
 # --- Windows: quiche は内蔵 BoringSSL。aws-lc-sys はプレフィックス維持で共存 ---
-AWS_LC_SYS_NO_PREFIX_x86_64_pc_windows_msvc = "0"
-AWS_LC_SYS_NO_PREFIX_aarch64_pc_windows_msvc = "0"
+AWS_LC_SYS_NO_PREFIX_x86_64_pc_windows_msvc = { value = "0", force = true }
+AWS_LC_SYS_NO_PREFIX_aarch64_pc_windows_msvc = { value = "0", force = true }
 
 # --- macOS: quiche は内蔵 BoringSSL。universal2 は x86_64/aarch64 個別にビルドされる ---
-AWS_LC_SYS_NO_PREFIX_x86_64_apple_darwin = "0"
-AWS_LC_SYS_NO_PREFIX_aarch64_apple_darwin = "0"
+AWS_LC_SYS_NO_PREFIX_x86_64_apple_darwin = { value = "0", force = true }
+AWS_LC_SYS_NO_PREFIX_aarch64_apple_darwin = { value = "0", force = true }
 
 # --- OpenBSD: rustls=ring / quiche=内蔵 BoringSSL（aws-lc-sys は非依存） ---
-AWS_LC_SYS_NO_PREFIX_x86_64_unknown_openbsd = "0"
-AWS_LC_SYS_NO_PREFIX_aarch64_unknown_openbsd = "0"
+AWS_LC_SYS_NO_PREFIX_x86_64_unknown_openbsd = { value = "0", force = true }
+AWS_LC_SYS_NO_PREFIX_aarch64_unknown_openbsd = { value = "0", force = true }
