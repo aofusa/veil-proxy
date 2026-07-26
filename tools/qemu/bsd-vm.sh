@@ -129,6 +129,11 @@ SSH_USER="${SSH_USER:-root}"
 SSH_OPTS=(-i "${KEY}" -p "${SSH_PORT}"
   -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
   -o ConnectTimeout=90 -o ServerAliveInterval=20 -o LogLevel=ERROR)
+# scp のポート指定は **-P**（-p は「タイムスタンプを保持」で意味が違う）。
+# SSH_OPTS をそのまま渡すとポートが効かず 22 番へ繋ぎに行って失敗する。
+SCP_OPTS=(-i "${KEY}" -P "${SSH_PORT}"
+  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+  -o ConnectTimeout=90 -o ServerAliveInterval=20 -o LogLevel=ERROR)
 
 log() { echo "[${OS_NAME}-${ARCH}] $*" >&2; }
 die() { echo "[${OS_NAME}-${ARCH}] ERROR: $*" >&2; exit 1; }
@@ -547,7 +552,7 @@ PY
 # toolchain / sync / build / e2e / fetch
 # ---------------------------------------------------------------------------
 cmd_ssh() { ssh "${SSH_OPTS[@]}" "${SSH_USER}@127.0.0.1" "$@"; }
-cmd_scp() { scp "${SSH_OPTS[@]}" "$@"; }
+cmd_scp() { scp "${SCP_OPTS[@]}" "$@"; }
 
 # VM 内のリポジトリルート
 GUEST_ROOT="/root/veil-proxy"

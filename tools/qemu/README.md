@@ -114,8 +114,10 @@ tools/qemu/bsd-vm.sh freebsd x86_64 e2e \
 |---|---|
 | ゲストイメージ URL（FreeBSD amd64/arm64・OpenBSD 7.9 amd64/arm64） | **HTTP 200 を確認済み** |
 | FreeBSD amd64: `setup` → `up` → `provision` | **成功**（SSH 鍵認証で `FreeBSD 14.3-RELEASE-p16` へ到達） |
-| FreeBSD amd64: `toolchain` | **成功**（cargo 1.96.1 / cmake 3.31.12） |
-| FreeBSD amd64: `build` / `e2e` / `fetch` | 実行中・順次確認 |
+| FreeBSD amd64: `toolchain` | **成功**（cargo 1.96.1 / cmake 3.31.12 / GNU Make 4.4.1） |
+| FreeBSD amd64: `build`（`--no-default-features --features full-freebsd`） | **成功**（29分42秒。http3(quiche+共有 aws-lc-sys) / jemalloc / **aio** を含む。生成物は `ELF 64-bit LSB pie executable, x86-64, for FreeBSD 14.3`） |
+| FreeBSD amd64: `fetch` → `build-bsd.sh` | **成功**（`packaging/output/veil-0.6.0-x86_64-unknown-freebsd.tar.gz` を生成） |
+| FreeBSD amd64: `e2e` | 未実行（VM 内で test_backends / grpc_server / E2E テストのビルドが要るため追加で時間がかかる） |
 | FreeBSD aarch64 | 未実行（同じ経路のはずだが TCG のため低速） |
 | OpenBSD（`openbsd-autoinstall.py`） | **未実行**。インストーラの対話文言に依存するため追従が要る可能性が高い |
 | `linux-aarch64-e2e.sh` | **未実行**（KVM 非対応ホストでは TCG が実用不能） |
