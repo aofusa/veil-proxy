@@ -17,9 +17,9 @@
 //! - プロキシ機能（HTTPSバックエンドへのプロトコル変換）
 //! - ファイル配信、リダイレクト、メトリクス
 
+use crate::runtime::handle::AsRawFd;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
-use crate::runtime::handle::AsRawFd;
 // CString / AsRawFd / FromRawFd は memfd 経由の証明書リロード（Linux / FreeBSD）でのみ
 // 使用する。OpenBSD は一時ファイルフォールバックのため不要（`create_memfd_for_pem` 参照）。
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -2822,8 +2822,8 @@ pub(crate) async fn proxy_to_backend_async_with_tls(
     timeout_secs: u64,
     tls_insecure: bool,
 ) -> io::Result<BackendProxyResult> {
-    use crate::runtime::tcp::TcpStream;
     use crate::runtime::handle::AsRawFd;
+    use crate::runtime::tcp::TcpStream;
 
     let addr = format!("{}:{}", target.host, target.port);
     debug!("[HTTP/3] Async connecting to backend {}", addr);
@@ -3179,7 +3179,13 @@ async fn proxy_to_tls_backend_async(
 
 #[inline]
 fn read_nonblocking(fd: crate::runtime::handle::RawFd, buf: &mut [u8]) -> io::Result<usize> {
-    let result = unsafe { libc::read(fd as libc::c_int, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as _) };
+    let result = unsafe {
+        libc::read(
+            fd as libc::c_int,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len() as _,
+        )
+    };
     if result < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -3189,7 +3195,13 @@ fn read_nonblocking(fd: crate::runtime::handle::RawFd, buf: &mut [u8]) -> io::Re
 
 #[inline]
 fn write_nonblocking(fd: crate::runtime::handle::RawFd, buf: &[u8]) -> io::Result<usize> {
-    let result = unsafe { libc::write(fd as libc::c_int, buf.as_ptr() as *const libc::c_void, buf.len() as _) };
+    let result = unsafe {
+        libc::write(
+            fd as libc::c_int,
+            buf.as_ptr() as *const libc::c_void,
+            buf.len() as _,
+        )
+    };
     if result < 0 {
         Err(io::Error::last_os_error())
     } else {

@@ -1,41 +1,54 @@
-# http3/quiche の AWS_LC_SYS_NO_PREFIX をターゲットトリプル別に適用
-# Linux / FreeBSD: quiche と aws-lc-rs で同一 aws-lc-sys を共有するため AWS_LC_SYS_NO_PREFIX=1
-[target.x86_64-unknown-linux-gnu.env]
-AWS_LC_SYS_NO_PREFIX = "1"
+# http3/quiche 向け AWS_LC_SYS_NO_PREFIX のターゲットトリプル別設定（B-47 / F-131）
+#
+# 背景:
+#   `http3` フィーチャーは quiche を使う。quiche の暗号バックエンドはターゲットで異なる
+#   （Cargo.toml の target 別依存を参照）:
+#     - linux / freebsd        : quiche(default-features=false) が rustls(aws-lc-rs) と
+#                                同一の aws-lc-sys を共有する。quiche は BoringSSL 互換の
+#                                **非プレフィックス**シンボルを要求するため NO_PREFIX=1。
+#     - windows / macos        : quiche(boring) が内蔵 BoringSSL を持つ。aws-lc-rs と
+#                                共存させるには aws-lc-sys 側のシンボルを**プレフィックス
+#                                したまま**にする必要があるため NO_PREFIX=0
+#                                （0 のままにしないと BoringSSL とシンボルが衝突する）。
+#     - openbsd                : rustls は ring、quiche は内蔵 BoringSSL。aws-lc-sys は
+#                                依存グラフに現れないが、一貫性のため NO_PREFIX=0 とする。
+#
+# なぜ `[env]` にターゲット接尾辞付きの変数名を並べるのか:
+#   cargo には**ターゲット別の環境変数設定が存在しない**。`[target.<triple>.env]` は
+#   cargo が認識しないキーであり、**警告もなく黙って無視される**（実際にこれが原因で
+#   クロスビルドが失敗していた）。一方 aws-lc-sys のビルドスクリプトは
+#   `AWS_LC_SYS_<NAME>_<target_with_underscores>` 形式のターゲット別変数を
+#   非接尾辞版より優先して読む（aws-lc-sys builder/main.rs の
+#   `optional_env_crate_target` / `env_name_for_target`）。
+#   そこで cargo のグローバル `[env]` にターゲット接尾辞付きの名前を列挙することで、
+#   ビルド方法（ローカル cargo / cargo zigbuild / cargo xwin / Docker / QEMU VM 内）に
+#   依らず、`--target` で選ばれたトリプルに応じた値が確実に渡るようにする。
+#
+#   接尾辞はトリプルの `-` を `_` に置換したもの。値 "1"/"0" は aws-lc-sys の
+#   `parse_to_bool`（先頭文字 0/n/off/f を false、数字/y/on/t を true）で解釈される。
+#
+# 非接尾辞の `AWS_LC_SYS_NO_PREFIX` は**意図的に定義しない**。定義すると全ターゲットへ
+# 一律に適用され、ターゲット別の値と食い違ったときに原因が分かりにくくなるため。
 
-[target.x86_64-unknown-linux-musl.env]
-AWS_LC_SYS_NO_PREFIX = "1"
+[env]
+# --- Linux: quiche と aws-lc-rs で aws-lc-sys を共有する（非プレフィックス） ---
+AWS_LC_SYS_NO_PREFIX_x86_64_unknown_linux_gnu = "1"
+AWS_LC_SYS_NO_PREFIX_x86_64_unknown_linux_musl = "1"
+AWS_LC_SYS_NO_PREFIX_aarch64_unknown_linux_gnu = "1"
+AWS_LC_SYS_NO_PREFIX_aarch64_unknown_linux_musl = "1"
 
-[target.aarch64-unknown-linux-gnu.env]
-AWS_LC_SYS_NO_PREFIX = "1"
+# --- FreeBSD: Linux と同じく aws-lc-sys 共有 ---
+AWS_LC_SYS_NO_PREFIX_x86_64_unknown_freebsd = "1"
+AWS_LC_SYS_NO_PREFIX_aarch64_unknown_freebsd = "1"
 
-[target.aarch64-unknown-linux-musl.env]
-AWS_LC_SYS_NO_PREFIX = "1"
+# --- Windows: quiche は内蔵 BoringSSL。aws-lc-sys はプレフィックス維持で共存 ---
+AWS_LC_SYS_NO_PREFIX_x86_64_pc_windows_msvc = "0"
+AWS_LC_SYS_NO_PREFIX_aarch64_pc_windows_msvc = "0"
 
-[target.x86_64-unknown-freebsd.env]
-AWS_LC_SYS_NO_PREFIX = "1"
+# --- macOS: quiche は内蔵 BoringSSL。universal2 は x86_64/aarch64 個別にビルドされる ---
+AWS_LC_SYS_NO_PREFIX_x86_64_apple_darwin = "0"
+AWS_LC_SYS_NO_PREFIX_aarch64_apple_darwin = "0"
 
-[target.aarch64-unknown-freebsd.env]
-AWS_LC_SYS_NO_PREFIX = "1"
-
-# Windows / macOS / OpenBSD: quiche 内蔵 BoringSSL (boring) と aws-lc-rs/ring の共存のため AWS_LC_SYS_NO_PREFIX=0
-[target.x86_64-pc-windows-msvc.env]
-AWS_LC_SYS_NO_PREFIX = "0"
-
-[target.aarch64-pc-windows-msvc.env]
-AWS_LC_SYS_NO_PREFIX = "0"
-
-[target.universal2-apple-darwin.env]
-AWS_LC_SYS_NO_PREFIX = "0"
-
-[target.x86_64-apple-darwin.env]
-AWS_LC_SYS_NO_PREFIX = "0"
-
-[target.aarch64-apple-darwin.env]
-AWS_LC_SYS_NO_PREFIX = "0"
-
-[target.x86_64-unknown-openbsd.env]
-AWS_LC_SYS_NO_PREFIX = "0"
-
-[target.aarch64-unknown-openbsd.env]
-AWS_LC_SYS_NO_PREFIX = "0"
+# --- OpenBSD: rustls=ring / quiche=内蔵 BoringSSL（aws-lc-sys は非依存） ---
+AWS_LC_SYS_NO_PREFIX_x86_64_unknown_openbsd = "0"
+AWS_LC_SYS_NO_PREFIX_aarch64_unknown_openbsd = "0"

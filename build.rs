@@ -1,10 +1,11 @@
 //! veil のビルドスクリプト。
 //!
-//! `http3` フィーチャー有効時、Linux / FreeBSD では quiche が要求する BoringSSL 互換（非プレフィックス）
-//! シンボルを rustls と共有するため `AWS_LC_SYS_NO_PREFIX=1` を適用する。
-//! （Windows / macOS / OpenBSD では quiche の内蔵 BoringSSL と aws-lc-rs/ring の共存のため `AWS_LC_SYS_NO_PREFIX=0` となる）
-//! libssl / libcrypto のリンクは aws-lc-sys（Linux/FreeBSD `http3` で `ssl` フィーチャー有効）が担う。
-
+//! `http3` フィーチャー有効時の `AWS_LC_SYS_NO_PREFIX` は **`.cargo/config.toml` の
+//! `[env]`（ターゲット接尾辞付きの変数名）が唯一の設定箇所**であり、ここでは扱わない。
+//! ビルドスクリプトの実行順序上、依存クレート（aws-lc-sys）のビルドスクリプトは
+//! 本スクリプトより**先に別プロセスとして**実行されるため、ここで
+//! `std::env::set_var` してもこれらへは一切伝播しない（B-47）。
+//! ターゲット別の値と理由は `.cargo/config.toml` のコメントを参照。
 //!
 //! F-120: クロスプラットフォーム対応（Phase 1）向けに、target_os / feature の
 //! 組み合わせから `veil_rt_uring` / `veil_rt_reactor` / `veil_poller_epoll` /
@@ -12,24 +13,12 @@
 //! 各所に散らばるのを防ぎ、`src/runtime/` 等はこれらのエイリアスのみを見ればよい。
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_HTTP3");
-    println!("cargo:rerun-if-env-changed=AWS_LC_SYS_NO_PREFIX");
-    println!("cargo:rerun-if-env-changed=VEIL_SSL_NO_PREFIX_BOOTSTRAP");
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_OS");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_EPOLL");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_KTLS");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_AIO");
 
     emit_runtime_backend_cfg();
-
-    if !feature_enabled("HTTP3") {
-        return;
-    }
-
-    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if target_os == "linux" || target_os == "freebsd" {
-        ensure_aws_lc_no_prefix();
-    }
 }
 
 fn feature_enabled(name: &str) -> bool {
@@ -130,13 +119,3 @@ fn emit_runtime_backend_cfg() {
         }
     }
 }
-
-/// quiche は BoringSSL 互換の非プレフィックスシンボルを要求する。
-/// Linux / FreeBSD で http3 フィーチャー有効時は `AWS_LC_SYS_NO_PREFIX=1` を補完する。
-fn ensure_aws_lc_no_prefix() {
-    if std::env::var("AWS_LC_SYS_NO_PREFIX").is_err() {
-        std::env::set_var("AWS_LC_SYS_NO_PREFIX", "1");
-    }
-}
-
-

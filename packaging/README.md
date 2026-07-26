@@ -24,7 +24,7 @@ packaging/
 ├── scripts/
 │   ├── build.sh                 # 統合ビルド（.deb + .rpm）
 │   ├── build-bsd.sh             # FreeBSD/OpenBSD tar.gz（VM ネイティブビルド）
-│   ├── build-cross.sh           # macOS universal2 tar.gz（Docker クロスビルド、F-125）
+│   ├── build-cross.sh           # macOS / Windows / FreeBSD tar.gz・zip（Docker クロスビルド）
 │   ├── test-install.sh          # 両パッケージを順に検証
 │   ├── test-deb.sh              # .deb 検証
 │   ├── test-rpm.sh              # .rpm 検証
@@ -120,18 +120,50 @@ RUST_TARGET=aarch64-unknown-linux-gnu ./packaging/scripts/build.sh --docker
 
 ### FreeBSD / OpenBSD 向けパッケージ（F-120 Phase 6）
 
-FreeBSD/OpenBSD は Rust Tier 2/3 かつクロスビルドが困難なため、バイナリは
-**QEMU VM 内でネイティブビルド**したものを取り出し、専用スクリプトで
-rc.d サービススクリプト・設定リファレンス・（FreeBSD は）jail.conf サンプルを
-同梱した tar.gz を生成する（deb/rpm は Linux 専用のため BSD は tar.gz のみ）。
+FreeBSD/OpenBSD のバイナリは **QEMU VM 内でネイティブビルド**したものを取り出し、
+専用スクリプトで rc.d サービススクリプト・設定リファレンス・（FreeBSD は）jail.conf
+サンプルを同梱した tar.gz を生成する（deb/rpm は Linux 専用のため BSD は tar.gz のみ）。
+
+VM の作成からビルド・E2E・バイナリ取得までは
+[`tools/qemu/bsd-vm.sh`](../tools/qemu/README.md) が **FreeBSD/OpenBSD × x86_64/aarch64
+の 4 通り**を同じインタフェースで面倒を見る（x86_64 ゲストはホストに `/dev/kvm` が
+あれば KVM 加速される）。
 
 ```bash
-# VM でビルドしたバイナリを host へ持ち出してから（--os-version でビルド OS バージョンを明記）:
-./packaging/scripts/build-bsd.sh --os freebsd --arch x86_64 --binary ./veil-freebsd-amd64 --os-version 14.3-RELEASE
-./packaging/scripts/build-bsd.sh --os openbsd --arch x86_64 --binary ./veil-openbsd-amd64 --os-version 7.6
-# aarch64 も --arch aarch64 で対応（VM 内 aarch64 ネイティブビルドが前提）
+# 例: FreeBSD amd64（setup 〜 fetch まで）
+tools/qemu/bsd-vm.sh freebsd x86_64 setup
+tools/qemu/bsd-vm.sh freebsd x86_64 up
+tools/qemu/bsd-vm.sh freebsd x86_64 grow
+tools/qemu/bsd-vm.sh freebsd x86_64 provision
+tools/qemu/bsd-vm.sh freebsd x86_64 wait
+tools/qemu/bsd-vm.sh freebsd x86_64 toolchain
+tools/qemu/bsd-vm.sh freebsd x86_64 build      # --features full
+tools/qemu/bsd-vm.sh freebsd x86_64 e2e        # tests/e2e_setup.sh test
+tools/qemu/bsd-vm.sh freebsd x86_64 fetch      # → packaging/build/veil-freebsd-x86_64
+
+# 取り出したバイナリを tar.gz 化（--os-version でビルド OS バージョンを明記）
+./packaging/scripts/build-bsd.sh --os freebsd --arch x86_64 \
+  --binary packaging/build/veil-freebsd-x86_64 \
+  --os-version "$(cat packaging/build/veil-freebsd-x86_64.os-version)"
+./packaging/scripts/build-bsd.sh --os openbsd --arch x86_64 \
+  --binary packaging/build/veil-openbsd-x86_64 \
+  --os-version "$(cat packaging/build/veil-openbsd-x86_64.os-version)"
+# aarch64 も --arch aarch64 で同様
 # 対象 OS の VM 内で直接実行する場合は --os-version 省略で uname -r から自動検出される。
 ```
+
+**FreeBSD x86_64 は Docker クロスビルドも可能**（`docker/Dockerfile.freebsd`、
+`cargo-zigbuild` が FreeBSD libc を同梱しており `x86_64-unknown-freebsd` は Rust Tier 2）。
+VM 内フルビルドを省いて E2E だけ VM で回せる:
+
+```bash
+./packaging/scripts/build-cross.sh --target freebsd
+tools/qemu/bsd-vm.sh freebsd x86_64 e2e \
+  --prebuilt packaging/build/artifact-x86_64-unknown-freebsd/veil
+```
+
+`aarch64-unknown-freebsd` は Rust Tier 3（prebuilt std 無し）のため VM 内ネイティブ
+ビルドのみ。
 
 tar.gz には `veil` バイナリ・`rc.d/veil`（サービススクリプト）・`config.toml.default`・
 `www/index.html`・`INSTALL.txt`・`BUILD_INFO.txt`（+ FreeBSD は `jail.conf.sample`）を
@@ -154,8 +186,12 @@ fat binary）をクロスビルド**できる。FreeBSD/OpenBSD と異なり VM 
 ./packaging/scripts/build-cross.sh --target macos
 ```
 
-内部では `messense/cargo-zigbuild` イメージ内で `cmake` + `nasm` を導入し、
-`cargo zigbuild --release --target universal2-apple-darwin --features full` を実行する。macOS は
+内部では [`docker/Dockerfile.macos`](../docker/Dockerfile.macos)（`messense/cargo-zigbuild`
+ベース、`Dockerfile.glibc` と同じ cacher/builder 2 段構成）を
+`--target artifact --output type=local` でビルドし、`cargo zigbuild --release --target
+universal2-apple-darwin --features full` の成果物を取り出す。2 段構成のため、ソース
+変更だけの再ビルドでは `aws-lc-sys` / `boring-sys` の重い C ビルドがレイヤキャッシュ
+から再利用される（B-47）。macOS は
 rustls の暗号プロバイダに **aws_lc_rs** を使い（`Cargo.toml` の target 別依存、F-131）、
 `http3` (quiche) は内蔵 BoringSSL (`boring-sys`) を独立して使用しシンボル分離されている。
 
@@ -179,9 +215,12 @@ VM ネイティブビルドは不要）。QEMU 実行・実機検証は行って
 ./packaging/scripts/build-cross.sh --target windows
 ```
 
-内部では `messense/cargo-xwin` イメージ内で `cmake` + `nasm` を自動セットアップし、
+内部では [`docker/Dockerfile.windows`](../docker/Dockerfile.windows)（`messense/cargo-xwin`
+ベース、`Dockerfile.glibc` と同じ cacher/builder 2 段構成）を
+`--target artifact --output type=local` でビルドし、
 `cargo xwin build --release --target <target> --features full` を x86_64/aarch64 両方に
-対して実行し、それぞれ zip を出力する。rustls の暗号プロバイダは **x86_64 / aarch64 ともに aws_lc_rs**
+対して実行して、それぞれ zip を出力する。2 段構成により `aws-lc-sys` / `boring-sys` の
+C ビルドと xwin の Windows SDK 取得がレイヤキャッシュに残る（B-47）。rustls の暗号プロバイダは **x86_64 / aarch64 ともに aws_lc_rs**
 を使用し（`Cargo.toml` の target 別依存、F-131）、`http3` (quiche) には BoringSSL (`boring-sys`) を、
 UDP ソケットには Windows Winsock 互換（`QuicUdpSocket`）が適用されている。`l4-proxy` も対応済みである。
 
@@ -192,8 +231,17 @@ zip には `veil.exe`・`config.toml.default`・`www/index.html`・`INSTALL.txt`
 （`ACTIVE_PROCESS=1`、`KILL_ON_JOB_CLOSE`）を適用するのみで、seccomp/Landlock
 相当のシステムコールフィルタではない。
 
-**注意**: Docker ビルドはリポジトリを `/io` としてマウントし `target/` を共有する
-ため、ホスト側の他の `cargo build` と同時に実行しないこと（target 競合）。
+**`AWS_LC_SYS_NO_PREFIX` について（B-47）**: `http3` / `full` ビルドで
+`aws-lc-sys` と `quiche` のシンボルをどう扱うかは
+**`.cargo/config.toml` の `[env]`（ターゲット接尾辞付き変数）が唯一の設定箇所**である
+（Linux/FreeBSD = `1`、Windows/macOS/OpenBSD = `0`）。cargo にターゲット別 env の仕組みが
+無いため（`[target.<triple>.env]` は黙って無視される）、`aws-lc-sys` が優先して読む
+`AWS_LC_SYS_NO_PREFIX_<triple_with_underscores>` を列挙している。
+packaging のスクリプトや Dockerfile 側でこの変数を設定してはならない。
+
+**注意**: 各クロスビルドは専用 Dockerfile のビルドコンテキスト内で完結し、
+ホストの `target/` を共有しない（`--output type=local` で成果物だけを取り出す）。
+そのためホスト側の `cargo build` と同時に実行しても競合しない。
 
 ### 成果物
 
@@ -204,6 +252,7 @@ packaging/output/veil-<version>-x86_64-unknown-linux-gnu.tar.gz
 packaging/output/veil-<version>-x86_64-unknown-linux-musl.tar.gz
 packaging/output/veil-<version>-<arch>-unknown-freebsd.tar.gz   # build-bsd.sh
 packaging/output/veil-<version>-<arch>-unknown-openbsd.tar.gz   # build-bsd.sh
+packaging/output/veil-<version>-x86_64-unknown-freebsd.tar.gz   # build-cross.sh --target freebsd
 packaging/output/veil-<version>-universal2-apple-darwin.tar.gz # build-cross.sh --target macos
 packaging/output/veil-<version>-x86_64-pc-windows-msvc.zip      # build-cross.sh --target windows
 packaging/output/veil-<version>-aarch64-pc-windows-msvc.zip     # build-cross.sh --target windows
@@ -332,4 +381,8 @@ sudo tail -50 /var/log/veil/veil.error-*.log
 | [contrib/systemd/veil.service](../contrib/systemd/veil.service) | systemd ユニット |
 | [docker/Dockerfile.glibc](../docker/Dockerfile.glibc) | glibc 配布バイナリビルド |
 | [docker/Dockerfile.musl](../docker/Dockerfile.musl) | musl 配布バイナリビルド |
+| [docker/Dockerfile.macos](../docker/Dockerfile.macos) | macOS universal2 クロスビルド（キャッシュ有効） |
+| [docker/Dockerfile.windows](../docker/Dockerfile.windows) | Windows x86_64/aarch64 クロスビルド（キャッシュ有効） |
+| [docker/Dockerfile.freebsd](../docker/Dockerfile.freebsd) | FreeBSD x86_64 クロスビルド（キャッシュ有効） |
+| [tools/qemu/bsd-vm.sh](../tools/qemu/README.md) | FreeBSD/OpenBSD × x86_64/aarch64 の VM ビルド・E2E・バイナリ取得 |
 | [examples/config.toml](../examples/config.toml) | 設定リファレンス |

@@ -12,6 +12,54 @@ docker build -f Dockerfile.glibc -t "veil:glibc" --build-arg CARGO_FEATURES='ful
 docker build -f Dockerfile.musl -t "veil:musl" --build-arg CARGO_FEATURES='full' ..
 ```
 
+### `AWS_LC_SYS_NO_PREFIX` について（B-47）
+
+`http3` / `full` ビルドで `aws-lc-sys` と `quiche` のシンボルをどう扱うかは
+**`.cargo/config.toml` の `[env]`（ターゲット接尾辞付き変数）が唯一の設定箇所**である。
+Dockerfile 側で `ENV AWS_LC_SYS_NO_PREFIX=...` を設定してはならない（設定が二重化し、
+ターゲット別の値と食い違ったときに原因が追えなくなる）。
+
+| ターゲット | 値 | 理由 |
+|---|---|---|
+| Linux / FreeBSD | `1` | quiche と rustls(aws-lc-rs) が同一の aws-lc-sys を共有する（非プレフィックス） |
+| Windows / macOS / OpenBSD | `0` | quiche は内蔵 BoringSSL を使うため aws-lc-sys はプレフィックス維持で共存させる |
+
+cargo には**ターゲット別の環境変数設定が存在しない**（`[target.<triple>.env]` は
+黙って無視される）ため、`aws-lc-sys` が優先して読む
+`AWS_LC_SYS_NO_PREFIX_<triple_with_underscores>` をグローバル `[env]` に列挙している。
+詳細は [`docs/backlog/bugs/B-47-...`](../docs/backlog/bugs/B-47-awslc-no-prefix-not-applied-cross-build.md) を参照。
+
+### 非 Linux 向けクロスビルド（macOS / Windows / FreeBSD）
+
+`Dockerfile.glibc` と同じ **cacher（依存だけ先にビルド）→ builder（実ソース）** の
+2 段構成にしてあるため、ソースだけを変更した再ビルドでは `aws-lc-sys` /
+`boring-sys`（quiche 内蔵 BoringSSL）の重い C ビルドがレイヤキャッシュから再利用される。
+
+| Dockerfile | ターゲット | ベースイメージ |
+|---|---|---|
+| `Dockerfile.macos` | `universal2-apple-darwin`（x86_64 + aarch64 fat） | `messense/cargo-zigbuild` |
+| `Dockerfile.windows` | `x86_64-pc-windows-msvc` / `aarch64-pc-windows-msvc` | `messense/cargo-xwin` |
+| `Dockerfile.freebsd` | `x86_64-unknown-freebsd` | `messense/cargo-zigbuild` |
+
+いずれもランタイムステージを持たない（生成物を Linux コンテナで実行できないため）。
+最終ステージ `artifact` は scratch にバイナリだけを置くので、`--output type=local` で
+取り出す。
+
+```sh
+# 例: Windows aarch64 バイナリを ./out へ取り出す
+docker build -f Dockerfile.windows --target artifact \
+  --build-arg RUST_TARGET=aarch64-pc-windows-msvc \
+  --build-arg CARGO_FEATURES=full \
+  --output type=local,dest=./out ..
+```
+
+通常は `packaging/scripts/build-cross.sh --target {macos|windows|freebsd}` から
+呼び出す（tar.gz / zip 化まで行う）。
+
+`aarch64-unknown-freebsd` は Rust Tier 3（prebuilt std 無し）のため Docker では扱わず、
+`tools/qemu/bsd-vm.sh freebsd aarch64 build` で VM 内ネイティブビルドする。
+OpenBSD も同様に `tools/qemu/bsd-vm.sh openbsd {x86_64,aarch64}` を使う。
+
 ### aarch64-unknown-linux クロスビルド（F-120 Phase 3）
 
 x86_64 ホスト上で aarch64-unknown-linux-{gnu,musl} バイナリをクロスビルドする。

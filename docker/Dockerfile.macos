@@ -1,0 +1,104 @@
+# syntax=docker/dockerfile:1
+# macOS（*-apple-darwin / universal2）クロスビルド + 成果物エクスポート専用イメージ
+#
+# messense/cargo-zigbuild で Darwin 向けにクロスビルドする。Dockerfile.glibc と同じ
+# 「cacher（依存だけ先にビルド）→ builder（実ソース）」の 2 段構成にすることで、
+# ソース変更のたびに aws-lc-sys / boring-sys（quiche 内蔵 BoringSSL）の重い C ビルドを
+# やり直さずに済む（従来の packaging/scripts/build-cross.sh は毎回フルビルドだった）。
+#
+# ランタイムステージは持たない（macOS バイナリは Linux コンテナで実行できない）。
+# 最終ステージ `artifact` は scratch に veil だけを置き、
+#   docker build --target artifact --output type=local,dest=<dir>
+# で取り出す。
+#
+# ARG:
+#   RUST_TARGET     universal2-apple-darwin（既定）/ x86_64-apple-darwin / aarch64-apple-darwin
+#   CARGO_FEATURES  既定 full（http3 + wasm 含む全機能）
+#
+# AWS_LC_SYS_NO_PREFIX は .cargo/config.toml の [env]（ターゲット接尾辞付き変数）で
+# 一元管理する。macOS は "0"（quiche は内蔵 BoringSSL を使うため、aws-lc-sys の
+# シンボルはプレフィックスしたままにして共存させる）。universal2 は cargo-zigbuild が
+# x86_64-apple-darwin / aarch64-apple-darwin を個別にビルドして lipo するため、
+# .cargo/config.toml では両トリプル分を定義してある。B-47 / F-131。
+
+# ==========================================
+# 1. ツールチェーンステージ
+# ==========================================
+FROM messense/cargo-zigbuild AS tool-builder
+
+WORKDIR /app
+
+# aws-lc-sys（cmake 必須）と boring-sys のビルドに必要なツール
+RUN apt-get update -y \
+    && apt-get install -y --no-install-recommends \
+        cmake \
+        nasm \
+        yasm \
+        perl \
+        golang-go \
+    && rm -rf /var/lib/apt/lists/*
+
+# boring-sys / aws-lc-sys の cmake 検出が xcrun を呼ぶため、SDK パスを返すシムを置く
+# （イメージ同梱の macOS SDK を指す。Xcode は不要）。
+RUN printf '#!/bin/sh\necho /opt/MacOSX11.3.sdk\n' > /usr/local/bin/xcrun \
+    && chmod +x /usr/local/bin/xcrun
+
+ENV CMAKE_SYSTEM_NAME=Darwin \
+    BORING_BSSL_NO_ASM=1
+
+# ==========================================
+# 2. 依存ライブラリの事前ビルドステージ
+# ==========================================
+FROM tool-builder AS cacher
+
+ARG CARGO_FEATURES=full
+ARG RUST_TARGET=universal2-apple-darwin
+
+# Cargo.toml と Cargo.lock、および fuzz ワークスペースメンバのマニフェストを先にコピー
+# （[workspace] members = [".", "fuzz"] のため、fuzz/Cargo.toml が無いとワークスペース解決に失敗する）
+COPY Cargo.toml Cargo.lock /app/
+COPY .cargo/config.toml /app/.cargo/config.toml
+COPY build.rs /app/build.rs
+COPY fuzz/Cargo.toml /app/fuzz/Cargo.toml
+
+# 空の main.rs / lib.rs を作り、依存関係「だけ」を先にコンパイルしてキャッシュ化する
+RUN mkdir src benches \
+    && echo "fn main() {}" > src/main.rs \
+    && echo "" > src/lib.rs \
+    && awk -F'"' '/^\[\[bench\]\]/{p=1} p && /name =/{print $2; p=0}' Cargo.toml \
+       | xargs -I {} touch benches/{}.rs \
+    && awk -F'"' '/^path =/{print $2}' fuzz/Cargo.toml \
+       | while read -r p; do mkdir -p "fuzz/$(dirname "$p")" && echo "fn main() {}" > "fuzz/$p"; done \
+    && cargo zigbuild --release --target "${RUST_TARGET}" \
+         --no-default-features --features "${CARGO_FEATURES}" --locked \
+    && rm -rf src/
+
+# ==========================================
+# 3. アプリケーションコードのビルドステージ
+# ==========================================
+FROM tool-builder AS builder
+
+ARG CARGO_FEATURES=full
+ARG RUST_TARGET=universal2-apple-darwin
+
+# cacher ステージから「ビルド済みの依存関係アセット」を引き継ぐ
+COPY --from=cacher /usr/local/cargo /usr/local/cargo
+COPY --from=cacher /app/target /app/target
+COPY --from=cacher /app/benches /app/benches
+
+# ソースコードをコピー
+COPY . /app
+
+# cacher 段のスタブ成果物を確実に置き換えるため全 .rs の mtime を更新する
+RUN find src -name '*.rs' -exec touch {} + \
+    && cargo zigbuild --release --target "${RUST_TARGET}" \
+         --no-default-features --features "${CARGO_FEATURES}" --locked
+
+# ==========================================
+# 4. 成果物エクスポートステージ（--output type=local で取り出す）
+# ==========================================
+FROM scratch AS artifact
+
+ARG RUST_TARGET=universal2-apple-darwin
+
+COPY --from=builder /app/target/${RUST_TARGET}/release/veil /veil

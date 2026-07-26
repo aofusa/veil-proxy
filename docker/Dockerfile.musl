@@ -34,7 +34,9 @@ FROM tool-builder AS cacher
 
 ARG CARGO_FEATURES=full
 ARG RUST_TARGET=x86_64-unknown-linux-musl
-ENV AWS_LC_SYS_NO_PREFIX=1
+# AWS_LC_SYS_NO_PREFIX は .cargo/config.toml の [env]（ターゲット接尾辞付き変数）で
+# 一元管理する（Linux ターゲットは "1" = quiche と aws-lc-sys のシンボル共有）。
+# ここで非接尾辞版の ENV を設定すると設定箇所が二重化し食い違いの原因になるため設定しない（B-47）。
 
 
 # Cargo.toml と Cargo.lock、および fuzz ワークスペースメンバのマニフェストを先にコピー

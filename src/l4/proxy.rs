@@ -18,11 +18,11 @@ use crate::ktls_rustls::{KtlsServerStream, RustlsAcceptor};
 use crate::simple_tls::{SimpleTlsAcceptor, SimpleTlsServerStream};
 use ftlog::{debug, info, warn};
 // std::io は splice 転送（Linux 専用経路）でのみ使用する。
+#[allow(unused_imports)]
+use crate::runtime::handle::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
-#[allow(unused_imports)]
-use crate::runtime::handle::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;

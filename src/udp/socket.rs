@@ -11,9 +11,9 @@
 
 #![allow(unused_imports)]
 
+use crate::runtime::handle::AsRawFd;
 use std::io;
 use std::net::SocketAddr;
-use crate::runtime::handle::AsRawFd;
 
 // 非ブロッキング UDP ソケット（std::net::UdpSocket ラッパー）
 // monoio::net::udp::UdpSocket を削除し、std を使用する
@@ -1727,7 +1727,17 @@ impl MmsgRecvScratch {
         Self {
             batch,
             bufs: vec![0u8; batch * RECV_BUFFER_SIZE].into_boxed_slice(),
-            metas: vec![(0, SocketAddr::V4(std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0))); batch].into_boxed_slice(),
+            metas: vec![
+                (
+                    0,
+                    SocketAddr::V4(std::net::SocketAddrV4::new(
+                        std::net::Ipv4Addr::UNSPECIFIED,
+                        0
+                    ))
+                );
+                batch
+            ]
+            .into_boxed_slice(),
         }
     }
 

@@ -1,20 +1,120 @@
 # tools/qemu — full-system QEMU 検証環境（プラットフォーム×arch ビルド・動作確認）
 
 veil を **各プラットフォーム×arch の実カーネル上**でビルド・E2E・`tools/perf` 検証する
-ための QEMU 環境を用意するスクリプト群。Linux io_uring（実 aarch64 カーネル）に加え、
-v0.6.0 では **FreeBSD arm64（aarch64）のネイティブビルド + 動作確認**をカバーする。
+ための QEMU 環境を用意するスクリプト群。
 
 ホストに `qemu-system-*` / UEFI ファーム / cloud image ツールが無く sudo も使えない環境を
 想定し、これらを内包した Docker ヘルパイメージ（`helper/Dockerfile`）経由で起動する。
+ヘルパには **aarch64 ゲスト（qemu-system-arm + AAVMF）と x86_64 ゲスト
+（qemu-system-x86 + OVMF）の両方**が入っており、x86_64 ゲストはホストに `/dev/kvm` が
+あれば **KVM 加速**される（実用速度で in-VM フルビルド + E2E が回る）。
 
 ## プラットフォーム×arch 検証マトリクス
 
-| プラットフォーム | x86_64 | aarch64 | このディレクトリの手段 |
+| プラットフォーム | x86_64 | aarch64 | 手段 |
 |---|---|---|---|
-| Linux（io_uring/epoll） | ネイティブ/Docker で直接 | full-system QEMU（実カーネル要、`aarch64-vm.sh` + `run-e2e-aarch64.sh`）。**KVM 不可ホストでは TCG が実用不能**（下記制約） | `aarch64-vm.sh` |
-| FreeBSD | amd64 は KVM で高速な x86_64 VM（本リポジトリ外の運用 VM。kTLS/capsicum の E2E に使用） | **FreeBSD arm64 VM-IMAGE は TCG でも実用起動**。in-VM ネイティブビルド + smoke（`fbsd-arm64-vm.sh`） | `fbsd-arm64-vm.sh` / `fbsd-arm64-provision.py` / `fbsd-arm64-smoke.sh` / `fbsd-capmode-e2e.sh` |
-| OpenBSD | amd64 は KVM で x86_64 VM（pledge/unveil の検証） | ready な VM-IMAGE が無く miniroot からの対話 install + Tier3 で TCG では非現実的（未対応） | — |
-| macOS / Windows | — | ネイティブ実行ホストが無くクロスビルド + packaging のみ（`packaging/scripts/build-cross.sh`） | — |
+| Linux（io_uring/epoll） | ネイティブ/Docker で直接 | Docker クロスビルド + full-system QEMU で E2E（`linux-aarch64-e2e.sh`）。**KVM 不可ホストでは TCG が実用不能**（下記制約） | `aarch64-vm.sh` / `run-e2e-aarch64.sh` / `linux-aarch64-e2e.sh` |
+| FreeBSD | Docker クロスビルド（`docker/Dockerfile.freebsd`）または VM 内ネイティブビルド。VM は **KVM で実用速度** | Rust Tier 3 のため **VM 内ネイティブビルド**。TCG でも実用起動する | `bsd-vm.sh freebsd {x86_64,aarch64}` |
+| OpenBSD | miniroot から autoinstall した VM で **ネイティブビルド**。KVM で実用速度 | 同左（TCG のため低速） | `bsd-vm.sh openbsd {x86_64,aarch64}` |
+| macOS / Windows | ネイティブ実行ホストが無く **Docker クロスビルドのみ**（`docker/Dockerfile.{macos,windows}` / `packaging/scripts/build-cross.sh`） | 同左 | — |
+
+**なぜ Linux/macOS/Windows に QEMU が要らないか**: Linux x86_64 はホストそのもの、
+macOS/Windows は Docker（cargo-zigbuild / cargo-xwin）で完結するクロスビルドのみを
+合格基準としているため。Linux aarch64 だけは io_uring を**実カーネル**で確認したいので
+QEMU を使う。
+
+---
+
+## BSD 統合ヘルパ `bsd-vm.sh`（FreeBSD / OpenBSD × x86_64 / aarch64）
+
+`packaging/` が配布する BSD バイナリを**実 OS 上でビルド・E2E 検証**し、成果物を
+host 側へ取り出す（`packaging/scripts/build-bsd.sh` へ渡す）ための統合スクリプト。
+
+```bash
+tools/qemu/bsd-vm.sh <os> <arch> <command> [args]
+#   os   : freebsd | openbsd
+#   arch : x86_64 | aarch64
+```
+
+| コマンド | 内容 |
+|---|---|
+| `setup` | helper イメージ build + ゲストイメージ取得 + SSH 鍵生成 |
+| `up` / `down` / `status` / `console` | VM ライフサイクル |
+| `wait` | SSH 到達までブロック |
+| `grow` | ディスク拡張（FreeBSD: `qemu-img resize` + single-user `growfs`） |
+| `provision` | SSH 鍵注入 + sshd 有効化（FreeBSD はシリアル single-user 経由 / OpenBSD は autoinstall） |
+| `toolchain` | VM 内へ rust / cmake / llvm / bash / curl を導入 |
+| `sync` | リポジトリを VM へ転送（tar over ssh） |
+| `build` | VM 内で `--features full` リリースビルド |
+| `e2e` | VM 内で `tests/e2e_setup.sh test` を実行 |
+| `fetch` | VM 内の release バイナリを `packaging/build/` へ取得 |
+
+### フル一巡（FreeBSD amd64、KVM 有効ホスト）
+
+```bash
+tools/qemu/bsd-vm.sh freebsd x86_64 setup
+tools/qemu/bsd-vm.sh freebsd x86_64 up
+tools/qemu/bsd-vm.sh freebsd x86_64 grow        # root FS は既定 ~5G で不足する
+tools/qemu/bsd-vm.sh freebsd x86_64 provision
+tools/qemu/bsd-vm.sh freebsd x86_64 wait
+tools/qemu/bsd-vm.sh freebsd x86_64 toolchain
+tools/qemu/bsd-vm.sh freebsd x86_64 build       # full features
+tools/qemu/bsd-vm.sh freebsd x86_64 e2e         # tests/e2e_setup.sh test
+tools/qemu/bsd-vm.sh freebsd x86_64 fetch       # packaging/build/veil-freebsd-x86_64
+tools/qemu/bsd-vm.sh freebsd x86_64 down
+
+# 取得したバイナリを packaging に渡す
+./packaging/scripts/build-bsd.sh --os freebsd --arch x86_64 \
+  --binary packaging/build/veil-freebsd-x86_64 \
+  --os-version "$(cat packaging/build/veil-freebsd-x86_64.os-version)"
+```
+
+### FreeBSD x86_64 は Docker クロスビルドでも良い
+
+Zig が FreeBSD の libc を同梱しており `x86_64-unknown-freebsd` は Rust Tier 2 なので、
+`docker/Dockerfile.freebsd` でクロスビルドしてから VM では **E2E だけ**回せる
+（VM 内フルビルドを省ける）。
+
+```bash
+./packaging/scripts/build-cross.sh --target freebsd
+tools/qemu/bsd-vm.sh freebsd x86_64 e2e \
+  --prebuilt packaging/build/artifact-x86_64-unknown-freebsd/veil
+```
+
+`--prebuilt` を渡すと `VEIL_E2E_SKIP_VEIL_BUILD=1` が効き、veil 本体を VM 内でビルド
+しない。ただし `grpc_server` / `test_backends` と E2E テストバイナリ自体は cargo が
+必要なので VM 内でビルドされる（`toolchain` は必要）。
+
+`aarch64-unknown-freebsd` は Rust Tier 3（prebuilt std 無し）のため Docker では扱えず、
+`bsd-vm.sh freebsd aarch64 build` の VM 内ネイティブビルドを使う。
+
+### ポート割り当て
+
+同時に 4 VM を起動しても衝突しないよう os/arch ごとに固定している
+（`SSH_PORT` / `CON_PORT` で上書き可）。
+
+| VM | ssh | console(telnet) |
+|---|---|---|
+| freebsd x86_64 | 2310 | 2311 |
+| freebsd aarch64 | 2320 | 2321 |
+| openbsd x86_64 | 2330 | 2331 |
+| openbsd aarch64 | 2340 | 2341 |
+
+### OpenBSD の VM 作成（autoinstall）
+
+OpenBSD は FreeBSD と違い ready-made な qcow2 を配布していないため、
+`installNN.img`（miniroot）から **autoinstall(8) で無人インストール**して起動ディスクを
+作る（`openbsd-autoinstall.py`）。応答ファイルは helper コンテナ内の
+`python3 -m http.server` から `http://10.0.2.2:8000/auto_install.conf` として配る
+（slirp のゲートウェイ 10.0.2.2 = QEMU を実行しているコンテナ自身）。
+
+amd64 のブートローダは既定で VGA コンソールへ出るため、`boot>` へ
+**ブラインドで `set tty com0`** を送ってシリアルへ切り替えている（arm64 は UEFI +
+efiboot が既定でシリアルなので不要）。
+
+> **注意**: `openbsd-autoinstall.py` は OpenBSD インストーラの**対話文言に依存**する。
+> リリースによって文言が変わった場合は追従が必要。`OPENBSD_VER`（既定 7.6）で
+> バージョンを指定する。
 
 ---
 
@@ -84,8 +184,21 @@ tools/qemu/aarch64-vm.sh down
 SSH 経由でバイナリを起動する）。
 
 ```bash
-tools/qemu/run-e2e-aarch64.sh          # クロスビルド + VM E2E スモーク
+tools/qemu/run-e2e-aarch64.sh          # クロスビルド + VM E2E スモーク（HTTPS 静的配信のみ）
 ```
+
+より強い検証として、**Docker でクロスビルドした aarch64 バイナリを VM へ持ち込み、
+`tests/e2e_setup.sh test` の全 E2E スイートを実 aarch64 カーネル上で回す**スクリプトも
+用意している（B-47）。
+
+```bash
+tools/qemu/linux-aarch64-e2e.sh        # docker build → VM 転送 → tests/e2e_setup.sh test
+```
+
+veil 本体は `docker/Dockerfile.glibc.aarch64` の成果物を使い、VM 内では
+`VEIL_E2E_SKIP_VEIL_BUILD=1` でビルドを省略する（`grpc_server` / `test_backends` と
+E2E テストバイナリは cargo が要るので VM 内でビルドされる）。上記「既知の環境制約」の
+とおり、KVM が使えないホストでは TCG が遅すぎて完走しない。
 
 ## VM 仕様
 
@@ -124,7 +237,7 @@ tools/qemu/fbsd-arm64-vm.sh down
 - `virtio-net-pci` には **`romfile=`（空）** が必須（`efi-virtio.rom` 不足で起動失敗）。
 - シリアルに **getty が無く root SSH も既定無効** → `provision` は **loader メニューで
   single-user（"2"）** を選び、getty 不要の root シェルから鍵注入 + `sysrc sshd_enable=YES`
-  + `PermitRootLogin yes` を行う（`bsd-arm64-provision.py --mode ssh`）。
+  + `PermitRootLogin yes` を行う（`freebsd-provision.py --mode ssh`）。
 - qemu の **telnet シリアルコンソールは IAC(0xff)** を送るため pexpect は `encoding="latin-1"`。
   unix socket は root 所有で非 root が connect できないため **TCP telnet** を使う。
 - **root FS が ~5G と小さい**。`qemu-img resize` 後の online growfs はマウント中 root で
@@ -140,8 +253,8 @@ tools/qemu/fbsd-arm64-vm.sh down
 
 | ファイル | 役割 |
 |---|---|
-| `fbsd-arm64-vm.sh` | ライフサイクル（setup/up/grow/provision/smoke/ssh/down） |
-| `bsd-arm64-provision.py` | single-user 経由の SSH 鍵注入（`--mode ssh`）/ growfs（`--mode grow`） |
+| `fbsd-arm64-vm.sh` | ライフサイクル（setup/up/grow/provision/smoke/ssh/down）。**新規用途では `bsd-vm.sh freebsd aarch64` を推奨**（本スクリプトは smoke 専用の従来経路として残置） |
+| `freebsd-provision.py` | single-user 経由の SSH 鍵注入（`--mode ssh`）/ growfs（`--mode grow`） |
 | `fbsd-arm64-smoke.sh` | VM 内 HTTPS 静的配信 smoke（`veil` 起動 → curl → 200 判定） |
 | `fbsd-capmode-e2e.sh` | capsicum capability mode 静的配信 E2E（F-123。arch 非依存で amd64/arm64 とも） |
 

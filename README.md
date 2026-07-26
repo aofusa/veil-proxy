@@ -96,8 +96,8 @@ hot-path cost). The default is unchanged (Linux io_uring).
 | **Linux `--features epoll`** | epoll readiness reactor (`src/runtime/reactor/`) | seccomp (epoll syscalls; io_uring syscalls dropped) + Landlock | ✅ | Fallback for hosts without io_uring |
 | **FreeBSD (x86_64/aarch64)** | kqueue readiness reactor (optionally POSIX AIO with `--features aio`, F-127) | capsicum (`cap_rights_limit` / `cap_enter`) + jail | ✅ (FreeBSD 13.0+, `TCP_TXTLS_ENABLE`/`TCP_RXTLS_ENABLE`; F-126) | `[security] enable_capsicum`, `capsicum_capability_mode`, `jail_name` |
 | **OpenBSD (x86_64/aarch64)** | kqueue readiness reactor | pledge + unveil | ✗ (userspace rustls) | `[security] enable_pledge`, `enable_unveil`. TLS uses the **ring** rustls provider (aws-lc-rs can't complete handshakes on OpenBSD; F-122). HTTPS static/proxy serving verified 200 |
-| **macOS (x86_64/aarch64, universal2)** | kqueue readiness reactor (reused from FreeBSD/OpenBSD) | `sandbox_init` (Seatbelt) | ✗ (userspace rustls) | `[security] enable_sandbox_macos`. TLS uses the **ring** rustls provider (aws-lc-sys can't cross-link under zig; F-125). Cross-built with `cargo zigbuild --target universal2-apple-darwin`; QEMU/real-hardware testing not performed — see caveats below |
-| **Windows (x86_64-pc-windows-msvc / aarch64-pc-windows-msvc)** | WSAPoll readiness reactor (`src/runtime/reactor/wsapoll.rs`, `src/runtime/reactor/tcp/windows.rs`, Winsock) | Job Object (best-effort) | ✗ (userspace rustls) | `[security] enable_job_object_windows`. TLS provider is split **per arch**: x86_64 uses **ring** (aws-lc-sys needs NASM, unavailable in the cargo-xwin container), aarch64 uses **aws_lc_rs** (ARM asm needs no NASM; cross-buildable via cmake — ring 0.17 has no prebuilt asm for aarch64-pc-windows-msvc and fails under cargo-xwin's `/imsvc` handling; v0.6.0). Cross-built with `cargo xwin build --target <target>` (`packaging/scripts/build-cross.sh --target windows` builds both archs); QEMU/real-hardware testing not performed — see caveats below |
+| **macOS (x86_64/aarch64, universal2)** | kqueue readiness reactor (reused from FreeBSD/OpenBSD) | `sandbox_init` (Seatbelt) | ✗ (userspace rustls) | `[security] enable_sandbox_macos`. TLS uses the **aws_lc_rs** rustls provider; `http3` (quiche) uses its own bundled BoringSSL (F-131). Cross-built with `docker/Dockerfile.macos` (`cargo zigbuild --target universal2-apple-darwin`, `--features full`); verified on real hardware by the maintainer |
+| **Windows (x86_64-pc-windows-msvc / aarch64-pc-windows-msvc)** | WSAPoll readiness reactor (`src/runtime/reactor/wsapoll.rs`, `src/runtime/reactor/tcp/windows.rs`, Winsock) | Job Object (best-effort) | ✗ (userspace rustls) | `[security] enable_job_object_windows`. TLS uses the **aws_lc_rs** rustls provider on both archs; `http3` (quiche) uses its own bundled BoringSSL (F-131). Cross-built with `docker/Dockerfile.windows` (`cargo xwin build --target <target>`, `--features full`; `packaging/scripts/build-cross.sh --target windows` builds both archs); verified on real hardware by the maintainer |
 
 - The backend is chosen by `build.rs`-emitted cfgs (`veil_rt_uring` / `veil_rt_reactor` and
   `veil_poller_epoll` / `veil_poller_kqueue`). The public runtime API paths
@@ -106,8 +106,14 @@ hot-path cost). The default is unchanged (Linux io_uring).
   selected automatically). Non-target security keys are accepted and ignored with a warning.
 - **aarch64-linux**: cross-built via `docker/Dockerfile.{glibc,musl}.aarch64`
   (QEMU user-mode verified; QEMU lacks io_uring, so QEMU runs use the `epoll` build).
-- FreeBSD/OpenBSD are built natively inside a matching VM (Rust Tier 2/3; cross-build not
-  supported). See `packaging/scripts/build-bsd.sh` for tar.gz packaging with rc.d/jail.conf.
+- **FreeBSD/OpenBSD** are built inside a matching QEMU VM — `tools/qemu/bsd-vm.sh <os> <arch>`
+  covers FreeBSD/OpenBSD × x86_64/aarch64 (setup → build → `tests/e2e_setup.sh test` →
+  fetch the binary), and `packaging/scripts/build-bsd.sh` turns the binary into a tar.gz with
+  rc.d/jail.conf. **`x86_64-unknown-freebsd` can also be cross-built with Docker**
+  (`docker/Dockerfile.freebsd`; zig bundles FreeBSD libc and the target is Rust Tier 2), in
+  which case the VM is only used to run the E2E suite
+  (`tools/qemu/bsd-vm.sh freebsd x86_64 e2e --prebuilt <binary>`).
+  `aarch64-unknown-freebsd` is Rust Tier 3 (no prebuilt std) and must be built in the VM.
 - **FreeBSD POSIX AIO (`--features aio`, F-127)**: opt-in build-time switch (FreeBSD only;
   build.rs panics on other targets, same pattern as `epoll`). Replaces the default kqueue
   readiness `TcpStream::read`/`write` with `aio_read(2)`/`aio_write(2)` completion-based I/O,
@@ -116,32 +122,28 @@ hot-path cost). The default is unchanged (Linux io_uring).
   `EAGAIN` (AIO daemon pool/queue limits). Not part of `--features full`; see
   `docs/backlog/features/F-127-freebsd-aio.md` and
   `docs/artifacts/f127_freebsd_aio_design.md` for the design and verification notes.
-- **macOS (F-125)**: cross-built only, via Docker (`messense/cargo-zigbuild`) — see
+- **macOS (F-125/F-131)**: cross-built via Docker (`docker/Dockerfile.macos`,
+  `messense/cargo-zigbuild`) — see
   `packaging/scripts/build-cross.sh --target macos`. macOS lacks
   `accept4`/`MSG_NOSIGNAL`/`pipe2`/`SOCK_NONBLOCK|SOCK_CLOEXEC`; `reactor/tcp.rs` and
   `runtime/udp.rs` fall back to plain `socket`/`accept` + `fcntl` and `SO_NOSIGPIPE`, and
-  `runtime/offload.rs` falls back to `pipe` + `fcntl`. No real-hardware or QEMU verification
-  was performed — cross-build success is the only acceptance bar per the F-125 design doc.
-  `http3`/`wasm` features are not yet verified on macOS cross-builds (excluded from the
-  default `build-cross.sh` feature set).
-- **Windows (F-125, v0.6.0)**: cross-built only, via Docker (`messense/cargo-xwin`) — see
+  `runtime/offload.rs` falls back to `pipe` + `fcntl`. `--features full` (including
+  `http3` and `wasm`) is the default for `build-cross.sh --target macos` (F-131).
+- **Windows (F-125/F-131, v0.6.0)**: cross-built via Docker (`docker/Dockerfile.windows`,
+  `messense/cargo-xwin`) — see
   `packaging/scripts/build-cross.sh --target windows`, which builds both
-  x86_64-pc-windows-msvc and aarch64-pc-windows-msvc. No real-hardware or QEMU
-  verification was performed. `http3`/`wasm`/`ktls`/`l4-proxy` features are not part of
-  the default feature set (`l4-proxy` is excluded because `runtime::udp` assumes Unix
-  socket APIs).
-- **TLS crypto provider** is selected per target **and, for Windows, per arch** in
-  `src/tls_provider.rs` (F-122/F-125): OpenBSD, macOS, and **x86_64-pc-windows-msvc**
-  use rustls's `ring` provider (aws-lc-rs cannot complete TLS handshakes on OpenBSD;
-  aws-lc-sys's hand-written assembly cannot be linked by zig for the macOS cross-build,
-  and `AWS_LC_SYS_NO_ASM` is forbidden in release builds; aws-lc-sys needs NASM on
-  x86_64-Windows, unavailable in the cargo-xwin container), while Linux/FreeBSD and
-  **aarch64-pc-windows-msvc** use `aws_lc_rs` (shared AWS-LC build with kTLS and
-  quiche/HTTP/3 on Linux/FreeBSD; aarch64's aws-lc uses ARM assembly and needs no NASM,
-  cross-buildable via cmake — ring 0.17 ships no prebuilt asm for aarch64-pc-windows-msvc
-  and fails to build from source under cargo-xwin's `/imsvc` handling).
-  `Cargo.toml` splits the provider via target-and-arch-specific dependencies plus
-  `resolver = "2"`.
+  x86_64-pc-windows-msvc and aarch64-pc-windows-msvc with `--features full`
+  (`http3` via bundled BoringSSL, plus `wasm` and `l4-proxy`). `ktls` is Linux/FreeBSD only.
+- **TLS crypto provider** is selected per target in `src/tls_provider.rs` (F-122/F-131):
+  **OpenBSD uses rustls's `ring`** provider (aws-lc-rs cannot complete TLS handshakes
+  there), **every other target (Linux/FreeBSD/macOS/Windows) uses `aws_lc_rs`**.
+  `Cargo.toml` splits the provider via target-specific dependencies plus `resolver = "2"`;
+  keep the two in sync.
+- **HTTP/3 (quiche) crypto backend** is likewise split per target:
+  Linux/FreeBSD build quiche with `default-features = false` so it **shares the same
+  `aws-lc-sys`** as rustls, while macOS/Windows/OpenBSD build quiche with its **bundled
+  BoringSSL** (`boring`). This is what `AWS_LC_SYS_NO_PREFIX` selects — see the note in
+  the packaging section and [`.cargo/config.toml`](.cargo/config.toml) (B-47).
 
 ## Build
 
@@ -238,7 +240,13 @@ Verify in Docker (both packages):
 
 See [packaging/README.md](packaging/README.md) for details (Docker build, postinst behavior, troubleshooting).
 
-> **Note**: `cmake` and `nasm` must be installed inside the container when building with `--features full` because the `http3` feature builds aws-lc-sys `libssl` (shared with quiche and rustls; requires cmake) and `aws-lc-rs` uses assembly optimizations (requires nasm). The default build without `http3` does not need cmake. For `http3` / `full` builds, `AWS_LC_SYS_NO_PREFIX=1` is applied automatically via `.cargo/config.toml` and `build.rs` so quiche links the same unprefixed AWS-LC symbols as rustls.
+> **Note**: `cmake` and `nasm` must be installed inside the container when building with `--features full` because the `http3` feature builds aws-lc-sys `libssl` (requires cmake) and `aws-lc-rs` uses assembly optimizations (requires nasm). The default build without `http3` does not need cmake.
+>
+> **`AWS_LC_SYS_NO_PREFIX` (per-target, B-47)**: for `http3` / `full` builds the value is set **only** in the `[env]` table of [`.cargo/config.toml`](.cargo/config.toml), using aws-lc-sys' target-suffixed variable names (`AWS_LC_SYS_NO_PREFIX_<triple_with_underscores>`):
+> - **Linux / FreeBSD → `1`**: quiche links the same *unprefixed* AWS-LC symbols as rustls (one shared `aws-lc-sys`).
+> - **Windows / macOS / OpenBSD → `0`**: quiche uses its own bundled BoringSSL, so `aws-lc-sys` must keep its symbol prefix to coexist.
+>
+> Cargo has no per-target environment mechanism (`[target.<triple>.env]` is silently ignored), and a `build.rs` cannot set env vars for its dependencies' build scripts (those run first, in separate processes). Do not set this variable in Dockerfiles or packaging scripts — the single source of truth is `.cargo/config.toml`.
 
 > **Cargo features**: The complete list of available feature flags is defined in the [`[features]` section of `Cargo.toml`](Cargo.toml).
 > Key notes:

@@ -1,0 +1,114 @@
+# syntax=docker/dockerfile:1
+# Windows（*-pc-windows-msvc）クロスビルド + 成果物エクスポート専用イメージ
+#
+# messense/cargo-xwin で MSVC ABI 向けにクロスビルドする。Dockerfile.glibc と同じ
+# 「cacher（依存だけ先にビルド）→ builder（実ソース）」の 2 段構成にすることで、
+# ソース変更のたびに aws-lc-sys / boring-sys（quiche 内蔵 BoringSSL）の重い C ビルドを
+# やり直さずに済む（従来の packaging/scripts/build-cross.sh は毎回フルビルドだった）。
+#
+# ランタイムステージは持たない（Windows バイナリは Linux コンテナで実行できない）。
+# 最終ステージ `artifact` は scratch に veil.exe だけを置き、
+#   docker build --target artifact --output type=local,dest=<dir>
+# で取り出す。
+#
+# ARG:
+#   RUST_TARGET     x86_64-pc-windows-msvc / aarch64-pc-windows-msvc
+#   CARGO_FEATURES  既定 full（http3 + wasm 含む全機能）
+#
+# AWS_LC_SYS_NO_PREFIX は .cargo/config.toml の [env]（ターゲット接尾辞付き変数）で
+# 一元管理する。Windows は "0"（quiche は内蔵 BoringSSL を使うため、aws-lc-sys の
+# シンボルはプレフィックスしたままにして共存させる）。B-47 / F-131。
+
+# ==========================================
+# 1. ツールチェーンステージ
+# ==========================================
+FROM messense/cargo-xwin AS tool-builder
+
+WORKDIR /app
+
+# aws-lc-sys（cmake 必須）と boring-sys のビルドに必要なツール
+RUN apt-get update -y \
+    && apt-get install -y --no-install-recommends \
+        cmake \
+        nasm \
+        yasm \
+        perl \
+        golang-go \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG RUST_TARGET=x86_64-pc-windows-msvc
+
+# MSVC ABI 向けの C/C++ ツールチェーン（clang-cl / llvm-ar）と、
+# アセンブリ実装を避けるためのフラグ（MSVC 向け ml64/armasm が無いため）
+ENV CMAKE_SYSTEM_NAME=Windows \
+    CC_x86_64_pc_windows_msvc=clang-cl \
+    CXX_x86_64_pc_windows_msvc=clang-cl \
+    AR_x86_64_pc_windows_msvc=llvm-ar \
+    CC_aarch64_pc_windows_msvc=clang-cl \
+    CXX_aarch64_pc_windows_msvc=clang-cl \
+    AR_aarch64_pc_windows_msvc=llvm-ar \
+    CFLAGS=-DOPENSSL_NO_ASM \
+    CXXFLAGS=-DOPENSSL_NO_ASM \
+    BORING_BSSL_NO_ASM=1 \
+    XWIN_CACHE_DIR=/xwin-cache
+
+# ==========================================
+# 2. 依存ライブラリの事前ビルドステージ
+# ==========================================
+FROM tool-builder AS cacher
+
+ARG CARGO_FEATURES=full
+ARG RUST_TARGET=x86_64-pc-windows-msvc
+
+# Cargo.toml と Cargo.lock、および fuzz ワークスペースメンバのマニフェストを先にコピー
+# （[workspace] members = [".", "fuzz"] のため、fuzz/Cargo.toml が無いとワークスペース解決に失敗する）
+COPY Cargo.toml Cargo.lock /app/
+COPY .cargo/config.toml /app/.cargo/config.toml
+COPY build.rs /app/build.rs
+COPY fuzz/Cargo.toml /app/fuzz/Cargo.toml
+
+# 空の main.rs / lib.rs を作り、依存関係「だけ」を先にコンパイルしてキャッシュ化する。
+# xwin の Windows SDK ダウンロードもこの層で完了させ、以降の再ビルドで再取得しない。
+RUN mkdir src benches \
+    && echo "fn main() {}" > src/main.rs \
+    && echo "" > src/lib.rs \
+    && awk -F'"' '/^\[\[bench\]\]/{p=1} p && /name =/{print $2; p=0}' Cargo.toml \
+       | xargs -I {} touch benches/{}.rs \
+    && awk -F'"' '/^path =/{print $2}' fuzz/Cargo.toml \
+       | while read -r p; do mkdir -p "fuzz/$(dirname "$p")" && echo "fn main() {}" > "fuzz/$p"; done \
+    && cargo xwin build --release --target "${RUST_TARGET}" \
+         --no-default-features --features "${CARGO_FEATURES}" --locked \
+    && rm -rf src/
+
+# ==========================================
+# 3. アプリケーションコードのビルドステージ
+# ==========================================
+FROM tool-builder AS builder
+
+ARG CARGO_FEATURES=full
+ARG RUST_TARGET=x86_64-pc-windows-msvc
+
+# cacher ステージから「ビルド済みの依存関係アセット」を引き継ぐ
+COPY --from=cacher /usr/local/cargo /usr/local/cargo
+COPY --from=cacher /xwin-cache /xwin-cache
+COPY --from=cacher /app/target /app/target
+COPY --from=cacher /app/benches /app/benches
+
+# ソースコードをコピー
+COPY . /app
+
+# cacher 段はスタブの src/main.rs / src/lib.rs で release 成果物をキャッシュしている。
+# 実ソースへ差し替えた後は全 .rs の mtime を更新して再コンパイルを強制する
+# （main.rs だけ touch すると lib のスタブ成果物が最新と誤判定され veil::run 未定義になる）。
+RUN find src -name '*.rs' -exec touch {} + \
+    && cargo xwin build --release --target "${RUST_TARGET}" \
+         --no-default-features --features "${CARGO_FEATURES}" --locked
+
+# ==========================================
+# 4. 成果物エクスポートステージ（--output type=local で取り出す）
+# ==========================================
+FROM scratch AS artifact
+
+ARG RUST_TARGET=x86_64-pc-windows-msvc
+
+COPY --from=builder /app/target/${RUST_TARGET}/release/veil.exe /veil.exe

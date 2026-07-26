@@ -96,8 +96,8 @@ io_uring（独自実装ランタイム）と rustls を使用した高性能リ�
 | **Linux `--features epoll`** | epoll readiness reactor（`src/runtime/reactor/`） | seccomp（epoll 系許可・io_uring 系除外）+ Landlock | ✅ | io_uring 非対応ホスト向けフォールバック |
 | **FreeBSD（x86_64/aarch64）** | kqueue readiness reactor（`--features aio` で POSIX AIO 経路にも切替可・F-127） | capsicum（`cap_rights_limit` / `cap_enter`）+ jail | ✅（FreeBSD 13.0+、`TCP_TXTLS_ENABLE`/`TCP_RXTLS_ENABLE`; F-126） | `[security] enable_capsicum` / `capsicum_capability_mode` / `jail_name` |
 | **OpenBSD（x86_64/aarch64）** | kqueue readiness reactor | pledge + unveil | ✗（ユーザ空間 rustls） | `[security] enable_pledge` / `enable_unveil`。TLS は rustls の **ring** プロバイダを使用（aws-lc-rs は OpenBSD でハンドシェイク未完・F-122）。静的配信/プロキシとも HTTPS 200 検証済み |
-| **macOS（x86_64/aarch64、universal2）** | kqueue readiness reactor（FreeBSD/OpenBSD と共通実装を再利用） | `sandbox_init`（Seatbelt） | ✗（ユーザ空間 rustls） | `[security] enable_sandbox_macos`。TLS は rustls の **ring** プロバイダを使用（aws-lc-sys は zig クロスリンク不可・F-125）。`cargo zigbuild --target universal2-apple-darwin` でクロスビルド。QEMU・実機検証は未実施（下記の注意点を参照） |
-| **Windows（x86_64-pc-windows-msvc / aarch64-pc-windows-msvc）** | WSAPoll readiness reactor（`src/runtime/reactor/wsapoll.rs`、`src/runtime/reactor/tcp/windows.rs`、Winsock） | Job Object（best-effort） | ✗（ユーザ空間 rustls） | `[security] enable_job_object_windows`。TLS プロバイダは **arch 別**: x86_64 は **ring**（aws-lc-sys が NASM を要求するが cargo-xwin コンテナに無い）、aarch64 は **aws_lc_rs**（ARM asm・NASM 不要で cmake クロスビルド可。ring 0.17 は aarch64-pc-windows-msvc の prebuilt asm を持たず cargo-xwin の `/imsvc` handling で失敗するため。v0.6.0）。`cargo xwin build --target <target>`（`packaging/scripts/build-cross.sh --target windows` で両 arch を一括ビルド）。QEMU・実機検証は未実施（下記の注意点を参照） |
+| **macOS（x86_64/aarch64、universal2）** | kqueue readiness reactor（FreeBSD/OpenBSD と共通実装を再利用） | `sandbox_init`（Seatbelt） | ✗（ユーザ空間 rustls） | `[security] enable_sandbox_macos`。TLS は rustls の **aws_lc_rs** プロバイダ、`http3`（quiche）は内蔵 BoringSSL を使用（F-131）。`docker/Dockerfile.macos`（`cargo zigbuild --target universal2-apple-darwin --features full`）でクロスビルドし、実機で動作確認済み |
+| **Windows（x86_64-pc-windows-msvc / aarch64-pc-windows-msvc）** | WSAPoll readiness reactor（`src/runtime/reactor/wsapoll.rs`、`src/runtime/reactor/tcp/windows.rs`、Winsock） | Job Object（best-effort） | ✗（ユーザ空間 rustls） | `[security] enable_job_object_windows`。TLS は両 arch とも rustls の **aws_lc_rs** プロバイダ、`http3`（quiche）は内蔵 BoringSSL を使用（F-131）。`docker/Dockerfile.windows`（`cargo xwin build --target <target> --features full`。`packaging/scripts/build-cross.sh --target windows` で両 arch を一括ビルド）でクロスビルドし、実機で動作確認済み |
 
 - バックエンドは `build.rs` 発行の cfg（`veil_rt_uring` / `veil_rt_reactor`、
   `veil_poller_epoll` / `veil_poller_kqueue`）で選択され、公開ランタイム API パス
@@ -106,8 +106,15 @@ io_uring（独自実装ランタイム）と rustls を使用した高性能リ�
   kqueue が自動選択）。非対象 OS のセキュリティ設定キーは受理し警告して無視する。
 - **aarch64-linux**: `docker/Dockerfile.{glibc,musl}.aarch64` でクロスビルド（QEMU
   user-mode 検証済み。QEMU は io_uring 非対応のため QEMU 実行は `epoll` ビルドを使用）。
-- FreeBSD/OpenBSD は対応する VM 内でネイティブビルド（Rust Tier 2/3・クロスビルド不可）。
-  tar.gz + rc.d/jail.conf のパッケージングは `packaging/scripts/build-bsd.sh` 参照。
+- **FreeBSD/OpenBSD** は対応する QEMU VM 内でビルドする。`tools/qemu/bsd-vm.sh <os> <arch>`
+  が FreeBSD/OpenBSD × x86_64/aarch64 の 4 通りについて、VM 作成 → ビルド →
+  `tests/e2e_setup.sh test` → バイナリ取得までを一括で扱う（x86_64 ゲストはホストに
+  `/dev/kvm` があれば KVM 加速される）。tar.gz + rc.d/jail.conf のパッケージングは
+  `packaging/scripts/build-bsd.sh` 参照。
+  **`x86_64-unknown-freebsd` は Docker クロスビルドも可能**（`docker/Dockerfile.freebsd`。
+  zig が FreeBSD libc を同梱しており Rust Tier 2 のため）。その場合 VM は E2E 実行のみに
+  使う（`tools/qemu/bsd-vm.sh freebsd x86_64 e2e --prebuilt <バイナリ>`）。
+  `aarch64-unknown-freebsd` は Rust Tier 3（prebuilt std 無し）のため VM 内ビルド必須。
 - **FreeBSD POSIX AIO（`--features aio`、F-127）**: ビルド時オプトイン切替（FreeBSD 専用。
   他ターゲットで指定すると `epoll` と同様 build.rs がエラーにする）。既定の kqueue
   readiness 経路の代わりに `TcpStream::read`/`write` を `aio_read(2)`/`aio_write(2)` の
@@ -116,26 +123,29 @@ io_uring（独自実装ランタイム）と rustls を使用した高性能リ�
   キュー上限）時は当該 I/O だけ readiness 経路へフォールバックする。`--features full` には
   含まれない。設計・検証結果は `docs/artifacts/f127_freebsd_aio_design.md` と
   `docs/backlog/features/F-127-freebsd-aio.md` を参照。
-- **macOS（F-125）**: クロスビルドのみ対応。Docker（`messense/cargo-zigbuild`）で
-  ビルドする（`packaging/scripts/build-cross.sh --target macos` 参照）。TLS 暗号は
-  **ring** プロバイダを使用する（aws-lc-sys の手書きアセンブリを zig リンカが解釈できず、
-  release では `AWS_LC_SYS_NO_ASM` も禁止のため。`src/tls_provider.rs` 参照）。macOS には
+- **macOS（F-125/F-131）**: クロスビルドのみ対応。Docker（`docker/Dockerfile.macos`、
+  `messense/cargo-zigbuild` ベース）でビルドする
+  （`packaging/scripts/build-cross.sh --target macos` 参照）。TLS 暗号は
+  **aws_lc_rs** プロバイダを使用する（`src/tls_provider.rs` 参照）。macOS には
   `accept4`/`MSG_NOSIGNAL`/`pipe2`/`SOCK_NONBLOCK|SOCK_CLOEXEC` が無いため、
   `reactor/tcp.rs`・`runtime/udp.rs` は素の `socket`/`accept` + `fcntl`・`SO_NOSIGPIPE` へ、
   `runtime/offload.rs` は `pipe` + `fcntl` へそれぞれフォールバックする。
-  実機・QEMU での動作検証は行っていない（F-125 設計ドキュメントの方針により、クロス
-  ビルド成功のみを合格基準とする）。`http3`/`wasm` feature は macOS クロスビルドで
-  未検証のため `build-cross.sh` の既定 feature セットには含めていない。
-- **Windows（F-125、v0.6.0）**: クロスビルドのみ対応。Docker（`messense/cargo-xwin`）で
+  `build-cross.sh --target macos` の既定は `--features full`（`http3`・`wasm` を含む）で、
+  実機で動作確認済み（F-131）。
+- **Windows（F-125/F-131、v0.6.0）**: クロスビルドのみ対応。Docker
+  （`docker/Dockerfile.windows`、`messense/cargo-xwin` ベース）で
   x86_64-pc-windows-msvc / aarch64-pc-windows-msvc を個別にビルドする
   （`packaging/scripts/build-cross.sh --target windows` 参照）。TLS 暗号プロバイダは
-  arch により異なる（`Cargo.toml` の target 別依存）: x86_64 は **ring**（aws-lc-sys が
-  x86 で NASM を要求するが cargo-xwin コンテナに無いため）、aarch64 は **aws_lc_rs**
-  （ARM asm・NASM 不要。コンテナに `cmake` を導入すればクロスビルド可。ring 0.17 は
-  aarch64-pc-windows-msvc 向け prebuilt asm を持たずソースコンパイルが失敗するため）。
-  実機・QEMU での動作検証は行っていない。`http3`/`wasm`/`ktls`/`l4-proxy` feature は
-  未対応のため既定 feature セットには含めていない（`l4-proxy` は `runtime::udp` が
-  Unix ソケット API 前提のため）。
+  両 arch とも **aws_lc_rs**、`http3`（quiche）は内蔵 BoringSSL を使用する。
+  既定は `--features full`（`http3`・`wasm`・`l4-proxy` を含む）で、実機で動作確認済み。
+  `ktls` は Linux/FreeBSD 専用のため対象外。
+- **TLS 暗号プロバイダ / quiche 暗号バックエンドのターゲット分割（F-122/F-131）**:
+  rustls のプロバイダは **OpenBSD のみ `ring`**、それ以外（Linux/FreeBSD/macOS/Windows）は
+  `aws_lc_rs`（`src/tls_provider.rs` と `Cargo.toml` の target 別依存を一致させること）。
+  `http3` の quiche は **Linux/FreeBSD で `aws-lc-sys` を共有**し、
+  **macOS/Windows/OpenBSD では内蔵 BoringSSL**（`boring`）を使う。この切り替えが
+  `AWS_LC_SYS_NO_PREFIX` であり、値は
+  [`.cargo/config.toml`](../../.cargo/config.toml) の `[env]` のみで設定する（B-47）。
 
 ## ビルド
 
@@ -232,7 +242,13 @@ Docker コンテナでのインストール・起動・curl 動作確認（両�
 
 詳細は [packaging/README.md](../../packaging/README.md) を参照してください。
 
-> **注意**: `--features full` でビルドする場合、`http3` フィーチャーが aws-lc-sys の `libssl` をビルドするため（quiche と rustls で共有、cmake が必要）、`aws-lc-rs` がアセンブリ最適化を使用するため `nasm` が、それぞれコンテナ内にインストールされている必要があります。`http3` を含まないデフォルトビルドでは cmake は不要です。`http3` / `full` ビルド時の `AWS_LC_SYS_NO_PREFIX=1` は `.cargo/config.toml` と `build.rs` により自動適用されます。
+> **注意**: `--features full` でビルドする場合、`http3` フィーチャーが aws-lc-sys の `libssl` をビルドするため cmake が、`aws-lc-rs` がアセンブリ最適化を使用するため `nasm` が、それぞれコンテナ内にインストールされている必要があります。`http3` を含まないデフォルトビルドでは cmake は不要です。
+>
+> **`AWS_LC_SYS_NO_PREFIX`（ターゲット別、B-47）**: `http3` / `full` ビルドでのこの値は [`.cargo/config.toml`](../../.cargo/config.toml) の `[env]` テーブル**のみ**で設定します。aws-lc-sys がターゲット別に優先して読む変数名（`AWS_LC_SYS_NO_PREFIX_<トリプルの - を _ にしたもの>`）を列挙する方式です。
+> - **Linux / FreeBSD → `1`**: quiche が rustls と同じ**非プレフィックス**の AWS-LC シンボルへリンクする（`aws-lc-sys` を 1 つ共有）。
+> - **Windows / macOS / OpenBSD → `0`**: quiche は内蔵 BoringSSL を使うため、`aws-lc-sys` 側はプレフィックスを維持して共存させる。
+>
+> cargo には**ターゲット別の環境変数設定が存在せず**（`[target.<triple>.env]` は警告もなく無視される）、`build.rs` から依存クレートのビルドスクリプトへ環境変数を渡すこともできません（依存側が先に別プロセスで実行されるため）。この変数を Dockerfile や packaging スクリプトで設定してはいけません（設定箇所は `.cargo/config.toml` 1 箇所）。
 
 > **Cargo フィーチャー**: 利用可能なフィーチャーフラグの一覧は [`Cargo.toml` の `[features]` セクション](../../Cargo.toml) を参照してください。
 > 主な注意点：

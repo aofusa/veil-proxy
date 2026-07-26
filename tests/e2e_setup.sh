@@ -29,6 +29,12 @@ VEIL_BIN="${WORKSPACE_DIR}/target/debug/veil"
 if [ -f "${PROJECT_DIR}/target/debug/veil" ]; then
     VEIL_BIN="${PROJECT_DIR}/target/debug/veil"
 fi
+# 事前ビルド済みバイナリの明示指定（B-47 / tools/qemu）。
+# QEMU VM 上で E2E を回す際、veil 本体を VM 内でビルドせず Docker クロスビルド成果物を
+# 使いたいケースがある。指定時はそのパスを優先する。
+if [ -n "${VEIL_BIN_OVERRIDE:-}" ]; then
+    VEIL_BIN="${VEIL_BIN_OVERRIDE}"
+fi
 FIXTURES_DIR="${SCRIPT_DIR}/fixtures"
 PIDS_FILE="${FIXTURES_DIR}/pids.txt"
 
@@ -119,9 +125,15 @@ ensure_veil_binary() {
     local grpc_bin="${SCRIPT_DIR}/grpc_server/target/debug/grpc-server"
     local backends_bin="${SCRIPT_DIR}/test_backends/target/debug/test-backends"
 
+    # VEIL_E2E_SKIP_VEIL_BUILD=1: veil 本体のビルドを省略し、既存バイナリ（VEIL_BIN /
+    # VEIL_BIN_OVERRIDE）をそのまま使う。QEMU VM 上で Docker クロスビルド済みの
+    # veil を検証する用途（tools/qemu、B-47）。grpc-server / test-backends と
+    # E2E テストバイナリ自体は VM 内 cargo が必要なため従来どおりビルドする。
     log_info "Building all E2E binaries (veil + grpc-server + test-backends) with features ${VEIL_E2E_FEATURES}..."
     cd "$PROJECT_DIR"
-    if ! cargo build --features "${VEIL_E2E_FEATURES}"; then
+    if [ "${VEIL_E2E_SKIP_VEIL_BUILD:-0}" = "1" ]; then
+        log_warn "VEIL_E2E_SKIP_VEIL_BUILD=1: skipping veil build, using ${VEIL_BIN}"
+    elif ! cargo build --features "${VEIL_E2E_FEATURES}"; then
         log_error "cargo build --features ${VEIL_E2E_FEATURES} failed"
         exit 1
     fi

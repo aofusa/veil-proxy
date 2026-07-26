@@ -26,7 +26,7 @@
 # 落とし穴（project memory / VM 検証で確認済み）:
 #   - virtio-net-pci には romfile=（空）が必須（efi-virtio.rom 不足で起動失敗するため）。
 #   - シリアルに getty 無し + root SSH 既定無効 → loader メニューで single-user（"2"）から
-#     provision（bsd-arm64-provision.py）。telnet console は IAC(0xff) があり pexpect は latin-1。
+#     provision（freebsd-provision.py）。telnet console は IAC(0xff) があり pexpect は latin-1。
 #   - root FS が ~5G と小さい。qemu-img resize 後の online growfs はマウント中 root で不可
 #     → single-user で / を ro 再マウント → fsck → growfs（`grow` が実施）。
 #   - pkg は IGNORE_OSVERSION=yes ASSUME_ALWAYS_YES=yes で userland 版不一致プロンプト回避。
@@ -90,8 +90,8 @@ cmd_up() {
 cmd_down() { docker rm -f "${NAME}" 2>/dev/null || true; log "removed ${NAME}"; }
 
 cmd_provision() {
-    log "single-user で SSH 鍵注入（bsd-arm64-provision.py --mode ssh）"
-    python3 "${HERE}/bsd-arm64-provision.py" --mode ssh --con-port "${CON_PORT}" --pubkey "${KEY}.pub"
+    log "single-user で SSH 鍵注入（freebsd-provision.py --mode ssh）"
+    python3 "${HERE}/freebsd-provision.py" --mode ssh --con-port "${CON_PORT}" --pubkey "${KEY}.pub"
     log "provision 完了。multi-user 起動を待って ssh 可能（数分）"
 }
 
@@ -120,7 +120,7 @@ s.sendall(b"\r\n"); time.sleep(2)
 s.sendall(b"gpart recover vtbd0 ; gpart resize -i 3 vtbd0\r\n"); time.sleep(10)
 s.close()
 PY
-    python3 "${HERE}/bsd-arm64-provision.py" --mode grow --con-port "${CON_PORT}"
+    python3 "${HERE}/freebsd-provision.py" --mode grow --con-port "${CON_PORT}"
     log "grow 完了（reboot 後 df で確認）"
 }
 

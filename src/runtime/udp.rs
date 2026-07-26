@@ -256,8 +256,7 @@ impl UdpSocket {
                 return Err(io::Error::last_os_error());
             }
             let (storage, len) = sockaddr_to_storage(&addr);
-            let ret =
-                unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, len) };
+            let ret = unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, len) };
             if ret < 0 {
                 unsafe { libc::close(fd) };
                 return Err(io::Error::last_os_error());
@@ -352,14 +351,8 @@ impl UdpSocket {
     pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
             #[cfg(unix)]
-            let ret = unsafe {
-                libc::recv(
-                    self.fd,
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    buf.len(),
-                    0,
-                )
-            };
+            let ret =
+                unsafe { libc::recv(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
             #[cfg(windows)]
             let ret = unsafe {
                 ws_recv(

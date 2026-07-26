@@ -1,3 +1,14 @@
-# 親ワークスペースの AWS_LC_SYS_NO_PREFIX を上書きする。
+# 親ワークスペース（リポジトリ root の .cargo/config.toml）が設定するターゲット別
+# AWS_LC_SYS_NO_PREFIX を打ち消し、プリ生成バインディング（プレフィックス付き）で
+# 高速ビルドする。ここは quiche を使わないテスト用バックエンドのため、
+# 非プレフィックス化（quiche とのシンボル共有）は不要。
+#
+# 親が定義するのは**ターゲット接尾辞付き**の名前であり、aws-lc-sys はそちらを
+# 非接尾辞版より優先して読むため、同じ接尾辞付きの名前を force で上書きする必要がある
+# （非接尾辞の AWS_LC_SYS_NO_PREFIX を 0 にするだけでは親の設定が勝ってしまう）。
 [env]
 AWS_LC_SYS_NO_PREFIX = { value = "0", force = true }
+AWS_LC_SYS_NO_PREFIX_x86_64_unknown_linux_gnu = { value = "0", force = true }
+AWS_LC_SYS_NO_PREFIX_x86_64_unknown_linux_musl = { value = "0", force = true }
+AWS_LC_SYS_NO_PREFIX_aarch64_unknown_linux_gnu = { value = "0", force = true }
+AWS_LC_SYS_NO_PREFIX_aarch64_unknown_linux_musl = { value = "0", force = true }

@@ -32,8 +32,8 @@
 
 #![cfg(feature = "http3")]
 
-use std::cell::RefCell;
 use crate::runtime::handle::AsRawFd;
+use std::cell::RefCell;
 use std::io;
 use std::rc::Rc;
 use std::time::Duration;
@@ -316,7 +316,13 @@ fn drain_plaintext(dst: &mut Vec<u8>, rd: &mut dyn std::io::Read) {
 
 /// `libc::read` ラッパー（ノンブロッキング fd 用）。
 fn raw_fd_read(fd: crate::runtime::handle::RawFd, buf: &mut [u8]) -> io::Result<usize> {
-    let n = unsafe { libc::read(fd as libc::c_int, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as _) };
+    let n = unsafe {
+        libc::read(
+            fd as libc::c_int,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len() as _,
+        )
+    };
     if n < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -326,7 +332,13 @@ fn raw_fd_read(fd: crate::runtime::handle::RawFd, buf: &mut [u8]) -> io::Result<
 
 /// `libc::write` ラッパー（ノンブロッキング fd 用）。
 fn raw_fd_write(fd: crate::runtime::handle::RawFd, buf: &[u8]) -> io::Result<usize> {
-    let n = unsafe { libc::write(fd as libc::c_int, buf.as_ptr() as *const libc::c_void, buf.len() as _) };
+    let n = unsafe {
+        libc::write(
+            fd as libc::c_int,
+            buf.as_ptr() as *const libc::c_void,
+            buf.len() as _,
+        )
+    };
     if n < 0 {
         Err(io::Error::last_os_error())
     } else {
