@@ -17,6 +17,10 @@
 //! - プロキシ機能（HTTPSバックエンドへのプロトコル変換）
 //! - ファイル配信、リダイレクト、メトリクス
 
+// AsRawFd は memfd 経由の証明書リロード（Linux / FreeBSD）と、Linux + io_uring の
+// UDP パイプライン（`PipelinedUdpRecv` / `UringUdpSend`）でのみ使用する。
+// macOS / OpenBSD / Windows では未使用になるため cfg で絞る（unused_imports 警告対策）。
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use crate::runtime::handle::AsRawFd;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -224,8 +228,8 @@ fn create_memfd_for_pem(name: &str, pem_data: &[u8]) -> io::Result<(PemBackedFil
 /// プロファイルのため、一時ファイル書き込みは通常ブロックされない）。
 #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 fn create_memfd_for_pem(name: &str, pem_data: &[u8]) -> io::Result<(PemBackedFile, String)> {
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
+    // OpenOptionsExt は下の `#[cfg(unix)]` ブロック内で use する（ここで先に use すると
+    // 非 unix ターゲットで未使用になり unused_imports 警告になる）。
 
     // 衝突しにくい一意名（pid + 単調カウンタ）。O_EXCL で既存ファイルを掴まない。
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
