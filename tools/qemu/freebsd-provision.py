@@ -40,14 +40,46 @@ def connect(con_port: int):
 
 
 def enter_single_user(child):
-    # ローダーメニュー（beastie）で single user（オプション 2）を選ぶ。
+    """ローダーメニュー（beastie）で single user（オプション 2）を選ぶ。
+
+    メニューは再描画が激しく、1 回の "2" は取りこぼされて autoboot がそのまま
+    multi-user へ進んでしまうことがある（実測）。そこで
+      1. Space で autoboot のカウントダウンを止め、
+      2. "2" を複数回送る
+    という手順にしている。
+    """
     i = child.expect([r"Boot Multi user", r"Autoboot in", TIMEOUT], timeout=300)
     if i == 2:
         print("TIMEOUT waiting for loader menu", flush=True)
         sys.exit(1)
-    time.sleep(1)
-    child.send("2")
+    # autoboot のカウントダウンを止める（メニューが確実に操作可能になる）
+    time.sleep(0.5)
+    child.send(" ")
+    time.sleep(1.5)
+
+    # amd64 では **ローダプロンプトから `console="comconsole"` を設定してから**
+    # single-user 起動する必要がある。
+    # SeaBIOS 経路では SeaBIOS/boot2/ローダの出力はシリアルへ流れるが、
+    # FreeBSD **カーネル**は既定で vidconsole しか使わないため、メニューで "2" を
+    # 選んだだけではカーネル以降の出力・入力がシリアルに出てこない（実測）。
+    # 入力もシリアル経由なので、ここで comconsole へ切り替えても操作系は生き続ける。
+    child.send("3")  # Escape to loader prompt
+    child.expect([r"OK ", r"OK"], timeout=120)
+    child.sendline('set console="comconsole"')
+    time.sleep(1.5)
+    # コンソール切り替え直後は最初の 1 文字が落ちる（`boot -s` が `oot -s` になり
+    # "unknown command" になる）。空行を 1 回送ってプロンプトを出し直してから本命を送る。
+    child.sendline("")
+    time.sleep(1.0)
+    # `-h` (RB_SERIAL) を付けて**カーネル**にもシリアルコンソールを使わせる。
+    # ローダの `console="comconsole"` だけではローダまでの出力しかシリアルに出ず、
+    # カーネル以降が vidconsole のままになる（実測）。
+    child.sendline("boot -s -h")
+
     j = child.expect([r"Enter full pathname of shell.*:", r"\r\n# ", TIMEOUT], timeout=300)
+    if j == 2:
+        print("TIMEOUT waiting for single-user shell", flush=True)
+        sys.exit(1)
     if j == 0:
         child.sendline("")
     child.expect([r"\r\n# "], timeout=120)

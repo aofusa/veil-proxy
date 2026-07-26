@@ -100,6 +100,7 @@ tools/qemu/bsd-vm.sh freebsd x86_64 e2e \
 | `freebsd-provision.py` | FreeBSD のシリアル single-user 経由 SSH 鍵注入（`--mode ssh`）/ growfs（`--mode grow`） |
 | `openbsd-autoinstall.py` | OpenBSD の autoinstall(8) をシリアルコンソールから駆動 |
 | `console-dump.py` | シリアルコンソール（telnet）を非対話で読み出す（`console` サブコマンド） |
+| `qmp-sendkeys.py` | QMP `send-key` でゲストへブラインド入力を送る（シリアルが使えない環境の切り分け用）。QMP は `SSH_PORT+2` で公開している |
 | `helper/Dockerfile` | qemu-system-{arm,x86} + AAVMF/OVMF + ssh/python3-pexpect を収録したヘルパイメージ |
 | `aarch64-vm.sh` | Linux aarch64 VM のライフサイクル |
 | `run-e2e-aarch64.sh` | Linux aarch64 の HTTPS スモーク E2E |
@@ -114,29 +115,52 @@ tools/qemu/bsd-vm.sh freebsd x86_64 e2e \
 | ゲストイメージ URL（FreeBSD amd64/arm64・OpenBSD 7.9 amd64/arm64） | **HTTP 200 を確認済み**（FreeBSD arm64 の URL は "RELEASE" 二重で 404 だったのを修正。OpenBSD 7.6 は CDN から消えていたため既定を 7.9 へ） |
 | `setup`（helper build → イメージ DL → 展開） | **FreeBSD amd64 で実行成功**（helper イメージ build・806MB の xz DL・3.7GB qcow2 展開まで） |
 | `up`（KVM 加速つき起動） | **起動成功**（`accel=kvm -cpu host`。コンテナ内 qemu が動作継続） |
-| `provision` 以降（`grow`/`toolchain`/`build`/`e2e`/`fetch`） | **未達**。下記「FreeBSD amd64 のシリアルコンソール問題」を参照 |
+| ローダメニューのシリアル操作（Space/`3`/`set console`/`boot -s -h`） | **到達確認済み**（下記参照） |
+| `provision` 以降（`grow`/`toolchain`/`build`/`e2e`/`fetch`） | **未達**。カーネルがシリアルへ出力しないため single-user シェルを掴めない。下記「FreeBSD amd64 のシリアルコンソール問題」を参照 |
 | `openbsd-autoinstall.py` | **未実行**。OpenBSD インストーラの対話文言に依存するため、初回実行時に応答の追従が要る可能性が高い |
 | `linux-aarch64-e2e.sh` | **未実行**（KVM 非対応ホストでは TCG が実用不能。下記「既知の環境制約」参照） |
 
-### FreeBSD amd64 のシリアルコンソール問題（未解決）
+### FreeBSD amd64 のシリアルコンソール問題（未解決・調査結果）
 
-**配布されている `FreeBSD-<ver>-RELEASE-amd64.qcow2`（VM-IMAGE）は、電源投入から
-シリアルポートへ一切出力しない**（`-nographic` + `-serial telnet:...` で接続しても
-telnet の IAC バイトしか届かない。ローダメニューも起動ログも出ない）。
-amd64 のローダ／カーネルが既定で vidconsole を使うためで、arm64 VM-IMAGE
-（UEFI + efiboot で既定シリアル）とは事情が異なる。
+`provision`（`freebsd-provision.py` がローダメニューから single-user に入り root の
+SSH 鍵を注入する経路）は **amd64 では最後まで到達しない**。以下は実測で分かったこと。
 
-このため `provision`（= `freebsd-provision.py` がローダメニューで single-user に入り
-root の SSH 鍵を注入する経路）が **amd64 では機能しない**。
-`fbsd-arm64-vm.sh` が arm64 で動いていたのは arm64 が既定でシリアル出力するから。
+**動くところ:**
 
-解決には以下のいずれかが要る（いずれも未実施）:
+- `-serial telnet:...,server,nowait` は**接続前の出力を捨てる**。VM 起動から数秒以内に
+  コンソールへ接続すれば、**SeaBIOS → boot2 → ローダの出力はシリアルに出る**
+  （当初「何も出ない」と見えたのは接続が遅かったため）。`cmd_provision` が
+  down→up 直後にスクリプトを起動するのはこのため。
+- ローダメニューはシリアルから操作できる。Space で autoboot を止め、`3` で
+  ローダプロンプトへ入り、`set console="comconsole"` → `boot -s -h` まで通る
+  （コンソール切り替え直後は 1 文字落ちるので空行を挟む必要がある）。
 
-- イメージをオフラインで編集して `/boot/loader.conf` に `console="comconsole"`
-  （あるいはブートパーティション直下に `-h` を書いた `/boot.config`）を入れる。
-  libguestfs / qemu-nbd が必要で、本リポジトリの想定（sudo 不可）から外れる。
-- 既にプロビジョニング済み（root SSH 鍵入り）のイメージを持ち込む。
-  そのために `BASE_IMG` を用意してある（下記）。
+**動かないところ:**
+
+- ローダが `Loading configured modules...` まで出した後、**カーネルはシリアルへ
+  一切出力しない**。`console="comconsole"` と `-h`(RB_SERIAL) の両方を与えても同じ。
+  `-machine q35` / `-machine pc` の双方で再現する。
+  そのため single-user のシェルプロンプトを掴めず、鍵注入まで進めない。
+
+**試して駄目だった代替手段:**
+
+| 手段 | 結果 |
+|---|---|
+| UEFI(OVMF) で起動して efiboot のシリアル出力を使う | OVMF 自体がシリアルへ出力せず、ローダにも到達を確認できない |
+| libguestfs でイメージをオフライン編集し `/boot/loader.conf` に `console="comconsole"` を書く | **UFS が読み取り専用**。アプライアンスの Linux カーネルは `ufstype=ufs2` で mount できるが書き込み不可（`Read-only file system`） |
+| QMP `send-key` で VGA コンソールへブラインド入力（`qmp-sendkeys.py`） | ローダメニュー操作までは成功（QMP `screendump` で確認済み）。ただし `set console="comconsole"` を入れるとローダが VGA キーボードを読まなくなり、以降タイプできない |
+
+`qmp-sendkeys.py` と `console-dump.py` は上記の切り分けで実際に役立ったため残してある
+（`screendump` でゲスト画面を PNG に落として確認できる）。
+
+**次に試す価値がある案:**
+
+- FreeBSD の `bootonly.iso` / `mini-memstick.img` からシリアル指定でインストールし、
+  `console="comconsole"` を含むイメージを一度だけ作って `BASE_IMG` として使い回す。
+- ホストで root が使える環境なら `qemu-nbd` でイメージをマウントして
+  `/boot/loader.conf` を編集する（本リポジトリの想定外だが最短）。
+- arm64（`bsd-vm.sh freebsd aarch64`）は UEFI + efiboot が既定でシリアルを使うため
+  この問題を受けない。amd64 のビルドを急ぐ場合は arm64 側で先に流す手もある。
 
 #### `BASE_IMG`: プロビジョニング済みイメージのオーバーレイ運用
 

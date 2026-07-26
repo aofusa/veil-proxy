@@ -118,6 +118,9 @@ _port_base() {
 PORT_BASE="$(_port_base)"
 SSH_PORT="${SSH_PORT:-${PORT_BASE}}"
 CON_PORT="${CON_PORT:-$((PORT_BASE + 1))}"
+# QMP（x86_64 のみ使用）。FreeBSD amd64 はシリアルへ出力しないため、
+# ローダへブラインドでキーを送ってシリアルを有効化するのに使う（qmp-sendkeys.py）。
+QMP_PORT="${QMP_PORT:-$((PORT_BASE + 2))}"
 
 # ゲストの SSH ユーザ（FreeBSD/OpenBSD とも root で運用する）
 SSH_USER="${SSH_USER:-root}"
@@ -259,15 +262,24 @@ _write_boot() {
     if [[ "${ARCH}" == "x86_64" ]]; then
         local accel="tcg" cpu="qemu64"
         if [[ "$(uname -m)" == "x86_64" && -r /dev/kvm ]]; then accel="kvm"; cpu="host"; fi
+        # **BIOS(SeaBIOS) で起動する**。UEFI(OVMF) では FreeBSD の efiboot / カーネルが
+        # EFI コンソール（フレームバッファ）を使い、`console="comconsole"` を設定しても
+        # シリアルへ出力されない（実測）。SeaBIOS 経路なら SeaBIOS・boot2・ローダ・
+        # カーネルのすべてがシリアルへ出力される。
+        #
+        # 重要: `-serial ...,server,nowait` は**接続前の出力を捨てる**ため、
+        # ローダメニューを捕まえるには VM 起動直後にコンソールへ接続する必要がある
+        # （`cmd_provision` は down→up 直後に freebsd-provision.py を起動する）。
         cat > "${WORKDIR}/boot.sh" <<EOF
 #!/bin/bash
 set -e
 cd /w
-exec qemu-system-x86_64 -machine q35,accel=${accel} -cpu ${cpu} -smp ${VM_SMP} -m ${VM_MEM_MB} \\
+exec qemu-system-x86_64 -machine pc,accel=${accel} -cpu ${cpu} -smp ${VM_SMP} -m ${VM_MEM_MB} \\
   ${drives} \\
   -netdev user,id=net0,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \\
   -device virtio-net-pci,netdev=net0 \\
-  -nographic -serial telnet:0.0.0.0:${CON_PORT},server,nowait -monitor none
+  -nographic -serial telnet:0.0.0.0:${CON_PORT},server,nowait \\
+  -qmp telnet:0.0.0.0:${QMP_PORT},server,nowait -monitor none
 EOF
     else
         cat > "${WORKDIR}/boot.sh" <<EOF
@@ -297,7 +309,7 @@ cmd_up() {
     fi
     # shellcheck disable=SC2046  # _kvm_args は 0/1 個の引数を意図的に展開する
     docker run -d --name "${NAME}" $(_kvm_args) "${base_mount[@]}" \
-        -p "${SSH_PORT}:${SSH_PORT}" -p "${CON_PORT}:${CON_PORT}" \
+        -p "${SSH_PORT}:${SSH_PORT}" -p "${CON_PORT}:${CON_PORT}" -p "${QMP_PORT}:${QMP_PORT}" \
         -v "${WORKDIR}:/w" -w /w "${HELPER_IMG}" bash /w/boot.sh >/dev/null
     log "起動: console=telnet 127.0.0.1:${CON_PORT}, ssh=127.0.0.1:${SSH_PORT}"
     [[ "${ARCH}" == "aarch64" ]] && log "aarch64 は TCG のため multi-user 到達に数分〜数十分かかる"
@@ -341,6 +353,11 @@ cmd_wait() {
 # ---------------------------------------------------------------------------
 cmd_provision() {
     if [[ "${OS_NAME}" == "freebsd" ]]; then
+        # ローダメニューは起動直後の数秒しか出ず、`-serial ...,nowait` は接続前の出力を
+        # 捨てるため、**VM を再起動してから即座に**コンソールへ接続する必要がある。
+        log "VM を再起動してローダメニューを捕まえる"
+        cmd_down
+        cmd_up
         log "single-user 経由で SSH 鍵注入（freebsd-provision.py --mode ssh）"
         python3 "${HERE}/freebsd-provision.py" --mode ssh --con-port "${CON_PORT}" --pubkey "${KEY}.pub"
     else
