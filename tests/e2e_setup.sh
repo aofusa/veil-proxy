@@ -155,6 +155,14 @@ ensure_veil_binary() {
     fi
     cd - > /dev/null
 
+    # VEIL_BIN はスクリプト冒頭（ビルド前）に解決しているため、クリーンな作業ツリーでは
+    # まだ ${PROJECT_DIR}/target/debug/veil が存在せず、ワークスペースルート側の
+    # パスが選ばれてしまう（QEMU VM の新規チェックアウトで顕在化）。
+    # ビルド後にもう一度解決し直す（明示指定がある場合はそれを尊重する）。
+    if [ -z "${VEIL_BIN_OVERRIDE:-}" ] && [ -f "${PROJECT_DIR}/target/debug/veil" ]; then
+        VEIL_BIN="${PROJECT_DIR}/target/debug/veil"
+    fi
+
     wait_for_binary_ready "$VEIL_BIN" "veil" 300 || exit 1
     wait_for_binary_ready "$grpc_bin" "grpc-server" 120 || exit 1
     wait_for_binary_ready "$backends_bin" "test-backends" 120 || exit 1
