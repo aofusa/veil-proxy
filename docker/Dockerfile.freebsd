@@ -115,10 +115,18 @@ RUN find src -name '*.rs' -exec touch {} + \
          --no-default-features --features "${CARGO_FEATURES}" --locked
 
 # ==========================================
-# 4. 成果物エクスポートステージ（--output type=local で取り出す）
+# 4. 成果物エクスポートステージ
 # ==========================================
+# `--output type=local` は snap 版 Docker のように daemon がファイル所有権を
+# 設定できない環境で `lchownat: operation not permitted` になるため、
+# **イメージとして tag → `docker create` + `docker cp` で取り出す**方式にする
+# （packaging/scripts/build-cross.sh がこの手順を実行する）。
+# scratch イメージでも `docker create` できるよう ENTRYPOINT を置いておく
+# （コンテナは起動せず、ファイル取り出しにしか使わない）。
 FROM scratch AS artifact
 
 ARG RUST_TARGET=x86_64-unknown-freebsd
 
 COPY --from=builder /app/target/${RUST_TARGET}/release/veil /veil
+
+ENTRYPOINT ["/veil"]

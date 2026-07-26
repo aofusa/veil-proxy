@@ -97,6 +97,35 @@ if [[ "${TARGET_OS}" != "macos" && "${TARGET_OS}" != "windows" && "${TARGET_OS}"
     exit 1
 fi
 
+# 専用 Dockerfile の `artifact` ステージをビルドし、成果物を dest_dir へ取り出す。
+#
+# buildkit のローカルエクスポータ（--output）を使わないのは、snap 版 Docker のように
+# daemon がエクスポート先のファイル所有権を設定できない環境で
+# `error setting metadata: lchownat: operation not permitted` になるため。
+# イメージとして tag し `docker create` + `docker cp` で取り出す方式ならその制約を
+# 受けない（コンテナは起動しない。artifact ステージには ENTRYPOINT だけ置いてある）。
+#
+#   $1 dockerfile  $2 rust_target  $3 features  $4 dest_dir  $5 binary name
+_build_artifact() {
+    local dockerfile="$1" rust_target="$2" features="$3" dest_dir="$4" bin_name="$5"
+    local tag="veil-artifact:${rust_target}"
+
+    docker build \
+        -f "${dockerfile}" \
+        --target artifact \
+        --build-arg "RUST_TARGET=${rust_target}" \
+        --build-arg "CARGO_FEATURES=${features}" \
+        -t "${tag}" \
+        "${ROOT}"
+
+    rm -rf "${dest_dir}"
+    mkdir -p "${dest_dir}"
+    local cid
+    cid="$(docker create "${tag}")"
+    docker cp "${cid}:/${bin_name}" "${dest_dir}/${bin_name}"
+    docker rm "${cid}" >/dev/null
+}
+
 build_macos() {
     local features="${CARGO_FEATURES:-${DEFAULT_MACOS_FEATURES}}"
     local rust_target="universal2-apple-darwin"
@@ -109,15 +138,8 @@ build_macos() {
     # aws-lc-sys / boring-sys の重い C ビルドをレイヤキャッシュに残す（B-47）。
     # AWS_LC_SYS_NO_PREFIX は .cargo/config.toml の [env] が唯一の設定箇所（macOS は "0"）。
     local artifact_dir="${BUILD_DIR}/artifact-${rust_target}"
-    rm -rf "${artifact_dir}"
-    mkdir -p "${artifact_dir}"
-    docker build \
-        -f "${ROOT}/docker/Dockerfile.macos" \
-        --target artifact \
-        --build-arg "RUST_TARGET=${rust_target}" \
-        --build-arg "CARGO_FEATURES=${features}" \
-        --output "type=local,dest=${artifact_dir}" \
-        "${ROOT}"
+    _build_artifact "${ROOT}/docker/Dockerfile.macos" "${rust_target}" \
+        "${features}" "${artifact_dir}" veil
 
     local binary_path="${artifact_dir}/veil"
     if [[ ! -f "${binary_path}" ]]; then
@@ -190,15 +212,8 @@ _build_one_windows() {
     # ホスト側の cargo ビルドと同時に走らせても競合しない。
     # AWS_LC_SYS_NO_PREFIX は .cargo/config.toml の [env] が唯一の設定箇所（Windows は "0"）。
     local artifact_dir="${BUILD_DIR}/artifact-${rust_target}"
-    rm -rf "${artifact_dir}"
-    mkdir -p "${artifact_dir}"
-    docker build \
-        -f "${ROOT}/docker/Dockerfile.windows" \
-        --target artifact \
-        --build-arg "RUST_TARGET=${rust_target}" \
-        --build-arg "CARGO_FEATURES=${features}" \
-        --output "type=local,dest=${artifact_dir}" \
-        "${ROOT}"
+    _build_artifact "${ROOT}/docker/Dockerfile.windows" "${rust_target}" \
+        "${features}" "${artifact_dir}" veil.exe
 
     local binary_path="${artifact_dir}/veil.exe"
     if [[ ! -f "${binary_path}" ]]; then
@@ -282,15 +297,8 @@ WARN
 
     # AWS_LC_SYS_NO_PREFIX は .cargo/config.toml の [env] が唯一の設定箇所（FreeBSD は "1"）。
     local artifact_dir="${BUILD_DIR}/artifact-${rust_target}"
-    rm -rf "${artifact_dir}"
-    mkdir -p "${artifact_dir}"
-    docker build \
-        -f "${ROOT}/docker/Dockerfile.freebsd" \
-        --target artifact \
-        --build-arg "RUST_TARGET=${rust_target}" \
-        --build-arg "CARGO_FEATURES=${features}" \
-        --output "type=local,dest=${artifact_dir}" \
-        "${ROOT}"
+    _build_artifact "${ROOT}/docker/Dockerfile.freebsd" "${rust_target}" \
+        "${features}" "${artifact_dir}" veil
 
     local binary_path="${artifact_dir}/veil"
     if [[ ! -f "${binary_path}" ]]; then
