@@ -161,10 +161,12 @@ _image_url() {
             echo "https://download.freebsd.org/releases/VM-IMAGES/${FREEBSD_VER}/amd64/Latest/FreeBSD-${FREEBSD_VER}-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz" ;;
         freebsd-aarch64)
             echo "https://download.freebsd.org/releases/VM-IMAGES/${FREEBSD_VER}/aarch64/Latest/FreeBSD-${FREEBSD_VER}-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz" ;;
+        # miniroot（数十 MB）を使い、sets は HTTP ミラーから取得する
+        # （install イメージは 700MB 超で、どのみち sets は HTTP 指定にするため）。
         openbsd-x86_64)
-            echo "https://cdn.openbsd.org/pub/OpenBSD/${OPENBSD_VER}/amd64/install${OPENBSD_VER//./}.img" ;;
+            echo "https://cdn.openbsd.org/pub/OpenBSD/${OPENBSD_VER}/amd64/miniroot${OPENBSD_VER//./}.img" ;;
         openbsd-aarch64)
-            echo "https://cdn.openbsd.org/pub/OpenBSD/${OPENBSD_VER}/arm64/install${OPENBSD_VER//./}.img" ;;
+            echo "https://cdn.openbsd.org/pub/OpenBSD/${OPENBSD_VER}/arm64/miniroot${OPENBSD_VER//./}.img" ;;
     esac
 }
 
@@ -288,9 +290,13 @@ EOF
 # qemu を実行している helper コンテナ自身。同コンテナ内で python3 -m http.server を上げる）。
 _write_openbsd_autoinstall() {
     local pub; pub="$(cat "${KEY}.pub")"
+    # 応答ファイルに無い質問はインストーラの**既定値**が使われる。必要最小限だけ書く。
+    # ディスクは miniroot が sd0、インストール先の qcow2 が sd1（_write_boot 参照）。
+    local parttable="whole"
+    [[ "${ARCH}" == "aarch64" ]] && parttable="GPT"
     cat > "${WORKDIR}/auto_install.conf" <<EOF
-System hostname = veil-${ARCH}
-Password for root = *************
+System hostname = veil-${OS_NAME}-${ARCH}
+Password for root = ${VM_ROOT_PASSWORD}
 Allow root ssh login = prohibit-password
 Public ssh key for root account = ${pub}
 Network interfaces = vio0
@@ -298,14 +304,13 @@ IPv4 address for vio0 = dhcp
 Setup a user = no
 What timezone are you in = UTC
 Which disk is the root disk = sd1
-Use (W)hole disk MBR, whole disk (G)PT or (E)dit = whole
+Use (W)hole disk MBR, whole disk (G)PT or (E)dit = ${parttable}
 Use (A)uto layout, (E)dit auto layout, or create (C)ustom layout = auto
 Location of sets = http
 HTTP Server = cdn.openbsd.org
 Unable to connect using https. Use http instead = yes
-Set name(s) = -game* -x* done
+Set name(s) = -game* -x*
 Directory does not contain SHA256.sig. Continue without verification = yes
-Do you expect to run the X Window System = no
 EOF
     log "auto_install.conf を生成: ${WORKDIR}/auto_install.conf"
 }
@@ -321,34 +326,36 @@ _kvm_args() {
 }
 
 _write_boot() {
-    # OpenBSD の install フェーズだけ miniroot を 1 台目（= 起動ディスク、ゲストからは
-    # sd0）、ターゲット qcow2 を 2 台目（sd1）として繋ぐ。auto_install.conf の
-    # 「root disk = sd1」はこの並びに対応する。install 後は miniroot を外して
-    # ターゲットだけで起動する（そのとき sd0 になる）。
-    # オーバーレイ運用（BASE_IMG）では backing file を読み取り専用マウントで見せるため、
+    local phase="${1:-}"
+
+    # --- ルートディスク -------------------------------------------------------
+    # オーバーレイ運用（BASE_IMG）では backing file を読み取り専用でマウントするため、
     # qemu が backing に共有 write ロックを取ろうとして
-    # `Could not open backing file: Failed to get shared "write" lock` で失敗する。
+    # `Could not open backing file: Failed to get shared "write" lock` になる。
     # backing のロックだけ無効化する（backing は qemu が O_RDONLY で開くので安全）。
     local drive_opts=""
     [[ -f "${WORKDIR}/.base_img_dir" ]] && drive_opts=",backing.file.locking=off"
 
     # ルートディスクは素の `-drive if=virtio,index=0` にする。
-    # `-drive if=none` + `-device virtio-blk-pci,bootindex=0` に変えたところ、
-    # boot2 が `Booting from Hard Disk...` のスピナーのまま進まなくなった（実測）。
-    # ブート候補を増やさないため、cloud-init シードは下で CD-ROM として繋ぐ。
+    # `-drive if=none` + `-device virtio-blk-pci,bootindex=0` へ変えたところ、
+    # FreeBSD の boot2 が `Booting from Hard Disk...` のスピナーのまま進まなくなった
+    # （実測）。ブート候補を増やさないため、追加メディアは下で CD-ROM として繋ぐ。
     local drives
-    if [[ "${OS_NAME}" == "openbsd" && "${1:-}" == "install" ]]; then
+    if [[ "${OS_NAME}" == "openbsd" && "${phase}" == "install" ]]; then
+        # OpenBSD の install フェーズだけ miniroot を 1 台目（ゲストからは sd0）、
+        # ターゲット qcow2 を 2 台目（sd1）にする。
+        # auto_install.conf の「root disk = sd1」はこの並びに対応する。
         drives="-drive if=virtio,format=raw,file=miniroot.img,index=0 \\
   -drive if=virtio,format=qcow2,file=${IMG_NAME},index=1"
     else
         drives="-drive if=virtio,format=qcow2,file=${IMG_NAME},index=0${drive_opts}"
     fi
 
+    # --- 追加メディア（cloud-init シード） -----------------------------------
     # FreeBSD は cloud-init シード（ISO9660、ラベル `cidata`）を繋ぐ。
-    # **CD-ROM として繋ぐ**のが要点。virtio-blk のディスクとして足すと、
-    # FreeBSD のローダが起動デバイスを取り違えて `Failed to load kernel 'kernel'` で
-    # ローダプロンプトに落ちる（bootindex を明示しても再現した）。
-    # CD-ROM なら NoCloud データソースの標準形でもあり、ディスク列挙にも影響しない。
+    # **CD-ROM として繋ぐ**のが要点。virtio-blk のディスクとして足すと、FreeBSD の
+    # ローダが起動デバイスを取り違えて `Failed to load kernel 'kernel'` になる
+    # （bootindex を明示しても再現）。CD-ROM は NoCloud データソースの標準形でもある。
     local seed_drive=""
     if [[ "${OS_NAME}" == "freebsd" && -f "${WORKDIR}/seed.img" ]]; then
         if [[ "${ARCH}" == "x86_64" ]]; then
@@ -356,7 +363,7 @@ _write_boot() {
   -device ide-cd,drive=seed0 \\
   "
         else
-            # aarch64 virt マシンには IDE が無いので virtio-scsi 経由の CD-ROM にする
+            # aarch64 の virt マシンには IDE が無いので virtio-scsi 経由の CD-ROM にする
             seed_drive="-device virtio-scsi-pci,id=scsi0 \\
   -drive if=none,id=seed0,format=raw,file=seed.img,media=cdrom \\
   -device scsi-cd,bus=scsi0.0,drive=seed0 \\
@@ -364,42 +371,46 @@ _write_boot() {
         fi
     fi
 
+    # --- コンソール ------------------------------------------------------------
+    # `-serial ...,server,nowait` は**接続前の出力を捨てる**。ローダメニューなど
+    # 起動直後の出力を見たいときは VM 起動直後にコンソールへ接続すること。
+    # QMP は send-key / screendump / system_powerdown に使う（両アーキで公開する）。
+    local console_args="-nographic -serial telnet:0.0.0.0:${CON_PORT},server,nowait \\
+  -qmp telnet:0.0.0.0:${QMP_PORT},server,nowait -monitor none"
+
     if [[ "${ARCH}" == "x86_64" ]]; then
         local accel="tcg" cpu="qemu64"
         if [[ "$(uname -m)" == "x86_64" && -r /dev/kvm ]]; then accel="kvm"; cpu="host"; fi
         # **BIOS(SeaBIOS) で起動する**。UEFI(OVMF) では FreeBSD の efiboot / カーネルが
-        # EFI コンソール（フレームバッファ）を使い、`console="comconsole"` を設定しても
-        # シリアルへ出力されない（実測）。SeaBIOS 経路なら SeaBIOS・boot2・ローダ・
-        # カーネルのすべてがシリアルへ出力される。
-        #
-        # 重要: `-serial ...,server,nowait` は**接続前の出力を捨てる**ため、
-        # ローダメニューを捕まえるには VM 起動直後にコンソールへ接続する必要がある
-        # （`cmd_provision` は down→up 直後に freebsd-provision.py を起動する）。
+        # EFI コンソールを使い、`console="comconsole"` を設定してもシリアルへ出力されない
+        # （実測）。SeaBIOS 経路なら SeaBIOS・boot2・ローダ・カーネルすべてがシリアルに出る。
         cat > "${WORKDIR}/boot.sh" <<EOF
 #!/bin/bash
 set -e
 cd /w
-exec qemu-system-x86_64 -machine pc,accel=${accel} -cpu ${cpu} -smp ${VM_SMP} -m ${VM_MEM_MB} \\
-  ${drives} \\
-  ${seed_drive}-netdev user,id=net0,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \\
-  -device virtio-net-pci,netdev=net0 \\
-  -nographic -serial telnet:0.0.0.0:${CON_PORT},server,nowait \\
-  -qmp telnet:0.0.0.0:${QMP_PORT},server,nowait -monitor none
+exec qemu-system-x86_64 -machine pc,accel=${accel} -cpu ${cpu} -smp ${VM_SMP} -m ${VM_MEM_MB} \
+  ${drives} \
+  ${seed_drive}-netdev user,id=net0,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
+  -device virtio-net-pci,netdev=net0 \
+  ${console_args}
 EOF
     else
+        # aarch64 は UEFI(AAVMF)。arm64 の BSD は efiboot がファームウェアの ConOut を
+        # 引き継ぐため、シリアルが既定で使える（amd64 と事情が違う）。
+        # virtio-net-pci には romfile=（空）が必須（efi-virtio.rom 不足で起動失敗するため）。
         cat > "${WORKDIR}/boot.sh" <<EOF
 #!/bin/bash
 set -e
 cd /w
 [ -f efi_code.img ] || { truncate -s 64m efi_code.img; dd if=/usr/share/AAVMF/AAVMF_CODE.fd of=efi_code.img conv=notrunc 2>/dev/null; }
 [ -f varstore.img ] || truncate -s 64m varstore.img
-exec qemu-system-aarch64 -machine virt -cpu cortex-a72 -smp ${VM_SMP} -m ${VM_MEM_MB} \\
-  -drive if=pflash,format=raw,file=efi_code.img,readonly=on \\
-  -drive if=pflash,format=raw,file=varstore.img \\
-  ${drives} \\
-  ${seed_drive}-netdev user,id=net0,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \\
-  -device virtio-net-pci,netdev=net0,romfile= \\
-  -nographic -serial telnet:0.0.0.0:${CON_PORT},server,nowait -monitor none
+exec qemu-system-aarch64 -machine virt -cpu cortex-a72 -smp ${VM_SMP} -m ${VM_MEM_MB} \
+  -drive if=pflash,format=raw,file=efi_code.img,readonly=on \
+  -drive if=pflash,format=raw,file=varstore.img \
+  ${drives} \
+  ${seed_drive}-netdev user,id=net0,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
+  -device virtio-net-pci,netdev=net0,romfile= \
+  ${console_args}
 EOF
     fi
 }
@@ -492,13 +503,21 @@ cmd_provision() {
         cmd_ssh 'uname -a'
         log "provision 完了"
     else
-        # OpenBSD は autoinstall で鍵注入済み。install フェーズをここで実行する。
+        # OpenBSD は autoinstall(8) がインストールと同時に SSH 公開鍵まで入れる。
+        # miniroot を 1 台目に繋いだ install フェーズを起動し、応答ファイルを与える。
+        [[ -f "${WORKDIR}/auto_install.conf" ]] || die "auto_install.conf が無い。先に setup を実行すること"
         log "OpenBSD autoinstall を実行（miniroot 起動 → 応答ファイル取得 → インストール）"
+        cmd_down
         cmd_up install
         python3 "${HERE}/openbsd-autoinstall.py" --con-port "${CON_PORT}" --workdir "${WORKDIR}" \
             --container "${NAME}" --arch "${ARCH}"
-        log "autoinstall 完了。miniroot 無しで再起動する"
-        cmd_down; cmd_up
+        log "autoinstall 完了。miniroot を外して再起動する"
+        cmd_down
+        cmd_up
+        log "SSH 到達を確認"
+        cmd_wait "${1:-1200}"
+        cmd_ssh 'uname -a'
+        log "provision 完了"
     fi
 }
 
