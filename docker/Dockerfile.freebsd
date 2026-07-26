@@ -56,16 +56,29 @@ RUN ZL="$(dirname "$(readlink -f "$(command -v zig)")")/lib" \
     && cp -a "$ZL/libc/include/x86_64-freebsd-none" /zig-freebsd-includes/ \
     && ls /zig-freebsd-includes
 
-# CMAKE_SYSTEM_NAME は **あえて設定しない**（B-49）。
-# aws-lc-sys は cmake ビルダを使う（`ssl` フィーチャーが必要で、cc ビルダは
-# "cc_builder for libssl not supported" になるため cmake 一択）。その cmake 設定は
-# cmake-rs が TARGET から CMAKE_SYSTEM_NAME と **CMAKE_SYSTEM_PROCESSOR** を
-# 揃えて導出する。ここで CMAKE_SYSTEM_NAME だけを手で与えると PROCESSOR が
-# 伴わず、aws-lc の CMakeLists がアーキテクチャを判定できずアセンブリを無効化し、
-# s2n-bignum の `.S`（curve25519 / edwards25519 / bignum_*）が 1 つも組み立てられない。
-# 一方 aws-lc の C 側は `OPENSSL_FREEBSD` により `CURVE25519_S2N_BIGNUM_CAPABLE` を
-# 立ててこれらを呼ぶため、リンク時に `undefined symbol: curve25519_x25519_byte` などが
-# 多数出る。導出を cmake-rs に任せることで整合させる。
+# !! 既知の未解決問題（B-49）: 本 Dockerfile は **リンク段で失敗する** !!
+#
+# Rust のコンパイルまでは通るが、aws-lc-sys の s2n-bignum アセンブリ
+# （curve25519 / edwards25519 / bignum_*）が FreeBSD クロス構成で 1 つも
+# 組み立てられず、`undefined symbol: curve25519_x25519_byte` などが多数出る。
+# aws-lc の C 側は `OPENSSL_FREEBSD` により `CURVE25519_S2N_BIGNUM_CAPABLE` を
+# 立ててこれらを呼ぶため、実体が無いままリンクに入る。
+#
+# 試して**解決しなかった**もの:
+#   - AWS_LC_SYS_CMAKE_BUILDER=0（cc ビルダ強制）
+#       → "cc_builder for libssl not supported" で panic。veil は quiche と
+#         シンボルを共有するため `ssl` フィーチャーが必須で cmake 一択。
+#   - CMAKE_SYSTEM_NAME=FreeBSD を明示 / 明示せず cmake-rs に導出させる
+#       → どちらも同じ undefined symbol 群で失敗（そのため現在は設定しない）。
+#   - AWS_LC_SYS_NO_ASM=1
+#       → aws-lc-sys が "only allowed for debug builds!" で panic。
+#
+# なお `zig cc -target x86_64-freebsd-none` 自体は該当の `.S` を正しく組み立て、
+# シンボルを定義できることを実測で確認済み（zig 側の制約ではない）。
+#
+# **FreeBSD の公式ビルド経路は QEMU VM 内のネイティブビルド**:
+#   tools/qemu/bsd-vm.sh freebsd {x86_64,aarch64} build
+# 詳細: docs/backlog/bugs/B-49-awslc-freebsd-cross-missing-s2n-bignum-asm.md
 ENV BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_freebsd="--target=x86_64-unknown-freebsd -isystem /zig-freebsd-includes/x86_64-freebsd-none -isystem /zig-freebsd-includes/generic-freebsd"
 
 # ==========================================
