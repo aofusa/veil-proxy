@@ -144,12 +144,18 @@ def main() -> None:
     ap.add_argument("--type", dest="text", action="append", default=[],
                     help="タイプする文字列（末尾で Enter）")
     ap.add_argument("--sleep", type=float, default=0.0, help="処理前の待機秒数")
+    ap.add_argument("--powerdown", action="store_true",
+                    help="ACPI シャットダウン（system_powerdown）を送る")
     args = ap.parse_args()
 
     if args.sleep:
         time.sleep(args.sleep)
 
     q = Qmp(args.port)
+    if args.powerdown:
+        q.cmd({"execute": "system_powerdown"})
+        print("POWERDOWN_SENT", flush=True)
+        return
     if args.freebsd_serial_boot:
         freebsd_serial_boot(q, args.menu_wait, args.single_user)
     for k in args.key:

@@ -84,6 +84,8 @@ VM_SMP="${VM_SMP:-4}"
 VM_MEM_MB="${VM_MEM_MB:-4096}"
 GROW_GB="${GROW_GB:-24}"
 FREEBSD_VER="${FREEBSD_VER:-14.3-RELEASE}"
+# ゲストの root パスワード（シリアルコンソールからのデバッグ用。SSH は鍵のみ）
+VM_ROOT_PASSWORD="${VM_ROOT_PASSWORD:-veil}"
 # OpenBSD の CDN は直近数リリースしか保持しない（例: 7.6 は既に 404）。
 # 既定は入手可能な最新に追従させ、古いリリースを使う場合は OPENBSD_VER で指定する
 # （`curl -s https://cdn.openbsd.org/pub/OpenBSD/ | grep -oE '"[0-9]\.[0-9]/"'` で確認できる）。
@@ -145,10 +147,15 @@ helper() {
 # ---------------------------------------------------------------------------
 _image_url() {
     case "${OS_NAME}-${ARCH}" in
+        # **BASIC-CLOUDINIT 版**を使う。cloud-init が入っているので、NoCloud シード
+        # （cloud-localds で作る `cidata` ラベルのディスク）から SSH 公開鍵を注入でき、
+        # **シリアルコンソール操作なしで provision が完結する**。
+        # 素の VM-IMAGE はシリアルへ出力せず（amd64）、コンソール経由の鍵注入が
+        # 現実的でないため採用しない（tools/qemu/README.md 参照）。
         freebsd-x86_64)
-            echo "https://download.freebsd.org/releases/VM-IMAGES/${FREEBSD_VER}/amd64/Latest/FreeBSD-${FREEBSD_VER}-amd64.qcow2.xz" ;;
+            echo "https://download.freebsd.org/releases/VM-IMAGES/${FREEBSD_VER}/amd64/Latest/FreeBSD-${FREEBSD_VER}-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz" ;;
         freebsd-aarch64)
-            echo "https://download.freebsd.org/releases/VM-IMAGES/${FREEBSD_VER}/aarch64/Latest/FreeBSD-${FREEBSD_VER}-arm64-aarch64.qcow2.xz" ;;
+            echo "https://download.freebsd.org/releases/VM-IMAGES/${FREEBSD_VER}/aarch64/Latest/FreeBSD-${FREEBSD_VER}-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz" ;;
         openbsd-x86_64)
             echo "https://cdn.openbsd.org/pub/OpenBSD/${OPENBSD_VER}/amd64/install${OPENBSD_VER//./}.img" ;;
         openbsd-aarch64)
@@ -181,12 +188,20 @@ cmd_setup() {
 
     local url; url="$(_image_url)"
     if [[ "${OS_NAME}" == "freebsd" ]]; then
-        if [[ ! -f "${IMG}" ]]; then
-            log "FreeBSD VM-IMAGE を DL + 展開: ${url}"
-            curl -fL --retry 3 -o "${IMG}.xz" "${url}"
-            xz -dc "${IMG}.xz" > "${IMG}"
-            rm -f "${IMG}.xz"
+        # 配布イメージは `base.qcow2` として保持し、実際に起動するのはその
+        # **qcow2 オーバーレイ**（`disk.qcow2`）にする。こうすると
+        #   - 再プロビジョニングはオーバーレイを作り直すだけ（再ダウンロード不要）
+        #   - 元イメージが汚れない
+        # という利点がある。`reset` サブコマンドでオーバーレイだけ作り直せる。
+        local base="${WORKDIR}/base.qcow2"
+        if [[ ! -f "${base}" ]]; then
+            log "FreeBSD VM-IMAGE（BASIC-CLOUDINIT）を DL + 展開: ${url}"
+            curl -fL --retry 3 -o "${base}.xz" "${url}"
+            xz -dc "${base}.xz" > "${base}"
+            rm -f "${base}.xz"
         fi
+        [[ -f "${IMG}" ]] || _create_overlay
+        _write_cloudinit_seed
     else
         # OpenBSD は ready-made な qcow2 が無いため miniroot からの autoinstall。
         if [[ ! -f "${WORKDIR}/miniroot.img" ]]; then
@@ -200,6 +215,67 @@ cmd_setup() {
         _write_openbsd_autoinstall
     fi
     log "setup 完了"
+}
+
+# base.qcow2 から起動用オーバーレイ（disk.qcow2）を作る。
+#
+# 配布イメージの仮想サイズは ~6GiB しかなく、cloud-init の初回処理
+# （デバッグシンボルの展開など）で **ゲストのファイルシステムが満杯**になり、
+# sshd まで到達しない（`No space left on device` が延々と出る = 実測）。
+# そこでオーバーレイ作成時に +${GROW_GB}G して、cloud-init の growfs に拡張させる。
+_create_overlay() {
+    local base_size total
+    base_size="$(helper qemu-img info --output=json base.qcow2 | tr -d ' \n' \
+        | sed -n 's/.*"virtual-size":\([0-9]*\).*/\1/p')"
+    [[ -n "${base_size}" ]] || die "base.qcow2 の仮想サイズを取得できなかった"
+    total=$(( base_size + GROW_GB * 1024 * 1024 * 1024 ))
+    log "起動用オーバーレイを作成（base + ${GROW_GB}G = $(( total / 1024 / 1024 / 1024 ))G）"
+    helper qemu-img create -f qcow2 -F qcow2 -b base.qcow2 "${IMG_NAME}" "${total}" >/dev/null
+}
+
+# cloud-init（NoCloud）のシードディスクを作る。
+#
+# FreeBSD の BASIC-CLOUDINIT イメージは cloud-init 入りなので、`cidata` ラベルの
+# ディスクを 1 本足すだけで root の SSH 公開鍵注入と sshd 有効化ができる。
+# **シリアルコンソールを一切使わない**ので、amd64 でローダ/カーネルがシリアルへ
+# 出力しない問題（tools/qemu/README.md 参照）を完全に回避できる。
+_write_cloudinit_seed() {
+    local pub; pub="$(cat "${KEY}.pub")"
+    # 鍵は `users:` 経由ではなく **write_files で /root/.ssh/authorized_keys を直接置く**。
+    # cloud-init の `users:` による root の鍵設定はディストリ差があり、FreeBSD の
+    # BASIC-CLOUDINIT イメージでは適用されず `Permission denied (publickey)` になった。
+    cat > "${WORKDIR}/user-data" <<EOF
+#cloud-config
+disable_root: false
+ssh_pwauth: false
+# シリアルコンソールからのデバッグ用に root パスワードを設定する。
+# SSH は鍵認証のみ（ssh_pwauth: false）で、VM のポートは 127.0.0.1 のみに
+# フォワードされるローカル開発用 VM なので、固定パスワードで問題ない。
+chpasswd:
+  expire: false
+  list: |
+    root:${VM_ROOT_PASSWORD}
+write_files:
+  - path: /root/.ssh/authorized_keys
+    permissions: '0600'
+    owner: 'root:wheel'
+    content: |
+      ${pub}
+runcmd:
+  - [ sh, -c, "chmod 700 /root/.ssh" ]
+  - [ sysrc, sshd_enable=YES ]
+  - [ sh, -c, "sed -i '' -e 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config" ]
+  - [ sh, -c, "sed -i '' -e 's/^#*PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config" ]
+  - [ service, sshd, restart ]
+EOF
+    # instance-id を変えると cloud-init は「別インスタンス」とみなして設定を**再適用**する。
+    # 鍵やユーザデータを変えたあとに seed を作り直して再起動すれば反映される。
+    cat > "${WORKDIR}/meta-data" <<EOF
+instance-id: veil-${OS_NAME}-${ARCH}-$(date +%s)
+local-hostname: veil-${OS_NAME}-${ARCH}
+EOF
+    log "cloud-init シードを生成（cloud-localds）"
+    helper cloud-localds seed.img user-data meta-data
 }
 
 # OpenBSD autoinstall(8) の応答ファイル。installer から
@@ -251,12 +327,36 @@ _write_boot() {
     local drive_opts=""
     [[ -f "${WORKDIR}/.base_img_dir" ]] && drive_opts=",backing.file.locking=off"
 
+    # ルートディスクは素の `-drive if=virtio,index=0` にする。
+    # `-drive if=none` + `-device virtio-blk-pci,bootindex=0` に変えたところ、
+    # boot2 が `Booting from Hard Disk...` のスピナーのまま進まなくなった（実測）。
+    # ブート候補を増やさないため、cloud-init シードは下で CD-ROM として繋ぐ。
     local drives
     if [[ "${OS_NAME}" == "openbsd" && "${1:-}" == "install" ]]; then
         drives="-drive if=virtio,format=raw,file=miniroot.img,index=0 \\
   -drive if=virtio,format=qcow2,file=${IMG_NAME},index=1"
     else
         drives="-drive if=virtio,format=qcow2,file=${IMG_NAME},index=0${drive_opts}"
+    fi
+
+    # FreeBSD は cloud-init シード（ISO9660、ラベル `cidata`）を繋ぐ。
+    # **CD-ROM として繋ぐ**のが要点。virtio-blk のディスクとして足すと、
+    # FreeBSD のローダが起動デバイスを取り違えて `Failed to load kernel 'kernel'` で
+    # ローダプロンプトに落ちる（bootindex を明示しても再現した）。
+    # CD-ROM なら NoCloud データソースの標準形でもあり、ディスク列挙にも影響しない。
+    local seed_drive=""
+    if [[ "${OS_NAME}" == "freebsd" && -f "${WORKDIR}/seed.img" ]]; then
+        if [[ "${ARCH}" == "x86_64" ]]; then
+            seed_drive="-drive if=none,id=seed0,format=raw,file=seed.img,media=cdrom \\
+  -device ide-cd,drive=seed0 \\
+  "
+        else
+            # aarch64 virt マシンには IDE が無いので virtio-scsi 経由の CD-ROM にする
+            seed_drive="-device virtio-scsi-pci,id=scsi0 \\
+  -drive if=none,id=seed0,format=raw,file=seed.img,media=cdrom \\
+  -device scsi-cd,bus=scsi0.0,drive=seed0 \\
+  "
+        fi
     fi
 
     if [[ "${ARCH}" == "x86_64" ]]; then
@@ -276,7 +376,7 @@ set -e
 cd /w
 exec qemu-system-x86_64 -machine pc,accel=${accel} -cpu ${cpu} -smp ${VM_SMP} -m ${VM_MEM_MB} \\
   ${drives} \\
-  -netdev user,id=net0,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \\
+  ${seed_drive}-netdev user,id=net0,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \\
   -device virtio-net-pci,netdev=net0 \\
   -nographic -serial telnet:0.0.0.0:${CON_PORT},server,nowait \\
   -qmp telnet:0.0.0.0:${QMP_PORT},server,nowait -monitor none
@@ -292,7 +392,7 @@ exec qemu-system-aarch64 -machine virt -cpu cortex-a72 -smp ${VM_SMP} -m ${VM_ME
   -drive if=pflash,format=raw,file=efi_code.img,readonly=on \\
   -drive if=pflash,format=raw,file=varstore.img \\
   ${drives} \\
-  -netdev user,id=net0,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \\
+  ${seed_drive}-netdev user,id=net0,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \\
   -device virtio-net-pci,netdev=net0,romfile= \\
   -nographic -serial telnet:0.0.0.0:${CON_PORT},server,nowait -monitor none
 EOF
@@ -316,7 +416,22 @@ cmd_up() {
     return 0
 }
 
-cmd_down() { docker rm -f "${NAME}" >/dev/null 2>&1 || true; log "removed ${NAME}"; }
+# VM を止める。**まず QMP で ACPI シャットダウンを試み**、ゲストのファイルシステムを
+# 壊さないようにする（`docker rm -f` は qemu を SIGKILL するため、cloud-init/growfs の
+# 書き込み中に落とすとイメージが壊れて次回 boot2 が回り続ける = 実測）。
+cmd_down() {
+    if docker ps --filter "name=^/${NAME}$" --format '{{.Names}}' 2>/dev/null | grep -q .; then
+        if python3 "${HERE}/qmp-sendkeys.py" --port "${QMP_PORT}" --powerdown >/dev/null 2>&1; then
+            local waited=0
+            while (( waited < ${DOWN_TIMEOUT:-60} )); do
+                docker ps --filter "name=^/${NAME}$" --format '{{.Names}}' 2>/dev/null | grep -q . || break
+                sleep 3; waited=$((waited + 3))
+            done
+        fi
+    fi
+    docker rm -f "${NAME}" >/dev/null 2>&1 || true
+    log "removed ${NAME}"
+}
 
 cmd_status() {
     docker ps -a --filter "name=^/${NAME}$" --format '{{.Names}} {{.Status}}' || true
@@ -353,13 +468,24 @@ cmd_wait() {
 # ---------------------------------------------------------------------------
 cmd_provision() {
     if [[ "${OS_NAME}" == "freebsd" ]]; then
-        # ローダメニューは起動直後の数秒しか出ず、`-serial ...,nowait` は接続前の出力を
-        # 捨てるため、**VM を再起動してから即座に**コンソールへ接続する必要がある。
-        log "VM を再起動してローダメニューを捕まえる"
+        # 2 段構え:
+        #   1. cloud-init（BASIC-CLOUDINIT イメージ + NoCloud シード）が root
+        #      パスワード設定と growfs を行う。
+        #   2. **シリアルコンソールから root ログインして SSH 公開鍵を注入**する。
+        #      FreeBSD 版 cloud-init は `chpasswd` は適用するが `write_files` /
+        #      `runcmd` は実行しないため、鍵注入は cloud-init に任せられない（実測）。
+        [[ -f "${WORKDIR}/seed.img" ]] || die "cloud-init シードがない。先に setup を実行すること"
+        log "VM を起動（初回は growfs / freebsd-update で 10 分以上かかることがある）"
         cmd_down
         cmd_up
-        log "single-user 経由で SSH 鍵注入（freebsd-provision.py --mode ssh）"
-        python3 "${HERE}/freebsd-provision.py" --mode ssh --con-port "${CON_PORT}" --pubkey "${KEY}.pub"
+        sleep 5
+        log "シリアルコンソールから root ログインして SSH 鍵を注入"
+        python3 "${HERE}/freebsd-provision.py" --mode login --con-port "${CON_PORT}" \
+            --pubkey "${KEY}.pub" --password "${VM_ROOT_PASSWORD}"
+        log "SSH 到達を確認"
+        cmd_wait "${1:-600}"
+        cmd_ssh 'uname -a'
+        log "provision 完了"
     else
         # OpenBSD は autoinstall で鍵注入済み。install フェーズをここで実行する。
         log "OpenBSD autoinstall を実行（miniroot 起動 → 応答ファイル取得 → インストール）"
@@ -369,6 +495,17 @@ cmd_provision() {
         log "autoinstall 完了。miniroot 無しで再起動する"
         cmd_down; cmd_up
     fi
+}
+
+# 起動用オーバーレイを作り直して初期状態へ戻す（base.qcow2 は再利用するので DL 不要）。
+# cloud-init も instance-id が変わるので設定を再適用する。
+cmd_reset() {
+    [[ -f "${WORKDIR}/base.qcow2" ]] || die "base.qcow2 が無い。先に setup を実行すること"
+    cmd_down
+    rm -f "${IMG}"
+    _create_overlay
+    _write_cloudinit_seed
+    log "reset 完了（次の up で初期状態から起動する）"
 }
 
 cmd_grow() {
@@ -506,6 +643,7 @@ cmd_fetch() {
 
 case "${COMMAND}" in
     setup) cmd_setup ;;
+    reset) cmd_reset ;;
     up) cmd_up "$@" ;;
     wait) cmd_wait "$@" ;;
     grow) cmd_grow ;;

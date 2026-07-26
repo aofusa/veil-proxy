@@ -92,18 +92,69 @@ def run(child, cmd, t=300):
     return child.before
 
 
+def login_and_inject_key(child, password: str, pubkey_path: str) -> None:
+    """multi-user のシリアル getty へログインし、root の SSH 公開鍵を設置する。"""
+    pub = open(pubkey_path).read().strip()
+
+    i = child.expect([r"login:", r"root@[^#]*# ", TIMEOUT], timeout=1800)
+    if i == 2:
+        print("TIMEOUT waiting for the login prompt", flush=True)
+        sys.exit(1)
+    if i == 0:
+        child.sendline("root")
+        j = child.expect([r"[Pp]assword:", r"root@[^#]*# ", TIMEOUT], timeout=120)
+        if j == 0:
+            child.sendline(password)
+            child.expect([r"root@[^#]*# ", r"\r\n# "], timeout=180)
+        elif j == 2:
+            print("TIMEOUT after sending the login name", flush=True)
+            sys.exit(1)
+    print("LOGGED_IN", flush=True)
+
+    def run(cmd, t=180):
+        child.sendline(cmd)
+        child.expect([r"root@[^#]*# ", r"\r\n# "], timeout=t)
+        return child.before
+
+    run("mkdir -p /root/.ssh && chmod 700 /root/.ssh")
+    run("printf '%%s\\n' '%s' > /root/.ssh/authorized_keys" % pub)
+    run("chmod 600 /root/.ssh/authorized_keys")
+    run("sysrc sshd_enable=YES")
+    run("grep -q '^PermitRootLogin prohibit-password' /etc/ssh/sshd_config || "
+        "echo 'PermitRootLogin prohibit-password' >> /etc/ssh/sshd_config")
+    run("grep -q '^PubkeyAuthentication yes' /etc/ssh/sshd_config || "
+        "echo 'PubkeyAuthentication yes' >> /etc/ssh/sshd_config")
+    run("service sshd restart || service sshd start", t=180)
+    run("wc -l /root/.ssh/authorized_keys")
+    run("sync")
+    print("PROVISIONED_SSH", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["ssh", "grow"], required=True)
+    ap.add_argument("--mode", choices=["ssh", "grow", "login"], required=True)
     ap.add_argument("--con-port", type=int, default=2224)
     ap.add_argument("--pubkey", default=os.path.expanduser("~/.ssh/veil_qemu_key.pub"))
     ap.add_argument("--dev", default="/dev/gpt/rootfs")
+    ap.add_argument("--password", default="veil",
+                    help="login モードで使う root パスワード（cloud-init の chpasswd で設定した値）")
     args = ap.parse_args()
 
     s = connect(args.con_port)
     child = fdpexpect.fdspawn(s.fileno(), encoding="latin-1", timeout=600)
     child.logfile_read = sys.stdout
     child.sendline("")
+
+    if args.mode == "login":
+        # multi-user の getty へ root/パスワードでログインして鍵を注入する。
+        #
+        # cloud-init（BASIC-CLOUDINIT イメージ）は `chpasswd` は適用するが
+        # `write_files` / `runcmd` は実行されない（FreeBSD 版は有効モジュールが
+        # 限定的。実測）。そのため鍵注入だけはコンソールから行う。
+        login_and_inject_key(child, args.password, args.pubkey)
+        s.close()
+        return
+
     enter_single_user(child)
 
     if args.mode == "ssh":
