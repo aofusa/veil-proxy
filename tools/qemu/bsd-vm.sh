@@ -554,13 +554,15 @@ GUEST_ROOT="/root/veil-proxy"
 
 cmd_toolchain() {
     if [[ "${OS_NAME}" == "freebsd" ]]; then
-        log "pkg install rust cmake llvm bash curl openssl nasm"
-        cmd_ssh 'env IGNORE_OSVERSION=yes ASSUME_ALWAYS_YES=yes pkg install -y rust cmake llvm bash curl nasm git >/tmp/pkg.log 2>&1 || { tail -20 /tmp/pkg.log; exit 1; }'
+        # gmake は tikv-jemalloc-sys（`full-freebsd` の jemalloc）のビルドに必須。
+        # 無いと `failed to execute command: No such file or directory` で落ちる。
+        log "pkg install rust cmake llvm gmake bash curl nasm git pkgconf"
+        cmd_ssh 'env IGNORE_OSVERSION=yes ASSUME_ALWAYS_YES=yes pkg install -y rust cmake llvm gmake bash curl nasm git pkgconf >/tmp/pkg.log 2>&1 || { tail -20 /tmp/pkg.log; exit 1; }'
     else
         log "pkg_add rust cmake llvm bash curl"
         cmd_ssh 'PKG_PATH=https://cdn.openbsd.org/pub/OpenBSD/$(uname -r)/packages/$(uname -m)/ pkg_add -I rust cmake llvm bash curl git >/tmp/pkg.log 2>&1 || { tail -20 /tmp/pkg.log; exit 1; }'
     fi
-    cmd_ssh 'cargo --version; cmake --version | head -1'
+    cmd_ssh 'cargo --version; cmake --version | head -1; gmake --version 2>/dev/null | head -1'
 }
 
 cmd_sync() {
