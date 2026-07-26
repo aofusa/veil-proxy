@@ -45,7 +45,7 @@ tools/qemu/bsd-vm.sh <os> <arch> <command> [args]
 | `provision` | SSH 鍵注入 + sshd 有効化（FreeBSD はシリアル single-user 経由 / OpenBSD は autoinstall） |
 | `toolchain` | VM 内へ rust / cmake / llvm / bash / curl を導入 |
 | `sync` | リポジトリを VM へ転送（tar over ssh） |
-| `build` | VM 内で `--features full` リリースビルド |
+| `build` | VM 内でリリースビルド（既定 `--no-default-features --features full-freebsd\|full-openbsd`） |
 | `e2e` | VM 内で `tests/e2e_setup.sh test` を実行 |
 | `fetch` | VM 内の release バイナリを `packaging/build/` へ取得 |
 
@@ -87,6 +87,32 @@ tools/qemu/bsd-vm.sh freebsd x86_64 e2e \
 
 `aarch64-unknown-freebsd` は Rust Tier 3（prebuilt std 無し）のため Docker では扱えず、
 `bsd-vm.sh freebsd aarch64 build` の VM 内ネイティブビルドを使う。
+
+### ファイル一覧
+
+| ファイル | 役割 |
+|---|---|
+| `bsd-vm.sh` | **FreeBSD/OpenBSD × x86_64/aarch64 の統合ヘルパ**（本節） |
+| `freebsd-provision.py` | FreeBSD のシリアル single-user 経由 SSH 鍵注入（`--mode ssh`）/ growfs（`--mode grow`） |
+| `openbsd-autoinstall.py` | OpenBSD の autoinstall(8) をシリアルコンソールから駆動 |
+| `console-dump.py` | シリアルコンソール（telnet）を非対話で読み出す（`console` サブコマンド） |
+| `helper/Dockerfile` | qemu-system-{arm,x86} + AAVMF/OVMF + ssh/python3-pexpect を収録したヘルパイメージ |
+| `aarch64-vm.sh` | Linux aarch64 VM のライフサイクル |
+| `run-e2e-aarch64.sh` | Linux aarch64 の HTTPS スモーク E2E |
+| `linux-aarch64-e2e.sh` | Linux aarch64 で `tests/e2e_setup.sh test` の全 E2E を実行 |
+| `fbsd-arm64-vm.sh` / `fbsd-arm64-smoke.sh` | FreeBSD arm64 の従来経路（smoke 専用。新規用途は `bsd-vm.sh` を推奨） |
+| `fbsd-capmode-e2e.sh` | capsicum capability mode 静的配信 E2E（F-123） |
+
+### 検証状況（重要）
+
+| 項目 | 状況 |
+|---|---|
+| ゲストイメージ URL（FreeBSD amd64/arm64・OpenBSD 7.9 amd64/arm64） | **HTTP 200 を確認済み** |
+| `bsd-vm.sh` の各サブコマンド（VM 作成〜build/e2e/fetch） | **未実行**（本リポジトリのホストではディスク・時間の制約により未検証） |
+| `openbsd-autoinstall.py` | **未実行**。OpenBSD インストーラの対話文言に依存するため、初回実行時に応答の追従が要る可能性が高い |
+| `linux-aarch64-e2e.sh` | **未実行**（KVM 非対応ホストでは TCG が実用不能。下記「既知の環境制約」参照） |
+
+> OpenBSD の CDN は直近数リリースしか保持しない（7.6 は既に 404）。既定は 7.9。
 
 ### ポート割り当て
 
