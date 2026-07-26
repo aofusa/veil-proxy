@@ -58,6 +58,8 @@
 #   KEY            SSH 鍵（既定 ~/.ssh/veil_qemu_key）
 #   CARGO_FEATURES freature セット（既定: freebsd=full-freebsd / openbsd=full-openbsd。
 #                  いずれも --no-default-features 併用でアロケータを差し替える）
+#   CONSOLE_WAIT   1 で qemu がシリアルコンソール接続を待ってから起動する
+#                  （ブートローダのプロンプトを取り逃さない。provision で使用）
 #   VM_SMP/VM_MEM_MB/GROW_GB
 #   FREEBSD_VER (14.3-RELEASE) / OPENBSD_VER (7.9。CDN は直近リリースのみ保持)
 #   HELPER_IMG     helper イメージ名（既定 veil-qemu:local）
@@ -376,7 +378,13 @@ _write_boot() {
     # `-serial ...,server,nowait` は**接続前の出力を捨てる**。ローダメニューなど
     # 起動直後の出力を見たいときは VM 起動直後にコンソールへ接続すること。
     # QMP は send-key / screendump / system_powerdown に使う（両アーキで公開する）。
-    local console_args="-nographic -serial telnet:0.0.0.0:${CON_PORT},server,nowait \\
+    # `CONSOLE_WAIT=1` のときは `server,wait` にして **qemu がコンソール接続を待つ**。
+    # `nowait` だと接続前の出力が捨てられ、ブートローダのプロンプト
+    # （OpenBSD の `boot>` や FreeBSD のローダメニュー）を取り逃す競合が起きる。
+    # provision のようにプロンプトを確実に掴みたい場面で使う。
+    local con_mode="nowait"
+    [[ "${CONSOLE_WAIT:-0}" == "1" ]] && con_mode="wait"
+    local console_args="-nographic -serial telnet:0.0.0.0:${CON_PORT},server,${con_mode} \\
   -qmp telnet:0.0.0.0:${QMP_PORT},server,nowait -monitor none"
 
     if [[ "${ARCH}" == "x86_64" ]]; then
@@ -509,7 +517,11 @@ cmd_provision() {
         [[ -f "${WORKDIR}/auto_install.conf" ]] || die "auto_install.conf が無い。先に setup を実行すること"
         log "OpenBSD autoinstall を実行（miniroot 起動 → 応答ファイル取得 → インストール）"
         cmd_down
-        cmd_up install
+        # ブートローダの `boot>` を確実に掴むため、qemu にコンソール接続を待たせる。
+        # NOTE: bash では「VAR=x 関数呼び出し」の代入がシェルに**残る**ため、
+        #       明示的に export → unset する（残ると再起動側も wait になり永久に起動しない）。
+        CONSOLE_WAIT=1 cmd_up install
+        unset CONSOLE_WAIT
         python3 "${HERE}/openbsd-autoinstall.py" --con-port "${CON_PORT}" --workdir "${WORKDIR}" \
             --container "${NAME}" --arch "${ARCH}"
         log "autoinstall 完了。miniroot を外して再起動する"
