@@ -11,6 +11,11 @@
 #   ./packaging/scripts/build-bsd.sh --os freebsd --arch x86_64 --binary ./veil-freebsd-amd64
 #   ./packaging/scripts/build-bsd.sh --os openbsd --arch x86_64 --binary ./veil-openbsd-amd64
 #
+# tools/qemu/bsd-vm.sh で取得したバイナリをそのまま使う場合（推奨）:
+#   tools/qemu/bsd-vm.sh freebsd x86_64 fetch      # → packaging/build/veil-freebsd-x86_64
+#   ./packaging/scripts/build-bsd.sh --os freebsd --arch x86_64 --from-qemu
+#   ./packaging/scripts/build-bsd.sh --all         # 取得済みの 4 通りをまとめて
+#
 # ターゲットトリプル命名（tar.gz 名）:
 #   freebsd: <arch>-unknown-freebsd    openbsd: <arch>-unknown-openbsd
 set -euo pipefail
@@ -26,10 +31,14 @@ VERSION="$(awk -F'"' '/^version = / { print $2; exit }' "${ROOT}/Cargo.toml")"
 OS=""
 ARCH="x86_64"
 BINARY=""
+FROM_QEMU=0
+ALL=0
 
 usage() {
     cat <<EOF
 Usage: $(basename "$0") --os {freebsd|openbsd} [--arch {x86_64|aarch64}] --binary PATH [--os-version VER]
+       $(basename "$0") --os {freebsd|openbsd} --arch {x86_64|aarch64} --from-qemu
+       $(basename "$0") --all
 
 Assemble a FreeBSD/OpenBSD binary tarball with rc.d service script,
 config reference, and (FreeBSD) jail.conf sample. The OS version the binary
@@ -41,8 +50,15 @@ Options:
   --binary PATH      Pre-built veil binary for the target OS/arch (required;
                      build it inside a matching QEMU VM)
   --os-version VER   OS release the binary was built on (e.g. 14.3-RELEASE,
-                     7.6). Auto-detected via 'uname -r' when run on the target
+                     7.9). Auto-detected via 'uname -r' when run on the target
                      OS; specify explicitly otherwise.
+  --from-qemu        Use the binary fetched by
+                     'tools/qemu/bsd-vm.sh <os> <arch> fetch', i.e.
+                     packaging/build/veil-<os>-<arch> together with the OS
+                     version recorded in the matching .os-version file.
+                     (--binary / --os-version are then unnecessary.)
+  --all              Package every fetched BSD binary found under
+                     packaging/build/ (freebsd/openbsd x x86_64/aarch64).
   -h, --help         Show this help
 
 Output:
@@ -57,10 +73,45 @@ while [[ $# -gt 0 ]]; do
         --arch) ARCH="$2"; shift 2 ;;
         --binary) BINARY="$2"; shift 2 ;;
         --os-version) OS_VERSION="$2"; shift 2 ;;
+        --from-qemu) FROM_QEMU=1; shift ;;
+        --all) ALL=1; FROM_QEMU=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
     esac
 done
+
+# --all: packaging/build/ にある取得済みバイナリを総当たりでパッケージ化する。
+# 取得は tools/qemu/bsd-vm.sh <os> <arch> fetch が行う。
+if (( ALL )); then
+    found=0
+    for os_name in freebsd openbsd; do
+        for arch_name in x86_64 aarch64; do
+            bin="${BUILD_DIR}/veil-${os_name}-${arch_name}"
+            [[ -f "${bin}" ]] || continue
+            found=1
+            ver="unknown"
+            [[ -f "${bin}.os-version" ]] && ver="$(cat "${bin}.os-version")"
+            echo "==> ${os_name}/${arch_name} (built on ${ver})"
+            "$0" --os "${os_name}" --arch "${arch_name}" --binary "${bin}" --os-version "${ver}"
+        done
+    done
+    if (( ! found )); then
+        echo "ERROR: packaging/build/veil-<os>-<arch> が 1 つも見つかりません。" >&2
+        echo "       先に 'tools/qemu/bsd-vm.sh <os> <arch> fetch' でバイナリを取得してください。" >&2
+        exit 1
+    fi
+    exit 0
+fi
+
+# --from-qemu: bsd-vm.sh fetch が置いたバイナリと .os-version を使う
+if (( FROM_QEMU )); then
+    if [[ -z "${BINARY}" ]]; then
+        BINARY="${BUILD_DIR}/veil-${OS}-${ARCH}"
+    fi
+    if [[ -z "${OS_VERSION}" && -f "${BINARY}.os-version" ]]; then
+        OS_VERSION="$(cat "${BINARY}.os-version")"
+    fi
+fi
 
 if [[ "${OS}" != "freebsd" && "${OS}" != "openbsd" ]]; then
     echo "ERROR: --os must be freebsd or openbsd" >&2; usage >&2; exit 1

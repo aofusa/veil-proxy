@@ -37,6 +37,7 @@
 #   tools/qemu/bsd-vm.sh freebsd x86_64 e2e --prebuilt packaging/output/veil-freebsd-amd64
 #
 # コマンド一覧:
+#   all        setup → provision → toolchain → build → e2e → fetch を一括実行
 #   setup      helper イメージ build + ゲストイメージ取得 + SSH 鍵生成
 #   up         VM 起動（detached、telnet シリアルコンソール + hostfwd ssh）
 #   wait       SSH 到達までブロック
@@ -667,7 +668,21 @@ cmd_fetch() {
     log "packaging: ./packaging/scripts/build-bsd.sh --os ${OS_NAME} --arch ${ARCH} --binary ${dest} --os-version \$(cat ${dest}.os-version)"
 }
 
+# setup から fetch まで一気に実行する（再現用のワンショット）。
+# 途中で失敗したら、その段階のサブコマンドから手動で再開できる。
+cmd_all() {
+    cmd_setup
+    cmd_provision
+    cmd_toolchain
+    cmd_build
+    cmd_e2e
+    cmd_fetch
+    log "all 完了: packaging/build/veil-${OS_NAME}-${ARCH} を取得済み"
+    log "パッケージ化: ./packaging/scripts/build-bsd.sh --os ${OS_NAME} --arch ${ARCH} --from-qemu"
+}
+
 case "${COMMAND}" in
+    all) cmd_all ;;
     setup) cmd_setup ;;
     reset) cmd_reset ;;
     up) cmd_up "$@" ;;

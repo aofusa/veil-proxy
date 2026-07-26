@@ -14,8 +14,8 @@ veil を **各プラットフォーム×arch の実カーネル上**でビルド
 | プラットフォーム | x86_64 | aarch64 | 手段 |
 |---|---|---|---|
 | Linux（io_uring/epoll） | ネイティブ/Docker で直接 | Docker クロスビルド + full-system QEMU で E2E（`linux-aarch64-e2e.sh`）。**KVM 不可ホストでは TCG が実用不能**（下記制約） | `aarch64-vm.sh` / `run-e2e-aarch64.sh` / `linux-aarch64-e2e.sh` |
-| FreeBSD | Docker クロスビルド（`docker/Dockerfile.freebsd`）または VM 内ネイティブビルド。VM は **KVM で実用速度** | Rust Tier 3 のため **VM 内ネイティブビルド**。TCG でも実用起動する | `bsd-vm.sh freebsd {x86_64,aarch64}` |
-| OpenBSD | miniroot から autoinstall した VM で **ネイティブビルド**。KVM で実用速度 | 同左（TCG のため低速） | `bsd-vm.sh openbsd {x86_64,aarch64}` |
+| FreeBSD | **VM 内ネイティブビルド**（KVM で実用速度。実測 ~30 分）。Docker クロスビルドは B-49 未解決で使えない | Rust Tier 3 のため **VM 内ネイティブビルド**（TCG のため低速） | `bsd-vm.sh freebsd {x86_64,aarch64}` |
+| OpenBSD | miniroot から autoinstall した VM で **ネイティブビルド**（KVM で実用速度） | 同左（TCG のため低速） | `bsd-vm.sh openbsd {x86_64,aarch64}` |
 | macOS / Windows | ネイティブ実行ホストが無く **Docker クロスビルドのみ**（`docker/Dockerfile.{macos,windows}` / `packaging/scripts/build-cross.sh`） | 同左 | — |
 
 **なぜ Linux/macOS/Windows に QEMU が要らないか**: Linux x86_64 はホストそのもの、
@@ -28,7 +28,7 @@ QEMU を使う。
 ## BSD 統合ヘルパ `bsd-vm.sh`（FreeBSD / OpenBSD × x86_64 / aarch64）
 
 `packaging/` が配布する BSD バイナリを**実 OS 上でビルド・E2E 検証**し、成果物を
-host 側へ取り出す（`packaging/scripts/build-bsd.sh` へ渡す）ための統合スクリプト。
+host 側へ取り出すための統合スクリプト。
 
 ```bash
 tools/qemu/bsd-vm.sh <os> <arch> <command> [args]
@@ -36,75 +36,82 @@ tools/qemu/bsd-vm.sh <os> <arch> <command> [args]
 #   arch : x86_64 | aarch64
 ```
 
+### いちばん短い再現手順
+
+```bash
+# setup → provision → toolchain → build → e2e → fetch を一括
+tools/qemu/bsd-vm.sh freebsd x86_64 all
+
+# 取得したバイナリを tar.gz 化
+./packaging/scripts/build-bsd.sh --os freebsd --arch x86_64 --from-qemu
+```
+
+4 通り（freebsd/openbsd × x86_64/aarch64）すべて同じ形で実行できる。
+取得済みのものをまとめてパッケージ化するなら `build-bsd.sh --all`。
+
+> **所要時間の目安**（4 コア / KVM 有効ホスト）
+> x86_64 ゲストは KVM で加速されるため実用的（FreeBSD amd64 の
+> `--features full-freebsd` リリースビルドで実測 **約 30 分**）。
+> aarch64 ゲストは x86_64 ホストでは TCG なので数倍〜十数倍かかる。
+
+### サブコマンド
+
 | コマンド | 内容 |
 |---|---|
-| `setup` | helper イメージ build + ゲストイメージ取得 + SSH 鍵生成 |
-| `up` / `down` / `status` / `console` | VM ライフサイクル |
+| `all` | 下記を setup → fetch まで一括実行 |
+| `setup` | helper イメージ build + ゲストイメージ取得 + SSH 鍵生成（+ FreeBSD は cloud-init シード、OpenBSD は autoinstall 応答ファイル） |
+| `reset` | 起動用オーバーレイを作り直して初期状態へ戻す（**再ダウンロード不要**、FreeBSD） |
+| `up` / `down` / `status` / `console` | VM ライフサイクル（`down` は ACPI シャットダウンを先に試す） |
 | `wait` | SSH 到達までブロック |
-| `grow` | ディスク拡張（FreeBSD: `qemu-img resize` + single-user `growfs`） |
-| `provision` | SSH 鍵注入 + sshd 有効化（FreeBSD はシリアル single-user 経由 / OpenBSD は autoinstall） |
-| `toolchain` | VM 内へ rust / cmake / llvm / bash / curl を導入 |
+| `provision` | SSH 鍵注入まで（OS ごとに方式が違う。下記） |
+| `toolchain` | VM 内へ rust / cmake / llvm / gmake 等を導入 |
 | `sync` | リポジトリを VM へ転送（tar over ssh） |
 | `build` | VM 内でリリースビルド（既定 `--no-default-features --features full-freebsd\|full-openbsd`） |
-| `e2e` | VM 内で `tests/e2e_setup.sh test` を実行 |
-| `fetch` | VM 内の release バイナリを `packaging/build/` へ取得 |
+| `e2e` | VM 内で `tests/e2e_setup.sh test` |
+| `fetch` | VM 内の release バイナリを `packaging/build/veil-<os>-<arch>` へ取得 |
 
-### フル一巡（FreeBSD amd64、KVM 有効ホスト）
+### provision の方式（OS で異なる）
 
-```bash
-tools/qemu/bsd-vm.sh freebsd x86_64 setup
-tools/qemu/bsd-vm.sh freebsd x86_64 up
-tools/qemu/bsd-vm.sh freebsd x86_64 grow        # root FS は既定 ~5G で不足する
-tools/qemu/bsd-vm.sh freebsd x86_64 provision
-tools/qemu/bsd-vm.sh freebsd x86_64 wait
-tools/qemu/bsd-vm.sh freebsd x86_64 toolchain
-tools/qemu/bsd-vm.sh freebsd x86_64 build       # full features
-tools/qemu/bsd-vm.sh freebsd x86_64 e2e         # tests/e2e_setup.sh test
-tools/qemu/bsd-vm.sh freebsd x86_64 fetch       # packaging/build/veil-freebsd-x86_64
-tools/qemu/bsd-vm.sh freebsd x86_64 down
+| OS | 方式 |
+|---|---|
+| FreeBSD | 配布の **BASIC-CLOUDINIT** イメージ + NoCloud シード。cloud-init が root パスワード設定と growfs を行い、**SSH 公開鍵はシリアルの getty へ root ログインして注入**する（`freebsd-provision.py --mode login`）。FreeBSD の cloud-init は `write_files` / `runcmd` を実行しないため鍵は cloud-init に任せられない |
+| OpenBSD | 配布 VM イメージが無いので **`miniroot<NN>.img` から autoinstall(8)** で無人インストールする（`openbsd-autoinstall.py`）。応答ファイルは helper コンテナ内の HTTP サーバから `http://10.0.2.2:8000/auto_install.conf` として配る。sets は HTTP ミラーから取得。鍵と sshd 設定は autoinstall が行う |
 
-# 取得したバイナリを packaging に渡す
-./packaging/scripts/build-bsd.sh --os freebsd --arch x86_64 \
-  --binary packaging/build/veil-freebsd-x86_64 \
-  --os-version "$(cat packaging/build/veil-freebsd-x86_64.os-version)"
-```
+### ポート割り当て
 
-### FreeBSD x86_64 の Docker クロスビルドは現在使えない（B-49）
+同時に 4 VM を起動しても衝突しないよう os/arch ごとに固定している
+（`SSH_PORT` / `CON_PORT` / `QMP_PORT` で上書き可）。
 
-Zig が FreeBSD の libc を同梱しており `x86_64-unknown-freebsd` は Rust Tier 2 なので
-`docker/Dockerfile.freebsd` を用意してあるが、**aws-lc-sys の s2n-bignum アセンブリが
-FreeBSD クロス構成で組み立てられず、リンク段で失敗する**（B-49、未解決）。
-当面は x86_64 も上記の VM 内ネイティブビルドを使うこと。
+| VM | ssh | console(telnet) | QMP |
+|---|---|---|---|
+| freebsd x86_64 | 2310 | 2311 | 2312 |
+| freebsd aarch64 | 2320 | 2321 | 2322 |
+| openbsd x86_64 | 2330 | 2331 | 2332 |
+| openbsd aarch64 | 2340 | 2341 | 2342 |
 
-B-49 が解決すれば、クロスビルドしてから VM では **E2E だけ**回す運用にできる
-（VM 内フルビルドを省ける）。
+### 主な環境変数
 
-```bash
-./packaging/scripts/build-cross.sh --target freebsd
-tools/qemu/bsd-vm.sh freebsd x86_64 e2e \
-  --prebuilt packaging/build/artifact-x86_64-unknown-freebsd/veil
-```
-
-`--prebuilt` を渡すと `VEIL_E2E_SKIP_VEIL_BUILD=1` が効き、veil 本体を VM 内でビルド
-しない。ただし `grpc_server` / `test_backends` と E2E テストバイナリ自体は cargo が
-必要なので VM 内でビルドされる（`toolchain` は必要）。
-
-`aarch64-unknown-freebsd` は Rust Tier 3（prebuilt std 無し）のため Docker では扱えず、
-`bsd-vm.sh freebsd aarch64 build` の VM 内ネイティブビルドを使う。
+| 変数 | 既定 | 意味 |
+|---|---|---|
+| `VEIL_QEMU_DIR` | `~/qemu-images` | VM 資材の親ディレクトリ |
+| `FREEBSD_VER` / `OPENBSD_VER` | `14.3-RELEASE` / `7.9` | ゲスト OS バージョン（OpenBSD の CDN は直近数リリースのみ保持） |
+| `GROW_GB` | 24 | 起動ディスクに上乗せするサイズ |
+| `VM_SMP` / `VM_MEM_MB` | 4 / 4096 | vCPU / メモリ |
+| `VM_ROOT_PASSWORD` | `veil` | ゲスト root パスワード（コンソールデバッグ用。SSH は鍵のみ、ポートは 127.0.0.1 のみ） |
+| `CARGO_FEATURES` | `full-freebsd` / `full-openbsd` | ビルドする feature セット |
+| `BASE_IMG` | — | 既にプロビジョニング済みのイメージを backing file にして起動する（元イメージは変更しない） |
 
 ### ファイル一覧
 
 | ファイル | 役割 |
 |---|---|
 | `bsd-vm.sh` | **FreeBSD/OpenBSD × x86_64/aarch64 の統合ヘルパ**（本節） |
-| `freebsd-provision.py` | FreeBSD のシリアル single-user 経由 SSH 鍵注入（`--mode ssh`）/ growfs（`--mode grow`） |
+| `freebsd-provision.py` | FreeBSD の provision。`--mode login`（getty へ root ログインして鍵注入・**現行の既定経路**）/ `--mode ssh`（ローダメニュー経由 single-user）/ `--mode grow`（growfs） |
 | `openbsd-autoinstall.py` | OpenBSD の autoinstall(8) をシリアルコンソールから駆動 |
 | `console-dump.py` | シリアルコンソール（telnet）を非対話で読み出す（`console` サブコマンド） |
-| `qmp-sendkeys.py` | QMP `send-key` でゲストへブラインド入力を送る（シリアルが使えない環境の切り分け用）。QMP は `SSH_PORT+2` で公開している |
-| `helper/Dockerfile` | qemu-system-{arm,x86} + AAVMF/OVMF + ssh/python3-pexpect を収録したヘルパイメージ |
-| `aarch64-vm.sh` | Linux aarch64 VM のライフサイクル |
-| `run-e2e-aarch64.sh` | Linux aarch64 の HTTPS スモーク E2E |
-| `linux-aarch64-e2e.sh` | Linux aarch64 で `tests/e2e_setup.sh test` の全 E2E を実行 |
+| `qmp-sendkeys.py` | QMP 経由の `send-key` / `screendump` / `system_powerdown`。シリアルに何も出ない状況の切り分けに使う |
+| `helper/Dockerfile` | qemu-system-{arm,x86} + AAVMF/OVMF + ssh + python3-pexpect + cloud-image-utils |
+| `aarch64-vm.sh` / `run-e2e-aarch64.sh` / `linux-aarch64-e2e.sh` | Linux aarch64 用（後述） |
 | `fbsd-arm64-vm.sh` / `fbsd-arm64-smoke.sh` | FreeBSD arm64 の従来経路（smoke 専用。新規用途は `bsd-vm.sh` を推奨） |
 | `fbsd-capmode-e2e.sh` | capsicum capability mode 静的配信 E2E（F-123） |
 
@@ -112,41 +119,35 @@ tools/qemu/bsd-vm.sh freebsd x86_64 e2e \
 
 | 項目 | 状況 |
 |---|---|
-| ゲストイメージ URL（FreeBSD amd64/arm64・OpenBSD 7.9 amd64/arm64） | **HTTP 200 を確認済み** |
-| FreeBSD amd64: `setup` → `up` → `provision` | **成功**（SSH 鍵認証で `FreeBSD 14.3-RELEASE-p16` へ到達） |
-| FreeBSD amd64: `toolchain` | **成功**（cargo 1.96.1 / cmake 3.31.12 / GNU Make 4.4.1） |
-| FreeBSD amd64: `build`（`--no-default-features --features full-freebsd`） | **成功**（29分42秒。http3(quiche+共有 aws-lc-sys) / jemalloc / **aio** を含む。生成物は `ELF 64-bit LSB pie executable, x86-64, for FreeBSD 14.3`） |
-| FreeBSD amd64: `fetch` → `build-bsd.sh` | **成功**（`packaging/output/veil-0.6.0-x86_64-unknown-freebsd.tar.gz` を生成） |
-| FreeBSD amd64: `e2e` | 未実行（VM 内で test_backends / grpc_server / E2E テストのビルドが要るため追加で時間がかかる） |
-| FreeBSD aarch64 | 未実行（同じ経路のはずだが TCG のため低速） |
-| OpenBSD（`openbsd-autoinstall.py`） | **未実行**。インストーラの対話文言に依存するため追従が要る可能性が高い |
+| ゲストイメージ URL（FreeBSD amd64/arm64・OpenBSD 7.9 amd64/arm64 miniroot） | **HTTP 200 を確認済み** |
+| FreeBSD x86_64: `setup` → `provision` | **成功**（SSH 鍵認証で `FreeBSD 14.3-RELEASE-p16` へ到達） |
+| FreeBSD x86_64: `toolchain` | **成功**（cargo 1.96.1 / cmake 3.31.12 / GNU Make 4.4.1） |
+| FreeBSD x86_64: `build`（`full-freebsd`） | **成功**（29分42秒。http3(quiche+共有 aws-lc-sys) / jemalloc / **aio** を含む） |
+| FreeBSD x86_64: `fetch` → `build-bsd.sh` | **成功**（`veil-0.6.0-x86_64-unknown-freebsd.tar.gz` を生成） |
+| FreeBSD x86_64: `e2e` | 実行中 |
+| FreeBSD aarch64 | **未実行**（スクリプトは同経路で対応済み。TCG のため長時間） |
+| OpenBSD x86_64 / aarch64 | **未実行**（`openbsd-autoinstall.py` はインストーラの対話文言に依存するため追従が要る可能性がある） |
 | `linux-aarch64-e2e.sh` | **未実行**（KVM 非対応ホストでは TCG が実用不能） |
 
-### FreeBSD amd64 で踏んだ落とし穴（すべて実測）
-
-ここは再発しやすいので詳しく残す。
+### FreeBSD amd64 で踏んだ落とし穴（すべて実測。再発しやすいので残す）
 
 1. **配布されている素の `FreeBSD-<ver>-RELEASE-amd64.qcow2` は使えない。**
    シリアルへ一切出力しないうえ、ローダが `Loading configured modules...` を出した
    あとカーネルが起動せずハングする（`-machine q35`/`pc`、`-cpu host`/`qemu64`、
    BIOS/UEFI の全組み合わせで再現）。
    → **`BASIC-CLOUDINIT` 版**を使う。こちらは `Dual Console: Serial Primary` で
-   シリアルが有効、かつ正常に起動する。`_image_url` はこれを指している。
+   シリアルが有効、かつ正常に起動する。
 
 2. **配布イメージの仮想サイズは ~6GiB しかない。**
    初回ブートの `freebsd-update` がデバッグシンボルを展開してゲストの FS が満杯になり、
    `No space left on device` を延々と出して sshd まで到達しない。
    → `setup` は配布イメージを `base.qcow2` として保持し、起動用の
-   **qcow2 オーバーレイ**（`disk.qcow2`）を `+${GROW_GB}G` して作る。
-   cloud-init の growfs が拡張する。`reset` でオーバーレイだけ作り直せる（再 DL 不要）。
+   **qcow2 オーバーレイ**を `+${GROW_GB}G` して作る。cloud-init の growfs が拡張する。
+   `reset` でオーバーレイだけ作り直せる（再ダウンロード不要）。
 
 3. **FreeBSD の cloud-init は `chpasswd` は適用するが `write_files` / `runcmd` は
-   実行しない。** そのため SSH 公開鍵を cloud-init で置くことはできない。
-   → cloud-init には **root パスワード設定と growfs** だけを任せ、
-   **鍵の注入はシリアルの getty へ root ログインして行う**
-   （`freebsd-provision.py --mode login`）。
-   root パスワードは `VM_ROOT_PASSWORD`（既定 `veil`）。SSH は鍵認証のみで、
-   ポートは 127.0.0.1 にしかフォワードしていないローカル VM なので固定値でよい。
+   実行しない。** → cloud-init には root パスワード設定と growfs だけを任せ、
+   **鍵注入はシリアルの getty へ root ログインして行う**。
 
 4. **cloud-init シードは CD-ROM として繋ぐ。**
    virtio-blk のディスクとして足すと、ローダが起動デバイスを取り違えて
@@ -160,42 +161,17 @@ tools/qemu/bsd-vm.sh freebsd x86_64 e2e \
    イメージが壊れ、次回の boot2 が回り続ける。
 
 6. **`-serial ...,server,nowait` は接続前の出力を捨てる。**
-   ローダメニューなど起動直後の出力を見たいときは、VM 起動直後にコンソールへ
-   接続すること（`console-dump.py` / `provision` はそうしている）。
+   ローダメニューなど起動直後の出力を見たいときは、VM 起動直後に接続すること。
 
-`qmp-sendkeys.py`（QMP `send-key` / `screendump` / `system_powerdown`）は上記の
-切り分けで実際に役立った。シリアルに何も出ない状況でも `screendump` でゲスト画面を
-PNG に落として確認できる。
+7. **`tikv-jemalloc-sys` は `gmake` を要求する。**
+   `full-freebsd` は jemalloc を含むため、`toolchain` で `gmake` を入れないと
+   `failed to execute command: No such file or directory` で落ちる。
 
-### ポート割り当て
+8. **`scp` のポート指定は `-P`**（`-p` は「タイムスタンプ保持」）。
+   ssh 用のオプション配列をそのまま流用すると 22 番へ繋ぎに行って `fetch` が失敗する。
 
-同時に 4 VM を起動しても衝突しないよう os/arch ごとに固定している
-（`SSH_PORT` / `CON_PORT` で上書き可）。
-
-| VM | ssh | console(telnet) |
-|---|---|---|
-| freebsd x86_64 | 2310 | 2311 |
-| freebsd aarch64 | 2320 | 2321 |
-| openbsd x86_64 | 2330 | 2331 |
-| openbsd aarch64 | 2340 | 2341 |
-
-### OpenBSD の VM 作成（autoinstall）
-
-OpenBSD は FreeBSD と違い ready-made な qcow2 を配布していないため、
-`installNN.img`（miniroot）から **autoinstall(8) で無人インストール**して起動ディスクを
-作る（`openbsd-autoinstall.py`）。応答ファイルは helper コンテナ内の
-`python3 -m http.server` から `http://10.0.2.2:8000/auto_install.conf` として配る
-（slirp のゲートウェイ 10.0.2.2 = QEMU を実行しているコンテナ自身）。
-
-amd64 のブートローダは既定で VGA コンソールへ出るため、`boot>` へ
-**ブラインドで `set tty com0`** を送ってシリアルへ切り替えている（arm64 は UEFI +
-efiboot が既定でシリアルなので不要）。
-
-> **注意**: `openbsd-autoinstall.py` は OpenBSD インストーラの**対話文言に依存**する。
-> リリースによって文言が変わった場合は追従が必要。`OPENBSD_VER`（既定 7.9。CDN は直近リリースのみ保持するため古い版は 404 になる）で
-> バージョンを指定する。
-
----
+> aarch64（arm64）はこれらのうち 1・3・4 の影響を受けない。UEFI + efiboot が
+> ファームウェアの ConOut を引き継ぐためシリアルが既定で使え、素直に起動する。
 
 ## Linux aarch64（io_uring、`aarch64-vm.sh`）
 
