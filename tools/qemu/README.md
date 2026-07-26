@@ -126,7 +126,12 @@ tools/qemu/bsd-vm.sh freebsd x86_64 all
 | FreeBSD x86_64: `fetch` → `build-bsd.sh` | **成功**（`veil-0.6.0-x86_64-unknown-freebsd.tar.gz` を生成） |
 | FreeBSD x86_64: `e2e` | **実行完了: 416 passed / 117 failed**。失敗は**全て HTTP/3**（QUIC の UDP ポートが bind されない = **B-50** として起票）。HTTP/1.1・HTTP/2・gRPC・WebSocket・L4 は通過 |
 | FreeBSD aarch64 | **未実行**（スクリプトは同経路で対応済み。TCG のため長時間） |
-| OpenBSD x86_64 / aarch64 | **未実行**（`openbsd-autoinstall.py` はインストーラの対話文言に依存するため追従が要る可能性がある） |
+| OpenBSD x86_64: `setup` → `provision`（autoinstall） | **成功**（`CONGRATULATIONS` → SSH 鍵認証で `OpenBSD 7.9 GENERIC.MP#449 amd64` へ到達） |
+| OpenBSD x86_64: `toolchain` | **成功**（cargo 1.94.1 / cmake 4.2.3 / GNU Make 4.4.1 / libprotoc 34.1 / llvm-19） |
+| OpenBSD x86_64: `build`（`full-openbsd`） | **成功**（71分56秒。ring + システムアロケータ + quiche/BoringSSL の http3 を含む） |
+| OpenBSD x86_64: `fetch` → `build-bsd.sh` | **成功**（`veil-0.6.0-x86_64-unknown-openbsd.tar.gz` を生成） |
+| OpenBSD x86_64: `e2e` | 実行中 |
+| OpenBSD aarch64 | **未実行**（スクリプトは同経路で対応済み。TCG のため長時間） |
 | `linux-aarch64-e2e.sh` | **未実行**（KVM 非対応ホストでは TCG が実用不能） |
 
 ### FreeBSD amd64 で踏んだ落とし穴（すべて実測。再発しやすいので残す）
@@ -169,6 +174,48 @@ tools/qemu/bsd-vm.sh freebsd x86_64 all
 
 8. **`scp` のポート指定は `-P`**（`-p` は「タイムスタンプ保持」）。
    ssh 用のオプション配列をそのまま流用すると 22 番へ繋ぎに行って `fetch` が失敗する。
+
+### OpenBSD で踏んだ落とし穴（すべて実測）
+
+quiche が使う **BoringSSL（boring-sys）は OpenBSD を想定していない**ため、
+ビルド環境側での回避が複数必要になる。以下はすべて `bsd-vm.sh` が自動で行う。
+
+1. **`/` が ~628M しかない。** autoinstall の auto layout は `/` を小さく取り、
+   `/usr/obj` が最大（24G ディスクで ~8G）。`GUEST_ROOT` と `CARGO_HOME` を
+   `/usr/obj` 配下にしないと `No space left on device` になる。
+
+2. **`llvm` が黙って入らない。** OpenBSD には llvm-19/20/21 が並存するため、
+   曖昧な `llvm` を `pkg_add -I`（非対話）へ渡すと失敗する。その結果
+   `LIBCLANG_PATH` が空になり bindgen が
+   `Unable to find libclang ... (invalid: [])` で落ちる。
+   `pkg_info -Q llvm` から具体的なバージョンを選んで入れる。
+
+3. **`pthread_rwlock_t` が見つからない。** BoringSSL の `openssl/thread.h` は
+   `pthread_rwlock_t` が `<sys/types.h>` から見える前提だが（glibc/FreeBSD/macOS
+   では真）、OpenBSD では `<pthread.h>` にしかない。
+   → **C ファイルのときだけ** `-include pthread.h` する cc ラッパ
+   （`/usr/local/bin/veil-cc`）を `CC_<target>` として使う。
+   `CFLAGS_<target>` に足すと **アセンブリ(.S) にも**適用され、zstd-sys の
+   `huf_decompress_amd64.S` が `unknown token in expression` で壊れる。
+
+4. **bindgen にも同じ指定が要る。** bindgen は cc ラッパを経由せず自前の clang で
+   ヘッダを解析するため、`BINDGEN_EXTRA_CLANG_ARGS_<target>` にも
+   `-include pthread.h` を渡す。
+
+5. **`-lstdc++` が無い。** boring-sys は非 Apple ターゲットで `-lstdc++` を要求するが、
+   OpenBSD の C++ 標準ライブラリは **libc++**。
+   `/usr/local/lib/libstdc++.so → /usr/lib/libc++.so.N` の互換リンクを張り、
+   `RUSTFLAGS='-L /usr/local/lib'` で解決する。
+
+6. **cmake はコンパイラ設定をキャッシュする。** 上記 3 の対処を入れても、
+   前回失敗時の `target/*/build/boring-sys-*/out/build` が残っていると
+   `CMakeCache.txt` の古い `CMAKE_C_COMPILER` が使われ続ける。
+   環境変数を変えたときは boring-sys の build ディレクトリを消してから再実行する。
+
+7. **`-serial ...,server,nowait` はブートローダのプロンプトを取り逃す。**
+   OpenBSD amd64 は `boot>` へ `set tty com0` を送ってシリアルへ切り替える必要が
+   あるが、`nowait` だと接続前に流れてしまう。`provision` は `CONSOLE_WAIT=1` で
+   **qemu にコンソール接続を待たせて**から起動する。
 
 > aarch64（arm64）はこれらのうち 1・3・4 の影響を受けない。UEFI + efiboot が
 > ファームウェアの ConOut を引き継ぐためシリアルが既定で使え、素直に起動する。
