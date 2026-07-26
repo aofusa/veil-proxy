@@ -60,6 +60,8 @@
 #                  いずれも --no-default-features 併用でアロケータを差し替える）
 #   CONSOLE_WAIT   1 で qemu がシリアルコンソール接続を待ってから起動する
 #                  （ブートローダのプロンプトを取り逃さない。provision で使用）
+#   GUEST_ROOT     VM 内のリポジトリ配置先
+#                  （既定: FreeBSD=/root/veil-proxy, OpenBSD=/usr/obj/veil-proxy）
 #   VM_SMP/VM_MEM_MB/GROW_GB
 #   FREEBSD_VER (14.3-RELEASE) / OPENBSD_VER (7.9。CDN は直近リリースのみ保持)
 #   HELPER_IMG     helper イメージ名（既定 veil-qemu:local）
@@ -586,8 +588,17 @@ PY
 cmd_ssh() { ssh "${SSH_OPTS[@]}" "${SSH_USER}@127.0.0.1" "$@"; }
 cmd_scp() { scp "${SCP_OPTS[@]}" "$@"; }
 
-# VM 内のリポジトリルート
-GUEST_ROOT="/root/veil-proxy"
+# VM 内のリポジトリルート。
+#
+# OpenBSD は autoinstall の auto layout が `/` を 628M 程度しか取らないため、
+# `/root` 配下ではビルド成果物が入らない（`No space left on device`）。
+# auto layout で最も大きい `/usr/obj`（24G ディスクで ~8G）を使う。
+# FreeBSD は `/` が単一の大きな領域なので `/root` でよい。
+if [[ "${OS_NAME}" == "openbsd" ]]; then
+    GUEST_ROOT="${GUEST_ROOT:-/usr/obj/veil-proxy}"
+else
+    GUEST_ROOT="${GUEST_ROOT:-/root/veil-proxy}"
+fi
 
 cmd_toolchain() {
     if [[ "${OS_NAME}" == "freebsd" ]]; then
@@ -609,7 +620,10 @@ cmd_sync() {
     log "リポジトリを VM へ転送（tar over ssh）"
     cmd_ssh "mkdir -p ${GUEST_ROOT}"
     # fuzz はワークスペースメンバだがゲストでは不要。転送後に members から外す。
+    # ホスト側のビルド成果物（target/）は転送しない。
+    # 巨大なうえゲストのアーキ/OS では使えず、OpenBSD では容量不足の原因になる。
     (cd "${ROOT}" && tar czf - \
+        --exclude='./target' --exclude='*/target' --exclude='.git' \
         src benches tests examples contrib docker/assets \
         Cargo.toml Cargo.lock build.rs clippy.toml .cargo) \
       | cmd_ssh "cd ${GUEST_ROOT} && tar xzf - && sed -i'' -e 's|members = \[\".\", \"fuzz\"\]|members = [\".\"]|' Cargo.toml"
@@ -617,11 +631,14 @@ cmd_sync() {
 
 # aws-lc-sys の bindgen が libclang を要求するため、VM 内での LIBCLANG_PATH を解決する
 _guest_env_prefix() {
-    if [[ "${OS_NAME}" == "freebsd" ]]; then
-        echo 'LIBCLANG_PATH=$(find /usr/local -name libclang.so\* 2>/dev/null | head -1 | xargs dirname)'
-    else
-        echo 'LIBCLANG_PATH=$(find /usr/local -name libclang.so\* 2>/dev/null | head -1 | xargs dirname)'
+    local pre='LIBCLANG_PATH=$(find /usr/local -name libclang.so\* 2>/dev/null | head -1 | xargs dirname)'
+    if [[ "${OS_NAME}" == "openbsd" ]]; then
+        # OpenBSD は autoinstall の auto layout で `/` が ~628M しかなく、既定の
+        # CARGO_HOME（/root/.cargo）にレジストリを展開すると溢れる。
+        # 大きい /usr/obj へ逃がす（GUEST_ROOT も同じ理由で /usr/obj 配下）。
+        pre="${pre} CARGO_HOME=/usr/obj/cargo"
     fi
+    echo "${pre}"
 }
 
 # BSD 向けの既定 feature セット（Cargo.toml）。
