@@ -55,7 +55,7 @@
 #   CARGO_FEATURES freature セット（既定: freebsd=full-freebsd / openbsd=full-openbsd。
 #                  いずれも --no-default-features 併用でアロケータを差し替える）
 #   VM_SMP/VM_MEM_MB/GROW_GB
-#   FREEBSD_VER (14.3-RELEASE) / OPENBSD_VER (7.6)
+#   FREEBSD_VER (14.3-RELEASE) / OPENBSD_VER (7.9。CDN は直近リリースのみ保持)
 #   HELPER_IMG     helper イメージ名（既定 veil-qemu:local）
 set -euo pipefail
 
@@ -81,7 +81,10 @@ VM_SMP="${VM_SMP:-4}"
 VM_MEM_MB="${VM_MEM_MB:-4096}"
 GROW_GB="${GROW_GB:-24}"
 FREEBSD_VER="${FREEBSD_VER:-14.3-RELEASE}"
-OPENBSD_VER="${OPENBSD_VER:-7.6}"
+# OpenBSD の CDN は直近数リリースしか保持しない（例: 7.6 は既に 404）。
+# 既定は入手可能な最新に追従させ、古いリリースを使う場合は OPENBSD_VER で指定する
+# （`curl -s https://cdn.openbsd.org/pub/OpenBSD/ | grep -oE '"[0-9]\.[0-9]/"'` で確認できる）。
+OPENBSD_VER="${OPENBSD_VER:-7.9}"
 NAME="veil-${OS_NAME}-${ARCH}"
 IMG="${WORKDIR}/disk.qcow2"
 
@@ -118,7 +121,7 @@ _image_url() {
         freebsd-x86_64)
             echo "https://download.freebsd.org/releases/VM-IMAGES/${FREEBSD_VER}/amd64/Latest/FreeBSD-${FREEBSD_VER}-amd64.qcow2.xz" ;;
         freebsd-aarch64)
-            echo "https://download.freebsd.org/releases/VM-IMAGES/${FREEBSD_VER}/aarch64/Latest/FreeBSD-${FREEBSD_VER}-RELEASE-arm64-aarch64.qcow2.xz" ;;
+            echo "https://download.freebsd.org/releases/VM-IMAGES/${FREEBSD_VER}/aarch64/Latest/FreeBSD-${FREEBSD_VER}-arm64-aarch64.qcow2.xz" ;;
         openbsd-x86_64)
             echo "https://cdn.openbsd.org/pub/OpenBSD/${OPENBSD_VER}/amd64/install${OPENBSD_VER//./}.img" ;;
         openbsd-aarch64)
@@ -262,7 +265,14 @@ cmd_status() {
     fi
 }
 
-cmd_console() { docker logs --tail "${1:-80}" "${NAME}" 2>&1 || true; }
+# シリアルコンソールは `-serial telnet:...` に出るため docker logs には現れない。
+# telnet ポートへ繋いで一定時間読み出す（対話したい場合は telnet で直接繋ぐ）。
+cmd_console() {
+    local secs="${1:-5}"
+    log "シリアルコンソール（telnet 127.0.0.1:${CON_PORT}）を ${secs}s 読み出す"
+    log "対話する場合: telnet 127.0.0.1 ${CON_PORT}"
+    timeout "${secs}" python3 "${HERE}/console-dump.py" "${CON_PORT}" || true
+}
 
 cmd_wait() {
     local timeout="${1:-1800}" waited=0
