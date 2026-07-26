@@ -51,6 +51,9 @@
 #
 # 環境変数:
 #   VEIL_QEMU_DIR  VM 資材の親ディレクトリ（既定 ~/qemu-images）
+#   BASE_IMG       プロビジョニング済みイメージ。setup でこれを backing file とする
+#                  qcow2 オーバーレイを作る（元イメージは変更しない）
+#   IMG            使用するディスクイメージのパス（既定 ${WORKDIR}/disk.qcow2）
 #   KEY            SSH 鍵（既定 ~/.ssh/veil_qemu_key）
 #   CARGO_FEATURES freature セット（既定: freebsd=full-freebsd / openbsd=full-openbsd。
 #                  いずれも --no-default-features 併用でアロケータを差し替える）
@@ -86,7 +89,22 @@ FREEBSD_VER="${FREEBSD_VER:-14.3-RELEASE}"
 # （`curl -s https://cdn.openbsd.org/pub/OpenBSD/ | grep -oE '"[0-9]\.[0-9]/"'` で確認できる）。
 OPENBSD_VER="${OPENBSD_VER:-7.9}"
 NAME="veil-${OS_NAME}-${ARCH}"
-IMG="${WORKDIR}/disk.qcow2"
+
+# 使用するディスクイメージ。既定は setup が作る ${WORKDIR}/disk.qcow2。
+#
+# `BASE_IMG` に**プロビジョニング済みイメージ**を指すと、それを backing file とする
+# qcow2 オーバーレイを ${WORKDIR}/disk.qcow2 として作り、元イメージを一切変更せずに
+# 起動する（setup 時に作成）。ストックの FreeBSD amd64 VM-IMAGE はシリアルコンソールへ
+# 何も出力せず `provision` のコンソール操作が効かないため、既に root SSH 鍵を仕込んだ
+# イメージがある場合はこの経路を使う:
+#
+#   BASE_IMG=~/qemu-images/freebsd-14.3-amd64.qcow2 \
+#     tools/qemu/bsd-vm.sh freebsd x86_64 setup
+#
+# `IMG` を直接指定すると（オーバーレイを作らず）そのイメージを使う。
+IMG="${IMG:-${WORKDIR}/disk.qcow2}"
+IMG_NAME="$(basename "${IMG}")"
+IMG_DIR="$(cd "$(dirname "${IMG}")" 2>/dev/null && pwd || echo "${WORKDIR}")"
 
 # os/arch ごとに固定のポートを割り当て（4 VM を同時起動しても衝突しない）
 _port_base() {
@@ -111,7 +129,13 @@ log() { echo "[${OS_NAME}-${ARCH}] $*" >&2; }
 die() { echo "[${OS_NAME}-${ARCH}] ERROR: $*" >&2; exit 1; }
 
 # helper コンテナ内で 1 コマンド実行（WORKDIR を /w にマウント）
-helper() { docker run --rm -v "${WORKDIR}:/w" -w /w "${HELPER_IMG}" "$@"; }
+helper() {
+    if [[ "${IMG_DIR}" == "${WORKDIR}" ]]; then
+        docker run --rm -v "${WORKDIR}:/w" -w /w "${HELPER_IMG}" "$@"
+    else
+        docker run --rm -v "${WORKDIR}:/w" -v "${IMG_DIR}:/img" -w /w "${HELPER_IMG}" "$@"
+    fi
+}
 
 # ---------------------------------------------------------------------------
 # イメージ URL
@@ -138,6 +162,20 @@ cmd_setup() {
     docker build -t "${HELPER_IMG}" "${HERE}/helper"
     [[ -f "${KEY}" ]] || { log "SSH 鍵を生成: ${KEY}"; ssh-keygen -t ed25519 -N '' -f "${KEY}" >/dev/null; }
 
+    if [[ -n "${BASE_IMG:-}" ]]; then
+        [[ -f "${BASE_IMG}" ]] || die "BASE_IMG not found: ${BASE_IMG}"
+        local base_dir base_name
+        base_dir="$(cd "$(dirname "${BASE_IMG}")" && pwd)"
+        base_name="$(basename "${BASE_IMG}")"
+        log "プロビジョニング済みイメージのオーバーレイを作成（元イメージは変更しない）: ${BASE_IMG}"
+        docker run --rm -v "${WORKDIR}:/w" -v "${base_dir}:/base:ro" -w /w "${HELPER_IMG}" \
+            qemu-img create -f qcow2 -F qcow2 -b "/base/${base_name}" "${IMG_NAME}" >/dev/null
+        # 起動時にも backing file を同じパス（/base）で見せる必要があるため記録しておく
+        echo "${base_dir}" > "${WORKDIR}/.base_img_dir"
+        log "setup 完了（オーバーレイ: ${IMG}、backing: ${BASE_IMG}）"
+        return 0
+    fi
+
     local url; url="$(_image_url)"
     if [[ "${OS_NAME}" == "freebsd" ]]; then
         if [[ ! -f "${IMG}" ]]; then
@@ -154,7 +192,7 @@ cmd_setup() {
         fi
         if [[ ! -f "${IMG}" ]]; then
             log "空のターゲットディスクを作成（${GROW_GB}G）"
-            helper qemu-img create -f qcow2 disk.qcow2 "${GROW_GB}G" >/dev/null
+            helper qemu-img create -f qcow2 "${IMG_NAME}" "${GROW_GB}G" >/dev/null
         fi
         _write_openbsd_autoinstall
     fi
@@ -203,12 +241,19 @@ _write_boot() {
     # sd0）、ターゲット qcow2 を 2 台目（sd1）として繋ぐ。auto_install.conf の
     # 「root disk = sd1」はこの並びに対応する。install 後は miniroot を外して
     # ターゲットだけで起動する（そのとき sd0 になる）。
+    # オーバーレイ運用（BASE_IMG）では backing file を読み取り専用マウントで見せるため、
+    # qemu が backing に共有 write ロックを取ろうとして
+    # `Could not open backing file: Failed to get shared "write" lock` で失敗する。
+    # backing のロックだけ無効化する（backing は qemu が O_RDONLY で開くので安全）。
+    local drive_opts=""
+    [[ -f "${WORKDIR}/.base_img_dir" ]] && drive_opts=",backing.file.locking=off"
+
     local drives
     if [[ "${OS_NAME}" == "openbsd" && "${1:-}" == "install" ]]; then
         drives="-drive if=virtio,format=raw,file=miniroot.img,index=0 \\
-  -drive if=virtio,format=qcow2,file=disk.qcow2,index=1"
+  -drive if=virtio,format=qcow2,file=${IMG_NAME},index=1"
     else
-        drives="-drive if=virtio,format=qcow2,file=disk.qcow2,index=0"
+        drives="-drive if=virtio,format=qcow2,file=${IMG_NAME},index=0${drive_opts}"
     fi
 
     if [[ "${ARCH}" == "x86_64" ]]; then
@@ -245,8 +290,13 @@ EOF
 cmd_up() {
     _write_boot "${1:-}"
     docker rm -f "${NAME}" >/dev/null 2>&1 || true
+    # オーバーレイ運用時は backing file を /base（読み取り専用）で見せる。
+    local base_mount=()
+    if [[ -f "${WORKDIR}/.base_img_dir" ]]; then
+        base_mount=(-v "$(cat "${WORKDIR}/.base_img_dir"):/base:ro")
+    fi
     # shellcheck disable=SC2046  # _kvm_args は 0/1 個の引数を意図的に展開する
-    docker run -d --name "${NAME}" $(_kvm_args) \
+    docker run -d --name "${NAME}" $(_kvm_args) "${base_mount[@]}" \
         -p "${SSH_PORT}:${SSH_PORT}" -p "${CON_PORT}:${CON_PORT}" \
         -v "${WORKDIR}:/w" -w /w "${HELPER_IMG}" bash /w/boot.sh >/dev/null
     log "起動: console=telnet 127.0.0.1:${CON_PORT}, ssh=127.0.0.1:${SSH_PORT}"
@@ -308,7 +358,7 @@ cmd_grow() {
     [[ "${OS_NAME}" == "freebsd" ]] || { log "grow は FreeBSD 専用（OpenBSD は autoinstall 時に全ディスクを使う）"; return 0; }
     log "qcow2 を +${GROW_GB}G 拡張 → single-user で growfs"
     cmd_down; sleep 2
-    helper qemu-img resize disk.qcow2 "+${GROW_GB}G"
+    helper qemu-img resize "${IMG_NAME}" "+${GROW_GB}G"
     cmd_up; sleep 6
     # gpart でパーティションを広げてから growfs（provision.py が fsck+growfs+reboot）。
     python3 - "${CON_PORT}" <<'PY'

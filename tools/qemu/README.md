@@ -111,10 +111,51 @@ tools/qemu/bsd-vm.sh freebsd x86_64 e2e \
 
 | 項目 | 状況 |
 |---|---|
-| ゲストイメージ URL（FreeBSD amd64/arm64・OpenBSD 7.9 amd64/arm64） | **HTTP 200 を確認済み** |
-| `bsd-vm.sh` の各サブコマンド（VM 作成〜build/e2e/fetch） | **未実行**（本リポジトリのホストではディスク・時間の制約により未検証） |
+| ゲストイメージ URL（FreeBSD amd64/arm64・OpenBSD 7.9 amd64/arm64） | **HTTP 200 を確認済み**（FreeBSD arm64 の URL は "RELEASE" 二重で 404 だったのを修正。OpenBSD 7.6 は CDN から消えていたため既定を 7.9 へ） |
+| `setup`（helper build → イメージ DL → 展開） | **FreeBSD amd64 で実行成功**（helper イメージ build・806MB の xz DL・3.7GB qcow2 展開まで） |
+| `up`（KVM 加速つき起動） | **起動成功**（`accel=kvm -cpu host`。コンテナ内 qemu が動作継続） |
+| `provision` 以降（`grow`/`toolchain`/`build`/`e2e`/`fetch`） | **未達**。下記「FreeBSD amd64 のシリアルコンソール問題」を参照 |
 | `openbsd-autoinstall.py` | **未実行**。OpenBSD インストーラの対話文言に依存するため、初回実行時に応答の追従が要る可能性が高い |
 | `linux-aarch64-e2e.sh` | **未実行**（KVM 非対応ホストでは TCG が実用不能。下記「既知の環境制約」参照） |
+
+### FreeBSD amd64 のシリアルコンソール問題（未解決）
+
+**配布されている `FreeBSD-<ver>-RELEASE-amd64.qcow2`（VM-IMAGE）は、電源投入から
+シリアルポートへ一切出力しない**（`-nographic` + `-serial telnet:...` で接続しても
+telnet の IAC バイトしか届かない。ローダメニューも起動ログも出ない）。
+amd64 のローダ／カーネルが既定で vidconsole を使うためで、arm64 VM-IMAGE
+（UEFI + efiboot で既定シリアル）とは事情が異なる。
+
+このため `provision`（= `freebsd-provision.py` がローダメニューで single-user に入り
+root の SSH 鍵を注入する経路）が **amd64 では機能しない**。
+`fbsd-arm64-vm.sh` が arm64 で動いていたのは arm64 が既定でシリアル出力するから。
+
+解決には以下のいずれかが要る（いずれも未実施）:
+
+- イメージをオフラインで編集して `/boot/loader.conf` に `console="comconsole"`
+  （あるいはブートパーティション直下に `-h` を書いた `/boot.config`）を入れる。
+  libguestfs / qemu-nbd が必要で、本リポジトリの想定（sudo 不可）から外れる。
+- 既にプロビジョニング済み（root SSH 鍵入り）のイメージを持ち込む。
+  そのために `BASE_IMG` を用意してある（下記）。
+
+#### `BASE_IMG`: プロビジョニング済みイメージのオーバーレイ運用
+
+```bash
+BASE_IMG=~/qemu-images/freebsd-14.3-amd64.qcow2 \
+  tools/qemu/bsd-vm.sh freebsd x86_64 setup
+tools/qemu/bsd-vm.sh freebsd x86_64 up
+tools/qemu/bsd-vm.sh freebsd x86_64 wait
+```
+
+`setup` が `BASE_IMG` を backing file とする qcow2 オーバーレイを作るので、
+**元イメージは一切変更されない**。起動時は backing を `/base` へ読み取り専用で
+マウントし、qemu が backing に共有 write ロックを取ろうとして失敗するのを
+`backing.file.locking=off` で回避する。
+
+> 本セッションではこの経路で既存イメージの起動まで確認したが、SSH が
+> banner exchange でタイムアウトした（ゲストの NIC 名や rc.conf が、本スクリプトの
+> `-machine q35` + `virtio-net-pci` 構成と噛み合っていない可能性がある）。
+> **コンソール出力が無いため原因の切り分けができず、build/e2e までは到達していない。**
 
 > OpenBSD の CDN は直近数リリースしか保持しない（7.6 は既に 404）。既定は 7.9。
 
