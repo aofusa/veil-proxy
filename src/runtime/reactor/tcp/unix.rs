@@ -379,8 +379,8 @@ impl TcpStream {
 
     /// バッファに非同期で読み込む（AIO 版。上の `veil_aio` 節参照）。
     #[cfg(veil_aio)]
-    pub fn read<T: IoBufMut>(&self, buf: T) -> super::aio::AioReadFuture<T> {
-        super::aio::AioReadFuture::new(self.fd, buf)
+    pub fn read<T: IoBufMut>(&self, buf: T) -> crate::runtime::reactor::aio::AioReadFuture<T> {
+        crate::runtime::reactor::aio::AioReadFuture::new(self.fd, buf)
     }
 
     /// バッファを非同期で書き込む。バッファの所有権を取り、完了時に `(Result<usize>, T)` を返す。
@@ -396,8 +396,8 @@ impl TcpStream {
 
     /// バッファを非同期で書き込む（AIO 版。上の `veil_aio` 節参照）。
     #[cfg(veil_aio)]
-    pub fn write<T: IoBuf>(&self, buf: T) -> super::aio::AioWriteFuture<T> {
-        super::aio::AioWriteFuture::new(self.fd, buf)
+    pub fn write<T: IoBuf>(&self, buf: T) -> crate::runtime::reactor::aio::AioWriteFuture<T> {
+        crate::runtime::reactor::aio::AioWriteFuture::new(self.fd, buf)
     }
 
     /// 2 つの不連続バッファを 1 回の `sendmsg`（scatter-gather）で書き込む（F-59 互換）。
@@ -542,7 +542,7 @@ impl crate::runtime::io::AsyncReadRent for TcpStream {
         &mut self,
         buf: T,
     ) -> impl std::future::Future<Output = crate::runtime::io::BufResult<usize, T>> {
-        super::aio::AioReadFuture::new(self.fd, buf)
+        crate::runtime::reactor::aio::AioReadFuture::new(self.fd, buf)
     }
 }
 
@@ -561,7 +561,7 @@ impl crate::runtime::io::AsyncWriteRent for TcpStream {
         &mut self,
         buf: T,
     ) -> impl std::future::Future<Output = crate::runtime::io::BufResult<usize, T>> {
-        super::aio::AioWriteFuture::new(self.fd, buf)
+        crate::runtime::reactor::aio::AioWriteFuture::new(self.fd, buf)
     }
 
     fn shutdown(&mut self) -> impl std::future::Future<Output = std::io::Result<()>> {
