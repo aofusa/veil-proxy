@@ -654,6 +654,8 @@ fi'
 }
 
 cmd_sync() {
+    # up 直後に呼ばれると SSH がまだ上がっておらず 255 で落ちるため待つ
+    cmd_wait "${SYNC_WAIT_TIMEOUT:-900}" >/dev/null 2>&1 || die "VM の SSH に到達できない"
     log "リポジトリを VM へ転送（tar over ssh）"
     cmd_ssh "mkdir -p ${GUEST_ROOT}"
     # fuzz はワークスペースメンバだがゲストでは不要。転送後に members から外す。
