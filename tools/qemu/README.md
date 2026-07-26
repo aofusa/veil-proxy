@@ -108,80 +108,62 @@ tools/qemu/bsd-vm.sh freebsd x86_64 e2e \
 | `fbsd-arm64-vm.sh` / `fbsd-arm64-smoke.sh` | FreeBSD arm64 の従来経路（smoke 専用。新規用途は `bsd-vm.sh` を推奨） |
 | `fbsd-capmode-e2e.sh` | capsicum capability mode 静的配信 E2E（F-123） |
 
-### 検証状況（重要）
+### 検証状況
 
 | 項目 | 状況 |
 |---|---|
-| ゲストイメージ URL（FreeBSD amd64/arm64・OpenBSD 7.9 amd64/arm64） | **HTTP 200 を確認済み**（FreeBSD arm64 の URL は "RELEASE" 二重で 404 だったのを修正。OpenBSD 7.6 は CDN から消えていたため既定を 7.9 へ） |
-| `setup`（helper build → イメージ DL → 展開） | **FreeBSD amd64 で実行成功**（helper イメージ build・806MB の xz DL・3.7GB qcow2 展開まで） |
-| `up`（KVM 加速つき起動） | **起動成功**（`accel=kvm -cpu host`。コンテナ内 qemu が動作継続） |
-| ローダメニューのシリアル操作（Space/`3`/`set console`/`boot -s -h`） | **到達確認済み**（下記参照） |
-| `provision` 以降（`grow`/`toolchain`/`build`/`e2e`/`fetch`） | **未達**。カーネルがシリアルへ出力しないため single-user シェルを掴めない。下記「FreeBSD amd64 のシリアルコンソール問題」を参照 |
-| `openbsd-autoinstall.py` | **未実行**。OpenBSD インストーラの対話文言に依存するため、初回実行時に応答の追従が要る可能性が高い |
-| `linux-aarch64-e2e.sh` | **未実行**（KVM 非対応ホストでは TCG が実用不能。下記「既知の環境制約」参照） |
+| ゲストイメージ URL（FreeBSD amd64/arm64・OpenBSD 7.9 amd64/arm64） | **HTTP 200 を確認済み** |
+| FreeBSD amd64: `setup` → `up` → `provision` | **成功**（SSH 鍵認証で `FreeBSD 14.3-RELEASE-p16` へ到達） |
+| FreeBSD amd64: `toolchain` | **成功**（cargo 1.96.1 / cmake 3.31.12） |
+| FreeBSD amd64: `build` / `e2e` / `fetch` | 実行中・順次確認 |
+| FreeBSD aarch64 | 未実行（同じ経路のはずだが TCG のため低速） |
+| OpenBSD（`openbsd-autoinstall.py`） | **未実行**。インストーラの対話文言に依存するため追従が要る可能性が高い |
+| `linux-aarch64-e2e.sh` | **未実行**（KVM 非対応ホストでは TCG が実用不能） |
 
-### FreeBSD amd64 のシリアルコンソール問題（未解決・調査結果）
+### FreeBSD amd64 で踏んだ落とし穴（すべて実測）
 
-`provision`（`freebsd-provision.py` がローダメニューから single-user に入り root の
-SSH 鍵を注入する経路）は **amd64 では最後まで到達しない**。以下は実測で分かったこと。
+ここは再発しやすいので詳しく残す。
 
-**動くところ:**
+1. **配布されている素の `FreeBSD-<ver>-RELEASE-amd64.qcow2` は使えない。**
+   シリアルへ一切出力しないうえ、ローダが `Loading configured modules...` を出した
+   あとカーネルが起動せずハングする（`-machine q35`/`pc`、`-cpu host`/`qemu64`、
+   BIOS/UEFI の全組み合わせで再現）。
+   → **`BASIC-CLOUDINIT` 版**を使う。こちらは `Dual Console: Serial Primary` で
+   シリアルが有効、かつ正常に起動する。`_image_url` はこれを指している。
 
-- `-serial telnet:...,server,nowait` は**接続前の出力を捨てる**。VM 起動から数秒以内に
-  コンソールへ接続すれば、**SeaBIOS → boot2 → ローダの出力はシリアルに出る**
-  （当初「何も出ない」と見えたのは接続が遅かったため）。`cmd_provision` が
-  down→up 直後にスクリプトを起動するのはこのため。
-- ローダメニューはシリアルから操作できる。Space で autoboot を止め、`3` で
-  ローダプロンプトへ入り、`set console="comconsole"` → `boot -s -h` まで通る
-  （コンソール切り替え直後は 1 文字落ちるので空行を挟む必要がある）。
+2. **配布イメージの仮想サイズは ~6GiB しかない。**
+   初回ブートの `freebsd-update` がデバッグシンボルを展開してゲストの FS が満杯になり、
+   `No space left on device` を延々と出して sshd まで到達しない。
+   → `setup` は配布イメージを `base.qcow2` として保持し、起動用の
+   **qcow2 オーバーレイ**（`disk.qcow2`）を `+${GROW_GB}G` して作る。
+   cloud-init の growfs が拡張する。`reset` でオーバーレイだけ作り直せる（再 DL 不要）。
 
-**動かないところ:**
+3. **FreeBSD の cloud-init は `chpasswd` は適用するが `write_files` / `runcmd` は
+   実行しない。** そのため SSH 公開鍵を cloud-init で置くことはできない。
+   → cloud-init には **root パスワード設定と growfs** だけを任せ、
+   **鍵の注入はシリアルの getty へ root ログインして行う**
+   （`freebsd-provision.py --mode login`）。
+   root パスワードは `VM_ROOT_PASSWORD`（既定 `veil`）。SSH は鍵認証のみで、
+   ポートは 127.0.0.1 にしかフォワードしていないローカル VM なので固定値でよい。
 
-- ローダが `Loading configured modules...` まで出した後、**カーネルはシリアルへ
-  一切出力しない**。`console="comconsole"` と `-h`(RB_SERIAL) の両方を与えても同じ。
-  `-machine q35` / `-machine pc` の双方で再現する。
-  そのため single-user のシェルプロンプトを掴めず、鍵注入まで進めない。
+4. **cloud-init シードは CD-ROM として繋ぐ。**
+   virtio-blk のディスクとして足すと、ローダが起動デバイスを取り違えて
+   `Failed to load kernel 'kernel'` でローダプロンプトに落ちる。
+   ルートディスクは `-drive if=virtio,index=0` のままにすること
+   （`-drive if=none` + `-device virtio-blk-pci,bootindex=0` に変えると
+   boot2 が `Booting from Hard Disk...` のスピナーのまま進まなくなる）。
 
-**試して駄目だった代替手段:**
+5. **`down` は ACPI シャットダウンを先に試す。**
+   cloud-init / growfs の書き込み中に `docker rm -f`（= qemu へ SIGKILL）すると
+   イメージが壊れ、次回の boot2 が回り続ける。
 
-| 手段 | 結果 |
-|---|---|
-| UEFI(OVMF) で起動して efiboot のシリアル出力を使う | OVMF 自体がシリアルへ出力せず、ローダにも到達を確認できない |
-| libguestfs でイメージをオフライン編集し `/boot/loader.conf` に `console="comconsole"` を書く | **UFS が読み取り専用**。アプライアンスの Linux カーネルは `ufstype=ufs2` で mount できるが書き込み不可（`Read-only file system`） |
-| QMP `send-key` で VGA コンソールへブラインド入力（`qmp-sendkeys.py`） | ローダメニュー操作までは成功（QMP `screendump` で確認済み）。ただし `set console="comconsole"` を入れるとローダが VGA キーボードを読まなくなり、以降タイプできない |
+6. **`-serial ...,server,nowait` は接続前の出力を捨てる。**
+   ローダメニューなど起動直後の出力を見たいときは、VM 起動直後にコンソールへ
+   接続すること（`console-dump.py` / `provision` はそうしている）。
 
-`qmp-sendkeys.py` と `console-dump.py` は上記の切り分けで実際に役立ったため残してある
-（`screendump` でゲスト画面を PNG に落として確認できる）。
-
-**次に試す価値がある案:**
-
-- FreeBSD の `bootonly.iso` / `mini-memstick.img` からシリアル指定でインストールし、
-  `console="comconsole"` を含むイメージを一度だけ作って `BASE_IMG` として使い回す。
-- ホストで root が使える環境なら `qemu-nbd` でイメージをマウントして
-  `/boot/loader.conf` を編集する（本リポジトリの想定外だが最短）。
-- arm64（`bsd-vm.sh freebsd aarch64`）は UEFI + efiboot が既定でシリアルを使うため
-  この問題を受けない。amd64 のビルドを急ぐ場合は arm64 側で先に流す手もある。
-
-#### `BASE_IMG`: プロビジョニング済みイメージのオーバーレイ運用
-
-```bash
-BASE_IMG=~/qemu-images/freebsd-14.3-amd64.qcow2 \
-  tools/qemu/bsd-vm.sh freebsd x86_64 setup
-tools/qemu/bsd-vm.sh freebsd x86_64 up
-tools/qemu/bsd-vm.sh freebsd x86_64 wait
-```
-
-`setup` が `BASE_IMG` を backing file とする qcow2 オーバーレイを作るので、
-**元イメージは一切変更されない**。起動時は backing を `/base` へ読み取り専用で
-マウントし、qemu が backing に共有 write ロックを取ろうとして失敗するのを
-`backing.file.locking=off` で回避する。
-
-> 本セッションではこの経路で既存イメージの起動まで確認したが、SSH が
-> banner exchange でタイムアウトした（ゲストの NIC 名や rc.conf が、本スクリプトの
-> `-machine q35` + `virtio-net-pci` 構成と噛み合っていない可能性がある）。
-> **コンソール出力が無いため原因の切り分けができず、build/e2e までは到達していない。**
-
-> OpenBSD の CDN は直近数リリースしか保持しない（7.6 は既に 404）。既定は 7.9。
+`qmp-sendkeys.py`（QMP `send-key` / `screendump` / `system_powerdown`）は上記の
+切り分けで実際に役立った。シリアルに何も出ない状況でも `screendump` でゲスト画面を
+PNG に落として確認できる。
 
 ### ポート割り当て
 
