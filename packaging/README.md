@@ -157,10 +157,18 @@ tools/qemu/bsd-vm.sh freebsd x86_64 fetch      # → packaging/build/veil-freebs
 tools/qemu/bsd-vm.sh freebsd x86_64 reset      # 初期状態へ（再ダウンロード不要）
 ```
 
-**所要時間の目安**（4 コア / KVM 有効ホスト）: x86_64 ゲストは KVM で加速されるため
-実用的で、FreeBSD amd64 の `full-freebsd` リリースビルドは**実測 約 30 分**。
+**所要時間の実測**（4 コア / KVM 有効ホスト、x86_64 ゲスト）:
+
+| 対象 | in-VM リリースビルド |
+|---|---|
+| FreeBSD 14.3 amd64（`full-freebsd`） | **約 30 分** |
+| OpenBSD 7.9 amd64（`full-openbsd`） | **約 72 分** |
+
 aarch64 ゲストは x86_64 ホストでは TCG なので数倍〜十数倍かかる。
-落とし穴と検証状況は [tools/qemu/README.md](../tools/qemu/README.md) に詳しくまとめてある。
+**OS ごとに固有の落とし穴がある**（OpenBSD は `/` が ~628M しかない、BoringSSL が
+OpenBSD を想定しておらず cc ラッパ・libstdc++ 互換リンクが要る、など）。
+`bsd-vm.sh` がすべて自動で処理するが、内容と検証状況は
+[tools/qemu/README.md](../tools/qemu/README.md) にまとめてある。
 
 対象 OS の VM 内で `build-bsd.sh` を直接実行する場合は `--os-version` 省略で
 `uname -r` から自動検出される。
@@ -213,7 +221,14 @@ tar.gz には `veil` バイナリ・`rc.d/veil`（サービススクリプト）
 （ABI 互換の目安。大きく異なる OS バージョンでは再ビルド推奨）。
 FreeBSD は capsicum（`[security] enable_capsicum`）・jail と、OpenBSD は
 pledge/unveil（`[security] enable_pledge` / `enable_unveil`）と併用できる。
-OpenBSD の TLS は rustls の ring プロバイダを使用し（F-122）、`full` フィーチャー（HTTP/3 + WASM 含む全機能）でのビルドに対応している。静的配信/プロキシとも HTTPS 200 で動作する（pledge+unveil 有効のまま）。
+OpenBSD の TLS は rustls の ring プロバイダを使用し（F-122）、`full-openbsd`
+（HTTP/3 + WASM 含む全機能。アロケータはシステム malloc）でのビルドに対応している。
+静的配信/プロキシとも HTTPS 200 で動作する（pledge+unveil 有効のまま）。
+
+> **FreeBSD の HTTP/3 に関する既知の制限**: FreeBSD では `http3_enabled = true` でも
+> QUIC の UDP ポートが bind されず HTTP/3 が機能しない（**B-50**、未修正）。
+> 配布物は `full-freebsd` でビルドされ http3 を含むが、実際には使えない点に注意。
+> HTTP/1.1・HTTP/2・gRPC・WebSocket・L4 は動作する（VM 内 E2E で 416 件通過）。
 
 ### macOS 向けパッケージ（F-125、Docker クロスビルド）
 
