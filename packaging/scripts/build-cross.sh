@@ -8,6 +8,9 @@
 #   windows  x86_64-pc-windows-msvc + aarch64-pc-windows-msvc      / cargo-xwin
 #   freebsd  x86_64-unknown-freebsd                                 / cargo-zigbuild
 #
+# BSD 向けは `full` ではなく `full-freebsd`（jemalloc + POSIX AIO）を既定にする。
+# OpenBSD（VM ネイティブビルド）は `full-openbsd`（システムアロケータ）を使う。
+#
 # 各 Dockerfile は Dockerfile.glibc と同じ cacher/builder 2 段構成のため、
 # ソース変更だけの再ビルドでは aws-lc-sys / boring-sys（quiche 内蔵 BoringSSL）の
 # 重い C ビルドがレイヤキャッシュから再利用される（B-47）。
@@ -42,9 +45,11 @@ DEFAULT_MACOS_FEATURES="full"
 # Windows クロスビルドデフォルト feature セット（full: http3, wasm 含む全機能）。
 DEFAULT_WINDOWS_FEATURES="full"
 
-# FreeBSD x86_64 クロスビルドデフォルト feature セット（full: http3, wasm 含む全機能。
-# TLS 暗号・quiche とも aws-lc-sys を共有する = AWS_LC_SYS_NO_PREFIX 1）。
-DEFAULT_FREEBSD_FEATURES="full"
+# FreeBSD x86_64 クロスビルドデフォルト feature セット。
+# `full` と機能セットは同じだが、**アロケータを jemalloc**（mimalloc ではなく）にし、
+# **POSIX AIO 経路（F-127）を有効**にした BSD 向けセット（Cargo.toml の `full-freebsd`）。
+# TLS 暗号・quiche とも aws-lc-sys を共有する（AWS_LC_SYS_NO_PREFIX=1）。
+DEFAULT_FREEBSD_FEATURES="full-freebsd"
 
 TARGET_OS=""
 

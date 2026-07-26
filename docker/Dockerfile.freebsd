@@ -64,7 +64,7 @@ ENV CMAKE_SYSTEM_NAME=FreeBSD \
 # ==========================================
 FROM tool-builder AS cacher
 
-ARG CARGO_FEATURES=full
+ARG CARGO_FEATURES=full-freebsd
 ARG RUST_TARGET=x86_64-unknown-freebsd
 
 # Cargo.toml と Cargo.lock、および fuzz ワークスペースメンバのマニフェストを先にコピー
@@ -91,7 +91,7 @@ RUN mkdir src benches \
 # ==========================================
 FROM tool-builder AS builder
 
-ARG CARGO_FEATURES=full
+ARG CARGO_FEATURES=full-freebsd
 ARG RUST_TARGET=x86_64-unknown-freebsd
 
 COPY --from=cacher /usr/local/cargo /usr/local/cargo

@@ -52,6 +52,8 @@
 # 環境変数:
 #   VEIL_QEMU_DIR  VM 資材の親ディレクトリ（既定 ~/qemu-images）
 #   KEY            SSH 鍵（既定 ~/.ssh/veil_qemu_key）
+#   CARGO_FEATURES freature セット（既定: freebsd=full-freebsd / openbsd=full-openbsd。
+#                  いずれも --no-default-features 併用でアロケータを差し替える）
 #   VM_SMP/VM_MEM_MB/GROW_GB
 #   FREEBSD_VER (14.3-RELEASE) / OPENBSD_VER (7.6)
 #   HELPER_IMG     helper イメージ名（既定 veil-qemu:local）
@@ -366,12 +368,22 @@ _guest_env_prefix() {
     fi
 }
 
-CARGO_FEATURES="${CARGO_FEATURES:-full}"
+# BSD 向けの既定 feature セット（Cargo.toml）。
+#   full-freebsd : full と同じ機能セット + アロケータを jemalloc + POSIX AIO(F-127) 有効
+#   full-openbsd : full と同じ機能セット + システムアロケータ（mimalloc/jemalloc を使わない）
+# どちらも `--no-default-features` と併用する（default features の mimalloc を外すため）。
+_default_features() {
+    case "${OS_NAME}" in
+        freebsd) echo "full-freebsd" ;;
+        openbsd) echo "full-openbsd" ;;
+    esac
+}
+CARGO_FEATURES="${CARGO_FEATURES:-$(_default_features)}"
 
 cmd_build() {
     cmd_sync
-    log "in-VM リリースビルド（--features ${CARGO_FEATURES}）"
-    cmd_ssh "cd ${GUEST_ROOT} && $(_guest_env_prefix) cargo build --release --features '${CARGO_FEATURES}'"
+    log "in-VM リリースビルド（--no-default-features --features ${CARGO_FEATURES}）"
+    cmd_ssh "cd ${GUEST_ROOT} && $(_guest_env_prefix) cargo build --release --no-default-features --features '${CARGO_FEATURES}'"
     cmd_ssh "ls -l ${GUEST_ROOT}/target/release/veil"
 }
 
@@ -397,8 +409,8 @@ cmd_e2e() {
         cmd_ssh "chmod +x ${GUEST_ROOT}/target/debug/veil"
         env_prefix="${env_prefix} VEIL_E2E_SKIP_VEIL_BUILD=1"
     fi
-    log "in-VM E2E（tests/e2e_setup.sh test）"
-    cmd_ssh "cd ${GUEST_ROOT} && ${env_prefix} VEIL_E2E_FEATURES='${CARGO_FEATURES}' bash tests/e2e_setup.sh test"
+    log "in-VM E2E（tests/e2e_setup.sh test、features=${CARGO_FEATURES}）"
+    cmd_ssh "cd ${GUEST_ROOT} && ${env_prefix} VEIL_E2E_NO_DEFAULT_FEATURES=1 VEIL_E2E_FEATURES='${CARGO_FEATURES}' bash tests/e2e_setup.sh test"
 }
 
 # packaging へ渡すためにビルド済みバイナリを取り出す

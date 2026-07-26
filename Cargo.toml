@@ -187,6 +187,43 @@ full = [
     "l4-proxy",
 ]
 
+# BSD 向けの全機能ビルド（packaging 用）
+# ---------------------------------------------------------------------------
+# `full` との違いはアロケータと FreeBSD 専用の I/O 経路だけで、機能セットは同一。
+# cargo にはターゲット別の default features が無いため、`full` からアロケータを
+# 差し替えたセットを別 feature として用意し、packaging のビルドスクリプト
+# （packaging/scripts/build-cross.sh・tools/qemu/bsd-vm.sh）が
+# `--no-default-features --features full-freebsd|full-openbsd` で明示指定する。
+# 通常の `--features full` は従来どおり mimalloc のままで挙動を変えない。
+
+# FreeBSD: mimalloc の代わりに jemalloc、加えて POSIX AIO 経路（F-127）を有効化する。
+full-freebsd = [
+    "ktls", "http2", "http3",
+    "grpc-full", "wasm",
+    "opentelemetry",
+    "compression", "cache", "metrics",
+    "websocket", "rate-limit", "buffering",
+    "jemalloc",
+    "aio",
+    "admin",
+    "access-log",
+    "l4-proxy",
+]
+
+# OpenBSD: システムアロケータ（global_allocator を差し替えない）を使う。
+# mimalloc / jemalloc とも有効化しないことでシステム malloc(3) が使われる。
+full-openbsd = [
+    "ktls", "http2", "http3",
+    "grpc-full", "wasm",
+    "opentelemetry",
+    "compression", "cache", "metrics",
+    "websocket", "rate-limit", "buffering",
+    "system-allocator",
+    "admin",
+    "access-log",
+    "l4-proxy",
+]
+
 [dependencies]
 # monoio 削除: カスタム io_uring 実装 (src/runtime/) に完全移行
 # rustls を直接使用（ハンドシェイク後に kTLS へオフロード）。

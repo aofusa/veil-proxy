@@ -254,6 +254,7 @@ Docker コンテナでのインストール・起動・curl 動作確認（両�
 > 主な注意点：
 > - **デフォルトフィーチャー**: `ktls`、`http2`、`mimalloc`
 > - **`full`**: 全フィーチャーを有効化（`ktls`、`http2`、`http3`、`grpc-full`、`wasm`、`compression`、`cache`、`metrics`、`websocket`、`rate-limit`、`buffering`、`mimalloc`）
+> - **`full-freebsd` / `full-openbsd`**: `full` と機能セットは同一でアロケータのみ異なる BSD 向けセット。`full-freebsd` は **jemalloc** + **`aio`**（FreeBSD POSIX AIO、F-127）、`full-openbsd` は**システムアロケータ**。cargo にターゲット別 default features が無いため、packaging のスクリプトが `--no-default-features` と併せて明示指定する（`packaging/scripts/build-cross.sh --target freebsd`、`tools/qemu/bsd-vm.sh <os> <arch> build|e2e`）。素の `--features full` の挙動は従来どおり変わらない。
 > - **アロケータフィーチャー**（`mimalloc`、`jemalloc`、`system-allocator`）は排他的 — 複数同時有効化不可
 > - HTTP/3 は UDP ベースのため kTLS と併用不可
 

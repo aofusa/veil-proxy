@@ -252,6 +252,7 @@ See [packaging/README.md](packaging/README.md) for details (Docker build, postin
 > Key notes:
 > - **Default features**: `ktls`, `http2`, `mimalloc`
 > - **`full`**: enables everything (`ktls`, `http2`, `http3`, `grpc-full`, `wasm`, `compression`, `cache`, `metrics`, `websocket`, `rate-limit`, `buffering`, `mimalloc`)
+> - **`full-freebsd` / `full-openbsd`**: same feature set as `full`, but with a different allocator — `full-freebsd` uses **jemalloc** and additionally enables **`aio`** (FreeBSD POSIX AIO, F-127), `full-openbsd` uses the **system allocator**. Cargo has no per-target default features, so the packaging scripts pass these explicitly with `--no-default-features` (`packaging/scripts/build-cross.sh --target freebsd`, `tools/qemu/bsd-vm.sh <os> <arch> build|e2e`). Plain `--features full` is unchanged.
 > - **Allocator features** (`mimalloc`, `jemalloc`, `system-allocator`) are mutually exclusive — enable at most one
 > - HTTP/3 is UDP-based and cannot be combined with kTLS
 

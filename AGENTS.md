@@ -86,7 +86,7 @@ AI エージェントおよびコントリビュータ向けの **最小指針**
 
 - 依頼範囲外のドライブバイリファクタ、無関係ファイルの変更。
 - README / 仕様を更新せず挙動・設定だけ変えること。
-- `default = ["ktls", "http2", "mimalloc"]` を崩して重い依存をデフォルト必須にすること。
+- `default = ["ktls", "http2", "mimalloc"]` を崩して重い依存をデフォルト必須にすること。（BSD 向けのアロケータ差し替えは `full-freebsd` / `full-openbsd` という**別 feature セット**で表現し、packaging のスクリプトが `--no-default-features` と併せて明示指定する。default を target 別に変えようとしないこと）
 - 検証なしの `unsafe` 拡大、安易な `#[ignore]`（やむを得ない場合は理由を文書化）。
 - `docs/artifacts/` 以外への AI 専用成果物の散乱。
 - バックログの個別 md だけ更新して [docs/backlog/backlog.md](docs/backlog/backlog.md) を更新しないこと。

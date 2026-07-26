@@ -121,6 +121,14 @@ wait_for_binary_ready() {
 # （F-120 Phase 2: reactor（epoll）バックエンドの E2E 検証を
 # `VEIL_E2E_FEATURES="full,epoll" ./tests/e2e_setup.sh test` で実行するため）。
 VEIL_E2E_FEATURES="${VEIL_E2E_FEATURES:-full}"
+# VEIL_E2E_NO_DEFAULT_FEATURES=1 で `--no-default-features` を併用する。
+# BSD 向けの `full-freebsd` / `full-openbsd`（default features の mimalloc を外して
+# jemalloc / システムアロケータへ差し替えたセット）を VM 内 E2E で使うため（tools/qemu/bsd-vm.sh）。
+if [ "${VEIL_E2E_NO_DEFAULT_FEATURES:-0}" = "1" ]; then
+    VEIL_E2E_NO_DEFAULT_ARG="--no-default-features"
+else
+    VEIL_E2E_NO_DEFAULT_ARG=""
+fi
 ensure_veil_binary() {
     local grpc_bin="${SCRIPT_DIR}/grpc_server/target/debug/grpc-server"
     local backends_bin="${SCRIPT_DIR}/test_backends/target/debug/test-backends"
@@ -133,7 +141,7 @@ ensure_veil_binary() {
     cd "$PROJECT_DIR"
     if [ "${VEIL_E2E_SKIP_VEIL_BUILD:-0}" = "1" ]; then
         log_warn "VEIL_E2E_SKIP_VEIL_BUILD=1: skipping veil build, using ${VEIL_BIN}"
-    elif ! cargo build --features "${VEIL_E2E_FEATURES}"; then
+    elif ! cargo build ${VEIL_E2E_NO_DEFAULT_ARG} --features "${VEIL_E2E_FEATURES}"; then
         log_error "cargo build --features ${VEIL_E2E_FEATURES} failed"
         exit 1
     fi
@@ -2041,12 +2049,12 @@ run_tests() {
         log_info "Command: cargo test --test e2e_tests --features '${VEIL_E2E_FEATURES}' -- ${TEST_FILTER} --test-threads=${TEST_THREADS} --nocapture"
 
         # テスト実行
-        cargo test --test e2e_tests --features "${VEIL_E2E_FEATURES}" -- "${TEST_FILTER}" --test-threads=${TEST_THREADS} --nocapture
+        cargo test --test e2e_tests ${VEIL_E2E_NO_DEFAULT_ARG} --features "${VEIL_E2E_FEATURES}" -- "${TEST_FILTER}" --test-threads=${TEST_THREADS} --nocapture
     else
         log_info "Command: cargo test --test e2e_tests --features '${VEIL_E2E_FEATURES}' -- --test-threads=${TEST_THREADS}"
 
         # テスト実行
-        cargo test --test e2e_tests --features "${VEIL_E2E_FEATURES}" -- --test-threads=${TEST_THREADS}
+        cargo test --test e2e_tests ${VEIL_E2E_NO_DEFAULT_ARG} --features "${VEIL_E2E_FEATURES}" -- --test-threads=${TEST_THREADS}
     fi
     
     log_info "E2E tests completed"

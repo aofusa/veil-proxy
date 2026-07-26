@@ -152,6 +152,22 @@ tools/qemu/bsd-vm.sh freebsd x86_64 fetch      # → packaging/build/veil-freebs
 # 対象 OS の VM 内で直接実行する場合は --os-version 省略で uname -r から自動検出される。
 ```
 
+### BSD 向けの feature セット（`full-freebsd` / `full-openbsd`）
+
+BSD 向けパッケージは `full` ではなく **BSD 専用の feature セット**でビルドする
+（`Cargo.toml` の `[features]`）。機能セットは `full` と同一で、**アロケータと
+FreeBSD 専用 I/O 経路だけが異なる**。cargo にはターゲット別の default features が
+無いため、packaging のスクリプト側で `--no-default-features` と併せて明示指定する。
+
+| セット | アロケータ | 追加 | 使う場所 |
+|---|---|---|---|
+| `full`（既定） | mimalloc | — | Linux / macOS / Windows |
+| `full-freebsd` | **jemalloc** | **`aio`**（POSIX AIO 経路、F-127） | `build-cross.sh --target freebsd` / `bsd-vm.sh freebsd …` |
+| `full-openbsd` | **システムアロケータ**（`global_allocator` を差し替えない） | — | `bsd-vm.sh openbsd …` |
+
+通常の `cargo build --features full` の挙動は従来どおり（mimalloc・AIO 無効）で変わらない。
+`CARGO_FEATURES` 環境変数で上書きもできる。
+
 **FreeBSD x86_64 は Docker クロスビルドも可能**（`docker/Dockerfile.freebsd`、
 `cargo-zigbuild` が FreeBSD libc を同梱しており `x86_64-unknown-freebsd` は Rust Tier 2）。
 VM 内フルビルドを省いて E2E だけ VM で回せる:
