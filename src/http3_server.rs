@@ -3209,7 +3209,7 @@ async fn proxy_to_tls_backend_async(
     // 別スレッドでブロッキング TLS 通信を実行し、mpsc channel 経由で結果を受け取る
     let (tx, rx) = std::sync::mpsc::sync_channel::<io::Result<BackendProxyResult>>(1);
     std::thread::spawn(move || {
-        use std::io::{Read, Write};
+        use std::io::Write;
         let result = (|| -> io::Result<BackendProxyResult> {
             let timeout = Duration::from_secs(timeout_secs);
             let mut std_stream = std::net::TcpStream::connect(&addr as &str).map_err(|e| {
@@ -3225,7 +3225,19 @@ async fn proxy_to_tls_backend_async(
             let mut tls = rustls::Stream::new(&mut conn, &mut std_stream);
             tls.write_all(&request)?;
             let mut response = Vec::with_capacity(16384);
-            tls.read_to_end(&mut response)?;
+            // `read_to_end` は rustls の «close_notify なしの EOF» をエラーとして
+            // 伝播させてしまい、HTTP/3 → TLS バックエンドのプロキシが 502 になる
+            // （B-54）。close_notify を送らずに閉じるバックエンドは HTTP/1.1 では
+            // ごく普通なので、kTLS 版と同じく UnexpectedEof は正常終了として扱う。
+            let mut buf = [0u8; 8192];
+            loop {
+                match std::io::Read::read(&mut tls, &mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => response.extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(e),
+                }
+            }
             parse_http_response(&response)
         })();
         let _ = tx.send(result);
