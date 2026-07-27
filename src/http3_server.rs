@@ -147,7 +147,9 @@ fn apply_memfd_seals(fd: i32) -> io::Result<()> {
     Ok(())
 }
 
-/// PEM データを memfd に書き込み、/proc/self/fd/<fd> パスを返す（セキュリティ強化版）
+/// PEM データを memfd に書き込み、quiche へ渡すパスを返す（セキュリティ強化版）
+///
+/// Linux は `/proc/self/fd/<fd>`。他 OS の扱いは各 `create_memfd_for_pem` を参照。
 ///
 /// この関数は以下のことを行います：
 /// 1. memfd_create で匿名ファイルを作成（MFD_CLOEXEC + MFD_ALLOW_SEALING）
@@ -166,29 +168,33 @@ fn apply_memfd_seals(fd: i32) -> io::Result<()> {
 /// ドロップされると fd が閉じられ、パスが無効になります。
 /// PEM を載せたファイルと、quiche がそれを読むためのパスのラッパ。
 ///
-/// - Linux / FreeBSD: `memfd`（`/proc/self/fd/<fd>` 経由・FS 非経由）。Drop は fd を
+/// - Linux: `memfd`（`/proc/self/fd/<fd>` 経由・FS 非経由）。Drop は fd を
 ///   閉じるだけ（匿名メモリのため後始末不要）。
+/// - FreeBSD: `memfd_create(2)` はあるが **`/proc` は既定でマウントされない**ため、
+///   fdescfs（`/dev/fd`）が使えるときだけ memfd をパス経由で渡し、駄目なら一時ファイル
+///   フォールバックへ落とす（B-50）。
 /// - OpenBSD / macOS: `memfd_create(2)` が無いため 0600 権限の一時ファイルへフォールバックし、
 ///   **Drop で必ず unlink** して機密がディスクに滞留しないようにする（F-125）。
 struct PemBackedFile {
     _file: std::fs::File,
-    /// OpenBSD/macOS の一時ファイルのみ Drop で unlink 対象として保持する。
-    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-    temp_path: std::path::PathBuf,
+    /// 一時ファイルフォールバックのときだけ `Some`（Drop で unlink する）。
+    /// Linux は常に memfd 経由なのでフィールド自体を持たない。
+    #[cfg(not(target_os = "linux"))]
+    temp_path: Option<std::path::PathBuf>,
 }
 
 impl Drop for PemBackedFile {
     fn drop(&mut self) {
-        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-        {
+        #[cfg(not(target_os = "linux"))]
+        if let Some(path) = self.temp_path.as_ref() {
             // 機密（秘密鍵/証明書）をディスクに残さない。close 前の unlink で
             // 名前を外し、fd クローズ時に実体が解放される。
-            let _ = std::fs::remove_file(&self.temp_path);
+            let _ = std::fs::remove_file(path);
         }
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(target_os = "linux")]
 fn create_memfd_for_pem(name: &str, pem_data: &[u8]) -> io::Result<(PemBackedFile, String)> {
     // memfd を作成（セキュリティフラグ付き）
     let mut memfd = memfd_create_secure(name)?;
@@ -219,15 +225,80 @@ fn create_memfd_for_pem(name: &str, pem_data: &[u8]) -> io::Result<(PemBackedFil
     Ok((PemBackedFile { _file: memfd }, proc_path))
 }
 
+/// FreeBSD 版（B-50）。
+///
+/// FreeBSD にも `memfd_create(2)`（13+）はあるが、**`/proc` は既定でマウントされない**
+/// （`procfs(5)` は非推奨扱い）。そのため Linux と同じ `/proc/self/fd/<fd>` を quiche へ
+/// 渡すと `load_cert_chain_from_pem_file` が失敗し、`run_http3_server` が起動直後に
+/// Err で終了して **QUIC の UDP ソケットが一切 bind されない**（= HTTP/3 が全滅する）。
+///
+/// FreeBSD で fd をパス化できるのは fdescfs（`/dev/fd`）だが、これも既定ではマウント
+/// されず `/dev/fd/{0,1,2}` しか見えない。したがって:
+///
+/// 1. memfd に PEM を載せ、`/dev/fd/<fd>` が**実際に読めるか**を確認する
+///    （= fdescfs がマウントされている）。読めればそのパスを使う（FS 非経由・最良）。
+/// 2. 読めなければ 0600 の一時ファイルへフォールバックする（Drop で unlink）。
+///
+/// capability mode（`cap_enter`）下では両方とも失敗し得るが、HTTP/3 ワーカーの
+/// 証明書ロードは `cap_enter` より前に実行される（F-123）。
+#[cfg(target_os = "freebsd")]
+fn create_memfd_for_pem(name: &str, pem_data: &[u8]) -> io::Result<(PemBackedFile, String)> {
+    let mut memfd = memfd_create_secure(name)?;
+    memfd.write_all(pem_data)?;
+    memfd.seek(io::SeekFrom::Start(0))?;
+
+    let fd = memfd.as_raw_fd();
+    let dev_fd_path = format!("/dev/fd/{}", fd);
+
+    // fdescfs が無いと `/dev/fd/<fd>`（fd >= 3）は存在しない。open できるかで判定する。
+    // 起動時とホットリロード時のみのコールドパス。
+    #[allow(clippy::disallowed_methods)] // 起動/リロードのコールドパス（ホットパスではない）
+    let dev_fd_usable = std::fs::File::open(&dev_fd_path).is_ok();
+
+    if dev_fd_usable {
+        if let Err(e) = apply_memfd_seals(fd) {
+            warn!(
+                "[HTTP/3] Failed to apply memfd seals: {} (continuing without seals)",
+                e
+            );
+        } else {
+            debug!("[HTTP/3] memfd seals applied: WRITE|SHRINK|GROW|SEAL");
+        }
+        debug!("[HTTP/3] PEM path via fdescfs: {}", dev_fd_path);
+        return Ok((
+            PemBackedFile {
+                _file: memfd,
+                temp_path: None,
+            },
+            dev_fd_path,
+        ));
+    }
+
+    debug!(
+        "[HTTP/3] fdescfs (/dev/fd) unavailable; falling back to a 0600 temp file for '{}'",
+        name
+    );
+    drop(memfd);
+    create_temp_pem_file(name, pem_data)
+}
+
 /// OpenBSD / macOS 版: `memfd_create(2)` が無いため 0600 権限の一時ファイルへ PEM を
-/// 書き込み、その実パスを返す（Drop で unlink）。証明書ホットリロードは数ヶ月に 1 回の
-/// コールドパスのため一時ファイル経由でも性能影響はない。OpenBSD の `unveil` 有効時は
-/// 一時ディレクトリが unveil 対象外だと作成に失敗し得るが、その場合リロードは警告付きで
-/// スキップされ既存証明書のまま稼働を継続する（非致命）。macOS には unveil 相当の制約は
-/// 無い（F-125: sandbox_init は `(allow file-write* (subpath tmp))` を許可する保守的な
-/// プロファイルのため、一時ファイル書き込みは通常ブロックされない）。
+/// 書き込み、その実パスを返す（Drop で unlink）。
 #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 fn create_memfd_for_pem(name: &str, pem_data: &[u8]) -> io::Result<(PemBackedFile, String)> {
+    create_temp_pem_file(name, pem_data)
+}
+
+/// 0600 権限の一時ファイルへ PEM を書き込み、その実パスを返す（Drop で unlink）。
+///
+/// 証明書ホットリロードは数ヶ月に 1 回のコールドパスのため一時ファイル経由でも性能影響は
+/// ない。OpenBSD の `unveil` 有効時は一時ディレクトリが unveil 対象外だと作成に失敗し得る
+/// が、その場合リロードは警告付きでスキップされ既存証明書のまま稼働を継続する（非致命）。
+/// macOS には unveil 相当の制約は無い（F-125: sandbox_init は
+/// `(allow file-write* (subpath tmp))` を許可する保守的なプロファイルのため、一時ファイル
+/// 書き込みは通常ブロックされない）。
+#[cfg(not(target_os = "linux"))]
+fn create_temp_pem_file(name: &str, pem_data: &[u8]) -> io::Result<(PemBackedFile, String)> {
     // OpenOptionsExt は下の `#[cfg(unix)]` ブロック内で use する（ここで先に use すると
     // 非 unix ターゲットで未使用になり unused_imports 警告になる）。
 
@@ -253,7 +324,7 @@ fn create_memfd_for_pem(name: &str, pem_data: &[u8]) -> io::Result<(PemBackedFil
     Ok((
         PemBackedFile {
             _file: file,
-            temp_path,
+            temp_path: Some(temp_path),
         },
         path_str,
     ))
