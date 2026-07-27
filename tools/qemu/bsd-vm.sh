@@ -695,6 +695,11 @@ _guest_env_prefix() {
         pre="${pre} BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_openbsd='-include pthread.h'"
         # 上記 libstdc++ 互換リンクを見つけさせる
         pre="${pre} RUSTFLAGS='-L /usr/local/lib'"
+        # autoinstall の auto layout では /usr/obj が 24G ディスクでも ~8G しかなく、
+        # デバッグ情報付きの dev プロファイル（target/debug が 5G 超 + incremental 1.5G）
+        # だと **E2E のビルド中に `No space left on device` で落ちる**（実測）。
+        # E2E はデバッガを使わないのでデバッグ情報とインクリメンタルを切って容量を稼ぐ。
+        pre="${pre} CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0"
     fi
     echo "${pre}"
 }
