@@ -100,6 +100,7 @@ tools/qemu/bsd-vm.sh freebsd x86_64 all
 | `VM_ROOT_PASSWORD` | `veil` | ゲスト root パスワード（コンソールデバッグ用。SSH は鍵のみ、ポートは 127.0.0.1 のみ） |
 | `CARGO_FEATURES` | `full-freebsd` / `full-openbsd` | ビルドする feature セット |
 | `BASE_IMG` | — | 既にプロビジョニング済みのイメージを backing file にして起動する（元イメージは変更しない） |
+| `VM_FIRMWARE` | `bios` | x86_64 ゲストのファームウェア。`uefi` にすると OVMF + q35 で起動する（`BASE_IMG` に配布の素の VM-IMAGE 由来イメージを指す場合はこちらが必要） |
 
 ### ファイル一覧
 
@@ -109,6 +110,7 @@ tools/qemu/bsd-vm.sh freebsd x86_64 all
 | `freebsd-provision.py` | FreeBSD の provision。`--mode login`（getty へ root ログインして鍵注入・**現行の既定経路**）/ `--mode ssh`（ローダメニュー経由 single-user）/ `--mode grow`（growfs） |
 | `openbsd-autoinstall.py` | OpenBSD の autoinstall(8) をシリアルコンソールから駆動 |
 | `console-dump.py` | シリアルコンソール（telnet）を非対話で読み出す（`console` サブコマンド） |
+| `serial-exec.py` | シリアルへ root ログインして**任意のコマンドを実行**する。SSH が上がらない／壊れた VM の切り分けと復旧に使う（例: unclean な UFS の `fsck` + `mount -u -w /`）。`--con-port` は `SSH_PORT+1` |
 | `qmp-sendkeys.py` | QMP 経由の `--key`/`--type`（ブラインド入力）・`--screendump`（ゲスト画面を PNG 化）・`--powerdown`。シリアルに何も出ない状況の切り分けに使う。QMP ポートは `SSH_PORT+2`。例: `python3 tools/qemu/qmp-sendkeys.py --port 2312 --screendump /w/screen.png`（`/w` = ホストの `${WORKDIR}`） |
 | `helper/Dockerfile` | qemu-system-{arm,x86} + AAVMF/OVMF + ssh + python3-pexpect + cloud-image-utils |
 | `aarch64-vm.sh` / `run-e2e-aarch64.sh` / `linux-aarch64-e2e.sh` | Linux aarch64 用（後述） |
@@ -175,6 +177,30 @@ tools/qemu/bsd-vm.sh freebsd x86_64 all
 
 8. **`scp` のポート指定は `-P`**（`-p` は「タイムスタンプ保持」）。
    ssh 用のオプション配列をそのまま流用すると 22 番へ繋ぎに行って `fetch` が失敗する。
+
+9. **電源断（`docker rm -f` / ホスト再起動）の後始末は 3 箇所ある。**
+   UFS が unclean のまま起動すると `/` が **read-only でマウント**され、rc の
+   ネットワーク設定が適用されないまま sshd だけが上がる。この状態は外からは
+   `Connection timed out during banner exchange` にしか見えず原因が分かりにくい。
+   `serial-exec.py` でシリアルから入って復旧する:
+
+   ```bash
+   python3 tools/qemu/serial-exec.py --con-port 2311 --timeout 1200 \
+     'fsck -y /dev/gpt/rootfs' 'mount -u -w /' 'sync; reboot'
+   ```
+
+   同じ電源断で次の 2 つも壊れることがある（どちらも実測）:
+   - `pkg` の `/var/db/pkg/local.sqlite` → `database disk image is malformed` /
+     `Assertion failed: (p != NULL) ... pkg_jobs_conflicts.c`。
+     `mv /var/db/pkg/local.sqlite /var/db/pkg/local.sqlite.corrupt` してから
+     `toolchain` をやり直す（実体のファイルは残っているので上書きインストールされる）。
+   - cargo のレジストリキャッシュ → `failed to unpack package ...` /
+     `numeric field was not a number`。`rm -rf $CARGO_HOME/registry` で解消する。
+
+10. **`BASE_IMG` に配布の素の VM-IMAGE 由来イメージを指す場合は UEFI 起動が要る。**
+    既定の SeaBIOS（`-machine pc`）ではカーネルまで進まず画面が真っ黒のまま止まる。
+    `VM_FIRMWARE=uefi` を指定すると OVMF + q35 で起動する（この経路ではカーネルの
+    出力は `Dual Console: Serial Primary` 以降シリアルへ移る）。
 
 ### OpenBSD で踏んだ落とし穴（すべて実測）
 

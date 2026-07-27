@@ -391,7 +391,7 @@ tempfile = "3.24.0"
 proptest = "1"
 
 # TLS証明書生成（テスト用自己署名証明書）
-rcgen = { version = "0.14.6", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
+# 暗号バックエンドは target 別（下の [target.*.dev-dependencies] を参照。F-122 / B-51）
 
 # ベンチマーク用
 criterion = { version = "0.8.1", features = ["html_reports"] }
@@ -519,11 +519,13 @@ quiche = { version = "0.24.9", default-features = false, features = ["boring"], 
 # テスト用 TLS スタックの target 別 feature（F-122 / B-51）
 # ---------------------------------------------------------------------------
 [target.'cfg(not(target_os = "openbsd"))'.dev-dependencies]
+rcgen = { version = "0.14.6", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
 tokio-rustls = "0.26.4"
 hyper-rustls = { version = "0.27.7", features = ["http1", "http2"] }
 tonic = { version = "0.14.2", features = ["tls-aws-lc", "channel"] }
 
 [target.'cfg(target_os = "openbsd")'.dev-dependencies]
+rcgen = { version = "0.14.6", default-features = false, features = ["crypto", "pem", "ring"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "ring"] }
 hyper-rustls = { version = "0.27.7", default-features = false, features = ["native-tokio", "http1", "http2", "tls12", "logging", "ring"] }
 tonic = { version = "0.14.2", features = ["tls-ring", "channel"] }
