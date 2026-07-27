@@ -146,12 +146,24 @@ def main() -> None:
     ap.add_argument("--sleep", type=float, default=0.0, help="処理前の待機秒数")
     ap.add_argument("--powerdown", action="store_true",
                     help="ACPI シャットダウン（system_powerdown）を送る")
+    ap.add_argument("--screendump", metavar="GUEST_PATH",
+                    help="ゲスト画面を PNG で保存する。パスは **qemu プロセスから見た**"
+                         " 位置なので、helper コンテナの作業ディレクトリ /w を使う"
+                         "（例: /w/screen.png → ホストの ${WORKDIR}/screen.png）。"
+                         "シリアルに何も出ない状況の切り分けに有効")
     args = ap.parse_args()
 
     if args.sleep:
         time.sleep(args.sleep)
 
     q = Qmp(args.port)
+    if args.screendump:
+        r = q.cmd({"execute": "screendump",
+                   "arguments": {"filename": args.screendump, "format": "png"}})
+        if "error" in r:
+            sys.exit("screendump failed: %s" % r["error"])
+        print("SCREENDUMP_OK %s" % args.screendump, flush=True)
+        return
     if args.powerdown:
         q.cmd({"execute": "system_powerdown"})
         print("POWERDOWN_SENT", flush=True)
