@@ -116,3 +116,23 @@ aws-lc-rs を使っていた。引き込み元は 4 つ:
 検証: `cargo tree --target x86_64-unknown-openbsd --no-default-features
 --features full-openbsd -i aws-lc-rs` が "nothing to print" になること
 （Linux 側は従来どおり aws-lc-rs が入ることも確認済み）。
+
+## 追補: `tests/test_backends` にも同じ問題があった（2026-07-27）
+
+上記の修正後に OpenBSD で E2E を通したところ、今度は **TLS エコーバックエンド
+（`tests/test_backends`）が SIGSEGV** で落ちた。
+
+```
+tests/e2e_setup.sh: line 1: 65350 Segmentation fault (core dumped) \
+  ... "${SCRIPT_DIR}/test_backends/target/debug/test-backends" > /tmp/test_backends.log
+```
+
+`tests/test_backends` は**独立したワークスペース**（自前の `Cargo.toml` /
+`Cargo.lock`）で、`tokio-rustls = "0.26"` を既定 feature のまま使っていたため
+`aws_lc_rs` が入っていた。veil 本体・E2E テストクライアントと同じ target 分割を
+このクレートにも入れて OpenBSD では `ring` を使うようにした。
+
+**教訓**: OpenBSD で aws-lc を排除するときは、
+`Cargo.toml`（本体 + dev-deps）だけでなく **`tests/` 配下の独立クレート**
+（`tests/test_backends`、`tests/grpc_server`）も確認すること。
+`tests/grpc_server` は `tonic` を TLS feature 無しで使っているため影響しない。

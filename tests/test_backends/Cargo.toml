@@ -11,4 +11,13 @@ tokio-tungstenite = "0.24"
 futures-util = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# rustls の暗号プロバイダは target 別（F-122 / B-51）。
+# OpenBSD で aws-lc-rs を使うと aws-lc-sys の curve25519（s2n-bignum アセンブリ）で
+# SIGSEGV し、TLS エコーバックエンドがプロセスごと落ちて E2E が総崩れになる。
+# veil 本体・E2E テストクライアントと同じく OpenBSD だけ ring にそろえる。
+[target.'cfg(not(target_os = "openbsd"))'.dependencies]
 tokio-rustls = "0.26"
+
+[target.'cfg(target_os = "openbsd")'.dependencies]
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
