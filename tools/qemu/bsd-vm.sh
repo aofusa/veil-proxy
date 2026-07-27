@@ -91,6 +91,9 @@ GROW_GB="${GROW_GB:-24}"
 FREEBSD_VER="${FREEBSD_VER:-14.3-RELEASE}"
 # ゲストの root パスワード（シリアルコンソールからのデバッグ用。SSH は鍵のみ）
 VM_ROOT_PASSWORD="${VM_ROOT_PASSWORD:-veil}"
+# x86_64 ゲストのファームウェア（bios=SeaBIOS / uefi=OVMF+q35）。
+# 既定は bios。`BASE_IMG` に配布の素の VM-IMAGE 由来イメージを指す場合は uefi が要る。
+VM_FIRMWARE="${VM_FIRMWARE:-bios}"
 # OpenBSD の CDN は直近数リリースしか保持しない（例: 7.6 は既に 404）。
 # 既定は入手可能な最新に追従させ、古いリリースを使う場合は OPENBSD_VER で指定する
 # （`curl -s https://cdn.openbsd.org/pub/OpenBSD/ | grep -oE '"[0-9]\.[0-9]/"'` で確認できる）。
@@ -392,6 +395,26 @@ _write_boot() {
     if [[ "${ARCH}" == "x86_64" ]]; then
         local accel="tcg" cpu="qemu64"
         if [[ "$(uname -m)" == "x86_64" && -r /dev/kvm ]]; then accel="kvm"; cpu="host"; fi
+        if [[ "${VM_FIRMWARE}" == "uefi" ]]; then
+            # UEFI(OVMF) + q35。`BASE_IMG` に**配布の素の VM-IMAGE 由来イメージ**を
+            # 指す場合は SeaBIOS ではカーネルまで進まず画面が真っ黒のまま止まるため、
+            # こちらを使う（実測）。この経路ではカーネルの出力は
+            # `Dual Console: Serial Primary` 以降シリアルへ移る。
+            cat > "${WORKDIR}/boot.sh" <<EOF
+#!/bin/bash
+set -e
+cd /w
+[ -f efi_code.fd ] || cp /usr/share/OVMF/OVMF_CODE.fd efi_code.fd
+[ -f efi_vars.fd ] || cp /usr/share/OVMF/OVMF_VARS.fd efi_vars.fd
+exec qemu-system-x86_64 -machine q35,accel=${accel} -cpu ${cpu} -smp ${VM_SMP} -m ${VM_MEM_MB} \
+  -drive if=pflash,format=raw,readonly=on,file=efi_code.fd \
+  -drive if=pflash,format=raw,file=efi_vars.fd \
+  ${drives} \
+  ${seed_drive}-netdev user,id=net0,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
+  -device virtio-net-pci,netdev=net0 \
+  ${console_args}
+EOF
+        else
         # **BIOS(SeaBIOS) で起動する**。UEFI(OVMF) では FreeBSD の efiboot / カーネルが
         # EFI コンソールを使い、`console="comconsole"` を設定してもシリアルへ出力されない
         # （実測）。SeaBIOS 経路なら SeaBIOS・boot2・ローダ・カーネルすべてがシリアルに出る。
@@ -405,6 +428,7 @@ exec qemu-system-x86_64 -machine pc,accel=${accel} -cpu ${cpu} -smp ${VM_SMP} -m
   -device virtio-net-pci,netdev=net0 \
   ${console_args}
 EOF
+        fi
     else
         # aarch64 は UEFI(AAVMF)。arm64 の BSD は efiboot がファームウェアの ConOut を
         # 引き継ぐため、シリアルが既定で使える（amd64 と事情が違う）。

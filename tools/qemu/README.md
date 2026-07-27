@@ -126,14 +126,14 @@ tools/qemu/bsd-vm.sh freebsd x86_64 all
 | FreeBSD x86_64: `toolchain` | **成功**（cargo 1.96.1 / cmake 3.31.12 / GNU Make 4.4.1） |
 | FreeBSD x86_64: `build`（`full-freebsd`） | **成功**（29分42秒。http3(quiche+共有 aws-lc-sys) / jemalloc / **aio** を含む） |
 | FreeBSD x86_64: `fetch` → `build-bsd.sh` | **成功**（`veil-0.6.0-x86_64-unknown-freebsd.tar.gz` を生成） |
-| FreeBSD x86_64: `e2e` | **実行完了: 416 passed / 117 failed**。失敗は**全て HTTP/3**（QUIC の UDP ポートが bind されない = **B-50** として起票）。HTTP/1.1・HTTP/2・gRPC・WebSocket・L4 は通過 |
+| FreeBSD x86_64: `e2e` | **532 passed / 1 failed**（B-50 修正後。HTTP/3 の 117 件失敗はすべて解消）。残り 1 件は実行ごとに変わる負荷起因フレーク（`oversized-header` 等）で、静かなホストでの単体実行では通る |
 | （E2E 全般） | `tests/e2e_setup.sh` の `run_tests` が cargo の終了コードを握り潰していた（最後の `log_info` の戻り値が返っていた）。上記 2 件はどちらも «成功» と報告されていた。修正済み |
 | FreeBSD aarch64 | **未実行**（スクリプトは同経路で対応済み。TCG のため長時間） |
 | OpenBSD x86_64: `setup` → `provision`（autoinstall） | **成功**（`CONGRATULATIONS` → SSH 鍵認証で `OpenBSD 7.9 GENERIC.MP#449 amd64` へ到達） |
 | OpenBSD x86_64: `toolchain` | **成功**（cargo 1.94.1 / cmake 4.2.3 / GNU Make 4.4.1 / libprotoc 34.1 / llvm-19） |
 | OpenBSD x86_64: `build`（`full-openbsd`） | **成功**（71分56秒。ring + システムアロケータ + quiche/BoringSSL の http3 を含む） |
 | OpenBSD x86_64: `fetch` → `build-bsd.sh` | **成功**（`veil-0.6.0-x86_64-unknown-openbsd.tar.gz` を生成） |
-| OpenBSD x86_64: `e2e` | **実行完了・失敗**: テストバイナリが 533 tests 開始直後に **SIGSEGV**（**B-51** として起票）。ビルド・fetch・パッケージ化は成功している |
+| OpenBSD x86_64: `e2e` | **530 passed / 3 failed・SIGSEGV なし**（B-51 / B-52 / B-53 / B-54 修正後。全 533 件が実行される）。残り 3 件はいずれもタイムアウト系の負荷起因フレークで、単体実行では 3 件とも通る |
 | OpenBSD aarch64 | **未実行**（スクリプトは同経路で対応済み。TCG のため長時間） |
 | `linux-aarch64-e2e.sh` | **未実行**（KVM 非対応ホストでは TCG が実用不能） |
 
@@ -239,7 +239,19 @@ quiche が使う **BoringSSL（boring-sys）は OpenBSD を想定していない
    `CMakeCache.txt` の古い `CMAKE_C_COMPILER` が使われ続ける。
    環境変数を変えたときは boring-sys の build ディレクトリを消してから再実行する。
 
-7. **`-serial ...,server,nowait` はブートローダのプロンプトを取り逃す。**
+7. **`/` 以外は `wxallowed` ではない。** OpenBSD の既定 fstab で `wxallowed` が付くのは
+   **`/usr/local` だけ**。ネイティブ JIT（wasmtime の Cranelift 等）は
+   `mprotect(PROT_EXEC)` に実行ファイルが `wxallowed` マウント上にあることを要求するため、
+   `/usr/obj` にビルドした veil では JIT が使えない。
+   veil は OpenBSD では **Pulley インタープリタ**を使うのでこの制約を受けないが、
+   切り分けで JIT を試すときは `mount -u -o wxallowed /usr/obj` が要る（B-52）。
+
+8. **`/usr/obj` が ~8G しかないためデバッグ情報付きビルドは入らない。**
+   `target/debug` が 5G 超 + `incremental` 1.5G で `No space left on device` になる。
+   `bsd-vm.sh` はゲスト側 env に `CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0` を
+   付けて回避する（E2E はデバッガを使わないため実害なし。target が ~2.3G に収まる）。
+
+9. **`-serial ...,server,nowait` はブートローダのプロンプトを取り逃す。**
    OpenBSD amd64 は `boot>` へ `set tty com0` を送ってシリアルへ切り替える必要が
    あるが、`nowait` だと接続前に流れてしまう。`provision` は `CONSOLE_WAIT=1` で
    **qemu にコンソール接続を待たせて**から起動する。
