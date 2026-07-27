@@ -2058,14 +2058,25 @@ run_tests() {
 
         # テスト実行
         cargo test --test e2e_tests ${VEIL_E2E_NO_DEFAULT_ARG} --features "${VEIL_E2E_FEATURES}" -- "${TEST_FILTER}" --test-threads=${TEST_THREADS} --nocapture
+        local rc=$?
     else
         log_info "Command: cargo test --test e2e_tests --features '${VEIL_E2E_FEATURES}' -- --test-threads=${TEST_THREADS}"
 
         # テスト実行
         cargo test --test e2e_tests ${VEIL_E2E_NO_DEFAULT_ARG} --features "${VEIL_E2E_FEATURES}" -- --test-threads=${TEST_THREADS}
+        local rc=$?
     fi
-    
-    log_info "E2E tests completed"
+
+    # cargo test の終了コードを**必ず返す**。
+    # ここで log_info を最後に置くと関数の戻り値がその成功（0）になってしまい、
+    # 呼び出し側の `TEST_EXIT_CODE=$?` が常に 0 になる＝**テスト失敗が握り潰される**。
+    # 実際、FreeBSD の 117 件失敗も OpenBSD の SIGSEGV も «成功» として報告されていた。
+    if [ "$rc" -eq 0 ]; then
+        log_info "E2E tests completed"
+    else
+        log_error "E2E tests failed (exit code: $rc)"
+    fi
+    return "$rc"
 }
 
 # クリーンアップ
