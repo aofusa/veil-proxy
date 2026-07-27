@@ -222,13 +222,15 @@ tar.gz には `veil` バイナリ・`rc.d/veil`（サービススクリプト）
 FreeBSD は capsicum（`[security] enable_capsicum`）・jail と、OpenBSD は
 pledge/unveil（`[security] enable_pledge` / `enable_unveil`）と併用できる。
 OpenBSD の TLS は rustls の ring プロバイダを使用し（F-122）、`full-openbsd`
-（HTTP/3 + WASM 含む全機能。アロケータはシステム malloc）でのビルドに対応している。
+（HTTP/3 を含む。アロケータはシステム malloc）でのビルドに対応している。
 静的配信/プロキシとも HTTPS 200 で動作する（pledge+unveil 有効のまま）。
 
-> **FreeBSD の HTTP/3 に関する既知の制限**: FreeBSD では `http3_enabled = true` でも
-> QUIC の UDP ポートが bind されず HTTP/3 が機能しない（**B-50**、未修正）。
-> 配布物は `full-freebsd` でビルドされ http3 を含むが、実際には使えない点に注意。
-> HTTP/1.1・HTTP/2・gRPC・WebSocket・L4 は動作する（VM 内 E2E で 416 件通過）。
+> **OpenBSD の WASM に関する既知の制限**: `full-openbsd` は **`wasm` を含まない**。
+> wasmtime が OpenBSD をサポートしておらず、WASM フィルタを適用したルートへ
+> 1 リクエスト送っただけで veil がプロセスごと SIGSEGV する（**B-52**）。
+> Proxy-Wasm 拡張が必要な場合は Linux / FreeBSD / macOS / Windows を使うこと。
+> それ以外の機能（HTTP/1.1・HTTP/2・HTTP/3・gRPC・WebSocket・L4・圧縮・キャッシュ・
+> レート制限・バッファリング・admin・アクセスログ）は OpenBSD でも動作する。
 
 ### macOS 向けパッケージ（F-125、Docker クロスビルド）
 

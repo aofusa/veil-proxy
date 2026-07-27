@@ -17901,6 +17901,7 @@ async fn test_b17_bad_backend_no_response_returns_504() {
 // ステータスを含むローカルレスポンスを返す。
 
 #[tokio::test]
+#[cfg(feature = "wasm")]
 async fn test_f62_wasm_http_call_pause_resume() {
     let client = Http1TestClient::new_https("127.0.0.1", PROXY_PORT).expect("client");
     let (status, headers, body) = tokio::time::timeout(
@@ -17936,6 +17937,7 @@ async fn test_f62_wasm_http_call_pause_resume() {
 }
 
 #[tokio::test]
+#[cfg(feature = "wasm")]
 async fn test_f62_wasm_http_call_concurrent_requests() {
     // Pause/resume がリクエストごとに独立して機能すること（並行 8 リクエスト）
     let mut handles = Vec::new();

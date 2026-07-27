@@ -212,9 +212,12 @@ full-freebsd = [
 
 # OpenBSD: システムアロケータ（global_allocator を差し替えない）を使う。
 # mimalloc / jemalloc とも有効化しないことでシステム malloc(3) が使われる。
+# OpenBSD だけ **wasm を含めない**。wasmtime は OpenBSD をサポートしておらず、
+# wasm モジュールを 1 回実行しただけで veil ごと SIGSEGV する（B-52）。
+# 他の機能（http3 / grpc / kTLS 以外）は OpenBSD でも動作する。
 full-openbsd = [
     "ktls", "http2", "http3",
-    "grpc-full", "wasm",
+    "grpc-full",
     "opentelemetry",
     "compression", "cache", "metrics",
     "websocket", "rate-limit", "buffering",
