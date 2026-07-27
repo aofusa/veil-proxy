@@ -3,6 +3,14 @@
 //! h3+h3-quinn+quinnライブラリを使用したHTTP/3クライアント実装
 //! tokioランタイム上で動作し、非同期API
 
+// F-122 / B-51: テストクライアントの rustls 暗号プロバイダは本体（src/tls_provider.rs）と
+// 同じ target 別選択にする。OpenBSD で aws-lc-rs を使うと aws-lc-sys の curve25519
+// （s2n-bignum アセンブリ）で SIGSEGV し、テストバイナリごと落ちる。
+#[cfg(not(target_os = "openbsd"))]
+use rustls::crypto::aws_lc_rs as test_crypto;
+#[cfg(target_os = "openbsd")]
+use rustls::crypto::ring as test_crypto;
+
 use bytes::{Buf, Bytes};
 use h3::client::SendRequest;
 use h3_quinn::Connection;
@@ -337,7 +345,7 @@ fn create_quic_tls_config(
     // CryptoProviderを初期化（既に初期化されている場合は無視）
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
-        let _ = CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider());
+        let _ = CryptoProvider::install_default(test_crypto::default_provider());
     });
 
     // 証明書検証をスキップするカスタム検証器
@@ -375,7 +383,7 @@ fn create_quic_tls_config(
         }
 
         fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-            rustls::crypto::aws_lc_rs::default_provider()
+            test_crypto::default_provider()
                 .signature_verification_algorithms
                 .supported_schemes()
                 .to_vec()

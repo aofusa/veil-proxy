@@ -422,18 +422,22 @@ tokio = { version = "1.48", features = ["full", "test-util"] }
 
 # HTTP/2クライアント
 h2 = "0.4.12"
-tokio-rustls = "0.26.4"
 http = "1.4.0"
 # HTTP/1.1 + HTTP/2クライアント
 hyper = { version = "1.8.1", features = ["client", "http1", "http2"] }
-hyper-rustls = { version = "0.27.7", features = ["http1", "http2"] }
 hyper-util = { version = "0.1.19", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
 
 # gRPCクライアント（HTTP/2ベース）
-# tls-aws-lcはaws-lc-rsを使用したTLS、channelはクライアント機能
-tonic = { version = "0.14.2", features = ["tls-aws-lc", "channel"] }
+# TLS プロバイダは target 別（下の [target.*.dev-dependencies] を参照）
 tonic-build = "0.14.2"
 
+# テストクライアントの rustls 暗号プロバイダ（F-122 / B-51）
+#
+# 本体 (`src/tls_provider.rs`) と同じく **OpenBSD だけ ring**、他は aws_lc_rs にする。
+# OpenBSD で aws-lc-rs を使うと aws-lc-sys の curve25519（s2n-bignum アセンブリ）で
+# SIGSEGV し、E2E テストバイナリがテスト 1 件目で落ちる（B-51）。
+# resolver = "2" により dev-dependencies の feature は本体ビルドへ波及しない。
+# quinn の `rustls` feature は `rustls-ring` の別名なので target 分割は不要。
 # HTTP/3クライアント（QUIC/quinn + h3）
 h3 = "0.0.8"
 quinn = { version = "0.11.9", features = ["runtime-tokio", "rustls"] }
@@ -510,3 +514,16 @@ aws-lc-sys = { version = "0.41", features = ["ssl", "bindgen"] }
 
 [target.'cfg(not(any(target_os = "linux", target_os = "freebsd")))'.dependencies]
 quiche = { version = "0.24.9", default-features = false, features = ["boring"], optional = true }
+
+# ---------------------------------------------------------------------------
+# テスト用 TLS スタックの target 別 feature（F-122 / B-51）
+# ---------------------------------------------------------------------------
+[target.'cfg(not(target_os = "openbsd"))'.dev-dependencies]
+tokio-rustls = "0.26.4"
+hyper-rustls = { version = "0.27.7", features = ["http1", "http2"] }
+tonic = { version = "0.14.2", features = ["tls-aws-lc", "channel"] }
+
+[target.'cfg(target_os = "openbsd")'.dev-dependencies]
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "ring"] }
+hyper-rustls = { version = "0.27.7", default-features = false, features = ["native-tokio", "http1", "http2", "tls12", "logging", "ring"] }
+tonic = { version = "0.14.2", features = ["tls-ring", "channel"] }

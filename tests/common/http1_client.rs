@@ -3,6 +3,14 @@
 //! hyper + hyper-rustls + tokioを使用したHTTP/1.1クライアント実装
 //! TLS対応の非同期HTTP/1.1リクエストを送信
 
+// F-122 / B-51: テストクライアントの rustls 暗号プロバイダは本体（src/tls_provider.rs）と
+// 同じ target 別選択にする。OpenBSD で aws-lc-rs を使うと aws-lc-sys の curve25519
+// （s2n-bignum アセンブリ）で SIGSEGV し、テストバイナリごと落ちる。
+#[cfg(not(target_os = "openbsd"))]
+use rustls::crypto::aws_lc_rs as test_crypto;
+#[cfg(target_os = "openbsd")]
+use rustls::crypto::ring as test_crypto;
+
 use bytes::Bytes;
 use http::{Method, Request, Uri};
 use http_body_util::{BodyExt, Full};
@@ -198,7 +206,7 @@ fn init_crypto_provider() {
 
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
-        let _ = CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider());
+        let _ = CryptoProvider::install_default(test_crypto::default_provider());
     });
 }
 
@@ -241,7 +249,7 @@ fn create_tls_config_no_alpn() -> Result<Arc<ClientConfig>, Box<dyn std::error::
         }
 
         fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-            rustls::crypto::aws_lc_rs::default_provider()
+            test_crypto::default_provider()
                 .signature_verification_algorithms
                 .supported_schemes()
                 .to_vec()

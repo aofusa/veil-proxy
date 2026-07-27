@@ -37,6 +37,14 @@
 // F-88 の disallowed-methods はデータプレーン向け規則のため、テストではファイル単位で許容する。
 #![allow(clippy::disallowed_methods)]
 
+// F-122 / B-51: テストクライアントの rustls 暗号プロバイダは本体（src/tls_provider.rs）と
+// 同じ target 別選択にする。OpenBSD で aws-lc-rs を使うと aws-lc-sys の curve25519
+// （s2n-bignum アセンブリ）で SIGSEGV し、テストバイナリごと落ちる。
+#[cfg(not(target_os = "openbsd"))]
+use rustls::crypto::aws_lc_rs as test_crypto;
+#[cfg(target_os = "openbsd")]
+use rustls::crypto::ring as test_crypto;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -178,7 +186,7 @@ async fn is_e2e_environment_ready() -> bool {
 fn init_crypto_provider() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
-        let _ = CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider());
+        let _ = CryptoProvider::install_default(test_crypto::default_provider());
     });
 }
 
@@ -217,7 +225,7 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::aws_lc_rs::default_provider()
+        test_crypto::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
             .to_vec()
@@ -17364,7 +17372,7 @@ fn tls_handshake_negotiated_suite(
 ) -> Result<String, String> {
     init_crypto_provider();
 
-    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    let mut provider = test_crypto::default_provider();
     if let Some(suites) = client_suites {
         provider.cipher_suites = suites;
     }
@@ -17425,10 +17433,9 @@ async fn test_tls_cipher_suites_allows_configured_suite() {
     }
 
     let negotiated = tokio::task::spawn_blocking(move || {
-        use rustls::crypto::aws_lc_rs::cipher_suite;
         tls_handshake_negotiated_suite(
             PROXY_PORT,
-            Some(vec![cipher_suite::TLS13_AES_128_GCM_SHA256]),
+            Some(vec![test_crypto::cipher_suite::TLS13_AES_128_GCM_SHA256]),
         )
     })
     .await
@@ -17448,10 +17455,11 @@ async fn test_tls_cipher_suites_rejects_excluded_suite() {
     }
 
     let result = tokio::task::spawn_blocking(move || {
-        use rustls::crypto::aws_lc_rs::cipher_suite;
         tls_handshake_negotiated_suite(
             PROXY_PORT,
-            Some(vec![cipher_suite::TLS13_CHACHA20_POLY1305_SHA256]),
+            Some(vec![
+                test_crypto::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+            ]),
         )
     })
     .await

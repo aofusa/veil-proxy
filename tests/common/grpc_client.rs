@@ -10,6 +10,14 @@
 // F-88 の disallowed-methods はデータプレーン向け規則のため、テストではファイル単位で許容する。
 #![allow(clippy::disallowed_methods)]
 
+// F-122 / B-51: テストクライアントの rustls 暗号プロバイダは本体（src/tls_provider.rs）と
+// 同じ target 別選択にする。OpenBSD で aws-lc-rs を使うと aws-lc-sys の curve25519
+// （s2n-bignum アセンブリ）で SIGSEGV し、テストバイナリごと落ちる。
+#[cfg(not(target_os = "openbsd"))]
+use rustls::crypto::aws_lc_rs as test_crypto;
+#[cfg(target_os = "openbsd")]
+use rustls::crypto::ring as test_crypto;
+
 use super::http1_client::Http1TestClient;
 use http::uri::Uri;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -96,7 +104,7 @@ impl GrpcTestClient {
         // CryptoProviderの初期化
         static INIT: std::sync::Once = std::sync::Once::new();
         INIT.call_once(|| {
-            let _ = CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider());
+            let _ = CryptoProvider::install_default(test_crypto::default_provider());
         });
 
         // 証明書検証をスキップするカスタム検証器
@@ -134,7 +142,7 @@ impl GrpcTestClient {
             }
 
             fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-                rustls::crypto::aws_lc_rs::default_provider()
+                test_crypto::default_provider()
                     .signature_verification_algorithms
                     .supported_schemes()
                     .to_vec()
