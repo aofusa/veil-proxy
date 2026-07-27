@@ -89,3 +89,53 @@ tools/qemu/bsd-vm.sh freebsd x86_64 ssh \
 - B-47（本件の検出につながった QEMU ビルド環境整備）
 - F-120 / F-126 / F-127（FreeBSD 対応・kqueue reactor・POSIX AIO）
 - F-130（HTTP/3 UDP データプレーンの io_uring パイプライン化。Linux 専用経路）
+
+---
+
+## 真因（2026-07-27 確定）
+
+`src/http3_server.rs` の `create_memfd_for_pem()` が **Linux と FreeBSD で同じ実装**を
+共有しており、`memfd_create(2)` した fd を `"/proc/self/fd/<fd>"` というパスにして
+quiche へ渡していた。
+
+FreeBSD には `memfd_create(2)`（13+）はあるが、**procfs は既定でマウントされない**
+（`procfs(5)` は非推奨扱い）。実機で確認:
+
+```
+$ ls /proc            # 空（マウントされていない）
+$ ls /dev/fd
+0
+1
+2                     # fdescfs 未マウントのため fd>=3 は見えない
+$ mount | grep -iE 'fdesc|proc'
+                      # 何も無い
+```
+
+そのため `load_cert_chain_from_pem_file("/proc/self/fd/N")` が失敗し、
+`run_http3_server_async` が **証明書ロードの時点で Err を返して終了**していた。
+UDP ソケットの bind はその後にあるため、**QUIC のリスナが一度も作られない**。
+`sockstat` に 8443/udp が現れなかったのはこのため。
+
+## 修正
+
+FreeBSD 用の `create_memfd_for_pem` を分離した:
+
+1. memfd に PEM を書き、`/dev/fd/<fd>` が**実際に open できるか**を確認する
+   （= fdescfs がマウントされている）。開ければそのパスを使う（FS 非経由で最良）。
+2. 開けなければ **0600 の一時ファイル**へフォールバックし、`Drop` で必ず unlink する
+   （OpenBSD / macOS と同じ経路。F-125）。
+
+Linux 経路（`/proc/self/fd` + memfd シール）は**一切変更していない**。
+
+## 検証（FreeBSD 14.3-RELEASE amd64 / QEMU + KVM）
+
+```
+--- UDP listeners:
+root  veil  7727  6  udp4  127.0.0.1:19443  *:*    ← 修正前は存在しなかった
+[HTTP/3] Certificates loaded, memfd closed, sensitive data zeroed
+[HTTP/3] Server listening on 127.0.0.1:19443 (QUIC/UDP)
+```
+
+`tests/e2e_setup.sh test`（`--no-default-features --features full-freebsd`）:
+**416 passed / 117 failed → 532 passed / 1 failed**。HTTP/3 の失敗 117 件はすべて解消。
+残る 1 件は HTTP/3 と無関係の負荷起因フレーク（B-52）。

@@ -209,9 +209,16 @@ prepare_fixtures() {
     echo "OK" > "${FIXTURES_DIR}/backend_h2c/health"
 
     # 圧縮テスト・大容量ファイルテスト用（1024バイト超の圧縮閾値とtest_static_file_large用）
-    head -c 10000 /dev/zero | tr '\0' 'A' > "${FIXTURES_DIR}/backend1/large.txt"
-    head -c 10000 /dev/zero | tr '\0' 'A' > "${FIXTURES_DIR}/backend2/large.txt"
-    head -c 10000 /dev/zero | tr '\0' 'A' > "${FIXTURES_DIR}/backend_h2c/large.txt"
+    #
+    # 注意: `head -c` は GNU 拡張で **OpenBSD の head には無い**（`unknown option -- c`）。
+    # 失敗しても `>` がファイルを作るため **0 バイトの large.txt** が出来てしまい、
+    # 圧縮 / バッファリング / キャッシュ系の E2E がまとめて落ちる（B-53）。
+    # POSIX の dd を使う。
+    for _dir in backend1 backend2 backend_h2c; do
+        dd if=/dev/zero bs=10000 count=1 2>/dev/null | tr '\0' 'A' \
+            > "${FIXTURES_DIR}/${_dir}/large.txt"
+    done
+    unset _dir
 
     # H2C テスト用ファイル（test_h2c_post_request / test_h2c_large_request_body が
     # /h2c/test.txt、test_h2c_multiple_streams が /h2c/test{0,1,2}.txt を参照する）
