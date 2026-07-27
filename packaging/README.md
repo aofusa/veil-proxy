@@ -225,12 +225,17 @@ OpenBSD の TLS は rustls の ring プロバイダを使用し（F-122）、`fu
 （HTTP/3 を含む。アロケータはシステム malloc）でのビルドに対応している。
 静的配信/プロキシとも HTTPS 200 で動作する（pledge+unveil 有効のまま）。
 
-> **OpenBSD の WASM に関する既知の制限**: `full-openbsd` は **`wasm` を含まない**。
-> wasmtime が OpenBSD をサポートしておらず、WASM フィルタを適用したルートへ
-> 1 リクエスト送っただけで veil がプロセスごと SIGSEGV する（**B-52**）。
-> Proxy-Wasm 拡張が必要な場合は Linux / FreeBSD / macOS / Windows を使うこと。
-> それ以外の機能（HTTP/1.1・HTTP/2・HTTP/3・gRPC・WebSocket・L4・圧縮・キャッシュ・
-> レート制限・バッファリング・admin・アクセスログ）は OpenBSD でも動作する。
+> **OpenBSD の WASM について（B-52）**: OpenBSD では wasm を wasmtime の
+> **Pulley インタープリタ**（`Config::target("pulley64")`）で実行し、インスタンス
+> アロケータを **OnDemand**、ファイバスタックを **`MAP_STACK` 付き**で確保する。
+> - OpenBSD 6.4+ はスタックポインタが `MAP_STACK` 領域を指すことをカーネルが強制する。
+>   wasmtime 既定のファイバスタックは `MAP_STACK` 無しのため、wasm を 1 回呼んだだけで
+>   プロセスが SIGSEGV で落ちる。
+> - `Config::with_host_stack`（スタック確保の差し替え）は **OnDemand アロケータでしか
+>   参照されない**（プーリングでは黙って無視される）ため、OpenBSD だけ OnDemand にする。
+> - Pulley はネイティブコードを生成しないため、**`wxallowed` なファイルシステムが不要**。
+>   ネイティブ JIT だと OpenBSD の W^X により実行ファイルの置き場所が制約される。
+>   代償として wasm の実行速度はインタープリタ相当になる。
 
 ### macOS 向けパッケージ（F-125、Docker クロスビルド）
 

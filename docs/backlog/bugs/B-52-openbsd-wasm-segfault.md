@@ -1,5 +1,7 @@
 # B-52: OpenBSD で WASM モジュールを実行すると veil がプロセスごと SIGSEGV する
 
+**状態: 修正済み（2026-07-27）**
+
 ## 事象
 
 OpenBSD 7.9 amd64（QEMU VM、`--no-default-features --features full-openbsd`）で、
@@ -10,7 +12,7 @@ tests/e2e_setup.sh: line 1:  4499 Segmentation fault \
   VEIL_TLS_INSECURE=1 "${VEIL_BIN}" --config "${FIXTURES_DIR}/proxy.toml" > /tmp/proxy.log 2>&1
 ```
 
-最小再現（バックエンドすら不要。`/health` は 200 を返す状態から）:
+最小再現（バックエンド不要。`/health` は 200 を返す状態から）:
 
 ```
 $ curl -sk -m 5 -o /dev/null -w "%{http_code}\n" https://127.0.0.1:8443/health
@@ -19,70 +21,110 @@ $ curl -skv -m 10 https://127.0.0.1:8443/wasm/     # header_filter を適用し�
 * Connection closed abruptly
 ```
 
-`/tmp/proxy.log` には**リクエストに対応する行が 1 行も出ない**（アクセスログも
-エラーログも無い）。WASM エンジンの初期化自体は成功している:
+`/tmp/proxy.log` には**リクエストに対応する行が 1 行も出ない**。WASM エンジンの
+初期化自体は成功している。
 
-```
-Loading WASM module: header_filter
-Loaded WASM module 'header_filter' with capabilities: http_calls=false, upstreams=[]
-WASM Filter Engine initialized successfully
-WASM tick thread started
-```
-
-## E2E への影響（重要）
+## E2E への影響（重要・再発時の注意）
 
 このクラッシュは **E2E の集計上ほとんど見えない**。veil が死ぬと以降のテストは
 `is_e2e_environment_ready()` が false になって **skip（= "ok" 扱い）** されるため、
-「506 passed / 27 failed」のように*ほぼ通っているように見える*。実際には
-プロキシが途中で死んで残りが検証されていない。
+「506 passed / 27 failed」のように*ほぼ通っているように見える*。
+**E2E のログに `Segmentation fault` が出ていないかを必ず確認すること。**
 
-## 調査（3 つの仮説を実測で否定済み）
+## 真因
 
-コアダンプの backtrace は**シンボルが取れない**:
+**OpenBSD 6.4 以降は「スタックポインタが `MAP_STACK` 付きでマップされた領域を
+指していること」をカーネルが強制する。** 条件を満たさないままカーネルへ入ると
+プロセスは SIGSEGV で殺される。
+
+`wasmtime::Config::async_support(true)` を使うと wasm の実行は **ファイバ**
+（wasmtime が確保した専用スタックへスタックスイッチして実行する仕組み）の上で行われる。
+wasmtime のファイバスタックは `MAP_STACK` 無しの通常の `mmap` で確保されるため、
+**ファイバへ切り替えた瞬間に落ちる**。
+
+### 決め手になった ktrace
 
 ```
-Program terminated with signal 11, Segmentation fault.
-#0  0x00000e8c14e2ebf0 in ?? ()
+ 53005 veil  CALL  mprotect(0xe62593b000,0x110000,0x3<PROT_READ|PROT_WRITE>)
+ 53005 veil  RET   mprotect 0
+ 53005 veil  CALL  mmap(0,0x80000,0x3<PROT_READ|PROT_WRITE>,0x1002<MAP_PRIVATE|MAP_ANON>,-1,0)
+ 53005 veil  PSIG  SIGSEGV caught handler=0xe328cf3310 code=SEGV_ACCERR addr=0xe326d922c0
+ 53005 veil  CALL  sigaction(SIGSEGV,0xe5d789bae0,0)
+ 53005 veil  CALL  sigreturn(0xe5d789bb40)
+ 53005 veil  RET   sigreturn JUSTRETURN
+ 53005 veil  PSIG  SIGSEGV SIG_DFL code=SEGV_ACCERR addr=0xe326d922c0
 ```
 
-PC は匿名 mmap 領域内（JIT / ファイバスタック相当のアドレス帯）。gdb はそこから
-1 フレームも巻き戻せない。`dmesg` に W^X / MAP_STACK 違反の記録は無い。
+- `code=SEGV_ACCERR`（**マップ済みだがアクセス不許可**。未マップなら `SEGV_MAPERR`）
+- `addr=0xe326d922c0` は **ページ境界に揃っていない** → コード/データではなく
+  **スタックポインタ**の値。これが `MAP_STACK` 強制の典型的なシグネチャ。
+- wasmtime の SIGSEGV ハンドラが一度捕捉し、「wasm のトラップではない」と判断して
+  `SIG_DFL` に戻して再送 → プロセス終了、という流れも読み取れる。
 
-| # | 仮説 | 対処 | 結果 |
-|---|---|---|---|
-| 1 | wasmtime のファイバスタックが `MAP_STACK` 無しで mmap されており、OpenBSD 6.4+ の「SP は MAP_STACK 領域を指すこと」強制に触れる | `wasmtime::StackCreator` を実装し `MAP_STACK` + ガードページでスタックを確保（`Config::with_host_stack`） | **変化なし**（SIGSEGV のまま） |
-| 2 | ガードページ + SIGSEGV ハンドラによる境界チェック（signals-based traps）が OpenBSD で機能しない | `Config::signals_based_traps(false)` で明示的境界チェックへ切替 | **変化なし** |
-| 3 | JIT の `mprotect(PROT_EXEC)` が W^X で拒否され、非実行ページへジャンプしている | ビルド先 `/usr/obj` を `mount -u -o wxallowed` で再マウント（既定では `/usr/local` のみ wxallowed） | **変化なし** |
+### なぜ「MAP_STACK 対応」が最初は効かなかったのか（重要）
 
-1 と 2 の実装は検証できなかったため**リバート済み**（未検証の unsafe コードを
-残さない方針）。手順と結論だけを本チケットに残す。
+`Config::with_host_stack`（ファイバスタック確保の差し替え）は
+**`InstanceAllocationStrategy::OnDemand` でしか参照されない**。
+veil は**プーリングアロケータ**を使っていたため、wasmtime 40 の
+`config.rs::build_allocator` は `set_stack_creator` を呼ばず、**指定を黙って捨てる**:
 
-FreeBSD では同じ `full-freebsd`（wasm 込み）で **WASM の E2E がすべて通っている**ため、
-BSD 一般の問題ではなく **OpenBSD 固有**。wasmtime の公式サポート対象に OpenBSD は
-含まれていない。
+```rust
+match &self.allocation_strategy {
+    InstanceAllocationStrategy::OnDemand => {
+        let mut _allocator = Box::new(OnDemandInstanceAllocator::new(...));
+        #[cfg(feature = "async")]
+        if let Some(stack_creator) = &self.stack_creator {
+            _allocator.set_stack_creator(stack_creator.clone());   // ← ここだけ
+        }
+        Ok(_allocator)
+    }
+    InstanceAllocationStrategy::Pooling(config) => { /* stack_creator を見ない */ }
+}
+```
 
-## 暫定対応（実施済み）
+プーリング側はスタックを自前のスラブから切り出す（`pooling.rs::allocate_fiber_stack`
+→ `self.stacks.allocate()`）。つまり最初に入れた `StackCreator` は
+**一度も呼ばれていなかった**。効果が無かったのは仮説が誤りだったからではなく、
+**仮説を検証できていなかったから**である。
 
-- `Cargo.toml` の **`full-openbsd` から `wasm` を外した**。OpenBSD 配布物は
-  WASM フィルタ非対応となる（他機能 = HTTP/1.1・HTTP/2・HTTP/3・gRPC・WebSocket・
-  L4・圧縮・キャッシュ・レート制限・バッファリング・admin・アクセスログは動作する）。
-- `tests/e2e_tests.rs` の `test_f62_wasm_http_call_*` 2 件に
-  `#[cfg(feature = "wasm")]` を付けた（他の WASM E2E は既に feature gate 済みで、
-  この 2 件だけ漏れていた）。
-- README / README.ja / packaging/README に OpenBSD の制限として明記。
+## 修正
 
-## 次にやるなら
+OpenBSD のみ 3 点（他ターゲットは一切変更なし）:
 
-1. `wasmtime` 単体の最小再現（veil を介さず `wasmtime` の hello world を OpenBSD で
-   `async_support(true)` で実行する）を作り、veil 側の問題でないことを確定させる。
-2. 上流（bytecodealliance/wasmtime）へ OpenBSD の状況を確認・報告する。
-3. `Config::async_support(false)`（同期実行）でも落ちるかを見る。落ちないなら
-   ファイバ経路が真因で、OpenBSD だけ同期 wasm 実行にする案が取れる
-   （ただし engine 側は `call_async` 前提のため相応の改修が要る）。
+1. **`InstanceAllocationStrategy::OnDemand`** を使う（`with_host_stack` を効かせるため）。
+2. **`MAP_STACK` 付きファイバスタック**（`src/wasm/openbsd_stack.rs` の
+   `MapStackCreator`）。低位側に `PROT_NONE` のガードページを 1 枚置き、
+   その上を `MAP_FIXED | MAP_STACK` で貼り直す（`MAP_STACK` は mmap 時にしか付けられず、
+   `mprotect` では後付けできない）。
+3. **Pulley インタープリタ**（`Config::target("pulley64")` + wasmtime の `pulley` feature）。
+
+3 が必要な理由は「クラッシュの回避」ではなく **配布上の都合**である。OpenBSD の W^X は
+JIT が `mprotect(PROT_EXEC)` するとき、**実行ファイルが `wxallowed` マウント上に
+あること**を要求する（既定では `/usr/local` のみ）。ネイティブ JIT のままだと
+veil の設置場所に制約が生まれるため、ネイティブコードを一切生成しない Pulley を選ぶ。
+代償として wasm の実行速度はインタープリタ相当になる。
+
+## 検証
+
+```
+tools/qemu/bsd-vm.sh openbsd x86_64 ssh '... TEST_FILTER=test_f62_wasm ... e2e_setup.sh test'
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 531 filtered out
+```
+
+修正前は同じコマンドで veil が SIGSEGV し 0 passed / 2 failed だった。
+
+## 否定された仮説（記録）
+
+| # | 仮説 | 結果 |
+|---|---|---|
+| 1 | `signals_based_traps(false)`（ガードページ + シグナル経由のトラップが原因） | 効果なし |
+| 2 | `/usr/obj` が `wxallowed` でない（W^X で JIT が失敗） | 実際に非 wxallowed だったが、再マウントしても効果なし |
+| 3 | Pulley 単体（ネイティブコード生成が原因） | 効果なし（= 真因はコード実行方式ではない、と分かった有用な否定） |
+| 4 | Pulley + `MAP_STACK`（プーリングアロケータのまま） | 効果なし（上記のとおり `StackCreator` が無視されていた） |
 
 ## 関連
 
-- B-51（OpenBSD の E2E テストバイナリが aws-lc-rs で SIGSEGV。**別件・修正済み**。
+- B-51（OpenBSD の E2E テストバイナリが aws-lc-rs で SIGSEGV。別件・修正済み。
   こちらを直したことで本件が見えるようになった）
 - B-53（`head -c` 非互換。同じ E2E 実行で併発した別件・修正済み）
 - F-120 Phase 5（OpenBSD 対応 / pledge・unveil）、F-122（OpenBSD は ring）

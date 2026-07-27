@@ -5,7 +5,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use wasmtime::{Engine, InstancePre, Linker, Module, PoolingAllocationConfig};
+use wasmtime::{Engine, InstancePre, Linker, Module};
+// OpenBSD は OnDemand アロケータを使うため未使用になる（`create_engine` 参照。B-52）。
+#[cfg(not(target_os = "openbsd"))]
+use wasmtime::PoolingAllocationConfig;
 
 use super::capabilities::ModuleCapabilities;
 use super::context::HostState;
@@ -58,15 +61,32 @@ impl ModuleRegistry {
         // Enable AOT compilation
         config.cranelift_opt_level(wasmtime::OptLevel::Speed);
 
-        // Enable pooling allocator
-        let mut pooling_config = PoolingAllocationConfig::default();
-        pooling_config.total_memories(pooling.total_memories);
-        pooling_config.total_tables(pooling.total_tables);
-        pooling_config.max_memory_size(pooling.max_memory_size);
+        // プーリングアロケータ（OpenBSD 以外）
+        //
+        // OpenBSD だけ **OnDemand** を使う。wasmtime の `Config::with_host_stack`
+        // （= ファイバスタックの確保方法の差し替え）は **OnDemand でしか参照されず、
+        // プーリングアロケータでは黙って無視される**（wasmtime 40 の
+        // `config.rs::build_allocator`）。プーリング側はスタックを自前のスラブから
+        // `MAP_STACK` 無しで切り出すため、OpenBSD ではファイバへ切り替えた瞬間に
+        // カーネルに殺される（B-52）。OnDemand にして下の `MapStackCreator` を
+        // 実際に効かせる。
+        #[cfg(not(target_os = "openbsd"))]
+        {
+            let mut pooling_config = PoolingAllocationConfig::default();
+            pooling_config.total_memories(pooling.total_memories);
+            pooling_config.total_tables(pooling.total_tables);
+            pooling_config.max_memory_size(pooling.max_memory_size);
 
-        config.allocation_strategy(wasmtime::InstanceAllocationStrategy::Pooling(
-            pooling_config,
-        ));
+            config.allocation_strategy(wasmtime::InstanceAllocationStrategy::Pooling(
+                pooling_config,
+            ));
+        }
+        #[cfg(target_os = "openbsd")]
+        {
+            // `pooling` の各上限は OnDemand では使わない（インスタンス単位で確保する）。
+            let _ = pooling;
+            config.allocation_strategy(wasmtime::InstanceAllocationStrategy::OnDemand);
+        }
 
         // 非同期サポートを有効化（async host functions のため）
         // これにより Store::call_async などの非同期実行が可能になる
@@ -79,6 +99,25 @@ impl ModuleRegistry {
         // エンジンのエポックを定期的にインクリメントし、
         // Store のデッドラインと照合してタイムアウトを検出する
         config.epoch_interruption(true);
+
+        // OpenBSD だけ **Pulley インタープリタ**で実行する（B-52）。
+        //
+        // Pulley は wasm を**ポータブルなバイトコードへコンパイルしてインタープリタで
+        // 実行する**バックエンドで、ネイティブコードの生成・実行を一切行わないため、
+        // ホスト固有の JIT 前提（W^X・実行可能 mmap・シグナルベースのトラップ等）に
+        // 依存しない。ネイティブ JIT より遅いが、OpenBSD で WASM を使えるようにする。
+        //
+        // 他のターゲットは従来どおり Cranelift のネイティブ JIT（`pulley` feature も
+        // OpenBSD 向けにしか入れない）。
+        #[cfg(target_os = "openbsd")]
+        config.target("pulley64")?;
+
+        // OpenBSD: wasmtime 既定のファイバスタックは MAP_STACK なしで mmap されるが、
+        // OpenBSD 6.4+ は「SP は MAP_STACK 領域を指すこと」をカーネルが強制する。
+        // これは実行方式に依存しない（Pulley でもインタープリタループはファイバ
+        // スタック上で回る）ため、Pulley と併せて差し込む。
+        #[cfg(target_os = "openbsd")]
+        config.with_host_stack(std::sync::Arc::new(super::openbsd_stack::MapStackCreator));
 
         Engine::new(&config)
     }

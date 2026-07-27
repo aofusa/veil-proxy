@@ -23,6 +23,10 @@ pub mod grpc_integration;
 pub(crate) mod host;
 pub mod http_executor;
 pub mod integration;
+// OpenBSD は wasmtime 既定のファイバスタック（MAP_STACK なし）で SIGSEGV するため、
+// MAP_STACK 付きでスタックを確保する StackCreator を差し込む（B-52）。
+#[cfg(target_os = "openbsd")]
+mod openbsd_stack;
 pub mod persistent_context;
 pub mod queue_notify;
 mod registry;
