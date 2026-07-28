@@ -228,6 +228,40 @@ full-openbsd = [
     "l4-proxy",
 ]
 
+# BSD の **aarch64** 向け feature セット（B-55）。
+#
+# `full-freebsd` / `full-openbsd` から **`wasm` だけを外した**もの。
+# wasmtime 40 のシグナルベーストラップ実装
+# （`src/runtime/vm/sys/unix/signals.rs`）には `(freebsd, aarch64)` /
+# `(openbsd, aarch64)` の分岐が無く `compile_error!("unsupported platform")` になる。
+# 有効/無効は wasmtime の build.rs が **ホストの target_arch から導出**するため
+# （`has_native_signals`）、cargo feature で外すこともできない。
+# したがって BSD aarch64 では wasm を含められない。x86_64 は従来どおり wasm 込み。
+full-freebsd-aarch64 = [
+    "ktls", "http2", "http3",
+    "grpc-full",
+    "opentelemetry",
+    "compression", "cache", "metrics",
+    "websocket", "rate-limit", "buffering",
+    "jemalloc",
+    "aio",
+    "admin",
+    "access-log",
+    "l4-proxy",
+]
+
+full-openbsd-aarch64 = [
+    "ktls", "http2", "http3",
+    "grpc-full",
+    "opentelemetry",
+    "compression", "cache", "metrics",
+    "websocket", "rate-limit", "buffering",
+    "system-allocator",
+    "admin",
+    "access-log",
+    "l4-proxy",
+]
+
 [dependencies]
 # monoio 削除: カスタム io_uring 実装 (src/runtime/) に完全移行
 # rustls を直接使用（ハンドシェイク後に kTLS へオフロード）。

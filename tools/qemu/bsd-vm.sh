@@ -732,10 +732,13 @@ _guest_env_prefix() {
 #   full-freebsd : full と同じ機能セット + アロケータを jemalloc + POSIX AIO(F-127) 有効
 #   full-openbsd : full と同じ機能セット + システムアロケータ（mimalloc/jemalloc を使わない）
 # どちらも `--no-default-features` と併用する（default features の mimalloc を外すため）。
+# aarch64 は wasmtime がビルドできないため wasm 抜きのセットを使う（B-55）。
 _default_features() {
+    local suffix=""
+    [[ "${ARCH}" == "aarch64" ]] && suffix="-aarch64"
     case "${OS_NAME}" in
-        freebsd) echo "full-freebsd" ;;
-        openbsd) echo "full-openbsd" ;;
+        freebsd) echo "full-freebsd${suffix}" ;;
+        openbsd) echo "full-openbsd${suffix}" ;;
     esac
 }
 CARGO_FEATURES="${CARGO_FEATURES:-$(_default_features)}"
