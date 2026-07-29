@@ -37,6 +37,14 @@ fn get_headers(state: &HostState, map_type: i32) -> Option<&Vec<(Vec<u8>, Vec<u8
                 None
             }
         }
+        // F-134: 従来は未認識の MapType として BadArgument になっていた。
+        // `proxy_on_grpc_receive_initial_metadata`/`proxy_on_grpc_receive_trailing_metadata`
+        // 呼び出し前に engine.rs が書き込む（grpc feature 無効時はそもそも
+        // ゲストへ配送されないため、その場合はここへも到達せず空のまま）。
+        #[cfg(feature = "grpc")]
+        GRPC_RECEIVE_INITIAL_METADATA => Some(&state.http_ctx.grpc_receive_initial_metadata),
+        #[cfg(feature = "grpc")]
+        GRPC_RECEIVE_TRAILING_METADATA => Some(&state.http_ctx.grpc_receive_trailing_metadata),
         _ => None,
     }
 }
@@ -62,6 +70,13 @@ fn check_read_capability(state: &HostState, map_type: i32) -> bool {
             state.http_ctx.capabilities.allow_response_headers_read
         }
         HTTP_CALL_RESPONSE_HEADERS | HTTP_CALL_RESPONSE_TRAILERS => {
+            state.http_ctx.capabilities.allow_http_calls
+        }
+        // F-134: gRPC 受信メタデータも「外向き呼び出しの結果を読む」権限という点で
+        // proxy_http_call のレスポンスヘッダ読み取りと同じ性質のため、既存の
+        // `allow_http_calls` を流用する（gRPC 専用の capability は新設しない）。
+        #[cfg(feature = "grpc")]
+        GRPC_RECEIVE_INITIAL_METADATA | GRPC_RECEIVE_TRAILING_METADATA => {
             state.http_ctx.capabilities.allow_http_calls
         }
         _ => false,

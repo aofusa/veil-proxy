@@ -59,6 +59,23 @@ pub struct ModuleCapabilities {
     #[serde(default)]
     pub allow_response_body_write: bool,
 
+    // === Network Filter (L4, F-133) ===
+    /// Allow reading downstream (client → proxy) connection data
+    #[serde(default)]
+    pub allow_downstream_data_read: bool,
+
+    /// Allow modifying downstream connection data
+    #[serde(default)]
+    pub allow_downstream_data_write: bool,
+
+    /// Allow reading upstream (proxy → backend) connection data
+    #[serde(default)]
+    pub allow_upstream_data_read: bool,
+
+    /// Allow modifying upstream connection data
+    #[serde(default)]
+    pub allow_upstream_data_write: bool,
+
     // === Control ===
     /// Allow sending local response
     #[serde(default)]
@@ -123,6 +140,10 @@ impl Default for ModuleCapabilities {
             allow_response_headers_write: false,
             allow_response_body_read: false,
             allow_response_body_write: false,
+            allow_downstream_data_read: false,
+            allow_downstream_data_write: false,
+            allow_upstream_data_read: false,
+            allow_upstream_data_write: false,
             allow_send_local_response: false,
             allow_http_calls: false,
             allowed_upstreams: Vec::new(),
@@ -189,6 +210,10 @@ impl CapabilityPreset {
                 allow_response_headers_write: true,
                 allow_response_body_read: true,
                 allow_response_body_write: true,
+                allow_downstream_data_read: true,
+                allow_downstream_data_write: true,
+                allow_upstream_data_read: true,
+                allow_upstream_data_write: true,
                 allow_send_local_response: true,
                 allow_http_calls: true,
                 allowed_properties: vec!["*".to_string()],

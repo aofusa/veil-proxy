@@ -952,9 +952,15 @@ where
 
         let stream = self.streams.get(stream_id).unwrap();
 
-        // For trailers, we don't overwrite request_headers but could store them separately
-        // For now, trailers just need to pass validation
-        if !is_trailer {
+        // トレイラー（2 番目の HEADERS、END_STREAM 付き）は request_headers を上書きせず
+        // request_trailers へ保存する（F-133: gRPC リクエストトレイラーの WASM フィルタ適用。
+        // wasm feature 無効時は従来どおり検証のみで破棄する）。
+        if is_trailer {
+            #[cfg(feature = "wasm")]
+            {
+                stream.request_trailers = headers;
+            }
+        } else {
             stream.request_headers = headers;
 
             // Content-Length を解析
@@ -2168,6 +2174,8 @@ where
     pub fn take_request_parts(&mut self, stream_id: u32) -> Option<H2RequestParts> {
         let stream = self.streams.get(stream_id)?;
         let all_headers = std::mem::take(&mut stream.request_headers);
+        #[cfg(feature = "wasm")]
+        let trailers = std::mem::take(&mut stream.request_trailers);
         let body = std::mem::take(&mut stream.request_body);
 
         let mut method = Vec::new();
@@ -2189,6 +2197,8 @@ where
             authority,
             headers,
             body,
+            #[cfg(feature = "wasm")]
+            trailers,
         })
     }
 }
@@ -2264,6 +2274,11 @@ pub struct H2RequestParts {
     /// 蓄積済みリクエストボディ（`Stream::request_body` からの移動。
     /// `freeze()` でゼロコピーに `Bytes` 化できる）。
     pub body: bytes::BytesMut,
+    /// リクエストトレイラー（`Stream::request_trailers` からの移動。gRPC 等が
+    /// 使う 2 番目の HEADERS。通常のリクエストでは空、F-133）。wasm feature 無効時は
+    /// 誰も読まないためフィールド自体を無くす（dead_code 回避）。
+    #[cfg(feature = "wasm")]
+    pub trailers: Vec<crate::http2::hpack::HeaderField>,
 }
 
 #[cfg(test)]

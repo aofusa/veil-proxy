@@ -142,6 +142,20 @@ pub struct HttpContext {
     /// Local response to send (if set)
     pub local_response: Option<LocalResponse>,
 
+    // === Network Filter (L4, F-133) ===
+    /// Downstream (client → proxy) connection data（`BufferType::DownstreamData=2`）。
+    /// HTTP コンテキストでは未使用（空のまま = 追加コストなし）。
+    pub downstream_data: BodyBuffer,
+    /// Downstream data がモジュールにより書き換えられたか。
+    pub downstream_data_modified: bool,
+    /// Upstream (proxy → backend) connection data（`BufferType::UpstreamData=3`）。
+    pub upstream_data: BodyBuffer,
+    /// Upstream data がモジュールにより書き換えられたか。
+    pub upstream_data_modified: bool,
+    /// `proxy_close_stream` が呼ばれ、接続クローズが要求されたか（network filter 専用。
+    /// Proxy-Wasm ABI の Action には Close が無いため、host 関数呼び出しで検知する）。
+    pub close_requested: bool,
+
     // === HTTP Calls ===
     /// Pending HTTP calls
     pub pending_http_calls: HashMap<u32, PendingHttpCall>,
@@ -194,6 +208,22 @@ pub struct HttpContext {
     /// Next gRPC stream ID
     #[cfg(feature = "grpc")]
     pub next_grpc_stream_id: u32,
+
+    // === gRPC Receive State (feature = "grpc", F-134) ===
+    // `MapType::GrpcReceiveInitialMetadata`(4) / `GrpcReceiveTrailingMetadata`(5) /
+    // `BufferType::GrpcReceiveBuffer`(5) のバックストア。`proxy_on_grpc_receive*`
+    // コールバック実行前に engine.rs がここへ書き込み、ゲストが
+    // `proxy_get_header_map_pairs`/`proxy_get_buffer_bytes` で読み出せるようにする
+    // （従来は認識されない MapType/BufferType として BadArgument になっていた）。
+    /// 直近の gRPC 受信初期メタデータ
+    #[cfg(feature = "grpc")]
+    pub grpc_receive_initial_metadata: Vec<(Vec<u8>, Vec<u8>)>,
+    /// 直近の gRPC 受信メッセージ本体
+    #[cfg(feature = "grpc")]
+    pub grpc_receive_message: Bytes,
+    /// 直近の gRPC 受信トレーリングメタデータ
+    #[cfg(feature = "grpc")]
+    pub grpc_receive_trailing_metadata: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 /// gRPC stream state
@@ -255,6 +285,11 @@ impl HttpContext {
             response_headers_modified: false,
             response_body_modified: false,
             local_response: None,
+            downstream_data: BodyBuffer::empty(),
+            downstream_data_modified: false,
+            upstream_data: BodyBuffer::empty(),
+            upstream_data_modified: false,
+            close_requested: false,
             pending_http_calls: HashMap::new(),
             next_http_call_token: 1,
             http_call_responses: HashMap::new(),
@@ -276,6 +311,12 @@ impl HttpContext {
             pending_grpc_streams: HashMap::new(),
             #[cfg(feature = "grpc")]
             next_grpc_stream_id: 1,
+            #[cfg(feature = "grpc")]
+            grpc_receive_initial_metadata: Vec::new(),
+            #[cfg(feature = "grpc")]
+            grpc_receive_message: Bytes::new(),
+            #[cfg(feature = "grpc")]
+            grpc_receive_trailing_metadata: Vec::new(),
         }
     }
 

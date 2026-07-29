@@ -85,6 +85,11 @@ pub struct Stream {
     pub recv_window: i32,
     /// リクエストヘッダー
     pub request_headers: Vec<HeaderField>,
+    /// リクエストトレイラー（END_STREAM 付きの 2 番目の HEADERS。gRPC 等が使う。
+    /// 通常のリクエストでは空のまま = 追加コストなし、F-133）。
+    /// wasm feature 無効時は誰も読まないためフィールド自体を無くす（dead_code 回避）。
+    #[cfg(feature = "wasm")]
+    pub request_trailers: Vec<HeaderField>,
     /// リクエストボディ (累積、bytes::BytesMut によるゼロコピー蓄積)
     pub request_body: BytesMut,
     /// レスポンスヘッダー
@@ -124,6 +129,8 @@ impl Stream {
             send_window: send_window_size,
             recv_window: recv_window_size,
             request_headers: Vec::new(),
+            #[cfg(feature = "wasm")]
+            request_trailers: Vec::new(),
             request_body: BytesMut::new(),
             response_headers: Vec::new(),
             response_body: BytesMut::new(),

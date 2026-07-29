@@ -315,6 +315,108 @@ async fn forward_direction(
     total
 }
 
+/// WASM network filter 適用ありの 1 方向転送ループ（F-133）。
+///
+/// `bidirectional_forward` から WASM モジュールが設定されている場合のみ呼ばれる
+/// （呼び出し側で 1 回だけ判定済み）。splice ゼロコピー経路は使わず、読み取ったバイト列を
+/// 都度 `FilterEngine` へ渡してから書き込む。WASM に生データを見せる必要があるための
+/// 意図的なユーザー空間バッファ経由経路であり、ホットパス絶対規則の「WASM 無効時は
+/// コスト増なし」はこの関数を呼ばないことで満たす（無効時は `forward_direction`/
+/// `forward_direction_splice` のみが動く）。
+#[cfg(feature = "wasm")]
+async fn forward_direction_wasm(
+    src: &IoUringTcpStream,
+    dst: &IoUringTcpStream,
+    idle_timeout: Duration,
+    name: &str,
+    wasm_modules: &[String],
+    is_downstream_data: bool,
+) -> usize {
+    #[allow(clippy::uninit_vec)]
+    let mut buf: Vec<u8> = {
+        let mut b = Vec::with_capacity(BUF_SIZE);
+        // SAFETY: read(2) が先頭 n バイトを上書きし、直後の set_len(n) で切り詰めるため
+        // 未初期化領域を Rust 側から読まない。
+        unsafe { b.set_len(BUF_SIZE) };
+        b
+    };
+
+    let mut total = 0usize;
+    'outer: loop {
+        let (res, mut b) = match timeout(idle_timeout, src.read(buf)).await {
+            Ok(r) => r,
+            Err(_) => {
+                debug!("[L4:{}] idle timeout (wasm)", name);
+                break;
+            }
+        };
+        let n = match res {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        unsafe { b.set_len(n) };
+
+        // WASM フィルタ経由（この経路自体が「ユーザー空間バッファを通す」選択の結果
+        // なので、Bytes 化・書き換え時のコピーは許容する）。読み取りバッファ `b` は
+        // 次の read で使い回すため copy_from_slice でコピーし、b の所有権は手元に残す。
+        let data = bytes::Bytes::copy_from_slice(&b);
+        let engine = CURRENT_CONFIG.load().wasm_filter_engine.clone();
+        let out = if let Some(engine) = engine {
+            let result = if is_downstream_data {
+                engine
+                    .on_downstream_data_with_modules(wasm_modules, data.clone(), false)
+                    .await
+            } else {
+                engine
+                    .on_upstream_data_with_modules(wasm_modules, data.clone(), false)
+                    .await
+            };
+            match result {
+                crate::wasm::NetworkFilterResult::Continue { data } => data,
+                crate::wasm::NetworkFilterResult::Close => {
+                    debug!("[L4:{}] WASM module requested connection close", name);
+                    break;
+                }
+                crate::wasm::NetworkFilterResult::Pause => {
+                    warn!(
+                        "[L4:{}] WASM module requested Pause on network data, \
+                         but async resume is not yet supported for L4; continuing",
+                        name
+                    );
+                    data
+                }
+            }
+        } else {
+            data
+        };
+
+        let out_len = out.len();
+        let mut pending = out.to_vec();
+        let mut written = 0usize;
+        while written < out_len {
+            if written > 0 {
+                pending.copy_within(written..out_len, 0);
+                pending.truncate(out_len - written);
+            }
+            let (wres, wb) = dst.write(pending).await;
+            pending = wb;
+            match wres {
+                Ok(0) | Err(_) => break 'outer,
+                Ok(wn) => written += wn,
+            }
+        }
+        total += n;
+
+        // 次の read のためにバッファ長を BUF_SIZE に戻す（capacity は変わらないため
+        // 再確保は発生しない。b は read() から返ってきた元の Vec の ownership）。
+        unsafe { b.set_len(BUF_SIZE) };
+        buf = b;
+    }
+
+    let _ = dst.shutdown(std::net::Shutdown::Write);
+    total
+}
+
 // ====================
 // L4 splice パイプのスレッドローカルプール（F-40）
 // ====================
@@ -443,7 +545,58 @@ pub async fn bidirectional_forward(
     upstream: IoUringTcpStream,
     idle_timeout: Duration,
     listener_name: &str,
+    #[cfg(feature = "wasm")] wasm_modules: &[String],
 ) {
+    // F-133: WASM network filter が設定されているかどうかを接続確立時に 1 回だけ判定する
+    // （ホットパス絶対規則: WASM 無効時はこの分岐 1 つだけがコストのすべてで、以降は
+    // 従来どおり splice/forward_direction のゼロコピー経路をそのまま使う）。
+    #[cfg(feature = "wasm")]
+    if !wasm_modules.is_empty() {
+        // WASM 有効時は splice を使わず、データを可視化できるユーザー空間バッファ経由の
+        // 転送へ切り替える（design doc F-133: 「splice/zero-copy 経路は WASM 無効時のみ」）。
+        let engine = CURRENT_CONFIG.load().wasm_filter_engine.clone();
+        if let Some(ref engine) = engine {
+            match engine.on_new_connection_with_modules(wasm_modules).await {
+                crate::wasm::NetworkAction::Close => {
+                    debug!(
+                        "[L4:{}] WASM module closed connection on_new_connection",
+                        listener_name
+                    );
+                    return;
+                }
+                crate::wasm::NetworkAction::Continue => {}
+            }
+        }
+
+        let (c2u_bytes, u2c_bytes) = futures::join!(
+            forward_direction_wasm(
+                &client,
+                &upstream,
+                idle_timeout,
+                listener_name,
+                wasm_modules,
+                true,
+            ),
+            forward_direction_wasm(
+                &upstream,
+                &client,
+                idle_timeout,
+                listener_name,
+                wasm_modules,
+                false,
+            )
+        );
+        debug!(
+            "[L4:{}] connection closed (wasm): c→u {} bytes, u→c {} bytes",
+            listener_name, c2u_bytes, u2c_bytes
+        );
+        if let Some(ref engine) = engine {
+            engine.on_downstream_close_with_modules(wasm_modules).await;
+            engine.on_upstream_close_with_modules(wasm_modules).await;
+        }
+        return;
+    }
+
     // BSD（`splice(2)` 非搭載）: 設計ドキュメント 3.3 節のとおり、splice/パイプ経路は
     // Linux 専用のため使わず、常にユーザースペース read/write 転送（`forward_direction`。
     // コネクション確立時に一度だけバッファを確保しリクエストごとの再確保は発生しない）
@@ -642,7 +795,15 @@ pub async fn handle_l4_connection(
     );
 
     let idle_timeout = Duration::from_secs(config.idle_timeout_secs);
-    bidirectional_forward(client, upstream, idle_timeout, &config.name).await;
+    bidirectional_forward(
+        client,
+        upstream,
+        idle_timeout,
+        &config.name,
+        #[cfg(feature = "wasm")]
+        &config.wasm_modules,
+    )
+    .await;
 }
 
 /// L4 TLS 終端用のサーバー TLS 設定を取得する。
@@ -728,9 +889,41 @@ async fn bidirectional_forward_tls_terminate<C>(
     upstream: &IoUringTcpStream,
     idle_timeout: Duration,
     listener_name: &str,
+    #[cfg(feature = "wasm")] wasm_modules: &[String],
 ) where
     C: AsyncReadRent + AsyncWriteRent + Unpin,
 {
+    // F-133: WASM network filter が設定されているかどうかを接続確立時に 1 回だけ判定する
+    // （ホットパス絶対規則: 未設定時はこの分岐 1 つだけがコストのすべてで、以降は
+    // 従来どおりのユーザー空間ポーリングループをそのまま使う。TLS 終端経路はもともと
+    // splice を使わない平文コピーのため、WASM 有効時も追加のバッファ経路切替は不要で
+    // 同じループへ WASM 呼び出しを差し込むだけで済む）。
+    #[cfg(feature = "wasm")]
+    let wasm_active = !wasm_modules.is_empty();
+    #[cfg(not(feature = "wasm"))]
+    let wasm_active = false;
+
+    #[cfg(feature = "wasm")]
+    let engine = if wasm_active {
+        CURRENT_CONFIG.load().wasm_filter_engine.clone()
+    } else {
+        None
+    };
+
+    #[cfg(feature = "wasm")]
+    if let Some(ref engine) = engine {
+        match engine.on_new_connection_with_modules(wasm_modules).await {
+            crate::wasm::NetworkAction::Close => {
+                debug!(
+                    "[L4:{}] WASM module closed connection on_new_connection (tls terminate)",
+                    listener_name
+                );
+                return;
+            }
+            crate::wasm::NetworkAction::Continue => {}
+        }
+    }
+
     #[allow(clippy::uninit_vec)]
     let make_buf = || {
         let mut b = Vec::with_capacity(BUF_SIZE);
@@ -739,7 +932,7 @@ async fn bidirectional_forward_tls_terminate<C>(
         b
     };
 
-    loop {
+    'outer: loop {
         let mut had_activity = false;
 
         let buf = make_buf();
@@ -747,6 +940,45 @@ async fn bidirectional_forward_tls_terminate<C>(
             Ok((Ok(0), _)) => break,
             Ok((Ok(n), mut b)) => {
                 unsafe { b.set_len(n) };
+
+                // downstream (client → upstream) データを WASM フィルタへ通す
+                // （`wasm_active` が false の場合はこのブロック自体を跳ばし、
+                // 従来どおり b をそのまま転送する）。
+                #[cfg(feature = "wasm")]
+                if wasm_active {
+                    let data = bytes::Bytes::copy_from_slice(&b[..n]);
+                    if let Some(ref engine) = engine {
+                        let result = engine
+                            .on_downstream_data_with_modules(wasm_modules, data, false)
+                            .await;
+                        match result {
+                            crate::wasm::NetworkFilterResult::Continue { data } => {
+                                // WASM が書き換えた（あるいは未変更の）データで b の内容を
+                                // 置き換える。capacity は BUF_SIZE だが、モジュールが長さを
+                                // 変えた場合でも安全なように clear + extend_from_slice で扱う
+                                // （超過時のみ再確保、通常は同容量内で完結）。
+                                b.clear();
+                                b.extend_from_slice(&data);
+                            }
+                            crate::wasm::NetworkFilterResult::Close => {
+                                debug!(
+                                    "[L4:{}] WASM module requested connection close (tls terminate, downstream)",
+                                    listener_name
+                                );
+                                break 'outer;
+                            }
+                            crate::wasm::NetworkFilterResult::Pause => {
+                                warn!(
+                                    "[L4:{}] WASM module requested Pause on network data, \
+                                     but async resume is not yet supported for L4; continuing",
+                                    listener_name
+                                );
+                            }
+                        }
+                    }
+                }
+
+                let n = b.len();
                 let mut pending = b;
                 let mut written = 0usize;
                 while written < n {
@@ -757,7 +989,7 @@ async fn bidirectional_forward_tls_terminate<C>(
                     let (wres, returned) = upstream.write(pending).await;
                     pending = returned;
                     match wres {
-                        Ok(0) | Err(_) => return,
+                        Ok(0) | Err(_) => break 'outer,
                         Ok(wn) => written += wn,
                     }
                 }
@@ -772,6 +1004,42 @@ async fn bidirectional_forward_tls_terminate<C>(
             Ok((Ok(0), _)) => break,
             Ok((Ok(n), mut b)) => {
                 unsafe { b.set_len(n) };
+
+                // upstream (backend → client) データを WASM フィルタへ通す。
+                #[cfg(feature = "wasm")]
+                if wasm_active {
+                    let data = bytes::Bytes::copy_from_slice(&b[..n]);
+                    if let Some(ref engine) = engine {
+                        let result = engine
+                            .on_upstream_data_with_modules(wasm_modules, data, false)
+                            .await;
+                        match result {
+                            crate::wasm::NetworkFilterResult::Continue { data } => {
+                                // WASM が書き換えた（あるいは未変更の）データで b の内容を
+                                // 置き換える。capacity は BUF_SIZE だが、モジュールが長さを
+                                // 変えた場合でも安全なように clear + extend_from_slice で扱う
+                                // （超過時のみ再確保、通常は同容量内で完結）。
+                                b.clear();
+                                b.extend_from_slice(&data);
+                            }
+                            crate::wasm::NetworkFilterResult::Close => {
+                                debug!(
+                                    "[L4:{}] WASM module requested connection close (tls terminate, upstream)",
+                                    listener_name
+                                );
+                                break 'outer;
+                            }
+                            crate::wasm::NetworkFilterResult::Pause => {
+                                warn!(
+                                    "[L4:{}] WASM module requested Pause on network data, \
+                                     but async resume is not yet supported for L4; continuing",
+                                    listener_name
+                                );
+                            }
+                        }
+                    }
+                }
+
                 let (wres, _) = client.write_all(b).await;
                 if wres.is_err() {
                     break;
@@ -786,6 +1054,12 @@ async fn bidirectional_forward_tls_terminate<C>(
             debug!("[L4:{}] TLS terminate idle timeout", listener_name);
             break;
         }
+    }
+
+    #[cfg(feature = "wasm")]
+    if let Some(ref engine) = engine {
+        engine.on_downstream_close_with_modules(wasm_modules).await;
+        engine.on_upstream_close_with_modules(wasm_modules).await;
     }
 }
 
@@ -881,8 +1155,15 @@ async fn handle_l4_tls_terminate_connection(
     );
 
     let idle_timeout = Duration::from_secs(config.idle_timeout_secs);
-    bidirectional_forward_tls_terminate(&mut tls_client, &upstream, idle_timeout, &config.name)
-        .await;
+    bidirectional_forward_tls_terminate(
+        &mut tls_client,
+        &upstream,
+        idle_timeout,
+        &config.name,
+        #[cfg(feature = "wasm")]
+        &config.wasm_modules,
+    )
+    .await;
 }
 
 #[cfg(test)]
@@ -908,6 +1189,8 @@ mod tests {
             health_check: None,
             connect_timeout_secs: 10,
             idle_timeout_secs: 600,
+            #[cfg(feature = "wasm")]
+            wasm_modules: Vec::new(),
         }
     }
 

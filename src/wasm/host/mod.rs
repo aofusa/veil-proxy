@@ -6,6 +6,8 @@ pub(crate) mod abi;
 mod buffers;
 mod foreign;
 mod grpc;
+#[cfg(feature = "grpc")]
+pub mod grpc_executor;
 mod headers;
 mod http_call;
 mod logging;

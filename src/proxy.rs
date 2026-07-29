@@ -818,6 +818,10 @@ struct H2RequestCtx {
     headers: Vec<crate::http2::hpack::HeaderField>,
     /// 完了済みリクエストボディ（バッファ経路。ストリーミング経路では空）。
     body: Bytes,
+    /// リクエストトレイラー（gRPC 等。通常のリクエストでは空、F-133）。wasm feature
+    /// 無効時は誰も読まないためフィールド自体を無くす（dead_code 回避）。
+    #[cfg(feature = "wasm")]
+    trailers: Vec<crate::http2::hpack::HeaderField>,
     client_ip: Box<str>,
     start: Instant,
 }
@@ -942,6 +946,8 @@ fn h2_spawn_for_request<S>(
         authority,
         headers: parts.headers,
         body: parts.body.freeze(),
+        #[cfg(feature = "wasm")]
+        trailers: parts.trailers,
         client_ip: Box::from(client_ip),
         start: Instant::now(),
     };
@@ -1531,6 +1537,13 @@ async fn h2_dispatch(
     }
 
     // WASM リクエストフィルタ。
+    //
+    // F-133: `on_request_headers` が返した変更後ヘッダを保持する（変更があった場合のみ Some）。
+    // 従来 HTTP/2 経路は `Continue { .. } => {}` で**変更後ヘッダを捨てていた**ため、
+    // WASM によるリクエストヘッダ変更が上流に一切反映されなかった（HTTP/3 経路は
+    // `wasm_request_headers` として反映済み。HTTP/1.1 経路も反映済み）。
+    #[cfg(feature = "wasm")]
+    let mut wasm_request_headers_override: Option<Vec<crate::http2::hpack::HeaderField>> = None;
     #[cfg(feature = "wasm")]
     let wasm_modules_to_apply: Arc<Vec<String>> = {
         let config = CURRENT_CONFIG.load();
@@ -1582,13 +1595,91 @@ async fn h2_dispatch(
                     crate::wasm::FilterResult::Pause => {
                         warn!("WASM module requested pause, but async operations are not yet supported");
                     }
-                    crate::wasm::FilterResult::Continue { .. } => {}
+                    crate::wasm::FilterResult::Continue { headers, .. } => {
+                        // F-133: 変更後ヘッダを上流リクエストへ反映する（下の ctx 差し替え）。
+                        wasm_request_headers_override = Some(
+                            headers
+                                .into_iter()
+                                .map(|(name, value)| crate::http2::hpack::HeaderField {
+                                    name,
+                                    value,
+                                })
+                                .collect(),
+                        );
+                    }
                 }
             }
             modules_to_apply
         } else {
             crate::wasm::empty_wasm_modules()
         }
+    };
+
+    // gRPC リクエストトレイラー WASM フィルタ（F-133）。トレイラー無しの一般的なリクエストは
+    // `ctx.trailers` が空のため、この分岐だけで即座に抜ける（コスト増なし）。
+    #[cfg(feature = "wasm")]
+    if !ctx.trailers.is_empty() && !wasm_modules_to_apply.is_empty() {
+        let config = CURRENT_CONFIG.load();
+        if let Some(ref wasm_engine) = config.wasm_filter_engine {
+            let trailers_vec: Vec<(Vec<u8>, Vec<u8>)> = ctx
+                .trailers
+                .iter()
+                .map(|h| (h.name.clone(), h.value.clone()))
+                .collect();
+            let wasm_result = wasm_engine
+                .on_request_trailers_with_modules(&wasm_modules_to_apply, trailers_vec)
+                .await;
+            match wasm_result {
+                crate::wasm::FilterResult::LocalResponse(resp) => {
+                    let mut headers: Vec<(Vec<u8>, Vec<u8>)> = resp
+                        .headers
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    for (n, v) in h2_base_headers(false) {
+                        headers.push((n, v));
+                    }
+                    return h2_emit_full(resp_tx, notify, resp.status_code, headers, resp.body)
+                        .await;
+                }
+                crate::wasm::FilterResult::Pause => {
+                    warn!(
+                        "WASM module requested pause on request trailers, but async operations are not yet supported"
+                    );
+                }
+                // F-133 調査結果: リクエストトレイラー自体が上流バックエンドへ転送される
+                // 経路が存在しない（`h2_proxy_h2c` は `h2c_client.send_request` に
+                // method/path/authority/headers/body しか渡せず、リクエストトレイラーの
+                // 送信 API が無い。H1/HTTPS バックエンド経路も同様）。したがって
+                // WASM がここで返した変更後トレイラーには反映先が無く、意図的に破棄する
+                // （元の `ctx.trailers` を使っても上流へは送られないため、変更後を
+                // 使っても使わなくても観測可能な挙動差は無い）。将来リクエストトレイラー
+                // 転送を実装する際は、ここで変更後トレイラーを保持して反映すること。
+                crate::wasm::FilterResult::Continue { .. } => {}
+            }
+        }
+    }
+
+    // F-133: WASM がリクエストヘッダを変更した場合のみ、ヘッダを差し替えた `H2RequestCtx` を
+    // ローカルに構築して `ctx` をシャドウイングする（ホットパス絶対規則: WASM 未適用時は
+    // `None` 分岐のみでコスト増なし。`body` は `Bytes` の clone のため参照カウント増加のみ）。
+    #[cfg(feature = "wasm")]
+    let modified_ctx;
+    #[cfg(feature = "wasm")]
+    let ctx = if let Some(headers) = wasm_request_headers_override {
+        modified_ctx = H2RequestCtx {
+            method: ctx.method.clone(),
+            path: ctx.path.clone(),
+            authority: ctx.authority.clone(),
+            headers,
+            body: ctx.body.clone(),
+            trailers: ctx.trailers.clone(),
+            client_ip: ctx.client_ip.clone(),
+            start: ctx.start,
+        };
+        &modified_ctx
+    } else {
+        ctx
     };
 
     // Accept-Encoding。
@@ -2345,8 +2436,15 @@ async fn h2_proxy_h2c(
             if has_trailers {
                 #[cfg(feature = "grpc")]
                 {
+                    // gRPC トレイラー WASM フィルタ（F-133）: `grpc-status`/`grpc-message` の
+                    // 書き換えを許可する。`wasm_modules` が空なら早期 return（コスト増なし）。
+                    #[cfg(feature = "wasm")]
+                    let trailers =
+                        apply_h2_wasm_response_trailers(wasm_modules, h2c_resp.trailers).await;
+                    #[cfg(not(feature = "wasm"))]
+                    let trailers = h2c_resp.trailers;
                     let mut grpc_status = 0u32;
-                    for (name, value) in &h2c_resp.trailers {
+                    for (name, value) in &trailers {
                         if name == b"grpc-status" {
                             if let Ok(s) = std::str::from_utf8(value) {
                                 grpc_status = s.trim().parse().unwrap_or(0);
@@ -2358,7 +2456,7 @@ async fn h2_proxy_h2c(
                     let mut status_buf = itoa::Buffer::new();
                     let status_str = status_buf.format(grpc_status);
                     crate::metrics::record_grpc_request(grpc_method, status_str, &target.host);
-                    let _ = h2_send(resp_tx, notify, H2RespMsg::Trailers(h2c_resp.trailers)).await;
+                    let _ = h2_send(resp_tx, notify, H2RespMsg::Trailers(trailers)).await;
                 }
                 #[cfg(not(feature = "grpc"))]
                 {
@@ -3461,6 +3559,43 @@ async fn apply_h2_wasm_response_headers(
         header_store = modified_headers;
     }
     header_store
+}
+
+/// gRPC トレイラー（`grpc-status`/`grpc-message` 等）へ WASM レスポンスフィルタを適用（F-133）。
+///
+/// `wasm_modules` が空なら早期 return（追加コストなし）。トレイラー送出時点で
+/// HEADERS/DATA は既に送出済みのため、`LocalResponse`/`Pause` は適用不能として
+/// 警告ログのみ出し、トレイラーはそのまま（あるいは `Continue` の変更のみ反映して）通す。
+#[cfg(all(feature = "http2", feature = "grpc", feature = "wasm"))]
+async fn apply_h2_wasm_response_trailers(
+    wasm_modules: &Arc<Vec<String>>,
+    trailers: Vec<(Vec<u8>, Vec<u8>)>,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    if wasm_modules.is_empty() {
+        return trailers;
+    }
+    let config = CURRENT_CONFIG.load();
+    let Some(ref wasm_engine) = config.wasm_filter_engine else {
+        return trailers;
+    };
+
+    let original = trailers.clone();
+    match wasm_engine
+        .on_response_trailers_with_modules(wasm_modules, trailers)
+        .await
+    {
+        crate::wasm::FilterResult::Continue { headers, .. } => headers,
+        crate::wasm::FilterResult::Pause | crate::wasm::FilterResult::LocalResponse(_) => {
+            // gRPC トレイラー送出時点で HEADERS/DATA は送出済みのため Pause/LocalResponse は
+            // 適用できない（既存の送出済みレスポンスを差し替えられない）。元のトレイラーを
+            // そのまま通す（grpc-status 欠落によるクライアントハングを避ける）。
+            warn!(
+                "WASM module requested Pause/LocalResponse on gRPC response trailers, \
+                 but response head is already sent; keeping original trailers"
+            );
+            original
+        }
+    }
 }
 
 /// HTTP/2 静的応答の圧縮ネゴシエーションとヘッダー構築（B-32）

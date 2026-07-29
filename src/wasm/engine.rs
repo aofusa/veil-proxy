@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use wasmtime::Store;
 
+use super::constants::{ACTION_CONTINUE, ACTION_PAUSE};
 use super::context::{HostState, HttpContext};
 use super::registry::{LoadedModule, ModuleRegistry};
 use super::types::{FilterAction, LocalResponse, WasmConfig};
@@ -1851,6 +1852,13 @@ impl FilterEngine {
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_configuration = module.configuration.clone();
+        // F-134: MapType::GrpcReceiveInitialMetadata(4) のバックストア。
+        // ゲストが proxy_on_grpc_receive_initial_metadata 内で
+        // proxy_get_header_map_pairs(GrpcReceiveInitialMetadata) を呼べるようにする。
+        http_ctx.grpc_receive_initial_metadata = headers
+            .iter()
+            .map(|(k, v)| (k.clone().into_bytes(), v.clone().into_bytes()))
+            .collect();
 
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
@@ -1962,6 +1970,8 @@ impl FilterEngine {
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_configuration = module.configuration.clone();
+        // F-134: BufferType::GrpcReceiveBuffer(5) のバックストア。
+        http_ctx.grpc_receive_message = bytes::Bytes::copy_from_slice(message);
 
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
@@ -2079,6 +2089,11 @@ impl FilterEngine {
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_configuration = module.configuration.clone();
+        // F-134: MapType::GrpcReceiveTrailingMetadata(5) のバックストア。
+        http_ctx.grpc_receive_trailing_metadata = trailers
+            .iter()
+            .map(|(k, v)| (k.clone().into_bytes(), v.clone().into_bytes()))
+            .collect();
 
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
@@ -2267,6 +2282,426 @@ impl FilterEngine {
 
         Ok(())
     }
+
+    // ========================================================================
+    // Network Filter (L4 TCP/UDP stream, F-133)
+    //
+    // Proxy-Wasm の network filter ABI（`proxy_on_new_connection` /
+    // `proxy_on_downstream_data` / `proxy_on_upstream_data` /
+    // `proxy_on_downstream_close` / `proxy_on_upstream_close`）。HTTP コンテキストと異なり
+    // ヘッダが無く、生バイト列のみを扱う。`proxy_get_buffer_bytes`/`proxy_set_buffer_bytes`
+    // の `BufferType::DownstreamData=2`/`UpstreamData=3` 経由でデータを読み書きする。
+    // ========================================================================
+
+    /// Execute `proxy_on_new_connection` for specified modules（接続確立時に 1 回）。
+    pub async fn on_new_connection_with_modules(&self, module_names: &[String]) -> NetworkAction {
+        let modules: Vec<Arc<LoadedModule>> = module_names
+            .iter()
+            .filter_map(|name| self.registry.get_module(name))
+            .collect();
+
+        for module in &modules {
+            match self.execute_on_new_connection(module).await {
+                Ok(NetworkAction::Close) => return NetworkAction::Close,
+                Ok(NetworkAction::Continue) => {}
+                Err(e) => {
+                    ftlog::error!("[wasm:{}] on_new_connection error: {}", module.name, e);
+                }
+            }
+        }
+        NetworkAction::Continue
+    }
+
+    async fn execute_on_new_connection(
+        &self,
+        module: &LoadedModule,
+    ) -> anyhow::Result<NetworkAction> {
+        let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
+        http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_configuration = module.configuration.clone();
+
+        let host_state = HostState::new(http_ctx);
+        let mut store = Store::new(self.registry.engine(), host_state);
+        store.set_fuel(self.fuel_limit)?;
+        store.fuel_async_yield_interval(Some(10_000))?;
+        store.set_epoch_deadline(self.epoch_deadline);
+        self.registry.engine().increment_epoch();
+
+        let instance = module.instance_pre.instantiate_async(&mut store).await?;
+
+        if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
+            let _ = func.call_async(&mut store, ()).await;
+        } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
+            let _ = func.call_async(&mut store, ()).await;
+        }
+
+        let root_context_id = 1i32;
+        let stream_context_id = 2i32;
+        let config_size = module.configuration.len() as i32;
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
+            let _ = func.call_async(&mut store, (root_context_id, 0)).await;
+        }
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
+        {
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
+        }
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
+        {
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
+        }
+        // network filter (stream) context は root context の子として作る。
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
+            let _ = func
+                .call_async(&mut store, (stream_context_id, root_context_id))
+                .await;
+        }
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32,), i32>(&mut store, "proxy_on_new_connection")
+        {
+            let _ = func.call_async(&mut store, (stream_context_id,)).await?;
+        }
+
+        if store.data().http_ctx.close_requested {
+            Ok(NetworkAction::Close)
+        } else {
+            Ok(NetworkAction::Continue)
+        }
+    }
+
+    /// Execute `proxy_on_downstream_data`（クライアント → プロキシ方向のデータ）を
+    /// 指定モジュール群に対して実行する。
+    pub async fn on_downstream_data_with_modules(
+        &self,
+        module_names: &[String],
+        data: bytes::Bytes,
+        end_of_stream: bool,
+    ) -> NetworkFilterResult {
+        self.run_network_data_filters(
+            module_names,
+            data,
+            end_of_stream,
+            NetworkDataDirection::Downstream,
+        )
+        .await
+    }
+
+    /// Execute `proxy_on_upstream_data`（バックエンド → プロキシ方向のデータ）を
+    /// 指定モジュール群に対して実行する。
+    pub async fn on_upstream_data_with_modules(
+        &self,
+        module_names: &[String],
+        data: bytes::Bytes,
+        end_of_stream: bool,
+    ) -> NetworkFilterResult {
+        self.run_network_data_filters(
+            module_names,
+            data,
+            end_of_stream,
+            NetworkDataDirection::Upstream,
+        )
+        .await
+    }
+
+    async fn run_network_data_filters(
+        &self,
+        module_names: &[String],
+        data: bytes::Bytes,
+        end_of_stream: bool,
+        direction: NetworkDataDirection,
+    ) -> NetworkFilterResult {
+        let modules: Vec<Arc<LoadedModule>> = module_names
+            .iter()
+            .filter_map(|name| self.registry.get_module(name))
+            .collect();
+
+        if modules.is_empty() {
+            return NetworkFilterResult::Continue { data };
+        }
+
+        let mut current = data;
+        for module in &modules {
+            // Bytes の clone は参照カウント共有のみ（deep copy なし）。
+            let result = self
+                .execute_on_network_data(module, current.clone(), end_of_stream, direction)
+                .await;
+            match result {
+                Ok(NetworkDataModuleResult::Continue { data }) => current = data,
+                Ok(NetworkDataModuleResult::Pause) => return NetworkFilterResult::Pause,
+                Ok(NetworkDataModuleResult::Close) => return NetworkFilterResult::Close,
+                Err(e) => {
+                    ftlog::error!(
+                        "[wasm:{}] on_{}_data error: {}",
+                        module.name,
+                        direction.label(),
+                        e
+                    );
+                }
+            }
+        }
+
+        NetworkFilterResult::Continue { data: current }
+    }
+
+    async fn execute_on_network_data(
+        &self,
+        module: &LoadedModule,
+        data: bytes::Bytes,
+        end_of_stream: bool,
+        direction: NetworkDataDirection,
+    ) -> anyhow::Result<NetworkDataModuleResult> {
+        let data_len = data.len() as i32;
+        let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
+        match direction {
+            NetworkDataDirection::Downstream => {
+                http_ctx.downstream_data = crate::wasm::context::BodyBuffer::Shared(data)
+            }
+            NetworkDataDirection::Upstream => {
+                http_ctx.upstream_data = crate::wasm::context::BodyBuffer::Shared(data)
+            }
+        }
+        http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_configuration = module.configuration.clone();
+
+        let host_state = HostState::new(http_ctx);
+        let mut store = Store::new(self.registry.engine(), host_state);
+        store.set_fuel(self.fuel_limit)?;
+        store.fuel_async_yield_interval(Some(10_000))?;
+        store.set_epoch_deadline(self.epoch_deadline);
+        self.registry.engine().increment_epoch();
+
+        let instance = module.instance_pre.instantiate_async(&mut store).await?;
+
+        if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
+            let _ = func.call_async(&mut store, ()).await;
+        } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
+            let _ = func.call_async(&mut store, ()).await;
+        }
+
+        let root_context_id = 1i32;
+        let stream_context_id = 2i32;
+        let config_size = module.configuration.len() as i32;
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
+            let _ = func.call_async(&mut store, (root_context_id, 0)).await;
+        }
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
+        {
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
+        }
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
+        {
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
+        }
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
+            let _ = func
+                .call_async(&mut store, (stream_context_id, root_context_id))
+                .await;
+        }
+
+        let callback_name = direction.callback_name();
+        let end_of_stream_i32 = if end_of_stream { 1 } else { 0 };
+        let mut action = ACTION_CONTINUE;
+        if let Ok(func) = instance.get_typed_func::<(i32, i32, i32), i32>(&mut store, callback_name)
+        {
+            action = func
+                .call_async(&mut store, (stream_context_id, data_len, end_of_stream_i32))
+                .await?;
+        }
+
+        let state = store.data();
+        // `proxy_close_stream` 呼び出し（close_requested）を最優先で判定し、次に
+        // `proxy_action_t`（Continue=0/Pause=1）の戻り値で Pause を判定する。
+        if state.http_ctx.close_requested {
+            return Ok(NetworkDataModuleResult::Close);
+        }
+        if action == ACTION_PAUSE {
+            return Ok(NetworkDataModuleResult::Pause);
+        }
+
+        let modified = match direction {
+            NetworkDataDirection::Downstream => {
+                if state.http_ctx.downstream_data_modified {
+                    Some(state.http_ctx.downstream_data.share())
+                } else {
+                    None
+                }
+            }
+            NetworkDataDirection::Upstream => {
+                if state.http_ctx.upstream_data_modified {
+                    Some(state.http_ctx.upstream_data.share())
+                } else {
+                    None
+                }
+            }
+        };
+
+        match modified {
+            Some(data) => Ok(NetworkDataModuleResult::Continue { data }),
+            None => Ok(NetworkDataModuleResult::Continue {
+                data: match direction {
+                    NetworkDataDirection::Downstream => state.http_ctx.downstream_data.share(),
+                    NetworkDataDirection::Upstream => state.http_ctx.upstream_data.share(),
+                },
+            }),
+        }
+    }
+
+    /// Execute `proxy_on_downstream_close`（クライアント側接続クローズ通知、1 回のみ）。
+    pub async fn on_downstream_close_with_modules(&self, module_names: &[String]) {
+        self.run_network_close(module_names, "proxy_on_downstream_close")
+            .await
+    }
+
+    /// Execute `proxy_on_upstream_close`（バックエンド側接続クローズ通知、1 回のみ）。
+    pub async fn on_upstream_close_with_modules(&self, module_names: &[String]) {
+        self.run_network_close(module_names, "proxy_on_upstream_close")
+            .await
+    }
+
+    async fn run_network_close(&self, module_names: &[String], callback_name: &str) {
+        let modules: Vec<Arc<LoadedModule>> = module_names
+            .iter()
+            .filter_map(|name| self.registry.get_module(name))
+            .collect();
+
+        for module in &modules {
+            if let Err(e) = self.execute_on_network_close(module, callback_name).await {
+                ftlog::error!("[wasm:{}] {} error: {}", module.name, callback_name, e);
+            }
+        }
+    }
+
+    async fn execute_on_network_close(
+        &self,
+        module: &LoadedModule,
+        callback_name: &str,
+    ) -> anyhow::Result<()> {
+        let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
+        http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_configuration = module.configuration.clone();
+
+        let host_state = HostState::new(http_ctx);
+        let mut store = Store::new(self.registry.engine(), host_state);
+        store.set_fuel(self.fuel_limit)?;
+        store.fuel_async_yield_interval(Some(10_000))?;
+        store.set_epoch_deadline(self.epoch_deadline);
+        self.registry.engine().increment_epoch();
+
+        let instance = module.instance_pre.instantiate_async(&mut store).await?;
+
+        if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
+            let _ = func.call_async(&mut store, ()).await;
+        } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
+            let _ = func.call_async(&mut store, ()).await;
+        }
+
+        let root_context_id = 1i32;
+        let stream_context_id = 2i32;
+        let config_size = module.configuration.len() as i32;
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
+            let _ = func.call_async(&mut store, (root_context_id, 0)).await;
+        }
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
+        {
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
+        }
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
+        {
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
+        }
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
+            let _ = func
+                .call_async(&mut store, (stream_context_id, root_context_id))
+                .await;
+        }
+
+        // Signature: (context_id, close_type) -> void（close_type は未使用のため 0 固定）
+        if let Ok(func) = instance.get_typed_func::<(i32, i32), ()>(&mut store, callback_name) {
+            let _ = func.call_async(&mut store, (stream_context_id, 0)).await;
+        }
+
+        Ok(())
+    }
+}
+
+/// network data (downstream/upstream) の方向。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetworkDataDirection {
+    Downstream,
+    Upstream,
+}
+
+impl NetworkDataDirection {
+    fn callback_name(self) -> &'static str {
+        match self {
+            NetworkDataDirection::Downstream => "proxy_on_downstream_data",
+            NetworkDataDirection::Upstream => "proxy_on_upstream_data",
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            NetworkDataDirection::Downstream => "downstream",
+            NetworkDataDirection::Upstream => "upstream",
+        }
+    }
+}
+
+/// `proxy_on_new_connection` の結果（Close は `proxy_close_stream` 呼び出しで検知）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkAction {
+    Continue,
+    Close,
+}
+
+/// 単一モジュールの network data フィルタ実行結果（内部用）。
+enum NetworkDataModuleResult {
+    Continue { data: bytes::Bytes },
+    Pause,
+    Close,
+}
+
+/// network data フィルタチェーン全体の実行結果。
+pub enum NetworkFilterResult {
+    /// 転送を継続する（`data` は書き換え後、または未変更の場合はそのまま）。
+    Continue { data: bytes::Bytes },
+    /// 処理を一時停止する（現状 L4 では非同期再開経路が無いため、呼び出し側は
+    /// 警告ログを出して Continue 相当に倒す想定）。
+    Pause,
+    /// 接続をクローズする（`proxy_close_stream` が呼ばれた）。
+    Close,
 }
 
 /// Result from a single module execution
@@ -2321,6 +2756,10 @@ mod exec_smoke_tests {
     use crate::wasm::types::{ModuleConfig, WasmConfig, WasmDefaults};
 
     fn header_filter_engine() -> Option<FilterEngine> {
+        header_filter_engine_with_interpreter(false)
+    }
+
+    fn header_filter_engine_with_interpreter(interpreter: bool) -> Option<FilterEngine> {
         let path = "tests/fixtures/wasm/header_filter.wasm";
         if !std::path::Path::new(path).exists() {
             return None;
@@ -2334,6 +2773,7 @@ mod exec_smoke_tests {
                 configuration: String::new(),
                 capabilities: Default::default(),
             }],
+            interpreter,
         };
         FilterEngine::new(&config).ok()
     }

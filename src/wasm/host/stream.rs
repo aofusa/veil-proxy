@@ -22,11 +22,15 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     )?;
 
     // proxy_close_stream
+    // F-133: network filter（L4）が接続クローズを要求する経路。Proxy-Wasm ABI の
+    // Action（Continue/Pause）には Close が無いため、host 関数呼び出しでフラグを立て、
+    // FilterEngine 側で `HttpContext::close_requested` を確認してクローズを決定する。
     linker.func_wrap(
         "env",
         "proxy_close_stream",
-        |_caller: Caller<'_, HostState>, _stream_type: i32| -> i32 {
-            // Stream closing is handled at a higher level
+        |mut caller: Caller<'_, HostState>, _stream_type: i32| -> i32 {
+            let state = caller.data_mut();
+            state.http_ctx.close_requested = true;
             PROXY_RESULT_OK
         },
     )?;

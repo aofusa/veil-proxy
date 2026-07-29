@@ -19,7 +19,6 @@ use serde::Deserialize;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
-use std::fs::File;
 use std::io;
 use std::io::BufReader;
 use std::net::SocketAddr;
@@ -1459,6 +1458,16 @@ pub fn collect_unveil_paths(config_path: &Path) -> io::Result<UnveilPaths> {
         push_unveil_parent_dir(&mut read_write_create, file_path);
     }
 
+    // F-136/F-137: system-tls 有効時、OpenBSD の HTTP/3(quiche) は `boringssl-boring-crate`
+    // の in-memory SSL_CTX API ではなくパス指定 API（`create_memfd_for_pem` 相当の一時ファイル
+    // 経由）にフォールバックする（`src/http3_server.rs::new_quic_config_with_certs` の
+    // `cfg(any(target_os = "linux", feature = "system-tls"))` 分岐）。unveil のビューに
+    // 一時ディレクトリが無いと一時ファイルの作成が `ENOENT`/`EPERM` 相当で失敗し、初回ロード・
+    // 証明書ホットリロードとも恒常的に失敗する。`pledge` の promise には既に `wpath cpath` が
+    // 含まれているため、こちらは変更不要。
+    #[cfg(feature = "system-tls")]
+    read_write_create.push(std::env::temp_dir());
+
     Ok(UnveilPaths {
         read_only,
         read_write_create,
@@ -2794,6 +2803,13 @@ pub struct L4ListenerConfig {
     /// アイドルタイムアウト（秒）: この時間データ転送がなければ接続を切断（デフォルト: 600）
     #[serde(default = "default_l4_idle_timeout")]
     pub idle_timeout_secs: u64,
+    /// WASM network filter モジュール名一覧（F-133）。空（デフォルト）なら WASM 無効で
+    /// 従来の splice/ゼロコピー転送経路を使う（ホットパス絶対規則: 追加コストなし）。
+    /// 指定すると splice を使わずユーザー空間バッファ経由の転送へ切り替わる
+    /// （データを WASM に見せる必要があるため）。
+    #[cfg(feature = "wasm")]
+    #[serde(default)]
+    pub wasm_modules: Vec<String>,
 }
 
 fn default_l4_connect_timeout() -> u64 {
@@ -4976,6 +4992,24 @@ fn validate_config(config: &Config) -> io::Result<()> {
         }
     }
 
+    // L4 リスナーの WASM モジュール参照チェック（F-133）
+    #[cfg(all(feature = "wasm", feature = "l4-proxy"))]
+    if let Some(ref wasm_cfg) = config.wasm {
+        for l4 in config.l4.iter().flatten() {
+            for module_name in &l4.wasm_modules {
+                if !wasm_cfg.modules.iter().any(|m| &m.name == module_name) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "L4 listener '{}' references unknown WASM module: {}",
+                            l4.name, module_name
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -5137,10 +5171,16 @@ fn load_tls_config(
     ktls_enabled: bool,
     #[allow(unused_variables)] http2_enabled: bool,
 ) -> io::Result<Arc<ServerConfig>> {
-    let cert_file = File::open(&tls_config.cert_path)?;
-    let key_file = File::open(&tls_config.key_path)?;
+    // F-136: cert/key 読み取りは単一チョークポイント `tls_reload::read_pem` を経由する。
+    // 通常（Linux/macOS/Windows/OpenBSD）は `std::fs::read` と完全に等価。FreeBSD
+    // capability mode 下で `security::capsicum::init_tls_cert_dirfds` が該当パスを
+    // 登録済みの場合のみ dirfd 相対の `openat`（`O_RESOLVE_BENEATH`）へ切り替わる。
+    // これにより H1/H2（rustls）は「PEM をバイト列として読み、ライブラリにパスを渡さない」
+    // という既存の設計のまま、capability mode 下でも証明書リロードが継続動作する。
+    let cert_pem = crate::tls_reload::read_pem(Path::new(&tls_config.cert_path))?;
+    let key_pem = crate::tls_reload::read_pem(Path::new(&tls_config.key_path))?;
 
-    let cert_reader = BufReader::new(cert_file);
+    let cert_reader = BufReader::new(cert_pem.as_slice());
     let cert_chain: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(cert_reader)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| {
@@ -5150,7 +5190,7 @@ fn load_tls_config(
             )
         })?;
 
-    let key_reader = BufReader::new(key_file);
+    let key_reader = BufReader::new(key_pem.as_slice());
     let keys: PrivateKeyDer<'static> = PrivateKeyDer::from_pem_reader(key_reader).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,

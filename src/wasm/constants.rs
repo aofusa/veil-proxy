@@ -99,6 +99,14 @@ pub const GRPC_RECEIVE_BUFFER: i32 = 5;
 pub const VM_CONFIGURATION: i32 = 6;
 /// Plugin configuration
 pub const PLUGIN_CONFIGURATION: i32 = 7;
+/// Call data（`proxy_on_foreign_function` 呼び出し時に渡される引数バッファ）。
+///
+/// F-134: veil はホスト側から Wasm ゲストの `proxy_on_foreign_function` を
+/// 呼び出す経路（Envoy 拡張、ABI 上はオプション）を実装していないため、
+/// この型は常に「認識はするが中身は空」として扱う（未対応型として
+/// `BadArgument` を返すのは不適合。詳細は
+/// `docs/backlog/features/F-138-proxy-wasm-buffer-maptype-gaps.md`）。
+pub const CALL_DATA: i32 = 8;
 
 // ============================================================
 // proxy_stream_type_t - Stream types

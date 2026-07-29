@@ -1,0 +1,19 @@
+[package]
+name = "network-filter"
+version = "0.1.0"
+edition = "2021"
+description = "Sample Proxy-Wasm L4 network filter for veil-proxy (F-133)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+proxy-wasm = "0.2"
+log = "0.4"
+
+[profile.release]
+lto = true
+opt-level = "s"
+
+# Exclude from parent workspace
+[workspace]
