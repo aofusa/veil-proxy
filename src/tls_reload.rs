@@ -11,13 +11,69 @@
 //! - SIGHUP 受信時: `reload_now()` を呼ぶ（main.rs のリロードスレッド）
 //! - 定期チェック（既定 60 秒）: `check_and_reload()` を呼ぶ
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use arc_swap::ArcSwap;
 use rustls::ServerConfig;
+
+// ============================================================================
+// F-136: cert/key 読み取りの単一チョークポイント
+// ============================================================================
+//
+// FreeBSD の capability mode（`cap_enter`）下では絶対パスの `open`/`stat` が
+// `ECAPMODE` で禁止されるため、`security::capsicum::init_tls_cert_dirfds` が
+// `cap_enter` 前に確保した dirfd 経由の `openat`/`fstatat`（`O_RESOLVE_BENEATH`）へ
+// 切り替える。Linux/macOS/Windows/OpenBSD は挙動を一切変えず `std::fs` のまま
+// （OpenBSD の pledge/unveil はパス単位の許可のため、cert/key を unveil していれば
+// 素の `std::fs` で引き続き動作する）。
+//
+// この 2 関数（`read_pem`/`pem_mtime`）が cert/key への唯一の読み取り経路であり、
+// `combined_mtime`（mtime ポーリング）と `reload_http3_certs`（HTTP/3 用 PEM 再読込）が
+// 経由する。`src/config.rs` の `load_tls_config`（H1/H2 rustls 用 `ServerConfig` 構築、
+// 起動時・リロード時の両方から呼ばれる）も同じ関数を経由する。
+
+/// cert/key の PEM バイト列を読み込む（単一チョークポイント）。
+///
+/// 通常は `std::fs::read` と完全に等価。FreeBSD capability mode 下で
+/// `init_tls_cert_dirfds` が該当パスを登録済みの場合のみ dirfd 相対の `openat` を使う。
+// 理由付き allow: TLS リロードのコールドパス（起動時 / SIGHUP / 定期チェックスレッド。
+// イベントループ非経由）。dirfd 経路が使えない場合のフォールバックとして std::fs::read が要る。
+#[allow(clippy::disallowed_methods)]
+pub fn read_pem(path: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(target_os = "freebsd")]
+    {
+        if let Some(result) = crate::security::capsicum::open_tls_pem_ro(path) {
+            use std::io::Read;
+            let mut file = result?;
+            let mut buf = Vec::new();
+            file.read_to_end(&mut buf)?;
+            return Ok(buf);
+        }
+    }
+    std::fs::read(path)
+}
+
+/// cert/key の mtime を取得する（単一チョークポイント）。
+///
+/// 通常は `std::fs::metadata(path)?.modified()` と完全に等価。FreeBSD capability mode 下で
+/// `init_tls_cert_dirfds` が該当パスを登録済みの場合のみ dirfd 相対の `fstatat` を使う。
+// 理由付き allow: 上記 read_pem と同じくコールドパス専用。
+#[allow(clippy::disallowed_methods)]
+pub fn pem_mtime(path: &Path) -> std::io::Result<SystemTime> {
+    #[cfg(target_os = "freebsd")]
+    {
+        if let Some(result) = crate::security::capsicum::stat_tls_pem(path) {
+            let st = result?;
+            return st.mtime.ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::Other, "fstatat: mtime unavailable")
+            });
+        }
+    }
+    std::fs::metadata(path)?.modified()
+}
 
 /// 証明書ビルダー型
 ///
@@ -253,11 +309,12 @@ impl TlsCertReloader {
     }
 
     /// 証明書と秘密鍵の mtime のうち新しい方を返す。
-    // 理由付き allow: 専用 TLS リロードスレッドから呼ばれる mtime 検査（イベントループ外・500ms 周期）。
-    #[allow(clippy::disallowed_methods)]
-    fn combined_mtime(cert: &PathBuf, key: &PathBuf) -> anyhow::Result<SystemTime> {
-        let cert_m = std::fs::metadata(cert)?.modified()?;
-        let key_m = std::fs::metadata(key)?.modified()?;
+    ///
+    /// F-136: 実際の読み取りは単一チョークポイント `pem_mtime` に集約済み
+    /// （FreeBSD capability mode 下では dirfd 相対 `fstatat` を使う）。
+    fn combined_mtime(cert: &Path, key: &Path) -> anyhow::Result<SystemTime> {
+        let cert_m = pem_mtime(cert)?;
+        let key_m = pem_mtime(key)?;
         Ok(cert_m.max(key_m))
     }
 
@@ -311,15 +368,15 @@ impl TlsCertReloader {
     /// HTTP/3 (quiche) ワーカーへ新しい cert/key PEM を配信する（F-105）。
     ///
     /// HTTP/3 ワーカーが 1 台も登録されていない場合は何もしない。
-    // 理由付き allow: 専用 TLS リロードスレッドから呼ばれる cert/key の再読込（イベントループ外・
-    // 数ヶ月に 1 回のコールドパス）。生 PEM は quiche へ memfd 経由でロードするため生バイトが要る。
-    #[allow(clippy::disallowed_methods)]
+    ///
+    /// F-136: 実際の読み取りは単一チョークポイント `read_pem` に集約済み
+    /// （FreeBSD capability mode 下では dirfd 相対 `openat` を使う）。
     fn reload_http3_certs(&self) -> anyhow::Result<()> {
         if HTTP3_WORKER_COUNT.load(Ordering::Relaxed) == 0 {
             return Ok(());
         }
-        let cert_pem = std::fs::read(&self.cert_path)?;
-        let key_pem = std::fs::read(&self.key_path)?;
+        let cert_pem = read_pem(&self.cert_path)?;
+        let key_pem = read_pem(&self.key_path)?;
         publish_http3_certs(cert_pem, key_pem);
         Ok(())
     }

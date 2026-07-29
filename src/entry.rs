@@ -940,6 +940,12 @@ pub fn run() {
                     _ => None,
                 })
                 .collect();
+            // F-136: capability mode 下でも TLS 証明書ホットリロードを動作させるため、
+            // cert/key の親ディレクトリ fd を **cap_enter 前** に登録する。auto_reload が
+            // 無効なら TLS リロードスレッド自体が起動しないため登録は不要。
+            let tls_auto_reload = loaded_config.tls_auto_reload;
+            let tls_cert_path = std::path::PathBuf::from(&loaded_config.tls_cert_path);
+            let tls_key_path = std::path::PathBuf::from(&loaded_config.tls_key_path);
             std::thread::Builder::new()
                 .name("veil-cap-enter".to_string())
                 .spawn(move || {
@@ -961,6 +967,38 @@ pub fn run() {
                                     "capsicum: 静的ルート dirfd 登録に失敗（capability mode 下で\
                                      静的配信が 404 になる可能性）: {}",
                                     e
+                                );
+                            }
+                            // F-136: TLS 証明書 dirfd の登録（auto_reload 有効時のみ）。
+                            if tls_auto_reload {
+                                match crate::security::capsicum::init_tls_cert_dirfds(
+                                    &tls_cert_path,
+                                    &tls_key_path,
+                                ) {
+                                    Ok(()) => info!(
+                                        "capsicum: TLS certificate hot-reload will remain functional under capability mode (dirfd relative openat/fstatat)"
+                                    ),
+                                    Err(e) => error!(
+                                        "capsicum: TLS 証明書 dirfd 登録に失敗（capability mode 下で\
+                                         証明書ホットリロードが機能しなくなる可能性）: {}",
+                                        e
+                                    ),
+                                }
+                                // F-137: system-tls 有効時、HTTP/3（quiche）の証明書ロードは
+                                // in-memory SSL_CTX API（boring）ではなく従来のパス経由
+                                // （fopen(3) 相当）にフォールバックする（Cargo.toml の
+                                // `system-tls` feature コメント参照）。dirfd 相対 openat/fstatat
+                                // は veil 自身の `read_pem`/`pem_mtime` チョークポイントのみを
+                                // 経由するため、quiche/BoringSSL/OpenSSL が内部で直接呼ぶ
+                                // `fopen(3)`（＝素の `open(2)`）は capability mode 下で
+                                // `ECAPMODE` になり回避できない。H1/H2（rustls、常にバイト列
+                                // 読み込み）のホットリロードは影響を受けない。
+                                #[cfg(all(feature = "system-tls", feature = "http3"))]
+                                warn!(
+                                    "capsicum: `system-tls` + `http3` 構成では HTTP/3 の証明書 \
+                                     ホットリロードは capability mode 下で機能しない（quiche が \
+                                     内部で fopen(3)/open(2) を直接呼ぶため dirfd 経由の openat \
+                                     で代替できない）。H1/H2 のホットリロードは引き続き機能する"
                                 );
                             }
                             match crate::security::capsicum::enter_capability_mode() {

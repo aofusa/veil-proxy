@@ -2695,6 +2695,156 @@ pub mod capsicum {
         }))
     }
 
+    // ------------------------------------------------------------------
+    // F-136: capability mode 下の TLS 証明書ホットリロード（cert/key の dirfd 相対化）
+    //
+    // F-123 の静的配信 dirfd と同じ仕組みで、cert/key **各ファイルの親ディレクトリ** fd を
+    // `cap_enter` 前に確保しておく。`src/tls_reload.rs` の単一チョークポイント
+    // （`read_pem`/`pem_mtime`）がここを経由して `openat`/`fstatat`（`O_RESOLVE_BENEATH`）で
+    // 読み書きすることで、capability mode 下でも証明書リロードが継続動作する。
+    //
+    // 静的配信の登録（複数ディレクトリ・prefix 照合）と異なり、こちらは cert/key の
+    // **具体的な 1 ファイルずつ**を登録する（config で指定された元のパス値をキーに、
+    // 対応する dirfd + ファイル名 CString を引く）。
+    // ------------------------------------------------------------------
+
+    /// 登録済み TLS 証明書ファイル（config パス原形 → (親ディレクトリ dirfd, ファイル名)）。
+    static TLS_CERT_ENTRY: OnceLock<(PathBuf, RawFd, CString)> = OnceLock::new();
+    /// 登録済み TLS 秘密鍵ファイル（同上）。
+    static TLS_KEY_ENTRY: OnceLock<(PathBuf, RawFd, CString)> = OnceLock::new();
+    /// TLS 証明書の dirfd 相対化が有効か（`init_tls_cert_dirfds` 成功後に true）。
+    static TLS_CERT_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+    /// 1 ファイルの親ディレクトリを open し、(dirfd, ファイル名 CString) を返す。
+    ///
+    /// canonicalize は絶対パス操作のため `cap_enter` 前にのみ呼ぶ（呼び出し元が保証する）。
+    fn open_parent_dirfd(path: &Path) -> io::Result<(RawFd, CString)> {
+        let canonical = path.canonicalize()?;
+        let parent = canonical.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("path {:?} has no parent directory", canonical),
+            )
+        })?;
+        let filename = canonical.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("path {:?} has no file name", canonical),
+            )
+        })?;
+        let parent_c = CString::new(parent.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+        let fd = unsafe {
+            libc::open(
+                parent_c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // TLS 証明書/秘密鍵ディレクトリは静的配信ルートと同じ最小権利で十分
+        // （CAP_LOOKUP による openat 相対解決 + CAP_FSTAT による fstatat）。
+        limit_static_dir_rights(fd)?;
+        let filename_c = CString::new(filename.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "file name contains NUL"))?;
+        Ok((fd, filename_c))
+    }
+
+    /// cert/key の親ディレクトリ fd を open し、登録する（**`cap_enter` 前**に呼ぶこと）。
+    ///
+    /// 以降 `read_pem`/`pem_mtime`（`src/tls_reload.rs`）が capability mode 下で
+    /// これらの登録済みパスに対する読み取り・mtime 取得を dirfd 相対化できるようになる。
+    /// cert と key が同じディレクトリにあっても、それぞれ独立して dirfd を open する
+    /// （F-123 の静的ルートのような重複排除は行わない。TLS 証明書は高々 2 ファイルのため
+    /// 単純さを優先する）。
+    pub fn init_tls_cert_dirfds(cert: &Path, key: &Path) -> io::Result<()> {
+        let (cert_fd, cert_name) = open_parent_dirfd(cert)?;
+        let (key_fd, key_name) = open_parent_dirfd(key)?;
+        let _ = TLS_CERT_ENTRY.set((cert.to_path_buf(), cert_fd, cert_name));
+        let _ = TLS_KEY_ENTRY.set((key.to_path_buf(), key_fd, key_name));
+        TLS_CERT_ACTIVE.store(true, Ordering::Release);
+        info!(
+            "capsicum: TLS 証明書/秘密鍵の dirfd を登録（cert={:?}, key={:?}）",
+            cert, key
+        );
+        Ok(())
+    }
+
+    /// TLS 証明書の dirfd 相対化が有効か（ホットパスではなく TLS リロードの低頻度パスで
+    /// 呼ばれるだけなので relaxed-acquire の単純ロードで十分）。
+    #[inline]
+    pub fn tls_cert_dirfds_active() -> bool {
+        TLS_CERT_ACTIVE.load(Ordering::Acquire)
+    }
+
+    /// 登録済み cert/key パスのいずれかに一致すれば (dirfd, ファイル名) を返す。
+    /// 一致しない、または未登録の場合は `None`（呼び出し側は通常経路 std::fs へフォールバック）。
+    fn resolve_tls_path(abs: &Path) -> Option<(RawFd, &'static CString)> {
+        if !tls_cert_dirfds_active() {
+            return None;
+        }
+        if let Some((p, fd, name)) = TLS_CERT_ENTRY.get() {
+            if p == abs {
+                return Some((*fd, name));
+            }
+        }
+        if let Some((p, fd, name)) = TLS_KEY_ENTRY.get() {
+            if p == abs {
+                return Some((*fd, name));
+            }
+        }
+        None
+    }
+
+    /// capability mode 下で登録済み cert/key を dirfd 相対に読み取り専用 open する。
+    /// `None` = 相対化対象外（未登録パス。呼び出し側は通常の絶対パス経路にフォールバック）。
+    /// `Some(Err)` = 相対化対象だが openat 失敗。
+    pub fn open_tls_pem_ro(abs: &Path) -> Option<io::Result<std::fs::File>> {
+        let (dirfd, name) = resolve_tls_path(abs)?;
+        let fd = unsafe {
+            libc::openat(
+                dirfd,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | O_RESOLVE_BENEATH,
+            )
+        };
+        if fd < 0 {
+            Some(Err(io::Error::last_os_error()))
+        } else {
+            // SAFETY: openat が返した所有権のある有効な fd。
+            Some(Ok(unsafe { std::fs::File::from_raw_fd(fd) }))
+        }
+    }
+
+    /// capability mode 下で登録済み cert/key の mtime を `fstatat` で取得する
+    /// （`std::fs::metadata().modified()` 代替）。
+    pub fn stat_tls_pem(abs: &Path) -> Option<io::Result<StaticStat>> {
+        let (dirfd, name) = resolve_tls_path(abs)?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let ret = unsafe { libc::fstatat(dirfd, name.as_ptr(), &mut st, AT_RESOLVE_BENEATH) };
+        if ret != 0 {
+            return Some(Err(io::Error::last_os_error()));
+        }
+        let is_file = (st.st_mode & libc::S_IFMT) == libc::S_IFREG;
+        let is_dir = (st.st_mode & libc::S_IFMT) == libc::S_IFDIR;
+        let mtime = {
+            let secs = st.st_mtime;
+            let nsecs = st.st_mtime_nsec;
+            if secs >= 0 {
+                Some(UNIX_EPOCH + Duration::new(secs as u64, nsecs as u32))
+            } else {
+                None
+            }
+        };
+        Some(Ok(StaticStat {
+            len: st.st_size as u64,
+            mtime,
+            is_file,
+            is_dir,
+        }))
+    }
+
     /// jail 名から jid を解決し `jail_attach(2)` する（root 前提）。
     ///
     /// `jail_get(2)`（`<sys/jail.h>`）へ `{"name", jail_name}` の iovec ペアを渡して jid を

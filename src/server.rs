@@ -633,6 +633,106 @@ pub fn spawn_wasm_tick_thread() {
                         response,
                     ));
                 }
+
+                // F-134: pending gRPC 呼び出し（proxy_grpc_call / proxy_grpc_stream +
+                // proxy_grpc_send(end_of_stream) が登録した分）の実行。
+                // 従来は登録するだけで実行ループが存在せず、proxy_on_grpc_receive*/
+                // proxy_on_grpc_close が永遠に呼ばれない不適合だった。HTTP call と
+                // 同じ tick スレッド（cold path）上でブロッキング gRPC-over-h2c
+                // ユーナリー呼び出しを実行する。
+                #[cfg(feature = "grpc")]
+                {
+                    let pending_grpc_calls =
+                        crate::wasm::host::grpc_executor::take_global_pending_grpc_calls();
+                    for pending in pending_grpc_calls {
+                        let upstream_name = &pending.upstream;
+
+                        debug!(
+                            "[wasm:grpc_call] Processing pending call: module='{}' call_id={} upstream='{}'",
+                            pending.module_name, pending.call_id, upstream_name
+                        );
+
+                        let upstream_groups = &config.upstream_groups;
+                        let (status_code, status_message, initial_metadata, message, trailing_metadata) =
+                            if let Some(group) = upstream_groups.get(upstream_name) {
+                                if let Some(server) = group.select("0.0.0.0") {
+                                    let host = server.host();
+                                    let port = server.port();
+                                    match crate::wasm::host::grpc_executor::execute_grpc_unary_call(
+                                        host,
+                                        port,
+                                        &pending.path,
+                                        &pending.initial_metadata,
+                                        &pending.messages,
+                                        pending.timeout_ms,
+                                    ) {
+                                        Ok(result) => (
+                                            result.status_code,
+                                            result.status_message,
+                                            result.initial_metadata,
+                                            result.message,
+                                            result.trailing_metadata,
+                                        ),
+                                        Err(e) => {
+                                            warn!(
+                                                "[wasm:grpc_call] call to '{}' failed: {}",
+                                                upstream_name, e
+                                            );
+                                            (
+                                                crate::wasm::grpc_status::UNAVAILABLE,
+                                                format!("gRPC call failed: {e}"),
+                                                Vec::new(),
+                                                Vec::new(),
+                                                Vec::new(),
+                                            )
+                                        }
+                                    }
+                                } else {
+                                    warn!(
+                                        "[wasm:grpc_call] No healthy servers in upstream '{}' for module '{}'",
+                                        upstream_name, pending.module_name
+                                    );
+                                    (
+                                        crate::wasm::grpc_status::UNAVAILABLE,
+                                        "No healthy upstream servers available".to_string(),
+                                        Vec::new(),
+                                        Vec::new(),
+                                        Vec::new(),
+                                    )
+                                }
+                            } else {
+                                warn!(
+                                    "[wasm:grpc_call] Upstream '{}' not found for module '{}'",
+                                    upstream_name, pending.module_name
+                                );
+                                (
+                                    crate::wasm::grpc_status::UNIMPLEMENTED,
+                                    format!("Upstream '{upstream_name}' not found"),
+                                    Vec::new(),
+                                    Vec::new(),
+                                    Vec::new(),
+                                )
+                            };
+
+                        let mut trailing = trailing_metadata;
+                        trailing.push(("grpc-status".to_string(), status_code.to_string()));
+                        if !status_message.is_empty() {
+                            trailing.push(("grpc-message".to_string(), status_message));
+                        }
+
+                        crate::wasm::process_grpc_response(
+                            wasm_engine,
+                            crate::wasm::GrpcCallResponse {
+                                module_name: pending.module_name,
+                                call_id: pending.call_id,
+                                status_code,
+                                initial_metadata,
+                                message,
+                                trailing_metadata: trailing,
+                            },
+                        );
+                    }
+                }
             }
         }
     });
