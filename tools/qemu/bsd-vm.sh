@@ -731,6 +731,10 @@ _guest_env_prefix() {
 # BSD 向けの既定 feature セット（Cargo.toml）。
 #   full-freebsd : full と同じ機能セット + アロケータを jemalloc + POSIX AIO(F-127) 有効
 #   full-openbsd : full と同じ機能セット + システムアロケータ（mimalloc/jemalloc を使わない）
+#                  + system-tls（F-137、システムの LibreSSL へ動的リンク。既定の
+#                  packaging 構成）。従来の同梱（vendored）構成が必要な場合は
+#                  `CARGO_FEATURES=full-openbsd-vendor`（aarch64 は
+#                  `full-openbsd-aarch64-vendor`）を明示指定する。
 # どちらも `--no-default-features` と併用する（default features の mimalloc を外すため）。
 # aarch64 は wasmtime がビルドできないため wasm 抜きのセットを使う（B-55）。
 _default_features() {
