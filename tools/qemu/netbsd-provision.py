@@ -52,16 +52,52 @@ def connect(con_port: int, timeout: int = 180):
 def try_switch_to_serial(child) -> None:
     """NetBSD x86 のブートメニューでシリアルコンソールへの切り替えを試みる。
 
-    メニューが見えない（＝既にシリアルへ出ている、または起動が速すぎて通過した）
-    場合は何もせず戻る。失敗しても致命的ではない設計にしてある。
+    実機コンソール（B-55 調査で確認済み）では、カーネルコンソールが既定で VGA
+    （`ttyE0`）に向いており、ブートローダのメニューだけがシリアルにも出力される:
+
+        NetBSD/x86 ffsv1 Primary Bootstrap
+          1. Boot normally
+          2. Boot single user
+          3. Drop to boot prompt
+        Choose an option; RETURN for default; SPACE to stop countdown.
+
+    カウントダウンは既定 5 秒しかなく、`>>` のようなブートプロンプトはこの時点
+    ではまだ出ない（"3. Drop to boot prompt" を選んで初めて `>` プロンプトに
+    落ちる）。そのため:
+      1. "Choose an option" を検出したら、まず SPACE でカウントダウンを止める
+         （5 秒の猶予をあてにせず、確実に操作できる状態にする）。
+      2. "3" を送って boot prompt へ落ちる。
+      3. boot prompt で `consdev com0` を送りシリアルへ切り替え、`boot` で続行。
+
+    メニューが見えない（＝既にシリアルへ出ている、または速すぎて通過した）
+    場合は何もせず戻る。失敗しても致命的ではない設計にしてある
+    （その場合ログイン待ちがタイムアウトし、呼び出し元で気付ける）。
     """
-    i = child.expect([r">>\s*$", r"login:", r"Last message repeated", TIMEOUT], timeout=90)
+    i = child.expect([r"Choose an option", r">\s*$", r"login:", r"Last message repeated", TIMEOUT],
+                      timeout=90)
     if i == 0:
-        print("\n(boot prompt '>>' detected; trying 'consdev com0')", flush=True)
+        print("\n(boot menu 'Choose an option' detected; stopping countdown and selecting"
+              " '3. Drop to boot prompt')", flush=True)
+        child.send(" ")  # SPACE: カウントダウン停止（5 秒の猶予に賭けない）
+        # SPACE でカウントダウンを止めると "Option: [1]:" という行入力プロンプトに
+        # なる（実測: 数字キー即時選択ではなく、Enter で確定するテキスト入力）。
+        child.expect([r"Option:\s*\[1\]:", TIMEOUT], timeout=10)
+        child.sendline("3")
+        j = child.expect([r">\s*$", TIMEOUT], timeout=30)
+        if j == 0:
+            print("\n(boot prompt '>' detected; sending 'consdev com0' then 'boot')", flush=True)
+            child.sendline("consdev com0")
+            time.sleep(1.0)
+            child.sendline("boot")
+        else:
+            print("\n(boot prompt not reached after selecting option 3; continuing anyway)",
+                  flush=True)
+    elif i == 1:
+        print("\n(boot prompt '>' detected directly; trying 'consdev com0')", flush=True)
         child.sendline("consdev com0")
         time.sleep(1.0)
         child.sendline("boot")
-    elif i == 1:
+    elif i == 2:
         # 既にログインプロンプトが見えている＝シリアルは既定で有効だった。
         # login() 側で再度 expect するので、ここでは何もしない。
         pass
@@ -113,6 +149,17 @@ def login_and_inject_key(child, password: str, pubkey_path: str) -> None:
         "echo 'PubkeyAuthentication yes' >> /etc/ssh/sshd_config")
     run("/etc/rc.d/sshd restart 2>/dev/null || /etc/rc.d/sshd start", t=180)
     run("wc -l /root/.ssh/authorized_keys")
+
+    # 恒久化: 次回以降の起動でブートメニュー操作（3 を選んで consdev com0 を打つ）
+    # をせずに済むよう、/boot.cfg の先頭へ `consdev=com0` を書き込む。
+    # boot.cfg(5) のグローバルディレクティブで、ブートローダ自身の表示と
+    # カーネルへ渡す consdev の双方に効く（`/etc/ttys` の `console` エントリは
+    # カーネルコンソールに追従するため、これだけでシリアルに getty が出る）。
+    # 既存の consdev= 行は除去してから先頭に差し込む（冪等・再実行安全）。
+    run("test -f /boot.cfg && cp /boot.cfg /boot.cfg.orig 2>/dev/null; "
+        "{ echo 'consdev=com0'; grep -v '^consdev=' /boot.cfg 2>/dev/null; } > /boot.cfg.new && "
+        "mv /boot.cfg.new /boot.cfg")
+    run("cat /boot.cfg")
     run("sync")
     print("PROVISIONED_SSH", flush=True)
 

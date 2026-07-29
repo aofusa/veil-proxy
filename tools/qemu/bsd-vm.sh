@@ -619,8 +619,15 @@ cmd_provision() {
             # 同じ発想でシリアルへ root ログインして SSH 鍵を注入する。
             log "NetBSD live image を起動し、シリアルから root ログインして SSH 鍵を注入"
             cmd_down
-            cmd_up
-            sleep 5
+            # `nowait` + 固定 sleep だと、ブートローダのメニュー選択猶予（既定 5 秒の
+            # カウントダウン）が qemu 起動〜python 接続までのオーバーヘッドだけで
+            # 使い切られてしまい、シリアルコンソールへの切り替え操作（consdev com0）
+            # が間に合わない（実測: B-52/B-54 と同種の取りこぼし）。
+            # OpenBSD/NetBSD(aarch64) の install フェーズに倣い、`CONSOLE_WAIT=1`
+            # （`-serial ...,server,wait`）でコンソール接続まで出力を保持させ、
+            # メニューのカウントダウンを丸ごと使えるようにする。
+            CONSOLE_WAIT=1 cmd_up
+            unset CONSOLE_WAIT
             python3 "${HERE}/netbsd-provision.py" --con-port "${CON_PORT}" \
                 --pubkey "${KEY}.pub" --password "${VM_ROOT_PASSWORD}"
             log "SSH 到達を確認"
