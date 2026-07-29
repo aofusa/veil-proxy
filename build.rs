@@ -17,12 +17,43 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_EPOLL");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_KTLS");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_AIO");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SYSTEM_TLS");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_VENDORED_TLS");
 
+    check_tls_backend_exclusivity();
     emit_runtime_backend_cfg();
 }
 
 fn feature_enabled(name: &str) -> bool {
     std::env::var(format!("CARGO_FEATURE_{name}")).is_ok()
+}
+
+/// `vendored-tls`（同梱 aws-lc-rs/aws-lc-sys/ring）と `system-tls`（システムの
+/// OpenSSL/LibreSSL への動的リンク）は排他（F-137）。
+///
+/// 両方を有効にすると、aws-lc-sys のビルド成果物に含まれる `libssl.a`/`libcrypto.a`
+/// （`AWS_LC_SYS_NO_PREFIX` の値に関わらずこの名前で生成される）が最終リンクコマンドの
+/// `-L` 探索順でシステムの動的 libssl/libcrypto より先に来てしまい、`rustls-openssl`/
+/// quiche が要求するシンボルの一部（aws-lc-sys に無い新しめの OpenSSL 3.0 系 API）が
+/// undefined symbol になってリンクが壊れる（`http3` を外した最小構成でも再現し、
+/// quiche の feature 選択とは無関係の問題であることを確認済み。
+/// `docs/backlog/features/F-137-system-tls-feature.md` 参照）。
+/// 意味不明なリンクエラーで悩ませないよう、依存関係の解決前にビルドを止めて
+/// 原因と対処法を明示する。
+fn check_tls_backend_exclusivity() {
+    if feature_enabled("VENDORED_TLS") && feature_enabled("SYSTEM_TLS") {
+        panic!(
+            "veil build.rs: `vendored-tls` and `system-tls` cannot be enabled together \
+             (F-137). `vendored-tls` pulls in aws-lc-rs/aws-lc-sys (or ring on OpenBSD), \
+             whose build artifacts contain files literally named libssl.a/libcrypto.a; \
+             linking those alongside `system-tls`'s dynamic system libssl/libcrypto \
+             fails with undefined-symbol errors regardless of the http3/quiche feature \
+             selection. Use `--no-default-features` together with a feature set that \
+             does not include `vendored-tls`, e.g. `full-system-tls` (Linux), \
+             `full-freebsd-system-tls` (FreeBSD), or `full-openbsd` (OpenBSD, already \
+             system-tls by default). See docs/backlog/features/F-137-system-tls-feature.md."
+        );
+    }
 }
 
 /// ランタイムバックエンド選択用の cfg エイリアスを発行する（F-120 Phase 1）。
@@ -34,7 +65,7 @@ fn feature_enabled(name: &str) -> bool {
 /// | `veil_poller_epoll` | `target_os = "linux"` かつ `feature = "epoll"` | reactor の poller = epoll |
 /// | `veil_poller_kqueue` | `target_os = "freebsd"`、`"openbsd"`、`"macos"` | reactor の poller = kqueue |
 /// | `veil_poller_wsapoll` | `target_os = "windows"` | reactor の poller = WSAPoll（F-125、cfg 発行のみ。実装は別作業） |
-/// | `veil_ktls` | `feature = "ktls"` かつ (`target_os = "linux"` または `"freebsd"`) | kTLS カーネルオフロード経路（F-126: FreeBSD 対応追加。OpenBSD は非対応のまま） |
+/// | `veil_ktls` | `feature = "ktls"` かつ (`target_os = "linux"` または `"freebsd"`) かつ `not(feature = "system-tls")` | kTLS カーネルオフロード経路（F-126: FreeBSD 対応追加。OpenBSD は非対応のまま。F-137: `system-tls` と同時指定時は自動的に無効化し `cargo:warning` を出す） |
 /// | `veil_aio` | `feature = "aio"` かつ `target_os = "freebsd"` | POSIX AIO（`aio_read`/`aio_write` + `EVFILT_AIO`）による TCP read/write 経路（F-127。FreeBSD 専用、既定オフ） |
 ///
 /// `cargo::rustc-check-cfg` も併せて発行し、`unexpected_cfgs` 警告を防ぐ。
@@ -52,6 +83,7 @@ fn emit_runtime_backend_cfg() {
     let epoll = feature_enabled("EPOLL");
     let ktls = feature_enabled("KTLS");
     let aio = feature_enabled("AIO");
+    let system_tls = feature_enabled("SYSTEM_TLS");
 
     match target_os.as_str() {
         "linux" => {
@@ -101,7 +133,19 @@ fn emit_runtime_backend_cfg() {
     }
 
     if ktls && (target_os == "linux" || target_os == "freebsd") {
-        println!("cargo::rustc-cfg=veil_ktls");
+        if system_tls {
+            // F-137: veil_ktls は aws_lc_rs 固有の cipher_suite 定数を直接参照する
+            // （src/tls_provider.rs 参照）ため、`system-tls`（rustls-openssl）とは
+            // 併用できない。cfg を立てず kTLS を自動的に無効化する。
+            println!(
+                "cargo:warning=veil: `ktls` feature is disabled automatically because \
+                 `system-tls` is also enabled (kTLS relies on aws_lc_rs-specific cipher \
+                 suite constants that are unavailable under system-tls; F-137). Remove \
+                 `ktls` from the feature list to silence this warning."
+            );
+        } else {
+            println!("cargo::rustc-cfg=veil_ktls");
+        }
     }
 
     // F-127: POSIX AIO(FreeBSD の aio_read/aio_write + EVFILT_AIO)は FreeBSD 専用。

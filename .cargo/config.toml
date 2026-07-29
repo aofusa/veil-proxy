@@ -3,14 +3,18 @@
 # 背景:
 #   `http3` フィーチャーは quiche を使う。quiche の暗号バックエンドはターゲットで異なる
 #   （Cargo.toml の target 別依存を参照）:
-#     - linux / freebsd        : quiche(default-features=false) が rustls(aws-lc-rs) と
+#     - linux                   : quiche(default-features=false) が rustls(aws-lc-rs) と
 #                                同一の aws-lc-sys を共有する。quiche は BoringSSL 互換の
 #                                **非プレフィックス**シンボルを要求するため NO_PREFIX=1。
-#     - windows / macos        : quiche(boring) が内蔵 BoringSSL を持つ。aws-lc-rs と
-#                                共存させるには aws-lc-sys 側のシンボルを**プレフィックス
-#                                したまま**にする必要があるため NO_PREFIX=0
-#                                （0 のままにしないと BoringSSL とシンボルが衝突する）。
-#     - openbsd                : rustls は ring、quiche は内蔵 BoringSSL。aws-lc-sys は
+#     - freebsd / windows / macos: quiche(boringssl-boring-crate) が外部 `boring` crate
+#                                （BoringSSL）を持つ。aws-lc-rs と共存させるには aws-lc-sys
+#                                側のシンボルを**プレフィックスしたまま**にする必要がある
+#                                ため NO_PREFIX=0（0 のままにしないと BoringSSL とシンボルが
+#                                衝突する）。FreeBSD は F-136 で aws-lc-sys 共有からこちらへ
+#                                切り替えた（証明書ホットリロードの in-memory SSL_CTX API が
+#                                boringssl-boring-crate 限定のため。B-47 の失敗モードと同じ
+#                                重複シンボルを避ける）。
+#     - openbsd                : rustls は ring、quiche は boringssl-boring-crate。aws-lc-sys は
 #                                依存グラフに現れないが、一貫性のため NO_PREFIX=0 とする。
 #
 # なぜ `[env]` にターゲット接尾辞付きの変数名を並べるのか:
@@ -45,9 +49,15 @@ AWS_LC_SYS_NO_PREFIX_x86_64_unknown_linux_musl = { value = "1", force = true }
 AWS_LC_SYS_NO_PREFIX_aarch64_unknown_linux_gnu = { value = "1", force = true }
 AWS_LC_SYS_NO_PREFIX_aarch64_unknown_linux_musl = { value = "1", force = true }
 
-# --- FreeBSD: Linux と同じく aws-lc-sys 共有 ---
-AWS_LC_SYS_NO_PREFIX_x86_64_unknown_freebsd = { value = "1", force = true }
-AWS_LC_SYS_NO_PREFIX_aarch64_unknown_freebsd = { value = "1", force = true }
+# --- FreeBSD: F-136 で quiche を boringssl-boring-crate へ切替、aws-lc-sys 共有をやめた。
+#     証明書ホットリロードを capsicum capability mode 下でも動かすため quiche の
+#     in-memory SSL_CTX API（`with_boring_ssl_ctx_builder`）を使う必要があり、これは
+#     外部 `boring` crate 経由でのみ提供される。aws-lc-sys（NO_PREFIX=1）と BoringSSL を
+#     同一バイナリに同居させるとリンク時に重複シンボルエラーになる（実験で確認済み、
+#     docs/artifacts/f136_platform_design.md 参照）ため、Windows/macOS/OpenBSD と同じ
+#     NO_PREFIX=0（プレフィックス維持で共存）に変更する。
+AWS_LC_SYS_NO_PREFIX_x86_64_unknown_freebsd = { value = "0", force = true }
+AWS_LC_SYS_NO_PREFIX_aarch64_unknown_freebsd = { value = "0", force = true }
 
 # --- Windows: quiche は内蔵 BoringSSL。aws-lc-sys はプレフィックス維持で共存 ---
 AWS_LC_SYS_NO_PREFIX_x86_64_pc_windows_msvc = { value = "0", force = true }

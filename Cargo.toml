@@ -170,6 +170,75 @@ access-log = []
 # ビルド方法: cargo build --features l4-proxy
 l4-proxy = []
 
+# システムの SSL ライブラリ（OpenSSL / LibreSSL）へ動的リンクする（F-137）。
+#
+# **OpenBSD 専用**（将来 NetBSD にも同じ扱いで対応予定）。Linux/FreeBSD/macOS/Windows で
+# 指定すると `build.rs` がビルド開始時点で明確なエラーを出して止める
+# （`SYSTEM_TLS_ALLOWED_TARGET_OSES` 参照。NetBSD 対応時はこの配列に "netbsd" を
+# 1 行足すだけでよい形にしてある）。
+#
+# rustls の暗号プロバイダを `rustls-openssl`（システムの LibreSSL libcrypto を呼ぶ）へ
+# 切り替える。rustls 本体はそのまま使い、**依存する暗号ライブラリだけ**を差し替える。
+# HTTP/3（quiche）側は本 feature 単体では変更しない。`full-openbsd` が
+# `quiche?/openssl`（pkg-config 経由の動的リンク）を別途明示的に追加して同じシステム
+# ライブラリへ揃える。
+#
+# **なぜ OpenBSD 専用か**: Linux/FreeBSD は `aws-lc-rs`/`aws-lc-sys` が
+# `target_os` のみで決まる無条件の依存であり、どの Cargo feature を選んでも
+# 依存グラフから外れない。aws-lc-sys のビルド成果物には `AWS_LC_SYS_NO_PREFIX` の
+# 値に関わらず `libssl.a`/`libcrypto.a` という**システム OpenSSL と同名の静的
+# ライブラリ**が生成され、これが最終リンクコマンドの `-L` でシステムパスより先に
+# 来るため、`rustls-openssl`（openssl-sys 経由）が要求する動的 `-lssl -lcrypto` が
+# そちらに解決されてしまい、aws-lc-sys に無い新しめの OpenSSL 3.0 系シンボル
+# （`EVP_Q_digest`/`EVP_default_properties_is_fips_enabled`/`ERR_get_error_all` 等）が
+# undefined symbol になってリンクが壊れる（`http3` を完全に外した最小構成
+# `--features "http2,mimalloc,system-tls"` でも再現する、quiche の feature 選択とは
+# 無関係の問題であることを確認済み）。修正には aws-lc-rs/aws-lc-sys を
+# `optional = true` にして system-tls と排他的に切り替える必要があるが、これは
+# 「`cargo build --no-default-features`（フィーチャー無し単体）が動作し続ける」という
+# 既存の受け入れ条件と両立しない（Cargo のフィーチャーは加算のみで、一方が立っていたら
+# 他方を無効化するという否定的な表現ができないため）ため見送った。
+# **OpenBSD のみ**、quiche/rustls の依存を aws-lc-sys 共有から完全に切り離してある
+# （下の `[target.'cfg(target_os = "openbsd")'.dependencies]` 参照）ため、この衝突が
+# 起きない。詳細な調査ログは `docs/backlog/features/F-137-system-tls-feature.md` の
+# 「既知の限界・今後の課題」を参照。
+#
+# HTTP/3 証明書ホットリロードへの影響（`src/http3_server.rs`、OpenBSD限定の話）:
+# `system-tls` 有効時は quiche の in-memory `SSL_CTX` API（`boringssl-boring-crate`
+# 限定）が使えなくなるため、Linux と同じパス指定 API（`create_memfd_for_pem`、
+# OpenBSD 版は 0600 の一時ファイル、`std::env::temp_dir()` 配下、Drop で unlink）に
+# フォールバックする。unveil のビューに一時ディレクトリが必要で、
+# `src/config.rs::collect_unveil_paths` が `system-tls` 有効時のみ
+# `std::env::temp_dir()` を `read_write_create` に追加済み（`pledge` の
+# `wpath cpath` promise は既存のまま変更不要）。`system-tls` を使わない
+# `full-openbsd-vendor`（BoringSSL 同梱）は代わりに in-memory 経路（ファイル不使用、
+# サンドボックス耐性がより高い）を使う。FreeBSD（`system-tls` 非対象）は
+# 常に in-memory 経路のままで、capsicum capability mode 下でもホットリロードが
+# 機能する（F-136 の成果は無変更）。
+#
+# kTLS との併用: `veil_ktls` は aws_lc_rs 固有の cipher_suite 定数を直接参照するため
+# `system-tls` とは併用できない（OpenBSD は元々 kTLS 非対応なので実質関係ない）。
+# `build.rs` が `ktls` + `system-tls` 同時指定時に `veil_ktls` cfg を立てず
+# （kTLS を自動的に無効化し）、`cargo:warning` を出す。
+#
+# ビルド要件: pkg-config と libssl/libcrypto の .pc（開発パッケージ）
+# ビルド方法: cargo build --no-default-features --features full-openbsd  # OpenBSD（既定）
+system-tls = ["dep:rustls-openssl", "dep:openssl"]
+
+# OpenBSD 専用の内部フォワーディング feature（F-137）: quiche の vendored BoringSSL
+# バックエンド（`boringssl-boring-crate`、外部 `boring` crate 経由）を有効化する。
+# `full-openbsd-vendor` / `full-openbsd-aarch64-vendor` が使用する。
+#
+# `system-tls` とは併用できない: quiche の build.rs は `boringssl-boring-crate` が
+# 有効だと静的リンク（boring crate が cmake でビルドする BoringSSL）を、`openssl`
+# feature が有効だと pkg-config 経由の動的リンクを、それぞれ独立に指示するため、
+# 両方同時に有効化すると同一バイナリに BoringSSL 静的リンクとシステム libssl
+# 動的リンクが混在し、目的（システムライブラリのみへ動的リンク）を満たせなくなる。
+# OpenBSD 以外（FreeBSD/macOS/Windows）は従来通り target 別依存で
+# `boringssl-boring-crate` を無条件有効化しており、この feature の対象外
+# （`system-tls` は現状 OpenBSD packaging のみで使用する）。
+openbsd-vendor-tls = ["quiche?/boringssl-boring-crate", "dep:boring"]
+
 # ====================
 # 複合フィーチャ（便利用）
 # ====================
@@ -216,6 +285,16 @@ full-freebsd = [
 # wasmtime の Cranelift JIT が生成するネイティブコードは OpenBSD で動かず、
 # wasm モジュールを 1 回実行しただけで veil ごと SIGSEGV するため、
 # `src/wasm/registry.rs` が OpenBSD のみ `Config::target("pulley64")` を指定する。
+#
+# F-137: 既定の OpenBSD packaging 構成は `system-tls`（システムの LibreSSL へ
+# 動的リンク）。従来の同梱（rustls+ring / quiche+BoringSSL 同梱）構成が必要な場合は
+# 下の `full-openbsd-vendor` を使う。
+# `quiche?/openssl` を明示的に追加している: OpenBSD の quiche 依存は
+# aws-lc-sys 共有から完全に切り離してある（`system-tls` のコメント参照）ため、
+# ここでのみ quiche の TLS バックエンドも動的リンクの `openssl` feature へ
+# 安全に切り替えられる（Linux/FreeBSD は衝突するため `system-tls` 自体には含めない）。
+# HTTP/3 証明書ホットリロードは一時ファイル経由（`std::env::temp_dir()`、unveil の
+# read-write-create に追加済み、`src/config.rs::collect_unveil_paths`）で機能する。
 full-openbsd = [
     "ktls", "http2", "http3",
     "grpc-full", "wasm",
@@ -226,6 +305,25 @@ full-openbsd = [
     "admin",
     "access-log",
     "l4-proxy",
+    "system-tls",
+    "quiche?/openssl",
+]
+
+# OpenBSD: 従来の rustls+ring / quiche+BoringSSL 同梱構成（vendored、F-137 以前と同一内容）。
+# `system-tls` の代わりに `openbsd-vendor-tls`（quiche の vendored BoringSSL、
+# `boringssl-boring-crate` feature 経由）を有効化する。HTTP/3 証明書ホットリロードは
+# in-memory `SSL_CTX` API（ファイル不使用、サンドボックス耐性がより高い）を使う。
+full-openbsd-vendor = [
+    "ktls", "http2", "http3",
+    "grpc-full", "wasm",
+    "opentelemetry",
+    "compression", "cache", "metrics",
+    "websocket", "rate-limit", "buffering",
+    "system-allocator",
+    "admin",
+    "access-log",
+    "l4-proxy",
+    "openbsd-vendor-tls",
 ]
 
 # BSD の **aarch64** 向け feature セット（B-55）。
@@ -260,6 +358,22 @@ full-openbsd-aarch64 = [
     "admin",
     "access-log",
     "l4-proxy",
+    "system-tls",
+    "quiche?/openssl",
+]
+
+# `full-openbsd-aarch64` の従来（vendored）構成。`full-openbsd-vendor` の aarch64 版。
+full-openbsd-aarch64-vendor = [
+    "ktls", "http2", "http3",
+    "grpc-full",
+    "opentelemetry",
+    "compression", "cache", "metrics",
+    "websocket", "rate-limit", "buffering",
+    "system-allocator",
+    "admin",
+    "access-log",
+    "l4-proxy",
+    "openbsd-vendor-tls",
 ]
 
 [dependencies]
@@ -316,13 +430,24 @@ signal-hook = "0.4.1"
 prometheus = { version = "0.14.0", optional = true }
 clap = { version = "4.5.53", features = ["derive"] }
 
+# system-tls（F-137）: rustls の暗号プロバイダをシステム libcrypto（OpenSSL / LibreSSL）へ
+# 差し替える。`vendored` feature は絶対に有効化しない（静的埋め込みになり本来の目的
+# ＝システムライブラリへの動的リンクに反する）。tls12 は他プロバイダ（aws_lc_rs/ring）と
+# 同じ TLS1.2 サポート範囲に揃えるため明示指定する。
+rustls-openssl = { version = "0.3.1", optional = true, default-features = false, features = ["tls12"] }
+# system-tls 時の HTTP/3（quiche）RNG シム用（`SecureRandom`/`SystemRandom` 相当、
+# src/tls_provider.rs 参照）。
+openssl = { version = "0.10", optional = true }
+
 # HTTP/3 用 QUIC 実装（Cloudflare quiche）は末尾の target.*.dependencies で定義
 
 # Wasmtime: WebAssembly ランタイム (Proxy-Wasm v0.2.1)
 # - pooling-allocator: 高速インスタンス化
 # - cranelift: AOT コンパイル
 # - component-model: WASI対応
-wasmtime = { version = "40.0.0", optional = true, features = ["pooling-allocator", "cranelift"] }
+# - pulley: ポータブルバイトコードインタープリタ（`Config::target("pulleyNN")`）。
+#   `[wasm] interpreter = true`（F-135）や OpenBSD（B-52、常時強制）で使用する。
+wasmtime = { version = "40.0.0", optional = true, features = ["pooling-allocator", "cranelift", "pulley"] }
 
 # Protobuf: gRPC メッセージのシリアライズ/デシリアライズ
 # prost は gRPC feature 有効時のみ使用
@@ -381,22 +506,38 @@ futures = "0.3.31"
 # aws_lc_rs を使う target:
 #   - 非 OpenBSD（Linux/FreeBSD/macOS/Windows）: kTLS（ktls_rustls）・quiche(http3) と
 #     AWS-LC を共有し、アセンブリ最適化が効く。http3_server の RNG（aws_lc_rs::rand）にも使う。
+#
+# F-137: これらは **無条件依存のまま**にしてある。`system-tls` は OpenBSD 専用で、
+# 非 OpenBSD では build.rs がエラーにするため、optional 化して排他切替する必要が無い
+# （optional 化すると `cargo build --no-default-features` 単体が暗号プロバイダ不在で
+# コンパイルできなくなり、既存の受け入れ条件を壊す。`system-tls` のコメント参照）。
 [target.'cfg(not(target_os = "openbsd"))'.dependencies]
-# default-features = false は base の [dependencies] rustls と一致させる（default に含まれる
-# aws_lc_rs をここで暗黙有効化しないため。provider は features で明示する）。
+# default-features = false は base の [dependencies] rustls と一致させる（provider は明示指定）。
 rustls = { version = "0.23.35", default-features = false, features = ["aws_lc_rs"] }
 # bindgen: AWS_LC_SYS_NO_PREFIX 時に aws-lc-sys がバインディング生成するため必要
 aws-lc-rs = { version = "1.15.2", features = ["bindgen"] }
 
 # ring を使う target:
 #   - OpenBSD: aws-lc-rs は TLS ハンドシェイクを完了できない（F-122）。
+#
+# F-137: `system-tls` 有効時は `src/tls_provider.rs` が `rustls_openssl` を provider に
+# 使うため `ring` は未使用になるが、依存としては残す（無条件依存のまま。上記参照）。
 [target.'cfg(target_os = "openbsd")'.dependencies]
 rustls = { version = "0.23.35", default-features = false, features = ["ring"] }
 ring = "0.17"
+# F-137: OpenBSD のみ、`system-tls`（quiche `openssl` feature、システム LibreSSL へ
+# 動的リンク）と `openbsd-vendor-tls`（従来の quiche `boringssl-boring-crate`、
+# `boring` crate 経由の vendored BoringSSL）を切り替えられるよう、quiche の TLS
+# backend feature と `boring` crate の両方を optional にする（併用不可。上の
+# [features] `openbsd-vendor-tls` のコメント参照）。
+quiche = { version = "0.24.9", default-features = false, optional = true }
+boring = { version = "4.3", optional = true }
 # OpenBSD は wasm を **Pulley（ポータブルバイトコードインタープリタ）** で実行する。
 # ネイティブ JIT コードの実行が OpenBSD で機能しないため（B-52）。
-# `pulley` feature は Cranelift の Pulley バックエンド（= pulley64 へのコンパイル）と
-# インタープリタを有効にする。他ターゲットには入れない。
+# `pulley` feature は base の [dependencies] wasmtime にも入っている（F-135:
+# `[wasm] interpreter = true` で他ターゲットでも Pulley を選択可能にするため）。
+# この target 別指定はバージョン/他 feature を OpenBSD 専用に固定するために残す
+# （cargo は同一依存の feature を union するので重複指定しても無害）。
 wasmtime = { version = "40.0.0", optional = true, features = ["pooling-allocator", "cranelift", "pulley"] }
 
 # ====================
@@ -549,14 +690,47 @@ name = "wasm"
 harness = false
 
 # HTTP/3 用 QUIC 実装（Cloudflare quiche）ターゲット別設定
-# Linux/FreeBSD は default-features = false で aws-lc-sys と共有
-# OpenBSD/Windows/macOS は quiche 内蔵 BoringSSL (boring) を使用
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+# Linux は default-features = false で aws-lc-sys と共有（memfd 経由の従来経路、F-136で不変）
+# FreeBSD/OpenBSD は `boringssl-boring-crate`（外部 `boring` crate、F-137 で optional 化）、
+# macOS/Windows は従来どおり `boringssl-boring-crate` を無条件使用する。
+#
+# F-136: 証明書ホットリロードを capsicum capability mode（FreeBSD）/ pledge+unveil（OpenBSD）
+# 下でも動作させるため、quiche の in-memory SSL_CTX API
+# （`Config::with_boring_ssl_ctx_builder`）を使う。この API は `boringssl-boring-crate`
+# feature（外部 `boring` crate 経由）でのみ提供され、quiche 内蔵ビルド（旧 `"boring"`
+# feature）には無い。aws-lc-sys（NO_PREFIX=1）と BoringSSL を同一バイナリに同居させると
+# リンク時に重複シンボルエラーになるため（実験で確認済み、docs/artifacts/f136_platform_design.md
+# 参照）、FreeBSD は Linux と異なり aws-lc-sys 共有から外し、OpenBSD 等と同じ boring 系へ揃える。
+# **Linux は無変更**（AGENTS.md「Linux 経路は不変」）: `boring` crate を Linux の依存に
+# 入れてはならない（重複シンボルでリンクが壊れる）。
+#
+# F-137: `aws-lc-sys` は Linux では無条件依存のまま（`system-tls` は OpenBSD 専用のため
+# ここで排他切替する必要が無い）。
+[target.'cfg(target_os = "linux")'.dependencies]
 quiche = { version = "0.24.9", default-features = false, optional = true }
 aws-lc-sys = { version = "0.41", features = ["ssl", "bindgen"] }
 
-[target.'cfg(not(any(target_os = "linux", target_os = "freebsd")))'.dependencies]
-quiche = { version = "0.24.9", default-features = false, features = ["boring"], optional = true }
+# FreeBSD: quiche の TLS バックエンドを `freebsd-vendor-tls`（既定、`boringssl-boring-crate`
+# 経由の vendored BoringSSL、F-136 の in-memory 証明書リロード API に必要）と
+# `system-tls`（`quiche?/openssl`、動的リンク。capsicum capability mode 下では
+# 証明書ホットリロード不可）とで切り替えられるよう optional 化する（F-137）。
+[target.'cfg(target_os = "freebsd")'.dependencies]
+quiche = { version = "0.24.9", default-features = false, optional = true }
+# quiche 0.24.9 が依存する boring のバージョンと必ず一致させること（異なると
+# `SslContextBuilder` の型が別物になりコンパイルエラーになる）。
+boring = { version = "4.3", optional = true }
+
+# macOS/Windows: F-137 の `system-tls` を用意していないため、従来どおり
+# vendored BoringSSL（boring crate）を無条件で使う（不変）。
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
+quiche = { version = "0.24.9", default-features = false, features = ["boringssl-boring-crate"], optional = true }
+# `src/http3_server.rs` が `boring::ssl::SslContextBuilder` 等を直接使うための直接依存
+# （quiche 内部の boring 依存とは別に、自クレートのコードから使うには直接宣言が要る）。
+# Cargo の feature はターゲット非依存（`http3 = ["dep:quiche"]` に `dep:boring` を
+# 混ぜると、boring 未宣言の Linux ターゲットで解決エラーになる）のため、意図的に
+# optional にせず本ターゲット共通依存として常時コンパイルする（http3 feature 無効時の
+# 追加コストは、macOS/Windows の full-* feature セットが常に http3 を含むため許容する）。
+boring = "4.3"
 
 # ---------------------------------------------------------------------------
 # テスト用 TLS スタックの target 別 feature（F-122 / B-51）
