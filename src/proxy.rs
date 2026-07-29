@@ -10816,6 +10816,36 @@ async fn handle_sendfile_userspace(
     client_wants_close: bool,
     response_status: u16,
 ) -> Option<(ServerTls, u16, u64, bool)> {
+    // F-141: FreeBSD の平文（TLS 終端なし）接続に限り sendfile(2) によるゼロコピー
+    // 送信を使う。TlsMode::Rustls（ユーザー空間 TLS）ではファイルの生バイトを暗号化
+    // なしにソケットへ流すことになり平文漏洩になるため、is_plain() で厳密に判定する
+    // （kTLS 有効時は既に handle_sendfile_zerocopy 側で処理済みでここには来ない）。
+    #[cfg(target_os = "freebsd")]
+    {
+        if tls_stream.is_plain() && transfer_length > 0 {
+            use crate::runtime::reactor::sendfile::sendfile_all;
+            let out_fd = tls_stream.as_raw_fd();
+            let in_fd = file.as_raw_fd();
+            return match sendfile_all(out_fd, in_fd, transfer_offset, transfer_length as usize)
+                .await
+            {
+                Ok(()) => Some((
+                    tls_stream,
+                    response_status,
+                    transfer_length,
+                    client_wants_close,
+                )),
+                Err(e) => {
+                    error!("sendfile(2) error (FreeBSD plain): {}", e);
+                    // 部分送信済みバイト数は sendfile_all からは分からないため、ここでは
+                    // 0 として報告する（アクセスログの送信バイト数は目安であり、接続は
+                    // どのみち後続処理でクローズ扱いになるため実害はない）。
+                    Some((tls_stream, response_status, 0, true))
+                }
+            };
+        }
+    }
+
     let mut total_sent = 0u64;
     let mut offset = transfer_offset as u64;
     let target_end = transfer_offset as u64 + transfer_length;

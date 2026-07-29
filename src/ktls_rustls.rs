@@ -113,6 +113,16 @@ impl KtlsServerStream {
         matches!(self.mode, TlsMode::KtlsFull)
     }
 
+    /// 平文（`TlsMode::Plain`、TLS 終端なし）接続かどうか。
+    ///
+    /// F-141: FreeBSD の非 kTLS 静的ファイル配信経路で `sendfile(2)` を安全に使って
+    /// よいかの判定に使う。`TlsMode::Rustls`（ユーザー空間 TLS）の場合はファイルの
+    /// 生バイトを暗号化なしにソケットへ流すことになり平文漏洩になるため、
+    /// `sendfile(2)` を使えるのは本メソッドが `true` を返す場合のみ。
+    pub fn is_plain(&self) -> bool {
+        self.mode == TlsMode::Plain
+    }
+
     /// ファイルディスクリプタを取得
     pub fn as_raw_fd(&self) -> RawFd {
         self.inner.as_raw_fd()
