@@ -742,18 +742,24 @@ cmd_toolchain() {
         # NetBSD（F-140）: pkgsrc のバイナリパッケージ（pkgin）で rust-bin を導入する。
         # ソースからの rust ビルドは QEMU 上で数時間かかるため **必ず rust-bin を使う**
         # （`rust` パッケージ = ソースビルドを引くパッケージとは別物）。
+        # NetBSD の SSH 非対話シェルの既定 PATH には /usr/sbin が入っておらず
+        # （実測: PATH=/usr/bin:/bin:/usr/pkg/bin:/usr/local/bin）、pkg_add(8) は
+        # /usr/sbin にあるため「pkg_add: not found」になる。絶対パスで呼ぶ。
+        # また `uname -m` は amd64 を返すが pkgsrc パッケージのパス要素は x86_64
+        # （amd64 は x86_64 へ 302 リダイレクトされる。ARCH は本スクリプトの
+        # 引数なので既に x86_64/aarch64 で pkgsrc のパスと一致している）。
         local pkg_path="https://cdn.NetBSD.org/pub/pkgsrc/packages/NetBSD/${ARCH}/${NETBSD_PKG_VER}/All/"
         log "pkgin bootstrap + rust-bin/cmake/llvm 導入（PKG_PATH=${pkg_path}）"
         cmd_ssh "set -e
+export PATH=/usr/pkg/bin:/usr/pkg/sbin:/usr/sbin:/sbin:\$PATH
 export PKG_PATH='${pkg_path}'
-if ! command -v pkgin >/dev/null 2>&1 && [ ! -x /usr/pkg/bin/pkgin ]; then
-  echo 'pkgin が無いので pkg_add で bootstrap する'
-  pkg_add -v pkgin
+if [ ! -x /usr/pkg/bin/pkgin ]; then
+  echo 'pkgin が無いので /usr/sbin/pkg_add で bootstrap する'
+  /usr/sbin/pkg_add -v pkgin >/tmp/pkg_add.log 2>&1 || { tail -40 /tmp/pkg_add.log; exit 1; }
 fi
-export PATH=/usr/pkg/bin:/usr/pkg/sbin:\$PATH
-pkgin -y update >/tmp/pkgin.log 2>&1 || { tail -40 /tmp/pkgin.log; exit 1; }
-pkgin -y install rust-bin cmake llvm protobuf gmake bash curl git nasm pkgconf mozilla-rootcerts-openssl >>/tmp/pkgin.log 2>&1 || { tail -60 /tmp/pkgin.log; exit 1; }
-mozilla-rootcerts-openssl install >/dev/null 2>&1 || true
+/usr/pkg/bin/pkgin -y update >/tmp/pkgin.log 2>&1 || { tail -40 /tmp/pkgin.log; exit 1; }
+/usr/pkg/bin/pkgin -y install rust-bin cmake llvm protobuf gmake bash curl git nasm pkgconf mozilla-rootcerts-openssl >>/tmp/pkgin.log 2>&1 || { tail -60 /tmp/pkgin.log; exit 1; }
+/usr/pkg/sbin/mozilla-rootcerts-openssl install >/dev/null 2>&1 || /usr/pkg/bin/mozilla-rootcerts-openssl install >/dev/null 2>&1 || true
 "
     else
         # OpenBSD も同様に protobuf（protoc）と gmake が要る
@@ -798,7 +804,7 @@ if ! find /usr/local -name "libclang*so*" 2>/dev/null | grep -q .; then
 fi'
     fi
     if [[ "${OS_NAME}" == "netbsd" ]]; then
-        cmd_ssh 'export PATH=/usr/pkg/bin:/usr/pkg/sbin:$PATH; cargo --version; cmake --version | head -1; gmake --version 2>/dev/null | head -1; protoc --version 2>/dev/null'
+        cmd_ssh 'export PATH=/usr/pkg/bin:/usr/pkg/sbin:/usr/sbin:/sbin:$PATH; cargo --version; cmake --version | head -1; gmake --version 2>/dev/null | head -1; protoc --version 2>/dev/null'
     else
         cmd_ssh 'cargo --version; cmake --version | head -1; gmake --version 2>/dev/null | head -1; protoc --version 2>/dev/null'
     fi
@@ -857,7 +863,7 @@ _guest_env_prefix() {
         # /usr/pkg/lib/llvmNN/lib 配下（OpenBSD/FreeBSD の /usr/local とは別系統）。
         # 非対話 ssh セッションには既定で /usr/pkg/{bin,sbin} が PATH に無い。
         pre='LIBCLANG_PATH=$(find /usr/pkg -name "libclang.so*" 2>/dev/null | head -1 | xargs dirname)'
-        pre="${pre} PATH=/usr/pkg/bin:/usr/pkg/sbin:\$PATH"
+        pre="${pre} PATH=/usr/pkg/bin:/usr/pkg/sbin:/usr/sbin:/sbin:\$PATH"
     fi
     echo "${pre}"
 }
