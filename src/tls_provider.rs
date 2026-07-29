@@ -48,11 +48,29 @@
 #[cfg(feature = "system-tls")]
 pub use rustls_openssl as provider;
 
-#[cfg(all(not(feature = "system-tls"), not(target_os = "openbsd")))]
+#[cfg(all(
+    not(feature = "system-tls"),
+    not(any(target_os = "openbsd", target_os = "netbsd"))
+))]
 pub use rustls::crypto::aws_lc_rs as provider;
-#[cfg(all(not(feature = "system-tls"), target_os = "openbsd"))]
+#[cfg(all(
+    not(feature = "system-tls"),
+    any(target_os = "openbsd", target_os = "netbsd")
+))]
 pub use rustls::crypto::ring as provider;
 
+#[cfg(all(
+    feature = "http3",
+    not(feature = "system-tls"),
+    not(any(target_os = "openbsd", target_os = "netbsd"))
+))]
+pub use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+#[cfg(all(
+    feature = "http3",
+    not(feature = "system-tls"),
+    any(target_os = "openbsd", target_os = "netbsd")
+))]
+pub use ring::rand::{SecureRandom, SystemRandom};
 /// HTTP/3（quiche）の乱数生成に使う `SecureRandom` 実装。
 ///
 /// 非 OpenBSD は aws-lc-rs、OpenBSD は ring の `SystemRandom` を用いる
@@ -61,10 +79,6 @@ pub use rustls::crypto::ring as provider;
 /// `openssl::rand::rand_bytes` を包む薄いシムを使う（呼び出し形は同じ）。
 #[cfg(all(feature = "http3", feature = "system-tls"))]
 pub use system_tls_rand::{SecureRandom, SystemRandom};
-#[cfg(all(feature = "http3", not(feature = "system-tls"), not(target_os = "openbsd")))]
-pub use aws_lc_rs::rand::{SecureRandom, SystemRandom};
-#[cfg(all(feature = "http3", not(feature = "system-tls"), target_os = "openbsd"))]
-pub use ring::rand::{SecureRandom, SystemRandom};
 
 /// `system-tls` 時の HTTP/3（quiche）RNG シム（F-137）。
 ///

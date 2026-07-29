@@ -170,12 +170,13 @@ access-log = []
 # ビルド方法: cargo build --features l4-proxy
 l4-proxy = []
 
-# システムの SSL ライブラリ（OpenSSL / LibreSSL）へ動的リンクする（F-137）。
+# システムの SSL ライブラリ（OpenSSL / LibreSSL）へ動的リンクする（F-137/F-140）。
 #
-# **OpenBSD 専用**（将来 NetBSD にも同じ扱いで対応予定）。Linux/FreeBSD/macOS/Windows で
-# 指定すると `build.rs` がビルド開始時点で明確なエラーを出して止める
-# （`SYSTEM_TLS_ALLOWED_TARGET_OSES` 参照。NetBSD 対応時はこの配列に "netbsd" を
-# 1 行足すだけでよい形にしてある）。
+# **OpenBSD / NetBSD 専用**。Linux/FreeBSD/macOS/Windows で指定すると `build.rs` が
+# ビルド開始時点で明確なエラーを出して止める（`SYSTEM_TLS_ALLOWED_TARGET_OSES` 参照）。
+# NetBSD は OpenBSD と同じく quiche/rustls の依存を aws-lc-sys 共有から切り離してある
+# （下の `[target.'cfg(any(target_os = "openbsd", target_os = "netbsd"))'.dependencies]`
+# 参照）ため衝突しない。
 #
 # rustls の暗号プロバイダを `rustls-openssl`（システムの LibreSSL libcrypto を呼ぶ）へ
 # 切り替える。rustls 本体はそのまま使い、**依存する暗号ライブラリだけ**を差し替える。
@@ -203,18 +204,18 @@ l4-proxy = []
 # 起きない。詳細な調査ログは `docs/backlog/features/F-137-system-tls-feature.md` の
 # 「既知の限界・今後の課題」を参照。
 #
-# HTTP/3 証明書ホットリロードへの影響（`src/http3_server.rs`、OpenBSD限定の話）:
+# HTTP/3 証明書ホットリロードへの影響（`src/http3_server.rs`、OpenBSD/NetBSD限定の話）:
 # `system-tls` 有効時は quiche の in-memory `SSL_CTX` API（`boringssl-boring-crate`
 # 限定）が使えなくなるため、Linux と同じパス指定 API（`create_memfd_for_pem`、
-# OpenBSD 版は 0600 の一時ファイル、`std::env::temp_dir()` 配下、Drop で unlink）に
+# OpenBSD/NetBSD 版は 0600 の一時ファイル、`std::env::temp_dir()` 配下、Drop で unlink）に
 # フォールバックする。unveil のビューに一時ディレクトリが必要で、
 # `src/config.rs::collect_unveil_paths` が `system-tls` 有効時のみ
 # `std::env::temp_dir()` を `read_write_create` に追加済み（`pledge` の
-# `wpath cpath` promise は既存のまま変更不要）。`system-tls` を使わない
-# `full-openbsd-vendor`（BoringSSL 同梱）は代わりに in-memory 経路（ファイル不使用、
-# サンドボックス耐性がより高い）を使う。FreeBSD（`system-tls` 非対象）は
-# 常に in-memory 経路のままで、capsicum capability mode 下でもホットリロードが
-# 機能する（F-136 の成果は無変更）。
+# `wpath cpath` promise は既存のまま変更不要。NetBSD には unveil 自体が無いため
+# 本項は無関係）。`system-tls` を使わない `full-openbsd-vendor`/`full-netbsd-vendor`
+# （BoringSSL 同梱）は代わりに in-memory 経路（ファイル不使用、サンドボックス耐性が
+# より高い）を使う。FreeBSD（`system-tls` 非対象）は常に in-memory 経路のままで、
+# capsicum capability mode 下でもホットリロードが機能する（F-136 の成果は無変更）。
 #
 # kTLS との併用: `veil_ktls` は aws_lc_rs 固有の cipher_suite 定数を直接参照するため
 # `system-tls` とは併用できない（OpenBSD は元々 kTLS 非対応なので実質関係ない）。
@@ -234,10 +235,16 @@ system-tls = ["dep:rustls-openssl", "dep:openssl"]
 # feature が有効だと pkg-config 経由の動的リンクを、それぞれ独立に指示するため、
 # 両方同時に有効化すると同一バイナリに BoringSSL 静的リンクとシステム libssl
 # 動的リンクが混在し、目的（システムライブラリのみへ動的リンク）を満たせなくなる。
-# OpenBSD 以外（FreeBSD/macOS/Windows）は従来通り target 別依存で
+# OpenBSD/NetBSD 以外（FreeBSD/macOS/Windows）は従来通り target 別依存で
 # `boringssl-boring-crate` を無条件有効化しており、この feature の対象外
-# （`system-tls` は現状 OpenBSD packaging のみで使用する）。
+# （`system-tls` は現状 OpenBSD/NetBSD packaging のみで使用する）。
 openbsd-vendor-tls = ["quiche?/boringssl-boring-crate", "dep:boring"]
+
+# NetBSD 専用の内部フォワーディング feature（F-140）: `openbsd-vendor-tls` と同一内容。
+# `full-netbsd-vendor` / `full-netbsd-aarch64-vendor` が使用する。分離した理由は
+# ドキュメント上の対称性のみ（依存関係としては `openbsd-vendor-tls` と全く同じものを
+# 有効化する）。
+netbsd-vendor-tls = ["quiche?/boringssl-boring-crate", "dep:boring"]
 
 # ====================
 # 複合フィーチャ（便利用）
@@ -376,6 +383,77 @@ full-openbsd-aarch64-vendor = [
     "openbsd-vendor-tls",
 ]
 
+# NetBSD: OpenBSD をテンプレートに横展開した feature セット（F-140）。
+# NetBSD には pledge/unveil 相当のランタイム API が無く（`src/security.rs` の
+# `netbsd` モジュール参照）、veil が提供できるのは chroot(2) + 特権降格 + rlimit
+# のみだが、TLS/wasm/機能セット自体は OpenBSD と同一内容にできる
+# （rustls=ring、quiche=boringssl-boring-crate、wasm=Pulley インタープリタ常時）。
+# システムアロケータ（mimalloc/jemalloc とも無効化）を使う点も OpenBSD と同じ。
+#
+# F-140: 既定の NetBSD packaging 構成は `system-tls`（システムの OpenSSL/LibreSSL へ
+# 動的リンク）。従来の同梱（rustls+ring / quiche+BoringSSL 同梱）構成が必要な場合は
+# 下の `full-netbsd-vendor` を使う。
+full-netbsd = [
+    "ktls", "http2", "http3",
+    "grpc-full", "wasm",
+    "opentelemetry",
+    "compression", "cache", "metrics",
+    "websocket", "rate-limit", "buffering",
+    "system-allocator",
+    "admin",
+    "access-log",
+    "l4-proxy",
+    "system-tls",
+    "quiche?/openssl",
+]
+
+# NetBSD: 従来の rustls+ring / quiche+BoringSSL 同梱構成（vendored、`full-openbsd-vendor`
+# と同一内容）。`system-tls` の代わりに `netbsd-vendor-tls` を有効化する。
+full-netbsd-vendor = [
+    "ktls", "http2", "http3",
+    "grpc-full", "wasm",
+    "opentelemetry",
+    "compression", "cache", "metrics",
+    "websocket", "rate-limit", "buffering",
+    "system-allocator",
+    "admin",
+    "access-log",
+    "l4-proxy",
+    "netbsd-vendor-tls",
+]
+
+# NetBSD の **aarch64** 向け feature セット（B-55）。`full-netbsd` から **`wasm` だけを
+# 外した**もの。wasmtime 40 のシグナルベーストラップ実装が BSD × aarch64 に対応して
+# いないため（`full-freebsd-aarch64`/`full-openbsd-aarch64` と同じ理由）、NetBSD
+# aarch64 でも wasm を含められない。x86_64 は従来どおり wasm 込み。
+full-netbsd-aarch64 = [
+    "ktls", "http2", "http3",
+    "grpc-full",
+    "opentelemetry",
+    "compression", "cache", "metrics",
+    "websocket", "rate-limit", "buffering",
+    "system-allocator",
+    "admin",
+    "access-log",
+    "l4-proxy",
+    "system-tls",
+    "quiche?/openssl",
+]
+
+# `full-netbsd-aarch64` の従来（vendored）構成。`full-netbsd-vendor` の aarch64 版。
+full-netbsd-aarch64-vendor = [
+    "ktls", "http2", "http3",
+    "grpc-full",
+    "opentelemetry",
+    "compression", "cache", "metrics",
+    "websocket", "rate-limit", "buffering",
+    "system-allocator",
+    "admin",
+    "access-log",
+    "l4-proxy",
+    "netbsd-vendor-tls",
+]
+
 [dependencies]
 # monoio 削除: カスタム io_uring 実装 (src/runtime/) に完全移行
 # rustls を直接使用（ハンドシェイク後に kTLS へオフロード）。
@@ -511,7 +589,7 @@ futures = "0.3.31"
 # 非 OpenBSD では build.rs がエラーにするため、optional 化して排他切替する必要が無い
 # （optional 化すると `cargo build --no-default-features` 単体が暗号プロバイダ不在で
 # コンパイルできなくなり、既存の受け入れ条件を壊す。`system-tls` のコメント参照）。
-[target.'cfg(not(target_os = "openbsd"))'.dependencies]
+[target.'cfg(not(any(target_os = "openbsd", target_os = "netbsd")))'.dependencies]
 # default-features = false は base の [dependencies] rustls と一致させる（provider は明示指定）。
 rustls = { version = "0.23.35", default-features = false, features = ["aws_lc_rs"] }
 # bindgen: AWS_LC_SYS_NO_PREFIX 時に aws-lc-sys がバインディング生成するため必要
@@ -519,25 +597,31 @@ aws-lc-rs = { version = "1.15.2", features = ["bindgen"] }
 
 # ring を使う target:
 #   - OpenBSD: aws-lc-rs は TLS ハンドシェイクを完了できない（F-122）。
+#   - NetBSD: OpenBSD と同じ扱い（F-140、未検証だが aws-lc-rs の Tier 3 サポート
+#     不足という同じ懸念があるため、実証済みの OpenBSD 側に合わせる保守的な選択）。
 #
-# F-137: `system-tls` 有効時は `src/tls_provider.rs` が `rustls_openssl` を provider に
-# 使うため `ring` は未使用になるが、依存としては残す（無条件依存のまま。上記参照）。
-[target.'cfg(target_os = "openbsd")'.dependencies]
+# F-137/F-140: `system-tls` 有効時は `src/tls_provider.rs` が `rustls_openssl` を
+# provider に使うため `ring` は未使用になるが、依存としては残す（無条件依存のまま。
+# 上記参照）。
+[target.'cfg(any(target_os = "openbsd", target_os = "netbsd"))'.dependencies]
 rustls = { version = "0.23.35", default-features = false, features = ["ring"] }
 ring = "0.17"
-# F-137: OpenBSD のみ、`system-tls`（quiche `openssl` feature、システム LibreSSL へ
-# 動的リンク）と `openbsd-vendor-tls`（従来の quiche `boringssl-boring-crate`、
-# `boring` crate 経由の vendored BoringSSL）を切り替えられるよう、quiche の TLS
-# backend feature と `boring` crate の両方を optional にする（併用不可。上の
-# [features] `openbsd-vendor-tls` のコメント参照）。
+# F-137/F-140: OpenBSD/NetBSD のみ、`system-tls`（quiche `openssl` feature、システム
+# OpenSSL/LibreSSL へ動的リンク）と `openbsd-vendor-tls`/`netbsd-vendor-tls`（従来の
+# quiche `boringssl-boring-crate`、`boring` crate 経由の vendored BoringSSL）を
+# 切り替えられるよう、quiche の TLS backend feature と `boring` crate の両方を
+# optional にする（併用不可。上の [features] `openbsd-vendor-tls`/`netbsd-vendor-tls`
+# のコメント参照）。
 quiche = { version = "0.24.9", default-features = false, optional = true }
 boring = { version = "4.3", optional = true }
-# OpenBSD は wasm を **Pulley（ポータブルバイトコードインタープリタ）** で実行する。
-# ネイティブ JIT コードの実行が OpenBSD で機能しないため（B-52）。
+# OpenBSD/NetBSD は wasm を **Pulley（ポータブルバイトコードインタープリタ）** で
+# 実行する。ネイティブ JIT コードの実行が OpenBSD で機能しないため（B-52）。NetBSD は
+# MAP_STACK 強制は無いが、ネイティブ JIT 自体の実機検証ができていないため OpenBSD と
+# 同じ保守的な Pulley 選択にする（F-140、`src/wasm/registry.rs` 参照）。
 # `pulley` feature は base の [dependencies] wasmtime にも入っている（F-135:
 # `[wasm] interpreter = true` で他ターゲットでも Pulley を選択可能にするため）。
-# この target 別指定はバージョン/他 feature を OpenBSD 専用に固定するために残す
-# （cargo は同一依存の feature を union するので重複指定しても無害）。
+# この target 別指定はバージョン/他 feature を OpenBSD/NetBSD 専用に固定するために
+# 残す（cargo は同一依存の feature を union するので重複指定しても無害）。
 wasmtime = { version = "40.0.0", optional = true, features = ["pooling-allocator", "cranelift", "pulley"] }
 
 # ====================
@@ -735,13 +819,15 @@ boring = "4.3"
 # ---------------------------------------------------------------------------
 # テスト用 TLS スタックの target 別 feature（F-122 / B-51）
 # ---------------------------------------------------------------------------
-[target.'cfg(not(target_os = "openbsd"))'.dev-dependencies]
+[target.'cfg(not(any(target_os = "openbsd", target_os = "netbsd")))'.dev-dependencies]
 rcgen = { version = "0.14.6", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
 tokio-rustls = "0.26.4"
 hyper-rustls = { version = "0.27.7", features = ["http1", "http2"] }
 tonic = { version = "0.14.2", features = ["tls-aws-lc", "channel"] }
 
-[target.'cfg(target_os = "openbsd")'.dev-dependencies]
+# NetBSD もテスト用 TLS スタックは OpenBSD と同じ ring 系（B-51 の教訓: aws-lc-rs の
+# curve25519 s2n-bignum アセンブリが未検証プラットフォームで SIGSEGV するリスクを避ける）。
+[target.'cfg(any(target_os = "openbsd", target_os = "netbsd"))'.dev-dependencies]
 rcgen = { version = "0.14.6", default-features = false, features = ["crypto", "pem", "ring"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "ring"] }
 hyper-rustls = { version = "0.27.7", default-features = false, features = ["native-tokio", "http1", "http2", "tls12", "logging", "ring"] }
