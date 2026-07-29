@@ -900,8 +900,6 @@ async fn bidirectional_forward_tls_terminate<C>(
     // 同じループへ WASM 呼び出しを差し込むだけで済む）。
     #[cfg(feature = "wasm")]
     let wasm_active = !wasm_modules.is_empty();
-    #[cfg(not(feature = "wasm"))]
-    let wasm_active = false;
 
     #[cfg(feature = "wasm")]
     let engine = if wasm_active {
