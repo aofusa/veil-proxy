@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# veil FreeBSD/OpenBSD バイナリ tar.gz パッケージング（F-120 Phase 6）
+# veil FreeBSD/OpenBSD/NetBSD バイナリ tar.gz パッケージング（F-120 Phase 6 / F-140）
 #
-# FreeBSD / OpenBSD は Rust Tier 2/3 かつクロスビルド困難なため、バイナリは
+# FreeBSD / OpenBSD / NetBSD は Rust Tier 2/3 かつクロスビルド困難なため、バイナリは
 # QEMU VM 内でネイティブビルドしたものを --binary で受け取り、rc.d サービス
 # スクリプト・設定リファレンス・（FreeBSD は）jail.conf サンプルを同梱した
 # tar.gz を packaging/output/ へ出力する。deb/rpm は Linux 専用のため BSD では
@@ -10,14 +10,16 @@
 # 使い方（VM でビルドしたバイナリを host へ持ち出してから）:
 #   ./packaging/scripts/build-bsd.sh --os freebsd --arch x86_64 --binary ./veil-freebsd-amd64
 #   ./packaging/scripts/build-bsd.sh --os openbsd --arch x86_64 --binary ./veil-openbsd-amd64
+#   ./packaging/scripts/build-bsd.sh --os netbsd  --arch x86_64 --binary ./veil-netbsd-amd64
 #
 # tools/qemu/bsd-vm.sh で取得したバイナリをそのまま使う場合（推奨）:
 #   tools/qemu/bsd-vm.sh freebsd x86_64 fetch      # → packaging/build/veil-freebsd-x86_64
 #   ./packaging/scripts/build-bsd.sh --os freebsd --arch x86_64 --from-qemu
-#   ./packaging/scripts/build-bsd.sh --all         # 取得済みの 4 通りをまとめて
+#   ./packaging/scripts/build-bsd.sh --all         # 取得済みの 6 通りをまとめて
 #
 # ターゲットトリプル命名（tar.gz 名）:
 #   freebsd: <arch>-unknown-freebsd    openbsd: <arch>-unknown-openbsd
+#   netbsd:  <arch>-unknown-netbsd
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -36,29 +38,29 @@ ALL=0
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") --os {freebsd|openbsd} [--arch {x86_64|aarch64}] --binary PATH [--os-version VER]
-       $(basename "$0") --os {freebsd|openbsd} --arch {x86_64|aarch64} --from-qemu
+Usage: $(basename "$0") --os {freebsd|openbsd|netbsd} [--arch {x86_64|aarch64}] --binary PATH [--os-version VER]
+       $(basename "$0") --os {freebsd|openbsd|netbsd} --arch {x86_64|aarch64} --from-qemu
        $(basename "$0") --all
 
-Assemble a FreeBSD/OpenBSD binary tarball with rc.d service script,
+Assemble a FreeBSD/OpenBSD/NetBSD binary tarball with rc.d service script,
 config reference, and (FreeBSD) jail.conf sample. The OS version the binary
 was built on is recorded in BUILD_INFO.txt / INSTALL.txt.
 
 Options:
-  --os OS            Target OS: freebsd or openbsd (required)
+  --os OS            Target OS: freebsd, openbsd, or netbsd (required)
   --arch ARCH        Target arch: x86_64 (default) or aarch64
   --binary PATH      Pre-built veil binary for the target OS/arch (required;
                      build it inside a matching QEMU VM)
   --os-version VER   OS release the binary was built on (e.g. 14.3-RELEASE,
-                     7.9). Auto-detected via 'uname -r' when run on the target
-                     OS; specify explicitly otherwise.
+                     7.9, 10.1). Auto-detected via 'uname -r' when run on the
+                     target OS; specify explicitly otherwise.
   --from-qemu        Use the binary fetched by
                      'tools/qemu/bsd-vm.sh <os> <arch> fetch', i.e.
                      packaging/build/veil-<os>-<arch> together with the OS
                      version recorded in the matching .os-version file.
                      (--binary / --os-version are then unnecessary.)
   --all              Package every fetched BSD binary found under
-                     packaging/build/ (freebsd/openbsd x x86_64/aarch64).
+                     packaging/build/ (freebsd/openbsd/netbsd x x86_64/aarch64).
   -h, --help         Show this help
 
 Output:
@@ -84,7 +86,7 @@ done
 # 取得は tools/qemu/bsd-vm.sh <os> <arch> fetch が行う。
 if (( ALL )); then
     found=0
-    for os_name in freebsd openbsd; do
+    for os_name in freebsd openbsd netbsd; do
         for arch_name in x86_64 aarch64; do
             bin="${BUILD_DIR}/veil-${os_name}-${arch_name}"
             [[ -f "${bin}" ]] || continue
@@ -113,8 +115,8 @@ if (( FROM_QEMU )); then
     fi
 fi
 
-if [[ "${OS}" != "freebsd" && "${OS}" != "openbsd" ]]; then
-    echo "ERROR: --os must be freebsd or openbsd" >&2; usage >&2; exit 1
+if [[ "${OS}" != "freebsd" && "${OS}" != "openbsd" && "${OS}" != "netbsd" ]]; then
+    echo "ERROR: --os must be freebsd, openbsd, or netbsd" >&2; usage >&2; exit 1
 fi
 
 # ビルドした OS のバージョンを明記する（ユーザ要件）。build-bsd.sh は対象 OS の VM 内で
@@ -166,7 +168,7 @@ if [[ "${OS}" == "freebsd" ]]; then
     install -m 0644 "${BSD_ASSETS}/freebsd/jail.conf.sample" "${stage_parent}/${dir_name}/jail.conf.sample"
 else
     mkdir -p "${stage_parent}/${dir_name}/rc.d"
-    install -m 0555 "${BSD_ASSETS}/openbsd/veil.rc" "${stage_parent}/${dir_name}/rc.d/veil"
+    install -m 0555 "${BSD_ASSETS}/${OS}/veil.rc" "${stage_parent}/${dir_name}/rc.d/veil"
 fi
 
 # ビルド情報（ビルドした OS バージョンを明記）
@@ -207,7 +209,7 @@ if [[ "${OS}" == "freebsd" ]]; then
   # （任意）jail 内で稼働させる場合は jail.conf.sample を参照
   # veil の [security] enable_capsicum = true で capsicum 併用を推奨
 EOF
-else
+elif [[ "${OS}" == "openbsd" ]]; then
     cat >> "${stage_parent}/${dir_name}/INSTALL.txt" <<EOF
   mkdir -p /etc/veil
   cp config.toml.default /etc/veil/config.toml
@@ -221,6 +223,22 @@ else
   #   config.toml で enable_pledge = true / enable_unveil = true を設定
   # TLS は rustls の ring プロバイダで動作（F-122）。HTTPS 静的配信/プロキシとも
   #   pledge+unveil 有効のまま 200 で動作することを検証済み。
+EOF
+else
+    cat >> "${stage_parent}/${dir_name}/INSTALL.txt" <<EOF
+  mkdir -p /etc/veil
+  cp config.toml.default /etc/veil/config.toml
+
+  # rc.d サービス（NetBSD には rcctl が無いため rc.conf を直接編集する）
+  install -m 0555 rc.d/veil /etc/rc.d/veil
+  echo 'veil=YES' >> /etc/rc.conf
+  /etc/rc.d/veil start
+
+  # NetBSD には pledge/unveil 相当のランタイム API が無い（F-140）。veil が
+  # 提供できるのは chroot(2)（config.toml の [security] chroot_dir）+
+  # setuid/setgid による特権降格 + rlimit のみ。
+  # TLS は既定で rustls の ring プロバイダ + system-tls（システムの OpenSSL/
+  # LibreSSL へ動的リンク、full-netbsd）。従来の同梱構成は full-netbsd-vendor。
 EOF
 fi
 

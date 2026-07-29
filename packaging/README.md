@@ -23,7 +23,7 @@ packaging/
 ├── rpm/veil.spec                # .rpm spec ファイル
 ├── scripts/
 │   ├── build.sh                 # 統合ビルド（.deb + .rpm）
-│   ├── build-bsd.sh             # FreeBSD/OpenBSD tar.gz（VM ネイティブビルド）
+│   ├── build-bsd.sh             # FreeBSD/OpenBSD/NetBSD tar.gz（VM ネイティブビルド）
 │   ├── build-cross.sh           # macOS / Windows / FreeBSD tar.gz・zip（Docker クロスビルド）
 │   ├── test-install.sh          # 両パッケージを順に検証
 │   ├── test-deb.sh              # .deb 検証
@@ -122,29 +122,35 @@ RUST_TARGET=aarch64-unknown-linux-gnu ./packaging/scripts/build.sh --docker
 
 NetBSD 向けの feature セット（`full-netbsd`/`full-netbsd-vendor`/`full-netbsd-aarch64`/
 `full-netbsd-aarch64-vendor`、`system-tls`/TLS プロバイダの target 別分岐、
-kqueue reactor の `struct kevent` 型差吸収）は **コード側は完成済み**だが、
-`tools/qemu/bsd-vm.sh` / `packaging/scripts/build-bsd.sh` への NetBSD 組み込みは
-**未着手**（別チケット `docs/backlog/features/F-140-netbsd-support.md`）。
-本節の FreeBSD/OpenBSD 手順は現時点では NetBSD には使えない。
+kqueue reactor の `struct kevent` 型差吸収）は **コード側は完成済み**。
+`tools/qemu/bsd-vm.sh`（`netbsd` os として追加）・`packaging/scripts/build-bsd.sh`・
+`packaging/bsd/netbsd/veil.rc` の組み込みも完了しており、以下の FreeBSD/OpenBSD 節と
+同じインタフェースで NetBSD も扱える。**ただし実 VM でのビルド・E2E 検証は
+コーディネーターが別途実施する**（本ドキュメント更新時点では QEMU 上の実起動確認は
+未実施）。詳細・既知の不確実点は
+[`docs/backlog/features/F-140-netbsd-support.md`](../docs/backlog/features/F-140-netbsd-support.md)
+と [`tools/qemu/README.md`](../tools/qemu/README.md) を参照。
 
-### FreeBSD / OpenBSD 向けパッケージ（F-120 Phase 6）
+### FreeBSD / OpenBSD / NetBSD 向けパッケージ（F-120 Phase 6 / F-140）
 
-FreeBSD/OpenBSD のバイナリは **QEMU VM 内でネイティブビルド**したものを取り出し、
+FreeBSD/OpenBSD/NetBSD のバイナリは **QEMU VM 内でネイティブビルド**したものを取り出し、
 専用スクリプトで rc.d サービススクリプト・設定リファレンス・（FreeBSD は）jail.conf
 サンプルを同梱した tar.gz を生成する（deb/rpm は Linux 専用のため BSD は tar.gz のみ）。
 
 VM の作成からビルド・E2E・バイナリ取得までは
-[`tools/qemu/bsd-vm.sh`](../tools/qemu/README.md) が **FreeBSD/OpenBSD × x86_64/aarch64
-の 4 通り**を同じインタフェースで面倒を見る（x86_64 ゲストはホストに `/dev/kvm` が
-あれば KVM 加速される）。
+[`tools/qemu/bsd-vm.sh`](../tools/qemu/README.md) が **FreeBSD/OpenBSD/NetBSD ×
+x86_64/aarch64 の 6 通り**を同じインタフェースで面倒を見る（x86_64 ゲストはホストに
+`/dev/kvm` があれば KVM 加速される）。
 
 ```bash
 # setup → provision → toolchain → build → e2e → fetch を一括
-# （4 通り: freebsd|openbsd × x86_64|aarch64。すべて同じ形）
+# （6 通り: freebsd|openbsd|netbsd × x86_64|aarch64。すべて同じ形）
 tools/qemu/bsd-vm.sh freebsd x86_64 all
 tools/qemu/bsd-vm.sh freebsd aarch64 all
 tools/qemu/bsd-vm.sh openbsd x86_64 all
 tools/qemu/bsd-vm.sh openbsd aarch64 all
+tools/qemu/bsd-vm.sh netbsd x86_64 all
+tools/qemu/bsd-vm.sh netbsd aarch64 all
 
 # 取り出したバイナリ（packaging/build/veil-<os>-<arch>）を tar.gz 化。
 # --from-qemu は .os-version も自動で拾うので --binary / --os-version は不要。
@@ -153,6 +159,21 @@ tools/qemu/bsd-vm.sh openbsd aarch64 all
 # 取得済みのものをまとめて（存在する組み合わせだけ処理する）
 ./packaging/scripts/build-bsd.sh --all
 ```
+
+**NetBSD 固有の注意（F-140、未検証）**:
+
+- x86_64 は起動可能な `-live.img.gz`（生イメージ）をそのまま qcow2 化して使う
+  （OpenBSD のような autoinstall は不要と見込んでいる）。cloud-init 相当が無いため
+  `provision` はシリアルコンソールへ root ログインして SSH 鍵を注入する
+  （`tools/qemu/netbsd-provision.py`、FreeBSD の `--mode login` と同じ発想）。
+- aarch64 は install ISO のみが配布されているため、`sysinst`（メニュー主導の
+  対話型インストーラ）をシリアルから自動操作する
+  （`tools/qemu/netbsd-autoinstall.py`。OpenBSD の `autoinstall(8)` と異なり応答
+  ファイル方式が無いため、キー送出ベースの自動化になっている）。
+- `toolchain` は **`rust-bin`**（バイナリパッケージ）を pkgin で導入する
+  （`rust`（ソースビルド）は QEMU 上で数時間かかるため避ける）。
+- x86_64 は Rust 1.96.0、aarch64 は Rust 1.91.1 が pkgsrc から入手できる
+  （veil の MSRV を満たすか要確認）。
 
 段階を分けて実行することもできる（失敗時はその段階から再開できる）:
 
@@ -195,8 +216,8 @@ FreeBSD 専用 I/O 経路だけが異なる**。cargo にはターゲット別�
 | `full-freebsd` | **jemalloc** | **`aio`**（POSIX AIO 経路、F-127） | `build-cross.sh --target freebsd` / `bsd-vm.sh freebsd …` |
 | `full-openbsd` | **システムアロケータ**（`global_allocator` を差し替えない） | **`system-tls`**（F-137、システムの LibreSSL へ動的リンク） | `bsd-vm.sh openbsd …`（既定） |
 | `full-openbsd-vendor` | 同上 | 従来の同梱構成（rustls+ring / quiche+BoringSSL 同梱） | `CARGO_FEATURES=full-openbsd-vendor` を明示指定 |
-| `full-netbsd` | システムアロケータ | `system-tls`（F-140、OpenBSD と同じ扱い） | コード側のみ完成。`bsd-vm.sh` 未対応（上記「NetBSD 対応の現状」参照） |
-| `full-netbsd-vendor` | 同上 | 従来の同梱構成（rustls+ring / quiche+BoringSSL 同梱） | 同上 |
+| `full-netbsd` | システムアロケータ | `system-tls`（F-140、OpenBSD と同じ扱い） | `bsd-vm.sh netbsd …`（既定。実 VM 検証は未実施、上記「NetBSD 対応の現状」参照） |
+| `full-netbsd-vendor` | 同上 | 従来の同梱構成（rustls+ring / quiche+BoringSSL 同梱） | `CARGO_FEATURES=full-netbsd-vendor` を明示指定 |
 
 **F-137: OpenBSD の既定は `system-tls`**。OpenBSD ベースの LibreSSL（`libssl.pc`/
 `libcrypto.pc`）へ動的リンクし、vendored な暗号ライブラリ（quiche の BoringSSL cmake
@@ -340,6 +361,8 @@ packaging/output/veil-<version>-x86_64-unknown-freebsd.tar.gz    # build-bsd.sh�
 packaging/output/veil-<version>-aarch64-unknown-freebsd.tar.gz   # build-bsd.sh（QEMU VM ビルド）
 packaging/output/veil-<version>-x86_64-unknown-openbsd.tar.gz    # build-bsd.sh（QEMU VM ビルド）
 packaging/output/veil-<version>-aarch64-unknown-openbsd.tar.gz   # build-bsd.sh（QEMU VM ビルド）
+packaging/output/veil-<version>-x86_64-unknown-netbsd.tar.gz     # build-bsd.sh（QEMU VM ビルド、F-140）
+packaging/output/veil-<version>-aarch64-unknown-netbsd.tar.gz    # build-bsd.sh（QEMU VM ビルド、F-140）
 packaging/output/veil-<version>-x86_64-unknown-freebsd.tar.gz   # build-cross.sh --target freebsd（B-49 により現在失敗）
 packaging/output/veil-<version>-universal2-apple-darwin.tar.gz # build-cross.sh --target macos
 packaging/output/veil-<version>-x86_64-pc-windows-msvc.zip      # build-cross.sh --target windows
@@ -472,6 +495,6 @@ sudo tail -50 /var/log/veil/veil.error-*.log
 | [docker/Dockerfile.macos](../docker/Dockerfile.macos) | macOS universal2 クロスビルド（キャッシュ有効） |
 | [docker/Dockerfile.windows](../docker/Dockerfile.windows) | Windows x86_64/aarch64 クロスビルド（キャッシュ有効） |
 | [docker/Dockerfile.freebsd](../docker/Dockerfile.freebsd) | FreeBSD x86_64 クロスビルド（キャッシュ有効） |
-| [tools/qemu/bsd-vm.sh](../tools/qemu/README.md) | FreeBSD/OpenBSD × x86_64/aarch64 の VM ビルド・E2E・バイナリ取得（`<os> <arch> all` で一括） |
+| [tools/qemu/bsd-vm.sh](../tools/qemu/README.md) | FreeBSD/OpenBSD/NetBSD × x86_64/aarch64 の VM ビルド・E2E・バイナリ取得（`<os> <arch> all` で一括） |
 | [packaging/scripts/build-bsd.sh](scripts/build-bsd.sh) | 上記の取得物を tar.gz 化（`--from-qemu` / `--all`） |
 | [examples/config.toml](../examples/config.toml) | 設定リファレンス |
