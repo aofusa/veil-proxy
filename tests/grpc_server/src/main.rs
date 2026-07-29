@@ -37,9 +37,19 @@ impl TestService for MyTestService {
     }
 
     async fn unary_call(&self, request: Request<SimpleRequest>) -> Result<Response<SimpleResponse>, Status> {
+        // F-133 E2E: WASM が付与したリクエストヘッダ `x-wasm-request-rewrite` が
+        // バックエンドまで届いたことをクライアントから観測できるよう、受信した値を
+        // そのまま `x-echoed-wasm-header` レスポンスメタデータへ反射する。
+        // ヘッダが無い通常のリクエストでは何もしない（既存テストへの影響なし）。
+        let echoed_header = request.metadata().get("x-wasm-request-rewrite").cloned();
         let req = request.into_inner();
         let mut resp = Response::new(SimpleResponse { message: req.message });
         self.apply_server_id(&mut resp);
+        if let Some(v) = echoed_header {
+            if let Ok(v) = v.to_str().unwrap_or("").parse() {
+                resp.metadata_mut().insert("x-echoed-wasm-header", v);
+            }
+        }
         Ok(resp)
     }
 

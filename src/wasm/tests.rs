@@ -365,6 +365,229 @@ mod integration_tests {
     }
 }
 
+// F-135: `[wasm] interpreter` (Pulley) オプションのテスト
+mod interpreter_tests {
+    use crate::wasm::{FilterEngine, FilterResult, ModuleConfig, ModuleRegistry, WasmConfig};
+    use std::sync::Arc;
+
+    const FIXTURE: &str = "tests/fixtures/wasm/header_filter.wasm";
+
+    fn config_with_interpreter(interpreter: bool) -> WasmConfig {
+        WasmConfig {
+            enabled: true,
+            defaults: Default::default(),
+            modules: vec![ModuleConfig {
+                name: "header_filter".to_string(),
+                path: FIXTURE.to_string(),
+                configuration: String::new(),
+                capabilities: Default::default(),
+            }],
+            interpreter,
+        }
+    }
+
+    /// `interpreter = true` でも `ModuleRegistry::new` が成功し、
+    /// 実モジュール（header_filter.wasm）をロードできる（F-135）。
+    #[test]
+    fn interpreter_true_loads_module() {
+        if !std::path::Path::new(FIXTURE).exists() {
+            eprintln!("wasm fixture missing; skipping");
+            return;
+        }
+        let config = config_with_interpreter(true);
+        let registry = ModuleRegistry::new(&config).expect("Pulley engine should build & load");
+        assert!(registry.get_module("header_filter").is_some());
+    }
+
+    /// `interpreter = true` / `false` で同じモジュールを実行しても、
+    /// 同じヘッダ変更結果になる（Pulley とネイティブ JIT の実行結果等価性）。
+    #[test]
+    fn interpreter_true_and_false_produce_equivalent_results() {
+        if !std::path::Path::new(FIXTURE).exists() {
+            eprintln!("wasm fixture missing; skipping");
+            return;
+        }
+
+        let headers = vec![
+            (b":path".to_vec(), b"/".to_vec()),
+            (b":method".to_vec(), b"GET".to_vec()),
+            (b":authority".to_vec(), b"example.com".to_vec()),
+        ];
+
+        let run = |interpreter: bool| -> FilterResult {
+            let config = config_with_interpreter(interpreter);
+            let engine = FilterEngine::new(&config).expect("engine should build");
+            futures::executor::block_on(engine.on_request_headers_with_modules(
+                &["header_filter".to_string()],
+                &Arc::from("/"),
+                &Arc::from("GET"),
+                headers.clone(),
+                &Arc::from("127.0.0.1"),
+                true,
+            ))
+        };
+
+        let jit_result = run(false);
+        let pulley_result = run(true);
+
+        fn variant_tag(r: &FilterResult) -> &'static str {
+            match r {
+                FilterResult::Continue { .. } => "continue",
+                FilterResult::Pause => "pause",
+                FilterResult::LocalResponse(_) => "local_response",
+            }
+        }
+
+        assert_eq!(
+            variant_tag(&jit_result),
+            variant_tag(&pulley_result),
+            "Cranelift JIT and Pulley interpreter should produce the same filter action"
+        );
+
+        if let (
+            FilterResult::Continue {
+                headers: jit_headers,
+                ..
+            },
+            FilterResult::Continue {
+                headers: pulley_headers,
+                ..
+            },
+        ) = (&jit_result, &pulley_result)
+        {
+            assert_eq!(
+                jit_headers, pulley_headers,
+                "Cranelift JIT and Pulley interpreter should produce the same header mutations"
+            );
+        }
+    }
+}
+
+// F-132: HTTP/3 経路が使う on_log / ボディフィルタ共有ヘルパのテスト
+// （E2E は独立プロセスの実サーバを叩くため、実サーバ内部の
+// `persistent_context::CONTEXT_REGISTRY` は同一プロセス内でしか観測できない。
+// 設計メモの指示どおり、コンテキスト解放の検証は本ファイル側で行う）。
+mod f132_h3_lifecycle_tests {
+    use crate::wasm::http_executor::{
+        apply_wasm_request_body, apply_wasm_response_body, set_content_length_header,
+        WasmBodyOutcome,
+    };
+    use crate::wasm::{on_request_complete_async, FilterEngine, ModuleConfig, WasmConfig};
+    use std::sync::Arc;
+
+    const FIXTURE: &str = "tests/fixtures/wasm/header_filter.wasm";
+
+    fn engine_with_header_filter() -> Option<FilterEngine> {
+        if !std::path::Path::new(FIXTURE).exists() {
+            return None;
+        }
+        let config = WasmConfig {
+            enabled: true,
+            defaults: Default::default(),
+            modules: vec![ModuleConfig {
+                name: "header_filter".to_string(),
+                path: FIXTURE.to_string(),
+                configuration: String::new(),
+                capabilities: Default::default(),
+            }],
+            interpreter: false,
+        };
+        Some(FilterEngine::new(&config).expect("engine should build"))
+    }
+
+    /// on_log（`on_request_complete_async`）をリクエストヘッダ処理に続けて繰り返し呼んでも
+    /// `persistent_context` のコンテキスト数が単調増加しないこと（F-132 のコンテキストリーク
+    /// 対策の回帰テスト）。
+    #[test]
+    fn on_log_after_repeated_requests_does_not_leak_contexts() {
+        let Some(engine) = engine_with_header_filter() else {
+            eprintln!("wasm fixture missing; skipping");
+            return;
+        };
+        let engine = Arc::new(engine);
+        let modules = Arc::new(vec!["header_filter".to_string()]);
+
+        let before = crate::wasm::get_context_stats().total_contexts;
+
+        for _ in 0..10 {
+            let headers = vec![
+                (b":path".to_vec(), b"/wasm/".to_vec()),
+                (b":method".to_vec(), b"GET".to_vec()),
+            ];
+            let _ = futures::executor::block_on(engine.on_request_headers_with_modules(
+                &modules,
+                &Arc::from("/wasm/"),
+                &Arc::from("GET"),
+                headers,
+                &Arc::from("127.0.0.1"),
+                true,
+            ));
+            futures::executor::block_on(on_request_complete_async(engine.clone(), modules.clone()));
+        }
+
+        let after = crate::wasm::get_context_stats().total_contexts;
+        assert!(
+            after <= before,
+            "on_log should not leave contexts registered: before={} after={}",
+            before,
+            after
+        );
+    }
+
+    /// リクエスト/レスポンスボディフィルタの共有ヘルパ（HTTP/3 経路が使う）が
+    /// モジュール未設定時はゼロコピーでそのまま返し、モジュール設定時は
+    /// `BodyFilterResult` を正しく変換すること。
+    #[test]
+    fn body_filter_helpers_passthrough_without_modules() {
+        let Some(engine) = engine_with_header_filter() else {
+            eprintln!("wasm fixture missing; skipping");
+            return;
+        };
+        let body = bytes::Bytes::from_static(b"hello world");
+
+        let req_result = futures::executor::block_on(apply_wasm_request_body(
+            &engine,
+            &[], // モジュール未指定 -> ゼロコピーでそのまま
+            body.clone(),
+            true,
+        ));
+        match req_result {
+            WasmBodyOutcome::Continue(b) => assert_eq!(b, body),
+            WasmBodyOutcome::LocalResponse(_) => panic!("unexpected LocalResponse"),
+        }
+
+        let resp_result =
+            futures::executor::block_on(apply_wasm_response_body(&engine, &[], body.clone(), true));
+        match resp_result {
+            WasmBodyOutcome::Continue(b) => assert_eq!(b, body),
+            WasmBodyOutcome::LocalResponse(_) => panic!("unexpected LocalResponse"),
+        }
+    }
+
+    /// B-46: `set_content_length_header` は既存の content-length（大小文字問わず）を
+    /// 除去してから新しい本文長を1つだけ追加する（重複させない）。
+    #[test]
+    fn set_content_length_header_replaces_existing() {
+        let mut headers = vec![
+            (b"Content-Length".to_vec(), b"999".to_vec()),
+            (b"x-other".to_vec(), b"keep".to_vec()),
+        ];
+        set_content_length_header(&mut headers, 42);
+
+        let content_length_count = headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case(b"content-length"))
+            .count();
+        assert_eq!(content_length_count, 1, "must not duplicate content-length");
+        assert!(headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case(b"content-length") && value == b"42"));
+        assert!(headers
+            .iter()
+            .any(|(name, value)| name == b"x-other" && value == b"keep"));
+    }
+}
+
 // Host function tests - tests the Proxy-Wasm ABI implementation
 mod host_function_tests {
     use crate::wasm::capabilities::{CapabilityPreset, ModuleCapabilities};
@@ -1234,5 +1457,162 @@ mod body_buffer_tests {
         let buf = BodyBuffer::empty();
         assert!(buf.is_empty());
         assert_eq!(buf.len(), 0);
+    }
+}
+
+/// F-133: L4 network filter（Proxy-Wasm `StreamContext` ABI）のディスパッチ・
+/// データ書き換え・`Pause`/`Close` アクションの単体テスト。
+mod f133_network_filter_tests {
+    use crate::wasm::{FilterEngine, ModuleConfig, NetworkAction, NetworkFilterResult, WasmConfig};
+    use bytes::Bytes;
+
+    const FIXTURE: &str = "tests/fixtures/wasm/network_filter.wasm";
+
+    fn network_filter_engine() -> Option<FilterEngine> {
+        if !std::path::Path::new(FIXTURE).exists() {
+            return None;
+        }
+        let config = WasmConfig {
+            enabled: true,
+            defaults: Default::default(),
+            modules: vec![ModuleConfig {
+                name: "network_filter".to_string(),
+                path: FIXTURE.to_string(),
+                configuration: String::new(),
+                capabilities: crate::wasm::ModuleCapabilities {
+                    allow_downstream_data_read: true,
+                    allow_downstream_data_write: true,
+                    allow_upstream_data_read: true,
+                    allow_upstream_data_write: true,
+                    ..Default::default()
+                },
+            }],
+            interpreter: false,
+        };
+        Some(FilterEngine::new(&config).expect("engine should build"))
+    }
+
+    /// モジュール未指定（空リスト）はゼロコピーでそのまま Continue（ホットパス絶対規則:
+    /// WASM 無効時のディスパッチは早期 return の 1 分岐のみ）。
+    #[test]
+    fn empty_modules_passthrough_without_instantiation() {
+        let Some(engine) = network_filter_engine() else {
+            eprintln!("wasm fixture missing; skipping");
+            return;
+        };
+        let data = Bytes::from_static(b"foo bar baz");
+        let result = futures::executor::block_on(engine.on_downstream_data_with_modules(
+            &[],
+            data.clone(),
+            false,
+        ));
+        match result {
+            NetworkFilterResult::Continue { data: out } => assert_eq!(out, data),
+            _ => panic!("expected Continue passthrough"),
+        }
+    }
+
+    #[test]
+    fn on_new_connection_continues_without_marker() {
+        let Some(engine) = network_filter_engine() else {
+            eprintln!("wasm fixture missing; skipping");
+            return;
+        };
+        let modules = vec!["network_filter".to_string()];
+        let action = futures::executor::block_on(engine.on_new_connection_with_modules(&modules));
+        assert_eq!(action, NetworkAction::Continue);
+    }
+
+    /// downstream data 中の `foo` が `bar` に書き換わること（proxy_get/set_buffer_bytes
+    /// 経由の DownstreamData バッファ操作）。
+    #[test]
+    fn downstream_data_rewrite_foo_to_bar() {
+        let Some(engine) = network_filter_engine() else {
+            eprintln!("wasm fixture missing; skipping");
+            return;
+        };
+        let modules = vec!["network_filter".to_string()];
+        let data = Bytes::from_static(b"foofoo hello");
+        let result = futures::executor::block_on(
+            engine.on_downstream_data_with_modules(&modules, data, false),
+        );
+        match result {
+            NetworkFilterResult::Continue { data } => {
+                assert_eq!(&data[..], b"barbar hello");
+            }
+            _ => panic!("expected Continue with rewritten data"),
+        }
+    }
+
+    /// upstream data 中の `bar` が `baz` に書き換わること。
+    #[test]
+    fn upstream_data_rewrite_bar_to_baz() {
+        let Some(engine) = network_filter_engine() else {
+            eprintln!("wasm fixture missing; skipping");
+            return;
+        };
+        let modules = vec!["network_filter".to_string()];
+        let data = Bytes::from_static(b"bar response");
+        let result = futures::executor::block_on(
+            engine.on_upstream_data_with_modules(&modules, data, false),
+        );
+        match result {
+            NetworkFilterResult::Continue { data } => {
+                assert_eq!(&data[..], b"baz response");
+            }
+            _ => panic!("expected Continue with rewritten data"),
+        }
+    }
+
+    /// downstream data に `CLOSE_ME` マーカーが含まれる場合、モジュールが
+    /// `proxy_close_stream` を呼び、エンジンは `NetworkFilterResult::Close` を返す。
+    #[test]
+    fn downstream_data_close_marker_triggers_close() {
+        let Some(engine) = network_filter_engine() else {
+            eprintln!("wasm fixture missing; skipping");
+            return;
+        };
+        let modules = vec!["network_filter".to_string()];
+        let data = Bytes::from_static(b"please CLOSE_ME now");
+        let result = futures::executor::block_on(
+            engine.on_downstream_data_with_modules(&modules, data, false),
+        );
+        assert!(
+            matches!(result, NetworkFilterResult::Close),
+            "expected Close action on CLOSE_ME marker"
+        );
+    }
+
+    /// データに変更が無い場合は元のバッファがそのまま返る（コピーの有無は問わないが
+    /// 中身が完全一致すること）。
+    #[test]
+    fn downstream_data_unchanged_when_no_match() {
+        let Some(engine) = network_filter_engine() else {
+            eprintln!("wasm fixture missing; skipping");
+            return;
+        };
+        let modules = vec!["network_filter".to_string()];
+        let data = Bytes::from_static(b"nothing to see here");
+        let result = futures::executor::block_on(engine.on_downstream_data_with_modules(
+            &modules,
+            data.clone(),
+            false,
+        ));
+        match result {
+            NetworkFilterResult::Continue { data: out } => assert_eq!(out, data),
+            _ => panic!("expected Continue with unchanged data"),
+        }
+    }
+
+    /// on_downstream_close / on_upstream_close はパニックせず完走する。
+    #[test]
+    fn close_callbacks_run_without_panic() {
+        let Some(engine) = network_filter_engine() else {
+            eprintln!("wasm fixture missing; skipping");
+            return;
+        };
+        let modules = vec!["network_filter".to_string()];
+        futures::executor::block_on(engine.on_downstream_close_with_modules(&modules));
+        futures::executor::block_on(engine.on_upstream_close_with_modules(&modules));
     }
 }

@@ -54,6 +54,7 @@ PROXY_L4_PORT=8444
 PROXY_L4_LEAST_CONN_PORT=8445
 PROXY_L4_TERMINATE_PORT=8446
 PROXY_L4_UDP_PORT=8447
+PROXY_L4_WASM_PORT=8448  # F-133: L4 network filter (WASM) E2E 用
 BACKEND1_PORT=9001
 BACKEND2_PORT=9002
 BACKEND_H2C_TLS_PORT=9013
@@ -286,6 +287,14 @@ prepare_fixtures() {
     }
     copy_wasm_module "header_filter.wasm"
     copy_wasm_module "http_call_filter.wasm"
+    # F-132: HTTP/3 WASM LocalResponse E2E 用（WAF フィルタは既定 CRS Level2/Block で
+    # SQLi 等のパターンを 403 で遮断する。tests/wasm は gitignore 対象のため
+    # tests/fixtures/wasm にも追跡済みコピーを置きフォールバックにしている）。
+    copy_wasm_module "waf_filter.wasm"
+    # F-133: L4 network filter（StreamContext ABI）E2E 用
+    copy_wasm_module "network_filter.wasm"
+    # F-133: gRPC トレーラー/リクエストヘッダ書き換え E2E 用
+    copy_wasm_module "grpc_trailer_filter.wasm"
 }
 
 # 設定ファイルを生成
@@ -1202,7 +1211,57 @@ allow_http_calls = true
 allowed_upstreams = ["bad-pool"]
 EOF
             fi
-            
+
+            # F-132: HTTP/3 WASM LocalResponse E2E 用（WAF が SQLi 等を 403 で遮断する）
+            if [ -f "${FIXTURES_DIR}/wasm/waf_filter.wasm" ]; then
+                cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
+
+[[wasm.modules]]
+name = "waf_filter"
+path = "${FIXTURES_DIR}/wasm/waf_filter.wasm"
+
+[wasm.modules.capabilities]
+allow_logging = true
+allow_request_headers_read = true
+allow_request_headers_write = true
+allow_send_local_response = true
+EOF
+            fi
+
+            # F-133: L4 network filter（StreamContext ABI、foo->bar/bar->baz 書き換え + CLOSE_ME 切断）
+            if [ -f "${FIXTURES_DIR}/wasm/network_filter.wasm" ]; then
+                cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
+
+[[wasm.modules]]
+name = "network_filter"
+path = "${FIXTURES_DIR}/wasm/network_filter.wasm"
+
+[wasm.modules.capabilities]
+allow_logging = true
+allow_downstream_data_read = true
+allow_downstream_data_write = true
+allow_upstream_data_read = true
+allow_upstream_data_write = true
+EOF
+            fi
+
+            # F-133: gRPC トレーラー（grpc-status/grpc-message）書き換え + リクエストヘッダ書き換え
+            if [ -f "${FIXTURES_DIR}/wasm/grpc_trailer_filter.wasm" ]; then
+                cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
+
+[[wasm.modules]]
+name = "grpc_trailer_filter"
+path = "${FIXTURES_DIR}/wasm/grpc_trailer_filter.wasm"
+
+[wasm.modules.capabilities]
+allow_logging = true
+allow_request_headers_read = true
+allow_request_headers_write = true
+allow_response_headers_read = true
+allow_response_headers_write = true
+EOF
+            fi
+
             # WASMモジュールを適用するルートを追加
             # 注意: modulesはroute直下（[route.action]配下ではなく）に設定する必要がある
             cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
@@ -1251,6 +1310,97 @@ path = "/wasm-http-call/*"
 [route.action]
 type = "Proxy"
 upstream = "backend-pool"
+EOF
+            fi
+
+            # F-132: WAF フィルタのルート（LocalResponse / 静的配信 WASM 適用の両方で使う）
+            if [ -f "${FIXTURES_DIR}/wasm/waf_filter.wasm" ]; then
+                cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
+
+[[route]]
+modules = ["waf_filter"]
+[route.conditions]
+host = "localhost"
+path = "/waf/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+
+[[route]]
+modules = ["waf_filter"]
+[route.conditions]
+host = "127.0.0.1"
+path = "/waf/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+
+[[route]]
+modules = ["header_filter"]
+[route.conditions]
+host = "localhost"
+path = "/wasm-static"
+[route.action]
+type = "File"
+path = "${FIXTURES_DIR}/proxy_health.json"
+
+[[route]]
+modules = ["header_filter"]
+[route.conditions]
+host = "127.0.0.1"
+path = "/wasm-static"
+[route.action]
+type = "File"
+path = "${FIXTURES_DIR}/proxy_health.json"
+EOF
+            fi
+
+            # F-133: gRPC トレーラー/リクエストヘッダ書き換え E2E 用の専用ルート。
+            # 既存の /grpc.test.v1.TestService/* ルート（header_filter 適用、host=localhost/127.0.0.1）
+            # には触れず、別 host 条件（grpc-wasm-trailer.test）で新規に追加する
+            # （既存 test_grpc_wasm_interceptor 等への影響を避けるため）。
+            if [ -f "${FIXTURES_DIR}/wasm/grpc_trailer_filter.wasm" ]; then
+                cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
+
+[[route]]
+modules = ["grpc_trailer_filter"]
+[route.conditions]
+host = "grpc-wasm-trailer.test"
+path = "/grpc.test.v1.TestService/*"
+[route.action]
+type = "Proxy"
+upstream = "grpc-pool"
+use_h2c = true
+[route.buffering]
+mode = "full"
+max_memory_buffer = 64
+max_disk_buffer = 64
+EOF
+            fi
+
+            # F-133: L4 network filter 用の専用リスナー（既存の l4-passthrough 等の
+            # リスナー設定には一切触れず、新しいポートで追加する）。他の config_type
+            # では [wasm.modules] に network_filter が定義されないため、この
+            # [[l4]] ブロック自体をここ（config_type=wasm/default の場合のみ）に置く
+            # ことで「未定義 WASM モジュール参照」による起動失敗を避けている。
+            if [ -f "${FIXTURES_DIR}/wasm/network_filter.wasm" ]; then
+                cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
+
+# L4 TCP プロキシ（WASM network filter、F-133）: foo->bar（downstream）/
+# bar->baz（upstream）書き換えと CLOSE_ME マーカーでの切断を検証する。
+# backend は HTTP body-echo（BACKEND_ECHO_PORT）を使い、1 往復で両方向の
+# 書き換えを観測できるようにする（client が送った foo は downstream で bar に
+# 書き換わりバックエンドへ届き、echo された bar は upstream で baz に書き換わって
+# client へ返る）。
+[[l4]]
+name = "l4-wasm-network-filter"
+listen = "127.0.0.1:${PROXY_L4_WASM_PORT}"
+lb = "round_robin"
+tls = "none"
+wasm_modules = ["network_filter"]
+
+  [[l4.upstreams]]
+  addr = "127.0.0.1:${BACKEND_ECHO_PORT}"
 EOF
             fi
         fi
@@ -1802,7 +1952,7 @@ check_port_conflicts() {
     log_info "Checking for port conflicts..."
     local conflicts=0
     
-    for port in $PROXY_HTTPS_PORT $PROXY_HTTP_PORT $PROXY_H2C_PORT $PROXY_L4_PORT $PROXY_L4_LEAST_CONN_PORT $PROXY_L4_TERMINATE_PORT $PROXY_L4_UDP_PORT $BACKEND1_PORT $BACKEND2_PORT $BACKEND_H2C_PORT $BACKEND_GRPC_PORT $BACKEND_GRPC2_PORT $BACKEND_WS_PORT $BACKEND_ERROR_PORT $BACKEND_BAD_PORT $BACKEND_CHUNKED_PORT $BACKEND_ECHO_PORT $BACKEND_TLS_ECHO_PORT $BACKEND_UDP_ECHO_PORT; do
+    for port in $PROXY_HTTPS_PORT $PROXY_HTTP_PORT $PROXY_H2C_PORT $PROXY_L4_PORT $PROXY_L4_LEAST_CONN_PORT $PROXY_L4_TERMINATE_PORT $PROXY_L4_UDP_PORT $PROXY_L4_WASM_PORT $BACKEND1_PORT $BACKEND2_PORT $BACKEND_H2C_PORT $BACKEND_GRPC_PORT $BACKEND_GRPC2_PORT $BACKEND_WS_PORT $BACKEND_ERROR_PORT $BACKEND_BAD_PORT $BACKEND_CHUNKED_PORT $BACKEND_ECHO_PORT $BACKEND_TLS_ECHO_PORT $BACKEND_UDP_ECHO_PORT; do
         if check_port_in_use "$port"; then
             log_error "Port $port is already in use"
             conflicts=$((conflicts + 1))
