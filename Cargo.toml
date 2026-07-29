@@ -386,16 +386,24 @@ full-openbsd-aarch64-vendor = [
 # NetBSD: OpenBSD をテンプレートに横展開した feature セット（F-140）。
 # NetBSD には pledge/unveil 相当のランタイム API が無く（`src/security.rs` の
 # `netbsd` モジュール参照）、veil が提供できるのは chroot(2) + 特権降格 + rlimit
-# のみだが、TLS/wasm/機能セット自体は OpenBSD と同一内容にできる
-# （rustls=ring、quiche=boringssl-boring-crate、wasm=Pulley インタープリタ常時）。
+# のみだが、TLS/機能セット自体は OpenBSD と同一内容にできる
+# （rustls=ring、quiche=boringssl-boring-crate）。
 # システムアロケータ（mimalloc/jemalloc とも無効化）を使う点も OpenBSD と同じ。
+#
+# **wasm は含めない（B-55 更新）**。実機検証（NetBSD 10.1 amd64 / QEMU）で判明した
+# とおり、wasmtime 40 は NetBSD を **x86_64 を含む全アーキテクチャで**サポートしない
+# （`signals.rs` に NetBSD 向け ucontext 分岐が一切無く、x86_64 でも
+# `compile_error!("unsupported platform")` になる。詳細は B-55 参照）。
+# OpenBSD/FreeBSD の x86_64 は実機動作実績があるため wasm を維持しており、
+# NetBSD だけが全アーキ非対応という OpenBSD/FreeBSD（aarch64 のみ非対応）とは
+# 異なる扱いになる。
 #
 # F-140: 既定の NetBSD packaging 構成は `system-tls`（システムの OpenSSL/LibreSSL へ
 # 動的リンク）。従来の同梱（rustls+ring / quiche+BoringSSL 同梱）構成が必要な場合は
 # 下の `full-netbsd-vendor` を使う。
 full-netbsd = [
     "ktls", "http2", "http3",
-    "grpc-full", "wasm",
+    "grpc-full",
     "opentelemetry",
     "compression", "cache", "metrics",
     "websocket", "rate-limit", "buffering",
@@ -409,9 +417,11 @@ full-netbsd = [
 
 # NetBSD: 従来の rustls+ring / quiche+BoringSSL 同梱構成（vendored、`full-openbsd-vendor`
 # と同一内容）。`system-tls` の代わりに `netbsd-vendor-tls` を有効化する。
+# `full-netbsd` と同じ理由（B-55: wasmtime が NetBSD を全アーキ非対応）で
+# `wasm` は含めない。
 full-netbsd-vendor = [
     "ktls", "http2", "http3",
-    "grpc-full", "wasm",
+    "grpc-full",
     "opentelemetry",
     "compression", "cache", "metrics",
     "websocket", "rate-limit", "buffering",
@@ -422,10 +432,10 @@ full-netbsd-vendor = [
     "netbsd-vendor-tls",
 ]
 
-# NetBSD の **aarch64** 向け feature セット（B-55）。`full-netbsd` から **`wasm` だけを
-# 外した**もの。wasmtime 40 のシグナルベーストラップ実装が BSD × aarch64 に対応して
-# いないため（`full-freebsd-aarch64`/`full-openbsd-aarch64` と同じ理由）、NetBSD
-# aarch64 でも wasm を含められない。x86_64 は従来どおり wasm 込み。
+# NetBSD の **aarch64** 向け feature セット（B-55）。`full-netbsd`（x86_64、こちらも
+# wasm 抜き）と同一内容。NetBSD は x86_64 も含め全アーキテクチャで wasmtime 非対応の
+# ため、他 BSD（`full-freebsd-aarch64`/`full-openbsd-aarch64` は aarch64 のみ非対応）
+# と違い x86_64/aarch64 の区別自体が無くなっている（feature 名は互換性のため維持）。
 full-netbsd-aarch64 = [
     "ktls", "http2", "http3",
     "grpc-full",

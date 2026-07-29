@@ -298,6 +298,32 @@ quiche が使う **BoringSSL（boring-sys）は OpenBSD を想定していない
    pkgsrc パッケージのディレクトリ番号（10.0）は異なる**。
 7. **Rust は `rust-bin`（バイナリパッケージ）を使うこと。** ソースの `rust` は
    QEMU 上で数時間かかる。
+8. **wasmtime 40 は NetBSD を全アーキテクチャでサポートしない（B-55 更新）。**
+   `cargo build --no-default-features --features full-netbsd`（当時 `wasm` 込み）が
+   依存の wasmtime でコンパイルエラーになった:
+   ```
+   error: unsupported platform
+     --> wasmtime-40.0.4/src/runtime/vm/sys/unix/signals.rs:329:13
+         compile_error!("unsupported platform");
+   error: unsupported platform
+     --> wasmtime-40.0.4/src/runtime/vm/sys/unix/signals.rs:401:13
+   error: could not compile `wasmtime` (lib) due to 2 previous errors
+   ```
+   wasmtime のシグナルベーストラップ実装（`signals.rs`）には NetBSD 向けの
+   `ucontext` 分岐が一切無く、**x86_64 ですら**このエラーになる。B-55 は当初
+   「BSD × aarch64 のみ非対応」という内容だったが、NetBSD は x86_64 を含む全
+   アーキテクチャで非対応であることが判明したため範囲を拡張した
+   （`has_native_signals` はホストの target_arch から wasmtime の build.rs が
+   導出するため cargo feature で無効化できず、Pulley インタープリタへの切替でも
+   回避できない）。対応として `Cargo.toml` の `full-netbsd`/`full-netbsd-vendor`
+   からも `wasm` を除外した（`full-netbsd-aarch64`/`full-netbsd-aarch64-vendor` は
+   元々除外済み）。詳細は `docs/backlog/bugs/B-55-wasmtime-no-bsd-aarch64.md` 参照。
+9. **`system-tls` を使うには `pkgconf` の導入が必須。** NetBSD base には
+   OpenSSL 3.0.12 と `/usr/lib/pkgconfig/openssl.pc` が既にあるが、
+   `pkg-config` コマンド自体は base に含まれておらず pkgsrc の `pkgconf` が
+   要る。無いと `openssl-sys` のビルドスクリプトが `Could not find directory of
+   OpenSSL installation` で失敗する。`cmd_toolchain` の `pkgin install` 一覧には
+   元々 `pkgconf` を含めてあったため追加対応は不要（実機で有効性を確認）。
 
 以下は設計時点の想定として残す（上記で否定/確認された項目を含む）。
 

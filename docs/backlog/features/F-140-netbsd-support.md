@@ -58,6 +58,17 @@ OpenBSD 対応（F-120 Phase 5 / F-122 / B-52 / F-136 / F-137）をテンプレ�
 - `src/wasm/types.rs`: `interpreter = false` が NetBSD でも無視される旨の警告を追加。
 - aarch64 は wasmtime のシグナルベーストラップが BSD×aarch64 未対応（B-55）のため、
   `full-netbsd-aarch64`/`full-netbsd-aarch64-vendor` は wasm 抜き。
+- **【2026-07-29 実機検証で追記】NetBSD は x86_64 も wasmtime 非対応と判明**（B-55 更新）。
+  NetBSD 10.1 amd64（QEMU 実機）で `cargo build --no-default-features --features
+  full-netbsd`（当時 wasm 込み）を実行すると `wasmtime-40.0.4/src/runtime/vm/sys/
+  unix/signals.rs` の `compile_error!("unsupported platform")` で失敗した。
+  `signals.rs` には NetBSD 向けの `ucontext` 分岐が x86_64/aarch64 とも存在しない
+  （FreeBSD/OpenBSD は x86_64 分岐だけは存在する点で NetBSD よりまだマシ）。Pulley
+  インタープリタへの切替でも回避不能（失敗は wasmtime 自身の build.rs によるホスト
+  target_arch 判定の時点で起きるため、`Config::target` の選択より前の話）。
+  対応として `full-netbsd`/`full-netbsd-vendor`（x86_64 向け）からも `wasm` を除外した
+  （`full-netbsd-aarch64`/`full-netbsd-aarch64-vendor` は元々除外済みだったため変更不要）。
+  詳細は `docs/backlog/bugs/B-55-wasmtime-no-bsd-aarch64.md` 参照。
 
 ### セキュリティ（`src/security.rs`）
 
@@ -151,7 +162,12 @@ provision・toolchain・build・e2e はコーディネーターが別途実施�
     `pkg_add -v pkgin` で bootstrap する分岐を入れた。`PKG_PATH` は
     `https://cdn.NetBSD.org/pub/pkgsrc/packages/NetBSD/<arch>/<NETBSD_PKG_VER>/All/`
     （既定 `NETBSD_PKG_VER=10.0`。実際は `10.0_2026Q2` 等へ 302 リダイレクトされる
-    ことを `curl -sIL` で確認済み）。
+    ことを `curl -sIL` で確認済み）。**`pkgconf` は `system-tls`（既定の NetBSD
+    packaging 構成）に必須**であることを 2026-07-29 の実機検証で確認した:
+    NetBSD base には OpenSSL 3.0.12 と `/usr/lib/pkgconfig/openssl.pc` が既にあるが
+    `pkg-config` コマンド自体は base に無く、無いと `openssl-sys` のビルドが
+    `Could not find directory of OpenSSL installation` で失敗する。この一覧には
+    元々 `pkgconf` を含めてあったため追加対応は不要。
   - `_default_features`: `netbsd) echo "full-netbsd${suffix}"` を追加。
   - `_guest_env_prefix`: NetBSD 用に `LIBCLANG_PATH` の探索先を `/usr/pkg` に、
     `PATH` に `/usr/pkg/{bin,sbin}` を追加する分岐を追加（pkgsrc は `/usr/pkg`

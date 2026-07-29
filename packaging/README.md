@@ -125,11 +125,28 @@ NetBSD 向けの feature セット（`full-netbsd`/`full-netbsd-vendor`/`full-ne
 kqueue reactor の `struct kevent` 型差吸収）は **コード側は完成済み**。
 `tools/qemu/bsd-vm.sh`（`netbsd` os として追加）・`packaging/scripts/build-bsd.sh`・
 `packaging/bsd/netbsd/veil.rc` の組み込みも完了しており、以下の FreeBSD/OpenBSD 節と
-同じインタフェースで NetBSD も扱える。**ただし実 VM でのビルド・E2E 検証は
-コーディネーターが別途実施する**（本ドキュメント更新時点では QEMU 上の実起動確認は
-未実施）。詳細・既知の不確実点は
+同じインタフェースで NetBSD も扱える。2026-07-29 に NetBSD 10.1 amd64 の実機（QEMU）で
+setup/provision まで確認済み。詳細・既知の不確実点は
 [`docs/backlog/features/F-140-netbsd-support.md`](../docs/backlog/features/F-140-netbsd-support.md)
 と [`tools/qemu/README.md`](../tools/qemu/README.md) を参照。
+
+> **NetBSD バイナリは Proxy-Wasm 非対応（B-55）**: wasmtime 40 のシグナルベース
+> トラップ実装（`signals.rs`）に NetBSD 向けの `ucontext` 分岐が一切無く、実機
+> （NetBSD 10.1 amd64）で確認したところ **x86_64 ですら** `compile_error!
+> ("unsupported platform")` でビルドできない。FreeBSD/OpenBSD は aarch64 のみ
+> 非対応（別途 `full-freebsd-aarch64`/`full-openbsd-aarch64` あり）だが、NetBSD は
+> アーキテクチャ不問で非対応のため、`full-netbsd`/`full-netbsd-vendor`/
+> `full-netbsd-aarch64`/`full-netbsd-aarch64-vendor` の**全て**が `wasm` を含まない。
+> つまり NetBSD 向けにビルドした `veil` バイナリでは Proxy-Wasm 拡張フィルタは
+> 使えない。詳細は
+> [`docs/backlog/bugs/B-55-wasmtime-no-bsd-aarch64.md`](../docs/backlog/bugs/B-55-wasmtime-no-bsd-aarch64.md)。
+>
+> **`system-tls`（NetBSD の既定構成）のビルドには `pkgconf` の導入が必須**（実機で
+> 確認済み）: NetBSD base には OpenSSL 3.0.12 と `/usr/lib/pkgconfig/openssl.pc` が
+> 既にあるが、`pkg-config` コマンド自体は base に含まれておらず pkgsrc の `pkgconf`
+> パッケージが要る。無いと `openssl-sys` のビルドスクリプトが `Could not find
+> directory of OpenSSL installation` で失敗する。`tools/qemu/bsd-vm.sh` の NetBSD
+> `cmd_toolchain` は `pkgin install` 対象に `pkgconf` を含めている。
 
 ### FreeBSD / OpenBSD / NetBSD 向けパッケージ（F-120 Phase 6 / F-140）
 
@@ -216,8 +233,8 @@ FreeBSD 専用 I/O 経路だけが異なる**。cargo にはターゲット別�
 | `full-freebsd` | **jemalloc** | **`aio`**（POSIX AIO 経路、F-127） | `build-cross.sh --target freebsd` / `bsd-vm.sh freebsd …` |
 | `full-openbsd` | **システムアロケータ**（`global_allocator` を差し替えない） | **`system-tls`**（F-137、システムの LibreSSL へ動的リンク） | `bsd-vm.sh openbsd …`（既定） |
 | `full-openbsd-vendor` | 同上 | 従来の同梱構成（rustls+ring / quiche+BoringSSL 同梱） | `CARGO_FEATURES=full-openbsd-vendor` を明示指定 |
-| `full-netbsd` | システムアロケータ | `system-tls`（F-140、OpenBSD と同じ扱い） | `bsd-vm.sh netbsd …`（既定。実 VM 検証は未実施、上記「NetBSD 対応の現状」参照） |
-| `full-netbsd-vendor` | 同上 | 従来の同梱構成（rustls+ring / quiche+BoringSSL 同梱） | `CARGO_FEATURES=full-netbsd-vendor` を明示指定 |
+| `full-netbsd` | システムアロケータ | `system-tls`（F-140、OpenBSD と同じ扱い）。**`wasm` は含まない**（B-55） | `bsd-vm.sh netbsd …`（既定。実 VM 検証は未実施、上記「NetBSD 対応の現状」参照） |
+| `full-netbsd-vendor` | 同上 | 従来の同梱構成（rustls+ring / quiche+BoringSSL 同梱）。**`wasm` は含まない**（B-55） | `CARGO_FEATURES=full-netbsd-vendor` を明示指定 |
 
 **F-137: OpenBSD の既定は `system-tls`**。OpenBSD ベースの LibreSSL（`libssl.pc`/
 `libcrypto.pc`）へ動的リンクし、vendored な暗号ライブラリ（quiche の BoringSSL cmake
