@@ -96,6 +96,52 @@ fn check_write_capability(state: &HostState, map_type: i32) -> bool {
     }
 }
 
+/// F-134 適合度修正: 書き込み可能な MapType（0-3）かどうか。
+///
+/// Proxy-Wasm ABI v0.2.1 の Status には veil 独自拡張の `NOT_ALLOWED(13)` は
+/// 存在せず、13 は「capability による拒否」専用として veil が予約した値
+/// （`src/wasm/constants.rs` 参照）。読み取り専用 MapType（GrpcReceiveInitialMetadata=4 /
+/// GrpcReceiveTrailingMetadata=5 / HttpCallResponseHeaders=6 / HttpCallResponseTrailers=7）
+/// や未知の MapType への書き込みは capability の有無に関わらず仕様上 `BadArgument(2)`
+/// であるべきなので、capability チェックより前にこの判定を行う。
+fn is_writable_map_type(map_type: i32) -> bool {
+    matches!(
+        map_type,
+        HTTP_REQUEST_HEADERS
+            | HTTP_REQUEST_TRAILERS
+            | HTTP_RESPONSE_HEADERS
+            | HTTP_RESPONSE_TRAILERS
+    )
+}
+
+/// F-134 適合度修正: host が認識する MapType（0-7）かどうか。
+///
+/// `get_headers`/`get_headers_mut` が `None` を返すのは 2 通りの意味を持つ:
+/// (1) 完全に未知の MapType（`BadArgument` が正しい）、
+/// (2) 認識はしている読み取り専用型だが、まだデータが無い（例:
+/// `proxy_http_call`/gRPC 呼び出しの応答がまだ届いていない場合の
+/// HttpCallResponseHeaders/GrpcReceiveInitialMetadata 等）。
+/// 後者は ABI 上 `NotFound(1)` が適切（型自体は不正ではない）。
+/// この判定を capability チェックの後・データ取得の後で使い分ける。
+fn is_known_map_type(map_type: i32) -> bool {
+    #[cfg(feature = "grpc")]
+    if matches!(
+        map_type,
+        GRPC_RECEIVE_INITIAL_METADATA | GRPC_RECEIVE_TRAILING_METADATA
+    ) {
+        return true;
+    }
+    matches!(
+        map_type,
+        HTTP_REQUEST_HEADERS
+            | HTTP_REQUEST_TRAILERS
+            | HTTP_RESPONSE_HEADERS
+            | HTTP_RESPONSE_TRAILERS
+            | HTTP_CALL_RESPONSE_HEADERS
+            | HTTP_CALL_RESPONSE_TRAILERS
+    )
+}
+
 /// Helper to read string from WASM memory
 fn read_string(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option<String> {
     let memory = caller.get_export("memory")?;
@@ -163,6 +209,9 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
 
                 let headers = match get_headers(state, map_type) {
                     Some(h) => h.clone(),
+                    // F-134: 認識済みの読み取り専用型（gRPC 受信メタデータ/HTTP call
+                    // 応答）はデータ未到着なら NotFound、完全に未知の型のみ BadArgument。
+                    None if is_known_map_type(map_type) => return PROXY_RESULT_NOT_FOUND,
                     None => return PROXY_RESULT_BAD_ARGUMENT,
                 };
 
@@ -208,6 +257,10 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
         "env",
         "proxy_set_header_map_pairs",
         |mut caller: Caller<'_, HostState>, map_type: i32, map_ptr: i32, map_size: i32| -> i32 {
+            // F-134: 読み取り専用/未知の MapType は capability に関わらず BadArgument
+            if !is_writable_map_type(map_type) {
+                return PROXY_RESULT_BAD_ARGUMENT;
+            }
             // Check write capability
             {
                 let state = caller.data();
@@ -281,6 +334,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
 
                 let headers = match get_headers(caller.data(), map_type) {
                     Some(h) => h,
+                    // F-134: 認識済みの読み取り専用型はデータ未到着なら NotFound。
+                    None if is_known_map_type(map_type) => return PROXY_RESULT_NOT_FOUND,
                     None => return PROXY_RESULT_BAD_ARGUMENT,
                 };
 
@@ -341,6 +396,10 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
          value_ptr: i32,
          value_size: i32|
          -> i32 {
+            // F-134: 読み取り専用/未知の MapType は capability に関わらず BadArgument
+            if !is_writable_map_type(map_type) {
+                return PROXY_RESULT_BAD_ARGUMENT;
+            }
             // Check capability
             {
                 let state = caller.data();
@@ -441,6 +500,10 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
         "env",
         "proxy_remove_header_map_value",
         |mut caller: Caller<'_, HostState>, map_type: i32, key_ptr: i32, key_size: i32| -> i32 {
+            // F-134: 読み取り専用/未知の MapType は capability に関わらず BadArgument
+            if !is_writable_map_type(map_type) {
+                return PROXY_RESULT_BAD_ARGUMENT;
+            }
             // Check capability
             {
                 let state = caller.data();

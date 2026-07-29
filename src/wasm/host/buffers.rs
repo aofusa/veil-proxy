@@ -75,6 +75,41 @@ fn check_write_capability(state: &HostState, buffer_type: i32) -> bool {
     }
 }
 
+/// F-134 適合度修正: 書き込み可能な BufferType（0-3）かどうか。
+///
+/// veil 独自拡張の `NOT_ALLOWED(13)` は「capability による拒否」専用に限定する
+/// （`src/wasm/constants.rs` 参照）。読み取り専用 BufferType（HttpCallResponseBody=4 /
+/// GrpcReceiveBuffer=5 / VmConfiguration=6 / PluginConfiguration=7）や CallData=8、
+/// 未知の BufferType への書き込みは capability の有無に関わらず仕様上
+/// `BadArgument(2)` であるべきなので、capability チェックより前にこの判定を行う。
+fn is_writable_buffer_type(buffer_type: i32) -> bool {
+    matches!(
+        buffer_type,
+        HTTP_REQUEST_BODY | HTTP_RESPONSE_BODY | DOWNSTREAM_DATA | UPSTREAM_DATA
+    )
+}
+
+/// F-134 適合度修正: host が認識する BufferType（0-8）かどうか。
+///
+/// 未知の BufferType（例: 99）は capability の有無に関わらず `BadArgument(2)`。
+/// capability チェックの `_ => false` 分岐に落ちて `NOT_ALLOWED(13)` を返すのは
+/// veil 拡張の誤用（NOT_ALLOWED は capability 拒否専用）なので、認識判定を
+/// capability チェックより前に行う。
+fn is_known_buffer_type(buffer_type: i32) -> bool {
+    matches!(
+        buffer_type,
+        HTTP_REQUEST_BODY
+            | HTTP_RESPONSE_BODY
+            | DOWNSTREAM_DATA
+            | UPSTREAM_DATA
+            | HTTP_CALL_RESPONSE_BODY
+            | GRPC_RECEIVE_BUFFER
+            | VM_CONFIGURATION
+            | PLUGIN_CONFIGURATION
+            | CALL_DATA
+    )
+}
+
 /// Helper to allocate memory in WASM
 ///
 /// B-20: async store のため `call_async` を使用（同期 `call` は panic する）。
@@ -121,6 +156,12 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
         )| {
             Box::new(async move {
                 let state = caller.data();
+
+                // F-134: 未知の BufferType は capability に関わらず BadArgument
+                // （NOT_ALLOWED は capability 拒否専用の veil 拡張のため誤用しない）。
+                if !is_known_buffer_type(buffer_type) {
+                    return PROXY_RESULT_BAD_ARGUMENT;
+                }
 
                 // Check capability
                 if !check_read_capability(state, buffer_type) {
@@ -209,6 +250,10 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
          value_ptr: i32,
          value_size: i32|
          -> i32 {
+            // F-134: 読み取り専用/未知の BufferType は capability に関わらず BadArgument
+            if !is_writable_buffer_type(buffer_type) {
+                return PROXY_RESULT_BAD_ARGUMENT;
+            }
             // Check capability
             {
                 let state = caller.data();
