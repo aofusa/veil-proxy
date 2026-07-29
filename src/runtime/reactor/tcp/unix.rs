@@ -906,6 +906,14 @@ impl<'a> Future for Readable<'a> {
     type Output = io::Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // F-141: kqueue バックエンドでは、直前の `EVFILT_READ` 起床がこの fd を
+        // readable と報告済みなら、確認用の `poll(2)` syscall を省略する
+        // （`executor::take_read_hint` の doc 参照。consume-once のため、無関係な
+        // 後続呼び出しに古いヒントが漏れることはない）。
+        #[cfg(veil_poller_kqueue)]
+        if crate::runtime::executor::take_read_hint(self.fd) > 0 {
+            return Poll::Ready(Ok(()));
+        }
         // POLLIN/EPOLLIN 相当を即座に確認するため 0 バイト peek は行わず、まず fd の
         // readiness を epoll に問い合わせる（poll(2) を使い syscall 1 発で判定する）。
         let mut pfd = libc::pollfd {
@@ -959,6 +967,13 @@ impl Future for ReadableFd {
     type Output = io::Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // F-141: `Readable::poll` と同じ理由で、kqueue の直近ヒントがあれば
+        // 確認用 `poll(2)` syscall を省略する（UDP の `wait_readable_fd` 経路で使われる
+        // ため、`QuicUdpSocket` の recv 系ループがこの恩恵を受ける）。
+        #[cfg(veil_poller_kqueue)]
+        if crate::runtime::executor::take_read_hint(self.fd) > 0 {
+            return Poll::Ready(Ok(()));
+        }
         let mut pfd = libc::pollfd {
             fd: self.fd,
             events: libc::POLLIN,
