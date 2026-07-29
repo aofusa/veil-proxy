@@ -18,7 +18,6 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_KTLS");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_AIO");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SYSTEM_TLS");
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_VENDORED_TLS");
 
     check_tls_backend_exclusivity();
     emit_runtime_backend_cfg();
@@ -41,19 +40,33 @@ fn feature_enabled(name: &str) -> bool {
 /// 意味不明なリンクエラーで悩ませないよう、依存関係の解決前にビルドを止めて
 /// 原因と対処法を明示する。
 fn check_tls_backend_exclusivity() {
-    if feature_enabled("VENDORED_TLS") && feature_enabled("SYSTEM_TLS") {
-        panic!(
-            "veil build.rs: `vendored-tls` and `system-tls` cannot be enabled together \
-             (F-137). `vendored-tls` pulls in aws-lc-rs/aws-lc-sys (or ring on OpenBSD), \
-             whose build artifacts contain files literally named libssl.a/libcrypto.a; \
-             linking those alongside `system-tls`'s dynamic system libssl/libcrypto \
-             fails with undefined-symbol errors regardless of the http3/quiche feature \
-             selection. Use `--no-default-features` together with a feature set that \
-             does not include `vendored-tls`, e.g. `full-system-tls` (Linux), \
-             `full-freebsd-system-tls` (FreeBSD), or `full-openbsd` (OpenBSD, already \
-             system-tls by default). See docs/backlog/features/F-137-system-tls-feature.md."
-        );
+    // F-137: `system-tls` は OpenBSD 専用（NetBSD 対応時はこの配列に追加する）。
+    // 非対応 OS では aws-lc-rs/aws-lc-sys が target_os のみで決まる無条件依存であり、
+    // その OUT_DIR に生成される libssl.a/libcrypto.a が `-L` 探索順でシステムの
+    // 動的 libssl/libcrypto を遮蔽するため、`rustls-openssl` が要求する
+    // OpenSSL 3.0 系シンボルが undefined になる（http3/quiche の feature 選択とは無関係）。
+    // 意味不明なリンクエラーで悩ませないよう、依存解決前にビルドを止めて原因と対処法を示す。
+    const SYSTEM_TLS_ALLOWED_TARGET_OSES: &[&str] = &["openbsd"];
+
+    if !feature_enabled("SYSTEM_TLS") {
+        return;
     }
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if SYSTEM_TLS_ALLOWED_TARGET_OSES.contains(&target_os.as_str()) {
+        return;
+    }
+    panic!(
+        "veil build.rs: `system-tls` is only supported on {allowed:?} (current target_os = \
+         `{target_os}`). On other targets aws-lc-rs/aws-lc-sys are unconditional \
+         dependencies whose build artifacts contain files literally named \
+         libssl.a/libcrypto.a; those shadow the system libssl/libcrypto in the linker's \
+         -L search order and `rustls-openssl` fails with undefined-symbol errors \
+         (reproducible even with http3 disabled, so it is unrelated to the quiche feature \
+         selection). Drop `system-tls` on this target. \
+         See docs/backlog/features/F-137-system-tls-feature.md.",
+        allowed = SYSTEM_TLS_ALLOWED_TARGET_OSES,
+        target_os = target_os,
+    );
 }
 
 /// ランタイムバックエンド選択用の cfg エイリアスを発行する（F-120 Phase 1）。
