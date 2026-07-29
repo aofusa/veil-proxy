@@ -1311,6 +1311,24 @@ pub struct GlobalSecurityConfig {
     /// 最小構成（`crate::security::windows_security` 参照）。
     #[serde(default)]
     pub enable_job_object_windows: bool,
+
+    // ====================
+    // NetBSD: chroot + 特権降格 + rlimit（F-140）
+    // ====================
+    //
+    // 非対象 OS でもキー自体は受理し、未知キー拒否にはしない（capsicum/pledge/macOS
+    // sandbox と同じ方針）。適用時に警告ログを出して無視する。
+    /// 起動時に `chroot(2)` する新ルートディレクトリ（NetBSD 専用、root 前提）。
+    ///
+    /// NetBSD には OpenBSD の pledge/unveil に相当するランタイム API が無いため、
+    /// veil が提供できる範囲は `chroot(2)` + 特権降格
+    /// （`drop_privileges_user`/`drop_privileges_group`）+ rlimit のみ
+    /// （`crate::security::netbsd` 参照）。未設定なら chroot は行わない。
+    /// chroot 後にプロセスがアクセスする全パス（静的ファイルルート・TLS 証明書/鍵・
+    /// WASM モジュール・ログ/キャッシュディレクトリ）は新ルート基準で解決可能である
+    /// 必要があり、これは運用側の設定責任である。
+    #[serde(default)]
+    pub chroot_dir: Option<String>,
 }
 
 fn default_allow_security_failures() -> bool {

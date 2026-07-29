@@ -3200,6 +3200,91 @@ pub mod macos_sandbox {
 // - メモリ/CPU の定量的な上限は設定ファイルに対応するキーが無いため設定しない
 //   （config.toml から導出できる値が無いまま固定値を入れると環境依存の誤動作が
 //   起きやすい）。
+// ====================
+// NetBSD: chroot + 特権降格 + rlimit（F-140）
+// ====================
+//
+// NetBSD には OpenBSD の pledge/unveil に相当するランタイム API が無い
+// （NetBSD 固有のサンドボックス機構は Veriexec — カーネル設定・ロード時の
+// ファイル整合性検証機構であり、プロセスが自分自身にランタイムで適用できる
+// syscall フィルタや unveil 相当のパス制限 API ではない — と
+// secmodel_securelevel — システム全体の起動時セキュリティレベル設定であり、
+// veil プロセスから呼べる API ではない）。したがって veil が NetBSD 上で
+// 実際に適用できるプロセス自身のセキュリティ機構は次の 3 つに限られる:
+//
+// - `chroot(2)` + `chdir("/")`（本モジュール、設定で `chroot_dir` 指定時のみ）
+// - `setgroups`/`setgid`/`setuid` による特権降格（POSIX 共通、
+//   `src/system.rs::drop_privileges` が `#[cfg(unix)]` として既に NetBSD でも
+//   動作する。本モジュール固有のコードは不要）
+// - `RLIMIT_NOFILE` 等の rlimit（POSIX 共通、`crate::system::raise_nofile_limit`
+//   が既に NetBSD でも動作する。本モジュール固有のコードは不要）
+//
+// pledge/unveil に相当する syscall フィルタ・パスホワイトリストは提供できないため、
+// 起動時ログで「非対応」であることを正直に報告する（`report_security_support`）。
+// OpenBSD 同様、非対象 OS でも設定キー自体は受理し警告して無視する
+// （`enable_pledge`/`enable_unveil` 等と同じ方針）。
+#[cfg(target_os = "netbsd")]
+pub mod netbsd {
+    use ftlog::{info, warn};
+    use std::ffi::CString;
+    use std::io;
+    use std::path::Path;
+
+    /// `chroot(2)` を適用し、`chdir("/")` で新ルート内へカレントディレクトリを移す。
+    ///
+    /// root 権限が必要（`libc::chroot` は非 root では `EPERM`）。呼び出し順序は
+    /// **`drop_privileges`（setuid/setgid）より前**であること: 先に setuid してしまうと
+    /// 多くの実装で `chroot(2)` 自体が `EPERM` になり、たとえ成功しても chroot の意味が
+    /// 薄れる（setuid 後は権限が無く chroot の脱獄阻止効果を過信できない）。
+    ///
+    /// # 不変条件
+    /// - `dir` は呼び出し時点で存在するディレクトリであること（存在しなければ
+    ///   `chroot(2)` が `ENOENT` を返す）。
+    /// - chroot 後にプロセスがアクセスする全パス（静的ファイルルート、TLS 証明書/鍵、
+    ///   WASM モジュール、ログ/キャッシュディレクトリ等）は **新ルート基準の相対パスとして
+    ///   解決可能**であること。これは呼び出し元（設定）の責務であり、本関数は
+    ///   chroot(2) 自体の適用のみを行う。
+    pub fn chroot_to(dir: &Path) -> io::Result<()> {
+        let dir_c = CString::new(dir.as_os_str().as_encoded_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "chroot_dir has NUL byte"))?;
+        // SAFETY: dir_c はこの呼び出しが完了するまで生存する有効な NUL 終端バッファ。
+        if unsafe { libc::chroot(dir_c.as_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let root_c = CString::new("/").expect("no interior NUL");
+        // SAFETY: root_c は静的に有効な NUL 終端バッファ。chroot 直後に新ルート内の
+        // "/" へ chdir することで、相対パス解決が新ルート基準になることを保証する
+        // （chroot(2) だけでは cwd が旧ルート基準のまま残り得るため必須）。
+        if unsafe { libc::chdir(root_c.as_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        info!(
+            "netbsd: chroot(2) applied, new root = \"{}\"",
+            dir.display()
+        );
+        Ok(())
+    }
+
+    /// NetBSD のセキュリティ機能サポート状況を起動時ログへ正直に報告する。
+    ///
+    /// pledge/unveil に相当する API が無いことを明記し、実際に提供できる範囲
+    /// （chroot + 特権降格 + rlimit）のみを "Available" として示す。
+    pub fn report_security_support() {
+        info!("=== NetBSD Security Feature Support ===");
+        info!("chroot(2) + chdir(\"/\"): Available (opt-in via `chroot_dir`)");
+        info!("setuid/setgid/setgroups privilege drop: Available (POSIX common path)");
+        info!("RLIMIT_NOFILE and other rlimits: Available (POSIX common path)");
+        warn!(
+            "pledge(2)/unveil(2) equivalent: Not available on NetBSD (OpenBSD-specific API). \
+             Veriexec is a kernel-config/load-time integrity mechanism, not a runtime API the \
+             process can call; secmodel_securelevel is a system-wide boot-time setting, not a \
+             per-process sandbox. veil provides no syscall filtering or path allowlisting on \
+             NetBSD beyond chroot(2)."
+        );
+        info!("=========================================");
+    }
+}
+
 #[cfg(windows)]
 pub mod windows_security {
     use ftlog::info;
