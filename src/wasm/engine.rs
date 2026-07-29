@@ -2288,7 +2288,12 @@ impl FilterEngine {
     //
     // Proxy-Wasm の network filter ABI（`proxy_on_new_connection` /
     // `proxy_on_downstream_data` / `proxy_on_upstream_data` /
-    // `proxy_on_downstream_close` / `proxy_on_upstream_close`）。HTTP コンテキストと異なり
+    // `proxy_on_downstream_connection_close` / `proxy_on_upstream_connection_close`）。
+    // F-134: 以前は接尾辞 `_connection` を欠いた誤った名前
+    // （`proxy_on_downstream_close`/`proxy_on_upstream_close`）を呼んでおり、実 SDK
+    // （proxy-wasm-rust-sdk 等）でビルドしたモジュールではクローズコールバックが
+    // 一度も発火しなかった（フィクスチャが誤った名前に手書きで合わせていたため
+    // E2E は偶然通っていた）。HTTP コンテキストと異なり
     // ヘッダが無く、生バイト列のみを扱う。`proxy_get_buffer_bytes`/`proxy_set_buffer_bytes`
     // の `BufferType::DownstreamData=2`/`UpstreamData=3` 経由でデータを読み書きする。
     // ========================================================================
@@ -2568,15 +2573,23 @@ impl FilterEngine {
         }
     }
 
-    /// Execute `proxy_on_downstream_close`（クライアント側接続クローズ通知、1 回のみ）。
+    /// Execute `proxy_on_downstream_connection_close`（クライアント側接続クローズ通知、1 回のみ）。
+    ///
+    /// F-134: ABI v0.2.1 の正しいエクスポート名は `proxy_on_downstream_connection_close`
+    /// （旧実装は `_connection` を欠いた `proxy_on_downstream_close` を呼んでいたため、
+    /// 実 SDK ビルドのモジュールでは一度も発火しなかった）。
     pub async fn on_downstream_close_with_modules(&self, module_names: &[String]) {
-        self.run_network_close(module_names, "proxy_on_downstream_close")
+        self.run_network_close(module_names, "proxy_on_downstream_connection_close")
             .await
     }
 
-    /// Execute `proxy_on_upstream_close`（バックエンド側接続クローズ通知、1 回のみ）。
+    /// Execute `proxy_on_upstream_connection_close`（バックエンド側接続クローズ通知、1 回のみ）。
+    ///
+    /// F-134: ABI v0.2.1 の正しいエクスポート名は `proxy_on_upstream_connection_close`
+    /// （旧実装は `_connection` を欠いた `proxy_on_upstream_close` を呼んでいたため、
+    /// 実 SDK ビルドのモジュールでは一度も発火しなかった）。
     pub async fn on_upstream_close_with_modules(&self, module_names: &[String]) {
-        self.run_network_close(module_names, "proxy_on_upstream_close")
+        self.run_network_close(module_names, "proxy_on_upstream_connection_close")
             .await
     }
 
