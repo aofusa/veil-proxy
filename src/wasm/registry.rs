@@ -44,7 +44,11 @@ impl ModuleRegistry {
     pub fn new(config: &WasmConfig) -> anyhow::Result<Self> {
         // Create engine with pooling allocator
         let engine = Self::create_engine(config)?;
-        let pulley = cfg!(target_os = "openbsd") || config.interpreter;
+        // NetBSD は OpenBSD と異なり MAP_STACK 強制が無いため OnDemand アロケータや
+        // openbsd_stack（下記）は使わないが、wasmtime のネイティブ JIT 実行コード自体は
+        // 未検証のため、OpenBSD と同様に安全側で Pulley インタープリタへ倒す（F-140）。
+        let pulley =
+            cfg!(target_os = "openbsd") || cfg!(target_os = "netbsd") || config.interpreter;
 
         let mut registry = Self {
             engine,
@@ -115,9 +119,10 @@ impl ModuleRegistry {
         // 依存しない。ネイティブ JIT より遅いが、W^X 制約下や OpenBSD で WASM を
         // 使えるようにする。
         //
-        // OpenBSD は設定値を無視して常に Pulley（B-52）。他ターゲットは
+        // OpenBSD/NetBSD は設定値を無視して常に Pulley（B-52/F-140）。他ターゲットは
         // `[wasm] interpreter = true` のときだけ Pulley を選択する。
-        let use_pulley = cfg!(target_os = "openbsd") || wasm_config.interpreter;
+        let use_pulley =
+            cfg!(target_os = "openbsd") || cfg!(target_os = "netbsd") || wasm_config.interpreter;
         if use_pulley {
             // ポインタ幅に合わせて pulley64 / pulley32 を選ぶ。
             config.target(if cfg!(target_pointer_width = "64") {

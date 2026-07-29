@@ -178,12 +178,18 @@ impl WasmConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         use std::collections::HashSet;
 
-        // OpenBSD では interpreter の値に関わらず常に Pulley を使う（B-52）。
+        // OpenBSD/NetBSD では interpreter の値に関わらず常に Pulley を使う（B-52/F-140）。
         // false が明示された場合は無視される旨を起動時に警告する（コールドパス）。
         #[cfg(target_os = "openbsd")]
         if !self.interpreter {
             ftlog::warn!(
                 "[wasm] interpreter=false is ignored on OpenBSD; Pulley interpreter is always used (B-52)"
+            );
+        }
+        #[cfg(target_os = "netbsd")]
+        if !self.interpreter {
+            ftlog::warn!(
+                "[wasm] interpreter=false is ignored on NetBSD; Pulley interpreter is always used (F-140)"
             );
         }
 
