@@ -168,53 +168,72 @@ hot-path cost). The default is unchanged (Linux io_uring).
   link time with duplicate BoringSSL/AWS-LC symbols, which is why FreeBSD was moved off
   the shared-`aws-lc-sys` scheme instead of being added to it. See
   `docs/artifacts/f136_platform_design.md` for the experiment and rejected alternatives.
-- **`system-tls` feature (F-137/F-140) — OpenBSD/NetBSD only, do not use on Linux/FreeBSD/macOS/Windows.**
-  Dynamically links rustls's crypto backend to the **system** SSL library instead of
-  vendoring `aws-lc-rs`/`ring`, via the `rustls-openssl` crate (`vendored` feature is never
-  enabled), plus quiche's own `openssl` feature for HTTP/3 dynamic linking. This works on
-  **OpenBSD** (`full-openbsd`/`full-openbsd-aarch64`, LibreSSL) because OpenBSD's quiche/
-  rustls dependencies are fully decoupled from `aws-lc-sys` sharing. **On every other
-  target it fails at link time** (`undefined symbol: EVP_Q_digest`,
-  `EVP_default_properties_is_fips_enabled`, `ERR_get_error_all`, ...) — this reproduces
-  even with `http3` disabled entirely (`cargo build --no-default-features --features
-  "http2,mimalloc,system-tls"`), because `aws-lc-rs`/`aws-lc-sys` are **unconditional**
-  target dependencies on Linux/FreeBSD (present regardless of any Cargo feature —
-  `cargo tree --no-default-features` still shows `aws-lc-sys`), and aws-lc-sys's build
-  output includes files literally named `libssl.a`/`libcrypto.a` that shadow the system
-  library earlier in the linker's `-L` search order, regardless of the
-  `AWS_LC_SYS_NO_PREFIX` symbol-prefixing setting. Fixing this for Linux/FreeBSD would
-  require making `aws-lc-rs`/`aws-lc-sys` an optional, exclusively-selected dependency,
-  which conflicts with the existing requirement that a bare `cargo build
-  --no-default-features` (no features at all) must still produce a working TLS build —
-  Cargo features are additive-only and cannot express "enable unless some other feature is
-  also set," so this is unresolved and out of scope for F-137. `full`/`full-freebsd` and
-  every other feature set that doesn't request `system-tls` are completely unaffected
-  (`cargo tree --features full` is byte-identical with or without the `system-tls`
-  feature definition existing).
-  **`ktls` cannot be combined with `system-tls`**: kTLS references `aws_lc_rs`-specific
-  cipher suite constants directly, so `build.rs` automatically drops the `veil_ktls` cfg
-  (with a `cargo:warning`) whenever both features are requested together (mostly moot
-  since `system-tls` is OpenBSD-only and OpenBSD never supports kTLS).
-  **OpenBSD HTTP/3 certificate hot reload trade-off**: `full-openbsd` (system-tls) loads
-  quiche certs through a 0600 temp file under `std::env::temp_dir()` (no memfd on OpenBSD),
-  Drop-unlinked; `collect_unveil_paths` adds the temp directory to `unveil`'s
+- **`system-tls` feature (F-137/F-140/F-142) — Linux/FreeBSD/OpenBSD/NetBSD. Not supported
+  on macOS/Windows.**
+  Dynamically links rustls's crypto backend to the **system** SSL library (OpenSSL 3.x or
+  LibreSSL) instead of vendoring `aws-lc-rs`/`ring`. The provider is a from-scratch
+  `CryptoProvider` (`src/tls_provider/libressl/`, F-142) built only from the `openssl`
+  crate's classic EVP-level API (`EVP_CIPHER`/`EVP_MD`/`EVP_PKEY`/ECDH/X25519) — **not** the
+  `rustls-openssl` crate, which depends on OpenSSL 3.x's provider/FIPS API
+  (`EVP_default_properties_is_fips_enabled`, `Id::ED448`, ...) and fails to compile against
+  LibreSSL (confirmed on real NetBSD hardware). TLS1.3 HKDF and TLS1.2 PRF are not
+  reimplemented; they're wired through `rustls::crypto::tls13::HkdfUsingHmac` /
+  `rustls::crypto::tls12::PrfUsingHmac` on top of our own `Hmac` impl. AEAD reuses a single
+  `openssl::cipher_ctx::CipherCtx` per connection instead of allocating one per record.
+  Ed25519 is supported; Ed448 is not (LibreSSL doesn't have it).
+  **`vendored-tls` feature (F-142)**: the previous unconditional `aws-lc-rs`/`aws-lc-sys`
+  (Linux/FreeBSD/macOS/Windows) dependency is now gated behind this feature and is mutually
+  exclusive with `system-tls` (`build.rs` panics if both are requested — combining them
+  reproduces the same linker-shadowing problem described below). `default`, `full`,
+  `full-freebsd`, and `full-freebsd-aarch64` all include `vendored-tls`, so their dependency
+  graph and behavior are unchanged (`cargo tree --features full` is byte-identical).
+  OpenBSD/NetBSD's `ring` dependency is untouched (unconditional, as before) — it doesn't
+  produce the colliding `libssl.a`/`libcrypto.a` artifacts that `aws-lc-sys` does, so there
+  is nothing to gate there; `full-openbsd(-vendor)`/`full-netbsd(-vendor)` are unchanged.
+  **Why Linux/FreeBSD previously couldn't use `system-tls` at all**: before F-142,
+  `aws-lc-rs`/`aws-lc-sys` were unconditional target dependencies there (present regardless
+  of any Cargo feature), and aws-lc-sys's build output includes files literally named
+  `libssl.a`/`libcrypto.a` that shadow the system library earlier in the linker's `-L`
+  search order, causing undefined-symbol link failures — this reproduced even with `http3`
+  disabled entirely. F-142 resolved it by making `aws-lc-rs`/`aws-lc-sys` optional
+  (`vendored-tls`) and exclusive with `system-tls`.
+  **`full-system-tls`** (new, F-142) mirrors `full` with `system-tls` instead of
+  `vendored-tls`, plus `quiche?/openssl` for HTTP/3. Because quiche requires a
+  BoringSSL-derived QUIC API (`SSL_set_quic_method` etc.) that vanilla OpenSSL 3.x lacks
+  (LibreSSL 3.6+ / quictls have it), `build.rs` probes the system libssl via `pkg-config`
+  and panics with a clear message if the QUIC API is missing — so `full-system-tls` is
+  expected to fail to build on a stock Linux box with OpenSSL 3.x; drop `http3` or use a
+  QUIC-capable libssl. **`full-freebsd-system-tls`** mirrors `full-freebsd` but **excludes
+  `http3` entirely**: FreeBSD's HTTP/3 certificate hot reload (F-136) depends directly on
+  quiche's vendored-BoringSSL in-memory `SSL_CTX` API, which is incompatible with dynamic
+  linking to the system library.
+  **`ktls` cannot be combined with `system-tls`**, and also requires `vendored-tls`: kTLS
+  references `aws_lc_rs`-specific cipher suite constants directly (`src/ktls_rustls.rs`),
+  so `build.rs` automatically drops the `veil_ktls` cfg (with a `cargo:warning`) whenever
+  `system-tls` is set, or whenever `vendored-tls` is absent, together with `ktls`.
+  **OpenBSD/NetBSD HTTP/3 certificate hot reload trade-off**: `full-openbsd`/`full-netbsd`
+  (system-tls) load quiche certs through a 0600 temp file under `std::env::temp_dir()` (no
+  memfd there), Drop-unlinked; `collect_unveil_paths` adds the temp directory to `unveil`'s
   read-write-create set specifically when `system-tls` is enabled, otherwise reload would
-  fail once `unveil`/`pledge` is active. `full-openbsd-vendor` (bundled BoringSSL) instead
-  uses the in-memory `SSL_CTX` API (F-136, no filesystem access at all, stronger sandbox
-  posture) — pick that variant if avoiding any temp-file exposure of key material matters
-  more than dynamic linking to the base system's LibreSSL. FreeBSD (`full-freebsd`, which
-  does not include `system-tls`) is unaffected either way and keeps the F-136 in-memory
-  reload path working under capsicum capability mode.
-  Build: `cargo build --no-default-features --features full-openbsd` (OpenBSD only).
-  See `docs/backlog/features/F-137-system-tls-feature.md` and the F-137 section of
+  fail once `unveil`/`pledge` is active. `full-openbsd-vendor`/`full-netbsd-vendor` (bundled
+  BoringSSL) instead use the in-memory `SSL_CTX` API (F-136, no filesystem access at all,
+  stronger sandbox posture) — pick those variants if avoiding any temp-file exposure of key
+  material matters more than dynamic linking to the base system's LibreSSL. FreeBSD
+  (`full-freebsd`, vendored by default) keeps the F-136 in-memory reload path working under
+  capsicum capability mode either way.
+  Build: `cargo build --no-default-features --features full-openbsd` (OpenBSD),
+  `--features full-netbsd` (NetBSD), `--features full-system-tls` (Linux, rustls only —
+  drop `http3` or supply a QUIC-capable libssl), `--features full-freebsd-system-tls`
+  (FreeBSD, rustls only, no `http3`).
+  See `docs/backlog/features/F-137-system-tls-feature.md`,
+  `docs/backlog/features/F-142-libressl-crypto-provider.md`, and the F-137 section of
   `docs/artifacts/f136_platform_design.md` for the full experiment log.
-  **NetBSD `system-tls` build requirement**: confirmed on real hardware that `pkgconf`
-  must be installed for `openssl-sys` to locate the OpenSSL install. NetBSD base already
-  ships OpenSSL 3.0.12 and `/usr/lib/pkgconfig/openssl.pc`, but the `pkg-config` command
-  itself is not part of base — it comes from pkgsrc's `pkgconf` package. Without it,
-  `openssl-sys`'s build script fails with `Could not find directory of OpenSSL
-  installation`. `tools/qemu/bsd-vm.sh`'s NetBSD `cmd_toolchain` already installs
-  `pkgconf` via `pkgin`.
+  **NetBSD `system-tls` build requirement**: confirmed on real hardware that `pkgconf` and
+  a QUIC-capable `libressl` (from pkgsrc) must be installed — NetBSD base only ships OpenSSL
+  3.0.12, which lacks the QUIC API `http3` needs, and does not include the `pkg-config`
+  command at all (`pkgconf` from pkgsrc). Without `pkgconf`, `openssl-sys`'s build script
+  fails with `Could not find directory of OpenSSL installation`. `tools/qemu/bsd-vm.sh`'s
+  NetBSD `cmd_toolchain` already installs `pkgconf` via `pkgin`.
 
 ## Build
 

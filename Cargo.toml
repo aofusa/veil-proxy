@@ -21,7 +21,7 @@ path = "src/lib.rs"
 
 [features]
 # デフォルトビルド（kTLS + HTTP/2 + mimalloc）
-default = ["ktls", "http2", "mimalloc"]
+default = ["ktls", "http2", "mimalloc", "vendored-tls"]
 
 # ====================
 # プロトコル系
@@ -170,39 +170,39 @@ access-log = []
 # ビルド方法: cargo build --features l4-proxy
 l4-proxy = []
 
-# システムの SSL ライブラリ（OpenSSL / LibreSSL）へ動的リンクする（F-137/F-140）。
+# システムの SSL ライブラリ（OpenSSL / LibreSSL）へ動的リンクする（F-137/F-140/F-142）。
 #
-# **OpenBSD / NetBSD 専用**。Linux/FreeBSD/macOS/Windows で指定すると `build.rs` が
-# ビルド開始時点で明確なエラーを出して止める（`SYSTEM_TLS_ALLOWED_TARGET_OSES` 参照）。
-# NetBSD は OpenBSD と同じく quiche/rustls の依存を aws-lc-sys 共有から切り離してある
-# （下の `[target.'cfg(any(target_os = "openbsd", target_os = "netbsd"))'.dependencies]`
-# 参照）ため衝突しない。
+# **Linux / FreeBSD / OpenBSD / NetBSD で使用可能**（`SYSTEM_TLS_ALLOWED_TARGET_OSES` 参照。
+# macOS/Windows は未対応で `build.rs` が明確なエラーを出して止める）。
 #
-# rustls の暗号プロバイダを `rustls-openssl`（システムの LibreSSL libcrypto を呼ぶ）へ
-# 切り替える。rustls 本体はそのまま使い、**依存する暗号ライブラリだけ**を差し替える。
-# HTTP/3（quiche）側は本 feature 単体では変更しない。`full-openbsd` が
-# `quiche?/openssl`（pkg-config 経由の動的リンク）を別途明示的に追加して同じシステム
-# ライブラリへ揃える。
+# rustls の暗号プロバイダを自作の LibreSSL/OpenSSL 対応 `CryptoProvider`
+# （`src/tls_provider/libressl/`、`openssl` クレートのクラシック API のみを使用）へ
+# 切り替える。当初は `rustls-openssl` crate を使う設計だったが、OpenSSL 3.x の
+# provider/FIPS API に依存しており **LibreSSL でコンパイルできない**ことが NetBSD 実機で
+# 判明したため自作に切り替えた（F-142、詳細は
+# `docs/artifacts/f142_libressl_provider_design.md`）。
 #
-# **なぜ OpenBSD 専用か**: Linux/FreeBSD は `aws-lc-rs`/`aws-lc-sys` が
-# `target_os` のみで決まる無条件の依存であり、どの Cargo feature を選んでも
-# 依存グラフから外れない。aws-lc-sys のビルド成果物には `AWS_LC_SYS_NO_PREFIX` の
-# 値に関わらず `libssl.a`/`libcrypto.a` という**システム OpenSSL と同名の静的
-# ライブラリ**が生成され、これが最終リンクコマンドの `-L` でシステムパスより先に
-# 来るため、`rustls-openssl`（openssl-sys 経由）が要求する動的 `-lssl -lcrypto` が
-# そちらに解決されてしまい、aws-lc-sys に無い新しめの OpenSSL 3.0 系シンボル
-# （`EVP_Q_digest`/`EVP_default_properties_is_fips_enabled`/`ERR_get_error_all` 等）が
-# undefined symbol になってリンクが壊れる（`http3` を完全に外した最小構成
-# `--features "http2,mimalloc,system-tls"` でも再現する、quiche の feature 選択とは
-# 無関係の問題であることを確認済み）。修正には aws-lc-rs/aws-lc-sys を
-# `optional = true` にして system-tls と排他的に切り替える必要があるが、これは
-# 「`cargo build --no-default-features`（フィーチャー無し単体）が動作し続ける」という
-# 既存の受け入れ条件と両立しない（Cargo のフィーチャーは加算のみで、一方が立っていたら
-# 他方を無効化するという否定的な表現ができないため）ため見送った。
-# **OpenBSD のみ**、quiche/rustls の依存を aws-lc-sys 共有から完全に切り離してある
-# （下の `[target.'cfg(target_os = "openbsd")'.dependencies]` 参照）ため、この衝突が
-# 起きない。詳細な調査ログは `docs/backlog/features/F-137-system-tls-feature.md` の
-# 「既知の限界・今後の課題」を参照。
+# HTTP/3（quiche）側は本 feature 単体では変更しない。OpenBSD/NetBSD は `full-openbsd`/
+# `full-netbsd` が `quiche?/openssl`（pkg-config 経由の動的リンク）を明示的に追加して
+# 同じシステムライブラリへ揃える。Linux/FreeBSD で `system-tls` + `http3` を使うには
+# **システムの libssl が BoringSSL 系 QUIC API（`SSL_set_quic_method` 等、LibreSSL 3.6+ /
+# quictls が実装）を持つ必要がある**。バニラ OpenSSL 3.x にはこの API が無いため、
+# `build.rs` が pkg-config 経由でヘッダを検査し、無ければビルド開始時点で明確な
+# エラーを出す（`check_system_tls_quic_capability`）。FreeBSD の HTTP/3 証明書
+# ホットリロード（F-136）は vendored BoringSSL の in-memory `SSL_CTX` API
+# （`boringssl-boring-crate` 限定）に直接依存しているため、`system-tls` との併用は
+# 現状サポートしない（`full-freebsd-system-tls` は `http3` を含めない。下記参照）。
+#
+# **なぜ以前は OpenBSD/NetBSD 専用だったか**（F-142 で解消）: Linux/FreeBSD は
+# `aws-lc-rs`/`aws-lc-sys` が `target_os` のみで決まる無条件の依存だった。
+# aws-lc-sys のビルド成果物には `AWS_LC_SYS_NO_PREFIX` の値に関わらず
+# `libssl.a`/`libcrypto.a` という**システム OpenSSL と同名の静的ライブラリ**が生成され、
+# これが最終リンクコマンドの `-L` でシステムパスより先に来るため、システムの動的
+# `-lssl -lcrypto` が解決されるべきところが aws-lc-sys の静的ライブラリに奪われ、
+# undefined symbol でリンクが壊れていた。F-142 で `aws-lc-rs`/`aws-lc-sys` を
+# `vendored-tls` feature 配下の `optional = true` 依存にし、`system-tls` とは
+# `build.rs` で排他にした（両方同時指定は明確なエラー）ことで解消した。
+# 詳細な調査ログは `docs/backlog/features/F-137-system-tls-feature.md` を参照。
 #
 # HTTP/3 証明書ホットリロードへの影響（`src/http3_server.rs`、OpenBSD/NetBSD限定の話）:
 # `system-tls` 有効時は quiche の in-memory `SSL_CTX` API（`boringssl-boring-crate`
@@ -224,7 +224,28 @@ l4-proxy = []
 #
 # ビルド要件: pkg-config と libssl/libcrypto の .pc（開発パッケージ）
 # ビルド方法: cargo build --no-default-features --features full-openbsd  # OpenBSD（既定）
-system-tls = ["dep:rustls-openssl", "dep:openssl"]
+#
+# F-142: rustls 側は `rustls-openssl` crate ではなく、`openssl` クレートのクラシック API
+# だけで自作した CryptoProvider（`src/tls_provider/libressl/`）を使う。`rustls-openssl` は
+# OpenSSL 3.x の provider/FIPS API に依存し LibreSSL でコンパイルできないため
+# （NetBSD 実機で確認）廃止した。`vendored-tls` とは併用できない（`build.rs` が
+# 明確なエラーで止める）。
+system-tls = ["dep:openssl"]
+
+# rustls の暗号プロバイダとして同梱の aws-lc-rs（Linux/FreeBSD/macOS/Windows）を使う
+# ことを表す feature（F-142）。以前は `target_os` だけで決まる無条件依存だったが、
+# `system-tls`（システム libcrypto への動的リンク）と同一バイナリに同居させると
+# aws-lc-sys のビルド成果物（`libssl.a`/`libcrypto.a`）がシステムの動的 libssl/libcrypto
+# をリンカの `-L` 探索順で遮蔽し undefined symbol エラーになるため、`optional = true`
+# 化して `system-tls` と排他にした。`default`/`full`/`full-freebsd`/
+# `full-freebsd-aarch64` に含める。OpenBSD/NetBSD の `ring` はこの衝突を起こさないため
+# 対象外（`full-openbsd`/`full-netbsd` 系は変更なし。ring は無条件依存のまま）。
+#
+# `dep:aws-lc-rs`/`dep:aws-lc-sys` は target 別に宣言されている
+# （`[target.'cfg(not(any(target_os = "openbsd", target_os = "netbsd")))'.dependencies]`/
+# `[target.'cfg(target_os = "linux")'.dependencies]`）ため、宣言が存在しないターゲット
+# （OpenBSD/NetBSD）でこの feature を有効にしても無害（Cargo が黙って無視する）。
+vendored-tls = ["dep:aws-lc-rs", "dep:aws-lc-sys", "rustls/aws_lc_rs"]
 
 # OpenBSD 専用の内部フォワーディング feature（F-137）: quiche の vendored BoringSSL
 # バックエンド（`boringssl-boring-crate`、外部 `boring` crate 経由）を有効化する。
@@ -261,6 +282,29 @@ full = [
     "admin",
     "access-log",
     "l4-proxy",
+    "vendored-tls",
+]
+
+# `full` の system-tls 版（F-142）: 同梱 aws-lc-rs の代わりにシステムの
+# OpenSSL/LibreSSL へ動的リンクする。Linux のシステム libssl（OpenSSL 3.x）は
+# quiche が要求する BoringSSL 系 QUIC API（`SSL_set_quic_method` 等）を持たないため、
+# `http3` を含めたままだと `build.rs` の `check_system_tls_quic_capability` が
+# ビルド開始時点で明確なエラーを出して止まる（LibreSSL 3.6+ / quictls ベースの
+# libssl であれば動く）。http3 が要らない場合は `--features "full,system-tls"` からの
+# 差分ではなく本 feature から `http3` を手動で外して使うか、`quiche?/openssl` 抜きで
+# 個別に feature を指定すること。
+full-system-tls = [
+    "ktls", "http2", "http3",
+    "grpc-full", "wasm",
+    "opentelemetry",
+    "compression", "cache", "metrics",
+    "websocket", "rate-limit", "buffering",
+    "mimalloc",
+    "admin",
+    "access-log",
+    "l4-proxy",
+    "system-tls",
+    "quiche?/openssl",
 ]
 
 # BSD 向けの全機能ビルド（packaging 用）
@@ -284,6 +328,29 @@ full-freebsd = [
     "admin",
     "access-log",
     "l4-proxy",
+    "vendored-tls",
+]
+
+# `full-freebsd` の system-tls 版（F-142）。rustls 側はシステムの OpenSSL/LibreSSL へ
+# 動的リンクできるが、**`http3` は含めない**: FreeBSD の HTTP/3 証明書ホットリロード
+# （F-136、`src/http3_server.rs`）は capsicum capability mode 下でも動く in-memory
+# `SSL_CTX` API（`Config::with_boring_ssl_ctx_builder`）に直接依存しており、これは
+# quiche の `boringssl-boring-crate` feature（vendored BoringSSL、`boring` crate 経由）
+# でしか提供されない。`system-tls` の動的リンク方針とは非互換（このコード自体は
+# 別作業者が管理しているため本チケットでは変更しない）。HTTP/3 が必要な場合は
+# `full-freebsd`（vendored、既定）を使うこと。
+full-freebsd-system-tls = [
+    "http2",
+    "grpc-full", "wasm",
+    "opentelemetry",
+    "compression", "cache", "metrics",
+    "websocket", "rate-limit", "buffering",
+    "jemalloc",
+    "aio",
+    "admin",
+    "access-log",
+    "l4-proxy",
+    "system-tls",
 ]
 
 # OpenBSD: システムアロケータ（global_allocator を差し替えない）を使う。
@@ -353,6 +420,7 @@ full-freebsd-aarch64 = [
     "admin",
     "access-log",
     "l4-proxy",
+    "vendored-tls",
 ]
 
 full-openbsd-aarch64 = [
@@ -589,21 +657,21 @@ rayon = "1.12.0"
 futures = "0.3.31"
 
 # ====================
-# rustls 暗号プロバイダの target 別選択（F-122、src/tls_provider.rs 参照）
+# rustls 暗号プロバイダの target 別選択（F-122/F-142、src/tls_provider/mod.rs 参照）
 # ====================
 # aws_lc_rs を使う target:
-#   - 非 OpenBSD（Linux/FreeBSD/macOS/Windows）: kTLS（ktls_rustls）・quiche(http3) と
+#   - 非 OpenBSD/NetBSD（Linux/FreeBSD/macOS/Windows）: kTLS（ktls_rustls）・quiche(http3) と
 #     AWS-LC を共有し、アセンブリ最適化が効く。http3_server の RNG（aws_lc_rs::rand）にも使う。
 #
-# F-137: これらは **無条件依存のまま**にしてある。`system-tls` は OpenBSD 専用で、
-# 非 OpenBSD では build.rs がエラーにするため、optional 化して排他切替する必要が無い
-# （optional 化すると `cargo build --no-default-features` 単体が暗号プロバイダ不在で
-# コンパイルできなくなり、既存の受け入れ条件を壊す。`system-tls` のコメント参照）。
+# F-142: `vendored-tls` feature 配下の `optional = true` 依存にした（`system-tls` と
+# 同一バイナリに同居させると aws-lc-sys の静的ライブラリがシステム libssl/libcrypto を
+# 遮蔽してリンクが壊れるため、Cargo feature で排他切替できるようにした。
+# `system-tls` のコメント参照）。`rustls` 本体（std/tls12/logging）は base の
+# [dependencies] で無条件に宣言済みのため、ここでは `aws_lc_rs` cargo feature を
+# `vendored-tls`（[features] 参照）経由でのみ有効化する。
 [target.'cfg(not(any(target_os = "openbsd", target_os = "netbsd")))'.dependencies]
-# default-features = false は base の [dependencies] rustls と一致させる（provider は明示指定）。
-rustls = { version = "0.23.35", default-features = false, features = ["aws_lc_rs"] }
 # bindgen: AWS_LC_SYS_NO_PREFIX 時に aws-lc-sys がバインディング生成するため必要
-aws-lc-rs = { version = "1.15.2", features = ["bindgen"] }
+aws-lc-rs = { version = "1.15.2", features = ["bindgen"], optional = true }
 
 # ring を使う target:
 #   - OpenBSD: aws-lc-rs は TLS ハンドシェイクを完了できない（F-122）。
@@ -798,11 +866,17 @@ harness = false
 # **Linux は無変更**（AGENTS.md「Linux 経路は不変」）: `boring` crate を Linux の依存に
 # 入れてはならない（重複シンボルでリンクが壊れる）。
 #
-# F-137: `aws-lc-sys` は Linux では無条件依存のまま（`system-tls` は OpenBSD 専用のため
-# ここで排他切替する必要が無い）。
+# F-142: `aws-lc-sys` は `vendored-tls` feature 配下の `optional = true` 依存にした
+# （`system-tls` と同一バイナリに同居させるとその静的ライブラリがシステム
+# libssl/libcrypto を遮蔽してリンクが壊れるため、排他切替できるようにした）。
+# `system-tls` + `http3` を Linux で使う場合は `quiche?/openssl`（`full-system-tls`
+# 参照）で quiche 自体もシステム libssl へ動的リンクする。ただしバニラ OpenSSL 3.x には
+# quiche が要求する QUIC API（`SSL_set_quic_method` 等）が無いため、`build.rs` の
+# `check_system_tls_quic_capability` が pkg-config 経由でヘッダを検査しビルド時点で
+# 明確なエラーを出す（LibreSSL 3.6+ / quictls ベースの libssl であれば動く）。
 [target.'cfg(target_os = "linux")'.dependencies]
 quiche = { version = "0.24.9", default-features = false, optional = true }
-aws-lc-sys = { version = "0.41", features = ["ssl", "bindgen"] }
+aws-lc-sys = { version = "0.41", features = ["ssl", "bindgen"], optional = true }
 
 # FreeBSD: `system-tls`（F-137/F-140）は OpenBSD/NetBSD 専用であり FreeBSD は対象外
 # （AGENTS.md 参照）。FreeBSD は capsicum capability mode 下でも証明書ホットリロードが

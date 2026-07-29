@@ -18,8 +18,11 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_KTLS");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_AIO");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SYSTEM_TLS");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_VENDORED_TLS");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_HTTP3");
 
     check_tls_backend_exclusivity();
+    check_system_tls_quic_capability();
     emit_runtime_backend_cfg();
 }
 
@@ -27,46 +30,127 @@ fn feature_enabled(name: &str) -> bool {
     std::env::var(format!("CARGO_FEATURE_{name}")).is_ok()
 }
 
-/// `vendored-tls`（同梱 aws-lc-rs/aws-lc-sys/ring）と `system-tls`（システムの
-/// OpenSSL/LibreSSL への動的リンク）は排他（F-137）。
+/// `vendored-tls`（同梱 aws-lc-rs/aws-lc-sys、F-142 で feature 化）と `system-tls`
+/// （システムの OpenSSL/LibreSSL への動的リンク）は排他（F-137/F-142）。
 ///
 /// 両方を有効にすると、aws-lc-sys のビルド成果物に含まれる `libssl.a`/`libcrypto.a`
 /// （`AWS_LC_SYS_NO_PREFIX` の値に関わらずこの名前で生成される）が最終リンクコマンドの
-/// `-L` 探索順でシステムの動的 libssl/libcrypto より先に来てしまい、`rustls-openssl`/
-/// quiche が要求するシンボルの一部（aws-lc-sys に無い新しめの OpenSSL 3.0 系 API）が
-/// undefined symbol になってリンクが壊れる（`http3` を外した最小構成でも再現し、
-/// quiche の feature 選択とは無関係の問題であることを確認済み。
-/// `docs/backlog/features/F-137-system-tls-feature.md` 参照）。
+/// `-L` 探索順でシステムの動的 libssl/libcrypto より先に来てしまい、`system-tls`
+/// プロバイダ（`src/tls_provider/libressl/`）/ quiche が要求するシンボルの一部
+/// （aws-lc-sys に無い新しめの OpenSSL 3.0 系 API）が undefined symbol になってリンクが
+/// 壊れる（`http3` を外した最小構成でも再現し、quiche の feature 選択とは無関係の問題
+/// であることを確認済み。`docs/backlog/features/F-137-system-tls-feature.md` 参照）。
 /// 意味不明なリンクエラーで悩ませないよう、依存関係の解決前にビルドを止めて
 /// 原因と対処法を明示する。
 fn check_tls_backend_exclusivity() {
-    // F-137: `system-tls` は OpenBSD 専用（NetBSD 対応時はこの配列に追加する）。
-    // 非対応 OS では aws-lc-rs/aws-lc-sys が target_os のみで決まる無条件依存であり、
-    // その OUT_DIR に生成される libssl.a/libcrypto.a が `-L` 探索順でシステムの
-    // 動的 libssl/libcrypto を遮蔽するため、`rustls-openssl` が要求する
-    // OpenSSL 3.0 系シンボルが undefined になる（http3/quiche の feature 選択とは無関係）。
-    // 意味不明なリンクエラーで悩ませないよう、依存解決前にビルドを止めて原因と対処法を示す。
-    const SYSTEM_TLS_ALLOWED_TARGET_OSES: &[&str] = &["openbsd", "netbsd"];
+    // F-142: `system-tls` は Linux/FreeBSD/OpenBSD/NetBSD で使用可能（macOS/Windows は
+    // 未対応）。Linux/FreeBSD は F-142 で aws-lc-rs/aws-lc-sys を `vendored-tls` feature
+    // 配下の optional 依存にしたことで排他切替できるようになった。
+    const SYSTEM_TLS_ALLOWED_TARGET_OSES: &[&str] = &["openbsd", "netbsd", "linux", "freebsd"];
 
     if !feature_enabled("SYSTEM_TLS") {
         return;
     }
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if SYSTEM_TLS_ALLOWED_TARGET_OSES.contains(&target_os.as_str()) {
+    if !SYSTEM_TLS_ALLOWED_TARGET_OSES.contains(&target_os.as_str()) {
+        panic!(
+            "veil build.rs: `system-tls` is only supported on {allowed:?} (current target_os \
+             = `{target_os}`). On other targets aws-lc-rs/aws-lc-sys are unconditional \
+             dependencies whose build artifacts contain files literally named \
+             libssl.a/libcrypto.a; those shadow the system libssl/libcrypto in the linker's \
+             -L search order and the system-tls provider fails with undefined-symbol errors \
+             (reproducible even with http3 disabled, so it is unrelated to the quiche feature \
+             selection). Drop `system-tls` on this target. \
+             See docs/backlog/features/F-137-system-tls-feature.md.",
+            allowed = SYSTEM_TLS_ALLOWED_TARGET_OSES,
+            target_os = target_os,
+        );
+    }
+
+    // F-142: `vendored-tls` と `system-tls` の同時指定は、両方が aws-lc-sys の静的
+    // ライブラリ（`vendored-tls`）とシステム libssl への動的リンク（`system-tls`）を
+    // 同一バイナリに持ち込もうとするため、上記と同じリンク衝突を起こす。
+    if feature_enabled("VENDORED_TLS") {
+        panic!(
+            "veil build.rs: `vendored-tls` and `system-tls` cannot be enabled together. \
+             `vendored-tls` pulls in aws-lc-rs/aws-lc-sys (static libssl.a/libcrypto.a \
+             build artifacts) while `system-tls` dynamically links the system \
+             libssl/libcrypto; combining them causes the same linker shadowing/undefined- \
+             symbol failures described for the target_os check above. Pick exactly one: \
+             drop `vendored-tls` for a system-tls build, or drop `system-tls` for the \
+             default vendored build. See docs/backlog/features/F-137-system-tls-feature.md."
+        );
+    }
+}
+
+/// `system-tls` + `http3` の組み合わせが要求する QUIC API を、システムの libssl が
+/// 実装しているかを pkg-config 経由で検査する（F-142）。
+///
+/// quiche は BoringSSL 系 QUIC API（`SSL_set_quic_method`/`SSL_provide_quic_data` 等）を
+/// 要求するが、バニラ OpenSSL 3.x にはこれが無い（NetBSD 実機で
+/// `undefined reference to SSL_set_quic_method` を確認済み）。LibreSSL 3.6+ / quictls には
+/// 存在する。リンク時の不可解な undefined reference で悩ませないよう、依存解決前に
+/// `openssl/ssl.h` を pkg-config の include path から探して `SSL_set_quic_method` の
+/// 宣言があるかを grep で確認し、無ければビルドを止めて明確なエラーを出す。
+///
+/// `http3` を含まない `system-tls` 単体（rustls のみ）はこのチェックをスキップする
+/// （OpenSSL 3.x でも LibreSSL でも rustls 側は動くため）。
+fn check_system_tls_quic_capability() {
+    if !(feature_enabled("SYSTEM_TLS") && feature_enabled("HTTP3")) {
         return;
     }
-    panic!(
-        "veil build.rs: `system-tls` is only supported on {allowed:?} (current target_os = \
-         `{target_os}`). On other targets aws-lc-rs/aws-lc-sys are unconditional \
-         dependencies whose build artifacts contain files literally named \
-         libssl.a/libcrypto.a; those shadow the system libssl/libcrypto in the linker's \
-         -L search order and `rustls-openssl` fails with undefined-symbol errors \
-         (reproducible even with http3 disabled, so it is unrelated to the quiche feature \
-         selection). Drop `system-tls` on this target. \
-         See docs/backlog/features/F-137-system-tls-feature.md.",
-        allowed = SYSTEM_TLS_ALLOWED_TARGET_OSES,
-        target_os = target_os,
-    );
+
+    let Some(include_dir) = pkg_config_variable("libssl", "includedir") else {
+        // pkg-config 自体が無い/libssl.pc が見つからない場合は、リンク時に quiche 側の
+        // ビルドスクリプトがより具体的なエラーを出す（ここでは検出できないだけで諦める）。
+        println!(
+            "cargo:warning=veil: could not locate libssl via pkg-config to verify QUIC API \
+             support for `system-tls` + `http3`; proceeding, but the build may fail later \
+             with an undefined-symbol link error if the system libssl lacks \
+             SSL_set_quic_method (LibreSSL 3.6+ / quictls required)."
+        );
+        return;
+    };
+
+    let header = std::path::Path::new(&include_dir).join("openssl/ssl.h");
+    // build.rs はコールドパス（ビルド時に一度だけ実行）であり、AGENTS.md のホットパス
+    // 同期 I/O 禁止規則の対象外。
+    #[allow(clippy::disallowed_methods)]
+    let has_quic_api = std::fs::read_to_string(&header)
+        .map(|contents| contents.contains("SSL_set_quic_method"))
+        .unwrap_or(false);
+
+    if !has_quic_api {
+        panic!(
+            "veil build.rs: `system-tls` + `http3` requires the system libssl to implement \
+             the BoringSSL-derived QUIC API (LibreSSL 3.6+ / quictls), specifically \
+             `SSL_set_quic_method`. It was not found in {header}. Either drop `http3` (rustls \
+             alone works fine with vanilla OpenSSL 3.x / LibreSSL under system-tls), or use \
+             `vendored-tls` instead, or install a QUIC-capable libssl (e.g. LibreSSL 3.6+ on \
+             OpenBSD/NetBSD base, or pkgsrc libressl on NetBSD, or quictls on Linux/FreeBSD).",
+            header = header.display(),
+        );
+    }
+}
+
+/// `pkg-config --variable=<var> <pkg>` を実行し、成功した場合の標準出力（trim 済み）を返す。
+/// `pkg-config` コマンド自体が無い、または対象パッケージが見つからない場合は `None`。
+fn pkg_config_variable(pkg: &str, var: &str) -> Option<String> {
+    let output = std::process::Command::new("pkg-config")
+        .arg(format!("--variable={var}"))
+        .arg(pkg)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 /// ランタイムバックエンド選択用の cfg エイリアスを発行する（F-120 Phase 1）。
@@ -78,7 +162,7 @@ fn check_tls_backend_exclusivity() {
 /// | `veil_poller_epoll` | `target_os = "linux"` かつ `feature = "epoll"` | reactor の poller = epoll |
 /// | `veil_poller_kqueue` | `target_os = "freebsd"`、`"openbsd"`、`"macos"`、`"netbsd"`（F-140） | reactor の poller = kqueue |
 /// | `veil_poller_wsapoll` | `target_os = "windows"` | reactor の poller = WSAPoll（F-125、cfg 発行のみ。実装は別作業） |
-/// | `veil_ktls` | `feature = "ktls"` かつ (`target_os = "linux"` または `"freebsd"`) かつ `not(feature = "system-tls")` | kTLS カーネルオフロード経路（F-126: FreeBSD 対応追加。OpenBSD は非対応のまま。F-137: `system-tls` と同時指定時は自動的に無効化し `cargo:warning` を出す） |
+/// | `veil_ktls` | `feature = "ktls"` かつ (`target_os = "linux"` または `"freebsd"`) かつ `not(feature = "system-tls")` かつ `feature = "vendored-tls"` | kTLS カーネルオフロード経路（F-126: FreeBSD 対応追加。OpenBSD は非対応のまま。F-137: `system-tls` と同時指定時、F-142: `vendored-tls` 未指定時は自動的に無効化し `cargo:warning` を出す） |
 /// | `veil_aio` | `feature = "aio"` かつ `target_os = "freebsd"` | POSIX AIO（`aio_read`/`aio_write` + `EVFILT_AIO`）による TCP read/write 経路（F-127。FreeBSD 専用、既定オフ） |
 ///
 /// `cargo::rustc-check-cfg` も併せて発行し、`unexpected_cfgs` 警告を防ぐ。
@@ -97,6 +181,7 @@ fn emit_runtime_backend_cfg() {
     let ktls = feature_enabled("KTLS");
     let aio = feature_enabled("AIO");
     let system_tls = feature_enabled("SYSTEM_TLS");
+    let vendored_tls = feature_enabled("VENDORED_TLS");
 
     match target_os.as_str() {
         "linux" => {
@@ -148,13 +233,24 @@ fn emit_runtime_backend_cfg() {
     if ktls && (target_os == "linux" || target_os == "freebsd") {
         if system_tls {
             // F-137: veil_ktls は aws_lc_rs 固有の cipher_suite 定数を直接参照する
-            // （src/tls_provider.rs 参照）ため、`system-tls`（rustls-openssl）とは
-            // 併用できない。cfg を立てず kTLS を自動的に無効化する。
+            // （src/ktls_rustls.rs 参照）ため、`system-tls`とは併用できない。
+            // cfg を立てず kTLS を自動的に無効化する。
             println!(
                 "cargo:warning=veil: `ktls` feature is disabled automatically because \
                  `system-tls` is also enabled (kTLS relies on aws_lc_rs-specific cipher \
                  suite constants that are unavailable under system-tls; F-137). Remove \
                  `ktls` from the feature list to silence this warning."
+            );
+        } else if !vendored_tls {
+            // F-142: aws-lc-rs/aws-lc-sys が `vendored-tls` feature 配下の optional 依存に
+            // なったため、`rustls::crypto::aws_lc_rs` を直接参照する kTLS 経路
+            // （src/ktls_rustls.rs）は `vendored-tls` も必要とする。
+            println!(
+                "cargo:warning=veil: `ktls` feature is disabled automatically because \
+                 `vendored-tls` is not enabled (kTLS relies on the aws_lc_rs cipher suite \
+                 constants bundled by rustls's `aws_lc_rs` cargo feature, which `vendored-tls` \
+                 turns on; F-142). Add `vendored-tls` to the feature list, or remove `ktls` \
+                 to silence this warning."
             );
         } else {
             println!("cargo::rustc-cfg=veil_ktls");
