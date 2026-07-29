@@ -96,7 +96,8 @@ io_uring（独自実装ランタイム）と rustls を使用した高性能リ�
 | **Linux `--features epoll`** | epoll readiness reactor（`src/runtime/reactor/`） | seccomp（epoll 系許可・io_uring 系除外）+ Landlock | ✅ | io_uring 非対応ホスト向けフォールバック |
 | **FreeBSD（x86_64/aarch64）** | kqueue readiness reactor（`--features aio` で POSIX AIO 経路にも切替可・F-127） | capsicum（`cap_rights_limit` / `cap_enter`）+ jail | ✅（FreeBSD 13.0+、`TCP_TXTLS_ENABLE`/`TCP_RXTLS_ENABLE`; F-126） | `[security] enable_capsicum` / `capsicum_capability_mode` / `jail_name`。TLS 証明書ホットリロード（H1/H2・HTTP/3 とも）は capsicum capability mode 下でも動作する（F-136）: cert/key の親ディレクトリ fd を `cap_enter` 前に確保し `openat`/`fstatat`（`O_RESOLVE_BENEATH`）で読む。`http3`（quiche）は rustls との `aws-lc-sys` 共有をやめ **`boringssl-boring-crate`**（外部 `boring` crate）へ切替済みで、パスを一切介さない in-memory `SSL_CTX` API で証明書を再構築できる |
 | **OpenBSD（x86_64/aarch64）** | kqueue readiness reactor | pledge + unveil | ✗（ユーザ空間 rustls） | `[security] enable_pledge` / `enable_unveil`。TLS は rustls の **ring** プロバイダを使用（aws-lc-rs は OpenBSD でハンドシェイク未完・F-122）。**WASM は Pulley インタープリタで動作**（B-52）: OnDemand インスタンスアロケータ + `MAP_STACK` 付きファイバスタックと併用する（wasmtime のプーリングアロケータは `with_host_stack` を黙って無視し、OpenBSD は SP が `MAP_STACK` 領域外だとプロセスを殺すため）。Pulley はネイティブコードを生成しないので `wxallowed` なファイルシステムが不要（速度はインタープリタ相当）。静的配信/プロキシとも HTTPS 200 検証済み |
-| **macOS（x86_64/aarch64、universal2）** | kqueue readiness reactor（FreeBSD/OpenBSD と共通実装を再利用） | `sandbox_init`（Seatbelt） | ✗（ユーザ空間 rustls） | `[security] enable_sandbox_macos`。TLS は rustls の **aws_lc_rs** プロバイダ、`http3`（quiche）は内蔵 BoringSSL を使用（F-131）。`docker/Dockerfile.macos`（`cargo zigbuild --target universal2-apple-darwin --features full`）でクロスビルドし、実機で動作確認済み |
+| **NetBSD（x86_64/aarch64）** | kqueue readiness reactor | **chroot(2) + 特権降格のみ（pledge/unveil 相当は無い）**（F-140） | ✗（ユーザ空間 rustls） | `[security] chroot_dir`（opt-in、`chroot(2)` + `chdir("/")`。`drop_privileges_user`/`drop_privileges_group` による setuid/setgid より前に適用）。NetBSD には OpenBSD の pledge/unveil に相当するランタイム API が無い（Veriexec はカーネル設定・ロード時整合性検証機構でプロセス自身が呼べる syscall フィルタではなく、`secmodel_securelevel` はシステム全体の起動時設定）。veil は非対応であることを起動時ログで正直に報告する（`security::netbsd::report_security_support`）。TLS は OpenBSD と同じ rustls **ring** + quiche **boringssl-boring-crate**。WASM も OpenBSD と同様に常時 Pulley インタープリタで動作するが、OpenBSD 固有の `MAP_STACK`/OnDemand アロケータ回避（OpenBSD 6.4+ カーネル制約）は NetBSD には**追加しない**。コードは完成済みで、QEMU での実ビルド・E2E は別チケット（`docs/backlog/features/F-140-netbsd-support.md`） |
+| **macOS（x86_64/aarch64、universal2）** | kqueue readiness reactor（FreeBSD/OpenBSD/NetBSD と共通実装を再利用） | `sandbox_init`（Seatbelt） | ✗（ユーザ空間 rustls） | `[security] enable_sandbox_macos`。TLS は rustls の **aws_lc_rs** プロバイダ、`http3`（quiche）は内蔵 BoringSSL を使用（F-131）。`docker/Dockerfile.macos`（`cargo zigbuild --target universal2-apple-darwin --features full`）でクロスビルドし、実機で動作確認済み |
 | **Windows（x86_64-pc-windows-msvc / aarch64-pc-windows-msvc）** | WSAPoll readiness reactor（`src/runtime/reactor/wsapoll.rs`、`src/runtime/reactor/tcp/windows.rs`、Winsock） | Job Object（best-effort） | ✗（ユーザ空間 rustls） | `[security] enable_job_object_windows`。TLS は両 arch とも rustls の **aws_lc_rs** プロバイダ、`http3`（quiche）は内蔵 BoringSSL を使用（F-131）。`docker/Dockerfile.windows`（`cargo xwin build --target <target> --features full`。`packaging/scripts/build-cross.sh --target windows` で両 arch を一括ビルド）でクロスビルドし、実機で動作確認済み |
 
 - バックエンドは `build.rs` 発行の cfg（`veil_rt_uring` / `veil_rt_reactor`、
@@ -111,6 +112,12 @@ io_uring（独自実装ランタイム）と rustls を使用した高性能リ�
   `tests/e2e_setup.sh test` → バイナリ取得までを一括で扱う（x86_64 ゲストはホストに
   `/dev/kvm` があれば KVM 加速される）。tar.gz + rc.d/jail.conf のパッケージングは
   `packaging/scripts/build-bsd.sh` 参照。
+  **NetBSD 対応（F-140）はコード側は完成しているが `bsd-vm.sh`/`build-bsd.sh` への
+  組み込みは未着手**（QEMU VM 構築・E2E は別チケット
+  `docs/backlog/features/F-140-netbsd-support.md` で扱う）。本開発環境には NetBSD 向け
+  C クロスコンパイラも無いため、`cargo check --target x86_64-unknown-netbsd` は
+  `ring`/`boring` のネイティブビルドスクリプトの時点で失敗し veil 自身のコードへは
+  到達できていない。
   `x86_64-unknown-freebsd` 向けに `docker/Dockerfile.freebsd` を用意しているが
   （zig が FreeBSD libc を同梱しており Rust Tier 2）、**現在リンク段で失敗する**。
   aws-lc-sys の s2n-bignum アセンブリが FreeBSD クロス構成で 1 つも組み立てられず
@@ -142,28 +149,34 @@ io_uring（独自実装ランタイム）と rustls を使用した高性能リ�
   両 arch とも **aws_lc_rs**、`http3`（quiche）は内蔵 BoringSSL を使用する。
   既定は `--features full`（`http3`・`wasm`・`l4-proxy` を含む）で、実機で動作確認済み。
   `ktls` は Linux/FreeBSD 専用のため対象外。
-- **TLS 暗号プロバイダ / quiche 暗号バックエンドのターゲット分割（F-122/F-131/F-136）**:
-  rustls のプロバイダは **OpenBSD のみ `ring`**、それ以外（Linux/FreeBSD/macOS/Windows）は
-  `aws_lc_rs`（`src/tls_provider.rs` と `Cargo.toml` の target 別依存を一致させること）。
+- **TLS 暗号プロバイダ / quiche 暗号バックエンドのターゲット分割（F-122/F-131/F-136/F-140）**:
+  rustls のプロバイダは **OpenBSD/NetBSD のみ `ring`**（NetBSD は未検証だが OpenBSD と
+  同じ Tier 3 サポート不足の懸念があるため保守的に合わせた）、それ以外
+  （Linux/FreeBSD/macOS/Windows）は `aws_lc_rs`（`src/tls_provider.rs` と `Cargo.toml` の
+  target 別依存を一致させること）。
   `http3` の quiche は **Linux でのみ `aws-lc-sys` を共有**し（memfd 経由の従来証明書ロード、
-  無変更）、**FreeBSD/macOS/Windows/OpenBSD では `boringssl-boring-crate`**（外部 `boring`
-  crate）を使う。FreeBSD は F-136（capsicum capability mode 下での証明書ホットリロード）で
+  無変更）、**FreeBSD/macOS/Windows/OpenBSD/NetBSD では `boringssl-boring-crate`**（外部
+  `boring` crate）を使う。FreeBSD は F-136（capsicum capability mode 下での証明書ホットリロード）で
   `aws-lc-sys` 共有から切り替えた: `Config::with_boring_ssl_ctx_builder` という
   パスを一切介さない in-memory `SSL_CTX` 構築 API が `boringssl-boring-crate` でしか
   提供されないため。`aws-lc-sys`（`NO_PREFIX=1`）と外部 `boring` crate を同一バイナリに
   同居させるとリンク時に重複シンボルエラーになることを実験で確認済み
   （`docs/artifacts/f136_platform_design.md`）。この切り替えが `AWS_LC_SYS_NO_PREFIX` であり、
   値は [`.cargo/config.toml`](../../.cargo/config.toml) の `[env]` のみで設定する（B-47）。
-- **`system-tls` フィーチャー（F-137）— 現状 OpenBSD 専用。Linux/FreeBSD/macOS/Windows では
-  使用しないこと（リンクエラーで失敗する）**: rustls の暗号プロバイダをシステムの
-  OpenSSL/LibreSSL へ動的リンクする `rustls-openssl` crate（`vendored` は使わない）へ切り替え、
-  quiche 側も `openssl` feature で動的リンクする設計。**OpenBSD だけ**動作する:
-  OpenBSD の quiche/rustls 依存は元々 `aws-lc-sys` 共有から完全に切り離してある
-  （`Cargo.toml` の `[target.'cfg(target_os = "openbsd")'.dependencies]` で quiche/boring
-  を optional 化、`openbsd-vendor-tls` フォワーディング feature で従来の vendored
-  BoringSSL 構成に切替可能）ため、`full-openbsd`/`full-openbsd-aarch64` が既定で
+- **`system-tls` フィーチャー（F-137/F-140）— 現状 OpenBSD/NetBSD 専用。
+  Linux/FreeBSD/macOS/Windows では使用しないこと（リンクエラーで失敗する）**:
+  rustls の暗号プロバイダをシステムの OpenSSL/LibreSSL へ動的リンクする
+  `rustls-openssl` crate（`vendored` は使わない）へ切り替え、
+  quiche 側も `openssl` feature で動的リンクする設計。**OpenBSD/NetBSD だけ**動作する:
+  両者の quiche/rustls 依存は元々 `aws-lc-sys` 共有から完全に切り離してある
+  （`Cargo.toml` の
+  `[target.'cfg(any(target_os = "openbsd", target_os = "netbsd"))'.dependencies]` で
+  quiche/boring を optional 化、`openbsd-vendor-tls`/`netbsd-vendor-tls` フォワーディング
+  feature で従来の vendored BoringSSL 構成に切替可能）ため、
+  `full-openbsd`/`full-openbsd-aarch64`/`full-netbsd`/`full-netbsd-aarch64` が既定で
   `system-tls` + `quiche?/openssl` を使う。従来の同梱（vendored）構成は
-  `full-openbsd-vendor`/`full-openbsd-aarch64-vendor` として維持。
+  `full-openbsd-vendor`/`full-openbsd-aarch64-vendor`/`full-netbsd-vendor`/
+  `full-netbsd-aarch64-vendor` として維持。
   **Linux/FreeBSD で失敗する理由**: `aws-lc-rs`/`aws-lc-sys` は `target_os` のみで
   決まる無条件の依存であり、どの Cargo feature を選んでも `cargo tree
   --no-default-features` に残る。aws-lc-sys のビルド成果物には `AWS_LC_SYS_NO_PREFIX`
@@ -178,11 +191,12 @@ io_uring（独自実装ランタイム）と rustls を使用した高性能リ�
   既存の受け入れ条件と衝突する（Cargo のフィーチャーは加算のみで否定的な表現ができない
   ため）ため未解決。`system-tls` を含まない `full`/`full-freebsd` 等は本フィーチャーの
   存在による影響を一切受けない（`cargo tree --features full` 差分ゼロを確認済み）。
-  **OpenBSD の HTTP/3 証明書ホットリロード**: `create_memfd_for_pem`（OpenBSD 版は 0600
-  一時ファイル、`std::env::temp_dir()` 配下、Drop で unlink）経由のパス指定 API に
+  **OpenBSD/NetBSD の HTTP/3 証明書ホットリロード**: `create_memfd_for_pem`（OpenBSD/NetBSD
+  版は 0600 一時ファイル、`std::env::temp_dir()` 配下、Drop で unlink）経由のパス指定 API に
   フォールバックするため、`src/config.rs::collect_unveil_paths` が `system-tls` 有効時のみ
-  一時ディレクトリを unveil の `read_write_create` に追加している（追加しないと unveil
-  適用後に証明書ホットリロードが恒常的に無効になる）。`full-openbsd-vendor` は代わりに
+  一時ディレクトリを unveil の `read_write_create` に追加している（OpenBSD 限定の処置。
+  追加しないと unveil 適用後に証明書ホットリロードが恒常的に無効になる。NetBSD には
+  unveil 自体が無いため本項は無関係）。`full-openbsd-vendor`/`full-netbsd-vendor` は代わりに
   in-memory `SSL_CTX` API（ファイル不使用、サンドボックス耐性が高い）を使う。**`ktls`
   とは併用不可**（aws_lc_rs 固有の cipher_suite 定数に依存するため。OpenBSD は元々
   kTLS 非対応なので実質関係ない）で、両方指定すると `build.rs` が自動的に kTLS を

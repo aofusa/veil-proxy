@@ -96,7 +96,8 @@ hot-path cost). The default is unchanged (Linux io_uring).
 | **Linux `--features epoll`** | epoll readiness reactor (`src/runtime/reactor/`) | seccomp (epoll syscalls; io_uring syscalls dropped) + Landlock | ✅ | Fallback for hosts without io_uring |
 | **FreeBSD (x86_64/aarch64)** | kqueue readiness reactor (optionally POSIX AIO with `--features aio`, F-127) | capsicum (`cap_rights_limit` / `cap_enter`) + jail | ✅ (FreeBSD 13.0+, `TCP_TXTLS_ENABLE`/`TCP_RXTLS_ENABLE`; F-126) | `[security] enable_capsicum`, `capsicum_capability_mode`, `jail_name`. TLS cert hot-reload (H1/H2 and HTTP/3) keeps working under capsicum capability mode (F-136): cert/key parent directories get a dirfd opened before `cap_enter`, and reads go through `openat`/`fstatat` (`O_RESOLVE_BENEATH`). `http3` (quiche) now uses `boringssl-boring-crate` (external `boring` crate) instead of sharing `aws-lc-sys` with rustls, so its in-memory `SSL_CTX` API can rebuild certificates without ever opening a path |
 | **OpenBSD (x86_64/aarch64)** | kqueue readiness reactor | pledge + unveil | ✗ (userspace rustls) | `[security] enable_pledge`, `enable_unveil`. TLS uses the **ring** rustls provider (aws-lc-rs can't complete handshakes on OpenBSD; F-122). **WASM runs via the Pulley interpreter** with the on-demand instance allocator and `MAP_STACK` fiber stacks (B-52; wasmtime's pooling allocator silently ignores `with_host_stack`, and OpenBSD kills any process whose SP is outside a `MAP_STACK` mapping). Pulley emits no native code, so no `wxallowed` filesystem is required — at interpreter speed. HTTPS static/proxy serving verified 200 |
-| **macOS (x86_64/aarch64, universal2)** | kqueue readiness reactor (reused from FreeBSD/OpenBSD) | `sandbox_init` (Seatbelt) | ✗ (userspace rustls) | `[security] enable_sandbox_macos`. TLS uses the **aws_lc_rs** rustls provider; `http3` (quiche) uses its own bundled BoringSSL (F-131). Cross-built with `docker/Dockerfile.macos` (`cargo zigbuild --target universal2-apple-darwin`, `--features full`); verified on real hardware by the maintainer |
+| **NetBSD (x86_64/aarch64)** | kqueue readiness reactor | **chroot(2) + privilege drop only — no pledge/unveil equivalent** (F-140) | ✗ (userspace rustls) | `[security] chroot_dir` (opt-in `chroot(2)` + `chdir("/")`, applied before `drop_privileges_user`/`drop_privileges_group`). NetBSD has no runtime API equivalent to OpenBSD's pledge/unveil (Veriexec is a kernel-config/load-time integrity mechanism, not a per-process syscall filter; `secmodel_securelevel` is a system-wide boot-time setting) — veil logs this limitation honestly at startup (`security::netbsd::report_security_support`) rather than pretending to sandbox syscalls. TLS uses the same **ring** rustls provider + **`boringssl-boring-crate`** quiche backend as OpenBSD; WASM always runs via the Pulley interpreter (same conservative choice as OpenBSD) but **without** OpenBSD's `MAP_STACK`/on-demand-allocator workaround, which is an OpenBSD 6.4+ kernel-specific constraint NetBSD does not have. Code-complete; QEMU build/E2E verification is a separate follow-up (`docs/backlog/features/F-140-netbsd-support.md`) |
+| **macOS (x86_64/aarch64, universal2)** | kqueue readiness reactor (reused from FreeBSD/OpenBSD/NetBSD) | `sandbox_init` (Seatbelt) | ✗ (userspace rustls) | `[security] enable_sandbox_macos`. TLS uses the **aws_lc_rs** rustls provider; `http3` (quiche) uses its own bundled BoringSSL (F-131). Cross-built with `docker/Dockerfile.macos` (`cargo zigbuild --target universal2-apple-darwin`, `--features full`); verified on real hardware by the maintainer |
 | **Windows (x86_64-pc-windows-msvc / aarch64-pc-windows-msvc)** | WSAPoll readiness reactor (`src/runtime/reactor/wsapoll.rs`, `src/runtime/reactor/tcp/windows.rs`, Winsock) | Job Object (best-effort) | ✗ (userspace rustls) | `[security] enable_job_object_windows`. TLS uses the **aws_lc_rs** rustls provider on both archs; `http3` (quiche) uses its own bundled BoringSSL (F-131). Cross-built with `docker/Dockerfile.windows` (`cargo xwin build --target <target>`, `--features full`; `packaging/scripts/build-cross.sh --target windows` builds both archs); verified on real hardware by the maintainer |
 
 - The backend is chosen by `build.rs`-emitted cfgs (`veil_rt_uring` / `veil_rt_reactor` and
@@ -109,7 +110,12 @@ hot-path cost). The default is unchanged (Linux io_uring).
 - **FreeBSD/OpenBSD** are built inside a matching QEMU VM — `tools/qemu/bsd-vm.sh <os> <arch>`
   covers FreeBSD/OpenBSD × x86_64/aarch64 (setup → build → `tests/e2e_setup.sh test` →
   fetch the binary), and `packaging/scripts/build-bsd.sh` turns the binary into a tar.gz with
-  rc.d/jail.conf. A `docker/Dockerfile.freebsd` exists for `x86_64-unknown-freebsd`
+  rc.d/jail.conf. **NetBSD support (F-140) is code-complete but not yet wired into
+  `bsd-vm.sh`/`build-bsd.sh`** — QEMU VM setup and E2E verification for NetBSD are tracked
+  as follow-up work in `docs/backlog/features/F-140-netbsd-support.md`; this environment
+  also lacks a NetBSD cross C toolchain, so `cargo check --target x86_64-unknown-netbsd`
+  currently fails inside `ring`'s/`boring`'s native build scripts before reaching veil's own
+  code. A `docker/Dockerfile.freebsd` exists for `x86_64-unknown-freebsd`
   (zig bundles FreeBSD libc and the target is Rust Tier 2), but it **currently fails at link
   time** — `aws-lc-sys` assembles none of its s2n-bignum `.S` files under a FreeBSD cross
   configuration, producing many `undefined symbol: curve25519_x25519_byte`-style errors
@@ -136,15 +142,17 @@ hot-path cost). The default is unchanged (Linux io_uring).
   `packaging/scripts/build-cross.sh --target windows`, which builds both
   x86_64-pc-windows-msvc and aarch64-pc-windows-msvc with `--features full`
   (`http3` via bundled BoringSSL, plus `wasm` and `l4-proxy`). `ktls` is Linux/FreeBSD only.
-- **TLS crypto provider** is selected per target in `src/tls_provider.rs` (F-122/F-131):
-  **OpenBSD uses rustls's `ring`** provider (aws-lc-rs cannot complete TLS handshakes
-  there), **every other target (Linux/FreeBSD/macOS/Windows) uses `aws_lc_rs`**.
+- **TLS crypto provider** is selected per target in `src/tls_provider.rs` (F-122/F-131/F-140):
+  **OpenBSD/NetBSD use rustls's `ring`** provider (aws-lc-rs cannot complete TLS handshakes
+  on OpenBSD; NetBSD is assumed to share the same Tier-3 risk and was conservatively matched
+  to OpenBSD rather than independently verified), **every other target
+  (Linux/FreeBSD/macOS/Windows) uses `aws_lc_rs`**.
   `Cargo.toml` splits the provider via target-specific dependencies plus `resolver = "2"`;
   keep the two in sync.
 - **HTTP/3 (quiche) crypto backend** is likewise split per target:
   **Linux** builds quiche with `default-features = false` so it **shares the same
   `aws-lc-sys`** as rustls (unchanged, memfd-based cert loading), while
-  **FreeBSD/macOS/Windows/OpenBSD** build quiche with the **`boringssl-boring-crate`**
+  **FreeBSD/macOS/Windows/OpenBSD/NetBSD** build quiche with the **`boringssl-boring-crate`**
   feature (external `boring` crate, bundled BoringSSL). This is what `AWS_LC_SYS_NO_PREFIX`
   selects — see the note in the packaging section and
   [`.cargo/config.toml`](.cargo/config.toml) (B-47).
@@ -160,7 +168,7 @@ hot-path cost). The default is unchanged (Linux io_uring).
   link time with duplicate BoringSSL/AWS-LC symbols, which is why FreeBSD was moved off
   the shared-`aws-lc-sys` scheme instead of being added to it. See
   `docs/artifacts/f136_platform_design.md` for the experiment and rejected alternatives.
-- **`system-tls` feature (F-137) — OpenBSD only, do not use on Linux/FreeBSD/macOS/Windows.**
+- **`system-tls` feature (F-137/F-140) — OpenBSD/NetBSD only, do not use on Linux/FreeBSD/macOS/Windows.**
   Dynamically links rustls's crypto backend to the **system** SSL library instead of
   vendoring `aws-lc-rs`/`ring`, via the `rustls-openssl` crate (`vendored` feature is never
   enabled), plus quiche's own `openssl` feature for HTTP/3 dynamic linking. This works on

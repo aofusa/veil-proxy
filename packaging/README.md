@@ -118,6 +118,15 @@ aarch64 専用 Dockerfile（`docker/Dockerfile.{glibc,musl}.aarch64`）と
 RUST_TARGET=aarch64-unknown-linux-gnu ./packaging/scripts/build.sh --docker
 ```
 
+### NetBSD 対応の現状（F-140）
+
+NetBSD 向けの feature セット（`full-netbsd`/`full-netbsd-vendor`/`full-netbsd-aarch64`/
+`full-netbsd-aarch64-vendor`、`system-tls`/TLS プロバイダの target 別分岐、
+kqueue reactor の `struct kevent` 型差吸収）は **コード側は完成済み**だが、
+`tools/qemu/bsd-vm.sh` / `packaging/scripts/build-bsd.sh` への NetBSD 組み込みは
+**未着手**（別チケット `docs/backlog/features/F-140-netbsd-support.md`）。
+本節の FreeBSD/OpenBSD 手順は現時点では NetBSD には使えない。
+
 ### FreeBSD / OpenBSD 向けパッケージ（F-120 Phase 6）
 
 FreeBSD/OpenBSD のバイナリは **QEMU VM 内でネイティブビルド**したものを取り出し、
@@ -186,6 +195,8 @@ FreeBSD 専用 I/O 経路だけが異なる**。cargo にはターゲット別�
 | `full-freebsd` | **jemalloc** | **`aio`**（POSIX AIO 経路、F-127） | `build-cross.sh --target freebsd` / `bsd-vm.sh freebsd …` |
 | `full-openbsd` | **システムアロケータ**（`global_allocator` を差し替えない） | **`system-tls`**（F-137、システムの LibreSSL へ動的リンク） | `bsd-vm.sh openbsd …`（既定） |
 | `full-openbsd-vendor` | 同上 | 従来の同梱構成（rustls+ring / quiche+BoringSSL 同梱） | `CARGO_FEATURES=full-openbsd-vendor` を明示指定 |
+| `full-netbsd` | システムアロケータ | `system-tls`（F-140、OpenBSD と同じ扱い） | コード側のみ完成。`bsd-vm.sh` 未対応（上記「NetBSD 対応の現状」参照） |
+| `full-netbsd-vendor` | 同上 | 従来の同梱構成（rustls+ring / quiche+BoringSSL 同梱） | 同上 |
 
 **F-137: OpenBSD の既定は `system-tls`**。OpenBSD ベースの LibreSSL（`libssl.pc`/
 `libcrypto.pc`）へ動的リンクし、vendored な暗号ライブラリ（quiche の BoringSSL cmake
@@ -309,7 +320,7 @@ zip には `veil.exe`・`config.toml.default`・`www/index.html`・`INSTALL.txt`
 **`AWS_LC_SYS_NO_PREFIX` について（B-47）**: `http3` / `full` ビルドで
 `aws-lc-sys` と `quiche` のシンボルをどう扱うかは
 **`.cargo/config.toml` の `[env]`（ターゲット接尾辞付き変数）が唯一の設定箇所**である
-（Linux/FreeBSD = `1`、Windows/macOS/OpenBSD = `0`）。cargo にターゲット別 env の仕組みが
+（Linux/FreeBSD = `1`、Windows/macOS/OpenBSD/NetBSD = `0`）。cargo にターゲット別 env の仕組みが
 無いため（`[target.<triple>.env]` は黙って無視される）、`aws-lc-sys` が優先して読む
 `AWS_LC_SYS_NO_PREFIX_<triple_with_underscores>` を列挙している。
 packaging のスクリプトや Dockerfile 側でこの変数を設定してはならない。

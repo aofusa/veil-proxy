@@ -613,6 +613,29 @@ reuseport_balancing = "cbpf"
 # enable_job_object_windows = true
 
 # ============================================
+# chroot 設定 (NetBSD専用、F-140)
+# ============================================
+#
+# NetBSD には OpenBSD の pledge/unveil に相当するランタイム API が無い
+# （Veriexec はカーネル設定・ロード時の整合性検証機構であり、プロセスが自分自身に
+# 適用できる syscall フィルタやパスホワイトリスト API ではない。secmodel_securelevel
+# はシステム全体の起動時設定）。veil が NetBSD 上で提供できるのは chroot(2) +
+# 特権降格（drop_privileges_user/drop_privileges_group、全 OS 共通）+ rlimit のみ。
+# 本キーは全 OS で受理されるが、NetBSD 以外では警告ログのみで無視される。
+# kTLS は非対応（NetBSD ビルドは常に simple_tls = ユーザ空間 rustls、暗号プロバイダは
+# ring、quiche は boringssl-boring-crate）。
+#
+# chroot_dir を設定すると:
+#   - 起動シーケンスの早い段階（drop_privileges による setuid/setgid より前）に
+#     chroot(2) + chdir("/") を適用する（root 前提）。
+#   - 以降プロセスがアクセスする全パス（静的ファイルルート・TLS証明書/鍵・WASM
+#     モジュール・ログ/ディスクキャッシュディレクトリ）は、この新ルート基準で
+#     解決可能な位置に配置しておく必要がある（運用側の設定責任）。
+#   - 失敗時の挙動は allow_security_failures に従う。
+#
+# chroot_dir = "/var/lib/veil/chroot"
+
+# ============================================
 # 本番環境向け推奨設定
 # ============================================
 #
