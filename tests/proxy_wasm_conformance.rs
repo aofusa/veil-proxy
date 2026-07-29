@@ -18,11 +18,11 @@ use std::sync::Mutex;
 
 use veil::wasm::{
     build_conformance_test_engine, build_conformance_test_linker, HostState, HttpContext,
-    ModuleCapabilities, PROXY_RESULT_BAD_ARGUMENT, PROXY_RESULT_EMPTY, PROXY_RESULT_INTERNAL_FAILURE,
-    PROXY_RESULT_INVALID_MEMORY_ACCESS, PROXY_RESULT_NOT_ALLOWED, PROXY_RESULT_NOT_FOUND,
-    PROXY_RESULT_OK, PROXY_RESULT_PARSE_FAILURE,
+    ModuleCapabilities, PROXY_RESULT_BAD_ARGUMENT, PROXY_RESULT_EMPTY,
+    PROXY_RESULT_INTERNAL_FAILURE, PROXY_RESULT_INVALID_MEMORY_ACCESS, PROXY_RESULT_NOT_ALLOWED,
+    PROXY_RESULT_NOT_FOUND, PROXY_RESULT_OK,
 };
-use wasmtime::{Engine, Instance, Linker, Module, Store, Val};
+use wasmtime::{Engine, Instance, Module, Store, Val};
 
 const HARNESS_WAT: &str = include_str!("fixtures/wasm/abi_harness.wat");
 
@@ -153,20 +153,6 @@ impl Harness {
             .unwrap_or_else(|e| panic!("{name} must not trap, got: {e}"));
         results[0].unwrap_i32()
     }
-
-    /// `proxy_increment_metric`/`proxy_record_metric` 用（(i32, i64) -> i32）。
-    async fn call_i32_i64(&mut self, name: &str, a: i32, b: i64) -> i32 {
-        let func = self
-            .instance
-            .get_func(&mut self.store, name)
-            .unwrap_or_else(|| panic!("harness must export {name}"));
-        let params = vec![Val::I32(a), Val::I64(b)];
-        let mut results = vec![Val::I32(0)];
-        func.call_async(&mut self.store, &params, &mut results)
-            .await
-            .unwrap_or_else(|e| panic!("{name} must not trap, got: {e}"));
-        results[0].unwrap_i32()
-    }
 }
 
 /// スクラッチ領域（[0, 131072)）内の固定オフセット。
@@ -175,7 +161,6 @@ mod scratch {
     pub const VALUE: i32 = 4096;
     pub const OUT_PTR: i32 = 8192;
     pub const OUT_SIZE: i32 = 8196;
-    pub const OUT_CAS: i32 = 8200;
     pub const MSG: i32 = 16384;
 }
 
@@ -452,7 +437,11 @@ async fn item3_map_type_read_write_roundtrip() {
         assert_eq!(status, PROXY_RESULT_OK, "get failed for {label}");
         let ptr = h.read_i32(scratch::OUT_PTR);
         let size = h.read_i32(scratch::OUT_SIZE);
-        assert_eq!(h.read_bytes(ptr, size as usize), b"v1", "value mismatch for {label}");
+        assert_eq!(
+            h.read_bytes(ptr, size as usize),
+            b"v1",
+            "value mismatch for {label}"
+        );
 
         // replace
         h.write(scratch::VALUE, b"v2");
@@ -479,10 +468,8 @@ async fn item3_map_type_read_write_roundtrip() {
         if map_type == veil::wasm::HTTP_REQUEST_HEADERS
             || map_type == veil::wasm::HTTP_RESPONSE_HEADERS
         {
-            let pairs = veil_test_support::serialize_headers_for_test(&[(
-                b"x-a".to_vec(),
-                b"1".to_vec(),
-            )]);
+            let pairs =
+                veil_test_support::serialize_headers_for_test(&[(b"x-a".to_vec(), b"1".to_vec())]);
             h.write(scratch::VALUE, &pairs);
             let status = h
                 .call(
@@ -582,7 +569,11 @@ async fn item4_buffer_type_read_write_roundtrip() {
         assert_eq!(status, PROXY_RESULT_OK, "get failed for {label}");
         let ptr = h.read_i32(scratch::OUT_PTR);
         let size = h.read_i32(scratch::OUT_SIZE);
-        assert_eq!(h.read_bytes(ptr, size as usize), b"payload", "{label} roundtrip mismatch");
+        assert_eq!(
+            h.read_bytes(ptr, size as usize),
+            b"payload",
+            "{label} roundtrip mismatch"
+        );
     }
 
     for &(buffer_type, label) in &[
@@ -661,6 +652,14 @@ const EXPECTED_GUEST_EXPORTS: &[&str] = &[
     "proxy_on_downstream_data",
     "proxy_on_upstream_data",
     "proxy_on_foreign_function",
+    // F-134: 正しい ABI 名は `_connection_close`（`_close` だけの名前は存在しない）。
+    // veil の host 側 (src/wasm/engine.rs) が旧実装で誤った名前
+    // (`proxy_on_downstream_close`/`proxy_on_upstream_close`) を呼んでいたため、
+    // 実 SDK ビルドのモジュールではクローズコールバックが一度も発火しないバグが
+    // あった（本チケットで修正）。同じ間違いを再発させないため、ここで
+    // 正しい名前がフィクスチャに存在することを検証する。
+    "proxy_on_downstream_connection_close",
+    "proxy_on_upstream_connection_close",
 ];
 
 const FIXTURE_WASM_FILES: &[&str] = &[
@@ -714,8 +713,16 @@ async fn item5_guest_exports_present_in_real_sdk_modules() {
         .get_export("proxy_on_request_headers")
         .expect("proxy_on_request_headers must be exported");
     let func_ty = export.unwrap_func();
-    assert_eq!(func_ty.params().count(), 3, "proxy_on_request_headers must take 3 params");
-    assert_eq!(func_ty.results().count(), 1, "proxy_on_request_headers must return 1 value");
+    assert_eq!(
+        func_ty.params().count(),
+        3,
+        "proxy_on_request_headers must take 3 params"
+    );
+    assert_eq!(
+        func_ty.results().count(),
+        1,
+        "proxy_on_request_headers must return 1 value"
+    );
 
     record(
         "Item5: ゲスト側エクスポート（実 SDK fixture）",
@@ -726,11 +733,53 @@ async fn item5_guest_exports_present_in_real_sdk_modules() {
         ),
     );
     record(
-        "Item5: proxy_on_downstream_close/proxy_on_upstream_close",
-        Conformance::Partial,
-        "実 SDK は `proxy_on_downstream_connection_close`/`proxy_on_upstream_connection_close` \
-         という名前でエクスポートする（設計メモの命名と接尾辞が異なるだけで ABI 上同一機能）。\
-         host 側（src/http2 等）からこれらを呼ぶ配線は F-133 の範囲であり本チケットでは未検証。",
+        "Item5: proxy_on_downstream_connection_close/proxy_on_upstream_connection_close",
+        Conformance::Implemented,
+        "F-134 で発見・修正した実バグ: src/wasm/engine.rs が接尾辞 `_connection` を欠いた \
+         誤った名前（proxy_on_downstream_close/proxy_on_upstream_close）を呼んでおり、\
+         実 SDK（proxy-wasm-rust-sdk）ビルドのモジュールではクローズコールバックが \
+         一度も発火しなかった（get_typed_func が静かに失敗し no-op になるため trap も \
+         しない＝気づきにくい）。上記の EXPECTED_GUEST_EXPORTS に正しい名前を追加し、\
+         host 側の呼び出し名も修正済み。回帰防止は \
+         item5_close_callback_host_call_site_uses_correct_abi_name を参照。",
+    );
+}
+
+/// F-134 の実バグ回帰防止テスト: host 側（src/wasm/engine.rs）が正しい ABI 名
+/// （`_connection_close` 接尾辞つき）を呼んでいることをソースレベルで確認する。
+///
+/// 上の item5_guest_exports_present_in_real_sdk_modules は「フィクスチャが
+/// 正しい名前をエクスポートしているか」しか見ておらず、host 側が誤った名前
+/// （`proxy_on_downstream_close`/`proxy_on_upstream_close`、末尾に `_connection` が
+/// 無い）を呼んでいても検出できない（wasmtime の `get_typed_func` は未知の名前に
+/// 対して trap ではなく `Err` を返すだけなので、呼び出し側は静かに no-op になる）。
+/// このテストは host 側の呼び出し文字列そのものを検証することで、同じ命名ミスが
+/// 再発しても確実に落ちるようにする。
+#[test]
+fn item5_close_callback_host_call_site_uses_correct_abi_name() {
+    let engine_src = include_str!("../src/wasm/engine.rs");
+
+    assert!(
+        engine_src.contains("\"proxy_on_downstream_connection_close\""),
+        "src/wasm/engine.rs must call the ABI-correct \
+         \"proxy_on_downstream_connection_close\""
+    );
+    assert!(
+        engine_src.contains("\"proxy_on_upstream_connection_close\""),
+        "src/wasm/engine.rs must call the ABI-correct \
+         \"proxy_on_upstream_connection_close\""
+    );
+    // 旧・誤った名前（`_connection` 抜き）の呼び出し文字列リテラルが
+    // 再度紛れ込んでいないことを確認する。
+    assert!(
+        !engine_src.contains("\"proxy_on_downstream_close\""),
+        "regression: src/wasm/engine.rs must not call the ABI-incorrect \
+         \"proxy_on_downstream_close\" (missing `_connection`)"
+    );
+    assert!(
+        !engine_src.contains("\"proxy_on_upstream_close\""),
+        "regression: src/wasm/engine.rs must not call the ABI-incorrect \
+         \"proxy_on_upstream_close\" (missing `_connection`)"
     );
 }
 
@@ -799,7 +848,10 @@ async fn item7_end_of_stream_forwarded_to_body_filters() {
             false,
         )
         .await;
-    assert!(matches!(result, BodyFilterResult::Continue { .. } | BodyFilterResult::Pause));
+    assert!(matches!(
+        result,
+        BodyFilterResult::Continue { .. } | BodyFilterResult::Pause
+    ));
 
     // 最終チャンク: end_of_stream = true
     let result = engine
@@ -809,7 +861,10 @@ async fn item7_end_of_stream_forwarded_to_body_filters() {
             true,
         )
         .await;
-    assert!(matches!(result, BodyFilterResult::Continue { .. } | BodyFilterResult::Pause));
+    assert!(matches!(
+        result,
+        BodyFilterResult::Continue { .. } | BodyFilterResult::Pause
+    ));
 
     record(
         "Item7: end_of_stream セマンティクス",
@@ -843,8 +898,10 @@ async fn known_gap_grpc_call_execution_loop() {
         "F-134 で実行ループを実装（src/wasm/host/grpc_executor.rs + src/server.rs）。\
          ユーナリー呼び出し（proxy_grpc_call）と、ストリームを half-close した時点で \
          蓄積メッセージをまとめて送出するクライアントストリーミング簡略版（proxy_grpc_stream + \
-         proxy_grpc_send）を実装。TLS 上流・真の逐次双方向ストリーミング・接続プーリングは \
-         未対応（理由: docs/backlog/features/F-139-wasm-grpc-call-execution.md）。\
+         proxy_grpc_send）、TLS 上流（execute_grpc_unary_call の use_tls、\
+         proxy_http_call と同じ rustls 経路）を実装。真の逐次双方向ストリーミング・\
+         接続プーリングは未対応（理由: \
+         docs/backlog/features/F-139-wasm-grpc-call-execution.md）。\
          ネットワークを伴う E2E 確認は未実施（コーディネーターが実行予定）。",
     );
 }
@@ -915,6 +972,9 @@ async fn zzz_generate_conformance_report() {
         env!("CARGO_MANIFEST_DIR"),
         "/docs/artifacts/proxy_wasm_conformance_report.md"
     );
+    // 理由付き allow: 統合テストのコールドパス（プロキシのデータプレーンとは無関係。
+    // テスト実行完了時に一度だけレポートを書き出すだけの補助処理）。
+    #[allow(clippy::disallowed_methods)]
     if let Err(e) = std::fs::write(report_path, &out) {
         eprintln!("warning: failed to write {report_path}: {e}");
     }
