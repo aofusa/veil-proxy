@@ -152,13 +152,20 @@ impl KqueuePoller {
             &ts as *const libc::timespec
         };
         let mut changes = self.changelist.borrow_mut();
+        // F-140: `kevent(2)` の個数引数は **NetBSD だけ `size_t`**（他 BSD/macOS は `c_int`）。
+        // libc クレートの束縛も target 別に型が変わるため、`as _` ではなく明示的に
+        // ターゲット別のエイリアスへキャストする（`as _` は推論できず E0308 になる）。
+        #[cfg(target_os = "netbsd")]
+        type KeventCount = usize;
+        #[cfg(not(target_os = "netbsd"))]
+        type KeventCount = libc::c_int;
         let n = unsafe {
             libc::kevent(
                 self.kq,
                 changes.as_ptr(),
-                changes.len() as i32,
+                changes.len() as KeventCount,
                 events.as_mut_ptr(),
-                events.len() as i32,
+                events.len() as KeventCount,
                 ts_ptr,
             )
         };
