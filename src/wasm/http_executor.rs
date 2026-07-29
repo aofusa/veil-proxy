@@ -2,14 +2,100 @@
 //!
 //! Provides synchronous HTTP client for executing WASM proxy_http_call requests
 //! from the tick thread.
+//!
+//! F-132: このモジュールにはボディフィルタ（`on_request_body` / `on_response_body`）
+//! を h1/h2/h3 の各プロトコル経路から共用するためのヘルパも置く（現状 HTTP/3 のみ配線）。
 
 use std::io::{BufReader, Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::engine::{BodyFilterResult, FilterEngine};
 use super::persistent_context::GlobalPendingCall;
-use super::types::HttpCallResponse;
+use super::types::{HttpCallResponse, LocalResponse};
+
+/// ボディフィルタ適用結果（h1/h2/h3 共有）。
+///
+/// `BodyFilterResult::Pause` は非同期ボディ処理待ちに相当するが、現状どのプロトコル
+/// 経路も async body pause を実装していない（h1/h2 のヘッダフィルタと同様、警告ログを
+/// 出して元の本文を継続する）。
+pub enum WasmBodyOutcome {
+    /// フィルタ後の本文で継続する。
+    Continue(bytes::Bytes),
+    /// WASM モジュールがローカル応答を要求した。
+    LocalResponse(LocalResponse),
+}
+
+/// リクエストボディに WASM `on_request_body` を適用する。
+///
+/// `modules` が空なら一切コストをかけずそのまま返す
+/// （ホットパス絶対規則: WASM 未設定時は一切コストを増やさない）。
+/// `end_of_stream` は呼び出し元がボディ全体を保持しているかどうかを示す
+/// （HTTP/3 の Proxy 経路は WASM 適用時に必ず `Decision::Buffer` に落ちるため常に true）。
+pub async fn apply_wasm_request_body(
+    engine: &FilterEngine,
+    modules: &[String],
+    body: bytes::Bytes,
+    end_of_stream: bool,
+) -> WasmBodyOutcome {
+    if modules.is_empty() {
+        return WasmBodyOutcome::Continue(body);
+    }
+    match engine
+        .on_request_body_with_modules(modules, body.clone(), end_of_stream)
+        .await
+    {
+        BodyFilterResult::Continue { body } => WasmBodyOutcome::Continue(body),
+        BodyFilterResult::LocalResponse(resp) => WasmBodyOutcome::LocalResponse(resp),
+        BodyFilterResult::Pause => {
+            ftlog::warn!(
+                "[wasm] on_request_body requested Pause, but async body pause is not yet \
+                 supported; continuing with the original body"
+            );
+            WasmBodyOutcome::Continue(body)
+        }
+    }
+}
+
+/// レスポンスボディに WASM `on_response_body` を適用する。
+///
+/// `modules` が空なら一切コストをかけずそのまま返す。
+pub async fn apply_wasm_response_body(
+    engine: &FilterEngine,
+    modules: &[String],
+    body: bytes::Bytes,
+    end_of_stream: bool,
+) -> WasmBodyOutcome {
+    if modules.is_empty() {
+        return WasmBodyOutcome::Continue(body);
+    }
+    match engine
+        .on_response_body_with_modules(modules, body.clone(), end_of_stream)
+        .await
+    {
+        BodyFilterResult::Continue { body } => WasmBodyOutcome::Continue(body),
+        BodyFilterResult::LocalResponse(resp) => WasmBodyOutcome::LocalResponse(resp),
+        BodyFilterResult::Pause => {
+            ftlog::warn!(
+                "[wasm] on_response_body requested Pause, but async body pause is not yet \
+                 supported; continuing with the original body"
+            );
+            WasmBodyOutcome::Continue(body)
+        }
+    }
+}
+
+/// レスポンスヘッダの `content-length` を新しい本文長へ更新する。
+///
+/// B-46: WASM がレスポンス本文を書き換えた場合、古い `content-length` を残したまま
+/// 送出すると本文長と不一致になり、nghttp3 が malformed message として
+/// `H3_MESSAGE_ERROR` で拒否する（既存ヘッダ重複追加も同様に拒否される）。
+/// 既存の `content-length`（大小文字問わず）をすべて除去してから新しい値を 1 つ追加する。
+pub fn set_content_length_header(headers: &mut Vec<(Vec<u8>, Vec<u8>)>, len: usize) {
+    headers.retain(|(name, _)| !name.eq_ignore_ascii_case(b"content-length"));
+    headers.push((b"content-length".to_vec(), len.to_string().into_bytes()));
+}
 
 /// Execute a pending HTTP call and return the response
 ///

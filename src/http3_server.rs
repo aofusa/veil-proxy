@@ -330,46 +330,225 @@ fn create_temp_pem_file(name: &str, pem_data: &[u8]) -> io::Result<(PemBackedFil
     ))
 }
 
-/// 稼働中の `quiche::Config` の証明書・秘密鍵を差し替える（F-105 ホットリロード）。
+/// PEM バイト列から証明書・秘密鍵を設定した新規 `quiche::Config` を構築する（F-136/F-137）。
 ///
-/// TLS リロードスレッドが配信した新しい cert/key PEM を、既存の `create_memfd_for_pem`
-/// （`/proc/self/fd/<fd>` 経由・ファイルシステム非経由）で memfd に載せ、quiche へロードし直す。
-/// これにより Landlock 有効時も FS を介さず証明書を更新できる。
+/// - Linux、または `system-tls`（F-137）有効時: `create_memfd_for_pem`（Linux は
+///   `/proc/self/fd/<fd>` 経由・FS 非経由、他 OS は各 `create_memfd_for_pem` 実装を参照）で
+///   一時的にファイル化し、`load_cert_chain_from_pem_file`/`load_priv_key_from_pem_file`
+///   （パス指定 API、quiche の TLS バックエンドに依存しない汎用 API）へパスとして渡す。
+///   **Linux 経路（`target_os = "linux"`）は F-136/F-137 のいずれでも 1 行も変更しない**
+///   （AGENTS.md「Linux 経路は不変」）。`system-tls` 有効時の非 Linux でこの経路を使う理由は
+///   `Cargo.toml` の `system-tls` feature のコメント参照（quiche の `boringssl-boring-crate`
+///   と `openssl` feature を同時に有効化するとリンクが壊れるため、`with_boring_ssl_ctx_builder`
+///   ではなくパス経由にフォールバックする）。capability mode（FreeBSD capsicum）下では
+///   quiche 側の `fopen(3)` が `ECAPMODE` で失敗するため、この場合 H3 証明書の
+///   *ホットリロード*（初回ロードは cap_enter 前なので影響なし）が機能しなくなる
+///   （`reload_quiche_certs` の呼び出し元で警告を出す）。
+/// - 上記以外（`system-tls` 無効時の FreeBSD/OpenBSD/macOS/Windows）: PEM バイト列から
+///   直接 BoringSSL の `SslContextBuilder` を組み、`Config::with_boring_ssl_ctx_builder` で
+///   ロードする。ファイル・パス・memfd を一切介さないため、FreeBSD capsicum capability
+///   mode / OpenBSD pledge+unveil のいずれの下でも動作する（設計根拠は
+///   docs/artifacts/f136_platform_design.md の F-136 節参照）。
+#[cfg(any(target_os = "linux", feature = "system-tls"))]
+fn new_quic_config_with_certs(cert_pem: &[u8], key_pem: &[u8]) -> io::Result<Config> {
+    let mut quic_config = Config::new(quiche::PROTOCOL_VERSION)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+
+    let (cert_memfd, cert_path) = create_memfd_for_pem("tls_cert", cert_pem)
+        .map_err(|e| io::Error::other(format!("Failed to create memfd for cert: {}", e)))?;
+    quic_config
+        .load_cert_chain_from_pem_file(&cert_path)
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("cert load error (memfd): {}", e),
+            )
+        })?;
+    drop(cert_memfd);
+
+    let (key_memfd, key_path) = create_memfd_for_pem("tls_key", key_pem)
+        .map_err(|e| io::Error::other(format!("Failed to create memfd for key: {}", e)))?;
+    quic_config
+        .load_priv_key_from_pem_file(&key_path)
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("key load error (memfd): {}", e),
+            )
+        })?;
+    drop(key_memfd);
+
+    Ok(quic_config)
+}
+
+/// PEM バイト列から証明書・秘密鍵を設定した新規 `quiche::Config` を構築する
+/// （F-136、`system-tls` 無効時の Linux 以外）。
+///
+/// `new_quic_config_with_certs` の doc コメント参照。`boringssl-boring-crate` feature
+/// （外部 `boring` crate）でのみ提供される in-memory SSL_CTX API を使う。
+#[cfg(all(not(target_os = "linux"), not(feature = "system-tls")))]
+fn new_quic_config_with_certs(cert_pem: &[u8], key_pem: &[u8]) -> io::Result<Config> {
+    use boring::pkey::PKey;
+    use boring::ssl::{SslContextBuilder, SslMethod};
+    use boring::x509::X509;
+
+    let mut builder = SslContextBuilder::new(SslMethod::tls()).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("boring SslContextBuilder::new: {}", e),
+        )
+    })?;
+
+    let mut chain = X509::stack_from_pem(cert_pem)
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("certificate parse error: {}", e),
+            )
+        })?
+        .into_iter();
+    let leaf = chain
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty certificate chain"))?;
+    builder.set_certificate(&leaf).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("set_certificate: {}", e),
+        )
+    })?;
+    // 残りは中間 CA チェーン。
+    for extra in chain {
+        builder.add_extra_chain_cert(extra).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("add_extra_chain_cert: {}", e),
+            )
+        })?;
+    }
+
+    let pkey = PKey::private_key_from_pem(key_pem).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("private key parse error: {}", e),
+        )
+    })?;
+    builder.set_private_key(&pkey).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("set_private_key: {}", e),
+        )
+    })?;
+
+    Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
+}
+
+/// QUIC トランスポートパラメータを `Config` へ適用する（TLS 証明書設定とは独立、初回ロード・
+/// リロード共通。F-136 でリロード時にも呼べるよう独立関数へ切り出した）。
+fn configure_quic_transport(
+    quic_config: &mut Config,
+    config: &Http3ServerConfig,
+) -> io::Result<()> {
+    quic_config.set_max_idle_timeout(config.max_idle_timeout);
+    quic_config.set_max_recv_udp_payload_size(config.max_udp_payload_size as usize);
+    quic_config.set_max_send_udp_payload_size(config.max_udp_payload_size as usize);
+    quic_config.set_initial_max_data(config.initial_max_data);
+    quic_config.set_initial_max_stream_data_bidi_local(config.initial_max_stream_data_bidi_local);
+    quic_config.set_initial_max_stream_data_bidi_remote(config.initial_max_stream_data_bidi_remote);
+    quic_config.set_initial_max_stream_data_uni(config.initial_max_stream_data_uni);
+    quic_config.set_initial_max_streams_bidi(config.initial_max_streams_bidi);
+    quic_config.set_initial_max_streams_uni(config.initial_max_streams_uni);
+    quic_config.set_disable_active_migration(true);
+    quic_config.enable_early_data();
+
+    // F-124: 輻輳制御 / Pacing / HyStart++（quiche 低レベル Config API）
+    let cc_name = config.cc_algorithm.trim();
+    if let Err(e) = quic_config.set_cc_algorithm_name(cc_name) {
+        warn!(
+            "[HTTP/3] unknown cc_algorithm '{}': {}; falling back to bbr",
+            cc_name, e
+        );
+        let _ = quic_config.set_cc_algorithm_name("bbr");
+    }
+    quic_config.enable_pacing(config.pacing);
+    if let Some(rate) = config.max_pacing_rate {
+        quic_config.set_max_pacing_rate(rate);
+    }
+    quic_config.enable_hystart(config.hystart);
+
+    // HTTP/3 用の ALPN を設定
+    quic_config
+        .set_application_protos(h3::APPLICATION_PROTOCOL)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+
+    Ok(())
+}
+
+/// 稼働中の `quiche::Config` の証明書・秘密鍵を差し替える（F-105 ホットリロード、F-136 で
+/// capability mode 対応、F-137 で system-tls 対応）。
+///
+/// - Linux、または `system-tls` 有効時: 既存 `Config` の内部 SSL_CTX に対して
+///   `load_cert_chain_from_pem_file`/`load_priv_key_from_pem_file` を呼び直すだけで済む
+///   （メモリ確保済みの他のトランスポートパラメータは無傷のまま）。**Linux 経路は無変更**。
+///   `system-tls` 有効時の非 Linux で capability mode（FreeBSD capsicum）が有効な場合、
+///   quiche 側の `fopen(3)` が `ECAPMODE` で失敗し**このリロードは失敗する**（初回ロードは
+///   `cap_enter` 前に完了しているため影響しない）。呼び出し元がこの制約を起動時に警告する。
+/// - それ以外（`system-tls` 無効時の非 Linux）: `with_boring_ssl_ctx_builder` は**新しい
+///   `Config` を構築する** API であり、既存 `Config` の SSL_CTX だけを差し替えることは
+///   できない。そのため `new_quic_config_with_certs` で新規 `Config` を作り、
+///   `configure_quic_transport` で初回ロードと同じトランスポートパラメータを再適用した
+///   うえで、`RefCell` の中身を丸ごと入れ替える（初回ロードとリロードで同じ in-memory
+///   経路を通る）。
 ///
 /// # ホットパス例外について（AGENTS.md）
-/// 本処理はパース + memfd 書き込みで数 ms ループをブロックするが、証明書更新は数ヶ月に 1 回の
-/// **コールドパス**であり、イベントループ先頭の世代ゲートで差分検知時のみ実行される。ホットパス
-/// 絶対規則の明示的な例外として許容する（既存接続は `quiche::accept` 時に SSL_CTX から複製済みの
-/// ため影響を受けず、以後の新規ハンドシェイクのみ新証明書を提示する）。
+/// 本処理はパース + memfd 書き込み/BoringSSL 初期化で数 ms ループをブロックするが、証明書更新は
+/// 数ヶ月に 1 回の**コールドパス**であり、イベントループ先頭の世代ゲートで差分検知時のみ実行
+/// される。ホットパス絶対規則の明示的な例外として許容する（既存接続は `quiche::accept` 時に
+/// SSL_CTX から複製済みのため影響を受けず、以後の新規ハンドシェイクのみ新証明書を提示する）。
 fn reload_quiche_certs(
     quic_config: &Rc<RefCell<Config>>,
     material: &crate::tls_reload::Http3CertMaterial,
+    // Linux / system-tls では未使用（既存 Config の SSL_CTX だけを差し替えるため）。
+    // アンダースコア接頭辞はその場合の unused 警告抑制であり、それ以外では通常どおり使用する。
+    _transport_config: &Http3ServerConfig,
 ) -> io::Result<()> {
     material.load_into(|cert_pem, key_pem| {
-        let mut cfg = quic_config.borrow_mut();
+        #[cfg(any(target_os = "linux", feature = "system-tls"))]
+        {
+            let mut cfg = quic_config.borrow_mut();
 
-        // 証明書チェーンを memfd 経由で差し替え。
-        let (cert_memfd, cert_path) = create_memfd_for_pem("tls_cert_reload", cert_pem)?;
-        cfg.load_cert_chain_from_pem_file(&cert_path).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("cert reload error (memfd): {}", e),
-            )
-        })?;
-        // memfd はロード完了後ただちにクローズ（機密の滞留を避ける）。
-        drop(cert_memfd);
+            // 証明書チェーンを memfd 経由で差し替え。
+            let (cert_memfd, cert_path) = create_memfd_for_pem("tls_cert_reload", cert_pem)?;
+            cfg.load_cert_chain_from_pem_file(&cert_path).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("cert reload error (memfd): {}", e),
+                )
+            })?;
+            // memfd はロード完了後ただちにクローズ（機密の滞留を避ける）。
+            drop(cert_memfd);
 
-        // 秘密鍵を memfd 経由で差し替え。
-        let (key_memfd, key_path) = create_memfd_for_pem("tls_key_reload", key_pem)?;
-        cfg.load_priv_key_from_pem_file(&key_path).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("key reload error (memfd): {}", e),
-            )
-        })?;
-        drop(key_memfd);
+            // 秘密鍵を memfd 経由で差し替え。
+            let (key_memfd, key_path) = create_memfd_for_pem("tls_key_reload", key_pem)?;
+            cfg.load_priv_key_from_pem_file(&key_path).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("key reload error (memfd): {}", e),
+                )
+            })?;
+            drop(key_memfd);
 
-        Ok(())
+            Ok(())
+        }
+        #[cfg(all(not(target_os = "linux"), not(feature = "system-tls")))]
+        {
+            // F-136: capability mode / pledge+unveil 下でも動作する in-memory 経路。
+            // 初回ロードと全く同じ手順で新規 Config を構築し、まるごと差し替える。
+            let mut new_cfg = new_quic_config_with_certs(cert_pem, key_pem)?;
+            configure_quic_transport(&mut new_cfg, _transport_config)?;
+            *quic_config.borrow_mut() = new_cfg;
+            Ok(())
+        }
     })
 }
 
@@ -576,6 +755,22 @@ struct PartialResponse {
     body: Vec<u8>,
     /// 送信済みボディバイト数。
     written: usize,
+}
+
+/// `Http3Handler::handle_sendfile` の引数まとめ。
+///
+/// F-132: WASM モジュールリストを渡す引数が増えたことで `clippy::too_many_arguments`
+/// に抵触するため、理由なし `#[allow]` を増やす代わりに構造体へまとめた。
+struct SendFileRequest<'a> {
+    stream_id: u64,
+    base_path: &'a Path,
+    is_dir: bool,
+    index_file: Option<&'a str>,
+    req_path: &'a [u8],
+    prefix: &'a [u8],
+    security: &'a SecurityConfig,
+    #[cfg(feature = "wasm")]
+    wasm_modules: Option<&'a Arc<Vec<String>>>,
 }
 
 /// HTTP/3 コネクションハンドラー
@@ -1066,11 +1261,45 @@ impl Http3Handler {
     /// HTTP/3 リクエストを処理（完全版）
     ///
     /// HTTP/1.1と同等のルーティング・セキュリティ・プロキシ機能をサポート。
+    /// `handle_request_impl` を呼び出し、**成功・失敗（`?` による早期 return）を問わず**
+    /// 最後に一度だけ `on_log`（`finish_h3_wasm_lifecycle`）を呼ぶ。
+    ///
+    /// F-132: `handle_request_impl` 内には `self.send_response(...)?` 等、`?` で早期 return
+    /// する箇所が多数あり、そこに個別に `on_log` 呼び出しを仕込むと取りこぼしうる
+    /// （WASM コンテキストのリークに直結する）。このラッパで囲むことで、
+    /// 離脱点の数に関係なく **1 リクエストにつきちょうど 1 回** だけ呼ばれることを構造的に
+    /// 保証する（`handle_request_impl` 側は `finish_h3_wasm_lifecycle` を呼ばない）。
     async fn handle_request(
         &mut self,
         stream_id: u64,
         headers: &[h3::Header],
         request_body: &[u8],
+    ) -> io::Result<()> {
+        #[cfg(feature = "wasm")]
+        let mut wasm_modules_to_apply: Option<Arc<Vec<String>>> = None;
+
+        let result = self
+            .handle_request_impl(
+                stream_id,
+                headers,
+                request_body,
+                #[cfg(feature = "wasm")]
+                &mut wasm_modules_to_apply,
+            )
+            .await;
+
+        #[cfg(feature = "wasm")]
+        finish_h3_wasm_lifecycle(&wasm_modules_to_apply).await;
+
+        result
+    }
+
+    async fn handle_request_impl(
+        &mut self,
+        stream_id: u64,
+        headers: &[h3::Header],
+        request_body: &[u8],
+        #[cfg(feature = "wasm")] wasm_modules_to_apply: &mut Option<Arc<Vec<String>>>,
     ) -> io::Result<()> {
         // HTTP/3コネクションが確立されていなければ何もしない
         if self.h3_conn.is_none() {
@@ -1381,10 +1610,14 @@ impl Http3Handler {
         }
 
         // WASM モジュール適用（B-38: リクエストヘッダ変更 + レスポンスヘッダ変更）
-        #[cfg(feature = "wasm")]
-        let mut wasm_modules_to_apply: Option<std::sync::Arc<Vec<String>>> = None;
+        // F-132: `wasm_modules_to_apply` は呼び出し元（`handle_request`）が保持する out
+        // パラメータ。ここで `Some` にセットしておけば、この後どの `?` で早期 return しても
+        // 呼び出し元側で必ず一度だけ `on_log` が呼ばれる。
         #[cfg(feature = "wasm")]
         let mut wasm_request_headers: Option<Vec<(Vec<u8>, Vec<u8>)>> = None;
+        // F-132: WASM on_request_body で書き換えられた本文（適用時のみ Some）。
+        #[cfg(feature = "wasm")]
+        let mut wasm_request_body_override: Option<Bytes> = None;
         #[cfg(feature = "wasm")]
         {
             let config = CURRENT_CONFIG.load();
@@ -1400,7 +1633,7 @@ impl Http3Handler {
                 };
 
                 if !modules_to_apply.is_empty() {
-                    wasm_modules_to_apply = Some(modules_to_apply.clone());
+                    *wasm_modules_to_apply = Some(modules_to_apply.clone());
 
                     let headers_vec: Vec<(Vec<u8>, Vec<u8>)> = headers
                         .iter()
@@ -1448,6 +1681,9 @@ impl Http3Handler {
                                 &self.client_ip,
                                 "",
                             );
+                            // F-132: on_log は呼び出し元の `handle_request` ラッパが
+                            // `?`/早期 return を問わず最後に一度だけ呼ぶ
+                            // （`*wasm_modules_to_apply` は既にセット済み）。
                             return Ok(());
                         }
                         crate::wasm::FilterResult::Pause => {
@@ -1458,6 +1694,58 @@ impl Http3Handler {
                         } => {
                             // B-38: 変更後ヘッダを上流リクエストへ反映
                             wasm_request_headers = Some(modified);
+
+                            // F-132: リクエストボディフィルタ（HTTP/3 は WASM 適用時に
+                            // 必ず Decision::Buffer に落ちるためボディ全体がメモリ上にある。
+                            // end_of_stream=true の 1 回呼びで実装できる）。
+                            if !request_body.is_empty() {
+                                match crate::wasm::http_executor::apply_wasm_request_body(
+                                    wasm_engine,
+                                    &modules_to_apply,
+                                    Bytes::copy_from_slice(request_body),
+                                    true,
+                                )
+                                .await
+                                {
+                                    crate::wasm::http_executor::WasmBodyOutcome::Continue(b) => {
+                                        wasm_request_body_override = Some(b);
+                                    }
+                                    crate::wasm::http_executor::WasmBodyOutcome::LocalResponse(
+                                        resp,
+                                    ) => {
+                                        self.send_response(
+                                            stream_id,
+                                            resp.status_code,
+                                            &resp
+                                                .headers
+                                                .iter()
+                                                .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                                                .collect::<Vec<_>>(),
+                                            Some(&resp.body),
+                                        )?;
+                                        let user_agent_slice: &[u8] = if user_agent.is_empty() {
+                                            &[]
+                                        } else {
+                                            &user_agent
+                                        };
+                                        log_access(
+                                            &method,
+                                            &authority,
+                                            &path,
+                                            user_agent_slice,
+                                            request_body.len() as u64,
+                                            resp.status_code,
+                                            resp.body.len() as u64,
+                                            start_time,
+                                            &self.client_ip,
+                                            "",
+                                        );
+                                        // F-132: on_log は呼び出し元の `handle_request`
+                                        // ラッパが最後に一度だけ呼ぶ。
+                                        return Ok(());
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1475,6 +1763,14 @@ impl Http3Handler {
                 let effective_compression =
                     resolve_http3_compression_config(&path_compression, &config.http3_config);
 
+                // F-132: WASM on_request_body で書き換えられた本文があればそれを使う。
+                #[cfg(feature = "wasm")]
+                let effective_request_body: &[u8] = wasm_request_body_override
+                    .as_deref()
+                    .unwrap_or(request_body);
+                #[cfg(not(feature = "wasm"))]
+                let effective_request_body: &[u8] = request_body;
+
                 let result = self
                     .handle_proxy(
                         stream_id,
@@ -1485,7 +1781,7 @@ impl Http3Handler {
                         &path,
                         &prefix,
                         headers,
-                        request_body,
+                        effective_request_body,
                         #[cfg(feature = "wasm")]
                         wasm_modules_to_apply.as_ref(),
                         #[cfg(feature = "wasm")]
@@ -1515,36 +1811,42 @@ impl Http3Handler {
                     self.send_error_response(stream_id, 404, b"Not Found")?;
                     (404, 9)
                 } else {
-                    let mut resp_headers: Vec<(&[u8], &[u8])> = vec![
-                        (b"content-type", mime_type.as_bytes()),
-                        (b"server", b"veil/http3"),
+                    // F-132: h1/h2 と同様、静的配信（Backend::File 系）にも WASM
+                    // on_response_headers を適用する。
+                    let mut header_store: Vec<(Vec<u8>, Vec<u8>)> = vec![
+                        (b"content-type".to_vec(), mime_type.as_bytes().to_vec()),
+                        (b"server".to_vec(), b"veil/http3".to_vec()),
                     ];
-
-                    // セキュリティヘッダー追加
-                    let security_headers: Vec<(Vec<u8>, Vec<u8>)> = security
-                        .add_response_headers
-                        .iter()
-                        .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec()))
-                        .collect();
-
-                    for (k, v) in &security_headers {
-                        resp_headers.push((k.as_slice(), v.as_slice()));
+                    for (k, v) in &security.add_response_headers {
+                        header_store.push((k.as_bytes().to_vec(), v.as_bytes().to_vec()));
                     }
+                    #[cfg(feature = "wasm")]
+                    if let Some(modules) = wasm_modules_to_apply.as_ref() {
+                        header_store =
+                            apply_h3_wasm_response_headers(modules, 200, header_store).await;
+                    }
+
+                    let resp_headers: Vec<(&[u8], &[u8])> = header_store
+                        .iter()
+                        .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                        .collect();
 
                     self.send_response(stream_id, 200, &resp_headers, Some(&data))?;
                     (200, data.len())
                 }
             }
             Backend::SendFile(base_path, is_dir, index_file, security, _cache, _, _) => self
-                .handle_sendfile(
+                .handle_sendfile(SendFileRequest {
                     stream_id,
-                    &base_path,
+                    base_path: &base_path,
                     is_dir,
-                    index_file.as_deref(),
-                    &path,
-                    &prefix,
-                    &security,
-                )
+                    index_file: index_file.as_deref(),
+                    req_path: &path,
+                    prefix: &prefix,
+                    security: &security,
+                    #[cfg(feature = "wasm")]
+                    wasm_modules: wasm_modules_to_apply.as_ref(),
+                })
                 .await
                 .unwrap_or((404, 9)),
             Backend::Redirect(redirect_url, status_code, preserve_path, _) => self
@@ -1576,6 +1878,7 @@ impl Http3Handler {
             &self.client_ip,
             "",
         );
+        // F-132: on_log は呼び出し元の `handle_request` ラッパが最後に一度だけ呼ぶ。
         Ok(())
     }
 
@@ -1990,6 +2293,9 @@ impl Http3Handler {
         match proxy_result {
             Ok(backend_result) => {
                 let status_code = backend_result.status_code;
+                #[cfg(feature = "wasm")]
+                let mut body = backend_result.body;
+                #[cfg(not(feature = "wasm"))]
                 let body = backend_result.body;
                 let trailers = backend_result.trailers;
 
@@ -2007,6 +2313,62 @@ impl Http3Handler {
                 #[cfg(not(feature = "wasm"))]
                 let resp_header_store = backend_result.headers;
 
+                // gRPC は圧縮ネゴシエーション/ボディフィルタ対象外（application/grpc、trailers は F-133）
+                #[cfg(feature = "grpc")]
+                let is_grpc_ct = resp_header_store
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(b"content-type"))
+                    .map(|(_, v)| crate::grpc::headers::is_grpc_content_type(v))
+                    .unwrap_or(false);
+                #[cfg(not(feature = "grpc"))]
+                let is_grpc_ct = false;
+
+                // F-132: WASM レスポンスボディフィルタ（HTTP/3 は WASM 適用時に必ず
+                // Decision::Buffer に落ちるためボディ全体がメモリ上にある。end_of_stream=true
+                // の 1 回呼びで実装できる）。書き換えたら content-length を更新する（B-46）。
+                #[cfg(feature = "wasm")]
+                if !is_grpc_ct {
+                    if let Some(modules) = wasm_modules {
+                        if !modules.is_empty() {
+                            let config = CURRENT_CONFIG.load();
+                            if let Some(ref wasm_engine) = config.wasm_filter_engine {
+                                match crate::wasm::http_executor::apply_wasm_response_body(
+                                    wasm_engine,
+                                    modules,
+                                    Bytes::from(body),
+                                    true,
+                                )
+                                .await
+                                {
+                                    crate::wasm::http_executor::WasmBodyOutcome::Continue(b) => {
+                                        crate::wasm::http_executor::set_content_length_header(
+                                            &mut resp_header_store,
+                                            b.len(),
+                                        );
+                                        body = b.to_vec();
+                                    }
+                                    crate::wasm::http_executor::WasmBodyOutcome::LocalResponse(
+                                        resp,
+                                    ) => {
+                                        let resp_headers: Vec<(&[u8], &[u8])> = resp
+                                            .headers
+                                            .iter()
+                                            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                                            .collect();
+                                        self.send_response(
+                                            stream_id,
+                                            resp.status_code,
+                                            &resp_headers,
+                                            Some(&resp.body),
+                                        )?;
+                                        return Ok((resp.status_code, resp.body.len()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // 圧縮判定
                 let mut content_type: Option<&[u8]> = None;
                 let mut existing_encoding: Option<&[u8]> = None;
@@ -2017,14 +2379,6 @@ impl Http3Handler {
                         existing_encoding = Some(value.as_slice());
                     }
                 }
-
-                // gRPC は圧縮ネゴシエーション対象外（application/grpc）
-                #[cfg(feature = "grpc")]
-                let is_grpc_ct = content_type
-                    .map(crate::grpc::headers::is_grpc_content_type)
-                    .unwrap_or(false);
-                #[cfg(not(feature = "grpc"))]
-                let is_grpc_ct = false;
 
                 let should_compress = if is_grpc_ct {
                     None
@@ -2091,16 +2445,18 @@ impl Http3Handler {
     }
 
     /// ファイル配信
-    async fn handle_sendfile(
-        &mut self,
-        stream_id: u64,
-        base_path: &Path,
-        is_dir: bool,
-        index_file: Option<&str>,
-        req_path: &[u8],
-        prefix: &[u8],
-        security: &SecurityConfig,
-    ) -> io::Result<(u16, usize)> {
+    async fn handle_sendfile(&mut self, req: SendFileRequest<'_>) -> io::Result<(u16, usize)> {
+        let SendFileRequest {
+            stream_id,
+            base_path,
+            is_dir,
+            index_file,
+            req_path,
+            prefix,
+            security,
+            #[cfg(feature = "wasm")]
+            wasm_modules,
+        } = req;
         let path_str = std::str::from_utf8(req_path).unwrap_or("/");
         let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
 
@@ -2156,21 +2512,23 @@ impl Http3Handler {
         let mime_type = mime_guess::from_path(&file_path).first_or_octet_stream();
         let mime_str = mime_type.as_ref();
 
-        let mut resp_headers: Vec<(&[u8], &[u8])> = vec![
-            (b"content-type", mime_str.as_bytes()),
-            (b"server", b"veil/http3"),
+        // F-132: h1/h2 と同様、静的配信にも WASM on_response_headers を適用する。
+        let mut header_store: Vec<(Vec<u8>, Vec<u8>)> = vec![
+            (b"content-type".to_vec(), mime_str.as_bytes().to_vec()),
+            (b"server".to_vec(), b"veil/http3".to_vec()),
         ];
-
-        // セキュリティヘッダー追加
-        let security_headers: Vec<(Vec<u8>, Vec<u8>)> = security
-            .add_response_headers
-            .iter()
-            .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec()))
-            .collect();
-
-        for (k, v) in &security_headers {
-            resp_headers.push((k.as_slice(), v.as_slice()));
+        for (k, v) in &security.add_response_headers {
+            header_store.push((k.as_bytes().to_vec(), v.as_bytes().to_vec()));
         }
+        #[cfg(feature = "wasm")]
+        if let Some(modules) = wasm_modules {
+            header_store = apply_h3_wasm_response_headers(modules, 200, header_store).await;
+        }
+
+        let resp_headers: Vec<(&[u8], &[u8])> = header_store
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
 
         self.send_response(stream_id, 200, &resp_headers, Some(&data))?;
         Ok((200, data.len()))
@@ -3369,6 +3727,26 @@ async fn apply_h3_wasm_response_headers(
     header_store
 }
 
+/// F-132: HTTP/3 経路の WASM ライフサイクル終端ヘルパ（`on_log` = `on_request_complete_async`）。
+///
+/// `LocalResponse` による早期 return を含む**すべての離脱点**から呼ぶことで、
+/// HTTP/1.1・HTTP/2 経路（`src/proxy.rs`）と同じ回数だけ `proxy_on_log` が呼ばれるようにする。
+/// モジュール未適用（`None` または空リスト）ならコストゼロで即 return する
+/// （ホットパス絶対規則: WASM 未設定時は一切コストを増やさない）。
+#[cfg(feature = "wasm")]
+async fn finish_h3_wasm_lifecycle(wasm_modules_to_apply: &Option<Arc<Vec<String>>>) {
+    let Some(modules) = wasm_modules_to_apply else {
+        return;
+    };
+    if modules.is_empty() {
+        return;
+    }
+    let config = CURRENT_CONFIG.load();
+    if let Some(ref wasm_engine) = config.wasm_filter_engine {
+        crate::wasm::on_request_complete_async(wasm_engine.clone(), modules.clone()).await;
+    }
+}
+
 /// B-39: HTTP/3 → H2C 上流プロキシ（gRPC 等）
 ///
 /// Prior Knowledge で H2C 接続し、レスポンスヘッダ + ボディ + trailers を返す。
@@ -3483,128 +3861,88 @@ pub async fn run_http3_server_async(
     bind_addr: SocketAddr,
     mut config: Http3ServerConfig,
 ) -> io::Result<()> {
-    // QUIC 設定を作成
-    let mut quic_config = Config::new(quiche::PROTOCOL_VERSION)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-
-    // TLS 証明書を設定
-    // memfd アプローチ: 事前読み込み済みの PEM バイト列を memfd に書き込み、
-    // /proc/self/fd/<fd> パス経由で quiche に渡す
-    // これにより Landlock でファイルシステムアクセスを制限しながら HTTP/3 を使用可能
+    // TLS 証明書を設定した QUIC 設定を作成する（F-136/F-137）。
     //
-    // セキュリティ: quiche が証明書を読み込んだ後:
-    // 1. memfd を即座にドロップ（カーネルがメモリ解放）
-    // 2. config 内の Vec<u8> をセキュアにゼロ化してからドロップ
-    if let (Some(mut cert_pem), Some(mut key_pem)) = (config.cert_pem.take(), config.key_pem.take())
+    // - Linux、または `system-tls`（F-137）有効時: `new_quic_config_with_certs` が
+    //   memfd/一時ファイル経由でロードする（Linux は `/proc/self/fd/<fd>`、Landlock
+    //   でファイルシステムアクセスを制限しながら HTTP/3 を使用可能）。
+    // - それ以外（`system-tls` 無効時の非 Linux）: PEM バイト列から直接 BoringSSL の
+    //   `SslContextBuilder` を組む in-memory 経路（capsicum capability mode /
+    //   pledge+unveil 下でも動作する）。
+    //
+    // セキュリティ: quiche が証明書を読み込んだ後、config 内の Vec<u8> をセキュアに
+    // ゼロ化してからドロップする。
+    let mut quic_config = if let (Some(mut cert_pem), Some(mut key_pem)) =
+        (config.cert_pem.take(), config.key_pem.take())
     {
-        // memfd 経由でロード（Landlock 対応）
-        info!("[HTTP/3] Loading certificates via memfd (Landlock compatible)");
+        info!(
+            "[HTTP/3] Loading certificates ({})",
+            if cfg!(any(target_os = "linux", feature = "system-tls")) {
+                "via memfd/temp file (path-based quiche API)"
+            } else {
+                "in-memory SSL_CTX, capability-mode compatible"
+            }
+        );
 
-        // 証明書を memfd に書き込み
-        let (cert_memfd, cert_path) = create_memfd_for_pem("tls_cert", &cert_pem)
-            .map_err(|e| io::Error::other(format!("Failed to create memfd for cert: {}", e)))?;
+        let cfg = new_quic_config_with_certs(&cert_pem, &key_pem)?;
 
-        // quiche が証明書を読み込む
-        quic_config
-            .load_cert_chain_from_pem_file(&cert_path)
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("cert load error (memfd): {}", e),
-                )
-            })?;
-
-        // 証明書 memfd を即座にドロップ（fd を閉じてカーネルにメモリ解放を依頼）
-        drop(cert_memfd);
-
-        // 証明書データをセキュアにゼロ化
+        // 証明書・秘密鍵データをセキュアにゼロ化
         secure_zero(&mut cert_pem);
         drop(cert_pem);
-        debug!("[HTTP/3] Certificate data securely zeroed and released");
-
-        // 秘密鍵を memfd に書き込み
-        let (key_memfd, key_path) = create_memfd_for_pem("tls_key", &key_pem)
-            .map_err(|e| io::Error::other(format!("Failed to create memfd for key: {}", e)))?;
-
-        // quiche が秘密鍵を読み込む
-        quic_config
-            .load_priv_key_from_pem_file(&key_path)
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("key load error (memfd): {}", e),
-                )
-            })?;
-
-        // 秘密鍵 memfd を即座にドロップ
-        drop(key_memfd);
-
-        // 秘密鍵データをセキュアにゼロ化
         secure_zero(&mut key_pem);
         drop(key_pem);
-        debug!("[HTTP/3] Private key data securely zeroed and released");
+        debug!("[HTTP/3] Certificate/key data securely zeroed and released");
+        info!("[HTTP/3] Certificates loaded, sensitive data zeroed");
 
-        info!("[HTTP/3] Certificates loaded, memfd closed, sensitive data zeroed");
+        cfg
     } else {
         // ファイルパスから直接ロード（後方互換性）
         info!("[HTTP/3] Loading certificates from file path (legacy mode)");
-        warn!("[HTTP/3] Note: When using Landlock, add cert/key paths to landlock_read_paths");
-
-        quic_config
-            .load_cert_chain_from_pem_file(&config.cert_path)
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("cert load error: {}", e),
-                )
+        #[cfg(target_os = "linux")]
+        {
+            warn!("[HTTP/3] Note: When using Landlock, add cert/key paths to landlock_read_paths");
+            let mut cfg = Config::new(quiche::PROTOCOL_VERSION)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+            cfg.load_cert_chain_from_pem_file(&config.cert_path)
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("cert load error: {}", e),
+                    )
+                })?;
+            cfg.load_priv_key_from_pem_file(&config.key_path)
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("key load error: {}", e),
+                    )
+                })?;
+            cfg
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // 理由付き allow: 起動時コールドパス（cert_pem 未指定のレガシー経路のみ。
+            // 通常経路は config.rs が Landlock 対応済みの PEM バイト列を事前に読み込んで渡す）。
+            #[allow(clippy::disallowed_methods)]
+            let cert_pem = std::fs::read(&config.cert_path).map_err(|e| {
+                io::Error::new(e.kind(), format!("failed to read cert file: {}", e))
             })?;
+            #[allow(clippy::disallowed_methods)]
+            let key_pem = std::fs::read(&config.key_path)
+                .map_err(|e| io::Error::new(e.kind(), format!("failed to read key file: {}", e)))?;
+            new_quic_config_with_certs(&cert_pem, &key_pem)?
+        }
+    };
 
-        quic_config
-            .load_priv_key_from_pem_file(&config.key_path)
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("key load error: {}", e),
-                )
-            })?;
-    }
-
-    // QUIC パラメータを設定
-    quic_config.set_max_idle_timeout(config.max_idle_timeout);
-    quic_config.set_max_recv_udp_payload_size(config.max_udp_payload_size as usize);
-    quic_config.set_max_send_udp_payload_size(config.max_udp_payload_size as usize);
-    quic_config.set_initial_max_data(config.initial_max_data);
-    quic_config.set_initial_max_stream_data_bidi_local(config.initial_max_stream_data_bidi_local);
-    quic_config.set_initial_max_stream_data_bidi_remote(config.initial_max_stream_data_bidi_remote);
-    quic_config.set_initial_max_stream_data_uni(config.initial_max_stream_data_uni);
-    quic_config.set_initial_max_streams_bidi(config.initial_max_streams_bidi);
-    quic_config.set_initial_max_streams_uni(config.initial_max_streams_uni);
-    quic_config.set_disable_active_migration(true);
-    quic_config.enable_early_data();
-
-    // F-124: 輻輳制御 / Pacing / HyStart++（quiche 低レベル Config API）
-    let cc_name = config.cc_algorithm.trim();
-    if let Err(e) = quic_config.set_cc_algorithm_name(cc_name) {
-        warn!(
-            "[HTTP/3] unknown cc_algorithm '{}': {}; falling back to bbr",
-            cc_name, e
-        );
-        let _ = quic_config.set_cc_algorithm_name("bbr");
-    }
-    quic_config.enable_pacing(config.pacing);
-    if let Some(rate) = config.max_pacing_rate {
-        quic_config.set_max_pacing_rate(rate);
-    }
-    quic_config.enable_hystart(config.hystart);
+    // QUIC トランスポートパラメータを設定（初回ロード・リロード共通の独立関数、F-136）
+    configure_quic_transport(&mut quic_config, &config)?;
     info!(
         "[HTTP/3] quiche transport: cc={} pacing={} hystart={} mmsg_batch={}",
-        cc_name, config.pacing, config.hystart, config.mmsg_batch_size
+        config.cc_algorithm.trim(),
+        config.pacing,
+        config.hystart,
+        config.mmsg_batch_size
     );
-
-    // HTTP/3 用の ALPN を設定
-    quic_config
-        .set_application_protos(h3::APPLICATION_PROTOCOL)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
     // 設定を Rc で共有（quiche::Config は Clone できないため）
     let quic_config = Rc::new(RefCell::new(quic_config));
@@ -3766,7 +4104,7 @@ pub async fn run_http3_server_async(
             let cur_gen = crate::tls_reload::http3_cert_generation();
             if cur_gen != local_cert_gen {
                 if let Some(material) = crate::tls_reload::load_http3_material() {
-                    match reload_quiche_certs(&quic_config, &material) {
+                    match reload_quiche_certs(&quic_config, &material, &config) {
                         Ok(()) => {
                             info!(
                                 "[HTTP/3] Certificate hot-reloaded (generation {})",
