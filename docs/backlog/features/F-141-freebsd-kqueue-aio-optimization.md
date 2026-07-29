@@ -107,10 +107,18 @@ FreeBSD の `sendfile(2)` を使ったファイル→ソケットのゼロコピ
   つながる。実機 FreeBSD でしか検証できない領域のため採用を見送った。ヘッダは従来通り
   `write`/`sendmsg` 経路で送り、ファイル本体（ゼロコピー化の効果が大きい部分）のみを
   本モジュールで送る設計とした。
-- **呼び出し側（`src/proxy.rs` の静的配信経路）への配線は本チケットの対象外**
-  （作業範囲が `src/runtime/reactor/`・`src/udp/` に限定されているため）。
-  `crate::runtime::sendfile::{sendfile_once, sendfile_all}` として公開済みなので、
-  静的配信の非 kTLS 経路を本プリミティブへ切り替える作業は別チケットで行う。
+- **配線済み**（レビュー指摘対応）: `KtlsServerStream`/`SimpleTlsServerStream` に
+  `is_plain()`（`TlsMode::Plain` 判定）を追加し、`src/proxy.rs` の
+  `handle_sendfile_userspace` 冒頭で `#[cfg(target_os = "freebsd")]` かつ
+  `tls_stream.is_plain()`（TLS 終端なしの平文接続）の場合のみ `sendfile_all` を
+  使うファストパスへ分岐させた。**`is_plain() == false`（`TlsMode::Rustls`、
+  ユーザー空間 TLS）では従来通り read→暗号化→write を使い、`sendfile(2)` は
+  絶対に使わない**（ファイルの生バイトを暗号化なしにソケットへ流すと、
+  クライアントが TLS ストリームだと信じている接続に平文が混入する重大な
+  セキュリティ上の欠陥になるため）。kTLS 有効時（`is_ktls_send_enabled()`）は
+  既存の `handle_sendfile_zerocopy`（`sendfile_ktls`、FreeBSD 版は 7 引数 API を
+  使用、本チケットの新規実装ではなく既存 F-126 実装）側で処理済みでこの
+  ファストパスには到達しない。
 
 ## 検証の制約（本セッションでは実施不能）
 
