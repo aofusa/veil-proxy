@@ -1154,6 +1154,15 @@ reuseport_balancing = "cbpf"
 # WASM拡張を有効化（デフォルト: false）
 # enabled = true
 
+# Wasm を Cranelift ネイティブ JIT ではなく Pulley インタープリタで実行する（F-135）
+# デフォルト: false（= Cranelift JIT でネイティブコードを生成・実行）
+# true にすると `Config::target("pulley64"/"pulley32")` を指定し、ネイティブコードを
+# 一切生成しない。W^X 制約のある環境・実行可能 mmap を許可できない環境向け。
+# ネイティブ JIT より実行速度は低下する。
+# 注意: OpenBSD ではこの値は常に無視され、常に Pulley インタープリタが使われる
+#（B-52。SIGSEGV を避けるための必須対応。false を指定すると起動時に警告ログが出る）。
+# interpreter = false
+
 # デフォルト設定
 # [wasm.defaults]
 # 最大実行時間（ミリ秒）
@@ -2057,6 +2066,12 @@ reuseport_balancing = "cbpf"
 # max_connections = 200
 # connect_timeout_secs = 5
 # idle_timeout_secs = 600
+# # WASM network filter モジュール名一覧（F-133、wasm feature 必須）。
+# # 省略時・空リストの場合は WASM 無効で splice/ゼロコピー転送のまま
+# # （ホットパス絶対規則: コスト増なし）。指定すると splice を使わず
+# # ユーザー空間バッファ経由の転送へ切り替わる。参照するモジュール名は
+# # [wasm] の modules で定義済みであること。
+# wasm_modules = ["network_filter"]
 #
 #   [[l4.upstreams]]
 #   addr = "10.0.0.1:5432"
