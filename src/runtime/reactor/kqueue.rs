@@ -166,14 +166,45 @@ impl KqueuePoller {
     }
 }
 
-// filter/flags は FreeBSD/OpenBSD で型が異なり得る（libc クレートが target 別に
+// filter/flags は FreeBSD/OpenBSD/macOS で型が異なり得る（libc クレートが target 別に
 // `libc::kevent` のフィールド型を定義する）ため、呼び出し側の `libc::EVFILT_*`/
 // `libc::EV_*` 定数をそのまま `as _` でフィールド型へキャストする（ハードコードした
 // 具象型を引数に取らない）。
+//
+// F-140: NetBSD の `struct kevent` は歴史的な BSD 定義（FreeBSD/OpenBSD/macOS の
+// `filter: i16` / `flags: u16` / `udata: intptr_t`）から拡張されており、
+// `filter`/`flags` とも `uint32_t`、`udata` は `void *` である（NetBSD
+// `<sys/event.h>` 参照）。本関数は `udata` を一切設定しない（`mem::zeroed()` の
+// ままゼロ/NULL）ため `udata` の型差はここでは影響しないが、`filter`/`flags` の
+// 代入先フィールド型が変わるため `TryInto<i16>`/`TryInto<u16>` 固定の下の実装は
+// NetBSD では型不一致でコンパイルできない。`TryInto<u32>` 版を別途用意して吸収する
+// （FreeBSD/OpenBSD/macOS 側のこの関数は 1 行も変更していない）。
+#[cfg(not(target_os = "netbsd"))]
 fn make_kevent(
     fd: RawFd,
     filter: impl TryInto<i16> + Copy,
     flags: impl TryInto<u16> + Copy,
+) -> libc::kevent {
+    let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
+    ev.ident = fd as libc::uintptr_t;
+    ev.filter = match filter.try_into() {
+        Ok(v) => v,
+        Err(_) => 0,
+    };
+    ev.flags = match flags.try_into() {
+        Ok(v) => v,
+        Err(_) => 0,
+    };
+    ev
+}
+
+/// NetBSD 版 `make_kevent`（`filter`/`flags` が `uint32_t` のため `TryInto<u32>`
+/// で受ける。ロジックは非 NetBSD 版と同一）。
+#[cfg(target_os = "netbsd")]
+fn make_kevent(
+    fd: RawFd,
+    filter: impl TryInto<u32> + Copy,
+    flags: impl TryInto<u32> + Copy,
 ) -> libc::kevent {
     let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
     ev.ident = fd as libc::uintptr_t;
