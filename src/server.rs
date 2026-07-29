@@ -653,66 +653,76 @@ pub fn spawn_wasm_tick_thread() {
                         );
 
                         let upstream_groups = &config.upstream_groups;
-                        let (status_code, status_message, initial_metadata, message, trailing_metadata) =
-                            if let Some(group) = upstream_groups.get(upstream_name) {
-                                if let Some(server) = group.select("0.0.0.0") {
-                                    let host = server.host();
-                                    let port = server.port();
-                                    match crate::wasm::host::grpc_executor::execute_grpc_unary_call(
-                                        host,
-                                        port,
-                                        &pending.path,
-                                        &pending.initial_metadata,
-                                        &pending.messages,
-                                        pending.timeout_ms,
-                                    ) {
-                                        Ok(result) => (
-                                            result.status_code,
-                                            result.status_message,
-                                            result.initial_metadata,
-                                            result.message,
-                                            result.trailing_metadata,
-                                        ),
-                                        Err(e) => {
-                                            warn!(
-                                                "[wasm:grpc_call] call to '{}' failed: {}",
-                                                upstream_name, e
-                                            );
-                                            (
-                                                crate::wasm::grpc_status::UNAVAILABLE,
-                                                format!("gRPC call failed: {e}"),
-                                                Vec::new(),
-                                                Vec::new(),
-                                                Vec::new(),
-                                            )
-                                        }
+                        let (
+                            status_code,
+                            status_message,
+                            initial_metadata,
+                            message,
+                            trailing_metadata,
+                        ) = if let Some(group) = upstream_groups.get(upstream_name) {
+                            if let Some(server) = group.select("0.0.0.0") {
+                                let host = server.host();
+                                let port = server.port();
+                                // F-134 フォローアップ: HTTP call と同じ
+                                // `server.use_tls()` を使い、gRPC 上流も TLS
+                                // （h2, ALPN "h2"）へ接続できるようにする。
+                                let use_tls = server.use_tls();
+                                match crate::wasm::host::grpc_executor::execute_grpc_unary_call(
+                                    host,
+                                    port,
+                                    use_tls,
+                                    &pending.path,
+                                    &pending.initial_metadata,
+                                    &pending.messages,
+                                    pending.timeout_ms,
+                                ) {
+                                    Ok(result) => (
+                                        result.status_code,
+                                        result.status_message,
+                                        result.initial_metadata,
+                                        result.message,
+                                        result.trailing_metadata,
+                                    ),
+                                    Err(e) => {
+                                        warn!(
+                                            "[wasm:grpc_call] call to '{}' failed: {}",
+                                            upstream_name, e
+                                        );
+                                        (
+                                            crate::wasm::grpc_status::UNAVAILABLE,
+                                            format!("gRPC call failed: {e}"),
+                                            Vec::new(),
+                                            Vec::new(),
+                                            Vec::new(),
+                                        )
                                     }
-                                } else {
-                                    warn!(
-                                        "[wasm:grpc_call] No healthy servers in upstream '{}' for module '{}'",
-                                        upstream_name, pending.module_name
-                                    );
-                                    (
-                                        crate::wasm::grpc_status::UNAVAILABLE,
-                                        "No healthy upstream servers available".to_string(),
-                                        Vec::new(),
-                                        Vec::new(),
-                                        Vec::new(),
-                                    )
                                 }
                             } else {
                                 warn!(
-                                    "[wasm:grpc_call] Upstream '{}' not found for module '{}'",
-                                    upstream_name, pending.module_name
-                                );
+                                        "[wasm:grpc_call] No healthy servers in upstream '{}' for module '{}'",
+                                        upstream_name, pending.module_name
+                                    );
                                 (
-                                    crate::wasm::grpc_status::UNIMPLEMENTED,
-                                    format!("Upstream '{upstream_name}' not found"),
+                                    crate::wasm::grpc_status::UNAVAILABLE,
+                                    "No healthy upstream servers available".to_string(),
                                     Vec::new(),
                                     Vec::new(),
                                     Vec::new(),
                                 )
-                            };
+                            }
+                        } else {
+                            warn!(
+                                "[wasm:grpc_call] Upstream '{}' not found for module '{}'",
+                                upstream_name, pending.module_name
+                            );
+                            (
+                                crate::wasm::grpc_status::UNIMPLEMENTED,
+                                format!("Upstream '{upstream_name}' not found"),
+                                Vec::new(),
+                                Vec::new(),
+                                Vec::new(),
+                            )
+                        };
 
                         let mut trailing = trailing_metadata;
                         trailing.push(("grpc-status".to_string(), status_code.to_string()));

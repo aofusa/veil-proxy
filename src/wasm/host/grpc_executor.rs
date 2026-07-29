@@ -19,7 +19,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
@@ -92,6 +92,75 @@ pub fn take_global_pending_grpc_calls() -> Vec<PendingGrpcUnaryCall> {
 /// クライアントコネクションプリフェース (RFC 7540 Section 3.5)
 const CONNECTION_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
+/// gRPC-over-h2/h2c 呼び出し用の TCP ストリーム抽象。
+///
+/// F-134 フォローアップ: 従来は平文 `TcpStream` 決め打ちで gRPC over TLS（h2, ALPN
+/// `h2`）上流に接続できなかった（`docs/backlog/features/F-139-wasm-grpc-call-execution.md`
+/// の「TLS 上流」課題）。`src/wasm/http_executor.rs::execute_https_request` と同じ
+/// 設計（rustls + webpki-roots のシステムルート、ブロッキング I/O）を踏襲し、
+/// `Read`/`Write` を実装した列挙体で呼び出し側のロジック（フレーム送受信ループ）を
+/// TLS の有無に関わらず共通化する。
+enum ClientStream {
+    Plain(TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+}
+
+impl Read for ClientStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            ClientStream::Plain(s) => s.read(buf),
+            ClientStream::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for ClientStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            ClientStream::Plain(s) => s.write(buf),
+            ClientStream::Tls(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            ClientStream::Plain(s) => s.flush(),
+            ClientStream::Tls(s) => s.flush(),
+        }
+    }
+}
+
+/// TLS 上流用の rustls `ClientConnection` を確立し、`TcpStream` を包む。
+///
+/// システムルート（webpki-roots）で検証する。クライアント証明書認証は
+/// veil の他の WASM 発呼経路（`proxy_http_call`）と同様に未対応（相互 TLS が
+/// 必要な上流は現状スコープ外、必要になれば `[[upstream]]` 設定に証明書パスを
+/// 追加する形で拡張できる）。
+fn wrap_tls(stream: TcpStream, host: &str) -> Result<ClientStream, String> {
+    use rustls::pki_types::ServerName;
+    use rustls::ClientConfig;
+
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    let mut config = ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    // gRPC over TLS は ALPN `h2` を要求するサーバーが多い（h2c 相当のフレーミングを
+    // そのまま流用するため、ALPN のネゴシエーション結果自体は使わないが、
+    // アナウンスしないと拒否するサーバーがある）。
+    config.alpn_protocols = vec![b"h2".to_vec()];
+
+    let server_name = ServerName::try_from(host.to_string())
+        .map_err(|_| format!("invalid server name: {host}"))?;
+
+    let conn = rustls::ClientConnection::new(Arc::new(config), server_name)
+        .map_err(|e| format!("TLS handshake setup failed: {e}"))?;
+
+    Ok(ClientStream::Tls(Box::new(rustls::StreamOwned::new(
+        conn, stream,
+    ))))
+}
+
 /// ユーナリー gRPC 呼び出しの結果
 #[derive(Debug, Clone)]
 pub struct GrpcUnaryResult {
@@ -107,17 +176,21 @@ pub struct GrpcUnaryResult {
     pub trailing_metadata: Vec<(String, String)>,
 }
 
-/// gRPC-over-h2c のユーナリー呼び出しを 1 本の使い捨て TCP 接続で実行する。
+/// gRPC-over-h2c/h2 のユーナリー呼び出しを 1 本の使い捨て TCP 接続で実行する。
 ///
 /// `path` は `/<service>/<method>` 形式。`initial_metadata` はゲストが
 /// `proxy_grpc_call` に渡したメタデータ（gRPC-Metadata としてヘッダに変換される）。
+/// `use_tls` が true の場合、`src/wasm/http_executor.rs::execute_https_request` と
+/// 同じ rustls + webpki-roots システムルート検証で TLS 上流に接続する（F-134 の
+/// 「TLS 上流未対応」課題を解消。詳細は
+/// `docs/backlog/features/F-139-wasm-grpc-call-execution.md`）。
 /// 接続プーリングは行わない（1 呼び出し 1 接続。F-106 の HTTP/2 バックエンド
 /// プーリングとは別経路であり、頻繁な WASM 発 gRPC 呼び出しがある場合は
-/// 将来プーリング化を検討する余地がある。詳細は
-/// `docs/backlog/features/F-139-wasm-grpc-call-execution.md`）。
+/// 将来プーリング化を検討する余地がある。詳細は同チケット）。
 pub fn execute_grpc_unary_call(
     host: &str,
     port: u16,
+    use_tls: bool,
     path: &str,
     initial_metadata: &[(String, String)],
     messages: &[Vec<u8>],
@@ -127,15 +200,21 @@ pub fn execute_grpc_unary_call(
     let deadline = Instant::now() + timeout;
 
     let addr = format!("{host}:{port}");
-    let mut stream = TcpStream::connect_timeout(
+    let tcp_stream = TcpStream::connect_timeout(
         &addr
             .parse()
             .map_err(|e| format!("invalid upstream address '{addr}': {e}"))?,
         timeout,
     )
     .map_err(|e| format!("connect failed: {e}"))?;
-    stream.set_read_timeout(Some(timeout)).ok();
-    stream.set_write_timeout(Some(timeout)).ok();
+    tcp_stream.set_read_timeout(Some(timeout)).ok();
+    tcp_stream.set_write_timeout(Some(timeout)).ok();
+
+    let mut stream = if use_tls {
+        wrap_tls(tcp_stream, host)?
+    } else {
+        ClientStream::Plain(tcp_stream)
+    };
 
     let settings = Http2Settings::new();
     let frame_encoder = FrameEncoder::new(settings.max_frame_size);
@@ -279,8 +358,10 @@ pub fn execute_grpc_unary_call(
                     if !got_response_headers && !has_grpc_status {
                         // 通常の応答ヘッダ（:status 等）。疑似ヘッダは除いて
                         // GrpcReceiveInitialMetadata へ渡す。
-                        initial_metadata_out =
-                            pairs.into_iter().filter(|(k, _)| !k.starts_with(':')).collect();
+                        initial_metadata_out = pairs
+                            .into_iter()
+                            .filter(|(k, _)| !k.starts_with(':'))
+                            .collect();
                         got_response_headers = true;
                     } else {
                         // トレーラー（grpc-status を含む HEADERS、または
@@ -355,6 +436,7 @@ mod tests {
         let result = execute_grpc_unary_call(
             "not a valid host!!",
             0,
+            false,
             "/test.Service/Method",
             &[],
             &[],
@@ -368,7 +450,43 @@ mod tests {
     fn test_execute_grpc_unary_call_connection_refused() {
         // ポート 0 への接続はプラットフォーム上ほぼ確実に失敗する。
         let result =
-            execute_grpc_unary_call("127.0.0.1", 1, "/test.Service/Method", &[], &[], 200);
+            execute_grpc_unary_call("127.0.0.1", 1, false, "/test.Service/Method", &[], &[], 200);
+        assert!(result.is_err());
+    }
+
+    /// F-134 フォローアップ（TLS 上流対応）: `use_tls=true` でも接続失敗時は
+    /// panic せず Err を返す（TLS ハンドシェイク前に TCP connect が失敗する経路）。
+    #[test]
+    fn test_execute_grpc_unary_call_tls_connection_refused() {
+        let result =
+            execute_grpc_unary_call("127.0.0.1", 1, true, "/test.Service/Method", &[], &[], 200);
+        assert!(result.is_err());
+    }
+
+    /// F-134 フォローアップ: 不正なサーバー名（TLS SNI 用）は TCP 接続前に
+    /// 弾かれず、`wrap_tls` の `ServerName::try_from` で BadArgument 相当の
+    /// エラーとして trap せず Err になることを確認する
+    /// （host 文字列は WASM ゲスト由来であり不正値が来ても panic してはならない）。
+    #[test]
+    fn test_wrap_tls_invalid_server_name() {
+        // rustls はプロセス全体で 1 度だけ CryptoProvider をインストールする必要がある
+        // （通常は entry.rs の起動処理が行うが、単体テストバイナリでは未実行）。
+        // 複数テストが並行実行されても二重インストールで panic しないよう結果を無視する。
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            crate::tls_provider::provider::default_provider(),
+        );
+
+        // localhost の適当な TCP リスナーを 1 本立てて connect 自体は成功させ、
+        // TLS ラップの ServerName 検証だけを単独でテストする。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind should succeed");
+        let addr = listener.local_addr().expect("local_addr should succeed");
+        // 理由付き allow: 単体テスト（コールドパス、専用テストスレッド）内のみの
+        // 同期 connect。本体のホットパス（io_uring イベントループ）には無関係。
+        #[allow(clippy::disallowed_methods)]
+        let stream = TcpStream::connect(addr).expect("connect should succeed");
+        drop(listener);
+
+        let result = wrap_tls(stream, "not a valid server name!!");
         assert!(result.is_err());
     }
 
@@ -391,10 +509,7 @@ mod tests {
             "test_module_grpc_exec",
             9999
         ));
-        assert!(cancel_global_pending_grpc_call(
-            "test_module_grpc_exec",
-            42
-        ));
+        assert!(cancel_global_pending_grpc_call("test_module_grpc_exec", 42));
 
         // 既にキャンセル済みなので取り出しても空
         let taken = take_global_pending_grpc_calls();
