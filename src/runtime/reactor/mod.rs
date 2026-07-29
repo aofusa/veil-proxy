@@ -35,6 +35,10 @@ pub(crate) mod aio;
 pub(crate) mod poller;
 
 pub mod executor;
+/// sendfile(2) によるゼロコピー静的ファイル送信は FreeBSD 専用（F-141）。
+/// Linux の `splice` とは完全に独立した実装（`sendfile` モジュール doc 参照）。
+#[cfg(target_os = "freebsd")]
+pub mod sendfile;
 /// splice(2) は Linux 専用（BSD は呼び出し側で read/write 転送へフォールバック。設計 3.3 節）。
 #[cfg(target_os = "linux")]
 pub mod splice;
