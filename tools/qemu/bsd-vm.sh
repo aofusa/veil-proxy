@@ -19,7 +19,7 @@
 #
 # 使い方:
 #   tools/qemu/bsd-vm.sh <os> <arch> <command> [args]
-#     os   : freebsd | openbsd
+#     os   : freebsd | openbsd | netbsd
 #     arch : x86_64 | aarch64
 #
 #   # FreeBSD amd64 を作って full features でビルドし E2E まで回して取り出す
@@ -77,7 +77,7 @@ usage() {
     sed -n '2,60p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 1
 }
-case "${OS_NAME}" in freebsd|openbsd) ;; *) echo "ERROR: os must be freebsd|openbsd" >&2; usage ;; esac
+case "${OS_NAME}" in freebsd|openbsd|netbsd) ;; *) echo "ERROR: os must be freebsd|openbsd|netbsd" >&2; usage ;; esac
 case "${ARCH}" in x86_64|aarch64) ;; *) echo "ERROR: arch must be x86_64|aarch64" >&2; usage ;; esac
 [[ -n "${COMMAND}" ]] || usage
 
@@ -98,6 +98,12 @@ VM_FIRMWARE="${VM_FIRMWARE:-bios}"
 # 既定は入手可能な最新に追従させ、古いリリースを使う場合は OPENBSD_VER で指定する
 # （`curl -s https://cdn.openbsd.org/pub/OpenBSD/ | grep -oE '"[0-9]\.[0-9]/"'` で確認できる）。
 OPENBSD_VER="${OPENBSD_VER:-7.9}"
+# NetBSD: OS バージョン（配布イメージ）とパッケージリポジトリのバージョンは別軸
+# （実地確認済み: 10.1 リリースのパッケージは pkgsrc の "10.0_2026Q2" 系列に入っている）。
+NETBSD_VER="${NETBSD_VER:-10.1}"
+NETBSD_PKG_VER="${NETBSD_PKG_VER:-10.0}"
+# ↑ cdn.NetBSD.org は .../NetBSD/<arch>/10.0/All/ を .../10.0_2026Q2/All/ 等へ
+# 302 リダイレクトする（curl -sIL で確認済み）。curl -fL を使うので追従される。
 NAME="veil-${OS_NAME}-${ARCH}"
 
 # 使用するディスクイメージ。既定は setup が作る ${WORKDIR}/disk.qcow2。
@@ -123,6 +129,8 @@ _port_base() {
         freebsd-aarch64) echo 2320 ;;
         openbsd-x86_64) echo 2330 ;;
         openbsd-aarch64) echo 2340 ;;
+        netbsd-x86_64) echo 2350 ;;
+        netbsd-aarch64) echo 2360 ;;
     esac
 }
 PORT_BASE="$(_port_base)"
@@ -175,6 +183,15 @@ _image_url() {
             echo "https://cdn.openbsd.org/pub/OpenBSD/${OPENBSD_VER}/amd64/miniroot${OPENBSD_VER//./}.img" ;;
         openbsd-aarch64)
             echo "https://cdn.openbsd.org/pub/OpenBSD/${OPENBSD_VER}/arm64/miniroot${OPENBSD_VER//./}.img" ;;
+        # NetBSD（F-140）: x86_64 は起動可能な **live image**（生イメージ、rootfs 込み）が
+        # 配布されているのでそのまま qcow2 化して使う。cloud-init 相当が無いため
+        # provision はシリアルへ root ログインして行う（netbsd-provision.py）。
+        # aarch64 は install ISO のみの配布のため sysinst をシリアルから自動操作する
+        # （netbsd-autoinstall.py、openbsd-autoinstall.py に倣う）。
+        netbsd-x86_64)
+            echo "https://cdn.netbsd.org/pub/NetBSD/NetBSD-${NETBSD_VER}/images/NetBSD-${NETBSD_VER}-amd64-live.img.gz" ;;
+        netbsd-aarch64)
+            echo "https://cdn.netbsd.org/pub/NetBSD/NetBSD-${NETBSD_VER}/images/NetBSD-${NETBSD_VER}-evbarm-aarch64.iso" ;;
     esac
 }
 
@@ -217,7 +234,7 @@ cmd_setup() {
         fi
         [[ -f "${IMG}" ]] || _create_overlay
         _write_cloudinit_seed
-    else
+    elif [[ "${OS_NAME}" == "openbsd" ]]; then
         # OpenBSD は ready-made な qcow2 が無いため miniroot からの autoinstall。
         if [[ ! -f "${WORKDIR}/miniroot.img" ]]; then
             log "OpenBSD インストーライメージを DL: ${url}"
@@ -228,6 +245,35 @@ cmd_setup() {
             helper qemu-img create -f qcow2 "${IMG_NAME}" "${GROW_GB}G" >/dev/null
         fi
         _write_openbsd_autoinstall
+    else
+        # NetBSD（F-140）。
+        if [[ "${ARCH}" == "x86_64" ]]; then
+            # live image（生イメージ、gzip 圧縮）を DL して qcow2 化し、
+            # FreeBSD と同じ「base.qcow2 + 起動用オーバーレイ」構成にする
+            # （cloud-init は無いので seed は作らない。provision はシリアル
+            # ログイン経由 = netbsd-provision.py）。
+            local base="${WORKDIR}/base.qcow2"
+            if [[ ! -f "${base}" ]]; then
+                log "NetBSD live image を DL + qcow2 変換: ${url}"
+                curl -fL --retry 3 -o "${WORKDIR}/live.img.gz" "${url}"
+                gunzip -kf "${WORKDIR}/live.img.gz"
+                helper qemu-img convert -f raw -O qcow2 live.img base.qcow2
+                rm -f "${WORKDIR}/live.img.gz" "${WORKDIR}/live.img"
+            fi
+            [[ -f "${IMG}" ]] || _create_overlay
+        else
+            # aarch64 は install ISO のみの配布。OpenBSD の miniroot と同じ発想で
+            # ISO を CD-ROM、空のターゲット qcow2 を 2 台目に繋いで sysinst を
+            # シリアルから自動操作する（netbsd-autoinstall.py）。
+            if [[ ! -f "${WORKDIR}/install.iso" ]]; then
+                log "NetBSD インストール ISO を DL: ${url}"
+                curl -fL --retry 3 -o "${WORKDIR}/install.iso" "${url}"
+            fi
+            if [[ ! -f "${IMG}" ]]; then
+                log "空のターゲットディスクを作成（${GROW_GB}G）"
+                helper qemu-img create -f qcow2 "${IMG_NAME}" "${GROW_GB}G" >/dev/null
+            fi
+        fi
     fi
     log "setup 完了"
 }
@@ -355,6 +401,15 @@ _write_boot() {
         # auto_install.conf の「root disk = sd1」はこの並びに対応する。
         drives="-drive if=virtio,format=raw,file=miniroot.img,index=0 \\
   -drive if=virtio,format=qcow2,file=${IMG_NAME},index=1"
+    elif [[ "${OS_NAME}" == "netbsd" && "${phase}" == "install" ]]; then
+        # NetBSD aarch64 の install フェーズ: install ISO を CD-ROM（sysinst から
+        # 見えるブート/インストールメディア）、ターゲット qcow2 を virtio-blk で繋ぐ。
+        # aarch64 の virt マシンには IDE が無いので virtio-scsi 経由の CD-ROM にする
+        # （FreeBSD/OpenBSD の seed_drive と同じ手法）。
+        drives="-device virtio-scsi-pci,id=scsi0 \\
+  -drive if=none,id=cd0,format=raw,file=install.iso,media=cdrom \\
+  -device scsi-cd,bus=scsi0.0,drive=cd0,bootindex=0 \\
+  -drive if=virtio,format=qcow2,file=${IMG_NAME},index=0,bootindex=1"
     else
         drives="-drive if=virtio,format=qcow2,file=${IMG_NAME},index=0${drive_opts}"
     fi
@@ -537,7 +592,7 @@ cmd_provision() {
         cmd_wait "${1:-600}"
         cmd_ssh 'uname -a'
         log "provision 完了"
-    else
+    elif [[ "${OS_NAME}" == "openbsd" ]]; then
         # OpenBSD は autoinstall(8) がインストールと同時に SSH 公開鍵まで入れる。
         # miniroot を 1 台目に繋いだ install フェーズを起動し、応答ファイルを与える。
         [[ -f "${WORKDIR}/auto_install.conf" ]] || die "auto_install.conf が無い。先に setup を実行すること"
@@ -557,6 +612,44 @@ cmd_provision() {
         cmd_wait "${1:-1200}"
         cmd_ssh 'uname -a'
         log "provision 完了"
+    else
+        # NetBSD（F-140）。
+        if [[ "${ARCH}" == "x86_64" ]]; then
+            # live image は cloud-init 相当を持たないため、FreeBSD の --mode login と
+            # 同じ発想でシリアルへ root ログインして SSH 鍵を注入する。
+            log "NetBSD live image を起動し、シリアルから root ログインして SSH 鍵を注入"
+            cmd_down
+            cmd_up
+            sleep 5
+            python3 "${HERE}/netbsd-provision.py" --con-port "${CON_PORT}" \
+                --pubkey "${KEY}.pub" --password "${VM_ROOT_PASSWORD}"
+            log "SSH 到達を確認"
+            cmd_wait "${1:-600}"
+            cmd_ssh 'uname -a'
+            log "provision 完了"
+        else
+            # aarch64: install ISO から sysinst を自動操作する（openbsd-autoinstall.py
+            # に倣った netbsd-autoinstall.py。sysinst はメニュー主導の対話ツールで
+            # OpenBSD の autoinstall(8) のような応答ファイルが無いため、シリアルへの
+            # キー送出で駆動する）。
+            [[ -f "${WORKDIR}/install.iso" ]] || die "install.iso が無い。先に setup を実行すること"
+            log "NetBSD sysinst を実行（install ISO 起動 → 自動操作 → インストール）"
+            cmd_down
+            CONSOLE_WAIT=1 cmd_up install
+            unset CONSOLE_WAIT
+            python3 "${HERE}/netbsd-autoinstall.py" --con-port "${CON_PORT}" \
+                --pubkey "${KEY}.pub" --password "${VM_ROOT_PASSWORD}"
+            log "sysinst 完了。ISO を外して再起動し、シリアルログインで SSH 鍵を注入"
+            cmd_down
+            cmd_up
+            sleep 5
+            python3 "${HERE}/netbsd-provision.py" --con-port "${CON_PORT}" \
+                --pubkey "${KEY}.pub" --password "${VM_ROOT_PASSWORD}"
+            log "SSH 到達を確認"
+            cmd_wait "${1:-1800}"
+            cmd_ssh 'uname -a'
+            log "provision 完了"
+        fi
     fi
 }
 
@@ -567,7 +660,10 @@ cmd_reset() {
     cmd_down
     rm -f "${IMG}"
     _create_overlay
-    _write_cloudinit_seed
+    # cloud-init シードは FreeBSD の BASIC-CLOUDINIT イメージ専用。
+    # NetBSD x86_64 も base.qcow2 を持つが cloud-init は無いので対象外
+    # （provision は毎回シリアルログインで鍵注入し直す）。
+    [[ "${OS_NAME}" == "freebsd" ]] && _write_cloudinit_seed
     log "reset 完了（次の up で初期状態から起動する）"
 }
 
@@ -621,6 +717,9 @@ cmd_scp() { scp "${SCP_OPTS[@]}" "$@"; }
 if [[ "${OS_NAME}" == "openbsd" ]]; then
     GUEST_ROOT="${GUEST_ROOT:-/usr/obj/veil-proxy}"
 else
+    # NetBSD もひとまず FreeBSD と同じ /root 配下（live image のパーティション構成が
+    # OpenBSD の autoinstall auto layout ほど狭いかどうかは未検証。狭ければ OpenBSD と
+    # 同様に GUEST_ROOT を広いパーティションへ変える必要がある）。
     GUEST_ROOT="${GUEST_ROOT:-/root/veil-proxy}"
 fi
 
@@ -632,6 +731,23 @@ cmd_toolchain() {
         # protobuf: tests/grpc_server の prost-build が protoc を要求する（E2E に必要）
         log "pkg install rust cmake llvm gmake protobuf bash curl nasm git pkgconf"
         cmd_ssh 'env IGNORE_OSVERSION=yes ASSUME_ALWAYS_YES=yes pkg install -y rust cmake llvm gmake protobuf bash curl nasm git pkgconf >/tmp/pkg.log 2>&1 || { tail -20 /tmp/pkg.log; exit 1; }'
+    elif [[ "${OS_NAME}" == "netbsd" ]]; then
+        # NetBSD（F-140）: pkgsrc のバイナリパッケージ（pkgin）で rust-bin を導入する。
+        # ソースからの rust ビルドは QEMU 上で数時間かかるため **必ず rust-bin を使う**
+        # （`rust` パッケージ = ソースビルドを引くパッケージとは別物）。
+        local pkg_path="https://cdn.NetBSD.org/pub/pkgsrc/packages/NetBSD/${ARCH}/${NETBSD_PKG_VER}/All/"
+        log "pkgin bootstrap + rust-bin/cmake/llvm 導入（PKG_PATH=${pkg_path}）"
+        cmd_ssh "set -e
+export PKG_PATH='${pkg_path}'
+if ! command -v pkgin >/dev/null 2>&1 && [ ! -x /usr/pkg/bin/pkgin ]; then
+  echo 'pkgin が無いので pkg_add で bootstrap する'
+  pkg_add -v pkgin
+fi
+export PATH=/usr/pkg/bin:/usr/pkg/sbin:\$PATH
+pkgin -y update >/tmp/pkgin.log 2>&1 || { tail -40 /tmp/pkgin.log; exit 1; }
+pkgin -y install rust-bin cmake llvm protobuf gmake bash curl git nasm pkgconf mozilla-rootcerts-openssl >>/tmp/pkgin.log 2>&1 || { tail -60 /tmp/pkgin.log; exit 1; }
+mozilla-rootcerts-openssl install >/dev/null 2>&1 || true
+"
     else
         # OpenBSD も同様に protobuf（protoc）と gmake が要る
         log "OpenBSD 用 cc ラッパを設置（C ファイルのみ -include pthread.h）"
@@ -674,7 +790,11 @@ if ! find /usr/local -name "libclang*so*" 2>/dev/null | grep -q .; then
   env $P pkg_add -I "$LLVM" >>/tmp/pkg.log 2>&1 || { tail -20 /tmp/pkg.log; exit 1; }
 fi'
     fi
-    cmd_ssh 'cargo --version; cmake --version | head -1; gmake --version 2>/dev/null | head -1; protoc --version 2>/dev/null'
+    if [[ "${OS_NAME}" == "netbsd" ]]; then
+        cmd_ssh 'export PATH=/usr/pkg/bin:/usr/pkg/sbin:$PATH; cargo --version; cmake --version | head -1; gmake --version 2>/dev/null | head -1; protoc --version 2>/dev/null'
+    else
+        cmd_ssh 'cargo --version; cmake --version | head -1; gmake --version 2>/dev/null | head -1; protoc --version 2>/dev/null'
+    fi
 }
 
 cmd_sync() {
@@ -725,6 +845,13 @@ _guest_env_prefix() {
         # E2E はデバッガを使わないのでデバッグ情報とインクリメンタルを切って容量を稼ぐ。
         pre="${pre} CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0"
     fi
+    if [[ "${OS_NAME}" == "netbsd" ]]; then
+        # pkgsrc の rust-bin/cmake/llvm は /usr/pkg 配下に入り、libclang も
+        # /usr/pkg/lib/llvmNN/lib 配下（OpenBSD/FreeBSD の /usr/local とは別系統）。
+        # 非対話 ssh セッションには既定で /usr/pkg/{bin,sbin} が PATH に無い。
+        pre='LIBCLANG_PATH=$(find /usr/pkg -name "libclang.so*" 2>/dev/null | head -1 | xargs dirname)'
+        pre="${pre} PATH=/usr/pkg/bin:/usr/pkg/sbin:\$PATH"
+    fi
     echo "${pre}"
 }
 
@@ -743,6 +870,7 @@ _default_features() {
     case "${OS_NAME}" in
         freebsd) echo "full-freebsd${suffix}" ;;
         openbsd) echo "full-openbsd${suffix}" ;;
+        netbsd) echo "full-netbsd${suffix}" ;;
     esac
 }
 CARGO_FEATURES="${CARGO_FEATURES:-$(_default_features)}"
