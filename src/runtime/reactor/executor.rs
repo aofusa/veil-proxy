@@ -459,7 +459,7 @@ fn park(timeout_ms: i32) {
                 // 通常のイベントではなく `EV_ERROR` フラグ付きの kevent として
                 // eventlist に混ざって返る（`kqueue::KqueuePoller::wait` の doc 参照）。
                 // 実際の read/write readiness ではないため読み飛ばす。
-                if ev.flags & (libc::EV_ERROR as _) != 0 {
+                if (ev.flags as u32) & (libc::EV_ERROR as u32) != 0 {
                     continue;
                 }
                 let fd = ev.ident as RawFd;

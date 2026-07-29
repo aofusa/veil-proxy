@@ -794,15 +794,18 @@ harness = false
 quiche = { version = "0.24.9", default-features = false, optional = true }
 aws-lc-sys = { version = "0.41", features = ["ssl", "bindgen"] }
 
-# FreeBSD: quiche の TLS バックエンドを `freebsd-vendor-tls`（既定、`boringssl-boring-crate`
-# 経由の vendored BoringSSL、F-136 の in-memory 証明書リロード API に必要）と
-# `system-tls`（`quiche?/openssl`、動的リンク。capsicum capability mode 下では
-# 証明書ホットリロード不可）とで切り替えられるよう optional 化する（F-137）。
+# FreeBSD: `system-tls`（F-137/F-140）は OpenBSD/NetBSD 専用であり FreeBSD は対象外
+# （AGENTS.md 参照）。FreeBSD は capsicum capability mode 下でも証明書ホットリロードが
+# 動作する in-memory SSL_CTX API（`Config::with_boring_ssl_ctx_builder`、F-136）が
+# `boringssl-boring-crate` feature 経由でしか提供されないため、常時これを使う
+# （macOS/Windows と同じ構成。feature 経由の切替は不要＝常に固定）。
 [target.'cfg(target_os = "freebsd")'.dependencies]
-quiche = { version = "0.24.9", default-features = false, optional = true }
+quiche = { version = "0.24.9", default-features = false, features = ["boringssl-boring-crate"], optional = true }
 # quiche 0.24.9 が依存する boring のバージョンと必ず一致させること（異なると
-# `SslContextBuilder` の型が別物になりコンパイルエラーになる）。
-boring = { version = "4.3", optional = true }
+# `SslContextBuilder` の型が別物になりコンパイルエラーになる）。FreeBSD は常に
+# BoringSSL 固定のため optional にしない（http3 feature 無効時の追加コストは
+# full-freebsd が常に http3 を含むため許容する。macOS/Windows と同じ理由）。
+boring = "4.3"
 
 # macOS/Windows: F-137 の `system-tls` を用意していないため、従来どおり
 # vendored BoringSSL（boring crate）を無条件で使う（不変）。

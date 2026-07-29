@@ -10823,7 +10823,7 @@ async fn handle_sendfile_userspace(
     #[cfg(target_os = "freebsd")]
     {
         if tls_stream.is_plain() && transfer_length > 0 {
-            use crate::runtime::reactor::sendfile::sendfile_all;
+            use crate::runtime::sendfile::sendfile_all;
             let out_fd = tls_stream.as_raw_fd();
             let in_fd = file.as_raw_fd();
             return match sendfile_all(out_fd, in_fd, transfer_offset, transfer_length as usize)
