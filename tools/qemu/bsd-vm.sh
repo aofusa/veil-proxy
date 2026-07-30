@@ -758,7 +758,7 @@ if [ ! -x /usr/pkg/bin/pkgin ]; then
   /usr/sbin/pkg_add -v pkgin >/tmp/pkg_add.log 2>&1 || { tail -40 /tmp/pkg_add.log; exit 1; }
 fi
 /usr/pkg/bin/pkgin -y update >/tmp/pkgin.log 2>&1 || { tail -40 /tmp/pkgin.log; exit 1; }
-/usr/pkg/bin/pkgin -y install rust-bin cmake llvm protobuf gmake bash curl git nasm pkgconf mozilla-rootcerts-openssl >>/tmp/pkgin.log 2>&1 || { tail -60 /tmp/pkgin.log; exit 1; }
+/usr/pkg/bin/pkgin -y install rust-bin cmake llvm clang libressl protobuf gmake bash curl git nasm pkgconf mozilla-rootcerts-openssl >>/tmp/pkgin.log 2>&1 || { tail -60 /tmp/pkgin.log; exit 1; }
 /usr/pkg/sbin/mozilla-rootcerts-openssl install >/dev/null 2>&1 || /usr/pkg/bin/mozilla-rootcerts-openssl install >/dev/null 2>&1 || true
 "
     else
