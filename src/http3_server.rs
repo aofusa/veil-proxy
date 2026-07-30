@@ -17,20 +17,27 @@
 //! - プロキシ機能（HTTPSバックエンドへのプロトコル変換）
 //! - ファイル配信、リダイレクト、メトリクス
 
-// AsRawFd は memfd 経由の証明書リロード（Linux / FreeBSD）と、Linux + io_uring の
+// AsRawFd は **パス経由の証明書ロード**（memfd / 一時ファイル）と、Linux + io_uring の
 // UDP パイプライン（`PipelinedUdpRecv` / `UringUdpSend`）でのみ使用する。
-// macOS / OpenBSD / Windows では未使用になるため cfg で絞る（unused_imports 警告対策）。
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+// F-136 で非 Linux は in-memory SSL_CTX 経路へ移ったため、FreeBSD では
+// `system-tls`（= パス経由へフォールバックする構成）のときだけ必要になる。
+// 条件がずれると未使用 import の warning になる（FreeBSD 実機ビルドで検出）。
+#[cfg(any(target_os = "linux", feature = "system-tls"))]
 use crate::runtime::handle::AsRawFd;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
-// CString / AsRawFd / FromRawFd は memfd 経由の証明書リロード（Linux / FreeBSD）でのみ
-// 使用する。OpenBSD は一時ファイルフォールバックのため不要（`create_memfd_for_pem` 参照）。
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+// CString / FromRawFd / Seek / Write は **パス経由の証明書ロード**
+// （`create_memfd_for_pem` / `create_temp_pem_file`）でのみ使う。
+// F-136 で非 Linux は in-memory SSL_CTX 経路へ移ったため、これらが必要なのは
+// **関数本体と同じ `any(target_os = "linux", feature = "system-tls")`** のときだけ。
+// 条件がずれると未使用 import の warning になる（FreeBSD 実機ビルドで検出）。
+#[cfg(any(target_os = "linux", feature = "system-tls"))]
 use std::ffi::CString;
-use std::io::{self, Seek, Write as IoWrite};
+use std::io::{self};
+#[cfg(any(target_os = "linux", feature = "system-tls"))]
+use std::io::{Seek, Write as IoWrite};
 use std::net::SocketAddr;
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", feature = "system-tls"))]
 use std::os::unix::io::FromRawFd;
 use std::path::Path;
 use std::rc::Rc;
