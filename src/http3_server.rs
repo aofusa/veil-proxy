@@ -92,6 +92,7 @@ fn h3_request_header_block_size(headers: &[h3::Header]) -> usize {
 /// `create_memfd_for_pem` が一時ファイルフォールバック（Drop で unlink）を使うため、
 /// 本関数は memfd を持つターゲットでのみコンパイルする。
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", feature = "system-tls"))]
 fn memfd_create_secure(name: &str) -> io::Result<std::fs::File> {
     let c_name = CString::new(name).map_err(|e| {
         io::Error::new(
@@ -124,6 +125,7 @@ fn memfd_create_secure(name: &str) -> io::Result<std::fs::File> {
 /// FreeBSD ではファイルシーリングが非対応で `fcntl(F_ADD_SEALS)` が失敗し得るが、
 /// 呼び出し側はシール失敗を警告のみで許容する（致命的でない）。
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", feature = "system-tls"))]
 fn apply_memfd_seals(fd: i32) -> io::Result<()> {
     // F_ADD_SEALS = 1033
     // F_SEAL_SEAL = 1 (これ以上シールを追加できなくする)
@@ -175,6 +177,7 @@ fn apply_memfd_seals(fd: i32) -> io::Result<()> {
 ///   フォールバックへ落とす（B-50）。
 /// - OpenBSD / macOS: `memfd_create(2)` が無いため 0600 権限の一時ファイルへフォールバックし、
 ///   **Drop で必ず unlink** して機密がディスクに滞留しないようにする（F-125）。
+#[cfg(any(target_os = "linux", feature = "system-tls"))]
 struct PemBackedFile {
     _file: std::fs::File,
     /// 一時ファイルフォールバックのときだけ `Some`（Drop で unlink する）。
@@ -183,6 +186,7 @@ struct PemBackedFile {
     temp_path: Option<std::path::PathBuf>,
 }
 
+#[cfg(any(target_os = "linux", feature = "system-tls"))]
 impl Drop for PemBackedFile {
     fn drop(&mut self) {
         #[cfg(not(target_os = "linux"))]
@@ -195,6 +199,7 @@ impl Drop for PemBackedFile {
 }
 
 #[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", feature = "system-tls"))]
 fn create_memfd_for_pem(name: &str, pem_data: &[u8]) -> io::Result<(PemBackedFile, String)> {
     // memfd を作成（セキュリティフラグ付き）
     let mut memfd = memfd_create_secure(name)?;
@@ -242,6 +247,7 @@ fn create_memfd_for_pem(name: &str, pem_data: &[u8]) -> io::Result<(PemBackedFil
 /// capability mode（`cap_enter`）下では両方とも失敗し得るが、HTTP/3 ワーカーの
 /// 証明書ロードは `cap_enter` より前に実行される（F-123）。
 #[cfg(target_os = "freebsd")]
+#[cfg(any(target_os = "linux", feature = "system-tls"))]
 fn create_memfd_for_pem(name: &str, pem_data: &[u8]) -> io::Result<(PemBackedFile, String)> {
     let mut memfd = memfd_create_secure(name)?;
     memfd.write_all(pem_data)?;
@@ -285,6 +291,7 @@ fn create_memfd_for_pem(name: &str, pem_data: &[u8]) -> io::Result<(PemBackedFil
 /// OpenBSD / macOS 版: `memfd_create(2)` が無いため 0600 権限の一時ファイルへ PEM を
 /// 書き込み、その実パスを返す（Drop で unlink）。
 #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+#[cfg(any(target_os = "linux", feature = "system-tls"))]
 fn create_memfd_for_pem(name: &str, pem_data: &[u8]) -> io::Result<(PemBackedFile, String)> {
     create_temp_pem_file(name, pem_data)
 }
@@ -298,6 +305,7 @@ fn create_memfd_for_pem(name: &str, pem_data: &[u8]) -> io::Result<(PemBackedFil
 /// `(allow file-write* (subpath tmp))` を許可する保守的なプロファイルのため、一時ファイル
 /// 書き込みは通常ブロックされない）。
 #[cfg(not(target_os = "linux"))]
+#[cfg(any(target_os = "linux", feature = "system-tls"))]
 fn create_temp_pem_file(name: &str, pem_data: &[u8]) -> io::Result<(PemBackedFile, String)> {
     // OpenOptionsExt は下の `#[cfg(unix)]` ブロック内で use する（ここで先に use すると
     // 非 unix ターゲットで未使用になり unused_imports 警告になる）。

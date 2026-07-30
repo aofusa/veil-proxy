@@ -864,6 +864,14 @@ _guest_env_prefix() {
         # 非対話 ssh セッションには既定で /usr/pkg/{bin,sbin} が PATH に無い。
         pre='LIBCLANG_PATH=$(find /usr/pkg -name "libclang.so*" 2>/dev/null | head -1 | xargs dirname)'
         pre="${pre} PATH=/usr/pkg/bin:/usr/pkg/sbin:/usr/sbin:/sbin:\$PATH"
+        # F-140/F-137: `system-tls`（`full-netbsd`）は **pkgsrc の LibreSSL** を使う。
+        # NetBSD base の OpenSSL 3.0.12 には BoringSSL 系の QUIC API
+        # （`SSL_set_quic_method` / `SSL_provide_quic_data` 等）が無く、quiche のリンクが
+        # undefined reference で失敗する（実機で確認）。pkgsrc の libressl-4.1.0 は
+        # 同 API を実装しており（`ssl.h` に 7 箇所）、OpenBSD と同じ構図になる。
+        # LibreSSL は base と衝突しないよう `/usr/pkg/libressl` の独立プレフィックスへ
+        # 入るため、pkg-config をそちらへ向ける。
+        pre="${pre} PKG_CONFIG_PATH=/usr/pkg/libressl/lib/pkgconfig"
     fi
     echo "${pre}"
 }
