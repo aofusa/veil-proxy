@@ -247,3 +247,26 @@ curl -sIL <各 URL>                                     # すべて HTTP 200（3
 ```
 
 shellcheck は本環境に未導入のため未実施（コーディネーター環境で確認推奨）。
+
+
+## 検証状況（2026-07-30 時点）
+
+| 対象 | 状態 |
+|---|---|
+| NetBSD x86_64 | **実機ビルド成功**（`full-netbsd`、release 35分34秒、warning 0）。E2E 実施 |
+| NetBSD aarch64 | **未検証（今回のスコープ外）**。`tools/qemu/bsd-vm.sh netbsd aarch64` の配線と
+  `netbsd-autoinstall.py` は用意済みだが、実 ISO に対する sysinst のキー送出は未調整。
+  aarch64 は wasm 非対応（wasmtime）に加え検証時間が長いため、今回は見送った |
+
+### x86_64 で必要だった前提パッケージ（実機で確定）
+
+```
+pkgin install rust-bin cmake llvm clang libressl protobuf gmake bash curl git nasm pkgconf
+```
+
+- `rust-bin` — ソースの `rust` は QEMU 上で数時間かかる
+- **`clang`** — pkgsrc では `llvm` と別パッケージ。`llvm` だけでは `/usr/pkg/lib/libclang.so`
+  が入らず bindgen が `Unable to find libclang` で失敗する（FreeBSD/OpenBSD の llvm とは構成が違う）
+- `pkgconf` — base に `pkg-config` コマンドが無く `openssl-sys` が失敗する
+- `libressl` — `system-tls` 利用時のみ。ただし **`system-tls` は HTTP/3 と併用不可**
+  （F-137/F-142 参照）なので、既定の `full-netbsd`（vendored）では不要

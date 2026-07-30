@@ -145,8 +145,8 @@ tools/qemu/bsd-vm.sh freebsd x86_64 all
 | OpenBSD x86_64: `fetch` → `build-bsd.sh` | **成功**（`veil-0.6.0-x86_64-unknown-openbsd.tar.gz` を生成） |
 | OpenBSD x86_64: `e2e` | **530 passed / 3 failed・SIGSEGV なし**（B-51 / B-52 / B-53 / B-54 修正後。全 533 件が実行される）。残り 3 件はいずれもタイムアウト系の負荷起因フレークで、単体実行では 3 件とも通る |
 | OpenBSD aarch64 | **未実行**（スクリプトは同経路で対応済み。TCG のため長時間） |
-| NetBSD x86_64（F-140） | **setup / up / provision まで実測済み**（SSH 到達確認、`uname -a` = NetBSD 10.1 amd64）。toolchain / build / e2e は実施中。下記「NetBSD で踏んだ落とし穴」参照 |
-| NetBSD aarch64（F-140） | **未実行**（ISO からの sysinst 自動操作は未検証） |
+| NetBSD x86_64（F-140） | **setup / provision / toolchain / build まで実機で成功**（`NetBSD 10.1 amd64`、release ビルド 35分34秒・warning 0）。e2e は実施中。下記「NetBSD で踏んだ落とし穴」参照 |
+| NetBSD aarch64（F-140） | **未検証**（今回のスコープ外。ISO からの sysinst 自動操作は実機未確認で、`netbsd-autoinstall.py` のキー送出は実 ISO に対して調整が要る見込み。x86_64 は実機で build 成功済み） |
 | `linux-aarch64-e2e.sh` | **未実行**（KVM 非対応ホストでは TCG が実用不能） |
 
 ### FreeBSD amd64 で踏んだ落とし穴（すべて実測。再発しやすいので残す）
