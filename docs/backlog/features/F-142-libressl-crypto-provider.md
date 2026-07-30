@@ -1,5 +1,20 @@
 # F-142: LibreSSL 対応 rustls CryptoProvider の自作
 
+## 取り下げ（Withdrawn、2026-07-30）
+
+**本チケットの実装はユーザー判断により F-137 と合わせて撤回済み。**
+`src/tls_provider/libressl/` は削除し、`src/tls_provider/mod.rs` は単一ファイル
+`src/tls_provider.rs` に戻した。`vendored-tls` feature（同梱 aws-lc-rs/aws-lc-sys を
+optional 化する仕組み）も削除し、rustls の暗号プロバイダは再び target_os のみで決まる
+無条件依存（F-122 の状態）に戻している。
+
+以下は撤回前の設計・実装記録として残す。`rustls-openssl` crate が OpenSSL 3.x の
+provider/FIPS API に依存し LibreSSL でコンパイルできないという実機知見（NetBSD で
+確認）、および自作 `CryptoProvider` の実装方針（`openssl` クレートのクラシック API
+のみを使う設計）は、将来同様の検討をする際の参考資料として価値がある。
+
+---
+
 ## 目的
 
 `system-tls`（F-137/F-140）は当初 `rustls-openssl` 0.3.1 crate を使う設計だったが、

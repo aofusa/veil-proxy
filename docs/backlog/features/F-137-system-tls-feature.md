@@ -1,5 +1,22 @@
 # F-137: `system-tls` feature（rustls / quiche のシステム SSL 動的リンク）
 
+## 取り下げ（Withdrawn、2026-07-30）
+
+**本チケットの実装はユーザー判断により撤回済み。** `system-tls`/`vendored-tls`/
+`openbsd-vendor-tls`/`netbsd-vendor-tls` などの feature、`build.rs` の排他チェック、
+`src/tls_provider/libressl/` は全て削除し、rustls は aws-lc-rs（Linux/FreeBSD/macOS/
+Windows）/ ring（OpenBSD/NetBSD）の無条件依存、quiche は常に同梱（Linux は共有
+aws-lc-sys、それ以外は `boringssl-boring-crate`）というシンプルな構成へ巻き戻した
+（F-136 の capsicum/pledge 下の証明書ホットリロードはそのまま維持）。
+
+以下は撤回前の設計・実装記録として残す。実機で判明した知見（quiche が quictls 専用の
+QUIC API（`SSL_set_quic_method` 等）を要求しバニラ OpenSSL 3.x では動かないこと、
+`rustls-openssl` が OpenSSL 3.x の provider/FIPS API に依存し LibreSSL でコンパイル
+できないこと、aws-lc-sys の静的ライブラリがシステム libssl/libcrypto をリンカの `-L`
+探索順で遮蔽する構造的な問題など）は、将来同様の検討をする際の参考資料として価値がある。
+
+---
+
 ## 目的
 
 `--features system-tls` で、rustls（H1/H2 の TLS 終端）が **システムの SSL ライブラリ

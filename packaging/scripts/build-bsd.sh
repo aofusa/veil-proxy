@@ -237,8 +237,7 @@ else
   # NetBSD には pledge/unveil 相当のランタイム API が無い（F-140）。veil が
   # 提供できるのは chroot(2)（config.toml の [security] chroot_dir）+
   # setuid/setgid による特権降格 + rlimit のみ。
-  # TLS は既定で rustls の ring プロバイダ + system-tls（システムの OpenSSL/
-  # LibreSSL へ動的リンク、full-netbsd）。従来の同梱構成は full-netbsd-vendor。
+  # TLS は rustls の ring プロバイダ + quiche 同梱 BoringSSL（full-netbsd）で動作する。
 EOF
 fi
 

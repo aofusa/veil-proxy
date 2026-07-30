@@ -120,9 +120,8 @@ RUST_TARGET=aarch64-unknown-linux-gnu ./packaging/scripts/build.sh --docker
 
 ### NetBSD 対応の現状（F-140）
 
-NetBSD 向けの feature セット（`full-netbsd`/`full-netbsd-vendor`/`full-netbsd-aarch64`/
-`full-netbsd-aarch64-vendor`、`system-tls`/TLS プロバイダの target 別分岐、
-kqueue reactor の `struct kevent` 型差吸収）は **コード側は完成済み**。
+NetBSD 向けの feature セット（`full-netbsd`/`full-netbsd-aarch64`、TLS プロバイダの
+target 別分岐、kqueue reactor の `struct kevent` 型差吸収）は **コード側は完成済み**。
 `tools/qemu/bsd-vm.sh`（`netbsd` os として追加）・`packaging/scripts/build-bsd.sh`・
 `packaging/bsd/netbsd/veil.rc` の組み込みも完了しており、以下の FreeBSD/OpenBSD 節と
 同じインタフェースで NetBSD も扱える。2026-07-29 に NetBSD 10.1 amd64 の実機（QEMU）で
@@ -135,18 +134,10 @@ setup/provision まで確認済み。詳細・既知の不確実点は
 > （NetBSD 10.1 amd64）で確認したところ **x86_64 ですら** `compile_error!
 > ("unsupported platform")` でビルドできない。FreeBSD/OpenBSD は aarch64 のみ
 > 非対応（別途 `full-freebsd-aarch64`/`full-openbsd-aarch64` あり）だが、NetBSD は
-> アーキテクチャ不問で非対応のため、`full-netbsd`/`full-netbsd-vendor`/
-> `full-netbsd-aarch64`/`full-netbsd-aarch64-vendor` の**全て**が `wasm` を含まない。
-> つまり NetBSD 向けにビルドした `veil` バイナリでは Proxy-Wasm 拡張フィルタは
-> 使えない。詳細は
+> アーキテクチャ不問で非対応のため、`full-netbsd`/`full-netbsd-aarch64` の**両方**が
+> `wasm` を含まない。つまり NetBSD 向けにビルドした `veil` バイナリでは Proxy-Wasm
+> 拡張フィルタは使えない。詳細は
 > [`docs/backlog/bugs/B-55-wasmtime-no-bsd-aarch64.md`](../docs/backlog/bugs/B-55-wasmtime-no-bsd-aarch64.md)。
->
-> **`system-tls`（NetBSD の既定構成）のビルドには `pkgconf` の導入が必須**（実機で
-> 確認済み）: NetBSD base には OpenSSL 3.0.12 と `/usr/lib/pkgconfig/openssl.pc` が
-> 既にあるが、`pkg-config` コマンド自体は base に含まれておらず pkgsrc の `pkgconf`
-> パッケージが要る。無いと `openssl-sys` のビルドスクリプトが `Could not find
-> directory of OpenSSL installation` で失敗する。`tools/qemu/bsd-vm.sh` の NetBSD
-> `cmd_toolchain` は `pkgin install` 対象に `pkgconf` を含めている。
 
 ### FreeBSD / OpenBSD / NetBSD 向けパッケージ（F-120 Phase 6 / F-140）
 
@@ -231,19 +222,8 @@ FreeBSD 専用 I/O 経路だけが異なる**。cargo にはターゲット別�
 |---|---|---|---|
 | `full`（既定） | mimalloc | — | Linux / macOS / Windows |
 | `full-freebsd` | **jemalloc** | **`aio`**（POSIX AIO 経路、F-127） | `build-cross.sh --target freebsd` / `bsd-vm.sh freebsd …` |
-| `full-openbsd` | **システムアロケータ**（`global_allocator` を差し替えない） | **`system-tls`**（F-137、システムの LibreSSL へ動的リンク） | `bsd-vm.sh openbsd …`（既定） |
-| `full-openbsd-vendor` | 同上 | 従来の同梱構成（rustls+ring / quiche+BoringSSL 同梱） | `CARGO_FEATURES=full-openbsd-vendor` を明示指定 |
-| `full-netbsd` | システムアロケータ | `system-tls`（F-140、OpenBSD と同じ扱い）。**`wasm` は含まない**（B-55） | `bsd-vm.sh netbsd …`（既定。実 VM 検証は未実施、上記「NetBSD 対応の現状」参照） |
-| `full-netbsd-vendor` | 同上 | 従来の同梱構成（rustls+ring / quiche+BoringSSL 同梱）。**`wasm` は含まない**（B-55） | `CARGO_FEATURES=full-netbsd-vendor` を明示指定 |
-
-**F-137: OpenBSD の既定は `system-tls`**。OpenBSD ベースの LibreSSL（`libssl.pc`/
-`libcrypto.pc`）へ動的リンクし、vendored な暗号ライブラリ（quiche の BoringSSL cmake
-ビルドを含む）を避ける。`rustls` 側は `rustls-openssl` crate（`vendored` feature は
-不使用）、HTTP/3(quiche) 側は `openssl` feature（pkg-config 経由）。OpenBSD の quiche
-依存は Linux の `aws-lc-sys` 共有から完全に切り離してあるため、Linux/FreeBSD で
-同種の組み合わせを試すとリンクが壊れる（`docs/backlog/features/F-137-system-tls-feature.md`
-参照）のに対し OpenBSD では問題なく動く。従来の同梱（vendored）構成が必要な場合は
-`full-openbsd-vendor`（aarch64 は `full-openbsd-aarch64-vendor`）を使う。
+| `full-openbsd` | **システムアロケータ**（`global_allocator` を差し替えない） | 同梱 rustls(ring)/quiche(BoringSSL) | `bsd-vm.sh openbsd …`（既定） |
+| `full-netbsd` | システムアロケータ | 同梱 rustls(ring)/quiche(BoringSSL)。**`wasm` は含まない**（B-55） | `bsd-vm.sh netbsd …`（既定。実 VM 検証は未実施、上記「NetBSD 対応の現状」参照） |
 
 通常の `cargo build --features full` の挙動は従来どおり（mimalloc・AIO 無効）で変わらない。
 `CARGO_FEATURES` 環境変数で上書きもできる。
@@ -280,10 +260,8 @@ tar.gz には `veil` バイナリ・`rc.d/veil`（サービススクリプト）
 （ABI 互換の目安。大きく異なる OS バージョンでは再ビルド推奨）。
 FreeBSD は capsicum（`[security] enable_capsicum`）・jail と、OpenBSD は
 pledge/unveil（`[security] enable_pledge` / `enable_unveil`）と併用できる。
-OpenBSD の TLS は既定で `system-tls`（F-137、システムの LibreSSL へ動的リンク）を使い、
+OpenBSD の TLS は rustls ring プロバイダ + quiche 同梱 BoringSSL 構成（F-122）を使い、
 `full-openbsd`（HTTP/3 を含む。アロケータはシステム malloc）でのビルドに対応している。
-従来の rustls ring プロバイダ + quiche 同梱 BoringSSL 構成（F-122）は `full-openbsd-vendor`
-で引き続き利用できる。
 静的配信/プロキシとも HTTPS 200 で動作する（pledge+unveil 有効のまま）。
 
 > **OpenBSD の WASM について（B-52）**: OpenBSD では wasm を wasmtime の

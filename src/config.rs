@@ -1476,16 +1476,6 @@ pub fn collect_unveil_paths(config_path: &Path) -> io::Result<UnveilPaths> {
         push_unveil_parent_dir(&mut read_write_create, file_path);
     }
 
-    // F-136/F-137: system-tls 有効時、OpenBSD の HTTP/3(quiche) は `boringssl-boring-crate`
-    // の in-memory SSL_CTX API ではなくパス指定 API（`create_memfd_for_pem` 相当の一時ファイル
-    // 経由）にフォールバックする（`src/http3_server.rs::new_quic_config_with_certs` の
-    // `cfg(any(target_os = "linux", feature = "system-tls"))` 分岐）。unveil のビューに
-    // 一時ディレクトリが無いと一時ファイルの作成が `ENOENT`/`EPERM` 相当で失敗し、初回ロード・
-    // 証明書ホットリロードとも恒常的に失敗する。`pledge` の promise には既に `wpath cpath` が
-    // 含まれているため、こちらは変更不要。
-    #[cfg(feature = "system-tls")]
-    read_write_create.push(std::env::temp_dir());
-
     Ok(UnveilPaths {
         read_only,
         read_write_create,

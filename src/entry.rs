@@ -1012,22 +1012,6 @@ pub fn run() {
                                         e
                                     ),
                                 }
-                                // F-137: system-tls 有効時、HTTP/3（quiche）の証明書ロードは
-                                // in-memory SSL_CTX API（boring）ではなく従来のパス経由
-                                // （fopen(3) 相当）にフォールバックする（Cargo.toml の
-                                // `system-tls` feature コメント参照）。dirfd 相対 openat/fstatat
-                                // は veil 自身の `read_pem`/`pem_mtime` チョークポイントのみを
-                                // 経由するため、quiche/BoringSSL/OpenSSL が内部で直接呼ぶ
-                                // `fopen(3)`（＝素の `open(2)`）は capability mode 下で
-                                // `ECAPMODE` になり回避できない。H1/H2（rustls、常にバイト列
-                                // 読み込み）のホットリロードは影響を受けない。
-                                #[cfg(all(feature = "system-tls", feature = "http3"))]
-                                warn!(
-                                    "capsicum: `system-tls` + `http3` 構成では HTTP/3 の証明書 \
-                                     ホットリロードは capability mode 下で機能しない（quiche が \
-                                     内部で fopen(3)/open(2) を直接呼ぶため dirfd 経由の openat \
-                                     で代替できない）。H1/H2 のホットリロードは引き続き機能する"
-                                );
                             }
                             match crate::security::capsicum::enter_capability_mode() {
                                 Ok(()) => info!(

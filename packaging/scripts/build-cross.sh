@@ -13,8 +13,7 @@
 #
 # BSD 向けは `full` ではなく `full-freebsd`（jemalloc + POSIX AIO）を既定にする。
 # OpenBSD（VM ネイティブビルド、tools/qemu/bsd-vm.sh）は `full-openbsd`
-# （システムアロケータ + system-tls、F-137: システムの LibreSSL へ動的リンク）を使う。
-# 従来の同梱（vendored）構成が必要な場合は `full-openbsd-vendor` を明示指定する。
+# （システムアロケータ + 同梱 rustls(ring)/quiche(BoringSSL)）を使う。
 #
 # 各 Dockerfile は Dockerfile.glibc と同じ cacher/builder 2 段構成のため、
 # ソース変更だけの再ビルドでは aws-lc-sys / boring-sys（quiche 内蔵 BoringSSL）の

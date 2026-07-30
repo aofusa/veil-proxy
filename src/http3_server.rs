@@ -17,20 +17,23 @@
 //! - プロキシ機能（HTTPSバックエンドへのプロトコル変換）
 //! - ファイル配信、リダイレクト、メトリクス
 
-// AsRawFd は memfd 経由の証明書リロード（Linux / FreeBSD）と、Linux + io_uring の
+// AsRawFd は memfd 経由の証明書リロード（Linux）と、Linux + io_uring の
 // UDP パイプライン（`PipelinedUdpRecv` / `UringUdpSend`）でのみ使用する。
-// macOS / OpenBSD / Windows では未使用になるため cfg で絞る（unused_imports 警告対策）。
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+// 非 Linux（FreeBSD/OpenBSD/NetBSD/macOS/Windows）では未使用になるため cfg で絞る
+// （unused_imports 警告対策。F-136 で非 Linux は in-memory SSL_CTX 経路へ移った）。
+#[cfg(target_os = "linux")]
 use crate::runtime::handle::AsRawFd;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
-// CString / AsRawFd / FromRawFd は memfd 経由の証明書リロード（Linux / FreeBSD）でのみ
-// 使用する。OpenBSD は一時ファイルフォールバックのため不要（`create_memfd_for_pem` 参照）。
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+// CString / FromRawFd / Seek / Write は memfd 経由の証明書リロード（Linux 専用）でのみ
+// 使用する。
+#[cfg(target_os = "linux")]
 use std::ffi::CString;
-use std::io::{self, Seek, Write as IoWrite};
+use std::io::{self};
+#[cfg(target_os = "linux")]
+use std::io::{Seek, Write as IoWrite};
 use std::net::SocketAddr;
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(target_os = "linux")]
 use std::os::unix::io::FromRawFd;
 use std::path::Path;
 use std::rc::Rc;
@@ -88,11 +91,10 @@ fn h3_request_header_block_size(headers: &[h3::Header]) -> usize {
 /// - MFD_CLOEXEC: exec() 時に自動的に閉じる（fd リーク防止）
 /// - MFD_ALLOW_SEALING: 書き込み後にシールを適用可能にする
 ///
-/// `memfd_create(2)` は Linux / FreeBSD 13+ にあるが OpenBSD には無い。OpenBSD では
-/// `create_memfd_for_pem` が一時ファイルフォールバック（Drop で unlink）を使うため、
-/// 本関数は memfd を持つターゲットでのみコンパイルする。
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
-#[cfg(any(target_os = "linux", feature = "system-tls"))]
+/// `memfd_create(2)` は Linux にある。非 Linux（FreeBSD/OpenBSD/NetBSD/macOS/Windows）は
+/// quiche の in-memory `SSL_CTX` API（`with_boring_ssl_ctx_builder`）を使うため、
+/// memfd 自体が不要（F-136）。本関数は Linux のみでコンパイルする。
+#[cfg(target_os = "linux")]
 fn memfd_create_secure(name: &str) -> io::Result<std::fs::File> {
     let c_name = CString::new(name).map_err(|e| {
         io::Error::new(
@@ -121,11 +123,8 @@ fn memfd_create_secure(name: &str) -> io::Result<std::fs::File> {
 /// これにより、攻撃者が memfd の内容を書き換えて不正な証明書を
 /// 注入することを防止できます。
 ///
-/// memfd を持つターゲット（Linux / FreeBSD 13+）でのみコンパイルする。
-/// FreeBSD ではファイルシーリングが非対応で `fcntl(F_ADD_SEALS)` が失敗し得るが、
-/// 呼び出し側はシール失敗を警告のみで許容する（致命的でない）。
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
-#[cfg(any(target_os = "linux", feature = "system-tls"))]
+/// memfd を持つ Linux でのみコンパイルする（F-136）。
+#[cfg(target_os = "linux")]
 fn apply_memfd_seals(fd: i32) -> io::Result<()> {
     // F_ADD_SEALS = 1033
     // F_SEAL_SEAL = 1 (これ以上シールを追加できなくする)
@@ -151,7 +150,10 @@ fn apply_memfd_seals(fd: i32) -> io::Result<()> {
 
 /// PEM データを memfd に書き込み、quiche へ渡すパスを返す（セキュリティ強化版）
 ///
-/// Linux は `/proc/self/fd/<fd>`。他 OS の扱いは各 `create_memfd_for_pem` を参照。
+/// Linux 専用: `/proc/self/fd/<fd>` 経由・FS 非経由。非 Linux（FreeBSD/OpenBSD/NetBSD/
+/// macOS/Windows）は quiche の in-memory `SSL_CTX` API（`with_boring_ssl_ctx_builder`）を
+/// 使うため、本関数自体が不要（`new_quic_config_with_certs`/`reload_quiche_certs` の
+/// `#[cfg(not(target_os = "linux"))]` 実装を参照、F-136）。
 ///
 /// この関数は以下のことを行います：
 /// 1. memfd_create で匿名ファイルを作成（MFD_CLOEXEC + MFD_ALLOW_SEALING）
@@ -168,38 +170,12 @@ fn apply_memfd_seals(fd: i32) -> io::Result<()> {
 /// ## 注意
 /// 戻り値の File オブジェクトはスコープ内で保持し続ける必要があります。
 /// ドロップされると fd が閉じられ、パスが無効になります。
-/// PEM を載せたファイルと、quiche がそれを読むためのパスのラッパ。
-///
-/// - Linux: `memfd`（`/proc/self/fd/<fd>` 経由・FS 非経由）。Drop は fd を
-///   閉じるだけ（匿名メモリのため後始末不要）。
-/// - FreeBSD: `memfd_create(2)` はあるが **`/proc` は既定でマウントされない**ため、
-///   fdescfs（`/dev/fd`）が使えるときだけ memfd をパス経由で渡し、駄目なら一時ファイル
-///   フォールバックへ落とす（B-50）。
-/// - OpenBSD / macOS: `memfd_create(2)` が無いため 0600 権限の一時ファイルへフォールバックし、
-///   **Drop で必ず unlink** して機密がディスクに滞留しないようにする（F-125）。
-#[cfg(any(target_os = "linux", feature = "system-tls"))]
+#[cfg(target_os = "linux")]
 struct PemBackedFile {
     _file: std::fs::File,
-    /// 一時ファイルフォールバックのときだけ `Some`（Drop で unlink する）。
-    /// Linux は常に memfd 経由なのでフィールド自体を持たない。
-    #[cfg(not(target_os = "linux"))]
-    temp_path: Option<std::path::PathBuf>,
-}
-
-#[cfg(any(target_os = "linux", feature = "system-tls"))]
-impl Drop for PemBackedFile {
-    fn drop(&mut self) {
-        #[cfg(not(target_os = "linux"))]
-        if let Some(path) = self.temp_path.as_ref() {
-            // 機密（秘密鍵/証明書）をディスクに残さない。close 前の unlink で
-            // 名前を外し、fd クローズ時に実体が解放される。
-            let _ = std::fs::remove_file(path);
-        }
-    }
 }
 
 #[cfg(target_os = "linux")]
-#[cfg(any(target_os = "linux", feature = "system-tls"))]
 fn create_memfd_for_pem(name: &str, pem_data: &[u8]) -> io::Result<(PemBackedFile, String)> {
     // memfd を作成（セキュリティフラグ付き）
     let mut memfd = memfd_create_secure(name)?;
@@ -230,134 +206,19 @@ fn create_memfd_for_pem(name: &str, pem_data: &[u8]) -> io::Result<(PemBackedFil
     Ok((PemBackedFile { _file: memfd }, proc_path))
 }
 
-/// FreeBSD 版（B-50）。
+/// PEM バイト列から証明書・秘密鍵を設定した新規 `quiche::Config` を構築する（F-136）。
 ///
-/// FreeBSD にも `memfd_create(2)`（13+）はあるが、**`/proc` は既定でマウントされない**
-/// （`procfs(5)` は非推奨扱い）。そのため Linux と同じ `/proc/self/fd/<fd>` を quiche へ
-/// 渡すと `load_cert_chain_from_pem_file` が失敗し、`run_http3_server` が起動直後に
-/// Err で終了して **QUIC の UDP ソケットが一切 bind されない**（= HTTP/3 が全滅する）。
-///
-/// FreeBSD で fd をパス化できるのは fdescfs（`/dev/fd`）だが、これも既定ではマウント
-/// されず `/dev/fd/{0,1,2}` しか見えない。したがって:
-///
-/// 1. memfd に PEM を載せ、`/dev/fd/<fd>` が**実際に読めるか**を確認する
-///    （= fdescfs がマウントされている）。読めればそのパスを使う（FS 非経由・最良）。
-/// 2. 読めなければ 0600 の一時ファイルへフォールバックする（Drop で unlink）。
-///
-/// capability mode（`cap_enter`）下では両方とも失敗し得るが、HTTP/3 ワーカーの
-/// 証明書ロードは `cap_enter` より前に実行される（F-123）。
-#[cfg(target_os = "freebsd")]
-#[cfg(any(target_os = "linux", feature = "system-tls"))]
-fn create_memfd_for_pem(name: &str, pem_data: &[u8]) -> io::Result<(PemBackedFile, String)> {
-    let mut memfd = memfd_create_secure(name)?;
-    memfd.write_all(pem_data)?;
-    memfd.seek(io::SeekFrom::Start(0))?;
-
-    let fd = memfd.as_raw_fd();
-    let dev_fd_path = format!("/dev/fd/{}", fd);
-
-    // fdescfs が無いと `/dev/fd/<fd>`（fd >= 3）は存在しない。open できるかで判定する。
-    // 起動時とホットリロード時のみのコールドパス。
-    #[allow(clippy::disallowed_methods)] // 起動/リロードのコールドパス（ホットパスではない）
-    let dev_fd_usable = std::fs::File::open(&dev_fd_path).is_ok();
-
-    if dev_fd_usable {
-        if let Err(e) = apply_memfd_seals(fd) {
-            warn!(
-                "[HTTP/3] Failed to apply memfd seals: {} (continuing without seals)",
-                e
-            );
-        } else {
-            debug!("[HTTP/3] memfd seals applied: WRITE|SHRINK|GROW|SEAL");
-        }
-        debug!("[HTTP/3] PEM path via fdescfs: {}", dev_fd_path);
-        return Ok((
-            PemBackedFile {
-                _file: memfd,
-                temp_path: None,
-            },
-            dev_fd_path,
-        ));
-    }
-
-    debug!(
-        "[HTTP/3] fdescfs (/dev/fd) unavailable; falling back to a 0600 temp file for '{}'",
-        name
-    );
-    drop(memfd);
-    create_temp_pem_file(name, pem_data)
-}
-
-/// OpenBSD / macOS 版: `memfd_create(2)` が無いため 0600 権限の一時ファイルへ PEM を
-/// 書き込み、その実パスを返す（Drop で unlink）。
-#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-#[cfg(any(target_os = "linux", feature = "system-tls"))]
-fn create_memfd_for_pem(name: &str, pem_data: &[u8]) -> io::Result<(PemBackedFile, String)> {
-    create_temp_pem_file(name, pem_data)
-}
-
-/// 0600 権限の一時ファイルへ PEM を書き込み、その実パスを返す（Drop で unlink）。
-///
-/// 証明書ホットリロードは数ヶ月に 1 回のコールドパスのため一時ファイル経由でも性能影響は
-/// ない。OpenBSD の `unveil` 有効時は一時ディレクトリが unveil 対象外だと作成に失敗し得る
-/// が、その場合リロードは警告付きでスキップされ既存証明書のまま稼働を継続する（非致命）。
-/// macOS には unveil 相当の制約は無い（F-125: sandbox_init は
-/// `(allow file-write* (subpath tmp))` を許可する保守的なプロファイルのため、一時ファイル
-/// 書き込みは通常ブロックされない）。
-#[cfg(not(target_os = "linux"))]
-#[cfg(any(target_os = "linux", feature = "system-tls"))]
-fn create_temp_pem_file(name: &str, pem_data: &[u8]) -> io::Result<(PemBackedFile, String)> {
-    // OpenOptionsExt は下の `#[cfg(unix)]` ブロック内で use する（ここで先に use すると
-    // 非 unix ターゲットで未使用になり unused_imports 警告になる）。
-
-    // 衝突しにくい一意名（pid + 単調カウンタ）。O_EXCL で既存ファイルを掴まない。
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut temp_path = std::env::temp_dir();
-    temp_path.push(format!("veil-{}-{}-{}.pem", name, std::process::id(), seq));
-
-    let mut opts = std::fs::OpenOptions::new();
-    opts.read(true).write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut file = opts.open(&temp_path)?;
-
-    file.write_all(pem_data)?;
-    file.seek(io::SeekFrom::Start(0))?;
-
-    let path_str = temp_path.to_string_lossy().into_owned();
-    Ok((
-        PemBackedFile {
-            _file: file,
-            temp_path: Some(temp_path),
-        },
-        path_str,
-    ))
-}
-
-/// PEM バイト列から証明書・秘密鍵を設定した新規 `quiche::Config` を構築する（F-136/F-137）。
-///
-/// - Linux、または `system-tls`（F-137）有効時: `create_memfd_for_pem`（Linux は
-///   `/proc/self/fd/<fd>` 経由・FS 非経由、他 OS は各 `create_memfd_for_pem` 実装を参照）で
+/// - Linux: `create_memfd_for_pem`（`/proc/self/fd/<fd>` 経由・FS 非経由）で
 ///   一時的にファイル化し、`load_cert_chain_from_pem_file`/`load_priv_key_from_pem_file`
 ///   （パス指定 API、quiche の TLS バックエンドに依存しない汎用 API）へパスとして渡す。
-///   **Linux 経路（`target_os = "linux"`）は F-136/F-137 のいずれでも 1 行も変更しない**
-///   （AGENTS.md「Linux 経路は不変」）。`system-tls` 有効時の非 Linux でこの経路を使う理由は
-///   `Cargo.toml` の `system-tls` feature のコメント参照（quiche の `boringssl-boring-crate`
-///   と `openssl` feature を同時に有効化するとリンクが壊れるため、`with_boring_ssl_ctx_builder`
-///   ではなくパス経由にフォールバックする）。capability mode（FreeBSD capsicum）下では
-///   quiche 側の `fopen(3)` が `ECAPMODE` で失敗するため、この場合 H3 証明書の
-///   *ホットリロード*（初回ロードは cap_enter 前なので影響なし）が機能しなくなる
-///   （`reload_quiche_certs` の呼び出し元で警告を出す）。
-/// - 上記以外（`system-tls` 無効時の FreeBSD/OpenBSD/macOS/Windows）: PEM バイト列から
+///   **Linux 経路（`target_os = "linux"`）は F-136 で 1 行も変更しない**
+///   （AGENTS.md「Linux 経路は不変」）。
+/// - 上記以外（FreeBSD/OpenBSD/NetBSD/macOS/Windows）: PEM バイト列から
 ///   直接 BoringSSL の `SslContextBuilder` を組み、`Config::with_boring_ssl_ctx_builder` で
 ///   ロードする。ファイル・パス・memfd を一切介さないため、FreeBSD capsicum capability
 ///   mode / OpenBSD pledge+unveil のいずれの下でも動作する（設計根拠は
 ///   docs/artifacts/f136_platform_design.md の F-136 節参照）。
-#[cfg(any(target_os = "linux", feature = "system-tls"))]
+#[cfg(target_os = "linux")]
 fn new_quic_config_with_certs(cert_pem: &[u8], key_pem: &[u8]) -> io::Result<Config> {
     let mut quic_config = Config::new(quiche::PROTOCOL_VERSION)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
@@ -390,11 +251,11 @@ fn new_quic_config_with_certs(cert_pem: &[u8], key_pem: &[u8]) -> io::Result<Con
 }
 
 /// PEM バイト列から証明書・秘密鍵を設定した新規 `quiche::Config` を構築する
-/// （F-136、`system-tls` 無効時の Linux 以外）。
+/// （F-136、Linux 以外）。
 ///
 /// `new_quic_config_with_certs` の doc コメント参照。`boringssl-boring-crate` feature
 /// （外部 `boring` crate）でのみ提供される in-memory SSL_CTX API を使う。
-#[cfg(all(not(target_os = "linux"), not(feature = "system-tls")))]
+#[cfg(not(target_os = "linux"))]
 fn new_quic_config_with_certs(cert_pem: &[u8], key_pem: &[u8]) -> io::Result<Config> {
     use boring::pkey::PKey;
     use boring::ssl::{SslContextBuilder, SslMethod};
@@ -493,15 +354,12 @@ fn configure_quic_transport(
 }
 
 /// 稼働中の `quiche::Config` の証明書・秘密鍵を差し替える（F-105 ホットリロード、F-136 で
-/// capability mode 対応、F-137 で system-tls 対応）。
+/// capability mode 対応）。
 ///
-/// - Linux、または `system-tls` 有効時: 既存 `Config` の内部 SSL_CTX に対して
+/// - Linux: 既存 `Config` の内部 SSL_CTX に対して
 ///   `load_cert_chain_from_pem_file`/`load_priv_key_from_pem_file` を呼び直すだけで済む
 ///   （メモリ確保済みの他のトランスポートパラメータは無傷のまま）。**Linux 経路は無変更**。
-///   `system-tls` 有効時の非 Linux で capability mode（FreeBSD capsicum）が有効な場合、
-///   quiche 側の `fopen(3)` が `ECAPMODE` で失敗し**このリロードは失敗する**（初回ロードは
-///   `cap_enter` 前に完了しているため影響しない）。呼び出し元がこの制約を起動時に警告する。
-/// - それ以外（`system-tls` 無効時の非 Linux）: `with_boring_ssl_ctx_builder` は**新しい
+/// - それ以外（非 Linux）: `with_boring_ssl_ctx_builder` は**新しい
 ///   `Config` を構築する** API であり、既存 `Config` の SSL_CTX だけを差し替えることは
 ///   できない。そのため `new_quic_config_with_certs` で新規 `Config` を作り、
 ///   `configure_quic_transport` で初回ロードと同じトランスポートパラメータを再適用した
@@ -516,12 +374,12 @@ fn configure_quic_transport(
 fn reload_quiche_certs(
     quic_config: &Rc<RefCell<Config>>,
     material: &crate::tls_reload::Http3CertMaterial,
-    // Linux / system-tls では未使用（既存 Config の SSL_CTX だけを差し替えるため）。
+    // Linux では未使用（既存 Config の SSL_CTX だけを差し替えるため）。
     // アンダースコア接頭辞はその場合の unused 警告抑制であり、それ以外では通常どおり使用する。
     _transport_config: &Http3ServerConfig,
 ) -> io::Result<()> {
     material.load_into(|cert_pem, key_pem| {
-        #[cfg(any(target_os = "linux", feature = "system-tls"))]
+        #[cfg(target_os = "linux")]
         {
             let mut cfg = quic_config.borrow_mut();
 
@@ -548,7 +406,7 @@ fn reload_quiche_certs(
 
             Ok(())
         }
-        #[cfg(all(not(target_os = "linux"), not(feature = "system-tls")))]
+        #[cfg(not(target_os = "linux"))]
         {
             // F-136: capability mode / pledge+unveil 下でも動作する in-memory 経路。
             // 初回ロードと全く同じ手順で新規 Config を構築し、まるごと差し替える。
@@ -3869,12 +3727,12 @@ pub async fn run_http3_server_async(
     bind_addr: SocketAddr,
     mut config: Http3ServerConfig,
 ) -> io::Result<()> {
-    // TLS 証明書を設定した QUIC 設定を作成する（F-136/F-137）。
+    // TLS 証明書を設定した QUIC 設定を作成する（F-136）。
     //
-    // - Linux、または `system-tls`（F-137）有効時: `new_quic_config_with_certs` が
-    //   memfd/一時ファイル経由でロードする（Linux は `/proc/self/fd/<fd>`、Landlock
-    //   でファイルシステムアクセスを制限しながら HTTP/3 を使用可能）。
-    // - それ以外（`system-tls` 無効時の非 Linux）: PEM バイト列から直接 BoringSSL の
+    // - Linux: `new_quic_config_with_certs` が memfd 経由でロードする
+    //   （`/proc/self/fd/<fd>`、Landlock でファイルシステムアクセスを制限しながら
+    //   HTTP/3 を使用可能）。
+    // - それ以外（非 Linux）: PEM バイト列から直接 BoringSSL の
     //   `SslContextBuilder` を組む in-memory 経路（capsicum capability mode /
     //   pledge+unveil 下でも動作する）。
     //
@@ -3885,7 +3743,7 @@ pub async fn run_http3_server_async(
     {
         info!(
             "[HTTP/3] Loading certificates ({})",
-            if cfg!(any(target_os = "linux", feature = "system-tls")) {
+            if cfg!(target_os = "linux") {
                 "via memfd/temp file (path-based quiche API)"
             } else {
                 "in-memory SSL_CTX, capability-mode compatible"

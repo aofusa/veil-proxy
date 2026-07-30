@@ -96,7 +96,7 @@ io_uring（独自実装ランタイム）と rustls を使用した高性能リ�
 | **Linux `--features epoll`** | epoll readiness reactor（`src/runtime/reactor/`） | seccomp（epoll 系許可・io_uring 系除外）+ Landlock | ✅ | io_uring 非対応ホスト向けフォールバック |
 | **FreeBSD（x86_64/aarch64）** | kqueue readiness reactor（`--features aio` で POSIX AIO 経路にも切替可・F-127） | capsicum（`cap_rights_limit` / `cap_enter`）+ jail | ✅（FreeBSD 13.0+、`TCP_TXTLS_ENABLE`/`TCP_RXTLS_ENABLE`; F-126） | `[security] enable_capsicum` / `capsicum_capability_mode` / `jail_name`。TLS 証明書ホットリロード（H1/H2・HTTP/3 とも）は capsicum capability mode 下でも動作する（F-136）: cert/key の親ディレクトリ fd を `cap_enter` 前に確保し `openat`/`fstatat`（`O_RESOLVE_BENEATH`）で読む。`http3`（quiche）は rustls との `aws-lc-sys` 共有をやめ **`boringssl-boring-crate`**（外部 `boring` crate）へ切替済みで、パスを一切介さない in-memory `SSL_CTX` API で証明書を再構築できる |
 | **OpenBSD（x86_64/aarch64）** | kqueue readiness reactor | pledge + unveil | ✗（ユーザ空間 rustls） | `[security] enable_pledge` / `enable_unveil`。TLS は rustls の **ring** プロバイダを使用（aws-lc-rs は OpenBSD でハンドシェイク未完・F-122）。**WASM は Pulley インタープリタで動作**（B-52）: OnDemand インスタンスアロケータ + `MAP_STACK` 付きファイバスタックと併用する（wasmtime のプーリングアロケータは `with_host_stack` を黙って無視し、OpenBSD は SP が `MAP_STACK` 領域外だとプロセスを殺すため）。Pulley はネイティブコードを生成しないので `wxallowed` なファイルシステムが不要（速度はインタープリタ相当）。静的配信/プロキシとも HTTPS 200 検証済み |
-| **NetBSD（x86_64/aarch64）** | kqueue readiness reactor | **chroot(2) + 特権降格のみ（pledge/unveil 相当は無い）**（F-140） | ✗（ユーザ空間 rustls） | `[security] chroot_dir`（opt-in、`chroot(2)` + `chdir("/")`。`drop_privileges_user`/`drop_privileges_group` による setuid/setgid より前に適用）。NetBSD には OpenBSD の pledge/unveil に相当するランタイム API が無い（Veriexec はカーネル設定・ロード時整合性検証機構でプロセス自身が呼べる syscall フィルタではなく、`secmodel_securelevel` はシステム全体の起動時設定）。veil は非対応であることを起動時ログで正直に報告する（`security::netbsd::report_security_support`）。TLS は OpenBSD と同じ rustls **ring** + quiche **boringssl-boring-crate**。**NetBSD では Proxy-Wasm は利用できない**（アーキテクチャ不問）: wasmtime 40 のシグナルベーストラップ実装には NetBSD 向けの `ucontext` 分岐が一切無く、実機（NetBSD 10.1 amd64、B-55）で確認したところ x86_64 ですら `signals.rs` が `error: unsupported platform` でコンパイルできない。Pulley インタープリタへの切替でも回避できない（失敗は wasmtime 自体の build.rs 判定の時点で起きるため、`Config::target` の選択より前の話）。`full-netbsd`/`full-netbsd-vendor`/`full-netbsd-aarch64`/`full-netbsd-aarch64-vendor` はいずれも `wasm` を含めない。それ以外はコードは完成済みで、QEMU での実ビルド・E2E は別チケット（`docs/backlog/features/F-140-netbsd-support.md`） |
+| **NetBSD（x86_64/aarch64）** | kqueue readiness reactor | **chroot(2) + 特権降格のみ（pledge/unveil 相当は無い）**（F-140） | ✗（ユーザ空間 rustls） | `[security] chroot_dir`（opt-in、`chroot(2)` + `chdir("/")`。`drop_privileges_user`/`drop_privileges_group` による setuid/setgid より前に適用）。NetBSD には OpenBSD の pledge/unveil に相当するランタイム API が無い（Veriexec はカーネル設定・ロード時整合性検証機構でプロセス自身が呼べる syscall フィルタではなく、`secmodel_securelevel` はシステム全体の起動時設定）。veil は非対応であることを起動時ログで正直に報告する（`security::netbsd::report_security_support`）。TLS は OpenBSD と同じ rustls **ring** + quiche **boringssl-boring-crate**。**NetBSD では Proxy-Wasm は利用できない**（アーキテクチャ不問）: wasmtime 40 のシグナルベーストラップ実装には NetBSD 向けの `ucontext` 分岐が一切無く、実機（NetBSD 10.1 amd64、B-55）で確認したところ x86_64 ですら `signals.rs` が `error: unsupported platform` でコンパイルできない。Pulley インタープリタへの切替でも回避できない（失敗は wasmtime 自体の build.rs 判定の時点で起きるため、`Config::target` の選択より前の話）。`full-netbsd`/`full-netbsd-aarch64` はいずれも `wasm` を含めない。それ以外はコードは完成済みで、QEMU での実ビルド・E2E は別チケット（`docs/backlog/features/F-140-netbsd-support.md`） |
 | **macOS（x86_64/aarch64、universal2）** | kqueue readiness reactor（FreeBSD/OpenBSD/NetBSD と共通実装を再利用） | `sandbox_init`（Seatbelt） | ✗（ユーザ空間 rustls） | `[security] enable_sandbox_macos`。TLS は rustls の **aws_lc_rs** プロバイダ、`http3`（quiche）は内蔵 BoringSSL を使用（F-131）。`docker/Dockerfile.macos`（`cargo zigbuild --target universal2-apple-darwin --features full`）でクロスビルドし、実機で動作確認済み |
 | **Windows（x86_64-pc-windows-msvc / aarch64-pc-windows-msvc）** | WSAPoll readiness reactor（`src/runtime/reactor/wsapoll.rs`、`src/runtime/reactor/tcp/windows.rs`、Winsock） | Job Object（best-effort） | ✗（ユーザ空間 rustls） | `[security] enable_job_object_windows`。TLS は両 arch とも rustls の **aws_lc_rs** プロバイダ、`http3`（quiche）は内蔵 BoringSSL を使用（F-131）。`docker/Dockerfile.windows`（`cargo xwin build --target <target> --features full`。`packaging/scripts/build-cross.sh --target windows` で両 arch を一括ビルド）でクロスビルドし、実機で動作確認済み |
 
@@ -163,51 +163,6 @@ io_uring（独自実装ランタイム）と rustls を使用した高性能リ�
   同居させるとリンク時に重複シンボルエラーになることを実験で確認済み
   （`docs/artifacts/f136_platform_design.md`）。この切り替えが `AWS_LC_SYS_NO_PREFIX` であり、
   値は [`.cargo/config.toml`](../../.cargo/config.toml) の `[env]` のみで設定する（B-47）。
-- **`system-tls` フィーチャー（F-137/F-140）— 現状 OpenBSD/NetBSD 専用。
-  Linux/FreeBSD/macOS/Windows では使用しないこと（リンクエラーで失敗する）**:
-  rustls の暗号プロバイダをシステムの OpenSSL/LibreSSL へ動的リンクする
-  `rustls-openssl` crate（`vendored` は使わない）へ切り替え、
-  quiche 側も `openssl` feature で動的リンクする設計。**OpenBSD/NetBSD だけ**動作する:
-  両者の quiche/rustls 依存は元々 `aws-lc-sys` 共有から完全に切り離してある
-  （`Cargo.toml` の
-  `[target.'cfg(any(target_os = "openbsd", target_os = "netbsd"))'.dependencies]` で
-  quiche/boring を optional 化、`openbsd-vendor-tls`/`netbsd-vendor-tls` フォワーディング
-  feature で従来の vendored BoringSSL 構成に切替可能）ため、
-  `full-openbsd`/`full-openbsd-aarch64`/`full-netbsd`/`full-netbsd-aarch64` が既定で
-  `system-tls` + `quiche?/openssl` を使う。従来の同梱（vendored）構成は
-  `full-openbsd-vendor`/`full-openbsd-aarch64-vendor`/`full-netbsd-vendor`/
-  `full-netbsd-aarch64-vendor` として維持。
-  **Linux/FreeBSD で失敗する理由**: `aws-lc-rs`/`aws-lc-sys` は `target_os` のみで
-  決まる無条件の依存であり、どの Cargo feature を選んでも `cargo tree
-  --no-default-features` に残る。aws-lc-sys のビルド成果物には `AWS_LC_SYS_NO_PREFIX`
-  の値に関係なく `libssl.a`/`libcrypto.a` というシステム OpenSSL と同名の静的ライブラリが
-  生成され、これが最終リンクコマンドの `-L` でシステムパスより先に来るため、
-  `rustls-openssl`/quiche が要求する動的 `-lssl -lcrypto` がそちらに解決されてしまい、
-  aws-lc-sys に無い新しめのシンボル（`EVP_Q_digest` 等）が undefined symbol になる。
-  `http3` を完全に外した最小構成（`--features "http2,mimalloc,system-tls"`）でも同じ
-  エラーが再現するため quiche の feature 選択とは無関係の、より根本的な問題であり、
-  `aws-lc-rs`/`aws-lc-sys` を optional 化し `system-tls` と排他的に切り替えるには
-  「フィーチャー無し単体の `cargo build --no-default-features` が動作し続ける」という
-  既存の受け入れ条件と衝突する（Cargo のフィーチャーは加算のみで否定的な表現ができない
-  ため）ため未解決。`system-tls` を含まない `full`/`full-freebsd` 等は本フィーチャーの
-  存在による影響を一切受けない（`cargo tree --features full` 差分ゼロを確認済み）。
-  **OpenBSD/NetBSD の HTTP/3 証明書ホットリロード**: `create_memfd_for_pem`（OpenBSD/NetBSD
-  版は 0600 一時ファイル、`std::env::temp_dir()` 配下、Drop で unlink）経由のパス指定 API に
-  フォールバックするため、`src/config.rs::collect_unveil_paths` が `system-tls` 有効時のみ
-  一時ディレクトリを unveil の `read_write_create` に追加している（OpenBSD 限定の処置。
-  追加しないと unveil 適用後に証明書ホットリロードが恒常的に無効になる。NetBSD には
-  unveil 自体が無いため本項は無関係）。`full-openbsd-vendor`/`full-netbsd-vendor` は代わりに
-  in-memory `SSL_CTX` API（ファイル不使用、サンドボックス耐性が高い）を使う。**`ktls`
-  とは併用不可**（aws_lc_rs 固有の cipher_suite 定数に依存するため。OpenBSD は元々
-  kTLS 非対応なので実質関係ない）で、両方指定すると `build.rs` が自動的に kTLS を
-  無効化し `cargo:warning` を出す。
-  詳細は [docs/backlog/features/F-137-system-tls-feature.md](../backlog/features/F-137-system-tls-feature.md) 参照。
-  **NetBSD で `system-tls` を使うビルド要件**: 実機で確認済み。NetBSD base には
-  OpenSSL 3.0.12 と `/usr/lib/pkgconfig/openssl.pc` が既にあるが、`pkg-config`
-  コマンド自体は base に含まれておらず、pkgsrc の `pkgconf` パッケージが必要。
-  これが無いと `openssl-sys` のビルドスクリプトが `Could not find directory of
-  OpenSSL installation` で失敗する。`tools/qemu/bsd-vm.sh` の NetBSD 用
-  `cmd_toolchain` は `pkgin` 経由で `pkgconf` を既に導入している。
 
 ## ビルド
 
@@ -316,7 +271,7 @@ Docker コンテナでのインストール・起動・curl 動作確認（両�
 > 主な注意点：
 > - **デフォルトフィーチャー**: `ktls`、`http2`、`mimalloc`
 > - **`full`**: 全フィーチャーを有効化（`ktls`、`http2`、`http3`、`grpc-full`、`wasm`、`compression`、`cache`、`metrics`、`websocket`、`rate-limit`、`buffering`、`mimalloc`）
-> - **`full-freebsd` / `full-openbsd`**: `full` と機能セットは同一でアロケータのみ異なる BSD 向けセット。`full-freebsd` は **jemalloc** + **`aio`**（FreeBSD POSIX AIO、F-127）、`full-openbsd` は**システムアロケータ**＋**`system-tls`**（F-137、システムの LibreSSL へ動的リンク。既定の packaging 構成）で、`wasm` は wasmtime の **Pulley インタープリタ**経由で動作する（B-52）。従来の同梱（vendored）TLS 構成は `full-openbsd-vendor` として維持（`full-openbsd-aarch64` にも同様に `full-openbsd-aarch64-vendor` がある）。cargo にターゲット別 default features が無いため、packaging のスクリプトが `--no-default-features` と併せて明示指定する（`packaging/scripts/build-cross.sh --target freebsd`、`tools/qemu/bsd-vm.sh <os> <arch> build|e2e`）。素の `--features full` の挙動は従来どおり変わらない。
+> - **`full-freebsd` / `full-openbsd` / `full-netbsd`**: `full` と機能セットは同一でアロケータのみ異なる BSD 向けセット。`full-freebsd` は **jemalloc** + **`aio`**（FreeBSD POSIX AIO、F-127）、`full-openbsd`/`full-netbsd` は**システムアロケータ**を使う。`full-openbsd` の `wasm` は wasmtime の **Pulley インタープリタ**経由で動作する（B-52）。`full-netbsd` は `wasm` を含めない（wasmtime が全アーキテクチャで NetBSD 非対応のため、B-55）。TLS はいずれも同梱構成（FreeBSD は rustls+aws_lc_rs、OpenBSD/NetBSD は rustls+ring。quiche は 3 者とも同梱 BoringSSL）。`full-freebsd-aarch64`/`full-openbsd-aarch64`/`full-netbsd-aarch64` は同構成から `wasm` を除いたもの（B-55）。cargo にターゲット別 default features が無いため、packaging のスクリプトが `--no-default-features` と併せて明示指定する（`packaging/scripts/build-cross.sh --target freebsd`、`tools/qemu/bsd-vm.sh <os> <arch> build|e2e`）。素の `--features full` の挙動は従来どおり変わらない。
 > - **アロケータフィーチャー**（`mimalloc`、`jemalloc`、`system-allocator`）は排他的 — 複数同時有効化不可
 > - HTTP/3 は UDP ベースのため kTLS と併用不可
 

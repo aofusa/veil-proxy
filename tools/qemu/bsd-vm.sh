@@ -873,14 +873,6 @@ _guest_env_prefix() {
         # 非対話 ssh セッションには既定で /usr/pkg/{bin,sbin} が PATH に無い。
         pre='LIBCLANG_PATH=$(find /usr/pkg -name "libclang.so*" 2>/dev/null | head -1 | xargs dirname)'
         pre="${pre} PATH=/usr/pkg/bin:/usr/pkg/sbin:/usr/sbin:/sbin:\$PATH"
-        # F-140/F-137: `system-tls`（`full-netbsd`）は **pkgsrc の LibreSSL** を使う。
-        # NetBSD base の OpenSSL 3.0.12 には BoringSSL 系の QUIC API
-        # （`SSL_set_quic_method` / `SSL_provide_quic_data` 等）が無く、quiche のリンクが
-        # undefined reference で失敗する（実機で確認）。pkgsrc の libressl-4.1.0 は
-        # 同 API を実装しており（`ssl.h` に 7 箇所）、OpenBSD と同じ構図になる。
-        # LibreSSL は base と衝突しないよう `/usr/pkg/libressl` の独立プレフィックスへ
-        # 入るため、pkg-config をそちらへ向ける。
-        pre="${pre} PKG_CONFIG_PATH=/usr/pkg/libressl/lib/pkgconfig"
     fi
     echo "${pre}"
 }
@@ -888,11 +880,9 @@ _guest_env_prefix() {
 # BSD 向けの既定 feature セット（Cargo.toml）。
 #   full-freebsd : full と同じ機能セット + アロケータを jemalloc + POSIX AIO(F-127) 有効
 #   full-openbsd : full と同じ機能セット + システムアロケータ（mimalloc/jemalloc を使わない）
-#                  + system-tls（F-137、システムの LibreSSL へ動的リンク。既定の
-#                  packaging 構成）。従来の同梱（vendored）構成が必要な場合は
-#                  `CARGO_FEATURES=full-openbsd-vendor`（aarch64 は
-#                  `full-openbsd-aarch64-vendor`）を明示指定する。
-# どちらも `--no-default-features` と併用する（default features の mimalloc を外すため）。
+#                  + 同梱 rustls(ring)/quiche(BoringSSL)。
+#   full-netbsd  : full-openbsd と同一方針（システムアロケータ + 同梱 TLS）。
+# いずれも `--no-default-features` と併用する（default features の mimalloc を外すため）。
 # aarch64 は wasmtime がビルドできないため wasm 抜きのセットを使う（B-55）。
 _default_features() {
     local suffix=""
