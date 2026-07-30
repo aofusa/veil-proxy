@@ -378,6 +378,7 @@ full-openbsd = [
     "admin",
     "access-log",
     "l4-proxy",
+    "openbsd-vendor-tls",
 ]
 
 # OpenBSD: 従来の rustls+ring / quiche+BoringSSL 同梱構成（vendored、F-137 以前と同一内容）。
@@ -432,6 +433,7 @@ full-openbsd-aarch64 = [
     "l4-proxy",
     "system-tls",
     "quiche?/openssl",
+    "openbsd-vendor-tls",
 ]
 
 # `full-openbsd-aarch64` の従来（vendored）構成。`full-openbsd-vendor` の aarch64 版。
@@ -476,6 +478,7 @@ full-netbsd = [
     "admin",
     "access-log",
     "l4-proxy",
+    "netbsd-vendor-tls",
 ]
 
 # NetBSD: 従来の rustls+ring / quiche+BoringSSL 同梱構成（vendored、`full-openbsd-vendor`
@@ -511,6 +514,7 @@ full-netbsd-aarch64 = [
     "l4-proxy",
     "system-tls",
     "quiche?/openssl",
+    "netbsd-vendor-tls",
 ]
 
 # `full-netbsd-aarch64` の従来（vendored）構成。`full-netbsd-vendor` の aarch64 版。
