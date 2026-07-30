@@ -818,11 +818,20 @@ cmd_sync() {
     # fuzz はワークスペースメンバだがゲストでは不要。転送後に members から外す。
     # ホスト側のビルド成果物（target/）は転送しない。
     # 巨大なうえゲストのアーキ/OS では使えず、OpenBSD では容量不足の原因になる。
+    #
+    # 転送先ディレクトリは展開前に **削除する**。`tar xzf -` は追加・上書きしかせず
+    # **ホスト側で削除したファイルがゲストに残り続ける**ため。実際に
+    # `src/tls_provider.rs` → `src/tls_provider/mod.rs` へ移動した際、ゲストに旧
+    # ファイルが残って `E0761: file for module found at both ...` でビルドが壊れた
+    # （F-142、実機で検出）。`target/` は転送対象外なので消えない（ビルドキャッシュは維持）。
     (cd "${ROOT}" && tar czf - \
         --exclude='./target' --exclude='*/target' --exclude='.git' \
         src benches tests examples contrib docker/assets \
         Cargo.toml Cargo.lock build.rs clippy.toml .cargo) \
-      | cmd_ssh "cd ${GUEST_ROOT} && tar xzf - && sed -i'' -e 's|members = \[\".\", \"fuzz\"\]|members = [\".\"]|' Cargo.toml"
+      | cmd_ssh "cd ${GUEST_ROOT} \
+          && rm -rf src benches tests examples contrib docker/assets .cargo \
+          && tar xzf - \
+          && sed -i'' -e 's|members = \[\".\", \"fuzz\"\]|members = [\".\"]|' Cargo.toml"
 }
 
 # aws-lc-sys の bindgen が libclang を要求するため、VM 内での LIBCLANG_PATH を解決する
