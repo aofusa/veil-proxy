@@ -96,60 +96,43 @@ fn check_tls_backend_exclusivity() {
 /// `http3` を含まない `system-tls` 単体（rustls のみ）はこのチェックをスキップする
 /// （OpenSSL 3.x でも LibreSSL でも rustls 側は動くため）。
 fn check_system_tls_quic_capability() {
-    if !(feature_enabled("SYSTEM_TLS") && feature_enabled("HTTP3")) {
-        return;
-    }
-
-    let Some(include_dir) = pkg_config_variable("libssl", "includedir") else {
-        // pkg-config 自体が無い/libssl.pc が見つからない場合は、リンク時に quiche 側の
-        // ビルドスクリプトがより具体的なエラーを出す（ここでは検出できないだけで諦める）。
-        println!(
-            "cargo:warning=veil: could not locate libssl via pkg-config to verify QUIC API \
-             support for `system-tls` + `http3`; proceeding, but the build may fail later \
-             with an undefined-symbol link error if the system libssl lacks \
-             SSL_set_quic_method (LibreSSL 3.6+ / quictls required)."
-        );
-        return;
-    };
-
-    let header = std::path::Path::new(&include_dir).join("openssl/ssl.h");
-    // build.rs はコールドパス（ビルド時に一度だけ実行）であり、AGENTS.md のホットパス
-    // 同期 I/O 禁止規則の対象外。
-    #[allow(clippy::disallowed_methods)]
-    let has_quic_api = std::fs::read_to_string(&header)
-        .map(|contents| contents.contains("SSL_set_quic_method"))
-        .unwrap_or(false);
-
-    if !has_quic_api {
+    // F-137/F-142: `system-tls` と `http3` は**併用できない**（実機で確定）。
+    //
+    // quiche の `openssl` feature が対象とするのは **quictls**（QUIC API を足した
+    // OpenSSL フォーク）であり、LibreSSL でもバニラ OpenSSL でもない。NetBSD 実機で
+    // 次の三すくみを確認した:
+    //
+    //   | ライブラリ   | QUIC API | OpenSSL 3.x API | quiche |
+    //   |-------------|----------|-----------------|--------|
+    //   | LibreSSL    | あり      | 無い             | 不可   |
+    //   | OpenSSL 3.x | 無い      | あり             | 不可   |
+    //   | quictls     | あり      | あり             | 可     |
+    //
+    // LibreSSL では `EVP_CipherInit_ex2` / `EVP_PKEY_CTX_set_hkdf_md` 等の
+    // OpenSSL 3.0+ 専用 API が undefined reference になり、バニラ OpenSSL では
+    // `SSL_set_quic_method` 等の QUIC API が無い。quictls は OpenBSD base にも
+    // NetBSD pkgsrc にも Linux/FreeBSD の標準にも無い。
+    //
+    // BoringSSL を静的リンクしつつ rustls だけシステム SSL を使う案も、両者が同じ
+    // `SSL_*` / `EVP_*` シンボルを提供するため衝突する。
+    //
+    // よってビルド開始時点で明確に停止する（リンク段階の大量の undefined reference で
+    // 悩ませない）。詳細は docs/backlog/features/F-137-system-tls-feature.md。
+    if feature_enabled("SYSTEM_TLS") && feature_enabled("HTTP3") {
         panic!(
-            "veil build.rs: `system-tls` + `http3` requires the system libssl to implement \
-             the BoringSSL-derived QUIC API (LibreSSL 3.6+ / quictls), specifically \
-             `SSL_set_quic_method`. It was not found in {header}. Either drop `http3` (rustls \
-             alone works fine with vanilla OpenSSL 3.x / LibreSSL under system-tls), or use \
-             `vendored-tls` instead, or install a QUIC-capable libssl (e.g. LibreSSL 3.6+ on \
-             OpenBSD/NetBSD base, or pkgsrc libressl on NetBSD, or quictls on Linux/FreeBSD).",
-            header = header.display(),
+            "veil build.rs: `system-tls` and `http3` cannot be enabled together.\n\
+             quiche's `openssl` feature targets **quictls** (an OpenSSL fork with the QUIC \
+             API), not LibreSSL and not vanilla OpenSSL: LibreSSL has the QUIC API but lacks \
+             OpenSSL 3.0+ APIs (`EVP_CipherInit_ex2`, `EVP_PKEY_CTX_set_hkdf_md`, ...), while \
+             vanilla OpenSSL has those but lacks the QUIC API (`SSL_set_quic_method`, ...). \
+             quictls ships in neither OpenBSD base, NetBSD pkgsrc, nor the Linux/FreeBSD \
+             defaults. Mixing a statically linked BoringSSL with a dynamically linked system \
+             libssl is not an option either (both export the same `SSL_*`/`EVP_*` symbols).\n\
+             With `system-tls`, only rustls (HTTP/1.1, HTTP/2) links against the system SSL \
+             library. If you need HTTP/3, drop `system-tls` and use the vendored default \
+             (e.g. `full`, `full-freebsd`, `full-openbsd`, `full-netbsd`).\n\
+             See docs/backlog/features/F-137-system-tls-feature.md."
         );
-    }
-}
-
-/// `pkg-config --variable=<var> <pkg>` を実行し、成功した場合の標準出力（trim 済み）を返す。
-/// `pkg-config` コマンド自体が無い、または対象パッケージが見つからない場合は `None`。
-fn pkg_config_variable(pkg: &str, var: &str) -> Option<String> {
-    let output = std::process::Command::new("pkg-config")
-        .arg(format!("--variable={var}"))
-        .arg(pkg)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value = String::from_utf8(output.stdout).ok()?;
-    let value = value.trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
     }
 }
 

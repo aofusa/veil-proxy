@@ -294,8 +294,8 @@ full = [
 # 差分ではなく本 feature から `http3` を手動で外して使うか、`quiche?/openssl` 抜きで
 # 個別に feature を指定すること。
 full-system-tls = [
-    "ktls", "http2", "http3",
-    "grpc-full", "wasm",
+    "http2",
+    "grpc", "grpc-web", "wasm",
     "opentelemetry",
     "compression", "cache", "metrics",
     "websocket", "rate-limit", "buffering",
@@ -304,7 +304,6 @@ full-system-tls = [
     "access-log",
     "l4-proxy",
     "system-tls",
-    "quiche?/openssl",
 ]
 
 # BSD 向けの全機能ビルド（packaging 用）
@@ -341,7 +340,7 @@ full-freebsd = [
 # `full-freebsd`（vendored、既定）を使うこと。
 full-freebsd-system-tls = [
     "http2",
-    "grpc-full", "wasm",
+    "grpc", "grpc-web", "wasm",
     "opentelemetry",
     "compression", "cache", "metrics",
     "websocket", "rate-limit", "buffering",
@@ -379,8 +378,6 @@ full-openbsd = [
     "admin",
     "access-log",
     "l4-proxy",
-    "system-tls",
-    "quiche?/openssl",
 ]
 
 # OpenBSD: 従来の rustls+ring / quiche+BoringSSL 同梱構成（vendored、F-137 以前と同一内容）。
@@ -479,8 +476,6 @@ full-netbsd = [
     "admin",
     "access-log",
     "l4-proxy",
-    "system-tls",
-    "quiche?/openssl",
 ]
 
 # NetBSD: 従来の rustls+ring / quiche+BoringSSL 同梱構成（vendored、`full-openbsd-vendor`
