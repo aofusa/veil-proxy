@@ -6,9 +6,12 @@
 // F-122 / B-51: テストクライアントの rustls 暗号プロバイダは本体（src/tls_provider.rs）と
 // 同じ target 別選択にする。OpenBSD で aws-lc-rs を使うと aws-lc-sys の curve25519
 // （s2n-bignum アセンブリ）で SIGSEGV し、テストバイナリごと落ちる。
-#[cfg(not(target_os = "openbsd"))]
+// F-140: NetBSD も OpenBSD と同じく rustls は ring を使う（Cargo.toml の
+// target 別依存参照）。ここが openbsd だけだと NetBSD で
+// `no `aws_lc_rs` in `crypto`` になり E2E テストがビルドできない（実機で検出）。
+#[cfg(not(any(target_os = "openbsd", target_os = "netbsd")))]
 use rustls::crypto::aws_lc_rs as test_crypto;
-#[cfg(target_os = "openbsd")]
+#[cfg(any(target_os = "openbsd", target_os = "netbsd"))]
 use rustls::crypto::ring as test_crypto;
 
 use bytes::Bytes;
