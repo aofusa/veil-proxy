@@ -120,7 +120,10 @@ const PROXY_L4_PORT: u16 = 8444; // L4 TCP プロキシ（TLS パススルー、
 const PROXY_L4_LEAST_CONN_PORT: u16 = 8445; // L4 Least Connection
 const PROXY_L4_TERMINATE_PORT: u16 = 8446; // L4 TLS 終端
 const PROXY_L4_UDP_PORT: u16 = 8447; // L4 UDP プロキシ（セッションテーブル方式、F-124）
-const PROXY_L4_WASM_PORT: u16 = 8448; // L4 network filter（WASM、F-133）
+// L4 network filter（WASM、F-133）。参照元のテストが l4-proxy + wasm 双方を要求するため、
+// 同じ条件で cfg しないと wasm 非対応プラットフォーム（NetBSD）で dead_code 警告になる。
+#[cfg(all(feature = "l4-proxy", feature = "wasm"))]
+const PROXY_L4_WASM_PORT: u16 = 8448;
 const PROXY_HTTP3_PORT: u16 = 8443; // HTTP/3ポート（デフォルトではHTTPSポートと同じ）
 const BACKEND1_PORT: u16 = 9001;
 const BACKEND2_PORT: u16 = 9002;
