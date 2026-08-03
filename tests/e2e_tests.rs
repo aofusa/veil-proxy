@@ -59,6 +59,9 @@ use rustls::crypto::CryptoProvider;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection};
 
+// 参照元は grpc（LPM ヘルパ）と grpc-web（gRPC-Web 形式テスト）の双方。
+// どちらも無効な構成（既定 feature 等）では未使用インポート警告になるため cfg する。
+#[cfg(any(feature = "grpc", feature = "grpc-web"))]
 use common::grpc_client::GrpcFrame;
 
 // 新しい非同期テストクライアント（hyper + tokio）
@@ -120,6 +123,7 @@ const PROXY_L4_PORT: u16 = 8444; // L4 TCP プロキシ（TLS パススルー、
 const PROXY_L4_LEAST_CONN_PORT: u16 = 8445; // L4 Least Connection
 const PROXY_L4_TERMINATE_PORT: u16 = 8446; // L4 TLS 終端
 const PROXY_L4_UDP_PORT: u16 = 8447; // L4 UDP プロキシ（セッションテーブル方式、F-124）
+
 // L4 network filter（WASM、F-133）。参照元のテストが l4-proxy + wasm 双方を要求するため、
 // 同じ条件で cfg しないと wasm 非対応プラットフォーム（NetBSD）で dead_code 警告になる。
 #[cfg(all(feature = "l4-proxy", feature = "wasm"))]
@@ -279,6 +283,10 @@ async fn send_request_with_retry(
 }
 
 /// HTTPS POSTリクエストを送信してレスポンスを取得（非同期版）
+///
+/// 参照元は http2（H2C POST）と wasm（ボディフィルタ）のテストのみ。
+/// 双方無効な構成では未使用関数の警告になるため cfg する。
+#[cfg(any(feature = "http2", feature = "wasm"))]
 async fn send_post_request(
     port: u16,
     path: &str,

@@ -24,9 +24,19 @@ pub struct FilterEngine {
     /// Default execution time limit (fuel)
     fuel_limit: u64,
     /// Epoch deadline for timeout enforcement
-    /// When epoch interruption is enabled, each store gets a deadline of
-    /// current_epoch + 1, and the engine's epoch is incremented after setting up the store.
-    /// This provides a simple per-execution timeout mechanism.
+    ///
+    /// B-56: wasmtime の epoch は **時計ではなく、この `Engine` を共有する全 WASM 実行
+    /// （全モジュール・全リクエスト・全プロトコル経路）が呼び出すたびに 1 ずつ増える
+    /// グローバルなカウンタ**である。`increment_epoch()` を定期的に呼ぶタイマースレッドは
+    /// 存在せず、各呼び出し箇所が実行直前に 1 回だけ呼ぶ（本ファイル中の
+    /// `self.registry.engine().increment_epoch()` の呼び出し箇所を参照）。
+    /// 各 store は生成時に `current_epoch + epoch_deadline` を締切として持ち、
+    /// エンジン全体でその締切分だけ**他の**WASM 呼び出しが積み重なるとトラップする
+    /// （経過時間ではなく「他の呼び出し回数」に依存する）。同時実行数が多いほど
+    /// 締切に達するまでの実時間は短くなる。F-62 の Pause/resume
+    /// （`resolve_pending_http_calls_inline`）のように store を長時間サスペンドしたまま
+    /// 外部 I/O を待つ経路では、再開直前に締切を引き直す必要がある（さもないと
+    /// 無関係な同時リクエストの WASM 呼び出しだけで誤ってトラップする）。
     epoch_deadline: u64,
 }
 
@@ -290,6 +300,13 @@ impl FilterEngine {
                 super::persistent_context::remove_global_pending_call(&module.name, token);
 
                 let response = Self::execute_http_call_offloaded(&module.name, call).await;
+
+                // B-56: エポックはエンジン共有の「WASM 呼び出し回数」カウンタであり時計ではない。
+                // pause 中に他リクエストが 10 回 WASM を呼ぶと、外部 I/O を待っていただけの本 store の
+                // デッドラインが期限切れになり resume 直後にトラップする。再開直前に猶予を与え直す。
+                // （外部 I/O の待ち時間はゲストの CPU 時間ではないため、これは制限の回避ではない）
+                store.set_epoch_deadline(self.epoch_deadline);
+                self.registry.engine().increment_epoch();
 
                 // 応答をコンテキストへ格納して proxy_on_http_call_response を呼ぶ
                 let (num_headers, body_size, num_trailers) = (
@@ -2767,6 +2784,7 @@ pub enum BodyFilterResult {
 mod exec_smoke_tests {
     use super::*;
     use crate::wasm::types::{ModuleConfig, WasmConfig, WasmDefaults};
+    use crate::wasm::ModuleCapabilities;
 
     fn header_filter_engine() -> Option<FilterEngine> {
         header_filter_engine_with_interpreter(false)
@@ -2822,6 +2840,135 @@ mod exec_smoke_tests {
             FilterResult::Continue { .. }
             | FilterResult::Pause
             | FilterResult::LocalResponse(_) => {}
+        }
+    }
+
+    fn http_call_filter_engine() -> Option<FilterEngine> {
+        let path = "tests/fixtures/wasm/http_call_filter.wasm";
+        if !std::path::Path::new(path).exists() {
+            return None;
+        }
+        let config = WasmConfig {
+            enabled: true,
+            defaults: WasmDefaults::default(),
+            modules: vec![ModuleConfig {
+                name: "http_call_filter".to_string(),
+                path: path.to_string(),
+                // 空文字列 → モジュールは既定の "backend-pool" を使う（examples/wasm-filters/http-call-filter）。
+                // upstream_groups が未設定（テスト用 CURRENT_CONFIG）でも 502 応答経路で
+                // resume 機構自体は同じように駆動されるため、実バックエンドは不要。
+                configuration: String::new(),
+                capabilities: ModuleCapabilities {
+                    allow_logging: true,
+                    allow_request_headers_read: true,
+                    allow_request_headers_write: true,
+                    allow_send_local_response: true,
+                    allow_http_calls: true,
+                    ..Default::default()
+                },
+            }],
+            interpreter: false,
+        };
+        FilterEngine::new(&config).ok()
+    }
+
+    /// B-56 回帰テスト（決定的）: `resolve_pending_http_calls_inline` が
+    /// `proxy_on_http_call_response` で resume する **直前**に epoch 締切を
+    /// 引き直すこと（本チケットの修正）を、実際に store をサスペンドさせた状態から
+    /// エンジン共有の epoch を `epoch_deadline` 分以上進めて検証する。
+    ///
+    /// 負荷や並行リクエストは一切使わない — `Engine::increment_epoch()` を
+    /// 直接呼んで「他のリクエストが epoch_deadline 回以上 WASM を呼んだ」状態を
+    /// 決定的に再現する（B-56 の真因はまさにこのグローバルカウンタの積み上がりであり、
+    /// 経過時間や並行数ではない）。
+    ///
+    /// このテストは `resolve_pending_http_calls_inline` 内の
+    /// `store.set_epoch_deadline(...); self.registry.engine().increment_epoch();`
+    /// （本チケットの修正そのもの）を一時的に取り除いた状態で実行すると
+    /// `wasm trap: interrupt` で FAIL することを確認済み（コミットメッセージ参照）。
+    #[test]
+    fn b56_http_call_resume_survives_epoch_pressure_while_suspended() {
+        let engine = match http_call_filter_engine() {
+            Some(e) => e,
+            None => {
+                eprintln!("wasm fixture missing; skipping");
+                return;
+            }
+        };
+        let module = engine
+            .get_module("http_call_filter")
+            .expect("module must be loaded");
+
+        let headers = vec![
+            (b":path".to_vec(), b"/".to_vec()),
+            (b":method".to_vec(), b"GET".to_vec()),
+            (b":authority".to_vec(), b"example.com".to_vec()),
+        ];
+        let num_headers = headers.len() as i32;
+
+        let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
+        http_ctx.set_request(
+            Arc::from("GET"),
+            Arc::from("/"),
+            headers,
+            Arc::from("127.0.0.1"),
+        );
+        http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_configuration = module.configuration.clone();
+
+        let host_state = HostState::new(http_ctx);
+        let mut store = Store::new(engine.registry.engine(), host_state);
+
+        // 本命リクエストの `proxy_on_request_headers` を実行する。
+        // モジュールは `dispatch_http_call` してから Pause を返す（F-62）。
+        let (action, instance) = futures::executor::block_on(engine.run_headers_module(
+            &module,
+            &mut store,
+            "proxy_on_request_headers",
+            num_headers,
+            true,
+        ))
+        .expect("run_headers_module must not error");
+
+        assert_eq!(
+            FilterAction::from(action),
+            FilterAction::Pause,
+            "module must dispatch_http_call and return Pause"
+        );
+        assert!(
+            !store.data().http_ctx.pending_http_calls.is_empty(),
+            "a pending http call must be registered before suspending"
+        );
+
+        // B-56 再現条件: store がこの Pause 状態で「サスペンド」されている間に、
+        // 無関係な他リクエストの WASM 呼び出しがエンジン全体で epoch_deadline 回以上
+        // 積み上がる（実運用では offload 待ちの間に他リクエストが WASM を呼ぶことで
+        // 発生する。ここでは決定的に `increment_epoch()` を直接呼んで再現する）。
+        for _ in 0..engine.epoch_deadline {
+            engine.registry.engine().increment_epoch();
+        }
+
+        // 実運用の resume 経路をそのまま呼ぶ（`execute_http_call_offloaded` は
+        // upstream 未解決で 502 応答を返すが、`proxy_on_http_call_response` は
+        // 必ず呼ばれるため resume 機構自体の検証には十分）。
+        let resumed = futures::executor::block_on(
+            engine.resolve_pending_http_calls_inline(&module, &mut store, instance),
+        );
+
+        match resumed {
+            Ok(true) => {
+                // モジュールは `on_http_call_response` でローカルレスポンスを返す。
+                // fail-open していないこと（＝ローカルレスポンスが設定されていること）を確認する。
+                assert!(
+                    store.data().http_ctx.local_response.is_some(),
+                    "resume must produce the module's local response, not fail open (B-56)"
+                );
+            }
+            Ok(false) => panic!("expected the pending http call to be resolved and resumed"),
+            Err(e) => panic!(
+                "resume must not trap on stale epoch deadline while suspended (B-56): {}",
+                e
+            ),
         }
     }
 }
