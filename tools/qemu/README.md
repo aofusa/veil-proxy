@@ -74,6 +74,18 @@ tools/qemu/bsd-vm.sh freebsd x86_64 all
 | `e2e` | VM 内で `tests/e2e_setup.sh test` |
 | `fetch` | VM 内の release バイナリを `packaging/build/veil-<os>-<arch>` へ取得 |
 
+> **`sync` / `build` / `e2e` / `fetch` は VM が起動済みであることが前提。**
+> 停止中に実行すると内部の `cmd_wait` が SSH 到達を **900 秒** 待ち続け、その間
+> **何も出力しないまま**タイムアウトして終了する（「無言でハングした」ように見える）。
+> 先に `up`（必要なら `wait`）を実行すること。起動しているかは `status`、
+> あるいは `docker ps` に `veil-<os>-<arch>` が出るかで確認できる。
+>
+> ```bash
+> tools/qemu/bsd-vm.sh openbsd x86_64 up
+> tools/qemu/bsd-vm.sh openbsd x86_64 wait 900
+> tools/qemu/bsd-vm.sh openbsd x86_64 e2e
+> ```
+
 ### provision の方式（OS で異なる）
 
 | OS | 方式 |

@@ -589,9 +589,12 @@ harness = false
 name = "load_balancing"
 harness = false
 
+# quiche を直接使うため http3 が必要。無指定だと `--all-targets` で
+# feature 無効時にも展開され `unresolved module quiche` になる。
 [[bench]]
 name = "http3"
 harness = false
+required-features = ["http3"]
 
 [[bench]]
 name = "websocket"
@@ -608,6 +611,7 @@ harness = false
 [[bench]]
 name = "wasm"
 harness = false
+required-features = ["wasm"]
 
 # HTTP/3 用 QUIC 実装（Cloudflare quiche）ターゲット別設定
 # Linux は default-features = false で aws-lc-sys と共有（memfd 経由の従来経路、F-136で不変）
