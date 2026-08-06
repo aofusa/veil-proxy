@@ -152,6 +152,24 @@ mkdir -p "${stage_parent}/${dir_name}"
 # バイナリ
 install -m 0755 "${BINARY}" "${stage_parent}/${dir_name}/veil"
 
+# NetBSD は PaX MPROTECT がシステム全体で強制されており（security.pax.mprotect.*）、
+# wasmtime の wasm 実行用 mmap/mprotect が EACCES で失敗する（B-60、OpenBSD の
+# wxallowed/MAP_STACK 制約・B-52 の NetBSD 版に相当）。paxctl(8) は NetBSD 上にしか
+# 無いツールのため、本スクリプトを NetBSD 上（paxctl 導入済み）で実行している場合は
+# ここでパッケージ前に +m を適用してしまう。それ以外のホスト（通常はこちら。
+# tools/qemu/bsd-vm.sh 側で VM 内ビルド直後に既に +m 済みのことが多い）では
+# 適用できないため警告のみ表示し、INSTALL.txt 側にも導入手順として明記する。
+if [[ "${OS}" == "netbsd" ]]; then
+    if command -v paxctl >/dev/null 2>&1; then
+        paxctl +m "${stage_parent}/${dir_name}/veil" \
+            && echo "==> paxctl +m applied to packaged NetBSD binary" \
+            || echo "WARNING: paxctl +m failed; see INSTALL.txt for the required manual step (B-60)" >&2
+    else
+        echo "NOTE: paxctl not available on this host; NetBSD package requires a manual" >&2
+        echo "      'paxctl +m /usr/local/bin/veil' post-install step for wasm to work (B-60)." >&2
+    fi
+fi
+
 # 設定リファレンス・静的コンテンツ
 install -m 0644 "${ROOT}/contrib/config/config.toml" "${stage_parent}/${dir_name}/config.toml.default"
 install -m 0644 "${ROOT}/docker/assets/www/index.html" "${stage_parent}/${dir_name}/www/index.html" 2>/dev/null || {
@@ -238,6 +256,14 @@ else
   # 提供できるのは chroot(2)（config.toml の [security] chroot_dir）+
   # setuid/setgid による特権降格 + rlimit のみ。
   # TLS は rustls の ring プロバイダ + quiche 同梱 BoringSSL（full-netbsd）で動作する。
+
+  # 重要（B-60）: NetBSD は PaX MPROTECT がシステム全体で有効になっており
+  # （security.pax.mprotect.enabled / .global = 1）、これを無効化しないと
+  # wasmtime の wasm 実行時 mmap/mprotect が EACCES で失敗し、Proxy-Wasm
+  # フィルタが動かない（"on_request_headers error: Permission denied"）。
+  # wasm 機能を使う場合は必ず以下を実行すること（本パッケージが自動で
+  # 適用できなかった場合、あるいは配置先を変えた場合は都度実行する）:
+  paxctl +m /usr/local/bin/veil
 EOF
 fi
 

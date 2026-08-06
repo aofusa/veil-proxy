@@ -143,6 +143,18 @@ setup/provision まで確認済み。詳細・既知の不確実点は
 > [`docs/backlog/bugs/B-55-wasmtime-no-bsd-aarch64.md`](../docs/backlog/bugs/B-55-wasmtime-no-bsd-aarch64.md)・
 > [`../third_party/wasmtime/README.veil.md`](../third_party/wasmtime/README.veil.md)。
 
+> **NetBSD で WASM を実行するには `paxctl +m` が必須（B-60、実機 NetBSD 10.1 で確認）**:
+> NetBSD は PaX MPROTECT をシステム全体で強制しており
+> （`security.pax.mprotect.enabled`/`.global` = 1）、Pulley インタープリタ実行でも
+> wasmtime のランタイム `mmap`/`mprotect` が `EACCES` で失敗し `on_request_headers`
+> 等のホスト関数呼び出しが軒並みエラーになる（OpenBSD の wxallowed/MAP_STACK・
+> B-52 の NetBSD 版に相当）。`/usr/sbin/paxctl +m <veil バイナリ>` で明示的に
+> MPROTECT 制限を解除する必要がある。`tests/e2e_setup.sh`（NetBSD 実行時に自動）・
+> `tools/qemu/bsd-vm.sh`（`cmd_build` がビルド直後に自動適用）・
+> `packaging/scripts/build-bsd.sh`（NetBSD ホストでのパッケージ化時は自動適用、
+> それ以外は生成される `INSTALL.txt` に手順を明記）に組み込み済み。詳細は
+> [`docs/backlog/bugs/B-60-netbsd-pax-mprotect-wasm.md`](../docs/backlog/bugs/B-60-netbsd-pax-mprotect-wasm.md)。
+
 ### FreeBSD / OpenBSD / NetBSD 向けパッケージ（F-120 Phase 6 / F-140）
 
 FreeBSD/OpenBSD/NetBSD のバイナリは **QEMU VM 内でネイティブビルド**したものを取り出し、

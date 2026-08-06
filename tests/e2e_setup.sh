@@ -164,6 +164,18 @@ ensure_veil_binary() {
         VEIL_BIN="${PROJECT_DIR}/target/debug/veil"
     fi
 
+    # NetBSD は PaX MPROTECT がデフォルトでシステム全体に強制されており
+    # （`security.pax.mprotect.enabled`/`.global` = 1）、wasmtime が wasm 実行用に
+    # 行う実行可能メモリの mmap/mprotect が EACCES で失敗する（B-60、OpenBSD の
+    # MAP_STACK 強制・B-52 の NetBSD 版に相当）。paxctl(8) でバイナリの MPROTECT
+    # 制限を明示的に解除しておかないと WASM フィルタが軒並み動かない。
+    # 他 OS では uname が一致しないため常に no-op。失敗しても E2E 自体は続行する
+    # （paxctl 非搭載の最小環境や wasm 機能を使わない構成もあるため警告のみ）。
+    if [ "$(uname -s 2>/dev/null)" = "NetBSD" ] && [ -x /usr/sbin/paxctl ]; then
+        log_info "NetBSD: PaX MPROTECT を無効化 (paxctl +m ${VEIL_BIN})"
+        /usr/sbin/paxctl +m "${VEIL_BIN}" || log_warn "paxctl +m ${VEIL_BIN} に失敗（wasm E2E が失敗する可能性あり）"
+    fi
+
     wait_for_binary_ready "$VEIL_BIN" "veil" 300 || exit 1
     wait_for_binary_ready "$grpc_bin" "grpc-server" 120 || exit 1
     wait_for_binary_ready "$backends_bin" "test-backends" 120 || exit 1

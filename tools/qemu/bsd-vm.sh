@@ -1171,6 +1171,14 @@ cmd_build() {
     log "in-VM リリースビルド（--no-default-features --features ${CARGO_FEATURES}）"
     cmd_ssh "cd ${GUEST_ROOT} && $(_guest_env_prefix) cargo build --release --no-default-features --features '${CARGO_FEATURES}'"
     cmd_ssh "ls -l ${GUEST_ROOT}/target/release/veil"
+    # NetBSD は PaX MPROTECT がシステム全体で有効（security.pax.mprotect.*）なため、
+    # wasmtime の wasm 実行用 mmap/mprotect が EACCES で落ちる（B-60）。paxctl +m で
+    # ビルド直後のバイナリの MPROTECT 制限を解除しておく（無ければ警告のみで継続、
+    # 他 OS ゲストでは no-op）。e2e/fetch とも同じバイナリを参照するのでここで一度
+    # 掛けておけば十分。
+    if [[ "${OS_NAME}" == "netbsd" ]]; then
+        cmd_ssh "if [ -x /usr/sbin/paxctl ]; then /usr/sbin/paxctl +m ${GUEST_ROOT}/target/release/veil && echo 'paxctl +m applied'; else echo 'WARNING: paxctl not found, skipping PaX MPROTECT disable (wasm may fail, B-60)'; fi"
+    fi
 }
 
 # e2e: VM 内で tests/e2e_setup.sh test を実行する。
