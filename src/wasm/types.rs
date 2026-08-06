@@ -18,6 +18,15 @@ pub struct WasmConfig {
     /// Module definitions
     #[serde(default)]
     pub modules: Vec<ModuleConfig>,
+
+    /// Wasm を Cranelift ネイティブ JIT ではなく Pulley インタープリタで実行する。
+    ///
+    /// 既定 false（= Cranelift JIT）。true にすると `Config::target("pulley64")` /
+    /// `("pulley32")` を指定し、ネイティブコードを一切生成しない。
+    /// W^X 制約のある環境・実行可能 mmap を許可できない環境向け。
+    /// **OpenBSD ではこの値は常に無視され、常に Pulley が使われる**（B-52）。
+    #[serde(default)]
+    pub interpreter: bool,
 }
 
 /// Default WASM settings
@@ -168,6 +177,21 @@ impl WasmConfig {
     /// Validate WASM configuration
     pub fn validate(&self) -> anyhow::Result<()> {
         use std::collections::HashSet;
+
+        // OpenBSD/NetBSD では interpreter の値に関わらず常に Pulley を使う（B-52/F-140）。
+        // false が明示された場合は無視される旨を起動時に警告する（コールドパス）。
+        #[cfg(target_os = "openbsd")]
+        if !self.interpreter {
+            ftlog::warn!(
+                "[wasm] interpreter=false is ignored on OpenBSD; Pulley interpreter is always used (B-52)"
+            );
+        }
+        #[cfg(target_os = "netbsd")]
+        if !self.interpreter {
+            ftlog::warn!(
+                "[wasm] interpreter=false is ignored on NetBSD; Pulley interpreter is always used (F-140)"
+            );
+        }
 
         // モジュール名の重複チェック
         let mut module_names = HashSet::new();

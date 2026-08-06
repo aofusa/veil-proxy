@@ -19,3 +19,6 @@ AWS_LC_SYS_NO_PREFIX_x86_64_unknown_freebsd = { value = "0", force = true }
 AWS_LC_SYS_NO_PREFIX_aarch64_unknown_freebsd = { value = "0", force = true }
 AWS_LC_SYS_NO_PREFIX_x86_64_unknown_openbsd = { value = "0", force = true }
 AWS_LC_SYS_NO_PREFIX_aarch64_unknown_openbsd = { value = "0", force = true }
+# NetBSD も親と同じ値（"0"）だが、明示しておく（F-140、B-51 の教訓の対称性）。
+AWS_LC_SYS_NO_PREFIX_x86_64_unknown_netbsd = { value = "0", force = true }
+AWS_LC_SYS_NO_PREFIX_aarch64_unknown_netbsd = { value = "0", force = true }

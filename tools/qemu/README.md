@@ -16,6 +16,7 @@ veil を **各プラットフォーム×arch の実カーネル上**でビルド
 | Linux（io_uring/epoll） | ネイティブ/Docker で直接 | Docker クロスビルド + full-system QEMU で E2E（`linux-aarch64-e2e.sh`）。**KVM 不可ホストでは TCG が実用不能**（下記制約） | `aarch64-vm.sh` / `run-e2e-aarch64.sh` / `linux-aarch64-e2e.sh` |
 | FreeBSD | **VM 内ネイティブビルド**（KVM で実用速度。実測 ~30 分）。Docker クロスビルドは B-49 未解決で使えない | Rust Tier 3 のため **VM 内ネイティブビルド**（TCG のため低速） | `bsd-vm.sh freebsd {x86_64,aarch64}` |
 | OpenBSD | miniroot から autoinstall した VM で **ネイティブビルド**（KVM で実用速度） | 同左（TCG のため低速） | `bsd-vm.sh openbsd {x86_64,aarch64}` |
+| NetBSD（F-140、実 VM 未検証） | live image を起動し **VM 内ネイティブビルド**（`rust-bin` で数分程度に短縮できる見込み） | install ISO から sysinst 経由でインストールし **VM 内ネイティブビルド**（TCG のため低速） | `bsd-vm.sh netbsd {x86_64,aarch64}` |
 | macOS / Windows | ネイティブ実行ホストが無く **Docker クロスビルドのみ**（`docker/Dockerfile.{macos,windows}` / `packaging/scripts/build-cross.sh`） | 同左 | — |
 
 **なぜ Linux/macOS/Windows に QEMU が要らないか**: Linux x86_64 はホストそのもの、
@@ -25,14 +26,14 @@ QEMU を使う。
 
 ---
 
-## BSD 統合ヘルパ `bsd-vm.sh`（FreeBSD / OpenBSD × x86_64 / aarch64）
+## BSD 統合ヘルパ `bsd-vm.sh`（FreeBSD / OpenBSD / NetBSD × x86_64 / aarch64）
 
 `packaging/` が配布する BSD バイナリを**実 OS 上でビルド・E2E 検証**し、成果物を
 host 側へ取り出すための統合スクリプト。
 
 ```bash
 tools/qemu/bsd-vm.sh <os> <arch> <command> [args]
-#   os   : freebsd | openbsd
+#   os   : freebsd | openbsd | netbsd
 #   arch : x86_64 | aarch64
 ```
 
@@ -46,8 +47,11 @@ tools/qemu/bsd-vm.sh freebsd x86_64 all
 ./packaging/scripts/build-bsd.sh --os freebsd --arch x86_64 --from-qemu
 ```
 
-4 通り（freebsd/openbsd × x86_64/aarch64）すべて同じ形で実行できる。
+6 通り（freebsd/openbsd/netbsd × x86_64/aarch64）すべて同じ形で実行できる。
 取得済みのものをまとめてパッケージ化するなら `build-bsd.sh --all`。
+
+**NetBSD（F-140）は 2026-07-29 時点で実 VM 起動を未検証**（コード配線のみ完了。
+実際の起動確認・調整は本ドキュメント末尾「NetBSD で踏んだ落とし穴」節を参照）。
 
 > **所要時間の目安**（4 コア / KVM 有効ホスト）
 > x86_64 ゲストは KVM で加速されるため実用的（FreeBSD amd64 の
@@ -70,12 +74,25 @@ tools/qemu/bsd-vm.sh freebsd x86_64 all
 | `e2e` | VM 内で `tests/e2e_setup.sh test` |
 | `fetch` | VM 内の release バイナリを `packaging/build/veil-<os>-<arch>` へ取得 |
 
+> **`sync` / `build` / `e2e` / `fetch` は VM が起動済みであることが前提。**
+> 停止中に実行すると内部の `cmd_wait` が SSH 到達を **900 秒** 待ち続け、その間
+> **何も出力しないまま**タイムアウトして終了する（「無言でハングした」ように見える）。
+> 先に `up`（必要なら `wait`）を実行すること。起動しているかは `status`、
+> あるいは `docker ps` に `veil-<os>-<arch>` が出るかで確認できる。
+>
+> ```bash
+> tools/qemu/bsd-vm.sh openbsd x86_64 up
+> tools/qemu/bsd-vm.sh openbsd x86_64 wait 900
+> tools/qemu/bsd-vm.sh openbsd x86_64 e2e
+> ```
+
 ### provision の方式（OS で異なる）
 
 | OS | 方式 |
 |---|---|
 | FreeBSD | 配布の **BASIC-CLOUDINIT** イメージ + NoCloud シード。cloud-init が root パスワード設定と growfs を行い、**SSH 公開鍵はシリアルの getty へ root ログインして注入**する（`freebsd-provision.py --mode login`）。FreeBSD の cloud-init は `write_files` / `runcmd` を実行しないため鍵は cloud-init に任せられない |
 | OpenBSD | 配布 VM イメージが無いので **`miniroot<NN>.img` から autoinstall(8)** で無人インストールする（`openbsd-autoinstall.py`）。応答ファイルは helper コンテナ内の HTTP サーバから `http://10.0.2.2:8000/auto_install.conf` として配る。sets は HTTP ミラーから取得。鍵と sshd 設定は autoinstall が行う |
+| NetBSD（F-140、実 VM 未検証） | x86_64 は起動可能な **`-live.img.gz`**（生イメージ）をそのまま使う。cloud-init 相当が無いため、FreeBSD と同様に**シリアルへ root ログインして鍵を注入**する（`netbsd-provision.py`）。aarch64 は install ISO のみの配布のため **`sysinst` をシリアルから自動操作**してインストールし（`netbsd-autoinstall.py`）、完了後に ISO を外して再起動してから同じ `netbsd-provision.py` で鍵注入する |
 
 ### ポート割り当て
 
@@ -88,13 +105,16 @@ tools/qemu/bsd-vm.sh freebsd x86_64 all
 | freebsd aarch64 | 2320 | 2321 | 2322 |
 | openbsd x86_64 | 2330 | 2331 | 2332 |
 | openbsd aarch64 | 2340 | 2341 | 2342 |
+| netbsd x86_64 | 2350 | 2351 | 2352 |
+| netbsd aarch64 | 2360 | 2361 | 2362 |
 
 ### 主な環境変数
 
 | 変数 | 既定 | 意味 |
 |---|---|---|
 | `VEIL_QEMU_DIR` | `~/qemu-images` | VM 資材の親ディレクトリ |
-| `FREEBSD_VER` / `OPENBSD_VER` | `14.3-RELEASE` / `7.9` | ゲスト OS バージョン（OpenBSD の CDN は直近数リリースのみ保持） |
+| `FREEBSD_VER` / `OPENBSD_VER` / `NETBSD_VER` | `14.3-RELEASE` / `7.9` / `10.1` | ゲスト OS バージョン（OpenBSD の CDN は直近数リリースのみ保持） |
+| `NETBSD_PKG_VER` | `10.0` | NetBSD の pkgsrc バイナリパッケージのバージョン系列（OS バージョンとは別軸。`cdn.NetBSD.org` は `.../10.0/All/` を実際のクォータリー版（例 `10.0_2026Q2`）へリダイレクトする） |
 | `GROW_GB` | 24 | 起動ディスクに上乗せするサイズ |
 | `VM_SMP` / `VM_MEM_MB` | 4 / 4096 | vCPU / メモリ |
 | `VM_ROOT_PASSWORD` | `veil` | ゲスト root パスワード（コンソールデバッグ用。SSH は鍵のみ、ポートは 127.0.0.1 のみ） |
@@ -106,9 +126,11 @@ tools/qemu/bsd-vm.sh freebsd x86_64 all
 
 | ファイル | 役割 |
 |---|---|
-| `bsd-vm.sh` | **FreeBSD/OpenBSD × x86_64/aarch64 の統合ヘルパ**（本節） |
+| `bsd-vm.sh` | **FreeBSD/OpenBSD/NetBSD × x86_64/aarch64 の統合ヘルパ**（本節） |
 | `freebsd-provision.py` | FreeBSD の provision。`--mode login`（getty へ root ログインして鍵注入・**現行の既定経路**）/ `--mode ssh`（ローダメニュー経由 single-user）/ `--mode grow`（growfs） |
 | `openbsd-autoinstall.py` | OpenBSD の autoinstall(8) をシリアルコンソールから駆動 |
+| `netbsd-provision.py` | NetBSD x86_64（live image）のシリアルログイン provision（SSH 鍵注入・sshd 有効化）。aarch64 も sysinst 完了後のポストプロビジョンで再利用する（F-140、実機未検証） |
+| `netbsd-autoinstall.py` | NetBSD aarch64 の `sysinst` をシリアルコンソールから自動操作する（応答ファイル方式が無いためキー送出ベース。F-140、実機未検証） |
 | `console-dump.py` | シリアルコンソール（telnet）を非対話で読み出す（`console` サブコマンド） |
 | `serial-exec.py` | シリアルへ root ログインして**任意のコマンドを実行**する。SSH が上がらない／壊れた VM の切り分けと復旧に使う（例: unclean な UFS の `fsck` + `mount -u -w /`）。`--con-port` は `SSH_PORT+1` |
 | `qmp-sendkeys.py` | QMP 経由の `--key`/`--type`（ブラインド入力）・`--screendump`（ゲスト画面を PNG 化）・`--powerdown`。シリアルに何も出ない状況の切り分けに使う。QMP ポートは `SSH_PORT+2`。例: `python3 tools/qemu/qmp-sendkeys.py --port 2312 --screendump /w/screen.png`（`/w` = ホストの `${WORKDIR}`） |
@@ -134,7 +156,10 @@ tools/qemu/bsd-vm.sh freebsd x86_64 all
 | OpenBSD x86_64: `build`（`full-openbsd`） | **成功**（71分56秒。ring + システムアロケータ + quiche/BoringSSL の http3 を含む） |
 | OpenBSD x86_64: `fetch` → `build-bsd.sh` | **成功**（`veil-0.6.0-x86_64-unknown-openbsd.tar.gz` を生成） |
 | OpenBSD x86_64: `e2e` | **530 passed / 3 failed・SIGSEGV なし**（B-51 / B-52 / B-53 / B-54 修正後。全 533 件が実行される）。残り 3 件はいずれもタイムアウト系の負荷起因フレークで、単体実行では 3 件とも通る |
+| OpenBSD x86_64: `e2e`（v0.6.0 最終） | **535 passed / 6 failed / 1 ignored**（F-132〜F-141 + B-56/B-57/B-58 反映後、全 542 件）。**失敗 6 件は単独実行で全て成功**（http3_cache 系 4 件 0.28s / buffering_spillover 0.10s / h2c_large_request_body 0.04s / oversized_request_line 0.24s）＝負荷起因フレークで機能欠陥なし。ignored 1 件は B-58（Pulley で WAF が QUIC idle timeout を超過）。**HTTP/3 + WASM 4 件は全て成功**（B-58 を ignore 化するまでは WAF が HTTP/3 ワーカーを占有して巻き添えにしていた） |
 | OpenBSD aarch64 | **未実行**（スクリプトは同経路で対応済み。TCG のため長時間） |
+| NetBSD x86_64（F-140） | **setup / provision / toolchain / build まで実機で成功**（`NetBSD 10.1 amd64`、release ビルド 35分34秒・warning 0）。e2e は実施中。下記「NetBSD で踏んだ落とし穴」参照 |
+| NetBSD aarch64（F-140） | **未検証**（今回のスコープ外。ISO からの sysinst 自動操作は実機未確認で、`netbsd-autoinstall.py` のキー送出は実 ISO に対して調整が要る見込み。x86_64 は実機で build 成功済み） |
 | `linux-aarch64-e2e.sh` | **未実行**（KVM 非対応ホストでは TCG が実用不能） |
 
 ### FreeBSD amd64 で踏んだ落とし穴（すべて実測。再発しやすいので残す）
@@ -258,6 +283,110 @@ quiche が使う **BoringSSL（boring-sys）は OpenBSD を想定していない
 
 > aarch64（arm64）はこれらのうち 1・3・4 の影響を受けない。UEFI + efiboot が
 > ファームウェアの ConOut を引き継ぐためシリアルが既定で使え、素直に起動する。
+
+### NetBSD で踏んだ落とし穴（F-140、**実 VM で実測済み**）
+
+**2026-07-29 に実 VM（NetBSD 10.1 amd64 / QEMU）で確認した結果:**
+
+1. **x86_64 の live image はそのままブートでき、autoinstall は不要**（想定どおり）。
+   `-live.img.gz` を `qemu-img convert` で qcow2 化するだけで起動する。
+2. **カーネルコンソールは既定で VGA（`ttyE0`）。シリアルに getty が出ない。**
+   ブートローダのメニューはシリアルにも出るが、カーネル起動後の出力は VGA だけになる。
+   ブートメニューで `3`（Drop to boot prompt）→ `consdev com0` → `boot` とすると
+   シリアルがカーネルコンソールになり、`/etc/ttys` の `console` エントリが追従して
+   シリアルにログインプロンプトが出る。初回ログイン後に `/boot.cfg` へ
+   `consdev=com0` を書き込めば以降は自動（`netbsd-provision.py` が実施）。
+3. **ブートメニューのカウントダウンは 5 秒しかない。**
+   `-serial ...,server,nowait` + 固定 `sleep` では qemu/docker の起動オーバーヘッドで
+   カウントダウンを消費してしまい、メニューを一度も観測できずに VGA へ自動ブートする。
+   **`CONSOLE_WAIT=1`（`server,wait`）** でスクリプト接続まで qemu を待たせること。
+4. **メニューの `Option: [1]:` プロンプトは単一キーではなく行入力。**
+   `send("3")` ではなく `sendline("3")` が必要（実測）。
+5. **SSH 非対話シェルの既定 PATH に `/usr/sbin` が無い**
+   （実測: `PATH=/usr/bin:/bin:/usr/pkg/bin:/usr/local/bin`）。
+   `pkg_add(8)` は `/usr/sbin` にあるため**絶対パスで呼ぶ**必要がある。
+   `pkgin` も `/usr/pkg/bin` なので同様。
+6. **`uname -m` は `amd64` を返すが pkgsrc のパス要素は `x86_64`**
+   （`amd64` は `x86_64` へ 302 リダイレクト）。また **NetBSD のリリース番号（10.1）と
+   pkgsrc パッケージのディレクトリ番号（10.0）は異なる**。
+7. **Rust は `rust-bin`（バイナリパッケージ）を使うこと。** ソースの `rust` は
+   QEMU 上で数時間かかる。
+8. **wasmtime 40 は NetBSD を全アーキテクチャでサポートしない（B-55 更新）。**
+   `cargo build --no-default-features --features full-netbsd`（当時 `wasm` 込み）が
+   依存の wasmtime でコンパイルエラーになった:
+   ```
+   error: unsupported platform
+     --> wasmtime-40.0.4/src/runtime/vm/sys/unix/signals.rs:329:13
+         compile_error!("unsupported platform");
+   error: unsupported platform
+     --> wasmtime-40.0.4/src/runtime/vm/sys/unix/signals.rs:401:13
+   error: could not compile `wasmtime` (lib) due to 2 previous errors
+   ```
+   wasmtime のシグナルベーストラップ実装（`signals.rs`）には NetBSD 向けの
+   `ucontext` 分岐が一切無く、**x86_64 ですら**このエラーになる。B-55 は当初
+   「BSD × aarch64 のみ非対応」という内容だったが、NetBSD は x86_64 を含む全
+   アーキテクチャで非対応であることが判明したため範囲を拡張した
+   （`has_native_signals` はホストの target_arch から wasmtime の build.rs が
+   導出するため cargo feature で無効化できず、Pulley インタープリタへの切替でも
+   回避できない）。対応として `Cargo.toml` の `full-netbsd` からも `wasm` を除外した
+   （`full-netbsd-aarch64` は元々除外済み）。詳細は
+   `docs/backlog/bugs/B-55-wasmtime-no-bsd-aarch64.md` 参照。
+
+以下は設計時点の想定として残す（上記で否定/確認された項目を含む）。
+
+NetBSD は 2026-07-28 時点で入手性のみ実地確認済み（ゲストイメージ URL・pkgsrc
+バイナリパッケージ URL とも `curl -sIL` で HTTP 200 を確認済み）。**実際の QEMU
+起動・provision・toolchain・build・e2e はコーディネーターが別途行う**ため、以下は
+FreeBSD/OpenBSD の実測知見から類推した設計上の想定であり、実機での検証で変わる
+可能性が高い。
+
+1. **x86_64 は live image を使うことで OpenBSD のような autoinstall が不要という
+   想定。** `-live.img.gz` は起動可能な生イメージ（rootfs 込み）なので、
+   `qemu-img convert` で qcow2 化するだけでブート可能なはず。ただし cloud-init
+   相当が無いため、SSH 鍵注入は FreeBSD の `--mode login` と同じ発想で
+   **シリアルへ root ログインして行う**（`netbsd-provision.py`）。
+   - NetBSD の live image が **root パスワード空**でログインできるか、
+     ネットワークが起動時に自動設定（dhcpcd 等）されるかは未検証。
+   - x86 のブートローダ（boot.cfg）が既定でシリアルへ出力するか、VGA
+     コンソールへ出力しメニュー操作でシリアルへ切り替える必要があるかは
+     FreeBSD/OpenBSD 同様に不透明（`netbsd-provision.py` はどちらにも
+     対応しようとするベストエフォート実装）。
+2. **aarch64 は install ISO のみで、`sysinst` の自動操作が要る。**
+   OpenBSD の `autoinstall(8)` と違い、NetBSD の `sysinst` には応答ファイル方式が
+   無い。`netbsd-autoinstall.py` は一般的な sysinst の操作手順（言語選択 →
+   メインメニュー → ディスク選択 → GPT 全体パーティション → CD-ROM からの
+   セット取得 → 確認 → インストール）を**キー送出**で推定実装しているが、
+   **実際のメニュー文言・キー割り当てはリリースにより変わりうる**ため、
+   `console-dump.py` で実際の画面遷移を確認して調整する必要が高い見込み。
+   - sysinst 完了後、ISO が bootindex=0 のまま reboot すると再びインストーラへ
+     戻ってしまうため、`netbsd-autoinstall.py` は**インストール完了で終了するだけ**
+     にしてある。`bsd-vm.sh` 側で ISO を外して起動し直してから
+     `netbsd-provision.py` で SSH 鍵注入する 2 段構成にした（FreeBSD/OpenBSD には
+     無い NetBSD 固有の構成）。
+3. **toolchain は `rust-bin`（バイナリ）を使うことが必須。**
+   pkgsrc には `rust`（ソースビルド）と `rust-bin`（プリビルド）が並存する。
+   `rust` を選ぶと OpenBSD のソースビルドと同様に QEMU 上で数時間かかるため、
+   `cmd_toolchain` は明示的に `rust-bin` を指定する。`pkgin` 自体が既定で
+   入っているかは不明なため、`command -v pkgin` が失敗したら `pkg_add -v pkgin`
+   で bootstrap するようにしてある（bootstrap kit の入手方法は他にもあり、
+   実機で失敗する場合は要調整）。
+4. **pkgsrc のパッケージバージョン系列（`NETBSD_PKG_VER`）は OS バージョンと別軸。**
+   `cdn.NetBSD.org/pub/pkgsrc/packages/NetBSD/<arch>/10.0/All/` は実際には
+   `10.0_2026Q2/All/` 等へ 302 リダイレクトされる（`curl -fL` で追従される）。
+   NetBSD 10.1 の OS イメージに対して pkgsrc は `10.0` 系列を使う点に注意
+   （タスク依頼時点の実地調査結果をそのまま採用）。
+5. **x86_64 と aarch64 で Rust のバージョンが異なる**（pkgsrc `rust-bin-1.96.0` /
+   `rust-bin-1.91.1`）。veil の MSRV を満たすかは実機 toolchain 実行時に
+   `cargo --version` で確認すること。
+6. **GUEST_ROOT / パーティションサイズは未検証。** OpenBSD の autoinstall auto
+   layout のように `/` が極端に小さい構成になるかは、NetBSD の live image /
+   sysinst のデフォルトパーティショニング次第。ビルドが `No space left on
+   device` で落ちる場合は OpenBSD と同様に `GUEST_ROOT` を広いパーティションへ
+   変更する対応が要る（`bsd-vm.sh` の `GUEST_ROOT` 環境変数で上書き可能）。
+7. **NetBSD には pledge/unveil 相当が無い。** サンドボックス面は chroot(2) +
+   特権降格のみ（`src/security.rs` の `netbsd` モジュール、F-140 コード側で
+   実装済み）。VM 内 E2E で capsicum/pledge 相当のテストケースが skip される
+   想定になっているか要確認。
 
 ## Linux aarch64（io_uring、`aarch64-vm.sh`）
 

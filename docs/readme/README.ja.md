@@ -94,9 +94,10 @@ io_uring（独自実装ランタイム）と rustls を使用した高性能リ�
 |---|---|---|---|---|
 | **Linux（デフォルト）** | io_uring（`src/runtime/uring/`） | seccomp + Landlock + CBPF | ✅（Linux 5.15+） | デフォルト features 不変・性能非劣化 |
 | **Linux `--features epoll`** | epoll readiness reactor（`src/runtime/reactor/`） | seccomp（epoll 系許可・io_uring 系除外）+ Landlock | ✅ | io_uring 非対応ホスト向けフォールバック |
-| **FreeBSD（x86_64/aarch64）** | kqueue readiness reactor（`--features aio` で POSIX AIO 経路にも切替可・F-127） | capsicum（`cap_rights_limit` / `cap_enter`）+ jail | ✅（FreeBSD 13.0+、`TCP_TXTLS_ENABLE`/`TCP_RXTLS_ENABLE`; F-126） | `[security] enable_capsicum` / `capsicum_capability_mode` / `jail_name` |
+| **FreeBSD（x86_64/aarch64）** | kqueue readiness reactor（`--features aio` で POSIX AIO 経路にも切替可・F-127） | capsicum（`cap_rights_limit` / `cap_enter`）+ jail | ✅（FreeBSD 13.0+、`TCP_TXTLS_ENABLE`/`TCP_RXTLS_ENABLE`; F-126） | `[security] enable_capsicum` / `capsicum_capability_mode` / `jail_name`。TLS 証明書ホットリロード（H1/H2・HTTP/3 とも）は capsicum capability mode 下でも動作する（F-136）: cert/key の親ディレクトリ fd を `cap_enter` 前に確保し `openat`/`fstatat`（`O_RESOLVE_BENEATH`）で読む。`http3`（quiche）は rustls との `aws-lc-sys` 共有をやめ **`boringssl-boring-crate`**（外部 `boring` crate）へ切替済みで、パスを一切介さない in-memory `SSL_CTX` API で証明書を再構築できる |
 | **OpenBSD（x86_64/aarch64）** | kqueue readiness reactor | pledge + unveil | ✗（ユーザ空間 rustls） | `[security] enable_pledge` / `enable_unveil`。TLS は rustls の **ring** プロバイダを使用（aws-lc-rs は OpenBSD でハンドシェイク未完・F-122）。**WASM は Pulley インタープリタで動作**（B-52）: OnDemand インスタンスアロケータ + `MAP_STACK` 付きファイバスタックと併用する（wasmtime のプーリングアロケータは `with_host_stack` を黙って無視し、OpenBSD は SP が `MAP_STACK` 領域外だとプロセスを殺すため）。Pulley はネイティブコードを生成しないので `wxallowed` なファイルシステムが不要（速度はインタープリタ相当）。静的配信/プロキシとも HTTPS 200 検証済み |
-| **macOS（x86_64/aarch64、universal2）** | kqueue readiness reactor（FreeBSD/OpenBSD と共通実装を再利用） | `sandbox_init`（Seatbelt） | ✗（ユーザ空間 rustls） | `[security] enable_sandbox_macos`。TLS は rustls の **aws_lc_rs** プロバイダ、`http3`（quiche）は内蔵 BoringSSL を使用（F-131）。`docker/Dockerfile.macos`（`cargo zigbuild --target universal2-apple-darwin --features full`）でクロスビルドし、実機で動作確認済み |
+| **NetBSD（x86_64/aarch64）** | kqueue readiness reactor | **chroot(2) + 特権降格のみ（pledge/unveil 相当は無い）**（F-140） | ✗（ユーザ空間 rustls） | `[security] chroot_dir`（opt-in、`chroot(2)` + `chdir("/")`。`drop_privileges_user`/`drop_privileges_group` による setuid/setgid より前に適用）。NetBSD には OpenBSD の pledge/unveil に相当するランタイム API が無い（Veriexec はカーネル設定・ロード時整合性検証機構でプロセス自身が呼べる syscall フィルタではなく、`secmodel_securelevel` はシステム全体の起動時設定）。veil は非対応であることを起動時ログで正直に報告する（`security::netbsd::report_security_support`）。TLS は OpenBSD と同じ rustls **ring** + quiche **boringssl-boring-crate**。**NetBSD では Proxy-Wasm は利用できない**（アーキテクチャ不問）: wasmtime 40 のシグナルベーストラップ実装には NetBSD 向けの `ucontext` 分岐が一切無く、実機（NetBSD 10.1 amd64、B-55）で確認したところ x86_64 ですら `signals.rs` が `error: unsupported platform` でコンパイルできない。Pulley インタープリタへの切替でも回避できない（失敗は wasmtime 自体の build.rs 判定の時点で起きるため、`Config::target` の選択より前の話）。`full-netbsd`/`full-netbsd-aarch64` はいずれも `wasm` を含めない。それ以外はコードは完成済みで、QEMU での実ビルド・E2E は別チケット（`docs/backlog/features/F-140-netbsd-support.md`） |
+| **macOS（x86_64/aarch64、universal2）** | kqueue readiness reactor（FreeBSD/OpenBSD/NetBSD と共通実装を再利用） | `sandbox_init`（Seatbelt） | ✗（ユーザ空間 rustls） | `[security] enable_sandbox_macos`。TLS は rustls の **aws_lc_rs** プロバイダ、`http3`（quiche）は内蔵 BoringSSL を使用（F-131）。`docker/Dockerfile.macos`（`cargo zigbuild --target universal2-apple-darwin --features full`）でクロスビルドし、実機で動作確認済み |
 | **Windows（x86_64-pc-windows-msvc / aarch64-pc-windows-msvc）** | WSAPoll readiness reactor（`src/runtime/reactor/wsapoll.rs`、`src/runtime/reactor/tcp/windows.rs`、Winsock） | Job Object（best-effort） | ✗（ユーザ空間 rustls） | `[security] enable_job_object_windows`。TLS は両 arch とも rustls の **aws_lc_rs** プロバイダ、`http3`（quiche）は内蔵 BoringSSL を使用（F-131）。`docker/Dockerfile.windows`（`cargo xwin build --target <target> --features full`。`packaging/scripts/build-cross.sh --target windows` で両 arch を一括ビルド）でクロスビルドし、実機で動作確認済み |
 
 - バックエンドは `build.rs` 発行の cfg（`veil_rt_uring` / `veil_rt_reactor`、
@@ -111,6 +112,12 @@ io_uring（独自実装ランタイム）と rustls を使用した高性能リ�
   `tests/e2e_setup.sh test` → バイナリ取得までを一括で扱う（x86_64 ゲストはホストに
   `/dev/kvm` があれば KVM 加速される）。tar.gz + rc.d/jail.conf のパッケージングは
   `packaging/scripts/build-bsd.sh` 参照。
+  **NetBSD 対応（F-140）はコード側は完成しているが `bsd-vm.sh`/`build-bsd.sh` への
+  組み込みは未着手**（QEMU VM 構築・E2E は別チケット
+  `docs/backlog/features/F-140-netbsd-support.md` で扱う）。本開発環境には NetBSD 向け
+  C クロスコンパイラも無いため、`cargo check --target x86_64-unknown-netbsd` は
+  `ring`/`boring` のネイティブビルドスクリプトの時点で失敗し veil 自身のコードへは
+  到達できていない。
   `x86_64-unknown-freebsd` 向けに `docker/Dockerfile.freebsd` を用意しているが
   （zig が FreeBSD libc を同梱しており Rust Tier 2）、**現在リンク段で失敗する**。
   aws-lc-sys の s2n-bignum アセンブリが FreeBSD クロス構成で 1 つも組み立てられず
@@ -142,13 +149,20 @@ io_uring（独自実装ランタイム）と rustls を使用した高性能リ�
   両 arch とも **aws_lc_rs**、`http3`（quiche）は内蔵 BoringSSL を使用する。
   既定は `--features full`（`http3`・`wasm`・`l4-proxy` を含む）で、実機で動作確認済み。
   `ktls` は Linux/FreeBSD 専用のため対象外。
-- **TLS 暗号プロバイダ / quiche 暗号バックエンドのターゲット分割（F-122/F-131）**:
-  rustls のプロバイダは **OpenBSD のみ `ring`**、それ以外（Linux/FreeBSD/macOS/Windows）は
-  `aws_lc_rs`（`src/tls_provider.rs` と `Cargo.toml` の target 別依存を一致させること）。
-  `http3` の quiche は **Linux/FreeBSD で `aws-lc-sys` を共有**し、
-  **macOS/Windows/OpenBSD では内蔵 BoringSSL**（`boring`）を使う。この切り替えが
-  `AWS_LC_SYS_NO_PREFIX` であり、値は
-  [`.cargo/config.toml`](../../.cargo/config.toml) の `[env]` のみで設定する（B-47）。
+- **TLS 暗号プロバイダ / quiche 暗号バックエンドのターゲット分割（F-122/F-131/F-136/F-140）**:
+  rustls のプロバイダは **OpenBSD/NetBSD のみ `ring`**（NetBSD は未検証だが OpenBSD と
+  同じ Tier 3 サポート不足の懸念があるため保守的に合わせた）、それ以外
+  （Linux/FreeBSD/macOS/Windows）は `aws_lc_rs`（`src/tls_provider.rs` と `Cargo.toml` の
+  target 別依存を一致させること）。
+  `http3` の quiche は **Linux でのみ `aws-lc-sys` を共有**し（memfd 経由の従来証明書ロード、
+  無変更）、**FreeBSD/macOS/Windows/OpenBSD/NetBSD では `boringssl-boring-crate`**（外部
+  `boring` crate）を使う。FreeBSD は F-136（capsicum capability mode 下での証明書ホットリロード）で
+  `aws-lc-sys` 共有から切り替えた: `Config::with_boring_ssl_ctx_builder` という
+  パスを一切介さない in-memory `SSL_CTX` 構築 API が `boringssl-boring-crate` でしか
+  提供されないため。`aws-lc-sys`（`NO_PREFIX=1`）と外部 `boring` crate を同一バイナリに
+  同居させるとリンク時に重複シンボルエラーになることを実験で確認済み
+  （`docs/artifacts/f136_platform_design.md`）。この切り替えが `AWS_LC_SYS_NO_PREFIX` であり、
+  値は [`.cargo/config.toml`](../../.cargo/config.toml) の `[env]` のみで設定する（B-47）。
 
 ## ビルド
 
@@ -248,8 +262,8 @@ Docker コンテナでのインストール・起動・curl 動作確認（両�
 > **注意**: `--features full` でビルドする場合、`http3` フィーチャーが aws-lc-sys の `libssl` をビルドするため cmake が、`aws-lc-rs` がアセンブリ最適化を使用するため `nasm` が、それぞれコンテナ内にインストールされている必要があります。`http3` を含まないデフォルトビルドでは cmake は不要です。
 >
 > **`AWS_LC_SYS_NO_PREFIX`（ターゲット別、B-47）**: `http3` / `full` ビルドでのこの値は [`.cargo/config.toml`](../../.cargo/config.toml) の `[env]` テーブル**のみ**で設定します。aws-lc-sys がターゲット別に優先して読む変数名（`AWS_LC_SYS_NO_PREFIX_<トリプルの - を _ にしたもの>`）を列挙する方式です。
-> - **Linux / FreeBSD → `1`**: quiche が rustls と同じ**非プレフィックス**の AWS-LC シンボルへリンクする（`aws-lc-sys` を 1 つ共有）。
-> - **Windows / macOS / OpenBSD → `0`**: quiche は内蔵 BoringSSL を使うため、`aws-lc-sys` 側はプレフィックスを維持して共存させる。
+> - **Linux → `1`**: quiche が rustls と同じ**非プレフィックス**の AWS-LC シンボルへリンクする（`aws-lc-sys` を 1 つ共有）。
+> - **FreeBSD / Windows / macOS / OpenBSD → `0`**: quiche は外部 `boringssl-boring-crate`（`boring`）を使うため、`aws-lc-sys` 側はプレフィックスを維持して共存させる。FreeBSD は F-136 で capsicum capability mode 下の証明書ホットリロード（quiche の in-memory `SSL_CTX` API が `boringssl-boring-crate` 限定）のためここへ移った。
 >
 > cargo には**ターゲット別の環境変数設定が存在せず**（`[target.<triple>.env]` は警告もなく無視される）、`build.rs` から依存クレートのビルドスクリプトへ環境変数を渡すこともできません（依存側が先に別プロセスで実行されるため）。この変数を Dockerfile や packaging スクリプトで設定してはいけません（設定箇所は `.cargo/config.toml` 1 箇所）。
 
@@ -257,7 +271,7 @@ Docker コンテナでのインストール・起動・curl 動作確認（両�
 > 主な注意点：
 > - **デフォルトフィーチャー**: `ktls`、`http2`、`mimalloc`
 > - **`full`**: 全フィーチャーを有効化（`ktls`、`http2`、`http3`、`grpc-full`、`wasm`、`compression`、`cache`、`metrics`、`websocket`、`rate-limit`、`buffering`、`mimalloc`）
-> - **`full-freebsd` / `full-openbsd`**: `full` と機能セットは同一でアロケータのみ異なる BSD 向けセット。`full-freebsd` は **jemalloc** + **`aio`**（FreeBSD POSIX AIO、F-127）、`full-openbsd` は**システムアロケータ**で、`wasm` は wasmtime の **Pulley インタープリタ**経由で動作する（B-52）。cargo にターゲット別 default features が無いため、packaging のスクリプトが `--no-default-features` と併せて明示指定する（`packaging/scripts/build-cross.sh --target freebsd`、`tools/qemu/bsd-vm.sh <os> <arch> build|e2e`）。素の `--features full` の挙動は従来どおり変わらない。
+> - **`full-freebsd` / `full-openbsd` / `full-netbsd`**: `full` と機能セットは同一でアロケータのみ異なる BSD 向けセット。`full-freebsd` は **jemalloc** + **`aio`**（FreeBSD POSIX AIO、F-127）、`full-openbsd`/`full-netbsd` は**システムアロケータ**を使う。`full-openbsd` の `wasm` は wasmtime の **Pulley インタープリタ**経由で動作する（B-52）。`full-netbsd` は `wasm` を含めない（wasmtime が全アーキテクチャで NetBSD 非対応のため、B-55）。TLS はいずれも同梱構成（FreeBSD は rustls+aws_lc_rs、OpenBSD/NetBSD は rustls+ring。quiche は 3 者とも同梱 BoringSSL）。`full-freebsd-aarch64`/`full-openbsd-aarch64`/`full-netbsd-aarch64` は同構成から `wasm` を除いたもの（B-55）。cargo にターゲット別 default features が無いため、packaging のスクリプトが `--no-default-features` と併せて明示指定する（`packaging/scripts/build-cross.sh --target freebsd`、`tools/qemu/bsd-vm.sh <os> <arch> build|e2e`）。素の `--features full` の挙動は従来どおり変わらない。
 > - **アロケータフィーチャー**（`mimalloc`、`jemalloc`、`system-allocator`）は排他的 — 複数同時有効化不可
 > - HTTP/3 は UDP ベースのため kTLS と併用不可
 
@@ -1733,6 +1747,7 @@ idle_timeout_secs = 30          # 30秒無通信でクライアントセッシ�
 | `max_connections` | 最大同時接続数/セッション数（0 = 無制限） | `0` |
 | `connect_timeout_secs` | upstream接続タイムアウト（秒、TCPのみ） | `10` |
 | `idle_timeout_secs` | アイドルタイムアウト（秒）。この時間通信がなければ接続/セッションを切断 | `600` |
+| `wasm_modules` | WASM network filter モジュール名一覧（`wasm` feature 必須、F-133）。空（既定）なら WASM 無効で従来どおり `splice`/ゼロコピー経路を使う。指定すると `splice` を使わずユーザー空間バッファ経由の転送へ切り替わり、`proxy_on_downstream_data`/`proxy_on_upstream_data` でデータを検査・書き換えできる（切替判定は接続確立時に1回のみ） | `[]` |
 | `upstreams[].addr` | upstreamアドレス（`"host:port"` 形式） | 必須 |
 | `upstreams[].weight` | 重み（weighted RR用、現在予約） | `1` |
 | `health_check` | ヘルスチェック設定（upstreamのhealth_checkと同形式） | なし |
@@ -1829,7 +1844,8 @@ servers = ["http://api1:8080", "http://api2:8080"]
 - **既存のTLS接続**は旧証明書を使い続ける（接続断なし）。
 - **新しいTLSハンドシェイク**は自動的に新証明書を使用。
 - SIGHUPシグナルでも設定リロードと同時に即時更新。
-- **HTTP/1.1・HTTP/2 に加え、HTTP/3（QUIC/quiche）もホットリロード対応**（F-105）。HTTP/3 は各ワーカーが自身の `quiche::Config` を保持するため、リロードスレッドが cert/key の生 PEM を `ArcSwap` でアトミックに配信し、各ワーカーがイベントループ先頭の安価な世代ゲート（差分検知時のみ）で `memfd` 経由（Landlock 互換・FS 非経由）に差し替える。既存 QUIC 接続は影響を受けず、新規ハンドシェイクのみ新証明書を提示する。全ワーカーの適用完了後、秘密鍵の平文はメモリ上でゼロ化（`secure_zero`）される。
+- **HTTP/1.1・HTTP/2 に加え、HTTP/3（QUIC/quiche）もホットリロード対応**（F-105）。HTTP/3 は各ワーカーが自身の `quiche::Config` を保持するため、リロードスレッドが cert/key の生 PEM を `ArcSwap` でアトミックに配信し、各ワーカーがイベントループ先頭の安価な世代ゲート（差分検知時のみ）で反映する。**Linux** は `memfd` 経由（Landlock 互換・FS 非経由）に差し替える。**FreeBSD/OpenBSD/macOS/Windows**（F-136）は `Config::with_boring_ssl_ctx_builder` で `quiche::Config` を丸ごと in-memory 再構築し、PEM バイト列を直接 `boring::ssl::SslContextBuilder` へ渡す（ファイル・パス・memfd を一切介さない）。これにより FreeBSD capsicum capability mode 下（パス指定の `open`/`stat` が `ECAPMODE` になる環境）でも証明書リロードが継続動作する。既存 QUIC 接続は影響を受けず、新規ハンドシェイクのみ新証明書を提示する。全ワーカーの適用完了後、秘密鍵の平文はメモリ上でゼロ化（`secure_zero`）される。
+- **capability mode 下の H1/H2 リロード**（F-136）: FreeBSD capsicum capability mode では、rustls `ServerConfig` 用の cert/key 読み取り（mtime 検査 + PEM 読み込み）を単一チョークポイント `tls_reload::pem_mtime`/`read_pem` に集約し、`cap_enter` 前に確保した dirfd（`security::capsicum::init_tls_cert_dirfds`）経由の `openat`/`fstatat`（`O_RESOLVE_BENEATH`）へ切り替える。Linux/macOS/Windows/OpenBSD は挙動不変（引き続き `std::fs`）。
 
 ### 設定
 
@@ -2732,6 +2748,10 @@ VeilはProxy-Wasm ABI v0.2.1に完全準拠したWASM拡張システムを提供
 - **Pooling Allocator**: 高速なインスタンス化
 - **非同期実行（Head-of-Line ブロッキングなし）**: wasmtime async support + Fuel ベースの協調的 yield（約10k命令ごと）で実行。CPU バウンドなフィルタが io_uring ワーカーの他 I/O をストールさせない
 - **Capability制限**: モジュールごとの細かい権限制御（デフォルト全て無効）
+- **Pulley インタープリタ選択**（`[wasm] interpreter = true`、F-135）: Cranelift ネイティブ JIT の代わりに wasmtime の Pulley ポータブルバイトコードインタープリタで実行し、ネイティブコードを一切生成しない。W^X 制約のあるホストや実行可能 `mmap` を許可できない環境向け。ネイティブ JIT より低速。既定は `false`（Cranelift JIT）。AOT サイドカーキャッシュはファイル名を分離（`.pulley.cwasm`）し、JIT 版と Pulley 版が同じキャッシュを奪い合って毎回再コンパイルする事態を避ける。**OpenBSD ではこの設定は常に無視され、常に Pulley が使われる**（B-52。`interpreter = false` を明示指定すると起動時に警告ログが出るが無視される）
+- **HTTP/3 が HTTP/1.1・HTTP/2 と同等のライフサイクルに対応**（F-132）: HTTP/3 経路でも `on_log` がすべての離脱点（`LocalResponse` による早期 return を含む）から確実に呼ばれるようになり、`Backend::File`（静的配信）ルートにも `on_response_headers` フィルタが適用される。`Backend::Proxy` ルートではリクエスト/レスポンスボディフィルタ（`on_request_body`/`on_response_body`）も動作する（HTTP/3 は WASM 適用時に本文全体を既にバッファしているため `end_of_stream=true` の1回呼びで実装）。レスポンス本文を書き換えた場合は `content-length` を新しい長さへ更新し、nghttp3 の `H3_MESSAGE_ERROR`（本文長不一致・重複)を回避する。
+- **gRPC トレイラーフィルタ**（F-133）: gRPC over H2C で `on_request_trailers`/`on_response_trailers` が実行されるようになり、レスポンストレイラーの `grpc-status`/`grpc-message` を書き換えたり、クライアント送信のリクエストトレイラーを見て `LocalResponse` でリクエストを拒否できる。リクエストトレイラーは観測のみ（バックエンドへの転送機構は無い）。レスポンストレイラーの `Pause`/`LocalResponse` は HEADERS/DATA が送出済みのため適用できず、元のトレイラーをそのまま通して警告ログを出す。
+- **L4 network filter（Proxy-Wasm `StreamContext` ABI）**（F-133）: `[[l4]]` TCP リスナーに `wasm_modules = ["name"]` を指定すると、生バイト列を検査・書き換えできる（`proxy_on_new_connection`、`proxy_on_downstream_data`、`proxy_on_upstream_data`、`proxy_on_downstream_connection_close`、`proxy_on_upstream_connection_close`）。データは `BufferType::DownstreamData`/`UpstreamData`（値 `2`/`3`）として `proxy_get_buffer_bytes`/`proxy_set_buffer_bytes` 経由でアクセスし、`proxy_close_stream` で接続をクローズできる。**未設定時はコスト増なし**: `wasm_modules` が空（既定）なら従来どおり `splice`/ゼロコピー経路のまま `is_empty()` 判定 1 つだけが追加コスト。モジュールを設定すると（接続確立時に1回だけ）`splice` を使わないユーザー空間バッファ経由の転送へ切り替わる（WASM にデータを見せる必要があるため）。
 
 ### ビルド
 
@@ -2744,6 +2764,10 @@ cargo build --release --features wasm
 ```toml
 [wasm]
 enabled = true
+
+# Cranelift ネイティブ JIT の代わりに Pulley インタープリタで実行する（F-135）。
+# デフォルト: false。OpenBSD では常に true 相当（B-52、この設定値は無視される）。
+# interpreter = false
 
 # デフォルト設定（オプション）
 [wasm.defaults]
@@ -2784,6 +2808,7 @@ allowed_upstreams = ["webdis"]  # HTTP呼び出し許可先
 | オプション | 説明 | デフォルト |
 |-----------|------|-----------|
 | `max_execution_time_ms` | WASM呼び出しごとの最大実行時間（ミリ秒） | 100 |
+| `interpreter` | Cranelift ネイティブ JIT の代わりに Pulley インタープリタで実行する（F-135）。OpenBSD では常に `true` 相当（B-52） | false |
 
 #### Poolingアロケータ設定
 
@@ -2810,6 +2835,10 @@ allowed_upstreams = ["webdis"]  # HTTP呼び出し許可先
 | `allow_response_headers_write` | レスポンスヘッダー書き換え | false |
 | `allow_response_body_read` | レスポンスボディ読み取り | false |
 | `allow_response_body_write` | レスポンスボディ書き換え | false |
+| `allow_downstream_data_read` | L4 downstream（クライアント→proxy）接続データ読み取り（F-133） | false |
+| `allow_downstream_data_write` | L4 downstream 接続データ書き換え（F-133） | false |
+| `allow_upstream_data_read` | L4 upstream（proxy→バックエンド）接続データ読み取り（F-133） | false |
+| `allow_upstream_data_write` | L4 upstream 接続データ書き換え（F-133） | false |
 | `allow_send_local_response` | ローカルレスポンス送信 | false |
 | `allow_http_calls` | HTTP外部呼び出し | false |
 | `allowed_upstreams` | 許可upstream | [] |

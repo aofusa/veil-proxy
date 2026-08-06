@@ -32,7 +32,7 @@ fn feature_enabled(name: &str) -> bool {
 /// | `veil_rt_uring` | `target_os = "linux"` かつ `not(feature = "epoll")` | io_uring 完了ベースランタイム |
 /// | `veil_rt_reactor` | 上記以外（linux+epoll、freebsd、openbsd、macos、windows） | readiness ベースランタイム |
 /// | `veil_poller_epoll` | `target_os = "linux"` かつ `feature = "epoll"` | reactor の poller = epoll |
-/// | `veil_poller_kqueue` | `target_os = "freebsd"`、`"openbsd"`、`"macos"` | reactor の poller = kqueue |
+/// | `veil_poller_kqueue` | `target_os = "freebsd"`、`"openbsd"`、`"macos"`、`"netbsd"`（F-140） | reactor の poller = kqueue |
 /// | `veil_poller_wsapoll` | `target_os = "windows"` | reactor の poller = WSAPoll（F-125、cfg 発行のみ。実装は別作業） |
 /// | `veil_ktls` | `feature = "ktls"` かつ (`target_os = "linux"` または `"freebsd"`) | kTLS カーネルオフロード経路（F-126: FreeBSD 対応追加。OpenBSD は非対応のまま） |
 /// | `veil_aio` | `feature = "aio"` かつ `target_os = "freebsd"` | POSIX AIO（`aio_read`/`aio_write` + `EVFILT_AIO`）による TCP read/write 経路（F-127。FreeBSD 専用、既定オフ） |
@@ -62,7 +62,7 @@ fn emit_runtime_backend_cfg() {
                 println!("cargo::rustc-cfg=veil_rt_uring");
             }
         }
-        "freebsd" | "openbsd" | "macos" => {
+        "freebsd" | "openbsd" | "macos" | "netbsd" => {
             if epoll {
                 panic!(
                     "veil build.rs: --features epoll is only meaningful on Linux \
@@ -95,7 +95,7 @@ fn emit_runtime_backend_cfg() {
             panic!(
                 "veil build.rs: unsupported target_os \"{other}\" — veil currently \
                  supports target_os = \"linux\", \"freebsd\", \"openbsd\", \"macos\", \
-                 \"windows\" only (F-120/F-125)"
+                 \"netbsd\", \"windows\" only (F-120/F-125/F-140)"
             );
         }
     }

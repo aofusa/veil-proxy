@@ -358,6 +358,8 @@ mod tests {
             health_check: None,
             connect_timeout_secs: 10,
             idle_timeout_secs: 1,
+            #[cfg(feature = "wasm")]
+            wasm_modules: Vec::new(),
         }
     }
 

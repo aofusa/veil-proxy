@@ -13,6 +13,9 @@ fn get_buffer(state: &HostState, buffer_type: i32) -> Option<bytes::Bytes> {
     match buffer_type {
         HTTP_REQUEST_BODY => Some(state.http_ctx.request_body.share()),
         HTTP_RESPONSE_BODY => Some(state.http_ctx.response_body.share()),
+        // F-133: L4 network filter バッファ（HTTP コンテキストでは空のまま未使用）。
+        DOWNSTREAM_DATA => Some(state.http_ctx.downstream_data.share()),
+        UPSTREAM_DATA => Some(state.http_ctx.upstream_data.share()),
         HTTP_CALL_RESPONSE_BODY => {
             if let Some(token) = state.http_ctx.current_http_call_token {
                 state
@@ -30,6 +33,16 @@ fn get_buffer(state: &HostState, buffer_type: i32) -> Option<bytes::Bytes> {
         VM_CONFIGURATION => Some(bytes::Bytes::copy_from_slice(
             &state.http_ctx.vm_configuration,
         )),
+        // F-134: gRPC 受信メッセージ本体（proxy_on_grpc_receive 呼び出し前に
+        // engine.rs が書き込む）。
+        #[cfg(feature = "grpc")]
+        GRPC_RECEIVE_BUFFER => Some(state.http_ctx.grpc_receive_message.clone()),
+        // F-134: `CallData` は host が Wasm ゲストの `proxy_on_foreign_function` を
+        // 呼び出す経路（veil 未実装、下記チケット参照）専用のバッファで、veil では
+        // 常に空。認識しない型として BadArgument を返すのは不適合だったため、
+        // 「型として認識するが常に空」を返す（Empty 相当の 0 バイト、trap しない）。
+        // docs/backlog/features/F-138-proxy-wasm-buffer-maptype-gaps.md
+        CALL_DATA => Some(bytes::Bytes::new()),
         _ => None,
     }
 }
@@ -39,8 +52,14 @@ fn check_read_capability(state: &HostState, buffer_type: i32) -> bool {
     match buffer_type {
         HTTP_REQUEST_BODY => state.http_ctx.capabilities.allow_request_body_read,
         HTTP_RESPONSE_BODY => state.http_ctx.capabilities.allow_response_body_read,
+        DOWNSTREAM_DATA => state.http_ctx.capabilities.allow_downstream_data_read,
+        UPSTREAM_DATA => state.http_ctx.capabilities.allow_upstream_data_read,
         HTTP_CALL_RESPONSE_BODY => state.http_ctx.capabilities.allow_http_calls,
+        #[cfg(feature = "grpc")]
+        GRPC_RECEIVE_BUFFER => state.http_ctx.capabilities.allow_http_calls,
         PLUGIN_CONFIGURATION | VM_CONFIGURATION => true, // Always allowed
+        // CallData は中身が常に空でセキュリティ上の意味を持たないため常に許可する。
+        CALL_DATA => true,
         _ => false,
     }
 }
@@ -50,8 +69,45 @@ fn check_write_capability(state: &HostState, buffer_type: i32) -> bool {
     match buffer_type {
         HTTP_REQUEST_BODY => state.http_ctx.capabilities.allow_request_body_write,
         HTTP_RESPONSE_BODY => state.http_ctx.capabilities.allow_response_body_write,
+        DOWNSTREAM_DATA => state.http_ctx.capabilities.allow_downstream_data_write,
+        UPSTREAM_DATA => state.http_ctx.capabilities.allow_upstream_data_write,
         _ => false,
     }
+}
+
+/// F-134 適合度修正: 書き込み可能な BufferType（0-3）かどうか。
+///
+/// veil 独自拡張の `NOT_ALLOWED(13)` は「capability による拒否」専用に限定する
+/// （`src/wasm/constants.rs` 参照）。読み取り専用 BufferType（HttpCallResponseBody=4 /
+/// GrpcReceiveBuffer=5 / VmConfiguration=6 / PluginConfiguration=7）や CallData=8、
+/// 未知の BufferType への書き込みは capability の有無に関わらず仕様上
+/// `BadArgument(2)` であるべきなので、capability チェックより前にこの判定を行う。
+fn is_writable_buffer_type(buffer_type: i32) -> bool {
+    matches!(
+        buffer_type,
+        HTTP_REQUEST_BODY | HTTP_RESPONSE_BODY | DOWNSTREAM_DATA | UPSTREAM_DATA
+    )
+}
+
+/// F-134 適合度修正: host が認識する BufferType（0-8）かどうか。
+///
+/// 未知の BufferType（例: 99）は capability の有無に関わらず `BadArgument(2)`。
+/// capability チェックの `_ => false` 分岐に落ちて `NOT_ALLOWED(13)` を返すのは
+/// veil 拡張の誤用（NOT_ALLOWED は capability 拒否専用）なので、認識判定を
+/// capability チェックより前に行う。
+fn is_known_buffer_type(buffer_type: i32) -> bool {
+    matches!(
+        buffer_type,
+        HTTP_REQUEST_BODY
+            | HTTP_RESPONSE_BODY
+            | DOWNSTREAM_DATA
+            | UPSTREAM_DATA
+            | HTTP_CALL_RESPONSE_BODY
+            | GRPC_RECEIVE_BUFFER
+            | VM_CONFIGURATION
+            | PLUGIN_CONFIGURATION
+            | CALL_DATA
+    )
 }
 
 /// Helper to allocate memory in WASM
@@ -100,6 +156,12 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
         )| {
             Box::new(async move {
                 let state = caller.data();
+
+                // F-134: 未知の BufferType は capability に関わらず BadArgument
+                // （NOT_ALLOWED は capability 拒否専用の veil 拡張のため誤用しない）。
+                if !is_known_buffer_type(buffer_type) {
+                    return PROXY_RESULT_BAD_ARGUMENT;
+                }
 
                 // Check capability
                 if !check_read_capability(state, buffer_type) {
@@ -188,6 +250,10 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
          value_ptr: i32,
          value_size: i32|
          -> i32 {
+            // F-134: 読み取り専用/未知の BufferType は capability に関わらず BadArgument
+            if !is_writable_buffer_type(buffer_type) {
+                return PROXY_RESULT_BAD_ARGUMENT;
+            }
             // Check capability
             {
                 let state = caller.data();
@@ -218,6 +284,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             let buffer = match buffer_type {
                 HTTP_REQUEST_BODY => state.http_ctx.request_body.to_mut(),
                 HTTP_RESPONSE_BODY => state.http_ctx.response_body.to_mut(),
+                DOWNSTREAM_DATA => state.http_ctx.downstream_data.to_mut(),
+                UPSTREAM_DATA => state.http_ctx.upstream_data.to_mut(),
                 _ => return PROXY_RESULT_BAD_ARGUMENT,
             };
 
@@ -252,6 +320,12 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 }
                 HTTP_RESPONSE_BODY => {
                     state.http_ctx.response_body_modified = true;
+                }
+                DOWNSTREAM_DATA => {
+                    state.http_ctx.downstream_data_modified = true;
+                }
+                UPSTREAM_DATA => {
+                    state.http_ctx.upstream_data_modified = true;
                 }
                 _ => {}
             }

@@ -40,8 +40,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
          service_size: i32,
          method_ptr: i32,
          method_size: i32,
-         _initial_metadata_ptr: i32,
-         _initial_metadata_size: i32,
+         initial_metadata_ptr: i32,
+         initial_metadata_size: i32,
          message_ptr: i32,
          message_size: i32,
          timeout_ms: i32,
@@ -57,6 +57,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                     service_size,
                     method_ptr,
                     method_size,
+                    initial_metadata_ptr,
+                    initial_metadata_size,
                     message_ptr,
                     message_size,
                     timeout_ms,
@@ -73,6 +75,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                     service_size,
                     method_ptr,
                     method_size,
+                    initial_metadata_ptr,
+                    initial_metadata_size,
                     message_ptr,
                     message_size,
                     timeout_ms,
@@ -216,7 +220,11 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
 // gRPC Implementation (feature = "grpc")
 // ============================================================================
 
+/// F-134: proxy_grpc_call の 12 番目までの引数のうち、実際に使うものを渡す薄い
+/// ラッパー引数構造体。呼び出し側（`add_functions`）が 12 個の位置引数を展開して
+/// 渡すため、clippy::too_many_arguments を避けるために 1 か所へまとめる。
 #[cfg(feature = "grpc")]
+#[allow(clippy::too_many_arguments)] // ABI 上固定の 12 引数（ラッパー内で 1 回だけ集約する）
 fn proxy_grpc_call_impl(
     caller: &mut Caller<'_, HostState>,
     upstream_ptr: i32,
@@ -225,19 +233,49 @@ fn proxy_grpc_call_impl(
     service_size: i32,
     method_ptr: i32,
     method_size: i32,
+    initial_metadata_ptr: i32,
+    initial_metadata_size: i32,
     message_ptr: i32,
     message_size: i32,
     timeout_ms: i32,
     return_call_id_ptr: i32,
 ) -> i32 {
+    // F-134: 従来 proxy_http_call と異なり capability チェックが一切なく、
+    // どのモジュールでも無制限に外向き gRPC 呼び出しを発行できてしまっていた。
+    // proxy_http_call と同じ `allow_http_calls`/`allowed_upstreams` を流用する
+    // （gRPC 専用の capability は新設しない。理由は headers.rs のコメント参照）。
+    {
+        let state = caller.data();
+        if !state.http_ctx.capabilities.allow_http_calls {
+            ftlog::warn!(
+                "[wasm:{}] gRPC call denied: allow_http_calls=false",
+                state.http_ctx.plugin_name
+            );
+            return PROXY_RESULT_NOT_ALLOWED;
+        }
+    }
+
     // Read upstream name
-    let upstream = match read_wasm_memory(caller, upstream_ptr, upstream_size) {
+    let upstream_bytes = match read_wasm_memory(caller, upstream_ptr, upstream_size) {
         Some(data) => data,
         None => {
             ftlog::warn!("WASM: proxy_grpc_call - failed to read upstream name");
             return PROXY_RESULT_INVALID_MEMORY_ACCESS;
         }
     };
+    let upstream = String::from_utf8_lossy(&upstream_bytes).to_string();
+
+    {
+        let state = caller.data();
+        if !state.http_ctx.capabilities.is_upstream_allowed(&upstream) {
+            ftlog::warn!(
+                "[wasm:{}] gRPC call to '{}' denied: not in allowed_upstreams",
+                state.http_ctx.plugin_name,
+                upstream
+            );
+            return PROXY_RESULT_BAD_ARGUMENT;
+        }
+    }
 
     // Read service name
     let service = match read_wasm_memory(caller, service_ptr, service_size) {
@@ -257,6 +295,16 @@ fn proxy_grpc_call_impl(
         }
     };
 
+    // Read initial metadata (optional)
+    let initial_metadata = if initial_metadata_size > 0 {
+        match read_wasm_memory(caller, initial_metadata_ptr, initial_metadata_size) {
+            Some(bytes) => deserialize_grpc_metadata(&bytes),
+            None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
+        }
+    } else {
+        Vec::new()
+    };
+
     // Read message
     let message = match read_wasm_memory(caller, message_ptr, message_size) {
         Some(data) => data,
@@ -268,7 +316,7 @@ fn proxy_grpc_call_impl(
 
     ftlog::info!(
         "WASM: proxy_grpc_call - upstream={}, service={}, method={}, message_size={}, timeout_ms={}",
-        String::from_utf8_lossy(&upstream),
+        upstream,
         String::from_utf8_lossy(&service),
         String::from_utf8_lossy(&method),
         message.len(),
@@ -282,12 +330,30 @@ fn proxy_grpc_call_impl(
         String::from_utf8_lossy(&method)
     );
 
-    // Store pending gRPC call info in context for later execution
+    // Store pending gRPC call info in context (互換性維持: 既存の take_pending_grpc_calls
+    // ベースのテスト・API のため）と、tick スレッドが実際に実行できるよう
+    // グローバルレジストリの両方へ登録する（proxy_http_call と同じ二重登録方式）。
     let state = caller.data_mut();
     let call_id = state.http_ctx.next_grpc_call_id();
-    state
-        .http_ctx
-        .register_grpc_call(call_id, grpc_path, message, timeout_ms as u32);
+    let module_name = state.http_ctx.plugin_name.clone();
+    state.http_ctx.register_grpc_call(
+        call_id,
+        grpc_path.clone(),
+        message.clone(),
+        timeout_ms as u32,
+    );
+
+    super::grpc_executor::register_global_pending_grpc_call(
+        super::grpc_executor::PendingGrpcUnaryCall {
+            module_name: module_name.clone(),
+            call_id,
+            upstream,
+            path: grpc_path,
+            initial_metadata,
+            messages: vec![message],
+            timeout_ms: timeout_ms as u32,
+        },
+    );
 
     // Write call_id to return pointer
     if return_call_id_ptr > 0 {
@@ -304,15 +370,28 @@ fn proxy_grpc_call_impl(
         }
     }
 
-    ftlog::debug!("WASM: proxy_grpc_call registered with call_id={}", call_id);
+    ftlog::debug!(
+        "[wasm:{}] proxy_grpc_call registered with call_id={} (queued for tick thread execution)",
+        module_name,
+        call_id
+    );
     PROXY_RESULT_OK
 }
 
 #[cfg(feature = "grpc")]
 fn proxy_grpc_cancel_impl(caller: &mut Caller<'_, HostState>, call_id: i32) -> i32 {
+    let module_name = caller.data().http_ctx.plugin_name.clone();
     let state = caller.data_mut();
 
-    if state.http_ctx.cancel_grpc_call(call_id as u32) {
+    // F-134: 従来はローカル pending_grpc_calls から消すだけで、tick スレッドが
+    // 拾うグローバルレジストリ側は消えず、まだ実行されていない呼び出しでも
+    // キャンセル後に実行されてしまっていた（グローバル側から拾って初めて
+    // 実行される設計になったため、こちらも忘れず消す）。
+    let removed_local = state.http_ctx.cancel_grpc_call(call_id as u32);
+    let removed_global =
+        super::grpc_executor::cancel_global_pending_grpc_call(&module_name, call_id as u32);
+
+    if removed_local || removed_global {
         ftlog::debug!("WASM: proxy_grpc_cancel - cancelled call_id={}", call_id);
         PROXY_RESULT_OK
     } else {
@@ -336,11 +415,35 @@ fn proxy_grpc_stream_impl(
 ) -> i32 {
     use crate::wasm::context::{GrpcStream, GrpcStreamState};
 
+    // F-134: proxy_grpc_call と同じ capability ゲート（従来は無制限だった）。
+    {
+        let state = caller.data();
+        if !state.http_ctx.capabilities.allow_http_calls {
+            ftlog::warn!(
+                "[wasm:{}] gRPC stream denied: allow_http_calls=false",
+                state.http_ctx.plugin_name
+            );
+            return PROXY_RESULT_NOT_ALLOWED;
+        }
+    }
+
     // Read upstream name
     let upstream = match read_wasm_memory(caller, upstream_ptr, upstream_size) {
         Some(bytes) => String::from_utf8_lossy(&bytes).to_string(),
         None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
     };
+
+    {
+        let state = caller.data();
+        if !state.http_ctx.capabilities.is_upstream_allowed(&upstream) {
+            ftlog::warn!(
+                "[wasm:{}] gRPC stream to '{}' denied: not in allowed_upstreams",
+                state.http_ctx.plugin_name,
+                upstream
+            );
+            return PROXY_RESULT_BAD_ARGUMENT;
+        }
+    }
 
     // Read service name
     let service = match read_wasm_memory(caller, service_ptr, service_size) {
@@ -413,10 +516,15 @@ fn proxy_grpc_stream_impl(
 fn proxy_grpc_close_impl(caller: &mut Caller<'_, HostState>, stream_id: i32) -> i32 {
     use crate::wasm::context::GrpcStreamState;
 
+    let module_name = caller.data().http_ctx.plugin_name.clone();
     let state = caller.data_mut();
-    let stream_id = stream_id as u32;
+    let stream_id_u32 = stream_id as u32;
 
-    if let Some(stream) = state.http_ctx.pending_grpc_streams.get_mut(&stream_id) {
+    // ストリームがまだ tick スレッドで実行されていなければグローバル
+    // レジストリからも取り除く（F-134: 実行前クローズで通信を起こさない）。
+    super::grpc_executor::cancel_global_pending_grpc_call(&module_name, stream_id_u32);
+
+    if let Some(stream) = state.http_ctx.pending_grpc_streams.get_mut(&stream_id_u32) {
         stream.state = GrpcStreamState::Closed;
         ftlog::debug!("WASM: proxy_grpc_close - closed stream_id={}", stream_id);
         PROXY_RESULT_OK
@@ -446,6 +554,7 @@ fn proxy_grpc_send_impl(
         Vec::new()
     };
 
+    let module_name = caller.data().http_ctx.plugin_name.clone();
     let state = caller.data_mut();
     let stream_id_u32 = stream_id as u32;
 
@@ -465,10 +574,33 @@ fn proxy_grpc_send_impl(
         }
 
         // Handle end of stream
+        //
+        // F-134: 従来はローカル状態を HalfClosed にするだけで、実際に
+        // ネットワークへ何も送出しないまま黙って終わっていた（呼び出し元からは
+        // 成功したように見えるのに proxy_on_grpc_receive/proxy_on_grpc_close が
+        // 永遠に呼ばれない不適合）。ここでゲストが送信した全メッセージを
+        // まとめてグローバルレジストリへ登録し、tick スレッドが 1 回の
+        // HTTP/2 ストリームとして送出する（真の逐次双方向ストリーミングでは
+        // ないクライアントストリーミングの簡略実装。理由・制限は
+        // docs/backlog/features/F-139-wasm-grpc-call-execution.md 参照）。
         if end_of_stream != 0 {
+            let path = format!("/{}/{}", stream.service, stream.method);
+            super::grpc_executor::register_global_pending_grpc_call(
+                super::grpc_executor::PendingGrpcUnaryCall {
+                    module_name,
+                    call_id: stream_id_u32,
+                    upstream: stream.upstream.clone(),
+                    path,
+                    initial_metadata: stream.initial_metadata.clone(),
+                    messages: stream.pending_messages.clone(),
+                    // gRPC ストリームには proxy_grpc_call の timeout_ms 相当の
+                    // パラメータが ABI に無いため、既定値を用いる。
+                    timeout_ms: 30_000,
+                },
+            );
             stream.state = GrpcStreamState::HalfClosed;
             ftlog::debug!(
-                "WASM: proxy_grpc_send - stream_id={} half-closed",
+                "WASM: proxy_grpc_send - stream_id={} half-closed, queued for execution",
                 stream_id
             );
         }

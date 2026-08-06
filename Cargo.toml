@@ -48,10 +48,11 @@ http2 = []
 # 注意: HTTP/3 は UDP ベースのため kTLS は使用不可
 # GSO/GRO による高パフォーマンス UDP 処理
 #
-# ターゲット別 TLS バックエンド（build.rs が AWS_LC_SYS_NO_PREFIX を制御）:
-#   - linux / freebsd : quiche (default-features=false) + 共有 aws-lc-sys (NO_PREFIX=1)
-#   - windows / macos : quiche (boring) + rustls 側の aws-lc-rs (NO_PREFIX=0 で共存)
-#   - openbsd         : quiche (boring) + rustls 側の ring（aws-lc-* は一切依存しない）
+# ターゲット別 TLS バックエンド（.cargo/config.toml の [env] が AWS_LC_SYS_NO_PREFIX を制御）:
+#   - linux                        : quiche (default-features=false) + 共有 aws-lc-sys (NO_PREFIX=1)
+#   - freebsd/openbsd/netbsd/macos/windows : quiche (boringssl-boring-crate) + rustls 側の
+#     aws-lc-rs（FreeBSD/macOS/Windows、NO_PREFIX=0 で共存）または ring（OpenBSD/NetBSD、
+#     aws-lc-* は一切依存しない）
 http3 = ["dep:quiche"]
 
 # epoll ベースの readiness ランタイム（F-120 クロスプラットフォーム対応）
@@ -216,6 +217,7 @@ full-freebsd = [
 # wasmtime の Cranelift JIT が生成するネイティブコードは OpenBSD で動かず、
 # wasm モジュールを 1 回実行しただけで veil ごと SIGSEGV するため、
 # `src/wasm/registry.rs` が OpenBSD のみ `Config::target("pulley64")` を指定する。
+# rustls=ring、quiche=boringssl-boring-crate（いずれも target 別依存で無条件付与）。
 full-openbsd = [
     "ktls", "http2", "http3",
     "grpc-full", "wasm",
@@ -251,6 +253,48 @@ full-freebsd-aarch64 = [
 ]
 
 full-openbsd-aarch64 = [
+    "ktls", "http2", "http3",
+    "grpc-full",
+    "opentelemetry",
+    "compression", "cache", "metrics",
+    "websocket", "rate-limit", "buffering",
+    "system-allocator",
+    "admin",
+    "access-log",
+    "l4-proxy",
+]
+
+# NetBSD: OpenBSD をテンプレートに横展開した feature セット（F-140）。
+# NetBSD には pledge/unveil 相当のランタイム API が無く（`src/security.rs` の
+# `netbsd` モジュール参照）、veil が提供できるのは chroot(2) + 特権降格 + rlimit
+# のみだが、TLS/機能セット自体は OpenBSD と同一内容にできる
+# （rustls=ring、quiche=boringssl-boring-crate）。
+# システムアロケータ（mimalloc/jemalloc とも無効化）を使う点も OpenBSD と同じ。
+#
+# **wasm は含めない（B-55 更新）**。実機検証（NetBSD 10.1 amd64 / QEMU）で判明した
+# とおり、wasmtime 40 は NetBSD を **x86_64 を含む全アーキテクチャで**サポートしない
+# （`signals.rs` に NetBSD 向け ucontext 分岐が一切無く、x86_64 でも
+# `compile_error!("unsupported platform")` になる。詳細は B-55 参照）。
+# OpenBSD/FreeBSD の x86_64 は実機動作実績があるため wasm を維持しており、
+# NetBSD だけが全アーキ非対応という OpenBSD/FreeBSD（aarch64 のみ非対応）とは
+# 異なる扱いになる。
+full-netbsd = [
+    "ktls", "http2", "http3",
+    "grpc-full",
+    "opentelemetry",
+    "compression", "cache", "metrics",
+    "websocket", "rate-limit", "buffering",
+    "system-allocator",
+    "admin",
+    "access-log",
+    "l4-proxy",
+]
+
+# NetBSD の **aarch64** 向け feature セット（B-55）。`full-netbsd`（x86_64、こちらも
+# wasm 抜き）と同一内容。NetBSD は x86_64 も含め全アーキテクチャで wasmtime 非対応の
+# ため、他 BSD（`full-freebsd-aarch64`/`full-openbsd-aarch64` は aarch64 のみ非対応）
+# と違い x86_64/aarch64 の区別自体が無くなっている（feature 名は互換性のため維持）。
+full-netbsd-aarch64 = [
     "ktls", "http2", "http3",
     "grpc-full",
     "opentelemetry",
@@ -322,7 +366,9 @@ clap = { version = "4.5.53", features = ["derive"] }
 # - pooling-allocator: 高速インスタンス化
 # - cranelift: AOT コンパイル
 # - component-model: WASI対応
-wasmtime = { version = "40.0.0", optional = true, features = ["pooling-allocator", "cranelift"] }
+# - pulley: ポータブルバイトコードインタープリタ（`Config::target("pulleyNN")`）。
+#   `[wasm] interpreter = true`（F-135）や OpenBSD（B-52、常時強制）で使用する。
+wasmtime = { version = "40.0.0", optional = true, features = ["pooling-allocator", "cranelift", "pulley"] }
 
 # Protobuf: gRPC メッセージのシリアライズ/デシリアライズ
 # prost は gRPC feature 有効時のみ使用
@@ -379,24 +425,39 @@ futures = "0.3.31"
 # rustls 暗号プロバイダの target 別選択（F-122、src/tls_provider.rs 参照）
 # ====================
 # aws_lc_rs を使う target:
-#   - 非 OpenBSD（Linux/FreeBSD/macOS/Windows）: kTLS（ktls_rustls）・quiche(http3) と
+#   - 非 OpenBSD/NetBSD（Linux/FreeBSD/macOS/Windows）: kTLS（ktls_rustls）・quiche(http3) と
 #     AWS-LC を共有し、アセンブリ最適化が効く。http3_server の RNG（aws_lc_rs::rand）にも使う。
-[target.'cfg(not(target_os = "openbsd"))'.dependencies]
-# default-features = false は base の [dependencies] rustls と一致させる（default に含まれる
-# aws_lc_rs をここで暗黙有効化しないため。provider は features で明示する）。
+#
+# `rustls` 本体（std/tls12/logging）は base の [dependencies] で無条件に宣言済みのため、
+# ここでは `aws_lc_rs` cargo feature を追加で有効化する（Cargo は同一クレートへの複数の
+# 依存宣言の features を union する）。
+[target.'cfg(not(any(target_os = "openbsd", target_os = "netbsd")))'.dependencies]
 rustls = { version = "0.23.35", default-features = false, features = ["aws_lc_rs"] }
 # bindgen: AWS_LC_SYS_NO_PREFIX 時に aws-lc-sys がバインディング生成するため必要
 aws-lc-rs = { version = "1.15.2", features = ["bindgen"] }
 
 # ring を使う target:
 #   - OpenBSD: aws-lc-rs は TLS ハンドシェイクを完了できない（F-122）。
-[target.'cfg(target_os = "openbsd")'.dependencies]
+#   - NetBSD: OpenBSD と同じ扱い（F-140、未検証だが aws-lc-rs の Tier 3 サポート
+#     不足という同じ懸念があるため、実証済みの OpenBSD 側に合わせる保守的な選択）。
+[target.'cfg(any(target_os = "openbsd", target_os = "netbsd"))'.dependencies]
 rustls = { version = "0.23.35", default-features = false, features = ["ring"] }
 ring = "0.17"
-# OpenBSD は wasm を **Pulley（ポータブルバイトコードインタープリタ）** で実行する。
-# ネイティブ JIT コードの実行が OpenBSD で機能しないため（B-52）。
-# `pulley` feature は Cranelift の Pulley バックエンド（= pulley64 へのコンパイル）と
-# インタープリタを有効にする。他ターゲットには入れない。
+# OpenBSD/NetBSD の quiche(http3) は vendored BoringSSL（`boringssl-boring-crate` feature、
+# 外部 `boring` crate 経由）を無条件で使う（FreeBSD/macOS/Windows と同じ構成、F-136）。
+quiche = { version = "0.24.9", default-features = false, features = ["boringssl-boring-crate"], optional = true }
+# quiche 0.24.9 が依存する boring のバージョンと必ず一致させること（異なると
+# `SslContextBuilder` の型が別物になりコンパイルエラーになる）。FreeBSD/macOS/Windows と
+# 同じ理由で optional にしない。
+boring = "4.3"
+# OpenBSD/NetBSD は wasm を **Pulley（ポータブルバイトコードインタープリタ）** で
+# 実行する。ネイティブ JIT コードの実行が OpenBSD で機能しないため（B-52）。NetBSD は
+# MAP_STACK 強制は無いが、ネイティブ JIT 自体の実機検証ができていないため OpenBSD と
+# 同じ保守的な Pulley 選択にする（F-140、`src/wasm/registry.rs` 参照）。
+# `pulley` feature は base の [dependencies] wasmtime にも入っている（F-135:
+# `[wasm] interpreter = true` で他ターゲットでも Pulley を選択可能にするため）。
+# この target 別指定はバージョン/他 feature を OpenBSD/NetBSD 専用に固定するために
+# 残す（cargo は同一依存の feature を union するので重複指定しても無害）。
 wasmtime = { version = "40.0.0", optional = true, features = ["pooling-allocator", "cranelift", "pulley"] }
 
 # ====================
@@ -528,9 +589,12 @@ harness = false
 name = "load_balancing"
 harness = false
 
+# quiche を直接使うため http3 が必要。無指定だと `--all-targets` で
+# feature 無効時にも展開され `unresolved module quiche` になる。
 [[bench]]
 name = "http3"
 harness = false
+required-features = ["http3"]
 
 [[bench]]
 name = "websocket"
@@ -547,27 +611,61 @@ harness = false
 [[bench]]
 name = "wasm"
 harness = false
+required-features = ["wasm"]
 
 # HTTP/3 用 QUIC 実装（Cloudflare quiche）ターゲット別設定
-# Linux/FreeBSD は default-features = false で aws-lc-sys と共有
-# OpenBSD/Windows/macOS は quiche 内蔵 BoringSSL (boring) を使用
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+# Linux は default-features = false で aws-lc-sys と共有（memfd 経由の従来経路、F-136で不変）
+# FreeBSD/OpenBSD/NetBSD/macOS/Windows は `boringssl-boring-crate`（外部 `boring` crate）を
+# 無条件使用する。
+#
+# F-136: 証明書ホットリロードを capsicum capability mode（FreeBSD）/ pledge+unveil（OpenBSD）
+# 下でも動作させるため、quiche の in-memory SSL_CTX API
+# （`Config::with_boring_ssl_ctx_builder`）を使う。この API は `boringssl-boring-crate`
+# feature（外部 `boring` crate 経由）でのみ提供され、quiche 内蔵ビルド（旧 `"boring"`
+# feature）には無い。aws-lc-sys（NO_PREFIX=1）と BoringSSL を同一バイナリに同居させると
+# リンク時に重複シンボルエラーになるため（実験で確認済み、docs/artifacts/f136_platform_design.md
+# 参照）、FreeBSD は Linux と異なり aws-lc-sys 共有から外し、OpenBSD 等と同じ boring 系へ揃える。
+# **Linux は無変更**（AGENTS.md「Linux 経路は不変」）: `boring` crate を Linux の依存に
+# 入れてはならない（重複シンボルでリンクが壊れる）。
+[target.'cfg(target_os = "linux")'.dependencies]
 quiche = { version = "0.24.9", default-features = false, optional = true }
 aws-lc-sys = { version = "0.41", features = ["ssl", "bindgen"] }
 
-[target.'cfg(not(any(target_os = "linux", target_os = "freebsd")))'.dependencies]
-quiche = { version = "0.24.9", default-features = false, features = ["boring"], optional = true }
+# FreeBSD は capsicum capability mode 下でも証明書ホットリロードが
+# 動作する in-memory SSL_CTX API（`Config::with_boring_ssl_ctx_builder`、F-136）が
+# `boringssl-boring-crate` feature 経由でしか提供されないため、常時これを使う
+# （macOS/Windows と同じ構成）。
+[target.'cfg(target_os = "freebsd")'.dependencies]
+quiche = { version = "0.24.9", default-features = false, features = ["boringssl-boring-crate"], optional = true }
+# quiche 0.24.9 が依存する boring のバージョンと必ず一致させること（異なると
+# `SslContextBuilder` の型が別物になりコンパイルエラーになる）。FreeBSD は常に
+# BoringSSL 固定のため optional にしない（http3 feature 無効時の追加コストは
+# full-freebsd が常に http3 を含むため許容する。macOS/Windows と同じ理由）。
+boring = "4.3"
+
+# macOS/Windows: 従来どおり vendored BoringSSL（boring crate）を無条件で使う（不変）。
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
+quiche = { version = "0.24.9", default-features = false, features = ["boringssl-boring-crate"], optional = true }
+# `src/http3_server.rs` が `boring::ssl::SslContextBuilder` 等を直接使うための直接依存
+# （quiche 内部の boring 依存とは別に、自クレートのコードから使うには直接宣言が要る）。
+# Cargo の feature はターゲット非依存（`http3 = ["dep:quiche"]` に `dep:boring` を
+# 混ぜると、boring 未宣言の Linux ターゲットで解決エラーになる）のため、意図的に
+# optional にせず本ターゲット共通依存として常時コンパイルする（http3 feature 無効時の
+# 追加コストは、macOS/Windows の full-* feature セットが常に http3 を含むため許容する）。
+boring = "4.3"
 
 # ---------------------------------------------------------------------------
 # テスト用 TLS スタックの target 別 feature（F-122 / B-51）
 # ---------------------------------------------------------------------------
-[target.'cfg(not(target_os = "openbsd"))'.dev-dependencies]
+[target.'cfg(not(any(target_os = "openbsd", target_os = "netbsd")))'.dev-dependencies]
 rcgen = { version = "0.14.6", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
 tokio-rustls = "0.26.4"
 hyper-rustls = { version = "0.27.7", features = ["http1", "http2"] }
 tonic = { version = "0.14.2", features = ["tls-aws-lc", "channel"] }
 
-[target.'cfg(target_os = "openbsd")'.dev-dependencies]
+# NetBSD もテスト用 TLS スタックは OpenBSD と同じ ring 系（B-51 の教訓: aws-lc-rs の
+# curve25519 s2n-bignum アセンブリが未検証プラットフォームで SIGSEGV するリスクを避ける）。
+[target.'cfg(any(target_os = "openbsd", target_os = "netbsd"))'.dev-dependencies]
 rcgen = { version = "0.14.6", default-features = false, features = ["crypto", "pem", "ring"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "ring"] }
 hyper-rustls = { version = "0.27.7", default-features = false, features = ["native-tokio", "http1", "http2", "tls12", "logging", "ring"] }

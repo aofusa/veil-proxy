@@ -13,7 +13,7 @@ use wasmtime::PoolingAllocationConfig;
 use super::capabilities::ModuleCapabilities;
 use super::context::HostState;
 use super::host;
-use super::types::{ModuleConfig, PoolingConfig, WasmConfig};
+use super::types::{ModuleConfig, WasmConfig};
 
 /// Loaded WASM module
 pub struct LoadedModule {
@@ -33,17 +33,27 @@ pub struct ModuleRegistry {
     engine: Engine,
     /// Loaded modules
     modules: std::collections::HashMap<String, Arc<LoadedModule>>,
+    /// エンジンが Pulley インタープリタ向け（`Config::target("pulleyNN")`）かどうか。
+    /// AOT サイドカーキャッシュのファイル名をネイティブ JIT 版と分けるために使う
+    /// （F-135。Pulley と Cranelift のキャッシュはバイナリ非互換）。
+    pulley: bool,
 }
 
 impl ModuleRegistry {
     /// Create a new module registry
     pub fn new(config: &WasmConfig) -> anyhow::Result<Self> {
         // Create engine with pooling allocator
-        let engine = Self::create_engine(&config.defaults.pooling)?;
+        let engine = Self::create_engine(config)?;
+        // NetBSD は OpenBSD と異なり MAP_STACK 強制が無いため OnDemand アロケータや
+        // openbsd_stack（下記）は使わないが、wasmtime のネイティブ JIT 実行コード自体は
+        // 未検証のため、OpenBSD と同様に安全側で Pulley インタープリタへ倒す（F-140）。
+        let pulley =
+            cfg!(target_os = "openbsd") || cfg!(target_os = "netbsd") || config.interpreter;
 
         let mut registry = Self {
             engine,
             modules: std::collections::HashMap::new(),
+            pulley,
         };
 
         // Load all modules
@@ -55,7 +65,8 @@ impl ModuleRegistry {
     }
 
     /// Create Wasmtime engine with pooling allocator
-    fn create_engine(pooling: &PoolingConfig) -> anyhow::Result<Engine> {
+    fn create_engine(wasm_config: &WasmConfig) -> anyhow::Result<Engine> {
+        let pooling = &wasm_config.defaults.pooling;
         let mut config = wasmtime::Config::new();
 
         // Enable AOT compilation
@@ -100,17 +111,26 @@ impl ModuleRegistry {
         // Store のデッドラインと照合してタイムアウトを検出する
         config.epoch_interruption(true);
 
-        // OpenBSD だけ **Pulley インタープリタ**で実行する（B-52）。
+        // Pulley インタープリタ（F-135 / B-52）。
         //
         // Pulley は wasm を**ポータブルなバイトコードへコンパイルしてインタープリタで
         // 実行する**バックエンドで、ネイティブコードの生成・実行を一切行わないため、
         // ホスト固有の JIT 前提（W^X・実行可能 mmap・シグナルベースのトラップ等）に
-        // 依存しない。ネイティブ JIT より遅いが、OpenBSD で WASM を使えるようにする。
+        // 依存しない。ネイティブ JIT より遅いが、W^X 制約下や OpenBSD で WASM を
+        // 使えるようにする。
         //
-        // 他のターゲットは従来どおり Cranelift のネイティブ JIT（`pulley` feature も
-        // OpenBSD 向けにしか入れない）。
-        #[cfg(target_os = "openbsd")]
-        config.target("pulley64")?;
+        // OpenBSD/NetBSD は設定値を無視して常に Pulley（B-52/F-140）。他ターゲットは
+        // `[wasm] interpreter = true` のときだけ Pulley を選択する。
+        let use_pulley =
+            cfg!(target_os = "openbsd") || cfg!(target_os = "netbsd") || wasm_config.interpreter;
+        if use_pulley {
+            // ポインタ幅に合わせて pulley64 / pulley32 を選ぶ。
+            config.target(if cfg!(target_pointer_width = "64") {
+                "pulley64"
+            } else {
+                "pulley32"
+            })?;
+        }
 
         // OpenBSD: wasmtime 既定のファイバスタックは MAP_STACK なしで mmap されるが、
         // OpenBSD 6.4+ は「SP は MAP_STACK 領域を指すこと」をカーネルが強制する。
@@ -138,7 +158,12 @@ impl ModuleRegistry {
             // SAFETY: 信頼できる事前生成 AOT モジュールの明示指定。
             unsafe { Module::deserialize_file(&self.engine, &config.path)? }
         } else {
-            Self::load_or_compile_with_cache(&self.engine, path)?
+            let suffix = if self.pulley {
+                ".pulley.cwasm"
+            } else {
+                ".cwasm"
+            };
+            Self::load_or_compile_with_cache(&self.engine, path, suffix)?
         };
 
         // Create linker with host functions
@@ -170,11 +195,16 @@ impl ModuleRegistry {
 
     /// `.wasm` を AOT サイドカーキャッシュ経由でロードする（F-36）。
     ///
-    /// 1. `<path>.cwasm` が存在し `.wasm` 以降に生成されていれば `deserialize_file` で
+    /// 1. `<path><suffix>` が存在し `.wasm` 以降に生成されていれば `deserialize_file` で
     ///    高速ロードする（Cranelift JIT を回避し起動時間とメモリを削減）。
     /// 2. 不在・古い・wasmtime 版不一致（deserialize 失敗）の場合は `from_file` で
     ///    コンパイルし、その AOT バイナリをサイドカーへ書き出す（ベストエフォート、
     ///    書き込み失敗は無視してコンパイル済みモジュールをそのまま使う）。
+    ///
+    /// `suffix` はキャッシュファイル名の拡張子で、通常は `.cwasm`。Pulley
+    /// インタープリタ使用時（F-135）は `.pulley.cwasm` を渡し、Cranelift ネイティブ
+    /// AOT キャッシュとバイナリ非互換な Pulley 用キャッシュを別ファイルに分離する
+    /// （同名だと deserialize が毎回失敗し再コンパイルを繰り返すため）。
     ///
     /// モジュールロードは起動時（Landlock / seccomp 適用前）に行われるため、サイドカー
     /// 書き込みの権限問題は通常発生しない。`deserialize` は自前生成の信頼できるキャッシュ
@@ -182,11 +212,15 @@ impl ModuleRegistry {
     /// ファイル完全性）、いかなるエラーも安全側（再コンパイル）にフォールバックする。
     // 理由付き allow: WASM モジュールのロード・AOT キャッシュ生成は設定適用時（起動/リロード）のコールドパス。
     #[allow(clippy::disallowed_methods)]
-    fn load_or_compile_with_cache(engine: &Engine, wasm_path: &Path) -> anyhow::Result<Module> {
-        // サイドカーパス: "<path>.cwasm"
+    fn load_or_compile_with_cache(
+        engine: &Engine,
+        wasm_path: &Path,
+        suffix: &str,
+    ) -> anyhow::Result<Module> {
+        // サイドカーパス: "<path><suffix>"
         let cache_path: PathBuf = {
             let mut s = wasm_path.as_os_str().to_owned();
-            s.push(".cwasm");
+            s.push(suffix);
             PathBuf::from(s)
         };
 

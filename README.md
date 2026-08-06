@@ -94,9 +94,10 @@ hot-path cost). The default is unchanged (Linux io_uring).
 |----------|-----------------|-----------------|------|-------|
 | **Linux (default)** | io_uring (`src/runtime/uring/`) | seccomp + Landlock + CBPF | ✅ (Linux 5.15+) | Default features unchanged; performance non-regressed |
 | **Linux `--features epoll`** | epoll readiness reactor (`src/runtime/reactor/`) | seccomp (epoll syscalls; io_uring syscalls dropped) + Landlock | ✅ | Fallback for hosts without io_uring |
-| **FreeBSD (x86_64/aarch64)** | kqueue readiness reactor (optionally POSIX AIO with `--features aio`, F-127) | capsicum (`cap_rights_limit` / `cap_enter`) + jail | ✅ (FreeBSD 13.0+, `TCP_TXTLS_ENABLE`/`TCP_RXTLS_ENABLE`; F-126) | `[security] enable_capsicum`, `capsicum_capability_mode`, `jail_name` |
+| **FreeBSD (x86_64/aarch64)** | kqueue readiness reactor (optionally POSIX AIO with `--features aio`, F-127) | capsicum (`cap_rights_limit` / `cap_enter`) + jail | ✅ (FreeBSD 13.0+, `TCP_TXTLS_ENABLE`/`TCP_RXTLS_ENABLE`; F-126) | `[security] enable_capsicum`, `capsicum_capability_mode`, `jail_name`. TLS cert hot-reload (H1/H2 and HTTP/3) keeps working under capsicum capability mode (F-136): cert/key parent directories get a dirfd opened before `cap_enter`, and reads go through `openat`/`fstatat` (`O_RESOLVE_BENEATH`). `http3` (quiche) now uses `boringssl-boring-crate` (external `boring` crate) instead of sharing `aws-lc-sys` with rustls, so its in-memory `SSL_CTX` API can rebuild certificates without ever opening a path |
 | **OpenBSD (x86_64/aarch64)** | kqueue readiness reactor | pledge + unveil | ✗ (userspace rustls) | `[security] enable_pledge`, `enable_unveil`. TLS uses the **ring** rustls provider (aws-lc-rs can't complete handshakes on OpenBSD; F-122). **WASM runs via the Pulley interpreter** with the on-demand instance allocator and `MAP_STACK` fiber stacks (B-52; wasmtime's pooling allocator silently ignores `with_host_stack`, and OpenBSD kills any process whose SP is outside a `MAP_STACK` mapping). Pulley emits no native code, so no `wxallowed` filesystem is required — at interpreter speed. HTTPS static/proxy serving verified 200 |
-| **macOS (x86_64/aarch64, universal2)** | kqueue readiness reactor (reused from FreeBSD/OpenBSD) | `sandbox_init` (Seatbelt) | ✗ (userspace rustls) | `[security] enable_sandbox_macos`. TLS uses the **aws_lc_rs** rustls provider; `http3` (quiche) uses its own bundled BoringSSL (F-131). Cross-built with `docker/Dockerfile.macos` (`cargo zigbuild --target universal2-apple-darwin`, `--features full`); verified on real hardware by the maintainer |
+| **NetBSD (x86_64/aarch64)** | kqueue readiness reactor | **chroot(2) + privilege drop only — no pledge/unveil equivalent** (F-140) | ✗ (userspace rustls) | `[security] chroot_dir` (opt-in `chroot(2)` + `chdir("/")`, applied before `drop_privileges_user`/`drop_privileges_group`). NetBSD has no runtime API equivalent to OpenBSD's pledge/unveil (Veriexec is a kernel-config/load-time integrity mechanism, not a per-process syscall filter; `secmodel_securelevel` is a system-wide boot-time setting) — veil logs this limitation honestly at startup (`security::netbsd::report_security_support`) rather than pretending to sandbox syscalls. TLS uses the same **ring** rustls provider + **`boringssl-boring-crate`** quiche backend as OpenBSD. **Proxy-Wasm is NOT available on NetBSD** (any architecture): wasmtime 40's signal-based trap handling has no `ucontext` branch for NetBSD at all — confirmed on real hardware (NetBSD 10.1 amd64, B-55) that even x86_64 fails to compile with `error: unsupported platform` in `signals.rs`, and it cannot be worked around with the Pulley interpreter (the failure happens in wasmtime's own build, before any `Config::target` choice matters). `full-netbsd`/`full-netbsd-aarch64` both omit the `wasm` feature. Code-complete otherwise; QEMU build/E2E verification is a separate follow-up (`docs/backlog/features/F-140-netbsd-support.md`) |
+| **macOS (x86_64/aarch64, universal2)** | kqueue readiness reactor (reused from FreeBSD/OpenBSD/NetBSD) | `sandbox_init` (Seatbelt) | ✗ (userspace rustls) | `[security] enable_sandbox_macos`. TLS uses the **aws_lc_rs** rustls provider; `http3` (quiche) uses its own bundled BoringSSL (F-131). Cross-built with `docker/Dockerfile.macos` (`cargo zigbuild --target universal2-apple-darwin`, `--features full`); verified on real hardware by the maintainer |
 | **Windows (x86_64-pc-windows-msvc / aarch64-pc-windows-msvc)** | WSAPoll readiness reactor (`src/runtime/reactor/wsapoll.rs`, `src/runtime/reactor/tcp/windows.rs`, Winsock) | Job Object (best-effort) | ✗ (userspace rustls) | `[security] enable_job_object_windows`. TLS uses the **aws_lc_rs** rustls provider on both archs; `http3` (quiche) uses its own bundled BoringSSL (F-131). Cross-built with `docker/Dockerfile.windows` (`cargo xwin build --target <target>`, `--features full`; `packaging/scripts/build-cross.sh --target windows` builds both archs); verified on real hardware by the maintainer |
 
 - The backend is chosen by `build.rs`-emitted cfgs (`veil_rt_uring` / `veil_rt_reactor` and
@@ -109,7 +110,12 @@ hot-path cost). The default is unchanged (Linux io_uring).
 - **FreeBSD/OpenBSD** are built inside a matching QEMU VM — `tools/qemu/bsd-vm.sh <os> <arch>`
   covers FreeBSD/OpenBSD × x86_64/aarch64 (setup → build → `tests/e2e_setup.sh test` →
   fetch the binary), and `packaging/scripts/build-bsd.sh` turns the binary into a tar.gz with
-  rc.d/jail.conf. A `docker/Dockerfile.freebsd` exists for `x86_64-unknown-freebsd`
+  rc.d/jail.conf. **NetBSD support (F-140) is code-complete but not yet wired into
+  `bsd-vm.sh`/`build-bsd.sh`** — QEMU VM setup and E2E verification for NetBSD are tracked
+  as follow-up work in `docs/backlog/features/F-140-netbsd-support.md`; this environment
+  also lacks a NetBSD cross C toolchain, so `cargo check --target x86_64-unknown-netbsd`
+  currently fails inside `ring`'s/`boring`'s native build scripts before reaching veil's own
+  code. A `docker/Dockerfile.freebsd` exists for `x86_64-unknown-freebsd`
   (zig bundles FreeBSD libc and the target is Rust Tier 2), but it **currently fails at link
   time** — `aws-lc-sys` assembles none of its s2n-bignum `.S` files under a FreeBSD cross
   configuration, producing many `undefined symbol: curve25519_x25519_byte`-style errors
@@ -136,16 +142,32 @@ hot-path cost). The default is unchanged (Linux io_uring).
   `packaging/scripts/build-cross.sh --target windows`, which builds both
   x86_64-pc-windows-msvc and aarch64-pc-windows-msvc with `--features full`
   (`http3` via bundled BoringSSL, plus `wasm` and `l4-proxy`). `ktls` is Linux/FreeBSD only.
-- **TLS crypto provider** is selected per target in `src/tls_provider.rs` (F-122/F-131):
-  **OpenBSD uses rustls's `ring`** provider (aws-lc-rs cannot complete TLS handshakes
-  there), **every other target (Linux/FreeBSD/macOS/Windows) uses `aws_lc_rs`**.
+- **TLS crypto provider** is selected per target in `src/tls_provider.rs` (F-122/F-131/F-140):
+  **OpenBSD/NetBSD use rustls's `ring`** provider (aws-lc-rs cannot complete TLS handshakes
+  on OpenBSD; NetBSD is assumed to share the same Tier-3 risk and was conservatively matched
+  to OpenBSD rather than independently verified), **every other target
+  (Linux/FreeBSD/macOS/Windows) uses `aws_lc_rs`**.
   `Cargo.toml` splits the provider via target-specific dependencies plus `resolver = "2"`;
   keep the two in sync.
 - **HTTP/3 (quiche) crypto backend** is likewise split per target:
-  Linux/FreeBSD build quiche with `default-features = false` so it **shares the same
-  `aws-lc-sys`** as rustls, while macOS/Windows/OpenBSD build quiche with its **bundled
-  BoringSSL** (`boring`). This is what `AWS_LC_SYS_NO_PREFIX` selects — see the note in
-  the packaging section and [`.cargo/config.toml`](.cargo/config.toml) (B-47).
+  **Linux** builds quiche with `default-features = false` so it **shares the same
+  `aws-lc-sys`** as rustls (unchanged, memfd-based cert loading), while
+  **FreeBSD/macOS/Windows/OpenBSD/NetBSD** build quiche with the **`boringssl-boring-crate`**
+  feature (external `boring` crate, bundled BoringSSL). This is what `AWS_LC_SYS_NO_PREFIX`
+  selects — see the note in the packaging section and
+  [`.cargo/config.toml`](.cargo/config.toml) (B-47).
+- **F-136 (TLS cert hot reload under sandboxing)**: on FreeBSD/OpenBSD/macOS/Windows,
+  HTTP/3 certificate (re)loading uses quiche's in-memory `SSL_CTX` API
+  (`Config::with_boring_ssl_ctx_builder`) — the PEM bytes already held in memory are fed
+  straight into a `boring::ssl::SslContextBuilder`, with no file, path, or memfd involved.
+  This is what makes certificate hot reload work even under FreeBSD capsicum capability
+  mode, where any path-based `open`/`stat` (including the `fopen(3)` that
+  `load_cert_chain_from_pem_file` performs internally) fails with `ECAPMODE`. Linux keeps
+  the original memfd + `/proc/self/fd/N` path unchanged; mixing `aws-lc-sys`
+  (`NO_PREFIX=1`) with the external `boring` crate in one binary was tested and fails at
+  link time with duplicate BoringSSL/AWS-LC symbols, which is why FreeBSD was moved off
+  the shared-`aws-lc-sys` scheme instead of being added to it. See
+  `docs/artifacts/f136_platform_design.md` for the experiment and rejected alternatives.
 
 ## Build
 
@@ -245,8 +267,8 @@ See [packaging/README.md](packaging/README.md) for details (Docker build, postin
 > **Note**: `cmake` and `nasm` must be installed inside the container when building with `--features full` because the `http3` feature builds aws-lc-sys `libssl` (requires cmake) and `aws-lc-rs` uses assembly optimizations (requires nasm). The default build without `http3` does not need cmake.
 >
 > **`AWS_LC_SYS_NO_PREFIX` (per-target, B-47)**: for `http3` / `full` builds the value is set **only** in the `[env]` table of [`.cargo/config.toml`](.cargo/config.toml), using aws-lc-sys' target-suffixed variable names (`AWS_LC_SYS_NO_PREFIX_<triple_with_underscores>`):
-> - **Linux / FreeBSD → `1`**: quiche links the same *unprefixed* AWS-LC symbols as rustls (one shared `aws-lc-sys`).
-> - **Windows / macOS / OpenBSD → `0`**: quiche uses its own bundled BoringSSL, so `aws-lc-sys` must keep its symbol prefix to coexist.
+> - **Linux → `1`**: quiche links the same *unprefixed* AWS-LC symbols as rustls (one shared `aws-lc-sys`).
+> - **FreeBSD / Windows / macOS / OpenBSD → `0`**: quiche uses the external `boringssl-boring-crate` (`boring`), so `aws-lc-sys` must keep its symbol prefix to coexist. FreeBSD moved here in F-136 so that HTTP/3 certificate hot reload can use quiche's in-memory `SSL_CTX` API (`with_boring_ssl_ctx_builder`, only available with `boringssl-boring-crate`) under capsicum capability mode; sharing `aws-lc-sys` with the `boring` crate in one binary fails at link time with duplicate BoringSSL symbols.
 >
 > Cargo has no per-target environment mechanism (`[target.<triple>.env]` is silently ignored), and a `build.rs` cannot set env vars for its dependencies' build scripts (those run first, in separate processes). Do not set this variable in Dockerfiles or packaging scripts — the single source of truth is `.cargo/config.toml`.
 
@@ -254,7 +276,7 @@ See [packaging/README.md](packaging/README.md) for details (Docker build, postin
 > Key notes:
 > - **Default features**: `ktls`, `http2`, `mimalloc`
 > - **`full`**: enables everything (`ktls`, `http2`, `http3`, `grpc-full`, `wasm`, `compression`, `cache`, `metrics`, `websocket`, `rate-limit`, `buffering`, `mimalloc`)
-> - **`full-freebsd` / `full-openbsd`**: same feature set as `full`, but with a different allocator — `full-freebsd` uses **jemalloc** and additionally enables **`aio`** (FreeBSD POSIX AIO, F-127), `full-openbsd` uses the **system allocator** and runs `wasm` through wasmtime's **Pulley interpreter** (B-52). Cargo has no per-target default features, so the packaging scripts pass these explicitly with `--no-default-features` (`packaging/scripts/build-cross.sh --target freebsd`, `tools/qemu/bsd-vm.sh <os> <arch> build|e2e`). Plain `--features full` is unchanged.
+> - **`full-freebsd` / `full-openbsd` / `full-netbsd`**: same feature set as `full`, but with a different allocator — `full-freebsd` uses **jemalloc** and additionally enables **`aio`** (FreeBSD POSIX AIO, F-127); `full-openbsd`/`full-netbsd` use the **system allocator**. `full-openbsd` runs `wasm` through wasmtime's **Pulley interpreter** (B-52); `full-netbsd` omits `wasm` entirely (wasmtime doesn't support NetBSD on any architecture, B-55). All three use vendored TLS (rustls+aws_lc_rs on FreeBSD, rustls+ring on OpenBSD/NetBSD; quiche+bundled BoringSSL on all three). `full-freebsd-aarch64` / `full-openbsd-aarch64` / `full-netbsd-aarch64` mirror these without `wasm` (B-55). Cargo has no per-target default features, so the packaging scripts pass these explicitly with `--no-default-features` (`packaging/scripts/build-cross.sh --target freebsd`, `tools/qemu/bsd-vm.sh <os> <arch> build|e2e`). Plain `--features full` is unchanged.
 > - **Allocator features** (`mimalloc`, `jemalloc`, `system-allocator`) are mutually exclusive — enable at most one
 > - HTTP/3 is UDP-based and cannot be combined with kTLS
 
@@ -1776,6 +1798,7 @@ idle_timeout_secs = 30          # evict a client session after 30s of no traffic
 | `max_connections` | Max simultaneous connections/sessions (0 = unlimited) | `0` |
 | `connect_timeout_secs` | Upstream connect timeout in seconds (TCP only) | `10` |
 | `idle_timeout_secs` | Idle timeout in seconds before closing a connection/session | `600` |
+| `wasm_modules` | WASM network filter module names (requires `wasm` feature, F-133). Empty (default) = WASM disabled and the zero-copy `splice`/`sendfile` path is used unchanged. When non-empty, `splice` is bypassed and data is routed through a userspace buffer so WASM modules can inspect/rewrite it (`proxy_on_downstream_data`/`proxy_on_upstream_data`); this switch is decided once per connection. | `[]` |
 | `upstreams[].addr` | Upstream address (`"host:port"`) | required |
 | `upstreams[].weight` | Weight (reserved for weighted RR) | `1` |
 | `health_check` | Optional health check config (same as upstream health_check) | none |
@@ -1872,7 +1895,8 @@ Zero-downtime certificate rotation without restarting the proxy.
 - **Existing TLS connections** continue using the old certificate (no disruption).
 - **New TLS handshakes** automatically pick up the new certificate.
 - A `SIGHUP` signal also triggers an immediate reload of both config and certificates.
-- **HTTP/1.1, HTTP/2, and HTTP/3 (QUIC/quiche) are all hot-reloadable** (F-105). Because each HTTP/3 worker owns its own `quiche::Config`, the reload thread publishes the raw cert/key PEM atomically via an `ArcSwap`, and each worker swaps them into its config through a `memfd` (Landlock-compatible, no filesystem access) — gated by a cheap per-iteration generation check so the event loop hot path is untouched. Existing QUIC connections keep the old certificate; only new handshakes present the new one. Once every worker has applied the update, the private-key plaintext is zeroed in memory (`secure_zero`).
+- **HTTP/1.1, HTTP/2, and HTTP/3 (QUIC/quiche) are all hot-reloadable** (F-105). Because each HTTP/3 worker owns its own `quiche::Config`, the reload thread publishes the raw cert/key PEM atomically via an `ArcSwap` — gated by a cheap per-iteration generation check so the event loop hot path is untouched. On **Linux** each worker swaps the PEM into its config through a `memfd` (Landlock-compatible, no filesystem access). On **FreeBSD/OpenBSD/macOS/Windows** (F-136) each worker rebuilds its `quiche::Config` entirely in memory via `Config::with_boring_ssl_ctx_builder`, feeding the PEM bytes straight into a `boring::ssl::SslContextBuilder` — no file, path, or memfd involved, which is what keeps reload working under FreeBSD capsicum capability mode (path-based `open`/`stat` — including the internal `fopen(3)` a path-based quiche API would perform — fails with `ECAPMODE` there). Existing QUIC connections keep the old certificate; only new handshakes present the new one. Once every worker has applied the update, the private-key plaintext is zeroed in memory (`secure_zero`).
+- **Capability-mode / sandboxed reload for HTTP/1.1 and HTTP/2** (F-136): under FreeBSD capsicum capability mode, the mtime poll and PEM read for rustls's `ServerConfig` go through a single choke point (`tls_reload::pem_mtime`/`read_pem`) that switches to a dirfd opened before `cap_enter` (`security::capsicum::init_tls_cert_dirfds`) and reads via `openat`/`fstatat` with `O_RESOLVE_BENEATH`. Linux/macOS/Windows/OpenBSD are byte-for-byte unchanged (still plain `std::fs`).
 
 ### Configuration
 
@@ -2742,6 +2766,10 @@ Veil provides a WASM extension system fully compliant with Proxy-Wasm ABI v0.2.1
 - **Pooling Allocator**: High-speed instance creation
 - **Async Execution (no Head-of-Line blocking)**: Modules run on wasmtime async support with fuel-based cooperative yielding (every ~10k instructions), so a CPU-heavy filter cannot stall the io_uring worker's other I/O
 - **Capability Restrictions**: Fine-grained per-module permission control (all disabled by default)
+- **Optional Pulley Interpreter** (`[wasm] interpreter = true`, F-135): runs Wasm through wasmtime's Pulley portable-bytecode interpreter instead of the Cranelift native JIT, emitting no native code at all. Useful on hosts with W^X constraints or where executable `mmap` cannot be granted. Slower than the native JIT. Default is `false` (Cranelift JIT). The AOT sidecar cache uses a distinct filename (`.pulley.cwasm`) so JIT and Pulley builds never fight over — or invalidate — the same cache file. **On OpenBSD this setting is always ignored and Pulley is always used** (B-52; explicitly setting `interpreter = false` logs a startup warning and is otherwise ignored)
+- **HTTP/3 parity with HTTP/1.1/HTTP/2** (F-132): the HTTP/3 path now runs the full filter lifecycle — `on_log` fires from every exit point (including early `LocalResponse` returns), `Backend::File` static-serving routes also get the `on_response_headers` filter applied, and `Backend::Proxy` routes run request/response body filters (`on_request_body`/`on_response_body`, applied once with `end_of_stream=true` since HTTP/3 already buffers the whole body when a WASM module is configured). A response body rewrite updates `content-length` to match, avoiding the H3 message-framing error nghttp3 raises on a mismatch/duplicate.
+- **gRPC trailer filtering** (F-133): `on_request_trailers`/`on_response_trailers` now run for gRPC-over-H2C requests, so a module can rewrite `grpc-status`/`grpc-message` on the response trailers, or reject a request based on client-sent request trailers (via `LocalResponse`). Request trailers are only observed this way (there is no client-trailer forwarding to the backend); response trailer `Pause`/`LocalResponse` is not applicable since HEADERS/DATA are already sent by that point, so the original trailers are kept and a warning is logged.
+- **L4 network filter (Proxy-Wasm `StreamContext` ABI)** (F-133): `[[l4]]` TCP listeners can attach WASM modules via `wasm_modules = ["name"]` to inspect/rewrite raw bytes (`proxy_on_new_connection`, `proxy_on_downstream_data`, `proxy_on_upstream_data`, `proxy_on_downstream_connection_close`, `proxy_on_upstream_connection_close`), using `BufferType::DownstreamData`/`UpstreamData` (values `2`/`3`) via `proxy_get_buffer_bytes`/`proxy_set_buffer_bytes`, and can close the connection via `proxy_close_stream`. **Zero cost when unset**: an empty `wasm_modules` list (the default) takes the same `splice`/zero-copy path as before with one added `is_empty()` branch per connection. When modules are configured, the listener switches (once, at connection setup) to a userspace-buffer copy loop instead of `splice`, since the data must be visible to WASM.
 
 ### Build
 
@@ -2754,6 +2782,10 @@ cargo build --release --features wasm
 ```toml
 [wasm]
 enabled = true
+
+# Run Wasm via the Pulley interpreter instead of the Cranelift native JIT (F-135).
+# Default: false. Always forced to true on OpenBSD regardless of this setting (B-52).
+# interpreter = false
 
 # Default settings (optional)
 [wasm.defaults]
@@ -2794,6 +2826,7 @@ The `[wasm.defaults]` section allows you to configure global WASM runtime settin
 | Option | Description | Default |
 |--------|-------------|---------|
 | `max_execution_time_ms` | Maximum execution time per WASM call (milliseconds) | 100 |
+| `interpreter` | Run Wasm via the Pulley interpreter instead of the Cranelift native JIT (F-135). Always forced to `true` on OpenBSD (B-52) | false |
 
 #### Pooling Allocator Settings
 
@@ -2820,6 +2853,10 @@ The `[wasm.defaults.pooling]` section configures the pooling allocator for high-
 | `allow_response_headers_write` | Modify response headers | false |
 | `allow_response_body_read` | Read response body | false |
 | `allow_response_body_write` | Modify response body | false |
+| `allow_downstream_data_read` | Read L4 downstream (client → proxy) connection data (F-133) | false |
+| `allow_downstream_data_write` | Modify L4 downstream connection data (F-133) | false |
+| `allow_upstream_data_read` | Read L4 upstream (proxy → backend) connection data (F-133) | false |
+| `allow_upstream_data_write` | Modify L4 upstream connection data (F-133) | false |
 | `allow_send_local_response` | Send local response | false |
 | `allow_http_calls` | HTTP external calls | false |
 | `allowed_upstreams` | Allowed upstreams | [] |

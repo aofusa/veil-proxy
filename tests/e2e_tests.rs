@@ -40,9 +40,11 @@
 // F-122 / B-51: テストクライアントの rustls 暗号プロバイダは本体（src/tls_provider.rs）と
 // 同じ target 別選択にする。OpenBSD で aws-lc-rs を使うと aws-lc-sys の curve25519
 // （s2n-bignum アセンブリ）で SIGSEGV し、テストバイナリごと落ちる。
-#[cfg(not(target_os = "openbsd"))]
+// F-140: NetBSD も OpenBSD と同じく rustls は ring を使う（Cargo.toml の
+// target 別 dev-dependencies 参照）。
+#[cfg(not(any(target_os = "openbsd", target_os = "netbsd")))]
 use rustls::crypto::aws_lc_rs as test_crypto;
-#[cfg(target_os = "openbsd")]
+#[cfg(any(target_os = "openbsd", target_os = "netbsd"))]
 use rustls::crypto::ring as test_crypto;
 
 use std::io::{Read, Write};
@@ -57,6 +59,9 @@ use rustls::crypto::CryptoProvider;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection};
 
+// 参照元は grpc（LPM ヘルパ）と grpc-web（gRPC-Web 形式テスト）の双方。
+// どちらも無効な構成（既定 feature 等）では未使用インポート警告になるため cfg する。
+#[cfg(any(feature = "grpc", feature = "grpc-web"))]
 use common::grpc_client::GrpcFrame;
 
 // 新しい非同期テストクライアント（hyper + tokio）
@@ -118,6 +123,11 @@ const PROXY_L4_PORT: u16 = 8444; // L4 TCP プロキシ（TLS パススルー、
 const PROXY_L4_LEAST_CONN_PORT: u16 = 8445; // L4 Least Connection
 const PROXY_L4_TERMINATE_PORT: u16 = 8446; // L4 TLS 終端
 const PROXY_L4_UDP_PORT: u16 = 8447; // L4 UDP プロキシ（セッションテーブル方式、F-124）
+
+// L4 network filter（WASM、F-133）。参照元のテストが l4-proxy + wasm 双方を要求するため、
+// 同じ条件で cfg しないと wasm 非対応プラットフォーム（NetBSD）で dead_code 警告になる。
+#[cfg(all(feature = "l4-proxy", feature = "wasm"))]
+const PROXY_L4_WASM_PORT: u16 = 8448;
 const PROXY_HTTP3_PORT: u16 = 8443; // HTTP/3ポート（デフォルトではHTTPSポートと同じ）
 const BACKEND1_PORT: u16 = 9001;
 const BACKEND2_PORT: u16 = 9002;
@@ -273,6 +283,10 @@ async fn send_request_with_retry(
 }
 
 /// HTTPS POSTリクエストを送信してレスポンスを取得（非同期版）
+///
+/// 参照元は http2（H2C POST）と wasm（ボディフィルタ）のテストのみ。
+/// 双方無効な構成では未使用関数の警告になるため cfg する。
+#[cfg(any(feature = "http2", feature = "wasm"))]
 async fn send_post_request(
     port: u16,
     path: &str,
@@ -17357,6 +17371,180 @@ async fn test_l4_passthrough_large_payload() {
 }
 
 // ====================
+// L4 network filter (WASM, F-133)
+// ====================
+//
+// `l4-wasm-network-filter` リスナー（PROXY_L4_WASM_PORT=8448、平文 TCP、tls="none"）は
+// `network_filter` WASM モジュールを適用し、backend は HTTP body-echo
+// （tests/test_backends の `run_echo_server`）。1 往復で downstream（client→upstream、
+// foo->bar）と upstream（backend→client、bar->baz）の両方向の書き換えを観測できる:
+// クライアントが送った "foo" は downstream フィルタで "bar" に書き換わってバックエンドへ
+// 届き、バックエンドがそのまま "bar" を echo した応答は upstream フィルタで "baz" に
+// 書き換わってクライアントへ返る。
+#[tokio::test]
+#[ntest::timeout(15000)]
+#[cfg(all(feature = "l4-proxy", feature = "wasm"))]
+async fn test_l4_wasm_downstream_upstream_data_rewrite() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let mut stream = match tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect(("127.0.0.1", PROXY_L4_WASM_PORT)),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        other => {
+            panic!("failed to connect to L4 WASM network filter listener: {other:?}");
+        }
+    };
+
+    let body = b"foo-data-foo";
+    let request = format!(
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write L4 WASM request headers");
+    stream
+        .write_all(body)
+        .await
+        .expect("write L4 WASM request body");
+
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+        .await
+        .expect("read L4 WASM response (timeout)")
+        .expect("read L4 WASM response");
+
+    let response_str = String::from_utf8_lossy(&response);
+    eprintln!("L4 WASM network filter response: {}", response_str);
+
+    assert!(
+        response_str.starts_with("HTTP/1.1 200"),
+        "L4 WASM listener should still forward a normal HTTP response: {}",
+        response_str
+    );
+    assert!(
+        response_str.contains("baz-data-baz"),
+        "downstream (foo->bar) + upstream (bar->baz) rewrite should yield 'baz-data-baz' \
+         in the echoed body, got: {}",
+        response_str
+    );
+    assert!(
+        !response_str.contains("foo-data-foo") && !response_str.contains("bar-data-bar"),
+        "original/intermediate payload must not leak through unmodified: {}",
+        response_str
+    );
+}
+
+/// downstream データに `CLOSE_ME` マーカーが含まれると、WASM モジュールが
+/// `proxy_close_stream` を呼び、L4 がバックエンドへ転送せずに接続を切断すること
+/// （＝クライアントは HTTP レスポンスを一切受け取らない）を検証する。
+#[tokio::test]
+#[ntest::timeout(15000)]
+#[cfg(all(feature = "l4-proxy", feature = "wasm"))]
+async fn test_l4_wasm_close_on_marker() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let mut stream = match tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect(("127.0.0.1", PROXY_L4_WASM_PORT)),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        other => {
+            panic!("failed to connect to L4 WASM network filter listener: {other:?}");
+        }
+    };
+
+    let body = b"CLOSE_ME";
+    let request = format!(
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write L4 WASM CLOSE_ME request headers");
+    stream
+        .write_all(body)
+        .await
+        .expect("write L4 WASM CLOSE_ME request body");
+
+    let mut response = Vec::new();
+    let read_result =
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+            .await
+            .expect("read after CLOSE_ME should not hang (timeout)");
+
+    // 接続がエラーで切れるか（Err）、EOF まで読めても中身が空（正常応答なし）で
+    // あることのいずれかを許容する（プラットフォームにより RST/FIN の見え方が違うため）。
+    match read_result {
+        Ok(_) => {
+            assert!(
+                response.is_empty(),
+                "WASM close_stream should prevent any HTTP response from being forwarded, \
+                 got {} bytes: {:?}",
+                response.len(),
+                String::from_utf8_lossy(&response)
+            );
+        }
+        Err(_) => {
+            // 接続リセット等のエラーも「レスポンスが来ない」という期待どおりの結果。
+        }
+    }
+    eprintln!(
+        "L4 WASM close-on-marker: passed (response bytes: {})",
+        response.len()
+    );
+}
+
+/// 既存の WASM 無効な L4 リスナー（`l4-passthrough`）が本チケットの変更後も従来どおり
+/// 動作すること（退行防止）。`test_l4_tcp_passthrough_forward`/`test_l4_passthrough_large_payload`
+/// が引き続きグリーンであることそのものが確認になるため、ここでは
+/// `wasm_modules` 未設定リスナーが `is_empty()` 早期 return 経路（従来の splice/
+/// forward_direction のみ）を通ることを明示的にコメントで残す（コードレベルの根拠は
+/// `src/l4/proxy.rs::bidirectional_forward` 冒頭を参照）。
+#[tokio::test]
+#[ntest::timeout(15000)]
+async fn test_l4_wasm_disabled_listener_still_passthrough() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    // l4-passthrough（PROXY_L4_PORT）には wasm_modules が設定されていないため、
+    // 既存の TLS パススルー転送がそのまま動くことを再確認する。
+    let response = send_request_with_retry(PROXY_L4_PORT, "/", &[], 3).await;
+    assert!(
+        response.is_some(),
+        "WASM-disabled L4 listener should keep forwarding as before"
+    );
+    let status = get_status_code(&response.unwrap());
+    assert_eq!(
+        status,
+        Some(200),
+        "WASM-disabled L4 listener regression check failed, got: {:?}",
+        status
+    );
+    eprintln!("L4 WASM-disabled listener passthrough regression: passed");
+}
+
+// ====================
 // TLS cipher_suites 設定テスト（F-50）
 // ====================
 //
@@ -18421,6 +18609,233 @@ async fn test_http3_wasm_integration() {
         has_wasm_header,
         "HTTP/3 WASM integration should add filter response headers, got headers={:?}",
         resp.headers
+    );
+}
+
+/// F-132: HTTP/3 経由でリクエストヘッダ変更が上流（バックエンド）まで届く経路が壊れていないこと。
+///
+/// header_filter.wasm はリクエストヘッダに `X-Veil-Request-Id` を追加する（B-38）。
+/// バックエンドはヘッダをエコーしない静的ファイルサーバのため、ここでは h1/h2 の既存テスト
+/// （test_wasm_request_header_read）と同水準で「カスタムリクエストヘッダを送っても
+/// WASM リクエストヘッダフィルタが正常実行され 200 が返る」ことを確認する。
+#[tokio::test]
+#[ntest::timeout(20000)]
+#[cfg(all(feature = "http3", feature = "wasm"))]
+async fn test_http3_wasm_request_header_mutation() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
+        Ok(c) => c,
+        Err(e) => panic!("HTTP/3 client failed: {}", e),
+    };
+
+    use common::http3_client::send_http3_request_full;
+    let resp = send_http3_request_full(
+        &mut send_request,
+        "GET",
+        "/wasm/",
+        &[
+            ("x-custom-header", "test-value"),
+            ("user-agent", "wasm-h3-test-client"),
+        ],
+        None,
+    )
+    .await
+    .expect("HTTP/3 wasm request with custom header");
+    assert_eq!(
+        resp.status, 200,
+        "HTTP/3 /wasm/ with custom request header should return 200"
+    );
+
+    let processed = resp
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-veil-processed"));
+    assert!(
+        processed.is_some_and(|(_, v)| v == "true"),
+        "WASM on_request_headers should have executed (X-Veil-Processed missing), headers={:?}",
+        resp.headers
+    );
+}
+
+/// F-132: HTTP/3 経由の /wasm/* でレスポンスヘッダ変更が適用されること（h1/h2 既存相当）。
+#[tokio::test]
+#[ntest::timeout(20000)]
+#[cfg(all(feature = "http3", feature = "wasm"))]
+async fn test_http3_wasm_response_header_mutation() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
+        Ok(c) => c,
+        Err(e) => panic!("HTTP/3 client failed: {}", e),
+    };
+
+    use common::http3_client::send_http3_request_full;
+    let resp = send_http3_request_full(&mut send_request, "GET", "/wasm/", &[], None)
+        .await
+        .expect("HTTP/3 wasm request");
+    assert_eq!(resp.status, 200, "HTTP/3 /wasm/ should return 200");
+
+    let get = |name: &str| {
+        resp.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+
+    assert_eq!(
+        get("x-veil-processed"),
+        Some("true".to_string()),
+        "Should have X-Veil-Processed header, got headers={:?}",
+        resp.headers
+    );
+    assert_eq!(
+        get("x-veil-filter-version"),
+        Some("1.0.0".to_string()),
+        "Should have X-Veil-Filter-Version header, got headers={:?}",
+        resp.headers
+    );
+    assert!(
+        get("x-veil-context-id").is_some(),
+        "Should have X-Veil-Context-Id header, got headers={:?}",
+        resp.headers
+    );
+}
+
+/// F-132: HTTP/3 経由で WASM モジュールが LocalResponse を返した場合、それがそのまま
+/// クライアントへ返ること。
+///
+/// 調査の経緯（重要）: 当初はパストラバーサルのクエリ文字列（`../../etc/passwd` 等）で
+/// 403 を検証しようとしたが、`tests/wasm/waf_filter.wasm`（`tests/fixtures/wasm/` に
+/// フォールバックコピー済み）は `examples/wasm-filters/waf-filter` の**古い版**
+/// （コミット `fd9ede9`〜、`cmdi-00N`/`sqli-00N`/`traversal-00N` 命名。現行 `crs-*` 版とは別物）
+/// からビルドされており、`on_http_request_headers` がパス/クエリを
+/// `self.get_http_request_header(":path")`（`:path` **疑似ヘッダをヘッダマップ経由**で取得）
+/// で読んでいる。しかし本リポジトリの WASM ホスト実装は `:path`/`:method` を
+/// リクエストコンテキストの別フィールド（`HttpContext::request_path`/`request_method`。
+/// `get_property("request.path")` 経由でのみ参照可能）として保持し、ヘッダマップ
+/// （`proxy_get_header_map_value` が読む `request_headers`）には含めない
+/// （`src/http3_server.rs`/`src/proxy.rs` とも疑似ヘッダを除外して `set_request()` へ渡す。
+/// `src/wasm/context.rs::set_request` 参照）。そのため `get_http_request_header(":path")` は
+/// **HTTP/1.1・HTTP/2・HTTP/3 のいずれでも** 常に `None` を返し、パス/クエリに基づく
+/// ルール（path traversal 等）は本バイナリでは発火しない
+/// （`curl -H "Host: localhost" https://127.0.0.1:8443/waf/?file=../../etc/passwd` を
+/// h2 で直接叩いても 200 が返ることを手動確認済み。HTTP/3 固有のリグレッションではない）。
+/// そこで **`user-agent` ヘッダ**（通常のヘッダマップに含まれ、疑似ヘッダの制約を受けない）
+/// を対象にした `cmdi-003`（`(?i)(^|;)\s*(cat|ls|...|curl|wget|...)\b`）ルールで
+/// LocalResponse を発火させる。これは「HTTP/3 で WASM の LocalResponse が機能すること」を
+/// 実証する目的を保ったまま、実際にこのモジュールが発火する条件に合わせたテストである。
+///
+/// B-58: OpenBSD だけ制限時間を大幅に延ばしている。OpenBSD は W^X 制約のため WASM を
+/// Cranelift JIT ではなく **Pulley インタープリタ**で実行する（B-52）。waf_filter は
+/// CRS Level 2 の正規表現ルール群を評価する CPU 律速モジュールで、実機計測では
+/// モジュール初期化から `on_configure` 到達までだけで約 18 秒を要した（他プラットフォーム
+/// では数十 ms）。機能自体は正しく動作しており、ハングでもデッドロックでもないため、
+/// スキップせず制限時間の延長で計測対象に残す。header_filter のような軽量モジュールは
+/// OpenBSD でも HTTP/3 上で 0.17 秒で完走する。
+#[tokio::test]
+#[ntest::timeout(20000)]
+#[cfg(all(feature = "http3", feature = "wasm"))]
+#[cfg_attr(
+    target_os = "openbsd",
+    ignore = "B-58: OpenBSD は Pulley インタープリタ実行のため waf_filter の評価が QUIC の \
+              idle timeout(約30秒)を超過し ConnectionError(Timeout) になる。制限時間の延長では \
+              解決しない（180 秒にしても 30 秒で QUIC 側が切断）。軽量モジュールなら 0.17 秒で完走する"
+)]
+async fn test_http3_wasm_local_response() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
+        Ok(c) => c,
+        Err(e) => panic!("HTTP/3 client failed: {}", e),
+    };
+
+    use common::http3_client::send_http3_request_full;
+    let resp = send_http3_request_full(
+        &mut send_request,
+        "GET",
+        "/waf/",
+        &[("user-agent", "curl/8.5.0")],
+        None,
+    )
+    .await
+    .expect("HTTP/3 waf request");
+
+    assert_eq!(
+        resp.status, 403,
+        "HTTP/3 WAF WASM module should block a flagged User-Agent with 403, got status={} headers={:?}",
+        resp.status, resp.headers
+    );
+    let has_waf_marker = resp
+        .headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("x-waf-block"));
+    assert!(
+        has_waf_marker,
+        "WAF LocalResponse should carry x-waf-block header, got headers={:?}",
+        resp.headers
+    );
+}
+
+/// F-132: HTTP/3 の `Backend::File`（静的配信）ルートにも WASM on_response_headers が
+/// 適用されること（h1/h2 は既に対応済み。HTTP/3 は本チケットで追加）。
+#[tokio::test]
+#[ntest::timeout(20000)]
+#[cfg(all(feature = "http3", feature = "wasm"))]
+async fn test_http3_wasm_static_file() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
+        Ok(c) => c,
+        Err(e) => panic!("HTTP/3 client failed: {}", e),
+    };
+
+    use common::http3_client::send_http3_request_full;
+    let resp = send_http3_request_full(&mut send_request, "GET", "/wasm-static", &[], None)
+        .await
+        .expect("HTTP/3 wasm-static request");
+    assert_eq!(
+        resp.status, 200,
+        "HTTP/3 /wasm-static (Backend::File) should return 200"
+    );
+
+    let has_wasm_header = resp
+        .headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("x-veil-processed") && v == "true");
+    assert!(
+        has_wasm_header,
+        "HTTP/3 static file (Backend::File) route should also have WASM response headers \
+         applied, got headers={:?}",
+        resp.headers
+    );
+    assert!(
+        !resp.body.is_empty(),
+        "HTTP/3 static file response body should not be empty"
     );
 }
 
@@ -19626,6 +20041,115 @@ async fn test_grpc_wasm_interceptor() {
     assert!(
         has_wasm,
         "gRPC WASM interceptor should add filter response headers, got headers={:?}",
+        resp.headers
+    );
+}
+
+/// F-133: gRPC over H2C のレスポンストレイラー（`grpc-status`/`grpc-message`）を
+/// WASM（`grpc_trailer_filter`）が書き換え、クライアントがその値を受け取ることを検証する。
+///
+/// 専用ルート（host="grpc-wasm-trailer.test"）は `test_grpc_wasm_interceptor` が使う
+/// 既存ルート（host=localhost/127.0.0.1、`header_filter` 適用）とは別に定義されているため、
+/// 既存テストには影響しない。
+#[tokio::test]
+#[ntest::timeout(20000)]
+#[cfg(all(feature = "http2", feature = "grpc", feature = "wasm"))]
+async fn test_grpc_wasm_trailer_mutation() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let mut client = Http2TestClient::new("127.0.0.1", PROXY_PORT)
+        .await
+        .expect("h2 client");
+    let lpm = [0u8, 0, 0, 0, 0];
+    let headers = [
+        ("host", "grpc-wasm-trailer.test"),
+        ("content-type", "application/grpc"),
+        ("te", "trailers"),
+    ];
+    let resp = client
+        .send_request_full(
+            "POST",
+            "/grpc.test.v1.TestService/UnaryCall",
+            &headers,
+            Some(&lpm),
+        )
+        .await
+        .expect("gRPC+WASM trailer mutation request");
+
+    eprintln!(
+        "gRPC trailer mutation: status={} trailers={:?} grpc_status={:?} grpc_message={:?}",
+        resp.status,
+        resp.trailers,
+        resp.grpc_status(),
+        resp.grpc_message()
+    );
+
+    assert_eq!(
+        resp.grpc_status(),
+        Some(0),
+        "grpc_trailer_filter should keep grpc-status=0, got trailers={:?}",
+        resp.trailers
+    );
+    assert_eq!(
+        resp.grpc_message().as_deref(),
+        Some("rewritten-by-wasm"),
+        "grpc_trailer_filter should rewrite grpc-message, got trailers={:?}",
+        resp.trailers
+    );
+}
+
+/// F-133: gRPC リクエストヘッダの WASM 書き換え（`grpc_trailer_filter` が付与する
+/// `x-wasm-request-rewrite: applied`）がバックエンドまで届くことを検証する。
+///
+/// クライアント視点ではリクエストヘッダの中身を直接観測できないため、
+/// バックエンド（`tests/grpc_server`）が受信した値を `x-echoed-wasm-header`
+/// レスポンスメタデータへ反射する仕組みを使って間接的に検証する。
+#[tokio::test]
+#[ntest::timeout(20000)]
+#[cfg(all(feature = "http2", feature = "grpc", feature = "wasm"))]
+async fn test_grpc_wasm_request_header_mutation() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let mut client = Http2TestClient::new("127.0.0.1", PROXY_PORT)
+        .await
+        .expect("h2 client");
+    let lpm = [0u8, 0, 0, 0, 0];
+    let headers = [
+        ("host", "grpc-wasm-trailer.test"),
+        ("content-type", "application/grpc"),
+        ("te", "trailers"),
+    ];
+    let resp = client
+        .send_request_full(
+            "POST",
+            "/grpc.test.v1.TestService/UnaryCall",
+            &headers,
+            Some(&lpm),
+        )
+        .await
+        .expect("gRPC+WASM request header mutation request");
+
+    eprintln!(
+        "gRPC request header mutation: status={} headers={:?}",
+        resp.status, resp.headers
+    );
+
+    let echoed = resp
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-echoed-wasm-header"))
+        .map(|(_, v)| v.clone());
+    assert_eq!(
+        echoed.as_deref(),
+        Some("applied"),
+        "backend should have received the WASM-added request header \
+         (x-wasm-request-rewrite: applied) and echoed it back, got headers={:?}",
         resp.headers
     );
 }

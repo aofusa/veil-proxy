@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use wasmtime::Store;
 
+use super::constants::{ACTION_CONTINUE, ACTION_PAUSE};
 use super::context::{HostState, HttpContext};
 use super::registry::{LoadedModule, ModuleRegistry};
 use super::types::{FilterAction, LocalResponse, WasmConfig};
@@ -23,9 +24,19 @@ pub struct FilterEngine {
     /// Default execution time limit (fuel)
     fuel_limit: u64,
     /// Epoch deadline for timeout enforcement
-    /// When epoch interruption is enabled, each store gets a deadline of
-    /// current_epoch + 1, and the engine's epoch is incremented after setting up the store.
-    /// This provides a simple per-execution timeout mechanism.
+    ///
+    /// B-56: wasmtime の epoch は **時計ではなく、この `Engine` を共有する全 WASM 実行
+    /// （全モジュール・全リクエスト・全プロトコル経路）が呼び出すたびに 1 ずつ増える
+    /// グローバルなカウンタ**である。`increment_epoch()` を定期的に呼ぶタイマースレッドは
+    /// 存在せず、各呼び出し箇所が実行直前に 1 回だけ呼ぶ（本ファイル中の
+    /// `self.registry.engine().increment_epoch()` の呼び出し箇所を参照）。
+    /// 各 store は生成時に `current_epoch + epoch_deadline` を締切として持ち、
+    /// エンジン全体でその締切分だけ**他の**WASM 呼び出しが積み重なるとトラップする
+    /// （経過時間ではなく「他の呼び出し回数」に依存する）。同時実行数が多いほど
+    /// 締切に達するまでの実時間は短くなる。F-62 の Pause/resume
+    /// （`resolve_pending_http_calls_inline`）のように store を長時間サスペンドしたまま
+    /// 外部 I/O を待つ経路では、再開直前に締切を引き直す必要がある（さもないと
+    /// 無関係な同時リクエストの WASM 呼び出しだけで誤ってトラップする）。
     epoch_deadline: u64,
 }
 
@@ -289,6 +300,13 @@ impl FilterEngine {
                 super::persistent_context::remove_global_pending_call(&module.name, token);
 
                 let response = Self::execute_http_call_offloaded(&module.name, call).await;
+
+                // B-56: エポックはエンジン共有の「WASM 呼び出し回数」カウンタであり時計ではない。
+                // pause 中に他リクエストが 10 回 WASM を呼ぶと、外部 I/O を待っていただけの本 store の
+                // デッドラインが期限切れになり resume 直後にトラップする。再開直前に猶予を与え直す。
+                // （外部 I/O の待ち時間はゲストの CPU 時間ではないため、これは制限の回避ではない）
+                store.set_epoch_deadline(self.epoch_deadline);
+                self.registry.engine().increment_epoch();
 
                 // 応答をコンテキストへ格納して proxy_on_http_call_response を呼ぶ
                 let (num_headers, body_size, num_trailers) = (
@@ -1851,6 +1869,13 @@ impl FilterEngine {
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_configuration = module.configuration.clone();
+        // F-134: MapType::GrpcReceiveInitialMetadata(4) のバックストア。
+        // ゲストが proxy_on_grpc_receive_initial_metadata 内で
+        // proxy_get_header_map_pairs(GrpcReceiveInitialMetadata) を呼べるようにする。
+        http_ctx.grpc_receive_initial_metadata = headers
+            .iter()
+            .map(|(k, v)| (k.clone().into_bytes(), v.clone().into_bytes()))
+            .collect();
 
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
@@ -1962,6 +1987,8 @@ impl FilterEngine {
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_configuration = module.configuration.clone();
+        // F-134: BufferType::GrpcReceiveBuffer(5) のバックストア。
+        http_ctx.grpc_receive_message = bytes::Bytes::copy_from_slice(message);
 
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
@@ -2079,6 +2106,11 @@ impl FilterEngine {
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_configuration = module.configuration.clone();
+        // F-134: MapType::GrpcReceiveTrailingMetadata(5) のバックストア。
+        http_ctx.grpc_receive_trailing_metadata = trailers
+            .iter()
+            .map(|(k, v)| (k.clone().into_bytes(), v.clone().into_bytes()))
+            .collect();
 
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
@@ -2267,6 +2299,439 @@ impl FilterEngine {
 
         Ok(())
     }
+
+    // ========================================================================
+    // Network Filter (L4 TCP/UDP stream, F-133)
+    //
+    // Proxy-Wasm の network filter ABI（`proxy_on_new_connection` /
+    // `proxy_on_downstream_data` / `proxy_on_upstream_data` /
+    // `proxy_on_downstream_connection_close` / `proxy_on_upstream_connection_close`）。
+    // F-134: 以前は接尾辞 `_connection` を欠いた誤った名前
+    // （`proxy_on_downstream_close`/`proxy_on_upstream_close`）を呼んでおり、実 SDK
+    // （proxy-wasm-rust-sdk 等）でビルドしたモジュールではクローズコールバックが
+    // 一度も発火しなかった（フィクスチャが誤った名前に手書きで合わせていたため
+    // E2E は偶然通っていた）。HTTP コンテキストと異なり
+    // ヘッダが無く、生バイト列のみを扱う。`proxy_get_buffer_bytes`/`proxy_set_buffer_bytes`
+    // の `BufferType::DownstreamData=2`/`UpstreamData=3` 経由でデータを読み書きする。
+    // ========================================================================
+
+    /// Execute `proxy_on_new_connection` for specified modules（接続確立時に 1 回）。
+    pub async fn on_new_connection_with_modules(&self, module_names: &[String]) -> NetworkAction {
+        let modules: Vec<Arc<LoadedModule>> = module_names
+            .iter()
+            .filter_map(|name| self.registry.get_module(name))
+            .collect();
+
+        for module in &modules {
+            match self.execute_on_new_connection(module).await {
+                Ok(NetworkAction::Close) => return NetworkAction::Close,
+                Ok(NetworkAction::Continue) => {}
+                Err(e) => {
+                    ftlog::error!("[wasm:{}] on_new_connection error: {}", module.name, e);
+                }
+            }
+        }
+        NetworkAction::Continue
+    }
+
+    async fn execute_on_new_connection(
+        &self,
+        module: &LoadedModule,
+    ) -> anyhow::Result<NetworkAction> {
+        let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
+        http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_configuration = module.configuration.clone();
+
+        let host_state = HostState::new(http_ctx);
+        let mut store = Store::new(self.registry.engine(), host_state);
+        store.set_fuel(self.fuel_limit)?;
+        store.fuel_async_yield_interval(Some(10_000))?;
+        store.set_epoch_deadline(self.epoch_deadline);
+        self.registry.engine().increment_epoch();
+
+        let instance = module.instance_pre.instantiate_async(&mut store).await?;
+
+        if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
+            let _ = func.call_async(&mut store, ()).await;
+        } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
+            let _ = func.call_async(&mut store, ()).await;
+        }
+
+        let root_context_id = 1i32;
+        let stream_context_id = 2i32;
+        let config_size = module.configuration.len() as i32;
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
+            let _ = func.call_async(&mut store, (root_context_id, 0)).await;
+        }
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
+        {
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
+        }
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
+        {
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
+        }
+        // network filter (stream) context は root context の子として作る。
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
+            let _ = func
+                .call_async(&mut store, (stream_context_id, root_context_id))
+                .await;
+        }
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32,), i32>(&mut store, "proxy_on_new_connection")
+        {
+            let _ = func.call_async(&mut store, (stream_context_id,)).await?;
+        }
+
+        if store.data().http_ctx.close_requested {
+            Ok(NetworkAction::Close)
+        } else {
+            Ok(NetworkAction::Continue)
+        }
+    }
+
+    /// Execute `proxy_on_downstream_data`（クライアント → プロキシ方向のデータ）を
+    /// 指定モジュール群に対して実行する。
+    pub async fn on_downstream_data_with_modules(
+        &self,
+        module_names: &[String],
+        data: bytes::Bytes,
+        end_of_stream: bool,
+    ) -> NetworkFilterResult {
+        self.run_network_data_filters(
+            module_names,
+            data,
+            end_of_stream,
+            NetworkDataDirection::Downstream,
+        )
+        .await
+    }
+
+    /// Execute `proxy_on_upstream_data`（バックエンド → プロキシ方向のデータ）を
+    /// 指定モジュール群に対して実行する。
+    pub async fn on_upstream_data_with_modules(
+        &self,
+        module_names: &[String],
+        data: bytes::Bytes,
+        end_of_stream: bool,
+    ) -> NetworkFilterResult {
+        self.run_network_data_filters(
+            module_names,
+            data,
+            end_of_stream,
+            NetworkDataDirection::Upstream,
+        )
+        .await
+    }
+
+    async fn run_network_data_filters(
+        &self,
+        module_names: &[String],
+        data: bytes::Bytes,
+        end_of_stream: bool,
+        direction: NetworkDataDirection,
+    ) -> NetworkFilterResult {
+        let modules: Vec<Arc<LoadedModule>> = module_names
+            .iter()
+            .filter_map(|name| self.registry.get_module(name))
+            .collect();
+
+        if modules.is_empty() {
+            return NetworkFilterResult::Continue { data };
+        }
+
+        let mut current = data;
+        for module in &modules {
+            // Bytes の clone は参照カウント共有のみ（deep copy なし）。
+            let result = self
+                .execute_on_network_data(module, current.clone(), end_of_stream, direction)
+                .await;
+            match result {
+                Ok(NetworkDataModuleResult::Continue { data }) => current = data,
+                Ok(NetworkDataModuleResult::Pause) => return NetworkFilterResult::Pause,
+                Ok(NetworkDataModuleResult::Close) => return NetworkFilterResult::Close,
+                Err(e) => {
+                    ftlog::error!(
+                        "[wasm:{}] on_{}_data error: {}",
+                        module.name,
+                        direction.label(),
+                        e
+                    );
+                }
+            }
+        }
+
+        NetworkFilterResult::Continue { data: current }
+    }
+
+    async fn execute_on_network_data(
+        &self,
+        module: &LoadedModule,
+        data: bytes::Bytes,
+        end_of_stream: bool,
+        direction: NetworkDataDirection,
+    ) -> anyhow::Result<NetworkDataModuleResult> {
+        let data_len = data.len() as i32;
+        let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
+        match direction {
+            NetworkDataDirection::Downstream => {
+                http_ctx.downstream_data = crate::wasm::context::BodyBuffer::Shared(data)
+            }
+            NetworkDataDirection::Upstream => {
+                http_ctx.upstream_data = crate::wasm::context::BodyBuffer::Shared(data)
+            }
+        }
+        http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_configuration = module.configuration.clone();
+
+        let host_state = HostState::new(http_ctx);
+        let mut store = Store::new(self.registry.engine(), host_state);
+        store.set_fuel(self.fuel_limit)?;
+        store.fuel_async_yield_interval(Some(10_000))?;
+        store.set_epoch_deadline(self.epoch_deadline);
+        self.registry.engine().increment_epoch();
+
+        let instance = module.instance_pre.instantiate_async(&mut store).await?;
+
+        if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
+            let _ = func.call_async(&mut store, ()).await;
+        } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
+            let _ = func.call_async(&mut store, ()).await;
+        }
+
+        let root_context_id = 1i32;
+        let stream_context_id = 2i32;
+        let config_size = module.configuration.len() as i32;
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
+            let _ = func.call_async(&mut store, (root_context_id, 0)).await;
+        }
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
+        {
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
+        }
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
+        {
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
+        }
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
+            let _ = func
+                .call_async(&mut store, (stream_context_id, root_context_id))
+                .await;
+        }
+
+        let callback_name = direction.callback_name();
+        let end_of_stream_i32 = if end_of_stream { 1 } else { 0 };
+        let mut action = ACTION_CONTINUE;
+        if let Ok(func) = instance.get_typed_func::<(i32, i32, i32), i32>(&mut store, callback_name)
+        {
+            action = func
+                .call_async(&mut store, (stream_context_id, data_len, end_of_stream_i32))
+                .await?;
+        }
+
+        let state = store.data();
+        // `proxy_close_stream` 呼び出し（close_requested）を最優先で判定し、次に
+        // `proxy_action_t`（Continue=0/Pause=1）の戻り値で Pause を判定する。
+        if state.http_ctx.close_requested {
+            return Ok(NetworkDataModuleResult::Close);
+        }
+        if action == ACTION_PAUSE {
+            return Ok(NetworkDataModuleResult::Pause);
+        }
+
+        let modified = match direction {
+            NetworkDataDirection::Downstream => {
+                if state.http_ctx.downstream_data_modified {
+                    Some(state.http_ctx.downstream_data.share())
+                } else {
+                    None
+                }
+            }
+            NetworkDataDirection::Upstream => {
+                if state.http_ctx.upstream_data_modified {
+                    Some(state.http_ctx.upstream_data.share())
+                } else {
+                    None
+                }
+            }
+        };
+
+        match modified {
+            Some(data) => Ok(NetworkDataModuleResult::Continue { data }),
+            None => Ok(NetworkDataModuleResult::Continue {
+                data: match direction {
+                    NetworkDataDirection::Downstream => state.http_ctx.downstream_data.share(),
+                    NetworkDataDirection::Upstream => state.http_ctx.upstream_data.share(),
+                },
+            }),
+        }
+    }
+
+    /// Execute `proxy_on_downstream_connection_close`（クライアント側接続クローズ通知、1 回のみ）。
+    ///
+    /// F-134: ABI v0.2.1 の正しいエクスポート名は `proxy_on_downstream_connection_close`
+    /// （旧実装は `_connection` を欠いた `proxy_on_downstream_close` を呼んでいたため、
+    /// 実 SDK ビルドのモジュールでは一度も発火しなかった）。
+    pub async fn on_downstream_close_with_modules(&self, module_names: &[String]) {
+        self.run_network_close(module_names, "proxy_on_downstream_connection_close")
+            .await
+    }
+
+    /// Execute `proxy_on_upstream_connection_close`（バックエンド側接続クローズ通知、1 回のみ）。
+    ///
+    /// F-134: ABI v0.2.1 の正しいエクスポート名は `proxy_on_upstream_connection_close`
+    /// （旧実装は `_connection` を欠いた `proxy_on_upstream_close` を呼んでいたため、
+    /// 実 SDK ビルドのモジュールでは一度も発火しなかった）。
+    pub async fn on_upstream_close_with_modules(&self, module_names: &[String]) {
+        self.run_network_close(module_names, "proxy_on_upstream_connection_close")
+            .await
+    }
+
+    async fn run_network_close(&self, module_names: &[String], callback_name: &str) {
+        let modules: Vec<Arc<LoadedModule>> = module_names
+            .iter()
+            .filter_map(|name| self.registry.get_module(name))
+            .collect();
+
+        for module in &modules {
+            if let Err(e) = self.execute_on_network_close(module, callback_name).await {
+                ftlog::error!("[wasm:{}] {} error: {}", module.name, callback_name, e);
+            }
+        }
+    }
+
+    async fn execute_on_network_close(
+        &self,
+        module: &LoadedModule,
+        callback_name: &str,
+    ) -> anyhow::Result<()> {
+        let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
+        http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_configuration = module.configuration.clone();
+
+        let host_state = HostState::new(http_ctx);
+        let mut store = Store::new(self.registry.engine(), host_state);
+        store.set_fuel(self.fuel_limit)?;
+        store.fuel_async_yield_interval(Some(10_000))?;
+        store.set_epoch_deadline(self.epoch_deadline);
+        self.registry.engine().increment_epoch();
+
+        let instance = module.instance_pre.instantiate_async(&mut store).await?;
+
+        if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
+            let _ = func.call_async(&mut store, ()).await;
+        } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
+            let _ = func.call_async(&mut store, ()).await;
+        }
+
+        let root_context_id = 1i32;
+        let stream_context_id = 2i32;
+        let config_size = module.configuration.len() as i32;
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
+            let _ = func.call_async(&mut store, (root_context_id, 0)).await;
+        }
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
+        {
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
+        }
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
+        {
+            let _ = func
+                .call_async(&mut store, (root_context_id, config_size))
+                .await;
+        }
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
+            let _ = func
+                .call_async(&mut store, (stream_context_id, root_context_id))
+                .await;
+        }
+
+        // Signature: (context_id, close_type) -> void（close_type は未使用のため 0 固定）
+        if let Ok(func) = instance.get_typed_func::<(i32, i32), ()>(&mut store, callback_name) {
+            let _ = func.call_async(&mut store, (stream_context_id, 0)).await;
+        }
+
+        Ok(())
+    }
+}
+
+/// network data (downstream/upstream) の方向。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetworkDataDirection {
+    Downstream,
+    Upstream,
+}
+
+impl NetworkDataDirection {
+    fn callback_name(self) -> &'static str {
+        match self {
+            NetworkDataDirection::Downstream => "proxy_on_downstream_data",
+            NetworkDataDirection::Upstream => "proxy_on_upstream_data",
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            NetworkDataDirection::Downstream => "downstream",
+            NetworkDataDirection::Upstream => "upstream",
+        }
+    }
+}
+
+/// `proxy_on_new_connection` の結果（Close は `proxy_close_stream` 呼び出しで検知）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkAction {
+    Continue,
+    Close,
+}
+
+/// 単一モジュールの network data フィルタ実行結果（内部用）。
+enum NetworkDataModuleResult {
+    Continue { data: bytes::Bytes },
+    Pause,
+    Close,
+}
+
+/// network data フィルタチェーン全体の実行結果。
+pub enum NetworkFilterResult {
+    /// 転送を継続する（`data` は書き換え後、または未変更の場合はそのまま）。
+    Continue { data: bytes::Bytes },
+    /// 処理を一時停止する（現状 L4 では非同期再開経路が無いため、呼び出し側は
+    /// 警告ログを出して Continue 相当に倒す想定）。
+    Pause,
+    /// 接続をクローズする（`proxy_close_stream` が呼ばれた）。
+    Close,
 }
 
 /// Result from a single module execution
@@ -2319,8 +2784,13 @@ pub enum BodyFilterResult {
 mod exec_smoke_tests {
     use super::*;
     use crate::wasm::types::{ModuleConfig, WasmConfig, WasmDefaults};
+    use crate::wasm::ModuleCapabilities;
 
     fn header_filter_engine() -> Option<FilterEngine> {
+        header_filter_engine_with_interpreter(false)
+    }
+
+    fn header_filter_engine_with_interpreter(interpreter: bool) -> Option<FilterEngine> {
         let path = "tests/fixtures/wasm/header_filter.wasm";
         if !std::path::Path::new(path).exists() {
             return None;
@@ -2334,6 +2804,7 @@ mod exec_smoke_tests {
                 configuration: String::new(),
                 capabilities: Default::default(),
             }],
+            interpreter,
         };
         FilterEngine::new(&config).ok()
     }
@@ -2369,6 +2840,135 @@ mod exec_smoke_tests {
             FilterResult::Continue { .. }
             | FilterResult::Pause
             | FilterResult::LocalResponse(_) => {}
+        }
+    }
+
+    fn http_call_filter_engine() -> Option<FilterEngine> {
+        let path = "tests/fixtures/wasm/http_call_filter.wasm";
+        if !std::path::Path::new(path).exists() {
+            return None;
+        }
+        let config = WasmConfig {
+            enabled: true,
+            defaults: WasmDefaults::default(),
+            modules: vec![ModuleConfig {
+                name: "http_call_filter".to_string(),
+                path: path.to_string(),
+                // 空文字列 → モジュールは既定の "backend-pool" を使う（examples/wasm-filters/http-call-filter）。
+                // upstream_groups が未設定（テスト用 CURRENT_CONFIG）でも 502 応答経路で
+                // resume 機構自体は同じように駆動されるため、実バックエンドは不要。
+                configuration: String::new(),
+                capabilities: ModuleCapabilities {
+                    allow_logging: true,
+                    allow_request_headers_read: true,
+                    allow_request_headers_write: true,
+                    allow_send_local_response: true,
+                    allow_http_calls: true,
+                    ..Default::default()
+                },
+            }],
+            interpreter: false,
+        };
+        FilterEngine::new(&config).ok()
+    }
+
+    /// B-56 回帰テスト（決定的）: `resolve_pending_http_calls_inline` が
+    /// `proxy_on_http_call_response` で resume する **直前**に epoch 締切を
+    /// 引き直すこと（本チケットの修正）を、実際に store をサスペンドさせた状態から
+    /// エンジン共有の epoch を `epoch_deadline` 分以上進めて検証する。
+    ///
+    /// 負荷や並行リクエストは一切使わない — `Engine::increment_epoch()` を
+    /// 直接呼んで「他のリクエストが epoch_deadline 回以上 WASM を呼んだ」状態を
+    /// 決定的に再現する（B-56 の真因はまさにこのグローバルカウンタの積み上がりであり、
+    /// 経過時間や並行数ではない）。
+    ///
+    /// このテストは `resolve_pending_http_calls_inline` 内の
+    /// `store.set_epoch_deadline(...); self.registry.engine().increment_epoch();`
+    /// （本チケットの修正そのもの）を一時的に取り除いた状態で実行すると
+    /// `wasm trap: interrupt` で FAIL することを確認済み（コミットメッセージ参照）。
+    #[test]
+    fn b56_http_call_resume_survives_epoch_pressure_while_suspended() {
+        let engine = match http_call_filter_engine() {
+            Some(e) => e,
+            None => {
+                eprintln!("wasm fixture missing; skipping");
+                return;
+            }
+        };
+        let module = engine
+            .get_module("http_call_filter")
+            .expect("module must be loaded");
+
+        let headers = vec![
+            (b":path".to_vec(), b"/".to_vec()),
+            (b":method".to_vec(), b"GET".to_vec()),
+            (b":authority".to_vec(), b"example.com".to_vec()),
+        ];
+        let num_headers = headers.len() as i32;
+
+        let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
+        http_ctx.set_request(
+            Arc::from("GET"),
+            Arc::from("/"),
+            headers,
+            Arc::from("127.0.0.1"),
+        );
+        http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_configuration = module.configuration.clone();
+
+        let host_state = HostState::new(http_ctx);
+        let mut store = Store::new(engine.registry.engine(), host_state);
+
+        // 本命リクエストの `proxy_on_request_headers` を実行する。
+        // モジュールは `dispatch_http_call` してから Pause を返す（F-62）。
+        let (action, instance) = futures::executor::block_on(engine.run_headers_module(
+            &module,
+            &mut store,
+            "proxy_on_request_headers",
+            num_headers,
+            true,
+        ))
+        .expect("run_headers_module must not error");
+
+        assert_eq!(
+            FilterAction::from(action),
+            FilterAction::Pause,
+            "module must dispatch_http_call and return Pause"
+        );
+        assert!(
+            !store.data().http_ctx.pending_http_calls.is_empty(),
+            "a pending http call must be registered before suspending"
+        );
+
+        // B-56 再現条件: store がこの Pause 状態で「サスペンド」されている間に、
+        // 無関係な他リクエストの WASM 呼び出しがエンジン全体で epoch_deadline 回以上
+        // 積み上がる（実運用では offload 待ちの間に他リクエストが WASM を呼ぶことで
+        // 発生する。ここでは決定的に `increment_epoch()` を直接呼んで再現する）。
+        for _ in 0..engine.epoch_deadline {
+            engine.registry.engine().increment_epoch();
+        }
+
+        // 実運用の resume 経路をそのまま呼ぶ（`execute_http_call_offloaded` は
+        // upstream 未解決で 502 応答を返すが、`proxy_on_http_call_response` は
+        // 必ず呼ばれるため resume 機構自体の検証には十分）。
+        let resumed = futures::executor::block_on(
+            engine.resolve_pending_http_calls_inline(&module, &mut store, instance),
+        );
+
+        match resumed {
+            Ok(true) => {
+                // モジュールは `on_http_call_response` でローカルレスポンスを返す。
+                // fail-open していないこと（＝ローカルレスポンスが設定されていること）を確認する。
+                assert!(
+                    store.data().http_ctx.local_response.is_some(),
+                    "resume must produce the module's local response, not fail open (B-56)"
+                );
+            }
+            Ok(false) => panic!("expected the pending http call to be resolved and resumed"),
+            Err(e) => panic!(
+                "resume must not trap on stale epoch deadline while suspended (B-56): {}",
+                e
+            ),
         }
     }
 }

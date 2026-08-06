@@ -146,6 +146,34 @@ pub fn run() {
         warn!("jail_name is set but this build does not target FreeBSD; ignoring");
     }
 
+    // NetBSD: chroot(2)（F-140、オプトイン、root 前提）。
+    //
+    // NetBSD には pledge/unveil 相当のランタイム API が無いため
+    // （`crate::security::netbsd` のモジュールコメント参照）、まず起動時ログで
+    // 実際にサポートできる範囲（chroot + 特権降格 + rlimit）を正直に報告する。
+    // chroot 自体は `drop_privileges`（setuid/setgid、entry.rs 後段）より
+    // **前**に適用すること（先に setuid すると多くの実装で chroot(2) 自体が
+    // `EPERM` になる）。
+    #[cfg(target_os = "netbsd")]
+    {
+        crate::security::netbsd::report_security_support();
+        if let Some(dir) = loaded_config.global_security.chroot_dir.as_deref() {
+            match crate::security::netbsd::chroot_to(std::path::Path::new(dir)) {
+                Ok(()) => info!("netbsd: chroot applied to \"{}\"", dir),
+                Err(e) => {
+                    error!("netbsd: chroot(\"{}\") failed: {}", dir, e);
+                    if !loaded_config.global_security.allow_security_failures {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "netbsd"))]
+    if loaded_config.global_security.chroot_dir.is_some() {
+        warn!("chroot_dir is set but this build does not target NetBSD; ignoring");
+    }
+
     // OpenBSD: unveil(2)（F-120 Phase 5）。
     //
     // 設定パスが確定した直後（TLS 証明書/鍵・WASM モジュールは load_config 内で既に
@@ -940,6 +968,12 @@ pub fn run() {
                     _ => None,
                 })
                 .collect();
+            // F-136: capability mode 下でも TLS 証明書ホットリロードを動作させるため、
+            // cert/key の親ディレクトリ fd を **cap_enter 前** に登録する。auto_reload が
+            // 無効なら TLS リロードスレッド自体が起動しないため登録は不要。
+            let tls_auto_reload = loaded_config.tls_auto_reload;
+            let tls_cert_path = std::path::PathBuf::from(&loaded_config.tls_cert_path);
+            let tls_key_path = std::path::PathBuf::from(&loaded_config.tls_key_path);
             std::thread::Builder::new()
                 .name("veil-cap-enter".to_string())
                 .spawn(move || {
@@ -962,6 +996,22 @@ pub fn run() {
                                      静的配信が 404 になる可能性）: {}",
                                     e
                                 );
+                            }
+                            // F-136: TLS 証明書 dirfd の登録（auto_reload 有効時のみ）。
+                            if tls_auto_reload {
+                                match crate::security::capsicum::init_tls_cert_dirfds(
+                                    &tls_cert_path,
+                                    &tls_key_path,
+                                ) {
+                                    Ok(()) => info!(
+                                        "capsicum: TLS certificate hot-reload will remain functional under capability mode (dirfd relative openat/fstatat)"
+                                    ),
+                                    Err(e) => error!(
+                                        "capsicum: TLS 証明書 dirfd 登録に失敗（capability mode 下で\
+                                         証明書ホットリロードが機能しなくなる可能性）: {}",
+                                        e
+                                    ),
+                                }
                             }
                             match crate::security::capsicum::enter_capability_mode() {
                                 Ok(()) => info!(

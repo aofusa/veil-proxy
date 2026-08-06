@@ -12,7 +12,8 @@
 #              tools/qemu/bsd-vm.sh の VM 内ネイティブビルドを使うこと。
 #
 # BSD 向けは `full` ではなく `full-freebsd`（jemalloc + POSIX AIO）を既定にする。
-# OpenBSD（VM ネイティブビルド）は `full-openbsd`（システムアロケータ）を使う。
+# OpenBSD（VM ネイティブビルド、tools/qemu/bsd-vm.sh）は `full-openbsd`
+# （システムアロケータ + 同梱 rustls(ring)/quiche(BoringSSL)）を使う。
 #
 # 各 Dockerfile は Dockerfile.glibc と同じ cacher/builder 2 段構成のため、
 # ソース変更だけの再ビルドでは aws-lc-sys / boring-sys（quiche 内蔵 BoringSSL）の

@@ -315,6 +315,148 @@ async fn forward_direction(
     total
 }
 
+/// WASM network filter 適用ありの 1 方向転送ループ（F-133）。
+///
+/// `bidirectional_forward` から WASM モジュールが設定されている場合のみ呼ばれる
+/// （呼び出し側で 1 回だけ判定済み）。splice ゼロコピー経路は使わず、読み取ったバイト列を
+/// 都度 `FilterEngine` へ渡してから書き込む。WASM に生データを見せる必要があるための
+/// 意図的なユーザー空間バッファ経由経路であり、ホットパス絶対規則の「WASM 無効時は
+/// コスト増なし」はこの関数を呼ばないことで満たす（無効時は `forward_direction`/
+/// `forward_direction_splice` のみが動く）。
+#[cfg(feature = "wasm")]
+async fn forward_direction_wasm(
+    src: &IoUringTcpStream,
+    dst: &IoUringTcpStream,
+    idle_timeout: Duration,
+    name: &str,
+    wasm_modules: &[String],
+    is_downstream_data: bool,
+    close_requested: &Arc<AtomicBool>,
+) -> usize {
+    #[allow(clippy::uninit_vec)]
+    let mut buf: Vec<u8> = {
+        let mut b = Vec::with_capacity(BUF_SIZE);
+        // SAFETY: read(2) が先頭 n バイトを上書きし、直後の set_len(n) で切り詰めるため
+        // 未初期化領域を Rust 側から読まない。
+        unsafe { b.set_len(BUF_SIZE) };
+        b
+    };
+
+    let mut total = 0usize;
+    'outer: loop {
+        // B-57: `futures::join!` は c→u/u→c の 2 方向を同一タスク内で協調動作させるだけで、
+        // 一方が WASM フィルタから `NetworkAction::Close` を受け取っても他方には伝わらない
+        // （Proxy-Wasm の `proxy_close_stream` は「コネクション全体」を終了させる意味論の
+        // はずが、片方向だけ止まり、もう片方はバックエンド応答をクライアントへ転送し続けて
+        // しまうバグがあった）。`close_requested` は接続ごとに 1 個確保する `Arc<AtomicBool>`
+        // で、ループ 1 周につき 1 回のアトミック load のみを追加する（ロック・アロケーション
+        // 増加なし）。対向方向が既に close 済みならここで即座に自分も転送を止める。
+        if close_requested.load(Ordering::SeqCst) {
+            debug!(
+                "[L4:{}] peer direction requested close, stopping forward (wasm)",
+                name
+            );
+            break;
+        }
+
+        let (res, mut b) = match timeout(idle_timeout, src.read(buf)).await {
+            Ok(r) => r,
+            Err(_) => {
+                debug!("[L4:{}] idle timeout (wasm)", name);
+                break;
+            }
+        };
+        let n = match res {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        unsafe { b.set_len(n) };
+
+        // WASM フィルタ経由（この経路自体が「ユーザー空間バッファを通す」選択の結果
+        // なので、Bytes 化・書き換え時のコピーは許容する）。読み取りバッファ `b` は
+        // 次の read で使い回すため copy_from_slice でコピーし、b の所有権は手元に残す。
+        let data = bytes::Bytes::copy_from_slice(&b);
+        let engine = CURRENT_CONFIG.load().wasm_filter_engine.clone();
+        let out = if let Some(engine) = engine {
+            let result = if is_downstream_data {
+                engine
+                    .on_downstream_data_with_modules(wasm_modules, data.clone(), false)
+                    .await
+            } else {
+                engine
+                    .on_upstream_data_with_modules(wasm_modules, data.clone(), false)
+                    .await
+            };
+            match result {
+                crate::wasm::NetworkFilterResult::Continue { data } => data,
+                crate::wasm::NetworkFilterResult::Close => {
+                    debug!("[L4:{}] WASM module requested connection close", name);
+                    // B-57: Close はコネクション全体の終了を意味する。自分のループを
+                    // 抜けるだけでなく (1) 対向方向へ知らせるフラグを立て、(2) 対向方向が
+                    // ブロックしている可能性のある read を即座に起こすため src/dst 双方を
+                    // shutdown(Both) する。対向方向の src は自分の dst と、対向方向の dst は
+                    // 自分の src と同一ソケットなので、この 2 回の shutdown だけで両ソケット
+                    // とも読み書き不可になり、対向方向の read はブロックせず即座に
+                    // 0 バイト/エラーで返る（shutdown(2) は新規 io_uring オペコードを要さない
+                    // 非ブロッキング syscall）。
+                    close_requested.store(true, Ordering::SeqCst);
+                    let _ = src.shutdown(std::net::Shutdown::Both);
+                    let _ = dst.shutdown(std::net::Shutdown::Both);
+                    break 'outer;
+                }
+                crate::wasm::NetworkFilterResult::Pause => {
+                    warn!(
+                        "[L4:{}] WASM module requested Pause on network data, \
+                         but async resume is not yet supported for L4; continuing",
+                        name
+                    );
+                    data
+                }
+            }
+        } else {
+            data
+        };
+
+        // B-57: フィルタ呼び出しは非同期（ホスト関数呼び出し中に await で他方向へ
+        // 制御が渡り得る）ため、自分がここに到達するまでの間に対向方向が close を
+        // 要求している可能性がある。書き込み前に再チェックし、要求されていれば
+        // このデータは転送せずに終了する（対向方向 close 後にバックエンド応答が
+        // クライアントへ届いてしまう F-133 由来のバグ、B-57、を防ぐ）。
+        if close_requested.load(Ordering::SeqCst) {
+            debug!(
+                "[L4:{}] peer direction requested close, dropping already-read data (wasm)",
+                name
+            );
+            break;
+        }
+
+        let out_len = out.len();
+        let mut pending = out.to_vec();
+        let mut written = 0usize;
+        while written < out_len {
+            if written > 0 {
+                pending.copy_within(written..out_len, 0);
+                pending.truncate(out_len - written);
+            }
+            let (wres, wb) = dst.write(pending).await;
+            pending = wb;
+            match wres {
+                Ok(0) | Err(_) => break 'outer,
+                Ok(wn) => written += wn,
+            }
+        }
+        total += n;
+
+        // 次の read のためにバッファ長を BUF_SIZE に戻す（capacity は変わらないため
+        // 再確保は発生しない。b は read() から返ってきた元の Vec の ownership）。
+        unsafe { b.set_len(BUF_SIZE) };
+        buf = b;
+    }
+
+    let _ = dst.shutdown(std::net::Shutdown::Write);
+    total
+}
+
 // ====================
 // L4 splice パイプのスレッドローカルプール（F-40）
 // ====================
@@ -443,7 +585,63 @@ pub async fn bidirectional_forward(
     upstream: IoUringTcpStream,
     idle_timeout: Duration,
     listener_name: &str,
+    #[cfg(feature = "wasm")] wasm_modules: &[String],
 ) {
+    // F-133: WASM network filter が設定されているかどうかを接続確立時に 1 回だけ判定する
+    // （ホットパス絶対規則: WASM 無効時はこの分岐 1 つだけがコストのすべてで、以降は
+    // 従来どおり splice/forward_direction のゼロコピー経路をそのまま使う）。
+    #[cfg(feature = "wasm")]
+    if !wasm_modules.is_empty() {
+        // WASM 有効時は splice を使わず、データを可視化できるユーザー空間バッファ経由の
+        // 転送へ切り替える（design doc F-133: 「splice/zero-copy 経路は WASM 無効時のみ」）。
+        let engine = CURRENT_CONFIG.load().wasm_filter_engine.clone();
+        if let Some(ref engine) = engine {
+            match engine.on_new_connection_with_modules(wasm_modules).await {
+                crate::wasm::NetworkAction::Close => {
+                    debug!(
+                        "[L4:{}] WASM module closed connection on_new_connection",
+                        listener_name
+                    );
+                    return;
+                }
+                crate::wasm::NetworkAction::Continue => {}
+            }
+        }
+
+        // B-57: 2 方向間で close 要求を共有するためのフラグ。接続ごとに 1 回だけ確保する
+        // （ホットパスへの割り込みはこの `Arc::new` 1 回のみで、ループ内では発生しない）。
+        let close_requested = Arc::new(AtomicBool::new(false));
+        let (c2u_bytes, u2c_bytes) = futures::join!(
+            forward_direction_wasm(
+                &client,
+                &upstream,
+                idle_timeout,
+                listener_name,
+                wasm_modules,
+                true,
+                &close_requested,
+            ),
+            forward_direction_wasm(
+                &upstream,
+                &client,
+                idle_timeout,
+                listener_name,
+                wasm_modules,
+                false,
+                &close_requested,
+            )
+        );
+        debug!(
+            "[L4:{}] connection closed (wasm): c→u {} bytes, u→c {} bytes",
+            listener_name, c2u_bytes, u2c_bytes
+        );
+        if let Some(ref engine) = engine {
+            engine.on_downstream_close_with_modules(wasm_modules).await;
+            engine.on_upstream_close_with_modules(wasm_modules).await;
+        }
+        return;
+    }
+
     // BSD（`splice(2)` 非搭載）: 設計ドキュメント 3.3 節のとおり、splice/パイプ経路は
     // Linux 専用のため使わず、常にユーザースペース read/write 転送（`forward_direction`。
     // コネクション確立時に一度だけバッファを確保しリクエストごとの再確保は発生しない）
@@ -642,7 +840,15 @@ pub async fn handle_l4_connection(
     );
 
     let idle_timeout = Duration::from_secs(config.idle_timeout_secs);
-    bidirectional_forward(client, upstream, idle_timeout, &config.name).await;
+    bidirectional_forward(
+        client,
+        upstream,
+        idle_timeout,
+        &config.name,
+        #[cfg(feature = "wasm")]
+        &config.wasm_modules,
+    )
+    .await;
 }
 
 /// L4 TLS 終端用のサーバー TLS 設定を取得する。
@@ -728,9 +934,39 @@ async fn bidirectional_forward_tls_terminate<C>(
     upstream: &IoUringTcpStream,
     idle_timeout: Duration,
     listener_name: &str,
+    #[cfg(feature = "wasm")] wasm_modules: &[String],
 ) where
     C: AsyncReadRent + AsyncWriteRent + Unpin,
 {
+    // F-133: WASM network filter が設定されているかどうかを接続確立時に 1 回だけ判定する
+    // （ホットパス絶対規則: 未設定時はこの分岐 1 つだけがコストのすべてで、以降は
+    // 従来どおりのユーザー空間ポーリングループをそのまま使う。TLS 終端経路はもともと
+    // splice を使わない平文コピーのため、WASM 有効時も追加のバッファ経路切替は不要で
+    // 同じループへ WASM 呼び出しを差し込むだけで済む）。
+    #[cfg(feature = "wasm")]
+    let wasm_active = !wasm_modules.is_empty();
+
+    #[cfg(feature = "wasm")]
+    let engine = if wasm_active {
+        CURRENT_CONFIG.load().wasm_filter_engine.clone()
+    } else {
+        None
+    };
+
+    #[cfg(feature = "wasm")]
+    if let Some(ref engine) = engine {
+        match engine.on_new_connection_with_modules(wasm_modules).await {
+            crate::wasm::NetworkAction::Close => {
+                debug!(
+                    "[L4:{}] WASM module closed connection on_new_connection (tls terminate)",
+                    listener_name
+                );
+                return;
+            }
+            crate::wasm::NetworkAction::Continue => {}
+        }
+    }
+
     #[allow(clippy::uninit_vec)]
     let make_buf = || {
         let mut b = Vec::with_capacity(BUF_SIZE);
@@ -739,7 +975,7 @@ async fn bidirectional_forward_tls_terminate<C>(
         b
     };
 
-    loop {
+    'outer: loop {
         let mut had_activity = false;
 
         let buf = make_buf();
@@ -747,6 +983,45 @@ async fn bidirectional_forward_tls_terminate<C>(
             Ok((Ok(0), _)) => break,
             Ok((Ok(n), mut b)) => {
                 unsafe { b.set_len(n) };
+
+                // downstream (client → upstream) データを WASM フィルタへ通す
+                // （`wasm_active` が false の場合はこのブロック自体を跳ばし、
+                // 従来どおり b をそのまま転送する）。
+                #[cfg(feature = "wasm")]
+                if wasm_active {
+                    let data = bytes::Bytes::copy_from_slice(&b[..n]);
+                    if let Some(ref engine) = engine {
+                        let result = engine
+                            .on_downstream_data_with_modules(wasm_modules, data, false)
+                            .await;
+                        match result {
+                            crate::wasm::NetworkFilterResult::Continue { data } => {
+                                // WASM が書き換えた（あるいは未変更の）データで b の内容を
+                                // 置き換える。capacity は BUF_SIZE だが、モジュールが長さを
+                                // 変えた場合でも安全なように clear + extend_from_slice で扱う
+                                // （超過時のみ再確保、通常は同容量内で完結）。
+                                b.clear();
+                                b.extend_from_slice(&data);
+                            }
+                            crate::wasm::NetworkFilterResult::Close => {
+                                debug!(
+                                    "[L4:{}] WASM module requested connection close (tls terminate, downstream)",
+                                    listener_name
+                                );
+                                break 'outer;
+                            }
+                            crate::wasm::NetworkFilterResult::Pause => {
+                                warn!(
+                                    "[L4:{}] WASM module requested Pause on network data, \
+                                     but async resume is not yet supported for L4; continuing",
+                                    listener_name
+                                );
+                            }
+                        }
+                    }
+                }
+
+                let n = b.len();
                 let mut pending = b;
                 let mut written = 0usize;
                 while written < n {
@@ -757,7 +1032,7 @@ async fn bidirectional_forward_tls_terminate<C>(
                     let (wres, returned) = upstream.write(pending).await;
                     pending = returned;
                     match wres {
-                        Ok(0) | Err(_) => return,
+                        Ok(0) | Err(_) => break 'outer,
                         Ok(wn) => written += wn,
                     }
                 }
@@ -772,6 +1047,42 @@ async fn bidirectional_forward_tls_terminate<C>(
             Ok((Ok(0), _)) => break,
             Ok((Ok(n), mut b)) => {
                 unsafe { b.set_len(n) };
+
+                // upstream (backend → client) データを WASM フィルタへ通す。
+                #[cfg(feature = "wasm")]
+                if wasm_active {
+                    let data = bytes::Bytes::copy_from_slice(&b[..n]);
+                    if let Some(ref engine) = engine {
+                        let result = engine
+                            .on_upstream_data_with_modules(wasm_modules, data, false)
+                            .await;
+                        match result {
+                            crate::wasm::NetworkFilterResult::Continue { data } => {
+                                // WASM が書き換えた（あるいは未変更の）データで b の内容を
+                                // 置き換える。capacity は BUF_SIZE だが、モジュールが長さを
+                                // 変えた場合でも安全なように clear + extend_from_slice で扱う
+                                // （超過時のみ再確保、通常は同容量内で完結）。
+                                b.clear();
+                                b.extend_from_slice(&data);
+                            }
+                            crate::wasm::NetworkFilterResult::Close => {
+                                debug!(
+                                    "[L4:{}] WASM module requested connection close (tls terminate, upstream)",
+                                    listener_name
+                                );
+                                break 'outer;
+                            }
+                            crate::wasm::NetworkFilterResult::Pause => {
+                                warn!(
+                                    "[L4:{}] WASM module requested Pause on network data, \
+                                     but async resume is not yet supported for L4; continuing",
+                                    listener_name
+                                );
+                            }
+                        }
+                    }
+                }
+
                 let (wres, _) = client.write_all(b).await;
                 if wres.is_err() {
                     break;
@@ -786,6 +1097,12 @@ async fn bidirectional_forward_tls_terminate<C>(
             debug!("[L4:{}] TLS terminate idle timeout", listener_name);
             break;
         }
+    }
+
+    #[cfg(feature = "wasm")]
+    if let Some(ref engine) = engine {
+        engine.on_downstream_close_with_modules(wasm_modules).await;
+        engine.on_upstream_close_with_modules(wasm_modules).await;
     }
 }
 
@@ -881,8 +1198,15 @@ async fn handle_l4_tls_terminate_connection(
     );
 
     let idle_timeout = Duration::from_secs(config.idle_timeout_secs);
-    bidirectional_forward_tls_terminate(&mut tls_client, &upstream, idle_timeout, &config.name)
-        .await;
+    bidirectional_forward_tls_terminate(
+        &mut tls_client,
+        &upstream,
+        idle_timeout,
+        &config.name,
+        #[cfg(feature = "wasm")]
+        &config.wasm_modules,
+    )
+    .await;
 }
 
 #[cfg(test)]
@@ -908,6 +1232,8 @@ mod tests {
             health_check: None,
             connect_timeout_secs: 10,
             idle_timeout_secs: 600,
+            #[cfg(feature = "wasm")]
+            wasm_modules: Vec::new(),
         }
     }
 
@@ -1485,5 +1811,232 @@ mod tests {
 
         src_peer_handle.join().expect("join src peer thread");
         dst_peer_handle.join().expect("join dst peer thread");
+    }
+
+    // ====================
+    // B-57: WASM close_stream の方向間キャンセル共有の回帰テスト
+    // ====================
+    //
+    // `forward_direction_wasm` は `wasm` feature 有効時のみ存在し、target_os 非依存
+    // （splice と違い Linux 限定ではない）。ただし実 I/O を伴うため、ランタイム
+    // ドライバ（io_uring/epoll/kqueue）が使えない環境ではスキップする。
+    #[cfg(feature = "wasm")]
+    #[cfg(veil_rt_uring)]
+    fn wasm_forward_runtime_available() -> bool {
+        crate::runtime::ring::IoUring::new(8, 0).is_ok()
+    }
+
+    #[cfg(feature = "wasm")]
+    #[cfg(all(veil_rt_reactor, target_os = "linux"))]
+    fn wasm_forward_runtime_available() -> bool {
+        let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+            true
+        } else {
+            false
+        }
+    }
+
+    /// BSD/macOS の kqueue readiness reactor は（io_uring と違って）テスト環境で
+    /// 権限制約により使えないケースが実質無いため、無条件で利用可能とみなす。
+    #[cfg(feature = "wasm")]
+    #[cfg(all(veil_rt_reactor, not(target_os = "linux")))]
+    fn wasm_forward_runtime_available() -> bool {
+        true
+    }
+
+    /// `close_requested` が既に立っている状態で `forward_direction_wasm` を呼ぶと、
+    /// WASM エンジン呼び出しにすら到達せず（ループ先頭のアトミック load 1 回のみで）
+    /// 即座に転送を止めること。
+    ///
+    /// 修正前は `forward_direction_wasm` に方向間の共有状態が存在せず、対向方向が
+    /// close 済みでも自分は読み取ったデータをそのまま転送し続けていた（B-57）。
+    /// この経路は接続確立時に既に読み取り可能なデータを src 側へ用意しておき、
+    /// 修正後の実装がそのデータへ一切触れず（read すら発行せず）即座に戻ることを検証する。
+    #[cfg(feature = "wasm")]
+    #[test]
+    fn test_forward_direction_wasm_stops_before_read_when_close_already_requested() {
+        if !wasm_forward_runtime_available() {
+            eprintln!(
+                "runtime unavailable; skipping test_forward_direction_wasm_stops_before_read_when_close_already_requested"
+            );
+            return;
+        }
+
+        // src 側: 接続直後に「転送されてはいけないデータ」を書き込んでおく。
+        let src_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind src");
+        let src_addr = src_listener.local_addr().expect("src addr");
+        let src_peer_handle = std::thread::spawn(move || {
+            use std::io::Write;
+            let (mut peer, _) = src_listener.accept().expect("accept src peer");
+            peer.write_all(b"must-not-be-forwarded")
+                .expect("write src data");
+            // テスト側の block_on が完了するまでピアを保持する。
+            #[allow(clippy::disallowed_methods)]
+            std::thread::sleep(Duration::from_millis(300));
+        });
+
+        // dst 側: 何か 1 バイトでも受信したかどうかだけを報告する。
+        let dst_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind dst");
+        let dst_addr = dst_listener.local_addr().expect("dst addr");
+        let (data_tx, data_rx) = std::sync::mpsc::channel::<usize>();
+        let dst_peer_handle = std::thread::spawn(move || {
+            use std::io::Read;
+            let (mut peer, _) = dst_listener.accept().expect("accept dst peer");
+            peer.set_read_timeout(Some(Duration::from_millis(500)))
+                .expect("set_read_timeout");
+            let mut buf = [0u8; 64];
+            let n = peer.read(&mut buf).unwrap_or(0);
+            let _ = data_tx.send(n);
+        });
+
+        let close_requested = Arc::new(AtomicBool::new(true));
+
+        crate::runtime::block_on(async move {
+            let src = IoUringTcpStream::connect(src_addr)
+                .await
+                .expect("connect src");
+            let dst = IoUringTcpStream::connect(dst_addr)
+                .await
+                .expect("connect dst");
+
+            let start = std::time::Instant::now();
+            // idle_timeout はあえて長め（30秒）にし、早期リターンがタイムアウト待ちに
+            // よるものではなく close_requested チェックそのものによることを保証する。
+            let total = forward_direction_wasm(
+                &src,
+                &dst,
+                Duration::from_secs(30),
+                "test-b57-pre-close",
+                &[],
+                true,
+                &close_requested,
+            )
+            .await;
+            assert_eq!(
+                total, 0,
+                "no bytes should be forwarded once close is already requested"
+            );
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "close_requested check must short-circuit long before idle_timeout"
+            );
+        });
+
+        let received = data_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("dst peer thread must report a result");
+        assert_eq!(
+            received, 0,
+            "dst must never receive forwarded data once close is requested (B-57)"
+        );
+
+        src_peer_handle.join().expect("join src peer thread");
+        dst_peer_handle.join().expect("join dst peer thread");
+    }
+
+    /// `bidirectional_forward` の 2 方向は `(src, dst) = (client, upstream)` と
+    /// `(upstream, client)` のように src/dst が入れ替わって同じソケットを共有する。
+    /// 片方向が close する際に自分の `src`/`dst` 双方へ `shutdown(Shutdown::Both)`
+    /// を発行する設計（本チケットの修正）が、対向方向がブロックしている `read` を
+    /// アイドルタイムアウトを待たずに即座に起こすことを検証する。
+    ///
+    /// WASM モジュール/エンジンは使わず、`NetworkFilterResult::Close` が実際に
+    /// 行うのと同じ shutdown 操作を外部から模して行う。エンジンを介した実際の
+    /// close 分岐（マーカー検出→ Close 判定）自体は `tests/e2e_tests.rs` の
+    /// `test_l4_wasm_close_on_marker`（ライブソケット越しの E2E）でのみ検証可能なため、
+    /// ここでは意図的にそちらへ委ねる。
+    #[cfg(feature = "wasm")]
+    #[test]
+    fn test_forward_direction_wasm_shutdown_unblocks_peers_blocked_read() {
+        if !wasm_forward_runtime_available() {
+            eprintln!(
+                "runtime unavailable; skipping test_forward_direction_wasm_shutdown_unblocks_peers_blocked_read"
+            );
+            return;
+        }
+
+        // ピアは「テスト側から明示的に合図されるまで」接続を保持する（合図は
+        // block_on 完了直後に送信元 channel を drop することで行う）。固定 sleep
+        // ではなくこの方式にすることで、(1) 万一 shutdown 伝搬が効かず read が
+        // idle_timeout いっぱいブロックしても確実にそれより長く生き残り「対向の
+        // 自然切断」による偽陽性を防ぎつつ、(2) 正常系（修正が効いて数百ms で
+        // 完了する場合）はピアを即座に解放してテストを高速に保てる。
+        // フォールバックの 20 秒は、本テストで使う idle_timeout（30 秒未満）より
+        // 短く見えるが、合図が正しく送られる限り実際に使われることはない
+        // （合図が届かない異常系のみのセーフティネット）。
+        let (client_done_tx, client_done_rx) = std::sync::mpsc::channel::<()>();
+        let client_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind client");
+        let client_addr = client_listener.local_addr().expect("client addr");
+        let client_peer_handle = std::thread::spawn(move || {
+            let (peer, _) = client_listener.accept().expect("accept client peer");
+            // 何も送らずピアを保持する（B 方向の書き込み先）。
+            let _ = client_done_rx.recv_timeout(Duration::from_secs(20));
+            drop(peer);
+        });
+
+        let (upstream_done_tx, upstream_done_rx) = std::sync::mpsc::channel::<()>();
+        let upstream_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind upstream");
+        let upstream_addr = upstream_listener.local_addr().expect("upstream addr");
+        let upstream_peer_handle = std::thread::spawn(move || {
+            let (peer, _) = upstream_listener.accept().expect("accept upstream peer");
+            // データを送らず保持し、B 方向の read が実際にブロックする状況を作る。
+            let _ = upstream_done_rx.recv_timeout(Duration::from_secs(20));
+            drop(peer);
+        });
+
+        let close_requested = Arc::new(AtomicBool::new(false));
+
+        crate::runtime::block_on(async move {
+            let client = IoUringTcpStream::connect(client_addr)
+                .await
+                .expect("connect client");
+            let upstream = IoUringTcpStream::connect(upstream_addr)
+                .await
+                .expect("connect upstream");
+
+            let start = std::time::Instant::now();
+
+            // B 方向（upstream → client）。production と同じ引数の並び。idle_timeout は
+            // あえて長め（30秒）にし、早期リターンがタイムアウト待ちではなく
+            // shutdown(Both) による即時の read 解除によることを保証する。
+            let b_direction = forward_direction_wasm(
+                &upstream,
+                &client,
+                Duration::from_secs(30),
+                "test-b57-b",
+                &[],
+                false,
+                &close_requested,
+            );
+
+            // A 方向が Close を検知した際に実行するのと同じ操作
+            // （`close_requested` を立てて自分の src/dst 双方を shutdown(Both)）を、
+            // 100ms 後に外部から模す。A の src/dst はちょうど B の dst/src と同一
+            // ソケットのため、この 2 回の shutdown で B の read が起きるはずである。
+            let closer = async {
+                crate::runtime::time::sleep(Duration::from_millis(100)).await;
+                close_requested.store(true, Ordering::SeqCst);
+                let _ = client.shutdown(std::net::Shutdown::Both);
+                let _ = upstream.shutdown(std::net::Shutdown::Both);
+            };
+
+            let (total, _) = futures::join!(b_direction, closer);
+            assert_eq!(total, 0, "no data should have been forwarded");
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "shutdown(Both) must unblock the peer's blocked read promptly instead of \
+                 waiting for idle_timeout (B-57)"
+            );
+        });
+
+        // ピアへ「もう閉じてよい」と合図してから join する（正常系は即座に解放される）。
+        drop(client_done_tx);
+        drop(upstream_done_tx);
+        client_peer_handle.join().expect("join client peer thread");
+        upstream_peer_handle
+            .join()
+            .expect("join upstream peer thread");
     }
 }

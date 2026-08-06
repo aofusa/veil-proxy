@@ -1,0 +1,19 @@
+[package]
+name = "grpc-trailer-filter"
+version = "0.1.0"
+edition = "2021"
+description = "Sample Proxy-Wasm filter that rewrites gRPC response trailers and request headers (F-133 E2E)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+proxy-wasm = "0.2"
+log = "0.4"
+
+[profile.release]
+lto = true
+opt-level = "s"
+
+# Exclude from parent workspace
+[workspace]

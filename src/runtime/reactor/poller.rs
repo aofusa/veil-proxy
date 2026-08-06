@@ -64,6 +64,17 @@ pub(crate) struct FdRecord {
     /// 不要（常に `EV_ADD` でよい）。
     #[cfg(veil_poller_epoll)]
     pub known_to_kernel: bool,
+    /// F-141: 直近に届いた `EVFILT_READ` イベントの `data`（読み取り可能バイト数、
+    /// カーネルが kevent 発火時点で観測した値）のヒント。kqueue バックエンド専用
+    /// （epoll は `epoll_event` に同等のフィールドを持たない）。
+    ///
+    /// `reactor::tcp::Readable`/`ReadableFd`（TCP・UDP 双方の `wait_readable_fd` 経路）が
+    /// 「直前の kqueue 起床で readable と判明済みか」を判定し、確認用の `poll(2)`
+    /// syscall を省略するために使う（`runtime::executor::take_read_hint` 参照）。
+    /// consume-once（取得時に 0 へリセット）のため、無関係な後続呼び出しへ古い値が
+    /// 漏れることはない。
+    #[cfg(veil_poller_kqueue)]
+    pub read_hint: usize,
 }
 
 /// fd 番号でインデックスする登録テーブル（Unix: `Vec` ベース）。

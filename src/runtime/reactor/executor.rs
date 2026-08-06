@@ -89,6 +89,38 @@ pub(crate) fn current_kqueue_fd() -> Option<RawFd> {
     POLLER.with(|p| p.borrow().as_ref().map(|poller| poller.raw_fd()))
 }
 
+/// F-141: fd の直近の `EVFILT_READ` readiness ヒント（読み取り可能バイト数の
+/// スナップショット、`poller::FdRecord::read_hint` 参照）を **消費**（0 にリセット）
+/// しつつ取得する。
+///
+/// consume-once（take）にする理由: `dispatch_event` が Waker を起こすのと同一
+/// スレッド・同一イベントループ周回内で、起こされたタスクが直後に再 poll される
+/// （シングルスレッド executor のため、この間に他タスクが同じ fd を読み進めることは
+/// ない）。そのため「起こされた直後の 1 回だけヒントを信頼して `poll(2)` の
+/// 確認 syscall を省略し、以降は 0 に戻す」ことで、無関係な後続の poll 呼び出しが
+/// 古いヒントを誤って読み取って spurious な readiness を報告することを防ぐ
+/// （`reactor::tcp::ReadableFd`/`Readable` 参照）。
+///
+/// ヒントが不正確だった場合（真に readable でなかった場合）も、呼び出し側は
+/// 元々 `Poll::Ready` 後に非ブロッキング read/recv を試して `WouldBlock` を
+/// 処理できる設計（try-first パターン）のため安全側（誤検知しても実害は
+/// 「1 回余分な read syscall」のみで、既存の epoll 版のレベルトリガ相当の
+/// spurious wake と同程度）。
+///
+/// reactor 未初期化のスレッドや、その fd に対する read イベントがまだ一度も
+/// 届いていない場合は `0` を返す。
+#[cfg(veil_poller_kqueue)]
+pub(crate) fn take_read_hint(fd: RawFd) -> usize {
+    FD_TABLE
+        .try_with(|t| {
+            t.borrow_mut()
+                .get_mut(fd)
+                .map(|r| std::mem::take(&mut r.read_hint))
+                .unwrap_or(0)
+        })
+        .unwrap_or(0)
+}
+
 #[cfg(veil_poller_epoll)]
 fn with_poller<R>(f: impl FnOnce(&EpollPoller) -> R) -> R {
     POLLER.with(|p| {
@@ -205,9 +237,11 @@ fn register(fd: RawFd, interest: Interest, waker: Waker) {
         rec.armed |= bit;
         (prev, rec.armed)
     });
-    if let Err(e) = with_poller(|p| p.update(fd, new_mask, prev_mask)) {
-        ftlog::error!("reactor: kqueue register failed for fd {}: {}", fd, e);
-    }
+    // F-141: `update` は changelist へ積むだけで syscall しない（次の `park` の
+    // `kevent()` でまとめて反映される）ため、ここでは同期エラーが発生しない。
+    // 適用時のエラー（ENOENT 等）は `park` 側で `EV_ERROR` エントリとして観測され、
+    // 実害の無いものは黙って無視される（`kqueue::KqueuePoller` 型 doc 参照）。
+    with_poller(|p| p.update(fd, new_mask, prev_mask));
 }
 
 /// fd の interest（READ/WRITE いずれか）を登録する（WSAPoll 版、Windows）。
@@ -420,6 +454,14 @@ fn park(timeout_ms: i32) {
                     super::aio::handle_completion(ev.udata as u64);
                     continue;
                 }
+                // F-141: changelist バッチ化により、適用に失敗した change
+                // （例: 既に close 済みの fd への `EV_DELETE` が ENOENT になる）は
+                // 通常のイベントではなく `EV_ERROR` フラグ付きの kevent として
+                // eventlist に混ざって返る（`kqueue::KqueuePoller::wait` の doc 参照）。
+                // 実際の read/write readiness ではないため読み飛ばす。
+                if (ev.flags as u32) & (libc::EV_ERROR as u32) != 0 {
+                    continue;
+                }
                 let fd = ev.ident as RawFd;
                 // EVFILT_READ/EVFILT_WRITE はフィルタごとに独立したイベントとして届く
                 // （epoll のように 1 fd 1 イベントへ両方向がまとめられない）ため、
@@ -431,7 +473,13 @@ fn park(timeout_ms: i32) {
                 } else {
                     continue;
                 };
-                dispatch_event(fd, bit);
+                // F-141: EVFILT_READ の `data`（読み取り可能バイト数のカーネル観測値）を
+                // fd ごとのヒントとして保持する（`poller::FdRecord::read_hint` 参照）。
+                // `reactor::tcp::Readable`/`ReadableFd`（UDP の `wait_readable_fd` を含む）が
+                // 「起こされた直後は確認用 poll(2) を省略してよい」判定に使う
+                // （`executor::take_read_hint` 参照）。ヒントを読まない経路には副作用が無い。
+                let data_hint = ev.data;
+                dispatch_event(fd, bit, data_hint);
             }
         });
     }
@@ -439,11 +487,12 @@ fn park(timeout_ms: i32) {
 }
 
 #[cfg(veil_poller_kqueue)]
-fn dispatch_event(fd: RawFd, flags: u32) {
+fn dispatch_event(fd: RawFd, flags: u32, data_hint: impl TryInto<i64>) {
     // kqueue は EV_ONESHOT 発火時にカーネル側フィルタを自動削除するため、epoll のように
     // 「片方だけ起きたらもう片方を再武装する」再武装処理（epoll_ctl(MOD)）は不要。
     // 起きた方向のビットを armed から落とすだけでよい（次回 register 時に改めて
     // EV_ADD|EV_ONESHOT される）。
+    let data_hint = data_hint.try_into().unwrap_or(0).max(0) as usize;
     let (read_wakers, write_wakers) = FD_TABLE.with(|t| {
         let mut t = t.borrow_mut();
         let Some(rec) = t.get_mut(fd) else {
@@ -451,6 +500,9 @@ fn dispatch_event(fd: RawFd, flags: u32) {
         };
         let mut rw = Vec::new();
         let mut ww = Vec::new();
+        if flags & READ != 0 {
+            rec.read_hint = data_hint;
+        }
         if flags & READ != 0 && !rec.read_wakers.is_empty() {
             rw = std::mem::take(&mut rec.read_wakers);
             rec.armed &= !READ;

@@ -54,6 +54,10 @@ pub use reactor::{executor, tcp, timer};
 // read/write 転送へフォールバックする（F-120 設計 3.3 節）。
 #[cfg(all(veil_rt_reactor, target_os = "linux"))]
 pub use reactor::splice;
+// sendfile(2) は FreeBSD 専用（F-141）。`splice` と同じ理由で他プラットフォームには
+// `runtime::sendfile` パス自体を提供しない。
+#[cfg(all(veil_rt_reactor, target_os = "freebsd"))]
+pub use reactor::sendfile;
 #[cfg(veil_rt_uring)]
 pub use uring::{executor, ring, splice, tcp, timer};
 // udp_recv/udp_send は HTTP/3 io_uring 送受信専用（crate::udp を参照）。http3 無効時は

@@ -23,7 +23,7 @@ packaging/
 ├── rpm/veil.spec                # .rpm spec ファイル
 ├── scripts/
 │   ├── build.sh                 # 統合ビルド（.deb + .rpm）
-│   ├── build-bsd.sh             # FreeBSD/OpenBSD tar.gz（VM ネイティブビルド）
+│   ├── build-bsd.sh             # FreeBSD/OpenBSD/NetBSD tar.gz（VM ネイティブビルド）
 │   ├── build-cross.sh           # macOS / Windows / FreeBSD tar.gz・zip（Docker クロスビルド）
 │   ├── test-install.sh          # 両パッケージを順に検証
 │   ├── test-deb.sh              # .deb 検証
@@ -118,24 +118,47 @@ aarch64 専用 Dockerfile（`docker/Dockerfile.{glibc,musl}.aarch64`）と
 RUST_TARGET=aarch64-unknown-linux-gnu ./packaging/scripts/build.sh --docker
 ```
 
-### FreeBSD / OpenBSD 向けパッケージ（F-120 Phase 6）
+### NetBSD 対応の現状（F-140）
 
-FreeBSD/OpenBSD のバイナリは **QEMU VM 内でネイティブビルド**したものを取り出し、
+NetBSD 向けの feature セット（`full-netbsd`/`full-netbsd-aarch64`、TLS プロバイダの
+target 別分岐、kqueue reactor の `struct kevent` 型差吸収）は **コード側は完成済み**。
+`tools/qemu/bsd-vm.sh`（`netbsd` os として追加）・`packaging/scripts/build-bsd.sh`・
+`packaging/bsd/netbsd/veil.rc` の組み込みも完了しており、以下の FreeBSD/OpenBSD 節と
+同じインタフェースで NetBSD も扱える。2026-07-29 に NetBSD 10.1 amd64 の実機（QEMU）で
+setup/provision まで確認済み。詳細・既知の不確実点は
+[`docs/backlog/features/F-140-netbsd-support.md`](../docs/backlog/features/F-140-netbsd-support.md)
+と [`tools/qemu/README.md`](../tools/qemu/README.md) を参照。
+
+> **NetBSD バイナリは Proxy-Wasm 非対応（B-55）**: wasmtime 40 のシグナルベース
+> トラップ実装（`signals.rs`）に NetBSD 向けの `ucontext` 分岐が一切無く、実機
+> （NetBSD 10.1 amd64）で確認したところ **x86_64 ですら** `compile_error!
+> ("unsupported platform")` でビルドできない。FreeBSD/OpenBSD は aarch64 のみ
+> 非対応（別途 `full-freebsd-aarch64`/`full-openbsd-aarch64` あり）だが、NetBSD は
+> アーキテクチャ不問で非対応のため、`full-netbsd`/`full-netbsd-aarch64` の**両方**が
+> `wasm` を含まない。つまり NetBSD 向けにビルドした `veil` バイナリでは Proxy-Wasm
+> 拡張フィルタは使えない。詳細は
+> [`docs/backlog/bugs/B-55-wasmtime-no-bsd-aarch64.md`](../docs/backlog/bugs/B-55-wasmtime-no-bsd-aarch64.md)。
+
+### FreeBSD / OpenBSD / NetBSD 向けパッケージ（F-120 Phase 6 / F-140）
+
+FreeBSD/OpenBSD/NetBSD のバイナリは **QEMU VM 内でネイティブビルド**したものを取り出し、
 専用スクリプトで rc.d サービススクリプト・設定リファレンス・（FreeBSD は）jail.conf
 サンプルを同梱した tar.gz を生成する（deb/rpm は Linux 専用のため BSD は tar.gz のみ）。
 
 VM の作成からビルド・E2E・バイナリ取得までは
-[`tools/qemu/bsd-vm.sh`](../tools/qemu/README.md) が **FreeBSD/OpenBSD × x86_64/aarch64
-の 4 通り**を同じインタフェースで面倒を見る（x86_64 ゲストはホストに `/dev/kvm` が
-あれば KVM 加速される）。
+[`tools/qemu/bsd-vm.sh`](../tools/qemu/README.md) が **FreeBSD/OpenBSD/NetBSD ×
+x86_64/aarch64 の 6 通り**を同じインタフェースで面倒を見る（x86_64 ゲストはホストに
+`/dev/kvm` があれば KVM 加速される）。
 
 ```bash
 # setup → provision → toolchain → build → e2e → fetch を一括
-# （4 通り: freebsd|openbsd × x86_64|aarch64。すべて同じ形）
+# （6 通り: freebsd|openbsd|netbsd × x86_64|aarch64。すべて同じ形）
 tools/qemu/bsd-vm.sh freebsd x86_64 all
 tools/qemu/bsd-vm.sh freebsd aarch64 all
 tools/qemu/bsd-vm.sh openbsd x86_64 all
 tools/qemu/bsd-vm.sh openbsd aarch64 all
+tools/qemu/bsd-vm.sh netbsd x86_64 all
+tools/qemu/bsd-vm.sh netbsd aarch64 all
 
 # 取り出したバイナリ（packaging/build/veil-<os>-<arch>）を tar.gz 化。
 # --from-qemu は .os-version も自動で拾うので --binary / --os-version は不要。
@@ -144,6 +167,21 @@ tools/qemu/bsd-vm.sh openbsd aarch64 all
 # 取得済みのものをまとめて（存在する組み合わせだけ処理する）
 ./packaging/scripts/build-bsd.sh --all
 ```
+
+**NetBSD 固有の注意（F-140、未検証）**:
+
+- x86_64 は起動可能な `-live.img.gz`（生イメージ）をそのまま qcow2 化して使う
+  （OpenBSD のような autoinstall は不要と見込んでいる）。cloud-init 相当が無いため
+  `provision` はシリアルコンソールへ root ログインして SSH 鍵を注入する
+  （`tools/qemu/netbsd-provision.py`、FreeBSD の `--mode login` と同じ発想）。
+- aarch64 は install ISO のみが配布されているため、`sysinst`（メニュー主導の
+  対話型インストーラ）をシリアルから自動操作する
+  （`tools/qemu/netbsd-autoinstall.py`。OpenBSD の `autoinstall(8)` と異なり応答
+  ファイル方式が無いため、キー送出ベースの自動化になっている）。
+- `toolchain` は **`rust-bin`**（バイナリパッケージ）を pkgin で導入する
+  （`rust`（ソースビルド）は QEMU 上で数時間かかるため避ける）。
+- x86_64 は Rust 1.96.0、aarch64 は Rust 1.91.1 が pkgsrc から入手できる
+  （veil の MSRV を満たすか要確認）。
 
 段階を分けて実行することもできる（失敗時はその段階から再開できる）:
 
@@ -184,7 +222,8 @@ FreeBSD 専用 I/O 経路だけが異なる**。cargo にはターゲット別�
 |---|---|---|---|
 | `full`（既定） | mimalloc | — | Linux / macOS / Windows |
 | `full-freebsd` | **jemalloc** | **`aio`**（POSIX AIO 経路、F-127） | `build-cross.sh --target freebsd` / `bsd-vm.sh freebsd …` |
-| `full-openbsd` | **システムアロケータ**（`global_allocator` を差し替えない） | — | `bsd-vm.sh openbsd …` |
+| `full-openbsd` | **システムアロケータ**（`global_allocator` を差し替えない） | 同梱 rustls(ring)/quiche(BoringSSL) | `bsd-vm.sh openbsd …`（既定） |
+| `full-netbsd` | システムアロケータ | 同梱 rustls(ring)/quiche(BoringSSL)。**`wasm` は含まない**（B-55） | `bsd-vm.sh netbsd …`（既定。実 VM 検証は未実施、上記「NetBSD 対応の現状」参照） |
 
 通常の `cargo build --features full` の挙動は従来どおり（mimalloc・AIO 無効）で変わらない。
 `CARGO_FEATURES` 環境変数で上書きもできる。
@@ -221,8 +260,8 @@ tar.gz には `veil` バイナリ・`rc.d/veil`（サービススクリプト）
 （ABI 互換の目安。大きく異なる OS バージョンでは再ビルド推奨）。
 FreeBSD は capsicum（`[security] enable_capsicum`）・jail と、OpenBSD は
 pledge/unveil（`[security] enable_pledge` / `enable_unveil`）と併用できる。
-OpenBSD の TLS は rustls の ring プロバイダを使用し（F-122）、`full-openbsd`
-（HTTP/3 を含む。アロケータはシステム malloc）でのビルドに対応している。
+OpenBSD の TLS は rustls ring プロバイダ + quiche 同梱 BoringSSL 構成（F-122）を使い、
+`full-openbsd`（HTTP/3 を含む。アロケータはシステム malloc）でのビルドに対応している。
 静的配信/プロキシとも HTTPS 200 で動作する（pledge+unveil 有効のまま）。
 
 > **OpenBSD の WASM について（B-52）**: OpenBSD では wasm を wasmtime の
@@ -297,7 +336,7 @@ zip には `veil.exe`・`config.toml.default`・`www/index.html`・`INSTALL.txt`
 **`AWS_LC_SYS_NO_PREFIX` について（B-47）**: `http3` / `full` ビルドで
 `aws-lc-sys` と `quiche` のシンボルをどう扱うかは
 **`.cargo/config.toml` の `[env]`（ターゲット接尾辞付き変数）が唯一の設定箇所**である
-（Linux/FreeBSD = `1`、Windows/macOS/OpenBSD = `0`）。cargo にターゲット別 env の仕組みが
+（Linux/FreeBSD = `1`、Windows/macOS/OpenBSD/NetBSD = `0`）。cargo にターゲット別 env の仕組みが
 無いため（`[target.<triple>.env]` は黙って無視される）、`aws-lc-sys` が優先して読む
 `AWS_LC_SYS_NO_PREFIX_<triple_with_underscores>` を列挙している。
 packaging のスクリプトや Dockerfile 側でこの変数を設定してはならない。
@@ -317,6 +356,8 @@ packaging/output/veil-<version>-x86_64-unknown-freebsd.tar.gz    # build-bsd.sh�
 packaging/output/veil-<version>-aarch64-unknown-freebsd.tar.gz   # build-bsd.sh（QEMU VM ビルド）
 packaging/output/veil-<version>-x86_64-unknown-openbsd.tar.gz    # build-bsd.sh（QEMU VM ビルド）
 packaging/output/veil-<version>-aarch64-unknown-openbsd.tar.gz   # build-bsd.sh（QEMU VM ビルド）
+packaging/output/veil-<version>-x86_64-unknown-netbsd.tar.gz     # build-bsd.sh（QEMU VM ビルド、F-140）
+packaging/output/veil-<version>-aarch64-unknown-netbsd.tar.gz    # build-bsd.sh（QEMU VM ビルド、F-140）
 packaging/output/veil-<version>-x86_64-unknown-freebsd.tar.gz   # build-cross.sh --target freebsd（B-49 により現在失敗）
 packaging/output/veil-<version>-universal2-apple-darwin.tar.gz # build-cross.sh --target macos
 packaging/output/veil-<version>-x86_64-pc-windows-msvc.zip      # build-cross.sh --target windows
@@ -449,6 +490,6 @@ sudo tail -50 /var/log/veil/veil.error-*.log
 | [docker/Dockerfile.macos](../docker/Dockerfile.macos) | macOS universal2 クロスビルド（キャッシュ有効） |
 | [docker/Dockerfile.windows](../docker/Dockerfile.windows) | Windows x86_64/aarch64 クロスビルド（キャッシュ有効） |
 | [docker/Dockerfile.freebsd](../docker/Dockerfile.freebsd) | FreeBSD x86_64 クロスビルド（キャッシュ有効） |
-| [tools/qemu/bsd-vm.sh](../tools/qemu/README.md) | FreeBSD/OpenBSD × x86_64/aarch64 の VM ビルド・E2E・バイナリ取得（`<os> <arch> all` で一括） |
+| [tools/qemu/bsd-vm.sh](../tools/qemu/README.md) | FreeBSD/OpenBSD/NetBSD × x86_64/aarch64 の VM ビルド・E2E・バイナリ取得（`<os> <arch> all` で一括） |
 | [packaging/scripts/build-bsd.sh](scripts/build-bsd.sh) | 上記の取得物を tar.gz 化（`--from-qemu` / `--all`） |
 | [examples/config.toml](../examples/config.toml) | 設定リファレンス |

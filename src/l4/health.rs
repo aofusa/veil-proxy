@@ -122,6 +122,8 @@ mod tests {
             health_check: Some(hc),
             connect_timeout_secs: 10,
             idle_timeout_secs: 600,
+            #[cfg(feature = "wasm")]
+            wasm_modules: Vec::new(),
         }
     }
 
@@ -165,6 +167,8 @@ mod tests {
             health_check: None,
             connect_timeout_secs: 10,
             idle_timeout_secs: 600,
+            #[cfg(feature = "wasm")]
+            wasm_modules: Vec::new(),
         });
         let state = new_health_state(1);
         spawn_l4_health_checker(config, state.clone());

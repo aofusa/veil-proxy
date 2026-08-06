@@ -30,7 +30,14 @@ pub const PROXY_RESULT_RESULT_MISMATCH: i32 = 9;
 pub const PROXY_RESULT_INTERNAL_FAILURE: i32 = 10;
 /// Unimplemented
 pub const PROXY_RESULT_UNIMPLEMENTED: i32 = 12;
-/// Operation not allowed (capability denied)
+/// veil 独自拡張（ABI v0.2.1 の `proxy_status_t` には存在しない値）。
+///
+/// F-134 適合度テストで確定した契約: **13 は「capability による拒否」専用**とする。
+/// 読み取り専用の MapType/BufferType への書き込みや未知の enum 値は、capability の
+/// 有無に関わらず標準の `BadArgument(2)` を返す（`src/wasm/host/headers.rs` の
+/// `is_writable_map_type`、`src/wasm/host/buffers.rs` の `is_writable_buffer_type`/
+/// `is_known_buffer_type` が判定を capability チェックより前に行う）。
+/// `NOT_ALLOWED` は `ModuleCapabilities` の該当フィールドが false のときにのみ使う。
 pub const PROXY_RESULT_NOT_ALLOWED: i32 = 13;
 
 // ============================================================
@@ -99,6 +106,14 @@ pub const GRPC_RECEIVE_BUFFER: i32 = 5;
 pub const VM_CONFIGURATION: i32 = 6;
 /// Plugin configuration
 pub const PLUGIN_CONFIGURATION: i32 = 7;
+/// Call data（`proxy_on_foreign_function` 呼び出し時に渡される引数バッファ）。
+///
+/// F-134: veil はホスト側から Wasm ゲストの `proxy_on_foreign_function` を
+/// 呼び出す経路（Envoy 拡張、ABI 上はオプション）を実装していないため、
+/// この型は常に「認識はするが中身は空」として扱う（未対応型として
+/// `BadArgument` を返すのは不適合。詳細は
+/// `docs/backlog/features/F-138-proxy-wasm-buffer-maptype-gaps.md`）。
+pub const CALL_DATA: i32 = 8;
 
 // ============================================================
 // proxy_stream_type_t - Stream types

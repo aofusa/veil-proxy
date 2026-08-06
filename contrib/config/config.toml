@@ -1085,6 +1085,15 @@ sandbox_keep_capabilities = ["CAP_NET_BIND_SERVICE"]
 # WASM拡張を有効化（デフォルト: false）
 # enabled = true
 
+# Wasm を Cranelift ネイティブ JIT ではなく Pulley インタープリタで実行する（F-135）
+# デフォルト: false（= Cranelift JIT でネイティブコードを生成・実行）
+# true にすると `Config::target("pulley64"/"pulley32")` を指定し、ネイティブコードを
+# 一切生成しない。W^X 制約のある環境・実行可能 mmap を許可できない環境向け。
+# ネイティブ JIT より実行速度は低下する。
+# 注意: OpenBSD ではこの値は常に無視され、常に Pulley インタープリタが使われる
+#（B-52。SIGSEGV を避けるための必須対応。false を指定すると起動時に警告ログが出る）。
+# interpreter = false
+
 # デフォルト設定
 # [wasm.defaults]
 # 最大実行時間（ミリ秒）

@@ -38,8 +38,10 @@ mod tests;
 
 pub use capabilities::{CapabilityPreset, ModuleCapabilities};
 pub use constants::*;
-pub use context::HttpContext;
-pub use engine::{BodyFilterResult, FilterEngine, FilterResult};
+pub use context::{HostState, HttpContext};
+pub use engine::{
+    BodyFilterResult, FilterEngine, FilterResult, NetworkAction, NetworkFilterResult,
+};
 pub use grpc_integration::{
     on_grpc_close, on_grpc_initial_metadata, on_grpc_message, on_grpc_trailing_metadata,
 };
@@ -82,4 +84,31 @@ pub use types::*;
 /// Initialize the WASM extension system
 pub fn init(config: &WasmConfig) -> anyhow::Result<FilterEngine> {
     FilterEngine::new(config)
+}
+
+// ============================================================================
+// F-134: Proxy-Wasm ABI 適合度テスト向けサポート API
+// ============================================================================
+//
+// `tests/proxy_wasm_conformance.rs`（外部統合テストクレート）はホスト関数を
+// `Linker` へ登録した実体（`host::add_host_functions`、`pub(crate)`）へ直接
+// アクセスできない。本番の `registry.rs::create_engine` はプーリングアロケータ・
+// Pulley 切替・epoch/fuel 等の本番専用設定を伴うため流用せず、ホスト関数の
+// 引数検証・ステータスコードのみを検証する最小構成をここに用意する。
+
+/// 適合度テスト用の `Engine` を構築する（async host functions を使うため
+/// `async_support(true)` のみ必要）。
+pub fn build_conformance_test_engine() -> anyhow::Result<wasmtime::Engine> {
+    let mut config = wasmtime::Config::new();
+    config.async_support(true);
+    wasmtime::Engine::new(&config)
+}
+
+/// 本番と同じホスト関数一式を登録した `Linker` を構築する。
+pub fn build_conformance_test_linker(
+    engine: &wasmtime::Engine,
+) -> anyhow::Result<wasmtime::Linker<HostState>> {
+    let mut linker = wasmtime::Linker::new(engine);
+    host::add_host_functions(&mut linker)?;
+    Ok(linker)
 }

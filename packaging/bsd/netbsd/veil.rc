@@ -1,0 +1,61 @@
+#!/bin/sh
+#
+# NetBSD rc.d サービススクリプト（veil、F-140）
+#
+# インストール:
+#   install -m 0555 veil.rc /etc/rc.d/veil
+#   echo 'veil=YES' >> /etc/rc.conf
+#   /etc/rc.d/veil start
+#
+# 設定ファイル: /etc/veil/config.toml
+#
+# 注意: veil のアプリ内セキュリティ機構は OpenBSD の pledge/unveil と違い、
+# NetBSD には相当するランタイム API が無い（F-140）。veil が提供できるのは
+# chroot(2)（[security] chroot_dir）+ setuid/setgid による特権降格 + rlimit のみ。
+# TLS は既定で rustls の ring プロバイダ + `system-tls`（システムの OpenSSL/LibreSSL
+# へ動的リンク）を使う（`full-netbsd`）。従来の同梱（vendored）構成が必要な場合は
+# `full-netbsd-vendor` でビルドしたバイナリに差し替えること。
+#
+# NetBSD には FreeBSD の daemon(8) 相当が無いため、veil プロセス自身をバック
+# グラウンドへ回して pidfile を書く（rc.subr の一般的な非デーモン化コマンド向け
+# パターン）。
+#
+# PROVIDE: veil
+# REQUIRE: NETWORKING SERVERS
+# KEYWORD: shutdown
+
+$_rc_subr_loaded . /etc/rc.subr
+
+name="veil"
+rcvar=$name
+
+load_rc_config $name
+
+: ${veil:="NO"}
+: ${veil_config:="/etc/veil/config.toml"}
+
+pidfile="/var/run/${name}.pid"
+procname="/usr/local/bin/veil"
+command="/usr/local/bin/veil"
+command_args="-c ${veil_config} & echo \$! > ${pidfile}"
+
+# 設定リロード（SIGHUP でホットリロード）
+extra_commands="reload configtest"
+reload_cmd="veil_reload"
+configtest_cmd="veil_configtest"
+
+veil_reload()
+{
+	if [ -f "${pidfile}" ]; then
+		kill -HUP "$(cat "${pidfile}")" && echo "veil: reloaded"
+	else
+		echo "veil: not running"
+	fi
+}
+
+veil_configtest()
+{
+	${procname} -t -c "${veil_config}"
+}
+
+run_rc_command "$1"
