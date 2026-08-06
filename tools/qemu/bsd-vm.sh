@@ -1162,7 +1162,7 @@ _guest_env_prefix() {
 #                  + 同梱 rustls(ring)/quiche(BoringSSL)。
 #   full-netbsd  : full-openbsd と同一方針（システムアロケータ + 同梱 TLS）。
 # いずれも `--no-default-features` と併用する（default features の mimalloc を外すため）。
-# aarch64 は wasmtime がビルドできないため wasm 抜きのセットを使う（B-55）。
+# aarch64 も B-55 解消により wasm 込み（third_party/wasmtime = veil-wasmtime を使う）。
 _default_features() {
     local suffix=""
     [[ "${ARCH}" == "aarch64" ]] && suffix="-aarch64"
