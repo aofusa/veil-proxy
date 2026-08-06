@@ -1090,8 +1090,10 @@ sandbox_keep_capabilities = ["CAP_NET_BIND_SERVICE"]
 # true にすると `Config::target("pulley64"/"pulley32")` を指定し、ネイティブコードを
 # 一切生成しない。W^X 制約のある環境・実行可能 mmap を許可できない環境向け。
 # ネイティブ JIT より実行速度は低下する。
-# 注意: OpenBSD ではこの値は常に無視され、常に Pulley インタープリタが使われる
-#（B-52。SIGSEGV を避けるための必須対応。false を指定すると起動時に警告ログが出る）。
+# 注意: OpenBSD（全アーキ）・NetBSD（全アーキ）・FreeBSD aarch64 ではこの値は常に
+# 無視され、常に Pulley インタープリタが使われる（B-52: OpenBSD は SIGSEGV を避ける
+# 必須対応。B-55: NetBSD 全アーキ・FreeBSD/OpenBSD aarch64 は third_party/wasmtime
+# （veil-wasmtime）を使うため Pulley 専用。false を指定すると起動時に警告ログが出る）。
 # interpreter = false
 
 # デフォルト設定

@@ -1,6 +1,6 @@
 # B-55: wasmtime が BSD の一部プラットフォームをサポートしておらず `full-*` の一部がビルドできない
 
-**状態: 回避済み（該当プラットフォームは wasm 抜きの feature セットを使う）**
+**状態: 対応済み（`third_party/wasmtime` vendoring + ターゲット別依存 + Pulley 強制で該当プラットフォームでも `wasm` を有効化、`feat/bsd-wasm-integration`）**
 
 **当初は「BSD × aarch64」のみの制約だと考えていたが、2026-07-29 の NetBSD 実機検証で
 NetBSD は **x86_64 を含む全アーキテクチャ**で wasmtime 非対応であることが判明した
@@ -84,7 +84,10 @@ Pulley は `Config::target("pulley64")` による**コード生成先**の切り
   レート制限・バッファリング・admin・アクセスログ・kTLS(FreeBSD)・AIO(FreeBSD)）は
   上記プラットフォームでも利用できる。
 
-## 対応
+（上記は発見当時の事象。下記「対応（解消）」により現在はこれらのプラットフォームでも
+Proxy-Wasm が利用できる。）
+
+## 初期対応（暫定回避、2026-07 時点。下記「対応（解消）」で置き換え済み）
 
 cargo は **feature セットを target 別に切り替えられない**（`[target.*]` は依存関係
 専用で features には効かない）ため、既存の `full-freebsd` / `full-openbsd` と同じく
@@ -98,6 +101,49 @@ cargo は **feature セットを target 別に切り替えられない**（`[tar
   `full-netbsd-vendor` / `full-netbsd-aarch64` / `full-netbsd-aarch64-vendor` の
   **4 つ全てから `wasm` を除外**した（`full-netbsd-aarch64*` は元々除外済みだった
   ため変更不要、`full-netbsd`/`full-netbsd-vendor`（x86_64 向け）から新たに除外）。
+
+これは「対象プラットフォームでは Proxy-Wasm を諦める」という機能除外であり、
+根本原因（wasmtime 側の `ucontext` 分岐欠如）そのものの解消ではなかった。
+
+## 対応（解消、`feat/bsd-wasm-integration`）
+
+上記の暫定回避を撤回し、対象 3 ターゲット（NetBSD 全アーキ・FreeBSD aarch64・
+OpenBSD aarch64）でも `wasm` を有効なまま使えるようにした。検討した 2 案
+（vendoring 案 A・wasmi 別実装案 B）と判断根拠は
+`docs/artifacts/b55_bsd_wasm_design.md` 参照（B を不採用にしたのは wasmi 版
+ホスト実装のスタブが多くプラットフォーム間で挙動が変わりうるため）。
+
+**やったこと**:
+
+1. **crates.io wasmtime 40.0.4 を `third_party/wasmtime` へ vendoring**し、
+   パッケージ名だけ `veil-wasmtime` に変更（`[lib] name = "wasmtime"` は据え置き）。
+   差分は `Cargo.toml` の名前変更 + `[lints.rust] dead_code = "allow"` と、
+   `build.rs` の `has_native_signals` 算出に対象 3 ターゲットで `false` を強制する
+   1 箇所のみ（詳細・由来・追従手順は `third_party/wasmtime/README.veil.md`）。
+2. **Cargo のターゲット別依存**（`[target.'cfg(...)'.dependencies]`）で
+   `wasmtime`（crates.io 版）と `veil-wasmtime`（path 版）を相互排他に切り替え。
+   `[patch.crates-io]` は全ターゲットの wasmtime を差し替えてしまうため使わず、
+   依存キーを分けることで cargo の
+   `Dependency 'wasmtime' has different source paths depending on the build target`
+   エラーを回避した。`[lib] name` が同じ `wasmtime` のままなので `src/` の
+   `use wasmtime::...` は 1 行も変更不要。
+3. `build.rs` が `veil_wasm_nosignals` cfg（対象 3 ターゲットで true）を発行し、
+   `src/wasm/registry.rs` はこの cfg が立っているとき常に Pulley インタープリタを
+   強制する（既存の OpenBSD 常時 Pulley 強制と統合）。ネイティブ JIT を生成しない
+   ため、そもそもシグナルベース trap が不要という点は当初の分析どおり。
+4. `full-freebsd-aarch64` / `full-openbsd-aarch64` / `full-netbsd` /
+   `full-netbsd-aarch64` の 4 feature セットすべてに `wasm` を復活させた。
+
+**適用範囲の限定**: Linux / Windows / macOS / FreeBSD x86_64 / OpenBSD x86_64 は
+crates.io の wasmtime 40.0.0 をソース・依存とも一切変えずそのまま使う
+（vendoring は対象 3 ターゲットのビルド時にのみ選択される）。
+
+**残課題（上流）**: 本対応はあくまで veil 側のローカルな回避策であり、
+下記「上流について」に書いた `ucontext` 分岐を wasmtime 本体に追加するのが
+本来の直し方であることに変わりはない。wasmtime のバージョンを上げるたびに
+`third_party/wasmtime/README.veil.md` の「新しい wasmtime バージョンへ追従する
+手順」に従って `has_native_signals` 差分を再適用する必要がある（自動追従の
+仕組みは無い）。
 
 ## 上流について
 

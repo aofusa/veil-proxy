@@ -129,15 +129,19 @@ setup/provision まで確認済み。詳細・既知の不確実点は
 [`docs/backlog/features/F-140-netbsd-support.md`](../docs/backlog/features/F-140-netbsd-support.md)
 と [`tools/qemu/README.md`](../tools/qemu/README.md) を参照。
 
-> **NetBSD バイナリは Proxy-Wasm 非対応（B-55）**: wasmtime 40 のシグナルベース
-> トラップ実装（`signals.rs`）に NetBSD 向けの `ucontext` 分岐が一切無く、実機
-> （NetBSD 10.1 amd64）で確認したところ **x86_64 ですら** `compile_error!
-> ("unsupported platform")` でビルドできない。FreeBSD/OpenBSD は aarch64 のみ
-> 非対応（別途 `full-freebsd-aarch64`/`full-openbsd-aarch64` あり）だが、NetBSD は
-> アーキテクチャ不問で非対応のため、`full-netbsd`/`full-netbsd-aarch64` の**両方**が
-> `wasm` を含まない。つまり NetBSD 向けにビルドした `veil` バイナリでは Proxy-Wasm
-> 拡張フィルタは使えない。詳細は
-> [`docs/backlog/bugs/B-55-wasmtime-no-bsd-aarch64.md`](../docs/backlog/bugs/B-55-wasmtime-no-bsd-aarch64.md)。
+> **NetBSD バイナリも Proxy-Wasm が使える（B-55 解消）**: crates.io wasmtime 40 の
+> シグナルベーストラップ実装（`signals.rs`）には NetBSD 向けの `ucontext` 分岐が
+> 一切無く、実機（NetBSD 10.1 amd64）で確認したところ **x86_64 ですら**
+> `compile_error!("unsupported platform")` でビルドできなかった（FreeBSD/OpenBSD は
+> aarch64 のみ非対応、NetBSD はアーキテクチャ不問で非対応）。これを解消するため
+> crates.io wasmtime 40.0.4 を `third_party/wasmtime`（パッケージ名のみ
+> `veil-wasmtime`）として vendoring し、対象ターゲット（NetBSD 全アーキ・FreeBSD/
+> OpenBSD aarch64）だけ `build.rs` の `has_native_signals` を強制的に `false` にした
+> ものを Cargo のターゲット別依存で選択させ、常に Pulley インタープリタで実行する
+> ようにした。`full-netbsd`/`full-netbsd-aarch64` はいずれも `wasm` を含む。それ以外の
+> 全プラットフォームは crates.io の wasmtime をそのまま使い無影響。詳細は
+> [`docs/backlog/bugs/B-55-wasmtime-no-bsd-aarch64.md`](../docs/backlog/bugs/B-55-wasmtime-no-bsd-aarch64.md)・
+> [`../third_party/wasmtime/README.veil.md`](../third_party/wasmtime/README.veil.md)。
 
 ### FreeBSD / OpenBSD / NetBSD 向けパッケージ（F-120 Phase 6 / F-140）
 
@@ -223,7 +227,7 @@ FreeBSD 専用 I/O 経路だけが異なる**。cargo にはターゲット別�
 | `full`（既定） | mimalloc | — | Linux / macOS / Windows |
 | `full-freebsd` | **jemalloc** | **`aio`**（POSIX AIO 経路、F-127） | `build-cross.sh --target freebsd` / `bsd-vm.sh freebsd …` |
 | `full-openbsd` | **システムアロケータ**（`global_allocator` を差し替えない） | 同梱 rustls(ring)/quiche(BoringSSL) | `bsd-vm.sh openbsd …`（既定） |
-| `full-netbsd` | システムアロケータ | 同梱 rustls(ring)/quiche(BoringSSL)。**`wasm` は含まない**（B-55） | `bsd-vm.sh netbsd …`（既定。実 VM 検証は未実施、上記「NetBSD 対応の現状」参照） |
+| `full-netbsd` | システムアロケータ | 同梱 rustls(ring)/quiche(BoringSSL)。**`wasm` を含む**（`third_party/wasmtime` 経由の Pulley 実行、B-55 解消） | `bsd-vm.sh netbsd …`（既定。実 VM 検証は未実施、上記「NetBSD 対応の現状」参照） |
 
 通常の `cargo build --features full` の挙動は従来どおり（mimalloc・AIO 無効）で変わらない。
 `CARGO_FEATURES` 環境変数で上書きもできる。
