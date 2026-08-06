@@ -1,0 +1,83 @@
+# B-58: OpenBSD（Pulley インタープリタ）で CPU 律速の WASM モジュールが極端に遅い
+
+**状態: 調査完了・制限事項として文書化（機能不全ではない）**
+
+## 事象
+
+OpenBSD 7.9 amd64（QEMU 実機）の E2E で `test_http3_wasm_local_response` が
+**単体実行でも** 20 秒の制限時間を超過して失敗する。
+
+```
+thread 'test_http3_wasm_local_response' panicked at tests/e2e_tests.rs:18741:1:
+timeout: the function call took 20002 ms. Max time 20000 ms
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 541 filtered out
+```
+
+## 切り分け
+
+### ハング／デッドロックではない
+
+テストがタイムアウトした後も 90 秒待ってプロキシのログを確認したが、
+エラーもトラップも記録されていない。実行が進行中のまま制限時間を迎えている。
+
+実機ログのタイムスタンプ:
+
+```
+03:44:56.697  Loading WASM module: waf_filter
+03:44:56.719  Loaded WASM module 'waf_filter'
+03:45:14.159  [wasm:waf_filter] [waf] Using default configuration   ← 約 18 秒後
+```
+
+`on_configure`（ルートコンテキスト）へ到達するまでだけで **約 18 秒**を要している。
+他プラットフォームでは数十 ms。
+
+### HTTP/3 + WASM の経路自体は健全
+
+同じ OpenBSD 実機で、軽量モジュール（`header_filter`）を使う HTTP/3 + WASM は
+**単体 0.17 秒で完走**し、WASM のライフサイクルも最後まで記録される。
+
+```
+test_http3_wasm_request_header_mutation ... ok (0.17s)
+
+[wasm:header_filter] Added request headers for context 2
+[wasm:header_filter] Added response headers for context 2
+[wasm:] Request 2 completed
+```
+
+したがって F-132（HTTP/3 の Proxy-Wasm 対応）自体に欠陥は無い。
+
+### 原因
+
+OpenBSD は W^X 制約のため WASM を Cranelift ネイティブ JIT ではなく
+**Pulley インタープリタ**で実行する（B-52）。`waf_filter` は CRS Level 2 の
+正規表現ルール群を評価する **CPU 律速**モジュールであり、インタープリタ実行の
+オーバーヘッド（JIT 比で 10〜50 倍）がそのまま実行時間に乗る。
+
+`header_filter` のようにヘッダを数個追加するだけのモジュールでは差が表面化しない。
+
+## 対応
+
+**スキップせず、OpenBSD だけ制限時間を延長して計測対象に残す。**
+
+```rust
+#[cfg_attr(not(target_os = "openbsd"), ntest::timeout(20000))]
+#[cfg_attr(target_os = "openbsd", ntest::timeout(180000))]
+```
+
+スキップすると「OpenBSD で WASM の LocalResponse が動くこと」を一切検証しなくなる。
+機能は正しく動作しており実行に時間がかかるだけなので、時間を与えて検証を残す方が
+実態に即している。
+
+## 利用者への影響
+
+OpenBSD / NetBSD で **CPU 律速の WASM フィルタ（WAF、正規表現マッチ、
+大きなボディの走査など）を本番投入するのは現実的でない**。ヘッダの追加・書き換え
+程度の軽量なフィルタであれば実用範囲。
+
+Linux / FreeBSD / macOS / Windows は Cranelift JIT で実行するため影響を受けない。
+
+## 関連
+
+- B-52: OpenBSD で MAP_STACK ファイバスタック + OnDemand + Pulley により WASM を動作させた
+- B-55: wasmtime 40 が FreeBSD/OpenBSD aarch64 と NetBSD 全アーキテクチャで WASM 非対応
+- F-135: `[wasm] interpreter` オプション（OpenBSD/NetBSD は設定値を無視して常に Pulley）

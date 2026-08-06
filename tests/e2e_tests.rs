@@ -18737,8 +18737,17 @@ async fn test_http3_wasm_response_header_mutation() {
 /// を対象にした `cmdi-003`（`(?i)(^|;)\s*(cat|ls|...|curl|wget|...)\b`）ルールで
 /// LocalResponse を発火させる。これは「HTTP/3 で WASM の LocalResponse が機能すること」を
 /// 実証する目的を保ったまま、実際にこのモジュールが発火する条件に合わせたテストである。
+///
+/// B-58: OpenBSD だけ制限時間を大幅に延ばしている。OpenBSD は W^X 制約のため WASM を
+/// Cranelift JIT ではなく **Pulley インタープリタ**で実行する（B-52）。waf_filter は
+/// CRS Level 2 の正規表現ルール群を評価する CPU 律速モジュールで、実機計測では
+/// モジュール初期化から `on_configure` 到達までだけで約 18 秒を要した（他プラットフォーム
+/// では数十 ms）。機能自体は正しく動作しており、ハングでもデッドロックでもないため、
+/// スキップせず制限時間の延長で計測対象に残す。header_filter のような軽量モジュールは
+/// OpenBSD でも HTTP/3 上で 0.17 秒で完走する。
 #[tokio::test]
-#[ntest::timeout(20000)]
+#[cfg_attr(not(target_os = "openbsd"), ntest::timeout(20000))]
+#[cfg_attr(target_os = "openbsd", ntest::timeout(180000))]
 #[cfg(all(feature = "http3", feature = "wasm"))]
 async fn test_http3_wasm_local_response() {
     if !is_e2e_environment_ready().await {
