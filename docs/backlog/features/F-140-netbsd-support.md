@@ -56,19 +56,31 @@ OpenBSD 対応（F-120 Phase 5 / F-122 / B-52 / F-136 / F-137）をテンプレ�
   （`create_engine` の `#[cfg(not(target_os = "openbsd"))]`/`#[cfg(target_os =
   "openbsd")]` 分岐はそのまま。NetBSD は `not(target_os = "openbsd")` 側＝Pooling を通る）。
 - `src/wasm/types.rs`: `interpreter = false` が NetBSD でも無視される旨の警告を追加。
-- aarch64 は wasmtime のシグナルベーストラップが BSD×aarch64 未対応（B-55）のため、
-  `full-netbsd-aarch64`/`full-netbsd-aarch64-vendor` は wasm 抜き。
-- **【2026-07-29 実機検証で追記】NetBSD は x86_64 も wasmtime 非対応と判明**（B-55 更新）。
-  NetBSD 10.1 amd64（QEMU 実機）で `cargo build --no-default-features --features
-  full-netbsd`（当時 wasm 込み）を実行すると `wasmtime-40.0.4/src/runtime/vm/sys/
-  unix/signals.rs` の `compile_error!("unsupported platform")` で失敗した。
-  `signals.rs` には NetBSD 向けの `ucontext` 分岐が x86_64/aarch64 とも存在しない
-  （FreeBSD/OpenBSD は x86_64 分岐だけは存在する点で NetBSD よりまだマシ）。Pulley
-  インタープリタへの切替でも回避不能（失敗は wasmtime 自身の build.rs によるホスト
-  target_arch 判定の時点で起きるため、`Config::target` の選択より前の話）。
-  対応として `full-netbsd`/`full-netbsd-vendor`（x86_64 向け）からも `wasm` を除外した
-  （`full-netbsd-aarch64`/`full-netbsd-aarch64-vendor` は元々除外済みだったため変更不要）。
-  詳細は `docs/backlog/bugs/B-55-wasmtime-no-bsd-aarch64.md` 参照。
+- aarch64 は wasmtime のシグナルベーストラップが BSD×aarch64 未対応（B-55、発見当時）
+  のため、当時は `full-netbsd-aarch64`/`full-netbsd-aarch64-vendor` を wasm 抜きとした。
+- **【2026-07-29 実機検証で追記、発見当時の状況】NetBSD は x86_64 も wasmtime 非対応と
+  判明**（B-55 更新）。NetBSD 10.1 amd64（QEMU 実機）で `cargo build
+  --no-default-features --features full-netbsd`（当時 wasm 込み）を実行すると
+  `wasmtime-40.0.4/src/runtime/vm/sys/unix/signals.rs` の
+  `compile_error!("unsupported platform")` で失敗した。`signals.rs` には NetBSD 向けの
+  `ucontext` 分岐が x86_64/aarch64 とも存在しない（FreeBSD/OpenBSD は x86_64 分岐だけは
+  存在する点で NetBSD よりまだマシ）。Pulley インタープリタへの切替でも回避不能
+  （失敗は wasmtime 自身の build.rs によるホスト target_arch 判定の時点で起きるため、
+  `Config::target` の選択より前の話）。当時の対応として `full-netbsd`/
+  `full-netbsd-vendor`（x86_64 向け）からも `wasm` を除外した（`full-netbsd-aarch64`/
+  `full-netbsd-aarch64-vendor` は元々除外済みだったため変更不要）。
+- **【`feat/bsd-wasm-integration` で解消、B-55 は対応済み】** 上記の「wasm 抜き」
+  措置は撤回された。crates.io の wasmtime 40.0.4 を `third_party/wasmtime` に
+  vendoring し、パッケージ名のみ `veil-wasmtime`（`[lib] name = "wasmtime"` は
+  据え置き）に変更した上で、`build.rs` に 1 箇所だけ `has_native_signals` を
+  対象ターゲット（NetBSD 全アーキ・FreeBSD aarch64・OpenBSD aarch64）で `false` に
+  強制する差分を加えている。これによりシグナルベーストラップ（`signals.rs`）自体が
+  コンパイルされなくなり、NetBSD は x86_64/aarch64 とも Pulley インタープリタ上で
+  `wasm` が有効に動作する。`full-netbsd` / `full-netbsd-vendor` /
+  `full-netbsd-aarch64` / `full-netbsd-aarch64-vendor` の 4 feature セットすべてに
+  `wasm` を復活済み。詳細・追従手順は
+  `docs/backlog/bugs/B-55-wasmtime-no-bsd-aarch64.md` と
+  `third_party/wasmtime/README.veil.md` を参照。
 
 ### セキュリティ（`src/security.rs`）
 
@@ -125,9 +137,13 @@ POSIX 共通実装のため NetBSD でもそのまま動作し、`crate::system:
 
 - NetBSD のセキュリティ機能は chroot(2) + 特権降格 + rlimit のみ。pledge/unveil
   相当のプロセス自身による syscall フィルタ・パスホワイトリストは提供できない。
-- QEMU での実ビルド・E2E は未実施（別チケット）。
+- QEMU での実ビルド・E2E は未実施（別チケット）。**【更新】** その後、NetBSD x86_64 は
+  実機ビルド・E2E とも実施済み、NetBSD aarch64 は QEMU 起動・SSH provision まで
+  成功済み（詳細は末尾「検証状況」参照）。ただし aarch64 の `build`/`e2e` 自体は
+  本チケット時点でまだ計測中。
 - NetBSD 上での実機動作は未検証（rustls=ring・quiche=boring の選択は OpenBSD の
-  実証結果に基づく保守的な類推であり、NetBSD 固有の検証はまだ無い）。
+  実証結果に基づく保守的な類推であり、NetBSD 固有の検証はまだ無い）。**【更新】**
+  x86_64 は実機で rustls=ring・quiche=boring とも動作確認済み（末尾「検証状況」参照）。
 
 ## tools/qemu 環境の構築（2026-07-29、コード配線のみ完了・実 VM 未検証）
 
@@ -137,7 +153,18 @@ POSIX 共通実装のため NetBSD でもそのまま動作し、`crate::system:
 provision・toolchain・build・e2e はコーディネーターが別途実施する**ため、以下は
 実装内容と設計上の想定であり、実機検証で変わりうる。
 
-### 実装したもの
+**【`feat/bsd-wasm-integration` で追記】** 以下の「実装したもの」〜「確認したコマンド」
+は 2026-07-29 時点の初期設計（aarch64 は install ISO + `sysinst` 自動操作）をそのまま
+歴史的記録として残している。その後の実機検証（Apple Silicon + QEMU/HVF）で
+`sysinst` の言語選択メニューから先へ進まないことが判明したため、この設計は
+**撤回・全面変更**した。`tools/qemu/netbsd-autoinstall.py` は削除済みで、現在は
+aarch64 も x86_64 と同じ「起動可能な生イメージ（`evbarm-aarch64/binary/gzimg/
+arm64.img.gz`）→ `base.qcow2` 化 → シリアルへ root ログインして鍵注入
+（`netbsd-provision.py`、両アーキ共通）」という一本化された経路を使う。現状の
+正確な内容は `tools/qemu/README.md`「NetBSD で踏んだ落とし穴」項目 8・9 と
+`tools/qemu/bsd-vm.sh` の `_image_url`/`cmd_provision` 実装を参照。
+
+### 実装したもの（2026-07-29 時点、以降 aarch64 部分は撤回済み）
 
 - `tools/qemu/bsd-vm.sh`: `netbsd` を `case "${OS_NAME}"` の分岐に追加
   （`freebsd|openbsd` → `freebsd|openbsd|netbsd`）。既存の FreeBSD/OpenBSD の
@@ -150,12 +177,16 @@ provision・toolchain・build・e2e はコーディネーターが別途実施�
     FreeBSD と同じ「base.qcow2 + 起動用オーバーレイ」構成にする（cloud-init 相当が
     無いため seed は作らない）。aarch64 は install ISO を DL し、OpenBSD の
     miniroot と同様に空のターゲット qcow2 を用意する。
-  - `cmd_provision`: x86_64 はシリアルへ root ログインして SSH 鍵注入
+  - `cmd_provision`（当時の設計）: x86_64 はシリアルへ root ログインして SSH 鍵注入
     （`netbsd-provision.py`、FreeBSD の `--mode login` と同じ発想）。aarch64 は
     `sysinst` を自動操作してインストール後（`netbsd-autoinstall.py`）、**ISO を
     外して再起動してから** `netbsd-provision.py` で鍵注入する 2 段構成
     （sysinst 完了直後は ISO が bootindex=0 のままなので reboot するとインストーラ
-    に戻ってしまうため）。
+    に戻ってしまうため）という想定だった。**【撤回】** 実機検証（Apple Silicon +
+    QEMU/HVF）で `sysinst` が言語選択メニューから進まなかったため、aarch64 も
+    x86_64 と同じ「起動可能な生イメージ（`gzimg/arm64.img.gz`）→ `netbsd-provision.py`
+    でシリアルログイン鍵注入」という単段構成に一本化した。`sysinst` 自動操作は
+    行わない。
   - `cmd_toolchain`: `pkgin install rust-bin cmake llvm protobuf gmake bash curl
     git nasm pkgconf`。**`rust` ではなく `rust-bin`** を明示指定
     （ソースビルドは QEMU 上で数時間かかる想定のため）。`pkgin` 自体が無い場合は
@@ -181,12 +212,16 @@ provision・toolchain・build・e2e はコーディネーターが別途実施�
   ログイン provision。ブートメニューでの `consdev com0` 切り替え試行 → 失敗しても
   続行 → ログインプロンプト待ち → SSH 鍵注入・`sshd=YES`・sshd 再起動、という
   ベストエフォート実装。**実機コンソールの文言では未検証**。
-- `tools/qemu/netbsd-autoinstall.py`（新規）: aarch64 の `sysinst` を
-  シリアルから自動操作する。OpenBSD の `autoinstall(8)` と異なり応答ファイル
-  方式が無いため、一般的な sysinst の操作順序（言語選択 → メインメニュー →
-  ディスク選択 → GPT 全体パーティション → CD-ROM からのセット取得 → 確認 →
-  インストール）をキー送出で推定実装。**メニュー文言・キー割り当てはリリースに
-  より変わりうるため実機での調整が前提**。
+- `tools/qemu/netbsd-autoinstall.py`（当時新規追加。**その後削除済み**）: aarch64 の
+  `sysinst` をシリアルから自動操作する想定だった。OpenBSD の `autoinstall(8)` と
+  異なり応答ファイル方式が無いため、一般的な sysinst の操作順序（言語選択 →
+  メインメニュー → ディスク選択 → GPT 全体パーティション → CD-ROM からのセット
+  取得 → 確認 → インストール）をキー送出で推定実装していた。**実機検証（Apple
+  Silicon + QEMU/HVF）の結果、言語選択メニューで停止し動作しなかったため、この
+  スクリプトは全面的に廃止・削除した。** aarch64 も NetBSD が配布している
+  起動可能な生イメージ（`evbarm-aarch64/binary/gzimg/arm64.img.gz`）を使い、
+  x86_64 と同じ `netbsd-provision.py` によるシリアルログイン鍵注入方式に一本化
+  している。
 - `packaging/bsd/netbsd/veil.rc`（新規）: NetBSD の rc.d サービススクリプト。
   NetBSD には FreeBSD の `daemon(8)` に相当するものが標準に無いため、
   `command_args` の末尾に `& echo $! > pidfile` を付けて自前でバックグラウンド化
@@ -199,7 +234,8 @@ provision・toolchain・build・e2e はコーディネーターが別途実施�
 - `packaging/README.md` / `tools/qemu/README.md`: NetBSD 対応の記述を追記
   （使い方・既知の不確実点・検証状況テーブル）。
 
-### x86_64 で想定される手順（実機未検証）
+### x86_64 で想定される手順（2026-07-29 時点の想定。以降、実機で検証済み — 下記
+「検証状況」参照）
 
 ```bash
 tools/qemu/bsd-vm.sh netbsd x86_64 setup       # live.img.gz DL + qcow2 化
@@ -211,28 +247,38 @@ tools/qemu/bsd-vm.sh netbsd x86_64 fetch
 ```
 
 **autoinstall スクリプトは不要と見込んでいる**（live image がそのまま起動可能な
-ため）。ただし live image のパーティションサイズ・root パスワードの扱い・
-ネットワーク自動設定の有無は未確認であり、これらが期待どおりでない場合は
-OpenBSD 同様の autoinstall 相当の仕組みが必要になる可能性がある。
+ため）。この想定は実機検証で正しかったことを確認済み
+（`tools/qemu/README.md`「NetBSD で踏んだ落とし穴」項目 1 参照）。
 
-### aarch64 で想定される手順（実機未検証）
+### aarch64 の手順（当初の想定は撤回・現行の手順に置き換え済み）
+
+**【`feat/bsd-wasm-integration` で更新】** 当初は install ISO から `sysinst` を
+シリアル自動操作する想定（`netbsd-autoinstall.py`）だったが、Apple Silicon +
+QEMU/HVF の実機検証で `sysinst` が言語選択メニューから進まず頓挫した。NetBSD が
+`evbarm-aarch64` 向けにも amd64 の live image に相当する**起動可能な生イメージ**
+（`gzimg/arm64.img.gz`）を配布していることを確認できたため、install ISO +
+`sysinst` 経路は廃止し、x86_64 と同じ「生イメージ → `netbsd-provision.py` による
+シリアルログイン鍵注入」に一本化した。`netbsd-autoinstall.py` は削除済み。
+
+現行の手順（`tools/qemu/bsd-vm.sh` の実装どおり）:
 
 ```bash
-tools/qemu/bsd-vm.sh netbsd aarch64 setup       # install ISO DL + 空ディスク作成
-tools/qemu/bsd-vm.sh netbsd aarch64 provision   # ISO 起動 → sysinst 自動操作 →
-                                                 # ISO 無しで再起動 → 鍵注入
+tools/qemu/bsd-vm.sh netbsd aarch64 setup       # arm64.img.gz DL + qcow2 化
+tools/qemu/bsd-vm.sh netbsd aarch64 provision   # 起動 → シリアルログイン → 鍵注入
+                                                 # （netbsd-provision.py、x86_64 と共通）
 tools/qemu/bsd-vm.sh netbsd aarch64 toolchain
-tools/qemu/bsd-vm.sh netbsd aarch64 build       # --features full-netbsd-aarch64（wasm 抜き）
+tools/qemu/bsd-vm.sh netbsd aarch64 build       # --features full-netbsd-aarch64
+                                                 # （B-55 解消済みのため wasm 込み）
 tools/qemu/bsd-vm.sh netbsd aarch64 e2e
 tools/qemu/bsd-vm.sh netbsd aarch64 fetch
 ```
 
-**`netbsd-autoinstall.py` が必要**（ISO 配布のみのため）。sysinst の実際の画面
-遷移・文言は未確認であり、`netbsd-autoinstall.py` の expect パターンは高確率で
-調整が必要になる。`tools/qemu/console-dump.py` で実際の出力を確認しながら
-イテレーションすることを推奨する。x86_64 と aarch64 で pkgsrc の Rust バージョン
-が異なる（`rust-bin-1.96.0` / `rust-bin-1.91.1`）ため、aarch64 側で veil の
-MSRV を満たすか toolchain 実行時に要確認。
+**現状（このチケットの範囲）**: 上記の boot image + `netbsd-provision.py` 経路で
+実機 QEMU（Apple Silicon、HVF アクセラレーション）の起動・SSH 鍵注入までは
+成功を確認済み。`build`/`e2e` の実行結果はまだコーディネーターが計測中であり、
+本チケットでは主張しない。x86_64 と aarch64 で pkgsrc の Rust バージョンが異なる
+（`rust-bin-1.96.0` / `rust-bin-1.91.1`）ため、aarch64 側で veil の MSRV を満たすか
+toolchain 実行時に要確認な点は変わらない。
 
 ### 確認したコマンド（本チケットの範囲、VM 未起動）
 
@@ -242,7 +288,9 @@ tools/qemu/bsd-vm.sh netbsd x86_64                    # 引数不足で usage �
 tools/qemu/bsd-vm.sh freebsd x86_64                   # 既存動作に変化なし
 bash -n packaging/scripts/build-bsd.sh                # 構文エラー無し
 python3 -m py_compile tools/qemu/netbsd-provision.py  # 構文エラー無し
-python3 -m py_compile tools/qemu/netbsd-autoinstall.py # 構文エラー無し
+python3 -m py_compile tools/qemu/netbsd-autoinstall.py # 構文エラー無し（このスクリプトは
+                                                        # 後日 sysinst 自動操作が実機で
+                                                        # 動作しないと判明し削除済み）
 curl -sIL <各 URL>                                     # すべて HTTP 200（302 経由）
 ```
 
@@ -254,9 +302,19 @@ shellcheck は本環境に未導入のため未実施（コーディネーター
 | 対象 | 状態 |
 |---|---|
 | NetBSD x86_64 | **実機ビルド成功**（`full-netbsd`、release 35分34秒、warning 0）。E2E 実施 |
-| NetBSD aarch64 | **未検証（今回のスコープ外）**。`tools/qemu/bsd-vm.sh netbsd aarch64` の配線と
+| NetBSD aarch64（2026-07-30 時点） | **未検証（今回のスコープ外）**。`tools/qemu/bsd-vm.sh netbsd aarch64` の配線と
   `netbsd-autoinstall.py` は用意済みだが、実 ISO に対する sysinst のキー送出は未調整。
   aarch64 は wasm 非対応（wasmtime）に加え検証時間が長いため、今回は見送った |
+
+**【`feat/bsd-wasm-integration` で更新】** 上記 2 点はいずれも解消済み。
+`netbsd-autoinstall.py`（install ISO + sysinst 自動操作）は Apple Silicon +
+QEMU/HVF での実機検証で言語選択メニューから進まないことが判明したため削除し、
+x86_64 と同じ起動可能な生イメージ + `netbsd-provision.py` 方式に置き換えた。
+この新方式で **NetBSD aarch64 の QEMU 起動（Apple Silicon、HVF アクセラレーション）
+と SSH 経由の鍵注入・provision には成功済み**。また B-55 の解消により
+`full-netbsd-aarch64`/`full-netbsd-aarch64-vendor` も wasm 込みでビルド対象になった。
+ただし **`build`/`e2e` の実行結果は本チケット時点ではまだ計測中であり、成功・失敗
+いずれも本チケットでは主張しない**（別途コーディネーターが実施）。
 
 ### x86_64 で必要だった前提パッケージ（実機で確定）
 

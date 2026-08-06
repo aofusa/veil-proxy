@@ -1043,7 +1043,11 @@ ln -sf "$LIBCXX" /usr/local/lib/libstdc++.so
 ls -l /usr/local/lib/libstdc++.so'
         log "pkg_add rust cmake gmake protobuf bash curl git + llvm（バージョン明示）"
         cmd_ssh 'set -e
-P="PKG_PATH=https://cdn.openbsd.org/pub/OpenBSD/$(uname -r)/packages/$(uname -m)/"
+# パッケージのディレクトリ名は **`uname -p`**（プロセッサ）であって `uname -m`
+# （マシン）ではない。arm64 では `uname -m`=arm64 に対しパッケージ置き場は
+# `packages/aarch64/` で、`uname -m` を使うと "no such dir" になる（実測）。
+# amd64 は両者とも amd64 なので x86_64 側の挙動は変わらない。
+P="PKG_PATH=https://cdn.openbsd.org/pub/OpenBSD/$(uname -r)/packages/$(uname -p)/"
 env $P pkg_add -I rust cmake gmake protobuf bash curl git >/tmp/pkg.log 2>&1 || { tail -20 /tmp/pkg.log; exit 1; }
 if ! find /usr/local -name "libclang*so*" 2>/dev/null | grep -q .; then
   LLVM=$(env $P pkg_info -Q llvm 2>/dev/null | grep -E "^llvm-[0-9]" | sort -V | tail -1)
@@ -1124,6 +1128,16 @@ _guest_env_prefix() {
         # 非対話 ssh セッションには既定で /usr/pkg/{bin,sbin} が PATH に無い。
         pre='LIBCLANG_PATH=$(find /usr/pkg -name "libclang.so*" 2>/dev/null | head -1 | xargs dirname)'
         pre="${pre} PATH=/usr/pkg/bin:/usr/pkg/sbin:/usr/sbin:/sbin:\$PATH"
+        if [[ "${ARCH}" == "aarch64" ]]; then
+            # B-59: quiche が内蔵する BoringSSL には aarch64 の CPU 機能検出
+            # （`OPENSSL_cpuid_setup`）の実装が linux/apple/win/freebsd/openbsd 用しか無く、
+            # NetBSD/aarch64 では `undefined reference to 'OPENSSL_cpuid_setup'` で
+            # **リンクに失敗する**（実測）。`OPENSSL_STATIC_ARMCAP` を定義すると
+            # 実行時検出そのものを行わなくなり（= cpuid_setup を呼ばない）リンクが通る。
+            # NEON は ARMv8 で必須なので `_NEON` を静的に有効化しておく
+            # （AES/PMULL/SHA 拡張は使わない分だけ暗号処理は遅くなる）。
+            pre="${pre} CFLAGS_aarch64_unknown_netbsd='-DOPENSSL_STATIC_ARMCAP -DOPENSSL_STATIC_ARMCAP_NEON'"
+        fi
     fi
     echo "${pre}"
 }
