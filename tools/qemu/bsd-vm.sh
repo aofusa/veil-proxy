@@ -1120,6 +1120,14 @@ _guest_env_prefix() {
         # （C ビルドが通っても bindgen が同じ thread.h:81 で落ちる）。
         pre="${pre} BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_openbsd='-include pthread.h'"
         pre="${pre} BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_openbsd='-include pthread.h'"
+        # B-59: aarch64 では quiche 内蔵 BoringSSL の `OPENSSL_cpuid_setup`
+        # （aarch64 の CPU 機能検出）が OS 別実装ファイルに分かれており、OpenBSD/NetBSD の
+        # aarch64 向けがビルド対象に入らないため `undefined symbol: OPENSSL_cpuid_setup`
+        # でリンクに失敗する（実測: OpenBSD 7.9 arm64 / NetBSD 10.1 evbarm-aarch64）。
+        # `OPENSSL_STATIC_ARMCAP` を定義すると実行時検出自体を行わなくなり解消する
+        # （NEON は ARMv8 必須なので静的に有効化。AES/PMULL/SHA 拡張は使わない）。
+        # `-D` はアセンブリに渡っても無害なので CFLAGS_<target> で与えてよい。
+        pre="${pre} CFLAGS_aarch64_unknown_openbsd='-DOPENSSL_STATIC_ARMCAP -DOPENSSL_STATIC_ARMCAP_NEON'"
         # 上記 libstdc++ 互換リンクを見つけさせる
         pre="${pre} RUSTFLAGS='-L /usr/local/lib'"
         # autoinstall の auto layout では /usr/obj が 24G ディスクでも ~8G しかなく、

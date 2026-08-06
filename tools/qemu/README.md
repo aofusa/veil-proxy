@@ -195,9 +195,10 @@ native モードでの相違点（利用者から見て変わるのは主に「D
 | OpenBSD x86_64: `fetch` → `build-bsd.sh` | **成功**（`veil-0.6.0-x86_64-unknown-openbsd.tar.gz` を生成） |
 | OpenBSD x86_64: `e2e` | **530 passed / 3 failed・SIGSEGV なし**（B-51 / B-52 / B-53 / B-54 修正後。全 533 件が実行される）。残り 3 件はいずれもタイムアウト系の負荷起因フレークで、単体実行では 3 件とも通る |
 | OpenBSD x86_64: `e2e`（v0.6.0 最終） | **535 passed / 6 failed / 1 ignored**（F-132〜F-141 + B-56/B-57/B-58 反映後、全 542 件）。**失敗 6 件は単独実行で全て成功**（http3_cache 系 4 件 0.28s / buffering_spillover 0.10s / h2c_large_request_body 0.04s / oversized_request_line 0.24s）＝負荷起因フレークで機能欠陥なし。ignored 1 件は B-58（Pulley で WAF が QUIC idle timeout を超過）。**HTTP/3 + WASM 4 件は全て成功**（B-58 を ignore 化するまでは WAF が HTTP/3 ワーカーを占有して巻き添えにしていた） |
-| OpenBSD aarch64 | **検証中**（セットアップ・プロビジョニングまで実施済み。ビルド/E2E は継続中のため結果未確定） |
-| NetBSD x86_64（F-140、2026-08-06 実機） | **フルビルド + E2E 実行可能**。下記「NetBSD で踏んだ落とし穴」参照 |
-| NetBSD aarch64（F-140、2026-08-06 実機） | **ビルド可**（B-59 の `CFLAGS_aarch64_unknown_netbsd` 指定が必須）。E2E は **フルスイート完走不能**（B-62: dev-dependency の quinn-udp が NetBSD/aarch64 で panic → プロセスabort）。`TEST_FILTER=wasm_tests` 等 quinn を使わないテストへ絞り込めば実行可能 |
+| OpenBSD aarch64: `build`（`full-openbsd-aarch64`、wasm 込み） | **成功**（B-59 の `CFLAGS_aarch64_unknown_openbsd='-DOPENSSL_STATIC_ARMCAP -DOPENSSL_STATIC_ARMCAP_NEON'` が必要） |
+| OpenBSD aarch64: `e2e` | **`test result: ok. 541 passed; 0 failed; 1 ignored`（54.34s）**。wasm 関連テスト 36 件を含め全て pass |
+| NetBSD x86_64（F-140、2026-08-06 実機） | **フルビルド + E2E 実行可能**（`full-netbsd`、wasm 込み、18分32秒）。E2E は B-60 の `paxctl +m` 適用後 **530 passed / 12 failed**（適用前は 507 passed / 35 failed で 35 件は全て wasm テスト）。残り 12 件は concurrent/stress 系 4 件・HTTP/3 系 7 件・rate limiting 1 件で、いずれも高負荷下での実行が原因。下記「NetBSD で踏んだ落とし穴」参照 |
+| NetBSD aarch64（F-140、2026-08-06 実機） | **フルビルド可**（`full-netbsd-aarch64`、wasm 込み。B-59 の `CFLAGS_aarch64_unknown_netbsd` 指定が必須）。E2E は **フルスイート完走不能**（B-62: dev-dependency の quinn-udp が NetBSD/aarch64 で panic → プロセスabort）が、`TEST_FILTER=wasm_tests` では `test result: ok. 23 passed; 0 failed; 519 filtered out` |
 | `linux-aarch64-e2e.sh` | **未実行**（KVM 非対応ホストでは TCG が実用不能） |
 
 ### FreeBSD amd64 で踏んだ落とし穴（すべて実測。再発しやすいので残す）

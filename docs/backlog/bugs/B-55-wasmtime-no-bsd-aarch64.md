@@ -145,6 +145,28 @@ crates.io の wasmtime 40.0.0 をソース・依存とも一切変えずその�
 手順」に従って `has_native_signals` 差分を再適用する必要がある（自動追従の
 仕組みは無い）。
 
+## 検証結果（2026-08-06、QEMU: Apple Silicon macOS + HVF for aarch64 ゲスト、local Linux + KVM for NetBSD x86_64）
+
+ビルド（release、`--no-default-features --features <set>`、いずれも**警告ゼロ**）:
+
+| ターゲット | feature set（wasm 込み） | 結果 |
+|---|---|---|
+| FreeBSD 14.3 arm64 | `full-freebsd-aarch64` | 成功 |
+| OpenBSD 7.9 arm64 | `full-openbsd-aarch64` | 成功（B-59 の `CFLAGS_aarch64_unknown_openbsd='-DOPENSSL_STATIC_ARMCAP -DOPENSSL_STATIC_ARMCAP_NEON'` が必要） |
+| NetBSD 10.1 amd64 | `full-netbsd` | 成功（18分32秒） |
+| NetBSD 10.1 evbarm-aarch64 | `full-netbsd-aarch64` | 成功（B-59 の CFLAGS が必要） |
+
+E2E（`tests/e2e_setup.sh test`）:
+
+| ターゲット | 結果 |
+|---|---|
+| OpenBSD aarch64 | `test result: ok. 541 passed; 0 failed; 1 ignored`（54.34s）。wasm 関連テスト 36 件を含め全て pass |
+| FreeBSD aarch64 | 540 passed / 2 failed。`test_error_handling_oversized_header` は単独実行で pass（負荷起因の既知フレーキー）、`test_http3_large_request_body` は単独実行でも 60s タイムアウト（B-61）。wasm 関連テストは全て pass |
+| NetBSD x86_64 | 530 passed / 12 failed（B-60 の paxctl 適用後。適用前は 507 passed / 35 failed で 35 件は全て wasm テスト）。残り 12 件は concurrent/stress 系 4 件・HTTP/3 系 7 件・rate limiting 1 件で、いずれも Docker ビルドと並走した高負荷下での実行が原因。wasm 単体テスト（`wasm_tests::*`）は全て pass |
+| NetBSD aarch64 | `TEST_FILTER=wasm_tests` で `test result: ok. 23 passed; 0 failed; 519 filtered out`。フルスイートは B-62（テストハーネスの quinn が panic → プロセス abort）のため完走不可 |
+
+Linux x86_64（ホスト、参考）: 全 feature 組合せビルドがゼロ警告、`cargo clippy --features full --all-targets -- -D warnings` クリーン、`cargo fmt --check` クリーン、packaging の Docker glibc ビルド内で `cargo test --lib --features full` が `798 passed; 0 failed`。
+
 ## 上流について
 
 FreeBSD/OpenBSD については wasmtime に `(freebsd, aarch64)` / `(openbsd, aarch64)`

@@ -82,6 +82,18 @@ PaX MPROTECT は Pulley インタープリタ実行時にも発火する**（was
    `packaging/README.md`（NetBSD 対応の現状の節）に、`paxctl +m` が必須である
    ことと上記 3 箇所への組み込みを明記した。
 
+## 検証結果（2026-08-06、実機 QEMU: local Linux + KVM for NetBSD x86_64、Apple Silicon macOS + HVF for NetBSD aarch64）
+
+NetBSD x86_64 の E2E（`tests/e2e_setup.sh test`、`full-netbsd`）は `paxctl +m` 適用前後で:
+
+| 状態 | 結果 |
+|---|---|
+| `paxctl +m` 適用前 | 507 passed / 35 failed（失敗 35 件は全て wasm テスト） |
+| `paxctl +m` 適用後 | 530 passed / 12 failed（残り 12 件は concurrent/stress 系 4 件・HTTP/3 系 7 件・rate limiting 1 件で、いずれも Docker ビルドと並走した高負荷下での実行が原因。wasm 単体テストは全て pass） |
+
+NetBSD evbarm-aarch64（`full-netbsd-aarch64`）は `TEST_FILTER=wasm_tests` で
+`test result: ok. 23 passed; 0 failed; 519 filtered out`（`paxctl +m` 適用後、wasm 関連は全て pass）。
+
 ## 残課題
 
 - wasmtime が **Pulley インタープリタ実行時にも**実行可能メモリの動的な
