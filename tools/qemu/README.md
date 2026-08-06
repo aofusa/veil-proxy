@@ -188,16 +188,16 @@ native モードでの相違点（利用者から見て変わるのは主に「D
 | FreeBSD x86_64: `fetch` → `build-bsd.sh` | **成功**（`veil-0.6.0-x86_64-unknown-freebsd.tar.gz` を生成） |
 | FreeBSD x86_64: `e2e` | **532 passed / 1 failed**（B-50 修正後。HTTP/3 の 117 件失敗はすべて解消）。残り 1 件は実行ごとに変わる負荷起因フレーク（`oversized-header` 等）で、静かなホストでの単体実行では通る |
 | （E2E 全般） | `tests/e2e_setup.sh` の `run_tests` が cargo の終了コードを握り潰していた（最後の `log_info` の戻り値が返っていた）。上記 2 件はどちらも «成功» と報告されていた。修正済み |
-| FreeBSD aarch64 | **未実行**（スクリプトは同経路で対応済み。TCG のため長時間） |
+| FreeBSD aarch64: `build`（`full-freebsd-aarch64`）→ `e2e`（2026-08-06 実機） | **フルビルド + E2E 実行可能**。540 passed / 2 failed（542 件）。残り 2 件のうち `test_error_handling_oversized_header` は単独実行で pass（既知フレーキー）、`test_http3_large_request_body` は単独実行でも 60 秒タイムアウトで fail（B-61、未解決） |
 | OpenBSD x86_64: `setup` → `provision`（autoinstall） | **成功**（`CONGRATULATIONS` → SSH 鍵認証で `OpenBSD 7.9 GENERIC.MP#449 amd64` へ到達） |
 | OpenBSD x86_64: `toolchain` | **成功**（cargo 1.94.1 / cmake 4.2.3 / GNU Make 4.4.1 / libprotoc 34.1 / llvm-19） |
 | OpenBSD x86_64: `build`（`full-openbsd`） | **成功**（71分56秒。ring + システムアロケータ + quiche/BoringSSL の http3 を含む） |
 | OpenBSD x86_64: `fetch` → `build-bsd.sh` | **成功**（`veil-0.6.0-x86_64-unknown-openbsd.tar.gz` を生成） |
 | OpenBSD x86_64: `e2e` | **530 passed / 3 failed・SIGSEGV なし**（B-51 / B-52 / B-53 / B-54 修正後。全 533 件が実行される）。残り 3 件はいずれもタイムアウト系の負荷起因フレークで、単体実行では 3 件とも通る |
 | OpenBSD x86_64: `e2e`（v0.6.0 最終） | **535 passed / 6 failed / 1 ignored**（F-132〜F-141 + B-56/B-57/B-58 反映後、全 542 件）。**失敗 6 件は単独実行で全て成功**（http3_cache 系 4 件 0.28s / buffering_spillover 0.10s / h2c_large_request_body 0.04s / oversized_request_line 0.24s）＝負荷起因フレークで機能欠陥なし。ignored 1 件は B-58（Pulley で WAF が QUIC idle timeout を超過）。**HTTP/3 + WASM 4 件は全て成功**（B-58 を ignore 化するまでは WAF が HTTP/3 ワーカーを占有して巻き添えにしていた） |
-| OpenBSD aarch64 | **未実行**（スクリプトは同経路で対応済み。TCG のため長時間） |
-| NetBSD x86_64（F-140） | **setup / provision / toolchain / build まで実機で成功**（`NetBSD 10.1 amd64`、release ビルド 35分34秒・warning 0）。e2e は実施中。下記「NetBSD で踏んだ落とし穴」参照 |
-| NetBSD aarch64（F-140） | **未検証**（今回のスコープ外。x86_64 と同じ「起動可能な生イメージ + シリアルログイン provision」経路に統一済み。x86_64 は実機で build 成功済み） |
+| OpenBSD aarch64 | **検証中**（セットアップ・プロビジョニングまで実施済み。ビルド/E2E は継続中のため結果未確定） |
+| NetBSD x86_64（F-140、2026-08-06 実機） | **フルビルド + E2E 実行可能**。下記「NetBSD で踏んだ落とし穴」参照 |
+| NetBSD aarch64（F-140、2026-08-06 実機） | **ビルド可**（B-59 の `CFLAGS_aarch64_unknown_netbsd` 指定が必須）。E2E は **フルスイート完走不能**（B-62: dev-dependency の quinn-udp が NetBSD/aarch64 で panic → プロセスabort）。`TEST_FILTER=wasm_tests` 等 quinn を使わないテストへ絞り込めば実行可能 |
 | `linux-aarch64-e2e.sh` | **未実行**（KVM 非対応ホストでは TCG が実用不能） |
 
 ### FreeBSD amd64 で踏んだ落とし穴（すべて実測。再発しやすいので残す）
