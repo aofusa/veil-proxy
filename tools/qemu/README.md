@@ -156,6 +156,7 @@ tools/qemu/bsd-vm.sh freebsd x86_64 all
 | OpenBSD x86_64: `build`（`full-openbsd`） | **成功**（71分56秒。ring + システムアロケータ + quiche/BoringSSL の http3 を含む） |
 | OpenBSD x86_64: `fetch` → `build-bsd.sh` | **成功**（`veil-0.6.0-x86_64-unknown-openbsd.tar.gz` を生成） |
 | OpenBSD x86_64: `e2e` | **530 passed / 3 failed・SIGSEGV なし**（B-51 / B-52 / B-53 / B-54 修正後。全 533 件が実行される）。残り 3 件はいずれもタイムアウト系の負荷起因フレークで、単体実行では 3 件とも通る |
+| OpenBSD x86_64: `e2e`（v0.6.0 最終） | **535 passed / 6 failed / 1 ignored**（F-132〜F-141 + B-56/B-57/B-58 反映後、全 542 件）。**失敗 6 件は単独実行で全て成功**（http3_cache 系 4 件 0.28s / buffering_spillover 0.10s / h2c_large_request_body 0.04s / oversized_request_line 0.24s）＝負荷起因フレークで機能欠陥なし。ignored 1 件は B-58（Pulley で WAF が QUIC idle timeout を超過）。**HTTP/3 + WASM 4 件は全て成功**（B-58 を ignore 化するまでは WAF が HTTP/3 ワーカーを占有して巻き添えにしていた） |
 | OpenBSD aarch64 | **未実行**（スクリプトは同経路で対応済み。TCG のため長時間） |
 | NetBSD x86_64（F-140） | **setup / provision / toolchain / build まで実機で成功**（`NetBSD 10.1 amd64`、release ビルド 35分34秒・warning 0）。e2e は実施中。下記「NetBSD で踏んだ落とし穴」参照 |
 | NetBSD aarch64（F-140） | **未検証**（今回のスコープ外。ISO からの sysinst 自動操作は実機未確認で、`netbsd-autoinstall.py` のキー送出は実 ISO に対して調整が要る見込み。x86_64 は実機で build 成功済み） |
