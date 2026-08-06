@@ -14,3 +14,8 @@
 # ワークスペース解決に失敗する。
 !fuzz/Cargo.toml
 !fuzz/fuzz_targets
+
+# third_party/wasmtime はルート Cargo.toml が参照するパス依存クレート（B-55、NetBSD 全アーキ・
+# FreeBSD/OpenBSD aarch64 向け）。対象外プラットフォームのビルドでは本体をコンパイルしないが、
+# マニフェストと宣言ターゲットが無いと cargo がワークスペース解決に失敗するため丸ごと許可する。
+!third_party/

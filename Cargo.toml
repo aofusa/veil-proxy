@@ -1,5 +1,21 @@
 [workspace]
 members = [".", "fuzz"]
+# third_party/wasmtime は crates.io wasmtime 40.0.4 の vendoring（B-55、path 依存）で
+# あり、独立した crate ではあるがワークスペースメンバーではないため除外する
+# （メンバーに含めると `cargo test`/`cargo clippy --workspace` 等が第三者コードである
+# vendoring 先まで対象にしてしまう。詳細は third_party/wasmtime/README.veil.md）。
+#
+# 【既知の制約】cargo には「members に含まれるディレクトリ配下の path はこの
+# exclude が効かない」バグがある（rust-lang/cargo#6745）。本プロジェクトは
+# `members = ["."]` でルート自身がメンバーのため、配下の third_party/wasmtime は
+# この exclude の対象外になり、`cargo metadata` 上は暗黙メンバーとして扱われ続ける。
+# それでも意図の明示として残す（バグ修正後に効くようになる／将来 cargo が
+# workspace root 自体を path 依存除外の起点として扱うようになった場合に備える）。
+# 実害（third-party コードが cargo fmt/clippy --all-targets の対象になること）は
+# `third_party/wasmtime/Cargo.toml` 側で `[[test]]` を削除し（未取り込みの tests/ を
+# 参照していたため）、CI/検証コマンドは `-p veil` 相当（デフォルトカレントパッケージ）
+# で third_party 配下まで踏み込まないことで実質的に回避する。
+exclude = ["third_party/wasmtime"]
 # resolver v2: dev-dependencies の feature を通常ビルド（`cargo build`）へ統合しない。
 # これにより OpenBSD 本体ビルドがテスト用 dev-deps（hyper-rustls/quinn/tokio-rustls/rcgen
 # の aws_lc_rs）に引きずられて aws-lc-sys を要求することを防ぎ、ring のみでビルドできる
@@ -73,7 +89,11 @@ aio = []
 # WASM Extension サポート (Proxy-Wasm v0.2.1)
 # Wasmtime ランタイムによる WebAssembly フィルタ
 # AOT コンパイル、Pooling Allocator、InstancePre 使用
-wasm = ["dep:wasmtime"]
+# B-55: netbsd 全アーキ・freebsd/openbsd の aarch64 は crates.io wasmtime のビルドが
+# 通らないため third_party/wasmtime（veil-wasmtime、Pulley 専用）に切り替える。
+# 依存はターゲット別に排他なので、ビルドごとに実際に有効になるのはどちらか一方のみ
+# （[target.*.dependencies] 参照）。
+wasm = ["dep:wasmtime", "dep:veil-wasmtime"]
 
 # gRPC サポート (HTTP/2 ベース)
 # gRPC ワイヤプロトコル（framing, headers, trailers）を実装
@@ -232,16 +252,18 @@ full-openbsd = [
 
 # BSD の **aarch64** 向け feature セット（B-55）。
 #
-# `full-freebsd` / `full-openbsd` から **`wasm` だけを外した**もの。
-# wasmtime 40 のシグナルベーストラップ実装
+# `full-freebsd` / `full-openbsd` と同じ機能セット（`wasm` 込み）。
+# crates.io wasmtime 40 のシグナルベーストラップ実装
 # （`src/runtime/vm/sys/unix/signals.rs`）には `(freebsd, aarch64)` /
-# `(openbsd, aarch64)` の分岐が無く `compile_error!("unsupported platform")` になる。
-# 有効/無効は wasmtime の build.rs が **ホストの target_arch から導出**するため
-# （`has_native_signals`）、cargo feature で外すこともできない。
-# したがって BSD aarch64 では wasm を含められない。x86_64 は従来どおり wasm 込み。
+# `(openbsd, aarch64)` の分岐が無く `compile_error!("unsupported platform")` になるが、
+# `has_native_signals` は wasmtime 自身の build.rs が導出するため cargo feature では
+# 切り替えられない。そのため crates.io 版の代わりに `third_party/wasmtime`
+# （`veil-wasmtime`、B-55 解消）を使い、Pulley インタープリタ専用で実行することで
+# wasm を復活させた（`[target.*.dependencies]` でターゲット別に排他選択、
+# `src/wasm/registry.rs` が Pulley を強制。詳細は third_party/wasmtime/README.veil.md）。
 full-freebsd-aarch64 = [
     "ktls", "http2", "http3",
-    "grpc-full",
+    "grpc-full", "wasm",
     "opentelemetry",
     "compression", "cache", "metrics",
     "websocket", "rate-limit", "buffering",
@@ -254,7 +276,7 @@ full-freebsd-aarch64 = [
 
 full-openbsd-aarch64 = [
     "ktls", "http2", "http3",
-    "grpc-full",
+    "grpc-full", "wasm",
     "opentelemetry",
     "compression", "cache", "metrics",
     "websocket", "rate-limit", "buffering",
@@ -271,16 +293,13 @@ full-openbsd-aarch64 = [
 # （rustls=ring、quiche=boringssl-boring-crate）。
 # システムアロケータ（mimalloc/jemalloc とも無効化）を使う点も OpenBSD と同じ。
 #
-# **wasm は含めない（B-55 更新）**。実機検証（NetBSD 10.1 amd64 / QEMU）で判明した
-# とおり、wasmtime 40 は NetBSD を **x86_64 を含む全アーキテクチャで**サポートしない
-# （`signals.rs` に NetBSD 向け ucontext 分岐が一切無く、x86_64 でも
-# `compile_error!("unsupported platform")` になる。詳細は B-55 参照）。
-# OpenBSD/FreeBSD の x86_64 は実機動作実績があるため wasm を維持しており、
-# NetBSD だけが全アーキ非対応という OpenBSD/FreeBSD（aarch64 のみ非対応）とは
-# 異なる扱いになる。
+# **wasm を含む（B-55 解消）**。NetBSD は全アーキテクチャで crates.io wasmtime 40 の
+# ビルドが通らない（`signals.rs` に NetBSD 向け ucontext 分岐が一切無く、x86_64 でも
+# `compile_error!("unsupported platform")` になる）が、FreeBSD/OpenBSD aarch64 と同様に
+# `third_party/wasmtime`（`veil-wasmtime`）＋ Pulley インタープリタ実行で解消した。
 full-netbsd = [
     "ktls", "http2", "http3",
-    "grpc-full",
+    "grpc-full", "wasm",
     "opentelemetry",
     "compression", "cache", "metrics",
     "websocket", "rate-limit", "buffering",
@@ -291,12 +310,11 @@ full-netbsd = [
 ]
 
 # NetBSD の **aarch64** 向け feature セット（B-55）。`full-netbsd`（x86_64、こちらも
-# wasm 抜き）と同一内容。NetBSD は x86_64 も含め全アーキテクチャで wasmtime 非対応の
-# ため、他 BSD（`full-freebsd-aarch64`/`full-openbsd-aarch64` は aarch64 のみ非対応）
-# と違い x86_64/aarch64 の区別自体が無くなっている（feature 名は互換性のため維持）。
+# wasm 込み）と同一内容。NetBSD は x86_64/aarch64 の区別なく同じ扱いになる
+# （feature 名は互換性のため維持）。
 full-netbsd-aarch64 = [
     "ktls", "http2", "http3",
-    "grpc-full",
+    "grpc-full", "wasm",
     "opentelemetry",
     "compression", "cache", "metrics",
     "websocket", "rate-limit", "buffering",
@@ -362,13 +380,8 @@ clap = { version = "4.5.53", features = ["derive"] }
 
 # HTTP/3 用 QUIC 実装（Cloudflare quiche）は末尾の target.*.dependencies で定義
 
-# Wasmtime: WebAssembly ランタイム (Proxy-Wasm v0.2.1)
-# - pooling-allocator: 高速インスタンス化
-# - cranelift: AOT コンパイル
-# - component-model: WASI対応
-# - pulley: ポータブルバイトコードインタープリタ（`Config::target("pulleyNN")`）。
-#   `[wasm] interpreter = true`（F-135）や OpenBSD（B-52、常時強制）で使用する。
-wasmtime = { version = "40.0.0", optional = true, features = ["pooling-allocator", "cranelift", "pulley"] }
+# Wasmtime: WebAssembly ランタイム (Proxy-Wasm v0.2.1) は B-55 でターゲット別依存に
+# 分割したため、末尾の [target.*.dependencies]（`wasmtime` / `veil-wasmtime`）で定義する。
 
 # Protobuf: gRPC メッセージのシリアライズ/デシリアライズ
 # prost は gRPC feature 有効時のみ使用
@@ -454,11 +467,38 @@ boring = "4.3"
 # 実行する。ネイティブ JIT コードの実行が OpenBSD で機能しないため（B-52）。NetBSD は
 # MAP_STACK 強制は無いが、ネイティブ JIT 自体の実機検証ができていないため OpenBSD と
 # 同じ保守的な Pulley 選択にする（F-140、`src/wasm/registry.rs` 参照）。
-# `pulley` feature は base の [dependencies] wasmtime にも入っている（F-135:
-# `[wasm] interpreter = true` で他ターゲットでも Pulley を選択可能にするため）。
-# この target 別指定はバージョン/他 feature を OpenBSD/NetBSD 専用に固定するために
-# 残す（cargo は同一依存の feature を union するので重複指定しても無害）。
+# wasmtime 依存自体は B-55 でターゲット別（本セクションの cfg と一部重なる）に
+# 分離したため、ここには重複させない。以前はここに OpenBSD/NetBSD 専用の
+# `wasmtime = {...}` 重複指定があったが（cargo が feature を union する前提の保険）、
+# この cfg（openbsd/netbsd）は下の `<BSD_NOSIG>` cfg（netbsd 全体・openbsd aarch64）と
+# 重なりがあり、同一依存グラフに lib 名 "wasmtime" を持つクレートを 2 つ
+# （crates.io 版と path 版）混在させかねないため削除した。
+# wasmtime/veil-wasmtime の実体は下の
+# `[target.'cfg(not(<BSD_NOSIG>))'.dependencies]` /
+# `[target.'cfg(<BSD_NOSIG>)'.dependencies]`（B-55）を参照。
+
+# ====================
+# Wasmtime: WebAssembly ランタイム (Proxy-Wasm v0.2.1) のターゲット別選択（B-55）
+# ====================
+# <BSD_NOSIG> = netbsd 全アーキ ∪ (openbsd, aarch64) ∪ (freebsd, aarch64)。
+# これらのターゲットは crates.io wasmtime 40 の signals.rs に ucontext 分岐が無く
+# `compile_error!("unsupported platform")` になるため third_party/wasmtime
+# （`veil-wasmtime`、Pulley 専用、詳細は third_party/wasmtime/README.veil.md）に切り替える。
+# 依存キーを分けているのは、同一キー `wasmtime` に対し crates.io と path の 2 つの
+# source を target 別に与えると cargo が
+# 「Dependency 'wasmtime' has different source paths depending on the build target」
+# で解決を拒否するため（`[lib] name = "wasmtime"` は両方とも変えていないので、
+# Rust コード側の `use wasmtime::...` はどちらの経路でも無変更で動く）。
+#
+# - pooling-allocator: 高速インスタンス化
+# - cranelift: AOT コンパイル（<BSD_NOSIG> 側は Pulley 強制のため実質未使用）
+# - pulley: ポータブルバイトコードインタープリタ（`Config::target("pulleyNN")`）。
+#   `[wasm] interpreter = true`（F-135）・OpenBSD（B-52）・<BSD_NOSIG>（B-55）で常時使用。
+[target.'cfg(not(any(target_os = "netbsd", all(target_os = "openbsd", target_arch = "aarch64"), all(target_os = "freebsd", target_arch = "aarch64"))))'.dependencies]
 wasmtime = { version = "40.0.0", optional = true, features = ["pooling-allocator", "cranelift", "pulley"] }
+
+[target.'cfg(any(target_os = "netbsd", all(target_os = "openbsd", target_arch = "aarch64"), all(target_os = "freebsd", target_arch = "aarch64")))'.dependencies]
+veil-wasmtime = { path = "third_party/wasmtime", optional = true, features = ["pooling-allocator", "cranelift", "pulley"] }
 
 # ====================
 # Windows 専用依存（F-125/v0.6.0、WSAPoll reactor・Winsock ソケット層・Job Object）

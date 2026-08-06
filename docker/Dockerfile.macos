@@ -60,6 +60,9 @@ COPY Cargo.toml Cargo.lock /app/
 COPY .cargo/config.toml /app/.cargo/config.toml
 COPY build.rs /app/build.rs
 COPY fuzz/Cargo.toml /app/fuzz/Cargo.toml
+# third_party/wasmtime はルート Cargo.toml が参照するパス依存クレート（B-55）。
+# 本ターゲットではビルドされなくても、マニフェストが無いと cargo のワークスペース解決自体が失敗する
+COPY third_party /app/third_party
 
 # 空の main.rs / lib.rs を作り、依存関係「だけ」を先にコンパイルしてキャッシュ化する
 RUN mkdir src benches \

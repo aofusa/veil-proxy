@@ -47,8 +47,13 @@ impl ModuleRegistry {
         // NetBSD は OpenBSD と異なり MAP_STACK 強制が無いため OnDemand アロケータや
         // openbsd_stack（下記）は使わないが、wasmtime のネイティブ JIT 実行コード自体は
         // 未検証のため、OpenBSD と同様に安全側で Pulley インタープリタへ倒す（F-140）。
-        let pulley =
-            cfg!(target_os = "openbsd") || cfg!(target_os = "netbsd") || config.interpreter;
+        // `veil_wasm_nosignals`（B-55: netbsd 全アーキ・freebsd/openbsd の aarch64。
+        // build.rs 発行）のターゲットは third_party/wasmtime（veil-wasmtime）を使い、
+        // ネイティブコードを生成しない Pulley 実行のみを前提にしているため常に Pulley。
+        let pulley = cfg!(target_os = "openbsd")
+            || cfg!(target_os = "netbsd")
+            || cfg!(veil_wasm_nosignals)
+            || config.interpreter;
 
         let mut registry = Self {
             engine,
@@ -119,10 +124,14 @@ impl ModuleRegistry {
         // 依存しない。ネイティブ JIT より遅いが、W^X 制約下や OpenBSD で WASM を
         // 使えるようにする。
         //
-        // OpenBSD/NetBSD は設定値を無視して常に Pulley（B-52/F-140）。他ターゲットは
-        // `[wasm] interpreter = true` のときだけ Pulley を選択する。
-        let use_pulley =
-            cfg!(target_os = "openbsd") || cfg!(target_os = "netbsd") || wasm_config.interpreter;
+        // OpenBSD/NetBSD、および `veil_wasm_nosignals`（B-55: netbsd 全アーキ・
+        // freebsd/openbsd の aarch64。third_party/wasmtime = veil-wasmtime を使う
+        // ターゲット）は設定値を無視して常に Pulley（B-52/F-140/B-55）。
+        // 他ターゲットは `[wasm] interpreter = true` のときだけ Pulley を選択する。
+        let use_pulley = cfg!(target_os = "openbsd")
+            || cfg!(target_os = "netbsd")
+            || cfg!(veil_wasm_nosignals)
+            || wasm_config.interpreter;
         if use_pulley {
             // ポインタ幅に合わせて pulley64 / pulley32 を選ぶ。
             config.target(if cfg!(target_pointer_width = "64") {

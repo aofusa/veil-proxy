@@ -14,11 +14,13 @@
 
 fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_OS");
+    println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_EPOLL");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_KTLS");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_AIO");
 
     emit_runtime_backend_cfg();
+    emit_wasm_nosignals_cfg();
 }
 
 fn feature_enabled(name: &str) -> bool {
@@ -117,5 +119,29 @@ fn emit_runtime_backend_cfg() {
                  available. Remove the aio feature for this target."
             );
         }
+    }
+}
+
+/// B-55: wasm feature がターゲット別依存（`wasmtime` / `veil-wasmtime`）のどちらを
+/// 選んでいるかを `src/wasm/registry.rs` から判定するための cfg エイリアスを発行する。
+///
+/// | cfg | 条件 | 意味 |
+/// |-----|------|------|
+/// | `veil_wasm_nosignals` | netbsd 全アーキ ∪ (openbsd, aarch64) ∪ (freebsd, aarch64) | crates.io wasmtime のシグナルベーストラップが使えず `third_party/wasmtime`（Pulley 専用）に切り替わるターゲット。`Cargo.toml` の `[target.'cfg(<BSD_NOSIG>)'.dependencies]` と同一条件（B-55、詳細は third_party/wasmtime/README.veil.md） |
+///
+/// `cargo::rustc-check-cfg` も併せて発行し、`unexpected_cfgs` 警告を防ぐ。
+fn emit_wasm_nosignals_cfg() {
+    println!("cargo::rustc-check-cfg=cfg(veil_wasm_nosignals)");
+
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+
+    let nosignals = matches!(
+        (target_os.as_str(), target_arch.as_str()),
+        ("netbsd", _) | ("openbsd", "aarch64") | ("freebsd", "aarch64")
+    );
+
+    if nosignals {
+        println!("cargo::rustc-cfg=veil_wasm_nosignals");
     }
 }
