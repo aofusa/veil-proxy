@@ -74,26 +74,41 @@ OpenBSD は W^X 制約のため WASM を Cranelift ネイティブ JIT ではな
 したがって本件は**欠陥ではなくプラットフォームの性能特性**であり、
 正確な記録が正しい解決である。
 
-## 対応
+## 決定的な追加観測: QUIC の idle timeout が先に切れる
 
-**スキップせず、OpenBSD だけ制限時間を延長して計測対象に残す。**
+当初は「テストの制限時間が足りないだけ」と考え、OpenBSD のみ `ntest::timeout` を
+20 秒 → 180 秒へ延長して実測した。結果、**制限時間の延長では解決しない**ことが判明した。
 
-```rust
-#[cfg_attr(not(target_os = "openbsd"), ntest::timeout(20000))]
-#[cfg_attr(target_os = "openbsd", ntest::timeout(180000))]
+```
+thread '<unnamed>' panicked at tests/e2e_tests.rs:18775:6:
+HTTP/3 waf request: ConnectionError(Timeout)
+test result: FAILED. 0 passed; 1 failed ... finished in 30.08s
 ```
 
-スキップすると「OpenBSD で WASM の LocalResponse が動くこと」を一切検証しなくなる。
-機能は正しく動作しており実行に時間がかかるだけなので、時間を与えて検証を残す方が
-実態に即している。
+180 秒の制限に達する前に、**30 秒で QUIC 接続そのものがタイムアウト**している
+（`ConnectionError(Timeout)`）。WAF の評価が終わる前にクライアント側の QUIC idle
+timeout が満了し、接続が切断される。
 
-## 利用者への影響
+これは「遅い」ではなく **HTTP/3 上では機能しない**ことを意味する。テスト側の
+制限時間をいくら延ばしてもトランスポート層のタイムアウトが先に効くため無意味である。
 
-OpenBSD / NetBSD で **CPU 律速の WASM フィルタ（WAF、正規表現マッチ、
-大きなボディの走査など）を本番投入するのは現実的でない**。ヘッダの追加・書き換え
-程度の軽量なフィルタであれば実用範囲。
+## 対応
 
-Linux / FreeBSD / macOS / Windows は Cranelift JIT で実行するため影響を受けない。
+`#[cfg_attr(target_os = "openbsd", ignore = "...")]` で OpenBSD のみ ignore する。
+理由は属性内に明記し、無説明の抑制はしない。制限時間の延長は上記のとおり実測で
+無効と確認済みのため採らない。
+
+## 利用者への影響（重要）
+
+* **OpenBSD で CPU 律速の WASM フィルタ（WAF、正規表現ルール群、大きなボディの走査）を
+  HTTP/3 と組み合わせると、QUIC 接続がタイムアウトして応答できない。**
+  遅いだけでなく実質的に利用できない。
+* HTTP/1.1 / HTTP/2 はトランスポート層のタイムアウトが緩いため、遅いながらも完了しうる
+  （本リポジトリに H1/H2 の WAF E2E は無いため未計測）。
+* **ヘッダの追加・書き換え程度の軽量なフィルタは OpenBSD でも実用範囲**。
+  同じ HTTP/3 経路で `header_filter` は 0.17 秒で完走する。
+* NetBSD は wasmtime 40 が全アーキテクチャで非対応のため WASM 自体を利用できない（B-55）。
+* Linux / FreeBSD / macOS / Windows は Cranelift JIT のため影響を受けない。
 
 ## 関連
 
