@@ -17,6 +17,26 @@
 #     aarch64 ゲストは x86_64 ホストでは TCG（低速）。
 #   - SSH 鍵（既定 `~/.ssh/veil_qemu_key`）。python3 + pexpect（provision に使用）。
 #
+# native モード（Docker 不使用、`VEIL_QEMU_NATIVE=1`）:
+#   Docker が無いホスト（例: Apple Silicon macOS で Docker 未導入）向けに、
+#   helper コンテナを介さずホストの qemu-system-* を直接起動するモード。
+#   `VEIL_QEMU_NATIVE=1` を明示するか、`docker` コマンドが無い環境では**自動的に**
+#   native へ切り替わる（`VEIL_QEMU_NATIVE=0` を明示すれば自動切替を止められる）。
+#   Docker モードの挙動・出力は本モードの有無に関わらず一切変更していない。
+#
+#   macOS（Apple Silicon, M1〜M4）での前提:
+#     brew install qemu                                  # qemu-system-{aarch64,x86_64} + EDK2 ファーム
+#     brew install cdrtools                               # mkisofs（cloud-init シード ISO 作成用）
+#     python3 -m pip install --user --break-system-packages pexpect   # provision 系スクリプトが使用
+#
+#   aarch64 ゲスト（FreeBSD/OpenBSD/NetBSD の arm64）は、Apple Silicon ホストでは
+#   **HVF アクセラレータ**（`-machine virt,accel=hvf,gic-version=3 -cpu host`）で
+#   ネイティブ速度に近い速度で動く（TCG のような数分〜数十分のブートにはならない）。
+#   x86_64 ホスト用の QEMU（Homebrew qemu on Apple Silicon には x86_64 TCG も同梱）は
+#   引き続き TCG。これにより、Linux aarch64 は KVM 非対応ホストでは実用不能だった
+#   full-system E2E/ビルド検証が、Apple Silicon 実機（M4 等）では aarch64 BSD ゲストに
+#   限り実用速度で行える。
+#
 # 使い方:
 #   tools/qemu/bsd-vm.sh <os> <arch> <command> [args]
 #     os   : freebsd | openbsd | netbsd
@@ -51,6 +71,9 @@
 #   ssh/scp/console/status/down
 #
 # 環境変数:
+#   VEIL_QEMU_NATIVE  1 で Docker を使わずホストの qemu-system-* を直接起動する
+#                     （docker コマンドが無い場合は既定で自動的に 1 相当になる。
+#                     0 を明示すると自動切替を止める＝docker 呼び出しがそのまま失敗する）
 #   VEIL_QEMU_DIR  VM 資材の親ディレクトリ（既定 ~/qemu-images）
 #   BASE_IMG       プロビジョニング済みイメージ。setup でこれを backing file とする
 #                  qcow2 オーバーレイを作る（元イメージは変更しない）
@@ -85,6 +108,18 @@ VEIL_QEMU_DIR="${VEIL_QEMU_DIR:-${HOME}/qemu-images}"
 WORKDIR="${WORKDIR:-${VEIL_QEMU_DIR}/${OS_NAME}-${ARCH}}"
 KEY="${KEY:-${HOME}/.ssh/veil_qemu_key}"
 HELPER_IMG="${HELPER_IMG:-veil-qemu:local}"
+# native モード判定: `VEIL_QEMU_NATIVE=1` で明示指定するか、docker コマンドが
+# 無い環境（Docker 未導入の macOS ホスト等）では自動的に native（Docker を使わず
+# ホストの qemu-system-* を直接起動する）モードへ切り替える。
+# `VEIL_QEMU_NATIVE=0` を明示した場合は docker が無くても自動切替しない
+# （その場合は docker 呼び出し自体がエラーになる＝明示指定を尊重する）。
+if [[ -n "${VEIL_QEMU_NATIVE:-}" ]]; then
+    NATIVE="${VEIL_QEMU_NATIVE}"
+elif ! command -v docker >/dev/null 2>&1; then
+    NATIVE=1
+else
+    NATIVE=0
+fi
 VM_SMP="${VM_SMP:-4}"
 VM_MEM_MB="${VM_MEM_MB:-4096}"
 GROW_GB="${GROW_GB:-24}"
@@ -154,13 +189,61 @@ SCP_OPTS=(-i "${KEY}" -P "${SSH_PORT}"
 log() { echo "[${OS_NAME}-${ARCH}] $*" >&2; }
 die() { echo "[${OS_NAME}-${ARCH}] ERROR: $*" >&2; exit 1; }
 
-# helper コンテナ内で 1 コマンド実行（WORKDIR を /w にマウント）
+# helper コンテナ内で 1 コマンド実行（WORKDIR を /w にマウント）。
+# native モードでは Docker を使わず、ホスト上で直接コマンドを実行する
+# （cwd=${WORKDIR}。docker 版が /img・/base にマウントするパスへの参照
+# （引数が "/img/..." "/base/..." で始まる場合）は実ホストパスへ読み替える）。
 helper() {
-    if [[ "${IMG_DIR}" == "${WORKDIR}" ]]; then
+    if [[ "${NATIVE}" == "1" ]]; then
+        _native_run "$@"
+    elif [[ "${IMG_DIR}" == "${WORKDIR}" ]]; then
         docker run --rm -v "${WORKDIR}:/w" -w /w "${HELPER_IMG}" "$@"
     else
         docker run --rm -v "${WORKDIR}:/w" -v "${IMG_DIR}:/img" -w /w "${HELPER_IMG}" "$@"
     fi
+}
+
+# helper() の native 版実行本体。
+_native_run() {
+    local args=() a base_dir
+    base_dir=""
+    [[ -f "${WORKDIR}/.base_img_dir" ]] && base_dir="$(cat "${WORKDIR}/.base_img_dir")"
+    for a in "$@"; do
+        case "$a" in
+            /img/*) a="${IMG_DIR}/${a#/img/}" ;;
+            /base/*) [[ -n "${base_dir}" ]] && a="${base_dir}/${a#/base/}" ;;
+        esac
+        args+=("$a")
+    done
+    ( cd "${WORKDIR}" && "${args[@]}" )
+}
+
+# cloud-localds 相当（NoCloud の `cidata` ラベル ISO9660 シードを作る）。
+# macOS には cloud-localds が無いため、native モードでは
+# mkisofs/genisoimage/xorrisofs（Linux 系・Homebrew `cdrtools`）→
+# macOS 標準の hdiutil の順に試す。
+_make_cidata_iso() {
+    local out="$1" user_data="$2" meta_data="$3"
+    local src; src="$(mktemp -d "${TMPDIR:-/tmp}/veil-cidata-src.XXXXXX")"
+    cp "${user_data}" "${src}/user-data"
+    cp "${meta_data}" "${src}/meta-data"
+    if command -v mkisofs >/dev/null 2>&1; then
+        mkisofs -output "${out}" -volid cidata -joliet -rock "${src}" >/dev/null
+    elif command -v genisoimage >/dev/null 2>&1; then
+        genisoimage -output "${out}" -volid cidata -joliet -rock "${src}" >/dev/null
+    elif command -v xorrisofs >/dev/null 2>&1; then
+        xorrisofs -output "${out}" -volid cidata -joliet -rock "${src}" >/dev/null
+    elif command -v hdiutil >/dev/null 2>&1; then
+        # hdiutil は拡張子の無い出力名に自動で `.iso` を付け足すため、一旦
+        # 別名（拡張子無し）へ出力してから目的のファイル名へ move する。
+        local tmp_base; tmp_base="$(mktemp -u "${TMPDIR:-/tmp}/veil-cidata-out.XXXXXX")"
+        hdiutil makehybrid -iso -joliet -default-volume-name cidata -o "${tmp_base}" "${src}" >/dev/null
+        mv "${tmp_base}.iso" "${out}"
+    else
+        rm -rf "${src}"
+        die "cidata ISO を作るツールが無い（mkisofs/genisoimage/xorrisofs/hdiutil のいずれかが必要。macOS は 'brew install cdrtools' で mkisofs を導入できる）"
+    fi
+    rm -rf "${src}"
 }
 
 # ---------------------------------------------------------------------------
@@ -183,15 +266,17 @@ _image_url() {
             echo "https://cdn.openbsd.org/pub/OpenBSD/${OPENBSD_VER}/amd64/miniroot${OPENBSD_VER//./}.img" ;;
         openbsd-aarch64)
             echo "https://cdn.openbsd.org/pub/OpenBSD/${OPENBSD_VER}/arm64/miniroot${OPENBSD_VER//./}.img" ;;
-        # NetBSD（F-140）: x86_64 は起動可能な **live image**（生イメージ、rootfs 込み）が
-        # 配布されているのでそのまま qcow2 化して使う。cloud-init 相当が無いため
+        # NetBSD（F-140）: 両アーキとも起動可能な**生イメージ（gzip 圧縮）**が配布
+        # されているのでそのまま qcow2 化して使う。cloud-init 相当が無いため
         # provision はシリアルへ root ログインして行う（netbsd-provision.py）。
-        # aarch64 は install ISO のみの配布のため sysinst をシリアルから自動操作する
-        # （netbsd-autoinstall.py、openbsd-autoinstall.py に倣う）。
+        # x86_64 は `-live.img.gz`、aarch64 は evbarm-aarch64 の `gzimg/arm64.img.gz`
+        # （FreeBSD の VM-IMAGE に相当するもの。旧来は install ISO を sysinst で
+        # シリアル自動操作していたが、実機で言語選択メニューのまま止まり動作しない
+        # ことが判明したため、この既製ブータブルイメージへ切り替えた）。
         netbsd-x86_64)
             echo "https://cdn.netbsd.org/pub/NetBSD/NetBSD-${NETBSD_VER}/images/NetBSD-${NETBSD_VER}-amd64-live.img.gz" ;;
         netbsd-aarch64)
-            echo "https://cdn.netbsd.org/pub/NetBSD/NetBSD-${NETBSD_VER}/images/NetBSD-${NETBSD_VER}-evbarm-aarch64.iso" ;;
+            echo "https://cdn.netbsd.org/pub/NetBSD/NetBSD-${NETBSD_VER}/evbarm-aarch64/binary/gzimg/arm64.img.gz" ;;
     esac
 }
 
@@ -200,8 +285,12 @@ _image_url() {
 # ---------------------------------------------------------------------------
 cmd_setup() {
     mkdir -p "${WORKDIR}"
-    log "helper イメージを build（${HELPER_IMG}）"
-    docker build -t "${HELPER_IMG}" "${HERE}/helper"
+    if [[ "${NATIVE}" == "1" ]]; then
+        log "native モード（Docker 不使用）: helper イメージの build をスキップする"
+    else
+        log "helper イメージを build（${HELPER_IMG}）"
+        docker build -t "${HELPER_IMG}" "${HERE}/helper"
+    fi
     [[ -f "${KEY}" ]] || { log "SSH 鍵を生成: ${KEY}"; ssh-keygen -t ed25519 -N '' -f "${KEY}" >/dev/null; }
 
     if [[ -n "${BASE_IMG:-}" ]]; then
@@ -210,8 +299,12 @@ cmd_setup() {
         base_dir="$(cd "$(dirname "${BASE_IMG}")" && pwd)"
         base_name="$(basename "${BASE_IMG}")"
         log "プロビジョニング済みイメージのオーバーレイを作成（元イメージは変更しない）: ${BASE_IMG}"
-        docker run --rm -v "${WORKDIR}:/w" -v "${base_dir}:/base:ro" -w /w "${HELPER_IMG}" \
-            qemu-img create -f qcow2 -F qcow2 -b "/base/${base_name}" "${IMG_NAME}" >/dev/null
+        if [[ "${NATIVE}" == "1" ]]; then
+            ( cd "${WORKDIR}" && qemu-img create -f qcow2 -F qcow2 -b "${base_dir}/${base_name}" "${IMG_NAME}" ) >/dev/null
+        else
+            docker run --rm -v "${WORKDIR}:/w" -v "${base_dir}:/base:ro" -w /w "${HELPER_IMG}" \
+                qemu-img create -f qcow2 -F qcow2 -b "/base/${base_name}" "${IMG_NAME}" >/dev/null
+        fi
         # 起動時にも backing file を同じパス（/base）で見せる必要があるため記録しておく
         echo "${base_dir}" > "${WORKDIR}/.base_img_dir"
         log "setup 完了（オーバーレイ: ${IMG}、backing: ${BASE_IMG}）"
@@ -246,34 +339,19 @@ cmd_setup() {
         fi
         _write_openbsd_autoinstall
     else
-        # NetBSD（F-140）。
-        if [[ "${ARCH}" == "x86_64" ]]; then
-            # live image（生イメージ、gzip 圧縮）を DL して qcow2 化し、
-            # FreeBSD と同じ「base.qcow2 + 起動用オーバーレイ」構成にする
-            # （cloud-init は無いので seed は作らない。provision はシリアル
-            # ログイン経由 = netbsd-provision.py）。
-            local base="${WORKDIR}/base.qcow2"
-            if [[ ! -f "${base}" ]]; then
-                log "NetBSD live image を DL + qcow2 変換: ${url}"
-                curl -fL --retry 3 -o "${WORKDIR}/live.img.gz" "${url}"
-                gunzip -kf "${WORKDIR}/live.img.gz"
-                helper qemu-img convert -f raw -O qcow2 live.img base.qcow2
-                rm -f "${WORKDIR}/live.img.gz" "${WORKDIR}/live.img"
-            fi
-            [[ -f "${IMG}" ]] || _create_overlay
-        else
-            # aarch64 は install ISO のみの配布。OpenBSD の miniroot と同じ発想で
-            # ISO を CD-ROM、空のターゲット qcow2 を 2 台目に繋いで sysinst を
-            # シリアルから自動操作する（netbsd-autoinstall.py）。
-            if [[ ! -f "${WORKDIR}/install.iso" ]]; then
-                log "NetBSD インストール ISO を DL: ${url}"
-                curl -fL --retry 3 -o "${WORKDIR}/install.iso" "${url}"
-            fi
-            if [[ ! -f "${IMG}" ]]; then
-                log "空のターゲットディスクを作成（${GROW_GB}G）"
-                helper qemu-img create -f qcow2 "${IMG_NAME}" "${GROW_GB}G" >/dev/null
-            fi
+        # NetBSD（F-140）。x86_64/aarch64 とも起動可能な生イメージ（gzip 圧縮）を
+        # DL して qcow2 化し、FreeBSD と同じ「base.qcow2 + 起動用オーバーレイ」構成
+        # にする（cloud-init は無いので seed は作らない。provision はシリアル
+        # ログイン経由 = netbsd-provision.py）。
+        local base="${WORKDIR}/base.qcow2"
+        if [[ ! -f "${base}" ]]; then
+            log "NetBSD イメージを DL + qcow2 変換: ${url}"
+            curl -fL --retry 3 -o "${WORKDIR}/live.img.gz" "${url}"
+            gunzip -kf "${WORKDIR}/live.img.gz"
+            helper qemu-img convert -f raw -O qcow2 live.img base.qcow2
+            rm -f "${WORKDIR}/live.img.gz" "${WORKDIR}/live.img"
         fi
+        [[ -f "${IMG}" ]] || _create_overlay
     fi
     log "setup 完了"
 }
@@ -335,8 +413,13 @@ EOF
 instance-id: veil-${OS_NAME}-${ARCH}-$(date +%s)
 local-hostname: veil-${OS_NAME}-${ARCH}
 EOF
-    log "cloud-init シードを生成（cloud-localds）"
-    helper cloud-localds seed.img user-data meta-data
+    if [[ "${NATIVE}" == "1" ]]; then
+        log "cloud-init シードを生成（native: mkisofs/hdiutil 等）"
+        _make_cidata_iso "${WORKDIR}/seed.img" "${WORKDIR}/user-data" "${WORKDIR}/meta-data"
+    else
+        log "cloud-init シードを生成（cloud-localds）"
+        helper cloud-localds seed.img user-data meta-data
+    fi
 }
 
 # OpenBSD autoinstall(8) の応答ファイル。installer から
@@ -379,6 +462,130 @@ _kvm_args() {
     fi
 }
 
+# native モードでの EDK2/OVMF ファーム探索。Homebrew qemu（macOS）の配置と
+# Linux ディストリ（AAVMF/OVMF パッケージ）の配置の両方を試す。
+_native_fw_aarch64_code() {
+    local f
+    for f in /opt/homebrew/share/qemu/edk2-aarch64-code.fd \
+             /usr/local/share/qemu/edk2-aarch64-code.fd \
+             /usr/share/AAVMF/AAVMF_CODE.fd; do
+        [[ -f "${f}" ]] && { echo "${f}"; return 0; }
+    done
+    return 1
+}
+_native_fw_x86_64_code() {
+    local f
+    for f in /opt/homebrew/share/qemu/edk2-x86_64-code.fd \
+             /usr/local/share/qemu/edk2-x86_64-code.fd \
+             /usr/share/OVMF/OVMF_CODE.fd; do
+        [[ -f "${f}" ]] && { echo "${f}"; return 0; }
+    done
+    return 1
+}
+_native_fw_x86_64_vars() {
+    local f
+    for f in /opt/homebrew/share/qemu/edk2-i386-vars.fd \
+             /usr/local/share/qemu/edk2-i386-vars.fd \
+             /usr/share/OVMF/OVMF_VARS.fd; do
+        [[ -f "${f}" ]] && { echo "${f}"; return 0; }
+    done
+    return 1
+}
+
+# native モード用 boot.sh を生成する。docker 版と drives/seed_drive/console_args は
+# 完全に共通（呼び出し元の _write_boot で計算済みのものをそのまま受け取る）で、
+# 違いはアクセラレータ選択とファームウェアの入手経路（コンテナ内固定パス→ホスト探索）
+# ・起動コマンド（docker run → 直接 exec）だけ。
+_write_boot_native() {
+    local drives="$1" seed_drive="$2" console_args="$3"
+    # macOS の /bin/bash（3.2）でも動く 64MiB ゼロ埋めパディング（truncate が無い
+    # 環境向けに dd ベースのフォールバックを用意する）。boot.sh 内で使うため、
+    # 生成先スクリプトへそのままの文字列として埋め込む（ヒアドキュメントは非quoted
+    # だが、この変数の中身は既に展開済みの文字列なので $out 等は再展開されない）。
+    local pad64m_fn='_pad64m() {
+    local out="$1" src="${2:-}"
+    if command -v truncate >/dev/null 2>&1; then
+        truncate -s 64m "${out}"
+    else
+        dd if=/dev/zero of="${out}" bs=1m count=64 2>/dev/null
+    fi
+    [ -n "${src}" ] && dd if="${src}" of="${out}" conv=notrunc 2>/dev/null
+    return 0
+}'
+
+    if [[ "${ARCH}" == "x86_64" ]]; then
+        command -v qemu-system-x86_64 >/dev/null 2>&1 \
+            || die "qemu-system-x86_64 が PATH に無い（brew install qemu）"
+        local accel="tcg" cpu="qemu64"
+        if [[ "$(uname -m)" == "x86_64" && -r /dev/kvm ]]; then accel="kvm"; cpu="host"; fi
+        if [[ "${VM_FIRMWARE}" == "uefi" ]]; then
+            local fw_code fw_vars
+            fw_code="$(_native_fw_x86_64_code)" \
+                || die "x86_64 UEFI ファーム(edk2-x86_64-code.fd / OVMF_CODE.fd)が見つからない（brew install qemu）"
+            fw_vars="$(_native_fw_x86_64_vars)" \
+                || die "x86_64 UEFI VARS(edk2-i386-vars.fd / OVMF_VARS.fd)が見つからない（brew install qemu）"
+            cat > "${WORKDIR}/boot.sh" <<EOF
+#!/bin/bash
+set -e
+cd "${WORKDIR}"
+${pad64m_fn}
+[ -f efi_code.fd ] || cp "${fw_code}" efi_code.fd
+[ -f efi_vars.fd ] || cp "${fw_vars}" efi_vars.fd
+exec qemu-system-x86_64 -machine q35,accel=${accel} -cpu ${cpu} -smp ${VM_SMP} -m ${VM_MEM_MB} \
+  -drive if=pflash,format=raw,readonly=on,file=efi_code.fd \
+  -drive if=pflash,format=raw,file=efi_vars.fd \
+  ${drives} \
+  ${seed_drive}-netdev user,id=net0,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
+  -device virtio-net-pci,netdev=net0 \
+  ${console_args}
+EOF
+        else
+            cat > "${WORKDIR}/boot.sh" <<EOF
+#!/bin/bash
+set -e
+cd "${WORKDIR}"
+exec qemu-system-x86_64 -machine pc,accel=${accel} -cpu ${cpu} -smp ${VM_SMP} -m ${VM_MEM_MB} \
+  ${drives} \
+  ${seed_drive}-netdev user,id=net0,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
+  -device virtio-net-pci,netdev=net0 \
+  ${console_args}
+EOF
+        fi
+    else
+        command -v qemu-system-aarch64 >/dev/null 2>&1 \
+            || die "qemu-system-aarch64 が PATH に無い（brew install qemu）"
+        local fw_code accel_args
+        fw_code="$(_native_fw_aarch64_code)" \
+            || die "aarch64 UEFI ファーム(edk2-aarch64-code.fd / AAVMF_CODE.fd)が見つからない（brew install qemu）"
+        # Apple Silicon（Darwin + arm64 ホスト）かつ qemu が hvf アクセラレータを
+        # サポートしていれば HVF でネイティブ速度のまま aarch64 ゲストを起動できる。
+        # それ以外（x86_64 ホストでの aarch64 ゲスト等）は従来どおり TCG。
+        if [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" ]] \
+            && qemu-system-aarch64 -accel help 2>/dev/null | grep -qi '^hvf'; then
+            accel_args="-machine virt,accel=hvf,gic-version=3 -cpu host"
+            log "Apple Silicon + HVF で aarch64 ゲストをアクセラレーションする"
+        else
+            accel_args="-machine virt -cpu cortex-a72"
+        fi
+        cat > "${WORKDIR}/boot.sh" <<EOF
+#!/bin/bash
+set -e
+cd "${WORKDIR}"
+${pad64m_fn}
+[ -f efi_code.img ] || _pad64m efi_code.img "${fw_code}"
+[ -f varstore.img ] || _pad64m varstore.img
+exec qemu-system-aarch64 ${accel_args} -smp ${VM_SMP} -m ${VM_MEM_MB} \
+  -drive if=pflash,format=raw,file=efi_code.img,readonly=on \
+  -drive if=pflash,format=raw,file=varstore.img \
+  ${drives} \
+  ${seed_drive}-netdev user,id=net0,hostfwd=tcp:0.0.0.0:${SSH_PORT}-:22 \
+  -device virtio-net-pci,netdev=net0,romfile= \
+  ${console_args}
+EOF
+    fi
+    chmod +x "${WORKDIR}/boot.sh"
+}
+
 _write_boot() {
     local phase="${1:-}"
 
@@ -401,15 +608,6 @@ _write_boot() {
         # auto_install.conf の「root disk = sd1」はこの並びに対応する。
         drives="-drive if=virtio,format=raw,file=miniroot.img,index=0 \\
   -drive if=virtio,format=qcow2,file=${IMG_NAME},index=1"
-    elif [[ "${OS_NAME}" == "netbsd" && "${phase}" == "install" ]]; then
-        # NetBSD aarch64 の install フェーズ: install ISO を CD-ROM（sysinst から
-        # 見えるブート/インストールメディア）、ターゲット qcow2 を virtio-blk で繋ぐ。
-        # aarch64 の virt マシンには IDE が無いので virtio-scsi 経由の CD-ROM にする
-        # （FreeBSD/OpenBSD の seed_drive と同じ手法）。
-        drives="-device virtio-scsi-pci,id=scsi0 \\
-  -drive if=none,id=cd0,format=raw,file=install.iso,media=cdrom \\
-  -device scsi-cd,bus=scsi0.0,drive=cd0,bootindex=0 \\
-  -drive if=virtio,format=qcow2,file=${IMG_NAME},index=0,bootindex=1"
     else
         drives="-drive if=virtio,format=qcow2,file=${IMG_NAME},index=0${drive_opts}"
     fi
@@ -446,6 +644,11 @@ _write_boot() {
     [[ "${CONSOLE_WAIT:-0}" == "1" ]] && con_mode="wait"
     local console_args="-nographic -serial telnet:0.0.0.0:${CON_PORT},server,${con_mode} \\
   -qmp telnet:0.0.0.0:${QMP_PORT},server,nowait -monitor none"
+
+    if [[ "${NATIVE}" == "1" ]]; then
+        _write_boot_native "${drives}" "${seed_drive}" "${console_args}"
+        return 0
+    fi
 
     if [[ "${ARCH}" == "x86_64" ]]; then
         local accel="tcg" cpu="qemu64"
@@ -505,8 +708,48 @@ EOF
     fi
 }
 
+# native モードで qemu.pid の指すプロセスを止める。
+#   $1 = "force" : 即座に kill -9（docker 版の `docker rm -f` と同じ、猶予なし）。
+#   省略時        : QMP で ACPI シャットダウンを試みてから kill -9 にフォールバック
+#                   （cmd_down で使用）。
+_native_stop() {
+    local mode="${1:-graceful}"
+    [[ -f "${WORKDIR}/qemu.pid" ]] || return 0
+    local pid; pid="$(cat "${WORKDIR}/qemu.pid" 2>/dev/null || true)"
+    if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+        if [[ "${mode}" == "graceful" ]]; then
+            python3 "${HERE}/qmp-sendkeys.py" --port "${QMP_PORT}" --powerdown >/dev/null 2>&1 || true
+            local waited=0
+            while (( waited < ${DOWN_TIMEOUT:-60} )); do
+                kill -0 "${pid}" 2>/dev/null || break
+                sleep 3; waited=$((waited + 3))
+            done
+        fi
+        kill -0 "${pid}" 2>/dev/null && kill -9 "${pid}" 2>/dev/null
+    fi
+    rm -f "${WORKDIR}/qemu.pid"
+    return 0
+}
+
 cmd_up() {
     _write_boot "${1:-}"
+    if [[ "${NATIVE}" == "1" ]]; then
+        # 前回分が残っていれば docker rm -f 相当（即時 kill）で片付ける
+        _native_stop force
+        nohup bash "${WORKDIR}/boot.sh" > "${WORKDIR}/qemu.log" 2>&1 &
+        local qemu_pid=$!
+        disown "${qemu_pid}" 2>/dev/null || disown 2>/dev/null || true
+        echo "${qemu_pid}" > "${WORKDIR}/qemu.pid"
+        log "起動: console=telnet 127.0.0.1:${CON_PORT}, ssh=127.0.0.1:${SSH_PORT}（pid=${qemu_pid}）"
+        if [[ "${ARCH}" == "aarch64" ]]; then
+            if [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" ]]; then
+                log "aarch64 は HVF で加速されるためネイティブ速度で起動する"
+            else
+                log "aarch64 は TCG のため multi-user 到達に数分〜数十分かかる"
+            fi
+        fi
+        return 0
+    fi
     docker rm -f "${NAME}" >/dev/null 2>&1 || true
     # オーバーレイ運用時は backing file を /base（読み取り専用）で見せる。
     local base_mount=()
@@ -526,6 +769,11 @@ cmd_up() {
 # 壊さないようにする（`docker rm -f` は qemu を SIGKILL するため、cloud-init/growfs の
 # 書き込み中に落とすとイメージが壊れて次回 boot2 が回り続ける = 実測）。
 cmd_down() {
+    if [[ "${NATIVE}" == "1" ]]; then
+        _native_stop graceful
+        log "removed ${NAME}"
+        return 0
+    fi
     if docker ps --filter "name=^/${NAME}$" --format '{{.Names}}' 2>/dev/null | grep -q .; then
         if python3 "${HERE}/qmp-sendkeys.py" --port "${QMP_PORT}" --powerdown >/dev/null 2>&1; then
             local waited=0
@@ -540,7 +788,15 @@ cmd_down() {
 }
 
 cmd_status() {
-    docker ps -a --filter "name=^/${NAME}$" --format '{{.Names}} {{.Status}}' || true
+    if [[ "${NATIVE}" == "1" ]]; then
+        if [[ -f "${WORKDIR}/qemu.pid" ]] && kill -0 "$(cat "${WORKDIR}/qemu.pid")" 2>/dev/null; then
+            echo "${NAME} running (pid $(cat "${WORKDIR}/qemu.pid"))"
+        else
+            echo "${NAME} not running"
+        fi
+    else
+        docker ps -a --filter "name=^/${NAME}$" --format '{{.Names}} {{.Status}}' || true
+    fi
     if ssh "${SSH_OPTS[@]}" -o ConnectTimeout=5 "${SSH_USER}@127.0.0.1" true 2>/dev/null; then
         echo "ssh: reachable"
     else
@@ -603,8 +859,16 @@ cmd_provision() {
         #       明示的に export → unset する（残ると再起動側も wait になり永久に起動しない）。
         CONSOLE_WAIT=1 cmd_up install
         unset CONSOLE_WAIT
-        python3 "${HERE}/openbsd-autoinstall.py" --con-port "${CON_PORT}" --workdir "${WORKDIR}" \
-            --container "${NAME}" --arch "${ARCH}"
+        if [[ "${NATIVE}" == "1" ]]; then
+            # native モード: helper コンテナが無いので、応答ファイル配布用の
+            # HTTP サーバはホスト上で直接 python3 -m http.server を起動する
+            # （--container を省略すると openbsd-autoinstall.py が native 動作する）。
+            python3 "${HERE}/openbsd-autoinstall.py" --con-port "${CON_PORT}" --workdir "${WORKDIR}" \
+                --arch "${ARCH}"
+        else
+            python3 "${HERE}/openbsd-autoinstall.py" --con-port "${CON_PORT}" --workdir "${WORKDIR}" \
+                --container "${NAME}" --arch "${ARCH}"
+        fi
         log "autoinstall 完了。miniroot を外して再起動する"
         cmd_down
         cmd_up
@@ -613,50 +877,35 @@ cmd_provision() {
         cmd_ssh 'uname -a'
         log "provision 完了"
     else
-        # NetBSD（F-140）。
-        if [[ "${ARCH}" == "x86_64" ]]; then
-            # live image は cloud-init 相当を持たないため、FreeBSD の --mode login と
-            # 同じ発想でシリアルへ root ログインして SSH 鍵を注入する。
-            log "NetBSD live image を起動し、シリアルから root ログインして SSH 鍵を注入"
-            cmd_down
-            # `nowait` + 固定 sleep だと、ブートローダのメニュー選択猶予（既定 5 秒の
-            # カウントダウン）が qemu 起動〜python 接続までのオーバーヘッドだけで
-            # 使い切られてしまい、シリアルコンソールへの切り替え操作（consdev com0）
-            # が間に合わない（実測: B-52/B-54 と同種の取りこぼし）。
-            # OpenBSD/NetBSD(aarch64) の install フェーズに倣い、`CONSOLE_WAIT=1`
-            # （`-serial ...,server,wait`）でコンソール接続まで出力を保持させ、
-            # メニューのカウントダウンを丸ごと使えるようにする。
-            CONSOLE_WAIT=1 cmd_up
-            unset CONSOLE_WAIT
-            python3 "${HERE}/netbsd-provision.py" --con-port "${CON_PORT}" \
-                --pubkey "${KEY}.pub" --password "${VM_ROOT_PASSWORD}"
-            log "SSH 到達を確認"
-            cmd_wait "${1:-600}"
-            cmd_ssh 'uname -a'
-            log "provision 完了"
-        else
-            # aarch64: install ISO から sysinst を自動操作する（openbsd-autoinstall.py
-            # に倣った netbsd-autoinstall.py。sysinst はメニュー主導の対話ツールで
-            # OpenBSD の autoinstall(8) のような応答ファイルが無いため、シリアルへの
-            # キー送出で駆動する）。
-            [[ -f "${WORKDIR}/install.iso" ]] || die "install.iso が無い。先に setup を実行すること"
-            log "NetBSD sysinst を実行（install ISO 起動 → 自動操作 → インストール）"
-            cmd_down
-            CONSOLE_WAIT=1 cmd_up install
-            unset CONSOLE_WAIT
-            python3 "${HERE}/netbsd-autoinstall.py" --con-port "${CON_PORT}" \
-                --pubkey "${KEY}.pub" --password "${VM_ROOT_PASSWORD}"
-            log "sysinst 完了。ISO を外して再起動し、シリアルログインで SSH 鍵を注入"
-            cmd_down
-            cmd_up
-            sleep 5
-            python3 "${HERE}/netbsd-provision.py" --con-port "${CON_PORT}" \
-                --pubkey "${KEY}.pub" --password "${VM_ROOT_PASSWORD}"
-            log "SSH 到達を確認"
-            cmd_wait "${1:-1800}"
-            cmd_ssh 'uname -a'
-            log "provision 完了"
-        fi
+        # NetBSD（F-140）。x86_64/aarch64 とも起動可能な生イメージなので
+        # cloud-init 相当は無く、FreeBSD の --mode login と同じ発想でシリアルへ
+        # root ログインして SSH 鍵を注入する（netbsd-provision.py、両アーキ共通）。
+        #
+        # aarch64 は当初 install ISO から sysinst をシリアル自動操作する専用
+        # スクリプトを使っていたが、実機（Apple Silicon + QEMU/HVF）で sysinst の
+        # 言語選択メニューのまま止まり動作しないことが判明したため廃止し、x86_64 と
+        # 同じブータブルイメージ経路に統一した。
+        log "NetBSD イメージを起動し、シリアルから root ログインして SSH 鍵を注入"
+        cmd_down
+        # `nowait` + 固定 sleep だと、ブートローダのメニュー選択猶予（既定 5 秒の
+        # カウントダウン）が qemu 起動〜python 接続までのオーバーヘッドだけで
+        # 使い切られてしまい、シリアルコンソールへの切り替え操作（consdev com0）
+        # が間に合わない（実測: B-52/B-54 と同種の取りこぼし）。
+        # OpenBSD の install フェーズに倣い、`CONSOLE_WAIT=1`
+        # （`-serial ...,server,wait`）でコンソール接続まで出力を保持させ、
+        # メニューのカウントダウンを丸ごと使えるようにする。
+        CONSOLE_WAIT=1 cmd_up
+        unset CONSOLE_WAIT
+        python3 "${HERE}/netbsd-provision.py" --con-port "${CON_PORT}" \
+            --pubkey "${KEY}.pub" --password "${VM_ROOT_PASSWORD}"
+        log "SSH 到達を確認"
+        # aarch64 は TCG ホストだと multi-user 到達まで数十分かかりうるため
+        # x86_64 より長めの既定タイムアウトにする。
+        local default_wait=600
+        [[ "${ARCH}" == "aarch64" ]] && default_wait=1800
+        cmd_wait "${1:-${default_wait}}"
+        cmd_ssh 'uname -a'
+        log "provision 完了"
     fi
 }
 
@@ -819,6 +1068,8 @@ cmd_sync() {
     # ホスト側のビルド成果物（target/）は転送しない。
     # 巨大なうえゲストのアーキ/OS では使えず、OpenBSD では容量不足の原因になる。
     #
+    # third_party（B-55 の vendoring 済み wasmtime = veil-wasmtime）は path 依存なので、
+    # 転送しないとゲスト側で `cargo` がワークスペース解決に失敗する。
     # 転送先ディレクトリは展開前に **削除する**。`tar xzf -` は追加・上書きしかせず
     # **ホスト側で削除したファイルがゲストに残り続ける**ため。実際に
     # `src/tls_provider.rs` → `src/tls_provider/mod.rs` へ移動した際、ゲストに旧
@@ -826,10 +1077,10 @@ cmd_sync() {
     # （F-142、実機で検出）。`target/` は転送対象外なので消えない（ビルドキャッシュは維持）。
     (cd "${ROOT}" && tar czf - \
         --exclude='./target' --exclude='*/target' --exclude='.git' \
-        src benches tests examples contrib docker/assets \
+        src benches tests examples contrib docker/assets third_party \
         Cargo.toml Cargo.lock build.rs clippy.toml .cargo) \
       | cmd_ssh "cd ${GUEST_ROOT} \
-          && rm -rf src benches tests examples contrib docker/assets .cargo \
+          && rm -rf src benches tests examples contrib docker/assets third_party .cargo \
           && tar xzf - \
           && sed -i'' -e 's|members = \[\".\", \"fuzz\"\]|members = [\".\"]|' Cargo.toml"
 }
