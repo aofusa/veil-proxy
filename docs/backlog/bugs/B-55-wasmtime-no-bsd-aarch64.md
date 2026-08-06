@@ -167,6 +167,12 @@ E2E（`tests/e2e_setup.sh test`）:
 
 Linux x86_64（ホスト、参考）: 全 feature 組合せビルドがゼロ警告、`cargo clippy --features full --all-targets -- -D warnings` クリーン、`cargo fmt --check` クリーン、packaging の Docker glibc ビルド内で `cargo test --lib --features full` が `798 passed; 0 failed`。
 
+packaging（2026-08-06 実測、`packaging/scripts/build.sh --docker` / `build-cross.sh`）:
+Linux glibc・musl（いずれもコンテナ内 `cargo test --lib --features full` が 798 passed / 0 failed）、
+`.deb`・`.rpm`、macOS universal2（rc=0）、Windows x86_64 / aarch64（rc=0）の全成果物を生成できた。
+`.dockerignore` の `!third_party/` と各 Dockerfile の `COPY third_party` により、
+vendoring をコンパイルしないターゲットでも path 依存の解決が通ることを確認済み。
+
 ## 上流について
 
 FreeBSD/OpenBSD については wasmtime に `(freebsd, aarch64)` / `(openbsd, aarch64)`
