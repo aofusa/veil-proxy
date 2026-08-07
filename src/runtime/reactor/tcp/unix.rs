@@ -444,6 +444,7 @@ impl TcpStream {
     pub fn readable(&self) -> Readable<'_> {
         Readable {
             fd: self.fd,
+            registered: false,
             _marker: std::marker::PhantomData,
         }
     }
@@ -452,6 +453,7 @@ impl TcpStream {
     pub fn writable(&self) -> Writable<'_> {
         Writable {
             fd: self.fd,
+            registered: false,
             _marker: std::marker::PhantomData,
         }
     }
@@ -898,24 +900,34 @@ impl<A: IoBuf, B: IoBuf> Future for SendMsgFuture<A, B> {
 
 /// 読み取り可能まで待つ Future。
 ///
-/// F-145: 確認用の `poll(2)` プローブは行わない。この Future の呼び出し元は
-/// 例外なく「非ブロッキング read/recv を試みて `EAGAIN`/`WouldBlock` を受け取った
-/// 直後」にのみこれを await する（try-first パターン、モジュール doc 参照。
-/// 呼び出し箇所監査は docs/backlog/features/F-145-hotpath-syscall-reduction.md）。
-/// そのため `poll(2)` は「ほぼ常に not-ready を返すだけの無駄な syscall」であり、
-/// 削除しても正しさは損なわれない: kqueue の `EV_ADD`／epoll のレベルトリガ登録は
-/// いずれも登録時点で fd が既に readable であれば直ちにイベントを報告するため、
-/// 「登録した瞬間に readable だった」ケースでも起床が失われることはなく、最悪でも
-/// イベントループが 1 ターン余分に回るだけで済む（ハングしない）。
+/// # F-145: `poll(2)` プローブを使わず「登録済みフラグ」で完了を判定する
+///
+/// 以前はこの Future の `poll` が毎回 `poll(2)` を発行して readiness を確認していた
+/// （実測 1.7 回/リクエストの純粋なオーバーヘッド）。呼び出し元は例外なく
+/// 非ブロッキング I/O が `WouldBlock` を返した**直後**にのみ await するため、この
+/// プローブはほぼ常に「まだ準備できていない」を返すだけだった。
+///
+/// ただしプローブを単に削除すると **`Poll::Ready` を返す経路が無くなり永久に
+/// `Pending` を返し続ける**（実測: FreeBSD で 54KB の静的ファイルを HTTP/1.1 TLS で
+/// 返す際、送信バッファが埋まって `writable()` を待った時点で応答が停止した）。
+/// そこで「初回 poll で登録して `Pending`、2 回目以降の poll は
+/// poller が当該方向の readiness を報告して起床させた結果なので `Ready`」という
+/// 状態遷移で完了を表す（syscall ゼロ）。
+///
+/// 起床が本当に readiness に由来しない場合（他要因による spurious wake）でも安全:
+/// 呼び出し元は `Ready` の後に必ず非ブロッキング I/O を再試行し、`WouldBlock` なら
+/// 再度この Future を await する（従来の `poll(2)` の偽陽性と同じ扱い）。
 pub struct Readable<'a> {
     fd: RawFd,
+    /// 既に interest を登録済みか（型 doc の状態遷移。初回のみ登録する）。
+    registered: bool,
     _marker: std::marker::PhantomData<&'a TcpStream>,
 }
 
 impl<'a> Future for Readable<'a> {
     type Output = io::Result<()>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // F-141: kqueue バックエンドでは、直前の `EVFILT_READ` 起床がこの fd を
         // readable と報告済みなら、確認用の `poll(2)` syscall を省略する
         // （`executor::take_read_hint` の doc 参照。consume-once のため、無関係な
@@ -924,6 +936,13 @@ impl<'a> Future for Readable<'a> {
         if crate::runtime::executor::take_read_hint(self.fd) > 0 {
             return Poll::Ready(Ok(()));
         }
+        if self.registered {
+            // 登録済みで再 poll された = poller が readiness を報告して起床させた。
+            // （読み取りヒントが 0 の EOF イベント等、`take_read_hint` が 0 を返す
+            //   ケースでもここで確実に完了する。）
+            return Poll::Ready(Ok(()));
+        }
+        self.registered = true;
         register_read(self.fd, cx.waker().clone());
         Poll::Pending
     }
@@ -931,20 +950,71 @@ impl<'a> Future for Readable<'a> {
 
 /// 書き込み可能まで待つ Future。
 ///
-/// F-145: `Readable` と同じ理由で確認用の `poll(2)` プローブを行わない
-/// （呼び出し元は例外なく非ブロッキング write/send の `WouldBlock` 後にのみ await する）。
+/// # 書き込み側は `poll(2)` プローブを**残す**（F-145 実測）
+///
+/// 読み取り側と違い、書き込み側はプローブを消すと**遅くなる**。`WouldBlock` 直後でも
+/// カーネルが送信バッファを既に排出済みで即座に書き込み可能なことが多く、その場合
+/// プローブなら syscall 1 回で `Ready` を返せるのに対し、プローブを消すと必ず
+/// 「登録 → park → kevent 起床 → 再 poll」というタスク再スケジュール 1 往復を
+/// 払うことになる。FreeBSD 実測（54KB 静的ファイル・HTTP/1.1 TLS）でプローブ削除は
+/// **約 5% の低下**を示した（小さな応答は writable 待ちが発生しないため影響なし）。
+///
+/// 一方で完了判定は `registered` フラグ側で行う（プローブだけに頼ると、プローブが
+/// not-ready を返した後に起床しても `Ready` を返す経路が無く永久に `Pending` を
+/// 返し続ける。実測でこの経路が応答を完全に停止させた）。
+///
+/// # F-145: `poll(2)` プローブを使わず「登録済みフラグ」で完了を判定する
+///
+/// 以前はこの Future の `poll` が毎回 `poll(2)` を発行して readiness を確認していた
+/// （実測 1.7 回/リクエストの純粋なオーバーヘッド）。呼び出し元は例外なく
+/// 非ブロッキング I/O が `WouldBlock` を返した**直後**にのみ await するため、この
+/// プローブはほぼ常に「まだ準備できていない」を返すだけだった。
+///
+/// ただしプローブを単に削除すると **`Poll::Ready` を返す経路が無くなり永久に
+/// `Pending` を返し続ける**（実測: FreeBSD で 54KB の静的ファイルを HTTP/1.1 TLS で
+/// 返す際、送信バッファが埋まって `writable()` を待った時点で応答が停止した）。
+/// そこで「初回 poll で登録して `Pending`、2 回目以降の poll は
+/// poller が当該方向の readiness を報告して起床させた結果なので `Ready`」という
+/// 状態遷移で完了を表す（syscall ゼロ）。
+///
+/// 起床が本当に readiness に由来しない場合（他要因による spurious wake）でも安全:
+/// 呼び出し元は `Ready` の後に必ず非ブロッキング I/O を再試行し、`WouldBlock` なら
+/// 再度この Future を await する（従来の `poll(2)` の偽陽性と同じ扱い）。
 pub struct Writable<'a> {
     fd: RawFd,
+    /// 既に interest を登録済みか（型 doc の状態遷移。初回のみ登録する）。
+    registered: bool,
     _marker: std::marker::PhantomData<&'a TcpStream>,
 }
 
 impl<'a> Future for Writable<'a> {
     type Output = io::Result<()>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.registered {
+            // 登録済みで再 poll された = poller が書き込み可能を報告して起床させた。
+            return Poll::Ready(Ok(()));
+        }
+        // 型 doc の「書き込み側はプローブを残す」参照。
+        if poll_writable_now(self.fd) {
+            return Poll::Ready(Ok(()));
+        }
+        self.registered = true;
         register_write(self.fd, cx.waker().clone());
         Poll::Pending
     }
+}
+
+/// fd が今すぐ書き込み可能かを `poll(2)` 1 回で判定する（`Writable`/`WritableFd` 用）。
+fn poll_writable_now(fd: RawFd) -> bool {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    // SAFETY: pfd は有効なスタック上の 1 要素。timeout=0 でブロックしない。
+    let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
+    ret > 0 && pfd.revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP) != 0
 }
 
 // ====================
@@ -958,12 +1028,14 @@ impl<'a> Future for Writable<'a> {
 /// await する。UDP の recv 系ループ・`offload` の io_uring 経路等）。
 pub struct ReadableFd {
     fd: RawFd,
+    /// 既に interest を登録済みか（`Readable` と同じ状態遷移。F-145）。
+    registered: bool,
 }
 
 impl Future for ReadableFd {
     type Output = io::Result<()>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // F-141: `Readable::poll` と同じ理由で、kqueue の直近ヒントがあれば
         // 確認用 `poll(2)` syscall を省略する（UDP の `wait_readable_fd` 経路で使われる
         // ため、`QuicUdpSocket` の recv 系ループがこの恩恵を受ける）。
@@ -971,6 +1043,10 @@ impl Future for ReadableFd {
         if crate::runtime::executor::take_read_hint(self.fd) > 0 {
             return Poll::Ready(Ok(()));
         }
+        if self.registered {
+            return Poll::Ready(Ok(()));
+        }
+        self.registered = true;
         register_read(self.fd, cx.waker().clone());
         Poll::Pending
     }
@@ -981,12 +1057,21 @@ impl Future for ReadableFd {
 /// F-145: `Writable` と同じ理由で確認用の `poll(2)` プローブを行わない。
 pub struct WritableFd {
     fd: RawFd,
+    /// 既に interest を登録済みか（`Writable` と同じ状態遷移。F-145）。
+    registered: bool,
 }
 
 impl Future for WritableFd {
     type Output = io::Result<()>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.registered {
+            return Poll::Ready(Ok(()));
+        }
+        if poll_writable_now(self.fd) {
+            return Poll::Ready(Ok(()));
+        }
+        self.registered = true;
         register_write(self.fd, cx.waker().clone());
         Poll::Pending
     }
@@ -994,10 +1079,16 @@ impl Future for WritableFd {
 
 /// 任意の FD が読み込み可能になるまで待つ。
 pub fn wait_readable_fd(fd: RawFd) -> ReadableFd {
-    ReadableFd { fd }
+    ReadableFd {
+        fd,
+        registered: false,
+    }
 }
 
 /// 任意の FD が書き込み可能になるまで待つ。
 pub fn wait_writable_fd(fd: RawFd) -> WritableFd {
-    WritableFd { fd }
+    WritableFd {
+        fd,
+        registered: false,
+    }
 }
