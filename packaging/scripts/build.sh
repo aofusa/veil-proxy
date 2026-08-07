@@ -251,9 +251,13 @@ if [[ "${USE_DOCKER}" -eq 1 && "${RPM_ONLY_INTERNAL}" -eq 0 && "${DEB_ONLY_INTER
 
     echo "==> Packaging in Docker (ubuntu:24.04)"
     rel_binary="${BINARY_PATH#"${ROOT}/"}"
+    # RUST_TARGET はコンテナ内の build.sh でも deb_arch/rpm_arch の導出に必要
+    # （渡さないとホストの uname -m に落ちて、aarch64 バイナリが amd64/x86_64 名の
+    #  deb/rpm として出力され、既存の x86_64 パッケージを上書きしてしまう）。
     docker run --rm \
         -v "${ROOT}:/src" \
         -w /src \
+        -e RUST_TARGET="${GNU_TARGET}" \
         ubuntu:24.04 bash -c "
             set -euo pipefail
             export DEBIAN_FRONTEND=noninteractive
@@ -319,6 +323,7 @@ build_deb() {
         docker run --rm \
             -v "${ROOT}:/src" \
             -w /src \
+            -e RUST_TARGET="${GNU_TARGET}" \
             ubuntu:24.04 bash -c "
                 set -euo pipefail
                 export DEBIAN_FRONTEND=noninteractive
@@ -344,11 +349,13 @@ build_rpm_tree() {
     mkdir -p "${rpm_top}/BUILD" "${rpm_top}/BUILDROOT" "${rpm_top}/RPMS" "${rpm_top}/SRPMS" "${rpm_top}/SPECS"
     cp "${PKG_ROOT}/rpm/veil.spec" "${rpm_top}/SPECS/veil.spec"
 
+    # --target はクロスアーキ時に必須（x86_64 ホストで BuildArch: aarch64 の spec を
+    # ビルドすると rpmbuild が "No compatible architectures found for build" で失敗する）。
     rpmbuild -bb "${rpm_top}/SPECS/veil.spec" \
+        --target "${RPM_ARCH}" \
         --define "_topdir ${rpm_top}" \
         --define "_sourcedir ${rpm_top}/SOURCES" \
-        --define "veil_version ${VERSION}" \
-        --define "veil_arch ${RPM_ARCH}"
+        --define "veil_version ${VERSION}"
 }
 
 build_rpm() {
@@ -362,6 +369,7 @@ build_rpm() {
         docker run --rm \
             -v "${ROOT}:/src" \
             -w /src \
+            -e RUST_TARGET="${GNU_TARGET}" \
             ubuntu:24.04 bash -c "
                 set -euo pipefail
                 export DEBIAN_FRONTEND=noninteractive

@@ -17,6 +17,11 @@
 #     すでにユニットテストは実行されているため、aarch64 版では省略する）
 #   - ランタイムステージのベースイメージに `--platform=linux/arm64` を指定
 
+# ランタイムステージの --platform 用（FROM で参照する ARG は最初の FROM より前に
+# 宣言する必要がある。定数の直書きは BuildKit の FromPlatformFlagConstDisallowed lint に
+# 触れるため ARG 経由にする。既定値は常に linux/arm64）。
+ARG RUNTIME_PLATFORM=linux/arm64
+
 # ==========================================
 # 1. 最小設定ファイルやツールを用意する共通ステージ
 # ==========================================
@@ -115,7 +120,8 @@ RUN find src -name '*.rs' -exec touch {} + \
 # ==========================================
 # 4. 最終実行用ランタイム（distroless/base-nossl、arm64）
 # ==========================================
-FROM --platform=linux/arm64 gcr.io/distroless/base-nossl-debian13 AS runtime
+# --platform はファイル冒頭で宣言した RUNTIME_PLATFORM を使う
+FROM --platform=${RUNTIME_PLATFORM} gcr.io/distroless/base-nossl-debian13 AS runtime
 
 ARG RUST_TARGET=aarch64-unknown-linux-gnu
 ARG LIBC_VERSION=.2.28

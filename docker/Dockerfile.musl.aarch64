@@ -24,8 +24,10 @@
 # 1. 最小設定ファイルやツールを用意する共通ステージ
 # ==========================================
 # ビルダーは x86_64 ホストで実行する（--platform linux/arm64 での docker build 時にも
-# arm64 変種を pull しに行かないよう明示的に amd64 を指定する）
-FROM --platform=linux/amd64 messense/rust-musl-cross:aarch64-musl AS tool-builder
+# arm64 変種を pull しに行かないよう明示的に amd64 を指定する）。
+# 定数の直書きは BuildKit の FromPlatformFlagConstDisallowed lint に触れるため ARG 経由にする。
+ARG BUILDER_PLATFORM=linux/amd64
+FROM --platform=${BUILDER_PLATFORM} messense/rust-musl-cross:aarch64-musl AS tool-builder
 
 WORKDIR /app
 

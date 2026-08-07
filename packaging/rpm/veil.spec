@@ -4,7 +4,9 @@ Release:        1%{?dist}
 Summary:        High-performance reverse proxy server using io_uring and rustls
 License:        Apache-2.0 OR MIT
 URL:            https://github.com/aofusa/veil
-BuildArch:      %{veil_arch}
+# アーキテクチャは rpmbuild --target で指定する（build.sh が RPM_ARCH を渡す）。
+# BuildArch を併記すると x86_64 ホストでの aarch64 ビルドが
+# "No compatible architectures found for build" で失敗する。
 Requires:       openssl
 Requires:       systemd
 AutoReqProv:    no
