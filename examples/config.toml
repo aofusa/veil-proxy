@@ -2,6 +2,13 @@
 # High-Performance Reverse Proxy Server
 # 設定ファイル
 # ==========================================
+#
+# 補足: 以下のどのキーも、ファイルを編集せず起動時のコマンドラインから
+# `-o "path.to.key = value"`（`--override`、繰り返し指定可）で上書きできる
+# （F-143）。例: `veil -o "server.threads = 4"` や
+# `veil -o "[server].threads = 4"`（ブラケット記法も等価）。
+# 起動時・`-t` 検証時・SIGHUP によるホットリロード時のすべてに同じ上書きが
+# 適用される。構文の詳細は README.md / docs/readme/README.ja.md を参照。
 
 [server]
 listen = "127.0.0.1:443"

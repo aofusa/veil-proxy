@@ -272,6 +272,7 @@ Docker コンテナでのインストール・起動・curl 動作確認（両�
 > - **デフォルトフィーチャー**: `ktls`、`http2`、`mimalloc`
 > - **`full`**: 全フィーチャーを有効化（`ktls`、`http2`、`http3`、`grpc-full`、`wasm`、`compression`、`cache`、`metrics`、`websocket`、`rate-limit`、`buffering`、`mimalloc`）
 > - **`full-freebsd` / `full-openbsd` / `full-netbsd`**: `full` と機能セットは同一でアロケータのみ異なる BSD 向けセット。`full-freebsd` は **jemalloc** + **`aio`**（FreeBSD POSIX AIO、F-127）、`full-openbsd`/`full-netbsd` は**システムアロケータ**を使う。3 者とも `wasm` を含み、`full-openbsd`/`full-netbsd` は wasmtime の **Pulley インタープリタ**経由で動作する（B-52/B-55）。TLS はいずれも同梱構成（FreeBSD は rustls+aws_lc_rs、OpenBSD/NetBSD は rustls+ring。quiche は 3 者とも同梱 BoringSSL）。`full-freebsd-aarch64`/`full-openbsd-aarch64`/`full-netbsd-aarch64` も同構成のまま**引き続き `wasm` を含む**（B-55 解消）: NetBSD（全アーキ）・FreeBSD aarch64・OpenBSD aarch64 では `wasm` が crates.io wasmtime の代わりに vendoring 版 `third_party/wasmtime`（Pulley 専用、詳細は `third_party/wasmtime/README.veil.md`）を使う（crates.io wasmtime 40 がこの 3 ターゲットのシグナルハンドリングに対応していないため）。それ以外のプラットフォームは無影響で crates.io wasmtime のまま。cargo にターゲット別 default features が無いため、packaging のスクリプトが `--no-default-features` と併せて明示指定する（`packaging/scripts/build-cross.sh --target freebsd`、`tools/qemu/bsd-vm.sh <os> <arch> build|e2e`）。素の `--features full` の挙動は従来どおり変わらない。
+> - **`full-container`**（F-144）: `full` と機能セットは同一で、加えて `epoll` を有効化する。デフォルトの io_uring 完了ベースランタイム（`veil_rt_uring`）の代わりに、明示的に epoll ベースの readiness ランタイム（`veil_rt_reactor`、Linux 専用）を選ぶ。コンテナ・オーケストレーション環境（Docker/Kubernetes/gVisor 等）では seccomp プロファイルやコンテナランタイムのシステムコールエミュレーションにより io_uring がしばしばブロック・制限されるための対応。`default` は不変。`cargo build --features full-container`（アロケータも差し替えたい場合は `--no-default-features --features full-container` を併用）でビルドする。
 > - **アロケータフィーチャー**（`mimalloc`、`jemalloc`、`system-allocator`）は排他的 — 複数同時有効化不可
 > - HTTP/3 は UDP ベースのため kTLS と併用不可
 
@@ -299,8 +300,48 @@ Docker コンテナでのインストール・起動・curl 動作確認（両�
 |-----------|------|-----------|
 | `-c, --config <PATH>` | 設定ファイルのパス | `/etc/veil/config.toml` |
 | `-t, --test` | 設定ファイルの構文と内容を検証して終了（nginx -t 相当） | - |
+| `-o, --override <KEY=VALUE>` | config.toml の値をコマンドラインから上書き（繰り返し指定可、後述） | - |
 | `-h, --help` | ヘルプメッセージを表示 | - |
 | `-V, --version` | バージョン情報を表示 | - |
+
+### 設定の上書き（`-o`/`--override`）
+
+`config.toml` の任意のキーを、ファイルを編集せずコマンドラインから上書きできます。
+繰り返し指定可能（`-o` 1 個につき 1 個のオーバーライド）で、起動時・`-t` 検証時・
+**ホットリロード（SIGHUP）時のすべて** で同じグローバルなオーバーライド集合が適用される
+（設定ファイルを再パースするたびに同じ経路を通るため）。
+
+構文: `<path> = <toml-value>`（`=` 前後の空白は任意）。
+
+- `<path>` はドット区切りのキーパス（例: `server.threads`、`tls.cert_path`、
+  `http3.mmsg_batch_size`）。各セグメントは次のいずれか:
+  - 裸のキー: `[A-Za-z0-9_-]+`
+  - クオート文字列（`"..."` または `'...'`）: キー自体にドットを含む場合に使う
+  - 10 進数の配列インデックス（親が配列である場合のみ有効。例: `l4.0.listen`）
+  - 利便性のため、任意のセグメントを TOML のセクション記法風に `[ ]` で囲んでよい
+    （`[server].threads = 1` は `server.threads = 1` と等価。セグメント解釈前に
+    先頭の `[` と末尾の `]` を 1 個だけ取り除く）。
+- `<toml-value>` は TOML 値としてそのままパースする（`1`、`"str"`、`true`、`1.5`、
+  `[1, 2]`、`{ a = 1 }` などが使える）。クオート無しの裸の値が TOML 値として
+  パースできず、かつ `"`・`'`・`[`・`]`・`{`・`}` のいずれも含まない場合に限り、
+  1 回だけ文字列リテラルとして再解釈する（これにより
+  `-o "tls.cert_path = /etc/veil/cert.pem"` のようにパスをクオート無しで書ける）。
+  これらの記号を含みながら TOML として不正な値はハードエラー（文字列への
+  暗黙フォールバックはしない）。
+
+```bash
+# スカラー値の上書き
+./veil -o "server.threads = 4"
+
+# ブラケット記法（[section].key）。上と等価
+./veil -o "[server].threads = 4"
+
+# クオート無しの文字列値
+./veil -o "tls.cert_path = /etc/veil/cert.pem"
+
+# 複数指定（配列インデックスを含む）
+./veil -o "server.threads = 4" -o "l4.0.listen = 0.0.0.0:9000"
+```
 
 ### 設定ファイルの検証
 

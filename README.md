@@ -277,6 +277,7 @@ See [packaging/README.md](packaging/README.md) for details (Docker build, postin
 > - **Default features**: `ktls`, `http2`, `mimalloc`
 > - **`full`**: enables everything (`ktls`, `http2`, `http3`, `grpc-full`, `wasm`, `compression`, `cache`, `metrics`, `websocket`, `rate-limit`, `buffering`, `mimalloc`)
 > - **`full-freebsd` / `full-openbsd` / `full-netbsd`**: same feature set as `full`, but with a different allocator — `full-freebsd` uses **jemalloc** and additionally enables **`aio`** (FreeBSD POSIX AIO, F-127); `full-openbsd`/`full-netbsd` use the **system allocator**. All three include `wasm`; `full-openbsd`/`full-netbsd` run it through wasmtime's **Pulley interpreter** (B-52/B-55). All three use vendored TLS (rustls+aws_lc_rs on FreeBSD, rustls+ring on OpenBSD/NetBSD; quiche+bundled BoringSSL on all three). `full-freebsd-aarch64` / `full-openbsd-aarch64` / `full-netbsd-aarch64` mirror these — also **with** `wasm` (B-55 resolved): on NetBSD (any arch), FreeBSD aarch64, and OpenBSD aarch64, `wasm` builds against a vendored `third_party/wasmtime` (Pulley-only, see `third_party/wasmtime/README.veil.md`) instead of crates.io wasmtime, since crates.io wasmtime 40 has no signal-handling support for these targets; every other platform is unaffected and keeps unmodified crates.io wasmtime. Cargo has no per-target default features, so the packaging scripts pass these explicitly with `--no-default-features` (`packaging/scripts/build-cross.sh --target freebsd`, `tools/qemu/bsd-vm.sh <os> <arch> build|e2e`). Plain `--features full` is unchanged.
+> - **`full-container`** (F-144): same feature set as `full`, plus `epoll` — an explicit epoll-based readiness runtime (`veil_rt_reactor`, Linux only) instead of the default io_uring completion-based runtime (`veil_rt_uring`). Intended for container/orchestration environments (Docker, Kubernetes, gVisor) where seccomp profiles or the container runtime's syscall emulation frequently block or restrict io_uring. `default` is unchanged; build with `cargo build --features full-container` (or `--no-default-features --features full-container` if you also want to swap the allocator).
 > - **Allocator features** (`mimalloc`, `jemalloc`, `system-allocator`) are mutually exclusive — enable at most one
 > - HTTP/3 is UDP-based and cannot be combined with kTLS
 
@@ -303,8 +304,49 @@ See [packaging/README.md](packaging/README.md) for details (Docker build, postin
 |--------|-------------|---------|
 | `-c, --config <PATH>` | Path to config file | `/etc/veil/config.toml` |
 | `-t, --test` | Test config file syntax and validity, then exit (nginx -t equivalent) | - |
+| `-o, --override <KEY=VALUE>` | Override a config.toml value from the command line (repeatable, see below) | - |
 | `-h, --help` | Show help message | - |
 | `-V, --version` | Show version information | - |
+
+### Configuration Override (`-o`/`--override`)
+
+Any key in `config.toml` can be overridden from the command line at load time, without
+editing the file. The option is repeatable (each `-o` supplies one override) and is
+applied on startup, on `-t` validation, **and** on hot reload (SIGHUP) — the same
+global override set is applied every time the config file is (re)parsed.
+
+Syntax: `<path> = <toml-value>` (spaces around `=` are optional).
+
+- `<path>` is a dotted key path, e.g. `server.threads`, `tls.cert_path`,
+  `http3.mmsg_batch_size`. Each segment is one of:
+  - a bare key: `[A-Za-z0-9_-]+`
+  - a quoted string (`"..."` or `'...'`), needed when a key itself contains a dot
+  - a decimal array index, used when the parent is an array, e.g. `l4.0.listen`
+  - for convenience, any segment may be wrapped TOML-section-style in square
+    brackets: `[server].threads = 1` is accepted and treated exactly like
+    `server.threads = 1` (a single leading `[` / trailing `]` is stripped before
+    the segment is interpreted).
+- `<toml-value>` is parsed as a TOML value (so `1`, `"str"`, `true`, `1.5`,
+  `[1, 2]`, `{ a = 1 }` all work as-is). If a bare, unquoted value fails to parse
+  as TOML **and** contains none of `"`, `'`, `[`, `]`, `{`, `}`, it is retried once
+  as a plain string literal — this lets you write
+  `-o "tls.cert_path = /etc/veil/cert.pem"` without quoting the path. Values that
+  contain those characters but still fail to parse as TOML are a hard error
+  (no silent string fallback).
+
+```bash
+# Override a scalar
+./veil -o "server.threads = 4"
+
+# Bracket ([section].key) form, equivalent to the above
+./veil -o "[server].threads = 4"
+
+# String value without quotes
+./veil -o "tls.cert_path = /etc/veil/cert.pem"
+
+# Multiple overrides, including an array index
+./veil -o "server.threads = 4" -o "l4.0.listen = 0.0.0.0:9000"
+```
 
 ### Configuration Validation
 

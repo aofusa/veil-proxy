@@ -90,6 +90,7 @@ pub mod simple_tls;
 pub mod tls_provider;
 
 pub mod config;
+pub mod config_override;
 pub mod tls_reload;
 pub use crate::config::*;
 pub mod fuzz_api;

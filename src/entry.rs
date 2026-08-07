@@ -66,6 +66,20 @@ pub fn run() {
     // コマンドライン引数を解析（--help, --version は clap が自動処理）
     let cli_args = CliArgs::parse();
 
+    // -o/--override をパースしてグローバルへ確定させる（設定ファイルを読む前に行う）。
+    // 起動時のみならずホットリロード（SIGHUP）・-t 検証も同じグローバル集合を通る
+    // （src/config_override.rs の apply_to_toml_str が単一チョークポイント）。
+    let overrides = cli_args
+        .overrides
+        .iter()
+        .map(|s| crate::config_override::ConfigOverride::parse(s))
+        .collect::<Result<Vec<_>, String>>()
+        .unwrap_or_else(|e| {
+            eprintln!("veil: invalid --override: {}", e);
+            std::process::exit(1);
+        });
+    crate::config_override::set_global_overrides(overrides);
+
     // 設定ファイルパスをグローバル変数に保存（ホットリロード用）
     CONFIG_PATH.store(Arc::new(cli_args.config.clone()));
     let config_path = cli_args.config;

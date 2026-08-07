@@ -1419,12 +1419,8 @@ pub struct UnveilPaths {
 #[cfg(target_os = "openbsd")]
 pub fn collect_unveil_paths(config_path: &Path) -> io::Result<UnveilPaths> {
     let config_str = fs::read_to_string(config_path)?;
-    let config: Config = toml::from_str(&config_str).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("TOML parse error: {}", e),
-        )
-    })?;
+    let config: Config = crate::config_override::apply_to_toml_str(&config_str)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     let mut read_only = vec![config_path.to_path_buf()];
     let mut read_write_create = Vec::new();
@@ -1497,12 +1493,8 @@ pub fn collect_macos_sandbox_paths(
     use crate::security::macos_sandbox::SandboxPaths;
 
     let config_str = fs::read_to_string(config_path)?;
-    let config: Config = toml::from_str(&config_str).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("TOML parse error: {}", e),
-        )
-    })?;
+    let config: Config = crate::config_override::apply_to_toml_str(&config_str)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     let mut static_roots = Vec::new();
     // `read_only` は wasm feature 有効時のみ変更されるため、mut 修飾を feature で分岐する
@@ -5599,12 +5591,10 @@ pub struct LoadedConfigWithoutTls {
 #[allow(clippy::disallowed_methods)]
 fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
     let config_str = fs::read_to_string(path)?;
-    let config: Config = toml::from_str(&config_str).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("TOML parse error: {}", e),
-        )
-    })?;
+    // ホットリロード時も --override は同じグローバル集合が適用される
+    // （src/config_override.rs の単一チョークポイント経由）。
+    let config: Config = crate::config_override::apply_to_toml_str(&config_str)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     // 設定ファイルのバリデーション
     validate_config(&config)?;
@@ -5755,12 +5745,8 @@ fn build_optimized_router(routes: &[Route]) -> Arc<routing::OptimizedRouter> {
 #[allow(clippy::disallowed_methods)]
 pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     let config_str = fs::read_to_string(path)?;
-    let config: Config = toml::from_str(&config_str).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("TOML parse error: {}", e),
-        )
-    })?;
+    let config: Config = crate::config_override::apply_to_toml_str(&config_str)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     // 設定ファイルのバリデーション
     validate_config(&config)?;
@@ -6013,12 +5999,8 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
 #[allow(clippy::disallowed_methods)]
 pub fn load_logging_config(path: &Path) -> io::Result<LoggingConfigSection> {
     let config_str = fs::read_to_string(path)?;
-    let config: Config = toml::from_str(&config_str).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("TOML parse error: {}", e),
-        )
-    })?;
+    let config: Config = crate::config_override::apply_to_toml_str(&config_str)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(config.logging)
 }
 
@@ -6327,6 +6309,24 @@ pub struct CliArgs {
     /// 設定ファイルの構文と内容を検証して終了（nginx -t 相当）
     #[arg(short = 't', long = "test")]
     pub test_config: bool,
+
+    /// config.toml の値をコマンドラインから上書きする（繰り返し指定可）。
+    ///
+    /// 構文: `<path> = <toml-value>`（`=` 前後の空白は任意）。
+    /// - `<path>` はドット区切りのキーパス（例: `server.threads`）。セグメントは
+    ///   裸のキー（`[A-Za-z0-9_-]+`）・クオート文字列（`"a.b"`/`'a.b'`、キーに
+    ///   ドットを含む場合用）・10 進数の配列インデックス（親が配列の場合。
+    ///   例: `l4.0.listen`）のいずれか。セクション記法風に `[server].threads = 1`
+    ///   のように先頭（または任意のセグメント）を `[ ]` で囲んでもよい。
+    /// - `<toml-value>` は TOML 値としてパースする（`1`、`"str"`、`true`、`1.5`、
+    ///   `[1, 2]`、`{ a = 1 }` 等）。クオート・角括弧・波括弧のいずれも含まない
+    ///   裸のトークンが TOML 値として不正な場合は文字列として扱う
+    ///   （例: `-o "tls.cert_path = /etc/veil/cert.pem"`）。
+    /// - 例: `-o "server.threads = 1" -o '[server].threads = 1'`
+    ///
+    /// 起動時のみならず SIGHUP によるホットリロード・`-t` 検証にも同じ内容が適用される。
+    #[arg(short = 'o', long = "override", value_name = "KEY=VALUE")]
+    pub overrides: Vec<String>,
 }
 
 /// 設定ファイルを検証（読み込みとバリデーションのみ、起動しない）
@@ -6346,14 +6346,10 @@ pub fn test_config_file(path: &Path) -> io::Result<()> {
         ));
     }
 
-    // TOMLパース
+    // TOMLパース（--override 適用込み。src/config_override.rs の単一チョークポイント）
     let config_str = std::fs::read_to_string(path)?;
-    let config: Config = toml::from_str(&config_str).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("TOML parse error: {}", e),
-        )
-    })?;
+    let config: Config = crate::config_override::apply_to_toml_str(&config_str)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     // 設定バリデーション
     validate_config(&config)?;

@@ -324,6 +324,29 @@ full-netbsd-aarch64 = [
     "l4-proxy",
 ]
 
+# コンテナ向けの全機能ビルド（F-144）
+# ---------------------------------------------------------------------------
+# `full` との違いは readiness ランタイム（epoll）を明示的に追加している点だけで、
+# 機能セット自体は同一。コンテナ環境（Docker/Kubernetes/gVisor 等）では seccomp
+# プロファイルや gVisor のシステムコールエミュレーションによって io_uring
+# （デフォルトの `veil_rt_uring`）が頻繁にブロックされるため、`epoll` feature で
+# `veil_rt_reactor`（epoll ベースの readiness ランタイム、Linux 専用）を明示的に
+# 選択できるようにする。default はこの feature を含まない（AGENTS.md の default
+# 不変則）。
+# ビルド方法: cargo build --features full-container
+full-container = [
+    "ktls", "http2", "http3",
+    "grpc-full", "wasm",
+    "opentelemetry",
+    "compression", "cache", "metrics",
+    "websocket", "rate-limit", "buffering",
+    "mimalloc",
+    "admin",
+    "access-log",
+    "l4-proxy",
+    "epoll",
+]
+
 [dependencies]
 # monoio 削除: カスタム io_uring 実装 (src/runtime/) に完全移行
 # rustls を直接使用（ハンドシェイク後に kTLS へオフロード）。
