@@ -99,6 +99,7 @@ AI エージェントおよびコントリビュータ向けの **最小指針**
 
 ### 注意事項
 - **コンパイル時の依存関係**: `entry.rs`/各モジュールは `http2` や `grpc`（もしくは `grpc-full`）feature が有効でないと、`send_grpc_trailers` の呼び出し箇所等でコンパイルエラーが発生します。そのため、ビルドやテストの際は必ず十分な feature（例：`--features "http2,grpc-full"` またはフルフィーチャー）を指定して実行してください。
+- **reactor バックエンドの E2E を必ず回すこと（F-145 の教訓）**: Linux の既定ビルドは io_uring バックエンド（`veil_rt_uring`）で、`src/runtime/reactor/` を **1 行もコンパイルしません**。reactor は BSD 全種・macOS・コンテナ向け `full-container` が使う本番経路であるため、`src/runtime/reactor/` に触れた場合は `VEIL_E2E_FEATURES="full,epoll" ./tests/e2e_setup.sh test` を必ず実行してください。F-145 では「最初の 1 リクエストでサーバがハングする」重篤な不具合が、単体 816 件・統合 53 件・E2E 541 件のすべてを通過しています（既定ビルドが当該コードを含まないため）。
 - **E2Eテスト**: E2Eテストは専用のバックエンド環境を起動する必要があります。手動で直接 `cargo test` を叩くとバックエンドへの接続ができずタイムアウトするため、必ず `./tests/e2e_setup.sh test` を使用して自動セットアップ・実行・クリーンアップを行ってください。また、ポート競合エラーが発生した場合は、`pkill -f veil` 等で残存プロセスを終了させてから再実行してください。
 
 ### 実行コマンド例
