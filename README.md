@@ -122,12 +122,20 @@ hot-path cost). The default is unchanged (Linux io_uring).
   (see `docs/backlog/bugs/B-49-...`, unresolved). Until that is fixed, build FreeBSD in the
   VM for both architectures. `aarch64-unknown-freebsd` is Rust Tier 3 (no prebuilt std) and
   must be built in the VM regardless.
-- **FreeBSD POSIX AIO (`--features aio`, F-127)**: opt-in build-time switch (FreeBSD only;
+- **FreeBSD POSIX AIO (`--features aio`, F-127)**: opt-in build-time switch, **not recommended**
+  (FreeBSD only;
   build.rs panics on other targets, same pattern as `epoll`). Replaces the default kqueue
   readiness `TcpStream::read`/`write` with `aio_read(2)`/`aio_write(2)` completion-based I/O,
   with completions delivered through the same kqueue loop via `EVFILT_AIO`
   (`aio_sigevent.sigev_notify = SIGEV_KEVENT`). Falls back to the readiness path per-call on
-  `EAGAIN` (AIO daemon pool/queue limits). Not part of `--features full`; see
+  `EAGAIN` (AIO daemon pool/queue limits). Not part of `--features full`, and **no longer part
+  of `full-freebsd` / `full-freebsd-aarch64` either (B-63)**: measured on FreeBSD 14.3 aarch64
+  it is strictly worse than the readiness path — POSIX AIO needs 3 syscalls per I/O
+  (submit + `aio_error` + `aio_return`) versus 1, costing 78% of small-response HTTP/1.1 TLS
+  throughput (105,520 vs 187,374 rps) and ~80% of small-response L4 TCP throughput
+  (37k vs 202k rps), with no measurable gain on large (54KB) responses — and it makes the
+  server stall completely under concurrent small HTTP/2 responses. See
+  `docs/backlog/bugs/B-63-freebsd-aio-h2-stall.md`,
   `docs/backlog/features/F-127-freebsd-aio.md` and
   `docs/artifacts/f127_freebsd_aio_design.md` for the design and verification notes.
 - **macOS (F-125/F-131)**: cross-built via Docker (`docker/Dockerfile.macos`,
@@ -276,7 +284,7 @@ See [packaging/README.md](packaging/README.md) for details (Docker build, postin
 > Key notes:
 > - **Default features**: `ktls`, `http2`, `mimalloc`
 > - **`full`**: enables everything (`ktls`, `http2`, `http3`, `grpc-full`, `wasm`, `compression`, `cache`, `metrics`, `websocket`, `rate-limit`, `buffering`, `mimalloc`)
-> - **`full-freebsd` / `full-openbsd` / `full-netbsd`**: same feature set as `full`, but with a different allocator — `full-freebsd` uses **jemalloc** and additionally enables **`aio`** (FreeBSD POSIX AIO, F-127); `full-openbsd`/`full-netbsd` use the **system allocator**. All three include `wasm`; `full-openbsd`/`full-netbsd` run it through wasmtime's **Pulley interpreter** (B-52/B-55). All three use vendored TLS (rustls+aws_lc_rs on FreeBSD, rustls+ring on OpenBSD/NetBSD; quiche+bundled BoringSSL on all three). `full-freebsd-aarch64` / `full-openbsd-aarch64` / `full-netbsd-aarch64` mirror these — also **with** `wasm` (B-55 resolved): on NetBSD (any arch), FreeBSD aarch64, and OpenBSD aarch64, `wasm` builds against a vendored `third_party/wasmtime` (Pulley-only, see `third_party/wasmtime/README.veil.md`) instead of crates.io wasmtime, since crates.io wasmtime 40 has no signal-handling support for these targets; every other platform is unaffected and keeps unmodified crates.io wasmtime. Cargo has no per-target default features, so the packaging scripts pass these explicitly with `--no-default-features` (`packaging/scripts/build-cross.sh --target freebsd`, `tools/qemu/bsd-vm.sh <os> <arch> build|e2e`). Plain `--features full` is unchanged.
+> - **`full-freebsd` / `full-openbsd` / `full-netbsd`**: same feature set as `full`, but with a different allocator — `full-freebsd` uses **jemalloc**; `full-openbsd`/`full-netbsd` use the **system allocator**. All three include `wasm`; `full-openbsd`/`full-netbsd` run it through wasmtime's **Pulley interpreter** (B-52/B-55). All three use vendored TLS (rustls+aws_lc_rs on FreeBSD, rustls+ring on OpenBSD/NetBSD; quiche+bundled BoringSSL on all three). `full-freebsd-aarch64` / `full-openbsd-aarch64` / `full-netbsd-aarch64` mirror these — also **with** `wasm` (B-55 resolved): on NetBSD (any arch), FreeBSD aarch64, and OpenBSD aarch64, `wasm` builds against a vendored `third_party/wasmtime` (Pulley-only, see `third_party/wasmtime/README.veil.md`) instead of crates.io wasmtime, since crates.io wasmtime 40 has no signal-handling support for these targets; every other platform is unaffected and keeps unmodified crates.io wasmtime. Cargo has no per-target default features, so the packaging scripts pass these explicitly with `--no-default-features` (`packaging/scripts/build-cross.sh --target freebsd`, `tools/qemu/bsd-vm.sh <os> <arch> build|e2e`). Plain `--features full` is unchanged.
 > - **`full-container`** (F-144): same feature set as `full`, plus `epoll` — an explicit epoll-based readiness runtime (`veil_rt_reactor`, Linux only) instead of the default io_uring completion-based runtime (`veil_rt_uring`). Intended for container/orchestration environments (Docker, Kubernetes, gVisor) where seccomp profiles or the container runtime's syscall emulation frequently block or restrict io_uring. `default` is unchanged; build with `cargo build --features full-container` (or `--no-default-features --features full-container` if you also want to swap the allocator).
 > - **Allocator features** (`mimalloc`, `jemalloc`, `system-allocator`) are mutually exclusive — enable at most one
 > - HTTP/3 is UDP-based and cannot be combined with kTLS

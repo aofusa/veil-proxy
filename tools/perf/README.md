@@ -48,6 +48,13 @@
 > HTTP/3 を計測できないため、`docker build -t local/h2load-h3:latest tools/perf/h2load-http3` で
 > ngtcp2/nghttp3/quictls 組み込みの h2load をビルドしてください。未ビルドの場合、http3 構成は
 > スキップされます（gRPC/WebSocket/その他は影響しません）。
+>
+> **Docker が無い環境（FreeBSD 等）で HTTP/3 を計測する場合**は、上記 QUIC 対応 h2load の
+> 代わりに veil 自身が依存する `quiche` クレートで実装した自前クライアント
+> `examples/h3load.rs`（`h2load` 互換の CLI・出力書式、`cargo build --release --example h3load
+> --features http3` でビルド）を使えます。`tools/perf/freebsd/run_perf_freebsd.sh` はこれを
+> 優先して使い（無ければ `h2load --h3` にフォールバック）、詳細は同スクリプトのヘッダコメントを
+> 参照してください。
 
 ---
 

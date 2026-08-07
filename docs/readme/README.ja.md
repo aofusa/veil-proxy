@@ -125,13 +125,20 @@ io_uring（独自実装ランタイム）と rustls を使用した高性能リ�
   （`docs/backlog/bugs/B-49-...`、未解決）。解決するまで FreeBSD は x86_64 / aarch64 とも
   VM 内ネイティブビルドを使う。`aarch64-unknown-freebsd` は Rust Tier 3
   （prebuilt std 無し）のため、いずれにせよ VM 内ビルド必須。
-- **FreeBSD POSIX AIO（`--features aio`、F-127）**: ビルド時オプトイン切替（FreeBSD 専用。
+- **FreeBSD POSIX AIO（`--features aio`、F-127）**: ビルド時オプトイン切替。**推奨しない**（FreeBSD 専用。
   他ターゲットで指定すると `epoll` と同様 build.rs がエラーにする）。既定の kqueue
   readiness 経路の代わりに `TcpStream::read`/`write` を `aio_read(2)`/`aio_write(2)` の
   完了通知ベースへ切り替える。完了は同じ kqueue ループへ `EVFILT_AIO`
   （`aio_sigevent.sigev_notify = SIGEV_KEVENT`）として届く。`EAGAIN`（AIO デーモンプール/
   キュー上限）時は当該 I/O だけ readiness 経路へフォールバックする。`--features full` には
-  含まれない。設計・検証結果は `docs/artifacts/f127_freebsd_aio_design.md` と
+  含まれず、**`full-freebsd` / `full-freebsd-aarch64` からも除外した（B-63）**: FreeBSD 14.3
+  aarch64 実測で readiness 経路より一貫して劣るため。POSIX AIO は 1 I/O あたり 3 syscall
+  （submit + `aio_error` + `aio_return`）を要し（readiness は 1）、小レスポンスの
+  HTTP/1.1 TLS で 105,520 rps 対 187,374 rps（**+77.6%**）、L4 TCP で約 37k 対約 202k rps と
+  大差がつく一方、54KB の大きなレスポンスでは有意差が無い。さらに HTTP/2 で小さな
+  レスポンスを高並行に返すとサーバが完全に停止する（B-63）。設計・検証結果は
+  `docs/backlog/bugs/B-63-freebsd-aio-h2-stall.md`、
+  `docs/artifacts/f127_freebsd_aio_design.md`、
   `docs/backlog/features/F-127-freebsd-aio.md` を参照。
 - **macOS（F-125/F-131）**: クロスビルドのみ対応。Docker（`docker/Dockerfile.macos`、
   `messense/cargo-zigbuild` ベース）でビルドする
@@ -271,7 +278,7 @@ Docker コンテナでのインストール・起動・curl 動作確認（両�
 > 主な注意点：
 > - **デフォルトフィーチャー**: `ktls`、`http2`、`mimalloc`
 > - **`full`**: 全フィーチャーを有効化（`ktls`、`http2`、`http3`、`grpc-full`、`wasm`、`compression`、`cache`、`metrics`、`websocket`、`rate-limit`、`buffering`、`mimalloc`）
-> - **`full-freebsd` / `full-openbsd` / `full-netbsd`**: `full` と機能セットは同一でアロケータのみ異なる BSD 向けセット。`full-freebsd` は **jemalloc** + **`aio`**（FreeBSD POSIX AIO、F-127）、`full-openbsd`/`full-netbsd` は**システムアロケータ**を使う。3 者とも `wasm` を含み、`full-openbsd`/`full-netbsd` は wasmtime の **Pulley インタープリタ**経由で動作する（B-52/B-55）。TLS はいずれも同梱構成（FreeBSD は rustls+aws_lc_rs、OpenBSD/NetBSD は rustls+ring。quiche は 3 者とも同梱 BoringSSL）。`full-freebsd-aarch64`/`full-openbsd-aarch64`/`full-netbsd-aarch64` も同構成のまま**引き続き `wasm` を含む**（B-55 解消）: NetBSD（全アーキ）・FreeBSD aarch64・OpenBSD aarch64 では `wasm` が crates.io wasmtime の代わりに vendoring 版 `third_party/wasmtime`（Pulley 専用、詳細は `third_party/wasmtime/README.veil.md`）を使う（crates.io wasmtime 40 がこの 3 ターゲットのシグナルハンドリングに対応していないため）。それ以外のプラットフォームは無影響で crates.io wasmtime のまま。cargo にターゲット別 default features が無いため、packaging のスクリプトが `--no-default-features` と併せて明示指定する（`packaging/scripts/build-cross.sh --target freebsd`、`tools/qemu/bsd-vm.sh <os> <arch> build|e2e`）。素の `--features full` の挙動は従来どおり変わらない。
+> - **`full-freebsd` / `full-openbsd` / `full-netbsd`**: `full` と機能セットは同一でアロケータのみ異なる BSD 向けセット。`full-freebsd` は **jemalloc**（`aio` は B-63 により既定から除外）、`full-openbsd`/`full-netbsd` は**システムアロケータ**を使う。3 者とも `wasm` を含み、`full-openbsd`/`full-netbsd` は wasmtime の **Pulley インタープリタ**経由で動作する（B-52/B-55）。TLS はいずれも同梱構成（FreeBSD は rustls+aws_lc_rs、OpenBSD/NetBSD は rustls+ring。quiche は 3 者とも同梱 BoringSSL）。`full-freebsd-aarch64`/`full-openbsd-aarch64`/`full-netbsd-aarch64` も同構成のまま**引き続き `wasm` を含む**（B-55 解消）: NetBSD（全アーキ）・FreeBSD aarch64・OpenBSD aarch64 では `wasm` が crates.io wasmtime の代わりに vendoring 版 `third_party/wasmtime`（Pulley 専用、詳細は `third_party/wasmtime/README.veil.md`）を使う（crates.io wasmtime 40 がこの 3 ターゲットのシグナルハンドリングに対応していないため）。それ以外のプラットフォームは無影響で crates.io wasmtime のまま。cargo にターゲット別 default features が無いため、packaging のスクリプトが `--no-default-features` と併せて明示指定する（`packaging/scripts/build-cross.sh --target freebsd`、`tools/qemu/bsd-vm.sh <os> <arch> build|e2e`）。素の `--features full` の挙動は従来どおり変わらない。
 > - **`full-container`**（F-144）: `full` と機能セットは同一で、加えて `epoll` を有効化する。デフォルトの io_uring 完了ベースランタイム（`veil_rt_uring`）の代わりに、明示的に epoll ベースの readiness ランタイム（`veil_rt_reactor`、Linux 専用）を選ぶ。コンテナ・オーケストレーション環境（Docker/Kubernetes/gVisor 等）では seccomp プロファイルやコンテナランタイムのシステムコールエミュレーションにより io_uring がしばしばブロック・制限されるための対応。`default` は不変。`cargo build --features full-container`（アロケータも差し替えたい場合は `--no-default-features --features full-container` を併用）でビルドする。
 > - **アロケータフィーチャー**（`mimalloc`、`jemalloc`、`system-allocator`）は排他的 — 複数同時有効化不可
 > - HTTP/3 は UDP ベースのため kTLS と併用不可

@@ -897,6 +897,16 @@ impl<A: IoBuf, B: IoBuf> Future for SendMsgFuture<A, B> {
 // ====================
 
 /// 読み取り可能まで待つ Future。
+///
+/// F-145: 確認用の `poll(2)` プローブは行わない。この Future の呼び出し元は
+/// 例外なく「非ブロッキング read/recv を試みて `EAGAIN`/`WouldBlock` を受け取った
+/// 直後」にのみこれを await する（try-first パターン、モジュール doc 参照。
+/// 呼び出し箇所監査は docs/backlog/features/F-145-hotpath-syscall-reduction.md）。
+/// そのため `poll(2)` は「ほぼ常に not-ready を返すだけの無駄な syscall」であり、
+/// 削除しても正しさは損なわれない: kqueue の `EV_ADD`／epoll のレベルトリガ登録は
+/// いずれも登録時点で fd が既に readable であれば直ちにイベントを報告するため、
+/// 「登録した瞬間に readable だった」ケースでも起床が失われることはなく、最悪でも
+/// イベントループが 1 ターン余分に回るだけで済む（ハングしない）。
 pub struct Readable<'a> {
     fd: RawFd,
     _marker: std::marker::PhantomData<&'a TcpStream>,
@@ -914,23 +924,15 @@ impl<'a> Future for Readable<'a> {
         if crate::runtime::executor::take_read_hint(self.fd) > 0 {
             return Poll::Ready(Ok(()));
         }
-        // POLLIN/EPOLLIN 相当を即座に確認するため 0 バイト peek は行わず、まず fd の
-        // readiness を epoll に問い合わせる（poll(2) を使い syscall 1 発で判定する）。
-        let mut pfd = libc::pollfd {
-            fd: self.fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
-        if ret > 0 && pfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
-            return Poll::Ready(Ok(()));
-        }
         register_read(self.fd, cx.waker().clone());
         Poll::Pending
     }
 }
 
 /// 書き込み可能まで待つ Future。
+///
+/// F-145: `Readable` と同じ理由で確認用の `poll(2)` プローブを行わない
+/// （呼び出し元は例外なく非ブロッキング write/send の `WouldBlock` 後にのみ await する）。
 pub struct Writable<'a> {
     fd: RawFd,
     _marker: std::marker::PhantomData<&'a TcpStream>,
@@ -940,15 +942,6 @@ impl<'a> Future for Writable<'a> {
     type Output = io::Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut pfd = libc::pollfd {
-            fd: self.fd,
-            events: libc::POLLOUT,
-            revents: 0,
-        };
-        let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
-        if ret > 0 && pfd.revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP) != 0 {
-            return Poll::Ready(Ok(()));
-        }
         register_write(self.fd, cx.waker().clone());
         Poll::Pending
     }
@@ -959,6 +952,10 @@ impl<'a> Future for Writable<'a> {
 // ====================
 
 /// 任意の FD が読み込み可能になるまで待つ Future。
+///
+/// F-145: `Readable` と同じ理由で確認用の `poll(2)` プローブを行わない
+/// （`wait_readable_fd` の全呼び出し元は非ブロッキング read/recv の `WouldBlock` 後にのみ
+/// await する。UDP の recv 系ループ・`offload` の io_uring 経路等）。
 pub struct ReadableFd {
     fd: RawFd,
 }
@@ -974,21 +971,14 @@ impl Future for ReadableFd {
         if crate::runtime::executor::take_read_hint(self.fd) > 0 {
             return Poll::Ready(Ok(()));
         }
-        let mut pfd = libc::pollfd {
-            fd: self.fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
-        if ret > 0 && pfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
-            return Poll::Ready(Ok(()));
-        }
         register_read(self.fd, cx.waker().clone());
         Poll::Pending
     }
 }
 
 /// 任意の FD が書き込み可能になるまで待つ Future。
+///
+/// F-145: `Writable` と同じ理由で確認用の `poll(2)` プローブを行わない。
 pub struct WritableFd {
     fd: RawFd,
 }
@@ -997,15 +987,6 @@ impl Future for WritableFd {
     type Output = io::Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut pfd = libc::pollfd {
-            fd: self.fd,
-            events: libc::POLLOUT,
-            revents: 0,
-        };
-        let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
-        if ret > 0 && pfd.revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP) != 0 {
-            return Poll::Ready(Ok(()));
-        }
         register_write(self.fd, cx.waker().clone());
         Poll::Pending
     }

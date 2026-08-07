@@ -9,8 +9,21 @@
 #
 # 実行場所 : FreeBSD ゲスト内・root
 # 前提     : pkg install nginx nghttp2 wrk-luajit curl
-#            （nginx は --with-http_v2_module / --with-http_v3_module / --with-stream 付き、
-#             h2load は QUIC 対応ビルドであること。FreeBSD 14.3 の公式 pkg は両方満たす）
+#            （nginx は --with-http_v2_module / --with-http_v3_module / --with-stream 付き）
+#
+# HTTP/3 計測（h3_file シナリオ）:
+#   FreeBSD の nghttp2 pkg の h2load は ngtcp2 非搭載で QUIC を計測できない（curl pkg も
+#   HTTP/3 非対応）。そのため veil 自身が依存する quiche クレートで作った自前クライアント
+#   `examples/h3load.rs`（`${REPO}/target/release/examples/h3load`）を優先して使う。
+#   事前にビルドしておくこと（FreeBSD の perf ビルドは
+#   `--no-default-features --features full-freebsd-aarch64` 等を使うため、example も同じ
+#   feature セットで揃える必要がある。http3 を含んでいれば良い）:
+#     cargo build --release --example h3load --no-default-features \
+#         --features full-freebsd-aarch64
+#   （x86_64 等 aarch64 以外の FreeBSD ターゲットでは、そのターゲット用の full-freebsd-*
+#    feature セットに読み替える。h3load 自体はどのターゲットでも http3 feature のみ要求）
+#   ビルド済みバイナリが無い場合は `h2load --h3` にフォールバックする（QUIC 非対応ビルドでは
+#   計測失敗になる点に注意。ログに警告を出す）。
 #
 # 公平化のためのルール:
 #   - veil / nginx とも **同じ 2 コア**（cpuset 0,1）に固定し、負荷生成側は
@@ -38,6 +51,9 @@ set -eu
 WORK="${WORK:-/tmp/veilperf}"
 REPO="${REPO:-$(cd "$(dirname "$0")/../../.." && pwd)}"
 VEIL_BIN="${VEIL_BIN:-${REPO}/target/release/veil}"
+# HTTP/3 (QUIC) 負荷生成: quiche ベースの自前クライアント（examples/h3load.rs）。
+# 無ければ measure() が h2load --h3 へフォールバックする（QUIC 非対応ビルドでは失敗する）。
+H3LOAD_BIN="${H3LOAD_BIN:-${REPO}/target/release/examples/h3load}"
 
 ITERATIONS="${ITERATIONS:-3}"
 DURATION="${DURATION:-15}"
@@ -401,6 +417,36 @@ run_h2load() {
         END { printf "%s\t%.2f\t%.3f\t%.3f\t%d", (rps==""?0:rps), mbps, p50, 0, (e==""?0:e) }'
 }
 
+# run_h3load <url> -> 同上（h3load.rs の固定書式を前提にパースする。h2load と違い
+# こちらは veil 自身の examples/h3load.rs が出力する書式なので構造が完全に既知）。
+run_h3load() {
+    url="$1"
+    total=$(( CONNECTIONS * 2000 ))
+    out=$(timeout $((DURATION * 4 + 60)) cpuset -l "${GEN_CPUS}" "${H3LOAD_BIN}" \
+            -t"${LOAD_THREADS}" -c"${CONNECTIONS}" -m 32 -n "${total}" "$url" 2>&1) || true
+    printf '%s\n' "$out" >> "${WORK}/logs/h3load.log"
+    printf '%s' "$out" | awk '
+        /^finished in/ {
+            rps = $4
+            bps = $6; sub(/B\/s,?$/,"",bps); mbps = bps*8/1024/1024
+        }
+        /^requests:/ {
+            failed=0; errored=0
+            for (i=1;i<=NF;i++) {
+                if ($i=="failed,")  failed=$(i-1)
+                if ($i=="errored,") errored=$(i-1)
+            }
+            e = failed + errored
+        }
+        /^time for request:/ { p50=lat($11); p99=lat($13) }
+        function lat(v) {
+            if (v ~ /us$/) { sub(/us$/,"",v); return v/1000 }
+            if (v ~ /ms$/) { sub(/ms$/,"",v); return v+0 }
+            if (v ~ /s$/)  { sub(/s$/,"",v);  return v*1000 }
+            return v+0 }
+        END { printf "%s\t%.2f\t%.3f\t%.3f\t%d", (rps==""?0:rps), mbps, p50, p99, (e==""?0:e) }'
+}
+
 # ---------------------------------------------------------------------------
 # シナリオ実行
 # ---------------------------------------------------------------------------
@@ -457,9 +503,18 @@ measure() {
     case "$1" in
         wrk)       run_wrk "$2" ;;
         h2load)    run_h2load "$2" ;;
-        # nghttp2 1.69 の h2load は `--h3`（= --alpn-list=h3 + QUIC 強制）。
-        # 旧 `--npn-list` は deprecated で QUIC を有効にしない。
-        h2load_h3) run_h2load "$2" --h3 ;;
+        h2load_h3)
+            # FreeBSD の nghttp2 pkg の h2load は ngtcp2 非搭載で QUIC を計測できないため、
+            # quiche ベースの自前クライアント h3load（examples/h3load.rs）を優先する。
+            # 未ビルドの場合のみ `h2load --h3`（= --alpn-list=h3 + QUIC 強制）へ
+            # フォールバックする（QUIC 非対応ビルドでは計測失敗になる）。
+            if [ -x "${H3LOAD_BIN}" ]; then
+                run_h3load "$2"
+            else
+                log "警告: ${H3LOAD_BIN} が無いため h2load --h3 にフォールバック（QUIC 非対応ビルドだと失敗する）"
+                run_h2load "$2" --h3
+            fi
+            ;;
     esac
 }
 

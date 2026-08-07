@@ -225,7 +225,15 @@ full-freebsd = [
     "compression", "cache", "metrics",
     "websocket", "rate-limit", "buffering",
     "jemalloc",
-    "aio",
+    # B-63 / F-145: `aio`（F-127 の POSIX AIO 経路）は **既定から外した**。
+    #   - 性能: aio_read/aio_write は「submit + aio_error + aio_return」で
+    #     1 I/O あたり 3 syscall を要し、readiness 経路（read/write 1 発）より遅い。
+    #     FreeBSD 14.3 aarch64 実測で小レスポンス HTTP/1.1 TLS が
+    #     105,520 → 187,374 rps（+77.6%）、L4 TCP が 37k → 202k rps。
+    #     54KB の大きな応答では有意差なし（21.5k 対 21.3k）＝利点が無い。
+    #   - 正しさ: HTTP/2 で小さな応答を高並行に返すとサーバが完全に停止する
+    #     （B-63。全スレッドが sleep のまま CPU を消費せず応答しなくなる）。
+    # feature 自体は残してあるので `--features aio` で従来どおり明示有効化できる。
     "admin",
     "access-log",
     "l4-proxy",
@@ -268,7 +276,15 @@ full-freebsd-aarch64 = [
     "compression", "cache", "metrics",
     "websocket", "rate-limit", "buffering",
     "jemalloc",
-    "aio",
+    # B-63 / F-145: `aio`（F-127 の POSIX AIO 経路）は **既定から外した**。
+    #   - 性能: aio_read/aio_write は「submit + aio_error + aio_return」で
+    #     1 I/O あたり 3 syscall を要し、readiness 経路（read/write 1 発）より遅い。
+    #     FreeBSD 14.3 aarch64 実測で小レスポンス HTTP/1.1 TLS が
+    #     105,520 → 187,374 rps（+77.6%）、L4 TCP が 37k → 202k rps。
+    #     54KB の大きな応答では有意差なし（21.5k 対 21.3k）＝利点が無い。
+    #   - 正しさ: HTTP/2 で小さな応答を高並行に返すとサーバが完全に停止する
+    #     （B-63。全スレッドが sleep のまま CPU を消費せず応答しなくなる）。
+    # feature 自体は残してあるので `--features aio` で従来どおり明示有効化できる。
     "admin",
     "access-log",
     "l4-proxy",
@@ -675,6 +691,15 @@ harness = false
 name = "wasm"
 harness = false
 required-features = ["wasm"]
+
+# h3load: ポータブル HTTP/3 (QUIC) 負荷生成ツール（examples/h3load.rs）。
+# FreeBSD 等 Docker の使えないプラットフォームに QUIC 対応の h2load 相当が無いため、
+# 既に依存している quiche クレートで自前クライアントを提供する（tools/perf/freebsd/ 用）。
+# quiche を直接使うため http3 が必要。無指定だと `--all-targets` で feature 無効時にも
+# 展開され `unresolved module quiche` になる（上の bench "http3" と同じ理由）。
+[[example]]
+name = "h3load"
+required-features = ["http3"]
 
 # HTTP/3 用 QUIC 実装（Cloudflare quiche）ターゲット別設定
 # Linux は default-features = false で aws-lc-sys と共有（memfd 経由の従来経路、F-136で不変）

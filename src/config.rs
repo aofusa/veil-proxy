@@ -3918,12 +3918,16 @@ pub enum Backend {
         Option<Arc<Vec<String>>>,
     ),
     /// SendFile バックエンド
-    /// - Arc<PathBuf>: ベースパス
+    /// - Arc<PathBuf>: ベースパス（設定に書かれた原形。パストラバーサル検査の
+    ///   フォールバック・capsicum のルート照合キーとして使う）
     /// - bool: ディレクトリかどうか
     /// - Option<Arc<str>>: インデックスファイル名（None = "index.html"）
     /// - Arc<SecurityConfig>: ルートごとのセキュリティ設定
     /// - Arc<cache::CacheConfig>: キャッシュ設定
     /// - Option<Arc<cache::OpenFileCacheConfig>>: OpenFileCache設定（ルーティングごと）
+    /// - Option<Arc<Path>>: base_path の canonical 形（F-145、`load_backend` で
+    ///   config ロード時に一度だけ解決。ディレクトリルートでのみ Some になり得る。
+    ///   解決失敗時は None＝リクエスト時は生の base_path へフォールバック）
     SendFile(
         Arc<PathBuf>,
         bool,
@@ -3931,6 +3935,7 @@ pub enum Backend {
         Arc<SecurityConfig>,
         Arc<cache::CacheConfig>,
         Option<Arc<cache::OpenFileCacheConfig>>,
+        Option<Arc<Path>>,
         /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
         Option<Arc<Vec<String>>>,
     ),
@@ -3957,7 +3962,7 @@ impl Backend {
         match self {
             Backend::Proxy(_, security, _, _, _, _) => security,
             Backend::MemoryFile(_, _, security, _) => security,
-            Backend::SendFile(_, _, _, security, _, _, _) => security,
+            Backend::SendFile(_, _, _, security, _, _, _, _) => security,
             Backend::Redirect(_, _, _, _) => &DEFAULT_SECURITY,
         }
     }
@@ -3969,7 +3974,7 @@ impl Backend {
         match self {
             Backend::Proxy(_, _, _, _, _, modules) => modules.as_ref(),
             Backend::MemoryFile(_, _, _, modules) => modules.as_ref(),
-            Backend::SendFile(_, _, _, _, _, _, modules) => modules.as_ref(),
+            Backend::SendFile(_, _, _, _, _, _, _, modules) => modules.as_ref(),
             Backend::Redirect(_, _, _, modules) => modules.as_ref(),
         }
     }
@@ -3978,7 +3983,7 @@ impl Backend {
         match self {
             Backend::Proxy(_, _, _, _, _, modules) => modules.as_deref().map(|v| v.as_slice()),
             Backend::MemoryFile(_, _, _, modules) => modules.as_deref().map(|v| v.as_slice()),
-            Backend::SendFile(_, _, _, _, _, _, modules) => {
+            Backend::SendFile(_, _, _, _, _, _, _, modules) => {
                 modules.as_deref().map(|v| v.as_slice())
             }
             Backend::Redirect(_, _, _, modules) => modules.as_deref().map(|v| v.as_slice()),
@@ -6175,15 +6180,47 @@ pub fn load_backend(
                         modules_arc.clone(),
                     ))
                 }
-                "sendfile" | "" => Ok(Backend::SendFile(
-                    Arc::new(PathBuf::from(path)),
-                    is_dir,
-                    index_file,
-                    security,
-                    cache,
-                    open_file_cache_arc,
-                    modules_arc.clone(),
-                )),
+                "sendfile" | "" => {
+                    // F-145: ディレクトリルートの封じ込め検査（starts_with 比較）に使う
+                    // base_path の canonical 形を、config ロード時（cold path）に一度だけ
+                    // 解決しておく。従来はリクエストごとに
+                    // `cache::get_file_info_with_config(base_path, ...)` を再実行しており
+                    // （`open_file_cache` 無効時は canonicalize + metadata の再実行＝
+                    // `__realpathat`/`fstatat`/offload スレッド往復）、この解決は
+                    // 設定に対して不変なため無駄だった（DTrace 実測: F-145 チケット参照）。
+                    //
+                    // 失敗時（起動時点でディレクトリが未作成等）は今日の挙動を維持する:
+                    // 起動を失敗させず、生の base_path へフォールバックする（
+                    // `cache::sendfile_base_contains` 参照。運用上ディレクトリが後から
+                    // 作られても動作し続ける）。理由付き allow: cold path（設定ロード時）
+                    // のみで、ホットパスには一切現れない。
+                    #[allow(clippy::disallowed_methods)]
+                    let canonical_base: Option<Arc<Path>> = if is_dir {
+                        match Path::new(path).canonicalize() {
+                            Ok(c) => Some(Arc::from(c.as_path())),
+                            Err(e) => {
+                                warn!(
+                                    "File ルート {:?} の起動時 canonicalize に失敗（\
+                                     リクエスト時は生パスへフォールバック）: {}",
+                                    path, e
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    Ok(Backend::SendFile(
+                        Arc::new(PathBuf::from(path)),
+                        is_dir,
+                        index_file,
+                        security,
+                        cache,
+                        open_file_cache_arc,
+                        canonical_base,
+                        modules_arc.clone(),
+                    ))
+                }
                 _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid mode")),
             }
         }

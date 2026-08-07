@@ -1740,6 +1740,7 @@ async fn h2_dispatch(
             security,
             _cache,
             open_file_cache_config,
+            canonical_base,
             _,
         ) => {
             h2_sendfile(
@@ -1752,6 +1753,7 @@ async fn h2_dispatch(
                 &route_compression,
                 client_encoding,
                 open_file_cache_config.as_deref(),
+                canonical_base.as_deref(),
                 #[cfg(feature = "wasm")]
                 &wasm_modules_to_apply,
                 resp_tx,
@@ -2939,6 +2941,7 @@ async fn h2_sendfile(
     compression: &CompressionConfig,
     client_encoding: AcceptedEncoding,
     open_file_cache_config: Option<&cache::OpenFileCacheConfig>,
+    canonical_base: Option<&Path>,
     #[cfg(feature = "wasm")] wasm_modules: &Arc<Vec<String>>,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
@@ -2984,17 +2987,12 @@ async fn h2_sendfile(
     };
 
     // ディレクトリルートの場合は base_path からの canonical パス封じ込め検査。
-    if is_dir {
-        if let Some(base_info) =
-            cache::get_file_info_with_config(base_path, open_file_cache_config).await
-        {
-            if !file_info
-                .canonical_path
-                .starts_with(&base_info.canonical_path)
-            {
-                return h2_emit_error(resp_tx, notify, 403, b"Forbidden").await;
-            }
-        }
+    // F-145: base_path 側の解決はリクエストごとに再実行せず、config ロード時に
+    // 一度だけ解決済みの canonical_base を使う（`cache::sendfile_base_contains` 参照）。
+    if is_dir
+        && !cache::sendfile_base_contains(&file_info.canonical_path, canonical_base, base_path)
+    {
+        return h2_emit_error(resp_tx, notify, 403, b"Forbidden").await;
     }
 
     // ディレクトリの場合はインデックスファイルを解決する。
@@ -5378,6 +5376,7 @@ async fn handle_backend(
             security,
             _cache,
             open_file_cache_config,
+            canonical_base,
             _,
         ) => {
             // Range ヘッダーを抽出 (RFC 7233)
@@ -5396,6 +5395,7 @@ async fn handle_backend(
                 &security,
                 range_header,
                 open_file_cache_config.as_deref(),
+                canonical_base.as_deref(),
                 wasm_modules,
             )
             .await
@@ -10419,6 +10419,7 @@ async fn handle_sendfile(
     security: &SecurityConfig,
     range_header: Option<&[u8]>, // RFC 7233 Range header support
     open_file_cache_config: Option<&cache::OpenFileCacheConfig>, // OpenFileCache設定（ルーティングごと）
+    canonical_base: Option<&Path>, // base_path の canonical 形（F-145、config ロード時に一度だけ解決）
     wasm_modules: Arc<Vec<String>>,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // --- パス解決ロジック（Nginx風） ---
@@ -10498,20 +10499,15 @@ async fn handle_sendfile(
     };
 
     // ディレクトリの場合はセキュリティチェック
-    if is_dir {
-        // ベースパスのキャッシュ情報も取得（頻繁にアクセスされるため）
-        if let Some(base_info) =
-            cache::get_file_info_with_config(base_path, open_file_cache_config).await
-        {
-            if !file_info
-                .canonical_path
-                .starts_with(&base_info.canonical_path)
-            {
-                let err_buf = ERR_MSG_FORBIDDEN.to_vec();
-                let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
-                return Some((tls_stream, 403, 0, true));
-            }
-        }
+    // F-145: base_path 側の canonicalize/metadata はリクエストごとに再実行せず、
+    // config ロード時に一度だけ解決済みの canonical_base を使う
+    // （`cache::sendfile_base_contains` 参照）。
+    if is_dir
+        && !cache::sendfile_base_contains(&file_info.canonical_path, canonical_base, base_path)
+    {
+        let err_buf = ERR_MSG_FORBIDDEN.to_vec();
+        let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+        return Some((tls_stream, 403, 0, true));
     }
 
     // ディレクトリの場合はインデックスファイルを試す

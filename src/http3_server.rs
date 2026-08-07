@@ -1701,7 +1701,7 @@ impl Http3Handler {
                     (200, data.len())
                 }
             }
-            Backend::SendFile(base_path, is_dir, index_file, security, _cache, _, _) => self
+            Backend::SendFile(base_path, is_dir, index_file, security, _cache, _, _, _) => self
                 .handle_sendfile(SendFileRequest {
                     stream_id,
                     base_path: &base_path,

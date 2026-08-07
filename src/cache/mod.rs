@@ -60,6 +60,46 @@ pub use entry::{CacheEntry, CacheStorage};
 pub use key::CacheKey;
 pub use policy::{CacheControl, CachePolicy, VaryResult};
 
+/// ディレクトリルート File バックエンドの封じ込め検査（F-145）。
+///
+/// 従来は毎リクエスト `get_file_info_with_config(base_path, ...)` をもう一度呼び、
+/// その `canonical_path` と比較していた（`open_file_cache` 無効時は
+/// `canonicalize`/`metadata` の再実行＝ `__realpathat`/`fstatat`/offload スレッド
+/// 往復が 1 リクエストあたり追加で発生していた）。base_path はロード中の設定に対して
+/// 不変なので、`canonical_base`（config ロード時に一度だけ解決した canonical 形、
+/// `config::load_backend` 参照）を使い回すことでこの往復を排除する。
+///
+/// - `canonical_base` が `Some`: 事前解決済みの canonical パスと比較する
+///   （挙動は解決前と同一）。
+/// - `canonical_base` が `None`（load 時の解決失敗。ディレクトリ未作成等）:
+///   生の `base_path` と比較する。`full_path` は常に `base_path` を起点に
+///   join して構築されるため、この比較は恒真（許可）になる。従来もこの場合は
+///   base 情報取得自体が失敗して封じ込め検査をスキップ（実質許可）していたため、
+///   結果として同じ「許可」に帰着する（起動後にディレクトリが作成される運用でも
+///   動作し続ける）。
+///
+/// FreeBSD capability mode（`cap_enter`、F-123）が有効な間は、実際のパストラバーサル
+/// 封じ込めは dirfd 相対 `openat`/`fstatat` の `O_RESOLVE_BENEATH` が担う。この経路では
+/// `file_info.canonical_path` 自体が生パス（`full_path` そのもの）になるため、
+/// `full_path` が常に `base_path` の join で構築される以上この比較は必ず真になる
+/// （cap_enter 前と同じ「常に許可」という結果は変わらない）。よって
+/// `security::capsicum::static_serving_active()`（追加 syscall 無しの atomic load）が
+/// true の間は比較そのものを省略できる。`cache` feature の有無に依存しないため
+/// feature ゲート外（このファイル）に置く。
+#[inline]
+pub fn sendfile_base_contains(
+    file_canonical_path: &std::path::Path,
+    canonical_base: Option<&std::path::Path>,
+    base_path: &std::path::Path,
+) -> bool {
+    #[cfg(target_os = "freebsd")]
+    if crate::security::capsicum::static_serving_active() {
+        return true;
+    }
+    let base = canonical_base.unwrap_or(base_path);
+    file_canonical_path.starts_with(base)
+}
+
 // cache feature 有効時のみ公開
 #[cfg(feature = "cache")]
 pub use disk::DiskCache;
