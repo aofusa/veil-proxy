@@ -5,7 +5,7 @@
 ## 事象
 
 FreeBSD 14.3 arm64（QEMU/HVF on Apple Silicon、4 vCPU / サーバ 2 コア固定）で
-`--features aio` を含むビルド（`full-freebsd-aarch64`、**従来の既定**）を使い、
+`--features aio` を含むビルド（`full-freebsd`、**従来の既定**）を使い、
 静的ファイル（3 バイト）を HTTP/2 over TLS で高並行に取得すると、veil が
 **応答を返さなくなり、そのまま復帰しない**。
 
@@ -62,7 +62,7 @@ readiness 経路（`read`/`write` 1 発）より高コストである。DTrace �
 
 ## 対応
 
-`Cargo.toml` の `full-freebsd` / `full-freebsd-aarch64` から `"aio"` を除外した
+`Cargo.toml` の `full-freebsd` / `full-freebsd` から `"aio"` を除外した
 （F-145 と同じ変更にて）。feature 自体は残しているため、`--features aio` で
 従来どおり明示的に有効化はできる。
 
@@ -84,6 +84,6 @@ readiness 経路（`read`/`write` 1 発）より高コストである。DTrace �
 
 ```bash
 # FreeBSD ゲスト内
-cargo build --release --no-default-features --features full-freebsd-aarch64,aio
+cargo build --release --no-default-features --features full-freebsd,aio
 sh tools/perf/freebsd/run_perf_freebsd.sh -r 1 -d 10 -p /small.html h2_file_tls
 ```

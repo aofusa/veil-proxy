@@ -5,7 +5,7 @@
 ## 事象
 
 FreeBSD 14.3 arm64（実機、QEMU/HVF on Apple Silicon）で `tests/e2e_setup.sh test`
-（`--no-default-features --features full-freebsd-aarch64`）を実行すると、542 テスト中
+（`--no-default-features --features full-freebsd`）を実行すると、542 テスト中
 540 が pass、次の 2 件が fail する。
 
 1. `test_error_handling_oversized_header`
@@ -54,7 +54,7 @@ QUIC のハンドシェイク/フロー制御のどこかでデッドロック�
 ## 切り分け済みの事実
 
 - WASM とは無関係（本テストは wasm フィルタを経由しない経路）。
-- B-55（wasm vendoring）の変更前から存在していた潜在問題で、`full-freebsd-aarch64`
+- B-55（wasm vendoring）の変更前から存在していた潜在問題で、`full-freebsd`
   で E2E を実機で回したのが今回（2026-08-06）が初めてだったため今回顕在化した。
 - 他プラットフォームの同テストは pass する（NetBSD x86_64 のフル E2E でも本テストは
   失敗していない）。
@@ -75,5 +75,5 @@ QUIC のハンドシェイク/フロー制御のどこかでデッドロック�
 
 - B-50（FreeBSD の HTTP/3 UDP バインド問題）
 - B-55（wasmtime が BSD の一部プラットフォームをサポートしていない件。本チケットの
-  発見は B-55 で追加した `full-freebsd-aarch64` の実機 E2E 実行が契機）
+  発見は B-55 で追加した `full-freebsd` の実機 E2E 実行が契機）
 - F-140（NetBSD 対応。BSD 系プラットフォームの実機検証プロジェクトの一環）

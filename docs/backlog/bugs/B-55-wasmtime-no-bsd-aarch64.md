@@ -1,5 +1,18 @@
 # B-55: wasmtime が BSD の一部プラットフォームをサポートしておらず `full-*` の一部がビルドできない
 
+> **追記（2026-08-08）: `full-*bsd-aarch64` は廃止した。**
+> 本チケットで追加した `full-freebsd-aarch64` / `full-openbsd-aarch64` /
+> `full-netbsd-aarch64` は、中身が対応する `full-freebsd` / `full-openbsd` /
+> `full-netbsd` と**完全に同一**だった。vendoring 版 wasmtime（`veil-wasmtime`）の
+> 選択は feature ではなく **Cargo のターゲット別依存**
+> （`[target.'cfg(...)'.dependencies]`）で行っているため、feature セットを
+> アーキテクチャごとに分ける必要がそもそも無かったためである。
+> 現在は x86_64 / aarch64 とも `--features full-freebsd` 等をそのまま使う。
+> 本チケット中の feature 名は現行名（`-aarch64` 無し）へ書き換えてある
+> （セットの内容が同一のため、記録された検証結果はそのまま有効）。
+
+
+
 **状態: 対応済み（`third_party/wasmtime` vendoring + ターゲット別依存 + Pulley 強制で該当プラットフォームでも `wasm` を有効化、`feat/bsd-wasm-integration`）**
 
 **当初は「BSD × aarch64」のみの制約だと考えていたが、2026-07-29 の NetBSD 実機検証で
@@ -93,6 +106,10 @@ cargo は **feature セットを target 別に切り替えられない**（`[tar
 専用で features には効かない）ため、既存の `full-freebsd` / `full-openbsd` と同じく
 **プラットフォーム別の feature セットを明示指定する**方式にそろえた。
 
+（※ 以下は**当時の**feature 名で記す。`full-*bsd-aarch64` と `*-vendor` は
+いずれも現在は存在しない — 前者は本ページ冒頭の追記のとおり基底セットへ統合、
+後者は F-137 の撤回に伴い削除済み。）
+
 - `Cargo.toml` に `full-freebsd-aarch64` / `full-openbsd-aarch64`（それぞれ
   `full-freebsd` / `full-openbsd` から **`wasm` だけを除いたもの**）を追加。
 - `tools/qemu/bsd-vm.sh` の `_default_features()` が `ARCH=aarch64` のとき
@@ -131,8 +148,8 @@ OpenBSD aarch64）でも `wasm` を有効なまま使えるようにした。検
    `src/wasm/registry.rs` はこの cfg が立っているとき常に Pulley インタープリタを
    強制する（既存の OpenBSD 常時 Pulley 強制と統合）。ネイティブ JIT を生成しない
    ため、そもそもシグナルベース trap が不要という点は当初の分析どおり。
-4. `full-freebsd-aarch64` / `full-openbsd-aarch64` / `full-netbsd` /
-   `full-netbsd-aarch64` の 4 feature セットすべてに `wasm` を復活させた。
+4. `full-freebsd` / `full-openbsd` / `full-netbsd` /
+   `full-netbsd` の 4 feature セットすべてに `wasm` を復活させた。
 
 **適用範囲の限定**: Linux / Windows / macOS / FreeBSD x86_64 / OpenBSD x86_64 は
 crates.io の wasmtime 40.0.0 をソース・依存とも一切変えずそのまま使う
@@ -151,10 +168,10 @@ crates.io の wasmtime 40.0.0 をソース・依存とも一切変えずその�
 
 | ターゲット | feature set（wasm 込み） | 結果 |
 |---|---|---|
-| FreeBSD 14.3 arm64 | `full-freebsd-aarch64` | 成功 |
-| OpenBSD 7.9 arm64 | `full-openbsd-aarch64` | 成功（B-59 の `CFLAGS_aarch64_unknown_openbsd='-DOPENSSL_STATIC_ARMCAP -DOPENSSL_STATIC_ARMCAP_NEON'` が必要） |
+| FreeBSD 14.3 arm64 | `full-freebsd` | 成功 |
+| OpenBSD 7.9 arm64 | `full-openbsd` | 成功（B-59 の `CFLAGS_aarch64_unknown_openbsd='-DOPENSSL_STATIC_ARMCAP -DOPENSSL_STATIC_ARMCAP_NEON'` が必要） |
 | NetBSD 10.1 amd64 | `full-netbsd` | 成功（18分32秒） |
-| NetBSD 10.1 evbarm-aarch64 | `full-netbsd-aarch64` | 成功（B-59 の CFLAGS が必要） |
+| NetBSD 10.1 evbarm-aarch64 | `full-netbsd` | 成功（B-59 の CFLAGS が必要） |
 
 E2E（`tests/e2e_setup.sh test`）:
 

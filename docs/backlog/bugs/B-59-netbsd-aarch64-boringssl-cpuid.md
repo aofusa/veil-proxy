@@ -5,7 +5,7 @@
 ## 事象
 
 NetBSD 10.1 evbarm-aarch64（実機、QEMU/HVF on Apple Silicon）で
-`cargo build --release --no-default-features --features full-netbsd-aarch64`
+`cargo build --release --no-default-features --features full-netbsd`
 を実行すると、**リンク工程**で失敗する。
 
 ```
@@ -45,7 +45,7 @@ CFLAGS_aarch64_unknown_netbsd='-DOPENSSL_STATIC_ARMCAP -DOPENSSL_STATIC_ARMCAP_N
 
 `tools/qemu/bsd-vm.sh` の `_guest_env_prefix()` に netbsd × aarch64 のときだけ
 付与するよう組み込み済み（build / e2e の両方に効く）。これで
-`full-netbsd-aarch64`（wasm・http3 込み）のリリースビルドが成功することを実機で
+`full-netbsd`（wasm・http3 込み）のリリースビルドが成功することを実機で
 確認した。
 
 ## トレードオフ

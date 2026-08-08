@@ -5,7 +5,7 @@
 ## 事象
 
 NetBSD 10.1（実機 QEMU、x86_64・evbarm-aarch64 とも、`--no-default-features
---features full-netbsd`/`full-netbsd-aarch64`）で、WASM モジュールの**ロードは
+--features full-netbsd`/`full-netbsd`）で、WASM モジュールの**ロードは
 成功する**が、フィルタを**実行すると**必ず失敗する。
 
 ```
@@ -91,7 +91,7 @@ NetBSD x86_64 の E2E（`tests/e2e_setup.sh test`、`full-netbsd`）は `paxctl 
 | `paxctl +m` 適用前 | 507 passed / 35 failed（失敗 35 件は全て wasm テスト） |
 | `paxctl +m` 適用後 | 530 passed / 12 failed（残り 12 件は concurrent/stress 系 4 件・HTTP/3 系 7 件・rate limiting 1 件で、いずれも Docker ビルドと並走した高負荷下での実行が原因。wasm 単体テストは全て pass） |
 
-NetBSD evbarm-aarch64（`full-netbsd-aarch64`）は `TEST_FILTER=wasm_tests` で
+NetBSD evbarm-aarch64（`full-netbsd`）は `TEST_FILTER=wasm_tests` で
 `test result: ok. 23 passed; 0 failed; 519 filtered out`（`paxctl +m` 適用後、wasm 関連は全て pass）。
 
 ## 残課題

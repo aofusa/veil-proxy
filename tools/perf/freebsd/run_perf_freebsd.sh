@@ -16,12 +16,12 @@
 #   HTTP/3 非対応）。そのため veil 自身が依存する quiche クレートで作った自前クライアント
 #   `examples/h3load.rs`（`${REPO}/target/release/examples/h3load`）を優先して使う。
 #   事前にビルドしておくこと（FreeBSD の perf ビルドは
-#   `--no-default-features --features full-freebsd-aarch64` 等を使うため、example も同じ
+#   `--no-default-features --features full-freebsd` を使うため、example も同じ
 #   feature セットで揃える必要がある。http3 を含んでいれば良い）:
 #     cargo build --release --example h3load --no-default-features \
-#         --features full-freebsd-aarch64
-#   （x86_64 等 aarch64 以外の FreeBSD ターゲットでは、そのターゲット用の full-freebsd-*
-#    feature セットに読み替える。h3load 自体はどのターゲットでも http3 feature のみ要求）
+#         --features full-freebsd
+#   （feature セットはアーキ非依存なので x86_64 / aarch64 とも同じ名前でよい。
+#    h3load 自体はどのターゲットでも http3 feature のみ要求する）
 #   ビルド済みバイナリが無い場合は `h2load --h3` にフォールバックする（QUIC 非対応ビルドでは
 #   計測失敗になる点に注意。ログに警告を出す）。
 #

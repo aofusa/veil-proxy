@@ -79,7 +79,8 @@
 #                  qcow2 オーバーレイを作る（元イメージは変更しない）
 #   IMG            使用するディスクイメージのパス（既定 ${WORKDIR}/disk.qcow2）
 #   KEY            SSH 鍵（既定 ~/.ssh/veil_qemu_key）
-#   CARGO_FEATURES freature セット（既定: freebsd=full-freebsd / openbsd=full-openbsd。
+#   CARGO_FEATURES feature セット（既定: freebsd=full-freebsd / openbsd=full-openbsd /
+#                  netbsd=full-netbsd。アーキ非依存＝aarch64 でも同じ名前を使う。
 #                  いずれも --no-default-features 併用でアロケータを差し替える）
 #   CONSOLE_WAIT   1 で qemu がシリアルコンソール接続を待ってから起動する
 #                  （ブートローダのプロンプトを取り逃さない。provision で使用）
@@ -1163,13 +1164,15 @@ _guest_env_prefix() {
 #   full-netbsd  : full-openbsd と同一方針（システムアロケータ + 同梱 TLS）。
 # いずれも `--no-default-features` と併用する（default features の mimalloc を外すため）。
 # aarch64 も B-55 解消により wasm 込み（third_party/wasmtime = veil-wasmtime を使う）。
+# feature セットは **アーキテクチャ非依存**。以前は aarch64 用に
+# `full-*bsd-aarch64` を選んでいたが、中身が `full-*bsd` と完全同一だったため
+# Cargo.toml 側で廃止した（B-55 の wasmtime 切り替えは feature ではなく
+# ターゲット別依存で行っているため arch ごとに分ける必要が無い）。
 _default_features() {
-    local suffix=""
-    [[ "${ARCH}" == "aarch64" ]] && suffix="-aarch64"
     case "${OS_NAME}" in
-        freebsd) echo "full-freebsd${suffix}" ;;
-        openbsd) echo "full-openbsd${suffix}" ;;
-        netbsd) echo "full-netbsd${suffix}" ;;
+        freebsd) echo "full-freebsd" ;;
+        openbsd) echo "full-openbsd" ;;
+        netbsd) echo "full-netbsd" ;;
     esac
 }
 CARGO_FEATURES="${CARGO_FEATURES:-$(_default_features)}"

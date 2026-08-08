@@ -214,8 +214,17 @@ full = [
 # cargo にはターゲット別の default features が無いため、`full` からアロケータを
 # 差し替えたセットを別 feature として用意し、packaging のビルドスクリプト
 # （packaging/scripts/build-cross.sh・tools/qemu/bsd-vm.sh）が
-# `--no-default-features --features full-freebsd|full-openbsd` で明示指定する。
+# `--no-default-features --features full-freebsd|full-openbsd|full-netbsd` で明示指定する。
 # 通常の `--features full` は従来どおり mimalloc のままで挙動を変えない。
+#
+# **アーキテクチャ非依存**: 以前は aarch64 用に `full-freebsd-aarch64` /
+# `full-openbsd-aarch64` / `full-netbsd-aarch64` を別途用意していたが、中身は
+# 対応する `full-*bsd` と完全に同一だったため廃止した。B-55（NetBSD 全アーキ・
+# FreeBSD/OpenBSD の aarch64 で crates.io wasmtime がビルドできない問題）の切り替えは
+# **feature ではなくターゲット別依存**（下の `[target.'cfg(...)'.dependencies]` で
+# `wasmtime` と vendoring 版 `veil-wasmtime` を排他選択）で行っているため、
+# feature セットを arch ごとに分ける必要がそもそも無い。x86_64 でも aarch64 でも
+# `--features full-freebsd` 等をそのまま使う。
 
 # FreeBSD: mimalloc の代わりに jemalloc、加えて POSIX AIO 経路（F-127）を有効化する。
 full-freebsd = [
@@ -258,50 +267,6 @@ full-openbsd = [
     "l4-proxy",
 ]
 
-# BSD の **aarch64** 向け feature セット（B-55）。
-#
-# `full-freebsd` / `full-openbsd` と同じ機能セット（`wasm` 込み）。
-# crates.io wasmtime 40 のシグナルベーストラップ実装
-# （`src/runtime/vm/sys/unix/signals.rs`）には `(freebsd, aarch64)` /
-# `(openbsd, aarch64)` の分岐が無く `compile_error!("unsupported platform")` になるが、
-# `has_native_signals` は wasmtime 自身の build.rs が導出するため cargo feature では
-# 切り替えられない。そのため crates.io 版の代わりに `third_party/wasmtime`
-# （`veil-wasmtime`、B-55 解消）を使い、Pulley インタープリタ専用で実行することで
-# wasm を復活させた（`[target.*.dependencies]` でターゲット別に排他選択、
-# `src/wasm/registry.rs` が Pulley を強制。詳細は third_party/wasmtime/README.veil.md）。
-full-freebsd-aarch64 = [
-    "ktls", "http2", "http3",
-    "grpc-full", "wasm",
-    "opentelemetry",
-    "compression", "cache", "metrics",
-    "websocket", "rate-limit", "buffering",
-    "jemalloc",
-    # B-63 / F-145: `aio`（F-127 の POSIX AIO 経路）は **既定から外した**。
-    #   - 性能: aio_read/aio_write は「submit + aio_error + aio_return」で
-    #     1 I/O あたり 3 syscall を要し、readiness 経路（read/write 1 発）より遅い。
-    #     FreeBSD 14.3 aarch64 実測で小レスポンス HTTP/1.1 TLS が
-    #     105,520 → 187,374 rps（+77.6%）、L4 TCP が 37k → 202k rps。
-    #     54KB の大きな応答では有意差なし（21.5k 対 21.3k）＝利点が無い。
-    #   - 正しさ: HTTP/2 で小さな応答を高並行に返すとサーバが完全に停止する
-    #     （B-63。全スレッドが sleep のまま CPU を消費せず応答しなくなる）。
-    # feature 自体は残してあるので `--features aio` で従来どおり明示有効化できる。
-    "admin",
-    "access-log",
-    "l4-proxy",
-]
-
-full-openbsd-aarch64 = [
-    "ktls", "http2", "http3",
-    "grpc-full", "wasm",
-    "opentelemetry",
-    "compression", "cache", "metrics",
-    "websocket", "rate-limit", "buffering",
-    "system-allocator",
-    "admin",
-    "access-log",
-    "l4-proxy",
-]
-
 # NetBSD: OpenBSD をテンプレートに横展開した feature セット（F-140）。
 # NetBSD には pledge/unveil 相当のランタイム API が無く（`src/security.rs` の
 # `netbsd` モジュール参照）、veil が提供できるのは chroot(2) + 特権降格 + rlimit
@@ -325,31 +290,6 @@ full-netbsd = [
     "l4-proxy",
 ]
 
-# NetBSD の **aarch64** 向け feature セット（B-55）。`full-netbsd`（x86_64、こちらも
-# wasm 込み）と同一内容。NetBSD は x86_64/aarch64 の区別なく同じ扱いになる
-# （feature 名は互換性のため維持）。
-full-netbsd-aarch64 = [
-    "ktls", "http2", "http3",
-    "grpc-full", "wasm",
-    "opentelemetry",
-    "compression", "cache", "metrics",
-    "websocket", "rate-limit", "buffering",
-    "system-allocator",
-    "admin",
-    "access-log",
-    "l4-proxy",
-]
-
-# コンテナ向けの全機能ビルド（F-144）
-# ---------------------------------------------------------------------------
-# `full` との違いは readiness ランタイム（epoll）を明示的に追加している点だけで、
-# 機能セット自体は同一。コンテナ環境（Docker/Kubernetes/gVisor 等）では seccomp
-# プロファイルや gVisor のシステムコールエミュレーションによって io_uring
-# （デフォルトの `veil_rt_uring`）が頻繁にブロックされるため、`epoll` feature で
-# `veil_rt_reactor`（epoll ベースの readiness ランタイム、Linux 専用）を明示的に
-# 選択できるようにする。default はこの feature を含まない（AGENTS.md の default
-# 不変則）。
-# ビルド方法: cargo build --features full-container
 full-container = [
     "ktls", "http2", "http3",
     "grpc-full", "wasm",

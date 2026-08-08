@@ -192,6 +192,87 @@ main / feat/h2-multiplexing を各イメージ再ビルドの上で連続計測�
     接続チャーン）・B-45（L4 半クローズ未伝搬）・B-46（H3 content-length 重複）を検出・
     修正**し、修正後の再計測で全行 Non-2xx=0。`--net=host` + GSO/GRO の HTTP/3 参考値も追加。
 
+12. **FreeBSD ネイティブ計測（2026-08-07、F-145 / B-63）**: DTrace で 1 リクエスト約 20 syscall を実測し、`aio`（POSIX AIO）が 1 I/O あたり 3 syscall で readiness 経路より遅く、かつ HTTP/2 の小レスポンス高並行でサーバを完全停止させることを発見（`full-freebsd*` の既定から除外）。小レスポンスで HTTP/1.1 TLS +77.6%・L4 TCP 約 5.5 倍。HTTP/3 は自作 `examples/h3load.rs` で初めて計測可能になった。
+
+## FreeBSD ネイティブ計測（2026-08-07、F-145 / B-63）
+
+`tools/perf/` 本体は Docker 前提のため FreeBSD では動かない。専用ハーネス
+[`tools/perf/freebsd/run_perf_freebsd.sh`](../../tools/perf/freebsd/run_perf_freebsd.sh) を
+追加し、**ゲスト内 loopback で veil と nginx を同条件**（同じ 2 コアへ cpuset 固定・
+負荷生成は別 2 コア・アクセスログ双方オフ・proxy/L4 の上流は共通 nginx）で計測した。
+
+- 環境: FreeBSD 14.3-RELEASE aarch64（QEMU/HVF on Apple Silicon）、4 vCPU / 4GB、
+  サーバ 2 コア・負荷生成 2 コア、loopback
+- 比較対象: nginx 1.29（FreeBSD pkg、`--with-http_v2_module` / `--with-http_v3_module` /
+  `--with-stream`）
+- 負荷: HTTP/1.1 = wrk / HTTP/2・h2c = h2load / **HTTP/3 = 自作 `examples/h3load.rs`**
+  （FreeBSD の nghttp2 pkg の h2load は ngtcp2 非同梱、curl pkg も HTTP/3 非対応のため）
+- 配信ファイルは 54KB（バイト単価）と 3B（リクエスト単価）の 2 種
+
+### 環境の理論値（実測プリミティブから算出）
+
+| 項目 | 実測 |
+|---|---|
+| AES-128-GCM（OpenSSL、16KB ブロック、1 コア） | **7.80 GB/s** |
+| nginx 平文 h2c 54KB（2 コア） | 5.82 GB/s（106,700 rps） |
+| nginx TLS HTTP/1.1 54KB（2 コア） | 2.55 GB/s（46,800 rps） |
+| nginx TLS HTTP/1.1 3B（2 コア） | 384,000 rps |
+
+暗号処理は 2 コアで 15.6 GB/s 相当あり**ボトルネックにならない**。小さな応答では
+nginx が約 38〜42 万 rps に達しており、これが「1 リクエスト = read + write の 2 syscall」
+から見積もられる本環境の実務上の上限とほぼ一致する。
+
+### B-63: `aio`（F-127 の POSIX AIO 経路）が大幅な性能低下と停止を起こす
+
+DTrace（54KB 静的ファイル / HTTP/1.1 TLS / 約 174k リクエスト）で **1 リクエストあたり
+約 20 syscall**（nginx は 5〜6）を消費していることが判明した。内訳の一部:
+
+```
+openat 1, close 1, sendfile 1, write 2, __realpathat 2, fstatat 3,
+poll 1.7, kevent 0.74, _umtx_op 3.4,
+aio_read 1, aio_write 1, aio_error 2, aio_return 2   ← AIO だけで 6 syscall
+```
+
+POSIX AIO は 1 I/O あたり submit + `aio_error` + `aio_return` の **3 syscall** を要し、
+readiness 経路（`read`/`write` 1 発）より遅い。実測:
+
+| 計測（サーバ 2 コア固定） | `aio` あり | `aio` なし |
+|---|---|---|
+| HTTP/1.1 TLS・3 バイト | 105,520 rps | **187,374 rps（+77.6%）** |
+| HTTP/1.1 TLS・54KB | 21,540 rps | 21,291 rps（有意差なし） |
+| L4 TCP・3 バイト | 約 37,000 rps | **約 202,000 rps（約 5.5 倍）** |
+| HTTP/2 TLS・3 バイト（`-c32 -m16`） | **サーバが完全停止** | 148,679 rps・エラー 0 |
+
+大きな転送でも改善が無く、かつ HTTP/2 で停止するため、`full-freebsd` /
+`full-freebsd-aarch64` の既定から `aio` を除外した（B-63）。**これが本計測で得られた
+最大の改善**である。
+
+### 対 nginx 比（`aio` 除外後、同一反復内の比で評価）
+
+| シナリオ | 54KB | 3B |
+|---|---|---|
+| HTTP/1.1 TLS | 0.44 | 0.38 |
+| HTTP/2 TLS | 0.52 | 0.32 |
+| h2c 平文 | 0.52 | 0.30 |
+| HTTP/1.1 proxy | 0.72 | 0.68 |
+| HTTP/2 proxy | 0.94 | **1.77（veil が上回る）** |
+| L4 TCP | 0.61 | 0.83 |
+| HTTP/3 | 0.50（veil 5,869 / nginx 11,665 rps） | — |
+
+**HTTP/3 は syscall 律速ではない**: FreeBSD には `sendmmsg`/`recvmmsg`・UDP GSO が無く
+54KB あたり約 41 データグラムを個別に送るため上限は約 37,000 rps と見積もられるが、
+実測は veil・nginx とも**その 1/3〜1/6** に留まる。したがって FreeBSD の HTTP/3 の
+支配要因はデータグラム syscall ではなく **QUIC の暗号処理と輻輳制御**である
+（当初の想定を計測が否定した）。
+
+### 残存ボトルネック（未対応）
+
+静的配信の HTTP/2・HTTP/3 は**リクエストごとにファイル全体を `offload`
+（専用スレッドプール）経由で読み直している**（`src/proxy.rs` の `h2_sendfile`、
+`src/http3_server.rs` の `handle_sendfile`）。スレッド往復（DTrace の `_umtx_op`）+
+open/read/close + ファイル全体の `Vec` 確保が 1 リクエストごとに走る。
+HTTP/1.1 は `sendfile(2)`/kTLS のゼロコピー経路なのでこの問題が無い。→ F-146。
+
 ## 教訓（計測方針に反映済み）
 
 - **コンテナ（veth/bridge）では kTLS が不利**。feat 系構成は kTLS 既定オフ。
@@ -209,8 +290,47 @@ main / feat/h2-multiplexing を各イメージ再ビルドの上で連続計測�
   `/proc/net/tcp` の状態分布を確認する（B-44/B-45 の教訓）。
 - **git worktree から tools/perf を実行する場合、git 管理外の生成物
   （`docker/assets/ssl/*.pem` 等）を本体ツリーからコピーする**（F-116 A/B の教訓）。
+- **FreeBSD の kTLS は既定で無効**（`sysctl kern.ipc.tls.enable=1` が必要）。有効化しても
+  ユーザ空間 rustls より速いとは限らない（実測では kTLS 有効の方が 17% 遅かった: 21,175
+  対 24,753 rps）。計測前に `kern.ipc.tls.stats.sw.gcm` が増えているかで実際に kTLS
+  セッションが張られたかを確認する（F-145 の教訓）。
+- **QEMU/HVF 上の VM は連続計測でスループットが単調に劣化する**（実測: 同一バイナリで
+  18,217 → 15,153 → 12,845 rps）。A/B で「先に走った方が有利」という順序バイアスが
+  効果量と同オーダーになるため、**交互かつ短時間サンプルを多数取る**こと。本環境では
+  5〜10% の差は判定できない（F-145 の教訓）。
+- **reactor バックエンド（BSD/macOS/`full-container`）は Linux 既定ビルドで 1 行も
+  コンパイルされない**。`src/runtime/reactor/` を変更したら
+  `VEIL_E2E_FEATURES="full,epoll" ./tests/e2e_setup.sh test` を必ず回す。F-145 では
+  「最初の 1 リクエストでサーバがハングする」変更が単体 816 / 統合 53 / E2E 541 件の
+  **全テストを通過**した（AGENTS.md に明記済み）。
+- **計測は必ず静穏ホストで**。並行ビルド中の E2E は 415 passed / 127 failed になり、
+  静穏時は 541 passed / 1 failed だった（所要 822 秒 → 88 秒）。大量失敗を見たら
+  まず loadavg を疑う。
 
 ## 再現手順
+
+### FreeBSD ネイティブ計測
+
+```bash
+# 1) FreeBSD ゲストを起動してビルド（Apple Silicon macOS では HVF で実用速度）
+tools/qemu/bsd-vm.sh freebsd aarch64 up
+CARGO_FEATURES=full-freebsd-aarch64 tools/qemu/bsd-vm.sh freebsd aarch64 build
+
+# 2) HTTP/3 クライアント（FreeBSD には QUIC 対応 h2load が無いため必須）
+#    ゲスト内で:
+cargo build --release --example h3load --no-default-features \
+    --features full-freebsd-aarch64
+
+# 3) 計測（ゲスト内。nginx / wrk / nghttp2 が必要）
+pkg install -y nginx nghttp2 wrk-luajit
+sh tools/perf/freebsd/run_perf_freebsd.sh -r 3 -d 10                 # 54KB
+sh tools/perf/freebsd/run_perf_freebsd.sh -r 3 -d 10 -p /small.html  # 3B
+
+# ホスト（macOS）からは薄いラッパ経由でも実行できる
+bash tools/perf/freebsd/vmrun.sh -r 3 -d 10
+```
+
+### Docker ベース計測（Linux）
 
 ```bash
 docker build -f docker/Dockerfile.glibc -t veil:glibc --build-arg CARGO_FEATURES='full' .

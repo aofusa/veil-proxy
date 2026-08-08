@@ -188,17 +188,17 @@ native モードでの相違点（利用者から見て変わるのは主に「D
 | FreeBSD x86_64: `fetch` → `build-bsd.sh` | **成功**（`veil-0.6.0-x86_64-unknown-freebsd.tar.gz` を生成） |
 | FreeBSD x86_64: `e2e` | **532 passed / 1 failed**（B-50 修正後。HTTP/3 の 117 件失敗はすべて解消）。残り 1 件は実行ごとに変わる負荷起因フレーク（`oversized-header` 等）で、静かなホストでの単体実行では通る |
 | （E2E 全般） | `tests/e2e_setup.sh` の `run_tests` が cargo の終了コードを握り潰していた（最後の `log_info` の戻り値が返っていた）。上記 2 件はどちらも «成功» と報告されていた。修正済み |
-| FreeBSD aarch64: `build`（`full-freebsd-aarch64`）→ `e2e`（2026-08-06 実機） | **フルビルド + E2E 実行可能**。540 passed / 2 failed（542 件）。残り 2 件のうち `test_error_handling_oversized_header` は単独実行で pass（既知フレーキー）、`test_http3_large_request_body` は単独実行でも 60 秒タイムアウトで fail（B-61、未解決） |
+| FreeBSD aarch64: `build`（`full-freebsd`）→ `e2e`（2026-08-06 実機） | **フルビルド + E2E 実行可能**。540 passed / 2 failed（542 件）。残り 2 件のうち `test_error_handling_oversized_header` は単独実行で pass（既知フレーキー）、`test_http3_large_request_body` は単独実行でも 60 秒タイムアウトで fail（B-61、未解決） |
 | OpenBSD x86_64: `setup` → `provision`（autoinstall） | **成功**（`CONGRATULATIONS` → SSH 鍵認証で `OpenBSD 7.9 GENERIC.MP#449 amd64` へ到達） |
 | OpenBSD x86_64: `toolchain` | **成功**（cargo 1.94.1 / cmake 4.2.3 / GNU Make 4.4.1 / libprotoc 34.1 / llvm-19） |
 | OpenBSD x86_64: `build`（`full-openbsd`） | **成功**（71分56秒。ring + システムアロケータ + quiche/BoringSSL の http3 を含む） |
 | OpenBSD x86_64: `fetch` → `build-bsd.sh` | **成功**（`veil-0.6.0-x86_64-unknown-openbsd.tar.gz` を生成） |
 | OpenBSD x86_64: `e2e` | **530 passed / 3 failed・SIGSEGV なし**（B-51 / B-52 / B-53 / B-54 修正後。全 533 件が実行される）。残り 3 件はいずれもタイムアウト系の負荷起因フレークで、単体実行では 3 件とも通る |
 | OpenBSD x86_64: `e2e`（v0.6.0 最終） | **535 passed / 6 failed / 1 ignored**（F-132〜F-141 + B-56/B-57/B-58 反映後、全 542 件）。**失敗 6 件は単独実行で全て成功**（http3_cache 系 4 件 0.28s / buffering_spillover 0.10s / h2c_large_request_body 0.04s / oversized_request_line 0.24s）＝負荷起因フレークで機能欠陥なし。ignored 1 件は B-58（Pulley で WAF が QUIC idle timeout を超過）。**HTTP/3 + WASM 4 件は全て成功**（B-58 を ignore 化するまでは WAF が HTTP/3 ワーカーを占有して巻き添えにしていた） |
-| OpenBSD aarch64: `build`（`full-openbsd-aarch64`、wasm 込み） | **成功**（B-59 の `CFLAGS_aarch64_unknown_openbsd='-DOPENSSL_STATIC_ARMCAP -DOPENSSL_STATIC_ARMCAP_NEON'` が必要） |
+| OpenBSD aarch64: `build`（`full-openbsd`、wasm 込み） | **成功**（B-59 の `CFLAGS_aarch64_unknown_openbsd='-DOPENSSL_STATIC_ARMCAP -DOPENSSL_STATIC_ARMCAP_NEON'` が必要） |
 | OpenBSD aarch64: `e2e` | **`test result: ok. 541 passed; 0 failed; 1 ignored`（54.34s）**。wasm 関連テスト 36 件を含め全て pass |
 | NetBSD x86_64（F-140、2026-08-06 実機） | **フルビルド + E2E 実行可能**（`full-netbsd`、wasm 込み、18分32秒）。E2E は B-60 の `paxctl +m` 適用後 **530 passed / 12 failed**（適用前は 507 passed / 35 failed で 35 件は全て wasm テスト）。残り 12 件は concurrent/stress 系 4 件・HTTP/3 系 7 件・rate limiting 1 件で、いずれも高負荷下での実行が原因。下記「NetBSD で踏んだ落とし穴」参照 |
-| NetBSD aarch64（F-140、2026-08-06 実機） | **フルビルド可**（`full-netbsd-aarch64`、wasm 込み。B-59 の `CFLAGS_aarch64_unknown_netbsd` 指定が必須）。E2E は **フルスイート完走不能**（B-62: dev-dependency の quinn-udp が NetBSD/aarch64 で panic → プロセスabort）が、`TEST_FILTER=wasm_tests` では `test result: ok. 23 passed; 0 failed; 519 filtered out` |
+| NetBSD aarch64（F-140、2026-08-06 実機） | **フルビルド可**（`full-netbsd`、wasm 込み。B-59 の `CFLAGS_aarch64_unknown_netbsd` 指定が必須）。E2E は **フルスイート完走不能**（B-62: dev-dependency の quinn-udp が NetBSD/aarch64 で panic → プロセスabort）が、`TEST_FILTER=wasm_tests` では `test result: ok. 23 passed; 0 failed; 519 filtered out` |
 | `linux-aarch64-e2e.sh` | **未実行**（KVM 非対応ホストでは TCG が実用不能） |
 
 ### FreeBSD amd64 で踏んだ落とし穴（すべて実測。再発しやすいので残す）
@@ -378,7 +378,7 @@ quiche が使う **BoringSSL（boring-sys）は OpenBSD を想定していない
    （`has_native_signals` はホストの target_arch から wasmtime の build.rs が
    導出するため cargo feature で無効化できず、Pulley インタープリタへの切替でも
    回避できない）。対応として `Cargo.toml` の `full-netbsd` からも `wasm` を除外した
-   （`full-netbsd-aarch64` は元々除外済み）。詳細は
+   （`full-netbsd` は元々除外済み）。詳細は
    `docs/backlog/bugs/B-55-wasmtime-no-bsd-aarch64.md` 参照。
 
 以下は設計時点の想定として残す（上記で否定/確認された項目を含む）。

@@ -120,7 +120,7 @@ RUST_TARGET=aarch64-unknown-linux-gnu ./packaging/scripts/build.sh --docker
 
 ### NetBSD 対応の現状（F-140）
 
-NetBSD 向けの feature セット（`full-netbsd`/`full-netbsd-aarch64`、TLS プロバイダの
+NetBSD 向けの feature セット（`full-netbsd`、TLS プロバイダの
 target 別分岐、kqueue reactor の `struct kevent` 型差吸収）は **コード側は完成済み**。
 `tools/qemu/bsd-vm.sh`（`netbsd` os として追加）・`packaging/scripts/build-bsd.sh`・
 `packaging/bsd/netbsd/veil.rc` の組み込みも完了しており、以下の FreeBSD/OpenBSD 節と
@@ -138,7 +138,7 @@ setup/provision まで確認済み。詳細・既知の不確実点は
 > `veil-wasmtime`）として vendoring し、対象ターゲット（NetBSD 全アーキ・FreeBSD/
 > OpenBSD aarch64）だけ `build.rs` の `has_native_signals` を強制的に `false` にした
 > ものを Cargo のターゲット別依存で選択させ、常に Pulley インタープリタで実行する
-> ようにした。`full-netbsd`/`full-netbsd-aarch64` はいずれも `wasm` を含む。それ以外の
+> ようにした。`full-netbsd` は `wasm` を含む。それ以外の
 > 全プラットフォームは crates.io の wasmtime をそのまま使い無影響。詳細は
 > [`docs/backlog/bugs/B-55-wasmtime-no-bsd-aarch64.md`](../docs/backlog/bugs/B-55-wasmtime-no-bsd-aarch64.md)・
 > [`../third_party/wasmtime/README.veil.md`](../third_party/wasmtime/README.veil.md)。
