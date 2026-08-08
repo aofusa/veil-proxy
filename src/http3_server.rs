@@ -21,6 +21,7 @@
 // UDP パイプライン（`PipelinedUdpRecv` / `UringUdpSend`）でのみ使用する。
 // 非 Linux（FreeBSD/OpenBSD/NetBSD/macOS/Windows）では未使用になるため cfg で絞る
 // （unused_imports 警告対策。F-136 で非 Linux は in-memory SSL_CTX 経路へ移った）。
+use crate::cache;
 #[cfg(target_os = "linux")]
 use crate::runtime::handle::AsRawFd;
 use std::cell::RefCell;
@@ -635,6 +636,10 @@ struct SendFileRequest<'a> {
     req_path: &'a [u8],
     prefix: &'a [u8],
     security: &'a SecurityConfig,
+    /// OpenFileCache 設定（ルーティングごとの上書き、F-146 で is_dir 判定にも使用）
+    open_file_cache_config: Option<&'a cache::OpenFileCacheConfig>,
+    /// 静的コンテンツキャッシュ設定（F-146、ルーティングごとの上書き）
+    static_file_cache_config: Option<&'a cache::StaticContentCacheRouteConfig>,
     #[cfg(feature = "wasm")]
     wasm_modules: Option<&'a Arc<Vec<String>>>,
 }
@@ -1701,7 +1706,17 @@ impl Http3Handler {
                     (200, data.len())
                 }
             }
-            Backend::SendFile(base_path, is_dir, index_file, security, _cache, _, _, _) => self
+            Backend::SendFile(
+                base_path,
+                is_dir,
+                index_file,
+                security,
+                _cache,
+                open_file_cache_config,
+                _canonical_base,
+                static_file_cache_config,
+                _,
+            ) => self
                 .handle_sendfile(SendFileRequest {
                     stream_id,
                     base_path: &base_path,
@@ -1710,6 +1725,8 @@ impl Http3Handler {
                     req_path: &path,
                     prefix: &prefix,
                     security: &security,
+                    open_file_cache_config: open_file_cache_config.as_deref(),
+                    static_file_cache_config: static_file_cache_config.as_deref(),
                     #[cfg(feature = "wasm")]
                     wasm_modules: wasm_modules_to_apply.as_ref(),
                 })
@@ -2320,6 +2337,8 @@ impl Http3Handler {
             req_path,
             prefix,
             security,
+            open_file_cache_config,
+            static_file_cache_config,
             #[cfg(feature = "wasm")]
             wasm_modules,
         } = req;
@@ -2341,16 +2360,12 @@ impl Http3Handler {
             return Ok((403, 9));
         }
 
-        // ファイルパス構築
-        let file_path = if is_dir {
+        // ファイルパス構築（素の join のみ。ディレクトリかどうかの判定は下の
+        // `get_file_info_with_config` の非同期呼び出しへ委譲する）。
+        let full_path = if is_dir {
             let mut p = base_path.to_path_buf();
-            if clean_sub.is_empty() || clean_sub == "/" {
-                p.push(index_file.unwrap_or("index.html"));
-            } else {
+            if !clean_sub.is_empty() {
                 p.push(clean_sub);
-                if p.is_dir() {
-                    p.push(index_file.unwrap_or("index.html"));
-                }
             }
             p
         } else {
@@ -2361,22 +2376,65 @@ impl Http3Handler {
             base_path.to_path_buf()
         };
 
-        // ファイル読み込み（B-26: whole-file の同期 read はイベントループをブロックするため
-        // offload（専用スレッドプール）へ退避する。HTTP/1.1 経路の proxy.rs と同方式）。
-        let read_path = file_path.clone();
-        // 理由付き allow: offload ワーカースレッド内で実行（イベントループ非ブロック）。
-        #[allow(clippy::disallowed_methods)]
-        let read_result = crate::runtime::offload::offload(move || std::fs::read(read_path)).await;
-        let data = match read_result {
-            Ok(d) => d,
-            Err(_) => {
-                self.send_error_response(stream_id, 404, b"Not Found")?;
-                return Ok((404, 9));
+        // F-146: 従来はここで `p.is_dir()`（同期ブロッキング stat）をイベントループ上で
+        // 直接呼んでおり、ホットパス絶対規則（同期 I/O 禁止）に反していた。
+        // HTTP/1.1・HTTP/2 と同じ非同期 OpenFileCache 経由の解決に置き換える
+        // （キャッシュ無効時も内部でオフロード経由の非同期 stat にフォールバックする）。
+        let file_info =
+            match cache::get_file_info_with_config(&full_path, open_file_cache_config).await {
+                Some(info) => info,
+                None => {
+                    self.send_error_response(stream_id, 404, b"Not Found")?;
+                    return Ok((404, 9));
+                }
+            };
+
+        // ディレクトリの場合はインデックスファイルを解決する（h1/h2 と同一ロジック）。
+        let (final_path, resolved_mime): (std::path::PathBuf, String) = if !file_info.is_file {
+            let filename = index_file.unwrap_or("index.html");
+            let index_path = file_info.canonical_path.join(filename);
+            match cache::get_file_info_with_config(&index_path, open_file_cache_config).await {
+                Some(idx_info) if idx_info.is_file => {
+                    (idx_info.canonical_path.clone(), idx_info.mime_type.clone())
+                }
+                _ => {
+                    self.send_error_response(stream_id, 403, b"Forbidden")?;
+                    return Ok((403, 9));
+                }
             }
+        } else {
+            (
+                file_info.canonical_path.clone(),
+                file_info.mime_type.clone(),
+            )
         };
 
-        let mime_type = mime_guess::from_path(&file_path).first_or_octet_stream();
-        let mime_str = mime_type.as_ref();
+        // F-146: ファイル本体をキャッシュ優先で取得する。HTTP/3 は QUIC ストリームへの
+        // 再フレーミングが必須で sendfile(2) を使えないため、HTTP/2 と同じくユーザ空間
+        // メモリ（`bytes::Bytes`）に保持し参照カウントクローンで配信する
+        // （キャッシュ無効・上限超過時は内部で offload 読み込みへフォールバックする）。
+        // MIME タイプは OpenFileCache 側で既に解決済みのため、コンテンツキャッシュの
+        // ミス時フォールバックとして渡し `mime_guess` の再計算を避ける
+        // （ヒット時はコンテンツキャッシュ内に保存済みの MIME をそのまま再利用する）。
+        let content_cfg = cache::effective_static_content_cache_config(static_file_cache_config);
+        // `Arc<str>` の確保はクロージャの**中**で行う（外で作るとキャッシュヒット時にも
+        // 1 リクエストあたり確保が発生する。クロージャはミス時にしか呼ばれない）。
+        let (data, mime_arc) =
+            match cache::get_or_load_content_cache_with_mime(&final_path, &content_cfg, move || {
+                Arc::from(resolved_mime.as_str())
+            })
+            .await
+            {
+                Some(result) => result,
+                None => {
+                    // ファイルが開けない場合はキャッシュを無効化（HTTP/1.1・HTTP/2 と同様）。
+                    cache::invalidate_file_cache(&full_path);
+                    cache::invalidate_content_cache(&full_path);
+                    self.send_error_response(stream_id, 404, b"Not Found")?;
+                    return Ok((404, 9));
+                }
+            };
+        let mime_str: &str = &mime_arc;
 
         // F-132: h1/h2 と同様、静的配信にも WASM on_response_headers を適用する。
         let mut header_store: Vec<(Vec<u8>, Vec<u8>)> = vec![
@@ -2396,7 +2454,7 @@ impl Http3Handler {
             .map(|(k, v)| (k.as_slice(), v.as_slice()))
             .collect();
 
-        self.send_response(stream_id, 200, &resp_headers, Some(&data))?;
+        self.send_response(stream_id, 200, &resp_headers, Some(data.as_ref()))?;
         Ok((200, data.len()))
     }
 

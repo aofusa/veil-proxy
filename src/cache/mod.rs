@@ -42,6 +42,8 @@ mod policy;
 
 // DashMap依存モジュール（cache feature 有効時のみ）
 #[cfg(feature = "cache")]
+mod content_cache;
+#[cfg(feature = "cache")]
 mod disk;
 #[cfg(feature = "cache")]
 mod file_cache;
@@ -101,6 +103,14 @@ pub fn sendfile_base_contains(
 }
 
 // cache feature 有効時のみ公開
+#[cfg(feature = "cache")]
+pub use content_cache::{
+    clear as clear_content_cache, configure_global_static_content_cache,
+    effective_static_content_cache_config, get_or_load as get_or_load_content_cache,
+    get_or_load_with_mime as get_or_load_content_cache_with_mime, hits as content_cache_hits,
+    invalidate as invalidate_content_cache, len as content_cache_len,
+    misses as content_cache_misses, StaticContentCacheConfig, StaticContentCacheRouteConfig,
+};
 #[cfg(feature = "cache")]
 pub use disk::DiskCache;
 #[cfg(feature = "cache")]
@@ -335,6 +345,105 @@ pub async fn get_file_info(path: &std::path::Path) -> Option<CachedFileInfo> {
 
 #[cfg(not(feature = "cache"))]
 pub fn invalidate_file_cache(_path: &std::path::Path) {}
+
+// ====================
+// 静的コンテンツキャッシュ（F-146）スタブ（cache feature 無効時）
+// ====================
+//
+// `cache` feature が無いビルドではキャッシュ本体（DashMap）を持たず、常に
+// オフロード経由の直接読み込みへフォールバックする（`get_file_info_with_config`
+// の無効時挙動と同じ設計：キャッシュしないだけで、静的配信自体は成立させる）。
+
+/// 静的コンテンツキャッシュのグローバル設定（`cache` feature 無効時のスタブ）。
+#[cfg(not(feature = "cache"))]
+#[derive(Clone, Copy, Debug, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct StaticContentCacheConfig {
+    pub enabled: bool,
+    pub valid_duration_secs: u64,
+    pub max_entries: usize,
+    pub max_file_size_bytes: u64,
+    pub max_total_bytes: u64,
+    pub revalidate_mtime: bool,
+}
+
+/// ルートごとの静的コンテンツキャッシュ上書き設定（`cache` feature 無効時のスタブ）。
+#[cfg(not(feature = "cache"))]
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub struct StaticContentCacheRouteConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub valid_duration_secs: Option<u64>,
+    #[serde(default)]
+    pub max_entries: Option<usize>,
+    #[serde(default)]
+    pub max_file_size_bytes: Option<u64>,
+    #[serde(default)]
+    pub max_total_bytes: Option<u64>,
+    #[serde(default)]
+    pub revalidate_mtime: Option<bool>,
+}
+
+#[cfg(not(feature = "cache"))]
+pub fn configure_global_static_content_cache(_cfg: &StaticContentCacheConfig) {}
+
+#[cfg(not(feature = "cache"))]
+pub fn effective_static_content_cache_config(
+    _route: Option<&StaticContentCacheRouteConfig>,
+) -> StaticContentCacheConfig {
+    StaticContentCacheConfig::default()
+}
+
+/// `cache` feature 無効時は常にオフロード経由で直接読み込む（キャッシュしない）。
+#[cfg(not(feature = "cache"))]
+pub async fn get_or_load_content_cache(
+    path: &std::path::Path,
+    _cfg: &StaticContentCacheConfig,
+) -> Option<bytes::Bytes> {
+    let load_path = path.to_path_buf();
+    // 理由付き allow: offload 専用ワーカースレッド内で実行、イベントループ非ブロック。
+    #[allow(clippy::disallowed_methods)]
+    crate::runtime::offload::offload(move || std::fs::read(&load_path))
+        .await
+        .ok()
+        .map(bytes::Bytes::from)
+}
+
+/// [`get_or_load_content_cache`] の MIME タイプ再利用版スタブ。
+#[cfg(not(feature = "cache"))]
+pub async fn get_or_load_content_cache_with_mime<F>(
+    path: &std::path::Path,
+    _cfg: &StaticContentCacheConfig,
+    mime_fallback: F,
+) -> Option<(bytes::Bytes, std::sync::Arc<str>)>
+where
+    F: FnOnce() -> std::sync::Arc<str>,
+{
+    let data = get_or_load_content_cache(path, _cfg).await?;
+    Some((data, mime_fallback()))
+}
+
+#[cfg(not(feature = "cache"))]
+pub fn invalidate_content_cache(_path: &std::path::Path) {}
+
+#[cfg(not(feature = "cache"))]
+pub fn clear_content_cache() {}
+
+#[cfg(not(feature = "cache"))]
+pub fn content_cache_hits() -> u64 {
+    0
+}
+
+#[cfg(not(feature = "cache"))]
+pub fn content_cache_misses() -> u64 {
+    0
+}
+
+#[cfg(not(feature = "cache"))]
+pub fn content_cache_len() -> usize {
+    0
+}
 
 /// 再検証スタブ（cache feature 無効時）
 #[cfg(not(feature = "cache"))]

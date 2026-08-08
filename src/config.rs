@@ -2656,6 +2656,11 @@ pub struct Route {
     #[serde(default)]
     pub open_file_cache: Option<cache::OpenFileCacheConfig>,
 
+    /// ルートレベルの静的コンテンツキャッシュ設定（F-146、Fileバックエンドのみ、
+    /// actionの設定をオーバーライド）
+    #[serde(default)]
+    pub static_file_cache: Option<cache::StaticContentCacheRouteConfig>,
+
     /// ルートレベルのWASMモジュール名のリスト（このルートに適用するWASMモジュール）
     /// 注意: modules は route 直下で設定（action配下の設定は削除）
     #[serde(default)]
@@ -2691,6 +2696,13 @@ struct Config {
     /// バッファプール設定（メモリ最適化）
     #[serde(default)]
     buffer_pool: BufferPoolConfig,
+    /// 静的ファイル本体キャッシュ設定（F-146、グローバルデフォルト）
+    ///
+    /// HTTP/2・HTTP/3 静的配信のファイル本体（`bytes::Bytes`）をユーザ空間メモリに
+    /// 保持し、リクエストごとの `offload(std::fs::read)` 往復を避ける。
+    /// 既定は無効（[`cache::StaticContentCacheConfig::default`]）。
+    #[serde(default)]
+    static_file_cache: cache::StaticContentCacheConfig,
     /// HTTP/2 設定セクション
     #[serde(default)]
     #[cfg_attr(not(feature = "http2"), allow(dead_code))]
@@ -3928,6 +3940,8 @@ pub enum Backend {
     /// - Option<Arc<Path>>: base_path の canonical 形（F-145、`load_backend` で
     ///   config ロード時に一度だけ解決。ディレクトリルートでのみ Some になり得る。
     ///   解決失敗時は None＝リクエスト時は生の base_path へフォールバック）
+    /// - Option<Arc<cache::StaticContentCacheRouteConfig>>: 静的コンテンツキャッシュ
+    ///   設定（F-146、ルーティングごとのグローバル上書き）
     SendFile(
         Arc<PathBuf>,
         bool,
@@ -3936,6 +3950,7 @@ pub enum Backend {
         Arc<cache::CacheConfig>,
         Option<Arc<cache::OpenFileCacheConfig>>,
         Option<Arc<Path>>,
+        Option<Arc<cache::StaticContentCacheRouteConfig>>,
         /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
         Option<Arc<Vec<String>>>,
     ),
@@ -3962,7 +3977,7 @@ impl Backend {
         match self {
             Backend::Proxy(_, security, _, _, _, _) => security,
             Backend::MemoryFile(_, _, security, _) => security,
-            Backend::SendFile(_, _, _, security, _, _, _, _) => security,
+            Backend::SendFile(_, _, _, security, _, _, _, _, _) => security,
             Backend::Redirect(_, _, _, _) => &DEFAULT_SECURITY,
         }
     }
@@ -3974,7 +3989,7 @@ impl Backend {
         match self {
             Backend::Proxy(_, _, _, _, _, modules) => modules.as_ref(),
             Backend::MemoryFile(_, _, _, modules) => modules.as_ref(),
-            Backend::SendFile(_, _, _, _, _, _, _, modules) => modules.as_ref(),
+            Backend::SendFile(_, _, _, _, _, _, _, _, modules) => modules.as_ref(),
             Backend::Redirect(_, _, _, modules) => modules.as_ref(),
         }
     }
@@ -3983,7 +3998,7 @@ impl Backend {
         match self {
             Backend::Proxy(_, _, _, _, _, modules) => modules.as_deref().map(|v| v.as_slice()),
             Backend::MemoryFile(_, _, _, modules) => modules.as_deref().map(|v| v.as_slice()),
-            Backend::SendFile(_, _, _, _, _, _, _, modules) => {
+            Backend::SendFile(_, _, _, _, _, _, _, _, modules) => {
                 modules.as_deref().map(|v| v.as_slice())
             }
             Backend::Redirect(_, _, _, modules) => modules.as_deref().map(|v| v.as_slice()),
@@ -5673,6 +5688,9 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
         performance_config.open_file_cache_max_entries,
     );
 
+    // F-146: グローバル静的コンテンツキャッシュ設定を適用
+    cache::configure_global_static_content_cache(&config.static_file_cache);
+
     // F-35: グローバル IP ブロックリストを適用（起動時・SIGHUP リロード時の両方で本関数が
     // 呼ばれるためここで一元的に適用する）。CIDR はパース済みで保持され accept ホットパスでは
     // 文字列解析を行わない。
@@ -5850,6 +5868,9 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         performance_config.open_file_cache_valid_duration_secs,
         performance_config.open_file_cache_max_entries,
     );
+
+    // F-146: グローバル静的コンテンツキャッシュ設定を適用
+    cache::configure_global_static_content_cache(&config.static_file_cache);
 
     // F-35: グローバル IP ブロックリストを適用（起動時・SIGHUP リロード時の両方で本関数が
     // 呼ばれるためここで一元的に適用する）。CIDR はパース済みで保持され accept ホットパスでは
@@ -6153,6 +6174,10 @@ pub fn load_backend(
             let security = Arc::new(security.clone());
             let cache = Arc::new(cache.clone());
             let open_file_cache_arc = route.open_file_cache.as_ref().map(|c| Arc::new(c.clone()));
+            let static_file_cache_arc = route
+                .static_file_cache
+                .as_ref()
+                .map(|c| Arc::new(c.clone()));
 
             // キャッシュ設定のログ出力
             if cache.enabled {
@@ -6218,6 +6243,7 @@ pub fn load_backend(
                         cache,
                         open_file_cache_arc,
                         canonical_base,
+                        static_file_cache_arc,
                         modules_arc.clone(),
                     ))
                 }

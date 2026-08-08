@@ -58,6 +58,7 @@ A high-performance reverse proxy server using io_uring (custom runtime) and rust
 - **CPU Affinity**: Pin worker threads to CPU cores
 - **CBPF Distribution**: Client IP-based load balancing with SO_REUSEPORT (Linux 4.6+)
 - **OpenFileCache**: File metadata cache to reduce system calls (canonicalize, metadata, mime_guess) - 60-67% reduction in system calls for static file serving. On cache miss, the blocking `canonicalize`/`metadata`/disk reads run on a dedicated offload thread pool (completion signaled via `eventfd` + `POLL_ADD`) so the io_uring event loop never blocks
+- **Static Content Cache** (F-146, HTTP/2/HTTP/3 only, off by default): HTTP/2 and HTTP/3 static serving must re-frame the body into DATA frames / QUIC streams and therefore cannot use `sendfile(2)`, so every request used to re-read the whole file via the offload thread pool. With `[static_file_cache]`/`[route.static_file_cache]` enabled, the file body is held in userspace memory as `bytes::Bytes`; a cache hit is served with just a `DashMap` lookup + `Bytes::clone()` (refcount bump) — zero syscalls, zero allocation, zero offload round-trip. HTTP/1.1 is unaffected (it already uses sendfile(2)/kTLS splice)
 - **HTTP/2 Response Streaming**: For non-compressed responses, the backend body is forwarded to the HTTP/2 client as DATA frames incrementally instead of being fully buffered — both `Content-Length` and `Transfer-Encoding: chunked` responses. Chunked bodies are decoded zero-copy via a span-based decoder (sub-slices of the read buffer, no intermediate `Vec`). Each DATA frame obeys HTTP/2 flow control (connection/stream window + `WINDOW_UPDATE`), so backpressure follows the client's receive rate and RSS does not scale with payload size (OOM resistance for large downloads)
 - **HTTP/2 Send Frame Coalescing** (F-74): On the response send path, all frames of a single response (HEADERS + every DATA frame, and gRPC trailers) are appended into **one contiguous, per-connection reuse buffer** (`write_buf`, recycled across connections via a thread-local pool) and flushed with a **single `write_all` / io_uring submission** instead of one write per frame. A minimal response therefore costs **one write** instead of two-plus, and HEADERS never race ahead of the first DATA on the wire. Frames are appended with zero extra allocation via `encode_headers_into` / `encode_data_into` (no per-frame `Vec`). For large streamed bodies the buffer flushes at a **128 KiB threshold** (and before any flow-control `WINDOW_UPDATE` wait) to bound memory and pipeline sending; the streaming `Content-Length` path coalesces HEADERS with the first already-read body chunk. Control frames (SETTINGS/PING/`RST_STREAM`/GOAWAY) still write directly and only at flushed boundaries (the coalesce buffer is empty at every direct-write call), while the multiplexed loop's consumption-coupled `WINDOW_UPDATE` (F-116) is appended to `write_buf` so it never overtakes queued frames — frame ordering is preserved either way
 - **HTTP/2 Request Streaming (uploads)**: For proxied uploads, the backend connection is opened as soon as the request **HEADERS** arrive (before the body finishes), and each incoming `DATA` frame is forwarded to the backend as a `Transfer-Encoding: chunked` chunk **without buffering the whole body**. The frame's owned buffer is sent zero-copy (only the chunk-size line and CRLF are small allocations); flow-control accounting runs without copying into `request_body`. Backpressure is **consumption-coupled** (F-116): the receive window is replenished (`WINDOW_UPDATE`) only when body chunks are actually handed off to the per-stream request task, so a slow backend throttles the client via HTTP/2 flow control and pending upload bytes stay bounded by the window (RSS independent of upload size). Eligible for `Proxy` backends over HTTP/1.1 (non-h2c), `buffering` mode ≠ `full`, no WASM body filter, non-gRPC; the body-size limit (`max_request_body_size`) is enforced mid-transfer (413 + `RST_STREAM`). Non-eligible requests fall back to the buffered path with no behavior change
@@ -491,6 +492,12 @@ The following table lists default values for major configuration options:
 | `[performance]` | `open_file_cache_enabled` | `false` | Enable OpenFileCache |
 | `[performance]` | `open_file_cache_valid_duration_secs` | `60` | Cache validity (seconds) |
 | `[performance]` | `open_file_cache_max_entries` | `10000` | Max cache entries |
+| `[static_file_cache]` | `enabled` | `false` | Enable static content cache (F-146, HTTP/2/HTTP/3 only) |
+| `[static_file_cache]` | `valid_duration_secs` | `60` | Cache validity (seconds) |
+| `[static_file_cache]` | `max_entries` | `1024` | Max cache entries |
+| `[static_file_cache]` | `max_file_size_bytes` | `1048576` | Max file size to cache (bytes) |
+| `[static_file_cache]` | `max_total_bytes` | `67108864` | Max total cached bytes |
+| `[static_file_cache]` | `revalidate_mtime` | `false` | Re-stat mtime on hit (true reintroduces a syscall on the hot path) |
 | `[tls]` | `ktls_enabled` | `false` | Enable kTLS |
 | `[tls]` | `ktls_fallback_enabled` | `true` | kTLS fallback to rustls |
 | `[tls]` | `tcp_cork_enabled` | `true` | Enable TCP_CORK |
@@ -677,6 +684,12 @@ mode = "sendfile"
 enabled = true
 valid_duration_secs = 300  # 5 minutes (static files change infrequently)
 max_entries = 50000
+# Static content cache configuration (route-specific, overrides global setting).
+# HTTP/2/HTTP/3 only — HTTP/1.1 already uses sendfile(2) and is unaffected.
+[route.static_file_cache]
+enabled = true
+valid_duration_secs = 300
+max_file_size_bytes = 2097152  # 2 MiB
 
 # Directory serving (without trailing slash - same behavior, no redirect)
 [[route]]

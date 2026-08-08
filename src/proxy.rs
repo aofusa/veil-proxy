@@ -1741,6 +1741,7 @@ async fn h2_dispatch(
             _cache,
             open_file_cache_config,
             canonical_base,
+            static_file_cache_config,
             _,
         ) => {
             h2_sendfile(
@@ -1754,6 +1755,7 @@ async fn h2_dispatch(
                 client_encoding,
                 open_file_cache_config.as_deref(),
                 canonical_base.as_deref(),
+                static_file_cache_config.as_deref(),
                 #[cfg(feature = "wasm")]
                 &wasm_modules_to_apply,
                 resp_tx,
@@ -2942,6 +2944,7 @@ async fn h2_sendfile(
     client_encoding: AcceptedEncoding,
     open_file_cache_config: Option<&cache::OpenFileCacheConfig>,
     canonical_base: Option<&Path>,
+    static_file_cache_config: Option<&cache::StaticContentCacheRouteConfig>,
     #[cfg(feature = "wasm")] wasm_modules: &Arc<Vec<String>>,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
@@ -3012,11 +3015,17 @@ async fn h2_sendfile(
         )
     };
 
-    let data = match crate::runtime::io::read(&final_path).await {
-        Ok(d) => d,
-        Err(_) => {
+    // F-146: ファイル本体をキャッシュ優先で取得する。HTTP/2 は DATA フレームへの
+    // 再フレーミングが必須で sendfile(2) を使えないため、ユーザ空間メモリ
+    // （`bytes::Bytes`）に保持し参照カウントクローンで配信する
+    // （キャッシュ無効・上限超過時は既存の offload 読み込みへ内部でフォールバックする）。
+    let content_cfg = cache::effective_static_content_cache_config(static_file_cache_config);
+    let data = match cache::get_or_load_content_cache(&final_path, &content_cfg).await {
+        Some(d) => d,
+        None => {
             // ファイルが開けない場合はキャッシュを無効化（HTTP/1.1 と同様）。
             cache::invalidate_file_cache(&full_path);
+            cache::invalidate_content_cache(&full_path);
             return h2_emit_error(resp_tx, notify, 404, b"Not Found").await;
         }
     };
@@ -5377,6 +5386,7 @@ async fn handle_backend(
             _cache,
             open_file_cache_config,
             canonical_base,
+            _static_file_cache_config,
             _,
         ) => {
             // Range ヘッダーを抽出 (RFC 7233)
