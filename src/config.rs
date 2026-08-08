@@ -6033,7 +6033,94 @@ pub fn load_logging_config(path: &Path) -> io::Result<LoggingConfigSection> {
 // JSON形式ログフォーマッタ（JsonLogFormat 等）と init_logging は
 // crate::logging モジュールに移動しました。
 
-// 理由付き allow: 起動・リロード・設定検証時のみ実行されるコールドパス（データプレーン非経由）。
+/// `File` ルートの `is_dir` 判定をメモ化して返す（B-64）。
+///
+/// `canonical_base_memoized` と同じ理由。`load_backend` がリクエストごとに呼ばれるため、
+/// `fs::metadata` を毎回叩くと 1 リクエスト 1 回の `fstatat` になる（DTrace 実測で
+/// `__realpathat` と同数＝最多の syscall だった）。設定に対して不変な値なので
+/// 設定パスごとに 1 回だけ解決する。
+///
+/// エラーはメモしない（起動時にパスが存在しない運用を壊さないため、次回再試行する）。
+/// 成功した時点でメモされ、以降 syscall は発生しない。
+fn is_dir_memoized<F>(path: &str, fetch: F) -> io::Result<bool>
+where
+    F: FnOnce() -> io::Result<bool>,
+{
+    if let Some(hit) = IS_DIR_MEMO.with(|m| m.borrow().get(path).copied()) {
+        return Ok(hit);
+    }
+    let resolved = fetch()?;
+    IS_DIR_MEMO.with(|m| m.borrow_mut().insert(path.to_string(), resolved));
+    Ok(resolved)
+}
+
+// `is_dir_memoized` のメモ本体（`CANONICAL_BASE_MEMO` と同じくスレッドローカル。
+// 理由はそちらのコメントを参照）。
+thread_local! {
+    static IS_DIR_MEMO: std::cell::RefCell<std::collections::HashMap<String, bool>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+// `File` ルートの base_path を canonical 化した結果のメモ（B-64）。
+//
+// `load_backend` はリクエストごとに呼ばれるため、ここで毎回 `canonicalize()` すると
+// 1 リクエスト 1 回の `__realpathat` になる（実測でホットパス最多の syscall だった）。
+// base_path は設定に対して不変なので、設定文字列をキーにプロセス全体で 1 回だけ解決する。
+//
+// 値が `None`（解決失敗）の場合もキャッシュする。起動時にディレクトリが存在しない運用を
+// 壊さないための挙動（`cache::sendfile_base_contains` が生パスへフォールバックする）だが、
+// 失敗を毎回再試行すると結局 syscall が走ってしまうため、結果ごとキャッシュする。
+// **スレッドローカルで持つ**。当初はプロセス共有の `RwLock<HashMap>` にしたが、
+// `load_backend` はリクエストごとに呼ばれるため**毎リクエスト 1 回のロック取得**が
+// 発生し、実測でスループットが改善しなかった（syscall は消えたのに 234k → 201k rps）。
+// ウォームな VFS キャッシュ上の `realpath`/`fstat` は 1μs 程度と安く、
+// ワーカースレッド間で共有する RwLock の読み取り競合の方が高くつく。
+// veil は thread-per-core なので、ワーカーごとに 1 回解決すれば以降は
+// **syscall もアトミック操作も無し**で済む。
+// （`dashmap` は `cache` feature 依存なので `--no-default-features` では使えない、
+//  という制約もあり std のみで完結させている。）
+thread_local! {
+    static CANONICAL_BASE_MEMO: std::cell::RefCell<
+        std::collections::HashMap<String, Option<Arc<Path>>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// `path` の canonical 形をメモ化して返す（B-64。詳細は [`CANONICAL_BASE_MEMO`]）。
+fn canonical_base_memoized(path: &str) -> Option<Arc<Path>> {
+    if let Some(hit) = CANONICAL_BASE_MEMO.with(|m| m.borrow().get(path).cloned()) {
+        return hit;
+    }
+    // 理由付き allow: 設定パスごとに 1 回だけ実行されるコールドパス（以降はメモから返る）。
+    #[allow(clippy::disallowed_methods)]
+    let resolved = match Path::new(path).canonicalize() {
+        Ok(c) => Some(Arc::from(c.as_path())),
+        Err(e) => {
+            warn!(
+                "File ルート {:?} の canonicalize に失敗（リクエスト時は生パスへフォールバック）: {}",
+                path, e
+            );
+            None
+        }
+    };
+    // **失敗（None）はメモしない。** 起動時点でディレクトリが存在しなくても、後から
+    // 作成されれば動作し続ける、という既存の運用挙動を壊さないため
+    // （`cache::sendfile_base_contains` が生パスへフォールバックする設計）。
+    // 失敗し続ける構成では毎回 `canonicalize` が走るが、それは元々の挙動と同じであり、
+    // 正常な構成（＝解決できる）では初回のみで以降 syscall は発生しない。
+    if resolved.is_some() {
+        CANONICAL_BASE_MEMO.with(|m| m.borrow_mut().insert(path.to_string(), resolved.clone()));
+    }
+    resolved
+}
+
+// 理由付き allow: `fs::metadata`（is_dir 判定）と `fs::read`（MemoryFile モードの
+// 事前読み込み）を使う。**この関数はリクエストごとに呼ばれる**（`upstream.rs` の
+// `find_backend_unified`）ため本来ホットパスだが、いずれも「設定に対して不変な値」の
+// 解決であり、B-64 で判明したコストの大きい `canonicalize`/`metadata` は
+// `canonical_base_memoized` / `is_dir_memoized` で設定パスごとに 1 回だけ実行するよう
+// メモ化してある（2 回目以降は syscall なし）。`fs::read` は MemoryFile モード
+// （起動時にファイル全体をメモリへ読み込む構成）専用で、同モードでは応答自体が
+// メモリから返るため毎回の読み込みは発生しない。
 #[allow(clippy::disallowed_methods)]
 pub fn load_backend(
     route: &Route,
@@ -6160,15 +6247,19 @@ pub fn load_backend(
             // ため、登録済みルート dirfd 相対の `fstatat` で is_dir を判定する
             // （File ルート自身は登録ルートなので rel="." で解決される）。
             #[cfg(target_os = "freebsd")]
-            let is_dir = if let Some(res) =
-                crate::security::capsicum::stat_static(std::path::Path::new(path))
-            {
-                res.map_err(access_err)?.is_dir
-            } else {
-                fs::metadata(path).map_err(access_err)?.is_dir()
-            };
+            let is_dir = is_dir_memoized(path, || {
+                if let Some(res) =
+                    crate::security::capsicum::stat_static(std::path::Path::new(path))
+                {
+                    Ok(res.map_err(access_err)?.is_dir)
+                } else {
+                    Ok(fs::metadata(path).map_err(access_err)?.is_dir())
+                }
+            })?;
             #[cfg(not(target_os = "freebsd"))]
-            let is_dir = fs::metadata(path).map_err(access_err)?.is_dir();
+            let is_dir = is_dir_memoized(path, || {
+                Ok(fs::metadata(path).map_err(access_err)?.is_dir())
+            })?;
             // インデックスファイル名を Arc<str> に変換（None = デフォルトで "index.html"）
             let index_file: Option<Arc<str>> = index.as_ref().map(|s| Arc::from(s.as_str()));
             let security = Arc::new(security.clone());
@@ -6206,32 +6297,22 @@ pub fn load_backend(
                     ))
                 }
                 "sendfile" | "" => {
-                    // F-145: ディレクトリルートの封じ込め検査（starts_with 比較）に使う
-                    // base_path の canonical 形を、config ロード時（cold path）に一度だけ
-                    // 解決しておく。従来はリクエストごとに
-                    // `cache::get_file_info_with_config(base_path, ...)` を再実行しており
-                    // （`open_file_cache` 無効時は canonicalize + metadata の再実行＝
-                    // `__realpathat`/`fstatat`/offload スレッド往復）、この解決は
-                    // 設定に対して不変なため無駄だった（DTrace 実測: F-145 チケット参照）。
+                    // F-145 / B-64: SendFile の封じ込め検査に使う base_path の canonical 形。
                     //
-                    // 失敗時（起動時点でディレクトリが未作成等）は今日の挙動を維持する:
-                    // 起動を失敗させず、生の base_path へフォールバックする（
-                    // `cache::sendfile_base_contains` 参照。運用上ディレクトリが後から
-                    // 作られても動作し続ける）。理由付き allow: cold path（設定ロード時）
-                    // のみで、ホットパスには一切現れない。
-                    #[allow(clippy::disallowed_methods)]
+                    // **`load_backend` はリクエストごとに呼ばれる**（`upstream.rs` の
+                    // `find_backend_unified` がルート照合のたびに Backend を組み立てる）。
+                    // F-145 の初版はここで直接 `canonicalize()` していたため、
+                    // **1 リクエストあたり 1 回の `__realpathat` を発生させていた**
+                    // （DTrace 実測で最多の syscall だった。B-64）。`realpath` はパスの
+                    // 構成要素を 1 つずつ辿るので `stat` より高価で、小さなレスポンスほど
+                    // 相対コストが大きい。
+                    //
+                    // base_path は設定に対して不変なので、**設定文字列をキーにメモ化**して
+                    // プロセス全体で 1 回だけ解決する。ホットパスでは DashMap のルックアップ
+                    // （syscall なし）だけになる。ホットリロードで設定が変わっても、
+                    // 新しいパス文字列は別キーになるので取り違えは起きない。
                     let canonical_base: Option<Arc<Path>> = if is_dir {
-                        match Path::new(path).canonicalize() {
-                            Ok(c) => Some(Arc::from(c.as_path())),
-                            Err(e) => {
-                                warn!(
-                                    "File ルート {:?} の起動時 canonicalize に失敗（\
-                                     リクエスト時は生パスへフォールバック）: {}",
-                                    path, e
-                                );
-                                None
-                            }
-                        }
+                        canonical_base_memoized(path)
                     } else {
                         None
                     };
