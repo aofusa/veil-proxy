@@ -4,7 +4,7 @@
 
 すべて **docker コマンドのみ** で完結し、ホストへの追加インストールは不要です（証明書生成に `openssl` を使う場合を除く）。
 
-計測結果は [docs/perf/](../../docs/perf/) を参照してください。バックログ上は [F-58](../../docs/backlog/features/F-58-perf-report-glibc-musl-nginx.md) の再現ハーネスです。
+計測結果は [docs/perf/](../../docs/perf/) を参照してください（Linux/Docker の生データは [`docs/perf/results_raw.tsv`](../../docs/perf/results_raw.tsv)、**FreeBSD ネイティブ計測の生データは [`docs/perf/freebsd_results_raw.tsv`](../../docs/perf/freebsd_results_raw.tsv)**）。バックログ上は [F-58](../../docs/backlog/features/F-58-perf-report-glibc-musl-nginx.md) の再現ハーネスです。
 
 ---
 

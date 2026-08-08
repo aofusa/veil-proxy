@@ -7,6 +7,11 @@ Veil の HTTP/1.1・HTTP/2・HTTP/3・gRPC・L4 スループット／レイテ�
   `run_perf.sh` で反復計測 / `analyze_results.sh` で median±stdev 集計）。
   実行すると `tools/perf/results/results_raw.tsv`（1 反復 1 行の生データ）と
   `results_summary.md`（集計）が生成される（いずれも git 管理外の作業成果物）。
+- **FreeBSD ネイティブ計測の生データは [`freebsd_results_raw.tsv`](freebsd_results_raw.tsv)**
+  （2026-08-07〜08）。Docker が使えない FreeBSD 用の別ハーネス
+  （`tools/perf/freebsd/`）の出力で、`build` 列（aio / noaio / cache_off / cache_on /
+  ktls_on / ktls_off）で構成を、`body` 列（54576 / 3）でレスポンスサイズを区別する。
+  詳細な分析は下記「FreeBSD ネイティブ計測」節を参照。
 - **本ディレクトリの [`results_raw.tsv`](results_raw.tsv)** は最新計測
   （2026-07-16、v0.5.0 向けフルスイート）の `tools/perf` 生データのコミット済みコピー。
   `bash tools/perf/analyze_results.sh docs/perf/results_raw.tsv` で下表を再集計できる。
@@ -196,12 +201,16 @@ main / feat/h2-multiplexing を各イメージ再ビルドの上で連続計測�
 13. **F-146 静的コンテンツキャッシュ（2026-08-08）**: HTTP/2・HTTP/3 の静的配信がリクエストごとにファイル全体を offload スレッドプール経由で読み直していた問題を解消（`[static_file_cache]`、既定オフ）。小レスポンスの HTTP/2 で **+32%**（168.7k → 223.5k rps）、54KB の大レスポンスは帯域律速のため変化なし。レビューで DashMap の自己デッドロック（キャッシュ有効時に必ず踏む）を発見・修正。
 14. **54KB 応答のボトルネック特定（2026-08-08）**: CPU 律速ではなく**コンテキストスイッチ律速**（約 400,000 回/秒 = 1 リクエスト約 17 回、CPU は 51% idle）であり、接続数を 64→512 に増やしてもスループットが動かない直列化点があることを突き止めた。原因は FreeBSD の software kTLS が TLS レコードごとにカーネルスレッドへ暗号処理をディスパッチすること。kTLS 無効で中央値 +26%（最良ラウンドは 2.24 GB/s で nginx の 2.55 GB/s に肉薄）。
 
-## FreeBSD ネイティブ計測（2026-08-07、F-145 / B-63）
+## FreeBSD ネイティブ計測（2026-08-07〜08、B-63 / F-145 / F-146）
 
 `tools/perf/` 本体は Docker 前提のため FreeBSD では動かない。専用ハーネス
 [`tools/perf/freebsd/run_perf_freebsd.sh`](../../tools/perf/freebsd/run_perf_freebsd.sh) を
 追加し、**ゲスト内 loopback で veil と nginx を同条件**（同じ 2 コアへ cpuset 固定・
 負荷生成は別 2 コア・アクセスログ双方オフ・proxy/L4 の上流は共通 nginx）で計測した。
+
+**生データ: [`freebsd_results_raw.tsv`](freebsd_results_raw.tsv)**（本節・
+「F-146 静的コンテンツキャッシュ」節・「FreeBSD の kTLS は大きな応答で不利」節の
+全計測を含む）。
 
 - 環境: FreeBSD 14.3-RELEASE aarch64（QEMU/HVF on Apple Silicon）、4 vCPU / 4GB、
   サーバ 2 コア・負荷生成 2 コア、loopback
@@ -210,6 +219,22 @@ main / feat/h2-multiplexing を各イメージ再ビルドの上で連続計測�
 - 負荷: HTTP/1.1 = wrk / HTTP/2・h2c = h2load / **HTTP/3 = 自作 `tools/perf/h3load`**
   （FreeBSD の nghttp2 pkg の h2load は ngtcp2 非同梱、curl pkg も HTTP/3 非対応のため）
 - 配信ファイルは 54KB（バイト単価）と 3B（リクエスト単価）の 2 種
+
+### 改善サマリ（本セッションの累積、veil / FreeBSD aarch64）
+
+| シナリオ | 改善前 | 改善後 | 倍率 | 効いた変更 |
+|---|---|---|---|---|
+| HTTP/1.1 TLS・3B | 77,504 | 105,344 | **1.36x** | B-63（aio 除外） |
+| HTTP/2 TLS・3B | 計測不能（停止） | 223,500 | **—** | B-63 + F-146 |
+| h2c 平文・3B | 1,927（エラー多発） | 119,860 | **62x** | B-63 |
+| L4 TCP・3B | 13,491 | 202,108 | **15x** | B-63 |
+| HTTP/2 TLS・54KB | 21,446 | 27,860（kTLS 無効時） | **1.30x** | B-63 + kTLS 無効化 |
+| HTTP/3・54KB | 計測手段なし | 5,869 | **—** | h3load 追加 |
+
+改善前 = `full-freebsd`（当時の既定、`aio` 有効）。改善後 = `aio` 除外 +
+`[static_file_cache]` 有効 + `ktls_enabled = false`。
+小さなレスポンスでの劇的な改善（62x / 15x）は、`aio` 有効時にサーバが
+停止・大量エラーを起こしていた（B-63）状態からの回復を含む。
 
 ### 環境の理論値（実測プリミティブから算出）
 

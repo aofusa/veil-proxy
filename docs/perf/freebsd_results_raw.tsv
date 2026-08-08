@@ -1,0 +1,100 @@
+## FreeBSD ネイティブ計測の生データ（2026-08-07 〜 08）
+## 環境: FreeBSD 14.3-RELEASE aarch64 / QEMU+HVF on Apple Silicon / 4 vCPU・4GB
+##       サーバ 2 コア（cpuset 0,1）・負荷生成 2 コア（cpuset 2,3）・loopback
+## ハーネス: tools/perf/freebsd/run_perf_freebsd.sh / ab_content_cache.sh
+## 負荷: HTTP/1.1=wrk, HTTP/2・h2c=h2load, HTTP/3=tools/perf/h3load (quinn+h3)
+## 配信: index.html=54576B（バイト単価）, small.html=3B（リクエスト単価）
+##
+## build 列の意味:
+##   aio        = full-freebsd（当時の既定、POSIX AIO 有効）
+##   noaio      = aio を除外（B-63 の対応後 = 現在の full-freebsd）
+##   cache_off  = noaio + [static_file_cache] 無効（F-146 既定）
+##   cache_on   = noaio + [static_file_cache] 有効
+##   ktls_on    = noaio + [tls] ktls_enabled = true
+##   ktls_off   = noaio + [tls] ktls_enabled = false（既定）
+## rps が 0 の行は当該構成が失敗したことを示す（errors 列を参照）。
+build	scenario	body	server	iter	rps	mbps	p50_ms	p99_ms	errors
+aio	h1_file_tls	54576	nginx	1	49026.42	20480.00	1.270	1.590	0
+aio	h1_file_tls	54576	veil	1	21693.41	9011.20	2.930	3.840	0
+aio	h1_file_tls	54576	nginx	2	44590.15	18677.76	1.410	1.670	0
+aio	h1_file_tls	54576	veil	2	21636.35	9011.20	2.940	3.880	0
+aio	h2_file_tls	54576	nginx	1	43614.02	18186.24	0.000	0.000	0
+aio	h2_file_tls	54576	veil	1	21445.65	8929.28	0.000	0.000	0
+aio	h2c_file_plain	54576	nginx	1	106157.73	44318.72	0.000	0.000	0
+aio	h2c_file_plain	54576	veil	1	64529.95	26869.76	0.000	0.000	0
+aio	h1_proxy_tls	54576	nginx	1	31870.88	13352.96	2.000	2.540	0
+aio	h1_proxy_tls	54576	veil	1	21593.10	9011.20	2.880	14.120	0
+aio	h2_proxy_tls	54576	nginx	1	21985.22	9175.04	0.000	0.000	0
+aio	h2_proxy_tls	54576	veil	1	21881.51	9093.12	0.000	0.000	0
+aio	l4_tcp	54576	nginx	1	68023.07	28426.24	0.930	1.260	0
+aio	l4_tcp	54576	veil	1	53090.97	22200.32	1.080	2.350	0
+aio	h1_file_tls	3	nginx	1	378151.04	683.76	0.160	0.248	0
+aio	h1_file_tls	3	veil	1	77503.59	66.24	0.744	3.170	0
+aio	h2_file_tls	3	nginx	1	416897.37	397.68	0.000	0.000	0
+aio	h2_file_tls	3	veil	1	0.00	0.00	0.000	0.000	0
+aio	h2c_file_plain	3	nginx	1	418224.12	398.96	0.000	0.000	0
+aio	h2c_file_plain	3	veil	1	1927.17	0.47	0.000	0.000	25440
+aio	h1_proxy_tls	3	nginx	1	217299.22	392.88	0.287	0.458	0
+aio	h1_proxy_tls	3	veil	1	82541.85	149.28	0.752	1.410	0
+aio	h2_proxy_tls	3	nginx	1	115185.39	118.64	0.000	0.000	0
+aio	h2_proxy_tls	3	veil	1	7875.09	2.29	0.000	0.000	11217
+aio	l4_tcp	3	nginx	1	244086.11	441.36	0.193	154.040	0
+aio	l4_tcp	3	veil	1	13490.71	24.40	0.781	2.110	1284
+noaio	h1_file_tls	54576	nginx	1	48853.97	20398.08	1.270	1.670	0
+noaio	h1_file_tls	54576	veil	1	21382.26	8929.28	2.960	3.490	0
+noaio	h2_file_tls	54576	nginx	1	43930.34	18350.08	0.000	0.000	0
+noaio	h2_file_tls	54576	veil	1	22748.98	9502.72	0.000	0.000	0
+noaio	h2c_file_plain	54576	nginx	1	106044.71	44318.72	0.000	0.000	0
+noaio	h2c_file_plain	54576	veil	1	55650.26	23183.36	0.000	0.000	0
+noaio	h1_proxy_tls	54576	nginx	1	30840.82	12861.44	2.050	2.580	0
+noaio	h1_proxy_tls	54576	veil	1	22271.99	9338.88	2.800	1770.000	0
+noaio	h2_proxy_tls	54576	nginx	1	22885.21	9584.64	0.000	0.000	0
+noaio	h2_proxy_tls	54576	veil	1	21625.65	9011.20	0.000	0.000	0
+noaio	l4_tcp	54576	nginx	1	67295.24	28180.48	0.940	1.210	0
+noaio	l4_tcp	54576	veil	1	41205.57	17203.20	1.540	1.790	0
+noaio	h1_file_tls	3	nginx	1	279688.53	505.76	0.201	0.417	0
+noaio	h1_file_tls	3	veil	1	105343.86	90.00	0.495	1.320	0
+noaio	h2_file_tls	3	nginx	1	267009.89	254.72	0.000	0.000	0
+noaio	h2_file_tls	3	veil	1	86001.33	21.04	0.000	0.000	0
+noaio	h2c_file_plain	3	nginx	1	399798.85	381.36	0.000	0.000	0
+noaio	h2c_file_plain	3	veil	1	119860.40	29.28	0.000	0.000	0
+noaio	h1_proxy_tls	3	nginx	1	151233.52	273.44	0.419	0.643	0
+noaio	h1_proxy_tls	3	veil	1	102492.96	185.36	0.599	0.970	0
+noaio	h2_proxy_tls	3	nginx	1	81294.98	83.76	0.000	0.000	0
+noaio	h2_proxy_tls	3	veil	1	143605.46	41.76	0.000	0.000	0
+noaio	l4_tcp	3	nginx	1	242403.04	438.32	0.251	0.433	0
+noaio	l4_tcp	3	veil	1	202108.08	365.44	0.299	0.466	0
+noaio	h3_file	54576	nginx	1	11664.91	5093.00	0.000	0.000	0
+noaio	h3_file	54576	veil	1	5868.57	2562.26	0.000	0.000	0
+cache_off	h2_file_tls	54576	veil	1	22198.40	9250.00	0.000	0.000	0
+cache_on	h2_file_tls	54576	veil	1	22345.52	9311.00	0.000	0.000	0
+cache_off	h2_file_tls	54576	veil	2	22312.89	9298.00	0.000	0.000	0
+cache_on	h2_file_tls	54576	veil	2	22318.09	9300.00	0.000	0.000	0
+cache_off	h2_file_tls	54576	veil	3	22233.64	9265.00	0.000	0.000	0
+cache_on	h2_file_tls	54576	veil	3	22145.43	9228.00	0.000	0.000	0
+cache_off	h2_file_tls	54576	veil	4	22082.00	9202.00	0.000	0.000	0
+cache_on	h2_file_tls	54576	veil	4	22250.06	9272.00	0.000	0.000	0
+cache_off	h2_file_tls	3	veil	1	172479.22	42.10	0.000	0.000	0
+cache_on	h2_file_tls	3	veil	1	224608.06	54.83	0.000	0.000	0
+cache_off	h2_file_tls	3	veil	2	172972.22	42.23	0.000	0.000	0
+cache_on	h2_file_tls	3	veil	2	224590.40	54.83	0.000	0.000	0
+cache_off	h2_file_tls	3	veil	3	164556.91	40.17	0.000	0.000	0
+cache_on	h2_file_tls	3	veil	3	220529.05	53.84	0.000	0.000	0
+cache_off	h2_file_tls	3	veil	4	159285.76	38.88	0.000	0.000	0
+cache_on	h2_file_tls	3	veil	4	222490.45	54.32	0.000	0.000	0
+ktls_on	h2_file_tls	54576	veil	1	22173.78	9239.00	0.000	0.000	0
+ktls_off	h2_file_tls	54576	veil	1	23407.09	9753.00	0.000	0.000	0
+ktls_on	h2_file_tls	54576	veil	2	21858.76	9108.00	0.000	0.000	0
+ktls_off	h2_file_tls	54576	veil	2	29685.17	12369.00	0.000	0.000	0
+ktls_on	h2_file_tls	54576	veil	3	22102.13	9209.00	0.000	0.000	0
+ktls_off	h2_file_tls	54576	veil	3	41082.78	17118.00	0.000	0.000	0
+ktls_on	h2_file_tls	54576	veil	4	22350.94	9313.00	0.000	0.000	0
+ktls_off	h2_file_tls	54576	veil	4	26034.18	10847.00	0.000	0.000	0
+ktls_on	h2_file_tls	3	veil	1	170765.03	41.69	0.000	0.000	0
+ktls_off	h2_file_tls	3	veil	1	166421.20	40.63	0.000	0.000	0
+ktls_on	h2_file_tls	3	veil	2	169316.47	41.34	0.000	0.000	0
+ktls_off	h2_file_tls	3	veil	2	178533.17	43.59	0.000	0.000	0
+ktls_on	h2_file_tls	3	veil	3	169366.65	41.35	0.000	0.000	0
+ktls_off	h2_file_tls	3	veil	3	161421.80	39.41	0.000	0.000	0
+ktls_on	h2_file_tls	3	veil	4	150941.69	36.85	0.000	0.000	0
+ktls_off	h2_file_tls	3	veil	4	162637.33	39.71	0.000	0.000	0

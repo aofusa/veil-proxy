@@ -38,6 +38,9 @@
 #   例) sh tools/perf/freebsd/run_perf_freebsd.sh -r 3 -d 15
 #       sh tools/perf/freebsd/run_perf_freebsd.sh h1_file_tls h2_file_tls
 #
+# 計測結果の記録先: docs/perf/README.md の「FreeBSD ネイティブ計測」節（分析）と
+#   docs/perf/freebsd_results_raw.tsv（生データ）。公開する結果はこの 2 つへ反映すること。
+#
 # 出力: TSV（既定 ${WORK}/results_raw.tsv）
 #   scenario  server  iter  rps  transfer_mbps  p50_ms  p99_ms  errors
 # =============================================================================
