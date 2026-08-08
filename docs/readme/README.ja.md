@@ -285,6 +285,25 @@ Docker コンテナでのインストール・起動・curl 動作確認（両�
 > - HTTP/3 は UDP ベースのため kTLS と併用不可
 
 
+
+### ビルドプロファイル
+
+- **`cargo build --release`** は cargo 既定（`lto = false` / `codegen-units = 16`）。
+  Linux x86_64 と FreeBSD aarch64 の両方で実測した結果、veil のワークロードでは
+  **LTO によるスループット差は誤差範囲**だった（ホットパスは syscall・TLS 暗号処理・
+  コンテキストスイッチが支配的で、クレート跨ぎ呼び出しのコストは相対的に小さい）。
+  そのため開発・E2E・perf 計測のビルドを遅くしてまで有効にしない
+  （fat LTO は FreeBSD の増分ビルドで実測 26 秒 → 4 分 25 秒）。release はシンボルを
+  残すので、DTrace のスタックや panic のバックトレースを関数名で読める。
+- **`cargo build --profile dist`** が配布用（`inherits = "release"` +
+  `lto = "fat"` + `codegen-units = 1` + `strip = "symbols"`）。実測 36.8MB → 25.3MB
+  （**-31%**）。packaging のみが使う（`docker/Dockerfile.*`、
+  `packaging/scripts/build.sh`、`tools/qemu/bsd-vm.sh` は `CARGO_PROFILE=dist`）。
+- **`panic = "abort"` は意図的に使わない。** `src/system.rs` がコネクションのタスクを
+  `catch_unwind` で包み、1 リクエストの panic をログに記録してワーカーを生かす設計。
+  abort にすると 1 本の不正リクエストでプロキシ全体が落ち、`ConnectionGuard` の
+  `Drop`（接続数の計上）も走らない。
+
 ## 起動
 
 ```bash

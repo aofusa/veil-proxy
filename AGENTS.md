@@ -59,6 +59,36 @@ AI エージェントおよびコントリビュータ向けの **最小指針**
 
 ---
 
+## ビルドプロファイル（F-147）
+
+- **`[profile.release]` は cargo 既定のまま**（`lto=false` / `codegen-units=16`）。
+  Linux x86_64・FreeBSD aarch64 の両方で実測した結果、**LTO はスループットに影響せず
+  効くのはバイナリサイズだけ**だったため、日常のビルド（開発・E2E・perf 反復）を
+  遅くしてまで有効にしない（fat LTO は FreeBSD 増分ビルドで実測 26 秒 → 4 分 25 秒）。
+- **配布バイナリは `[profile.dist]`**（`inherits = "release"` + `lto="fat"` +
+  `codegen-units=1` + `strip="symbols"`）。実測 36.8MB → 25.3MB（**-31%**）。
+  packaging のみが使う: `docker/Dockerfile.*`（builder ステージ）、
+  `packaging/scripts/build.sh`、`tools/qemu/bsd-vm.sh`（`CARGO_PROFILE=dist`）。
+  `--release` はシンボルを残すので DTrace とバックトレースが読める（perf 調査に必須）。
+- **`panic = "abort"` は使用禁止**。`src/system.rs` の `CatchUnwindFuture` が
+  `catch_unwind` でコネクション単位の panic を捕捉してワーカーを生かす設計であり、
+  abort にすると 1 本の不正リクエストでプロキシ全体が落ち、`ConnectionGuard` の
+  Drop（接続数カウンタ）も走らない。
+
+## ホットパスの落とし穴（実測で判明）
+
+- **`config::load_backend` はリクエストごとに呼ばれる**（`upstream.rs` の
+  `find_backend_unified` がルート照合のたびに Backend を組み立てる）。ここに
+  同期 FS 呼び出しを足すと即座に「1 リクエスト 1 syscall」になる（B-64 で
+  `canonicalize`/`fs::metadata` を実測検出。設定に対して不変な値は
+  スレッドローカルにメモ化すること）。**`#[allow(clippy::disallowed_methods)]` の
+  「コールドパスだから安全」という根拠を鵜呑みにしないこと**（B-64 のものは事実と
+  異なっていた）。
+- **性能改善は必ず交互 A/B で確認する**。計測環境（QEMU VM）は同一バイナリでも
+  ラウンド間で 1.8 倍変動する。時間をまたいだ比較は無意味
+  （B-64 では syscall を 2 つ消しても中央値に差が出なかった＝そこはボトルネックでは
+  なかった、という結論を交互 A/B で初めて確定できた）。
+
 ## コーディング規約
 
 - 既存に合わせる（多くは **日本語のモジュール／doc コメント**）。英語への統一リファクタはしない。

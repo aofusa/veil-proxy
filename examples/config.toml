@@ -226,6 +226,14 @@ key_path = "/path/to/key.pem"
 
 # kTLS有効化（Linux 5.15+ または FreeBSD 13.0+、feature flag必須。F-126）
 # FreeBSD では別途 `sysctl kern.ipc.tls.enable=1` が必要（既定 0）。
+#
+# 【FreeBSD の注意】**大きなレスポンスを扱う用途では有効にしないこと**。
+# FreeBSD の software kTLS は TLS レコードごとにカーネルワーカースレッドへ
+# 暗号処理をディスパッチするため、54KB 応答の実測でスループットが中央値 26% 低下し、
+# 1.2 GB/s で直列化により張り付く（コンテキストスイッチ約 400,000 回/秒 =
+# 1 リクエストあたり約 17 回。CPU は 51% アイドルのまま接続数を 64→512 に
+# 増やしても伸びない）。小さなレスポンス主体なら有意差は無い。
+# 詳細は docs/perf/README.md の「FreeBSD の kTLS は大きな応答で不利」節。
 ktls_enabled = true
 
 # kTLS有効化失敗時にrustlsへフォールバックするかどうか

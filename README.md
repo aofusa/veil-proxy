@@ -290,6 +290,25 @@ See [packaging/README.md](packaging/README.md) for details (Docker build, postin
 > - **Allocator features** (`mimalloc`, `jemalloc`, `system-allocator`) are mutually exclusive — enable at most one
 > - HTTP/3 is UDP-based and cannot be combined with kTLS
 
+
+### Build profiles
+
+- **`cargo build --release`** uses Cargo's defaults (`lto = false`, `codegen-units = 16`).
+  Measured on Linux x86_64 and FreeBSD aarch64, LTO makes **no measurable throughput
+  difference** for veil's workload — the hot path is dominated by syscalls, TLS crypto and
+  context switches, not cross-crate call overhead — so it is not worth slowing every
+  development/E2E/perf build down (fat LTO took a FreeBSD incremental build from 26s to 4m25s).
+  Release binaries keep their symbol table, which is what makes DTrace stacks and panic
+  backtraces readable during performance work.
+- **`cargo build --profile dist`** is the distribution profile: `inherits = "release"` plus
+  `lto = "fat"`, `codegen-units = 1` and `strip = "symbols"`. Measured 36.8MB → 25.3MB
+  (**-31%**). Only the packaging path uses it (`docker/Dockerfile.*`,
+  `packaging/scripts/build.sh`, and `tools/qemu/bsd-vm.sh` via `CARGO_PROFILE=dist`).
+- **`panic = "abort"` is deliberately not used.** `src/system.rs` wraps connection tasks in
+  `catch_unwind` so a panic in one request is logged and the worker survives; aborting would
+  turn a single malformed request into a full proxy outage, and `ConnectionGuard`'s `Drop`
+  (connection accounting) would not run either.
+
 ## Startup
 
 ```bash
