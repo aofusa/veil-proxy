@@ -1176,19 +1176,32 @@ _default_features() {
     esac
 }
 CARGO_FEATURES="${CARGO_FEATURES:-$(_default_features)}"
+# ビルドプロファイル。既定は `release`（perf 計測・E2E 用。シンボルが残るので DTrace で
+# 関数名が読め、増分ビルドも速い）。**配布パッケージを作るときは `dist` を指定する**
+# （F-147: fat LTO + codegen-units=1 + strip=symbols。サイズ -24.9% だがビルドは
+# 実測 26 秒 → 4 分 25 秒と大幅に遅くなるため既定にはしない）:
+#   CARGO_PROFILE=dist tools/qemu/bsd-vm.sh freebsd aarch64 build
+CARGO_PROFILE="${CARGO_PROFILE:-release}"
+# `--release` と `--profile dist` で cargo の引数表記が異なる（出力先はどちらも
+# target/<プロファイル名>/ なのでパスは ${CARGO_PROFILE} で共通に扱える）。
+if [[ "${CARGO_PROFILE}" == "release" ]]; then
+    CARGO_PROFILE_ARG="--release"
+else
+    CARGO_PROFILE_ARG="--profile ${CARGO_PROFILE}"
+fi
 
 cmd_build() {
     cmd_sync
     log "in-VM リリースビルド（--no-default-features --features ${CARGO_FEATURES}）"
-    cmd_ssh "cd ${GUEST_ROOT} && $(_guest_env_prefix) cargo build --release --no-default-features --features '${CARGO_FEATURES}'"
-    cmd_ssh "ls -l ${GUEST_ROOT}/target/release/veil"
+    cmd_ssh "cd ${GUEST_ROOT} && $(_guest_env_prefix) cargo build ${CARGO_PROFILE_ARG} --no-default-features --features '${CARGO_FEATURES}'"
+    cmd_ssh "ls -l ${GUEST_ROOT}/target/${CARGO_PROFILE}/veil"
     # NetBSD は PaX MPROTECT がシステム全体で有効（security.pax.mprotect.*）なため、
     # wasmtime の wasm 実行用 mmap/mprotect が EACCES で落ちる（B-60）。paxctl +m で
     # ビルド直後のバイナリの MPROTECT 制限を解除しておく（無ければ警告のみで継続、
     # 他 OS ゲストでは no-op）。e2e/fetch とも同じバイナリを参照するのでここで一度
     # 掛けておけば十分。
     if [[ "${OS_NAME}" == "netbsd" ]]; then
-        cmd_ssh "if [ -x /usr/sbin/paxctl ]; then /usr/sbin/paxctl +m ${GUEST_ROOT}/target/release/veil && echo 'paxctl +m applied'; else echo 'WARNING: paxctl not found, skipping PaX MPROTECT disable (wasm may fail, B-60)'; fi"
+        cmd_ssh "if [ -x /usr/sbin/paxctl ]; then /usr/sbin/paxctl +m ${GUEST_ROOT}/target/${CARGO_PROFILE}/veil && echo 'paxctl +m applied'; else echo 'WARNING: paxctl not found, skipping PaX MPROTECT disable (wasm may fail, B-60)'; fi"
     fi
 }
 
@@ -1225,7 +1238,7 @@ cmd_fetch() {
     mkdir -p "${out_dir}"
     local dest="${out_dir}/veil-${OS_NAME}-${arch_label}"
     log "VM から release バイナリを取得 → ${dest}"
-    cmd_scp "${SSH_USER}@127.0.0.1:${GUEST_ROOT}/target/release/veil" "${dest}"
+    cmd_scp "${SSH_USER}@127.0.0.1:${GUEST_ROOT}/target/${CARGO_PROFILE}/veil" "${dest}"
     chmod +x "${dest}"
     cmd_ssh 'uname -r' > "${dest}.os-version"
     log "取得完了: ${dest}（OS バージョン: $(cat "${dest}.os-version")）"

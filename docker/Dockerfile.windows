@@ -103,14 +103,8 @@ COPY . /app
 # cacher 段はスタブの src/main.rs / src/lib.rs で release 成果物をキャッシュしている。
 # 実ソースへ差し替えた後は全 .rs の mtime を更新して再コンパイルを強制する
 # （main.rs だけ touch すると lib のスタブ成果物が最新と誤判定され veil::run 未定義になる）。
-# 配布バイナリはシンボルテーブルまで除去する（`strip = "symbols"` 相当）。
-# 実測: none 36.8MB → debuginfo 36.2MB（-1.7%）→ symbols 28.7MB（**-22%**）。
-# release ビルドは元々 debug=0 なので DWARF はほとんど無く、効くのはシンボル表の除去。
-# 既定プロファイル（[profile.release] strip = "debuginfo"）は E2E/perf でのバックトレース
-# 可読性を優先しシンボルを残すため、**配布ビルドでのみ**ここで上書きする。
-ENV CARGO_PROFILE_RELEASE_STRIP=symbols
 RUN find src -name '*.rs' -exec touch {} + \
-    && cargo xwin build --release --target "${RUST_TARGET}" \
+    && cargo xwin build --profile dist --target "${RUST_TARGET}" \
          --no-default-features --features "${CARGO_FEATURES}" --locked
 
 # ==========================================
@@ -126,6 +120,6 @@ FROM scratch AS artifact
 
 ARG RUST_TARGET=x86_64-pc-windows-msvc
 
-COPY --from=builder /app/target/${RUST_TARGET}/release/veil.exe /veil.exe
+COPY --from=builder /app/target/${RUST_TARGET}/dist/veil.exe /veil.exe
 
 ENTRYPOINT ["/veil.exe"]

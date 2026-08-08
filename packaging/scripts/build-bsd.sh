@@ -161,6 +161,9 @@ install -m 0755 "${BINARY}" "${stage_parent}/${dir_name}/veil"
 # ビルド時に strip すると診断が効かなくなるため、**配布パッケージを作る本スクリプトで
 # だけ** strip する。strip(1) が無い環境では警告のみで続行する。
 # STRIP_BINARY=0 を渡すと抑止できる（クラッシュ解析用に symbol を残したい場合）。
+# `CARGO_PROFILE=dist` でビルドしたバイナリは既に strip 済み（profile.dist の
+# strip = "symbols"）なので、ここでの strip は no-op になる。既定の `release` で
+# ビルドしたバイナリ（perf 計測と同じもの）をパッケージ化する場合にのみ効く。
 if [ "${STRIP_BINARY:-1}" = "1" ]; then
     if command -v strip >/dev/null 2>&1; then
         _before=$(wc -c < "${stage_parent}/${dir_name}/veil")
