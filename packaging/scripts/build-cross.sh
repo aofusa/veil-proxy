@@ -11,7 +11,7 @@
 #              FreeBSD クロスで組み立てられずリンクに失敗する）。FreeBSD は
 #              tools/qemu/bsd-vm.sh の VM 内ネイティブビルドを使うこと。
 #
-# BSD 向けは `full` ではなく `full-freebsd`（jemalloc + POSIX AIO）を既定にする。
+# BSD 向けは `full` ではなく `full-freebsd`（jemalloc）を既定にする。
 # OpenBSD（VM ネイティブビルド、tools/qemu/bsd-vm.sh）は `full-openbsd`
 # （システムアロケータ + 同梱 rustls(ring)/quiche(BoringSSL)）を使う。
 #
@@ -49,9 +49,12 @@ DEFAULT_MACOS_FEATURES="full"
 # Windows クロスビルドデフォルト feature セット（full: http3, wasm 含む全機能）。
 DEFAULT_WINDOWS_FEATURES="full"
 
-# FreeBSD x86_64 クロスビルドデフォルト feature セット。
-# `full` と機能セットは同じだが、**アロケータを jemalloc**（mimalloc ではなく）にし、
-# **POSIX AIO 経路（F-127）を有効**にした BSD 向けセット（Cargo.toml の `full-freebsd`）。
+# FreeBSD クロスビルドのデフォルト feature セット（**アーキ非依存**: x86_64 / aarch64 とも
+# 同じ `full-freebsd` を使う。旧 `full-freebsd-aarch64` は内容が同一だったため廃止した）。
+# `full` と機能セットは同じで、**アロケータを jemalloc**（mimalloc ではなく）にした
+# BSD 向けセット（Cargo.toml の `full-freebsd`）。
+# POSIX AIO 経路（F-127、`aio` feature）は **含まない**: readiness 経路より遅く、
+# HTTP/2 の小レスポンス高並行でサーバが停止するため既定から除外した（B-63）。
 # TLS 暗号・quiche とも aws-lc-sys を共有する（AWS_LC_SYS_NO_PREFIX=1）。
 DEFAULT_FREEBSD_FEATURES="full-freebsd"
 
