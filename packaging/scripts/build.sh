@@ -2,6 +2,14 @@
 # veil Linux パッケージ統合ビルド（.deb + .rpm + glibc/musl バイナリ tar.gz）
 set -euo pipefail
 
+# 配布バイナリはシンボルテーブルまで除去する（`strip = "symbols"` 相当、-22%）。
+# 実測: none 36.8MB → debuginfo 36.2MB（-1.7%）→ symbols 28.7MB。release ビルドは
+# 元々 debug=0 で DWARF がほぼ無いため、効くのはシンボル表の除去である。
+# 既定プロファイル（[profile.release] strip = "debuginfo"）は E2E/perf でのバックトレース
+# 可読性のためシンボルを残すので、**配布ビルドのここでだけ**上書きする。
+# 明示的に上書きしたい場合は呼び出し側で CARGO_PROFILE_RELEASE_STRIP を設定する。
+export CARGO_PROFILE_RELEASE_STRIP="${CARGO_PROFILE_RELEASE_STRIP:-symbols}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 PKG_ROOT="${ROOT}/packaging"

@@ -64,3 +64,8 @@ __pycache__/
 # perf 計測専用の独立クレート（tools/perf/h3load）のビルド成果物。
 # 本体ワークスペース外なので target/ もここに生成される。
 /tools/perf/h3load/target/
+
+# tools/perf/profile_ab.sh がリリースプロファイル A/B 用に作る一時ビルドディレクトリ
+# （それぞれ数 GB。git のインデックス走査を遅くするため必ず除外する）
+/target-prof/
+/target-prof-bins/

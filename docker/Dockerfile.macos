@@ -93,6 +93,12 @@ COPY --from=cacher /app/benches /app/benches
 COPY . /app
 
 # cacher 段のスタブ成果物を確実に置き換えるため全 .rs の mtime を更新する
+# 配布バイナリはシンボルテーブルまで除去する（`strip = "symbols"` 相当）。
+# 実測: none 36.8MB → debuginfo 36.2MB（-1.7%）→ symbols 28.7MB（**-22%**）。
+# release ビルドは元々 debug=0 なので DWARF はほとんど無く、効くのはシンボル表の除去。
+# 既定プロファイル（[profile.release] strip = "debuginfo"）は E2E/perf でのバックトレース
+# 可読性を優先しシンボルを残すため、**配布ビルドでのみ**ここで上書きする。
+ENV CARGO_PROFILE_RELEASE_STRIP=symbols
 RUN find src -name '*.rs' -exec touch {} + \
     && cargo zigbuild --release --target "${RUST_TARGET}" \
          --no-default-features --features "${CARGO_FEATURES}" --locked

@@ -152,6 +152,28 @@ mkdir -p "${stage_parent}/${dir_name}"
 # バイナリ
 install -m 0755 "${BINARY}" "${stage_parent}/${dir_name}/veil"
 
+# 配布パッケージのバイナリはシンボル表まで除去する（実測 36.8MB → 28.7MB、-22%）。
+# release ビルドは元々 debug=0 で DWARF がほぼ無いため、効くのはシンボル表の除去である
+# （`strip --strip-debug` は -1.7% にしかならない）。
+#
+# **ここで strip する理由**: BSD バイナリは `tools/qemu/bsd-vm.sh build` が VM 内で
+# 作るが、そのバイナリは perf 計測（DTrace で関数名を見る）や E2E にも使う。
+# ビルド時に strip すると診断が効かなくなるため、**配布パッケージを作る本スクリプトで
+# だけ** strip する。strip(1) が無い環境では警告のみで続行する。
+# STRIP_BINARY=0 を渡すと抑止できる（クラッシュ解析用に symbol を残したい場合）。
+if [ "${STRIP_BINARY:-1}" = "1" ]; then
+    if command -v strip >/dev/null 2>&1; then
+        _before=$(wc -c < "${stage_parent}/${dir_name}/veil")
+        strip --strip-all "${stage_parent}/${dir_name}/veil" 2>/dev/null \
+            || strip "${stage_parent}/${dir_name}/veil" 2>/dev/null \
+            || echo "WARNING: strip に失敗（サイズ削減なしで続行）" >&2
+        _after=$(wc -c < "${stage_parent}/${dir_name}/veil")
+        echo "==> strip: ${_before} -> ${_after} bytes"
+    else
+        echo "WARNING: strip(1) が見つからないためシンボル除去をスキップ" >&2
+    fi
+fi
+
 # NetBSD は PaX MPROTECT がシステム全体で強制されており（security.pax.mprotect.*）、
 # wasmtime の wasm 実行用 mmap/mprotect が EACCES で失敗する（B-60、OpenBSD の
 # wxallowed/MAP_STACK 制約・B-52 の NetBSD 版に相当）。paxctl(8) は NetBSD 上にしか

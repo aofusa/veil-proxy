@@ -39,6 +39,56 @@ build = "build.rs"
 name = "veil"
 path = "src/lib.rs"
 
+# ---------------------------------------------------------------------------
+# リリースプロファイル（F-147）
+# ---------------------------------------------------------------------------
+# 以前は `[profile.release]` が無く cargo 既定（lto=false / codegen-units=16）で
+# 配布バイナリを作っていた。Linux x86_64 と FreeBSD aarch64 の両方で実測して決めた。
+#
+# **実測の結論: LTO はスループットにはほぼ影響せず、効くのはバイナリサイズ**。
+# veil のホットパスは syscall・TLS 暗号処理・コンテキストスイッチが支配的で、
+# LTO がインライン化するクレート跨ぎの呼び出しコストは相対的に小さいため。
+#
+# | 計測 | baseline | fat LTO + cgu=1 |
+# |---|---|---|
+# | Linux x86_64 54KB / 3B | 2,542 / 4,793 rps | 2,571 / 4,803 rps（誤差範囲） |
+# | FreeBSD aarch64 54KB / 3B | 22,995 / 161,028 rps | 22,832 / 159,064 rps（誤差範囲） |
+# | バイナリサイズ Linux | 36.8MB | **28.9MB（-21.6%）** |
+# | バイナリサイズ FreeBSD | 31.8MB | **23.9MB（-24.9%）** |
+#
+# 【ビルド時間の注意】fat LTO + codegen-units=1 は release ビルドを大幅に遅くする
+# （FreeBSD ゲストの増分ビルドで実測 26 秒 → 4 分 25 秒）。E2E はデバッグビルドを
+# 使うので影響しないが、perf 計測を回すときなど反復を速くしたい場合は
+# `CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16` で
+# 一時的に無効化できる（Cargo.toml を編集する必要はない）。
+[profile.release]
+# 既定と同じだが、性能最優先の意図を明示するため書いておく。
+opt-level = 3
+# クレート跨ぎの最適化。主目的はサイズ削減（上表）。
+lto = "fat"
+# コード生成単位を 1 にして最適化範囲を最大化する（LTO と併用）。
+codegen-units = 1
+# **`panic = "abort"` は使ってはならない。**
+# `src/system.rs` の `CatchUnwindFuture` が `std::panic::catch_unwind` で
+# コネクション単位のパニックを捕捉し、ワーカースレッドを生かしたままログに記録する
+# （`spawn_with_panic_catch` / `spawn_pooled_with_panic_catch`）。abort にすると
+# この保護が消え、**1 本の不正リクエストで生じた panic がプロキシ全体を落とす**。
+# さらに巻き戻しが起きないため `ConnectionGuard` の Drop（接続数カウンタの整合性）も
+# 走らない。バイナリサイズと僅かな速度のために可用性を捨てる取引は割に合わない。
+panic = "unwind"
+# デバッグ情報のみ除去する（シンボル表は残す）。実測で none 36.8MB →
+# debuginfo 36.2MB（-1.7%）→ symbols 28.7MB（-22%）であり、debug=0 の release では
+# DWARF がほとんど無いため効果は小さい。それでもシンボルを残すのは、E2E・perf 計測・
+# DTrace でスタックを関数名で読めることの価値が大きいため（実測で B-63 / kTLS の
+# ボトルネック特定に不可欠だった）。
+# **配布バイナリは packaging 側で `CARGO_PROFILE_RELEASE_STRIP=symbols` を指定して
+# シンボル表まで除去する**（docker/Dockerfile.* と packaging/scripts/*）。
+strip = "debuginfo"
+# 既定と同じだが明示する。有効化すると算術演算ごとにチェックが入りホットパスが遅くなる。
+overflow-checks = false
+debug = false
+incremental = false
+
 [features]
 # デフォルトビルド（kTLS + HTTP/2 + mimalloc）
 default = ["ktls", "http2", "mimalloc"]
