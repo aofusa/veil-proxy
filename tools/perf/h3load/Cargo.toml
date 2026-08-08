@@ -1,0 +1,58 @@
+# h3load — ポータブル HTTP/3 (QUIC) 負荷生成ツール（perf 計測専用）
+#
+# **veil 本体のワークスペースからは意図的に除外している**（ルート Cargo.toml の
+# `[workspace] exclude`）。理由:
+#
+# 1. 通常のビルド・テスト・パッケージングに一切影響させないため。以前はルートの
+#    `[[example]]` として宣言していたが、cargo は**マニフェスト解析の時点で**
+#    宣言済みターゲットのソース有無を検査するため、Docker のビルドコンテキスト
+#    （`.dockerignore` がホワイトリスト方式）や依存キャッシュ段のスタブツリーに
+#    ソースが無いだけで**全プラットフォームのコンテナビルドが失敗した**。
+#    計測専用ツールが本体の配布ビルドを壊すのは筋が悪い。
+# 2. 依存関係を本体と切り離せる。AGENTS.md の方針どおり `quiche` は本番データプレーン
+#    （`src/http3_server.rs`）専用とし、テスト・計測ツールは `quinn` + `h3` を使う
+#    （`tests/common/http3_client.rs` と同じ構成）。rustls の暗号プロバイダも ring 固定
+#    にすることで、本体のターゲット別 TLS 構成（aws-lc-rs / ring の切り替え）から
+#    完全に独立させている。quiche 版と異なり cmake / 同梱 BoringSSL のビルドは不要。
+#
+# ビルド（計測時のみ・明示的に）:
+#   cargo build --release --manifest-path tools/perf/h3load/Cargo.toml
+#
+# 生成物: tools/perf/h3load/target/release/h3load
+
+# 空の [workspace] テーブルで**独立したワークスペースルート**にする。
+# ルート Cargo.toml の `[workspace] exclude` だけでは不十分: cargo には
+# 「members に含まれるディレクトリ配下の path には exclude が効かない」既知の挙動があり
+# （rust-lang/cargo#6745、本リポジトリは `members = ["."]` でルート自身がメンバー）、
+# third_party/wasmtime と同じ理由でここも exclude の対象外になる。
+# 空の [workspace] を置くと cargo はこのクレートを親と無関係に扱う（cargo 自身の推奨）。
+[workspace]
+
+[package]
+name = "h3load"
+version = "0.1.0"
+edition = "2021"
+description = "Portable HTTP/3 (QUIC) load generator for veil perf measurement"
+license = "Apache-2.0 OR MIT"
+publish = false
+
+[[bin]]
+name = "h3load"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP/3 クライアント実装。本体の `src/http3_server.rs` は quiche だが、テスト・計測
+# ツールは quinn + h3 を使う方針（AGENTS.md、tests/common/http3_client.rs と同じ構成）。
+# バージョンはルート Cargo.toml の dev-dependencies と揃えている。
+h3 = "0.0.8"
+quinn = { version = "0.11.9", features = ["runtime-tokio", "rustls"] }
+h3-quinn = "0.0.10"
+tokio = { version = "1.48", features = ["full"] }
+# quinn の `rustls` feature は `rustls-ring` の別名。本体・本ツールの依存を分離するため
+# 明示的に ring を使う（aws-lc-rs は使わない。cmake 不要で自己完結する）。
+rustls = { version = "0.23.35", default-features = false, features = ["ring"] }
+bytes = "1"
+http = "1"
+
+[profile.release]
+opt-level = 3

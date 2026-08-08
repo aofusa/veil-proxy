@@ -60,3 +60,7 @@ tools/perf/results/
 # Python バイトコードキャッシュ（tools/qemu の provision スクリプト等）
 __pycache__/
 *.pyc
+
+# perf 計測専用の独立クレート（tools/perf/h3load）のビルド成果物。
+# 本体ワークスペース外なので target/ もここに生成される。
+/tools/perf/h3load/target/

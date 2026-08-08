@@ -15,7 +15,11 @@ members = [".", "fuzz"]
 # `third_party/wasmtime/Cargo.toml` 側で `[[test]]` を削除し（未取り込みの tests/ を
 # 参照していたため）、CI/検証コマンドは `-p veil` 相当（デフォルトカレントパッケージ）
 # で third_party 配下まで踏み込まないことで実質的に回避する。
-exclude = ["third_party/wasmtime"]
+# tools/perf/h3load は perf 計測専用の独立クレート（HTTP/3 負荷生成ツール）。
+# 本体のビルド・テスト・パッケージングから完全に切り離すためワークスペース外に置く
+# （詳細は tools/perf/h3load/Cargo.toml の冒頭コメント）。計測時のみ
+# `cargo build --release --manifest-path tools/perf/h3load/Cargo.toml` で明示ビルドする。
+exclude = ["third_party/wasmtime", "tools/perf/h3load"]
 # resolver v2: dev-dependencies の feature を通常ビルド（`cargo build`）へ統合しない。
 # これにより OpenBSD 本体ビルドがテスト用 dev-deps（hyper-rustls/quinn/tokio-rustls/rcgen
 # の aws_lc_rs）に引きずられて aws-lc-sys を要求することを防ぎ、ring のみでビルドできる
@@ -631,15 +635,6 @@ harness = false
 name = "wasm"
 harness = false
 required-features = ["wasm"]
-
-# h3load: ポータブル HTTP/3 (QUIC) 負荷生成ツール（examples/h3load.rs）。
-# FreeBSD 等 Docker の使えないプラットフォームに QUIC 対応の h2load 相当が無いため、
-# 既に依存している quiche クレートで自前クライアントを提供する（tools/perf/freebsd/ 用）。
-# quiche を直接使うため http3 が必要。無指定だと `--all-targets` で feature 無効時にも
-# 展開され `unresolved module quiche` になる（上の bench "http3" と同じ理由）。
-[[example]]
-name = "h3load"
-required-features = ["http3"]
 
 # HTTP/3 用 QUIC 実装（Cloudflare quiche）ターゲット別設定
 # Linux は default-features = false で aws-lc-sys と共有（memfd 経由の従来経路、F-136で不変）

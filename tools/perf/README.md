@@ -50,11 +50,12 @@
 > スキップされます（gRPC/WebSocket/その他は影響しません）。
 >
 > **Docker が無い環境（FreeBSD 等）で HTTP/3 を計測する場合**は、上記 QUIC 対応 h2load の
-> 代わりに veil 自身が依存する `quiche` クレートで実装した自前クライアント
-> `examples/h3load.rs`（`h2load` 互換の CLI・出力書式、`cargo build --release --example h3load
-> --features http3` でビルド）を使えます。`tools/perf/freebsd/run_perf_freebsd.sh` はこれを
-> 優先して使い（無ければ `h2load --h3` にフォールバック）、詳細は同スクリプトのヘッダコメントを
-> 参照してください。
+> 代わりに `quinn` + `h3`（テスト・計測ツール向けの HTTP/3 ライブラリ。本番データプレーンの
+> `quiche` とは別方針、AGENTS.md 参照）で実装した自前クライアント
+> `tools/perf/h3load`（`h2load` 互換の CLI・出力書式、`cargo build --release --manifest-path
+> tools/perf/h3load/Cargo.toml` でビルド）を使えます。`tools/perf/freebsd/run_perf_freebsd.sh` は
+> これを優先して使い（無ければ `h2load --h3` にフォールバック）、詳細は同スクリプトのヘッダ
+> コメントを参照してください。
 
 ---
 

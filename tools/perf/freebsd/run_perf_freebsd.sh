@@ -13,15 +13,14 @@
 #
 # HTTP/3 計測（h3_file シナリオ）:
 #   FreeBSD の nghttp2 pkg の h2load は ngtcp2 非搭載で QUIC を計測できない（curl pkg も
-#   HTTP/3 非対応）。そのため veil 自身が依存する quiche クレートで作った自前クライアント
-#   `examples/h3load.rs`（`${REPO}/target/release/examples/h3load`）を優先して使う。
+#   HTTP/3 非対応）。そのため quinn + h3（テスト・計測ツール向けの HTTP/3 ライブラリ。
+#   本番データプレーンの quiche とは別方針、AGENTS.md 参照）で作った自前クライアント
+#   `tools/perf/h3load`（`${REPO}/tools/perf/h3load/target/release/h3load`）を優先して使う。
 #   事前にビルドしておくこと（FreeBSD の perf ビルドは
-#   `--no-default-features --features full-freebsd` を使うため、example も同じ
-#   feature セットで揃える必要がある。http3 を含んでいれば良い）:
-#     cargo build --release --example h3load --no-default-features \
-#         --features full-freebsd
-#   （feature セットはアーキ非依存なので x86_64 / aarch64 とも同じ名前でよい。
-#    h3load 自体はどのターゲットでも http3 feature のみ要求する）
+#   h3load は **veil 本体のワークスペース外の独立クレート**なので、本体の feature とは
+#   無関係に単体でビルドする（本体の通常ビルド・パッケージングには一切含まれない）:
+#     cargo build --release --manifest-path tools/perf/h3load/Cargo.toml
+#   （quinn + h3 は cmake 不要でビルドできる）
 #   ビルド済みバイナリが無い場合は `h2load --h3` にフォールバックする（QUIC 非対応ビルドでは
 #   計測失敗になる点に注意。ログに警告を出す）。
 #
@@ -51,9 +50,9 @@ set -eu
 WORK="${WORK:-/tmp/veilperf}"
 REPO="${REPO:-$(cd "$(dirname "$0")/../../.." && pwd)}"
 VEIL_BIN="${VEIL_BIN:-${REPO}/target/release/veil}"
-# HTTP/3 (QUIC) 負荷生成: quiche ベースの自前クライアント（examples/h3load.rs）。
+# HTTP/3 (QUIC) 負荷生成: quinn + h3 ベースの自前クライアント（tools/perf/h3load、独立クレート）。
 # 無ければ measure() が h2load --h3 へフォールバックする（QUIC 非対応ビルドでは失敗する）。
-H3LOAD_BIN="${H3LOAD_BIN:-${REPO}/target/release/examples/h3load}"
+H3LOAD_BIN="${H3LOAD_BIN:-${REPO}/tools/perf/h3load/target/release/h3load}"
 
 ITERATIONS="${ITERATIONS:-3}"
 DURATION="${DURATION:-15}"
@@ -418,7 +417,7 @@ run_h2load() {
 }
 
 # run_h3load <url> -> 同上（h3load.rs の固定書式を前提にパースする。h2load と違い
-# こちらは veil 自身の examples/h3load.rs が出力する書式なので構造が完全に既知）。
+# こちらは同梱の tools/perf/h3load が出力する書式なので構造が完全に既知）。
 run_h3load() {
     url="$1"
     total=$(( CONNECTIONS * 2000 ))
@@ -505,7 +504,7 @@ measure() {
         h2load)    run_h2load "$2" ;;
         h2load_h3)
             # FreeBSD の nghttp2 pkg の h2load は ngtcp2 非搭載で QUIC を計測できないため、
-            # quiche ベースの自前クライアント h3load（examples/h3load.rs）を優先する。
+            # quinn + h3 ベースの自前クライアント h3load（tools/perf/h3load）を優先する。
             # 未ビルドの場合のみ `h2load --h3`（= --alpn-list=h3 + QUIC 強制）へ
             # フォールバックする（QUIC 非対応ビルドでは計測失敗になる）。
             if [ -x "${H3LOAD_BIN}" ]; then

@@ -192,7 +192,7 @@ main / feat/h2-multiplexing を各イメージ再ビルドの上で連続計測�
     接続チャーン）・B-45（L4 半クローズ未伝搬）・B-46（H3 content-length 重複）を検出・
     修正**し、修正後の再計測で全行 Non-2xx=0。`--net=host` + GSO/GRO の HTTP/3 参考値も追加。
 
-12. **FreeBSD ネイティブ計測（2026-08-07、F-145 / B-63）**: DTrace で 1 リクエスト約 20 syscall を実測し、`aio`（POSIX AIO）が 1 I/O あたり 3 syscall で readiness 経路より遅く、かつ HTTP/2 の小レスポンス高並行でサーバを完全停止させることを発見（`full-freebsd*` の既定から除外）。小レスポンスで HTTP/1.1 TLS +77.6%・L4 TCP 約 5.5 倍。HTTP/3 は自作 `examples/h3load.rs` で初めて計測可能になった。
+12. **FreeBSD ネイティブ計測（2026-08-07、F-145 / B-63）**: DTrace で 1 リクエスト約 20 syscall を実測し、`aio`（POSIX AIO）が 1 I/O あたり 3 syscall で readiness 経路より遅く、かつ HTTP/2 の小レスポンス高並行でサーバを完全停止させることを発見（`full-freebsd*` の既定から除外）。小レスポンスで HTTP/1.1 TLS +77.6%・L4 TCP 約 5.5 倍。HTTP/3 は自作 `tools/perf/h3load`（本体ワークスペース外の独立クレート）で初めて計測可能になった。
 
 ## FreeBSD ネイティブ計測（2026-08-07、F-145 / B-63）
 
@@ -205,7 +205,7 @@ main / feat/h2-multiplexing を各イメージ再ビルドの上で連続計測�
   サーバ 2 コア・負荷生成 2 コア、loopback
 - 比較対象: nginx 1.29（FreeBSD pkg、`--with-http_v2_module` / `--with-http_v3_module` /
   `--with-stream`）
-- 負荷: HTTP/1.1 = wrk / HTTP/2・h2c = h2load / **HTTP/3 = 自作 `examples/h3load.rs`**
+- 負荷: HTTP/1.1 = wrk / HTTP/2・h2c = h2load / **HTTP/3 = 自作 `tools/perf/h3load`**
   （FreeBSD の nghttp2 pkg の h2load は ngtcp2 非同梱、curl pkg も HTTP/3 非対応のため）
 - 配信ファイルは 54KB（バイト単価）と 3B（リクエスト単価）の 2 種
 
@@ -318,8 +318,7 @@ CARGO_FEATURES=full-freebsd-aarch64 tools/qemu/bsd-vm.sh freebsd aarch64 build
 
 # 2) HTTP/3 クライアント（FreeBSD には QUIC 対応 h2load が無いため必須）
 #    ゲスト内で:
-cargo build --release --example h3load --no-default-features \
-    --features full-freebsd-aarch64
+cargo build --release --manifest-path tools/perf/h3load/Cargo.toml-aarch64
 
 # 3) 計測（ゲスト内。nginx / wrk / nghttp2 が必要）
 pkg install -y nginx nghttp2 wrk-luajit
