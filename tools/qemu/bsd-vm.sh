@@ -1180,7 +1180,16 @@ CARGO_FEATURES="${CARGO_FEATURES:-$(_default_features)}"
 # 関数名が読め、増分ビルドも速い）。**配布パッケージを作るときは `dist` を指定する**
 # （F-147: fat LTO + codegen-units=1 + strip=symbols。サイズ -24.9% だがビルドは
 # 実測 26 秒 → 4 分 25 秒と大幅に遅くなるため既定にはしない）:
-#   CARGO_PROFILE=dist tools/qemu/bsd-vm.sh freebsd aarch64 build
+#   VM_MEM_MB=8192 CARGO_PROFILE=dist tools/qemu/bsd-vm.sh freebsd aarch64 build
+#
+# **【注意】`dist` は既定の VM メモリ（4096MB）では OOM で失敗する**（実測: fat LTO の
+# 全プログラムリンク段階で `Killed`）。`codegen-units = 1` の fat LTO はリンク時に
+# 大量のメモリを要求するため、`VM_MEM_MB=8192` 以上で VM を作り直すこと
+# （`down` → `VM_MEM_MB=8192 up`）。
+#
+# メモリを増やせない場合は既定の `release` のままビルドし、
+# `packaging/scripts/build-bsd.sh` が行う strip でサイズ削減する
+# （strip だけでも実測 -22%。LTO 分の追加削減は得られないが配布物としては十分小さい）。
 CARGO_PROFILE="${CARGO_PROFILE:-release}"
 # `--release` と `--profile dist` で cargo の引数表記が異なる（出力先はどちらも
 # target/<プロファイル名>/ なのでパスは ${CARGO_PROFILE} で共通に扱える）。

@@ -63,6 +63,13 @@ path = "src/lib.rs"
 #
 # 使い方（packaging のスクリプト・Dockerfile が指定する。成果物は target/dist/ 配下）:
 #   cargo build --profile dist --features full
+#
+# 【メモリ要件】fat LTO + codegen-units = 1 はリンク段階で大量のメモリを使う。
+# **メモリ 4GB の FreeBSD ゲストでは OOM で失敗する**ことを実測で確認した
+# （`Killed`）。VM でビルドする場合は 8GB 以上を割り当てること
+# （`VM_MEM_MB=8192 tools/qemu/bsd-vm.sh ... up`）。割り当てられない環境では
+# `release` でビルドし `packaging/scripts/build-bsd.sh` の strip でサイズを削る
+# （strip 単体でも実測 -22%）。
 [profile.dist]
 inherits = "release"
 # クレート跨ぎ最適化とコード生成単位の集約。目的はサイズ削減（上表）。
