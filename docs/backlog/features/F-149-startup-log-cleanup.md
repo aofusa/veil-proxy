@@ -11,7 +11,11 @@
 **現在のコードと矛盾する内容の行**が混在していた。
 メッセージ本文は変えず、重複行の出力処理そのものを削る（意味は減らさない）。
 
-## 実測ログ（改修前・抜粋、`docs/artifacts/f149_startup_log_before.log` に全文）
+## 実測ログ（改修前・抜粋）
+
+全文は `docs/artifacts/f149_startup_log_before.log`（`.gitignore` の `docs/*` により
+**git 管理外**。`./tests/e2e_setup.sh start` 後の `/tmp/proxy.log` から再取得できる）。
+
 
 ```
 [src/config.rs:5296] HTTP/2 enabled via ALPN negotiation (h2, http/1.1)

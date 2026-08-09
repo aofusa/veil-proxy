@@ -153,8 +153,6 @@ impl ModuleRegistry {
 
     /// Load a module
     fn load_module(&mut self, config: &ModuleConfig) -> anyhow::Result<()> {
-        ftlog::info!("Loading WASM module: {}", config.name);
-
         // Check if file exists
         let path = Path::new(&config.path);
         if !path.exists() {

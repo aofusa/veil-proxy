@@ -40,6 +40,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use crate::udp::QuicUdpSocket;
@@ -3792,6 +3793,32 @@ type ConnectionMap = Rc<RefCell<HashMap<ConnectionId<'static>, Http3Handler>>>;
 // 借用するのは本 H3 メインループタスクのみ。バックエンドタスクは Rc チャネル + Notify
 // 経由で通信し RefCell に触れない（F-32 のアクターモデル）ため、await 中に他タスクが
 // 再入借用して panic する経路は存在しない（B-16 とは異なり単一借用者）。
+// F-149: 以下 7 種の起動時ログ（証明書ロード方式/トランスポートパラメータ/GSO・GRO/
+// リスンアドレス/パイプライン化 RECVMSG・SENDMSG）は `run_http3_server_async` の
+// 起動処理部分（ループに入る前）でワーカースレッドごとに実行されるが、内容はワーカー間で
+// 完全に同一のため最初の 1 回だけ出力する（ログ行ごとに個別の `Once` を用意する。単一の
+// `Once` を複数の `call_once` 呼び出しで共有すると、最初に完了した呼び出しの後は他の
+// クロージャが一切実行されなくなるため不可）。
+//
+// `Once` は起動経路とリロード経路が同じ関数を共有していない場合のみ安全に使える
+// （共有している場合、リロード時に再度この経路を通ると 2 回目以降が出力されなくなって
+// しまう）。本関数のうち Once で囲む区間は「関数がループに入る前の初回セットアップ」のみで、
+// 証明書ホットリロードは同じ関数内の別区間ではなく別関数 `reload_quiche_certs`
+// （メインループの中から呼ばれる）が担う。つまりリロードはこの Once 区間へ再入しないため、
+// 「プロセス全体で 1 回」のまま安全に使える。
+static HTTP3_LOG_ONCE_CERT_LOADING: Once = Once::new();
+static HTTP3_LOG_ONCE_CERT_LOADED: Once = Once::new();
+static HTTP3_LOG_ONCE_TRANSPORT: Once = Once::new();
+static HTTP3_LOG_ONCE_GSO_GRO: Once = Once::new();
+static HTTP3_LOG_ONCE_LISTENING: Once = Once::new();
+// パイプライン化 io_uring RECVMSG/SENDMSG のログは Linux uring バックエンドでのみ
+// 存在する分岐（`#[cfg(all(target_os = "linux", veil_rt_uring))]`）の中でのみ使うため、
+// 他バックエンド（reactor/epoll）ビルドで未使用 static にならないよう同じ cfg を付ける。
+#[cfg(all(target_os = "linux", veil_rt_uring))]
+static HTTP3_LOG_ONCE_RECVMSG: Once = Once::new();
+#[cfg(all(target_os = "linux", veil_rt_uring))]
+static HTTP3_LOG_ONCE_SENDMSG: Once = Once::new();
+
 #[allow(clippy::await_holding_refcell_ref)]
 pub async fn run_http3_server_async(
     bind_addr: SocketAddr,
@@ -3811,14 +3838,16 @@ pub async fn run_http3_server_async(
     let mut quic_config = if let (Some(mut cert_pem), Some(mut key_pem)) =
         (config.cert_pem.take(), config.key_pem.take())
     {
-        info!(
-            "[HTTP/3] Loading certificates ({})",
-            if cfg!(target_os = "linux") {
-                "via memfd/temp file (path-based quiche API)"
-            } else {
-                "in-memory SSL_CTX, capability-mode compatible"
-            }
-        );
+        HTTP3_LOG_ONCE_CERT_LOADING.call_once(|| {
+            info!(
+                "[HTTP/3] Loading certificates ({})",
+                if cfg!(target_os = "linux") {
+                    "via memfd/temp file (path-based quiche API)"
+                } else {
+                    "in-memory SSL_CTX, capability-mode compatible"
+                }
+            );
+        });
 
         let cfg = new_quic_config_with_certs(&cert_pem, &key_pem)?;
 
@@ -3828,7 +3857,8 @@ pub async fn run_http3_server_async(
         secure_zero(&mut key_pem);
         drop(key_pem);
         debug!("[HTTP/3] Certificate/key data securely zeroed and released");
-        info!("[HTTP/3] Certificates loaded, sensitive data zeroed");
+        HTTP3_LOG_ONCE_CERT_LOADED
+            .call_once(|| info!("[HTTP/3] Certificates loaded, sensitive data zeroed"));
 
         cfg
     } else {
@@ -3872,13 +3902,15 @@ pub async fn run_http3_server_async(
 
     // QUIC トランスポートパラメータを設定（初回ロード・リロード共通の独立関数、F-136）
     configure_quic_transport(&mut quic_config, &config)?;
-    info!(
-        "[HTTP/3] quiche transport: cc={} pacing={} hystart={} mmsg_batch={}",
-        config.cc_algorithm.trim(),
-        config.pacing,
-        config.hystart,
-        config.mmsg_batch_size
-    );
+    HTTP3_LOG_ONCE_TRANSPORT.call_once(|| {
+        info!(
+            "[HTTP/3] quiche transport: cc={} pacing={} hystart={} mmsg_batch={}",
+            config.cc_algorithm.trim(),
+            config.pacing,
+            config.hystart,
+            config.mmsg_batch_size
+        );
+    });
 
     // 設定を Rc で共有（quiche::Config は Clone できないため）
     let quic_config = Rc::new(RefCell::new(quic_config));
@@ -3888,23 +3920,35 @@ pub async fn run_http3_server_async(
     crate::tls_reload::register_http3_worker();
     let mut local_cert_gen = crate::tls_reload::http3_cert_generation();
 
-    // UDP ソケットを作成（monoio io_uring ベース）
+    // UDP ソケットを作成（独自ランタイム上、`src/runtime/` のバックエンド経由）
     // SO_REUSEPORT を設定して複数ワーカーで並列処理を可能に
     // GSO/GRO は config.gso_gro_enabled に基づいて設定
     let socket = QuicUdpSocket::bind_reuseport_with_gso(bind_addr, config.gso_gro_enabled)?;
-    info!(
-        "[HTTP/3] GSO enabled: {}, GRO enabled: {} (config gso_gro_enabled: {})",
-        socket.gso_enabled(),
-        socket.gro_enabled(),
-        config.gso_gro_enabled
-    );
+    HTTP3_LOG_ONCE_GSO_GRO.call_once(|| {
+        info!(
+            "[HTTP/3] GSO enabled: {}, GRO enabled: {} (config gso_gro_enabled: {})",
+            socket.gso_enabled(),
+            socket.gro_enabled(),
+            config.gso_gro_enabled
+        );
+    });
     let socket = Rc::new(socket);
     let local_addr = bind_addr;
 
-    info!(
-        "[HTTP/3] Server listening on {} (QUIC/UDP, monoio io_uring)",
-        bind_addr
-    );
+    // F-149(B.9): monoio は F-28 で除去済みで現存しない。ビルドバックエンドに応じて実態の
+    // ランタイム名（io_uring / readiness reactor）を報告する（build.rs 発行の cfg、
+    // veil_rt_uring = Linux 既定 io_uring、veil_rt_reactor = epoll/kqueue readiness）。
+    #[cfg(veil_rt_uring)]
+    const HTTP3_RUNTIME_BACKEND: &str = "io_uring";
+    #[cfg(veil_rt_reactor)]
+    const HTTP3_RUNTIME_BACKEND: &str = "readiness reactor";
+
+    HTTP3_LOG_ONCE_LISTENING.call_once(|| {
+        info!(
+            "[HTTP/3] Server listening on {} (QUIC/UDP, {})",
+            bind_addr, HTTP3_RUNTIME_BACKEND
+        );
+    });
 
     // コネクション管理
     let connections: ConnectionMap = Rc::new(RefCell::new(HashMap::new()));
@@ -3943,10 +3987,12 @@ pub async fn run_http3_server_async(
         } else {
             match crate::runtime::udp_recv::PipelinedUdpRecv::new(socket.as_raw_fd(), mmsg_batch) {
                 Ok(m) => {
-                    info!(
-                        "[HTTP/3] pipelined io_uring RECVMSG enabled ({} slots in-flight, no libc recvmmsg on hot path)",
-                        m.batch_size()
-                    );
+                    HTTP3_LOG_ONCE_RECVMSG.call_once(|| {
+                        info!(
+                            "[HTTP/3] pipelined io_uring RECVMSG enabled ({} slots in-flight, no libc recvmmsg on hot path)",
+                            m.batch_size()
+                        );
+                    });
                     Some(m)
                 }
                 Err(e) => {
@@ -3969,10 +4015,12 @@ pub async fn run_http3_server_async(
                 socket.as_raw_fd(),
                 mmsg_batch,
             ));
-            info!(
-                "[HTTP/3] pipelined io_uring SENDMSG enabled ({} slots, no libc sendmmsg on hot path)",
-                mmsg_batch
-            );
+            HTTP3_LOG_ONCE_SENDMSG.call_once(|| {
+                info!(
+                    "[HTTP/3] pipelined io_uring SENDMSG enabled ({} slots, no libc sendmmsg on hot path)",
+                    mmsg_batch
+                );
+            });
         }
     }
 

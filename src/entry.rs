@@ -417,30 +417,6 @@ pub fn run() {
         }
     }
 
-    // HTTP/2・HTTP/3・H2C の設定ログ
-    #[cfg(feature = "http2")]
-    if loaded_config.http2_enabled {
-        info!("HTTP/2 enabled via ALPN negotiation");
-    }
-    #[cfg(feature = "http2")]
-    if loaded_config.h2c_enabled {
-        let h2c_addr = loaded_config
-            .h2c_listen
-            .as_deref()
-            .unwrap_or(&loaded_config.listen_addr);
-        info!("H2C (HTTP/2 Cleartext) enabled (listener: {})", h2c_addr);
-    }
-    #[cfg(feature = "http3")]
-    if loaded_config.http3_enabled {
-        info!(
-            "HTTP/3 enabled (UDP listener: {})",
-            loaded_config
-                .http3_listen
-                .as_deref()
-                .unwrap_or(&loaded_config.listen_addr)
-        );
-    }
-
     let hostname = hostname::get()
         .map(|h| h.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "unknown".to_string());
@@ -451,9 +427,7 @@ pub fn run() {
     info!("High-Performance Reverse Proxy Server");
     info!("Config File: {}", config_path.display());
     info!("Hostname: {}", hostname);
-    info!("Listen Address: {}", listen_addr);
     info!("Threads: {} (CPU cores: {})", num_threads, num_cpus::get());
-    info!("CPU Affinity: Enabled (pinning workers to cores)");
     info!(
         "Reuseport Balancing: {:?}",
         loaded_config.reuseport_balancing
@@ -1269,7 +1243,6 @@ pub fn run() {
             tls_key_path,
             tls_key_pem.len()
         );
-        info!("TLS loading method: memfd (Landlock compatible)");
         info!("============================================");
 
         // [http3] セクションの quiche 輸送パラメータ・GSO/GRO・バッチ幅などをワーカーへ渡す。
@@ -1525,8 +1498,6 @@ pub fn run() {
             &mut loaded_config.tls_key_pem,
             "TLS private key (LoadedConfig)",
         );
-
-        info!("[Security] Pre-loaded TLS credentials have been securely cleared from memory");
     }
 
     for (index, handle) in handles.into_iter().enumerate() {
