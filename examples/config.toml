@@ -1743,14 +1743,14 @@ revalidate_mtime = false
 # ------------------------------------------
 # WASMモジュールはroute直下で設定します（route.action配下ではありません）
 # [[route]]
+# # WASMモジュール名のリスト（このルートに適用するWASMモジュール）
+# modules = ["header_filter", "waf_filter"]
 # [route.conditions]
 # host = "api.example.com"
 # path = "/api/*"
 # [route.action]
 # type = "Proxy"
 # url = "http://localhost:8080/"
-# # WASMモジュール名のリスト（このルートに適用するWASMモジュール）
-# modules = ["header_filter", "waf_filter"]
 
 # ------------------------------------------
 # レスポンス圧縮設定付きプロキシ
