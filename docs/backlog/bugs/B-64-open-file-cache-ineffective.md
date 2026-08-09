@@ -93,9 +93,35 @@ DTrace（FreeBSD 14.3 aarch64、3B ファイル / HTTP/2 `-c32 -m16`、6 秒窓�
   この誤った記述を残すと、次に触る人が同じ勘違いをする。
 - 計測上のデメリットが無い（誤差範囲）。
 
-## 次の調査先
+## 次の調査先: `poll`（発生源を特定済み）
 
 nginx との残り差（3B で約 0.54 倍）の主因は別にある。現在の syscall 内訳では
-**`poll` が 1 リクエストあたり約 3 回で最多**であり、次はここを疑うべき。
-`reactor` の readiness 経路（`Readable`/`Writable` の投機的 `poll(2)` プローブ）が
-関係している可能性がある（F-145 で一度削除を試みてハングし撤回した箇所）。
+**`poll` が最多**（realpath/fstat 除去後）。DTrace の `ustack()` で発生源を特定した:
+
+```
+libc.so.7`_poll
+veil`<veil::runtime::reactor::tcp::unix::ReadableFd as core::future::Future>::poll
+```
+
+`ReadableFd` は `wait_readable_fd` の実体で、HTTP/2 経路では
+`src/proxy.rs` の `h2_select_readable_or_notify`（ソケットの読み取り可能と
+「応答が用意できた」通知を race させる箇所）から呼ばれる。ここが
+**投機的 `poll(2)` プローブ**を毎回発行している。
+
+**注意: ここは F-145 で一度「プローブ削除」を試みて撤回した箇所である。**
+プローブは単なる fast path ではなく、`Poll::Ready` へ到達する唯一の経路として
+機能しており、素朴に削除すると Future が永久に `Pending` を返してサーバが停止する。
+`registered` フラグで完了経路を別途用意する修正も試したが、それでもなお
+h2c がハングした（3 つ目の未解明の不具合が残っている）。詳細は
+`docs/backlog/features/F-145-hotpath-syscall-reduction.md` の撤回記録を参照。
+
+したがってこの領域に着手する場合は、
+**先に `VEIL_E2E_FEATURES="full,epoll" ./tests/e2e_setup.sh test` が通ることを確認できる
+状態を作り**、4 つの Future（`Readable`/`Writable`/`ReadableFd`/`WritableFd`）それぞれに
+ついて `Ready` へ到達する経路を個別に検証しながら進めること。
+kqueue バックエンドには `take_read_hint`（F-141）による syscall 不要の fast path が
+既にあるので、「ヒントが 0 のときだけプローブする」現状をどう安全に減らすかが論点になる。
+
+なお本チケットの経験から、**syscall を減らしても速くなるとは限らない**点に注意
+（realpath/fstat は 2 つ消しても中央値に差が出なかった）。着手前に
+「その syscall が本当にボトルネックか」を交互 A/B で確認することを勧める。
