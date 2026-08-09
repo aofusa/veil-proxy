@@ -1265,7 +1265,10 @@ where
     let (_prefix, backend, _rc) = backend_result?;
     let (upstream_group, security, buffering) = match &backend {
         Backend::Proxy(ug, sec, _comp, buf, _cache, modules) => {
-            if modules.as_ref().is_some_and(|m| !m.is_empty()) {
+            if modules
+                .as_ref()
+                .is_some_and(|m: &Arc<Vec<crate::wasm_plugin_config::ModuleRef>>| !m.is_empty())
+            {
                 return None;
             }
             (ug.clone(), sec.clone(), buf.clone())
@@ -1545,7 +1548,7 @@ async fn h2_dispatch(
     #[cfg(feature = "wasm")]
     let mut wasm_request_headers_override: Option<Vec<crate::http2::hpack::HeaderField>> = None;
     #[cfg(feature = "wasm")]
-    let wasm_modules_to_apply: Arc<Vec<String>> = {
+    let wasm_modules_to_apply: Arc<Vec<crate::wasm_plugin_config::ModuleRef>> = {
         let config = CURRENT_CONFIG.load();
         if let Some(ref wasm_engine) = config.wasm_filter_engine {
             let path_str = std::str::from_utf8(path).unwrap_or("/");
@@ -1804,7 +1807,7 @@ async fn h2_proxy(
     client_encoding: AcceptedEncoding,
     prefix: &[u8],
     security: &SecurityConfig,
-    #[cfg(feature = "wasm")] wasm_modules: &Arc<Vec<String>>,
+    #[cfg(feature = "wasm")] wasm_modules: &Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
 ) -> (u16, u64) {
@@ -2318,7 +2321,7 @@ async fn h2_proxy_h2c(
     method: &[u8],
     path: &[u8],
     security: &SecurityConfig,
-    #[cfg(feature = "wasm")] wasm_modules: &Arc<Vec<String>>,
+    #[cfg(feature = "wasm")] wasm_modules: &Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
 ) -> (u16, u64) {
@@ -2945,7 +2948,7 @@ async fn h2_sendfile(
     open_file_cache_config: Option<&cache::OpenFileCacheConfig>,
     canonical_base: Option<&Path>,
     static_file_cache_config: Option<&cache::StaticContentCacheRouteConfig>,
-    #[cfg(feature = "wasm")] wasm_modules: &Arc<Vec<String>>,
+    #[cfg(feature = "wasm")] wasm_modules: &Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
 ) -> (u16, u64) {
@@ -3536,7 +3539,7 @@ fn parse_http1_admin_response(resp: &[u8]) -> (u16, Vec<u8>) {
 /// HTTP/2 応答ヘッダーへ WASM レスポンスフィルタを適用（B-30）
 #[cfg(all(feature = "http2", feature = "wasm"))]
 async fn apply_h2_wasm_response_headers(
-    wasm_modules: &Arc<Vec<String>>,
+    wasm_modules: &Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
     status: u16,
     mut header_store: Vec<(Vec<u8>, Vec<u8>)>,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -3575,7 +3578,7 @@ async fn apply_h2_wasm_response_headers(
 /// 警告ログのみ出し、トレイラーはそのまま（あるいは `Continue` の変更のみ反映して）通す。
 #[cfg(all(feature = "http2", feature = "grpc", feature = "wasm"))]
 async fn apply_h2_wasm_response_trailers(
-    wasm_modules: &Arc<Vec<String>>,
+    wasm_modules: &Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
     trailers: Vec<(Vec<u8>, Vec<u8>)>,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
     if wasm_modules.is_empty() {
@@ -4837,12 +4840,13 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                 // モジュールリストをローカル変数として保持（スレッドローカルを使わない、並行タスク間の干渉を防ぐ）
                 // F-43: モジュールリストは Arc 共有（リクエストごとの deep copy 排除）
                 #[cfg(feature = "wasm")]
-                let modules_to_apply: Arc<Vec<String>> =
-                    if let Some(backend_modules) = backend.modules_arc() {
-                        backend_modules.clone()
-                    } else {
-                        crate::wasm::empty_wasm_modules()
-                    };
+                let modules_to_apply: Arc<
+                    Vec<crate::wasm_plugin_config::ModuleRef>,
+                > = if let Some(backend_modules) = backend.modules_arc() {
+                    backend_modules.clone()
+                } else {
+                    crate::wasm::empty_wasm_modules()
+                };
 
                 #[cfg(feature = "wasm")]
                 let headers_for_proxy = {
@@ -5206,7 +5210,7 @@ async fn handle_backend(
     headers: &[(Box<[u8]>, Box<[u8]>)],
     initial_body: &[u8],
     client_wants_close: bool,
-    wasm_modules: Arc<Vec<String>>,
+    wasm_modules: Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
     client_ip: &str,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // Proxy バックエンドはリクエストボディを上流へ転送して消費する。それ以外（File/Memory/
@@ -6100,7 +6104,7 @@ async fn handle_proxy(
     headers: &[(Box<[u8]>, Box<[u8]>)],
     initial_body: &[u8],
     client_wants_close: bool,
-    wasm_modules: Arc<Vec<String>>,
+    wasm_modules: Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
     client_ip: &str,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // クライアントの Accept-Encoding を解析
@@ -6792,7 +6796,7 @@ async fn proxy_http_pooled(
     initial_body: &[u8],
     client_wants_close: bool,
     cache_ctx: Option<&mut CacheSaveContext>,
-    wasm_modules: Arc<Vec<String>>,
+    wasm_modules: Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // セキュリティ設定からタイムアウトを取得
     let connect_timeout = Duration::from_secs(security.backend_connect_timeout_secs);
@@ -8030,7 +8034,7 @@ async fn proxy_http_request_with_compression(
     client_encoding: AcceptedEncoding,
     cache_ctx: Option<&mut CacheSaveContext>,
     security: &SecurityConfig,
-    wasm_modules: Arc<Vec<String>>,
+    wasm_modules: Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
 ) -> Option<(u16, u64, bool, bool)> {
     // 1. リクエストヘッダー送信（タイムアウト付き）
     let write_result = timeout(WRITE_TIMEOUT, backend_stream.write_all(request)).await;
@@ -8126,7 +8130,7 @@ async fn transfer_response_with_compression(
     client_encoding: AcceptedEncoding,
     mut cache_ctx: Option<&mut CacheSaveContext>,
     security: &SecurityConfig,
-    wasm_modules: Arc<Vec<String>>,
+    wasm_modules: Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
 ) -> (u64, u16, bool, bool) {
     let mut accumulated = Vec::with_capacity(BUF_SIZE);
     let mut total = 0u64;
@@ -9422,7 +9426,7 @@ async fn proxy_https_pooled(
     initial_body: &[u8],
     client_wants_close: bool,
     tls_insecure: bool,
-    wasm_modules: Arc<Vec<String>>,
+    wasm_modules: Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // セキュリティ設定からタイムアウトを取得
     let connect_timeout = Duration::from_secs(security.backend_connect_timeout_secs);
@@ -9579,7 +9583,7 @@ async fn proxy_https_request_with_compression(
     compression: &CompressionConfig,
     client_encoding: AcceptedEncoding,
     security: &SecurityConfig,
-    wasm_modules: Arc<Vec<String>>,
+    wasm_modules: Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
 ) -> Option<(u16, u64, bool, bool)> {
     // 1. リクエストヘッダー送信
     let write_result = timeout(WRITE_TIMEOUT, backend_stream.write_all(request)).await;
@@ -9662,7 +9666,7 @@ async fn transfer_https_response_with_compression(
     compression: &CompressionConfig,
     client_encoding: AcceptedEncoding,
     security: &SecurityConfig,
-    wasm_modules: Arc<Vec<String>>,
+    wasm_modules: Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
 ) -> (u64, u16, bool, bool) {
     let mut accumulated = Vec::with_capacity(BUF_SIZE);
     let mut total = 0u64;
@@ -10430,7 +10434,7 @@ async fn handle_sendfile(
     range_header: Option<&[u8]>, // RFC 7233 Range header support
     open_file_cache_config: Option<&cache::OpenFileCacheConfig>, // OpenFileCache設定（ルーティングごと）
     canonical_base: Option<&Path>, // base_path の canonical 形（F-145、config ロード時に一度だけ解決）
-    wasm_modules: Arc<Vec<String>>,
+    wasm_modules: Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // --- パス解決ロジック（Nginx風） ---
     //

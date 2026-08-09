@@ -1118,7 +1118,16 @@ sandbox_keep_capabilities = ["CAP_NET_BIND_SERVICE"]
 # [[wasm.modules]]
 # name = "auth_filter"         # モジュール名（一意識別子）
 # path = "/etc/veil/wasm/auth.wasm"  # .wasm または .cwasm ファイルパス
-# configuration = '{"key": "value"}'  # プラグイン設定（JSON文字列）
+# configuration = '{"key": "value"}'  # プラグイン設定（JSON文字列。後方互換の従来方式）
+#
+# # F-148: configuration は TOML テーブルでも記述できる（JSON オブジェクトへ変換して渡る）。
+# # [wasm.modules.configuration]
+# # mode = "block"
+# # max_body_size = 65536
+# # patterns = ["union select", "<script"]
+#
+# # F-148: ルート単位で上書きしたい場合は [[route]] 側の
+# # [route.module_configuration.<モジュール名>] を使う。
 #
 #   # ケーパビリティ設定（モジュールが使用可能なAPIを制限）
 #   [wasm.modules.capabilities]
@@ -1576,6 +1585,9 @@ sandbox_keep_capabilities = ["CAP_NET_BIND_SERVICE"]
 # [[route]]
 # # WASMモジュール名のリスト（このルートに適用するWASMモジュール）
 # modules = ["header_filter", "waf_filter"]
+# # F-148: ルート単位でモジュール設定を上書きする（modules 内のモジュール名のみ指定可）。
+# [route.module_configuration.waf_filter]
+# mode = "log_only"
 # [route.conditions]
 # host = "api.example.com"
 # path = "/api/*"

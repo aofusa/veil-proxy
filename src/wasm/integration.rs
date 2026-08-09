@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use super::engine::FilterEngine;
 use super::types::HttpCallResponse;
+use crate::wasm_plugin_config::ModuleRef;
 
 /// Execute on_log callback for WASM modules at the end of request processing
 ///
@@ -16,8 +17,8 @@ use super::types::HttpCallResponse;
 ///
 /// # Arguments
 /// * `engine` - The WASM filter engine
-/// * `modules` - List of module names to invoke
-pub fn on_request_complete(engine: &Arc<FilterEngine>, modules: &[String]) {
+/// * `modules` - List of module references to invoke
+pub fn on_request_complete(engine: &Arc<FilterEngine>, modules: &[ModuleRef]) {
     if modules.is_empty() {
         return;
     }
@@ -27,12 +28,12 @@ pub fn on_request_complete(engine: &Arc<FilterEngine>, modules: &[String]) {
 
 /// Execute on_log callback for WASM modules at the end of request processing ASYNCHRONOUSLY
 /// 空のモジュールリスト（Arc 共有・プロセスで 1 個。F-43: リクエストごとの確保排除）。
-pub fn empty_wasm_modules() -> Arc<Vec<String>> {
-    static EMPTY: std::sync::OnceLock<Arc<Vec<String>>> = std::sync::OnceLock::new();
+pub fn empty_wasm_modules() -> Arc<Vec<ModuleRef>> {
+    static EMPTY: std::sync::OnceLock<Arc<Vec<ModuleRef>>> = std::sync::OnceLock::new();
     EMPTY.get_or_init(|| Arc::new(Vec::new())).clone()
 }
 
-pub async fn on_request_complete_async(engine: Arc<FilterEngine>, modules: Arc<Vec<String>>) {
+pub async fn on_request_complete_async(engine: Arc<FilterEngine>, modules: Arc<Vec<ModuleRef>>) {
     if modules.is_empty() {
         return;
     }
@@ -48,11 +49,11 @@ pub async fn on_request_complete_async(engine: Arc<FilterEngine>, modules: Arc<V
 ///
 /// # Arguments
 /// * `engine` - The WASM filter engine
-/// * `modules` - List of module names to invoke
+/// * `modules` - List of module references to invoke
 ///
 /// # Returns
 /// `true` if any module wants to keep the context alive
-pub fn on_context_destroy(engine: &Arc<FilterEngine>, modules: &[String]) -> bool {
+pub fn on_context_destroy(engine: &Arc<FilterEngine>, modules: &[ModuleRef]) -> bool {
     if modules.is_empty() {
         return false;
     }

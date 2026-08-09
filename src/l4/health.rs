@@ -124,6 +124,10 @@ mod tests {
             idle_timeout_secs: 600,
             #[cfg(feature = "wasm")]
             wasm_modules: Vec::new(),
+            #[cfg(feature = "wasm")]
+            module_configuration: None,
+            #[cfg(feature = "wasm")]
+            resolved_wasm_modules: std::sync::Arc::new(Vec::new()),
         }
     }
 
@@ -169,6 +173,10 @@ mod tests {
             idle_timeout_secs: 600,
             #[cfg(feature = "wasm")]
             wasm_modules: Vec::new(),
+            #[cfg(feature = "wasm")]
+            module_configuration: None,
+            #[cfg(feature = "wasm")]
+            resolved_wasm_modules: std::sync::Arc::new(Vec::new()),
         });
         let state = new_health_state(1);
         spawn_l4_health_checker(config, state.clone());

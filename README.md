@@ -1019,15 +1019,23 @@ WASM modules are configured at the route level (not under `route.action`):
 
 ```toml
 [[route]]
+# WASM module names to apply to this route (directly under [[route]], NOT under [route.action])
+modules = ["header_filter", "waf_filter"]
+
+# Optional (F-148): override each module's plugin configuration for this route only.
+# Only names listed in `modules` above may appear here.
+[route.module_configuration.waf_filter]
+mode = "log_only"
+
 [route.conditions]
 host = "api.example.com"
 path = "/api/*"
 [route.action]
 type = "Proxy"
 url = "http://localhost:8080/"
-# WASM module names to apply to this route
-modules = ["header_filter", "waf_filter"]
 ```
+
+See [Plugin Configuration](#plugin-configuration-f-148) for the value types and merge rules.
 
 ### File Serving Mode
 
@@ -1881,6 +1889,7 @@ idle_timeout_secs = 30          # evict a client session after 30s of no traffic
 | `connect_timeout_secs` | Upstream connect timeout in seconds (TCP only) | `10` |
 | `idle_timeout_secs` | Idle timeout in seconds before closing a connection/session | `600` |
 | `wasm_modules` | WASM network filter module names (requires `wasm` feature, F-133). Empty (default) = WASM disabled and the zero-copy `splice`/`sendfile` path is used unchanged. When non-empty, `splice` is bypassed and data is routed through a userspace buffer so WASM modules can inspect/rewrite it (`proxy_on_downstream_data`/`proxy_on_upstream_data`); this switch is decided once per connection. | `[]` |
+| `module_configuration` | Per-listener Proxy-Wasm plugin configuration override (module name → string or TOML table, F-148). Same merge rules as `[[route]]`; only names listed in `wasm_modules` are accepted. | (none) |
 | `upstreams[].addr` | Upstream address (`"host:port"`) | required |
 | `upstreams[].weight` | Weight (reserved for weighted RR) | `1` |
 | `health_check` | Optional health check config (same as upstream health_check) | none |
@@ -2900,6 +2909,70 @@ allowed_upstreams = ["webdis"]  # Allowed HTTP call destinations
 ```
 
 **Note**: To apply WASM modules to specific routes, use the `modules` field in the route configuration (see Routing section).
+
+### Plugin Configuration (F-148)
+
+`configuration` is the byte string handed to the module as its Proxy-Wasm *plugin configuration*
+(`proxy_on_configure` / `proxy_get_buffer(PluginConfiguration)`). It can be written **either** as a
+string (the original form — passed through verbatim, typically JSON) **or** as a TOML table
+(serialized to a JSON object before being passed, so modules need no changes):
+
+```toml
+# 1. String form (backwards compatible — bytes are passed through unchanged)
+[[wasm.modules]]
+name = "header_filter"
+path = "/etc/veil/wasm/header_filter.wasm"
+configuration = '{"header_name": "x-veil"}'
+
+# 2. TOML table form (converted to a JSON object)
+[[wasm.modules]]
+name = "waf_filter"
+path = "/etc/veil/wasm/waf_filter.wasm"
+[wasm.modules.configuration]
+mode = "block"
+max_body_size = 65536
+patterns = ["union select", "<script"]
+```
+
+TOML → JSON conversion: String → string, Integer/Float → number (`NaN`/`Inf` → `null`),
+Boolean → bool, Datetime → RFC 3339 string, Array → array, Table → object.
+
+#### Per-route override
+
+`[[route]]` (and `[[l4]]`) accept `module_configuration`, a map from module name to a
+configuration value of the same type, letting one loaded module serve several routes with
+different parameters:
+
+```toml
+[[route]]
+modules = ["header_filter", "waf_filter"]
+
+# Only this route runs the WAF in log-only mode; other routes keep "block"
+[route.module_configuration.waf_filter]
+mode = "log_only"
+
+[route.conditions]
+path = "/static/*"
+[route.action]
+type = "File"
+path = "./www"
+```
+
+Merge rules (route wins):
+
+| Module definition | Route | Effective configuration |
+|---|---|---|
+| — | — | empty byte string |
+| set | — | module definition value |
+| — | set | route value |
+| Table | Table | **deep merge** (same-named keys take the route value, nested tables merge recursively, arrays are replaced) |
+| any other combination (either side a string) | set | route value **replaces** the module value entirely (an opaque string cannot be merged) |
+
+Naming a module in `module_configuration` that is not listed in that route's `modules`
+(or that listener's `wasm_modules`) is a configuration error and rejected at startup.
+
+Merging and TOML → JSON conversion run **once at config load time** (startup and SIGHUP
+reload); the request path only clones an `Arc`.
 
 ### Default Settings
 

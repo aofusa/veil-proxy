@@ -24,7 +24,7 @@ pub struct LoadedModule {
     /// Module capabilities
     pub capabilities: ModuleCapabilities,
     /// Plugin configuration
-    pub configuration: Vec<u8>,
+    pub configuration: Arc<[u8]>,
 }
 
 /// Module registry
@@ -187,7 +187,7 @@ impl ModuleRegistry {
             name: config.name.clone(),
             instance_pre,
             capabilities: config.capabilities.clone(),
-            configuration: config.configuration.as_bytes().to_vec(),
+            configuration: config.configuration.to_bytes(),
         };
 
         ftlog::info!(

@@ -1008,15 +1008,23 @@ WASMモジュールはroute直下で設定します（`route.action`配下では
 
 ```toml
 [[route]]
+# このルートに適用するWASMモジュール名のリスト（[route.action] 配下ではなく [[route]] 直下）
+modules = ["header_filter", "waf_filter"]
+
+# 任意（F-148）: このルートだけモジュールのプラグイン設定を上書きする。
+# ここに書けるのは上の modules に列挙したモジュール名のみ。
+[route.module_configuration.waf_filter]
+mode = "log_only"
+
 [route.conditions]
 host = "api.example.com"
 path = "/api/*"
 [route.action]
 type = "Proxy"
 url = "http://localhost:8080/"
-# このルートに適用するWASMモジュール名のリスト
-modules = ["header_filter", "waf_filter"]
 ```
+
+値の型と合成規則は「[プラグイン設定の記述方法（F-148）](#プラグイン設定の記述方法f-148)」を参照。
 
 ### ファイル配信モード
 
@@ -1828,6 +1836,7 @@ idle_timeout_secs = 30          # 30秒無通信でクライアントセッシ�
 | `connect_timeout_secs` | upstream接続タイムアウト（秒、TCPのみ） | `10` |
 | `idle_timeout_secs` | アイドルタイムアウト（秒）。この時間通信がなければ接続/セッションを切断 | `600` |
 | `wasm_modules` | WASM network filter モジュール名一覧（`wasm` feature 必須、F-133）。空（既定）なら WASM 無効で従来どおり `splice`/ゼロコピー経路を使う。指定すると `splice` を使わずユーザー空間バッファ経由の転送へ切り替わり、`proxy_on_downstream_data`/`proxy_on_upstream_data` でデータを検査・書き換えできる（切替判定は接続確立時に1回のみ） | `[]` |
+| `module_configuration` | リスナー単位の Proxy-Wasm プラグイン設定上書き（モジュール名 → 文字列 or TOML テーブル、F-148）。合成規則は `[[route]]` と同じで、`wasm_modules` に列挙した名前のみ指定可 | （なし） |
 | `upstreams[].addr` | upstreamアドレス（`"host:port"` 形式） | 必須 |
 | `upstreams[].weight` | 重み（weighted RR用、現在予約） | `1` |
 | `health_check` | ヘルスチェック設定（upstreamのhealth_checkと同形式） | なし |
@@ -2880,6 +2889,71 @@ allowed_upstreams = ["webdis"]  # HTTP呼び出し許可先
 ```
 
 **注意**: 特定のルートにWASMモジュールを適用するには、ルート設定の`modules`フィールドを使用してください（ルーティングセクションを参照）。
+
+### プラグイン設定の記述方法（F-148）
+
+`configuration` は、モジュールへ Proxy-Wasm の *plugin configuration*
+（`proxy_on_configure` / `proxy_get_buffer(PluginConfiguration)`）として渡されるバイト列です。
+**文字列**（従来方式。バイト列をそのまま渡す。多くは JSON）と
+**TOML テーブル**（JSON オブジェクトへ変換してから渡すため、モジュール側の実装は変更不要）の
+どちらでも記述できます。
+
+```toml
+# 1. 文字列形式（従来どおり。バイト列は 1 バイトも変わらない）
+[[wasm.modules]]
+name = "header_filter"
+path = "/etc/veil/wasm/header_filter.wasm"
+configuration = '{"header_name": "x-veil"}'
+
+# 2. TOML テーブル形式（JSON オブジェクトへ変換して渡す）
+[[wasm.modules]]
+name = "waf_filter"
+path = "/etc/veil/wasm/waf_filter.wasm"
+[wasm.modules.configuration]
+mode = "block"
+max_body_size = 65536
+patterns = ["union select", "<script"]
+```
+
+TOML → JSON の変換規則: String → string、Integer/Float → number（`NaN`/`Inf` は `null`）、
+Boolean → bool、Datetime → RFC 3339 相当の string、Array → array、Table → object。
+
+#### ルート単位の上書き
+
+`[[route]]`（および `[[l4]]`）に `module_configuration`（モジュール名 → 設定値のマップ）を
+書くと、**同じモジュールをルートごとに違うパラメータで使えます**
+（同じ `.wasm` を別名で二重にロードする必要がありません）。
+
+```toml
+[[route]]
+modules = ["header_filter", "waf_filter"]
+
+# このルートだけ WAF を log_only にする（他のルートはモジュール定義の "block" のまま）
+[route.module_configuration.waf_filter]
+mode = "log_only"
+
+[route.conditions]
+path = "/static/*"
+[route.action]
+type = "File"
+path = "./www"
+```
+
+合成規則（ルート優先）:
+
+| モジュール定義 | ルート | 実効設定 |
+|---|---|---|
+| なし | なし | 空バイト列 |
+| あり | なし | モジュール定義の値 |
+| なし | あり | ルートの値 |
+| Table | Table | **ディープマージ**（同名キーはルート優先、ネストしたテーブルも再帰マージ、配列は置換） |
+| 上記以外（片方でも文字列） | あり | ルートの値で**完全置換**（文字列は不透明なバイト列でマージ不能なため） |
+
+`module_configuration` に、そのルートの `modules`（L4 なら `wasm_modules`）へ
+列挙していないモジュール名を書くと**起動時に設定エラー**になります。
+
+合成と TOML → JSON 変換は**設定ロード時（起動・SIGHUP リロード）に 1 回だけ**実行され、
+リクエスト経路では `Arc` の clone しか行いません。
 
 ### デフォルト設定
 

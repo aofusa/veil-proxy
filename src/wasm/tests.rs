@@ -379,7 +379,7 @@ mod interpreter_tests {
             modules: vec![ModuleConfig {
                 name: "header_filter".to_string(),
                 path: FIXTURE.to_string(),
-                configuration: String::new(),
+                configuration: crate::wasm_plugin_config::PluginConfiguration::default(),
                 capabilities: Default::default(),
             }],
             interpreter,
@@ -418,7 +418,9 @@ mod interpreter_tests {
             let config = config_with_interpreter(interpreter);
             let engine = FilterEngine::new(&config).expect("engine should build");
             futures::executor::block_on(engine.on_request_headers_with_modules(
-                &["header_filter".to_string()],
+                &[crate::wasm_plugin_config::ModuleRef::from_name(
+                    "header_filter",
+                )],
                 &Arc::from("/"),
                 &Arc::from("GET"),
                 headers.clone(),
@@ -487,7 +489,7 @@ mod f132_h3_lifecycle_tests {
             modules: vec![ModuleConfig {
                 name: "header_filter".to_string(),
                 path: FIXTURE.to_string(),
-                configuration: String::new(),
+                configuration: crate::wasm_plugin_config::PluginConfiguration::default(),
                 capabilities: Default::default(),
             }],
             interpreter: false,
@@ -505,7 +507,9 @@ mod f132_h3_lifecycle_tests {
             return;
         };
         let engine = Arc::new(engine);
-        let modules = Arc::new(vec!["header_filter".to_string()]);
+        let modules = Arc::new(vec![crate::wasm_plugin_config::ModuleRef::from_name(
+            "header_filter",
+        )]);
 
         let before = crate::wasm::get_context_stats().total_contexts;
 
@@ -1478,7 +1482,7 @@ mod f133_network_filter_tests {
             modules: vec![ModuleConfig {
                 name: "network_filter".to_string(),
                 path: FIXTURE.to_string(),
-                configuration: String::new(),
+                configuration: crate::wasm_plugin_config::PluginConfiguration::default(),
                 capabilities: crate::wasm::ModuleCapabilities {
                     allow_downstream_data_read: true,
                     allow_downstream_data_write: true,
@@ -1518,7 +1522,9 @@ mod f133_network_filter_tests {
             eprintln!("wasm fixture missing; skipping");
             return;
         };
-        let modules = vec!["network_filter".to_string()];
+        let modules = vec![crate::wasm_plugin_config::ModuleRef::from_name(
+            "network_filter",
+        )];
         let action = futures::executor::block_on(engine.on_new_connection_with_modules(&modules));
         assert_eq!(action, NetworkAction::Continue);
     }
@@ -1531,7 +1537,9 @@ mod f133_network_filter_tests {
             eprintln!("wasm fixture missing; skipping");
             return;
         };
-        let modules = vec!["network_filter".to_string()];
+        let modules = vec![crate::wasm_plugin_config::ModuleRef::from_name(
+            "network_filter",
+        )];
         let data = Bytes::from_static(b"foofoo hello");
         let result = futures::executor::block_on(
             engine.on_downstream_data_with_modules(&modules, data, false),
@@ -1551,7 +1559,9 @@ mod f133_network_filter_tests {
             eprintln!("wasm fixture missing; skipping");
             return;
         };
-        let modules = vec!["network_filter".to_string()];
+        let modules = vec![crate::wasm_plugin_config::ModuleRef::from_name(
+            "network_filter",
+        )];
         let data = Bytes::from_static(b"bar response");
         let result = futures::executor::block_on(
             engine.on_upstream_data_with_modules(&modules, data, false),
@@ -1572,7 +1582,9 @@ mod f133_network_filter_tests {
             eprintln!("wasm fixture missing; skipping");
             return;
         };
-        let modules = vec!["network_filter".to_string()];
+        let modules = vec![crate::wasm_plugin_config::ModuleRef::from_name(
+            "network_filter",
+        )];
         let data = Bytes::from_static(b"please CLOSE_ME now");
         let result = futures::executor::block_on(
             engine.on_downstream_data_with_modules(&modules, data, false),
@@ -1591,7 +1603,9 @@ mod f133_network_filter_tests {
             eprintln!("wasm fixture missing; skipping");
             return;
         };
-        let modules = vec!["network_filter".to_string()];
+        let modules = vec![crate::wasm_plugin_config::ModuleRef::from_name(
+            "network_filter",
+        )];
         let data = Bytes::from_static(b"nothing to see here");
         let result = futures::executor::block_on(engine.on_downstream_data_with_modules(
             &modules,
@@ -1611,7 +1625,9 @@ mod f133_network_filter_tests {
             eprintln!("wasm fixture missing; skipping");
             return;
         };
-        let modules = vec!["network_filter".to_string()];
+        let modules = vec![crate::wasm_plugin_config::ModuleRef::from_name(
+            "network_filter",
+        )];
         futures::executor::block_on(engine.on_downstream_close_with_modules(&modules));
         futures::executor::block_on(engine.on_upstream_close_with_modules(&modules));
     }

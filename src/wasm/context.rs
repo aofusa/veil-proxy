@@ -123,10 +123,10 @@ pub struct HttpContext {
     pub client_ip: std::sync::Arc<str>,
     /// Plugin name
     pub plugin_name: String,
-    /// Plugin configuration
-    pub plugin_configuration: Vec<u8>,
+    /// Plugin configuration（ルート単位で実効値が解決されている場合はその値。F-148）
+    pub plugin_configuration: Arc<[u8]>,
     /// VM configuration
-    pub vm_configuration: Vec<u8>,
+    pub vm_configuration: Arc<[u8]>,
 
     // === Modification Flags ===
     /// Request headers modified
@@ -278,8 +278,8 @@ impl HttpContext {
             response_body_complete: false,
             client_ip: std::sync::Arc::from(""),
             plugin_name: String::new(),
-            plugin_configuration: Vec::new(),
-            vm_configuration: Vec::new(),
+            plugin_configuration: crate::wasm_plugin_config::empty_configuration(),
+            vm_configuration: crate::wasm_plugin_config::empty_configuration(),
             request_headers_modified: false,
             request_body_modified: false,
             response_headers_modified: false,

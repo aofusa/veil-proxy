@@ -84,6 +84,11 @@ AI エージェントおよびコントリビュータ向けの **最小指針**
   スレッドローカルにメモ化すること）。**`#[allow(clippy::disallowed_methods)]` の
   「コールドパスだから安全」という根拠を鵜呑みにしないこと**（B-64 のものは事実と
   異なっていた）。
+- **ルートに紐づく派生値は `Route` に事前計算して持たせる**（F-148）。`load_backend` が
+  リクエストごとに呼ばれる以上、そこで `Arc::new(x.clone())` するものは 1 リクエスト 1 アロケーション
+  になる。WASM モジュールリストは設定ロード時に合成済みの `Route::resolved_modules:
+  Option<Arc<Vec<ModuleRef>>>` を作り、`load_backend` は `Arc` を clone するだけにしてある。
+  新しいルート単位設定を足すときも同じ形（`#[serde(skip)]` の解決済みフィールド + ロード時に埋める）にすること。
 - **性能改善は必ず交互 A/B で確認する**。計測環境（QEMU VM）は同一バイナリでも
   ラウンド間で 1.8 倍変動する。時間をまたいだ比較は無意味
   （B-64 では syscall を 2 つ消しても中央値に差が出なかった＝そこはボトルネックでは
@@ -155,6 +160,7 @@ cargo test --bins --test integration_tests --features "full"
 | `src/lib.rs` | クレートルート・mod 宣言・公開 API（`cargo fuzz`・統合テスト向け） |
 | `src/entry.rs` | サーバ起動配線（`run()`：ワーカースレッド・accept ループなど） |
 | `src/runtime/` | 独自ランタイム。共有（buf.rs/io.rs/offload.rs）+ `uring/`（io_uring: ring/executor/tcp/timer/splice、`veil_rt_uring`。HTTP/3 UDP はパイプライン化 `IORING_OP_RECVMSG`（`udp_recv.rs` の `PipelinedUdpRecv`）/ `IORING_OP_SENDMSG`（`udp_send.rs` の `UringUdpSend`）= F-130）+ `reactor/`（epoll/kqueue readiness: poller/epoll/kqueue/executor/tcp/timer/splice、`veil_rt_reactor`）。バックエンドは build.rs 発行 cfg で選択、公開パスはファサードで不変（F-120） |
+| `src/wasm_plugin_config.rs` | Proxy-Wasm プラグイン設定（F-148）。`configuration` の型 `PluginConfiguration`（untagged: 文字列 = 従来互換 / TOML テーブル = JSON へ変換）、ルート単位上書きの合成 `merge_over`、`serde_json` を使わない自前 TOML→JSON エンコーダ、ルートが持ち回る `ModuleRef`（名前 + 解決済み設定）。**`wasm` feature に依存せず常にコンパイル**（`config.rs` の `Route` が型として使うため）。合成・変換は設定ロード時のみのコールドパス |
 | `tests/`、`benches/` | 統合・E2E・ベンチ（`cargo test` が拾うホワイトボックス） |
 | `examples/config.toml` | 設定リファレンス（全キー網羅・`src/config.rs` 同期） |
 | `docs/readme/` | 日本語 README（`README.ja.md`） |

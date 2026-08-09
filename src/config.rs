@@ -28,6 +28,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::wasm_plugin_config::{ModuleRef, PluginConfiguration};
+
 #[cfg(veil_ktls)]
 use crate::ktls_rustls::{KtlsClientStream, KtlsServerStream, RustlsConnector};
 
@@ -2665,6 +2667,19 @@ pub struct Route {
     /// 注意: modules は route 直下で設定（action配下の設定は削除）
     #[serde(default)]
     pub modules: Option<Vec<String>>,
+
+    /// ルート単位の WASM モジュール設定上書き（モジュール名 → 設定値、F-148）。
+    /// `[[wasm.modules]]` 側の `configuration`（TOML 文字列 or テーブル）を base、
+    /// ここに書いた値を override として合成する（合成規則は
+    /// `PluginConfiguration::merge_over` 参照）。
+    #[serde(default)]
+    pub module_configuration: Option<HashMap<String, PluginConfiguration>>,
+
+    /// 設定ロード時に解決した実効モジュール参照（名前 + マージ済み設定、F-148）。
+    /// `load_backend` はリクエストごとに呼ばれる（B-64）ため、ここで事前計算して
+    /// Arc 共有する（ホットパスでの合成・アロケーションを避ける）。
+    #[serde(skip)]
+    pub resolved_modules: Option<Arc<Vec<ModuleRef>>>,
 }
 
 #[derive(Deserialize)]
@@ -2822,6 +2837,16 @@ pub struct L4ListenerConfig {
     #[cfg(feature = "wasm")]
     #[serde(default)]
     pub wasm_modules: Vec<String>,
+    /// L4 リスナー単位の WASM モジュール設定上書き（モジュール名 → 設定値、F-148）。
+    /// HTTP ルートの `Route::module_configuration` と同じ合成規則。
+    #[cfg(feature = "wasm")]
+    #[serde(default)]
+    pub module_configuration: Option<HashMap<String, PluginConfiguration>>,
+    /// 設定ロード時に解決した実効モジュール参照（F-148）。`wasm_modules` から
+    /// `resolve_l4_wasm_modules` で 1 回だけ構築し、以後は Arc 共有で持ち回る。
+    #[cfg(feature = "wasm")]
+    #[serde(skip)]
+    pub resolved_wasm_modules: Arc<Vec<ModuleRef>>,
 }
 
 fn default_l4_connect_timeout() -> u64 {
@@ -3915,8 +3940,9 @@ pub enum Backend {
         Arc<CompressionConfig>,
         Arc<buffering::BufferingConfig>,
         Arc<cache::CacheConfig>,
-        /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
-        Option<Arc<Vec<String>>>,
+        /// このバックエンドに適用するWASMモジュール参照のリスト（F-148: 名前 + ルート単位
+        /// で解決済みの実効 plugin configuration）
+        Option<Arc<Vec<ModuleRef>>>,
     ),
     /// MemoryFile バックエンド
     /// - Arc<Vec<u8>>: ファイルコンテンツ
@@ -3926,8 +3952,8 @@ pub enum Backend {
         Arc<Vec<u8>>,
         Arc<str>,
         Arc<SecurityConfig>,
-        /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
-        Option<Arc<Vec<String>>>,
+        /// このバックエンドに適用するWASMモジュール参照のリスト（F-148）
+        Option<Arc<Vec<ModuleRef>>>,
     ),
     /// SendFile バックエンド
     /// - Arc<PathBuf>: ベースパス（設定に書かれた原形。パストラバーサル検査の
@@ -3951,8 +3977,8 @@ pub enum Backend {
         Option<Arc<cache::OpenFileCacheConfig>>,
         Option<Arc<Path>>,
         Option<Arc<cache::StaticContentCacheRouteConfig>>,
-        /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
-        Option<Arc<Vec<String>>>,
+        /// このバックエンドに適用するWASMモジュール参照のリスト（F-148）
+        Option<Arc<Vec<ModuleRef>>>,
     ),
     /// Redirect バックエンド
     /// - Arc<str>: リダイレクト先URL
@@ -3962,8 +3988,8 @@ pub enum Backend {
         Arc<str>,
         u16,
         bool,
-        /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
-        Option<Arc<Vec<String>>>,
+        /// このバックエンドに適用するWASMモジュール参照のリスト（F-148）
+        Option<Arc<Vec<ModuleRef>>>,
     ),
 }
 
@@ -3982,10 +4008,10 @@ impl Backend {
         }
     }
 
-    /// このバックエンドに適用するWASMモジュール名のリストを取得
+    /// このバックエンドに適用するWASMモジュール参照のリストを取得
     #[inline]
-    /// F-43: WASM モジュールリストを Arc 共有で取得する（リクエストごとの deep copy 排除）。
-    pub fn modules_arc(&self) -> Option<&Arc<Vec<String>>> {
+    /// F-43/F-148: WASM モジュールリストを Arc 共有で取得する（リクエストごとの deep copy 排除）。
+    pub fn modules_arc(&self) -> Option<&Arc<Vec<ModuleRef>>> {
         match self {
             Backend::Proxy(_, _, _, _, _, modules) => modules.as_ref(),
             Backend::MemoryFile(_, _, _, modules) => modules.as_ref(),
@@ -3994,14 +4020,20 @@ impl Backend {
         }
     }
 
-    pub fn modules(&self) -> Option<&[String]> {
+    pub fn modules(&self) -> Option<&[ModuleRef]> {
         match self {
-            Backend::Proxy(_, _, _, _, _, modules) => modules.as_deref().map(|v| v.as_slice()),
-            Backend::MemoryFile(_, _, _, modules) => modules.as_deref().map(|v| v.as_slice()),
-            Backend::SendFile(_, _, _, _, _, _, _, _, modules) => {
-                modules.as_deref().map(|v| v.as_slice())
+            Backend::Proxy(_, _, _, _, _, modules) => {
+                modules.as_deref().map(|v: &Vec<ModuleRef>| v.as_slice())
             }
-            Backend::Redirect(_, _, _, modules) => modules.as_deref().map(|v| v.as_slice()),
+            Backend::MemoryFile(_, _, _, modules) => {
+                modules.as_deref().map(|v: &Vec<ModuleRef>| v.as_slice())
+            }
+            Backend::SendFile(_, _, _, _, _, _, _, _, modules) => {
+                modules.as_deref().map(|v: &Vec<ModuleRef>| v.as_slice())
+            }
+            Backend::Redirect(_, _, _, modules) => {
+                modules.as_deref().map(|v: &Vec<ModuleRef>| v.as_slice())
+            }
         }
     }
 }
@@ -5027,6 +5059,21 @@ fn validate_config(config: &Config) -> io::Result<()> {
                     ));
                 }
             }
+
+            // F-148: module_configuration のキーが wasm_modules に含まれているかチェック
+            if let Some(ref module_configuration) = l4.module_configuration {
+                for key in module_configuration.keys() {
+                    if !l4.wasm_modules.iter().any(|m| m == key) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "L4 listener '{}' has module_configuration for module '{}' which is not listed in its wasm_modules",
+                                l4.name, key
+                            ),
+                        ));
+                    }
+                }
+            }
         }
     }
 
@@ -5117,7 +5164,68 @@ fn validate_route_config(
         }
     }
 
+    // F-148: module_configuration のキーが route.modules に含まれているかチェック
+    // （modules に無いモジュールへ設定を書いても絶対に適用されないため、設定ミスとして拒否）。
+    #[cfg(feature = "wasm")]
+    if let Some(ref module_configuration) = route.module_configuration {
+        let modules = route.modules.as_deref().unwrap_or(&[]);
+        for key in module_configuration.keys() {
+            if !modules.iter().any(|m| m == key) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "Route '{}' has module_configuration for module '{}' which is not listed in its modules",
+                        route_name, key
+                    ),
+                ));
+            }
+        }
+    }
+
     Ok(())
+}
+
+/// `route.modules` + `route.module_configuration` から `resolved_modules` を構築する
+/// （F-148、設定ロード時のみ実行するコールドパス。合成結果は `Arc` で共有し、
+/// `load_backend`（リクエストごとに呼ばれる、B-64）は clone のみで済ませる）。
+///
+/// - `wasm` feature 無効ビルドではモジュール定義（`WasmConfig`）自体が存在しないため、
+///   `route.module_configuration` の上書きは適用できず、名前のみの `ModuleRef` を作る
+///   （既存の「モジュール名だけ持ち回る」挙動と 1 バイトも変わらない）。
+/// - `wasm` feature 有効ビルドでは `[[wasm.modules]]` の `configuration` を base、
+///   `route.module_configuration[name]` を override として `PluginConfiguration::merge_over`
+///   で合成し、`to_bytes()`（TOML→JSON エンコード、コールドパス専用）した結果を持つ。
+fn resolve_route_modules(
+    route: &mut Route,
+    #[cfg(feature = "wasm")] wasm_config: Option<&crate::wasm::WasmConfig>,
+) {
+    let Some(names) = route.modules.clone() else {
+        route.resolved_modules = None;
+        return;
+    };
+
+    #[cfg(feature = "wasm")]
+    let resolved: Vec<ModuleRef> = names
+        .iter()
+        .map(|name| {
+            let base = wasm_config
+                .and_then(|w| w.modules.iter().find(|m| &m.name == name))
+                .map(|m| &m.configuration);
+            let over = route
+                .module_configuration
+                .as_ref()
+                .and_then(|mc| mc.get(name));
+            match PluginConfiguration::merge_over(base, over) {
+                Some(cfg) => ModuleRef::new(name.clone(), Some(cfg.to_bytes())),
+                None => ModuleRef::from_name(name),
+            }
+        })
+        .collect();
+
+    #[cfg(not(feature = "wasm"))]
+    let resolved: Vec<ModuleRef> = names.iter().map(|n| ModuleRef::from_name(n)).collect();
+
+    route.resolved_modules = Some(Arc::new(resolved));
 }
 
 // rustls 用の TLS 設定読み込み（統一）
@@ -5669,7 +5777,14 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
     // 統合ルーティング（[[route]]）の読み込み
     let routes = if let Some(routes_config) = config.route {
         let mut routes_vec = Vec::with_capacity(routes_config.len());
-        for route in routes_config {
+        for mut route in routes_config {
+            // F-148: モジュール設定の合成は設定ロード時に 1 回だけ行い、`resolved_modules`
+            // へ Arc 共有で持たせる（load_backend はリクエストごとに呼ばれるため）。
+            resolve_route_modules(
+                &mut route,
+                #[cfg(feature = "wasm")]
+                config.wasm.as_ref(),
+            );
             routes_vec.push(route);
         }
         Arc::new(routes_vec)
@@ -5850,7 +5965,14 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     // 統合ルーティング（[[route]]）の読み込み
     let routes = if let Some(routes_config) = config.route {
         let mut routes_vec = Vec::with_capacity(routes_config.len());
-        for route in routes_config {
+        for mut route in routes_config {
+            // F-148: モジュール設定の合成は設定ロード時に 1 回だけ行い、`resolved_modules`
+            // へ Arc 共有で持たせる（load_backend はリクエストごとに呼ばれるため）。
+            resolve_route_modules(
+                &mut route,
+                #[cfg(feature = "wasm")]
+                config.wasm.as_ref(),
+            );
             routes_vec.push(route);
         }
         Arc::new(routes_vec)
@@ -6016,8 +6138,41 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         performance: config.performance.clone(),
         graceful_shutdown_timeout_secs: config.server.graceful_shutdown_timeout_secs,
         #[cfg(feature = "l4-proxy")]
-        l4_listeners: config.l4.unwrap_or_default(),
+        l4_listeners: {
+            let mut listeners = config.l4.unwrap_or_default();
+            // F-148: L4 リスナーの WASM モジュール設定も HTTP ルートと同様、設定ロード時に
+            // 1 回だけ合成する（コネクションごとの合成を避ける）。
+            #[cfg(feature = "wasm")]
+            for l4 in &mut listeners {
+                resolve_l4_wasm_modules(l4, config.wasm.as_ref());
+            }
+            listeners
+        },
     })
+}
+
+/// L4 リスナーの `wasm_modules` + `module_configuration` から
+/// `resolved_wasm_modules` を構築する（F-148、設定ロード時のみのコールドパス）。
+#[cfg(feature = "wasm")]
+fn resolve_l4_wasm_modules(
+    l4: &mut L4ListenerConfig,
+    wasm_config: Option<&crate::wasm::WasmConfig>,
+) {
+    let resolved: Vec<ModuleRef> = l4
+        .wasm_modules
+        .iter()
+        .map(|name| {
+            let base = wasm_config
+                .and_then(|w| w.modules.iter().find(|m| &m.name == name))
+                .map(|m| &m.configuration);
+            let over = l4.module_configuration.as_ref().and_then(|mc| mc.get(name));
+            match PluginConfiguration::merge_over(base, over) {
+                Some(cfg) => ModuleRef::new(name.clone(), Some(cfg.to_bytes())),
+                None => ModuleRef::from_name(name),
+            }
+        })
+        .collect();
+    l4.resolved_wasm_modules = Arc::new(resolved);
 }
 
 /// 設定ファイルからログ設定のみを読み込む（ログ初期化前用）
@@ -6131,7 +6286,19 @@ pub fn load_backend(
     let compression = route.compression.clone().unwrap_or_default();
     let buffering = route.buffering.clone().unwrap_or_default();
     let cache = route.cache.clone().unwrap_or_default();
-    let modules_arc = route.modules.as_ref().map(|m| Arc::new(m.clone()));
+    // F-148: 設定ロード時に解決済みの `resolved_modules` を Arc clone するだけ
+    // （従来あった `Arc::new(m.clone())` = リクエストごとの `Vec<String>` ディープコピーを排除）。
+    // `resolved_modules` が未設定（安全網）の場合のみ、名前のみの `ModuleRef` を都度組み立てる。
+    let modules_arc = route.resolved_modules.clone().or_else(|| {
+        route.modules.as_ref().map(|names| {
+            Arc::new(
+                names
+                    .iter()
+                    .map(|n| ModuleRef::from_name(n))
+                    .collect::<Vec<_>>(),
+            )
+        })
+    });
 
     match &route.action {
         BackendConfig::Proxy {

@@ -12,6 +12,32 @@ use super::constants::{ACTION_CONTINUE, ACTION_PAUSE};
 use super::context::{HostState, HttpContext};
 use super::registry::{LoadedModule, ModuleRegistry};
 use super::types::{FilterAction, LocalResponse, WasmConfig};
+use crate::wasm_plugin_config::ModuleRef;
+
+/// `modules`（ルート単位で解決済みの `ModuleRef` リスト）から、レジストリに実際に
+/// ロードされているモジュールと、その実効 plugin configuration（ルート上書きが
+/// あればそれ、無ければモジュール定義の値）の組を集める。
+///
+/// 実効設定の解決はここで `Arc` clone のみ（参照カウント増加）で行い、
+/// バイト列のディープコピーは発生しない（F-148）。設定ロード時に既に
+/// `to_bytes()` 済みのバイト列を持ち回るだけ。
+fn resolve_effective_modules(
+    registry: &ModuleRegistry,
+    modules: &[ModuleRef],
+) -> Vec<(Arc<LoadedModule>, Arc<[u8]>)> {
+    modules
+        .iter()
+        .filter_map(|r| {
+            registry.get_module(&r.name).map(|m| {
+                let config = r
+                    .configuration
+                    .clone()
+                    .unwrap_or_else(|| m.configuration.clone());
+                (m, config)
+            })
+        })
+        .collect()
+}
 
 // ====================
 // スレッドローカルインスタンスプール
@@ -81,19 +107,16 @@ impl FilterEngine {
     /// ヘッダは所有権ムーブスルー（per-module の deep copy 排除）。
     pub async fn on_request_headers_with_modules(
         &self,
-        module_names: &[String],
+        modules: &[ModuleRef],
         path: &Arc<str>,
         method: &Arc<str>,
         headers: Vec<(Vec<u8>, Vec<u8>)>,
         client_ip: &Arc<str>,
         end_of_stream: bool,
     ) -> FilterResult {
-        let modules: Vec<Arc<LoadedModule>> = module_names
-            .iter()
-            .filter_map(|name| self.registry.get_module(name))
-            .collect();
+        let resolved = resolve_effective_modules(&self.registry, modules);
 
-        if modules.is_empty() {
+        if resolved.is_empty() {
             return FilterResult::Continue {
                 headers,
                 body: None,
@@ -102,10 +125,11 @@ impl FilterEngine {
 
         let mut current_headers = headers;
 
-        for module in &modules {
+        for (module, config) in &resolved {
             let (returned, result) = self
                 .execute_on_request_headers(
                     module,
+                    config,
                     path,
                     method,
                     current_headers,
@@ -140,10 +164,10 @@ impl FilterEngine {
     /// Execute on_request_headers for specified modules ASYNCHRONOUSLY
     /// Note: runs inline in the current async task to avoid cross-thread waker issues with monoio.
     ///
-    /// F-43: `module_names` は `Arc` 共有（呼び出しごとの `Vec<String>` deep copy 排除）。
+    /// F-43/F-148: `modules` は `Arc` 共有（呼び出しごとの `Vec<ModuleRef>` deep copy 排除）。
     pub async fn on_request_headers_with_modules_async(
         self: Arc<Self>,
-        module_names: Arc<Vec<String>>,
+        modules: Arc<Vec<ModuleRef>>,
         path: Arc<str>,
         method: Arc<str>,
         headers: Vec<(Vec<u8>, Vec<u8>)>,
@@ -151,7 +175,7 @@ impl FilterEngine {
         end_of_stream: bool,
     ) -> FilterResult {
         self.on_request_headers_with_modules(
-            &module_names,
+            &modules,
             &path,
             &method,
             headers,
@@ -166,6 +190,7 @@ impl FilterEngine {
     async fn run_headers_module(
         &self,
         module: &LoadedModule,
+        configuration: &Arc<[u8]>,
         store: &mut Store<HostState>,
         callback_name: &str,
         num_headers: i32,
@@ -193,7 +218,7 @@ impl FilterEngine {
 
         let root_context_id = 1i32; // Root context ID (SDK uses 1)
         let http_context_id = 2i32; // HTTP context ID
-        let config_size = module.configuration.len() as i32;
+        let config_size = configuration.len() as i32;
 
         // proxy_on_context_create は root / HTTP の 2 回呼ぶが、エクスポート解決
         // （get_typed_func：エクスポート表のハッシュ探索 + 型チェック）は 1 回で済ませ、
@@ -399,6 +424,7 @@ impl FilterEngine {
     async fn execute_on_request_headers(
         &self,
         module: &LoadedModule,
+        configuration: &Arc<[u8]>,
         path: &Arc<str>,
         method: &Arc<str>,
         headers: Vec<(Vec<u8>, Vec<u8>)>,
@@ -411,7 +437,7 @@ impl FilterEngine {
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
         http_ctx.set_request(method.clone(), path.clone(), headers, client_ip.clone());
         http_ctx.plugin_name = module.name.clone();
-        http_ctx.plugin_configuration = module.configuration.clone();
+        http_ctx.plugin_configuration = configuration.clone();
 
         // Create store with fuel limit
         let host_state = HostState::new(http_ctx);
@@ -420,6 +446,7 @@ impl FilterEngine {
         let run = self
             .run_headers_module(
                 module,
+                configuration,
                 &mut store,
                 "proxy_on_request_headers",
                 num_headers,
@@ -490,17 +517,14 @@ impl FilterEngine {
     /// F-43: ヘッダは所有権ムーブスルー（per-module の deep copy 排除）。
     pub async fn on_response_headers_with_modules(
         &self,
-        module_names: &[String],
+        modules: &[ModuleRef],
         status: u16,
         headers: Vec<(Vec<u8>, Vec<u8>)>,
         end_of_stream: bool,
     ) -> FilterResult {
-        let modules: Vec<Arc<LoadedModule>> = module_names
-            .iter()
-            .filter_map(|name| self.registry.get_module(name))
-            .collect();
+        let resolved = resolve_effective_modules(&self.registry, modules);
 
-        if modules.is_empty() {
+        if resolved.is_empty() {
             return FilterResult::Continue {
                 headers,
                 body: None,
@@ -510,11 +534,11 @@ impl FilterEngine {
         let mut current_headers = headers;
 
         // Execute in reverse order for response
-        for module in modules.iter().rev() {
+        for (module, config) in resolved.iter().rev() {
             // F-09: WASM フィルタ実行時間を計測
             let _wasm_start = std::time::Instant::now();
             let (returned, result) = self
-                .execute_on_response_headers(module, status, current_headers, end_of_stream)
+                .execute_on_response_headers(module, config, status, current_headers, end_of_stream)
                 .await;
             current_headers = returned;
             crate::metrics::observe_wasm_filter_duration(
@@ -546,15 +570,15 @@ impl FilterEngine {
     /// Execute on_response_headers for specified modules ASYNCHRONOUSLY
     /// Note: runs inline in the current async task to avoid cross-thread waker issues with monoio.
     ///
-    /// F-43: `module_names` は `Arc` 共有（呼び出しごとの `Vec<String>` deep copy 排除）。
+    /// F-43/F-148: `modules` は `Arc` 共有（呼び出しごとの `Vec<ModuleRef>` deep copy 排除）。
     pub async fn on_response_headers_with_modules_async(
         self: Arc<Self>,
-        module_names: Arc<Vec<String>>,
+        modules: Arc<Vec<ModuleRef>>,
         status: u16,
         headers: Vec<(Vec<u8>, Vec<u8>)>,
         end_of_stream: bool,
     ) -> FilterResult {
-        self.on_response_headers_with_modules(&module_names, status, headers, end_of_stream)
+        self.on_response_headers_with_modules(&modules, status, headers, end_of_stream)
             .await
     }
 
@@ -564,6 +588,7 @@ impl FilterEngine {
     async fn execute_on_response_headers(
         &self,
         module: &LoadedModule,
+        configuration: &Arc<[u8]>,
         status: u16,
         headers: Vec<(Vec<u8>, Vec<u8>)>,
         end_of_stream: bool,
@@ -574,6 +599,7 @@ impl FilterEngine {
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
         http_ctx.set_response(status, headers);
         http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_configuration = configuration.clone();
 
         // Create store with fuel limit
         let host_state = HostState::new(http_ctx);
@@ -582,6 +608,7 @@ impl FilterEngine {
         let run = self
             .run_headers_module(
                 module,
+                configuration,
                 &mut store,
                 "proxy_on_response_headers",
                 num_headers,
@@ -639,6 +666,10 @@ impl FilterEngine {
     ///
     /// This should be called after an HTTP call completes to deliver the response
     /// back to the WASM module.
+    ///
+    /// F-148: 単一モジュール名のみを取る API（ルート文脈が無い）のため、ここでは
+    /// ルート単位の上書き設定は解決できず、常にモジュール定義側の
+    /// `module.configuration` を使う。
     pub async fn on_http_call_response(
         &self,
         module_name: &str,
@@ -822,16 +853,13 @@ impl FilterEngine {
     /// Returns potentially modified body data.
     pub async fn on_request_body_with_modules(
         &self,
-        module_names: &[String],
+        modules: &[ModuleRef],
         body: bytes::Bytes,
         end_of_stream: bool,
     ) -> BodyFilterResult {
-        let modules: Vec<Arc<LoadedModule>> = module_names
-            .iter()
-            .filter_map(|name| self.registry.get_module(name))
-            .collect();
+        let resolved = resolve_effective_modules(&self.registry, modules);
 
-        if modules.is_empty() {
+        if resolved.is_empty() {
             // F-61: モジュール未登録時はゼロコピーでそのまま返す
             return BodyFilterResult::Continue { body };
         }
@@ -839,9 +867,9 @@ impl FilterEngine {
         // F-61: `Bytes` の参照カウント共有でフィルタチェーンを回す（deep copy なし）
         let mut current_body = body;
 
-        for module in &modules {
+        for (module, config) in &resolved {
             let result = self
-                .execute_on_request_body(module, current_body.clone(), end_of_stream)
+                .execute_on_request_body(module, config, current_body.clone(), end_of_stream)
                 .await;
 
             match result {
@@ -870,11 +898,11 @@ impl FilterEngine {
     /// Note: runs inline in the current async task to avoid cross-thread waker issues with monoio.
     pub async fn on_request_body_with_modules_async(
         self: Arc<Self>,
-        module_names: Vec<String>,
+        modules: Vec<ModuleRef>,
         body: bytes::Bytes,
         end_of_stream: bool,
     ) -> BodyFilterResult {
-        self.on_request_body_with_modules(&module_names, body, end_of_stream)
+        self.on_request_body_with_modules(&modules, body, end_of_stream)
             .await
     }
 
@@ -882,6 +910,7 @@ impl FilterEngine {
     async fn execute_on_request_body(
         &self,
         module: &LoadedModule,
+        configuration: &Arc<[u8]>,
         body: bytes::Bytes,
         end_of_stream: bool,
     ) -> anyhow::Result<BodyModuleResult> {
@@ -897,7 +926,7 @@ impl FilterEngine {
         let body_len = body.len();
         http_ctx.set_request_body(body, end_of_stream);
         http_ctx.plugin_name = module.name.clone();
-        http_ctx.plugin_configuration = module.configuration.clone();
+        http_ctx.plugin_configuration = configuration.clone();
 
         // Create store with fuel limit
         let host_state = HostState::new(http_ctx);
@@ -919,7 +948,7 @@ impl FilterEngine {
 
         let root_context_id = 1i32;
         let http_context_id = 2i32;
-        let config_size = module.configuration.len() as i32;
+        let config_size = configuration.len() as i32;
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
@@ -994,16 +1023,13 @@ impl FilterEngine {
     /// Returns potentially modified body data.
     pub async fn on_response_body_with_modules(
         &self,
-        module_names: &[String],
+        modules: &[ModuleRef],
         body: bytes::Bytes,
         end_of_stream: bool,
     ) -> BodyFilterResult {
-        let modules: Vec<Arc<LoadedModule>> = module_names
-            .iter()
-            .filter_map(|name| self.registry.get_module(name))
-            .collect();
+        let resolved = resolve_effective_modules(&self.registry, modules);
 
-        if modules.is_empty() {
+        if resolved.is_empty() {
             // F-61: モジュール未登録時はゼロコピーでそのまま返す
             return BodyFilterResult::Continue { body };
         }
@@ -1012,9 +1038,9 @@ impl FilterEngine {
         let mut current_body = body;
 
         // Execute in reverse order for response
-        for module in modules.iter().rev() {
+        for (module, config) in resolved.iter().rev() {
             let result = self
-                .execute_on_response_body(module, current_body.clone(), end_of_stream)
+                .execute_on_response_body(module, config, current_body.clone(), end_of_stream)
                 .await;
 
             match result {
@@ -1042,11 +1068,11 @@ impl FilterEngine {
     /// Note: runs inline in the current async task to avoid cross-thread waker issues with monoio.
     pub async fn on_response_body_with_modules_async(
         self: Arc<Self>,
-        module_names: Vec<String>,
+        modules: Vec<ModuleRef>,
         body: bytes::Bytes,
         end_of_stream: bool,
     ) -> BodyFilterResult {
-        self.on_response_body_with_modules(&module_names, body, end_of_stream)
+        self.on_response_body_with_modules(&modules, body, end_of_stream)
             .await
     }
 
@@ -1054,6 +1080,7 @@ impl FilterEngine {
     async fn execute_on_response_body(
         &self,
         module: &LoadedModule,
+        configuration: &Arc<[u8]>,
         body: bytes::Bytes,
         end_of_stream: bool,
     ) -> anyhow::Result<BodyModuleResult> {
@@ -1069,7 +1096,7 @@ impl FilterEngine {
         let body_len = body.len();
         http_ctx.set_response_body(body, end_of_stream);
         http_ctx.plugin_name = module.name.clone();
-        http_ctx.plugin_configuration = module.configuration.clone();
+        http_ctx.plugin_configuration = configuration.clone();
 
         // Create store with fuel limit
         let host_state = HostState::new(http_ctx);
@@ -1091,7 +1118,7 @@ impl FilterEngine {
 
         let root_context_id = 1i32;
         let http_context_id = 2i32;
-        let config_size = module.configuration.len() as i32;
+        let config_size = configuration.len() as i32;
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
@@ -1164,14 +1191,11 @@ impl FilterEngine {
     ///
     /// Called at the end of HTTP request processing (log phase).
     /// This is the final callback before the stream is closed.
-    pub async fn on_log_with_modules(&self, module_names: &[String]) {
-        let modules: Vec<Arc<LoadedModule>> = module_names
-            .iter()
-            .filter_map(|name| self.registry.get_module(name))
-            .collect();
+    pub async fn on_log_with_modules(&self, modules: &[ModuleRef]) {
+        let resolved = resolve_effective_modules(&self.registry, modules);
 
-        for module in &modules {
-            if let Err(e) = self.execute_on_log(module).await {
+        for (module, config) in &resolved {
+            if let Err(e) = self.execute_on_log(module, config).await {
                 ftlog::error!("[wasm:{}] on_log error: {}", module.name, e);
             }
         }
@@ -1179,14 +1203,23 @@ impl FilterEngine {
 
     /// Execute on_log for specified modules ASYNCHRONOUSLY
     /// Note: runs inline in the current async task to avoid cross-thread waker issues with monoio.
-    pub async fn on_log_with_modules_async(self: Arc<Self>, module_names: Arc<Vec<String>>) {
-        self.on_log_with_modules(&module_names).await;
+    pub async fn on_log_with_modules_async(self: Arc<Self>, modules: Arc<Vec<ModuleRef>>) {
+        self.on_log_with_modules(&modules).await;
     }
 
     /// Execute on_log for a single module
-    async fn execute_on_log(&self, module: &LoadedModule) -> anyhow::Result<()> {
+    async fn execute_on_log(
+        &self,
+        module: &LoadedModule,
+        configuration: &Arc<[u8]>,
+    ) -> anyhow::Result<()> {
         // Create context
-        let http_ctx = HttpContext::new(1, module.capabilities.clone());
+        // F-148: 下で `config_size` に `configuration.len()` を渡すため、実体のバッファも
+        // 必ず同じものを積む（サイズだけ非ゼロで中身が空だと、モジュールが
+        // proxy_get_buffer(PluginConfiguration) で空を読んでしまう）。
+        let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
+        http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_configuration = configuration.clone();
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
         store.set_fuel(self.fuel_limit)?;
@@ -1206,7 +1239,7 @@ impl FilterEngine {
 
         let root_context_id = 1i32;
         let http_context_id = 2i32;
-        let config_size = module.configuration.len() as i32;
+        let config_size = configuration.len() as i32;
 
         // Create contexts
         if let Ok(func) =
@@ -1261,16 +1294,13 @@ impl FilterEngine {
     ///
     /// Called when an HTTP context is being deleted.
     /// Returns true if the module wants to keep the context alive (async operation pending).
-    pub async fn on_done_with_modules(&self, module_names: &[String]) -> bool {
-        let modules: Vec<Arc<LoadedModule>> = module_names
-            .iter()
-            .filter_map(|name| self.registry.get_module(name))
-            .collect();
+    pub async fn on_done_with_modules(&self, modules: &[ModuleRef]) -> bool {
+        let resolved = resolve_effective_modules(&self.registry, modules);
 
         let mut any_pending = false;
 
-        for module in &modules {
-            match self.execute_on_done(module).await {
+        for (module, config) in &resolved {
+            match self.execute_on_done(module, config).await {
                 Ok(keep_alive) => {
                     if keep_alive {
                         any_pending = true;
@@ -1286,9 +1316,16 @@ impl FilterEngine {
     }
 
     /// Execute on_done for a single module
-    async fn execute_on_done(&self, module: &LoadedModule) -> anyhow::Result<bool> {
+    async fn execute_on_done(
+        &self,
+        module: &LoadedModule,
+        configuration: &Arc<[u8]>,
+    ) -> anyhow::Result<bool> {
         // Create context
-        let http_ctx = HttpContext::new(1, module.capabilities.clone());
+        // F-148: `execute_on_log` と同じ理由で configuration の実体も積む。
+        let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
+        http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_configuration = configuration.clone();
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
         store.set_fuel(self.fuel_limit)?;
@@ -1308,7 +1345,7 @@ impl FilterEngine {
 
         let root_context_id = 1i32;
         let http_context_id = 2i32;
-        let config_size = module.configuration.len() as i32;
+        let config_size = configuration.len() as i32;
 
         // Create contexts
         if let Ok(func) =
@@ -1365,6 +1402,8 @@ impl FilterEngine {
     ///
     /// Called periodically based on the tick period set by the module.
     /// This should be called on the root context.
+    /// F-148: 単一モジュール名のみを取る API（ルート文脈が無い）のため、ここでは
+    /// ルート単位の上書き設定は解決できず、常にモジュール定義側の `module.configuration` を使う。
     pub async fn on_tick(&self, module_name: &str) {
         let module = match self.registry.get_module(module_name) {
             Some(m) => m,
@@ -1446,15 +1485,12 @@ impl FilterEngine {
     /// Called when request trailers are received (HTTP/2, gRPC).
     pub async fn on_request_trailers_with_modules(
         &self,
-        module_names: &[String],
+        modules: &[ModuleRef],
         trailers: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> FilterResult {
-        let modules: Vec<Arc<LoadedModule>> = module_names
-            .iter()
-            .filter_map(|name| self.registry.get_module(name))
-            .collect();
+        let resolved = resolve_effective_modules(&self.registry, modules);
 
-        if modules.is_empty() {
+        if resolved.is_empty() {
             return FilterResult::Continue {
                 headers: trailers,
                 body: None,
@@ -1463,9 +1499,9 @@ impl FilterEngine {
 
         let mut current_trailers = trailers;
 
-        for module in &modules {
+        for (module, config) in &resolved {
             let result = self
-                .execute_on_request_trailers(module, &current_trailers)
+                .execute_on_request_trailers(module, config, &current_trailers)
                 .await;
 
             match result {
@@ -1496,13 +1532,14 @@ impl FilterEngine {
     async fn execute_on_request_trailers(
         &self,
         module: &LoadedModule,
+        configuration: &Arc<[u8]>,
         trailers: &[(Vec<u8>, Vec<u8>)],
     ) -> anyhow::Result<ModuleResult> {
         // Create context
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
         http_ctx.request_trailers = trailers.to_vec();
         http_ctx.plugin_name = module.name.clone();
-        http_ctx.plugin_configuration = module.configuration.clone();
+        http_ctx.plugin_configuration = configuration.clone();
 
         // Create store with fuel limit
         let host_state = HostState::new(http_ctx);
@@ -1524,7 +1561,7 @@ impl FilterEngine {
 
         let root_context_id = 1i32;
         let http_context_id = 2i32;
-        let config_size = module.configuration.len() as i32;
+        let config_size = configuration.len() as i32;
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
@@ -1594,15 +1631,12 @@ impl FilterEngine {
     /// Called when response trailers are received (HTTP/2, gRPC).
     pub async fn on_response_trailers_with_modules(
         &self,
-        module_names: &[String],
+        modules: &[ModuleRef],
         trailers: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> FilterResult {
-        let modules: Vec<Arc<LoadedModule>> = module_names
-            .iter()
-            .filter_map(|name| self.registry.get_module(name))
-            .collect();
+        let resolved = resolve_effective_modules(&self.registry, modules);
 
-        if modules.is_empty() {
+        if resolved.is_empty() {
             return FilterResult::Continue {
                 headers: trailers,
                 body: None,
@@ -1612,9 +1646,9 @@ impl FilterEngine {
         let mut current_trailers = trailers;
 
         // Execute in reverse order for response
-        for module in modules.iter().rev() {
+        for (module, config) in resolved.iter().rev() {
             let result = self
-                .execute_on_response_trailers(module, &current_trailers)
+                .execute_on_response_trailers(module, config, &current_trailers)
                 .await;
 
             match result {
@@ -1645,13 +1679,14 @@ impl FilterEngine {
     async fn execute_on_response_trailers(
         &self,
         module: &LoadedModule,
+        configuration: &Arc<[u8]>,
         trailers: &[(Vec<u8>, Vec<u8>)],
     ) -> anyhow::Result<ModuleResult> {
         // Create context
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
         http_ctx.response_trailers = trailers.to_vec();
         http_ctx.plugin_name = module.name.clone();
-        http_ctx.plugin_configuration = module.configuration.clone();
+        http_ctx.plugin_configuration = configuration.clone();
 
         // Create store with fuel limit
         let host_state = HostState::new(http_ctx);
@@ -1673,7 +1708,7 @@ impl FilterEngine {
 
         let root_context_id = 1i32;
         let http_context_id = 2i32;
-        let config_size = module.configuration.len() as i32;
+        let config_size = configuration.len() as i32;
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
@@ -1741,6 +1776,8 @@ impl FilterEngine {
     /// Execute on_queue_ready callback for a module
     ///
     /// Called when a message is enqueued to a shared queue that the module is subscribed to.
+    /// F-148: 単一モジュール名のみを取る API（ルート文脈が無い）のため、ここでは
+    /// ルート単位の上書き設定は解決できず、常にモジュール定義側の `module.configuration` を使う。
     pub async fn on_queue_ready(&self, module_name: &str, queue_id: u32) {
         let module = match self.registry.get_module(module_name) {
             Some(m) => m,
@@ -1834,6 +1871,8 @@ impl FilterEngine {
     /// Execute on_grpc_receive_initial_metadata callback for a module
     ///
     /// Called when initial metadata is received from a gRPC call.
+    /// F-148: 単一モジュール名のみを取る API（ルート文脈が無い）のため、ここでは
+    /// ルート単位の上書き設定は解決できず、常にモジュール定義側の `module.configuration` を使う。
     #[cfg(feature = "grpc")]
     pub async fn on_grpc_receive_initial_metadata(
         &self,
@@ -1961,6 +2000,8 @@ impl FilterEngine {
     /// Execute on_grpc_receive callback for a module
     ///
     /// Called when a gRPC message is received.
+    /// F-148: 単一モジュール名のみを取る API（ルート文脈が無い）のため、ここでは
+    /// ルート単位の上書き設定は解決できず、常にモジュール定義側の `module.configuration` を使う。
     #[cfg(feature = "grpc")]
     pub async fn on_grpc_receive(&self, module_name: &str, call_id: u32, message: &[u8]) {
         let module = match self.registry.get_module(module_name) {
@@ -2071,6 +2112,8 @@ impl FilterEngine {
     /// Execute on_grpc_receive_trailing_metadata callback for a module
     ///
     /// Called when trailing metadata is received from a gRPC call.
+    /// F-148: 単一モジュール名のみを取る API（ルート文脈が無い）のため、ここでは
+    /// ルート単位の上書き設定は解決できず、常にモジュール定義側の `module.configuration` を使う。
     #[cfg(feature = "grpc")]
     pub async fn on_grpc_receive_trailing_metadata(
         &self,
@@ -2196,6 +2239,8 @@ impl FilterEngine {
     /// Execute on_grpc_close callback for a module
     ///
     /// Called when a gRPC call is closed.
+    /// F-148: 単一モジュール名のみを取る API（ルート文脈が無い）のため、ここでは
+    /// ルート単位の上書き設定は解決できず、常にモジュール定義側の `module.configuration` を使う。
     #[cfg(feature = "grpc")]
     pub async fn on_grpc_close(&self, module_name: &str, call_id: u32, status_code: i32) {
         let module = match self.registry.get_module(module_name) {
@@ -2316,14 +2361,11 @@ impl FilterEngine {
     // ========================================================================
 
     /// Execute `proxy_on_new_connection` for specified modules（接続確立時に 1 回）。
-    pub async fn on_new_connection_with_modules(&self, module_names: &[String]) -> NetworkAction {
-        let modules: Vec<Arc<LoadedModule>> = module_names
-            .iter()
-            .filter_map(|name| self.registry.get_module(name))
-            .collect();
+    pub async fn on_new_connection_with_modules(&self, modules: &[ModuleRef]) -> NetworkAction {
+        let resolved = resolve_effective_modules(&self.registry, modules);
 
-        for module in &modules {
-            match self.execute_on_new_connection(module).await {
+        for (module, config) in &resolved {
+            match self.execute_on_new_connection(module, config).await {
                 Ok(NetworkAction::Close) => return NetworkAction::Close,
                 Ok(NetworkAction::Continue) => {}
                 Err(e) => {
@@ -2337,10 +2379,11 @@ impl FilterEngine {
     async fn execute_on_new_connection(
         &self,
         module: &LoadedModule,
+        configuration: &Arc<[u8]>,
     ) -> anyhow::Result<NetworkAction> {
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
         http_ctx.plugin_name = module.name.clone();
-        http_ctx.plugin_configuration = module.configuration.clone();
+        http_ctx.plugin_configuration = configuration.clone();
 
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
@@ -2359,7 +2402,7 @@ impl FilterEngine {
 
         let root_context_id = 1i32;
         let stream_context_id = 2i32;
-        let config_size = module.configuration.len() as i32;
+        let config_size = configuration.len() as i32;
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
@@ -2406,12 +2449,12 @@ impl FilterEngine {
     /// 指定モジュール群に対して実行する。
     pub async fn on_downstream_data_with_modules(
         &self,
-        module_names: &[String],
+        modules: &[ModuleRef],
         data: bytes::Bytes,
         end_of_stream: bool,
     ) -> NetworkFilterResult {
         self.run_network_data_filters(
-            module_names,
+            modules,
             data,
             end_of_stream,
             NetworkDataDirection::Downstream,
@@ -2423,40 +2466,32 @@ impl FilterEngine {
     /// 指定モジュール群に対して実行する。
     pub async fn on_upstream_data_with_modules(
         &self,
-        module_names: &[String],
+        modules: &[ModuleRef],
         data: bytes::Bytes,
         end_of_stream: bool,
     ) -> NetworkFilterResult {
-        self.run_network_data_filters(
-            module_names,
-            data,
-            end_of_stream,
-            NetworkDataDirection::Upstream,
-        )
-        .await
+        self.run_network_data_filters(modules, data, end_of_stream, NetworkDataDirection::Upstream)
+            .await
     }
 
     async fn run_network_data_filters(
         &self,
-        module_names: &[String],
+        modules: &[ModuleRef],
         data: bytes::Bytes,
         end_of_stream: bool,
         direction: NetworkDataDirection,
     ) -> NetworkFilterResult {
-        let modules: Vec<Arc<LoadedModule>> = module_names
-            .iter()
-            .filter_map(|name| self.registry.get_module(name))
-            .collect();
+        let resolved = resolve_effective_modules(&self.registry, modules);
 
-        if modules.is_empty() {
+        if resolved.is_empty() {
             return NetworkFilterResult::Continue { data };
         }
 
         let mut current = data;
-        for module in &modules {
+        for (module, config) in &resolved {
             // Bytes の clone は参照カウント共有のみ（deep copy なし）。
             let result = self
-                .execute_on_network_data(module, current.clone(), end_of_stream, direction)
+                .execute_on_network_data(module, config, current.clone(), end_of_stream, direction)
                 .await;
             match result {
                 Ok(NetworkDataModuleResult::Continue { data }) => current = data,
@@ -2479,6 +2514,7 @@ impl FilterEngine {
     async fn execute_on_network_data(
         &self,
         module: &LoadedModule,
+        configuration: &Arc<[u8]>,
         data: bytes::Bytes,
         end_of_stream: bool,
         direction: NetworkDataDirection,
@@ -2494,7 +2530,7 @@ impl FilterEngine {
             }
         }
         http_ctx.plugin_name = module.name.clone();
-        http_ctx.plugin_configuration = module.configuration.clone();
+        http_ctx.plugin_configuration = configuration.clone();
 
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
@@ -2513,7 +2549,7 @@ impl FilterEngine {
 
         let root_context_id = 1i32;
         let stream_context_id = 2i32;
-        let config_size = module.configuration.len() as i32;
+        let config_size = configuration.len() as i32;
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
@@ -2595,8 +2631,8 @@ impl FilterEngine {
     /// F-134: ABI v0.2.1 の正しいエクスポート名は `proxy_on_downstream_connection_close`
     /// （旧実装は `_connection` を欠いた `proxy_on_downstream_close` を呼んでいたため、
     /// 実 SDK ビルドのモジュールでは一度も発火しなかった）。
-    pub async fn on_downstream_close_with_modules(&self, module_names: &[String]) {
-        self.run_network_close(module_names, "proxy_on_downstream_connection_close")
+    pub async fn on_downstream_close_with_modules(&self, modules: &[ModuleRef]) {
+        self.run_network_close(modules, "proxy_on_downstream_connection_close")
             .await
     }
 
@@ -2605,19 +2641,19 @@ impl FilterEngine {
     /// F-134: ABI v0.2.1 の正しいエクスポート名は `proxy_on_upstream_connection_close`
     /// （旧実装は `_connection` を欠いた `proxy_on_upstream_close` を呼んでいたため、
     /// 実 SDK ビルドのモジュールでは一度も発火しなかった）。
-    pub async fn on_upstream_close_with_modules(&self, module_names: &[String]) {
-        self.run_network_close(module_names, "proxy_on_upstream_connection_close")
+    pub async fn on_upstream_close_with_modules(&self, modules: &[ModuleRef]) {
+        self.run_network_close(modules, "proxy_on_upstream_connection_close")
             .await
     }
 
-    async fn run_network_close(&self, module_names: &[String], callback_name: &str) {
-        let modules: Vec<Arc<LoadedModule>> = module_names
-            .iter()
-            .filter_map(|name| self.registry.get_module(name))
-            .collect();
+    async fn run_network_close(&self, modules: &[ModuleRef], callback_name: &str) {
+        let resolved = resolve_effective_modules(&self.registry, modules);
 
-        for module in &modules {
-            if let Err(e) = self.execute_on_network_close(module, callback_name).await {
+        for (module, config) in &resolved {
+            if let Err(e) = self
+                .execute_on_network_close(module, config, callback_name)
+                .await
+            {
                 ftlog::error!("[wasm:{}] {} error: {}", module.name, callback_name, e);
             }
         }
@@ -2626,11 +2662,12 @@ impl FilterEngine {
     async fn execute_on_network_close(
         &self,
         module: &LoadedModule,
+        configuration: &Arc<[u8]>,
         callback_name: &str,
     ) -> anyhow::Result<()> {
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
         http_ctx.plugin_name = module.name.clone();
-        http_ctx.plugin_configuration = module.configuration.clone();
+        http_ctx.plugin_configuration = configuration.clone();
 
         let host_state = HostState::new(http_ctx);
         let mut store = Store::new(self.registry.engine(), host_state);
@@ -2649,7 +2686,7 @@ impl FilterEngine {
 
         let root_context_id = 1i32;
         let stream_context_id = 2i32;
-        let config_size = module.configuration.len() as i32;
+        let config_size = configuration.len() as i32;
 
         if let Ok(func) =
             instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
@@ -2801,7 +2838,7 @@ mod exec_smoke_tests {
             modules: vec![ModuleConfig {
                 name: "header_filter".to_string(),
                 path: path.to_string(),
-                configuration: String::new(),
+                configuration: crate::wasm_plugin_config::PluginConfiguration::default(),
                 capabilities: Default::default(),
             }],
             interpreter,
@@ -2828,7 +2865,7 @@ mod exec_smoke_tests {
         ];
         // async になった WASM 実行をテスト用に駆動する（背景スレッド扱い）。
         let result = futures::executor::block_on(engine.on_request_headers_with_modules(
-            &["header_filter".to_string()],
+            &[ModuleRef::from_name("header_filter")],
             &Arc::from("/"),
             &Arc::from("GET"),
             headers,
@@ -2857,7 +2894,7 @@ mod exec_smoke_tests {
                 // 空文字列 → モジュールは既定の "backend-pool" を使う（examples/wasm-filters/http-call-filter）。
                 // upstream_groups が未設定（テスト用 CURRENT_CONFIG）でも 502 応答経路で
                 // resume 機構自体は同じように駆動されるため、実バックエンドは不要。
-                configuration: String::new(),
+                configuration: crate::wasm_plugin_config::PluginConfiguration::default(),
                 capabilities: ModuleCapabilities {
                     allow_logging: true,
                     allow_request_headers_read: true,
@@ -2921,8 +2958,10 @@ mod exec_smoke_tests {
 
         // 本命リクエストの `proxy_on_request_headers` を実行する。
         // モジュールは `dispatch_http_call` してから Pause を返す（F-62）。
+        let configuration = module.configuration.clone();
         let (action, instance) = futures::executor::block_on(engine.run_headers_module(
             &module,
+            &configuration,
             &mut store,
             "proxy_on_request_headers",
             num_headers,

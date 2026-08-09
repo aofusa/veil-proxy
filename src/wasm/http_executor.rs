@@ -35,7 +35,7 @@ pub enum WasmBodyOutcome {
 /// （HTTP/3 の Proxy 経路は WASM 適用時に必ず `Decision::Buffer` に落ちるため常に true）。
 pub async fn apply_wasm_request_body(
     engine: &FilterEngine,
-    modules: &[String],
+    modules: &[crate::wasm_plugin_config::ModuleRef],
     body: bytes::Bytes,
     end_of_stream: bool,
 ) -> WasmBodyOutcome {
@@ -63,7 +63,7 @@ pub async fn apply_wasm_request_body(
 /// `modules` が空なら一切コストをかけずそのまま返す。
 pub async fn apply_wasm_response_body(
     engine: &FilterEngine,
-    modules: &[String],
+    modules: &[crate::wasm_plugin_config::ModuleRef],
     body: bytes::Bytes,
     end_of_stream: bool,
 ) -> WasmBodyOutcome {

@@ -817,7 +817,7 @@ async fn item7_end_of_stream_forwarded_to_body_filters() {
         modules: vec![veil::wasm::ModuleConfig {
             name: "eos_test".to_string(),
             path: "tests/fixtures/wasm/header_filter.wasm".to_string(),
-            configuration: String::new(),
+            configuration: veil::wasm_plugin_config::PluginConfiguration::default(),
             capabilities: ModuleCapabilities {
                 allow_request_body_read: true,
                 ..ModuleCapabilities::default()
@@ -843,7 +843,7 @@ async fn item7_end_of_stream_forwarded_to_body_filters() {
     // 中間チャンク: end_of_stream = false
     let result = engine
         .on_request_body_with_modules(
-            &["eos_test".to_string()],
+            &[veil::wasm_plugin_config::ModuleRef::from_name("eos_test")],
             bytes::Bytes::from_static(b"chunk1"),
             false,
         )
@@ -856,7 +856,7 @@ async fn item7_end_of_stream_forwarded_to_body_filters() {
     // 最終チャンク: end_of_stream = true
     let result = engine
         .on_request_body_with_modules(
-            &["eos_test".to_string()],
+            &[veil::wasm_plugin_config::ModuleRef::from_name("eos_test")],
             bytes::Bytes::from_static(b"chunk2"),
             true,
         )

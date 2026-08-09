@@ -1278,7 +1278,20 @@ revalidate_mtime = false
 # [[wasm.modules]]
 # name = "auth_filter"         # モジュール名（一意識別子）
 # path = "/etc/veil/wasm/auth.wasm"  # .wasm または .cwasm ファイルパス
-# configuration = '{"key": "value"}'  # プラグイン設定（JSON文字列）
+# configuration = '{"key": "value"}'  # プラグイン設定（JSON文字列。後方互換の従来方式）
+#
+# # F-148: configuration は TOML テーブルでも記述できる。JSON オブジェクトへ変換して
+# # からモジュールへ渡す（モジュール側の実装は変更不要）。上の文字列方式と併用不可
+# # （同じ [[wasm.modules]] ブロックではどちらか一方のみ）。
+# # [wasm.modules.configuration]
+# # mode = "block"
+# # max_body_size = 65536
+# # patterns = ["union select", "<script"]
+#
+# # F-148: ルート単位で configuration を上書きしたい場合は [[route]] 側の
+# # [route.module_configuration.<モジュール名>] を使う（下記 [[route]] セクション参照）。
+# # 両方 TOML テーブルならディープマージ（同名キーはルート優先）、
+# # どちらかが文字列（JSON）の場合はルート側の値で完全置換される。
 #
 #   # ケーパビリティ設定（モジュールが使用可能なAPIを制限）
 #   [wasm.modules.capabilities]
@@ -1745,6 +1758,11 @@ revalidate_mtime = false
 # [[route]]
 # # WASMモジュール名のリスト（このルートに適用するWASMモジュール）
 # modules = ["header_filter", "waf_filter"]
+# # F-148: ルート単位でモジュール設定を上書きする（モジュール名 → 設定値）。
+# # 値の型は [[wasm.modules]] の configuration と同じ（文字列 or テーブル）。
+# # ここに書けるのは上の modules に列挙したモジュール名のみ（それ以外は設定エラー）。
+# [route.module_configuration.waf_filter]
+# mode = "log_only"  # モジュール定義側の値をルートごとに上書き（ディープマージ）
 # [route.conditions]
 # host = "api.example.com"
 # path = "/api/*"
@@ -2172,6 +2190,10 @@ revalidate_mtime = false
 # # ユーザー空間バッファ経由の転送へ切り替わる。参照するモジュール名は
 # # [wasm] の modules で定義済みであること。
 # wasm_modules = ["network_filter"]
+# # F-148: L4 リスナー単位のモジュール設定上書き（HTTP route と同じ合成規則）。
+# # ここに書けるのは上の wasm_modules に列挙したモジュール名のみ。
+# # [l4.module_configuration.network_filter]
+# # mode = "log_only"
 #
 #   [[l4.upstreams]]
 #   addr = "10.0.0.1:5432"

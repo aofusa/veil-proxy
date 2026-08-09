@@ -44,6 +44,7 @@
 | `entry.rs` `HTTP/3 enabled (UDP listener: X)` | HTTP/3 サーババナーの `HTTP/3 Listen Address: X (UDP)` |
 | メインバナーの `Listen Address: X` | `HTTPS Server` バナーの `Listen Address: X`（TLS リスナーを実際に起動した箇所でのみ出るため、H2C 専用構成で誤った表示にならない） |
 | `entry.rs` `[Security] Pre-loaded TLS credentials have been securely cleared from memory` | `system.rs` の cert / key それぞれの `securely zeroed (N bytes)` 2 行（バイト数付きで上位互換） |
+| `registry.rs` `Loading WASM module: {name}` | 直後の `Loaded WASM module '{name}' with capabilities: ...`（同じモジュール名 + ケーパビリティ付きで上位互換。モジュール数 × 2 行 → × 1 行） |
 
 ### B. 誤った内容の修正
 
@@ -90,6 +91,11 @@
   示す 1 行で、内容は重複していない。
 - `SIGHUP handler registered ...`（シグナルハンドラ登録）と
   `Runtime configuration initialized (hot reload enabled via SIGHUP)`（設定の初期化完了）は別事象。
+- `Initializing WASM Filter Engine...` / `WASM Filter Engine initialized successfully` の対は残す。
+  この区間は wasmtime の Engine 生成と全モジュールの AOT コンパイル（コールドキャッシュ時は
+  秒単位）を含み、**成功行は「どこで時間がかかっているか」を示さない**ため、開始マーカーに
+  独立した意味がある（対してモジュール単位の `Loading` は直後の `Loaded` が同じ名前を出すので
+  開始マーカーとして機能していない）。
 - L4 の `starting <proto> listener on ADDR (...)` と `listening on ADDR` は
   「開始要求」と「bind 成功」で別事象。
 - `Threads: N (CPU cores: M)`（プロセス全体のワーカー数）と各サーババナーの

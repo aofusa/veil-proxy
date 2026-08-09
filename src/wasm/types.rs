@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::capabilities::ModuleCapabilities;
+use crate::wasm_plugin_config::PluginConfiguration;
 
 /// WASM extension configuration
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -99,9 +100,9 @@ pub struct ModuleConfig {
     /// Path to .wasm or .cwasm file
     pub path: String,
 
-    /// Plugin configuration (JSON string)
+    /// Plugin configuration（TOML では文字列（JSON 相当）またはテーブルで記述可能。F-148）
     #[serde(default)]
-    pub configuration: String,
+    pub configuration: PluginConfiguration,
 
     /// Capability settings
     #[serde(default)]

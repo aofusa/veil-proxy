@@ -329,7 +329,7 @@ async fn forward_direction_wasm(
     dst: &IoUringTcpStream,
     idle_timeout: Duration,
     name: &str,
-    wasm_modules: &[String],
+    wasm_modules: &[crate::wasm_plugin_config::ModuleRef],
     is_downstream_data: bool,
     close_requested: &Arc<AtomicBool>,
 ) -> usize {
@@ -585,7 +585,7 @@ pub async fn bidirectional_forward(
     upstream: IoUringTcpStream,
     idle_timeout: Duration,
     listener_name: &str,
-    #[cfg(feature = "wasm")] wasm_modules: &[String],
+    #[cfg(feature = "wasm")] wasm_modules: &[crate::wasm_plugin_config::ModuleRef],
 ) {
     // F-133: WASM network filter が設定されているかどうかを接続確立時に 1 回だけ判定する
     // （ホットパス絶対規則: WASM 無効時はこの分岐 1 つだけがコストのすべてで、以降は
@@ -846,7 +846,7 @@ pub async fn handle_l4_connection(
         idle_timeout,
         &config.name,
         #[cfg(feature = "wasm")]
-        &config.wasm_modules,
+        &config.resolved_wasm_modules,
     )
     .await;
 }
@@ -934,7 +934,7 @@ async fn bidirectional_forward_tls_terminate<C>(
     upstream: &IoUringTcpStream,
     idle_timeout: Duration,
     listener_name: &str,
-    #[cfg(feature = "wasm")] wasm_modules: &[String],
+    #[cfg(feature = "wasm")] wasm_modules: &[crate::wasm_plugin_config::ModuleRef],
 ) where
     C: AsyncReadRent + AsyncWriteRent + Unpin,
 {
@@ -1204,7 +1204,7 @@ async fn handle_l4_tls_terminate_connection(
         idle_timeout,
         &config.name,
         #[cfg(feature = "wasm")]
-        &config.wasm_modules,
+        &config.resolved_wasm_modules,
     )
     .await;
 }
@@ -1234,6 +1234,10 @@ mod tests {
             idle_timeout_secs: 600,
             #[cfg(feature = "wasm")]
             wasm_modules: Vec::new(),
+            #[cfg(feature = "wasm")]
+            module_configuration: None,
+            #[cfg(feature = "wasm")]
+            resolved_wasm_modules: std::sync::Arc::new(Vec::new()),
         }
     }
 

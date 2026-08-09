@@ -77,6 +77,10 @@ pub mod otel;
 pub mod pool;
 pub mod resilience;
 
+/// Proxy-Wasm プラグイン設定（TOML テーブル記法・ルート単位上書き、F-148）。
+/// `wasm` feature に依存せず常にコンパイルされる（`config.rs` が型として使うため）。
+pub mod wasm_plugin_config;
+
 #[cfg(feature = "access-log")]
 pub mod access_log;
 

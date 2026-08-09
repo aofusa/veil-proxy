@@ -360,6 +360,10 @@ mod tests {
             idle_timeout_secs: 1,
             #[cfg(feature = "wasm")]
             wasm_modules: Vec::new(),
+            #[cfg(feature = "wasm")]
+            module_configuration: None,
+            #[cfg(feature = "wasm")]
+            resolved_wasm_modules: std::sync::Arc::new(Vec::new()),
         }
     }
 

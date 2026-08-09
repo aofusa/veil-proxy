@@ -641,7 +641,7 @@ struct SendFileRequest<'a> {
     /// 静的コンテンツキャッシュ設定（F-146、ルーティングごとの上書き）
     static_file_cache_config: Option<&'a cache::StaticContentCacheRouteConfig>,
     #[cfg(feature = "wasm")]
-    wasm_modules: Option<&'a Arc<Vec<String>>>,
+    wasm_modules: Option<&'a Arc<Vec<crate::wasm_plugin_config::ModuleRef>>>,
 }
 
 /// HTTP/3 コネクションハンドラー
@@ -1061,7 +1061,11 @@ impl Http3Handler {
         }
         // WASM モジュール適用ありはボディ全体が必要 → バッファ経路。
         #[cfg(feature = "wasm")]
-        if _modules.as_deref().map(|m| !m.is_empty()).unwrap_or(false) {
+        if _modules
+            .as_deref()
+            .map(|m: &Vec<crate::wasm_plugin_config::ModuleRef>| !m.is_empty())
+            .unwrap_or(false)
+        {
             return Decision::Buffer;
         }
         // gRPC はトレーラー処理のためバッファ経路（ストリーミング Decision の対象外）
@@ -1147,7 +1151,9 @@ impl Http3Handler {
         request_body: &[u8],
     ) -> io::Result<()> {
         #[cfg(feature = "wasm")]
-        let mut wasm_modules_to_apply: Option<Arc<Vec<String>>> = None;
+        let mut wasm_modules_to_apply: Option<
+            Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
+        > = None;
 
         let result = self
             .handle_request_impl(
@@ -1170,7 +1176,9 @@ impl Http3Handler {
         stream_id: u64,
         headers: &[h3::Header],
         request_body: &[u8],
-        #[cfg(feature = "wasm")] wasm_modules_to_apply: &mut Option<Arc<Vec<String>>>,
+        #[cfg(feature = "wasm")] wasm_modules_to_apply: &mut Option<
+            Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
+        >,
     ) -> io::Result<()> {
         // HTTP/3コネクションが確立されていなければ何もしない
         if self.h3_conn.is_none() {
@@ -2044,7 +2052,9 @@ impl Http3Handler {
         prefix: &[u8],
         headers: &[h3::Header],
         request_body: &[u8],
-        #[cfg(feature = "wasm")] wasm_modules: Option<&std::sync::Arc<Vec<String>>>,
+        #[cfg(feature = "wasm")] wasm_modules: Option<
+            &std::sync::Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
+        >,
         #[cfg(feature = "wasm")] wasm_request_headers: Option<&[(Vec<u8>, Vec<u8>)]>,
     ) -> io::Result<(u16, usize)> {
         // サーバー選択（F-97: Consistent Hash header/cookie キー対応）
@@ -3619,7 +3629,7 @@ fn parse_http_response(response: &[u8]) -> io::Result<BackendProxyResult> {
 /// B-38: HTTP/3 経路で WASM on_response_headers を適用する
 #[cfg(feature = "wasm")]
 async fn apply_h3_wasm_response_headers(
-    wasm_modules: &std::sync::Arc<Vec<String>>,
+    wasm_modules: &std::sync::Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
     status: u16,
     header_store: Vec<(Vec<u8>, Vec<u8>)>,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -3658,7 +3668,9 @@ async fn apply_h3_wasm_response_headers(
 /// モジュール未適用（`None` または空リスト）ならコストゼロで即 return する
 /// （ホットパス絶対規則: WASM 未設定時は一切コストを増やさない）。
 #[cfg(feature = "wasm")]
-async fn finish_h3_wasm_lifecycle(wasm_modules_to_apply: &Option<Arc<Vec<String>>>) {
+async fn finish_h3_wasm_lifecycle(
+    wasm_modules_to_apply: &Option<Arc<Vec<crate::wasm_plugin_config::ModuleRef>>>,
+) {
     let Some(modules) = wasm_modules_to_apply else {
         return;
     };
