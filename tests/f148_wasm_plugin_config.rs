@@ -9,34 +9,58 @@
 #![cfg(feature = "wasm")]
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use veil::config::load_config;
 
-const CERT_PEM: &str = "tests/fixtures/cert.pem";
-const KEY_PEM: &str = "tests/fixtures/key.pem";
+/// git 管理下の Proxy-Wasm テストモジュール（`tests/fixtures/wasm/` は追跡対象）。
 const HEADER_FILTER_WASM: &str = "tests/fixtures/wasm/header_filter.wasm";
 
-/// 最小の server/tls セクション込みの設定本文を組み立てる。
-fn base_config(extra: &str) -> String {
-    format!(
+/// TLS 証明書は `tests/fixtures/*.pem` が `.gitignore` 対象（e2e_setup.sh の生成物）の
+/// ため、本テストでは毎回 rcgen で一時ディレクトリへ自己署名証明書を生成する
+/// （E2E のセットアップ有無に依存せず単体で実行できるようにする）。
+// 理由付き allow: テストのセットアップ（一時ディレクトリへの証明書書き出し）であり、
+// データプレーンのホットパスではない（clippy.toml の disallowed-methods はホットパスの
+// ブロッキング検出が目的）。
+#[allow(clippy::disallowed_methods)]
+fn generate_certs(dir: &Path) -> (PathBuf, PathBuf) {
+    use rcgen::{generate_simple_self_signed, CertifiedKey};
+
+    let CertifiedKey { cert, signing_key } =
+        generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .expect("self-signed cert");
+
+    let cert_path = dir.join("cert.pem");
+    let key_path = dir.join("key.pem");
+    std::fs::write(&cert_path, cert.pem()).expect("write cert");
+    std::fs::write(&key_path, signing_key.serialize_pem()).expect("write key");
+    (cert_path, key_path)
+}
+
+/// 最小の server/tls セクション込みの設定を一時ディレクトリへ書き出す。
+/// 返り値の `TempDir` を保持している間だけ設定ファイルが存在する。
+fn write_temp_config(extra: &str) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (cert_path, key_path) = generate_certs(dir.path());
+    let body = format!(
         r#"
 [server]
 listen = "127.0.0.1:0"
 
 [tls]
-cert_path = "{CERT_PEM}"
-key_path = "{KEY_PEM}"
+cert_path = "{cert}"
+key_path = "{key}"
 
 {extra}
-"#
-    )
-}
-
-fn write_temp_config(body: &str) -> tempfile::NamedTempFile {
-    let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
-    tmp.write_all(body.as_bytes()).expect("write");
-    tmp.flush().expect("flush");
-    tmp
+"#,
+        cert = cert_path.display(),
+        key = key_path.display(),
+    );
+    let config_path = dir.path().join("config.toml");
+    let mut f = std::fs::File::create(&config_path).expect("create config");
+    f.write_all(body.as_bytes()).expect("write config");
+    f.flush().expect("flush");
+    (dir, config_path)
 }
 
 /// `[[wasm.modules]]` の `configuration` を TOML テーブルで書いた設定がパースでき、
@@ -69,10 +93,9 @@ redirect_url = "https://example.com/"
 redirect_status = 302
 "#
     );
-    let body = base_config(&extra);
-    let tmp = write_temp_config(&body);
+    let (_dir, config_path) = write_temp_config(&extra);
 
-    let loaded = load_config(tmp.path()).expect("config should load");
+    let loaded = load_config(&config_path).expect("config should load");
     assert_eq!(loaded.route.len(), 1);
     let resolved = loaded.route[0]
         .resolved_modules
@@ -120,10 +143,9 @@ redirect_url = "https://example.com/"
 redirect_status = 302
 "#
     );
-    let body = base_config(&extra);
-    let tmp = write_temp_config(&body);
+    let (_dir, config_path) = write_temp_config(&extra);
 
-    let loaded = load_config(tmp.path()).expect("config should load");
+    let loaded = load_config(&config_path).expect("config should load");
     let resolved = loaded.route[0].resolved_modules.as_ref().unwrap();
     let bytes = resolved[0].configuration.as_ref().unwrap();
     let json = std::str::from_utf8(bytes).expect("valid utf8");
@@ -155,10 +177,9 @@ redirect_url = "https://example.com/"
 redirect_status = 302
 "#
     );
-    let body = base_config(&extra);
-    let tmp = write_temp_config(&body);
+    let (_dir, config_path) = write_temp_config(&extra);
 
-    let result = load_config(tmp.path());
+    let result = load_config(&config_path);
     let err = match result {
         Ok(_) => panic!("must reject module_configuration for unlisted module"),
         Err(e) => e,

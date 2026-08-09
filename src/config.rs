@@ -6139,13 +6139,20 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         graceful_shutdown_timeout_secs: config.server.graceful_shutdown_timeout_secs,
         #[cfg(feature = "l4-proxy")]
         l4_listeners: {
-            let mut listeners = config.l4.unwrap_or_default();
+            let listeners = config.l4.unwrap_or_default();
             // F-148: L4 リスナーの WASM モジュール設定も HTTP ルートと同様、設定ロード時に
             // 1 回だけ合成する（コネクションごとの合成を避ける）。
+            // `wasm` 無効ビルドでは合成対象が無く `mut` も不要になるため、
+            // `mut` を伴うシャドーイングごと cfg の内側に閉じ込める（`#[allow(unused_mut)]`
+            // を足さずに警告ゼロを保つ）。
             #[cfg(feature = "wasm")]
-            for l4 in &mut listeners {
-                resolve_l4_wasm_modules(l4, config.wasm.as_ref());
-            }
+            let listeners = {
+                let mut listeners = listeners;
+                for l4 in &mut listeners {
+                    resolve_l4_wasm_modules(l4, config.wasm.as_ref());
+                }
+                listeners
+            };
             listeners
         },
     })
@@ -6153,7 +6160,11 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
 
 /// L4 リスナーの `wasm_modules` + `module_configuration` から
 /// `resolved_wasm_modules` を構築する（F-148、設定ロード時のみのコールドパス）。
-#[cfg(feature = "wasm")]
+///
+/// 呼び出し元は `load_config` の `l4_listeners` 構築部（`l4-proxy` feature 有効時のみ存在）
+/// なので、`wasm` だけを有効にしたビルドで未使用関数にならないよう両方の feature で
+/// ゲートする。
+#[cfg(all(feature = "wasm", feature = "l4-proxy"))]
 fn resolve_l4_wasm_modules(
     l4: &mut L4ListenerConfig,
     wasm_config: Option<&crate::wasm::WasmConfig>,
