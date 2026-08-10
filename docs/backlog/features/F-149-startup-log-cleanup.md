@@ -106,6 +106,31 @@
   `Workers: N (SO_REUSEPORT enabled)`（そのリスナーの多重化方式）は、
   値が一致するだけで示す事実が異なるため残す。
 
+## 結果
+
+同一構成（`full` features・HTTP/1.1 + H2 + H2C + HTTP/3 + L4 + WASM + Prometheus + admin）で
+再取得した起動時ログは **129 行 → 117 行**。削除したのはすべて他の行が同じ事実を
+（多くは追加情報付きで）出しているものだけで、**失われた事実は無い**。
+改修後のログは `docs/artifacts/f149_startup_log_after.log`（git 管理外）。
+
+主な差分の確認:
+- `[HTTP/3] Server listening on 127.0.0.1:8443 (QUIC/UDP, io_uring)` — `monoio` が消え、
+  ランタイム名が build.rs 発行の cfg に追従することを実機ログで確認。
+- `CPU Affinity: 4 cores available, pinning 1 worker threads` のみが残り、
+  無条件の `CPU Affinity: Enabled (...)` が消えた。
+- WASM モジュールのロードが `Loaded WASM module 'X' with capabilities: ...` の 1 行 × モジュール数に。
+
+## 棚卸しで「候補」に留めたもの（今回は削除していない）
+
+いずれも片方に追加情報があり、単純な重複ではないと判断した:
+
+- `security.rs` の `seccomp filter applied (mode: {:?})` と `entry.rs` の `seccomp: mode={:?}`
+  （2 箇所から同じ mode を報告しているが、適用箇所と設定サマリで文脈が異なる）
+- `security.rs` の `Landlock filesystem restrictions applied` と `entry.rs` の
+  `Landlock: read_paths=..., write_paths=...`（後者はパス一覧を持つ）
+- `config.rs` の `TLS certificates pre-loaded for Landlock compatibility (cert: N bytes, key: N bytes)` と
+  HTTP/3 バナーの `TLS Cert: <path> (pre-loaded, N bytes)`（後者はパス付きだが HTTP/3 有効時のみ出る）
+
 ## 対象外
 
 `src/main.rs` / `src/http3_server.rs` などの **doc コメント**に残る `monoio` の記述は

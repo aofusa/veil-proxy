@@ -130,6 +130,29 @@ TOML → JSON 変換は `src/wasm_plugin_config.rs` に約 80 行の
 - `src/proxy.rs` / `src/http3_server.rs` / `src/l4.rs`（型の追従）
 - `examples/config.toml` / `contrib/config/config.toml` / README / README.ja
 
+## 検証結果
+
+| 対象 | 結果 |
+|---|---|
+| 単体（`--lib --features full`） | 841 passed / 0 failed |
+| 統合（`--bins --test integration_tests`） | 53 passed / 0 failed |
+| 新規統合（`--test f148_wasm_plugin_config`） | 3 passed / 0 failed |
+| Proxy-Wasm 適合（`--test proxy_wasm_conformance`） | 14 passed / 0 failed |
+| プロパティ（`--test config_proptest`） | 4 passed / 0 failed |
+| E2E Linux x86_64 io_uring（既定） | 542 passed / 0 failed |
+| E2E Linux x86_64 reactor（`full,epoll`） | 542 passed / 0 failed |
+| E2E FreeBSD 14.3 aarch64（`full-freebsd`） | 541 passed / 1 failed（**B-61** = 既知・本変更と無関係。単体実行では 31 秒で pass） |
+| E2E OpenBSD 7.9 aarch64（`full-openbsd`） | 541 passed / 0 failed |
+| E2E NetBSD 10.1 aarch64（`full-netbsd`） | **B-62**（既知）によりスイート完走不可。ビルドは成功 |
+| feature 組み合わせビルド 16 種 + clippy(full/no-default, all-targets) + fmt | 警告・エラーゼロ |
+
+feature 組み合わせは default / `--no-default-features` / `full` / `full-container` /
+`wasm` / `http2` / `http3` / `l4-proxy` / `grpc-full` / `admin` / `access-log` / `metrics` /
+`ktls` / `mimalloc` / `opentelemetry` / `full,epoll` の 16 種。
+実装中に検出した 2 件の feature 組み合わせ警告
+（`wasm` のみ有効時の未使用 `resolve_l4_wasm_modules`、`l4-proxy` のみ有効時の `unused_mut`）は
+`#[allow]` を使わず cfg ゲートとスコープ調整で解消した。
+
 ## 後方互換性
 
 既存の `configuration = '<JSON 文字列>'` は **untagged enum の先頭バリアント**として
