@@ -25,7 +25,8 @@ use crate::cache;
 #[cfg(target_os = "linux")]
 use crate::runtime::handle::AsRawFd;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 // CString / FromRawFd / Seek / Write は memfd 経由の証明書リロード（Linux 専用）でのみ
 // 使用する。
 #[cfg(target_os = "linux")]
@@ -668,14 +669,25 @@ struct Http3Handler {
     buffered_reqs: HashMap<u64, BufferedReq>,
     /// ストリームごとのリクエストボディ蓄積（バッファ経路 + ストリーミング初回バッチ）。
     stream_bodies: HashMap<u64, BytesMut>,
-    /// バックエンドタスク → メインループの起床通知（F-32）。
-    notify: crate::http3_stream::H3Notify,
+    /// バックエンドタスク → メインループの起床通知（F-32）。F-151 で per-connection 化
+    /// （`ConnWaker`）し、`notify()` 前に自 cid を共有起床キューへ積むようにした。
+    notify: crate::http3_stream::ConnWaker,
     /// バックエンドタスクのスポーナ（F-46: 型付きタスクプール。ワーカースレッドで共有）。
     backend_spawner: crate::http3_stream::BackendSpawner,
     /// F-99: QUIC 接続ゲージ（Drop で自動 dec。ホットパス無アロケーション）
     _conn_metric: Http3ActiveConnGuard,
     /// F-99: メトリクス計上中のリクエストストリーム ID（open/close の二重計上防止）
     metric_open_streams: HashSet<u64>,
+    /// F-151: ダーティ集合への多重登録防止フラグ。`true` の間はメインループの
+    /// `dirty_queue` に既に自 cid が積まれている。
+    dirty: bool,
+    /// F-151: タイマーヒープへ最後に登録した期限。ヒープ pop 時にこの値と一致する
+    /// エントリだけを有効とみなす（遅延削除。期限更新後の古いエントリは無視して捨てる）。
+    timer_deadline: Option<Instant>,
+    /// F-151（レビュー修正）: 自接続 ID の共有ハンドル。ダーティキュー/タイマーヒープ/
+    /// 送出対象リストへ渡す際は `key.clone()`（`Rc::clone`、参照カウント +1 のみ）で済ませ、
+    /// `ConnectionId` 本体（内部 `Vec<u8>`）のディープコピーをホットパスから排除する。
+    key: crate::http3_stream::ConnKey,
 }
 
 impl Http3Handler {
@@ -683,8 +695,9 @@ impl Http3Handler {
     fn new(
         conn: quiche::Connection,
         peer_addr: SocketAddr,
-        notify: crate::http3_stream::H3Notify,
+        notify: crate::http3_stream::ConnWaker,
         backend_spawner: crate::http3_stream::BackendSpawner,
+        key: crate::http3_stream::ConnKey,
     ) -> Self {
         Self {
             conn,
@@ -699,6 +712,9 @@ impl Http3Handler {
             backend_spawner,
             _conn_metric: Http3ActiveConnGuard::new(),
             metric_open_streams: HashSet::new(),
+            dirty: false,
+            timer_deadline: None,
+            key,
         }
     }
 
@@ -754,11 +770,22 @@ impl Http3Handler {
     /// Data 排出は、**既にストリーミング中のストリーム**には `req_readable` を立てるだけで
     /// `recv_body` せず（バックプレッシャ対応の `drive_proxy_stream` に委譲）、それ以外は
     /// `stream_bodies` へ蓄積する（バッファ経路 + ストリーミング初回バッチ）。
-    async fn process_h3_events(&mut self) -> io::Result<()> {
+    ///
+    /// F-151: 戻り値は「1 件でも仕事をしたか」（`h3.poll()` が 1 件でもイベントを返した /
+    /// バッファ経路リクエストを処理した / 部分レスポンスを進めた のいずれか）。
+    ///
+    /// **B-12 再発防止の不変条件**: h3 のイベントは `poll()` でしか取り出せず、
+    /// `drive_proxy_streams` の `recv_body`（`h3.poll()` の外）がストリームを進めると
+    /// イベントが内部キューに滞留したまま誰も取り出さない状態になり得る（詳細は
+    /// `drive_request_pump` のコメント）。「仕事をしたら必ずもう一度 poll される」ことを
+    /// メインループのダーティ集合再投入（`did_work` → dirty のまま維持）で保証し、
+    /// イベントが残っているのにダーティを降ろす経路を構造的に排除する。
+    async fn process_h3_events(&mut self) -> io::Result<bool> {
         // 新規 Headers（stream_id, headers, more_frames）と Finished / Reset を収集。
         let mut new_headers: Vec<(u64, Vec<h3::Header>, bool)> = Vec::new();
         let mut finished: Vec<u64> = Vec::new();
         let mut reset: Vec<u64> = Vec::new();
+        let mut did_work = false;
 
         if let Some(ref mut h3_conn) = self.h3_conn {
             loop {
@@ -770,9 +797,11 @@ impl Http3Handler {
                             more_frames,
                             list.len()
                         );
+                        did_work = true;
                         new_headers.push((stream_id, list, more_frames));
                     }
                     Ok((stream_id, h3::Event::Data)) => {
+                        did_work = true;
                         if let Some(ps) = self.proxy_streams.get_mut(&stream_id) {
                             // ストリーミング中: バックプレッシャ対応の pump に委譲。
                             ps.req_readable = true;
@@ -802,10 +831,16 @@ impl Http3Handler {
                             }
                         }
                     }
-                    Ok((stream_id, h3::Event::Finished)) => finished.push(stream_id),
-                    Ok((stream_id, h3::Event::Reset(_))) => reset.push(stream_id),
-                    Ok((_flow_id, h3::Event::GoAway)) => {}
-                    Ok((_, h3::Event::PriorityUpdate)) => {}
+                    Ok((stream_id, h3::Event::Finished)) => {
+                        did_work = true;
+                        finished.push(stream_id);
+                    }
+                    Ok((stream_id, h3::Event::Reset(_))) => {
+                        did_work = true;
+                        reset.push(stream_id);
+                    }
+                    Ok((_flow_id, h3::Event::GoAway)) => did_work = true,
+                    Ok((_, h3::Event::PriorityUpdate)) => did_work = true,
                     Err(h3::Error::Done) => break,
                     Err(e) => {
                         warn!("[HTTP/3] h3 poll error: {}", e);
@@ -877,6 +912,7 @@ impl Http3Handler {
             .map(|(k, _)| *k)
             .collect();
         for stream_id in ready {
+            did_work = true;
             let br = self.buffered_reqs.remove(&stream_id).unwrap();
             let body = self
                 .stream_bodies
@@ -888,35 +924,49 @@ impl Http3Handler {
         }
 
         // 部分的なレスポンスを送信（非ストリーミング経路）。
-        self.flush_partial_responses()?;
+        if self.flush_partial_responses()? {
+            did_work = true;
+        }
 
         // ストリーミング駆動はメインループの毎イテレーション drive で行う（通知/タイムアウト時も
         // 確実に進めるため。ここで重複呼び出ししない）。
 
-        Ok(())
+        Ok(did_work)
     }
 
     /// すべてのストリーミングストリームを 1 回駆動する（req pump + resp flush）。
     ///
     /// メインループから毎イテレーション呼ばれ、フロー制御に従って `recv_body`→req チャネル、
     /// resp チャネル→`send_response`/`send_body` を進める。完了したストリームは除去する。
-    fn drive_proxy_streams(&mut self) {
+    ///
+    /// F-151: 戻り値は「1 件でも仕事をしたか」（ストリームへ 1 バイトでも書けた / 完了した /
+    /// 保留レスポンスを進めた のいずれか）。メインループはこれが `true` の間、当該接続を
+    /// ダーティ集合から降ろさない（B-12 再発防止）。
+    fn drive_proxy_streams(&mut self) -> bool {
         let h3 = match self.h3_conn.as_mut() {
             Some(h) => h,
-            None => return,
+            None => return false,
         };
         let conn = &mut self.conn;
         let mut done: Vec<u64> = Vec::new();
+        let mut did_work = false;
         for (&stream_id, ps) in self.proxy_streams.iter_mut() {
-            if drive_proxy_stream(h3, conn, stream_id, ps) {
+            let (work, is_done) = drive_proxy_stream(h3, conn, stream_id, ps);
+            did_work |= work;
+            if is_done {
                 done.push(stream_id);
             }
+        }
+        if !done.is_empty() {
+            // ストリーム完了自体も「仕事をした」に含める。
+            did_work = true;
         }
         for stream_id in done {
             debug!("[HTTP/3] streaming proxy stream {} done", stream_id);
             self.proxy_streams.remove(&stream_id);
             self.metric_stream_close(stream_id);
         }
+        did_work
     }
 
     /// リクエストをストリーミング適格・バッファ・即時応答済みに分類する（F-32）。
@@ -2597,45 +2647,66 @@ impl Http3Handler {
         }
     }
 
-    /// 部分的なレスポンスをフラッシュ
-    fn flush_partial_responses(&mut self) -> io::Result<()> {
+    /// 部分的なレスポンスをフラッシュする。
+    ///
+    /// F-151: 戻り値は「1 件でも進捗があったか」（ヘッダ/ボディ送出 or 完了）。
+    /// `process_h3_events` がダーティ集合を降ろすかどうかの判定に使う。
+    fn flush_partial_responses(&mut self) -> io::Result<bool> {
         let h3_conn = match &mut self.h3_conn {
             Some(h3) => h3,
-            None => return Ok(()),
+            None => return Ok(false),
         };
 
         let mut completed = Vec::new();
+        let mut did_work = false;
         for (&stream_id, pr) in &mut self.partial_responses {
+            // 進捗判定用に呼び出し前の状態を控える（try_flush_partial 自体は変更しない）。
+            let written_before = pr.written;
+            let head_present_before = pr.head.is_some();
             if Self::try_flush_partial(h3_conn, &mut self.conn, stream_id, pr) {
                 completed.push(stream_id);
+                did_work = true;
+            } else if pr.written != written_before || pr.head.is_some() != head_present_before {
+                // 未完了でもヘッダ送出/部分バイト送出があった＝進捗あり。
+                did_work = true;
             }
         }
         for stream_id in completed {
             self.partial_responses.remove(&stream_id);
         }
 
-        Ok(())
+        Ok(did_work)
     }
 
     /// 書き込み可能なストリームを処理（quiche パターン）
     ///
     /// conn.writable() で書き込み可能になったストリームに対して、
     /// 保留中の部分レスポンスを再送します。
-    fn handle_writable_streams(&mut self) -> io::Result<()> {
+    ///
+    /// F-151: 戻り値は「1 件でも進捗があったか」。B-12 再発防止のため、
+    /// ダーティ集合を降ろすかどうかの判定に使う（進捗があれば次イテレーションでも
+    /// もう一度見る）。
+    fn handle_writable_streams(&mut self) -> io::Result<bool> {
         let h3_conn = match &mut self.h3_conn {
             Some(h3) => h3,
-            None => return Ok(()),
+            None => return Ok(false),
         };
 
         // 書き込み可能なストリームを収集
         let writable_streams: Vec<u64> = self.conn.writable().collect();
 
         let mut completed = Vec::new();
+        let mut did_work = false;
         for stream_id in writable_streams {
             // 部分レスポンスがあるかチェック
             if let Some(pr) = self.partial_responses.get_mut(&stream_id) {
+                let written_before = pr.written;
+                let head_present_before = pr.head.is_some();
                 if Self::try_flush_partial(h3_conn, &mut self.conn, stream_id, pr) {
                     completed.push(stream_id);
+                    did_work = true;
+                } else if pr.written != written_before || pr.head.is_some() != head_present_before {
+                    did_work = true;
                 }
             }
         }
@@ -2643,7 +2714,7 @@ impl Http3Handler {
             self.partial_responses.remove(&stream_id);
         }
 
-        Ok(())
+        Ok(did_work)
     }
 }
 
@@ -2814,49 +2885,58 @@ fn build_h1_request_head(
     req
 }
 
-/// 1 ストリームの駆動結果。`true` を返したら呼び出し側が `proxy_streams` から除去する。
+/// 1 ストリームの駆動結果。`(did_work, done)`。`did_work` は F-151 のダーティ集合維持判定
+/// （進捗があれば呼び出し側がダーティのまま再投入する）、`done` が `true` なら呼び出し側が
+/// `proxy_streams` から除去する。
 fn drive_proxy_stream(
     h3: &mut h3::Connection,
     conn: &mut quiche::Connection,
     stream_id: u64,
     ps: &mut ProxyStream,
-) -> bool {
-    drive_request_pump(h3, conn, stream_id, ps);
-    drive_response_flush(h3, conn, stream_id, ps);
+) -> (bool, bool) {
+    let pump_work = drive_request_pump(h3, conn, stream_id, ps);
+    let flush_work = drive_response_flush(h3, conn, stream_id, ps);
     // 完了条件: レスポンス fin 送出済み かつ リクエスト側クローズ済み。
-    ps.resp_fin_sent && ps.req_tx.is_none() && ps.req_pending.is_empty()
+    let done = ps.resp_fin_sent && ps.req_tx.is_none() && ps.req_pending.is_empty();
+    (pump_work || flush_work, done)
 }
 
 /// リクエストボディ pump: `recv_body` → req チャネル（フロー制御 + バックプレッシャ）。
+///
+/// F-151: 戻り値は「1 件でも進捗があったか」。フロー制御で完全にブロックされた
+/// （`Full`/`is_full`）だけの呼び出しは `false`（進捗なし）とし、ダーティ集合からの
+/// ビジーループ再投入を避ける。それ以外の状態遷移（送出・EOF 検出・破棄）は `true` とし、
+/// B-12 の不変条件（イベントが残っているのに誰も見なくなる経路を作らない）を安全側に倒す。
 fn drive_request_pump(
     h3: &mut h3::Connection,
     conn: &mut quiche::Connection,
     stream_id: u64,
     ps: &mut ProxyStream,
-) {
+) -> bool {
     use crate::http3_stream::TrySendError;
+    let mut did_work = false;
     let tx = match &ps.req_tx {
         Some(t) => t,
-        None => return,
+        None => return did_work,
     };
 
     // ボディ上限超過済みなら何もしない（応答 flush 側で 413 + リセット）。
     if ps.req_too_large {
-        return;
+        return did_work;
     }
 
     // 1. 未投入ボディ（初回バッチ/溢れ分）を先に流す（ゼロコピー: clone せず move）。
     while let Some(front) = ps.req_pending.pop_front() {
         match tx.try_send(front) {
-            Ok(()) => {}
+            Ok(()) => did_work = true,
             Err(TrySendError::Full(item)) => {
                 ps.req_pending.push_front(item); // バックプレッシャ: recv_body も止める。
-                return;
+                return did_work;
             }
             Err(TrySendError::Closed(_)) => {
                 ps.req_pending.clear();
                 ps.req_tx = None;
-                return;
+                return true;
             }
         }
     }
@@ -2865,7 +2945,7 @@ fn drive_request_pump(
     if ps.req_readable {
         loop {
             if tx.is_full() {
-                return; // データを quiche に残す → フロー制御でクライアント送信が止まる。
+                return did_work; // データを quiche に残す → フロー制御でクライアント送信が止まる。
             }
             let mut buf = BytesMut::with_capacity(REQ_RECV_CHUNK);
             let spare = buf.spare_capacity_mut();
@@ -2875,6 +2955,7 @@ fn drive_request_pump(
             };
             match h3.recv_body(conn, stream_id, spare_u8) {
                 Ok(n) if n > 0 => {
+                    did_work = true;
                     unsafe { buf.advance_mut(n) };
                     ps.req_bytes_total += n as u64;
                     // ボディ上限チェック（0 = 無制限）。
@@ -2884,17 +2965,17 @@ fn drive_request_pump(
                         ps.req_pending.clear();
                         // クライアントの送信を止める。
                         let _ = conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0);
-                        return;
+                        return true;
                     }
                     match tx.try_send(buf.freeze()) {
                         Ok(()) => continue,
                         Err(TrySendError::Full(b)) => {
                             ps.req_pending.push_back(b);
-                            return;
+                            return did_work;
                         }
                         Err(TrySendError::Closed(_)) => {
                             ps.req_tx = None;
-                            return;
+                            return true;
                         }
                     }
                 }
@@ -2919,32 +3000,42 @@ fn drive_request_pump(
     // EOF を伝播する。
     if !ps.req_eof_seen && conn.stream_finished(stream_id) {
         ps.req_eof_seen = true;
+        did_work = true; // 新規に EOF を検出 = 進捗（response flush 側が最終処理できるように）。
     }
 
     // 3. クライアント END_STREAM 受信かつ全消化なら送信端を閉じて EOF 伝播。
     if ps.req_eof_seen && ps.req_pending.is_empty() && !ps.req_readable {
         ps.req_tx = None;
+        did_work = true;
     }
+
+    did_work
 }
 
 /// レスポンス flush: resp チャネル → `send_response`/`send_body`（フロー制御 + 部分送信保持）。
+///
+/// F-151: 戻り値は「1 件でも進捗があったか」（ヘッダ/ボディ/fin を実際に送出できた、または
+/// エラー応答で完了させた）。`Blocked`（quiche 側フロー制御で 0 バイトも送れなかった）は
+/// 進捗なしとして扱い、ビジーループ再投入を避ける。
 fn drive_response_flush(
     h3: &mut h3::Connection,
     conn: &mut quiche::Connection,
     stream_id: u64,
     ps: &mut ProxyStream,
-) {
+) -> bool {
     use crate::http3_stream::{RespMsg, TryRecv};
 
     if ps.resp_fin_sent {
-        return;
+        return false;
     }
+
+    let mut did_work = false;
 
     // ボディ上限超過 → 413 を返して終了（応答未開始時のみ）。
     if ps.req_too_large && !ps.resp_started {
         send_simple_h3_error(h3, conn, stream_id, 413);
         ps.resp_fin_sent = true;
-        return;
+        return true;
     }
 
     // 0. 保留中の fin を再送。
@@ -2952,21 +3043,25 @@ fn drive_response_flush(
         if try_send_h3_fin(h3, conn, stream_id) {
             ps.resp_fin_sent = true;
             ps.need_fin = false;
+            did_work = true;
         }
-        return;
+        return did_work;
     }
 
     // 1. StreamBlocked で保留した head を再送。
     if let Some((status, headers)) = ps.head_pending.take() {
         match send_h3_head(h3, conn, stream_id, status, &headers) {
-            HeadSend::Sent => ps.resp_started = true,
+            HeadSend::Sent => {
+                ps.resp_started = true;
+                did_work = true;
+            }
             HeadSend::Blocked => {
                 ps.head_pending = Some((status, headers));
-                return;
+                return did_work;
             }
             HeadSend::Error => {
                 ps.resp_fin_sent = true;
-                return;
+                return true;
             }
         }
     }
@@ -2974,18 +3069,19 @@ fn drive_response_flush(
     // 2. 部分送信のボディ断片を flush。
     if let Some((buf, off)) = ps.body_pending.take() {
         match send_h3_body(h3, conn, stream_id, &buf, off) {
-            BodySend::Done => {}
+            BodySend::Done => did_work = true,
             BodySend::Partial(new_off) => {
+                did_work = true; // 一部でも送れたので進捗あり。
                 ps.body_pending = Some((buf, new_off));
-                return;
+                return did_work;
             }
             BodySend::Blocked => {
                 ps.body_pending = Some((buf, off));
-                return;
+                return did_work;
             }
             BodySend::Error => {
                 ps.resp_fin_sent = true;
-                return;
+                return true;
             }
         }
     }
@@ -2993,35 +3089,39 @@ fn drive_response_flush(
     // 3. チャネルを排出して送出。
     loop {
         if ps.head_pending.is_some() || ps.body_pending.is_some() {
-            return;
+            return did_work;
         }
         match ps.resp_rx.try_recv() {
             TryRecv::Item(RespMsg::Head { status, headers }) => {
                 match send_h3_head(h3, conn, stream_id, status, &headers) {
-                    HeadSend::Sent => ps.resp_started = true,
+                    HeadSend::Sent => {
+                        ps.resp_started = true;
+                        did_work = true;
+                    }
                     HeadSend::Blocked => {
                         ps.head_pending = Some((status, headers));
-                        return;
+                        return did_work;
                     }
                     HeadSend::Error => {
                         ps.resp_fin_sent = true;
-                        return;
+                        return true;
                     }
                 }
             }
             TryRecv::Item(RespMsg::Body(b)) => match send_h3_body(h3, conn, stream_id, &b, 0) {
-                BodySend::Done => {}
+                BodySend::Done => did_work = true,
                 BodySend::Partial(off) => {
+                    did_work = true;
                     ps.body_pending = Some((b, off));
-                    return;
+                    return did_work;
                 }
                 BodySend::Blocked => {
                     ps.body_pending = Some((b, 0));
-                    return;
+                    return did_work;
                 }
                 BodySend::Error => {
                     ps.resp_fin_sent = true;
-                    return;
+                    return true;
                 }
             },
             TryRecv::Item(RespMsg::Error { status }) => {
@@ -3032,7 +3132,7 @@ fn drive_response_flush(
                     let _ = conn.stream_shutdown(stream_id, quiche::Shutdown::Write, 0x10c);
                 }
                 ps.resp_fin_sent = true;
-                return;
+                return true;
             }
             TryRecv::Closed => {
                 // バックエンド完了 → fin 送出。
@@ -3047,9 +3147,9 @@ fn drive_response_flush(
                     send_simple_h3_error(h3, conn, stream_id, 502);
                     ps.resp_fin_sent = true;
                 }
-                return;
+                return true;
             }
-            TryRecv::Empty => return,
+            TryRecv::Empty => return did_work,
         }
     }
 }
@@ -4024,6 +4124,22 @@ pub async fn run_http3_server_async(
         }
     }
 
+    // F-151: ダーティ接続集合 + タイマー最小ヒープでイベント駆動化する（実験で確定した
+    // 「1 イテレーションあたり接続マップ全体を最大 6 回スイープする固定費」を排除する）。
+    // いずれもループ外で 1 度だけ確保し、以降は使い回す（ホットパスでの新規アロケーション
+    // 禁止のため `VecDeque`/`BinaryHeap` を毎イテレーション `new()` しない）。
+    // `ConnKey`（= `Rc<ConnectionId<'static>>`）で持ち回ることで、これらのキューへの
+    // push のたびに発生していた `ConnectionId`（内部 `Vec<u8>`）のヒープ確保を
+    // `Rc::clone`（参照カウント +1 のみ）に置き換える（F-151 レビュー修正）。
+    let mut dirty_queue: VecDeque<ConnKey> = VecDeque::new();
+    let mut timers: BinaryHeap<Reverse<TimerKey>> = BinaryHeap::new();
+    // F-151: バックエンドタスクが per-connection に積む起床キュー（`Http3Handler` 生成時に
+    // `ConnWaker` へ `Rc` で共有する）。
+    let wake_queue: crate::http3_stream::WakeQueue = Rc::new(RefCell::new(VecDeque::new()));
+    // F-151: 末尾の送出スイープで走査する対象 cid（このイテレーションで処理した接続）。
+    // ループ外で 1 度だけ確保し、毎イテレーション clear して使い回す。
+    let mut send_targets: Vec<ConnKey> = Vec::new();
+
     // メインループ: パケット受信とディスパッチ
     loop {
         // シャットダウンチェック
@@ -4110,15 +4226,18 @@ pub async fn run_http3_server_async(
             }
         }
 
-        // 最小タイムアウトを計算
-        let timeout_duration = {
-            let conns = connections.borrow();
-            conns
-                .values()
-                .filter_map(|h| h.conn.timeout())
-                .min()
-                .unwrap_or(Duration::from_millis(100))
-        };
+        // F-151: 次に処理すべき最短期限をタイマーヒープから算出する（全接続の
+        // `conn.timeout()` を毎回スイープしていた従来方式を廃止）。
+        // `!dirty_queue.is_empty()` を渡す: 前イテレーションで `did_work` により再投入された
+        // 未処理の接続が残っている間は、タイマー期限に関係なく sleep せず即座に次の
+        // ダーティ処理へ進む（レビュー修正: これをしないとストリーミング中のレスポンスが
+        // チャンクごとに最大 100ms 停止し得る）。
+        let now = Instant::now();
+        let timeout_duration = next_sleep_duration(
+            timers.peek().map(|Reverse(TimerKey(dl, _))| *dl),
+            now,
+            !dirty_queue.is_empty(),
+        );
 
         // パケット受信・バックエンドタスク通知・タイムアウトの 3 者を多重化（F-32 + F-124）。
         //
@@ -4129,15 +4248,13 @@ pub async fn run_http3_server_async(
         // **フォールバック (reactor / multishot 不可)**: 従来の recv_gro_async + recvmmsg drain。
         // F-32: バックエンド notify でメインループを起こしストリーミングを駆動する。
 
-        // タイムアウト処理は受信の前後どちらでもよいが、従来通り受信 select の後に行う。
-        // （下で select 後に実行）
+        // F-151: タイムアウト処理・起床キューの drain は受信 select の直後、両分岐で共通して
+        // 1 回だけ行う（下で分岐後に実行）。
 
         #[cfg(all(target_os = "linux", veil_rt_uring))]
         let used_multishot = ms_recv.is_some();
         #[cfg(not(all(target_os = "linux", veil_rt_uring)))]
         let used_multishot = false;
-
-        let mut got_packet = false;
 
         if used_multishot {
             #[cfg(all(target_os = "linux", veil_rt_uring))]
@@ -4154,26 +4271,16 @@ pub async fn run_http3_server_async(
                     _ = futures::FutureExt::fuse(crate::runtime::time::sleep(timeout_duration)) => MsOutcome::Timeout,
                 };
 
-                // タイムアウト処理
+                // F-151: タイマーヒープから期限到来分だけ pop して on_timeout する。
                 {
                     let mut conns = connections.borrow_mut();
-                    let mut closed = Vec::new();
-                    for (cid, handler) in conns.iter_mut() {
-                        handler.conn.on_timeout();
-                        if handler.conn.is_closed() {
-                            closed.push(cid.clone());
-                        }
-                    }
-                    for cid in closed {
-                        debug!("[HTTP/3] Connection closed (timeout)");
-                        conns.remove(&cid);
-                    }
+                    expire_due_timers(&mut conns, &mut timers, &mut dirty_queue, Instant::now());
+                    drain_wake_queue(&wake_queue, &mut conns, &mut dirty_queue);
                 }
 
                 if let MsOutcome::Batch(result) = outcome {
                     match result {
                         Ok(n) => {
-                            got_packet = true;
                             let mut conns = connections.borrow_mut();
                             // F-130 C1: recv_batch() が今回完了を見つけた全スロット
                             // （n 件、複数同時のことがある）を処理する。libc recvmmsg は
@@ -4193,6 +4300,8 @@ pub async fn run_http3_server_async(
                                             local_addr,
                                             &notify,
                                             &backend_spawner,
+                                            &wake_queue,
+                                            &mut dirty_queue,
                                         )?;
                                     }
                                     Err(e) if e.kind() != io::ErrorKind::WouldBlock => {
@@ -4204,9 +4313,7 @@ pub async fn run_http3_server_async(
                             if let Err(e) = ms.rearm_ready() {
                                 error!("[HTTP/3] RECVMSG re-arm failed: {}", e);
                             }
-                            drop(conns);
-                            send_pending_packets(&connections, &socket, local_addr, mmsg_batch)
-                                .await;
+                            // F-151: 受信直後の送出は行わない（イテレーション末尾の 1 回に統一）。
                         }
                         Err(e) => {
                             error!("[HTTP/3] pipelined RECVMSG error: {}", e);
@@ -4224,17 +4331,8 @@ pub async fn run_http3_server_async(
 
             {
                 let mut conns = connections.borrow_mut();
-                let mut closed = Vec::new();
-                for (cid, handler) in conns.iter_mut() {
-                    handler.conn.on_timeout();
-                    if handler.conn.is_closed() {
-                        closed.push(cid.clone());
-                    }
-                }
-                for cid in closed {
-                    debug!("[HTTP/3] Connection closed (timeout)");
-                    conns.remove(&cid);
-                }
+                expire_due_timers(&mut conns, &mut timers, &mut dirty_queue, Instant::now());
+                drain_wake_queue(&wake_queue, &mut conns, &mut dirty_queue);
             }
 
             let gro_result = match recv_outcome {
@@ -4249,7 +4347,6 @@ pub async fn run_http3_server_async(
             };
 
             if let Some(first_gro) = gro_result {
-                got_packet = true;
                 let mut conns = connections.borrow_mut();
                 let first_total = first_gro.bytes_received;
                 process_datagram_segments(
@@ -4262,6 +4359,8 @@ pub async fn run_http3_server_async(
                     local_addr,
                     &notify,
                     &backend_spawner,
+                    &wake_queue,
+                    &mut dirty_queue,
                 )?;
 
                 let mut drained = 0usize;
@@ -4288,6 +4387,8 @@ pub async fn run_http3_server_async(
                             local_addr,
                             &notify,
                             &backend_spawner,
+                            &wake_queue,
+                            &mut dirty_queue,
                         )?;
                     }
                     drained += n;
@@ -4295,15 +4396,13 @@ pub async fn run_http3_server_async(
                         break;
                     }
                 }
-                drop(conns);
-                send_pending_packets(&connections, &socket, local_addr, mmsg_batch).await;
+                // F-151: 受信直後の送出は行わない（イテレーション末尾の 1 回に統一）。
             }
         }
 
-        // got_packet は今後の分岐用（現状は送信を上で実施済み）。未使用警告回避。
-        let _ = got_packet;
-
-        // H3初期化とイベント処理（B-12: パケット受信時だけでなく**毎イテレーション**実行する）。
+        // F-151: ダーティ接続だけを 1 回処理する（B-12: パケット受信時だけでなく通知/
+        // タイマー起床時も含め、ダーティな接続は毎回 init_h3/handle_writable_streams/
+        // process_h3_events/drive_proxy_streams を通す）。
         //
         // `drive_proxy_streams` の `recv_body`（`h3.poll()` の外）がストリームを進めると、
         // h3 イベントは poll でしか取り出せない形で滞留する。具体例（B-12 のハング）:
@@ -4312,10 +4411,29 @@ pub async fn run_http3_server_async(
         // （非 DATA フレームの消費は poll 専用）、`Finished` も生成されない。クライアントは
         // 送信完了後は無通信のため「パケット到着時のみ poll」だと永久に取り残され、
         // EOF 未伝播 → レスポンス無し → QUIC アイドルタイムアウトの双方向デッドロックに陥る。
-        // poll はイベントが無ければ即 `Done` を返すだけで安価なので、毎イテレーション呼ぶ。
+        //
+        // **不変条件（B-12 再発防止）**: `handle_writable_streams` /
+        // `process_h3_events` / `drive_proxy_streams` の**いずれか 1 件でも仕事をしたら**
+        // 当該接続をダーティのままキューへ再投入し、次イテレーションでもう一度見る。
+        // 「イベントが残っているのにダーティを降ろす」経路を構造的に排除するため。
+        send_targets.clear();
         {
             let mut conns = connections.borrow_mut();
-            for (_, handler) in conns.iter_mut() {
+            // このイテレーション開始時点のキュー長だけ処理する。処理中に did_work で
+            // 再投入された分は次イテレーションへ回す（無限ループ防止）。
+            let n = dirty_queue.len();
+            for _ in 0..n {
+                let Some(cid) = dirty_queue.pop_front() else {
+                    break;
+                };
+                // `ConnKey`（`Rc<ConnectionId>`）を `&*cid` で deref し、HashMap キー
+                // （素の `ConnectionId<'static>`）としてルックアップする。
+                let Some(handler) = conns.get_mut(&*cid) else {
+                    continue; // 既に削除済み（タイムアウト/エラーでクローズ）。
+                };
+
+                let mut did_work = false;
+
                 // HTTP/3 初期化
                 if handler.h3_conn.is_none() && handler.conn.is_established() {
                     debug!("[HTTP/3] Connection established, initializing H3");
@@ -4324,43 +4442,240 @@ pub async fn run_http3_server_async(
                     warn!("[HTTP/3] init_h3 error: {}", e);
                 }
 
-                // 書き込み可能なストリームを処理（quiche パターン）
-                // 部分レスポンスを再送する
+                // 書き込み可能なストリームを処理（quiche パターン）。部分レスポンスを再送する。
                 if handler.h3_conn.is_some() {
-                    if let Err(e) = handler.handle_writable_streams() {
-                        warn!("[HTTP/3] handle_writable_streams error: {}", e);
+                    match handler.handle_writable_streams() {
+                        Ok(w) => did_work |= w,
+                        Err(e) => warn!("[HTTP/3] handle_writable_streams error: {}", e),
                     }
                 }
 
                 // HTTP/3 イベント処理
                 if handler.h3_conn.is_some() {
-                    if let Err(e) = handler.process_h3_events().await {
-                        warn!("[HTTP/3] process_h3_events error: {}", e);
+                    match handler.process_h3_events().await {
+                        Ok(w) => did_work |= w,
+                        Err(e) => warn!("[HTTP/3] process_h3_events error: {}", e),
                     }
                 }
-            }
-        }
 
-        // F-32: 全ハンドラのストリーミングストリームを駆動（パケット無し = 通知/タイムアウト時も）。
-        // バックエンドタスクが生成したレスポンス断片を send_body、recv_body したリクエストボディを
-        // チャネルへ流す。フロー制御でブロックした分は次イテレーションで再試行される。
-        {
-            let mut conns = connections.borrow_mut();
-            for (_, handler) in conns.iter_mut() {
+                // F-32: ストリーミングストリームを駆動。バックエンドタスクが生成したレスポンス
+                // 断片を send_body、recv_body したリクエストボディをチャネルへ流す。
                 if handler.h3_conn.is_some() {
-                    handler.drive_proxy_streams();
+                    did_work |= handler.drive_proxy_streams();
                 }
+
+                // タイマー再登録（コネクション処理直後）。
+                schedule_timer(handler, &cid, Instant::now(), &mut timers);
+
+                if did_work {
+                    // まだ仕事が残っている可能性 → dirty のまま維持して再投入する。
+                    // `cid.clone()` が必要な理由: 同じ cid を dirty_queue（次回のダーティ処理
+                    // 対象）と send_targets（今回の送出対象）の両方へ積む必要があるため
+                    // （元のオブジェクトはどちらか一方にしか move できない）。`cid` は
+                    // `ConnKey`（`Rc`）なので `clone()` は参照カウント +1 のみで malloc なし。
+                    dirty_queue.push_back(cid.clone());
+                } else {
+                    handler.dirty = false;
+                }
+                send_targets.push(cid);
             }
         }
 
-        // 送信処理（常に実行 - タイムアウト時も送信が必要）
-        send_pending_packets(&connections, &socket, local_addr, mmsg_batch).await;
+        // 送信処理（ダーティ接続だけを走査する、F-151）。sendmmsg / io_uring SENDMSG の
+        // バッチ構築ロジック（`finalize_send_entry`/`send_mmsg_flush`/GSO セグメント判定）は
+        // 変更しない。走査対象の集合を全接続からダーティ接続へ絞るだけ。
+        //
+        // **ACK 送出漏れが無いことの論拠**（レビュー確認事項）: `send_targets` は
+        // 「このイテレーションでダーティ処理ループを通過した接続」の全量である
+        // （did_work の有無に関わらず、ループで pop した cid は必ず `send_targets.push`
+        // される）。ACK が必要になる契機は (1) 受信（`process_datagram_segments` が
+        // recv 直後に必ずダーティ化する）(2) タイマー発火（`expire_due_timers` が
+        // `on_timeout` 後に必ずダーティ化する）(3) バックエンド起床（`drain_wake_queue`
+        // がダーティ化する）のいずれかであり、すべてダーティ化 → 今回のダーティ処理
+        // ループを通過 → `send_targets` に入る、という経路を必ず通る。よってダーティで
+        // ない（＝今回何も起きていない）接続にだけ ACK 送出漏れが起き得ないことになる。
+        send_pending_packets(
+            &connections,
+            &socket,
+            local_addr,
+            mmsg_batch,
+            &send_targets,
+            &mut dirty_queue,
+        )
+        .await;
 
         // F-44: 協調的 yield。パケットが連続して到着すると select の recv arm が
         // 即 Ready になり続け、本タスクが単一 poll 内でループし続けて同一スレッドの
         // バックエンド I/O タスク（TLS ハンドシェイク・TCP 転送）が飢餓する。
         // 毎イテレーション一度キュー末尾へ譲り、spawn 済みタスクを 1 巡実行させる。
         crate::runtime::yield_now().await;
+    }
+}
+
+// ====================
+// F-151: ダーティ接続集合 + タイマー最小ヒープ（イベント駆動化）
+// ====================
+
+/// タイマーヒープの pop が来ない場合のフォールバック値であり、かつ `select` の sleep 時間の
+/// 上限クランプにも使う（従来のタイムアウト粒度 100ms から挙動を変えない）。
+const H3_DEFAULT_TIMER: Duration = Duration::from_millis(100);
+
+/// 接続 ID の共有ハンドル（`ConnKey` = `Rc<ConnectionId<'static>>`）。ダーティキュー/
+/// タイマーヒープ/送出対象リストはすべてこの型を使い、`clone()` を `Rc::clone`
+/// （参照カウント +1 のみ）に落として `ConnectionId` 本体のヒープ確保を避ける
+/// （F-151 レビュー修正。定義本体は [`crate::http3_stream::ConnKey`]）。
+type ConnKey = crate::http3_stream::ConnKey;
+
+/// タイマーヒープ（`BinaryHeap<Reverse<TimerKey>>`）のエントリ。
+///
+/// `quiche::ConnectionId` は `Ord`/`PartialOrd` を実装していないため `(Instant,
+/// ConnectionId)` タプルをそのまま `BinaryHeap` の要素にはできない。本型は `Instant` のみで
+/// 順序付けし（同着時の順序は問わない。タイマー期限の到来判定にしか使わないため cid の
+/// 大小関係は無関係）、`ConnKey` は識別子として運ぶだけにする。
+struct TimerKey(Instant, ConnKey);
+
+impl PartialEq for TimerKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+impl Eq for TimerKey {}
+impl PartialOrd for TimerKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for TimerKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+/// ヒープ先頭の期限から次の `select` sleep 時間を算出する（quiche/`Http3Handler` 非依存の
+/// 純粋関数。単体テスト対象）。
+///
+/// - **`has_dirty = true`（ダーティ集合に未処理の接続が残っている）→ 常に 0。**
+///   前イテレーションで `did_work` により再投入された接続がある状態で sleep してしまうと、
+///   ストリーミング中のレスポンスがチャンクごとに最大 `H3_DEFAULT_TIMER` 停止し得る
+///   （レイテンシ退行。F-151 レビュー修正）。
+/// - ヒープが空（`top = None`）→ 既定 100ms。
+/// - 先頭期限が既に過去（`top <= now`）→ 0（即座に処理すべきタイマーがある）。
+/// - 先頭期限が未来 → その差分。ただし上限を 100ms にクランプし、従来のタイムアウト粒度
+///   から外れないようにする。
+fn next_sleep_duration(top: Option<Instant>, now: Instant, has_dirty: bool) -> Duration {
+    if has_dirty {
+        return Duration::ZERO;
+    }
+    match top {
+        None => H3_DEFAULT_TIMER,
+        Some(dl) if dl <= now => Duration::ZERO,
+        Some(dl) => (dl - now).min(H3_DEFAULT_TIMER),
+    }
+}
+
+/// タイマーヒープの遅延削除判定（quiche/`Http3Handler` 非依存の純粋関数。単体テスト対象）。
+///
+/// pop したエントリの期限 `popped_deadline` が、そのハンドラの現在の期限
+/// （`Http3Handler::timer_deadline` 相当）と一致する場合のみ有効。期限が更新された後の
+/// 古いエントリは `false` を返し、呼び出し側は無視して捨てる。
+fn timer_entry_is_current(popped_deadline: Instant, current_deadline: Option<Instant>) -> bool {
+    current_deadline == Some(popped_deadline)
+}
+
+/// ダーティフラグ管理の核（quiche/`Http3Handler` 非依存。単体テスト対象）。
+///
+/// 既にダーティ（`*dirty == true`）なら何もしない（多重登録防止）。そうでなければ
+/// ダーティにしてキューへ push する。戻り値は「実際に push したか」。
+fn mark_dirty_flag<T: Clone>(dirty: &mut bool, queue: &mut VecDeque<T>, id: &T) -> bool {
+    if *dirty {
+        false
+    } else {
+        *dirty = true;
+        queue.push_back(id.clone());
+        true
+    }
+}
+
+/// 接続をダーティ集合へ登録する（多重登録防止）。`Http3Handler::dirty` が `false` のときだけ
+/// `true` にしてキューへ push する。
+///
+/// 呼び出し元が既に対象 `Http3Handler` を可変借用している場合はこの関数を使わず、
+/// `mark_dirty_flag(&mut handler.dirty, queue, key)` を直接呼ぶ（`conns` の二重借用を避ける
+/// ため。`process_datagram_segments` の受信直後の呼び出し箇所を参照）。
+fn mark_dirty(
+    conns: &mut HashMap<ConnectionId<'static>, Http3Handler>,
+    queue: &mut VecDeque<ConnKey>,
+    key: &ConnKey,
+) {
+    // `ConnKey` = `Rc<ConnectionId>` を `&**key` で deref し、HashMap キー（素の
+    // `ConnectionId<'static>`）としてルックアップする。
+    if let Some(h) = conns.get_mut(&**key) {
+        mark_dirty_flag(&mut h.dirty, queue, key);
+    }
+}
+
+/// コネクション処理直後にタイマーヒープへ次回期限を登録する（遅延削除方式）。
+///
+/// `conn.timeout()` が `None`（アイドル/未確立等）の場合は `H3_DEFAULT_TIMER` をフォール
+/// バックとして使う。
+fn schedule_timer(
+    handler: &mut Http3Handler,
+    key: &ConnKey,
+    now: Instant,
+    timers: &mut BinaryHeap<Reverse<TimerKey>>,
+) {
+    let deadline = now + handler.conn.timeout().unwrap_or(H3_DEFAULT_TIMER);
+    handler.timer_deadline = Some(deadline);
+    timers.push(Reverse(TimerKey(deadline, key.clone())));
+}
+
+/// タイマーヒープから期限到来分だけ pop して `on_timeout` を呼び、ダーティ化する（F-151）。
+///
+/// 全接続の `conn.timeout()` の最小値を求める走査と、期限が来ていない接続まで
+/// `on_timeout` する走査（従来方式）を廃止する。遅延削除方式: pop したエントリの期限が
+/// 現在の `timer_deadline` と一致しなければ（期限が更新済みの古いエントリ）無視して捨てる。
+fn expire_due_timers(
+    conns: &mut HashMap<ConnectionId<'static>, Http3Handler>,
+    timers: &mut BinaryHeap<Reverse<TimerKey>>,
+    dirty_queue: &mut VecDeque<ConnKey>,
+    now: Instant,
+) {
+    while let Some(top) = timers.peek() {
+        if top.0 .0 > now {
+            break;
+        }
+        // peek で存在確認済みなので pop は必ず成功する。
+        let Reverse(TimerKey(dl, key)) = timers.pop().expect("peek succeeded");
+
+        let Some(handler) = conns.get_mut(&*key) else {
+            continue; // 接続は既に削除済み。
+        };
+        if !timer_entry_is_current(dl, handler.timer_deadline) {
+            continue; // 期限が更新済みの古いエントリ（遅延削除）。
+        }
+        handler.conn.on_timeout();
+        if handler.conn.is_closed() {
+            debug!("[HTTP/3] Connection closed (timeout)");
+            conns.remove(&*key);
+            continue;
+        }
+        mark_dirty(conns, dirty_queue, &key);
+    }
+}
+
+/// バックエンド通知キュー（`ConnWaker` が積む cid）を drain してダーティ化する（F-151）。
+///
+/// per-connection 化により「どの接続が進んだか」を追跡できるため、全接続をダーティ化する
+/// フォールバックは不要（本関数はキューに積まれた cid だけを処理する）。
+fn drain_wake_queue(
+    wake_queue: &crate::http3_stream::WakeQueue,
+    conns: &mut HashMap<ConnectionId<'static>, Http3Handler>,
+    dirty_queue: &mut VecDeque<ConnKey>,
+) {
+    // borrow は drain 中だけ（`mark_dirty` は `wake_queue` に触れないため二重借用にならない）。
+    let mut q = wake_queue.borrow_mut();
+    while let Some(key) = q.pop_front() {
+        mark_dirty(conns, dirty_queue, &key);
     }
 }
 
@@ -4377,6 +4692,19 @@ pub async fn run_http3_server_async(
 /// 同じ DCID なら新規接続判定（contains_key + Initial 検査）をスキップし、per-segment の
 /// オーバーヘッドをルックアップ 1 回に抑える（`prev_cid` 最適化）。quiche の `recv` API は
 /// 1 データグラム単位のため呼び出し自体は per-segment。
+///
+/// F-151: そのコネクションに `conn.recv()` した接続（新規コネクション生成時も含む）は
+/// 必ずダーティ化する。これがダーティ化の契機の 1 つ（他の契機はタイマー期限到来・
+/// バックエンド起床キュー・前回パスの仕事継続）。
+///
+/// **タイマーの再登録はここでは行わない**（レビュー修正）。本関数は 1 データグラムごとに
+/// 呼ばれるホットパスであり、GRO で束ねられた 54KB のレスポンス相当では 1 リクエストあたり
+/// 40 回以上呼ばれ得る。ここで `schedule_timer` を呼ぶと呼び出しのたびに `ConnKey` の
+/// ヒープ確保（`Rc::new` 相当）は避けられても `BinaryHeap::push` が積み重なり、F-151 で
+/// 削減したかった固定費を上回りかねない。recv した接続は必ずダーティ化されるため、
+/// **同一イテレーション内のダーティ処理ループ**（呼び出し元のメインループ）で
+/// `schedule_timer` が接続ごとに高々 1 回だけ呼ばれ、タイマーの再登録は漏れなく行われる。
+#[allow(clippy::too_many_arguments)] // F-151: ダーティ集合/起床キューの受け渡しで増加（ホットパスの単一呼び出し経路）
 fn process_datagram_segments(
     conns: &mut HashMap<ConnectionId<'static>, Http3Handler>,
     data: &mut [u8],
@@ -4387,6 +4715,8 @@ fn process_datagram_segments(
     local_addr: SocketAddr,
     notify: &crate::http3_stream::H3Notify,
     backend_spawner: &crate::http3_stream::BackendSpawner,
+    wake_queue: &crate::http3_stream::WakeQueue,
+    dirty_queue: &mut VecDeque<ConnKey>,
 ) -> io::Result<()> {
     let total = data.len();
     // GRO セグメントサイズ。None/0（GRO 非適用 = 単発データグラム）の場合は
@@ -4435,9 +4765,23 @@ fn process_datagram_segments(
 
                     debug!("[HTTP/3] New connection from {}", from);
 
-                    let handler =
-                        Http3Handler::new(conn, from, notify.clone(), backend_spawner.clone());
+                    // F-151（レビュー修正）: 接続 ID の Rc ハンドルは接続の生成時に 1 度だけ
+                    // 作る（以降はこの Rc を clone するだけで malloc なしに使い回せる）。
+                    let key: ConnKey = Rc::new(scid.clone());
+                    // この接続専用の ConnWaker を組み立てる（cid を積んでから notify() する
+                    // per-connection 通知）。
+                    let waker = crate::http3_stream::ConnWaker::new(
+                        key.clone(),
+                        wake_queue.clone(),
+                        notify.clone(),
+                    );
+                    let mut handler =
+                        Http3Handler::new(conn, from, waker, backend_spawner.clone(), key.clone());
+                    // 新規接続は常にダーティ（後段の recv 直後のダーティ化と二重登録
+                    // しないよう、挿入前に直接フラグを立てて自前でキューへ積む）。
+                    handler.dirty = true;
                     conns.insert(scid.clone(), handler);
+                    dirty_queue.push_back(key);
 
                     prev_cid = Some(scid.clone());
                     scid
@@ -4471,16 +4815,33 @@ fn process_datagram_segments(
                     warn!("[HTTP/3] eager init_h3 error: {}", e);
                 }
             }
+
+            // F-151: recv した接続は必ずダーティ化する（新規接続は既に dirty=true 済みで
+            // ここではスキップされる）。`handler` を既に可変借用しているため、`mark_dirty`
+            // （`&mut HashMap` を取る版）は使わずインラインでフラグを立てる。
+            // `handler.key.clone()`（`Rc::clone`）は参照カウント +1 のみで malloc を伴わない
+            // ため、`conn_id`（素の `ConnectionId`）を clone するより安価。
+            if !handler.dirty {
+                handler.dirty = true;
+                dirty_queue.push_back(handler.key.clone());
+            }
+            // タイマーの再登録はここでは行わない（関数冒頭のコメント参照）。この接続は
+            // 上でダーティ化されたので、呼び出し元のダーティ処理ループが
+            // `schedule_timer` を呼ぶ。
         }
     }
 
     Ok(())
 }
 
-/// 保留中のパケットを全コネクションに対して送信
+/// 保留中のパケットを対象コネクションに対して送信する。
 ///
-/// この関数はメインループで常に呼び出され、タイムアウト時でも
+/// この関数はメインループの各イテレーション末尾で常に 1 回だけ呼び出され、タイムアウト時でも
 /// ACKやレスポンスパケットを送信します。
+///
+/// F-151: 走査対象は**全接続ではなく `targets`（このイテレーションでダーティ処理した接続）
+/// だけ**に絞る。sendmmsg / io_uring SENDMSG のバッチ構築ロジック（`finalize_send_entry` /
+/// `send_mmsg_flush` / GSO セグメント判定）は一切変更しない。
 ///
 /// F-115 第2段: 従来は per-connection で GSO バッチを組み、**接続ごとに 1 回以上の
 /// sendmsg/sendto** を発行していた（-c100 では 1 sweep 最大 ~100 syscall）。本実装は
@@ -4494,12 +4855,16 @@ fn process_datagram_segments(
 // 借用するのは本 H3 メインループタスクのみ。バックエンドタスクは Rc チャネル + Notify
 // 経由で通信し RefCell に触れない（F-32 のアクターモデル）ため、await 中に他タスクが
 // 再入借用して panic する経路は存在しない（B-16 とは異なり単一借用者）。
-#[allow(clippy::await_holding_refcell_ref)]
+// clippy::too_many_arguments 許容理由: F-151 でダーティ集合の受け渡しが増えた
+// （ホットパスの単一呼び出し経路のため構造体化のオーバーヘッドを避ける）。
+#[allow(clippy::await_holding_refcell_ref, clippy::too_many_arguments)]
 async fn send_pending_packets(
     connections: &ConnectionMap,
     socket: &Rc<QuicUdpSocket>,
     _local_addr: SocketAddr,
     mmsg_batch: usize,
+    targets: &[ConnKey],
+    dirty_queue: &mut VecDeque<ConnKey>,
 ) {
     let mut conns = connections.borrow_mut();
 
@@ -4529,7 +4894,12 @@ async fn send_pending_packets(
     let mut seg_size = 0usize;
     let mut cur_dest: Option<SocketAddr> = None;
 
-    for (cid, handler) in conns.iter_mut() {
+    for cid in targets {
+        // `ConnKey`（`Rc<ConnectionId>`）を `&**cid` で deref し、HashMap キー
+        // （素の `ConnectionId<'static>`）としてルックアップする。
+        let Some(handler) = conns.get_mut(&**cid) else {
+            continue; // 既に削除済み（この 1 イテレーション内では通常起きない）。
+        };
         // F-60: GSO セグメントサイズの自動調整。quiche の PMTU 探索結果
         // （`max_send_udp_payload_size`: ハンドシェイク中 1200 → 検証後は
         // 設定上限・経路 MTU の小さい方へ成長）に per-connection で追従し、
@@ -4539,9 +4909,16 @@ async fn send_pending_packets(
             .max_send_udp_payload_size()
             .clamp(MIN_UDP_SEND_PAYLOAD, send_buf.len());
 
+        // F-151: この接続が 1 パケットでも生成したか（送り残しの可能性があるため、
+        // 生成があればダーティのまま残す）。
+        let mut sent_any = false;
+
         loop {
             let (write, send_info) = match handler.conn.send(&mut send_buf[..max_payload]) {
-                Ok(v) => v,
+                Ok(v) => {
+                    sent_any = true;
+                    v
+                }
                 Err(quiche::Error::Done) => break,
                 Err(quiche::Error::CryptoFail) => {
                     // ハンドシェイク途中のため暗号化パケット生成に失敗
@@ -4638,6 +5015,12 @@ async fn send_pending_packets(
         if handler.conn.is_closed() {
             debug!("[HTTP/3] Connection closed from {}", handler.peer_addr);
             closed.push(cid.clone());
+        } else if sent_any && !handler.dirty {
+            // F-151: 送り残しがあるかもしれないため、パケットを生成した接続はダーティの
+            // まま残す。`handler` を既に可変借用中のため `mark_dirty` は使わずインラインで
+            // フラグを立てる（`conns` の二重借用を避けるため）。
+            handler.dirty = true;
+            dirty_queue.push_back(cid.clone());
         }
     }
 
@@ -4647,7 +5030,7 @@ async fn send_pending_packets(
     }
 
     for cid in closed {
-        conns.remove(&cid);
+        conns.remove(&*cid);
     }
 
     // スクラッチをスレッドローカルへ返却し、次回呼び出しで再利用する（malloc 排除）。
@@ -5019,6 +5402,118 @@ mod tests {
         let config = Http3ServerConfig::default();
         assert_eq!(config.max_idle_timeout, 30000);
         assert_eq!(config.max_udp_payload_size, 1350);
+    }
+
+    // ====================
+    // F-151: ダーティ接続集合 + タイマー最小ヒープ
+    // ====================
+
+    /// F-151: `mark_dirty_flag` が多重登録しないこと、`dirty=false` に戻したあとは
+    /// 再登録できることを検証する（quiche/`Http3Handler` に依存しない純粋ヘルパー）。
+    #[test]
+    fn test_mark_dirty_flag_dedup_and_reregister() {
+        let mut dirty = false;
+        let mut queue: VecDeque<u32> = VecDeque::new();
+
+        // 初回登録: push される。
+        assert!(mark_dirty_flag(&mut dirty, &mut queue, &1));
+        assert!(dirty);
+        assert_eq!(queue.len(), 1);
+
+        // 既にダーティ: 多重登録されない。
+        assert!(!mark_dirty_flag(&mut dirty, &mut queue, &1));
+        assert!(dirty);
+        assert_eq!(queue.len(), 1, "多重登録されないこと");
+
+        // dirty=false に戻したあとは再登録できる。
+        dirty = false;
+        queue.pop_front();
+        assert!(mark_dirty_flag(&mut dirty, &mut queue, &1));
+        assert!(dirty);
+        assert_eq!(queue.len(), 1);
+    }
+
+    /// F-151: タイマーヒープの遅延削除。同じ cid で期限を 2 回 push したあと、
+    /// 古い方の期限が来ても「現在の `timer_deadline` と一致しない」ため無視され、
+    /// 新しい方でのみ発火することを検証する。
+    #[test]
+    fn test_timer_entry_delayed_deletion() {
+        let base = Instant::now();
+        let old_deadline = base + Duration::from_millis(10);
+        let new_deadline = base + Duration::from_millis(50);
+
+        // 期限が更新される前に登録された古いエントリが pop されたとき、
+        // 現在の期限（既に new_deadline に更新済み）とは一致しないので無視される。
+        assert!(
+            !timer_entry_is_current(old_deadline, Some(new_deadline)),
+            "古い期限は無視されること"
+        );
+
+        // 新しい期限がそのまま pop されれば、現在の期限と一致するので発火する。
+        assert!(
+            timer_entry_is_current(new_deadline, Some(new_deadline)),
+            "最新の期限は発火すること"
+        );
+
+        // 接続が既に削除済み（timer_deadline が None）なら常に無視される。
+        assert!(!timer_entry_is_current(new_deadline, None));
+
+        // 実際の BinaryHeap<Reverse<..>> でも最小（最も早い）期限から pop されることを
+        // あわせて確認する（遅延削除の前提となる pop 順序）。
+        let mut heap: BinaryHeap<Reverse<(Instant, u32)>> = BinaryHeap::new();
+        heap.push(Reverse((old_deadline, 1)));
+        heap.push(Reverse((new_deadline, 1)));
+        let Reverse((first_popped, _)) = heap.pop().unwrap();
+        assert_eq!(first_popped, old_deadline, "古い期限が先に pop されること");
+        assert!(!timer_entry_is_current(first_popped, Some(new_deadline)));
+        let Reverse((second_popped, _)) = heap.pop().unwrap();
+        assert_eq!(second_popped, new_deadline);
+        assert!(timer_entry_is_current(second_popped, Some(new_deadline)));
+    }
+
+    /// F-151: `select` の sleep 時間算出。ヒープ空 → 100ms、先頭が未来 → その差分、
+    /// 先頭が過去 → 0、上限 100ms クランプ。
+    #[test]
+    fn test_next_sleep_duration() {
+        let now = Instant::now();
+
+        // ヒープが空 → 既定 100ms。
+        assert_eq!(
+            next_sleep_duration(None, now, false),
+            Duration::from_millis(100)
+        );
+
+        // 先頭が未来（30ms 後）→ その差分。
+        let future = now + Duration::from_millis(30);
+        assert_eq!(
+            next_sleep_duration(Some(future), now, false),
+            Duration::from_millis(30)
+        );
+
+        // 先頭が過去 → 0。
+        let past = now - Duration::from_millis(5);
+        assert_eq!(next_sleep_duration(Some(past), now, false), Duration::ZERO);
+
+        // 先頭が過去と現在同時刻（境界）→ 0。
+        assert_eq!(next_sleep_duration(Some(now), now, false), Duration::ZERO);
+
+        // 先頭が遠い未来（500ms 後）→ 100ms にクランプ。
+        let far_future = now + Duration::from_millis(500);
+        assert_eq!(
+            next_sleep_duration(Some(far_future), now, false),
+            Duration::from_millis(100)
+        );
+
+        // レビュー修正: ダーティ接続が残っている（has_dirty = true）なら、
+        // タイマーヒープの先頭がどれだけ未来でも常に 0（sleep しない）。
+        // これをしないとストリーミング中のレスポンスがチャンクごとに最大 100ms
+        // 停止し得るため（致命的なレイテンシ退行）。
+        assert_eq!(next_sleep_duration(None, now, true), Duration::ZERO);
+        assert_eq!(
+            next_sleep_duration(Some(far_future), now, true),
+            Duration::ZERO
+        );
+        assert_eq!(next_sleep_duration(Some(past), now, true), Duration::ZERO);
     }
 
     /// B-43: PartialResponse の状態表現の不変条件を検証する。
