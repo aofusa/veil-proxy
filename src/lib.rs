@@ -90,6 +90,12 @@ pub mod l4;
 #[cfg(not(veil_ktls))]
 pub mod simple_tls;
 
+/// rustls 暗号文チャンクを `writev(2)`（Windows は `WSASend`）で直接カーネルへ渡す
+/// ゼロコピー送信ヘルパー（F-150）。`simple_tls`（`veil_ktls` 無効時）・
+/// `ktls_rustls`（`veil_ktls` 時の rustls フォールバック経路）の両方が使うため、
+/// `veil_ktls` の有無に関わらず常にコンパイルする。
+pub(crate) mod tls_writev;
+
 /// rustls 暗号プロバイダ選択（F-122: OpenBSD は ring、他は aws_lc_rs）。
 pub mod tls_provider;
 
