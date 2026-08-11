@@ -486,6 +486,9 @@ pub struct Http3ServerConfig {
     pub hystart: bool,
     /// UDP mmsg / multishot バッチ幅（1..=128）。デフォルト: 64
     pub mmsg_batch_size: usize,
+    /// reactor バックエンド専用: 1 イテレーションあたりに掻き出す UDP データグラム数の上限
+    /// （`[http3] recv_drain_max`、1..=`H3_RECV_DRAIN_MAX_LIMIT`）。デフォルト: 64（F-152）
+    pub recv_drain_max: usize,
 }
 
 impl Default for Http3ServerConfig {
@@ -509,6 +512,7 @@ impl Default for Http3ServerConfig {
             max_pacing_rate: None,
             hystart: true,
             mmsg_batch_size: crate::udp::socket::MMSG_BATCH_DEFAULT,
+            recv_drain_max: H3_RECV_DRAIN_MAX_DEFAULT,
         }
     }
 }
@@ -4004,11 +4008,12 @@ pub async fn run_http3_server_async(
     configure_quic_transport(&mut quic_config, &config)?;
     HTTP3_LOG_ONCE_TRANSPORT.call_once(|| {
         info!(
-            "[HTTP/3] quiche transport: cc={} pacing={} hystart={} mmsg_batch={}",
+            "[HTTP/3] quiche transport: cc={} pacing={} hystart={} mmsg_batch={} recv_drain_max={}",
             config.cc_algorithm.trim(),
             config.pacing,
             config.hystart,
-            config.mmsg_batch_size
+            config.mmsg_batch_size,
+            config.recv_drain_max
         );
     });
 
@@ -4070,6 +4075,9 @@ pub async fn run_http3_server_async(
     // F-115 第2段 / F-124: recvmmsg 用スクラッチ（reactor フォールバック・drain 補助）。
     // バッチ幅は `[http3].mmsg_batch_size`（既定 64）。
     let mmsg_batch = crate::udp::socket::clamp_mmsg_batch(config.mmsg_batch_size);
+    // F-152: reactor 経路の 1 イテレーションあたり drain 上限（`[http3] recv_drain_max`）。
+    // io_uring 経路（`PipelinedUdpRecv`）は参照しないため、そちらのビルドでは未使用になる。
+    let recv_drain_max = config.recv_drain_max.clamp(1, H3_RECV_DRAIN_MAX_LIMIT);
     let mut mmsg_scratch = crate::udp::socket::MmsgRecvScratch::with_batch(mmsg_batch);
 
     // F-130 C1: パイプライン化 io_uring RECVMSG（Linux uring バックエンド）。
@@ -4364,7 +4372,7 @@ pub async fn run_http3_server_async(
                 )?;
 
                 let mut drained = 0usize;
-                while drained < H3_RECV_DRAIN_MAX {
+                while drained < recv_drain_max {
                     let n = match socket.recv_mmsg_sync(&mut mmsg_scratch) {
                         Ok(n) => n,
                         Err(_) => break,
@@ -5180,11 +5188,24 @@ async fn send_mmsg_flush(
 /// GSO セグメント上限（UDP GSO の一般的な最大セグメント数）
 const MAX_GSO_SEGMENTS: usize = 64;
 
-/// F-115: 1 回の readiness あたり非ブロッキングで掻き出す追加データグラム数の上限。
+/// F-115: 1 回の readiness あたり非ブロッキングで掻き出す追加データグラム数の**既定**上限。
 /// select/タイマー往復を drain バッチ全体で 1 回に償却しつつ、送信・タイムアウト・notify を
 /// 過度に遅延させないための上限（Docker veth では 1 データグラム 1 recvmsg のため、この値まで
 /// 連続受信すると 1 回の送信スイープへまとめられる）。
-const H3_RECV_DRAIN_MAX: usize = 64;
+///
+/// **F-152: この値は `[http3] recv_drain_max` で設定可能になった**（本定数は既定値）。
+/// reactor バックエンド（FreeBSD/OpenBSD/NetBSD/macOS・Linux の `--features epoll`）
+/// でのみ参照する。Linux 既定の io_uring 経路は `mmsg_batch_size` 本の
+/// `IORING_OP_RECVMSG` パイプライン（F-130）なので本値を使わない。
+pub const H3_RECV_DRAIN_MAX_DEFAULT: usize = 64;
+
+/// F-152: `[http3] recv_drain_max` のクランプ上限。
+///
+/// 1 イテレーションで掻き出すデータグラムを増やすほど固定費は償却されるが、
+/// その間は送信・タイムアウト・バックエンド通知が待たされるため上限を設ける。
+/// 受信バッファは `mmsg_batch_size` 個ぶんを使い回すだけなので、本値を大きくしても
+/// メモリ使用量は増えない（ループ回数が増えるだけ）。
+pub const H3_RECV_DRAIN_MAX_LIMIT: usize = 4096;
 
 /// F-60: 送信セグメントサイズの下限クランプ（RFC 9000 の最小 QUIC データグラム 1200B）
 const MIN_UDP_SEND_PAYLOAD: usize = 1200;
@@ -5397,9 +5418,40 @@ fn parse_status_code(header: &[u8]) -> Option<u16> {
 mod tests {
     use super::*;
 
+    /// F-152: `[http3] recv_drain_max`（reactor 経路の 1 イテレーションあたり
+    /// データグラム drain 上限）の既定値とクランプ範囲。
+    ///
+    /// 既定値は従来ハードコードされていた `H3_RECV_DRAIN_MAX`（= 64）と同値であること
+    /// （設定を書かなければ挙動が変わらないことの担保）。
+    #[test]
+    fn test_recv_drain_max_default_and_clamp() {
+        assert_eq!(
+            H3_RECV_DRAIN_MAX_DEFAULT, 64,
+            "既定値は従来の定数と同値であること"
+        );
+        assert_eq!(
+            Http3ServerConfig::default().recv_drain_max,
+            H3_RECV_DRAIN_MAX_DEFAULT
+        );
+
+        // メインループが適用するクランプと同じ式で範囲を検証する。
+        let clamp = |n: usize| n.clamp(1, H3_RECV_DRAIN_MAX_LIMIT);
+        assert_eq!(clamp(0), 1, "0 は 1 へ引き上げる（無限ループ防止）");
+        assert_eq!(clamp(1), 1);
+        assert_eq!(clamp(64), 64);
+        assert_eq!(clamp(1024), 1024, "上限内はそのまま使える");
+        assert_eq!(
+            clamp(H3_RECV_DRAIN_MAX_LIMIT + 1),
+            H3_RECV_DRAIN_MAX_LIMIT,
+            "上限超過はクランプする"
+        );
+        assert_eq!(clamp(usize::MAX), H3_RECV_DRAIN_MAX_LIMIT);
+    }
+
     #[test]
     fn test_config_default() {
         let config = Http3ServerConfig::default();
+        assert_eq!(config.recv_drain_max, H3_RECV_DRAIN_MAX_DEFAULT);
         assert_eq!(config.max_idle_timeout, 30000);
         assert_eq!(config.max_udp_payload_size, 1350);
     }

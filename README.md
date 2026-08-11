@@ -553,6 +553,7 @@ The following table lists default values for major configuration options:
 | `[http3]` | `max_pacing_rate` | *(none)* | Max pacing rate (bytes/s); omit for unlimited |
 | `[http3]` | `hystart` | `true` | Enable HyStart++ |
 | `[http3]` | `mmsg_batch_size` | `64` | UDP mmsg / io_uring pipelined RECVMSG/SENDMSG batch width (1..=128) |
+| `[http3]` | `recv_drain_max` | `64` | **reactor backends only** (FreeBSD/OpenBSD/NetBSD/macOS, and Linux `--features epoll`): max UDP datagrams drained per event-loop iteration (1..=4096). Larger values amortize the per-iteration fixed cost (select/timer round-trip + connection sweep) over more datagrams — F-151 measured a 3.2x throughput swing from this quantity alone — at the cost of delaying sends/timeouts/backend wakeups (p99 latency). The Linux io_uring default backend uses the `mmsg_batch_size` RECVMSG pipeline instead and ignores this key |
 | `[http3]` | `compression_enabled` | `false` | Enable compression |
 | `[http3]` | `gso_gro_enabled` | `false` | Enable GSO/GRO |
 | `[http3]` | `alt_svc_enabled` | `true` | Advertise HTTP/3 via Alt-Svc on H1/H2 responses (when `server.http3_enabled`) |

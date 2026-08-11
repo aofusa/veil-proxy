@@ -545,6 +545,7 @@ sudo setcap 'cap_net_bind_service=+ep' ./target/release/veil
 | `[http3]` | `max_pacing_rate` | （なし） | 最大 pacing レート（バイト/秒）。未指定で制限なし |
 | `[http3]` | `hystart` | `true` | HyStart++ を有効化 |
 | `[http3]` | `mmsg_batch_size` | `64` | UDP mmsg / io_uring パイプライン化 RECVMSG/SENDMSG バッチ幅（1..=128） |
+| `[http3]` | `recv_drain_max` | `64` | **reactor バックエンド専用**（FreeBSD/OpenBSD/NetBSD/macOS、Linux の `--features epoll`）: 1 イテレーションあたりに掻き出す UDP データグラム数の上限（1..=4096）。大きくするほど 1 イテレーションあたりの固定費（select/タイマー往復 + 接続スイープ）を多くのデータグラムへ償却できる（F-151 でこの量だけで 3.2 倍の差を実測）が、drain 中は送信・タイムアウト・バックエンド通知が待たされるため p99 レイテンシとのトレードオフ。Linux 既定の io_uring バックエンドは `mmsg_batch_size` の RECVMSG パイプラインを使うため本キーを参照しない |
 | `[http3]` | `compression_enabled` | `false` | 圧縮を有効化 |
 | `[http3]` | `gso_gro_enabled` | `false` | GSO/GROを有効化 |
 | `[http3]` | `alt_svc_enabled` | `true` | H1/H2 応答へ Alt-Svc で HTTP/3 を広告（`server.http3_enabled` 時のみ） |
