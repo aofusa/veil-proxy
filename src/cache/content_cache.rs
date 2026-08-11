@@ -235,6 +235,53 @@ impl ContentCache {
         self.total_bytes.store(0, Ordering::Relaxed);
     }
 
+    /// キャッシュヒット判定のみを行う共通ヘルパ（ロードは一切行わない）。
+    ///
+    /// `get_or_load_with_mime`（ロード込み版）と `get_cached`（ヒット限定版、F-150）の
+    /// 両方から呼ばれる、ヒット可否判定ロジックの単一の実装箇所。ヒット時はホットパス
+    /// 規則どおり syscall・アロケーション・オフロードを一切行わず `Bytes::clone()`
+    /// （参照カウント増加）のみで返す（`revalidate_mtime` 有効時のみ例外的に stat が入る）。
+    async fn try_hit(
+        &self,
+        path: &Path,
+        cfg: &StaticContentCacheConfig,
+    ) -> Option<(Bytes, Arc<str>)> {
+        if !cfg.enabled {
+            return None;
+        }
+        let entry = self.entries.get(path)?;
+        let ttl = Duration::from_secs(cfg.valid_duration_secs);
+        if entry.cached_at.elapsed() >= ttl {
+            return None;
+        }
+        if !cfg.revalidate_mtime {
+            // ホットパス: DashMap ルックアップ + TTL 判定 + Bytes::clone() のみ。
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Some((entry.data.clone(), entry.mime_type.clone()));
+        }
+        // revalidate_mtime = true: 明示的に選択された trade-off として毎回 stat を実行する
+        // （モジュール doc 参照）。
+        let stat_path = path.to_path_buf();
+        let cached_mtime = entry.mtime;
+        let cached_data = entry.data.clone();
+        let cached_mime = entry.mime_type.clone();
+        drop(entry);
+        // 理由付き allow: offload 専用ワーカースレッド内で実行、イベントループ非ブロック。
+        #[allow(clippy::disallowed_methods)]
+        let current_mtime = crate::runtime::offload::offload(move || {
+            std::fs::metadata(&stat_path)
+                .and_then(|m| m.modified())
+                .ok()
+        })
+        .await;
+        if current_mtime == cached_mtime {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Some((cached_data, cached_mime));
+        }
+        // mtime 不一致: 陳腐化しているため呼び出し元は再読み込みへフォールスルーする。
+        None
+    }
+
     /// ファイル本体をキャッシュ優先で取得する（インスタンスメソッド版）。
     ///
     /// キャッシュヒット時はホットパス規則どおり syscall・アロケーション・オフロードを
@@ -254,37 +301,8 @@ impl ContentCache {
     where
         F: FnOnce() -> Arc<str>,
     {
-        if cfg.enabled {
-            if let Some(entry) = self.entries.get(path) {
-                let ttl = Duration::from_secs(cfg.valid_duration_secs);
-                if entry.cached_at.elapsed() < ttl {
-                    if !cfg.revalidate_mtime {
-                        // ホットパス: DashMap ルックアップ + TTL 判定 + Bytes::clone() のみ。
-                        self.hits.fetch_add(1, Ordering::Relaxed);
-                        return Some((entry.data.clone(), entry.mime_type.clone()));
-                    }
-                    // revalidate_mtime = true: 明示的に選択された trade-off として
-                    // 毎回 stat を実行する（モジュール doc 参照）。
-                    let stat_path = path.to_path_buf();
-                    let cached_mtime = entry.mtime;
-                    let cached_data = entry.data.clone();
-                    let cached_mime = entry.mime_type.clone();
-                    drop(entry);
-                    // 理由付き allow: offload 専用ワーカースレッド内で実行、イベントループ非ブロック。
-                    #[allow(clippy::disallowed_methods)]
-                    let current_mtime = crate::runtime::offload::offload(move || {
-                        std::fs::metadata(&stat_path)
-                            .and_then(|m| m.modified())
-                            .ok()
-                    })
-                    .await;
-                    if current_mtime == cached_mtime {
-                        self.hits.fetch_add(1, Ordering::Relaxed);
-                        return Some((cached_data, cached_mime));
-                    }
-                    // mtime 不一致: 陳腐化しているため再読み込みへフォールスルー
-                }
-            }
+        if let Some(hit) = self.try_hit(path, cfg).await {
+            return Some(hit);
         }
 
         self.misses.fetch_add(1, Ordering::Relaxed);
@@ -328,6 +346,57 @@ impl ContentCache {
 
         Some((data, mime))
     }
+
+    /// キャッシュヒット時のみ内容を返す（F-150）。ミス時は一切ロードしない
+    /// （呼び出し元が既に開いている fd から自前で読み込み、`insert_bytes` で登録する
+    /// 設計を前提とする。HTTP/1.1 のユーザー空間 TLS 静的配信向け）。
+    async fn get_cached(&self, path: &Path, cfg: &StaticContentCacheConfig) -> Option<Bytes> {
+        match self.try_hit(path, cfg).await {
+            Some((data, _mime)) => Some(data),
+            None => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    /// 既に読み込み済みのバイト列をキャッシュへ登録する（F-150）。
+    ///
+    /// 上限判定（`cfg.enabled && len <= cfg.max_file_size_bytes`）は
+    /// `get_or_load_with_mime` のミス時挿入条件と同一にする。`try_insert` は
+    /// `DashMap::entry()` 保持中に `len()` を呼ばないよう構成済み（F-146 で修正済みの
+    /// 自己デッドロックを再導入しない）。
+    ///
+    /// `revalidate_mtime` が有効な場合、本来は挿入時点の mtime を stat して保持すべきだが、
+    /// このメソッドは「既に fd を開いている呼び出し元」向けの同期的な登録専用 API であり、
+    /// 追加の offload 往復（stat）を新設しない。mtime は `None` のまま保持されるため、
+    /// `revalidate_mtime = true` の構成では次回アクセス時に必ず再検証ミスとなり事実上
+    /// キャッシュが効かなくなるが、内容の正しさには影響しない
+    /// （`revalidate_mtime` は既定 `false` であり、この trade-off が効くのはこの経路を
+    /// 明示的に選んだ場合のみ）。
+    fn insert_bytes(
+        &self,
+        path: &Path,
+        data: Bytes,
+        mime: Arc<str>,
+        cfg: &StaticContentCacheConfig,
+    ) {
+        let len = data.len() as u64;
+        if !cfg.enabled || len > cfg.max_file_size_bytes {
+            return;
+        }
+        self.try_insert(
+            path,
+            CachedContent {
+                data,
+                len,
+                mtime: None,
+                mime_type: mime,
+                cached_at: Instant::now(),
+            },
+            cfg,
+        );
+    }
 }
 
 static CONTENT_CACHE: Lazy<ContentCache> = Lazy::new(ContentCache::new);
@@ -363,6 +432,18 @@ where
     CONTENT_CACHE
         .get_or_load_with_mime(path, cfg, mime_fallback)
         .await
+}
+
+/// キャッシュヒット時のみ内容を返す（グローバルシングルトン、F-150）。
+/// ミス時は一切ロードしない。詳細は [`ContentCache::get_cached`] 参照。
+pub async fn get_cached(path: &Path, cfg: &StaticContentCacheConfig) -> Option<Bytes> {
+    CONTENT_CACHE.get_cached(path, cfg).await
+}
+
+/// 既に読み込み済みのバイト列をキャッシュへ登録する（グローバルシングルトン、F-150）。
+/// 詳細は [`ContentCache::insert_bytes`] 参照。
+pub fn insert_bytes(path: &Path, data: Bytes, mime: Arc<str>, cfg: &StaticContentCacheConfig) {
+    CONTENT_CACHE.insert_bytes(path, data, mime, cfg);
 }
 
 /// 指定パスのキャッシュエントリを無効化する（読み込み失敗時等に既存の
@@ -574,6 +655,91 @@ mod tests {
         let initial_misses = cache.misses.load(Ordering::Relaxed);
         let _ = get(&cache, &path, &cfg);
         assert_eq!(cache.misses.load(Ordering::Relaxed), initial_misses + 1);
+    }
+
+    /// F-150: `get_cached` はミス時にロードしないこと
+    /// （存在するファイルパスを渡してもキャッシュに未登録なら `None` を返し、
+    /// キャッシュ件数・ミスカウンタ以外の状態が増えないこと）。
+    #[test]
+    fn get_cached_does_not_load_on_miss() {
+        let cache = ContentCache::new();
+        let dir = tempdir().unwrap();
+        // 実在するファイルを用意するが、一度もロード/挿入していない。
+        let path = write_file(&dir, "uncached.txt", b"exists but not cached");
+        let cfg = test_cfg();
+
+        let result =
+            block_on_fresh_thread(|| futures::executor::block_on(cache.get_cached(&path, &cfg)));
+        assert_eq!(result, None, "未登録なら実ファイルが存在してもミスになる");
+        assert_eq!(
+            cache.entries.len(),
+            0,
+            "get_cached はミス時にロード・挿入を一切行わない"
+        );
+    }
+
+    /// F-150: `insert_bytes` → `get_cached` のラウンドトリップ。
+    #[test]
+    fn insert_bytes_then_get_cached_round_trip() {
+        let cache = ContentCache::new();
+        let dir = tempdir().unwrap();
+        // insert_bytes はパスをキーとしてのみ使うため、実ファイルの有無は問わない
+        // （呼び出し元が既に読み込み済みのバイト列を渡す設計のため）。
+        let path = dir.path().join("in_memory_only.bin");
+        let cfg = test_cfg();
+        let payload = Bytes::from_static(b"round trip payload");
+        let mime: Arc<str> = Arc::from("text/plain");
+
+        cache.insert_bytes(&path, payload.clone(), mime.clone(), &cfg);
+
+        let hit =
+            block_on_fresh_thread(|| futures::executor::block_on(cache.get_cached(&path, &cfg)));
+        assert_eq!(
+            hit,
+            Some(payload),
+            "insert_bytes で登録した内容がそのまま返る"
+        );
+    }
+
+    /// F-150: `insert_bytes` は `max_file_size_bytes` 超過を拒否する。
+    #[test]
+    fn insert_bytes_rejects_oversized_payload() {
+        let cache = ContentCache::new();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("too_big.bin");
+        let mut cfg = test_cfg();
+        cfg.max_file_size_bytes = 4; // payload より小さい上限
+
+        cache.insert_bytes(
+            &path,
+            Bytes::from_static(b"too large"),
+            Arc::from("text/plain"),
+            &cfg,
+        );
+
+        assert_eq!(cache.entries.len(), 0, "上限を超えるバイト列は挿入されない");
+        let hit =
+            block_on_fresh_thread(|| futures::executor::block_on(cache.get_cached(&path, &cfg)));
+        assert_eq!(hit, None);
+    }
+
+    /// F-150: `cfg.enabled = false` のとき `insert_bytes` は登録しない。
+    #[test]
+    fn insert_bytes_noop_when_disabled() {
+        let cache = ContentCache::new();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("disabled.bin");
+        let mut cfg = test_cfg();
+        cfg.enabled = false;
+
+        cache.insert_bytes(
+            &path,
+            Bytes::from_static(b"data"),
+            Arc::from("text/plain"),
+            &cfg,
+        );
+
+        assert_eq!(cache.entries.len(), 0, "無効時は insert_bytes も何もしない");
     }
 
     /// グローバルシングルトン経由の公開 API（`get_or_load`/`invalidate`/`clear`）が

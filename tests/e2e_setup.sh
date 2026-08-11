@@ -243,6 +243,16 @@ prepare_fixtures() {
     # /healthエンドポイント用JSONファイル（プロキシが直接サービスする）
     echo '{"status":"ok","proxy":"veil"}' > "${FIXTURES_DIR}/proxy_health.json"
 
+    # F-150: 静的コンテンツキャッシュ検証用ファイル。
+    # 40000 バイト = 16KB の TLS レコードを 3 個ぶんまたぐサイズにして、
+    # writev(2) 直結送出（F-150 改修 1）と Bytes::slice の Range 切り出しを
+    # レコード境界をまたぐ条件で検証する。内容は `head -c` 非依存（B-53）かつ
+    # 決定的な ASCII パターン（CRLF を含まないのでレスポンスのヘッダ/ボディ
+    # 分割に干渉しない）。
+    mkdir -p "${FIXTURES_DIR}/f150_cache"
+    dd if=/dev/zero bs=40000 count=1 2>/dev/null | tr '\0' 'F' \
+        > "${FIXTURES_DIR}/f150_cache/cached.txt"
+
     # ルーティングテスト用フィクスチャ（各テストが使用するサブパス）
     for backend in backend1 backend2; do
         mkdir -p "${FIXTURES_DIR}/${backend}/api/v1"
@@ -1436,6 +1446,25 @@ path = "/health"
 [route.action]
 type = "File"
 path = "${FIXTURES_DIR}/proxy_health.json"
+EOF
+
+    # F-150: 静的コンテンツキャッシュを有効にした HTTP/1.1 静的配信ルート。
+    # プロキシの kTLS は既定で無効（proxy_ktls_enabled=false）なので、この経路は
+    # sendfile(2) を使えないユーザー空間 TLS（rustls）経路になり、F-150 で
+    # 追加したキャッシュ経路（初回ミス = 開いている fd から read_exact_at →
+    # insert、2 回目以降 = ヒットして Bytes::slice のみ）を実際に通る。
+    cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
+
+[[route]]
+[route.conditions]
+path = "/f150-cache/*"
+[route.action]
+type = "File"
+path = "${FIXTURES_DIR}/f150_cache/"
+[route.static_file_cache]
+enabled = true
+valid_duration_secs = 300
+max_file_size_bytes = 1048576
 EOF
 
     # リダイレクトルート（302/307/308テスト用）

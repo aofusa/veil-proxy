@@ -106,10 +106,12 @@ pub fn sendfile_base_contains(
 #[cfg(feature = "cache")]
 pub use content_cache::{
     clear as clear_content_cache, configure_global_static_content_cache,
-    effective_static_content_cache_config, get_or_load as get_or_load_content_cache,
+    effective_static_content_cache_config, get_cached as get_cached_content_cache,
+    get_or_load as get_or_load_content_cache,
     get_or_load_with_mime as get_or_load_content_cache_with_mime, hits as content_cache_hits,
-    invalidate as invalidate_content_cache, len as content_cache_len,
-    misses as content_cache_misses, StaticContentCacheConfig, StaticContentCacheRouteConfig,
+    insert_bytes as insert_content_cache_bytes, invalidate as invalidate_content_cache,
+    len as content_cache_len, misses as content_cache_misses, StaticContentCacheConfig,
+    StaticContentCacheRouteConfig,
 };
 #[cfg(feature = "cache")]
 pub use disk::DiskCache;
@@ -422,6 +424,26 @@ where
 {
     let data = get_or_load_content_cache(path, _cfg).await?;
     Some((data, mime_fallback()))
+}
+
+/// `cache` feature 無効時のスタブ: キャッシュ本体が無いため常に `None`
+/// （呼び出し元はミス扱いとして自前で読み込みへフォールバックする）。
+#[cfg(not(feature = "cache"))]
+pub async fn get_cached_content_cache(
+    _path: &std::path::Path,
+    _cfg: &StaticContentCacheConfig,
+) -> Option<bytes::Bytes> {
+    None
+}
+
+/// `cache` feature 無効時のスタブ: キャッシュ本体が無いため何もしない。
+#[cfg(not(feature = "cache"))]
+pub fn insert_content_cache_bytes(
+    _path: &std::path::Path,
+    _data: bytes::Bytes,
+    _mime: std::sync::Arc<str>,
+    _cfg: &StaticContentCacheConfig,
+) {
 }
 
 #[cfg(not(feature = "cache"))]
