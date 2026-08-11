@@ -421,11 +421,18 @@ run_h2load() {
 
 # run_h3load <url> -> 同上（h3load.rs の固定書式を前提にパースする。h2load と違い
 # こちらは同梱の tools/perf/h3load が出力する書式なので構造が完全に既知）。
+#
+# **`-n`（固定リクエスト数）ではなく `-d`（実行時間）を使うこと**（2026-08-11 修正）:
+# 以前は `-n $((CONNECTIONS * 2000))`（既定 64 接続なら 128,000 リクエスト）を
+# 外側の `timeout $((DURATION * 4 + 60))` で包んでいたため、**サーバが遅い環境では
+# 指定本数を捌き切る前に timeout に殺され、h3load が集計行を出力しないまま
+# 0 rps として記録される**（しかもエラーにならないので気付けない）。実際
+# FreeBSD amd64 (QEMU/KVM) では h3_file が veil・nginx とも 0 rps になっていた。
+# wrk と同じ「時間で区切る」方式にすれば、マシンの速度に依存せず必ず集計行が出る。
 run_h3load() {
     url="$1"
-    total=$(( CONNECTIONS * 2000 ))
     out=$(timeout $((DURATION * 4 + 60)) cpuset -l "${GEN_CPUS}" "${H3LOAD_BIN}" \
-            -t"${LOAD_THREADS}" -c"${CONNECTIONS}" -m 32 -n "${total}" "$url" 2>&1) || true
+            -t"${LOAD_THREADS}" -c"${CONNECTIONS}" -m 32 -d "${DURATION}" "$url" 2>&1) || true
     printf '%s\n' "$out" >> "${WORK}/logs/h3load.log"
     printf '%s' "$out" | awk '
         /^finished in/ {
