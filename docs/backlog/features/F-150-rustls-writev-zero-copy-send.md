@@ -1,7 +1,7 @@
 # F-150: rustls 送信経路のゼロコピー化（`writev(2)` 直結 + 静的配信のキャッシュ適用）
 
 - 優先度: P1
-- 状態: 対応中
+- 状態: 完了
 - 関連: `docs/perf/README.md`「残存ボトルネック（未対応）」の 1 件目、F-146、B-27、F-59
 
 ## 背景（何を解こうとしているか）
@@ -148,4 +148,38 @@ HTTP/2・HTTP/3 にしか適用していないが、**kTLS を無効にした Fr
 
 ## 検証結果
 
-（実装後に追記）
+### テスト
+
+- `cargo test --lib --features full`: **853 passed / 0 failed**
+  （`tls_writev` の socketpair 実 fd 単体テスト 5 件 + `content_cache` の `get_cached`/
+  `insert_bytes` 単体テスト 4 件を追加）
+- `cargo test --test integration_tests --features full`: **54 passed / 0 failed**
+  （実 TCP + 実 rustls クライアントで 54KB / 3B / 0B のヘッダ+ボディがバイト一致することを検証）
+- E2E `full`（io_uring）/ `full,epoll`（reactor）: いずれも **544 passed / 0 failed**
+  （`static_file_cache` を有効にした HTTP/1.1 の 2 回連続 GET と、TLS レコード境界を
+  またぐ Range リクエストの E2E 2 件を追加）
+- FreeBSD 14.3 amd64 実機（`full-freebsd`）E2E: 543 passed / 1 failed
+  （失敗は B-61 の先行バグ。改修前コミットで 3/3 失敗・改修後 2/3 失敗の A/B で確認済み）
+- `cargo build --features full` / `--no-default-features` / 各 feature 単体 /
+  `cargo clippy --features full --all-targets`: いずれも **warning 0**
+
+### 性能（FreeBSD 14.3 amd64 / QEMU+KVM、54KB、対 nginx 比）
+
+`docs/perf/README.md`「F-150/F-151 後の FreeBSD 計測」節を参照。
+
+| シナリオ | 改修前の対 nginx 比（aarch64） | 改修後の対 nginx 比（amd64） |
+|---|---|---|
+| HTTP/1.1 TLS | 0.44 | **0.97** |
+| HTTP/2 TLS | 0.52 | **1.05** |
+| HTTP/1.1 proxy | 0.72 | **1.02** |
+| HTTP/2 proxy | 0.94 | **1.42** |
+
+**注意**: 改修前の計測は aarch64 / QEMU+HVF、改修後は amd64 / QEMU+KVM であり、
+**絶対値の直接比較はできない**。有効なのは同一実行内で併走させた nginx との比である。
+
+### Linux 退行確認
+
+`h2_1_ktls_0_lb_kernel_ofc_1`（3 反復、全 Non-2xx = 0）で **退行なし**。
+同時計測の nginx 比は veil_glibc HTTP/1.1 1.46×・HTTP/2 1.19×、
+veil_musl 1.44×・1.20× で、過去計測（1.41〜1.45 / 1.17〜1.19 / 1.43 / 1.15）と
+同等かわずかに良い。詳細は `docs/perf/README.md`。
