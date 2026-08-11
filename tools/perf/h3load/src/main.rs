@@ -107,6 +107,26 @@ fn print_help() {
     );
 }
 
+/// 値が密着した短オプション（`-c64`）をフラグと値に分解する。
+///
+/// `h2load` は `-c64` と `-c 64` の**両方**を受理するため、h2load 互換を掲げる本ツールも
+/// 両方を受理する必要がある。実際 `tools/perf/freebsd/run_perf_freebsd.sh` は
+/// `-t2 -c64` の密着形で渡しており、密着形を弾いていたために **FreeBSD の HTTP/3 計測が
+/// 丸ごと 0 rps になっていた**（2026-08-11 に発覚）。
+///
+/// 戻り値は `(フラグ, 密着した値)`。密着値が無ければ第 2 要素は `None`。
+/// `--help` のような長オプションと、単独の `-c` は分解しない。
+fn split_short_opt(arg: &str) -> (&str, Option<&str>) {
+    const VALUE_OPTS: [&str; 5] = ["-c", "-m", "-n", "-d", "-t"];
+    if arg.len() > 2 && arg.starts_with('-') && !arg.starts_with("--") {
+        let (head, rest) = arg.split_at(2);
+        if VALUE_OPTS.contains(&head) {
+            return (head, Some(rest));
+        }
+    }
+    (arg, None)
+}
+
 fn parse_args() -> Result<Args, String> {
     let mut connections = 1usize;
     let mut max_concurrent = 1usize;
@@ -118,8 +138,13 @@ fn parse_args() -> Result<Args, String> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < raw.len() {
-        let arg = raw[i].as_str();
+        let raw_arg = raw[i].clone();
+        let (arg, inline) = split_short_opt(&raw_arg);
         let mut next_val = || -> Result<String, String> {
+            // 密着形（`-c64`）ならその値を使い、分離形（`-c 64`）なら次の引数を読む。
+            if let Some(v) = inline {
+                return Ok(v.to_string());
+            }
             i += 1;
             raw.get(i)
                 .cloned()
@@ -652,4 +677,47 @@ fn print_summary(stats: &Stats, elapsed: Duration) {
         format_duration(p50),
         format_duration(p99)
     );
+}
+
+// ====================
+// テスト
+// ====================
+
+#[cfg(test)]
+mod tests {
+    use super::split_short_opt;
+
+    /// h2load 互換: 値が密着した短オプション（`-c64`）を分解できること。
+    ///
+    /// これを弾いていたために `tools/perf/freebsd/run_perf_freebsd.sh`（`-t2 -c64` の形で
+    /// 渡す）からの HTTP/3 計測が丸ごと 0 rps になっていた（2026-08-11 発覚）。
+    #[test]
+    fn split_short_opt_handles_attached_values() {
+        assert_eq!(split_short_opt("-c64"), ("-c", Some("64")));
+        assert_eq!(split_short_opt("-t2"), ("-t", Some("2")));
+        assert_eq!(split_short_opt("-m32"), ("-m", Some("32")));
+        assert_eq!(split_short_opt("-n128000"), ("-n", Some("128000")));
+        assert_eq!(split_short_opt("-d10"), ("-d", Some("10")));
+    }
+
+    /// 分離形（`-c 64`）は従来どおり「フラグのみ」として扱われること。
+    #[test]
+    fn split_short_opt_keeps_separated_form() {
+        for flag in ["-c", "-m", "-n", "-d", "-t"] {
+            assert_eq!(split_short_opt(flag), (flag, None));
+        }
+    }
+
+    /// 値を取らないオプション・長オプション・URL は分解しないこと。
+    #[test]
+    fn split_short_opt_leaves_other_args_intact() {
+        assert_eq!(split_short_opt("-h"), ("-h", None));
+        assert_eq!(split_short_opt("--help"), ("--help", None));
+        assert_eq!(
+            split_short_opt("https://127.0.0.1:4443/"),
+            ("https://127.0.0.1:4443/", None)
+        );
+        // 値を取らない短オプションに文字が続く形は分解対象外（未知オプション扱いのまま）。
+        assert_eq!(split_short_opt("-xyz"), ("-xyz", None));
+    }
 }
