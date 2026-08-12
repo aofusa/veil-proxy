@@ -44,6 +44,19 @@ trap 'rm -rf "${WORK}"' EXIT
 fail=0
 checked=0
 
+# 展開ディレクトリから **veil 本体のバイナリ** を選ぶ。
+#
+# BSD 向けの tar.gz には rc スクリプト `rc.d/veil` が同梱されており、
+# 単純な `find -name veil | head -1` では**シェルスクリプトの方**を掴んでしまう
+# （実際にこれで BSD aarch64 の成果物を誤って STALE と判定した）。
+# 候補のうち**最大サイズのファイル**を本体とみなす（rc スクリプトは数 KB、
+# 本体は数十 MB なので確実に区別できる）。
+find_veil_binary() {
+    local dir="$1"
+    find "${dir}" -type f \( -name veil -o -name 'veil.exe' \) -printf '%s\t%p\n' 2>/dev/null \
+        | sort -rn | head -1 | cut -f2-
+}
+
 # バイナリ 1 つを検証する。
 check_binary() {
     local label="$1" bin="$2"
@@ -75,7 +88,7 @@ for f in "${OUTPUT_DIR}"/*.tar.gz "${OUTPUT_DIR}"/*.zip; do
         *.tar.gz) tar xzf "${f}" -C "${d}" 2>/dev/null ;;
         *.zip)    unzip -qo "${f}" -d "${d}" 2>/dev/null ;;
     esac
-    bin="$(find "${d}" -type f \( -name veil -o -name 'veil.exe' \) | head -1)"
+    bin="$(find_veil_binary "${d}")"
     if [[ -n "${bin}" ]]; then
         check_binary "$(basename "${f}")" "${bin}"
     else
