@@ -90,3 +90,17 @@ TOML → `Http3ConfigSection` → `Http3ServerConfig` → メインループの�
 `recv_drain_max=` が出なかった。原因は `cargo build`（debug）しか実行しておらず
 `target/release/veil` が古いままだったこと。**「設定が効くか」はリリースバイナリを
 建て直して実際に起動して確かめること。**
+
+### 全プラットフォーム packaging への反映（2026-08-12〜13）
+
+本設定は `src/config.rs` / `src/http3_server.rs` を変更するため、**配布バイナリの
+再ビルドが必要**だった。全 15 成果物を再ビルドし、
+`packaging/scripts/verify-artifacts.sh recv_drain_max` で**バイナリ内に設定キーが
+含まれること**を実際に確認済み（Linux gnu/musl × x86_64/aarch64、.deb × 2、
+Windows × 2、macOS universal2、FreeBSD/OpenBSD/NetBSD × x86_64/aarch64）。
+
+このとき、**`docker build` が「呼び出した時点」のソースをコンテキストとして送るため、
+複数ターゲットを直列に流している最中にソースを変更すると成果物が新旧混在になる**
+ことが判明した（しかもタイムスタンプは新しくなるので一覧では見分けられない）。
+再発防止として `verify-artifacts.sh` を追加した。
+
