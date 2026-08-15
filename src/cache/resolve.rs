@@ -34,6 +34,12 @@ use ftlog::{info, warn};
 static STARTUP_LOG_ONCE: Once = Once::new();
 /// 実行時に openat2 が使えないと判明した場合の警告も 1 回だけ出す
 /// （毎リクエスト ENOSYS を撃ち続けるのを防ぐための memoization と対になっている）。
+///
+/// `openat2` の実行時フォールバック判定は Linux 経路にしか存在しない
+/// （FreeBSD は `O_RESOLVE_BENEATH` が使えるかを起動時に確定させる）ため、
+/// Linux 以外ではこの静的変数もロガーも参照されない。`#[allow(dead_code)]` は
+/// AGENTS.md で禁止されているので cfg で存在自体を絞る。
+#[cfg(target_os = "linux")]
 static RUNTIME_FALLBACK_LOG_ONCE: Once = Once::new();
 
 fn log_registration_result(beneath_active: bool) {
@@ -52,6 +58,8 @@ fn log_registration_result(beneath_active: bool) {
     });
 }
 
+/// Linux 経路専用（上記 `RUNTIME_FALLBACK_LOG_ONCE` のコメント参照）。
+#[cfg(target_os = "linux")]
 fn log_runtime_fallback_engaged(reason: &str) {
     RUNTIME_FALLBACK_LOG_ONCE.call_once(|| {
         warn!(
