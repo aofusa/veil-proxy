@@ -24972,3 +24972,138 @@ async fn test_grpc_web_cors_preflight() {
         status, acao, acam
     );
 }
+
+// ====================
+// F-150: 静的コンテンツキャッシュ（kTLS 無効の HTTP/1.1 ユーザー空間 TLS 経路）
+// ====================
+//
+// プロキシの kTLS は E2E 既定で無効なので、`/f150-cache/*` ルート（`e2e_setup.sh` が
+// `[route.static_file_cache] enabled = true` を付けて生成する）への静的配信は
+// `sendfile(2)` に乗らないユーザー空間 rustls 経路になる。F-150 はこの経路に
+// 静的コンテンツキャッシュを適用し、リクエストごとの `pread(2)` を排除した。
+//
+// 配信ファイルは 40000 バイト（16KB の TLS レコードを 3 個ぶんまたぐ）で、
+// `writev(2)` 直結送出（F-150 改修 1）と `Bytes::slice` による Range 切り出しを
+// レコード境界をまたぐ条件で検証できる。
+
+/// F-150 で配信するフィクスチャの内容（`e2e_setup.sh` が `tr '\0' 'F'` で生成する）。
+const F150_CACHED_LEN: usize = 40000;
+
+/// レスポンス文字列からボディだけを取り出す。ヘッダとボディの区切りは最初の
+/// 空行なので `splitn(2, ..)` を使う（ボディ側に区切り列が現れても壊れない）。
+fn f150_body(response: &str) -> &str {
+    response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .unwrap_or("")
+}
+
+/// F-150: キャッシュ有効時、**2 回連続の GET が両方ともバイト単位で一致**すること。
+///
+/// 1 回目はキャッシュミス（開いている fd から `read_exact_at` で全体を読んで登録）、
+/// 2 回目はヒット（`Bytes::clone()` + `Bytes::slice()` のみ）と**別々のコード経路**を
+/// 通るため、両方を突き合わせることで登録・取り出しの往復が壊れていないことを検証する。
+#[tokio::test]
+#[ntest::timeout(20000)]
+async fn test_f150_static_content_cache_http1_repeat_get() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let first = send_request(PROXY_PORT, "/f150-cache/cached.txt", &[]).await;
+    assert!(first.is_some(), "1 回目の GET が応答すること");
+    let first = first.unwrap();
+    assert_eq!(
+        get_status_code(&first),
+        Some(200),
+        "1 回目は 200 を返すこと: {:?}",
+        get_status_code(&first)
+    );
+    let first_body = f150_body(&first);
+    assert_eq!(
+        first_body.len(),
+        F150_CACHED_LEN,
+        "1 回目（キャッシュミス経路）のボディ長がファイル全体と一致すること"
+    );
+    assert!(
+        first_body.bytes().all(|b| b == b'F'),
+        "1 回目のボディ内容がフィクスチャと一致すること"
+    );
+
+    let second = send_request(PROXY_PORT, "/f150-cache/cached.txt", &[]).await;
+    assert!(second.is_some(), "2 回目の GET が応答すること");
+    let second = second.unwrap();
+    assert_eq!(
+        get_status_code(&second),
+        Some(200),
+        "2 回目も 200 を返すこと"
+    );
+    let second_body = f150_body(&second);
+
+    // キャッシュヒット経路（Bytes::clone + slice）とミス経路（fd から読み込み）で
+    // 1 バイトも差が出ないこと。
+    assert_eq!(
+        second_body, first_body,
+        "キャッシュヒット時のボディがミス時と完全に一致すること"
+    );
+}
+
+/// F-150: キャッシュ経路の Range リクエストが 206 で正しい部分バイト列を返すこと。
+///
+/// キャッシュヒット時の送出は `Bytes::slice(start..end)`（参照カウントのみ・コピーなし）
+/// で行うため、オフセット計算を誤ると静かに壊れた範囲を返す。TLS レコード境界
+/// （16384 バイト）をまたぐ範囲を指定して検証する。
+#[tokio::test]
+#[ntest::timeout(20000)]
+async fn test_f150_static_content_cache_http1_range() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    // 先に 1 回取得してキャッシュへ載せる（ヒット経路の slice を検証したいため）。
+    let _ = send_request(PROXY_PORT, "/f150-cache/cached.txt", &[]).await;
+
+    // 16384（TLS レコード境界）をまたぐ範囲を要求する。
+    let start = 16_000usize;
+    let end = 16_999usize; // inclusive
+    let expected_len = end - start + 1;
+    let response = send_request(
+        PROXY_PORT,
+        "/f150-cache/cached.txt",
+        &[("Range", &format!("bytes={}-{}", start, end))],
+    )
+    .await;
+    assert!(response.is_some(), "Range リクエストが応答すること");
+    let response = response.unwrap();
+
+    assert_eq!(
+        get_status_code(&response),
+        Some(206),
+        "Range リクエストは 206 Partial Content を返すこと"
+    );
+
+    let content_range = get_header_value(&response, "Content-Range");
+    assert!(
+        content_range.is_some(),
+        "206 には Content-Range ヘッダーが付くこと"
+    );
+    let content_range = content_range.unwrap();
+    assert!(
+        content_range.contains(&format!("{}-{}", start, end)),
+        "Content-Range が要求範囲を反映すること: {}",
+        content_range
+    );
+
+    let body = f150_body(&response);
+    assert_eq!(
+        body.len(),
+        expected_len,
+        "206 のボディ長が要求範囲の長さと一致すること（Bytes::slice のオフセット検証）"
+    );
+    assert!(
+        body.bytes().all(|b| b == b'F'),
+        "206 のボディ内容がフィクスチャと一致すること"
+    );
+}

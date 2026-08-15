@@ -737,3 +737,23 @@ veil_musl	h3_proxy_wasm	http2	3	1928.95	100.52MB/s	300.98ms	NA	0	124.5	423.6
 veil_musl	h3_proxy_wasm	http3	1	649.30	33.86MB/s	1.47s	NA	0	173.6	495.9
 veil_musl	h3_proxy_wasm	http3	2	653.82	34.10MB/s	1.45s	NA	0	171.6	511.7
 veil_musl	h3_proxy_wasm	http3	3	654.10	34.11MB/s	1.46s	NA	0	174.2	523.0
+
+# ==== 2026-08-11 F-150/F-151 後の Linux 退行確認（h2_1_ktls_0_lb_kernel_ofc_1、3 反復）====
+nginx	base	http1.1	1	2062.12	107.85MB	47.14ms	129.24ms	0	186.2	21.9
+nginx	base	http1.1	2	2070.37	108.27MB	46.41ms	123.56ms	0	200.6	22.2
+nginx	base	http1.1	3	2069.09	108.26MB	46.70ms	126.97ms	0	183.6	22.1
+nginx	base	http2	1	2185.18	114.11MB/s	275.48ms	NA	0	153.1	25.5
+nginx	base	http2	2	2265.24	118.29MB/s	235.31ms	NA	0	158.6	26.3
+nginx	base	http2	3	2276.01	118.86MB/s	233.28ms	NA	0	155.1	26.2
+veil_glibc	h2_1_ktls_0_lb_kernel_ofc_1	http1.1	1	3017.57	157.49MB	31.33ms	93.98ms	0	170.9	90.2
+veil_glibc	h2_1_ktls_0_lb_kernel_ofc_1	http1.1	2	3018.51	157.52MB	31.48ms	92.46ms	0	178.7	99.5
+veil_glibc	h2_1_ktls_0_lb_kernel_ofc_1	http1.1	3	3028.42	157.99MB	31.33ms	90.91ms	0	165.7	106.4
+veil_glibc	h2_1_ktls_0_lb_kernel_ofc_1	http2	1	2693.85	140.35MB/s	182.42ms	NA	0	106.9	164.4
+veil_glibc	h2_1_ktls_0_lb_kernel_ofc_1	http2	2	2683.19	139.80MB/s	182.12ms	NA	0	106.4	185.8
+veil_glibc	h2_1_ktls_0_lb_kernel_ofc_1	http2	3	2763.19	143.97MB/s	178.87ms	NA	0	106.5	189.1
+veil_musl	h2_1_ktls_0_lb_kernel_ofc_1	http1.1	1	2989.83	156.01MB	31.73ms	98.78ms	0	168.9	89.9
+veil_musl	h2_1_ktls_0_lb_kernel_ofc_1	http1.1	2	2989.08	156.02MB	31.88ms	92.93ms	0	173.4	105.8
+veil_musl	h2_1_ktls_0_lb_kernel_ofc_1	http1.1	3	2997.56	156.47MB	31.63ms	95.60ms	0	174.8	115.6
+veil_musl	h2_1_ktls_0_lb_kernel_ofc_1	http2	1	2707.70	141.07MB/s	186.17ms	NA	0	122.0	174.1
+veil_musl	h2_1_ktls_0_lb_kernel_ofc_1	http2	2	2721.11	141.77MB/s	180.71ms	NA	0	120.0	192.8
+veil_musl	h2_1_ktls_0_lb_kernel_ofc_1	http2	3	2592.24	135.06MB/s	185.43ms	NA	0	104.5	187.9

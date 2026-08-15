@@ -34,6 +34,7 @@
 
 use crate::runtime::handle::AsRawFd;
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::io;
 use std::rc::Rc;
 use std::time::Duration;
@@ -55,6 +56,67 @@ use crate::{AcceptedEncoding, CompressionConfig};
 pub(crate) use crate::stream_channel::{
     channel, Notify as H3Notify, Receiver, Sender, TryRecv, TrySendError,
 };
+
+// ============================================================================
+// F-151: バックエンド通知の per-connection 化
+// ============================================================================
+
+/// 接続 ID を持ち回るための共有ハンドル（F-151 レビュー修正）。
+///
+/// `quiche::ConnectionId<'static>` は内部が `Vec<u8>` のため、素の `clone()` は
+/// 呼び出しのたびにヒープ確保（malloc）を伴う。ダーティキュー/タイマーヒープ/起床キューは
+/// いずれも「同じ接続 ID を何度も複製して受け渡す」ホットパス（レスポンスボディの
+/// チャンクごと・バックエンド通知のたびに発生し得る）であるため、`Rc` で包んで
+/// `clone()` を参照カウント +1 のみ（malloc なし）に落とす。`HashMap`（`ConnectionMap`）の
+/// キー自体は従来どおり素の `ConnectionId<'static>` のままでよく、ルックアップ時は
+/// `&**key`（`Rc` → `ConnectionId` の deref）で行う。
+pub(crate) type ConnKey = Rc<quiche::ConnectionId<'static>>;
+
+/// メインループが drain する「起床した接続」の共有キュー。
+///
+/// バックエンドタスクが [`ConnWaker::notify`] を呼ぶ際に自分の接続 ID をここへ積む。
+/// メインループは `select` から戻るたびにこのキューを drain し、積まれた接続だけを
+/// ダーティ化する（従来は 1 本の `H3Notify` で起こすだけで「どの接続が進んだか」が
+/// 分からず全接続を駆動していた）。`Rc<RefCell<..>>` は本クレートの `ConnectionMap` と
+/// 同じ単一スレッド・ロックフリー方針。
+pub(crate) type WakeQueue = Rc<RefCell<VecDeque<ConnKey>>>;
+
+/// バックエンドタスク → メインループの起床通知を per-connection 化したラッパー（F-151）。
+///
+/// 内部の `H3Notify` はそのままメインループの `select` 待機対象として使う（起床自体は
+/// 引き続き 1 本の Notify で行う）。`notify()` を呼ぶ**前**に自 cid を [`WakeQueue`] へ
+/// push することで、メインループがどの接続の何が進んだかを知り、全接続ではなく
+/// 起こされた接続だけをダーティ化できるようにする。
+#[derive(Clone)]
+pub(crate) struct ConnWaker {
+    /// 自接続の ID（`ConnectionMap` のキーと同じ値を指す `Rc` ハンドル）。
+    cid: ConnKey,
+    /// メインループが drain する共有起床キュー。
+    wake_queue: WakeQueue,
+    /// メインループの select を起こす実体。
+    notify: H3Notify,
+}
+
+impl ConnWaker {
+    pub(crate) fn new(cid: ConnKey, wake_queue: WakeQueue, notify: H3Notify) -> Self {
+        Self {
+            cid,
+            wake_queue,
+            notify,
+        }
+    }
+
+    /// メインループを起こす。呼び出し前に自 cid を起床キューへ積むため、メインループ側は
+    /// 「どの接続が起こされたか」を取りこぼさずに把握できる。
+    ///
+    /// `self.cid.clone()`（`Rc::clone`）は参照カウント +1 のみで malloc を伴わない
+    /// （`ConnKey` の意図どおり）。レスポンスボディのチャンクごとに呼ばれ得るホットパスの
+    /// ため、ここで `ConnectionId` のディープコピーが発生しないことが重要。
+    pub(crate) fn notify(&self) {
+        self.wake_queue.borrow_mut().push_back(self.cid.clone());
+        self.notify.notify();
+    }
+}
 
 // ============================================================================
 // バックエンド I/O 抽象（F-44: 平文 TCP / TLS バックエンドの全二重ストリーミング）
@@ -437,7 +499,7 @@ pub(crate) struct BackendTaskParams {
 /// 閉じ込めて `Rc<dyn Fn>` として配布する（クロージャは HTTP/3 ワーカースレッドごとに
 /// 1 回だけ作られ、spawn 呼び出しは動的ディスパッチ 1 回 + プールスロット再利用のみ）。
 pub(crate) type BackendSpawner =
-    Rc<dyn Fn(BackendTaskParams, Receiver<Bytes>, Sender<RespMsg>, H3Notify)>;
+    Rc<dyn Fn(BackendTaskParams, Receiver<Bytes>, Sender<RespMsg>, ConnWaker)>;
 
 /// HTTP/3 ワーカースレッド用のバックエンドタスクスポーナを作成する。
 pub(crate) fn backend_task_spawner() -> BackendSpawner {
@@ -456,7 +518,7 @@ async fn backend_task(
     params: BackendTaskParams,
     req_body_rx: Receiver<Bytes>,
     resp_tx: Sender<RespMsg>,
-    notify: H3Notify,
+    notify: ConnWaker,
 ) {
     let server = params.server;
     server.acquire();
@@ -499,7 +561,7 @@ async fn run_backend_task(
     tls_insecure: bool,
     req_body_rx: &Receiver<Bytes>,
     resp_tx: &Sender<RespMsg>,
-    notify: &H3Notify,
+    notify: &ConnWaker,
 ) -> Result<(), u16> {
     let target = &server.target;
     let addr = crate::http_utils::HostPortStr::new(&target.host, target.port); // F-41
@@ -653,7 +715,7 @@ async fn stream_response(
     client_encoding: AcceptedEncoding,
     timeout_secs: u64,
     resp_tx: &Sender<RespMsg>,
-    notify: &H3Notify,
+    notify: &ConnWaker,
 ) -> Result<(), u16> {
     // 読み取りバッファ（所有権ベース read のため都度払い出し→受け取り）。
     let mut read_buf = vec![0u8; RESP_READ_CHUNK];
@@ -763,7 +825,7 @@ async fn stream_body_length(
     total: usize,
     deadline: std::time::Instant,
     resp_tx: &Sender<RespMsg>,
-    notify: &H3Notify,
+    notify: &ConnWaker,
 ) -> Result<(), u16> {
     let mut sent = 0usize;
     if !leftover.is_empty() {
@@ -806,7 +868,7 @@ async fn stream_body_chunked(
     mut read_buf: Vec<u8>,
     deadline: std::time::Instant,
     resp_tx: &Sender<RespMsg>,
-    notify: &H3Notify,
+    notify: &ConnWaker,
 ) -> Result<(), u16> {
     use crate::http_utils::ChunkedDecoder;
     let mut decoder = ChunkedDecoder::new_unlimited();
@@ -847,7 +909,7 @@ async fn drain_chunked(
     decoder: &mut crate::http_utils::ChunkedDecoder,
     data: &Bytes,
     resp_tx: &Sender<RespMsg>,
-    notify: &H3Notify,
+    notify: &ConnWaker,
 ) -> Result<bool, u16> {
     let mut pos = 0;
     while pos < data.len() {
@@ -878,7 +940,7 @@ async fn stream_body_eof(
     mut read_buf: Vec<u8>,
     deadline: std::time::Instant,
     resp_tx: &Sender<RespMsg>,
-    notify: &H3Notify,
+    notify: &ConnWaker,
 ) -> Result<(), u16> {
     if !leftover.is_empty() && send_body_bytes(resp_tx, notify, leftover).await.is_err() {
         return Ok(());
@@ -1027,7 +1089,7 @@ fn bytes_from_read(read_buf: &[u8], n: usize) -> Bytes {
 #[inline]
 async fn send_body_bytes(
     resp_tx: &Sender<RespMsg>,
-    notify: &H3Notify,
+    notify: &ConnWaker,
     chunk: Bytes,
 ) -> Result<(), ()> {
     resp_tx.send(RespMsg::Body(chunk)).await?;

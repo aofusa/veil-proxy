@@ -5390,7 +5390,7 @@ async fn handle_backend(
             _cache,
             open_file_cache_config,
             canonical_base,
-            _static_file_cache_config,
+            static_file_cache_config,
             _,
         ) => {
             // Range ヘッダーを抽出 (RFC 7233)
@@ -5411,6 +5411,7 @@ async fn handle_backend(
                 open_file_cache_config.as_deref(),
                 canonical_base.as_deref(),
                 wasm_modules,
+                static_file_cache_config.as_deref(),
             )
             .await
         }
@@ -10435,6 +10436,7 @@ async fn handle_sendfile(
     open_file_cache_config: Option<&cache::OpenFileCacheConfig>, // OpenFileCache設定（ルーティングごと）
     canonical_base: Option<&Path>, // base_path の canonical 形（F-145、config ロード時に一度だけ解決）
     wasm_modules: Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
+    static_file_cache_config: Option<&cache::StaticContentCacheRouteConfig>, // F-150: HTTP/1.1 ユーザー空間 TLS 経路向け静的コンテンツキャッシュ設定
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // --- パス解決ロジック（Nginx風） ---
     //
@@ -10742,10 +10744,14 @@ async fn handle_sendfile(
         }
     }
 
-    // kTLS が無効な場合は従来の read/write を使用
+    // kTLS が無効な場合は従来の read/write を使用（F-150: 静的コンテンツキャッシュ対象）
     handle_sendfile_userspace(
         tls_stream,
         &file,
+        &final_path,
+        file_size,
+        &mime_type,
+        static_file_cache_config,
         transfer_offset,
         transfer_length,
         client_wants_close,
@@ -10818,9 +10824,18 @@ async fn handle_sendfile_zerocopy(
 /// 従来の read/write によるファイル送信（ユーザー空間経由）
 ///
 /// kTLS が無効な場合、または rustls 使用時に使用されます。
+// clippy::too_many_arguments 許容理由: F-150 で静的コンテンツキャッシュのルックアップに
+// 必要な値（解決済みパス・ファイルサイズ・決定済み MIME・ルート単位のキャッシュ設定）を
+// 受け取るため引数が増えた。いずれも呼び出し元 `handle_sendfile` が既に算出済みの値であり、
+// ここで構造体へまとめ直すとリクエストごとのアロケーション/ムーブが増えるため渡し切りにする。
+#[allow(clippy::too_many_arguments)]
 async fn handle_sendfile_userspace(
     mut tls_stream: ServerTls,
     file: &crate::runtime::io::File,
+    file_path: &Path,
+    file_size: u64,
+    mime_type: &str,
+    static_file_cache_config: Option<&cache::StaticContentCacheRouteConfig>,
     transfer_offset: i64,
     transfer_length: u64,
     client_wants_close: bool,
@@ -10853,6 +10868,73 @@ async fn handle_sendfile_userspace(
                     Some((tls_stream, response_status, 0, true))
                 }
             };
+        }
+    }
+
+    // F-150: kTLS 無効（ユーザー空間 rustls）経路の静的配信に静的コンテンツキャッシュを
+    // 適用する。ここに到達した時点で、上の FreeBSD 平文 sendfile 分岐にも kTLS
+    // ゼロコピー分岐（handle_sendfile_zerocopy、呼び出し元 handle_sendfile 参照）にも
+    // 乗っていない＝暗号化コピーを伴うユーザー空間 TLS 経路であることが確定しており、
+    // F-146 が「HTTP/1.1 は sendfile(2)/kTLS のゼロコピー経路だから対象外」としていた
+    // 前提はここでは成立しない（詳細は F-150 チケット参照）。既定は enabled=false のため
+    // 既定挙動は完全に不変。
+    let content_cfg = cache::effective_static_content_cache_config(static_file_cache_config);
+    if content_cfg.enabled && file_size <= content_cfg.max_file_size_bytes {
+        // キャッシュはファイル全体を保持する（Range リクエストであっても部分内容だけを
+        // 挿入すると、後続の別範囲・全体リクエストが正しく解決できなくなるため）。
+        let cached =
+            if let Some(data) = cache::get_cached_content_cache(file_path, &content_cfg).await {
+                Some(data)
+            } else {
+                // キャッシュミス: 既に開いている fd から 1 回の read_exact_at でファイル
+                // 全体を読み込む。`cache::get_or_load` は `std::fs::read(path)` で
+                // **開き直す**ため使えない（FreeBSD capability mode = `cap_enter` 下では
+                // 絶対パス open が禁止されている、F-123）。既に開いている fd を使えば
+                // open/close も増えない。`Vec::with_capacity` はゼロ初期化を伴わず、
+                // `read_exact_at` が生ポインタへ直接書き込む（`IoBufMut` 実装参照）。
+                let read_buf: Vec<u8> = Vec::with_capacity(file_size as usize);
+                let (res, returned_buf) = file.read_exact_at(read_buf, 0).await;
+                match res {
+                    Ok(n) if n as u64 == file_size => {
+                        // Vec<u8> -> Bytes はヒープ確保をそのまま引き継ぐだけで memcpy を
+                        // 伴わない（`Bytes::from(Vec<u8>)`）。
+                        // `use bytes::Bytes` は `feature = "http2"` 限定のため、本経路
+                        // （feature 非依存）ではフルパスで参照する。
+                        let data = bytes::Bytes::from(returned_buf);
+                        // mime_guess の再計算を避けるため、呼び出し元（handle_sendfile）が
+                        // 既に決定済みの MIME タイプを使い回す（Arc<str> 化はミス時のみ発生）。
+                        cache::insert_content_cache_bytes(
+                            file_path,
+                            data.clone(),
+                            Arc::from(mime_type),
+                            &content_cfg,
+                        );
+                        Some(data)
+                    }
+                    _ => None, // 読み込み失敗・短い読み込み時は下の通常経路へフォールバック
+                }
+            };
+
+        if let Some(data) = cached {
+            let start = transfer_offset as usize;
+            let end = start.saturating_add(transfer_length as usize);
+            if end <= data.len() {
+                // Bytes::slice は参照カウントのみ・コピーなし（Range リクエストの
+                // 部分送出にもそのまま使える）。
+                let slice = data.slice(start..end);
+                let write_result = timeout(WRITE_TIMEOUT, tls_stream.write_all(slice)).await;
+                return match write_result {
+                    Ok((Ok(_), _)) => Some((
+                        tls_stream,
+                        response_status,
+                        transfer_length,
+                        client_wants_close,
+                    )),
+                    _ => None,
+                };
+            }
+            // data の長さがリクエスト範囲を満たさない（キャッシュ後にファイルが縮小した
+            // 等の稀なレース）場合は安全側で下の通常経路へフォールスルーする。
         }
     }
 

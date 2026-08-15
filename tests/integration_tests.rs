@@ -1444,3 +1444,186 @@ fn test_f18_l4_weighted_rr_distributes() {
     assert_eq!(c1, 3, "backend1 (weight=3) should receive 3 of 4 requests");
     assert_eq!(c2, 1, "backend2 (weight=1) should receive 1 of 4 requests");
 }
+
+// ====================
+// F-150: rustls writev(2) ゼロコピー送信の統合テスト
+// ====================
+//
+// veil の TLS サーバストリーム（`simple_tls::SimpleTlsServerStream` /
+// `ktls_rustls::KtlsServerStream` の rustls フォールバック経路、`veil_ktls` の
+// 有無で片方だけがコンパイルされる）から `write_all_vectored`（F-59/F-150 改修 2）
+// で 54KB（複数 TLS レコードにまたがる）・3B・0B のヘッダ + ボディを送出し、
+// ブロッキング rustls クライアント（`rustls::StreamOwned`、実 TCP 経由）で
+// 受信した平文がバイト単位で完全一致することを検証する。
+mod f150_tls_writev_roundtrip {
+    use std::io::Read as _;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use rustls::pki_types::ServerName;
+
+    /// 証明書検証をスキップする検証器（テスト用自己署名証明書）。
+    #[derive(Debug)]
+    struct NoVerify;
+
+    impl rustls::client::danger::ServerCertVerifier for NoVerify {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            veil::tls_provider::provider::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+                .to_vec()
+        }
+    }
+
+    /// プロセスに一度だけデフォルト暗号プロバイダをインストールする。
+    fn ensure_provider() {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            let _ = veil::tls_provider::provider::default_provider().install_default();
+        });
+    }
+
+    /// 自己署名証明書のサーバ設定を作る。
+    fn make_server_config() -> Arc<rustls::ServerConfig> {
+        ensure_provider();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap();
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .unwrap();
+        Arc::new(config)
+    }
+
+    /// 証明書検証をスキップするクライアント設定を作る。
+    fn make_client_config() -> Arc<rustls::ClientConfig> {
+        ensure_provider();
+        let config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
+            .with_no_client_auth();
+        Arc::new(config)
+    }
+
+    /// 送出する 3 ケース（ヘッダ + ボディ）: 54KB（TLS レコード境界をまたぐ）・3B・0B。
+    fn make_cases() -> Vec<(&'static [u8], Vec<u8>)> {
+        let body_54k: Vec<u8> = (0..54_000usize).map(|i| (i % 251) as u8).collect();
+        let body_3b: Vec<u8> = vec![0x11, 0x22, 0x33];
+        let body_0b: Vec<u8> = Vec::new();
+        vec![
+            (b"HDR1".as_slice(), body_54k),
+            (b"HDR2".as_slice(), body_3b),
+            (b"HDR3".as_slice(), body_0b),
+        ]
+    }
+
+    /// ブロッキング rustls クライアントで接続し、各ケースの `header ++ body` が
+    /// バイト単位で完全一致することを検証する（実 TCP 経由・別スレッド）。
+    fn blocking_client_verify(addr: SocketAddr, cases: Vec<(&'static [u8], Vec<u8>)>) {
+        let config = make_client_config();
+        let server_name = ServerName::try_from("localhost".to_string()).unwrap();
+        let conn = rustls::ClientConnection::new(config, server_name).expect("client conn");
+        let sock = std::net::TcpStream::connect(addr).expect("connect");
+        sock.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let mut tls = rustls::StreamOwned::new(conn, sock);
+
+        for (header, body) in cases {
+            let mut buf = vec![0u8; header.len() + body.len()];
+            tls.read_exact(&mut buf).expect("read_exact");
+            assert_eq!(&buf[..header.len()], header, "header mismatch");
+            assert_eq!(&buf[header.len()..], body.as_slice(), "body mismatch");
+        }
+    }
+
+    #[cfg(not(veil_ktls))]
+    #[test]
+    fn test_f150_simple_tls_writev_roundtrip() {
+        use veil::runtime::{self, TcpListener};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let server_config = make_server_config();
+        let cases = make_cases();
+        let cases_for_client = cases.clone();
+
+        let client_thread =
+            std::thread::spawn(move || blocking_client_verify(addr, cases_for_client));
+
+        runtime::block_on(async move {
+            let (stream, _peer) = listener.accept().await.expect("accept");
+            let mut tls = veil::simple_tls::accept(stream, server_config, None)
+                .await
+                .expect("tls accept");
+
+            for (header, body) in cases {
+                let (res, _h, _b) = tls.write_all_vectored(header.to_vec(), body).await;
+                res.expect("write_all_vectored");
+            }
+        });
+
+        client_thread.join().expect("client thread panicked");
+    }
+
+    #[cfg(veil_ktls)]
+    #[test]
+    fn test_f150_ktls_rustls_fallback_writev_roundtrip() {
+        use veil::runtime::{self, TcpListener};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let server_config = make_server_config();
+        let cases = make_cases();
+        let cases_for_client = cases.clone();
+
+        let client_thread =
+            std::thread::spawn(move || blocking_client_verify(addr, cases_for_client));
+
+        runtime::block_on(async move {
+            let (stream, _peer) = listener.accept().await.expect("accept");
+            // enable_ktls = false: rustls フォールバック経路（F-150 改修対象）を強制的に使う。
+            let mut tls = veil::ktls_rustls::accept(stream, server_config, false, true, true, None)
+                .await
+                .expect("tls accept");
+
+            for (header, body) in cases {
+                let (res, _h, _b) = tls.write_all_vectored(header.to_vec(), body).await;
+                res.expect("write_all_vectored");
+            }
+        });
+
+        client_thread.join().expect("client thread panicked");
+    }
+}

@@ -58,7 +58,7 @@ io_uring（独自実装ランタイム）と rustls を使用した高性能リ�
 - **CPUアフィニティ**: ワーカースレッドのCPUコアピン留め
 - **CBPF振り分け**: SO_REUSEPORTのクライアントIPベースロードバランシング（Linux 4.6+）
 - **OpenFileCache**: ファイルメタデータキャッシュ（canonicalize、metadata、mime_guessのシステムコール削減） - 静的ファイル配信で60〜67%のシステムコール削減。キャッシュミス時はブロッキングな canonicalize/metadata/ディスク読込を専用オフロードスレッドプール（完了を eventfd + POLL_ADD で通知）で実行し、io_uring イベントループをブロックしない
-- **静的ファイル本体キャッシュ**（F-146、HTTP/2・HTTP/3 限定、既定オフ）: HTTP/2・HTTP/3 の静的配信は DATA フレーム/QUIC ストリームへの再フレーミングが必須で `sendfile(2)` を使えないため、従来はリクエストごとにファイル全体をオフロード経由で読み直していた。`[static_file_cache]`/`[route.static_file_cache]` で有効化すると、ファイル本体を `bytes::Bytes` としてユーザ空間メモリに保持し、キャッシュヒット時は `DashMap` ルックアップ + `Bytes::clone()`（参照カウント増加）のみで配信する（syscall・アロケーション・オフロード往復ゼロ）。HTTP/1.1 は sendfile(2)/kTLS splice を使うため対象外（無変更）
+- **静的ファイル本体キャッシュ**（F-146/F-150、既定オフ）: HTTP/2・HTTP/3 の静的配信は DATA フレーム/QUIC ストリームへの再フレーミングが必須で `sendfile(2)` を使えないため、従来はリクエストごとにファイル全体をオフロード経由で読み直していた。kTLS を無効化した HTTP/1.1 のユーザー空間 TLS（rustls）経路も同様に `sendfile(2)` を使えず、リクエストごとに `pread(2)` でファイルを読み直していた（F-150）。FreeBSD の推奨構成は `ktls_enabled = false`（software kTLS はレコード単位ディスパッチのため大きな応答で不利）であり、この経路に該当する。`[static_file_cache]`/`[route.static_file_cache]` で有効化すると、ファイル本体を `bytes::Bytes` としてユーザ空間メモリに保持し、キャッシュヒット時は `DashMap` ルックアップ + `Bytes::clone()`（参照カウント増加。HTTP/1.1 では Range リクエスト向けに `Bytes::slice()` も併用）のみで配信する（syscall・アロケーション・オフロード往復ゼロ）。kTLS 有効時・平文時の HTTP/1.1 は既に sendfile(2)/kTLS ゼロコピー経路を使うため対象外（無変更）
 - **HTTP/2 レスポンスストリーミング**: 非圧縮レスポンスは、バックエンドのボディを全バッファリングせず DATA フレームとして逐次転送する（`Content-Length` 既知・`Transfer-Encoding: chunked` の両方に対応）。chunked ボディは span ベースデコーダでゼロコピーにデコードする（読み取りバッファのサブスライスを使い中間 `Vec` を持たない）。各 DATA フレームは HTTP/2 フロー制御（コネクション/ストリームウィンドウ + `WINDOW_UPDATE`）に従うため、クライアントの受信速度に応じたバックプレッシャが効き、RSS がペイロードサイズに比例しない（大容量ダウンロードの OOM 耐性）
 - **HTTP/2 送信フレーム連結（コアレッシング）**（F-74）: レスポンス送信経路では、1 レスポンス分の全フレーム（HEADERS + 全 DATA フレーム、gRPC トレイラー）を**接続ごとの再利用連結バッファ**（`write_buf`。スレッドローカルプールで接続をまたいで再利用）へ追記し、フレームごとに書き込む代わりに **1 回の `write_all` / io_uring 送信**でまとめて送出する。最小構成のレスポンスでも書き込みが 2 回以上から **1 回**になり、HEADERS が最初の DATA より先行してワイヤに出ることもない。フレーム追記は `encode_headers_into` / `encode_data_into` によりゼロ追加確保（per-frame `Vec` 無し）。大容量ストリーミングボディでは **128 KiB 閾値**（およびフロー制御 `WINDOW_UPDATE` 待ちに入る前）でフラッシュしてメモリを抑えつつ送信をパイプライン化し、`Content-Length` ストリーミング経路は HEADERS と最初の既読ボディ断片を連結する。制御フレーム（SETTINGS/PING/`RST_STREAM`/GOAWAY）は従来どおり直接書き込み（直接書き込みの呼び出し境界では連結バッファは常に空）、多重化ループの消費連動 `WINDOW_UPDATE`（F-116）は積まれたフレームを追い越さないよう `write_buf` へ追記するため、いずれの経路でもフレーム順序は保たれる
 - **HTTP/2 リクエストストリーミング（アップロード）**: プロキシ対象のアップロードは、リクエスト **HEADERS** 受信時点で（ボディ完了を待たず）バックエンド接続を開始し、受信した各 `DATA` フレームを `Transfer-Encoding: chunked` のチャンクとして**ボディ全体をバッファせず**バックエンドへ転送する。フレームの所有バッファはゼロコピーで送出する（チャンクサイズ行と CRLF のみ小バッファ）。フロー制御のアカウンティングは `request_body` へコピーせず行う。バックプレッシャは**消費連動**（F-116）: 受信ウィンドウの補充（`WINDOW_UPDATE`）はボディ断片を per-stream リクエストタスクへ引き渡せたタイミングでのみ行うため、バックエンドが遅い場合は HTTP/2 フロー制御がクライアントを抑制し、未転送のアップロードバイトはウィンドウ分で有界に保たれる（RSS がアップロードサイズに比例しない）。適格条件は、HTTP/1.1（h2c 以外）の `Proxy` バックエンド・`buffering` モードが `full` 以外・WASM ボディフィルタ非適用・非 gRPC。ボディサイズ上限（`max_request_body_size`）は転送中に強制する（413 + `RST_STREAM`）。非適格なリクエストは従来のバッファ経路にフォールバックし挙動は変わらない
@@ -503,7 +503,7 @@ sudo setcap 'cap_net_bind_service=+ep' ./target/release/veil
 | `[performance]` | `open_file_cache_enabled` | `false` | OpenFileCacheを有効化 |
 | `[performance]` | `open_file_cache_valid_duration_secs` | `60` | キャッシュ有効期間（秒） |
 | `[performance]` | `open_file_cache_max_entries` | `10000` | 最大キャッシュエントリ数 |
-| `[static_file_cache]` | `enabled` | `false` | 静的ファイル本体キャッシュ（F-146、HTTP/2・HTTP/3 限定）を有効化 |
+| `[static_file_cache]` | `enabled` | `false` | 静的ファイル本体キャッシュ（F-146/F-150。HTTP/2・HTTP/3、および kTLS 無効時の HTTP/1.1）を有効化 |
 | `[static_file_cache]` | `valid_duration_secs` | `60` | キャッシュ有効期間（秒） |
 | `[static_file_cache]` | `max_entries` | `1024` | 最大キャッシュエントリ数 |
 | `[static_file_cache]` | `max_file_size_bytes` | `1048576` | キャッシュ対象の最大ファイルサイズ（バイト） |
@@ -545,6 +545,7 @@ sudo setcap 'cap_net_bind_service=+ep' ./target/release/veil
 | `[http3]` | `max_pacing_rate` | （なし） | 最大 pacing レート（バイト/秒）。未指定で制限なし |
 | `[http3]` | `hystart` | `true` | HyStart++ を有効化 |
 | `[http3]` | `mmsg_batch_size` | `64` | UDP mmsg / io_uring パイプライン化 RECVMSG/SENDMSG バッチ幅（1..=128） |
+| `[http3]` | `recv_drain_max` | `64` | **reactor バックエンド専用**（FreeBSD/OpenBSD/NetBSD/macOS、Linux の `--features epoll`）: 1 イテレーションあたりに掻き出す UDP データグラム数の上限（1..=4096）。大きくするほど 1 イテレーションあたりの固定費（select/タイマー往復 + 接続スイープ）を多くのデータグラムへ償却できる（F-151 でこの量だけで 3.2 倍の差を実測）が、drain 中は送信・タイムアウト・バックエンド通知が待たされるため p99 レイテンシとのトレードオフ。Linux 既定の io_uring バックエンドは `mmsg_batch_size` の RECVMSG パイプラインを使うため本キーを参照しない |
 | `[http3]` | `compression_enabled` | `false` | 圧縮を有効化 |
 | `[http3]` | `gso_gro_enabled` | `false` | GSO/GROを有効化 |
 | `[http3]` | `alt_svc_enabled` | `true` | H1/H2 応答へ Alt-Svc で HTTP/3 を広告（`server.http3_enabled` 時のみ） |

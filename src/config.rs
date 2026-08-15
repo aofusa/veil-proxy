@@ -3218,6 +3218,26 @@ pub struct Http3ConfigSection {
     #[serde(default = "default_h3_mmsg_batch_size")]
     pub mmsg_batch_size: usize,
 
+    /// 1 イテレーションあたりに掻き出す UDP データグラム数の上限（reactor バックエンド専用、F-152）
+    ///
+    /// **readiness reactor（FreeBSD / OpenBSD / NetBSD / macOS、および Linux の
+    /// `--features epoll`）だけで使う。** Linux 既定の io_uring バックエンドは
+    /// `mmsg_batch_size` 本の `IORING_OP_RECVMSG` を常時 in-flight に保つ
+    /// パイプライン方式（F-130）なので本設定は参照しない。
+    ///
+    /// reactor 経路は「読み込み可能になったら `recv_mmsg_sync` を繰り返して掻き出す」
+    /// 形をとる。本設定はその 1 イテレーションあたりの合計データグラム数の上限で、
+    /// 大きくするほど select/タイマー往復と接続スイープの固定費を多くのデータグラムへ
+    /// 償却できる（F-151 の実験では、1 イテレーションで扱うデータグラム数を増やすと
+    /// スループットが 3.2 倍になった）。ただし大きすぎると送信・タイムアウト・
+    /// バックエンド通知の処理が遅れるため、レイテンシとのトレードオフになる。
+    ///
+    /// 範囲: 1..=4096。範囲外はクランプする。
+    ///
+    /// デフォルト: `64`
+    #[serde(default = "default_h3_recv_drain_max")]
+    pub recv_drain_max: usize,
+
     // ====================
     // Alt-Svc（HTTP/3 広告、F-94）— すべて [http3] に集約
     // ====================
@@ -3264,6 +3284,11 @@ fn default_h3_cc_algorithm() -> String {
 fn default_h3_mmsg_batch_size() -> usize {
     64
 }
+/// F-152: reactor 経路の 1 イテレーションあたり drain 上限の既定値
+/// （従来ハードコードされていた `H3_RECV_DRAIN_MAX` と同値）。
+fn default_h3_recv_drain_max() -> usize {
+    64
+}
 
 impl Default for Http3ConfigSection {
     fn default() -> Self {
@@ -3285,6 +3310,7 @@ impl Default for Http3ConfigSection {
             max_pacing_rate: None,
             hystart: true,
             mmsg_batch_size: default_h3_mmsg_batch_size(),
+            recv_drain_max: default_h3_recv_drain_max(),
             alt_svc_enabled: true,
             alt_svc: None,
             alt_svc_ma_secs: default_h3_alt_svc_ma(),
@@ -3321,6 +3347,9 @@ impl Http3ConfigSection {
             mmsg_batch_size: self
                 .mmsg_batch_size
                 .clamp(1, crate::udp::socket::MMSG_BATCH_MAX),
+            recv_drain_max: self
+                .recv_drain_max
+                .clamp(1, http3_server::H3_RECV_DRAIN_MAX_LIMIT),
         }
     }
 }

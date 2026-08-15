@@ -41,17 +41,6 @@ fn raw_read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     }
 }
 
-#[inline]
-#[cfg(unix)]
-fn raw_write(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
-    let result = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
-    if result < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(result as usize)
-    }
-}
-
 /// Winsock 版の同期 recv（`WSAGetLastError()` を見る必要がある点が Unix 版と異なる）。
 #[inline]
 #[cfg(windows)]
@@ -74,26 +63,41 @@ fn raw_read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     }
 }
 
-/// Winsock 版の同期 send。
-#[inline]
-#[cfg(windows)]
-fn raw_write(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
-    use crate::runtime::handle::win;
-    let result = unsafe {
-        windows_sys::Win32::Networking::WinSock::send(
-            win::to_socket(fd),
-            buf.as_ptr(),
-            buf.len() as i32,
-            0,
-        )
-    };
-    if result < 0 {
-        Err(io::Error::from_raw_os_error(unsafe {
-            windows_sys::Win32::Networking::WinSock::WSAGetLastError()
-        }))
-    } else {
-        Ok(result as usize)
+/// rustls の送信平文バッファへ `slice` を積む（F-150 改修 2）。
+///
+/// バッファ上限（既定 64KB）に当たって部分受理された場合は、その時点で
+/// `flush_tls_writev` して残りを積む（`write_all` 相当のループ）。
+/// `write_all_vectored` がヘッダ・ボディの両方を積んでから最後に 1 回だけ
+/// フラッシュするための下請け。
+async fn push_plaintext_server(
+    stream: &TcpStream,
+    conn: &mut ServerConnection,
+    mut slice: &[u8],
+) -> io::Result<()> {
+    while !slice.is_empty() {
+        let accepted = {
+            let mut wr = conn.writer();
+            std::io::Write::write(&mut wr, slice)?
+        };
+        if accepted == 0 {
+            // 送信キューが上限に達していて 1 バイトも受理されなかった。キューを
+            // 吐き出して空けてから再試行する。吐き出すものが無いのに 0 受理なら
+            // 前進不能なのでエラーにする（無限ループ防止）。
+            if !conn.wants_write() {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "rustls writer accepted 0 bytes",
+                ));
+            }
+            crate::tls_writev::flush_tls_writev(stream, conn).await?;
+            continue;
+        }
+        slice = &slice[accepted..];
+        if !slice.is_empty() {
+            crate::tls_writev::flush_tls_writev(stream, conn).await?;
+        }
     }
+    Ok(())
 }
 
 /// rustls の復号済み平文を `drained` の未初期化スペア容量へ直接読み込む（中間バッファ・
@@ -186,11 +190,13 @@ impl SimpleTlsServerStream {
         self.alpn_protocol() == Some(b"h2")
     }
 
-    /// 2 つの不連続バッファ（ヘッダ + ボディ）を全量書き込む（F-59）
+    /// 2 つの不連続バッファ（ヘッダ + ボディ）を全量書き込む（F-59、F-150 改修 2）
     ///
     /// 平文（`TlsMode::Plain`）接続では 1 回の `IORING_OP_SENDMSG`（scatter-gather）で
-    /// 送出し、syscall/SQE を半減する。rustls モードはユーザー空間でレコード化するため
-    /// 従来の 2 回書き込みへフォールバックする。
+    /// 送出し、syscall/SQE を半減する。rustls モードは両方の平文を
+    /// `conn.writer()`（rustls の送信キュー）へ積んでから `flush_tls_writev` を
+    /// 1 回だけ呼ぶ（`writev(2)` 1 回で送出。以前はヘッダ・ボディそれぞれで
+    /// フラッシュが走り `write(2)` が 2 回発行されていた）。
     pub async fn write_all_vectored<A: IoBuf, B: IoBuf>(
         &mut self,
         a: A,
@@ -199,17 +205,24 @@ impl SimpleTlsServerStream {
         if self.mode == TlsMode::Plain {
             return self.inner.write_all_vectored(a, b).await;
         }
-        use crate::runtime::io::AsyncWriteRentExt;
-        let (res, a) = self.write_all(a).await;
-        if let Err(e) = res {
+
+        let conn = match self.conn.as_mut() {
+            Some(c) => c,
+            None => return (Err(io::Error::other("TLS connection closed")), a, b),
+        };
+
+        let a_slice = unsafe { std::slice::from_raw_parts(a.read_ptr(), a.bytes_init()) };
+        if let Err(e) = push_plaintext_server(&self.inner, conn, a_slice).await {
             return (Err(e), a, b);
         }
         if b.bytes_init() > 0 {
-            let (res, b) = self.write_all(b).await;
-            if let Err(e) = res {
+            let b_slice = unsafe { std::slice::from_raw_parts(b.read_ptr(), b.bytes_init()) };
+            if let Err(e) = push_plaintext_server(&self.inner, conn, b_slice).await {
                 return (Err(e), a, b);
             }
-            return (Ok(()), a, b);
+        }
+        if let Err(e) = crate::tls_writev::flush_tls_writev(&self.inner, conn).await {
+            return (Err(e), a, b);
         }
         (Ok(()), a, b)
     }
@@ -291,24 +304,7 @@ async fn do_server_handshake(
             }
         }
 
-        while conn.wants_write() {
-            let mut write_buf = Vec::new();
-            conn.write_tls(&mut write_buf)?;
-
-            let mut written = 0;
-            while written < write_buf.len() {
-                match raw_write(fd, &write_buf[written..]) {
-                    Ok(0) => {
-                        return Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0"))
-                    }
-                    Ok(n) => written += n,
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        stream.writable().await?;
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-        }
+        crate::tls_writev::flush_tls_writev(stream, conn).await?;
 
         if conn.wants_read() {
             loop {
@@ -336,26 +332,7 @@ async fn do_server_handshake(
 
     // ハンドシェイク完了後、バッファリングされた TLS レコードを全て送信
     // TLS 1.3 ではセッションチケット (NewSessionTicket) がハンドシェイク後に送信される
-    while conn.wants_write() {
-        let mut write_buf = Vec::new();
-        conn.write_tls(&mut write_buf)?;
-
-        if write_buf.is_empty() {
-            break;
-        }
-
-        let mut written = 0;
-        while written < write_buf.len() {
-            match raw_write(fd, &write_buf[written..]) {
-                Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0")),
-                Ok(n) => written += n,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    stream.writable().await?;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
+    crate::tls_writev::flush_tls_writev(stream, conn).await?;
 
     Ok(())
 }
@@ -364,24 +341,7 @@ async fn do_client_handshake(stream: &TcpStream, conn: &mut ClientConnection) ->
     let fd = stream.as_raw_fd();
     let mut read_buf = vec![0u8; 16384];
     while conn.is_handshaking() {
-        while conn.wants_write() {
-            let mut write_buf = Vec::new();
-            conn.write_tls(&mut write_buf)?;
-
-            let mut written = 0;
-            while written < write_buf.len() {
-                match raw_write(fd, &write_buf[written..]) {
-                    Ok(0) => {
-                        return Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0"))
-                    }
-                    Ok(n) => written += n,
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        stream.writable().await?;
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-        }
+        crate::tls_writev::flush_tls_writev(stream, conn).await?;
 
         if conn.wants_read() {
             loop {
@@ -409,26 +369,7 @@ async fn do_client_handshake(stream: &TcpStream, conn: &mut ClientConnection) ->
 
     // ハンドシェイク完了後、バッファリングされた TLS レコードを全て送信
     // TLS 1.3 ではクライアントの Finished メッセージがここで送信される
-    while conn.wants_write() {
-        let mut write_buf = Vec::new();
-        conn.write_tls(&mut write_buf)?;
-
-        if write_buf.is_empty() {
-            break;
-        }
-
-        let mut written = 0;
-        while written < write_buf.len() {
-            match raw_write(fd, &write_buf[written..]) {
-                Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0")),
-                Ok(n) => written += n,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    stream.writable().await?;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
+    crate::tls_writev::flush_tls_writev(stream, conn).await?;
 
     Ok(())
 }
@@ -607,31 +548,8 @@ impl crate::runtime::io::AsyncWriteRent for SimpleTlsServerStream {
             }
         };
 
-        let fd = self.inner.as_raw_fd();
-        while conn.wants_write() {
-            let mut write_buf = Vec::new();
-            if let Err(e) = conn.write_tls(&mut write_buf) {
-                return (Err(e), buf);
-            }
-
-            let mut written = 0;
-            while written < write_buf.len() {
-                match raw_write(fd, &write_buf[written..]) {
-                    Ok(0) => {
-                        return (
-                            Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0")),
-                            buf,
-                        )
-                    }
-                    Ok(n) => written += n,
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        if let Err(e) = self.inner.writable().await {
-                            return (Err(e), buf);
-                        }
-                    }
-                    Err(e) => return (Err(e), buf),
-                }
-            }
+        if let Err(e) = crate::tls_writev::flush_tls_writev(&self.inner, conn).await {
+            return (Err(e), buf);
         }
 
         (Ok(accepted), buf)
@@ -756,31 +674,8 @@ impl crate::runtime::io::AsyncWriteRent for SimpleTlsClientStream {
             }
         };
 
-        let fd = self.inner.as_raw_fd();
-        while self.conn.wants_write() {
-            let mut write_buf = Vec::new();
-            if let Err(e) = self.conn.write_tls(&mut write_buf) {
-                return (Err(e), buf);
-            }
-
-            let mut written = 0;
-            while written < write_buf.len() {
-                match raw_write(fd, &write_buf[written..]) {
-                    Ok(0) => {
-                        return (
-                            Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0")),
-                            buf,
-                        )
-                    }
-                    Ok(n) => written += n,
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        if let Err(e) = self.inner.writable().await {
-                            return (Err(e), buf);
-                        }
-                    }
-                    Err(e) => return (Err(e), buf),
-                }
-            }
+        if let Err(e) = crate::tls_writev::flush_tls_writev(&self.inner, &mut self.conn).await {
+            return (Err(e), buf);
         }
 
         (Ok(accepted), buf)
