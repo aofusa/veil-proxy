@@ -50,8 +50,21 @@ E0282 群は E0433 に起因する連鎖エラーなので、これだけで解�
 `packaging/scripts/build-cross.sh --target freebsd` /
 `tools/qemu/bsd-vm.sh freebsd <arch> build` を通すたびに AIO 経路がコンパイルされる。
 
+## 追記（2026-08-15）
+
+`docker/Dockerfile.freebsd` および `packaging/scripts/build-cross.sh --target freebsd`
+は B-49（未解決）により削除した。本件を最初に顕在化させた Docker クロスビルド経路
+自体が無くなったため、上記「検出経緯」「再発防止」に書いた
+`packaging/scripts/build-cross.sh --target freebsd` は現在は存在しない
+（過去の検出経緯としてはそのまま残す）。修正済みの `super::aio::` →
+`crate::runtime::reactor::aio::` はソースコードの変更であり Docker 削除の影響を
+受けないため、本チケットのステータス（完了）は変わらない。`full-freebsd`
+（`aio` を含む）のコンパイルは引き続き `tools/qemu/bsd-vm.sh freebsd <arch> build`
+（QEMU VM 内ネイティブビルド）を通すたびに検証される。
+
 ## 関連
 
 - F-127（FreeBSD POSIX AIO）
 - F-125（`reactor/tcp` の Windows 対応分割 = 混入時期）
 - B-47（本件の検出元。クロスビルド環境整備）
+- B-49（FreeBSD Docker クロスビルドは 2026-08-15 に経路ごと削除。詳細は B-49 参照）

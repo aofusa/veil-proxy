@@ -1,5 +1,24 @@
 # B-49: FreeBSD クロスビルドで aws-lc-sys の s2n-bignum アセンブリが組み立てられずリンクに失敗する
 
+## 追記（2026-08-15）: Docker クロスビルド経路自体を削除（Won't Fix / 経路廃止）
+
+`docker/Dockerfile.freebsd` を削除し、`packaging/scripts/build-cross.sh` から
+`--target freebsd` を撤去した（`--target freebsd` を指定すると QEMU VM ネイティブ
+ビルドへの案内を表示して非ゼロ終了する）。
+
+FreeBSD の公式なビルド経路は元々 **QEMU VM 内のネイティブビルド**
+（`tools/qemu/bsd-vm.sh freebsd <arch> build` → `fetch` →
+`packaging/scripts/build-bsd.sh`）であり、x86_64 / aarch64 とも実際に成果物を
+生成できていた。一方 Docker クロスビルド経路は本チケットの問題が解決しないまま
+「警告を出して続行し、どうせ失敗するビルドを開始する」だけの状態になっており、
+動かない経路を残すことが誤用を招くと判断したため削除した。
+
+**ステータス: 解消（Won't Fix / 経路廃止）** — 本チケットが報告していたリンク
+エラー自体は未調査のまま（aws-lc-sys 側の根本原因は解明されていない）が、
+その原因となっていた Docker クロスビルド経路そのものを削除したことで問題が
+再現し得なくなったため、対応不要とする。将来 Docker クロスビルドを復活させたい
+場合は本チケットの調査内容（下記）を再利用できる。
+
 ## 事象
 
 `docker/Dockerfile.freebsd`（`cargo zigbuild --target x86_64-unknown-freebsd`、
@@ -75,11 +94,12 @@ $ nm f.o
 FreeBSD ターゲットでの C 側のコード選択と aws-lc-sys が用意する asm の対応自体が
 噛み合っていない可能性が高い。aws-lc-sys 側の対応が要る。
 
-## 状態: 未解決（保留）
+## 状態（当時の記録）: 未解決（保留）→ 2026-08-15 に経路廃止で解消
 
-`x86_64-unknown-freebsd` の **Docker クロスビルドは現状できない**。
+`x86_64-unknown-freebsd` の **Docker クロスビルドは当時できなかった**。
 `docker/Dockerfile.freebsd` と `packaging/scripts/build-cross.sh --target freebsd` は
-残してあるが、実行すると上記のリンクエラーで失敗する（スクリプト冒頭で警告を出す）。
+残してあり、実行すると上記のリンクエラーで失敗していた（スクリプト冒頭で警告を出す）。
+2026-08-15 に `docker/Dockerfile.freebsd` ごと削除した（詳細は冒頭の追記を参照）。
 
 **FreeBSD の公式なビルド経路は QEMU VM 内のネイティブビルド**
 （`tools/qemu/bsd-vm.sh freebsd {x86_64,aarch64} build`）であり、そちらは

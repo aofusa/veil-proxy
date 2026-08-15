@@ -116,13 +116,16 @@ hot-path cost). The default is unchanged (Linux io_uring).
   as follow-up work in `docs/backlog/features/F-140-netbsd-support.md`; this environment
   also lacks a NetBSD cross C toolchain, so `cargo check --target x86_64-unknown-netbsd`
   currently fails inside `ring`'s/`boring`'s native build scripts before reaching veil's own
-  code. A `docker/Dockerfile.freebsd` exists for `x86_64-unknown-freebsd`
-  (zig bundles FreeBSD libc and the target is Rust Tier 2), but it **currently fails at link
-  time** — `aws-lc-sys` assembles none of its s2n-bignum `.S` files under a FreeBSD cross
+  code. **FreeBSD has no Docker cross-build path** — `docker/Dockerfile.freebsd` and
+  `build-cross.sh --target freebsd` were removed because the build **fails at link
+  time**: `aws-lc-sys` assembles none of its s2n-bignum `.S` files under a FreeBSD cross
   configuration, producing many `undefined symbol: curve25519_x25519_byte`-style errors
-  (see `docs/backlog/bugs/B-49-...`, unresolved). Until that is fixed, build FreeBSD in the
-  VM for both architectures. `aarch64-unknown-freebsd` is Rust Tier 3 (no prebuilt std) and
-  must be built in the VM regardless.
+  (see `docs/backlog/bugs/B-49-...`, unresolved — the ticket documents the removal).
+  **QEMU VM native build is the sole official FreeBSD build path**, for both
+  architectures (`aarch64-unknown-freebsd` is additionally Rust Tier 3 with no prebuilt
+  std, so it could never have used Docker regardless):
+  `tools/qemu/bsd-vm.sh freebsd <arch> build` → `fetch` →
+  `packaging/scripts/build-bsd.sh --os freebsd --arch <arch> --binary <path>`.
 - **FreeBSD POSIX AIO (`--features aio`, F-127)**: opt-in build-time switch, **not recommended**
   (FreeBSD only;
   build.rs panics on other targets, same pattern as `epoll`). Replaces the default kqueue

@@ -29,7 +29,7 @@ cargo には**ターゲット別の環境変数設定が存在しない**（`[ta
 `AWS_LC_SYS_NO_PREFIX_<triple_with_underscores>` をグローバル `[env]` に列挙している。
 詳細は [`docs/backlog/bugs/B-47-...`](../docs/backlog/bugs/B-47-awslc-no-prefix-not-applied-cross-build.md) を参照。
 
-### 非 Linux 向けクロスビルド（macOS / Windows / FreeBSD）
+### 非 Linux 向けクロスビルド（macOS / Windows）
 
 `Dockerfile.glibc` と同じ **cacher（依存だけ先にビルド）→ builder（実ソース）** の
 2 段構成にしてあるため、ソースだけを変更した再ビルドでは `aws-lc-sys` /
@@ -39,7 +39,6 @@ cargo には**ターゲット別の環境変数設定が存在しない**（`[ta
 |---|---|---|
 | `Dockerfile.macos` | `universal2-apple-darwin`（x86_64 + aarch64 fat） | `messense/cargo-zigbuild` |
 | `Dockerfile.windows` | `x86_64-pc-windows-msvc` / `aarch64-pc-windows-msvc` | `messense/cargo-xwin` |
-| `Dockerfile.freebsd` | `x86_64-unknown-freebsd` ※**現在リンクに失敗（B-49）** | `messense/cargo-zigbuild` |
 
 いずれもランタイムステージを持たない（生成物を Linux コンテナで実行できないため）。
 最終ステージ `artifact` は scratch にバイナリだけを置くので、`--output type=local` で
@@ -53,13 +52,16 @@ docker build -f Dockerfile.windows --target artifact \
   --output type=local,dest=./out ..
 ```
 
-通常は `packaging/scripts/build-cross.sh --target {macos|windows|freebsd}` から
+通常は `packaging/scripts/build-cross.sh --target {macos|windows}` から
 呼び出す（tar.gz / zip 化まで行う）。
 
-**FreeBSD は現在 Docker クロスビルドが通らない**（B-49: aws-lc-sys の s2n-bignum
-アセンブリが組み立てられずリンクエラー）。`aarch64-unknown-freebsd` はそもそも
-Rust Tier 3（prebuilt std 無し）で Docker では扱えない。FreeBSD は x86_64 / aarch64 とも
-`tools/qemu/bsd-vm.sh freebsd <arch> build` の VM 内ネイティブビルドを使う。
+**FreeBSD 向けの `Dockerfile.freebsd` は B-49（未解決）により削除した**: aws-lc-sys の
+s2n-bignum アセンブリが FreeBSD クロス構成で 1 つも組み立てられずリンクエラーになる
+経路を残しておくと誤用を招くため撤去した。`build-cross.sh --target freebsd` を
+実行すると案内を出して終了する。`aarch64-unknown-freebsd` はそもそも
+Rust Tier 3（prebuilt std 無し）で Docker では扱えない。**FreeBSD は x86_64 / aarch64
+とも QEMU VM 内ネイティブビルドが唯一の公式経路**（`tools/qemu/bsd-vm.sh freebsd
+<arch> build` → `fetch` → `packaging/scripts/build-bsd.sh`）。
 OpenBSD も同様に `tools/qemu/bsd-vm.sh openbsd {x86_64,aarch64}` を使う。
 
 ### aarch64-unknown-linux クロスビルド（F-120 Phase 3）
