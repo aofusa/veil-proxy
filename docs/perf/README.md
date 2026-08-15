@@ -497,6 +497,38 @@ kTLS 無効 HTTP/1.1 の静的配信を `[static_file_cache]` の対象に追加
 どの接続にも毎パス実際に仕事があり **ダーティ集合 = 全接続が正しい状態**＝
 削れる無駄がそもそも無いためである。
 
+## F-153: 静的配信のパス解決（2026-08-15）
+
+「h2c 平文が対 nginx 0.65」という残件を調査した結果、**h2c 固有の問題ではなく
+静的配信のリクエスト単価**が原因だった（h2c は TLS の暗号コストが無いぶん固定費が
+そのまま露出する。同じ経路を HTTP/1.1・HTTP/2・HTTP/3 も通る）。
+
+`strace` で **1 リクエストあたり `readlink` 7 回・全件エラー**を検出。
+`canonicalize()` がパスの全コンポーネントに `readlink` していた。
+解決を「canonicalize してから含有チェック」から
+「静的ルート dirfd 相対 open + カーネルの `RESOLVE_BENEATH` 封じ込め」へ置き換えた
+（Linux は `openat2(2)`、FreeBSD は `O_RESOLVE_BENEATH`）。
+検査と open が原子的になるため **TOCTOU の窓も消えている**（セキュリティも向上）。
+
+| プラットフォーム | パス解決 syscall（1 リクエストあたり） | h2c スループット |
+|---|---|---|
+| Linux（glibc） | `readlink` **7 回 → 0 回** | 中央値 7,820 → **9,132（+17%）**、対 nginx 0.69 → 0.81 |
+| FreeBSD | `__realpathat` **1 回 → 0 回** | ほぼ変化なし（対 nginx 0.65 → 0.68） |
+
+### 教訓: `canonicalize()` のコストは libc 実装依存で桁が違う
+
+**Linux（glibc）は `realpath` をユーザ空間で実装しパスの全コンポーネントに `readlink` する**
+のに対し、**FreeBSD は `__realpathat` という単一 syscall** で済ませる。
+同じ Rust の `Path::canonicalize()` でも**コストが 7 倍違った**。
+「同じ API だから同じコスト」と考えず、**プラットフォームごとに syscall を数えること**。
+
+### FreeBSD の h2c ギャップは別原因（未解決）
+
+FreeBSD では本改修が正しく効いている（`__realpathat` が 0 回になった）にもかかわらず
+対 nginx 0.68 のままであり、**ギャップの主因はパス解決ではない**ことが確定した。
+残る候補は 1 リクエストあたり `write` 2 回・`read` 約 4.7 回・offload 往復。
+→ B-65 として別途調査する。
+
 ## 教訓（計測方針に反映済み）
 
 - **コンテナ（veth/bridge）では kTLS が不利**。feat 系構成は kTLS 既定オフ。

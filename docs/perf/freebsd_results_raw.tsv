@@ -106,3 +106,23 @@ h3_file	nginx	2	615.27	256.19	1611.510	10924.400	0
 h3_file	veil	2	594.86	247.69	2303.770	7939.190	0
 h3_file	nginx	3	389.68	162.26	1456.170	14038.560	0
 h3_file	veil	3	595.31	247.88	1932.850	8937.790	0
+
+# ==== 2026-08-15 F-153 後 FreeBSD 14.3 amd64 (QEMU/KVM)、3B（-p /small.html）====
+h2c_file_plain  nginx   1     14391.74  13.76  0.000   0.000    0
+h2c_file_plain  veil    1     10009.21  2.45   0.000   0.000    0
+h2_file_tls     nginx   1     11804.25  11.28  0.000   0.000    0
+h2_file_tls     veil    1     10968.54  2.68   0.000   0.000    0
+h1_file_tls     nginx   1     10380.87  18.80  5.500   53.170   0
+h1_file_tls     veil    1     6310.15   5.39   8.880   49.020   0
+h2c_file_plain  nginx   2     14773.29  14.08  0.000   0.000    0
+h2c_file_plain  veil    2     9782.08   2.39   0.000   0.000    0
+h2_file_tls     nginx   2     11877.80  11.36  0.000   0.000    0
+h2_file_tls     veil    2     10306.65  2.52   0.000   0.000    0
+h1_file_tls     nginx   2     9637.12   17.44  5.690   135.940  0
+h1_file_tls     veil    2     6324.82   5.41   8.750   64.770   0
+h2c_file_plain  nginx   3     17556.49  16.72  0.000   0.000    0
+h2c_file_plain  veil    3     10327.60  2.52   0.000   0.000    0
+h2_file_tls     nginx   3     13446.74  12.80  0.000   0.000    0
+h2_file_tls     veil    3     10047.33  2.46   0.000   0.000    0
+h1_file_tls     nginx   3     10601.67  19.20  5.050   64.460   0
+h1_file_tls     veil    3     6328.38   5.41   8.950   78.350   0
