@@ -19,6 +19,8 @@ tests/fixtures/backend2/*
 !tests/fixtures/backend2/.gitkeep
 tests/fixtures/backend_h2c/*
 !tests/fixtures/backend_h2c/.gitkeep
+# F-150 E2E の生成フィクスチャ（e2e_setup.sh が dd で作る 40000 バイトのファイル）
+tests/fixtures/f150_cache/*
 
 # WASM ビルドアーティファクト
 # サンプルフィルタのビルド成果物
