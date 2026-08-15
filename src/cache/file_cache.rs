@@ -209,14 +209,52 @@ impl OpenFileCache {
 
     /// ファイル情報を直接フェッチ（キャッシュをバイパス、F-29 で完全非同期化）
     ///
-    /// `canonicalize`（シンボリックリンク解決を含む）と `metadata` は同期 syscall であり、特に
-    /// `canonicalize` は io_uring 非対応。ブロッキングオフロード（`runtime::offload`）で専用
-    /// ワーカースレッドへ退避し、**イベントループをブロックしない**。MIME 推測も同所で実行する。
+    /// F-153: `canonicalize`（シンボリックリンク解決を含む）はパスの全コンポーネントに
+    /// `readlink(2)` を発行する重い同期 syscall（実測で 1 リクエストあたり 7 回、全件
+    /// エラー）。静的ルートが `cache::resolve::register_static_roots` で登録済みの場合は
+    /// `resolve::open_beneath_for_request` によるカーネル封じ込め（Linux: `openat2`
+    /// `RESOLVE_BENEATH`、FreeBSD: F-123 の `capsicum` `O_RESOLVE_BENEATH`）で置き換え、
+    /// `readlink` をゼロにする。登録されていない場合・本プラットフォーム未対応の場合は
+    /// 従来どおり `canonicalize()` + `metadata()` へフォールバックする（防御水準は変わらない）。
+    ///
+    /// いずれの経路も同期 syscall であり io_uring 非対応のため、ブロッキングオフロード
+    /// （`runtime::offload`）で専用ワーカースレッドへ退避し、**イベントループをブロックしない**。
+    /// MIME 推測も同所で実行する。
     // 理由付き allow: 同期 FS は offload 閉包内（専用ワーカースレッド）で実行され、イベントループを塞がない。
     #[allow(clippy::disallowed_methods)]
     pub(crate) async fn fetch_file_info(&self, path: &Path) -> Option<CachedFileInfo> {
         let path = path.to_path_buf();
         crate::runtime::offload::offload(move || {
+            // F-153: カーネル封じ込め（openat2/capsicum）による解決を優先する。
+            //
+            // `canonical_path` の互換性について: このパスは open_beneath_for_request が
+            // 既にカーネルに封じ込めを保証させた**登録済みルート配下の生パス**（開き直し
+            // 不要）であり、`cache::sendfile_base_contains` の呼び出し側は `canonical_base`
+            // と `base_path` のどちらを渡しても、`full_path` は常に `base_path` の join で
+            // 構築されるため比較は必ず真になる（F-123 の capsicum 経路が採用しているのと
+            // 同じ設計。`security::capsicum::static_serving_active()` 有効時と同じ結論に
+            // 帰着し、含有チェックが冗長になる点も同一）。
+            if let Some(res) = crate::cache::resolve::open_beneath_for_request(&path) {
+                return match res {
+                    Ok((_file, meta)) => {
+                        let mime_type = mime_guess::from_path(&path)
+                            .first_or_octet_stream()
+                            .to_string();
+                        Some(CachedFileInfo {
+                            canonical_path: path,
+                            file_size: meta.len(),
+                            mime_type,
+                            last_modified: meta.modified().ok(),
+                            is_file: meta.is_file(),
+                            cached_at: Instant::now(),
+                        })
+                    }
+                    // 登録済みルート配下と判定された上での失敗（404 相当）。ここで
+                    // canonicalize フォールバックへ二重に緩く倒すとフェイルオープンの
+                    // 入り口になるため、素直に None（未検出）で返す。
+                    Err(_) => None,
+                };
+            }
             // F-123: FreeBSD capability mode 下では canonicalize（絶対パス realpath）が
             // 禁止されるため、登録済みルート dirfd 相対の fstatat で代替する
             // （O_RESOLVE_BENEATH が封じ込めを担保。canonical_path は原パスのまま）。
@@ -235,7 +273,7 @@ impl OpenFileCache {
                     cached_at: Instant::now(),
                 });
             }
-            // パスを正規化（シンボリックリンク解決・パストラバーサル防止）
+            // フォールバック: パスを正規化（シンボリックリンク解決・パストラバーサル防止）
             let canonical = path.canonicalize().ok()?;
             // メタデータを取得
             let metadata = std::fs::metadata(&canonical).ok()?;

@@ -142,6 +142,26 @@ pub fn run() {
         }
     };
 
+    // F-153: 静的配信のパス解決をカーネル封じ込め（Linux: openat2 RESOLVE_BENEATH、
+    // FreeBSD: F-123 の capsicum O_RESOLVE_BENEATH）へ切り替えるため、File ルートの
+    // ルートディレクトリを設定ロード直後（**FreeBSD の `cap_enter`・OpenBSD の
+    // `unveil` ロックより前**）に登録する。絶対パス open/canonicalize がまだ許可されて
+    // いるうちに行う必要があるため、この位置（他の OS 別セキュリティ機構より前）で
+    // 1 回だけ呼ぶ。FreeBSD の capability mode（`cap_enter`）はこの後さらに listener
+    // の bind 完了を待ってから発動するため、ここで先に登録しておいても順序は安全
+    // （登録 → listener bind → cap_enter の順が常に保たれる）。
+    // 登録に失敗しても静的配信自体は canonicalize フォールバックで動作し続けるため、
+    // 起動を中断しない（`register_static_roots` 内で警告ログのみ出す）。
+    let static_roots: Vec<std::path::PathBuf> = loaded_config
+        .route
+        .iter()
+        .filter_map(|r| match &r.action {
+            crate::config::BackendConfig::File { path, .. } => Some(std::path::PathBuf::from(path)),
+            _ => None,
+        })
+        .collect();
+    crate::cache::resolve::register_static_roots(&static_roots);
+
     // FreeBSD: jail_name が設定されていれば起動最初期に jail_attach する（F-120 Phase 4）。
     // root 前提・失敗は明確なエラーで起動中止する（サンドボックス/権限降格より前に行う:
     // jail 内へ移った後でこそ以降のセキュリティ処理が正しいコンテキストで動く）。
@@ -943,19 +963,12 @@ pub fn run() {
         if capsicum_capability_mode_requested {
             let listeners_ready = std::sync::Arc::clone(&listeners_ready);
             let expected = num_threads;
-            // F-123: capability mode 下でも静的配信を動作させるため、File ルートの
-            // ルートディレクトリ fd を **cap_enter 前** に開いて登録する。config の
-            // File アクションからルートパスを列挙（Landlock の read_only 列挙と同じ経路）。
-            let static_roots: Vec<std::path::PathBuf> = loaded_config
-                .route
-                .iter()
-                .filter_map(|r| match &r.action {
-                    crate::config::BackendConfig::File { path, .. } => {
-                        Some(std::path::PathBuf::from(path))
-                    }
-                    _ => None,
-                })
-                .collect();
+            // F-123/F-153: 静的ルート dirfd の登録は設定ロード直後（この関数の先頭付近、
+            // `cache::resolve::register_static_roots` 呼び出し）で **cap_enter よりずっと前**
+            // に完了済み（`capsicum::init_static_dirfds` 経由。canonicalize/絶対パス open が
+            // まだ許可されているタイミングで実行される）。ここで二重に登録し直すと
+            // `capsicum::STATIC_DIRS`（`OnceLock`）への 2 回目の `set` が黙って無視され、
+            // 1 回目に open した fd がリークするため、ここでは登録し直さない。
             // F-136: capability mode 下でも TLS 証明書ホットリロードを動作させるため、
             // cert/key の親ディレクトリ fd を **cap_enter 前** に登録する。auto_reload が
             // 無効なら TLS リロードスレッド自体が起動しないため登録は不要。
@@ -974,17 +987,8 @@ pub fn run() {
                             // すると、capability mode 下のスレッド生成がスタックガード設定
                             // 等で失敗し得る。cap_enter 前にプールを暖機しておく（F-123）。
                             crate::runtime::offload::warmup();
-                            // cap_enter 前に静的ルート dirfd を登録（絶対パス open/
-                            // canonicalize がまだ許可されているうちに）。
-                            if let Err(e) =
-                                crate::security::capsicum::init_static_dirfds(&static_roots)
-                            {
-                                error!(
-                                    "capsicum: 静的ルート dirfd 登録に失敗（capability mode 下で\
-                                     静的配信が 404 になる可能性）: {}",
-                                    e
-                                );
-                            }
+                            // F-153: 静的ルート dirfd は既に `register_static_roots`
+                            // （関数冒頭）で登録済み。
                             // F-136: TLS 証明書 dirfd の登録（auto_reload 有効時のみ）。
                             if tls_auto_reload {
                                 match crate::security::capsicum::init_tls_cert_dirfds(

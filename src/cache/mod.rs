@@ -39,6 +39,9 @@ mod config;
 mod entry;
 mod key;
 mod policy;
+// F-153: 静的配信のパス解決（canonicalize を使わないカーネル封じ込め）。
+// `cache` feature の有無どちらでも静的配信自体は成立させる必要があるため常時コンパイル。
+pub mod resolve;
 
 // DashMap依存モジュール（cache feature 有効時のみ）
 #[cfg(feature = "cache")]
@@ -296,6 +299,26 @@ pub fn get_file_cache() -> Option<std::sync::Arc<()>> {
 async fn fetch_file_info_uncached(path: &std::path::Path) -> Option<CachedFileInfo> {
     let path = path.to_path_buf();
     crate::runtime::offload::offload(move || {
+        // F-153: カーネル封じ込め（openat2、Linux 専用）による解決を優先する。
+        // `canonical_path` の互換性・フォールバック方針は `file_cache.rs::fetch_file_info`
+        // のコメント参照（`cache` feature 有無に関わらず同じ設計）。
+        if let Some(res) = crate::cache::resolve::open_beneath_for_request(&path) {
+            return match res {
+                Ok((_file, meta)) => {
+                    let mime_type = mime_guess::from_path(&path)
+                        .first_or_octet_stream()
+                        .to_string();
+                    Some(CachedFileInfo {
+                        canonical_path: path,
+                        file_size: meta.len(),
+                        mime_type,
+                        last_modified: meta.modified().ok(),
+                        is_file: meta.is_file(),
+                    })
+                }
+                Err(_) => None,
+            };
+        }
         // F-123: FreeBSD capability mode 下では canonicalize（絶対パス realpath）が
         // 禁止されるため、登録済みルート dirfd 相対の fstatat で代替する（O_RESOLVE_BENEATH
         // が封じ込めを担保。canonical_path は原パスのまま = 配信 open も同経路で相対化）。
