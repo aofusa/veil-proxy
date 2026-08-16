@@ -119,13 +119,16 @@ io_uring（独自実装ランタイム）と rustls を使用した高性能リ�
   C クロスコンパイラも無いため、`cargo check --target x86_64-unknown-netbsd` は
   `ring`/`boring` のネイティブビルドスクリプトの時点で失敗し veil 自身のコードへは
   到達できていない。
-  `x86_64-unknown-freebsd` 向けに `docker/Dockerfile.freebsd` を用意しているが
-  （zig が FreeBSD libc を同梱しており Rust Tier 2）、**現在リンク段で失敗する**。
-  aws-lc-sys の s2n-bignum アセンブリが FreeBSD クロス構成で 1 つも組み立てられず
-  `undefined symbol: curve25519_x25519_byte` などが多数出るため
-  （`docs/backlog/bugs/B-49-...`、未解決）。解決するまで FreeBSD は x86_64 / aarch64 とも
-  VM 内ネイティブビルドを使う。`aarch64-unknown-freebsd` は Rust Tier 3
-  （prebuilt std 無し）のため、いずれにせよ VM 内ビルド必須。
+  **FreeBSD には Docker クロスビルド経路が無い** — `docker/Dockerfile.freebsd` と
+  `build-cross.sh --target freebsd` はリンク段で失敗する（aws-lc-sys の s2n-bignum
+  アセンブリが FreeBSD クロス構成で 1 つも組み立てられず
+  `undefined symbol: curve25519_x25519_byte` などが多数出る、
+  `docs/backlog/bugs/B-49-...` 未解決）ため削除した（チケットに削除の経緯を記録）。
+  **QEMU VM 内ネイティブビルドが FreeBSD の唯一の公式経路**であり、x86_64 /
+  aarch64 とも同じ手順を使う（`aarch64-unknown-freebsd` はさらに Rust Tier 3 で
+  prebuilt std が無いため、そもそも Docker を使えない）:
+  `tools/qemu/bsd-vm.sh freebsd <arch> build` → `fetch` →
+  `packaging/scripts/build-bsd.sh --os freebsd --arch <arch> --binary <パス>`。
 - **FreeBSD POSIX AIO（`--features aio`、F-127）**: ビルド時オプトイン切替。**推奨しない**（FreeBSD 専用。
   他ターゲットで指定すると `epoll` と同様 build.rs がエラーにする）。既定の kqueue
   readiness 経路の代わりに `TcpStream::read`/`write` を `aio_read(2)`/`aio_write(2)` の

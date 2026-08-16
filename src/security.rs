@@ -170,6 +170,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     79, // getcwd (canonicalize() で使用)
     89, // readlink (canonicalize() で使用)
     257, // openat
+    437, // openat2 (RESOLVE_BENEATH 静的配信封じ込め、F-153。ENOSYS/EPERM 時は canonicalize フォールバックへ自動的に落ちる)
     262, // newfstatat
     269, // faccessat (新しめの libc がファイルアクセス確認で使用)
     275, // splice (kTLS ゼロコピー転送)
@@ -311,6 +312,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     79, // getcwd (canonicalize() で使用)
     89, // readlink (canonicalize() で使用)
     257, // openat
+    437, // openat2 (RESOLVE_BENEATH 静的配信封じ込め、F-153。ENOSYS/EPERM 時は canonicalize フォールバックへ自動的に落ちる)
     262, // newfstatat
     269, // faccessat (新しめの libc がファイルアクセス確認で使用)
     275, // splice (kTLS ゼロコピー転送、reactor の非ブロッキング splice(2) 転送)
@@ -443,6 +445,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     17,  // getcwd (canonicalize() で使用)
     48,  // faccessat (DNS解決: ファイルアクセス権確認)
     56,  // openat
+    437, // openat2 (RESOLVE_BENEATH 静的配信封じ込め、F-153。ENOSYS/EPERM 時は canonicalize フォールバックへ自動的に落ちる)
     57,  // close
     62,  // lseek
     63,  // read
@@ -576,6 +579,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     17,  // getcwd (canonicalize() で使用)
     48,  // faccessat (DNS解決: ファイルアクセス権確認)
     56,  // openat
+    437, // openat2 (RESOLVE_BENEATH 静的配信封じ込め、F-153。ENOSYS/EPERM 時は canonicalize フォールバックへ自動的に落ちる)
     57,  // close
     62,  // lseek
     63,  // read
@@ -2648,6 +2652,25 @@ pub mod capsicum {
         None
     }
 
+    /// `open_static_ro`/`stat_static` が実際に登録済みルートへ相対化できるかどうかを
+    /// **syscall を一切発行せず** 事前判定する（B-65）。
+    ///
+    /// 静的配信のメタデータ+本体を 1 回の offload で取得する複合 API
+    /// （`cache::get_static_file_with_content`）が「1 回の offload で済む高速経路」かを、
+    /// offload を起動する **前**に決めるために使う（`resolve::has_fast_path` の
+    /// FreeBSD 版）。
+    /// `resolve_root` と異なり `CString` を確保しない（判定専用・ホットパスで
+    /// アロケーションを増やさないため）。
+    pub fn is_registered_static_root(abs: &Path) -> bool {
+        if !static_serving_active() {
+            return false;
+        }
+        match STATIC_DIRS.get() {
+            Some(dirs) => dirs.iter().any(|(root, _)| abs.strip_prefix(root).is_ok()),
+            None => false,
+        }
+    }
+
     /// capability mode 下でルート dirfd 相対に読み取り専用 open する。
     /// `None` = 相対化対象外（通常の絶対パス open にフォールバック）。
     /// `Some(Err)` = 相対化対象だが openat 失敗（404 相当）。
@@ -3734,6 +3757,13 @@ mod tests {
             ALLOWED_SYSCALLS.contains(&439),
             "faccessat2 (439) が許可リストに無いと静的配信が 404 になる"
         );
+        // openat2 (437) は F-153 の RESOLVE_BENEATH 封じ込め静的配信で使用される。
+        // 未許可だと ENOSYS/EPERM 相当でフォールバックし続け、B-13 と同じ失敗モード
+        // （静的配信が全部 404）にはならないが、性能改善が全く効かなくなる回帰を防ぐ。
+        assert!(
+            ALLOWED_SYSCALLS.contains(&437),
+            "openat2 (437) が許可リストに無いと F-153 の RESOLVE_BENEATH 経路が常にフォールバックする"
+        );
         // 従来の access/faccessat 系も許可されていること
         #[cfg(target_arch = "x86_64")]
         {
@@ -3750,6 +3780,7 @@ mod tests {
         #[cfg(target_arch = "aarch64")]
         {
             assert!(ALLOWED_SYSCALLS.contains(&48)); // faccessat
+            assert!(ALLOWED_SYSCALLS.contains(&56)); // openat
         }
     }
 

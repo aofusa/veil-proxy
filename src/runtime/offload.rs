@@ -277,6 +277,36 @@ unsafe fn signal_notify(write_fd: RawFd) {
     );
 }
 
+// テスト専用: `offload()` の呼び出し回数を数えるフック（B-65）。
+//
+// 「両キャッシュヒット時に offload を 1 回も呼ばない」ことを単体テストで直接
+// 検証するために使う。
+//
+// **スレッドローカルにすること**（グローバルにしてはならない）。`cargo test` は
+// テストを並列実行するため、グローバルカウンタだと**無関係なテストの offload まで
+// 数えてしまい、単体では通るのに全体実行でだけ落ちる**という偽陽性になる
+// （実際にそれで 2 度落とした）。カウント対象のテストは `block_on_fresh_thread` で
+// 専用スレッドを立てて実行するため、スレッドローカルなら他テストと干渉しない。
+//
+// 同期/非同期どちらの実行経路でも `offload()` に入った時点で必ずインクリメントする。
+#[cfg(test)]
+thread_local! {
+    /// テスト専用: `offload()` 呼び出し回数（呼び出しスレッド単位）。
+    pub(crate) static OFFLOAD_CALL_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// テスト専用: 呼び出し回数カウンタ（呼び出しスレッド単位）をリセットする。
+#[cfg(test)]
+pub(crate) fn reset_offload_call_count() {
+    OFFLOAD_CALL_COUNT.with(|c| c.set(0));
+}
+
+/// テスト専用: 現在の呼び出し回数（呼び出しスレッド単位）を取得する。
+#[cfg(test)]
+pub(crate) fn offload_call_count() -> u64 {
+    OFFLOAD_CALL_COUNT.with(|c| c.get())
+}
+
 /// ブロッキングなクロージャ `f` を専用スレッドで実行し、結果を非同期に受け取る。
 ///
 /// ドライバのあるワーカースレッドでは eventfd で待機して**イベントループをブロックしない**。
@@ -286,6 +316,9 @@ where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
+    #[cfg(test)]
+    OFFLOAD_CALL_COUNT.with(|c| c.set(c.get() + 1));
+
     let (read_fd, write_fd) = match current_thread_notify_fds() {
         Some(fds) => fds,
         // ドライバ無し: 同期実行（このパスは単体テスト等のみ）

@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
 # veil クロスプラットフォームバイナリ tar.gz/zip パッケージング（F-125）
 #
-# 専用 Dockerfile（docker/Dockerfile.{macos,windows,freebsd}）でクロスビルドし、
+# 専用 Dockerfile（docker/Dockerfile.{macos,windows}）でクロスビルドし、
 # 単体バイナリ tar.gz/zip を packaging/output/ へ出力する。
 #
 #   macos    universal2-apple-darwin（x86_64 + aarch64 fat binary） / cargo-zigbuild
 #   windows  x86_64-pc-windows-msvc + aarch64-pc-windows-msvc      / cargo-xwin
-#   freebsd  x86_64-unknown-freebsd                                 / cargo-zigbuild
-#            ※ B-49 により**現在ビルドが通らない**（aws-lc-sys の s2n-bignum asm が
-#              FreeBSD クロスで組み立てられずリンクに失敗する）。FreeBSD は
-#              tools/qemu/bsd-vm.sh の VM 内ネイティブビルドを使うこと。
 #
-# BSD 向けは `full` ではなく `full-freebsd`（jemalloc）を既定にする。
-# OpenBSD（VM ネイティブビルド、tools/qemu/bsd-vm.sh）は `full-openbsd`
-# （システムアロケータ + 同梱 rustls(ring)/quiche(BoringSSL)）を使う。
+# FreeBSD の Docker クロスビルドは B-49（aws-lc-sys の s2n-bignum asm が FreeBSD
+# クロス構成で組み立てられずリンクに失敗する、未解決）により削除した
+# （`docker/Dockerfile.freebsd` は撤去済み）。FreeBSD は
+# QEMU VM 内ネイティブビルドが唯一の公式経路: `--target freebsd` を指定すると
+# 案内を表示して終了する（下記 build_freebsd_unsupported 参照）。
+#
+# BSD 向けは `full` ではなく `full-freebsd`（jemalloc）を既定にする
+# （tools/qemu/bsd-vm.sh freebsd <arch> build が使う）。OpenBSD（同じく VM
+# ネイティブビルド）は `full-openbsd`（システムアロケータ + 同梱
+# rustls(ring)/quiche(BoringSSL)）を使う。
 #
 # 各 Dockerfile は Dockerfile.glibc と同じ cacher/builder 2 段構成のため、
 # ソース変更だけの再ビルドでは aws-lc-sys / boring-sys（quiche 内蔵 BoringSSL）の
@@ -21,15 +24,10 @@
 #
 # macOS / Windows は QEMU 実行・実機検証を本スクリプトでは行わない
 # （クロスビルドが通ることのみを検証する。docs/artifacts/f125_windows_macos_design.md）。
-# FreeBSD は x86_64 / aarch64 とも QEMU VM 内ネイティブビルドが公式経路:
-#   tools/qemu/bsd-vm.sh freebsd <arch> build → e2e → fetch
-# （B-49 が解決すれば x86_64 は Docker クロスビルド + VM で E2E だけ、にできる:
-#   tools/qemu/bsd-vm.sh freebsd x86_64 e2e --prebuilt <クロスビルドした veil>）
 #
 # 使い方:
 #   ./packaging/scripts/build-cross.sh --target macos
 #   ./packaging/scripts/build-cross.sh --target windows
-#   ./packaging/scripts/build-cross.sh --target freebsd
 #
 # 環境変数:
 #   CARGO_FEATURES  ビルドする feature セット（デフォルト: "full"（http3, wasm 含む全機能））
@@ -50,42 +48,58 @@ DEFAULT_MACOS_FEATURES="full"
 # Windows クロスビルドデフォルト feature セット（full: http3, wasm 含む全機能）。
 DEFAULT_WINDOWS_FEATURES="full"
 
-# FreeBSD クロスビルドのデフォルト feature セット（**アーキ非依存**: x86_64 / aarch64 とも
-# 同じ `full-freebsd` を使う。旧 `full-freebsd-aarch64` は内容が同一だったため廃止した）。
-# `full` と機能セットは同じで、**アロケータを jemalloc**（mimalloc ではなく）にした
-# BSD 向けセット（Cargo.toml の `full-freebsd`）。
-# POSIX AIO 経路（F-127、`aio` feature）は **含まない**: readiness 経路より遅く、
-# HTTP/2 の小レスポンス高並行でサーバが停止するため既定から除外した（B-63）。
-# TLS 暗号・quiche とも aws-lc-sys を共有する（AWS_LC_SYS_NO_PREFIX=1）。
-DEFAULT_FREEBSD_FEATURES="full-freebsd"
-
 TARGET_OS=""
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") --target <macos|windows|freebsd>
+Usage: $(basename "$0") --target <macos|windows>
 
 Build a standalone veil binary tarball/zip for a cross-compiled non-Linux
 target using the dedicated, layer-cached Dockerfiles under docker/:
   macos    universal2-apple-darwin        (docker/Dockerfile.macos)
   windows  {x86_64,aarch64}-pc-windows-msvc (docker/Dockerfile.windows)
-  freebsd  x86_64-unknown-freebsd         (docker/Dockerfile.freebsd)
+
+FreeBSD is NOT supported here (B-49: Docker cross build fails at link time
+because aws-lc-sys assembles none of its s2n-bignum .S files under a
+FreeBSD cross configuration). Pass --target freebsd to see the QEMU VM
+native-build instructions.
 
 Options:
-  --target TARGET   Cross-build target: macos | windows | freebsd (required)
+  --target TARGET   Cross-build target: macos | windows (required)
   -h, --help        Show this help
 
 Environment:
   CARGO_FEATURES    Cargo features to build with
                      (default: "${DEFAULT_MACOS_FEATURES}" for macos,
-                      "${DEFAULT_WINDOWS_FEATURES}" for windows,
-                      "${DEFAULT_FREEBSD_FEATURES}" for freebsd)
+                      "${DEFAULT_WINDOWS_FEATURES}" for windows)
 
 Output:
   packaging/output/veil-\${VERSION}-universal2-apple-darwin.tar.gz
   packaging/output/veil-\${VERSION}-{x86_64,aarch64}-pc-windows-msvc.zip
-  packaging/output/veil-\${VERSION}-x86_64-unknown-freebsd.tar.gz
 EOF
+}
+
+# FreeBSD の Docker クロスビルドは B-49（未解決）で削除済み。案内を表示して
+# 非ゼロで終了する（黙って「不正な値」と言うだけにしない）。
+build_freebsd_unsupported() {
+    cat >&2 <<'EOF'
+ERROR: FreeBSD の Docker クロスビルドは削除されました（B-49、未解決）。
+
+  aws-lc-sys の s2n-bignum アセンブリが FreeBSD クロス構成で 1 つも
+  組み立てられず、リンク段で `undefined symbol: curve25519_x25519_byte`
+  などが多数発生するため、動かない経路として docker/Dockerfile.freebsd と
+  この --target freebsd を撤去しました。詳細:
+    docs/backlog/bugs/B-49-awslc-freebsd-cross-missing-s2n-bignum-asm.md
+
+FreeBSD は QEMU VM 内ネイティブビルドが唯一の公式経路です:
+
+  tools/qemu/bsd-vm.sh freebsd <arch> build   # <arch> = x86_64 | aarch64
+  tools/qemu/bsd-vm.sh freebsd <arch> fetch   # → packaging/build/veil-freebsd-<arch>
+  packaging/scripts/build-bsd.sh --os freebsd --arch <arch> --binary <上記のパス>
+
+（`tools/qemu/bsd-vm.sh freebsd <arch> all` で setup〜fetch を一括実行できます）
+EOF
+    exit 1
 }
 
 while [[ $# -gt 0 ]]; do
@@ -96,8 +110,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "${TARGET_OS}" != "macos" && "${TARGET_OS}" != "windows" && "${TARGET_OS}" != "freebsd" ]]; then
-    echo "ERROR: --target must be 'macos', 'windows' or 'freebsd'" >&2
+if [[ "${TARGET_OS}" == "freebsd" ]]; then
+    build_freebsd_unsupported
+fi
+
+if [[ "${TARGET_OS}" != "macos" && "${TARGET_OS}" != "windows" ]]; then
+    echo "ERROR: --target must be 'macos' or 'windows'" >&2
     usage >&2
     exit 1
 fi
@@ -271,94 +289,7 @@ build_windows() {
     _build_one_windows aarch64-pc-windows-msvc
 }
 
-# FreeBSD x86_64（x86_64-unknown-freebsd）を Docker クロスビルドして tar.gz 化する。
-# Zig が FreeBSD の libc を同梱しており、かつ x86_64-unknown-freebsd は Rust Tier 2 で
-# prebuilt std があるため Docker だけで完結する（aarch64 は Tier 3 のため QEMU ネイティブ）。
-# 生成物は tools/qemu/bsd-vm.sh の `e2e --prebuilt` で実 FreeBSD 上の E2E に掛けられる。
-build_freebsd() {
-    cat >&2 <<'WARN'
-!! WARNING: FreeBSD の Docker クロスビルドは現在ビルドが通りません（B-49、未解決）。
-!!   aws-lc-sys の s2n-bignum アセンブリが FreeBSD クロス構成で組み立てられず、
-!!   リンク段で `undefined symbol: curve25519_x25519_byte` などが多数発生します。
-!!   詳細と試行済みの回避策:
-!!     docs/backlog/bugs/B-49-awslc-freebsd-cross-missing-s2n-bignum-asm.md
-!!
-!! FreeBSD の公式なビルド経路は QEMU VM 内のネイティブビルドです:
-!!   tools/qemu/bsd-vm.sh freebsd x86_64 build   # amd64
-!!   tools/qemu/bsd-vm.sh freebsd aarch64 build  # arm64（Rust Tier 3 のため VM 必須）
-!!   tools/qemu/bsd-vm.sh freebsd <arch> fetch   # → packaging/build/veil-freebsd-<arch>
-!!   ./packaging/scripts/build-bsd.sh --os freebsd --arch <arch> --binary <上記>
-!!
-!! それでも続行する場合は 5 秒後に開始します（Ctrl-C で中断）。
-WARN
-    sleep 5
-
-    local features="${CARGO_FEATURES:-${DEFAULT_FREEBSD_FEATURES}}"
-    local rust_target="x86_64-unknown-freebsd"
-    local archive_name="veil-${VERSION}-${rust_target}.tar.gz"
-
-    echo "==> Building veil binary for ${rust_target} via docker/Dockerfile.freebsd"
-    echo "==> Features: ${features}"
-
-    # AWS_LC_SYS_NO_PREFIX は .cargo/config.toml の [env] が唯一の設定箇所（FreeBSD は "1"）。
-    local artifact_dir="${BUILD_DIR}/artifact-${rust_target}"
-    _build_artifact "${ROOT}/docker/Dockerfile.freebsd" "${rust_target}" \
-        "${features}" "${artifact_dir}" veil
-
-    local binary_path="${artifact_dir}/veil"
-    if [[ ! -f "${binary_path}" ]]; then
-        echo "ERROR: expected binary not found: ${binary_path}" >&2
-        exit 1
-    fi
-
-    if command -v file >/dev/null 2>&1; then
-        echo "==> file(1) output for ${binary_path}:"
-        file "${binary_path}" || true
-    fi
-
-    mkdir -p "${OUTPUT_DIR}"
-    local stage_parent="${BUILD_DIR}/tarball-${rust_target}"
-    local dir_name="veil-${VERSION}-${rust_target}"
-    rm -rf "${stage_parent}"
-    mkdir -p "${stage_parent}/${dir_name}/www"
-
-    install -m 0755 "${binary_path}" "${stage_parent}/${dir_name}/veil"
-    install -m 0644 "${ROOT}/contrib/config/config.toml" "${stage_parent}/${dir_name}/config.toml.default"
-    install -m 0644 "${ROOT}/docker/assets/www/index.html" "${stage_parent}/${dir_name}/www/index.html"
-    install -m 0755 "${ROOT}/packaging/bsd/freebsd/veil.rc" "${stage_parent}/${dir_name}/veil.rc"
-    install -m 0644 "${ROOT}/packaging/bsd/freebsd/jail.conf.sample" "${stage_parent}/${dir_name}/jail.conf.sample"
-
-    cat > "${stage_parent}/${dir_name}/INSTALL.txt" <<EOF
-veil ${VERSION} — ${rust_target}
-
-FreeBSD amd64 バイナリ（Docker + cargo-zigbuild クロスビルド）。
-動作確認は QEMU VM 上で行えます:
-
-  tools/qemu/bsd-vm.sh freebsd x86_64 e2e --prebuilt <この veil のパス>
-
-インストール手順:
-
-  install -m 0755 veil /usr/local/bin/veil
-  install -m 0755 veil.rc /usr/local/etc/rc.d/veil
-  mkdir -p /usr/local/etc/veil
-  cp config.toml.default /usr/local/etc/veil/config.toml
-  sysrc veil_enable=YES && service veil start
-
-FreeBSD ネイティブのセキュリティ:
-  capsicum（[security] enable_capsicum）・jail（jail.conf.sample 参照）。
-  kTLS（[tls] ktls_enabled）は TCP_TXTLS_ENABLE / TCP_RXTLS_ENABLE で対応。
-
-含まれる feature: ${features}
-（TLS 暗号は aws_lc_rs プロバイダ、HTTP/3 (quiche) も同じ aws-lc-sys を共有します）
-EOF
-
-    tar -C "${stage_parent}" -czf "${OUTPUT_DIR}/${archive_name}" "${dir_name}"
-    rm -rf "${stage_parent}"
-    echo "==> Created ${OUTPUT_DIR}/${archive_name}"
-}
-
 case "${TARGET_OS}" in
     macos) build_macos ;;
     windows) build_windows ;;
-    freebsd) build_freebsd ;;
 esac

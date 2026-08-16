@@ -644,6 +644,9 @@ struct SendFileRequest<'a> {
     security: &'a SecurityConfig,
     /// OpenFileCache 設定（ルーティングごとの上書き、F-146 で is_dir 判定にも使用）
     open_file_cache_config: Option<&'a cache::OpenFileCacheConfig>,
+    /// base_path の canonical 形（F-145、config ロード時に一度だけ解決）。
+    /// ディレクトリルートの per-route 封じ込め検査に使う（B-65 続き）。
+    canonical_base: Option<&'a Path>,
     /// 静的コンテンツキャッシュ設定（F-146、ルーティングごとの上書き）
     static_file_cache_config: Option<&'a cache::StaticContentCacheRouteConfig>,
     #[cfg(feature = "wasm")]
@@ -1776,7 +1779,7 @@ impl Http3Handler {
                 security,
                 _cache,
                 open_file_cache_config,
-                _canonical_base,
+                canonical_base,
                 static_file_cache_config,
                 _,
             ) => self
@@ -1789,6 +1792,7 @@ impl Http3Handler {
                     prefix: &prefix,
                     security: &security,
                     open_file_cache_config: open_file_cache_config.as_deref(),
+                    canonical_base: canonical_base.as_deref(),
                     static_file_cache_config: static_file_cache_config.as_deref(),
                     #[cfg(feature = "wasm")]
                     wasm_modules: wasm_modules_to_apply.as_ref(),
@@ -2403,6 +2407,7 @@ impl Http3Handler {
             prefix,
             security,
             open_file_cache_config,
+            canonical_base,
             static_file_cache_config,
             #[cfg(feature = "wasm")]
             wasm_modules,
@@ -2441,65 +2446,74 @@ impl Http3Handler {
             base_path.to_path_buf()
         };
 
-        // F-146: 従来はここで `p.is_dir()`（同期ブロッキング stat）をイベントループ上で
-        // 直接呼んでおり、ホットパス絶対規則（同期 I/O 禁止）に反していた。
-        // HTTP/1.1・HTTP/2 と同じ非同期 OpenFileCache 経由の解決に置き換える
-        // （キャッシュ無効時も内部でオフロード経由の非同期 stat にフォールバックする）。
-        let file_info =
-            match cache::get_file_info_with_config(&full_path, open_file_cache_config).await {
-                Some(info) => info,
-                None => {
-                    self.send_error_response(stream_id, 404, b"Not Found")?;
-                    return Ok((404, 9));
-                }
-            };
+        // B-65（続き）: 従来は「メタデータ解決（offload 1）→ …index 解決…→ 本体読み込み
+        // （offload 2）」で 1 リクエストあたり offload のクロススレッド往復が 2 回
+        // 発生していた（`docs/backlog/bugs/B-65-freebsd-h2c-request-cost.md`）。
+        // 当初の改修は `is_dir == false`（固定ファイルルート）でしか高速経路が使われず、
+        // 実運用で一般的なディレクトリルートでは改善していなかった。
+        //
+        // `is_dir` の true/false に関わらずまず `get_static_file_with_content` を 1 回
+        // 呼ぶ（両キャッシュヒット時は offload ゼロ）。ディレクトリルートの場合のみ
+        // `containment` に「このルート自身の」`base_path` を渡し、高速経路（Linux）は
+        // その `base_path` の dirfd に対してのみ open する（F-154:
+        // `resolve::open_beneath_in_root`）ため、これ自体が per-route の封じ込めになり、
+        // `readlink` 等の事後検査は不要（`cache::static_file` モジュール doc 参照）。
+        // h1/h2 と同一方針。
+        let content_cfg = cache::effective_static_content_cache_config(static_file_cache_config);
+        let containment = is_dir.then_some(cache::RouteContainment {
+            root: base_path,
+            canonical_base,
+        });
+        let first_result = cache::get_static_file_with_content(
+            &full_path,
+            open_file_cache_config,
+            &content_cfg,
+            containment,
+        )
+        .await;
 
-        // ディレクトリの場合はインデックスファイルを解決する（h1/h2 と同一ロジック）。
-        let (final_path, resolved_mime): (std::path::PathBuf, String) = if !file_info.is_file {
-            let filename = index_file.unwrap_or("index.html");
-            let index_path = file_info.canonical_path.join(filename);
-            match cache::get_file_info_with_config(&index_path, open_file_cache_config).await {
-                Some(idx_info) if idx_info.is_file => {
-                    (idx_info.canonical_path.clone(), idx_info.mime_type.clone())
-                }
-                _ => {
-                    self.send_error_response(stream_id, 403, b"Forbidden")?;
-                    return Ok((403, 9));
+        let (data, mime_owned): (bytes::Bytes, String) = match first_result {
+            Some(cache::StaticFileOutcome::File(info, data)) => (data, info.mime_type),
+            Some(cache::StaticFileOutcome::Forbidden) => {
+                self.send_error_response(stream_id, 403, b"Forbidden")?;
+                return Ok((403, 9));
+            }
+            Some(cache::StaticFileOutcome::Directory(file_info)) => {
+                // ディレクトリの場合はインデックスファイルを解決してからもう一度呼ぶ
+                // （h1/h2 と同一ロジック。封じ込め検査は既に上で通過済みのため index
+                // パスにも同じ containment を渡す）。
+                let filename = index_file.unwrap_or("index.html");
+                let index_path = file_info.canonical_path.join(filename);
+                match cache::get_static_file_with_content(
+                    &index_path,
+                    open_file_cache_config,
+                    &content_cfg,
+                    containment,
+                )
+                .await
+                {
+                    Some(cache::StaticFileOutcome::File(info, data)) => (data, info.mime_type),
+                    Some(cache::StaticFileOutcome::Forbidden) | None => {
+                        self.send_error_response(stream_id, 403, b"Forbidden")?;
+                        return Ok((403, 9));
+                    }
+                    Some(cache::StaticFileOutcome::Directory(_)) => {
+                        // index ファイル自体がさらにディレクトリ（通常起こり得ないが、
+                        // 安全側に倒して 403 とする）。
+                        self.send_error_response(stream_id, 403, b"Forbidden")?;
+                        return Ok((403, 9));
+                    }
                 }
             }
-        } else {
-            (
-                file_info.canonical_path.clone(),
-                file_info.mime_type.clone(),
-            )
+            None => {
+                // ファイルが開けない場合はキャッシュを無効化（HTTP/1.1・HTTP/2 と同様）。
+                cache::invalidate_file_cache(&full_path);
+                cache::invalidate_content_cache(&full_path);
+                self.send_error_response(stream_id, 404, b"Not Found")?;
+                return Ok((404, 9));
+            }
         };
-
-        // F-146: ファイル本体をキャッシュ優先で取得する。HTTP/3 は QUIC ストリームへの
-        // 再フレーミングが必須で sendfile(2) を使えないため、HTTP/2 と同じくユーザ空間
-        // メモリ（`bytes::Bytes`）に保持し参照カウントクローンで配信する
-        // （キャッシュ無効・上限超過時は内部で offload 読み込みへフォールバックする）。
-        // MIME タイプは OpenFileCache 側で既に解決済みのため、コンテンツキャッシュの
-        // ミス時フォールバックとして渡し `mime_guess` の再計算を避ける
-        // （ヒット時はコンテンツキャッシュ内に保存済みの MIME をそのまま再利用する）。
-        let content_cfg = cache::effective_static_content_cache_config(static_file_cache_config);
-        // `Arc<str>` の確保はクロージャの**中**で行う（外で作るとキャッシュヒット時にも
-        // 1 リクエストあたり確保が発生する。クロージャはミス時にしか呼ばれない）。
-        let (data, mime_arc) =
-            match cache::get_or_load_content_cache_with_mime(&final_path, &content_cfg, move || {
-                Arc::from(resolved_mime.as_str())
-            })
-            .await
-            {
-                Some(result) => result,
-                None => {
-                    // ファイルが開けない場合はキャッシュを無効化（HTTP/1.1・HTTP/2 と同様）。
-                    cache::invalidate_file_cache(&full_path);
-                    cache::invalidate_content_cache(&full_path);
-                    self.send_error_response(stream_id, 404, b"Not Found")?;
-                    return Ok((404, 9));
-                }
-            };
-        let mime_str: &str = &mime_arc;
+        let mime_str: &str = &mime_owned;
 
         // F-132: h1/h2 と同様、静的配信にも WASM on_response_headers を適用する。
         let mut header_store: Vec<(Vec<u8>, Vec<u8>)> = vec![

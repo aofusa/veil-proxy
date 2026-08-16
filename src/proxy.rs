@@ -2984,47 +2984,62 @@ async fn h2_sendfile(
         base_path.to_path_buf()
     };
 
-    // OpenFileCache経由でファイル情報を取得（canonicalize/metadata/mime_guessをキャッシュ、
-    // HTTP/1.1 の handle_sendfile と同一経路。キャッシュミス時は offload でブロッキング解決）。
-    let file_info = match cache::get_file_info_with_config(&full_path, open_file_cache_config).await
-    {
-        Some(info) => info,
-        None => return h2_emit_error(resp_tx, notify, 404, b"Not Found").await,
-    };
-
-    // ディレクトリルートの場合は base_path からの canonical パス封じ込め検査。
-    // F-145: base_path 側の解決はリクエストごとに再実行せず、config ロード時に
-    // 一度だけ解決済みの canonical_base を使う（`cache::sendfile_base_contains` 参照）。
-    if is_dir
-        && !cache::sendfile_base_contains(&file_info.canonical_path, canonical_base, base_path)
-    {
-        return h2_emit_error(resp_tx, notify, 403, b"Forbidden").await;
-    }
-
-    // ディレクトリの場合はインデックスファイルを解決する。
-    let (final_path, mime_type) = if !file_info.is_file {
-        let filename = index_file.unwrap_or("index.html");
-        let index_path = file_info.canonical_path.join(filename);
-        match cache::get_file_info_with_config(&index_path, open_file_cache_config).await {
-            Some(idx_info) if idx_info.is_file => {
-                (idx_info.canonical_path.clone(), idx_info.mime_type.clone())
-            }
-            _ => return h2_emit_error(resp_tx, notify, 403, b"Forbidden").await,
-        }
-    } else {
-        (
-            file_info.canonical_path.clone(),
-            file_info.mime_type.clone(),
-        )
-    };
-
-    // F-146: ファイル本体をキャッシュ優先で取得する。HTTP/2 は DATA フレームへの
-    // 再フレーミングが必須で sendfile(2) を使えないため、ユーザ空間メモリ
-    // （`bytes::Bytes`）に保持し参照カウントクローンで配信する
-    // （キャッシュ無効・上限超過時は既存の offload 読み込みへ内部でフォールバックする）。
     let content_cfg = cache::effective_static_content_cache_config(static_file_cache_config);
-    let data = match cache::get_or_load_content_cache(&final_path, &content_cfg).await {
-        Some(d) => d,
+
+    // B-65（続き）: 従来は「メタデータ解決（offload 1）→ …検査… → 本体読み込み
+    // （offload 2）」で 1 リクエストあたり offload のクロススレッド往復が 2 回
+    // 発生していた（`docs/backlog/bugs/B-65-freebsd-h2c-request-cost.md`）。
+    // 当初の改修は `is_dir == false`（固定ファイルルート）でしか高速経路が使われず、
+    // 実運用で一般的なディレクトリルートでは改善していなかった。
+    //
+    // `is_dir` の true/false に関わらずまず `get_static_file_with_content` を 1 回
+    // 呼ぶ（両キャッシュヒット時は offload ゼロ）。ディレクトリルートの場合のみ
+    // `containment` に「このルート自身の」`base_path` を渡し、高速経路（Linux）は
+    // その `base_path` の dirfd に対してのみ open する（F-154:
+    // `resolve::open_beneath_in_root`）ため、これ自体が per-route の封じ込めになり、
+    // `readlink` 等の事後検査は不要（`static_file.rs` モジュール doc 参照）。
+    let containment = is_dir.then_some(cache::RouteContainment {
+        root: base_path,
+        canonical_base,
+    });
+    let first_result = cache::get_static_file_with_content(
+        &full_path,
+        open_file_cache_config,
+        &content_cfg,
+        containment,
+    )
+    .await;
+
+    let (mime_type, data) = match first_result {
+        Some(cache::StaticFileOutcome::File(info, data)) => (info.mime_type, data),
+        Some(cache::StaticFileOutcome::Forbidden) => {
+            return h2_emit_error(resp_tx, notify, 403, b"Forbidden").await;
+        }
+        Some(cache::StaticFileOutcome::Directory(file_info)) => {
+            // ディレクトリの場合はインデックスファイルを解決してからもう一度呼ぶ
+            // （封じ込め検査は既に上で通過済みのため index パスにも同じ containment
+            // を渡す）。
+            let filename = index_file.unwrap_or("index.html");
+            let index_path = file_info.canonical_path.join(filename);
+            match cache::get_static_file_with_content(
+                &index_path,
+                open_file_cache_config,
+                &content_cfg,
+                containment,
+            )
+            .await
+            {
+                Some(cache::StaticFileOutcome::File(info, data)) => (info.mime_type, data),
+                Some(cache::StaticFileOutcome::Forbidden) | None => {
+                    return h2_emit_error(resp_tx, notify, 403, b"Forbidden").await;
+                }
+                Some(cache::StaticFileOutcome::Directory(_)) => {
+                    // index ファイル自体がさらにディレクトリ（通常起こり得ないが、
+                    // 安全側に倒して 403 とする）。
+                    return h2_emit_error(resp_tx, notify, 403, b"Forbidden").await;
+                }
+            }
+        }
         None => {
             // ファイルが開けない場合はキャッシュを無効化（HTTP/1.1 と同様）。
             cache::invalidate_file_cache(&full_path);

@@ -304,9 +304,11 @@ impl std::os::windows::io::AsRawHandle for File {
 /// OpenOptions（monoio::fs::OpenOptions 互換）
 pub struct OpenOptions {
     inner: std::fs::OpenOptions,
-    // F-123: FreeBSD capability mode 下で読み取り専用 open を dirfd 相対 openat へ
-    // 切り替えるため、書き込み系フラグの有無を追跡する（読み取り専用のみ相対化対象）。
-    #[cfg(target_os = "freebsd")]
+    // F-123/F-153: FreeBSD capability mode / Linux openat2 で読み取り専用 open を
+    // dirfd 相対の封じ込め付き open へ切り替えるため、書き込み系フラグの有無を追跡する
+    // （読み取り専用のみ相対化対象。書き込み系は登録済み静的ルート dirfd に書き込み
+    // 権限が無いため、常に通常経路を使う）。
+    #[cfg(any(target_os = "freebsd", target_os = "linux"))]
     write_like: bool,
 }
 
@@ -314,7 +316,7 @@ impl OpenOptions {
     pub fn new() -> Self {
         Self {
             inner: std::fs::OpenOptions::new(),
-            #[cfg(target_os = "freebsd")]
+            #[cfg(any(target_os = "freebsd", target_os = "linux"))]
             write_like: false,
         }
     }
@@ -326,7 +328,7 @@ impl OpenOptions {
 
     pub fn write(mut self, write: bool) -> Self {
         self.inner.write(write);
-        #[cfg(target_os = "freebsd")]
+        #[cfg(any(target_os = "freebsd", target_os = "linux"))]
         {
             self.write_like |= write;
         }
@@ -335,7 +337,7 @@ impl OpenOptions {
 
     pub fn create(mut self, create: bool) -> Self {
         self.inner.create(create);
-        #[cfg(target_os = "freebsd")]
+        #[cfg(any(target_os = "freebsd", target_os = "linux"))]
         {
             self.write_like |= create;
         }
@@ -344,7 +346,7 @@ impl OpenOptions {
 
     pub fn append(mut self, append: bool) -> Self {
         self.inner.append(append);
-        #[cfg(target_os = "freebsd")]
+        #[cfg(any(target_os = "freebsd", target_os = "linux"))]
         {
             self.write_like |= append;
         }
@@ -360,6 +362,16 @@ impl OpenOptions {
         if !self.write_like {
             if let Some(res) = crate::security::capsicum::open_static_ro(path) {
                 return res.map(|inner| File { inner });
+            }
+        }
+        // F-153: Linux は登録済み静的ルート dirfd に対する openat2(RESOLVE_BENEATH) へ
+        // 切り替える（`readlink` を伴う旧経路の canonicalize を経由しない）。対象外
+        // （未登録ルート・古いカーネルで openat2 が恒久的に利用不可と判明済み）の場合は
+        // `None` が返るため、下の通常経路（`std::fs::OpenOptions`）へ安全にフォールバックする。
+        #[cfg(target_os = "linux")]
+        if !self.write_like {
+            if let Some(res) = crate::cache::resolve::open_beneath_for_request(path) {
+                return res.map(|(inner, _meta)| File { inner });
             }
         }
         let inner = self.inner.open(path)?;
