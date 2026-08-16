@@ -126,3 +126,17 @@ h2_file_tls     nginx   3     13446.74  12.80  0.000   0.000    0
 h2_file_tls     veil    3     10047.33  2.46   0.000   0.000    0
 h1_file_tls     nginx   3     10601.67  19.20  5.050   64.460   0
 h1_file_tls     veil    3     6328.38   5.41   8.950   78.350   0
+
+# ==== 2026-08-16 B-65 後 FreeBSD 14.3 amd64 (QEMU/KVM)、3B、capsicum+capability mode 有効 ====
+h2c_file_plain  nginx   1     13550.07  12.96  0.000   0.000   0
+h2c_file_plain  veil    1     10702.24  2.62   0.000   0.000   0
+h2_file_tls     nginx   1     13180.94  12.56  0.000   0.000   0
+h2_file_tls     veil    1     9863.76   2.41   0.000   0.000   0
+h2c_file_plain  nginx   2     16605.01  15.84  0.000   0.000   0
+h2c_file_plain  veil    2     12588.84  3.08   0.000   0.000   0
+h2_file_tls     nginx   2     9824.17   9.36   0.000   0.000   0
+h2_file_tls     veil    2     9293.67   2.27   0.000   0.000   0
+h2c_file_plain  nginx   3     11796.97  11.28  0.000   0.000   0
+h2c_file_plain  veil    3     9102.14   2.22   0.000   0.000   0
+h2_file_tls     nginx   3     6364.14   6.07   0.000   0.000   0
+h2_file_tls     veil    3     5445.44   1.33   0.000   0.000   0
