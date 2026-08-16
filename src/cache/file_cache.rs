@@ -87,6 +87,11 @@ impl CachedFileInfo {
     /// `Metadata` からキャッシュエントリを組み立てるために使う。`canonical_path` は
     /// `fetch_file_info` の登録済みルート経路と同じく「開き直し不要な生パス」を
     /// そのまま使う（F-153 と同じ設計、コメント参照）。
+    ///
+    /// この高速経路は Linux/FreeBSD にしか存在しないため、それ以外のターゲットでは
+    /// 呼び出し元ごと存在しなくなる。cfg で本関数自体の存在を絞ることで unused
+    /// warning を解消する（`#[allow(dead_code)]` は規約で禁止）。
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     pub(crate) fn from_open_metadata(path: &Path, meta: &std::fs::Metadata) -> Self {
         let mime_type = mime_guess::from_path(path)
             .first_or_octet_stream()
@@ -427,6 +432,11 @@ impl OpenFileCache {
     /// 設定を考慮した挿入（B-65）。`get_or_fetch_with_config` の挿入部分と同じ
     /// admission control（最大エントリ数超過時は `evict_oldest`）を使う。
     /// 複合取得 API がオフロードで既に得たメタデータをキャッシュへ登録する用途。
+    ///
+    /// 呼び出し元は `static_file` の高速経路のみで、その経路は Linux/FreeBSD に
+    /// しか存在しない。それ以外のターゲットでは未使用になるため cfg で本メソッド
+    /// 自体の存在を絞る（`#[allow(dead_code)]` は規約で禁止）。
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     pub(crate) fn insert_with_config(
         &self,
         path: &Path,

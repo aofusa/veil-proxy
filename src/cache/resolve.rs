@@ -28,7 +28,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 
-use ftlog::{info, warn};
+use ftlog::info;
+// `warn!` は Linux（openat2 実行時フォールバック検知）と FreeBSD（capsicum 経路）の
+// 警告ログでのみ使う。それ以外のターゲットでは参照されず unused import になるため、
+// 存在自体を cfg で絞る（`#[allow(unused)]` は規約で禁止）。
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+use ftlog::warn;
 
 /// 起動時ログ（どちらの解決経路を使っているか）は 1 回だけ出す。
 static STARTUP_LOG_ONCE: Once = Once::new();

@@ -57,8 +57,17 @@
 //! 「そもそもそのルートの外は開けない」構造になり、`readlink` はもちろん事後検査自体が
 //! 不要になる（`finish_fast` 参照）。カーネルが per-route の封じ込めを直接保証する。
 
+// `std::io::Read`（`read_to_end`）は高速経路（`read_into_bytes`）でのみ使う。
+// 高速経路自体が Linux/FreeBSD 専用のため cfg で存在を絞る。
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+// `PathBuf` は高速経路（`owned_root` の構築）でのみ使う。高速経路自体が
+// Linux/FreeBSD 専用のため、他ターゲットでは unused import にならないよう cfg で絞る。
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+use std::path::PathBuf;
+// `Arc` は高速経路（MIME タイプ文字列の Arc 化）でのみ使う。理由は PathBuf と同じ。
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -130,37 +139,44 @@ pub async fn get_static_file_with_content(
     //    (base_path) の dirfd」に限定するため（`open_beneath_in_root`）、
     //    open が成功した時点でそれ自体が per-route の封じ込め証明になる。
     //    B-65 が使っていた `readlink` による事後検査は不要（かつ実装しない）。
-    if fast_path_available(path, containment) {
-        let owned = path.to_path_buf();
-        // containment が不要な場合（固定ファイルルート）は余分な確保をしない。
-        let owned_root: Option<PathBuf> = containment.map(|c| c.root.to_path_buf());
-        // 理由付き allow: offload 専用ワーカースレッド内で実行され、イベントループを
-        // ブロックしない（F-153 の open_beneath_for_request/open_static_ro と同じ許容箇所）。
-        #[allow(clippy::disallowed_methods)]
-        let loaded = crate::runtime::offload::offload(move || {
-            open_and_read_fast(&owned, owned_root.as_deref())
-        })
-        .await;
-        let outcome = loaded?;
+    // 高速経路自体が Linux/FreeBSD にしか存在しないため、このブロックごと cfg で
+    // 括る。それ以外のターゲットは fast_path_available を呼ぶまでもなく素通しで
+    // 下の「3. フォールバック」へ進む（挙動は現状と同一: 従来もこのターゲットでは
+    // fast_path_available が false を返して同じ経路を通っていた）。
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    {
+        if fast_path_available(path, containment) {
+            let owned = path.to_path_buf();
+            // containment が不要な場合（固定ファイルルート）は余分な確保をしない。
+            let owned_root: Option<PathBuf> = containment.map(|c| c.root.to_path_buf());
+            // 理由付き allow: offload 専用ワーカースレッド内で実行され、イベントループを
+            // ブロックしない（F-153 の open_beneath_for_request/open_static_ro と同じ許容箇所）。
+            #[allow(clippy::disallowed_methods)]
+            let loaded = crate::runtime::offload::offload(move || {
+                open_and_read_fast(&owned, owned_root.as_deref())
+            })
+            .await;
+            let outcome = loaded?;
 
-        return Some(match outcome {
-            FastOutcome::File(meta, data) => {
-                // 両方のキャッシュへ登録する（各キャッシュの既存の有効化・上限判定を
-                // そのまま使う）。
-                file_cache::get_file_cache().insert_with_config(path, meta.clone(), ofc);
-                content_cache::insert_bytes(
-                    path,
-                    data.clone(),
-                    Arc::from(meta.mime_type.as_str()),
-                    content_cfg,
-                );
-                StaticFileOutcome::File(meta, data)
-            }
-            FastOutcome::Directory(meta) => {
-                file_cache::get_file_cache().insert_with_config(path, meta.clone(), ofc);
-                StaticFileOutcome::Directory(meta)
-            }
-        });
+            return Some(match outcome {
+                FastOutcome::File(meta, data) => {
+                    // 両方のキャッシュへ登録する（各キャッシュの既存の有効化・上限判定を
+                    // そのまま使う）。
+                    file_cache::get_file_cache().insert_with_config(path, meta.clone(), ofc);
+                    content_cache::insert_bytes(
+                        path,
+                        data.clone(),
+                        Arc::from(meta.mime_type.as_str()),
+                        content_cfg,
+                    );
+                    StaticFileOutcome::File(meta, data)
+                }
+                FastOutcome::Directory(meta) => {
+                    file_cache::get_file_cache().insert_with_config(path, meta.clone(), ofc);
+                    StaticFileOutcome::Directory(meta)
+                }
+            });
+        }
     }
 
     // 3. フォールバック: 従来どおり 2 回 offload（本体を読む前に封じ込め検査を行う
@@ -183,6 +199,10 @@ pub async fn get_static_file_with_content(
 /// `path`（`containment` が `None` の場合）または `containment.root`
 /// （`Some` の場合）が登録済み静的ルートで、高速経路（1 回の offload で
 /// open+read ができる経路）を使えるかどうかを **syscall なし**で判定する。
+///
+/// 高速経路自体が Linux/FreeBSD にしか存在しないため、この判定関数も cfg で
+/// 存在を絞る（`#[allow(dead_code)]` は規約で禁止）。
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 #[inline]
 fn fast_path_available(path: &Path, containment: Option<RouteContainment<'_>>) -> bool {
     if let Some(c) = containment {
@@ -196,11 +216,6 @@ fn fast_path_available(path: &Path, containment: Option<RouteContainment<'_>>) -
     {
         crate::security::capsicum::is_registered_static_root(path)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-    {
-        let _ = path;
-        false
-    }
 }
 
 /// `containment` の `root` が高速経路として使えるか（F-154）。
@@ -210,6 +225,7 @@ fn fast_path_available(path: &Path, containment: Option<RouteContainment<'_>>) -
 /// （`resolve::open_beneath_in_root` の doc コメント参照：capsicum 側の
 /// `sendfile_base_contains` が既に no-op のため `readlink` 相当の問題自体が無い）
 /// のため、従来どおり「どれかの登録済みルート」探索のままにする。
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 #[inline]
 fn route_fast_path_available(root: &Path) -> bool {
     #[cfg(target_os = "linux")]
@@ -220,11 +236,6 @@ fn route_fast_path_available(root: &Path) -> bool {
     {
         crate::security::capsicum::is_registered_static_root(root)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-    {
-        let _ = root;
-        false
-    }
 }
 
 /// offload クロージャ内（1 回の open+fstat+read）で得られる中間結果。
@@ -233,6 +244,10 @@ fn route_fast_path_available(root: &Path) -> bool {
 /// `open_beneath_for_request`）自体が per-route の封じ込めを保証するため、`Forbidden`
 /// は存在しない（open が拒否された場合は単に `None` になり `open_and_read_fast` の
 /// 呼び出し元がフォールバックへ進む）。
+///
+/// 高速経路自体が Linux/FreeBSD にしか存在しないため、この enum も cfg で
+/// 存在を絞る（`#[allow(dead_code)]` は規約で禁止）。
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 enum FastOutcome {
     File(CachedFileInfo, Bytes),
     Directory(CachedFileInfo),
@@ -251,6 +266,9 @@ enum FastOutcome {
 /// （旧 `finish_fast`/`resolved_path_for_containment`）が不要になった。
 // 理由付き allow: offload 専用ワーカースレッド内から呼ばれる同期 FS 操作
 // （呼び出し元 `get_static_file_with_content` が offload で包む。イベントループ非ブロック）。
+// 高速経路自体が Linux/FreeBSD にしか存在しないため、本関数も cfg で存在を絞る
+// （`#[allow(dead_code)]` は規約で禁止）。
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 #[allow(clippy::disallowed_methods)]
 fn open_and_read_fast(path: &Path, root: Option<&Path>) -> Option<FastOutcome> {
     #[cfg(target_os = "linux")]
@@ -281,11 +299,6 @@ fn open_and_read_fast(path: &Path, root: Option<&Path>) -> Option<FastOutcome> {
             }
             Err(_) => None,
         }
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-    {
-        let _ = (path, root);
-        None
     }
 }
 
