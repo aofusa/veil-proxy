@@ -1,7 +1,7 @@
 # F-154: 静的配信の封じ込めを「ルート単位 dirfd」でカーネルに任せ、`readlink` を消す
 
 - 優先度: P2
-- 状態: 対応中
+- 状態: 完了
 - 関連: F-153（`RESOLVE_BENEATH` 封じ込め）、B-65（offload 往復の統合）
 
 ## 背景（B-65 の検証中に実測で発見）
@@ -69,6 +69,73 @@ pub fn open_beneath_in_root(root: &Path, full_path: &Path) -> Option<io::Result<
 - `readlink` が増えていないことを syscall カウントで確認する（実測）。
 - 既存の B-65 / F-153 のテストが引き続き通ること。
 
-## 検証結果
+## 検証結果（2026-08-16）
 
-（実装後に追記）
+### syscall カウント（実測。本チケットの主目的の直接証明）
+
+Linux、h2c 静的配信、`strace -f -c`。B-65 時点の計測は 1,000 リクエスト、
+本計測はウォームアップ込みで約 1,200 リクエストのため、**1 リクエストあたりに
+正規化**して比較する（`openat2` の実数がリクエスト数の代理指標になる）。
+
+| syscall | B-65 時点 | F-154 後 | 1 req あたり |
+|---|---|---|---|
+| `readlink` | 1,012（うち errors 12） | **12（全て errors）** | 1.01 → **0.00** |
+| `openat2` | 1,000 | 1,200 | 1.00 → 1.00 |
+| `write`（= offload 完了通知） | 1,000 | 1,200 | 1.00 → **1.00（維持）** |
+| `statx` | 2,018 | 2,418 | 2.02 → 2.02 |
+
+**`readlink` はリクエスト単価から完全に消えた**（F-153 の成果を完全に取り戻した）。
+残る 12 件は B-65 側にも**同数・同じく全件エラー**で存在する起動時の一過性プローブで
+あり、リクエスト処理とは無関係。かつ **B-65 の成果（offload 1 回/リクエスト）は
+維持されている**（`write` が 1.00/req のまま）ことも同時に確認できている。
+
+計測中の 1,000 リクエストは `1000 succeeded, 0 failed` / `1000 2xx` で、
+封じ込めを厳格化しても正常配信が壊れていないことを示している。
+
+### セキュリティ上の改善（性能と同時に達成した点）
+
+本改修は「速くなったついでに安全になった」のではなく、**封じ込めの保証形態が
+事後検査から構造的保証へ変わった**点が本質:
+
+- 変更前: `open_beneath_for_request`（**どれか**の登録済みルート）で開く
+  → `readlink` で実パスを求める → `sendfile_base_contains` で**事後に**検査
+- 変更後: `open_beneath_in_root(root, path)` が **その `root` の dirfd のみ**に対して
+  `openat2(RESOLVE_BENEATH)` する → **そもそもルート外は開けない**
+
+検査漏れの余地が無くなり、`readlink`（= `/proc` 依存）も不要になった。
+未登録ルート・`strip_prefix` 失敗・古いカーネルはすべて `None` を返して
+**`canonicalize()` + 含有チェックへフェイルクローズ**する（検査を飛ばす経路は無い）。
+
+`containment` が `None`（any-root 探索）のまま残るのは**固定ファイルルートのみ**で、
+そこでは `full_path` が config 由来の `base_path` そのもの（remainder が空でなければ
+404）であり、**ユーザ入力が一切混入しない**ことを呼び出し側で確認済み。
+
+### テスト
+
+クロスルート拒否テスト（**最重要要件**）は、単に「失敗すること」を見るのではなく
+**対照実験付き**にしてある:
+
+1. 旧来の any-root 探索（`open_beneath_for_request`）なら root_b に**成功する**ことを先に示す
+2. そのうえで `open_beneath_in_root(root_a, ...)` が root_b を**一切開けない**ことを示す
+3. 上位 API（`get_static_file_with_content`）経由でも root_b の内容が配信されないこと
+4. **本体が content cache に入っていないこと**（= 読んですらいない証拠）
+
+加えて `..` 脱出・ルート外への絶対シンボリックリンク（EXDEV → フォールバック →
+含有チェックで拒否）も個別に検証している。
+
+複数ルートの登録が必要なテストは `OnceLock` の共有フィクスチャ経由に統一した。
+`register_static_roots` はプロセス全体で 1 回しか有効化されないため、テストごとに
+別々のルートを登録すると「単体では通るが全体実行の順序次第で落ちる」グローバル状態
+依存の不安定テストになる（本ブランチで 2 回踏んだ罠と同型）ため、その再発を構造的に防ぐ。
+
+- `cargo test --lib --features full`: **872 passed / 0 failed**（2 回連続で安定）
+- `cargo test --test integration_tests --features full`: 54 passed
+- ビルド（`full` / `--no-default-features` / `--no-default-features,cache`）・clippy・
+  release: いずれも **warning 0**
+
+### 付随して修正した warning
+
+`src/cache/static_file.rs` の `use super::resolve;` は FreeBSD ビルドで未使用
+（FreeBSD は `security::capsicum` 側を使うため）になり warning が出ていたため、
+`#[cfg(target_os = "linux")]` で絞った。`resolve` を参照するテストも全て
+`#[cfg(target_os = "linux")]` 済みであることを確認済み。`#[allow]` は使っていない。
