@@ -80,6 +80,27 @@ pub struct CachedFileInfo {
 }
 
 impl CachedFileInfo {
+    /// 開いた File の `Metadata` から直接構築する（B-65 専用）。
+    ///
+    /// `cache::get_static_file_with_content` の高速経路（登録済みルート配下で
+    /// open+fstat+read を 1 回の offload にまとめる経路）が、既に取得済みの
+    /// `Metadata` からキャッシュエントリを組み立てるために使う。`canonical_path` は
+    /// `fetch_file_info` の登録済みルート経路と同じく「開き直し不要な生パス」を
+    /// そのまま使う（F-153 と同じ設計、コメント参照）。
+    pub(crate) fn from_open_metadata(path: &Path, meta: &std::fs::Metadata) -> Self {
+        let mime_type = mime_guess::from_path(path)
+            .first_or_octet_stream()
+            .to_string();
+        Self {
+            canonical_path: path.to_path_buf(),
+            file_size: meta.len(),
+            mime_type,
+            last_modified: meta.modified().ok(),
+            is_file: meta.is_file(),
+            cached_at: Instant::now(),
+        }
+    }
+
     /// キャッシュが有効かどうかをチェック
     #[inline]
     pub fn is_valid(&self, max_age: Duration) -> bool {
@@ -367,6 +388,65 @@ impl OpenFileCache {
     pub fn reset_stats(&self) {
         self.hits.store(0, Ordering::Relaxed);
         self.misses.store(0, Ordering::Relaxed);
+    }
+
+    /// 設定を考慮したヒット判定のみ（フェッチしない・syscall/offload 一切なし、B-65）。
+    ///
+    /// `cache::get_static_file_with_content`（メタデータ+本体の複合取得 API）が、
+    /// 「両方のキャッシュがヒットする場合は offload を 1 回も呼ばない」という条件を
+    /// 満たすために使う。ミス時はここでは何もフェッチせず `None` を返すだけ
+    /// （フェッチは呼び出し元が別途 offload 経由で行う）。
+    pub(crate) fn peek_with_config(
+        &self,
+        path: &Path,
+        config: Option<&OpenFileCacheConfig>,
+    ) -> Option<CachedFileInfo> {
+        let enabled = config
+            .and_then(|c| c.enabled)
+            .unwrap_or_else(|| OPEN_FILE_CACHE_GLOBAL_ENABLED.load(Ordering::Relaxed));
+        if !enabled {
+            return None;
+        }
+        let valid_duration = config
+            .and_then(|c| c.valid_duration_secs)
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| {
+                Duration::from_nanos(
+                    OPEN_FILE_CACHE_GLOBAL_VALID_DURATION_NANOS.load(Ordering::Relaxed),
+                )
+            });
+        let entry = self.entries.get(path)?;
+        if entry.is_valid(valid_duration) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            Some(entry.clone())
+        } else {
+            None
+        }
+    }
+
+    /// 設定を考慮した挿入（B-65）。`get_or_fetch_with_config` の挿入部分と同じ
+    /// admission control（最大エントリ数超過時は `evict_oldest`）を使う。
+    /// 複合取得 API がオフロードで既に得たメタデータをキャッシュへ登録する用途。
+    pub(crate) fn insert_with_config(
+        &self,
+        path: &Path,
+        info: CachedFileInfo,
+        config: Option<&OpenFileCacheConfig>,
+    ) {
+        let enabled = config
+            .and_then(|c| c.enabled)
+            .unwrap_or_else(|| OPEN_FILE_CACHE_GLOBAL_ENABLED.load(Ordering::Relaxed));
+        if !enabled {
+            return;
+        }
+        let max_entries = config
+            .and_then(|c| c.max_entries)
+            .unwrap_or_else(|| OPEN_FILE_CACHE_GLOBAL_MAX_ENTRIES.load(Ordering::Relaxed));
+        let current_max_entries = self.max_entries.load(Ordering::Relaxed);
+        if self.entries.len() >= max_entries.min(current_max_entries) {
+            self.evict_oldest();
+        }
+        self.entries.insert(path.to_path_buf(), info);
     }
 
     /// 設定を考慮してファイル情報を取得

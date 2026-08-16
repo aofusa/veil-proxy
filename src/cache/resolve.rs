@@ -140,6 +140,28 @@ pub fn open_beneath_for_request(full_path: &Path) -> Option<io::Result<(File, Me
     }
 }
 
+/// `open_beneath_for_request` が実際に高速経路（登録済みルート＋openat2 利用可）を
+/// 使えるかどうかを **syscall を一切発行せず** 事前判定する（B-65）。
+///
+/// 静的配信のメタデータ+本体を 1 回の offload で取得する複合 API
+/// （`cache::get_static_file_with_content`）が「1 回の offload で済む高速経路」か
+/// 「従来どおり 2 回 offload するフォールバック経路」かを、offload を起動する **前**に
+/// 決めるために使う（該当しない場合に offload を 1 回無駄撃ちしてからフォールバックすると
+/// 往復が 3 回に増えてしまうため、この事前判定が必須）。
+///
+/// Linux 専用（FreeBSD は `security::capsicum::is_registered_static_root` を使う）。
+pub fn has_fast_path(full_path: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux_impl::is_registered(full_path)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = full_path;
+        false
+    }
+}
+
 /// 単発の封じ込め付き open（ルート dirfd を毎回新規 open する汎用版）。
 ///
 /// `register_static_roots` による事前登録を必要としないため、テストや
@@ -369,6 +391,19 @@ mod linux_impl {
         let file = unsafe { File::from_raw_fd(fd) };
         let meta = file.metadata()?;
         Ok((file, meta))
+    }
+
+    /// `full_path` が登録済み静的ルート配下かどうかを syscall なしで判定する（B-65）。
+    pub(super) fn is_registered(full_path: &Path) -> bool {
+        if openat2_unavailable() {
+            return false;
+        }
+        match LINUX_ROOTS.get() {
+            Some(roots) => roots
+                .iter()
+                .any(|r| full_path.strip_prefix(&r.root).is_ok()),
+            None => false,
+        }
     }
 
     /// 登録済み dirfd を使う高速経路（ホットパス用。ルート open をやり直さない）。

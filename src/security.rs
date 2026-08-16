@@ -2652,6 +2652,25 @@ pub mod capsicum {
         None
     }
 
+    /// `open_static_ro`/`stat_static` が実際に登録済みルートへ相対化できるかどうかを
+    /// **syscall を一切発行せず** 事前判定する（B-65）。
+    ///
+    /// 静的配信のメタデータ+本体を 1 回の offload で取得する複合 API
+    /// （`cache::get_static_file_with_content`）が「1 回の offload で済む高速経路」かを、
+    /// offload を起動する **前**に決めるために使う（`resolve::has_fast_path` の
+    /// FreeBSD 版）。
+    /// `resolve_root` と異なり `CString` を確保しない（判定専用・ホットパスで
+    /// アロケーションを増やさないため）。
+    pub fn is_registered_static_root(abs: &Path) -> bool {
+        if !static_serving_active() {
+            return false;
+        }
+        match STATIC_DIRS.get() {
+            Some(dirs) => dirs.iter().any(|(root, _)| abs.strip_prefix(root).is_ok()),
+            None => false,
+        }
+    }
+
     /// capability mode 下でルート dirfd 相対に読み取り専用 open する。
     /// `None` = 相対化対象外（通常の絶対パス open にフォールバック）。
     /// `Some(Err)` = 相対化対象だが openat 失敗（404 相当）。
