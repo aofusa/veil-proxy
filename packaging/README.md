@@ -14,6 +14,39 @@ Debian/Ubuntu 向け `.deb` と Amazon Linux 2023 向け `.rpm` を生成・検�
 | systemd ユニット | `contrib/systemd/veil.service` |
 | 実行ユーザー | `veil:veil` |
 
+## ビルド時の落とし穴（実際に踏んだもの）
+
+### NetBSD aarch64 の `dist` プロファイルはメモリ不足で失敗しうる
+
+`[profile.dist]`（`lto="fat"` + `codegen-units=1`）の最終リンクは大量のメモリを要求する。
+NetBSD aarch64 VM（既定 `VM_MEM_MB=4096`）では **`rustc` が SIGKILL（OOM）される**。
+
+```
+process didn't exit successfully: `rustc --crate-name veil ... -C lto=fat -C codegen-units=1 ...` (signal: 9, SIGKILL: kill)
+```
+
+対処（いずれか）:
+- `VM_MEM_MB=8192` 以上でリトライする
+- `CARGO_PROFILE=release` でビルドする（LTO 無しのぶんバイナリは大きくなるが機能は同一）
+
+### ビルドの失敗をパイプで握り潰さないこと
+
+```bash
+# 悪い例: $? は tail のものになり、ビルド失敗が EXIT=0 として記録される
+tools/qemu/bsd-vm.sh netbsd aarch64 build 2>&1 | tail -4; echo "EXIT=$?"
+
+# 良い例: ログはファイルへ、終了コードは直接受け取る
+tools/qemu/bsd-vm.sh netbsd aarch64 build > build.log 2>&1; echo "EXIT=$?"
+```
+
+実際にこれで **OOM 失敗を「成功」と記録し、古いバイナリのまま packaging してしまった**
+（`verify-artifacts.sh` の内容検証で発見）。
+
+### 4 コア機で VM と docker build を同時に走らせないこと
+
+QEMU VM 3 台 + `docker build` を並行させると BuildKit が
+`frontend grpc server closed unexpectedly` で落ちる。**直列で回すこと。**
+
 ## 成果物の鮮度検証（必ず実施すること）
 
 `docker build` は **呼び出した時点**のソースをビルドコンテキストとして送る。
