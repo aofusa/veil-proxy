@@ -2994,11 +2994,14 @@ async fn h2_sendfile(
     //
     // `is_dir` の true/false に関わらずまず `get_static_file_with_content` を 1 回
     // 呼ぶ（両キャッシュヒット時は offload ゼロ）。ディレクトリルートの場合のみ
-    // `containment` を渡し、per-route の封じ込め検査を offload クロージャの中
-    // （open+fstat の後・read の前）で行わせる（`resolve::has_fast_path` は
-    // 「どれかの登録済みルート配下」を示すに過ぎず、自ルートの base_path 配下とは
-    // 限らないため、この検査は省略できない — `static_file.rs` モジュール doc 参照）。
-    let containment = is_dir.then_some((canonical_base, base_path));
+    // `containment` に「このルート自身の」`base_path` を渡し、高速経路（Linux）は
+    // その `base_path` の dirfd に対してのみ open する（F-154:
+    // `resolve::open_beneath_in_root`）ため、これ自体が per-route の封じ込めになり、
+    // `readlink` 等の事後検査は不要（`static_file.rs` モジュール doc 参照）。
+    let containment = is_dir.then_some(cache::RouteContainment {
+        root: base_path,
+        canonical_base,
+    });
     let first_result = cache::get_static_file_with_content(
         &full_path,
         open_file_cache_config,

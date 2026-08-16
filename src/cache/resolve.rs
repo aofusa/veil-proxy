@@ -140,6 +140,53 @@ pub fn open_beneath_for_request(full_path: &Path) -> Option<io::Result<(File, Me
     }
 }
 
+/// 「このルートの」dirfd に対して相対 open する（F-154）。
+///
+/// `open_beneath_for_request` と異なり、探索対象を **呼び出し側が指定した `root` 一つ**
+/// に限定する。`root` が指す dirfd に対して `openat2(RESOLVE_BENEATH)` を発行するため、
+/// **カーネルがそのまま per-route の封じ込めになる**（`root` 以外のルート配下へは
+/// 構造的に出られない）。呼び出し側は結果を得た後に「実際にどのルート配下へ解決されたか」
+/// を `readlink` 等で再検査する必要が一切ない（B-65 が抱えていた `readlink` 1 回/リクエスト
+/// を丸ごと削除できる）。
+///
+/// - `root` が登録済みルートで**ない**場合、または `full_path` が `root` の配下でない
+///   場合（`strip_prefix` 失敗）は `None`（呼び出し側は `canonicalize` フォールバックへ）。
+/// - `Some(Ok(..))`/`Some(Err(..))` の意味・EXDEV/ELOOP 時の 1 リクエスト限りの
+///   フォールバック挙動は `open_beneath_for_request` と同じ（`fallback_open_beneath` を
+///   `root`/`rel` に対して呼ぶため、これも per-route のまま維持される）。
+///
+/// Linux 専用（FreeBSD は `security::capsicum` が「どれかの登録済みルート」方式のまま
+/// だが、`cache::sendfile_base_contains` が cap_enter 下で常に `true` を返す設計のため
+/// そもそも `readlink` 相当の検査を行っておらず、本チケットが解消しようとしている問題が
+/// 存在しない。FreeBSD 側の per-route 化は別途の検証環境が必要なため本チケットの範囲外
+/// とする）。
+pub fn open_beneath_in_root(root: &Path, full_path: &Path) -> Option<io::Result<(File, Metadata)>> {
+    #[cfg(target_os = "linux")]
+    {
+        linux_impl::open_in_root(root, full_path)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (root, full_path);
+        None
+    }
+}
+
+/// `open_beneath_in_root` が実際に高速経路（`root` が登録済み＋openat2 利用可）を
+/// 使えるかどうかを **syscall を一切発行せず** 事前判定する（F-154、`has_fast_path` の
+/// ルート指定版）。
+pub fn has_fast_path_in_root(root: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux_impl::is_registered_root(root)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = root;
+        false
+    }
+}
+
 /// `open_beneath_for_request` が実際に高速経路（登録済みルート＋openat2 利用可）を
 /// 使えるかどうかを **syscall を一切発行せず** 事前判定する（B-65）。
 ///
@@ -404,6 +451,49 @@ mod linux_impl {
                 .any(|r| full_path.strip_prefix(&r.root).is_ok()),
             None => false,
         }
+    }
+
+    /// `root` が登録済みルートかどうかを syscall なしで判定する（F-154）。
+    pub(super) fn is_registered_root(root: &Path) -> bool {
+        if openat2_unavailable() {
+            return false;
+        }
+        match LINUX_ROOTS.get() {
+            Some(roots) => roots.iter().any(|r| r.root == root),
+            None => false,
+        }
+    }
+
+    /// `root` の登録済み dirfd に対してのみ相対 open する高速経路（F-154）。
+    /// `open_for_request` と異なり、`root` 以外のルートは一切探索しない
+    /// （呼び出し側が「このリクエストを処理しているルート」を明示するため、
+    /// カーネルの `RESOLVE_BENEATH` がそのまま per-route の封じ込めになる）。
+    pub(super) fn open_in_root(
+        root: &Path,
+        full_path: &Path,
+    ) -> Option<io::Result<(File, std::fs::Metadata)>> {
+        if openat2_unavailable() {
+            return None;
+        }
+        let roots = LINUX_ROOTS.get()?;
+        let r = roots.iter().find(|r| r.root == root)?;
+        let rel = full_path.strip_prefix(root).ok()?;
+        let rel_c = match path_to_rel_cstring(rel) {
+            Ok(c) => c,
+            Err(e) => return Some(Err(e)),
+        };
+        Some(match raw_openat2(r.dirfd, &rel_c) {
+            Ok(fd) => finish(fd),
+            Err(e) if is_unsupported(&e) => {
+                mark_openat2_unavailable(&e.to_string());
+                return None;
+            }
+            // EXDEV/ELOOP: このパスだけ openat2 が安全側に拒否した。1 リクエスト限りで
+            // canonicalize + 含有チェックへ再判定させる（`root`/`rel` を渡すため、
+            // この再判定も per-route のまま維持される）。
+            Err(e) if is_retry_fallback(&e) => fallback_open_beneath(root, rel),
+            Err(e) => Err(e),
+        })
     }
 
     /// 登録済み dirfd を使う高速経路（ホットパス用。ルート open をやり直さない）。

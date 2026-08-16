@@ -109,6 +109,24 @@ pub fn sendfile_base_contains(
     file_canonical_path.starts_with(base)
 }
 
+/// ディレクトリルート File バックエンドの per-route 封じ込めパラメータ（F-154）。
+///
+/// `cache` feature の有無に関わらず同じ型を使う（`get_static_file_with_content` の
+/// シグネチャを両 cfg で揃えるため、feature ゲート外のこのファイルに置く）。
+///
+/// - `root`: そのリクエストを処理しているルートの `base_path`。高速経路
+///   （`resolve::open_beneath_in_root`/Linux）はこの `root` の dirfd に対して直接
+///   `openat2(RESOLVE_BENEATH)` するため、**それ自体が per-route の封じ込め**になり、
+///   `readlink` による事後検査が不要になる（B-65 が追加していた 1 回/リクエストの
+///   `readlink` を削除できる＝本チケットの目的）。
+/// - `canonical_base`: フォールバック経路（`canonicalize()` + `sendfile_base_contains`）
+///   でのみ使う、config ロード時に解決済みの `root` の canonical 形。
+#[derive(Clone, Copy)]
+pub struct RouteContainment<'a> {
+    pub root: &'a std::path::Path,
+    pub canonical_base: Option<&'a std::path::Path>,
+}
+
 // cache feature 有効時のみ公開
 #[cfg(feature = "cache")]
 pub use content_cache::{
@@ -416,11 +434,13 @@ pub enum StaticFileOutcome {
 /// 本体読み込みの両方を行う。それ以外は `canonicalize` + `File::open` + 読み込みへ
 /// フォールバックする（`fetch_file_info_uncached` と同じ防御水準）。
 ///
-/// `containment`（B-65 続き）: ディレクトリルートの per-route 封じ込め検査
-/// （`(canonical_base, base_path)`）。open+fstat の直後・本体を読む前に検査し、
-/// 失敗したら本体を読まずに `Forbidden` を返す。`static_file.rs` モジュール doc の
-/// 「なぜ `has_fast_path` だけでは不十分か」を参照（`cache` feature 有無に関わらず
-/// 同じ理由が当てはまる）。
+/// `containment`（F-154）: ディレクトリルートの per-route 封じ込め検査。
+/// `Some` の場合は `root`（= そのルートの `base_path`）の dirfd に対してのみ
+/// `openat2`/`openat` するため、開けた時点でそれ自体が封じ込めの証明になり、
+/// `readlink` による事後検査は不要（`RouteContainment` doc 参照。`cache` feature
+/// 有無に関わらず同じ理由が当てはまる）。`None`（固定ファイルルート）の場合は
+/// 「どれかの登録済みルート」探索（`open_beneath_for_request`）のままでよい
+/// （`path` は常に config 由来の固定値でユーザ入力に左右されないため）。
 #[cfg(not(feature = "cache"))]
 fn open_and_read_uncached(
     path: &std::path::Path,
@@ -429,33 +449,25 @@ fn open_and_read_uncached(
     use std::io::Read;
 
     #[cfg(target_os = "linux")]
-    if let Some(res) = crate::cache::resolve::open_beneath_for_request(path) {
-        return match res {
-            Ok((mut file, meta)) => {
-                if let Some((canonical_base, base_path)) = containment.as_ref() {
-                    use std::os::unix::io::AsRawFd;
-                    let proc_path = format!("/proc/self/fd/{}", file.as_raw_fd());
-                    // 理由付き allow: offload ワーカースレッド内の readlink（実解決パスの
-                    // 取得。フェイルオープン厳禁のため失敗時は Forbidden とする）。
-                    #[allow(clippy::disallowed_methods)]
-                    let resolved = match std::fs::read_link(&proc_path) {
-                        Ok(p) => p,
-                        Err(_) => return Some(StaticFileOutcome::Forbidden),
-                    };
-                    if !sendfile_base_contains(&resolved, canonical_base.as_deref(), base_path) {
-                        return Some(StaticFileOutcome::Forbidden);
-                    }
-                }
-                let info = build_cached_file_info_uncached(path, &meta);
-                if !info.is_file {
-                    return Some(StaticFileOutcome::Directory(info));
-                }
-                let mut buf: Vec<u8> = Vec::with_capacity(meta.len() as usize);
-                file.read_to_end(&mut buf).ok()?;
-                Some(StaticFileOutcome::File(info, bytes::Bytes::from(buf)))
-            }
-            Err(_) => None,
+    {
+        let opened = match containment.as_ref() {
+            Some((_, root)) => crate::cache::resolve::open_beneath_in_root(root, path),
+            None => crate::cache::resolve::open_beneath_for_request(path),
         };
+        if let Some(res) = opened {
+            return match res {
+                Ok((mut file, meta)) => {
+                    let info = build_cached_file_info_uncached(path, &meta);
+                    if !info.is_file {
+                        return Some(StaticFileOutcome::Directory(info));
+                    }
+                    let mut buf: Vec<u8> = Vec::with_capacity(meta.len() as usize);
+                    file.read_to_end(&mut buf).ok()?;
+                    Some(StaticFileOutcome::File(info, bytes::Bytes::from(buf)))
+                }
+                Err(_) => None,
+            };
+        }
     }
     #[cfg(target_os = "freebsd")]
     if let Some(res) = crate::security::capsicum::open_static_ro(path) {
@@ -484,6 +496,8 @@ fn open_and_read_uncached(
         };
     }
     // フォールバック: canonicalize + open + read（`fetch_file_info_uncached` と同じ解決）。
+    // ここは高速経路（openat2/capsicum）が使えなかった場合の経路であり、per-route の
+    // 封じ込め検査を省略してはならない。
     let canonical = path.canonicalize().ok()?;
     if let Some((canonical_base, base_path)) = containment.as_ref() {
         if !sendfile_base_contains(&canonical, canonical_base.as_deref(), base_path) {
@@ -515,11 +529,16 @@ pub async fn get_static_file_with_content(
     path: &std::path::Path,
     _ofc: Option<&OpenFileCacheConfig>,
     _content_cfg: &StaticContentCacheConfig,
-    containment: Option<(Option<&std::path::Path>, &std::path::Path)>,
+    containment: Option<RouteContainment<'_>>,
 ) -> Option<StaticFileOutcome> {
     let owned = path.to_path_buf();
-    let owned_containment: Option<(Option<std::path::PathBuf>, std::path::PathBuf)> =
-        containment.map(|(cb, bp)| (cb.map(std::path::Path::to_path_buf), bp.to_path_buf()));
+    let owned_containment: Option<(Option<std::path::PathBuf>, std::path::PathBuf)> = containment
+        .map(|c| {
+            (
+                c.canonical_base.map(std::path::Path::to_path_buf),
+                c.root.to_path_buf(),
+            )
+        });
     // 理由付き allow: offload 専用ワーカースレッド内で実行、イベントループ非ブロック。
     #[allow(clippy::disallowed_methods)]
     crate::runtime::offload::offload(move || open_and_read_uncached(&owned, owned_containment))
