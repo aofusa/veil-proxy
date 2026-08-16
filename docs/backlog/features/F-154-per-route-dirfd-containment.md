@@ -130,8 +130,15 @@ Linux、h2c 静的配信、`strace -f -c`。B-65 時点の計測は 1,000 リク
 
 - `cargo test --lib --features full`: **872 passed / 0 failed**（2 回連続で安定）
 - `cargo test --test integration_tests --features full`: 54 passed
+- E2E `full`（io_uring）: **544 passed / 0 failed**
+- E2E `full,epoll`（reactor）: **544 passed / 0 failed**
 - ビルド（`full` / `--no-default-features` / `--no-default-features,cache`）・clippy・
   release: いずれも **warning 0**
+
+reactor バックエンドの E2E を必ず通しているのは、Linux 既定ビルド（io_uring）では
+reactor 側のコードがそもそもコンパイルされずテストの空白地帯になるため
+（`docs/backlog/features/F-145` 参照）。本改修は静的配信の共通経路に手を入れており
+両バックエンドから使われるため、片方だけの確認では不十分。
 
 ### 付随して修正した warning
 
