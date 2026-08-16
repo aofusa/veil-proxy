@@ -249,9 +249,17 @@ ${1:-}
 [logging]
 level = "warn"
 
+# ベンチマークは **可能な限りセキュリティ機能を有効にした状態**で測る
+# （本番に近い条件で測らなければ意味がないため。2026-08-16 に有効化）。
+#   - capsicum + capability mode: FreeBSD の主要なサンドボックス。F-123 で
+#     capability mode 下の静的配信（dirfd + openat/O_RESOLVE_BENEATH）が
+#     動作するようにしてあるので、この構成は F-123/F-153 の回帰テストも兼ねる。
+#   - allow_security_failures = false: セキュリティ機能の適用に失敗したら
+#     黙って無効化せず起動を止める（「有効にしたつもり」を防ぐ）。
 [security]
-allow_security_failures = true
-enable_capsicum = false
+allow_security_failures = false
+enable_capsicum = true
+capsicum_capability_mode = true
 
 [tls]
 cert_path = "${WORK}/ssl/cert.pem"
