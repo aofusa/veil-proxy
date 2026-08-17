@@ -6,7 +6,7 @@ title = "veil container_security gitleaks"
 useDefault = true
 
 [allowlist]
-description = "Build artifacts, caches, and generated reports"
+description = "Build artifacts, caches, generated reports, and triaged false positives"
 paths = [
   '''(^|/)target/''',
   '''(^|/)tools/container_security/results/''',
@@ -15,4 +15,23 @@ paths = [
   '''(^|/)\.git/''',
   '''\.rmeta$''',
   '''\.rlib$''',
+  # --- トリアージ済み誤検知（2026-08-17）---
+  # テスト・開発用の自己署名証明書。E2E / perf ハーネス / コンテナイメージが
+  # 使う使い捨ての鍵で、本番の秘密情報ではない（いずれも CN=localhost もしくは
+  # "rcgen self signed cert" の自己署名。openssl x509 で確認済み）。
+  # これらは意図的にリポジトリへコミットされている（テストを自己完結させるため）。
+  '''(^|/)tests/fixtures/key\.pem$''',
+  '''(^|/)docker/assets/ssl/key\.pem$''',
+  '''(^|/)credential/ssl/key\.pem$''',
+  # ドキュメント中の例示値のみ（JWT フィルタの設定例と curl の実行例）。
+  # "dGhpcyBpcyBhIHNlY3JldCBrZXkgZm9yIEhTMjU2" は "this is a secret key for HS256"
+  # の base64 で、読者に形式を示すためのプレースホルダ。
+  '''(^|/)examples/wasm-filters/jwt-filter/README\.md$''',
+]
+regexes = [
+  # --- トリアージ済み誤検知（2026-08-17）---
+  # RFC 6455 Section 1.3 に記載された **仕様書そのものの例値**（"the sample nonce"
+  # の base64）。WebSocket ハンドシェイクのテスト・プローブで多数使っている。
+  # generic-api-key ルールが base64 文字列として拾うが秘密情報ではない。
+  '''dGhlIHNhbXBsZSBub25jZQ==''',
 ]

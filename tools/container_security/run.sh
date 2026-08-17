@@ -94,6 +94,16 @@ run_trivy_scan() {
     else
         log "Trivy スキャンで警告あり（レポート参照）"
     fi
+    # 集計（lib/report.sh）は「レポートに ': ok' があるか」で成否を判定するため、
+    # 判定行を必ず書き出す。これが無いと **脆弱性ゼロでも failed に分類される**。
+    # Trivy は `--exit-code 0` で常に 0 を返す運用なので、検出有無は本文から判定する。
+    if grep -qE '^(Total: 0|.*│[[:space:]]*0[[:space:]]*│)' "${report}" 2>/dev/null \
+        || grep -q 'No vulnerabilities found' "${report}" 2>/dev/null; then
+        echo "trivy: ok (0 ${TRIVY_SEVERITY} vulnerabilities)" | tee -a "${report}"
+    else
+        echo "trivy: findings detected — triage required (severity=${TRIVY_SEVERITY})" \
+            | tee -a "${report}"
+    fi
     rm -f "${image_tar}"
 }
 
@@ -163,6 +173,12 @@ main() {
         "${SCRIPT_DIR}/fuzz/run_libfuzzer.sh" || log "libFuzzer で警告（レポート参照）"
     else
         log "libFuzzer をスキップ (SKIP_LIBFUZZER=1)"
+        # スキップした旨をレポートへ**上書き**で残す。これを書かないと、
+        # 以前の実行で残った古い libfuzzer_report.txt を集計が読み取り、
+        # 「今回スキップしたのに failed」と誤って分類される（results/ は
+        # 実行ごとにクリアされないため実際に発生した）。
+        mkdir -p "${RESULTS_DIR}"
+        echo "libfuzzer: skipped (SKIP_LIBFUZZER=1)" > "${RESULTS_DIR}/libfuzzer_report.txt"
     fi
 
     # フェーズ 1c: libFuzzer + ASAN（F-71、既定 SKIP。永続 corpus）
