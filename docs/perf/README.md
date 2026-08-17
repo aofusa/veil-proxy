@@ -976,3 +976,76 @@ HTTP/3 が host-net h2load で ~7500 req/s だったため、HTTP/2 も同一ホ
 受信は N 本の独立 `IORING_OP_RECVMSG` を常時 in-flight（per-slot 固定 msghdr で peer 安全）、
 送信は `IORING_OP_SENDMSG`（GSO cmsg）を複数 SQE で 1 submit した効果。真 multishot（C2）は
 kernel 6.0+ 依存・multi-peer 安全性の実装コストと F-129 での不安定化実績から次段送り（フォールバック維持）。
+
+---
+
+## F-157: h2c 平文の対 nginx 劣後を解消（2026-08-17、FreeBSD 14.3 aarch64）
+
+### 結果（54,576B、3 反復中央値、`static_file_cache` + `open_file_cache` 有効）
+
+| シナリオ | veil | nginx | 対 nginx | 開始時 |
+|---|---|---|---|---|
+| `h2_file_tls` | 34,804 | 24,248 | **1.44** | 1.05 |
+| `h1_file_tls` | 33,864 | 26,111 | **1.30** | 1.08 |
+| `h2_proxy_tls` | 16,115 | 12,907 | **1.25** | 1.17 |
+| `l4_tcp` | 43,822 | 39,801 | **1.10** | 1.13 |
+| `h1_file_plain` | 57,213 | 54,754 | **1.04** | 1.03 |
+| `h1_proxy_tls` | 17,613 | 17,712 | 0.99 | 1.02 |
+| `h3_file` | 3,571 | 3,689 | 0.97 | 0.98 |
+| `h2c_file_plain` | 58,938 | 73,380 | 0.80 | **0.51** |
+
+> 比較対象の nginx にも `open_file_cache` を入れて条件を揃えている（片側だけ
+> チューニングして測らない。F-155 の kTLS と同じ失敗を繰り返さないため）。
+> VM の絶対値はラウンド間で 1.8 倍変動するので、判定は必ず**同一ラウンド内の
+> 対 nginx 比**で行うこと。
+
+### 何がボトルネックだったか（DTrace、N=128,000 で正規化）
+
+h2c だけが劣後していた理由は「HTTP/2 のフレーミングが遅い」ではなく、
+**リクエストごとのファイル読み込みと offload スレッドプール往復**だった。
+
+| syscall | 改修前 | 最終 |
+|---|---|---|
+| `openat` / `fstat` / `lseek` / `close` | 1.0 / 2.0 / 1.0 / 1.0 | 各 0.016〜0.032 |
+| `read` | 3.00 | 0.078 |
+| 1 バイト `write`（offload 完了通知パイプ） | 1.00 | 0.016 |
+| `_umtx_op`（offload のスレッド間同期） | 1.58 | 0.016 |
+| 合計 | **約 12** | **約 1.1** |
+
+nginx は h2c でも `sendfile(2)` + `sf_hdtr` でカーネル内完結できるが、veil は
+HTTP/2 の DATA 再フレーミングが要るため構造的に `sendfile` に載せられない。
+TLS 版 HTTP/2 が元から勝っていたのは、暗号処理コストが両者で支配的になり
+この固定費が相対的に隠れていたためで、平文でマスキングが外れて露呈していた。
+
+### 実施した改修
+
+1. **ホットパスのディープコピー・確保を排除** — `build_h2_compressed_file_response` の
+   `to_vec()`（F-146 のゼロコピー設計を無効化していた）、`fill_read_buf` の `split_off`、
+   `drive_h2_streams` の毎ループ `collect()`。
+2. **静的コンテンツキャッシュ経路の是正（効果最大）** — `static_file_cache` と
+   `open_file_cache` は**セットで有効にしないと効かない**（offload ゼロ経路は
+   メタデータキャッシュのヒットを前提に本体キャッシュを参照する構造）。
+
+### 棄却した案: DATA フレームの `writev` ゼロコピー化
+
+`sendmsg` の N 本 iovec で 54KB の memcpy を消す案を実装・検証まで行ったが、
+**交互 A/B 4 ラウンドすべてで回帰**したため revert した（対 nginx 0.886 → 0.807）。
+
+| round | base | writev |
+|---|---|---|
+| 1 | 0.896 | 0.873 |
+| 2 | 0.894 | 0.841 |
+| 3 | 0.864 | 0.784 |
+| 4 | 0.878 | 0.775 |
+
+事前見積もりが memcpy コストを DRAM 帯域（5 GB/s → 1 リクエスト 5.4µs）で計算していたのが
+誤りで、**同じファイルを毎回配信するベンチではコピー元が L2/L3 に residence し続け、
+memcpy は見積もりよりはるかに安い**。一方 `sendmsg` の per-iovec コストは実在する。
+
+### 残件
+
+`h2c_file_plain` は 0.80〜0.89 でまだ nginx を超えていない。残差は HTTP/2 の
+per-request タスク spawn + チャネル + `Notify` 起床の固定費と見られる
+（`poll` が 0.53/req 残っているのもここ）。解消には
+`docs/artifacts/freebsd_h2c_perf_investigation.md` の Phase 3
+「静的キャッシュヒット時の per-stream タスク spawn バイパス」が要る。
