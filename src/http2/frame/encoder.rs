@@ -52,6 +52,32 @@ impl FrameEncoder {
         out.extend_from_slice(data);
     }
 
+    /// DATA フレームの**ヘッダ（9 バイト）のみ**を既存バッファへ追記する（F-157）。
+    ///
+    /// 本体は追記しない。呼び出し側が本体を別セグメント（`bytes::Bytes` 等）として
+    /// scatter-gather 送出（`sendmsg` の複数 iovec）へ回す場合に使う。`encode_data_into`
+    /// は本体を `out` へ memcpy するため、本体をゼロコピーで送出したい大きなチャンクには
+    /// 使えない。`data_len` は実際に別セグメントとして送る本体のバイト数（フレームの
+    /// `length` フィールドに書き込まれる）。
+    pub fn encode_data_header_into(
+        &self,
+        out: &mut Vec<u8>,
+        stream_id: u32,
+        data_len: u32,
+        end_stream: bool,
+    ) {
+        let mut flags = 0u8;
+        if end_stream {
+            flags |= FrameFlags::END_STREAM;
+        }
+
+        let header = FrameHeader::new(FrameType::Data, flags, stream_id, data_len);
+
+        let mut header_buf = [0u8; 9];
+        header.encode(&mut header_buf);
+        out.extend_from_slice(&header_buf);
+    }
+
     /// HEADERS フレームをエンコード
     pub fn encode_headers(
         &self,

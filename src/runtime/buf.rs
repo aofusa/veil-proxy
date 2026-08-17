@@ -238,6 +238,70 @@ unsafe impl IoBufMut for OffsetBufMut {
     }
 }
 
+// ====================
+// IoSeg: scatter-gather 送出 1 回分のセグメント（F-157）
+// ====================
+
+/// scatter-gather 送出（`writev`/`sendmsg`）1 回分の 1 セグメント。
+///
+/// HTTP/2 の DATA フレームゼロコピー送出（F-157）で、制御フレーム・フレームヘッダ
+/// （`Owned`）とレスポンス本体（`Shared`、参照カウント共有でコピー無し）を混在させて
+/// 1 回の `sendmsg` へ並べるために使う。`Shared` は `bytes::Bytes` の `clone()` が
+/// O(1)（refcount +1）であることを利用し、本体の memcpy を発生させない。
+pub enum IoSeg {
+    /// 所有バッファ（制御フレーム・フレームヘッダ等、都度確保/再利用するデータ）。
+    Owned(Vec<u8>),
+    /// 参照カウント共有バッファ（レスポンス本体等、コピー無しで共有する読み取り専用データ）。
+    Shared(bytes::Bytes),
+}
+
+impl IoSeg {
+    /// セグメントの内容をスライスとして取得する。
+    #[inline(always)]
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            IoSeg::Owned(v) => v.as_slice(),
+            IoSeg::Shared(b) => b.as_ref(),
+        }
+    }
+
+    /// セグメントのバイト長。
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    /// セグメントが空か。
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[cfg(test)]
+mod io_seg_tests {
+    use super::*;
+
+    #[test]
+    fn owned_and_shared_report_consistent_slice() {
+        let owned = IoSeg::Owned(vec![1, 2, 3]);
+        assert_eq!(owned.as_slice(), &[1, 2, 3]);
+        assert_eq!(owned.len(), 3);
+        assert!(!owned.is_empty());
+
+        let shared = IoSeg::Shared(bytes::Bytes::from_static(b"abc"));
+        assert_eq!(shared.as_slice(), b"abc");
+        assert_eq!(shared.len(), 3);
+        assert!(!shared.is_empty());
+    }
+
+    #[test]
+    fn empty_segments_report_empty() {
+        assert!(IoSeg::Owned(Vec::new()).is_empty());
+        assert!(IoSeg::Shared(bytes::Bytes::new()).is_empty());
+    }
+}
+
 #[cfg(test)]
 mod offset_buf_mut_tests {
     use super::*;

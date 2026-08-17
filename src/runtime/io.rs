@@ -67,6 +67,32 @@ pub trait AsyncWriteRent {
 
     /// シャットダウン
     fn shutdown(&mut self) -> impl std::future::Future<Output = io::Result<()>>;
+
+    /// N 本の scatter-gather セグメントを全量書き込む（F-157）。
+    ///
+    /// HTTP/2 の DATA フレームゼロコピー送出用。デフォルト実装はセグメントを 1 本の
+    /// `Vec<u8>` へ連結してから [`AsyncWriteRentExt::write_all`] を呼ぶフォールバック
+    /// （コピーは発生するがゼロコピーではない、単発 `write` のみをサポートするストリーム型
+    /// 向け）。`sendmsg`/`writev` によるゼロコピー scatter-gather をサポートするストリーム型
+    /// （`runtime::tcp::TcpStream`）はこのメソッドをオーバーライドし、`Owned`/`Shared`
+    /// セグメントをコピー無しで 1 回の `sendmsg` へ並べる。
+    fn write_all_vectored_n(
+        &mut self,
+        segs: Vec<super::buf::IoSeg>,
+    ) -> impl std::future::Future<Output = (io::Result<()>, Vec<super::buf::IoSeg>)>
+    where
+        Self: Sized,
+    {
+        async move {
+            let total: usize = segs.iter().map(super::buf::IoSeg::len).sum();
+            let mut buf = Vec::with_capacity(total);
+            for seg in &segs {
+                buf.extend_from_slice(seg.as_slice());
+            }
+            let (result, _) = AsyncWriteRentExt::write_all(self, buf).await;
+            (result.map(|_| ()), segs)
+        }
+    }
 }
 
 /// AsyncWriteRent の拡張メソッド（monoio::io::AsyncWriteRentExt 互換）

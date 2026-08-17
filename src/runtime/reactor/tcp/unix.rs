@@ -18,7 +18,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use crate::runtime::buf::{IoBuf, IoBufMut};
+use crate::runtime::buf::{IoBuf, IoBufMut, IoSeg};
 use crate::runtime::executor::{register_read, register_write, unregister};
 
 // SO_* ソケットオプション
@@ -518,6 +518,49 @@ impl TcpStream {
         (Ok(()), a, b)
     }
 
+    /// N 本の不連続セグメントを 1 回の `sendmsg` で書き込む（F-157）。
+    ///
+    /// `skip` は全セグメントを連結とみなした先頭からの送信済みバイト数（部分送信の継続用）。
+    /// 1 回の `sendmsg` に載せる iovec は [`MAX_SENDMSG_N_IOV`] 本にクランプする
+    /// （`IOV_MAX` 対策）。
+    fn sendmsg_n(&self, segs: Vec<IoSeg>, skip: usize) -> SendMsgNFuture {
+        SendMsgNFuture {
+            fd: self.fd,
+            segs: Some(segs),
+            skip,
+        }
+    }
+
+    /// N 本の不連続セグメントを全量書き込む（F-157: `sendmsg` scatter-gather）。
+    ///
+    /// HTTP/2 の HEADERS/DATA ヘッダ（`Owned`）とレスポンス本体（`Shared`、
+    /// 参照カウント共有）を混在させ、本体の memcpy 無しで 1 回の `sendmsg` へ並べる。
+    /// io_uring 版（`runtime::uring::tcp::TcpStream::write_all_vectored_n`）と同一の
+    /// 挙動・シグネチャを提供する。
+    pub async fn write_all_vectored_n(&self, segs: Vec<IoSeg>) -> (io::Result<()>, Vec<IoSeg>) {
+        let total: usize = segs.iter().map(IoSeg::len).sum();
+        let mut sent = 0usize;
+        let mut segs = segs;
+        while sent < total {
+            let (res, rsegs) = self.sendmsg_n(segs, sent).await;
+            segs = rsegs;
+            match res {
+                Ok(0) => {
+                    return (
+                        Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "sendmsg returned zero",
+                        )),
+                        segs,
+                    );
+                }
+                Ok(n) => sent += n,
+                Err(e) => return (Err(e), segs),
+            }
+        }
+        (Ok(()), segs)
+    }
+
     /// 読み取り可能になるまで待つ。
     pub fn readable(&self) -> Readable<'_> {
         Readable {
@@ -688,6 +731,16 @@ impl crate::runtime::io::AsyncWriteRent for TcpStream {
     fn shutdown(&mut self) -> impl std::future::Future<Output = std::io::Result<()>> {
         let result = TcpStream::shutdown(self, std::net::Shutdown::Both);
         async move { result }
+    }
+
+    /// トレイトのデフォルト実装（コピーして単発 write）をオーバーライドし、`sendmsg`
+    /// によるゼロコピー scatter-gather 送出（[`TcpStream::write_all_vectored_n`]）へ
+    /// 委譲する（F-157）。io_uring 版と同一の挙動。
+    fn write_all_vectored_n(
+        &mut self,
+        segs: Vec<IoSeg>,
+    ) -> impl std::future::Future<Output = (std::io::Result<()>, Vec<IoSeg>)> {
+        TcpStream::write_all_vectored_n(self, segs)
     }
 }
 
@@ -1052,6 +1105,107 @@ impl<A: IoBuf, B: IoBuf> Future for SendMsgFuture<A, B> {
             }
             let (a, b) = this.bufs.take().expect("buffers present on error");
             return Poll::Ready((Err(e), a, b));
+        }
+    }
+}
+
+// ====================
+// SendMsgN (N 本 scatter-gather) Future（F-157）
+// ====================
+
+/// 1 回の `sendmsg` に載せる iovec の最大本数（uring 版と同じ理由・同じ値）。
+const MAX_SENDMSG_N_IOV: usize = 64;
+
+/// `segs` の `skip` 位置以降から、最大 [`MAX_SENDMSG_N_IOV`] 本の iovec を構築する。
+///
+/// 空セグメントは iovec に載せない。`skip` バイト分を先頭から読み飛ばす。
+/// 戻り値は構築した iovec の本数。
+fn build_iovecs_n(
+    segs: &[IoSeg],
+    skip: usize,
+    out: &mut [libc::iovec; MAX_SENDMSG_N_IOV],
+) -> usize {
+    let mut remaining_skip = skip;
+    let mut count = 0usize;
+    for seg in segs {
+        if count >= MAX_SENDMSG_N_IOV {
+            break;
+        }
+        let slice = seg.as_slice();
+        let len = slice.len();
+        if len == 0 {
+            continue;
+        }
+        if remaining_skip >= len {
+            remaining_skip -= len;
+            continue;
+        }
+        let start = remaining_skip;
+        remaining_skip = 0;
+        out[count] = libc::iovec {
+            // SAFETY: start < len は上のガードで保証済み。slice は seg（Vec<u8>/Bytes）が
+            // 生存する限り有効。reactor バックエンドは syscall を同期実行するため、
+            // in-flight 中にカーネルが非同期にバッファを参照し続けることは無い。
+            iov_base: unsafe { slice.as_ptr().add(start) } as *mut libc::c_void,
+            iov_len: len - start,
+        };
+        count += 1;
+    }
+    count
+}
+
+/// scatter-gather 書き込み Future（N 本版、`sendmsg(2)` の try-first ラッパ、F-157）。
+///
+/// [`SendMsgFuture`]（2 本固定）を N 本へ一般化したもの。
+pub struct SendMsgNFuture {
+    fd: RawFd,
+    segs: Option<Vec<IoSeg>>,
+    skip: usize,
+}
+
+impl Future for SendMsgNFuture {
+    type Output = (io::Result<usize>, Vec<IoSeg>);
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+        loop {
+            let segs = this
+                .segs
+                .as_ref()
+                .expect("SendMsgNFuture polled after completion");
+
+            let mut iovecs = [libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            }; MAX_SENDMSG_N_IOV];
+            let iov_count = build_iovecs_n(segs, this.skip, &mut iovecs);
+            debug_assert!(iov_count > 0, "skip is beyond total segment length");
+
+            let mut msghdr: libc::msghdr = unsafe { std::mem::zeroed() };
+            msghdr.msg_iov = iovecs.as_mut_ptr();
+            msghdr.msg_iovlen = iov_count as _;
+
+            // macOS には `MSG_NOSIGNAL` が無いため send フラグを 0 にする（`WriteFuture` と
+            // 同じ理由。生成時の `SO_NOSIGPIPE` で SIGPIPE 抑止済み）。
+            #[cfg(target_os = "macos")]
+            const SENDMSG_FLAGS: libc::c_int = 0;
+            #[cfg(not(target_os = "macos"))]
+            const SENDMSG_FLAGS: libc::c_int = libc::MSG_NOSIGNAL;
+            let ret = unsafe { libc::sendmsg(this.fd, &msghdr, SENDMSG_FLAGS) };
+            if ret >= 0 {
+                let segs = this.segs.take().expect("segs present at completion");
+                return Poll::Ready((Ok(ret as usize), segs));
+            }
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if is_would_block(&e) {
+                register_write(this.fd, cx.waker().clone());
+                return Poll::Pending;
+            }
+            let segs = this.segs.take().expect("segs present on error");
+            return Poll::Ready((Err(e), segs));
         }
     }
 }
