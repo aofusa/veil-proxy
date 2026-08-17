@@ -1049,3 +1049,38 @@ per-request タスク spawn + チャネル + `Notify` 起床の固定費と見�
 （`poll` が 0.53/req 残っているのもここ）。解消には
 `docs/artifacts/freebsd_h2c_perf_investigation.md` の Phase 3
 「静的キャッシュヒット時の per-stream タスク spawn バイパス」が要る。
+
+---
+
+## F-157: Linux 退行確認と h2c 新規計測（2026-08-17、Linux x86_64 / io_uring）
+
+### 退行確認（`h2_1_ktls_0_lb_kernel_ofc_1`、3 反復中央値）
+
+| Target | Proto | 2026-08-17 | 2026-08-16 | 差 |
+|---|---|---|---|---|
+| veil_glibc | HTTP/1.1 | **3008.1** | 2969.5 | +1.3% |
+| veil_musl | HTTP/1.1 | **2967.8** | 2968.1 | ±0% |
+| veil_glibc | HTTP/2 | **2746.7** | 2636.1 | +4.2% |
+| veil_musl | HTTP/2 | **2702.4** | 2709.9 | −0.3% |
+| nginx（同時計測） | HTTP/1.1 | 2177.6 | 1658.2 | — |
+| nginx（同時計測） | HTTP/2 | 2287.2 | 1884.4 | — |
+
+**退行なし**（veil 側の絶対値は同等以上）。nginx の絶対値が上がっているのは
+ホストが静かだったためで、同時計測での対 nginx 比は HTTP/1.1 **1.38 倍**・
+HTTP/2 **1.20 倍**と veil 優位を維持している。
+
+### h2c（平文 HTTP/2 prior knowledge）新規計測
+
+本リリースで `tools/perf` に h2c 計測を追加した（`h2c_file` / `h2c_proxy`）。
+veil の平文リスナー（`h2c_listen`）は **h2c 専用**で HTTP/1.1 を受け付けないため、
+比較対象の nginx も `listen 8080; http2 on;` で h2c を有効化し、
+双方に静的配信の推奨キャッシュ設定を入れて条件を揃えている。
+
+| 構成 | veil_glibc | veil_musl | nginx | 対 nginx |
+|---|---|---|---|---|
+| `h2c_file`（静的配信） | **9051.9** | 8845.7 | 3687.5 | **2.45 / 2.40 倍** |
+| `h2c_proxy`（逆プロキシ） | **2367.2** | 2231.8 | 2112.5 | 1.12 / 1.06 倍 |
+
+> **Linux（io_uring）では h2c が nginx の 2.45 倍**であり、FreeBSD 側で観測された
+> h2c の劣後（0.80〜0.89）は **reactor/kqueue バックエンド固有**であることがわかる。
+> FreeBSD 側の残件は F-157 チケットの「残件」節を参照。
