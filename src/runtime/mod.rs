@@ -66,7 +66,7 @@ pub use uring::{executor, ring, splice, tcp, timer};
 pub use uring::{udp_recv, udp_send};
 
 // 公開 API の再エクスポート
-pub use buf::{IoBuf, IoBufMut, IoSeg};
+pub use buf::{IoBuf, IoBufMut};
 pub use executor::{spawn, yield_now, Executor, TaskPool};
 #[cfg(veil_rt_uring)]
 pub use ring::IoUring;

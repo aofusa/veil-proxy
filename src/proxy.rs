@@ -1094,8 +1094,7 @@ where
         {
             let st = streams.get_mut(&sid).unwrap();
             if let Some((buf, off)) = st.pending_body.take() {
-                // F-157: `buf.slice(off..)` は refcount のみ増やすゼロコピー（memcpy なし）。
-                let queued = conn.queue_data_frames(sid, &buf.slice(off..), false)?;
+                let queued = conn.queue_data_frames(sid, &buf[off..], false)?;
                 let new_off = off + queued;
                 if conn.pending_write_len() > WRITE_BUF_FLUSH_THRESHOLD {
                     conn.flush_write_buf().await?;
@@ -1121,7 +1120,7 @@ where
                     let st = streams.get_mut(&sid).unwrap();
                     if st.head_sent && !st.end_sent {
                         // EOF: head 送出済みで END_STREAM 未送なら空 DATA で閉じる。
-                        conn.queue_data_frames(sid, &Bytes::new(), true)?;
+                        conn.queue_data_frames(sid, &[], true)?;
                         st.end_sent = true;
                     } else if !st.head_sent {
                         // タスクが Head を送らずに終了（想定外の異常終了）: クライアントを

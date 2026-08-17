@@ -17,7 +17,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use crate::runtime::buf::{IoBuf, IoBufMut, IoSeg};
+use crate::runtime::buf::{IoBuf, IoBufMut};
 use crate::runtime::executor::{
     alloc_op, detach_op, peek_op_result, remove_op, set_op_waker, submit_sqes, take_op_result,
     with_ring, OpGuard,
@@ -470,51 +470,6 @@ impl TcpStream {
         (Ok(()), a, b)
     }
 
-    /// N 本の不連続セグメントを 1 回の SENDMSG（scatter-gather）で書き込む（F-157）。
-    ///
-    /// `skip` は全セグメントを連結とみなした先頭からの送信済みバイト数（部分送信の継続用）。
-    /// 1 回の SQE に載せる iovec は [`MAX_SENDMSG_N_IOV`] 本にクランプする（`IOV_MAX` 対策）。
-    fn sendmsg_n(&self, segs: Vec<IoSeg>, skip: usize) -> SendMsgNFuture {
-        SendMsgNFuture {
-            fd: self.fd,
-            segs: Some(segs),
-            skip,
-            state: None,
-            user_data: 0,
-            submitted: false,
-        }
-    }
-
-    /// N 本の不連続セグメントを全量書き込む（F-157: SENDMSG scatter-gather）。
-    ///
-    /// HTTP/2 の HEADERS/DATA ヘッダ（`Owned`）とレスポンス本体（`Shared`、
-    /// 参照カウント共有）を混在させ、本体の memcpy 無しで 1 回の `sendmsg` へ並べる。
-    /// 部分送信（short write）時は送信済みオフセットを進めて iovec を再構築し、
-    /// 全量送出まで SENDMSG を再発行する。
-    pub async fn write_all_vectored_n(&self, segs: Vec<IoSeg>) -> (io::Result<()>, Vec<IoSeg>) {
-        let total: usize = segs.iter().map(IoSeg::len).sum();
-        let mut sent = 0usize;
-        let mut segs = segs;
-        while sent < total {
-            let (res, rsegs) = self.sendmsg_n(segs, sent).await;
-            segs = rsegs;
-            match res {
-                Ok(0) => {
-                    return (
-                        Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "sendmsg returned zero",
-                        )),
-                        segs,
-                    );
-                }
-                Ok(n) => sent += n,
-                Err(e) => return (Err(e), segs),
-            }
-        }
-        (Ok(()), segs)
-    }
-
     /// 読み取り可能になるまで待つ（POLL_ADD POLLIN）
     pub fn readable(&self) -> Readable<'_> {
         Readable {
@@ -640,16 +595,6 @@ impl crate::runtime::io::AsyncWriteRent for TcpStream {
         // SHUT_RDWR でシャットダウン（同期操作だが async として wrap）
         let result = TcpStream::shutdown(self, std::net::Shutdown::Both);
         async move { result }
-    }
-
-    /// トレイトのデフォルト実装（コピーして単発 write）をオーバーライドし、`sendmsg`
-    /// によるゼロコピー scatter-gather 送出（[`TcpStream::write_all_vectored_n`]）へ
-    /// 委譲する（F-157）。
-    fn write_all_vectored_n(
-        &mut self,
-        segs: Vec<IoSeg>,
-    ) -> impl std::future::Future<Output = (std::io::Result<()>, Vec<IoSeg>)> {
-        TcpStream::write_all_vectored_n(self, segs)
     }
 }
 
@@ -1182,209 +1127,6 @@ impl<A: IoBuf, B: IoBuf> Drop for SendMsgFuture<A, B> {
                     OpGuard::Cleanup(Box::new(move |_res| {
                         drop(bufs);
                         release_sendmsg_state(state);
-                    })),
-                );
-            }
-        }
-    }
-}
-
-// ====================
-// SendMsgN (N 本 scatter-gather) Future（F-157）
-// ====================
-
-/// 1 回の `sendmsg` に載せる iovec の最大本数。
-///
-/// `IOV_MAX` は Linux/FreeBSD とも 1024 だが、スタック/ヒープ上の配列を小さく保つため
-/// 64 に切る。54KB のレスポンスを `SETTINGS_MAX_FRAME_SIZE`（既定 16384）で分割すると
-/// 高々 4 DATA フレーム（ヘッダ+本体で 8 iovec）程度のため、実運用では十分な余裕がある。
-/// 64 本を超えるセグメント列は複数回の `sendmsg`（`write_all_vectored_n` のループ）に
-/// 分割される。
-const MAX_SENDMSG_N_IOV: usize = 64;
-
-/// SENDMSG（N 本版）用のカーネル参照領域。[`SendMsgState`] の N 本版。
-struct SendMsgNState {
-    iovecs: [libc::iovec; MAX_SENDMSG_N_IOV],
-    msghdr: libc::msghdr,
-}
-
-impl SendMsgNState {
-    fn new_boxed() -> Box<Self> {
-        // SAFETY: iovec / msghdr は全ゼロが有効な初期値（ポインタは submit 前に設定する）
-        Box::new(unsafe { std::mem::zeroed() })
-    }
-}
-
-thread_local! {
-    // clippy::vec_box 許容理由: SendMsgState と同じ（カーネルが SQE 経由で参照するため
-    // アドレス固定が必須）。
-    #[allow(clippy::vec_box)]
-    static SENDMSG_N_STATE_POOL: std::cell::RefCell<Vec<Box<SendMsgNState>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-const SENDMSG_N_STATE_POOL_MAX: usize = 64;
-
-fn acquire_sendmsg_n_state() -> Box<SendMsgNState> {
-    SENDMSG_N_STATE_POOL
-        .with(|pool| pool.borrow_mut().pop())
-        .unwrap_or_else(SendMsgNState::new_boxed)
-}
-
-fn release_sendmsg_n_state(state: Box<SendMsgNState>) {
-    SENDMSG_N_STATE_POOL.with(|pool| {
-        let mut pool = pool.borrow_mut();
-        if pool.len() < SENDMSG_N_STATE_POOL_MAX {
-            pool.push(state);
-        }
-        // 満杯なら Drop で解放
-    });
-}
-
-/// `segs` の `skip` 位置以降から、最大 [`MAX_SENDMSG_N_IOV`] 本の iovec を構築する。
-///
-/// 空セグメントは iovec に載せない。`skip` バイト分を先頭から読み飛ばす。
-/// 戻り値は構築した iovec の本数。
-fn build_iovecs_n(
-    segs: &[IoSeg],
-    skip: usize,
-    out: &mut [libc::iovec; MAX_SENDMSG_N_IOV],
-) -> usize {
-    let mut remaining_skip = skip;
-    let mut count = 0usize;
-    for seg in segs {
-        if count >= MAX_SENDMSG_N_IOV {
-            break;
-        }
-        let slice = seg.as_slice();
-        let len = slice.len();
-        if len == 0 {
-            continue;
-        }
-        if remaining_skip >= len {
-            remaining_skip -= len;
-            continue;
-        }
-        let start = remaining_skip;
-        remaining_skip = 0;
-        out[count] = libc::iovec {
-            // SAFETY: start < len は上のガードで保証済み。slice は seg（Vec<u8>/Bytes）が
-            // 生存する限り有効で、Future が segs の所有権を保持するため in-flight 中も
-            // 生存し続ける。
-            iov_base: unsafe { slice.as_ptr().add(start) } as *mut libc::c_void,
-            iov_len: len - start,
-        };
-        count += 1;
-    }
-    count
-}
-
-/// scatter-gather 書き込み Future（N 本版、IORING_OP_SENDMSG、F-157）
-///
-/// [`SendMsgFuture`]（2 本固定）と同じ設計・同じ opcode（`IORING_OP_SENDMSG`）を N 本へ
-/// 一般化したもの。メモリ安全性・in-flight drop 時の延命方針も同一（B-07 拡張）。
-struct SendMsgNFuture {
-    fd: RawFd,
-    /// in-flight のまま drop された場合に detach ガードへ移すため Option で保持
-    segs: Option<Vec<IoSeg>>,
-    /// 連結視での送信済みバイト数（この位置から iovec を構築する）
-    skip: usize,
-    state: Option<Box<SendMsgNState>>,
-    user_data: u64,
-    submitted: bool,
-}
-
-impl Future for SendMsgNFuture {
-    type Output = (io::Result<usize>, Vec<IoSeg>);
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // SAFETY: SendMsgNFuture 自体は自己参照を持たない（カーネル参照領域は Box で固定）
-        let this = unsafe { self.get_unchecked_mut() };
-
-        if !this.submitted {
-            let mut state = acquire_sendmsg_n_state();
-
-            let segs = this
-                .segs
-                .as_ref()
-                .expect("SendMsgNFuture polled after completion");
-            let iov_count = build_iovecs_n(segs, this.skip, &mut state.iovecs);
-            debug_assert!(iov_count > 0, "skip is beyond total segment length");
-
-            state.msghdr = unsafe { std::mem::zeroed() };
-            state.msghdr.msg_iov = state.iovecs.as_mut_ptr();
-            // msg_iovlen はターゲットにより型が異なる（glibc: usize / musl: c_int）
-            state.msghdr.msg_iovlen = iov_count as _;
-
-            let user_data = alloc_op();
-            this.user_data = user_data;
-
-            let fd = this.fd;
-            let msghdr_ptr = &state.msghdr as *const libc::msghdr as u64;
-            let acquired = with_ring(|ring| {
-                if let Some(sqe) = ring.get_sqe_or_submit() {
-                    sqe.opcode = IORING_OP_SENDMSG;
-                    sqe.fd = fd;
-                    sqe.addr_or_splice_off_in = msghdr_ptr;
-                    sqe.len = 1;
-                    sqe.op_flags = libc::MSG_NOSIGNAL as u32;
-                    sqe.user_data = user_data;
-                    true
-                } else {
-                    false
-                }
-            });
-            this.state = Some(state);
-
-            if !acquired {
-                // B-24: SQ/CQ 枯渇で SQE を確保できず。op・state・バッファを解放し WouldBlock で
-                // graceful に失敗する（submitted を立てないためハングしない）。
-                remove_op(user_data);
-                release_sendmsg_n_state(this.state.take().expect("state present on SQ-full"));
-                let segs = this.segs.take().expect("segs present on SQ-full");
-                return Poll::Ready((Err(io::Error::from(io::ErrorKind::WouldBlock)), segs));
-            }
-
-            if let Err(e) = submit_sqes() {
-                remove_op(user_data);
-                release_sendmsg_n_state(this.state.take().expect("state present on submit error"));
-                let segs = this.segs.take().expect("segs present on submit error");
-                return Poll::Ready((Err(e), segs));
-            }
-
-            this.submitted = true;
-        }
-
-        match take_op_result(this.user_data) {
-            Some(n) => {
-                release_sendmsg_n_state(this.state.take().expect("state present at completion"));
-                let segs = this.segs.take().expect("segs present at completion");
-                if n < 0 {
-                    Poll::Ready((Err(io::Error::from_raw_os_error(-n)), segs))
-                } else {
-                    Poll::Ready((Ok(n as usize), segs))
-                }
-            }
-            None => {
-                set_op_waker(this.user_data, cx.waker().clone());
-                Poll::Pending
-            }
-        }
-    }
-}
-
-impl Drop for SendMsgNFuture {
-    fn drop(&mut self) {
-        // submitted かつリソースが手元にある = SENDMSG が in-flight のまま drop された。
-        // カーネルは msghdr / iovec / セグメント本体をまだ参照しているため、両者を
-        // detach ガードへ移して CQE 到着まで延命する（B-07 拡張、SendMsgFuture と同じ）。
-        if self.submitted {
-            if let (Some(segs), Some(state)) = (self.segs.take(), self.state.take()) {
-                detach_op(
-                    self.user_data,
-                    OpGuard::Cleanup(Box::new(move |_res| {
-                        drop(segs);
-                        release_sendmsg_n_state(state);
                     })),
                 );
             }

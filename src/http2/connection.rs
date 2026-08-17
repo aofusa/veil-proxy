@@ -5,9 +5,7 @@
 
 use std::io;
 
-use bytes::Bytes;
-
-use crate::runtime::buf::{IoSeg, OffsetBufMut};
+use crate::runtime::buf::OffsetBufMut;
 use crate::runtime::io::{AsyncReadRent, AsyncWriteRentExt};
 
 use crate::http2::error::{Http2Error, Http2ErrorCode, Http2Result};
@@ -78,14 +76,6 @@ pub struct Http2Connection<S> {
     /// 1 回にまとめる再利用バッファ。呼び出し境界では常に空（`flush_write_buf` 済み）。
     /// 接続をまたいでスレッドローカルプールで再利用する（F-73 続き）。
     write_buf: Vec<u8>,
-    /// ゼロコピー DATA 送出用の scatter-gather セグメント列（F-157）。
-    ///
-    /// `queue_data_frames` が `max_frame_size` チャンクを 4096 バイト以上と判定した場合、
-    /// その時点の `write_buf`（HEADERS 等 + DATA フレームヘッダ）を `IoSeg::Owned` として
-    /// 封じ込め、続けて本体を `IoSeg::Shared`（`bytes::Bytes`、参照カウント共有）として
-    /// 積む。呼び出し境界では常に空（`flush_write_buf` 済み）。送出順序は
-    /// 「`pending_segs` の順 + 最後に `write_buf`」で一意に決まる。
-    pending_segs: Vec<IoSeg>,
 }
 
 // ====================
@@ -107,14 +97,6 @@ const H2_READ_BUF_RETAIN_MAX: usize = 1 << 20;
 /// この閾値を超えたら 1 回書き込んでバッファを空にする。小〜中サイズのレスポンスは
 /// 閾値未満のため HEADERS + 全 DATA が 1 回の書き込みにまとまる。
 const WRITE_BUF_FLUSH_THRESHOLD: usize = 128 * 1024;
-
-/// DATA チャンクをゼロコピー（`Bytes` 共有 + scatter-gather sendmsg）で送るか、
-/// `write_buf` へ memcpy するかの閾値（F-157）。
-///
-/// 小さいチャンクは iovec を 1 本増やすオーバーヘッド（sendmsg の iovec 走査・カーネル側
-/// の scatter-gather コスト）の方が memcpy より高くつくため、この閾値未満は従来どおり
-/// `encode_data_into` でコピーする。
-const ZEROCOPY_DATA_MIN_LEN: usize = 4096;
 
 thread_local! {
     static H2_READ_BUF_POOL: std::cell::RefCell<Vec<Vec<u8>>> =
@@ -188,10 +170,6 @@ impl<S> Drop for Http2Connection<S> {
         release_h2_read_buf(std::mem::take(&mut self.read_buf));
         // 送信連結バッファも同様にプールへ返却する。
         release_h2_write_buf(std::mem::take(&mut self.write_buf));
-        // pending_segs は呼び出し境界で常に空のはずだが、異常終了経路の保険として
-        // 明示的に破棄する（プールは持たない。Owned セグメントは小さいフレームヘッダ
-        // のみのため再利用の価値が薄い）。
-        self.pending_segs.clear();
     }
 }
 
@@ -263,7 +241,6 @@ where
             control_frame_window_start: now,
             continuation_count: 0,
             write_buf: acquire_h2_write_buf(),
-            pending_segs: Vec::new(),
         }
     }
 
@@ -470,12 +447,11 @@ where
     /// （HTTP/2 送信ホットパス最適化）。runtime の write_all は short write を内部で
     /// 継続する（B-27）ため、`Ok` は常に完全書き込みを意味する。
     async fn write_all(&mut self, buf: Vec<u8>) -> Http2Result<()> {
-        // 呼び出し境界では write_buf/pending_segs は空である不変条件（各送信 API は復帰前に
-        // flush する）。直接 write_all する制御フレーム等が連結バッファ（および F-157 の
-        // ゼロコピー scatter-gather セグメント列）を追い越して順序が壊れないよう保証する。
+        // 呼び出し境界では write_buf は空である不変条件（各送信 API は復帰前に flush する）。
+        // 直接 write_all する制御フレーム等が連結バッファを追い越して順序が壊れないよう保証する。
         debug_assert!(
-            self.write_buf.is_empty() && self.pending_segs.is_empty(),
-            "write_all called with pending coalesced write_buf/pending_segs"
+            self.write_buf.is_empty(),
+            "write_all called with pending coalesced write_buf"
         );
         let returned = self.write_all_raw(buf).await?;
         // 所有バッファの容量を再利用のため回収（write_buf が空のときのみ）。
@@ -512,61 +488,14 @@ where
     /// F-116: 多重化メインループが `drive_streams` 後に 1 イテレーション 1 回、および
     /// `queue_data_frames` で `write_buf` が閾値超過した際に明示フラッシュするため `pub`。
     pub async fn flush_write_buf(&mut self) -> Http2Result<()> {
-        if self.pending_segs.is_empty() {
-            if self.write_buf.is_empty() {
-                return Ok(());
-            }
-            let buf = std::mem::take(&mut self.write_buf);
-            let mut returned = self.write_all_raw(buf).await?;
-            returned.clear();
-            self.write_buf = returned;
+        if self.write_buf.is_empty() {
             return Ok(());
         }
-
-        // F-157: ゼロコピー DATA セグメントが積まれている。現在の write_buf を末尾
-        // セグメントとして足し、1 回の sendmsg（scatter-gather）でまとめて送出する。
-        let mut segs = std::mem::take(&mut self.pending_segs);
-        let tail = std::mem::take(&mut self.write_buf);
-        segs.push(IoSeg::Owned(tail));
-
-        let mut returned = self.write_all_vectored_raw(segs).await?;
-
-        // 送出後、Owned セグメント（フレームヘッダ + 末尾 write_buf）のうち最大容量のものを
-        // write_buf として回収し、次回のアロケーションを避ける（Shared は Bytes の
-        // 参照カウントを下げるだけで良いので回収不要）。
-        let mut reclaimed: Option<Vec<u8>> = None;
-        for seg in returned.drain(..) {
-            if let IoSeg::Owned(v) = seg {
-                let better = reclaimed
-                    .as_ref()
-                    .map(|r| v.capacity() > r.capacity())
-                    .unwrap_or(true);
-                if better {
-                    reclaimed = Some(v);
-                }
-            }
-        }
-        let mut buf = reclaimed.unwrap_or_default();
-        buf.clear();
-        self.write_buf = buf;
+        let buf = std::mem::take(&mut self.write_buf);
+        let mut returned = self.write_all_raw(buf).await?;
+        returned.clear();
+        self.write_buf = returned;
         Ok(())
-    }
-
-    /// N 本の scatter-gather セグメントを全量書き込む（F-157）。
-    ///
-    /// `write_all_raw`（単一バッファ版）と同じ WouldBlock 再試行方針。
-    async fn write_all_vectored_raw(&mut self, mut segs: Vec<IoSeg>) -> Http2Result<Vec<IoSeg>> {
-        loop {
-            let (result, returned) = self.stream.write_all_vectored_n(segs).await;
-            match result {
-                Ok(_) => return Ok(returned),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    segs = returned;
-                    continue;
-                }
-                Err(e) => return Err(Http2Error::Io(e)),
-            }
-        }
     }
 
     /// フレームを処理（外部からアクセス可能）
@@ -1528,9 +1457,7 @@ where
     /// `queue_data_frames` は決してフラッシュしないため、メインループは本値が
     /// フラッシュ閾値（128KB）を超えたら明示的に `flush_write_buf` する。
     pub fn pending_write_len(&self) -> usize {
-        // F-157: ゼロコピー DATA セグメント（pending_segs）も合算しないとフラッシュ閾値
-        // 判定が壊れる（大きなボディが memcpy 経路を通らず write_buf に反映されないため）。
-        self.write_buf.len() + self.pending_segs.iter().map(IoSeg::len).sum::<usize>()
+        self.write_buf.len()
     }
 
     /// ヘッダーを連結バッファへ積むだけで即送出しない（ストリーミング応答の HEADERS +
@@ -2169,7 +2096,7 @@ where
     pub fn queue_data_frames(
         &mut self,
         stream_id: u32,
-        data: &Bytes,
+        data: &[u8],
         end_stream: bool,
     ) -> Http2Result<usize> {
         // 空ボディ + END_STREAM: 0 長 DATA フレームで終端を伝える（send_data と同挙動）。
@@ -2205,8 +2132,8 @@ where
             let remaining = data.len() - offset;
             let chunk_len = remaining.min(max_frame_size).min(available_window);
             let is_last = offset + chunk_len >= data.len();
+            let chunk = &data[offset..offset + chunk_len];
             let len = chunk_len as i32;
-            let frame_end_stream = end_stream && is_last;
 
             // ウィンドウを減少
             self.conn_send_window -= len;
@@ -2214,32 +2141,14 @@ where
                 stream.send_window -= len;
             }
 
-            if chunk_len >= ZEROCOPY_DATA_MIN_LEN {
-                // F-157: 大きいチャンクは本体を memcpy せず、9 バイトヘッダだけ write_buf へ
-                // 積んでから write_buf を封じ（Owned）、本体は Bytes の参照カウント共有
-                // （Shared）として pending_segs へ回す。以降のフレームは空になった
-                // write_buf へ積まれるため、送出順序（pending_segs → write_buf）は保たれる。
-                self.frame_encoder.encode_data_header_into(
-                    &mut self.write_buf,
-                    stream_id,
-                    chunk_len as u32,
-                    frame_end_stream,
-                );
-                let body = data.slice(offset..offset + chunk_len);
-                let sealed = std::mem::take(&mut self.write_buf);
-                self.pending_segs.push(IoSeg::Owned(sealed));
-                self.pending_segs.push(IoSeg::Shared(body));
-            } else {
-                // 小さいチャンクは iovec を 1 本増やすより memcpy の方が安いため、
-                // 従来どおり write_buf へコピーする。
-                let chunk = &data[offset..offset + chunk_len];
-                self.frame_encoder.encode_data_into(
-                    &mut self.write_buf,
-                    stream_id,
-                    chunk,
-                    frame_end_stream,
-                );
-            }
+            // DATA フレームを連結バッファへ追記（per-frame Vec 確保を排除）。
+            // END_STREAM は全量積み切りが確定した最終フレームのみに付与。
+            self.frame_encoder.encode_data_into(
+                &mut self.write_buf,
+                stream_id,
+                chunk,
+                end_stream && is_last,
+            );
 
             offset += chunk_len;
         }
@@ -2810,8 +2719,8 @@ mod tests {
         // コネクションウィンドウ < ストリームウィンドウのとき、conn 側で制限されること。
         let mut conn = conn_with_open_stream(1);
         conn.conn_send_window = 6; // ストリームは 65535
-        let data = Bytes::from_static(b"0123456789");
-        let queued = conn.queue_data_frames(1, &data, true).expect("queue");
+        let data = b"0123456789";
+        let queued = conn.queue_data_frames(1, data, true).expect("queue");
         assert_eq!(queued, 6, "conn ウィンドウ分だけ積まれる");
         assert_eq!(conn.conn_send_window, 0);
         assert_eq!(conn.streams.get_ref(1).unwrap().send_window, 65535 - 6);
@@ -2829,8 +2738,8 @@ mod tests {
         // ストリームウィンドウ < コネクションウィンドウのとき、ストリーム側で制限されること。
         let mut conn = conn_with_open_stream(1);
         conn.streams.get(1).unwrap().send_window = 4;
-        let data = Bytes::from_static(b"0123456789");
-        let queued = conn.queue_data_frames(1, &data, true).expect("queue");
+        let data = b"0123456789";
+        let queued = conn.queue_data_frames(1, data, true).expect("queue");
         assert_eq!(queued, 4, "ストリームウィンドウ分だけ積まれる");
         assert_eq!(conn.streams.get_ref(1).unwrap().send_window, 0);
         assert_eq!(conn.conn_send_window, 65535 - 4);
@@ -2846,8 +2755,8 @@ mod tests {
         // max_frame_size で分割され、END_STREAM が最終フレームのみに立つこと。
         let mut conn = conn_with_open_stream(1);
         conn.remote_settings.max_frame_size = 4;
-        let data = Bytes::from_static(b"0123456789"); // 10 バイト → 4,4,2
-        let queued = conn.queue_data_frames(1, &data, true).expect("queue");
+        let data = b"0123456789"; // 10 バイト → 4,4,2
+        let queued = conn.queue_data_frames(1, data, true).expect("queue");
         assert_eq!(queued, 10, "ウィンドウ内なら全量積まれる");
 
         let frames = parse_frames(&conn.write_buf);
@@ -2870,8 +2779,8 @@ mod tests {
         // ウィンドウ枯渇で途中まで → END_STREAM なし。回復後の残量で END_STREAM が立つこと。
         let mut conn = conn_with_open_stream(1);
         conn.conn_send_window = 4;
-        let data = Bytes::from_static(b"0123456789");
-        let queued = conn.queue_data_frames(1, &data, true).expect("queue");
+        let data = b"0123456789";
+        let queued = conn.queue_data_frames(1, data, true).expect("queue");
         assert_eq!(queued, 4);
         {
             let frames = parse_frames(&conn.write_buf);
@@ -2892,7 +2801,7 @@ mod tests {
         conn.conn_send_window = 100;
         conn.write_buf.clear();
         let queued2 = conn
-            .queue_data_frames(1, &data.slice(queued..), true)
+            .queue_data_frames(1, &data[queued..], true)
             .expect("queue rest");
         assert_eq!(queued2, 6);
         let frames = parse_frames(&conn.write_buf);
@@ -2906,9 +2815,7 @@ mod tests {
     fn queue_data_frames_empty_body_end_stream() {
         // 空ボディ + END_STREAM は 0 長 END_STREAM DATA フレームを積むこと。
         let mut conn = conn_with_open_stream(1);
-        let queued = conn
-            .queue_data_frames(1, &Bytes::new(), true)
-            .expect("queue");
+        let queued = conn.queue_data_frames(1, &[], true).expect("queue");
         assert_eq!(queued, 0);
         let frames = parse_frames(&conn.write_buf);
         assert_eq!(frames.len(), 1);
@@ -2924,52 +2831,9 @@ mod tests {
     fn queue_data_frames_empty_body_without_end_stream_is_noop() {
         // 空ボディ + end_stream=false は何も積まない。
         let mut conn = conn_with_open_stream(1);
-        let queued = conn
-            .queue_data_frames(1, &Bytes::new(), false)
-            .expect("queue");
+        let queued = conn.queue_data_frames(1, &[], false).expect("queue");
         assert_eq!(queued, 0);
         assert!(conn.write_buf.is_empty());
-    }
-
-    #[test]
-    fn queue_data_frames_large_chunk_uses_pending_segs_zerocopy() {
-        // F-157: 4096 バイト以上のチャンクは write_buf へ memcpy されず、
-        // pending_segs（Owned ヘッダ + Shared 本体）へ積まれること。
-        let mut conn = conn_with_open_stream(1);
-        let body_len = ZEROCOPY_DATA_MIN_LEN + 100;
-        let data = Bytes::from(vec![0x42u8; body_len]);
-        let queued = conn.queue_data_frames(1, &data, true).expect("queue");
-        assert_eq!(queued, body_len, "1 フレームに収まる範囲で全量積まれる");
-
-        // write_buf は DATA ヘッダを積んだ直後に封じられ（pending_segs[0] へ移動）、
-        // 呼び出し境界では空へ戻っている。本体は write_buf へ memcpy されない。
-        assert!(conn.write_buf.is_empty());
-        // pending_segs は [Owned(header, 9 バイト), Shared(body)] の 2 セグメント。
-        assert_eq!(conn.pending_segs.len(), 2);
-        match &conn.pending_segs[0] {
-            IoSeg::Owned(v) => assert_eq!(v.len(), 9, "DATA ヘッダ 9 バイトのみ"),
-            _ => panic!("先頭は Owned のはず"),
-        }
-        match &conn.pending_segs[1] {
-            IoSeg::Shared(b) => assert_eq!(b.len(), body_len, "本体が Shared として積まれる"),
-            _ => panic!("2 番目は Shared のはず"),
-        }
-
-        // pending_write_len は write_buf + pending_segs の合算。
-        assert_eq!(conn.pending_write_len(), 9 + body_len);
-
-        // flush 後は write_buf/pending_segs とも空へ戻り、送出内容がフレームとして正しい。
-        drive(conn.flush_write_buf()).expect("flush");
-        assert!(conn.write_buf.is_empty());
-        assert!(conn.pending_segs.is_empty());
-
-        let sent = conn.stream.concat();
-        let frames = parse_frames(&sent);
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].0, FRAME_DATA);
-        assert_eq!(frames[0].1 & FLAG_END_STREAM, FLAG_END_STREAM);
-        assert_eq!(frames[0].3.len(), body_len);
-        assert!(frames[0].3.iter().all(|&b| b == 0x42));
     }
 
     #[test]
