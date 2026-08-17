@@ -179,6 +179,14 @@ http {
     keepalive_timeout 65;
     keepalive_requests 1000000;
 
+    # 静的配信の推奨チューニング。veil 側で静的コンテンツキャッシュ（F-146）を
+    # 有効にしているため、nginx にも同等の open_file_cache を入れて条件を揃える
+    # （open/fstat/close をリクエストごとに繰り返さない状態どうしで比較する）。
+    open_file_cache max=1024 inactive=60s;
+    open_file_cache_valid 60s;
+    open_file_cache_min_uses 1;
+    open_file_cache_errors on;
+
     # ---- 共通上流（veil / nginx の proxy・L4 計測の双方が使う）----
     server {
         listen 127.0.0.1:${UPSTREAM} reuseport;
@@ -271,6 +279,25 @@ cert_path = "${WORK}/ssl/cert.pem"
 key_path = "${WORK}/ssl/key.pem"
 ktls_enabled = false
 ktls_fallback_enabled = true
+
+# 静的コンテンツキャッシュ（F-146）を有効化する。
+#
+# HTTP/2・HTTP/3 は DATA フレーム / QUIC ストリームへの再フレーミングが要るため
+# `sendfile(2)` に載せられず、ファイル本体をユーザ空間へ読み出す必要がある。
+# 無効のままだと **1 リクエストごとに** offload スレッドプールへ往復して
+# open/fstat/lseek/read/close を実行する（F-157 の DTrace 実測で 1 リクエストあたり
+# openat 1.0 / fstat 2.0 / lseek 1.0 / close 1.0 / read 3.0 / 完了通知パイプの
+# 1 バイト write 1.0 / _umtx_op 1.6 を確認）。これが h2c 平文で nginx に劣後する
+# 主因だった。
+#
+# 比較対象の nginx 側も `open_file_cache` を有効にしてあり（生成する nginx.conf を
+# 参照）、**双方とも「静的配信向けに推奨設定を入れた状態」で突き合わせる**。
+# 片方だけチューニングして測ってはならない（F-155 の kTLS と同じ失敗）。
+[static_file_cache]
+enabled = true
+valid_duration_secs = 60
+max_entries = 1024
+max_file_size_bytes = 1048576
 EOF
 }
 
