@@ -1086,9 +1086,20 @@ cmd_sync() {
     # `src/tls_provider.rs` → `src/tls_provider/mod.rs` へ移動した際、ゲストに旧
     # ファイルが残って `E0761: file for module found at both ...` でビルドが壊れた
     # （F-142、実機で検出）。`target/` は転送対象外なので消えない（ビルドキャッシュは維持）。
+    # `tools` も必ず転送する。VM 内で実行するのはビルド・E2E だけでなく
+    # **perf 計測ハーネス（tools/perf/freebsd/run_perf_freebsd.sh）**もであり、
+    # これが転送対象から漏れていると **ホスト側でハーネスを直しても VM 側は
+    # 古いままで、しかも sync は成功（exit 0）を返す**（F-157 で実際に踏んだ:
+    # 計測条件を変えたつもりで 2 ラウンド分、無変更の設定を測っていた）。
+    #
+    # ただし `tools` は上の `rm -rf` の対象に **入れない**。tar は `*/target` を
+    # 除外するため、消すと VM 内でビルド済みの `tools/perf/h3load/target/release/h3load`
+    # （HTTP/3 計測クライアント）まで失われ、h3 計測が h2load --h3 フォールバックで
+    # 失敗するようになる。`tools` は crate のモジュール解決に関与しないので、
+    # 上書き展開だけで十分（`rm -rf` の理由だった E0761 は起きない）。
     (cd "${ROOT}" && tar czf - \
         --exclude='./target' --exclude='*/target' --exclude='.git' \
-        src benches tests examples contrib docker/assets third_party \
+        src benches tests examples contrib docker/assets third_party tools \
         Cargo.toml Cargo.lock build.rs clippy.toml .cargo) \
       | cmd_ssh "cd ${GUEST_ROOT} \
           && rm -rf src benches tests examples contrib docker/assets third_party .cargo \
