@@ -101,3 +101,21 @@ F-150/F-151（rustls 送信の writev 化 / HTTP/3 メインループのイベ�
   `test_b17_bad_backend_no_response_returns_504` は、**ホスト負荷が高い状態**
   （並行 docker ビルドにより loadavg 8 超）でのみ失敗し、静穏時の再実行では
   543 passed / 1 failed（本件のみ）となった＝既知の負荷フレーキー。
+
+
+## 2026-08-17 追記（F-155/F-156 の検証中の観測）
+
+FreeBSD 14.3 aarch64 でフル E2E を計 4 回実行した際の再現状況:
+
+- `test_http3_large_request_body`: **4 回中 4 回失敗**。単独実行でも
+  1 回目は成功（30.41s）、別の機会には 60 秒タイムアウトで失敗しており、
+  本チケットに記録済みの「単独実行でも再現するが intermittent」という
+  性質と一致する。
+- **同じ HTTP/3 の大きなリクエストボディ系である
+  `test_http3_request_body_streaming_tls_backend`（F-44、1.2MB ボディ）でも
+  4 回中 1 回失敗した**（単独実行では成功）。本チケットと同じ事象の
+  別の現れ方である可能性が高く、調査時は両方を対象にすること。
+
+いずれも F-155（capsicum パス解決・kqueue write hint・バッチ accept・sf_hdtr）
+および F-156（L4 マルチワーカー化・H2C accept）とは無関係の経路であり、
+これらの変更による回帰ではない（同一コードで Linux io_uring の E2E は 544 件全成功）。

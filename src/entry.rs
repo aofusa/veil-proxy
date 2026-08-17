@@ -1,6 +1,5 @@
 //! バイナリエントリ（`main` から `veil::run()` で呼び出す）。
 
-use crate::http_utils::IpStr;
 use crate::logging::*;
 use crate::metrics::*;
 use crate::pool::*;
@@ -1483,7 +1482,7 @@ pub fn run() {
                                     // 固定長バッファ（`IpStr`）を使う。`as_str()` の借用が
                                     // `handle_h2c_connection(...).await` の呼び出し全体で
                                     // 生存するよう、この async ブロック内で保持する。
-                                    let client_ip = IpStr::new(peer_addr.ip());
+                                    let client_ip = crate::http_utils::IpStr::new(peer_addr.ip());
                                     // H2C専用リスナーでも、プロトコル検出を実行して初期データを取得
                                     // これにより、クライアントがまだプリフェースを送信していない場合でも
                                     // 正しく処理できる
