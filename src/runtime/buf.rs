@@ -169,3 +169,123 @@ unsafe impl IoBuf for bytes::Bytes {
         self.len()
     }
 }
+
+// ====================
+// OffsetBufMut: 読み込み継続用のオフセット付き所有権ビュー
+// ====================
+
+/// `Vec<u8>` の `offset` 以降だけを書き込み先として見せる所有権ビュー（F-157）。
+///
+/// `AsyncReadRent` は所有権ムーブ型の `IoBufMut` を要求するため `&mut [u8]` を
+/// 直接渡すことはできない。従来の HTTP/2 受信経路（`fill_read_buf`）は
+/// `Vec::split_off(offset)` で末尾を新しいバッファへ確保・コピーして渡し、読み込み
+/// 完了後に `extend_from_slice` で結合し直していたが、これは 1 回の read のたびに
+/// malloc + memcpy を発生させていた。このラッパーは `Vec<u8>` の所有権をそのまま
+/// 保持しつつ `offset` 位置から書き込ませることで、そのコピーを完全に排除する。
+///
+/// # 不変条件
+/// - `offset <= buf.capacity()`（`new()` で `debug_assert!` する）。
+/// - `write_ptr()`/`bytes_total()` は `offset` を起点としたビューを返す
+///   （読み込み先は `offset..capacity` の未初期化領域でよい）。
+/// - `set_init(pos)` は元の `Vec` の `len` を `offset + pos` に設定する。既存の
+///   `Vec<u8>` 実装と同じ grow-only（`pos` が小さくても `len` を縮めない）ため、
+///   呼び出し側は返却された `Vec` の `len()` ではなく実際に読み込んだバイト数
+///   （read の戻り値）だけを有効データ長として扱うこと。
+pub struct OffsetBufMut {
+    buf: Vec<u8>,
+    offset: usize,
+}
+
+impl OffsetBufMut {
+    #[inline(always)]
+    pub fn new(buf: Vec<u8>, offset: usize) -> Self {
+        debug_assert!(offset <= buf.capacity());
+        Self { buf, offset }
+    }
+
+    /// 元の `Vec<u8>` を取り出す。
+    #[inline(always)]
+    pub fn into_inner(self) -> Vec<u8> {
+        self.buf
+    }
+}
+
+unsafe impl IoBufMut for OffsetBufMut {
+    #[inline(always)]
+    fn write_ptr(&mut self) -> *mut u8 {
+        // SAFETY: `offset <= capacity` は `new()` の不変条件で保証されている。
+        // `capacity` 分のメモリは `Vec` が確保済みのため、`offset` だけ進めた
+        // ポインタも確保済みメモリ範囲内を指す。
+        unsafe { self.buf.as_mut_ptr().add(self.offset) }
+    }
+
+    #[inline(always)]
+    fn bytes_total(&mut self) -> usize {
+        // `len` ではなく `capacity` を使う。読み込み先は未初期化領域でよい。
+        self.buf.capacity() - self.offset
+    }
+
+    #[inline(always)]
+    unsafe fn set_init(&mut self, pos: usize) {
+        // SAFETY: 呼び出し側（read 完了ハンドラ）は `pos` バイト分が
+        // `write_ptr()` から書き込み済みであることを `IoBufMut::set_init` の
+        // 契約として保証する。`offset + pos <= offset + bytes_total() <=
+        // capacity()` のため `set_len` の引数は確保済み範囲内に収まる。
+        let new_len = self.offset + pos;
+        if new_len > self.buf.len() {
+            self.buf.set_len(new_len);
+        }
+    }
+}
+
+#[cfg(test)]
+mod offset_buf_mut_tests {
+    use super::*;
+
+    #[test]
+    fn write_ptr_starts_at_offset() {
+        let buf = vec![0xAAu8; 16];
+        let offset = 4;
+        let mut view = OffsetBufMut::new(buf, offset);
+        let expected_ptr = unsafe { view.buf.as_ptr().add(offset) };
+        assert_eq!(view.write_ptr() as *const u8, expected_ptr);
+        assert_eq!(view.bytes_total(), 16 - offset);
+    }
+
+    #[test]
+    fn into_inner_returns_original_buffer_with_offset_data() {
+        let mut buf = Vec::with_capacity(16);
+        buf.extend_from_slice(&[1, 2, 3, 4]);
+        let offset = buf.len();
+        let mut view = OffsetBufMut::new(buf, offset);
+
+        // offset 位置へ書き込む。
+        unsafe {
+            std::ptr::write(view.write_ptr(), 9);
+            view.set_init(1);
+        }
+
+        let restored = view.into_inner();
+        assert_eq!(restored.len(), offset + 1);
+        assert_eq!(&restored[..], &[1, 2, 3, 4, 9]);
+    }
+
+    #[test]
+    fn set_init_is_grow_only() {
+        let mut buf = Vec::with_capacity(16);
+        buf.extend_from_slice(&[1, 2, 3, 4]);
+        let mut view = OffsetBufMut::new(buf, 0);
+
+        // 一度 len を進める。
+        unsafe {
+            view.set_init(10);
+        }
+        assert_eq!(view.buf.len(), 10);
+
+        // より小さい pos を渡しても縮まらない（grow-only）。
+        unsafe {
+            view.set_init(2);
+        }
+        assert_eq!(view.buf.len(), 10);
+    }
+}

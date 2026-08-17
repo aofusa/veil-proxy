@@ -5,6 +5,7 @@
 
 use std::io;
 
+use crate::runtime::buf::OffsetBufMut;
 use crate::runtime::io::{AsyncReadRent, AsyncWriteRentExt};
 
 use crate::http2::error::{Http2Error, Http2ErrorCode, Http2Result};
@@ -394,35 +395,35 @@ where
             }
         }
 
-        // 読み込み用のスライスを準備 (バッファの末尾に追加)
-        // read_buf全体を渡すと0から上書きされてしまうため、split_offで後半を取り出す
-        // しかしVecの所有権を渡す必要があるため、一度takeして分割し、戻ってきたら結合する
-
-        let mut full_buf = std::mem::take(&mut self.read_buf);
-
-        // buf_end 以降の部分を切り出して読み込み先にする（既存データを上書きしない）。
-        let tail_buf = full_buf.split_off(self.buf_end);
+        // 読み込み用のビューを準備 (バッファの末尾 buf_end 以降に読み込む)。
+        //
+        // F-157: 従来は `split_off` で buf_end 以降を新しいバッファへ確保・コピーして
+        // 渡し、読み込み完了後に `extend_from_slice` で結合し直しており、read のたびに
+        // malloc + memcpy が発生していた。`OffsetBufMut` は `Vec<u8>` の所有権を
+        // そのまま保持しつつ offset 位置から書き込ませるビューのため、そのコピーを
+        // 完全に排除できる。
+        let full_buf = std::mem::take(&mut self.read_buf);
+        let view = OffsetBufMut::new(full_buf, self.buf_end);
 
         // 読み込み実行
-        let (result, returned_tail) = self.stream.read(tail_buf).await;
+        let (result, view) = self.stream.read(view).await;
 
         match result {
             Ok(0) => {
-                self.read_buf = full_buf;
+                self.read_buf = view.into_inner();
                 Err(Http2Error::ConnectionClosed)
             }
             Ok(n) => {
-                // 実際に読み込んだ n バイトのみ結合する。返却バッファの len は
-                // IoBufMut::set_init が grow-only のため（compact 後の残留データを含み）
-                // n より大きくなり得る。必ず result の n を使う（さもないと残留バイトを
-                // 取り込みフレーム解析が壊れて "Frame too large" になる）。
-                full_buf.extend_from_slice(&returned_tail[..n]);
-                self.read_buf = full_buf;
+                // 実際に読み込んだのは n バイトのみ。IoBufMut::set_init が grow-only
+                // のため（compact 後の残留データを含み）バッファの len は n より大きく
+                // なり得るが、有効データ長は buf_end += n で管理する（さもないと残留
+                // バイトを取り込みフレーム解析が壊れて "Frame too large" になる）。
+                self.read_buf = view.into_inner();
                 self.buf_end += n;
                 Ok(n)
             }
             Err(e) => {
-                self.read_buf = full_buf;
+                self.read_buf = view.into_inner();
                 Err(Http2Error::Io(e))
             }
         }

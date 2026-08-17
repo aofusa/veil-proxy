@@ -572,10 +572,13 @@ where
     let spawner = h2_task_spawner();
     let mut streams: std::collections::HashMap<u32, H2ActiveStream> =
         std::collections::HashMap::new();
+    // `drive_h2_streams` のストリーム ID 走査用バッファ（F-157）。コネクションごとに
+    // 1 本持ち回して毎イテレーションのヒープ確保を避ける。
+    let mut stream_ids: Vec<u32> = Vec::new();
 
     loop {
         // 1. 各ストリームのレスポンスを送出（HPACK エンコードは送信順にここでのみ行う）。
-        drive_h2_streams(conn, &mut streams).await?;
+        drive_h2_streams(conn, &mut streams, &mut stream_ids).await?;
         // 2. 1 イテレーション 1 回のフラッシュ（複数ストリームの write_buf 合流を 1 回で送出）。
         conn.flush_write_buf().await?;
 
@@ -1033,6 +1036,7 @@ async fn h2_select_readable_or_notify(fd: RawFd, notify: &crate::stream_channel:
 async fn drive_h2_streams<S>(
     conn: &mut http2::Http2Connection<S>,
     streams: &mut std::collections::HashMap<u32, H2ActiveStream>,
+    stream_ids: &mut Vec<u32>,
 ) -> Result<(), http2::Http2Error>
 where
     S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
@@ -1040,9 +1044,19 @@ where
     use crate::stream_channel::{TryRecv, TrySendError};
 
     let mut done: Vec<u32> = Vec::new();
-    let ids: Vec<u32> = streams.keys().copied().collect();
 
-    for sid in ids {
+    // ストリーム ID の走査用バッファ（F-157）。毎イテレーションの
+    // `collect::<Vec<u32>>()` によるヒープ確保を消すため、呼び出し元
+    // （`handle_http2_requests`）が持つ**コネクションごと**のバッファを借りて再利用する。
+    //
+    // スレッドローカルにしてはならない: このループは `.await` をまたぐため、
+    // 同一スレッド上の別コネクションの `drive_h2_streams` が割り込んで
+    // 同じバッファを `clear()` し、走査中の ID 列を壊す。
+    stream_ids.clear();
+    stream_ids.extend(streams.keys().copied());
+
+    for idx in 0..stream_ids.len() {
+        let sid = stream_ids[idx];
         // --- リクエストボディを req チャネルへ流す（バックプレッシャ考慮） ---
         {
             let st = streams.get_mut(&sid).unwrap();
@@ -1407,7 +1421,7 @@ async fn h2_emit_full(
     notify: &crate::stream_channel::Notify,
     status: u16,
     headers: Vec<(Vec<u8>, Vec<u8>)>,
-    body: Vec<u8>,
+    body: Bytes,
 ) -> (u16, u64) {
     let len = body.len() as u64;
     let empty = body.is_empty();
@@ -1426,7 +1440,7 @@ async fn h2_emit_full(
         return (status, len);
     }
     if !empty {
-        let _ = h2_send(resp_tx, notify, H2RespMsg::Body(Bytes::from(body))).await;
+        let _ = h2_send(resp_tx, notify, H2RespMsg::Body(body)).await;
     }
     (status, len)
 }
@@ -1444,7 +1458,7 @@ async fn h2_emit_error(
         notify,
         status,
         h2_base_headers(false),
-        msg.to_vec(),
+        Bytes::copy_from_slice(msg),
     )
     .await
 }
@@ -1497,7 +1511,7 @@ async fn h2_dispatch(
                 b"content-type".to_vec(),
                 b"text/plain; version=0.0.4; charset=utf-8".to_vec(),
             ));
-            return h2_emit_full(resp_tx, notify, 200, headers, body).await;
+            return h2_emit_full(resp_tx, notify, 200, headers, Bytes::from(body)).await;
         }
     }
 
@@ -1505,7 +1519,7 @@ async fn h2_dispatch(
     #[cfg(feature = "admin")]
     if let Some((status, headers, body)) = h2_admin_response(method, path, client_ip, &headers_raw)
     {
-        return h2_emit_full(resp_tx, notify, status, headers, body).await;
+        return h2_emit_full(resp_tx, notify, status, headers, Bytes::from(body)).await;
     }
 
     let config = CURRENT_CONFIG.load();
@@ -1604,9 +1618,14 @@ async fn h2_dispatch(
                         for (n, v) in h2_base_headers(false) {
                             headers.push((n, v));
                         }
-                        let (st, sz) =
-                            h2_emit_full(resp_tx, notify, resp.status_code, headers, resp.body)
-                                .await;
+                        let (st, sz) = h2_emit_full(
+                            resp_tx,
+                            notify,
+                            resp.status_code,
+                            headers,
+                            Bytes::from(resp.body),
+                        )
+                        .await;
                         crate::wasm::on_request_complete_async(
                             wasm_engine.clone(),
                             modules_to_apply.clone(),
@@ -1661,8 +1680,14 @@ async fn h2_dispatch(
                     for (n, v) in h2_base_headers(false) {
                         headers.push((n, v));
                     }
-                    return h2_emit_full(resp_tx, notify, resp.status_code, headers, resp.body)
-                        .await;
+                    return h2_emit_full(
+                        resp_tx,
+                        notify,
+                        resp.status_code,
+                        headers,
+                        Bytes::from(resp.body),
+                    )
+                    .await;
                 }
                 crate::wasm::FilterResult::Pause => {
                     warn!(
@@ -1740,7 +1765,7 @@ async fn h2_dispatch(
                 h2_emit_error(resp_tx, notify, 404, b"Not Found").await
             } else {
                 let (built_headers, response_body) = build_h2_compressed_file_response(
-                    &data,
+                    Bytes::from_owner(ArcVecBytes(data)),
                     mime_type.as_ref(),
                     &security,
                     &route_compression,
@@ -2730,7 +2755,7 @@ where
                 final_body
             };
             let (status2, sent) =
-                h2_emit_full(resp_tx, notify, status, headers, response_body).await;
+                h2_emit_full(resp_tx, notify, status, headers, Bytes::from(response_body)).await;
             return (
                 status2,
                 sent,
@@ -3067,13 +3092,8 @@ async fn h2_sendfile(
         }
     };
 
-    let (built_headers, response_body) = build_h2_compressed_file_response(
-        &data,
-        &mime_type,
-        security,
-        compression,
-        client_encoding,
-    );
+    let (built_headers, response_body) =
+        build_h2_compressed_file_response(data, &mime_type, security, compression, client_encoding);
     #[cfg(feature = "wasm")]
     let header_store = apply_h2_wasm_response_headers(wasm_modules, 200, built_headers).await;
     #[cfg(not(feature = "wasm"))]
@@ -3642,15 +3662,36 @@ async fn apply_h2_wasm_response_trailers(
     }
 }
 
+/// `Arc<Vec<u8>>` を `Bytes::from_owner` でゼロコピー化するための薄いラッパ（F-157）。
+///
+/// `Backend::MemoryFile` はコンテンツを `Arc<Vec<u8>>` で保持しており、そのまま
+/// `Bytes` へ変換すると 1 回のディープコピーが発生する。`AsRef<[u8]>` を実装した
+/// この newtype を `Bytes::from_owner` に渡すことで、`Arc` の参照カウントだけで
+/// `Bytes` 化できる（`Bytes` の内部が `Arc` を保持し続けるだけでコピーは発生しない）。
+#[cfg(feature = "http2")]
+struct ArcVecBytes(Arc<Vec<u8>>);
+
+#[cfg(feature = "http2")]
+impl AsRef<[u8]> for ArcVecBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
 /// HTTP/2 静的応答の圧縮ネゴシエーションとヘッダー構築（B-32）
+///
+/// F-157: `data` は `Bytes`（参照カウント共有）で受け取り、非圧縮時はそのまま返す。
+/// 圧縮する場合のみ `compress_body_h2` で新規バッファを確保する。呼び出し元
+/// （`h2_sendfile`）が渡す `data` はキャッシュヒット時に参照カウントクローンだけで
+/// 得られるため、非圧縮の静的配信ホットパスからディープコピーが完全に消える。
 #[cfg(feature = "http2")]
 fn build_h2_compressed_file_response(
-    data: &[u8],
+    data: Bytes,
     mime_type: &str,
     security: &SecurityConfig,
     compression: &CompressionConfig,
     client_encoding: AcceptedEncoding,
-) -> (Vec<(Vec<u8>, Vec<u8>)>, Vec<u8>) {
+) -> (Vec<(Vec<u8>, Vec<u8>)>, Bytes) {
     let should_compress = compression.should_compress(
         client_encoding,
         Some(mime_type.as_bytes()),
@@ -3685,9 +3726,9 @@ fn build_h2_compressed_file_response(
             header_store.push((b"content-encoding".to_vec(), encoding_name.to_vec()));
             header_store.push((b"vary".to_vec(), b"Accept-Encoding".to_vec()));
         }
-        compress_body_h2(data, enc, compression)
+        Bytes::from(compress_body_h2(&data, enc, compression))
     } else {
-        data.to_vec()
+        data
     };
 
     (header_store, response_body)
