@@ -109,9 +109,14 @@ die() { printf '[perf] ERROR: %s\n' "$*" >&2; exit 1; }
 prepare() {
     mkdir -p "${WORK}/www" "${WORK}/ssl" "${WORK}/logs" "${WORK}/conf" "${WORK}/cache" "${WORK}/nginx/logs"
 
-    # FreeBSD の kTLS は既定で無効（kern.ipc.tls.enable=0）。有効化しないと veil も nginx も
-    # ユーザ空間 TLS へフォールバックし、kTLS の効果を計測できない。両者に等しく効くので
-    # ここで有効化する（GENERIC カーネルは ktls_ocf を内蔵しているため kldload は不要）。
+    # FreeBSD の kTLS は既定で無効（kern.ipc.tls.enable=0）。カーネル側の能力自体は
+    # 有効化しておく（kTLS を明示的に測りたいバリエーションのため。GENERIC カーネルは
+    # ktls_ocf を内蔵しているので kldload は不要）。
+    # ただし **veil の既定計測は ktls_enabled = false** にしてある（_veil_common_head）:
+    # FreeBSD の software kTLS は TLS レコード（16KB）ごとにカーネルワーカースレッドへ
+    # 暗号処理をディスパッチするため、コンテキストスイッチが秒間 40 万回に達して
+    # 帯域が 1.2 GB/s で直列化する（docs/perf/README.md の FreeBSD 節）。nginx 側も
+    # kTLS を使わない構成（ssl_conf_command 未指定）なので、無効側が公平な比較になる。
     sysctl kern.ipc.tls.enable=1 >/dev/null 2>&1 || log "kTLS を有効化できなかった（計測は継続）"
     # listen backlog の既定 128 は 64 コネクションの負荷でも accept キュー溢れを起こしうる。
     # veil / nginx 双方に等しく効くので引き上げる。
@@ -264,7 +269,7 @@ capsicum_capability_mode = true
 [tls]
 cert_path = "${WORK}/ssl/cert.pem"
 key_path = "${WORK}/ssl/key.pem"
-ktls_enabled = true
+ktls_enabled = false
 ktls_fallback_enabled = true
 EOF
 }
