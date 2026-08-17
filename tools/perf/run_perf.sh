@@ -22,6 +22,8 @@ K6DIR="$HERE/k6"                     # k6 スクリプト・proto の所在
 WRK_ARGS="${WRK_ARGS:--t4 -c100 -d10s --timeout 5s --latency}"
 H2_ARGS="${H2_ARGS:--n 30000 -c100 -m10}"
 H3_ARGS="${H3_ARGS:---alpn-list=h3 -n 30000 -c100 -m10}"  # h2load QUIC モード（HTTP/3）
+H2C_PORT="${H2C_PORT:-8080}"       # 平文 h2c リスナーのポート（veil: h2c_listen / nginx: listen 8080 http2）
+H2C_ARGS="${H2C_ARGS:-$H2_ARGS}"   # h2c 負荷（既定は HTTP/2 と同条件）
 K6_VUS="${K6_VUS:-50}"             # k6 並列仮想ユーザ数（gRPC / WebSocket）
 K6_DURATION="${K6_DURATION:-10s}" # k6 計測時間
 ITERATIONS="${ITERATIONS:-3}"      # 各 (config, proto) の反復回数（median±stdev 集計用）
@@ -157,6 +159,25 @@ run_http3() { # label cfg container
     done
 }
 
+# h2c（平文 HTTP/2 prior knowledge）計測: veil の平文リスナー（h2c_listen）は h2c
+# 専用で HTTP/1.1 を受け付けない（`[server].http` は 301 リダイレクト専用）ため、
+# 通常の wrk（HTTP/1.1）ではなく h2load を http:// スキームで使い prior knowledge
+# で計測する（$H2_IMG をそのまま `--entrypoint h2load` で流用できる）。
+run_h2c() { # label cfg container [path]
+    local label="$1" cfg="$2" c="$3" path="${4:-/}" iter reqps tput latmean non2xx cpu mem
+    local url="http://$c:$H2C_PORT$path"
+    docker run --rm --network $NET --entrypoint h2load $H2_IMG -n 1000 -c 10 "$url" >/dev/null 2>&1
+    for iter in $(seq 1 "$ITERATIONS"); do
+        ( sleep 1; sample_stats "$c" > "$LOGDIR/${label}_${cfg}_h2c_${iter}.stats" ) &
+        docker run --rm --network $NET --entrypoint h2load $H2_IMG $H2C_ARGS "$url" \
+            > "$LOGDIR/${label}_${cfg}_h2c_${iter}.log" 2>&1
+        wait
+        read reqps tput latmean non2xx < <(parse_h2load "$LOGDIR/${label}_${cfg}_h2c_${iter}.log")
+        read cpu mem < "$LOGDIR/${label}_${cfg}_h2c_${iter}.stats" 2>/dev/null || { cpu=NA; mem=NA; }
+        emit "$label" "$cfg" "h2c" "$iter" "$reqps" "$tput" "$latmean" "NA" "$non2xx" "$cpu" "$mem"
+    done
+}
+
 run_load() { # target_label config_label container has_http2
     local label="$1" cfg="$2" c="$3" h2="$4" iter reqps transfer latavg latp99 non2xx cpu mem tput latmean
 
@@ -167,6 +188,7 @@ run_load() { # target_label config_label container has_http2
         grpc_h3*)         run_grpc_h3 "$label" "$cfg" "$c"; return ;;
         *grpc*)           run_grpc    "$label" "$cfg" "$c"; return ;;
         *websocket*)      run_ws      "$label" "$cfg" "$c"; return ;;
+        h2c_*)            run_h2c     "$label" "$cfg" "$c" "/"; return ;;
     esac
 
     # compression 構成は Accept-Encoding を送らないと圧縮経路を通らないため付与する。
@@ -263,6 +285,10 @@ wait_ready() { # container [cfg]
                     docker run --rm --network $NET curlimages/curl:latest -s -o /dev/null \
                         -w '%{http_code}' "http://$c:9080/" 2>/dev/null | grep -q 200 && return 0
                     ;;
+                h2c_*)
+                    docker run --rm --network $NET curlimages/curl:latest -s -o /dev/null \
+                        -w '%{http_code}' --http2-prior-knowledge "http://$c:$H2C_PORT/" 2>/dev/null | grep -q 200 && return 0
+                    ;;
                 *) return 0 ;;
             esac
         fi
@@ -309,6 +335,9 @@ docker run -d --rm --network $NET \
     --name nginx-perf nginx:alpine >/dev/null
 if wait_ready nginx-perf; then
     run_load nginx base nginx-perf 1
+    # h2c ベースライン（veil の h2c_file / h2c_proxy と同じ config 名で比較できるようにする）
+    run_h2c nginx h2c_file  nginx-perf "/"
+    run_h2c nginx h2c_proxy nginx-perf "/proxy/"
 fi
 docker rm -f nginx-perf >/dev/null 2>&1
 

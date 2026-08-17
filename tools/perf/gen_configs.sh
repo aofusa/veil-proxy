@@ -570,19 +570,26 @@ count=$((count + 1))
 #   設定として表現できないため N/A（L4 ベース 1 種のみを維持）。
 # ============================================================
 
-# server/logging/security/performance/tls 共通ヘッダ（http3 有無を引数化）。$1=http3(0/1)
+# server/logging/security/performance/tls 共通ヘッダ（http3 有無を引数化）。
+# $1=http3(0/1) $2=h2c ポート（省略可。指定時のみ [server] に h2c_listen を追加）
+#   veil の平文 HTTP/1.1 (`[server].http`) は HTTPS への 301 リダイレクト専用リスナーで
+#   計測に使えないため、平文 HTTP/2 (h2c prior knowledge) を計測するには専用の
+#   h2c_listen リスナーが必要。
 gen_srv_head() {
-    local h3="$1" http3_line="" http3_block=""
+    local h3="$1" h2c_port="${2:-}" http3_line="" http3_block="" h2c_lines=""
     if [ "$h3" = 1 ]; then
         http3_line=$'http3_enabled = true\n'
         http3_block=$'\n[http3]\nlisten = "0.0.0.0:443"\n'
+    fi
+    if [ -n "$h2c_port" ]; then
+        h2c_lines="h2c_enabled = true"$'\n'"h2c_listen = \"0.0.0.0:${h2c_port}\""$'\n'
     fi
     cat <<EOF
 [server]
 listen = "0.0.0.0:443"
 http = "0.0.0.0:80"
 http2_enabled = true
-${http3_line}threads = 0
+${http3_line}${h2c_lines}threads = 0
 
 [logging]
 level = "warn"
@@ -753,6 +760,25 @@ for feat in wasm metrics access_log rate_limit otel; do
         gen_route file "" "/" none 0 '"HEAD", "GET"'
     } | emit_cfg "$OUT/grpc_h3_${feat}.toml"
 done
+
+# ============================================================
+# h2c（平文 HTTP/2 prior knowledge）
+# veil の平文リスナー `h2c_listen` は h2c 専用で HTTP/1.1 を受け付けない
+# （`[server].http` は HTTPS への 301 リダイレクト専用のため計測に使えない）。
+# gen_srv_head の第 2 引数で h2c_listen を 8080 番へ有効化し、File / Proxy の
+# 2 経路を h2load の平文 prior knowledge モードで計測する。
+# ============================================================
+
+{
+    gen_srv_head 0 8080
+    gen_route file "" "/" none 0 '"HEAD", "GET"'
+} | emit_cfg "$OUT/h2c_file.toml"
+
+{
+    gen_srv_head 0 8080
+    gen_upstream_backend
+    gen_route proxy perf-backend "/" none 0 '"HEAD", "GET"'
+} | emit_cfg "$OUT/h2c_proxy.toml"
 
 count=$(find "$OUT" -maxdepth 1 -name '*.toml' ! -name '_debug*.toml' | wc -l)
 echo "生成完了: ${count} バリアント -> $OUT"

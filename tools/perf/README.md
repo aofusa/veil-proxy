@@ -13,10 +13,10 @@
 | パス | 役割 |
 |------|------|
 | `run_perf.sh` | 計測オーケストレータ（nginx → veil glibc/musl × 全バリアント × 反復）。完了後に集計も実行 |
-| `gen_configs.sh` | 計測用 `config.toml` バリアントを生成（**完全直交 2⁴=16** + full features 機能ショーケース `feat_*` + **全プロトコル×全機能マトリクス**（F-114: `h2_1_proxy_*` / `h3_file_*` / `h3_proxy*` / `grpc_h2_*` / `grpc_h3*`）） |
+| `gen_configs.sh` | 計測用 `config.toml` バリアントを生成（**完全直交 2⁴=16** + full features 機能ショーケース `feat_*` + **全プロトコル×全機能マトリクス**（F-114: `h2_1_proxy_*` / `h3_file_*` / `h3_proxy*` / `grpc_h2_*` / `grpc_h3*`）+ **h2c（平文 HTTP/2 prior knowledge）**（`h2c_file` / `h2c_proxy`）） |
 | `analyze_results.sh` | 反復生データ（`results_raw.tsv`）を **median±stdev** に集計し Markdown を出力 |
 | `configs/*.toml` | 生成済みバリアント（`gen_configs.sh` で再生成可能） |
-| `nginx/nginx.conf` | 比較対象 nginx の設定（`access_log off` で公平化） |
+| `nginx/nginx.conf` | 比較対象 nginx の設定（`access_log off` で公平化。平文 8080 で `listen 8080; http2 on;` により h2c も有効化し、veil の h2c 専用リスナーと条件を揃える） |
 | `results/` | 計測結果（`results_raw.tsv` / `results_summary.md` / `logs/` は `.gitignore` 対象）。公開する生データは [docs/perf/results_raw.tsv](../../docs/perf/results_raw.tsv) へコピーしてコミットする（サマリは [docs/perf/README.md](../../docs/perf/README.md)） |
 
 計測に必要な静的アセットは **`docker/assets/`** を参照します（このディレクトリには複製しません）。
@@ -89,6 +89,8 @@ bash tools/perf/analyze_results.sh tools/perf/results/results_raw.tsv
 | `WRK_ARGS` | `-t4 -c100 -d10s --timeout 5s --latency` | HTTP/1.1（wrk）: 4 スレッド・100 接続・10 秒 |
 | `H2_ARGS` | `-n 30000 -c100 -m10` | HTTP/2（h2load）: 30000 リクエスト・100 接続・多重化 10 |
 | `H3_ARGS` | `--alpn-list=h3 -n 30000 -c100 -m10` | HTTP/3（h2load QUIC）: ALPN=h3・30000 リクエスト・100 接続・多重化 10 |
+| `H2C_PORT` | `8080` | h2c（平文 HTTP/2 prior knowledge）: veil の `h2c_listen` / nginx の `listen 8080 http2` のポート |
+| `H2C_ARGS` | `$H2_ARGS`（既定 `-n 30000 -c100 -m10`） | h2c（h2load 平文 prior knowledge）: 既定は HTTP/2 と同条件 |
 | `K6_VUS` | `50` | gRPC / WebSocket（k6）並列仮想ユーザ数 |
 | `K6_DURATION` | `10s` | gRPC / WebSocket（k6）計測時間 |
 | `CONFIG_GLOB` | `*` | 計測対象 config を絞り込む glob（例: `h3_*` / `grpc_*` / `h2_1_proxy_*`）。既定は全構成 |
@@ -170,6 +172,24 @@ http3 / grpc / websocket は専用クライアントで計測します（`run_pe
   per-listener の該当設定が無く（L7 の `[route.*]` / グローバル `[prometheus]` の責務）、
   設定として表現できないため **N/A**（L4 ベース `h2_0_feat_l4` 1 種のみ維持）。
 
+### h2c（平文 HTTP/2 prior knowledge、`h2c_file` / `h2c_proxy`）
+
+veil の平文リスナー `h2c_listen` は **h2c 専用**で HTTP/1.1 を受け付けません（`[server].http` は
+HTTPS への 301 リダイレクト専用のため計測に使えません）。そのため h2c は専用の 2 構成を用意し、
+`gen_srv_head` の第 2 引数（h2c ポート）で `h2c_enabled = true` / `h2c_listen = "0.0.0.0:8080"` を
+`[server]` に追加します。
+
+| 構成 | プロトコル | アクション | 計測対象 |
+|------|-----------|-----------|----------|
+| `h2c_file` | h2c | File | 平文 HTTP/2 prior knowledge での静的配信 |
+| `h2c_proxy` | h2c | Proxy(perf-backend) | 平文 HTTP/2 prior knowledge での逆プロキシ中継 |
+
+比較対象の nginx も `nginx/nginx.conf` の平文 8080 サーバブロックで `http2 on;` により h2c を
+有効化しており、`/proxy/` へのアクセスで `h2c_proxy` 相当の逆プロキシ経路も計測します
+（`run_perf.sh` が nginx ベースラインでも `h2c_file` / `h2c_proxy` と同じ config 名で結果を出力し、
+比較できるようにしています）。クライアントは通常の HTTP/2 と同じ `h2load` を `http://` スキームで
+使い、prior knowledge（ALPN ネゴシエーションなし）で接続します。
+
 > 網羅マトリクスを加えた全構成（65+）× glibc/musl × 反復 のフルスイートは非常に時間がかかります。
 > `CONFIG_GLOB` 環境変数で対象を絞り込めます（例: `CONFIG_GLOB='h3_*' bash tools/perf/run_perf.sh`
 > で HTTP/3 構成のみ、`CONFIG_GLOB='grpc_*'` で gRPC 構成のみ）。既定は全構成。
@@ -202,7 +222,7 @@ target  config  proto  iteration  req_per_sec  transfer  lat_avg  lat_p99  non2x
 
 - `target`: `nginx` / `veil_glibc` / `veil_musl`
 - `config`: バリアント名（nginx は `base` 固定）
-- `proto`: `http1.1`（wrk）/ `http2`（h2load）/ `http3`（h2load QUIC）/ `grpc`（k6）/ `websocket`（k6）
+- `proto`: `http1.1`（wrk）/ `http2`（h2load）/ `http3`（h2load QUIC）/ `h2c`（h2load 平文 prior knowledge）/ `grpc`（k6）/ `websocket`（k6）
 - `iteration`: 反復番号（1..`ITERATIONS`）
 - `cpu_pct` / `mem_mb`: 各反復の負荷中に `docker stats` を 3 回サンプルした平均
 
