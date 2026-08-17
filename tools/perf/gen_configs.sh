@@ -769,9 +769,25 @@ done
 # 2 経路を h2load の平文 prior knowledge モードで計測する。
 # ============================================================
 
+# 静的配信の推奨設定（F-157）。h2c は DATA フレーム再フレーミングが要るため
+# `sendfile(2)` に載せられず、キャッシュが無いと **1 リクエストごとに** offload
+# スレッドプールへ往復して open+read する（FreeBSD の DTrace 実測で確認）。
+# **2 つのキャッシュは必ずセットで有効にすること**: offload ゼロ経路は
+# 「メタデータキャッシュがヒットしたときに限り本体キャッシュを参照する」構造
+# （`src/cache/static_file.rs`）なので、本体キャッシュだけでは素通りする。
+# 比較対象の nginx 側も h2c サーバブロックで `open_file_cache` を有効にしてある。
+gen_static_cache() {
+    printf '\n[static_file_cache]\nenabled = true\nvalid_duration_secs = 60\nmax_entries = 1024\nmax_file_size_bytes = 1048576\n'
+}
+gen_route_ofc() {
+    printf '[route.open_file_cache]\nenabled = true\nvalid_duration_secs = 60\nmax_entries = 1024\n'
+}
+
 {
     gen_srv_head 0 8080
+    gen_static_cache
     gen_route file "" "/" none 0 '"HEAD", "GET"'
+    gen_route_ofc
 } | emit_cfg "$OUT/h2c_file.toml"
 
 {

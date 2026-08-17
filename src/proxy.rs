@@ -1055,8 +1055,7 @@ where
     stream_ids.clear();
     stream_ids.extend(streams.keys().copied());
 
-    for idx in 0..stream_ids.len() {
-        let sid = stream_ids[idx];
+    for &sid in stream_ids.iter() {
         // --- リクエストボディを req チャネルへ流す（バックプレッシャ考慮） ---
         {
             let st = streams.get_mut(&sid).unwrap();

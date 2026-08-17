@@ -30,6 +30,12 @@ key_path = "/etc/veil/ssl/key.pem"
 ktls_enabled = false
 ktls_fallback_enabled = true
 
+[static_file_cache]
+enabled = true
+valid_duration_secs = 60
+max_entries = 1024
+max_file_size_bytes = 1048576
+
 [[route]]
 [route.conditions]
 path = "/"
@@ -38,3 +44,7 @@ type = "File"
 path = "/var/www/"
 [route.security]
 allowed_methods = ["HEAD", "GET"]
+[route.open_file_cache]
+enabled = true
+valid_duration_secs = 60
+max_entries = 1024
