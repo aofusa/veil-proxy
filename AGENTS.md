@@ -49,6 +49,9 @@ AI エージェントおよびコントリビュータ向けの **最小指針**
 - **veil の平文リスナー（`h2c_listen`）は h2c 専用で HTTP/1.1 を受け付けない（F-155 で明文化）** — 平文 HTTP/1.1 は**メインリスナー（TLS ポート）のプロトコル検出**（`detect_protocol_with_buffer` → `accept_plain`）経由でしか到達しない。平文 HTTP/1.1 を計測・テストするときは `http://` を **TLS ポート**へ投げること（h2c ポートへ投げると「Plain HTTP/1.1 not supported on H2C-only server」で切断され、0 rps になる）。
 - **kqueue の readiness ヒントは read/write 両方向に持つ（F-141/F-155）** — `EVFILT_READ`/`EVFILT_WRITE` の `data` を `FdRecord::read_hint`/`write_hint` に保存し、`Readable`/`Writable` が確認用の `poll(2)` を省略する。**ヒントが無いときの `poll(2)` フォールバックを消してはならない**（消すと必ず kqueue 往復 1 回分のレイテンシが乗る）。consume-once（`take`）にして古いヒントが後続へ漏れないようにすること。
 - **accept は 1 周回 1 接続にしない（F-155）** — reactor バックエンドでは nginx の `multi_accept` 相当の `TcpListener::accept_batch`（上限 32 件）でバックログを引き上げる。上限で必ず抜けてイベントループへ戻る協調的設計を崩さないこと。`Accept::poll` と `accept_batch` は `raw_accept_one` を共用し、accept4/macOS フォールバック・fd リーク防止の順序を二重管理しない。**io_uring 側には実装せず `src/entry.rs` の cfg 分岐で切り分ける**（io_uring パスのロジックは変えない方針）。
+- **リスナーは必ず `server::create_listener` 経由で作る（F-156）** — `SO_REUSEPORT`（FreeBSD は `SO_REUSEPORT_LB`）による全ワーカーへの分散と、FreeBSD capsicum のリスナー fd 権利制限（`limit_listener_rights`）がこの関数に集約されている。**L4 だけが `TcpListener::bind` を直接呼んでいたため、(1) 設定の `threads` に関わらず 1 コアでしか動かず、(2) capsicum の権利制限が適用されていなかった**（doc コメントは「全経路が通る」と書いてあったが事実と違った）。新しいリスナーを足すときも必ずこの関数を通すこと。
+- **ワーカーを増やすときはワーカー間で共有すべき状態を必ず洗い出す（F-156）** — L4 のマルチワーカー化では`rr_state`（ラウンドロビン）・`conn_counters`（LeastConn）・`listener_counter`（`max_connections`）をリスナーにつき 1 個だけ作って `Arc` で配る。ワーカーごとに独立させると **`max_connections` の上限がワーカー数倍に緩む（設定違反）** ほか、ロードバランシングが壊れる。ヘルスチェッカーも同様にリスナーにつき 1 回だけ起動する（ワーカーごとだと上流へのヘルスチェックがワーカー数倍になる）。
+- **接続受理のホットパスで `to_string()` しない（F-156）** — クライアント IP は `http_utils::IpStr`（`[u8; 46]` のスタックバッファ）を使う。`peer_addr.ip().to_string()` は接続ごとの malloc になる。
 - **動的設定**は ArcSwap とリロード経路の不変条件を維持する。
 - **`unsafe` は最小限** — 拡大時は不変条件をコメントで明示。
 

@@ -1,0 +1,78 @@
+# F-156: L4 リスナーのマルチワーカー化と H2C ワーカーの accept 最適化
+
+- 優先度: P1
+- 状態: 対応中
+- 関連: F-155（FreeBSD perf・`accept_batch` の導入元）、F-120（reactor バックエンド）、B-66（平文大レスポンスの劣化）
+- 出典: `docs/artifacts/freebsd_h2c_l4_perf_analysis.md`
+
+## 背景
+
+F-155 で FreeBSD の TLS 系シナリオは対 nginx 1.00〜1.27 になったが、
+**h2c 平文（0.45〜0.61）と L4 TCP（0.63〜0.90）だけが劣後**して残っていた。
+
+## 実施内容
+
+### 1. L4 TCP リスナーのマルチワーカー化（最大の要因）
+
+**`spawn_l4_listeners` はリスナー定義 1 個につき `thread::spawn` を 1 回しか呼んでおらず、
+設定の `threads` に関わらず L4 TCP は常に 1 スレッド（1 コア）でしか動いていなかった。**
+比較対象の nginx は `worker_processes 2` + `listen ... reuseport` で 2 コアを使う。
+
+1 コアあたりの効率で見ると **veil のほうが速い**（veil 22.7k rps/コア vs nginx 18.1k rps/コア）
+ため、劣後の主因はコード効率ではなく**使用コア数**だった。
+
+- `spawn_l4_listeners(listeners, num_threads, balancing)` へシグネチャ変更し、
+  TCP リスナーを `num_threads` 個のワーカースレッドで起動する。
+- 各ワーカーは `crate::server::create_listener` を使う（`SO_REUSEPORT`、
+  FreeBSD は `SO_REUSEPORT_LB`）。
+- accept ループに F-155 と同じ `accept_batch`（reactor 限定、最大 32 件）を導入。
+
+**ロードバランシング状態は必ず全ワーカーで共有すること**（`Arc`）。
+`rr_state`/`conn_counters`/`listener_counter` をワーカーごとに独立させると
+(1) ラウンドロビンが偏る (2) LeastConn の最小接続選択が壊れる
+(3) **`max_connections` の上限がワーカー数倍に緩む（設定違反）** という 3 つの不具合が出る。
+ヘルスチェッカーもリスナーにつき 1 回だけ起動する（ワーカーごとだと上流への
+ヘルスチェック要求がワーカー数倍になる）。
+
+**UDP は現状維持**（シングルスレッド）。reuseport 分散はセッション管理
+（`sessions`）がワーカーごとに分断されるため、別途設計が必要。
+
+### 2. 副産物: capsicum のリスナー権利制限漏れの解消（セキュリティ）
+
+`src/server.rs` の `create_listener` の doc コメントには
+「全リスナー作成経路（HTTP/H2C/L4）がこの関数を通るため、ここが単一の適用ポイント」と
+書かれていたが、**L4 だけは `TcpListener::bind` を直接呼んでいて通っていなかった**。
+そのため FreeBSD で capsicum 有効時に **L4 リスナー fd にだけ
+`limit_listener_rights` が適用されていなかった**。
+マルチワーカー化で `create_listener` 経由に統一したことで、この抜けも塞がった。
+
+### 3. H2C ワーカーの accept 最適化
+
+- `accept_batch`（reactor 限定、最大 32 件）を導入（メイン TLS ワーカーと同一パターン。
+  `max_conn` 判定は `CURRENT_CONNECTIONS.load(..) + batch_accepted` 方式も含めて同じ）。
+- 接続ごとの `peer_addr.ip().to_string()`（ヒープ確保）を、メイン TLS ワーカーと同じ
+  スタック固定長バッファ `IpStr` へ置換（ホットパス絶対規則違反の是正）。
+
+## 分析ドキュメントから意図的に外したもの
+
+1. **h2c のプロトコル検出バイパス（改善案 3）— 不採用。**
+   節約できるのは接続あたり `Vec` 1 個で、`read` 自体は `Http2Connection` が
+   どのみち発行する。一方で失うものが大きい: 現在の実装は HTTP/1.1 や TLS が
+   h2c ポートへ来たときに「Plain HTTP/1.1 not supported on H2C-only server」等の
+   **明確な warn ログ**を出す。F-155 の計測作業で、平文 HTTP/1.1 を h2c ポートへ
+   投げてしまった原因をこのログで特定できた実績がある。バイパスすると
+   HTTP/2 プリフェース不一致エラーになり原因が分かりにくくなる。
+2. **L4 の 64KB バッファのスレッドローカルプール化（改善案 5）— 不採用。**
+   このバッファは**接続ごとに 1 回**（`forward_direction` の入口で 1 個）確保される
+   もので、リクエストごとではない。keep-alive の 64 接続・15 秒計測では
+   合計 64 回程度の確保にすぎず、計測可能な効果は無い。一方でバッファ再利用は
+   前接続のデータが混入する経路を新設することになり（分析ドキュメント自身が
+   このリスクを挙げている）、リスクだけが残る。
+3. **h2c の DATA フレーム `writev` 直結（改善案 4 / H10）— 別チケット F-157 へ分離。**
+   F-74 のフレーム連結・F-116 の多重化アクターモデル・フロー制御チャンク分割・
+   `writev` の部分書き込み再開をまたぐ設計変更であり、期待値も未実測。
+   B-66 の解消で計測の分解能が戻ってから着手する。
+4. **ハーネスへの `static_file_cache` バリエーション追加（改善案 6）— 見送り。**
+   F-146 の効果（3B で 168k → 224k rps、+32%）は `docs/perf/README.md` に
+   計測済みで記録されている。既定構成の比較に別条件を混ぜると
+   「どの構成同士を比べたのか」が曖昧になるため、必要なら独立した計測として行う。

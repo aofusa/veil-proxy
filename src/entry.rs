@@ -1,5 +1,6 @@
 //! バイナリエントリ（`main` から `veil::run()` で呼び出す）。
 
+use crate::http_utils::IpStr;
 use crate::logging::*;
 use crate::metrics::*;
 use crate::pool::*;
@@ -1427,7 +1428,7 @@ pub fn run() {
                         let accept_result =
                             timeout(Duration::from_secs(1), listener.accept()).await;
 
-                        let (mut stream, peer_addr) = match accept_result {
+                        let (stream, peer_addr) = match accept_result {
                             Ok(Ok(s)) => s,
                             Ok(Err(e)) => {
                                 error!("[H2C Worker {}] Accept error: {}", thread_id, e);
@@ -1439,59 +1440,104 @@ pub fn run() {
                             }
                         };
 
-                        // F-35: 最前線 IP ブロックリスト（プロトコル検出前に弾く）
-                        if crate::config::is_ip_blocked(peer_addr.ip()) {
-                            continue;
-                        }
+                        // F-155/H6: 1 周回で受理した接続数のローカルカウンタ。
+                        // バッチ内で spawn したタスクはまだ `ConnectionGuard::new()` を
+                        // 実行していない可能性があるため（spawn 直後はまだ poll されて
+                        // いない）、`CURRENT_CONNECTIONS` のロード値だけでは同一バッチ内で
+                        // 受理済みの分を勘定できない。`CURRENT_CONNECTIONS.load(..) +
+                        // batch_accepted` で判定することで、バッチ受理中に同時接続数
+                        // 上限を一時的に超えるのを防ぐ（メインワーカーと同じ方式）。
+                        let mut batch_accepted: usize = 0;
 
-                        // 同時接続数制限チェック
-                        if max_conn > 0 {
-                            let current = CURRENT_CONNECTIONS.load(Ordering::Relaxed);
-                            if current >= max_conn {
-                                warn!("[H2C Worker {}] Connection limit reached ({}/{}), rejecting connection from {}", 
-                                      thread_id, current, max_conn, peer_addr);
-                                drop(stream);
-                                continue;
+                        // 1 件受理した接続の検証・処理ロジック（1 件目・バッチ内の残りで
+                        // 共通のため、ローカルクロージャへまとめる）。
+                        let mut handle_accepted =
+                            |mut stream: crate::runtime::tcp::TcpStream, peer_addr: SocketAddr| {
+                                // F-35: 最前線 IP ブロックリスト（プロトコル検出前に弾く）
+                                if crate::config::is_ip_blocked(peer_addr.ip()) {
+                                    return;
+                                }
+
+                                // 同時接続数制限チェック（上の doc コメント参照）。
+                                if max_conn > 0 {
+                                    let current = CURRENT_CONNECTIONS.load(Ordering::Relaxed)
+                                        + batch_accepted;
+                                    if current >= max_conn {
+                                        warn!(
+                                            "[H2C Worker {}] Connection limit reached ({}/{}), rejecting connection from {}",
+                                            thread_id, current, max_conn, peer_addr
+                                        );
+                                        drop(stream);
+                                        return;
+                                    }
+                                }
+
+                                let _ = stream.set_nodelay(true);
+                                batch_accepted += 1;
+
+                                // H2C接続処理をspawn（パニック耐性あり・型付きプール）
+                                spawn_pooled_with_panic_catch(&conn_pool, async move {
+                                    let _guard = ConnectionGuard::new();
+                                    // H7: `peer_addr.ip().to_string()` のヒープ確保を排除し、
+                                    // メイン TLS ワーカー（`handle_connection`）と同じスタック
+                                    // 固定長バッファ（`IpStr`）を使う。`as_str()` の借用が
+                                    // `handle_h2c_connection(...).await` の呼び出し全体で
+                                    // 生存するよう、この async ブロック内で保持する。
+                                    let client_ip = IpStr::new(peer_addr.ip());
+                                    // H2C専用リスナーでも、プロトコル検出を実行して初期データを取得
+                                    // これにより、クライアントがまだプリフェースを送信していない場合でも
+                                    // 正しく処理できる
+                                    let (protocol_type, initial_data) =
+                                        detect_protocol_with_buffer(&mut stream).await;
+
+                                    match protocol_type {
+                                        ProtocolType::H2C => {
+                                            // H2C接続処理
+                                            handle_h2c_connection(
+                                                stream,
+                                                client_ip.as_str(),
+                                                initial_data,
+                                            )
+                                            .await;
+                                        }
+                                        ProtocolType::Http11 => {
+                                            // HTTP/1.1はH2C専用サーバーではサポートしない
+                                            warn!(
+                                                "[H2C Worker] Plain HTTP/1.1 not supported on H2C-only server, closing connection from {}",
+                                                peer_addr
+                                            );
+                                        }
+                                        ProtocolType::TLS => {
+                                            // TLSはH2C専用サーバーではサポートしない
+                                            warn!(
+                                                "[H2C Worker] TLS not supported on H2C-only server, closing connection from {}",
+                                                peer_addr
+                                            );
+                                        }
+                                        ProtocolType::Unknown => {
+                                            warn!(
+                                                "[H2C Worker] Unknown protocol from {}, closing connection",
+                                                peer_addr
+                                            );
+                                        }
+                                    }
+                                });
+                            };
+
+                        handle_accepted(stream, peer_addr);
+
+                        // F-155/H6: nginx の `multi_accept` 相当。1 件目に続けて、
+                        // バックログに滞留している接続を合計最大 32 件（1 件目 + 31 件）まで
+                        // 一気に受理・spawn する。io_uring バックエンド（`veil_rt_uring`）の
+                        // `TcpListener` には `accept_batch` が存在しない（io_uring パスの
+                        // ロジックは変更しない方針のため）ので、reactor バックエンド
+                        // （`veil_rt_reactor`: epoll/kqueue）限定で有効にする。
+                        #[cfg(veil_rt_reactor)]
+                        {
+                            if let Err(e) = listener.accept_batch(31, &mut handle_accepted) {
+                                error!("[H2C Worker {}] Accept error: {}", thread_id, e);
                             }
                         }
-
-                        let _ = stream.set_nodelay(true);
-
-                        // H2C接続処理をspawn（パニック耐性あり・型付きプール）
-                        spawn_pooled_with_panic_catch(&conn_pool, async move {
-                            let _guard = ConnectionGuard::new();
-                            // H2C専用リスナーでも、プロトコル検出を実行して初期データを取得
-                            // これにより、クライアントがまだプリフェースを送信していない場合でも
-                            // 正しく処理できる
-                            let (protocol_type, initial_data) =
-                                detect_protocol_with_buffer(&mut stream).await;
-
-                            match protocol_type {
-                                ProtocolType::H2C => {
-                                    // H2C接続処理
-                                    handle_h2c_connection(
-                                        stream,
-                                        &peer_addr.ip().to_string(),
-                                        initial_data,
-                                    )
-                                    .await;
-                                }
-                                ProtocolType::Http11 => {
-                                    // HTTP/1.1はH2C専用サーバーではサポートしない
-                                    warn!("[H2C Worker] Plain HTTP/1.1 not supported on H2C-only server, closing connection from {}", peer_addr);
-                                }
-                                ProtocolType::TLS => {
-                                    // TLSはH2C専用サーバーではサポートしない
-                                    warn!("[H2C Worker] TLS not supported on H2C-only server, closing connection from {}", peer_addr);
-                                }
-                                ProtocolType::Unknown => {
-                                    warn!(
-                                        "[H2C Worker] Unknown protocol from {}, closing connection",
-                                        peer_addr
-                                    );
-                                }
-                            }
-                        });
                     }
 
                     // グレースフルシャットダウン: 既存接続の完了を待機
@@ -1512,7 +1558,11 @@ pub fn run() {
             info!("L4 Stream Proxy");
             info!("Listeners: {}", loaded_config.l4_listeners.len());
             info!("============================================");
-            crate::l4::server::spawn_l4_listeners(&loaded_config.l4_listeners);
+            crate::l4::server::spawn_l4_listeners(
+                &loaded_config.l4_listeners,
+                num_threads,
+                loaded_config.reuseport_balancing,
+            );
         }
     }
 
