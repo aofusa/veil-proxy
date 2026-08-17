@@ -1807,6 +1807,8 @@ UDP is connectionless, so the UDP path uses a session-table design similar to ng
 
 L4 listeners are defined using `[[l4]]` sections (separate from HTTP routes). L4 listeners are started at launch and **cannot be hot-reloaded** via SIGHUP.
 
+**Threading (F-156)**: TCP listeners run on `[server].threads` worker threads, each replicating the listener socket with `SO_REUSEPORT` (`SO_REUSEPORT_LB` on FreeBSD) and accepting on its own event loop — the same model as the HTTP/H2C workers. Before F-156 the L4 listener ran on a **single thread regardless of `threads`**, capping throughput on multi-core hosts (measured on FreeBSD: 0.58 → 1.09 relative to nginx). Load-balancing state (round-robin position, per-upstream connection counts) and the `max_connections` counter are shared across all workers, so distribution accuracy and the limit are preserved. UDP listeners remain single-threaded (the session table would be partitioned across workers).
+
 ```toml
 # TCP proxy for PostgreSQL (requires --features l4-proxy)
 [[l4]]

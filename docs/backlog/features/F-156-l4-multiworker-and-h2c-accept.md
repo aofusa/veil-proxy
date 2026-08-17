@@ -116,3 +116,37 @@ accept は計測開始時の 64 回しか走らない。** 15 秒間のスルー
 最終的には、メイン TLS ワーカー・L4 ワーカーとの一貫性と、
 短命接続ワークロードでの本来の効果を理由に**採用**した。
 評価するには接続確立レートを測る別の負荷が必要。
+
+
+## 検証結果
+
+- **Linux x86_64**
+  - 単体 876 / 統合 54 すべて成功。
+  - E2E（io_uring 既定）: **544 passed / 0 failed**。
+  - E2E（`full,epoll` = reactor 経路。F-145 の教訓に従い必須）: 543 passed / 1 failed
+    （`test_http3_large_request_body` = 既存の B-61。同一コードで io_uring は全成功）。
+  - `cargo check` / `cargo clippy -- -D warnings`: `default` / `no-default-features` /
+    `full` / `full,epoll` / `full-container` / 個別 feature 21 種の **計 26 構成すべて警告ゼロ**。
+    `cargo fmt --check` クリーン。
+  - feature 総当たりで `--no-default-features` 時の未使用 import 警告 1 件を検出し、
+    `#[allow]` を足さずに完全修飾パス化で修正した。
+- **FreeBSD 14.3 aarch64 実機**
+  - `full-freebsd` リリースビルド **警告ゼロ**（L4 マルチワーカー・`accept_batch`・
+    capsicum のコードは Linux では別 cfg なので、この実機ビルドが唯一の型検査になる）。
+  - E2E: 542 passed / 2 failed。2 件はいずれも HTTP/3 の大容量リクエストボディ系で、
+    `test_http3_request_body_streaming_tls_backend` は単独実行で成功（4 回中 1 回の
+    フレーキー）、`test_http3_large_request_body` は既存の B-61。どちらも本変更が
+    触れていない経路（→ B-61 に観測を追記）。
+  - `sockstat` で 1 プロセス内に L4 listen ソケットが `threads` 本できることを確認。
+
+## ドキュメント更新
+
+- `AGENTS.md`: リスナーは必ず `create_listener` 経由で作ること、ワーカーを増やすときは
+  共有すべき状態を洗い出すこと（`max_connections` がワーカー数倍に緩む罠）、
+  接続受理のホットパスで `to_string()` しないこと、この VM のノイズは数ラウンドの
+  一致では超えられないこと、A/B の別バイナリは basename を `veil` にすること。
+- `README.md` / `docs/readme/README.ja.md` / `examples/config.toml`:
+  L4 の TCP リスナーが `[server].threads` 個のワーカーで動くようになったこと
+  （F-156 より前は 1 スレッド固定だったこと）、LB 状態と `max_connections` は
+  ワーカー間で共有されること、UDP はシングルスレッド維持であることを明記。
+- `docs/perf/README.md`: L4 の実測表と、計測の落とし穴 2 件を追記。
