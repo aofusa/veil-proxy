@@ -338,8 +338,26 @@ EOF
 # ---------------------------------------------------------------------------
 # サーバのライフサイクル
 # ---------------------------------------------------------------------------
+
+# 計測対象 veil を確実に停止する。
+#
+# **`pkill -x veil` だけでは不十分**（実測で踏んだ）: `-x` はプロセス名の**完全一致**
+# なので、`VEIL_BIN` に `veil.f156` のような別名のバイナリを指定して A/B すると
+# 1 つも kill されない。さらに veil のリスナーは `SO_REUSEPORT`(_LB) で bind するため、
+# **取り残された旧プロセスが同じポートを掴んだまま生き残り、カーネルが新旧プロセスへ
+# 接続を分散してしまう**（＝別バイナリの混合を計測する）。実際にこれで A/B が丸ごと
+# 無効化され、取り残しが 13 プロセスまで積み上がって「ラウンドごとに単調劣化する」
+# という誤った結論を出しかけた。
+#
+# そのため (1) 実行中の `VEIL_BIN` をフルパスで狙い撃ちし、(2) 名前が `veil` の
+# プロセスも従来どおり落とす、の 2 段構えにする。
+stop_veil() {
+    pkill -f "^${VEIL_BIN}( |$)" >/dev/null 2>&1 || true
+    pkill -x veil >/dev/null 2>&1 || true
+}
+
 stop_all() {
-    pkill -x veil  >/dev/null 2>&1 || true
+    stop_veil
     if [ -f "${WORK}/nginx/nginx.pid" ]; then
         nginx -c "${WORK}/conf/nginx.conf" -s quit >/dev/null 2>&1 || true
     fi
@@ -355,6 +373,16 @@ start_nginx() {
 
 start_veil() {
     cfg="$1"; shift
+    # 起動前に veil のプロセスが 1 つも残っていないことを確認する。
+    # SO_REUSEPORT(_LB) のため、取り残しがいると新旧プロセスが同じポートを共有し、
+    # カーネルが両方へ接続を分散して**別バイナリの混合を計測してしまう**
+    # （`stop_veil` のコメント参照。実際に A/B を丸ごと無効化した）。
+    # 残っていたら黙って続行せず、計測を止める。
+    leftover=$(pgrep veil | wc -l | tr -d ' ')
+    if [ "${leftover}" != "0" ]; then
+        pgrep -l veil >&2 || true
+        die "veil のプロセスが ${leftover} 個残っている（計測が混ざるので中止）"
+    fi
     # cpuset で計測対象コアへ固定する。veil 自身の CPU アフィニティ設定は
     # cpuset のマスク内で解決されるため二重指定でも問題ない。
     cpuset -l "${SRV_CPUS}" "${VEIL_BIN}" -c "${cfg}" "$@" \
@@ -534,7 +562,7 @@ run_scenario() {
     esac
     r=$(measure "$tool" "$v_url")
     printf '%s\t%s\t%s\t%s\n' "$sc" veil "$iter" "$r" >> "${OUT_TSV}"
-    pkill -x veil >/dev/null 2>&1 || true
+    stop_veil
     sleep 1
 }
 

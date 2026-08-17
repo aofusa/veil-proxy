@@ -1526,12 +1526,23 @@ pub fn run() {
 
                         handle_accepted(stream, peer_addr);
 
-                        // F-155/H6: nginx の `multi_accept` 相当。1 件目に続けて、
-                        // バックログに滞留している接続を合計最大 32 件（1 件目 + 31 件）まで
-                        // 一気に受理・spawn する。io_uring バックエンド（`veil_rt_uring`）の
-                        // `TcpListener` には `accept_batch` が存在しない（io_uring パスの
-                        // ロジックは変更しない方針のため）ので、reactor バックエンド
-                        // （`veil_rt_reactor`: epoll/kqueue）限定で有効にする。
+                        // F-156: nginx の `multi_accept` 相当。1 件目に続けて、バックログに
+                        // 滞留している接続を合計最大 32 件（1 件目 + 31 件）まで一気に受理する。
+                        // メイン TLS ワーカー・L4 ワーカーと同じパターン。
+                        // io_uring バックエンド（`veil_rt_uring`）の `TcpListener` には
+                        // `accept_batch` が無い（io_uring パスのロジックは変更しない方針）ため、
+                        // reactor バックエンド（`veil_rt_reactor`: epoll/kqueue）限定で有効にする。
+                        //
+                        // **効果は FreeBSD の既存ハーネスでは測定できない**（測定を試みた記録）:
+                        // `h2c_file_plain` は h2load が keep-alive で 64 接続を張りっぱなしに
+                        // するため、accept は計測開始時の 64 回しか実行されず、
+                        // 15 秒間のスループットにはほぼ寄与しない。実際、有無を変えた交互 A/B を
+                        // 2 回（計 8 ラウンド）取ったところ、1 回目は「有り」が一貫して劣り、
+                        // 2 回目は「有り」が一貫して勝つという逆の結果になり、8 サンプルの
+                        // 平均は 0.431 対 0.434 でほぼ同一だった（＝差は測定ノイズ）。
+                        // **この構成の数ラウンドの一致を根拠に採否を判断してはならない。**
+                        // 本最適化が効くのは短命接続が支配的なワークロードであり、
+                        // 評価するにはそれ用の負荷（接続確立レートを測るもの）が要る。
                         #[cfg(veil_rt_reactor)]
                         {
                             if let Err(e) = listener.accept_batch(31, &mut handle_accepted) {
