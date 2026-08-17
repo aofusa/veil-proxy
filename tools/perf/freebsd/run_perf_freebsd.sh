@@ -283,14 +283,14 @@ ktls_fallback_enabled = true
 # 静的コンテンツキャッシュ（F-146）を有効化する。
 #
 # HTTP/2・HTTP/3 は DATA フレーム / QUIC ストリームへの再フレーミングが要るため
-# `sendfile(2)` に載せられず、ファイル本体をユーザ空間へ読み出す必要がある。
+# sendfile(2) に載せられず、ファイル本体をユーザ空間へ読み出す必要がある。
 # 無効のままだと **1 リクエストごとに** offload スレッドプールへ往復して
 # open/fstat/lseek/read/close を実行する（F-157 の DTrace 実測で 1 リクエストあたり
 # openat 1.0 / fstat 2.0 / lseek 1.0 / close 1.0 / read 3.0 / 完了通知パイプの
 # 1 バイト write 1.0 / _umtx_op 1.6 を確認）。これが h2c 平文で nginx に劣後する
 # 主因だった。
 #
-# 比較対象の nginx 側も `open_file_cache` を有効にしてあり（生成する nginx.conf を
+# 比較対象の nginx 側も open_file_cache を有効にしてあり（生成する nginx.conf を
 # 参照）、**双方とも「静的配信向けに推奨設定を入れた状態」で突き合わせる**。
 # 片方だけチューニングして測ってはならない（F-155 の kTLS と同じ失敗）。
 [static_file_cache]
@@ -314,7 +314,7 @@ path = "${WORK}/www/"
 allowed_methods = ["HEAD", "GET"]
 
 # メタデータキャッシュ（open_file_cache）。**[static_file_cache] と必ずセットで
-# 有効にすること**（F-157）: `cache::get_static_file_with_content` の offload ゼロ
+# 有効にすること**（F-157）: cache::get_static_file_with_content の offload ゼロ
 # 経路は「メタデータキャッシュがヒットしたときに限り本体キャッシュを参照する」
 # 構造（src/cache/static_file.rs）なので、本体キャッシュだけ有効にしても
 # 素通りして毎リクエスト offload の open+read に落ちる（実測で openat が
