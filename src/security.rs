@@ -2552,7 +2552,7 @@ pub mod capsicum {
     // 封じ込めは `O_RESOLVE_BENEATH`（FreeBSD 13+）が担う（`..`/シンボリックリンクで
     // ルート外へ抜ける解決を EACCES で拒否。capability mode 自体の beneath 強制と多重化）。
     // ------------------------------------------------------------------
-    use std::ffi::CString;
+    use std::ffi::{CStr, CString};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::io::FromRawFd;
     use std::path::{Path, PathBuf};
@@ -2632,21 +2632,56 @@ pub mod capsicum {
         STATIC_ACTIVE.load(Ordering::Acquire)
     }
 
-    /// 絶対パスを登録ルート配下の相対 `CString` + ルート dirfd へ解決する。
-    /// 有効化されていない / どのルート配下でもない場合は `None`（呼び出し側は通常経路へ）。
-    fn resolve_root(abs: &Path) -> Option<(RawFd, CString)> {
+    /// 絶対パスを登録ルート配下の相対パスへ解決し、ルート dirfd と NUL 終端された
+    /// 相対パス（`&CStr`）をコールバック `f` に渡す（F-155: ゼロアロケーション版）。
+    ///
+    /// 相対パスのバイト列は **スタック上の固定長バッファ**（FreeBSD の `PATH_MAX` =
+    /// 1024 バイト、NUL 終端込み）へコピーする。`CString::new` によるヒープ確保は
+    /// 一切行わない（静的ファイルアクセスのたびに実行されるホットパスのため）。
+    ///
+    /// - 相対パスが空なら `"."` を使う（旧 `resolve_root` と同じ挙動）。
+    /// - 相対パスの途中に NUL バイトを含む場合は `None` を返す（`CString::new` が
+    ///   NUL 混入時にエラーを返していた既存の安全性を落とさないため）。
+    /// - 相対パス（NUL 終端込み）が `PATH_MAX`(1024) に収まらない場合も `None` を
+    ///   返す。FreeBSD の `openat`/`fstatat` はこの場合どのみち `ENAMETOOLONG` に
+    ///   なるため、ヒープへフォールバックしてまで受理する意味がない
+    ///   （ホットパスにアロケーション経路を残さないほうが AGENTS.md の規約に沿うと
+    ///   判断し、設計書にある「CString フォールバック」はあえて採用していない）。
+    /// - 有効化されていない / どのルート配下でもない場合は `None`
+    ///   （呼び出し側は通常経路へフォールバックする）。
+    fn with_resolved_root<F, R>(abs: &Path, f: F) -> Option<R>
+    where
+        F: FnOnce(RawFd, &CStr) -> R,
+    {
         if !static_serving_active() {
             return None;
         }
         let dirs = STATIC_DIRS.get()?;
         for (root, fd) in dirs {
             if let Ok(rel) = abs.strip_prefix(root) {
-                let rel_c = if rel.as_os_str().is_empty() {
-                    CString::new(".").ok()?
+                let rel_bytes = rel.as_os_str().as_bytes();
+                let src: &[u8] = if rel_bytes.is_empty() {
+                    b"."
                 } else {
-                    CString::new(rel.as_os_str().as_bytes()).ok()?
+                    rel_bytes
                 };
-                return Some((*fd, rel_c));
+                // 途中に NUL バイトが含まれる場合は安全な CStr を構築できない。
+                if src.contains(&0) {
+                    return None;
+                }
+                // NUL 終端込みで PATH_MAX(1024) に収まらない場合は openat/fstatat 側で
+                // どのみち ENAMETOOLONG になるため、ヒープへフォールバックせず None。
+                if src.len() >= 1024 {
+                    return None;
+                }
+                let mut buf = [0u8; 1024];
+                buf[..src.len()].copy_from_slice(src);
+                buf[src.len()] = 0;
+                // SAFETY: buf[..=src.len()] は「NUL を含まないことを確認済みの
+                // src」+ 末尾 1 バイトの 0 からなり、CStr::from_bytes_with_nul の
+                // 不変条件（NUL は末尾に 1 個のみ）を満たす。
+                let cstr = unsafe { CStr::from_bytes_with_nul_unchecked(&buf[..=src.len()]) };
+                return Some(f(*fd, cstr));
             }
         }
         None
@@ -2659,7 +2694,7 @@ pub mod capsicum {
     /// （`cache::get_static_file_with_content`）が「1 回の offload で済む高速経路」かを、
     /// offload を起動する **前**に決めるために使う（`resolve::has_fast_path` の
     /// FreeBSD 版）。
-    /// `resolve_root` と異なり `CString` を確保しない（判定専用・ホットパスで
+    /// `with_resolved_root` と異なりスタックバッファへのコピーすら行わない（判定専用・ホットパスで
     /// アロケーションを増やさないため）。
     pub fn is_registered_static_root(abs: &Path) -> bool {
         if !static_serving_active() {
@@ -2675,47 +2710,49 @@ pub mod capsicum {
     /// `None` = 相対化対象外（通常の絶対パス open にフォールバック）。
     /// `Some(Err)` = 相対化対象だが openat 失敗（404 相当）。
     pub fn open_static_ro(abs: &Path) -> Option<io::Result<std::fs::File>> {
-        let (dirfd, rel) = resolve_root(abs)?;
-        let fd = unsafe {
-            libc::openat(
-                dirfd,
-                rel.as_ptr(),
-                libc::O_RDONLY | libc::O_CLOEXEC | O_RESOLVE_BENEATH,
-            )
-        };
-        if fd < 0 {
-            Some(Err(io::Error::last_os_error()))
-        } else {
-            // SAFETY: openat が返した所有権のある有効な fd。
-            Some(Ok(unsafe { std::fs::File::from_raw_fd(fd) }))
-        }
+        with_resolved_root(abs, |dirfd, rel| {
+            let fd = unsafe {
+                libc::openat(
+                    dirfd,
+                    rel.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | O_RESOLVE_BENEATH,
+                )
+            };
+            if fd < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                // SAFETY: openat が返した所有権のある有効な fd。
+                Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+            }
+        })
     }
 
     /// capability mode 下でルート dirfd 相対に `fstatat` する（`canonicalize`+`metadata` 代替）。
     pub fn stat_static(abs: &Path) -> Option<io::Result<StaticStat>> {
-        let (dirfd, rel) = resolve_root(abs)?;
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        let ret = unsafe { libc::fstatat(dirfd, rel.as_ptr(), &mut st, AT_RESOLVE_BENEATH) };
-        if ret != 0 {
-            return Some(Err(io::Error::last_os_error()));
-        }
-        let is_file = (st.st_mode & libc::S_IFMT) == libc::S_IFREG;
-        let is_dir = (st.st_mode & libc::S_IFMT) == libc::S_IFDIR;
-        let mtime = {
-            let secs = st.st_mtime;
-            let nsecs = st.st_mtime_nsec;
-            if secs >= 0 {
-                Some(UNIX_EPOCH + Duration::new(secs as u64, nsecs as u32))
-            } else {
-                None
+        with_resolved_root(abs, |dirfd, rel| {
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            let ret = unsafe { libc::fstatat(dirfd, rel.as_ptr(), &mut st, AT_RESOLVE_BENEATH) };
+            if ret != 0 {
+                return Err(io::Error::last_os_error());
             }
-        };
-        Some(Ok(StaticStat {
-            len: st.st_size as u64,
-            mtime,
-            is_file,
-            is_dir,
-        }))
+            let is_file = (st.st_mode & libc::S_IFMT) == libc::S_IFREG;
+            let is_dir = (st.st_mode & libc::S_IFMT) == libc::S_IFDIR;
+            let mtime = {
+                let secs = st.st_mtime;
+                let nsecs = st.st_mtime_nsec;
+                if secs >= 0 {
+                    Some(UNIX_EPOCH + Duration::new(secs as u64, nsecs as u32))
+                } else {
+                    None
+                }
+            };
+            Ok(StaticStat {
+                len: st.st_size as u64,
+                mtime,
+                is_file,
+                is_dir,
+            })
+        })
     }
 
     // ------------------------------------------------------------------

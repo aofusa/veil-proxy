@@ -915,36 +915,68 @@ pub fn run() {
                             }
                         };
 
-                        // F-35: 最前線 IP ブロックリスト。ブロック対象 IP は TLS ハンドシェイク
-                        // 前・ハンドラ spawn 前に切断する（stream は drop で閉じられる）。
-                        if crate::config::is_ip_blocked(peer_addr.ip()) {
-                            continue;
-                        }
+                        // F-155: 1 周回で受理した接続数のローカルカウンタ。
+                        // バッチ内で spawn したタスクはまだ `ConnectionGuard::new()` を
+                        // 実行していない可能性があるため（spawn 直後はまだ poll されて
+                        // いない）、`CURRENT_CONNECTIONS` のロード値だけでは同一バッチ内で
+                        // 受理済みの分を勘定できない。`CURRENT_CONNECTIONS.load(..) +
+                        // batch_accepted` で判定することで、バッチ受理中に同時接続数
+                        // 上限を一時的に超えるのを防ぐ。
+                        let mut batch_accepted: usize = 0;
 
-                        // 同時接続数制限チェック
-                        if max_conn > 0 {
-                            let current = CURRENT_CONNECTIONS.load(Ordering::Relaxed);
-                            if current >= max_conn {
-                                warn!("[Thread {}] Connection limit reached ({}/{}), rejecting connection from {}",
-                                  thread_id, current, max_conn, peer_addr);
-                                drop(stream);
-                                continue;
+                        // 1 件受理した接続の検証・処理ロジック（1 件目・バッチ内の残りで
+                        // 共通のため、ローカルクロージャへまとめる）。
+                        let mut handle_accepted =
+                            |stream: crate::runtime::tcp::TcpStream, peer_addr: SocketAddr| {
+                                // F-35: 最前線 IP ブロックリスト。ブロック対象 IP は TLS
+                                // ハンドシェイク前・ハンドラ spawn 前に切断する
+                                // （stream は drop で閉じられる）。
+                                if crate::config::is_ip_blocked(peer_addr.ip()) {
+                                    return;
+                                }
+
+                                // 同時接続数制限チェック（上の doc コメント参照）。
+                                if max_conn > 0 {
+                                    let current = CURRENT_CONNECTIONS.load(Ordering::Relaxed)
+                                        + batch_accepted;
+                                    if current >= max_conn {
+                                        warn!("[Thread {}] Connection limit reached ({}/{}), rejecting connection from {}",
+                                          thread_id, current, max_conn, peer_addr);
+                                        drop(stream);
+                                        return;
+                                    }
+                                }
+
+                                let _ = stream.set_nodelay(true);
+                                batch_accepted += 1;
+
+                                let acceptor = acceptor_clone.clone();
+
+                                // パニックキャッチ + 型付きプール（F-46）でスレッド生存とゼロ確保を両立
+                                spawn_pooled_with_panic_catch(&conn_pool, async move {
+                                    // ConnectionGuard がスコープ内で生存している間、接続がカウントされる
+                                    // パニック時も Drop が呼ばれるため、カウンターの整合性が保証される
+                                    let _guard = ConnectionGuard::new();
+                                    // handle_connection 内で CURRENT_CONFIG から最新の設定を取得
+                                    // これによりホットリロード時に新しい設定が即座に反映される
+                                    handle_connection(stream, acceptor, peer_addr).await;
+                                });
+                            };
+
+                        handle_accepted(stream, peer_addr);
+
+                        // F-155: nginx の `multi_accept` 相当。1 件目に続けて、
+                        // バックログに滞留している接続を合計最大 32 件（1 件目 + 31 件）まで
+                        // 一気に受理・spawn する。io_uring バックエンド（`veil_rt_uring`）の
+                        // `TcpListener` には `accept_batch` が存在しない（io_uring パスの
+                        // ロジックは変更しない方針のため）ので、reactor バックエンド
+                        // （`veil_rt_reactor`: epoll/kqueue）限定で有効にする。
+                        #[cfg(veil_rt_reactor)]
+                        {
+                            if let Err(e) = listener.accept_batch(31, &mut handle_accepted) {
+                                error!("[Thread {}] Accept error: {}", thread_id, e);
                             }
                         }
-
-                        let _ = stream.set_nodelay(true);
-
-                        let acceptor = acceptor_clone.clone();
-
-                        // パニックキャッチ + 型付きプール（F-46）でスレッド生存とゼロ確保を両立
-                        spawn_pooled_with_panic_catch(&conn_pool, async move {
-                            // ConnectionGuard がスコープ内で生存している間、接続がカウントされる
-                            // パニック時も Drop が呼ばれるため、カウンターの整合性が保証される
-                            let _guard = ConnectionGuard::new();
-                            // handle_connection 内で CURRENT_CONFIG から最新の設定を取得
-                            // これによりホットリロード時に新しい設定が即座に反映される
-                            handle_connection(stream, acceptor, peer_addr).await;
-                        });
                     }
 
                     // グレースフルシャットダウン: 既存接続の完了を待機

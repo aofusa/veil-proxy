@@ -121,6 +121,30 @@ pub(crate) fn take_read_hint(fd: RawFd) -> usize {
         .unwrap_or(0)
 }
 
+/// F-155: fd の直近の `EVFILT_WRITE` readiness ヒント（送信可能バイト数の
+/// スナップショット、`poller::FdRecord::write_hint` 参照）を **消費**（0 にリセット）
+/// しつつ取得する。
+///
+/// consume-once（take）にする理由は `take_read_hint` と同一（`dispatch_event` が
+/// Waker を起こすのと同一スレッド・同一イベントループ周回内で、起こされたタスクが
+/// 直後に再 poll されるため、「起こされた直後の 1 回だけヒントを信頼して `poll(2)` の
+/// 確認 syscall を省略し、以降は 0 に戻す」ことで、無関係な後続の poll 呼び出しが
+/// 古いヒントを誤って読み取って spurious な readiness を報告することを防ぐ）。
+///
+/// reactor 未初期化のスレッドや、その fd に対する write イベントがまだ一度も
+/// 届いていない場合は `0` を返す。
+#[cfg(veil_poller_kqueue)]
+pub(crate) fn take_write_hint(fd: RawFd) -> usize {
+    FD_TABLE
+        .try_with(|t| {
+            t.borrow_mut()
+                .get_mut(fd)
+                .map(|r| std::mem::take(&mut r.write_hint))
+                .unwrap_or(0)
+        })
+        .unwrap_or(0)
+}
+
 #[cfg(veil_poller_epoll)]
 fn with_poller<R>(f: impl FnOnce(&EpollPoller) -> R) -> R {
     POLLER.with(|p| {
@@ -502,6 +526,12 @@ fn dispatch_event(fd: RawFd, flags: u32, data_hint: impl TryInto<i64>) {
         let mut ww = Vec::new();
         if flags & READ != 0 {
             rec.read_hint = data_hint;
+        }
+        // F-155: read_hint と対称に、waker が空でも（futures 側が readiness を
+        // まだ待っていない場合でも）ヒントだけは保存する。次回 `Writable::poll` 等が
+        // 確認用 poll(2) を省略できるようにするため。
+        if flags & WRITE != 0 {
+            rec.write_hint = data_hint;
         }
         if flags & READ != 0 && !rec.read_wakers.is_empty() {
             rw = std::mem::take(&mut rec.read_wakers);

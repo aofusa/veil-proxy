@@ -243,6 +243,62 @@ impl TcpListener {
         }
         storage_to_sockaddr(&storage)
     }
+
+    /// F-155: nginx の `multi_accept` 相当。バックログに滞留している接続を
+    /// `max_batch` 件を上限に、非ブロッキングで一括受理する（`Future` ではない同期
+    /// メソッド。syscall のみでブロックしないため、ホットパスの一部として呼んでよい）。
+    ///
+    /// 呼び出し側（`entry.rs` のワーカー accept ループ）は、まず `accept().await` で
+    /// shutdown チェック用の 1 秒タイムアウト付きで 1 件目を待ち、受理できたら本メソッドで
+    /// 残りのバックログを引き上げる想定。`max_batch` 件で必ずループを抜けて呼び出し側へ
+    /// 制御を返すため、バックログがどれだけ積み上がっていても他 fd の処理や shutdown
+    /// チェックを飢餓させない、協調的な設計になっている。
+    ///
+    /// ホットパスなので中間 `Vec` 等のバッファは確保しない。受理した接続はその場で
+    /// `on_conn` コールバックへ渡す（コールバック方式にしている理由そのもの）。
+    ///
+    /// `raw_accept_one` の accept4/accept ロジックは `Accept::poll` と共用する
+    /// （挙動は完全に同一。macOS の `accept`+`fcntl`+`set_so_nosigpipe` フォールバック、
+    /// fd をリークしないよう先に `TcpStream` を構築してから `storage_to_sockaddr` する
+    /// 順序を含む）。
+    ///
+    /// `storage_to_sockaddr` が失敗した場合（未対応アドレスファミリ）は、その 1 件のみ
+    /// 破棄して次へ進む（fd は `TcpStream` の `Drop` で close 済みのためリークしない）。
+    /// `Accept::poll` は単発 accept なので即座に `Err` を返して呼び出し側へ委ねるが、
+    /// `accept_batch` はバックログ一括処理という性質上、1 件の異常でそれ以降の正常な
+    /// 接続まで巻き込んで受理を中断する理由が無いため、あえて異なる方針を採る。
+    ///
+    /// `EINTR` は内側でリトライする。`EWOULDBLOCK`/`EAGAIN` でバックログが尽きたら、
+    /// その時点までの受理件数を `Ok` で返す。それ以外のエラーは、それまでに受理した分は
+    /// 既に `on_conn` へ渡した上で `Err` を返す。
+    pub fn accept_batch<F>(&self, max_batch: usize, mut on_conn: F) -> io::Result<usize>
+    where
+        F: FnMut(TcpStream, SocketAddr),
+    {
+        let mut count = 0usize;
+        while count < max_batch {
+            match raw_accept_one(self.fd) {
+                Ok(Some((fd, storage))) => {
+                    // 先に TcpStream を構築する: アドレス変換が失敗しても Drop 経由で
+                    // fd がクローズされ、リークしない（`Accept::poll` と同じ順序）。
+                    let stream = TcpStream { fd };
+                    match storage_to_sockaddr(&storage) {
+                        Ok(peer_addr) => {
+                            on_conn(stream, peer_addr);
+                            count += 1;
+                        }
+                        Err(_) => {
+                            // この 1 件のみ破棄して次へ進む（doc コメント参照）。
+                            drop(stream);
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(count)
+    }
 }
 
 impl Drop for TcpListener {
@@ -262,6 +318,64 @@ impl AsRawFd for TcpListener {
 // Accept Future
 // ====================
 
+/// `accept4`（macOS では `accept`+`fcntl`+`set_so_nosigpipe` フォールバック）を
+/// 1 回だけ非ブロッキングで試みる、`Accept::poll` と `TcpListener::accept_batch` の
+/// 共通ヘルパ。アドレス変換（`storage_to_sockaddr`）は行わず、生の `RawFd` と
+/// `sockaddr_storage` を返す（呼び出し側が変換失敗時の後始末方針をそれぞれ選べる
+/// ようにするため。`Accept::poll` は即座にエラーを返す一方、`accept_batch` は
+/// その 1 件のみ破棄してバックログの受理を続ける）。
+///
+/// - 成功: `Ok(Some((fd, storage)))`
+/// - `EINTR`: 内部でリトライする（呼び出し側からは見えない）
+/// - `EWOULDBLOCK`/`EAGAIN`: バックログが尽きたことを示す `Ok(None)`
+/// - それ以外のエラー: `Err(e)`
+fn raw_accept_one(listener_fd: RawFd) -> io::Result<Option<(RawFd, libc::sockaddr_storage)>> {
+    loop {
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        // macOS には `accept4(2)` が無いため、`accept(2)` +
+        // `fcntl(F_SETFL, O_NONBLOCK)` + `fcntl(F_SETFD, FD_CLOEXEC)` へフォールバック
+        // する（設計 docs/artifacts/f125_windows_macos_design.md の macOS 節 1）。
+        // 他 OS は従来どおり `accept4` 1 syscall で完結させる。
+        #[cfg(target_os = "macos")]
+        let fd = unsafe {
+            libc::accept(
+                listener_fd,
+                &mut storage as *mut _ as *mut libc::sockaddr,
+                &mut len,
+            )
+        };
+        #[cfg(not(target_os = "macos"))]
+        let fd = unsafe {
+            libc::accept4(
+                listener_fd,
+                &mut storage as *mut _ as *mut libc::sockaddr,
+                &mut len,
+                libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            )
+        };
+        if fd >= 0 {
+            #[cfg(target_os = "macos")]
+            {
+                unsafe {
+                    libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                }
+                set_so_nosigpipe(fd);
+            }
+            return Ok(Some((fd, storage)));
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if is_would_block(&e) {
+            return Ok(None);
+        }
+        return Err(e);
+    }
+}
+
 /// accept Future（`accept4` の try-first ラッパ）。
 pub struct Accept<'a> {
     listener_fd: RawFd,
@@ -272,54 +386,18 @@ impl<'a> Future for Accept<'a> {
     type Output = io::Result<(TcpStream, SocketAddr)>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        loop {
-            let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-            let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-            // macOS には `accept4(2)` が無いため、`accept(2)` +
-            // `fcntl(F_SETFL, O_NONBLOCK)` + `fcntl(F_SETFD, FD_CLOEXEC)` へフォールバック
-            // する（設計 docs/artifacts/f125_windows_macos_design.md の macOS 節 1）。
-            // 他 OS は従来どおり `accept4` 1 syscall で完結させる。
-            #[cfg(target_os = "macos")]
-            let fd = unsafe {
-                libc::accept(
-                    self.listener_fd,
-                    &mut storage as *mut _ as *mut libc::sockaddr,
-                    &mut len,
-                )
-            };
-            #[cfg(not(target_os = "macos"))]
-            let fd = unsafe {
-                libc::accept4(
-                    self.listener_fd,
-                    &mut storage as *mut _ as *mut libc::sockaddr,
-                    &mut len,
-                    libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-                )
-            };
-            if fd >= 0 {
-                #[cfg(target_os = "macos")]
-                {
-                    unsafe {
-                        libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
-                        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-                    }
-                    set_so_nosigpipe(fd);
-                }
+        match raw_accept_one(self.listener_fd)? {
+            Some((fd, storage)) => {
                 // 先に TcpStream を構築する: アドレス変換が失敗しても Drop 経由で
                 // fd がクローズされ、リークしない。
                 let stream = TcpStream { fd };
                 let peer_addr = storage_to_sockaddr(&storage)?;
-                return Poll::Ready(Ok((stream, peer_addr)));
+                Poll::Ready(Ok((stream, peer_addr)))
             }
-            let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            if is_would_block(&e) {
+            None => {
                 register_read(self.listener_fd, cx.waker().clone());
-                return Poll::Pending;
+                Poll::Pending
             }
-            return Poll::Ready(Err(e));
         }
     }
 }
@@ -474,6 +552,49 @@ impl TcpStream {
         Ok(())
     }
 
+    /// `TCP_NOPUSH` を設定する（F-155、FreeBSD 専用）。
+    ///
+    /// Linux の `TCP_CORK` に相当する FreeBSD のソケットオプション。有効化すると
+    /// 小さいセグメントの即時送出を抑制し、可能な限り MSS 一杯までパケットを
+    /// まとめてから送出する。無効化（クリア）した瞬間に溜まっていたデータが
+    /// 即座にフラッシュされる。
+    #[cfg(target_os = "freebsd")]
+    pub fn set_nopush(&self, enable: bool) -> io::Result<()> {
+        let optval: libc::c_int = if enable { 1 } else { 0 };
+        let ret = unsafe {
+            libc::setsockopt(
+                self.fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_NOPUSH,
+                &optval as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// `TCP_NOPUSH` を有効化し、drop 時に必ず解除する RAII ガードを返す（F-155、
+    /// FreeBSD 専用）。
+    ///
+    /// 有効化（`setsockopt` 呼び出し）に失敗した場合は `None` を返す
+    /// （ホットパス上のエラーとして扱わず、呼び出し側はガード無しで従来通り送信を
+    /// 続けてよい）。
+    ///
+    /// 返るガードは `&self` のライフタイムに縛られる。ガードの `Drop` は fd へ
+    /// `setsockopt` するため、`TcpStream` が先に drop（fd が close）されると
+    /// 別用途に再利用された fd を触りうる。借用で縛ることでこれをコンパイル時に防ぐ。
+    #[cfg(target_os = "freebsd")]
+    pub fn nopush_guard(&self) -> Option<NoPushGuard<'_>> {
+        self.set_nopush(true).ok()?;
+        Some(NoPushGuard {
+            fd: self.fd,
+            _marker: std::marker::PhantomData,
+        })
+    }
+
     /// ピアアドレスを取得する。
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
@@ -582,6 +703,49 @@ impl Drop for TcpStream {
 impl AsRawFd for TcpStream {
     fn as_raw_fd(&self) -> RawFd {
         self.fd
+    }
+}
+
+/// `TCP_NOPUSH` の RAII ガード（F-155、FreeBSD 専用）。
+///
+/// `TcpStream::nopush_guard` が返す。保持している間は `TCP_NOPUSH` が有効
+/// （コルク状態）であり、`Drop` で必ず `TCP_NOPUSH` を解除する（`setsockopt` の
+/// 失敗は無視する。解除自体が失敗しても後続の通信を止めるべきではないため）。
+///
+/// **解除漏れ防止**: 呼び出し側が明示的に解除を呼び忘れると、最後の小さな
+/// セグメントがカーネル内に溜まったまま送出されない「Nagle の罠」に類する問題に
+/// 直結する。本ガードは `Drop` で解除するため、正常終了・早期 `return`・
+/// エラー伝播・（async 関数内であれば）Future の中断のいずれの経路でも、
+/// スコープを抜ける際に必ず `TCP_NOPUSH` がクリアされる。
+///
+/// **panic 安全性**: `Drop::drop` は unwind 中にも呼ばれるため、途中で panic が
+/// 発生してスタック巻き戻しが起きた場合でも `TCP_NOPUSH` は解除される。
+///
+/// ライフタイム `'a` は生成元の `TcpStream` の借用であり、fd が close された後に
+/// `Drop` が走ることをコンパイル時に防ぐ（`TcpStream::nopush_guard` の doc 参照）。
+#[cfg(target_os = "freebsd")]
+pub struct NoPushGuard<'a> {
+    fd: RawFd,
+    _marker: std::marker::PhantomData<&'a TcpStream>,
+}
+
+#[cfg(target_os = "freebsd")]
+impl Drop for NoPushGuard<'_> {
+    fn drop(&mut self) {
+        let optval: libc::c_int = 0;
+        // SAFETY: fd は本ガードの生成元 TcpStream が close するまで有効であることを
+        // 呼び出し側（TcpStream::nopush_guard）が保証する（ガードは TcpStream より
+        // 長生きしない使い方を前提とする）。setsockopt の失敗は意図的に無視する
+        // （doc 参照: 解除失敗で後続処理を止めない）。
+        unsafe {
+            libc::setsockopt(
+                self.fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_NOPUSH,
+                &optval as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
     }
 }
 
@@ -940,6 +1104,14 @@ impl<'a> Future for Writable<'a> {
     type Output = io::Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // F-155: kqueue バックエンドでは、直前の `EVFILT_WRITE` 起床がこの fd を
+        // writable と報告済みなら、確認用の `poll(2)` syscall を省略する
+        // （`executor::take_write_hint` の doc 参照。consume-once のため、無関係な
+        // 後続呼び出しに古いヒントが漏れることはない）。
+        #[cfg(veil_poller_kqueue)]
+        if crate::runtime::executor::take_write_hint(self.fd) > 0 {
+            return Poll::Ready(Ok(()));
+        }
         let mut pfd = libc::pollfd {
             fd: self.fd,
             events: libc::POLLOUT,
@@ -997,6 +1169,12 @@ impl Future for WritableFd {
     type Output = io::Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // F-155: `Writable::poll` と同じ理由で、kqueue の直近ヒントがあれば
+        // 確認用 `poll(2)` syscall を省略する。
+        #[cfg(veil_poller_kqueue)]
+        if crate::runtime::executor::take_write_hint(self.fd) > 0 {
+            return Poll::Ready(Ok(()));
+        }
         let mut pfd = libc::pollfd {
             fd: self.fd,
             events: libc::POLLOUT,

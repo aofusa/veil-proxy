@@ -67,6 +67,25 @@ fn https_pool_key_no_sni(host: &str, port: u16, tls_insecure: bool) -> String {
     format!("{}:{}:{}", host, port, tag)
 }
 
+/// バックエンドへの TCP 接続を確立する（F-155: 事前解決済み `SocketAddr` の活用）。
+///
+/// `target.socket_addr` が `Some`（`host` が IP アドレスリテラルで設定ロード時に
+/// 解決済み）の場合はそれを使って直接 `TcpStream::connect` する。`None`（`host` が
+/// ホスト名）の場合のみ、従来どおり `addr`（`HostPortStr` 経由で構築済みの
+/// `"host:port"` 文字列）を使って `TcpStream::connect_str` の同期名前解決経路へ
+/// フォールバックする。呼び出し側で `timeout(..)` を被せる方式は変更しない
+/// （エラー種別・502/504 分岐・ログは呼び出し元がこれまでどおり処理する）。
+///
+/// ホットパスのため追加のアロケーション・ヒープボックス化は一切行わない。
+#[inline]
+async fn connect_target(target: &ProxyTarget, addr: &str) -> io::Result<TcpStream> {
+    if let Some(sock_addr) = target.socket_addr {
+        TcpStream::connect(sock_addr).await
+    } else {
+        TcpStream::connect_str(addr).await
+    }
+}
+
 /// プロキシ起動時刻（F-21: 管理API /stats 用）
 #[cfg(feature = "admin")]
 static PROXY_START_TIME: once_cell::sync::Lazy<std::time::Instant> =
@@ -3247,8 +3266,8 @@ async fn h2_serve_streaming(
     }
     request.extend_from_slice(b"Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n");
 
-    // バックエンド接続。
-    let backend_tcp = match timeout(CONNECT_TIMEOUT, TcpStream::connect_str(addr)).await {
+    // バックエンド接続（事前解決済み SocketAddr があればブロッキング DNS を迂回）。
+    let backend_tcp = match timeout(CONNECT_TIMEOUT, connect_target(target, addr)).await {
         Ok(Ok(s)) => s,
         _ => {
             server.release();
@@ -5656,7 +5675,7 @@ async fn handle_websocket_proxy_http(
     // バックエンドに接続
     let addr = HostPortStr::new(&target.host, target.port); // F-41: スタック上に構築（ヒープ確保なし）
     let addr = addr.as_str();
-    let connect_result = timeout(connect_timeout, TcpStream::connect_str(addr)).await;
+    let connect_result = timeout(connect_timeout, connect_target(target, addr)).await;
 
     let mut backend_stream = match connect_result {
         Ok(Ok(stream)) => {
@@ -5767,10 +5786,10 @@ async fn handle_websocket_proxy_https(
     request: Vec<u8>,
     poll_config: &WebSocketPollConfig,
 ) -> Option<(u16, u64)> {
-    // バックエンドに TCP 接続
+    // バックエンドに TCP 接続（事前解決済み SocketAddr があればブロッキング DNS を迂回）
     let addr = HostPortStr::new(&target.host, target.port); // F-41: スタック上に構築（ヒープ確保なし）
     let addr = addr.as_str();
-    let connect_result = timeout(connect_timeout, TcpStream::connect_str(addr)).await;
+    let connect_result = timeout(connect_timeout, connect_target(target, addr)).await;
 
     let backend_tcp = match connect_result {
         Ok(Ok(stream)) => {
@@ -6821,10 +6840,10 @@ async fn proxy_http_pooled(
     let mut backend_stream = match HTTP_POOL.with(|p| p.borrow_mut().get(pool_key)) {
         Some(stream) => stream,
         None => {
-            // 新規接続を作成
+            // 新規接続を作成（事前解決済み SocketAddr があればブロッキング DNS を迂回）
             let addr = HostPortStr::new(&target.host, target.port); // F-41: スタック上に構築（ヒープ確保なし）
             let addr = addr.as_str();
-            let connect_result = timeout(connect_timeout, TcpStream::connect_str(addr)).await;
+            let connect_result = timeout(connect_timeout, connect_target(target, addr)).await;
 
             match connect_result {
                 Ok(Ok(stream)) => {
@@ -7060,10 +7079,10 @@ async fn proxy_h2c(
 ) -> Option<(ServerTls, u16, u64, bool)> {
     let connect_timeout = Duration::from_secs(security.backend_connect_timeout_secs);
 
-    // バックエンドに接続
+    // バックエンドに接続（事前解決済み SocketAddr があればブロッキング DNS を迂回）
     let addr = HostPortStr::new(&target.host, target.port); // F-41: スタック上に構築（ヒープ確保なし）
     let addr = addr.as_str();
-    let connect_result = timeout(connect_timeout, TcpStream::connect_str(addr)).await;
+    let connect_result = timeout(connect_timeout, connect_target(target, addr)).await;
 
     let backend_stream = match connect_result {
         Ok(Ok(stream)) => {
@@ -9388,7 +9407,7 @@ async fn connect_https_backend_fresh(
 ) -> Result<ClientTls, (u16, &'static [u8])> {
     let addr = HostPortStr::new(&target.host, target.port); // F-41: スタック上に構築（ヒープ確保なし）
     let addr = addr.as_str();
-    let backend_tcp = match timeout(connect_timeout, TcpStream::connect_str(addr)).await {
+    let backend_tcp = match timeout(connect_timeout, connect_target(target, addr)).await {
         Ok(Ok(stream)) => {
             let _ = stream.set_nodelay(true);
             stream
@@ -10729,19 +10748,76 @@ async fn handle_sendfile(
         header_buf.extend_from_slice(b"Connection: keep-alive\r\n\r\n");
     }
 
-    // ヘッダー送信（タイムアウト付き）
-    let write_result = timeout(WRITE_TIMEOUT, tls_stream.write_all(header_buf)).await;
-    if !matches!(write_result, Ok((Ok(_), _))) {
-        return None;
-    }
-
     // ファイル転送
     // Range リクエストの場合はオフセットと長さを調整
+    // （F-155: ヘッダー送信より前に移動。この計算はヘッダー送信に依存しないため
+    // 移動しても挙動は変わらない。FreeBSD 高速経路がヘッダー送信前にこの値を
+    // 必要とするため。）
     let (transfer_offset, transfer_length) = if let Some((start, end)) = range_info {
         (start as i64, end - start + 1)
     } else {
         (0i64, file_size)
     };
+
+    // F-155: FreeBSD の平文（TLS 終端なし）接続に限り、レスポンスヘッダーと
+    // ファイル本体を sf_hdtr 付き sendfile(2) 1 回で送る（write(2) + sendfile(2) の
+    // 2 syscall を 1 syscall に統合する）。is_plain() は
+    // handle_sendfile_userspace 側の既存 FreeBSD 分岐と同一条件（kTLS 有効時は
+    // ServerTls::mode が KtlsTxOnly/KtlsFull になり is_plain() は false を返すため
+    // 別途 kTLS 判定を足す必要はない。ktls_rustls.rs / simple_tls.rs の
+    // is_plain() 実装を確認済み）。rustls ユーザー空間 TLS では絶対に通らない。
+    #[cfg(target_os = "freebsd")]
+    {
+        if tls_stream.is_plain() && transfer_length > 0 {
+            use crate::runtime::sendfile::sendfile_all_with_header;
+            let out_fd = tls_stream.as_raw_fd();
+            let in_fd = file.as_raw_fd();
+
+            // F-155 Phase 6: sendfile(2) 呼び出しの間、TCP_NOPUSH でカーネルに
+            // セグメントの早期送出を抑制させ、MSS 一杯までまとめて送出させる。
+            // ガードが drop されると TCP_NOPUSH が解除され、残っているデータが
+            // 即座にフラッシュされる（NoPushGuard の doc 参照）。取得（setsockopt）
+            // 自体に失敗しても致命的ではないため None のまま続行する。
+            let nopush = tls_stream.get_ref().nopush_guard();
+
+            let result = sendfile_all_with_header(
+                out_fd,
+                in_fd,
+                transfer_offset,
+                transfer_length as usize,
+                &header_buf,
+            )
+            .await;
+
+            // ガードを明示的に drop して TCP_NOPUSH を解除し、最後のセグメントを
+            // 即座にフラッシュさせる（送信完了後に解除する必要があるため await の
+            // 後でこのタイミングまで保持する）。
+            drop(nopush);
+
+            return match result {
+                Ok(()) => Some((
+                    tls_stream,
+                    response_status,
+                    transfer_length,
+                    client_wants_close,
+                )),
+                Err(e) => {
+                    error!("sendfile(2) with sf_hdtr error (FreeBSD plain): {}", e);
+                    // ヘッダーが実際にどこまで送れたか（部分送信）は sf_hdtr 経路
+                    // からは呼び出し側に分からないため、既存の FreeBSD sendfile
+                    // エラー処理と同様に送信バイト数は 0 として報告し、接続は
+                    // クローズ扱いにする。
+                    Some((tls_stream, response_status, 0, true))
+                }
+            };
+        }
+    }
+
+    // ヘッダー送信（タイムアウト付き）
+    let write_result = timeout(WRITE_TIMEOUT, tls_stream.write_all(header_buf)).await;
+    if !matches!(write_result, Ok((Ok(_), _))) {
+        return None;
+    }
 
     // kTLS が有効な場合は sendfile によるゼロコピー送信を使用
     #[cfg(veil_ktls)]
@@ -10860,6 +10936,16 @@ async fn handle_sendfile_userspace(
     // 送信を使う。TlsMode::Rustls（ユーザー空間 TLS）ではファイルの生バイトを暗号化
     // なしにソケットへ流すことになり平文漏洩になるため、is_plain() で厳密に判定する
     // （kTLS 有効時は既に handle_sendfile_zerocopy 側で処理済みでここには来ない）。
+    //
+    // F-155 で到達条件が変わった: 唯一の呼び出し元 handle_sendfile は、ヘッダー送信
+    // より前に本分岐と全く同じ条件（is_plain() && transfer_length > 0）で
+    // sf_hdtr 付き sendfile_all_with_header の高速経路へ既に分岐して return する
+    // ため、通常のリクエスト処理では本分岐へは到達しない（tls_stream の TLS
+    // モードは handle_sendfile 呼び出し中に変化しないため、2 箇所の条件は常に
+    // 一致する）。それでも本分岐は削除せず残す: handle_sendfile_userspace は
+    // 単体でも意味の通る「平文なら sendfile を使う」関数であり、将来 handle_sendfile
+    // 以外の呼び出し元が増えた場合（例: 高速経路の条件を先に通さない別経路）や、
+    // handle_sendfile 側の高速経路を将来外した場合に備えた安全網として機能する。
     #[cfg(target_os = "freebsd")]
     {
         if tls_stream.is_plain() && transfer_length > 0 {

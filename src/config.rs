@@ -4080,6 +4080,13 @@ pub struct ProxyTarget {
     /// true の場合、非TLSバックエンドにHTTP/2で接続
     /// HTTP/2 Upgrade 経由ではなく、Prior Knowledge モードを使用
     pub use_h2c: bool,
+    /// 事前パース済みの接続先 `SocketAddr`（`host` が IP アドレスリテラルの場合のみ `Some`）。
+    /// 設定ロード時に一度だけ解決しておくことで、ホットパス（接続確立のたびに実行される
+    /// `to_socket_addrs()`。内部で `Vec` 確保が発生し、`host` がホスト名の場合は
+    /// 同期 `getaddrinfo` によるブロッキング DNS 解決も伴う）を排除する。
+    /// `host` がホスト名の場合は `None` となり、従来どおり `TcpStream::connect_str` 経由で
+    /// 名前解決する。
+    pub socket_addr: Option<std::net::SocketAddr>,
 }
 
 impl ProxyTarget {
@@ -4106,6 +4113,19 @@ impl ProxyTarget {
             None => (host_port.to_string(), if scheme { 443 } else { 80 }),
         };
 
+        // host が IP アドレスリテラルであれば、設定ロード時に一度だけ SocketAddr を
+        // 構築しておく（ホットパスでのブロッキング DNS 解決・to_socket_addrs() の
+        // Vec 確保を排除するため）。IPv6 リテラルは `[::1]` のように角括弧付きで
+        // 保持され得るため、判定前に前後の `[` `]` を剥がす。
+        let ip_literal = host
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(&host);
+        let socket_addr = ip_literal
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .map(|ip| std::net::SocketAddr::new(ip, port));
+
         Some(ProxyTarget {
             host,
             port,
@@ -4113,6 +4133,7 @@ impl ProxyTarget {
             path_prefix: path.to_string(),
             sni_name: None,
             use_h2c: false, // デフォルトでは無効
+            socket_addr,
         })
     }
 
@@ -4145,6 +4166,52 @@ impl ProxyTarget {
         } else {
             self.port == 80
         }
+    }
+}
+
+#[cfg(test)]
+mod proxy_target_socket_addr_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn socket_addr_is_some_for_ipv4_literal_host() {
+        let t = ProxyTarget::parse("http://127.0.0.1:8080/").unwrap();
+        assert_eq!(
+            t.socket_addr,
+            Some(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                8080
+            ))
+        );
+    }
+
+    #[test]
+    fn socket_addr_is_some_for_ipv4_literal_host_default_port() {
+        let t = ProxyTarget::parse("https://10.0.0.1/api").unwrap();
+        assert_eq!(
+            t.socket_addr,
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 443))
+        );
+    }
+
+    #[test]
+    fn socket_addr_is_none_for_hostname() {
+        let t = ProxyTarget::parse("http://example.com:8080/").unwrap();
+        assert_eq!(t.socket_addr, None);
+        assert_eq!(t.host, "example.com");
+    }
+
+    /// IPv6 リテラル `[::1]:8080` は、既存の `host_port.find(':')` による
+    /// ホスト/ポート分割ロジック（本タスクでは変更禁止）が角括弧を考慮しないため、
+    /// 最初のコロンをポート区切りと誤認し `ProxyTarget::parse` 自体が `None` を返す
+    /// （既存の挙動であり、本変更で新たに壊れたものではない）。
+    /// socket_addr 側の角括弧除去処理はこの既存の制約下では到達しないが、将来
+    /// host/port 分割ロジックが IPv6 に対応した場合に備えて安全側の実装としている。
+    #[test]
+    fn ipv6_bracket_literal_is_rejected_by_existing_split_logic() {
+        assert!(ProxyTarget::parse("http://[::1]:8080/").is_none());
+        assert!(ProxyTarget::parse("http://[::1]/").is_none());
     }
 }
 

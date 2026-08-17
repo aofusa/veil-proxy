@@ -80,7 +80,7 @@ OUT_TSV="${OUT_TSV:-${WORK}/results_raw.tsv}"
 # リクエスト単価（syscall・パース・フレーミング）の比較になる。
 REQ_PATH="${REQ_PATH:-/index.html}"
 
-ALL_SCENARIOS="h1_file_tls h2_file_tls h2c_file_plain h3_file h1_proxy_tls h2_proxy_tls l4_tcp"
+ALL_SCENARIOS="h1_file_tls h2_file_tls h1_file_plain h2c_file_plain h3_file h1_proxy_tls h2_proxy_tls l4_tcp"
 
 usage() {
     sed -n '2,32p' "$0"
@@ -486,6 +486,15 @@ run_scenario() {
       h2c_file_plain)
         v_cfg=veil_file.toml;    v_url="http://127.0.0.1:${VEIL_HTTP}${REQ_PATH}"
         n_url="http://127.0.0.1:${NGX_HTTP}${REQ_PATH}"; tool=h2load ;;
+      # F-155: 平文 HTTP/1.1 の静的配信。veil の FreeBSD `sendfile(2)` ゼロコピー経路
+      # （kTLS 無効・TLS 終端なしのときだけ通る）が実際に効く唯一のシナリオであり、
+      # sf_hdtr による 1-syscall 化の効果はここでしか観測できない
+      # （h2c は HTTP/2 のフレーミングが要るので sendfile に載らない）。
+      # nginx 側も `sendfile on;` で同じくカーネルゼロコピー + sf_hdtr を使うため、
+      # 「1 リクエストあたりの syscall 数」を真正面から比較する構成になる。
+      h1_file_plain)
+        v_cfg=veil_file.toml;    v_url="http://127.0.0.1:${VEIL_HTTP}${REQ_PATH}"
+        n_url="http://127.0.0.1:${NGX_HTTP}${REQ_PATH}"; tool=wrk ;;
       h3_file)
         v_cfg=veil_file_h3.toml; v_url="https://127.0.0.1:${VEIL_HTTPS}${REQ_PATH}"
         n_url="https://127.0.0.1:${NGX_HTTPS}${REQ_PATH}"; tool=h2load_h3 ;;
@@ -510,7 +519,7 @@ run_scenario() {
     log "[$sc iter=$iter] veil 計測"
     start_veil "${WORK}/conf/${v_cfg}"
     case "$sc" in
-      h2c_file_plain)               wait_port "${VEIL_HTTP}"  || die "veil(h2c) 起動失敗" ;;
+      h2c_file_plain|h1_file_plain) wait_port "${VEIL_HTTP}"  || die "veil(平文) 起動失敗" ;;
       l4_tcp)                       wait_port "${VEIL_L4}"    || die "veil(l4) 起動失敗" ;;
       h3_file)                      wait_udp_port "${VEIL_HTTPS}" || die "veil(h3) 起動失敗" ;;
       *)                            wait_port "${VEIL_HTTPS}" || die "veil(https) 起動失敗" ;;

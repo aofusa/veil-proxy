@@ -75,6 +75,16 @@ pub(crate) struct FdRecord {
     /// 漏れることはない。
     #[cfg(veil_poller_kqueue)]
     pub read_hint: usize,
+    /// F-155: 直近に届いた `EVFILT_WRITE` イベントの `data`（送信可能バイト数、
+    /// カーネルが kevent 発火時点で観測した値）のヒント。kqueue バックエンド専用
+    /// （epoll は `epoll_event` に同等のフィールドを持たない）。
+    ///
+    /// `reactor::tcp::Writable`/`WritableFd` が「直前の kqueue 起床で writable と
+    /// 判明済みか」を判定し、確認用の `poll(2)` syscall を省略するために使う
+    /// （`runtime::executor::take_write_hint` 参照）。consume-once（取得時に 0 へ
+    /// リセット）のため、無関係な後続呼び出しへ古い値が漏れることはない。
+    #[cfg(veil_poller_kqueue)]
+    pub write_hint: usize,
 }
 
 /// fd 番号でインデックスする登録テーブル（Unix: `Vec` ベース）。
