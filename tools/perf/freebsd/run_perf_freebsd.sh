@@ -312,6 +312,17 @@ type = "File"
 path = "${WORK}/www/"
 [route.security]
 allowed_methods = ["HEAD", "GET"]
+
+# メタデータキャッシュ（open_file_cache）。**[static_file_cache] と必ずセットで
+# 有効にすること**（F-157）: `cache::get_static_file_with_content` の offload ゼロ
+# 経路は「メタデータキャッシュがヒットしたときに限り本体キャッシュを参照する」
+# 構造（src/cache/static_file.rs）なので、本体キャッシュだけ有効にしても
+# 素通りして毎リクエスト offload の open+read に落ちる（実測で openat が
+# 1.0/req のまま変わらず、スループットも改善しなかった）。
+[route.open_file_cache]
+enabled = true
+valid_duration_secs = 60
+max_entries = 1024
 EOF
 }
 
