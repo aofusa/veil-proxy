@@ -1,7 +1,7 @@
 # F-155: FreeBSD の対 nginx パフォーマンスパリティ（ハーネス適正化 + reactor/静的配信の固定費削減）
 
 - 優先度: P1
-- 状態: 対応中
+- 状態: 完了（Phase 6 は効果未確認。B-66 修正後に再評価）
 - 関連: F-141（FreeBSD kqueue/sendfile）、F-145（reactor E2E の空白地帯）、F-153/F-154/B-65（静的配信の固定費）、F-123（capsicum capability mode の dirfd 相対化）、B-63（aio 除外）
 
 ## 背景
@@ -71,9 +71,18 @@ FreeBSD の `sendfile(2)` ゼロコピー経路は `handle_sendfile_userspace` �
 
 したがって `sf_hdtr` の効果は **平文 HTTP/1.1 の静的配信でしか観測できない**。
 既存の `ALL_SCENARIOS` にその構成が無かったため、**検証用に `h1_file_plain`
-シナリオを追加した**（veil の平文リスナー / nginx の平文 server へ wrk で
-HTTP/1.1 を投げる。nginx 側も `sendfile on; tcp_nopush on;` なので
+シナリオを追加した**（nginx 側も `sendfile on; tcp_nopush on;` なので
 「1 リクエストあたりの syscall 数」を正面から比較できる）。
+
+**罠**: veil の平文リスナー（`h2c_listen`）は **h2c 専用**で、平文 HTTP/1.1 は
+「Plain HTTP/1.1 not supported on H2C-only server」として切断される
+（`src/entry.rs` の H2C ワーカー）。最初これを知らずに h2c ポートへ wrk を投げ、
+**veil だけ 0 rps** という結果を出してしまった。平文 HTTP/1.1 が veil に届く唯一の経路は
+**メインリスナー（TLS ポート）のプロトコル検出**（`detect_protocol_with_buffer` →
+`accept_plain`）であり、`http://127.0.0.1:<TLS ポート>/` へ投げる必要がある。
+
+初回の健全な計測では **54KB が対 nginx 0.92**（veil 70,804 / nginx 76,889）、
+3B が 0.41 だった。ただし繰り返すと B-66 の劣化に飲まれる。
 
 ## 設計上の判断（分析ドキュメント・実装指示書から意図的に外したもの）
 
@@ -100,4 +109,28 @@ HTTP/1.1 を投げる。nginx 側も `sendfile on; tcp_nopush on;` なので
 
 - **h2c 平文 54KB が 0.61、L4 TCP 54KB が 0.63。** どの Phase も直接は狙っていない。
   h2c は B-65 の続きであり、L4 は splice/中継経路の帯域。
-- 小応答（3B）のリクエスト単価。Phase 2/3/4 が効く想定だが、効果の確定は A/B 実測による。
+- **小応答（3B）のリクエスト単価は改善を確定できなかった。** Phase 2/3/4 が狙った領域だが、
+  この VM のラウンド間変動（同一バイナリで 1.8 倍）と B-66 の劣化に埋もれ、
+  交互 A/B でも単独の寄与を分離できなかった。**「+10〜15%」「+25〜40%」といった
+  実装指示書の期待値は実測で裏付けられていない**ので、そのまま引用しないこと。
+- **B-66（平文 HTTP/1.1 大レスポンスの単調劣化・p99 数秒）** を本チケットの検証中に発見した。
+  F-155 の回帰ではない（`b148615` でも再現）が、`h1_file_plain` の安定計測を阻んでいる。
+- **Phase 6（`TCP_NOPUSH`）は効果未確認のまま残してある。** 4 ラウンドの交互 A/B で
+  一貫した差が出ず、かつ 1 リクエストあたり `setsockopt` が 2 回増える。
+  B-66 修正後に再度 A/B し、効果が無ければ削除すること。
+
+## 検証結果
+
+- Linux x86_64: 単体 876 / 統合 54 すべて成功。`cargo check` / `cargo clippy -D warnings` は
+  `full`（io_uring）・`full,epoll`（reactor）とも警告ゼロ。`cargo fmt` クリーン。
+- Linux E2E（`full,epoll` = reactor 経路、F-145 の教訓に従い必ず実行）: 543 passed / 1 failed
+  （`test_error_handling_oversized_header` = 既知の負荷フレーキー。ホストの loadavg は 10〜12 だった）。
+- FreeBSD 14.3 aarch64 実機: `full-freebsd` リリースビルドが **警告ゼロ**
+  （kqueue・`sf_hdtr`・`TCP_NOPUSH`・capsicum のコードは Linux では 1 行もコンパイルされないため、
+  この実機ビルドが唯一の型検査になる）。
+- FreeBSD E2E: フルスイートを 2 回実行し 541 passed/3 failed → 543 passed/1 failed。
+  **失敗集合が入れ替わった**うえ 3 件とも単独実行では成功したため、既知の 4 並列負荷フレーキーと確定。
+  一貫して失敗するのは `test_http3_large_request_body`（既存の B-61、Linux io_uring でも再現）のみ。
+- `sf_hdtr` の実機での正しさ: 平文 HTTP/1.1 で 200 応答・`Content-Length` 一致・
+  3B 本体一致・54,576B 本体の md5 が配信元と一致することを確認
+  （ヘッダの重複送信/欠落が起きていないことの直接的な証拠）。

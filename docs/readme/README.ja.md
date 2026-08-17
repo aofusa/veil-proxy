@@ -652,6 +652,11 @@ huge_pages_enabled = true
 cert_path = "/path/to/cert.pem"
 key_path = "/path/to/key.pem"
 ktls_enabled = true         # kTLS有効化（Linux 5.15+ または FreeBSD 13.0+、feature flag必須。F-126）
+                            # FreeBSD で **HW kTLS オフロードが無い場合は false を推奨**（F-155）:
+                            # software kTLS は 16KB の TLS レコードごとにカーネルワーカースレッドへ
+                            # 暗号処理をディスパッチし、スループットが直列化する。無効化するだけで
+                            # 54KB の対 nginx 比が HTTP/1.1 で 0.51 → 1.09、HTTP/2 で 0.56 → 1.16 と
+                            # 逆転した（同一 VM 実測）。詳細は docs/perf/README.md。
 ktls_fallback_enabled = true # kTLS失敗時のrustlsフォールバック（デフォルト: true）
 tcp_cork_enabled = true     # kTLS設定時にTCP_CORKを使用（デフォルト: true）
 

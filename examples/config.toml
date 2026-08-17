@@ -234,6 +234,12 @@ key_path = "/path/to/key.pem"
 # 1 リクエストあたり約 17 回。CPU は 51% アイドルのまま接続数を 64→512 に
 # 増やしても伸びない）。小さなレスポンス主体なら有意差は無い。
 # 詳細は docs/perf/README.md の「FreeBSD の kTLS は大きな応答で不利」節。
+#
+# 【F-155 の実測（2026-08-17、FreeBSD 14.3 aarch64）】上記は「26% 低下」どころでは
+# なかった。同一 VM・同一セッションで ktls_enabled を false にするだけで、
+# 54KB 応答の対 nginx 比が HTTP/1.1 TLS で 0.51 → 1.09、HTTP/2 TLS で 0.56 → 1.16 と
+# **逆転**する（veil が nginx を上回る）。**HW kTLS オフロードが無い FreeBSD では
+# ktls_enabled = false を強く推奨する。**
 ktls_enabled = true
 
 # kTLS有効化失敗時にrustlsへフォールバックするかどうか

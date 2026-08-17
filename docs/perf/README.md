@@ -182,6 +182,92 @@ CPU バウンドで大きい、他はノイズ範囲）も従来と一致する�
 生データは [`results_raw.tsv`](results_raw.tsv) 末尾の
 `# ==== 2026-08-16 ...` 2 節。
 
+## F-155: FreeBSD の対 nginx パリティ（2026-08-17、FreeBSD 14.3 aarch64 / QEMU+HVF）
+
+### 結論: 54KB の劣後は**コードではなく計測ハーネスの設定**が原因だった
+
+`tools/perf/freebsd/run_perf_freebsd.sh` は veil の設定に `ktls_enabled = true` を
+ハードコードしていた一方、比較対象の nginx は kTLS を使っていなかった
+（`ssl_conf_command` 未指定）。FreeBSD の software kTLS が TLS レコードごとに
+カーネルワーカースレッドへ暗号処理をディスパッチして直列化することは
+2026-08-08 に本ドキュメントへ記録済みだったが、**ハーネスがその知見に追従していなかった**。
+
+`ktls_enabled = false` に揃えた同一 VM・同一セッションの実測（3 反復の中央値、54,576B）:
+
+| シナリオ | nginx | veil | **veil/nginx** | 2026-08-16（kTLS 有効） |
+|---|---|---|---|---|
+| HTTP/1.1 TLS | 23,890 | 26,024 | **1.09** | 0.51 |
+| HTTP/2 TLS | 21,566 | 24,922 | **1.16** | 0.56 |
+| h2c 平文 | 66,724 | 40,381 | 0.61 | 0.58 |
+| HTTP/3 | 3,426 | 3,428 | 1.00 | 0.98 |
+| HTTP/1.1 proxy | 16,233 | 16,681 | **1.03** | 0.78 |
+| HTTP/2 proxy | 12,702 | 16,191 | **1.27** | 0.98 |
+| L4 TCP | 36,209 | 22,770 | 0.63 | 0.58 |
+
+**TLS を使う 4 シナリオすべてで veil が nginx を上回った**（HTTP/1.1・HTTP/2 の
+ファイル配信とプロキシ）。残る劣後は h2c 平文（0.61）と L4 TCP（0.63）。
+
+### p99 3810ms のスパイクは再現しない（H7 は誤診）
+
+`docs/artifacts/freebsd_perf_bottleneck_analysis.md` は `h1_proxy_tls` の
+p99 = 3810ms を「`TcpStream::connect_str` の `to_socket_addrs()` が同期
+`getaddrinfo` を呼ぶため」と結論していたが、**これは誤りである**:
+
+1. Rust 標準の `impl ToSocketAddrs for str` は**まず `SocketAddr` としてのパースを試し、
+   成功したら resolver を呼ばない**。上流は `127.0.0.1:18080` の IP リテラルなので
+   `getaddrinfo` は元から実行されていない。
+2. 再計測すると p99 は 54KB で 5.66〜5.82ms（nginx 5.87〜6.05ms）、
+   3B で 1.24〜1.30ms。スパイクは一度も観測されなかった。
+
+F-155 の Phase 1（`ProxyTarget::socket_addr` の事前解決）は
+「接続ごとの `Vec` 確保を消す」というホットパス規則上の改善として入れてあるが、
+**p99 の改善を主張してはならない**。
+
+### 3B（リクエスト単価）は依然として劣後する
+
+| シナリオ | nginx | veil | veil/nginx |
+|---|---|---|---|
+| HTTP/1.1 TLS | 200,390 | 93,068 | 0.46 |
+| HTTP/2 TLS | 211,104 | 177,370 | 0.84 |
+| h2c 平文 | 374,569 | 168,032 | 0.45 |
+| HTTP/1.1 proxy | 107,430 | 98,824 | 0.92 |
+| HTTP/2 proxy | 76,948 | 82,829 | **1.08** |
+| L4 TCP | 170,818 | 153,575 | 0.90 |
+
+F-155 の Phase 2/3/4（capsicum の malloc 排除・kqueue `write_hint`・バッチ accept）は
+この領域を狙ったものだが、**この VM のラウンド間変動（同一バイナリで 1.8 倍）に
+対して効果が埋もれ、単独の寄与を確定できなかった**。交互 A/B を組んでも
+下記 B-66 の影響でノイズが支配的になる。
+
+### `h1_file_plain` シナリオの追加と、そこで見つかった既存バグ（B-66）
+
+Phase 5（`sf_hdtr` によるヘッダ+本体の 1-syscall 化）が効くのは
+**平文 HTTP/1.1 の静的配信だけ**（rustls 経路は平文漏洩になるので通さない、
+HTTP/2・h2c は DATA フレーミングが要るので `sendfile` に載らない）。
+既存シナリオにその構成が無かったため `h1_file_plain` を追加した。
+
+**注意**: veil の平文リスナー（`h2c_listen`）は **h2c 専用**で HTTP/1.1 を
+「Plain HTTP/1.1 not supported on H2C-only server」として切断する。
+平文 HTTP/1.1 を veil に喋らせる唯一の方法は、**TLS ポートへ `http://` を投げて
+プロトコル検出経由で `accept_plain` させる**こと。これを知らずに h2c ポートへ
+投げると veil だけ 0 rps になる（一度踏んだ）。
+
+初回計測は健全で **54KB が対 nginx 0.92**（veil 70,804 / nginx 76,889）だったが、
+計測を繰り返すと veil のみ単調に劣化し p99 が数秒に達した。
+F-155 適用前の `b148615` をビルドして交互 A/B した結果、**この劣化は F-155 の回帰ではなく
+既存の事象**と確定した（→ **B-66**）。したがって `h1_file_plain` は
+B-66 が直るまで安定した計測値を出さない。
+
+### Phase 6（`TCP_NOPUSH`）の効果は確認できていない
+
+`nopush_guard` の有無だけを変えた 2 バイナリで 4 ラウンドの交互 A/B を行ったが、
+**一貫した差は出なかった**（両方とも B-66 の劣化に支配された）。
+Phase 5 でヘッダと本体が既に 1 回の `sendfile(2)` にまとまっているため
+`TCP_NOPUSH` に合流させる余地はほとんど無く、代わりに 1 リクエストあたり
+`setsockopt` が 2 回増える。**B-66 修正後に改めて A/B し、効果が確認できなければ外すこと。**
+
+生データは `docs/artifacts/freebsd_perf/`（git 管理外の作業成果物）。
+
 ### FreeBSD 14.3 aarch64（QEMU/HVF・Apple Silicon、54,576B、capsicum + capability mode 有効）
 
 **同一 VM・同一ボディサイズの 2026-08-07 計測との直接比較**（アーキ・ハイパーバイザが

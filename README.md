@@ -662,6 +662,11 @@ huge_pages_enabled = true
 cert_path = "/path/to/cert.pem"
 key_path = "/path/to/key.pem"
 ktls_enabled = true         # Enable kTLS (Linux 5.15+ or FreeBSD 13.0+, requires feature flag; F-126)
+                            # On FreeBSD **without hardware kTLS offload, set this to false** (F-155):
+                            # software kTLS dispatches every 16KB TLS record to a kernel worker
+                            # thread, serializing throughput. Disabling it flipped the 54KB
+                            # veil/nginx ratio from 0.51 to 1.09 (HTTP/1.1) and 0.56 to 1.16 (HTTP/2)
+                            # on the same VM. See docs/perf/README.md.
 ktls_fallback_enabled = true # Fallback to rustls on kTLS failure (default: true)
 tcp_cork_enabled = true     # Use TCP_CORK during kTLS setup (default: true)
 

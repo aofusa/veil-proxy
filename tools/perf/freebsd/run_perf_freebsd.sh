@@ -487,13 +487,21 @@ run_scenario() {
         v_cfg=veil_file.toml;    v_url="http://127.0.0.1:${VEIL_HTTP}${REQ_PATH}"
         n_url="http://127.0.0.1:${NGX_HTTP}${REQ_PATH}"; tool=h2load ;;
       # F-155: 平文 HTTP/1.1 の静的配信。veil の FreeBSD `sendfile(2)` ゼロコピー経路
-      # （kTLS 無効・TLS 終端なしのときだけ通る）が実際に効く唯一のシナリオであり、
-      # sf_hdtr による 1-syscall 化の効果はここでしか観測できない
+      # （`ServerTls::is_plain()` = TLS 終端なしのときだけ通る）が実際に効く唯一の
+      # シナリオであり、sf_hdtr による 1-syscall 化の効果はここでしか観測できない
       # （h2c は HTTP/2 のフレーミングが要るので sendfile に載らない）。
       # nginx 側も `sendfile on;` で同じくカーネルゼロコピー + sf_hdtr を使うため、
       # 「1 リクエストあたりの syscall 数」を真正面から比較する構成になる。
+      #
+      # **veil の宛先が HTTPS ポートなのは誤記ではない。** veil の平文リスナー
+      # （`h2c_listen`）は **h2c 専用**で、平文 HTTP/1.1 は
+      # 「Plain HTTP/1.1 not supported on H2C-only server」として切断される。
+      # 一方、メインリスナーは先頭バイトのプロトコル検出（`detect_protocol_with_buffer`）
+      # を行い、TLS ClientHello でなければ平文 HTTP/1.1 として `accept_plain` する。
+      # したがって「veil に平文 HTTP/1.1 を喋らせる」唯一の方法は、TLS ポートへ
+      # `http://` で投げることである（実機で 200 / Content-Length 一致 / 本体 md5 一致を確認済み）。
       h1_file_plain)
-        v_cfg=veil_file.toml;    v_url="http://127.0.0.1:${VEIL_HTTP}${REQ_PATH}"
+        v_cfg=veil_file.toml;    v_url="http://127.0.0.1:${VEIL_HTTPS}${REQ_PATH}"
         n_url="http://127.0.0.1:${NGX_HTTP}${REQ_PATH}"; tool=wrk ;;
       h3_file)
         v_cfg=veil_file_h3.toml; v_url="https://127.0.0.1:${VEIL_HTTPS}${REQ_PATH}"
@@ -519,7 +527,7 @@ run_scenario() {
     log "[$sc iter=$iter] veil 計測"
     start_veil "${WORK}/conf/${v_cfg}"
     case "$sc" in
-      h2c_file_plain|h1_file_plain) wait_port "${VEIL_HTTP}"  || die "veil(平文) 起動失敗" ;;
+      h2c_file_plain)               wait_port "${VEIL_HTTP}"  || die "veil(h2c) 起動失敗" ;;
       l4_tcp)                       wait_port "${VEIL_L4}"    || die "veil(l4) 起動失敗" ;;
       h3_file)                      wait_udp_port "${VEIL_HTTPS}" || die "veil(h3) 起動失敗" ;;
       *)                            wait_port "${VEIL_HTTPS}" || die "veil(https) 起動失敗" ;;
