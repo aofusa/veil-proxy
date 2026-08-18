@@ -1402,16 +1402,26 @@ where
     }
 
     /// ヘッダーのみを送信 (ステータスコード付き)
-    pub async fn send_headers(
+    ///
+    /// F-157/A-3: `headers` は `AsRef<[u8]>` を実装する任意の名前/値ペア列を受け付ける
+    /// ジェネリクスにしてある。呼び出し側が既に `Vec<(Vec<u8>, Vec<u8>)>` のような
+    /// 所有型でヘッダーを保持している場合（`H2RespMsg::Head` 等）、`&[u8]` へ変換する
+    /// 中間 `Vec<(&[u8], &[u8])>` を `collect()` する必要が無くなり、1 レスポンスあたり
+    /// 1 回のヒープ確保が消える。
+    pub async fn send_headers<K, V>(
         &mut self,
         stream_id: u32,
         status: u16,
-        headers: &[(&[u8], &[u8])],
+        headers: &[(K, V)],
         end_stream: bool,
-    ) -> Http2Result<()> {
+    ) -> Http2Result<()>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
         let mut lowercase_names: Vec<Vec<u8>> = Vec::with_capacity(headers.len());
-        for &(name, _) in headers {
-            lowercase_names.push(name.to_ascii_lowercase());
+        for (name, _) in headers {
+            lowercase_names.push(name.as_ref().to_ascii_lowercase());
         }
 
         self.send_headers_internal(
@@ -1430,16 +1440,22 @@ where
     /// 多重化メインループの `drive_streams` が、複数ストリームの HEADERS/DATA を
     /// `write_buf` へ合流させ 1 回の書き込みでフラッシュするために使う。`end_stream=true` で
     /// ボディ無し応答（リダイレクト・304 等）の HEADERS に END_STREAM を付与する。
-    pub async fn send_headers_buffered_end(
+    ///
+    /// `headers` のジェネリクス化の理由は `send_headers` の doc コメント参照（F-157/A-3）。
+    pub async fn send_headers_buffered_end<K, V>(
         &mut self,
         stream_id: u32,
         status: u16,
-        headers: &[(&[u8], &[u8])],
+        headers: &[(K, V)],
         end_stream: bool,
-    ) -> Http2Result<()> {
+    ) -> Http2Result<()>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
         let mut lowercase_names: Vec<Vec<u8>> = Vec::with_capacity(headers.len());
-        for &(name, _) in headers {
-            lowercase_names.push(name.to_ascii_lowercase());
+        for (name, _) in headers {
+            lowercase_names.push(name.as_ref().to_ascii_lowercase());
         }
         self.send_headers_internal(
             stream_id,
@@ -1467,15 +1483,19 @@ where
     /// フラッシュする）を続けて呼ぶこと。途中で `write_all` を伴う制御フレーム送出
     /// （`send_rst_stream` 等）を挟んではならない（連結バッファに HEADERS が残っているため
     /// 順序が壊れる）。`end_stream=false` 固定（ボディが続く前提）。
-    pub async fn send_headers_buffered(
+    pub async fn send_headers_buffered<K, V>(
         &mut self,
         stream_id: u32,
         status: u16,
-        headers: &[(&[u8], &[u8])],
-    ) -> Http2Result<()> {
+        headers: &[(K, V)],
+    ) -> Http2Result<()>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
         let mut lowercase_names: Vec<Vec<u8>> = Vec::with_capacity(headers.len());
-        for &(name, _) in headers {
-            lowercase_names.push(name.to_ascii_lowercase());
+        for (name, _) in headers {
+            lowercase_names.push(name.as_ref().to_ascii_lowercase());
         }
 
         self.send_headers_internal(stream_id, status, headers, &lowercase_names, false, false)
@@ -1486,15 +1506,21 @@ where
     ///
     /// `flush` が `true` のとき連結バッファを即座に書き込む。`false` のときは
     /// 続く DATA/トレイラーと 1 回の書き込みにまとめるためバッファに残す。
-    async fn send_headers_internal(
+    ///
+    /// `headers` のジェネリクス化の理由は `send_headers` の doc コメント参照（F-157/A-3）。
+    async fn send_headers_internal<K, V>(
         &mut self,
         stream_id: u32,
         status: u16,
-        headers: &[(&[u8], &[u8])],
+        headers: &[(K, V)],
         lowercase_names: &[Vec<u8>],
         end_stream: bool,
         flush: bool,
-    ) -> Http2Result<()> {
+    ) -> Http2Result<()>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
         // ステータスコードを文字列に変換
         let mut status_buf = [0u8; 3];
         let status_str: &[u8] = match status {
@@ -1525,8 +1551,8 @@ where
         let mut header_list: Vec<(&[u8], &[u8], bool)> = Vec::with_capacity(headers.len() + 1);
         header_list.push((b":status", status_str, false));
 
-        for (i, &(_, value)) in headers.iter().enumerate() {
-            header_list.push((&lowercase_names[i], value, false));
+        for (i, (_, value)) in headers.iter().enumerate() {
+            header_list.push((&lowercase_names[i], value.as_ref(), false));
         }
 
         let header_block = self

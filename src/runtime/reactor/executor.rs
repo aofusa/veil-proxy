@@ -710,6 +710,31 @@ impl ExecutorState {
         self.ready.push_back((index, generation));
     }
 
+    /// タスク本体を新しいスロットへ格納するが、ready キューへは積まない（A-1'）。
+    ///
+    /// `spawn_body` と同じスロット確保規律（free-list 優先、無ければ push）を使うが、
+    /// 呼び出し側（`spawn_body_and_poll`）がこの直後に自前で 1 回 poll するため、
+    /// 通常の実行キュー経由の起動とは別経路を取る。戻り値は確保したスロットの
+    /// (index, generation)。uring 版 `runtime::uring::executor::ExecutorState::reserve_slot`
+    /// と等価な実装。
+    fn reserve_slot(&mut self, body: TaskBody) -> (usize, u32) {
+        let index = if let Some(i) = self.free.pop() {
+            let slot = &mut self.slots[i];
+            slot.body = Some(body);
+            slot.scheduled = false;
+            i
+        } else {
+            let i = self.slots.len();
+            self.slots.push(TaskSlot {
+                body: Some(body),
+                generation: 0,
+                scheduled: false,
+            });
+            i
+        };
+        (index, self.slots[index].generation)
+    }
+
     fn schedule(&mut self, index: usize, generation: u32) {
         if let Some(slot) = self.slots.get_mut(index) {
             if slot.generation != generation || slot.scheduled {
@@ -907,6 +932,53 @@ pub fn current_executor() -> Executor {
     Executor::new()
 }
 
+/// タスクをスラブへ登録し、その場でタスク自身の実 Waker を使って 1 回だけ poll する（A-1'）。
+///
+/// uring 版 `runtime::uring::executor::spawn_body_and_poll` と等価な実装
+/// （AGENTS.md の「reactor 追加でも uring 生成コードを等価に保つ」方針に沿い、
+/// reactor 側も対称的に実装する）。健全性の根拠（Waker・借用規律）は
+/// uring 版の doc コメントを参照。
+///
+/// `Poll::Ready` まで進めば `true`（ready キューに一度も積まれない = エグゼキュータ往復・
+/// fd readiness の確認 poll(2)・Notify 起床が消える）、`Poll::Pending` なら `false`
+/// （通常の `spawn()` と全く同じ状態でエグゼキュータに残る）を返す。
+fn spawn_body_and_poll(body: TaskBody) -> bool {
+    // スロットを確保する（ready キューへは積まない）。
+    let (index, generation) = EXEC_STATE.with(|s| s.borrow_mut().reserve_slot(body));
+
+    // poll 対象の body を取り出す（EXEC_STATE 借用外で poll するため）。
+    let mut body = EXEC_STATE
+        .with(|s| s.borrow_mut().slots[index].body.take())
+        .expect("reserve_slot 直後のスロットに body が無い");
+
+    let waker = make_waker(index, generation);
+    let mut cx = Context::from_waker(&waker);
+    let poll = match &mut body {
+        TaskBody::Boxed(f) => f.as_mut().poll(&mut cx),
+        TaskBody::Pooled { pool, slot } => pool.poll_slot(*slot, &mut cx),
+    };
+
+    EXEC_STATE.with(|s| {
+        let mut st = s.borrow_mut();
+        match st.slots.get_mut(index) {
+            Some(slot) if slot.generation == generation => match poll {
+                Poll::Pending => {
+                    slot.body = Some(body);
+                    false
+                }
+                Poll::Ready(()) => {
+                    slot.generation = slot.generation.wrapping_add(1);
+                    slot.scheduled = false;
+                    st.free.push(index);
+                    true
+                }
+            },
+            // 単一スレッド・直列 poll のため通常起き得ない（run_ready_tasks と同じ前提）。
+            _ => true,
+        }
+    })
+}
+
 // ====================
 // 型付きタスクプール（uring 版と同一実装）
 // ====================
@@ -941,7 +1013,8 @@ impl<F: Future<Output = ()> + 'static> TaskPool<F> {
         }
     }
 
-    pub fn spawn(&self, future: F) {
+    /// future を空きスロットへ格納し、スロット index を返す（`spawn`/`spawn_inline` 共有）。
+    fn store(&self, future: F) -> u32 {
         let slot = {
             let mut free = self.inner.free.borrow_mut();
             match free.pop() {
@@ -966,8 +1039,21 @@ impl<F: Future<Output = ()> + 'static> TaskPool<F> {
             let cell = &chunks[slot as usize / POOL_CHUNK][slot as usize % POOL_CHUNK];
             *cell.borrow_mut() = Some(future);
         }
+        slot
+    }
+
+    pub fn spawn(&self, future: F) {
+        let slot = self.store(future);
         let pool: Rc<dyn PoolPoll> = self.inner.clone();
         EXEC_STATE.with(|s| s.borrow_mut().spawn_body(TaskBody::Pooled { pool, slot }));
+    }
+
+    /// future をプールのスロットへ格納し、その場で 1 回だけ poll する（A-1'）。
+    /// uring 版 `TaskPool::spawn_inline` と等価。健全性の根拠はそちらの doc コメント参照。
+    pub fn spawn_inline(&self, future: F) -> bool {
+        let slot = self.store(future);
+        let pool: Rc<dyn PoolPoll> = self.inner.clone();
+        spawn_body_and_poll(TaskBody::Pooled { pool, slot })
     }
 }
 

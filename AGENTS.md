@@ -163,7 +163,12 @@ cargo build --features "full"
 ./tests/e2e_setup.sh test
 
 # ユニットテストや統合テストの実行（features指定必須）
-cargo test --bins --test integration_tests --features "full"
+#
+# 注意: `--bins` はバイナリターゲット（main.rs）のテストで **0 件** である。
+# 単体テスト（879 件）は **ライブラリ側**にあるため `--lib` が必須。
+# `--bins --test integration_tests` だけだと統合 54 件しか走らず、
+# 単体テストを 1 件も実行しないまま「ok」になる（実際に踏んだ）。
+cargo test --lib --bins --test integration_tests --features "full"
 ```
 
 ---

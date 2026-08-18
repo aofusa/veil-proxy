@@ -885,11 +885,21 @@ type H2TaskSpawner = std::rc::Rc<
 >;
 
 /// HTTP/2 ワーカースレッド用の per-stream タスクスポーナを作成する。
+///
+/// A-1': `pool.spawn()` ではなく `pool.spawn_inline()` を使う。タスク本体
+/// （`h2_request_task`）が実際に pend する await を 1 つも持たない場合（静的キャッシュ
+/// ヒット等）、その場でタスク自身の実 Waker を使って 1 回 poll し、`Poll::Ready` まで
+/// 進めばエグゼキュータへは一切登録しない。これにより「spawn → メインループへ戻る →
+/// 1 周回後にエグゼキュータがタスクを実行する」という強制往復（poll(2) 相当の待機・
+/// `Notify` 起床を含む）が 1 リクエストにつき 1 回消える。`Poll::Pending` の場合は
+/// `spawn()` と全く同じ状態でエグゼキュータに残るため、戻り値（完了したか）は
+/// スポーナの呼び出し元にとって意味を持たず、ここでは無視してよい
+/// （`H2TaskSpawner` の関数型は変えない）。
 #[cfg(feature = "http2")]
 fn h2_task_spawner() -> H2TaskSpawner {
     let pool = crate::runtime::TaskPool::new();
     std::rc::Rc::new(move |ctx, req_rx, resp_tx, notify| {
-        pool.spawn(h2_request_task(ctx, req_rx, resp_tx, notify));
+        let _ = pool.spawn_inline(h2_request_task(ctx, req_rx, resp_tx, notify));
     })
 }
 
@@ -982,6 +992,17 @@ fn h2_spawn_for_request<S>(
         (None, None)
     };
 
+    // A-1': spawner はタスクを `spawn_inline` するため、この呼び出し自体が
+    // `h2_request_task` を完了まで（ペンドせずに済む限り）その場で実行する可能性がある。
+    // つまりタスクが Head/Body を `resp_tx` へ送出し終えるのが、`streams.insert` より
+    // **前**になり得る。これは安全: `resp_rx`（受信端）はこの関数のローカル変数として
+    // 保持したままであり、他のタスク/コネクションが同時に読み出すことは無い
+    // （thread-per-core・単一スレッドのため、この関数呼び出し自体が他コードと
+    // 競合しない）。`streams.insert` はこの直後に行われ、以降 `drive_h2_streams` が
+    // `resp_rx.try_recv()` でチャネルに既に積まれたメッセージを回収する。チャネルは
+    // 容量 `H2_RESP_CHANNEL_CAP`（4）の有界チャネルであり、それを超える送出は
+    // タスク側が Pending で止まる（= 通常の spawn 経路にフォールバックする）ため、
+    // 送出順序を先取りしても取りこぼしは発生しない。
     spawner(ctx, req_rx, resp_tx, notify.clone());
 
     streams.insert(
@@ -1141,11 +1162,11 @@ where
                     headers,
                     end_stream,
                 } => {
-                    let hv: Vec<(&[u8], &[u8])> = headers
-                        .iter()
-                        .map(|(k, v)| (k.as_slice(), v.as_slice()))
-                        .collect();
-                    conn.send_headers_buffered_end(sid, status, &hv, end_stream)
+                    // F-157/A-3: `send_headers_buffered_end` は `AsRef<[u8]>` の名前/値ペア列を
+                    // 直接受け付けるようジェネリクス化済みのため、`headers: Vec<(Vec<u8>, Vec<u8>)>`
+                    // を `&[u8]` へ変換する中間 `Vec<(&[u8], &[u8])>` の `collect()`
+                    // （1 レスポンスにつき 1 回のヒープ確保）が不要になった。
+                    conn.send_headers_buffered_end(sid, status, &headers, end_stream)
                         .await?;
                     let st = streams.get_mut(&sid).unwrap();
                     st.head_sent = true;
