@@ -289,20 +289,23 @@ unsafe fn signal_notify(write_fd: RawFd) {
 // 専用スレッドを立てて実行するため、スレッドローカルなら他テストと干渉しない。
 //
 // 同期/非同期どちらの実行経路でも `offload()` に入った時点で必ずインクリメントする。
-#[cfg(test)]
+// 消費側（`cache::static_file` のテスト）が `cache` feature でのみコンパイルされるため、
+// フックも同じ条件に揃える（`cache` 無効ビルドで dead_code 警告になるのを防ぐ。
+// `allow(dead_code)` は使わない）。
+#[cfg(all(test, feature = "cache"))]
 thread_local! {
     /// テスト専用: `offload()` 呼び出し回数（呼び出しスレッド単位）。
     pub(crate) static OFFLOAD_CALL_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// テスト専用: 呼び出し回数カウンタ（呼び出しスレッド単位）をリセットする。
-#[cfg(test)]
+#[cfg(all(test, feature = "cache"))]
 pub(crate) fn reset_offload_call_count() {
     OFFLOAD_CALL_COUNT.with(|c| c.set(0));
 }
 
 /// テスト専用: 現在の呼び出し回数（呼び出しスレッド単位）を取得する。
-#[cfg(test)]
+#[cfg(all(test, feature = "cache"))]
 pub(crate) fn offload_call_count() -> u64 {
     OFFLOAD_CALL_COUNT.with(|c| c.get())
 }
@@ -316,7 +319,9 @@ where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    #[cfg(test)]
+    // カウンタ本体と同じ cfg 条件に揃える（`cache` 無効ビルドでは
+    // `OFFLOAD_CALL_COUNT` 自体が存在しない）。
+    #[cfg(all(test, feature = "cache"))]
     OFFLOAD_CALL_COUNT.with(|c| c.set(c.get() + 1));
 
     let (read_fd, write_fd) = match current_thread_notify_fds() {
