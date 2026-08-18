@@ -16,16 +16,30 @@
 #     バイナリを実行することはできない。x86_64 ビルド（Dockerfile.glibc）側で
 #     すでにユニットテストは実行されているため、aarch64 版では省略する）
 #   - ランタイムステージのベースイメージに `--platform=linux/arm64` を指定
+#   - ビルダーステージを `linux/amd64` にピン（下記）
+#
+# `docker build --platform` は **コンパイルターゲットを決めない**。決めるのは
+# この Dockerfile と RUST_TARGET（cargo-zigbuild のクロスコンパイル）である。
+# `--platform` が決めるのは「ピンしていない全 FROM の既定プラットフォーム」と
+# 「最終イメージの OCI Architecture」だけ。ビルダーを未ピンのままにすると
+# `docker build --platform linux/arm64` が arm64 の cargo-zigbuild を引きに行き、
+# **rustc 一式が QEMU エミュレーション上で動いて極端に遅くなる**（実測で
+# x86_64 ネイティブなら十数分の依存ビルドが数時間規模になった）。
+# musl 版（Dockerfile.musl.aarch64）は当初からビルダーを amd64 にピンしている。
 
-# ランタイムステージの --platform 用（FROM で参照する ARG は最初の FROM より前に
-# 宣言する必要がある。定数の直書きは BuildKit の FromPlatformFlagConstDisallowed lint に
-# 触れるため ARG 経由にする。既定値は常に linux/arm64）。
+# FROM で参照する ARG は最初の FROM より前に宣言する必要がある。
+# 定数の直書きは BuildKit の FromPlatformFlagConstDisallowed lint に触れるため ARG 経由。
+# ビルダーは x86_64 ホストでネイティブに動かす（QEMU 上で rustc を回さない）。
+ARG BUILDER_PLATFORM=linux/amd64
+# ランタイムステージの --platform 用（既定値は常に linux/arm64）。
+# これがあるので glibc 側は `docker build --platform` を付けなくても
+# 最終イメージが linux/arm64 として記録される。
 ARG RUNTIME_PLATFORM=linux/arm64
 
 # ==========================================
 # 1. 最小設定ファイルやツールを用意する共通ステージ
 # ==========================================
-FROM messense/cargo-zigbuild AS tool-builder
+FROM --platform=${BUILDER_PLATFORM} messense/cargo-zigbuild AS tool-builder
 
 WORKDIR /app
 

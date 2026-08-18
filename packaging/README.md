@@ -161,14 +161,47 @@ cargo build --release --features full
 ### aarch64（arm64）向けパッケージ（F-120 Phase 3/6）
 
 `RUST_TARGET` に aarch64 ターゲットを指定すると、`ARCH` が自動的に `aarch64` へ
-追従し deb は `arm64`・rpm は `aarch64` として出力される。Docker ビルドは
-aarch64 専用 Dockerfile（`docker/Dockerfile.{glibc,musl}.aarch64`）と
-`--platform linux/arm64` を自動選択する。
+追従し deb は `arm64`・rpm は `aarch64` として出力される。
 
 ```bash
 # aarch64 の .deb / .rpm / tar.gz（Docker クロスビルド）
 RUST_TARGET=aarch64-unknown-linux-gnu ./packaging/scripts/build.sh --docker
 ```
+
+#### `docker build --platform` はコンパイルターゲットではない
+
+**aarch64 バイナリを生成するのは専用 Dockerfile
+（`docker/Dockerfile.{glibc,musl}.aarch64`）と `RUST_TARGET` である。**
+どちらの Dockerfile も **ビルダーは x86_64** で、その上で aarch64 ELF を
+クロスコンパイルする（glibc は cargo-zigbuild、musl は rust-musl-cross）。
+
+`docker build --platform` が決めるのは次の 2 つだけで、バイナリの ISA は決めない。
+
+1. ピンしていない全 `FROM` の既定プラットフォーム
+2. 最終イメージの OCI `Architecture` メタデータ
+
+そのため glibc と musl で扱いが **非対称**になる。
+
+| | `docker build --platform` | 理由 |
+|---|---|---|
+| glibc | **付けない** | ランタイムが `FROM --platform=${RUNTIME_PLATFORM} distroless` なので Dockerfile 内だけで最終イメージが arm64 になる |
+| musl | **付ける** | ランタイムが `FROM scratch`（空・アーキ非依存）で、Dockerfile 内だけでは OCI Architecture を確定できない |
+
+> **glibc に `--platform linux/arm64` を付けてはならない。** ビルダーの
+> `messense/cargo-zigbuild` まで arm64 として解決され、**rustc 一式が QEMU
+> エミュレーション上で動いて極端に遅くなる**（実測で、本来 x86_64 ネイティブなら
+> 十数分で終わる依存ビルドが数時間規模になった）。防御として
+> `Dockerfile.glibc.aarch64` のビルダーも `--platform=${BUILDER_PLATFORM}`
+> （既定 `linux/amd64`）にピンしてある（musl は当初からピン済み）。
+
+`docker create` は「できあがった arm64 イメージ」から作るので、glibc / musl とも
+`--platform linux/arm64` が必要（`build.sh` が build 用と create 用を分けて渡す）。
+
+なお packaging の `--docker` は **イメージを実行しない**（`docker create` +
+`docker cp` で `/veil` を取り出すだけ）。できた aarch64 パッケージは実 aarch64 機向けで、
+既定 feature は `full`（io_uring）。x86_64 上の QEMU user-mode では io_uring の
+syscall が `ENOSYS` になるため動かない。コンテナとして試すなら
+[docker/README.md](../docker/README.md) の `full,epoll` 手順を参照。
 
 ### NetBSD 対応の現状（F-140）
 
@@ -555,8 +588,10 @@ sudo tail -50 /var/log/veil/veil.error-*.log
 |------|------|
 | [contrib/config/config.toml](../contrib/config/config.toml) | パッケージ用デフォルト設定 |
 | [contrib/systemd/veil.service](../contrib/systemd/veil.service) | systemd ユニット |
-| [docker/Dockerfile.glibc](../docker/Dockerfile.glibc) | glibc 配布バイナリビルド |
-| [docker/Dockerfile.musl](../docker/Dockerfile.musl) | musl 配布バイナリビルド |
+| [docker/Dockerfile.glibc](../docker/Dockerfile.glibc) | glibc 配布バイナリビルド（x86_64） |
+| [docker/Dockerfile.musl](../docker/Dockerfile.musl) | musl 配布バイナリビルド（x86_64） |
+| [docker/Dockerfile.glibc.aarch64](../docker/Dockerfile.glibc.aarch64) | Linux aarch64 glibc クロスビルド（x86_64 上の cargo-zigbuild。ビルダーは `linux/amd64` にピン。`docker build --platform` は付けない） |
+| [docker/Dockerfile.musl.aarch64](../docker/Dockerfile.musl.aarch64) | Linux aarch64 musl クロスビルド（x86_64 上の rust-musl-cross。ランタイムが `scratch` のため OCI メタデータ用に `docker build --platform linux/arm64` を付ける） |
 | [docker/Dockerfile.macos](../docker/Dockerfile.macos) | macOS universal2 クロスビルド（キャッシュ有効） |
 | [docker/Dockerfile.windows](../docker/Dockerfile.windows) | Windows x86_64/aarch64 クロスビルド（キャッシュ有効） |
 | [tools/qemu/bsd-vm.sh](../tools/qemu/README.md) | FreeBSD/OpenBSD/NetBSD × x86_64/aarch64 の VM ビルド・E2E・バイナリ取得（`<os> <arch> all` で一括） |

@@ -147,15 +147,25 @@ build_binary_glibc_docker() {
     local libc="${LIBC_VERSION:-.2.28}"
     mkdir -p "${BUILD_DIR}"
     # aarch64 ターゲットは専用の cross Dockerfile（F-120 Phase 3）を使う。
-    # ランタイムステージが arm64 イメージのため、docker build にも
-    # --platform linux/arm64 を渡してメタデータを arm64 に揃える。
+    #
+    # **`docker build --platform` はコンパイルターゲットを決めない。**
+    # aarch64 バイナリを作るのは Dockerfile（cargo-zigbuild）と RUST_TARGET である。
+    # `--platform` が決めるのは「ピンしていない全 FROM の既定プラットフォーム」と
+    # 「最終イメージの OCI Architecture」だけ。
+    #
+    # glibc は **build には付けない**。ランタイムの
+    # `FROM --platform=${RUNTIME_PLATFORM} distroless` で最終イメージが arm64 になるため
+    # 不要であり、付けるとビルダーの cargo-zigbuild まで arm64 として解決されて
+    # **rustc が QEMU 上で動き極端に遅くなる**（実測で数時間規模になった）。
+    # 一方 `docker create` は「できた arm64 イメージ」から作るので --platform が要る。
     local dockerfile="${ROOT}/docker/Dockerfile.glibc"
-    local platform_arg=()
+    local build_platform=()
+    local create_platform=()
     if [[ "${ARCH}" == "aarch64" ]]; then
         dockerfile="${ROOT}/docker/Dockerfile.glibc.aarch64"
-        platform_arg=(--platform linux/arm64)
+        create_platform=(--platform linux/arm64)
     fi
-    docker build "${platform_arg[@]}" -f "${dockerfile}" \
+    docker build "${build_platform[@]}" -f "${dockerfile}" \
         --build-arg CARGO_FEATURES="${features}" \
         --build-arg RUST_TARGET="${target}" \
         --build-arg LIBC_VERSION="${libc}" \
@@ -163,7 +173,7 @@ build_binary_glibc_docker() {
         "${ROOT}"
 
     local cid
-    cid=$(docker create "${platform_arg[@]}" "veil:glibc-${ARCH}")
+    cid=$(docker create "${create_platform[@]}" "veil:glibc-${ARCH}")
     docker cp "${cid}:/veil" "${BUILD_DIR}/veil-glibc"
     docker rm "${cid}"
 
@@ -176,20 +186,27 @@ build_binary_musl_docker() {
     local features="${CARGO_FEATURES:-full}"
     local target="${MUSL_TARGET}"
     mkdir -p "${BUILD_DIR}"
+    # musl は glibc と非対称で **build にも --platform が要る**。
+    # ランタイムが `FROM scratch`（空・アーキ非依存）なので、Dockerfile 内だけでは
+    # 最終イメージの OCI Architecture を確定できないため。
+    # ビルダーは Dockerfile 側で `--platform=${BUILDER_PLATFORM}`（linux/amd64）に
+    # ピン済みなので、これを付けても rust-musl-cross が arm64 化することはない。
     local dockerfile="${ROOT}/docker/Dockerfile.musl"
-    local platform_arg=()
+    local build_platform=()
+    local create_platform=()
     if [[ "${ARCH}" == "aarch64" ]]; then
         dockerfile="${ROOT}/docker/Dockerfile.musl.aarch64"
-        platform_arg=(--platform linux/arm64)
+        build_platform=(--platform linux/arm64)
+        create_platform=(--platform linux/arm64)
     fi
-    docker build "${platform_arg[@]}" -f "${dockerfile}" \
+    docker build "${build_platform[@]}" -f "${dockerfile}" \
         --build-arg CARGO_FEATURES="${features}" \
         --build-arg RUST_TARGET="${target}" \
         -t "veil:musl-${ARCH}" \
         "${ROOT}"
 
     local cid
-    cid=$(docker create "${platform_arg[@]}" "veil:musl-${ARCH}")
+    cid=$(docker create "${create_platform[@]}" "veil:musl-${ARCH}")
     docker cp "${cid}:/veil" "${BUILD_DIR}/veil-musl"
     docker rm "${cid}"
 
