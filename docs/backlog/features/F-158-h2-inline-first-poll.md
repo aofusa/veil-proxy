@@ -1,7 +1,7 @@
 # F-158: HTTP/2 per-stream タスクのインライン初回 poll
 
 **優先度**: P2
-**ステータス**: 完了（FreeBSD 実測で確認、Linux 非劣化確認は別途）
+**ステータス**: 完了（**readiness reactor 限定で採用**。io_uring では実測で退行したため不採用）
 **関連**: F-116（per-stream タスク多重化）、F-157（残件として本件を指名）、F-141/F-155（kqueue readiness ヒント）
 
 ---
@@ -94,6 +94,52 @@ md5 で 2 バイナリが別物であることを確認済み。
 
 固定費を消した改修なので **3B で大きく効き 54KB では埋もれる**のが期待される挙動であり、
 実測はそれと一致する。
+
+## 【重要】io_uring では退行した → reactor 限定に変更した
+
+FreeBSD で +27.3% を確認したあと Linux（io_uring・既定バックエンド）でも交互 A/B を
+取ったところ、**逆に退行していた**。
+
+| バックエンド | 構成 | base 中央値 | new 中央値 | 差 | base の勝ち |
+|---|---|---|---|---|---|
+| kqueue（FreeBSD aarch64） | h2c 3B | 555,119 | **706,779** | **+27.3%** | 0/10 |
+| kqueue（FreeBSD aarch64） | h2c 54KB | 96,981 | 97,794 | +0.8% | 2/10 |
+| **io_uring（Linux x86_64）** | `h2c_file` | 9,678.9 | 9,231.8 | **−4.6%** | **11/12** |
+| **io_uring（Linux x86_64）** | `h2c_proxy` | 2,744.1 | 2,639.1 | −3.8% | 5/6 |
+
+（Linux は 12 ラウンド + 6 ラウンドの 2 回、いずれも交互・順序入替。24 ラウンド中 21 で
+ベースラインが勝った。）
+
+### 原因: 消せる往復コストがバックエンドで違う
+
+- **reactor**: 待機は `h2_select_readable_or_notify` → `Readable::poll` を通り、
+  kqueue ヒントが無いときは**同期 `poll(2)` を 1 回発行する**
+  （この `poll(2)` フォールバック自体は F-141/F-155 の実測により削除禁止）。
+  インライン初回 poll はこの往復ごと消せるので大きく効く。
+- **io_uring**: 同じ待機が `IORING_OP_POLL_ADD` の SQE 1 本で、他の SQE とまとめて
+  submit される。**消せる往復コストがそもそも小さい**。残るのはインライン poll 側の
+  固定費（スロット確保・Waker 構築・`EXEC_STATE` の追加借用）と SQE バッチングの
+  乱れだけになり、差し引きで退行する。
+
+### 対処
+
+`veil_rt_reactor` のときだけ `spawn_inline` を呼ぶよう `h2_task_spawner` を cfg 分岐し、
+**`src/runtime/uring/executor.rs` は F-158 以前と 1 バイトも変わらない状態へ戻した**
+（`git diff` で確認済み）。AGENTS.md の「io_uring パスのロジックは変えない」と
+「Linux io_uring 経路の非劣化保証」の両方を満たす。
+`spawn_inline`/`spawn_body_and_poll` は reactor 側にのみ存在する（dead_code なし）。
+
+適用対象: FreeBSD / OpenBSD / NetBSD / macOS / Linux `--features epoll`。
+**epoll も同じ恩恵を受けるはず**である（readiness ヒントは kqueue 限定の実装なので、
+epoll は常に `poll(2)` フォールバックを通る）。
+
+### 教訓
+
+**「片方のプラットフォームで大きく効いた」ことは、もう一方で効くことを何ら意味しない。**
+本件は同一の変更が **+27% と −4.6%** に分かれた。仕様書は FreeBSD の h2c と
+Linux の h2c proxy を 1 つの問題として扱い共通の改修案を並べていたが、
+**待機プリミティブが違う以上、両者は別の問題である**。
+新しいホットパス最適化は**必ず両バックエンドで交互 A/B を取ること**。
 
 ## 計測時の落とし穴（本件で踏んだもの）
 

@@ -886,20 +886,50 @@ type H2TaskSpawner = std::rc::Rc<
 
 /// HTTP/2 ワーカースレッド用の per-stream タスクスポーナを作成する。
 ///
-/// A-1': `pool.spawn()` ではなく `pool.spawn_inline()` を使う。タスク本体
-/// （`h2_request_task`）が実際に pend する await を 1 つも持たない場合（静的キャッシュ
-/// ヒット等）、その場でタスク自身の実 Waker を使って 1 回 poll し、`Poll::Ready` まで
-/// 進めばエグゼキュータへは一切登録しない。これにより「spawn → メインループへ戻る →
-/// 1 周回後にエグゼキュータがタスクを実行する」という強制往復（poll(2) 相当の待機・
-/// `Notify` 起床を含む）が 1 リクエストにつき 1 回消える。`Poll::Pending` の場合は
-/// `spawn()` と全く同じ状態でエグゼキュータに残るため、戻り値（完了したか）は
-/// スポーナの呼び出し元にとって意味を持たず、ここでは無視してよい
-/// （`H2TaskSpawner` の関数型は変えない）。
+/// F-158（A-1'）: **readiness reactor バックエンドに限り** `pool.spawn()` ではなく
+/// `pool.spawn_inline()` を使う。タスク本体（`h2_request_task`）が実際に pend する
+/// await を 1 つも持たない場合（静的キャッシュヒット等）、その場でタスク自身の実 Waker で
+/// 1 回 poll し、`Poll::Ready` まで進めばエグゼキュータへ一切登録しない。これにより
+/// 「spawn → メインループへ戻る → 1 周回後にエグゼキュータがタスクを実行する」という
+/// 強制往復が 1 リクエストにつき 1 回消える。`Poll::Pending` の場合は `spawn()` と全く
+/// 同じ状態でエグゼキュータに残るため、戻り値（完了したか）はここでは無視してよい。
+///
+/// ## なぜ io_uring では使わないのか（実測に基づく）
+///
+/// **この最適化は readiness reactor 固有のコストを消すものであり、io_uring では
+/// 逆に退行する。** 交互 A/B の実測:
+///
+/// - FreeBSD 14.3 aarch64（kqueue）: 3B レスポンスで中央値 **+27.3%**
+///   （10/10 ラウンド勝ち・分布は完全分離）。54KB は +0.8% で退行なし。
+/// - Linux x86_64（io_uring）: `h2c_file` で中央値 **−4.6%**（12 ラウンド中 11 で
+///   ベースラインが勝ち）。`h2c_proxy` も −3.8%。
+///
+/// 理由は待機の実装差にある。reactor では `h2_select_readable_or_notify` が
+/// `Readable::poll` を通り、**kqueue ヒントが無いときは同期 `poll(2)` を 1 回発行する**
+/// （この `poll(2)` フォールバック自体は F-141/F-155 の実測により削除禁止。
+/// AGENTS.md 参照）。インライン初回 poll はこの往復ごと消せるため大きく効く。
+/// 一方 io_uring では同じ待機が `IORING_OP_POLL_ADD` の SQE 1 本であり、他の SQE と
+/// まとめて submit されるため**消せる往復コストがそもそも小さい**。残るのは
+/// インライン poll 側の固定費（スロット確保・Waker 構築・`EXEC_STATE` の追加借用）と
+/// SQE バッチングの乱れだけになり、差し引きで退行する。
+///
+/// **したがって io_uring 側にはこの機構を実装せず**（`runtime::uring::executor` は
+/// F-158 以前と 1 バイトも変わらない）、`veil_rt_reactor` のときだけ `spawn_inline` を
+/// 呼ぶ。AGENTS.md の「io_uring パスのロジックは変えない」「Linux io_uring 経路の
+/// 非劣化保証」の両方を満たす。
 #[cfg(feature = "http2")]
 fn h2_task_spawner() -> H2TaskSpawner {
     let pool = crate::runtime::TaskPool::new();
     std::rc::Rc::new(move |ctx, req_rx, resp_tx, notify| {
-        let _ = pool.spawn_inline(h2_request_task(ctx, req_rx, resp_tx, notify));
+        let fut = h2_request_task(ctx, req_rx, resp_tx, notify);
+        #[cfg(veil_rt_reactor)]
+        {
+            let _ = pool.spawn_inline(fut);
+        }
+        #[cfg(not(veil_rt_reactor))]
+        {
+            pool.spawn(fut);
+        }
     })
 }
 

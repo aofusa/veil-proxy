@@ -911,30 +911,6 @@ impl ExecutorState {
         self.ready.push_back((index, generation));
     }
 
-    /// タスク本体を新しいスロットへ格納するが、ready キューへは積まない（A-1'）。
-    ///
-    /// `spawn_body` と同じスロット確保規律（free-list 優先、無ければ push）を使うが、
-    /// 呼び出し側（`spawn_body_and_poll`）がこの直後に自前で 1 回 poll するため、
-    /// 通常の実行キュー経由の起動とは別経路を取る。戻り値は確保したスロットの
-    /// (index, generation)。
-    fn reserve_slot(&mut self, body: TaskBody) -> (usize, u32) {
-        let index = if let Some(i) = self.free.pop() {
-            let slot = &mut self.slots[i];
-            slot.body = Some(body);
-            slot.scheduled = false;
-            i
-        } else {
-            let i = self.slots.len();
-            self.slots.push(TaskSlot {
-                body: Some(body),
-                generation: 0,
-                scheduled: false,
-            });
-            i
-        };
-        (index, self.slots[index].generation)
-    }
-
     /// index/generation のタスクを ready キューへ積む（既に積まれていれば何もしない）。
     fn schedule(&mut self, index: usize, generation: u32) {
         if let Some(slot) = self.slots.get_mut(index) {
@@ -1168,74 +1144,6 @@ pub fn current_executor() -> Executor {
     Executor::new()
 }
 
-/// タスクをスラブへ登録し、その場でタスク自身の実 Waker を使って 1 回だけ poll する（A-1'）。
-///
-/// `Poll::Ready` まで進めば `true` を返す。この場合 **エグゼキュータの ready キューには
-/// 一度も積まれない**（`spawn_body` を経由しないため）ので、通常経路の spawn →
-/// 起動（poll(2) 相当の待機/Notify 起床）→ 実行という 1 往復がまるごと消える。
-/// `Poll::Pending` の場合は `false` を返し、通常の `spawn()` が作る状態と完全に同一
-/// （スロットに body が戻り、generation はそのまま、後続の wake で ready キューへ
-/// 積まれる）になる。
-///
-/// ## Waker の健全性
-///
-/// 初回 poll には **タスク自身の実 Waker**（`make_waker(index, generation)`）を使う。
-/// noop waker を使うと、future が `Pending` を返す際に waker を保存していた場合
-/// （典型的には io_uring op 登録や channel の待機者登録）、二度と起床されず恒久的に
-/// ハングする。ここでは通常の `run_ready_tasks` が使うのと全く同じ waker 構築経路
-/// （index/generation ベース、参照カウント無し）を使うため、Pending 時の起床可能性は
-/// 通常 spawn と数学的に同一である。
-///
-/// poll 中に future 自身が（あるいは poll 中に完了した子タスクが）`wake_by_ref` を
-/// 呼んだ場合、`EXEC_STATE::schedule` はスロットの (index, generation) をそのまま
-/// ready キューへ積む。poll が最終的に `Pending` を返せば、そのタスクは次の
-/// `run_ready_tasks` で正しく再開される（自己 wake → 即再開したいタスクも通常経路と
-/// 同じに振る舞う）。poll が `Ready` を返した場合は、その直後に generation を
-/// インクリメントしてスロットを解放するため、schedule 済みの stale なエントリは
-/// 世代不一致で自然に無視される（既存の `stale_waker_is_ignored` と同じ機構）。
-///
-/// ## 借用規律
-///
-/// `run_ready_tasks` と同じ規律を守る: poll 呼び出しの間は `EXEC_STATE` を borrow
-/// しない。future が自身の中で（同じプールへの再入も含め）`spawn`/`spawn_inline` を
-/// 呼んでも、この関数の borrow と衝突しない。
-fn spawn_body_and_poll(body: TaskBody) -> bool {
-    // スロットを確保する（ready キューへは積まない）。
-    let (index, generation) = EXEC_STATE.with(|s| s.borrow_mut().reserve_slot(body));
-
-    // poll 対象の body を取り出す（EXEC_STATE 借用外で poll するため）。
-    let mut body = EXEC_STATE
-        .with(|s| s.borrow_mut().slots[index].body.take())
-        .expect("reserve_slot 直後のスロットに body が無い");
-
-    let waker = make_waker(index, generation);
-    let mut cx = Context::from_waker(&waker);
-    let poll = match &mut body {
-        TaskBody::Boxed(f) => f.as_mut().poll(&mut cx),
-        TaskBody::Pooled { pool, slot } => pool.poll_slot(*slot, &mut cx),
-    };
-
-    EXEC_STATE.with(|s| {
-        let mut st = s.borrow_mut();
-        match st.slots.get_mut(index) {
-            Some(slot) if slot.generation == generation => match poll {
-                Poll::Pending => {
-                    slot.body = Some(body);
-                    false
-                }
-                Poll::Ready(()) => {
-                    slot.generation = slot.generation.wrapping_add(1);
-                    slot.scheduled = false;
-                    st.free.push(index);
-                    true
-                }
-            },
-            // 単一スレッド・直列 poll のため通常起き得ない（run_ready_tasks と同じ前提）。
-            _ => true,
-        }
-    })
-}
-
 // ====================
 // 型付きタスクプール（F-46）
 // ====================
@@ -1297,8 +1205,8 @@ impl<F: Future<Output = ()> + 'static> TaskPool<F> {
         }
     }
 
-    /// future を空きスロットへ格納し、スロット index を返す（`spawn`/`spawn_inline` 共有）。
-    fn store(&self, future: F) -> u32 {
+    /// future をプールのスロットへ格納し、エグゼキュータのタスクとして起動する。
+    pub fn spawn(&self, future: F) {
         let slot = {
             let mut free = self.inner.free.borrow_mut();
             match free.pop() {
@@ -1327,32 +1235,8 @@ impl<F: Future<Output = ()> + 'static> TaskPool<F> {
             let cell = &chunks[slot as usize / POOL_CHUNK][slot as usize % POOL_CHUNK];
             *cell.borrow_mut() = Some(future);
         }
-        slot
-    }
-
-    /// future をプールのスロットへ格納し、エグゼキュータのタスクとして起動する。
-    pub fn spawn(&self, future: F) {
-        let slot = self.store(future);
         let pool: Rc<dyn PoolPoll> = self.inner.clone();
         EXEC_STATE.with(|s| s.borrow_mut().spawn_body(TaskBody::Pooled { pool, slot }));
-    }
-
-    /// future をプールのスロットへ格納し、その場で 1 回だけ poll する（A-1'）。
-    ///
-    /// `Poll::Ready` まで進んだ場合はエグゼキュータへ一切登録せず `true` を返す
-    /// （通常の `spawn()` が強制する「エグゼキュータへの 1 往復」＝ 待機/Notify 起床
-    /// ぶんの固定費が完全に消える）。`Poll::Pending` の場合は通常の `spawn()` と
-    /// 全く同じ状態でエグゼキュータに残し `false` を返す。
-    ///
-    /// スロットへの格納自体は `spawn()` と同一（プールのチャンク列に future を置き、
-    /// Pin 健全性は型 doc の通り in-place で保たれる）。差分は「エグゼキュータへの
-    /// 登録直後に ready キュー経由で実行されるのを待つ」代わりに「登録と同時に
-    /// タスク自身の実 Waker で 1 回 poll する」ことだけであり、`spawn_body_and_poll`
-    /// の doc コメントに述べた Waker 健全性・借用規律がそのまま適用される。
-    pub fn spawn_inline(&self, future: F) -> bool {
-        let slot = self.store(future);
-        let pool: Rc<dyn PoolPoll> = self.inner.clone();
-        spawn_body_and_poll(TaskBody::Pooled { pool, slot })
     }
 }
 
