@@ -1,102 +1,79 @@
-# B-67: OpenBSD / NetBSD が boring-sys のビルド失敗で**一切ビルドできない**
+# B-67: 【誤起票・取り下げ】OpenBSD / NetBSD がビルドできない
 
-**優先度**: P1（OpenBSD・NetBSD の全ビルド・E2E・パッケージングがブロックされる）
-**ステータス**: 未修正（原因特定済み・回避策は不成立）
-**発見日**: 2026-08-18（F-158 の作業中、OpenBSD E2E を回そうとして判明）
-**関連**: F-136（quiche の boringssl-boring-crate 化）、B-55（wasmtime vendoring）
+**優先度**: —
+**ステータス**: **取り下げ（Invalid）**。事象は実在せず、**起票者の実行手順の誤り**だった。
+**起票日**: 2026-08-18 / **取り下げ日**: 2026-08-22
 
 ---
 
-## 事象
+## 結論: OpenBSD / NetBSD は壊れていない
 
-OpenBSD 7.9 aarch64 で `cargo build` が `boring-sys v4.22.0` のビルドで失敗する。
+当初「`boring-sys v4.22.0` の vendored BoringSSL が
+`thread.h:81: unknown type name 'pthread_rwlock_t'` で失敗し、
+OpenBSD/NetBSD は全 feature 構成でビルド不能」と P1 で起票したが、**これは誤りである。**
+
+**この問題は既知であり、`tools/qemu/bsd-vm.sh` に回避策が実装済みだった。**
+実際 `packaging/output/` の成果物には成功記録が残っている:
 
 ```
-error: failed to run custom build command for `boring-sys v4.22.0`
-  .../boringssl/src/include/openssl/thread.h:81:9:
-      error: unknown type name 'pthread_rwlock_t'
+target      : aarch64-unknown-openbsd
+built on OS : openbsd 7.9
+built at    : 2026-08-17T21:55:19Z
+rustc       : rustc 1.94.1
 ```
 
-**`http3` feature を外しても再現する。** `boring = "4.3"` は
-[Cargo.toml:498](../../../Cargo.toml) で **OpenBSD/NetBSD 共通の無条件依存**として
-宣言されている（`optional` ではない）ため、feature 構成に関わらず必ずビルドされる。
+同じ OS バージョン・同じ `Cargo.lock`（**Cargo.toml/lock は 2026-08-09 以降未変更**）で
+5 日前に成功している。「環境ドリフトで壊れた」という当初の推測も誤りだった。
 
-したがって **OpenBSD と NetBSD は現在いかなる feature 構成でもビルドできない。**
-これにより次がすべてブロックされる:
+## 実際の原因: `bsd-vm.sh build` を迂回して直接 `cargo build` を叩いた
 
-- OpenBSD / NetBSD の E2E（`tests/e2e_setup.sh`）
-- OpenBSD / NetBSD の packaging（`--profile dist`）
-- `tools/qemu/bsd-vm.sh openbsd|netbsd <arch> build`
+`tools/qemu/bsd-vm.sh` の `_guest_env_prefix()` は、OpenBSD/NetBSD のビルドに
+**必須の環境変数**を組み立ててから `cargo build` を実行する:
 
-## 原因
-
-BoringSSL の `include/openssl/thread.h` が非 glibc 環境で
-**`<pthread.h>` を include せずに `pthread_rwlock_t` を使っている**:
-
-```c
-#elif defined(OPENSSL_WINDOWS)
-  typedef union crypto_mutex_st { void *handle; } CRYPTO_MUTEX;
-#elif !defined(__GLIBC__)
-  typedef pthread_rwlock_t CRYPTO_MUTEX;   // ← 81 行目。OpenBSD はここに入る
-#else
-  // glibc では pthread_rwlock_t が feature flag に隠れているため
-  // 十分なサイズのパディング構造体を使う（static_assert で担保）
-#endif
-```
-
-glibc 側は「feature flag に隠れている」ことを理由にパディング構造体で回避しているが、
-**非 glibc 側は `pthread_rwlock_t` が可視である前提**になっている。
-
-OpenBSD の `/usr/include/pthread.h:120` は
-`typedef struct pthread_rwlock *pthread_rwlock_t;` を**無条件で**定義しており、
-feature-test マクロによる隠蔽は**していない**。つまり原因は可視性マクロではなく、
-**単に `thread.h` が `<pthread.h>` を include していないこと**である。
-
-## 試した回避策（すべて失敗）
-
-| 回避策 | 結果 |
+| 環境変数 | 役割 |
 |---|---|
-| `CFLAGS=-D_BSD_SOURCE` | 失敗（可視性マクロの問題ではないため当然） |
-| `CFLAGS=-std=gnu11` | 失敗（同上） |
-| `CFLAGS='-D_POSIX_C_SOURCE=200809L -D_BSD_SOURCE'` | 失敗（同上） |
-| `CFLAGS='-include pthread.h'` | **悪化**。`boring-sys` に加えて `ring` と `zstd-sys` のビルドまで壊れた（`CFLAGS` は全 C 依存クレートに一律に効くため、アセンブリを含むクレートが巻き添えになる） |
+| `CC_{x86_64,aarch64}_unknown_openbsd=/usr/local/bin/veil-cc` | **本件の回避策そのもの**（下記） |
+| `BINDGEN_EXTRA_CLANG_ARGS_*_openbsd='-include pthread.h'` | bindgen は cc ラッパを経由しないため別途必要 |
+| `CFLAGS_aarch64_unknown_{openbsd,netbsd}='-DOPENSSL_STATIC_ARMCAP …'` | B-59（aarch64 の `OPENSSL_cpuid_setup` 未定義リンクエラー） |
+| `CARGO_HOME=/usr/obj/cargo` | OpenBSD の `/` は ~628M しかなく既定の CARGO_HOME が溢れる |
+| `LIBCLANG_PATH=…` | bindgen |
+| `RUSTFLAGS='-L /usr/local/lib'` | libstdc++ 互換リンク |
+| `PATH=/usr/pkg/bin:…`（NetBSD） | pkgsrc の rust/cmake/llvm |
 
-**グローバル `CFLAGS` による回避は原理的に不適切**である。効かせたいのは
-boring-sys だけだが、cargo の `CFLAGS` はターゲット全体に効く。
+起票者は「`bsd-vm.sh <os> <arch> ssh` が stdin を転送しない」問題を回避するため
+直接 `ssh root@127.0.0.1` へ切り替えた際、**ソース転送だけでなくビルドまで
+直接 ssh で実行してしまい、この env prefix を丸ごと失った。**
 
-## 推奨する修正
+## 既存の回避策（`veil-cc` ラッパ）
 
-`third_party/wasmtime`（B-55）と同じ **vendoring 方式**が本命:
+`bsd-vm.sh` の `toolchain` が OpenBSD ゲストへ設置する:
 
-1. `boring-sys` を `third_party/` へ vendoring し、
-   `thread.h` の非 glibc 分岐の直前に `#include <pthread.h>` を追加する
-   （または当該分岐を glibc と同じパディング構造体方式に寄せる）。
-2. Cargo の `[patch]` かパッケージ名変更 + ターゲット別依存で差し替える。
+```sh
+#!/bin/sh
+# BoringSSL(boring-sys) は pthread_rwlock_t が <sys/types.h> から見える前提だが、
+# OpenBSD では <pthread.h> にしかない。C ファイルのときだけ pthread.h を先に読ませる。
+# アセンブリ(.S/.s) には付けない（付けると zstd-sys 等のアセンブルが壊れる）。
+for a in "$@"; do
+  case "$a" in
+    *.S|*.s) exec /usr/bin/cc "$@" ;;
+  esac
+done
+exec /usr/bin/cc -include pthread.h "$@"
+```
 
-代替案として、**OpenBSD/NetBSD の `boring` 依存を本当に無条件にする必要があるかを
-再検討する**価値がある。`src/http3_server.rs` が `boring::ssl::SslContextBuilder` を
-直接使うのは `http3` 有効時だけなので、`http3` を切れば `boring` が要らない構成に
-できるなら、`http3` 無効の OpenBSD/NetBSD ビルドだけでも救える
-（Cargo の feature がターゲット非依存であることが障害になっている旨は
-Cargo.toml のコメントに記載があるが、`dep:boring` をターゲット別 feature で
-表現できないか再検討する）。
+起票者は回避策として `CFLAGS='-include pthread.h'` を試し、
+**`ring` と `zstd-sys` のアセンブルまで壊れて「悪化」と結論づけた**が、
+その失敗こそが `veil-cc` ラッパが存在する理由そのものだった
+（`.S`/`.s` を除外すれば正しく動く）。既存の解を再発見しかけて取り逃していた。
 
-## いつから壊れたか
+## 教訓
 
-- `boring-sys 4.22.0` は **2026-07-22 の `ef669e9`** から Cargo.lock に固定されている。
-- OpenBSD VM 内の最後の成功ビルド成果物は **2026-08-09 04:40** の
-  `/usr/obj/veil-proxy/target/release/veil`。
-
-つまり **同じ boring-sys 4.22.0 で 8/9 には成功していた**。
-Cargo.lock はその後 `9be1c6f`（B-55）でしか変更されていないため、
-**VM 側の環境ドリフト（OpenBSD 7.9 のコンパイラ/ヘッダ更新）が引き金**と考えられる。
-再現条件を確定するには、8/9 時点のツールチェーンとの差分を確認する必要がある。
-
-## F-158 との関係（無関係であることの根拠）
-
-本件は F-158（HTTP/2 インライン初回 poll）とは**完全に無関係**である:
-
-1. F-158 の変更は `src/` 内の純粋な Rust のみで、`Cargo.toml` / `Cargo.lock` を
-   **1 行も変更していない**（`git diff b239dc1~1 -- Cargo.toml Cargo.lock` が空）。
-2. 失敗しているのは**依存クレートの C ビルドスクリプト**であり、
-   veil 自身のコンパイルより前段で止まっている。
+- **BSD ゲストのビルドは必ず `tools/qemu/bsd-vm.sh <os> <arch> build` を使う。**
+  直接 `ssh` で `cargo build` を叩いてはならない（必須 env を失う）。
+  `bsd-vm.sh ssh` の stdin 非転送を回避して直 ssh にする場合も、
+  **迂回してよいのはファイル転送だけで、ビルド実行は迂回しないこと。**
+- **「ビルドが壊れた」と結論する前に、`packaging/output/` の `BUILD_INFO.txt` で
+  直近の成功時刻・OS・rustc を確認する**（本件は 5 日前の成功記録が残っていた）。
+- **既存のビルドスクリプトに同じエラーメッセージが書かれていないか grep する。**
+  本件は `bsd-vm.sh` に `unknown type name 'pthread_rwlock_t'` が
+  コメントとして明記されていた。
