@@ -206,6 +206,44 @@ impl TcpListener {
         }
     }
 
+    /// バックログに溜まっている接続を最大 `max_batch` 件までまとめて受理する
+    /// （F-155 の nginx `multi_accept` 相当。unix 版と同じインタフェース・同じ規律）。
+    ///
+    /// 1 周回 1 接続にしないことでバックログを引き上げるが、**上限で必ず抜けて
+    /// イベントループへ戻る**協調的設計を崩さないこと。受理できた件数を返し、
+    /// `0` は「今は接続が無い」（`WSAEWOULDBLOCK`）を意味する。
+    ///
+    /// アドレス変換に失敗した接続は**その 1 件だけ破棄**して受理を続ける
+    /// （`TcpStream` を先に構築してあるため `Drop` でソケットが閉じられ、リークしない）。
+    pub fn accept_batch<F>(&self, max_batch: usize, mut on_conn: F) -> io::Result<usize>
+    where
+        F: FnMut(TcpStream, SocketAddr),
+    {
+        let mut count = 0usize;
+        while count < max_batch {
+            match raw_accept_one(self.fd) {
+                Ok(Some((fd, storage))) => {
+                    // 先に TcpStream を構築する: アドレス変換が失敗しても Drop 経由で
+                    // ソケットがクローズされ、リークしない（`Accept::poll` と同じ順序）。
+                    let stream = TcpStream { fd };
+                    match storage_to_sockaddr(&storage) {
+                        Ok(peer_addr) => {
+                            on_conn(stream, peer_addr);
+                            count += 1;
+                        }
+                        Err(_) => {
+                            // この 1 件のみ破棄して次へ進む（doc コメント参照）。
+                            drop(stream);
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(count)
+    }
+
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         let sock = win::to_socket(self.fd);
         let mut buf = [0u8; 128];
@@ -240,29 +278,56 @@ pub struct Accept<'a> {
     _marker: std::marker::PhantomData<&'a TcpListener>,
 }
 
+/// `accept` を 1 回だけ非ブロッキングで試みる、`Accept::poll` と
+/// `TcpListener::accept_batch` の共通ヘルパ（unix 版 `raw_accept_one` と同じ役割）。
+///
+/// アドレス変換（`storage_to_sockaddr`）は行わず、生の `RawFd` と
+/// `sockaddr` バッファを返す（呼び出し側が変換失敗時の後始末方針をそれぞれ選べる
+/// ようにするため。`Accept::poll` は即座にエラーを返す一方、`accept_batch` は
+/// その 1 件のみ破棄してバックログの受理を続ける）。
+///
+/// 受理したソケットの非ブロッキング化（`FIONBIO`）は**ここ 1 箇所**で行う
+/// （F-155 の「accept の作法を二重管理しない」方針）。
+///
+/// - 成功: `Ok(Some((fd, storage)))`
+/// - `WSAEWOULDBLOCK`: バックログが尽きたことを示す `Ok(None)`
+/// - それ以外のエラー: `Err(e)`
+fn raw_accept_one(listener_fd: RawFd) -> io::Result<Option<(RawFd, [u8; 128])>> {
+    let listener_sock = win::to_socket(listener_fd);
+    let mut buf = [0u8; 128];
+    let mut len = buf.len() as i32;
+    let accepted =
+        unsafe { WinSock::accept(listener_sock, buf.as_mut_ptr() as *mut SOCKADDR, &mut len) };
+    if accepted != INVALID_SOCKET {
+        let mut nonblocking: u32 = 1;
+        unsafe { ioctlsocket(accepted, FIONBIO, &mut nonblocking) };
+        return Ok(Some((win::from_socket(accepted), buf)));
+    }
+    let e = last_wsa_error();
+    if is_would_block(&e) {
+        return Ok(None);
+    }
+    Err(e)
+}
+
 impl<'a> Future for Accept<'a> {
     type Output = io::Result<(TcpStream, SocketAddr)>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let listener_sock = win::to_socket(self.listener_fd);
-        let mut buf = [0u8; 128];
-        let mut len = buf.len() as i32;
-        let accepted =
-            unsafe { WinSock::accept(listener_sock, buf.as_mut_ptr() as *mut SOCKADDR, &mut len) };
-        if accepted != INVALID_SOCKET {
-            let fd = win::from_socket(accepted);
-            let mut nonblocking: u32 = 1;
-            unsafe { ioctlsocket(accepted, FIONBIO, &mut nonblocking) };
-            let stream = TcpStream { fd };
-            let peer_addr = storage_to_sockaddr(&buf)?;
-            return Poll::Ready(Ok((stream, peer_addr)));
+        match raw_accept_one(self.listener_fd) {
+            Ok(Some((fd, buf))) => {
+                // 先に TcpStream を構築してからアドレス変換する（変換失敗時も
+                // Drop でソケットが閉じられ、リークしない）。
+                let stream = TcpStream { fd };
+                let peer_addr = storage_to_sockaddr(&buf)?;
+                Poll::Ready(Ok((stream, peer_addr)))
+            }
+            Ok(None) => {
+                register_read(self.listener_fd, cx.waker().clone());
+                Poll::Pending
+            }
+            Err(e) => Poll::Ready(Err(e)),
         }
-        let e = last_wsa_error();
-        if is_would_block(&e) {
-            register_read(self.listener_fd, cx.waker().clone());
-            return Poll::Pending;
-        }
-        Poll::Ready(Err(e))
     }
 }
 
