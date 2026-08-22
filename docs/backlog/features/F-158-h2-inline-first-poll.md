@@ -167,3 +167,30 @@ Linux の h2c proxy を 1 つの問題として扱い共通の改修案を並べ
   本改修とは無関係の環境要因（co-tenant 負荷、load average 1.4〜3.2）。
 - E2E（`full,epoll` = reactor）: **544 passed / 0 failed**
 - clippy（`full` / `full,epoll`）・`cargo fmt --check`: 警告ゼロ
+
+## 全プラットフォーム検証結果（2026-08-22 最終）
+
+`--profile dist` で **17 成果物すべて**をビルドし直したうえで E2E を実行した。
+
+| プラットフォーム | バックエンド | ビルド | E2E |
+|---|---|---|---|
+| Linux x86_64（既定） | io_uring | ✅ | ✅ 544/544（※1） |
+| Linux x86_64 `--features epoll` | reactor/epoll | ✅ | ✅ 544/544 |
+| Linux aarch64 | io_uring | ✅ | — |
+| FreeBSD 14.3 aarch64 | reactor/kqueue | ✅ | ✅ ベースラインと同一（B-68 の既存 2 件のみ） |
+| FreeBSD 14.3 x86_64 | reactor/kqueue | ✅ | ✅ 543/1（既知フレーキー 1 件） |
+| **OpenBSD 7.9 aarch64** | reactor/kqueue | ✅ | ✅ **543 passed / 0 failed** |
+| OpenBSD 7.9 x86_64 | reactor/kqueue | ✅ | 538/5（B-71: 既存の HTTP/3 4 件 + フレーキー） |
+| NetBSD 10.1 aarch64 | reactor/kqueue | ✅ | B-70（テストヘルパの panic で中断） |
+| NetBSD 10.1 x86_64 | reactor/kqueue | ✅ | 540/4（HTTP/3 系のみ） |
+| macOS universal2 | reactor/kqueue | ✅ | 実機なし |
+| Windows x86_64 / aarch64 | reactor/wsapoll | ✅（B-69 修正後） | 実機なし |
+
+※1: フルスイート並列実行時に `test_http2_request_body_streaming` /
+`test_http3_large_request_body` が稀に失敗するが、**いずれも単独実行では 3/3 成功**し、
+実行ごとに失敗するテストもバックエンドも入れ替わるため環境フレーキーと確定している
+（io_uring は `spawn_inline` を使わないため F-158 と無関係でもある）。
+
+**F-158 に起因する回帰はどのプラットフォームでも検出されなかった。**
+検証中に見つかった失敗はすべて、ベースライン実行または単独再実行により
+既存問題ないし環境フレーキーであることを実測で確認済み（B-68 / B-70 / B-71）。
