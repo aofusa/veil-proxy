@@ -1142,6 +1142,10 @@ VM 状態・ハーネス条件が異なるためであり、**本ドキュメン
 （veil 側は同一変種内で ±9% に収まる）。3B での対 nginx 比は信頼できないため、
 上表は veil の絶対値のみで比較している。
 
+生データは [`freebsd_results_raw.tsv`](freebsd_results_raw.tsv) 末尾の
+`# ==== 2026-08-22 F-158 交互 A/B ...` の 2 節（3B / 54,576B、各 10 ラウンド）。
+`server` 列の `veil_base` / `veil_new` で変種を区別する。
+
 ### F-158 の Linux 計測: io_uring では退行したため reactor 限定にした（2026-08-18）
 
 FreeBSD で +27.3% を確認したあと、**既定バックエンドである Linux io_uring でも
@@ -1173,6 +1177,10 @@ reactor の待機は `Readable::poll` の**同期 `poll(2)`** を伴う（F-141/
 > 交互 A/B を取ること**。FreeBSD の結果だけで採用していれば、
 > 既定プラットフォームに 4.6% の退行を入れていた。
 
+生データは [`results_raw.tsv`](results_raw.tsv) 末尾の
+`# ==== 2026-08-22 F-158 交互 A/B ...` の 2 節（12 ラウンド / 6 ラウンド）。
+`target` 列の `veil_glibc_base` / `veil_glibc_new` で変種を区別する。
+
 ### h2c_proxy の「静的配信の 1/4」は veil 固有ではない（2026-08-18）
 
 仕様書は Linux `h2c_proxy`（2,367 req/s）を「静的配信 `h2c_file`（9,051 req/s）の
@@ -1198,3 +1206,6 @@ reactor の待機は `Readable::poll` の**同期 `poll(2)`** を伴う（F-141/
 `compute_upstream_path` の所有 `String` は**ホットパス規則違反として実在する**が、
 malloc は ~50ns 程度であり **110µs 規模の差を説明しない**（直す価値はあるが
 スループット改善を期待して直してはならない）。
+
+生データは [`results_raw.tsv`](results_raw.tsv) 末尾の
+`# ==== 2026-08-18 F-158 調査: nginx をプロキシにした静的:プロキシ比の実測 ...` 節。

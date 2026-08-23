@@ -994,3 +994,69 @@ veil_musl	h2c_file	h2c	3	8845.69	460.87MB/s	57.67ms	NA	0	81.1	154.8
 veil_musl	h2c_proxy	h2c	1	2654.75	138.34MB/s	329.25ms	NA	0	110.4	225.4
 veil_musl	h2c_proxy	h2c	2	2231.82	116.30MB/s	427.07ms	NA	0	121.6	341.4
 veil_musl	h2c_proxy	h2c	3	2185.78	113.90MB/s	432.46ms	NA	0	129.5	369.6
+# ==== 2026-08-22 F-158 交互 A/B: Linux x86_64 io_uring、h2c_file、12 ラウンド ====
+# target 列: veil_glibc_base = F-158 適用前（b239dc1~1）の veil:glibc-base イメージ /
+#            veil_glibc_new  = F-158 適用後の veil:glibc イメージ。イメージ digest が別物であることを確認済み。
+# ラウンドごとに実行順を入替。iteration = ラウンド番号。
+# 本 A/B では rps のみ取得（transfer/lat/cpu/mem は NA）。
+# 結果: base 中央値 9,678.9 / new 中央値 9,231.8 = **-4.6%**、12 ラウンド中 11 で base が勝ち。
+#       → io_uring では退行するため F-158 は reactor 限定に変更した（uring executor は無変更）。
+veil_glibc_base	h2c_file	h2c	1	9523.05	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_file	h2c	1	9425.37	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_file	h2c	2	9586.63	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_file	h2c	2	9436.17	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_file	h2c	3	9622.80	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_file	h2c	3	9199.21	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_file	h2c	4	8990.24	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_file	h2c	4	9668.86	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_file	h2c	5	9821.26	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_file	h2c	5	9254.24	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_file	h2c	6	9161.47	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_file	h2c	6	9940.04	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_file	h2c	7	9871.08	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_file	h2c	7	9423.11	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_file	h2c	8	9190.93	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_file	h2c	8	9347.36	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_file	h2c	9	9688.85	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_file	h2c	9	9213.59	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_file	h2c	10	9205.66	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_file	h2c	10	9646.44	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_file	h2c	11	9879.48	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_file	h2c	11	9249.99	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_file	h2c	12	9494.90	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_file	h2c	12	9753.05	NA	NA	NA	0	NA	NA
+# ==== 2026-08-22 F-158 交互 A/B: Linux x86_64 io_uring、h2c_file / h2c_proxy、各 6 ラウンド（初回計測）====
+# 上の 12 ラウンドとは別セッション。h2c_file -5.4%（5/6 で base 勝ち）、h2c_proxy -3.8%（5/6 で base 勝ち）。
+# 2 回合計 24 ラウンド中 21 でベースラインが勝ち、io_uring での退行が確定した。
+veil_glibc_base	h2c_file	h2c	1	9323.61	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_file	h2c	1	9509.83	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_file	h2c	2	8805.22	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_file	h2c	2	9082.01	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_file	h2c	3	9412.72	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_file	h2c	3	9046.20	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_file	h2c	4	9040.86	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_file	h2c	4	9756.95	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_file	h2c	5	9714.42	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_file	h2c	5	8995.92	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_file	h2c	6	9452.96	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_file	h2c	6	9783.34	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_proxy	h2c	1	2596.37	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_proxy	h2c	1	2605.49	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_proxy	h2c	2	2671.23	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_proxy	h2c	2	2723.19	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_proxy	h2c	3	2751.09	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_proxy	h2c	3	2607.03	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_proxy	h2c	4	2804.53	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_proxy	h2c	4	2737.13	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_proxy	h2c	5	2818.18	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_proxy	h2c	5	2575.11	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_proxy	h2c	6	2754.77	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_proxy	h2c	6	2789.09	NA	NA	NA	0	NA	NA
+# ==== 2026-08-18 F-158 調査: nginx をプロキシにした静的:プロキシ比の実測（仕様書の「三重コピー」説の反証）====
+# 同一ホスト・同一 nginx で静的配信とプロキシ中継を計測。比が 3B と 54KB で同一（0.50/0.51）＝
+# ボトルネックはバイト数ではなくリクエストあたりの固定費（HTTP トランザクションが 1→2 回）。
+# CPU 内訳（54KB プロキシ時）: h2load 50% / nginx-perf 128% / perf-backend 82% = 約 2.6/4.0 コア（未飽和）。
+nginx	h2c_file_54576B	h2c	1	3168.08	165.44MB/s	NA	NA	0	203.0	NA
+nginx	h2c_proxy_54576B	h2c	1	1587.26	82.93MB/s	NA	NA	0	128.0	NA
+nginx	h2c_file_3B	h2c	1	7678.63	1.62MB/s	NA	NA	0	NA	NA
+nginx	h2c_proxy_3B	h2c	1	3882.47	838.23KB/s	NA	NA	0	NA	NA

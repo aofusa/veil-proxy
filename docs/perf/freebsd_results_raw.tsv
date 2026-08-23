@@ -238,3 +238,74 @@ h2_proxy_tls	nginx	3	13919.77	5818.24	0.000	0.000	0
 h2_proxy_tls	veil	3	16114.77	6717.52	0.000	0.000	0
 l4_tcp	nginx	3	39801.27	16629.76	1.530	214.360	0
 l4_tcp	veil	3	43861.46	18350.08	1.420	2.250	0
+# ==== 2026-08-22 F-158 交互 A/B: FreeBSD 14.3 aarch64（QEMU/HVF・Apple Silicon）、3B（-p /small.html）、10 ラウンド ====
+# server 列: veil_base = F-158 適用前（b239dc1~1） / veil_new = F-158 適用後。md5 で別バイナリを確認済み。
+# /root/ab/{base,new}/veil（basename は veil のまま = F-156 の教訓）。ラウンドごとに実行順を入替。
+# iter = ラウンド番号。transfer/p50/p99 は本 A/B では取得していない（rps のみ）ため NA。
+# 列: scenario / server / iter / rps / mbps / p50_ms / p99_ms / errors
+# 結果: veil_new が 10/10 勝、中央値 555,119 → 706,779（+27.3%）、分布は完全分離
+#       （base 最大 581,694 < new 最小 652,805）。
+h2c_file_plain	veil_base	1	510588.73	NA	NA	NA	0
+h2c_file_plain	veil_new	1	658612.39	NA	NA	NA	0
+h2c_file_plain	nginx	1	170329.19	NA	NA	NA	0
+h2c_file_plain	veil_new	2	709522.57	NA	NA	NA	0
+h2c_file_plain	veil_base	2	559736.57	NA	NA	NA	0
+h2c_file_plain	nginx	2	114525.09	NA	NA	NA	0
+h2c_file_plain	veil_base	3	485039.56	NA	NA	NA	0
+h2c_file_plain	veil_new	3	704236.98	NA	NA	NA	0
+h2c_file_plain	nginx	3	127875.83	NA	NA	NA	0
+h2c_file_plain	veil_new	4	709322.04	NA	NA	NA	0
+h2c_file_plain	veil_base	4	581060.16	NA	NA	NA	0
+h2c_file_plain	nginx	4	125027.47	NA	NA	NA	0
+h2c_file_plain	veil_base	5	571102.23	NA	NA	NA	0
+h2c_file_plain	veil_new	5	727640.68	NA	NA	NA	0
+h2c_file_plain	nginx	5	124773.73	NA	NA	NA	0
+h2c_file_plain	veil_new	6	691888.15	NA	NA	NA	0
+h2c_file_plain	veil_base	6	563238.98	NA	NA	NA	0
+h2c_file_plain	nginx	6	179054.04	NA	NA	NA	0
+h2c_file_plain	veil_base	7	550502.12	NA	NA	NA	0
+h2c_file_plain	veil_new	7	710716.27	NA	NA	NA	0
+h2c_file_plain	nginx	7	140492.45	NA	NA	NA	0
+h2c_file_plain	veil_new	8	652804.77	NA	NA	NA	0
+h2c_file_plain	veil_base	8	581693.91	NA	NA	NA	0
+h2c_file_plain	nginx	8	188397.09	NA	NA	NA	0
+h2c_file_plain	veil_base	9	441871.46	NA	NA	NA	0
+h2c_file_plain	veil_new	9	721928.00	NA	NA	NA	0
+h2c_file_plain	nginx	9	270295.38	NA	NA	NA	0
+h2c_file_plain	veil_new	10	664251.83	NA	NA	NA	0
+h2c_file_plain	veil_base	10	475108.76	NA	NA	NA	0
+h2c_file_plain	nginx	10	191462.85	NA	NA	NA	0
+# ==== 2026-08-22 F-158 交互 A/B: FreeBSD 14.3 aarch64、54,576B（-p /index.html）、10 ラウンド ====
+# 結果: 中央値 96,981 → 97,794（+0.8%、8/10 勝）＝ 退行なし。
+# 固定費を消す改修のため 3B で効き 54KB では埋もれる（設計どおりの非対称）。
+# 列: scenario / server / iter / rps / mbps / p50_ms / p99_ms / errors
+h2c_file_plain	veil_base	1	96517.09	NA	NA	NA	0
+h2c_file_plain	veil_new	1	97158.35	NA	NA	NA	0
+h2c_file_plain	nginx	1	111443.99	NA	NA	NA	0
+h2c_file_plain	veil_new	2	97886.19	NA	NA	NA	0
+h2c_file_plain	veil_base	2	97189.33	NA	NA	NA	0
+h2c_file_plain	nginx	2	112504.53	NA	NA	NA	0
+h2c_file_plain	veil_base	3	97418.34	NA	NA	NA	0
+h2c_file_plain	veil_new	3	97870.70	NA	NA	NA	0
+h2c_file_plain	nginx	3	108551.76	NA	NA	NA	0
+h2c_file_plain	veil_new	4	99608.34	NA	NA	NA	0
+h2c_file_plain	veil_base	4	96822.78	NA	NA	NA	0
+h2c_file_plain	nginx	4	111625.44	NA	NA	NA	0
+h2c_file_plain	veil_base	5	98735.19	NA	NA	NA	0
+h2c_file_plain	veil_new	5	97514.75	NA	NA	NA	0
+h2c_file_plain	nginx	5	112501.26	NA	NA	NA	0
+h2c_file_plain	veil_new	6	97688.30	NA	NA	NA	0
+h2c_file_plain	veil_base	6	98518.45	NA	NA	NA	0
+h2c_file_plain	nginx	6	110314.11	NA	NA	NA	0
+h2c_file_plain	veil_base	7	96994.61	NA	NA	NA	0
+h2c_file_plain	veil_new	7	98730.16	NA	NA	NA	0
+h2c_file_plain	nginx	7	111007.04	NA	NA	NA	0
+h2c_file_plain	veil_new	8	98054.91	NA	NA	NA	0
+h2c_file_plain	veil_base	8	96945.90	NA	NA	NA	0
+h2c_file_plain	nginx	8	110102.13	NA	NA	NA	0
+h2c_file_plain	veil_base	9	96968.15	NA	NA	NA	0
+h2c_file_plain	veil_new	9	97718.35	NA	NA	NA	0
+h2c_file_plain	nginx	9	110089.91	NA	NA	NA	0
+h2c_file_plain	veil_new	10	97227.87	NA	NA	NA	0
+h2c_file_plain	veil_base	10	96443.57	NA	NA	NA	0
+h2c_file_plain	nginx	10	111084.40	NA	NA	NA	0

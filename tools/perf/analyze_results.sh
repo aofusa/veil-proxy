@@ -9,6 +9,21 @@ set -euo pipefail
 RAW="${1:-$(cd "$(dirname "$0")" && pwd)/results/results_raw.tsv}"
 [ -f "$RAW" ] || { echo "raw tsv が見つかりません: $RAW" >&2; exit 1; }
 
+# 本スクリプトは **Linux/Docker ハーネス（run_perf.sh）の 11 列形式**専用である。
+# FreeBSD ネイティブハーネス（tools/perf/freebsd/run_perf_freebsd.sh）は 8 列の
+# 別形式（scenario/server/iter/rps/mbps/p50/p99/errors。初期の節は build 列付きの
+# 10 列）で、列位置が違うため
+# そのまま渡すと **rps 列を取り違えて全行 0.0 を出力する**（黙って間違う）。
+# 静かに壊れた集計を出さないよう、データ行の列数を検査して明示的に落とす。
+_ncol=$(awk -F'\t' '!/^[[:space:]]*#/ && !/^[[:space:]]*$/ && $1 != "target" && $1 != "scenario" { print NF; exit }' "$RAW")
+if [ -n "${_ncol:-}" ] && [ "$_ncol" -ne 11 ]; then
+    echo "ERROR: 列数が ${_ncol} です（本スクリプトは Linux ハーネスの 11 列形式専用）。" >&2
+    echo "       FreeBSD ネイティブ計測（run_perf_freebsd.sh）の集計には対応していません" >&2
+    echo "       （8 列: scenario/server/iter/rps/mbps/p50/p99/errors、初期の節は build 列付きの 10 列）。" >&2
+    echo "       分析は docs/perf/README.md の FreeBSD 節を参照してください。" >&2
+    exit 2
+fi
+
 awk -F'\t' '
 function parse_val(s,   v) {
     if (s == "NA" || s == "") return "NA"
@@ -36,6 +51,12 @@ function stdev(a, n,   i, mean, s) {
     return sqrt(s / (n - 1))
 }
 NR == 1 { next }   # ヘッダ行
+# コメント行（`# ==== <日付> <計測名> ====` の節見出しや列凡例）とヘッダ行・空行は
+# 集計対象外。生データ TSV は計測セッションごとに `#` 始まりの節見出しを挟む運用のため、
+# これを除外しないと見出しがそのまま 1 行の「計測結果」として出力されてしまう。
+/^[[:space:]]*#/ { next }
+/^[[:space:]]*$/ { next }
+$1 == "target" || $1 == "scenario" { next }
 {
     key = $1 "\t" $2 "\t" $3
     if (!(key in seen)) { seen[key] = 1; order[++nk] = key }

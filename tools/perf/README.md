@@ -14,7 +14,7 @@
 |------|------|
 | `run_perf.sh` | 計測オーケストレータ（nginx → veil glibc/musl × 全バリアント × 反復）。完了後に集計も実行 |
 | `gen_configs.sh` | 計測用 `config.toml` バリアントを生成（**完全直交 2⁴=16** + full features 機能ショーケース `feat_*` + **全プロトコル×全機能マトリクス**（F-114: `h2_1_proxy_*` / `h3_file_*` / `h3_proxy*` / `grpc_h2_*` / `grpc_h3*`）+ **h2c（平文 HTTP/2 prior knowledge）**（`h2c_file` / `h2c_proxy`）） |
-| `analyze_results.sh` | 反復生データ（`results_raw.tsv`）を **median±stdev** に集計し Markdown を出力 |
+| `analyze_results.sh` | 反復生データ（`results_raw.tsv`）を **median±stdev** に集計し Markdown を出力。**Linux ハーネスの 11 列形式専用**で、FreeBSD ネイティブ計測（8/10 列）を渡すと列位置がずれるため**明示エラーで停止する**（黙って全行 0.0 を出さない）。`#` 始まりの節見出し・列凡例・ヘッダ行は集計対象外 |
 | `configs/*.toml` | 生成済みバリアント（`gen_configs.sh` で再生成可能） |
 | `nginx/nginx.conf` | 比較対象 nginx の設定（`access_log off` で公平化。平文 8080 で `listen 8080; http2 on;` により h2c も有効化し、veil の h2c 専用リスナーと条件を揃える） |
 | `results/` | 計測結果（`results_raw.tsv` / `results_summary.md` / `logs/` は `.gitignore` 対象）。公開する生データは [docs/perf/results_raw.tsv](../../docs/perf/results_raw.tsv) へコピーしてコミットする（サマリは [docs/perf/README.md](../../docs/perf/README.md)） |
@@ -232,6 +232,49 @@ target  config  proto  iteration  req_per_sec  transfer  lat_avg  lat_p99  non2x
 エラー合計を Markdown 表にまとめます。
 
 ---
+
+## バイナリ交互 A/B（改修前 vs 改修後）の手順と落とし穴
+
+`profile_ab.sh` は **cargo プロファイル**（lto/codegen-units）の A/B 用である。
+**ソース改修の効果**（例: F-158）を測るときは「改修前後の 2 バイナリを交互に走らせる」
+別の手順が要る。AGENTS.md の「性能改善は必ず交互 A/B で確認する」はこちらを指す。
+
+### 手順
+
+1. **2 バイナリを別ディレクトリに置く。basename は `veil` のままにする**（F-156）。
+   `/root/ab/base/veil` と `/root/ab/new/veil` のように**ディレクトリで分ける**。
+   `veil.base` のような別名にすると `pkill -x veil` が 1 つも kill せず、
+   `SO_REUSEPORT`(_LB) で旧プロセスが同じポートを掴んだまま残り、
+   **新旧混合を計測する**（F-156 で実際に踏んだ）。
+2. **計測前に 2 バイナリの md5 が異なることを必ず確認する**（下記の落とし穴 1・2）。
+3. **ラウンドごとに実行順を入れ替える**（奇数ラウンドは base→new、偶数は new→base）。
+   計測系には時間ドリフトがあるため、順序を固定すると後半の変種が不利になる。
+4. **判定は「何ラウンド勝ったか」と「分布が重なるか」で行う**。
+   F-156 の教訓どおり、**4 ラウンド方向が揃っただけでは有意ではない**。
+   F-158 は 10 ラウンド全勝かつ **base の最大 < new の最小**（完全分離）で確定させた。
+
+### 落とし穴（F-158 で実際に踏んだもの）
+
+| # | 事象 | 対策 |
+|---|---|---|
+| 1 | **`tools/qemu/bsd-vm.sh <os> <arch> ssh` は stdin を転送しない。** `tar czf - src \| bsd-vm.sh ... ssh "tar xzf -"` が**エラーを出さずに何も展開しない** | VM へのファイル流し込みは直接 `ssh -i ~/.ssh/veil_qemu_key -p <port> root@127.0.0.1` を使う。**ただしビルド実行は迂回しない**（下記 5） |
+| 2 | **`git archive HEAD` はファイル mtime をコミット時刻にする。** cargo は mtime で差分判定するため既存フィンガープリントより古いと**再ビルドが走らない** | 展開後に `find src -name '*.rs' -exec touch {} +` |
+| 3 | 1+2 の合わせ技で **base と new の md5 が完全一致**したまま A/B を回しかけた（＝「差が無い＝退行なし」という誤結論が出るところだった） | **A/B 開始前に md5 差分を assert する** |
+| 4 | **`bsd-vm.sh fetch` はビルドが失敗しても、過去の `target/<profile>/veil` が残っていれば「取得完了」と報告する** | fetch 前に `rm -rf target/<profile>`、または取得後に**バイナリの日付・サイズを VM 側と突き合わせる** |
+| 5 | **`CARGO_PROFILE=dist` を `build` にだけ渡して `fetch` に渡し忘れる**と、`release` の成果物を取得してしまう | `build` と `fetch` の**両方**に渡す |
+
+**共通する失敗モードは「成功メッセージを出しながら間違った成果物を作る」こと。**
+数字を読む前に、**測っている 2 つが本当に別物か**を毎回確認すること。
+
+### 適用例
+
+F-158（HTTP/2 インライン初回 poll）の A/B 結果と生データは
+[docs/perf/README.md](../../docs/perf/README.md) の F-158 節、および
+[`docs/perf/freebsd_results_raw.tsv`](../../docs/perf/freebsd_results_raw.tsv) /
+[`docs/perf/results_raw.tsv`](../../docs/perf/results_raw.tsv) 末尾の
+`# ==== 2026-08-22 F-158 交互 A/B ...` 節を参照。
+**同一の変更が kqueue で +27.3%、io_uring で −4.6% と正反対になった**ため、
+**ホットパス最適化は必ず両バックエンドで A/B を取ること**。
 
 ## 注意
 
