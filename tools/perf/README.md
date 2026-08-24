@@ -196,12 +196,24 @@ HTTPS への 301 リダイレクト専用のため計測に使えません）。
 > `CONFIG_GLOB` 環境変数で対象を絞り込めます（例: `CONFIG_GLOB='h3_*' bash tools/perf/run_perf.sh`
 > で HTTP/3 構成のみ、`CONFIG_GLOB='grpc_*'` で gRPC 構成のみ）。既定は全構成。
 
-主な着目点（[docs/perf/README.md](../../docs/perf/README.md) 参照。以下は 2026-07-07 v0.5.0 の
-全直交表計測時の知見。最新の代表値・HTTP/3 2 倍化の内訳は同 README を参照）:
+主な着目点（[docs/perf/README.md](../../docs/perf/README.md) 参照。**最新のフルスイートは
+2026-08-24（B-72 マージ後、全 67 構成 × glibc/musl × 3 反復 = 757 計測、Non-2xx = 0）**）:
 
 - **最良構成 `h2_1_ktls_0_lb_kernel_ofc_1`**（HTTP/2 有効・kTLS 無効・kernel LB・OFC 有効）で
-  **veil は nginx を上回る**（HTTP/1.1 glibc 3124 / musl 3178 vs nginx 2309 = +35〜38%、
-  HTTP/2 glibc 2757 / musl 2685 vs nginx 2435 = +10〜13%）。エラーは全 68 計測で 0。
+  **veil は nginx を上回る**（2026-08-24 実測: HTTP/1.1 glibc 9,180 / musl 8,981 vs nginx 6,511
+  = **1.41×**、HTTP/2 glibc 7,249 / musl 7,302 vs nginx 6,129 = **1.18×**）。
+- **h2c は静的 2.19×・逆プロキシ 1.57×**（`h2c_file` 23,849 / `h2c_proxy` 10,039 vs
+  nginx 10,905 / 6,409）。L4 平文素通しは **2.11×**。
+- **`feat_proxy` / `feat_buffering` の「対 nginx」を額面どおり読まないこと。**
+  nginx ベースライン（`base` 構成）は **TLS 静的配信**であり逆プロキシではない
+  （`nginx/nginx.conf` の 443 サーバは `root /var/www`）。したがってこれらの比は
+  「veil の逆プロキシ」対「nginx の静的配信」であって同条件比較ではない。
+  **プロキシ同士の同条件比較になっているのは h2c だけ**（nginx 側も `/proxy/` で中継する）。
+- 機能別オーバーヘッド（HTTP/2・基準 `h2_1_ktls_0_lb_kernel_ofc_0` = 7,085）は
+  観測系（metrics / otel / admin / rate-limit / access-log / wasm / cache）が **96〜99%**、
+  proxy / buffering が **83%**（バックエンドホップそのもの）、
+  compression が **28%**（54,576B を毎リクエスト実圧縮する CPU バウンド処理）。
+- glibc と musl の差は代表構成のいずれでも **数 % 以内でノイズ範囲**。
 - コンテナ（veth）では **kTLS 有効が不利**（`ktls_1` は rustls 比で低下）。
 - 単一クライアント IP 負荷では **`cbpf` が 1 ワーカーに集約**して 4 コアを使い切れず、`kernel` 分散が有利。
 - 過去計測（2026-07-06）で異常だった「`feat_proxy` HTTP/1.1 の wrk 完了 0」「`kernel` +
