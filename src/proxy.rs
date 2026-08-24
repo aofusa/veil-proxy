@@ -2590,12 +2590,50 @@ async fn h2_relay_backend_response<B>(
 where
     B: crate::runtime::io::AsyncReadRent + Unpin,
 {
-    let mut response_buf = Vec::with_capacity(BUF_SIZE);
+    // プールバッファを最後まで保持し、確実に返却する RAII ラッパー。
+    // ヘッダーが 1 回目の read で完結した場合（大半のケース）は、このバッファを
+    // そのままヘッダー/ボディの参照元として使い続け、`Vec` への確保・コピーを避ける。
+    struct PooledBuf(Option<SafeReadBuffer>);
+    impl PooledBuf {
+        #[inline(always)]
+        fn as_slice(&self) -> &[u8] {
+            self.0
+                .as_ref()
+                .expect("PooledBuf は drop まで常に Some")
+                .as_valid_slice()
+        }
+    }
+    impl Drop for PooledBuf {
+        fn drop(&mut self) {
+            if let Some(b) = self.0.take() {
+                buf_put(b);
+            }
+        }
+    }
 
-    loop {
+    // レスポンスデータの所有元。ヘッダーが複数回の read にまたがる稀なケースのみ
+    // `Heap` に蓄積する（従来どおりの挙動）。
+    enum RespData {
+        Pooled(PooledBuf),
+        Heap(Vec<u8>),
+    }
+    impl RespData {
+        #[inline(always)]
+        fn as_slice(&self) -> &[u8] {
+            match self {
+                RespData::Pooled(b) => b.as_slice(),
+                RespData::Heap(v) => v.as_slice(),
+            }
+        }
+    }
+
+    // 1 回目の read はプールバッファへ直接行い、コピーせずその場でパースを試みる。
+    // このパース結果をそのまま持ち回り、後段で同じヘッダーを二重に
+    // parse_http_response し直さない（ヘッダーが 1 回で揃う大半のケースでの
+    // 解析回数を「据え置き」、コピー削減分を無駄にしない）。
+    let (data, parsed) = {
         let buf = buf_get();
-        let read_result = timeout(READ_TIMEOUT, backend.read(buf)).await;
-        let (res, mut returned_buf) = match read_result {
+        let (res, mut returned_buf) = match timeout(READ_TIMEOUT, backend.read(buf)).await {
             Ok(r) => r,
             Err(_) => {
                 let (s, sz) = h2_emit_error(resp_tx, notify, 504, b"Gateway Timeout").await;
@@ -2605,7 +2643,8 @@ where
         let n = match res {
             Ok(0) => {
                 buf_put(returned_buf);
-                break;
+                let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
+                return (s, sz, false);
             }
             Ok(n) => n,
             Err(_) => {
@@ -2615,69 +2654,88 @@ where
             }
         };
         returned_buf.set_valid_len(n);
-        response_buf.extend_from_slice(returned_buf.as_valid_slice());
-        buf_put(returned_buf);
 
-        if let Some(parsed) = parse_http_response(&response_buf) {
-            let status = parsed.status_code;
-            let body_start = parsed.header_len;
-            let body = &response_buf[body_start..];
+        match parse_http_response(returned_buf.as_valid_slice()) {
+            Some(parsed) => (RespData::Pooled(PooledBuf(Some(returned_buf))), parsed),
+            None => {
+                // ヘッダーがこの read だけでは完結しなかった（稀）:
+                // 従来どおり Vec へ蓄積し、揃うまで追加の read を繰り返す。
+                let mut heap = Vec::with_capacity(BUF_SIZE);
+                heap.extend_from_slice(returned_buf.as_valid_slice());
+                buf_put(returned_buf);
 
-            let mut headers_storage = [httparse::EMPTY_HEADER; 64];
-            let mut resp = httparse::Response::new(&mut headers_storage);
-            let _ = resp.parse(&response_buf);
-            let content_type = resp
-                .headers
-                .iter()
-                .find(|h| h.name.eq_ignore_ascii_case("content-type"))
-                .map(|h| h.value);
-            let existing_encoding = resp
-                .headers
-                .iter()
-                .find(|h| h.name.eq_ignore_ascii_case("content-encoding"))
-                .map(|h| h.value);
-
-            let stream_compress_hint = compression.should_compress(
-                client_encoding,
-                content_type,
-                parsed.content_length,
-                existing_encoding,
-            );
-
-            // 非圧縮 + CL 既知 + 非 chunked → 逐次ストリーミング。
-            if stream_compress_hint.is_none() && !parsed.is_chunked {
-                if let Some(content_len) = parsed.content_length {
-                    let mut headers = h2_base_headers(true);
-                    for header in resp.headers.iter() {
-                        if header.name.is_empty() {
-                            continue;
-                        }
-                        if header.name.eq_ignore_ascii_case("connection")
-                            || header.name.eq_ignore_ascii_case("keep-alive")
-                            || header.name.eq_ignore_ascii_case("transfer-encoding")
-                            || header.name.eq_ignore_ascii_case("upgrade")
-                        {
-                            continue;
-                        }
-                        headers.push((header.name.as_bytes().to_vec(), header.value.to_vec()));
+                let parsed = loop {
+                    if let Some(parsed) = parse_http_response(&heap) {
+                        break parsed;
                     }
-                    let (sent, ok) = h2_stream_body_cl(
-                        resp_tx,
-                        notify,
-                        status,
-                        headers,
-                        backend,
-                        body,
-                        content_len,
-                    )
-                    .await;
-                    let reusable = ok && sent == content_len as u64 && !parsed.is_connection_close;
-                    return (status, sent, reusable);
-                }
-            }
+                    if heap.len() > MAX_HEADER_SIZE {
+                        let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
+                        return (s, sz, false);
+                    }
 
-            // 非圧縮 + chunked → ゼロコピー逐次デコード転送。
-            if stream_compress_hint.is_none() && parsed.is_chunked {
+                    let buf = buf_get();
+                    let read_result = timeout(READ_TIMEOUT, backend.read(buf)).await;
+                    let (res, mut returned_buf) = match read_result {
+                        Ok(r) => r,
+                        Err(_) => {
+                            let (s, sz) =
+                                h2_emit_error(resp_tx, notify, 504, b"Gateway Timeout").await;
+                            return (s, sz, false);
+                        }
+                    };
+                    let n = match res {
+                        Ok(0) => {
+                            buf_put(returned_buf);
+                            let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
+                            return (s, sz, false);
+                        }
+                        Ok(n) => n,
+                        Err(_) => {
+                            buf_put(returned_buf);
+                            let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
+                            return (s, sz, false);
+                        }
+                    };
+                    returned_buf.set_valid_len(n);
+                    heap.extend_from_slice(returned_buf.as_valid_slice());
+                    buf_put(returned_buf);
+                };
+
+                (RespData::Heap(heap), parsed)
+            }
+        }
+    };
+
+    {
+        let status = parsed.status_code;
+        let body_start = parsed.header_len;
+        let response_buf = data.as_slice();
+        let body = &response_buf[body_start..];
+
+        let mut headers_storage = [httparse::EMPTY_HEADER; 64];
+        let mut resp = httparse::Response::new(&mut headers_storage);
+        let _ = resp.parse(response_buf);
+        let content_type = resp
+            .headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case("content-type"))
+            .map(|h| h.value);
+        let existing_encoding = resp
+            .headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case("content-encoding"))
+            .map(|h| h.value);
+
+        let stream_compress_hint = compression.should_compress(
+            client_encoding,
+            content_type,
+            parsed.content_length,
+            existing_encoding,
+        );
+
+        // 非圧縮 + CL 既知 + 非 chunked → 逐次ストリーミング。
+        if stream_compress_hint.is_none() && !parsed.is_chunked {
+            if let Some(content_len) = parsed.content_length {
                 let mut headers = h2_base_headers(true);
                 for header in resp.headers.iter() {
                     if header.name.is_empty() {
@@ -2687,98 +2745,22 @@ where
                         || header.name.eq_ignore_ascii_case("keep-alive")
                         || header.name.eq_ignore_ascii_case("transfer-encoding")
                         || header.name.eq_ignore_ascii_case("upgrade")
-                        || header.name.eq_ignore_ascii_case("content-length")
                     {
                         continue;
                     }
                     headers.push((header.name.as_bytes().to_vec(), header.value.to_vec()));
                 }
-                let sent =
-                    h2_stream_body_chunked(resp_tx, notify, status, headers, backend, body).await;
-                return (status, sent, false);
+                let (sent, ok) =
+                    h2_stream_body_cl(resp_tx, notify, status, headers, backend, body, content_len)
+                        .await;
+                let reusable = ok && sent == content_len as u64 && !parsed.is_connection_close;
+                return (status, sent, reusable);
             }
+        }
 
-            // 圧縮あり / 長さ不明 → 全読み込み後に（必要なら圧縮して）送信。
-            let mut backend_reusable = false;
-            let final_body = if parsed.is_chunked {
-                let mut decoder = ChunkedDecoder::new_unlimited();
-                let mut full_body = body.to_vec();
-                decoder.feed(body);
-                while !decoder.is_complete() {
-                    let buf = buf_get();
-                    let (res, mut returned_buf) =
-                        match timeout(READ_TIMEOUT, backend.read(buf)).await {
-                            Ok(r) => r,
-                            Err(_) => break,
-                        };
-                    let n = match res {
-                        Ok(0) => {
-                            buf_put(returned_buf);
-                            break;
-                        }
-                        Ok(n) => n,
-                        Err(_) => {
-                            buf_put(returned_buf);
-                            break;
-                        }
-                    };
-                    returned_buf.set_valid_len(n);
-                    full_body.extend_from_slice(returned_buf.as_valid_slice());
-                    decoder.feed(returned_buf.as_valid_slice());
-                    buf_put(returned_buf);
-                }
-                decode_chunked_body(&full_body)
-            } else if let Some(content_len) = parsed.content_length {
-                let mut full_body = body.to_vec();
-                while full_body.len() < content_len {
-                    let buf = buf_get();
-                    let (res, mut returned_buf) =
-                        match timeout(READ_TIMEOUT, backend.read(buf)).await {
-                            Ok(r) => r,
-                            Err(_) => break,
-                        };
-                    let n = match res {
-                        Ok(0) => {
-                            buf_put(returned_buf);
-                            break;
-                        }
-                        Ok(n) => n,
-                        Err(_) => {
-                            buf_put(returned_buf);
-                            break;
-                        }
-                    };
-                    returned_buf.set_valid_len(n);
-                    full_body.extend_from_slice(returned_buf.as_valid_slice());
-                    buf_put(returned_buf);
-                }
-                backend_reusable = full_body.len() == content_len;
-                full_body
-            } else {
-                body.to_vec()
-            };
-
-            let should_compress = compression.should_compress(
-                client_encoding,
-                content_type,
-                Some(final_body.len()),
-                existing_encoding,
-            );
-
+        // 非圧縮 + chunked → ゼロコピー逐次デコード転送。
+        if stream_compress_hint.is_none() && parsed.is_chunked {
             let mut headers = h2_base_headers(true);
-            if let Some(enc) = should_compress {
-                let encoding_name: &'static [u8] = match enc {
-                    AcceptedEncoding::Zstd => b"zstd",
-                    AcceptedEncoding::Brotli => b"br",
-                    AcceptedEncoding::Gzip => b"gzip",
-                    AcceptedEncoding::Deflate => b"deflate",
-                    AcceptedEncoding::Identity => b"",
-                };
-                if !encoding_name.is_empty() {
-                    headers.push((b"content-encoding".to_vec(), encoding_name.to_vec()));
-                    headers.push((b"vary".to_vec(), b"Accept-Encoding".to_vec()));
-                }
-            }
             for header in resp.headers.iter() {
                 if header.name.is_empty() {
                     continue;
@@ -2787,40 +2769,129 @@ where
                     || header.name.eq_ignore_ascii_case("keep-alive")
                     || header.name.eq_ignore_ascii_case("transfer-encoding")
                     || header.name.eq_ignore_ascii_case("upgrade")
-                {
-                    continue;
-                }
-                if should_compress.is_some()
-                    && (header.name.eq_ignore_ascii_case("content-length")
-                        || header.name.eq_ignore_ascii_case("content-encoding"))
+                    || header.name.eq_ignore_ascii_case("content-length")
                 {
                     continue;
                 }
                 headers.push((header.name.as_bytes().to_vec(), header.value.to_vec()));
             }
+            let sent =
+                h2_stream_body_chunked(resp_tx, notify, status, headers, backend, body).await;
+            return (status, sent, false);
+        }
 
-            let response_body = if let Some(enc) = should_compress {
-                compress_body_h2(&final_body, enc, compression)
-            } else {
-                final_body
+        // 圧縮あり / 長さ不明 → 全読み込み後に（必要なら圧縮して）送信。
+        let mut backend_reusable = false;
+        let final_body = if parsed.is_chunked {
+            let mut decoder = ChunkedDecoder::new_unlimited();
+            let mut full_body = body.to_vec();
+            decoder.feed(body);
+            while !decoder.is_complete() {
+                let buf = buf_get();
+                let (res, mut returned_buf) = match timeout(READ_TIMEOUT, backend.read(buf)).await {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let n = match res {
+                    Ok(0) => {
+                        buf_put(returned_buf);
+                        break;
+                    }
+                    Ok(n) => n,
+                    Err(_) => {
+                        buf_put(returned_buf);
+                        break;
+                    }
+                };
+                returned_buf.set_valid_len(n);
+                full_body.extend_from_slice(returned_buf.as_valid_slice());
+                decoder.feed(returned_buf.as_valid_slice());
+                buf_put(returned_buf);
+            }
+            decode_chunked_body(&full_body)
+        } else if let Some(content_len) = parsed.content_length {
+            let mut full_body = body.to_vec();
+            while full_body.len() < content_len {
+                let buf = buf_get();
+                let (res, mut returned_buf) = match timeout(READ_TIMEOUT, backend.read(buf)).await {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let n = match res {
+                    Ok(0) => {
+                        buf_put(returned_buf);
+                        break;
+                    }
+                    Ok(n) => n,
+                    Err(_) => {
+                        buf_put(returned_buf);
+                        break;
+                    }
+                };
+                returned_buf.set_valid_len(n);
+                full_body.extend_from_slice(returned_buf.as_valid_slice());
+                buf_put(returned_buf);
+            }
+            backend_reusable = full_body.len() == content_len;
+            full_body
+        } else {
+            body.to_vec()
+        };
+
+        let should_compress = compression.should_compress(
+            client_encoding,
+            content_type,
+            Some(final_body.len()),
+            existing_encoding,
+        );
+
+        let mut headers = h2_base_headers(true);
+        if let Some(enc) = should_compress {
+            let encoding_name: &'static [u8] = match enc {
+                AcceptedEncoding::Zstd => b"zstd",
+                AcceptedEncoding::Brotli => b"br",
+                AcceptedEncoding::Gzip => b"gzip",
+                AcceptedEncoding::Deflate => b"deflate",
+                AcceptedEncoding::Identity => b"",
             };
-            let (status2, sent) =
-                h2_emit_full(resp_tx, notify, status, headers, Bytes::from(response_body)).await;
-            return (
-                status2,
-                sent,
-                backend_reusable && !parsed.is_connection_close,
-            );
+            if !encoding_name.is_empty() {
+                headers.push((b"content-encoding".to_vec(), encoding_name.to_vec()));
+                headers.push((b"vary".to_vec(), b"Accept-Encoding".to_vec()));
+            }
+        }
+        for header in resp.headers.iter() {
+            if header.name.is_empty() {
+                continue;
+            }
+            if header.name.eq_ignore_ascii_case("connection")
+                || header.name.eq_ignore_ascii_case("keep-alive")
+                || header.name.eq_ignore_ascii_case("transfer-encoding")
+                || header.name.eq_ignore_ascii_case("upgrade")
+            {
+                continue;
+            }
+            if should_compress.is_some()
+                && (header.name.eq_ignore_ascii_case("content-length")
+                    || header.name.eq_ignore_ascii_case("content-encoding"))
+            {
+                continue;
+            }
+            headers.push((header.name.as_bytes().to_vec(), header.value.to_vec()));
         }
 
-        if response_buf.len() > MAX_HEADER_SIZE {
-            let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
-            return (s, sz, false);
-        }
+        let response_body = if let Some(enc) = should_compress {
+            compress_body_h2(&final_body, enc, compression)
+        } else {
+            final_body
+        };
+        let (status2, sent) =
+            h2_emit_full(resp_tx, notify, status, headers, Bytes::from(response_body)).await;
+        (
+            status2,
+            sent,
+            backend_reusable && !parsed.is_connection_close,
+        )
     }
-
-    let (s, sz) = h2_emit_error(resp_tx, notify, 502, b"Bad Gateway").await;
-    (s, sz, false)
 }
 
 /// 非圧縮・CL 既知ボディを [`H2RespMsg::Body`] として逐次転送する。戻り値 `(sent, ok)`。
