@@ -1102,3 +1102,38 @@ nginx	h2c_file_54576B	h2c	1	10795.25	NA	NA	NA	0	NA	NA
 # perf record（-F 999 -g、ホスト実行の cargo build --release、20 秒）:
 #   修正前: io_cancel_req_match 36.75% + io_timeout_extract 3.89% = 40.6%
 #   修正後: io_cancel_req_match **0.00%**（両シンボルとも消滅）
+# ==== 2026-08-24 h2 プロキシ応答の中間 64KB Vec 除去 交互 A/B ====
+# base = veil:glibc-b72new（B-72 修正済み・コミット 22e6af5）
+# new  = veil:glibc-nocopy（中間 Vec 除去）。md5 が異なることを確認済み。
+# 構成 h2c_proxy（54,576B）/ 各ラウンド 40 秒ウォームアップ後に -n 40000 -c100 -m10。
+veil_glibc_base	h2c_proxy_54576B	h2c	1	10180.66	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_proxy_54576B	h2c	1	10412.72	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_proxy_54576B	h2c	2	10332.52	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_proxy_54576B	h2c	2	9992.29	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_proxy_54576B	h2c	3	10298.48	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_proxy_54576B	h2c	3	10291.18	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_proxy_54576B	h2c	4	10412.67	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_proxy_54576B	h2c	4	10135.48	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_proxy_54576B	h2c	5	10128.84	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_proxy_54576B	h2c	5	10399.74	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_proxy_54576B	h2c	6	10457.44	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_proxy_54576B	h2c	6	10098.37	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_proxy_54576B	h2c	7	10068.45	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_proxy_54576B	h2c	7	10456.06	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_proxy_54576B	h2c	8	10453.62	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_proxy_54576B	h2c	8	9934.30	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_proxy_54576B	h2c	9	10241.67	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_proxy_54576B	h2c	9	10209.06	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_proxy_54576B	h2c	10	10480.14	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_proxy_54576B	h2c	10	10183.26	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_proxy_54576B	h2c	11	10155.80	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_proxy_54576B	h2c	11	10406.82	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_proxy_54576B	h2c	12	10481.58	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_proxy_54576B	h2c	12	10030.26	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_proxy_54576B	h2c	13	10212.79	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_proxy_54576B	h2c	13	10553.79	NA	NA	NA	0	NA	NA
+# 集計: base n=13 中央値 10135.5（9934.3〜10298.5）/ new n=13 中央値 10412.7（10209.1〜10553.8）
+# → 中央値 +2.74%。11/13 ラウンドで new 勝ち。
+# **分布は完全分離しない**（base 最大 10298.5 > new 最小 10209.1）が、
+# 全ペア 13×13=169 通りのうち 165 通り（97.6%）で new が上回る。
+# 効果量が小さい（~3%）ため、B-72（+30.8%・完全分離）より弱い証拠であることを明記しておく。
