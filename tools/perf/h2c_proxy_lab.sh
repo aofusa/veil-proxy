@@ -12,6 +12,8 @@
 #   bash tools/perf/h2c_proxy_lab.sh cpu  [path] [秒]        # 負荷中の CPU 内訳を取る
 #   bash tools/perf/h2c_proxy_lab.sh strace [path] [件数]    # 1 req あたりの syscall 回数
 #   bash tools/perf/h2c_proxy_lab.sh mem  [path] [秒]        # 持続負荷中のメモリ推移
+#   bash tools/perf/h2c_proxy_lab.sh ab <base_img> <new_img> [config] [path] [rounds]
+#                                                            # 交互 A/B（定常状態で計測）
 #   bash tools/perf/h2c_proxy_lab.sh down                    # 後始末
 #
 # `path` は `/`（= 54,576B の index.html）または `/3b.html`（= 3B）。
@@ -229,6 +231,48 @@ cmd_mem() {
     docker rm -f "$cli" >/dev/null 2>&1
 }
 
+# 2 イメージの交互 A/B（改修前 vs 改修後）。
+#
+# **必ず定常状態に入れてから測ること。** B-72（io_uring の `IORING_OP_TIMEOUT` が
+# READ_TIMEOUT = 30 秒カーネルに居座る）のように、コストが**負荷を続けた秒数に
+# 依存して積み上がる**現象があるため、`-n 20000`（実測 2〜3 秒で終わる）を
+# 起動直後に流すと蓄積前の有利な状態を測ってしまう。
+# ここでは毎ラウンド `WARM_SECS`（既定 40 秒）の持続負荷をかけてから計測する。
+#
+# ラウンドごとに実行順を入れ替える（奇数 base→new、偶数 new→base）。
+# 計測系の時間ドリフトで後半の変種が不利になるのを避けるため（tools/perf/README.md）。
+cmd_ab() {
+    local base_img="$1" new_img="$2" cfg="${3:-h2c_proxy}" path="${4:-/}" rounds="${5:-8}"
+    local warm="${WARM_SECS:-40}" nreq="${AB_NREQ:-40000}"
+
+    if [ "$(docker image inspect -f '{{.Id}}' "$base_img" 2>/dev/null)" = \
+         "$(docker image inspect -f '{{.Id}}' "$new_img" 2>/dev/null)" ]; then
+        echo "!! base と new が同一イメージ。A/B にならない" >&2
+        return 1
+    fi
+
+    echo -e "round\tvariant\treq_per_sec"
+    local r order img
+    for r in $(seq 1 "$rounds"); do
+        if [ $((r % 2)) -eq 1 ]; then order="base new"; else order="new base"; fi
+        for variant in $order; do
+            case "$variant" in
+                base) img="$base_img" ;;
+                new)  img="$new_img" ;;
+            esac
+            cmd_up "$cfg" "$img" >/dev/null 2>&1 || { echo -e "$r\t$variant\tNA"; continue; }
+            # 定常状態まで持っていく（蓄積系のコストを計測対象に含める）
+            docker run --rm --network "$NET" --entrypoint h2load "$H2_IMG" \
+                -c 100 -m 10 -D "$warm" "http://$TARGET:$H2C_PORT$path" >/dev/null 2>&1
+            local rps
+            rps=$(docker run --rm --network "$NET" --entrypoint h2load "$H2_IMG" \
+                    -n "$nreq" -c 100 -m 10 "http://$TARGET:$H2C_PORT$path" 2>&1 \
+                  | awk '/finished in/{print $4}')
+            echo -e "$r\t$variant\t${rps:-NA}"
+        done
+    done
+}
+
 cmd_down() {
     docker rm -f "$VEIL_NAME" "$NGINX_NAME" "$BACKEND_NAME" lab-h2load-cpu lab-h2load-str >/dev/null 2>&1
     docker network rm "$NET" >/dev/null 2>&1
@@ -242,6 +286,7 @@ case "${1:-}" in
     cpu)    shift; cmd_cpu "$@" ;;
     strace) shift; cmd_strace "$@" ;;
     mem)    shift; cmd_mem "$@" ;;
+    ab)     shift; cmd_ab "$@" ;;
     down)   cmd_down ;;
     *) sed -n '2,20p' "${BASH_SOURCE[0]}"; exit 1 ;;
 esac
