@@ -3,7 +3,7 @@
 | 項目 | 内容 |
 |---|---|
 | 優先度 | **P1** |
-| 状態 | 対応中 |
+| 状態 | **完了**（2026-08-24） |
 | 対象 | Linux io_uring バックエンド（既定）。reactor（BSD/macOS/`--features epoll`）は**非該当** |
 | 影響 | 逆プロキシ経路の **CPU の約 40% がカーネルのリスト走査**に消える |
 | 発見 | Linux h2c proxy 性能調査（`docs/artifacts/h2c_proxy_bottleneck_investigation.md` 5 章） |
@@ -122,3 +122,32 @@ per-stream タスクは Head / Body ごとに notify するため、
 - reactor バックエンドは無変更。
 - 新しい io_uring オペコードは増やさない（`IORING_OP_TIMEOUT` は既に使用中）。
   seccomp 許可リストの変更も不要。
+
+---
+
+## 結果（2026-08-24）
+
+`h2c_proxy`（54,576B）の交互 A/B。**各ラウンドで計測前に 40 秒の持続負荷をかけ、
+`ctx->timeout_list` が定常状態まで積み上がってから測っている**
+（本バグのコストは負荷継続秒数に依存するため、起動直後の短い計測では base を過大評価する）。
+
+| variant | n | 中央値 | 最小 | 最大 |
+|---|---|---|---|---|
+| base | 9 | 7,757.5 | 7,228.1 | 8,120.5 |
+| **new** | 10 | **10,145.4** | 9,951.2 | 10,361.4 |
+
+**中央値 +30.8%・9/9 ラウンド勝ち・分布完全分離**（base 最大 < new 最小）。
+
+機序の確認（`perf record -F 999 -g`、20 秒）:
+
+| シンボル | 修正前 | 修正後 |
+|---|---|---|
+| `io_cancel_req_match` | **36.75%** | **0.00%** |
+| `io_timeout_extract` | 3.89% | 0.00% |
+
+CPU 内訳（4 コア、docker stats）: veil 222% → 196%、
+1 リクエストあたり **253 → 193 µs·コア（-24%）**。
+対 nginx は 1.19× → **1.56×**。
+
+検証: 単体 883 / 統合 54 パス、clippy `--features full` / `full,epoll` 警告ゼロ、
+`src/runtime/reactor/` は diff 空（reactor 側の非劣化は A/B ではなく無変更で保証）。

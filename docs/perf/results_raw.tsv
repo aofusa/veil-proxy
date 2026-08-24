@@ -1060,3 +1060,45 @@ nginx	h2c_file_54576B	h2c	1	3168.08	165.44MB/s	NA	NA	0	203.0	NA
 nginx	h2c_proxy_54576B	h2c	1	1587.26	82.93MB/s	NA	NA	0	128.0	NA
 nginx	h2c_file_3B	h2c	1	7678.63	1.62MB/s	NA	NA	0	NA	NA
 nginx	h2c_proxy_3B	h2c	1	3882.47	838.23KB/s	NA	NA	0	NA	NA
+# ==== 2026-08-24 B-72 交互 A/B: io_uring タイマーをユーザ空間デッドラインヒープ化 ====
+# ホスト: 4 コア Linux x86_64（quiet host = co-tenant なし、loadavg < 1.0）。
+# 構成 h2c_proxy（54,576B）/ 負荷 h2load -n 40000 -c100 -m10。
+# **各ラウンドで計測前に 40 秒の持続負荷（-D 40）をかけて定常状態にしてから測っている。**
+#   B-72 のコストは「負荷を続けた秒数」に依存して積み上がる（READ_TIMEOUT = 30 秒ぶんの
+#   IORING_OP_TIMEOUT が ctx->timeout_list に溜まる）ため、-n 40000（実測 4〜5 秒）を
+#   起動直後に流すと蓄積前の有利な状態を測ってしまい base を過大評価する。
+# ラウンドごとに実行順を入れ替え（奇数 base→new / 偶数 new→base）。
+# base = veil:glibc-b72base（HEAD 1f1fcf3 のクリーン worktree からビルド）
+# new  = veil:glibc-b72new（B-72 修正）。md5 が異なることを確認済み。
+veil_glibc_base	h2c_proxy_54576B	h2c	1	7526.48	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_proxy_54576B	h2c	1	9951.18	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_proxy_54576B	h2c	2	10126.76	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_proxy_54576B	h2c	2	7757.53	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_proxy_54576B	h2c	3	7992.30	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_proxy_54576B	h2c	3	10269.10	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_proxy_54576B	h2c	4	10308.54	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_proxy_54576B	h2c	5	7568.43	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_proxy_54576B	h2c	5	10164.00	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_proxy_54576B	h2c	6	10097.98	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_proxy_54576B	h2c	6	8120.49	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_proxy_54576B	h2c	7	8089.64	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_proxy_54576B	h2c	7	10168.38	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_proxy_54576B	h2c	8	10122.69	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_proxy_54576B	h2c	8	7778.70	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_proxy_54576B	h2c	9	7228.13	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_proxy_54576B	h2c	9	10361.37	NA	NA	NA	0	NA	NA
+veil_glibc_new	h2c_proxy_54576B	h2c	10	10092.25	NA	NA	NA	0	NA	NA
+veil_glibc_base	h2c_proxy_54576B	h2c	10	7590.30	NA	NA	NA	0	NA	NA
+# 集計: base n=9 中央値 7757.5（範囲 7228.1〜8120.5）/ new n=10 中央値 10145.4（範囲 9951.2〜10361.4）
+# → 中央値 +30.8%。9/9 ラウンドで new 勝ち。**分布は完全分離**（base 最大 8120.5 < new 最小 9951.2）。
+#
+# ---- 同一セッションの周辺計測（すべて 40 秒ウォームアップ後、-n 40000 -c100 -m10 の 3 回中央値）----
+veil_glibc_new	h2c_file_54576B	h2c	1	24636.44	NA	NA	NA	0	195.0	NA
+nginx	h2c_proxy_54576B	h2c	1	6507.35	NA	NA	NA	0	NA	NA
+nginx	h2c_file_54576B	h2c	1	10795.25	NA	NA	NA	0	NA	NA
+# CPU 内訳（54KB プロキシ、docker stats 同時サンプル、4 コア）:
+#   修正前: クライアント 62% / veil 222% / 上流 117%（計 ~400% = 飽和）→ veil 253 µs·コア/req
+#   修正後: クライアント 67% / veil 196% / 上流 122%（計 ~385%）      → veil 193 µs·コア/req（-24%）
+# perf record（-F 999 -g、ホスト実行の cargo build --release、20 秒）:
+#   修正前: io_cancel_req_match 36.75% + io_timeout_extract 3.89% = 40.6%
+#   修正後: io_cancel_req_match **0.00%**（両シンボルとも消滅）
