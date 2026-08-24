@@ -3763,7 +3763,7 @@ recv/send/accept/timer Future をランダムに Drop する `runtime_cancellati
 には理由付き `#[allow]` を付与する。
 
 ユニットテスト数はリリースイメージビルド（`docker/Dockerfile.musl` が
-`cargo test --lib --features full` を実行 = 879 passed）で検証している。
+`cargo test --lib --features full` を実行 = 883 passed）で検証している。
 リポジトリ内テストに加え、Docker ベースの外形検証ハーネスを 2 つ用意している。
 
 - **[`tools/container_security/`](../../tools/container_security/)** — ファジング・カオス・
