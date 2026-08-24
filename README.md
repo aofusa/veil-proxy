@@ -3827,7 +3827,7 @@ reason-annotated `#[allow]` at the legitimate call sites (offload closures, dedi
 startup/reload cold paths, tests/benches).
 
 The unit-test count is verified inside the release image build (`docker/Dockerfile.musl`
-runs `cargo test --lib --features full` — 879 passed). In addition to the in-repo tests,
+runs `cargo test --lib --features full` — 883 passed). In addition to the in-repo tests,
 two Docker-based external-verification harnesses are provided:
 
 - **[`tools/container_security/`](tools/container_security/)** — fuzzing, chaos, h2spec HTTP/2

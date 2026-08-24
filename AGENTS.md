@@ -58,6 +58,41 @@ AI エージェントおよびコントリビュータ向けの **最小指針**
 - **HTTP/2・HTTP/3 の静的配信は `static_file_cache` と `open_file_cache` を必ずセットで有効にする（F-157）** — `cache::get_static_file_with_content`（`src/cache/static_file.rs`）の offload ゼロ経路は「**メタデータキャッシュがヒットしたときに限り本体キャッシュを参照する**」構造なので、**本体キャッシュ（`[static_file_cache]`）だけ有効にしても素通りして毎リクエスト offload の open+read に落ちる**（実測で `openat` が 1.0/req のまま変わらず、スループットも改善しなかった）。HTTP/2・HTTP/3 は DATA フレーム / QUIC ストリームへの再フレーミングが要るため `sendfile(2)` に載せられず（nginx は h2c でも `sendfile` + `sf_hdtr` でカーネル内完結できる）、この 2 段キャッシュが sendfile の等価物になる。**計測でも片側だけをチューニングして比較してはならない**（nginx 側にも `open_file_cache` を入れる。F-155 の kTLS と同じ失敗）。
 - **ホットパスのコピー削減は「コピー元がキャッシュに載っているか」を先に確認する（F-157）** — 54KB の DATA 本体を `write_buf` へ memcpy している箇所を `sendmsg` の N 本 iovec によるゼロコピー送出に置き換えたところ、**交互 A/B 4 ラウンドすべてで回帰した**（対 nginx 0.886 → 0.807）。事前見積もりは memcpy を DRAM 帯域（5 GB/s → 1 リクエスト 5.4µs）で計算していたが、**同じファイルを毎回配信するワークロードではコピー元が L2/L3 に residence し続け、memcpy は見積もりよりはるかに安い**。一方 `sendmsg` の per-iovec コストは実在する。「大きなコピーを消せば速くなる」は自明ではない。
 - **HTTP/2 の per-stream タスクは reactor でだけ「インライン初回 poll」する（F-158）** — `h2_task_spawner` は `veil_rt_reactor` のときだけ `TaskPool::spawn_inline`（future をスラブへ格納し、**そのタスク自身の実 Waker** で 1 回だけその場で poll。`Poll::Ready` ならエグゼキュータの ready キューへ一度も積まない）を使い、**io_uring では従来どおり `spawn()` を使う**。`spawn_inline`/`spawn_body_and_poll` は `runtime::reactor::executor` にのみ存在し、**`runtime::uring::executor` は F-158 以前と 1 バイトも変わらない**。**同一の変更が kqueue で +27.3%（3B、10/10 ラウンド・分布完全分離）、io_uring で −4.6%（`h2c_file`、12 ラウンド中 11 でベースライン勝ち）と正反対になったため**である。理由は消せる往復コストの差で、reactor の待機は `Readable::poll` の**同期 `poll(2)`** を伴う（この `poll(2)` フォールバックは削除禁止＝上項参照）のに対し、io_uring の同じ待機は `IORING_OP_POLL_ADD` の SQE 1 本が他の SQE とまとめて submit されるため元から安く、インライン poll 側の固定費（スロット確保・Waker 構築・`EXEC_STATE` の追加借用）と SQE バッチングの乱れだけが残る。noop waker で初回 poll してはならない（Pending 時に恒久ハングする）。**教訓: ホットパス最適化は「片方のバックエンドで効いた」ことをもう一方へ一般化してはならず、必ず両方で交互 A/B を取ること。**
+- **io_uring で I/O ごとにカーネルタイマーを張ってはならない（B-72）** — `runtime::uring::timer` は
+  **スレッドローカルのデッドライン最小ヒープ**であり、`Sleep::poll` / `Sleep::drop` は
+  ユーザ空間のヒープ操作だけで **SQE も syscall も出さない**。カーネルへの `IORING_OP_TIMEOUT` は
+  `executor::wait_for_completions` が park 直前に **最近接の live デッドラインへ 1 本だけ**アームする
+  （`ctx->timeout_list` の長さは常に 0 か 1）。**不変条件**: live な `D_min` が存在するとき、
+  アーム中の TIMEOUT の期限は必ず `D_min` 以下（崩れると park が寝過ごす）。
+  アーム中 TIMEOUT が参照する `KernelTimespec` は **drop されない専用スレッドローカル**に置く
+  （`Option` に入れて再アーム時に drop すると、submit がエラーを返して SQE が未提出のまま
+  SQ に残った場合にダングリングポインタになる）。満了処理 `fire_expired` は
+  **`run_ready_tasks` の前**で回す（後ろに置くと、起こしたタスクを実行しないまま park する）。
+  **旧実装は `Sleep::drop` で「キャンセル SQE + submit の syscall を節約する」ためキャンセルを
+  投げず、`timeout(READ_TIMEOUT, read)` の勝ち筋のたびにタイマーを 30 秒カーネルに残していた。**
+  数千 rps で `ctx->timeout_list` が 10 万オーダーに肥大し、別経路（in-flight POLL_ADD の drop）が
+  出す `IORING_OP_ASYNC_CANCEL` のカーネル側フォールバック（`io_timeout_cancel` →
+  `io_timeout_extract` → `io_cancel_req_match`）が**毎回そのリストを線形走査**して、
+  逆プロキシ経路の **CPU の 40.6%** を食っていた（`perf record` 実測）。
+  静的配信は `timeout()` を 1 度も通らずリストが空のため無傷で、これが
+  「静的は nginx の 2.2 倍なのにプロキシは 1.2 倍」の正体だった。修正で **+30.8%**。
+  **教訓 1: 「syscall を 1 回節約する」局所最適化が、別経路の計算量を O(1) から O(n) へ
+  引き上げることがある。ホットパスの判断はユーザ空間の命令数だけでなくカーネル側の
+  データ構造まで見て行うこと**（`perf` でカーネルシンボルを必ず確認する）。
+  **教訓 2: 蓄積するコストは「定常状態」で測る。** 本バグのコストは負荷継続秒数に依存して
+  積み上がるため、起動直後に `-n 40000`（実測 4〜5 秒）を流すと蓄積前の有利な状態を測ってしまい、
+  ベースラインを 13% 過大評価する（実測 8,765 対 7,757）。**A/B の各ラウンドで
+  `READ_TIMEOUT` を超える持続負荷（40 秒）をかけてから計測すること**
+  （`tools/perf/h2c_proxy_lab.sh ab` に組み込み済み）。
+- **プロキシ応答の中間バッファをリクエストごとに確保しない（B-72 第 2 弾）** —
+  `h2_relay_backend_response` はヘッダーが 1 回目の read で完結する通常ケースでは
+  **プール済み受信バッファのスライスを直接** `parse_http_response` に渡し、`PooledBuf`
+  （Drop で必ず `buf_put` する RAII）で持ち回る。中間 `Vec::with_capacity(BUF_SIZE)`（64KB）への
+  確保 + `extend_from_slice` を復活させてはならない（+2.74%）。**ヘッダー解析回数を増やさないこと**:
+  速い経路は `parse_http_response` 1 回 + `httparse::Response` 1 回の計 2 回で、
+  1 回目の解析結果を捨てて後段で解析し直すと解析が 3 回になり、コピー削減分を打ち消す
+  （実装中に実際に踏み、レビューで差し戻した）。**`queue_data_frames` の DATA フレーミング
+  コピーには手を付けないこと**（F-157 が iovec 化の退行を実測済み）。
 - **動的設定**は ArcSwap とリロード経路の不変条件を維持する。
 - **`unsafe` は最小限** — 拡大時は不変条件をコメントで明示。
 

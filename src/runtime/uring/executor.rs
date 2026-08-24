@@ -15,9 +15,11 @@ use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::time::Instant;
 
+use super::timer;
 use crate::runtime::ring::{
-    IoUring, IoUringCqe, IORING_OP_ACCEPT, IORING_OP_ASYNC_CANCEL, IORING_OP_CLOSE,
+    IoUring, IoUringCqe, KernelTimespec, IORING_OP_ACCEPT, IORING_OP_ASYNC_CANCEL, IORING_OP_CLOSE,
     IORING_OP_CONNECT, IORING_OP_NOP, IORING_OP_POLL_ADD, IORING_OP_POLL_REMOVE, IORING_OP_RECV,
     IORING_OP_RECVMSG, IORING_OP_SEND, IORING_OP_SENDMSG, IORING_OP_SPLICE, IORING_OP_TIMEOUT,
     IORING_SETUP_R_DISABLED,
@@ -607,6 +609,33 @@ thread_local! {
 
     /// スレッドローカルな操作テーブル
     pub(crate) static OP_TABLE: RefCell<OpTable> = RefCell::new(OpTable::new());
+
+    /// B-72: 現在カーネルへアーム中の唯一の `IORING_OP_TIMEOUT`。
+    ///
+    /// `runtime::uring::timer` はユーザ空間のデッドラインヒープのみを管理し、カーネルへは
+    /// 一切 SQE を出さない。`wait_for_completions` が park 直前に、ヒープの最近接デッドライン
+    /// （`timer::next_deadline()`）に対して**このスレッドで高々 1 本だけ** TIMEOUT をアームする。
+    static ARMED_TIMER: RefCell<Option<ArmedTimer>> = const { RefCell::new(None) };
+
+    /// アーム中 TIMEOUT の SQE が `addr` で指す timespec の実体。
+    ///
+    /// **スレッド生存期間中ずっと同じアドレスに置く**（`Option` に入れて drop させない）。
+    /// 再アーム時に古いレコード（`ArmedTimer`）を drop する設計にすると、直前の
+    /// `submit_and_wait` がエラーを返して SQE が未提出のまま SQ リングに残っていた場合に、
+    /// その SQE が解放済みアドレスを指すダングリングポインタになる（submit エラーは稀だが
+    /// 通常経路であり得る）。値の上書きは無害（未提出の古い SQE が新しい期限を使うだけで、
+    /// どのみち新しい `D_min` 以下の期限になる）。
+    static ARMED_TIMER_TS: RefCell<KernelTimespec> =
+        const { RefCell::new(KernelTimespec { tv_sec: 0, tv_nsec: 0 }) };
+}
+
+/// アーム中のカーネル `IORING_OP_TIMEOUT` の記録。
+///
+/// timespec 本体は `ARMED_TIMER_TS`（専用スレッドローカル、drop されない）に置く。
+/// この構造体自体を drop しても、カーネルが参照し得るアドレスは無効化されない。
+struct ArmedTimer {
+    user_data: u64,
+    deadline: Instant,
 }
 
 /// スレッドローカルな io_uring リングを初期化する
@@ -793,11 +822,104 @@ pub fn poll_completions() {
 }
 
 /// io_uring の CQE を処理する（最低 1 件完了まで待機）
+///
+/// B-72: park 直前にユーザ空間タイマーヒープの最近接デッドラインへ向けてカーネル
+/// `IORING_OP_TIMEOUT` を高々 1 本アームし、起床後にその結果を回収してから
+/// `timer::fire_expired` で満了分の Waker を起こす。
 pub fn wait_for_completions() -> std::io::Result<()> {
+    arm_kernel_timeout_if_needed();
+
     with_ring(|ring| ring.submit_and_wait(1))?;
 
     poll_completions();
+    take_armed_timer_result_if_fired();
+    if timer::has_timers() {
+        timer::fire_expired(Instant::now());
+    }
     Ok(())
+}
+
+/// タイマーヒープの最近接デッドラインに対してカーネル `IORING_OP_TIMEOUT` をアームする
+/// （B-72）。
+///
+/// **不変条件**: live なデッドライン `D_min` が存在するとき、アーム中の TIMEOUT の期限は
+/// 必ず `D_min` 以下でなければならない（さもないと park が `D_min` を取りこぼして寝過ごす）。
+/// そのため「未アーム」または「アーム中の期限が `D_min` より後」の場合にのみ再アームする。
+///
+/// 旧アーム（あれば）はキャンセルの SQE を投げない。カーネル側で自然完了させ、その CQE は
+/// スプリアスな早期起床として無視される（`detach_op_no_cancel` で op テーブルのスロットは
+/// 自己解放される。ASYNC_CANCEL 分の syscall を節約しつつ B-72 が問題にした
+/// `ctx->timeout_list` の長期居座りは発生しない ＝ 直近で新しい TIMEOUT に置き換わるまでの
+/// 短期間しか居座らない）。
+fn arm_kernel_timeout_if_needed() {
+    let Some(d_min) = timer::next_deadline() else {
+        return;
+    };
+
+    let needs_rearm = ARMED_TIMER.with(|a| match &*a.borrow() {
+        Some(armed) => armed.deadline > d_min,
+        None => true,
+    });
+    if !needs_rearm {
+        return;
+    }
+
+    if let Some(old) = ARMED_TIMER.with(|a| a.borrow_mut().take()) {
+        detach_op_no_cancel(old.user_data, OpGuard::Noop);
+    }
+
+    let remaining = d_min.saturating_duration_since(Instant::now());
+    let user_data = alloc_op();
+
+    // ARMED_TIMER_TS へ書き込み、借用を終えてからポインタを取り出す（with_ring 呼び出し中に
+    // 本セルの借用を保持し続けない。RefCell の実行時借用チェックと、将来この関数へ再入する
+    // 経路が増えても panic しない健全性のため）。ARMED_TIMER_TS は drop されないスレッド
+    // ローカルなので、このアドレスはスレッドの生存期間中ずっと有効。
+    let ts_ptr = ARMED_TIMER_TS.with(|t| {
+        let mut t = t.borrow_mut();
+        t.tv_sec = remaining.as_secs() as i64;
+        t.tv_nsec = remaining.subsec_nanos() as i64;
+        &*t as *const KernelTimespec as u64
+    });
+
+    ARMED_TIMER.with(|a| {
+        *a.borrow_mut() = Some(ArmedTimer {
+            user_data,
+            deadline: d_min,
+        });
+    });
+
+    let acquired = with_ring(|ring| {
+        if let Some(sqe) = ring.get_sqe_or_submit() {
+            sqe.opcode = IORING_OP_TIMEOUT;
+            sqe.fd = -1;
+            sqe.addr_or_splice_off_in = ts_ptr;
+            sqe.len = 1; // 件数
+            sqe.user_data = user_data;
+            sqe.off_or_addr2 = 0; // 絶対タイムアウトカウント 0 = 相対タイムアウト
+            true
+        } else {
+            false
+        }
+    });
+
+    if !acquired {
+        // B-24: SQ/CQ 枯渇で TIMEOUT SQE を確保できず。次回 park 前の
+        // `arm_kernel_timeout_if_needed` 呼び出しで再試行する。
+        remove_op(user_data);
+        ARMED_TIMER.with(|a| *a.borrow_mut() = None);
+    }
+}
+
+/// アーム中の TIMEOUT が完了していれば結果を回収してレコードを解放する。
+fn take_armed_timer_result_if_fired() {
+    let user_data = ARMED_TIMER.with(|a| a.borrow().as_ref().map(|t| t.user_data));
+    let Some(user_data) = user_data else {
+        return;
+    };
+    if take_op_result(user_data).is_some() {
+        ARMED_TIMER.with(|a| *a.borrow_mut() = None);
+    }
 }
 
 /// SQE を提出する
@@ -1086,7 +1208,15 @@ impl Executor {
         });
 
         loop {
-            // Ready なタスクを実行
+            // B-72: 満了タイマーを ready タスク実行より先に起こす。順序が逆だと、
+            // ここで起こされたタスクを実行しないまま次の park に入ってしまい
+            // （park は無関係な完了が来るまで戻らない）、満了済みタイマーのタスクが
+            // 任意の時間ストールし得る。ヒープが空なら `Instant::now()` すら呼ばない。
+            if timer::has_timers() {
+                timer::fire_expired(Instant::now());
+            }
+
+            // Ready なタスクを実行（上で起こしたタスクも含む）
             self.run_ready_tasks();
 
             if result.borrow().is_some() {

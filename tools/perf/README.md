@@ -14,6 +14,7 @@
 |------|------|
 | `run_perf.sh` | 計測オーケストレータ（nginx → veil glibc/musl × 全バリアント × 反復）。完了後に集計も実行 |
 | `gen_configs.sh` | 計測用 `config.toml` バリアントを生成（**完全直交 2⁴=16** + full features 機能ショーケース `feat_*` + **全プロトコル×全機能マトリクス**（F-114: `h2_1_proxy_*` / `h3_file_*` / `h3_proxy*` / `grpc_h2_*` / `grpc_h3*`）+ **h2c（平文 HTTP/2 prior knowledge）**（`h2c_file` / `h2c_proxy`）） |
+| `h2c_proxy_lab.sh` | h2c 単一構成のラボハーネス（`run_perf.sh` は 1 構成の計測が終わるとコンテナを落とすため、**負荷をかけたまま**の CPU 内訳・syscall 集計・メモリ推移が取れない）。`up`/`upnginx` で veil と比較対象 nginx を起動しっぱなしにし、`load`（rps）・`cpu`（クライアント/プロキシ/上流の 3 者同時サンプル）・`strace`（**1 リクエストあたりの syscall 回数**）・`mem`（持続負荷中の RSS 推移）を差し込む。ペイロードは `/`（54,576B）と `/3b.html`（3B）の 2 サイズを配信し、**バイト単価と固定費を切り分けられる**ようにしてある |
 | `analyze_results.sh` | 反復生データ（`results_raw.tsv`）を **median±stdev** に集計し Markdown を出力。**Linux ハーネスの 11 列形式専用**で、FreeBSD ネイティブ計測（8/10 列）を渡すと列位置がずれるため**明示エラーで停止する**（黙って全行 0.0 を出さない）。`#` 始まりの節見出し・列凡例・ヘッダ行は集計対象外 |
 | `configs/*.toml` | 生成済みバリアント（`gen_configs.sh` で再生成可能） |
 | `nginx/nginx.conf` | 比較対象 nginx の設定（`access_log off` で公平化。平文 8080 で `listen 8080; http2 on;` により h2c も有効化し、veil の h2c 専用リスナーと条件を揃える） |
@@ -94,6 +95,7 @@ bash tools/perf/analyze_results.sh tools/perf/results/results_raw.tsv
 | `K6_VUS` | `50` | gRPC / WebSocket（k6）並列仮想ユーザ数 |
 | `K6_DURATION` | `10s` | gRPC / WebSocket（k6）計測時間 |
 | `CONFIG_GLOB` | `*` | 計測対象 config を絞り込む glob（例: `h3_*` / `grpc_*` / `h2_1_proxy_*`）。既定は全構成 |
+| `BUILDS` | `glibc musl` | 計測対象の veil ビルド。改修の A/B 中は片方のイメージしか作り直さないため、`BUILDS=glibc` で古い `veil:musl` を混ぜないようにする |
 
 > 全構成（65+）× glibc/musl × 反復 のフルスイートは時間がかかります。素早く確認したい場合は
 > `ITERATIONS=1` や `CONFIG_GLOB='h3_*'`（対象構成のみ）で実行してください。

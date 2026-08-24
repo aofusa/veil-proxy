@@ -29,6 +29,9 @@ K6_DURATION="${K6_DURATION:-10s}" # k6 計測時間
 ITERATIONS="${ITERATIONS:-3}"      # 各 (config, proto) の反復回数（median±stdev 集計用）
 CONFIG_GLOB="${CONFIG_GLOB:-*}"    # 計測対象 config を絞り込む glob（既定 * = 全構成）。
                                     # 例: CONFIG_GLOB='h3_*' や CONFIG_GLOB='grpc_*' で scoped 計測。
+BUILDS="${BUILDS:-glibc musl}"     # 計測対象の veil ビルド（既定は両方）。改修の A/B 中は
+                                    # 片方のイメージしか作り直さないことがあり、古いイメージを
+                                    # 混ぜて計測しないよう `BUILDS=glibc` のように絞れる。
 
 # 計測結果は raw（1 反復 1 行）で保存し、analyze_results.sh で median±stdev に集計する。
 RESULTS_RAW="$HERE/results/results_raw.tsv"
@@ -344,7 +347,7 @@ docker rm -f nginx-perf >/dev/null 2>&1
 # ---- veil glibc / musl x configs ----
 # glibc → musl の順でループする（TSV 行順要件: nginx → veil_glibc → veil_musl）。
 # 将来の並列化・リオーダはこの順序を崩すため行わないこと。
-for build in glibc musl; do
+for build in $BUILDS; do
     img="veil:$build"
     for cfgfile in "$HERE"/configs/$CONFIG_GLOB.toml; do
         [ -e "$cfgfile" ] || continue
