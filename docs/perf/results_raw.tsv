@@ -1137,3 +1137,40 @@ veil_glibc_new	h2c_proxy_54576B	h2c	13	10553.79	NA	NA	NA	0	NA	NA
 # **分布は完全分離しない**（base 最大 10298.5 > new 最小 10209.1）が、
 # 全ペア 13×13=169 通りのうち 165 通り（97.6%）で new が上回る。
 # 効果量が小さい（~3%）ため、B-72（+30.8%・完全分離）より弱い証拠であることを明記しておく。
+# ==== 2026-08-24 改修前(1f1fcf3) vs HEAD の直接 A/B（累積効果と静的経路の非退行確認） ====
+# base = veil:glibc-prefix（1f1fcf3 = B-72 修正前）/ new = veil:glibc（HEAD）。
+# 各ラウンド 40 秒ウォームアップ後に -n 40000 -c100 -m10。
+#
+# --- h2c_proxy（累積効果）: 中央値 7384.3 → 10473.4 = +41.8%、6/6 勝ち、分布完全分離 ---
+# 注: 2 改修を別々に測った中央値を掛け合わせると +34.2% になるが、各 A/B は
+# 別時刻に取られており掛け算は妥当でない。**同一セッションで改修前後を直接比較した
+# 本節の +41.8% を累積効果の正とする。**
+veil_glibc_prefix	h2c_proxy_54576B	h2c	1	7353.16	NA	NA	NA	0	NA	NA
+veil_glibc_head	h2c_proxy_54576B	h2c	1	10454.10	NA	NA	NA	0	NA	NA
+veil_glibc_head	h2c_proxy_54576B	h2c	2	10422.14	NA	NA	NA	0	NA	NA
+veil_glibc_prefix	h2c_proxy_54576B	h2c	2	7235.15	NA	NA	NA	0	NA	NA
+veil_glibc_prefix	h2c_proxy_54576B	h2c	3	7415.45	NA	NA	NA	0	NA	NA
+veil_glibc_head	h2c_proxy_54576B	h2c	3	10492.68	NA	NA	NA	0	NA	NA
+veil_glibc_head	h2c_proxy_54576B	h2c	4	10501.84	NA	NA	NA	0	NA	NA
+veil_glibc_prefix	h2c_proxy_54576B	h2c	4	7476.20	NA	NA	NA	0	NA	NA
+veil_glibc_prefix	h2c_proxy_54576B	h2c	5	7536.44	NA	NA	NA	0	NA	NA
+veil_glibc_head	h2c_proxy_54576B	h2c	5	10616.26	NA	NA	NA	0	NA	NA
+veil_glibc_head	h2c_proxy_54576B	h2c	6	10334.90	NA	NA	NA	0	NA	NA
+veil_glibc_prefix	h2c_proxy_54576B	h2c	6	7332.40	NA	NA	NA	0	NA	NA
+#
+# --- h2c_file（静的 = 非退行確認）: 中央値 24725.2 → 25027.7 = +1.2%、3/6 勝ち ---
+# 静的経路は `timeout()` を 1 度も通らないため恩恵は無く、新設の per-loop `has_timers()`
+# チェックぶんの退行が出るならここに出る。**3/6 勝ち・値が完全に交互＝ノイズと区別できず、
+# 退行なしと判定**（P(new>base)=0.72）。
+veil_glibc_prefix	h2c_file_54576B	h2c	1	24787.32	NA	NA	NA	0	NA	NA
+veil_glibc_head	h2c_file_54576B	h2c	1	25830.70	NA	NA	NA	0	NA	NA
+veil_glibc_head	h2c_file_54576B	h2c	2	25105.93	NA	NA	NA	0	NA	NA
+veil_glibc_prefix	h2c_file_54576B	h2c	2	24617.23	NA	NA	NA	0	NA	NA
+veil_glibc_prefix	h2c_file_54576B	h2c	3	25057.79	NA	NA	NA	0	NA	NA
+veil_glibc_head	h2c_file_54576B	h2c	3	24871.17	NA	NA	NA	0	NA	NA
+veil_glibc_head	h2c_file_54576B	h2c	4	24156.06	NA	NA	NA	0	NA	NA
+veil_glibc_prefix	h2c_file_54576B	h2c	4	24501.61	NA	NA	NA	0	NA	NA
+veil_glibc_prefix	h2c_file_54576B	h2c	5	24663.18	NA	NA	NA	0	NA	NA
+veil_glibc_head	h2c_file_54576B	h2c	5	25878.38	NA	NA	NA	0	NA	NA
+veil_glibc_head	h2c_file_54576B	h2c	6	24949.54	NA	NA	NA	0	NA	NA
+veil_glibc_prefix	h2c_file_54576B	h2c	6	25014.68	NA	NA	NA	0	NA	NA
