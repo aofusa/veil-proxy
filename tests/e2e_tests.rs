@@ -59,9 +59,14 @@ use rustls::crypto::CryptoProvider;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection};
 
-// 参照元は grpc（LPM ヘルパ）と grpc-web（gRPC-Web 形式テスト）の双方。
-// どちらも無効な構成（既定 feature 等）では未使用インポート警告になるため cfg する。
-#[cfg(any(feature = "grpc", feature = "grpc-web"))]
+// 参照元は LPM ヘルパ（`grpc` かつ HTTP/2 か HTTP/3 が有効なときだけ存在する）と
+// gRPC-Web 形式テスト（`grpc-web`）の双方。参照元と同じ条件で cfg しないと、
+// `--no-default-features --features grpc` のように「grpc だけで HTTP/2・HTTP/3 が無い」
+// 構成で未使用インポート警告になる。
+#[cfg(any(
+    all(feature = "grpc", any(feature = "http2", feature = "http3")),
+    feature = "grpc-web"
+))]
 use common::grpc_client::GrpcFrame;
 
 // 新しい非同期テストクライアント（hyper + tokio）
@@ -94,13 +99,19 @@ fn encode_simple_request(msg: &str) -> Vec<u8> {
 }
 
 /// gRPC LPM（Length-Prefixed Message）を組み立てる。F-92/F-93/F-112 gRPC 詳細 E2E 専用。
-#[cfg(feature = "grpc")]
+///
+/// 呼び出し側のテストはいずれも `grpc` に加えて `http2` か `http3` を要求する
+/// （gRPC は HTTP/2 か HTTP/3 の上でしか流れない）。cfg を `grpc` だけにすると
+/// `--no-default-features --features grpc` で未使用となり dead_code 警告が出る。
+#[cfg(all(feature = "grpc", any(feature = "http2", feature = "http3")))]
 fn encode_grpc_lpm(message: &[u8]) -> Vec<u8> {
     GrpcFrame::new(message.to_vec()).encode()
 }
 
 /// ボディから複数 gRPC LPM を順に抽出。F-92/F-93 gRPC 詳細 E2E 専用。
-#[cfg(feature = "grpc")]
+///
+/// cfg を `grpc` だけにしない理由は [`encode_grpc_lpm`] と同じ。
+#[cfg(all(feature = "grpc", any(feature = "http2", feature = "http3")))]
 fn decode_all_grpc_frames(body: &[u8]) -> Vec<GrpcFrame> {
     let mut frames = Vec::new();
     let mut offset = 0usize;
