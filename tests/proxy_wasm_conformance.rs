@@ -886,22 +886,26 @@ async fn known_gap_grpc_call_execution_loop() {
     // 存在しなかった（呼び出し元からは成功したように見えるのに
     // proxy_on_grpc_receive*/proxy_on_grpc_close が永遠に呼ばれない）。
     //
-    // 本チケットで実行ループを実装した（src/wasm/host/grpc_executor.rs の
-    // ブロッキング gRPC-over-h2c ユーナリークライアント + src/server.rs の
-    // WASM tick スレッドでの実行・配送）。ネットワーク越しの実行確認は
+    // F-134 で実行ループを実装し、**F-139 で残課題（真の逐次双方向ストリーミング・
+    // 接続プーリング・ノンブロッキング化）も解消した**（src/wasm/host/grpc_executor.rs の
+    // GrpcRunner/ActiveCall 状態機械 + src/wasm/host/grpc_pool.rs の接続プール +
+    // src/server.rs の専用 gRPC 実行スレッド）。ネットワーク越しの実行確認は
     // E2E（コーディネーターが実行）に委ねるため、ここではレジストリの
-    // 登録・キャンセル・取り出しの単体テストで代替する
-    // （`src/wasm/host/grpc_executor.rs` の `test_pending_grpc_call_registry_roundtrip`）。
+    // 登録・キャンセル・取り出しと状態機械の単体テストで代替する
+    // （`src/wasm/host/grpc_executor.rs` の `test_pending_grpc_call_registry_roundtrip` /
+    // `test_pending_grpc_send_registered_immediately` / `test_active_call_deadline_exceeded`、
+    // `src/wasm/host/grpc_pool.rs` の `test_pool_checkout_checkin_hits`）。
     record(
         "既知の不適合: proxy_grpc_call 系の実行ループ欠如",
         Conformance::Partial,
-        "F-134 で実行ループを実装（src/wasm/host/grpc_executor.rs + src/server.rs）。\
-         ユーナリー呼び出し（proxy_grpc_call）と、ストリームを half-close した時点で \
-         蓄積メッセージをまとめて送出するクライアントストリーミング簡略版（proxy_grpc_stream + \
-         proxy_grpc_send）、TLS 上流（execute_grpc_unary_call の use_tls、\
-         proxy_http_call と同じ rustls 経路）を実装。真の逐次双方向ストリーミング・\
-         接続プーリングは未対応（理由: \
-         docs/backlog/features/F-139-wasm-grpc-call-execution.md）。\
+        "F-134 で実行ループを実装し、F-139 で残課題を解消した。\
+         proxy_grpc_send はメッセージごとに即時送出され（half-close 待ちの蓄積を廃止）、\
+         サーバーからのメッセージは到着ごとに proxy_on_grpc_receive へ配送される。\
+         上流 (host, port, tls) ごとの HTTP/2 接続プール（1 接続 1 アクティブストリーム）で \
+         呼び出しごとの TCP+TLS ハンドシェイクを排除し、専用実行スレッド上の \
+         ノンブロッキング状態機械で複数呼び出しを並行して進める。\
+         残る制約: 接続プールミス時の新規 TCP connect / TLS ハンドシェイクのみ同期実行\
+         （データプレーンには影響しない。理由は grpc_executor.rs の doc コメント）。\
          ネットワークを伴う E2E 確認は未実施（コーディネーターが実行予定）。",
     );
 }

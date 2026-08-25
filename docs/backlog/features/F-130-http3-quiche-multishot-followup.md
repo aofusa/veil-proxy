@@ -1,6 +1,20 @@
 # F-130: HTTP/3 quiche / io_uring 受信の後続 + UDP/HTTP3 極限 io_uring 化（F-129 引き継ぎ）
 
-**ステータス: 未着手（引き継ぎ用・2026-07-19 時点の現状固定、§14 は同日追記）**  
+**ステータス: 完了（C1+C3）／C2 は実装済みだが既定オプトイン（2026-08-25 追記）**
+
+> **2026-08-25 追記（C2）**: 真の `IORING_RECV_MULTISHOT` + provided buffer ring を実装した
+> （`ring.rs`: `IORING_REGISTER_PBUF_RING`/`UNREGISTER` と ABI 構造体・`register_buf_ring`、
+> `udp_recv.rs`: `MultishotUdpRecv` と C1/C2 共通インタフェース `UdpRecvBackend`）。
+> SQE オペコードの許可リスト（`PROXY_ALLOWED_OPCODES`）は変更せず、`apply_restrictions` に
+> **register op の許可だけ**追加している。
+> **ただし既定は C1 のままで、`VEIL_H3_BUFRING=1` を指定したときだけ C2 を試みる。**
+> 理由: 検証機の Linux 6.8.0-137-generic は `IORING_REGISTER_PBUF_RING` を
+> （クリーンなリング・liburing 経由・`IOU_PBUF_RING_MMAP` の有無を問わず）`-EINVAL` で拒否し、
+> multishot 受信のハッピーパス（複数 CQE の drain・バッファ返却・GRO / 切り詰め処理）を
+> 実機で 1 度も動かせていない（検証は純関数の単体テストのみ）。交互 A/B も取れていないため、
+> 検証していない経路を既定で本番に流さない方針とした。オプトイン時も登録・アーム失敗時は
+> 自動的に C1 へフォールバックする。**PBUF_RING が使えるカーネルでの E2E と交互 A/B が
+> 今後の受け入れ条件**である。  
 **優先度: P1**  
 **親・前提: [F-129](F-129-http3-quiche-cc-multishot.md)（完了・部分達成）**  
 **ブランチ参考: `feat/http3-quiche`（base 付近 `5b55ec8` から F-129 コミット群）**  

@@ -33,7 +33,7 @@
 #![cfg(feature = "http3")]
 
 use crate::runtime::handle::AsRawFd;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::io;
 use std::rc::Rc;
@@ -79,7 +79,11 @@ pub(crate) type ConnKey = Rc<quiche::ConnectionId<'static>>;
 /// ダーティ化する（従来は 1 本の `H3Notify` で起こすだけで「どの接続が進んだか」が
 /// 分からず全接続を駆動していた）。`Rc<RefCell<..>>` は本クレートの `ConnectionMap` と
 /// 同じ単一スレッド・ロックフリー方針。
-pub(crate) type WakeQueue = Rc<RefCell<VecDeque<ConnKey>>>;
+///
+/// F-161: 要素は `(ConnKey, Rc<Cell<bool>>)`。第 2 要素は当該接続の `ConnWaker::queued`
+/// フラグ（全クローンで共有）で、drain 時に `false` へ戻すことでコアレッシングする
+/// （詳細は [`ConnWaker`] のドキュメントを参照）。
+pub(crate) type WakeQueue = Rc<RefCell<VecDeque<(ConnKey, Rc<Cell<bool>>)>>>;
 
 /// バックエンドタスク → メインループの起床通知を per-connection 化したラッパー（F-151）。
 ///
@@ -87,6 +91,11 @@ pub(crate) type WakeQueue = Rc<RefCell<VecDeque<ConnKey>>>;
 /// 引き続き 1 本の Notify で行う）。`notify()` を呼ぶ**前**に自 cid を [`WakeQueue`] へ
 /// push することで、メインループがどの接続の何が進んだかを知り、全接続ではなく
 /// 起こされた接続だけをダーティ化できるようにする。
+///
+/// F-161: レスポンスボディのチャンクごとに `notify()` が呼ばれるが、メインループが
+/// drain するまでは 2 回目以降の push は完全な無駄（`mark_dirty` は `dirty` フラグにより
+/// 2 回目以降は何もしない）。`queued`（接続ごとに共有する `Rc<Cell<bool>>`）で
+/// 「既に `wake_queue` へ自 cid を積んである」ことを表し、積んである間は push を省く。
 #[derive(Clone)]
 pub(crate) struct ConnWaker {
     /// 自接続の ID（`ConnectionMap` のキーと同じ値を指す `Rc` ハンドル）。
@@ -95,6 +104,9 @@ pub(crate) struct ConnWaker {
     wake_queue: WakeQueue,
     /// メインループの select を起こす実体。
     notify: H3Notify,
+    /// F-161: 既に `wake_queue` へ自 cid を積んであるか（接続内の全クローンで共有）。
+    /// メインループが drain するときに false へ戻す。
+    queued: Rc<Cell<bool>>,
 }
 
 impl ConnWaker {
@@ -103,6 +115,7 @@ impl ConnWaker {
             cid,
             wake_queue,
             notify,
+            queued: Rc::new(Cell::new(false)),
         }
     }
 
@@ -112,8 +125,17 @@ impl ConnWaker {
     /// `self.cid.clone()`（`Rc::clone`）は参照カウント +1 のみで malloc を伴わない
     /// （`ConnKey` の意図どおり）。レスポンスボディのチャンクごとに呼ばれ得るホットパスの
     /// ため、ここで `ConnectionId` のディープコピーが発生しないことが重要。
+    ///
+    /// F-161: `queued` が既に `true` なら（前回の notify がまだ drain されていなければ）
+    /// push を省く。`Cell::replace` で読み取りと設定を 1 操作にし、二重 push を防ぐ。
+    /// `H3Notify::notify()` 自体は内部で bool コアレッシング済みのため常に呼んでよい
+    /// （安価）。
     pub(crate) fn notify(&self) {
-        self.wake_queue.borrow_mut().push_back(self.cid.clone());
+        if !self.queued.replace(true) {
+            self.wake_queue
+                .borrow_mut()
+                .push_back((self.cid.clone(), self.queued.clone()));
+        }
         self.notify.notify();
     }
 }
@@ -1404,5 +1426,28 @@ mod tests {
         let parsed = parse_response_headers(h);
         assert!(matches!(parsed.framing, Framing::Eof));
         assert_eq!(parsed.content_length, None);
+    }
+
+    // F-161: 同一 ConnWaker から複数回 notify() してもキュー長が 1（コアレッシング）。
+    #[test]
+    fn conn_waker_notify_coalesces_until_drained() {
+        let wake_queue: WakeQueue = Rc::new(RefCell::new(VecDeque::new()));
+        let notify = H3Notify::new();
+        let cid: ConnKey = Rc::new(quiche::ConnectionId::from_ref(&[1, 2, 3]).into_owned());
+        let waker = ConnWaker::new(cid, wake_queue.clone(), notify);
+
+        // 3 回 notify() してもキューには 1 エントリしか積まれない。
+        waker.notify();
+        waker.notify();
+        waker.notify();
+        assert_eq!(wake_queue.borrow().len(), 1);
+
+        // drain（pop → flag=false）を模してから再度 notify() すると再びキューへ積まれる。
+        let (_, queued) = wake_queue.borrow_mut().pop_front().expect("1 entry");
+        queued.set(false);
+        assert!(wake_queue.borrow().is_empty());
+
+        waker.notify();
+        assert_eq!(wake_queue.borrow().len(), 1);
     }
 }

@@ -634,115 +634,75 @@ pub fn spawn_wasm_tick_thread() {
                     ));
                 }
 
-                // F-134: pending gRPC 呼び出し（proxy_grpc_call / proxy_grpc_stream +
-                // proxy_grpc_send(end_of_stream) が登録した分）の実行。
-                // 従来は登録するだけで実行ループが存在せず、proxy_on_grpc_receive*/
-                // proxy_on_grpc_close が永遠に呼ばれない不適合だった。HTTP call と
-                // 同じ tick スレッド（cold path）上でブロッキング gRPC-over-h2c
-                // ユーナリー呼び出しを実行する。
-                #[cfg(feature = "grpc")]
-                {
-                    let pending_grpc_calls =
-                        crate::wasm::host::grpc_executor::take_global_pending_grpc_calls();
-                    for pending in pending_grpc_calls {
-                        let upstream_name = &pending.upstream;
+                // F-139: pending gRPC 呼び出しの実行は専用スレッド
+                // （`spawn_wasm_grpc_thread`）へ一本化した。tick スレッド
+                // （100ms 固定周期）で状態機械を駆動すると 1 ステップ 100ms に
+                // なり、F-134 時点の「1 呼び出し 1 ブロッキング完結」より
+                // レイテンシが悪化してしまうため、条件変数 / poll(2) 駆動の
+                // 別スレッドに分離した。詳細は
+                // `docs/artifacts/f139_wasm_grpc_nonblocking_design.md`。
+            }
+        }
+    });
+}
 
-                        debug!(
-                            "[wasm:grpc_call] Processing pending call: module='{}' call_id={} upstream='{}'",
-                            pending.module_name, pending.call_id, upstream_name
-                        );
+/// F-139: 専用 gRPC 実行スレッド。
+///
+/// WASM tick スレッド（100ms 固定周期）とは別に 1 本立て、gRPC 呼び出しの状態機械
+/// （`crate::wasm::host::grpc_executor::GrpcRunner`）を条件変数 / poll(2) 駆動で
+/// 進める。アクティブな呼び出しが無ければ新規登録があるまで条件変数で待ち
+/// （ビジースピン禁止）、アクティブな呼び出しがあれば poll(2) で
+/// 「いずれかのソケットが読み書き可能 or 最短デッドライン」まで待つ
+/// （`GrpcRunner::poll_all` 内部）。
+///
+/// **ホットパス絶対規則との関係**: この処理はデータプレーン（io_uring イベント
+/// ループ）とは完全に別のバックグラウンド専用スレッド上でのみ実行される。
+/// したがってブロッキング `poll(2)` / 同期 I/O を使ってよい。
+// `wasm` と `grpc` の**両方**が必要（本体が `crate::wasm` のレジストリ・エンジンを参照するため）。
+// `--features grpc` 単独ビルドでも壊れないよう、呼び出し側（`entry.rs`）と同じ条件で切る。
+#[cfg(all(feature = "wasm", feature = "grpc"))]
+// 理由付き allow: 専用 gRPC 実行スレッド上の待機（イベントループ外）。
+#[allow(clippy::disallowed_methods)]
+pub fn spawn_wasm_grpc_thread() {
+    thread::spawn(move || {
+        info!("WASM gRPC executor thread started");
 
-                        let upstream_groups = &config.upstream_groups;
-                        let (
-                            status_code,
-                            status_message,
-                            initial_metadata,
-                            message,
-                            trailing_metadata,
-                        ) = if let Some(group) = upstream_groups.get(upstream_name) {
-                            if let Some(server) = group.select("0.0.0.0") {
-                                let host = server.host();
-                                let port = server.port();
-                                // F-134 フォローアップ: HTTP call と同じ
-                                // `server.use_tls()` を使い、gRPC 上流も TLS
-                                // （h2, ALPN "h2"）へ接続できるようにする。
-                                let use_tls = server.use_tls();
-                                match crate::wasm::host::grpc_executor::execute_grpc_unary_call(
-                                    host,
-                                    port,
-                                    use_tls,
-                                    &pending.path,
-                                    &pending.initial_metadata,
-                                    &pending.messages,
-                                    pending.timeout_ms,
-                                ) {
-                                    Ok(result) => (
-                                        result.status_code,
-                                        result.status_message,
-                                        result.initial_metadata,
-                                        result.message,
-                                        result.trailing_metadata,
-                                    ),
-                                    Err(e) => {
-                                        warn!(
-                                            "[wasm:grpc_call] call to '{}' failed: {}",
-                                            upstream_name, e
-                                        );
-                                        (
-                                            crate::wasm::grpc_status::UNAVAILABLE,
-                                            format!("gRPC call failed: {e}"),
-                                            Vec::new(),
-                                            Vec::new(),
-                                            Vec::new(),
-                                        )
-                                    }
-                                }
-                            } else {
-                                warn!(
-                                        "[wasm:grpc_call] No healthy servers in upstream '{}' for module '{}'",
-                                        upstream_name, pending.module_name
-                                    );
-                                (
-                                    crate::wasm::grpc_status::UNAVAILABLE,
-                                    "No healthy upstream servers available".to_string(),
-                                    Vec::new(),
-                                    Vec::new(),
-                                    Vec::new(),
-                                )
-                            }
-                        } else {
-                            warn!(
-                                "[wasm:grpc_call] Upstream '{}' not found for module '{}'",
-                                upstream_name, pending.module_name
-                            );
-                            (
-                                crate::wasm::grpc_status::UNIMPLEMENTED,
-                                format!("Upstream '{upstream_name}' not found"),
-                                Vec::new(),
-                                Vec::new(),
-                                Vec::new(),
-                            )
-                        };
+        let mut runner = crate::wasm::host::grpc_executor::GrpcRunner::new();
 
-                        let mut trailing = trailing_metadata;
-                        trailing.push(("grpc-status".to_string(), status_code.to_string()));
-                        if !status_message.is_empty() {
-                            trailing.push(("grpc-message".to_string(), status_message));
-                        }
+        loop {
+            if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
+                info!("WASM gRPC executor thread shutting down");
+                break;
+            }
 
-                        crate::wasm::process_grpc_response(
-                            wasm_engine,
-                            crate::wasm::GrpcCallResponse {
-                                module_name: pending.module_name,
-                                call_id: pending.call_id,
-                                status_code,
-                                initial_metadata,
-                                message,
-                                trailing_metadata: trailing,
-                            },
-                        );
-                    }
-                }
+            // 新規登録（呼び出し開始・逐次送出・キャンセル）を取り込む。
+            let new_calls = crate::wasm::host::grpc_executor::take_global_pending_grpc_calls();
+            let new_sends = crate::wasm::host::grpc_executor::take_global_pending_grpc_sends();
+            let cancels = crate::wasm::host::grpc_executor::take_global_pending_grpc_cancels();
+
+            let config = CURRENT_CONFIG.load();
+            let Some(ref wasm_engine) = config.wasm_filter_engine else {
+                // WASM 未設定なら本来登録も発生しないはずだが、念のため待機する。
+                crate::wasm::host::grpc_executor::wait_for_grpc_work();
+                continue;
+            };
+
+            let ingest_events =
+                runner.ingest(new_calls, new_sends, cancels, &config.upstream_groups);
+            for ev in ingest_events {
+                crate::wasm::host::grpc_executor::deliver_event(wasm_engine, ev);
+            }
+
+            if !runner.has_active_calls() {
+                // アクティブな呼び出しが無い間は条件変数で待つ（ビジースピン禁止）。
+                crate::wasm::host::grpc_executor::wait_for_grpc_work();
+                continue;
+            }
+
+            // アクティブな呼び出しがある間は poll(2) で駆動する。
+            let events = runner.poll_all();
+            for ev in events {
+                crate::wasm::host::grpc_executor::deliver_event(wasm_engine, ev);
             }
         }
     });

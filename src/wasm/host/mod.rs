@@ -5,9 +5,15 @@
 pub(crate) mod abi;
 mod buffers;
 mod foreign;
-mod grpc;
+// F-160: GrpcMetadataBlob/GrpcMetadataIter を grpc_executor.rs・context.rs から
+// 参照できるよう pub(crate) にする（従来はホスト関数登録のみで完結していた）。
+pub(crate) mod grpc;
 #[cfg(feature = "grpc")]
 pub mod grpc_executor;
+#[cfg(feature = "grpc")]
+mod grpc_pool;
+#[cfg(feature = "grpc")]
+mod grpc_tls;
 mod headers;
 mod http_call;
 mod logging;

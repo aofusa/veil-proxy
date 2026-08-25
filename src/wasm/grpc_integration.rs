@@ -5,6 +5,9 @@
 
 use std::sync::Arc;
 
+#[cfg(feature = "grpc")]
+use bytes::Bytes;
+
 use super::engine::FilterEngine;
 
 /// gRPC call response data
@@ -17,12 +20,12 @@ pub struct GrpcCallResponse {
     pub call_id: u32,
     /// gRPC status code (0 = OK)
     pub status_code: i32,
-    /// Initial metadata from the server
-    pub initial_metadata: Vec<(String, String)>,
+    /// Initial metadata from the server（F-160: `Bytes` で保持）
+    pub initial_metadata: Vec<(Bytes, Bytes)>,
     /// Response message bytes
-    pub message: Vec<u8>,
-    /// Trailing metadata from the server
-    pub trailing_metadata: Vec<(String, String)>,
+    pub message: Bytes,
+    /// Trailing metadata from the server（F-160: `Bytes` で保持）
+    pub trailing_metadata: Vec<(Bytes, Bytes)>,
 }
 
 /// Notify a WASM module of gRPC initial metadata
@@ -33,7 +36,7 @@ pub fn on_grpc_initial_metadata(
     engine: &Arc<FilterEngine>,
     module_name: &str,
     call_id: u32,
-    headers: &[(String, String)],
+    headers: &[(Bytes, Bytes)],
 ) {
     futures::executor::block_on(engine.on_grpc_receive_initial_metadata(
         module_name,
@@ -63,7 +66,7 @@ pub fn on_grpc_trailing_metadata(
     engine: &Arc<FilterEngine>,
     module_name: &str,
     call_id: u32,
-    trailers: &[(String, String)],
+    trailers: &[(Bytes, Bytes)],
 ) {
     futures::executor::block_on(engine.on_grpc_receive_trailing_metadata(
         module_name,
@@ -182,9 +185,12 @@ mod tests {
             module_name: "grpc_module".to_string(),
             call_id: 1,
             status_code: status::OK,
-            initial_metadata: vec![("content-type".to_string(), "application/grpc".to_string())],
-            message: b"response data".to_vec(),
-            trailing_metadata: vec![("grpc-status".to_string(), "0".to_string())],
+            initial_metadata: vec![(
+                Bytes::from_static(b"content-type"),
+                Bytes::from_static(b"application/grpc"),
+            )],
+            message: Bytes::from_static(b"response data"),
+            trailing_metadata: vec![(Bytes::from_static(b"grpc-status"), Bytes::from_static(b"0"))],
         };
 
         assert_eq!(response.module_name, "grpc_module");

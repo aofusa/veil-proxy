@@ -4,6 +4,8 @@
 //! When `grpc` feature is enabled, provides actual gRPC call support.
 //! Otherwise returns UNIMPLEMENTED.
 
+#[cfg(feature = "grpc")]
+use bytes::Bytes;
 use wasmtime::{Caller, Linker};
 
 use crate::wasm::constants::*;
@@ -296,13 +298,16 @@ fn proxy_grpc_call_impl(
     };
 
     // Read initial metadata (optional)
+    // F-160: メタデータはペアごとの String への展開をせず、ゲストメモリから
+    // 読み出した直列化バイト列をそのまま `Bytes` として保持する（ホットパスの
+    // アロケーションをブロブ 1 回分に抑える）。
     let initial_metadata = if initial_metadata_size > 0 {
         match read_wasm_memory(caller, initial_metadata_ptr, initial_metadata_size) {
-            Some(bytes) => deserialize_grpc_metadata(&bytes),
+            Some(bytes) => GrpcMetadataBlob::new(Bytes::from(bytes)),
             None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
         }
     } else {
-        Vec::new()
+        GrpcMetadataBlob::empty()
     };
 
     // Read message
@@ -313,6 +318,10 @@ fn proxy_grpc_call_impl(
             return PROXY_RESULT_INVALID_MEMORY_ACCESS;
         }
     };
+    // F-160: `Vec<u8>` を 1 度だけ `Bytes` に変換する。以降 `register_grpc_call` と
+    // グローバルレジストリの両方へ渡す際の `clone()` は参照カウント +1 のみで、
+    // メッセージ本体のディープコピーは発生しない。
+    let message = Bytes::from(message);
 
     ftlog::info!(
         "WASM: proxy_grpc_call - upstream={}, service={}, method={}, message_size={}, timeout_ms={}",
@@ -458,13 +467,14 @@ fn proxy_grpc_stream_impl(
     };
 
     // Read initial metadata (optional)
+    // F-160: proxy_grpc_call と同様、直列化バイト列のまま `Bytes` で保持する。
     let initial_metadata = if initial_metadata_size > 0 {
         match read_wasm_memory(caller, initial_metadata_ptr, initial_metadata_size) {
-            Some(bytes) => deserialize_grpc_metadata(&bytes),
+            Some(bytes) => GrpcMetadataBlob::new(Bytes::from(bytes)),
             None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
         }
     } else {
-        Vec::new()
+        GrpcMetadataBlob::empty()
     };
 
     // Allocate stream ID
@@ -479,7 +489,6 @@ fn proxy_grpc_stream_impl(
         service: service.clone(),
         method: method.clone(),
         state: GrpcStreamState::Open,
-        pending_messages: Vec::new(),
         initial_metadata,
     };
 
@@ -545,13 +554,15 @@ fn proxy_grpc_send_impl(
     use crate::wasm::context::GrpcStreamState;
 
     // Read message data
+    // F-139: メッセージは `Bytes` のまま逐次グローバル送信キューへ積む
+    // （蓄積してから一括送出する従来方式は廃止、下記コメント参照）。
     let message = if message_size > 0 {
         match read_wasm_memory(caller, message_ptr, message_size) {
-            Some(bytes) => bytes,
+            Some(bytes) => Bytes::from(bytes),
             None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
         }
     } else {
-        Vec::new()
+        Bytes::new()
     };
 
     let module_name = caller.data().http_ctx.plugin_name.clone();
@@ -568,36 +579,32 @@ fn proxy_grpc_send_impl(
             return PROXY_RESULT_BAD_ARGUMENT;
         }
 
-        // Queue the message
-        if !message.is_empty() {
-            stream.pending_messages.push(message);
-        }
+        // F-139: 逐次送出。従来（F-134）はメッセージを `pending_messages` へ溜め、
+        // half-close 時にまとめて 1 回だけグローバルレジストリへ登録していた
+        // （真の逐次双方向ストリーミングではなく、クライアントストリーミングの
+        // 簡略実装だった）。ここではメッセージ 1 件ごとに即座に
+        // `GLOBAL_PENDING_GRPC_SENDS` へ登録し、gRPC 実行スレッド
+        // （`src/server.rs::spawn_wasm_grpc_thread`）が対応する `ActiveCall` の
+        // outbox へ push する。対応する呼び出しがまだ実行スレッド側に存在しない
+        // （`proxy_grpc_stream` 直後の最初の送出）場合は、実行スレッドが接続確立に
+        // 必要な情報（upstream/path/initial_metadata）からその場で作成する。
+        let path = format!("/{}/{}", stream.service, stream.method);
+        super::grpc_executor::register_global_pending_grpc_send(
+            super::grpc_executor::PendingGrpcSend {
+                module_name,
+                call_id: stream_id_u32,
+                upstream: stream.upstream.clone(),
+                path,
+                initial_metadata: stream.initial_metadata.clone(),
+                // gRPC ストリームには proxy_grpc_call の timeout_ms 相当の
+                // パラメータが ABI に無いため、既定値を用いる。
+                timeout_ms: 30_000,
+                message,
+                end_of_stream: end_of_stream != 0,
+            },
+        );
 
-        // Handle end of stream
-        //
-        // F-134: 従来はローカル状態を HalfClosed にするだけで、実際に
-        // ネットワークへ何も送出しないまま黙って終わっていた（呼び出し元からは
-        // 成功したように見えるのに proxy_on_grpc_receive/proxy_on_grpc_close が
-        // 永遠に呼ばれない不適合）。ここでゲストが送信した全メッセージを
-        // まとめてグローバルレジストリへ登録し、tick スレッドが 1 回の
-        // HTTP/2 ストリームとして送出する（真の逐次双方向ストリーミングでは
-        // ないクライアントストリーミングの簡略実装。理由・制限は
-        // docs/backlog/features/F-139-wasm-grpc-call-execution.md 参照）。
         if end_of_stream != 0 {
-            let path = format!("/{}/{}", stream.service, stream.method);
-            super::grpc_executor::register_global_pending_grpc_call(
-                super::grpc_executor::PendingGrpcUnaryCall {
-                    module_name,
-                    call_id: stream_id_u32,
-                    upstream: stream.upstream.clone(),
-                    path,
-                    initial_metadata: stream.initial_metadata.clone(),
-                    messages: stream.pending_messages.clone(),
-                    // gRPC ストリームには proxy_grpc_call の timeout_ms 相当の
-                    // パラメータが ABI に無いため、既定値を用いる。
-                    timeout_ms: 30_000,
-                },
-            );
             stream.state = GrpcStreamState::HalfClosed;
             ftlog::debug!(
                 "WASM: proxy_grpc_send - stream_id={} half-closed, queued for execution",
@@ -617,46 +624,194 @@ fn proxy_grpc_send_impl(
     }
 }
 
-/// Deserialize gRPC metadata from Proxy-Wasm format
+/// F-160: ゲストが `proxy_grpc_call`/`proxy_grpc_stream` に渡した直列化メタデータの
+/// バイト列をコピーせずそのまま保持する newtype。
+///
+/// 従来の `deserialize_grpc_metadata`（本ファイル末尾のテスト参照実装）はメタデータ
+/// 1 ペアにつき `String` を 2 個確保していたが、これはホットパス（データプレーンの
+/// ワーカースレッド上で動く `proxy_grpc_call` 等の実行経路）で毎回発生していた。
+/// `Bytes` は参照カウント方式のため、スレッドをまたぐ移動や `clone()` は
+/// 参照カウントの増減のみで済み、バイト列自体の複製は発生しない。
 #[cfg(feature = "grpc")]
-fn deserialize_grpc_metadata(data: &[u8]) -> Vec<(String, String)> {
-    if data.len() < 4 {
-        return Vec::new();
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GrpcMetadataBlob(Bytes);
+
+#[cfg(feature = "grpc")]
+impl GrpcMetadataBlob {
+    /// ゲストメモリから読み出した直列化バイト列から構築する。
+    /// コピーは呼び出し元の `Bytes::from(Vec<u8>)`（ゲストメモリ読み出し時の
+    /// 1 回のみ）で完結し、ここでは追加のアロケーションを行わない。
+    pub(crate) fn new(data: Bytes) -> Self {
+        Self(data)
     }
 
-    let num_pairs = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    let mut metadata = Vec::with_capacity(num_pairs);
-    let mut pos = 4;
-
-    for _ in 0..num_pairs {
-        if pos + 4 > data.len() {
-            break;
-        }
-        let key_len =
-            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-        pos += 4;
-
-        if pos + key_len > data.len() {
-            break;
-        }
-        let key = String::from_utf8_lossy(&data[pos..pos + key_len]).to_string();
-        pos += key_len;
-
-        if pos + 4 > data.len() {
-            break;
-        }
-        let val_len =
-            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-        pos += 4;
-
-        if pos + val_len > data.len() {
-            break;
-        }
-        let value = String::from_utf8_lossy(&data[pos..pos + val_len]).to_string();
-        pos += val_len;
-
-        metadata.push((key, value));
+    /// 空のメタデータ blob（initial_metadata_size == 0 の場合など）。
+    pub(crate) fn empty() -> Self {
+        Self(Bytes::new())
     }
 
-    metadata
+    /// 直列化バイト列をコピーせず走査するイテレータを返す。
+    pub(crate) fn iter(&self) -> GrpcMetadataIter<'_> {
+        GrpcMetadataIter::new(&self.0)
+    }
+}
+
+/// ゲストが渡した直列化メタデータをコピーせず走査するイテレータ（F-160）。
+///
+/// フォーマットは Proxy-Wasm の `u32 num_pairs` +
+/// `(u32 key_len, key, u32 val_len, value)*`（リトルエンディアン）。
+/// 返す `(&[u8], &[u8])` はバッキングストア（`GrpcMetadataBlob`）からの借用であり、
+/// 新たな確保を行わない。ゲスト由来の信頼できない入力のため、途中で切れた・
+/// 長さが不正な入力に対しては panic せず、その時点で走査を打ち切る
+/// （挙動は旧 `deserialize_grpc_metadata` と同じ）。
+#[cfg(feature = "grpc")]
+pub(crate) struct GrpcMetadataIter<'a> {
+    data: &'a [u8],
+    pos: usize,
+    remaining: usize,
+}
+
+#[cfg(feature = "grpc")]
+impl<'a> GrpcMetadataIter<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        if data.len() < 4 {
+            return Self {
+                data,
+                pos: 0,
+                remaining: 0,
+            };
+        }
+        let num_pairs = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        Self {
+            data,
+            pos: 4,
+            remaining: num_pairs,
+        }
+    }
+}
+
+#[cfg(feature = "grpc")]
+impl<'a> Iterator for GrpcMetadataIter<'a> {
+    type Item = (&'a [u8], &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        // 途中で打ち切る場合も無限ループにならないよう先に残り件数を減らす。
+        self.remaining -= 1;
+
+        let data = self.data;
+        if self.pos + 4 > data.len() {
+            self.remaining = 0;
+            return None;
+        }
+        let key_len = u32::from_le_bytes([
+            data[self.pos],
+            data[self.pos + 1],
+            data[self.pos + 2],
+            data[self.pos + 3],
+        ]) as usize;
+        self.pos += 4;
+
+        if self.pos + key_len > data.len() {
+            self.remaining = 0;
+            return None;
+        }
+        let key = &data[self.pos..self.pos + key_len];
+        self.pos += key_len;
+
+        if self.pos + 4 > data.len() {
+            self.remaining = 0;
+            return None;
+        }
+        let val_len = u32::from_le_bytes([
+            data[self.pos],
+            data[self.pos + 1],
+            data[self.pos + 2],
+            data[self.pos + 3],
+        ]) as usize;
+        self.pos += 4;
+
+        if self.pos + val_len > data.len() {
+            self.remaining = 0;
+            return None;
+        }
+        let value = &data[self.pos..self.pos + val_len];
+        self.pos += val_len;
+
+        Some((key, value))
+    }
+}
+
+#[cfg(all(test, feature = "grpc"))]
+mod tests {
+    use super::*;
+
+    /// Proxy-Wasm 直列化フォーマットでメタデータをエンコードするテスト用ヘルパー。
+    fn encode_metadata(pairs: &[(&[u8], &[u8])]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(pairs.len() as u32).to_le_bytes());
+        for (k, v) in pairs {
+            buf.extend_from_slice(&(k.len() as u32).to_le_bytes());
+            buf.extend_from_slice(k);
+            buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            buf.extend_from_slice(v);
+        }
+        buf
+    }
+
+    /// (a) 正常な入力を正しく走査できること。
+    #[test]
+    fn test_grpc_metadata_iter_valid_input() {
+        let raw = encode_metadata(&[
+            (b"authorization", b"Bearer token"),
+            (b"x-request-id", b"abc-123"),
+        ]);
+        let blob = GrpcMetadataBlob::new(Bytes::from(raw));
+        let pairs: Vec<(&[u8], &[u8])> = blob.iter().collect();
+        assert_eq!(
+            pairs,
+            vec![
+                (&b"authorization"[..], &b"Bearer token"[..]),
+                (&b"x-request-id"[..], &b"abc-123"[..]),
+            ]
+        );
+    }
+
+    /// (b) 途中で切れた入力・不正な長さでも panic せず走査を打ち切ること。
+    #[test]
+    fn test_grpc_metadata_iter_truncated_input_does_not_panic() {
+        // num_pairs だけあって本体が無い
+        let mut raw = 3u32.to_le_bytes().to_vec();
+        let blob = GrpcMetadataBlob::new(Bytes::from(raw.clone()));
+        assert_eq!(blob.iter().count(), 0);
+
+        // 1 ペア目の key_len だけあって key 本体が無い（不正な長さ）
+        raw = 1u32.to_le_bytes().to_vec();
+        raw.extend_from_slice(&100u32.to_le_bytes()); // key_len=100 だが実データなし
+        let blob = GrpcMetadataBlob::new(Bytes::from(raw));
+        assert_eq!(blob.iter().count(), 0);
+
+        // 1 ペア目は正常、2 ペア目の途中で切れている
+        let mut raw = encode_metadata(&[(b"k1", b"v1")]);
+        raw[0..4].copy_from_slice(&2u32.to_le_bytes()); // num_pairs を偽って 2 に書き換え
+        let blob = GrpcMetadataBlob::new(Bytes::from(raw));
+        let pairs: Vec<(&[u8], &[u8])> = blob.iter().collect();
+        assert_eq!(pairs, vec![(&b"k1"[..], &b"v1"[..])]);
+
+        // 4 バイト未満（num_pairs すら読めない）
+        let blob = GrpcMetadataBlob::new(Bytes::from(vec![0u8, 1u8]));
+        assert_eq!(blob.iter().count(), 0);
+    }
+
+    /// (c) 空入力で空を返すこと。
+    #[test]
+    fn test_grpc_metadata_iter_empty_input() {
+        let blob = GrpcMetadataBlob::empty();
+        assert_eq!(blob.iter().count(), 0);
+
+        let blob = GrpcMetadataBlob::new(Bytes::from(encode_metadata(&[])));
+        assert_eq!(blob.iter().count(), 0);
+    }
 }

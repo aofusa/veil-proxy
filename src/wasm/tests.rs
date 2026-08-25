@@ -1293,8 +1293,7 @@ mod p3_grpc_callback_tests {
             service: "grpc.health.v1.Health".to_string(),
             method: "Check".to_string(),
             state: GrpcStreamState::Open,
-            pending_messages: vec![],
-            initial_metadata: vec![],
+            initial_metadata: crate::wasm::host::grpc::GrpcMetadataBlob::empty(),
         };
 
         assert_eq!(stream.stream_id, 1);
@@ -1311,14 +1310,14 @@ mod p3_grpc_callback_tests {
         ctx.register_grpc_call(
             call_id,
             "/grpc.health.v1.Health/Check".to_string(),
-            vec![0x0a, 0x00],
+            bytes::Bytes::from_static(&[0x0a, 0x00]),
             5000,
         );
 
         assert!(ctx.pending_grpc_calls.contains_key(&call_id));
         let (path, message, timeout) = ctx.pending_grpc_calls.get(&call_id).unwrap();
         assert_eq!(path, "/grpc.health.v1.Health/Check");
-        assert_eq!(message, &vec![0x0a, 0x00]);
+        assert_eq!(message.as_ref(), &[0x0a, 0x00]);
         assert_eq!(*timeout, 5000);
     }
 
@@ -1329,7 +1328,12 @@ mod p3_grpc_callback_tests {
         let mut ctx = HttpContext::new(1, caps);
 
         let call_id = ctx.next_grpc_call_id();
-        ctx.register_grpc_call(call_id, "/test.Service/Method".to_string(), vec![], 1000);
+        ctx.register_grpc_call(
+            call_id,
+            "/test.Service/Method".to_string(),
+            bytes::Bytes::new(),
+            1000,
+        );
 
         // Cancel the call
         let cancelled = ctx.cancel_grpc_call(call_id);
@@ -1393,8 +1397,18 @@ mod p3_grpc_callback_tests {
         let mut ctx = HttpContext::new(1, caps);
 
         // Register multiple calls
-        ctx.register_grpc_call(1, "/path1".to_string(), vec![1], 100);
-        ctx.register_grpc_call(2, "/path2".to_string(), vec![2], 200);
+        ctx.register_grpc_call(
+            1,
+            "/path1".to_string(),
+            bytes::Bytes::from_static(&[1]),
+            100,
+        );
+        ctx.register_grpc_call(
+            2,
+            "/path2".to_string(),
+            bytes::Bytes::from_static(&[2]),
+            200,
+        );
 
         assert_eq!(ctx.pending_grpc_calls.len(), 2);
 

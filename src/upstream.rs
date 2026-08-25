@@ -706,7 +706,7 @@ pub fn find_backend_unified(
     source_ip: &SocketAddr,
     routes: &[Route],
     upstream_groups: &Arc<HashMap<String, Arc<UpstreamGroup>>>,
-) -> Option<(Box<[u8]>, Backend, Arc<CompressionConfig>)> {
+) -> Option<(Arc<[u8]>, Backend, Arc<CompressionConfig>)> {
     // CURRENT_CONFIG から OptimizedRouter を取得
     let config = CURRENT_CONFIG.load();
     let optimized_router = &config.optimized_router;
@@ -737,8 +737,15 @@ pub fn find_backend_unified(
                 source_ip,
             ) {
                 if let Ok(backend) = load_backend(route, upstream_groups) {
-                    let prefix = extract_path_prefix(route);
-                    let compression = Arc::new(route.compression.clone().unwrap_or_default());
+                    // F-159: 解決済みなら Arc clone のみ（malloc なし）。
+                    let prefix = route
+                        .resolved_path_prefix
+                        .clone()
+                        .unwrap_or_else(|| extract_path_prefix_arc(route));
+                    let compression = route
+                        .resolved_compression
+                        .clone()
+                        .unwrap_or_else(|| Arc::new(route.compression.clone().unwrap_or_default()));
                     return Some((prefix, backend, compression));
                 }
             }
@@ -788,8 +795,14 @@ pub fn find_backend_unified(
                 );
                 match load_backend(route, upstream_groups) {
                     Ok(backend) => {
-                        let prefix = extract_path_prefix(route);
-                        let compression = Arc::new(route.compression.clone().unwrap_or_default());
+                        // F-159: 解決済みなら Arc clone のみ（malloc なし）。
+                        let prefix = route
+                            .resolved_path_prefix
+                            .clone()
+                            .unwrap_or_else(|| extract_path_prefix_arc(route));
+                        let compression = route.resolved_compression.clone().unwrap_or_else(|| {
+                            Arc::new(route.compression.clone().unwrap_or_default())
+                        });
                         // キャッシュに保存
                         optimized_router.cache_result(cache_key, Some(route_idx));
                         return Some((prefix, backend, compression));
@@ -836,6 +849,15 @@ pub(crate) fn extract_path_prefix(route: &Route) -> Box<[u8]> {
     } else {
         Box::new([])
     }
+}
+
+/// パスプレフィックスを抽出（`Arc<[u8]>` 版、F-159）。
+///
+/// 設定ロード時に `Route::resolved_path_prefix` を構築するために使う。ホットパスでは
+/// 呼ばれず、`route.resolved_path_prefix.clone()`（Arc 参照カウント増分のみ）を使う。
+#[inline]
+pub(crate) fn extract_path_prefix_arc(route: &Route) -> Arc<[u8]> {
+    extract_path_prefix(route).into()
 }
 
 /// 残りの条件（host/path/source_ip以外）のみをチェック
@@ -892,7 +914,7 @@ pub(crate) fn find_backend_linear(
     upstream_groups: &Arc<HashMap<String, Arc<UpstreamGroup>>>,
     cache_key: &routing::RouteCacheKey,
     optimized_router: &routing::OptimizedRouter,
-) -> Option<(Box<[u8]>, Backend, Arc<CompressionConfig>)> {
+) -> Option<(Arc<[u8]>, Backend, Arc<CompressionConfig>)> {
     // 配列の順序で評価（first-match）
     for (i, route) in routes.iter().enumerate() {
         let matched = matches_conditions(
@@ -912,8 +934,15 @@ pub(crate) fn find_backend_linear(
             );
             match load_backend(route, upstream_groups) {
                 Ok(backend) => {
-                    let prefix = extract_path_prefix(route);
-                    let compression = Arc::new(route.compression.clone().unwrap_or_default());
+                    // F-159: 解決済みなら Arc clone のみ（malloc なし）。
+                    let prefix = route
+                        .resolved_path_prefix
+                        .clone()
+                        .unwrap_or_else(|| extract_path_prefix_arc(route));
+                    let compression = route
+                        .resolved_compression
+                        .clone()
+                        .unwrap_or_else(|| Arc::new(route.compression.clone().unwrap_or_default()));
                     // キャッシュに保存
                     optimized_router.cache_result(*cache_key, Some(i));
                     return Some((prefix, backend, compression));

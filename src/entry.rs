@@ -502,6 +502,10 @@ pub fn run() {
     #[cfg(feature = "wasm")]
     spawn_wasm_tick_thread();
 
+    // F-139: WASM gRPC 呼び出し専用の実行スレッドを起動（tick スレッドとは分離）。
+    #[cfg(all(feature = "wasm", feature = "grpc"))]
+    spawn_wasm_grpc_thread();
+
     let mut handles = Vec::with_capacity(num_threads);
 
     // CPUアフィニティ設定のためのコアID取得

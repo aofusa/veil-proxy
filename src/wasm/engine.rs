@@ -1878,7 +1878,7 @@ impl FilterEngine {
         &self,
         module_name: &str,
         call_id: u32,
-        headers: &[(String, String)],
+        headers: &[(bytes::Bytes, bytes::Bytes)],
     ) {
         let module = match self.registry.get_module(module_name) {
             Some(m) => m,
@@ -1902,7 +1902,7 @@ impl FilterEngine {
         &self,
         module: &LoadedModule,
         call_id: u32,
-        headers: &[(String, String)],
+        headers: &[(bytes::Bytes, bytes::Bytes)],
     ) -> anyhow::Result<()> {
         // Create context
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
@@ -1911,9 +1911,13 @@ impl FilterEngine {
         // F-134: MapType::GrpcReceiveInitialMetadata(4) のバックストア。
         // ゲストが proxy_on_grpc_receive_initial_metadata 内で
         // proxy_get_header_map_pairs(GrpcReceiveInitialMetadata) を呼べるようにする。
+        // F-160: `grpc_receive_initial_metadata` の型（`Vec<(Vec<u8>, Vec<u8>)>`）は
+        // `headers.rs::get_headers` が全マップ共通で使うため変更しない
+        // （変更すると 15 ファイル・100 箇所に波及するため対象外）。
+        // 境界の `to_vec()` はここでの 1 回のみ（変更前と同等のコピー回数）。
         http_ctx.grpc_receive_initial_metadata = headers
             .iter()
-            .map(|(k, v)| (k.clone().into_bytes(), v.clone().into_bytes()))
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
             .collect();
 
         let host_state = HostState::new(http_ctx);
@@ -2119,7 +2123,7 @@ impl FilterEngine {
         &self,
         module_name: &str,
         call_id: u32,
-        trailers: &[(String, String)],
+        trailers: &[(bytes::Bytes, bytes::Bytes)],
     ) {
         let module = match self.registry.get_module(module_name) {
             Some(m) => m,
@@ -2143,16 +2147,18 @@ impl FilterEngine {
         &self,
         module: &LoadedModule,
         call_id: u32,
-        trailers: &[(String, String)],
+        trailers: &[(bytes::Bytes, bytes::Bytes)],
     ) -> anyhow::Result<()> {
         // Create context
         let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
         http_ctx.plugin_name = module.name.clone();
         http_ctx.plugin_configuration = module.configuration.clone();
         // F-134: MapType::GrpcReceiveTrailingMetadata(5) のバックストア。
+        // F-160: `grpc_receive_trailing_metadata` の型は headers.rs 共通のため
+        // 変更しない。境界の `to_vec()` はここでの 1 回のみ。
         http_ctx.grpc_receive_trailing_metadata = trailers
             .iter()
-            .map(|(k, v)| (k.clone().into_bytes(), v.clone().into_bytes()))
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
             .collect();
 
         let host_state = HostState::new(http_ctx);

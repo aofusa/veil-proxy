@@ -570,6 +570,10 @@ where
 
     let notify = crate::stream_channel::Notify::new();
     let spawner = h2_task_spawner();
+    // F-162: per-stream 固定費削減。`client_ip` の `Rc<str>` 化と `SocketAddr` 解決は
+    // 接続あたり 1 回だけ行い、以降は `Rc::clone`（参照カウント +1）と値渡し（Copy）で使い回す。
+    let client_ip_rc: std::rc::Rc<str> = std::rc::Rc::from(client_ip);
+    let client_socket_addr = h2_client_socket_addr(client_ip);
     let mut streams: std::collections::HashMap<u32, H2ActiveStream> =
         std::collections::HashMap::new();
     // `drive_h2_streams` のストリーム ID 走査用バッファ（F-157）。コネクションごとに
@@ -675,7 +679,8 @@ where
                             &mut streams,
                             &notify,
                             &spawner,
-                            client_ip,
+                            &client_ip_rc,
+                            client_socket_addr,
                             connection_metric,
                         );
                     }
@@ -721,7 +726,8 @@ where
                             &mut streams,
                             &notify,
                             &spawner,
-                            client_ip,
+                            &client_ip_rc,
+                            client_socket_addr,
                             connection_metric,
                         );
                     }
@@ -844,7 +850,10 @@ struct H2RequestCtx {
     /// 無効時は誰も読まないためフィールド自体を無くす（dead_code 回避）。
     #[cfg(feature = "wasm")]
     trailers: Vec<crate::http2::hpack::HeaderField>,
-    client_ip: Box<str>,
+    /// 接続あたり 1 回だけ確保して `Rc::clone`（参照カウント +1）で使い回す（F-162）。
+    client_ip: std::rc::Rc<str>,
+    /// `client_ip` から解決した `SocketAddr`。接続確立時に 1 回だけ解決する（F-162）。
+    client_socket_addr: SocketAddr,
     start: Instant,
 }
 
@@ -956,7 +965,8 @@ fn h2_spawn_for_request<S>(
     streams: &mut std::collections::HashMap<u32, H2ActiveStream>,
     notify: &crate::stream_channel::Notify,
     spawner: &H2TaskSpawner,
-    client_ip: &str,
+    client_ip: &std::rc::Rc<str>,
+    client_socket_addr: SocketAddr,
     connection_metric: &mut ActiveConnectionMetric,
 ) where
     S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
@@ -969,7 +979,7 @@ fn h2_spawn_for_request<S>(
     // ストリーミング適格判定 + リクエストボディ上限をルーティング 1 回で取得する
     // （適格判定と上限取得で find_backend_unified を二重実行しない）。
     let plan = if body_pending {
-        h2_route_streaming_plan(conn, stream_id, client_ip)
+        h2_route_streaming_plan(conn, stream_id, client_ip, client_socket_addr)
     } else {
         None
     };
@@ -997,9 +1007,9 @@ fn h2_spawn_for_request<S>(
     });
 
     if let Ok(host_str) = std::str::from_utf8(&authority) {
-        connection_metric.set_host(host_str.to_string());
+        connection_metric.set_host(host_str);
     } else {
-        connection_metric.set_host("unknown".to_string());
+        connection_metric.set_host("unknown");
     }
 
     let ctx = H2RequestCtx {
@@ -1010,7 +1020,8 @@ fn h2_spawn_for_request<S>(
         body: parts.body.freeze(),
         #[cfg(feature = "wasm")]
         trailers: parts.trailers,
-        client_ip: Box::from(client_ip),
+        client_ip: std::rc::Rc::clone(client_ip),
+        client_socket_addr,
         start: Instant::now(),
     };
 
@@ -1276,6 +1287,7 @@ fn h2_route_streaming_plan<S>(
     conn: &http2::Http2Connection<S>,
     stream_id: u32,
     client_ip: &str,
+    client_socket_addr: SocketAddr,
 ) -> Option<u64>
 where
     S: crate::runtime::io::AsyncReadRent + crate::runtime::io::AsyncWriteRentExt + Unpin,
@@ -1315,8 +1327,6 @@ where
     let query_start = path.iter().position(|&b| b == b'?');
     let raw_query: &[u8] = query_start.map(|i| &path[i + 1..]).unwrap_or(b"");
     let path_wo_query = query_start.map(|i| &path[..i]).unwrap_or(&path[..]);
-
-    let client_socket_addr = h2_client_socket_addr(client_ip);
 
     let backend_result = find_backend_unified(
         &authority,
@@ -1576,7 +1586,6 @@ async fn h2_dispatch(
     let query_start = path.iter().position(|&b| b == b'?');
     let raw_query: &[u8] = query_start.map(|i| &path[i + 1..]).unwrap_or(b"");
     let path_wo_query = query_start.map(|i| &path[..i]).unwrap_or(path);
-    let client_socket_addr = h2_client_socket_addr(client_ip);
     let authority = &ctx.authority[..];
 
     let backend_result = find_backend_unified(
@@ -1585,7 +1594,7 @@ async fn h2_dispatch(
         method,
         &headers_raw,
         raw_query,
-        &client_socket_addr,
+        &ctx.client_socket_addr,
         config.route.as_slice(),
         &config.upstream_groups,
     )
@@ -1597,7 +1606,7 @@ async fn h2_dispatch(
                 method,
                 &headers_raw,
                 raw_query,
-                &client_socket_addr,
+                &ctx.client_socket_addr,
                 config.route.as_slice(),
                 &config.upstream_groups,
             )
@@ -1772,6 +1781,7 @@ async fn h2_dispatch(
             body: ctx.body.clone(),
             trailers: ctx.trailers.clone(),
             client_ip: ctx.client_ip.clone(),
+            client_socket_addr: ctx.client_socket_addr,
             start: ctx.start,
         };
         &modified_ctx
@@ -3301,7 +3311,6 @@ async fn h2_serve_streaming(
     let query_start = path.iter().position(|&b| b == b'?');
     let raw_query: &[u8] = query_start.map(|i| &path[i + 1..]).unwrap_or(b"");
     let path_wo_query = query_start.map(|i| &path[..i]).unwrap_or(path);
-    let client_socket_addr = h2_client_socket_addr(client_ip);
     let authority = &ctx.authority[..];
 
     let backend_result = find_backend_unified(
@@ -3310,7 +3319,7 @@ async fn h2_serve_streaming(
         method,
         &headers_raw,
         raw_query,
-        &client_socket_addr,
+        &ctx.client_socket_addr,
         config.route.as_slice(),
         &config.upstream_groups,
     )
@@ -3322,7 +3331,7 @@ async fn h2_serve_streaming(
                 method,
                 &headers_raw,
                 raw_query,
-                &client_socket_addr,
+                &ctx.client_socket_addr,
                 config.route.as_slice(),
                 &config.upstream_groups,
             )
@@ -4559,9 +4568,9 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
 
                 // メトリクス: 最初のリクエストでホスト名を取得し、インクリメント
                 if let Ok(host_str) = std::str::from_utf8(&host_bytes) {
-                    connection_metric.set_host(host_str.to_string());
+                    connection_metric.set_host(host_str);
                 } else {
-                    connection_metric.set_host("unknown".to_string());
+                    connection_metric.set_host("unknown");
                 }
 
                 let path_bytes: Box<[u8]> = req
@@ -5400,7 +5409,7 @@ async fn handle_backend(
     backend: Backend,
     method: &[u8],
     req_path: &[u8],
-    prefix: Box<[u8]>,
+    prefix: Arc<[u8]>,
     content_length: usize,
     is_chunked: bool,
     headers: &[(Box<[u8]>, Box<[u8]>)],
