@@ -658,7 +658,9 @@ pub fn spawn_wasm_tick_thread() {
 /// **ホットパス絶対規則との関係**: この処理はデータプレーン（io_uring イベント
 /// ループ）とは完全に別のバックグラウンド専用スレッド上でのみ実行される。
 /// したがってブロッキング `poll(2)` / 同期 I/O を使ってよい。
-#[cfg(feature = "grpc")]
+// `wasm` と `grpc` の**両方**が必要（本体が `crate::wasm` のレジストリ・エンジンを参照するため）。
+// `--features grpc` 単独ビルドでも壊れないよう、呼び出し側（`entry.rs`）と同じ条件で切る。
+#[cfg(all(feature = "wasm", feature = "grpc"))]
 // 理由付き allow: 専用 gRPC 実行スレッド上の待機（イベントループ外）。
 #[allow(clippy::disallowed_methods)]
 pub fn spawn_wasm_grpc_thread() {
