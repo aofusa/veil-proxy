@@ -161,11 +161,11 @@ impl ActiveConnectionMetric {
         }
     }
 
-    pub(crate) fn set_host(&mut self, _host: String) {
+    pub(crate) fn set_host(&mut self, _host: &str) {
         #[cfg(feature = "metrics")]
         if self.enabled && self.host_name.is_none() {
-            self.host_name = Some(_host.clone());
-            HTTP_ACTIVE_CONNECTIONS.with_label_values(&[&_host]).inc();
+            self.host_name = Some(_host.to_string());
+            HTTP_ACTIVE_CONNECTIONS.with_label_values(&[_host]).inc();
         }
     }
 }
