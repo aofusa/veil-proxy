@@ -192,8 +192,10 @@ pub struct HttpContext {
 
     // === gRPC Calls (feature = "grpc") ===
     /// Pending gRPC calls (call_id -> (path, message, timeout_ms))
+    /// F-160: message は `Bytes`。ホスト関数側で `Vec<u8>` から 1 度だけ変換した
+    /// ものを保持し、ここへ入れる際の `clone()` は参照カウントのみで完結する。
     #[cfg(feature = "grpc")]
-    pub pending_grpc_calls: HashMap<u32, (String, Vec<u8>, u32)>,
+    pub pending_grpc_calls: HashMap<u32, (String, Bytes, u32)>,
     /// Next gRPC call ID
     #[cfg(feature = "grpc")]
     pub next_grpc_call_id: u32,
@@ -241,9 +243,13 @@ pub struct GrpcStream {
     /// Stream state
     pub state: GrpcStreamState,
     /// Pending messages to send
-    pub pending_messages: Vec<Vec<u8>>,
-    /// Initial metadata
-    pub initial_metadata: Vec<(String, String)>,
+    /// F-160: `Bytes` にして half-close 時の一括送出（`clone()`）を
+    /// 参照カウントのみで完結させる。
+    pub pending_messages: Vec<Bytes>,
+    /// Initial metadata（直列化バイト列のまま保持。F-160）
+    /// `GrpcMetadataBlob` はクレート内部専用の型のため、フィールドも
+    /// `pub(crate)` にする（`GrpcStream` は crate 内でのみ組み立てられる）。
+    pub(crate) initial_metadata: super::host::grpc::GrpcMetadataBlob,
 }
 
 /// gRPC stream state
@@ -402,7 +408,7 @@ impl HttpContext {
         &mut self,
         call_id: u32,
         path: String,
-        message: Vec<u8>,
+        message: Bytes,
         timeout_ms: u32,
     ) {
         self.pending_grpc_calls
@@ -432,7 +438,7 @@ impl HttpContext {
 
     /// Take pending gRPC calls for execution
     #[cfg(feature = "grpc")]
-    pub fn take_pending_grpc_calls(&mut self) -> HashMap<u32, (String, Vec<u8>, u32)> {
+    pub fn take_pending_grpc_calls(&mut self) -> HashMap<u32, (String, Bytes, u32)> {
         std::mem::take(&mut self.pending_grpc_calls)
     }
 }

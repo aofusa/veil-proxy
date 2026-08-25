@@ -692,7 +692,7 @@ pub fn spawn_wasm_tick_thread() {
                                             crate::wasm::grpc_status::UNAVAILABLE,
                                             format!("gRPC call failed: {e}"),
                                             Vec::new(),
-                                            Vec::new(),
+                                            bytes::Bytes::new(),
                                             Vec::new(),
                                         )
                                     }
@@ -706,7 +706,7 @@ pub fn spawn_wasm_tick_thread() {
                                     crate::wasm::grpc_status::UNAVAILABLE,
                                     "No healthy upstream servers available".to_string(),
                                     Vec::new(),
-                                    Vec::new(),
+                                    bytes::Bytes::new(),
                                     Vec::new(),
                                 )
                             }
@@ -719,15 +719,24 @@ pub fn spawn_wasm_tick_thread() {
                                 crate::wasm::grpc_status::UNIMPLEMENTED,
                                 format!("Upstream '{upstream_name}' not found"),
                                 Vec::new(),
-                                Vec::new(),
+                                bytes::Bytes::new(),
                                 Vec::new(),
                             )
                         };
 
+                        // F-160: metadata が `(Bytes, Bytes)` になったため、追加する
+                        // `grpc-status`/`grpc-message` も `Bytes` で構築する
+                        // （キー側は静的文字列なので `Bytes::from_static` でコピー不要）。
                         let mut trailing = trailing_metadata;
-                        trailing.push(("grpc-status".to_string(), status_code.to_string()));
+                        trailing.push((
+                            bytes::Bytes::from_static(b"grpc-status"),
+                            bytes::Bytes::from(status_code.to_string()),
+                        ));
                         if !status_message.is_empty() {
-                            trailing.push(("grpc-message".to_string(), status_message));
+                            trailing.push((
+                                bytes::Bytes::from_static(b"grpc-message"),
+                                bytes::Bytes::from(status_message),
+                            ));
                         }
 
                         crate::wasm::process_grpc_response(

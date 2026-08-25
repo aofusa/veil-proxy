@@ -22,8 +22,10 @@ use std::net::TcpStream;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use once_cell::sync::Lazy;
 
+use super::grpc::GrpcMetadataBlob;
 use crate::grpc::framing::GrpcFrameDecoder;
 use crate::http2::frame::{FrameDecoder, FrameEncoder, FrameHeader, FrameType};
 use crate::http2::hpack::{HpackDecoder, HpackEncoder};
@@ -48,10 +50,12 @@ pub struct PendingGrpcUnaryCall {
     pub upstream: String,
     /// `/<service>/<method>` パス
     pub path: String,
-    /// 初期メタデータ
-    pub initial_metadata: Vec<(String, String)>,
-    /// 送信するメッセージ（複数可、ストリーミングの蓄積分）
-    pub messages: Vec<Vec<u8>>,
+    /// 初期メタデータ（F-160: 直列化バイト列のまま保持し、ペアごとの
+    /// `String` 確保を発生させない）
+    pub initial_metadata: GrpcMetadataBlob,
+    /// 送信するメッセージ（複数可、ストリーミングの蓄積分。F-160: `Bytes` で
+    /// 参照カウント共有し、蓄積分の一括送出時のディープコピーを避ける）
+    pub messages: Vec<Bytes>,
     /// タイムアウト（ミリ秒）
     pub timeout_ms: u32,
 }
@@ -168,12 +172,12 @@ pub struct GrpcUnaryResult {
     pub status_code: i32,
     /// `grpc-message` トレーラー
     pub status_message: String,
-    /// 応答の初期メタデータ（疑似ヘッダを除く）
-    pub initial_metadata: Vec<(String, String)>,
+    /// 応答の初期メタデータ（疑似ヘッダを除く。F-160: `Bytes` で保持）
+    pub initial_metadata: Vec<(Bytes, Bytes)>,
     /// 応答メッセージ本体（gRPC 5 バイトフレーミングを剥がした後の Protobuf バイト列）
-    pub message: Vec<u8>,
-    /// トレーリングメタデータ（`grpc-status`/`grpc-message` を除く）
-    pub trailing_metadata: Vec<(String, String)>,
+    pub message: Bytes,
+    /// トレーリングメタデータ（`grpc-status`/`grpc-message` を除く。F-160: `Bytes` で保持）
+    pub trailing_metadata: Vec<(Bytes, Bytes)>,
 }
 
 /// gRPC-over-h2c/h2 のユーナリー呼び出しを 1 本の使い捨て TCP 接続で実行する。
@@ -192,8 +196,8 @@ pub fn execute_grpc_unary_call(
     port: u16,
     use_tls: bool,
     path: &str,
-    initial_metadata: &[(String, String)],
-    messages: &[Vec<u8>],
+    initial_metadata: &GrpcMetadataBlob,
+    messages: &[Bytes],
     timeout_ms: u32,
 ) -> Result<GrpcUnaryResult, String> {
     let timeout = Duration::from_millis(timeout_ms.max(1) as u64);
@@ -236,8 +240,9 @@ pub fn execute_grpc_unary_call(
         (b"te", b"trailers", false),
         (b"grpc-timeout", grpc_timeout.as_bytes(), false),
     ];
-    for (k, v) in initial_metadata {
-        headers.push((k.as_bytes(), v.as_bytes(), false));
+    // F-160: 直列化バイト列をコピーせず走査し、そのまま HPACK エンコーダへ渡す。
+    for (k, v) in initial_metadata.iter() {
+        headers.push((k, v, false));
     }
     let header_block = hpack_encoder
         .encode(&headers)
@@ -272,8 +277,8 @@ pub fn execute_grpc_unary_call(
     let mut grpc_decoder = GrpcFrameDecoder::new();
 
     let mut read_buf: Vec<u8> = Vec::with_capacity(8192);
-    let mut initial_metadata_out: Vec<(String, String)> = Vec::new();
-    let mut trailing_metadata_out: Vec<(String, String)> = Vec::new();
+    let mut initial_metadata_out: Vec<(Bytes, Bytes)> = Vec::new();
+    let mut trailing_metadata_out: Vec<(Bytes, Bytes)> = Vec::new();
     let mut got_response_headers = false;
     let mut end_stream_seen = false;
     let mut tmp = [0u8; 8192];
@@ -343,24 +348,22 @@ pub fn execute_grpc_unary_call(
                     let fields = hpack_decoder
                         .decode(&header_block)
                         .map_err(|e| format!("hpack decode failed: {e:?}"))?;
-                    let pairs: Vec<(String, String)> = fields
+                    // F-160: HPACK デコード結果（`f.name`/`f.value`、いずれも既に
+                    // 所有された `Vec<u8>`）を `String` へ再変換せず、`Bytes::from`
+                    // でそのまま引き継ぐ（UTF-8 検証もコピーも発生しない）。
+                    let pairs: Vec<(Bytes, Bytes)> = fields
                         .into_iter()
-                        .map(|f| {
-                            (
-                                String::from_utf8_lossy(&f.name).to_string(),
-                                String::from_utf8_lossy(&f.value).to_string(),
-                            )
-                        })
+                        .map(|f| (Bytes::from(f.name), Bytes::from(f.value)))
                         .collect();
 
-                    let has_grpc_status = pairs.iter().any(|(k, _)| k == "grpc-status");
+                    let has_grpc_status = pairs.iter().any(|(k, _)| k.as_ref() == b"grpc-status");
 
                     if !got_response_headers && !has_grpc_status {
                         // 通常の応答ヘッダ（:status 等）。疑似ヘッダは除いて
                         // GrpcReceiveInitialMetadata へ渡す。
                         initial_metadata_out = pairs
                             .into_iter()
-                            .filter(|(k, _)| !k.starts_with(':'))
+                            .filter(|(k, _)| !k.starts_with(b":"))
                             .collect();
                         got_response_headers = true;
                     } else {
@@ -368,7 +371,7 @@ pub fn execute_grpc_unary_call(
                         // trailers-only 応答で最初から grpc-status を含む場合）。
                         trailing_metadata_out = pairs
                             .into_iter()
-                            .filter(|(k, _)| !k.starts_with(':'))
+                            .filter(|(k, _)| !k.starts_with(b":"))
                             .collect();
                     }
 
@@ -392,25 +395,28 @@ pub fn execute_grpc_unary_call(
         }
     }
 
-    let message = match grpc_decoder
+    // F-160: `Vec<u8>` を再アロケーションせず `Bytes::from` でそのまま引き継ぐ。
+    let message: Bytes = match grpc_decoder
         .decode_next()
         .map_err(|e| format!("grpc frame decode failed: {e}"))?
     {
-        Some(frame) => frame.data,
-        None => Vec::new(),
+        Some(frame) => Bytes::from(frame.data),
+        None => Bytes::new(),
     };
 
     let status_code: i32 = trailing_metadata_out
         .iter()
-        .find(|(k, _)| k == "grpc-status")
-        .and_then(|(_, v)| v.parse().ok())
+        .find(|(k, _)| k.as_ref() == b"grpc-status")
+        .and_then(|(_, v)| std::str::from_utf8(v).ok())
+        .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let status_message = trailing_metadata_out
         .iter()
-        .find(|(k, _)| k == "grpc-message")
-        .map(|(_, v)| v.clone())
+        .find(|(k, _)| k.as_ref() == b"grpc-message")
+        .map(|(_, v)| String::from_utf8_lossy(v).to_string())
         .unwrap_or_default();
-    trailing_metadata_out.retain(|(k, _)| k != "grpc-status" && k != "grpc-message");
+    trailing_metadata_out
+        .retain(|(k, _)| k.as_ref() != b"grpc-status" && k.as_ref() != b"grpc-message");
 
     Ok(GrpcUnaryResult {
         status_code,
@@ -438,7 +444,7 @@ mod tests {
             0,
             false,
             "/test.Service/Method",
-            &[],
+            &GrpcMetadataBlob::empty(),
             &[],
             100,
         );
@@ -449,8 +455,15 @@ mod tests {
     #[test]
     fn test_execute_grpc_unary_call_connection_refused() {
         // ポート 0 への接続はプラットフォーム上ほぼ確実に失敗する。
-        let result =
-            execute_grpc_unary_call("127.0.0.1", 1, false, "/test.Service/Method", &[], &[], 200);
+        let result = execute_grpc_unary_call(
+            "127.0.0.1",
+            1,
+            false,
+            "/test.Service/Method",
+            &GrpcMetadataBlob::empty(),
+            &[],
+            200,
+        );
         assert!(result.is_err());
     }
 
@@ -458,8 +471,15 @@ mod tests {
     /// panic せず Err を返す（TLS ハンドシェイク前に TCP connect が失敗する経路）。
     #[test]
     fn test_execute_grpc_unary_call_tls_connection_refused() {
-        let result =
-            execute_grpc_unary_call("127.0.0.1", 1, true, "/test.Service/Method", &[], &[], 200);
+        let result = execute_grpc_unary_call(
+            "127.0.0.1",
+            1,
+            true,
+            "/test.Service/Method",
+            &GrpcMetadataBlob::empty(),
+            &[],
+            200,
+        );
         assert!(result.is_err());
     }
 
@@ -498,8 +518,8 @@ mod tests {
             call_id: 42,
             upstream: "backend".to_string(),
             path: "/test.Service/Method".to_string(),
-            initial_metadata: vec![],
-            messages: vec![b"hello".to_vec()],
+            initial_metadata: GrpcMetadataBlob::empty(),
+            messages: vec![Bytes::from_static(b"hello")],
             timeout_ms: 1000,
         };
         register_global_pending_grpc_call(call.clone());
