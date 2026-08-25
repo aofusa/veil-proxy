@@ -38,12 +38,17 @@ use crate::runtime::ring::{
 ///
 /// F-124/F-129: HTTP/3 UDP 受信に `IORING_OP_RECVMSG` を追加。
 ///
-/// F-130: `IORING_OP_RECVMSG`（受信）/`IORING_OP_SENDMSG`（送信）を **パイプライン化**して
+/// F-130 C1: `IORING_OP_RECVMSG`（受信）/`IORING_OP_SENDMSG`（送信）を **パイプライン化**して
 /// libc `recvmmsg`/`sendmmsg` をホットパスから排除した（`runtime::uring::udp_recv` /
-/// `udp_send`）。真の `IORING_RECV_MULTISHOT` + provided buffers（C2、`IORING_OP_PROVIDE_BUFFERS`
-/// / `REMOVE_BUFFERS` が必要）は unconnected multi-peer UDP でのアドレス安全性と ENOBUFS 耐性の
-/// 課題が残るため見送り、許可オペコードからも外してある（restriction 許可リストを実使用分に
-/// 限定 = セキュリティサーフェスの最小化）。将来 C2 に着手する場合はここへ追記すること。
+/// `udp_send`）。
+///
+/// F-130 C2: 真の `IORING_RECV_MULTISHOT` + provided buffer ring（`runtime::uring::udp_recv::
+/// MultishotUdpRecv`）を追加。`IORING_OP_RECVMSG` は既に許可済みで、buffer ring の登録
+/// （`IORING_REGISTER_PBUF_RING` / `IORING_UNREGISTER_PBUF_RING`）は SQE オペコードではなく
+/// `io_uring_register` 側の register 操作のため、ここ（SQE 許可リスト）への追加は不要
+/// （許可は `ring.rs::apply_restrictions` 側で行う）。`IORING_OP_PROVIDE_BUFFERS` /
+/// `REMOVE_BUFFERS`（旧来の legacy provided buffers 用 SQE オペコード）は使わないため
+/// 引き続き許可リストに含めない。
 pub const PROXY_ALLOWED_OPCODES: &[u8] = &[
     IORING_OP_NOP,
     IORING_OP_POLL_ADD,
@@ -711,28 +716,20 @@ pub fn alloc_op() -> u64 {
     OP_TABLE.with(|t| t.borrow_mut().alloc())
 }
 
-/// Multishot 用スロットを確保する（F-124 の試作: `IORING_RECV_MULTISHOT`）。
+/// Multishot 用スロットを確保する（F-124 で土台を用意し、F-130 C2 で使用開始:
+/// `IORING_RECV_MULTISHOT` + provided buffer ring、`runtime::uring::udp_recv::MultishotUdpRecv`）。
 ///
 /// 同一 user_data に複数 CQE が届き、`take_multishot_cqe` で 1 件ずつ取り出す。
-///
-/// **現状未使用**（F-130 時点）。F-129/F-130 は真の `IORING_RECV_MULTISHOT` + provided
-/// buffers ではなく、独立した複数 `IORING_OP_RECVMSG` を in-flight に保つソフトウェア
-/// パイプライン（`runtime::uring::udp_recv::PipelinedUdpRecv`）を採用したため出番がない。
-/// 将来 C2（真 multishot + buffer ring）に着手する際の土台として残す。
 #[inline]
-#[allow(dead_code)]
 pub fn alloc_multishot_op() -> u64 {
     OP_TABLE.with(|t| t.borrow_mut().alloc_multishot())
 }
 
-/// Multishot CQE を 1 件取り出す。
+/// Multishot CQE を 1 件取り出す（F-130 C2: `MultishotUdpRecv` が使用）。
 ///
 /// 戻り値: `(Some((res, flags)), finished)` / キュー空なら `(None, finished)`。
 /// `finished && item.is_none()` のときスロットは解放済みで、呼び出し側は再 arm する。
-///
-/// **現状未使用**（`alloc_multishot_op` と同じ理由。F-130 C2 用に温存）。
 #[inline]
-#[allow(dead_code)]
 pub fn take_multishot_cqe(user_data: u64) -> (Option<(i32, u32)>, bool) {
     OP_TABLE.with(|t| t.borrow_mut().take_multishot(user_data))
 }

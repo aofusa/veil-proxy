@@ -73,6 +73,10 @@ pub const IORING_REGISTER_PERSONALITY: u32 = 9;
 pub const IORING_UNREGISTER_PERSONALITY: u32 = 10;
 pub const IORING_REGISTER_RESTRICTIONS: u32 = 11;
 pub const IORING_REGISTER_ENABLE_RINGS: u32 = 12;
+/// provided buffer ring の登録（F-130 C2、kernel 5.19+）。
+pub const IORING_REGISTER_PBUF_RING: u32 = 22;
+/// provided buffer ring の解除（F-130 C2）。
+pub const IORING_UNREGISTER_PBUF_RING: u32 = 23;
 
 // ====================
 // SQE オペコード
@@ -295,6 +299,69 @@ pub struct IoUringRestriction {
 }
 
 // ====================
+// provided buffer ring 構造体（F-130 C2: IORING_REGISTER_PBUF_RING）
+// ====================
+
+/// `IORING_REGISTER_PBUF_RING` の登録引数。
+///
+/// カーネルの `struct io_uring_buf_reg`（40 バイト）と ABI 互換でなければならない。
+/// `pad` はカーネル側では `flags`（`IOU_PBUF_RING_MMAP` 等）に相当するが、本実装は
+/// 常にユーザ空間で mmap 済みのリングを渡す方式（フラグ 0 = デフォルト）のみを使うため
+/// 未使用のまま 0 固定とする。フィールド構成・サイズを変更してはならない
+/// （`register_buf_ring_struct_is_abi_compatible` で 40 バイトを固定）。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IoUringBufReg {
+    /// リング領域（`IoUringBuf` の配列）の先頭アドレス。ページ整列必須。
+    pub ring_addr: u64,
+    /// リングエントリ数（2 の冪）。
+    pub ring_entries: u32,
+    /// buffer group ID。
+    pub bgid: u16,
+    /// 予約（カーネル ABI では `flags`。本実装は常に 0）。
+    pub pad: u16,
+    pub resv: [u64; 3],
+}
+
+/// provided buffer ring の 1 エントリ。
+///
+/// カーネルの `struct io_uring_buf`（16 バイト）と ABI 互換でなければならない
+/// （`buf_ring_entry_struct_is_abi_compatible` で 16 バイトを固定）。
+/// リング先頭エントリ（index 0）の `resv`（オフセット 14）はカーネル ABI 上
+/// `struct io_uring_buf_ring` の `tail` フィールドと同じメモリを指す（union）。
+/// バッファを公開する手順は「該当インデックスへエントリを書く → 先頭エントリの
+/// `resv`（tail）を Release 順序で store」。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IoUringBuf {
+    /// バッファの先頭アドレス。
+    pub addr: u64,
+    /// バッファ長。
+    pub len: u32,
+    /// buffer ID（CQE.flags から `IORING_CQE_BUFFER_SHIFT` で取り出される値と対応）。
+    pub bid: u16,
+    pub resv: u16,
+}
+
+/// `IORING_OP_RECVMSG` + provided buffer 使用時にバッファ先頭へカーネルが書き込むヘッダ。
+///
+/// カーネルの `struct io_uring_recvmsg_out`（16 バイト）と ABI 互換でなければならない
+/// （`recvmsg_out_struct_is_abi_compatible` で 16 バイトを固定）。このヘッダに続けて
+/// name（確保長 = 要求した `msg_namelen`）、control（確保長 = 要求した `msg_controllen`）、
+/// payload の順でカーネルが書き込む（liburing と同じレイアウト）。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IoUringRecvmsgOut {
+    /// name 部に実際必要だった長さ（要求値を超えていれば truncate＝破棄すべき）。
+    pub namelen: u32,
+    /// control 部に実際必要だった長さ（同上）。
+    pub controllen: u32,
+    /// payload の長さ。
+    pub payloadlen: u32,
+    pub flags: u32,
+}
+
+// ====================
 // タイムアウト構造体
 // ====================
 
@@ -492,10 +559,26 @@ impl IoUring {
         // 制限登録に成功するとリングは restricted 状態になり、以後の io_uring_register
         // 操作（ENABLE_RINGS を含む）はすべて register_op ビットマップで検査される。
         // そのため enable_rings() を呼べるよう ENABLE_RINGS を明示的に許可しておく。
-        let mut restrictions: Vec<IoUringRestriction> = Vec::with_capacity(sqe_opcodes.len() + 1);
+        //
+        // F-130 C2: provided buffer ring（`IORING_REGISTER_PBUF_RING` /
+        // `IORING_UNREGISTER_PBUF_RING`）は SQE オペコードではなく register 操作のため、
+        // `PROXY_ALLOWED_OPCODES`（SQE 許可リスト）を変更せずここで明示的に許可する。
+        // セキュリティサーフェスの変化は「provided buffer の登録が可能になること」のみで、
+        // 新しい SQE オペコードは一切追加していない。
+        let mut restrictions: Vec<IoUringRestriction> = Vec::with_capacity(sqe_opcodes.len() + 3);
         restrictions.push(IoUringRestriction {
             opcode: IORING_RESTRICTION_REGISTER_OP,
             register_opcode_or_sqe_op: IORING_REGISTER_ENABLE_RINGS as u8,
+            ..Default::default()
+        });
+        restrictions.push(IoUringRestriction {
+            opcode: IORING_RESTRICTION_REGISTER_OP,
+            register_opcode_or_sqe_op: IORING_REGISTER_PBUF_RING as u8,
+            ..Default::default()
+        });
+        restrictions.push(IoUringRestriction {
+            opcode: IORING_RESTRICTION_REGISTER_OP,
+            register_opcode_or_sqe_op: IORING_UNREGISTER_PBUF_RING as u8,
             ..Default::default()
         });
         restrictions.extend(sqe_opcodes.iter().map(|&op| IoUringRestriction {
@@ -532,6 +615,61 @@ impl IoUring {
             )
         };
 
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// `IORING_REGISTER_PBUF_RING` で provided buffer ring を登録する（F-130 C2）。
+    ///
+    /// `ring_addr` は呼び出し側が mmap 済みのリング領域（`IoUringBuf` の配列、
+    /// `entries * size_of::<IoUringBuf>()` バイト）の先頭アドレスで、ページ整列済みかつ
+    /// **登録が成功した後もカーネルが参照し続ける間はアドレスが変わらず、かつ解放されない**
+    /// こと（呼び出し側の不変条件）。`entries` は 2 の冪でなければならない。
+    pub fn register_buf_ring(&self, bgid: u16, entries: u32, ring_addr: u64) -> io::Result<()> {
+        let mut reg = IoUringBufReg {
+            ring_addr,
+            ring_entries: entries,
+            bgid,
+            pad: 0,
+            resv: [0; 3],
+        };
+        let ret = unsafe {
+            libc::syscall(
+                SYS_IO_URING_REGISTER,
+                self.fd as libc::c_long,
+                IORING_REGISTER_PBUF_RING as libc::c_long,
+                &mut reg as *mut IoUringBufReg as libc::c_long,
+                1i64,
+            )
+        };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// `IORING_UNREGISTER_PBUF_RING` で provided buffer ring の登録を解除する（F-130 C2）。
+    ///
+    /// カーネルは `bgid` のみを見る（`ring_addr`/`ring_entries` は無視される）。
+    pub fn unregister_buf_ring(&self, bgid: u16) -> io::Result<()> {
+        let mut reg = IoUringBufReg {
+            ring_addr: 0,
+            ring_entries: 0,
+            bgid,
+            pad: 0,
+            resv: [0; 3],
+        };
+        let ret = unsafe {
+            libc::syscall(
+                SYS_IO_URING_REGISTER,
+                self.fd as libc::c_long,
+                IORING_UNREGISTER_PBUF_RING as libc::c_long,
+                &mut reg as *mut IoUringBufReg as libc::c_long,
+                1i64,
+            )
+        };
         if ret < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -701,6 +839,40 @@ mod tests {
     fn restriction_struct_is_abi_compatible() {
         assert_eq!(std::mem::size_of::<IoUringRestriction>(), 16);
         assert_eq!(std::mem::align_of::<IoUringRestriction>(), 4);
+    }
+
+    /// F-130 C2: `IoUringBufReg` はカーネルの `struct io_uring_buf_reg` と同じ 40 バイトで
+    /// なければならない（`IORING_REGISTER_PBUF_RING` の引数として渡す）。
+    #[test]
+    fn buf_reg_struct_is_abi_compatible() {
+        assert_eq!(std::mem::size_of::<IoUringBufReg>(), 40);
+        assert_eq!(std::mem::align_of::<IoUringBufReg>(), 8);
+    }
+
+    /// F-130 C2: `IoUringBuf` はカーネルの `struct io_uring_buf` と同じ 16 バイトでなければ
+    /// ならない（provided buffer ring の 1 エントリ）。
+    #[test]
+    fn buf_entry_struct_is_abi_compatible() {
+        assert_eq!(std::mem::size_of::<IoUringBuf>(), 16);
+        assert_eq!(std::mem::align_of::<IoUringBuf>(), 8);
+    }
+
+    /// F-130 C2: リング先頭エントリの `resv`（オフセット 14, u16）が tail を兼ねる ABI 前提の
+    /// オフセット検証。ここがずれるとバッファ公開（tail store）が別のフィールドを破壊する。
+    #[test]
+    fn buf_entry_resv_offset_is_14() {
+        let buf = IoUringBuf::default();
+        let base = &buf as *const IoUringBuf as usize;
+        let resv_addr = std::ptr::addr_of!(buf.resv) as usize;
+        assert_eq!(resv_addr - base, 14);
+    }
+
+    /// F-130 C2: `IoUringRecvmsgOut` はカーネルの `struct io_uring_recvmsg_out` と同じ
+    /// 16 バイトでなければならない（provided buffer 先頭のヘッダをこの型で読む）。
+    #[test]
+    fn recvmsg_out_struct_is_abi_compatible() {
+        assert_eq!(std::mem::size_of::<IoUringRecvmsgOut>(), 16);
+        assert_eq!(std::mem::align_of::<IoUringRecvmsgOut>(), 4);
     }
 
     /// `IORING_REGISTER_RESTRICTIONS` が実際に許可外オペコードを `-EACCES` で拒否することを検証する。

@@ -4094,24 +4094,33 @@ pub async fn run_http3_server_async(
     let recv_drain_max = config.recv_drain_max.clamp(1, H3_RECV_DRAIN_MAX_LIMIT);
     let mut mmsg_scratch = crate::udp::socket::MmsgRecvScratch::with_batch(mmsg_batch);
 
-    // F-130 C1: パイプライン化 io_uring RECVMSG（Linux uring バックエンド）。
-    // 常に mmsg_batch 個の RECVMSG を in-flight に保ち、libc recvmmsg をホットパスから排除する。
-    // 既定で有効化し、初期化失敗時のみ POLL+recvmmsg へフォールバックする。
-    // デバッグで無効化する場合は VEIL_H3_MULTISHOT=0（環境変数名は F-124/F-129 からの互換名）。
+    // F-130 C1/C2: io_uring RECVMSG バックエンド（Linux uring バックエンド）。
+    // 既定は C1（パイプライン化 RECVMSG）。C2（真の IORING_RECV_MULTISHOT + provided
+    // buffer ring）は **`VEIL_H3_BUFRING=1` を指定したときだけ**試み、非対応環境では
+    // 自動的に C1 へフォールバックする（既定をオプトインにしている理由は
+    // `UdpRecvBackend::new` の doc コメント参照）。
+    // C1/C2 いずれも使わない場合は POLL+recvmmsg へフォールバックする。
+    // デバッグで両方無効化する場合は VEIL_H3_MULTISHOT=0（環境変数名は F-124/F-129 からの互換名）。
     #[cfg(all(target_os = "linux", veil_rt_uring))]
     let mut ms_recv = {
         let disabled = std::env::var_os("VEIL_H3_MULTISHOT")
             .map(|v| v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
             .unwrap_or(false);
         if disabled {
-            info!("[HTTP/3] pipelined io_uring RECVMSG disabled via VEIL_H3_MULTISHOT=0");
+            info!("[HTTP/3] io_uring RECVMSG backends disabled via VEIL_H3_MULTISHOT=0");
             None
         } else {
-            match crate::runtime::udp_recv::PipelinedUdpRecv::new(socket.as_raw_fd(), mmsg_batch) {
+            match crate::runtime::udp_recv::UdpRecvBackend::new(socket.as_raw_fd(), mmsg_batch) {
                 Ok(m) => {
+                    let label = if m.is_multishot() {
+                        "true multishot + buffer ring (C2)"
+                    } else {
+                        "pipelined RECVMSG (C1)"
+                    };
                     HTTP3_LOG_ONCE_RECVMSG.call_once(|| {
                         info!(
-                            "[HTTP/3] pipelined io_uring RECVMSG enabled ({} slots in-flight, no libc recvmmsg on hot path)",
+                            "[HTTP/3] UDP receive backend: {} ({} buffers, no libc recvmmsg on hot path)",
+                            label,
                             m.batch_size()
                         );
                     });
@@ -4119,7 +4128,7 @@ pub async fn run_http3_server_async(
                 }
                 Err(e) => {
                     warn!(
-                        "[HTTP/3] pipelined RECVMSG unavailable ({}), using POLL+recvmmsg fallback",
+                        "[HTTP/3] io_uring RECVMSG backends unavailable ({}), using POLL+recvmmsg fallback",
                         e
                     );
                     None
@@ -4338,7 +4347,24 @@ pub async fn run_http3_server_async(
                             // F-151: 受信直後の送出は行わない（イテレーション末尾の 1 回に統一）。
                         }
                         Err(e) => {
-                            error!("[HTTP/3] pipelined RECVMSG error: {}", e);
+                            error!("[HTTP/3] io_uring RECVMSG error: {}", e);
+                            // F-130 C2: buffer ring 登録には対応するが true multishot recv
+                            // 自体は未対応というカーネルギャップ（5.19〜6.0）を実行時に検出
+                            // した場合、同じ fd で C1 へ 1 度だけ切り替える。
+                            match ms.downgrade_to_pipelined_if_einval(mmsg_batch) {
+                                Ok(true) => {
+                                    warn!(
+                                        "[HTTP/3] switched UDP receive backend to pipelined RECVMSG (C1) after runtime EINVAL"
+                                    );
+                                }
+                                Ok(false) => {}
+                                Err(downgrade_err) => {
+                                    error!(
+                                        "[HTTP/3] fallback to pipelined RECVMSG (C1) failed: {}",
+                                        downgrade_err
+                                    );
+                                }
+                            }
                         }
                     }
                 }
