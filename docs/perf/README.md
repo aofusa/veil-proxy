@@ -12,8 +12,10 @@ Veil の HTTP/1.1・HTTP/2・HTTP/3・gRPC・L4 スループット／レイテ�
   （`tools/perf/freebsd/`）の出力で、`build` 列（aio / noaio / cache_off / cache_on /
   ktls_on / ktls_off）で構成を、`body` 列（54576 / 3）でレスポンスサイズを区別する。
   詳細な分析は下記「FreeBSD ネイティブ計測」節を参照。
-- **本ディレクトリの [`results_raw.tsv`](results_raw.tsv)** は最新計測
-  （2026-07-16、v0.5.0 向けフルスイート）の `tools/perf` 生データのコミット済みコピー。
+- **本ディレクトリの [`results_raw.tsv`](results_raw.tsv)** は `tools/perf` 生データの
+  コミット済みコピーで、計測のたびに `# ==== <日付> ...` の節として**追記**していく。
+  **最新のフルスイートは 2026-08-24（B-72 マージ後、全 67 構成 × glibc/musl × 3 反復 = 757 計測）**
+  で、下記「2026-08-24 フルスイート」節がその集計。
   `bash tools/perf/analyze_results.sh docs/perf/results_raw.tsv` で下表を再集計できる。
   行順は **nginx ベースライン → veil_glibc 各構成 → veil_musl 各構成**（F-118 で明文化）。
   `h3_proxy_buffering` の行のみ、B-46 修正後の同日 scoped 再計測で置換している（下記）。
@@ -30,6 +32,76 @@ Veil の HTTP/1.1・HTTP/2・HTTP/3・gRPC・L4 スループット／レイテ�
 - 各 (config, proto) を warmup 後 3 反復、median±stdev 集計。Errors は Non-2xx
 - gRPC over HTTP/3 はクライアント（k6）非対応のためフェイルセーフで NA（仕様どおり）
 - kTLS はコンテナ（veth）と相性が悪いため feat 系構成では無効（直交表の ktls 因子でのみ計測）
+
+## 2026-08-24 フルスイート（B-72 マージ後、全 67 構成 × glibc/musl × 3 反復）
+
+B-72（io_uring タイマーのユーザ空間ヒープ化）と中間 64KB `Vec` 除去を main へ入れたあと、
+**h2c 以外も含めた Linux 全構成**を計測し直した。**757 計測すべてで Non-2xx = 0**。
+`NA` は `grpc_h3*` の 6 構成のみ（k6 が gRPC over HTTP/3 に非対応のフェイルセーフ、仕様どおり）。
+`veil:glibc` / `veil:musl` は**同一コミットから同日ビルド**している。
+
+### 代表構成（Req/s 中央値）
+
+| 構成 | プロトコル | nginx | veil_glibc | veil_musl | 対 nginx |
+|---|---|---|---|---|---|
+| `h2c_file`（h2c 静的） | h2c | 10,905 | **23,849** | 23,359 | **2.19×** |
+| `h2c_proxy`（h2c 逆プロキシ） | h2c | 6,409 | **10,039** | 9,943 | **1.57×** |
+| `h2_1_ktls_0_lb_kernel_ofc_1`（TLS 静的・最良構成） | HTTP/1.1 | 6,511 | **9,180** | 8,981 | **1.41×** |
+| 同上 | HTTP/2 | 6,129 | **7,249** | 7,302 | **1.18×** |
+| `h2_0_feat_l4`（L4 平文素通し） | HTTP/1.1 | 6,511 | **13,726** | 13,736 | **2.11×** |
+| `h2_1_feat_proxy`（TLS 逆プロキシ） | HTTP/1.1 | 6,511※ | 6,337 | 6,326 | 0.97×※ |
+| 同上 | HTTP/2 | 6,129※ | 5,882 | 5,862 | 0.96×※ |
+| `h2_1_feat_buffering` | HTTP/2 | 6,129※ | 5,938 | 5,916 | 0.97×※ |
+| `h2_1_feat_http3`（HTTP/3 静的） | HTTP/3 | — | 1,849 | — | — |
+| `h3_proxy`（HTTP/3 逆プロキシ） | HTTP/3 | — | 1,598 | 1,592 | — |
+| `h2_1_feat_grpc` | gRPC(k6) | — | 4,308 | 4,289 | — |
+| `h2_1_feat_websocket` | WebSocket(k6) | — | 3,109 | 3,292 | — |
+
+> ※ **この行の「対 nginx」を額面どおり読んではならない。** `run_perf.sh` の nginx ベースライン
+> （`base` 構成）は **TLS 静的配信**であり、逆プロキシではない（F-118 の方針。`nginx.conf` の
+> 443 サーバは `root /var/www` の静的配信）。したがって `feat_proxy` / `feat_buffering` の比は
+> **「veil の逆プロキシ」対「nginx の静的配信」**であって同条件比較ではなく、
+> 実際には「veil はプロキシしながら nginx の静的配信とほぼ同速」と読むのが正しい。
+> **プロキシ同士の同条件比較になっているのは h2c だけ**（nginx 側も `/proxy/` で中継する）で、
+> そこでは **1.57×**。
+
+### B-72 の効果（h2c_proxy）
+
+同一ハーネスで測った `h2c_proxy` 1.57× は、改修時の交互 A/B（ラボハーネス）で得た
+**対 nginx ~1.60×** と一致しており、**標準ハーネス側からも独立に裏付けられた**。
+改修前は 1.19× だった（下記 B-72 節参照）。
+
+### 機能別オーバーヘッド（HTTP/2・glibc・基準 = `h2_1_ktls_0_lb_kernel_ofc_0` の 7,085）
+
+| 機能 | Req/s | 基準比 |
+|---|---|---|
+| metrics | 7,029 | 99.2% |
+| http3（併設） | 6,996 | 98.7% |
+| opentelemetry | 6,982 | 98.6% |
+| admin | 6,965 | 98.3% |
+| rate-limit | 6,954 | 98.2% |
+| wasm（パススルー 1 枚） | 6,911 | 97.5% |
+| access-log | 6,860 | 96.8% |
+| cache | 6,826 | 96.3% |
+| **buffering** | 5,938 | **83.8%** |
+| **proxy（バックエンドホップ）** | 5,882 | **83.0%** |
+| **compression** | 2,011 | **28.4%** |
+
+- **観測系（metrics / otel / admin / rate-limit / access-log / wasm / cache）は 96〜99%**
+  で、ほぼノイズ範囲のオーバーヘッドに収まっている。
+- **proxy / buffering の −17% はバックエンドホップそのもの**のコストで、機能実装の問題ではない。
+- **compression の −72% は 54,576B を毎リクエスト実圧縮している**ためで、
+  CPU バウンドな処理として妥当（キャッシュ無しの最悪ケース）。
+
+### glibc と musl
+
+代表構成のいずれでも **両者の差は数 % 以内**でノイズ範囲。アロケータ・libc の違いが
+スループットを左右する状況にはなっていない。
+
+生データは [`results_raw.tsv`](results_raw.tsv) 末尾の
+`# ==== 2026-08-24 B-72 マージ後 Linux フルスイート再計測 ...` 節。
+
+---
 
 ## v0.6.0 io_uring 非劣化確認（2026-07-20、median ± stdev）
 
