@@ -1503,4 +1503,288 @@ mod tests {
         }
         assert_eq!(call.phase, CallPhase::Done);
     }
+
+    // ========================================================================
+    // F-139 効果測定: 接続プーリング（`GrpcRunner`）vs 1 呼び出し 1 接続
+    // （`execute_grpc_unary_call`、同期フォールバック）
+    // ========================================================================
+    //
+    // `tools/perf` の負荷ハーネスが使う WASM フィルタ（`docker/assets/wasm/`
+    // 配下）はヘッダ操作のみで gRPC 呼び出しを一切発行しないため、F-139 が
+    // 導入した接続プーリングの効果はどの外形計測にも現れない。ここでは
+    // クレート内部の `#[cfg(test)]` からのみ到達できる `execute_grpc_unary_call`
+    // （旧方式）と `GrpcRunner`（新方式）を、同一のテスト用 gRPC-over-h2c
+    // モックサーバに対して実際に動かし、経過時間と（本質的な効果である）
+    // 接続確立回数の両方を測る。
+
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// テスト用ミニマル gRPC-over-h2c サーバ。
+    ///
+    /// プリフェース + SETTINGS を受け付け、以後は同一コネクション上で何度でも
+    /// 「ストリームが END_STREAM を受信したらユーナリー応答を返す」を繰り返す
+    /// （`GrpcConnPool` による接続再利用＝同一コネクション上の複数呼び出しに
+    /// 対応するため）。受理した TCP 接続数を `accepted_conns` に記録する。
+    fn spawn_mock_grpc_server(
+        accepted_conns: Arc<AtomicUsize>,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        // 理由付き allow: 単体テスト（コールドパス）専用の同期 TCP。
+        #[allow(clippy::disallowed_methods)]
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind should succeed");
+        let port = listener
+            .local_addr()
+            .expect("local_addr should succeed")
+            .port();
+
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                accepted_conns.fetch_add(1, Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    let _ = serve_one_mock_connection(stream);
+                });
+            }
+        });
+
+        (port, handle)
+    }
+
+    /// 1 コネクション分の処理。ストリームが END_STREAM を受信するたびに
+    /// ユーナリー応答一式（HEADERS → DATA(gRPC framing) → トレーラー HEADERS）を返す。
+    fn serve_one_mock_connection(mut stream: TcpStream) -> std::io::Result<()> {
+        stream.set_nodelay(true).ok();
+
+        let mut preface_buf = [0u8; 24];
+        stream.read_exact(&mut preface_buf)?;
+        if preface_buf != *CONNECTION_PREFACE {
+            return Ok(());
+        }
+
+        let frame_decoder = FrameDecoder::new(16384);
+        let frame_encoder = FrameEncoder::new(16384);
+        let mut hpack_dec = crate::http2::hpack::HpackDecoder::new(4096);
+        let mut hpack_enc = crate::http2::hpack::HpackEncoder::new(4096);
+
+        stream.write_all(&frame_encoder.encode_settings(&[], false))?;
+
+        let mut read_buf = Vec::with_capacity(4096);
+        let mut tmp = [0u8; 4096];
+
+        loop {
+            while read_buf.len() < FrameHeader::SIZE {
+                let n = stream.read(&mut tmp)?;
+                if n == 0 {
+                    return Ok(());
+                }
+                read_buf.extend_from_slice(&tmp[..n]);
+            }
+            let header = match frame_decoder.decode_header(&read_buf) {
+                Ok(h) => h,
+                Err(_) => return Ok(()),
+            };
+            let total_len = FrameHeader::SIZE + header.length as usize;
+            while read_buf.len() < total_len {
+                let n = stream.read(&mut tmp)?;
+                if n == 0 {
+                    return Ok(());
+                }
+                read_buf.extend_from_slice(&tmp[..n]);
+            }
+            let payload = read_buf[FrameHeader::SIZE..total_len].to_vec();
+            let end_stream_flag = header.is_end_stream();
+            let stream_id = header.stream_id;
+            let frame_type = header.get_frame_type();
+            read_buf.drain(..total_len);
+
+            match frame_type {
+                Some(FrameType::Settings) => {
+                    if !header.is_ack() {
+                        stream.write_all(&frame_encoder.encode_settings_ack())?;
+                    }
+                }
+                Some(FrameType::Ping) => {
+                    if !header.is_ack() && payload.len() == 8 {
+                        let mut data = [0u8; 8];
+                        data.copy_from_slice(&payload);
+                        stream.write_all(&frame_encoder.encode_ping(&data, true))?;
+                    }
+                }
+                Some(FrameType::Headers) | Some(FrameType::Data) => {
+                    if frame_type == Some(FrameType::Headers) {
+                        let _ = hpack_dec.decode(&payload);
+                    }
+                    if end_stream_flag {
+                        send_mock_unary_response(
+                            &mut stream,
+                            &frame_encoder,
+                            &mut hpack_enc,
+                            stream_id,
+                        )?;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// ユーナリー応答一式（HEADERS → DATA(gRPC framing) → トレーラー HEADERS）を送出する。
+    fn send_mock_unary_response(
+        stream: &mut TcpStream,
+        frame_encoder: &FrameEncoder,
+        hpack_enc: &mut crate::http2::hpack::HpackEncoder,
+        stream_id: u32,
+    ) -> std::io::Result<()> {
+        let resp_headers: Vec<(&[u8], &[u8], bool)> = vec![
+            (b":status", b"200", false),
+            (b"content-type", b"application/grpc", false),
+        ];
+        let header_block = hpack_enc.encode(&resp_headers).expect("hpack encode");
+        stream.write_all(&frame_encoder.encode_headers(
+            stream_id,
+            &header_block,
+            false,
+            true,
+            None,
+        ))?;
+
+        // gRPC 5 バイトフレーミング（圧縮なし・長さ 0）+ 空メッセージ。
+        let grpc_frame = [0u8, 0, 0, 0, 0];
+        stream.write_all(&frame_encoder.encode_data(stream_id, &grpc_frame, false))?;
+
+        let trailer_headers: Vec<(&[u8], &[u8], bool)> = vec![(b"grpc-status", b"0", false)];
+        let trailer_block = hpack_enc.encode(&trailer_headers).expect("hpack encode");
+        stream.write_all(&frame_encoder.encode_headers(
+            stream_id,
+            &trailer_block,
+            true,
+            true,
+            None,
+        ))?;
+        Ok(())
+    }
+
+    /// F-139 効果測定本体。旧方式（`execute_grpc_unary_call`: 1 呼び出し 1 接続）と
+    /// 新方式（`GrpcRunner`: 接続プール、同一上流への逐次呼び出しは 1 コネクションを
+    /// 使い回す）を、同一のモックサーバに対して N = 100 回のユーナリー呼び出しで
+    /// 比較する。
+    ///
+    /// 時間は環境（CI・co-tenant 負荷）でばらつくため `println!` で報告するのみで
+    /// assert しない。F-139 の本質である「接続確立回数」（旧 = N 回、新 = 1 回）を
+    /// assert する。
+    #[test]
+    fn measure_pooled_vs_fresh_connection() {
+        const N: usize = 100;
+
+        // --- 旧方式: execute_grpc_unary_call（1 呼び出し 1 接続） ---
+        let accepted_fresh = Arc::new(AtomicUsize::new(0));
+        let (port_fresh, _server_fresh) = spawn_mock_grpc_server(accepted_fresh.clone());
+        #[allow(clippy::disallowed_methods)]
+        std::thread::sleep(Duration::from_millis(50));
+
+        let start_fresh = Instant::now();
+        for _ in 0..N {
+            let result = execute_grpc_unary_call(
+                "127.0.0.1",
+                port_fresh,
+                false,
+                "/bench.Service/Call",
+                &GrpcMetadataBlob::empty(),
+                &[Bytes::from_static(b"")],
+                5000,
+            );
+            assert!(result.is_ok(), "unary call should succeed: {result:?}");
+        }
+        let elapsed_fresh = start_fresh.elapsed();
+        #[allow(clippy::disallowed_methods)]
+        std::thread::sleep(Duration::from_millis(100));
+        let conns_fresh = accepted_fresh.load(Ordering::SeqCst);
+
+        // --- 新方式: GrpcRunner（接続プール） ---
+        let accepted_pooled = Arc::new(AtomicUsize::new(0));
+        let (port_pooled, _server_pooled) = spawn_mock_grpc_server(accepted_pooled.clone());
+        #[allow(clippy::disallowed_methods)]
+        std::thread::sleep(Duration::from_millis(50));
+
+        let entry = crate::config::UpstreamServerEntry {
+            url: format!("http://127.0.0.1:{port_pooled}"),
+            sni_name: None,
+            use_h2c: true,
+            weight: 1,
+        };
+        let group = UpstreamGroup::new(
+            "bench".to_string(),
+            vec![entry],
+            crate::config::LoadBalanceAlgorithm::RoundRobin,
+            None,
+            false,
+        )
+        .expect("upstream group should build");
+        let mut upstream_groups: HashMap<String, Arc<UpstreamGroup>> = HashMap::new();
+        upstream_groups.insert("bench".to_string(), Arc::new(group));
+
+        let mut runner = GrpcRunner::new();
+        let start_pooled = Instant::now();
+        for call_id in 0..N as u32 {
+            let call = PendingGrpcUnaryCall {
+                module_name: "bench-module".to_string(),
+                call_id,
+                upstream: "bench".to_string(),
+                path: "/bench.Service/Call".to_string(),
+                initial_metadata: GrpcMetadataBlob::empty(),
+                messages: vec![Bytes::from_static(b"")],
+                timeout_ms: 5000,
+            };
+            let mut events = runner.ingest(vec![call], Vec::new(), Vec::new(), &upstream_groups);
+            let mut closed = events
+                .iter()
+                .any(|e| matches!(e, GrpcEvent::Close { call_id: id, .. } if *id == call_id));
+            while !closed {
+                events = runner.poll_all();
+                closed |= events
+                    .iter()
+                    .any(|e| matches!(e, GrpcEvent::Close { call_id: id, .. } if *id == call_id));
+            }
+            // Close 済みなら status_code == OK のはず。
+            for ev in &events {
+                if let GrpcEvent::Close {
+                    status_code,
+                    call_id: id,
+                    ..
+                } = ev
+                {
+                    if *id == call_id {
+                        assert_eq!(
+                            *status_code,
+                            grpc_status::OK,
+                            "call {call_id} should succeed"
+                        );
+                    }
+                }
+            }
+        }
+        let elapsed_pooled = start_pooled.elapsed();
+        #[allow(clippy::disallowed_methods)]
+        std::thread::sleep(Duration::from_millis(100));
+        let conns_pooled = accepted_pooled.load(Ordering::SeqCst);
+
+        println!("=== F-139 WASM gRPC 接続プーリング 効果測定（N={N}） ===");
+        println!(
+            "旧(execute_grpc_unary_call): {:.2} ms（接続確立 {} 回）",
+            elapsed_fresh.as_secs_f64() * 1000.0,
+            conns_fresh
+        );
+        println!(
+            "新(GrpcRunner):              {:.2} ms（接続確立 {} 回）",
+            elapsed_pooled.as_secs_f64() * 1000.0,
+            conns_pooled
+        );
+
+        // F-139 の本質: 逐次呼び出しなら旧方式は毎回新規接続、新方式は 1 本を使い回す。
+        assert_eq!(conns_fresh, N, "旧方式は呼び出し回数だけ接続確立するはず");
+        assert_eq!(
+            conns_pooled, 1,
+            "新方式は接続を再利用し 1 回だけ確立するはず"
+        );
+    }
 }
