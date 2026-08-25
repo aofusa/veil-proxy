@@ -1934,3 +1934,36 @@ veil_musl	h3_proxy_wasm	http2	3	5882.06	306.52MB/s	88.65ms	NA	0	128.1	350.3
 veil_musl	h3_proxy_wasm	http3	1	1597.11	83.29MB/s	542.21ms	NA	0	179.1	470.8
 veil_musl	h3_proxy_wasm	http3	2	1628.55	84.93MB/s	544.38ms	NA	0	168.6	483.8
 veil_musl	h3_proxy_wasm	http3	3	1592.29	83.04MB/s	538.87ms	NA	0	167.1	480.0
+# ==== 2026-08-25 F-159 交互 A/B: ルート解決のリクエスト単価ゼロアロケーション化 ====
+# ホスト: 4 コア Linux x86_64（quiet host、loadavg < 0.3）。io_uring 既定ビルド。
+# base = veil:ab-base（HEAD 01cdb6e）/ new = veil:ab-f159（F-159 適用、8d82bbd）。イメージ ID が別物であることを確認済み。
+# 各ラウンドで 40 秒の持続負荷（-D 40）で定常状態にしてから h2load -n 40000 -c100 -m10 で計測。
+# ラウンドごとに実行順を入替（奇数 base→new / 偶数 new→base）。rps のみ取得（他列は NA）。
+# 結果: h2c_proxy（54,576B）base 中央値 10,321.4 → new 10,594.5 = **+2.65%**（6/6 ラウンドで new 勝ち）
+#       h2c_file（3B）      base 中央値 95,706.8 → new 102,796.4 = **+7.41%**（6/6 ラウンドで new 勝ち）
+#       固定費が支配する 3B のほうが改善幅が大きく、削ったものがリクエスト単価の
+#       アロケーション（約 10 個/req）であることと整合する。
+veil_glibc_base	h2c_proxy	h2c	1	10536.04	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_proxy	h2c	1	10835.14	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_proxy	h2c	2	10497.2	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_proxy	h2c	2	10423.52	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_proxy	h2c	3	10147.09	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_proxy	h2c	3	10424.16	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_proxy	h2c	4	10601.51	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_proxy	h2c	4	10412.31	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_proxy	h2c	5	10230.44	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_proxy	h2c	5	10587.42	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_proxy	h2c	6	10695.9	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_proxy	h2c	6	10222.08	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_file_3b	h2c	1	95834.32	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_file_3b	h2c	1	104957.4	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_file_3b	h2c	2	101127.32	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_file_3b	h2c	2	100401.1	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_file_3b	h2c	3	95169.44	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_file_3b	h2c	3	102882.78	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_file_3b	h2c	4	102710.0	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_file_3b	h2c	4	92662.09	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_file_3b	h2c	5	95579.22	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_file_3b	h2c	5	101576.47	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_file_3b	h2c	6	103185.6	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_file_3b	h2c	6	98094.75	NA	NA	NA	NA	NA	NA
