@@ -116,6 +116,10 @@ fn create_nonblocking_socket(domain: libc::c_int) -> io::Result<RawFd> {
 /// 非同期 TCP リスナー
 pub struct TcpListener {
     fd: RawFd,
+    /// AF_UNIX リスナーかどうか（F-164）。`accept` 時の peer アドレス取得を
+    /// 分岐させるための唯一のフラグ。ホットパスへの影響は accept 経路の
+    /// 1 分岐のみに限定する（型は増やさない）。
+    is_unix: bool,
 }
 
 impl TcpListener {
@@ -158,7 +162,7 @@ impl TcpListener {
             return Err(io::Error::last_os_error());
         }
 
-        Ok(Self { fd })
+        Ok(Self { fd, is_unix: false })
     }
 
     /// SO_REUSEPORT を設定してバインドする
@@ -206,19 +210,35 @@ impl TcpListener {
             return Err(io::Error::last_os_error());
         }
 
-        Ok(Self { fd })
+        Ok(Self { fd, is_unix: false })
     }
 
     /// 新しい接続を非同期で受け入れる（io_uring ACCEPT）
     pub fn accept(&self) -> Accept<'_> {
         Accept {
             listener_fd: self.fd,
+            is_unix: self.is_unix,
             user_data: 0,
             addr_storage: Box::new(unsafe { std::mem::zeroed() }),
             addr_len: Box::new(std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t),
             submitted: false,
             _marker: std::marker::PhantomData,
         }
+    }
+
+    /// 既存の AF_UNIX リスナー fd から `TcpListener` を作る（F-164）。
+    ///
+    /// `server::bind_unix_listener` が 1 度だけ bind+listen した共有 fd を、
+    /// 各ワーカーが `dup(2)` した自分専用の fd で呼び出す想定（fd はワーカーごとに
+    /// 独立に close される）。AF_UNIX には `SO_REUSEPORT` が無いため、TCP の
+    /// `bind_reuse_port` とは異なる経路で各ワーカーの `TcpListener` を用意する。
+    ///
+    /// # Safety
+    /// `fd` は listen 済みの有効な AF_UNIX ソケット fd であり、この `TcpListener`
+    /// が所有権を持つこと（Drop で close される）。
+    #[cfg(unix)]
+    pub unsafe fn from_raw_fd_unix(fd: RawFd) -> Self {
+        Self { fd, is_unix: true }
     }
 
     /// ローカルアドレスを取得する
@@ -258,6 +278,9 @@ impl AsRawFd for TcpListener {
 /// accept Future（IORING_OP_ACCEPT）
 pub struct Accept<'a> {
     listener_fd: RawFd,
+    /// AF_UNIX リスナーかどうか（F-164）。`true` の場合、peer アドレスは
+    /// `sockaddr_un` を持たないプレースホルダ `127.0.0.1:0` を返す。
+    is_unix: bool,
     user_data: u64,
     addr_storage: Box<libc::sockaddr_storage>,
     addr_len: Box<libc::socklen_t>,
@@ -313,7 +336,13 @@ impl<'a> Future for Accept<'a> {
                     Poll::Ready(Err(io::Error::from_raw_os_error(-res)))
                 } else {
                     let fd = res;
-                    let peer_addr = storage_to_sockaddr(&self.addr_storage)?;
+                    // F-164: AF_UNIX は sockaddr_un を SocketAddr へ変換できないため、
+                    // プレースホルダを返す（IP ブロックリスト・アクセスログはこの値を見る）。
+                    let peer_addr = if self.is_unix {
+                        SocketAddr::from(([127, 0, 0, 1], 0))
+                    } else {
+                        storage_to_sockaddr(&self.addr_storage)?
+                    };
                     Poll::Ready(Ok((TcpStream { fd }, peer_addr)))
                 }
             }
@@ -1552,5 +1581,61 @@ mod tests {
             received, expected,
             "byte order must be preserved across short writes"
         );
+    }
+
+    /// F-164: AF_UNIX リスナー fd から `TcpListener` を作り、accept が成功すること
+    /// （peer_addr はプレースホルダ `127.0.0.1:0` を返す）。
+    ///
+    /// `server::bind_unix_listener` 相当のセットアップ（bind+listen）を生の libc で行い、
+    /// `from_raw_fd_unix` に渡す（`server.rs` 側のテストはコールドパスの起動配線を、
+    /// こちらは accept 経路のプレースホルダ分岐そのものを検証する）。
+    #[test]
+    // 理由付き allow: テストのソケットパス後始末（起動/イベントループ外のテストコード）。
+    #[allow(clippy::disallowed_methods)]
+    fn test_unix_listener_accept_placeholder_peer_addr() {
+        if !io_uring_available() {
+            eprintln!(
+                "io_uring unavailable; skipping test_unix_listener_accept_placeholder_peer_addr"
+            );
+            return;
+        }
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("veil-f164-uring-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let listener = bind_raw_unix_listener(&path);
+        let fd = listener.as_raw_fd();
+        // TcpListener が fd の所有権を持つため、生の RawFd の二重 close を避けるべく
+        // 元の値を into_raw_fd 相当で手放す（Drop で close されないよう mem::forget）。
+        std::mem::forget(listener);
+        let uds_listener = unsafe { TcpListener::from_raw_fd_unix(fd) };
+
+        let connect_path = path.clone();
+        let client = std::thread::spawn(move || {
+            std::os::unix::net::UnixStream::connect(&connect_path).expect("client connect")
+        });
+
+        let peer_addr = crate::runtime::block_on(async move {
+            let (_stream, peer_addr) = uds_listener.accept().await.expect("accept");
+            peer_addr
+        });
+
+        client.join().expect("client thread join");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(peer_addr, SocketAddr::from(([127, 0, 0, 1], 0)));
+    }
+
+    /// テスト専用: `libc` で直接 AF_UNIX SOCK_STREAM ノンブロッキングソケットを
+    /// bind + listen し、`std::os::unix::net::UnixListener` として返す（`as_raw_fd`
+    /// で fd を取り出して `from_raw_fd_unix` へ渡すために使う）。
+    fn bind_raw_unix_listener(path: &std::path::Path) -> std::os::unix::net::UnixListener {
+        // std の UnixListener は bind 時点で非ブロッキング化されないため、
+        // bind 後に O_NONBLOCK を設定する（本番の `bind_unix_listener` は生成時点で
+        // SOCK_NONBLOCK を使うが、テストでは std の型で十分）。
+        let listener = std::os::unix::net::UnixListener::bind(path).expect("unix bind");
+        listener.set_nonblocking(true).expect("set_nonblocking");
+        listener
     }
 }

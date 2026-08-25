@@ -59,6 +59,68 @@ where
 }
 
 // ====================
+// F-164: TCP / UDS 共通のワーカーリスナー取得
+// ====================
+
+/// メイン TLS リスナー・H2C リスナーのワーカーがそれぞれ自分専用の
+/// `runtime::TcpListener` を得る手段（F-164）。
+///
+/// - TCP: 各ワーカーが `SO_REUSEPORT` で個別に bind する（従来どおり）。
+/// - UDS（`cfg(unix)` のみ）: AF_UNIX に `SO_REUSEPORT` は無いため、ワーカー spawn 前に
+///   `server::bind_unix_listener` で 1 度だけ bind し、各ワーカーはその fd を
+///   `dup(2)` して使う（カーネルが accept を分散する）。
+#[derive(Clone)]
+enum WorkerListenerSource {
+    Tcp(SocketAddr),
+    #[cfg(unix)]
+    Unix(Arc<crate::server::OwnedListenerFd>),
+}
+
+impl WorkerListenerSource {
+    /// `ListenAddr` から、ワーカー spawn 前の準備（UDS の場合は bind）まで済ませて作る。
+    /// `unix_socket_permissions` は `[server].unix_socket_permissions`（8 進数表記の文字列）。
+    fn prepare(
+        addr: &crate::listen_addr::ListenAddr,
+        #[cfg_attr(not(unix), allow(unused_variables))] unix_socket_permissions: &str,
+    ) -> std::io::Result<Self> {
+        match addr {
+            crate::listen_addr::ListenAddr::Tcp(a) => Ok(Self::Tcp(*a)),
+            #[cfg(unix)]
+            crate::listen_addr::ListenAddr::Unix(path) => {
+                let mode = crate::config::parse_unix_socket_permissions(unix_socket_permissions)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+                let fd = crate::server::bind_unix_listener(path, mode)?;
+                Ok(Self::Unix(Arc::new(fd)))
+            }
+        }
+    }
+
+    /// UDS の場合、bind したソケットファイルのパスを返す（グレースフルシャットダウン時の
+    /// unlink 用）。
+    #[cfg(unix)]
+    fn unix_socket_path(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::Tcp(_) => None,
+            Self::Unix(fd) => Some(fd.path()),
+        }
+    }
+
+    /// このワーカー専用の `runtime::TcpListener` を取得する。
+    fn obtain(
+        &self,
+        balancing: ReuseportBalancing,
+        workers: usize,
+        thread_id: usize,
+    ) -> std::io::Result<TcpListener> {
+        match self {
+            Self::Tcp(addr) => create_listener(*addr, balancing, workers, thread_id),
+            #[cfg(unix)]
+            Self::Unix(fd) => fd.dup_listener(),
+        }
+    }
+}
+
+// ====================
 // メイン関数
 // ====================
 
@@ -373,13 +435,23 @@ pub fn run() {
         }
     }
 
-    let listen_addr = loaded_config
-        .listen_addr
-        .parse::<SocketAddr>()
-        .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 443)));
+    // F-164: `unix:<path>` 形式（UDS）も受理する。`config::validate_config` で既に
+    // 検証済みのため、ここでのパース失敗は基本的に起こらない想定だが、防御的に
+    // 従来どおり TCP 既定値へフォールバックする。
+    let listen_kind = crate::listen_addr::ListenAddr::parse(&loaded_config.listen_addr)
+        .unwrap_or_else(|e| {
+            warn!(
+                "Invalid listen address '{}': {} (falling back to 0.0.0.0:443)",
+                loaded_config.listen_addr, e
+            );
+            crate::listen_addr::ListenAddr::Tcp(SocketAddr::from(([0, 0, 0, 0], 443)))
+        });
 
-    // HTTPSリダイレクト用ポートを保存（HTTP→HTTPSリダイレクト時に使用）
-    HTTPS_REDIRECT_PORT.store(listen_addr.port(), std::sync::atomic::Ordering::Relaxed);
+    // HTTPSリダイレクト用ポートを保存（HTTP→HTTPSリダイレクト時に使用）。
+    // UDS にはポートの概念が無いため、TCP のときのみ更新する（既定値 443 のまま = F-164）。
+    if let Some(addr) = listen_kind.tcp_addr() {
+        HTTPS_REDIRECT_PORT.store(addr.port(), std::sync::atomic::Ordering::Relaxed);
+    }
 
     let ktls_config = Arc::new(loaded_config.ktls_config.clone());
 
@@ -830,11 +902,33 @@ pub fn run() {
     #[cfg(target_os = "macos")]
     let listeners_ready = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
+    // メイン TLS リスナーの UDS ソケットファイルパス（bind した場合のみ）。
+    // グレースフルシャットダウン時に veil 自身が作成したファイルを unlink する（F-164）。
+    #[cfg(unix)]
+    let mut main_listener_unix_path: Option<std::path::PathBuf> = None;
+
     // 通常のTLSリスナーを起動（H2C専用サーバーの場合はスキップ）
     if !is_h2c_only_server {
+        // F-164: UDS の場合はワーカー spawn 前に 1 度だけ bind する
+        // （AF_UNIX には SO_REUSEPORT が無いため）。
+        let listener_source = match WorkerListenerSource::prepare(
+            &listen_kind,
+            &loaded_config.unix_socket_permissions,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Bind error on {}: {}", listen_kind, e);
+                return;
+            }
+        };
+        #[cfg(unix)]
+        {
+            main_listener_unix_path = listener_source.unix_socket_path().map(|p| p.to_path_buf());
+        }
+
         info!("============================================");
         info!("HTTPS Server");
-        info!("Listen Address: {}", listen_addr);
+        info!("Listen Address: {}", listen_kind);
         info!("Workers: {} (SO_REUSEPORT enabled)", num_threads);
         info!(
             "TLS Only (plaintext rejected on main listener): {}",
@@ -846,7 +940,7 @@ pub fn run() {
             let acceptor_clone = acceptor.clone();
             // 注: host_routes と path_routes は CURRENT_CONFIG から取得するため、ここでは不要
             // ホットリロード時に各接続が最新の設定を参照できるようにする
-            let addr = listen_addr;
+            let listener_source = listener_source.clone();
             let balancing = reuseport_balancing;
             let workers = num_threads;
             let max_conn = max_connections;
@@ -879,7 +973,7 @@ pub fn run() {
                 }
 
                 crate::runtime::block_on(async move {
-                    let listener = match create_listener(addr, balancing, workers, thread_id) {
+                    let listener = match listener_source.obtain(balancing, workers, thread_id) {
                         Ok(l) => l,
                         Err(e) => {
                             error!("[Thread {}] Bind error: {}", thread_id, e);
@@ -1367,6 +1461,13 @@ pub fn run() {
         );
     }
 
+    // H2C リスナーの UDS ソケットファイルパス（bind した場合のみ）。
+    // グレースフルシャットダウン時に veil 自身が作成したファイルを unlink する（F-164）。
+    // `http2` feature 無効時は代入されないため `mut` が未使用になる。
+    #[cfg(unix)]
+    #[cfg_attr(not(feature = "http2"), allow(unused_mut))]
+    let mut h2c_listener_unix_path: Option<std::path::PathBuf> = None;
+
     // H2C (HTTP/2 Cleartext) サーバー（設定されている場合のみ）
     #[cfg(feature = "http2")]
     if loaded_config.h2c_enabled {
@@ -1375,23 +1476,44 @@ pub fn run() {
             .clone()
             .unwrap_or_else(|| loaded_config.listen_addr.clone());
 
-        let h2c_addr: SocketAddr = match h2c_addr_str.parse() {
-            Ok(addr) => addr,
+        // F-164: `unix:<path>` 形式（UDS）も受理する。
+        let h2c_listen_kind = match crate::listen_addr::ListenAddr::parse(&h2c_addr_str) {
+            Ok(k) => k,
             Err(e) => {
                 error!("Invalid H2C listen address '{}': {}", h2c_addr_str, e);
                 return;
             }
         };
 
+        // F-164: UDS の場合はワーカー spawn 前に 1 度だけ bind する
+        // （AF_UNIX には SO_REUSEPORT が無いため）。
+        let h2c_listener_source = match WorkerListenerSource::prepare(
+            &h2c_listen_kind,
+            &loaded_config.unix_socket_permissions,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Bind error on {}: {}", h2c_listen_kind, e);
+                return;
+            }
+        };
+        #[cfg(unix)]
+        {
+            h2c_listener_unix_path = h2c_listener_source
+                .unix_socket_path()
+                .map(|p| p.to_path_buf());
+        }
+
         info!("============================================");
         info!("H2C (HTTP/2 Cleartext) Server");
-        info!("H2C Listen Address: {}", h2c_addr);
+        info!("H2C Listen Address: {}", h2c_listen_kind);
         info!("H2C Workers: {} (SO_REUSEPORT enabled)", num_threads);
         info!("============================================");
 
         // 各ワーカースレッドでH2Cリスナーを起動
         let core_ids = core_ids.clone();
         for thread_id in 0..num_threads {
+            let h2c_listener_source = h2c_listener_source.clone();
             let balancing = loaded_config.reuseport_balancing;
             let max_conn = loaded_config.global_security.max_concurrent_connections;
 
@@ -1419,7 +1541,7 @@ pub fn run() {
 
                 crate::runtime::block_on(async move {
                     let listener =
-                        match create_listener(h2c_addr, balancing, num_threads, thread_id) {
+                        match h2c_listener_source.obtain(balancing, num_threads, thread_id) {
                             Ok(l) => l,
                             Err(e) => {
                                 error!("[H2C Worker {}] Bind error: {}", thread_id, e);
@@ -1620,6 +1742,18 @@ pub fn run() {
             Err(e) => {
                 error!("Worker thread {} panicked: {:?}", index, e);
             }
+        }
+    }
+
+    // F-164: veil 自身が bind した UDS ソケットファイルを unlink する
+    // （全ワーカー join 後 = accept ループが抜けて fd が close された後）。
+    #[cfg(unix)]
+    {
+        if let Some(path) = main_listener_unix_path {
+            crate::server::unlink_unix_socket(&path);
+        }
+        if let Some(path) = h2c_listener_unix_path {
+            crate::server::unlink_unix_socket(&path);
         }
     }
 

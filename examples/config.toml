@@ -13,6 +13,28 @@
 [server]
 listen = "127.0.0.1:443"
 
+# Unix ドメインソケット（UDS）リスナー（F-164、`cfg(unix)` のみ）
+#
+# listen / h2c_listen は "unix:<path>" 形式でも指定できます。
+#   listen = "unix:/run/veil/https.sock"
+# 対象は listen / h2c_listen のみです（[[l4]].listen・上流バックエンドへの UDS 接続・
+# server.http（HTTPS リダイレクト用平文リスナー）・[http3].listen は非対応。
+# HTTP/3 は QUIC/UDP のため UDS では動作しません）。
+#
+# 注意事項:
+# - Windows では非対応です（設定エラーとして起動を拒否します）。
+# - AF_UNIX には SO_REUSEPORT が無いため、TCP のようにワーカーごとに bind するのではなく、
+#   起動時に 1 度だけ bind し、各ワーカーが fd を dup(2) して使います（カーネルが accept を
+#   分散します）。
+# - 既存パスがソケットファイルの場合のみ自動的に unlink して再利用します（stale socket
+#   対応）。通常ファイル・ディレクトリが存在する場合は安全側に倒して起動エラーになります。
+# - accept したクライアントの peer アドレスは AF_UNIX には無いため、プレースホルダ
+#   "127.0.0.1:0" になります（IP ブロックリスト・アクセスログの送信元 IP はこの値になります）。
+# - listen を unix: にした場合、HTTPS リダイレクト先ポートの自動推定ができないため、
+#   既定値 443 のままになります。
+#
+# unix_socket_permissions = "0660"
+
 # HTTP to HTTPS リダイレクト（オプション）
 #
 # HTTPアクセスをHTTPSにリダイレクトするリスナーを起動します。

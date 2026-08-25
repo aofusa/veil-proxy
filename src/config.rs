@@ -3493,6 +3493,22 @@ pub struct ServerConfigSection {
     pub tls_only: bool,
 
     // ====================
+    // Unix ドメインソケット（UDS）設定（F-164）
+    // ====================
+    /// `[server].listen` / `[server].h2c_listen` に `unix:<path>` を指定した場合の
+    /// ソケットファイルパーミッション（8 進数表記の文字列、既定 `"0660"`）。
+    ///
+    /// bind の前後で `umask(2)` と `chmod(2)` を用いて適用する（Linux では AF_UNIX
+    /// ソケット fd への `fchmod(2)` がパスのパーミッションへ反映されないため）。
+    /// 不正な値（8 進数として解釈できない、
+    /// または `0` 〜 `0777` の範囲外）は設定エラーとして起動を拒否する。
+    ///
+    /// `cfg(unix)` のみで意味を持つ（TCP リスナーには影響しない）。Windows では
+    /// UDS 自体が非対応のため、この設定値も無視される。
+    #[serde(default = "default_unix_socket_permissions")]
+    pub unix_socket_permissions: String,
+
+    // ====================
     // グレースフルシャットダウン設定
     // ====================
     /// グレースフルシャットダウンのドレインタイムアウト（秒）
@@ -3516,6 +3532,73 @@ fn default_graceful_shutdown_timeout() -> u64 {
 /// TLS リスナーへの平文フォールバックを既定で禁止する（F-163）。
 fn default_tls_only() -> bool {
     true
+}
+
+/// `[server].unix_socket_permissions` のデフォルト値（`"0660"`）。
+fn default_unix_socket_permissions() -> String {
+    "0660".to_string()
+}
+
+/// `[server].unix_socket_permissions` の文字列表現をパースする（F-164）。
+///
+/// 8 進数表記（`"0660"` のような先頭 `0` あり、`"660"` のような先頭 `0` なしの
+/// いずれも受理する）。`0` 〜 `0777`（10 進で 511）の範囲外や、8 進数として
+/// 解釈できない文字列はエラーにする。
+pub fn parse_unix_socket_permissions(s: &str) -> Result<u32, String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err(format!("invalid unix_socket_permissions '{}': empty", s));
+    }
+    // `0` は有効な 8 進数字でもあるため、先頭の "0" を特別扱いせず
+    // そのまま基数 8 でパースできる（"0660" と "660" は同じ結果になる）。
+    let mode = u32::from_str_radix(trimmed, 8)
+        .map_err(|e| format!("invalid unix_socket_permissions '{}': {}", s, e))?;
+    if mode > 0o777 {
+        return Err(format!(
+            "invalid unix_socket_permissions '{}': must be between 0 and 0777",
+            s
+        ));
+    }
+    Ok(mode)
+}
+
+#[cfg(test)]
+mod unix_socket_permissions_tests {
+    use super::parse_unix_socket_permissions;
+
+    #[test]
+    fn test_parse_default() {
+        assert_eq!(parse_unix_socket_permissions("0660").unwrap(), 0o660);
+    }
+
+    #[test]
+    fn test_parse_without_leading_zero() {
+        assert_eq!(parse_unix_socket_permissions("660").unwrap(), 0o660);
+    }
+
+    #[test]
+    fn test_parse_full_permissions() {
+        assert_eq!(parse_unix_socket_permissions("0777").unwrap(), 0o777);
+    }
+
+    #[test]
+    fn test_parse_zero() {
+        assert_eq!(parse_unix_socket_permissions("0").unwrap(), 0);
+        assert_eq!(parse_unix_socket_permissions("0000").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_parse_invalid_digit() {
+        assert!(parse_unix_socket_permissions("0888").is_err());
+        assert!(parse_unix_socket_permissions("abc").is_err());
+        assert!(parse_unix_socket_permissions("").is_err());
+    }
+
+    #[test]
+    fn test_parse_out_of_range() {
+        // 0o1000 は 0777 を超える
+        assert!(parse_unix_socket_permissions("1000").is_err());
+    }
 }
 
 /// Serverヘッダーのデフォルト値
@@ -5138,11 +5221,44 @@ fn validate_config(config: &Config) -> io::Result<()> {
         ));
     }
 
-    // バインドアドレスの妥当性チェック
-    if config.server.listen.parse::<SocketAddr>().is_err() {
+    // バインドアドレスの妥当性チェック（F-164: `unix:<path>` も受理する）
+    if let Err(e) = crate::listen_addr::ListenAddr::parse(&config.server.listen) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("Invalid listen address: {}", config.server.listen),
+            format!("Invalid listen address: {}", e),
+        ));
+    }
+
+    // H2C リスニングアドレスの妥当性チェック（F-164: `unix:<path>` も受理する）
+    #[cfg(feature = "http2")]
+    if let Some(ref h2c_listen) = config.server.h2c_listen {
+        if let Err(e) = crate::listen_addr::ListenAddr::parse(h2c_listen) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Invalid h2c_listen address: {}", e),
+            ));
+        }
+    }
+
+    // UDS ソケットパーミッションの妥当性チェック（F-164）
+    if let Err(e) = parse_unix_socket_permissions(&config.server.unix_socket_permissions) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, e));
+    }
+
+    // F-164: HTTP/3（QUIC/UDP）は UDS に載せられない。`[server].listen` が
+    // `unix:<path>` のとき `[http3].listen` が未指定だと、HTTP/3 リスナーが
+    // `[server].listen` を継承して起動時に失敗するため、設定エラーとして先に弾く。
+    #[cfg(feature = "http3")]
+    if config.server.http3_enabled
+        && config.http3.listen.is_none()
+        && crate::listen_addr::ListenAddr::parse(&config.server.listen)
+            .map(|a| a.is_unix())
+            .unwrap_or(false)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "HTTP/3 cannot listen on a unix socket: set [http3].listen to a host:port address \
+             when [server].listen is a unix:<path> address",
         ));
     }
 
@@ -5559,6 +5675,10 @@ fn load_tls_config(
 /// 設定読み込みの戻り値型（統一）
 pub struct LoadedConfig {
     pub listen_addr: String,
+    /// UDS ソケットファイルパーミッション（`[server].unix_socket_permissions`、
+    /// F-164）。8 進数表記の文字列のまま保持し、bind 時に
+    /// `parse_unix_socket_permissions` でパースする。
+    pub unix_socket_permissions: String,
     /// HTTPリスナーアドレス（HTTPSリダイレクト用、オプション）
     pub listen_http_addr: Option<SocketAddr>,
     pub tls_config: Arc<ServerConfig>,
@@ -6267,6 +6387,7 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
 
     Ok(LoadedConfig {
         listen_addr: config.server.listen,
+        unix_socket_permissions: config.server.unix_socket_permissions.clone(),
         listen_http_addr,
         tls_config,
         tls_cert_path: config.tls.cert_path.clone(),

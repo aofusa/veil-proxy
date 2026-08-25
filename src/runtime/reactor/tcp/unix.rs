@@ -147,6 +147,9 @@ fn is_would_block(e: &io::Error) -> bool {
 /// 非同期 TCP リスナー。
 pub struct TcpListener {
     fd: RawFd,
+    /// AF_UNIX リスナーかどうか（F-164）。`accept`/`accept_batch` の peer アドレス
+    /// 取得を分岐させるための唯一のフラグ（`uring::tcp::TcpListener` と同じ設計）。
+    is_unix: bool,
 }
 
 impl TcpListener {
@@ -216,13 +219,28 @@ impl TcpListener {
             return Err(e);
         }
 
-        Ok(Self { fd })
+        Ok(Self { fd, is_unix: false })
+    }
+
+    /// 既存の AF_UNIX リスナー fd から `TcpListener` を作る（F-164）。
+    ///
+    /// `server::bind_unix_listener` が 1 度だけ bind+listen した共有 fd を、
+    /// 各ワーカーが `dup(2)` した自分専用の fd で呼び出す想定（fd はワーカーごとに
+    /// 独立に close される）。AF_UNIX には `SO_REUSEPORT` が無いため、TCP の
+    /// `bind_reuse_port` とは異なる経路で各ワーカーの `TcpListener` を用意する。
+    ///
+    /// # Safety
+    /// `fd` は listen 済みの有効な AF_UNIX ソケット fd であり、この `TcpListener`
+    /// が所有権を持つこと（Drop で close される）。
+    pub unsafe fn from_raw_fd_unix(fd: RawFd) -> Self {
+        Self { fd, is_unix: true }
     }
 
     /// 新しい接続を非同期で受け入れる。
     pub fn accept(&self) -> Accept<'_> {
         Accept {
             listener_fd: self.fd,
+            is_unix: self.is_unix,
             _marker: std::marker::PhantomData,
         }
     }
@@ -282,6 +300,13 @@ impl TcpListener {
                     // 先に TcpStream を構築する: アドレス変換が失敗しても Drop 経由で
                     // fd がクローズされ、リークしない（`Accept::poll` と同じ順序）。
                     let stream = TcpStream { fd };
+                    // F-164: AF_UNIX は sockaddr_un を SocketAddr へ変換できないため、
+                    // プレースホルダを返す（IP ブロックリスト・アクセスログはこの値を見る）。
+                    if self.is_unix {
+                        on_conn(stream, SocketAddr::from(([127, 0, 0, 1], 0)));
+                        count += 1;
+                        continue;
+                    }
                     match storage_to_sockaddr(&storage) {
                         Ok(peer_addr) => {
                             on_conn(stream, peer_addr);
@@ -379,6 +404,9 @@ fn raw_accept_one(listener_fd: RawFd) -> io::Result<Option<(RawFd, libc::sockadd
 /// accept Future（`accept4` の try-first ラッパ）。
 pub struct Accept<'a> {
     listener_fd: RawFd,
+    /// AF_UNIX リスナーかどうか（F-164）。`true` の場合、peer アドレスは
+    /// `sockaddr_un` を持たないプレースホルダ `127.0.0.1:0` を返す。
+    is_unix: bool,
     _marker: std::marker::PhantomData<&'a TcpListener>,
 }
 
@@ -391,7 +419,11 @@ impl<'a> Future for Accept<'a> {
                 // 先に TcpStream を構築する: アドレス変換が失敗しても Drop 経由で
                 // fd がクローズされ、リークしない。
                 let stream = TcpStream { fd };
-                let peer_addr = storage_to_sockaddr(&storage)?;
+                let peer_addr = if self.is_unix {
+                    SocketAddr::from(([127, 0, 0, 1], 0))
+                } else {
+                    storage_to_sockaddr(&storage)?
+                };
                 Poll::Ready(Ok((stream, peer_addr)))
             }
             None => {
@@ -1197,4 +1229,50 @@ pub fn wait_readable_fd(fd: RawFd) -> ReadableFd {
 /// 任意の FD が書き込み可能になるまで待つ。
 pub fn wait_writable_fd(fd: RawFd) -> WritableFd {
     WritableFd { fd }
+}
+
+// ====================
+// テスト
+// ====================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F-164: AF_UNIX リスナー fd から `TcpListener` を作り、accept が成功すること
+    /// （peer_addr はプレースホルダ `127.0.0.1:0` を返す）。reactor（epoll/kqueue）
+    /// バックエンドでの `Accept::poll` の `is_unix` 分岐を検証する
+    /// （`uring::tcp` 側の同名テストと対になる。F-145 の「reactor はテストの
+    /// 空白地帯」の教訓により、両バックエンドに同じテストを置く）。
+    #[test]
+    // 理由付き allow: テストのソケットパス後始末（起動/イベントループ外のテストコード）。
+    #[allow(clippy::disallowed_methods)]
+    fn test_unix_listener_accept_placeholder_peer_addr() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("veil-f164-reactor-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("unix bind");
+        listener.set_nonblocking(true).expect("set_nonblocking");
+        let fd = listener.as_raw_fd();
+        // TcpListener が fd の所有権を持つため、std 側の Drop による二重 close を
+        // 避ける（所有権を明示的に移す）。
+        std::mem::forget(listener);
+        let uds_listener = unsafe { TcpListener::from_raw_fd_unix(fd) };
+
+        let connect_path = path.clone();
+        let client = std::thread::spawn(move || {
+            std::os::unix::net::UnixStream::connect(&connect_path).expect("client connect")
+        });
+
+        let peer_addr = crate::runtime::block_on(async move {
+            let (_stream, peer_addr) = uds_listener.accept().await.expect("accept");
+            peer_addr
+        });
+
+        client.join().expect("client thread join");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(peer_addr, SocketAddr::from(([127, 0, 0, 1], 0)));
+    }
 }

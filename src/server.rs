@@ -24,9 +24,10 @@ use crate::system::*;
 use crate::upstream::*;
 
 use crate::cache;
-// AsRawFd は Linux（CBPF reuseport）と FreeBSD（capsicum rights 制限）の
-// リスナー fd 取得でのみ使用する。OpenBSD 等では未使用のため cfg でゲートする。
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+// AsRawFd は Linux（CBPF reuseport）・FreeBSD（capsicum rights 制限）の
+// リスナー fd 取得に加え、F-164 の UDS リスナー（`OwnedListenerFd`）が
+// `cfg(unix)` 全体で必要とする。Windows 等では未使用のため cfg でゲートする。
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
 // log_ktls_status は crate::logging モジュールに移動しました。
@@ -862,4 +863,298 @@ pub fn create_listener(
     }
 
     Ok(listener)
+}
+
+// ====================
+// Unix ドメインソケット（UDS）リスナー（F-164）
+// ====================
+
+/// AF_UNIX リスナー fd の所有権ラッパー。
+///
+/// `bind_unix_listener` が返す。TCP と異なり AF_UNIX には `SO_REUSEPORT` が無いため、
+/// 各ワーカーが個別に bind するのではなく、この fd を 1 度だけ bind し、各ワーカーは
+/// [`OwnedListenerFd::dup_listener`] で `dup(2)` した自分専用の `runtime::TcpListener`
+/// を作る（カーネルが accept を分散する）。`Drop` はこの元 fd のみを close する
+/// （dup 後の各ワーカーの fd は各自の `TcpListener::drop` で独立に close される）。
+#[cfg(unix)]
+pub struct OwnedListenerFd {
+    fd: std::os::unix::io::RawFd,
+    /// bind したソケットファイルのパス（グレースフルシャットダウン時の unlink 用）。
+    path: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl OwnedListenerFd {
+    /// この fd を `dup(2)` して、ワーカー専用の `runtime::TcpListener` を作る。
+    pub fn dup_listener(&self) -> io::Result<TcpListener> {
+        let new_fd = unsafe { libc::dup(self.fd) };
+        if new_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: dup(2) が返した新規 fd であり、この TcpListener が単独で所有する。
+        Ok(unsafe { TcpListener::from_raw_fd_unix(new_fd) })
+    }
+
+    /// bind したソケットファイルのパス。
+    pub fn path(&self) -> &std::path::Path {
+        self.path.as_path()
+    }
+}
+
+#[cfg(unix)]
+impl AsRawFd for OwnedListenerFd {
+    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.fd
+    }
+}
+
+#[cfg(unix)]
+impl Drop for OwnedListenerFd {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.fd) };
+    }
+}
+
+/// AF_UNIX ソケットにリッスンする（F-164、`[server].listen` / `[server].h2c_listen` の
+/// `unix:<path>` 形式向け）。
+///
+/// ワーカー spawn 前に **1 回だけ** 呼ぶ想定のコールドパス関数（起動時のみ）。
+///
+/// # 挙動
+/// - 既存パスが**ソケットである場合に限り** `unlink` してから bind する
+///   （stale socket 対応）。通常ファイル・ディレクトリの場合は安全側に倒し、
+///   データを消さずにエラーを返す。
+/// - bind 成功後、ソケットファイルへ `mode`（`unix_socket_permissions` 由来）を
+///   `chmod(path, mode)` で適用する。Linux では AF_UNIX ソケット fd に対する
+///   `fchmod(2)` はソケットのバインドされたパスのパーミッションを変更しない
+///   （fd 経由では効果が無い/無視される）ため、パス経由の `chmod` が必須である
+///   （bind 直後〜listen 前に行うため、TOCTOU ウィンドウは他プロセスがまだこの
+///   パスを知らない起動シーケンス内に限られる）。
+/// - FreeBSD capsicum が有効なら `create_listener` と同じ `limit_listener_rights`
+///   をこのリスナー fd にも適用する。
+///
+/// # 引数
+/// * `path` - ソケットファイルパス。
+/// * `mode` - bind 直後に設定するパーミッション（例: `0o660`）。
+// 理由付き allow: 起動時に 1 度だけ呼ばれるコールドパス（ワーカー spawn 前の bind）。
+// `std::fs`/`libc` の同期呼び出しはホットパス（accept 以降のデータプレーン）には
+// 一切含まれない。stat/unlink/bind/chmod/listen はすべて libc 直呼びで完結させ、
+// clippy::disallowed_methods の対象（std::fs::metadata/remove_file 等）を使わない。
+#[cfg(unix)]
+pub fn bind_unix_listener(path: &std::path::Path, mode: u32) -> io::Result<OwnedListenerFd> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+
+    // 既存パスがソケットである場合に限り unlink する（stale socket 対応）。
+    // 通常ファイル・ディレクトリなら安全側に倒してエラーにする。
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let stat_ret = unsafe { libc::stat(c_path.as_ptr(), &mut st) };
+    if stat_ret == 0 {
+        if st.st_mode & libc::S_IFMT == libc::S_IFSOCK {
+            if unsafe { libc::unlink(c_path.as_ptr()) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "refusing to bind unix socket: existing path is not a socket: {}",
+                    path.display()
+                ),
+            ));
+        }
+    } else {
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::NotFound {
+            return Err(e);
+        }
+    }
+
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let path_bytes = path.as_os_str().as_bytes();
+    if path_bytes.len() >= addr.sun_path.len() {
+        unsafe { libc::close(fd) };
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unix socket path too long: {}", path.display()),
+        ));
+    }
+    for (i, &b) in path_bytes.iter().enumerate() {
+        addr.sun_path[i] = b as libc::c_char;
+    }
+    let addr_len =
+        (std::mem::size_of::<libc::sa_family_t>() + path_bytes.len() + 1) as libc::socklen_t;
+
+    // umask を一時的に「mode の補集合」へ設定しておくことで、bind(2) が作る
+    // ソケットファイルを **最初から** 目的のパーミッションで生成する
+    // （bind → chmod の間に緩いパーミッションで見える窓を作らないため）。
+    // ワーカー spawn 前の起動シーケンス内でのみ実行されるコールドパスであり、
+    // 直後に元の umask へ戻す。
+    let old_umask = unsafe { libc::umask((0o777 & !mode) as libc::mode_t) };
+    let bind_ret = unsafe { libc::bind(fd, &addr as *const _ as *const libc::sockaddr, addr_len) };
+    let bind_err = io::Error::last_os_error();
+    unsafe { libc::umask(old_umask) };
+    if bind_ret != 0 {
+        unsafe { libc::close(fd) };
+        return Err(bind_err);
+    }
+
+    // umask は「落とす」方向にしか効かないため、より緩いモード（例: 0666）を
+    // 指定した場合に備えて chmod でも明示的に設定する。Linux では AF_UNIX ソケット
+    // fd への fchmod(2) がパスのパーミッションに反映されないため、パス経由で行う。
+    if unsafe { libc::chmod(c_path.as_ptr(), mode as libc::mode_t) } != 0 {
+        let e = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+
+    if unsafe { libc::listen(fd, 1024) } != 0 {
+        let e = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+
+    // FreeBSD: capsicum が有効なら、このリスナー fd も最小権利へ制限する
+    // （`create_listener` の TCP 経路と同じ適用ポイント）。
+    #[cfg(target_os = "freebsd")]
+    if CURRENT_CONFIG.load().global_security.enable_capsicum {
+        if let Err(e) = crate::security::capsicum::limit_listener_rights(fd) {
+            warn!(
+                "capsicum: failed to limit unix listener rights for {}: {}",
+                path.display(),
+                e
+            );
+        } else {
+            debug!(
+                "capsicum: unix listener rights limited (CAP_ACCEPT|CAP_EVENT|...) for {}",
+                path.display()
+            );
+        }
+    }
+
+    Ok(OwnedListenerFd {
+        fd,
+        path: path.to_path_buf(),
+    })
+}
+
+/// UDS ソケットファイルを unlink する（グレースフルシャットダウン用、F-164）。
+///
+/// 起動時に veil 自身が bind したソケットファイルのみを対象とする想定
+/// （`entry.rs` がシャットダウン経路で呼ぶ）。失敗（既に存在しない等）は警告に留め、
+/// シャットダウンを妨げない。
+// 理由付き allow: シャットダウン時に高々数回呼ばれるコールドパス。
+#[cfg(unix)]
+pub fn unlink_unix_socket(path: &std::path::Path) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = match CString::new(path.as_os_str().as_bytes()) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    if unsafe { libc::unlink(c_path.as_ptr()) } != 0 {
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::NotFound {
+            warn!(
+                "failed to unlink unix socket {} during shutdown: {}",
+                path.display(),
+                e
+            );
+        }
+    } else {
+        debug!("unlinked unix socket {} during shutdown", path.display());
+    }
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+// 理由付き allow: テスト専用モジュール（起動/イベントループ外）。ソケットファイルの
+// 後始末・パーミッション検証・stale ファイル準備に std::fs を使う。
+#[allow(clippy::disallowed_methods)]
+mod uds_tests {
+    use super::*;
+
+    /// F-164: `bind_unix_listener` で bind したソケットへ、各ワーカー相当の
+    /// `dup_listener()` で作った `TcpListener` が accept できること。
+    #[test]
+    fn test_bind_unix_listener_dup_and_accept() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("veil-f164-server-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let owned = bind_unix_listener(&path, 0o660).expect("bind_unix_listener");
+
+        // パーミッションが反映されていること。
+        let meta = std::fs::metadata(&path).expect("metadata");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(meta.permissions().mode() & 0o777, 0o660);
+
+        let listener = owned.dup_listener().expect("dup_listener");
+
+        let connect_path = path.clone();
+        let client = std::thread::spawn(move || {
+            std::os::unix::net::UnixStream::connect(&connect_path).expect("client connect")
+        });
+
+        let peer_addr = crate::runtime::block_on(async move {
+            let (_stream, peer_addr) = listener.accept().await.expect("accept");
+            peer_addr
+        });
+
+        client.join().expect("client thread join");
+        assert_eq!(peer_addr, std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
+
+        drop(owned);
+        unlink_unix_socket(&path);
+        assert!(!path.exists());
+    }
+
+    /// stale socket（前回起動が残した既存のソケットファイル）は再 bind 時に
+    /// 自動的に unlink されて再利用できること。
+    #[test]
+    fn test_bind_unix_listener_replaces_stale_socket() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("veil-f164-stale-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let first = bind_unix_listener(&path, 0o660).expect("first bind");
+        drop(first);
+        // 最初の bind_unix_listener は自分の fd を close するのみでファイルは
+        // unlink しない（プロセス再起動を模すため、意図的にファイルを残す）。
+        assert!(path.exists());
+
+        let second = bind_unix_listener(&path, 0o660).expect("stale socket must be replaced");
+        drop(second);
+        unlink_unix_socket(&path);
+    }
+
+    /// 既存パスが通常ファイルの場合は安全側に倒してエラーになること
+    /// （データを破壊しない）。
+    #[test]
+    fn test_bind_unix_listener_refuses_regular_file() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("veil-f164-regular-{}.sock", std::process::id()));
+        std::fs::write(&path, b"not a socket").expect("write regular file");
+
+        let result = bind_unix_listener(&path, 0o660);
+        assert!(result.is_err());
+
+        let _ = std::fs::remove_file(&path);
+    }
 }

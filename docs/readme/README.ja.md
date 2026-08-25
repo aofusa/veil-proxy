@@ -564,6 +564,18 @@ sudo setcap 'cap_net_bind_service=+ep' ./target/release/veil
 ```toml
 [server]
 listen = "0.0.0.0:443"
+# Unix ドメインソケット（UDS）リスナー（Unix 系のみ）
+# [server].listen / [server].h2c_listen は "unix:<path>" 形式も指定できる。例:
+#   listen = "unix:/run/veil/https.sock"
+# 非対応: [[l4]].listen・上流バックエンドへの UDS 接続・[server].http・[http3].listen
+# （HTTP/3 は QUIC/UDP のため UDS 不可。listen が unix: のときは [http3].listen 必須）。
+# Windows では設定検証でエラーになる。
+# AF_UNIX に SO_REUSEPORT は無いため、起動時に 1 度だけ bind し、各ワーカーがその fd を
+# dup(2) して accept する（カーネルが分散する）。既存のソケットファイルは自動 unlink
+# （通常ファイル・ディレクトリがある場合は安全側に倒して起動エラー）。
+# UDS 接続の peer アドレスはプレースホルダ 127.0.0.1:0 になる
+# （IP ブロックリスト・アクセスログの送信元 IP もこの値）。
+# unix_socket_permissions = "0660"   # ソケットファイルのパーミッション（8 進数文字列）
 # メインリスナーで平文接続を拒否する（既定: true）
 # 適用範囲は [server].listen のみ。true の場合はプロトコル検出（MSG_PEEK）を行わず
 # 常に TLS ハンドシェイクへ進むため、平文 HTTP/1.1 / h2c クライアントは切断される。

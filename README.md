@@ -572,6 +572,18 @@ Configuration file example (`examples/config.toml`):
 ```toml
 [server]
 listen = "0.0.0.0:443"
+# Unix domain socket listeners (Unix only)
+# [server].listen and [server].h2c_listen also accept "unix:<path>", e.g.
+#   listen = "unix:/run/veil/https.sock"
+# Not supported: [[l4]].listen, upstream connections, [server].http and [http3].listen
+# (HTTP/3 is QUIC/UDP and cannot run over a unix socket — set [http3].listen explicitly).
+# Windows rejects unix: addresses at config validation time.
+# AF_UNIX has no SO_REUSEPORT, so veil binds once at startup and every worker dup(2)s
+# that fd; the kernel spreads accepts across them. A stale socket file is unlinked
+# automatically (a regular file or directory at that path is an error instead).
+# The peer address of a UDS connection is reported as the placeholder 127.0.0.1:0
+# (IP blocklist and access logs see this value).
+# unix_socket_permissions = "0660"   # mode applied to the socket file (octal string)
 # Reject plaintext connections on the main listener (default: true)
 # Applies to [server].listen only. When true, protocol detection (MSG_PEEK) is skipped
 # entirely and every connection goes straight to the TLS handshake, so plaintext

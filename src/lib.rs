@@ -99,6 +99,10 @@ pub(crate) mod tls_writev;
 /// rustls 暗号プロバイダ選択（F-122: OpenBSD は ring、他は aws_lc_rs）。
 pub mod tls_provider;
 
+/// リッスンアドレス表現（F-164: `unix:<path>` UDS 対応）。`config`/`server`/`entry` の
+/// いずれからも参照するためクレートルート直下に置く。
+pub mod listen_addr;
+
 pub mod config;
 pub mod config_override;
 pub mod tls_reload;
