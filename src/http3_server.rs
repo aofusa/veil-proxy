@@ -3850,10 +3850,6 @@ async fn proxy_to_h2c_backend_async(
         return Err(io::Error::other(format!("H2C handshake: {}", e)));
     }
 
-    let headers_ref: Vec<(&[u8], &[u8])> = headers
-        .iter()
-        .map(|(k, v)| (k.as_slice(), v.as_slice()))
-        .collect();
     let body = if request_body.is_empty() {
         None
     } else {
@@ -3861,9 +3857,16 @@ async fn proxy_to_h2c_backend_async(
     };
     let authority = target.host.as_bytes();
 
+    // F-166/F-165(A2): 中間 `Vec<(&[u8], &[u8])>` を作らずイテレータを直接渡す。
     let response = match crate::runtime::time::timeout(
         Duration::from_secs(timeout_secs),
-        client.send_request(method, path, authority, &headers_ref, body),
+        client.send_request(
+            method,
+            path,
+            authority,
+            headers.iter().map(|(k, v)| (k.as_slice(), v.as_slice())),
+            body,
+        ),
     )
     .await
     {
@@ -3890,9 +3893,20 @@ async fn proxy_to_h2c_backend_async(
 
     Ok(BackendProxyResult {
         status_code: response.status,
-        body: response.body,
-        headers: response.headers,
-        trailers: response.trailers,
+        // `H2cResponse` は F-166/F-165(A4) で `Bytes` 化されている。`BackendProxyResult`
+        // は本タスクの対象範囲外（HTTP/3 経路）のため型は変えず、境界で `Vec<u8>` へ
+        // 変換する（`Bytes` は一意参照なら `Vec::from` がコピー無しで引き取る）。
+        body: Vec::from(response.body),
+        headers: response
+            .headers
+            .into_iter()
+            .map(|(k, v)| (Vec::from(k), Vec::from(v)))
+            .collect(),
+        trailers: response
+            .trailers
+            .into_iter()
+            .map(|(k, v)| (Vec::from(k), Vec::from(v)))
+            .collect(),
     })
 }
 

@@ -4,12 +4,34 @@
 //! RFC 7540 Section 3.4 に基づく実装。
 
 use crate::runtime::io::{AsyncReadRent, AsyncWriteRentExt};
+use bytes::Bytes;
 use std::io;
 
 use crate::http2::error::{Http2Error, Http2Result};
 use crate::http2::frame::{Frame, FrameDecoder, FrameEncoder, FrameHeader};
 use crate::http2::hpack::{HpackDecoder, HpackEncoder};
 use crate::http2::settings::{defaults, Http2Settings};
+
+/// ヘッダ名スロット（F-166/F-165 A1）。
+///
+/// 既に小文字のヘッダ名（大半のケース）は元スライスを借用するだけでコピーしない。
+/// 大文字を含むヘッダ名（稀）のみ `Owned` に小文字化したバッファを持つ。この
+/// バッファは `crate::pool::lowered_header_name_buf_get`/`_put` の再利用プールから
+/// 借りており、HPACK エンコード完了後にプールへ返却する（warmup 後はヒープ確保ゼロ）。
+enum NameSlot<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Vec<u8>),
+}
+
+impl NameSlot<'_> {
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            NameSlot::Borrowed(s) => s,
+            NameSlot::Owned(v) => v.as_slice(),
+        }
+    }
+}
 
 /// HTTP/2 コネクションプリフェース (クライアントが送信)
 pub const CONNECTION_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -215,41 +237,54 @@ where
     }
 
     /// リクエストを送信してレスポンスを受信
-    pub async fn send_request(
+    ///
+    /// F-166/F-165(A2): `headers` はイテレータで受け取る。呼び出し側（`proxy.rs`
+    /// の `h2_proxy_h2c`）は `ctx.headers` へのフィルタ済みイテレータをそのまま渡せ、
+    /// 中間 `Vec<(&[u8], &[u8])>` の `collect()`（1 リクエスト 1 ヒープ確保）が
+    /// 不要になる。名前の小文字化必須ぶんだけ 2 回走査する（`Clone` 制約）。
+    pub async fn send_request<'h, I>(
         &mut self,
         method: &[u8],
         path: &[u8],
         authority: &[u8],
-        headers: &[(&[u8], &[u8])],
+        headers: I,
         body: Option<&[u8]>,
-    ) -> Http2Result<H2cResponse> {
+    ) -> Http2Result<H2cResponse>
+    where
+        I: Iterator<Item = (&'h [u8], &'h [u8])> + Clone,
+    {
         let stream_id = self.next_stream_id;
         self.next_stream_id += 2;
 
         // ヘッダーリストを構築
         // HTTP/2 はヘッダ名の小文字必須（RFC 9113 §8.2）。H1 からの転送で
         // Content-Type 等が混ざると h2/tonic が HPACK InvalidUtf8 → GOAWAY する（B-40）。
-        // 小文字化した名前は encode 完了までこの Vec に保持する。
-        let mut lowered_names: Vec<Vec<u8>> = Vec::with_capacity(headers.len());
-        for &(name, _) in headers {
+        // F-166/F-165(A1): 既に小文字の名前（大半）は元スライスを借用するだけでコピーしない。
+        // 大文字を含む名前（稀）だけ再利用プールのバッファへ小文字化して書き込む。
+        let mut lowered_names: Vec<NameSlot<'h>> = Vec::new();
+        for (name, _) in headers.clone() {
             if Self::skip_forwarded_request_header(name) {
                 continue;
             }
             if name.iter().any(|b| b.is_ascii_uppercase()) {
-                lowered_names.push(name.to_ascii_lowercase());
+                let mut buf = crate::pool::lowered_header_name_buf_get();
+                buf.extend_from_slice(name);
+                buf.make_ascii_lowercase();
+                lowered_names.push(NameSlot::Owned(buf));
             } else {
-                lowered_names.push(name.to_vec());
+                lowered_names.push(NameSlot::Borrowed(name));
             }
         }
 
-        let mut header_list: Vec<(&[u8], &[u8], bool)> = Vec::with_capacity(headers.len() + 4);
+        let mut header_list: Vec<(&[u8], &[u8], bool)> =
+            Vec::with_capacity(lowered_names.len() + 4);
         header_list.push((b":method", method, false));
         header_list.push((b":path", path, false));
         header_list.push((b":scheme", b"http", false));
         header_list.push((b":authority", authority, false));
 
         let mut li = 0usize;
-        for &(name, value) in headers {
+        for (name, value) in headers.clone() {
             if Self::skip_forwarded_request_header(name) {
                 continue;
             }
@@ -262,6 +297,14 @@ where
             .hpack_encoder
             .encode(&header_list)
             .map_err(|e| Http2Error::HpackEncode(e.to_string()))?;
+
+        // HPACK エンコード完了（`header_list` の借用終了）後、小文字化に使った
+        // プールバッファをここで返却する。
+        for slot in lowered_names {
+            if let NameSlot::Owned(buf) = slot {
+                crate::pool::lowered_header_name_buf_put(buf);
+            }
+        }
 
         // HEADERS フレームを送信
         let headers_frame = self.frame_encoder.encode_headers(
@@ -322,11 +365,16 @@ where
         let mut response = H2cResponse {
             status: 0,
             headers: Vec::new(),
-            body: Vec::new(),
+            body: Bytes::new(),
             trailers: Vec::new(),
         };
 
         let mut headers_received = false;
+        // F-166/F-165(A4): DATA フレームが単一（gRPC 単項応答等で最も一般的）の場合、
+        // 受信済みバッファを `Bytes::from`（ゼロコピー・所有権移動のみ）でそのまま
+        // `response.body` にできる。2 フレーム目以降が来た場合のみ結合用の `Vec` へ
+        // 切り替える（従来の `extend_from_slice` 方式と同等のコストに留める）。
+        let mut body_overflow: Option<Vec<u8>> = None;
 
         loop {
             let frame = self.read_frame().await?;
@@ -358,17 +406,26 @@ where
                                     response.status = s.parse().unwrap_or(0);
                                 }
                             } else if !header.name.starts_with(b":") {
-                                response.headers.push((header.name, header.value));
+                                // `HeaderField` の `Vec<u8>` を `Bytes::from` でムーブ
+                                // （ゼロコピー、F-166）。
+                                response
+                                    .headers
+                                    .push((Bytes::from(header.name), Bytes::from(header.value)));
                             }
                         }
                     } else {
                         // トレイラー (2回目以降の HEADERS フレーム)
                         for header in headers {
-                            response.trailers.push((header.name, header.value));
+                            response
+                                .trailers
+                                .push((Bytes::from(header.name), Bytes::from(header.value)));
                         }
                     }
 
                     if end_stream {
+                        if let Some(buf) = body_overflow.take() {
+                            response.body = Bytes::from(buf);
+                        }
                         return Ok(response);
                     }
                 }
@@ -381,10 +438,31 @@ where
                         continue;
                     }
 
-                    response.body.extend_from_slice(&data);
-
-                    // フロー制御
+                    // フロー制御（`data` は下の match で move されるため長さは先に控える）。
                     let data_len = data.len() as i32;
+
+                    if !data.is_empty() {
+                        match body_overflow.take() {
+                            Some(mut buf) => {
+                                buf.extend_from_slice(&data);
+                                body_overflow = Some(buf);
+                            }
+                            None if response.body.is_empty() => {
+                                // 最初のチャンク: 所有バッファをそのまま `Bytes` 化（ゼロコピー）。
+                                response.body = Bytes::from(data);
+                            }
+                            None => {
+                                // 2 フレーム目: これまでの `Bytes` を Vec へ移し結合を開始する
+                                // （多フレーム応答のみ発生する、従来と同等のコピー量）。
+                                let mut buf = Vec::with_capacity(response.body.len() + data.len());
+                                buf.extend_from_slice(&response.body);
+                                buf.extend_from_slice(&data);
+                                response.body = Bytes::new();
+                                body_overflow = Some(buf);
+                            }
+                        }
+                    }
+
                     self.conn_recv_window -= data_len;
 
                     // WINDOW_UPDATE を送信
@@ -403,6 +481,9 @@ where
                     }
 
                     if end_stream {
+                        if let Some(buf) = body_overflow.take() {
+                            response.body = Bytes::from(buf);
+                        }
                         return Ok(response);
                     }
                 }
@@ -558,12 +639,15 @@ where
 pub struct H2cResponse {
     /// ステータスコード
     pub status: u16,
-    /// レスポンスヘッダー
-    pub headers: Vec<(Vec<u8>, Vec<u8>)>,
-    /// レスポンスボディ
-    pub body: Vec<u8>,
+    /// レスポンスヘッダー（F-166/F-165 A4: `Bytes`。`HeaderField` の `Vec<u8>` から
+    /// `Bytes::from`（ゼロコピー、所有権移動のみ）で変換するため追加コピーは無い）
+    pub headers: Vec<(Bytes, Bytes)>,
+    /// レスポンスボディ（F-166/F-165 A4: 単一 DATA フレームで完結する一般的なケースは
+    /// 受信フレームの所有バッファをそのまま `Bytes` 化しコピーなし。複数フレームに
+    /// またがる場合のみ結合用のコピーが発生する＝従来と同等）
+    pub body: Bytes,
     /// レスポンストレイラー (gRPC用)
-    pub trailers: Vec<(Vec<u8>, Vec<u8>)>,
+    pub trailers: Vec<(Bytes, Bytes)>,
 }
 
 /// H2C gRPC レスポンス
@@ -927,22 +1011,24 @@ mod tests {
         );
 
         let req_body = b"ping-body";
+        let test_headers: [(&[u8], &[u8]); 1] = [(b"x-test", b"1")];
         let resp = drive(client.send_request(
             b"POST",
             b"/echo",
             b"backend.local",
-            &[(b"x-test", b"1")],
+            test_headers.into_iter(),
             Some(req_body),
         ))
         .expect("send_request");
 
         // 応答が正しくパースされる（ゼロコピー化した送信経路でも往復が成立する）。
         assert_eq!(resp.status, 200);
-        assert_eq!(resp.body, resp_body);
+        assert_eq!(resp.body.as_ref(), resp_body.as_slice());
         assert!(resp
             .headers
             .iter()
-            .any(|(n, v)| n == b"content-type" && v == b"text/plain"));
+            .any(|(n, v)| n.as_ref() == b"content-type" as &[u8]
+                && v.as_ref() == b"text/plain" as &[u8]));
 
         // 送出フレーム: HEADERS(END_HEADERS) + DATA(END_STREAM)。
         let frames = parse_frames(&client.stream.written());
@@ -973,7 +1059,7 @@ mod tests {
     #[test]
     fn backend_immediate_eof_returns_error() {
         let mut client = H2cClient::new(ScriptedStream::new(Vec::new()), Http2Settings::default());
-        let result = drive(client.send_request(b"GET", b"/", b"b", &[], None));
+        let result = drive(client.send_request(b"GET", b"/", b"b", std::iter::empty(), None));
         assert!(
             result.is_err(),
             "immediate EOF must yield Err, not hang/panic"
@@ -987,7 +1073,7 @@ mod tests {
         // HEADERS フレームヘッダ(9B)+数バイトだけ渡して切り詰める（宣言長に満たない）。
         let truncated = full[..12.min(full.len())].to_vec();
         let mut client = H2cClient::new(ScriptedStream::new(truncated), Http2Settings::default());
-        let result = drive(client.send_request(b"GET", b"/", b"b", &[], None));
+        let result = drive(client.send_request(b"GET", b"/", b"b", std::iter::empty(), None));
         assert!(result.is_err(), "truncated frame must yield Err, not hang");
     }
 
@@ -996,7 +1082,7 @@ mod tests {
     fn backend_garbage_bytes_returns_error() {
         let garbage = vec![0xffu8; 64];
         let mut client = H2cClient::new(ScriptedStream::new(garbage), Http2Settings::default());
-        let result = drive(client.send_request(b"GET", b"/", b"b", &[], None));
+        let result = drive(client.send_request(b"GET", b"/", b"b", std::iter::empty(), None));
         assert!(result.is_err(), "garbage bytes must yield Err, not panic");
     }
 
@@ -1006,7 +1092,7 @@ mod tests {
         let enc = FrameEncoder::new(16384);
         let goaway = enc.encode_goaway(0, 0, b"");
         let mut client = H2cClient::new(ScriptedStream::new(goaway), Http2Settings::default());
-        let result = drive(client.send_request(b"GET", b"/", b"b", &[], None));
+        let result = drive(client.send_request(b"GET", b"/", b"b", std::iter::empty(), None));
         assert!(matches!(result, Err(Http2Error::ConnectionClosed)));
     }
 
@@ -1017,7 +1103,7 @@ mod tests {
         // クライアントの最初のストリーム ID は 1。
         let rst = enc.encode_rst_stream(1, 0x8 /* CANCEL */);
         let mut client = H2cClient::new(ScriptedStream::new(rst), Http2Settings::default());
-        let result = drive(client.send_request(b"GET", b"/", b"b", &[], None));
+        let result = drive(client.send_request(b"GET", b"/", b"b", std::iter::empty(), None));
         assert!(result.is_err(), "RST_STREAM must yield Err");
     }
 
@@ -1046,15 +1132,15 @@ mod tests {
         script.extend_from_slice(&build_response_sid(3, b"two"));
         let mut client = H2cClient::new(ScriptedStream::new(script), Http2Settings::default());
 
-        let r1 = drive(client.send_request(b"POST", b"/a", b"b", &[], Some(b"x")))
+        let r1 = drive(client.send_request(b"POST", b"/a", b"b", std::iter::empty(), Some(b"x")))
             .expect("first request");
         assert_eq!(r1.status, 200);
-        assert_eq!(r1.body, b"one");
+        assert_eq!(r1.body.as_ref(), b"one" as &[u8]);
 
-        let r2 = drive(client.send_request(b"POST", b"/b", b"b", &[], Some(b"y")))
+        let r2 = drive(client.send_request(b"POST", b"/b", b"b", std::iter::empty(), Some(b"y")))
             .expect("second request (reused connection)");
         assert_eq!(r2.status, 200);
-        assert_eq!(r2.body, b"two");
+        assert_eq!(r2.body.as_ref(), b"two" as &[u8]);
 
         // 送出フレームのストリーム ID は 1（HEADERS/DATA）→ 3（HEADERS/DATA）。
         let frames = parse_frames(&client.stream.written());

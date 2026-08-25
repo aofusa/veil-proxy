@@ -18,6 +18,7 @@ pub(crate) use crate::simple_tls::SimpleTlsClientStream as ClientTls;
 
 use crate::runtime::buf::{IoBuf, IoBufMut};
 use crate::runtime::tcp::TcpStream;
+use bytes::Bytes;
 use ftlog::info;
 use once_cell::sync::Lazy;
 use serde::Deserialize;
@@ -437,22 +438,34 @@ impl H2cConnectionPool {
     }
 
     /// 接続をプールに返却（`is_reusable()` を満たす健全な接続のみ返す）
+    ///
+    /// F-166(B-1)/F-165(A2): `key: String` を要求すると呼び出し側が **毎リクエスト**
+    /// `to_string()` する羽目になる（同一ホストへ何千回も返却する gRPC 中継のホットパス）。
+    /// `&str` で受け取り、**既存ホストへの返却（共通ケース）はハッシュマップ探索 1 回のみで
+    /// 新規アロケーションなし**、未登録ホストのときだけ `to_string()` して新規エントリを
+    /// 挿入する（コールドパス、ホストごとに 1 回だけ発生）。
     pub(crate) fn put(
         &mut self,
-        key: String,
+        key: &str,
         client: crate::http2::H2cClient<TcpStream>,
         max_idle: usize,
         idle_timeout_secs: u64,
     ) {
-        let metric_key = key.clone();
-        let queue = self.connections.entry(key).or_default();
-
-        while queue.len() >= max_idle {
-            queue.pop_front();
+        if let Some(queue) = self.connections.get_mut(key) {
+            while queue.len() >= max_idle {
+                queue.pop_front();
+            }
+            queue.push_back(PooledConnection::new(client, idle_timeout_secs));
+            crate::metrics::set_connection_pool_size(key, queue.len());
+            return;
         }
 
+        // 未登録ホスト（コールドパス）: ここでのみ新規キーを確保する。
+        let mut queue: VecDeque<PooledConnection<crate::http2::H2cClient<TcpStream>>> =
+            VecDeque::new();
         queue.push_back(PooledConnection::new(client, idle_timeout_secs));
-        crate::metrics::set_connection_pool_size(&metric_key, queue.len());
+        crate::metrics::set_connection_pool_size(key, queue.len());
+        self.connections.insert(key.to_string(), queue);
     }
 }
 
@@ -464,6 +477,45 @@ thread_local! {
 #[cfg(feature = "http2")]
 thread_local! {
     pub(crate) static H2C_POOL: RefCell<H2cConnectionPool> = RefCell::new(H2cConnectionPool::new());
+}
+
+// ====================
+// H2C クライアント送信ホットパス用スクラッチプール（F-166/F-165 A1）
+// ====================
+//
+// `H2cClient::send_request` は HTTP/2 が要求するヘッダ名小文字化のうち、
+// 既に小文字のヘッダ名（大半のケース）は元スライスを借用するだけでコピーしない。
+// 大文字を含むヘッダ名（稀）のみ、ここから取り出した再利用バッファへ
+// 小文字化して書き込み、HPACK エンコード完了後にプールへ返却する
+// （リクエストごとの `Vec<u8>` 確保を warmup 後ゼロにする）。
+#[cfg(feature = "http2")]
+thread_local! {
+    static LOWERED_HEADER_NAME_POOL: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// プールに保持するバッファ本数の上限（スレッドごと）。
+/// 1 リクエストのヘッダ数の実用上限をカバーしつつ、無制限肥大を防ぐ。
+#[cfg(feature = "http2")]
+const LOWERED_HEADER_NAME_POOL_MAX: usize = 64;
+
+/// 小文字化ヘッダ名用の再利用バッファを取得（無ければ新規、空の `Vec`）。
+#[cfg(feature = "http2")]
+#[inline]
+pub(crate) fn lowered_header_name_buf_get() -> Vec<u8> {
+    LOWERED_HEADER_NAME_POOL.with(|p| p.borrow_mut().pop().unwrap_or_default())
+}
+
+/// 小文字化ヘッダ名用バッファをプールへ返却（クリアしてから積む）。
+#[cfg(feature = "http2")]
+#[inline]
+pub(crate) fn lowered_header_name_buf_put(mut buf: Vec<u8>) {
+    buf.clear();
+    LOWERED_HEADER_NAME_POOL.with(|p| {
+        let mut pool = p.borrow_mut();
+        if pool.len() < LOWERED_HEADER_NAME_POOL_MAX {
+            pool.push(buf);
+        }
+    });
 }
 
 // kTLS 有効時のスレッドローカル Splice パイプの checkout/return 型プール（B-16）
@@ -909,9 +961,13 @@ pub(crate) fn request_buf_put(mut buf: Vec<u8>) {
 // ====================
 
 /// Serverヘッダー値（起動時/リロード時に更新）
-/// Vec<u8>を使用（ArcSwapはSized型が必要）
-pub(crate) static SERVER_HEADER_VALUE: Lazy<arc_swap::ArcSwap<Vec<u8>>> =
-    Lazy::new(|| arc_swap::ArcSwap::from(Arc::new(Vec::new())));
+///
+/// F-166/F-165(B-2): 値本体を `Bytes` で保持する。ホットパス（`h2_base_headers`）は
+/// `Arc<Bytes>` を `ArcSwap` 越しに読んで **参照カウント clone のみ**で `Bytes` を
+/// 取り出せる（ヒープ確保ゼロ）。起動時/リロード時（コールドパス）のみ `Vec<u8>` から
+/// `Bytes::from` で 1 回変換する。
+pub(crate) static SERVER_HEADER_VALUE: Lazy<arc_swap::ArcSwap<Bytes>> =
+    Lazy::new(|| arc_swap::ArcSwap::from(Arc::new(Bytes::new())));
 
 /// Serverヘッダー有効フラグ
 pub(crate) static SERVER_HEADER_ENABLED: std::sync::atomic::AtomicBool =
@@ -939,20 +995,26 @@ pub fn get_server_header_guard() -> Option<ServerHeaderGuard> {
 ///
 /// このGuardがスコープ内にある限り、ヘッダー値は有効。
 pub struct ServerHeaderGuard {
-    pub(crate) guard: arc_swap::Guard<Arc<Vec<u8>>>,
+    pub(crate) guard: arc_swap::Guard<Arc<Bytes>>,
 }
 
 impl ServerHeaderGuard {
     /// ヘッダータプルとして取得（ゼロコピー）
     #[inline]
     pub fn as_header(&self) -> (&'static [u8], &[u8]) {
-        (b"server", self.guard.as_slice())
+        (b"server", self.guard.as_ref())
     }
 
     /// 値のスライスとして取得
     #[inline]
     pub fn value(&self) -> &[u8] {
-        self.guard.as_slice()
+        self.guard.as_ref()
+    }
+
+    /// 値を `Bytes` として取得（参照カウント clone のみ、ヒープ確保なし。F-166）。
+    #[inline]
+    pub fn value_bytes(&self) -> Bytes {
+        (**self.guard).clone()
     }
 }
 
@@ -960,7 +1022,7 @@ impl ServerHeaderGuard {
 pub(crate) fn init_server_header(enabled: bool, value: &str) {
     // 値を先に設定（順序重要: リロード時の競争状態防止）
     if !value.is_empty() {
-        let value_bytes = Arc::new(value.as_bytes().to_vec());
+        let value_bytes = Arc::new(Bytes::from(value.as_bytes().to_vec()));
         SERVER_HEADER_VALUE.store(value_bytes);
     }
 
@@ -983,8 +1045,11 @@ pub(crate) fn init_server_header(enabled: bool, value: &str) {
 // Server ヘッダーと同じく ArcSwap + AtomicBool でホットパスのゼロコピー参照を実現。
 
 /// Alt-Svc ヘッダー値（起動時/リロード時に更新）
-pub(crate) static ALT_SVC_VALUE: Lazy<arc_swap::ArcSwap<Vec<u8>>> =
-    Lazy::new(|| arc_swap::ArcSwap::from(Arc::new(Vec::new())));
+///
+/// F-166/F-165(B-2): Server ヘッダーと同様に `Bytes` で保持し、ホットパスは
+/// 参照カウント clone のみで値を取得する（ヒープ確保ゼロ）。
+pub(crate) static ALT_SVC_VALUE: Lazy<arc_swap::ArcSwap<Bytes>> =
+    Lazy::new(|| arc_swap::ArcSwap::from(Arc::new(Bytes::new())));
 
 /// Alt-Svc ヘッダー有効フラグ
 pub(crate) static ALT_SVC_ENABLED: std::sync::atomic::AtomicBool =
@@ -1007,20 +1072,26 @@ pub fn get_alt_svc_guard() -> Option<AltSvcGuard> {
 
 /// Alt-Svc 値を保持する Guard
 pub struct AltSvcGuard {
-    pub(crate) guard: arc_swap::Guard<Arc<Vec<u8>>>,
+    pub(crate) guard: arc_swap::Guard<Arc<Bytes>>,
 }
 
 impl AltSvcGuard {
     /// ヘッダータプルとして取得（ゼロコピー）。名前は小文字（HTTP/2/HPACK 向け）。
     #[inline]
     pub fn as_header(&self) -> (&'static [u8], &[u8]) {
-        (b"alt-svc", self.guard.as_slice())
+        (b"alt-svc", self.guard.as_ref())
     }
 
     /// 値のスライスとして取得
     #[inline]
     pub fn value(&self) -> &[u8] {
-        self.guard.as_slice()
+        self.guard.as_ref()
+    }
+
+    /// 値を `Bytes` として取得（参照カウント clone のみ、ヒープ確保なし。F-166）。
+    #[inline]
+    pub fn value_bytes(&self) -> Bytes {
+        (**self.guard).clone()
     }
 }
 
@@ -1030,9 +1101,9 @@ impl AltSvcGuard {
 /// * `value` - ヘッダー値全文（例: `h3=":8443"; ma=86400`）。空なら無効扱い
 pub(crate) fn init_alt_svc(enabled: bool, value: &str) {
     if !value.is_empty() {
-        ALT_SVC_VALUE.store(Arc::new(value.as_bytes().to_vec()));
+        ALT_SVC_VALUE.store(Arc::new(Bytes::from(value.as_bytes().to_vec())));
     } else {
-        ALT_SVC_VALUE.store(Arc::new(Vec::new()));
+        ALT_SVC_VALUE.store(Arc::new(Bytes::new()));
     }
     let effective = enabled && !value.is_empty();
     ALT_SVC_ENABLED.store(effective, std::sync::atomic::Ordering::Release);

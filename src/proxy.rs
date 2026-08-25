@@ -821,16 +821,22 @@ where
 #[cfg(feature = "http2")]
 enum H2RespMsg {
     /// レスポンス head（ステータス + ヘッダ）。最初に 1 回だけ送られる。
+    ///
+    /// F-166/F-165(B-2/A4): ヘッダは `Vec<(Bytes, Bytes)>`。`Bytes` は
+    /// `AsRef<[u8]>` を実装し `send_headers_buffered_end` は既にジェネリクス化済みのため
+    /// 送信側は無改修。定数ヘッダ（server/alt-svc）は `Bytes::from_static`/参照カウント
+    /// clone で構築でき、`h2_proxy_h2c` はバックエンド応答の `Bytes` をムーブするだけで
+    /// 済み、従来の `(k.clone(), v.clone())` ディープコピーが消える。
     Head {
         status: u16,
-        headers: Vec<(Vec<u8>, Vec<u8>)>,
+        headers: Vec<(Bytes, Bytes)>,
         end_stream: bool,
     },
     /// レスポンスボディ断片（ゼロコピー）。
     Body(Bytes),
     /// gRPC トレイラー等（END_STREAM 付き HEADERS）。gRPC 経路でのみ生成・送出する。
     #[cfg(feature = "grpc")]
-    Trailers(Vec<(Vec<u8>, Vec<u8>)>),
+    Trailers(Vec<(Bytes, Bytes)>),
     /// head 送出後のバックエンドエラー等でストリームをリセットする（RST_STREAM エラーコード）。
     Reset(u32),
 }
@@ -1234,11 +1240,11 @@ where
                         let mut grpc_status = 0u32;
                         let mut grpc_message: Option<String> = None;
                         for (name, value) in &_trailers {
-                            if name == b"grpc-status" {
+                            if name.as_ref() == b"grpc-status" as &[u8] {
                                 if let Ok(s) = std::str::from_utf8(value) {
                                     grpc_status = s.trim().parse().unwrap_or(0);
                                 }
-                            } else if name == b"grpc-message" {
+                            } else if name.as_ref() == b"grpc-message" as &[u8] {
                                 grpc_message =
                                     std::str::from_utf8(value).ok().map(|s| s.to_string());
                             }
@@ -1458,17 +1464,19 @@ async fn h2_send(
 }
 
 /// サーバー/Alt-Svc 等の共通レスポンスヘッダを所有ベクタで構築する。
+///
+/// F-166: 名前は静的定数（`Bytes::from_static`）、値は Guard から参照カウント
+/// `clone()`（`value_bytes()`）で取得する。**リクエストごとの `Vec<u8>` 確保はゼロ**
+/// （外側の `Vec` 自体は呼び出しごとに 1 回のみ確保。中身の名前/値はヒープ確保なし）。
 #[cfg(feature = "http2")]
-fn h2_base_headers(add_alt_svc: bool) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut headers: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(4);
+fn h2_base_headers(add_alt_svc: bool) -> Vec<(Bytes, Bytes)> {
+    let mut headers: Vec<(Bytes, Bytes)> = Vec::with_capacity(2);
     if let Some(ref g) = get_server_header_guard() {
-        let (n, v) = g.as_header();
-        headers.push((n.to_vec(), v.to_vec()));
+        headers.push((Bytes::from_static(b"server"), g.value_bytes()));
     }
     if add_alt_svc {
         if let Some(g) = get_alt_svc_guard() {
-            let (n, v) = g.as_header();
-            headers.push((n.to_vec(), v.to_vec()));
+            headers.push((Bytes::from_static(b"alt-svc"), g.value_bytes()));
         }
     }
     headers
@@ -1480,7 +1488,7 @@ async fn h2_emit_full(
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
     status: u16,
-    headers: Vec<(Vec<u8>, Vec<u8>)>,
+    headers: Vec<(Bytes, Bytes)>,
     body: Bytes,
 ) -> (u16, u64) {
     let len = body.len() as u64;
@@ -1568,8 +1576,8 @@ async fn h2_dispatch(
             let body = encode_prometheus_metrics();
             let mut headers = h2_base_headers(false);
             headers.push((
-                b"content-type".to_vec(),
-                b"text/plain; version=0.0.4; charset=utf-8".to_vec(),
+                Bytes::from_static(b"content-type"),
+                Bytes::from_static(b"text/plain; version=0.0.4; charset=utf-8"),
             ));
             return h2_emit_full(resp_tx, notify, 200, headers, Bytes::from(body)).await;
         }
@@ -1669,10 +1677,11 @@ async fn h2_dispatch(
                     .await;
                 match wasm_result {
                     crate::wasm::FilterResult::LocalResponse(resp) => {
-                        let mut headers: Vec<(Vec<u8>, Vec<u8>)> = resp
+                        // resp.headers を所有権ムーブで変換（`.clone()` 不要、F-166）。
+                        let mut headers: Vec<(Bytes, Bytes)> = resp
                             .headers
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .into_iter()
+                            .map(|(k, v)| (Bytes::from(k), Bytes::from(v)))
                             .collect();
                         for (n, v) in h2_base_headers(false) {
                             headers.push((n, v));
@@ -1731,10 +1740,11 @@ async fn h2_dispatch(
                 .await;
             match wasm_result {
                 crate::wasm::FilterResult::LocalResponse(resp) => {
-                    let mut headers: Vec<(Vec<u8>, Vec<u8>)> = resp
+                    // resp.headers を所有権ムーブで変換（`.clone()` 不要、F-166）。
+                    let mut headers: Vec<(Bytes, Bytes)> = resp
                         .headers
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .into_iter()
+                        .map(|(k, v)| (Bytes::from(k), Bytes::from(v)))
                         .collect();
                     for (n, v) in h2_base_headers(false) {
                         headers.push((n, v));
@@ -2456,20 +2466,23 @@ async fn h2_proxy_h2c(
         .headers
         .iter()
         .any(|h| header_pair_is_grpc(&h.name, &h.value));
-    let headers_vec: Vec<(&[u8], &[u8])> = ctx
-        .headers
-        .iter()
-        .filter(|h| !h.name.starts_with(b":"))
-        .filter(|h| {
-            !h.name.eq_ignore_ascii_case(b"connection")
-                && !h.name.eq_ignore_ascii_case(b"keep-alive")
-                && !h.name.eq_ignore_ascii_case(b"proxy-connection")
-                && !h.name.eq_ignore_ascii_case(b"transfer-encoding")
-                && !h.name.eq_ignore_ascii_case(b"upgrade")
-                && (is_grpc_upstream || !h.name.eq_ignore_ascii_case(b"te"))
-        })
-        .map(|h| (h.name.as_slice(), h.value.as_slice()))
-        .collect();
+    // F-166/F-165(A2): フィルタ済みイテレータを直接 `send_request` へ渡す
+    // （中間 `Vec<(&[u8], &[u8])>` の `collect()` を回避、1 リクエスト 1 ヒープ確保が消える）。
+    // クロージャは `is_grpc_upstream`（bool、Copy）を借用するだけなので `Clone` になる。
+    let headers_iter = || {
+        ctx.headers
+            .iter()
+            .filter(|h| !h.name.starts_with(b":"))
+            .filter(|h| {
+                !h.name.eq_ignore_ascii_case(b"connection")
+                    && !h.name.eq_ignore_ascii_case(b"keep-alive")
+                    && !h.name.eq_ignore_ascii_case(b"proxy-connection")
+                    && !h.name.eq_ignore_ascii_case(b"transfer-encoding")
+                    && !h.name.eq_ignore_ascii_case(b"upgrade")
+                    && (is_grpc_upstream || !h.name.eq_ignore_ascii_case(b"te"))
+            })
+            .map(|h| (h.name.as_slice(), h.value.as_slice()))
+    };
 
     let body: Option<&[u8]> = if ctx.body.is_empty() {
         None
@@ -2479,13 +2492,13 @@ async fn h2_proxy_h2c(
     let authority = target.host.as_bytes();
 
     let mut send_result = h2c_client
-        .send_request(method, path, authority, &headers_vec, body)
+        .send_request(method, path, authority, headers_iter(), body)
         .await;
     if send_result.is_err() && from_pool {
         if let Ok(fresh) = h2c_connect_and_handshake(addr).await {
             h2c_client = fresh;
             send_result = h2c_client
-                .send_request(method, path, authority, &headers_vec, body)
+                .send_request(method, path, authority, headers_iter(), body)
                 .await;
         }
     }
@@ -2495,17 +2508,14 @@ async fn h2_proxy_h2c(
             if h2c_client.is_reusable() {
                 let max_idle = security.max_idle_connections_per_host;
                 let idle_timeout = security.idle_connection_timeout_secs;
-                H2C_POOL.with(|p| {
-                    p.borrow_mut()
-                        .put(addr.to_string(), h2c_client, max_idle, idle_timeout)
-                });
+                // F-166(B-1)/F-165(A2): `&str` キーで返却。同一ホストへの返却
+                // （共通ケース）は `to_string()` を伴わない（`pool.rs` 参照）。
+                H2C_POOL.with(|p| p.borrow_mut().put(addr, h2c_client, max_idle, idle_timeout));
             }
 
-            let mut header_store: Vec<(Vec<u8>, Vec<u8>)> = h2c_resp
-                .headers
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
+            // F-166(B-2)/F-165(A3/A4): バックエンド応答の `Bytes` ヘッダをそのままムーブする
+            // （従来の `(k.clone(), v.clone())` ディープコピーを排除）。
+            let mut header_store: Vec<(Bytes, Bytes)> = h2c_resp.headers;
             #[cfg(feature = "wasm")]
             {
                 header_store =
@@ -2537,7 +2547,7 @@ async fn h2_proxy_h2c(
             }
 
             if has_body
-                && h2_send(resp_tx, notify, H2RespMsg::Body(Bytes::from(h2c_resp.body)))
+                && h2_send(resp_tx, notify, H2RespMsg::Body(h2c_resp.body))
                     .await
                     .is_err()
             {
@@ -2556,7 +2566,7 @@ async fn h2_proxy_h2c(
                     let trailers = h2c_resp.trailers;
                     let mut grpc_status = 0u32;
                     for (name, value) in &trailers {
-                        if name == b"grpc-status" {
+                        if name.as_ref() == b"grpc-status" as &[u8] {
                             if let Ok(s) = std::str::from_utf8(value) {
                                 grpc_status = s.trim().parse().unwrap_or(0);
                             }
@@ -2758,7 +2768,10 @@ where
                     {
                         continue;
                     }
-                    headers.push((header.name.as_bytes().to_vec(), header.value.to_vec()));
+                    headers.push((
+                        Bytes::copy_from_slice(header.name.as_bytes()),
+                        Bytes::copy_from_slice(header.value),
+                    ));
                 }
                 let (sent, ok) =
                     h2_stream_body_cl(resp_tx, notify, status, headers, backend, body, content_len)
@@ -2783,7 +2796,10 @@ where
                 {
                     continue;
                 }
-                headers.push((header.name.as_bytes().to_vec(), header.value.to_vec()));
+                headers.push((
+                    Bytes::copy_from_slice(header.name.as_bytes()),
+                    Bytes::copy_from_slice(header.value),
+                ));
             }
             let sent =
                 h2_stream_body_chunked(resp_tx, notify, status, headers, backend, body).await;
@@ -2865,8 +2881,14 @@ where
                 AcceptedEncoding::Identity => b"",
             };
             if !encoding_name.is_empty() {
-                headers.push((b"content-encoding".to_vec(), encoding_name.to_vec()));
-                headers.push((b"vary".to_vec(), b"Accept-Encoding".to_vec()));
+                headers.push((
+                    Bytes::from_static(b"content-encoding"),
+                    Bytes::from_static(encoding_name),
+                ));
+                headers.push((
+                    Bytes::from_static(b"vary"),
+                    Bytes::from_static(b"Accept-Encoding"),
+                ));
             }
         }
         for header in resp.headers.iter() {
@@ -2886,7 +2908,12 @@ where
             {
                 continue;
             }
-            headers.push((header.name.as_bytes().to_vec(), header.value.to_vec()));
+            // 応答ヘッダはパース元バッファ（プールへ返却される）を参照しているため、
+            // `Bytes::copy_from_slice` による 1 回のコピーが必要（従来の `to_vec()` と同等）。
+            headers.push((
+                Bytes::copy_from_slice(header.name.as_bytes()),
+                Bytes::copy_from_slice(header.value),
+            ));
         }
 
         let response_body = if let Some(enc) = should_compress {
@@ -2911,7 +2938,7 @@ async fn h2_stream_body_cl<B>(
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
     status: u16,
-    headers: Vec<(Vec<u8>, Vec<u8>)>,
+    headers: Vec<(Bytes, Bytes)>,
     backend: &mut B,
     initial_body: &[u8],
     content_length: usize,
@@ -2998,7 +3025,7 @@ async fn h2_stream_body_chunked<B>(
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
     status: u16,
-    headers: Vec<(Vec<u8>, Vec<u8>)>,
+    headers: Vec<(Bytes, Bytes)>,
     backend: &mut B,
     initial_body: &[u8],
 ) -> u64
@@ -3265,7 +3292,10 @@ async fn h2_redirect(
     }
 
     let mut headers = h2_base_headers(false);
-    headers.push((b"location".to_vec(), final_url.into_bytes()));
+    headers.push((
+        Bytes::from_static(b"location"),
+        Bytes::from(final_url.into_bytes()),
+    ));
     if h2_send(
         resp_tx,
         notify,
@@ -3531,7 +3561,7 @@ fn h2_admin_response(
     path: &[u8],
     client_ip: &str,
     headers_raw: &[(&[u8], &[u8])],
-) -> Option<(u16, Vec<(Vec<u8>, Vec<u8>)>, Vec<u8>)> {
+) -> Option<(u16, Vec<(Bytes, Bytes)>, Vec<u8>)> {
     let config = CURRENT_CONFIG.load();
     let admin_config = &config.admin_config;
     if !admin_config.enabled {
@@ -3607,7 +3637,10 @@ fn h2_admin_response(
     };
 
     let mut headers = h2_base_headers(false);
-    headers.push((b"content-type".to_vec(), b"application/json".to_vec()));
+    headers.push((
+        Bytes::from_static(b"content-type"),
+        Bytes::from_static(b"application/json"),
+    ));
     Some((status, headers, body))
 }
 
@@ -3725,8 +3758,8 @@ fn parse_http1_admin_response(resp: &[u8]) -> (u16, Vec<u8>) {
 async fn apply_h2_wasm_response_headers(
     wasm_modules: &Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
     status: u16,
-    mut header_store: Vec<(Vec<u8>, Vec<u8>)>,
-) -> Vec<(Vec<u8>, Vec<u8>)> {
+    header_store: Vec<(Bytes, Bytes)>,
+) -> Vec<(Bytes, Bytes)> {
     if wasm_modules.is_empty() {
         return header_store;
     }
@@ -3735,14 +3768,17 @@ async fn apply_h2_wasm_response_headers(
         return header_store;
     };
 
+    // WASM エンジン API（`src/wasm/engine.rs`）は `Vec<(Vec<u8>, Vec<u8>)>` 前提
+    // （エンジン内部の型は本タスクの対象ファイル範囲外のため変更しない）。
+    // wasm_modules が空でない稀なケースのみこの境界変換コストを払う。
+    let vec_headers: Vec<(Vec<u8>, Vec<u8>)> = header_store
+        .iter()
+        .map(|(k, v)| (k.to_vec(), v.to_vec()))
+        .collect();
+
     let wasm_result = wasm_engine
         .clone()
-        .on_response_headers_with_modules_async(
-            wasm_modules.clone(),
-            status,
-            header_store.clone(),
-            true,
-        )
+        .on_response_headers_with_modules_async(wasm_modules.clone(), status, vec_headers, true)
         .await;
 
     if let crate::wasm::FilterResult::Continue {
@@ -3750,9 +3786,13 @@ async fn apply_h2_wasm_response_headers(
         ..
     } = wasm_result
     {
-        header_store = modified_headers;
+        modified_headers
+            .into_iter()
+            .map(|(k, v)| (Bytes::from(k), Bytes::from(v)))
+            .collect()
+    } else {
+        header_store
     }
-    header_store
 }
 
 /// gRPC トレイラー（`grpc-status`/`grpc-message` 等）へ WASM レスポンスフィルタを適用（F-133）。
@@ -3763,8 +3803,8 @@ async fn apply_h2_wasm_response_headers(
 #[cfg(all(feature = "http2", feature = "grpc", feature = "wasm"))]
 async fn apply_h2_wasm_response_trailers(
     wasm_modules: &Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
-    trailers: Vec<(Vec<u8>, Vec<u8>)>,
-) -> Vec<(Vec<u8>, Vec<u8>)> {
+    trailers: Vec<(Bytes, Bytes)>,
+) -> Vec<(Bytes, Bytes)> {
     if wasm_modules.is_empty() {
         return trailers;
     }
@@ -3773,12 +3813,20 @@ async fn apply_h2_wasm_response_trailers(
         return trailers;
     };
 
-    let original = trailers.clone();
+    // WASM エンジン API は `Vec<(Vec<u8>, Vec<u8>)>` 前提（境界変換、上記と同様）。
+    let vec_trailers: Vec<(Vec<u8>, Vec<u8>)> = trailers
+        .iter()
+        .map(|(k, v)| (k.to_vec(), v.to_vec()))
+        .collect();
+
     match wasm_engine
-        .on_response_trailers_with_modules(wasm_modules, trailers)
+        .on_response_trailers_with_modules(wasm_modules, vec_trailers)
         .await
     {
-        crate::wasm::FilterResult::Continue { headers, .. } => headers,
+        crate::wasm::FilterResult::Continue { headers, .. } => headers
+            .into_iter()
+            .map(|(k, v)| (Bytes::from(k), Bytes::from(v)))
+            .collect(),
         crate::wasm::FilterResult::Pause | crate::wasm::FilterResult::LocalResponse(_) => {
             // gRPC トレイラー送出時点で HEADERS/DATA は送出済みのため Pause/LocalResponse は
             // 適用できない（既存の送出済みレスポンスを差し替えられない）。元のトレイラーを
@@ -3787,7 +3835,7 @@ async fn apply_h2_wasm_response_trailers(
                 "WASM module requested Pause/LocalResponse on gRPC response trailers, \
                  but response head is already sent; keeping original trailers"
             );
-            original
+            trailers
         }
     }
 }
@@ -3821,7 +3869,7 @@ fn build_h2_compressed_file_response(
     security: &SecurityConfig,
     compression: &CompressionConfig,
     client_encoding: AcceptedEncoding,
-) -> (Vec<(Vec<u8>, Vec<u8>)>, Bytes) {
+) -> (Vec<(Bytes, Bytes)>, Bytes) {
     let should_compress = compression.should_compress(
         client_encoding,
         Some(mime_type.as_bytes()),
@@ -3829,23 +3877,27 @@ fn build_h2_compressed_file_response(
         None,
     );
 
-    let mut header_store: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(8);
-    header_store.push((b"content-type".to_vec(), mime_type.as_bytes().to_vec()));
+    let mut header_store: Vec<(Bytes, Bytes)> = Vec::with_capacity(8);
+    header_store.push((
+        Bytes::from_static(b"content-type"),
+        Bytes::copy_from_slice(mime_type.as_bytes()),
+    ));
     if let Some(ref g) = get_server_header_guard() {
-        let (n, v) = g.as_header();
-        header_store.push((n.to_vec(), v.to_vec()));
+        header_store.push((Bytes::from_static(b"server"), g.value_bytes()));
     }
     for (k, v) in &security.add_response_headers {
-        header_store.push((k.as_bytes().to_vec(), v.as_bytes().to_vec()));
+        header_store.push((
+            Bytes::copy_from_slice(k.as_bytes()),
+            Bytes::copy_from_slice(v.as_bytes()),
+        ));
     }
     // F-94: HTTP/3 広告（Alt-Svc）
     if let Some(g) = get_alt_svc_guard() {
-        let (n, v) = g.as_header();
-        header_store.push((n.to_vec(), v.to_vec()));
+        header_store.push((Bytes::from_static(b"alt-svc"), g.value_bytes()));
     }
 
     let response_body = if let Some(enc) = should_compress {
-        let encoding_name: &[u8] = match enc {
+        let encoding_name: &'static [u8] = match enc {
             AcceptedEncoding::Zstd => b"zstd",
             AcceptedEncoding::Brotli => b"br",
             AcceptedEncoding::Gzip => b"gzip",
@@ -3853,8 +3905,14 @@ fn build_h2_compressed_file_response(
             AcceptedEncoding::Identity => b"",
         };
         if !encoding_name.is_empty() {
-            header_store.push((b"content-encoding".to_vec(), encoding_name.to_vec()));
-            header_store.push((b"vary".to_vec(), b"Accept-Encoding".to_vec()));
+            header_store.push((
+                Bytes::from_static(b"content-encoding"),
+                Bytes::from_static(encoding_name),
+            ));
+            header_store.push((
+                Bytes::from_static(b"vary"),
+                Bytes::from_static(b"Accept-Encoding"),
+            ));
         }
         Bytes::from(compress_body_h2(&data, enc, compression))
     } else {
@@ -7286,12 +7344,6 @@ async fn proxy_h2c(
         return Some((client_stream, 502, 0, true));
     }
 
-    // ヘッダーを変換 (Box<[u8]> -> &[u8])
-    let headers_ref: Vec<(&[u8], &[u8])> = headers
-        .iter()
-        .map(|(k, v)| (k.as_ref(), v.as_ref()))
-        .collect();
-
     // リクエストを送信
     let body = if request_body.is_empty() {
         None
@@ -7300,8 +7352,16 @@ async fn proxy_h2c(
     };
     let authority = target.host.as_bytes();
 
+    // F-166/F-165(A2): `Box<[u8]>` ペアへのイテレータを直接渡す（中間 `Vec` の
+    // `collect()` を回避）。
     let response = match h2c_client
-        .send_request(method, path, authority, &headers_ref, body)
+        .send_request(
+            method,
+            path,
+            authority,
+            headers.iter().map(|(k, v)| (k.as_ref(), v.as_ref())),
+            body,
+        )
         .await
     {
         Ok(resp) => resp,
