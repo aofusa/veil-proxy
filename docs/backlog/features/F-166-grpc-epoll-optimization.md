@@ -34,6 +34,30 @@ gRPC 中継経路のアロケーションが残っている。
   （共有 eventfd の複数待機はあふれ側で従来どおり動く）。
 - **A-4: `park` の `epoll_wait` バッチと `fire_expired` の順序を uring 版（B-72）と揃える。**
 
+### A-2 の詳細設計（ET 常時登録 + ユーザ空間 readiness）
+
+| 状況 | 現状 | 改修後 |
+|---|---|---|
+| 初回の interest 登録 | `epoll_ctl(ADD, EPOLLIN\|EPOLLONESHOT)` | `epoll_ctl(ADD, EPOLLIN\|EPOLLOUT\|EPOLLRDHUP\|EPOLLET)` **1 回だけ** |
+| 2 回目以降の待機 | 毎回 `epoll_ctl(MOD)` | **syscall 無し**（Waker を積むだけ） |
+| 待機前の readiness 確認 | 毎回 `poll(2)` | ヒントがあれば **syscall 無し**、無ければ従来どおり `poll(2)` |
+| イベント受信 | Waker 起床 + armed ビット落とし | Waker 起床 + `read_hint`/`write_hint` を立てる |
+
+**正しさの根拠（ET のエッジ取りこぼしを起こさない理由）:**
+
+1. ヒントは **consume-once**（`take`）。消費した側は必ずその直後に非ブロッキング I/O を試す。
+2. ヒントが無い状態で park する前に **必ず `poll(2)` で現在の readiness を確認する**。
+   したがって「エッジは既に過ぎたがデータは残っている」状態（部分読み取りの後など）でも
+   park せずに `Ready` を返せる。**この `poll(2)` フォールバックは削除禁止**
+   （AGENTS.md の kqueue 版と同じ不変条件）。
+3. 共有 fd（`runtime::offload` の eventfd）に複数待機者がいる場合も、
+   ヒントを取れなかった側は `poll(2)` で確認 → 未 readiness なら再登録（syscall 無し）
+   となり、次の `write(2)` が新しいエッジを生む。
+4. `EPOLLOUT` を常時 armed にすることで生じる余分な起床は、consume-once ヒントを
+   立てるだけで実害が無い（待機者がいなければ Waker 起床も起きない）。
+
+`EPOLL_CTL_DEL` は fd の close で暗黙に行われる（既存の `deregister` を維持）。
+
 ## B. gRPC 中継のアロケーション削減
 
 F-165 の A1〜A4・A6 がそのまま gRPC 中継（`h2_proxy_h2c` → `H2cClient`）の
