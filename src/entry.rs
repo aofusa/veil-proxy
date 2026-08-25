@@ -390,6 +390,7 @@ pub fn run() {
         optimized_router: loaded_config.optimized_router.clone(),
         tls_config: Some(loaded_config.tls_config.clone()),
         ktls_config: ktls_config.clone(),
+        tls_only: loaded_config.tls_only,
         global_security: Arc::new(loaded_config.global_security.clone()),
         prometheus_config: Arc::new(loaded_config.prometheus_config.clone()),
         #[cfg(feature = "admin")]
@@ -835,6 +836,10 @@ pub fn run() {
         info!("HTTPS Server");
         info!("Listen Address: {}", listen_addr);
         info!("Workers: {} (SO_REUSEPORT enabled)", num_threads);
+        info!(
+            "TLS Only (plaintext rejected on main listener): {}",
+            loaded_config.tls_only
+        );
         info!("============================================");
 
         for thread_id in 0..num_threads {
@@ -1353,6 +1358,13 @@ pub fn run() {
         // ローカル変数の Arc をドロップ（参照カウントを減らす）
         drop(tls_cert_pem);
         drop(tls_key_pem);
+    } else {
+        // H2C 専用サーバー構成（TLS リスナー自体が起動しない）のため、
+        // `[server].tls_only` は影響しない（F-163）。
+        info!(
+            "H2C-only server configuration detected (h2c_enabled=true, h2c_listen unset or == listen); \
+             TLS listener is not started, so [server].tls_only has no effect"
+        );
     }
 
     // H2C (HTTP/2 Cleartext) サーバー（設定されている場合のみ）

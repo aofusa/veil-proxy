@@ -572,6 +572,13 @@ Configuration file example (`examples/config.toml`):
 ```toml
 [server]
 listen = "0.0.0.0:443"
+# Reject plaintext connections on the main listener (default: true)
+# Applies to [server].listen only. When true, protocol detection (MSG_PEEK) is skipped
+# entirely and every connection goes straight to the TLS handshake, so plaintext
+# HTTP/1.1 and h2c clients are disconnected. Set to false to accept h2c / plaintext
+# HTTP/1.1 on the TLS port (requires h2c_enabled = true), which is the pre-0.8 behavior.
+# [server].h2c_listen, [server].http (redirect listener) and [[l4]] are unaffected.
+tls_only = true
 # HTTP to HTTPS redirect (optional)
 # Automatically redirect HTTP access to HTTPS (301 Moved Permanently)
 http = "0.0.0.0:80"

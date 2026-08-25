@@ -564,6 +564,13 @@ sudo setcap 'cap_net_bind_service=+ep' ./target/release/veil
 ```toml
 [server]
 listen = "0.0.0.0:443"
+# メインリスナーで平文接続を拒否する（既定: true）
+# 適用範囲は [server].listen のみ。true の場合はプロトコル検出（MSG_PEEK）を行わず
+# 常に TLS ハンドシェイクへ進むため、平文 HTTP/1.1 / h2c クライアントは切断される。
+# false にすると従来どおり TLS ポートで h2c / 平文 HTTP/1.1 を受理する
+# （h2c_enabled = true が必要）。
+# [server].h2c_listen・[server].http（リダイレクト用）・[[l4]] には影響しない。
+tls_only = true
 # HTTP to HTTPSリダイレクト（オプション）
 # HTTPアクセスを自動的にHTTPSにリダイレクト（301 Moved Permanently）
 http = "0.0.0.0:80"
@@ -2666,6 +2673,9 @@ curl --http2-prior-knowledge http://localhost:8080/
 #### 注意事項
 
 - `--features http2` でビルドする必要があります
+- **既定では TLS ポート（`[server].listen`）で h2c / 平文 HTTP/1.1 を受理しません**
+  （`[server].tls_only = true` が既定。F-163）。TLS ポートと同居させたい場合は
+  `tls_only = false` を明示するか、`h2c_listen` で専用ポートを分けてください
 - 平文通信のため、本番環境では内部ネットワークでのみ使用を推奨
 - ALPNネゴシエーションは行われません（Prior Knowledgeモード）
 - プロトコル検出は接続開始時の最初の数バイトを確認して行われます

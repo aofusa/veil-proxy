@@ -3473,6 +3473,25 @@ pub struct ServerConfigSection {
     #[cfg_attr(not(feature = "http2"), allow(dead_code))]
     pub h2c_listen: Option<String>,
 
+    /// TLSリスナー（[server].listen）で平文接続を拒否するかどうか（既定 `true`）
+    ///
+    /// 適用範囲はメインリスナー（`[server].listen`）のみです。
+    /// `[server].h2c_listen`、`listen_http`（HTTPS リダイレクト用）、`[[l4]]` など
+    /// 明示的に平文を扱う経路には影響しません。
+    ///
+    /// `true`（既定）の場合、メインリスナーではプロトコル検出（MSG_PEEK）自体を行わず、
+    /// 接続は常に TLS ハンドシェイクへ渡されます。平文クライアントはハンドシェイク失敗で
+    /// 切断されます。これは最も厳格な既定であると同時に、接続ごとの MSG_PEEK 往復
+    /// （最大 200ms 待ち）を省くためホットパス的にも有利です。
+    ///
+    /// `false` の場合、`h2c_enabled = true` であれば従来どおりメインリスナーで
+    /// h2c / 平文 HTTP/1.1 を受理します（プロトコル検出を実行）。
+    ///
+    /// 注意: `h2c_enabled = true` かつ `h2c_listen` が未指定または `listen` と同一の場合、
+    /// H2C 専用サーバー（TLS リスナー自体が起動しない）となるため、この設定は影響しません。
+    #[serde(default = "default_tls_only")]
+    pub tls_only: bool,
+
     // ====================
     // グレースフルシャットダウン設定
     // ====================
@@ -3490,6 +3509,13 @@ pub struct ServerConfigSection {
 /// グレースフルシャットダウンタイムアウトのデフォルト値（30秒）
 fn default_graceful_shutdown_timeout() -> u64 {
     30
+}
+
+/// `[server].tls_only` のデフォルト値（`true`）
+///
+/// TLS リスナーへの平文フォールバックを既定で禁止する（F-163）。
+fn default_tls_only() -> bool {
+    true
 }
 
 /// Serverヘッダーのデフォルト値
@@ -5536,6 +5562,8 @@ pub struct LoadedConfig {
     /// HTTPリスナーアドレス（HTTPSリダイレクト用、オプション）
     pub listen_http_addr: Option<SocketAddr>,
     pub tls_config: Arc<ServerConfig>,
+    /// TLSリスナーで平文接続を拒否するかどうか（F-163、既定 `true`）
+    pub tls_only: bool,
     /// TLS証明書パス（ログ・表示用）
     #[cfg_attr(not(feature = "http3"), allow(dead_code))]
     pub tls_cert_path: String,
@@ -5653,6 +5681,10 @@ pub struct RuntimeConfig {
     pub tls_config: Option<Arc<ServerConfig>>,
     /// kTLS設定（ホットリロード時の参照用）
     pub ktls_config: Arc<KtlsConfig>,
+    /// TLSリスナーで平文接続を拒否するかどうか（F-163、既定 `true`）
+    ///
+    /// メインリスナー（`[server].listen`）のみに適用される。ホットリロード対象。
+    pub tls_only: bool,
     /// グローバルセキュリティ設定（ホットリロード時の参照用）
     pub global_security: Arc<GlobalSecurityConfig>,
     /// Prometheusメトリクス設定
@@ -5698,6 +5730,7 @@ impl Default for RuntimeConfig {
             optimized_router: Arc::new(routing::OptimizedRouter::new()),
             tls_config: None,
             ktls_config: Arc::new(KtlsConfig::default()),
+            tls_only: default_tls_only(),
             global_security: Arc::new(GlobalSecurityConfig::default()),
             prometheus_config: Arc::new(PrometheusConfig::default()),
             #[cfg(feature = "admin")]
@@ -5772,6 +5805,7 @@ pub fn reload_config(path: &Path) -> io::Result<()> {
         // TLS設定は起動時のものを維持（セキュリティ上の理由）
         tls_config: current.tls_config.clone(),
         ktls_config: current.ktls_config.clone(),
+        tls_only: loaded.tls_only,
         global_security: Arc::new(loaded.global_security),
         prometheus_config: Arc::new(loaded.prometheus_config),
         #[cfg(feature = "admin")]
@@ -5831,6 +5865,8 @@ pub struct LoadedConfigWithoutTls {
     pub h2c_enabled: bool,
     #[cfg(feature = "http2")]
     pub h2c_listen: Option<String>,
+    /// TLSリスナーで平文接続を拒否するかどうか（F-163、既定 `true`）
+    pub tls_only: bool,
     pub performance: PerformanceConfigSection,
 }
 
@@ -5970,6 +6006,7 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
         h2c_enabled,
         #[cfg(feature = "http2")]
         h2c_listen,
+        tls_only: config.server.tls_only,
         performance: config.performance.clone(),
     })
 }
@@ -6239,6 +6276,7 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         tls_cipher_suites: config.tls.cipher_suites.clone(),
         tls_cert_pem: Arc::new(tls_cert_pem),
         tls_key_pem: Arc::new(tls_key_pem),
+        tls_only: config.server.tls_only,
         route: routes,
         optimized_router,
         ktls_config,
@@ -6901,6 +6939,44 @@ mod blocklist_tests {
 
         // グローバル状態を空に戻す（他テストへの影響を避ける）
         set_global_blocked_ips(&[]);
+    }
+}
+
+// ====================
+// F-163: [server].tls_only のテスト
+// ====================
+#[cfg(test)]
+mod tls_only_tests {
+    use super::*;
+
+    #[test]
+    fn test_tls_only_default_is_true() {
+        // tls_only を省略すると true になる
+        let toml = r#"
+listen = "0.0.0.0:8443"
+"#;
+        let cfg: ServerConfigSection = toml::from_str(toml).unwrap();
+        assert!(cfg.tls_only);
+    }
+
+    #[test]
+    fn test_tls_only_deser_false() {
+        let toml = r#"
+listen = "0.0.0.0:8443"
+tls_only = false
+"#;
+        let cfg: ServerConfigSection = toml::from_str(toml).unwrap();
+        assert!(!cfg.tls_only);
+    }
+
+    #[test]
+    fn test_tls_only_deser_true_explicit() {
+        let toml = r#"
+listen = "0.0.0.0:8443"
+tls_only = true
+"#;
+        let cfg: ServerConfigSection = toml::from_str(toml).unwrap();
+        assert!(cfg.tls_only);
     }
 }
 

@@ -4240,7 +4240,7 @@ pub async fn handle_connection(
     #[cfg(feature = "http2")]
     {
         let config = CURRENT_CONFIG.load();
-        if config.h2c_enabled {
+        if config.h2c_enabled && !config.tls_only {
             let (protocol_type, initial_data) = detect_protocol_with_buffer(&mut stream).await;
             initial_buffer = Some(initial_data);
 
@@ -4336,7 +4336,7 @@ pub async fn handle_connection(
     #[cfg(feature = "http2")]
     {
         let config = CURRENT_CONFIG.load();
-        if config.h2c_enabled {
+        if config.h2c_enabled && !config.tls_only {
             let (protocol_type, initial_data) = detect_protocol_with_buffer(&mut stream).await;
             initial_buffer = Some(initial_data);
 
