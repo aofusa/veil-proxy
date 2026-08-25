@@ -1967,3 +1967,46 @@ veil_glibc_base	h2c_file_3b	h2c	5	95579.22	NA	NA	NA	NA	NA	NA
 veil_glibc_new	h2c_file_3b	h2c	5	101576.47	NA	NA	NA	NA	NA	NA
 veil_glibc_new	h2c_file_3b	h2c	6	103185.6	NA	NA	NA	NA	NA	NA
 veil_glibc_base	h2c_file_3b	h2c	6	98094.75	NA	NA	NA	NA	NA	NA
+# ==== 2026-08-25 F-161 交互 A/B: HTTP/3 バックエンド起床通知のコアレッシング ====
+# ホスト: 4 コア Linux x86_64（quiet host）。io_uring 既定ビルド。構成 h3_proxy（54,576B を上流 nginx から中継）。
+# 負荷: QUIC 対応 h2load（local/h2load-h3）--alpn-list=h3 -c100 -m10、毎ラウンド -D 40 の持続負荷で定常状態にしてから -n 30000 で計測。
+# ハーネス: tools/perf/h3_ab.sh（本チケットで新規追加。h2c_proxy_lab.sh の HTTP/3 版）。
+# base = veil:ab-f160（e6e3716）/ new = veil:ab-f161（064392d、F-161 のみ差分）。
+# 結果（16 ラウンド合算）: base 中央値 1,609.0 → new 1,611.4 = **+0.15%**、new 勝ち 8/16。
+#   平均は -0.20%、標準偏差 23.6 / 37.0 rps（1.5〜2.3%）で **差は完全にノイズ内＝非退行**。
+#   1,600 rps 台では QUIC の暗号化・パケット化が支配的で、チャンクごとの
+#   `Rc::clone` + `VecDeque::push_back` + HashMap ルックアップ削減は測定にかからない。
+#   退行が無いこと（AGENTS.md の採否基準）を確認したうえで、無駄な per-chunk 作業を
+#   減らす変更として採用した。
+veil_glibc_base	h3_proxy	http3	1	1643.18	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h3_proxy	http3	1	1597.26	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h3_proxy	http3	2	1645.99	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h3_proxy	http3	2	1618.19	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h3_proxy	http3	3	1668.63	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h3_proxy	http3	3	1601.66	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h3_proxy	http3	4	1604.54	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h3_proxy	http3	4	1602.42	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h3_proxy	http3	5	1602.86	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h3_proxy	http3	5	1594.99	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h3_proxy	http3	6	1608.26	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h3_proxy	http3	6	1628.35	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h3_proxy	http3	7	1594.32	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h3_proxy	http3	7	1614.58	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h3_proxy	http3	8	1615.51	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h3_proxy	http3	8	1595.15	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h3_proxy	http3	9	1614.61	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h3_proxy	http3	9	1614.1	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h3_proxy	http3	10	1497.41	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h3_proxy	http3	10	1611.47	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h3_proxy	http3	11	1597.48	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h3_proxy	http3	11	1572.19	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h3_proxy	http3	12	1615.51	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h3_proxy	http3	12	1619.7	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h3_proxy	http3	13	1606.47	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h3_proxy	http3	13	1608.67	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h3_proxy	http3	14	1647.29	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h3_proxy	http3	14	1616.75	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h3_proxy	http3	15	1591.18	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h3_proxy	http3	15	1666.05	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h3_proxy	http3	16	1617.85	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h3_proxy	http3	16	1563.39	NA	NA	NA	NA	NA	NA
