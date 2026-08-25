@@ -1129,6 +1129,13 @@ revalidate_mtime = false
 # recvmmsg/sendmmsg および IORING_OP_RECVMSG multishot の同時データグラム数。
 # デフォルト: 64
 # mmsg_batch_size = 64
+#
+# 【環境変数による受信バックエンドの切替（設定キーではない）】
+#   VEIL_H3_MULTISHOT=0 … io_uring の RECVMSG バックエンドを無効化し POLL + recvmmsg へ落とす
+#   VEIL_H3_BUFRING=1   … 真の IORING_RECV_MULTISHOT + provided buffer ring（F-130 C2）を試す。
+#                         **既定は無効**（開発・検証機のカーネルが IORING_REGISTER_PBUF_RING を
+#                         拒否し、受信ハッピーパスを実機検証できていないため）。登録・アームに
+#                         失敗した場合は自動的に従来のパイプライン受信（C1）へフォールバックする。
 
 # 1 イテレーションあたりに掻き出す UDP データグラム数の上限（1..=4096、F-152）
 #
@@ -1599,6 +1606,11 @@ revalidate_mtime = false
 # ------------------------------------------
 # 静的ディレクトリ配信
 # ------------------------------------------
+#
+# 【mode = "memory" の注意（F-159）】
+# memory モードのファイルは **設定ロード時に 1 回だけ読み込まれ**、以降はメモリから配信される。
+# ディスク上のファイルを差し替えた場合は設定リロード（SIGHUP）が必要。
+# （F-159 以前はリクエストごとに読み直しており、memory モードの意味を成していなかった。）
 
 # デフォルトインデックス (index.html)
 # [[route]]
