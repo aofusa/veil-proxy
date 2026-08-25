@@ -482,10 +482,10 @@ veil-<version>-<target>/
 例:
 
 ```
-packaging/output/veil_0.6.0_amd64.deb
-packaging/output/veil-0.6.0-1.x86_64.rpm
-packaging/output/veil-0.6.0-x86_64-unknown-linux-gnu.tar.gz
-packaging/output/veil-0.6.0-x86_64-unknown-linux-musl.tar.gz
+packaging/output/veil_0.7.0_amd64.deb
+packaging/output/veil-0.7.0-1.x86_64.rpm
+packaging/output/veil-0.7.0-x86_64-unknown-linux-gnu.tar.gz
+packaging/output/veil-0.7.0-x86_64-unknown-linux-musl.tar.gz
 ```
 
 ### ビルド処理の流れ
@@ -507,7 +507,7 @@ packaging/output/veil-0.6.0-x86_64-unknown-linux-musl.tar.gz
 ### Debian / Ubuntu
 
 ```bash
-sudo dpkg -i packaging/output/veil_0.6.0_amd64.deb
+sudo dpkg -i packaging/output/veil_0.7.0_amd64.deb
 sudo apt-get install -f
 sudo systemctl enable --now veil
 ```
@@ -515,7 +515,7 @@ sudo systemctl enable --now veil
 ### Amazon Linux 2023
 
 ```bash
-sudo dnf install -y packaging/output/veil-0.6.0-1.x86_64.rpm
+sudo dnf install -y packaging/output/veil-0.7.0-1.x86_64.rpm
 sudo systemctl enable --now veil
 ```
 
