@@ -14,8 +14,10 @@ Veil の HTTP/1.1・HTTP/2・HTTP/3・gRPC・L4 スループット／レイテ�
   詳細な分析は下記「FreeBSD ネイティブ計測」節を参照。
 - **本ディレクトリの [`results_raw.tsv`](results_raw.tsv)** は `tools/perf` 生データの
   コミット済みコピーで、計測のたびに `# ==== <日付> ...` の節として**追記**していく。
-  **最新のフルスイートは 2026-08-24（B-72 マージ後、全 67 構成 × glibc/musl × 3 反復 = 757 計測）**
-  で、下記「2026-08-24 フルスイート」節がその集計。
+  **最新のフルスイートは 2026-08-25（`full-container`（epoll reactor）と io_uring 既定ビルドの
+  同一コミット比較、全 67 構成 × 2 ビルド × 3 反復 = 756 計測）**で、下記
+  「2026-08-25 full-container（epoll reactor）フルスイート」節がその集計。
+  その前のフルスイートは 2026-08-24（B-72 マージ後、全 67 構成 × glibc/musl × 3 反復 = 757 計測）。
   `bash tools/perf/analyze_results.sh docs/perf/results_raw.tsv` で下表を再集計できる。
   行順は **nginx ベースライン → veil_glibc 各構成 → veil_musl 各構成**（F-118 で明文化）。
   `h3_proxy_buffering` の行のみ、B-46 修正後の同日 scoped 再計測で置換している（下記）。
@@ -32,6 +34,76 @@ Veil の HTTP/1.1・HTTP/2・HTTP/3・gRPC・L4 スループット／レイテ�
 - 各 (config, proto) を warmup 後 3 反復、median±stdev 集計。Errors は Non-2xx
 - gRPC over HTTP/3 はクライアント（k6）非対応のためフェイルセーフで NA（仕様どおり）
 - kTLS はコンテナ（veth）と相性が悪いため feat 系構成では無効（直交表の ktls 因子でのみ計測）
+
+## 2026-08-25 full-container（epoll reactor）フルスイート（全 67 構成 × 2 ビルド × 3 反復）
+
+Linux の **`full-container` feature セット**（`full` + `epoll` = readiness reactor 本番経路。
+Docker / Kubernetes / gVisor など io_uring が seccomp や runtime のエミュレーションで
+制限されがちな環境向け、F-144）のスループットを、**同一コミット・同日ビルドの io_uring 既定
+ビルドと直接比較できる形**で取得した。
+
+- コミット `5ddb413`（F-159 / F-160 / F-139 / F-161 / F-130 C2 / F-162 適用後）
+- `veil:glibc` = `--build-arg CARGO_FEATURES=full`（`veil_rt_uring`）、
+  `veil:container` = `--build-arg CARGO_FEATURES=full-container`（`veil_rt_reactor`）。
+  どちらも `docker/Dockerfile.glibc`・同一コミット・同日ビルド。
+  reactor で動いていることは起動ログ（`enable_io_uring_restrictions ... this build uses the
+  reactor (epoll) runtime backend` の警告）で確認済み。
+- 実行: `BUILDS='glibc container' ITERATIONS=3 bash tools/perf/run_perf.sh`
+- **756 計測すべてで Non-2xx = 0**。`NA` は `grpc_h3*` の 12 行のみ（k6 が gRPC over HTTP/3 に
+  非対応のフェイルセーフ、仕様どおり）。生データは [`results_raw.tsv`](results_raw.tsv) の
+  `# ==== 2026-08-25 full-container ...` 節。
+
+### 代表構成（Req/s 中央値）
+
+| 構成 | プロトコル | nginx | io_uring (`full`) | full-container (`epoll`) | container / uring |
+|---|---|---|---|---|---|
+| `h2_1_ktls_0_lb_kernel_ofc_1` | HTTP/1.1 | 6,663 | 9,271 | 9,316 | **1.005** |
+| `h2_1_ktls_0_lb_kernel_ofc_1` | HTTP/2 | 6,134 | 7,367 | 7,450 | **1.011** |
+| `h2c_file`（3B 静的・平文 h2c） | h2c | 10,651 | 24,546 | 24,903 | **1.015** |
+| `h2c_proxy`（54KB 中継） | h2c | 6,417 | 10,407 | 10,565 | **1.015** |
+| `h2_1_feat_proxy` | HTTP/1.1 | 6,663 | 6,386 | 6,653 | **1.042** |
+| `h3_file_metrics` | HTTP/3 | — | 1,851 | 1,959 | **1.058** |
+| `h3_proxy` | HTTP/3 | — | 1,582 | 1,655 | **1.047** |
+| `grpc_h2_metrics` | gRPC | — | 4,438 | 4,565 | **1.029** |
+| `h2_1_feat_websocket` | WebSocket | — | 3,129 | 4,861 | **1.554** |
+| `h2_0_feat_l4` | L4（平文 9080） | 6,663 | 13,778 | 12,992 | **0.943** |
+| `h2_1_proxy_compression` | HTTP/1.1 | 6,663 | 1,881 | 1,607 | **0.854** |
+
+### プロトコル別の比（container / io_uring、中央値）
+
+| プロトコル | ペア数 | 比の中央値 | 最小 | 最大 |
+|---|---|---|---|---|
+| HTTP/1.1 | 52 | 1.009 | 0.854 | 1.055 |
+| HTTP/2 | 43 | 0.997 | 0.871 | 1.026 |
+| HTTP/3 | 18 | **1.033** | 1.018 | 1.066 |
+| h2c | 2 | 1.015 | 1.015 | 1.015 |
+| gRPC | 6 | 1.024 | 1.007 | 1.029 |
+| WebSocket | 1 | **1.554** | — | — |
+| **全 122 ペア** | 122 | **1.009** | 0.854 | 1.554 |
+
+### 読み方
+
+- **全体としては互角**（全 122 ペアの比の中央値 1.009）。`full-container` は
+  「io_uring が使えない環境向けの代替」であって性能を諦める選択ではない、という
+  F-144 の前提が 4 コア Linux 上の実測でも成り立っている。
+- **HTTP/3 は reactor のほうが一貫して速い（+1.8〜6.6%、18 ペア全部で reactor 勝ち）**。
+  io_uring 側の HTTP/3 受信は `mmsg_batch_size` 本の `IORING_OP_RECVMSG` を常時 in-flight に
+  保つパイプライン（F-130 C1）で、1 データグラムごとに SQE を再投入する。一方 reactor は
+  `recv_drain_max`（既定 64）まで `recvmmsg` で一気に drain するため、**この負荷（-c100 -m10 の
+  QUIC）では「1 回の syscall で何通拾えるか」で reactor が勝っている**。真の multishot + buffer ring
+  （F-130 C2）はまさにここを埋める施策だが、検証機のカーネルが `IORING_REGISTER_PBUF_RING` を
+  拒否するため実測できていない（AGENTS.md / F-130 参照）。
+- **WebSocket は reactor が +55%**。長寿命コネクション上の小さなフレームを往復させる
+  ワークロードで、io_uring 側は 1 フレームごとに SQE 提出 + CQE 回収の固定費を払うのに対し、
+  reactor は readiness ヒント（`poll` の結果）で読み書きを直接発行できる。
+  **1 リクエストあたりのバイト数が小さく往復回数が多いほど reactor 有利**という傾向は、
+  HTTP/3・gRPC の結果とも整合する。
+- **逆に reactor が明確に負けるのは「圧縮を伴うプロキシ」（-13〜15%）と
+  「kTLS + CBPF の HTTP/2」（-12%）、L4（-5.7%）**。前者は CPU バウンド（gzip/brotli）で
+  ワーカーが計算に張り付く構成、後者は kTLS の送信オフロードと `splice(2)` が絡む経路で、
+  いずれも io_uring の完了通知モデルが有利に働く。
+- **`veil:musl` は本計測では測っていない**（比較したい軸が libc ではなくランタイムバックエンド
+  であるため、`BUILDS='glibc container'` に絞った）。musl との比較は 2026-08-24 節を参照。
 
 ## 2026-08-24 フルスイート（B-72 マージ後、全 67 構成 × glibc/musl × 3 反復）
 

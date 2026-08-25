@@ -70,6 +70,28 @@ bash tools/perf/gen_configs.sh
 bash tools/perf/run_perf.sh
 ```
 
+### `full-container`（epoll reactor）ビルドの計測
+
+`BUILDS` は `veil:<name>` というイメージ名と `veil_<name>` というラベルにそのまま使われる。
+したがって **`full-container` feature セット（`full` + `epoll` = readiness reactor）のイメージを
+`veil:container` としてビルドしておけば、`BUILDS` に足すだけで同じマトリクスを計測できる**。
+
+```sh
+# full-container ビルドのイメージを作る（io_uring 既定ビルドと同一コミットから）
+docker build -f docker/Dockerfile.glibc -t veil:container \
+    --build-arg CARGO_FEATURES='full-container' .
+
+# io_uring 既定ビルドと reactor ビルドを同一スイートで比較する
+BUILDS='glibc container' ITERATIONS=3 bash tools/perf/run_perf.sh
+```
+
+**必ず同一コミットから両方をビルドすること**（片方だけ古いイメージを使うと、比較しているのが
+ランタイムバックエンドの差なのかコード差なのか分からなくなる）。reactor で動いていることは
+起動ログの `enable_io_uring_restrictions is set but this build uses the reactor (epoll) runtime
+backend` 警告で確認できる。実測結果は
+[docs/perf/README.md](../../docs/perf/README.md) の「2026-08-25 full-container（epoll reactor）
+フルスイート」節を参照。
+
 リポジトリのどこから実行しても、スクリプトが自身の位置からリポジトリルートと `docker/assets/` を解決します。
 
 各構成は**ウォームアップ後に `ITERATIONS`（既定 3）回**計測します。生データは `results/results_raw.tsv`
