@@ -1,5 +1,30 @@
 # F-139: `proxy_grpc_call` 系の真の双方向ストリーミング・接続プーリング
 
+**ステータス: 完了（2026-08-25）**
+
+## 完了時の実装（2026-08-25）
+
+- **専用 gRPC 実行スレッド**（`src/server.rs::spawn_wasm_grpc_thread`、`src/entry.rs` で起動）。
+  WASM tick スレッド（既定 100ms 周期）で状態機械を駆動すると 1 ステップ 100ms になり
+  従来よりレイテンシが悪化するため分離した。アクティブな呼び出しが無い間は条件変数で待ち、
+  あるときは `poll(2)` で「いずれかのソケットが読み書き可能 or 最短デッドライン」まで待つ
+  （ビジースピンなし）。tick スレッド側の gRPC 実行ブロックは撤去した。
+- **接続プール**（`src/wasm/host/grpc_pool.rs`）: `(host, port, tls)` ごとに HTTP/2 接続を再利用。
+  1 接続 1 アクティブストリーム（チェックアウト / チェックイン）、アイドル 60 秒、
+  GOAWAY / ストリーム ID 枯渇で破棄。呼び出しごとの TCP + TLS ハンドシェイクが消える。
+- **ノンブロッキング状態機械**（`GrpcRunner` / `ActiveCall` / `GrpcEvent`）:
+  `proxy_grpc_send` は half-close を待たずメッセージごとに即時送出、サーバーからのメッセージは
+  到着ごとに `proxy_on_grpc_receive` へ配送する。送信ウィンドウ（接続・ストリーム両方）を追跡し、
+  SETTINGS / WINDOW_UPDATE / PING / GOAWAY / RST_STREAM を処理する。デッドライン超過は
+  `Close(DEADLINE_EXCEEDED)`。イベント順序は InitialMetadata → Message* → TrailingMetadata → Close。
+- `execute_grpc_unary_call`（1 呼び出し 1 接続の同期実装）は単体テスト用の同期フォールバックとして温存。
+
+**既知の制約**: 接続プールミス時の新規 TCP connect / TLS ハンドシェイクのみ同期実行する。
+背景専用スレッド上でありデータプレーン（io_uring イベントループ）には影響しないが、
+その間だけ他の呼び出しの進行が遅れる。理由は `src/wasm/host/grpc_executor.rs` の doc コメント参照。
+
+---
+
 ## 背景
 
 F-134 の調査で、`proxy_grpc_call`/`proxy_grpc_stream`/`proxy_grpc_send` が
