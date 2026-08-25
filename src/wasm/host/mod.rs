@@ -10,6 +10,10 @@ mod foreign;
 pub(crate) mod grpc;
 #[cfg(feature = "grpc")]
 pub mod grpc_executor;
+#[cfg(feature = "grpc")]
+mod grpc_pool;
+#[cfg(feature = "grpc")]
+mod grpc_tls;
 mod headers;
 mod http_call;
 mod logging;

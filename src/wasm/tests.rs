@@ -1293,7 +1293,6 @@ mod p3_grpc_callback_tests {
             service: "grpc.health.v1.Health".to_string(),
             method: "Check".to_string(),
             state: GrpcStreamState::Open,
-            pending_messages: vec![],
             initial_metadata: crate::wasm::host::grpc::GrpcMetadataBlob::empty(),
         };
 

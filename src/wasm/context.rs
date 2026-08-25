@@ -242,10 +242,6 @@ pub struct GrpcStream {
     pub method: String,
     /// Stream state
     pub state: GrpcStreamState,
-    /// Pending messages to send
-    /// F-160: `Bytes` にして half-close 時の一括送出（`clone()`）を
-    /// 参照カウントのみで完結させる。
-    pub pending_messages: Vec<Bytes>,
     /// Initial metadata（直列化バイト列のまま保持。F-160）
     /// `GrpcMetadataBlob` はクレート内部専用の型のため、フィールドも
     /// `pub(crate)` にする（`GrpcStream` は crate 内でのみ組み立てられる）。

@@ -489,7 +489,6 @@ fn proxy_grpc_stream_impl(
         service: service.clone(),
         method: method.clone(),
         state: GrpcStreamState::Open,
-        pending_messages: Vec::new(),
         initial_metadata,
     };
 
@@ -555,8 +554,8 @@ fn proxy_grpc_send_impl(
     use crate::wasm::context::GrpcStreamState;
 
     // Read message data
-    // F-160: 蓄積される `pending_messages` も `Bytes` にして、half-close 時の
-    // `stream.pending_messages.clone()`（複数メッセージ分）を参照カウントのみで済ませる。
+    // F-139: メッセージは `Bytes` のまま逐次グローバル送信キューへ積む
+    // （蓄積してから一括送出する従来方式は廃止、下記コメント参照）。
     let message = if message_size > 0 {
         match read_wasm_memory(caller, message_ptr, message_size) {
             Some(bytes) => Bytes::from(bytes),
@@ -580,36 +579,32 @@ fn proxy_grpc_send_impl(
             return PROXY_RESULT_BAD_ARGUMENT;
         }
 
-        // Queue the message
-        if !message.is_empty() {
-            stream.pending_messages.push(message);
-        }
+        // F-139: 逐次送出。従来（F-134）はメッセージを `pending_messages` へ溜め、
+        // half-close 時にまとめて 1 回だけグローバルレジストリへ登録していた
+        // （真の逐次双方向ストリーミングではなく、クライアントストリーミングの
+        // 簡略実装だった）。ここではメッセージ 1 件ごとに即座に
+        // `GLOBAL_PENDING_GRPC_SENDS` へ登録し、gRPC 実行スレッド
+        // （`src/server.rs::spawn_wasm_grpc_thread`）が対応する `ActiveCall` の
+        // outbox へ push する。対応する呼び出しがまだ実行スレッド側に存在しない
+        // （`proxy_grpc_stream` 直後の最初の送出）場合は、実行スレッドが接続確立に
+        // 必要な情報（upstream/path/initial_metadata）からその場で作成する。
+        let path = format!("/{}/{}", stream.service, stream.method);
+        super::grpc_executor::register_global_pending_grpc_send(
+            super::grpc_executor::PendingGrpcSend {
+                module_name,
+                call_id: stream_id_u32,
+                upstream: stream.upstream.clone(),
+                path,
+                initial_metadata: stream.initial_metadata.clone(),
+                // gRPC ストリームには proxy_grpc_call の timeout_ms 相当の
+                // パラメータが ABI に無いため、既定値を用いる。
+                timeout_ms: 30_000,
+                message,
+                end_of_stream: end_of_stream != 0,
+            },
+        );
 
-        // Handle end of stream
-        //
-        // F-134: 従来はローカル状態を HalfClosed にするだけで、実際に
-        // ネットワークへ何も送出しないまま黙って終わっていた（呼び出し元からは
-        // 成功したように見えるのに proxy_on_grpc_receive/proxy_on_grpc_close が
-        // 永遠に呼ばれない不適合）。ここでゲストが送信した全メッセージを
-        // まとめてグローバルレジストリへ登録し、tick スレッドが 1 回の
-        // HTTP/2 ストリームとして送出する（真の逐次双方向ストリーミングでは
-        // ないクライアントストリーミングの簡略実装。理由・制限は
-        // docs/backlog/features/F-139-wasm-grpc-call-execution.md 参照）。
         if end_of_stream != 0 {
-            let path = format!("/{}/{}", stream.service, stream.method);
-            super::grpc_executor::register_global_pending_grpc_call(
-                super::grpc_executor::PendingGrpcUnaryCall {
-                    module_name,
-                    call_id: stream_id_u32,
-                    upstream: stream.upstream.clone(),
-                    path,
-                    initial_metadata: stream.initial_metadata.clone(),
-                    messages: stream.pending_messages.clone(),
-                    // gRPC ストリームには proxy_grpc_call の timeout_ms 相当の
-                    // パラメータが ABI に無いため、既定値を用いる。
-                    timeout_ms: 30_000,
-                },
-            );
             stream.state = GrpcStreamState::HalfClosed;
             ftlog::debug!(
                 "WASM: proxy_grpc_send - stream_id={} half-closed, queued for execution",
