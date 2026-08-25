@@ -4689,6 +4689,13 @@ fn expire_due_timers(
 ///
 /// per-connection 化により「どの接続が進んだか」を追跡できるため、全接続をダーティ化する
 /// フォールバックは不要（本関数はキューに積まれた cid だけを処理する）。
+///
+/// F-161: 要素は `(cid, queued フラグ)`。**pop → flag=false → mark_dirty** の順で処理する。
+/// flag を先に false に戻してから mark_dirty するため、この間（mark_dirty 実行中も含む）に
+/// バックエンドタスクが新たに notify() しても「flag は false → push される」ため
+/// 取りこぼされず、次の drain で確実に処理される。逆に flag を mark_dirty の後で false に
+/// 戻す順序にすると、mark_dirty 実行後・flag=false 前に発生した notify() が
+/// 「flag はまだ true → push されない」まま消えてしまう（取りこぼし）。
 fn drain_wake_queue(
     wake_queue: &crate::http3_stream::WakeQueue,
     conns: &mut HashMap<ConnectionId<'static>, Http3Handler>,
@@ -4696,7 +4703,8 @@ fn drain_wake_queue(
 ) {
     // borrow は drain 中だけ（`mark_dirty` は `wake_queue` に触れないため二重借用にならない）。
     let mut q = wake_queue.borrow_mut();
-    while let Some(key) = q.pop_front() {
+    while let Some((key, queued)) = q.pop_front() {
+        queued.set(false);
         mark_dirty(conns, dirty_queue, &key);
     }
 }
