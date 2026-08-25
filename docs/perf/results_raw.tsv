@@ -2010,3 +2010,64 @@ veil_glibc_base	h3_proxy	http3	15	1591.18	NA	NA	NA	NA	NA	NA
 veil_glibc_new	h3_proxy	http3	15	1666.05	NA	NA	NA	NA	NA	NA
 veil_glibc_new	h3_proxy	http3	16	1617.85	NA	NA	NA	NA	NA	NA
 veil_glibc_base	h3_proxy	http3	16	1563.39	NA	NA	NA	NA	NA	NA
+# ==== 2026-08-25 F-162 交互 A/B: HTTP/2 per-stream 固定費の削減 ====
+# ホスト: 4 コア Linux x86_64（quiet host、docker builder prune 後・待機してから計測）。io_uring 既定ビルド。
+# base = veil:ab-f139（bf43df5）/ new = veil:ab-f162（cfe3f5a、F-162 のみ差分）。
+# 各ラウンドで -D 40 の持続負荷 → h2load -n 40000 -c100 -m10。ラウンドごとに実行順を入替。
+# 結果: h2c_file（3B、固定費支配）base 中央値 103,349 → new 104,274 = **+0.89%**（new 勝ち 6/8）
+#       h2c_proxy（54,576B、18 ラウンド合算）base 中央値 11,070.9 → new 11,038.7 = **-0.29%**
+#       （new 勝ち 7/18、標準偏差 131/154 rps = 1.2〜1.4%）→ **差はノイズ内＝非退行**
+#       削ったのが「リクエストごとの小さな確保 2〜3 個」である以上、固定費が支配的な 3B でだけ
+#       効き、バイト単価が支配的な 54KB では出ない、という理論どおりの結果。
+veil_glibc_base	h2c_file_3b	h2c	1	105666.08	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_file_3b	h2c	1	106568.34	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_file_3b	h2c	2	103166.17	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_file_3b	h2c	2	102478.97	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_file_3b	h2c	3	105416.01	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_file_3b	h2c	3	102195.67	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_file_3b	h2c	4	105972.34	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_file_3b	h2c	4	103228.2	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_file_3b	h2c	5	103470.4	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_file_3b	h2c	5	104277.46	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_file_3b	h2c	6	103304.45	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_file_3b	h2c	6	102885.95	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_file_3b	h2c	7	101915.24	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_file_3b	h2c	7	107876.32	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_file_3b	h2c	8	104270.67	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_file_3b	h2c	8	104929.04	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_proxy	h2c	1	11124.66	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_proxy	h2c	1	10886.09	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_proxy	h2c	2	10836.41	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_proxy	h2c	2	10926.59	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_proxy	h2c	3	10779.26	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_proxy	h2c	3	10733.49	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_proxy	h2c	4	10853.66	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_proxy	h2c	4	11131.79	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_proxy	h2c	5	10997.58	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_proxy	h2c	5	10883.66	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_proxy	h2c	6	11220.33	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_proxy	h2c	6	11009.57	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_proxy	h2c	7	11078.38	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_proxy	h2c	7	11154.02	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_proxy	h2c	8	11032.92	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_proxy	h2c	8	10887.91	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_proxy	h2c	9	11122.09	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_proxy	h2c	9	11118.2	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_proxy	h2c	10	11170.46	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_proxy	h2c	10	11063.44	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_proxy	h2c	11	11087.98	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_proxy	h2c	11	11205.28	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_proxy	h2c	12	10810.54	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_proxy	h2c	12	11256.7	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_proxy	h2c	13	11180.03	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_proxy	h2c	13	10894.93	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_proxy	h2c	14	11062.89	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_proxy	h2c	14	10871.1	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_proxy	h2c	15	11167.64	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_proxy	h2c	15	10837.64	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_proxy	h2c	16	11044.57	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_proxy	h2c	16	11060.22	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_proxy	h2c	17	11212.63	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_proxy	h2c	17	11060.36	NA	NA	NA	NA	NA	NA
+veil_glibc_new	h2c_proxy	h2c	18	11122.62	NA	NA	NA	NA	NA	NA
+veil_glibc_base	h2c_proxy	h2c	18	10899.22	NA	NA	NA	NA	NA	NA
