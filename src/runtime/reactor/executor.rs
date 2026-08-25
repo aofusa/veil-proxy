@@ -89,9 +89,17 @@ pub(crate) fn current_kqueue_fd() -> Option<RawFd> {
     POLLER.with(|p| p.borrow().as_ref().map(|poller| poller.raw_fd()))
 }
 
-/// F-141: fd の直近の `EVFILT_READ` readiness ヒント（読み取り可能バイト数の
-/// スナップショット、`poller::FdRecord::read_hint` 参照）を **消費**（0 にリセット）
-/// しつつ取得する。
+/// F-166 A-1: epoll バックエンドで `EPOLLIN`/`EPOLLERR`/`EPOLLHUP` 発火を示す非ゼロ番兵値。
+/// epoll には kqueue の `data`（読み取り/書き込み可能バイト数）に相当するフィールドが
+/// 無いため、バイト数の代わりに「非ゼロ = 直前の起床でこの方向のイベントを観測した」
+/// という真偽相当の意味でこの値を `read_hint`/`write_hint` へ格納する
+/// （`poller::FdRecord` の doc 参照）。
+#[cfg(veil_poller_epoll)]
+pub(crate) const EPOLL_HINT_SENTINEL: usize = usize::MAX;
+
+/// F-141/F-166 A-1: fd の直近の read readiness ヒント（`poller::FdRecord::read_hint`
+/// 参照。kqueue はバイト数のスナップショット、epoll は `EPOLL_HINT_SENTINEL`）を
+/// **消費**（0 にリセット）しつつ取得する。
 ///
 /// consume-once（take）にする理由: `dispatch_event` が Waker を起こすのと同一
 /// スレッド・同一イベントループ周回内で、起こされたタスクが直後に再 poll される
@@ -107,9 +115,16 @@ pub(crate) fn current_kqueue_fd() -> Option<RawFd> {
 /// 「1 回余分な read syscall」のみで、既存の epoll 版のレベルトリガ相当の
 /// spurious wake と同程度）。
 ///
+/// **epoll の `EPOLLET`（F-166 A-2）とヒントの関係**: ET はエッジ検出のみを担い、
+/// 「readable かどうか」の意味論は本ヒント + `poll(2)` フォールバックが担う。
+/// ヒントを消費した側は必ず直後に非ブロッキング I/O を試すため、たとえエッジを
+/// 取りこぼしても「データは残っているが `read_hint` が立っていない」状態は
+/// 次の `poll(2)` フォールバックで検出できる（ヒントは「省略してよい」ことの
+/// 十分条件であって必要条件ではない）。
+///
 /// reactor 未初期化のスレッドや、その fd に対する read イベントがまだ一度も
 /// 届いていない場合は `0` を返す。
-#[cfg(veil_poller_kqueue)]
+#[cfg(any(veil_poller_kqueue, veil_poller_epoll))]
 pub(crate) fn take_read_hint(fd: RawFd) -> usize {
     FD_TABLE
         .try_with(|t| {
@@ -133,7 +148,7 @@ pub(crate) fn take_read_hint(fd: RawFd) -> usize {
 ///
 /// reactor 未初期化のスレッドや、その fd に対する write イベントがまだ一度も
 /// 届いていない場合は `0` を返す。
-#[cfg(veil_poller_kqueue)]
+#[cfg(any(veil_poller_kqueue, veil_poller_epoll))]
 pub(crate) fn take_write_hint(fd: RawFd) -> usize {
     FD_TABLE
         .try_with(|t| {
@@ -179,53 +194,52 @@ pub(crate) fn register_write(fd: RawFd, waker: Waker) {
     register(fd, Interest::Write, waker);
 }
 
+/// fd の interest（READ/WRITE いずれか）を登録する（epoll 版、F-166 A-2）。
+///
+/// **fd あたり `epoll_ctl` は生涯 1 回だけ**（初回登録時の `EPOLL_CTL_ADD`）。
+/// `EPOLLONESHOT` + 毎回 `EPOLL_CTL_MOD` だった旧実装をやめ、`EPOLLIN|EPOLLOUT|
+/// EPOLLRDHUP|EPOLLET`（エッジトリガ、読み書き両方向を常時）で 1 回 ADD したら、
+/// 以降の `register()` 呼び出しは **syscall を一切発行せず** `FD_TABLE` へ Waker を
+/// 積むだけになる（`known_to_kernel` が唯一の ADD/MOD ならぬ「ADD 済みか否か」判定軸）。
+///
+/// 読み書き両方向を常時 armed にすることの安全性: 待機者がいない方向の
+/// `EPOLLOUT`/`EPOLLIN` 起床は `dispatch_event` が Waker を探しても見つからず
+/// 何もしない（`WakerSlot::is_empty()` なら wake 対象なしで即終了）ため実害が無い
+/// （F-166 詳細設計の「正しさの根拠」4 参照）。
+///
+/// ET のエッジ取りこぼしを起こさない理由は `take_read_hint`/`take_write_hint` の
+/// doc と `poller::FdRecord` の doc を参照（ヒント consume-once + `poll(2)`
+/// フォールバックの組で塞ぐ）。
 #[cfg(veil_poller_epoll)]
 fn register(fd: RawFd, interest: Interest, waker: Waker) {
-    let (needs_add, mask) = FD_TABLE.with(|t| {
+    let needs_add = FD_TABLE.with(|t| {
         let mut t = t.borrow_mut();
         let rec = t.get_or_insert(fd);
-        // ADD/MOD の判定は「一度でも ADD 済みか」（`known_to_kernel`）だけを見る。
-        // `armed == 0` は EPOLLONESHOT 発火直後にも起こり得るが、その場合でも fd 自体は
-        // epoll の監視対象リストに残っているため MOD を使う必要がある（このコメントに
-        // 至った実装バグの詳細は `poller::FdRecord` の doc を参照）。
-        let needs_add = !rec.known_to_kernel;
-        // 同一方向の複数同時待機者を許容する（キューへ追加。`poller::FdRecord` の doc
+        // 同一方向の複数同時待機者を許容する（キューへ追加。`poller::WakerSlot` の doc
         // 参照。offload の共有 eventfd 等、1 fd に複数タスクが同時に読み取り可能待ちを
         // するケースで、先行者の Waker を上書き消失させないために必須）。
-        let bit = match interest {
-            Interest::Read => {
-                rec.read_wakers.push(waker);
-                READ
-            }
-            Interest::Write => {
-                rec.write_wakers.push(waker);
-                WRITE
-            }
-        };
-        let new_mask = rec.armed | bit;
-        rec.armed = new_mask;
-        (needs_add, new_mask)
+        match interest {
+            Interest::Read => rec.read_waker.push(waker),
+            Interest::Write => rec.write_waker.push(waker),
+        }
+        !rec.known_to_kernel
     });
-    // 「既に armed 済みなら epoll_ctl を省略する」最適化はあえて行わない。
-    // `register()` は個々の Future の poll ごとに（EAGAIN の度に）呼ばれるため、
-    // ここでの epoll_ctl は「新規待機開始」だけでなく「まだ完了していない待機の
-    // 再確認」でも起こり得る。呼び出しごとに MOD/ADD を無条件で発行することで、
-    // fd ごとの armed ビット計算に依存する ADD/MOD 判定ミス（EPOLLONESHOT の
-    // 再武装漏れ）の余地を構造的に排除する（EPOLL_CTL_MOD は冪等で安全に繰り返せる）。
-    let res = if needs_add {
-        with_poller(|p| p.add(fd, mask))
-    } else {
-        with_poller(|p| p.modify(fd, mask))
-    };
-    match res {
+    if !needs_add {
+        // 既にカーネルへ ADD 済み（ET・読み書き両方向を常時 armed）のため、
+        // ここでの epoll_ctl は不要（syscall ゼロ）。
+        return;
+    }
+    // EPOLLRDHUP: 相手が半クローズ（shutdown(SHUT_WR) 相当）したことを検出するため、
+    // 従来から要求していたビットをそのまま引き継ぐ（`ERR_HUP` を要求しなくても
+    // EPOLLERR/EPOLLHUP は常に配送されるが、EPOLLRDHUP は明示要求が必要）。
+    let mask = READ | WRITE | libc::EPOLLRDHUP as u32;
+    match with_poller(|p| p.add(fd, mask)) {
         Ok(()) => {
-            if needs_add {
-                FD_TABLE.with(|t| {
-                    if let Some(rec) = t.borrow_mut().get_mut(fd) {
-                        rec.known_to_kernel = true;
-                    }
-                });
-            }
+            FD_TABLE.with(|t| {
+                if let Some(rec) = t.borrow_mut().get_mut(fd) {
+                    rec.known_to_kernel = true;
+                }
+            });
         }
         Err(e) => {
             ftlog::error!("reactor: epoll register failed for fd {}: {}", fd, e);
@@ -250,11 +264,11 @@ fn register(fd: RawFd, interest: Interest, waker: Waker) {
         let prev = rec.armed;
         let bit = match interest {
             Interest::Read => {
-                rec.read_wakers.push(waker);
+                rec.read_waker.push(waker);
                 READ
             }
             Interest::Write => {
-                rec.write_wakers.push(waker);
+                rec.write_waker.push(waker);
                 WRITE
             }
         };
@@ -281,11 +295,11 @@ fn register(fd: RawFd, interest: Interest, waker: Waker) {
         let rec = t.get_or_insert(fd);
         let bit = match interest {
             Interest::Read => {
-                rec.read_wakers.push(waker);
+                rec.read_waker.push(waker);
                 READ
             }
             Interest::Write => {
-                rec.write_wakers.push(waker);
+                rec.write_waker.push(waker);
                 WRITE
             }
         };
@@ -309,19 +323,24 @@ fn register(fd: RawFd, interest: Interest, waker: Waker) {
 /// 未完了なら再登録して待機に戻る。
 #[cfg(veil_rt_reactor)]
 pub(crate) fn wake_all_readers(fd: RawFd) {
-    let wakers = FD_TABLE.with(|t| {
+    // A-3: 単一待機者（支配的なケース）なら `WakerSlot::wake_all()` はヒープ操作なしで
+    // 直接 wake する（`poller::WakerSlot` の doc 参照）。
+    //
+    // ET（F-166 A-2、epoll のみ）でもこの経路は安全: eventfd への次の `write(2)` が
+    // 新しいエッジを生成するため、ここで一旦全読者を起こして再登録させても
+    // 取りこぼしは発生しない（`offload.rs` の `OffloadWait::poll` が try-first で
+    // 自前の `poll(2)` を行うため、`read_hint`/ET の armed 状態に依存しない）。
+    let mut wakers = FD_TABLE.with(|t| {
         let mut t = t.borrow_mut();
         let Some(rec) = t.get_mut(fd) else {
-            return Vec::new();
+            return super::poller::WakerSlot::Empty;
         };
-        // カーネル側の armed ビットはそのままにする（counter=0 なら発火しないため無害。
-        // 起こされたタスクの再登録（MOD）で上書きされる）。テーブル側の armed も
-        // 対応する再登録で再計算されるためここでは触らない。
-        std::mem::take(&mut rec.read_wakers)
+        // カーネル側の armed ビット（kqueue/WSAPoll のみ持つフィールド。epoll は
+        // 保持しない）はそのままにする（counter=0 なら発火しないため無害。
+        // 起こされたタスクの再登録で上書きされる）。
+        std::mem::take(&mut rec.read_waker)
     });
-    for w in wakers {
-        w.wake();
-    }
+    wakers.wake_all();
 }
 
 /// fd の登録を破棄する（close 直前に呼ぶ）。
@@ -409,40 +428,58 @@ fn park(timeout_ms: i32) {
     super::timer::fire_expired(Instant::now());
 }
 
+/// epoll 版イベント配送（F-166 A-1/A-2/A-3）。
+///
+/// A-2（ET 常時登録）により、ここでは **epoll_ctl を一切呼ばない**（旧実装の
+/// 「片方だけ起きたらもう片方を再武装する」`modify` 呼び出しは、fd が生涯 ADD
+/// されたまま・両方向常時 armed のため不要になった）。
+///
+/// A-1: 起床させる Waker の有無に関わらず、観測したイベント方向の `read_hint`/
+/// `write_hint` へ非ゼロ番兵値（`EPOLL_HINT_SENTINEL`）を立てる（`take_read_hint`/
+/// `take_write_hint` の doc 参照）。待機者がいない方向にヒントだけ立てても、
+/// 対応する `Readable`/`Writable` 系 Future が次に poll されたときに consume-once で
+/// 読み取って `poll(2)` を省略するだけで実害は無い（詳細設計の「正しさの根拠」4）。
 #[cfg(veil_poller_epoll)]
 fn dispatch_event(fd: RawFd, flags: u32) {
-    // キュー内の **全** Waker を起床する（`poller::FdRecord` の doc 参照）。各タスクは
-    // 自身の非ブロッキング syscall を再試行し、成功できなかったものは再度 register する
-    // （レベルトリガ相当。eventfd のように「複数読者が同時に readable を観測できる」fd
-    // では全員が正しく起床する必要がある）。
-    let (read_wakers, write_wakers, remaining) = FD_TABLE.with(|t| {
+    // ヒント設定と Waker の取り出しは FD_TABLE を借用したまま行うが、実際に
+    // `wake()` するのは借用を外した後にする（Waker::wake() が再帰的に
+    // register()/FD_TABLE を触るタスクを起こし得るため、二重借用パニックを避ける）。
+    // A-3: `mem::take`（`WakerSlot::default()` = `Empty`）で取り出すのは単一待機者
+    // ならヒープ操作なしの `WakerSlot::One`（ムーブのみ）で、`Vec` を経由しない。
+    let (mut read_waker, mut write_waker) = FD_TABLE.with(|t| {
         let mut t = t.borrow_mut();
         let Some(rec) = t.get_mut(fd) else {
-            return (Vec::new(), Vec::new(), 0);
+            return (
+                super::poller::WakerSlot::Empty,
+                super::poller::WakerSlot::Empty,
+            );
         };
-        let mut rw = Vec::new();
-        let mut ww = Vec::new();
-        if flags & (READ | ERR_HUP) != 0 && !rec.read_wakers.is_empty() {
-            rw = std::mem::take(&mut rec.read_wakers);
-            rec.armed &= !READ;
+        // A-1: 起床させる Waker の有無に関わらず、観測したイベント方向のヒントを
+        // 立てる（`take_read_hint`/`take_write_hint` の doc 参照。待機者がいない
+        // 方向にヒントだけ立てても実害は無い＝詳細設計の「正しさの根拠」4）。
+        if flags & (READ | ERR_HUP) != 0 {
+            rec.read_hint = EPOLL_HINT_SENTINEL;
         }
-        if flags & (WRITE | ERR_HUP) != 0 && !rec.write_wakers.is_empty() {
-            ww = std::mem::take(&mut rec.write_wakers);
-            rec.armed &= !WRITE;
+        if flags & (WRITE | ERR_HUP) != 0 {
+            rec.write_hint = EPOLL_HINT_SENTINEL;
         }
-        (rw, ww, rec.armed)
+        let rw = if flags & (READ | ERR_HUP) != 0 {
+            std::mem::take(&mut rec.read_waker)
+        } else {
+            super::poller::WakerSlot::Empty
+        };
+        let ww = if flags & (WRITE | ERR_HUP) != 0 {
+            std::mem::take(&mut rec.write_waker)
+        } else {
+            super::poller::WakerSlot::Empty
+        };
+        (rw, ww)
     });
-    for w in read_wakers {
-        w.wake();
-    }
-    for w in write_wakers {
-        w.wake();
-    }
-    if remaining != 0 {
-        // EPOLLONESHOT により fd 全体の interest が disarm されているため、まだ待ち手が
-        // 残っている方向（読み書きどちらか一方のみ起床した場合）を再武装する。
-        let _ = with_poller(|p| p.modify(fd, remaining));
-    }
+    // A-2: ET 常時登録のため、ここでの再武装（旧: 片方だけ起きたらもう片方を
+    // 再武装する `epoll_ctl(MOD)`）は不要。fd は生涯 ADD 済みのまま・両方向常時
+    // armed であり、epoll_ctl は一切呼ばない。
+    read_waker.wake_all();
+    write_waker.wake_all();
 }
 
 /// kqueue バージョンの 1 回分の poller wait + イベント/タイマー処理。
@@ -517,13 +554,17 @@ fn dispatch_event(fd: RawFd, flags: u32, data_hint: impl TryInto<i64>) {
     // 起きた方向のビットを armed から落とすだけでよい（次回 register 時に改めて
     // EV_ADD|EV_ONESHOT される）。
     let data_hint = data_hint.try_into().unwrap_or(0).max(0) as usize;
-    let (read_wakers, write_wakers) = FD_TABLE.with(|t| {
+    // A-3: `mem::take` は `WakerSlot::default()`（= `Empty`）と交換するだけで、単一
+    // 待機者なら `WakerSlot::One` のムーブのみ（ヒープ操作なし）。`wake_all()` は
+    // FD_TABLE の借用を外した後に呼ぶ（`epoll::dispatch_event` と同じ理由）。
+    let (mut read_waker, mut write_waker) = FD_TABLE.with(|t| {
         let mut t = t.borrow_mut();
         let Some(rec) = t.get_mut(fd) else {
-            return (Vec::new(), Vec::new());
+            return (
+                super::poller::WakerSlot::Empty,
+                super::poller::WakerSlot::Empty,
+            );
         };
-        let mut rw = Vec::new();
-        let mut ww = Vec::new();
         if flags & READ != 0 {
             rec.read_hint = data_hint;
         }
@@ -533,22 +574,22 @@ fn dispatch_event(fd: RawFd, flags: u32, data_hint: impl TryInto<i64>) {
         if flags & WRITE != 0 {
             rec.write_hint = data_hint;
         }
-        if flags & READ != 0 && !rec.read_wakers.is_empty() {
-            rw = std::mem::take(&mut rec.read_wakers);
+        let rw = if flags & READ != 0 {
             rec.armed &= !READ;
-        }
-        if flags & WRITE != 0 && !rec.write_wakers.is_empty() {
-            ww = std::mem::take(&mut rec.write_wakers);
+            std::mem::take(&mut rec.read_waker)
+        } else {
+            super::poller::WakerSlot::Empty
+        };
+        let ww = if flags & WRITE != 0 {
             rec.armed &= !WRITE;
-        }
+            std::mem::take(&mut rec.write_waker)
+        } else {
+            super::poller::WakerSlot::Empty
+        };
         (rw, ww)
     });
-    for w in read_wakers {
-        w.wake();
-    }
-    for w in write_wakers {
-        w.wake();
-    }
+    read_waker.wake_all();
+    write_waker.wake_all();
 }
 
 #[cfg(veil_poller_wsapoll)]
@@ -601,29 +642,30 @@ fn dispatch_event(fd: RawFd, flags: u32) {
     // WSAPoll はレベルトリガのため、次回 park() で armed なエントリのみ再度渡す形で
     // oneshot 相当を表現する。ここでは発火した方向の armed ビットを落とし、対応する
     // Waker を起こすのみでよい（次回の待機は register() による再武装で行われる）。
-    let (read_wakers, write_wakers) = FD_TABLE.with(|t| {
+    let (mut read_waker, mut write_waker) = FD_TABLE.with(|t| {
         let mut t = t.borrow_mut();
         let Some(rec) = t.get_mut(fd) else {
-            return (Vec::new(), Vec::new());
+            return (
+                super::poller::WakerSlot::Empty,
+                super::poller::WakerSlot::Empty,
+            );
         };
-        let mut rw = Vec::new();
-        let mut ww = Vec::new();
-        if flags & (READ | ERR_HUP) != 0 && !rec.read_wakers.is_empty() {
-            rw = std::mem::take(&mut rec.read_wakers);
+        let rw = if flags & (READ | ERR_HUP) != 0 && !rec.read_waker.is_empty() {
             rec.armed &= !READ;
-        }
-        if flags & (WRITE | ERR_HUP) != 0 && !rec.write_wakers.is_empty() {
-            ww = std::mem::take(&mut rec.write_wakers);
+            std::mem::take(&mut rec.read_waker)
+        } else {
+            super::poller::WakerSlot::Empty
+        };
+        let ww = if flags & (WRITE | ERR_HUP) != 0 && !rec.write_waker.is_empty() {
             rec.armed &= !WRITE;
-        }
+            std::mem::take(&mut rec.write_waker)
+        } else {
+            super::poller::WakerSlot::Empty
+        };
         (rw, ww)
     });
-    for w in read_wakers {
-        w.wake();
-    }
-    for w in write_wakers {
-        w.wake();
-    }
+    read_waker.wake_all();
+    write_waker.wake_all();
 }
 
 /// poller wait のタイムアウト（ミリ秒）を最近接タイマーデッドラインから計算する。

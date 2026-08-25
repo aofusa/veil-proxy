@@ -183,6 +183,14 @@ jemalloc = ["dep:tikv-jemallocator"]
 # ビルド方法: cargo build --no-default-features --features system-allocator
 system-allocator = []
 
+# アロケーション計測（F-165 Phase 1）。opt-in・診断ビルド専用で `default` には
+# 含めない（`full` / `full-container` / BSD 系バンドルにも含めないこと）。
+# 有効化すると `#[global_allocator]` が mimalloc/jemalloc/システムアロケータを
+# `CountingAllocator` で包んだものに差し替わり、1 リクエストあたりの
+# ヒープアロケーション回数・バイト数を計測できる（`src/alloc_stats.rs`）。
+# ビルド方法: cargo build --features "full,alloc-stats"
+alloc-stats = []
+
 # ====================
 # 機能系（オプション）
 # ====================

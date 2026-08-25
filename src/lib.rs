@@ -8,16 +8,47 @@
 #[cfg(feature = "mimalloc")]
 use mimalloc::MiMalloc;
 
-#[cfg(feature = "mimalloc")]
+#[cfg(all(feature = "mimalloc", not(feature = "alloc-stats")))]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
 #[cfg(feature = "jemalloc")]
 use tikv_jemallocator::Jemalloc;
 
-#[cfg(all(feature = "jemalloc", not(feature = "mimalloc")))]
+#[cfg(all(
+    feature = "jemalloc",
+    not(feature = "mimalloc"),
+    not(feature = "alloc-stats")
+))]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
+
+// F-165 Phase 1: `alloc-stats` feature 有効時は、既存の選択ロジックが選ぶはずの
+// アロケータ（mimalloc → jemalloc → システムアロケータの優先順）を
+// `CountingAllocator` で包んだものに差し替える。opt-in・診断ビルド専用。
+#[cfg(feature = "alloc-stats")]
+pub mod alloc_stats;
+
+#[cfg(all(feature = "alloc-stats", feature = "mimalloc"))]
+#[global_allocator]
+static GLOBAL: alloc_stats::CountingAllocator<MiMalloc> = alloc_stats::CountingAllocator(MiMalloc);
+
+#[cfg(all(
+    feature = "alloc-stats",
+    feature = "jemalloc",
+    not(feature = "mimalloc")
+))]
+#[global_allocator]
+static GLOBAL: alloc_stats::CountingAllocator<Jemalloc> = alloc_stats::CountingAllocator(Jemalloc);
+
+#[cfg(all(
+    feature = "alloc-stats",
+    not(feature = "mimalloc"),
+    not(feature = "jemalloc")
+))]
+#[global_allocator]
+static GLOBAL: alloc_stats::CountingAllocator<std::alloc::System> =
+    alloc_stats::CountingAllocator(std::alloc::System);
 
 // kTLS はカーネルオフロード実装のため Linux/FreeBSD 専用（F-120 設計 2 節 / F-126）。
 // `ktls` feature が有効でも非対応 OS（OpenBSD）では `veil_ktls` が立たず、下の

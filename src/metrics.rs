@@ -235,6 +235,78 @@ pub(crate) static HTTP3_ACTIVE_STREAMS: Lazy<prometheus::IntGauge> = Lazy::new(|
     gauge
 });
 
+// ====================
+// アロケーション計測ゲージ（F-165 Phase 1、`alloc-stats` feature）
+// ====================
+//
+// `src/alloc_stats.rs::snapshot()` の値をスクレイプ直前に反映するだけの
+// ゲージ。バックグラウンドスレッドでポーリングはしない
+// （`encode_prometheus_metrics()` 内で都度 `set()` する）。
+// メトリクス名はプロジェクト既定の `veil_proxy_` namespace を使わず、
+// F-165 の設計どおり `veil_alloc_*` を直接指定する。
+
+#[cfg(all(feature = "alloc-stats", feature = "metrics"))]
+/// アロケーション（`alloc` + `alloc_zeroed`）呼び出し累計回数
+pub(crate) static ALLOC_STATS_ALLOCS_TOTAL: Lazy<prometheus::IntGauge> = Lazy::new(|| {
+    let opts = Opts::new(
+        "veil_alloc_allocs_total",
+        "Cumulative number of heap allocation calls observed by CountingAllocator",
+    );
+    let gauge = prometheus::IntGauge::with_opts(opts).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+#[cfg(all(feature = "alloc-stats", feature = "metrics"))]
+/// 解放（`dealloc`）呼び出し累計回数
+pub(crate) static ALLOC_STATS_DEALLOCS_TOTAL: Lazy<prometheus::IntGauge> = Lazy::new(|| {
+    let opts = Opts::new(
+        "veil_alloc_deallocs_total",
+        "Cumulative number of heap deallocation calls observed by CountingAllocator",
+    );
+    let gauge = prometheus::IntGauge::with_opts(opts).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+#[cfg(all(feature = "alloc-stats", feature = "metrics"))]
+/// 再確保（`realloc`）呼び出し累計回数
+pub(crate) static ALLOC_STATS_REALLOCS_TOTAL: Lazy<prometheus::IntGauge> = Lazy::new(|| {
+    let opts = Opts::new(
+        "veil_alloc_reallocs_total",
+        "Cumulative number of heap reallocation calls observed by CountingAllocator",
+    );
+    let gauge = prometheus::IntGauge::with_opts(opts).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+#[cfg(all(feature = "alloc-stats", feature = "metrics"))]
+/// 確保した合計バイト数
+pub(crate) static ALLOC_STATS_BYTES_TOTAL: Lazy<prometheus::IntGauge> = Lazy::new(|| {
+    let opts = Opts::new(
+        "veil_alloc_bytes_total",
+        "Cumulative number of bytes requested via heap allocation calls",
+    );
+    let gauge = prometheus::IntGauge::with_opts(opts).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+/// アロケーション計測ゲージへ最新のスナップショットを反映する。
+///
+/// スクレイプ直前（`encode_prometheus_metrics()`）にのみ呼び出し、常時ポーリング
+/// する背景スレッドは持たない。
+#[cfg(all(feature = "alloc-stats", feature = "metrics"))]
+#[inline]
+fn refresh_alloc_stats_gauges() {
+    let snap = crate::alloc_stats::snapshot();
+    ALLOC_STATS_ALLOCS_TOTAL.set(snap.allocs as i64);
+    ALLOC_STATS_DEALLOCS_TOTAL.set(snap.deallocs as i64);
+    ALLOC_STATS_REALLOCS_TOTAL.set(snap.reallocs as i64);
+    ALLOC_STATS_BYTES_TOTAL.set(snap.alloc_bytes as i64);
+}
+
 /// HTTP/3 接続メトリクスの RAII ガード（Drop で自動 dec）
 #[cfg(feature = "http3")]
 pub(crate) struct Http3ActiveConnGuard {
@@ -887,6 +959,9 @@ impl CacheSaveContext {
 /// Prometheusメトリクスをテキストフォーマットでエンコード
 #[cfg(feature = "metrics")]
 pub(crate) fn encode_prometheus_metrics() -> Vec<u8> {
+    #[cfg(feature = "alloc-stats")]
+    refresh_alloc_stats_gauges();
+
     let encoder = TextEncoder::new();
     let metric_families = METRICS_REGISTRY.gather();
     let mut buffer = Vec::new();

@@ -1102,11 +1102,13 @@ impl<'a> Future for Readable<'a> {
     type Output = io::Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // F-141: kqueue バックエンドでは、直前の `EVFILT_READ` 起床がこの fd を
-        // readable と報告済みなら、確認用の `poll(2)` syscall を省略する
+        // F-141/F-166 A-1: kqueue/epoll いずれのバックエンドでも、直前の起床が
+        // この fd を readable と報告済みなら、確認用の `poll(2)` syscall を省略する
         // （`executor::take_read_hint` の doc 参照。consume-once のため、無関係な
-        // 後続呼び出しに古いヒントが漏れることはない）。
-        #[cfg(veil_poller_kqueue)]
+        // 後続呼び出しに古いヒントが漏れることはない）。epoll は F-166 A-2 で ET 常時
+        // 登録に変わったため、ヒントが立っていない場合の以下の `poll(2)` フォールバックが
+        // 「エッジを取りこぼしていないか」の最終確認として必須になる（削除禁止）。
+        #[cfg(any(veil_poller_kqueue, veil_poller_epoll))]
         if crate::runtime::executor::take_read_hint(self.fd) > 0 {
             return Poll::Ready(Ok(()));
         }
@@ -1140,7 +1142,7 @@ impl<'a> Future for Writable<'a> {
         // writable と報告済みなら、確認用の `poll(2)` syscall を省略する
         // （`executor::take_write_hint` の doc 参照。consume-once のため、無関係な
         // 後続呼び出しに古いヒントが漏れることはない）。
-        #[cfg(veil_poller_kqueue)]
+        #[cfg(any(veil_poller_kqueue, veil_poller_epoll))]
         if crate::runtime::executor::take_write_hint(self.fd) > 0 {
             return Poll::Ready(Ok(()));
         }
@@ -1174,7 +1176,7 @@ impl Future for ReadableFd {
         // F-141: `Readable::poll` と同じ理由で、kqueue の直近ヒントがあれば
         // 確認用 `poll(2)` syscall を省略する（UDP の `wait_readable_fd` 経路で使われる
         // ため、`QuicUdpSocket` の recv 系ループがこの恩恵を受ける）。
-        #[cfg(veil_poller_kqueue)]
+        #[cfg(any(veil_poller_kqueue, veil_poller_epoll))]
         if crate::runtime::executor::take_read_hint(self.fd) > 0 {
             return Poll::Ready(Ok(()));
         }
@@ -1203,7 +1205,7 @@ impl Future for WritableFd {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // F-155: `Writable::poll` と同じ理由で、kqueue の直近ヒントがあれば
         // 確認用 `poll(2)` syscall を省略する。
-        #[cfg(veil_poller_kqueue)]
+        #[cfg(any(veil_poller_kqueue, veil_poller_epoll))]
         if crate::runtime::executor::take_write_hint(self.fd) > 0 {
             return Poll::Ready(Ok(()));
         }
@@ -1274,5 +1276,125 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(peer_addr, SocketAddr::from(([127, 0, 0, 1], 0)));
+    }
+
+    /// テスト用の非ブロッキング pipe(2) を 1 組作る（読み取り端, 書き込み端）。
+    fn make_nonblocking_pipe() -> (RawFd, RawFd) {
+        let mut fds = [0i32; 2];
+        let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(ret, 0, "pipe(2) failed: {}", io::Error::last_os_error());
+        for &fd in &fds {
+            unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFL);
+                let r = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                assert_eq!(r, 0, "fcntl O_NONBLOCK failed");
+            }
+        }
+        (fds[0], fds[1])
+    }
+
+    /// F-166 A-1/A-2: fd が readable になった時点で誰も待っていなくても（`register()` で
+    /// Waker を積んでいるタスクが 1 つも無くても）、`dispatch_event` は readiness ヒントを
+    /// 立てる。次に readable 待ちを行った future は、確認用 `poll(2)` を発行せず
+    /// ヒントのみで即座に `Ready` を返す（= 「ヒント経路」）。
+    ///
+    /// epoll（`EPOLLET` 常時登録・F-166 A-2）と kqueue（`EVFILT_READ` oneshot 再登録・
+    /// F-141）の両方で成立する不変条件のため、poller cfg で分岐せず両バックエンドで
+    /// 実行する共通テストにする。
+    #[test]
+    // 理由付き allow: テストのブロッキング I/O（pipe セットアップ・後始末用の別スレッド）。
+    #[allow(clippy::disallowed_methods)]
+    fn wait_readable_fd_reports_ready_via_hint_after_edge_with_no_waiter() {
+        let (rfd, wfd) = make_nonblocking_pipe();
+        crate::runtime::block_on(async move {
+            // 1) 最初の待機（Pending → register）→ 別スレッドが書き込み、起床させる。
+            let writer = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let b = [1u8];
+                let n = unsafe { libc::write(wfd, b.as_ptr() as *const _, 1) };
+                assert_eq!(n, 1);
+            });
+            wait_readable_fd(rfd).await.expect("first readable wait");
+            writer.join().expect("writer thread");
+
+            // データを完全に drain する（次の書き込みが確実に新しい edge になるように）。
+            let mut buf = [0u8; 1];
+            let n = unsafe { libc::read(rfd, buf.as_mut_ptr() as *mut std::ffi::c_void, 1) };
+            assert_eq!(n, 1);
+
+            // 2) 誰も待っていない状態で新しいデータを書き込む（新しい edge を生む）。
+            let b = [2u8];
+            let n = unsafe { libc::write(wfd, b.as_ptr() as *const _, 1) };
+            assert_eq!(n, 1);
+
+            // 3) 短いタイマー sleep で実際に park()（epoll_wait/kevent）を経由させる。
+            //    ET（epoll）は edge 発生時点でカーネルの ready list に載るため、
+            //    このタイミングで待機者が居なくても dispatch_event が走り、
+            //    read_hint が立つ（`executor::dispatch_event` 参照。誰も待っていない
+            //    方向への「余分な起床」は `WakerSlot::wake_all()` が no-op になるだけで
+            //    実害が無い）。
+            crate::runtime::timer::sleep(std::time::Duration::from_millis(50)).await;
+
+            // 4) 次の readable 待ちはヒントのみで即 Ready になる
+            //    （register() を一切呼ばずに `Poll::Ready` を返す）。
+            wait_readable_fd(rfd)
+                .await
+                .expect("second readable wait via hint");
+
+            let mut buf2 = [0u8; 1];
+            let n2 = unsafe { libc::read(rfd, buf2.as_mut_ptr() as *mut std::ffi::c_void, 1) };
+            assert_eq!(n2, 1);
+            assert_eq!(buf2[0], 2);
+        });
+
+        unsafe {
+            libc::close(rfd);
+            libc::close(wfd);
+        }
+    }
+
+    /// F-141/F-166: ヒントは consume-once のため、一度 `Ready` 判定に使われると
+    /// 0 へ戻る。それでもデータが（部分読み取りで）残っていれば、確認用 `poll(2)`
+    /// フォールバックが引き続き `Ready` を返す（ヒントを消しても readiness の
+    /// 検出そのものは失われない。`poll(2)` フォールバック削除禁止の直接的な検証）。
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn wait_readable_fd_falls_back_to_poll_after_hint_consumed_with_partial_read() {
+        let (rfd, wfd) = make_nonblocking_pipe();
+        crate::runtime::block_on(async move {
+            let writer = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let b = [1u8, 2u8];
+                let n = unsafe { libc::write(wfd, b.as_ptr() as *const _, 2) };
+                assert_eq!(n, 2);
+            });
+            // ヒント経由で Ready になる（この時点で該当方向のヒントは consume-once で
+            // 0 に戻る）。
+            wait_readable_fd(rfd).await.expect("first readable wait");
+            writer.join().expect("writer thread");
+
+            // 部分読み取り: 2 バイト書き込まれたうち 1 バイトだけ読む。
+            let mut buf = [0u8; 1];
+            let n = unsafe { libc::read(rfd, buf.as_mut_ptr() as *mut std::ffi::c_void, 1) };
+            assert_eq!(n, 1);
+            assert_eq!(buf[0], 1);
+
+            // ヒントは既に消費済みで、新しい edge も発生していない（部分読み取りは
+            // 新規の書き込みではないため ET のエッジを生まない）。それでもまだ 1 バイト
+            // 残っているため、poll(2) フォールバックが Ready を返すはず。
+            wait_readable_fd(rfd)
+                .await
+                .expect("second readable wait via poll(2) fallback");
+
+            let mut buf2 = [0u8; 1];
+            let n2 = unsafe { libc::read(rfd, buf2.as_mut_ptr() as *mut std::ffi::c_void, 1) };
+            assert_eq!(n2, 1);
+            assert_eq!(buf2[0], 2);
+        });
+
+        unsafe {
+            libc::close(rfd);
+            libc::close(wfd);
+        }
     }
 }
