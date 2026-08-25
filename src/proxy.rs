@@ -5400,7 +5400,7 @@ async fn handle_backend(
     backend: Backend,
     method: &[u8],
     req_path: &[u8],
-    prefix: Box<[u8]>,
+    prefix: Arc<[u8]>,
     content_length: usize,
     is_chunked: bool,
     headers: &[(Box<[u8]>, Box<[u8]>)],

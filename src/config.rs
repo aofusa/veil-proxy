@@ -2680,6 +2680,19 @@ pub struct Route {
     /// Arc 共有する（ホットパスでの合成・アロケーションを避ける）。
     #[serde(skip)]
     pub resolved_modules: Option<Arc<Vec<ModuleRef>>>,
+
+    /// 設定ロード時に解決済みの Backend（F-159）。`load_backend` はリクエストごとに
+    /// 呼ばれるため、ここで 1 回だけ構築して clone（Arc 参照カウント増分のみ）で返す。
+    /// 解決に失敗した場合（存在しないファイル等）は `None` のままにし、ホットパスは
+    /// 従来どおり毎回構築してエラーを返す（挙動の後方互換）。
+    #[serde(skip)]
+    pub resolved_backend: Option<Backend>,
+    /// 設定ロード時に解決済みの圧縮設定（`find_backend_unified` の戻り値用、F-159）。
+    #[serde(skip)]
+    pub resolved_compression: Option<Arc<CompressionConfig>>,
+    /// 設定ロード時に解決済みのパスプレフィックス（`extract_path_prefix` の結果、F-159）。
+    #[serde(skip)]
+    pub resolved_path_prefix: Option<Arc<[u8]>>,
 }
 
 #[derive(Deserialize)]
@@ -4020,6 +4033,20 @@ pub enum Backend {
         /// このバックエンドに適用するWASMモジュール参照のリスト（F-148）
         Option<Arc<Vec<ModuleRef>>>,
     ),
+}
+
+// F-159: `Route` に `resolved_backend: Option<Backend>` を追加したため `Route` の
+// `#[derive(Debug)]` を満たす必要がある。内部の `UpstreamGroup` 等が Debug 未実装のため
+// derive は使えず、バリアント名のみを出す最小実装にする（ログ／assert 用途で十分）。
+impl std::fmt::Debug for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Backend::Proxy(..) => write!(f, "Backend::Proxy(..)"),
+            Backend::MemoryFile(..) => write!(f, "Backend::MemoryFile(..)"),
+            Backend::SendFile(..) => write!(f, "Backend::SendFile(..)"),
+            Backend::Redirect(..) => write!(f, "Backend::Redirect(..)"),
+        }
+    }
 }
 
 impl Backend {
@@ -5881,6 +5908,14 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
                 #[cfg(feature = "wasm")]
                 config.wasm.as_ref(),
             );
+            // F-159: Backend / 圧縮設定 / パスプレフィックスを設定ロード時に 1 回だけ
+            // 構築し Route へ持たせる。ホットパス（load_backend / find_backend_unified）は
+            // Arc clone のみになる。失敗しても設定ロードは失敗させず（`.ok()`）、
+            // 従来どおりリクエスト時に構築して同じエラーを返す（後方互換）。
+            route.resolved_backend = build_backend(&route, &upstream_groups).ok();
+            route.resolved_compression =
+                Some(Arc::new(route.compression.clone().unwrap_or_default()));
+            route.resolved_path_prefix = Some(crate::upstream::extract_path_prefix_arc(&route));
             routes_vec.push(route);
         }
         Arc::new(routes_vec)
@@ -6069,6 +6104,14 @@ pub fn load_config(path: &Path) -> io::Result<LoadedConfig> {
                 #[cfg(feature = "wasm")]
                 config.wasm.as_ref(),
             );
+            // F-159: Backend / 圧縮設定 / パスプレフィックスを設定ロード時に 1 回だけ
+            // 構築し Route へ持たせる。ホットパス（load_backend / find_backend_unified）は
+            // Arc clone のみになる。失敗しても設定ロードは失敗させず（`.ok()`）、
+            // 従来どおりリクエスト時に構築して同じエラーを返す（後方互換）。
+            route.resolved_backend = build_backend(&route, &upstream_groups).ok();
+            route.resolved_compression =
+                Some(Arc::new(route.compression.clone().unwrap_or_default()));
+            route.resolved_path_prefix = Some(crate::upstream::extract_path_prefix_arc(&route));
             routes_vec.push(route);
         }
         Arc::new(routes_vec)
@@ -6375,16 +6418,33 @@ fn canonical_base_memoized(path: &str) -> Option<Arc<Path>> {
     resolved
 }
 
-// 理由付き allow: `fs::metadata`（is_dir 判定）と `fs::read`（MemoryFile モードの
-// 事前読み込み）を使う。**この関数はリクエストごとに呼ばれる**（`upstream.rs` の
-// `find_backend_unified`）ため本来ホットパスだが、いずれも「設定に対して不変な値」の
-// 解決であり、B-64 で判明したコストの大きい `canonicalize`/`metadata` は
-// `canonical_base_memoized` / `is_dir_memoized` で設定パスごとに 1 回だけ実行するよう
-// メモ化してある（2 回目以降は syscall なし）。`fs::read` は MemoryFile モード
-// （起動時にファイル全体をメモリへ読み込む構成）専用で、同モードでは応答自体が
-// メモリから返るため毎回の読み込みは発生しない。
-#[allow(clippy::disallowed_methods)]
 pub fn load_backend(
+    route: &Route,
+    upstream_groups: &HashMap<String, Arc<UpstreamGroup>>,
+) -> io::Result<Backend> {
+    // F-159: 設定ロード時に解決済みの Backend があれば Arc clone のみ（malloc なし）で
+    // 返す。未解決（安全網、または旧経路からの呼び出し）の場合のみ従来どおり構築する。
+    if let Some(b) = &route.resolved_backend {
+        return Ok(b.clone());
+    }
+    build_backend(route, upstream_groups)
+}
+
+/// `load_backend` の実体。ログ出力・エラーメッセージ・メモ化を含め従来の
+/// `load_backend` と同一の処理を行う。
+///
+/// F-159 以降、**通常は設定ロード時（`load_config` / `load_config_without_tls` の
+/// ルート読み込みループ）から 1 回だけ呼ばれる**。ホットパスから呼ばれるのは
+/// `resolved_backend` の解決に失敗したルート（存在しないファイル等）の安全網のみで、
+/// その場合は従来と同じエラーを毎回返す。
+///
+/// 理由付き allow: `fs::metadata`（is_dir 判定）と `fs::read`（MemoryFile モードの
+/// 事前読み込み）を使う。上記のとおり設定ロード時のコールドパスであり、安全網経路でも
+/// B-64 で判明したコストの大きい `canonicalize`/`metadata` は `canonical_base_memoized` /
+/// `is_dir_memoized` で設定パスごとに 1 回だけ実行するようメモ化してある（2 回目以降は
+/// syscall なし）。
+#[allow(clippy::disallowed_methods)]
+fn build_backend(
     route: &Route,
     upstream_groups: &HashMap<String, Arc<UpstreamGroup>>,
 ) -> io::Result<Backend> {
@@ -7836,5 +7896,61 @@ mod shipped_config_tests {
 
         // nginx -t 相当の検証（TOML パース + バリデーション + 証明書存在確認）
         test_config_file(&test_path).expect("shipped config.toml must parse and validate");
+    }
+}
+
+/// F-159: `Route::resolved_backend` が設定ロード時に構築される前提で、
+/// `load_backend` がホットパスで Arc clone のみを行うことを確認するテスト。
+#[cfg(test)]
+mod f159_resolved_backend_tests {
+    use super::*;
+
+    /// `resolved_backend` が埋まっている場合、`load_backend` はそれを clone して
+    /// 返すだけであること（＝設定ロード時に構築した Backend と同一であること）を確認する。
+    #[test]
+    fn load_backend_returns_resolved_backend_when_present() {
+        let toml = r#"
+            action = { type = "Redirect", redirect_url = "https://example.com/", redirect_status = 301, preserve_path = false }
+        "#;
+        let mut route: Route = toml::from_str(toml).unwrap();
+        let upstream_groups: HashMap<String, Arc<UpstreamGroup>> = HashMap::new();
+
+        // 設定ロード時と同様に resolved_backend を構築する。
+        let built = build_backend(&route, &upstream_groups).expect("build_backend should succeed");
+        route.resolved_backend = Some(built);
+
+        let loaded = load_backend(&route, &upstream_groups).expect("load_backend should succeed");
+
+        // Redirect ならリダイレクト先 URL が resolved_backend 由来のものと一致することを確認
+        // （clone のみで再構築していないことの間接確認）。
+        match loaded {
+            Backend::Redirect(url, status, preserve_path, _) => {
+                assert_eq!(&*url, "https://example.com/");
+                assert_eq!(status, 301);
+                assert!(!preserve_path);
+            }
+            _ => panic!("expected Backend::Redirect"),
+        }
+    }
+
+    /// 解決に失敗するルート（存在しない path の File バックエンド）では、
+    /// `resolved_backend` が `None` のままとなり、`load_backend` は従来どおり
+    /// エラーを返すこと（挙動の後方互換）を確認する。
+    #[test]
+    fn load_backend_errors_when_file_path_does_not_exist() {
+        let toml = r#"
+            action = { type = "File", path = "/nonexistent/path/for/f159/test", mode = "sendfile" }
+        "#;
+        let mut route: Route = toml::from_str(toml).unwrap();
+        let upstream_groups: HashMap<String, Arc<UpstreamGroup>> = HashMap::new();
+
+        // 設定ロード時の解決は失敗するため resolved_backend は None のまま
+        // （build_backend(...).ok() 相当の挙動）。
+        route.resolved_backend = build_backend(&route, &upstream_groups).ok();
+        assert!(route.resolved_backend.is_none());
+
+        // ホットパスの安全網として、従来どおり load_backend を呼んでもエラーになること。
+        let result = load_backend(&route, &upstream_groups);
+        assert!(result.is_err());
     }
 }
