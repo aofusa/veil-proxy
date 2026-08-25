@@ -2,8 +2,11 @@
 
 ## 仕様
 
-- `[server].listen` / `[server].h2c_listen` / `[[l4]].listen`（TCP のみ）に
-  **`unix:<path>`** 形式を受理する。例: `listen = "unix:/run/veil/https.sock"`。
+- `[server].listen` / `[server].h2c_listen` に **`unix:<path>`** 形式を受理する。
+  例: `listen = "unix:/run/veil/https.sock"`。
+- **対象外（今回のスコープ外）**: `[[l4]].listen`（L4 プロキシ）・上流バックエンドへの
+  UDS 接続・`[server].http`（HTTPS リダイレクト用平文リスナー）。
+  いずれも別チケットで扱う（要望は `server.listen` / `h2c_listen`）。
 - 対応プラットフォームは **`cfg(unix)` のみ**。Windows では設定エラーとして起動を拒否する
   （「この環境では unix ソケットは非対応」と明示）。
 - HTTP/3（QUIC/UDP）は UDS 非対応（設計上不可）。`[http3].listen` は従来どおり `host:port` のみ。
