@@ -111,6 +111,46 @@ AI エージェントおよびコントリビュータ向けの **最小指針**
   ここに置いた処理はそのままリクエスト単価になる。`set_host` は `&str` 受け（`metrics` 無効時に確保しない）、
   クライアント IP は接続あたり 1 個の `Rc<str>`、クライアント `SocketAddr` は接続あたり 1 回の解決。
   **新しい per-stream 処理を足すときは「接続あたり 1 回で済まないか」を先に考えること。**
+- **epoll reactor は fd あたり `epoll_ctl` を生涯 1 回しか呼ばない（F-166 A-2）** —
+  `EPOLLONESHOT` + 待機ごとの `EPOLL_CTL_MOD` は廃止し、初回登録時に
+  `EPOLLIN|EPOLLOUT|EPOLLRDHUP|EPOLLET` で **1 回だけ ADD** する。以降の
+  `executor::register` は Waker を積むだけで **syscall を出さない**。
+  **ET のエッジ取りこぼしを塞ぐ不変条件は 2 つ**: (1) `dispatch_event` が立てる
+  `read_hint`/`write_hint` は **consume-once**（`take`）で、消費した側は必ず直後に
+  非ブロッキング I/O を試す。(2) ヒントが無い状態で park する前に **必ず確認用
+  `poll(2)` を通す**（この `poll(2)` フォールバックは削除禁止＝kqueue 版と同じ）。
+  fd は close まで epoll の監視対象に残るため、register 前に届いたエッジも
+  次の `epoll_wait` で配送される。**実測: `h2c_proxy` の 1 リクエストあたり syscall が
+  54KB で 5.97 → 4.72（-21%）、3B で 5.47 → 3.83（-30%）、`epoll_ctl` は 1.25〜1.30 → 0.02〜0.13。**
+- **fd ごとの待機者は `WakerSlot`（Empty/One/Many）で持つ（F-166 A-3）** — 1 fd 1 待機者が
+  支配的なので、`Vec<Waker>` を常用すると待機・起床のたびに malloc/free が乗る。
+  複数待機（`runtime::offload` の共有 eventfd）は `Many` で従来どおり全員起床させる
+  （**先行者の Waker を上書き消失させない**という F-120 Phase 2 の不変条件は維持）。
+- **HTTP/2 レスポンスヘッダは `Vec<(Bytes, Bytes)>` で持つ（F-165/F-166 B）** —
+  `H2RespMsg::Head`/`Trailers` の型を `Vec<(Vec<u8>, Vec<u8>)>` に戻してはならない。
+  定数ヘッダは `Bytes::from_static`、`server`/`alt-svc` の値は `pool.rs` が `Bytes` で
+  保持して**参照カウント clone** で配る（レスポンスごとの確保ゼロ）。バックエンド応答の
+  ヘッダは **ムーブ**する（`(k.clone(), v.clone())` のディープコピーを復活させない）。
+- **アロケーションは推測せず `alloc-stats` で測る（F-165）** — `--features alloc-stats`
+  （既定オフ・opt-in）でグローバルアロケータがカウンティング版に差し替わり、
+  `veil_alloc_allocs_total` 等の Prometheus ゲージで 1 リクエストあたりの確保回数を
+  実測できる。ハーネスは `tools/perf/alloc_measure.sh`。
+  **実測の起点（2026-08-26）**: `h2c_file` 3B 静的で 33.4 allocs/req、
+  `h2c_proxy` 54KB で 50.7 allocs/req・61KB/req。**静的配信でも 30 回超確保している＝
+  HTTP/2 サーバ側の固定費が支配項**であり、削減対象を「プロキシ経路」と決め打ちしないこと。
+- **`[server].tls_only` は既定 `true`（F-163）** — メインリスナー（`[server].listen`）は
+  平文を受理しない。`true` のときはプロトコル検出（MSG_PEEK）自体を行わないので
+  接続ごとの往復も消える。平文 h2c / HTTP/1.1 を使うテスト・計測は
+  `h2c_listen` の専用ポート（または `tls_only = false`）を使うこと。
+- **UDS リスナーは 1 回 bind して各ワーカーが `dup(2)` する（F-164）** — AF_UNIX に
+  `SO_REUSEPORT` は無い。`server::bind_unix_listener` が唯一の bind 経路で、
+  stale socket の unlink・`unix_socket_permissions`（umask + chmod）・capsicum の
+  権利制限をここに集約する。peer アドレスは `sockaddr_un` を `SocketAddr` へ変換できないため
+  **プレースホルダ `127.0.0.1:0`** を返す（IP ブロックリスト・アクセスログはこの値を見る）。
+- **Windows のクロスビルドを壊していないか確認する（B-69 / B-73）** — `cfg(unix)` を
+  付け忘れた `std::os::unix::*` / `libc::poll` は Linux の単体・統合・E2E をすべて通過する。
+  検出手段は `packaging/scripts/build-cross.sh --target windows` のみ。
+  **2026-08-26 時点で B-73（F-139 の `wasm/host/grpc_executor.rs`）により失敗する。**
 - **動的設定**は ArcSwap とリロード経路の不変条件を維持する。
 - **`unsafe` は最小限** — 拡大時は不変条件をコメントで明示。
 
