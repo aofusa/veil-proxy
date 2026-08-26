@@ -74,3 +74,23 @@ h2load `-n 20000 -c 100 -m 10`、コミット 63565e8 時点）:
 | R3 | `http2/hpack/encoder.rs` 出力 | エンコード先を都度 `Vec` からプール／再利用バッファへ | -1〜2/req |
 | R4 | `proxy.rs::h2_stream_body_cl` ほか | ボディチャンクの `Bytes::copy_from_slice` をプール `BytesMut` の `split_to().freeze()` へ（**F-157 の教訓によりコピー削減は必ず A/B で確認する**） | bytes/req の大半 |
 | R5 | `runtime/reactor/tcp/unix.rs` | 「直前に EAGAIN を観測した」ことが分かっている待機では、park 前の確認用 `poll(2)` を省略して直接 register する（ET なら新規到着が必ずエッジを生むため安全）。**epoll のみ**（F-158 の教訓によりバックエンド間で一般化しない） | syscall -0.5/req |
+
+
+### R5 は見送り（負の結果、2026-08-26）
+
+「EAGAIN 直後の確認用 `poll(2)` を省略する」実装は API とテストまで書いたうえで**撤回した**。
+
+- 実際に `poll(2)` を出しているのは `ReadFuture`/`WriteFuture` **ではない**（これらは
+  try-first の `read(2)`/`write(2)` で EAGAIN を観測したらそのまま `register_read` するので
+  `poll(2)` を通らない）。出しているのは **`h2_select_readable_or_notify` が使う
+  `wait_readable_fd`**（HTTP/2 接続ループ）など、「EAGAIN 直後ではない」待機である。
+- そこでの `poll(2)` は**有用な仕事をしている**: まだ park していない時点では
+  `epoll_wait` を通っていないためヒントが立っておらず、`poll(2)` が「もう届いている
+  データ」を検出して park を丸ごと省く。これを省略すると
+  「register → Pending → park → `epoll_wait`（即時復帰）→ wake」に置き換わるだけで、
+  syscall は減らずレイテンシが増える可能性が高い。
+- したがって前提条件（「直前に同じ fd で EAGAIN を観測した」）を満たす呼び出し箇所が
+  ホットパスに存在せず、API だけが残る（＝デッドコード）ため実装を差し戻した。
+
+**教訓**: syscall プロファイルの数値（`poll` 0.53/req）を見て「この待機経路だろう」と
+当たりを付ける前に、**どのコード経路がその syscall を出しているかを特定する**こと。
