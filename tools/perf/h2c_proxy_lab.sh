@@ -273,6 +273,61 @@ cmd_ab() {
     done
 }
 
+# 交互 A/B で **veil の CPU/req（µs/req）** を測る（F-165/F-166）。
+#
+# このラボはクライアント（h2load）・veil・上流 nginx が同一 4 コアを共有するため、
+# 3 者合計で CPU が飽和し、**rps は veil 単体の改善に鈍い**（実測: client 71% /
+# veil 195% / backend 130% ＝ 約 400%）。veil の CPU/req なら共有飽和の影響を受けにくく、
+# 「veil が 1 リクエストに使う CPU 時間」を直接比較できる。
+#
+#   bash tools/perf/h2c_proxy_lab.sh cpuab <base_img> <new_img> [config] [path] [rounds]
+cmd_cpuab() {
+    local base_img="$1" new_img="$2" cfg="${3:-h2c_proxy}" path="${4:-/}" rounds="${5:-6}"
+    local warm="${WARM_SECS:-40}" nreq="${AB_NREQ:-40000}"
+
+    if [ "$(docker image inspect -f '{{.Id}}' "$base_img" 2>/dev/null)" = \
+         "$(docker image inspect -f '{{.Id}}' "$new_img" 2>/dev/null)" ]; then
+        echo "!! base と new が同一イメージ。A/B にならない" >&2
+        return 1
+    fi
+
+    echo -e "round\tvariant\treq_per_sec\tveil_cpu_pct\tveil_us_per_req"
+    local r order img
+    for r in $(seq 1 "$rounds"); do
+        if [ $((r % 2)) -eq 1 ]; then order="base new"; else order="new base"; fi
+        for variant in $order; do
+            case "$variant" in
+                base) img="$base_img" ;;
+                new)  img="$new_img" ;;
+            esac
+            cmd_up "$cfg" "$img" >/dev/null 2>&1 || { echo -e "$r\t$variant\tNA\tNA\tNA"; continue; }
+            docker run --rm --network "$NET" --entrypoint h2load "$H2_IMG" \
+                -c 100 -m 10 -D "$warm" "http://$TARGET:$H2C_PORT$path" >/dev/null 2>&1
+
+            local loadlog="$LOGDIR/cpuab_load.log"
+            docker run --rm --network "$NET" --entrypoint h2load "$H2_IMG" \
+                -n "$nreq" -c 100 -m 10 "http://$TARGET:$H2C_PORT$path" > "$loadlog" 2>&1 &
+            local load_pid=$!
+            # 負荷中に veil の CPU% をサンプリングする（起動直後の立ち上がりは避ける）
+            sleep 1
+            local samples=0 total=0 v
+            while kill -0 "$load_pid" 2>/dev/null && [ "$samples" -lt 8 ]; do
+                v=$(docker stats --no-stream --format '{{.CPUPerc}}' "$TARGET" 2>/dev/null | tr -d '%')
+                if [ -n "$v" ]; then
+                    total=$(awk -v a="$total" -v b="$v" 'BEGIN{print a+b}')
+                    samples=$((samples + 1))
+                fi
+            done
+            wait "$load_pid" 2>/dev/null
+            local rps cpu us
+            rps=$(awk '/finished in/{print $4}' "$loadlog")
+            cpu=$(awk -v t="$total" -v n="$samples" 'BEGIN{if(n>0) printf "%.1f", t/n; else print "NA"}')
+            us=$(awk -v c="$cpu" -v r="${rps:-0}" 'BEGIN{if(r>0 && c!="NA") printf "%.1f", c*10000/r; else print "NA"}')
+            echo -e "$r\t$variant\t${rps:-NA}\t${cpu}\t${us}"
+        done
+    done
+}
+
 cmd_down() {
     docker rm -f "$VEIL_NAME" "$NGINX_NAME" "$BACKEND_NAME" lab-h2load-cpu lab-h2load-str >/dev/null 2>&1
     docker network rm "$NET" >/dev/null 2>&1
@@ -287,6 +342,7 @@ case "${1:-}" in
     strace) shift; cmd_strace "$@" ;;
     mem)    shift; cmd_mem "$@" ;;
     ab)     shift; cmd_ab "$@" ;;
+    cpuab)  shift; cmd_cpuab "$@" ;;
     down)   cmd_down ;;
     *) sed -n '2,20p' "${BASH_SOURCE[0]}"; exit 1 ;;
 esac
