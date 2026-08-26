@@ -1092,8 +1092,32 @@ mod uds_tests {
 
     /// F-164: `bind_unix_listener` で bind したソケットへ、各ワーカー相当の
     /// `dup_listener()` で作った `TcpListener` が accept できること。
+    /// ランタイムドライバ（io_uring リング）が生成できるか。
+    ///
+    /// Docker のビルドサンドボックス・seccomp 制限下・古いカーネルでは
+    /// `io_uring_setup(2)` が拒否され、`runtime::block_on` が panic する。
+    /// 実 I/O を伴うテストはそのような環境ではスキップする
+    /// （`runtime::uring::tcp` の `io_uring_available` と同じ方針。E2E で網羅する）。
+    #[cfg(veil_rt_uring)]
+    fn runtime_driver_available() -> bool {
+        crate::runtime::IoUring::new(8, 0).is_ok()
+    }
+
+    /// reactor バックエンド（epoll/kqueue）は poller の生成に特別な権限を要さないため
+    /// 常に利用可能。
+    #[cfg(veil_rt_reactor)]
+    fn runtime_driver_available() -> bool {
+        true
+    }
+
     #[test]
     fn test_bind_unix_listener_dup_and_accept() {
+        if !runtime_driver_available() {
+            eprintln!(
+                "runtime driver unavailable; skipping test_bind_unix_listener_dup_and_accept"
+            );
+            return;
+        }
         let mut path = std::env::temp_dir();
         path.push(format!("veil-f164-server-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
