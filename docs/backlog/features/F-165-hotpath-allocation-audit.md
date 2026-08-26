@@ -48,3 +48,29 @@
 
 交互 A/B（`tools/perf/h2c_proxy_lab.sh ab`）で 3B（固定費支配）と 54KB（バイト単価支配）の
 両方を測る（F-159 の教訓）。
+
+## Phase 3: 実測に基づく第 2 ラウンド（2026-08-26）
+
+`alloc-stats` + `tools/perf/alloc_measure.sh` による **実測値**（`full-container`、
+h2load `-n 20000 -c 100 -m 10`、コミット 63565e8 時点）:
+
+| 構成 | allocs/req | bytes/req | reallocs/req |
+|---|---|---|---|
+| `h2c_proxy` 54KB | 50.7 | 61,455 | 3.33 |
+| `h2c_proxy` 3B | 54.7 | 11,134 | 3.31 |
+| `h2c_file` 3B（静的） | 33.4 | 3,201 | 2.31 |
+| `h2c_file` 54KB（静的） | 32.4 | 3,424 | 3.31 |
+
+**読み方**: 静的配信でも 1 リクエスト 32〜33 回確保している＝**HTTP/2 サーバ側の固定費**が
+支配項。プロキシはそこへ +18〜22 回。54KB プロキシの 61KB/req は
+**ボディチャンクの `Bytes::copy_from_slice`**（`h2_stream_body_cl`）がそのまま出ている。
+
+### 第 2 ラウンドの対象
+
+| # | 対象 | 内容 | 見積 |
+|---|---|---|---|
+| R1 | `http2/hpack/decoder.rs` + `table.rs` | `HeaderField` の `name`/`value` を `Vec<u8>` から `Bytes` へ。デコーダが持つ **アリーナ `BytesMut`** へ書いて `split_to().freeze()` で配る。静的テーブルは `Bytes::from_static`（確保ゼロ）、動的テーブルは参照カウント clone | **-2/ヘッダ ≈ -16〜24/req** |
+| R2 | `proxy.rs::H2RequestCtx` | `method`/`path`/`authority` を R1 のアリーナ由来 `Bytes` に（現状は per-stream の `Vec<u8>` コピー 3 個） | -3/req |
+| R3 | `http2/hpack/encoder.rs` 出力 | エンコード先を都度 `Vec` からプール／再利用バッファへ | -1〜2/req |
+| R4 | `proxy.rs::h2_stream_body_cl` ほか | ボディチャンクの `Bytes::copy_from_slice` をプール `BytesMut` の `split_to().freeze()` へ（**F-157 の教訓によりコピー削減は必ず A/B で確認する**） | bytes/req の大半 |
+| R5 | `runtime/reactor/tcp/unix.rs` | 「直前に EAGAIN を観測した」ことが分かっている待機では、park 前の確認用 `poll(2)` を省略して直接 register する（ET なら新規到着が必ずエッジを生むため安全）。**epoll のみ**（F-158 の教訓によりバックエンド間で一般化しない） | syscall -0.5/req |
