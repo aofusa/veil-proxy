@@ -404,32 +404,32 @@ impl Stream {
     pub fn method(&self) -> Option<&[u8]> {
         self.request_headers
             .iter()
-            .find(|h| h.name == b":method")
-            .map(|h| h.value.as_slice())
+            .find(|h| h.name.as_ref() == b":method".as_ref())
+            .map(|h| h.value.as_ref())
     }
 
     /// リクエストパスを取得
     pub fn path(&self) -> Option<&[u8]> {
         self.request_headers
             .iter()
-            .find(|h| h.name == b":path")
-            .map(|h| h.value.as_slice())
+            .find(|h| h.name.as_ref() == b":path".as_ref())
+            .map(|h| h.value.as_ref())
     }
 
     /// Authority を取得
     pub fn authority(&self) -> Option<&[u8]> {
         self.request_headers
             .iter()
-            .find(|h| h.name == b":authority")
-            .map(|h| h.value.as_slice())
+            .find(|h| h.name.as_ref() == b":authority".as_ref())
+            .map(|h| h.value.as_ref())
     }
 
     /// Scheme を取得
     pub fn scheme(&self) -> Option<&[u8]> {
         self.request_headers
             .iter()
-            .find(|h| h.name == b":scheme")
-            .map(|h| h.value.as_slice())
+            .find(|h| h.name.as_ref() == b":scheme".as_ref())
+            .map(|h| h.value.as_ref())
     }
 
     /// Content-Type ヘッダーを取得
@@ -437,7 +437,7 @@ impl Stream {
         self.request_headers
             .iter()
             .find(|h| h.name.eq_ignore_ascii_case(b"content-type"))
-            .map(|h| h.value.as_slice())
+            .map(|h| h.value.as_ref())
     }
 
     /// gRPC モードを設定

@@ -401,24 +401,20 @@ where
                         // 初回ヘッダー
                         headers_received = true;
                         for header in headers {
-                            if header.name == b":status" {
+                            if header.name.as_ref() == b":status".as_ref() {
                                 if let Ok(s) = std::str::from_utf8(&header.value) {
                                     response.status = s.parse().unwrap_or(0);
                                 }
                             } else if !header.name.starts_with(b":") {
                                 // `HeaderField` の `Vec<u8>` を `Bytes::from` でムーブ
                                 // （ゼロコピー、F-166）。
-                                response
-                                    .headers
-                                    .push((Bytes::from(header.name), Bytes::from(header.value)));
+                                response.headers.push((header.name, header.value));
                             }
                         }
                     } else {
                         // トレイラー (2回目以降の HEADERS フレーム)
                         for header in headers {
-                            response
-                                .trailers
-                                .push((Bytes::from(header.name), Bytes::from(header.value)));
+                            response.trailers.push((header.name, header.value));
                         }
                     }
 
@@ -768,26 +764,30 @@ where
                         // Initial headers
                         headers_received = true;
                         for header in headers {
-                            if header.name == b":status" {
+                            if header.name.as_ref() == b":status".as_ref() {
                                 if let Ok(s) = std::str::from_utf8(&header.value) {
                                     response.http_status = s.parse().unwrap_or(0);
                                 }
                             } else if !header.name.starts_with(b":") {
-                                response.headers.push((header.name, header.value));
+                                response
+                                    .headers
+                                    .push((header.name.to_vec(), header.value.to_vec()));
                             }
                         }
                     } else {
                         // Trailers (second HEADERS frame)
                         for header in headers {
-                            if header.name == b"grpc-status" {
+                            if header.name.as_ref() == b"grpc-status".as_ref() {
                                 if let Ok(s) = std::str::from_utf8(&header.value) {
                                     response.grpc_status = s.parse().unwrap_or(2);
                                     // Unknown
                                 }
-                            } else if header.name == b"grpc-message" {
+                            } else if header.name.as_ref() == b"grpc-message".as_ref() {
                                 response.grpc_message = GrpcStatus::decode_message(&header.value);
                             } else {
-                                response.trailers.push((header.name, header.value));
+                                response
+                                    .trailers
+                                    .push((header.name.to_vec(), header.value.to_vec()));
                             }
                         }
                     }

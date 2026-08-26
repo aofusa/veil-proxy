@@ -498,6 +498,46 @@ thread_local! {
 #[cfg(feature = "http2")]
 const LOWERED_HEADER_NAME_POOL_MAX: usize = 64;
 
+// ====================
+// HPACK エンコード出力用スクラッチプール（R3、F-165）
+// ====================
+//
+// `HpackEncoder::encode` は 1 リクエスト（レスポンス）あたり 1〜2 回呼ばれ、従来は毎回
+// 新規 `Vec<u8>` を確保していた（HEADERS 用・gRPC トレイラー用）。エンコード結果は
+// 呼び出し側で `FrameEncoder::encode_headers`/`encode_headers_into` へ `&[u8]` として
+// 渡されるだけで、渡し終えたら不要になる寿命の短いバッファなので、ここから
+// 取り出して使い、`EncodedHeaderBlock`（`http2::hpack::encoder`）の `Drop` で
+// 自動返却することで定常状態のアロケーションをゼロにする。
+#[cfg(feature = "http2")]
+thread_local! {
+    static HPACK_ENCODE_POOL: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// プールに保持するバッファ本数の上限（スレッドごと）。
+/// 1 コネクションが同時に持ちうる未フラッシュのエンコード結果数を上回る余裕を持たせる。
+#[cfg(feature = "http2")]
+const HPACK_ENCODE_POOL_MAX: usize = 64;
+
+/// HPACK エンコード出力用バッファを取得（無ければ新規、空の `Vec`）。
+#[cfg(feature = "http2")]
+#[inline]
+pub(crate) fn hpack_encode_buf_get() -> Vec<u8> {
+    HPACK_ENCODE_POOL.with(|p| p.borrow_mut().pop().unwrap_or_default())
+}
+
+/// HPACK エンコード出力用バッファをプールへ返却（クリアしてから積む）。
+#[cfg(feature = "http2")]
+#[inline]
+pub(crate) fn hpack_encode_buf_put(mut buf: Vec<u8>) {
+    buf.clear();
+    HPACK_ENCODE_POOL.with(|p| {
+        let mut pool = p.borrow_mut();
+        if pool.len() < HPACK_ENCODE_POOL_MAX {
+            pool.push(buf);
+        }
+    });
+}
+
 /// 小文字化ヘッダ名用の再利用バッファを取得（無ければ新規、空の `Vec`）。
 #[cfg(feature = "http2")]
 #[inline]

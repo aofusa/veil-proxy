@@ -5,6 +5,47 @@
 use super::huffman::{huffman_encode, huffman_encoded_len};
 use super::table::{DynamicTable, StaticTable};
 use super::{encode_integer, HpackResult};
+use bytes::Bytes;
+
+/// `HpackEncoder::encode` の戻り値（R3、F-165）。
+///
+/// 内部の `Vec<u8>` は `crate::pool::hpack_encode_buf_get` から借用しており、この値が
+/// Drop されるときに `crate::pool::hpack_encode_buf_put` へ自動返却される。
+/// `Deref<Target = [u8]>` / `AsRef<[u8]>` を実装しているため、既存の `&[u8]` 消費側
+/// （`FrameEncoder::encode_headers`/`encode_headers_into` 等）はコード変更なしで動く
+/// （`&encoded_block` が deref coercion で `&[u8]` になる）。
+pub struct EncodedHeaderBlock(Vec<u8>);
+
+impl std::ops::Deref for EncodedHeaderBlock {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl AsRef<[u8]> for EncodedHeaderBlock {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for EncodedHeaderBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+impl Drop for EncodedHeaderBlock {
+    #[inline]
+    fn drop(&mut self) {
+        // `mem::take` で空の `Vec`（確保済みキャパシティ 0）を残し、実バッファだけを
+        // プールへ返す（Drop 内で self.0 を clone せず所有権だけ移す）。
+        crate::pool::hpack_encode_buf_put(std::mem::take(&mut self.0));
+    }
+}
 
 /// HPACK エンコーダ
 pub struct HpackEncoder {
@@ -51,9 +92,16 @@ impl HpackEncoder {
     ///
     /// # Returns
     ///
-    /// エンコードされたバイト列
-    pub fn encode(&mut self, headers: &[(&[u8], &[u8], bool)]) -> HpackResult<Vec<u8>> {
-        let mut buf = Vec::with_capacity(headers.len() * 32);
+    /// エンコードされたバイト列（プール由来バッファのゼロコピー貸し出し、R3/F-165）。
+    /// 返り値を drop すると自動的にプールへ返却され、次回呼び出しで再利用される。
+    pub fn encode(&mut self, headers: &[(&[u8], &[u8], bool)]) -> HpackResult<EncodedHeaderBlock> {
+        // 毎回新規 `Vec::with_capacity` する代わりに、スレッドローカルの再利用バッファ
+        // プール（`crate::pool::hpack_encode_buf_get`）から借用する（定常状態でゼロ確保）。
+        let mut buf = crate::pool::hpack_encode_buf_get();
+        buf.clear();
+        if buf.capacity() < headers.len() * 32 {
+            buf.reserve(headers.len() * 32 - buf.capacity());
+        }
 
         // テーブルサイズ更新があれば先に送信
         if let Some(size) = self.pending_table_size_update.take() {
@@ -69,7 +117,7 @@ impl HpackEncoder {
             }
         }
 
-        Ok(buf)
+        Ok(EncodedHeaderBlock(buf))
     }
 
     /// 単一ヘッダーをエンコード
@@ -87,8 +135,12 @@ impl HpackEncoder {
         // 3. Literal Header Field with Incremental Indexing
         self.encode_literal_indexed(buf, name_index, name, value)?;
 
-        // 動的テーブルに追加
-        self.dynamic_table.insert(name.to_vec(), value.to_vec());
+        // 動的テーブルに追加（エンコーダ側は呼び出し元借用の `&[u8]` からのコピーが
+        // 避けられないため `Bytes::copy_from_slice` を使う。デコーダ側〈R1〉のような
+        // アリーナ共有はできない：ここでの入力はホットパスの HeaderField 由来ではなく
+        // 呼び出し元が渡す一時的な `&[u8]` であり、生存期間を跨いで共有できない）。
+        self.dynamic_table
+            .insert(Bytes::copy_from_slice(name), Bytes::copy_from_slice(value));
 
         Ok(())
     }

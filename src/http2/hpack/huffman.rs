@@ -3,6 +3,7 @@
 //! HTTP/2 ヘッダー圧縮用の Huffman 符号化/復号化を実装します。
 
 use super::HpackError;
+use bytes::{BufMut, BytesMut};
 
 /// Huffman 符号テーブル (RFC 7541 Appendix B)
 /// (符号, ビット長)
@@ -361,7 +362,18 @@ impl DecodeEntry {
 /// - 中間状態で `bits_left < STRIDE` のときは residual ACCEPT のみ。
 /// - 終了時は `state == 0` かつ残 0..=7 全1。
 pub fn huffman_decode(src: &[u8]) -> Result<Vec<u8>, HpackError> {
-    let mut result = Vec::with_capacity(src.len().saturating_mul(2));
+    let mut result = BytesMut::with_capacity(src.len().saturating_mul(2));
+    huffman_decode_into(src, &mut result)?;
+    Ok(result.to_vec())
+}
+
+/// Huffman デコードをアリーナ（呼び出し側が持つ `BytesMut`）へ直接書き込む版（R1、F-165）。
+///
+/// `huffman_decode` と同じ FSM だが、中間 `Vec<u8>` を経由せず `out` へ
+/// `BufMut::put_u8` で追記する。呼び出し側（`HpackDecoder::decode_string`）は
+/// デコード後に `out.split_to(len).freeze()` で当該デコード結果だけを `Bytes` として
+/// 切り出す（ゼロコピー）。
+pub(crate) fn huffman_decode_into(src: &[u8], out: &mut BytesMut) -> Result<(), HpackError> {
     let mut acc: u64 = 0;
     let mut bits_left: u32 = 0;
     let mut state: u8 = 0;
@@ -372,13 +384,13 @@ pub fn huffman_decode(src: &[u8]) -> Result<Vec<u8>, HpackError> {
         if bits_left > MAX_BITS_LEFT {
             return Err(HpackError::HuffmanDecodeError);
         }
-        drain_lut(&mut acc, &mut bits_left, &mut state, &mut result)?;
+        drain_lut(&mut acc, &mut bits_left, &mut state, out)?;
     }
-    drain_lut(&mut acc, &mut bits_left, &mut state, &mut result)?;
+    drain_lut(&mut acc, &mut bits_left, &mut state, out)?;
     // 中間状態に残ビットがある場合の最後の residual ACCEPT
-    residual_accept(&mut acc, &mut bits_left, &mut state, &mut result)?;
+    residual_accept(&mut acc, &mut bits_left, &mut state, out)?;
     finish_padding(acc, bits_left, state)?;
-    Ok(result)
+    Ok(())
 }
 
 /// ビットキャッシュを可能な限り消費する（I3–I5）。
@@ -387,7 +399,7 @@ fn drain_lut(
     acc: &mut u64,
     bits_left: &mut u32,
     state: &mut u8,
-    result: &mut Vec<u8>,
+    result: &mut BytesMut,
 ) -> Result<(), HpackError> {
     loop {
         if *state == 0 {
@@ -418,7 +430,7 @@ fn drain_lut(
             HUFFMAN_DECODE_FLAG_ERROR => return Err(HpackError::HuffmanDecodeError),
             HUFFMAN_DECODE_FLAG_ACCEPT => {
                 consume_bits(acc, bits_left, u32::from(e.bits));
-                result.push(e.sym);
+                result.put_u8(e.sym);
                 *state = e.next; // I1: root
             }
             HUFFMAN_DECODE_FLAG_NEED => {
@@ -439,7 +451,7 @@ fn residual_accept(
     acc: &mut u64,
     bits_left: &mut u32,
     state: &mut u8,
-    result: &mut Vec<u8>,
+    result: &mut BytesMut,
 ) -> Result<(), HpackError> {
     while *bits_left > 0 && *bits_left < HUFFMAN_DECODE_STRIDE {
         let shift = HUFFMAN_DECODE_STRIDE - *bits_left;
@@ -448,7 +460,7 @@ fn residual_accept(
         let e = load_entry(*state as usize, peek);
         if e.flags == HUFFMAN_DECODE_FLAG_ACCEPT && u32::from(e.bits) <= *bits_left {
             consume_bits(acc, bits_left, u32::from(e.bits));
-            result.push(e.sym);
+            result.put_u8(e.sym);
             *state = e.next;
             continue;
         }

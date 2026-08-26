@@ -353,7 +353,7 @@ fn perform_grpc_health_check_h2c(
                     if let Ok(decoded) = hpack_dec.decode(&header_block) {
                         for field in decoded {
                             if field.name.eq_ignore_ascii_case(b"grpc-status") {
-                                grpc_status_ok = field.value == b"0";
+                                grpc_status_ok = field.value.as_ref() == b"0".as_ref();
                             }
                         }
                     }

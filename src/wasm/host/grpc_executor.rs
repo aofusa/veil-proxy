@@ -509,10 +509,8 @@ impl ActiveCall {
                     }
                 };
                 // F-160 と同様に `Bytes::from` でそのまま引き継ぐ（コピー無し）。
-                let pairs: Vec<(Bytes, Bytes)> = fields
-                    .into_iter()
-                    .map(|f| (Bytes::from(f.name), Bytes::from(f.value)))
-                    .collect();
+                let pairs: Vec<(Bytes, Bytes)> =
+                    fields.into_iter().map(|f| (f.name, f.value)).collect();
                 let has_grpc_status = pairs.iter().any(|(k, _)| k.as_ref() == b"grpc-status");
 
                 if !self.got_initial_metadata && !has_grpc_status {
@@ -1199,10 +1197,8 @@ pub fn execute_grpc_unary_call(
                     let fields = hpack_decoder
                         .decode(&header_block)
                         .map_err(|e| format!("hpack decode failed: {e:?}"))?;
-                    let pairs: Vec<(Bytes, Bytes)> = fields
-                        .into_iter()
-                        .map(|f| (Bytes::from(f.name), Bytes::from(f.value)))
-                        .collect();
+                    let pairs: Vec<(Bytes, Bytes)> =
+                        fields.into_iter().map(|f| (f.name, f.value)).collect();
 
                     let has_grpc_status = pairs.iter().any(|(k, _)| k.as_ref() == b"grpc-status");
 

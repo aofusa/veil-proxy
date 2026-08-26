@@ -844,10 +844,11 @@ enum H2RespMsg {
 /// per-stream リクエストタスクへ conn 非依存で引き渡すリクエスト情報（F-116）。
 #[cfg(feature = "http2")]
 struct H2RequestCtx {
-    method: Vec<u8>,
-    path: Vec<u8>,
+    /// デコーダのアリーナ由来 `Bytes`（参照カウント clone のみ、R2/F-165）。
+    method: Bytes,
+    path: Bytes,
     /// `:authority`（無ければ host ヘッダー、いずれも無ければ空）。
-    authority: Vec<u8>,
+    authority: Bytes,
     /// 疑似ヘッダー `:method`/`:path`/`:authority` を除いたヘッダー（`:scheme` 等の残余含む）。
     headers: Vec<crate::http2::hpack::HeaderField>,
     /// 完了済みリクエストボディ（バッファ経路。ストリーミング経路では空）。
@@ -1315,18 +1316,19 @@ where
                 .request_headers
                 .iter()
                 .find(|h| h.name.eq_ignore_ascii_case(b"host"))
-                .map(|h| h.value.clone())
+                .map(|h| h.value.to_vec())
         })
         .unwrap_or_default();
 
-    let h2_headers_store: Vec<(Vec<u8>, Vec<u8>)> = stream
+    // `Bytes` の参照カウント clone のみ（デコーダのアリーナ由来なのでコピーなし、R2/F-165）。
+    let h2_headers_store: Vec<(Bytes, Bytes)> = stream
         .request_headers
         .iter()
         .map(|h| (h.name.clone(), h.value.clone()))
         .collect();
     let headers_raw: Vec<(&[u8], &[u8])> = h2_headers_store
         .iter()
-        .map(|(k, v)| (k.as_slice(), v.as_slice()))
+        .map(|(k, v)| (k.as_ref(), v.as_ref()))
         .collect();
 
     let config = CURRENT_CONFIG.load();
@@ -1419,7 +1421,7 @@ async fn h2_request_task(
     resp_tx: crate::stream_channel::Sender<H2RespMsg>,
     notify: crate::stream_channel::Notify,
 ) {
-    let user_agent: Vec<u8> = ctx
+    let user_agent: Bytes = ctx
         .headers
         .iter()
         .find(|h| h.name.eq_ignore_ascii_case(b"user-agent"))
@@ -1561,7 +1563,7 @@ async fn h2_dispatch(
         .headers
         .iter()
         .filter(|h| !h.name.starts_with(b":"))
-        .map(|h| (h.name.as_slice(), h.value.as_slice()))
+        .map(|h| (h.name.as_ref(), h.value.as_ref()))
         .collect();
 
     // メトリクスエンドポイント。
@@ -1659,10 +1661,13 @@ async fn h2_dispatch(
                 crate::wasm::empty_wasm_modules()
             };
             if !modules_to_apply.is_empty() {
+                // WASM ホスト API 境界は `Vec<u8>` 所有ペアを要求するため、ここでのみ
+                // `Bytes` → `Vec<u8>` へコピーする（guest 側は独立コピーを要するため
+                // 避けられない境界コスト。ホットパス本体〈R1/R2〉には影響しない）。
                 let headers_vec: Vec<(Vec<u8>, Vec<u8>)> = ctx
                     .headers
                     .iter()
-                    .map(|h| (h.name.clone(), h.value.clone()))
+                    .map(|h| (h.name.to_vec(), h.value.to_vec()))
                     .collect();
                 let wasm_result = wasm_engine
                     .clone()
@@ -1710,8 +1715,8 @@ async fn h2_dispatch(
                             headers
                                 .into_iter()
                                 .map(|(name, value)| crate::http2::hpack::HeaderField {
-                                    name,
-                                    value,
+                                    name: Bytes::from(name),
+                                    value: Bytes::from(value),
                                 })
                                 .collect(),
                         );
@@ -1733,7 +1738,7 @@ async fn h2_dispatch(
             let trailers_vec: Vec<(Vec<u8>, Vec<u8>)> = ctx
                 .trailers
                 .iter()
-                .map(|h| (h.name.clone(), h.value.clone()))
+                .map(|h| (h.name.to_vec(), h.value.to_vec()))
                 .collect();
             let wasm_result = wasm_engine
                 .on_request_trailers_with_modules(&wasm_modules_to_apply, trailers_vec)
@@ -2481,7 +2486,7 @@ async fn h2_proxy_h2c(
                     && !h.name.eq_ignore_ascii_case(b"upgrade")
                     && (is_grpc_upstream || !h.name.eq_ignore_ascii_case(b"te"))
             })
-            .map(|h| (h.name.as_slice(), h.value.as_slice()))
+            .map(|h| (h.name.as_ref(), h.value.as_ref()))
     };
 
     let body: Option<&[u8]> = if ctx.body.is_empty() {
@@ -3334,7 +3339,7 @@ async fn h2_serve_streaming(
         .headers
         .iter()
         .filter(|h| !h.name.starts_with(b":"))
-        .map(|h| (h.name.as_slice(), h.value.as_slice()))
+        .map(|h| (h.name.as_ref(), h.value.as_ref()))
         .collect();
 
     let config = CURRENT_CONFIG.load();

@@ -968,7 +968,7 @@ where
             if let Some(cl) = stream
                 .request_headers
                 .iter()
-                .find(|h| h.name == b"content-length")
+                .find(|h| h.name.as_ref() == b"content-length".as_ref())
             {
                 if let Some(len) = std::str::from_utf8(&cl.value)
                     .ok()
@@ -1035,7 +1035,7 @@ where
                     ));
                 }
 
-                match name.as_slice() {
+                match name.as_ref() {
                     b":method" => {
                         method_count += 1;
                     }
@@ -2205,12 +2205,12 @@ where
         let trailers = std::mem::take(&mut stream.request_trailers);
         let body = std::mem::take(&mut stream.request_body);
 
-        let mut method = Vec::new();
-        let mut path = Vec::new();
+        let mut method = bytes::Bytes::new();
+        let mut path = bytes::Bytes::new();
         let mut authority = None;
         let mut headers = Vec::with_capacity(all_headers.len());
         for h in all_headers {
-            match h.name.as_slice() {
+            match h.name.as_ref() {
                 b":method" => method = h.value,
                 b":path" => path = h.value,
                 b":authority" => authority = Some(h.value),
@@ -2288,13 +2288,14 @@ pub struct ProcessedRequest {
 /// `Http2Connection` に触れずにルーティング・バックエンド往復を実行できる。
 #[derive(Debug)]
 pub struct H2RequestParts {
-    /// `:method` 疑似ヘッダーの値。
-    pub method: Vec<u8>,
-    /// `:path` 疑似ヘッダーの値。
-    pub path: Vec<u8>,
+    /// `:method` 疑似ヘッダーの値。デコーダのアリーナ由来 `Bytes`
+    /// （参照カウント clone のみでここまで運ばれる、R2/F-165）。
+    pub method: bytes::Bytes,
+    /// `:path` 疑似ヘッダーの値（`method` と同様、R2/F-165）。
+    pub path: bytes::Bytes,
     /// `:authority` 疑似ヘッダーの値（無ければ `None`。host ヘッダーへの
     /// フォールバックは呼び出し側で行う）。
-    pub authority: Option<Vec<u8>>,
+    pub authority: Option<bytes::Bytes>,
     /// 抽出済み疑似ヘッダー（`:method`/`:path`/`:authority`）以外のヘッダー一覧
     /// （`:scheme` 等の残余疑似ヘッダーを含む）。
     pub headers: Vec<crate::http2::hpack::HeaderField>,
@@ -2880,14 +2881,20 @@ mod tests {
         }
 
         let parts = conn.take_request_parts(1).expect("parts");
-        assert_eq!(parts.method, b"POST");
-        assert_eq!(parts.path, b"/api/echo");
+        assert_eq!(parts.method.as_ref(), b"POST".as_ref());
+        assert_eq!(parts.path.as_ref(), b"/api/echo".as_ref());
         assert_eq!(parts.authority.as_deref(), Some(&b"example.com"[..]));
         assert_eq!(&parts.body[..], b"hello body");
         // 抽出対象外（:scheme・通常ヘッダー）は headers に残る。
         assert_eq!(parts.headers.len(), 2);
-        assert!(parts.headers.iter().any(|h| h.name == b":scheme"));
-        assert!(parts.headers.iter().any(|h| h.name == b"content-type"));
+        assert!(parts
+            .headers
+            .iter()
+            .any(|h| h.name.as_ref() == b":scheme".as_ref()));
+        assert!(parts
+            .headers
+            .iter()
+            .any(|h| h.name.as_ref() == b"content-type".as_ref()));
 
         // ストリーム側は空へ移動済みで、マネージャには残っている（クリーンアップ可能）。
         let stream = conn.streams.get_ref(1).unwrap();
