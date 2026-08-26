@@ -171,6 +171,94 @@ unsafe impl IoBuf for bytes::Bytes {
 }
 
 // ====================
+// bytes::BytesMut の実装（書き込み可能・プール共有のゼロコピー受信バッファ）
+// ====================
+//
+// F-165 R4: バックエンドから読み取ったボディを `Bytes::copy_from_slice` で都度
+// コピーするのではなく、プール済み `BytesMut`（`pool.rs` の `body_buf_get`/
+// `body_buf_put`）の空き容量（spare capacity）へ直接読み込み、
+// `split_to(n).freeze()` で参照カウント共有のまま切り出して使う。
+//
+// `Vec<u8>` 実装（`write_ptr` が常に先頭固定・`bytes_total` が `capacity()` 全体）
+// とは異なり、`BytesMut` の書き込み先は「呼び出し時点の `len()` を起点とした
+// 未初期化領域」である。`AsyncReadRent::read` は 1 回の read 操作につき
+// `write_ptr()`/`bytes_total()` を読み込み前に 1 回、`set_init(pos)` を完了後に
+// 1 回だけ呼ぶ契約（`src/runtime/io.rs`・各バックエンドの完了ハンドラを参照）
+// なので、その間に `len()` が外部から変化しないことが安全性の前提になる。
+unsafe impl IoBufMut for bytes::BytesMut {
+    #[inline(always)]
+    fn write_ptr(&mut self) -> *mut u8 {
+        // SAFETY: `spare_capacity_mut()` は `len()..capacity()` の未初期化領域を
+        // 指す有効なポインタを返す（bytes クレート自身の不変条件）。
+        self.spare_capacity_mut().as_mut_ptr() as *mut u8
+    }
+
+    #[inline(always)]
+    fn bytes_total(&mut self) -> usize {
+        self.spare_capacity_mut().len()
+    }
+
+    #[inline(always)]
+    unsafe fn set_init(&mut self, pos: usize) {
+        // SAFETY: 呼び出し側（read 完了ハンドラ）は `pos` バイト分が
+        // `write_ptr()`（= この read 開始時点の spare capacity 先頭）から
+        // 書き込み済みであることを `IoBufMut::set_init` の契約として保証する。
+        // また `pos <= bytes_total()`（= その時点の spare capacity）も契約上
+        // 保証されるため、`len() + pos <= capacity()` となり `set_len` は
+        // 確保済み範囲内に収まる。
+        let new_len = self.len() + pos;
+        unsafe {
+            self.set_len(new_len);
+        }
+    }
+}
+
+#[cfg(test)]
+mod bytes_mut_io_buf_mut_tests {
+    use super::*;
+    use bytes::BytesMut;
+
+    #[test]
+    fn write_ptr_starts_at_spare_capacity() {
+        let mut buf = BytesMut::with_capacity(16);
+        buf.extend_from_slice(&[1, 2, 3, 4]);
+        let expected_ptr = unsafe { buf.as_ptr().add(4) };
+        assert_eq!(IoBufMut::write_ptr(&mut buf) as *const u8, expected_ptr);
+        assert_eq!(IoBufMut::bytes_total(&mut buf), 16 - 4);
+    }
+
+    #[test]
+    fn set_init_extends_len_from_current_position() {
+        let mut buf = BytesMut::with_capacity(16);
+        buf.extend_from_slice(&[1, 2, 3, 4]);
+        unsafe {
+            let ptr = IoBufMut::write_ptr(&mut buf);
+            std::ptr::write(ptr, 9);
+            std::ptr::write(ptr.add(1), 8);
+            IoBufMut::set_init(&mut buf, 2);
+        }
+        assert_eq!(&buf[..], &[1, 2, 3, 4, 9, 8]);
+    }
+
+    #[test]
+    fn split_to_freeze_leaves_disjoint_writable_region() {
+        // split_to().freeze() で切り出した Bytes と、残りの BytesMut への
+        // その後の書き込みが同じメモリ領域を指さない（ゼロコピー切り出しの
+        // 安全性の核心）ことを検証する。
+        let mut buf = BytesMut::with_capacity(16);
+        buf.extend_from_slice(b"abcd");
+        let frozen = buf.split_to(4).freeze();
+        assert_eq!(&frozen[..], b"abcd");
+
+        // 残った buf（len=0, capacity=12）へ新しいデータを書き込む。
+        buf.extend_from_slice(b"EFGH");
+        // 先に切り出した frozen の内容が上書きされていないことを確認する。
+        assert_eq!(&frozen[..], b"abcd");
+        assert_eq!(&buf[..], b"EFGH");
+    }
+}
+
+// ====================
 // OffsetBufMut: 読み込み継続用のオフセット付き所有権ビュー
 // ====================
 

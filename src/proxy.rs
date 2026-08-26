@@ -2631,6 +2631,20 @@ where
                 .expect("PooledBuf は drop まで常に Some")
                 .as_valid_slice()
         }
+
+        /// バッファを消費し、有効データのみへ truncate した `Vec<u8>` を取り出す。
+        ///
+        /// プールへは返却しない（呼び出し側が `Bytes::from` で所有権を引き取り、
+        /// ボディをゼロコピーで配る＝F-165 R4）。内部で `Option` を `take()` する
+        /// ため、その後 `self` が drop されても `Drop::drop` は何もしない
+        /// （`buf_put` は呼ばれない）。
+        #[inline(always)]
+        fn into_vec(mut self) -> Vec<u8> {
+            self.0
+                .take()
+                .expect("PooledBuf は into_vec まで常に Some")
+                .into_truncated()
+        }
     }
     impl Drop for PooledBuf {
         fn drop(&mut self) {
@@ -2653,6 +2667,22 @@ where
                 RespData::Pooled(b) => b.as_slice(),
                 RespData::Heap(v) => v.as_slice(),
             }
+        }
+
+        /// `self` を消費し、`body_start` 以降をボディとして `Bytes` で取り出す
+        /// （F-165 R4）。`Bytes::from(Vec<u8>)` はヒープ確保をそのまま引き継ぐ
+        /// ゼロコピー変換で、続く `.slice()` も参照カウント共有のみで memcpy
+        /// しない。`RespData::Pooled` の場合、内部バッファはプール
+        /// （`BUF_POOL`）へは返却されず、最後の `Bytes` 参照が落ちたときに
+        /// 解放される（ヘッダー分のコピー削減と引き換えに、この 1 バッファ分は
+        /// プールへ戻らない）。
+        #[inline(always)]
+        fn into_body_bytes(self, body_start: usize) -> Bytes {
+            let full: Bytes = match self {
+                RespData::Pooled(b) => Bytes::from(b.into_vec()),
+                RespData::Heap(v) => Bytes::from(v),
+            };
+            full.slice(body_start..)
         }
     }
 
@@ -2782,9 +2812,20 @@ where
                         Bytes::copy_from_slice(header.value),
                     ));
                 }
-                let (sent, ok) =
-                    h2_stream_body_cl(resp_tx, notify, status, headers, backend, body, content_len)
-                        .await;
+                // ヘッダー抽出（上のループ）が済んだ時点で `data`（= `response_buf`/
+                // `body` の借用元）はもう参照されないため、ここで `Bytes` へ消費
+                // 変換してゼロコピーでボディを渡す（F-165 R4）。
+                let initial_body = data.into_body_bytes(body_start);
+                let (sent, ok) = h2_stream_body_cl(
+                    resp_tx,
+                    notify,
+                    status,
+                    headers,
+                    backend,
+                    initial_body,
+                    content_len,
+                )
+                .await;
                 let reusable = ok && sent == content_len as u64 && !parsed.is_connection_close;
                 return (status, sent, reusable);
             }
@@ -2810,8 +2851,11 @@ where
                     Bytes::copy_from_slice(header.value),
                 ));
             }
+            // 同上（F-165 R4）: ヘッダー抽出後に `data` を `Bytes` へ消費変換する。
+            let initial_body = data.into_body_bytes(body_start);
             let sent =
-                h2_stream_body_chunked(resp_tx, notify, status, headers, backend, body).await;
+                h2_stream_body_chunked(resp_tx, notify, status, headers, backend, initial_body)
+                    .await;
             return (status, sent, false);
         }
 
@@ -2949,7 +2993,7 @@ async fn h2_stream_body_cl<B>(
     status: u16,
     headers: Vec<(Bytes, Bytes)>,
     backend: &mut B,
-    initial_body: &[u8],
+    initial_body: Bytes,
     content_length: usize,
 ) -> (u64, bool)
 where
@@ -2977,10 +3021,13 @@ where
     let mut remaining = content_length;
     let init_len = initial_body.len().min(remaining);
     if init_len > 0 {
+        // ゼロコピー: `initial_body` は `RespData::into_body_bytes` が
+        // `Bytes::from(Vec<u8>)` で引き継いだ所有データなので、`.slice()`
+        // （参照カウント共有）で送るだけで memcpy しない（F-165 R4）。
         if h2_send(
             resp_tx,
             notify,
-            H2RespMsg::Body(Bytes::copy_from_slice(&initial_body[..init_len])),
+            H2RespMsg::Body(initial_body.slice(0..init_len)),
         )
         .await
         .is_err()
@@ -2991,7 +3038,7 @@ where
     }
 
     while remaining > 0 {
-        let buf = buf_get();
+        let buf = body_buf_get();
         let (res, mut returned_buf) = match timeout(READ_TIMEOUT, backend.read(buf)).await {
             Ok(r) => r,
             Err(_) => {
@@ -3003,24 +3050,35 @@ where
         let n = match res {
             Ok(0) => {
                 // content-length 未達でバックエンド切断: 空 END_STREAM で閉じる（graceful）。
-                buf_put(returned_buf);
+                body_buf_put(returned_buf);
                 return ((content_length - remaining) as u64, false);
             }
             Ok(n) => n,
             Err(_) => {
-                buf_put(returned_buf);
+                body_buf_put(returned_buf);
                 let _ = h2_send(resp_tx, notify, H2RespMsg::Reset(2)).await;
                 return ((content_length - remaining) as u64, false);
             }
         };
-        returned_buf.set_valid_len(n);
         let take = n.min(remaining);
-        let chunk = Bytes::copy_from_slice(&returned_buf.as_valid_slice()[..take]);
-        buf_put(returned_buf);
-        if h2_send(resp_tx, notify, H2RespMsg::Body(chunk))
+        // 読み込んだ n バイトを丸ごとゼロコピーで切り出す（split_to().freeze()）。
+        // content-length を超えて読めた場合（take < n、稀）のみさらに
+        // `.slice()` で先頭 take バイトへ絞る（これも参照カウント複製のみ）。
+        let frozen = returned_buf.split_to(n).freeze();
+        let chunk = if take == n {
+            frozen
+        } else {
+            frozen.slice(0..take)
+        };
+        let send_ok = h2_send(resp_tx, notify, H2RespMsg::Body(chunk))
             .await
-            .is_err()
-        {
+            .is_ok();
+        // `chunk` は上の送出で消費済み。`returned_buf`（残り部分）は同じ確保を
+        // 参照カウントで共有しているだけの別オブジェクトなので、送出後に
+        // ここで初めてプールへ返却を試みる（body_buf_put が一意所有かどうかを
+        // 判定し、まだ他所から参照されていればプールへは戻さず drop する）。
+        body_buf_put(returned_buf);
+        if !send_ok {
             return ((content_length - remaining) as u64, false);
         }
         remaining -= take;
@@ -3036,7 +3094,7 @@ async fn h2_stream_body_chunked<B>(
     status: u16,
     headers: Vec<(Bytes, Bytes)>,
     backend: &mut B,
-    initial_body: &[u8],
+    initial_body: Bytes,
 ) -> u64
 where
     B: crate::runtime::io::AsyncReadRent + Unpin,
@@ -3059,13 +3117,13 @@ where
     let mut decoder = crate::http_utils::ChunkedDecoder::new_unlimited();
     let mut sent: u64 = 0;
 
-    match h2_drain_chunked_to_msg(resp_tx, notify, &mut decoder, initial_body, &mut sent).await {
+    match h2_drain_chunked_to_msg(resp_tx, notify, &mut decoder, &initial_body, &mut sent).await {
         H2ChunkDrain::Done => return sent,
         H2ChunkDrain::NeedMore => {}
     }
 
     loop {
-        let buf = buf_get();
+        let buf = body_buf_get();
         let (res, mut returned_buf) = match timeout(READ_TIMEOUT, backend.read(buf)).await {
             Ok(r) => r,
             Err(_) => {
@@ -3076,26 +3134,24 @@ where
         let n = match res {
             Ok(0) => {
                 // 終端チャンク前に切断: 空 END_STREAM で閉じる（graceful）。
-                buf_put(returned_buf);
+                body_buf_put(returned_buf);
                 return sent;
             }
             Ok(n) => n,
             Err(_) => {
-                buf_put(returned_buf);
+                body_buf_put(returned_buf);
                 let _ = h2_send(resp_tx, notify, H2RespMsg::Reset(2)).await;
                 return sent;
             }
         };
-        returned_buf.set_valid_len(n);
-        let drain = h2_drain_chunked_to_msg(
-            resp_tx,
-            notify,
-            &mut decoder,
-            returned_buf.as_valid_slice(),
-            &mut sent,
-        )
-        .await;
-        buf_put(returned_buf);
+        // 読み込んだ n バイトをゼロコピーで切り出す（split_to().freeze()）。
+        let frozen = returned_buf.split_to(n).freeze();
+        let drain =
+            h2_drain_chunked_to_msg(resp_tx, notify, &mut decoder, &frozen, &mut sent).await;
+        drop(frozen);
+        // 送出（内部で複数チャンクへ分割されうる）が終わった後にプールへの
+        // 返却を試みる（h2_stream_body_cl と同じ理由。body_buf_put 参照）。
+        body_buf_put(returned_buf);
         match drain {
             H2ChunkDrain::Done => return sent,
             H2ChunkDrain::NeedMore => {}
@@ -3116,7 +3172,7 @@ async fn h2_drain_chunked_to_msg(
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
     decoder: &mut crate::http_utils::ChunkedDecoder,
-    data: &[u8],
+    data: &Bytes,
     sent: &mut u64,
 ) -> H2ChunkDrain {
     let mut pos = 0;
@@ -3124,7 +3180,10 @@ async fn h2_drain_chunked_to_msg(
         let span = decoder.next_data_span(&data[pos..]);
         if span.data_len > 0 {
             let start = pos + span.data_start;
-            let chunk = Bytes::copy_from_slice(&data[start..start + span.data_len]);
+            // ゼロコピー: `data` は呼び出し側が所有する `Bytes`（プール由来の
+            // `BytesMut::split_to().freeze()` または初回ヘッダー読み込みバッファ）
+            // への参照カウント共有スライス（F-165 R4、以前は毎回 `Bytes::copy_from_slice`）。
+            let chunk = data.slice(start..start + span.data_len);
             if h2_send(resp_tx, notify, H2RespMsg::Body(chunk))
                 .await
                 .is_err()

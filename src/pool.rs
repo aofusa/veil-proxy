@@ -849,6 +849,167 @@ pub(crate) fn buf_put_vec(mut buf: Vec<u8>) {
 }
 
 // ====================
+// ボディチャンク用プール済み BytesMut（F-165 R4）
+// ====================
+//
+// バックエンドから読み取ったレスポンスボディを、参照カウント共有の `Bytes` として
+// クライアント側チャンネルへゼロコピーで受け渡すためのスレッドローカルプール。
+// 読み込み先はプール済み `BytesMut` の空き容量（spare capacity）そのもので、
+// `split_to(n).freeze()` で切り出した `Bytes` は元のヒープ確保を参照カウントで
+// 共有する（memcpy なし）。従来は読み込みのたびに `Bytes::copy_from_slice` で
+// 新規 malloc + memcpy していた（54KB ボディで最大 ~54KB/req、F-165 実測 61KB/req
+// の大半）分を消す。`BUF_SIZE`（`SafeReadBuffer` 用の読み込みチャンクサイズ）と
+// 同じ値を使う。
+
+/// ボディ読み込み用チャンクサイズ。`SafeReadBuffer` 用の [`BUF_SIZE`] と揃える。
+///
+/// 利用箇所（`proxy.rs` の H2C ボディ中継）が `http2` feature 限定のため、
+/// このプール一式も同じ feature でのみコンパイルする。
+#[cfg(feature = "http2")]
+pub(crate) const BODY_CHUNK_SIZE: usize = BUF_SIZE;
+
+/// プールに保持する `BytesMut` の上限数（`BUF_POOL` と同じ考え方）。
+#[cfg(feature = "http2")]
+const BODY_BUF_POOL_CAP: usize = 32;
+
+#[cfg(feature = "http2")]
+thread_local! {
+    /// ボディチャンク用スレッドローカルプール。
+    ///
+    /// **不変条件**: プールに入っている `BytesMut` は必ず `len() == 0` かつ
+    /// `capacity() >= BODY_CHUNK_SIZE`（`body_buf_put` がこの条件を満たすものだけ
+    /// push する）。この不変条件により、`body_buf_get()` で取り出した直後の
+    /// バッファには前のリクエストの残留データが一切含まれない。
+    static BODY_BUF_POOL: RefCell<Vec<bytes::BytesMut>> = const { RefCell::new(Vec::new()) };
+}
+
+/// プールからボディ読み込み用 `BytesMut` を取得する。
+///
+/// 返される `BytesMut` は `len() == 0`、空き容量は最低 `BODY_CHUNK_SIZE`。
+/// 呼び出し側はこの空き容量（`IoBufMut` 経由で `AsyncReadRent::read` に直接渡す）
+/// へ読み込み、`split_to(n).freeze()` で読み込んだ範囲だけをゼロコピーで
+/// 切り出して使う。
+#[cfg(feature = "http2")]
+#[inline(always)]
+pub(crate) fn body_buf_get() -> bytes::BytesMut {
+    let mut buf = BODY_BUF_POOL
+        .with(|p| p.borrow_mut().pop())
+        .unwrap_or_else(|| bytes::BytesMut::with_capacity(BODY_CHUNK_SIZE));
+    // 防御的措置: プール由来のバッファは body_buf_put の不変条件により常に
+    // capacity() >= BODY_CHUNK_SIZE のはずだが、万一小さい場合のみ確保し直す。
+    if buf.capacity() - buf.len() < BODY_CHUNK_SIZE {
+        buf.reserve(BODY_CHUNK_SIZE);
+    }
+    buf
+}
+
+/// ボディ読み込み用 `BytesMut` をプールへ返却する。
+///
+/// # 回収ルール（安全性の核心）
+///
+/// `split_to(n).freeze()` で切り出した `Bytes` チャンクをレスポンス側の
+/// チャンネル（クライアントへの書き込みが完了するまで）がまだ保持している間、
+/// `buf`（残り部分）は内部ヒープ確保をそのチャンクと参照カウントで共有している。
+/// このとき `buf` をそのままプールへ戻し、次のリクエストが空き容量へ書き込んで
+/// しまうと、まだ生存している他リクエストの `Bytes` チャンクが指すメモリを
+/// 書き換えてしまう（別リクエストのボディが混入する Heartbleed 類似の事故）。
+///
+/// これを防ぐため、次の 2 条件を **両方** 満たすときだけプールへ戻す。
+/// 満たさない場合は drop する（最後の参照が落ちたときに確保が解放される）。
+///
+/// 1. `buf.is_empty()`（`len() == 0`）— 呼び出し側は読み込んだ範囲を必ず
+///    `split_to` で切り出してから返却する契約なので、通常は常に真。万一
+///    残留データがある場合（content-length を超えて読み込んだ余剰データ等）は
+///    次回利用への意図しない持ち越しを避けるため drop する。
+/// 2. `buf.try_reclaim(BODY_CHUNK_SIZE)` が `true` — `bytes` クレート自身が
+///    「追加容量を割り当てなしで確保できるか」を内部の共有状態（一意所有か
+///    どうか）で判定する。他の `Bytes`/`BytesMut` が同じ確保をまだ参照して
+///    いれば `false` を返す。**この判定を bytes クレートに委譲することで、
+///    生存中のチャンクが指す領域を誤って上書きする経路を構造的に排除する**
+///    （自前で参照カウントや所有権を追跡する必要がない）。
+#[cfg(feature = "http2")]
+#[inline(always)]
+pub(crate) fn body_buf_put(mut buf: bytes::BytesMut) {
+    if !buf.is_empty() {
+        return;
+    }
+    BODY_BUF_POOL.with(|p| {
+        let mut pool = p.borrow_mut();
+        if pool.len() < BODY_BUF_POOL_CAP && buf.try_reclaim(BODY_CHUNK_SIZE) {
+            pool.push(buf);
+        }
+    });
+}
+
+#[cfg(all(test, feature = "http2"))]
+mod body_buf_pool_tests {
+    use super::*;
+    use bytes::Buf;
+
+    // 各テストは独立スレッドで実行されるため thread_local プールは常に空から始まる。
+
+    #[test]
+    fn get_returns_empty_buffer_with_min_capacity() {
+        let buf = body_buf_get();
+        assert!(buf.is_empty());
+        assert!(buf.capacity() >= BODY_CHUNK_SIZE);
+    }
+
+    #[test]
+    fn put_then_get_reuses_the_same_allocation() {
+        let mut buf = body_buf_get();
+        // 確保の先頭アドレス（`split_to` で読み出し位置が進む前）を控える。
+        // `try_reclaim` は生存参照が無いときに読み出し位置を確保の先頭へ巻き戻して
+        // 空き容量を復元するため、再利用後のポインタは **split 後の位置ではなく
+        // 確保の先頭** と一致する。
+        let alloc_base = buf.as_ptr();
+        buf.extend_from_slice(b"hello");
+        let chunk = buf.split_to(5).freeze();
+        drop(chunk); // 参照を先に手放し、一意所有に戻す。
+        let ptr_before = alloc_base;
+        body_buf_put(buf);
+
+        let reused = body_buf_get();
+        // 同じヒープ確保が再利用される（try_reclaim がインプレースで空き容量を
+        // 復元し、新規 malloc が発生しない）ことをポインタ一致で確認する。
+        assert_eq!(reused.as_ptr(), ptr_before);
+        assert!(reused.is_empty());
+        assert!(reused.capacity() >= BODY_CHUNK_SIZE);
+    }
+
+    #[test]
+    fn buffer_with_live_reference_is_not_recycled_into_pool() {
+        // 危険なケース: split_to().freeze() した Bytes チャンクがまだ生存している
+        // 状態で残りの BytesMut を返却しても、プールへは戻らない（drop される）
+        // ことを検証する。戻ってしまうと、次のリクエストがこのチャンクの
+        // メモリ領域と隣接した空き容量へ書き込み、生存中のチャンクの内容が
+        // 破壊されるリスクがある不変条件違反になる。
+        BODY_BUF_POOL.with(|p| p.borrow_mut().clear()); // 他テストの残留を排除。
+
+        let mut buf = body_buf_get();
+        buf.extend_from_slice(b"live-chunk");
+        let live_chunk = buf.split_to(10).freeze(); // まだ drop しない。
+
+        body_buf_put(buf); // buf 側は is_empty() だが、live_chunk が参照を保持中。
+
+        // プールが空のまま（recycle されなかった）ことを直接確認する。
+        // 戻ってしまうと、次のリクエストがこのチャンクの確保と隣接した空き容量へ
+        // 書き込み、生存中の live_chunk の内容を破壊しうる不変条件違反になる。
+        let pool_len = BODY_BUF_POOL.with(|p| p.borrow().len());
+        assert_eq!(pool_len, 0, "共有中の BytesMut はプールへ戻ってはならない");
+
+        // live_chunk の内容が破壊されていないことを確認する（本テストの本題）。
+        assert_eq!(&live_chunk[..], b"live-chunk");
+
+        // remaining() は Buf トレイト経由。live_chunk が正しい範囲を指していることの
+        // 追加確認。
+        assert_eq!(live_chunk.remaining(), 10);
+
+        drop(live_chunk); // 最後の参照を落としてから次のテストへ影響を残さない。
+    }
+}
+
+// ====================
 // リクエスト構築用バッファプール（メモリ割り当て最適化）
 // ====================
 //
