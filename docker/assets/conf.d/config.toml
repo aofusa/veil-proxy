@@ -7,6 +7,12 @@
 
 [server]
 listen = "0.0.0.0:443"
+# メインリスナーで平文接続を拒否する（既定 true、F-163）。
+# false にすると TLS ポートで h2c / 平文 HTTP/1.1 も受理する（h2c_enabled = true が必要）。
+tls_only = true
+# listen / h2c_listen は "unix:/run/veil/https.sock" 形式（UDS）も指定できる（F-164、Unix 系のみ）。
+# その場合のソケットファイルのパーミッション（8 進数文字列、既定 "0660"）:
+# unix_socket_permissions = "0660"
 http = "0.0.0.0:80"
 http2_enabled = true
 threads = 0
