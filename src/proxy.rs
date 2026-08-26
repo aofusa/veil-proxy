@@ -1472,7 +1472,11 @@ async fn h2_send(
 /// （外側の `Vec` 自体は呼び出しごとに 1 回のみ確保。中身の名前/値はヒープ確保なし）。
 #[cfg(feature = "http2")]
 fn h2_base_headers(add_alt_svc: bool) -> Vec<(Bytes, Bytes)> {
-    let mut headers: Vec<(Bytes, Bytes)> = Vec::with_capacity(2);
+    // 呼び出し側はこの戻り値へさらに content-type / location / 上流ヘッダ等を push する。
+    // 容量を 2 に切り詰めると **リクエストごとに 1 回 realloc** が発生する
+    // （`alloc-stats` の reallocs/req が 2.31 → 3.34 に増えた形で実測された）。
+    // 従来どおり 4 を確保しておく。
+    let mut headers: Vec<(Bytes, Bytes)> = Vec::with_capacity(4);
     if let Some(ref g) = get_server_header_guard() {
         headers.push((Bytes::from_static(b"server"), g.value_bytes()));
     }
