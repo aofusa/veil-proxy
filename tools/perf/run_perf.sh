@@ -24,6 +24,28 @@ H2_ARGS="${H2_ARGS:--n 30000 -c100 -m10}"
 H3_ARGS="${H3_ARGS:---alpn-list=h3 -n 30000 -c100 -m10}"  # h2load QUIC モード（HTTP/3）
 H2C_PORT="${H2C_PORT:-8080}"       # 平文 h2c リスナーのポート（veil: h2c_listen / nginx: listen 8080 http2）
 H2C_ARGS="${H2C_ARGS:-$H2_ARGS}"   # h2c 負荷（既定は HTTP/2 と同条件）
+
+# 計測クライアント 1 回あたりの上限時間（秒）。**サーバ側のハングでスイート全体が
+# 止まらないための安全弁**（B-75: epoll + kTLS のハングで h2load が 36 分間ぶら下がり、
+# フルスイートが停止した）。超過した場合はそのイテレーションを NA として次へ進む。
+# `timeout` は docker CLI を殺すだけでコンテナは残るため、必ず `--name` を付けて
+# 明示的に `docker rm -f` する（`run_client` 参照）。
+CLIENT_TIMEOUT="${CLIENT_TIMEOUT:-180}"
+
+# 計測クライアントを名前付きで起動し、`CLIENT_TIMEOUT` 秒で打ち切るラッパ。
+# 出力（ログ）は $1 に書く。戻り値 124 = タイムアウト（＝サーバ側ハングの疑い）。
+run_client() { # logfile docker-run-args...
+    local logfile="$1"; shift
+    local name="perf-client-$$"
+    docker rm -f "$name" >/dev/null 2>&1
+    timeout "$CLIENT_TIMEOUT" docker run --rm --name "$name" "$@" > "$logfile" 2>&1
+    local rc=$?
+    if [ $rc -eq 124 ]; then
+        echo "!! 計測クライアントが ${CLIENT_TIMEOUT}s を超過（サーバ側ハングの疑い）: $logfile" >&2
+        docker rm -f "$name" >/dev/null 2>&1
+    fi
+    return $rc
+}
 K6_VUS="${K6_VUS:-50}"             # k6 並列仮想ユーザ数（gRPC / WebSocket）
 K6_DURATION="${K6_DURATION:-10s}" # k6 計測時間
 ITERATIONS="${ITERATIONS:-3}"      # 各 (config, proto) の反復回数（median±stdev 集計用）
@@ -102,10 +124,11 @@ run_grpc() { # label cfg container
         outdir="$LOGDIR/${label}_${cfg}_grpc_${iter}.out"
         rm -rf "$outdir"; mkdir -p "$outdir"; chmod 777 "$outdir"
         ( sleep 2; sample_stats "$c" > "$LOGDIR/${label}_${cfg}_grpc_${iter}.stats" ) &
-        docker run --rm --network $NET \
+        run_client "$LOGDIR/${label}_${cfg}_grpc_${iter}.log" \
+            --network $NET \
             -v "$K6DIR:/scripts:ro" -v "$outdir:/out" \
             -e TARGET="$c:443" -e VUS="$K6_VUS" -e DURATION="$K6_DURATION" \
-            $K6_IMG run /scripts/grpc.js > "$LOGDIR/${label}_${cfg}_grpc_${iter}.log" 2>&1
+            $K6_IMG run /scripts/grpc.js
         wait
         read reqps lat fails < <(parse_k6 "$outdir/result.tsv")
         read cpu mem < "$LOGDIR/${label}_${cfg}_grpc_${iter}.stats" 2>/dev/null || { cpu=NA; mem=NA; }
@@ -120,10 +143,11 @@ run_ws() { # label cfg container
         outdir="$LOGDIR/${label}_${cfg}_ws_${iter}.out"
         rm -rf "$outdir"; mkdir -p "$outdir"; chmod 777 "$outdir"
         ( sleep 2; sample_stats "$c" > "$LOGDIR/${label}_${cfg}_ws_${iter}.stats" ) &
-        docker run --rm --network $NET \
+        run_client "$LOGDIR/${label}_${cfg}_ws_${iter}.log" \
+            --network $NET \
             -v "$K6DIR:/scripts:ro" -v "$outdir:/out" \
             -e TARGET="wss://$c:443/.ws" -e VUS="$K6_VUS" -e DURATION="$K6_DURATION" \
-            $K6_IMG run /scripts/websocket.js > "$LOGDIR/${label}_${cfg}_ws_${iter}.log" 2>&1
+            $K6_IMG run /scripts/websocket.js
         wait
         read reqps lat fails < <(parse_k6 "$outdir/result.tsv")
         read cpu mem < "$LOGDIR/${label}_${cfg}_ws_${iter}.stats" 2>/dev/null || { cpu=NA; mem=NA; }
@@ -173,13 +197,13 @@ run_grpc_h3() { # label cfg container
     local url="https://$c:443/hello.HelloService/SayHello"
     local hdrs=(-H"content-type: application/grpc" -H"te: trailers")
     # ウォームアップ（QUIC ハンドシェイク・上流 h2c 接続プールの充填を計測窓の外へ）
-    docker run --rm --network $NET -v "$LOGDIR:/data:ro" --entrypoint h2load $H3_IMG \
-        $H3_ARGS -n 300 -c 10 -d /data/$(basename "$GRPC_H3_BODY") "${hdrs[@]}" "$url" >/dev/null 2>&1
+    run_client /dev/null --network $NET -v "$LOGDIR:/data:ro" --entrypoint h2load $H3_IMG \
+        $H3_ARGS -n 300 -c 10 -d /data/$(basename "$GRPC_H3_BODY") "${hdrs[@]}" "$url"
     for iter in $(seq 1 "$ITERATIONS"); do
         ( sleep 1; sample_stats "$c" > "$LOGDIR/${label}_${cfg}_grpch3_${iter}.stats" ) &
-        docker run --rm --network $NET -v "$LOGDIR:/data:ro" --entrypoint h2load $H3_IMG \
-            $H3_ARGS -d /data/$(basename "$GRPC_H3_BODY") "${hdrs[@]}" "$url" \
-            > "$LOGDIR/${label}_${cfg}_grpch3_${iter}.log" 2>&1
+        run_client "$LOGDIR/${label}_${cfg}_grpch3_${iter}.log" \
+            --network $NET -v "$LOGDIR:/data:ro" --entrypoint h2load $H3_IMG \
+            $H3_ARGS -d /data/$(basename "$GRPC_H3_BODY") "${hdrs[@]}" "$url"
         wait
         read reqps tput latmean non2xx < <(parse_h2load "$LOGDIR/${label}_${cfg}_grpch3_${iter}.log")
         read cpu mem < "$LOGDIR/${label}_${cfg}_grpch3_${iter}.stats" 2>/dev/null || { cpu=NA; mem=NA; }
@@ -197,11 +221,11 @@ run_http3() { # label cfg container
         emit "$label" "$cfg" "http3" 1 NA NA NA NA NA NA NA
         return
     fi
-    docker run --rm --network $NET --entrypoint h2load $H3_IMG $H3_ARGS -n 1000 -c 10 "https://$c:443/" >/dev/null 2>&1
+    run_client /dev/null --network $NET --entrypoint h2load $H3_IMG $H3_ARGS -n 1000 -c 10 "https://$c:443/"
     for iter in $(seq 1 "$ITERATIONS"); do
         ( sleep 1; sample_stats "$c" > "$LOGDIR/${label}_${cfg}_h3_${iter}.stats" ) &
-        docker run --rm --network $NET --entrypoint h2load $H3_IMG $H3_ARGS "https://$c:443/" \
-            > "$LOGDIR/${label}_${cfg}_h3_${iter}.log" 2>&1
+        run_client "$LOGDIR/${label}_${cfg}_h3_${iter}.log" \
+            --network $NET --entrypoint h2load $H3_IMG $H3_ARGS "https://$c:443/"
         wait
         read reqps tput latmean non2xx < <(parse_h2load "$LOGDIR/${label}_${cfg}_h3_${iter}.log")
         read cpu mem < "$LOGDIR/${label}_${cfg}_h3_${iter}.stats" 2>/dev/null || { cpu=NA; mem=NA; }
@@ -216,11 +240,11 @@ run_http3() { # label cfg container
 run_h2c() { # label cfg container [path]
     local label="$1" cfg="$2" c="$3" path="${4:-/}" iter reqps tput latmean non2xx cpu mem
     local url="http://$c:$H2C_PORT$path"
-    docker run --rm --network $NET --entrypoint h2load $H2_IMG -n 1000 -c 10 "$url" >/dev/null 2>&1
+    run_client /dev/null --network $NET --entrypoint h2load $H2_IMG -n 1000 -c 10 "$url"
     for iter in $(seq 1 "$ITERATIONS"); do
         ( sleep 1; sample_stats "$c" > "$LOGDIR/${label}_${cfg}_h2c_${iter}.stats" ) &
-        docker run --rm --network $NET --entrypoint h2load $H2_IMG $H2C_ARGS "$url" \
-            > "$LOGDIR/${label}_${cfg}_h2c_${iter}.log" 2>&1
+        run_client "$LOGDIR/${label}_${cfg}_h2c_${iter}.log" \
+            --network $NET --entrypoint h2load $H2_IMG $H2C_ARGS "$url"
         wait
         read reqps tput latmean non2xx < <(parse_h2load "$LOGDIR/${label}_${cfg}_h2c_${iter}.log")
         read cpu mem < "$LOGDIR/${label}_${cfg}_h2c_${iter}.stats" 2>/dev/null || { cpu=NA; mem=NA; }
@@ -258,13 +282,13 @@ run_load() { # target_label config_label container has_http2
     esac
 
     # ウォームアップ（JIT/ページキャッシュ/接続確立コストを計測外にする）
-    docker run --rm --network $NET $WRK_IMG -t2 -c10 -d2s "$h1_url" >/dev/null 2>&1
+    run_client /dev/null --network $NET $WRK_IMG -t2 -c10 -d2s "$h1_url"
 
     # HTTP/1.1 (wrk) × ITERATIONS
     for iter in $(seq 1 "$ITERATIONS"); do
         ( sleep 2; sample_stats "$c" > "$LOGDIR/${label}_${cfg}_wrk_${iter}.stats" ) &
-        docker run --rm --network $NET $WRK_IMG $WRK_ARGS "${wrk_extra[@]}" "$h1_url" \
-            > "$LOGDIR/${label}_${cfg}_wrk_${iter}.log" 2>&1
+        run_client "$LOGDIR/${label}_${cfg}_wrk_${iter}.log" \
+            --network $NET $WRK_IMG $WRK_ARGS "${wrk_extra[@]}" "$h1_url"
         wait
         read reqps transfer latavg latp99 non2xx < <(parse_wrk "$LOGDIR/${label}_${cfg}_wrk_${iter}.log")
         read cpu mem < "$LOGDIR/${label}_${cfg}_wrk_${iter}.stats" 2>/dev/null || { cpu=NA; mem=NA; }
@@ -273,11 +297,11 @@ run_load() { # target_label config_label container has_http2
 
     # HTTP/2 (h2load) × ITERATIONS
     if [ "$h2" = "1" ]; then
-        docker run --rm --network $NET --entrypoint h2load $H2_IMG -n 1000 -c 10 "https://$c:443/" >/dev/null 2>&1
+        run_client /dev/null --network $NET --entrypoint h2load $H2_IMG -n 1000 -c 10 "https://$c:443/"
         for iter in $(seq 1 "$ITERATIONS"); do
             ( sleep 1; sample_stats "$c" > "$LOGDIR/${label}_${cfg}_h2_${iter}.stats" ) &
-            docker run --rm --network $NET --entrypoint h2load $H2_IMG $H2_ARGS "${h2_extra[@]}" "https://$c:443/" \
-                > "$LOGDIR/${label}_${cfg}_h2_${iter}.log" 2>&1
+            run_client "$LOGDIR/${label}_${cfg}_h2_${iter}.log" \
+                --network $NET --entrypoint h2load $H2_IMG $H2_ARGS "${h2_extra[@]}" "https://$c:443/"
             wait
             read reqps tput latmean non2xx < <(parse_h2load "$LOGDIR/${label}_${cfg}_h2_${iter}.log")
             read cpu mem < "$LOGDIR/${label}_${cfg}_h2_${iter}.stats" 2>/dev/null || { cpu=NA; mem=NA; }
