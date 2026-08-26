@@ -35,6 +35,58 @@ Veil の HTTP/1.1・HTTP/2・HTTP/3・gRPC・L4 スループット／レイテ�
 - gRPC over HTTP/3 はクライアント（k6）非対応のためフェイルセーフで NA（仕様どおり）
 - kTLS はコンテナ（veth）と相性が悪いため feat 系構成では無効（直交表の ktls 因子でのみ計測）
 
+## 2026-08-26 フルスイート（F-163〜F-167 / B-74 / B-75 適用後、全 67 構成 × 2 ビルド × 3 反復）
+
+`BUILDS='glibc container' ITERATIONS=3 bash tools/perf/run_perf.sh`。
+**672 計測すべてで Non-2xx = 0、NA 行はゼロ**（`grpc_h3*` も F-167 で実計測できるようになった）。
+生データは [`results_raw.tsv`](results_raw.tsv) の `# ==== 2026-08-26 ...` 節。
+
+### 代表構成（Req/s 中央値、2026-08-25 の同一ハーネス計測との比較）
+
+| 構成 | プロトコル | nginx | 08-25 `full` | **今回 `full`** | 08-25 `full-container` | **今回 `full-container`** |
+|---|---|---|---|---|---|---|
+| `h2c_file`（3B 静的・h2c） | h2c | 10,329 | 24,546 | **24,647** | 24,903 | **25,787** |
+| `h2c_proxy`（54KB 中継・h2c） | h2c | 6,344 | 10,407 | **11,120（+6.8%）** | 10,565 | **11,402（+7.9%）** |
+| `h2_1_ktls_0_lb_kernel_ofc_1` | HTTP/1.1 | 6,758 | 9,271 | **9,433** | 9,316 | 9,322 |
+| 同上 | HTTP/2 | 6,205 | 7,367 | 7,349 | 7,450 | 7,376 |
+| `h2_1_feat_proxy` | HTTP/1.1 | 6,758※ | 6,386 | **6,526** | 6,653 | **6,662** |
+| `h3_file_metrics` | HTTP/3 | — | 1,851 | **1,878** | 1,959 | 1,912 |
+| `h3_proxy` | HTTP/3 | — | 1,582 | **1,613** | 1,655 | — |
+| `grpc_h2_metrics` | gRPC(k6) | — | 4,438 | **4,451** | 4,565 | 4,533 |
+| **`grpc_h3_metrics`** | **gRPC over HTTP/3** | — | **NA（計測不能）** | **8,018** | **NA** | **8,679** |
+| `h2_1_feat_websocket` | WebSocket | — | 3,129 | **3,268** | 4,861 | 4,791 |
+| `h2_0_feat_l4` | L4（平文 9080） | 6,758 | 13,778 | 13,709 | 12,992 | 12,823 |
+
+※ nginx ベースラインは TLS **静的配信**であり逆プロキシではない（F-118 の方針）。
+`feat_proxy` 行の対 nginx は同条件比較ではない。プロキシ同士の同条件比較は `h2c_proxy` のみ。
+
+### 読み方
+
+- **`h2c_proxy`（54KB 逆プロキシ）が両バックエンドで +6.8〜7.9%。** F-165 R4
+  （バックエンド応答ボディを `Bytes::copy_from_slice` からプール済み `BytesMut` の
+  `split_to().freeze()` へ）の効果で、ラボの交互 A/B（CPU/req -17%）と整合する。
+  対 nginx は **1.75×（`full-container`）／1.75×（`full`）**。
+- **gRPC over HTTP/3 が初めて数字になった（F-167）。** 全 6 構成で 7,300〜8,800 rps、
+  Non-2xx = 0。**k6 の gRPC（HTTP/2、4,400〜4,600 rps）と直接比較してはならない**
+  （k6 は VU ベース、h2load は `-c/-m` 多重化ベースで負荷モデルが違う）。
+  比較して意味があるのは同じ h2load 条件での構成間・ビルド間の相対値。
+- **この計測が B-74（HTTP/3 → h2c 上流にコネクションプールが無く `EADDRNOTAVAIL` で
+  5.9% が 5xx、726 rps）と B-75（epoll の readiness ヒントによる kTLS + HTTP/2 の
+  恒久ハング）の 2 件を発見した。** どちらも単体 934・統合 54・E2E 544 をすべて通過しており、
+  **フルスイートだけが検出できた**（B-74 修正後は同経路が 726 → 8,000 rps 超）。
+- `full` と `full-container` は 08-25 と同じく**概ね互角**で、WebSocket（container 有利）と
+  L4（uring 有利）の傾向も維持されている。
+
+### 計測条件
+
+- ホスト: 4 コア Linux（co-tenant あり）。**クライアント・veil・上流が同一マシンを共有する**ため、
+  veil 単体の改善は rps に鈍く出る（負荷時の CPU は client 71% / veil 195% / backend 130% ＝ 約 400%）。
+  改善幅を正確に見たい場合は `tools/perf/h2c_proxy_lab.sh cpuab`（veil の CPU/req 交互 A/B）を使う。
+- 負荷: HTTP/1.1 = wrk `-t4 -c100 -d10s` / HTTP/2・HTTP/3 = h2load `-n 30000 -c100 -m10` /
+  gRPC = k6 50VU×10s / **gRPC over HTTP/3 = QUIC 対応 h2load + gRPC unary ワイヤ形式（F-167）** /
+  WebSocket = k6 / L4 = wrk（平文 9080）
+- ハングでスイートが停止しないよう `CLIENT_TIMEOUT`（既定 180 秒）を導入済み（B-75 の教訓）。
+
 ## 2026-08-26 F-163〜F-166（tls_only / UDS / アロケーション最小化 / epoll 最適化）
 
 `tools/perf/h2c_proxy_lab.sh` の交互 A/B と、新設した **`cpuab`（veil の CPU/req 交互 A/B）**、
