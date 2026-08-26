@@ -77,3 +77,15 @@ F-165 の A1〜A4・A6 がそのまま gRPC 中継（`h2_proxy_h2c` → `H2cClie
   `CONFIG_GLOB=grpc_h2_*` scoped 実行。
 - **io_uring 既定ビルドの非退行も必ず確認する**（F-158 の教訓: 片方のバックエンドで
   効いた変更をもう一方へ一般化しない）。
+
+
+## A-2 は差し戻した（B-75、2026-08-26）
+
+`EPOLLET` + fd あたり ADD 1 回は、**kTLS + HTTP/2 で恒久ハング**を引き起こしたため
+差し戻した（詳細は `docs/backlog/bugs/B-75-epoll-et-ktls-hang.md`）。
+A-1（readiness ヒント）と A-3（`WakerSlot`）は維持している。
+
+**この設計ドキュメントの「A-2 の詳細設計」に書いた正しさの根拠は誤りだった**:
+「ヒントが無い状態で park する前に必ず `poll(2)` で確認する」と書いたが、
+実際の I/O 経路（`ReadFuture`/`WriteFuture`）は `poll(2)` を通らず `EAGAIN` から直接
+park するため、この保証は成立していなかった。

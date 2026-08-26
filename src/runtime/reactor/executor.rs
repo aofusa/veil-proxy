@@ -212,34 +212,56 @@ pub(crate) fn register_write(fd: RawFd, waker: Waker) {
 /// フォールバックの組で塞ぐ）。
 #[cfg(veil_poller_epoll)]
 fn register(fd: RawFd, interest: Interest, waker: Waker) {
-    let needs_add = FD_TABLE.with(|t| {
+    let (needs_add, mask) = FD_TABLE.with(|t| {
         let mut t = t.borrow_mut();
         let rec = t.get_or_insert(fd);
+        // ADD/MOD の判定は「一度でも ADD 済みか」（`known_to_kernel`）だけを見る。
+        // `armed == 0` は EPOLLONESHOT 発火直後にも起こり得るが、その場合でも fd 自体は
+        // epoll の監視対象リストに残っているため MOD を使う必要がある（このコメントに
+        // 至った実装バグの詳細は `poller::FdRecord` の doc を参照）。
+        let needs_add = !rec.known_to_kernel;
         // 同一方向の複数同時待機者を許容する（キューへ追加。`poller::WakerSlot` の doc
         // 参照。offload の共有 eventfd 等、1 fd に複数タスクが同時に読み取り可能待ちを
         // するケースで、先行者の Waker を上書き消失させないために必須）。
-        match interest {
-            Interest::Read => rec.read_waker.push(waker),
-            Interest::Write => rec.write_waker.push(waker),
-        }
-        !rec.known_to_kernel
+        let bit = match interest {
+            Interest::Read => {
+                rec.read_waker.push(waker);
+                READ
+            }
+            Interest::Write => {
+                rec.write_waker.push(waker);
+                WRITE
+            }
+        };
+        let new_mask = rec.armed | bit;
+        rec.armed = new_mask;
+        (needs_add, new_mask)
     });
-    if !needs_add {
-        // 既にカーネルへ ADD 済み（ET・読み書き両方向を常時 armed）のため、
-        // ここでの epoll_ctl は不要（syscall ゼロ）。
-        return;
-    }
-    // EPOLLRDHUP: 相手が半クローズ（shutdown(SHUT_WR) 相当）したことを検出するため、
-    // 従来から要求していたビットをそのまま引き継ぐ（`ERR_HUP` を要求しなくても
-    // EPOLLERR/EPOLLHUP は常に配送されるが、EPOLLRDHUP は明示要求が必要）。
-    let mask = READ | WRITE | libc::EPOLLRDHUP as u32;
-    match with_poller(|p| p.add(fd, mask)) {
+    // 「既に armed 済みなら epoll_ctl を省略する」最適化はあえて行わない。
+    // `register()` は個々の Future の poll ごとに（EAGAIN の度に）呼ばれるため、
+    // ここでの epoll_ctl は「新規待機開始」だけでなく「まだ完了していない待機の
+    // 再確認」でも起こり得る。呼び出しごとに MOD/ADD を無条件で発行することで、
+    // fd ごとの armed ビット計算に依存する ADD/MOD 判定ミス（EPOLLONESHOT の
+    // 再武装漏れ）の余地を構造的に排除する（EPOLL_CTL_MOD は冪等で安全に繰り返せる）。
+    //
+    // **B-75: この「毎回 MOD で再武装する」ことが正しさの要でもある。** 再武装のたびに
+    // カーネルがレベル状態を再評価するため、「`poll(2)` は readable なのに `recvmsg` が
+    // `EAGAIN` を返す」kTLS ソケットでも次の周回で必ず起床できる。F-166 A-2 で
+    // `EPOLLET` + 生涯 1 回 ADD に変えたところ、まさにこの状況で恒久ハングした。
+    let res = if needs_add {
+        with_poller(|p| p.add(fd, mask))
+    } else {
+        with_poller(|p| p.modify(fd, mask))
+    };
+    match res {
         Ok(()) => {
-            FD_TABLE.with(|t| {
-                if let Some(rec) = t.borrow_mut().get_mut(fd) {
-                    rec.known_to_kernel = true;
-                }
-            });
+            if needs_add {
+                FD_TABLE.with(|t| {
+                    if let Some(rec) = t.borrow_mut().get_mut(fd) {
+                        rec.known_to_kernel = true;
+                    }
+                });
+            }
         }
         Err(e) => {
             ftlog::error!("reactor: epoll register failed for fd {}: {}", fd, e);
@@ -446,12 +468,13 @@ fn dispatch_event(fd: RawFd, flags: u32) {
     // register()/FD_TABLE を触るタスクを起こし得るため、二重借用パニックを避ける）。
     // A-3: `mem::take`（`WakerSlot::default()` = `Empty`）で取り出すのは単一待機者
     // ならヒープ操作なしの `WakerSlot::One`（ムーブのみ）で、`Vec` を経由しない。
-    let (mut read_waker, mut write_waker) = FD_TABLE.with(|t| {
+    let (mut read_waker, mut write_waker, remaining) = FD_TABLE.with(|t| {
         let mut t = t.borrow_mut();
         let Some(rec) = t.get_mut(fd) else {
             return (
                 super::poller::WakerSlot::Empty,
                 super::poller::WakerSlot::Empty,
+                0,
             );
         };
         // A-1: 起床させる Waker の有無に関わらず、観測したイベント方向のヒントを
@@ -463,23 +486,30 @@ fn dispatch_event(fd: RawFd, flags: u32) {
         if flags & (WRITE | ERR_HUP) != 0 {
             rec.write_hint = EPOLL_HINT_SENTINEL;
         }
+        // EPOLLONESHOT により、発火した時点でカーネル側の interest は全方向とも
+        // 無効化されている。テーブル側の armed からも発火方向のビットを落とす
+        // （再武装は待機側の `register()`、または下の「残った方向の再武装」で行う）。
         let rw = if flags & (READ | ERR_HUP) != 0 {
+            rec.armed &= !READ;
             std::mem::take(&mut rec.read_waker)
         } else {
             super::poller::WakerSlot::Empty
         };
         let ww = if flags & (WRITE | ERR_HUP) != 0 {
+            rec.armed &= !WRITE;
             std::mem::take(&mut rec.write_waker)
         } else {
             super::poller::WakerSlot::Empty
         };
-        (rw, ww)
+        (rw, ww, rec.armed)
     });
-    // A-2: ET 常時登録のため、ここでの再武装（旧: 片方だけ起きたらもう片方を
-    // 再武装する `epoll_ctl(MOD)`）は不要。fd は生涯 ADD 済みのまま・両方向常時
-    // armed であり、epoll_ctl は一切呼ばない。
     read_waker.wake_all();
     write_waker.wake_all();
+    if remaining != 0 {
+        // EPOLLONESHOT により fd 全体の interest が disarm されているため、まだ待ち手が
+        // 残っている方向（読み書きどちらか一方のみ起床した場合）を再武装する。
+        let _ = with_poller(|p| p.modify(fd, remaining));
+    }
 }
 
 /// kqueue バージョンの 1 回分の poller wait + イベント/タイマー処理。

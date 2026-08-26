@@ -100,14 +100,16 @@ impl WakerSlot {
 /// fd ごとの登録状態。
 ///
 /// `read_waker` / `write_waker` は同時に存在してよい（同一 fd への読み待ちと書き待ちの
-/// 並存。L4/splice の双方向転送で必要）。`armed` はカーネル（kqueue/WSAPoll）へ現在
-/// **有効化されている** interest ビット（poller 実装が解釈するビット表現）を保持する。
-/// **epoll バックエンドは `armed` を使わない**（F-166 A-2: ET 常時登録のため「カーネルへの
-/// 現在の interest」という概念自体が不要になった。フィールドは kqueue/WSAPoll 専用）。
+/// 並存。L4/splice の双方向転送で必要）。`armed` はカーネル（epoll/kqueue/WSAPoll）へ現在
+/// **有効化されている** interest ビット（poller 実装が解釈するビット表現。epoll では
+/// `EPOLLIN`/`EPOLLOUT`）を保持する。
 ///
-/// `known_to_kernel` は epoll 専用で、「この fd に対して `epoll_ctl(ADD, ...)` を一度でも
-/// 実行済みか」を保持する（F-166 A-2 以降、ADD は fd あたり生涯 1 回だけで、以降の
-/// `register()` は epoll_ctl を一切呼ばない。`EPOLL_CTL_DEL` するまで true のまま）。
+/// `known_to_kernel` は `armed` とは別に管理する: `EPOLLONESHOT` は発火後に interest を
+/// 無効化するのみで、epoll インスタンスの監視対象リストからは fd を除去しない
+/// （`EPOLL_CTL_DEL` を呼ばない限り fd は登録済みのまま）。そのため「現在 armed なビットが
+/// 無い（`armed == 0`）」は「ADD 未実施」を意味しない。一度でも `EPOLL_CTL_ADD` に成功した
+/// fd は次回以降 `armed` の値に関わらず必ず `EPOLL_CTL_MOD` を使う必要がある
+/// （F-120 Phase 2 で発見した実装バグ）。
 ///
 /// `read_waker`/`write_waker` は [`WakerSlot`] で持つ（F-166 A-3。旧実装は常に
 /// `Vec<Waker>` だったため 1 fd 1 待機者という支配的ケースでも malloc/free が起床の
@@ -121,8 +123,7 @@ pub(crate) struct FdRecord {
     /// フィルタ（READ/WRITE）」の意味で使う（`kqueue::KqueuePoller::update`
     /// の `prev_mask` 引数に渡し、ビットが立たなくなった方向を `EV_DELETE` する判定に使う）。
     /// WSAPoll バックエンドでは「次回 `WSAPoll` 呼び出しに含める方向」の意味で使う。
-    /// epoll バックエンドはこのフィールドを参照・更新しない（上記 doc 参照）。
-    #[cfg(any(veil_poller_kqueue, veil_poller_wsapoll))]
+    /// epoll バックエンドでは「`EPOLLONESHOT` で現在カーネルへ有効化されている方向」。
     pub armed: u32,
     /// この fd に対して `EPOLL_CTL_ADD` を一度でも実行済みか（`EPOLL_CTL_DEL` するまで
     /// true のまま。F-166 A-2 以降、ADD/MOD 判定ではなく「初回登録か否か」の唯一の正になる:

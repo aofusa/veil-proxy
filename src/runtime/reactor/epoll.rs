@@ -1,13 +1,20 @@
 //! epoll(7) の薄いラッパ（`veil_poller_epoll`）
 //!
-//! `epoll_create1` / `epoll_ctl` / `epoll_wait` を直接呼ぶだけの最小レイヤ。fd ごとの
-//! Waker 管理は `reactor::executor`（`FdTable` 経由）が担う。本モジュールはカーネル
-//! 呼び出しのみに責務を絞り、poller の差し替え（kqueue 等）を local に閉じ込める。
+//! `epoll_create1` / `epoll_ctl` / `epoll_wait` を直接呼ぶだけの最小レイヤ。
+//! oneshot（`EPOLLONESHOT`）を前提とし、fd ごとの Waker 管理は
+//! `reactor::executor`（`FdTable` 経由）が担う。本モジュールはカーネル呼び出しのみに
+//! 責務を絞り、poller の差し替え（kqueue 等）を local に閉じ込める。
 //!
-//! F-166 A-2: エッジトリガ（`EPOLLET`）常時登録に変更した。`EPOLLONESHOT` +
-//! `epoll_ctl(MOD)` 毎回発行だった旧実装をやめ、fd あたり `epoll_ctl(ADD)` を
-//! **生涯 1 回だけ**呼ぶ（`reactor::executor::register` 参照）。`modify`（旧 MOD 再武装
-//! API）は呼び出し元が無くなったため削除した。
+//! **`EPOLLET`（エッジトリガ）を使ってはならない（B-75）。** F-166 A-2 で
+//! 「fd あたり `epoll_ctl(ADD)` 生涯 1 回 + `EPOLLET`」へ変更したところ、
+//! kTLS + HTTP/2 の負荷で **起床を取りこぼして恒久ハング**した（CPU 0.2% で停止）。
+//! 理由は ET が「`EAGAIN` ⇒ レベル的にも読めない」を前提にするのに対し、
+//! **kTLS ソケットは `poll(2)` が `POLLIN` を返す状態でも `recvmsg` が `EAGAIN` を
+//! 返しうる**（レコードが未完成、あるいは先頭がアプリケーションデータ以外）ためで、
+//! この状態ではもう新しいエッジが来ない。`EPOLLONESHOT` + 待機ごとの
+//! `EPOLL_CTL_MOD` 再武装は、再武装のたびにカーネルが**レベル状態を再評価**するため
+//! この取りこぼしが構造的に起こらない（＝旧実装が正しかった）。詳細は
+//! `docs/backlog/bugs/B-75-epoll-et-ktls-hang.md`。
 
 use std::io;
 use std::os::unix::io::RawFd;
@@ -19,8 +26,7 @@ pub const WRITE: u32 = libc::EPOLLOUT as u32;
 /// エラー/ハングアップ通知ビット（要求せずとも常に配送される）。
 pub const ERR_HUP: u32 = (libc::EPOLLERR | libc::EPOLLHUP) as u32;
 
-/// エッジトリガビット（`EPOLLET` 相当）。
-const EDGE_TRIGGERED: u32 = libc::EPOLLET as u32;
+const ONESHOT: u32 = libc::EPOLLONESHOT as u32;
 
 /// epoll インスタンスのラッパ。
 pub(crate) struct EpollPoller {
@@ -37,15 +43,30 @@ impl EpollPoller {
         Ok(Self { epfd })
     }
 
-    /// fd を interest ビット付きで新規登録する（`EPOLLET` を常に付与する。F-166 A-2）。
-    ///
-    /// 呼び出し元（`reactor::executor::register`）は fd あたりこれを生涯 1 回だけ呼ぶ。
+    /// fd を interest ビット付きで新規登録する（`EPOLLONESHOT` を常に付与する）。
     pub fn add(&self, fd: RawFd, interest: u32) -> io::Result<()> {
         let mut ev = libc::epoll_event {
-            events: interest | EDGE_TRIGGERED,
+            events: interest | ONESHOT,
             u64: fd as u64,
         };
         let ret = unsafe { libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_ADD, fd, &mut ev) };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// 既存登録の interest ビットを差し替える（oneshot 再武装）。
+    ///
+    /// **この再武装がレベル状態の再評価を伴うことが、kTLS のように
+    /// 「`poll(2)` は readable だが `recvmsg` が EAGAIN」になりうるソケットで
+    /// 取りこぼしを防ぐ唯一の仕組みである（B-75）。**
+    pub fn modify(&self, fd: RawFd, interest: u32) -> io::Result<()> {
+        let mut ev = libc::epoll_event {
+            events: interest | ONESHOT,
+            u64: fd as u64,
+        };
+        let ret = unsafe { libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_MOD, fd, &mut ev) };
         if ret < 0 {
             return Err(io::Error::last_os_error());
         }

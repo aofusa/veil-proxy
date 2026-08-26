@@ -111,17 +111,21 @@ AI エージェントおよびコントリビュータ向けの **最小指針**
   ここに置いた処理はそのままリクエスト単価になる。`set_host` は `&str` 受け（`metrics` 無効時に確保しない）、
   クライアント IP は接続あたり 1 個の `Rc<str>`、クライアント `SocketAddr` は接続あたり 1 回の解決。
   **新しい per-stream 処理を足すときは「接続あたり 1 回で済まないか」を先に考えること。**
-- **epoll reactor は fd あたり `epoll_ctl` を生涯 1 回しか呼ばない（F-166 A-2）** —
-  `EPOLLONESHOT` + 待機ごとの `EPOLL_CTL_MOD` は廃止し、初回登録時に
-  `EPOLLIN|EPOLLOUT|EPOLLRDHUP|EPOLLET` で **1 回だけ ADD** する。以降の
-  `executor::register` は Waker を積むだけで **syscall を出さない**。
-  **ET のエッジ取りこぼしを塞ぐ不変条件は 2 つ**: (1) `dispatch_event` が立てる
-  `read_hint`/`write_hint` は **consume-once**（`take`）で、消費した側は必ず直後に
-  非ブロッキング I/O を試す。(2) ヒントが無い状態で park する前に **必ず確認用
-  `poll(2)` を通す**（この `poll(2)` フォールバックは削除禁止＝kqueue 版と同じ）。
-  fd は close まで epoll の監視対象に残るため、register 前に届いたエッジも
-  次の `epoll_wait` で配送される。**実測: `h2c_proxy` の 1 リクエストあたり syscall が
-  54KB で 5.97 → 4.72（-21%）、3B で 5.47 → 3.83（-30%）、`epoll_ctl` は 1.25〜1.30 → 0.02〜0.13。**
+- **epoll は `EPOLLONESHOT` + 待機ごとの `EPOLL_CTL_MOD` 再武装から変えてはならない（B-75）** —
+  F-166 A-2 で「`EPOLLIN|EPOLLOUT|EPOLLRDHUP|EPOLLET` で fd あたり生涯 1 回 ADD」に
+  変更したところ、**kTLS + HTTP/2 の負荷で恒久ハングした**（CPU 0.2% で停止、
+  単体 934・統合 54・E2E 544 をすべて通過、`tools/perf` フルスイートでのみ検出）。
+  ET は「`EAGAIN` ⇒ レベルでも not ready ⇒ 次の到着が必ず新しいエッジを生む」を仮定するが、
+  **kTLS ソケットは `poll(2)` が `POLLIN` を返す状態でも `recvmsg` が `EAGAIN` を返しうる**
+  （レコード未完成 / 先頭がアプリケーションデータ以外）ため、その瞬間にエッジが枯れて
+  二度と起きない。`ReadFuture`/`WriteFuture` は確認用 `poll(2)` を通らず `EAGAIN` から
+  直接 park するので、ヒント + `poll(2)` フォールバックでは塞げない。
+  **毎回の MOD は「カーネルにレベル状態を再評価させる」ための正しさの仕組みであって
+  無駄ではない。** 詳細は `docs/backlog/bugs/B-75-epoll-et-ktls-hang.md`。
+- **epoll でも readiness ヒントで確認用 `poll(2)` を省略する（F-166 A-1、維持）** —
+  `dispatch_event` が `read_hint`/`write_hint` に非ゼロ番兵を立て、`Readable`/`Writable` が
+  consume-once で読んで `poll(2)` を省く（kqueue の F-141 と同じ仕組み）。
+  **`poll(2)` フォールバックは削除禁止。**
 - **fd ごとの待機者は `WakerSlot`（Empty/One/Many）で持つ（F-166 A-3）** — 1 fd 1 待機者が
   支配的なので、`Vec<Waker>` を常用すると待機・起床のたびに malloc/free が乗る。
   複数待機（`runtime::offload` の共有 eventfd）は `Many` で従来どおり全員起床させる
