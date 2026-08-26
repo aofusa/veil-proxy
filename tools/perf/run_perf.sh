@@ -131,13 +131,60 @@ run_ws() { # label cfg container
     done
 }
 
-# gRPC over HTTP/3 計測: k6（grafana/k6）は gRPC over QUIC/H3 をネイティブ非対応のため
-# 計測不能。レポート指示のフェイルセーフとして skip メッセージを stderr へ出し、
-# 欠損値（NA）を emit して次のテストへ進む（計測全体を停止させない）。
+# gRPC over HTTP/3 計測（F-167）。
+#
+# **なぜ k6 ではなく h2load なのか**: grafana/k6 の gRPC モジュールは HTTP/2 専用で
+# QUIC/HTTP-3 上の gRPC を話せない（これが従来 `grpc_h3*` を NA でスキップしていた理由）。
+# 一方 gRPC は「HTTP の上に載る単純なフレーミング規約」なので、**unary 呼び出し 1 回**は
+#
+#   POST /<package>.<Service>/<Method>
+#   content-type: application/grpc
+#   te: trailers
+#   body = [1 バイトの圧縮フラグ][4 バイトのビッグエンディアン長][protobuf メッセージ]
+#
+# を送るだけで成立する。QUIC 対応 h2load（`local/h2load-h3`）は `-d` でリクエストボディを
+# 送れるため、この 11 バイトのボディを与えれば **veil の gRPC over HTTP/3 データプレーン
+# （H3 受信 → h2c 上流への中継 → トレイラー返却）をそのまま計測できる**。
+#
+# 送るメッセージは k6 版（`tools/perf/k6/grpc.js`）と同じ grpcbin の
+# `hello.HelloService/SayHello`、引数 `HelloRequest{greeting:"veil"}`:
+#   protobuf: 0a 04 "veil"（field 1, wire type 2, len 4）= 6 バイト
+#   gRPC frame: 00 | 00 00 00 06 | 0a 04 76 65 69 6c = 11 バイト
+#
+# **k6 版の rps と直接比較してはならない**: k6 は VU ベース（同時実行数 = VUS、
+# 1 VU 1 リクエスト直列）、h2load は `-c/-m` ベースで多重化するため負荷モデルが異なる。
+# 比較して意味があるのは「同じ h2load 条件での veil ビルド間・構成間の相対値」である。
+GRPC_H3_BODY="$LOGDIR/grpc_unary_sayhello.bin"
+
+# gRPC unary リクエストボディ（上記の 11 バイト）を生成する。
+make_grpc_h3_body() {
+    mkdir -p "$LOGDIR"
+    printf '\x00\x00\x00\x00\x06\x0a\x04veil' > "$GRPC_H3_BODY"
+}
+
 run_grpc_h3() { # label cfg container
-    local label="$1" cfg="$2"
-    echo "!! gRPC over HTTP/3 は現在の計測クライアント(k6)が未サポートのためスキップ: $label/$cfg" >&2
-    emit "$label" "$cfg" "grpc_h3" 1 NA NA NA NA NA NA NA
+    local label="$1" cfg="$2" c="$3" iter reqps tput latmean non2xx cpu mem
+    if ! docker image inspect "$H3_IMG" >/dev/null 2>&1; then
+        echo "!! $H3_IMG が無いため gRPC over HTTP/3 計測をスキップ（tools/perf/h2load-http3 でビルド）" >&2
+        emit "$label" "$cfg" "grpc_h3" 1 NA NA NA NA NA NA NA
+        return
+    fi
+    make_grpc_h3_body
+    local url="https://$c:443/hello.HelloService/SayHello"
+    local hdrs=(-H"content-type: application/grpc" -H"te: trailers")
+    # ウォームアップ（QUIC ハンドシェイク・上流 h2c 接続プールの充填を計測窓の外へ）
+    docker run --rm --network $NET -v "$LOGDIR:/data:ro" --entrypoint h2load $H3_IMG \
+        $H3_ARGS -n 300 -c 10 -d /data/$(basename "$GRPC_H3_BODY") "${hdrs[@]}" "$url" >/dev/null 2>&1
+    for iter in $(seq 1 "$ITERATIONS"); do
+        ( sleep 1; sample_stats "$c" > "$LOGDIR/${label}_${cfg}_grpch3_${iter}.stats" ) &
+        docker run --rm --network $NET -v "$LOGDIR:/data:ro" --entrypoint h2load $H3_IMG \
+            $H3_ARGS -d /data/$(basename "$GRPC_H3_BODY") "${hdrs[@]}" "$url" \
+            > "$LOGDIR/${label}_${cfg}_grpch3_${iter}.log" 2>&1
+        wait
+        read reqps tput latmean non2xx < <(parse_h2load "$LOGDIR/${label}_${cfg}_grpch3_${iter}.log")
+        read cpu mem < "$LOGDIR/${label}_${cfg}_grpch3_${iter}.stats" 2>/dev/null || { cpu=NA; mem=NA; }
+        emit "$label" "$cfg" "grpc_h3" "$iter" "$reqps" "$tput" "$latmean" "NA" "$non2xx" "$cpu" "$mem"
+    done
 }
 
 # HTTP/3 計測: QUIC 対応 h2load（local/h2load-h3）の QUIC モード（--alpn-list=h3）で
