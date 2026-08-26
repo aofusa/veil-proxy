@@ -1691,7 +1691,11 @@ impl Http3Handler {
 
         // バックエンド処理
         let (status, resp_size) = match backend {
-            Backend::Proxy(upstream_group, _, path_compression, _buffering, _cache, _) => {
+            Backend::Proxy(upstream_group, security, path_compression, _buffering, _cache, _) => {
+                // B-74: H2C 接続プールの max_idle/idle_timeout 用。http2 feature 無効時は
+                // H2C 中継自体が無いため未使用（unused_variables 警告回避）。
+                #[cfg(not(feature = "http2"))]
+                let _ = &security;
                 debug!("[HTTP/3] Starting proxy request to upstream group");
 
                 // HTTP/3専用圧縮設定を解決
@@ -1712,6 +1716,8 @@ impl Http3Handler {
                     .handle_proxy(
                         stream_id,
                         &upstream_group,
+                        #[cfg(feature = "http2")]
+                        &security,
                         &effective_compression,
                         client_encoding,
                         &method,
@@ -2104,6 +2110,9 @@ impl Http3Handler {
         &mut self,
         stream_id: u64,
         upstream_group: &Arc<UpstreamGroup>,
+        // B-74: H2C 接続プール（H2C_POOL）の max_idle/idle_timeout を引くためだけに使う。
+        // http2 feature 無効時は H2C 中継自体が存在しないため未使用になる。
+        #[cfg(feature = "http2")] security: &SecurityConfig,
         compression: &CompressionConfig,
         client_encoding: AcceptedEncoding,
         method: &[u8],
@@ -2195,6 +2204,7 @@ impl Http3Handler {
                     &header_pairs,
                     request_body,
                     timeout_secs,
+                    security,
                 )
                 .await
             }
@@ -3802,25 +3812,20 @@ async fn finish_h3_wasm_lifecycle(
     }
 }
 
-/// B-39: HTTP/3 → H2C 上流プロキシ（gRPC 等）
+/// B-39/B-74: `proxy_to_h2c_backend_async` 用に新規 TCP 接続 + H2C ハンドシェイクを行う。
 ///
-/// Prior Knowledge で H2C 接続し、レスポンスヘッダ + ボディ + trailers を返す。
+/// プールミス時の新規接続と、プール接続での送信失敗時の再接続の両方から共有する。
 #[cfg(feature = "http2")]
-async fn proxy_to_h2c_backend_async(
-    target: &ProxyTarget,
-    method: &[u8],
-    path: &[u8],
-    headers: &[(Vec<u8>, Vec<u8>)],
-    request_body: &[u8],
+async fn h3_h2c_connect_and_handshake(
+    addr: &str,
     timeout_secs: u64,
-) -> io::Result<BackendProxyResult> {
+) -> io::Result<crate::http2::H2cClient<crate::runtime::tcp::TcpStream>> {
     use crate::http2::{H2cClient, Http2Settings};
     use crate::runtime::tcp::TcpStream;
 
-    let addr = format!("{}:{}", target.host, target.port);
     debug!("[HTTP/3] H2C connecting to backend {}", addr);
 
-    let connect_future = TcpStream::connect_str(&addr);
+    let connect_future = TcpStream::connect_str(addr);
     let backend = match crate::runtime::time::timeout(
         Duration::from_secs(timeout_secs),
         connect_future,
@@ -3850,26 +3855,75 @@ async fn proxy_to_h2c_backend_async(
         return Err(io::Error::other(format!("H2C handshake: {}", e)));
     }
 
+    Ok(client)
+}
+
+/// B-39: HTTP/3 → H2C 上流プロキシ（gRPC 等）
+///
+/// Prior Knowledge で H2C 接続し、レスポンスヘッダ + ボディ + trailers を返す。
+///
+/// B-74: `proxy.rs` の `h2_proxy_h2c`（HTTP/2 経路）と同様、`crate::pool::H2C_POOL`
+/// （スレッドローカル）で上流 H2C 接続を再利用する。HTTP/3 のワーカースレッドと
+/// HTTP/2 のワーカースレッドは別スレッドであり、`H2C_POOL` はスレッドローカルなので
+/// 相互に干渉しない（同一スレッド内での再利用のみ）。プールが無かった旧実装は
+/// リクエストごとに TCP 接続 + ハンドシェイクを行い、高負荷時にエフェメラルポートを
+/// 枯渇させて `EADDRNOTAVAIL` を引き起こしていた。
+#[cfg(feature = "http2")]
+async fn proxy_to_h2c_backend_async(
+    target: &ProxyTarget,
+    method: &[u8],
+    path: &[u8],
+    headers: &[(Vec<u8>, Vec<u8>)],
+    request_body: &[u8],
+    timeout_secs: u64,
+    security: &SecurityConfig,
+) -> io::Result<BackendProxyResult> {
+    // F-41/B-74: リクエストごとの `format!("{host}:{port}")` ヒープ確保をスタック整形で排除。
+    let addr = crate::http_utils::HostPortStr::new(&target.host, target.port);
+    let addr = addr.as_str();
+
+    let from_pool;
+    let mut client = match crate::pool::H2C_POOL.with(|p| p.borrow_mut().get(addr)) {
+        Some(c) => {
+            from_pool = true;
+            c
+        }
+        None => {
+            from_pool = false;
+            h3_h2c_connect_and_handshake(addr, timeout_secs).await?
+        }
+    };
+
     let body = if request_body.is_empty() {
         None
     } else {
         Some(request_body)
     };
     let authority = target.host.as_bytes();
+    // F-166/F-165(A2): 中間 `Vec<(&[u8], &[u8])>` を作らずイテレータを直接渡す
+    // （送信失敗時の再試行のため、同じフィルタ済みイテレータをクロージャで再構築する）。
+    let headers_iter = || headers.iter().map(|(k, v)| (k.as_slice(), v.as_slice()));
 
-    // F-166/F-165(A2): 中間 `Vec<(&[u8], &[u8])>` を作らずイテレータを直接渡す。
-    let response = match crate::runtime::time::timeout(
+    let mut response = crate::runtime::time::timeout(
         Duration::from_secs(timeout_secs),
-        client.send_request(
-            method,
-            path,
-            authority,
-            headers.iter().map(|(k, v)| (k.as_slice(), v.as_slice())),
-            body,
-        ),
+        client.send_request(method, path, authority, headers_iter(), body),
     )
-    .await
-    {
+    .await;
+
+    // プール由来の接続は上流に既に切られている可能性がある（B-74）。送信が
+    // 失敗（エラー/タイムアウトいずれも）した場合、新規接続で 1 回だけ再試行する。
+    if from_pool && !matches!(response, Ok(Ok(_))) {
+        if let Ok(fresh) = h3_h2c_connect_and_handshake(addr, timeout_secs).await {
+            client = fresh;
+            response = crate::runtime::time::timeout(
+                Duration::from_secs(timeout_secs),
+                client.send_request(method, path, authority, headers_iter(), body),
+            )
+            .await;
+        }
+    }
+
+    let response = match response {
         Ok(Ok(resp)) => resp,
         Ok(Err(e)) => {
             warn!("[HTTP/3] H2C request error: {}", e);
@@ -3883,6 +3937,13 @@ async fn proxy_to_h2c_backend_async(
             ));
         }
     };
+
+    // 応答が取得できた接続は、再利用可能ならプールへ返却する。
+    if client.is_reusable() {
+        let max_idle = security.max_idle_connections_per_host;
+        let idle_timeout = security.idle_connection_timeout_secs;
+        crate::pool::H2C_POOL.with(|p| p.borrow_mut().put(addr, client, max_idle, idle_timeout));
+    }
 
     debug!(
         "[HTTP/3] H2C response: status={} body_len={} trailers={}",
