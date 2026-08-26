@@ -146,7 +146,7 @@ pub(crate) struct FdRecord {
     /// syscall を省略するために使う（`runtime::executor::take_read_hint` 参照）。
     /// consume-once（取得時に 0 へリセット）のため、無関係な後続呼び出しへ古い値が
     /// 漏れることはない。
-    #[cfg(any(veil_poller_kqueue, veil_poller_epoll))]
+    #[cfg(veil_poller_kqueue)]
     pub read_hint: usize,
     /// 直近に届いた書き込み可能イベントのヒント（consume-once、F-155/F-166 A-1）。
     /// 値の意味は `read_hint` と対称（kqueue はバイト数、epoll は非ゼロ番兵値）。
@@ -155,7 +155,7 @@ pub(crate) struct FdRecord {
     /// 判明済みか」を判定し、確認用の `poll(2)` syscall を省略するために使う
     /// （`runtime::executor::take_write_hint` 参照）。consume-once（取得時に 0 へ
     /// リセット）のため、無関係な後続呼び出しへ古い値が漏れることはない。
-    #[cfg(any(veil_poller_kqueue, veil_poller_epoll))]
+    #[cfg(veil_poller_kqueue)]
     pub write_hint: usize,
 }
 

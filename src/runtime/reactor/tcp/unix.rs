@@ -1108,7 +1108,7 @@ impl<'a> Future for Readable<'a> {
         // 後続呼び出しに古いヒントが漏れることはない）。epoll は F-166 A-2 で ET 常時
         // 登録に変わったため、ヒントが立っていない場合の以下の `poll(2)` フォールバックが
         // 「エッジを取りこぼしていないか」の最終確認として必須になる（削除禁止）。
-        #[cfg(any(veil_poller_kqueue, veil_poller_epoll))]
+        #[cfg(veil_poller_kqueue)]
         if crate::runtime::executor::take_read_hint(self.fd) > 0 {
             return Poll::Ready(Ok(()));
         }
@@ -1142,7 +1142,7 @@ impl<'a> Future for Writable<'a> {
         // writable と報告済みなら、確認用の `poll(2)` syscall を省略する
         // （`executor::take_write_hint` の doc 参照。consume-once のため、無関係な
         // 後続呼び出しに古いヒントが漏れることはない）。
-        #[cfg(any(veil_poller_kqueue, veil_poller_epoll))]
+        #[cfg(veil_poller_kqueue)]
         if crate::runtime::executor::take_write_hint(self.fd) > 0 {
             return Poll::Ready(Ok(()));
         }
@@ -1176,7 +1176,7 @@ impl Future for ReadableFd {
         // F-141: `Readable::poll` と同じ理由で、kqueue の直近ヒントがあれば
         // 確認用 `poll(2)` syscall を省略する（UDP の `wait_readable_fd` 経路で使われる
         // ため、`QuicUdpSocket` の recv 系ループがこの恩恵を受ける）。
-        #[cfg(any(veil_poller_kqueue, veil_poller_epoll))]
+        #[cfg(veil_poller_kqueue)]
         if crate::runtime::executor::take_read_hint(self.fd) > 0 {
             return Poll::Ready(Ok(()));
         }
@@ -1205,7 +1205,7 @@ impl Future for WritableFd {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // F-155: `Writable::poll` と同じ理由で、kqueue の直近ヒントがあれば
         // 確認用 `poll(2)` syscall を省略する。
-        #[cfg(any(veil_poller_kqueue, veil_poller_epoll))]
+        #[cfg(veil_poller_kqueue)]
         if crate::runtime::executor::take_write_hint(self.fd) > 0 {
             return Poll::Ready(Ok(()));
         }

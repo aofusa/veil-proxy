@@ -89,14 +89,6 @@ pub(crate) fn current_kqueue_fd() -> Option<RawFd> {
     POLLER.with(|p| p.borrow().as_ref().map(|poller| poller.raw_fd()))
 }
 
-/// F-166 A-1: epoll バックエンドで `EPOLLIN`/`EPOLLERR`/`EPOLLHUP` 発火を示す非ゼロ番兵値。
-/// epoll には kqueue の `data`（読み取り/書き込み可能バイト数）に相当するフィールドが
-/// 無いため、バイト数の代わりに「非ゼロ = 直前の起床でこの方向のイベントを観測した」
-/// という真偽相当の意味でこの値を `read_hint`/`write_hint` へ格納する
-/// （`poller::FdRecord` の doc 参照）。
-#[cfg(veil_poller_epoll)]
-pub(crate) const EPOLL_HINT_SENTINEL: usize = usize::MAX;
-
 /// F-141/F-166 A-1: fd の直近の read readiness ヒント（`poller::FdRecord::read_hint`
 /// 参照。kqueue はバイト数のスナップショット、epoll は `EPOLL_HINT_SENTINEL`）を
 /// **消費**（0 にリセット）しつつ取得する。
@@ -124,7 +116,7 @@ pub(crate) const EPOLL_HINT_SENTINEL: usize = usize::MAX;
 ///
 /// reactor 未初期化のスレッドや、その fd に対する read イベントがまだ一度も
 /// 届いていない場合は `0` を返す。
-#[cfg(any(veil_poller_kqueue, veil_poller_epoll))]
+#[cfg(veil_poller_kqueue)]
 pub(crate) fn take_read_hint(fd: RawFd) -> usize {
     FD_TABLE
         .try_with(|t| {
@@ -148,7 +140,7 @@ pub(crate) fn take_read_hint(fd: RawFd) -> usize {
 ///
 /// reactor 未初期化のスレッドや、その fd に対する write イベントがまだ一度も
 /// 届いていない場合は `0` を返す。
-#[cfg(any(veil_poller_kqueue, veil_poller_epoll))]
+#[cfg(veil_poller_kqueue)]
 pub(crate) fn take_write_hint(fd: RawFd) -> usize {
     FD_TABLE
         .try_with(|t| {
@@ -477,15 +469,10 @@ fn dispatch_event(fd: RawFd, flags: u32) {
                 0,
             );
         };
-        // A-1: 起床させる Waker の有無に関わらず、観測したイベント方向のヒントを
-        // 立てる（`take_read_hint`/`take_write_hint` の doc 参照。待機者がいない
-        // 方向にヒントだけ立てても実害は無い＝詳細設計の「正しさの根拠」4）。
-        if flags & (READ | ERR_HUP) != 0 {
-            rec.read_hint = EPOLL_HINT_SENTINEL;
-        }
-        if flags & (WRITE | ERR_HUP) != 0 {
-            rec.write_hint = EPOLL_HINT_SENTINEL;
-        }
+        // B-75: epoll では readiness ヒント（F-166 A-1）を **使わない**。
+        // ヒントで確認用 `poll(2)` を省略すると kTLS + HTTP/2 の負荷で恒久ハングし、
+        // しかも省略できる `poll(2)` は実測で 0.558 → 0.531/req（-5%）とほぼ無価値だった。
+        // kqueue 版（F-141、`data` に読み取り可能バイト数が入る）はそのまま維持する。
         // EPOLLONESHOT により、発火した時点でカーネル側の interest は全方向とも
         // 無効化されている。テーブル側の armed からも発火方向のビットを落とす
         // （再武装は待機側の `register()`、または下の「残った方向の再武装」で行う）。

@@ -111,21 +111,19 @@ AI エージェントおよびコントリビュータ向けの **最小指針**
   ここに置いた処理はそのままリクエスト単価になる。`set_host` は `&str` 受け（`metrics` 無効時に確保しない）、
   クライアント IP は接続あたり 1 個の `Rc<str>`、クライアント `SocketAddr` は接続あたり 1 回の解決。
   **新しい per-stream 処理を足すときは「接続あたり 1 回で済まないか」を先に考えること。**
-- **epoll は `EPOLLONESHOT` + 待機ごとの `EPOLL_CTL_MOD` 再武装から変えてはならない（B-75）** —
-  F-166 A-2 で「`EPOLLIN|EPOLLOUT|EPOLLRDHUP|EPOLLET` で fd あたり生涯 1 回 ADD」に
-  変更したところ、**kTLS + HTTP/2 の負荷で恒久ハングした**（CPU 0.2% で停止、
-  単体 934・統合 54・E2E 544 をすべて通過、`tools/perf` フルスイートでのみ検出）。
-  ET は「`EAGAIN` ⇒ レベルでも not ready ⇒ 次の到着が必ず新しいエッジを生む」を仮定するが、
-  **kTLS ソケットは `poll(2)` が `POLLIN` を返す状態でも `recvmsg` が `EAGAIN` を返しうる**
-  （レコード未完成 / 先頭がアプリケーションデータ以外）ため、その瞬間にエッジが枯れて
-  二度と起きない。`ReadFuture`/`WriteFuture` は確認用 `poll(2)` を通らず `EAGAIN` から
-  直接 park するので、ヒント + `poll(2)` フォールバックでは塞げない。
-  **毎回の MOD は「カーネルにレベル状態を再評価させる」ための正しさの仕組みであって
-  無駄ではない。** 詳細は `docs/backlog/bugs/B-75-epoll-et-ktls-hang.md`。
-- **epoll でも readiness ヒントで確認用 `poll(2)` を省略する（F-166 A-1、維持）** —
-  `dispatch_event` が `read_hint`/`write_hint` に非ゼロ番兵を立て、`Readable`/`Writable` が
-  consume-once で読んで `poll(2)` を省く（kqueue の F-141 と同じ仕組み）。
-  **`poll(2)` フォールバックは削除禁止。**
+- **epoll の readiness 判定を「省略」してはならない（B-75）** — epoll バックエンドでは
+  (1) `EPOLLONESHOT` + 待機ごとの `EPOLL_CTL_MOD` 再武装、(2) ヒントに頼らない確認用 `poll(2)`、
+  の 2 つを**必ず**維持する。F-166 A-1（起床方向のヒントを立てて `poll(2)` を省く。kqueue の
+  F-141 と同じ形）を epoll へ広げたところ、**kTLS + HTTP/2 の負荷で恒久ハングした**
+  （CPU 0.2%、io_uring は無傷、単体 934・統合 54・E2E 544 をすべて通過、`tools/perf`
+  フルスイートでのみ検出）。ONESHOT では**再武装が `register()` でしか行われない**のに、
+  ヒントで `Ready` を返す経路は `register()` を通らない。そこへ
+  **kTLS 特有の「`poll(2)` は `POLLIN` を返すのに `recvmsg` は `EAGAIN`」**（レコード未完成 /
+  先頭が非アプリケーションデータ）が重なると「読めないが再武装もされない」状態に入り得る。
+  **省けていた `poll(2)` は実測 0.558 → 0.531/req（-5%）で、そもそも価値が無かった。**
+  `EPOLLET` 常時登録（F-166 A-2）も同じ理由で差し戻し済み。詳細は
+  `docs/backlog/bugs/B-75-epoll-et-ktls-hang.md`。**kqueue のヒント（F-141、`data` に
+  読み取り可能バイト数が入る実データ）は別物で、そのまま維持する。**
 - **fd ごとの待機者は `WakerSlot`（Empty/One/Many）で持つ（F-166 A-3）** — 1 fd 1 待機者が
   支配的なので、`Vec<Waker>` を常用すると待機・起床のたびに malloc/free が乗る。
   複数待機（`runtime::offload` の共有 eventfd）は `Many` で従来どおり全員起床させる
