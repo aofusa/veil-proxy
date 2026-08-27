@@ -1493,7 +1493,7 @@ pub(crate) fn last_modified_matches(client_ims: &str, cached_lm: &str) -> bool {
 /// # Returns
 /// (ヘッダー名, ヘッダー値) のペアのリスト
 pub(crate) fn extract_vary_headers_for_cache_key<'a>(
-    request_headers: &'a [(Box<[u8]>, Box<[u8]>)],
+    request_headers: &'a [(bytes::Bytes, bytes::Bytes)],
     key_header_names: &'a [String],
 ) -> Vec<(&'a str, &'a str)> {
     let mut result = Vec::new();

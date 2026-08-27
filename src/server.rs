@@ -213,7 +213,10 @@ pub fn spawn_background_revalidation(
     method: Vec<u8>,
     req_path: Vec<u8>,
     prefix: Vec<u8>,
-    headers: Vec<(Box<[u8]>, Box<[u8]>)>,
+    // F-168: proxy.rs 側のリクエストヘッダーが `Bytes`（accumulated からのゼロコピー
+    // 切り出し）になったため、こちらもそれに合わせる（これはリクエストヘッダーの再送用で
+    // レスポンス側とは無関係）。
+    headers: Vec<(bytes::Bytes, bytes::Bytes)>,
 ) {
     let hash = cache_key.hash_value();
 

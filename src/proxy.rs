@@ -10,8 +10,7 @@ use crate::runtime::io::OpenOptions;
 use crate::runtime::io::{AsyncReadRent, AsyncWriteRentExt, IoVecBuf, IoVecBufMut};
 use crate::runtime::tcp::TcpStream;
 use crate::runtime::time::timeout;
-#[cfg(feature = "http2")]
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use ftlog::{debug, error, info, warn};
 use httparse::{Request, Status};
 use std::io;
@@ -4558,13 +4557,27 @@ async fn lingering_drain_before_close(stream: &mut ServerTls) {
     }
 }
 
+/// `haystack` 内の部分スライス `needle` の (開始オフセット, 長さ) を求める。
+///
+/// `needle` は必ず `haystack` の内部を指している（借用元が同一である）ことを前提とする。
+/// httparse の解析結果（`Request::method`/`path`/各 `Header::value`）はすべて `req.parse()`
+/// に渡した元バッファのサブスライスであり、この前提を満たす。ポインタ演算のみで完結し、
+/// コピーもヒープ確保も発生しない。
+#[inline]
+fn slice_range(haystack: &[u8], needle: &[u8]) -> (usize, usize) {
+    let start = needle.as_ptr() as usize - haystack.as_ptr() as usize;
+    debug_assert!(start <= haystack.len());
+    debug_assert!(start + needle.len() <= haystack.len());
+    (start, needle.len())
+}
+
 // 統一されたリクエスト処理ループ（型エイリアスを使用）
 // clippy::drop_non_drop 許容理由: `req` はヘッダバッファ（accumulated）への借用を保持する
 // 非 Drop 型で、`drop(req)` は借用領域を明示的に終わらせて後続の可変利用を許すための
 // 意図的な記述（`let _ =` より意図が明確なため維持する）。
 #[allow(clippy::drop_non_drop)]
 async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: SocketAddr) {
-    let mut accumulated = Vec::with_capacity(BUF_SIZE);
+    let mut accumulated = BytesMut::with_capacity(BUF_SIZE);
 
     // アクティブ接続メトリクスの自動管理（Dropで自動デクリメント）
     let mut connection_metric = ActiveConnectionMetric::new(true);
@@ -4644,11 +4657,45 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
 
         match req.parse(&accumulated) {
             Ok(Status::Complete(header_len)) => {
+                // 各フィールドの (offset, len) を req の借用中（accumulated への参照が
+                // 生きている間）に確定する。以後は accumulated を可変利用するため、
+                // ここでオフセットをすべて集め終えたら直ちに req をドロップする。
+                let method_range = req.method.map(|m| slice_range(&accumulated, m.as_bytes()));
+                let host_range = req
+                    .headers
+                    .iter()
+                    .find(|h| h.name.eq_ignore_ascii_case("host"))
+                    .map(|h| slice_range(&accumulated, h.value));
+                let path_range = req.path.map(|p| slice_range(&accumulated, p.as_bytes()));
+                let user_agent_range = req
+                    .headers
+                    .iter()
+                    .find(|h| h.name.eq_ignore_ascii_case("user-agent"))
+                    .map(|h| slice_range(&accumulated, h.value));
+                let header_ranges: Vec<((usize, usize), (usize, usize))> = req
+                    .headers
+                    .iter()
+                    .filter(|h| !h.name.is_empty())
+                    .map(|h| {
+                        (
+                            slice_range(&accumulated, h.name.as_bytes()),
+                            slice_range(&accumulated, h.value),
+                        )
+                    })
+                    .collect();
+
+                // req（accumulated への借用）をここで明示的に終了させる。
+                drop(req);
+
+                // ヘッダー領域を Bytes として切り出す（参照カウント共有・memcpy なし）。
+                // split_to 後は accumulated にボディの続きだけが残り、読み込みバッファとして
+                // 再利用できる。
+                let header_bytes: Bytes = accumulated.split_to(header_len).freeze();
+
                 // HTTPメソッド取得
-                let method_bytes: Box<[u8]> = req
-                    .method
-                    .map(|m| m.as_bytes().into())
-                    .unwrap_or_else(|| Box::from(b"GET" as &[u8]));
+                let method_bytes: Bytes = method_range
+                    .map(|(off, len)| header_bytes.slice(off..off + len))
+                    .unwrap_or_else(|| Bytes::from_static(b"GET"));
 
                 // 有効なHTTPメソッドのみ受け付ける（RFC 7231）
                 const VALID_HTTP_METHODS: &[&[u8]] = &[
@@ -4659,19 +4706,15 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                     .iter()
                     .any(|m| method_bytes.as_ref().eq_ignore_ascii_case(m))
                 {
-                    drop(req);
                     let err_buf = ERR_MSG_METHOD_NOT_ALLOWED.to_vec();
                     let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
                     return;
                 }
 
                 // ヘッダー情報抽出
-                let host_bytes: Box<[u8]> = req
-                    .headers
-                    .iter()
-                    .find(|h| h.name.eq_ignore_ascii_case("host"))
-                    .map(|h| Box::from(h.value))
-                    .unwrap_or_else(|| Box::from([] as [u8; 0]));
+                let host_bytes: Bytes = host_range
+                    .map(|(off, len)| header_bytes.slice(off..off + len))
+                    .unwrap_or_else(Bytes::new);
 
                 // メトリクス: 最初のリクエストでホスト名を取得し、インクリメント
                 if let Ok(host_str) = std::str::from_utf8(&host_bytes) {
@@ -4680,42 +4723,47 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                     connection_metric.set_host("unknown");
                 }
 
-                let path_bytes: Box<[u8]> = req
-                    .path
-                    .map(|p| p.as_bytes().into())
-                    .unwrap_or_else(|| Box::from(b"/" as &[u8]));
+                let path_bytes: Bytes = path_range
+                    .map(|(off, len)| header_bytes.slice(off..off + len))
+                    .unwrap_or_else(|| Bytes::from_static(b"/"));
 
-                let user_agent: Box<[u8]> = req
-                    .headers
-                    .iter()
-                    .find(|h| h.name.eq_ignore_ascii_case("user-agent"))
-                    .map(|h| Box::from(h.value))
-                    .unwrap_or_else(|| Box::from([] as [u8; 0]));
+                let user_agent: Bytes = user_agent_range
+                    .map(|(off, len)| header_bytes.slice(off..off + len))
+                    .unwrap_or_else(Bytes::new);
+
+                // ヘッダー一覧を Bytes ペアとして構築（`Bytes::slice` は参照カウント +1 の
+                // みでコピーを伴わない）。
+                let headers_for_proxy: Vec<(Bytes, Bytes)> = header_ranges
+                    .into_iter()
+                    .map(|((name_off, name_len), (value_off, value_len))| {
+                        (
+                            header_bytes.slice(name_off..name_off + name_len),
+                            header_bytes.slice(value_off..value_off + value_len),
+                        )
+                    })
+                    .collect();
 
                 // Content-Length ヘッダーの値を取得し、不正な値の場合は400 Bad Requestを返す
                 // 複数の Content-Length ヘッダーは RFC 7230 Section 3.3.2 違反 → 400
-                let cl_headers: Vec<_> = req
-                    .headers
+                let cl_headers: Vec<_> = headers_for_proxy
                     .iter()
-                    .filter(|h| h.name.eq_ignore_ascii_case("content-length"))
+                    .filter(|(name, _)| name.eq_ignore_ascii_case(b"content-length"))
                     .collect();
 
                 if cl_headers.len() > 1 {
-                    drop(req);
                     let err_buf = ERR_MSG_BAD_REQUEST.to_vec();
                     let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
                     return;
                 }
 
-                let content_length: usize = if let Some(cl_header) = cl_headers.first() {
-                    match std::str::from_utf8(cl_header.value)
+                let content_length: usize = if let Some((_, cl_value)) = cl_headers.first() {
+                    match std::str::from_utf8(cl_value)
                         .ok()
                         .and_then(|s| s.trim().parse::<usize>().ok())
                     {
                         Some(len) => len,
                         None => {
                             // 不正な Content-Length 値 → 400 Bad Request
-                            drop(req);
                             let err_buf = ERR_MSG_BAD_REQUEST.to_vec();
                             let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
                             return;
@@ -4731,12 +4779,13 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                 // `Content-Length: 0` + `Transfer-Encoding: chunked`（CL の値に依らない CL.TE）や
                 // 最終エンコーディングが chunked でない TE を取りこぼしていた。
                 let is_chunked: bool = match classify_request_framing(
-                    req.headers.iter().map(|h| (h.name.as_bytes(), h.value)),
+                    headers_for_proxy
+                        .iter()
+                        .map(|(k, v)| (k.as_ref(), v.as_ref())),
                 ) {
                     Ok(RequestFraming::Chunked) => true,
                     Ok(RequestFraming::ContentLength) => false,
                     Err(_) => {
-                        drop(req);
                         let err_buf = ERR_MSG_BAD_REQUEST.to_vec();
                         let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
                         return;
@@ -4744,11 +4793,10 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                 };
 
                 // Connection ヘッダーチェック（Keep-Alive / Upgrade対応）
-                let connection_header: Option<&[u8]> = req
-                    .headers
+                let connection_header: Option<&[u8]> = headers_for_proxy
                     .iter()
-                    .find(|h| h.name.eq_ignore_ascii_case("connection"))
-                    .map(|h| h.value);
+                    .find(|(name, _)| name.eq_ignore_ascii_case(b"connection"))
+                    .map(|(_, value)| value.as_ref());
 
                 let client_wants_close: bool = connection_header
                     .map(|v| v.eq_ignore_ascii_case(b"close"))
@@ -4763,34 +4811,24 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                     })
                     .unwrap_or(false);
 
-                let is_websocket_upgrade: bool = req
-                    .headers
+                let is_websocket_upgrade: bool = headers_for_proxy
                     .iter()
-                    .find(|h| h.name.eq_ignore_ascii_case("upgrade"))
-                    .map(|h| h.value.eq_ignore_ascii_case(b"websocket"))
+                    .find(|(name, _)| name.eq_ignore_ascii_case(b"upgrade"))
+                    .map(|(_, value)| value.eq_ignore_ascii_case(b"websocket"))
                     .unwrap_or(false);
 
                 let is_websocket: bool = is_upgrade_connection && is_websocket_upgrade;
 
                 // ボディサイズ制限
                 if !is_chunked && content_length > MAX_BODY_SIZE {
-                    drop(req);
                     let err_buf = ERR_MSG_REQUEST_TOO_LARGE.to_vec();
                     let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
                     return;
                 }
 
-                let headers_for_proxy: Vec<(Box<[u8]>, Box<[u8]>)> = req
-                    .headers
-                    .iter()
-                    .filter(|h| !h.name.is_empty())
-                    .map(|h| (h.name.as_bytes().into(), h.value.into()))
-                    .collect();
-
                 // HTTP/1.1 Hostヘッダー必須チェック (RFC 7230 Section 5.4)
                 // HTTP/1.1リクエストにはHostヘッダーが必須
                 if validate_host_header(&headers_for_proxy, 1).is_err() {
-                    drop(req);
                     let err_buf = ERR_MSG_BAD_REQUEST.to_vec();
                     let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
                     return;
@@ -5066,13 +5104,12 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
 
                 // ヘッダーをゼロコピーのバイト列スライスとして参照し、
                 // クエリ文字列は生バイトのまま渡す（HashMap 割り当て不要）
-                // req のドロップはルーティング完了後に行う
+                // headers_for_proxy は既に accumulated から切り出し済みの Bytes なので、
+                // ここでは参照を並べるだけで新たなコピーは発生しない。
                 let backend_result = {
-                    let headers_raw: Vec<(&[u8], &[u8])> = req
-                        .headers
+                    let headers_raw: Vec<(&[u8], &[u8])> = headers_for_proxy
                         .iter()
-                        .filter(|h| !h.name.is_empty())
-                        .map(|h| (h.name.as_bytes(), h.value))
+                        .map(|(k, v)| (k.as_ref(), v.as_ref()))
                         .collect();
                     let raw_query: &[u8] =
                         query_start_pos.map(|i| &path_bytes[i + 1..]).unwrap_or(b"");
@@ -5088,8 +5125,6 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                         &config.upstream_groups,
                     )
                 };
-                // ルーティング完了後に req をドロップ（accumulated の borrow を解放）
-                drop(req);
 
                 let (prefix, backend, _route_compression) = match backend_result {
                     Some(b) => b,
@@ -5142,11 +5177,10 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                 }
 
                 // 初期ボディ（ヘッダー後のデータ）
-                let initial_body: Vec<u8> = if header_len < accumulated.len() {
-                    accumulated[header_len..].to_vec()
-                } else {
-                    Vec::new()
-                };
+                // ヘッダー領域は既に `accumulated.split_to(header_len)` で切り出し済みのため、
+                // 残っている accumulated 全体がそのままボディの先頭部分になる
+                // （header_len によるオフセット計算は不要）。
+                let initial_body: Vec<u8> = accumulated.to_vec();
 
                 // WASMモジュールの適用
                 // モジュールリストをローカル変数として保持（スレッドローカルを使わない、並行タスク間の干渉を防ぐ）
@@ -5193,10 +5227,12 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                                     ..
                                 } => {
                                     // 修正されたヘッダーを使用
-                                    // F-43: 所有権ムーブで変換（deep copy しない）
+                                    // F-43/F-168: 所有権ムーブで変換（deep copy しない）。
+                                    // `Bytes::from(Vec<u8>)` はバッファの所有権を引き継ぐだけで
+                                    // memcpy を伴わない。
                                     modified_headers
                                         .into_iter()
-                                        .map(|(k, v)| (k.into_boxed_slice(), v.into_boxed_slice()))
+                                        .map(|(k, v)| (Bytes::from(k), Bytes::from(v)))
                                         .collect()
                                 }
                                 crate::wasm::FilterResult::LocalResponse(resp) => {
@@ -5519,7 +5555,7 @@ async fn handle_backend(
     prefix: Arc<[u8]>,
     content_length: usize,
     is_chunked: bool,
-    headers: &[(Box<[u8]>, Box<[u8]>)],
+    headers: &[(Bytes, Bytes)],
     initial_body: &[u8],
     client_wants_close: bool,
     wasm_modules: Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
@@ -5855,7 +5891,7 @@ async fn handle_websocket_proxy(
     method: &[u8],
     req_path: &[u8],
     prefix: &[u8],
-    headers: &[(Box<[u8]>, Box<[u8]>)],
+    headers: &[(Bytes, Bytes)],
     initial_body: &[u8],
 ) -> Option<(u16, u64)> {
     let connect_timeout = Duration::from_secs(security.backend_connect_timeout_secs);
@@ -6414,7 +6450,7 @@ async fn handle_proxy(
     prefix: &[u8],
     content_length: usize,
     is_chunked: bool,
-    headers: &[(Box<[u8]>, Box<[u8]>)],
+    headers: &[(Bytes, Bytes)],
     initial_body: &[u8],
     client_wants_close: bool,
     wasm_modules: Arc<Vec<crate::wasm_plugin_config::ModuleRef>>,
@@ -7351,7 +7387,7 @@ async fn proxy_h2c(
     security: &SecurityConfig,
     method: &[u8],
     path: &[u8],
-    headers: &[(Box<[u8]>, Box<[u8]>)],
+    headers: &[(Bytes, Bytes)],
     request_body: &[u8],
     client_wants_close: bool,
 ) -> Option<(ServerTls, u16, u64, bool)> {
@@ -7401,7 +7437,7 @@ async fn proxy_h2c(
     };
     let authority = target.host.as_bytes();
 
-    // F-166/F-165(A2): `Box<[u8]>` ペアへのイテレータを直接渡す（中間 `Vec` の
+    // F-166/F-165(A2): `Bytes` ペアへのイテレータを直接渡す（中間 `Vec` の
     // `collect()` を回避）。
     let response = match h2c_client
         .send_request(

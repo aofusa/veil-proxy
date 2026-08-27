@@ -261,7 +261,10 @@ impl CachePolicy {
     }
 
     /// If-None-Match ヘッダーを取得
-    pub fn get_if_none_match(request_headers: &[(Box<[u8]>, Box<[u8]>)]) -> Option<&[u8]> {
+    ///
+    /// F-168: 呼び出し元（proxy.rs）のリクエストヘッダーが `Bytes`（accumulated からの
+    /// ゼロコピー切り出し）になったため、こちらもそれに合わせる。
+    pub fn get_if_none_match(request_headers: &[(bytes::Bytes, bytes::Bytes)]) -> Option<&[u8]> {
         request_headers
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case(b"if-none-match"))
@@ -269,7 +272,9 @@ impl CachePolicy {
     }
 
     /// If-Modified-Since ヘッダーを取得
-    pub fn get_if_modified_since(request_headers: &[(Box<[u8]>, Box<[u8]>)]) -> Option<&[u8]> {
+    pub fn get_if_modified_since(
+        request_headers: &[(bytes::Bytes, bytes::Bytes)],
+    ) -> Option<&[u8]> {
         request_headers
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case(b"if-modified-since"))
