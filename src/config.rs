@@ -669,7 +669,8 @@ impl Default for SecurityConfig {
 // ====================
 
 /// クライアントがサポートする圧縮方式
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// F-169: 圧縮結果キャッシュ（`cache::compressed`）のキーの一部として使うため Hash を追加。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AcceptedEncoding {
     /// Zstandard (zstd) - 最高効率
     Zstd,

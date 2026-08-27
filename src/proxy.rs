@@ -1834,6 +1834,9 @@ async fn h2_dispatch(
                     &security,
                     &route_compression,
                     client_encoding,
+                    // MemoryFile はファイルシステムパスを持たない（config 由来の
+                    // インメモリ内容）ため、圧縮結果キャッシュのキーが作れない。
+                    None,
                 );
                 #[cfg(feature = "wasm")]
                 let header_store =
@@ -3260,8 +3263,12 @@ async fn h2_sendfile(
     )
     .await;
 
-    let (mime_type, data) = match first_result {
-        Some(cache::StaticFileOutcome::File(info, data)) => (info.mime_type, data),
+    // F-169: 圧縮結果キャッシュのキーに使う「実際に配信するパス」（ディレクトリ
+    // ルートで index ファイルへフォールバックした場合は index 側のパス）を
+    // `full_path` の所有権をそのまま流用して求める（参照渡しの検索は既に完了して
+    // いるため `full_path` 自体はこの後不要 = 追加のクローンなしで済む）。
+    let (mime_type, data, served_path) = match first_result {
+        Some(cache::StaticFileOutcome::File(info, data)) => (info.mime_type, data, full_path),
         Some(cache::StaticFileOutcome::Forbidden) => {
             return h2_emit_error(resp_tx, notify, 403, b"Forbidden").await;
         }
@@ -3279,7 +3286,9 @@ async fn h2_sendfile(
             )
             .await
             {
-                Some(cache::StaticFileOutcome::File(info, data)) => (info.mime_type, data),
+                Some(cache::StaticFileOutcome::File(info, data)) => {
+                    (info.mime_type, data, index_path)
+                }
                 Some(cache::StaticFileOutcome::Forbidden) | None => {
                     return h2_emit_error(resp_tx, notify, 403, b"Forbidden").await;
                 }
@@ -3298,8 +3307,14 @@ async fn h2_sendfile(
         }
     };
 
-    let (built_headers, response_body) =
-        build_h2_compressed_file_response(data, &mime_type, security, compression, client_encoding);
+    let (built_headers, response_body) = build_h2_compressed_file_response(
+        data,
+        &mime_type,
+        security,
+        compression,
+        client_encoding,
+        Some((served_path.as_path(), &content_cfg)),
+    );
     #[cfg(feature = "wasm")]
     let header_store = apply_h2_wasm_response_headers(wasm_modules, 200, built_headers).await;
     #[cfg(not(feature = "wasm"))]
@@ -3910,6 +3925,13 @@ impl AsRef<[u8]> for ArcVecBytes {
 /// 圧縮する場合のみ `compress_body_h2` で新規バッファを確保する。呼び出し元
 /// （`h2_sendfile`）が渡す `data` はキャッシュヒット時に参照カウントクローンだけで
 /// 得られるため、非圧縮の静的配信ホットパスからディープコピーが完全に消える。
+///
+/// `static_ctx`（F-169）: 呼び出し元が静的配信のパスを把握している場合のみ
+/// `Some((path, static_content_cache_cfg))` を渡す。この場合、圧縮結果を
+/// `cache::compressed` でキャッシュする（`static_content_cache_cfg.enabled` が
+/// `false` なら内部でキャッシュを使わず毎回圧縮する）。プロキシ応答は毎回内容が
+/// 異なるためキャッシュしてはならず、その呼び出し元は必ず `None` を渡す
+/// （`Backend::MemoryFile` もパスを持たないため `None`）。
 #[cfg(feature = "http2")]
 fn build_h2_compressed_file_response(
     data: Bytes,
@@ -3917,6 +3939,7 @@ fn build_h2_compressed_file_response(
     security: &SecurityConfig,
     compression: &CompressionConfig,
     client_encoding: AcceptedEncoding,
+    static_ctx: Option<(&Path, &cache::StaticContentCacheConfig)>,
 ) -> (Vec<(Bytes, Bytes)>, Bytes) {
     let should_compress = compression.should_compress(
         client_encoding,
@@ -3962,7 +3985,15 @@ fn build_h2_compressed_file_response(
                 Bytes::from_static(b"Accept-Encoding"),
             ));
         }
-        Bytes::from(compress_body_h2(&data, enc, compression))
+        match static_ctx {
+            Some((path, static_cfg)) if static_cfg.enabled => {
+                let level = cache::compressed::compression_level(enc, compression);
+                cache::compressed::get_or_compress(path, enc, level, static_cfg, || {
+                    compress_body_h2(&data, enc, compression)
+                })
+            }
+            _ => Bytes::from(compress_body_h2(&data, enc, compression)),
+        }
     } else {
         data
     };
@@ -4000,6 +4031,46 @@ async fn h2c_connect_and_handshake(
     Ok(client)
 }
 
+/// F-169 Part B: zstd 圧縮コンテキストをスレッドローカルに保持して使い回す。
+///
+/// `zstd::encode_all` は呼び出しごとに内部コンテキスト（ワークスペース確保を伴う）
+/// を作り捨てていた。ワーカースレッドは固定でリクエストを処理し続けるため、
+/// スレッドローカルに `zstd::bulk::Compressor` を 1 つ保持し使い回すことで、
+/// 確保自体を消す。**「確保が減った」ことと「速くなった」ことは別の主張**であり
+/// （`AGENTS.md` F-168 の教訓）、本変更はスループット改善を約束するものではなく、
+/// ホットパス絶対規則（不要な確保をしない）に沿わせるための一貫性改修である。
+///
+/// 圧縮レベルは設定リロードで変わり得るため、使い回す前に必ず
+/// `set_compression_level` で反映する（level 変更自体のコストは
+/// コンテキスト新規確保よりは軽い）。
+#[cfg(all(feature = "http2", feature = "compression"))]
+fn zstd_compress_reuse_ctx(body: &[u8], level: i32) -> Vec<u8> {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static ZSTD_COMPRESSOR: RefCell<Option<zstd::bulk::Compressor<'static>>> =
+            const { RefCell::new(None) };
+    }
+
+    ZSTD_COMPRESSOR.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let compressor = match slot.as_mut() {
+            Some(c) => c,
+            None => {
+                let c = match zstd::bulk::Compressor::new(level) {
+                    Ok(c) => c,
+                    Err(_) => return body.to_vec(),
+                };
+                slot.get_or_insert(c)
+            }
+        };
+        if compressor.set_compression_level(level).is_err() {
+            return body.to_vec();
+        }
+        compressor.compress(body).unwrap_or_else(|_| body.to_vec())
+    })
+}
+
 /// HTTP/2 用レスポンスボディ圧縮ヘルパー関数
 ///
 /// バイト配列を受け取り、指定されたエンコーディングで圧縮して返します。
@@ -4015,12 +4086,7 @@ fn compress_body_h2(
     use std::io::Write;
 
     match encoding {
-        AcceptedEncoding::Zstd => {
-            match zstd::encode_all(std::io::Cursor::new(body), compression.zstd_level) {
-                Ok(compressed) => compressed,
-                Err(_) => body.to_vec(),
-            }
-        }
+        AcceptedEncoding::Zstd => zstd_compress_reuse_ctx(body, compression.zstd_level),
         AcceptedEncoding::Gzip => {
             let level = Compression::new(compression.gzip_level);
             let mut encoder = GzEncoder::new(Vec::with_capacity(body.len()), level);

@@ -42,6 +42,11 @@ mod policy;
 // F-153: 静的配信のパス解決（canonicalize を使わないカーネル封じ込め）。
 // `cache` feature の有無どちらでも静的配信自体は成立させる必要があるため常時コンパイル。
 pub mod resolve;
+// F-169: 静的配信の圧縮結果キャッシュ。`cache` feature の有無で内部実装が切り替わる
+// （無効時は毎回圧縮のスタブ）ため、モジュール自体は常時コンパイルする
+// （content_cache 等と違い `StaticContentCacheConfig` の型名を cfg 分岐なしで
+// そのまま `super::StaticContentCacheConfig` として使い回せる）。
+pub mod compressed;
 
 // DashMap依存モジュール（cache feature 有効時のみ）
 #[cfg(feature = "cache")]

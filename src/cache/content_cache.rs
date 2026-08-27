@@ -206,6 +206,12 @@ impl ContentCache {
                 self.total_bytes.fetch_sub(old_len, Ordering::Relaxed);
                 self.total_bytes.fetch_add(new_len, Ordering::Relaxed);
                 o.insert(content);
+                // F-169: 本体を上書きした（TTL 失効・mtime 再検証いずれの経路でも
+                // ここを通る）ので、古い内容に対する圧縮結果を必ず道連れにする。
+                // ここを通さず TTL だけに委ねると、`revalidate_mtime = true` の
+                // 構成で「本体は即時反映されるが圧縮結果だけ古いまま」という
+                // 不整合を生む（本改修で最も壊しやすい点）。
+                super::compressed::invalidate(path);
             }
             Entry::Vacant(v) => {
                 if current_entries >= cfg.max_entries {
@@ -228,11 +234,17 @@ impl ContentCache {
         if let Some((_, old)) = self.entries.remove(path) {
             self.total_bytes.fetch_sub(old.len, Ordering::Relaxed);
         }
+        // F-169: 本体キャッシュの明示的な無効化（例: 読み込み失敗時の 404 フォール
+        // バック）は、同じパスの圧縮結果も道連れにしないと「古い圧縮結果を返し続ける」
+        // 不整合を生む。`super::compressed::invalidate` はパス未登録でも副作用が
+        // 無いため、本体側に該当エントリが無かった場合も安全に呼べる。
+        super::compressed::invalidate(path);
     }
 
     fn clear(&self) {
         self.entries.clear();
         self.total_bytes.store(0, Ordering::Relaxed);
+        super::compressed::clear();
     }
 
     /// キャッシュヒット判定のみを行う共通ヘルパ（ロードは一切行わない）。
@@ -655,6 +667,151 @@ mod tests {
         let initial_misses = cache.misses.load(Ordering::Relaxed);
         let _ = get(&cache, &path, &cfg);
         assert_eq!(cache.misses.load(Ordering::Relaxed), initial_misses + 1);
+    }
+
+    /// F-169: 本体キャッシュの明示的な `invalidate` は、同じパスの圧縮結果キャッシュ
+    /// （`super::compressed`）も道連れに破棄すること。本改修で最も壊しやすい点。
+    ///
+    /// `cache::compressed` はグローバルシングルトンなので、他のテストと衝突しない
+    /// よう一時ディレクトリ由来のユニークなパスをキーに使う。
+    #[test]
+    fn invalidate_also_drops_compressed_cache_variants() {
+        let cache = ContentCache::new();
+        let dir = tempdir().unwrap();
+        let path = write_file(&dir, "f169_invalidate.txt", b"payload");
+        let cfg = test_cfg();
+
+        let _ = get(&cache, &path, &cfg);
+
+        // 圧縮結果キャッシュへ登録する（実運用ではプロキシ/HTTP3 層が
+        // `cache::compressed::get_or_compress` 経由で行う）。
+        let calls = AtomicUsize::new(0);
+        let first = super::super::compressed::get_or_compress(
+            &path,
+            crate::config::AcceptedEncoding::Zstd,
+            3,
+            &cfg,
+            || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                b"compressed-v1".to_vec()
+            },
+        );
+        assert_eq!(first, Bytes::from_static(b"compressed-v1"));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        // ヒット確認（再圧縮されない）。
+        let hit = super::super::compressed::get_or_compress(
+            &path,
+            crate::config::AcceptedEncoding::Zstd,
+            3,
+            &cfg,
+            || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                b"should-not-run".to_vec()
+            },
+        );
+        assert_eq!(hit, first);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        // 本体キャッシュを明示的に無効化する（例: 読み込み失敗時の 404 フォール
+        // バックが呼ぶ `cache::invalidate_content_cache` と同じ経路）。
+        cache.invalidate(&path);
+
+        // 圧縮結果キャッシュも道連れに破棄されているはずなので、再度呼ぶと
+        // 圧縮クロージャが再実行される。
+        let second = super::super::compressed::get_or_compress(
+            &path,
+            crate::config::AcceptedEncoding::Zstd,
+            3,
+            &cfg,
+            || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                b"compressed-v2".to_vec()
+            },
+        );
+        assert_eq!(second, Bytes::from_static(b"compressed-v2"));
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "invalidate 後は圧縮結果キャッシュも破棄され、再圧縮されること"
+        );
+    }
+
+    /// F-169: `revalidate_mtime = true` で本体が mtime 不一致によりリロード
+    /// （TTL はまだ切れていない）された場合も、圧縮結果キャッシュが道連れに
+    /// 破棄されること。TTL だけに委ねていた場合に見逃す不整合
+    /// （本体は即時反映されるが圧縮結果だけ古いまま）を防いでいることの確認。
+    #[test]
+    fn mtime_revalidation_reload_also_invalidates_compressed_cache() {
+        let cache = ContentCache::new();
+        let dir = tempdir().unwrap();
+        let path = write_file(&dir, "f169_mtime.txt", b"v1");
+        let mut cfg = test_cfg();
+        cfg.revalidate_mtime = true;
+        // TTL 自体は長いままにしておく（TTL 失効ではなく mtime 変化のみで
+        // 本体が入れ替わることを確認するため）。
+        cfg.valid_duration_secs = 60;
+
+        let _ = get(&cache, &path, &cfg);
+
+        let calls = AtomicUsize::new(0);
+        let first = super::super::compressed::get_or_compress(
+            &path,
+            crate::config::AcceptedEncoding::Zstd,
+            3,
+            &cfg,
+            || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                b"compressed-v1".to_vec()
+            },
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        // TTL がまだ残っている間はヒットする（再圧縮されない）ことも確認。
+        let hit_before = super::super::compressed::get_or_compress(
+            &path,
+            crate::config::AcceptedEncoding::Zstd,
+            3,
+            &cfg,
+            || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                b"should-not-run".to_vec()
+            },
+        );
+        assert_eq!(hit_before, first);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        // mtime を確実に進めるため 1.1 秒待ってから書き換える（秒単位分解能の
+        // ファイルシステムでも変化を保証する。`tests/integration_tests.rs` の
+        // `test_cert_mtime_changes_after_update` と同じ手法）。
+        #[allow(clippy::disallowed_methods)]
+        std::thread::sleep(Duration::from_millis(1100));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(b"v2").unwrap();
+        }
+
+        // revalidate_mtime = true なので、TTL が残っていても mtime 不一致で
+        // リロードされる。
+        let reloaded = get(&cache, &path, &cfg);
+        assert_eq!(reloaded.as_deref(), Some(&b"v2"[..]));
+
+        // 圧縮結果キャッシュも道連れに破棄されているはず。
+        let second = super::super::compressed::get_or_compress(
+            &path,
+            crate::config::AcceptedEncoding::Zstd,
+            3,
+            &cfg,
+            || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                b"compressed-v2".to_vec()
+            },
+        );
+        assert_eq!(second, Bytes::from_static(b"compressed-v2"));
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "mtime 再検証によるリロード後は圧縮結果も再計算されること"
+        );
     }
 
     /// F-150: `get_cached` はミス時にロードしないこと

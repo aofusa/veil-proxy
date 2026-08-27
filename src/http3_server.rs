@@ -630,6 +630,19 @@ struct PartialResponse {
     written: usize,
 }
 
+/// `Arc<Vec<u8>>` を `Bytes::from_owner` でゼロコピー化するための薄いラッパ（F-169）。
+///
+/// `Backend::MemoryFile` はコンテンツを `Arc<Vec<u8>>` で保持しており、`Arc<Vec<u8>>`
+/// 自体は `AsRef<[u8]>` を実装しない（`AsRef<Vec<u8>>` のみ）ため、そのまま
+/// `Bytes::from_owner` には渡せない。`src/proxy.rs` の同名ラッパと同じ設計。
+struct ArcVecBytes(Arc<Vec<u8>>);
+
+impl AsRef<[u8]> for ArcVecBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
 /// `Http3Handler::handle_sendfile` の引数まとめ。
 ///
 /// F-132: WASM モジュールリストを渡す引数が増えたことで `clippy::too_many_arguments`
@@ -642,6 +655,11 @@ struct SendFileRequest<'a> {
     req_path: &'a [u8],
     prefix: &'a [u8],
     security: &'a SecurityConfig,
+    /// 圧縮設定（F-169: HTTP/3 専用設定を解決済みのもの。h2 の `h2_sendfile` と同様、
+    /// 呼び出し元が `resolve_http3_compression_config` で解決してから渡す）。
+    compression: &'a CompressionConfig,
+    /// クライアントの Accept-Encoding から解決した圧縮方式（F-169）。
+    client_encoding: AcceptedEncoding,
     /// OpenFileCache 設定（ルーティングごとの上書き、F-146 で is_dir 判定にも使用）
     open_file_cache_config: Option<&'a cache::OpenFileCacheConfig>,
     /// base_path の canonical 形（F-145、config ロード時に一度だけ解決）。
@@ -1491,7 +1509,9 @@ impl Http3Handler {
             }
         });
 
-        let (prefix, backend, _route_compression) = match backend_result {
+        // F-169: File/MemoryFile バックエンドの圧縮ネゴシエーションに使う
+        // （従来は破棄していたため、HTTP/3 の静的配信では圧縮が一切効いていなかった）。
+        let (prefix, backend, route_compression) = match backend_result {
             Some(b) => b,
             None => {
                 debug!(
@@ -1798,6 +1818,41 @@ impl Http3Handler {
                     for (k, v) in &security.add_response_headers {
                         header_store.push((k.as_bytes().to_vec(), v.as_bytes().to_vec()));
                     }
+
+                    // F-169: HTTP/3 の File 系バックエンドは従来ここで圧縮設定
+                    // （`route_compression`）を破棄しており、h2 と違って圧縮が
+                    // 一切効いていなかった。h2 (`build_h2_compressed_file_response`)
+                    // と同じネゴシエーションを適用する。MemoryFile はファイルシステム
+                    // パスを持たないため圧縮結果キャッシュ（`cache::compressed`）は
+                    // 使えない（毎回圧縮する。h2 側の MemoryFile 経路と同じ扱い）。
+                    let file_compression =
+                        resolve_http3_compression_config(&route_compression, &config.http3_config);
+                    let should_compress = file_compression.should_compress(
+                        client_encoding,
+                        Some(mime_type.as_bytes()),
+                        Some(data.len()),
+                        None,
+                    );
+
+                    let response_body: Bytes = if let Some(enc) = should_compress {
+                        let encoding_name: &[u8] = match enc {
+                            AcceptedEncoding::Zstd => b"zstd",
+                            AcceptedEncoding::Brotli => b"br",
+                            AcceptedEncoding::Gzip => b"gzip",
+                            AcceptedEncoding::Deflate => b"deflate",
+                            AcceptedEncoding::Identity => b"",
+                        };
+                        if !encoding_name.is_empty() {
+                            header_store
+                                .push((b"content-encoding".to_vec(), encoding_name.to_vec()));
+                            header_store.push((b"vary".to_vec(), b"Accept-Encoding".to_vec()));
+                        }
+                        Bytes::from(compress_body_h3(data.as_slice(), enc, &file_compression))
+                    } else {
+                        // Arc<Vec<u8>> の参照カウントクローンのみ（ディープコピー無し）。
+                        Bytes::from_owner(ArcVecBytes(data.clone()))
+                    };
+
                     #[cfg(feature = "wasm")]
                     if let Some(modules) = wasm_modules_to_apply.as_ref() {
                         header_store =
@@ -1809,8 +1864,8 @@ impl Http3Handler {
                         .map(|(k, v)| (k.as_slice(), v.as_slice()))
                         .collect();
 
-                    self.send_response(stream_id, 200, &resp_headers, Some(&data))?;
-                    (200, data.len())
+                    self.send_response(stream_id, 200, &resp_headers, Some(&response_body))?;
+                    (200, response_body.len())
                 }
             }
             Backend::SendFile(
@@ -1823,8 +1878,13 @@ impl Http3Handler {
                 canonical_base,
                 static_file_cache_config,
                 _,
-            ) => self
-                .handle_sendfile(SendFileRequest {
+            ) => {
+                // F-169: HTTP/3 専用圧縮設定を解決（Proxy 経路の `handle_proxy` と同じ
+                // 優先順位: パス設定 > HTTP/3 設定 > デフォルト）。従来 SendFile は
+                // `route_compression` を破棄しており圧縮が一切効いていなかった。
+                let file_compression =
+                    resolve_http3_compression_config(&route_compression, &config.http3_config);
+                self.handle_sendfile(SendFileRequest {
                     stream_id,
                     base_path: &base_path,
                     is_dir,
@@ -1832,6 +1892,8 @@ impl Http3Handler {
                     req_path: &path,
                     prefix: &prefix,
                     security: &security,
+                    compression: &file_compression,
+                    client_encoding,
                     open_file_cache_config: open_file_cache_config.as_deref(),
                     canonical_base: canonical_base.as_deref(),
                     static_file_cache_config: static_file_cache_config.as_deref(),
@@ -1839,7 +1901,8 @@ impl Http3Handler {
                     wasm_modules: wasm_modules_to_apply.as_ref(),
                 })
                 .await
-                .unwrap_or((404, 9)),
+                .unwrap_or((404, 9))
+            }
             Backend::Redirect(redirect_url, status_code, preserve_path, _) => self
                 .handle_redirect(
                     stream_id,
@@ -2451,6 +2514,8 @@ impl Http3Handler {
             req_path,
             prefix,
             security,
+            compression,
+            client_encoding,
             open_file_cache_config,
             canonical_base,
             static_file_cache_config,
@@ -2517,47 +2582,56 @@ impl Http3Handler {
         )
         .await;
 
-        let (data, mime_owned): (bytes::Bytes, String) = match first_result {
-            Some(cache::StaticFileOutcome::File(info, data)) => (data, info.mime_type),
-            Some(cache::StaticFileOutcome::Forbidden) => {
-                self.send_error_response(stream_id, 403, b"Forbidden")?;
-                return Ok((403, 9));
-            }
-            Some(cache::StaticFileOutcome::Directory(file_info)) => {
-                // ディレクトリの場合はインデックスファイルを解決してからもう一度呼ぶ
-                // （h1/h2 と同一ロジック。封じ込め検査は既に上で通過済みのため index
-                // パスにも同じ containment を渡す）。
-                let filename = index_file.unwrap_or("index.html");
-                let index_path = file_info.canonical_path.join(filename);
-                match cache::get_static_file_with_content(
-                    &index_path,
-                    open_file_cache_config,
-                    &content_cfg,
-                    containment,
-                )
-                .await
-                {
-                    Some(cache::StaticFileOutcome::File(info, data)) => (data, info.mime_type),
-                    Some(cache::StaticFileOutcome::Forbidden) | None => {
-                        self.send_error_response(stream_id, 403, b"Forbidden")?;
-                        return Ok((403, 9));
-                    }
-                    Some(cache::StaticFileOutcome::Directory(_)) => {
-                        // index ファイル自体がさらにディレクトリ（通常起こり得ないが、
-                        // 安全側に倒して 403 とする）。
-                        self.send_error_response(stream_id, 403, b"Forbidden")?;
-                        return Ok((403, 9));
+        // F-169: `served_path`（実際に配信するパス。ディレクトリルートで index に
+        // フォールバックした場合は index 側）を圧縮結果キャッシュのキーに使う。
+        // `full_path` の所有権をそのまま流用するため追加のクローンは発生しない
+        // （h2 側 `h2_sendfile` と同じ方針）。
+        let (data, mime_owned, served_path): (bytes::Bytes, String, std::path::PathBuf) =
+            match first_result {
+                Some(cache::StaticFileOutcome::File(info, data)) => {
+                    (data, info.mime_type, full_path)
+                }
+                Some(cache::StaticFileOutcome::Forbidden) => {
+                    self.send_error_response(stream_id, 403, b"Forbidden")?;
+                    return Ok((403, 9));
+                }
+                Some(cache::StaticFileOutcome::Directory(file_info)) => {
+                    // ディレクトリの場合はインデックスファイルを解決してからもう一度呼ぶ
+                    // （h1/h2 と同一ロジック。封じ込め検査は既に上で通過済みのため index
+                    // パスにも同じ containment を渡す）。
+                    let filename = index_file.unwrap_or("index.html");
+                    let index_path = file_info.canonical_path.join(filename);
+                    match cache::get_static_file_with_content(
+                        &index_path,
+                        open_file_cache_config,
+                        &content_cfg,
+                        containment,
+                    )
+                    .await
+                    {
+                        Some(cache::StaticFileOutcome::File(info, data)) => {
+                            (data, info.mime_type, index_path)
+                        }
+                        Some(cache::StaticFileOutcome::Forbidden) | None => {
+                            self.send_error_response(stream_id, 403, b"Forbidden")?;
+                            return Ok((403, 9));
+                        }
+                        Some(cache::StaticFileOutcome::Directory(_)) => {
+                            // index ファイル自体がさらにディレクトリ（通常起こり得ないが、
+                            // 安全側に倒して 403 とする）。
+                            self.send_error_response(stream_id, 403, b"Forbidden")?;
+                            return Ok((403, 9));
+                        }
                     }
                 }
-            }
-            None => {
-                // ファイルが開けない場合はキャッシュを無効化（HTTP/1.1・HTTP/2 と同様）。
-                cache::invalidate_file_cache(&full_path);
-                cache::invalidate_content_cache(&full_path);
-                self.send_error_response(stream_id, 404, b"Not Found")?;
-                return Ok((404, 9));
-            }
-        };
+                None => {
+                    // ファイルが開けない場合はキャッシュを無効化（HTTP/1.1・HTTP/2 と同様）。
+                    cache::invalidate_file_cache(&full_path);
+                    cache::invalidate_content_cache(&full_path);
+                    self.send_error_response(stream_id, 404, b"Not Found")?;
+                    return Ok((404, 9));
+                }
+            };
         let mime_str: &str = &mime_owned;
 
         // F-132: h1/h2 と同様、静的配信にも WASM on_response_headers を適用する。
@@ -2568,6 +2642,42 @@ impl Http3Handler {
         for (k, v) in &security.add_response_headers {
             header_store.push((k.as_bytes().to_vec(), v.as_bytes().to_vec()));
         }
+
+        // F-169: 圧縮ネゴシエーション + 静的配信の圧縮結果キャッシュ
+        // （`cache::compressed`、`content_cfg.enabled` = `static_file_cache` 有効時のみ）。
+        // 従来この関数は圧縮設定自体を受け取っておらず、HTTP/3 の静的配信では
+        // 圧縮が一切効いていなかった。
+        let should_compress = compression.should_compress(
+            client_encoding,
+            Some(mime_str.as_bytes()),
+            Some(data.len()),
+            None,
+        );
+        let response_body: Bytes = if let Some(enc) = should_compress {
+            let encoding_name: &[u8] = match enc {
+                AcceptedEncoding::Zstd => b"zstd",
+                AcceptedEncoding::Brotli => b"br",
+                AcceptedEncoding::Gzip => b"gzip",
+                AcceptedEncoding::Deflate => b"deflate",
+                AcceptedEncoding::Identity => b"",
+            };
+            if !encoding_name.is_empty() {
+                header_store.push((b"content-encoding".to_vec(), encoding_name.to_vec()));
+                header_store.push((b"vary".to_vec(), b"Accept-Encoding".to_vec()));
+            }
+            if content_cfg.enabled {
+                let level = cache::compressed::compression_level(enc, compression);
+                cache::compressed::get_or_compress(&served_path, enc, level, &content_cfg, || {
+                    compress_body_h3(&data, enc, compression)
+                })
+            } else {
+                Bytes::from(compress_body_h3(&data, enc, compression))
+            }
+        } else {
+            // Bytes::clone() は参照カウント増加のみ（ディープコピー無し）。
+            data.clone()
+        };
+
         #[cfg(feature = "wasm")]
         if let Some(modules) = wasm_modules {
             header_store = apply_h3_wasm_response_headers(modules, 200, header_store).await;
@@ -2578,8 +2688,8 @@ impl Http3Handler {
             .map(|(k, v)| (k.as_slice(), v.as_slice()))
             .collect();
 
-        self.send_response(stream_id, 200, &resp_headers, Some(data.as_ref()))?;
-        Ok((200, data.len()))
+        self.send_response(stream_id, 200, &resp_headers, Some(response_body.as_ref()))?;
+        Ok((200, response_body.len()))
     }
 
     /// リダイレクト処理
@@ -5484,6 +5594,39 @@ pub fn run_http3_server(bind_addr: SocketAddr, config: Http3ServerConfig) -> io:
 // ヘルパー関数
 // ====================
 
+/// F-169 Part B: zstd 圧縮コンテキストをスレッドローカルに保持して使い回す。
+///
+/// `src/proxy.rs` の同名ヘルパーと同じ設計・同じ注意点（詳細はそちらの doc 参照）。
+/// **「確保が減った」ことと「速くなった」ことは別の主張**であり（`AGENTS.md` F-168 の
+/// 教訓）、本変更はスループット改善を約束するものではない。
+#[cfg(feature = "compression")]
+fn zstd_compress_reuse_ctx(body: &[u8], level: i32) -> Vec<u8> {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static ZSTD_COMPRESSOR: RefCell<Option<zstd::bulk::Compressor<'static>>> =
+            const { RefCell::new(None) };
+    }
+
+    ZSTD_COMPRESSOR.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let compressor = match slot.as_mut() {
+            Some(c) => c,
+            None => {
+                let c = match zstd::bulk::Compressor::new(level) {
+                    Ok(c) => c,
+                    Err(_) => return body.to_vec(),
+                };
+                slot.get_or_insert(c)
+            }
+        };
+        if compressor.set_compression_level(level).is_err() {
+            return body.to_vec();
+        }
+        compressor.compress(body).unwrap_or_else(|_| body.to_vec())
+    })
+}
+
 /// HTTP/3 用レスポンスボディ圧縮ヘルパー関数
 ///
 /// バイト配列を受け取り、指定されたエンコーディングで圧縮して返します。
@@ -5499,12 +5642,7 @@ pub(crate) fn compress_body_h3(
     use std::io::Write;
 
     match encoding {
-        AcceptedEncoding::Zstd => {
-            match zstd::encode_all(std::io::Cursor::new(body), compression.zstd_level) {
-                Ok(compressed) => compressed,
-                Err(_) => body.to_vec(),
-            }
-        }
+        AcceptedEncoding::Zstd => zstd_compress_reuse_ctx(body, compression.zstd_level),
         AcceptedEncoding::Gzip => {
             let level = Compression::new(compression.gzip_level);
             let mut encoder = GzEncoder::new(Vec::with_capacity(body.len()), level);
