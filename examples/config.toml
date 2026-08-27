@@ -2172,6 +2172,9 @@ revalidate_mtime = false
 #
 #   [route.security]
 #   # バックエンドに転送前にヘッダーを追加
+#   # 使える特殊変数: $client_ip / $host / $request_uri
+#   # 値の展開はテンプレートを 1 回走査するだけなので、展開後の値が再度
+#   # プレースホルダとして解釈されることはない。認識できない $xxx はそのまま残る。
 #   add_request_headers = { "X-Real-IP" = "$client_ip", "X-Forwarded-Proto" = "https" }
 #   # バックエンドに転送前にヘッダーを削除
 #   remove_request_headers = ["X-Debug-Token"]

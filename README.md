@@ -2141,6 +2141,11 @@ The following variables can be used in `add_request_headers` values:
 | `$host` | Host header from request |
 | `$request_uri` | Request URI (path + query string) |
 
+Values are expanded in a **single pass** over the template, so an expanded value is never
+re-scanned for placeholders. If a client IP (or Host, or URI) happens to contain the literal
+text `$host`, that text is emitted as-is rather than being substituted again. An unrecognized
+placeholder (e.g. `$foo`) is left in the value unchanged.
+
 ### Response Header Manipulation
 
 Add or remove headers before sending to the client. Also applies to static file serving.
