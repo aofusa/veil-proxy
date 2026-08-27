@@ -668,8 +668,8 @@ struct Http3Handler {
     peer_addr: SocketAddr,
     /// 部分的なレスポンス（ストリーム ID → 保留中の応答。B-43 で head を保持）
     partial_responses: HashMap<u64, PartialResponse>,
-    /// クライアントIPアドレス（文字列）
-    client_ip: String,
+    /// クライアント IP アドレス（F-168 P3: `to_string()` のヒープ確保を排除するスタックバッファ）
+    client_ip: crate::http_utils::IpStr,
     /// ストリーミングプロキシ中のストリーム（F-32）。
     proxy_streams: HashMap<u64, ProxyStream>,
     /// バッファ経路の保留リクエスト（F-32）。
@@ -695,6 +695,16 @@ struct Http3Handler {
     /// 送出対象リストへ渡す際は `key.clone()`（`Rc::clone`、参照カウント +1 のみ）で済ませ、
     /// `ConnectionId` 本体（内部 `Vec<u8>`）のディープコピーをホットパスから排除する。
     key: crate::http3_stream::ConnKey,
+    /// F-168 P3: `process_h3_events` の新規 Headers 一時収集バッファ（再利用）。
+    /// リクエストごとの `Vec` 確保をなくすため、`process_h3_events` が `mem::take` で
+    /// 借り出して使い、末尾で `clear()` してから本フィールドへ戻す。
+    ev_new_headers: Vec<(u64, Vec<h3::Header>, bool)>,
+    /// F-168 P3: `process_h3_events` の Finished ストリーム ID 一時収集バッファ（再利用）。
+    /// 用法は `ev_new_headers` と同じ。
+    ev_finished: Vec<u64>,
+    /// F-168 P3: `process_h3_events` の Reset ストリーム ID 一時収集バッファ（再利用）。
+    /// 用法は `ev_new_headers` と同じ。
+    ev_reset: Vec<u64>,
 }
 
 impl Http3Handler {
@@ -709,7 +719,7 @@ impl Http3Handler {
         Self {
             conn,
             h3_conn: None,
-            client_ip: peer_addr.ip().to_string(),
+            client_ip: crate::http_utils::IpStr::new(peer_addr.ip()),
             peer_addr,
             partial_responses: HashMap::new(),
             proxy_streams: HashMap::new(),
@@ -722,6 +732,9 @@ impl Http3Handler {
             dirty: false,
             timer_deadline: None,
             key,
+            ev_new_headers: Vec::new(),
+            ev_finished: Vec::new(),
+            ev_reset: Vec::new(),
         }
     }
 
@@ -789,9 +802,14 @@ impl Http3Handler {
     /// イベントが残っているのにダーティを降ろす経路を構造的に排除する。
     async fn process_h3_events(&mut self) -> io::Result<bool> {
         // 新規 Headers（stream_id, headers, more_frames）と Finished / Reset を収集。
-        let mut new_headers: Vec<(u64, Vec<h3::Header>, bool)> = Vec::new();
-        let mut finished: Vec<u64> = Vec::new();
-        let mut reset: Vec<u64> = Vec::new();
+        // F-168 P3: リクエストごとの `Vec` 確保をなくすため `Http3Handler` の再利用バッファを
+        // 借り出す（`mem::take`）。関数末尾で `clear()` して容量を保持したまま戻す。
+        // ※ 早期 return がある場合、その経路では戻せず次回は空 `Vec`（容量ロス）になり得るが、
+        //   正しさには影響しない。本関数唯一の早期 return（`?`、後述）は
+        //   3 バッファとも使い切った後なので、実際には全パスで戻せている。
+        let mut new_headers = std::mem::take(&mut self.ev_new_headers);
+        let mut finished = std::mem::take(&mut self.ev_finished);
+        let mut reset = std::mem::take(&mut self.ev_reset);
         let mut did_work = false;
 
         if let Some(ref mut h3_conn) = self.h3_conn {
@@ -858,7 +876,9 @@ impl Http3Handler {
         }
 
         // --- 新規 Headers を分類して振り分け ---
-        for (stream_id, headers, more_frames) in new_headers {
+        // F-168 P3: `drain(..)` で回すことで `new_headers` 自体の確保容量を維持する
+        // （ムーブで回すと Vec の所有権ごと失われ、次回また確保が必要になる）。
+        for (stream_id, headers, more_frames) in new_headers.drain(..) {
             // F-99: リクエストストリーム open をメトリクス計上
             self.metric_stream_open(stream_id);
             match self.classify(stream_id, &headers, more_frames) {
@@ -894,22 +914,26 @@ impl Http3Handler {
                 }
             }
         }
+        // new_headers は drain 済みで既に空。容量を保持したままフィールドへ戻す。
+        self.ev_new_headers = new_headers;
 
         // --- Finished / Reset 反映 ---
-        for stream_id in finished {
+        for stream_id in finished.drain(..) {
             if let Some(ps) = self.proxy_streams.get_mut(&stream_id) {
                 ps.req_eof_seen = true;
             } else if let Some(br) = self.buffered_reqs.get_mut(&stream_id) {
                 br.end = true;
             }
         }
-        for stream_id in reset {
+        self.ev_finished = finished;
+        for stream_id in reset.drain(..) {
             // ストリームを破棄（チャネル drop でバックエンドタスクも中断）。
             self.proxy_streams.remove(&stream_id);
             self.buffered_reqs.remove(&stream_id);
             self.stream_bodies.remove(&stream_id);
             self.metric_stream_close(stream_id);
         }
+        self.ev_reset = reset;
 
         // --- 完了したバッファ経路リクエストを処理 ---
         let ready: Vec<u64> = self
@@ -1036,7 +1060,7 @@ impl Http3Handler {
                 status,
                 msg.len() as u64,
                 Instant::now(),
-                &self.client_ip,
+                self.client_ip.as_str(),
                 "",
             );
             return Decision::Handled;
@@ -1133,7 +1157,13 @@ impl Http3Handler {
 
         // セキュリティチェック（ストリーミング適格は早期拒否でアップロードを溜めない）。
         let security = backend.security();
-        let check = check_security(security, &self.client_ip, method, content_length, false);
+        let check = check_security(
+            security,
+            self.client_ip.as_str(),
+            method,
+            content_length,
+            false,
+        );
         if check != SecurityCheckResult::Allowed {
             let status = check.status_code();
             let msg = check.message();
@@ -1147,14 +1177,14 @@ impl Http3Handler {
                 status,
                 msg.len() as u64,
                 Instant::now(),
-                &self.client_ip,
+                self.client_ip.as_str(),
                 "",
             );
             return Decision::Handled;
         }
 
         // サーバ選択（F-97: Consistent Hash header/cookie キー対応）。
-        let server = match upstream_group.select_with_header_fn(&self.client_ip, |name| {
+        let server = match upstream_group.select_with_header_fn(self.client_ip.as_str(), |name| {
             headers
                 .iter()
                 .find(|h| h.name().eq_ignore_ascii_case(name))
@@ -1331,7 +1361,7 @@ impl Http3Handler {
                 400,
                 0,
                 start_time,
-                &self.client_ip,
+                self.client_ip.as_str(),
                 "",
             );
             return Ok(());
@@ -1359,7 +1389,7 @@ impl Http3Handler {
             let path_str = std::str::from_utf8(&path).unwrap_or("/");
             if prom_config.enabled && path_str == prom_config.path && method == b"GET" {
                 // IPアドレス制限チェック
-                if !prom_config.is_ip_allowed(&self.client_ip) {
+                if !prom_config.is_ip_allowed(self.client_ip.as_str()) {
                     self.send_error_response(stream_id, 403, b"Forbidden")?;
                     let user_agent_slice: &[u8] = if user_agent.is_empty() {
                         &[]
@@ -1375,7 +1405,7 @@ impl Http3Handler {
                         403,
                         9,
                         start_time,
-                        &self.client_ip,
+                        self.client_ip.as_str(),
                         "",
                     );
                     return Ok(());
@@ -1407,7 +1437,7 @@ impl Http3Handler {
                     200,
                     body.len() as u64,
                     start_time,
-                    &self.client_ip,
+                    self.client_ip.as_str(),
                     "",
                 );
                 return Ok(());
@@ -1489,7 +1519,7 @@ impl Http3Handler {
                         200,
                         0,
                         start_time,
-                        &self.client_ip,
+                        self.client_ip.as_str(),
                         "",
                     );
                     return Ok(());
@@ -1510,7 +1540,7 @@ impl Http3Handler {
                     404,
                     9,
                     start_time,
-                    &self.client_ip,
+                    self.client_ip.as_str(),
                     "",
                 );
                 return Ok(());
@@ -1519,8 +1549,13 @@ impl Http3Handler {
 
         // セキュリティチェック
         let security = backend.security();
-        let check_result =
-            check_security(security, &self.client_ip, &method, content_length, false);
+        let check_result = check_security(
+            security,
+            self.client_ip.as_str(),
+            &method,
+            content_length,
+            false,
+        );
 
         if check_result != SecurityCheckResult::Allowed {
             let status = check_result.status_code();
@@ -1540,7 +1575,7 @@ impl Http3Handler {
                 status,
                 msg.len() as u64,
                 start_time,
-                &self.client_ip,
+                self.client_ip.as_str(),
                 "",
             );
             return Ok(());
@@ -1615,7 +1650,7 @@ impl Http3Handler {
                                 resp.status_code,
                                 resp.body.len() as u64,
                                 start_time,
-                                &self.client_ip,
+                                self.client_ip.as_str(),
                                 "",
                             );
                             // F-132: on_log は呼び出し元の `handle_request` ラッパが
@@ -1674,7 +1709,7 @@ impl Http3Handler {
                                             resp.status_code,
                                             resp.body.len() as u64,
                                             start_time,
-                                            &self.client_ip,
+                                            self.client_ip.as_str(),
                                             "",
                                         );
                                         // F-132: on_log は呼び出し元の `handle_request`
@@ -1831,7 +1866,7 @@ impl Http3Handler {
             status,
             resp_size as u64,
             start_time,
-            &self.client_ip,
+            self.client_ip.as_str(),
             "",
         );
         // F-132: on_log は呼び出し元の `handle_request` ラッパが最後に一度だけ呼ぶ。
@@ -2126,7 +2161,7 @@ impl Http3Handler {
         #[cfg(feature = "wasm")] wasm_request_headers: Option<&[(Vec<u8>, Vec<u8>)]>,
     ) -> io::Result<(u16, usize)> {
         // サーバー選択（F-97: Consistent Hash header/cookie キー対応）
-        let server = match upstream_group.select_with_header_fn(&self.client_ip, |name| {
+        let server = match upstream_group.select_with_header_fn(self.client_ip.as_str(), |name| {
             headers
                 .iter()
                 .find(|h| h.name().eq_ignore_ascii_case(name))
