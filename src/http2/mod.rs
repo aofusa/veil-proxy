@@ -36,3 +36,24 @@ pub use connection::{Http2Connection, ProcessedRequest};
 pub use error::{Http2Error, Http2ErrorCode};
 pub use settings::Http2Settings;
 pub use stream::{Stream, StreamManager, StreamState};
+
+/// ヘッダ名スロット（F-166/F-165 A1、F-168 H-2 で `client.rs`/`connection.rs` 共通化）。
+///
+/// 既に小文字のヘッダ名（大半のケース）は元スライスを借用するだけでコピーしない。
+/// 大文字を含むヘッダ名（稀）のみ `Owned` に小文字化したバッファを持つ。この
+/// バッファは `crate::pool::lowered_header_name_buf_get`/`_put` の再利用プールから
+/// 借りており、HPACK エンコード完了後にプールへ返却する（warmup 後はヒープ確保ゼロ）。
+pub(crate) enum NameSlot<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Vec<u8>),
+}
+
+impl NameSlot<'_> {
+    #[inline]
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        match self {
+            NameSlot::Borrowed(s) => s,
+            NameSlot::Owned(v) => v.as_slice(),
+        }
+    }
+}

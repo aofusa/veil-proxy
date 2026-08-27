@@ -1373,21 +1373,12 @@ where
         headers: &[(&[u8], &[u8])],
         body: Option<&[u8]>,
     ) -> Http2Result<()> {
-        let mut lowercase_names: Vec<Vec<u8>> = Vec::with_capacity(headers.len());
-        for &(name, _) in headers {
-            lowercase_names.push(name.to_ascii_lowercase());
-        }
-
         let empty_body = body.is_none() || body.map(|b| b.is_empty()).unwrap_or(true);
 
         // HEADERS を連結バッファへ積む。ボディがあるときはフラッシュせず、続く DATA と
         // 1 回の書き込みにまとめる（送信ホットパスのシステムコール削減・F-73 続き）。
         self.send_headers_internal(
-            stream_id,
-            status,
-            headers,
-            &lowercase_names,
-            empty_body,
+            stream_id, status, headers, empty_body,
             empty_body, // flush: ボディ無しなら即フラッシュ
         )
         .await?;
@@ -1419,20 +1410,8 @@ where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        let mut lowercase_names: Vec<Vec<u8>> = Vec::with_capacity(headers.len());
-        for (name, _) in headers {
-            lowercase_names.push(name.as_ref().to_ascii_lowercase());
-        }
-
-        self.send_headers_internal(
-            stream_id,
-            status,
-            headers,
-            &lowercase_names,
-            end_stream,
-            true,
-        )
-        .await
+        self.send_headers_internal(stream_id, status, headers, end_stream, true)
+            .await
     }
 
     /// ヘッダーを連結バッファへ積む（`end_stream` 指定可能）。即送出しない（F-116）。
@@ -1453,19 +1432,8 @@ where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        let mut lowercase_names: Vec<Vec<u8>> = Vec::with_capacity(headers.len());
-        for (name, _) in headers {
-            lowercase_names.push(name.as_ref().to_ascii_lowercase());
-        }
-        self.send_headers_internal(
-            stream_id,
-            status,
-            headers,
-            &lowercase_names,
-            end_stream,
-            false,
-        )
-        .await
+        self.send_headers_internal(stream_id, status, headers, end_stream, false)
+            .await
     }
 
     /// 連結バッファ `write_buf` に現在積まれているバイト数（F-116）。
@@ -1493,12 +1461,7 @@ where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        let mut lowercase_names: Vec<Vec<u8>> = Vec::with_capacity(headers.len());
-        for (name, _) in headers {
-            lowercase_names.push(name.as_ref().to_ascii_lowercase());
-        }
-
-        self.send_headers_internal(stream_id, status, headers, &lowercase_names, false, false)
+        self.send_headers_internal(stream_id, status, headers, false, false)
             .await
     }
 
@@ -1513,7 +1476,6 @@ where
         stream_id: u32,
         status: u16,
         headers: &[(K, V)],
-        lowercase_names: &[Vec<u8>],
         end_stream: bool,
         flush: bool,
     ) -> Http2Result<()>
@@ -1548,17 +1510,61 @@ where
         };
 
         // ステータスとヘッダーをエンコード
-        let mut header_list: Vec<(&[u8], &[u8], bool)> = Vec::with_capacity(headers.len() + 1);
-        header_list.push((b":status", status_str, false));
+        //
+        // F-168 H-2: HTTP/2 はヘッダ名の小文字必須（RFC 9113 §8.2）。内部生成ヘッダーや
+        // 通常のバックエンド応答ヘッダーは大半が既に小文字であるため、まず全体を走査して
+        // 大文字を含む名前が 1 つも無ければ元スライスを借用するだけでエンコードする
+        // （追加アロケーションゼロ）。大文字を含む名前がある稀なケースのみ、
+        // `client.rs`（F-166/F-165 A1）と同じ再利用プールへ小文字化コピーを取る。
+        let needs_lowering = headers
+            .iter()
+            .any(|(name, _)| name.as_ref().iter().any(|b| b.is_ascii_uppercase()));
 
-        for (i, (_, value)) in headers.iter().enumerate() {
-            header_list.push((&lowercase_names[i], value.as_ref(), false));
-        }
+        let header_block = if !needs_lowering {
+            let mut header_list: Vec<(&[u8], &[u8], bool)> = Vec::with_capacity(headers.len() + 1);
+            header_list.push((b":status", status_str, false));
+            for (name, value) in headers {
+                header_list.push((name.as_ref(), value.as_ref(), false));
+            }
 
-        let header_block = self
-            .hpack_encoder
-            .encode(&header_list)
-            .map_err(|e| Http2Error::HpackEncode(e.to_string()))?;
+            self.hpack_encoder
+                .encode(&header_list)
+                .map_err(|e| Http2Error::HpackEncode(e.to_string()))?
+        } else {
+            let mut lowered_names: Vec<crate::http2::NameSlot> = Vec::with_capacity(headers.len());
+            for (name, _) in headers {
+                let name = name.as_ref();
+                if name.iter().any(|b| b.is_ascii_uppercase()) {
+                    let mut buf = crate::pool::lowered_header_name_buf_get();
+                    buf.extend_from_slice(name);
+                    buf.make_ascii_lowercase();
+                    lowered_names.push(crate::http2::NameSlot::Owned(buf));
+                } else {
+                    lowered_names.push(crate::http2::NameSlot::Borrowed(name));
+                }
+            }
+
+            let mut header_list: Vec<(&[u8], &[u8], bool)> = Vec::with_capacity(headers.len() + 1);
+            header_list.push((b":status", status_str, false));
+            for (slot, (_, value)) in lowered_names.iter().zip(headers.iter()) {
+                header_list.push((slot.as_slice(), value.as_ref(), false));
+            }
+
+            let header_block = self
+                .hpack_encoder
+                .encode(&header_list)
+                .map_err(|e| Http2Error::HpackEncode(e.to_string()))?;
+
+            // HPACK エンコード完了（`header_list` の借用終了）後、小文字化に使った
+            // プールバッファをここで返却する。
+            for slot in lowered_names {
+                if let crate::http2::NameSlot::Owned(buf) = slot {
+                    crate::pool::lowered_header_name_buf_put(buf);
+                }
+            }
+
+            header_block
+        };
 
         self.frame_encoder.encode_headers_into(
             &mut self.write_buf,

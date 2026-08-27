@@ -272,6 +272,16 @@ static HUFFMAN_ENCODE_TABLE: [(u32, u8); 257] = [
 /// バイト列を Huffman 符号化します。
 pub fn huffman_encode(src: &[u8]) -> Vec<u8> {
     let mut result = Vec::with_capacity(src.len());
+    huffman_encode_into(src, &mut result);
+    result
+}
+
+/// Huffman エンコード（バッファ直書き版、F-168 H-1）
+///
+/// `src` を Huffman 符号化し、結果を `out` の末尾に追記します（`out` は
+/// クリアしません）。呼び出し元が `out` を再利用バッファとして使うことで、
+/// レスポンス送出のホットパスから `Vec` の新規確保をなくします。
+pub fn huffman_encode_into(src: &[u8], out: &mut Vec<u8>) {
     let mut current: u64 = 0;
     let mut bits: u32 = 0;
 
@@ -282,7 +292,7 @@ pub fn huffman_encode(src: &[u8]) -> Vec<u8> {
 
         while bits >= 8 {
             bits -= 8;
-            result.push((current >> bits) as u8);
+            out.push((current >> bits) as u8);
         }
     }
 
@@ -290,10 +300,8 @@ pub fn huffman_encode(src: &[u8]) -> Vec<u8> {
     if bits > 0 {
         let padding = 8 - bits;
         current = (current << padding) | ((1u64 << padding) - 1);
-        result.push(current as u8);
+        out.push(current as u8);
     }
-
-    result
 }
 
 // ---------------------------------------------------------------------------

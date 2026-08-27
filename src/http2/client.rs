@@ -11,27 +11,7 @@ use crate::http2::error::{Http2Error, Http2Result};
 use crate::http2::frame::{Frame, FrameDecoder, FrameEncoder, FrameHeader};
 use crate::http2::hpack::{HpackDecoder, HpackEncoder};
 use crate::http2::settings::{defaults, Http2Settings};
-
-/// ヘッダ名スロット（F-166/F-165 A1）。
-///
-/// 既に小文字のヘッダ名（大半のケース）は元スライスを借用するだけでコピーしない。
-/// 大文字を含むヘッダ名（稀）のみ `Owned` に小文字化したバッファを持つ。この
-/// バッファは `crate::pool::lowered_header_name_buf_get`/`_put` の再利用プールから
-/// 借りており、HPACK エンコード完了後にプールへ返却する（warmup 後はヒープ確保ゼロ）。
-enum NameSlot<'a> {
-    Borrowed(&'a [u8]),
-    Owned(Vec<u8>),
-}
-
-impl NameSlot<'_> {
-    #[inline]
-    fn as_slice(&self) -> &[u8] {
-        match self {
-            NameSlot::Borrowed(s) => s,
-            NameSlot::Owned(v) => v.as_slice(),
-        }
-    }
-}
+use crate::http2::NameSlot;
 
 /// HTTP/2 コネクションプリフェース (クライアントが送信)
 pub const CONNECTION_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";

@@ -2,7 +2,7 @@
 //!
 //! HTTP ヘッダーを HPACK 形式でエンコードします。
 
-use super::huffman::{huffman_encode, huffman_encoded_len};
+use super::huffman::{huffman_encode_into, huffman_encoded_len};
 use super::table::{DynamicTable, StaticTable};
 use super::{encode_integer, HpackResult};
 use bytes::Bytes;
@@ -276,7 +276,14 @@ impl HpackEncoder {
             if huffman_len < s.len() {
                 // Huffman エンコードが短い場合
                 encode_integer(buf, huffman_len, 7, 0x80);
-                buf.extend(huffman_encode(s));
+                // F-168 H-1: 一時 Vec を経由せず buf へ直接追記する（ゼロアロケーション）。
+                let before = buf.len();
+                huffman_encode_into(s, buf);
+                debug_assert_eq!(
+                    buf.len() - before,
+                    huffman_len,
+                    "huffman_encoded_len と huffman_encode_into の出力バイト数が不一致"
+                );
                 return Ok(());
             }
         }
