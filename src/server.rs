@@ -849,7 +849,7 @@ pub fn create_listener(
             let fd = listener.as_raw_fd();
             match attach_reuseport_cbpf(fd, num_workers) {
                 Ok(()) => {
-                    info!("[Worker {}] CBPF reuseport load balancing enabled (client IP hash -> {} workers)",
+                    info!("[Worker {}] CBPF reuseport load balancing enabled (flow hash -> {} workers)",
                           worker_id, num_workers);
                 }
                 Err(e) => {

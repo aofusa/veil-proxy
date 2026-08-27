@@ -56,7 +56,7 @@ A high-performance reverse proxy server using io_uring (custom runtime) and rust
 
 ### Performance
 - **CPU Affinity**: Pin worker threads to CPU cores
-- **CBPF Distribution**: Client IP-based load balancing with SO_REUSEPORT (Linux 4.6+)
+- **CBPF Distribution**: Flow hash-based (4-tuple) load balancing with SO_REUSEPORT, pinning each connection to a fixed worker (Linux 4.6+)
 - **OpenFileCache**: File metadata cache to reduce system calls (canonicalize, metadata, mime_guess) - 60-67% reduction in system calls for static file serving. On cache miss, the blocking `canonicalize`/`metadata`/disk reads run on a dedicated offload thread pool (completion signaled via `eventfd` + `POLL_ADD`) so the io_uring event loop never blocks
 - **Static Content Cache** (F-146/F-150, off by default): HTTP/2 and HTTP/3 static serving must re-frame the body into DATA frames / QUIC streams and therefore cannot use `sendfile(2)`, so every request used to re-read the whole file via the offload thread pool. The userspace TLS (rustls) path for HTTP/1.1 with kTLS disabled cannot use `sendfile(2)` either and used to re-read the file via `pread(2)` on every request (F-150) — this matters because FreeBSD's recommended configuration is `ktls_enabled = false` (software kTLS dispatches per-record and loses on large responses). With `[static_file_cache]`/`[route.static_file_cache]` enabled, the file body is held in userspace memory as `bytes::Bytes`; a cache hit is served with just a `DashMap` lookup + `Bytes::clone()` (refcount bump, and for HTTP/1.1 `Bytes::slice()` for Range requests) — zero syscalls, zero allocation, zero offload round-trip. HTTP/1.1 with kTLS enabled, or in plaintext, is unaffected (it already uses `sendfile(2)`/kTLS zero-copy)
 - **HTTP/2 Response Streaming**: For non-compressed responses, the backend body is forwarded to the HTTP/2 client as DATA frames incrementally instead of being fully buffered — both `Content-Length` and `Transfer-Encoding: chunked` responses. Chunked bodies are decoded zero-copy via a span-based decoder (sub-slices of the read buffer, no intermediate `Vec`). Each DATA frame obeys HTTP/2 flow control (connection/stream window + `WINDOW_UPDATE`), so backpressure follows the client's receive rate and RSS does not scale with payload size (OOM resistance for large downloads)
@@ -514,7 +514,7 @@ The following table lists default values for major configuration options:
 | `[logging]` | `error_file_path` | none (stderr) | Error log (ERROR) output path |
 | `[prometheus]` | `enabled` | `false` | Enable Prometheus metrics |
 | `[prometheus]` | `path` | `"/__metrics"` | Metrics endpoint path |
-| `[performance]` | `reuseport_balancing` | `"cbpf"` | SO_REUSEPORT balancing |
+| `[performance]` | `reuseport_balancing` | `"kernel"` | SO_REUSEPORT balancing |
 | `[performance]` | `huge_pages_enabled` | `false` | Enable Huge Pages |
 | `[performance]` | `open_file_cache_enabled` | `false` | Enable OpenFileCache |
 | `[performance]` | `open_file_cache_valid_duration_secs` | `60` | Cache validity (seconds) |
@@ -644,8 +644,9 @@ landlock_write_paths = ["/var/log/veil"]
 
 [performance]
 # SO_REUSEPORT distribution method
-# "kernel" = kernel default (3-tuple hash)
-# "cbpf"   = client IP-based CBPF (improved cache efficiency, requires Linux 4.6+)
+# "kernel" = kernel default (3-tuple hash) [default]
+# "cbpf"   = flow hash-based CBPF (4-tuple; pins each connection to a fixed
+#            worker for cache/session-reuse efficiency, requires Linux 4.6+)
 reuseport_balancing = "cbpf"
 
 # Use Huge Pages (Large OS Pages)
@@ -3617,23 +3618,30 @@ threads = 0  # If unspecified or 0, uses same number as CPU cores
 
 #### Overview
 
-When multiple worker threads listen on the same port using SO_REUSEPORT, the Linux kernel distributes connections by default using a 3-tuple hash (protocol + source IP + source port). In CBPF mode, a custom BPF program is attached to the kernel that selects workers based only on client IP address.
+When multiple worker threads listen on the same port using SO_REUSEPORT, the Linux kernel distributes connections by default using a 3-tuple hash (protocol + source IP + source port). In CBPF mode, a custom BPF program is attached to the kernel that selects a worker based on the flow hash (`skb->hash`, computed from the 4-tuple: source/destination IP and port), falling back to the receiving CPU when the hash is not yet computed. This is an option for pinning connections from many clients to a fixed worker; it is not a default recommendation — the default remains `kernel`.
 
 #### Effects
 
 | Aspect | Kernel (default) | CBPF |
 |--------|------------------|------|
-| Distribution Key | protocol + src IP + src port | src IP only |
-| Same Client | Varies by source port | Always same worker |
-| CPU Cache Efficiency | Medium | High (improved L1/L2 hit rate) |
-| TLS Session Resumption | Low-Medium | High (leverages session cache) |
+| Distribution Key | protocol + src IP + src port | flow hash (4-tuple), falls back to receiving CPU |
+| Same Connection | Fixed for the connection's lifetime | Always same worker |
+| CPU Cache Efficiency | Medium | Comparable (both keep a connection on one worker) |
+| TLS Session Resumption | Medium | Comparable |
+
+> **Note (B-76):** the kernel default already hashes the 4-tuple, so in practice `"cbpf"`
+> now behaves very close to `"kernel"`. The mode exists so that the selection policy is
+> expressed by a program you control (and so it can fall back to the receiving CPU when
+> `skb->hash` is unavailable). Before B-76 this mode was broken: the program always
+> returned index 0, so **every connection landed on worker 0** and multi-worker
+> parallelism was lost entirely.
 
 #### Configuration
 
 ```toml
 [performance]
-# "kernel" = kernel default (backward compatibility)
-# "cbpf"   = client IP-based CBPF (recommended)
+# "kernel" = kernel default [default]
+# "cbpf"   = flow hash-based CBPF (4-tuple; pins each connection to a fixed worker)
 reuseport_balancing = "cbpf"
 ```
 

@@ -56,7 +56,7 @@ io_uring（独自実装ランタイム）と rustls を使用した高性能リ�
 
 ### パフォーマンス
 - **CPUアフィニティ**: ワーカースレッドのCPUコアピン留め
-- **CBPF振り分け**: SO_REUSEPORTのクライアントIPベースロードバランシング（Linux 4.6+）
+- **CBPF振り分け**: SO_REUSEPORTのフローハッシュ（4タプル）ベースロードバランシング。同一接続を固定ワーカーへ振り分け（Linux 4.6+）
 - **OpenFileCache**: ファイルメタデータキャッシュ（canonicalize、metadata、mime_guessのシステムコール削減） - 静的ファイル配信で60〜67%のシステムコール削減。キャッシュミス時はブロッキングな canonicalize/metadata/ディスク読込を専用オフロードスレッドプール（完了を eventfd + POLL_ADD で通知）で実行し、io_uring イベントループをブロックしない
 - **静的ファイル本体キャッシュ**（F-146/F-150、既定オフ）: HTTP/2・HTTP/3 の静的配信は DATA フレーム/QUIC ストリームへの再フレーミングが必須で `sendfile(2)` を使えないため、従来はリクエストごとにファイル全体をオフロード経由で読み直していた。kTLS を無効化した HTTP/1.1 のユーザー空間 TLS（rustls）経路も同様に `sendfile(2)` を使えず、リクエストごとに `pread(2)` でファイルを読み直していた（F-150）。FreeBSD の推奨構成は `ktls_enabled = false`（software kTLS はレコード単位ディスパッチのため大きな応答で不利）であり、この経路に該当する。`[static_file_cache]`/`[route.static_file_cache]` で有効化すると、ファイル本体を `bytes::Bytes` としてユーザ空間メモリに保持し、キャッシュヒット時は `DashMap` ルックアップ + `Bytes::clone()`（参照カウント増加。HTTP/1.1 では Range リクエスト向けに `Bytes::slice()` も併用）のみで配信する（syscall・アロケーション・オフロード往復ゼロ）。kTLS 有効時・平文時の HTTP/1.1 は既に sendfile(2)/kTLS ゼロコピー経路を使うため対象外（無変更）
 - **HTTP/2 レスポンスストリーミング**: 非圧縮レスポンスは、バックエンドのボディを全バッファリングせず DATA フレームとして逐次転送する（`Content-Length` 既知・`Transfer-Encoding: chunked` の両方に対応）。chunked ボディは span ベースデコーダでゼロコピーにデコードする（読み取りバッファのサブスライスを使い中間 `Vec` を持たない）。各 DATA フレームは HTTP/2 フロー制御（コネクション/ストリームウィンドウ + `WINDOW_UPDATE`）に従うため、クライアントの受信速度に応じたバックプレッシャが効き、RSS がペイロードサイズに比例しない（大容量ダウンロードの OOM 耐性）
@@ -511,7 +511,7 @@ sudo setcap 'cap_net_bind_service=+ep' ./target/release/veil
 | `[logging]` | `flush_interval_ms` | `1000` | フラッシュ間隔（ミリ秒） |
 | `[prometheus]` | `enabled` | `false` | Prometheusメトリクスを有効化 |
 | `[prometheus]` | `path` | `"/__metrics"` | メトリクスエンドポイントパス |
-| `[performance]` | `reuseport_balancing` | `"cbpf"` | SO_REUSEPORT振り分け方式 |
+| `[performance]` | `reuseport_balancing` | `"kernel"` | SO_REUSEPORT振り分け方式 |
 | `[performance]` | `huge_pages_enabled` | `false` | Huge Pagesを有効化 |
 | `[performance]` | `open_file_cache_enabled` | `false` | OpenFileCacheを有効化 |
 | `[performance]` | `open_file_cache_valid_duration_secs` | `60` | キャッシュ有効期間（秒） |
@@ -639,8 +639,9 @@ landlock_write_paths = ["/var/log/veil"]
 
 [performance]
 # SO_REUSEPORT の振り分け方式
-# "kernel" = カーネルデフォルト（3元タプルハッシュ）
-# "cbpf"   = クライアントIPベースのCBPF（キャッシュ効率向上、Linux 4.6+必須）
+# "kernel" = カーネルデフォルト（3元タプルハッシュ）【既定】
+# "cbpf"   = フローハッシュ（4タプル）ベースのCBPF（同一接続を固定ワーカーへ振り分け、
+#            キャッシュ・セッション再利用効率向上、Linux 4.6+必須）
 reuseport_balancing = "cbpf"
 
 # Huge Pages (Large OS Pages) の使用
@@ -3603,23 +3604,30 @@ threads = 0  # 未指定または0の場合はCPUコア数と同じ
 
 #### 概要
 
-SO_REUSEPORTを使用して複数のワーカースレッドが同一ポートをリッスンする際、デフォルトではLinuxカーネルが3元タプルハッシュ（protocol + source IP + source port）で接続を振り分けます。CBPFモードでは、クライアントIPアドレスのみに基づいてワーカーを選択するカスタムBPFプログラムをカーネルにアタッチします。
+SO_REUSEPORTを使用して複数のワーカースレッドが同一ポートをリッスンする際、デフォルトではLinuxカーネルが3元タプルハッシュ（protocol + source IP + source port）で接続を振り分けます。CBPFモードでは、フローハッシュ（`skb->hash`。送信元/宛先IP・ポートの4タプルから計算）に基づいてワーカーを選択するカスタムBPFプログラムをカーネルにアタッチします（ハッシュが未計算の場合は受信CPU番号にフォールバック）。多数のクライアントからの接続を固定ワーカーへ振り分けたい場合の選択肢であり、既定は `kernel` のままです。
 
 #### 効果
 
 | 項目 | Kernel（デフォルト） | CBPF |
 |------|---------------------|------|
-| 振り分けキー | protocol + src IP + src port | src IP のみ |
-| 同一クライアント | source portで変動 | 常に同じワーカー |
-| CPUキャッシュ効率 | 中 | 高（L1/L2ヒット率向上） |
-| TLSセッション再開 | 低〜中 | 高（セッションキャッシュ活用） |
+| 振り分けキー | protocol + src IP + src port | フローハッシュ（4タプル）。未計算時は受信CPUへフォールバック |
+| 同一接続 | 接続中は固定 | 常に同じワーカー |
+| CPUキャッシュ効率 | 中 | 同等（どちらも接続を 1 ワーカーへ固定する） |
+| TLSセッション再開 | 中 | 同等 |
+
+> **注記（B-76）**: カーネル既定も 4 タプルをハッシュするため、実際には `"cbpf"` は
+> `"kernel"` とほぼ同じ挙動になる。本モードの意義は「振り分けポリシーを自前の
+> プログラムとして持てること」と「`skb->hash` が使えない場合に受信 CPU へ
+> フォールバックできること」にある。**B-76 以前の本モードは壊れており、
+> プログラムが常に 0 を返していたため全接続がワーカー 0 に固定され、
+> マルチワーカーの並列性が完全に失われていた。**
 
 #### 設定
 
 ```toml
 [performance]
-# "kernel" = カーネルデフォルト（後方互換性）
-# "cbpf"   = クライアントIPベースのCBPF（推奨）
+# "kernel" = カーネルデフォルト【既定】
+# "cbpf"   = フローハッシュ（4タプル）ベースのCBPF（同一接続を固定ワーカーへ振り分け）
 reuseport_balancing = "cbpf"
 ```
 

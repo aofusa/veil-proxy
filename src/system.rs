@@ -563,33 +563,71 @@ pub(crate) fn secure_clear_arc_vec(arc: &mut Arc<Vec<u8>>, name: &str) {
 pub(crate) static CBPF_ATTACHED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// クライアントIPハッシュに基づく振り分けCBPFプログラムを生成
+// classic BPF の "ancillary load"（拡張オフセット）関連定数。
+// libc クレートには定義が無いため、Linux の
+// include/uapi/linux/filter.h / net/core/filter.c (bpf_common.h) の値をそのまま持ち込む。
+//
+// `SO_ATTACH_REUSEPORT_CBPF` が受け取るのは **classic BPF**（`BPF_PROG_TYPE_SOCKET_FILTER`
+// と同じ命令セット）であり、eBPF の `BPF_PROG_TYPE_SK_REUSEPORT` が使う
+// `sk_reuseport_md`（オフセットでフィールドを読む構造体）とは全くの別物。
+// 「`SKF_AD_OFF` 以降の絶対オフセットへの `BPF_LD | BPF_ABS` ロード」は
+// カーネルが特別扱いする ancillary データへのアクセスであり、これを使わずに
+// `LD A, [0]` のような素のオフセットで読むと、実行前に
+// `run_bpf_filter`（net/core/sock_reuseport.c）が `pskb_pull(skb, hdr_len)` で
+// データポインタをトランスポートヘッダの先（＝ TCP ペイロード）まで進めているため、
+// リスナー選択が走る SYN パケット（ペイロード無し）では常に範囲外ロードとなり、
+// classic BPF の仕様どおりプログラムが打ち切られて 0 が返る
+// （＝ 全接続がワーカー 0 に固定される。B-76）。
+/// ancillary データ用の絶対オフセットの基点
+const SKF_AD_OFF: i32 = -0x1000;
+/// skb->hash（フロー 4 タプルの受信ハッシュ）を読むための ancillary オフセット
+const SKF_AD_RXHASH: u32 = 32;
+/// パケットを受信した CPU 番号を読むための ancillary オフセット
+const SKF_AD_CPU: u32 = 36;
+
+/// フローハッシュに基づく振り分けCBPFプログラムを生成
 ///
 /// このBPFプログラムは、accept()時に呼び出され、
-/// クライアントのソースIPアドレスをハッシュしてワーカーインデックスを返す
+/// `skb->hash`（送信元/宛先 IP・ポートから計算されるフロー 4 タプルハッシュ）を
+/// ワーカー数で割った余りをソケットインデックスとして返す。
+/// 同一 TCP 接続（＝同一フロー）は常に同じ値になるため、常に同じワーカーへ
+/// 振り分けられる（CPU キャッシュ効率・TLS セッション再開効率のための性質を維持）。
+///
+/// `skb->hash` が未計算（0）の場合は、受信 CPU 番号 (`SKF_AD_CPU`) にフォールバックする。
 ///
 /// # 引数
-/// * `num_workers` - ワーカースレッド数
+/// * `num_workers` - ワーカースレッド数（0 は `1` として扱う）
 ///
 /// # 戻り値
 /// BPF命令列（sock_filter配列）
 #[cfg(target_os = "linux")]
 pub(crate) fn create_reuseport_cbpf_program(num_workers: u32) -> Vec<libc::sock_filter> {
-    // BPF命令セット:
-    // 1. ソースIPアドレスを取得（sk_reuseport_mdからオフセット0でソースIPを読み取り）
-    // 2. ワーカー数でmod演算
-    // 3. 結果をソケットインデックスとして返す
-    //
-    // BPF_LD + BPF_W + BPF_ABS: 32ビットワードをパケットから絶対オフセットで読み込み
-    // BPF_ALU + BPF_MOD + BPF_K: 即値でmod演算
-    // BPF_RET + BPF_A: Aレジスタの値を返す
+    // 0 除算を避けるため、num_workers は最低 1 として扱う（呼び出し側では
+    // ワーカー数 0 は発生しないはずだが、ここでも防御的にガードする）。
+    let num_workers = num_workers.max(1);
+
     vec![
-        // LD A, [0]: ソースIPアドレスを読み込み（sk_reuseport_md構造体のオフセット0）
+        // LD A, [SKF_AD_OFF + SKF_AD_RXHASH]: skb->hash（フロー4タプルハッシュ）を読み込み
         libc::sock_filter {
             code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
             jt: 0,
             jf: 0,
-            k: 0, // remote_ip4 のオフセット
+            k: (SKF_AD_OFF + SKF_AD_RXHASH as i32) as u32,
+        },
+        // JEQ A, #0: hash が 0（未計算）なら次の CPU フォールバック命令へ進み（jt=0）、
+        // 非 0 ならフォールバック命令を 1 個読み飛ばす（jf=1）
+        libc::sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 1,
+            k: 0,
+        },
+        // LD A, [SKF_AD_OFF + SKF_AD_CPU]: 受信CPU番号にフォールバック
+        libc::sock_filter {
+            code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+            jt: 0,
+            jf: 0,
+            k: (SKF_AD_OFF + SKF_AD_CPU as i32) as u32,
         },
         // ALU MOD #num_workers: A = A % num_workers
         libc::sock_filter {
@@ -610,7 +648,7 @@ pub(crate) fn create_reuseport_cbpf_program(num_workers: u32) -> Vec<libc::sock_
 
 /// CBPFプログラムをソケットにアタッチする
 ///
-/// SO_ATTACH_REUSEPORT_CBPF を使用して、クライアントIPベースの
+/// SO_ATTACH_REUSEPORT_CBPF を使用して、フローハッシュ（skb->hash、4タプル）ベースの
 /// 振り分けロジックをカーネルに設定する
 ///
 /// # 引数
@@ -696,5 +734,192 @@ mod tests {
             "soft limit must not decrease"
         );
         assert!(after.rlim_cur <= after.rlim_max);
+    }
+
+    /// create_reuseport_cbpf_program が B-76 で定めた 5 命令
+    /// （RXHASH ロード→0判定分岐→CPUフォールバック→MOD→RET）を生成することを確認する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_create_reuseport_cbpf_program_instructions() {
+        let program = create_reuseport_cbpf_program(4);
+        assert_eq!(program.len(), 5);
+
+        // 命令0: LD A, [SKF_AD_OFF + SKF_AD_RXHASH]
+        assert_eq!(
+            program[0].code,
+            (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16
+        );
+        assert_eq!(program[0].k, (SKF_AD_OFF + SKF_AD_RXHASH as i32) as u32);
+
+        // 命令1: JEQ A, #0 (jt=0: hashが0ならCPUフォールバックへ, jf=1: 非0なら1個飛ばす)
+        assert_eq!(
+            program[1].code,
+            (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16
+        );
+        assert_eq!(program[1].k, 0);
+        assert_eq!(program[1].jt, 0);
+        assert_eq!(program[1].jf, 1);
+
+        // 命令2: LD A, [SKF_AD_OFF + SKF_AD_CPU]
+        assert_eq!(
+            program[2].code,
+            (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16
+        );
+        assert_eq!(program[2].k, (SKF_AD_OFF + SKF_AD_CPU as i32) as u32);
+
+        // 命令3: ALU MOD #num_workers
+        assert_eq!(
+            program[3].code,
+            (libc::BPF_ALU | libc::BPF_MOD | libc::BPF_K) as u16
+        );
+        assert_eq!(program[3].k, 4);
+
+        // 命令4: RET A
+        assert_eq!(program[4].code, (libc::BPF_RET | libc::BPF_A) as u16);
+    }
+
+    /// num_workers == 0 は max(1) でガードされ、0除算にならないこと。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_create_reuseport_cbpf_program_guards_zero_workers() {
+        let program = create_reuseport_cbpf_program(0);
+        assert_eq!(program[3].k, 1);
+    }
+
+    /// B-76 再発防止: 実際に SO_REUSEPORT リスナー4本へ200接続を流し、
+    /// 受理したリスナーの分布が1本（例えばワーカー0）に100%偏らないことを検証する。
+    /// カーネルが SO_ATTACH_REUSEPORT_CBPF を拒否する環境（コンテナの制限等）では
+    /// アタッチが Err になるため、その場合はテストをスキップする。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_reuseport_cbpf_accept_distribution_not_pinned_to_one_worker() {
+        use std::net::{TcpListener as StdTcpListener, TcpStream};
+        use std::os::unix::io::{AsRawFd, FromRawFd};
+
+        const NUM_LISTENERS: usize = 4;
+        const NUM_CONNECTIONS: usize = 200;
+
+        // 依存を増やさないため、libc を直接叩いて SO_REUSEADDR + SO_REUSEPORT 付きの
+        // リスナーを作る（`port == 0` を渡すとカーネルが空きポートを割り当てる）。
+        fn make_reuseport_listener(port: u16) -> io::Result<StdTcpListener> {
+            // SAFETY: 生成した fd はエラー時に確実に close し、成功時のみ所有権を
+            // StdTcpListener へ渡す（二重解放・リーク無し）。
+            unsafe {
+                let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+                if fd < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+
+                let optval: libc::c_int = 1;
+                let opt_size = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+                if libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_REUSEADDR,
+                    &optval as *const _ as *const libc::c_void,
+                    opt_size,
+                ) < 0
+                    || libc::setsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_REUSEPORT,
+                        &optval as *const _ as *const libc::c_void,
+                        opt_size,
+                    ) < 0
+                {
+                    let e = io::Error::last_os_error();
+                    libc::close(fd);
+                    return Err(e);
+                }
+
+                let mut sin: libc::sockaddr_in = std::mem::zeroed();
+                sin.sin_family = libc::AF_INET as libc::sa_family_t;
+                sin.sin_port = port.to_be();
+                sin.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
+                let ret = libc::bind(
+                    fd,
+                    &sin as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                );
+                if ret < 0 {
+                    let e = io::Error::last_os_error();
+                    libc::close(fd);
+                    return Err(e);
+                }
+
+                if libc::listen(fd, 1024) < 0 {
+                    let e = io::Error::last_os_error();
+                    libc::close(fd);
+                    return Err(e);
+                }
+
+                let listener = StdTcpListener::from_raw_fd(fd);
+                listener.set_nonblocking(true)?;
+                Ok(listener)
+            }
+        }
+
+        // 1本目を port 0 で bind し、実際に割り当てられたポートを残り3本で共有する。
+        let first = match make_reuseport_listener(0) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("skip: failed to create first SO_REUSEPORT listener: {e}");
+                return;
+            }
+        };
+        let addr = first.local_addr().expect("local_addr");
+
+        let mut listeners = vec![first];
+        for _ in 1..NUM_LISTENERS {
+            match make_reuseport_listener(addr.port()) {
+                Ok(l) => listeners.push(l),
+                Err(e) => {
+                    eprintln!("skip: failed to create additional SO_REUSEPORT listener: {e}");
+                    return;
+                }
+            }
+        }
+
+        // 1本目にCBPFプログラムをアタッチする。
+        if let Err(e) = attach_reuseport_cbpf(listeners[0].as_raw_fd(), NUM_LISTENERS) {
+            eprintln!("skip: SO_ATTACH_REUSEPORT_CBPF not available in this environment: {e}");
+            return;
+        }
+
+        // クライアント200本を接続する（サーバ側は非ブロッキングでaccept試行するのみ）。
+        let mut clients = Vec::with_capacity(NUM_CONNECTIONS);
+        for _ in 0..NUM_CONNECTIONS {
+            match TcpStream::connect(addr) {
+                Ok(s) => clients.push(s),
+                Err(e) => panic!("failed to connect to {addr}: {e}"),
+            }
+        }
+
+        // カーネルがバックログを処理する時間を与えつつ、各リスナーのaccept数を数える。
+        let mut counts = [0usize; NUM_LISTENERS];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut accepted = 0usize;
+        while accepted < NUM_CONNECTIONS && std::time::Instant::now() < deadline {
+            for (i, l) in listeners.iter().enumerate() {
+                while let Ok((_stream, _)) = l.accept() {
+                    counts[i] += 1;
+                    accepted += 1;
+                }
+            }
+            if accepted < NUM_CONNECTIONS {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+
+        drop(clients);
+
+        let total: usize = counts.iter().sum();
+        assert!(total > 0, "no connections were accepted at all");
+
+        let max_share = counts.iter().copied().max().unwrap_or(0) as f64 / total as f64;
+        assert!(
+            max_share < 0.90,
+            "accept distribution is pinned to one listener: {counts:?} (max share {max_share:.2})"
+        );
     }
 }

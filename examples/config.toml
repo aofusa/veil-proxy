@@ -350,8 +350,9 @@ ktls_fallback_enabled = true
 [performance]
 
 # SO_REUSEPORT の振り分け方式
-# "kernel" = カーネルデフォルト（3元タプルハッシュ）
-# "cbpf"   = クライアントIPベースのCBPF（キャッシュ効率向上、Linux 4.6+必須）
+# "kernel" = カーネルデフォルト（3元タプルハッシュ）【既定】
+# "cbpf"   = フローハッシュ（4タプル）ベースのCBPF。同一接続を固定ワーカーへ振り分けたい
+#            場合の選択肢（キャッシュ・セッション再利用効率向上、Linux 4.6+必須）
 reuseport_balancing = "cbpf"
 
 # Huge Pages (Large OS Pages) の使用

@@ -3694,7 +3694,7 @@ fn default_tcp_cork() -> bool {
 pub struct PerformanceConfigSection {
     /// SO_REUSEPORTの振り分け方式
     /// - "kernel": カーネルデフォルト（3元タプルハッシュ）
-    /// - "cbpf": クライアントIPベースのCBPF振り分け（Linux 4.6+必須）
+    /// - "cbpf": フローハッシュ（4タプル）ベースのCBPF振り分け（Linux 4.6+必須）
     #[serde(default)]
     pub reuseport_balancing: ReuseportBalancing,
     /// Huge Pages (Large OS Pages) の使用
@@ -3847,9 +3847,10 @@ pub enum ReuseportBalancing {
     /// カーネルデフォルト（3元タプルハッシュ: protocol + source IP + source port）
     #[default]
     Kernel,
-    /// クライアントIPベースのCBPF振り分け
-    /// 同一クライアントIPからの接続を常に同じワーカースレッドに振り分け
-    /// CPUキャッシュ効率とセッション再開効率を向上
+    /// フローハッシュ（skb->hash、4タプル: 送信元/宛先IP・ポート）ベースのCBPF振り分け
+    /// 同一TCP接続（同一フロー）からの接続を常に同じワーカースレッドに振り分け、
+    /// CPUキャッシュ効率とセッション再開効率を向上させる。
+    /// skb->hash が未計算（0）の場合は受信CPU番号にフォールバックする（B-76）。
     Cbpf,
 }
 
