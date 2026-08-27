@@ -50,6 +50,22 @@ docker run --rm \
     bash -c "
         set -euo pipefail
         rustup component add llvm-tools-preview rust-src 2>/dev/null || true
+        # aws-lc-sys は sanitizer 用 RUSTFLAGS が付くと事前生成バインディングではなく
+        # cmake ビルダ経路を選ぶため、cmake が無いと
+        #   Missing dependency: cmake -> Required build dependency is missing. Halting build.
+        # でビルドごと落ちる（rustlang/rust イメージには cmake が入っていない）。
+        # コード側の不具合ではなくコンテナのツール不足なので、ここで補う。
+        # cmake だけでなく bindgen 用の libclang も要る（次段で
+        #   Unable to find libclang ... set the LIBCLANG_PATH environment variable
+        # として落ちる）。
+        # 注意: この文字列はホスト側の二重引用符の中なので、コンテナ内で評価させたい
+        # 変数展開・コマンド置換は必ず \$ でエスケープする（既存の \${tdir} と同じ）。
+        if ! command -v cmake >/dev/null 2>&1 || [ -z \"\$(ls /usr/lib/llvm-*/lib/libclang.so* 2>/dev/null)\" ]; then
+            apt-get update -qq && apt-get install -y -qq --no-install-recommends cmake clang libclang-dev >/dev/null
+        fi
+        if [ -z \"\${LIBCLANG_PATH:-}\" ]; then
+            export LIBCLANG_PATH=\$(dirname \$(ls /usr/lib/llvm-*/lib/libclang.so* 2>/dev/null | head -1))
+        fi
         cargo install cargo-fuzz --locked 2>/dev/null
         cd fuzz
         for target in ${FUZZ_TARGETS}; do
