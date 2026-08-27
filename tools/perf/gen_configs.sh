@@ -796,5 +796,26 @@ gen_route_ofc() {
     gen_route proxy perf-backend "/" none 0 '"HEAD", "GET"'
 } | emit_cfg "$OUT/h2c_proxy.toml"
 
+# 静的配信 + 圧縮の「推奨構成」版（F-169）。
+# `h2_1_feat_compression` / `h3_file_compression` は静的キャッシュを有効にしていない
+# ため、F-169 の圧縮結果キャッシュ（`cache::compressed`）は **一切効かない**
+# （有効化条件が `static_file_cache` のため）。上の F-157 の注記どおり、HTTP/2・HTTP/3 の
+# 静的配信は 2 つのキャッシュをセットで有効にするのが推奨構成であり、その構成での
+# 圧縮スループットを測るために専用バリアントを分けて用意する。
+# 既存の 2 構成は履歴比較のためそのまま残す（キャッシュ無効時の圧縮コストを測る）。
+{
+    gen_srv_head 1
+    gen_static_cache
+    gen_route file "" "/" compression 0 '"HEAD", "GET"'
+    gen_route_ofc
+} | emit_cfg "$OUT/h2_1_feat_compression_cached.toml"
+
+{
+    gen_srv_head 1
+    gen_static_cache
+    gen_route file "" "/" compression 0 '"HEAD", "GET"'
+    gen_route_ofc
+} | emit_cfg "$OUT/h3_file_compression_cached.toml"
+
 count=$(find "$OUT" -maxdepth 1 -name '*.toml' ! -name '_debug*.toml' | wc -l)
 echo "生成完了: ${count} バリアント -> $OUT"
