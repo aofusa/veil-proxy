@@ -30,7 +30,7 @@ docker run --rm \
         if ! command -v cargo-deny >/dev/null 2>&1; then
             cargo install cargo-deny --locked --quiet
         fi
-        timeout 300 cargo deny check advisories licenses --color never 2>&1 \
+        timeout 300 cargo deny --color never check advisories licenses 2>&1 \
             | tee /results/cargo_deny_report.txt
         echo "cargo_deny: ok"
     '
