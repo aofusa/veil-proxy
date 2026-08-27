@@ -45,10 +45,10 @@
 //! ハンドシェイクの間だけ gRPC 実行スレッドが止まる（他の呼び出しの進行がその間だけ遅れる）。
 //! データプレーンには一切影響しない。
 
+use crate::runtime::handle::{AsRawFd, RawFd};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -852,12 +852,8 @@ impl GrpcRunner {
             .insert((active.module_name.clone(), call_id), active);
     }
 
-    /// アクティブな全呼び出しを 1 ステップ進める。poll(2) で
+    /// アクティブな全呼び出しを 1 ステップ進める。poll(2)/WSAPoll で
     /// 「いずれかのソケットが読み書き可能 or 最短デッドライン」まで待つ。
-    ///
-    /// 理由付き allow: 専用 gRPC 実行スレッド（データプレーンとは別スレッド）上の
-    /// ブロッキング `poll(2)` 待機。io_uring イベントループには一切関与しない。
-    #[allow(clippy::disallowed_methods)]
     pub fn poll_all(&mut self) -> Vec<GrpcEvent> {
         if self.active.is_empty() {
             return Vec::new();
@@ -866,7 +862,7 @@ impl GrpcRunner {
         let now = Instant::now();
         // 上限（デッドライン監視・シャットダウン検知の保険）。
         let mut timeout_ms: i32 = 1000;
-        let mut pollfds: Vec<libc::pollfd> = Vec::with_capacity(self.active.len());
+        let mut entries: Vec<(RawFd, bool)> = Vec::with_capacity(self.active.len());
         let mut keys: Vec<(String, u32)> = Vec::with_capacity(self.active.len());
         for (key, call) in self.active.iter() {
             let remaining_ms = call
@@ -876,25 +872,11 @@ impl GrpcRunner {
                 .unwrap_or(0);
             timeout_ms = timeout_ms.min(remaining_ms);
 
-            let mut ev = libc::POLLIN;
-            if call.has_pending_write() {
-                ev |= libc::POLLOUT;
-            }
-            pollfds.push(libc::pollfd {
-                fd: call.raw_fd(),
-                events: ev,
-                revents: 0,
-            });
+            entries.push((call.raw_fd(), call.has_pending_write()));
             keys.push(key.clone());
         }
 
-        unsafe {
-            libc::poll(
-                pollfds.as_mut_ptr(),
-                pollfds.len() as libc::nfds_t,
-                timeout_ms.max(0),
-            );
-        }
+        wait_sockets(&entries, timeout_ms.max(0));
 
         let mut events = Vec::new();
         for key in &keys {
@@ -918,6 +900,74 @@ impl GrpcRunner {
         self.pool.sweep_idle();
 
         events
+    }
+}
+
+/// 監視したい `(ハンドル, 書き込み可否も待つか)` の一覧を受け取り、いずれかが読み書き
+/// 可能になるか `timeout_ms` 経過するまでブロックする。戻り値は使わない（呼び出し元は
+/// 全 call を無条件に `poll_once` する既存挙動を維持するため、発火した fd を選別しない）。
+///
+/// 理由付き allow: 専用 gRPC 実行スレッド（データプレーンとは別スレッド）上の
+/// ブロッキング `poll(2)`/`WSAPoll` 待機。io_uring イベントループには一切関与しない。
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)]
+fn wait_sockets(entries: &[(RawFd, bool)], timeout_ms: i32) {
+    let mut pollfds: Vec<libc::pollfd> = entries
+        .iter()
+        .map(|(fd, want_write)| {
+            let mut ev = libc::POLLIN;
+            if *want_write {
+                ev |= libc::POLLOUT;
+            }
+            libc::pollfd {
+                fd: *fd,
+                events: ev,
+                revents: 0,
+            }
+        })
+        .collect();
+
+    unsafe {
+        libc::poll(
+            pollfds.as_mut_ptr(),
+            pollfds.len() as libc::nfds_t,
+            timeout_ms,
+        );
+    }
+}
+
+/// 監視したい `(ハンドル, 書き込み可否も待つか)` の一覧を受け取り、いずれかが読み書き
+/// 可能になるか `timeout_ms` 経過するまでブロックする（Windows: `WSAPoll` 版）。
+///
+/// 理由付き allow: 専用 gRPC 実行スレッド（データプレーンとは別スレッド）上の
+/// ブロッキング `WSAPoll` 待機。io_uring イベントループには一切関与しない。
+#[cfg(windows)]
+#[allow(clippy::disallowed_methods)]
+fn wait_sockets(entries: &[(RawFd, bool)], timeout_ms: i32) {
+    use crate::runtime::handle::win;
+    use windows_sys::Win32::Networking::WinSock::{WSAPoll, POLLRDNORM, POLLWRNORM, WSAPOLLFD};
+
+    if entries.is_empty() {
+        return;
+    }
+
+    let mut fds: Vec<WSAPOLLFD> = entries
+        .iter()
+        .map(|(fd, want_write)| {
+            let mut events: i16 = POLLRDNORM as i16;
+            if *want_write {
+                events |= POLLWRNORM as i16;
+            }
+            WSAPOLLFD {
+                fd: win::to_socket(*fd),
+                events,
+                revents: 0,
+            }
+        })
+        .collect();
+
+    unsafe {
+        WSAPoll(fds.as_mut_ptr(), fds.len() as u32, timeout_ms);
     }
 }
 

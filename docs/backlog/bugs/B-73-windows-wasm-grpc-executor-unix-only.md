@@ -48,3 +48,27 @@ F-139（WASM の gRPC 呼び出しを専用スレッドで駆動する）で追�
 **再発防止**: B-69 の再発なので、リリース前チェックリストに
 「`build-cross.sh --target windows` と `--target macos` を通す」ことを明記する
 （AGENTS.md のディレクトリ表・作業フローに追記済み）。
+
+## 対応（2026-08-27、完了）
+
+**改修案 1 を採用**（Windows 実装を足す。「未サポートを返す」案は採らない）。
+
+- `src/wasm/host/grpc_executor.rs` の `use std::os::unix::io::{AsRawFd, RawFd}` を、
+  既存のクロスプラットフォーム抽象 `crate::runtime::handle::{AsRawFd, RawFd}` へ差し替え。
+  Windows では `AsRawSocket` に対する blanket impl 経由で `std::net::TcpStream` に
+  `as_raw_fd()` が生えるため、`ActiveCall::raw_fd()` は無変更で通る。
+- `GrpcRunner::poll_all()` 内にインライン展開されていた `libc::poll` 呼び出しを
+  `wait_sockets(&[(RawFd, bool)], timeout_ms)` ヘルパーへ切り出し、
+  `#[cfg(unix)]`（`libc::poll`）と `#[cfg(windows)]`（`windows_sys` の `WSAPoll`。
+  `RawFd`→`SOCKET` 変換は `runtime::handle::win::to_socket`）の 2 実装に分けた。
+  呼び出し側のロジック（`timeout_ms` の算出・poll 後に全 call を `poll_once` する流れ・
+  `done_keys` の回収）は無変更。ブロッキング待機である旨の理由付き
+  `#[allow(clippy::disallowed_methods)]` は両ヘルパーへ引き継いだ。
+
+### 検証
+
+- `packaging/scripts/build-cross.sh --target windows`（`x86_64-pc-windows-msvc`）が
+  **成功**し、`veil-artifact:x86_64-pc-windows-msvc` を再生成できることを確認した
+  （F-139 以降ずっと失敗していた）。
+- Linux 非退行: `cargo fmt --check` クリーン / `cargo clippy --lib --features full -- -D warnings`
+  警告 0 / 単体 948・統合 54・E2E 544 すべて pass。
