@@ -70,3 +70,37 @@ clippy・単体 955・統合 54・E2E 544 すべて pass することを確認�
 
 wasmtime 47.x へのアップグレードと `third_party/wasmtime` の再 vendoring を
 独立タスクとして実施する。実施までは本チケットが既知の未対応事項として残る。
+
+## 追記（2026-08-27）: cargo-deny 側の 2 段の不具合と、追加で解消した勧告
+
+`cargo deny` は**引数順の誤り（B-79 コミットで修正済み）を直したあとに、さらに
+設定ファイル自体がデシリアライズできず落ちていた**。
+
+```
+error[unexpected-value]: expected '["all", "workspace", "transitive", "none"]'
+7 │ unmaintained = "warn"
+```
+
+cargo-deny 0.18 以降、`[advisories] unmaintained` は**重大度ではなく対象範囲**を取る。
+つまり cargo-deny は **2 重に動いていなかった**（引数で即死 → 直しても設定で即死）。
+`unmaintained = "workspace"` に変更し、`notice`（advisories version 2 で廃止）を削除した。
+
+動くようになった結果、さらに 3 件の実問題が表面化した。
+
+| 種別 | 内容 | 対応 |
+|---|---|---|
+| ライセンス拒否 | `xxhash-rust` 0.8.15 = **BSL-1.0**（OSI 承認・FSF Free/Libre のパーミッシブ） | `deny.toml` の allow に追加 |
+| ライセンス拒否 | `webpki-roots` 1.0.8 = **CDLA-Permissive-2.0**（Mozilla CA バンドルのデータ向けパーミッシブ） | 同上 |
+| 脆弱性（dev 依存） | `h2` 0.4.15 / `quinn-proto` 0.11.14 | `h2` 0.4.19 / `quinn-proto` 0.11.17 へ更新 |
+
+`cargo deny check advisories licenses` は **advisories ok, licenses ok** になった。
+
+`cargo audit` は 16 → **13 件**に減り、**残りはすべて wasmtime 40.0.4 と
+その間接依存（bitmaps / im-rc / sized-chunks）**である。
+
+### cargo_audit フェーズは意図的に failed のままにしている
+
+残る 13 件は本チケット（wasmtime 47.x アップグレード）でしか解消できない。
+**`ignore` で抑制していない**のは、適用対象である RUSTSEC-2026-0096（critical 9.0）と
+RUSTSEC-2026-0088 を隠すことになるためである。**このフェーズが赤いことは、
+未対応の実問題が存在するという正しい状態を表している。**

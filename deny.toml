@@ -4,8 +4,17 @@
 version = 2
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "warn"
-unmaintained = "warn"
-notice = "warn"
+# cargo-deny 0.18 以降、`unmaintained` は重大度（"warn" 等）ではなく
+# **対象範囲**（"all" | "workspace" | "transitive" | "none"）を取る。
+# 旧来の `unmaintained = "warn"` は
+#   error[unexpected-value]: expected '["all", "workspace", "transitive", "none"]'
+# で設定のデシリアライズごと失敗し、cargo-deny が一度も動かなくなる。
+#
+# "workspace" にしているのは、veil が直接依存するクレートの unmaintained 化は
+# 検出したい一方、間接依存（現状 wasmtime -> wasm-compose -> im-rc/sized-chunks/bitmaps）は
+# 上流の更新でしか解消できず、B-79（wasmtime 47.x へのアップグレード）で追跡しているため。
+unmaintained = "workspace"
+# `notice` は advisories 設定 version 2 で廃止された（重大度の個別指定は不可）。
 
 [licenses]
 version = 2
@@ -21,6 +30,10 @@ allow = [
     "0BSD",
     "CC0-1.0",
     "MPL-2.0",
+    # xxhash-rust。OSI 承認・FSF Free/Libre のパーミッシブライセンス。
+    "BSL-1.0",
+    # webpki-roots（Mozilla の CA バンドル）。データ向けのパーミッシブライセンス。
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 
