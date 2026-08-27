@@ -4557,6 +4557,55 @@ async fn lingering_drain_before_close(stream: &mut ServerTls) {
     }
 }
 
+/// `add_request_headers` の値テンプレートを 1 パスで展開して `out` へ追記する（F-168 P4）。
+///
+/// 対応するプレースホルダは `$client_ip` / `$host` / `$request_uri` の 3 つ。
+/// プレースホルダを含まない値（大半のケース）は `memchr` で `$` が 1 つも見つからず、
+/// スライスをそのまま追記するだけで中間 `String` を作らない。認識できない `$` は
+/// そのまま出力へ残す。
+///
+/// **`String::replace` の 3 連鎖との差異**: 旧実装は `$client_ip` → `$host` →
+/// `$request_uri` の順に置換していたため、**先に埋め込まれた値の中に後続の
+/// プレースホルダ文字列が含まれていると、それも置換されてしまう**
+/// （例: クライアント IP が `$host` を含む文字列だった場合）。本関数は入力を
+/// 1 回走査するだけなので、展開結果に対する再置換は起こらない。こちらが正しい挙動。
+fn expand_request_header_value(
+    template: &str,
+    client_ip: &str,
+    host: &str,
+    request_uri: &str,
+    out: &mut Vec<u8>,
+) {
+    let bytes = template.as_bytes();
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let rest = &bytes[pos..];
+        let Some(dollar) = memchr::memchr(b'$', rest) else {
+            out.extend_from_slice(rest);
+            return;
+        };
+        out.extend_from_slice(&rest[..dollar]);
+        pos += dollar;
+        let tail = &bytes[pos..];
+        // 長い名前から順に照合する（`$host` が `$hostname` の接頭辞になるような
+        // 取り違えは無いが、将来プレースホルダを増やしたときのために順序を固定する）。
+        if tail.starts_with(b"$request_uri") {
+            out.extend_from_slice(request_uri.as_bytes());
+            pos += b"$request_uri".len();
+        } else if tail.starts_with(b"$client_ip") {
+            out.extend_from_slice(client_ip.as_bytes());
+            pos += b"$client_ip".len();
+        } else if tail.starts_with(b"$host") {
+            out.extend_from_slice(host.as_bytes());
+            pos += b"$host".len();
+        } else {
+            // 認識できないプレースホルダ（末尾の裸の `$` を含む）はそのまま残す。
+            out.push(b'$');
+            pos += 1;
+        }
+    }
+}
+
 /// `haystack` 内の部分スライス `needle` の (開始オフセット, 長さ) を求める。
 ///
 /// `needle` は必ず `haystack` の内部を指している（借用元が同一である）ことを前提とする。
@@ -6881,29 +6930,35 @@ async fn handle_proxy(
 
     // 設定で追加が指定されているヘッダーを追加
     // 特殊変数の置換: $client_ip, $host, $request_uri
-    for (header_name, header_value) in &security.add_request_headers {
-        // 特殊変数を置換
+    //
+    // F-168 P4: `host_str` の検索はループ不変なので外へ出し、値の展開は
+    // `expand_request_header_value` の 1 パスで再利用バッファへ書き込む
+    // （`String::replace` の 3 連鎖はプレースホルダが無い値でも中間 `String` を
+    // 3 つ確保していた）。
+    if !security.add_request_headers.is_empty() {
         let host_str = headers
             .iter()
             .find(|(n, _)| n.eq_ignore_ascii_case(b"host"))
             .map(|(_, v)| std::str::from_utf8(v).unwrap_or("-"))
             .unwrap_or("-");
 
-        let value_replaced = header_value
-            .replace("$client_ip", client_ip)
-            .replace("$host", host_str)
-            .replace("$request_uri", path_str);
+        let mut scratch = crate::pool::header_value_scratch_get();
+        for (header_name, header_value) in &security.add_request_headers {
+            scratch.clear();
+            expand_request_header_value(header_value, client_ip, host_str, path_str, &mut scratch);
 
-        // Header Injection防止チェック
-        if !is_valid_header_value(value_replaced.as_bytes()) {
-            warn!("Invalid add_request_header value: {}", header_name);
-            continue;
+            // Header Injection防止チェック
+            if !is_valid_header_value(&scratch) {
+                warn!("Invalid add_request_header value: {}", header_name);
+                continue;
+            }
+
+            request.extend_from_slice(header_name.as_bytes());
+            request.extend_from_slice(HEADER_COLON);
+            request.extend_from_slice(&scratch);
+            request.extend_from_slice(HEADER_CRLF);
         }
-
-        request.extend_from_slice(header_name.as_bytes());
-        request.extend_from_slice(HEADER_COLON);
-        request.extend_from_slice(value_replaced.as_bytes());
-        request.extend_from_slice(HEADER_CRLF);
+        crate::pool::header_value_scratch_put(scratch);
     }
 
     // Via ヘッダー追加 (RFC 7230 Section 5.7.1)
@@ -11632,5 +11687,65 @@ mod connect_gate_tests {
                 "the 65th acquirer must resume after a slot is released"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod add_request_header_tests {
+    use super::*;
+
+    /// テスト用ヘルパ: 展開結果を `String` で受け取る。
+    fn expand(template: &str) -> String {
+        let mut out = Vec::new();
+        expand_request_header_value(template, "10.0.0.1", "example.test", "/a/b?q=1", &mut out);
+        String::from_utf8(out).expect("展開結果は UTF-8")
+    }
+
+    #[test]
+    fn f168_p4_no_placeholder_is_passed_through() {
+        assert_eq!(expand("https"), "https");
+        assert_eq!(expand(""), "");
+    }
+
+    #[test]
+    fn f168_p4_each_placeholder_expands() {
+        assert_eq!(expand("$client_ip"), "10.0.0.1");
+        assert_eq!(expand("$host"), "example.test");
+        assert_eq!(expand("$request_uri"), "/a/b?q=1");
+    }
+
+    #[test]
+    fn f168_p4_mixed_and_adjacent_placeholders() {
+        assert_eq!(
+            expand("ip=$client_ip; host=$host; uri=$request_uri"),
+            "ip=10.0.0.1; host=example.test; uri=/a/b?q=1"
+        );
+        // 連続（区切り無し）でも取り違えない
+        assert_eq!(expand("$host$request_uri"), "example.test/a/b?q=1");
+    }
+
+    #[test]
+    fn f168_p4_unknown_placeholder_is_kept() {
+        assert_eq!(expand("$foo"), "$foo");
+        assert_eq!(expand("a$foo$hostb"), "a$fooexample.testb");
+    }
+
+    #[test]
+    fn f168_p4_trailing_dollar_is_kept() {
+        // 末尾が裸の `$` でも境界外アクセスせずそのまま残す
+        assert_eq!(expand("value$"), "value$");
+        assert_eq!(expand("$"), "$");
+        // プレースホルダ名の途中で切れている場合もそのまま
+        assert_eq!(expand("$hos"), "$hos");
+        assert_eq!(expand("$client_i"), "$client_i");
+    }
+
+    #[test]
+    fn f168_p4_expanded_value_is_not_re_replaced() {
+        // 旧実装（String::replace の 3 連鎖）は client_ip の中の "$host" まで
+        // 置換してしまっていた。1 パス展開ではそれが起きないことを固定する。
+        let mut out = Vec::new();
+        expand_request_header_value("$client_ip", "x$host", "H", "/u", &mut out);
+        assert_eq!(String::from_utf8(out).unwrap(), "x$host");
     }
 }

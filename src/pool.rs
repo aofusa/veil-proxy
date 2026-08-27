@@ -496,6 +496,41 @@ thread_local! {
 }
 
 // ====================
+// 追加リクエストヘッダ組み立て用スクラッチプール（F-168 P4）
+// ====================
+//
+// `add_request_headers` の値は `$client_ip` / `$host` / `$request_uri` を展開して
+// バックエンドへ送るリクエストへ積む。展開結果を毎回 `String` で作ると、
+// この設定を有効にしただけでリクエストごとのヒープ確保が増えるため、
+// ここから借りた再利用バッファへ 1 パスで書き込み、使い終わったら返却する。
+// HTTP/1.1 プロキシ経路で使うので http2 feature には依存しない。
+thread_local! {
+    static HEADER_VALUE_SCRATCH_POOL: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// プールに保持するバッファ本数の上限（スレッドごと）。
+/// 1 リクエストにつき 1 本しか借りないため小さくてよい。
+const HEADER_VALUE_SCRATCH_POOL_MAX: usize = 8;
+
+/// 追加リクエストヘッダ値の組み立て用バッファを取得（無ければ新規、空の `Vec`）。
+#[inline]
+pub(crate) fn header_value_scratch_get() -> Vec<u8> {
+    HEADER_VALUE_SCRATCH_POOL.with(|p| p.borrow_mut().pop().unwrap_or_default())
+}
+
+/// 追加リクエストヘッダ値の組み立て用バッファをプールへ返却（クリアしてから積む）。
+#[inline]
+pub(crate) fn header_value_scratch_put(mut buf: Vec<u8>) {
+    buf.clear();
+    HEADER_VALUE_SCRATCH_POOL.with(|p| {
+        let mut pool = p.borrow_mut();
+        if pool.len() < HEADER_VALUE_SCRATCH_POOL_MAX {
+            pool.push(buf);
+        }
+    });
+}
+
+// ====================
 // H2C クライアント送信ホットパス用スクラッチプール（F-166/F-165 A1）
 // ====================
 //
