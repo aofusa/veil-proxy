@@ -89,6 +89,115 @@ impl HostPortStr {
     }
 }
 
+/// `PoolKeyStr` のスタックバッファ容量。
+const POOL_KEY_STACK_CAP: usize = 528;
+
+/// バックエンドコネクションプールのキーをスタックバッファへフォーマットする
+/// （`format!` のヒープ確保排除、F-168 P2）。
+///
+/// ホスト名最大 253 文字、ポート 5 桁、SNI（ホスト名相当、最大 253 文字）、
+/// タグ（"insecure"/"verify"、最大 8 文字）を ':' 区切りで収める 528 バイト固定。
+/// 上限を超える場合のみ（実運用では発生しない）ヒープへフォールバックする。
+// clippy::large_enum_variant 許容理由: Stack バリアントのインライン 528B こそが本型の目的
+// （F-168 P2: リクエストごとのプールキー文字列ヒープ確保をスタック整形で排除）。Box 化すると
+// ホットパスにアロケーションが戻り本末転倒になる。
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum PoolKeyStr {
+    Stack {
+        buf: [u8; POOL_KEY_STACK_CAP],
+        len: u16,
+    },
+    Heap(String),
+}
+
+impl PoolKeyStr {
+    /// 上限を超えない限りスタックへ、超えたらヒープへ ':' 区切りで連結する共通実装。
+    ///
+    /// 全コンストラクタがここを通るので、スタック版とヒープ版で結果がずれない
+    /// （プールキーが 1 バイトでも変わると再利用が静かに止まる）。
+    #[inline]
+    fn join_colon(parts: &[&str]) -> Self {
+        // ':' はパーツ数 - 1 個
+        let need = parts.iter().map(|p| p.len()).sum::<usize>() + parts.len() - 1;
+        if need > POOL_KEY_STACK_CAP {
+            let mut s = String::with_capacity(need);
+            for (i, p) in parts.iter().enumerate() {
+                if i > 0 {
+                    s.push(':');
+                }
+                s.push_str(p);
+            }
+            return PoolKeyStr::Heap(s);
+        }
+        let mut buf = [0u8; POOL_KEY_STACK_CAP];
+        let mut pos = 0usize;
+        for (i, p) in parts.iter().enumerate() {
+            if i > 0 {
+                buf[pos] = b':';
+                pos += 1;
+            }
+            buf[pos..pos + p.len()].copy_from_slice(p.as_bytes());
+            pos += p.len();
+        }
+        PoolKeyStr::Stack {
+            buf,
+            len: pos as u16,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn as_str(&self) -> &str {
+        match self {
+            // SAFETY: 各構成要素（host/sni/addr は &str = UTF-8、port は itoa の ASCII 数字、
+            // tag は固定 ASCII 文字列）を ':' で連結しており UTF-8 境界を保っている。
+            PoolKeyStr::Stack { buf, len } => unsafe {
+                std::str::from_utf8_unchecked(&buf[..*len as usize])
+            },
+            PoolKeyStr::Heap(s) => s.as_str(),
+        }
+    }
+
+    /// `host:port` 形式（SNI なし、平文/HTTP プール用）。
+    #[inline]
+    pub(crate) fn plain(host: &str, port: u16) -> Self {
+        let mut port_buf = itoa::Buffer::new();
+        Self::join_colon(&[host, port_buf.format(port)])
+    }
+
+    /// `host:port:sni:tag` 形式（TLS プール用、`tls_insecure` 設定毎に分離）。
+    #[inline]
+    pub(crate) fn tls(host: &str, port: u16, sni: &str, tls_insecure: bool) -> Self {
+        let mut port_buf = itoa::Buffer::new();
+        Self::join_colon(&[host, port_buf.format(port), sni, insecure_tag(tls_insecure)])
+    }
+
+    /// `host:port:tag` 形式（TLS プール用、SNI なし）。
+    #[inline]
+    pub(crate) fn tls_no_sni(host: &str, port: u16, tls_insecure: bool) -> Self {
+        let mut port_buf = itoa::Buffer::new();
+        Self::join_colon(&[host, port_buf.format(port), insecure_tag(tls_insecure)])
+    }
+
+    /// `addr:sni:tag` 形式（H2 バックエンドプール用、`addr` は既にフォーマット済みの
+    /// `host:port` 文字列）。
+    // `h2_proxy_https`（src/proxy.rs）からのみ使用され、それは http2 feature 限定。
+    #[cfg(feature = "http2")]
+    #[inline]
+    pub(crate) fn addr_sni(addr: &str, sni: &str, tls_insecure: bool) -> Self {
+        Self::join_colon(&[addr, sni, insecure_tag(tls_insecure)])
+    }
+}
+
+/// プールキーの `tls_insecure` タグ（証明書検証設定の異なる接続の再利用を防ぐ、B-30）。
+#[inline]
+fn insecure_tag(tls_insecure: bool) -> &'static str {
+    if tls_insecure {
+        "insecure"
+    } else {
+        "verify"
+    }
+}
+
 /// Via ヘッダーを追加 (RFC 7230 Section 5.7.1)
 ///
 /// プロキシ経由のリクエスト/レスポンスにViaヘッダーを追加します。
@@ -1854,6 +1963,70 @@ mod stack_fmt_tests {
         let hp = HostPortStr::new(&host, 65535);
         assert_eq!(hp.as_str(), format!("{host}:65535"));
         assert!(matches!(hp, HostPortStr::Heap(_)));
+    }
+
+    #[test]
+    fn pool_key_str_plain_matches_format() {
+        let k = PoolKeyStr::plain("backend.example.com", 8080);
+        assert_eq!(k.as_str(), format!("{}:{}", "backend.example.com", 8080));
+        assert!(matches!(k, PoolKeyStr::Stack { .. }));
+    }
+
+    #[test]
+    fn pool_key_str_tls_matches_format() {
+        let k = PoolKeyStr::tls("backend.example.com", 443, "sni.example.com", true);
+        assert_eq!(
+            k.as_str(),
+            format!(
+                "{}:{}:{}:{}",
+                "backend.example.com", 443, "sni.example.com", "insecure"
+            )
+        );
+        assert!(matches!(k, PoolKeyStr::Stack { .. }));
+
+        let k = PoolKeyStr::tls("backend.example.com", 443, "sni.example.com", false);
+        assert_eq!(
+            k.as_str(),
+            format!(
+                "{}:{}:{}:{}",
+                "backend.example.com", 443, "sni.example.com", "verify"
+            )
+        );
+    }
+
+    #[test]
+    fn pool_key_str_tls_no_sni_matches_format() {
+        let k = PoolKeyStr::tls_no_sni("backend.example.com", 443, false);
+        assert_eq!(
+            k.as_str(),
+            format!("{}:{}:{}", "backend.example.com", 443, "verify")
+        );
+        assert!(matches!(k, PoolKeyStr::Stack { .. }));
+    }
+
+    #[test]
+    #[cfg(feature = "http2")]
+    fn pool_key_str_addr_sni_matches_format() {
+        let k = PoolKeyStr::addr_sni("backend.example.com:443", "sni.example.com", true);
+        assert_eq!(
+            k.as_str(),
+            format!(
+                "{}:{}:{}",
+                "backend.example.com:443", "sni.example.com", "insecure"
+            )
+        );
+        assert!(matches!(k, PoolKeyStr::Stack { .. }));
+    }
+
+    #[test]
+    fn pool_key_str_heap_fallback_for_oversized_input() {
+        let host = "a".repeat(600);
+        let k = PoolKeyStr::tls(&host, 443, "sni.example.com", true);
+        assert_eq!(
+            k.as_str(),
+            format!("{}:{}:{}:{}", host, 443, "sni.example.com", "insecure")
+        );
+        assert!(matches!(k, PoolKeyStr::Heap(_)));
     }
 
     // B-11: 1xx 中間応答の読み捨て

@@ -53,20 +53,6 @@ use crate::simple_tls::SimpleTlsServerStream as ServerTls;
 // 接続処理
 // ====================
 
-/// HTTPS コネクションプールキー（`tls_insecure` 設定毎に分離しプール汚染を防ぐ）
-#[inline]
-fn https_pool_key(host: &str, port: u16, sni: &str, tls_insecure: bool) -> String {
-    let tag = if tls_insecure { "insecure" } else { "verify" };
-    format!("{}:{}:{}:{}", host, port, sni, tag)
-}
-
-/// HTTPS コネクションプールキー（SNI なし）
-#[inline]
-fn https_pool_key_no_sni(host: &str, port: u16, tls_insecure: bool) -> String {
-    let tag = if tls_insecure { "insecure" } else { "verify" };
-    format!("{}:{}:{}", host, port, tag)
-}
-
 /// バックエンドへの TCP 接続を確立する（F-155: 事前解決済み `SocketAddr` の活用）。
 ///
 /// `target.socket_addr` が `Some`（`host` が IP アドレスリテラルで設定ロード時に
@@ -2333,7 +2319,7 @@ async fn h2_proxy_http(
     if reusable {
         HTTP_POOL.with(|p| {
             p.borrow_mut().put(
-                addr.to_string(),
+                addr,
                 backend,
                 security.max_idle_connections_per_host,
                 security.idle_connection_timeout_secs,
@@ -2360,19 +2346,14 @@ async fn h2_proxy_https(
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
 ) -> (u16, u64) {
-    let pool_key = format!(
-        "{}:{}:{}",
-        addr,
-        sni,
-        if tls_insecure { "insecure" } else { "verify" }
-    );
+    let pool_key = crate::http_utils::PoolKeyStr::addr_sni(addr, sni, tls_insecure);
 
-    let mut backend = match HTTPS_POOL.with(|p| p.borrow_mut().get(&pool_key)) {
+    let mut backend = match HTTPS_POOL.with(|p| p.borrow_mut().get(pool_key.as_str())) {
         Some(stream) => stream,
         None => {
             // プールミス: 新規 connect 並行数ゲート経由で取得（B-44 第3段）
             let acquired = match acquire_backend_conn(addr, || {
-                HTTPS_POOL.with(|p| p.borrow_mut().get(&pool_key))
+                HTTPS_POOL.with(|p| p.borrow_mut().get(pool_key.as_str()))
             })
             .await
             {
@@ -2422,7 +2403,7 @@ async fn h2_proxy_https(
     if reusable {
         HTTPS_POOL.with(|p| {
             p.borrow_mut().put(
-                pool_key,
+                pool_key.as_str(),
                 backend,
                 security.max_idle_connections_per_host,
                 security.idle_connection_timeout_secs,
@@ -6767,11 +6748,11 @@ async fn handle_proxy(
     // HTTPS: SNI と tls_insecure 毎に別プール（B-30: 検証設定の異なる接続の再利用を防ぐ）
     let tls_insecure = upstream_group.tls_insecure();
     let pool_key = if target.use_tls && target.sni_name.is_some() {
-        https_pool_key(&target.host, target.port, target.sni(), tls_insecure)
+        crate::http_utils::PoolKeyStr::tls(&target.host, target.port, target.sni(), tls_insecure)
     } else if target.use_tls {
-        https_pool_key_no_sni(&target.host, target.port, tls_insecure)
+        crate::http_utils::PoolKeyStr::tls_no_sni(&target.host, target.port, tls_insecure)
     } else {
-        format!("{}:{}", target.host, target.port)
+        crate::http_utils::PoolKeyStr::plain(&target.host, target.port)
     };
 
     // リクエストパス構築
@@ -6929,7 +6910,7 @@ async fn handle_proxy(
             compression,
             buffering_config,
             client_encoding,
-            &pool_key,
+            pool_key.as_str(),
             request,
             content_length,
             is_chunked,
@@ -6976,7 +6957,7 @@ async fn handle_proxy(
                 compression,
                 buffering_config,
                 client_encoding,
-                &pool_key,
+                pool_key.as_str(),
                 request,
                 content_length,
                 is_chunked,
@@ -6996,7 +6977,7 @@ async fn handle_proxy(
             compression,
             buffering_config,
             client_encoding,
-            &pool_key,
+            pool_key.as_str(),
             request,
             content_length,
             is_chunked,
@@ -7334,7 +7315,7 @@ async fn proxy_http_pooled(
                 let idle_timeout = security.idle_connection_timeout_secs;
                 HTTP_POOL.with(|p| {
                     p.borrow_mut()
-                        .put(pool_key.to_string(), backend_stream, max_idle, idle_timeout)
+                        .put(pool_key, backend_stream, max_idle, idle_timeout)
                 });
             }
             // 408 (body timeout) sends Connection: close — must actually close
@@ -9877,12 +9858,8 @@ async fn proxy_https_pooled(
                     let max_idle = security.max_idle_connections_per_host;
                     let idle_timeout = security.idle_connection_timeout_secs;
                     HTTPS_POOL.with(|p| {
-                        p.borrow_mut().put(
-                            pool_key.to_string(),
-                            backend_stream,
-                            max_idle,
-                            idle_timeout,
-                        )
+                        p.borrow_mut()
+                            .put(pool_key, backend_stream, max_idle, idle_timeout)
                     });
                 }
                 // 408 (body timeout) sends Connection: close — must actually close

@@ -325,25 +325,33 @@ impl HttpConnectionPool {
     }
 
     /// 接続をプールに返却（設定可能なパラメータ付き）
+    ///
+    /// F-168(P2): `key: String` を要求すると呼び出し側が毎リクエスト `to_string()` する
+    /// 羽目になる。`H2cConnectionPool::put`（F-166）と同じパターンで `&str` を受け取り、
+    /// 既存ホストへの返却（共通ケース）はハッシュマップ探索 1 回のみで新規アロケーション
+    /// なし、未登録ホストのときだけ `to_string()` して新規エントリを挿入する。
     pub(crate) fn put(
         &mut self,
-        key: String,
+        key: &str,
         stream: TcpStream,
         max_idle: usize,
         idle_timeout_secs: u64,
     ) {
-        // F-09: メトリクス用にキーを保持（key は entry へムーブされるため）
-        let metric_key = key.clone();
-        let queue = self.connections.entry(key).or_default();
-
-        // 古い接続を削除（設定可能な最大数を使用）
-        while queue.len() >= max_idle {
-            queue.pop_front();
+        if let Some(queue) = self.connections.get_mut(key) {
+            while queue.len() >= max_idle {
+                queue.pop_front();
+            }
+            queue.push_back(PooledConnection::new(stream, idle_timeout_secs));
+            // F-09: プールサイズを更新
+            crate::metrics::set_connection_pool_size(key, queue.len());
+            return;
         }
 
+        // 未登録ホスト（コールドパス）: ここでのみ新規キーを確保する。
+        let mut queue: VecDeque<PooledConnection<TcpStream>> = VecDeque::new();
         queue.push_back(PooledConnection::new(stream, idle_timeout_secs));
-        // F-09: プールサイズを更新
-        crate::metrics::set_connection_pool_size(&metric_key, queue.len());
+        crate::metrics::set_connection_pool_size(key, queue.len());
+        self.connections.insert(key.to_string(), queue);
     }
 }
 
@@ -377,25 +385,33 @@ impl HttpsConnectionPool {
     }
 
     /// 接続をプールに返却（設定可能なパラメータ付き）
+    ///
+    /// F-168(P2): `key: String` を要求すると呼び出し側が毎リクエスト `to_string()` する
+    /// 羽目になる。`H2cConnectionPool::put`（F-166）と同じパターンで `&str` を受け取り、
+    /// 既存ホストへの返却（共通ケース）はハッシュマップ探索 1 回のみで新規アロケーション
+    /// なし、未登録ホストのときだけ `to_string()` して新規エントリを挿入する。
     pub(crate) fn put(
         &mut self,
-        key: String,
+        key: &str,
         stream: ClientTls,
         max_idle: usize,
         idle_timeout_secs: u64,
     ) {
-        // F-09: メトリクス用にキーを保持（key は entry へムーブされるため）
-        let metric_key = key.clone();
-        let queue = self.connections.entry(key).or_default();
-
-        // 古い接続を削除（設定可能な最大数を使用）
-        while queue.len() >= max_idle {
-            queue.pop_front();
+        if let Some(queue) = self.connections.get_mut(key) {
+            while queue.len() >= max_idle {
+                queue.pop_front();
+            }
+            queue.push_back(PooledConnection::new(stream, idle_timeout_secs));
+            // F-09: プールサイズを更新
+            crate::metrics::set_connection_pool_size(key, queue.len());
+            return;
         }
 
+        // 未登録ホスト（コールドパス）: ここでのみ新規キーを確保する。
+        let mut queue: VecDeque<PooledConnection<ClientTls>> = VecDeque::new();
         queue.push_back(PooledConnection::new(stream, idle_timeout_secs));
-        // F-09: プールサイズを更新
-        crate::metrics::set_connection_pool_size(&metric_key, queue.len());
+        crate::metrics::set_connection_pool_size(key, queue.len());
+        self.connections.insert(key.to_string(), queue);
     }
 }
 
@@ -1491,7 +1507,7 @@ mod tests {
             let key = "example.test:80";
             for _ in 0..(BACKEND_POOL_MAX_IDLE_PER_HOST + 8) {
                 pool.put(
-                    key.to_string(),
+                    key,
                     dummy_tcp_stream(),
                     BACKEND_POOL_MAX_IDLE_PER_HOST,
                     BACKEND_POOL_IDLE_TIMEOUT_SECS,
@@ -1511,7 +1527,7 @@ mod tests {
             let n = 10;
             for _ in 0..n {
                 pool.put(
-                    key.to_string(),
+                    key,
                     dummy_tcp_stream(),
                     BACKEND_POOL_MAX_IDLE_PER_HOST,
                     BACKEND_POOL_IDLE_TIMEOUT_SECS,
