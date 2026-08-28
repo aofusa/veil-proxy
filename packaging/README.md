@@ -42,6 +42,34 @@ tools/qemu/bsd-vm.sh netbsd aarch64 build > build.log 2>&1; echo "EXIT=$?"
 実際にこれで **OOM 失敗を「成功」と記録し、古いバイナリのまま packaging してしまった**
 （`verify-artifacts.sh` の内容検証で発見）。
 
+### TCG（x86_64 ゲスト on Apple Silicon）では provision の SSH 待ちを延ばす
+
+`bsd-vm.sh <os> x86_64 provision` の SSH 到達待ちは既定 **1200 秒**。
+Apple Silicon 上の x86_64 ゲストは TCG エミュレーションなので、
+**インストール自体は成功しているのに、インストール後の初回起動が 1200 秒に間に合わず
+provision が失敗扱いになる**ことがある（OpenBSD 7.9 で実際に発生。
+コンソールには `CONGRATULATIONS! Your OpenBSD install has been successfully completed`
+が出ているのに `ERROR: SSH 1200s` で終了する）。
+
+タイムアウトは秒数で上書きできる（引数はディスパッチャが転送する）:
+
+```bash
+tools/qemu/bsd-vm.sh openbsd x86_64 provision 3600
+```
+
+### OpenBSD の autoinstall は GROW_GB を小さくすると失敗する
+
+`GROW_GB=20` にしたところ、OpenBSD 7.9 の autoinstall が `base79.tgz` の取得中に
+
+```
+sha256: stdout: write error: No space left on device
+Fetching of base79.tgz failed. Continue anyway? [no] no
+```
+
+で失敗した（qcow2 は 592MB しか伸びていない = ホストのディスクではなくゲストの
+パーティションが原因）。OpenBSD の «(A)uto layout» はディスク全体を固定比率で分割するため、
+ディスクを小さくすると `/usr` も比例して小さくなる。**既定の `GROW_GB=24` を下回らないこと。**
+
 ### 4 コア機で VM と docker build を同時に走らせないこと
 
 QEMU VM 3 台 + `docker build` を並行させると BuildKit が

@@ -1285,7 +1285,10 @@ case "${COMMAND}" in
     up) cmd_up "$@" ;;
     wait) cmd_wait "$@" ;;
     grow) cmd_grow ;;
-    provision) cmd_provision ;;
+    # 引数を転送する（SSH 到達待ちのタイムアウト秒。TCG エミュレーションの x86_64 ゲストは
+    # インストール後の初回起動が既定 1200s を超えることがあり、上書きできないと
+    # インストール自体は成功しているのに provision が失敗扱いになる）。
+    provision) cmd_provision "$@" ;;
     toolchain) cmd_toolchain ;;
     sync) cmd_sync ;;
     build) cmd_build ;;
