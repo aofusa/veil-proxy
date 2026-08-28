@@ -42,6 +42,24 @@ tools/qemu/bsd-vm.sh netbsd aarch64 build > build.log 2>&1; echo "EXIT=$?"
 実際にこれで **OOM 失敗を「成功」と記録し、古いバイナリのまま packaging してしまった**
 （`verify-artifacts.sh` の内容検証で発見）。
 
+### x86_64 BSD ゲストは Apple Silicon 上では TCG（実測値）
+
+Apple Silicon の macOS で `bsd-vm.sh <os> x86_64` を回すと x86_64 は TCG
+エミュレーションになる。**遅いが実用可能**であることを 2026-08-28 に実測した。
+
+| 段階 | FreeBSD 14.3 amd64 | OpenBSD 7.9 amd64 |
+|---|---|---|
+| 初回起動（SSH 到達まで） | 約 15 分 | インストール込みで約 40 分 |
+| toolchain（pkg / pkg_add） | 約 10 分 | 約 10 分 |
+| `--profile dist` ビルド | 約 1 時間 | **約 1 時間 20 分**（うち fat LTO のリンクだけで約 50 分） |
+| 生成物 | 25,751,432 B | 23,582,896 B |
+
+**fat LTO のリンク中は rustc が一切出力しない**ため、ログの最終行が数十分変わらないのは
+正常である（`ps` で QEMU が 100% CPU を維持しているかで生死を判断する。
+リンクは単一スレッドなので 200% → 100% に落ちたらリンク段階に入った合図）。
+
+ディスクは 1 VM ずつ作って取得後に `disk.qcow2` を消せば **20〜30GB の空きで回せる**。
+
 ### TCG（x86_64 ゲスト on Apple Silicon）では provision の SSH 待ちを延ばす
 
 `bsd-vm.sh <os> x86_64 provision` の SSH 到達待ちは既定 **1200 秒**。
