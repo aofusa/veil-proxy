@@ -257,6 +257,14 @@ threads = ${SRV_THREADS}
 # （指定すると平文計測が 301 の空応答を測ることになる）。h2c リスナーを使う。
 h2c_enabled = true
 h2c_listen = "0.0.0.0:${VEIL_HTTP}"
+# F-163 で [server].tls_only の既定が true になった。true のときメインリスナーは
+# プロトコル検出（MSG_PEEK）自体を行わず平文を一切受理しないため、h1_file_plain
+# シナリオ（平文 HTTP/1.1 を TLS ポートへ投げる。下の case 文のコメント参照）が
+# **0 rps・全リクエストエラー**になる。平文 HTTP/1.1 を veil に喋らせる経路は
+# 「メインリスナーのプロトコル検出」しか無い（h2c リスナーは h2c 専用）ので、
+# 計測用構成では明示的に false にする。
+# 2026-08-27 の FreeBSD 計測で実際に踏んだ（veil 0.00 rps / errors 2,175,920）。
+tls_only = false
 ${1:-}
 
 [logging]
