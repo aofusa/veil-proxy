@@ -149,10 +149,52 @@ AI エージェントおよびコントリビュータ向けの **最小指針**
   stale socket の unlink・`unix_socket_permissions`（umask + chmod）・capsicum の
   権利制限をここに集約する。peer アドレスは `sockaddr_un` を `SocketAddr` へ変換できないため
   **プレースホルダ `127.0.0.1:0`** を返す（IP ブロックリスト・アクセスログはこの値を見る）。
-- **Windows のクロスビルドを壊していないか確認する（B-69 / B-73）** — `cfg(unix)` を
-  付け忘れた `std::os::unix::*` / `libc::poll` は Linux の単体・統合・E2E をすべて通過する。
-  検出手段は `packaging/scripts/build-cross.sh --target windows` のみ。
-  **2026-08-26 時点で B-73（F-139 の `wasm/host/grpc_executor.rs`）により失敗する。**
+- **Windows / macOS のクロスビルドを壊していないか確認する（B-69 / B-73 / B-81）** —
+  `cfg(unix)` を付け忘れた `std::os::unix::*` / `libc::poll` は Linux の単体・統合・E2E を
+  すべて通過する。検出手段は `packaging/scripts/build-cross.sh --target windows|macos` のみ。
+  B-73（F-139 の `wasm/host/grpc_executor.rs`）は 2026-08-27 に解消済み
+  （`runtime::handle` のクロスプラットフォーム抽象 + `WSAPoll` 実装）。
+- **`cfg(unix)` は「macOS でも通る」ことを意味しない（B-81）** — macOS は unix だが
+  **Linux/BSD の socket 拡張フラグを持たない**。`socket(2)` の type 引数に
+  `SOCK_NONBLOCK`/`SOCK_CLOEXEC` を渡すコードは macOS の libc に定義が無く
+  コンパイルエラーになる（B-81 = F-164 の UDS リスナーで実際に発生し、
+  macOS 成果物が F-164 以降ずっとビルドできていなかった）。
+  **新しく `libc::socket`/`accept` 系を足すときは
+  `runtime::reactor::tcp::unix.rs` の `create_nonblocking_socket` の
+  macOS 分岐（素の `SOCK_STREAM` + `fcntl` 2 段設定）を必ず参照すること。**
+  これは B-69・B-73 と同じクラスの 3 件目である。
+- **プラットフォーム限定の関数に付けた `cfg` は、その関数だけが使う定数にも付ける** —
+  `#[cfg(target_os = "linux")]` の関数が使う定数に cfg が無いと、非 Linux ビルドで
+  `constant ... is never used` 警告になる（B-76 の `SKF_AD_*` で実際に発生。
+  Linux の clippy はクリーンなので **BSD ビルドまで走らせないと気づけない**）。
+  `#[allow(dead_code)]` で黙らせないこと。
+- **`SO_ATTACH_REUSEPORT_CBPF` は classic BPF であり eBPF の `sk_reuseport_md` ではない（B-76）** —
+  `LD A, [0]` で「remote_ip4 を読む」つもりのコードは**常に 0 を返す**（カーネルの
+  `run_bpf_filter` が `pskb_pull(skb, hdr_len)` でデータポインタを TCP ペイロードまで
+  進めており、リスナー選択が走る SYN にはペイロードが無いため範囲外ロードになる）。
+  結果として `reuseport_balancing = "cbpf"` は**全接続をワーカー 0 に固定**していた。
+  classic BPF で使えるのは `SKF_AD_OFF` 以降の ancillary ロードだけで、
+  現在は `SKF_AD_RXHASH`（skb->hash）+ 0 のとき `SKF_AD_CPU` フォールバックを使う。
+  **BPF の「どのプログラム型か」を取り違えると、コンパイルもテストも通るのに
+  意味的に無効なプログラムができる。** 分布は必ず実測で確認すること（本件は
+  4 リスナー × 200 接続の accept 分布テストを単体テストとして追加済み）。
+- **キャッシュ機構の「有効化条件」を満たさない構成で効果を測らない（F-169 / F-157）** —
+  F-169 の圧縮結果キャッシュは `static_file_cache` が有効なときだけ動く。
+  既存の compression 計測構成はそれを有効にしておらず、**キャッシュは一度も動いて
+  いなかった**のに +64〜76% の改善が出た（実体は zstd コンテキスト再利用の効果）。
+  切り分けられたのは「**構造的にキャッシュが効かないプロキシ構成が同率で改善した**」
+  ことに気づいたためである。F-157 と合わせて同じ罠の 3 度目。
+- **ライブラリの「ワンショット API」はコンテキストを作り捨てている可能性を疑う（F-169）** —
+  `zstd::encode_all` は呼び出しごとに圧縮ワークスペースを確保・初期化していた。
+  ホットパスでは再利用可能なコンテキスト型（`zstd::bulk::Compressor` 等）を
+  スレッドローカルに保持して使い回すこと。
+- **既定値を変える変更は、その既定に暗黙に依存する計測ハーネス・テストを壊す（B-80）** —
+  F-163 が `[server].tls_only` の既定を `true` にした結果、FreeBSD 計測ハーネスの
+  平文 HTTP/1.1 シナリオが **0 rps・全リクエストエラー**になっていた（veil に平文
+  HTTP/1.1 を喋らせる経路はメインリスナーのプロトコル検出しか無く、`tls_only = true`
+  はそれ自体を行わない）。**壊れ方が「0 rps」なので「測れていない」ではなく
+  「性能が出ていない」と誤読しやすい。errors 列が跳ねている行はスループットの数字より
+  先に見ること。**
 - **動的設定**は ArcSwap とリロード経路の不変条件を維持する。
 - **`unsafe` は最小限** — 拡大時は不変条件をコメントで明示。
 
@@ -239,6 +281,19 @@ AI エージェントおよびコントリビュータ向けの **最小指針**
 - **HTTP/1.1 の計測は `tools/perf/alloc_measure_h1.sh`（F-168）** — `alloc_measure.sh` は
   h2load を h2c ポートへ投げるため `handle_requests`（HTTP/1.1 経路）を一度も通らない。
   veil の平文リスナーは h2c 専用なので、HTTP/1.1 は `h2load --h1` で **TLS ポート**へ投げる。
+- **同一イメージでもラン間で 15% 振れる構成がある（2026-08-27）**。`h2_1_proxy_compression`
+  の HTTP/1.1 は、**ラン内の 3 反復は 1% 未満**に収まるのに、**独立ランの中央値が
+  1,684〜1,930（14.6%）**ばらついた。**ラン内のばらつきの小ささを「その構成の再現性が
+  高い」と取り違えないこと。** 退行判定は「再計測して戻るか」「ビルド間で方向が一致するか」
+  で行う。2026-08-27 のフルスイートで 0.95× を割った 6 構成はすべてこれで否定できた。
+- **手元の `docker run` で挙動を再現するときはハーネスと同じマウント先を使う（2026-08-27）** —
+  `tools/perf/run_perf.sh` は計測設定を **`/etc/veil/conf.d/config.toml`** へマウントする。
+  `/etc/veil/config.toml` へマウントするとイメージ同梱の既定設定（静的 File ルート）が
+  生き残り、**まったく別の経路を測ってしまう**。さらに **snap 版 docker は
+  リポジトリ外パス（`/tmp/...`）を bind mount できず、エラーを返さずに空ディレクトリを作る**。
+  この 2 つが重なり「HTTP/1.1 は圧縮しない」という誤った結論を出しかけた
+  （正しくは `content-encoding: zstd` で 54,576B → 17,224B）。
+  **設定差し替えの検証では、まず起動ログで意図した経路（Proxy か SendFile か）を確認する。**
 - **性能改善は必ず交互 A/B で確認する**。計測環境（QEMU VM）は同一バイナリでも
   ラウンド間で 1.8 倍変動する。時間をまたいだ比較は無意味
   （B-64 では syscall を 2 つ消しても中央値に差が出なかった＝そこはボトルネックでは
