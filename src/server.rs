@@ -976,6 +976,23 @@ pub fn bind_unix_listener(path: &std::path::Path, mode: u32) -> io::Result<Owned
         }
     }
 
+    // macOS は `socket(2)` の type 引数に `SOCK_NONBLOCK`/`SOCK_CLOEXEC` を受け付けない
+    // （libc にも定義が無い）。生の `SOCK_STREAM` で作成して `fcntl` で 2 段設定する
+    // （`runtime::reactor::tcp::unix::create_nonblocking_socket` と同じ方針）。
+    // 他 OS は 1 syscall で完結させる（挙動不変）。
+    #[cfg(target_os = "macos")]
+    let fd = {
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+        fd
+    };
+    #[cfg(not(target_os = "macos"))]
     let fd = unsafe {
         libc::socket(
             libc::AF_UNIX,
