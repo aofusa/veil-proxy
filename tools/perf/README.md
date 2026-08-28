@@ -16,7 +16,7 @@
 | `gen_configs.sh` | 計測用 `config.toml` バリアントを生成（**完全直交 2⁴=16** + full features 機能ショーケース `feat_*` + **全プロトコル×全機能マトリクス**（F-114: `h2_1_proxy_*` / `h3_file_*` / `h3_proxy*` / `grpc_h2_*` / `grpc_h3*`）+ **h2c（平文 HTTP/2 prior knowledge）**（`h2c_file` / `h2c_proxy`）） |
 | `h2c_proxy_lab.sh` | h2c 単一構成のラボハーネス（`run_perf.sh` は 1 構成の計測が終わるとコンテナを落とすため、**負荷をかけたまま**の CPU 内訳・syscall 集計・メモリ推移が取れない）。`up`/`upnginx` で veil と比較対象 nginx を起動しっぱなしにし、`load`（rps）・`cpu`（クライアント/プロキシ/上流の 3 者同時サンプル）・`strace`（**1 リクエストあたりの syscall 回数**）・`mem`（持続負荷中の RSS 推移）を差し込む。ペイロードは `/`（54,576B）と `/3b.html`（3B）の 2 サイズを配信し、**バイト単価と固定費を切り分けられる**ようにしてある |
 | `analyze_results.sh` | 反復生データ（`results_raw.tsv`）を **median±stdev** に集計し Markdown を出力。**Linux ハーネスの 11 列形式専用**で、FreeBSD ネイティブ計測（8/10 列）を渡すと列位置がずれるため**明示エラーで停止する**（黙って全行 0.0 を出さない）。`#` 始まりの節見出し・列凡例・ヘッダ行は集計対象外 |
-| `configs/*.toml` | 生成済みバリアント（`gen_configs.sh` で再生成可能） |
+| `configs/*.toml` | 生成済みバリアント（`gen_configs.sh` で再生成可能）。**`*_compression_cached` は F-169 で追加した「静的キャッシュ有効」版**で、`static_file_cache` + `open_file_cache` を有効にしないと F-169 の圧縮結果キャッシュは有効化条件を満たさず一切効かない（既存の `*_compression` はキャッシュ無効時のコストを測るため据え置き） |
 | `nginx/nginx.conf` | 比較対象 nginx の設定（`access_log off` で公平化。平文 8080 で `listen 8080; http2 on;` により h2c も有効化し、veil の h2c 専用リスナーと条件を揃える） |
 | `results/` | 計測結果（`results_raw.tsv` / `results_summary.md` / `logs/` は `.gitignore` 対象）。公開する生データは [docs/perf/results_raw.tsv](../../docs/perf/results_raw.tsv) へコピーしてコミットする（サマリは [docs/perf/README.md](../../docs/perf/README.md)） |
 
@@ -93,6 +93,20 @@ backend` 警告で確認できる。実測結果は
 フルスイート」節を参照。
 
 リポジトリのどこから実行しても、スクリプトが自身の位置からリポジトリルートと `docker/assets/` を解決します。
+
+### 手元の `docker run` で挙動を再現するときの注意（2026-08-27）
+
+`run_perf.sh` の `start_veil` は計測用設定を **`/etc/veil/conf.d/config.toml`** へマウントする。
+手動で再現するときも**必ず同じマウント先を使うこと**。`/etc/veil/config.toml` へマウントすると
+イメージ同梱の既定設定（静的 File ルート）が生き残り、**意図した構成とは別の経路を測ってしまう**。
+
+さらに **snap 版 docker はリポジトリ外のパス（`/tmp/claude-*` 等）を bind mount できず、
+エラーを返さずに空ディレクトリを作る**。設定ファイルは**リポジトリ配下**に置くこと
+（`run_perf.sh` が `$LOGDIR` に runtime 設定を書くのはこのため）。
+
+この 2 つが重なると「設定を変えたのに何も変わらない」という形で現れる。
+**差し替え検証では、まず起動ログで意図した経路（`Proxy` か `SendFile` か）を確認する。**
+
 
 各構成は**ウォームアップ後に `ITERATIONS`（既定 3）回**計測します。生データは `results/results_raw.tsv`
 （1 反復 1 行）に、median±stdev 集計は `results/results_summary.md` に保存され、後者が標準出力にも表示されます。
