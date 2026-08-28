@@ -579,10 +579,18 @@ pub(crate) static CBPF_ATTACHED: std::sync::atomic::AtomicUsize =
 // classic BPF の仕様どおりプログラムが打ち切られて 0 が返る
 // （＝ 全接続がワーカー 0 に固定される。B-76）。
 /// ancillary データ用の絶対オフセットの基点
+///
+/// これらの定数は `create_reuseport_cbpf_program`（Linux 専用）でしか使わないため、
+/// 関数と同じ `#[cfg(target_os = "linux")]` を付ける。付けないと非 Linux ターゲット
+/// （FreeBSD/OpenBSD/NetBSD/macOS/Windows）のビルドで
+/// `constant \`SKF_AD_OFF\` is never used` 等の警告になる。
+#[cfg(target_os = "linux")]
 const SKF_AD_OFF: i32 = -0x1000;
 /// skb->hash（フロー 4 タプルの受信ハッシュ）を読むための ancillary オフセット
+#[cfg(target_os = "linux")]
 const SKF_AD_RXHASH: u32 = 32;
 /// パケットを受信した CPU 番号を読むための ancillary オフセット
+#[cfg(target_os = "linux")]
 const SKF_AD_CPU: u32 = 36;
 
 /// フローハッシュに基づく振り分けCBPFプログラムを生成
