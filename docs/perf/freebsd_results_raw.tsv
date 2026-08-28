@@ -1,311 +1,53 @@
-## FreeBSD ネイティブ計測の生データ（2026-08-07 〜 08）
-## 環境: FreeBSD 14.3-RELEASE aarch64 / QEMU+HVF on Apple Silicon / 4 vCPU・4GB
-##       サーバ 2 コア（cpuset 0,1）・負荷生成 2 コア（cpuset 2,3）・loopback
-## ハーネス: tools/perf/freebsd/run_perf_freebsd.sh / ab_content_cache.sh
-## 負荷: HTTP/1.1=wrk, HTTP/2・h2c=h2load, HTTP/3=tools/perf/h3load (quinn+h3)
-## 配信: index.html=54576B（バイト単価）, small.html=3B（リクエスト単価）
-##
-## build 列の意味:
-##   aio        = full-freebsd（当時の既定、POSIX AIO 有効）
-##   noaio      = aio を除外（B-63 の対応後 = 現在の full-freebsd）
-##   cache_off  = noaio + [static_file_cache] 無効（F-146 既定）
-##   cache_on   = noaio + [static_file_cache] 有効
-##   ktls_on    = noaio + [tls] ktls_enabled = true
-##   ktls_off   = noaio + [tls] ktls_enabled = false（既定）
-## rps が 0 の行は当該構成が失敗したことを示す（errors 列を参照）。
-build	scenario	body	server	iter	rps	mbps	p50_ms	p99_ms	errors
-aio	h1_file_tls	54576	nginx	1	49026.42	20480.00	1.270	1.590	0
-aio	h1_file_tls	54576	veil	1	21693.41	9011.20	2.930	3.840	0
-aio	h1_file_tls	54576	nginx	2	44590.15	18677.76	1.410	1.670	0
-aio	h1_file_tls	54576	veil	2	21636.35	9011.20	2.940	3.880	0
-aio	h2_file_tls	54576	nginx	1	43614.02	18186.24	0.000	0.000	0
-aio	h2_file_tls	54576	veil	1	21445.65	8929.28	0.000	0.000	0
-aio	h2c_file_plain	54576	nginx	1	106157.73	44318.72	0.000	0.000	0
-aio	h2c_file_plain	54576	veil	1	64529.95	26869.76	0.000	0.000	0
-aio	h1_proxy_tls	54576	nginx	1	31870.88	13352.96	2.000	2.540	0
-aio	h1_proxy_tls	54576	veil	1	21593.10	9011.20	2.880	14.120	0
-aio	h2_proxy_tls	54576	nginx	1	21985.22	9175.04	0.000	0.000	0
-aio	h2_proxy_tls	54576	veil	1	21881.51	9093.12	0.000	0.000	0
-aio	l4_tcp	54576	nginx	1	68023.07	28426.24	0.930	1.260	0
-aio	l4_tcp	54576	veil	1	53090.97	22200.32	1.080	2.350	0
-aio	h1_file_tls	3	nginx	1	378151.04	683.76	0.160	0.248	0
-aio	h1_file_tls	3	veil	1	77503.59	66.24	0.744	3.170	0
-aio	h2_file_tls	3	nginx	1	416897.37	397.68	0.000	0.000	0
-aio	h2_file_tls	3	veil	1	0.00	0.00	0.000	0.000	0
-aio	h2c_file_plain	3	nginx	1	418224.12	398.96	0.000	0.000	0
-aio	h2c_file_plain	3	veil	1	1927.17	0.47	0.000	0.000	25440
-aio	h1_proxy_tls	3	nginx	1	217299.22	392.88	0.287	0.458	0
-aio	h1_proxy_tls	3	veil	1	82541.85	149.28	0.752	1.410	0
-aio	h2_proxy_tls	3	nginx	1	115185.39	118.64	0.000	0.000	0
-aio	h2_proxy_tls	3	veil	1	7875.09	2.29	0.000	0.000	11217
-aio	l4_tcp	3	nginx	1	244086.11	441.36	0.193	154.040	0
-aio	l4_tcp	3	veil	1	13490.71	24.40	0.781	2.110	1284
-noaio	h1_file_tls	54576	nginx	1	48853.97	20398.08	1.270	1.670	0
-noaio	h1_file_tls	54576	veil	1	21382.26	8929.28	2.960	3.490	0
-noaio	h2_file_tls	54576	nginx	1	43930.34	18350.08	0.000	0.000	0
-noaio	h2_file_tls	54576	veil	1	22748.98	9502.72	0.000	0.000	0
-noaio	h2c_file_plain	54576	nginx	1	106044.71	44318.72	0.000	0.000	0
-noaio	h2c_file_plain	54576	veil	1	55650.26	23183.36	0.000	0.000	0
-noaio	h1_proxy_tls	54576	nginx	1	30840.82	12861.44	2.050	2.580	0
-noaio	h1_proxy_tls	54576	veil	1	22271.99	9338.88	2.800	1770.000	0
-noaio	h2_proxy_tls	54576	nginx	1	22885.21	9584.64	0.000	0.000	0
-noaio	h2_proxy_tls	54576	veil	1	21625.65	9011.20	0.000	0.000	0
-noaio	l4_tcp	54576	nginx	1	67295.24	28180.48	0.940	1.210	0
-noaio	l4_tcp	54576	veil	1	41205.57	17203.20	1.540	1.790	0
-noaio	h1_file_tls	3	nginx	1	279688.53	505.76	0.201	0.417	0
-noaio	h1_file_tls	3	veil	1	105343.86	90.00	0.495	1.320	0
-noaio	h2_file_tls	3	nginx	1	267009.89	254.72	0.000	0.000	0
-noaio	h2_file_tls	3	veil	1	86001.33	21.04	0.000	0.000	0
-noaio	h2c_file_plain	3	nginx	1	399798.85	381.36	0.000	0.000	0
-noaio	h2c_file_plain	3	veil	1	119860.40	29.28	0.000	0.000	0
-noaio	h1_proxy_tls	3	nginx	1	151233.52	273.44	0.419	0.643	0
-noaio	h1_proxy_tls	3	veil	1	102492.96	185.36	0.599	0.970	0
-noaio	h2_proxy_tls	3	nginx	1	81294.98	83.76	0.000	0.000	0
-noaio	h2_proxy_tls	3	veil	1	143605.46	41.76	0.000	0.000	0
-noaio	l4_tcp	3	nginx	1	242403.04	438.32	0.251	0.433	0
-noaio	l4_tcp	3	veil	1	202108.08	365.44	0.299	0.466	0
-noaio	h3_file	54576	nginx	1	11664.91	5093.00	0.000	0.000	0
-noaio	h3_file	54576	veil	1	5868.57	2562.26	0.000	0.000	0
-cache_off	h2_file_tls	54576	veil	1	22198.40	9250.00	0.000	0.000	0
-cache_on	h2_file_tls	54576	veil	1	22345.52	9311.00	0.000	0.000	0
-cache_off	h2_file_tls	54576	veil	2	22312.89	9298.00	0.000	0.000	0
-cache_on	h2_file_tls	54576	veil	2	22318.09	9300.00	0.000	0.000	0
-cache_off	h2_file_tls	54576	veil	3	22233.64	9265.00	0.000	0.000	0
-cache_on	h2_file_tls	54576	veil	3	22145.43	9228.00	0.000	0.000	0
-cache_off	h2_file_tls	54576	veil	4	22082.00	9202.00	0.000	0.000	0
-cache_on	h2_file_tls	54576	veil	4	22250.06	9272.00	0.000	0.000	0
-cache_off	h2_file_tls	3	veil	1	172479.22	42.10	0.000	0.000	0
-cache_on	h2_file_tls	3	veil	1	224608.06	54.83	0.000	0.000	0
-cache_off	h2_file_tls	3	veil	2	172972.22	42.23	0.000	0.000	0
-cache_on	h2_file_tls	3	veil	2	224590.40	54.83	0.000	0.000	0
-cache_off	h2_file_tls	3	veil	3	164556.91	40.17	0.000	0.000	0
-cache_on	h2_file_tls	3	veil	3	220529.05	53.84	0.000	0.000	0
-cache_off	h2_file_tls	3	veil	4	159285.76	38.88	0.000	0.000	0
-cache_on	h2_file_tls	3	veil	4	222490.45	54.32	0.000	0.000	0
-ktls_on	h2_file_tls	54576	veil	1	22173.78	9239.00	0.000	0.000	0
-ktls_off	h2_file_tls	54576	veil	1	23407.09	9753.00	0.000	0.000	0
-ktls_on	h2_file_tls	54576	veil	2	21858.76	9108.00	0.000	0.000	0
-ktls_off	h2_file_tls	54576	veil	2	29685.17	12369.00	0.000	0.000	0
-ktls_on	h2_file_tls	54576	veil	3	22102.13	9209.00	0.000	0.000	0
-ktls_off	h2_file_tls	54576	veil	3	41082.78	17118.00	0.000	0.000	0
-ktls_on	h2_file_tls	54576	veil	4	22350.94	9313.00	0.000	0.000	0
-ktls_off	h2_file_tls	54576	veil	4	26034.18	10847.00	0.000	0.000	0
-ktls_on	h2_file_tls	3	veil	1	170765.03	41.69	0.000	0.000	0
-ktls_off	h2_file_tls	3	veil	1	166421.20	40.63	0.000	0.000	0
-ktls_on	h2_file_tls	3	veil	2	169316.47	41.34	0.000	0.000	0
-ktls_off	h2_file_tls	3	veil	2	178533.17	43.59	0.000	0.000	0
-ktls_on	h2_file_tls	3	veil	3	169366.65	41.35	0.000	0.000	0
-ktls_off	h2_file_tls	3	veil	3	161421.80	39.41	0.000	0.000	0
-ktls_on	h2_file_tls	3	veil	4	150941.69	36.85	0.000	0.000	0
-ktls_off	h2_file_tls	3	veil	4	162637.33	39.71	0.000	0.000	0
-
-# ==== 2026-08-11 FreeBSD 14.3 amd64 (QEMU/KVM) F-150/F-151 後、54KB ====
-h3_file	nginx	1	477.17	198.68	3259.780	9396.910	0
-h3_file	veil	1	504.77	210.18	3132.380	7721.870	0
-h3_file	nginx	2	615.27	256.19	1611.510	10924.400	0
-h3_file	veil	2	594.86	247.69	2303.770	7939.190	0
-h3_file	nginx	3	389.68	162.26	1456.170	14038.560	0
-h3_file	veil	3	595.31	247.88	1932.850	8937.790	0
-
-# ==== 2026-08-15 F-153 後 FreeBSD 14.3 amd64 (QEMU/KVM)、3B（-p /small.html）====
-h2c_file_plain  nginx   1     14391.74  13.76  0.000   0.000    0
-h2c_file_plain  veil    1     10009.21  2.45   0.000   0.000    0
-h2_file_tls     nginx   1     11804.25  11.28  0.000   0.000    0
-h2_file_tls     veil    1     10968.54  2.68   0.000   0.000    0
-h1_file_tls     nginx   1     10380.87  18.80  5.500   53.170   0
-h1_file_tls     veil    1     6310.15   5.39   8.880   49.020   0
-h2c_file_plain  nginx   2     14773.29  14.08  0.000   0.000    0
-h2c_file_plain  veil    2     9782.08   2.39   0.000   0.000    0
-h2_file_tls     nginx   2     11877.80  11.36  0.000   0.000    0
-h2_file_tls     veil    2     10306.65  2.52   0.000   0.000    0
-h1_file_tls     nginx   2     9637.12   17.44  5.690   135.940  0
-h1_file_tls     veil    2     6324.82   5.41   8.750   64.770   0
-h2c_file_plain  nginx   3     17556.49  16.72  0.000   0.000    0
-h2c_file_plain  veil    3     10327.60  2.52   0.000   0.000    0
-h2_file_tls     nginx   3     13446.74  12.80  0.000   0.000    0
-h2_file_tls     veil    3     10047.33  2.46   0.000   0.000    0
-h1_file_tls     nginx   3     10601.67  19.20  5.050   64.460   0
-h1_file_tls     veil    3     6328.38   5.41   8.950   78.350   0
-
-# ==== 2026-08-16 B-65 後 FreeBSD 14.3 amd64 (QEMU/KVM)、3B、capsicum+capability mode 有効 ====
-h2c_file_plain  nginx   1     13550.07  12.96  0.000   0.000   0
-h2c_file_plain  veil    1     10702.24  2.62   0.000   0.000   0
-h2_file_tls     nginx   1     13180.94  12.56  0.000   0.000   0
-h2_file_tls     veil    1     9863.76   2.41   0.000   0.000   0
-h2c_file_plain  nginx   2     16605.01  15.84  0.000   0.000   0
-h2c_file_plain  veil    2     12588.84  3.08   0.000   0.000   0
-h2_file_tls     nginx   2     9824.17   9.36   0.000   0.000   0
-h2_file_tls     veil    2     9293.67   2.27   0.000   0.000   0
-h2c_file_plain  nginx   3     11796.97  11.28  0.000   0.000   0
-h2c_file_plain  veil    3     9102.14   2.22   0.000   0.000   0
-h2_file_tls     nginx   3     6364.14   6.07   0.000   0.000   0
-h2_file_tls     veil    3     5445.44   1.33   0.000   0.000   0
-
-# ==== 2026-08-16 v0.6.0 リリース前 FreeBSD 14.3 aarch64（QEMU/HVF・Apple Silicon）、54576B、capsicum+capability mode 有効、3 反復 ====
-# 列: scenario / server / iter / rps / mbps / p50_ms / p99_ms / errors（tools/perf/freebsd/run_perf_freebsd.sh の出力）
-h1_file_tls	nginx	1	49780.86	20807.68	1.260	1.900	0
-h1_file_tls	veil	1	21441.22	8929.28	2.980	3.380	0
-h2_file_tls	nginx	1	42648.67	17776.64	0.000	0.000	0
-h2_file_tls	veil	1	23033.86	9584.64	0.000	0.000	0
-h2c_file_plain	nginx	1	106183.53	44400.64	0.000	0.000	0
-h2c_file_plain	veil	1	60687.52	25313.28	0.000	0.000	0
-h3_file	nginx	1	6111.46	2544.70	260.110	1055.780	0
-h3_file	veil	1	6689.92	2785.56	154.720	1599.610	0
-h1_proxy_tls	nginx	1	30839.68	12861.44	2.060	2.550	0
-h1_proxy_tls	veil	1	22771.71	9502.72	2.770	3810.000	0
-h2_proxy_tls	nginx	1	25366.01	10567.68	0.000	0.000	0
-h2_proxy_tls	veil	1	22074.27	9175.04	0.000	0.000	0
-l4_tcp	nginx	1	67068.35	28016.64	1.000	1.330	0
-l4_tcp	veil	1	40066.98	16793.60	1.590	1.830	0
-h1_file_tls	nginx	2	42439.13	17776.64	1.470	1.950	0
-h1_file_tls	veil	2	21434.53	8929.28	2.980	3.430	0
-h2_file_tls	nginx	2	41269.16	17203.20	0.000	0.000	0
-h2_file_tls	veil	2	23001.90	9584.64	0.000	0.000	0
-h2c_file_plain	nginx	2	103958.63	43417.60	0.000	0.000	0
-h2c_file_plain	veil	2	67479.58	28098.56	0.000	0.000	0
-h3_file	nginx	2	6071.94	2528.25	271.730	1061.030	0
-h3_file	veil	2	5940.74	2473.62	177.880	1934.980	0
-h1_proxy_tls	nginx	2	29017.30	12124.16	2.180	2.640	0
-h1_proxy_tls	veil	2	22516.46	9420.80	2.690	4770.000	0
-h2_proxy_tls	nginx	2	20946.47	8765.44	0.000	0.000	0
-h2_proxy_tls	veil	2	20588.64	8601.60	0.000	0.000	0
-l4_tcp	nginx	2	64293.08	26869.76	1.010	1.340	0
-l4_tcp	veil	2	37477.95	15646.72	1.700	1.990	0
-h1_file_tls	nginx	3	37681.53	15728.64	1.670	2.310	0
-h1_file_tls	veil	3	21740.94	9093.12	2.940	3.390	0
-h2_file_tls	nginx	3	38989.89	16302.08	0.000	0.000	0
-h2_file_tls	veil	3	22238.09	9256.96	0.000	0.000	0
-h2c_file_plain	nginx	3	98325.17	41041.92	0.000	0.000	0
-h2c_file_plain	veil	3	55221.47	23019.52	0.000	0.000	0
-h3_file	nginx	3	5104.97	2125.62	319.540	1220.750	0
-h3_file	veil	3	5167.32	2151.58	188.100	2263.640	0
-h1_proxy_tls	nginx	3	24305.56	10158.08	2.650	3.330	0
-h1_proxy_tls	veil	3	19473.01	8110.08	2.050	4840.000	0
-h2_proxy_tls	nginx	3	20173.72	8437.76	0.000	0.000	0
-h2_proxy_tls	veil	3	20413.51	8519.68	0.000	0.000	0
-l4_tcp	nginx	3	54203.34	22691.84	1.180	1.610	0
-l4_tcp	veil	3	33692.91	14090.24	1.890	2.230	0
-
-# ==== 2026-08-17 F-157 後 FreeBSD 14.3 aarch64（QEMU/HVF・Apple Silicon）、54576B、3 反復 ====
-# capsicum+capability mode 有効 / ktls_enabled=false（F-155）/ static_file_cache + open_file_cache 有効（F-157）
-# nginx 側も open_file_cache 有効（片側だけチューニングしない）
-# 列: scenario / server / iter / rps / mbps / p50_ms / p99_ms / errors
-h1_file_tls	nginx	1	47728.30	19988.48	1.180	245.500	0
-h1_file_tls	veil	1	58373.57	24330.24	0.930	1.900	0
-h2_file_tls	nginx	1	38100.61	15892.48	0.000	0.000	0
-h2_file_tls	veil	1	53517.32	22282.24	0.000	0.000	0
-h1_file_plain	nginx	1	81625.93	34160.64	0.416	0.785	0
-h1_file_plain	veil	1	75178.04	31375.36	0.455	0.818	0
-h2c_file_plain	nginx	1	86524.84	36126.72	0.000	0.000	0
-h2c_file_plain	veil	1	73453.42	30638.08	0.000	0.000	0
-h3_file	nginx	1	4033.54	1679.49	412.880	1440.350	0
-h3_file	veil	1	3571.31	1487.03	364.000	2214.510	0
-h1_proxy_tls	nginx	1	16219.39	6783.36	3.930	6.350	0
-h1_proxy_tls	veil	1	16021.32	6700.48	3.980	5.730	0
-h2_proxy_tls	nginx	1	12834.05	5364.40	0.000	0.000	0
-h2_proxy_tls	veil	1	13454.32	5608.48	0.000	0.000	0
-l4_tcp	nginx	1	36731.34	15400.96	1.640	214.290	0
-l4_tcp	veil	1	41116.41	17203.20	1.530	2.740	0
-h1_file_tls	nginx	2	25077.81	10485.76	2.300	236.880	0
-h1_file_tls	veil	2	33468.14	13926.40	1.720	2.790	0
-h2_file_tls	nginx	2	24247.52	10158.08	0.000	0.000	0
-h2_file_tls	veil	2	34187.88	14254.08	0.000	0.000	0
-h1_file_plain	nginx	2	52464.90	21954.56	0.651	1.560	0
-h1_file_plain	veil	2	55230.11	23019.52	0.619	1.340	0
-h2c_file_plain	nginx	2	73380.19	30638.08	0.000	0.000	0
-h2c_file_plain	veil	2	58938.29	24576.00	0.000	0.000	0
-h3_file	nginx	2	3688.87	1535.98	455.190	1588.540	0
-h3_file	veil	2	3640.97	1516.03	385.810	2109.560	0
-h1_proxy_tls	nginx	2	17744.70	7454.72	3.580	5.660	0
-h1_proxy_tls	veil	2	17954.24	7536.64	3.310	5.870	0
-h2_proxy_tls	nginx	2	12907.03	5394.88	0.000	0.000	0
-h2_proxy_tls	veil	2	16896.42	7043.36	0.000	0.000	0
-l4_tcp	nginx	2	40344.87	16875.52	1.490	223.930	0
-l4_tcp	veil	2	43821.52	18350.08	1.420	2.270	0
-h1_file_tls	nginx	3	26111.38	10895.36	2.120	253.710	0
-h1_file_tls	veil	3	33864.50	14090.24	1.690	2.990	0
-h2_file_tls	nginx	3	19263.48	8047.68	0.000	0.000	0
-h2_file_tls	veil	3	34803.75	14499.84	0.000	0.000	0
-h1_file_plain	nginx	3	54753.87	22937.60	0.620	1.180	0
-h1_file_plain	veil	3	57213.46	23838.72	0.597	1.040	0
-h2c_file_plain	nginx	3	71982.94	30064.64	0.000	0.000	0
-h2c_file_plain	veil	3	58857.23	24494.08	0.000	0.000	0
-h3_file	nginx	3	3640.46	1515.82	465.040	1541.610	0
-h3_file	veil	3	3395.86	1413.97	403.200	2232.980	0
-h1_proxy_tls	nginx	3	17712.36	7372.80	3.600	5.950	0
-h1_proxy_tls	veil	3	17612.85	7372.80	3.590	5.350	0
-h2_proxy_tls	nginx	3	13919.77	5818.24	0.000	0.000	0
-h2_proxy_tls	veil	3	16114.77	6717.52	0.000	0.000	0
-l4_tcp	nginx	3	39801.27	16629.76	1.530	214.360	0
-l4_tcp	veil	3	43861.46	18350.08	1.420	2.250	0
-# ==== 2026-08-22 F-158 交互 A/B: FreeBSD 14.3 aarch64（QEMU/HVF・Apple Silicon）、3B（-p /small.html）、10 ラウンド ====
-# server 列: veil_base = F-158 適用前（b239dc1~1） / veil_new = F-158 適用後。md5 で別バイナリを確認済み。
-# /root/ab/{base,new}/veil（basename は veil のまま = F-156 の教訓）。ラウンドごとに実行順を入替。
-# iter = ラウンド番号。transfer/p50/p99 は本 A/B では取得していない（rps のみ）ため NA。
-# 列: scenario / server / iter / rps / mbps / p50_ms / p99_ms / errors
-# 結果: veil_new が 10/10 勝、中央値 555,119 → 706,779（+27.3%）、分布は完全分離
-#       （base 最大 581,694 < new 最小 652,805）。
-h2c_file_plain	veil_base	1	510588.73	NA	NA	NA	0
-h2c_file_plain	veil_new	1	658612.39	NA	NA	NA	0
-h2c_file_plain	nginx	1	170329.19	NA	NA	NA	0
-h2c_file_plain	veil_new	2	709522.57	NA	NA	NA	0
-h2c_file_plain	veil_base	2	559736.57	NA	NA	NA	0
-h2c_file_plain	nginx	2	114525.09	NA	NA	NA	0
-h2c_file_plain	veil_base	3	485039.56	NA	NA	NA	0
-h2c_file_plain	veil_new	3	704236.98	NA	NA	NA	0
-h2c_file_plain	nginx	3	127875.83	NA	NA	NA	0
-h2c_file_plain	veil_new	4	709322.04	NA	NA	NA	0
-h2c_file_plain	veil_base	4	581060.16	NA	NA	NA	0
-h2c_file_plain	nginx	4	125027.47	NA	NA	NA	0
-h2c_file_plain	veil_base	5	571102.23	NA	NA	NA	0
-h2c_file_plain	veil_new	5	727640.68	NA	NA	NA	0
-h2c_file_plain	nginx	5	124773.73	NA	NA	NA	0
-h2c_file_plain	veil_new	6	691888.15	NA	NA	NA	0
-h2c_file_plain	veil_base	6	563238.98	NA	NA	NA	0
-h2c_file_plain	nginx	6	179054.04	NA	NA	NA	0
-h2c_file_plain	veil_base	7	550502.12	NA	NA	NA	0
-h2c_file_plain	veil_new	7	710716.27	NA	NA	NA	0
-h2c_file_plain	nginx	7	140492.45	NA	NA	NA	0
-h2c_file_plain	veil_new	8	652804.77	NA	NA	NA	0
-h2c_file_plain	veil_base	8	581693.91	NA	NA	NA	0
-h2c_file_plain	nginx	8	188397.09	NA	NA	NA	0
-h2c_file_plain	veil_base	9	441871.46	NA	NA	NA	0
-h2c_file_plain	veil_new	9	721928.00	NA	NA	NA	0
-h2c_file_plain	nginx	9	270295.38	NA	NA	NA	0
-h2c_file_plain	veil_new	10	664251.83	NA	NA	NA	0
-h2c_file_plain	veil_base	10	475108.76	NA	NA	NA	0
-h2c_file_plain	nginx	10	191462.85	NA	NA	NA	0
-# ==== 2026-08-22 F-158 交互 A/B: FreeBSD 14.3 aarch64、54,576B（-p /index.html）、10 ラウンド ====
-# 結果: 中央値 96,981 → 97,794（+0.8%、8/10 勝）＝ 退行なし。
-# 固定費を消す改修のため 3B で効き 54KB では埋もれる（設計どおりの非対称）。
-# 列: scenario / server / iter / rps / mbps / p50_ms / p99_ms / errors
-h2c_file_plain	veil_base	1	96517.09	NA	NA	NA	0
-h2c_file_plain	veil_new	1	97158.35	NA	NA	NA	0
-h2c_file_plain	nginx	1	111443.99	NA	NA	NA	0
-h2c_file_plain	veil_new	2	97886.19	NA	NA	NA	0
-h2c_file_plain	veil_base	2	97189.33	NA	NA	NA	0
-h2c_file_plain	nginx	2	112504.53	NA	NA	NA	0
-h2c_file_plain	veil_base	3	97418.34	NA	NA	NA	0
-h2c_file_plain	veil_new	3	97870.70	NA	NA	NA	0
-h2c_file_plain	nginx	3	108551.76	NA	NA	NA	0
-h2c_file_plain	veil_new	4	99608.34	NA	NA	NA	0
-h2c_file_plain	veil_base	4	96822.78	NA	NA	NA	0
-h2c_file_plain	nginx	4	111625.44	NA	NA	NA	0
-h2c_file_plain	veil_base	5	98735.19	NA	NA	NA	0
-h2c_file_plain	veil_new	5	97514.75	NA	NA	NA	0
-h2c_file_plain	nginx	5	112501.26	NA	NA	NA	0
-h2c_file_plain	veil_new	6	97688.30	NA	NA	NA	0
-h2c_file_plain	veil_base	6	98518.45	NA	NA	NA	0
-h2c_file_plain	nginx	6	110314.11	NA	NA	NA	0
-h2c_file_plain	veil_base	7	96994.61	NA	NA	NA	0
-h2c_file_plain	veil_new	7	98730.16	NA	NA	NA	0
-h2c_file_plain	nginx	7	111007.04	NA	NA	NA	0
-h2c_file_plain	veil_new	8	98054.91	NA	NA	NA	0
-h2c_file_plain	veil_base	8	96945.90	NA	NA	NA	0
-h2c_file_plain	nginx	8	110102.13	NA	NA	NA	0
-h2c_file_plain	veil_base	9	96968.15	NA	NA	NA	0
-h2c_file_plain	veil_new	9	97718.35	NA	NA	NA	0
-h2c_file_plain	nginx	9	110089.91	NA	NA	NA	0
-h2c_file_plain	veil_new	10	97227.87	NA	NA	NA	0
-h2c_file_plain	veil_base	10	96443.57	NA	NA	NA	0
-h2c_file_plain	nginx	10	111084.40	NA	NA	NA	0
+scenario	server	iter	rps	transfer_mbps	p50_ms	p99_ms	errors
+# ==== 2026-08-28 FreeBSD 14.3 aarch64（QEMU+HVF）ネイティブ計測 ====
+# B-76 / F-169 / B-77 / B-80 適用後。54,576B、3 反復、veil/nginx とも cpuset 0,1 固定・負荷生成 2,3。
+# 双方 open_file_cache 有効、veil は static_file_cache も有効（F-157 の条件揃え）。
+# B-80 修正により h1_file_plain が 0 rps（全エラー）から正常計測へ回復している。
+h1_file_tls     nginx   1     49831.62   20807.68  1.140    3.400     0
+h1_file_tls     veil    1     64784.99   27033.60  0.849    1.200     0
+h2_file_tls     nginx   1     42760.24   17858.56  0.000    0.000     0
+h2_file_tls     veil    1     59967.54   24985.60  0.000    0.000     0
+h1_file_plain   nginx   1     91974.33   38502.40  0.367    0.557     0
+h1_file_plain   veil    1     96809.13   40386.56  0.350    0.477     0
+h2c_file_plain  nginx   1     103491.30  43253.76  0.000    0.000     0
+h2c_file_plain  veil    1     97662.29   40714.24  0.000    0.000     0
+h3_file         nginx   1     5891.46    2453.10   280.270  1063.300  0
+h3_file         veil    1     5640.08    2348.43   207.530  1887.250  0
+h1_proxy_tls    nginx   1     23165.08   9666.56   2.750    3.750     0
+h1_proxy_tls    veil    1     21279.19   8929.28   2.560    4.600     0
+h2_proxy_tls    nginx   1     13489.92   5638.56   0.000    0.000     0
+h2_proxy_tls    veil    1     18018.80   7511.28   0.000    0.000     0
+l4_tcp          nginx   1     39298.07   16465.92  1.620    2.760     0
+l4_tcp          veil    1     43644.89   18268.16  1.440    2.170     0
+h1_file_tls     nginx   2     25150.73   10485.76  2.470    3.750     0
+h1_file_tls     veil    2     33369.17   13926.40  1.620    2.400     0
+h2_file_tls     nginx   2     24704.33   10321.92  0.000    0.000     0
+h2_file_tls     veil    2     32173.92   13434.88  0.000    0.000     0
+h1_file_plain   nginx   2     54187.69   22691.84  0.624    0.970     0
+h1_file_plain   veil    2     57643.92   24084.48  0.587    0.802     0
+h2c_file_plain  nginx   2     85131.35   35553.28  0.000    0.000     0
+h2c_file_plain  veil    2     62990.36   26214.40  0.000    0.000     0
+h3_file         nginx   2     3718.63    1548.37   452.790  1574.960  0
+h3_file         veil    2     3553.20    1479.49   304.150  2112.910  0
+h1_proxy_tls    nginx   2     18739.25   7864.32   3.390    5.300     0
+h1_proxy_tls    veil    2     18338.76   7700.48   3.490    4.380     0
+h2_proxy_tls    nginx   2     14168.38   5922.16   0.000    0.000     0
+h2_proxy_tls    veil    2     18873.40   7867.52   0.000    0.000     0
+l4_tcp          nginx   2     39891.92   16711.68  1.620    2.290     0
+l4_tcp          veil    2     42836.99   17940.48  1.470    2.070     0
+h1_file_tls     nginx   3     24472.55   10240.00  2.550    3.670     0
+h1_file_tls     veil    3     31980.21   13352.96  1.670    2.150     0
+h2_file_tls     nginx   3     21535.68   9011.20   0.000    0.000     0
+h2_file_tls     veil    3     33215.54   13844.48  0.000    0.000     0
+h1_file_plain   nginx   3     52021.02   21790.72  0.653    1.070     0
+h1_file_plain   veil    3     52503.60   21872.64  0.638    0.920     0
+h2c_file_plain  nginx   3     76737.46   32030.72  0.000    0.000     0
+h2c_file_plain  veil    3     56045.25   23347.20  0.000    0.000     0
+h3_file         nginx   3     3482.19    1449.92   483.400  1622.750  0
+h3_file         veil    3     3325.60    1384.72   396.110  2148.330  0
+h1_proxy_tls    nginx   3     16732.72   6963.20   3.700    5.970     0
+h1_proxy_tls    veil    3     16968.87   7127.04   3.760    4.640     0
+h2_proxy_tls    nginx   3     12625.21   5277.12   0.000    0.000     0
+h2_proxy_tls    veil    3     16329.72   6807.12   0.000    0.000     0
+l4_tcp          nginx   3     37010.99   15482.88  1.930    2.970     0
+l4_tcp          veil    3     40764.61   17039.36  1.560    2.140     0
