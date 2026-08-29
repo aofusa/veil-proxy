@@ -315,16 +315,21 @@ tools/qemu/bsd-vm.sh netbsd aarch64 all
 ./packaging/scripts/build-bsd.sh --all
 ```
 
-**NetBSD 固有の注意（F-140、未検証）**:
+**NetBSD 固有の注意（F-140）**:
 
-- x86_64 は起動可能な `-live.img.gz`（生イメージ）をそのまま qcow2 化して使う
-  （OpenBSD のような autoinstall は不要と見込んでいる）。cloud-init 相当が無いため
-  `provision` はシリアルコンソールへ root ログインして SSH 鍵を注入する
-  （`tools/qemu/netbsd-provision.py`、FreeBSD の `--mode login` と同じ発想）。
-- aarch64 は install ISO のみが配布されているため、`sysinst`（メニュー主導の
-  対話型インストーラ）をシリアルから自動操作する
-  （`tools/qemu/netbsd-autoinstall.py`。OpenBSD の `autoinstall(8)` と異なり応答
-  ファイル方式が無いため、キー送出ベースの自動化になっている）。
+- **両アーキとも**配布されている起動可能な生イメージ（x86_64 = `-live.img.gz`、
+  aarch64 = `evbarm-aarch64/binary/gzimg/arm64.img.gz`）をそのまま qcow2 化して使う。
+  cloud-init 相当が無いため `provision` はシリアルコンソールへ root ログインして
+  SSH 鍵を注入する（`tools/qemu/netbsd-provision.py`、FreeBSD の `--mode login` と
+  同じ発想）。aarch64 は当初 install ISO の `sysinst` をシリアル自動操作していたが、
+  実機で言語選択メニューのまま停止するため廃止した。
+- **x86_64 のルートディスクは拡張してはいけない（B-82）。** live イメージは
+  MBR + BIOS 経路のため、qcow2 の仮想サイズを変えると CHS ジオメトリが変わって
+  ルートパーティションの位置がずれ、起動時の fsck が `UNEXPECTED INCONSISTENCY`
+  で失敗する。ビルドに必要な容量は `setup` が作る 2 台目のディスク
+  （`scratch.qcow2` → ゲストの `ld1`）で与え、`provision` が `/work` にマウントして
+  `/usr/pkg`・`/var/db/pkgin`・`GUEST_ROOT`・`CARGO_HOME`・`TMPDIR` をそこへ逃がす。
+  aarch64 は UEFI + GPT でこの CHS 依存が無いため、従来どおり拡張する。
 - `toolchain` は **`rust-bin`**（バイナリパッケージ）を pkgin で導入する
   （`rust`（ソースビルド）は QEMU 上で数時間かかるため避ける）。
 - x86_64 は Rust 1.96.0、aarch64 は Rust 1.91.1 が pkgsrc から入手できる
