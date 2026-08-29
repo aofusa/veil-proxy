@@ -184,3 +184,14 @@ FreeBSD 14.3 aarch64（QEMU/HVF、**他 VM を止めた静かなホスト**）�
   （`req_body_rx` を満たす側＝メインループが止まっていないか）。
 - FreeBSD **x86_64** でも同じ失敗が出るかを見る（aarch64 固有か FreeBSD 全体かの切り分け）。
 - 失敗率の定量化には同一ビルドで 10 回以上必要（現状 7 回で 5 失敗 2 成功）。
+
+
+### 2026-08-29 追記2: FreeBSD **x86_64** では再現しない
+
+同日に FreeBSD 14.3 **amd64**（TCG）でもフル E2E を回した（535 passed / 9 failed）。
+失敗 9 件は concurrent/stress 5・config_validation 2・oversized_header・rate limiting で、
+**`test_http3_large_request_body` を含む HTTP/3 系は 1 件も失敗していない**。
+
+したがって本件は **FreeBSD/aarch64 固有**の可能性が高い（FreeBSD 全体の問題ではない）。
+Linux（io_uring / epoll とも 544/544）でも起きないため、
+**aarch64 の kqueue reactor 経路**を疑うのが次の一手になる。

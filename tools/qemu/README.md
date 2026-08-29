@@ -200,7 +200,25 @@ native モードでの相違点（利用者から見て変わるのは主に「D
 | NetBSD x86_64（F-140、2026-08-06 実機） | **フルビルド + E2E 実行可能**（`full-netbsd`、wasm 込み、18分32秒）。E2E は B-60 の `paxctl +m` 適用後 **530 passed / 12 failed**（適用前は 507 passed / 35 failed で 35 件は全て wasm テスト）。下記「NetBSD で踏んだ落とし穴」参照 |
 | NetBSD x86_64（2026-08-29 再測、Apple Silicon 上の **TCG**） | **534 passed / 10 failed**（183.93s。HVF の aarch64 が 43s なので 4 倍以上遅い）。**失敗 10 件を 1 件ずつ再実行して切り分けた**: **5 件は単独なら成功**（`http3_request_body_streaming_tls_backend` 6.14s / `http3_sni_and_cert_reload` 4.44s / `http3_throughput` 0.46s / `http3_udp_unreachable_fallback` 3.26s / `rate_limiting_with_config` 3.85s）＝並列実行時の負荷起因。**残り 5 件（HTTP/3 + WASM 4 件・HTTP/3 + WebSocket 1 件）は単独でも失敗する**。原因は E2E ハーネスのログに出る `Proxy failed to become ready within 180s (WASM AOT compile?)` で、**TCG 上では WASM の AOT コンパイル（Pulley）が 180 秒の起動待ちを超過する**ため。B-58（OpenBSD の Pulley が極端に遅い）と同じ現象がエミュレーションで増幅されたもので、**機能不全ではない**。実機の NetBSD x86_64 では 2026-08-06 に完走している。**「NetBSD x86_64 の失敗は全て負荷起因」という従来の記述は誤り**だった |
 | NetBSD aarch64（F-140、2026-08-06 実機） | **フルビルド可**（`full-netbsd`、wasm 込み。B-59 の `CFLAGS_aarch64_unknown_netbsd` 指定が必須）。E2E は **フルスイート完走不能**（B-62: dev-dependency の quinn-udp が NetBSD/aarch64 で panic → プロセスabort）が、`TEST_FILTER=wasm_tests` では `test result: ok. 23 passed; 0 failed; 519 filtered out` |
+| **2026-08-29 一斉検証（6 環境すべて）** | 下表参照。**aarch64 は HVF、x86_64 は TCG** |
 | `linux-aarch64-e2e.sh` | **未実行**（KVM 非対応ホストでは TCG が実用不能） |
+
+### 2026-08-29: BSD 6 環境の E2E 一斉実行（Apple Silicon / aarch64=HVF・x86_64=TCG）
+
+| 環境 | 結果 | 内訳 |
+|---|---|---|
+| OpenBSD aarch64 | **543 passed / 0 failed** | 初回は `test_h2c_invalid_frame` が 1 件失敗したが**再実行で解消**（負荷フレーク） |
+| NetBSD aarch64 | **421 passed / 0 failed** | **B-62 を修正**して初めて完走できるようになった（従来は SIGABRT で 1 件も走らず）。HTTP/3 はこの環境ではコンパイル対象外 |
+| FreeBSD aarch64 | 543 passed / **1 failed** | `test_http3_large_request_body`（**B-68**）。単独実行でも約 50% 失敗する |
+| NetBSD x86_64 | 534 passed / **10 failed** | 5 件は単独なら成功（負荷起因）。5 件（HTTP/3+WASM 4・HTTP/3+WebSocket 1）は **TCG 上の WASM AOT が 180 秒の起動待ちを超過**するため |
+| OpenBSD x86_64 | 538 passed / **5 failed** / 1 ignored | 全て concurrent/stress 4 件 + rate limiting 1 件。**HTTP/3 の失敗は無し** |
+| FreeBSD x86_64 | 535 passed / **9 failed** | 全て concurrent/stress 5 件 + config_validation 2 件 + oversized_header + rate limiting。**HTTP/3 の失敗は無し**（B-68 の `large_request_body` も通過） |
+
+**x86_64（TCG）では単独実行による切り分けができない。** `tests/e2e_setup.sh start` の
+サーバ起動（WASM AOT コンパイル）が 180 秒の待ち時間を超過し、さらに feature/env が
+少しでも違うとフルリビルド（実測 41 分）が走るため。切り分けが必要なら
+**フルスイートを回した直後**の、サーバが温まった状態で行うこと
+（NetBSD x86_64 の 10 件はこの方法で切り分けた）。
 
 ### FreeBSD amd64 で踏んだ落とし穴（すべて実測。再発しやすいので残す）
 
