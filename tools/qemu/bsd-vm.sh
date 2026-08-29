@@ -1323,8 +1323,23 @@ cmd_e2e() {
         cmd_ssh "chmod +x ${GUEST_ROOT}/target/debug/veil"
         env_prefix="${env_prefix} VEIL_E2E_SKIP_VEIL_BUILD=1"
     fi
-    log "in-VM E2E（tests/e2e_setup.sh test、features=${CARGO_FEATURES}）"
-    cmd_ssh "cd ${GUEST_ROOT} && ${env_prefix} VEIL_E2E_NO_DEFAULT_FEATURES=1 VEIL_E2E_FEATURES='${CARGO_FEATURES}' bash tests/e2e_setup.sh test"
+    # B-62: NetBSD/aarch64 では E2E の HTTP/3 クライアント（dev-dependency の quinn）が
+    # libc の `_ALIGNBYTES` 不備（NetBSD/aarch64 だけ c_int=3、正しくは c_long=7）で
+    # CMSG のアラインメントをカーネルと 4 バイト取り違え、起動直後に panic する。
+    # さらに `quinn::Endpoint` の Drop 内で二重 panic するため **テストバイナリごと
+    # SIGABRT** になり、フルスイートが 1 件も完走しない。テスト名による `--skip` では
+    # 取りこぼす（`test_alt_svc_upgrade_flow` のように名前に http3/h3 を含まない
+    # HTTP/3 テストがあることを実測で確認）ため、**feature を落として HTTP/3 テストと
+    # クライアントをコンパイル対象から外す**。配布バイナリのビルド（build/fetch）は
+    # `full-netbsd` のままで、HTTP/3 は有効。veil 本体は cmsg を Linux 専用の
+    # io_uring 経路でしか使わないため、この libc の不備の影響を受けない。
+    local e2e_features="${CARGO_FEATURES}"
+    if [[ "${OS_NAME}" == "netbsd" && "${ARCH}" == "aarch64" && "${e2e_features}" == "full-netbsd" ]]; then
+        e2e_features="full-netbsd-no-http3"
+        log "B-62: NetBSD/aarch64 の E2E は HTTP/3 を外した ${e2e_features} で実行する"
+    fi
+    log "in-VM E2E（tests/e2e_setup.sh test、features=${e2e_features}）"
+    cmd_ssh "cd ${GUEST_ROOT} && ${env_prefix} VEIL_E2E_NO_DEFAULT_FEATURES=1 VEIL_E2E_FEATURES='${e2e_features}' bash tests/e2e_setup.sh test"
 }
 
 # packaging へ渡すためにビルド済みバイナリを取り出す

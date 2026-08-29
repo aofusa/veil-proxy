@@ -73,6 +73,7 @@ use common::grpc_client::GrpcFrame;
 use common::http1_client::Http1TestClient;
 
 // 新しい非同期HTTP/3テストクライアント（h3 + quinn）
+#[cfg(feature = "http3")]
 use common::http3_client::{http3_get, Http3TestClient};
 
 // 新しい非同期gRPCテストクライアント（tonic）
@@ -509,6 +510,7 @@ async fn test_proxy_health_endpoint_async() {
 /// HTTP/3基本接続テスト（非同期版）
 #[tokio::test]
 #[ntest::timeout(15000)]
+#[cfg(feature = "http3")]
 async fn test_http3_basic_connection_async() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -537,6 +539,7 @@ async fn test_http3_basic_connection_async() {
 /// HTTP/3 GETリクエストテスト（非同期版）
 #[tokio::test]
 #[ntest::timeout(15000)]
+#[cfg(feature = "http3")]
 async fn test_http3_get_request_async() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
@@ -19865,6 +19868,7 @@ async fn test_alt_svc_http3_advertisement() {
 /// E-H3-F94-02: UDP 到達不能時のフォールバック — H3 失敗後も H2/H1.1 で処理継続
 #[tokio::test]
 #[ntest::timeout(20000)]
+#[cfg(feature = "http3")]
 async fn test_http3_udp_unreachable_fallback() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");

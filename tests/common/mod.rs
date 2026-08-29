@@ -8,7 +8,12 @@
 #![allow(clippy::disallowed_methods)]
 
 // 新しいHTTP/3テストクライアント（h3+quinn版）
-// http3 featureフラグなしで有効
+// B-62: HTTP/3 テストクライアントは quinn を使う。NetBSD/aarch64 では quinn-udp が
+// libc の `_ALIGNBYTES` 不備で panic し、Drop 内の二重 panic でテストバイナリごと
+// abort するため、`http3` feature を落としてこのモジュールごと切り離せるようにする
+// （`full-netbsd-no-http3`）。以前は feature 無しでも有効にしていたが、利用側は
+// すべて `#[cfg(feature = "http3")]` のテストなので実害は無い。
+#[cfg(feature = "http3")]
 pub mod http3_client;
 
 pub mod grpc_client;
