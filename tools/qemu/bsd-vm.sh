@@ -1219,7 +1219,11 @@ _guest_env_prefix() {
         # pkgsrc の rust-bin/cmake/llvm は /usr/pkg 配下に入り、libclang も
         # /usr/pkg/lib/llvmNN/lib 配下（OpenBSD/FreeBSD の /usr/local とは別系統）。
         # 非対話 ssh セッションには既定で /usr/pkg/{bin,sbin} が PATH に無い。
-        pre='LIBCLANG_PATH=$(find /usr/pkg -name "libclang.so*" 2>/dev/null | head -1 | xargs dirname)'
+        # `find -L`（シンボリックリンクを辿る）であること。B-82 の対処で /usr/pkg は
+        # /work/pkg へのシンボリックリンクになっており、`-L` が無いと find はリンクを
+        # 降りずに **LIBCLANG_PATH が空**になって bindgen が
+        # `Unable to find libclang` で落ちる（実測）。
+        pre='LIBCLANG_PATH=$(find -L /usr/pkg -name "libclang.so*" 2>/dev/null | head -1 | xargs dirname)'
         pre="${pre} PATH=/usr/pkg/bin:/usr/pkg/sbin:/usr/sbin:/sbin:\$PATH"
         if [[ "${ARCH}" == "aarch64" ]]; then
             # B-59: quiche が内蔵する BoringSSL には aarch64 の CPU 機能検出
