@@ -130,7 +130,7 @@ native モードでの相違点（利用者から見て変わるのは主に「D
 |---|---|
 | FreeBSD | 配布の **BASIC-CLOUDINIT** イメージ + NoCloud シード。cloud-init が root パスワード設定と growfs を行い、**SSH 公開鍵はシリアルの getty へ root ログインして注入**する（`freebsd-provision.py --mode login`）。FreeBSD の cloud-init は `write_files` / `runcmd` を実行しないため鍵は cloud-init に任せられない |
 | OpenBSD | 配布 VM イメージが無いので **`miniroot<NN>.img` から autoinstall(8)** で無人インストールする（`openbsd-autoinstall.py`）。応答ファイルは helper コンテナ内の HTTP サーバから `http://10.0.2.2:8000/auto_install.conf` として配る。sets は HTTP ミラーから取得。鍵と sshd 設定は autoinstall が行う |
-| NetBSD（F-140） | x86_64/aarch64 とも起動可能な**生イメージ**をそのまま使う（x86_64 は `-live.img.gz`、aarch64 は `evbarm-aarch64/binary/gzimg/arm64.img.gz`。amd64 の live image に相当する aarch64 向けブータブルイメージ）。cloud-init 相当が無いため、FreeBSD と同様に**シリアルへ root ログインして鍵を注入**する（`netbsd-provision.py`、両アーキ共通）。旧来 aarch64 は install ISO から `sysinst` をシリアル自動操作していたが、実機で言語選択メニューのまま止まり動作しなかったため廃止した |
+| NetBSD（F-140） | x86_64/aarch64 とも起動可能な**生イメージ**をそのまま使う（x86_64 は `-live.img.gz`、aarch64 は `evbarm-aarch64/binary/gzimg/arm64.img.gz`。amd64 の live image に相当する aarch64 向けブータブルイメージ）。cloud-init 相当が無いため、FreeBSD と同様に**シリアルへ root ログインして鍵を注入**する（`netbsd-provision.py`、両アーキ共通）。旧来 aarch64 は install ISO から `sysinst` をシリアル自動操作していたが、実機で言語選択メニューのまま止まり動作しなかったため廃止した。**x86_64 だけはルートディスクを拡張しない**（B-82: MBR + BIOS 経路のため仮想サイズを変えると CHS ジオメトリが変わり、起動時の fsck が `UNEXPECTED INCONSISTENCY` で失敗する）。代わりに `setup` が `scratch.qcow2` を作って `up` が 2 台目（ゲストの `ld1`）として繋ぎ、`provision` が `newfs` して `/work` にマウントしたうえで `/usr/pkg`・`/var/db/pkgin`・`GUEST_ROOT`・`CARGO_HOME`・`TMPDIR` をそこへ逃がす（ルート FS は 1.8G しかなく空きは ~340M しかないため） |
 
 ### ポート割り当て
 

@@ -47,12 +47,12 @@ tools/qemu/bsd-vm.sh netbsd aarch64 build > build.log 2>&1; echo "EXIT=$?"
 Apple Silicon の macOS で `bsd-vm.sh <os> x86_64` を回すと x86_64 は TCG
 エミュレーションになる。**遅いが実用可能**であることを 2026-08-28 に実測した。
 
-| 段階 | FreeBSD 14.3 amd64 | OpenBSD 7.9 amd64 |
-|---|---|---|
-| 初回起動（SSH 到達まで） | 約 15 分 | インストール込みで約 40 分 |
-| toolchain（pkg / pkg_add） | 約 10 分 | 約 10 分 |
-| `--profile dist` ビルド | 約 1 時間 | **約 1 時間 20 分**（うち fat LTO のリンクだけで約 50 分） |
-| 生成物 | 25,751,432 B | 23,582,896 B |
+| 段階 | FreeBSD 14.3 amd64 | OpenBSD 7.9 amd64 | NetBSD 10.1 amd64 |
+|---|---|---|---|
+| 初回起動（SSH 到達まで） | 約 15 分 | インストール込みで約 40 分 | 約 10 分 |
+| toolchain（pkg / pkg_add / pkgin） | 約 10 分 | 約 10 分 | 約 10 分 |
+| `--profile dist` ビルド | 約 1 時間 | **約 1 時間 20 分**（うち fat LTO のリンクだけで約 50 分） | **約 2 時間 30 分**（wasm 込みで wasmtime/cranelift のコンパイルが重い） |
+| 生成物 | 25,751,432 B | 23,582,896 B | 23,491,400 B |
 
 **fat LTO のリンク中は rustc が一切出力しない**ため、ログの最終行が数十分変わらないのは
 正常である（`ps` で QEMU が 100% CPU を維持しているかで生死を判断する。
