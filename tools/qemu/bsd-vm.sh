@@ -353,6 +353,13 @@ cmd_setup() {
             rm -f "${WORKDIR}/live.img.gz" "${WORKDIR}/live.img"
         fi
         [[ -f "${IMG}" ]] || _create_overlay
+        # B-82: x86_64 はルートディスクを拡張できない（_create_overlay 参照）ので、
+        # ビルド用の容量は 2 台目のディスクで与える。provision で newfs して
+        # /work にマウントし、/usr/pkg もそこへ逃がす。
+        if [[ "${ARCH}" == "x86_64" && ! -f "${WORKDIR}/scratch.qcow2" ]]; then
+            log "ビルド用スクラッチディスクを作成（${GROW_GB}G）"
+            helper qemu-img create -f qcow2 scratch.qcow2 "${GROW_GB}G" >/dev/null
+        fi
     fi
     log "setup 完了"
 }
@@ -364,6 +371,18 @@ cmd_setup() {
 # sshd まで到達しない（`No space left on device` が延々と出る = 実測）。
 # そこでオーバーレイ作成時に +${GROW_GB}G して、cloud-init の growfs に拡張させる。
 _create_overlay() {
+    # B-82: NetBSD x86_64 のルートディスクは **拡張してはいけない**。
+    # 配布の live イメージは MBR + disklabel 構成で、qcow2 の仮想サイズを変えると
+    # SeaBIOS が申告する CHS ジオメトリが変わり、ルートパーティションの位置が
+    # ずれて起動時の fsck が `UNEXPECTED INCONSISTENCY` で失敗する
+    # （実測 2/2。拡張しなければ同じ base.qcow2 でマルチユーザまで到達する）。
+    # ビルドに必要な容量は 2 台目のディスク（scratch.qcow2 → /work）で与える。
+    # aarch64 は UEFI + GPT でこの CHS 依存が無いため、従来どおり拡張してよい。
+    if [[ "${OS_NAME}" == "netbsd" && "${ARCH}" == "x86_64" ]]; then
+        log "起動用オーバーレイを作成（NetBSD x86_64: 拡張しない / B-82）"
+        helper qemu-img create -f qcow2 -F qcow2 -b base.qcow2 "${IMG_NAME}" >/dev/null
+        return 0
+    fi
     local base_size total
     base_size="$(helper qemu-img info --output=json base.qcow2 | tr -d ' \n' \
         | sed -n 's/.*"virtual-size":\([0-9]*\).*/\1/p')"
@@ -611,6 +630,13 @@ _write_boot() {
   -drive if=virtio,format=qcow2,file=${IMG_NAME},index=1"
     else
         drives="-drive if=virtio,format=qcow2,file=${IMG_NAME},index=0${drive_opts}"
+    fi
+
+    # B-82: NetBSD x86_64 のビルド用スクラッチディスク（ゲストからは ld1）。
+    # ルートより後ろの index にするので起動順には影響しない。
+    if [[ -f "${WORKDIR}/scratch.qcow2" ]]; then
+        drives="${drives} \\
+  -drive if=virtio,format=qcow2,file=scratch.qcow2,index=1"
     fi
 
     # --- 追加メディア（cloud-init シード） -----------------------------------
@@ -906,8 +932,46 @@ cmd_provision() {
         [[ "${ARCH}" == "aarch64" ]] && default_wait=1800
         cmd_wait "${1:-${default_wait}}"
         cmd_ssh 'uname -a'
+        _netbsd_init_scratch
         log "provision 完了"
     fi
+}
+
+# B-82: NetBSD x86_64 の 2 台目のディスク（ld1）を newfs して /work にマウントし、
+# pkgsrc の導入先（/usr/pkg）と pkgin のキャッシュ（/var/db/pkgin）をそこへ逃がす。
+#
+# live イメージのルート FS は 1.8G しかなく空きは実測 ~340M。rust-bin を入れた
+# 時点で溢れるため、この退避は必須（ルートディスク自体は拡張できない）。
+# scratch.qcow2 が無い構成（NetBSD aarch64・他 OS）では何もしない。
+# 何度実行しても安全: 既にマウント済み／シンボリックリンク済みなら素通りし、
+# 既存 FS が読めるうちは newfs しない。
+_netbsd_init_scratch() {
+    [[ -f "${WORKDIR}/scratch.qcow2" ]] || return 0
+    log "スクラッチディスク（ld1 → /work）を初期化"
+    cmd_ssh 'set -e
+export PATH=/usr/sbin:/sbin:$PATH
+if ! mount | grep -q " on /work "; then
+  mkdir -p /work
+  # ラベルの無い素のディスクでは a が全体を覆う 4.2BSD パーティションになる（実測）。
+  # 既に FS があるなら作り直さない。
+  if ! mount /dev/ld1a /work 2>/dev/null; then
+    newfs -O2 /dev/rld1a >/dev/null
+    mount /dev/ld1a /work
+  fi
+fi
+grep -q " /work " /etc/fstab || echo "/dev/ld1a /work ffs rw 1 2" >> /etc/fstab
+mkdir -p /work/tmp /work/cargo
+if [ ! -L /usr/pkg ]; then
+  mkdir -p /work/pkg
+  if [ -d /usr/pkg ]; then (cd /usr/pkg && pax -rw -pe . /work/pkg); rm -rf /usr/pkg; fi
+  ln -s /work/pkg /usr/pkg
+fi
+if [ ! -L /var/db/pkgin ]; then
+  mkdir -p /work/pkgin
+  if [ -d /var/db/pkgin ]; then (cd /var/db/pkgin && pax -rw -pe . /work/pkgin); rm -rf /var/db/pkgin; fi
+  ln -s /work/pkgin /var/db/pkgin
+fi
+df -h / /work'
 }
 
 # 起動用オーバーレイを作り直して初期状態へ戻す（base.qcow2 は再利用するので DL 不要）。
@@ -973,10 +1037,13 @@ cmd_scp() { scp "${SCP_OPTS[@]}" "$@"; }
 # FreeBSD は `/` が単一の大きな領域なので `/root` でよい。
 if [[ "${OS_NAME}" == "openbsd" ]]; then
     GUEST_ROOT="${GUEST_ROOT:-/usr/obj/veil-proxy}"
+elif [[ "${OS_NAME}" == "netbsd" && "${ARCH}" == "x86_64" ]]; then
+    # B-82: live イメージのルート FS は 1.8G（空き ~340M）しかなく、ルートディスクは
+    # 拡張できない（_create_overlay 参照）。スクラッチディスク（/work）に置く。
+    GUEST_ROOT="${GUEST_ROOT:-/work/veil-proxy}"
 else
-    # NetBSD もひとまず FreeBSD と同じ /root 配下（live image のパーティション構成が
-    # OpenBSD の autoinstall auto layout ほど狭いかどうかは未検証。狭ければ OpenBSD と
-    # 同様に GUEST_ROOT を広いパーティションへ変える必要がある）。
+    # FreeBSD は `/` が単一の大きな領域。NetBSD aarch64 は gzimg を拡張できるので
+    # どちらも /root 配下でよい。
     GUEST_ROOT="${GUEST_ROOT:-/root/veil-proxy}"
 fi
 
@@ -1163,6 +1230,11 @@ _guest_env_prefix() {
             # NEON は ARMv8 で必須なので `_NEON` を静的に有効化しておく
             # （AES/PMULL/SHA 拡張は使わない分だけ暗号処理は遅くなる）。
             pre="${pre} CFLAGS_aarch64_unknown_netbsd='-DOPENSSL_STATIC_ARMCAP -DOPENSSL_STATIC_ARMCAP_NEON'"
+        fi
+        if [[ "${ARCH}" == "x86_64" ]]; then
+            # B-82: ルート FS が狭いので、cargo のレジストリキャッシュとビルド中の
+            # 一時ファイルもスクラッチディスク（/work）へ逃がす。
+            pre="${pre} CARGO_HOME=/work/cargo TMPDIR=/work/tmp"
         fi
     fi
     echo "${pre}"
