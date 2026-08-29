@@ -168,9 +168,19 @@ FreeBSD 14.3 aarch64（QEMU/HVF、**他 VM を止めた静かなホスト**）�
   補充できず送信が止まる**タイプのデッドロック。HTTP/2 の F-116 で踏んだ
   「消費連動のウィンドウ補充」と同種の問題である可能性がある。
 
+### 追加で否定した仮説: `stream_response` のビジースピンによる upload の starvation
+
+`select_biased!` は `respond` を先に poll するため、`stream_response` が
+`WouldBlock` を `continue` で回してビジースピンすると `upload` が永久に進まない
+（= ボディが送られずバックエンドの drain が 30 秒で諦める）という筋を検討したが、
+**否定した**。`read_into` は平文・TLS のどちらの経路でも `WouldBlock` の際に
+`self.inner.readable().await` で待つ実装になっており（`http3_stream.rs` の
+`read_tcp` および `TlsBackend::read_into`）、ビジースピンしない。
+
 ### 次にやること
 
 - `src/http3_stream.rs` のアップロード側 select で、バックエンド書き込みの待機中も
-  `quiche` の `stream_recv` を回してウィンドウを補充できているかを確認する。
+  `quiche` の `stream_recv` を回してウィンドウを補充できているかを確認する
+  （`req_body_rx` を満たす側＝メインループが止まっていないか）。
 - FreeBSD **x86_64** でも同じ失敗が出るかを見る（aarch64 固有か FreeBSD 全体かの切り分け）。
 - 失敗率の定量化には同一ビルドで 10 回以上必要（現状 7 回で 5 失敗 2 成功）。
