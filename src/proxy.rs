@@ -65,15 +65,24 @@ use crate::simple_tls::SimpleTlsServerStream as ServerTls;
 #[inline]
 async fn connect_target(target: &ProxyTarget, addr: &str) -> io::Result<TcpStream> {
     if let Some(sock_addr) = target.socket_addr {
-        TcpStream::connect(sock_addr).await
-    } else if let Some(path) = &target.unix_path {
-        // F-170: UDS バックエンド。`target.unix_path` があるので `connect_str` の
-        // `unix:` 接頭辞判定を経由せず直接 `connect_unix` を呼ぶ（`connect_str` 側でも
-        // `unix:` を扱えるため二重に安全だが、ホットパスで余計な文字列走査をしない）。
-        TcpStream::connect_unix(std::path::Path::new(path.as_ref())).await
-    } else {
-        TcpStream::connect_str(addr).await
+        return TcpStream::connect(sock_addr).await;
     }
+    // F-170: UDS バックエンド。`target.unix_path` があるので `connect_str` の
+    // `unix:` 接頭辞判定を経由せず直接 `connect_unix` を呼ぶ（`connect_str` 側でも
+    // `unix:` を扱えるため二重に安全だが、ホットパスで余計な文字列走査をしない）。
+    //
+    // **`#[cfg(unix)]` は必須**（B-69 クラス）: `unix_path` は非 unix でも
+    // 存在する（常に `None`）フィールドなので cfg を付けないとこの分岐が
+    // Windows でもコンパイル対象になり、`reactor::tcp::windows::TcpStream` に
+    // 無い `connect_unix` を呼んで**クロスビルドだけが壊れる**（Linux の
+    // 単体・統合・E2E はすべて通過する）。非 unix では `unix_path` が常に `None`
+    // のため、素通りして `connect_str` へ落ちる挙動で正しい（`connect_str` 側も
+    // `unix:` を非対応エラーで弾く）。
+    #[cfg(unix)]
+    if let Some(path) = &target.unix_path {
+        return TcpStream::connect_unix(std::path::Path::new(path.as_ref())).await;
+    }
+    TcpStream::connect_str(addr).await
 }
 
 /// プロキシ起動時刻（F-21: 管理API /stats 用）
