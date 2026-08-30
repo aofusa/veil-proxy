@@ -242,3 +242,19 @@ E2E で UDS バックエンドを veil 自身に喋らせたところ、**UDS �
 F-170 の E2E はこの 2 件を踏まないよう構成した（TLS 用と h2c 用で UDS バックエンドの
 プロセスを分ける / HTTP/3 の検証は TLS 上流で行う）。**この回避は E2E 側だけの措置で、
 本体の修正は B-83 / B-84 で別途行う。**
+
+### 実装中に踏んだ自傷バグ その2（本チケット内で修正済み）
+
+**`connect_target` の UDS 分岐に `cfg(unix)` を付け忘れて Windows ビルドを壊した。**
+`ProxyTarget::unix_path` は非 unix でも型としては存在する（値が常に `None`）ため、
+`if let Some(path) = &target.unix_path { TcpStream::connect_unix(..) }` は
+Windows でもコンパイル対象になり、`reactor::tcp::windows::TcpStream` に無い
+`connect_unix` を呼んで `error[E0599]` になる。
+
+**B-69 / B-73 / B-81 と同じクラスの 4 件目。** 単体 977 件・統合 54 件・
+E2E 551 件（io_uring / epoll の両方）をすべて通過し、
+`packaging/scripts/build-cross.sh --target windows` でのみ検出できた
+（macOS は `reactor/tcp/unix.rs` を共用するため通ってしまう）。
+
+**教訓: 「値が常に `None` だから安全」はコンパイルの話には通用しない。**
+プラットフォーム限定の API を呼ぶ分岐は、条件がどうであれ `cfg` で切ること。

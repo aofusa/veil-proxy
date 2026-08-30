@@ -189,6 +189,16 @@ AI エージェントおよびコントリビュータ向けの **最小指針**
   `runtime::reactor::tcp::unix.rs` の `create_nonblocking_socket` の
   macOS 分岐（素の `SOCK_STREAM` + `fcntl` 2 段設定）を必ず参照すること。**
   これは B-69・B-73 と同じクラスの 3 件目である。
+- **「非 unix でも存在するフィールド」を見る分岐にも `cfg(unix)` が要る（F-170、同クラス 4 件目）** —
+  `ProxyTarget::unix_path` は非 unix でも型としては存在する（値が常に `None`）ため、
+  `if let Some(path) = &target.unix_path { TcpStream::connect_unix(..) }` は
+  **Windows でもコンパイル対象になり**、`reactor::tcp::windows::TcpStream` に無い
+  `connect_unix` を呼んでクロスビルドだけが壊れる。**値が常に `None` だから安全、は
+  コンパイルの話には通用しない。** 非 unix では素通りさせて `connect_str`
+  （`unix:` を非対応エラーで弾く）へ落とすこと。単体 977 件・統合 54 件・
+  E2E 551 件（io_uring / epoll 両方）をすべて通過し、
+  `build-cross.sh --target windows` でのみ検出できた（macOS は
+  `reactor/tcp/unix.rs` を共用するため通ってしまう）。
 - **プラットフォーム限定の関数に付けた `cfg` は、その関数だけが使う定数にも付ける** —
   `#[cfg(target_os = "linux")]` の関数が使う定数に cfg が無いと、非 Linux ビルドで
   `constant ... is never used` 警告になる（B-76 の `SKF_AD_*` で実際に発生。
