@@ -800,6 +800,10 @@ mod tests {
     /// アタッチが Err になるため、その場合はテストをスキップする。
     #[cfg(target_os = "linux")]
     #[test]
+    // 理由付き allow: 単体テストのクライアント接続（同期 connect）とカーネルの
+    // accept 分散待ち（sleep）。いずれもテストコードであり、データプレーンの
+    // ホットパスではない（AGENTS.md「テスト/ベンチは理由付き個別 allow」）。
+    #[allow(clippy::disallowed_methods)]
     fn test_reuseport_cbpf_accept_distribution_not_pinned_to_one_worker() {
         use std::net::{TcpListener as StdTcpListener, TcpStream};
         use std::os::unix::io::{AsRawFd, FromRawFd};
