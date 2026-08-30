@@ -133,3 +133,83 @@ impl ProxyTarget {
 - `TCP_NODELAY` は AF_UNIX に存在しない（既存コードは `let _ =` で無視するので無害）。
 - ヘルスチェックの `timeout_secs` は UDS の connect には適用されない（read/write のみ）。
 - Windows は非対応（設定エラー）。
+
+---
+
+## 実装結果（2026-08-30）
+
+### 設計からの差分
+
+- `ProxyTarget.unix_path` の型は `Option<Arc<PathBuf>>` ではなく **`Option<Arc<str>>`**。
+  接続先表記（`unix:<path>`）の組み立てに必要なのは UTF-8 文字列であり、`PathBuf` を
+  経由すると `to_str()` の変換（と失敗時の panic 経路）が毎回挟まるため。
+  設定は TOML の `String` 由来なので UTF-8 は型で保証できる。
+- `ConnectUnix` は **`sockaddr_un` を Future 生成時に組み立てる**（当初案の
+  「Future がパスを持つ」形は接続確立ごとに `PathBuf` の malloc が 1 回乗るため
+  ホットパス絶対規則に反する）。構築失敗（パス長超過）は `Option<io::Error>` に
+  積んで初回 `poll` で返す。成功パスで `format!` は実行されない。
+- 同期プローブの共通化は `upstream::ProbeStream` + `connect_probe()`。
+  `http3_server.rs` の同期 TLS バックエンド経路もこれを再利用する
+  （列挙の重複実装を作らない）。**`connect_probe` はホスト名を `ToSocketAddrs` で
+  解決する**: 旧実装は `addr.parse().unwrap_or_else(|_| 127.0.0.1:80)` で
+  **ホスト名上流のヘルスチェックを黙って 127.0.0.1:80 へ向けていた**（本チケットで
+  副次的に解消）。ここを `SocketAddr` パースだけにすると、`http3_server.rs` が
+  旧 `std::net::TcpStream::connect(&str)` から引き継いでいる DNS 解決が消えて
+  ホスト名バックエンドが壊れる（レビューで検出・修正済み）。
+- `PoolKeyStr` の `host,port` ベースのコンストラクタは `#[cfg(test)]` へ移し、
+  **F-170 以前の実装を凍結**して addr ベースの新実装と突き合わせる不変条件テストにした
+  （`#[allow(dead_code)]` は使わない）。新実装へ委譲させると「同じコードを 2 回呼ぶだけ」の
+  空虚なテストになるため意図的に実装を重複させている。
+
+### 実装した範囲
+
+| 経路 | 状態 |
+|------|------|
+| HTTP/1.1 クライアント → UDS バックエンド（平文 / TLS / h2c） | 対応 |
+| HTTP/2 クライアント → UDS バックエンド | 対応 |
+| HTTP/3 クライアント → UDS バックエンド（非同期経路・同期 TLS 経路とも） | 対応 |
+| WebSocket プロキシ（平文 / TLS） | 対応 |
+| バックグラウンド再検証（キャッシュ） | 対応 |
+| ヘルスチェック（http / tcp / grpc） | 対応 |
+| L4 TCP ストリームプロキシの上流 | 対応 |
+| L4 UDP の上流 | **非対応**（設定検証と実行時の両方で拒否） |
+| `[[l4]].listen` の UDS | **非対応**（F-164 と同じくスコープ外） |
+| Windows | **非対応**（設定検証エラー） |
+
+### プラットフォーム別セキュリティ
+
+- Linux seccomp: 追加 syscall なし（`IORING_OP_CONNECT` を AF_UNIX で再利用）。
+- Linux Landlock: UDS バックエンドのソケットパスを書き込み許可へ追加（保守的措置）。
+- OpenBSD: pledge に `unix` promise を追加。unveil は **F-164 のリスナーパスも
+  収集漏れだった**ため併せて追加（`config::collect_uds_socket_paths`）。
+- macOS Seatbelt: 同じ収集関数で読み書き許可へ追加。
+- FreeBSD capsicum: 上流接続ありの構成で使えない点は UDS でも同じ（コメントのみ追記）。
+
+### 検証
+
+- `cargo clippy --features full --all-targets -- -D warnings` / `--features "full,epoll"`: 警告ゼロ
+- `cargo test --lib --features full`: 977 件成功
+- `cargo test --features full --test integration_tests`: 54 件成功
+- E2E（`./tests/e2e_setup.sh test`）: F-170 の 7 件（HTTP/1.1・HTTP/2・HTTP/3 の各
+  クライアント → UDS バックエンド、パスプレフィックス、存在しないソケットの 502、
+  UDS 上流への TCP ヘルスチェック）を含めて実行
+- `packaging/scripts/build-cross.sh --target windows|macos`: B-69 / B-81 クラスの
+  非 unix ビルド破壊がないことを確認
+
+### 実装中に発見した既存バグ（F-170 とは無関係・別チケット）
+
+E2E で UDS バックエンドを veil 自身に喋らせたところ、**UDS とは無関係の既存バグ 2 件**を
+踏んだ。どちらも TCP バックエンドでも同じように壊れる。
+
+- **B-83**: 上流 TLS の ALPN で `h2` を提示するのに常に HTTP/1.1 を喋る。
+  `http2_enabled = true` の HTTPS バックエンド（nginx/Envoy の既定構成、veil 同士の
+  多段構成）へ中継すると常に 502。**既存 E2E のバックエンドが `http2_enabled` 未設定
+  ＝ALPN を広告しないため一度も表面化していなかった。**
+- **B-84**: HTTP/3 のストリーミングバックエンド経路（`http3_stream::run_backend_task`）が
+  `use_h2c` を無視して HTTP/1.1 を送る。HTTP/3 → h2c 上流（= gRPC over HTTP/3 の中継）が
+  502 になる。**HTTP/1.1・HTTP/2 クライアントからは同じルートが 200 で通る**ため
+  気づきにくい。
+
+F-170 の E2E はこの 2 件を踏まないよう構成した（TLS 用と h2c 用で UDS バックエンドの
+プロセスを分ける / HTTP/3 の検証は TLS 上流で行う）。**この回避は E2E 側だけの措置で、
+本体の修正は B-83 / B-84 で別途行う。**

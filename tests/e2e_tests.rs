@@ -25273,8 +25273,14 @@ async fn test_e2e_uds_backend_via_http2_client() {
     );
 }
 
-/// HTTP/3 クライアント → UDS バックエンド（h2c）の中継
+/// HTTP/3 クライアント → UDS バックエンド（TLS）の中継
 /// （下流 QUIC / 上流 UDS の組み合わせ）。
+///
+/// **h2c 上流ではなく TLS 上流を使う**: HTTP/3 のストリーミングバックエンド経路
+/// （`http3_stream::run_backend_task`）は `use_h2c` を無視して HTTP/1.1 を送るため、
+/// h2c 専用サーバへ中継すると 502 になる（B-84。UDS とは無関係の既存バグ）。
+/// ここで検証したいのは「下流 HTTP/3 で受けたリクエストを UDS 上流へ中継できること」
+/// なので、その既存バグを踏まない TLS 上流で確認する。
 #[tokio::test]
 #[ntest::timeout(20000)]
 #[cfg(feature = "http3")]
@@ -25296,7 +25302,7 @@ async fn test_e2e_uds_backend_via_http3_client() {
         ),
     };
 
-    let (status, body) = http3_get(&mut send_request, "/uds-h2c/")
+    let (status, body) = http3_get(&mut send_request, "/uds-tls/")
         .await
         .expect("HTTP/3 request to UDS backend failed");
 

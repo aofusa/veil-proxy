@@ -75,6 +75,8 @@ BACKEND_UDP_ECHO_PORT=9019
 # 注意: sockaddr_un の sun_path は 108 バイト上限のため、パスは短く保つこと。
 BACKEND_UDS_TLS_SOCK="${FIXTURES_DIR}/uds_tls.sock"
 BACKEND_UDS_H2C_SOCK="${FIXTURES_DIR}/uds_h2c.sock"
+# h2c 専用プロセスの（使用しない）TLS リスナー。[server].listen は必須キーのため置く。
+BACKEND_UDS_H2C_TLS_SOCK="${FIXTURES_DIR}/uds_h2c_tls.sock"
 BACKEND_UDS_MISSING_SOCK="${FIXTURES_DIR}/uds_missing.sock"
 
 # 色付き出力
@@ -470,12 +472,54 @@ EOF
 
     # F-170: UDS バックエンド設定。veil 自身を Unix ドメインソケットで listen させ
     # （F-164 の UDS リスナー）、プロキシ側から `http(s)://unix:<path>` で接続する。
-    # 1 プロセスで TLS 用（listen）と h2c 用（h2c_listen）の 2 本を listen する。
-    rm -f "${BACKEND_UDS_TLS_SOCK}" "${BACKEND_UDS_H2C_SOCK}"
-    cat > "${FIXTURES_DIR}/backend_uds.toml" << EOF
+    #
+    # **TLS 用と h2c 用でプロセスを分ける**（backend1 と backend_h2c の関係と同じ）。
+    # 1 プロセスにまとめると h2c のために `http2_enabled = true` が必要になり、その
+    # 設定は TLS リスナーの ALPN に `h2` を広告させる。veil の上流 TLS クライアントは
+    # ALPN で `h2` を提示するのに常に HTTP/1.1 を喋るため（B-83、UDS とは無関係の
+    # 既存バグ）、TLS-over-UDS の中継が 502 になってしまう。
+    rm -f "${BACKEND_UDS_TLS_SOCK}" "${BACKEND_UDS_H2C_SOCK}" "${BACKEND_UDS_H2C_TLS_SOCK}"
+    cat > "${FIXTURES_DIR}/backend_uds_tls.toml" << EOF
 [server]
 listen = "unix:${BACKEND_UDS_TLS_SOCK}"
-h2c_listen = "unix:${BACKEND_UDS_H2C_SOCK}"
+threads = 1
+unix_socket_permissions = "0660"
+
+[tls]
+cert_path = "${FIXTURES_DIR}/cert.pem"
+key_path = "${FIXTURES_DIR}/key.pem"
+ktls_enabled = ${backend_ktls_enabled}
+
+[logging]
+level = "warn"
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/*"
+[route.action]
+type = "File"
+path = "${FIXTURES_DIR}/backend_uds"
+index = "index.html"
+[route.security]
+add_response_headers = { "X-Server-Id" = "backend_uds_tls" }
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/*"
+[route.action]
+type = "File"
+path = "${FIXTURES_DIR}/backend_uds"
+index = "index.html"
+[route.security]
+add_response_headers = { "X-Server-Id" = "backend_uds_tls" }
+EOF
+
+    cat > "${FIXTURES_DIR}/backend_uds_h2c.toml" << EOF
+[server]
+listen = "unix:${BACKEND_UDS_H2C_TLS_SOCK}"  # 未使用（listen は必須キー）
+h2c_listen = "unix:${BACKEND_UDS_H2C_SOCK}"  # h2c 専用（使用する）
 threads = 1
 http2_enabled = true
 h2c_enabled = true
@@ -498,7 +542,7 @@ type = "File"
 path = "${FIXTURES_DIR}/backend_uds"
 index = "index.html"
 [route.security]
-add_response_headers = { "X-Server-Id" = "backend_uds" }
+add_response_headers = { "X-Server-Id" = "backend_uds_h2c" }
 
 [[route]]
 [route.conditions]
@@ -509,7 +553,7 @@ type = "File"
 path = "${FIXTURES_DIR}/backend_uds"
 index = "index.html"
 [route.security]
-add_response_headers = { "X-Server-Id" = "backend_uds" }
+add_response_headers = { "X-Server-Id" = "backend_uds_h2c" }
 EOF
 
     # プロキシ設定（設定タイプに応じて生成）
@@ -1990,10 +2034,14 @@ start_servers() {
     echo $! >> "$PIDS_FILE"
     log_info "H2C Backend started on port ${BACKEND_H2C_PORT} (PID: $!)"
 
-    # F-170: UDS バックエンド起動（TLS 用 / h2c 用の 2 ソケットを 1 プロセスで listen）
-    "$VEIL_BIN" -c "${FIXTURES_DIR}/backend_uds.toml" > /tmp/backend_uds.log 2>&1 &
+    # F-170: UDS バックエンド起動（B-83 のため TLS 用と h2c 用でプロセスを分ける）
+    "$VEIL_BIN" -c "${FIXTURES_DIR}/backend_uds_tls.toml" > /tmp/backend_uds_tls.log 2>&1 &
     echo $! >> "$PIDS_FILE"
-    log_info "UDS Backend started on ${BACKEND_UDS_TLS_SOCK} / ${BACKEND_UDS_H2C_SOCK} (PID: $!)"
+    log_info "UDS TLS Backend started on ${BACKEND_UDS_TLS_SOCK} (PID: $!)"
+
+    "$VEIL_BIN" -c "${FIXTURES_DIR}/backend_uds_h2c.toml" > /tmp/backend_uds_h2c.log 2>&1 &
+    echo $! >> "$PIDS_FILE"
+    log_info "UDS H2C Backend started on ${BACKEND_UDS_H2C_SOCK} (PID: $!)"
 
     # gRPCバックエンド起動（スタンドアロンEchoサーバー、ビルドは ensure_veil_binary で完了済み）
     log_info "Starting gRPC Echo Backend..."
@@ -2060,7 +2108,8 @@ start_servers() {
     # UDS 相手に curl が使えないため、ソケットの存在で readiness を判定する）
     local uds_wait=0
     while [ $uds_wait -lt 30 ]; do
-        if [ -S "${BACKEND_UDS_TLS_SOCK}" ] && [ -S "${BACKEND_UDS_H2C_SOCK}" ]; then
+        if [ -S "${BACKEND_UDS_TLS_SOCK}" ] && [ -S "${BACKEND_UDS_H2C_SOCK}" ] \
+            && [ -S "${BACKEND_UDS_H2C_TLS_SOCK}" ]; then
             log_info "UDS Backend is ready (both sockets bound)"
             break
         fi
