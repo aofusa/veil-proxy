@@ -417,13 +417,22 @@ impl TcpStream {
     /// **新しい io_uring オペコードは増やさない**: 既存の `IORING_OP_CONNECT` を
     /// AF_UNIX ソケット + `sockaddr_un` で発行するだけで、TCP 経路（`Connect`）と
     /// SQE の構築ロジック（生成 → addr 詰め → submit → 後始末）を共有する。
+    ///
+    /// `sockaddr_un` の構築はパスに対して純粋なので、Future 生成時（この関数内）で
+    /// 組み立てておき、`poll` 側は完成済みの `sockaddr` + `len` を使うだけにする
+    /// （接続確立ごとに `PathBuf` を確保しない。フェーズ1 レビュー指摘）。パスが
+    /// `sun_path` に収まらない場合は初回 `poll` で `Poll::Ready(Err(..))` を返す。
     pub fn connect_unix(path: &std::path::Path) -> ConnectUnix {
+        let (addr_storage, addr_len, build_err) = match build_sockaddr_un_storage(path) {
+            Ok((storage, len)) => (Box::new(storage), len, None),
+            Err(e) => (Box::new(unsafe { std::mem::zeroed() }), 0, Some(e)),
+        };
         ConnectUnix {
-            path: path.to_path_buf(),
+            build_err,
             fd: -1,
             user_data: 0,
-            addr_storage: Box::new(unsafe { std::mem::zeroed() }),
-            addr_len: 0,
+            addr_storage,
+            addr_len,
             submitted: false,
         }
     }
@@ -820,7 +829,9 @@ fn build_sockaddr_un_storage(
 
 /// AF_UNIX へ接続する Future（`Connect` と同一の SQE 構築・後始末ロジック）。
 pub struct ConnectUnix {
-    path: std::path::PathBuf,
+    /// `connect_unix()` 呼び出し時点で `sockaddr_un` 構築（パス長超過）に失敗した
+    /// 場合のエラー。成功パスでは常に `None`（`format!` は実行されない）。
+    build_err: Option<io::Error>,
     fd: RawFd,
     user_data: u64,
     addr_storage: Box<libc::sockaddr_storage>,
@@ -833,22 +844,15 @@ impl Future for ConnectUnix {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if !self.submitted {
+            if let Some(e) = self.build_err.take() {
+                return Poll::Ready(Err(e));
+            }
+
             let fd = match create_nonblocking_socket(libc::AF_UNIX) {
                 Ok(fd) => fd,
                 Err(e) => return Poll::Ready(Err(e)),
             };
             self.fd = fd;
-
-            let (storage, len) = match build_sockaddr_un_storage(&self.path) {
-                Ok(v) => v,
-                Err(e) => {
-                    unsafe { libc::close(fd) };
-                    self.fd = -1;
-                    return Poll::Ready(Err(e));
-                }
-            };
-            *self.addr_storage = storage;
-            self.addr_len = len;
 
             let user_data = alloc_op();
             self.user_data = user_data;

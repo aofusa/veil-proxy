@@ -79,28 +79,23 @@ impl HostPortStr {
 
     /// `unix:<path>` 形式（F-170: UDS バックエンドの接続先表記）。
     ///
-    /// `ProxyTarget` の設定は TOML の `String` 由来のため、パスは常に UTF-8 が
-    /// 保証される（`to_string_lossy` による非可逆変換は不要）。
+    /// `ProxyTarget::unix_path` は `Arc<str>` で保持しているため、`Path` への往復
+    /// （`to_str()` の `expect` パニック経路）を経由せず `&str` を直接受け取る
+    /// （フェーズ1 レビュー指摘: `expect` はホットパスの panic 経路として不要に
+    /// 危険なため、そもそも UTF-8 でない状態を型で作れないようにする）。
     #[inline]
-    pub(crate) fn unix(path: &std::path::Path) -> Self {
-        // ソケットパスは TOML の `String` 由来（`ProxyTarget::parse`）のため常に UTF-8 が
-        // 保証される。ホットパスで `to_string_lossy` のヒープ確保フォールバックを持たせると
-        // 到達しない分岐のために毎回分岐コストを払うことになるため、`expect` で不変条件を
-        // 明示する（違反時は設定パイプラインのバグとして即座に検出できる方が安全）。
-        let path_str = path
-            .to_str()
-            .expect("UDS socket path must be UTF-8 (guaranteed by ProxyTarget::parse)");
-        let need = 5 + path_str.len(); // "unix:" (5 bytes)
+    pub(crate) fn unix(path: &str) -> Self {
+        let need = 5 + path.len(); // "unix:" (5 bytes)
         if need <= 260 {
             let mut buf = [0u8; 260];
             buf[..5].copy_from_slice(b"unix:");
-            buf[5..need].copy_from_slice(path_str.as_bytes());
+            buf[5..need].copy_from_slice(path.as_bytes());
             HostPortStr::Stack {
                 buf,
                 len: need as u16,
             }
         } else {
-            HostPortStr::Heap(format!("unix:{path_str}"))
+            HostPortStr::Heap(format!("unix:{path}"))
         }
     }
 
@@ -209,32 +204,34 @@ impl PoolKeyStr {
     /// `host:port` 形式（SNI なし、平文/HTTP プール用）。
     ///
     /// F-170: 本番コードは `plain_addr` へ移行済み（`target.conn_addr()` を渡す形）。
-    /// この `host,port` ベースのコンストラクタは、TCP での等価性（1 バイトも変わらない
-    /// こと）を固定する単体テスト専用として残す（`#[cfg(test)]` のため非テストビルドに
-    /// は現れず、`#[allow(dead_code)]` は不要）。
+    /// この `host,port` ベースのコンストラクタは **F-170 以前の実装をそのまま凍結**した
+    /// 単体テスト専用（`#[cfg(test)]`）で、`join_colon` を直接呼ぶ独立した経路として
+    /// `plain_addr` と突き合わせることで不変条件（同じ入力で 1 バイトも変わらない）を
+    /// 検証する。`plain_addr` に委譲すると「同じコードを 2 回呼ぶだけ」の空虚なテストに
+    /// なるため、意図的に実装を重複させている。
     #[cfg(test)]
     #[inline]
     pub(crate) fn plain(host: &str, port: u16) -> Self {
-        let addr = HostPortStr::new(host, port);
-        Self::plain_addr(addr.as_str())
+        let mut port_buf = itoa::Buffer::new();
+        Self::join_colon(&[host, port_buf.format(port)])
     }
 
     /// `host:port:sni:tag` 形式（TLS プール用、`tls_insecure` 設定毎に分離）。
-    /// F-170: 単体テスト専用（上記 `plain` と同じ理由）。
+    /// F-170: 単体テスト専用（上記 `plain` と同じ理由。旧実装を凍結）。
     #[cfg(test)]
     #[inline]
     pub(crate) fn tls(host: &str, port: u16, sni: &str, tls_insecure: bool) -> Self {
-        let addr = HostPortStr::new(host, port);
-        Self::tls_addr(addr.as_str(), sni, tls_insecure)
+        let mut port_buf = itoa::Buffer::new();
+        Self::join_colon(&[host, port_buf.format(port), sni, insecure_tag(tls_insecure)])
     }
 
     /// `host:port:tag` 形式（TLS プール用、SNI なし）。
-    /// F-170: 単体テスト専用（上記 `plain` と同じ理由）。
+    /// F-170: 単体テスト専用（上記 `plain` と同じ理由。旧実装を凍結）。
     #[cfg(test)]
     #[inline]
     pub(crate) fn tls_no_sni(host: &str, port: u16, tls_insecure: bool) -> Self {
-        let addr = HostPortStr::new(host, port);
-        Self::tls_addr_no_sni(addr.as_str(), tls_insecure)
+        let mut port_buf = itoa::Buffer::new();
+        Self::join_colon(&[host, port_buf.format(port), insecure_tag(tls_insecure)])
     }
 }
 
@@ -2067,10 +2064,12 @@ mod stack_fmt_tests {
         assert!(matches!(k, PoolKeyStr::Stack { .. }));
     }
 
-    /// F-170: `host,port` ベースの旧コンストラクタと `addr` ベースの新コンストラクタが
-    /// TCP（`unix:` を含まない `addr`）で完全に同じ文字列を生成すること。
-    /// プールキーが 1 バイトでも変わると再利用が静かに止まるため、この不変条件を
-    /// 単体テストで固定する。
+    /// F-170: `host,port` ベースの旧コンストラクタ（`plain`/`tls`/`tls_no_sni`。
+    /// `join_colon` を直接呼ぶ独立した実装として本テスト内に凍結）と `addr` ベースの
+    /// 新コンストラクタ（`plain_addr`/`tls_addr`/`tls_addr_no_sni`）が、TCP（`unix:` を
+    /// 含まない `addr`）で完全に同じ文字列を生成することを突き合わせる。両者が同じ
+    /// 実装に委譲していると「同じコードを 2 回呼ぶだけ」の空虚なテストになるため、
+    /// 独立した 2 経路の一致を確認する不変条件テストとして維持する。
     #[test]
     fn pool_key_str_addr_based_matches_host_port_based_for_tcp() {
         let host = "backend.example.com";
@@ -2099,7 +2098,7 @@ mod stack_fmt_tests {
     /// （プールキー・ノード ID の入力になる接続先表記の唯一の入口）。
     #[test]
     fn host_port_str_unix_formats_prefixed_path() {
-        let hp = HostPortStr::unix(std::path::Path::new("/run/app.sock"));
+        let hp = HostPortStr::unix("/run/app.sock");
         assert_eq!(hp.as_str(), "unix:/run/app.sock");
     }
 

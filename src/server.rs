@@ -739,21 +739,23 @@ pub fn spawn_health_check_thread() {
                         }
 
                         let target = &server.target;
-                        let addr = format!("{}:{}", target.host, target.port);
+                        // F-170: 接続先表記（UDS 対応、TCP は不変）。
+                        let addr = target.conn_addr();
+                        let addr = addr.as_str();
 
                         // チェック種別に応じてヘルスチェックを実行（F-22）
                         let timeout_dur = Duration::from_secs(hc_config.timeout_secs);
                         let check_result = match hc_config.check_type {
-                            HealthCheckType::Tcp => perform_tcp_health_check(&addr, timeout_dur),
+                            HealthCheckType::Tcp => perform_tcp_health_check(addr, timeout_dur),
                             HealthCheckType::Grpc => perform_grpc_health_check(
-                                &addr,
+                                addr,
                                 &hc_config.path,
                                 hc_config.use_tls,
                                 hc_config.verify_cert,
                                 timeout_dur,
                             ),
                             HealthCheckType::Http => perform_health_check(
-                                &addr,
+                                addr,
                                 &target.host,
                                 &hc_config.path,
                                 hc_config.use_tls,
@@ -764,7 +766,7 @@ pub fn spawn_health_check_thread() {
                         };
 
                         // メトリクス: ヘルスチェック結果を更新
-                        update_upstream_health(name, &addr, check_result);
+                        update_upstream_health(name, addr, check_result);
 
                         if check_result {
                             server.record_success(hc_config.healthy_threshold);

@@ -462,11 +462,27 @@ impl TcpStream {
     }
 
     /// AF_UNIX パスに非同期で接続する（F-170）。
+    ///
+    /// `sockaddr_un` の構築はパスに対して純粋なので、Future 生成時（この関数内）で
+    /// 組み立てておき、`poll` 側は完成済みの `sockaddr_un` + `len` を使うだけにする
+    /// （接続確立ごとに `PathBuf` を確保しない。フェーズ1 レビュー指摘）。パスが
+    /// `sun_path` に収まらない場合は初回 `poll` で `Poll::Ready(Err(..))` を返す。
     pub fn connect_unix(path: &std::path::Path) -> ConnectUnix {
-        ConnectUnix {
-            path: path.to_path_buf(),
-            fd: -1,
-            registered: false,
+        match build_sockaddr_un(path) {
+            Ok((addr, addr_len)) => ConnectUnix {
+                addr,
+                addr_len,
+                build_err: None,
+                fd: -1,
+                registered: false,
+            },
+            Err(e) => ConnectUnix {
+                addr: unsafe { std::mem::zeroed() },
+                addr_len: 0,
+                build_err: Some(e),
+                fd: -1,
+                registered: false,
+            },
         }
     }
 
@@ -950,8 +966,16 @@ fn build_sockaddr_un(path: &std::path::Path) -> io::Result<(libc::sockaddr_un, l
 }
 
 /// AF_UNIX へ接続する Future（`Connect` と同じ try-first パターン）。
+///
+/// `addr`/`addr_len` は `TcpStream::connect_unix()`（Future 生成時）で組み立て済み。
+/// `Box` にせずインラインで持つ（`sockaddr_un` は確保ゼロ・既存 `Connect` の
+/// `SocketAddr` フィールドと同等の増分）。
 pub struct ConnectUnix {
-    path: std::path::PathBuf,
+    addr: libc::sockaddr_un,
+    addr_len: libc::socklen_t,
+    /// `connect_unix()` 呼び出し時点で `sockaddr_un` 構築（パス長超過）に失敗した
+    /// 場合のエラー。成功パスでは常に `None`（`format!` は実行されない）。
+    build_err: Option<io::Error>,
     fd: RawFd,
     registered: bool,
 }
@@ -975,21 +999,23 @@ impl Future for ConnectUnix {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.fd < 0 {
+            if let Some(e) = self.build_err.take() {
+                return Poll::Ready(Err(e));
+            }
+
             let fd = match create_nonblocking_socket(libc::AF_UNIX) {
                 Ok(fd) => fd,
                 Err(e) => return Poll::Ready(Err(e)),
             };
             self.fd = fd;
 
-            let (addr, len) = match build_sockaddr_un(&self.path) {
-                Ok(v) => v,
-                Err(e) => {
-                    unsafe { libc::close(fd) };
-                    self.fd = -1;
-                    return Poll::Ready(Err(e));
-                }
+            let ret = unsafe {
+                libc::connect(
+                    fd,
+                    &self.addr as *const _ as *const libc::sockaddr,
+                    self.addr_len,
+                )
             };
-            let ret = unsafe { libc::connect(fd, &addr as *const _ as *const libc::sockaddr, len) };
             if ret == 0 {
                 // 即座に接続完了（AF_UNIX は多くの場合これに当たる）。
                 let fd = self.fd;

@@ -163,9 +163,19 @@ pub async fn handle_l4_udp_listener(
                         }
                     };
 
+                // F-170: UDP 上流は UDS 非対応（設定検証で `unix:` は既に拒否済みの想定）。
+                // `L4Endpoint::Unix` が来た場合は防御的に「解決失敗」として扱う。
                 let socket_addr = match upstream_targets.get(upstream_idx) {
                     Some(target) => match resolve_upstream_target(target).await {
-                        Some(a) => a,
+                        Some(crate::l4::proxy::L4Endpoint::Tcp(a)) => a,
+                        #[cfg(unix)]
+                        Some(crate::l4::proxy::L4Endpoint::Unix(_)) => {
+                            warn!(
+                                "[L4:{}] unix domain socket upstream is not supported for UDP: {}",
+                                config.name, upstream_addr_str
+                            );
+                            continue;
+                        }
                         None => {
                             warn!(
                                 "[L4:{}] failed to resolve upstream {}",

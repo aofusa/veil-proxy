@@ -2374,6 +2374,8 @@ pub fn report_sandbox_support() {
 //   グローバル名前空間操作（`connect(2)`、`open(2)` の絶対パス等）が一切できなくなるため、
 //   バックエンドへ `connect(2)` する構成（プロキシ/upstream あり）では使えない
 //   （設計ドキュメント 4.2 節）。静的ファイル配信のみの構成でのみ自動適用する。
+//   UDS バックエンド接続（F-170）も AF_UNIX へのパス指定 `connect(2)` である点は同じで、
+//   同じ制約を受ける（upstream ありの構成では capsicum は使えない、という結論に変更なし）。
 #[cfg(target_os = "freebsd")]
 pub mod capsicum {
     use ftlog::{info, warn};

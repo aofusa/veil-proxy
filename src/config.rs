@@ -1400,6 +1400,122 @@ fn default_landlock_write_paths() -> Vec<String> {
 }
 
 // ====================
+// UDS ソケットパス収集（F-164 リスナー・F-170 バックエンド、OpenBSD/macOS 共通）
+// ====================
+
+/// 生の `Config`（unveil/Seatbelt 専用の再パース結果）から UDS ソケットパスを収集する。
+///
+/// - `[server].listen` / `[server].h2c_listen` の `unix:<path>`（F-164。リスナー側は
+///   これまで収集漏れだった）。
+/// - `[[route]]` の Proxy URL（`http(s)://unix:<path>[:<prefix>]`）・
+///   `[upstreams.*.servers]` の URL（F-170、単一 URL プロキシと Upstream グループの両方）。
+/// - `[[l4]].upstreams` の `addr`（`unix:<path>`、F-170、上流のみ。`[[l4]].listen` は
+///   対象外）。
+///
+/// ソケットファイル自体は `bind`/`connect` 時点では存在するとは限らない
+/// （リスナー側は自分で作成、バックエンド側は先方プロセスが作成）ため、
+/// `push_unveil_parent_dir`/`push_sandbox_parent_dir` と同じ「ファイル単体を渡す」
+/// 方針をそのまま踏襲する（`unveil_path`/Seatbelt 側が不存在パスを無害にスキップする、
+/// または `connect(2)` 時点でのみ意味を持つため親ディレクトリ限定は不要）。
+#[cfg(any(target_os = "openbsd", target_os = "macos"))]
+fn collect_uds_socket_paths(config: &Config) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    for listen in [
+        Some(&config.server.listen),
+        config.server.h2c_listen.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(path) = listen.strip_prefix("unix:") {
+            if !path.is_empty() {
+                paths.push(PathBuf::from(path));
+            }
+        }
+    }
+
+    if let Some(routes) = &config.route {
+        for route in routes {
+            if let BackendConfig::Proxy { url, .. } = &route.action {
+                if let Some(target) = ProxyTarget::parse(url) {
+                    if let Some(p) = &target.unix_path {
+                        paths.push(PathBuf::from(p.as_ref()));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(upstreams) = &config.upstreams {
+        for group in upstreams.values() {
+            for server in &group.servers {
+                if let Some(target) = ProxyTarget::parse(&server.url) {
+                    if let Some(p) = &target.unix_path {
+                        paths.push(PathBuf::from(p.as_ref()));
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "l4-proxy")]
+    if let Some(l4_listeners) = &config.l4 {
+        for l4 in l4_listeners {
+            for u in &l4.upstreams {
+                if let Some(path) = u.addr.strip_prefix("unix:") {
+                    paths.push(PathBuf::from(path));
+                }
+            }
+        }
+    }
+
+    paths
+}
+
+/// `LoadedConfig` から UDS バックエンドのソケットパスを収集する（F-170: Linux Landlock 用）。
+///
+/// `collect_uds_socket_paths`（OpenBSD/macOS、生の TOML 再パース）と異なり、こちらは
+/// 起動時に既に構築済みの `Route::resolved_backend` / `upstream_groups` をそのまま
+/// 辿る（ロード時に一度だけ実行するコールドパスであり、`entry.rs` の Landlock 適用箇所
+/// から呼ぶ）。Landlock の FS アクセス権限は UDS への `connect(2)` を仲介しないと
+/// 考えられるが、将来の ABI 変更に備えた保守的措置として書き込み許可へ追加する。
+pub(crate) fn collect_uds_backend_paths_from_loaded(
+    routes: &[Route],
+    upstream_groups: &HashMap<String, Arc<UpstreamGroup>>,
+    l4_listeners: &[L4ListenerConfig],
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    let mut push_group = |group: &UpstreamGroup| {
+        for server in &group.servers {
+            if let Some(p) = &server.target.unix_path {
+                paths.push(PathBuf::from(p.as_ref()));
+            }
+        }
+    };
+
+    for route in routes {
+        if let Some(Backend::Proxy(group, ..)) = &route.resolved_backend {
+            push_group(group);
+        }
+    }
+    for group in upstream_groups.values() {
+        push_group(group);
+    }
+
+    for l4 in l4_listeners {
+        for u in &l4.upstreams {
+            if let Some(path) = u.addr.strip_prefix("unix:") {
+                paths.push(PathBuf::from(path));
+            }
+        }
+    }
+
+    paths
+}
+
+// ====================
 // OpenBSD: unveil 対象パス収集（F-120 Phase 5）
 // ====================
 
@@ -1475,6 +1591,11 @@ pub fn collect_unveil_paths(config_path: &Path) -> io::Result<UnveilPaths> {
         push_unveil_parent_dir(&mut read_write_create, file_path);
     }
 
+    // F-164/F-170: UDS リスナー・UDS バックエンドのソケットパス（`unix` promise で
+    // socket/connect/bind が必要）。socket/connect/bind はいずれもパス自体を対象と
+    // するため（親ディレクトリではなく）、`read_write_create` にそのまま追加する。
+    read_write_create.extend(collect_uds_socket_paths(&config));
+
     Ok(UnveilPaths {
         read_only,
         read_write_create,
@@ -1545,6 +1666,11 @@ pub fn collect_macos_sandbox_paths(
     if let Some(file_path) = &config.logging.error_file_path {
         push_sandbox_parent_dir(&mut read_write, file_path);
     }
+
+    // F-164/F-170: UDS リスナー・UDS バックエンドのソケットパス。既存プロファイルは
+    // `(allow system-socket)` 済みだが、パス指定の `connect`/`bind` にはファイルシステム
+    // パーミッションも必要なため読み書き許可へ追加する。
+    read_write.extend(collect_uds_socket_paths(&config));
 
     Ok(SandboxPaths {
         static_roots,
@@ -4339,7 +4465,7 @@ impl ProxyTarget {
     #[inline]
     pub(crate) fn conn_addr(&self) -> crate::http_utils::HostPortStr {
         match &self.unix_path {
-            Some(p) => crate::http_utils::HostPortStr::unix(Path::new(p.as_ref())),
+            Some(p) => crate::http_utils::HostPortStr::unix(p.as_ref()),
             None => crate::http_utils::HostPortStr::new(&self.host, self.port),
         }
     }
@@ -5356,6 +5482,57 @@ fn apply_alt_svc_from_config(config: &Config) {
     }
 }
 
+/// 上流 URL のパース失敗理由を説明するメッセージ（F-170）。
+///
+/// `ProxyTarget::parse` は非 unix プラットフォームで `http(s)://unix:<path>` を常に
+/// `None` にする（`parse_unix` が `#[cfg(not(unix))]` で `None` を返す）ため、素の
+/// "invalid url" だけでは原因（UDS 非対応）が分からない。`unix:` 表記かつ非 unix
+/// ビルドの場合はその旨を明示する。
+fn proxy_url_invalid_reason(url: &str) -> String {
+    #[cfg(not(unix))]
+    {
+        let rest = url
+            .strip_prefix("http://")
+            .or_else(|| url.strip_prefix("https://"));
+        if rest.is_some_and(|r| r.starts_with("unix:")) {
+            return format!(
+                "{} (unix domain socket backends are not supported on this platform)",
+                url
+            );
+        }
+    }
+    url.to_string()
+}
+
+#[cfg(test)]
+mod proxy_url_invalid_reason_tests {
+    use super::proxy_url_invalid_reason;
+
+    #[test]
+    fn plain_invalid_url_is_unchanged() {
+        assert_eq!(
+            proxy_url_invalid_reason("not a url"),
+            "not a url".to_string()
+        );
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn unix_notation_on_non_unix_explains_platform_reason() {
+        let msg = proxy_url_invalid_reason("http://unix:/run/app.sock");
+        assert!(msg.contains("not supported on this platform"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_notation_on_unix_is_unchanged_since_parse_would_succeed() {
+        // unix ビルドでは `unix:` 表記自体は有効なため、ここに到達するのは
+        // 別の理由（空パス等）でパースに失敗した場合のみ。特別なメッセージ拡張はしない。
+        let msg = proxy_url_invalid_reason("http://unix:");
+        assert_eq!(msg, "http://unix:".to_string());
+    }
+}
+
 fn validate_config(config: &Config) -> io::Result<()> {
     // TLS証明書ファイルの存在チェック
     let cert_path = Path::new(&config.tls.cert_path);
@@ -5429,7 +5606,57 @@ fn validate_config(config: &Config) -> io::Result<()> {
                 if ProxyTarget::parse(&entry.url).is_none() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        format!("Invalid server URL in upstream '{}': {}", name, entry.url),
+                        format!(
+                            "Invalid server URL in upstream '{}': {}",
+                            name,
+                            proxy_url_invalid_reason(&entry.url)
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    // L4 上流の妥当性チェック（F-170: `unix:<path>` の非対応プラットフォームでの
+    // 使用を明確なエラーにする）。
+    #[cfg(feature = "l4-proxy")]
+    for l4 in config.l4.iter().flatten() {
+        #[cfg(unix)]
+        for u in &l4.upstreams {
+            if let Some(path) = u.addr.strip_prefix("unix:") {
+                if path.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "L4 listener '{}' upstream '{}': empty unix socket path",
+                            l4.name, u.addr
+                        ),
+                    ));
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        for u in &l4.upstreams {
+            if u.addr.starts_with("unix:") {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "L4 listener '{}' upstream '{}': unix domain socket backends are not supported on this platform",
+                        l4.name, u.addr
+                    ),
+                ));
+            }
+        }
+        // F-170: UDP 上流は UDS 非対応（QUIC/UDP は AF_UNIX に載らない）。
+        if l4.protocol == L4Protocol::Udp {
+            for u in &l4.upstreams {
+                if u.addr.starts_with("unix:") {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "L4 listener '{}' upstream '{}': unix domain socket backends are not supported for UDP",
+                            l4.name, u.addr
+                        ),
                     ));
                 }
             }
@@ -5509,7 +5736,11 @@ fn validate_route_config(
             if ProxyTarget::parse(url).is_none() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("Invalid proxy URL for route '{}': {}", route_name, url),
+                    format!(
+                        "Invalid proxy URL for route '{}': {}",
+                        route_name,
+                        proxy_url_invalid_reason(url)
+                    ),
                 ));
             }
         }

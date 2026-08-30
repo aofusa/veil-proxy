@@ -3572,7 +3572,8 @@ async fn proxy_to_tls_backend_async(
     drop(tcp_stream);
 
     let skip_verify = tls_insecure;
-    let addr = format!("{}:{}", target.host, target.port);
+    // F-170: 接続先表記（UDS 対応、TCP は不変）。別スレッドへ move するため所有文字列化する。
+    let addr = target.conn_addr().as_str().to_string();
     let sni_name = target
         .sni_name
         .as_deref()
@@ -3644,14 +3645,12 @@ async fn proxy_to_tls_backend_async(
         use std::io::Write;
         let result = (|| -> io::Result<BackendProxyResult> {
             let timeout = Duration::from_secs(timeout_secs);
-            // TODO(F-170 phase3): UDS バックエンドはこの同期経路（別スレッド std::net）
-            // では未対応。target.host/port ベースの addr のままなので UDS では接続に失敗する。
-            let mut std_stream = std::net::TcpStream::connect(&addr as &str).map_err(|e| {
+            // F-170: TCP/UDS 共通の接続入口（`upstream::connect_probe` を再利用し、
+            // 同じ列挙を重複実装しない）。
+            let mut std_stream = crate::upstream::connect_probe(&addr, timeout).map_err(|e| {
                 warn!("[HTTP/3] std backend connect error: {}", e);
                 e
             })?;
-            std_stream.set_read_timeout(Some(timeout))?;
-            std_stream.set_write_timeout(Some(timeout))?;
             let server_name = rustls::pki_types::ServerName::try_from(sni_name)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
             let mut conn = rustls::ClientConnection::new(config, server_name)
@@ -3714,7 +3713,8 @@ async fn proxy_to_tls_backend_async(
     drop(tcp_stream);
 
     let skip_verify = tls_insecure;
-    let addr = format!("{}:{}", target.host, target.port);
+    // F-170: 接続先表記（UDS 対応、TCP は不変）。別スレッドへ move するため所有文字列化する。
+    let addr = target.conn_addr().as_str().to_string();
     let sni_name = target
         .sni_name
         .as_deref()
@@ -3783,14 +3783,12 @@ async fn proxy_to_tls_backend_async(
         use std::io::Write;
         let result = (|| -> io::Result<BackendProxyResult> {
             let timeout = Duration::from_secs(timeout_secs);
-            // TODO(F-170 phase3): UDS バックエンドはこの同期経路（別スレッド std::net）
-            // では未対応。target.host/port ベースの addr のままなので UDS では接続に失敗する。
-            let mut std_stream = std::net::TcpStream::connect(&addr as &str).map_err(|e| {
+            // F-170: TCP/UDS 共通の接続入口（`upstream::connect_probe` を再利用し、
+            // 同じ列挙を重複実装しない）。
+            let mut std_stream = crate::upstream::connect_probe(&addr, timeout).map_err(|e| {
                 warn!("[HTTP/3] std backend connect error: {}", e);
                 e
             })?;
-            std_stream.set_read_timeout(Some(timeout))?;
-            std_stream.set_write_timeout(Some(timeout))?;
             let server_name = rustls::pki_types::ServerName::try_from(sni_name)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
             let mut conn = rustls::ClientConnection::new(config, server_name)

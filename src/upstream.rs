@@ -6,9 +6,127 @@ use crate::config::*;
 use crate::routing;
 use ftlog::{debug, warn};
 use std::collections::HashMap;
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+
+// ====================
+// ヘルスチェック用の同期プローブ接続（F-170: TCP/UDS 両対応）
+// ====================
+
+/// ヘルスチェック専用スレッド（イベントループ外）が使う同期プローブ接続。
+///
+/// TCP と UDS（`cfg(unix)` のみ）を単一の `Read`/`Write` 実装で扱えるようにし、
+/// 3 プローブ（HTTP/TCP/gRPC）と `http3_server.rs` の同期 TLS バックエンド経路が
+/// 重複実装を持たずに再利用できるようにする（F-170）。
+pub(crate) enum ProbeStream {
+    Tcp(std::net::TcpStream),
+    #[cfg(unix)]
+    Unix(std::os::unix::net::UnixStream),
+}
+
+impl io::Read for ProbeStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            ProbeStream::Tcp(s) => s.read(buf),
+            #[cfg(unix)]
+            ProbeStream::Unix(s) => s.read(buf),
+        }
+    }
+}
+
+impl io::Write for ProbeStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            ProbeStream::Tcp(s) => s.write(buf),
+            #[cfg(unix)]
+            ProbeStream::Unix(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            ProbeStream::Tcp(s) => s.flush(),
+            #[cfg(unix)]
+            ProbeStream::Unix(s) => s.flush(),
+        }
+    }
+}
+
+/// ヘルスチェック接続の唯一の入口（F-170）。
+///
+/// `unix:<path>` 接頭辞なら `UnixStream::connect`（connect にタイムアウト付き API が
+/// 無いため、接続後に `set_read_timeout`/`set_write_timeout` のみ適用する。UDS の
+/// connect はローカルで即時完了するためタイムアウトの必要性が低い）。それ以外は
+/// **まず `SocketAddr` としてパースし、失敗したらホスト名として同期 `getaddrinfo`
+/// （`ToSocketAddrs`）で解決して最初のアドレスを使う**。ホスト名解決はここでのみ
+/// 発生し、呼び出し元はヘルスチェック専用スレッド／`http3_server.rs` の同期 TLS
+/// バックエンド専用スレッドに限られる（いずれもイベントループ外で実行されるため、
+/// AGENTS.md のホットパス絶対規則「同期処理禁止」には抵触しない）。
+///
+/// この関数は `http3_server.rs::proxy_to_tls_backend_async` が本来呼んでいた
+/// **旧 `std::net::TcpStream::connect(&addr as &str)`（`&str` の `ToSocketAddrs` 実装
+/// による DNS 解決）を引き継ぐもの**である。F-170 導入時に一度 `addr.parse::<SocketAddr>()`
+/// のみへ簡略化してしまい、ホスト名指定の HTTPS バックエンド（`backend.example.com:8080`）
+/// へ HTTP/3 経由で中継できなくなる退行を生んでいたため、ここで DNS 解決を復元する。
+///
+/// **副次的な改善**: 旧ヘルスチェック実装（`perform_health_check` 等）は
+/// `addr.parse().unwrap_or_else(|_| 127.0.0.1:80)` により、ホスト名を指定した上流に
+/// 対しては **黙って `127.0.0.1:80` へ接続していた**（パース失敗を握りつぶすバグ）。
+/// この関数への統一と DNS 解決の追加により、ホスト名指定の上流でも正しいアドレスへ
+/// ヘルスチェックが飛ぶようになった。
+///
+/// **パース・解決の両方に失敗した場合は `io::Error` として返す**（`bool` を返す
+/// プローブ関数側は `Err` を `false` へ変換するので、「不正アドレスは false」という
+/// 既存の振る舞いは維持される）。
+// 理由付き allow: ヘルスチェック専用スレッド／HTTP3 同期 TLS 専用スレッド（いずれも
+// イベントループ外）の同期 I/O・同期 DNS 解決。
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn connect_probe(addr: &str, timeout: Duration) -> io::Result<ProbeStream> {
+    #[cfg(unix)]
+    if let Some(path) = addr.strip_prefix("unix:") {
+        let stream = std::os::unix::net::UnixStream::connect(path)?;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
+        return Ok(ProbeStream::Unix(stream));
+    }
+    #[cfg(not(unix))]
+    if addr.starts_with("unix:") {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unix domain socket backends are not supported on this platform",
+        ));
+    }
+
+    let sock_addr: SocketAddr = match addr.parse() {
+        Ok(a) => a,
+        Err(_) => {
+            use std::net::ToSocketAddrs;
+            addr.to_socket_addrs()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
+                .next()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no address resolved"))?
+        }
+    };
+    let stream = std::net::TcpStream::connect_timeout(&sock_addr, timeout)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    Ok(ProbeStream::Tcp(stream))
+}
+
+/// ヘルスチェックの Host ヘッダ用ホスト名を接続先表記から導く（F-170）。
+///
+/// `unix:` 接頭辞（UDS）は `addr.split(':').next()` すると無意味な `"unix"` になる
+/// ため、`"localhost"` を返す。TCP は従来どおり `host:port` の先頭部分。
+#[inline]
+fn probe_host_header(addr: &str) -> &str {
+    if addr.starts_with("unix:") {
+        "localhost"
+    } else {
+        addr.split(':').next().unwrap_or(addr)
+    }
+}
 
 /// 同期的な健康チェックを実行
 ///
@@ -28,22 +146,13 @@ pub(crate) fn perform_health_check(
     use rustls::pki_types::ServerName;
     use rustls::{ClientConfig, ClientConnection, RootCertStore};
     use std::io::{ErrorKind, Read, Write};
-    use std::net::TcpStream as StdTcpStream;
     use std::sync::Arc;
 
-    // TCP 接続
-    let mut tcp_stream = match StdTcpStream::connect_timeout(
-        &addr
-            .parse()
-            .unwrap_or_else(|_| std::net::SocketAddr::from(([127, 0, 0, 1], 80))),
-        timeout,
-    ) {
+    // F-170: TCP/UDS 共通の接続入口（パース失敗は false へ変換）。
+    let mut tcp_stream = match connect_probe(addr, timeout) {
         Ok(s) => s,
         Err(_) => return false,
     };
-
-    let _ = tcp_stream.set_read_timeout(Some(timeout));
-    let _ = tcp_stream.set_write_timeout(Some(timeout));
 
     // TLS接続の場合
     if use_tls {
@@ -214,13 +323,7 @@ pub(crate) fn perform_health_check(
 /// HTTP リクエストは送信せず、TCP 3-way ハンドシェイクが完了すれば healthy と判断。
 /// L4 バックエンドや非 HTTP サービスの死活監視に使用する。
 pub(crate) fn perform_tcp_health_check(addr: &str, timeout: Duration) -> bool {
-    use std::net::TcpStream as StdTcpStream;
-
-    let sock_addr = match addr.parse() {
-        Ok(a) => a,
-        Err(_) => return false,
-    };
-    StdTcpStream::connect_timeout(&sock_addr, timeout).is_ok()
+    connect_probe(addr, timeout).is_ok()
 }
 
 /// gRPC Health Checking Protocol によるヘルスチェック（F-22）
@@ -264,17 +367,9 @@ fn perform_grpc_health_check_h2c(
     use crate::http2::hpack::{HpackDecoder, HpackEncoder};
     use crate::http2::settings::defaults;
     use std::io::{Read, Write};
-    use std::net::TcpStream as StdTcpStream;
 
-    let mut stream = StdTcpStream::connect_timeout(
-        &addr
-            .parse()
-            .unwrap_or_else(|_| std::net::SocketAddr::from(([127, 0, 0, 1], 80))),
-        timeout,
-    )
-    .map_err(|_| ())?;
-    let _ = stream.set_read_timeout(Some(timeout));
-    let _ = stream.set_write_timeout(Some(timeout));
+    // F-170: TCP/UDS 共通の接続入口。
+    let mut stream = connect_probe(addr, timeout).map_err(|_| ())?;
 
     let enc = FrameEncoder::new(defaults::MAX_FRAME_SIZE);
     let mut hpack = HpackEncoder::new(defaults::HEADER_TABLE_SIZE as usize);
@@ -292,7 +387,7 @@ fn perform_grpc_health_check_h2c(
     );
     stream.write_all(&settings).map_err(|_| ())?;
 
-    let host = addr.split(':').next().unwrap_or(addr);
+    let host = probe_host_header(addr);
     let path = b"/grpc.health.v1.Health/Check";
     let headers: [(&[u8], &[u8], bool); 6] = [
         (b":method", b"POST", false),
@@ -409,7 +504,6 @@ pub(crate) fn perform_grpc_health_check(
     timeout: Duration,
 ) -> bool {
     use std::io::{Read, Write};
-    use std::net::TcpStream as StdTcpStream;
 
     let grpc_frame = build_grpc_health_request_body(service_name);
 
@@ -424,21 +518,14 @@ pub(crate) fn perform_grpc_health_check(
         }
     }
 
-    // TCP 接続
-    let mut tcp_stream = match StdTcpStream::connect_timeout(
-        &addr
-            .parse()
-            .unwrap_or_else(|_| std::net::SocketAddr::from(([127, 0, 0, 1], 80))),
-        timeout,
-    ) {
+    // F-170: TCP/UDS 共通の接続入口。
+    let mut tcp_stream = match connect_probe(addr, timeout) {
         Ok(s) => s,
         Err(_) => return false,
     };
-    let _ = tcp_stream.set_read_timeout(Some(timeout));
-    let _ = tcp_stream.set_write_timeout(Some(timeout));
 
     // HTTP/1.1 モック互換パス（単体テスト・簡易バックエンド用）
-    let host_header = addr.split(':').next().unwrap_or(addr);
+    let host_header = probe_host_header(addr);
     let request = format!(
         "POST /grpc.health.v1.Health/Check HTTP/1.1\r\n\
          Host: {}\r\n\
@@ -1098,6 +1185,82 @@ mod tests {
         // 無効なアドレスは false を返す
         let result = perform_tcp_health_check("not-a-valid-addr", Duration::from_millis(200));
         assert!(!result);
+    }
+
+    // ====================
+    // F-170: connect_probe / ProbeStream / probe_host_header
+    // ====================
+
+    #[cfg(unix)]
+    #[test]
+    fn test_connect_probe_unix_success() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("veil-f170-probe-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("unix bind");
+        let acceptor = std::thread::spawn(move || listener.accept().expect("accept"));
+
+        let addr = format!("unix:{}", path.display());
+        let result = connect_probe(&addr, Duration::from_millis(500));
+
+        acceptor.join().expect("acceptor thread join");
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_connect_probe_unix_enoent() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "veil-f170-probe-enoent-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let addr = format!("unix:{}", path.display());
+        let result = connect_probe(&addr, Duration::from_millis(200));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_connect_probe_invalid_tcp_addr_is_err() {
+        // F-170: 旧実装の 127.0.0.1:80 フォールバックは廃止し、パース失敗は Err になる。
+        let result = connect_probe("not-a-valid-addr", Duration::from_millis(200));
+        match result {
+            Ok(_) => panic!("expected Err for invalid address"),
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+        }
+    }
+
+    #[test]
+    fn test_connect_probe_resolves_hostname() {
+        // F-170 修正: connect_probe は SocketAddr パースに失敗した表記を
+        // ホスト名として DNS 解決できなければならない（http3_server.rs の
+        // 旧 TcpStream::connect(&str) の DNS 解決を引き継ぐ回帰確認）。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral listener");
+        let port = listener.local_addr().expect("local_addr").port();
+        let acceptor = std::thread::spawn(move || listener.accept().expect("accept"));
+
+        let addr = format!("localhost:{}", port);
+        let result = connect_probe(&addr, Duration::from_secs(2));
+
+        acceptor.join().expect("acceptor thread join");
+        assert!(result.is_ok(), "expected localhost:{} to resolve", port);
+    }
+
+    #[test]
+    fn test_probe_host_header_unix_is_localhost() {
+        assert_eq!(probe_host_header("unix:/run/app.sock"), "localhost");
+    }
+
+    #[test]
+    fn test_probe_host_header_tcp_is_host_part() {
+        assert_eq!(
+            probe_host_header("backend.example.com:8080"),
+            "backend.example.com"
+        );
     }
 
     #[test]

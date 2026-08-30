@@ -149,6 +149,24 @@ AI エージェントおよびコントリビュータ向けの **最小指針**
   stale socket の unlink・`unix_socket_permissions`（umask + chmod）・capsicum の
   権利制限をここに集約する。peer アドレスは `sockaddr_un` を `SocketAddr` へ変換できないため
   **プレースホルダ `127.0.0.1:0`** を返す（IP ブロックリスト・アクセスログはこの値を見る）。
+- **UDS バックエンドの接続先表記は `ProxyTarget::conn_addr()` が唯一の入口（F-170）** —
+  上流へ AF_UNIX で接続できる（HTTP は nginx 互換の `http(s)://unix:<path>[:<prefix>]`、
+  L4 TCP 上流は `unix:<path>`）。**新しいバックエンド接続経路を足すときは
+  `HostPortStr::new(&target.host, target.port)` や `format!("{host}:{port}")` を書かず、
+  必ず `target.conn_addr()` を通すこと**（UDS では `unix:<path>` になる）。この文字列は
+  接続だけでなく**コネクションプールキー・Consistent Hash のノード ID・メトリクス
+  ラベル・ログ**の識別子でもあり、TCP では従来の `host:port` と **1 バイトも
+  変わらない**ことが不変条件（変わるとプール再利用が静かに止まる。`http_utils.rs` の
+  `pool_key_str_addr_based_matches_host_port_based_for_tcp` が旧実装を凍結して
+  突き合わせている）。非同期接続は `TcpStream::connect_str` の `unix:` 分岐（uring は
+  既存の `IORING_OP_CONNECT` を AF_UNIX で再利用＝**新規オペコードを増やさない**ので
+  seccomp 許可リストは無変更）、**専用スレッドの同期接続は `upstream::connect_probe`**
+  （ヘルスチェック 3 種と `http3_server.rs` の同期 TLS バックエンド経路が共用。
+  ホスト名は `ToSocketAddrs` で解決する＝ここを `SocketAddr` パースだけにすると
+  ホスト名上流が壊れる）が唯一の入口。UDS には host/port が無いため `host` は
+  論理値 `"localhost"`・`port = 0`・`is_default_port() == true`（Host ヘッダに `:0` を
+  付けない）で、Host の変更は `add_request_headers` で行う。OpenBSD は pledge の
+  `unix` promise と unveil へのソケットパス登録が要る（`config::collect_uds_socket_paths`）。
 - **Windows / macOS のクロスビルドを壊していないか確認する（B-69 / B-73 / B-81）** —
   `cfg(unix)` を付け忘れた `std::os::unix::*` / `libc::poll` は Linux の単体・統合・E2E を
   すべて通過する。検出手段は `packaging/scripts/build-cross.sh --target windows|macos` のみ。
