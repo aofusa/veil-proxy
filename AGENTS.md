@@ -167,6 +167,14 @@ AI エージェントおよびコントリビュータ向けの **最小指針**
   論理値 `"localhost"`・`port = 0`・`is_default_port() == true`（Host ヘッダに `:0` を
   付けない）で、Host の変更は `add_request_headers` で行う。OpenBSD は pledge の
   `unix` promise と unveil へのソケットパス登録が要る（`config::collect_uds_socket_paths`）。
+- **`Read`/`Write` を実装するラッパ型は `write_vectored`/`read_vectored` を必ず委譲する（F-170）** —
+  既定実装は**最初の非空バッファ 1 本しか書かない**ため、`writev(2)` へ
+  オーバーライド済みの `std::net::TcpStream` を包んだだけで、暗号文チャンク列を
+  最大 64 本の `IoSlice` で吐き出す **rustls の書き込みが停止し得る**
+  （F-170 の `upstream::ProbeStream` で実際に HTTP/3 の同期 TLS バックエンド経路が
+  ハングした）。性能劣化だけの話ではない。なお `is_write_vectored` は unstable
+  （`can_vector`）のため委譲できない。**この種の不具合は単体 977 件・統合 54 件・
+  他の E2E 543 件をすべて通過し、E2E 1 件だけが落ちる。**
 - **Windows / macOS のクロスビルドを壊していないか確認する（B-69 / B-73 / B-81）** —
   `cfg(unix)` を付け忘れた `std::os::unix::*` / `libc::poll` は Linux の単体・統合・E2E を
   すべて通過する。検出手段は `packaging/scripts/build-cross.sh --target windows|macos` のみ。

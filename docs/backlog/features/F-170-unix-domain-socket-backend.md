@@ -188,13 +188,39 @@ impl ProxyTarget {
 ### 検証
 
 - `cargo clippy --features full --all-targets -- -D warnings` / `--features "full,epoll"`: 警告ゼロ
-- `cargo test --lib --features full`: 977 件成功
-- `cargo test --features full --test integration_tests`: 54 件成功
-- E2E（`./tests/e2e_setup.sh test`）: F-170 の 7 件（HTTP/1.1・HTTP/2・HTTP/3 の各
-  クライアント → UDS バックエンド、パスプレフィックス、存在しないソケットの 502、
-  UDS 上流への TCP ヘルスチェック）を含めて実行
+- `cargo build --no-default-features`: 成功
+- `cargo test --lib --features full`: **977 件成功** / `--features "full,epoll"`: **954 件成功**
+- `cargo test --features full --test integration_tests`: **54 件成功**
+- E2E（`./tests/e2e_setup.sh test`）: **551 件成功・0 失敗**。F-170 の 7 件
+  （HTTP/1.1・HTTP/2・HTTP/3 の各クライアント → UDS バックエンド、パスプレフィックス、
+  存在しないソケットの 502、UDS 上流への TCP ヘルスチェック）を含む
 - `packaging/scripts/build-cross.sh --target windows|macos`: B-69 / B-81 クラスの
   非 unix ビルド破壊がないことを確認
+
+### 実装中に踏んだ自傷バグ（本チケット内で修正済み）
+
+**`ProbeStream` がベクタード I/O を委譲していなかった。** rustls の
+`ChunkVecBuffer::write_to` は暗号文チャンク列を最大 64 本の `IoSlice` で
+`write_vectored` へ渡す。`Write` の既定実装は「最初の非空バッファ 1 本だけを書く」ため、
+`writev(2)` へオーバーライド済みの `std::net::TcpStream` を `ProbeStream` で包んだだけで
+**rustls の書き込みが停止し得る**。HTTP/3 の同期 TLS バックエンド経路がハングし、
+`test_http3_buffering_spillover` が 20 秒でタイムアウトした。
+
+**単体 977 件・統合 54 件・他の E2E 543 件はすべて通過する**タイプの不具合で、
+E2E 1 件だけが落ちた。`main` で同テストが 0.2 秒で通ることを確認して退行と断定し、
+コミット単位の二分（フェーズ1 は通る / フェーズ2 で落ちる）→
+「`connect_probe` を元の `std::net::TcpStream::connect` に戻す」→
+「`connect_timeout` は使うが `ProbeStream` で包まない」の 2 段階の切り分け実験で
+ラッパそのものが原因であることを特定した。
+
+`is_write_vectored` は unstable（`can_vector`）のため委譲できない。
+`write_vectored` / `read_vectored` の委譲だけで解消することを実測で確認した。
+
+**教訓: `Read`/`Write` を実装するラッパ型を既存のソケットに被せるときは、
+`write_vectored` / `read_vectored` の委譲を必ず書くこと。** 既定実装は
+「最初のバッファだけ」であり、`std::net::TcpStream` がオーバーライドしている
+最適化を黙って無効化する。ホットパスの性能劣化だけでなく、
+**ベクタード書き込みを前提にしたライブラリ（rustls）では停止に至る。**
 
 ### 実装中に発見した既存バグ（F-170 とは無関係・別チケット）
 
