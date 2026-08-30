@@ -34,6 +34,16 @@ impl io::Read for ProbeStream {
             ProbeStream::Unix(s) => s.read(buf),
         }
     }
+
+    /// 書き込み側と同じ理由（下の `write_vectored` のコメント参照）で
+    /// ベクタード読み取りも内側のソケットへ委譲する。
+    fn read_vectored(&mut self, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
+        match self {
+            ProbeStream::Tcp(s) => s.read_vectored(bufs),
+            #[cfg(unix)]
+            ProbeStream::Unix(s) => s.read_vectored(bufs),
+        }
+    }
 }
 
 impl io::Write for ProbeStream {
@@ -42,6 +52,24 @@ impl io::Write for ProbeStream {
             ProbeStream::Tcp(s) => s.write(buf),
             #[cfg(unix)]
             ProbeStream::Unix(s) => s.write(buf),
+        }
+    }
+
+    /// **ベクタード書き込みは必ず内側のソケットへ委譲する。**
+    ///
+    /// `Write` の既定実装は「最初の非空バッファ 1 本だけを書く」ため、
+    /// rustls の `ChunkVecBuffer::write_to`（暗号文チャンク列を最大 64 本の
+    /// `IoSlice` で 1 回に吐き出す）が本来の挙動を取れなくなる。
+    /// `std::net::TcpStream` は
+    /// これを `writev(2)` へオーバーライドしているので、ラッパで握り潰すと
+    /// **`ProbeStream` を挟んだだけで rustls の書き込みが停止し得る**
+    /// （F-170 実装中に HTTP/3 の同期 TLS バックエンド経路が
+    /// `test_http3_buffering_spillover` でハングして実際に踏んだ）。
+    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        match self {
+            ProbeStream::Tcp(s) => s.write_vectored(bufs),
+            #[cfg(unix)]
+            ProbeStream::Unix(s) => s.write_vectored(bufs),
         }
     }
 
