@@ -575,8 +575,9 @@ listen = "0.0.0.0:443"
 # Unix ドメインソケット（UDS）リスナー（Unix 系のみ）
 # [server].listen / [server].h2c_listen は "unix:<path>" 形式も指定できる。例:
 #   listen = "unix:/run/veil/https.sock"
-# 非対応: [[l4]].listen・上流バックエンドへの UDS 接続・[server].http・[http3].listen
-# （HTTP/3 は QUIC/UDP のため UDS 不可。listen が unix: のときは [http3].listen 必須）。
+# リスナー側の対象はこの 2 つのみ（[[l4]].listen・[server].http・[http3].listen は非対応。
+# HTTP/3 は QUIC/UDP のため UDS 不可。listen が unix: のときは [http3].listen 必須）。
+# 上流バックエンドへの UDS 接続は対応済み（下の「UDS バックエンド」節を参照）。
 # Windows では設定検証でエラーになる。
 # AF_UNIX に SO_REUSEPORT は無いため、起動時に 1 度だけ bind し、各ワーカーがその fd を
 # dup(2) して accept する（カーネルが分散する）。既存のソケットファイルは自動 unlink
@@ -1245,6 +1246,60 @@ upstream = "https-pool"
 ```
 
 > **Note**: 文字列形式と構造体形式は同一配列内で混在可能です。従来の文字列形式は後方互換性のためそのまま動作します。
+
+#### Unix ドメインソケット（UDS）バックエンド
+
+上流バックエンドへ `AF_UNIX` で接続できます（Unix 系のみ）。表記は nginx の
+`proxy_pass http://unix:/path/to.sock:/uri;` と同じです。
+
+```
+http://unix:<socket-path>[:<path-prefix>]     # 平文 HTTP / h2c
+https://unix:<socket-path>[:<path-prefix>]    # UDS 上で TLS 終端
+```
+
+```toml
+[upstreams."uds-pool"]
+algorithm = "round_robin"
+servers = [
+  "http://unix:/run/app1.sock",                               # パスプレフィックスなし（"/"）
+  { url = "http://unix:/run/app2.sock:/api", use_h2c = true }  # 上流パスの先頭に "/api" を前置
+]
+
+  [upstreams."uds-pool".health_check]
+  enabled = true
+  check_type = "tcp"
+  interval_secs = 10
+  timeout_secs = 5
+
+# 単一バックエンド形式
+[[route]]
+[route.conditions]
+path = "/app/*"
+[route.action]
+type = "Proxy"
+url = "http://unix:/run/app1.sock"
+```
+
+注意事項・制約:
+
+- パスプレフィックスの区切りは「**最後の** `:` の直後が `/` で始まる」場合のみ認識します。
+  したがって **ソケットパスに `:` は使えません**。
+- UDS には host / port が無いため、上流へ送る `Host` ヘッダは既定で `localhost` に
+  なります。変更する場合は `[route.security]` の
+  `add_request_headers = { Host = "..." }` を使ってください。`https://unix:...` の
+  SNI は `sni_name`（未指定なら `localhost`）です。
+- コネクションプール・ログ・メトリクス・Consistent Hash のノード ID は
+  `unix:<socket-path>` で識別されます（TCP バックエンドの識別子は不変）。
+- ヘルスチェック（`http` / `tcp` / `grpc`）も `unix:` 上流に対応します。ただし
+  `timeout_secs` は UDS の connect には適用されません（read/write のみ）。
+- `[[l4]].upstreams` は `unix:<socket-path>`（スキーム無し。`[[l4]].listen` と同じ表記）
+  で TCP ストリームプロキシの上流を UDS にできます。L4 UDP 上流は非対応です。
+- HTTP/3 を **上流** に使う場合は UDS 不可です（QUIC は UDP のため）。
+  下流 HTTP/3 → 上流 UDS の中継は対応します。
+- Windows では設定検証エラーになります。
+- OpenBSD ではバックエンドのソケットパスが `unveil(2)` の許可リストへ自動追加され、
+  `unix` pledge promise が要求されます。FreeBSD の capability mode（capsicum）は
+  UDS を含め上流接続のある構成では使えません。
 
 ### WebSocket設定
 

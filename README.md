@@ -578,8 +578,11 @@ listen = "0.0.0.0:443"
 # Unix domain socket listeners (Unix only)
 # [server].listen and [server].h2c_listen also accept "unix:<path>", e.g.
 #   listen = "unix:/run/veil/https.sock"
-# Not supported: [[l4]].listen, upstream connections, [server].http and [http3].listen
-# (HTTP/3 is QUIC/UDP and cannot run over a unix socket — set [http3].listen explicitly).
+# Listener side is limited to these two: [[l4]].listen, [server].http and [http3].listen
+# are not supported (HTTP/3 is QUIC/UDP and cannot run over a unix socket — set
+# [http3].listen explicitly).
+# Upstream (backend) connections over UDS ARE supported — see "Unix domain socket
+# backends" below.
 # Windows rejects unix: addresses at config validation time.
 # AF_UNIX has no SO_REUSEPORT, so veil binds once at startup and every worker dup(2)s
 # that fd; the kernel spreads accepts across them. A stale socket file is unlinked
@@ -1252,6 +1255,60 @@ upstream = "https-pool"
 ```
 
 > **Note**: String and struct formats can be mixed within the same array. The traditional string format continues to work for backward compatibility.
+
+#### Unix Domain Socket Backends
+
+veil can connect to upstream backends over `AF_UNIX` (Unix only). The notation matches
+nginx's `proxy_pass http://unix:/path/to.sock:/uri;`:
+
+```
+http://unix:<socket-path>[:<path-prefix>]     # plaintext HTTP / h2c
+https://unix:<socket-path>[:<path-prefix>]    # TLS terminated on top of the socket
+```
+
+```toml
+[upstreams."uds-pool"]
+algorithm = "round_robin"
+servers = [
+  "http://unix:/run/app1.sock",                              # no path prefix ("/")
+  { url = "http://unix:/run/app2.sock:/api", use_h2c = true } # upstream path gets "/api" prepended
+]
+
+  [upstreams."uds-pool".health_check]
+  enabled = true
+  check_type = "tcp"
+  interval_secs = 10
+  timeout_secs = 5
+
+# Single-backend form
+[[route]]
+[route.conditions]
+path = "/app/*"
+[route.action]
+type = "Proxy"
+url = "http://unix:/run/app1.sock"
+```
+
+Notes and limitations:
+
+- The path-prefix separator is only recognised when the text after the **last** `:` starts
+  with `/`. **Socket paths therefore cannot contain `:`.**
+- A Unix socket has no host or port, so the `Host` header sent upstream defaults to
+  `localhost`. Override it with `add_request_headers = { Host = "..." }` under
+  `[route.security]`. For `https://unix:...`, the SNI name comes from `sni_name`
+  (defaulting to `localhost`).
+- Connection pools, logs, metrics and the consistent-hash node id identify these
+  backends as `unix:<socket-path>`. Identifiers for TCP backends are unchanged.
+- Health checks (`http`, `tcp`, `grpc`) work against `unix:` upstreams, but
+  `timeout_secs` does not apply to the UDS connect itself (only to reads/writes).
+- `[[l4]].upstreams` accepts `unix:<socket-path>` (no scheme, same notation as
+  `[[l4]].listen`) for TCP stream proxying. L4 UDP upstreams cannot use UDS.
+- HTTP/3 **upstreams** cannot use UDS (QUIC is UDP). Downstream HTTP/3 requests proxied
+  to a UDS backend are supported.
+- Windows rejects `unix:` upstream URLs at config validation time.
+- On OpenBSD, backend socket paths are added to the `unveil(2)` allow-list automatically
+  and the `unix` pledge promise is requested. On FreeBSD, capability mode (capsicum)
+  cannot be combined with any upstream connection, UDS included.
 
 ### WebSocket Configuration
 

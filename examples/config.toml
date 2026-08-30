@@ -17,9 +17,11 @@ listen = "127.0.0.1:443"
 #
 # listen / h2c_listen は "unix:<path>" 形式でも指定できます。
 #   listen = "unix:/run/veil/https.sock"
-# 対象は listen / h2c_listen のみです（[[l4]].listen・上流バックエンドへの UDS 接続・
+# リスナー側の対象は listen / h2c_listen のみです（[[l4]].listen・
 # server.http（HTTPS リダイレクト用平文リスナー）・[http3].listen は非対応。
 # HTTP/3 は QUIC/UDP のため UDS では動作しません）。
+# **上流バックエンドへの UDS 接続は F-170 で対応済みです**（下の
+# 「Unix ドメインソケット（UDS）バックエンド」節を参照）。
 #
 # 注意事項:
 # - Windows では非対応です（設定エラーとして起動を拒否します）。
@@ -1577,6 +1579,48 @@ revalidate_mtime = false
 #   timeout_secs = 5
 #   unhealthy_threshold = 3
 #   healthy_threshold = 2
+
+# ------------------------------------------
+# Unix ドメインソケット（UDS）バックエンド（F-170、`cfg(unix)` のみ）
+# ------------------------------------------
+# 上流バックエンドへ AF_UNIX で接続できます。表記は nginx の
+# `proxy_pass http://unix:/path/to.sock:/uri;` と同じです。
+#
+#   http://unix:<socket-path>[:<path-prefix>]    平文 HTTP / h2c
+#   https://unix:<socket-path>[:<path-prefix>]   UDS 上で TLS 終端するバックエンド
+#
+# 例:
+#   "http://unix:/run/app.sock"            → パスプレフィックスなし（"/"）
+#   "http://unix:/run/app.sock:/api"       → 上流パスの先頭に "/api" を前置
+#   "https://unix:/run/app.sock"           → UDS + TLS（SNI は sni_name、未指定なら "localhost"）
+#
+# 注意事項:
+# - パスプレフィックスの区切りは「最後の `:` の直後が `/` で始まる」場合のみです。
+#   したがって **ソケットパスに `:` は使えません**。
+# - UDS には host / port が無いため、上流へ送る Host ヘッダは既定で "localhost" に
+#   なります。変更したい場合は [route.security] の add_request_headers で
+#   { Host = "..." } を指定してください。
+# - コネクションプール・ログ・メトリクス・Consistent Hash のノード ID は
+#   "unix:<socket-path>" 表記で識別されます（TCP バックエンドの識別子は不変）。
+# - ヘルスチェック（http / tcp / grpc）も unix: 上流に対応します。ただし
+#   timeout_secs は UDS の connect には適用されません（read/write のみ）。
+# - Windows では非対応です（設定検証エラー）。HTTP/3（QUIC）を **上流** に使う場合も
+#   UDS は使えません（QUIC は UDP のため）。下流 HTTP/3 → 上流 UDS は対応します。
+# - [[l4]].upstreams でも `unix:<socket-path>`（スキーム無し。[[l4]].listen と同じ表記）
+#   で TCP ストリームプロキシの上流を UDS にできます（UDP は非対応）。
+#
+# [upstreams."uds-pool"]
+# algorithm = "round_robin"
+# servers = [
+#   "http://unix:/run/app1.sock",
+#   { url = "http://unix:/run/app2.sock:/api", use_h2c = true }
+# ]
+#
+#   [upstreams."uds-pool".health_check]
+#   enabled = true
+#   check_type = "tcp"
+#   interval_secs = 10
+#   timeout_secs = 5
 
 # ------------------------------------------
 # SNI名指定付きHTTPSアップストリーム

@@ -25128,3 +25128,181 @@ async fn test_f150_static_content_cache_http1_range() {
         "206 のボディ内容がフィクスチャと一致すること"
     );
 }
+
+// ====================
+// F-170: Unix ドメインソケット（UDS）バックエンド接続
+// ====================
+//
+// バックエンドは veil 自身を UDS で listen させたもの（tests/e2e_setup.sh の
+// backend_uds.toml）。プロキシ側の upstream URL は nginx 互換の
+// `http(s)://unix:<socket-path>[:<path-prefix>]` 表記を使う。
+// UDS バックエンドへ送る Host ヘッダは既定で "localhost" になる。
+
+/// HTTP/1.1 クライアント → TLS over UDS バックエンドへ中継できること。
+#[tokio::test]
+#[ntest::timeout(15000)]
+async fn test_e2e_uds_backend_tls() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let resp = send_request(PROXY_PORT, "/uds-tls/", &[]).await;
+    assert!(resp.is_some(), "UDS(TLS) route should respond");
+    let resp = resp.unwrap();
+    assert_eq!(get_status_code(&resp), Some(200));
+    assert!(
+        resp.contains("Hello from UDS Backend"),
+        "UDS(TLS) upstream should forward the backend body: {}",
+        resp
+    );
+}
+
+/// HTTP/1.1 クライアント → h2c over UDS バックエンドへ中継できること。
+#[tokio::test]
+#[ntest::timeout(15000)]
+async fn test_e2e_uds_backend_h2c() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let resp = send_request(PROXY_PORT, "/uds-h2c/", &[]).await;
+    assert!(resp.is_some(), "UDS(h2c) route should respond");
+    let resp = resp.unwrap();
+    assert_eq!(get_status_code(&resp), Some(200));
+    assert!(
+        resp.contains("Hello from UDS Backend"),
+        "UDS(h2c) upstream should forward the backend body: {}",
+        resp
+    );
+}
+
+/// `http://unix:<path>:/api` のパスプレフィックスが上流パスへ前置されること
+/// （`/uds-prefix/v1/test` → バックエンドの `/api/v1/test`）。
+#[tokio::test]
+#[ntest::timeout(15000)]
+async fn test_e2e_uds_backend_path_prefix() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let resp = send_request(PROXY_PORT, "/uds-prefix/v1/test", &[]).await;
+    assert!(resp.is_some(), "UDS prefix route should respond");
+    let resp = resp.unwrap();
+    assert_eq!(get_status_code(&resp), Some(200));
+    assert!(
+        resp.contains("uds prefix v1 test"),
+        "path prefix should be prepended to the upstream path: {}",
+        resp
+    );
+}
+
+/// 存在しないソケットパスへの UDS バックエンド接続は 502 になること
+/// （ハングせずエラー応答へ変換されること）。
+#[tokio::test]
+#[ntest::timeout(15000)]
+async fn test_e2e_uds_backend_missing_socket_returns_502() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let resp = send_request(PROXY_PORT, "/uds-missing/", &[]).await;
+    assert!(
+        resp.is_some(),
+        "missing UDS socket should still return an HTTP response"
+    );
+    let status = get_status_code(&resp.unwrap());
+    assert!(
+        matches!(status, Some(502) | Some(503) | Some(504)),
+        "missing UDS socket should map to 502/503/504, got {:?}",
+        status
+    );
+}
+
+/// UDS 上流に対する TCP ヘルスチェックが healthy 判定になり、中継が成功すること
+/// （`unix:<path>` 形式のアドレスで同期プローブが接続できること）。
+#[tokio::test]
+#[ntest::timeout(20000)]
+async fn test_e2e_uds_backend_tcp_health_check() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    // ヘルスチェック間隔（2 秒）を 1 周以上またいでから確認する。
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let resp = send_request(PROXY_PORT, "/uds-health/", &[]).await;
+    assert!(resp.is_some(), "UDS health-checked route should respond");
+    let resp = resp.unwrap();
+    assert_eq!(
+        get_status_code(&resp),
+        Some(200),
+        "UDS upstream must stay healthy under TCP health checks: {}",
+        resp
+    );
+}
+
+/// HTTP/2 クライアント → UDS バックエンド（h2c）の中継。
+#[tokio::test]
+#[ntest::timeout(15000)]
+#[cfg(feature = "http2")]
+async fn test_e2e_uds_backend_via_http2_client() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let mut client = match Http2TestClient::new("127.0.0.1", PROXY_PORT).await {
+        Ok(c) => c,
+        Err(e) => panic!("Failed to establish HTTP/2 connection to proxy: {}", e),
+    };
+
+    let (status, body) = client
+        .send_request("GET", "/uds-h2c/", &[("host", "localhost")], None)
+        .await
+        .expect("HTTP/2 request to UDS backend failed");
+
+    assert_eq!(status, 200, "HTTP/2 → UDS backend should return 200");
+    assert!(
+        String::from_utf8_lossy(&body).contains("Hello from UDS Backend"),
+        "HTTP/2 → UDS backend body mismatch"
+    );
+}
+
+/// HTTP/3 クライアント → UDS バックエンド（h2c）の中継
+/// （下流 QUIC / 上流 UDS の組み合わせ）。
+#[tokio::test]
+#[ntest::timeout(20000)]
+#[cfg(feature = "http3")]
+async fn test_e2e_uds_backend_via_http3_client() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
+        Ok(c) => c,
+        Err(e) => panic!(
+            "Failed to create HTTP/3 client for {}: {} (HTTP/3 may not be enabled)",
+            server_addr, e
+        ),
+    };
+
+    let (status, body) = http3_get(&mut send_request, "/uds-h2c/")
+        .await
+        .expect("HTTP/3 request to UDS backend failed");
+
+    assert_eq!(status, 200, "HTTP/3 → UDS backend should return 200");
+    assert!(
+        String::from_utf8_lossy(&body).contains("Hello from UDS Backend"),
+        "HTTP/3 → UDS backend body mismatch"
+    );
+}
