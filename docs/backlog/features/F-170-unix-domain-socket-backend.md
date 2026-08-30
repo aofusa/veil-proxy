@@ -191,7 +191,10 @@ impl ProxyTarget {
 - `cargo build --no-default-features`: 成功
 - `cargo test --lib --features full`: **977 件成功** / `--features "full,epoll"`: **954 件成功**
 - `cargo test --features full --test integration_tests`: **54 件成功**
-- E2E（`./tests/e2e_setup.sh test`）: **551 件成功・0 失敗**。F-170 の 7 件
+- E2E（`./tests/e2e_setup.sh test`、io_uring）: **551 件成功・0 失敗**
+- E2E（`VEIL_E2E_FEATURES="full,epoll" ./tests/e2e_setup.sh test`、reactor/epoll。
+  F-145 の教訓により `src/runtime/reactor/` を触ったため必須）: **551 件成功・0 失敗**。
+  F-170 の 7 件
   （HTTP/1.1・HTTP/2・HTTP/3 の各クライアント → UDS バックエンド、パスプレフィックス、
   存在しないソケットの 502、UDS 上流への TCP ヘルスチェック）を含む
 - `packaging/scripts/build-cross.sh --target windows|macos`: B-69 / B-81 クラスの
