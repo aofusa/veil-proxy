@@ -77,6 +77,33 @@ impl HostPortStr {
         }
     }
 
+    /// `unix:<path>` 形式（F-170: UDS バックエンドの接続先表記）。
+    ///
+    /// `ProxyTarget` の設定は TOML の `String` 由来のため、パスは常に UTF-8 が
+    /// 保証される（`to_string_lossy` による非可逆変換は不要）。
+    #[inline]
+    pub(crate) fn unix(path: &std::path::Path) -> Self {
+        // ソケットパスは TOML の `String` 由来（`ProxyTarget::parse`）のため常に UTF-8 が
+        // 保証される。ホットパスで `to_string_lossy` のヒープ確保フォールバックを持たせると
+        // 到達しない分岐のために毎回分岐コストを払うことになるため、`expect` で不変条件を
+        // 明示する（違反時は設定パイプラインのバグとして即座に検出できる方が安全）。
+        let path_str = path
+            .to_str()
+            .expect("UDS socket path must be UTF-8 (guaranteed by ProxyTarget::parse)");
+        let need = 5 + path_str.len(); // "unix:" (5 bytes)
+        if need <= 260 {
+            let mut buf = [0u8; 260];
+            buf[..5].copy_from_slice(b"unix:");
+            buf[5..need].copy_from_slice(path_str.as_bytes());
+            HostPortStr::Stack {
+                buf,
+                len: need as u16,
+            }
+        } else {
+            HostPortStr::Heap(format!("unix:{path_str}"))
+        }
+    }
+
     #[inline]
     pub(crate) fn as_str(&self) -> &str {
         match self {
@@ -157,34 +184,57 @@ impl PoolKeyStr {
         }
     }
 
+    /// `addr` 形式（SNI なし、平文/HTTP プール用）。`addr` は接続先表記
+    /// （`ProxyTarget::conn_addr()` の結果。TCP は `host:port`、UDS は `unix:<path>`）。
+    ///
+    /// F-170: 単一パーツの `join_colon` は区切り文字を追加しないため `addr` そのものと
+    /// バイト単位で一致する（`plain(host, port)` との等価性は下の単体テストで保証）。
+    #[inline]
+    pub(crate) fn plain_addr(addr: &str) -> Self {
+        Self::join_colon(&[addr])
+    }
+
+    /// `addr:sni:tag` 形式（TLS プール用、`tls_insecure` 設定毎に分離）。
+    #[inline]
+    pub(crate) fn tls_addr(addr: &str, sni: &str, tls_insecure: bool) -> Self {
+        Self::join_colon(&[addr, sni, insecure_tag(tls_insecure)])
+    }
+
+    /// `addr:tag` 形式（TLS プール用、SNI なし）。
+    #[inline]
+    pub(crate) fn tls_addr_no_sni(addr: &str, tls_insecure: bool) -> Self {
+        Self::join_colon(&[addr, insecure_tag(tls_insecure)])
+    }
+
     /// `host:port` 形式（SNI なし、平文/HTTP プール用）。
+    ///
+    /// F-170: 本番コードは `plain_addr` へ移行済み（`target.conn_addr()` を渡す形）。
+    /// この `host,port` ベースのコンストラクタは、TCP での等価性（1 バイトも変わらない
+    /// こと）を固定する単体テスト専用として残す（`#[cfg(test)]` のため非テストビルドに
+    /// は現れず、`#[allow(dead_code)]` は不要）。
+    #[cfg(test)]
     #[inline]
     pub(crate) fn plain(host: &str, port: u16) -> Self {
-        let mut port_buf = itoa::Buffer::new();
-        Self::join_colon(&[host, port_buf.format(port)])
+        let addr = HostPortStr::new(host, port);
+        Self::plain_addr(addr.as_str())
     }
 
     /// `host:port:sni:tag` 形式（TLS プール用、`tls_insecure` 設定毎に分離）。
+    /// F-170: 単体テスト専用（上記 `plain` と同じ理由）。
+    #[cfg(test)]
     #[inline]
     pub(crate) fn tls(host: &str, port: u16, sni: &str, tls_insecure: bool) -> Self {
-        let mut port_buf = itoa::Buffer::new();
-        Self::join_colon(&[host, port_buf.format(port), sni, insecure_tag(tls_insecure)])
+        let addr = HostPortStr::new(host, port);
+        Self::tls_addr(addr.as_str(), sni, tls_insecure)
     }
 
     /// `host:port:tag` 形式（TLS プール用、SNI なし）。
+    /// F-170: 単体テスト専用（上記 `plain` と同じ理由）。
+    #[cfg(test)]
     #[inline]
     pub(crate) fn tls_no_sni(host: &str, port: u16, tls_insecure: bool) -> Self {
-        let mut port_buf = itoa::Buffer::new();
-        Self::join_colon(&[host, port_buf.format(port), insecure_tag(tls_insecure)])
-    }
-
-    /// `addr:sni:tag` 形式（H2 バックエンドプール用、`addr` は既にフォーマット済みの
-    /// `host:port` 文字列）。
-    // `h2_proxy_https`（src/proxy.rs）からのみ使用され、それは http2 feature 限定。
-    #[cfg(feature = "http2")]
-    #[inline]
-    pub(crate) fn addr_sni(addr: &str, sni: &str, tls_insecure: bool) -> Self {
-        Self::join_colon(&[addr, sni, insecure_tag(tls_insecure)])
+        let addr = HostPortStr::new(host, port);
+        Self::tls_addr_no_sni(addr.as_str(), tls_insecure)
     }
 }
 
@@ -2005,9 +2055,8 @@ mod stack_fmt_tests {
     }
 
     #[test]
-    #[cfg(feature = "http2")]
-    fn pool_key_str_addr_sni_matches_format() {
-        let k = PoolKeyStr::addr_sni("backend.example.com:443", "sni.example.com", true);
+    fn pool_key_str_tls_addr_matches_format() {
+        let k = PoolKeyStr::tls_addr("backend.example.com:443", "sni.example.com", true);
         assert_eq!(
             k.as_str(),
             format!(
@@ -2016,6 +2065,42 @@ mod stack_fmt_tests {
             )
         );
         assert!(matches!(k, PoolKeyStr::Stack { .. }));
+    }
+
+    /// F-170: `host,port` ベースの旧コンストラクタと `addr` ベースの新コンストラクタが
+    /// TCP（`unix:` を含まない `addr`）で完全に同じ文字列を生成すること。
+    /// プールキーが 1 バイトでも変わると再利用が静かに止まるため、この不変条件を
+    /// 単体テストで固定する。
+    #[test]
+    fn pool_key_str_addr_based_matches_host_port_based_for_tcp() {
+        let host = "backend.example.com";
+        let port = 8443u16;
+        let sni = "sni.example.com";
+        let addr = HostPortStr::new(host, port);
+        let addr = addr.as_str();
+
+        assert_eq!(
+            PoolKeyStr::plain(host, port).as_str(),
+            PoolKeyStr::plain_addr(addr).as_str()
+        );
+        for insecure in [true, false] {
+            assert_eq!(
+                PoolKeyStr::tls(host, port, sni, insecure).as_str(),
+                PoolKeyStr::tls_addr(addr, sni, insecure).as_str()
+            );
+            assert_eq!(
+                PoolKeyStr::tls_no_sni(host, port, insecure).as_str(),
+                PoolKeyStr::tls_addr_no_sni(addr, insecure).as_str()
+            );
+        }
+    }
+
+    /// F-170: UDS 表記の `unix(path)` が `unix:<path>` を生成すること
+    /// （プールキー・ノード ID の入力になる接続先表記の唯一の入口）。
+    #[test]
+    fn host_port_str_unix_formats_prefixed_path() {
+        let hp = HostPortStr::unix(std::path::Path::new("/run/app.sock"));
+        assert_eq!(hp.as_str(), "unix:/run/app.sock");
     }
 
     #[test]

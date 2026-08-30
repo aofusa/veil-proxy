@@ -66,6 +66,11 @@ use crate::simple_tls::SimpleTlsServerStream as ServerTls;
 async fn connect_target(target: &ProxyTarget, addr: &str) -> io::Result<TcpStream> {
     if let Some(sock_addr) = target.socket_addr {
         TcpStream::connect(sock_addr).await
+    } else if let Some(path) = &target.unix_path {
+        // F-170: UDS バックエンド。`target.unix_path` があるので `connect_str` の
+        // `unix:` 接頭辞判定を経由せず直接 `connect_unix` を呼ぶ（`connect_str` 側でも
+        // `unix:` を扱えるため二重に安全だが、ホットパスで余計な文字列走査をしない）。
+        TcpStream::connect_unix(std::path::Path::new(path.as_ref())).await
     } else {
         TcpStream::connect_str(addr).await
     }
@@ -1976,7 +1981,7 @@ async fn h2_proxy(
 
     // H2C バックエンドは HPACK 応答のため専用処理。
     if target.use_h2c || upstream_group.use_h2c() {
-        let addr = HostPortStr::new(&target.host, target.port);
+        let addr = target.conn_addr(); // F-170: UDS 対応（TCP は従来と不変）
         let addr = addr.as_str();
         let result = h2_proxy_h2c(
             ctx,
@@ -2032,7 +2037,7 @@ async fn h2_proxy(
     request.extend_from_slice(b"Connection: keep-alive\r\n\r\n");
     request.extend_from_slice(&ctx.body);
 
-    let addr = HostPortStr::new(&target.host, target.port);
+    let addr = target.conn_addr(); // F-170: UDS 対応（TCP は従来と不変）
     let addr = addr.as_str();
 
     let result = if target.use_tls {
@@ -2348,7 +2353,7 @@ async fn h2_proxy_https(
     resp_tx: &crate::stream_channel::Sender<H2RespMsg>,
     notify: &crate::stream_channel::Notify,
 ) -> (u16, u64) {
-    let pool_key = crate::http_utils::PoolKeyStr::addr_sni(addr, sni, tls_insecure);
+    let pool_key = crate::http_utils::PoolKeyStr::tls_addr(addr, sni, tls_insecure);
 
     let mut backend = match HTTPS_POOL.with(|p| p.borrow_mut().get(pool_key.as_str())) {
         Some(stream) => stream,
@@ -3466,7 +3471,7 @@ async fn h2_serve_streaming(
     let use_tls = target.use_tls;
     let sni = target.sni().to_string();
     let tls_insecure = upstream_group.tls_insecure();
-    let addr = HostPortStr::new(&target.host, target.port);
+    let addr = target.conn_addr(); // F-170: UDS 対応（TCP は従来と不変）
     let addr = addr.as_str();
 
     // chunked リクエストヘッダ構築。
@@ -6102,7 +6107,7 @@ async fn handle_websocket_proxy_http(
     poll_config: &WebSocketPollConfig,
 ) -> Option<(u16, u64)> {
     // バックエンドに接続
-    let addr = HostPortStr::new(&target.host, target.port); // F-41: スタック上に構築（ヒープ確保なし）
+    let addr = target.conn_addr(); // F-41/F-170: スタック上に構築（ヒープ確保なし、UDS 対応。TCP は従来と不変）
     let addr = addr.as_str();
     let connect_result = timeout(connect_timeout, connect_target(target, addr)).await;
 
@@ -6216,7 +6221,7 @@ async fn handle_websocket_proxy_https(
     poll_config: &WebSocketPollConfig,
 ) -> Option<(u16, u64)> {
     // バックエンドに TCP 接続（事前解決済み SocketAddr があればブロッキング DNS を迂回）
-    let addr = HostPortStr::new(&target.host, target.port); // F-41: スタック上に構築（ヒープ確保なし）
+    let addr = target.conn_addr(); // F-41/F-170: スタック上に構築（ヒープ確保なし、UDS 対応。TCP は従来と不変）
     let addr = addr.as_str();
     let connect_result = timeout(connect_timeout, connect_target(target, addr)).await;
 
@@ -6895,15 +6900,18 @@ async fn handle_proxy(
     let resilience_start = std::time::Instant::now();
 
     let target = &server.target;
-    // コネクションプールキーの生成
+    // コネクションプールキーの生成（F-170: 接続先表記＝conn_addr() を第 1 要素にする。
+    // TCP では host:port と 1 バイトも変わらないため、プール再利用は不変）。
     // HTTPS: SNI と tls_insecure 毎に別プール（B-30: 検証設定の異なる接続の再利用を防ぐ）
     let tls_insecure = upstream_group.tls_insecure();
+    let pool_key_addr = target.conn_addr();
+    let pool_key_addr = pool_key_addr.as_str();
     let pool_key = if target.use_tls && target.sni_name.is_some() {
-        crate::http_utils::PoolKeyStr::tls(&target.host, target.port, target.sni(), tls_insecure)
+        crate::http_utils::PoolKeyStr::tls_addr(pool_key_addr, target.sni(), tls_insecure)
     } else if target.use_tls {
-        crate::http_utils::PoolKeyStr::tls_no_sni(&target.host, target.port, tls_insecure)
+        crate::http_utils::PoolKeyStr::tls_addr_no_sni(pool_key_addr, tls_insecure)
     } else {
-        crate::http_utils::PoolKeyStr::plain(&target.host, target.port)
+        crate::http_utils::PoolKeyStr::plain_addr(pool_key_addr)
     };
 
     // リクエストパス構築
@@ -7168,11 +7176,9 @@ async fn handle_proxy(
                     );
                 }
                 if s.is_ejected() {
-                    crate::metrics::set_outlier_ejected(
-                        &upstream_group.name,
-                        &format!("{}:{}", s.target.host, s.target.port),
-                        true,
-                    );
+                    // F-170: 接続先表記（conn_addr）で識別する。TCP は従来と不変。
+                    let addr = s.target.conn_addr();
+                    crate::metrics::set_outlier_ejected(&upstream_group.name, addr.as_str(), true);
                 }
             }
         }
@@ -7276,7 +7282,7 @@ async fn proxy_http_pooled(
         Some(stream) => stream,
         None => {
             // 新規接続を作成（事前解決済み SocketAddr があればブロッキング DNS を迂回）
-            let addr = HostPortStr::new(&target.host, target.port); // F-41: スタック上に構築（ヒープ確保なし）
+            let addr = target.conn_addr(); // F-41/F-170: スタック上に構築（ヒープ確保なし、UDS 対応。TCP は従来と不変）
             let addr = addr.as_str();
             let connect_result = timeout(connect_timeout, connect_target(target, addr)).await;
 
@@ -7515,7 +7521,7 @@ async fn proxy_h2c(
     let connect_timeout = Duration::from_secs(security.backend_connect_timeout_secs);
 
     // バックエンドに接続（事前解決済み SocketAddr があればブロッキング DNS を迂回）
-    let addr = HostPortStr::new(&target.host, target.port); // F-41: スタック上に構築（ヒープ確保なし）
+    let addr = target.conn_addr(); // F-41/F-170: スタック上に構築（ヒープ確保なし、UDS 対応。TCP は従来と不変）
     let addr = addr.as_str();
     let connect_result = timeout(connect_timeout, connect_target(target, addr)).await;
 
@@ -9842,7 +9848,7 @@ async fn connect_https_backend_fresh(
     connect_timeout: Duration,
     tls_insecure: bool,
 ) -> Result<ClientTls, (u16, &'static [u8])> {
-    let addr = HostPortStr::new(&target.host, target.port); // F-41: スタック上に構築（ヒープ確保なし）
+    let addr = target.conn_addr(); // F-41/F-170: スタック上に構築（ヒープ確保なし、UDS 対応。TCP は従来と不変）
     let addr = addr.as_str();
     let backend_tcp = match timeout(connect_timeout, connect_target(target, addr)).await {
         Ok(Ok(stream)) => {

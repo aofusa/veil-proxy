@@ -253,11 +253,13 @@ pub fn spawn_background_revalidation(
         };
 
         let target = &server.target;
-        let addr = format!("{}:{}", target.host, target.port);
+        // F-170: 接続先表記（UDS 対応、TCP は不変）。
+        let addr = target.conn_addr();
+        let addr = addr.as_str();
 
         // バックエンドに接続
         let connect_timeout = Duration::from_secs(security.backend_connect_timeout_secs);
-        let connect_result = timeout(connect_timeout, TcpStream::connect_str(&addr)).await;
+        let connect_result = timeout(connect_timeout, TcpStream::connect_str(addr)).await;
 
         let mut backend_stream = match connect_result {
             Ok(Ok(stream)) => {

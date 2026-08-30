@@ -412,10 +412,30 @@ impl TcpStream {
         }
     }
 
-    /// 文字列アドレス（"host:port"）から接続する
+    /// AF_UNIX パスに非同期で接続する（io_uring CONNECT、F-170）。
     ///
-    /// DNS 解決はブロッキングで行う（コールドパスのみ）。
+    /// **新しい io_uring オペコードは増やさない**: 既存の `IORING_OP_CONNECT` を
+    /// AF_UNIX ソケット + `sockaddr_un` で発行するだけで、TCP 経路（`Connect`）と
+    /// SQE の構築ロジック（生成 → addr 詰め → submit → 後始末）を共有する。
+    pub fn connect_unix(path: &std::path::Path) -> ConnectUnix {
+        ConnectUnix {
+            path: path.to_path_buf(),
+            fd: -1,
+            user_data: 0,
+            addr_storage: Box::new(unsafe { std::mem::zeroed() }),
+            addr_len: 0,
+            submitted: false,
+        }
+    }
+
+    /// 文字列アドレス（"host:port"、または F-170 の `unix:<path>` 表記）から接続する
+    ///
+    /// DNS 解決はブロッキングで行う（コールドパスのみ）。TCP 経路（`unix:` で
+    /// 始まらない場合）の命令列は F-170 以前と不変。
     pub async fn connect_str(addr: &str) -> io::Result<TcpStream> {
+        if let Some(path) = addr.strip_prefix("unix:") {
+            return TcpStream::connect_unix(std::path::Path::new(path)).await;
+        }
         use std::net::ToSocketAddrs;
         let socket_addr = addr
             .to_socket_addrs()
@@ -743,6 +763,156 @@ impl Drop for Connect {
             // カーネルは addr_storage を参照中の可能性があるため保持し、ソケット fd は
             // 完了/キャンセルの CQE 到着後にクローズする。正常完了/エラー時は poll が
             // submitted=false かつ fd=-1 にしてから返すため、この分岐には入らない。
+            let storage = std::mem::replace(
+                &mut self.addr_storage,
+                Box::new(unsafe { std::mem::zeroed() }),
+            );
+            let fd = self.fd;
+            self.fd = -1;
+            detach_op(
+                self.user_data,
+                OpGuard::Cleanup(Box::new(move |_res| {
+                    drop(storage);
+                    if fd >= 0 {
+                        unsafe { libc::close(fd) };
+                    }
+                })),
+            );
+        } else if self.fd >= 0 {
+            unsafe { libc::close(self.fd) };
+        }
+    }
+}
+
+// ====================
+// ConnectUnix Future（F-170: UDS バックエンド接続、IORING_OP_CONNECT 共用）
+// ====================
+
+/// `path` から `libc::sockaddr_storage`（実体は `sockaddr_un`）を組み立てる。
+///
+/// `server::bind_unix_listener` と同じ方針（`OsStrExt::as_bytes` でバイト化 →
+/// 長さチェック → `sun_path` へコピー）。パスが `sun_path` に収まらない場合は
+/// `InvalidInput` で "unix socket path too long" を返す（bind 側と同じ文言）。
+/// `sockaddr_storage` は `sockaddr_un` より大きいため、先頭を `sockaddr_un` として
+/// 上書きし、`Connect` と同じ `Box<sockaddr_storage>` フィールド型を共有できる。
+fn build_sockaddr_un_storage(
+    path: &std::path::Path,
+) -> io::Result<(libc::sockaddr_storage, libc::socklen_t)> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let addr = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_un) };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let path_bytes = path.as_os_str().as_bytes();
+    if path_bytes.len() >= addr.sun_path.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unix socket path too long: {}", path.display()),
+        ));
+    }
+    for (i, &b) in path_bytes.iter().enumerate() {
+        addr.sun_path[i] = b as libc::c_char;
+    }
+    let addr_len =
+        (std::mem::size_of::<libc::sa_family_t>() + path_bytes.len() + 1) as libc::socklen_t;
+    Ok((storage, addr_len))
+}
+
+/// AF_UNIX へ接続する Future（`Connect` と同一の SQE 構築・後始末ロジック）。
+pub struct ConnectUnix {
+    path: std::path::PathBuf,
+    fd: RawFd,
+    user_data: u64,
+    addr_storage: Box<libc::sockaddr_storage>,
+    addr_len: libc::socklen_t,
+    submitted: bool,
+}
+
+impl Future for ConnectUnix {
+    type Output = io::Result<TcpStream>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if !self.submitted {
+            let fd = match create_nonblocking_socket(libc::AF_UNIX) {
+                Ok(fd) => fd,
+                Err(e) => return Poll::Ready(Err(e)),
+            };
+            self.fd = fd;
+
+            let (storage, len) = match build_sockaddr_un_storage(&self.path) {
+                Ok(v) => v,
+                Err(e) => {
+                    unsafe { libc::close(fd) };
+                    self.fd = -1;
+                    return Poll::Ready(Err(e));
+                }
+            };
+            *self.addr_storage = storage;
+            self.addr_len = len;
+
+            let user_data = alloc_op();
+            self.user_data = user_data;
+
+            let addr_ptr = self.addr_storage.as_ref() as *const libc::sockaddr_storage;
+            let addr_len = self.addr_len;
+
+            let acquired = with_ring(|ring| {
+                if let Some(sqe) = ring.get_sqe_or_submit() {
+                    sqe.opcode = IORING_OP_CONNECT;
+                    sqe.fd = fd;
+                    sqe.addr_or_splice_off_in = addr_ptr as u64;
+                    sqe.off_or_addr2 = addr_len as u64;
+                    sqe.user_data = user_data;
+                    true
+                } else {
+                    false
+                }
+            });
+            if !acquired {
+                // B-24 と同じ扱い: SQ/CQ 枯渇時は graceful に WouldBlock で失敗する。
+                unsafe { libc::close(fd) };
+                self.fd = -1;
+                remove_op(user_data);
+                return Poll::Ready(Err(io::Error::from(io::ErrorKind::WouldBlock)));
+            }
+
+            if let Err(e) = submit_sqes() {
+                unsafe { libc::close(fd) };
+                remove_op(user_data);
+                return Poll::Ready(Err(e));
+            }
+
+            self.submitted = true;
+        }
+
+        match peek_op_result(self.user_data) {
+            Some(res) => {
+                take_op_result(self.user_data);
+                self.submitted = false;
+                if res < 0 && res != -libc::EINPROGRESS {
+                    let fd = self.fd;
+                    self.fd = -1;
+                    unsafe { libc::close(fd) };
+                    Poll::Ready(Err(io::Error::from_raw_os_error(-res)))
+                } else {
+                    let fd = self.fd;
+                    self.fd = -1;
+                    Poll::Ready(Ok(TcpStream { fd }))
+                }
+            }
+            None => {
+                set_op_waker(self.user_data, cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+}
+
+impl Drop for ConnectUnix {
+    fn drop(&mut self) {
+        // `Connect::drop` と同一の後始末（in-flight 中は addr_storage をカーネルが
+        // 参照している可能性があるため detach ガードへ移す）。
+        if self.submitted {
             let storage = std::mem::replace(
                 &mut self.addr_storage,
                 Box::new(unsafe { std::mem::zeroed() }),
@@ -1637,5 +1807,65 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(path).expect("unix bind");
         listener.set_nonblocking(true).expect("set_nonblocking");
         listener
+    }
+
+    /// F-170: `TcpStream::connect_unix` が UDS へ正常に接続できること
+    /// （io_uring CONNECT 経路）。対向は別スレッドの std blocking `UnixListener::accept`
+    /// （テスト専用。accept 側の非同期経路は `test_unix_listener_accept_placeholder_peer_addr`
+    /// が別途カバーする）。
+    #[test]
+    // 理由付き allow: テストのソケットパス後始末（起動/イベントループ外のテストコード）。
+    #[allow(clippy::disallowed_methods)]
+    fn test_connect_unix_success() {
+        if !io_uring_available() {
+            eprintln!("io_uring unavailable; skipping test_connect_unix_success");
+            return;
+        }
+
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "veil-f170-uring-connect-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("unix bind");
+        let accept_path = path.clone();
+        let acceptor = std::thread::spawn(move || {
+            let _ = accept_path;
+            listener.accept().expect("accept")
+        });
+
+        let connect_path = path.clone();
+        let connect_result =
+            crate::runtime::block_on(async move { TcpStream::connect_unix(&connect_path).await });
+
+        acceptor.join().expect("acceptor thread join");
+        let _ = std::fs::remove_file(&path);
+        connect_result.expect("connect_unix should succeed");
+    }
+
+    /// F-170: 存在しないソケットパスへの `connect_unix` は `ENOENT` で失敗すること。
+    #[test]
+    // 理由付き allow: テストのソケットパス後始末（起動/イベントループ外のテストコード）。
+    #[allow(clippy::disallowed_methods)]
+    fn test_connect_unix_enoent() {
+        if !io_uring_available() {
+            eprintln!("io_uring unavailable; skipping test_connect_unix_enoent");
+            return;
+        }
+
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "veil-f170-uring-connect-enoent-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let result = crate::runtime::block_on(async move { TcpStream::connect_unix(&path).await });
+        match result {
+            Ok(_) => panic!("connect to nonexistent socket must fail"),
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::NotFound),
+        }
     }
 }

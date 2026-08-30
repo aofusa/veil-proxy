@@ -586,7 +586,7 @@ async fn run_backend_task(
     notify: &ConnWaker,
 ) -> Result<(), u16> {
     let target = &server.target;
-    let addr = crate::http_utils::HostPortStr::new(&target.host, target.port); // F-41
+    let addr = target.conn_addr(); // F-41/F-170: スタック上に構築（UDS 対応、TCP は不変）
     let addr = addr.as_str();
 
     // --- 非同期接続（タイムアウト付き） ---

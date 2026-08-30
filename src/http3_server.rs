@@ -3466,11 +3466,14 @@ pub(crate) async fn proxy_to_backend_async_with_tls(
     use crate::runtime::handle::AsRawFd;
     use crate::runtime::tcp::TcpStream;
 
-    let addr = format!("{}:{}", target.host, target.port);
+    // F-170: 接続先表記（UDS 対応、TCP は不変）。この経路は非同期 `connect_str` を
+    // 使うため `unix:` 接頭辞をそのまま扱える。
+    let addr = target.conn_addr();
+    let addr = addr.as_str();
     debug!("[HTTP/3] Async connecting to backend {}", addr);
 
     // 非同期TCP接続（タイムアウト付き）
-    let connect_future = TcpStream::connect_str(&addr);
+    let connect_future = TcpStream::connect_str(addr);
     let backend = match crate::runtime::time::timeout(
         Duration::from_secs(timeout_secs),
         connect_future,
@@ -3641,6 +3644,8 @@ async fn proxy_to_tls_backend_async(
         use std::io::Write;
         let result = (|| -> io::Result<BackendProxyResult> {
             let timeout = Duration::from_secs(timeout_secs);
+            // TODO(F-170 phase3): UDS バックエンドはこの同期経路（別スレッド std::net）
+            // では未対応。target.host/port ベースの addr のままなので UDS では接続に失敗する。
             let mut std_stream = std::net::TcpStream::connect(&addr as &str).map_err(|e| {
                 warn!("[HTTP/3] std backend connect error: {}", e);
                 e
@@ -3778,6 +3783,8 @@ async fn proxy_to_tls_backend_async(
         use std::io::Write;
         let result = (|| -> io::Result<BackendProxyResult> {
             let timeout = Duration::from_secs(timeout_secs);
+            // TODO(F-170 phase3): UDS バックエンドはこの同期経路（別スレッド std::net）
+            // では未対応。target.host/port ベースの addr のままなので UDS では接続に失敗する。
             let mut std_stream = std::net::TcpStream::connect(&addr as &str).map_err(|e| {
                 warn!("[HTTP/3] std backend connect error: {}", e);
                 e
@@ -4023,8 +4030,9 @@ async fn proxy_to_h2c_backend_async(
     timeout_secs: u64,
     security: &SecurityConfig,
 ) -> io::Result<BackendProxyResult> {
-    // F-41/B-74: リクエストごとの `format!("{host}:{port}")` ヒープ確保をスタック整形で排除。
-    let addr = crate::http_utils::HostPortStr::new(&target.host, target.port);
+    // F-41/B-74/F-170: リクエストごとの `format!("{host}:{port}")` ヒープ確保をスタック
+    // 整形で排除しつつ、UDS バックエンド（unix:<path>）にも対応する。
+    let addr = target.conn_addr();
     let addr = addr.as_str();
 
     let from_pool;

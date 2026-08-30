@@ -4225,6 +4225,16 @@ pub struct ProxyTarget {
     /// `host` がホスト名の場合は `None` となり、従来どおり `TcpStream::connect_str` 経由で
     /// 名前解決する。
     pub socket_addr: Option<std::net::SocketAddr>,
+    /// UDS バックエンド（F-170）。`Some` のときソケットパス文字列を持つ。
+    /// `host`/`port` は Host ヘッダ・SNI・表示用の論理値（既定 `"localhost"` / `0`）。
+    ///
+    /// `Arc<str>`（`Arc<PathBuf>` ではなく）にしているのは (1) `load_backend` が
+    /// リクエストごとに `ProxyTarget` を clone しうる（F-159 で `resolved_backend` に
+    /// したが単一 URL プロキシのフォールバック経路は残っている）ため参照カウント増分の
+    /// みでディープコピーを避けたい、(2) 接続先表記（`unix:<path>`）の組み立て
+    /// （`HostPortStr::unix`）に必要なのは UTF-8 文字列であり、`PathBuf` を経由すると
+    /// `to_str()` の変換が毎回挟まる、の 2 点から。非 unix ターゲットでは常に `None`。
+    pub unix_path: Option<Arc<str>>,
 }
 
 impl ProxyTarget {
@@ -4236,6 +4246,13 @@ impl ProxyTarget {
         } else {
             return None;
         };
+
+        // F-170: `http(s)://unix:<socket-path>[:<path-prefix>]`（nginx の
+        // `proxy_pass http://unix:/path:/uri;` と同じ表記）。UDS 経路は host:port の
+        // 分割ロジックと独立させ、専用のパース関数へ委譲する。
+        if let Some(uds_rest) = rest.strip_prefix("unix:") {
+            return Self::parse_unix(scheme, uds_rest);
+        }
 
         let (host_port, path) = match rest.find('/') {
             Some(idx) => (&rest[..idx], &rest[idx..]),
@@ -4272,7 +4289,59 @@ impl ProxyTarget {
             sni_name: None,
             use_h2c: false, // デフォルトでは無効
             socket_addr,
+            unix_path: None,
         })
+    }
+
+    /// UDS 表記 (`unix:<socket-path>[:<path-prefix>]`、`unix:` 接頭辞は既に剥がれている)
+    /// をパースする（F-170）。
+    ///
+    /// ソケットパスの後ろの **最後の `:`** を境界候補とし、その直後が `/` で始まる
+    /// ときだけパスプレフィックスとして解釈する（省略時は `/`）。ソケットパスに `:`
+    /// は使えない（区切りと衝突するため）。ソケットパスが空なら設定エラーとして
+    /// `None` を返す。
+    #[cfg(unix)]
+    fn parse_unix(scheme: bool, rest: &str) -> Option<Self> {
+        let (socket_path, path_prefix) = match rest.rfind(':') {
+            Some(idx) if rest[idx + 1..].starts_with('/') => (&rest[..idx], &rest[idx + 1..]),
+            _ => (rest, "/"),
+        };
+        if socket_path.is_empty() {
+            return None;
+        }
+        Some(ProxyTarget {
+            host: "localhost".to_string(),
+            port: 0,
+            use_tls: scheme,
+            path_prefix: path_prefix.to_string(),
+            sni_name: None,
+            use_h2c: false,
+            socket_addr: None,
+            unix_path: Some(Arc::from(socket_path)),
+        })
+    }
+
+    /// 非 unix プラットフォームでは UDS 表記を受理しない（F-170）。
+    #[cfg(not(unix))]
+    fn parse_unix(_scheme: bool, _rest: &str) -> Option<Self> {
+        None
+    }
+
+    /// UDS バックエンドかどうか（F-170）。
+    #[inline]
+    pub fn is_unix(&self) -> bool {
+        self.unix_path.is_some()
+    }
+
+    /// 接続先表記。UDS なら `unix:<path>`、それ以外は従来どおり `host:port`
+    /// （F-170）。プールキー・ログ・メトリクス・Consistent Hash のノード ID の
+    /// 唯一の入口として使う。
+    #[inline]
+    pub(crate) fn conn_addr(&self) -> crate::http_utils::HostPortStr {
+        match &self.unix_path {
+            Some(p) => crate::http_utils::HostPortStr::unix(Path::new(p.as_ref())),
+            None => crate::http_utils::HostPortStr::new(&self.host, self.port),
+        }
     }
 
     /// SNI名を設定したコピーを作成
@@ -4297,8 +4366,13 @@ impl ProxyTarget {
     }
 
     /// デフォルトポートかどうかを判定
+    ///
+    /// UDS バックエンド（F-170）は常に `true`（Host ヘッダへ `:0` を付けない）。
     #[inline]
     pub fn is_default_port(&self) -> bool {
+        if self.is_unix() {
+            return true;
+        }
         if self.use_tls {
             self.port == 443
         } else {
@@ -4350,6 +4424,82 @@ mod proxy_target_socket_addr_tests {
     fn ipv6_bracket_literal_is_rejected_by_existing_split_logic() {
         assert!(ProxyTarget::parse("http://[::1]:8080/").is_none());
         assert!(ProxyTarget::parse("http://[::1]/").is_none());
+    }
+
+    // ==== F-170: UDS バックエンド ====
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_unix_without_path_prefix_defaults_to_slash() {
+        let t = ProxyTarget::parse("http://unix:/run/app.sock").unwrap();
+        assert!(t.is_unix());
+        assert_eq!(t.unix_path.as_deref(), Some("/run/app.sock"));
+        assert_eq!(t.path_prefix, "/");
+        assert_eq!(t.host, "localhost");
+        assert_eq!(t.port, 0);
+        assert!(!t.use_tls);
+        assert_eq!(t.socket_addr, None);
+        assert!(t.is_default_port());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_unix_with_path_prefix() {
+        let t = ProxyTarget::parse("http://unix:/run/app.sock:/api").unwrap();
+        assert!(t.is_unix());
+        assert_eq!(t.unix_path.as_deref(), Some("/run/app.sock"));
+        assert_eq!(t.path_prefix, "/api");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_unix_https_scheme_sets_use_tls() {
+        let t = ProxyTarget::parse("https://unix:/run/app.sock").unwrap();
+        assert!(t.is_unix());
+        assert!(t.use_tls);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_unix_rejects_empty_socket_path() {
+        assert!(ProxyTarget::parse("http://unix:").is_none());
+        // 最後の ':' 以降が '/' で始まらない（`:8080` のような数字）場合は
+        // 全体がソケットパスとして扱われるため空判定にはならないが、コロンの
+        // 直後が空文字列のケースだけを空扱いとする（"unix::/api" → ソケットパス空）。
+        assert!(ProxyTarget::parse("http://unix::/api").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_unix_colon_boundary_requires_slash_after_last_colon() {
+        // 最後の ':' の直後が '/' で始まらない場合は境界とみなさず、全体をソケット
+        // パスとして扱う（ソケットパスに ':' が含まれるケースは非対応の明文化）。
+        let t = ProxyTarget::parse("http://unix:/run/app.sock:8080").unwrap();
+        assert_eq!(t.unix_path.as_deref(), Some("/run/app.sock:8080"));
+        assert_eq!(t.path_prefix, "/");
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn parse_unix_notation_rejected_on_non_unix() {
+        assert!(ProxyTarget::parse("http://unix:/run/app.sock").is_none());
+    }
+
+    /// F-170: `conn_addr()` は TCP（`unix_path = None`）で
+    /// `HostPortStr::new(host, port)` と 1 バイトも変わらない（プールキー・
+    /// Consistent Hash ノード ID の再利用を静かに壊さないための不変条件）。
+    #[test]
+    fn conn_addr_matches_host_port_str_for_tcp_target() {
+        let t = ProxyTarget::parse("http://backend.example.com:8080/").unwrap();
+        let expected = crate::http_utils::HostPortStr::new(&t.host, t.port);
+        assert_eq!(t.conn_addr().as_str(), expected.as_str());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conn_addr_is_unix_prefixed_for_uds_target() {
+        let t = ProxyTarget::parse("http://unix:/run/app.sock").unwrap();
+        assert_eq!(t.conn_addr().as_str(), "unix:/run/app.sock");
     }
 }
 
@@ -4774,8 +4924,9 @@ impl UpstreamGroup {
         use xxhash_rust::xxh3::xxh3_64_with_seed;
         let mut ring: Vec<(u64, usize)> = Vec::with_capacity(pairs.len() * CONSISTENT_HASH_VNODES);
         for (idx, (_, server)) in pairs.iter().enumerate() {
-            // サーバー識別子（host:port）を基に vnode を生成
-            let id = format!("{}:{}", server.target.host, server.target.port);
+            // サーバー識別子（接続先表記。TCP は host:port、UDS は unix:<path>、F-170）を
+            // 基に vnode を生成。TCP では conn_addr() は host:port と 1 バイトも変わらない。
+            let id = server.target.conn_addr().as_str().to_string();
             for vnode in 0..CONSISTENT_HASH_VNODES {
                 let key = format!("{}#{}", id, vnode);
                 let h = xxh3_64_with_seed(key.as_bytes(), CONSISTENT_HASH_SEED);

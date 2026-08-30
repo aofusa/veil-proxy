@@ -355,6 +355,15 @@ impl TcpStream {
     }
 
     pub async fn connect_str(addr: &str) -> io::Result<TcpStream> {
+        // F-170: UDS バックエンド表記（`unix:<path>`）は Windows では非対応（B-69 の
+        // 教訓どおり windows.rs にも同じ分岐を必ず入れる。挙動は「対応しない」旨の
+        // エラーを返すのみで、TCP 経路の命令列は無変更）。
+        if addr.starts_with("unix:") {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "unix domain socket backends are not supported on this platform",
+            ));
+        }
         use std::net::ToSocketAddrs;
         let socket_addr = addr
             .to_socket_addrs()
