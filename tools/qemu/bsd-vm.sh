@@ -1344,6 +1344,9 @@ cmd_e2e() {
 
 # packaging へ渡すためにビルド済みバイナリを取り出す
 cmd_fetch() {
+    # `up` 直後に呼ばれると SSH がまだ上がっておらず scp が 255 で落ちるため待つ
+    # （`cmd_build`/`cmd_e2e` は `cmd_sync` 経由で待つが、fetch だけ素通りだった）。
+    cmd_wait "${SYNC_WAIT_TIMEOUT:-900}" >/dev/null 2>&1 || die "VM の SSH に到達できない"
     local out_dir="${ROOT}/packaging/build"
     local arch_label; arch_label="${ARCH}"
     mkdir -p "${out_dir}"
