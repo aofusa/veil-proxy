@@ -427,7 +427,12 @@ mod enabled {
 
         /// public API (`get_or_compress`/`invalidate`) の smoke test（グローバル
         /// シングルトン経由）。
+        // グローバル `COMPRESSED_CACHE` をシングルトン経由で触るため、並列実行だと
+        // `content_cache.rs` 側の同種テスト（`invalidate_also_drops_compressed_cache_variants`
+        // 等）と衝突しうる。両ファイル共通の既定グループ（引数なし `#[serial]`）で
+        // 直列化する。
         #[test]
+        #[serial_test::serial]
         fn public_api_get_or_compress_smoke_test() {
             let path = PathBuf::from("/var/www/e-smoke.txt");
             let cfg = test_cfg();
