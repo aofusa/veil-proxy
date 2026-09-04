@@ -1133,6 +1133,10 @@ type = "Proxy"
 url = "https://backend.example.com"
 ```
 
+veil は上流（`https://` バックエンド）へは常に HTTP/1.1 で接続する。ALPN で `h2` を
+提示しないため、HTTPS バックエンドが h2 を選択することはない。TLS 上の HTTP/2 上流は
+非対応であり、平文の HTTP/2 上流は後述の `use_h2c` で対応する。
+
 ### H2C (HTTP/2 over cleartext) プロキシ
 
 バックエンドがH2C（TLSなしのHTTP/2）をサポートしている場合、`use_h2c = true` を指定することでHTTP/2で通信できます。

@@ -6,5 +6,5 @@
 pub mod negotiation;
 
 pub use negotiation::{
-    configure_alpn_h2, configure_alpn_h2_client, get_negotiated_protocol, HttpProtocol,
+    configure_alpn_h2, configure_alpn_http11_client, get_negotiated_protocol, HttpProtocol,
 };

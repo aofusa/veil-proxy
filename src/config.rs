@@ -2269,7 +2269,7 @@ thread_local! {
 
         // kTLS が有効な場合のみシークレット抽出を有効化した設定を使用
         let config = (*crate::ktls_rustls::client_config(ktls_enabled)).clone();
-        let config = crate::protocol::configure_alpn_h2_client(config, false);
+        let config = crate::protocol::configure_alpn_http11_client(config);
 
         RustlsConnector::new(Arc::new(config))
             .with_ktls(ktls_enabled)        // 設定に基づいて kTLS を有効化
@@ -2308,7 +2308,7 @@ thread_local! {
         let tcp_cork_enabled = config_guard.ktls_config.tcp_cork_enabled;
 
         let config = (*crate::ktls_rustls::insecure_client_config()).clone();
-        let config = crate::protocol::configure_alpn_h2_client(config, false);
+        let config = crate::protocol::configure_alpn_http11_client(config);
 
         RustlsConnector::new(Arc::new(config))
             .with_ktls(ktls_enabled)
@@ -2340,7 +2340,7 @@ thread_local! {
 thread_local! {
     static TLS_CONNECTOR: simple_tls::SimpleTlsConnector = {
         let config = (*simple_tls::default_client_config()).clone();
-        let config = protocol::configure_alpn_h2_client(config, false);
+        let config = protocol::configure_alpn_http11_client(config);
         simple_tls::SimpleTlsConnector::new(Arc::new(config))
     };
 }
@@ -2359,7 +2359,7 @@ thread_local! {
 thread_local! {
     static TLS_CONNECTOR_INSECURE: simple_tls::SimpleTlsConnector = {
         let config = (*simple_tls::insecure_client_config()).clone();
-        let config = protocol::configure_alpn_h2_client(config, false);
+        let config = protocol::configure_alpn_http11_client(config);
         simple_tls::SimpleTlsConnector::new(Arc::new(config))
     };
 }

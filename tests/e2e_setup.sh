@@ -473,11 +473,10 @@ EOF
     # F-170: UDS バックエンド設定。veil 自身を Unix ドメインソケットで listen させ
     # （F-164 の UDS リスナー）、プロキシ側から `http(s)://unix:<path>` で接続する。
     #
-    # **TLS 用と h2c 用でプロセスを分ける**（backend1 と backend_h2c の関係と同じ）。
-    # 1 プロセスにまとめると h2c のために `http2_enabled = true` が必要になり、その
-    # 設定は TLS リスナーの ALPN に `h2` を広告させる。veil の上流 TLS クライアントは
-    # ALPN で `h2` を提示するのに常に HTTP/1.1 を喋るため（B-83、UDS とは無関係の
-    # 既存バグ）、TLS-over-UDS の中継が 502 になってしまう。
+    # B-83 は修正済み。backend1 / backend_h2c と同じく、TLS 用と h2c 用でプロセスを
+    # 分ける構成にしてある（1 プロセスにまとめると h2c のために `http2_enabled = true`
+    # が必要になり、TLS リスナーの ALPN に `h2` が広告されるため、両方のリスナーを
+    # 同一構成で検証したい場合の構成分離として維持する）。
     rm -f "${BACKEND_UDS_TLS_SOCK}" "${BACKEND_UDS_H2C_SOCK}" "${BACKEND_UDS_H2C_TLS_SOCK}"
     cat > "${FIXTURES_DIR}/backend_uds_tls.toml" << EOF
 [server]
@@ -804,6 +803,14 @@ timeout_secs = 2
 healthy_threshold = 1
 unhealthy_threshold = 3
 
+# B-83 回帰テスト用: backend_h2c.toml は http2_enabled = true のため TLS リスナー
+# （BACKEND_H2C_TLS_PORT）が ALPN で h2 を広告する。この上流を https:// で参照し、
+# 上流クライアントの ALPN から h2 を外しても中継が壊れないことを確認する。
+[upstreams."alpn-h2-pool"]
+algorithm = "round_robin"
+servers = ["https://127.0.0.1:${BACKEND_H2C_TLS_PORT}"]
+tls_insecure = true
+
 # F-44: HTTPS echo バックエンド（自己署名証明書・TLS ストリーミング検証用）
 [upstreams."tls-echo-pool"]
 algorithm = "round_robin"
@@ -1098,6 +1105,22 @@ path = "/sni-upstream/*"
 [route.action]
 type = "Proxy"
 upstream = "sni-pool"
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/alpn-h2/*"
+[route.action]
+type = "Proxy"
+upstream = "alpn-h2-pool"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/alpn-h2/*"
+[route.action]
+type = "Proxy"
+upstream = "alpn-h2-pool"
 
 [[route]]
 [route.conditions]

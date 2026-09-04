@@ -1142,6 +1142,10 @@ type = "Proxy"
 url = "https://backend.example.com"
 ```
 
+Veil always speaks HTTP/1.1 to backends over TLS (`https://`): it does not offer `h2` in
+the upstream ALPN, so an HTTPS backend never negotiates HTTP/2 with it. HTTP/2 backends
+over TLS are not supported; a plaintext HTTP/2 backend is reached via `use_h2c` below.
+
 ### H2C (HTTP/2 over cleartext) Proxy
 
 When the backend supports H2C (HTTP/2 without TLS), specify `use_h2c = true` to communicate via HTTP/2.

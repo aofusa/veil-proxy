@@ -1212,6 +1212,15 @@ impl Http3Handler {
             None => return Decision::Buffer, // handle_request -> 502
         };
 
+        // B-84: h2c 上流はストリーミング経路が扱えない（BackendTaskParams に use_h2c が無く
+        // HTTP/1.1 を送ってしまうため、h2c 専用サーバに切られて 502 になる）。h2c 対応済みの
+        // バッファ経路（handle_request -> proxy_to_h2c_backend_async）へ回す。
+        // HTTP/2 クライアント経路（proxy.rs::h2_proxy_h2c）も同じくバッファ型なので、
+        // これで HTTP/2 クライアントと HTTP/3 クライアントの挙動が揃う。
+        if server.target.use_h2c || upstream_group.use_h2c() {
+            return Decision::Buffer;
+        }
+
         // --- リクエスト head 構築 ---
         let client_encoding = accept_encoding
             .map(AcceptedEncoding::parse)

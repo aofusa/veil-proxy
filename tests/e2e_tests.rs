@@ -25273,18 +25273,53 @@ async fn test_e2e_uds_backend_via_http2_client() {
     );
 }
 
-/// HTTP/3 クライアント → UDS バックエンド（TLS）の中継
+/// HTTP/3 クライアント → UDS バックエンド（h2c）の中継
 /// （下流 QUIC / 上流 UDS の組み合わせ）。
 ///
-/// **h2c 上流ではなく TLS 上流を使う**: HTTP/3 のストリーミングバックエンド経路
-/// （`http3_stream::run_backend_task`）は `use_h2c` を無視して HTTP/1.1 を送るため、
-/// h2c 専用サーバへ中継すると 502 になる（B-84。UDS とは無関係の既存バグ）。
-/// ここで検証したいのは「下流 HTTP/3 で受けたリクエストを UDS 上流へ中継できること」
-/// なので、その既存バグを踏まない TLS 上流で確認する。
+/// B-84 修正済み。HTTP/3 のストリーミングバックエンド経路は、上流が h2c の場合
+/// サーバ選択直後にバッファ経路（`handle_request` -> `proxy_to_h2c_backend_async`）へ
+/// 回すようになったため、HTTP/3 → h2c 上流が通ることを検証する。
 #[tokio::test]
 #[ntest::timeout(20000)]
 #[cfg(feature = "http3")]
 async fn test_e2e_uds_backend_via_http3_client() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+
+    let (_client, mut send_request) = match Http3TestClient::new(server_addr, "localhost").await {
+        Ok(c) => c,
+        Err(e) => panic!(
+            "Failed to create HTTP/3 client for {}: {} (HTTP/3 may not be enabled)",
+            server_addr, e
+        ),
+    };
+
+    let (status, body) = http3_get(&mut send_request, "/uds-h2c/")
+        .await
+        .expect("HTTP/3 request to UDS backend failed");
+
+    assert_eq!(status, 200, "HTTP/3 → UDS backend should return 200");
+    assert!(
+        String::from_utf8_lossy(&body).contains("Hello from UDS Backend"),
+        "HTTP/3 → UDS backend body mismatch"
+    );
+}
+
+/// HTTP/3 クライアント → UDS バックエンド（TLS）の中継
+/// （下流 QUIC / 上流 TLS-over-UDS の組み合わせ）。
+///
+/// h2c 上流とは別経路（ストリーミング経路をそのまま通る TLS 上流）のカバレッジを
+/// 維持するため、h2c 版とは別関数として残す。
+#[tokio::test]
+#[ntest::timeout(20000)]
+#[cfg(feature = "http3")]
+async fn test_e2e_uds_backend_via_http3_client_tls() {
     if !is_e2e_environment_ready().await {
         eprintln!("Skipping test: E2E environment not ready");
         return;
@@ -25310,5 +25345,39 @@ async fn test_e2e_uds_backend_via_http3_client() {
     assert!(
         String::from_utf8_lossy(&body).contains("Hello from UDS Backend"),
         "HTTP/3 → UDS backend body mismatch"
+    );
+}
+
+// ====================
+// B-83: 上流 TLS の ALPN が h2 を広告しても中継が壊れないこと
+// ====================
+
+/// B-83 回帰テスト: 上流が ALPN で h2 を広告しても中継が壊れないこと。
+///
+/// `backend_h2c.toml` は `http2_enabled = true` のため TLS リスナー
+/// （`BACKEND_H2C_TLS_PORT`）が ALPN で `h2, http/1.1` を広告する。修正前は
+/// 上流クライアントの ALPN にも `h2` が含まれていたため、上流が h2 を選択して
+/// veil が HTTP/1.1 のバイト列を送りつけ、中継が 502 になっていた。
+#[tokio::test]
+#[ntest::timeout(15000)]
+async fn test_e2e_alpn_h2_upstream_regression() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    let resp = send_request(PROXY_PORT, "/alpn-h2/", &[]).await;
+    assert!(resp.is_some(), "ALPN h2 upstream route should respond");
+    let resp = resp.unwrap();
+    assert_eq!(
+        get_status_code(&resp),
+        Some(200),
+        "ALPN h2 upstream should not 502: {}",
+        resp
+    );
+    assert!(
+        resp.contains("H2C Backend"),
+        "ALPN h2 upstream should forward the backend body: {}",
+        resp
     );
 }
