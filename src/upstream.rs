@@ -1189,6 +1189,7 @@ mod tests {
     // 理由付き allow: テストコードは同期 I/O・sleep を使用してよい（データプレーン非経由）。
     #![allow(clippy::disallowed_methods)]
     use super::*;
+    use std::net::ToSocketAddrs;
 
     // ====================
     // F-22: ヘルスチェック種別テスト
@@ -1267,14 +1268,53 @@ mod tests {
         // F-170 修正: connect_probe は SocketAddr パースに失敗した表記を
         // ホスト名として DNS 解決できなければならない（http3_server.rs の
         // 旧 TcpStream::connect(&str) の DNS 解決を引き継ぐ回帰確認）。
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral listener");
+        //
+        // 「localhost」の名前解決は環境によって `::1`（IPv6）が先に返ることがある。
+        // 以前の実装はリスナーを固定で `127.0.0.1`（IPv4）へ bind していたため、
+        // 解決結果が IPv6 優先の環境では connect_probe が別アドレスへ接続してしまい、
+        // IPv4 リスナーの accept() が永久に来ない（= 待ち受けスレッドの join() が
+        // 永久に返らない）状態になり得た。実際に docker ビルド（builder ステージの
+        // `cargo test --lib`）でこのテストがハングし、ビルドが進まなくなったことが
+        // あるため、まず "localhost:0" を解決してその先頭アドレスへ bind することで
+        // connect_probe が解決する先頭アドレスと確実に同じファミリにする。
+        let resolve_addr = "localhost:0"
+            .to_socket_addrs()
+            .expect("resolve localhost")
+            .next()
+            .expect("localhost must resolve to at least one address");
+        let listener = std::net::TcpListener::bind(resolve_addr).expect("bind ephemeral listener");
         let port = listener.local_addr().expect("local_addr").port();
-        let acceptor = std::thread::spawn(move || listener.accept().expect("accept"));
+
+        // 上記でファミリを揃えてあるため、通常は connect_probe が確実に listener へ
+        // 到達する。それでも「万一ファミリが揃わなかった／connect が失敗した」場合に
+        // accept() が永久にブロックして join() が返らなくなる（= docker ビルドの
+        // `cargo test --lib` が再びハングする）事態を避けるため、accept 待ち受け側に
+        // 明示的な上限時間を設ける（ノンブロッキング + 短間隔ポーリング）。
+        listener.set_nonblocking(true).expect("set_nonblocking");
+        let acceptor = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                match listener.accept() {
+                    Ok(_) => return true,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            return false;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return false,
+                }
+            }
+        });
 
         let addr = format!("localhost:{}", port);
         let result = connect_probe(&addr, Duration::from_secs(2));
 
-        acceptor.join().expect("acceptor thread join");
+        let accepted = acceptor.join().expect("acceptor thread join");
+        assert!(
+            accepted,
+            "acceptor must observe a connection within the deadline"
+        );
         assert!(result.is_ok(), "expected localhost:{} to resolve", port);
     }
 
