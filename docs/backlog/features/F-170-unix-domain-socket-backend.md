@@ -258,3 +258,62 @@ E2E 551 件（io_uring / epoll の両方）をすべて通過し、
 
 **教訓: 「値が常に `None` だから安全」はコンパイルの話には通用しない。**
 プラットフォーム限定の API を呼ぶ分岐は、条件がどうであれ `cfg` で切ること。
+
+---
+
+## 全プラットフォーム検証（2026-09-04〜05）
+
+F-170 / B-83 / B-84 / B-85 を含む最終コードで、6 プラットフォーム × 2 アーキの
+ビルドと E2E、および Linux / FreeBSD の性能退行確認を実施した。
+
+### E2E（BSD は QEMU 上のネイティブ実行。`ssh llm` の Apple Silicon macOS）
+
+| 環境 | 結果 | 2026-08-29 ベースライン | 判定 |
+|---|---|---|---|
+| Linux x86_64（io_uring） | **553 / 0** | — | ✅ |
+| Linux x86_64（epoll） | **553 / 0** | — | ✅ |
+| FreeBSD x86_64（TCG） | 542 / 11 | 535 / 9 | ✅ 9 件一致。新規 2 件は VM 内単独実行 2 回で通過を実証 |
+| FreeBSD aarch64（HVF） | 552 / 1 | 543 / 1 | ✅ B-68 のみ・完全一致 |
+| OpenBSD x86_64（TCG） | 542/10 → **545/7** | 538 / 5 | ✅ 同一コードで失敗集合が変化＝負荷フレーク確定 |
+| OpenBSD aarch64（HVF） | 551 / 1 | 543 / 0 | ✅ `test_h2c_invalid_frame` はベースラインが「再実行で解消」と記録した同一テスト |
+| NetBSD x86_64（TCG） | 539/14 → 538/15 | 534 / 10 | ⚠️ 下記 |
+| NetBSD aarch64（HVF） | **428 / 0** | 421 / 0 | ✅ 完全通過（B-62 により HTTP/3 は対象外） |
+
+**NetBSD x86_64 の扱い（正直な記録）**: 10 件はベースラインと完全一致し、2 回のフル実行で
+失敗集合が 14 → 15 と**変動**した（`test_http3_throughput` は 2 回目のみ）ため環境の
+不安定性自体は実証できた。ただし両方で失敗した HTTP/3 系 3 件
+（`test_http3_request_body_streaming_tls_backend` / `test_http3_sni_and_cert_reload` /
+`test_http3_udp_unreachable_fallback`）は、**VM のスクラッチディスク枯渇とその後の
+起動不良により単独実行での直接確認ができていない**。判断材料は次のとおり:
+
+- 同じ 3 件が **他 6 環境すべて**（Linux io_uring / Linux epoll / FreeBSD x86_64 /
+  FreeBSD aarch64 / OpenBSD x86_64 / OpenBSD aarch64）で通過している。
+- 本変更（`conn_addr()` / 上流 ALPN / `Decision::Buffer`）に **OS 依存の分岐は無い**ため、
+  退行なら他環境にも出るはずである。
+- ベースラインが NetBSD x86_64 を「TCG 上で HTTP/3 + WASM が 180 秒の起動待ちを
+  超過する」環境として記録している。
+
+**「退行なし」と結論しているが、NetBSD 上での直接確認は未実施である**点を明記しておく。
+
+### 性能退行確認
+
+- **Linux x86_64 交互 A/B**（`main` 対 本ブランチ、8 ラウンド × 2 サイズ）:
+  54KB **-0.10%** / 3B **+0.13%**。いずれも σ の内側で方向も揃わず、退行なし。
+- **FreeBSD aarch64 対 nginx**（3 ラウンド × 8 シナリオ）: 全シナリオで
+  2026-08-28 と一致（差 -0.05〜+0.04）。F-170 が触ったプロキシ経路
+  （`h2_proxy_tls` 1.31 / `h1_proxy_tls` 0.99）もベースラインどおり。
+
+詳細は [`docs/perf/README.md`](../../perf/README.md)。
+
+### パッケージ
+
+`packaging/output/` に 17 種すべてを本日付で生成した（Linux x86_64/aarch64 の
+deb・rpm・glibc・musl、Windows x86_64/aarch64、macOS universal2、
+FreeBSD/OpenBSD/NetBSD × x86_64/aarch64 の tar.gz）。
+Linux/Windows/macOS は Docker クロスビルド、BSD 6 種は QEMU VM 内ネイティブビルド。
+
+### 最終ローカル検証
+
+`cargo fmt` クリーン / clippy（`full`・`full,epoll` の `--all-targets -D warnings`）警告ゼロ /
+**18 構成のビルド**（default・`no-default-features`・`full` + 個別 feature 15 種）警告ゼロ /
+単体 978・955 / 統合 54 / E2E 553・553。`#[allow(dead_code)]` は不使用。
