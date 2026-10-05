@@ -1521,6 +1521,8 @@ mod tests {
 
     // B-44: バックエンドコネクションプールが max_idle まで保持し、それ以上は
     // 最古のものから破棄することの回帰テスト（BACKEND_POOL_MAX_IDLE_PER_HOST = 256）。
+    // ダミー接続に socketpair(2) を使うため unix 限定（Windows に AF_UNIX socketpair は無い）。
+    #[cfg(unix)]
     mod http_connection_pool {
         use super::super::*;
 
@@ -1538,6 +1540,9 @@ mod tests {
 
         #[test]
         fn test_put_respects_max_idle_256() {
+            // 256 本超の fd を同時に保持する。macOS の既定 soft limit は 256 なので、
+            // 本番の起動処理と同じく soft を引き上げてから行う。
+            crate::system::raise_nofile_limit();
             let mut pool = HttpConnectionPool::new();
             let key = "example.test:80";
             for _ in 0..(BACKEND_POOL_MAX_IDLE_PER_HOST + 8) {
