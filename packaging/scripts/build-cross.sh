@@ -13,7 +13,7 @@
 # QEMU VM 内ネイティブビルドが唯一の公式経路: `--target freebsd` を指定すると
 # 案内を表示して終了する（下記 build_freebsd_unsupported 参照）。
 #
-# BSD 向けは `full` ではなく `full-freebsd`（jemalloc）を既定にする
+# BSD 向けは `full` ではなく `full-freebsd`（システムアロケータ。B-89）を既定にする
 # （tools/qemu/bsd-vm.sh freebsd <arch> build が使う）。OpenBSD（同じく VM
 # ネイティブビルド）は `full-openbsd`（システムアロケータ + 同梱
 # rustls(ring)/quiche(BoringSSL)）を使う。

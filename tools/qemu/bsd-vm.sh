@@ -1057,9 +1057,9 @@ fi
 
 cmd_toolchain() {
     if [[ "${OS_NAME}" == "freebsd" ]]; then
-        # gmake は tikv-jemalloc-sys（`full-freebsd` の jemalloc）のビルドに必須。
-        # 無いと `failed to execute command: No such file or directory` で落ちる。
-        # gmake  : tikv-jemalloc-sys（`full-freebsd` の jemalloc）のビルドに必須
+        # gmake は `--features jemalloc` の tikv-jemalloc-sys で必要だった（B-89 で FreeBSD は
+        # jemalloc feature 自体を廃止）。他の C 依存のビルドで使うことがあるため残している。
+        # gmake  : 上記
         # protobuf: tests/grpc_server の prost-build が protoc を要求する（E2E に必要）
         log "pkg install rust cmake llvm gmake protobuf bash curl nasm git pkgconf"
         cmd_ssh 'env IGNORE_OSVERSION=yes ASSUME_ALWAYS_YES=yes pkg install -y rust cmake llvm gmake protobuf bash curl nasm git pkgconf >/tmp/pkg.log 2>&1 || { tail -20 /tmp/pkg.log; exit 1; }'
@@ -1253,7 +1253,7 @@ _guest_env_prefix() {
 }
 
 # BSD 向けの既定 feature セット（Cargo.toml）。
-#   full-freebsd : full と同じ機能セット + アロケータを jemalloc + POSIX AIO(F-127) 有効
+#   full-freebsd : full と同じ機能セット（アロケータはシステムの malloc(3)。B-89）
 #   full-openbsd : full と同じ機能セット + システムアロケータ（mimalloc/jemalloc を使わない）
 #                  + 同梱 rustls(ring)/quiche(BoringSSL)。
 #   full-netbsd  : full-openbsd と同一方針（システムアロケータ + 同梱 TLS）。

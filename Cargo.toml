@@ -288,14 +288,19 @@ full = [
 # feature セットを arch ごとに分ける必要がそもそも無い。x86_64 でも aarch64 でも
 # `--features full-freebsd` 等をそのまま使う。
 
-# FreeBSD: mimalloc の代わりに jemalloc、加えて POSIX AIO 経路（F-127）を有効化する。
+# FreeBSD: mimalloc を使わずシステムの malloc(3)（= libc 内蔵の jemalloc）を使う。
+# B-89: 以前は tikv-jemallocator（`jemalloc` feature）を載せていたが、FreeBSD 向けに
+# ビルドされた jemalloc は libthr のフック（`_malloc_thread_cleanup` /
+# `_malloc_prefork` / `_malloc_postfork`）をプレフィックス無しで定義し、libc 内蔵
+# jemalloc のフックを上書きしてしまう。スレッド終了時に libc 側のスレッドキャッシュが
+# 片付けられず、次のスレッド生成で libc の malloc がクラッシュする（単体テストの
+# 並列実行で 100% 再現）。libc の malloc がそもそも jemalloc なので失うものは無い。
 full-freebsd = [
     "ktls", "http2", "http3",
     "grpc-full", "wasm",
     "opentelemetry",
     "compression", "cache", "metrics",
     "websocket", "rate-limit", "buffering",
-    "jemalloc",
     # B-63 / F-145: `aio`（F-127 の POSIX AIO 経路）は **既定から外した**。
     #   - 性能: aio_read/aio_write は「submit + aio_error + aio_return」で
     #     1 I/O あたり 3 syscall を要し、readiness 経路（read/write 1 発）より遅い。

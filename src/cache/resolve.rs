@@ -233,7 +233,13 @@ pub fn open_beneath(root: &Path, rel: &Path) -> io::Result<(File, Metadata)> {
     }
     #[cfg(target_os = "freebsd")]
     if let Some(result) = freebsd_impl::open_beneath_fresh(root, rel) {
-        return result;
+        // O_RESOLVE_BENEATH は絶対シンボリックリンクを（リンク先がルート内でも）
+        // ENOTCAPABLE で拒否する。Linux の EXDEV と同じく、この場合だけ従来経路で
+        // 再判定する（`security::capsicum::retry_outside_capmode` と同じ方針）。
+        match result {
+            Err(ref e) if e.raw_os_error() == Some(libc::ENOTCAPABLE) => {}
+            other => return other,
+        }
     }
     fallback_open_beneath(root, rel)
 }

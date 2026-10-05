@@ -373,7 +373,7 @@ FreeBSD 専用 I/O 経路だけが異なる**。cargo にはターゲット別�
 | セット | アロケータ | 追加 | 使う場所 |
 |---|---|---|---|
 | `full`（既定） | mimalloc | — | Linux / macOS / Windows |
-| `full-freebsd` | **jemalloc** | **`aio`**（POSIX AIO 経路、F-127） | `build-cross.sh --target freebsd` / `bsd-vm.sh freebsd …` |
+| `full-freebsd` | **システムアロケータ**（libc の jemalloc。tikv-jemalloc は B-89 で廃止） | — | `build-cross.sh --target freebsd` / `bsd-vm.sh freebsd …` |
 | `full-openbsd` | **システムアロケータ**（`global_allocator` を差し替えない） | 同梱 rustls(ring)/quiche(BoringSSL) | `bsd-vm.sh openbsd …`（既定） |
 | `full-netbsd` | システムアロケータ | 同梱 rustls(ring)/quiche(BoringSSL)。**`wasm` を含む**（`third_party/wasmtime` 経由の Pulley 実行、B-55 解消） | `bsd-vm.sh netbsd …`（既定。実 VM 検証は未実施、上記「NetBSD 対応の現状」参照） |
 

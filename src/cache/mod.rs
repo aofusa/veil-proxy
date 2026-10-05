@@ -92,25 +92,30 @@ pub use policy::{CacheControl, CachePolicy, VaryResult};
 ///   結果として同じ「許可」に帰着する（起動後にディレクトリが作成される運用でも
 ///   動作し続ける）。
 ///
-/// FreeBSD capability mode（`cap_enter`、F-123）が有効な間は、実際のパストラバーサル
-/// 封じ込めは dirfd 相対 `openat`/`fstatat` の `O_RESOLVE_BENEATH` が担う。この経路では
-/// `file_info.canonical_path` 自体が生パス（`full_path` そのもの）になるため、
-/// `full_path` が常に `base_path` の join で構築される以上この比較は必ず真になる
-/// （cap_enter 前と同じ「常に許可」という結果は変わらない）。よって
-/// `security::capsicum::static_serving_active()`（追加 syscall 無しの atomic load）が
-/// true の間は比較そのものを省略できる。`cache` feature の有無に依存しないため
-/// feature ゲート外（このファイル）に置く。
+/// FreeBSD では、登録済み静的ルートの dirfd 相対 `openat`/`fstatat`（F-123、
+/// `O_RESOLVE_BENEATH`）で開けた場合の `file_info.canonical_path` は生パス
+/// （`base_path` の join そのもの）になり、canonical 形の `canonical_base` とは
+/// 一致しないことがある（`base_path` がシンボリックリンクを含む場合）。そのため
+/// **生の `base_path` 配下であることも許可条件に加える**。dirfd 経路の生パスは
+/// カーネルが封じ込めを保証済みで、従来経路（`canonicalize()`）の canonical パスは
+/// シンボリックリンクを解決済みなので生の `base_path`（シンボリックリンクなら
+/// canonical パスの接頭辞になり得ない）に一致するのはルート内に限られる。
+///
+/// 以前は `static_serving_active()` の間この比較を丸ごと省略して常に許可していたが、
+/// それでは dirfd 経路を外れて従来経路へ落ちたパス（登録済みルート外・
+/// `ENOTCAPABLE` の再判定。B-89）の封じ込めが効かない（BSD 実機の単体テストで検出）。
+/// `cache` feature の有無に依存しないため feature ゲート外（このファイル）に置く。
 #[inline]
 pub fn sendfile_base_contains(
     file_canonical_path: &std::path::Path,
     canonical_base: Option<&std::path::Path>,
     base_path: &std::path::Path,
 ) -> bool {
+    let base = canonical_base.unwrap_or(base_path);
     #[cfg(target_os = "freebsd")]
-    if crate::security::capsicum::static_serving_active() {
+    if file_canonical_path.starts_with(base_path) {
         return true;
     }
-    let base = canonical_base.unwrap_or(base_path);
     file_canonical_path.starts_with(base)
 }
 
@@ -480,11 +485,9 @@ fn open_and_read_uncached(
             Ok(mut file) => {
                 let meta = file.metadata().ok()?;
                 if let Some((canonical_base, base_path)) = containment.as_ref() {
-                    // capability mode 下では /proc が使えない。`sendfile_base_contains` は
-                    // `capsicum::static_serving_active()` が true の間（＝この高速経路が
-                    // 使える間は必ず true）常にパスの値によらず true を返す設計
-                    // （このファイル冒頭の `sendfile_base_contains` doc 参照）ため、
-                    // raw path をそのまま渡しても判定結果には影響しない。
+                    // dirfd 相対 openat（O_RESOLVE_BENEATH）で開けた生パスを渡す。
+                    // `sendfile_base_contains` は FreeBSD では生の base_path 配下も許可する
+                    // （このファイル冒頭の doc 参照）ので、ルート内なら判定は真になる。
                     if !sendfile_base_contains(path, canonical_base.as_deref(), base_path) {
                         return Some(StaticFileOutcome::Forbidden);
                     }

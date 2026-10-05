@@ -76,7 +76,7 @@ use super::content_cache::{self, StaticContentCacheConfig};
 use super::file_cache::{self, CachedFileInfo, OpenFileCacheConfig};
 // `resolve`（openat2/RESOLVE_BENEATH によるカーネル封じ込め）は Linux 専用経路でしか
 // 使わない。FreeBSD は `security::capsicum` 側（`is_registered_static_root` /
-// capability mode 下で no-op になる `sendfile_base_contains`）を使うため、
+// 生の base_path 配下も許可する `sendfile_base_contains`）を使うため、
 // cfg で絞らないと FreeBSD ビルドで unused import の warning になる。
 // テストも該当分はすべて `#[cfg(target_os = "linux")]` で絞ってある。
 #[cfg(target_os = "linux")]

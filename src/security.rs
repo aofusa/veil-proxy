@@ -2712,7 +2712,7 @@ pub mod capsicum {
     /// `None` = 相対化対象外（通常の絶対パス open にフォールバック）。
     /// `Some(Err)` = 相対化対象だが openat 失敗（404 相当）。
     pub fn open_static_ro(abs: &Path) -> Option<io::Result<std::fs::File>> {
-        with_resolved_root(abs, |dirfd, rel| {
+        retry_outside_capmode(with_resolved_root(abs, |dirfd, rel| {
             let fd = unsafe {
                 libc::openat(
                     dirfd,
@@ -2726,12 +2726,34 @@ pub mod capsicum {
                 // SAFETY: openat が返した所有権のある有効な fd。
                 Ok(unsafe { std::fs::File::from_raw_fd(fd) })
             }
-        })
+        }))
+    }
+
+    /// `O_RESOLVE_BENEATH` が `ENOTCAPABLE` を返したとき、capability mode の外であれば
+    /// `None` を返して呼び出し側の従来経路（`canonicalize()` + 含有チェック）に
+    /// そのリクエスト限りで再判定させる。
+    ///
+    /// FreeBSD の `O_RESOLVE_BENEATH` は、リンク先がルート**内**であっても**絶対**
+    /// シンボリックリンクを `ENOTCAPABLE` で拒否する（Linux の `RESOLVE_BENEATH` が
+    /// `EXDEV` を返すのと同じ仕様）。これを権威ある拒否として扱うと、
+    /// `current -> /srv/www/releases/vNNN` 型のデプロイが 404 になる（F-153 が Linux で
+    /// 避けた失敗モードが FreeBSD にだけ残っていた。BSD 実機の単体テストで検出）。
+    /// `..` によるルート外への脱出も同じ errno になるが、従来経路の含有チェックが拒否する。
+    /// capability mode 内では絶対パスの `realpath` が使えないため従来どおり拒否のまま。
+    fn retry_outside_capmode<T>(r: Option<io::Result<T>>) -> Option<io::Result<T>> {
+        match r {
+            Some(Err(ref e))
+                if e.raw_os_error() == Some(libc::ENOTCAPABLE) && !is_capability_mode() =>
+            {
+                None
+            }
+            other => other,
+        }
     }
 
     /// capability mode 下でルート dirfd 相対に `fstatat` する（`canonicalize`+`metadata` 代替）。
     pub fn stat_static(abs: &Path) -> Option<io::Result<StaticStat>> {
-        with_resolved_root(abs, |dirfd, rel| {
+        retry_outside_capmode(with_resolved_root(abs, |dirfd, rel| {
             let mut st: libc::stat = unsafe { std::mem::zeroed() };
             let ret = unsafe { libc::fstatat(dirfd, rel.as_ptr(), &mut st, AT_RESOLVE_BENEATH) };
             if ret != 0 {
@@ -2754,7 +2776,7 @@ pub mod capsicum {
                 is_file,
                 is_dir,
             })
-        })
+        }))
     }
 
     // ------------------------------------------------------------------

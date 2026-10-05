@@ -15,6 +15,16 @@ static GLOBAL: MiMalloc = MiMalloc;
 #[cfg(feature = "jemalloc")]
 use tikv_jemallocator::Jemalloc;
 
+// B-89: FreeBSD 向けの tikv-jemalloc は libthr のフック（`_malloc_thread_cleanup` 等）を
+// プレフィックス無しで定義して libc 内蔵 jemalloc のフックを上書きし、スレッドの
+// 生成・終了を繰り返すと libc の malloc がクラッシュする。FreeBSD の malloc(3) は
+// 元から jemalloc なので、FreeBSD では `jemalloc` feature を使わせない。
+#[cfg(all(feature = "jemalloc", target_os = "freebsd"))]
+compile_error!(
+    "the `jemalloc` feature must not be used on FreeBSD (B-89): tikv-jemalloc overrides \
+     libthr's malloc hooks and corrupts the libc allocator; FreeBSD's malloc(3) already is jemalloc"
+);
+
 #[cfg(all(
     feature = "jemalloc",
     not(feature = "mimalloc"),

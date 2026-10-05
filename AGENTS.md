@@ -62,7 +62,8 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
   `reactor/tcp/unix.rs` の `create_nonblocking_socket` の macOS 分岐を参照する。
 - 非 unix でも型として存在するフィールドを見る分岐にも `cfg(unix)` が要る（F-170）。
 - プラットフォーム限定関数だけが使う定数にも同じ `cfg` を付ける（`allow(dead_code)` で黙らせない）。
-- FreeBSD の `aio` feature は使わない（B-63）。NetBSD の `struct kevent` は型が違う（`make_kevent` の netbsd 版）。
+- FreeBSD の `aio` feature は使わない（B-63）。FreeBSD で `jemalloc` feature（tikv-jemalloc）は使わない
+  （libthr の malloc フックを上書きして libc の jemalloc を壊す。compile_error 化済み。B-89）。NetBSD の `struct kevent` は型が違う（`make_kevent` の netbsd 版）。
 - セキュリティ機構は `target_os` で分岐: Linux = seccomp/Landlock/CBPF、FreeBSD = capsicum（cap-mode 下の静的配信・
   証明書リロードは dirfd 相対 `openat`、背景スレッドの sleep は `server::cap_safe_sleep`。F-123/F-136）、
   OpenBSD = pledge/unveil、NetBSD = chroot + 特権降格のみ（F-140）、macOS = Seatbelt。非対象 OS のキーは警告して無視。
@@ -89,6 +90,7 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
   決まる最重要チューニング項目。定数でハードコードし直さない（F-151/F-152）。
 - HTTP/3 のストリーミング経路で本文途中のエラーは fin ではなくストリームリセットにする（切り詰めを成功に見せない。B-86）。
 - 静的配信のパス解決に `canonicalize()` を使わない（dirfd 相対 `openat2`/`O_RESOLVE_BENEATH`。`openat2` は seccomp 許可必須。F-153）。
+  絶対シンボリックリンクは Linux=`EXDEV`・FreeBSD=`ENOTCAPABLE` で拒否されるので、その場合だけ従来経路で再判定する（B-89）。
 - FreeBSD の静的配信はヘッダも `sendfile(2)` の `sf_hdtr` で 1 syscall（平文 HTTP/1.1 のみ。TLS 経路に通すと平文漏洩。F-155）。
 - HTTP/2・HTTP/3 の静的配信は `static_file_cache` と `open_file_cache` をセットで有効にして初めて offload ゼロになる（F-157）。
 - HTTP/2 のインライン初回 poll（`spawn_inline`）は reactor 専用。io_uring 側の executor は変えない（F-158）。
