@@ -38,6 +38,16 @@
 #   VM_DISK_SIZE    ディスクサイズ（default: 14G）
 #   UBUNTU_IMG_URL  ベース cloud image URL
 #   WAIT_TIMEOUT    wait のタイムアウト秒（default: 1800）
+#   VEIL_QEMU_NATIVE 1 で Docker を使わずホストの qemu-system-aarch64 を直接起動する
+#                   （docker コマンドが無ければ自動で 1 相当。0 を明示すると自動切替しない）
+#
+# native モード（Docker 不使用）:
+#   `bsd-vm.sh` の native モードと同じ考え方。Apple Silicon macOS（Docker 未導入）では
+#   **HVF**（`-machine virt,accel=hvf -cpu host`）で起動するため、x86_64 ホストの TCG と
+#   違って Ubuntu cloud image が実用速度で動き、VM 内のネイティブビルドも現実的になる
+#   （`linux-aarch64-e2e.sh` の `NATIVE_BUILD=1`）。それ以外のホストでは TCG
+#   （`-cpu cortex-a72`）。前提: `brew install qemu cdrtools`（mkisofs）。
+#   Docker モードの挙動は本モードの有無に関わらず変えていない。
 set -euo pipefail
 
 VEIL_QEMU_DIR="${VEIL_QEMU_DIR:-${HOME}/qemu-images/aarch64}"
@@ -53,6 +63,14 @@ CONTAINER="veil-arm-vm"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SSH_KEY="${VEIL_QEMU_DIR}/id_vm"
 
+if [[ -n "${VEIL_QEMU_NATIVE:-}" ]]; then
+    NATIVE="${VEIL_QEMU_NATIVE}"
+elif ! command -v docker >/dev/null 2>&1; then
+    NATIVE=1
+else
+    NATIVE=0
+fi
+
 log() { echo "[aarch64-vm] $*" >&2; }
 die() { echo "[aarch64-vm] ERROR: $*" >&2; exit 1; }
 
@@ -60,12 +78,51 @@ ssh_opts=(-i "${SSH_KEY}" -p "${SSH_PORT}"
   -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
   -o ConnectTimeout=90 -o ServerAliveInterval=20 -o ServerAliveCountMax=6)
 
+# qemu-img 等を helper コンテナ（Docker モード）またはホスト（native）で実行する
+helper() {
+    if [[ "${NATIVE}" == "1" ]]; then
+        (cd "${VEIL_QEMU_DIR}" && "$@")
+    else
+        docker run --rm -v "${VEIL_QEMU_DIR}:/w" -w /w "${HELPER_IMAGE}" "$@"
+    fi
+}
+
+# native: cloud-init シード（ISO9660, volid cidata）を作る
+make_seed_native() {
+    local src; src="$(mktemp -d)"
+    cp "${VEIL_QEMU_DIR}/user-data" "${VEIL_QEMU_DIR}/meta-data" "${src}/"
+    rm -f "${VEIL_QEMU_DIR}/seed.img"
+    if command -v mkisofs >/dev/null 2>&1; then
+        mkisofs -output "${VEIL_QEMU_DIR}/seed.img" -volid cidata -joliet -rock "${src}" >/dev/null 2>&1
+    elif command -v genisoimage >/dev/null 2>&1; then
+        genisoimage -output "${VEIL_QEMU_DIR}/seed.img" -volid cidata -joliet -rock "${src}" >/dev/null 2>&1
+    else
+        rm -rf "${src}"
+        die "cidata ISO を作るツールが無い（mkisofs/genisoimage。macOS は 'brew install cdrtools'）"
+    fi
+    rm -rf "${src}"
+}
+
+# native: AAVMF/EDK2 の aarch64 UEFI コードを探す
+find_efi_code() {
+    local c
+    for c in /opt/homebrew/share/qemu/edk2-aarch64-code.fd /usr/local/share/qemu/edk2-aarch64-code.fd \
+             /usr/share/AAVMF/AAVMF_CODE.fd /usr/share/qemu/edk2-aarch64-code.fd; do
+        [[ -f "${c}" ]] && { echo "${c}"; return 0; }
+    done
+    return 1
+}
+
 cmd_setup() {
-    command -v docker >/dev/null || die "docker が必要です"
     mkdir -p "${VEIL_QEMU_DIR}"
 
-    log "ヘルパ Docker イメージをビルド: ${HELPER_IMAGE}"
-    docker build -t "${HELPER_IMAGE}" "${SCRIPT_DIR}/helper"
+    if [[ "${NATIVE}" == "1" ]]; then
+        command -v qemu-system-aarch64 >/dev/null || die "qemu-system-aarch64 が必要です（brew install qemu）"
+    else
+        command -v docker >/dev/null || die "docker が必要です"
+        log "ヘルパ Docker イメージをビルド: ${HELPER_IMAGE}"
+        docker build -t "${HELPER_IMAGE}" "${SCRIPT_DIR}/helper"
+    fi
 
     if [[ ! -f "${VEIL_QEMU_DIR}/ubuntu-arm64.img" ]]; then
         log "Ubuntu 24.04 arm64 cloud image をダウンロード（初回のみ、~600MB）"
@@ -74,8 +131,7 @@ cmd_setup() {
 
     log "VM ディスクを作成・リサイズ（${VM_DISK_SIZE}）"
     cp -f "${VEIL_QEMU_DIR}/ubuntu-arm64.img" "${VEIL_QEMU_DIR}/vm.img"
-    docker run --rm -v "${VEIL_QEMU_DIR}:/w" -w /w "${HELPER_IMAGE}" \
-        qemu-img resize vm.img "${VM_DISK_SIZE}"
+    helper qemu-img resize vm.img "${VM_DISK_SIZE}"
 
     if [[ ! -f "${SSH_KEY}" ]]; then
         log "SSH 鍵を生成: ${SSH_KEY}"
@@ -108,13 +164,62 @@ EOF
 instance-id: veilarm-001
 local-hostname: veilarm
 EOF
-    docker run --rm -v "${VEIL_QEMU_DIR}:/w" -w /w "${HELPER_IMAGE}" \
-        cloud-localds seed.img user-data meta-data
+    if [[ "${NATIVE}" == "1" ]]; then
+        make_seed_native
+    else
+        helper cloud-localds seed.img user-data meta-data
+    fi
+    rm -f "${VEIL_QEMU_DIR}/varstore.img" "${VEIL_QEMU_DIR}/efi_code.img"
     log "setup 完了"
+}
+
+cmd_up_native() {
+    local efi accel cpu
+    efi="$(find_efi_code)" || die "aarch64 UEFI ファーム（edk2-aarch64-code.fd）が見つからない（brew install qemu）"
+    if [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" ]]; then
+        accel="hvf,gic-version=3"; cpu="host"
+    else
+        accel="tcg"; cpu="cortex-a72"
+    fi
+    cmd_down_native
+    (
+        cd "${VEIL_QEMU_DIR}"
+        if [[ ! -f varstore.img ]]; then
+            dd if=/dev/zero of=varstore.img bs=1m count=64 2>/dev/null || dd if=/dev/zero of=varstore.img bs=1M count=64 2>/dev/null
+            dd if=/dev/zero of=efi_code.img bs=1m count=64 2>/dev/null || dd if=/dev/zero of=efi_code.img bs=1M count=64 2>/dev/null
+            dd if="${efi}" of=efi_code.img conv=notrunc 2>/dev/null
+        fi
+        nohup qemu-system-aarch64 \
+            -machine "virt,accel=${accel}" -cpu "${cpu}" -smp "${VM_SMP}" -m "${VM_MEM_MB}" \
+            -nographic \
+            -drive if=pflash,format=raw,file=efi_code.img,readonly=on \
+            -drive if=pflash,format=raw,file=varstore.img \
+            -drive if=virtio,format=qcow2,file=vm.img \
+            -drive if=virtio,format=raw,file=seed.img \
+            -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22" \
+            -device virtio-net-pci,netdev=net0,romfile= \
+            < /dev/null > console.log 2>&1 &
+        echo $! > qemu.pid
+        disown || true
+    )
+    log "起動しました（native, accel=${accel}）。'wait' で SSH 到達を待てます。"
+}
+
+cmd_down_native() {
+    local pidf="${VEIL_QEMU_DIR}/qemu.pid"
+    if [[ -f "${pidf}" ]] && kill -0 "$(cat "${pidf}")" 2>/dev/null; then
+        cmd_ssh 'sudo poweroff' >/dev/null 2>&1 || true
+        local i
+        for i in $(seq 1 30); do kill -0 "$(cat "${pidf}")" 2>/dev/null || break; sleep 2; done
+        kill -9 "$(cat "${pidf}")" 2>/dev/null || true
+        log "VM を停止しました"
+    fi
+    rm -f "${pidf}"
 }
 
 cmd_up() {
     [[ -f "${VEIL_QEMU_DIR}/vm.img" ]] || die "先に 'setup' を実行してください"
+    if [[ "${NATIVE}" == "1" ]]; then cmd_up_native; return; fi
     docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
 
     # UEFI ファーム: CODE（読み取り専用）+ VARS（書き込み可）を 64MiB flash として用意
@@ -170,7 +275,15 @@ cmd_scp() {
 }
 
 cmd_status() {
-    docker ps --filter "name=${CONTAINER}" --format 'container: {{.Status}}' || true
+    if [[ "${NATIVE}" == "1" ]]; then
+        if [[ -f "${VEIL_QEMU_DIR}/qemu.pid" ]] && kill -0 "$(cat "${VEIL_QEMU_DIR}/qemu.pid")" 2>/dev/null; then
+            echo "qemu: running (pid $(cat "${VEIL_QEMU_DIR}/qemu.pid"))"
+        else
+            echo "qemu: not running"
+        fi
+    else
+        docker ps --filter "name=${CONTAINER}" --format 'container: {{.Status}}' || true
+    fi
     if ssh "${ssh_opts[@]}" -o ConnectTimeout=10 veil@127.0.0.1 'uname -mr' 2>/dev/null; then
         echo "ssh: reachable"
     else
@@ -178,9 +291,13 @@ cmd_status() {
     fi
 }
 
-cmd_console() { docker logs "${CONTAINER}" 2>&1 | tail -"${1:-30}"; }
+cmd_console() {
+    if [[ "${NATIVE}" == "1" ]]; then tail -"${1:-30}" "${VEIL_QEMU_DIR}/console.log"; return; fi
+    docker logs "${CONTAINER}" 2>&1 | tail -"${1:-30}"
+}
 
 cmd_down() {
+    if [[ "${NATIVE}" == "1" ]]; then cmd_down_native; return; fi
     docker rm -f "${CONTAINER}" >/dev/null 2>&1 && log "VM を停止・削除しました" || log "VM は起動していません"
 }
 

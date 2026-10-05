@@ -322,7 +322,14 @@ cmd_setup() {
         local base="${WORKDIR}/base.qcow2"
         if [[ ! -f "${base}" ]]; then
             log "FreeBSD VM-IMAGE（BASIC-CLOUDINIT）を DL + 展開: ${url}"
-            curl -fL --retry 3 -o "${base}.xz" "${url}"
+            # サポートが終わったリリースは download.freebsd.org から消えて
+            # ftp-archive の old-releases へ移る（14.3-RELEASE は 2026-10 に 404 化を実測）。
+            # 本家が 404 なら同じパスのアーカイブへフォールバックする。
+            if ! curl -fL --retry 3 -o "${base}.xz" "${url}"; then
+                local archive_url="${url/https:\/\/download.freebsd.org\/releases/http:\/\/ftp-archive.freebsd.org\/pub\/FreeBSD-Archive\/old-releases}"
+                log "本家ミラーに無いためアーカイブから取得: ${archive_url}"
+                curl -fL --retry 3 -o "${base}.xz" "${archive_url}"
+            fi
             xz -dc "${base}.xz" > "${base}"
             rm -f "${base}.xz"
         fi
