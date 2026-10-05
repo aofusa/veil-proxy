@@ -1,0 +1,54 @@
+# F-81: GitHub Release の公開時に SBOM を生成してリリースアセットへ添付する。
+#
+# リリースページは手動で作成する運用のため、タグ push ではなく `release: published` を
+# 契機にする（作成済みのリリースへ `gh release upload` で追加するだけで、本文や
+# 既存アセットには触れない）。ソース（Cargo.lock 由来の CycloneDX）と、そのタグで
+# ビルドしたコンテナイメージ（SPDX）の 2 種を添付する。
+name: release-sbom
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "SBOM を添付するリリースのタグ（例: v0.7.0）"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  sbom:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Build Veil image (glibc)
+        working-directory: docker
+        run: |
+          docker build -f Dockerfile.glibc -t "veil:glibc" \
+            --build-arg CARGO_FEATURES='full' ..
+      - name: Generate SBOM (source + image)
+        env:
+          VEIL_IMAGE: "veil:glibc"
+          SKIP_SBOM: "0"
+        run: ./tools/container_security/security/run_sbom.sh
+      - name: Scan SBOM with grype (report only)
+        uses: anchore/scan-action@v6
+        with:
+          sbom: tools/container_security/results/sbom_source.cdx.json
+          fail-build: false
+          output-format: table
+      - name: Attach SBOM to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          r=tools/container_security/results
+          cp "$r/sbom_source.cdx.json" "veil-${TAG}-sbom-source.cdx.json"
+          cp "$r/sbom_image.spdx.json" "veil-${TAG}-sbom-image.spdx.json"
+          gh release upload "${TAG}" --clobber \
+            "veil-${TAG}-sbom-source.cdx.json" "veil-${TAG}-sbom-image.spdx.json"

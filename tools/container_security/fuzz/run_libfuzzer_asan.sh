@@ -15,6 +15,9 @@ RUST_IMAGE="${RUST_FUZZ_IMAGE:-rustlang/rust:nightly-bookworm}"
 FUZZ_RUNS="${FUZZ_RUNS:-4000}"
 FUZZ_MAX_TIME="${FUZZ_MAX_TIME:-180}"
 SANITIZER="${FUZZ_SANITIZER:-address}"
+# F-82: 1 で各ターゲットの実行後に `cargo fuzz cmin` で永続コーパスを最小化する
+# （CI の nightly で回次ごとに肥大化するコーパスを保存・復元するため）。
+FUZZ_CMIN="${FUZZ_CMIN:-0}"
 FUZZ_TARGETS="${FUZZ_TARGETS:-hpack_decode config_toml http2_frame_decode http_header_validate}"
 REPORT="${RESULTS_DIR}/libfuzzer_asan_report.txt"
 
@@ -77,6 +80,11 @@ docker run --rm \
             cargo fuzz run --sanitizer ${SANITIZER} \"\${target}\" /corpus/\${target} -- \
                 -runs=${FUZZ_RUNS} -max_total_time=${FUZZ_MAX_TIME} \
                 2>&1 | tee -a /results/libfuzzer_asan_report.txt
+            if [ \"${FUZZ_CMIN}\" = 1 ]; then
+                before=\$(ls /corpus/\${target} | wc -l)
+                cargo fuzz cmin --sanitizer ${SANITIZER} \"\${target}\" /corpus/\${target} >/dev/null 2>&1 || true
+                echo \"libfuzzer_asan cmin target=\${target} \${before} -> \$(ls /corpus/\${target} | wc -l)\" | tee -a /results/libfuzzer_asan_report.txt
+            fi
         done
         echo 'libfuzzer_asan: ok' | tee -a /results/libfuzzer_asan_report.txt
     "

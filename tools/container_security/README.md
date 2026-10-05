@@ -64,6 +64,16 @@ openssl req -x509 -newkey EC -pkeyopt ec_paramgen_curve:secp384r1 -nodes \
 SKIP_TRIVY=1 SKIP_H2SPEC=1 SKIP_TESTSSL=1 ./tools/container_security/run.sh
 ```
 
+### GitHub Actions での実行（`.github/workflows/container-security-nightly.yml`）
+
+| ジョブ | 頻度 | 内容 |
+|--------|------|------|
+| `suite` | 毎日 | 既定フェーズ（trivy / h2spec / h3spec（必須）/ toxiproxy / testssl / semgrep / gitleaks / cargo-audit / cargo-deny / 短時間 libFuzzer）を glibc・musl で |
+| `chaos-extended` | 毎週 | bad_backend / Pumba netem / リソース枯渇 / syscall 障害注入 / OWASP ZAP |
+| `sanitizers` | 毎週 | ASAN・TSAN の E2E カオス + ASAN libFuzzer（コーパスを cache で持ち越し `FUZZ_CMIN=1`） |
+| `e2e` | 毎日 | `tests/e2e_setup.sh test`（io_uring / epoll） |
+| `sbom` | 毎日 | SBOM 生成 + grype 照合。リリース公開時は `release-sbom.yml` がアセットへ添付 |
+
 ### nightly / リリース前（フル拡張）
 
 ```bash
@@ -202,6 +212,8 @@ CARGO_TARGET_DIR=/tmp/veil-build-target cargo build -p veil-fuzz
 | `SKIP_LIBFUZZER_ASAN` | `1` | libFuzzer + ASAN（F-71） |
 | `SKIP_LIBFUZZER_TSAN` | `1` | libFuzzer + TSAN（データ競合、F-71） |
 | `SKIP_PUMBA_COMPOUND` | `0` | Pumba の複合障害（tc で loss+delay 同時、F-69） |
+| `FUZZ_CMIN` | `0` | `1` で ASAN libFuzzer の各ターゲット実行後に `cargo fuzz cmin` で永続コーパスを最小化（F-82。nightly の `sanitizers` ジョブが使用） |
+| `H3SPEC_STRICT` / `H3SPEC_REQUIRED` | `0` / `0` | h3spec の失敗 / バイナリ未導入をゲート失敗にする（F-95。ハーネスコンテナへ渡す） |
 | `SEED_REGRESSION_CORPUS` | `1` | `fuzz/regression_corpus/` の既知クラッシュ seed をコーパスへ複製（F-80） |
 | `SEMGREP_CUSTOM_RULES` | `1` | `.semgrep/` の Veil カスタムルールを併用（F-64） |
 | `SKIP_CHAOS_LOAD` | `0` | 高並行負荷 + SIGHUP（`KERNEL_REQUIRE_IO_URING=1` 時は自動） |

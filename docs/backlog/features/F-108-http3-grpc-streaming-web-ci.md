@@ -6,7 +6,7 @@
 
 **本作業（F-107 実装フェーズ）では対象外。** ハーネス・テスト本体は F-107、GHA 配線のみ本チケット。
 
-## 改修内容（予定）
+## 改修内容
 
 1. `.github/workflows/ci.yml` の E2E ジョブで F-107 新規テストが実行されること（`full` features）
 2. `container-security-nightly.yml` で `h3_grpc_oversized_metadata` / `h3_grpc_rst_flood` / `h3_grpc_web_*` が実行されること
@@ -20,4 +20,11 @@
 
 ## 対応状況
 
-未着手（F-107 から分離。**本作業では対象外**）。
+完了（末尾「対応結果」参照）。
+
+## 対応結果（2026-10-05、完了）
+
+`container-security-nightly.yml` に毎日の `e2e` ジョブ（io_uring / epoll の 2 マトリクス、`tests/e2e_setup.sh test`）を追加したため、本チケットで追加した E2E は nightly で必ず実行される（PR CI では F-119 のとおり重いので回さない）。container_security 側のプローブ・fuzz ターゲットは `run.sh` の既定フェーズに含まれており、毎日の `suite` ジョブ（glibc/musl）で実行され、結果は `container-security-results-*` artifact に残る。
+
+ワークフローは GitHub Actions 上でしか実行できないため、ローカルでは YAML の構文検証と、
+同じ環境変数での `tools/container_security/run.sh` の実行（v0.7.0 リリース前検証）で確認した。

@@ -43,9 +43,11 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # AGENTS.md: allow(dead_code) 禁止・論拠なき allow 追加禁止のため、
-      # 変更由来の新規 warning を可視化する（既存のツールチェーン全体 lint は別途対応）。
-      - run: cargo clippy --features full --tests
+      # AGENTS.md: allow(dead_code) 禁止・論拠なき allow 追加禁止。警告ゼロを維持しているため
+      # -D warnings でゲートする。clippy.toml の disallowed-methods（ホットパスのブロッキング検出、
+      # F-88）もここで効く。reactor（epoll）は io_uring ビルドでは 1 行もコンパイルされないため両方回す。
+      - run: cargo clippy --all-targets --features full -- -D warnings
+      - run: cargo clippy --all-targets --features full,epoll -- -D warnings
 
   build:
     name: build (${{ matrix.features }})
