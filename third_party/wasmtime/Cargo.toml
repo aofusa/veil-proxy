@@ -553,8 +553,8 @@ priority = -1
 dead_code = "allow"
 trivial_numeric_casts = "warn"
 unstable_features = "warn"
-unused-lifetimes = "warn"
-unused-macro-rules = "warn"
+unused_lifetimes = "warn"
+unused_macro_rules = "warn"
 unused_extern_crates = "warn"
 unused_import_braces = "warn"
 

@@ -16,6 +16,10 @@ crates.io の [`wasmtime` 40.0.4](https://crates.io/crates/wasmtime/40.0.4) を�
 - `[package] name = "wasmtime"` → `name = "veil-wasmtime"`。
   **`[lib] name = "wasmtime"` は変更していない。**
 - `[lints.rust]` に `dead_code = "allow"` を追加。
+- `[lints.rust]` の `unused-lifetimes` / `unused-macro-rules` をアンダースコア表記
+  （`unused_lifetimes` / `unused_macro_rules`）へ変更。cargo 1.99 以降はハイフン表記を
+  非推奨としてビルドのたびに manifest 警告を出すため（2026-10、Linux aarch64 VM の
+  cargo 1.99.0 で検出。アンダースコア表記は旧 cargo でも同じ意味で解釈される）。
 
 ### 2. `build.rs`
 
@@ -113,7 +117,8 @@ cargo が `error: multiple workspace roots found in the same workspace` を返�
    `Cargo.lock` / `.cargo-ok` / `tests/` / `proptest-regressions/` は取り込まない）。
 3. 上記「差分は 2 点だけ」を再適用する。
    - `Cargo.toml`: `name = "veil-wasmtime"` への変更 + `[lints.rust] dead_code = "allow"`
-     （既存の `[lints.rust]` セクションがあればそこに追記、無ければ新設）。
+     （既存の `[lints.rust]` セクションがあればそこに追記、無ければ新設）+ ハイフン表記の
+     lint 名（`unused-lifetimes` 等）のアンダースコア化。
    - `build.rs`: `has_native_signals` 算出への `veil_force_no_native_signals` の AND。
 4. ルート `Cargo.toml` の `wasmtime` / `veil-wasmtime` 依存のバージョン指定
    （`version = "40.0.0"` 等）も新バージョンに合わせて更新する。
