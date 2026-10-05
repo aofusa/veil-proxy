@@ -110,6 +110,7 @@ native モードでの相違点（利用者から見て変わるのは主に「D
 | `sync` | リポジトリを VM へ転送（tar over ssh） |
 | `build` | VM 内でリリースビルド（既定 `--no-default-features --features full-freebsd\|full-openbsd`） |
 | `e2e` | VM 内で `tests/e2e_setup.sh test` |
+| `unit` | VM 内で単体テスト（`--lib`）+ 統合テスト（E2E と同じ feature・環境変数） |
 | `fetch` | VM 内の release バイナリを `packaging/build/veil-<os>-<arch>` へ取得 |
 
 > **`sync` / `build` / `e2e` / `fetch` は VM が起動済みであることが前提。**

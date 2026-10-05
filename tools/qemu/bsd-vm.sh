@@ -67,6 +67,7 @@
 #   sync       リポジトリを VM へ転送（tar over ssh）
 #   build      VM 内で full features リリースビルド
 #   e2e        VM 内で tests/e2e_setup.sh test を実行
+#   unit       VM 内で単体テスト（--lib）+ 統合テストを実行
 #   fetch      VM 内の release バイナリを host（packaging/build/）へ取得
 #   ssh/scp/console/status/down
 #
@@ -1349,6 +1350,20 @@ cmd_e2e() {
     cmd_ssh "cd ${GUEST_ROOT} && ${env_prefix} VEIL_E2E_NO_DEFAULT_FEATURES=1 VEIL_E2E_FEATURES='${e2e_features}' bash tests/e2e_setup.sh test"
 }
 
+# unit: VM 内で単体テスト（--lib）と統合テストを実行する。
+#   E2E は `tests/e2e_tests.rs` しか走らせないため、ライブラリ側の単体テストが BSD で
+#   コンパイル・通過するかはこれで確かめる（Linux 専用定数を参照するテストが BSD で
+#   コンパイル不能だった B-88 の再発防止）。feature は e2e と同じ規則で決める。
+cmd_unit() {
+    cmd_sync
+    local unit_features="${CARGO_FEATURES}"
+    if [[ "${OS_NAME}" == "netbsd" && "${ARCH}" == "aarch64" && "${unit_features}" == "full-netbsd" ]]; then
+        unit_features="full-netbsd-no-http3"
+    fi
+    log "in-VM 単体 + 統合テスト（features=${unit_features}）"
+    cmd_ssh "cd ${GUEST_ROOT} && $(_guest_env_prefix) cargo test --no-default-features --features '${unit_features}' --lib --test integration_tests"
+}
+
 # packaging へ渡すためにビルド済みバイナリを取り出す
 cmd_fetch() {
     # `up` 直後に呼ばれると SSH がまだ上がっておらず scp が 255 で落ちるため待つ
@@ -1394,6 +1409,7 @@ case "${COMMAND}" in
     sync) cmd_sync ;;
     build) cmd_build ;;
     e2e) cmd_e2e "$@" ;;
+    unit) cmd_unit ;;
     fetch) cmd_fetch ;;
     ssh) cmd_ssh "$@" ;;
     scp) cmd_scp "$@" ;;
