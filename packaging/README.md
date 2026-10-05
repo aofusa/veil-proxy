@@ -144,7 +144,7 @@ packaging/
 | ツール | 用途 |
 |--------|------|
 | `cargo` | veil バイナリビルド |
-| `cmake`, `nasm` | `full` フィーチャー（[README.md](../README.md) Build 節参照） |
+| `cmake`, `nasm` | `full` フィーチャー（[docs/guide/ja/building.md](../docs/guide/ja/building.md) 参照） |
 | `dpkg-deb` | `.deb` 生成 |
 | `rpmbuild` | `.rpm` 生成（`rpm` パッケージ） |
 
