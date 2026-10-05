@@ -500,6 +500,15 @@ impl TcpStream {
         if ret == SOCKET_ERROR {
             return Err(last_wsa_error());
         }
+        // Linux/BSD ではローカルの SHUT_RD で同じソケットの待機中 poll が即座に
+        // readable（EOF）になるが、Windows の WSAPoll はローカルの SD_RECEIVE を
+        // イベントとして報告しない。待機中の read が idle timeout まで起きないため
+        // （L4 の B-57: 片方向の close で対向方向の read を解除する経路が Windows だけ
+        // 30 秒止まっていた）、読み取り待機者を明示的に起こして recv を再試行させる
+        // （recv は WSAESHUTDOWN を返し、読み取り側が終了する）。
+        if how != SD_SEND {
+            crate::runtime::reactor::executor::wake_all_readers(self.fd);
+        }
         Ok(())
     }
 }

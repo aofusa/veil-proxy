@@ -11,7 +11,7 @@ use crate::runtime::io::{AsyncReadRent, AsyncWriteRentExt, IoVecBuf, IoVecBufMut
 use crate::runtime::tcp::TcpStream;
 use crate::runtime::time::timeout;
 use bytes::{Bytes, BytesMut};
-use ftlog::{debug, error, info, warn};
+use ftlog::{debug, error, warn};
 use httparse::{Request, Status};
 use std::io;
 use std::net::SocketAddr;
@@ -8684,7 +8684,8 @@ async fn transfer_response_with_compression(
             if let Some(encoding) = should_compress {
                 // 圧縮有効: ヘッダーを書き換えて圧縮転送
                 // 注意: 圧縮時はキャッシュ保存をスキップ（圧縮後のデータをキャッシュするには追加実装が必要）
-                info!(
+                // リクエストごとに通る経路なので info ではなく debug（既定レベルで出さない）。
+                ftlog::debug!(
                     "[Compression] Initializing compressed transfer with {:?}",
                     encoding
                 );
@@ -11118,10 +11119,6 @@ async fn handle_sendfile(
     // WASMレスポンスヘッダーフィルタを適用（後段で Connection ヘッダーを追記するため mut）
     #[cfg(feature = "wasm")]
     let mut header_buf = {
-        ftlog::info!(
-            "[WASM Response] SendFile: wasm_modules count = {}",
-            wasm_modules.len()
-        );
         if !wasm_modules.is_empty() {
             let config = CURRENT_CONFIG.load();
             if let Some(ref wasm_engine) = config.wasm_filter_engine {
@@ -11683,6 +11680,12 @@ mod connect_gate_tests {
         } else {
             false
         }
+    }
+
+    /// reactor（WSAPoll）ビルド: WSAPoll はカーネル資源を事前確保しないため常に利用可能。
+    #[cfg(veil_poller_wsapoll)]
+    fn io_uring_available() -> bool {
+        true
     }
 
     /// ConnectPermit の Drop が in_flight を確実に減算し、待機者へ通知すること（B-44 第3段）。

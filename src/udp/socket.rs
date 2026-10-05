@@ -1817,6 +1817,9 @@ mod tests {
     // 定数テスト
     // ====================
 
+    // GSO_SEGMENT_SIZE は Linux 専用定数（GSO は Linux のみ）なので、テストも Linux に限る。
+    // cfg が無いと BSD/macOS/Windows の `cargo test` がコンパイルエラーになる。
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_gso_segment_size() {
         // GSO セグメントサイズは適切な値
@@ -1830,6 +1833,7 @@ mod tests {
     fn test_recv_buffer_size() {
         // 受信バッファサイズは十分な大きさ
         assert_eq!(RECV_BUFFER_SIZE, 65536);
+        #[cfg(target_os = "linux")]
         const _: () = assert!(RECV_BUFFER_SIZE >= GSO_SEGMENT_SIZE);
     }
 

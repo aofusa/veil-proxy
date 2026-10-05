@@ -8467,10 +8467,13 @@ mod shipped_config_tests {
         std::fs::write(www.join("robots.txt"), "User-agent: *\n").unwrap();
         std::fs::write(www.join("index.html"), "<html></html>").unwrap();
 
+        // TOML の基本文字列ではバックスラッシュがエスケープ扱いになるため、
+        // Windows のパス（`C:\Users\...`）は区切りを `/` にしてから埋め込む。
+        let toml_path = |p: &std::path::Path| p.to_string_lossy().replace('\\', "/");
         let content = content
-            .replace("/path/to/cert.pem", &cert_path.to_string_lossy())
-            .replace("/path/to/key.pem", &key_path.to_string_lossy())
-            .replace("/var/www", &www.to_string_lossy());
+            .replace("/path/to/cert.pem", &toml_path(&cert_path))
+            .replace("/path/to/key.pem", &toml_path(&key_path))
+            .replace("/var/www", &toml_path(&www));
 
         let test_path = dir.path().join("config.toml");
         std::fs::write(&test_path, content).unwrap();

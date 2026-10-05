@@ -405,9 +405,12 @@ mod tests {
     /// そのため、登録が必要なテストは全てこの 1 箇所を経由し、`root_a`/`root_b`
     /// という 2 つの独立したルートを共有する（`OnceLock::get_or_init` で最初の
     /// 呼び出し時に 1 回だけ登録される。以後の呼び出しは同じ参照を返すだけ）。
+    ///
+    /// 2 つの TempDir は配列で持つ（`[0]` = root_a、`[1]` = root_b）。root_b を読むのは
+    /// Linux 専用テストだけなので、個別フィールドにすると非 Linux のテストビルドで
+    /// 「never read」警告になる（TempDir は Drop で消えないよう保持し続ける必要がある）。
     struct RegisteredTestRoots {
-        root_a: tempfile::TempDir,
-        root_b: tempfile::TempDir,
+        dirs: [tempfile::TempDir; 2],
     }
 
     static REGISTERED_TEST_ROOTS: std::sync::OnceLock<RegisteredTestRoots> =
@@ -418,7 +421,9 @@ mod tests {
             let root_a = tempdir().unwrap();
             let root_b = tempdir().unwrap();
             register_test_roots(&[root_a.path().to_path_buf(), root_b.path().to_path_buf()]);
-            RegisteredTestRoots { root_a, root_b }
+            RegisteredTestRoots {
+                dirs: [root_a, root_b],
+            }
         })
     }
 
@@ -681,7 +686,7 @@ mod tests {
     #[test]
     fn directory_route_file_access_calls_offload_once() {
         let roots = registered_test_roots();
-        let public_root = roots.root_a.path();
+        let public_root = roots.dirs[0].path();
         let file_path = write_file_in(public_root, "page.html", b"<html>ok</html>");
 
         let ofc = test_ofc();
@@ -741,8 +746,8 @@ mod tests {
     #[test]
     fn cross_route_open_beneath_in_root_rejects_other_route() {
         let roots = registered_test_roots();
-        let root_a = roots.root_a.path();
-        let root_b = roots.root_b.path();
+        let root_a = roots.dirs[0].path();
+        let root_b = roots.dirs[1].path();
         let file_in_b = write_file_in(root_b, "cross_route_secret.txt", b"route b secret");
 
         // 対照実験: 「どれかの登録済みルート」探索は B にマッチして成功する
@@ -806,8 +811,8 @@ mod tests {
     #[test]
     fn cross_route_dot_dot_escape_is_rejected() {
         let roots = registered_test_roots();
-        let root_a = roots.root_a.path();
-        let root_b = roots.root_b.path();
+        let root_a = roots.dirs[0].path();
+        let root_b = roots.dirs[1].path();
         let _ = write_file_in(root_b, "dotdot_secret.txt", b"dotdot secret");
 
         // root_a 配下の相対パスとして "../<root_b の basename>/dotdot_secret.txt"
@@ -834,8 +839,8 @@ mod tests {
     #[test]
     fn cross_route_absolute_symlink_escaping_root_is_rejected() {
         let roots = registered_test_roots();
-        let root_a = roots.root_a.path();
-        let root_b = roots.root_b.path();
+        let root_a = roots.dirs[0].path();
+        let root_b = roots.dirs[1].path();
         let secret = write_file_in(root_b, "symlink_secret.txt", b"symlink secret");
 
         let link_path = root_a.join("escape_link_f154");
@@ -854,7 +859,7 @@ mod tests {
     #[test]
     fn open_beneath_in_root_allows_file_within_registered_root() {
         let roots = registered_test_roots();
-        let root_a = roots.root_a.path();
+        let root_a = roots.dirs[0].path();
         let file_path = write_file_in(root_a, "normal_f154.txt", b"normal file");
 
         let (mut file, meta) = resolve::open_beneath_in_root(root_a, &file_path)
