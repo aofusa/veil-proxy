@@ -195,3 +195,14 @@ FreeBSD 14.3 aarch64（QEMU/HVF、**他 VM を止めた静かなホスト**）�
 したがって本件は **FreeBSD/aarch64 固有**の可能性が高い（FreeBSD 全体の問題ではない）。
 Linux（io_uring / epoll とも 544/544）でも起きないため、
 **aarch64 の kqueue reactor 経路**を疑うのが次の一手になる。
+
+---
+
+## 2026-10-06: 解決（真因は B-90）
+
+`test_http3_large_request_body` の失敗は FreeBSD/aarch64 固有ではなく、
+**TLS ハンドシェイクループが `read_tls` を 1 回しか呼ばず 4KB を超えた暗号文を捨てていた**
+プラットフォーム共通の不具合だった（[B-90](B-90-tls-handshake-drops-coalesced-records.md)）。
+「30 秒待ち」は、バックエンドが 400 で切断した後に HTTP/3 側が STOP_SENDING を送らず、
+クライアントの上り本文がフロー制御で止まっていたためで、こちらも B-90 で修正した。
+FreeBSD x86_64 で 10 回連続成功（修正前は環境起動後 2 回目以降すべて失敗）。

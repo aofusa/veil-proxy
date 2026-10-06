@@ -166,6 +166,11 @@ impl<T> Sender<T> {
         Ok(())
     }
 
+    /// 受信端が drop 済みか（以後の送信はすべて `Closed` になる）。
+    pub fn is_closed(&self) -> bool {
+        self.sh.borrow().receiver_closed
+    }
+
     /// キューが容量上限に達しているか（バックプレッシャ判定）。
     pub fn is_full(&self) -> bool {
         let s = self.sh.borrow();

@@ -3097,6 +3097,12 @@ fn drive_request_pump(
 ) -> bool {
     use crate::http3_stream::TrySendError;
     let mut did_work = false;
+    // バックエンドタスクが終了して本文が不要になった（チャネルが満杯のまま受信側が
+    // 閉じた場合も含む。満杯だと try_send に到達せず Closed を観測できない）。
+    if ps.req_tx.as_ref().is_some_and(|t| t.is_closed()) && !ps.req_too_large {
+        abandon_request_body(conn, stream_id, ps);
+        return true;
+    }
     let tx = match &ps.req_tx {
         Some(t) => t,
         None => return did_work,
@@ -3116,8 +3122,7 @@ fn drive_request_pump(
                 return did_work;
             }
             Err(TrySendError::Closed(_)) => {
-                ps.req_pending.clear();
-                ps.req_tx = None;
+                abandon_request_body(conn, stream_id, ps);
                 return true;
             }
         }
@@ -3156,7 +3161,7 @@ fn drive_request_pump(
                             return did_work;
                         }
                         Err(TrySendError::Closed(_)) => {
-                            ps.req_tx = None;
+                            abandon_request_body(conn, stream_id, ps);
                             return true;
                         }
                     }
@@ -3192,6 +3197,25 @@ fn drive_request_pump(
     }
 
     did_work
+}
+
+/// バックエンドタスクが要求本文を必要としなくなった（早期応答・バックエンド切断で
+/// req チャネルの受信側が閉じた）とき、要求ストリームの受信を打ち切る。
+///
+/// 以前は `req_tx` を落とすだけで `recv_body` を呼ばなくなっていたため、未受信の本文が
+/// quiche に溜まって QUIC のフロー制御ウィンドウが補充されず、**本文を送り切ってから応答を
+/// 読むクライアントは送信が止まったまま応答を受け取れず、アイドルタイムアウトまで停止した**
+/// （B-68 の 30 秒待ちの直接の原因）。RFC 9114 §4.1.1 に従い `STOP_SENDING(H3_NO_ERROR)` で
+/// 送信停止を求める（quiche は以後の受信データを破棄し、クライアントは応答を読める）。
+/// クライアントが既に本文を送り切っている（fin 受信済み）場合は何もしない。
+fn abandon_request_body(conn: &mut quiche::Connection, stream_id: u64, ps: &mut ProxyStream) {
+    /// RFC 9114 §8.1 H3_NO_ERROR
+    const H3_NO_ERROR: u64 = 0x100;
+    ps.req_pending.clear();
+    ps.req_tx = None;
+    if !ps.req_eof_seen && !conn.stream_finished(stream_id) {
+        let _ = conn.stream_shutdown(stream_id, quiche::Shutdown::Read, H3_NO_ERROR);
+    }
 }
 
 /// レスポンス flush: resp チャネル → `send_response`/`send_body`（フロー制御 + 部分送信保持）。

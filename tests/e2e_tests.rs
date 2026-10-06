@@ -3160,6 +3160,57 @@ async fn test_http3_request_body_streaming() {
     );
 }
 
+/// B-68: バックエンドが要求本文を読み切る前に応答して切断しても、HTTP/3 クライアントが
+/// 詰まらずに応答を受け取れること。
+///
+/// `/error-500/*` のバックエンドはヘッダだけ読んで即座に 500 を返して閉じる。修正前の veil は
+/// バックエンドタスクの終了後に要求ストリームの受信をやめるだけで STOP_SENDING を送らず、
+/// QUIC のフロー制御ウィンドウが補充されないため、本文を送り切ってから応答を読むクライアントは
+/// アイドルタイムアウトまで停止していた。
+#[tokio::test]
+#[ntest::timeout(60000)]
+#[cfg(feature = "http3")]
+async fn test_http3_early_backend_response_does_not_stall_upload() {
+    if !is_e2e_environment_ready().await {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    use common::http3_client::send_http3_request;
+
+    // QUIC の初期フロー制御ウィンドウ（1MB 程度）を大きく超える本文。
+    let body: Vec<u8> = vec![b'x'; 4_000_000];
+    let (mut _client, mut send_request) = Http3TestClient::new(server_addr, "localhost")
+        .await
+        .expect("connect");
+    let started = std::time::Instant::now();
+    let (status, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        send_http3_request(
+            &mut send_request,
+            "POST",
+            "/error-500/upload",
+            &[("content-type", "application/octet-stream")],
+            Some(&body),
+        ),
+    )
+    .await
+    .expect("upload must not stall until the QUIC idle timeout")
+    .expect("response must be received even if the server stops the upload");
+    assert!(
+        status == 500 || status == 502 || status == 503,
+        "unexpected status {}",
+        status
+    );
+    eprintln!(
+        "early backend response: status {} in {:?}",
+        status,
+        started.elapsed()
+    );
+}
+
 /// F-44: HTTP/3 リクエスト方向ストリーミング × **TLS バックエンド**の End-to-End。
 ///
 /// `/echo-upload-tls/*` は HTTPS の echo バックエンドへ振り分けられ、バックエンドタスクは

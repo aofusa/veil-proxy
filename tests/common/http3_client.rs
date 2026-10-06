@@ -163,14 +163,32 @@ pub async fn send_http3_request_full(
     // リクエストを送信
     let mut stream = send_request.send_request(request).await?;
 
-    // ボディを送信（ある場合）
+    // ボディを送信（ある場合）。
+    // RFC 9114 §4.1.1: サーバは本文を受け取り切る前に完全な応答を返し、STOP_SENDING
+    // （H3_NO_ERROR）で送信停止を求めてよい。その場合 send_data/finish はエラーになるが、
+    // 応答自体は届いているので読みに行く（応答も読めなければ送信側のエラーを返す）。
+    let mut send_err = None;
     if let Some(body_data) = body {
-        stream.send_data(Bytes::copy_from_slice(body_data)).await?;
+        if let Err(e) = stream.send_data(Bytes::copy_from_slice(body_data)).await {
+            send_err = Some(e);
+        }
     }
-    stream.finish().await?;
+    if send_err.is_none() {
+        if let Err(e) = stream.finish().await {
+            send_err = Some(e);
+        }
+    }
 
     // レスポンスを受信
-    let response = stream.recv_response().await?;
+    let response = match stream.recv_response().await {
+        Ok(r) => r,
+        Err(e) => {
+            return Err(match send_err {
+                Some(se) => se.into(),
+                None => e.into(),
+            })
+        }
+    };
     let status = response.status().as_u16();
     let mut resp_headers = Vec::new();
     for (name, value) in response.headers().iter() {

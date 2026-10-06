@@ -380,9 +380,7 @@ async fn do_server_handshake(
         // 先行読み取りデータがあれば先に処理
         if let Some(data) = initial_data.take() {
             if !data.is_empty() {
-                conn.read_tls(&mut &data[..])?;
-                conn.process_new_packets()
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                crate::tls_writev::read_tls_all(&mut *conn, &data)?;
                 // データの処理後にハンドシェイクが終わる可能性があるため、ループの先頭に戻る
                 continue;
             }
@@ -402,9 +400,7 @@ async fn do_server_handshake(
                         ))
                     }
                     Ok(n) => {
-                        conn.read_tls(&mut &read_buf[..n])?;
-                        conn.process_new_packets()
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                        crate::tls_writev::read_tls_all(&mut *conn, &read_buf[..n])?;
                         break;
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -447,9 +443,7 @@ async fn do_client_handshake(stream: &TcpStream, conn: &mut ClientConnection) ->
                         ))
                     }
                     Ok(n) => {
-                        conn.read_tls(&mut &read_buf[..n])?;
-                        conn.process_new_packets()
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                        crate::tls_writev::read_tls_all(&mut *conn, &read_buf[..n])?;
                         break;
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
