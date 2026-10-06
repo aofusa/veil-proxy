@@ -1527,6 +1527,8 @@ pub struct UnveilPaths {
 /// 個々のパス文字列を消費済みで再取得できないフィールドがあるため、unveil 専用に
 /// 設定ファイルをもう一度パースする（起動時コールドパスで 1 回のみ・ホットパス無関係）。
 #[cfg(target_os = "openbsd")]
+// 起動時コールドパス（unveil 前に 1 回だけ設定を読み直す）。データプレーン非経由。
+#[allow(clippy::disallowed_methods)]
 pub fn collect_unveil_paths(config_path: &Path) -> io::Result<UnveilPaths> {
     let config_str = fs::read_to_string(config_path)?;
     let config: Config = crate::config_override::apply_to_toml_str(&config_str)
@@ -1602,6 +1604,8 @@ pub fn collect_unveil_paths(config_path: &Path) -> io::Result<UnveilPaths> {
 /// （`LoadedConfig` はパス文字列を消費済みで再取得できないフィールドがある）で、起動時
 /// コールドパスにおいて設定ファイルをもう一度パースする。
 #[cfg(target_os = "macos")]
+// 起動時コールドパス（sandbox_init 前に 1 回だけ設定を読み直す）。データプレーン非経由。
+#[allow(clippy::disallowed_methods)]
 pub fn collect_macos_sandbox_paths(
     config_path: &Path,
 ) -> io::Result<crate::security::macos_sandbox::SandboxPaths> {

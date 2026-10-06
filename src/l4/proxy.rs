@@ -736,7 +736,7 @@ pub async fn bidirectional_forward(
             "[L4:{}] connection closed: c→u {} bytes, u→c {} bytes",
             listener_name, c2u_bytes, u2c_bytes
         );
-        return;
+        // 以降は Linux 専用（splice）なので、非 Linux ではここが関数の末尾になる。
     }
 
     // join_directions は両 Future を同一タスク内でインターリーブするため、
