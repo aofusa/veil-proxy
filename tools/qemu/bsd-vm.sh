@@ -355,7 +355,13 @@ cmd_setup() {
         local base="${WORKDIR}/base.qcow2"
         if [[ ! -f "${base}" ]]; then
             log "NetBSD イメージを DL + qcow2 変換: ${url}"
-            curl -fL --retry 3 -o "${WORKDIR}/live.img.gz" "${url}"
+            # サポート対象外になったリリースのイメージは cdn.netbsd.org から消えて
+            # archive.netbsd.org の NetBSD-archive へ移る（10.1 は 2026-10 に 404 化を実測）。
+            if ! curl -fL --retry 3 -o "${WORKDIR}/live.img.gz" "${url}"; then
+                local archive_url="${url/cdn.netbsd.org\/pub\/NetBSD/archive.netbsd.org\/pub\/NetBSD-archive}"
+                log "本家ミラーに無いためアーカイブから取得: ${archive_url}"
+                curl -fL --retry 3 -o "${WORKDIR}/live.img.gz" "${archive_url}"
+            fi
             gunzip -kf "${WORKDIR}/live.img.gz"
             helper qemu-img convert -f raw -O qcow2 live.img base.qcow2
             rm -f "${WORKDIR}/live.img.gz" "${WORKDIR}/live.img"
@@ -1172,8 +1178,13 @@ cmd_sync() {
     # （HTTP/3 計測クライアント）まで失われ、h3 計測が h2load --h3 フォールバックで
     # 失敗するようになる。`tools` は crate のモジュール解決に関与しないので、
     # 上書き展開だけで十分（`rm -rf` の理由だった E0761 は起きない）。
+    #
+    # `*.sock`（E2E が tests/fixtures に作る UNIX ソケット）は tar に入らないうえ、ホストの
+    # tar がエラー終了扱いになる。`--no-xattrs` は macOS の `com.apple.macl`（SIP 保護で
+    # 消せない拡張属性）をゲストが復元できずに展開がエラー終了し、`&&` の後ろの
+    # members 書き換えが走らずにビルドが壊れるのを防ぐ（2026-10、Apple Silicon で実測）。
     (cd "${ROOT}" && tar czf - \
-        --exclude='./target' --exclude='*/target' --exclude='.git' \
+        --exclude='./target' --exclude='*/target' --exclude='.git' --exclude='*.sock' --no-xattrs \
         src benches tests examples contrib docker/assets third_party tools \
         Cargo.toml Cargo.lock build.rs clippy.toml .cargo) \
       | cmd_ssh "cd ${GUEST_ROOT} \
