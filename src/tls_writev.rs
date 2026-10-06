@@ -554,3 +554,31 @@ mod read_tls_all_tests {
         );
     }
 }
+
+/// ユーザー空間 TLS の受信スクラッチ（暗号文 1 回分の生 read 先）のサイズ。
+const RX_SCRATCH_SIZE: usize = 16 * 1024;
+
+thread_local! {
+    /// スレッドごとに 1 本だけ持つ受信スクラッチ。以前は `read()` の呼び出しごとに
+    /// `vec![0u8; 16384]`（16KB の確保 + ゼロ埋め）していた（ホットパス規則違反）。
+    /// 借用は「生 read → rustls へ投入」の同期区間だけで、`.await` を跨がないため
+    /// 同じスレッドの他タスクと競合しない。
+    static RX_SCRATCH: std::cell::RefCell<Box<[u8]>> =
+        std::cell::RefCell::new(vec![0u8; RX_SCRATCH_SIZE].into_boxed_slice());
+}
+
+/// 受信スクラッチを借りて `f` を実行する（同期区間専用。`f` の中で `.await` しないこと）。
+#[inline]
+pub(crate) fn with_rx_scratch<R>(f: impl FnOnce(&mut [u8]) -> R) -> R {
+    RX_SCRATCH.with(|s| f(&mut s.borrow_mut()))
+}
+
+/// [`with_rx_scratch`] の中で行う「生 read → rustls 投入」1 回分の結果。
+pub(crate) enum RxFed {
+    /// 暗号文を読んで rustls へ投入した（平文はループ先頭で取り出す）。
+    Fed,
+    /// 相手が切断した（EOF）。
+    Eof,
+    /// 読めるデータが無い（readable を待つ）。
+    WouldBlock,
+}
