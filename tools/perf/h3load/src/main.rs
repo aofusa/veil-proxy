@@ -257,9 +257,25 @@ impl Budget {
     /// 新規リクエストを 1 件発行してよいか判定する（`Count` は成功時に内部カウンタを消費する）。
     fn try_acquire(&self) -> bool {
         match self {
-            Budget::Count(remaining) => remaining
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1))
-                .is_ok(),
+            // `fetch_update` は新しい rustc で非推奨（`try_update` へ改名）だが、`try_update` は
+            // 古い rustc（BSD の pkg 版）に無いため、同じことを CAS ループで書く。
+            Budget::Count(remaining) => {
+                let mut cur = remaining.load(Ordering::Relaxed);
+                loop {
+                    let Some(next) = cur.checked_sub(1) else {
+                        return false;
+                    };
+                    match remaining.compare_exchange_weak(
+                        cur,
+                        next,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => return true,
+                        Err(actual) => cur = actual,
+                    }
+                }
+            }
             Budget::Time(deadline) => Instant::now() < *deadline,
         }
     }
@@ -390,7 +406,26 @@ fn build_endpoint() -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>
     transport.max_idle_timeout(Some(Duration::from_secs(30).try_into()?));
     client_config.transport_config(Arc::new(transport));
 
-    let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
+    // クライアント側 UDP ソケットの送受信バッファを広げてから Endpoint を作る。
+    // BSD の既定（FreeBSD `net.inet.udp.recvspace` = 42KB）のままだと、サーバが多数の接続へ
+    // 応答をまとめて返した瞬間にクライアント側で取りこぼし、**負荷ツールの損失がサーバの
+    // 損失回復（PTO の指数バックオフ）として計測に乗る**（1 接続が 30 秒止まって
+    // アイドルタイムアウトになる現象を実測）。サーバ間の比較を公平にするため、
+    // 通る最大値（2MB から 1/8 ずつ下げる）を設定する。
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    {
+        let state = quinn::udp::UdpSocketState::new((&socket).into())?;
+        let mut want = 2 * 1024 * 1024usize;
+        while want >= 256 * 1024 && state.set_recv_buffer_size((&socket).into(), want).is_err() {
+            want -= want / 8;
+        }
+        let mut want = 2 * 1024 * 1024usize;
+        while want >= 256 * 1024 && state.set_send_buffer_size((&socket).into(), want).is_err() {
+            want -= want / 8;
+        }
+    }
+    let runtime = quinn::default_runtime().ok_or("h3load: async runtime が見つからない")?;
+    let mut endpoint = Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)?;
     endpoint.set_default_client_config(client_config);
     Ok(endpoint)
 }
@@ -463,18 +498,41 @@ async fn run_connection(
         let _ = driver.wait_idle().await;
     });
 
+    // 診断用（既定オフ）: `H3LOAD_SLOW_MS=<ms>` を設定すると、それを超えて完了（またはエラー）した
+    // リクエストについて経過時間・エラー・quinn の接続統計（RTT・損失・PTO・フレーム数）を
+    // 標準エラーへ出す。計測終了後に数十秒待たされる「一部ストリームのストール」が
+    // サーバ側の未送出か、損失回復の停滞かを切り分けるためのもの。
+    let slow_threshold = std::env::var("H3LOAD_SLOW_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis);
+
     let mut workers = tokio::task::JoinSet::new();
     for _ in 0..max_concurrent {
         let mut send_request = send_request.clone();
         let budget = Arc::clone(&budget);
         let authority = authority.clone();
         let path = path.clone();
+        let diag_conn = slow_threshold.map(|_| conn.clone());
         workers.spawn(async move {
             let mut local = Stats::default();
             while budget.try_acquire() {
                 local.started += 1;
                 let req_start = Instant::now();
-                match send_one_request(&mut send_request, &authority, &path).await {
+                let result = send_one_request(&mut send_request, &authority, &path).await;
+                if let (Some(th), Some(c)) = (slow_threshold, diag_conn.as_ref()) {
+                    let took = req_start.elapsed();
+                    if took > th {
+                        eprintln!(
+                            "h3load: slow request {:?} result={:?} conn={} stats={:?}",
+                            took,
+                            result.as_ref().map(|(s, _)| *s).map_err(|e| e.to_string()),
+                            c.stable_id(),
+                            c.stats()
+                        );
+                    }
+                }
+                match result {
                     Ok((status, body_len)) => {
                         local.record_response(status, body_len, req_start.elapsed());
                     }
