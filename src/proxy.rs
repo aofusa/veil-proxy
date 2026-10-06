@@ -4710,11 +4710,31 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
 
     // アクティブ接続メトリクスの自動管理（Dropで自動デクリメント）
     let mut connection_metric = ActiveConnectionMetric::new(true);
+    // 接続直後の 1 回目の読み取りか（kqueue の待機先行は 2 回目以降のみ。ServerTls::wait_next_request 参照）
+    #[cfg(veil_poller_kqueue)]
+    let mut first_read = true;
 
     loop {
         // 読み込み（アイドルタイムアウト付き）
         let read_buf = buf_get();
-        let read_result = timeout(IDLE_TIMEOUT, tls_stream.read(read_buf)).await;
+        // kqueue: 応答を返した直後（蓄積が空）は次のリクエストがまだ届いていないのが普通なので、
+        // 先読み（EAGAIN）+ 確認用 poll(2) を打たずに kevent の通知を待ってから 1 回だけ読む。
+        #[cfg(veil_poller_kqueue)]
+        let wait_first = !first_read && accumulated.is_empty();
+        #[cfg(veil_poller_kqueue)]
+        {
+            first_read = false;
+        }
+        let read_result = timeout(IDLE_TIMEOUT, async {
+            #[cfg(veil_poller_kqueue)]
+            if wait_first {
+                if let Err(e) = tls_stream.wait_next_request().await {
+                    return (Err(e), read_buf);
+                }
+            }
+            tls_stream.read(read_buf).await
+        })
+        .await;
 
         let (res, mut returned_buf) = match read_result {
             Ok(result) => result,
@@ -8625,11 +8645,28 @@ async fn transfer_response_with_compression(
     // 初期値false: エラー時はKeep-Aliveを無効化
     let mut backend_wants_keep_alive = false;
 
+    // kqueue: 要求を送った直後の 1 回目は応答がまだ届いていないのが普通なので、
+    // 先読み（EAGAIN）+ 確認用 poll(2) を打たずに kevent の通知を待ってから読む
+    // （`runtime::reactor::tcp::TcpStream::readable_lazy` 参照）。
+    #[cfg(veil_poller_kqueue)]
+    let mut first_read = true;
+
     // ヘッダー読み取り用バッファ
     loop {
         // B-17: ヘッダー読取は専用の短いタイムアウトで打ち切り、504 へ即変換する
         let read_buf = buf_get();
-        let read_result = timeout(BACKEND_HEADER_TIMEOUT, backend_stream.read(read_buf)).await;
+        #[cfg(veil_poller_kqueue)]
+        let wait_first = std::mem::replace(&mut first_read, false);
+        let read_result = timeout(BACKEND_HEADER_TIMEOUT, async {
+            #[cfg(veil_poller_kqueue)]
+            if wait_first {
+                if let Err(e) = backend_stream.readable_lazy().await {
+                    return (Err(e), read_buf);
+                }
+            }
+            backend_stream.read(read_buf).await
+        })
+        .await;
 
         let (res, mut returned_buf) = match read_result {
             Ok(result) => result,
@@ -11009,18 +11046,25 @@ async fn handle_sendfile(
         return Some((tls_stream, 403, 0, true));
     }
 
-    // ディレクトリの場合はインデックスファイルを試す
-    let (final_path, file_size, mime_type) = if !file_info.is_file {
+    // ディレクトリの場合はインデックスファイルを試す。
+    // `file_info` / `idx_info` は所有値なのでフィールドをムーブする（clone による
+    // PathBuf / String の確保をしない）。open_file_cache が開いた fd を共有していれば
+    // それを使い、open/close を省く（nginx の open_file_cache と同じ）。
+    let (final_path, file_size, mime_type, shared_file) = if !file_info.is_file {
         let filename = index_filename.unwrap_or("index.html");
         let index_path = file_info.canonical_path.join(filename);
 
         // インデックスファイルの情報をキャッシュから取得
         match cache::get_file_info_with_config(&index_path, open_file_cache_config).await {
-            Some(idx_info) if idx_info.is_file => (
-                idx_info.canonical_path.clone(),
-                idx_info.file_size,
-                idx_info.mime_type.clone(),
-            ),
+            Some(idx_info) if idx_info.is_file => {
+                let shared = idx_info.shared_file().cloned();
+                (
+                    idx_info.canonical_path,
+                    idx_info.file_size,
+                    idx_info.mime_type,
+                    shared,
+                )
+            }
             _ => {
                 // インデックスファイルが存在しない場合は403 Forbidden
                 let err_buf = ERR_MSG_FORBIDDEN.to_vec();
@@ -11029,23 +11073,28 @@ async fn handle_sendfile(
             }
         }
     } else {
+        let shared = file_info.shared_file().cloned();
         (
-            file_info.canonical_path.clone(),
+            file_info.canonical_path,
             file_info.file_size,
-            file_info.mime_type.clone(),
+            file_info.mime_type,
+            shared,
         )
     };
 
-    // ファイルを開く（非同期、実際のI/Oが必要）
-    let file = match OpenOptions::new().read(true).open(&final_path).await {
-        Ok(f) => f,
-        Err(_) => {
-            // ファイルが開けない場合はキャッシュを無効化
-            cache::invalidate_file_cache(&full_path);
-            let err_buf = ERR_MSG_NOT_FOUND.to_vec();
-            let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
-            return Some((tls_stream, 404, 0, true));
-        }
+    // ファイルを開く（キャッシュが fd を保持していれば共有するだけで syscall 無し）
+    let file = match shared_file {
+        Some(f) => crate::runtime::io::File::from_shared(f),
+        None => match OpenOptions::new().read(true).open(&final_path).await {
+            Ok(f) => f,
+            Err(_) => {
+                // ファイルが開けない場合はキャッシュを無効化
+                cache::invalidate_file_cache(&full_path);
+                let err_buf = ERR_MSG_NOT_FOUND.to_vec();
+                let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+                return Some((tls_stream, 404, 0, true));
+            }
+        },
     };
 
     // キャッシュから取得したサイズとMIMEタイプを使用
@@ -11258,16 +11307,14 @@ async fn handle_sendfile(
         }
     }
 
-    // ヘッダー送信（タイムアウト付き）
-    let write_result = timeout(WRITE_TIMEOUT, tls_stream.write_all(header_buf)).await;
-    if !matches!(write_result, Ok((Ok(_), _))) {
-        return None;
-    }
-
-    // kTLS が有効な場合は sendfile によるゼロコピー送信を使用
+    // kTLS が有効な場合は sendfile によるゼロコピー送信を使用（ヘッダーを先に送る）
     #[cfg(veil_ktls)]
     {
         if tls_stream.is_ktls_send_enabled() {
+            let write_result = timeout(WRITE_TIMEOUT, tls_stream.write_all(header_buf)).await;
+            if !matches!(write_result, Ok((Ok(_), _))) {
+                return None;
+            }
             return handle_sendfile_zerocopy(
                 tls_stream,
                 &file,
@@ -11280,9 +11327,11 @@ async fn handle_sendfile(
         }
     }
 
-    // kTLS が無効な場合は従来の read/write を使用（F-150: 静的コンテンツキャッシュ対象）
+    // kTLS が無効な場合は従来の read/write を使用（F-150: 静的コンテンツキャッシュ対象）。
+    // ヘッダーは本文と一緒に送る（静的コンテンツキャッシュ命中時は 1 回の書き込み）。
     handle_sendfile_userspace(
         tls_stream,
+        header_buf,
         &file,
         &final_path,
         file_size,
@@ -11367,6 +11416,7 @@ async fn handle_sendfile_zerocopy(
 #[allow(clippy::too_many_arguments)]
 async fn handle_sendfile_userspace(
     mut tls_stream: ServerTls,
+    header_buf: Vec<u8>,
     file: &crate::runtime::io::File,
     file_path: &Path,
     file_size: u64,
@@ -11394,11 +11444,17 @@ async fn handle_sendfile_userspace(
     #[cfg(target_os = "freebsd")]
     {
         if tls_stream.is_plain() && transfer_length > 0 {
-            use crate::runtime::sendfile::sendfile_all;
+            use crate::runtime::sendfile::sendfile_all_with_header;
             let out_fd = tls_stream.as_raw_fd();
             let in_fd = file.as_raw_fd();
-            return match sendfile_all(out_fd, in_fd, transfer_offset, transfer_length as usize)
-                .await
+            return match sendfile_all_with_header(
+                out_fd,
+                in_fd,
+                transfer_offset,
+                transfer_length as usize,
+                &header_buf,
+            )
+            .await
             {
                 Ok(()) => Some((
                     tls_stream,
@@ -11468,9 +11524,16 @@ async fn handle_sendfile_userspace(
                 // Bytes::slice は参照カウントのみ・コピーなし（Range リクエストの
                 // 部分送出にもそのまま使える）。
                 let slice = data.slice(start..end);
-                let write_result = timeout(WRITE_TIMEOUT, tls_stream.write_all(slice)).await;
+                // ヘッダーと本文を 1 回で送る（rustls は両方を送信キューへ積んでから
+                // writev 1 回、平文は sendmsg 1 回。以前はヘッダーを先に別途書いていたため
+                // 1 リクエストあたり書き込みが 2 回だった）。
+                let write_result = timeout(
+                    WRITE_TIMEOUT,
+                    tls_stream.write_all_vectored(header_buf, slice),
+                )
+                .await;
                 return match write_result {
-                    Ok((Ok(_), _)) => Some((
+                    Ok((Ok(_), _, _)) => Some((
                         tls_stream,
                         response_status,
                         transfer_length,
@@ -11482,6 +11545,12 @@ async fn handle_sendfile_userspace(
             // data の長さがリクエスト範囲を満たさない（キャッシュ後にファイルが縮小した
             // 等の稀なレース）場合は安全側で下の通常経路へフォールスルーする。
         }
+    }
+
+    // ヘッダー送信（タイムアウト付き）
+    let write_result = timeout(WRITE_TIMEOUT, tls_stream.write_all(header_buf)).await;
+    if !matches!(write_result, Ok((Ok(_), _))) {
+        return None;
     }
 
     let mut total_sent = 0u64;

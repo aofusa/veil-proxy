@@ -181,27 +181,57 @@ pub async fn remove_file(path: impl AsRef<std::path::Path>) -> io::Result<()> {
 
 /// 非同期ファイル（簡略実装、コールドパスのみ使用）
 pub struct File {
-    inner: std::fs::File,
+    inner: FileInner,
+}
+
+/// 所有する fd か、open_file_cache と共有する fd（静的配信の fd キャッシュ）か。
+enum FileInner {
+    Owned(std::fs::File),
+    Shared(std::sync::Arc<std::fs::File>),
+}
+
+impl FileInner {
+    #[inline]
+    fn get(&self) -> &std::fs::File {
+        match self {
+            FileInner::Owned(f) => f,
+            FileInner::Shared(f) => f,
+        }
+    }
 }
 
 impl File {
     /// ファイルを開く
     pub async fn open(path: impl AsRef<std::path::Path>) -> io::Result<Self> {
         let inner = std::fs::File::open(path)?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner: FileInner::Owned(inner),
+        })
+    }
+
+    /// open_file_cache が保持する開いた fd を共有する（open/close を伴わない）。
+    ///
+    /// 読み取りは `pread`/`sendfile` のようにオフセットを明示する API だけを使うため、
+    /// 複数のリクエストが同じ fd を同時に使ってもファイル位置を奪い合わない。
+    #[inline]
+    pub fn from_shared(file: std::sync::Arc<std::fs::File>) -> Self {
+        Self {
+            inner: FileInner::Shared(file),
+        }
     }
 
     /// ファイルを読み取る
     pub async fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
         use std::io::Read;
-        self.inner.read_to_end(buf)
+        let mut f: &std::fs::File = self.inner.get();
+        f.read_to_end(buf)
     }
 
     /// オフセット位置から読み取る（Unix: `pread`、Windows: `seek_read`。コールドパスのみ）
     #[cfg(unix)]
     pub async fn read_at<T: IoBufMut>(&self, mut buf: T, offset: u64) -> BufResult<usize, T> {
         use std::os::unix::io::AsRawFd;
-        let fd = self.inner.as_raw_fd();
+        let fd = self.inner.get().as_raw_fd();
         let ret = unsafe {
             libc::pread(
                 fd,
@@ -224,7 +254,7 @@ impl File {
     pub async fn read_at<T: IoBufMut>(&self, mut buf: T, offset: u64) -> BufResult<usize, T> {
         use std::os::windows::fs::FileExt;
         let slice = unsafe { std::slice::from_raw_parts_mut(buf.write_ptr(), buf.bytes_total()) };
-        match self.inner.seek_read(slice, offset) {
+        match self.inner.get().seek_read(slice, offset) {
             Ok(n) => {
                 unsafe {
                     buf.set_init(n);
@@ -239,7 +269,7 @@ impl File {
     #[cfg(unix)]
     pub async fn read_exact_at<T: IoBufMut>(&self, mut buf: T, offset: u64) -> BufResult<usize, T> {
         use std::os::unix::io::AsRawFd;
-        let fd = self.inner.as_raw_fd();
+        let fd = self.inner.get().as_raw_fd();
         let total = buf.bytes_total();
         let mut read = 0;
         while read < total {
@@ -274,7 +304,7 @@ impl File {
         while read < total {
             let slice =
                 unsafe { std::slice::from_raw_parts_mut(buf.write_ptr().add(read), total - read) };
-            match self.inner.seek_read(slice, offset + read as u64) {
+            match self.inner.get().seek_read(slice, offset + read as u64) {
                 Ok(0) => break, // EOF
                 Ok(n) => read += n,
                 Err(e) => return (Err(e), buf),
@@ -290,14 +320,14 @@ impl File {
 #[cfg(unix)]
 impl std::os::unix::io::AsRawFd for File {
     fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
-        self.inner.as_raw_fd()
+        self.inner.get().as_raw_fd()
     }
 }
 
 #[cfg(windows)]
 impl std::os::windows::io::AsRawHandle for File {
     fn as_raw_handle(&self) -> std::os::windows::io::RawHandle {
-        std::os::windows::io::AsRawHandle::as_raw_handle(&self.inner)
+        std::os::windows::io::AsRawHandle::as_raw_handle(self.inner.get())
     }
 }
 
@@ -361,7 +391,9 @@ impl OpenOptions {
         #[cfg(target_os = "freebsd")]
         if !self.write_like {
             if let Some(res) = crate::security::capsicum::open_static_ro(path) {
-                return res.map(|inner| File { inner });
+                return res.map(|inner| File {
+                    inner: FileInner::Owned(inner),
+                });
             }
         }
         // F-153: Linux は登録済み静的ルート dirfd に対する openat2(RESOLVE_BENEATH) へ
@@ -371,11 +403,15 @@ impl OpenOptions {
         #[cfg(target_os = "linux")]
         if !self.write_like {
             if let Some(res) = crate::cache::resolve::open_beneath_for_request(path) {
-                return res.map(|(inner, _meta)| File { inner });
+                return res.map(|(inner, _meta)| File {
+                    inner: FileInner::Owned(inner),
+                });
             }
         }
         let inner = self.inner.open(path)?;
-        Ok(File { inner })
+        Ok(File {
+            inner: FileInner::Owned(inner),
+        })
     }
 }
 

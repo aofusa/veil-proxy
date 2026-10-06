@@ -587,6 +587,24 @@ impl TcpStream {
         }
     }
 
+    /// 読み取り可能になるまで待つ（kqueue では確認用の `poll(2)` を打たずに登録から入る）。
+    ///
+    /// HTTP/1.1 keep-alive で「応答を返した直後に次のリクエストを待つ」箇所専用。
+    /// この時点でデータが届いていることはほぼ無いため、`read` を先に試すと毎回 EAGAIN、
+    /// `Readable` は確認用の `poll(2)` を打ってから登録するため、1 リクエストあたり
+    /// 2 syscall が無駄になる（FreeBSD の DTrace 実測: read 1.99/req・poll 0.98/req。
+    /// nginx は kevent の通知を待ってから 1 回だけ読む）。kqueue の `EVFILT_READ` は
+    /// レベルトリガなので、登録時点で既にデータがあればすぐに通知され取りこぼさない。
+    /// 2 回目以降の poll（ヒント無しの起床）は `Readable` と同じく `poll(2)` で確認する。
+    /// epoll は B-75 の理由で確認用 `poll(2)` を省略しないため `Readable` と同じ動作。
+    pub fn readable_lazy(&self) -> ReadableLazy<'_> {
+        ReadableLazy {
+            fd: self.fd,
+            registered: false,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
     /// 書き込み可能になるまで待つ。
     pub fn writable(&self) -> Writable<'_> {
         Writable {
@@ -1293,6 +1311,45 @@ impl<'a> Future for Readable<'a> {
         }
         // POLLIN/EPOLLIN 相当を即座に確認するため 0 バイト peek は行わず、まず fd の
         // readiness を epoll に問い合わせる（poll(2) を使い syscall 1 発で判定する）。
+        let mut pfd = libc::pollfd {
+            fd: self.fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
+        if ret > 0 && pfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
+            return Poll::Ready(Ok(()));
+        }
+        register_read(self.fd, cx.waker().clone());
+        Poll::Pending
+    }
+}
+
+/// 確認用 `poll(2)` を省いて登録から入る読み取り待機 Future（[`TcpStream::readable_lazy`]）。
+pub struct ReadableLazy<'a> {
+    fd: RawFd,
+    registered: bool,
+    _marker: std::marker::PhantomData<&'a TcpStream>,
+}
+
+impl<'a> Future for ReadableLazy<'a> {
+    type Output = io::Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        #[cfg(veil_poller_kqueue)]
+        {
+            if crate::runtime::executor::take_read_hint(self.fd) > 0 {
+                return Poll::Ready(Ok(()));
+            }
+            if !self.registered {
+                self.registered = true;
+                register_read(self.fd, cx.waker().clone());
+                return Poll::Pending;
+            }
+        }
+        let _ = &mut self.registered;
+        // ヒント無しの起床（他タスクによる wake_all_readers 等）や epoll では、
+        // `Readable` と同じく poll(2) で確認してから登録し直す。
         let mut pfd = libc::pollfd {
             fd: self.fd,
             events: libc::POLLIN,

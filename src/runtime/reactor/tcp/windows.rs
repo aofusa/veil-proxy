@@ -434,6 +434,12 @@ impl TcpStream {
         }
     }
 
+    /// `unix.rs` の `readable_lazy` に対応する（B-69: reactor/tcp のメソッドは両方に足す）。
+    /// WSAPoll には readiness ヒントが無いため通常の `readable` と同じ。
+    pub fn readable_lazy(&self) -> Readable<'_> {
+        self.readable()
+    }
+
     pub fn writable(&self) -> Writable<'_> {
         Writable {
             fd: self.fd,

@@ -176,9 +176,15 @@ huge_pages_enabled = true
 #   - Caches canonicalize, metadata, mime_guess system calls
 #   - Reduces 5-6 system calls per request to 2 (cache hit)
 # 
+#   - Keeps the opened file descriptor of each regular file, like nginx's
+#     open_file_cache, so HTTP/1.1 static responses need no open/close per request
+#
 # Notes:
 #   - File change detection may be delayed up to 60 seconds (default)
 #   - Symbolic link changes may be delayed
+#   - A file replaced or deleted within the validity period keeps being served from
+#     the cached descriptor until the entry expires (same as nginx)
+#   - Uses one file descriptor per cached regular file (up to max_entries)
 #   - Optimal for static file serving (not suitable for dynamically changing files)
 #
 # Route-specific configuration:

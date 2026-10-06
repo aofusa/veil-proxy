@@ -298,6 +298,12 @@ impl CachedFileInfo {
     pub fn last_modified_rfc7231(&self) -> Option<String> {
         None
     }
+
+    /// `cache` 無効時は fd を保持しない（配信時に開く）。
+    #[inline]
+    pub fn shared_file(&self) -> Option<&std::sync::Arc<std::fs::File>> {
+        None
+    }
     pub fn is_valid(&self, _max_age: std::time::Duration) -> bool {
         false
     }

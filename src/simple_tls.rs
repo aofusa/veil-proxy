@@ -142,6 +142,20 @@ impl crate::runtime::io::BufferedReadState for SimpleTlsServerStream {
 }
 
 impl SimpleTlsServerStream {
+    /// HTTP/1.1 keep-alive で次のリクエストを待つ（kqueue では先読みの EAGAIN と
+    /// 確認用 `poll(2)` を省く。`runtime::reactor::tcp::TcpStream::readable_lazy` 参照）。
+    ///
+    /// 復号済みの平文が残っていれば即座に返る。rustls 内部の平文は `read()` が毎回
+    /// `drained_buffer` へ排出しているため、2 回目以降のリクエスト待ちでは
+    /// `drained_buffer` だけを見ればよい（接続直後の 1 回目には使わないこと）。
+    #[cfg(veil_poller_kqueue)]
+    pub async fn wait_next_request(&self) -> io::Result<()> {
+        if crate::runtime::io::BufferedReadState::has_buffered_read_data(self) {
+            return Ok(());
+        }
+        self.inner.readable_lazy().await
+    }
+
     pub fn get_ref(&self) -> &TcpStream {
         &self.inner
     }
