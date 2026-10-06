@@ -54,3 +54,13 @@ pub use rustls::crypto::ring as provider;
 pub use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 #[cfg(all(feature = "http3", any(target_os = "openbsd", target_os = "netbsd")))]
 pub use ring::rand::{SecureRandom, SystemRandom};
+
+/// HTTP/3 のサーバ接続 ID 導出（クライアントの元 DCID → 決定的な SCID、B-94）に使う HMAC。
+/// 乱数と同じくプラットフォームの暗号プロバイダに揃える（API は aws-lc-rs と ring で同一）。
+#[cfg(all(
+    feature = "http3",
+    not(any(target_os = "openbsd", target_os = "netbsd"))
+))]
+pub use aws_lc_rs::hmac;
+#[cfg(all(feature = "http3", any(target_os = "openbsd", target_os = "netbsd")))]
+pub use ring::hmac;

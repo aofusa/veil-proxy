@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 
 use crate::udp::QuicUdpSocket;
 // F-122: RNG は OpenBSD では ring、他は aws-lc-rs（crate::tls_provider で選択）。
-use crate::tls_provider::{SecureRandom, SystemRandom};
+use crate::tls_provider::{hmac, SecureRandom, SystemRandom};
 use bytes::{BufMut, Bytes, BytesMut};
 use quiche::h3::NameValue;
 use quiche::{h3, Config, ConnectionId};
@@ -1382,8 +1382,8 @@ impl Http3Handler {
         let path: &[u8] = path.unwrap_or(b"/");
         let authority: &[u8] = authority.unwrap_or_default();
 
-        // 処理開始時刻
-        let start_time = Instant::now();
+        // 処理開始時刻（アクセスログ・メトリクスが無効なら時刻を読まない）
+        let start_time = crate::logging::request_start_instant();
 
         debug!(
             "[HTTP/3] Request: {} {} (stream {})",
@@ -4383,8 +4383,8 @@ pub async fn run_http3_server_async(
     // F-46: バックエンドタスクの型付きプール（本ワーカースレッドの全接続で共有）。
     let backend_spawner = crate::http3_stream::backend_task_spawner();
 
-    // 乱数生成器
-    let rng = SystemRandom::new();
+    // B-94: サーバ接続 ID 導出鍵（プロセスで 1 個。初回アクセス時に乱数で生成）。
+    let cid_key: &hmac::Key = &SERVER_CID_KEY;
 
     // ルーティング設定を CURRENT_CONFIG から取得（ホットリロード対応）
 
@@ -4632,7 +4632,7 @@ pub async fn run_http3_server_async(
                                             payload,
                                             meta.from,
                                             meta.gro_segment_size,
-                                            &rng,
+                                            cid_key,
                                             &quic_config,
                                             local_addr,
                                             &notify,
@@ -4708,7 +4708,7 @@ pub async fn run_http3_server_async(
                     &mut recv_buf[..first_total],
                     first_gro.from,
                     first_gro.gro_segment_size,
-                    &rng,
+                    cid_key,
                     &quic_config,
                     local_addr,
                     &notify,
@@ -4736,7 +4736,7 @@ pub async fn run_http3_server_async(
                             &mut mmsg_scratch.buf_mut(i)[..len],
                             from,
                             gro,
-                            &rng,
+                            cid_key,
                             &quic_config,
                             local_addr,
                             &notify,
@@ -4819,7 +4819,7 @@ pub async fn run_http3_server_async(
                 }
 
                 // タイマー再登録（コネクション処理直後）。
-                schedule_timer(handler, &cid, Instant::now(), &mut timers);
+                schedule_timer(handler, &cid, &mut timers);
 
                 if did_work {
                     // まだ仕事が残っている可能性 → dirty のまま維持して再投入する。
@@ -4970,15 +4970,23 @@ fn mark_dirty(
 
 /// コネクション処理直後にタイマーヒープへ次回期限を登録する（遅延削除方式）。
 ///
-/// `conn.timeout()` が `None`（アイドル/未確立等）の場合は `H3_DEFAULT_TIMER` をフォール
-/// バックとして使う。
+/// `conn.timeout_instant()` が `None`（アイドル/未確立等）の場合は `H3_DEFAULT_TIMER` を
+/// フォールバックとして使う。
+///
+/// ダーティ接続ごと・イテレーションごとに呼ばれるため時刻を読まない: quiche の
+/// `timeout()` は内部で `Instant::now()` を読んで残り時間に変換するので、従来の
+/// `Instant::now() + conn.timeout()` は 1 回あたり時刻読み取り 2 回だった
+/// （FreeBSD aarch64 の HTTP/3 プロファイルで `__vdso_gettc` が最上位）。
+/// 期限の絶対時刻 `timeout_instant()` をそのまま使えば同じ値になる。
 fn schedule_timer(
     handler: &mut Http3Handler,
     key: &ConnKey,
-    now: Instant,
     timers: &mut BinaryHeap<Reverse<TimerKey>>,
 ) {
-    let deadline = now + handler.conn.timeout().unwrap_or(H3_DEFAULT_TIMER);
+    let deadline = match handler.conn.timeout_instant() {
+        Some(t) => t,
+        None => Instant::now() + H3_DEFAULT_TIMER,
+    };
     handler.timer_deadline = Some(deadline);
     timers.push(Reverse(TimerKey(deadline, key.clone())));
 }
@@ -5066,13 +5074,37 @@ fn drain_wake_queue(
 /// 削減したかった固定費を上回りかねない。recv した接続は必ずダーティ化されるため、
 /// **同一イテレーション内のダーティ処理ループ**（呼び出し元のメインループ）で
 /// `schedule_timer` が接続ごとに高々 1 回だけ呼ばれ、タイマーの再登録は漏れなく行われる。
+/// B-94: サーバ接続 ID の導出鍵（プロセス全体で 1 個）。
+///
+/// SO_REUSEPORT で同じ 4-tuple は同じワーカーへ届くが、ワーカー間で鍵を分ける理由は無いので
+/// プロセスで共有する（`cbpf` 振り分け等で 4-tuple とワーカーの対応が変わっても同じ SCID になる）。
+static SERVER_CID_KEY: once_cell::sync::Lazy<hmac::Key> = once_cell::sync::Lazy::new(|| {
+    let mut seed = [0u8; 32];
+    SystemRandom::new()
+        .fill(&mut seed)
+        .expect("HTTP/3: failed to generate connection ID key");
+    hmac::Key::new(hmac::HMAC_SHA256, &seed)
+});
+
+/// B-94: クライアントの元 DCID からサーバ接続 ID（`MAX_CONN_ID_LEN` バイト）を導出する。
+///
+/// quiche のサンプルサーバと同じ方式（秘密鍵つき HMAC なので外部から予測できない）。
+/// 呼ばれるのは「未知の DCID を持つ Initial パケット」だけで、確立済み接続の
+/// データグラムでは呼ばれない（ハンドシェイク中だけのコスト）。
+fn derive_server_cid(key: &hmac::Key, client_dcid: &[u8]) -> [u8; quiche::MAX_CONN_ID_LEN] {
+    let tag = hmac::sign(key, client_dcid);
+    let mut cid = [0u8; quiche::MAX_CONN_ID_LEN];
+    cid.copy_from_slice(&tag.as_ref()[..quiche::MAX_CONN_ID_LEN]);
+    cid
+}
+
 #[allow(clippy::too_many_arguments)] // F-151: ダーティ集合/起床キューの受け渡しで増加（ホットパスの単一呼び出し経路）
 fn process_datagram_segments(
     conns: &mut HashMap<ConnectionId<'static>, Http3Handler>,
     data: &mut [u8],
     from: SocketAddr,
     gro_segment_size: Option<u16>,
-    rng: &SystemRandom,
+    cid_key: &hmac::Key,
     quic_config: &Rc<RefCell<quiche::Config>>,
     local_addr: SocketAddr,
     notify: &crate::http3_stream::H3Notify,
@@ -5115,38 +5147,54 @@ fn process_datagram_segments(
                         continue;
                     }
 
-                    // 新規コネクション
-                    let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
-                    rng.fill(&mut scid)
-                        .map_err(|_| io::Error::other("RNG error"))?;
-                    let scid = ConnectionId::from_ref(&scid).into_owned();
+                    // B-94: サーバ接続 ID はクライアントの元 DCID から決定的に導出する。
+                    // クライアントはサーバの最初の応答を受け取るまで Initial を元 DCID 宛てに
+                    // 送り続ける（PTO による再送・複数パケットにまたがる ClientHello）。
+                    // 乱数で SCID を作っていた頃は、それらが届くたびに別の新規接続を
+                    // `accept` していた（孤児接続が増え、クライアントには SCID の異なる
+                    // 2 つのサーバ接続から応答が届いてハンドシェイクが崩れる）。
+                    let derived = derive_server_cid(cid_key, &hdr.dcid);
+                    let derived_ref = ConnectionId::from_ref(&derived);
+                    if conns.contains_key(&derived_ref) {
+                        let cid = derived_ref.into_owned();
+                        prev_cid = Some(cid.clone());
+                        cid
+                    } else {
+                        // 新規コネクション
+                        let scid = derived_ref.into_owned();
 
-                    let mut config_ref = quic_config.borrow_mut();
-                    let conn = quiche::accept(&scid, None, local_addr, from, &mut config_ref)
-                        .map_err(|e| io::Error::other(e.to_string()))?;
+                        let mut config_ref = quic_config.borrow_mut();
+                        let conn = quiche::accept(&scid, None, local_addr, from, &mut config_ref)
+                            .map_err(|e| io::Error::other(e.to_string()))?;
 
-                    debug!("[HTTP/3] New connection from {}", from);
+                        debug!("[HTTP/3] New connection from {}", from);
 
-                    // F-151（レビュー修正）: 接続 ID の Rc ハンドルは接続の生成時に 1 度だけ
-                    // 作る（以降はこの Rc を clone するだけで malloc なしに使い回せる）。
-                    let key: ConnKey = Rc::new(scid.clone());
-                    // この接続専用の ConnWaker を組み立てる（cid を積んでから notify() する
-                    // per-connection 通知）。
-                    let waker = crate::http3_stream::ConnWaker::new(
-                        key.clone(),
-                        wake_queue.clone(),
-                        notify.clone(),
-                    );
-                    let mut handler =
-                        Http3Handler::new(conn, from, waker, backend_spawner.clone(), key.clone());
-                    // 新規接続は常にダーティ（後段の recv 直後のダーティ化と二重登録
-                    // しないよう、挿入前に直接フラグを立てて自前でキューへ積む）。
-                    handler.dirty = true;
-                    conns.insert(scid.clone(), handler);
-                    dirty_queue.push_back(key);
+                        // F-151（レビュー修正）: 接続 ID の Rc ハンドルは接続の生成時に 1 度だけ
+                        // 作る（以降はこの Rc を clone するだけで malloc なしに使い回せる）。
+                        let key: ConnKey = Rc::new(scid.clone());
+                        // この接続専用の ConnWaker を組み立てる（cid を積んでから notify() する
+                        // per-connection 通知）。
+                        let waker = crate::http3_stream::ConnWaker::new(
+                            key.clone(),
+                            wake_queue.clone(),
+                            notify.clone(),
+                        );
+                        let mut handler = Http3Handler::new(
+                            conn,
+                            from,
+                            waker,
+                            backend_spawner.clone(),
+                            key.clone(),
+                        );
+                        // 新規接続は常にダーティ（後段の recv 直後のダーティ化と二重登録
+                        // しないよう、挿入前に直接フラグを立てて自前でキューへ積む）。
+                        handler.dirty = true;
+                        conns.insert(scid.clone(), handler);
+                        dirty_queue.push_back(key);
 
-                    prev_cid = Some(scid.clone());
-                    scid
+                        prev_cid = Some(scid.clone());
+                        scid
+                    }
                 } else {
                     let cid = hdr.dcid.into_owned();
                     prev_cid = Some(cid.clone());
@@ -5799,6 +5847,95 @@ fn parse_status_code(header: &[u8]) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_b94_derive_server_cid_is_deterministic_and_keyed() {
+        let key = hmac::Key::new(hmac::HMAC_SHA256, b"0123456789abcdef0123456789abcdef");
+        let other = hmac::Key::new(hmac::HMAC_SHA256, b"fedcba9876543210fedcba9876543210");
+        let a = derive_server_cid(&key, b"client-dcid-1");
+        assert_eq!(a, derive_server_cid(&key, b"client-dcid-1"));
+        assert_ne!(a, derive_server_cid(&key, b"client-dcid-2"));
+        assert_ne!(a, derive_server_cid(&other, b"client-dcid-1"));
+        assert_eq!(a.len(), quiche::MAX_CONN_ID_LEN);
+    }
+
+    /// B-94: 同じ元 DCID の Initial が 2 回届いても（クライアントの PTO 再送・複数パケットに
+    /// またがる ClientHello）新規接続は 1 つだけ作られる。修正前は届くたびに乱数 SCID で
+    /// 別接続を `accept` していた。
+    #[test]
+    // テストのフィクスチャ読み込み（データプレーン外）。
+    #[allow(clippy::disallowed_methods)]
+    fn test_b94_retransmitted_initial_maps_to_same_connection() {
+        let cert = std::fs::read("tests/fixtures/cert.pem").expect("cert");
+        let key = std::fs::read("tests/fixtures/key.pem").expect("key");
+        let mut server_cfg = new_quic_config_with_certs(&cert, &key).expect("server config");
+        server_cfg
+            .set_application_protos(h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        server_cfg.set_initial_max_data(1 << 20);
+        let quic_config = Rc::new(RefCell::new(server_cfg));
+
+        let mut client_cfg = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        client_cfg
+            .set_application_protos(h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        client_cfg.verify_peer(false);
+        let client_scid = ConnectionId::from_ref(&[7u8; 16]);
+        let client_addr: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let server_addr: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let mut client = quiche::connect(
+            Some("localhost"),
+            &client_scid,
+            client_addr,
+            server_addr,
+            &mut client_cfg,
+        )
+        .unwrap();
+        let mut initial = vec![0u8; 1500];
+        let (len, _) = client.send(&mut initial).unwrap();
+        initial.truncate(len);
+
+        let mut conns: HashMap<ConnectionId<'static>, Http3Handler> = HashMap::new();
+        let notify = crate::http3_stream::H3Notify::new();
+        let spawner = crate::http3_stream::backend_task_spawner();
+        let wake_queue: crate::http3_stream::WakeQueue = Default::default();
+        let mut dirty = VecDeque::new();
+        let key = hmac::Key::new(hmac::HMAC_SHA256, &[42u8; 32]);
+        for round in 0..2 {
+            if round == 1 {
+                // 1 回目で作られた接続に目印を付ける（作り直されると消える）。
+                let h = conns.values_mut().next().unwrap();
+                h.stream_bodies.insert(u64::MAX, Default::default());
+            }
+            let mut pkt = initial.clone();
+            process_datagram_segments(
+                &mut conns,
+                &mut pkt,
+                client_addr,
+                None,
+                &key,
+                &quic_config,
+                server_addr,
+                &notify,
+                &spawner,
+                &wake_queue,
+                &mut dirty,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            conns.len(),
+            1,
+            "retransmitted Initial must not create a 2nd connection"
+        );
+        // 2 回目は**既存の接続へ**届いていること（同じキーで作り直して最初の
+        // ハンドシェイク状態を捨てていないこと）。
+        let handler = conns.values().next().unwrap();
+        assert!(
+            handler.stream_bodies.contains_key(&u64::MAX),
+            "the 2nd datagram must be delivered to the existing connection"
+        );
+    }
 
     /// F-152: `[http3] recv_drain_max`（reactor 経路の 1 イテレーションあたり
     /// データグラム drain 上限）の既定値とクランプ範囲。
