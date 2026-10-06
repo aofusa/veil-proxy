@@ -1028,7 +1028,8 @@ fn h2_spawn_for_request<S>(
         trailers: parts.trailers,
         client_ip: std::rc::Rc::clone(client_ip),
         client_socket_addr,
-        start: Instant::now(),
+        // アクセスログ・メトリクスが無効なら時刻を読まない（ストリームごとの固定費）。
+        start: crate::logging::request_start_instant(),
     };
 
     let (resp_tx, resp_rx) = crate::stream_channel::channel::<H2RespMsg>(H2_RESP_CHANNEL_CAP);
@@ -5458,8 +5459,8 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                     }
                 };
 
-                // 処理時間計測開始（Instant: モノトニック・高精度）
-                let start_instant = Instant::now();
+                // 処理時間計測開始（アクセスログ・メトリクスが無効なら時刻を読まない）
+                let start_instant = crate::logging::request_start_instant();
 
                 // バッファクリア（次のリクエストに備える）
                 accumulated.clear();

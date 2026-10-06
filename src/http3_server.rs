@@ -4204,19 +4204,16 @@ async fn proxy_to_h2c_backend_async(
 
 /// コネクション管理（Rc<RefCell> で共有）
 /// 接続マップ本体。キーはサーバが HMAC で導出した接続 ID（B-94）で、データグラムごとに
-/// 数回引くため、既定の SipHash ではなくプロセスごとにシードを変えた xxh3 を使う
+/// 数回引くため、既定の SipHash ではなく乱数シード付きの foldhash を使う
 /// （FreeBSD aarch64 の HTTP/3 プロファイルで SipHash が上位だった）。挿入されるキーは
 /// 予測不能な HMAC 出力なので、シード付きの高速ハッシュで HashDoS の心配は無い。
-type ConnMapInner = HashMap<ConnectionId<'static>, Http3Handler, xxhash_rust::xxh3::Xxh3Builder>;
+type ConnMapInner = HashMap<ConnectionId<'static>, Http3Handler, foldhash::quality::RandomState>;
 
 type ConnectionMap = Rc<RefCell<ConnMapInner>>;
 
-/// 接続マップのハッシャ（プロセス起動時の乱数をシードにする）。
-fn conn_map_hasher() -> xxhash_rust::xxh3::Xxh3Builder {
-    let mut seed = [0u8; 8];
-    // 失敗してもシード 0 で動作は正しい（性能・耐性だけの問題）。
-    let _ = SystemRandom::new().fill(&mut seed);
-    xxhash_rust::xxh3::Xxh3Builder::new().with_seed(u64::from_le_bytes(seed))
+/// 接続マップのハッシャ（foldhash がプロセスごとの乱数シードを持つ）。
+fn conn_map_hasher() -> foldhash::quality::RandomState {
+    foldhash::quality::RandomState::default()
 }
 
 /// HTTP/3 サーバーを起動（monoio ランタイム上で実行）

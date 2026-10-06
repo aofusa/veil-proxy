@@ -513,17 +513,14 @@ static CACHE_CAPACITY: AtomicUsize = AtomicUsize::new(10000);
 
 /// ルートキャッシュの LRU 本体。キーは xxh3 済みの 64 ビット値で、既定の SipHash で
 /// もう一度ハッシュする必要は無い。ただしキーの xxh3 は固定シードで、パスは攻撃者が
-/// 選べるため（衝突するキーを大量に作られると LRU のバケットが偏る）、スレッドごとに
-/// シードを変えた xxh3 で包む（リクエストごとの get / put 1 回あたりの SipHash を削減）。
-type RouteLru = LruCache<RouteCacheKey, Option<usize>, xxhash_rust::xxh3::Xxh3Builder>;
+/// 選べるため（衝突するキーを大量に作られると LRU のバケットが偏る）、乱数シード付きの
+/// foldhash（quality）で包む。xxh3 のストリーミング版ハッシャ（`Xxh3Builder`）は
+/// 小さいキーでは SipHash より遅い（FreeBSD のプロファイルで `xxh3_stateful_update` /
+/// `digest` が上位に出た）ので使わない。
+type RouteLru = LruCache<RouteCacheKey, Option<usize>, foldhash::quality::RandomState>;
 
 fn new_route_lru(cap: NonZeroUsize) -> RouteLru {
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-        ^ (std::process::id() as u64).rotate_left(32);
-    LruCache::with_hasher(cap, xxhash_rust::xxh3::Xxh3Builder::new().with_seed(seed))
+    LruCache::with_hasher(cap, foldhash::quality::RandomState::default())
 }
 
 thread_local! {

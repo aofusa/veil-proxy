@@ -197,14 +197,11 @@ fn path_key(path: &Path) -> &[u8] {
 }
 
 /// キーのハッシャ。キーは実在するファイルのパスに限られる（存在しないパスは挿入しない）が、
-/// 念のためプロセスごとにシードを変える。
-fn path_key_hasher() -> xxhash_rust::xxh3::Xxh3Builder {
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-        ^ (std::process::id() as u64).rotate_left(32);
-    xxhash_rust::xxh3::Xxh3Builder::new().with_seed(seed)
+/// 念のためプロセスごとに乱数シードを変える（foldhash）。xxh3 のストリーミング版ハッシャ
+/// （`Xxh3Builder`）は短いキーでは遅い（FreeBSD のプロファイルで `xxh3_stateful_update` /
+/// `digest` が上位に出た）ので使わない。
+fn path_key_hasher() -> foldhash::quality::RandomState {
+    foldhash::quality::RandomState::default()
 }
 
 /// ファイル情報キャッシュ
@@ -213,7 +210,7 @@ fn path_key_hasher() -> xxhash_rust::xxh3::Xxh3Builder {
 pub struct OpenFileCache {
     /// キャッシュエントリ（パス → ファイル情報）。DashMap は内部シャーディングにより
     /// グローバルロックを持たない。
-    entries: DashMap<Box<[u8]>, CachedFileInfo, xxhash_rust::xxh3::Xxh3Builder>,
+    entries: DashMap<Box<[u8]>, CachedFileInfo, foldhash::quality::RandomState>,
     /// キャッシュエントリの有効期間（ナノ秒、ロックフリー atomic）
     valid_duration_nanos: AtomicU64,
     /// キャッシュヒット数
