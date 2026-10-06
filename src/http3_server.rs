@@ -2595,52 +2595,53 @@ impl Http3Handler {
         // フォールバックした場合は index 側）を圧縮結果キャッシュのキーに使う。
         // `full_path` の所有権をそのまま流用するため追加のクローンは発生しない
         // （h2 側 `h2_sendfile` と同じ方針）。
-        let (data, mime_owned, served_path): (bytes::Bytes, String, std::path::PathBuf) =
-            match first_result {
-                Some(cache::StaticFileOutcome::File(info, data)) => {
-                    (data, info.mime_type, full_path)
-                }
-                Some(cache::StaticFileOutcome::Forbidden) => {
-                    self.send_error_response(stream_id, 403, b"Forbidden")?;
-                    return Ok((403, 9));
-                }
-                Some(cache::StaticFileOutcome::Directory(file_info)) => {
-                    // ディレクトリの場合はインデックスファイルを解決してからもう一度呼ぶ
-                    // （h1/h2 と同一ロジック。封じ込め検査は既に上で通過済みのため index
-                    // パスにも同じ containment を渡す）。
-                    let filename = index_file.unwrap_or("index.html");
-                    let index_path = file_info.canonical_path.join(filename);
-                    match cache::get_static_file_with_content(
-                        &index_path,
-                        open_file_cache_config,
-                        &content_cfg,
-                        containment,
-                    )
-                    .await
-                    {
-                        Some(cache::StaticFileOutcome::File(info, data)) => {
-                            (data, info.mime_type, index_path)
-                        }
-                        Some(cache::StaticFileOutcome::Forbidden) | None => {
-                            self.send_error_response(stream_id, 403, b"Forbidden")?;
-                            return Ok((403, 9));
-                        }
-                        Some(cache::StaticFileOutcome::Directory(_)) => {
-                            // index ファイル自体がさらにディレクトリ（通常起こり得ないが、
-                            // 安全側に倒して 403 とする）。
-                            self.send_error_response(stream_id, 403, b"Forbidden")?;
-                            return Ok((403, 9));
-                        }
+        let (data, mime_owned, served_path): (
+            bytes::Bytes,
+            std::sync::Arc<str>,
+            std::path::PathBuf,
+        ) = match first_result {
+            Some(cache::StaticFileOutcome::File(info, data)) => (data, info.mime_type, full_path),
+            Some(cache::StaticFileOutcome::Forbidden) => {
+                self.send_error_response(stream_id, 403, b"Forbidden")?;
+                return Ok((403, 9));
+            }
+            Some(cache::StaticFileOutcome::Directory(file_info)) => {
+                // ディレクトリの場合はインデックスファイルを解決してからもう一度呼ぶ
+                // （h1/h2 と同一ロジック。封じ込め検査は既に上で通過済みのため index
+                // パスにも同じ containment を渡す）。
+                let filename = index_file.unwrap_or("index.html");
+                let index_path = file_info.canonical_path.join(filename);
+                match cache::get_static_file_with_content(
+                    &index_path,
+                    open_file_cache_config,
+                    &content_cfg,
+                    containment,
+                )
+                .await
+                {
+                    Some(cache::StaticFileOutcome::File(info, data)) => {
+                        (data, info.mime_type, index_path)
+                    }
+                    Some(cache::StaticFileOutcome::Forbidden) | None => {
+                        self.send_error_response(stream_id, 403, b"Forbidden")?;
+                        return Ok((403, 9));
+                    }
+                    Some(cache::StaticFileOutcome::Directory(_)) => {
+                        // index ファイル自体がさらにディレクトリ（通常起こり得ないが、
+                        // 安全側に倒して 403 とする）。
+                        self.send_error_response(stream_id, 403, b"Forbidden")?;
+                        return Ok((403, 9));
                     }
                 }
-                None => {
-                    // ファイルが開けない場合はキャッシュを無効化（HTTP/1.1・HTTP/2 と同様）。
-                    cache::invalidate_file_cache(&full_path);
-                    cache::invalidate_content_cache(&full_path);
-                    self.send_error_response(stream_id, 404, b"Not Found")?;
-                    return Ok((404, 9));
-                }
-            };
+            }
+            None => {
+                // ファイルが開けない場合はキャッシュを無効化（HTTP/1.1・HTTP/2 と同様）。
+                cache::invalidate_file_cache(&full_path);
+                cache::invalidate_content_cache(&full_path);
+                self.send_error_response(stream_id, 404, b"Not Found")?;
+                return Ok((404, 9));
+            }
+        };
         let mime_str: &str = &mime_owned;
 
         // F-132: h1/h2 と同様、静的配信にも WASM on_response_headers を適用する。

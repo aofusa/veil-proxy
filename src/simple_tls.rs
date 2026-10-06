@@ -127,7 +127,8 @@ fn drain_rustls_into<R: std::io::Read>(drained: &mut Vec<u8>, mut rd: R) {
 
 pub struct SimpleTlsServerStream {
     inner: TcpStream,
-    conn: Option<ServerConnection>,
+    /// `ServerConnection` は 1KB 超あるため Box で持つ（`ktls_rustls::KtlsServerStream` と同じ理由）。
+    conn: Option<Box<ServerConnection>>,
     mode: TlsMode,
     drained_buffer: Vec<u8>,
 }
@@ -398,7 +399,7 @@ pub async fn accept(
 
     Ok(SimpleTlsServerStream {
         inner: stream,
-        conn: Some(conn),
+        conn: Some(Box::new(conn)),
         mode: TlsMode::Rustls,
         drained_buffer: Vec::new(),
     })

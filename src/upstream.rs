@@ -847,12 +847,12 @@ pub fn find_backend_unified(
     // CURRENT_CONFIG から OptimizedRouter を取得
     let config = CURRENT_CONFIG.load();
     let optimized_router = &config.optimized_router;
-    let host_str = std::str::from_utf8(host).unwrap_or("");
-    let path_str = std::str::from_utf8(path).unwrap_or("");
+    // 引数の UTF-8 変換は debug が有効なときだけ評価する（以前は毎リクエスト 3 回
+    // from_utf8 を計算していた。ftlog のマクロは無効レベルでは引数を評価しない）。
     debug!(
         "[Routing] find_backend_unified: host='{}', path='{}', method='{}'",
-        host_str,
-        path_str,
+        std::str::from_utf8(host).unwrap_or(""),
+        std::str::from_utf8(path).unwrap_or(""),
         std::str::from_utf8(method).unwrap_or("")
     );
 

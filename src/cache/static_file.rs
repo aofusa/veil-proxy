@@ -66,9 +66,6 @@ use std::path::Path;
 // Linux/FreeBSD 専用のため、他ターゲットでは unused import にならないよう cfg で絞る。
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use std::path::PathBuf;
-// `Arc` は高速経路（MIME タイプ文字列の Arc 化）でのみ使う。理由は PathBuf と同じ。
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
-use std::sync::Arc;
 
 use bytes::Bytes;
 
@@ -166,7 +163,7 @@ pub async fn get_static_file_with_content(
                     content_cache::insert_bytes(
                         path,
                         data.clone(),
-                        Arc::from(meta.mime_type.as_str()),
+                        meta.mime_type.clone(),
                         content_cfg,
                     );
                     StaticFileOutcome::File(meta, data)

@@ -209,6 +209,19 @@ impl TlsWriteSink for rustls::ServerConnection {
     }
 }
 
+/// Box で持つコネクション（`KtlsServerStream` / `SimpleTlsServerStream`）用。
+impl<T: TlsWriteSink + ?Sized> TlsWriteSink for Box<T> {
+    #[inline]
+    fn sink_wants_write(&self) -> bool {
+        (**self).sink_wants_write()
+    }
+
+    #[inline]
+    fn sink_write_tls(&mut self, wr: &mut dyn io::Write) -> io::Result<usize> {
+        (**self).sink_write_tls(wr)
+    }
+}
+
 impl TlsWriteSink for rustls::ClientConnection {
     #[inline]
     fn sink_wants_write(&self) -> bool {

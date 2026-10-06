@@ -5240,16 +5240,11 @@ async fn handle_requests(mut tls_stream: ServerTls, client_ip: &str, peer_addr: 
                     .unwrap_or(&path_bytes);
 
                 let config = CURRENT_CONFIG.load();
-                // client_ipをSocketAddrに変換
-                let client_socket_addr = if let Ok(addr) = client_ip.parse::<SocketAddr>() {
-                    addr
-                } else {
-                    if let Ok(ip) = client_ip.parse::<std::net::IpAddr>() {
-                        SocketAddr::new(ip, 80)
-                    } else {
-                        peer_addr
-                    }
-                };
+                // ルーティングの送信元条件に使うアドレス。`client_ip` は呼び出し側で
+                // `peer_addr.ip()` から作った文字列なので、毎リクエスト文字列から
+                // パースし直さず（DTrace で `read_ipv4_addr` がホットスポットに出ていた）
+                // `peer_addr` をそのまま使う（送信元条件が見るのは IP のみ）。
+                let client_socket_addr = peer_addr;
 
                 // ヘッダーをゼロコピーのバイト列スライスとして参照し、
                 // クエリ文字列は生バイトのまま渡す（HashMap 割り当て不要）

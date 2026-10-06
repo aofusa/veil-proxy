@@ -62,8 +62,12 @@ pub enum TlsMode {
 pub struct KtlsServerStream {
     /// 基盤となる TCP ストリーム
     inner: TcpStream,
-    /// rustls サーバーコネクション（kTLS 有効化前は Some、有効化後は None）
-    conn: Option<ServerConnection>,
+    /// rustls サーバーコネクション（kTLS 有効化前は Some、有効化後は None）。
+    /// `ServerConnection` は 1KB 超あるため Box で持つ。ストリームは HTTP/1.1 の各ハンドラへ
+    /// 値でムーブされ、各 async 関数のフューチャにも埋め込まれるため、インラインだと
+    /// 1 リクエストあたり何度も 1.2KB の memcpy になる（FreeBSD のプロファイルで memcpy が
+    /// 最大のホットスポットだった）。Box 化は接続あたり 1 回の確保で済む。
+    conn: Option<Box<ServerConnection>>,
     /// 現在の TLS モード
     mode: TlsMode,
     /// ALPN でネゴシエートされたプロトコル（kTLS 有効化後も保持）
@@ -144,7 +148,7 @@ impl KtlsServerStream {
 
     /// rustls コネクションへの参照を取得（kTLS 有効化後は None）
     pub fn rustls_conn(&self) -> Option<&ServerConnection> {
-        self.conn.as_ref()
+        self.conn.as_deref()
     }
 
     /// ALPN でネゴシエートされたプロトコルを取得
@@ -807,7 +811,7 @@ pub async fn accept(
 
     Ok(KtlsServerStream {
         inner: stream,
-        conn: conn_option,
+        conn: conn_option.map(Box::new),
         mode,
         alpn_protocol,
         drained_buffer,
