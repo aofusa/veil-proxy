@@ -19,7 +19,8 @@ members = [".", "fuzz"]
 # 本体のビルド・テスト・パッケージングから完全に切り離すためワークスペース外に置く
 # （詳細は tools/perf/h3load/Cargo.toml の冒頭コメント）。計測時のみ
 # `cargo build --release --manifest-path tools/perf/h3load/Cargo.toml` で明示ビルドする。
-exclude = ["third_party/wasmtime", "tools/perf/h3load"]
+# third_party/quiche も同じ理由で除外する（F-172、crates.io quiche 0.24.9 の vendoring）。
+exclude = ["third_party/wasmtime", "third_party/quiche", "tools/perf/h3load"]
 # resolver v2: dev-dependencies の feature を通常ビルド（`cargo build`）へ統合しない。
 # これにより OpenBSD 本体ビルドがテスト用 dev-deps（hyper-rustls/quinn/tokio-rustls/rcgen
 # の aws_lc_rs）に引きずられて aws-lc-sys を要求することを防ぎ、ring のみでビルドできる
@@ -784,3 +785,11 @@ rcgen = { version = "0.14.6", default-features = false, features = ["crypto", "p
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "ring"] }
 hyper-rustls = { version = "0.27.7", default-features = false, features = ["native-tokio", "http1", "http2", "tls12", "logging", "ring"] }
 tonic = { version = "0.14.2", features = ["tls-ring", "channel"] }
+
+# F-172: quiche は 1 パケットに STREAM フレームを 1 つしか詰めない（upstream は fuzzing
+# ビルド時のみ複数フレームを詰める）。小さい応答を多数多重化する HTTP/3 ではリクエストごとに
+# 1 パケット（sendto + AEAD + ヘッダ保護）を払うことになり、FreeBSD aarch64 の 3B 静的配信で
+# 送信 syscall が 1.01/req（nginx 0.22/req）だった。常に詰めるよう 1 箇所だけ差し替えた
+# vendoring 版で全ターゲットの quiche を置き換える。詳細は third_party/quiche/README.veil.md。
+[patch.crates-io]
+quiche = { path = "third_party/quiche" }
