@@ -18058,6 +18058,29 @@ async fn test_b17_bad_backend_ok_baseline() {
 }
 
 #[tokio::test]
+async fn test_b93_pooled_upstream_closed_while_idle_is_not_reused() {
+    // B-93: bad-backend の通常応答は `Connection: close` を付けずに応答後すぐ接続を閉じる。
+    // veil はこれを keep-alive 接続としてプールするため、従来は同じワーカーで次の要求が
+    // 閉じた接続を再利用して EOF を読み、502 を返していた（E2E 全体実行時に
+    // test_b17_bad_backend_no_response_returns_504 が 502 で落ちるフレークの正体）。
+    // hyper クライアントは keep-alive で同じ接続（= 同じ veil ワーカー）を使い回す。
+    let client = Http1TestClient::new_https("127.0.0.1", PROXY_PORT).expect("client");
+    for i in 0..3 {
+        let res = tokio::time::timeout(Duration::from_secs(8), client.get("/bad-backend/ok"))
+            .await
+            .expect("must not hang")
+            .expect("must succeed");
+        assert_eq!(
+            res.0, 200,
+            "request #{i} must not reuse the closed upstream"
+        );
+        assert_eq!(res.1, b"ok");
+        // 上流の FIN が veil 側ソケットへ届き、かつ生存確認の閾値（1ms）を超えるまで待つ。
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
 async fn test_b17_bad_backend_instant_close_returns_502() {
     // 応答せず即クローズ → 即時 502
     let res = b17_probe("/bad-backend/instant-close")

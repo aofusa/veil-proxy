@@ -89,6 +89,8 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 - HTTP/3 の 1 イテレーションのデータグラム数は `[http3] mmsg_batch_size`（io_uring）/ `recv_drain_max`（reactor）で
   決まる最重要チューニング項目。定数でハードコードし直さない（F-151/F-152）。
 - HTTP/3 のストリーミング経路で本文途中のエラーは fin ではなくストリームリセットにする（切り詰めを成功に見せない。B-86）。
+- quiche は `third_party/quiche` の vendoring 版を `[patch.crates-io]` で使う。差分は「複数ストリームの STREAM フレームを
+  1 パケットへ詰める」1 行（upstream は fuzzing 時のみ。外すと小応答が 1 リクエスト 1 パケットに戻る。F-172）。
 - 静的配信のパス解決に `canonicalize()` を使わない（dirfd 相対 `openat2`/`O_RESOLVE_BENEATH`。`openat2` は seccomp 許可必須。F-153）。
   絶対シンボリックリンクは Linux=`EXDEV`・FreeBSD=`ENOTCAPABLE` で拒否されるので、その場合だけ従来経路で再判定する（B-89）。
 - FreeBSD の静的配信はヘッダも `sendfile(2)` の `sf_hdtr` で 1 syscall（平文 HTTP/1.1 のみ。TLS 経路に通すと平文漏洩。F-155）。
@@ -102,6 +104,8 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
   `#[serde(skip)]` フィールドへ解決し、ホットパスは `Arc` clone のみ（F-148/F-159、B-64）。
 - UDS バックエンドの接続先表記は `ProxyTarget::conn_addr()` が唯一の入口（TCP では従来の `host:port` と 1 バイトも
   変えない）。同期プローブは `upstream::connect_probe`（F-170）。
+- 上流のプール接続はアイドル 1ms 以上のものだけ `MSG_PEEK` で生存確認して取り出す（B-93）。閾値を外して毎回確認すると
+  プロキシ要求ごとに syscall が 1 本増える。平文は未読データも破棄、TLS は破棄しない（NewSessionTicket が残り得る）。
 
 ### reactor 固有
 
@@ -202,6 +206,7 @@ VEIL_E2E_FEATURES="full,epoll" ./tests/e2e_setup.sh test           # reactor の
 | `docs/backlog/` | 機能・バグチケット（親は `backlog.md`） |
 | `docs/artifacts/` | AI 成果物・一時ファイル（git 管理外） |
 | `third_party/wasmtime/` | wasmtime 40.0.4 の vendoring（B-55） |
+| `third_party/quiche/` | quiche 0.24.9 の vendoring（F-172、STREAM フレーム coalescing） |
 | `docker/` | コンテナイメージ・Windows/macOS クロスビルド用 Dockerfile・共有アセット |
 | `packaging/` | 配布物のビルド（[packaging/README.md](packaging/README.md)） |
 | `tools/perf/` | nginx 比較の性能計測ハーネス |
