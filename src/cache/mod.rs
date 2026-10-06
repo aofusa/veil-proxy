@@ -113,10 +113,68 @@ pub fn sendfile_base_contains(
 ) -> bool {
     let base = canonical_base.unwrap_or(base_path);
     #[cfg(target_os = "freebsd")]
-    if file_canonical_path.starts_with(base_path) {
+    if path_has_prefix(file_canonical_path, base_path) {
         return true;
     }
-    file_canonical_path.starts_with(base)
+    path_has_prefix(file_canonical_path, base)
+}
+
+/// `Path::starts_with` と同じ判定を、まずバイト列の前方一致（要素境界つき）で行う。
+///
+/// `Path::starts_with` は両方のパスを要素ごとに走査するため、毎リクエスト呼ぶと
+/// 目立つ（FreeBSD のプロファイルで `Components::next` / `Path::starts_with` が上位）。
+/// 静的配信のパスは常に base_path の join で組み立てられるので、ほぼ全件が
+/// バイト列の一致で決着する。一致しない場合（`./` や重複区切りを含む等）だけ
+/// 従来の要素比較で判定し、結果は `Path::starts_with` と変わらない。
+#[inline]
+fn path_has_prefix(path: &std::path::Path, base: &std::path::Path) -> bool {
+    let p = path.as_os_str().as_encoded_bytes();
+    let b = base.as_os_str().as_encoded_bytes();
+    let b_trim = match b.last() {
+        Some(&last) if b.len() > 1 && std::path::is_separator(last as char) => &b[..b.len() - 1],
+        _ => b,
+    };
+    if p.len() >= b_trim.len()
+        && &p[..b_trim.len()] == b_trim
+        && (p.len() == b_trim.len()
+            || std::path::is_separator(p[b_trim.len()] as char)
+            || b_trim
+                .last()
+                .is_some_and(|&c| std::path::is_separator(c as char)))
+    {
+        return true;
+    }
+    path.starts_with(base)
+}
+
+#[cfg(test)]
+mod path_prefix_tests {
+    use super::path_has_prefix;
+    use std::path::Path;
+
+    /// バイト列の高速判定が `Path::starts_with` と常に同じ結論になること。
+    #[test]
+    fn matches_path_starts_with() {
+        let cases = [
+            ("/var/www/a.html", "/var/www"),
+            ("/var/www/a.html", "/var/www/"),
+            ("/var/www", "/var/www"),
+            ("/var/wwwx/a", "/var/www"),
+            ("/var/www/../etc/passwd", "/var/www"),
+            ("/var//www/a", "/var/www"),
+            ("./www/a", "www"),
+            ("/a", "/"),
+            ("/", "/"),
+            ("/other", "/var/www"),
+        ];
+        for (p, b) in cases {
+            assert_eq!(
+                path_has_prefix(Path::new(p), Path::new(b)),
+                Path::new(p).starts_with(Path::new(b)),
+                "{p} vs {b}"
+            );
+        }
+    }
 }
 
 /// ディレクトリルート File バックエンドの per-route 封じ込めパラメータ（F-154）。

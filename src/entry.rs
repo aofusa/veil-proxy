@@ -488,6 +488,8 @@ pub fn run() {
         #[cfg(feature = "l4-proxy")]
         l4_listeners: Arc::new(loaded_config.l4_listeners.clone()),
     };
+    // `[prometheus] enabled` を記録側の実行時スイッチへ反映する（config::reload と同じ）。
+    crate::metrics::set_metrics_runtime_enabled(runtime_config.prometheus_config.enabled);
     CURRENT_CONFIG.store(Arc::new(runtime_config));
     info!("Runtime configuration initialized (hot reload enabled via SIGHUP)");
 

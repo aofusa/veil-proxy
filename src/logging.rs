@@ -520,6 +520,21 @@ pub(crate) fn log_access(
     client_ip: &str,
     upstream: &str,
 ) {
+    // 出力先が 1 つも無ければ何もしない。本関数はリクエストごとに呼ばれ、以前は
+    // ログもメトリクスも無効な構成でも経過時間・時刻の読み取り（2 回）と from_utf8（4 回）
+    // を毎回行っていた（FreeBSD のプロファイルで from_utf8 と __vdso_gettc が上位）。
+    #[cfg(not(feature = "access-log"))]
+    let text_log = ftlog::log_enabled!(target: "access", Level::Info);
+    #[cfg(feature = "access-log")]
+    let text_log = crate::config::CURRENT_CONFIG
+        .load()
+        .access_log_config
+        .enabled;
+    let metrics_on = cfg!(feature = "metrics") && crate::metrics::metrics_runtime_enabled();
+    if !text_log && !metrics_on {
+        return;
+    }
+
     // 処理時間は Instant で高精度計測
     let duration = start_instant.elapsed();
     let duration_ms = duration.as_millis();

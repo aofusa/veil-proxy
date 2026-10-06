@@ -6326,6 +6326,9 @@ pub fn reload_config(path: &Path) -> io::Result<()> {
     };
 
     // アトミックに設定を入れ替え
+    // `[prometheus] enabled` を記録側の実行時スイッチへ反映する（以前は設定ロード時に
+    // 一度も呼ばれておらず、無効設定・既定値でも毎リクエストのメトリクス記録が走っていた）。
+    crate::metrics::set_metrics_runtime_enabled(runtime_config.prometheus_config.enabled);
     CURRENT_CONFIG.store(Arc::new(runtime_config));
 
     info!("Configuration reloaded successfully (TLS certificates unchanged - restart required for TLS updates)");
