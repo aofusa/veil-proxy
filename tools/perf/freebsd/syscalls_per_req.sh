@@ -8,7 +8,7 @@
 # サーバプロセスの syscall を数え、wrk の総リクエスト数で割って出力する。
 #
 # 使い方（FreeBSD ゲスト内・root、kldload dtraceall 済み）:
-#   sh tools/perf/freebsd/syscalls_per_req.sh <h1_file_plain|h1_file_tls|h1_proxy_tls|h3_file> [path]
+#   sh tools/perf/freebsd/syscalls_per_req.sh <h1_file_plain|h1_file_tls|h1_proxy_tls|h3_file|l4_tcp> [path]
 #   （h3_file は tools/perf/h3load をビルド済みであること）
 # =============================================================================
 set -eu
@@ -24,6 +24,7 @@ case "$SCEN" in
   h1_file_tls)   cfg=veil_file.toml;  v="https://127.0.0.1:4443${REQ_PATH}"; n="https://127.0.0.1:5443${REQ_PATH}" ;;
   h1_proxy_tls)  cfg=veil_proxy.toml; v="https://127.0.0.1:4443${REQ_PATH}"; n="https://127.0.0.1:5443/proxy${REQ_PATH}" ;;
   h3_file)       cfg=veil_file_h3.toml; v="https://127.0.0.1:4443${REQ_PATH}"; n="https://127.0.0.1:5443${REQ_PATH}" ;;
+  l4_tcp)        cfg=veil_l4.toml;      v="http://127.0.0.1:4090${REQ_PATH}";  n="http://127.0.0.1:5090${REQ_PATH}" ;;
   *) echo "unknown scenario $SCEN" >&2; exit 1 ;;
 esac
 

@@ -3,7 +3,7 @@
 # profile_cpu.sh — veil の CPU を関数別にサンプリングする（FreeBSD / DTrace profile）
 # =============================================================================
 # 使い方（FreeBSD ゲスト内・root。run_perf_freebsd.sh を一度実行して ${WORK} がある状態）:
-#   sh tools/perf/freebsd/profile_cpu.sh <h1_file_plain|h1_file_tls|h1_proxy_tls|h3_file> [path]
+#   sh tools/perf/freebsd/profile_cpu.sh <h1_file_plain|h1_file_tls|h1_proxy_tls|h3_file|l4_tcp> [path]
 # 出力: ユーザー空間の関数別サンプル数（上位）とカーネル関数別サンプル数（上位）
 # =============================================================================
 set -eu
@@ -18,6 +18,7 @@ case "$SCEN" in
   h1_file_tls)   cfg=veil_file.toml;    url="https://127.0.0.1:4443${REQ_PATH}" ;;
   h1_proxy_tls)  cfg=veil_proxy.toml;   url="https://127.0.0.1:4443${REQ_PATH}" ;;
   h3_file)       cfg=veil_file_h3.toml; url="https://127.0.0.1:4443${REQ_PATH}" ;;
+  l4_tcp)        cfg=veil_l4.toml;      url="http://127.0.0.1:4090${REQ_PATH}" ;;
   *) echo "unknown scenario" >&2; exit 1 ;;
 esac
 kldload dtraceall 2>/dev/null || true
