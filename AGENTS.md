@@ -89,6 +89,12 @@ io_uring は `src/runtime/` の独自実装（libc + bytes のみ）で直接操
 - HTTP/3 の 1 イテレーションのデータグラム数は `[http3] mmsg_batch_size`（io_uring）/ `recv_drain_max`（reactor）で
   決まる最重要チューニング項目。定数でハードコードし直さない（F-151/F-152）。
 - HTTP/3 のストリーミング経路で本文途中のエラーは fin ではなくストリームリセットにする（切り詰めを成功に見せない。B-86）。
+- HTTP/3 のサーバ接続 ID はクライアントの元 DCID から HMAC で決定的に導出する（乱数にすると Initial の再送・
+  複数パケットの ClientHello が届くたびに別接続を `accept` する。B-94）。
+- BSD は上限を超える `SO_RCVBUF`/`SO_SNDBUF` を `ENOBUFS` で拒否して既定値のまま残す（Linux は黙って切り詰める）。
+  失敗を無視せず通る最大値まで下げる（B-95）。負荷ツール側のソケットも同じ（取りこぼしがサーバの PTO として計測に乗る）。
+- 同じタスク内で複数の I/O Future を同時に待つとき `futures::join!` を使わない。片方の起床で全員を poll するため
+  reactor では起床していない側が `read(2)`/`poll(2)` を空打ちする（`FuturesUnordered` を使う。F-173）。
 - quiche は `third_party/quiche` の vendoring 版を `[patch.crates-io]` で使う。差分は「複数ストリームの STREAM フレームを
   1 パケットへ詰める」1 行（upstream は fuzzing 時のみ。外すと小応答が 1 リクエスト 1 パケットに戻る。F-172）。
 - 静的配信のパス解決に `canonicalize()` を使わない（dirfd 相対 `openat2`/`O_RESOLVE_BENEATH`。`openat2` は seccomp 許可必須。F-153）。
