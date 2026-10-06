@@ -137,10 +137,32 @@ pub(crate) fn connect_probe(addr: &str, timeout: Duration) -> io::Result<ProbeSt
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no address resolved"))?
         }
     };
-    let stream = std::net::TcpStream::connect_timeout(&sock_addr, timeout)?;
+    let stream = tcp_connect_timeout(&sock_addr, timeout)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     Ok(ProbeStream::Tcp(stream))
+}
+
+/// `std::net::TcpStream::connect_timeout` の結果を `SO_ERROR` まで確かめて返す（B-91）。
+///
+/// NetBSD では、拒否された接続（`ECONNREFUSED`）に対して std の `connect_timeout` が
+/// **`Ok` を返し、エラーを `SO_ERROR` に残したままにする**（`poll(2)` が `POLLHUP`/`POLLERR`
+/// を立てず `POLLOUT` だけを返すため、std がエラーを拾わない。NetBSD 10.1 aarch64 で実測。
+/// 同じアドレスへのブロッキング `connect` は正しく `ECONNREFUSED` を返す）。
+/// そのままでは**落ちたバックエンドがヘルスチェックで healthy に見える**ため、
+/// 接続後に `take_error()` を確認する（他 OS では常に `None` で、挙動は変わらない）。
+///
+/// 専用スレッド（ヘルスチェック・WASM の外部呼び出し・同期 TLS バックエンド経路）から
+/// 呼ぶ同期 API であり、データプレーンのワーカースレッドでは使わないこと。
+pub fn tcp_connect_timeout(
+    addr: &SocketAddr,
+    timeout: std::time::Duration,
+) -> io::Result<std::net::TcpStream> {
+    let stream = std::net::TcpStream::connect_timeout(addr, timeout)?;
+    if let Some(e) = stream.take_error()? {
+        return Err(e);
+    }
+    Ok(stream)
 }
 
 /// ヘルスチェックの Host ヘッダ用ホスト名を接続先表記から導く（F-170）。

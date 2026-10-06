@@ -111,7 +111,7 @@ pub fn execute_http_call(
 
     // Connect to upstream
     let addr = format!("{}:{}", upstream_host, upstream_port);
-    let stream = TcpStream::connect_timeout(
+    let stream = crate::upstream::tcp_connect_timeout(
         &addr
             .parse()
             .map_err(|e| format!("Invalid address: {}", e))?,

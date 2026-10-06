@@ -1360,8 +1360,23 @@ cmd_unit() {
     if [[ "${OS_NAME}" == "netbsd" && "${ARCH}" == "aarch64" && "${unit_features}" == "full-netbsd" ]]; then
         unit_features="full-netbsd-no-http3"
     fi
+    local runner_env=""
+    if [[ "${OS_NAME}" == "netbsd" ]]; then
+        # B-60: NetBSD は PaX MPROTECT がシステム全体で有効なため、wasmtime を使う単体テスト
+        # （WASM の実行）が EACCES で失敗する。E2E は veil 本体に paxctl +m を掛けているが、
+        # 単体テストのバイナリは cargo が生成するので、cargo の runner で実行直前に掛ける。
+        local triple="${ARCH}-unknown-netbsd"
+        local var="CARGO_TARGET_$(echo "${triple}" | tr 'a-z-' 'A-Z_')_RUNNER"
+        cmd_ssh "cat > ${GUEST_ROOT}/../paxrun.sh && chmod +x ${GUEST_ROOT}/../paxrun.sh" <<'PAXRUN'
+#!/bin/sh
+/usr/sbin/paxctl +m "$1" >/dev/null 2>&1
+exec "$@"
+PAXRUN
+        # 4GB の VM でテストバイナリ 3 本を並列リンクすると ld が OOM で落ちる（実測）。
+        runner_env="${var}=${GUEST_ROOT}/../paxrun.sh CARGO_BUILD_JOBS=2"
+    fi
     log "in-VM 単体 + 統合テスト（features=${unit_features}）"
-    cmd_ssh "cd ${GUEST_ROOT} && $(_guest_env_prefix) cargo test --no-default-features --features '${unit_features}' --lib --test integration_tests"
+    cmd_ssh "cd ${GUEST_ROOT} && $(_guest_env_prefix) ${runner_env} cargo test --no-default-features --features '${unit_features}' --lib --test integration_tests"
 }
 
 # packaging へ渡すためにビルド済みバイナリを取り出す

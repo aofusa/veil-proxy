@@ -765,7 +765,7 @@ fn test_f22_tcp_connect_to_listening_server() {
 #[test]
 fn test_f22_tcp_connect_to_closed_port() {
     // 確実に閉じているポートへの接続は失敗する
-    let result = std::net::TcpStream::connect_timeout(
+    let result = veil::upstream::tcp_connect_timeout(
         &"127.0.0.1:19997".parse().unwrap(),
         Duration::from_millis(300),
     );
@@ -1104,7 +1104,7 @@ healthy_threshold = 2
 fn test_f22_tcp_health_check_timeout() {
     let start = std::time::Instant::now();
     // 到達不能アドレス（接続確立前にタイムアウトすること）
-    let result = std::net::TcpStream::connect_timeout(
+    let result = veil::upstream::tcp_connect_timeout(
         &"127.0.0.1:19993".parse().unwrap(),
         Duration::from_millis(300),
     );
@@ -1341,8 +1341,10 @@ fn test_f18_l4_health_check_excludes_down_backend() {
     );
 
     // down_addr に接続できないことで unhealthy 判定されていること
-    let down_result =
-        TcpStream::connect_timeout(&down_addr.parse().unwrap(), Duration::from_millis(200));
+    let down_result = veil::upstream::tcp_connect_timeout(
+        &down_addr.parse().unwrap(),
+        Duration::from_millis(200),
+    );
     assert!(down_result.is_err(), "down backend should be unreachable");
 }
 
