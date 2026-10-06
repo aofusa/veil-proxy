@@ -1088,16 +1088,15 @@ where
                             "Connection-specific header field",
                         ));
                     }
-                    b"te" => {
+                    b"te"
                         // TE ヘッダーは "trailers" 以外禁止 (RFC 7540 8.1.2.2)
-                        if !header.value.eq_ignore_ascii_case(b"trailers") {
+                        if !header.value.eq_ignore_ascii_case(b"trailers") => {
                             return Err(Http2Error::stream_error(
                                 stream_id,
                                 Http2ErrorCode::ProtocolError,
                                 "TE header with value other than 'trailers'",
                             ));
                         }
-                    }
                     _ => {}
                 }
             }
@@ -2494,14 +2493,8 @@ mod tests {
 
     /// 単純な同期ドライバ（io_uring 不要な送信テスト用）。Pending は自己 wake 前提で即再試行。
     fn drive<F: Future>(mut fut: F) -> F::Output {
-        use std::sync::Arc;
-        use std::task::{Context, Poll, Wake, Waker};
-        struct NoopWake;
-        impl Wake for NoopWake {
-            fn wake(self: Arc<Self>) {}
-        }
-        let waker = Waker::from(Arc::new(NoopWake));
-        let mut cx = Context::from_waker(&waker);
+        use std::task::{Context, Poll, Waker};
+        let mut cx = Context::from_waker(Waker::noop());
         let mut fut = unsafe { std::pin::Pin::new_unchecked(&mut fut) };
         loop {
             match fut.as_mut().poll(&mut cx) {

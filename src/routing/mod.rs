@@ -398,8 +398,8 @@ impl CidrMatcher {
     /// Sort ranges by prefix length (most specific first)
     pub fn optimize(&mut self) {
         // Sort by prefix length descending (more specific first)
-        self.v4_ranges.sort_by(|a, b| b.1.cmp(&a.1));
-        self.v6_ranges.sort_by(|a, b| b.1.cmp(&a.1));
+        self.v4_ranges.sort_by_key(|r| std::cmp::Reverse(r.1));
+        self.v6_ranges.sort_by_key(|r| std::cmp::Reverse(r.1));
     }
 
     /// Check if an IP matches and get candidate routes

@@ -10,7 +10,7 @@ use crate::runtime::tcp::TcpStream;
 use crate::runtime::time::timeout;
 use arc_swap::ArcSwap;
 use clap::Parser;
-use ftlog::{info, warn};
+use ftlog::{debug, info, warn};
 use httparse::{Request, Status};
 use once_cell::sync::Lazy;
 use rustls::ServerConfig;
@@ -914,44 +914,35 @@ impl CompressionConfig {
             }
         }
 
-        // 4. Content-Type確認
-        if let Some(ct) = content_type {
-            let ct_str = std::str::from_utf8(ct).unwrap_or("");
-            info!("[Compression] Checking Content-Type: '{}'", ct_str);
+        // 4. Content-Type確認（Content-Type が無い場合は圧縮しない）。
+        // 本関数は圧縮対象の応答ごとに呼ばれるため、ログは debug に留める
+        // （以前は info! で毎リクエスト 3 行出力していた）。
+        let ct_str = std::str::from_utf8(content_type?).unwrap_or("");
+        debug!("[Compression] Checking Content-Type: '{}'", ct_str);
 
-            // スキップ対象をチェック
-            for skip in &self.skip_types {
-                if ct_str.starts_with(skip) {
-                    return None;
-                }
-            }
-
-            // 圧縮対象をチェック
-            let is_compressible = self
-                .compressible_types
-                .iter()
-                .any(|t| ct_str.starts_with(t));
-
-            if !is_compressible {
-                return None;
-            }
-        } else {
-            // Content-Typeがない場合は圧縮しない
+        // スキップ対象をチェック
+        if self.skip_types.iter().any(|skip| ct_str.starts_with(skip)) {
             return None;
         }
 
-        // 5. サイズ確認
+        // 圧縮対象をチェック
+        if !self
+            .compressible_types
+            .iter()
+            .any(|t| ct_str.starts_with(t))
+        {
+            return None;
+        }
+
+        // 5. サイズ確認（Content-Length 不明なら圧縮を試みる）
         if let Some(len) = content_length {
-            info!(
-                "[Compression] Checking Content-Length: {} (min_size: {})",
-                len, self.min_size
-            );
             if len < self.min_size {
-                info!("[Compression] Content-Length is too small, skipping");
+                debug!(
+                    "[Compression] Content-Length {} is below min_size {}, skipping",
+                    len, self.min_size
+                );
                 return None;
             }
-        } else {
-            info!("[Compression] Content-Length is missing, proceeding anyway");
         }
 
         // 6. クライアントがサポートし、かつ設定で許可されている圧縮方式を選択
@@ -4367,10 +4358,9 @@ impl ProxyTarget {
     pub fn parse(url: &str) -> Option<Self> {
         let (scheme, rest) = if let Some(rest) = url.strip_prefix("https://") {
             (true, rest)
-        } else if let Some(rest) = url.strip_prefix("http://") {
-            (false, rest)
         } else {
-            return None;
+            let rest = url.strip_prefix("http://")?;
+            (false, rest)
         };
 
         // F-170: `http(s)://unix:<socket-path>[:<path-prefix>]`（nginx の

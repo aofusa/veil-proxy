@@ -1153,7 +1153,7 @@ async fn send_body_bytes(
     notify: &ConnWaker,
     chunk: Bytes,
 ) -> Result<(), ()> {
-    resp_tx.send(RespMsg::Body(chunk)).await?;
+    resp_tx.send(RespMsg::Body(chunk)).await.map_err(|_| ())?;
     notify.notify();
     Ok(())
 }

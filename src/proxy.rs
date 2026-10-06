@@ -1459,7 +1459,7 @@ async fn h2_send(
     notify: &crate::stream_channel::Notify,
     msg: H2RespMsg,
 ) -> Result<(), ()> {
-    let r = resp_tx.send(msg).await;
+    let r = resp_tx.send(msg).await.map_err(|_| ());
     notify.notify();
     r
 }

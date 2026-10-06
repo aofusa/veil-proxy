@@ -497,10 +497,8 @@ where
                 Frame::RstStream {
                     stream_id: sid,
                     error_code,
-                } => {
-                    if sid == stream_id {
-                        return Err(Http2Error::stream_closed(stream_id, error_code));
-                    }
+                } if sid == stream_id => {
+                    return Err(Http2Error::stream_closed(stream_id, error_code));
                 }
                 _ => {}
             }
@@ -840,10 +838,8 @@ where
                 Frame::RstStream {
                     stream_id: sid,
                     error_code,
-                } => {
-                    if sid == stream_id {
-                        return Err(Http2Error::stream_closed(stream_id, error_code));
-                    }
+                } if sid == stream_id => {
+                    return Err(Http2Error::stream_closed(stream_id, error_code));
                 }
                 _ => {}
             }
@@ -925,14 +921,8 @@ mod tests {
 
     /// io_uring 不要な同期ドライバ（Pending は自己 wake 前提で即再試行）。
     fn drive<F: Future>(mut fut: F) -> F::Output {
-        use std::sync::Arc;
-        use std::task::{Context, Poll, Wake, Waker};
-        struct NoopWake;
-        impl Wake for NoopWake {
-            fn wake(self: Arc<Self>) {}
-        }
-        let waker = Waker::from(Arc::new(NoopWake));
-        let mut cx = Context::from_waker(&waker);
+        use std::task::{Context, Poll, Waker};
+        let mut cx = Context::from_waker(Waker::noop());
         let mut fut = unsafe { std::pin::Pin::new_unchecked(&mut fut) };
         loop {
             match fut.as_mut().poll(&mut cx) {

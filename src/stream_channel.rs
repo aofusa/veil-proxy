@@ -123,6 +123,10 @@ pub enum TrySendError<T> {
     Closed(#[allow(dead_code)] T),
 }
 
+/// [`Sender::send`] の失敗: 受信端が drop 済み（アイテムは破棄される）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SendClosed;
+
 /// [`Receiver::try_recv`] の結果。
 pub enum TryRecv<T> {
     /// アイテムを取り出した。
@@ -177,14 +181,14 @@ impl<T> Sender<T> {
         s.queue.len() >= s.cap
     }
 
-    /// 容量が空くまで待ってから送信する。受信端が閉じていれば `Err(())`。
-    pub async fn send(&self, item: T) -> Result<(), ()> {
+    /// 容量が空くまで待ってから送信する。受信端が閉じていれば `Err(SendClosed)`。
+    pub async fn send(&self, item: T) -> Result<(), SendClosed> {
         let mut item = Some(item);
         poll_fn(|cx: &mut Context<'_>| {
             let waker = {
                 let mut s = self.sh.borrow_mut();
                 if s.receiver_closed {
-                    return Poll::Ready(Err(()));
+                    return Poll::Ready(Err(SendClosed));
                 }
                 if s.queue.len() < s.cap {
                     s.queue
@@ -283,14 +287,8 @@ mod tests {
 
     /// 同一スレッドで Future を 1 つ実行する最小ランタイム（テスト用）。
     fn block_on<F: std::future::Future>(mut fut: F) -> F::Output {
-        use std::sync::Arc;
-        use std::task::{Context, Poll, Wake, Waker};
-        struct NoopWake;
-        impl Wake for NoopWake {
-            fn wake(self: Arc<Self>) {}
-        }
-        let waker = Waker::from(Arc::new(NoopWake));
-        let mut cx = Context::from_waker(&waker);
+        use std::task::{Context, Poll, Waker};
+        let mut cx = Context::from_waker(Waker::noop());
         let mut fut = unsafe { std::pin::Pin::new_unchecked(&mut fut) };
         loop {
             match fut.as_mut().poll(&mut cx) {
