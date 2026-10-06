@@ -671,6 +671,35 @@ struct SendFileRequest<'a> {
     wasm_modules: Option<&'a Arc<Vec<crate::wasm_plugin_config::ModuleRef>>>,
 }
 
+/// QUIC ストリーム ID をキーにするマップ用の軽量ハッシャ（乗算ハッシュ 1 回）。
+///
+/// 既定の SipHash はストリームごとの挿入・検索・削除のたびに走り、HTTP/3 の小さい応答では
+/// プロファイル上位に出ていた。ストリーム ID は QUIC の規約上ピアが任意に散らせない
+/// （低い ID から順に開く必要があり、同時数は max_streams で制限される）ため、
+/// HashDoS 耐性の強いハッシャは不要。
+#[derive(Default, Clone, Copy)]
+struct StreamIdHasher(u64);
+
+impl std::hash::Hasher for StreamIdHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(8) ^ b as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+    #[inline]
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0 ^ n).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+type StreamIdHasherBuilder = std::hash::BuildHasherDefault<StreamIdHasher>;
+type StreamMap<V> = HashMap<u64, V, StreamIdHasherBuilder>;
+
 /// HTTP/3 コネクションハンドラー
 ///
 /// quiche::Connection と h3::Connection をセットで保持し、
@@ -685,15 +714,15 @@ struct Http3Handler {
     /// リモートアドレス
     peer_addr: SocketAddr,
     /// 部分的なレスポンス（ストリーム ID → 保留中の応答。B-43 で head を保持）
-    partial_responses: HashMap<u64, PartialResponse>,
+    partial_responses: StreamMap<PartialResponse>,
     /// クライアント IP アドレス（F-168 P3: `to_string()` のヒープ確保を排除するスタックバッファ）
     client_ip: crate::http_utils::IpStr,
     /// ストリーミングプロキシ中のストリーム（F-32）。
-    proxy_streams: HashMap<u64, ProxyStream>,
+    proxy_streams: StreamMap<ProxyStream>,
     /// バッファ経路の保留リクエスト（F-32）。
-    buffered_reqs: HashMap<u64, BufferedReq>,
+    buffered_reqs: StreamMap<BufferedReq>,
     /// ストリームごとのリクエストボディ蓄積（バッファ経路 + ストリーミング初回バッチ）。
-    stream_bodies: HashMap<u64, BytesMut>,
+    stream_bodies: StreamMap<BytesMut>,
     /// バックエンドタスク → メインループの起床通知（F-32）。F-151 で per-connection 化
     /// （`ConnWaker`）し、`notify()` 前に自 cid を共有起床キューへ積むようにした。
     notify: crate::http3_stream::ConnWaker,
@@ -702,7 +731,7 @@ struct Http3Handler {
     /// F-99: QUIC 接続ゲージ（Drop で自動 dec。ホットパス無アロケーション）
     _conn_metric: Http3ActiveConnGuard,
     /// F-99: メトリクス計上中のリクエストストリーム ID（open/close の二重計上防止）
-    metric_open_streams: HashSet<u64>,
+    metric_open_streams: HashSet<u64, StreamIdHasherBuilder>,
     /// F-151: ダーティ集合への多重登録防止フラグ。`true` の間はメインループの
     /// `dirty_queue` に既に自 cid が積まれている。
     dirty: bool,
@@ -739,14 +768,14 @@ impl Http3Handler {
             h3_conn: None,
             client_ip: crate::http_utils::IpStr::new(peer_addr.ip()),
             peer_addr,
-            partial_responses: HashMap::new(),
-            proxy_streams: HashMap::new(),
-            buffered_reqs: HashMap::new(),
-            stream_bodies: HashMap::new(),
+            partial_responses: StreamMap::default(),
+            proxy_streams: StreamMap::default(),
+            buffered_reqs: StreamMap::default(),
+            stream_bodies: StreamMap::default(),
             notify,
             backend_spawner,
             _conn_metric: Http3ActiveConnGuard::new(),
-            metric_open_streams: HashSet::new(),
+            metric_open_streams: HashSet::default(),
             dirty: false,
             timer_deadline: None,
             key,
@@ -1316,29 +1345,29 @@ impl Http3Handler {
             return Ok(());
         }
 
-        // ヘッダーを解析
-        let mut method = None;
-        let mut path = None;
-        let mut authority = None;
+        // ヘッダーを解析（`headers` を借用するだけで、リクエストごとに `Vec` へコピーしない）
+        let mut method: Option<&[u8]> = None;
+        let mut path: Option<&[u8]> = None;
+        let mut authority: Option<&[u8]> = None;
         let mut content_length: usize = 0;
-        let mut accept_encoding: Option<Vec<u8>> = None;
-        let mut user_agent: Vec<u8> = Vec::new();
+        let mut accept_encoding: Option<&[u8]> = None;
+        let mut user_agent: &[u8] = &[];
 
         for header in headers {
             match header.name() {
-                b":method" => method = Some(header.value().to_vec()),
-                b":path" => path = Some(header.value().to_vec()),
-                b":authority" => authority = Some(header.value().to_vec()),
+                b":method" => method = Some(header.value()),
+                b":path" => path = Some(header.value()),
+                b":authority" => authority = Some(header.value()),
                 b"content-length" => {
                     if let Ok(s) = std::str::from_utf8(header.value()) {
                         content_length = s.parse().unwrap_or(0);
                     }
                 }
                 name if name.eq_ignore_ascii_case(b"accept-encoding") => {
-                    accept_encoding = Some(header.value().to_vec());
+                    accept_encoding = Some(header.value());
                 }
                 name if name.eq_ignore_ascii_case(b"user-agent") => {
-                    user_agent = header.value().to_vec();
+                    user_agent = header.value();
                 }
                 _ => {}
             }
@@ -1346,21 +1375,20 @@ impl Http3Handler {
 
         // クライアントの Accept-Encoding を解析
         let client_encoding = accept_encoding
-            .as_ref()
-            .map(|v| AcceptedEncoding::parse(v))
+            .map(AcceptedEncoding::parse)
             .unwrap_or(AcceptedEncoding::Identity);
 
-        let method = method.unwrap_or_else(|| b"GET".to_vec());
-        let path = path.unwrap_or_else(|| b"/".to_vec());
-        let authority = authority.unwrap_or_default();
+        let method: &[u8] = method.unwrap_or(b"GET");
+        let path: &[u8] = path.unwrap_or(b"/");
+        let authority: &[u8] = authority.unwrap_or_default();
 
         // 処理開始時刻
         let start_time = Instant::now();
 
         debug!(
             "[HTTP/3] Request: {} {} (stream {})",
-            String::from_utf8_lossy(&method),
-            String::from_utf8_lossy(&path),
+            String::from_utf8_lossy(method),
+            String::from_utf8_lossy(path),
             stream_id
         );
 
@@ -1372,17 +1400,17 @@ impl Http3Handler {
                 None
             }
         });
-        if crate::http_utils::authority_host_mismatch(&authority, host_hdr) {
+        if crate::http_utils::authority_host_mismatch(authority, host_hdr) {
             self.send_error_response(stream_id, 400, b"Bad Request: :authority/Host mismatch")?;
             let user_agent_slice: &[u8] = if user_agent.is_empty() {
                 &[]
             } else {
-                &user_agent
+                user_agent
             };
             log_access(
-                &method,
-                &authority,
-                &path,
+                method,
+                authority,
+                path,
                 user_agent_slice,
                 content_length as u64,
                 400,
@@ -1404,7 +1432,7 @@ impl Http3Handler {
         if is_grpc {
             debug!(
                 "[HTTP/3] gRPC request detected: {}",
-                String::from_utf8_lossy(&path)
+                String::from_utf8_lossy(path)
             );
         }
 
@@ -1413,7 +1441,7 @@ impl Http3Handler {
             let config = CURRENT_CONFIG.load();
             let prom_config = &config.prometheus_config;
 
-            let path_str = std::str::from_utf8(&path).unwrap_or("/");
+            let path_str = std::str::from_utf8(path).unwrap_or("/");
             if prom_config.enabled && path_str == prom_config.path && method == b"GET" {
                 // IPアドレス制限チェック
                 if !prom_config.is_ip_allowed(self.client_ip.as_str()) {
@@ -1421,12 +1449,12 @@ impl Http3Handler {
                     let user_agent_slice: &[u8] = if user_agent.is_empty() {
                         &[]
                     } else {
-                        &user_agent
+                        user_agent
                     };
                     log_access(
-                        &method,
-                        &authority,
-                        &path,
+                        method,
+                        authority,
+                        path,
                         user_agent_slice,
                         request_body.len() as u64,
                         403,
@@ -1453,12 +1481,12 @@ impl Http3Handler {
                 let user_agent_slice: &[u8] = if user_agent.is_empty() {
                     &[]
                 } else {
-                    &user_agent
+                    user_agent
                 };
                 log_access(
-                    &method,
-                    &authority,
-                    &path,
+                    method,
+                    authority,
+                    path,
                     user_agent_slice,
                     request_body.len() as u64,
                     200,
@@ -1484,12 +1512,12 @@ impl Http3Handler {
         // パス/クエリ分離（スキャンを1回に統一）
         let query_start_pos = path.iter().position(|&b| b == b'?');
         let raw_query: &[u8] = query_start_pos.map(|i| &path[i + 1..]).unwrap_or(b"");
-        let path_without_query = query_start_pos.map(|i| &path[..i]).unwrap_or(&path);
+        let path_without_query = query_start_pos.map(|i| &path[..i]).unwrap_or(path);
 
         let backend_result = find_backend_unified(
-            &authority,
+            authority,
             path_without_query,
-            &method,
+            method,
             &headers_raw,
             raw_query,
             &self.peer_addr,
@@ -1501,12 +1529,12 @@ impl Http3Handler {
             if !authority.is_empty() {
                 debug!(
                     "[HTTP/3] No route found for authority '{}', trying default routes",
-                    String::from_utf8_lossy(&authority)
+                    String::from_utf8_lossy(authority)
                 );
                 find_backend_unified(
                     b"",
                     path_without_query,
-                    &method,
+                    method,
                     &headers_raw,
                     raw_query,
                     &self.peer_addr,
@@ -1525,8 +1553,8 @@ impl Http3Handler {
             None => {
                 debug!(
                     "[HTTP/3] No backend found for authority='{}', path='{}'",
-                    String::from_utf8_lossy(&authority),
-                    String::from_utf8_lossy(&path)
+                    String::from_utf8_lossy(authority),
+                    String::from_utf8_lossy(path)
                 );
 
                 // gRPC リクエストの場合は gRPC エラーレスポンスを返す
@@ -1537,12 +1565,12 @@ impl Http3Handler {
                     let user_agent_slice: &[u8] = if user_agent.is_empty() {
                         &[]
                     } else {
-                        &user_agent
+                        user_agent
                     };
                     log_access(
-                        &method,
-                        &authority,
-                        &path,
+                        method,
+                        authority,
+                        path,
                         user_agent_slice,
                         request_body.len() as u64,
                         200,
@@ -1558,12 +1586,12 @@ impl Http3Handler {
                 let user_agent_slice: &[u8] = if user_agent.is_empty() {
                     &[]
                 } else {
-                    &user_agent
+                    user_agent
                 };
                 log_access(
-                    &method,
-                    &authority,
-                    &path,
+                    method,
+                    authority,
+                    path,
                     user_agent_slice,
                     request_body.len() as u64,
                     404,
@@ -1581,7 +1609,7 @@ impl Http3Handler {
         let check_result = check_security(
             security,
             self.client_ip.as_str(),
-            &method,
+            method,
             content_length,
             false,
         );
@@ -1593,12 +1621,12 @@ impl Http3Handler {
             let user_agent_slice: &[u8] = if user_agent.is_empty() {
                 &[]
             } else {
-                &user_agent
+                user_agent
             };
             log_access(
-                &method,
-                &authority,
-                &path,
+                method,
+                authority,
+                path,
                 user_agent_slice,
                 request_body.len() as u64,
                 status,
@@ -1623,8 +1651,8 @@ impl Http3Handler {
         {
             let config = CURRENT_CONFIG.load();
             if let Some(ref wasm_engine) = config.wasm_filter_engine {
-                let path_str = std::str::from_utf8(&path).unwrap_or("/");
-                let method_str = std::str::from_utf8(&method).unwrap_or("GET");
+                let path_str = std::str::from_utf8(path).unwrap_or("/");
+                let method_str = std::str::from_utf8(method).unwrap_or("GET");
 
                 // F-43: モジュールリストは Arc 共有（リクエストごとの deep copy 排除）
                 let modules_to_apply = if let Some(backend_modules) = backend.modules_arc() {
@@ -1668,12 +1696,12 @@ impl Http3Handler {
                             let user_agent_slice: &[u8] = if user_agent.is_empty() {
                                 &[]
                             } else {
-                                &user_agent
+                                user_agent
                             };
                             log_access(
-                                &method,
-                                &authority,
-                                &path,
+                                method,
+                                authority,
+                                path,
                                 user_agent_slice,
                                 request_body.len() as u64,
                                 resp.status_code,
@@ -1727,12 +1755,12 @@ impl Http3Handler {
                                         let user_agent_slice: &[u8] = if user_agent.is_empty() {
                                             &[]
                                         } else {
-                                            &user_agent
+                                            user_agent
                                         };
                                         log_access(
-                                            &method,
-                                            &authority,
-                                            &path,
+                                            method,
+                                            authority,
+                                            path,
                                             user_agent_slice,
                                             request_body.len() as u64,
                                             resp.status_code,
@@ -1784,8 +1812,8 @@ impl Http3Handler {
                         &security,
                         &effective_compression,
                         client_encoding,
-                        &method,
-                        &path,
+                        method,
+                        path,
                         &prefix,
                         headers,
                         effective_request_body,
@@ -1804,7 +1832,7 @@ impl Http3Handler {
             }
             Backend::MemoryFile(data, mime_type, security, _) => {
                 // パス完全一致チェック
-                let path_str = std::str::from_utf8(&path).unwrap_or("/");
+                let path_str = std::str::from_utf8(path).unwrap_or("/");
                 let prefix_str = std::str::from_utf8(&prefix).unwrap_or("");
 
                 let remainder = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
@@ -1898,7 +1926,7 @@ impl Http3Handler {
                     base_path: &base_path,
                     is_dir,
                     index_file: index_file.as_deref(),
-                    req_path: &path,
+                    req_path: path,
                     prefix: &prefix,
                     security: &security,
                     compression: &file_compression,
@@ -1918,7 +1946,7 @@ impl Http3Handler {
                     &redirect_url,
                     status_code,
                     preserve_path,
-                    &path,
+                    path,
                     &prefix,
                 )
                 .unwrap_or((500, 0)),
@@ -1927,12 +1955,12 @@ impl Http3Handler {
         let user_agent_slice: &[u8] = if user_agent.is_empty() {
             &[]
         } else {
-            &user_agent
+            user_agent
         };
         log_access(
-            &method,
-            &authority,
-            &path,
+            method,
+            authority,
+            path,
             user_agent_slice,
             request_body.len() as u64,
             status,
@@ -1974,7 +2002,10 @@ impl Http3Handler {
         // ステータスを含むヘッダーを構築（itoa::Buffer使用でヒープ割り当て削減）
         let mut status_buf = itoa::Buffer::new();
         let status_str = status_buf.format(status);
-        let mut h3_headers = vec![h3::Header::new(b":status", status_str.as_bytes())];
+        // 借用ヘッダ（`HeaderRef`）で渡す。`h3::Header::new` は名前と値を毎回 `Vec` に
+        // コピーするため、応答ごとにヘッダ数 × 2 回の確保になっていた。
+        let mut h3_headers: Vec<h3::HeaderRef<'_>> = Vec::with_capacity(headers.len() + 2);
+        h3_headers.push(h3::HeaderRef::new(b":status", status_str.as_bytes()));
 
         // B-46: headers に既に content-length が含まれるか、既存のヘッダー走査
         // ループに検査を織り込んで判定する（追加の走査を増やさない）。
@@ -1984,7 +2015,7 @@ impl Http3Handler {
                 if name.eq_ignore_ascii_case(b"content-length") {
                     has_content_length = true;
                 }
-                h3_headers.push(h3::Header::new(name, value));
+                h3_headers.push(h3::HeaderRef::new(name, value));
             }
         }
 
@@ -1995,11 +2026,11 @@ impl Http3Handler {
         // content-length を malformed message として H3_MESSAGE_ERROR で
         // 拒否し、ヘッダ受信直後にストリームを停止する（ボディ 0 バイト・
         // 全リクエスト失敗）。headers に既に含まれる場合は追加しない。
+        let mut len_buf = itoa::Buffer::new();
         if !has_content_length {
             if let Some(body_data) = body {
-                let mut len_buf = itoa::Buffer::new();
                 let len_str = len_buf.format(body_data.len());
-                h3_headers.push(h3::Header::new(b"content-length", len_str.as_bytes()));
+                h3_headers.push(h3::HeaderRef::new(b"content-length", len_str.as_bytes()));
             }
         }
 
@@ -2018,7 +2049,13 @@ impl Http3Handler {
                 self.partial_responses.insert(
                     stream_id,
                     PartialResponse {
-                        head: Some(h3_headers),
+                        // 保留時だけ所有ヘッダへ変換する（稀な経路）。
+                        head: Some(
+                            h3_headers
+                                .iter()
+                                .map(|h| h3::Header::new(h.name(), h.value()))
+                                .collect(),
+                        ),
                         body: body.map(|b| b.to_vec()).unwrap_or_default(),
                         written: 0,
                     },
@@ -2644,15 +2681,6 @@ impl Http3Handler {
         };
         let mime_str: &str = &mime_owned;
 
-        // F-132: h1/h2 と同様、静的配信にも WASM on_response_headers を適用する。
-        let mut header_store: Vec<(Vec<u8>, Vec<u8>)> = vec![
-            (b"content-type".to_vec(), mime_str.as_bytes().to_vec()),
-            (b"server".to_vec(), b"veil/http3".to_vec()),
-        ];
-        for (k, v) in &security.add_response_headers {
-            header_store.push((k.as_bytes().to_vec(), v.as_bytes().to_vec()));
-        }
-
         // F-169: 圧縮ネゴシエーション + 静的配信の圧縮結果キャッシュ
         // （`cache::compressed`、`content_cfg.enabled` = `static_file_cache` 有効時のみ）。
         // 従来この関数は圧縮設定自体を受け取っておらず、HTTP/3 の静的配信では
@@ -2663,18 +2691,15 @@ impl Http3Handler {
             Some(data.len()),
             None,
         );
+        let mut encoding_name: &[u8] = b"";
         let response_body: Bytes = if let Some(enc) = should_compress {
-            let encoding_name: &[u8] = match enc {
+            encoding_name = match enc {
                 AcceptedEncoding::Zstd => b"zstd",
                 AcceptedEncoding::Brotli => b"br",
                 AcceptedEncoding::Gzip => b"gzip",
                 AcceptedEncoding::Deflate => b"deflate",
                 AcceptedEncoding::Identity => b"",
             };
-            if !encoding_name.is_empty() {
-                header_store.push((b"content-encoding".to_vec(), encoding_name.to_vec()));
-                header_store.push((b"vary".to_vec(), b"Accept-Encoding".to_vec()));
-            }
             if content_cfg.enabled {
                 let level = cache::compressed::compression_level(enc, compression);
                 cache::compressed::get_or_compress(&served_path, enc, level, &content_cfg, || {
@@ -2688,15 +2713,36 @@ impl Http3Handler {
             data.clone()
         };
 
-        #[cfg(feature = "wasm")]
-        if let Some(modules) = wasm_modules {
-            header_store = apply_h3_wasm_response_headers(modules, 200, header_store).await;
+        // 応答ヘッダは借用のまま組み立てる（以前は `Vec<(Vec<u8>, Vec<u8>)>` で
+        // リクエストごとに 7〜8 回確保していた）。所有バッファが要るのは F-132 の
+        // WASM on_response_headers を適用するときだけ。
+        let mut resp_headers: Vec<(&[u8], &[u8])> =
+            Vec::with_capacity(4 + security.add_response_headers.len());
+        resp_headers.push((b"content-type", mime_str.as_bytes()));
+        resp_headers.push((b"server", b"veil/http3"));
+        for (k, v) in &security.add_response_headers {
+            resp_headers.push((k.as_bytes(), v.as_bytes()));
+        }
+        if !encoding_name.is_empty() {
+            resp_headers.push((b"content-encoding", encoding_name));
+            resp_headers.push((b"vary", b"Accept-Encoding"));
         }
 
-        let resp_headers: Vec<(&[u8], &[u8])> = header_store
-            .iter()
-            .map(|(k, v)| (k.as_slice(), v.as_slice()))
-            .collect();
+        // F-132: h1/h2 と同様、静的配信にも WASM on_response_headers を適用する。
+        #[cfg(feature = "wasm")]
+        if let Some(modules) = wasm_modules {
+            let header_store: Vec<(Vec<u8>, Vec<u8>)> = resp_headers
+                .iter()
+                .map(|(k, v)| (k.to_vec(), v.to_vec()))
+                .collect();
+            let header_store = apply_h3_wasm_response_headers(modules, 200, header_store).await;
+            let owned: Vec<(&[u8], &[u8])> = header_store
+                .iter()
+                .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                .collect();
+            self.send_response(stream_id, 200, &owned, Some(response_body.as_ref()))?;
+            return Ok((200, response_body.len()));
+        }
 
         self.send_response(stream_id, 200, &resp_headers, Some(response_body.as_ref()))?;
         Ok((200, response_body.len()))
