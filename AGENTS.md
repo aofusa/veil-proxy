@@ -190,6 +190,9 @@ VEIL_E2E_FEATURES="full,epoll" ./tests/e2e_setup.sh test           # reactor の
 - **Windows / macOS / BSD は Linux のテストを全て通過する不具合を持ち得る。** クロスビルド
   （`packaging/scripts/build-cross.sh --target windows|macos`）に加え、可能なら実機・VM で `cargo test` と E2E を回す
   （BSD・Linux aarch64 は `tools/qemu/`。B-69/B-73/B-81/B-88）。
+- コンテナイメージのビルド（`docker/Dockerfile.*`）は中で `cargo test --lib` を走らせる。単体テストは
+  `tests/` 配下のフィクスチャを読まない（ビルドコンテキストに無い。証明書は `rcgen` で生成）、
+  io_uring を必須にしない（ビルドのサンドボックスは io_uring を拒否する。可用性を見てスキップ）。
 - E2E は直接 `cargo test` せず `tests/e2e_setup.sh` を使う。残存プロセスは `pkill -x veil` で止める（`-f` は自シェルを巻き込む）。
 - 詳細は [docs/guide/testing.md](docs/guide/testing.md)・[tests/README.md](tests/README.md)。
 

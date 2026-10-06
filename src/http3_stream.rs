@@ -1382,6 +1382,18 @@ mod tests {
     // NOTE: channel / Notify の単体テストは抽出先の [`crate::stream_channel`] に移設した（F-116）。
 
     /// rustls の client/server をメモリ上でハンドシェイクさせる（テスト用）。
+    /// docker build のサンドボックス等、io_uring が seccomp で拒否される環境では
+    /// ランタイムを起動できない（`l4::proxy` のテストと同じ判定）。
+    #[cfg(all(veil_rt_uring, target_os = "linux"))]
+    fn runtime_available() -> bool {
+        crate::runtime::ring::IoUring::new(8, 0).is_ok()
+    }
+
+    #[cfg(all(unix, not(all(veil_rt_uring, target_os = "linux"))))]
+    fn runtime_available() -> bool {
+        true
+    }
+
     #[cfg(unix)]
     fn handshaked_pair() -> (rustls::ClientConnection, rustls::ServerConnection) {
         use std::sync::Arc;
@@ -1439,6 +1451,11 @@ mod tests {
     fn tls_backend_read_survives_large_record_followed_by_small_records() {
         use std::io::Write as _;
         use std::os::unix::io::FromRawFd as _;
+
+        if !runtime_available() {
+            eprintln!("skip: async runtime unavailable (io_uring denied in this sandbox)");
+            return;
+        }
 
         let (client, mut server) = handshaked_pair();
         // 16KB の最大長レコード 1 本 + 200 バイトのレコード 80 本。

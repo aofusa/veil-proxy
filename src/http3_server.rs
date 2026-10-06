@@ -5863,12 +5863,13 @@ mod tests {
     /// またがる ClientHello）新規接続は 1 つだけ作られる。修正前は届くたびに乱数 SCID で
     /// 別接続を `accept` していた。
     #[test]
-    // テストのフィクスチャ読み込み（データプレーン外）。
-    #[allow(clippy::disallowed_methods)]
     fn test_b94_retransmitted_initial_maps_to_same_connection() {
-        let cert = std::fs::read("tests/fixtures/cert.pem").expect("cert");
-        let key = std::fs::read("tests/fixtures/key.pem").expect("key");
-        let mut server_cfg = new_quic_config_with_certs(&cert, &key).expect("server config");
+        // tests/fixtures はコンテナビルドのコンテキストに含まれないため、その場で生成する。
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = ck.cert.pem();
+        let key = ck.signing_key.serialize_pem();
+        let mut server_cfg =
+            new_quic_config_with_certs(cert.as_bytes(), key.as_bytes()).expect("server config");
         server_cfg
             .set_application_protos(h3::APPLICATION_PROTOCOL)
             .unwrap();
