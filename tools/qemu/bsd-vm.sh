@@ -753,6 +753,15 @@ EOF
 #   $1 = "force" : 即座に kill -9（docker 版の `docker rm -f` と同じ、猶予なし）。
 #   省略時        : QMP で ACPI シャットダウンを試みてから kill -9 にフォールバック
 #                   （cmd_down で使用）。
+# VM（native の qemu プロセス / docker コンテナ）が起動中か。
+_vm_running() {
+    if [[ "${NATIVE}" == "1" ]]; then
+        [[ -f "${WORKDIR}/qemu.pid" ]] && kill -0 "$(cat "${WORKDIR}/qemu.pid" 2>/dev/null)" 2>/dev/null
+    else
+        docker ps --filter "name=^/${NAME}$" --format '{{.Names}}' 2>/dev/null | grep -q .
+    fi
+}
+
 _native_stop() {
     local mode="${1:-graceful}"
     [[ -f "${WORKDIR}/qemu.pid" ]] || return 0
@@ -773,9 +782,21 @@ _native_stop() {
 }
 
 cmd_up() {
+    # 起動中の VM を即時 kill して起動し直すと、ゲストの UFS が汚れたまま次回起動し、
+    # FreeBSD はシングルユーザーモードの fsck 待ちで止まる（実際に 2 回踏み、fsck の
+    # SALVAGE で cargo レジストリ・pkg のファイルが壊れた）。起動中なら何もしない。
+    # 作り直したいときは VM_RESTART=1 で、正常停止（ACPI powerdown）してから起動する。
+    if _vm_running; then
+        if [[ "${VM_RESTART:-0}" != "1" ]]; then
+            log "既に起動中（再起動するときは VM_RESTART=1）"
+            return 0
+        fi
+        log "VM_RESTART=1: 正常停止してから起動し直す"
+        cmd_down
+    fi
     _write_boot "${1:-}"
     if [[ "${NATIVE}" == "1" ]]; then
-        # 前回分が残っていれば docker rm -f 相当（即時 kill）で片付ける
+        # 前回分の pid が残っていれば片付ける（上で起動中でないことは確認済み）
         _native_stop force
         nohup bash "${WORKDIR}/boot.sh" > "${WORKDIR}/qemu.log" 2>&1 &
         local qemu_pid=$!
