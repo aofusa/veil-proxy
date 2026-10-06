@@ -213,6 +213,6 @@ where
 /// 時間関連ユーティリティ（monoio::time 互換）
 pub mod time {
     // timer モジュールの sleep/timeout/Elapsed を re-export
-    pub use super::timer::{sleep, timeout, Elapsed, Sleep};
+    pub use super::timer::{coarse_now, sleep, timeout, Elapsed, Sleep};
     pub use std::time::Duration;
 }

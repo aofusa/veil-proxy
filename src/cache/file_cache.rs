@@ -123,7 +123,9 @@ impl CachedFileInfo {
     /// キャッシュが有効かどうかをチェック
     #[inline]
     pub fn is_valid(&self, max_age: Duration) -> bool {
-        self.cached_at.elapsed() < max_age
+        // 毎ヒットで呼ばれるため、reactor では起床ごとに 1 回読む粗い時計を使う
+        // （有効期間は秒単位なので誤差は問題にならない）。
+        crate::runtime::time::coarse_now().saturating_duration_since(self.cached_at) < max_age
     }
 
     /// HTTP Last-Modified ヘッダー用のRFC 7231形式文字列を生成

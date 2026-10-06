@@ -287,6 +287,13 @@ impl Drop for Sleep {
 // ====================
 
 /// 指定した Duration スリープする
+/// reactor 版（起床ごとに 1 回読む粗い時計）と同じ公開 API。io_uring 版は既存の
+/// ロジックを変えないため、その場で正確な時刻を返す。
+#[inline]
+pub fn coarse_now() -> Instant {
+    Instant::now()
+}
+
 pub fn sleep(duration: Duration) -> Sleep {
     Sleep::new(duration)
 }

@@ -5717,7 +5717,12 @@ async fn handle_backend(
     }
     match backend {
         Backend::Proxy(upstream_group, security, compression, buffering, cache, _) => {
-            handle_proxy(
+            // handle_proxy のフューチャは約 19KB あり、インラインで待つと handle_backend の
+            // フューチャ全体が 22KB になる。handle_backend は毎リクエスト生成・ムーブされるため、
+            // 静的配信のリクエストでもこの 22KB の memcpy を払っていた（FreeBSD のプロファイルで
+            // memcpy が最大のホットスポット）。プロキシ経路だけを Box に逃がし、他の経路の
+            // フューチャを約 10KB に縮める。
+            Box::pin(handle_proxy(
                 tls_stream,
                 &upstream_group,
                 &security,
@@ -5734,7 +5739,7 @@ async fn handle_backend(
                 client_wants_close,
                 wasm_modules,
                 client_ip,
-            )
+            ))
             .await
         }
         Backend::MemoryFile(data, mime_type, security, _) => {
@@ -11267,7 +11272,16 @@ async fn handle_sendfile(
             // ガードが drop されると TCP_NOPUSH が解除され、残っているデータが
             // 即座にフラッシュされる（NoPushGuard の doc 参照）。取得（setsockopt）
             // 自体に失敗しても致命的ではないため None のまま続行する。
-            let nopush = tls_stream.get_ref().nopush_guard();
+            //
+            // ただしヘッダー + 本文が小さい応答（1 回の sendfile でまとめて送り切れる
+            // サイズ）では早期送出の抑制に意味が無く、setsockopt 2 回（ON/OFF）が丸ごと
+            // 無駄になる（FreeBSD の DTrace 実測で 2 syscall/req、プロファイル上位）。
+            const NOPUSH_MIN_BYTES: u64 = 16 * 1024;
+            let nopush = if transfer_length + header_buf.len() as u64 > NOPUSH_MIN_BYTES {
+                tls_stream.get_ref().nopush_guard()
+            } else {
+                None
+            };
 
             let result = sendfile_all_with_header(
                 out_fd,

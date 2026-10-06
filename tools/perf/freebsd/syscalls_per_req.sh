@@ -8,7 +8,8 @@
 # サーバプロセスの syscall を数え、wrk の総リクエスト数で割って出力する。
 #
 # 使い方（FreeBSD ゲスト内・root、kldload dtraceall 済み）:
-#   sh tools/perf/freebsd/syscalls_per_req.sh <h1_file_plain|h1_file_tls|h1_proxy_tls> [path]
+#   sh tools/perf/freebsd/syscalls_per_req.sh <h1_file_plain|h1_file_tls|h1_proxy_tls|h3_file> [path]
+#   （h3_file は tools/perf/h3load をビルド済みであること）
 # =============================================================================
 set -eu
 WORK="${WORK:-/tmp/veilperf}"
@@ -22,6 +23,7 @@ case "$SCEN" in
   h1_file_plain) cfg=veil_file.toml;  v="http://127.0.0.1:4443${REQ_PATH}";  n="http://127.0.0.1:5080${REQ_PATH}" ;;
   h1_file_tls)   cfg=veil_file.toml;  v="https://127.0.0.1:4443${REQ_PATH}"; n="https://127.0.0.1:5443${REQ_PATH}" ;;
   h1_proxy_tls)  cfg=veil_proxy.toml; v="https://127.0.0.1:4443${REQ_PATH}"; n="https://127.0.0.1:5443/proxy${REQ_PATH}" ;;
+  h3_file)       cfg=veil_file_h3.toml; v="https://127.0.0.1:4443${REQ_PATH}"; n="https://127.0.0.1:5443${REQ_PATH}" ;;
   *) echo "unknown scenario $SCEN" >&2; exit 1 ;;
 esac
 
@@ -37,7 +39,12 @@ measure() {  # name url execname
         -o "${WORK}/sc_$1.txt" &
     dpid=$!
     sleep 1
-    reqs=$(cpuset -l 2,3 wrk -t2 -c64 -d"$((DUR - 2))"s "$2" 2>/dev/null | awk '/requests in/ {print $1}')
+    if [ "$SCEN" = h3_file ]; then
+        reqs=$(cpuset -l 2,3 "${REPO}/tools/perf/h3load/target/release/h3load" -t2 -c64 -m 32 \
+            -d "$((DUR - 2))" "$2" 2>/dev/null | awk '/^requests:/ {print $8}')
+    else
+        reqs=$(cpuset -l 2,3 wrk -t2 -c64 -d"$((DUR - 2))"s "$2" 2>/dev/null | awk '/requests in/ {print $1}')
+    fi
     wait $dpid
     total=$(awk 'NF==2 {s+=$2} END {print s+0}' "${WORK}/sc_$1.txt")
     echo "== $1: requests=${reqs} syscalls=${total} per_req=$(echo "scale=2; ${total}/${reqs}" | bc)"
