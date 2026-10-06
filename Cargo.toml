@@ -71,6 +71,14 @@ path = "src/lib.rs"
 # （`VM_MEM_MB=8192 tools/qemu/bsd-vm.sh ... up`）。割り当てられない環境では
 # `release` でビルドし `packaging/scripts/build-bsd.sh` の strip でサイズを削る
 # （strip 単体でも実測 -22%）。
+# B-98: デバッグビルドでも Pulley インタープリタ（NetBSD 全アーキ・FreeBSD/OpenBSD aarch64 の
+# wasmtime 実行系、B-55）だけは最適化する。opt-level 0 のままだと命令ディスパッチが桁違いに
+# 遅く、E2E（デバッグビルド）で WAF モジュールを通るリクエストが 1 回 22 秒かかって
+# 並行実行時にタイムアウトしていた（opt-level 3 で 0.2 秒）。小さいクレートなので
+# ビルド時間への影響は小さく、Cranelift で動くターゲットでは実行経路に乗らない。
+[profile.dev.package.pulley-interpreter]
+opt-level = 3
+
 [profile.dist]
 inherits = "release"
 # クレート跨ぎ最適化とコード生成単位の集約。目的はサイズ削減（上表）。
