@@ -279,6 +279,41 @@ pub fn select_upstream<'a>(
 /// バッファサイズ（64KB: io_uring の一般的な推奨値）
 const BUF_SIZE: usize = 64 * 1024;
 
+/// c→u / u→c の 2 方向転送を同時に走らせ、両方の転送バイト数を返す。
+///
+/// `futures::join!` は**どちらか片方が起床するたびに両方を poll する**（子ごとの Waker を
+/// 持たない）。reactor（kqueue/epoll）の `read`/`readable` は poll されるたびに
+/// まず `read(2)`/`poll(2)` を試すので、起床していない側が毎回 EAGAIN を空打ちしていた
+/// （FreeBSD aarch64 の `l4_tcp` 3B で `read` 6.0/req = 1 方向 3 回のうち 1 回が空打ち）。
+/// `FuturesUnordered` は起床した子だけを poll する。子タスクのノード確保は接続あたり 2 回で、
+/// リクエストごとには発生しない（既存の 64KB 転送バッファと同じ接続単位の固定費）。
+async fn join_directions<F>(c2u: F, u2c: F) -> (usize, usize)
+where
+    F: std::future::Future<Output = usize>,
+{
+    use futures::stream::{FuturesUnordered, StreamExt};
+    use futures::FutureExt;
+    // 2 つの `map` が同じ型になるよう、クロージャではなく関数ポインタで方向を付ける。
+    fn tag_c2u(n: usize) -> (bool, usize) {
+        (true, n)
+    }
+    fn tag_u2c(n: usize) -> (bool, usize) {
+        (false, n)
+    }
+    let mut set = FuturesUnordered::new();
+    set.push(c2u.map(tag_c2u as fn(usize) -> (bool, usize)));
+    set.push(u2c.map(tag_u2c as fn(usize) -> (bool, usize)));
+    let (mut c2u_bytes, mut u2c_bytes) = (0, 0);
+    while let Some((is_c2u, n)) = set.next().await {
+        if is_c2u {
+            c2u_bytes = n;
+        } else {
+            u2c_bytes = n;
+        }
+    }
+    (c2u_bytes, u2c_bytes)
+}
+
 /// 1方向の転送ループ
 ///
 /// バッファはこの関数内でコネクション確立時に **一度だけ** 確保し、
@@ -692,10 +727,11 @@ pub async fn bidirectional_forward(
     // へフォールバックする。
     #[cfg(not(target_os = "linux"))]
     {
-        let (c2u_bytes, u2c_bytes) = futures::join!(
+        let (c2u_bytes, u2c_bytes) = join_directions(
             forward_direction(&client, &upstream, idle_timeout, listener_name),
-            forward_direction(&upstream, &client, idle_timeout, listener_name)
-        );
+            forward_direction(&upstream, &client, idle_timeout, listener_name),
+        )
+        .await;
         debug!(
             "[L4:{}] connection closed: c→u {} bytes, u→c {} bytes",
             listener_name, c2u_bytes, u2c_bytes
@@ -703,28 +739,29 @@ pub async fn bidirectional_forward(
         return;
     }
 
-    // futures::join! は両 Future を同一タスク内でインターリーブするため、
+    // join_directions は両 Future を同一タスク内でインターリーブするため、
     // &TcpStream / &Pipe の同時借用は安全。
     // パイプはスレッドローカルプール（F-40）から取得し、接続ごとの pipe2(2) を排除する。
     #[cfg(target_os = "linux")]
     match (acquire_pipe(), acquire_pipe()) {
         (Ok(c2u_pipe), Ok(u2c_pipe)) => {
-            let (c2u_bytes, u2c_bytes) = futures::join!(
+            let (c2u_bytes, u2c_bytes) = join_directions(
                 forward_direction_splice(
                     &client,
                     &upstream,
                     &c2u_pipe,
                     idle_timeout,
-                    listener_name
+                    listener_name,
                 ),
                 forward_direction_splice(
                     &upstream,
                     &client,
                     &u2c_pipe,
                     idle_timeout,
-                    listener_name
-                )
-            );
+                    listener_name,
+                ),
+            )
+            .await;
             debug!(
                 "[L4:{}] connection closed (splice): c→u {} bytes, u→c {} bytes",
                 listener_name, c2u_bytes, u2c_bytes
@@ -739,10 +776,11 @@ pub async fn bidirectional_forward(
                 "[L4:{}] pipe creation failed; falling back to userspace copy",
                 listener_name
             );
-            let (c2u_bytes, u2c_bytes) = futures::join!(
+            let (c2u_bytes, u2c_bytes) = join_directions(
                 forward_direction(&client, &upstream, idle_timeout, listener_name),
-                forward_direction(&upstream, &client, idle_timeout, listener_name)
-            );
+                forward_direction(&upstream, &client, idle_timeout, listener_name),
+            )
+            .await;
             debug!(
                 "[L4:{}] connection closed: c→u {} bytes, u→c {} bytes",
                 listener_name, c2u_bytes, u2c_bytes
