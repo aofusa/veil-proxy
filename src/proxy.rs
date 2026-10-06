@@ -4060,6 +4060,19 @@ async fn h2c_connect_and_handshake(
 /// コンテキスト新規確保よりは軽い）。
 #[cfg(all(feature = "http2", feature = "compression"))]
 fn zstd_compress_reuse_ctx(body: &[u8], level: i32) -> Vec<u8> {
+    zstd_compress_reused(body, level).unwrap_or_else(|| body.to_vec())
+}
+
+/// スレッドローカルの zstd 圧縮コンテキストを使い回して `body` を圧縮する。
+/// 失敗したら `None`（呼び出し側が無圧縮へフォールバックする）。
+///
+/// B-99: HTTP/1.1 のプロキシ圧縮経路（`transfer_compressed_response` /
+/// `transfer_https_compressed_response`）は F-169 の後も `zstd::encode_all`（呼び出しごとに
+/// コンテキストを確保・初期化するワンショット API）のままで、54KB の zstd レベル 3 に
+/// 1 リクエストあたり約 1.6ms の CPU を使っていた（静的配信の 6 倍）。HTTP/2・HTTP/3 と
+/// 同じくこの関数でコンテキストを使い回す。
+#[cfg(feature = "compression")]
+fn zstd_compress_reused(body: &[u8], level: i32) -> Option<Vec<u8>> {
     use std::cell::RefCell;
 
     thread_local! {
@@ -4071,18 +4084,10 @@ fn zstd_compress_reuse_ctx(body: &[u8], level: i32) -> Vec<u8> {
         let mut slot = cell.borrow_mut();
         let compressor = match slot.as_mut() {
             Some(c) => c,
-            None => {
-                let c = match zstd::bulk::Compressor::new(level) {
-                    Ok(c) => c,
-                    Err(_) => return body.to_vec(),
-                };
-                slot.get_or_insert(c)
-            }
+            None => slot.get_or_insert(zstd::bulk::Compressor::new(level).ok()?),
         };
-        if compressor.set_compression_level(level).is_err() {
-            return body.to_vec();
-        }
-        compressor.compress(body).unwrap_or_else(|_| body.to_vec())
+        compressor.set_compression_level(level).ok()?;
+        compressor.compress(body).ok()
     })
 }
 
@@ -9064,19 +9069,13 @@ async fn transfer_compressed_response(
 
     // 2. ボディを圧縮
     let compressed_body = match encoding {
-        AcceptedEncoding::Zstd => {
-            match zstd::encode_all(std::io::Cursor::new(&body_data), compression.zstd_level) {
-                Ok(compressed) => compressed,
-                Err(_) => {
-                    return transfer_uncompressed_fallback(
-                        client_stream,
-                        original_headers,
-                        &body_data,
-                    )
+        AcceptedEncoding::Zstd => match zstd_compress_reused(&body_data, compression.zstd_level) {
+            Some(compressed) => compressed,
+            None => {
+                return transfer_uncompressed_fallback(client_stream, original_headers, &body_data)
                     .await;
-                }
             }
-        }
+        },
         AcceptedEncoding::Gzip => {
             let level = Compression::new(compression.gzip_level);
             let mut encoder = GzEncoder::new(Vec::new(), level);
@@ -10555,19 +10554,13 @@ async fn transfer_compressed_https_response(
 
     // 2. ボディを圧縮
     let compressed_body = match encoding {
-        AcceptedEncoding::Zstd => {
-            match zstd::encode_all(std::io::Cursor::new(&body_data), compression.zstd_level) {
-                Ok(compressed) => compressed,
-                Err(_) => {
-                    return transfer_uncompressed_fallback(
-                        client_stream,
-                        original_headers,
-                        &body_data,
-                    )
+        AcceptedEncoding::Zstd => match zstd_compress_reused(&body_data, compression.zstd_level) {
+            Some(compressed) => compressed,
+            None => {
+                return transfer_uncompressed_fallback(client_stream, original_headers, &body_data)
                     .await;
-                }
             }
-        }
+        },
         AcceptedEncoding::Gzip => {
             let level = Compression::new(compression.gzip_level);
             let mut encoder = GzEncoder::new(Vec::new(), level);

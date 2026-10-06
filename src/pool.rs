@@ -290,6 +290,10 @@ impl<T> PooledConnection<T> {
     }
 
     /// 接続がまだ有効かどうかを判定（タイムアウトチェック）
+    ///
+    /// HTTP/HTTPS のプールは B-93 で `pooled_conn_reusable`（生存確認つき）へ移ったため、
+    /// 利用者は h2c のプール（`http2`）とテストだけ。
+    #[cfg(any(feature = "http2", test))]
     pub(crate) fn is_valid(&self) -> bool {
         self.created_at.elapsed().as_secs() < self.idle_timeout_secs
     }
