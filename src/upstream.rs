@@ -1147,6 +1147,14 @@ fn matches_wildcard(pattern: &str, text: &str) -> bool {
 /// - "/api/*" → "/api/" で始まるすべてのパスにマッチ
 /// - "/api/v2/*" → "/api/v2/" で始まるすべてのパスにマッチ
 fn matches_path_pattern(pattern: &str, path: &[u8]) -> bool {
+    // B-96: `"/"` は全パスに一致する（`routing::PathRouter::add_route` が `any_path` へ
+    // 振り分けるのと同じ意味論）。従来は下の前方一致で `"/" + "small.html"` の残りが
+    // `/` で始まらないため不一致になり、最も一般的な catch-all ルート（`path = "/"`）で
+    // **ルートキャッシュのヒット検証が毎回失敗**して、全リクエストがフル探索
+    // （`from_utf8_lossy` + 候補列挙 + LRU の put）に落ちていた。
+    if pattern == "/" {
+        return true;
+    }
     let path_str = match std::str::from_utf8(path) {
         Ok(s) => s,
         Err(_) => return false,
@@ -1212,6 +1220,36 @@ mod tests {
     #![allow(clippy::disallowed_methods)]
     use super::*;
     use std::net::ToSocketAddrs;
+
+    /// B-96: `path = "/"`（catch-all）はルーター本体（`any_path`）と同じく全パスに一致する。
+    /// ルートキャッシュのヒット検証（`matches_conditions`）がこれを不一致と判定すると、
+    /// キャッシュが一度も効かず毎リクエストのフル探索に落ちる。
+    #[test]
+    fn test_b96_root_path_pattern_matches_every_path() {
+        assert!(matches_path_pattern("/", b"/"));
+        assert!(matches_path_pattern("/", b"/small.html"));
+        assert!(matches_path_pattern("/", b"/a/b/c"));
+        // 既存の意味論は不変
+        assert!(matches_path_pattern("/api/*", b"/api/v1"));
+        assert!(!matches_path_pattern("/api/*", b"/apix"));
+        assert!(matches_path_pattern("/api", b"/api/v1"));
+        assert!(!matches_path_pattern("/api", b"/apix"));
+
+        let conditions = crate::config::RouteConditions {
+            path: Some("/".to_string()),
+            ..Default::default()
+        };
+        let ip: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        assert!(matches_conditions(
+            &conditions,
+            b"example.com",
+            b"/small.html",
+            b"GET",
+            &[],
+            b"",
+            &ip
+        ));
+    }
 
     // ====================
     // F-22: ヘルスチェック種別テスト

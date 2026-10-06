@@ -4203,7 +4203,21 @@ async fn proxy_to_h2c_backend_async(
 }
 
 /// コネクション管理（Rc<RefCell> で共有）
-type ConnectionMap = Rc<RefCell<HashMap<ConnectionId<'static>, Http3Handler>>>;
+/// 接続マップ本体。キーはサーバが HMAC で導出した接続 ID（B-94）で、データグラムごとに
+/// 数回引くため、既定の SipHash ではなくプロセスごとにシードを変えた xxh3 を使う
+/// （FreeBSD aarch64 の HTTP/3 プロファイルで SipHash が上位だった）。挿入されるキーは
+/// 予測不能な HMAC 出力なので、シード付きの高速ハッシュで HashDoS の心配は無い。
+type ConnMapInner = HashMap<ConnectionId<'static>, Http3Handler, xxhash_rust::xxh3::Xxh3Builder>;
+
+type ConnectionMap = Rc<RefCell<ConnMapInner>>;
+
+/// 接続マップのハッシャ（プロセス起動時の乱数をシードにする）。
+fn conn_map_hasher() -> xxhash_rust::xxh3::Xxh3Builder {
+    let mut seed = [0u8; 8];
+    // 失敗してもシード 0 で動作は正しい（性能・耐性だけの問題）。
+    let _ = SystemRandom::new().fill(&mut seed);
+    xxhash_rust::xxh3::Xxh3Builder::new().with_seed(u64::from_le_bytes(seed))
+}
 
 /// HTTP/3 サーバーを起動（monoio ランタイム上で実行）
 ///
@@ -4376,7 +4390,7 @@ pub async fn run_http3_server_async(
     });
 
     // コネクション管理
-    let connections: ConnectionMap = Rc::new(RefCell::new(HashMap::new()));
+    let connections: ConnectionMap = Rc::new(RefCell::new(HashMap::with_hasher(conn_map_hasher())));
 
     // F-32: バックエンドタスク → メインループの起床通知（全ハンドラ/タスクで共有）。
     let notify = crate::http3_stream::H3Notify::new();
@@ -4956,11 +4970,7 @@ fn mark_dirty_flag<T: Clone>(dirty: &mut bool, queue: &mut VecDeque<T>, id: &T) 
 /// 呼び出し元が既に対象 `Http3Handler` を可変借用している場合はこの関数を使わず、
 /// `mark_dirty_flag(&mut handler.dirty, queue, key)` を直接呼ぶ（`conns` の二重借用を避ける
 /// ため。`process_datagram_segments` の受信直後の呼び出し箇所を参照）。
-fn mark_dirty(
-    conns: &mut HashMap<ConnectionId<'static>, Http3Handler>,
-    queue: &mut VecDeque<ConnKey>,
-    key: &ConnKey,
-) {
+fn mark_dirty(conns: &mut ConnMapInner, queue: &mut VecDeque<ConnKey>, key: &ConnKey) {
     // `ConnKey` = `Rc<ConnectionId>` を `&**key` で deref し、HashMap キー（素の
     // `ConnectionId<'static>`）としてルックアップする。
     if let Some(h) = conns.get_mut(&**key) {
@@ -4997,7 +5007,7 @@ fn schedule_timer(
 /// `on_timeout` する走査（従来方式）を廃止する。遅延削除方式: pop したエントリの期限が
 /// 現在の `timer_deadline` と一致しなければ（期限が更新済みの古いエントリ）無視して捨てる。
 fn expire_due_timers(
-    conns: &mut HashMap<ConnectionId<'static>, Http3Handler>,
+    conns: &mut ConnMapInner,
     timers: &mut BinaryHeap<Reverse<TimerKey>>,
     dirty_queue: &mut VecDeque<ConnKey>,
     now: Instant,
@@ -5038,7 +5048,7 @@ fn expire_due_timers(
 /// 「flag はまだ true → push されない」まま消えてしまう（取りこぼし）。
 fn drain_wake_queue(
     wake_queue: &crate::http3_stream::WakeQueue,
-    conns: &mut HashMap<ConnectionId<'static>, Http3Handler>,
+    conns: &mut ConnMapInner,
     dirty_queue: &mut VecDeque<ConnKey>,
 ) {
     // borrow は drain 中だけ（`mark_dirty` は `wake_queue` に触れないため二重借用にならない）。
@@ -5100,7 +5110,7 @@ fn derive_server_cid(key: &hmac::Key, client_dcid: &[u8]) -> [u8; quiche::MAX_CO
 
 #[allow(clippy::too_many_arguments)] // F-151: ダーティ集合/起床キューの受け渡しで増加（ホットパスの単一呼び出し経路）
 fn process_datagram_segments(
-    conns: &mut HashMap<ConnectionId<'static>, Http3Handler>,
+    conns: &mut ConnMapInner,
     data: &mut [u8],
     from: SocketAddr,
     gro_segment_size: Option<u16>,
@@ -5896,7 +5906,7 @@ mod tests {
         let (len, _) = client.send(&mut initial).unwrap();
         initial.truncate(len);
 
-        let mut conns: HashMap<ConnectionId<'static>, Http3Handler> = HashMap::new();
+        let mut conns: ConnMapInner = HashMap::with_hasher(conn_map_hasher());
         let notify = crate::http3_stream::H3Notify::new();
         let spawner = crate::http3_stream::backend_task_spawner();
         let wake_queue: crate::http3_stream::WakeQueue = Default::default();

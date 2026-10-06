@@ -511,12 +511,27 @@ static CACHE_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// キャッシュ容量（設定値から反映）
 static CACHE_CAPACITY: AtomicUsize = AtomicUsize::new(10000);
 
+/// ルートキャッシュの LRU 本体。キーは xxh3 済みの 64 ビット値で、既定の SipHash で
+/// もう一度ハッシュする必要は無い。ただしキーの xxh3 は固定シードで、パスは攻撃者が
+/// 選べるため（衝突するキーを大量に作られると LRU のバケットが偏る）、スレッドごとに
+/// シードを変えた xxh3 で包む（リクエストごとの get / put 1 回あたりの SipHash を削減）。
+type RouteLru = LruCache<RouteCacheKey, Option<usize>, xxhash_rust::xxh3::Xxh3Builder>;
+
+fn new_route_lru(cap: NonZeroUsize) -> RouteLru {
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        ^ (std::process::id() as u64).rotate_left(32);
+    LruCache::with_hasher(cap, xxhash_rust::xxh3::Xxh3Builder::new().with_seed(seed))
+}
+
 thread_local! {
     /// スレッドローカル LRU キャッシュ: (世代, キャッシュ本体)
-    static TL_ROUTE_CACHE: RefCell<(u64, LruCache<RouteCacheKey, Option<usize>>)> = {
+    static TL_ROUTE_CACHE: RefCell<(u64, RouteLru)> = {
         let cap = NonZeroUsize::new(CACHE_CAPACITY.load(Ordering::Relaxed))
             .unwrap_or(NonZeroUsize::new(10000).unwrap());
-        RefCell::new((0, LruCache::new(cap)))
+        RefCell::new((0, new_route_lru(cap)))
     };
 }
 
@@ -550,7 +565,7 @@ impl RouteCache {
             if borrow.0 != gen {
                 let cap = NonZeroUsize::new(CACHE_CAPACITY.load(Ordering::Relaxed))
                     .unwrap_or(NonZeroUsize::new(10000).unwrap());
-                borrow.1 = LruCache::new(cap);
+                borrow.1 = new_route_lru(cap);
                 borrow.0 = gen;
             }
             if let Some(&result) = borrow.1.get(key) {
@@ -571,7 +586,7 @@ impl RouteCache {
             if borrow.0 != gen {
                 let cap = NonZeroUsize::new(CACHE_CAPACITY.load(Ordering::Relaxed))
                     .unwrap_or(NonZeroUsize::new(10000).unwrap());
-                borrow.1 = LruCache::new(cap);
+                borrow.1 = new_route_lru(cap);
                 borrow.0 = gen;
             }
             borrow.1.put(key, route_idx);
