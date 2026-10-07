@@ -70,9 +70,13 @@ if ! docker run --rm \
     bash -c "
         set -euo pipefail
         # full features は quiche(boringssl) のビルドに cmake + C/C++ ツールチェインを要する。
+        # aws-lc-sys の bindgen（B-79 で有効化）には libclang も要る（run_libfuzzer.sh と同じ）。
         export DEBIAN_FRONTEND=noninteractive
         apt-get update >/dev/null 2>&1 && \
-            apt-get install -y --no-install-recommends cmake build-essential perl >/dev/null 2>&1 || true
+            apt-get install -y --no-install-recommends cmake build-essential perl clang libclang-dev >/dev/null 2>&1 || true
+        if [ -z \"\${LIBCLANG_PATH:-}\" ]; then
+            export LIBCLANG_PATH=\$(dirname \$(ls /usr/lib/llvm-*/lib/libclang.so* 2>/dev/null | head -1))
+        fi
         rustup component add rust-src 2>/dev/null || true
         # --no-default-features で mimalloc を確実に外す（ASAN の独自アロケータと競合するため）。
         cargo build -Zbuild-std --target ${SAN_TARGET} \
