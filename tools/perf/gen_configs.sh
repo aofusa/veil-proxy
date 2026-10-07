@@ -73,9 +73,11 @@ EOF
     printf '%s' "$ofc_section"
 }
 
-# 既存の生成物をクリア（_debug*.toml は .gitignore 対象・保持）
+# 既存の生成物をクリア（_debug*.toml は .gitignore 対象・保持）。
+# *_alloc.toml は alloc_measure*.sh 用に手で管理している git 管理ファイルなので消さない
+# （以前はここで消えていて、スイートを回すたびに作業ツリーから削除されていた）。
 if [ "${KEEP_EXISTING:-0}" != 1 ]; then
-    find "$OUT" -maxdepth 1 -name '*.toml' ! -name '_debug*.toml' -delete 2>/dev/null || true
+    find "$OUT" -maxdepth 1 -name '*.toml' ! -name '_debug*.toml' ! -name '*_alloc.toml' -delete 2>/dev/null || true
 fi
 
 # 完全直交 2^4=16: http2 × ktls × lb(cbpf/kernel) × open_file_cache

@@ -1,355 +1,205 @@
 # docs/perf — パフォーマンス計測サマリ
 
-Veil の HTTP/1.1・HTTP/2・HTTP/3・gRPC・WebSocket・L4 のスループット／レイテンシ／
-CPU・メモリ使用量を、`nginx:alpine` を基準に **同一 Docker ネットワーク上のコンテナ間通信**
-で計測した結果のサマリ。
+Veil の HTTP/1.1・HTTP/2・HTTP/3・gRPC・WebSocket・L4 のスループットを、nginx を基準に計測した
+**最新の結果だけ**をまとめる（過去の計測は git 履歴で辿れる）。
 
-- 計測ハーネス: [`tools/perf/`](../../tools/perf/)（`gen_configs.sh` で構成生成 /
-  `run_perf.sh` で反復計測 / `analyze_results.sh` で median±stdev 集計）。
-- **本ディレクトリには「最新のフルスイート結果のみ」を記載する。** 過去の計測結果は
-  git 履歴で辿れるため本ファイルには残さない（計測方針の教訓だけは末尾に蓄積する）。
-- 生データは [`results_raw.tsv`](results_raw.tsv)。
-  `bash tools/perf/analyze_results.sh docs/perf/results_raw.tsv` で再集計できる。
-  行順は **nginx ベースライン → veil_glibc 各構成 → veil_container 各構成**（F-118）。
-- **FreeBSD ネイティブ計測の生データは [`freebsd_results_raw.tsv`](freebsd_results_raw.tsv)**
-  （Docker が使えない FreeBSD 用の別ハーネス `tools/perf/freebsd/` の出力）。
+| ファイル | 内容 |
+|---|---|
+| [`results_raw.tsv`](results_raw.tsv) | Linux x86_64 のフルスイート生データ（1 反復 1 行）+ B-99 の再計測 |
+| [`results_summary.md`](results_summary.md) | 上記の median±stdev 集計（`tools/perf/analyze_results.sh` の出力） |
+| [`freebsd_results_raw.tsv`](freebsd_results_raw.tsv) | FreeBSD 14.3 aarch64 ネイティブ計測の生データ |
+| [`platform_verification.md`](platform_verification.md) | v0.7.0 の全プラットフォーム検証（単体・統合・E2E） |
 
 ---
 
-## 2026-09-04 F-170 / B-83 / B-84 の退行確認（Linux x86_64、交互 A/B）
+## Linux x86_64（2026-10-07、Docker コンテナ間）
 
-F-170（UDS バックエンド接続）は `ProxyTarget::conn_addr()` を新設して**ホットパスに
-`Option` の分岐を 1 個増やしている**ため、性能退行が無いことを交互 A/B で確認した。
-B-83（上流 ALPN から `h2` を外す）・B-84（HTTP/3 の h2c 上流をバッファ経路へ）も同じ
-バイナリに含まれる。
-
-- **ベース**: `main`（`8979f93`）を `git worktree` でチェックアウトしてビルドした
-  `veil:base`。F-168 の教訓（**`docker build` はコミットではなく作業ツリーをコピーする**）に従う。
-  なお B-85 のテスト直列化パッチだけはベース側にも当てている（**テスト専用の変更で
-  バイナリは `main` と同一**。当てないと `cargo test --lib` のフレークで
-  イメージビルド自体が非決定に失敗する）。
-- **新**: `feat/f170-unix-socket-backend`（F-170 + B-83 + B-84 + B-85）をビルドした `veil:f170`。
-- ハーネス: `tools/perf/h2c_proxy_lab.sh ab`（各ラウンド `WARM_SECS=40` の持続負荷後に計測。
-  B-72 の教訓「蓄積するコストは定常状態で測る」に従う）。8 ラウンド = 各変種 8 サンプル。
-
-### 結果（h2c_proxy、Req/s）
-
-| 構成 | base 中央値 | new 中央値 | 比 | 平均±σ（base / new） | ラウンド勝敗 |
-|---|---|---|---|---|---|
-| 54,576B | 11,379 | 11,367 | **0.999（-0.10%）** | 11,378±117 / 11,385±99 | base 5 / 8 |
-| 3B | 23,407 | 23,436 | **1.001（+0.13%）** | 23,408±430 / 23,417±233 | base 5 / 8 |
-
-**結論: 退行なし。** どちらのサイズでも差は標準偏差（1〜2%）の内側で、**ラウンドごとの
-勝敗も方向が揃っていない**（8 ラウンド中 base 5 勝 = 偶然の範囲）。F-159/F-162 の教訓に
-従いバイト単価支配（54KB）と固定費支配（3B）の両方で測ったが、**どちらでも差が出ない**のは
-「増えたのは接続確立ごとの `Option` 分岐 1 個であり、リクエスト単価にはほぼ乗らない」という
-理論とも整合する。
-
-## 2026-08-27 フルスイート（B-76 / F-169 / B-77 / B-78 / B-79 適用後）
-
-- コミット: `perf/f169-benchmark-and-packaging`（B-76 CBPF 修正・F-169 圧縮キャッシュ・
-  B-77 HTTP/3 静的圧縮・依存更新 anyhow/crossbeam-epoch/lru/h2/quinn-proto を含む）
-- 実行: `BUILDS='glibc container' ITERATIONS=3 bash tools/perf/run_perf.sh`
-- イメージ: `veil:glibc`（`CARGO_FEATURES=full`、io_uring）/
-  `veil:container`（`CARGO_FEATURES=full-container`、epoll reactor）。
-  **同一コミット・同一日ビルド**。比較対象は `nginx:alpine`（`access_log off`、
-  h2c サーバブロックに `open_file_cache`）。
-- **822 計測すべてで Non-2xx = 0、NA 行ゼロ。**
+- コミット: `3746594`（v0.7.0 リリース候補）。B-99（HTTP/1.1 プロキシ圧縮）だけ `d8126b6` で再計測
+- イメージ: `veil:glibc`（`full`、io_uring）/ `veil:musl`（`full`、io_uring）。比較対象は `nginx:alpine`
+- **810 計測すべてで Non-2xx = 0、NA 行ゼロ**
+- 実行: `bash tools/perf/gen_configs.sh && bash tools/perf/run_perf.sh`（69 構成 × 3 反復）
 
 ### 代表構成（Req/s 中央値）
 
-| 構成 | プロトコル | nginx | veil glibc | veil container | 対 nginx（glibc） |
+| 構成 | プロトコル | nginx | veil glibc | veil musl | 対 nginx（glibc） |
 |---|---|---|---|---|---|
-| `h2c_file`（3B 静的・h2c） | h2c | 10,572 | **25,178** | 25,322 | **2.38×** |
-| `h2c_proxy`（54KB 中継・h2c） | h2c | 6,263 | **10,982** | 10,931 | **1.75×** |
-| `h2_1_ktls_0_lb_kernel_ofc_1` | HTTP/1.1 | 6,534 | **9,238** | 9,281 | **1.41×** |
-| 同上 | HTTP/2 | 5,971 | **7,373** | 7,342 | **1.23×** |
-| `h2_1_ktls_0_lb_cbpf_ofc_1` | HTTP/1.1 | 6,534 | **9,308** | 9,159 | **1.42×** |
-| `h2_0_ktls_0_lb_cbpf_ofc_0` | HTTP/1.1 | 6,534 | **8,200** | 8,175 | **1.26×** |
-| `h2_0_feat_l4`（L4 平文 9080） | L4 | 6,534 | **13,752** | 12,770 | **2.10×** |
-| `h2_1_feat_proxy` | HTTP/1.1 | 6,534※ | 6,422 | 6,431 | 0.98※ |
-| `h3_file_metrics` | HTTP/3 | — | 1,874 | 1,952 | — |
-| `h3_proxy` | HTTP/3 | — | 1,577 | 1,652 | — |
-| `grpc_h2_metrics` | gRPC(k6) | — | 4,486 | 4,513 | — |
-| `grpc_h3_metrics` | gRPC over HTTP/3 | — | 7,851 | 8,216 | — |
-| `h2_1_feat_websocket` | WebSocket | — | 3,180 | 4,814 | — |
+| `h2c_file`（3B 静的） | h2c | 10,080 | **24,135** | 23,811 | **2.39×** |
+| `h2c_proxy`（54KB 中継） | h2c | 6,188 | **10,858** | 10,519 | **1.75×** |
+| `h2_1_ktls_0_lb_kernel_ofc_1` | HTTP/1.1 | 6,437 | **9,667** | 9,527 | **1.50×** |
+| 同上 | HTTP/2 | 5,932 | **7,243** | 7,166 | **1.22×** |
+| `h2_1_ktls_0_lb_cbpf_ofc_1` | HTTP/1.1 | 6,437 | **9,721** | 9,682 | **1.51×** |
+| `h2_0_ktls_0_lb_cbpf_ofc_0` | HTTP/1.1 | 6,437 | **8,095** | 8,285 | **1.26×** |
+| `h2_0_feat_l4`（L4 平文） | HTTP/1.1 | 6,437 | **13,120** | — | **2.04×** |
+| `h2_1_feat_compression_cached` | HTTP/2 | 5,932 | **17,914** | 17,340 | **3.02×** |
+| 同上 | HTTP/1.1 | 6,437 | **10,930** | 10,883 | **1.70×** |
+| `h2_1_feat_proxy`（54KB 中継） | HTTP/1.1 | 6,437 | 6,279 | 6,342 | 0.98※ |
+| 同上 | HTTP/2 | 5,932 | 5,955 | 6,002 | 1.00※ |
+| `h3_file_metrics` | HTTP/3 | — | 1,824 | 1,817 | — |
+| `h3_proxy` | HTTP/3 | — | 1,583 | 1,578 | — |
+| `grpc_h2_metrics` | gRPC | — | 4,356 | 4,320 | — |
+| `grpc_h3_metrics` | gRPC over HTTP/3 | — | 7,895 | 8,034 | — |
 
-※ nginx ベースラインは TLS **静的配信**であり逆プロキシではない（F-118 の方針）。
-`feat_proxy` 行の対 nginx は同条件比較ではない。**プロキシ同士の同条件比較は `h2c_proxy` のみ**
-（1.75×）。
+※ nginx の列は `base` 構成で、**TLS 静的配信**（逆プロキシではない）。したがって `*_proxy*` との比は
+「veil の逆プロキシ」対「nginx の静的配信」で、同条件の比較ではない。**プロキシ同士の同条件比較は h2c だけ**
+（nginx 側も `/proxy/` で中継する）で、`h2c_proxy` は 1.75×。54KB の中継構成は約 6,400 req/s
+（約 2.8 Gbps）で、静的配信の nginx と同じくコンテナ間ネットワークの上限に張り付いている。
 
-### B-76: CBPF 振り分けの修正で cbpf 構成が 1.27〜1.93 倍に
+### 対 nginx の分布
 
-`reuseport_balancing = "cbpf"` は cBPF プログラムが常に 0 を返しており、
-**全接続がワーカー 0 に固定**されていた（詳細は
-[`B-76`](../backlog/bugs/B-76-reuseport-cbpf-pins-worker0.md)）。修正前は veil の全構成中
-**cbpf 構成だけが nginx に負けていた**（0.70×）。
+| プロトコル | veil 構成数 | nginx 以上 | 中央値 |
+|---|---|---|---|
+| HTTP/1.1 | 54 | 40 | **1.26×** |
+| HTTP/2 | 45 | 40 | **1.05×** |
 
-| 構成 | プロトコル | 修正前（08-26） | 修正後 | 比 |
+nginx を下回る構成は 2 種類だけ:
+
+1. **54KB 中継の各機能構成**（`h2_1_proxy_*` / `h3_proxy_*` の HTTP/1.1・HTTP/2）: 0.95〜0.99×。
+   比較相手は nginx の静的配信（上の ※）で、両者ともネットワーク上限に張り付いた並び。
+   veil の中継は上流へのホップ 1 段ぶん仕事が多い。
+2. **キャッシュ無効の圧縮構成**（`*_compression`）: 0.3〜0.7×。veil は毎リクエスト zstd で
+   圧縮しているのに対し、比較対象の nginx は圧縮していない（ハーネスの nginx に `gzip` 設定は
+   無い）ので、同じ仕事の比較ではない。推奨構成（`static_file_cache` + `open_file_cache` で
+   圧縮結果をキャッシュする `*_compression_cached`）は **HTTP/2 で 3.02×** である。
+
+### B-99: HTTP/1.1 のプロキシ圧縮（`d8126b6` で再計測）
+
+HTTP/1.1 のプロキシ圧縮 2 経路だけ `zstd::encode_all`（呼び出しごとにコンテキストを確保する
+ワンショット API）のままだった。HTTP/2・HTTP/3 と同じスレッドローカルのコンテキスト使い回しに
+揃えた。
+
+| 構成 | プロトコル | 修正前 | 修正後 | 比 |
 |---|---|---|---|---|
-| `h2_0_ktls_0_lb_cbpf_ofc_0` | HTTP/1.1 | 4,763 | **8,200** | **1.72×** |
-| `h2_0_ktls_0_lb_cbpf_ofc_1` | HTTP/1.1 | 5,788 | **9,231** | **1.59×** |
-| `h2_1_ktls_1_lb_cbpf_ofc_0` | HTTP/1.1 | 3,458 | **6,683** | **1.93×** |
-| `h2_1_ktls_0_lb_cbpf_ofc_0` | HTTP/2 | 5,534 | **7,092** | **1.28×** |
+| `h2_1_proxy_compression` | HTTP/1.1 | 1,939 | **2,751** | **1.42×** |
+| `h3_proxy_compression` | HTTP/1.1 | 2,015 | **2,739** | **1.36×** |
 
-修正後は cbpf 構成が kernel 構成とほぼ同値になる（どちらも 4 タプルをハッシュするため）。
-これが「4 ワーカー全部が接続を受理するようになった」ことの直接の証拠である。
+ほかの圧縮構成（HTTP/2・HTTP/3・静的）は ±3% で変化なし。
 
-### F-169: 静的配信 + 圧縮が対 nginx 2.9 倍に
+### 退行確認（2026-08-27 のフルスイートとの比較）
 
-B-76 修正後、**対 nginx で明確に劣後する構成は圧縮系だけ**（0.27〜0.41×）になった。
-[`F-169`](../backlog/features/F-169-static-compressed-variant-cache.md) で
-(A) 静的配信の圧縮結果キャッシュ と (B) zstd 圧縮コンテキストの使い回し を実装した。
+比較可能な 137 組（`veil_glibc` の構成 × プロトコル）の比の中央値は **0.992**。0.95 を下回った
+2 組を単独で再計測した:
 
-| 構成 | プロトコル | 静的キャッシュ無効 | **有効（推奨構成）** | nginx | 対 nginx |
+| 構成 | プロトコル | 前回 | 今回（フル） | 再計測 | 再計測 / 前回 |
 |---|---|---|---|---|---|
-| `h2_1_feat_compression` | HTTP/2 | 3,756 | **17,887** | 6,128 | **2.92×** |
-| `h3_file_compression` | HTTP/2 | 4,079 | **17,817** | 6,128 | **2.91×** |
-| `h2_1_feat_compression` | HTTP/1.1 | 8,168 | **9,593** | 6,633 | **1.45×** |
+| `h3_file_rate_limit` | HTTP/2 | 7,137 | 6,670 | 6,928 | 0.971 |
+| `h2_1_ktls_1_lb_cbpf_ofc_0` | HTTP/2 | 6,148 | 5,810 | 5,867 | 0.954 |
 
-**`*_compression_cached` 構成は F-169 で新設した**（`static_file_cache` +
-`open_file_cache` を有効にした推奨構成）。既存の `*_compression` 構成は
-キャッシュ無効時のコストを測るためそのまま残してある。
-どちらも 1 レスポンスあたり **16,467 / 16,464 バイト**（54,576B の zstd 圧縮後）で
-**出力は同一**であり、差はキャッシュヒットで圧縮処理そのものが消えたぶんである。
+どちらもラン間のばらつき（同一イメージで最大 15%、下記）の範囲内。後者はコンテナと相性の悪い
+kTLS 有効の構成で、同じ構成の HTTP/1.1 は 6,656（nginx 6,437 の 1.03×）だった。
 
-**寄与の内訳（当初の仮説とは逆だった）**: 既存 compression 構成での +64〜76% は
-**すべて (B) の zstd コンテキスト使い回し**によるもので、(A) のキャッシュは
-`static_file_cache` 無効のため一度も動いていなかった。決定的な証拠は
-**構造的にキャッシュが効かないプロキシ構成が同率（+65〜73%）で改善したこと**である。
+---
 
-### 計測のばらつきについて（重要）
+## FreeBSD 14.3 aarch64（QEMU + HVF、ネイティブ）
 
-`h2_1_proxy_compression` の HTTP/1.1 行は、**同一イメージ・同一設定でもラン間で
-14.6% 振れる**（ラン内は 1% 未満）。
+- コミット: `d8126b6`。`tools/perf/freebsd/run_perf_freebsd.sh -r 3 -d 10`（3B と 54,576B）
+- **全 96 計測でエラー 0**
 
-| 独立ラン | 3 反復の値 | 中央値 |
+### 対 nginx 比（同一ラウンド内の比、3 ラウンドの中央値）
+
+| シナリオ | 3B | 54,576B |
 |---|---|---|
-| A | 1921.5 / 1930.9 / 1926.0 | 1,926 |
-| B | 1683.6 / 1696.1 / 1678.5 | 1,684 |
-| C | 1912.8 / 1934.5 / 1930.2 | 1,930 |
+| `h1_file_tls`（HTTPS 静的） | **1.07** | **1.21** |
+| `h2_file_tls`（HTTP/2 静的） | **1.29** | **1.39** |
+| `h1_file_plain`（平文 HTTP/1.1 静的、sendfile） | **1.09** | **1.01** |
+| `h2c_file_plain`（h2c 静的） | **1.40** | 0.72 |
+| `h3_file`（HTTP/3 静的） | 0.89 | 0.89 |
+| `h1_proxy_tls`（HTTPS 中継） | **1.00** | **1.00** |
+| `h2_proxy_tls`（HTTP/2 中継） | **1.59** | **1.47** |
+| `l4_tcp`（L4 TCP 中継） | 0.98 | **1.15** |
 
-**この構成の単発比較で退行を判断してはならない。** 本スイートで 0.95× を下回った
-6 構成（`h2_1_proxy_compression` / `h2_1_feat_buffering` / `grpc_h3*`）は、
-いずれも再計測で元の水準へ戻るか、ビルド間で方向が一致しない（片方が上がり片方が下がる）
-ことを確認しており、**コード起因の退行は 1 件も無い**。
+16 項目中 12 項目で nginx 以上（互角を含む）。下回る 4 項目:
 
-### 退行確認（2026-08-26 フルスイートとの比較）
+- **`h3_file` 0.89**: 同じバイナリでも対 nginx 比は ±10〜20% 動き、交互 A/B（base / new を 5 ラウンド）では
+  0.94〜1.05 だった。2026-10 に HTTP/3 の固定費を順に削った結果（下表）、0.75〜0.86 から並ぶ水準になった
+- **`h2c_file_plain` 54KB 0.72**: F-157 からの構造的な差。nginx は h2c でも `sendfile(2)` + `sf_hdtr` で
+  カーネル内で完結するが、veil は HTTP/2 の DATA フレームへ再フレーミングするため `sendfile` に載らず、
+  本体を書き込みバッファへコピーする。ただしこの構成は両サーバとも CPU を約 50% しか使っておらず
+  （DTrace で確認）、スループットはクライアント（h2load 2 スレッド）とループバック側で決まっている。
+  コピーを消す iovec 化は F-157 で FreeBSD でも退行を確認済み
+- **`l4_tcp` 3B 0.98**: 互角（3 ラウンド 0.85 / 0.98 / 0.98）
 
-比較可能な **225 の (構成, プロトコル) ペアすべてで 0.95× を下回る退行は無し**
-（上記のばらつき検証で除外した 6 件を除く）。
+### 2026-10 の改善（FreeBSD で計測して直したもの）
 
-## FreeBSD ネイティブ計測（2026-09-04、F-170 / B-83 / B-84 適用後の退行確認）
+| 変更 | syscall / プロファイル | 対 nginx |
+|---|---|---|
+| F-172: quiche の STREAM フレーム結合 | h3 の `sendto` 1.012 → 0.143/req（nginx 0.219） | h3 3B 0.86 → 0.98 |
+| B-94 / B-95: Initial の再送処理・UDP バッファ | ハンドシェイクのタイムアウト 6〜20 本 → 0、クライアント送信の損失 14% → ほぼ 0 | 30 秒ストールの解消 |
+| B-96: `path = "/"` のルートキャッシュ | 毎リクエストのフル探索（lossy 変換・LRU put）が消える | h3 0.89 → 1.05、h1 TLS 0.94 → 1.02（交互 A/B） |
+| F-173: L4 の空打ち read | `read` 6.0 → 4.0/req、合計 8.23 → 6.26/req（nginx 8.12） | — |
+| HTTP/1.1 の syscall 削減（writev・sf_hdtr・TCP_NOPUSH・fd 共有） | `h1_file_plain` 2.04/req（nginx 4.22） | — |
 
-FreeBSD 14.3 aarch64 / QEMU+HVF、`tools/perf/freebsd/run_perf_freebsd.sh -r 3 -d 10`。
-**2026-08-28 と同じハーネス・同じ判定方法（同一ラウンド内の対 nginx 比）** で計測した。
-
-| シナリオ | R1 | R2 | R3 | 中央値 | 2026-08-28 | 差 |
-|---|---|---|---|---|---|---|
-| `h2_file_tls` | 1.55 | 1.44 | 1.44 | **1.44** | 1.40 | +0.04 |
-| `h2_proxy_tls` | 1.19 | 1.31 | 1.38 | **1.31** | 1.33 | -0.02 |
-| `h1_file_tls` | 1.30 | 1.40 | 1.23 | **1.30** | 1.31 | -0.01 |
-| `l4_tcp` | 1.06 | 1.11 | 1.11 | **1.11** | 1.10 | +0.01 |
-| `h1_file_plain` | 0.88 | 1.10 | 1.00 | **1.00** | 1.05 | -0.05 |
-| `h1_proxy_tls` | 0.98 | 0.99 | 1.08 | **0.99** | 0.98 | +0.01 |
-| `h3_file` | 0.85 | 1.02 | 0.95 | **0.95** | 0.96 | -0.01 |
-| `h2c_file_plain` | 0.85 | 0.69 | 0.71 | **0.71** | 0.74 | -0.03 |
-
-**結論: 退行なし。** 全 8 シナリオで差は -0.05〜+0.04 に収まり、**同一シナリオの
-ラウンド間のばらつき（例: `h1_file_plain` は 0.88〜1.10）より小さい**。対 nginx で
-5 シナリオが上回る構図も 2026-08-28 と変わらない。`h2c_file_plain` の劣後は
-F-170 以前からの既知の残件（F-157 Phase 3、下記参照）で、本変更とは無関係。
-
-**注意**: F-170 が触ったのは**バックエンド接続（プロキシ経路）**なので、退行が出るなら
-`*_proxy_*` に出るはずである。`h2_proxy_tls` 1.31 / `h1_proxy_tls` 0.99 はいずれも
-ベースラインどおりで、`conn_addr()` の分岐追加による影響は観測されない
-（Linux の交互 A/B でも -0.10%〜+0.13% でノイズ内だった）。
-
-## FreeBSD ネイティブ計測（2026-08-28、FreeBSD 14.3 aarch64 / QEMU+HVF）
-
-`tools/perf/` 本体は Docker 前提のため FreeBSD では動かない。専用ハーネス
-[`tools/perf/freebsd/run_perf_freebsd.sh`](../../tools/perf/freebsd/run_perf_freebsd.sh) で
-**ゲスト内 loopback で veil と nginx を同条件**（同じ 2 コアへ cpuset 固定・負荷生成は
-残り 2 コア・双方アクセスログ off・**双方 `open_file_cache` 有効**・veil は
-`static_file_cache` も有効）に突き合わせる。生データは
-[`freebsd_results_raw.tsv`](freebsd_results_raw.tsv)。
-
-**QEMU/HVF の VM は連続計測でスループットが単調に劣化する**ため、判定は必ず
-**同一ラウンド内の対 nginx 比**で行う（絶対値をラウンド間で比較しない）。
-
-### 結果（54,576B、3 ラウンド、各ラウンドの対 nginx 比）
-
-| シナリオ | R1 | R2 | R3 | 中央値 | 判定 |
-|---|---|---|---|---|---|
-| `h2_file_tls` | 1.40 | 1.30 | 1.54 | **1.40** | ✅ |
-| `h2_proxy_tls` | 1.34 | 1.33 | 1.29 | **1.33** | ✅ |
-| `h1_file_tls` | 1.30 | 1.33 | 1.31 | **1.31** | ✅ |
-| `l4_tcp` | 1.11 | 1.07 | 1.10 | **1.10** | ✅ |
-| `h1_file_plain` | 1.05 | 1.06 | 1.01 | **1.05** | ✅ |
-| `h1_proxy_tls` | 0.92 | 0.98 | 1.01 | 0.98 | ほぼ同等 |
-| `h3_file` | 0.96 | 0.96 | 0.96 | 0.96 | わずかに劣後 |
-| **`h2c_file_plain`** | 0.94 | 0.74 | 0.73 | **0.74** | **劣後（既知の残件）** |
-
-**8 シナリオ中 5 つで nginx を上回る**（最大 1.40 倍）。
-
-### B-80: `h1_file_plain` が F-163 以降ずっと 0 rps だった
-
-今回の計測で **`h1_file_plain` が veil 0.00 rps・エラー 217 万件**であることが判明した。
-原因は **F-163 が `[server].tls_only` の既定を `true` に変えた**ことで、veil に平文
-HTTP/1.1 を喋らせる唯一の経路（メインリスナーのプロトコル検出）が消えていたこと。
-**ハーネス側の追随漏れ**（詳細は [`B-80`](../backlog/bugs/B-80-freebsd-harness-tls-only.md)）。
-修正後は **1.05 倍**で正常に計測できている。
-
-FreeBSD ネイティブ計測の前回実施は 2026-08-07〜08 で、F-163（08-26）以降これが
-初の FreeBSD 計測だったため今回はじめて表面化した。
-
-### 残件: `h2c_file_plain` が 0.74（F-157 Phase 3）
-
-**本セッションで新たに生じた劣後ではなく、F-157 から続く既知の残件**である
-（当時 0.80〜0.89）。原因は構造的なもので、
-
-- **nginx は h2c でも `sendfile(2)` + `sf_hdtr` でカーネル内完結できる**のに対し、
-  veil は HTTP/2 の DATA フレームへ再フレーミングする必要があり `sendfile` に載せられない。
-  54KB のボディをユーザ空間へ読み出してフレーム化するぶんが丸ごと差になる。
-- 固定費側の削減（F-158 のインライン初回 poll）は **3B で +27.3% と大きく効くが
-  54KB では +0.8%** であり、このシナリオ（54KB = バイト単価支配）には効かない。
-- **DATA フレームの `writev` ゼロコピー化は F-157 で実測して棄却済み**
-  （交互 A/B 4 ラウンドすべてで退行）。
-
-残る打ち手は「FreeBSD の `sf_hdtr` で 9 バイトの DATA フレームヘッダと本体を
-1 回の `sendfile` にまとめ、16KB ごとにフレーム分割する」という HTTP/2 静的配信専用の
-経路だが、フロー制御との整合を含め規模が大きいため**本セッションでは着手していない**。
 
 ---
 
 ## 計測条件
 
-- ホスト: 4 コア Linux（co-tenant あり）。**クライアント・veil・上流が同一マシンを共有する**
-  ため、veil 単体の改善は rps に鈍く出る。改善幅を正確に見たい場合は
-  `tools/perf/h2c_proxy_lab.sh cpuab`（veil の CPU/req 交互 A/B）を使う。
+### Linux（`tools/perf/`）
+
+- 4 コアのホストでクライアント・veil・上流・nginx を同時に動かす（コンテナ間通信）。veil 単体の
+  改善は rps に鈍く出る。CPU/req を見たいときは `tools/perf/h2c_proxy_lab.sh cpuab`
 - 負荷: HTTP/1.1 = wrk `-t4 -c100 -d10s` / HTTP/2・HTTP/3 = h2load `-n 30000 -c100 -m10` /
-  gRPC = k6 50VU×10s / gRPC over HTTP/3 = QUIC 対応 h2load + gRPC unary ワイヤ形式（F-167）/
-  WebSocket = k6 / L4 = wrk（平文 9080）
-- 圧縮構成のみ `Accept-Encoding: gzip, br, zstd` を付与する（付けないと圧縮経路を通らない）。
-- 各 (config, proto) を warmup 後 3 反復、median±stdev 集計。Errors は Non-2xx。
-- kTLS はコンテナ（veth）と相性が悪いため feat 系構成では無効（直交表の ktls 因子でのみ計測）。
+  gRPC = k6 50VU × 10s / gRPC over HTTP/3 = QUIC 対応 h2load / WebSocket = k6 / L4 = wrk
+- 圧縮構成のみ `Accept-Encoding: gzip, br, zstd` を付ける
+- 各 (構成, プロトコル) をウォームアップ後 3 反復し中央値をとる。Errors は Non-2xx
+- kTLS はコンテナ（veth）と相性が悪いため、`feat_*` 構成では無効（直交表の ktls 因子でだけ有効）
+
+### FreeBSD（`tools/perf/freebsd/`）
+
+- FreeBSD 14.3 aarch64 ゲスト（4 vCPU、Apple Silicon の QEMU + HVF）。veil・nginx を CPU 0-1、
+  負荷生成を CPU 2-3 に `cpuset` で固定
+- HTTP/1.1 = wrk `-t2 -c64` / HTTP/2・h2c = h2load `-t2 -c64 -m32` / HTTP/3 = `tools/perf/h3load`
+  `-t2 -c64 -m32`（quinn ベース） / L4 = wrk
+- 3B（`/small.html`）と 54,576B（`/index.html`）の 2 サイズ、各 3 ラウンド。**判定は同一ラウンド内の
+  対 nginx 比**（絶対値はホスト状態で 3 倍振れる）
+- veil の software kTLS は無効（F-155）。双方 `open_file_cache` 有効、veil は `static_file_cache` も有効
 
 ---
 
-## 教訓（計測方針に反映済み）
+## 計測上の注意（実測で踏んだもの）
 
-- **コンテナ（veth/bridge）では kTLS が不利**。feat 系構成は kTLS 既定オフ。
-- **ホスト負荷（co-tenant のビルド等）が計測ノイズの支配的要因**。静穏ウィンドウ
-  （1 分 loadavg 目安 < 1.5）を確認してから計測し、比較は必ず**同日・同一環境の A/B**
-  （nginx 併走で環境ノイズを正規化）で行う。
-- **h2load の `failed`（ストリームエラー）は Non-2xx に計上されない**。Errors=0 でも
-  異常低スループット時は h2load の `requests:` 行とサーバ warn ログを確認する
-  （B-43・B-46 の教訓）。
-- **Docker seccomp 許可リストは使用 syscall の追加に追随させる**（F-115 の教訓）。
-- **h2load は既定 1 スレッドでクライアント律速になり得る**。HTTP/2 で 2800 req/s 級以上を
-  計測する際は `H2_ARGS='-n 60000 -c100 -m10 -t4'` を併用する（F-116 の教訓）。
-- **高並行の多重化計測は fd 上限・接続チャーンの検出器になる**。0 req/s 近傍や反復劣化を
-  見たら、サーバの `Too many open files` / `Backend connect error` ログと
-  `/proc/net/tcp` の状態分布を確認する（B-44/B-45 の教訓）。
-- **git worktree から tools/perf を実行する場合、git 管理外の生成物
-  （`docker/assets/ssl/*.pem` 等）を本体ツリーからコピーする**（F-116 A/B の教訓）。
-- **FreeBSD の kTLS は大きな応答で不利**（`sysctl kern.ipc.tls.enable=1` でカーネル側を
-  有効にしたうえで veil の `ktls_enabled = true` にした場合）。software kTLS が TLS
-  レコードごとにカーネルワーカースレッドへディスパッチするため、54KB 応答で
-  **中央値 26% 低下**し 1.2 GB/s で直列化により張り付く（上記「FreeBSD の kTLS は
-  大きな応答で不利」節）。計測前に `kern.ipc.tls.stats.sw.gcm` が増えているかで実際に kTLS
-  セッションが張られたかを確認する（F-145 の教訓）。
-- **QEMU/HVF 上の VM は連続計測でスループットが単調に劣化する**（実測: 同一バイナリで
-  18,217 → 15,153 → 12,845 rps）。A/B で「先に走った方が有利」という順序バイアスが
-  効果量と同オーダーになるため、**交互かつ短時間サンプルを多数取る**こと。本環境では
-  5〜10% の差は判定できない（F-145 の教訓）。
-- **reactor バックエンド（BSD/macOS/`full-container`）は Linux 既定ビルドで 1 行も
-  コンパイルされない**。`src/runtime/reactor/` を変更したら
-  `VEIL_E2E_FEATURES="full,epoll" ./tests/e2e_setup.sh test` を必ず回す。F-145 では
-  「最初の 1 リクエストでサーバがハングする」変更が単体 816 / 統合 53 / E2E 541 件の
-  **全テストを通過**した（AGENTS.md に明記済み）。
-- **「未対応ボトルネック」の原因仮説は、実装前に必ず計測で確定させる**（F-151 の教訓）。
-  `docs/perf` に書いていた「HTTP/3 は QUIC の暗号処理・輻輳制御が原因と見られる」という
-  仮説は、`cc_algorithm`/`pacing` の A/B で**有意差なし**として否定された。真因は
-  メインループの O(N_conn) 固定費で、**`mmsg_batch_size` を変えて「ループ回数だけ」を
-  動かす実験**（トラフィック量・暗号処理量・輻輳制御は不変）で 3.2 倍の差が出たことで
-  確定した。**「何を変えたら何が動くか」を 1 変数に絞った実験を先に作ること。**
-- **接続数を振って測ると律速の性質が分かる**（F-151 の教訓）。接続数に依存しない頭打ちは
-  「1 リクエストあたりのコスト」、接続数に比例して悪化するなら「接続数あたりの固定費」。
-  さらに**負荷生成側を 2 プロセスに割って合計が変わらないこと**を確認すると、
-  クライアント律速を確実に排除できる。
-- **計測ハーネスは「0 rps を記録して正常終了する」失敗モードを持つ**（2026-08-11 の教訓）。
-  FreeBSD の HTTP/3 計測は、(1) `h3load` が密着形短オプション（`-t2`）を受理せず即終了、
-  (2) 固定リクエスト数を外側 `timeout` が撃ち殺して集計行が出ない、の 2 件により
-  **veil・nginx とも 0 rps** を記録し続けていた。どちらもハーネスはエラー終了しない。
-  **新しい環境で計測したら、まず 0 / NA の行が無いかを確認すること。**
-  負荷生成は可能なかぎり**固定リクエスト数ではなく時間で区切る**（マシン速度に依存しない）。
-- **計測は必ず静穏ホストで**。並行ビルド中の E2E は 415 passed / 127 failed になり、
-  静穏時は 541 passed / 1 failed だった（所要 822 秒 → 88 秒）。大量失敗を見たら
-  まず loadavg を疑う。
+- **同一イメージでもラン間で 15% 振れる構成がある。** ラン内の 3 反復が 1% 未満でも、独立ランの
+  中央値は振れる（`h2_1_proxy_compression` HTTP/1.1 で 1,684〜1,930）。退行判定は「再計測して
+  戻るか」「ビルド間で方向が揃うか」で行う
+- **FreeBSD の計測 VM はホスト（macOS の常駐プロセス）の状態で絶対値が 3 倍振れる。** 同じバイナリの
+  交互 A/B でも対 nginx 比が ±10〜20% 動く。数ラウンドの差を根拠に結論を出さない
+- **負荷ツール側のソケットバッファにも注意。** BSD の UDP 既定（42KB）のままだとクライアントが
+  応答バーストを取りこぼし、サーバの損失回復（PTO の指数バックオフ）として計測に乗る
+  （1 接続が 30 秒止まる）。`h3load` は送受信バッファを広げている（B-95）
+- **計測構成がその機能の有効化条件を満たしているか先に確認する。** 圧縮結果キャッシュは
+  `static_file_cache` が、静的配信の offload ゼロ経路は `open_file_cache` が要る（F-157 / F-169）
+- **「0 rps・NA を記録して正常終了する」失敗モードがある。** 新しい環境ではまず 0 / NA / errors の
+  行が無いかを見る（B-80 では平文 HTTP/1.1 が 0 rps のまま気づかれなかった）
+- **計測中に同じホストでビルドしない。** 並行ビルドで E2E の失敗数や rps が大きく変わる
+- **手元の `docker run` で再現するときはハーネスと同じマウント先（`/etc/veil/conf.d/config.toml`）を
+  使う。** snap 版 docker はリポジトリ外のパスを黙って空ディレクトリとしてマウントする
 
-- **同一イメージでもラン間で 15% 振れる構成がある（2026-08-27）。** `h2_1_proxy_compression`
-  の HTTP/1.1 は、ラン内の 3 反復は 1% 未満に収まるのに、**独立ランの中央値が
-  1,684〜1,930（14.6%）** ばらついた。**ラン内のばらつきの小ささを、その構成の
-  再現性の高さと取り違えてはならない。** 退行判定は必ず「再計測して戻るか」
-  「ビルド間で方向が一致するか」で行う。
-- **計測構成がその機能の有効化条件を満たしているか先に確認する（F-169）。**
-  既存 compression 構成は `static_file_cache` を有効にしておらず、F-169 の圧縮結果
-  キャッシュは**有効化条件を満たさず一度も動かなかった**。効いていたのは別施策
-  （zstd コンテキストの使い回し）で、切り分けができたのは
-  **構造的にキャッシュが効かないプロキシ構成が同じ幅で改善した**ことに気づいたためである。
-  F-157（メタデータ／本体キャッシュの片側だけ有効化）と同じ罠の 3 度目。
-- **ライブラリの「ワンショット API」はコンテキストを作り捨てている可能性を疑う（F-169）。**
-  `zstd::encode_all` は呼び出しごとに圧縮ワークスペースを確保・初期化していた。
-  ホットパスでは再利用可能なコンテキスト型（`zstd::bulk::Compressor` 等）を使う。
-- **手元の docker run で挙動を再現するときは、ハーネスと同じマウント先を使う（2026-08-27）。**
-  `tools/perf/run_perf.sh` は計測用設定を **`/etc/veil/conf.d/config.toml`** へマウントする。
-  `/etc/veil/config.toml` へマウントするとイメージ同梱の既定設定（静的 File ルート）が
-  生き残り、**まったく別の経路を測ってしまう**。さらに **snap 版 docker は
-  `/tmp/claude-*` のようなホスト外パスを bind mount できず、黙って空ディレクトリを
-  作る**（エラーにならない）。実際にこの 2 つが重なり「HTTP/1.1 は圧縮しない」という
-  誤った結論を出しかけた（正しくは `content-encoding: zstd` で 54,576B → 17,224B）。
-  **設定を差し替えた検証では、まず起動ログで意図した経路（Proxy か SendFile か）を確認する。**
+---
 
 ## 再現手順
 
-### FreeBSD ネイティブ計測
+### Linux（Docker）
 
 ```bash
-# 1) FreeBSD ゲストを起動してビルド（Apple Silicon macOS では HVF で実用速度）
-tools/qemu/bsd-vm.sh freebsd aarch64 up
-CARGO_FEATURES=full-freebsd-aarch64 tools/qemu/bsd-vm.sh freebsd aarch64 build
-
-# 2) HTTP/3 クライアント（FreeBSD には QUIC 対応 h2load が無いため必須）
-#    ゲスト内で:
-cargo build --release --manifest-path tools/perf/h3load/Cargo.toml-aarch64
-
-# 3) 計測（ゲスト内。nginx / wrk / nghttp2 が必要）
-pkg install -y nginx nghttp2 wrk-luajit
-sh tools/perf/freebsd/run_perf_freebsd.sh -r 3 -d 10                 # 54KB
-sh tools/perf/freebsd/run_perf_freebsd.sh -r 3 -d 10 -p /small.html  # 3B
-
-# ホスト（macOS）からは薄いラッパ経由でも実行できる
-bash tools/perf/freebsd/vmrun.sh -r 3 -d 10
-```
-
-### Docker ベース計測（Linux）
-
-```bash
-docker build -f docker/Dockerfile.glibc -t veil:glibc --build-arg CARGO_FEATURES='full' .
-docker build -f docker/Dockerfile.musl  -t veil:musl  --build-arg CARGO_FEATURES='full' .
+docker build -f docker/Dockerfile.glibc -t veil:glibc .
+docker build -f docker/Dockerfile.musl  -t veil:musl  .
 docker build -t local/h2load-h3:latest tools/perf/h2load-http3   # HTTP/3 クライアント
 
 bash tools/perf/gen_configs.sh
-bash tools/perf/run_perf.sh                                      # 全構成スイート（~5 時間）
-# scoped 計測の例:
-CONFIG_GLOB='h2_1_feat_http3'             bash tools/perf/run_perf.sh   # HTTP/3 file
-CONFIG_GLOB='h2_1_ktls_0_lb_kernel_ofc_1' bash tools/perf/run_perf.sh   # H1/H2 best
-CONFIG_GLOB='grpc_*'                      bash tools/perf/run_perf.sh   # gRPC
-CONFIG_GLOB='h2_0_feat_l4'                bash tools/perf/run_perf.sh   # L4
-
-# B-46 リグレッション確認（修正前は 2xx ヘッダのみ・ボディ 0B で全 failed になる）
-# h3_proxy_buffering 構成の veil に対して:
-h2load --alpn-list=h3 -n 100 -c 10 -m10 https://<veil>:443/
+bash tools/perf/run_perf.sh                                       # 全構成（約 9 時間）
+BUILDS=glibc CONFIG_GLOB='*compression' bash tools/perf/run_perf.sh   # 一部だけ
+bash tools/perf/analyze_results.sh tools/perf/results/results_raw.tsv
 ```
 
+### FreeBSD（QEMU VM）
+
+```bash
+tools/qemu/bsd-vm.sh freebsd aarch64 up
+tools/qemu/bsd-vm.sh freebsd aarch64 build            # full-freebsd で release ビルド
+# ゲスト内:
+pkg install -y nginx nghttp2 wrk-luajit
+cargo build --release --manifest-path tools/perf/h3load/Cargo.toml
+sh tools/perf/freebsd/run_perf_freebsd.sh -r 3 -d 10                  # 54KB
+sh tools/perf/freebsd/run_perf_freebsd.sh -r 3 -d 10 -p /small.html   # 3B
+sh tools/perf/freebsd/syscalls_per_req.sh h3_file /small.html         # syscall/req（DTrace）
+sh tools/perf/freebsd/profile_cpu.sh h3_file /small.html              # 関数別 CPU（DTrace）
+```

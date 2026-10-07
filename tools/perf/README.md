@@ -95,9 +95,8 @@ BUILDS='glibc container' ITERATIONS=3 bash tools/perf/run_perf.sh
 **必ず同一コミットから両方をビルドすること**（片方だけ古いイメージを使うと、比較しているのが
 ランタイムバックエンドの差なのかコード差なのか分からなくなる）。reactor で動いていることは
 起動ログの `enable_io_uring_restrictions is set but this build uses the reactor (epoll) runtime
-backend` 警告で確認できる。実測結果は
-[docs/perf/README.md](../../docs/perf/README.md) の「2026-08-25 full-container（epoll reactor）
-フルスイート」節を参照。
+backend` 警告で確認できる（2026-10 の最新フルスイートは glibc / musl の 2 ビルドで、
+`full-container` は含めていない）。
 
 リポジトリのどこから実行しても、スクリプトが自身の位置からリポジトリルートと `docker/assets/` を解決します。
 
@@ -240,25 +239,28 @@ HTTPS への 301 リダイレクト専用のため計測に使えません）。
 > で HTTP/3 構成のみ、`CONFIG_GLOB='grpc_*'` で gRPC 構成のみ）。既定は全構成。
 
 主な着目点（[docs/perf/README.md](../../docs/perf/README.md) 参照。**最新のフルスイートは
-2026-08-24（B-72 マージ後、全 67 構成 × glibc/musl × 3 反復 = 757 計測、Non-2xx = 0）**）:
+2026-10-07（`3746594`、全 69 構成 × glibc/musl × 3 反復 = 810 計測、Non-2xx = 0、NA なし）**）:
 
 - **最良構成 `h2_1_ktls_0_lb_kernel_ofc_1`**（HTTP/2 有効・kTLS 無効・kernel LB・OFC 有効）で
-  **veil は nginx を上回る**（2026-08-24 実測: HTTP/1.1 glibc 9,180 / musl 8,981 vs nginx 6,511
-  = **1.41×**、HTTP/2 glibc 7,249 / musl 7,302 vs nginx 6,129 = **1.18×**）。
-- **h2c は静的 2.19×・逆プロキシ 1.57×**（`h2c_file` 23,849 / `h2c_proxy` 10,039 vs
-  nginx 10,905 / 6,409）。L4 平文素通しは **2.11×**。
+  HTTP/1.1 glibc 9,667 / musl 9,527 vs nginx 6,437 = **1.50×**、HTTP/2 glibc 7,243 / musl 7,166
+  vs nginx 5,932 = **1.22×**。
+- **h2c は静的 2.39×・逆プロキシ 1.75×**（`h2c_file` 24,135 / `h2c_proxy` 10,858 vs
+  nginx 10,080 / 6,188）。L4 平文素通しは **2.04×**。圧縮結果キャッシュ有効の
+  `h2_1_feat_compression_cached` は HTTP/2 で **3.02×**。
+- FreeBSD 14.3 aarch64 のネイティブ計測（`tools/perf/freebsd/`）は 16 項目中 12 項目で nginx 以上。
 - **`feat_proxy` / `feat_buffering` の「対 nginx」を額面どおり読まないこと。**
   nginx ベースライン（`base` 構成）は **TLS 静的配信**であり逆プロキシではない
   （`nginx/nginx.conf` の 443 サーバは `root /var/www`）。したがってこれらの比は
   「veil の逆プロキシ」対「nginx の静的配信」であって同条件比較ではない。
   **プロキシ同士の同条件比較になっているのは h2c だけ**（nginx 側も `/proxy/` で中継する）。
-- 機能別オーバーヘッド（HTTP/2・基準 `h2_1_ktls_0_lb_kernel_ofc_0` = 7,085）は
-  観測系（metrics / otel / admin / rate-limit / access-log / wasm / cache）が **96〜99%**、
-  proxy / buffering が **83%**（バックエンドホップそのもの）、
-  compression が **28%**（54,576B を毎リクエスト実圧縮する CPU バウンド処理）。
+- 機能別オーバーヘッド（HTTP/2・基準 `h2_1_ktls_0_lb_kernel_ofc_0` = 6,946、2026-10-07）は
+  観測系（metrics / otel / admin / rate-limit / access-log / wasm / cache）が **96〜100%**、
+  proxy / buffering が **86〜87%**（バックエンドホップそのもの）、
+  キャッシュ無効の compression が **56%**（54,576B を毎リクエスト zstd 圧縮する CPU バウンド処理）、
+  圧縮結果キャッシュ有効（`compression_cached`）は **258%**（圧縮後 16KB を返すため）。
 - glibc と musl の差は代表構成のいずれでも **数 % 以内でノイズ範囲**。
 - コンテナ（veth）では **kTLS 有効が不利**（`ktls_1` は rustls 比で低下）。
-- 単一クライアント IP 負荷では **`cbpf` が 1 ワーカーに集約**して 4 コアを使い切れず、`kernel` 分散が有利。
+- `cbpf` と `kernel` の振り分けは同等（`h2_1_ktls_0_lb_{cbpf,kernel}_ofc_1` の HTTP/1.1 で 9,721 / 9,667）。B-76 以前は cBPF が全接続をワーカー 0 に寄せていた。
 - 過去計測（2026-07-06）で異常だった「`feat_proxy` HTTP/1.1 の wrk 完了 0」「`kernel` +
   HTTP/2 + `ktls_1` の激減」「HTTP/2 逆プロキシの 5xx 混入」は、それぞれ
   B-25（splice `SPLICE_F_MORE`）/ B-27（`write_all` short write）/ B-28（バックエンド接続
@@ -325,11 +327,9 @@ target  config  proto  iteration  req_per_sec  transfer  lat_avg  lat_p99  non2x
 
 ### 適用例
 
-F-158（HTTP/2 インライン初回 poll）の A/B 結果と生データは
-[docs/perf/README.md](../../docs/perf/README.md) の F-158 節、および
-[`docs/perf/freebsd_results_raw.tsv`](../../docs/perf/freebsd_results_raw.tsv) /
-[`docs/perf/results_raw.tsv`](../../docs/perf/results_raw.tsv) 末尾の
-`# ==== 2026-08-22 F-158 交互 A/B ...` 節を参照。
+F-158（HTTP/2 インライン初回 poll）の A/B 結果は
+[F-158 のチケット](../../docs/backlog/features/F-158-h2-inline-first-poll.md) を参照
+（`docs/perf` は最新の計測だけを載せるため、過去の A/B の生データは git 履歴にある）。
 **同一の変更が kqueue で +27.3%、io_uring で −4.6% と正反対になった**ため、
 **ホットパス最適化は必ず両バックエンドで A/B を取ること**。
 
