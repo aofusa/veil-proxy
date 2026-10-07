@@ -6,7 +6,11 @@ set -euo pipefail
 VEIL_HOST="${VEIL_HOST:-veil-proxy}"
 VEIL_HTTP3_PORT="${VEIL_HTTP3_PORT:-443}"
 VEIL_HTTPS_PORT="${VEIL_HTTPS_PORT:-443}"
-H3SPEC_TIMEOUT="${H3SPEC_TIMEOUT:-60}"
+# H3SPEC_TIMEOUT: h3spec 全体の上限（秒）。H3SPEC_CASE_TIMEOUT_MS: 1 ケースの応答待ち（ms）。
+# 1 ケースの待ちを全体と同じ値にすると、応答を返さないケース（＝サーバが黙って捨てるのが
+# 正しい挙動のものを含む）1 件で全体が打ち切られ、残りのケースが一度も走らない。
+H3SPEC_TIMEOUT="${H3SPEC_TIMEOUT:-300}"
+H3SPEC_CASE_TIMEOUT_MS="${H3SPEC_CASE_TIMEOUT_MS:-3000}"
 # H3SPEC_STRICT=1: h3spec 失敗をゲート失敗にする（既定 0 = 観測＋post-health のみ）
 H3SPEC_STRICT="${H3SPEC_STRICT:-0}"
 # H3SPEC_REQUIRED=1: バイナリ未導入を失敗にする（既定 0 = SKIP）
@@ -51,7 +55,7 @@ fails=0
 set +e
 timeout "${H3SPEC_TIMEOUT}" h3spec \
     -n \
-    -t "$((H3SPEC_TIMEOUT * 1000))" \
+    -t "${H3SPEC_CASE_TIMEOUT_MS}" \
     "${VEIL_HOST}" "${VEIL_HTTP3_PORT}" \
     >>"${RESULTS}" 2>&1
 rc=$?
