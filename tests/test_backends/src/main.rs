@@ -494,6 +494,11 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(9009);
+    // B-93 の回帰テスト専用（他テストと上流プールを共有しないよう別ポートで同じ挙動を返す）
+    let bad_b93_port: u16 = std::env::var("BAD_B93_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9010);
     let chunked_port: u16 = std::env::var("CHUNKED_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -516,6 +521,7 @@ async fn main() {
     let ws_addr: SocketAddr = format!("127.0.0.1:{}", ws_port).parse().unwrap();
     let error_addr: SocketAddr = format!("127.0.0.1:{}", error_port).parse().unwrap();
     let bad_addr: SocketAddr = format!("127.0.0.1:{}", bad_port).parse().unwrap();
+    let bad_b93_addr: SocketAddr = format!("127.0.0.1:{}", bad_b93_port).parse().unwrap();
     let chunked_addr: SocketAddr = format!("127.0.0.1:{}", chunked_port).parse().unwrap();
     let echo_addr: SocketAddr = format!("127.0.0.1:{}", echo_port).parse().unwrap();
     let tls_echo_addr: SocketAddr = format!("127.0.0.1:{}", tls_echo_port).parse().unwrap();
@@ -534,5 +540,6 @@ async fn main() {
         run_tls_echo_server(tls_echo_addr, tls_cert, tls_key),
         run_udp_echo_server(udp_echo_addr),
         run_bad_backend_server(bad_addr),
+        run_bad_backend_server(bad_b93_addr),
     );
 }

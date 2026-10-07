@@ -64,6 +64,7 @@ BACKEND_GRPC2_PORT=9014
 BACKEND_WS_PORT=9005
 BACKEND_ERROR_PORT=9006
 BACKEND_BAD_PORT=9009
+BACKEND_BAD_B93_PORT=9010
 BACKEND_CHUNKED_PORT=9007
 BACKEND_ECHO_PORT=9008
 BACKEND_TLS_ECHO_PORT=9018
@@ -750,6 +751,15 @@ servers = [
     "http://127.0.0.1:${BACKEND_BAD_PORT}"
 ]
 
+# B-93 の回帰テスト専用。bad-pool と同じ挙動の別ポートにし、上流コネクションプールを
+# 他のテスト（並列実行）と共有しない（共有すると、他テストが直前 1ms 未満に返却した
+# 閉じかけの接続を拾い得る＝B-93 の既知の窓で、テストがフレークする）。
+[upstreams."bad-b93-pool"]
+algorithm = "round_robin"
+servers = [
+    "http://127.0.0.1:${BACKEND_BAD_B93_PORT}"
+]
+
 # SNI 上書き検証用（IP 直打ち + sni_name = localhost）
 [upstreams."sni-pool"]
 algorithm = "round_robin"
@@ -1333,6 +1343,14 @@ path = "/bad-backend/*"
 [route.action]
 type = "Proxy"
 upstream = "bad-pool"
+
+[[route]]
+[route.conditions]
+host = "127.0.0.1"
+path = "/bad-backend-b93/*"
+[route.action]
+type = "Proxy"
+upstream = "bad-b93-pool"
 
 # B-10: Round Robin 分散テスト専用ルート（共有 "/" と RR ステートを隔離）
 [[route]]
@@ -2083,7 +2101,7 @@ start_servers() {
     # テストバックエンド起動（WebSocket Echo + HTTP 500エラー + chunked ストリーミング）
     # ビルドは ensure_veil_binary で完了済み
     log_info "Starting Rust test backends (WS echo + HTTP error + chunked + body-echo)..."
-    WS_PORT="${BACKEND_WS_PORT}" ERROR_PORT="${BACKEND_ERROR_PORT}" BAD_PORT="${BACKEND_BAD_PORT}" CHUNKED_PORT="${BACKEND_CHUNKED_PORT}" ECHO_PORT="${BACKEND_ECHO_PORT}" \
+    WS_PORT="${BACKEND_WS_PORT}" ERROR_PORT="${BACKEND_ERROR_PORT}" BAD_PORT="${BACKEND_BAD_PORT}" BAD_B93_PORT="${BACKEND_BAD_B93_PORT}" CHUNKED_PORT="${BACKEND_CHUNKED_PORT}" ECHO_PORT="${BACKEND_ECHO_PORT}" \
         TLS_ECHO_PORT="${BACKEND_TLS_ECHO_PORT}" TLS_CERT_PATH="${FIXTURES_DIR}/cert.pem" TLS_KEY_PATH="${FIXTURES_DIR}/key.pem" \
         UDP_ECHO_PORT="${BACKEND_UDP_ECHO_PORT}" \
         RUST_LOG=info "${SCRIPT_DIR}/test_backends/target/debug/test-backends" \
@@ -2094,7 +2112,7 @@ start_servers() {
     # test_backendsの起動待機（全ポートがリッスン状態になるまで）
     local tb_wait=0
     while [ $tb_wait -lt 30 ]; do
-        if check_port_in_use "$BACKEND_WS_PORT" && check_port_in_use "$BACKEND_ERROR_PORT" && check_port_in_use "$BACKEND_CHUNKED_PORT" && check_port_in_use "$BACKEND_ECHO_PORT" && check_port_in_use "$BACKEND_TLS_ECHO_PORT" && check_port_in_use "$BACKEND_BAD_PORT" && check_port_in_use "$BACKEND_UDP_ECHO_PORT"; then
+        if check_port_in_use "$BACKEND_WS_PORT" && check_port_in_use "$BACKEND_ERROR_PORT" && check_port_in_use "$BACKEND_CHUNKED_PORT" && check_port_in_use "$BACKEND_ECHO_PORT" && check_port_in_use "$BACKEND_TLS_ECHO_PORT" && check_port_in_use "$BACKEND_BAD_PORT" && check_port_in_use "$BACKEND_BAD_B93_PORT" && check_port_in_use "$BACKEND_UDP_ECHO_PORT"; then
             sleep 0.2
             break
         fi
@@ -2273,7 +2291,7 @@ check_port_conflicts() {
     log_info "Checking for port conflicts..."
     local conflicts=0
     
-    for port in $PROXY_HTTPS_PORT $PROXY_HTTP_PORT $PROXY_H2C_PORT $PROXY_L4_PORT $PROXY_L4_LEAST_CONN_PORT $PROXY_L4_TERMINATE_PORT $PROXY_L4_UDP_PORT $PROXY_L4_WASM_PORT $BACKEND1_PORT $BACKEND2_PORT $BACKEND_H2C_PORT $BACKEND_GRPC_PORT $BACKEND_GRPC2_PORT $BACKEND_WS_PORT $BACKEND_ERROR_PORT $BACKEND_BAD_PORT $BACKEND_CHUNKED_PORT $BACKEND_ECHO_PORT $BACKEND_TLS_ECHO_PORT $BACKEND_UDP_ECHO_PORT; do
+    for port in $PROXY_HTTPS_PORT $PROXY_HTTP_PORT $PROXY_H2C_PORT $PROXY_L4_PORT $PROXY_L4_LEAST_CONN_PORT $PROXY_L4_TERMINATE_PORT $PROXY_L4_UDP_PORT $PROXY_L4_WASM_PORT $BACKEND1_PORT $BACKEND2_PORT $BACKEND_H2C_PORT $BACKEND_GRPC_PORT $BACKEND_GRPC2_PORT $BACKEND_WS_PORT $BACKEND_ERROR_PORT $BACKEND_BAD_PORT $BACKEND_BAD_B93_PORT $BACKEND_CHUNKED_PORT $BACKEND_ECHO_PORT $BACKEND_TLS_ECHO_PORT $BACKEND_UDP_ECHO_PORT; do
         if check_port_in_use "$port"; then
             log_error "Port $port is already in use"
             conflicts=$((conflicts + 1))

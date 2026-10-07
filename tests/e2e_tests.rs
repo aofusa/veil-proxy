@@ -18066,7 +18066,8 @@ async fn test_b93_pooled_upstream_closed_while_idle_is_not_reused() {
     // hyper クライアントは keep-alive で同じ接続（= 同じ veil ワーカー）を使い回す。
     let client = Http1TestClient::new_https("127.0.0.1", PROXY_PORT).expect("client");
     for i in 0..3 {
-        let res = tokio::time::timeout(Duration::from_secs(8), client.get("/bad-backend/ok"))
+        // 専用ルート（上流プールを他テストと共有しない。e2e_setup.sh の bad-b93-pool 参照）
+        let res = tokio::time::timeout(Duration::from_secs(8), client.get("/bad-backend-b93/ok"))
             .await
             .expect("must not hang")
             .expect("must succeed");
