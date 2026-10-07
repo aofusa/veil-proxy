@@ -1678,6 +1678,8 @@ pub fn run() {
                                                 "[H2C Worker] Unknown protocol from {}, closing connection",
                                                 peer_addr
                                             );
+                                            // RFC 9113 §3.4: GOAWAY(PROTOCOL_ERROR) を返して閉じる。
+                                            crate::proxy::reject_h2c_invalid_preface(stream).await;
                                         }
                                     }
                                 });

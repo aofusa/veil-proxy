@@ -4380,6 +4380,35 @@ pub async fn detect_protocol_with_buffer(stream: &mut TcpStream) -> (ProtocolTyp
     (ProtocolType::Unknown, Vec::new())
 }
 
+/// h2c 専用リスナーで HTTP/2 プリフェース以外を受けた接続を閉じる（エラー経路のみ）。
+///
+/// RFC 9113 §3.4: 不正なプリフェースは PROTOCOL_ERROR のコネクションエラー。固定の
+/// GOAWAY(last_stream_id=0, PROTOCOL_ERROR) を送り、送信側を閉じてから相手の close まで
+/// （時間・量の上限付きで）読み捨てる。未読データを残して close すると TCP は FIN ではなく
+/// RST を送り、相手が GOAWAY を読む前に捨てられ得る（h2spec 3.5/2 で検出）。
+#[cfg(feature = "http2")]
+pub async fn reject_h2c_invalid_preface(mut stream: TcpStream) {
+    const LINGER: Duration = Duration::from_millis(500);
+    const MAX_DRAIN: usize = 64 * 1024;
+    // length=8, type=GOAWAY(0x7), flags=0, stream=0 / last_stream_id=0, error=PROTOCOL_ERROR(0x1)
+    const GOAWAY_PROTOCOL_ERROR: [u8; 17] = [0, 0, 8, 0x7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x1];
+    let _ = timeout(LINGER, stream.write_all(GOAWAY_PROTOCOL_ERROR.to_vec())).await;
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let _ = timeout(LINGER, async {
+        let mut drained = 0usize;
+        let mut buf = vec![0u8; 4096];
+        while drained < MAX_DRAIN {
+            let (res, b) = stream.read(buf).await;
+            buf = b;
+            match res {
+                Ok(n) if n > 0 => drained += n,
+                _ => break,
+            }
+        }
+    })
+    .await;
+}
+
 /// H2Cサーバー接続処理
 ///
 /// TLSなしでHTTP/2コネクションを確立し、リクエストを処理します。
