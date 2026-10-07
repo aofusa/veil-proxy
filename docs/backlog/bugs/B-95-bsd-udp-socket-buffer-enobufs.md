@@ -17,7 +17,7 @@ FreeBSD aarch64 の h3 計測で、クライアント送信の約 14% が失わ�
 
 ## 修正
 
-`set_socket_buffer_best_effort`: 2MB から 1/8 ずつ下げて通る最大値を設定する（下限 256KB、
+`set_socket_buffer_best_effort`: 2MB から 1/8 ずつ下げて通る最大値を設定する（下限 64KB。NetBSD の既定 `kern.sbmax` は 256KB で実効上限が約 230KB のため、当初の下限 256KB では NetBSD で一度も設定できなかった。
 起動時 1 回のコールドパス）。下限でも通らなければ警告ログを出す。Linux 経路は無変更。
 
 計測ツール `tools/perf/h3load` も同じ問題を抱えていた（quinn の既定ソケット）ため、

@@ -1274,8 +1274,12 @@ pub fn create_recv_buffer() -> Vec<u8> {
 const QUIC_SOCKET_BUFFER_WANT: libc::c_int = 2 * 1024 * 1024;
 
 /// 下限。これ未満まで下げても通らない環境では諦めて OS 既定のままにする。
+///
+/// NetBSD の既定 `kern.sbmax` は 256KB で、mbuf のオーバーヘッドを差し引いた実効上限は
+/// それより小さい（約 230KB）。下限を 256KB にしていたときは NetBSD で一度も設定できず
+/// 既定（約 40KB）のまま残っていたので、64KB まで下げて通る最大値を探す。
 #[cfg(all(not(target_os = "linux"), unix))]
-const QUIC_SOCKET_BUFFER_MIN: libc::c_int = 256 * 1024;
+const QUIC_SOCKET_BUFFER_MIN: libc::c_int = 64 * 1024;
 
 /// B-95: `SO_RCVBUF`/`SO_SNDBUF` を「通る最大値」で設定する。設定できたサイズを返す。
 ///
