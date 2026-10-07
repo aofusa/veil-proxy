@@ -25,7 +25,8 @@ crates.io の [`wasmtime` 36.0.17](https://crates.io/crates/wasmtime/36.0.17)（
 
 - `[package] name = "wasmtime"` → `name = "veil-wasmtime"`。
   **`[lib] name = "wasmtime"` は変更していない。**
-- `[lints.rust]` に `dead_code = "allow"` を追加。
+- `[lints.rust]` に `dead_code = "allow"` と `unused_variables = "allow"` を追加
+  （no-signals ビルドで cfg により使われなくなる項目・引数の警告。36.0.17 で後者が増えた）。
 - `[[test]]`（crates.io 版の統合テスト宣言。`tests/` を取り込んでいないため）を削除。
 - `[lints.rust]` の `unused-lifetimes` / `unused-macro-rules` をアンダースコア表記
   （`unused_lifetimes` / `unused_macro_rules`）へ変更。cargo 1.99 以降はハイフン表記を
@@ -137,3 +138,10 @@ cargo が `error: multiple workspace roots found in the same workspace` を返�
    （新バージョンで `build.rs` の周辺コードが変わっている場合は手動でマージ）、
    Linux ホストでの `cargo build --features full` / `cargo clippy` / `cargo fmt --check` が
    ゼロ警告で通ることを確認する。
+
+### 3. `src/runtime/vm/stack_switching/stack/unix.rs`（警告修正のみ・挙動不変）
+
+`wasmtime_continuation_start as usize` を `wasmtime_continuation_start as *const () as usize` に
+した（新しい rustc の `function_casts_as_integer` lint が警告する関数アイテムの直接キャスト。
+lint 名で allow すると、この lint を知らない古い rustc（BSD の pkg 版など）で `unknown lint`
+警告になるため、lint の提案どおりにソースを直した。得られるアドレスは同じ）。

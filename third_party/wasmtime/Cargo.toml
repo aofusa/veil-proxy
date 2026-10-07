@@ -521,6 +521,9 @@ priority = -1
 # dead_code 警告になる。第三者コード（vendoring）に個別 #[allow] のパッチを
 # 重ねたくないため、crate 単位でこの警告のみ許可する。
 dead_code = "allow"
+# 36.0.17 の no-signals ビルドでは cfg で使われなくなった引数が unused_variables になる
+# （NetBSD x86_64 で 46 件）。dead_code と同じ理由で crate 単位で許可する。
+unused_variables = "allow"
 trivial_numeric_casts = "warn"
 unstable_features = "warn"
 # cargo 1.99 以降はハイフン表記を非推奨としてビルドのたびに manifest 警告を出すため
