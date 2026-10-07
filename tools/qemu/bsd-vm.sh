@@ -1206,9 +1206,13 @@ cmd_sync() {
     # members 書き換えが走らずにビルドが壊れるのを防ぐ（2026-10、Apple Silicon で実測）。
     # `tools/*/results` は git 管理外の計測・検査結果で、container_security の cargo-target が
     # 2.4GB あり毎回ゲストへ送っていた（NetBSD はルート FS が 1.8GB しかない）ので除外する。
+    # メンバー名は `./` 無し（`tools/...`）なので、GNU tar では `./` 付きのパターンが一致しない
+    # （macOS の bsdtar は一致する）。両方の形を書く。root 所有の sanitizer ビルド成果物を
+    # 読もうとして Permission denied で同期ごと失敗した（Linux ホスト、2026-10-07）。
     (cd "${ROOT}" && tar czf - \
         --exclude='./target' --exclude='*/target' --exclude='.git' --exclude='*.sock' --no-xattrs \
         --exclude='./tools/container_security/results' --exclude='./tools/perf/results' \
+        --exclude='tools/container_security/results' --exclude='tools/perf/results' \
         src benches tests examples contrib docker/assets third_party tools \
         Cargo.toml Cargo.lock build.rs clippy.toml .cargo) \
       | cmd_ssh "cd ${GUEST_ROOT} \
