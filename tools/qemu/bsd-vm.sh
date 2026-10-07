@@ -1204,8 +1204,11 @@ cmd_sync() {
     # tar がエラー終了扱いになる。`--no-xattrs` は macOS の `com.apple.macl`（SIP 保護で
     # 消せない拡張属性）をゲストが復元できずに展開がエラー終了し、`&&` の後ろの
     # members 書き換えが走らずにビルドが壊れるのを防ぐ（2026-10、Apple Silicon で実測）。
+    # `tools/*/results` は git 管理外の計測・検査結果で、container_security の cargo-target が
+    # 2.4GB あり毎回ゲストへ送っていた（NetBSD はルート FS が 1.8GB しかない）ので除外する。
     (cd "${ROOT}" && tar czf - \
         --exclude='./target' --exclude='*/target' --exclude='.git' --exclude='*.sock' --no-xattrs \
+        --exclude='./tools/container_security/results' --exclude='./tools/perf/results' \
         src benches tests examples contrib docker/assets third_party tools \
         Cargo.toml Cargo.lock build.rs clippy.toml .cargo) \
       | cmd_ssh "cd ${GUEST_ROOT} \
