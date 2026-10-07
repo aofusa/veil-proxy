@@ -84,6 +84,102 @@ fn h3_request_header_block_size(headers: &[h3::Header]) -> usize {
         .sum()
 }
 
+/// HTTP/3 のフィールドセクション（HEADERS フレーム）の検査結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum H3FieldSection {
+    /// 疑似ヘッダを持ち、リクエストの必須要件を満たす（新規リクエスト）。
+    Request,
+    /// 疑似ヘッダを 1 つも持たない（既存ストリームなら trailers、新規ストリームなら malformed）。
+    NoPseudo,
+}
+
+/// HTTP/3 の H3_MESSAGE_ERROR（RFC 9114 §8.1）。
+const H3_MESSAGE_ERROR: u64 = 0x10e;
+
+/// RFC 9114 §4.1.2 / §4.2 / §4.3.1 に従ってフィールドセクションを検査する。
+///
+/// `Err` は malformed（呼び出し側が H3_MESSAGE_ERROR で扱う）。検査するのは
+/// 疑似ヘッダの重複・未知/禁止（`:status`、拡張 CONNECT を広告していないので `:protocol` も）・
+/// 通常フィールドの後ろの疑似ヘッダ・大文字のフィールド名・接続固有フィールド・
+/// リクエストの必須疑似ヘッダ（CONNECT とそれ以外で異なる）。
+///
+/// quiche の h3 層はこれらを検査しないため、無ければ `:method` 欠落を GET と見なす等で
+/// malformed なリクエストに 200 を返していた（h3spec で検出）。
+///
+/// ホットパス（リクエストごと）: 確保なし・フィールド列を 1 回走査するだけ。
+fn h3_check_field_section<'a, I>(fields: I) -> Result<H3FieldSection, &'static str>
+where
+    I: IntoIterator<Item = (&'a [u8], &'a [u8])>,
+{
+    const METHOD: u8 = 1;
+    const SCHEME: u8 = 2;
+    const AUTHORITY: u8 = 4;
+    const PATH: u8 = 8;
+    let mut seen: u8 = 0;
+    let mut regular_seen = false;
+    let mut is_connect = false;
+    let mut host_seen = false;
+    let mut scheme_needs_authority = false;
+    for (name, value) in fields {
+        if let Some(pseudo) = name.strip_prefix(b":") {
+            if regular_seen {
+                return Err("pseudo-header after regular field");
+            }
+            let bit = match pseudo {
+                b"method" => METHOD,
+                b"scheme" => SCHEME,
+                b"authority" => AUTHORITY,
+                b"path" => PATH,
+                _ => return Err("unknown or prohibited pseudo-header"),
+            };
+            if seen & bit != 0 {
+                return Err("duplicated pseudo-header");
+            }
+            seen |= bit;
+            if bit == METHOD {
+                is_connect = value == b"CONNECT";
+            } else if bit == SCHEME {
+                scheme_needs_authority = value == b"https" || value == b"http";
+            } else if bit == PATH && value.is_empty() {
+                return Err("empty :path");
+            }
+        } else {
+            regular_seen = true;
+            if name.iter().any(u8::is_ascii_uppercase) {
+                return Err("uppercase field name");
+            }
+            match name {
+                b"connection" | b"keep-alive" | b"proxy-connection" | b"transfer-encoding"
+                | b"upgrade" => return Err("connection-specific field"),
+                b"te" if value != b"trailers" => return Err("te other than trailers"),
+                b"host" => host_seen = true,
+                _ => {}
+            }
+        }
+    }
+    if seen == 0 {
+        return Ok(H3FieldSection::NoPseudo);
+    }
+    if seen & METHOD == 0 {
+        return Err("missing :method");
+    }
+    if is_connect {
+        // §4.4: CONNECT は :scheme と :path を省き、:authority を必須とする。
+        if seen & (SCHEME | PATH) != 0 {
+            return Err("CONNECT with :scheme or :path");
+        }
+        if seen & AUTHORITY == 0 {
+            return Err("CONNECT without :authority");
+        }
+    } else if seen & (SCHEME | PATH) != (SCHEME | PATH) {
+        return Err("missing :scheme or :path");
+    } else if scheme_needs_authority && seen & AUTHORITY == 0 && !host_seen {
+        // §4.3.1: http/https は authority 成分が必須 → :authority か Host のどちらかが要る。
+        return Err("missing :authority and host");
+    }
+    Ok(H3FieldSection::Request)
+}
+
 /// memfd_create システムコールのラッパー（セキュリティ強化版）
 ///
 /// 匿名のメモリファイルを作成します。このファイルはファイルシステム上には
@@ -870,7 +966,35 @@ impl Http3Handler {
                             list.len()
                         );
                         did_work = true;
-                        new_headers.push((stream_id, list, more_frames));
+                        let section =
+                            h3_check_field_section(list.iter().map(|h| (h.name(), h.value())));
+                        // 既にリクエストを受け付けたストリームの 2 つ目のセクションは trailers。
+                        let known_stream = self.proxy_streams.contains_key(&stream_id)
+                            || self.buffered_reqs.contains_key(&stream_id)
+                            || new_headers.iter().any(|(id, _, _)| *id == stream_id);
+                        match section {
+                            Ok(H3FieldSection::Request) if !known_stream => {
+                                new_headers.push((stream_id, list, more_frames));
+                            }
+                            // trailers: 転送しない（従来は新規リクエストとして再分類していた）。
+                            Ok(H3FieldSection::NoPseudo) if known_stream => {}
+                            other => {
+                                let reason = match other {
+                                    Err(r) => r,
+                                    Ok(H3FieldSection::Request) => "pseudo-headers in trailers",
+                                    Ok(H3FieldSection::NoPseudo) => "missing :method",
+                                };
+                                // RFC 9114 §4.1.2: malformed はストリームエラー
+                                // H3_MESSAGE_ERROR。§8 によりコネクションエラーとして扱ってよく、
+                                // 不正なクライアントとの接続を残す理由が無いため接続ごと閉じる。
+                                warn!(
+                                    "[HTTP/3] malformed request on stream {} from {}: {}",
+                                    stream_id, self.peer_addr, reason
+                                );
+                                let _ = self.conn.close(true, H3_MESSAGE_ERROR, reason.as_bytes());
+                                break;
+                            }
+                        }
                     }
                     Ok((stream_id, h3::Event::Data)) => {
                         did_work = true;
@@ -5854,6 +5978,89 @@ fn parse_status_code(header: &[u8]) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn check(fields: &[(&str, &str)]) -> Result<H3FieldSection, &'static str> {
+        h3_check_field_section(fields.iter().map(|(n, v)| (n.as_bytes(), v.as_bytes())))
+    }
+
+    const GOOD: [(&str, &str); 4] = [
+        (":method", "GET"),
+        (":scheme", "https"),
+        (":authority", "example.com"),
+        (":path", "/"),
+    ];
+
+    #[test]
+    fn test_h3_field_section_accepts_valid_request_and_trailers() {
+        assert_eq!(check(&GOOD), Ok(H3FieldSection::Request));
+        let mut with_regular = GOOD.to_vec();
+        with_regular.push(("user-agent", "x"));
+        with_regular.push(("te", "trailers"));
+        assert_eq!(check(&with_regular), Ok(H3FieldSection::Request));
+        // :authority は Host で代替できる。
+        assert_eq!(
+            check(&[
+                (":method", "GET"),
+                (":scheme", "https"),
+                (":path", "/"),
+                ("host", "example.com"),
+            ]),
+            Ok(H3FieldSection::Request)
+        );
+        assert_eq!(
+            check(&[(":method", "CONNECT"), (":authority", "example.com:443")]),
+            Ok(H3FieldSection::Request)
+        );
+        assert_eq!(check(&[("grpc-status", "0")]), Ok(H3FieldSection::NoPseudo));
+        assert_eq!(check(&[]), Ok(H3FieldSection::NoPseudo));
+    }
+
+    #[test]
+    fn test_h3_field_section_rejects_malformed_requests() {
+        // h3spec: duplicated / absent / prohibited / after regular fields
+        let mut dup = GOOD.to_vec();
+        dup.insert(1, (":method", "GET"));
+        assert!(check(&dup).is_err());
+        assert!(check(&[(":scheme", "https"), (":path", "/")]).is_err());
+        assert!(check(&[(":method", "GET"), (":path", "/")]).is_err());
+        // https なのに :authority も Host も無い
+        assert!(check(&[(":method", "GET"), (":scheme", "https"), (":path", "/")]).is_err());
+        assert!(check(&[(":method", "GET"), (":scheme", "https")]).is_err());
+        let mut status = GOOD.to_vec();
+        status.push((":status", "200"));
+        assert!(check(&status).is_err());
+        let mut protocol = GOOD.to_vec();
+        protocol.push((":protocol", "websocket"));
+        assert!(check(&protocol).is_err());
+        assert!(check(&[
+            (":method", "GET"),
+            (":scheme", "https"),
+            ("user-agent", "x"),
+            (":path", "/"),
+        ])
+        .is_err());
+        // その他の malformed
+        let mut empty_path = GOOD.to_vec();
+        empty_path[3] = (":path", "");
+        assert!(check(&empty_path).is_err());
+        for bad in [
+            ("Host", "example.com"),
+            ("connection", "close"),
+            ("transfer-encoding", "chunked"),
+            ("te", "gzip"),
+        ] {
+            let mut v = GOOD.to_vec();
+            v.push(bad);
+            assert!(check(&v).is_err(), "{bad:?} must be rejected");
+        }
+        assert!(check(&[
+            (":method", "CONNECT"),
+            (":scheme", "https"),
+            (":authority", "a")
+        ])
+        .is_err());
+        assert!(check(&[(":method", "CONNECT")]).is_err());
+    }
 
     #[test]
     fn test_b94_derive_server_cid_is_deterministic_and_keyed() {

@@ -2968,6 +2968,10 @@ impl<F: BufFactory> Connection<F> {
             drop_pkt_on_err(e, self.recv_count, self.is_server, &self.trace_id)
         })?;
 
+        // veil: decrypt_hdr はヘッダ保護を外した先頭バイトを buf[0] へ書き戻す。
+        // 予約ビットの検査はペイロードの認証が通った後に行う（下記）。
+        let first_byte = b.buf()[0];
+
         let pn = packet::decode_pkt_num(
             self.pkt_num_spaces[epoch].largest_rx_pkt_num,
             hdr.pkt_num,
@@ -3040,6 +3044,14 @@ impl<F: BufFactory> Connection<F> {
         if self.pkt_num_spaces[epoch].recv_pkt_num.contains(pn) {
             trace!("{} ignored duplicate packet {}", self.trace_id, pn);
             return Err(Error::Done);
+        }
+
+        // veil: RFC 9000 §17.2 / §17.3.1 — 両方の保護を外した後に予約ビットが 0 でない
+        // パケットは PROTOCOL_VIOLATION のコネクションエラー（上流 quiche は未検査）。
+        // 認証済みのパケットに限って判定するので、偽造パケットで接続を切られることはない。
+        let reserved_mask = if hdr.ty == Type::Short { 0x18 } else { 0x0c };
+        if first_byte & reserved_mask != 0 {
+            return Err(Error::InvalidPacket);
         }
 
         // Packets with no frames are invalid.

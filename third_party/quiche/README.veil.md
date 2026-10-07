@@ -15,7 +15,7 @@ crates.io の [`quiche` 0.24.9](https://crates.io/crates/quiche/0.24.9) をそ�
 
 ## 差分
 
-### 1. `src/lib.rs`（挙動の変更はこれだけ）
+### 1. `src/lib.rs`: STREAM フレームの詰め合わせ
 
 `Connection::send_single` の STREAM フレーム生成ループ末尾:
 
@@ -51,10 +51,20 @@ incremental ストリームの末尾への並べ替え（ラウンドロビン�
 `[[example]]`（`examples/` を取り込んでいないため存在しないファイルを指す）を削除した。
 それ以外は無変更。
 
+### 4. `src/lib.rs`: 予約ビットの検査（B-100）
+
+`Connection::recv_single` で、ヘッダ保護を外した先頭バイトを `decrypt_hdr` 直後に控え、
+ペイロードの復号（＝認証）と重複判定の後に予約ビット（ロングヘッダ `0x0c`・ショートヘッダ
+`0x18`）が 0 でなければ `Error::InvalidPacket`（= PROTOCOL_VIOLATION の CONNECTION_CLOSE）
+を返す。RFC 9000 §17.2 / §17.3.1 の MUST で、upstream は検査していない（h3spec の
+「reserved bits in Handshake/Short are non-zero」で検出）。認証後にだけ判定するので、
+偽造パケットで接続を切らせることはできない。`grep -n 'veil: RFC 9000' src/lib.rs`。
+
 ## 追従手順
 
-quiche を更新するときは、新バージョンを同じ手順でコピーし直して上記 1・2 を再適用する
-（`grep -n 'Coalesce STREAM frames when fuzzing' src/lib.rs` で該当箇所が見つかる）。
+quiche を更新するときは、新バージョンを同じ手順でコピーし直して上記 1〜4 を再適用する
+（`grep -n 'Coalesce STREAM frames when fuzzing' src/lib.rs` と `grep -n 'veil:' src/lib.rs`
+で該当箇所が見つかる）。
 upstream がこの挙動を既定にした場合は vendoring を撤去し `[patch.crates-io]` を消す。
 
 ### 3. `src/crypto/boringssl.rs`（警告修正のみ・挙動不変）
