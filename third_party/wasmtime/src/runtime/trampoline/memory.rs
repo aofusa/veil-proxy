@@ -3,32 +3,33 @@ use crate::memory::{LinearMemory, MemoryCreator};
 use crate::prelude::*;
 use crate::runtime::vm::mpk::ProtectionKey;
 use crate::runtime::vm::{
-    CompiledModuleId, InstanceAllocationRequest, InstanceAllocator, Memory, MemoryAllocationIndex,
-    MemoryBase, ModuleRuntimeInfo, OnDemandInstanceAllocator, RuntimeLinearMemory,
-    RuntimeMemoryCreator, SharedMemory, Table, TableAllocationIndex,
+    CompiledModuleId, InstanceAllocationRequest, InstanceAllocatorImpl, Memory,
+    MemoryAllocationIndex, MemoryBase, ModuleRuntimeInfo, OnDemandInstanceAllocator,
+    RuntimeLinearMemory, RuntimeMemoryCreator, SharedMemory, Table, TableAllocationIndex,
 };
-use crate::store::{AllocateInstanceKind, InstanceId, StoreOpaque, StoreResourceLimiter};
+use crate::store::{AllocateInstanceKind, InstanceId, StoreOpaque};
 use alloc::sync::Arc;
 use wasmtime_environ::{
-    DefinedMemoryIndex, DefinedTableIndex, EntityIndex, HostPtr, Module, StaticModuleIndex,
-    Tunables, VMOffsets,
+    DefinedMemoryIndex, DefinedTableIndex, EntityIndex, HostPtr, Module, Tunables, VMOffsets,
 };
 
 #[cfg(feature = "component-model")]
-use wasmtime_environ::component::{Component, VMComponentOffsets};
+use wasmtime_environ::{
+    StaticModuleIndex,
+    component::{Component, VMComponentOffsets},
+};
 
 /// Create a "frankenstein" instance with a single memory.
 ///
 /// This separate instance is necessary because Wasm objects in Wasmtime must be
 /// attached to instances (versus the store, e.g.) and some objects exist
 /// outside: a host-provided memory import, shared memory.
-pub async fn create_memory(
+pub fn create_memory(
     store: &mut StoreOpaque,
-    limiter: Option<&mut StoreResourceLimiter<'_>>,
     memory_ty: &MemoryType,
     preallocation: Option<&SharedMemory>,
 ) -> Result<InstanceId> {
-    let mut module = Module::new(StaticModuleIndex::from_u32(0));
+    let mut module = Module::new();
 
     // Create a memory, though it will never be used for constructing a memory
     // with an allocator: instead the memories are either preallocated (i.e.,
@@ -51,16 +52,13 @@ pub async fn create_memory(
         ondemand: OnDemandInstanceAllocator::default(),
     };
     unsafe {
-        store
-            .allocate_instance(
-                limiter,
-                AllocateInstanceKind::Dummy {
-                    allocator: &allocator,
-                },
-                &ModuleRuntimeInfo::bare(Arc::new(module)),
-                Default::default(),
-            )
-            .await
+        store.allocate_instance(
+            AllocateInstanceKind::Dummy {
+                allocator: &allocator,
+            },
+            &ModuleRuntimeInfo::bare(Arc::new(module)),
+            Default::default(),
+        )
     }
 }
 
@@ -124,10 +122,9 @@ struct SingleMemoryInstance<'a> {
     ondemand: OnDemandInstanceAllocator,
 }
 
-#[async_trait::async_trait]
-unsafe impl InstanceAllocator for SingleMemoryInstance<'_> {
+unsafe impl InstanceAllocatorImpl for SingleMemoryInstance<'_> {
     #[cfg(feature = "component-model")]
-    fn validate_component<'a>(
+    fn validate_component_impl<'a>(
         &self,
         _component: &Component,
         _offsets: &VMComponentOffsets<HostPtr>,
@@ -136,18 +133,18 @@ unsafe impl InstanceAllocator for SingleMemoryInstance<'_> {
         unreachable!("`SingleMemoryInstance` allocator never used with components")
     }
 
-    fn validate_module(&self, module: &Module, offsets: &VMOffsets<HostPtr>) -> Result<()> {
+    fn validate_module_impl(&self, module: &Module, offsets: &VMOffsets<HostPtr>) -> Result<()> {
         anyhow::ensure!(
             module.memories.len() == 1,
             "`SingleMemoryInstance` allocator can only be used for modules with a single memory"
         );
-        self.ondemand.validate_module(module, offsets)?;
+        self.ondemand.validate_module_impl(module, offsets)?;
         Ok(())
     }
 
     #[cfg(feature = "gc")]
-    fn validate_memory(&self, memory: &wasmtime_environ::Memory) -> Result<()> {
-        self.ondemand.validate_memory(memory)
+    fn validate_memory_impl(&self, memory: &wasmtime_environ::Memory) -> Result<()> {
+        self.ondemand.validate_memory_impl(memory)
     }
 
     #[cfg(feature = "component-model")]
@@ -168,16 +165,18 @@ unsafe impl InstanceAllocator for SingleMemoryInstance<'_> {
         self.ondemand.decrement_core_instance_count();
     }
 
-    async fn allocate_memory(
+    fn allocate_memory(
         &self,
-        request: &mut InstanceAllocationRequest<'_, '_>,
+        request: &mut InstanceAllocationRequest,
         ty: &wasmtime_environ::Memory,
+        tunables: &Tunables,
         memory_index: Option<DefinedMemoryIndex>,
     ) -> Result<(MemoryAllocationIndex, Memory)> {
-        if cfg!(debug_assertions) {
+        #[cfg(debug_assertions)]
+        {
             let module = request.runtime_info.env_module();
             let offsets = request.runtime_info.offsets();
-            self.validate_module(module, offsets)
+            self.validate_module_impl(module, offsets)
                 .expect("should have already validated the module before allocating memory");
         }
 
@@ -186,11 +185,9 @@ unsafe impl InstanceAllocator for SingleMemoryInstance<'_> {
                 MemoryAllocationIndex::default(),
                 shared_memory.clone().as_memory(),
             )),
-            None => {
-                self.ondemand
-                    .allocate_memory(request, ty, memory_index)
-                    .await
-            }
+            None => self
+                .ondemand
+                .allocate_memory(request, ty, tunables, memory_index),
         }
     }
 
@@ -206,13 +203,14 @@ unsafe impl InstanceAllocator for SingleMemoryInstance<'_> {
         }
     }
 
-    async fn allocate_table(
+    fn allocate_table(
         &self,
-        req: &mut InstanceAllocationRequest<'_, '_>,
+        req: &mut InstanceAllocationRequest,
         ty: &wasmtime_environ::Table,
+        tunables: &Tunables,
         table_index: DefinedTableIndex,
     ) -> Result<(TableAllocationIndex, Table)> {
-        self.ondemand.allocate_table(req, ty, table_index).await
+        self.ondemand.allocate_table(req, ty, tunables, table_index)
     }
 
     unsafe fn deallocate_table(

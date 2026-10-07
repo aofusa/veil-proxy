@@ -1,5 +1,4 @@
-use crate::module::ModuleRegistry;
-use crate::runtime::vm::{self, GcStore, VMStore};
+use crate::runtime::vm::{self, VMStore};
 use crate::store::StoreOpaque;
 use crate::{StoreContext, StoreContextMut};
 use core::num::NonZeroU64;
@@ -252,31 +251,6 @@ impl StoreInstanceId {
     pub(crate) fn get_mut<'a>(&self, store: &'a mut StoreOpaque) -> Pin<&'a mut vm::Instance> {
         self.assert_belongs_to(store.id());
         store.instance_mut(self.instance)
-    }
-
-    /// Get both an instance handle and a borrow to the module
-    /// registry in the store.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `self` does not belong to `store`.
-    #[inline]
-    pub(crate) fn get_mut_and_module_registry<'a>(
-        &self,
-        store: &'a mut StoreOpaque,
-    ) -> (Pin<&'a mut vm::Instance>, &'a ModuleRegistry) {
-        self.assert_belongs_to(store.id());
-        store.instance_and_module_registry_mut(self.instance)
-    }
-
-    /// Same as [`Self::get_mut`], but also returns the `GcStore`.
-    #[inline]
-    pub(crate) fn get_with_gc_store_mut<'a>(
-        &self,
-        store: &'a mut StoreOpaque,
-    ) -> (Option<&'a mut GcStore>, Pin<&'a mut vm::Instance>) {
-        self.assert_belongs_to(store.id());
-        store.optional_gc_store_and_instance_mut(self.instance)
     }
 }
 

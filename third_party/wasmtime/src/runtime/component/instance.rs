@@ -12,7 +12,7 @@ use crate::runtime::vm::component::{
     CallContexts, ComponentInstance, ResourceTables, TypedResource, TypedResourceIndex,
 };
 use crate::runtime::vm::{self, VMFuncRef};
-use crate::store::{AsStoreOpaque, StoreOpaque};
+use crate::store::StoreOpaque;
 use crate::{AsContext, AsContextMut, Engine, Module, StoreContextMut};
 use alloc::sync::Arc;
 use core::marker;
@@ -378,11 +378,9 @@ impl Instance {
     pub(crate) fn resource_new32(
         self,
         store: &mut StoreOpaque,
-        caller: RuntimeComponentInstanceIndex,
         ty: TypeResourceTableIndex,
         rep: u32,
     ) -> Result<u32> {
-        self.id().get(store).check_may_leave(caller)?;
         let (calls, _, _, instance) = store.component_resource_state_with_instance(self);
         resource_tables(calls, instance).resource_new(TypedResource::Component { ty, rep })
     }
@@ -392,11 +390,9 @@ impl Instance {
     pub(crate) fn resource_rep32(
         self,
         store: &mut StoreOpaque,
-        caller: RuntimeComponentInstanceIndex,
         ty: TypeResourceTableIndex,
         index: u32,
     ) -> Result<u32> {
-        self.id().get(store).check_may_leave(caller)?;
         let (calls, _, _, instance) = store.component_resource_state_with_instance(self);
         resource_tables(calls, instance).resource_rep(TypedResourceIndex::Component { ty, index })
     }
@@ -405,11 +401,9 @@ impl Instance {
     pub(crate) fn resource_drop(
         self,
         store: &mut StoreOpaque,
-        caller: RuntimeComponentInstanceIndex,
         ty: TypeResourceTableIndex,
         index: u32,
     ) -> Result<Option<u32>> {
-        self.id().get(store).check_may_leave(caller)?;
         let (calls, _, _, instance) = store.component_resource_state_with_instance(self);
         resource_tables(calls, instance).resource_drop(TypedResourceIndex::Component { ty, index })
     }
@@ -465,122 +459,6 @@ impl Instance {
     pub(crate) fn lookup_vmdef(&self, store: &mut StoreOpaque, def: &CoreDef) -> vm::Export {
         lookup_vmdef(store, self.id.instance(), def)
     }
-
-    pub(crate) fn options<'a>(
-        &self,
-        store: &'a StoreOpaque,
-        options: OptionsIndex,
-    ) -> &'a CanonicalOptions {
-        &self.id.get(store).component().env_component().options[options]
-    }
-
-    fn options_memory_raw(
-        &self,
-        store: &StoreOpaque,
-        options: OptionsIndex,
-    ) -> Option<NonNull<vm::VMMemoryDefinition>> {
-        let instance = self.id.get(store);
-        let options = &instance.component().env_component().options[options];
-        let memory = match options.data_model {
-            CanonicalOptionsDataModel::Gc { .. } => return None,
-            CanonicalOptionsDataModel::LinearMemory(o) => match o.memory {
-                Some(m) => m,
-                None => return None,
-            },
-        };
-
-        Some(instance.runtime_memory(memory))
-    }
-
-    pub(crate) fn options_memory<'a>(
-        &self,
-        store: &'a StoreOpaque,
-        options: OptionsIndex,
-    ) -> &'a [u8] {
-        let memory = match self.options_memory_raw(store, options) {
-            Some(m) => m,
-            None => return &[],
-        };
-        // SAFETY: we're borrowing the entire `StoreOpaque` which owns the
-        // memory allocation to return the result of memory. That means that the
-        // lifetime connection here should be safe and the actual ptr/length are
-        // trusted parts of the runtime here.
-        unsafe {
-            let memory = memory.as_ref();
-            core::slice::from_raw_parts(memory.base.as_ptr(), memory.current_length())
-        }
-    }
-
-    pub(crate) fn options_memory_mut<'a>(
-        &self,
-        store: &'a mut StoreOpaque,
-        options: OptionsIndex,
-    ) -> &'a mut [u8] {
-        let memory = match self.options_memory_raw(store, options) {
-            Some(m) => m,
-            None => return &mut [],
-        };
-        // SAFETY: See `options_memory` comment above, and note that this is
-        // taking `&mut StoreOpaque` to thread the lifetime through instead.
-        unsafe {
-            let memory = memory.as_ref();
-            core::slice::from_raw_parts_mut(memory.base.as_ptr(), memory.current_length())
-        }
-    }
-
-    /// Helper function to simultaneously get a borrow to this instance's
-    /// component as well as the store that this component is contained within.
-    ///
-    /// Note that this function signature is not possible with safe Rust, so
-    /// this is using `unsafe` internally.
-    pub(crate) fn component_and_store_mut<'a, S>(
-        &self,
-        store: &'a mut S,
-    ) -> (&'a Component, &'a mut S)
-    where
-        S: AsStoreOpaque,
-    {
-        let store_opaque = store.as_store_opaque();
-        let instance = self.id.get_mut(store_opaque);
-        let component = instance.component();
-
-        // SAFETY: the goal of this function is to derive a pointer from
-        // `&mut S`, here `&Component`, and then return both so they can both be
-        // used at the same time. In general this is not safe operation since
-        // the original mutable pointer could be mutated or overwritten which
-        // would invalidate the derived pointer.
-        //
-        // In this case though we have a few guarantees which should make this
-        // safe:
-        //
-        // * Embedders never have the ability to overwrite a `StoreOpaque`. For
-        //   example the closest thing of `StoreContextMut` wraps up the
-        //   reference internally so it's inaccessible to the outside world.
-        //   This means that while mutations can still happen it's not possible
-        //   to overwrite a `StoreOpaque` directly.
-        //
-        // * Components are referred to by `vm::ComponentInstance` which holds a
-        //   strong reference. All `ComponentInstance` structures are allocated
-        //   within the store and unconditionally live as long as the entire
-        //   store itself. This means that there's no worry of the rooting
-        //   container going away or otherwise getting deallocated.
-        //
-        // * The `ComponentInstance` container has an invariant that after
-        //   creation the component used to create it cannot be changed. This is
-        //   enforced through `Pin<&mut ComponentInstance>` which disallows
-        //   mutable access to the `component` field, instead only allowing
-        //   read-only access.
-        //
-        // Putting all of this together it's not possible for a component,
-        // within a component instance, within a store, to be deallocated or mutated while
-        // a store is in use. Consequently it should be safe to simultaneously
-        // have a borrow to both at the same time, even if the store has a
-        // mutable borrow itself.
-        unsafe {
-            let component: *const Component = component;
-            (&*component, store)
-        }
-    }
 }
 
 /// Translates a `CoreDef`, a definition of a core wasm item, to an
@@ -605,15 +483,6 @@ pub(crate) fn lookup_vmdef(
             let id = StoreComponentInstanceId::new(store.id(), id);
             vm::Export::Global(crate::Global::from_component_flags(id, *idx))
         }
-        CoreDef::UnsafeIntrinsic(intrinsic) => {
-            let funcref = store
-                .store_data_mut()
-                .component_instance_mut(id)
-                .unsafe_intrinsic_func_ref(*intrinsic);
-            // SAFETY: as above, the `funcref` is owned by `store` and is valid
-            // within that store, so it's safe to create a `Func`.
-            vm::Export::Function(unsafe { crate::Func::from_vm_func_ref(store.id(), funcref) })
-        }
     }
 }
 
@@ -632,7 +501,7 @@ where
         .store_data_mut()
         .component_instance_mut(id)
         .instance(item.instance);
-    let (instance, registry) = store.instance_and_module_registry_mut(id);
+    let instance = store.instance_mut(id);
     let idx = match &item.item {
         ExportItem::Index(idx) => (*idx).into(),
 
@@ -649,7 +518,7 @@ where
     };
     // SAFETY: the `store_id` owns this instance and all exports contained
     // within.
-    unsafe { instance.get_export_by_index_mut(registry, store_id, idx) }
+    unsafe { instance.get_export_by_index_mut(store_id, idx) }
 }
 
 fn resource_tables<'a>(
@@ -738,13 +607,15 @@ pub(crate) enum RuntimeImport {
 pub type ImportedResources = PrimaryMap<ResourceIndex, ResourceType>;
 
 impl<'a> Instantiator<'a> {
+    /// Returns an error if `component` was not compiled by `store`'s engine.
     fn new(
         component: &'a Component,
         store: &mut StoreOpaque,
         imports: &'a Arc<PrimaryMap<RuntimeImportIndex, RuntimeImport>>,
     ) -> Result<Instantiator<'a>> {
         let env_component = component.env_component();
-        store.register_component(component)?;
+        let (modules, engine) = store.modules_and_engine_mut();
+        modules.register_component(component, engine)?;
         let imported_resources: ImportedResources =
             PrimaryMap::with_capacity(env_component.imported_resources.len());
 
@@ -765,7 +636,7 @@ impl<'a> Instantiator<'a> {
         })
     }
 
-    async fn run<T>(&mut self, store: &mut StoreContextMut<'_, T>) -> Result<()> {
+    fn run<T>(&mut self, store: &mut StoreContextMut<'_, T>) -> Result<()> {
         let env_component = self.component.env_component();
 
         // Before all initializers are processed configure all destructors for
@@ -800,31 +671,6 @@ impl<'a> Instantiator<'a> {
                 ptrs.wasm_call,
                 ptrs.array_call,
                 signature,
-            );
-        }
-
-        // Initialize the unsafe intrinsics used by this component, if any.
-        for (i, module_ty) in env_component
-            .unsafe_intrinsics
-            .iter()
-            .enumerate()
-            .filter_map(|(i, ty)| ty.expand().map(|ty| (i, ty)))
-        {
-            let i = u32::try_from(i).unwrap();
-            let intrinsic = UnsafeIntrinsic::from_u32(i);
-            let ptrs = self.component.unsafe_intrinsic_ptrs(intrinsic).expect(
-                "should have intrinsic pointers given that we assigned the intrinsic a type",
-            );
-            let shared_ty = self
-                .component
-                .signatures()
-                .shared_type(module_ty)
-                .expect("should have a shared type");
-            self.instance_mut(store.0).set_intrinsic(
-                intrinsic,
-                ptrs.wasm_call,
-                ptrs.array_call,
-                shared_ty,
             );
         }
 
@@ -870,7 +716,7 @@ impl<'a> Instantiator<'a> {
                     // if required.
 
                     let i = unsafe {
-                        crate::Instance::new_started(store, module, imports.as_ref()).await?
+                        crate::Instance::new_started_impl(store, module, imports.as_ref())?
                     };
                     self.instance_mut(store.0).push_instance_id(i.id());
                 }
@@ -928,11 +774,11 @@ impl<'a> Instantiator<'a> {
     }
 
     fn extract_memory(&mut self, store: &mut StoreOpaque, memory: &ExtractMemory) {
-        let import = match lookup_vmexport(store, self.id, &memory.export) {
-            crate::runtime::vm::Export::Memory(memory) => memory.vmimport(store),
-            crate::runtime::vm::Export::SharedMemory(_, import) => import,
+        let mem = match lookup_vmexport(store, self.id, &memory.export) {
+            crate::runtime::vm::Export::Memory { memory, .. } => memory,
             _ => unreachable!(),
         };
+        let import = mem.vmimport(store);
         self.instance_mut(store)
             .set_runtime_memory(memory.index, import.from.as_non_null());
     }
@@ -1040,7 +886,7 @@ impl<'a> Instantiator<'a> {
             return;
         }
 
-        let val = crate::Extern::from_wasmtime_export(export, store);
+        let val = unsafe { crate::Extern::from_wasmtime_export(export, store) };
         let ty = DefinitionType::from(store, &val);
         crate::types::matching::MatchCx::new(module.engine())
             .definition(&expected, &ty)
@@ -1147,7 +993,7 @@ impl<T: 'static> InstancePre<T> {
             !store.as_context().async_support(),
             "must use async instantiation when async support is enabled"
         );
-        vm::assert_ready(self._instantiate(store))
+        self.instantiate_impl(store)
     }
     /// Performs the instantiation process into the store specified.
     ///
@@ -1155,18 +1001,38 @@ impl<T: 'static> InstancePre<T> {
     //
     // TODO: needs more docs
     #[cfg(feature = "async")]
-    pub async fn instantiate_async(&self, store: impl AsContextMut<Data = T>) -> Result<Instance> {
-        self._instantiate(store).await
+    pub async fn instantiate_async(
+        &self,
+        mut store: impl AsContextMut<Data = T>,
+    ) -> Result<Instance>
+    where
+        T: Send,
+    {
+        let mut store = store.as_context_mut();
+        assert!(
+            store.0.async_support(),
+            "must use sync instantiation when async support is disabled"
+        );
+        store.on_fiber(|store| self.instantiate_impl(store)).await?
     }
 
-    async fn _instantiate(&self, mut store: impl AsContextMut<Data = T>) -> Result<Instance> {
+    fn instantiate_impl(&self, mut store: impl AsContextMut<Data = T>) -> Result<Instance> {
         let mut store = store.as_context_mut();
         store
             .engine()
             .allocator()
             .increment_component_instance_count()?;
-        let mut instantiator = Instantiator::new(&self.component, store.0, &self.imports)?;
-        instantiator.run(&mut store).await.map_err(|e| {
+        let mut instantiator = match Instantiator::new(&self.component, store.0, &self.imports) {
+            Ok(instantiator) => instantiator,
+            Err(e) => {
+                store
+                    .engine()
+                    .allocator()
+                    .decrement_component_instance_count();
+                return Err(e);
+            }
+        };
+        instantiator.run(&mut store).map_err(|e| {
             store
                 .engine()
                 .allocator()

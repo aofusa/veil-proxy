@@ -211,7 +211,14 @@ impl<T: 'static> Linker<T> {
     /// Returns an error if this linker doesn't define a name that the
     /// `component` imports or if a name defined doesn't match the type of the
     /// item imported by the `component` provided.
+    ///
+    /// Returns an error if `component` was not compiled by the same
+    /// [`Engine`](crate::Engine) as this linker.
     pub fn instantiate_pre(&self, component: &Component) -> Result<InstancePre<T>> {
+        ensure!(
+            Engine::same(&self.engine, component.engine()),
+            "cross-`Engine` instantiation is not currently supported"
+        );
         let cx = self.typecheck(&component)?;
 
         // A successful typecheck resolves all of the imported resources used by
@@ -337,7 +344,7 @@ impl<T: 'static> Linker<T> {
                     let fully_qualified_name = parent_instance
                         .map(|parent| format!("{parent}#{item_name}"))
                         .unwrap_or_else(|| item_name.to_owned());
-                    linker.func_new(&item_name, move |_, _, _, _| {
+                    linker.func_new(&item_name, move |_, _, _| {
                         bail!("unknown import: `{fully_qualified_name}` has not been defined")
                     })?;
                 }
@@ -515,9 +522,9 @@ impl<T: 'static> LinkerInstance<'_, T> {
     ///
     /// The closure `f` is provided an [`Accessor`] which can be used to acquire
     /// temporary, blocking, access to a [`StoreContextMut`] (through
-    /// [`Access`](crate::component::Access]). This models how a store is not
-    /// available to `f` across `await` points but it is temporarily available
-    /// while actively being polled.
+    /// [`Access`]). This models how a store is not available to `f` across
+    /// `await` points but it is temporarily available while actively being
+    /// polled.
     ///
     /// # Blocking / Async Behavior
     ///
@@ -635,7 +642,7 @@ impl<T: 'static> LinkerInstance<'_, T> {
     /// let mut linker = Linker::<()>::new(&engine);
     ///
     /// // Sample function that takes no arguments.
-    /// linker.root().func_new("thunk", |_store, _ty, params, results| {
+    /// linker.root().func_new("thunk", |_store, params, results| {
     ///     assert!(params.is_empty());
     ///     assert!(results.is_empty());
     ///     println!("Look ma, host hands!");
@@ -643,7 +650,7 @@ impl<T: 'static> LinkerInstance<'_, T> {
     /// })?;
     ///
     /// // This function takes one argument and returns one result.
-    /// linker.root().func_new("is-even", |_store, _ty, params, results| {
+    /// linker.root().func_new("is-even", |_store, params, results| {
     ///     assert_eq!(params.len(), 1);
     ///     let param = match params[0] {
     ///         Val::U32(n) => n,
@@ -665,10 +672,7 @@ impl<T: 'static> LinkerInstance<'_, T> {
     pub fn func_new(
         &mut self,
         name: &str,
-        func: impl Fn(StoreContextMut<'_, T>, types::ComponentFunc, &[Val], &mut [Val]) -> Result<()>
-        + Send
-        + Sync
-        + 'static,
+        func: impl Fn(StoreContextMut<'_, T>, &[Val], &mut [Val]) -> Result<()> + Send + Sync + 'static,
     ) -> Result<()> {
         self.insert(name, Definition::Func(HostFunc::new_dynamic(func)))?;
         Ok(())
@@ -685,7 +689,6 @@ impl<T: 'static> LinkerInstance<'_, T> {
     where
         F: for<'a> Fn(
                 StoreContextMut<'a, T>,
-                types::ComponentFunc,
                 &'a [Val],
                 &'a mut [Val],
             ) -> Box<dyn Future<Output = Result<()>> + Send + 'a>
@@ -697,9 +700,8 @@ impl<T: 'static> LinkerInstance<'_, T> {
             self.engine.config().async_support,
             "cannot use `func_new_async` without enabling async support in the config"
         );
-        let ff = move |store: StoreContextMut<'_, T>, ty, params: &[Val], results: &mut [Val]| {
-            store
-                .with_blocking(|store, cx| cx.block_on(Pin::from(f(store, ty, params, results)))?)
+        let ff = move |store: StoreContextMut<'_, T>, params: &[Val], results: &mut [Val]| {
+            store.with_blocking(|store, cx| cx.block_on(Pin::from(f(store, params, results)))?)
         };
         return self.func_new(name, ff);
     }
@@ -717,7 +719,6 @@ impl<T: 'static> LinkerInstance<'_, T> {
         T: 'static,
         F: for<'a> Fn(
                 &'a Accessor<T>,
-                types::ComponentFunc,
                 &'a [Val],
                 &'a mut [Val],
             ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>
@@ -829,11 +830,21 @@ impl<T: 'static> LinkerInstance<'_, T> {
                 let dtor = dtor.clone();
                 cx.as_context_mut().block_on(move |mut store| {
                     Box::pin(async move {
-                        let accessor =
-                            &Accessor::new(crate::store::StoreToken::new(store.as_context_mut()));
+                        // NOTE: We currently pass `None` as the `instance`
+                        // parameter to `Accessor::new` because we don't have ready
+                        // access to it, meaning `dtor` will panic if it tries to
+                        // use `Accessor::instance`.  We could plumb that through
+                        // from the `wasmtime-cranelift`-generated code, but we plan
+                        // to remove `Accessor::instance` once all instances in a
+                        // store share the same concurrent state, at which point we
+                        // won't need it anyway.
+                        let accessor = &Accessor::new(
+                            crate::store::StoreToken::new(store.as_context_mut()),
+                            None,
+                        );
                         let mut future = std::pin::pin!(dtor(accessor, param));
                         std::future::poll_fn(|cx| {
-                            crate::component::concurrent::tls::set(store.0, || {
+                            crate::component::concurrent::tls::set(store.0.traitobj_mut(), || {
                                 future.as_mut().poll(cx)
                             })
                         })

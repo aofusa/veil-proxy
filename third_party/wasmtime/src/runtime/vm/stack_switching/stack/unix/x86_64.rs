@@ -5,7 +5,7 @@
 // all the other bits. Documentation tries to reference various bits here and
 // there but try to make sure to read over everything before tweaking things!
 
-use core::arch::naked_asm;
+use wasmtime_asm_macros::asm_func;
 
 // This is a pretty special function that has no real signature. Its use is to
 // be the "base" function of all fibers. This entrypoint is used in
@@ -30,11 +30,9 @@ use core::arch::naked_asm;
 //
 // RSP: TOS - 0x40 - (16 * `args_capacity`)
 // RBP: TOS - 0x10
-
-#[unsafe(naked)]
-pub(crate) unsafe extern "C" fn wasmtime_continuation_start() {
-    naked_asm!(
-        "
+asm_func!(
+    "wasmtime_continuation_start",
+    "
         // TODO(frank-emrich): Restore DWARF information for this function. In
         // the meantime, debugging is possible using frame pointer walking.
 
@@ -74,10 +72,9 @@ pub(crate) unsafe extern "C" fn wasmtime_continuation_start() {
         mov rdi, 0
 
         jmp rsi
-        ",
-        fiber_start = sym super::fiber_start,
-    );
-}
+    ",
+    fiber_start = sym super::fiber_start,
+);
 
 #[test]
 fn test_return_payload() {

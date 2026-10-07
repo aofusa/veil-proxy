@@ -1,16 +1,13 @@
-use crate::component::Val;
+use crate::Uninhabited;
 use crate::component::func::{ComponentType, LiftContext, LowerContext};
+use crate::component::{Instance, Val};
 use crate::runtime::vm::VMStore;
 use anyhow::{Result, anyhow};
-use core::convert::Infallible;
 use core::future::Future;
 use core::marker::PhantomData;
 use core::pin::pin;
 use core::task::{Context, Poll, Waker};
 use wasmtime_environ::component::{InterfaceType, RuntimeComponentInstanceIndex};
-
-#[derive(Default)]
-pub struct ConcurrentState;
 
 fn should_have_failed_validation<T>(what: &str) -> Result<T> {
     // This should be unreachable; if we trap here, it indicates a
@@ -21,18 +18,17 @@ fn should_have_failed_validation<T>(what: &str) -> Result<T> {
     ))
 }
 
-pub(crate) fn check_blocking(_: &mut dyn VMStore) -> Result<()> {
-    Ok(())
-}
-
-pub(crate) fn poll_and_block<R: Send + Sync + 'static>(
-    _store: &mut dyn VMStore,
-    future: impl Future<Output = Result<R>> + Send + 'static,
-    _caller_instance: RuntimeComponentInstanceIndex,
-) -> Result<R> {
-    match pin!(future).poll(&mut Context::from_waker(Waker::noop())) {
-        Poll::Ready(result) => result,
-        Poll::Pending => should_have_failed_validation("async lowered import"),
+impl Instance {
+    pub(crate) fn poll_and_block<R: Send + Sync + 'static>(
+        self,
+        _store: &mut dyn VMStore,
+        future: impl Future<Output = Result<R>> + Send + 'static,
+        _caller_instance: RuntimeComponentInstanceIndex,
+    ) -> Result<R> {
+        match pin!(future).poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(result) => result,
+            Poll::Pending => should_have_failed_validation("async lowered import"),
+        }
     }
 }
 
@@ -60,7 +56,7 @@ pub(crate) fn lower_error_context_to_index<U>(
     should_have_failed_validation("use of `error-context`")
 }
 
-pub struct ErrorContext(Infallible);
+pub struct ErrorContext(Uninhabited);
 
 impl ErrorContext {
     pub(crate) fn into_val(self) -> Val {
@@ -85,7 +81,7 @@ impl ErrorContext {
 }
 
 pub struct StreamReader<P> {
-    uninhabited: Infallible,
+    uninhabited: Uninhabited,
     _phantom: PhantomData<P>,
 }
 
@@ -112,7 +108,7 @@ impl<P> StreamReader<P> {
 }
 
 pub struct FutureReader<P> {
-    uninhabited: Infallible,
+    uninhabited: Uninhabited,
     _phantom: PhantomData<P>,
 }
 

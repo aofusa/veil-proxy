@@ -9,7 +9,6 @@ use object::SectionFlags;
 use object::endian::Endianness;
 use object::read::{Object, ObjectSection, elf::ElfFile64};
 use wasmtime_environ::{Trap, lookup_trap_code, obj};
-use wasmtime_unwinder::ExceptionTable;
 
 /// Management of executable memory within a `MmapVec`
 ///
@@ -35,8 +34,6 @@ pub struct CodeMemory {
     wasm_data: Range<usize>,
     address_map_data: Range<usize>,
     stack_map_data: Range<usize>,
-    exception_data: Range<usize>,
-    frame_tables_data: Range<usize>,
     func_name_data: Range<usize>,
     info_data: Range<usize>,
     wasm_dwarf: Range<usize>,
@@ -122,8 +119,6 @@ impl CodeMemory {
         #[cfg(feature = "debug-builtins")]
         let mut has_native_debug_info = false;
         let mut trap_data = 0..0;
-        let mut exception_data = 0..0;
-        let mut frame_tables_data = 0..0;
         let mut wasm_data = 0..0;
         let mut address_map_data = 0..0;
         let mut stack_map_data = 0..0;
@@ -173,8 +168,6 @@ impl CodeMemory {
                 obj::ELF_WASMTIME_ADDRMAP => address_map_data = range,
                 obj::ELF_WASMTIME_STACK_MAP => stack_map_data = range,
                 obj::ELF_WASMTIME_TRAPS => trap_data = range,
-                obj::ELF_WASMTIME_EXCEPTIONS => exception_data = range,
-                obj::ELF_WASMTIME_FRAMES => frame_tables_data = range,
                 obj::ELF_NAME_DATA => func_name_data = range,
                 obj::ELF_WASMTIME_INFO => info_data = range,
                 obj::ELF_WASMTIME_DWARF => wasm_dwarf = range,
@@ -188,17 +181,6 @@ impl CodeMemory {
         // require mutability even when this is turned off
         #[cfg(not(has_host_compiler_backend))]
         let _ = &mut unwind;
-
-        // Ensure that the exception table is well-formed. This parser
-        // construction is cheap: it reads the header and validates
-        // ranges but nothing else. We do this only in debug-assertion
-        // builds because we otherwise require for safety that the
-        // compiled artifact is as-produced-by this version of
-        // Wasmtime, and we should always produce a correct exception
-        // table (i.e., we are not expecting untrusted data here).
-        if cfg!(debug_assertions) {
-            let _ = ExceptionTable::parse(&mmap[exception_data.clone()])?;
-        }
 
         Ok(Self {
             mmap,
@@ -218,8 +200,6 @@ impl CodeMemory {
             trap_data,
             address_map_data,
             stack_map_data,
-            exception_data,
-            frame_tables_data,
             func_name_data,
             wasm_dwarf,
             info_data,
@@ -273,18 +253,6 @@ impl CodeMemory {
     /// `wasmtime_environ::StackMap::lookup`.
     pub fn stack_map_data(&self) -> &[u8] {
         &self.mmap[self.stack_map_data.clone()]
-    }
-
-    /// Returns the encoded exception-tables section to pass to
-    /// `wasmtime_unwinder::ExceptionTable::parse`.
-    pub fn exception_tables(&self) -> &[u8] {
-        &self.mmap[self.exception_data.clone()]
-    }
-
-    /// Returns the encoded frame-tables section to pass to
-    /// `wasmtime_environ::FrameTable::parse`.
-    pub fn frame_tables(&self) -> &[u8] {
-        &self.mmap[self.frame_tables_data.clone()]
     }
 
     /// Returns the contents of the `ELF_WASMTIME_INFO` section, or an empty
@@ -351,10 +319,34 @@ impl CodeMemory {
                     if !self.mmap.supports_virtual_memory() {
                         bail!("this target requires virtual memory to be enabled");
                     }
-                    #[cfg(has_virtual_memory)]
-                    self.mmap
-                        .make_executable(self.text.clone(), self.enable_branch_protection)
-                        .context("unable to make memory executable")?;
+                    if !cfg!(feature = "std") {
+                        bail!(
+                            "with the `std` feature disabled at compile time \
+                             there must be a custom implementation of publishing \
+                             code memory"
+                        );
+                    }
+
+                    #[cfg(all(has_virtual_memory, feature = "std"))]
+                    {
+                        let text = self.text();
+
+                        use wasmtime_jit_icache_coherence as icache_coherence;
+
+                        // Clear the newly allocated code from cache if the processor requires it
+                        //
+                        // Do this before marking the memory as R+X, technically we should be able to do it after
+                        // but there are some CPU's that have had errata about doing this with read only memory.
+                        icache_coherence::clear_cache(text.as_ptr().cast(), text.len())
+                            .expect("Failed cache clear");
+
+                        self.mmap
+                            .make_executable(self.text.clone(), self.enable_branch_protection)
+                            .context("unable to make memory executable")?;
+
+                        // Flush any in-flight instructions from the pipeline
+                        icache_coherence::pipeline_flush_mt().expect("Failed pipeline flush");
+                    }
                 }
             }
 
@@ -430,7 +422,7 @@ impl CodeMemory {
         // and anything else necessary that is done in "create_gdbjit_image" right now.
         let image = self.mmap().to_vec();
         let text: &[u8] = self.text();
-        let bytes = crate::native_debug::create_gdbjit_image(image, (text.as_ptr(), text.len()))?;
+        let bytes = crate::debug::create_gdbjit_image(image, (text.as_ptr(), text.len()))?;
         let reg = crate::runtime::vm::GdbJitImageRegistration::register(bytes);
         self.debug_registration = Some(reg);
         Ok(())
@@ -440,23 +432,6 @@ impl CodeMemory {
     /// the trap code associated with that instruction, if there is one.
     pub fn lookup_trap_code(&self, text_offset: usize) -> Option<Trap> {
         lookup_trap_code(self.trap_data(), text_offset)
-    }
-
-    /// Get the raw address range of this CodeMemory.
-    pub(crate) fn raw_addr_range(&self) -> Range<usize> {
-        let start = self.text().as_ptr().addr();
-        let end = start + self.text().len();
-        start..end
-    }
-
-    /// Create a "deep clone": a separate CodeMemory for the same code
-    /// that can be patched or mutated independently. Also returns a
-    /// "metadata and location" handle that can be registered with the
-    /// global module registry and used for trap metadata lookups.
-    #[cfg(feature = "debug")]
-    pub(crate) fn deep_clone(self: &Arc<Self>, engine: &Engine) -> Result<CodeMemory> {
-        let mmap = self.mmap.deep_clone()?;
-        Self::new(engine, mmap)
     }
 }
 

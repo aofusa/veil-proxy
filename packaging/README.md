@@ -260,12 +260,12 @@ setup/provision まで確認済み。詳細・既知の不確実点は
 [`docs/backlog/features/F-140-netbsd-support.md`](../docs/backlog/features/F-140-netbsd-support.md)
 と [`tools/qemu/README.md`](../tools/qemu/README.md) を参照。
 
-> **NetBSD バイナリも Proxy-Wasm が使える（B-55 解消）**: crates.io wasmtime 40 の
+> **NetBSD バイナリも Proxy-Wasm が使える（B-55 解消）**: crates.io wasmtime（36 / 40 とも）の
 > シグナルベーストラップ実装（`signals.rs`）には NetBSD 向けの `ucontext` 分岐が
 > 一切無く、実機（NetBSD 10.1 amd64）で確認したところ **x86_64 ですら**
 > `compile_error!("unsupported platform")` でビルドできなかった（FreeBSD/OpenBSD は
 > aarch64 のみ非対応、NetBSD はアーキテクチャ不問で非対応）。これを解消するため
-> crates.io wasmtime 40.0.4 を `third_party/wasmtime`（パッケージ名のみ
+> crates.io wasmtime 36.0.17（LTS、B-79 で 40.0.4 から移行）を `third_party/wasmtime`（パッケージ名のみ
 > `veil-wasmtime`）として vendoring し、対象ターゲット（NetBSD 全アーキ・FreeBSD/
 > OpenBSD aarch64）だけ `build.rs` の `has_native_signals` を強制的に `false` にした
 > ものを Cargo のターゲット別依存で選択させ、常に Pulley インタープリタで実行する

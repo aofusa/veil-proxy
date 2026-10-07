@@ -214,7 +214,7 @@ VEIL_E2E_FEATURES="full,epoll" ./tests/e2e_setup.sh test           # reactor の
 | `docs/perf/` | 最新のベンチマーク結果 |
 | `docs/backlog/` | 機能・バグチケット（親は `backlog.md`） |
 | `docs/artifacts/` | AI 成果物・一時ファイル（git 管理外） |
-| `third_party/wasmtime/` | wasmtime 40.0.4 の vendoring（B-55） |
+| `third_party/wasmtime/` | wasmtime 36.0.17（LTS）の vendoring（B-55 / B-79） |
 | `third_party/quiche/` | quiche 0.24.9 の vendoring（F-172、STREAM フレーム coalescing） |
 | `docker/` | コンテナイメージ・Windows/macOS クロスビルド用 Dockerfile・共有アセット |
 | `packaging/` | 配布物のビルド（[packaging/README.md](packaging/README.md)） |

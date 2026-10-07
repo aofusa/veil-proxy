@@ -74,9 +74,10 @@ use log::warn;
 /// The [`Linker`] type is not compatible with usage between multiple [`Engine`]
 /// values. An [`Engine`] is provided when a [`Linker`] is created and only
 /// stores and items which originate from that [`Engine`] can be used with this
-/// [`Linker`]. If more than one [`Engine`] is used with a [`Linker`] then that
-/// may cause a panic at runtime, similar to how if a [`Func`] is used with the
-/// wrong [`Store`] that can also panic at runtime.
+/// [`Linker`]. Instantiating a [`Module`] from another [`Engine`] returns an
+/// error, and mixing engines in other ways may cause a panic at runtime,
+/// similar to how if a [`Func`] is used with the wrong [`Store`] that can also
+/// panic at runtime.
 ///
 /// [`Store`]: crate::Store
 /// [`Global`]: crate::Global
@@ -118,7 +119,13 @@ struct ImportKey {
 
 #[derive(Clone)]
 pub(crate) enum Definition {
-    Extern(Extern, DefinitionType),
+    Extern {
+        item: Extern,
+        ty: DefinitionType,
+        /// The engine of the store that `item` was taken from, which is the
+        /// engine that assigned any type indices within `ty`.
+        engine: Engine,
+    },
     HostFunc(Arc<HostFunc>),
 }
 
@@ -279,24 +286,26 @@ impl<T> Linker<T> {
     /// ```
     pub fn define_unknown_imports_as_default_values(
         &mut self,
-        mut store: impl AsContextMut<Data = T>,
+        store: &mut impl AsContextMut<Data = T>,
         module: &Module,
     ) -> anyhow::Result<()>
     where
         T: 'static,
     {
-        let mut store = store.as_context_mut();
         for import in module.imports() {
             if let Err(import_err) = self._get_by_import(&import) {
                 let default_extern =
-                    import_err.ty().default_value(&mut store).with_context(|| {
-                        anyhow!(
-                            "no default value exists for `{}::{}` with type `{:?}`",
-                            import.module(),
-                            import.name(),
-                            import_err.ty(),
-                        )
-                    })?;
+                    import_err
+                        .ty()
+                        .default_value(&mut *store)
+                        .with_context(|| {
+                            anyhow!(
+                                "no default value exists for `{}::{}` with type `{:?}`",
+                                import.module(),
+                                import.name(),
+                                import_err.ty(),
+                            )
+                        })?;
                 self.define(
                     store.as_context(),
                     import.module(),
@@ -993,7 +1002,7 @@ impl<T> Linker<T> {
         let dst = self.import_key(as_module, Some(as_name));
         match self.map.get(&src).cloned() {
             Some(item) => self.insert(dst, item)?,
-            None => bail!("no item named `{module}::{name}` defined"),
+            None => bail!("no item named `{}::{}` defined", module, name),
         }
         Ok(self)
     }
@@ -1036,7 +1045,7 @@ impl<T> Linker<T> {
                     Some(name) => format!("{module}::{name}"),
                     None => module.to_string(),
                 };
-                bail!("import of `{desc}` defined twice")
+                bail!("import of `{}` defined twice", desc)
             }
             Entry::Occupied(mut o) => {
                 o.insert(item);
@@ -1219,6 +1228,10 @@ impl<T> Linker<T> {
     where
         T: 'static,
     {
+        ensure!(
+            Engine::same(&self.engine, module.engine()),
+            "cross-`Engine` instantiation is not currently supported"
+        );
         let mut imports = module
             .imports()
             .map(|import| self._get_by_import(&import))
@@ -1228,7 +1241,7 @@ impl<T> Linker<T> {
                 import.update_size(store);
             }
         }
-        unsafe { InstancePre::new(module, imports) }
+        unsafe { InstancePre::new(&self.engine, module, imports) }
     }
 
     /// Returns an iterator over all items defined in this `Linker`, in
@@ -1342,7 +1355,7 @@ impl<T> Linker<T> {
             if let Extern::Func(func) = external {
                 return Ok(func);
             }
-            bail!("default export in '{module}' is not a function");
+            bail!("default export in '{}' is not a function", module);
         }
 
         // For compatibility, also recognize "_start".
@@ -1350,7 +1363,7 @@ impl<T> Linker<T> {
             if let Extern::Func(func) = external {
                 return Ok(func);
             }
-            bail!("`_start` in '{module}' is not a function");
+            bail!("`_start` in '{}' is not a function", module);
         }
 
         // Otherwise return a no-op function.
@@ -1367,13 +1380,26 @@ impl<T: 'static> Default for Linker<T> {
 impl Definition {
     fn new(store: &StoreOpaque, item: Extern) -> Definition {
         let ty = DefinitionType::from(store, &item);
-        Definition::Extern(item, ty)
+        Definition::Extern {
+            item,
+            ty,
+            engine: store.engine().clone(),
+        }
     }
 
     pub(crate) fn ty(&self) -> DefinitionType {
         match self {
-            Definition::Extern(_, ty) => ty.clone(),
+            Definition::Extern { ty, .. } => ty.clone(),
             Definition::HostFunc(func) => DefinitionType::Func(func.sig_index()),
+        }
+    }
+
+    /// The engine that assigned the type indices within this definition's
+    /// [`Definition::ty`].
+    pub(crate) fn engine(&self) -> &Engine {
+        match self {
+            Definition::Extern { engine, .. } => engine,
+            Definition::HostFunc(func) => func.engine(),
         }
     }
 
@@ -1386,7 +1412,7 @@ impl Definition {
     /// `HostFunc` matches the `T` on the store.
     pub(crate) unsafe fn to_extern(&self, store: &mut StoreOpaque) -> Extern {
         match self {
-            Definition::Extern(e, _) => e.clone(),
+            Definition::Extern { item, .. } => item.clone(),
             // SAFETY: the contract of this function is the same as what's
             // required of `to_func`, that `T` of the store matches the `T` of
             // this original definition.
@@ -1396,21 +1422,33 @@ impl Definition {
 
     pub(crate) fn comes_from_same_store(&self, store: &StoreOpaque) -> bool {
         match self {
-            Definition::Extern(e, _) => e.comes_from_same_store(store),
+            Definition::Extern { item, .. } => item.comes_from_same_store(store),
             Definition::HostFunc(_func) => true,
         }
     }
 
     fn update_size(&mut self, store: &StoreOpaque) {
         match self {
-            Definition::Extern(Extern::Memory(m), DefinitionType::Memory(_, size)) => {
+            Definition::Extern {
+                item: Extern::Memory(m),
+                ty: DefinitionType::Memory(_, size),
+                ..
+            } => {
                 *size = m.internal_size(store);
             }
-            Definition::Extern(Extern::SharedMemory(m), DefinitionType::Memory(_, size)) => {
+            Definition::Extern {
+                item: Extern::SharedMemory(m),
+                ty: DefinitionType::Memory(_, size),
+                ..
+            } => {
                 *size = m.size();
             }
-            Definition::Extern(Extern::Table(m), DefinitionType::Table(_, size)) => {
-                *size = m._size(store);
+            Definition::Extern {
+                item: Extern::Table(m),
+                ty: DefinitionType::Table(_, size),
+                ..
+            } => {
+                *size = m.internal_size(store);
             }
             _ => {}
         }
@@ -1421,7 +1459,9 @@ impl DefinitionType {
     pub(crate) fn from(store: &StoreOpaque, item: &Extern) -> DefinitionType {
         match item {
             Extern::Func(f) => DefinitionType::Func(f.type_index(store)),
-            Extern::Table(t) => DefinitionType::Table(*t.wasmtime_ty(store), t._size(store)),
+            Extern::Table(t) => {
+                DefinitionType::Table(*t.wasmtime_ty(store), t.internal_size(store))
+            }
             Extern::Global(t) => DefinitionType::Global(*t.wasmtime_ty(store)),
             Extern::Memory(t) => {
                 DefinitionType::Memory(*t.wasmtime_ty(store), t.internal_size(store))

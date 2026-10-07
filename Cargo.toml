@@ -1,6 +1,6 @@
 [workspace]
 members = [".", "fuzz"]
-# third_party/wasmtime は crates.io wasmtime 40.0.4 の vendoring（B-55、path 依存）で
+# third_party/wasmtime は crates.io wasmtime 36.0.17（LTS）の vendoring（B-55 / B-79、path 依存）で
 # あり、独立した crate ではあるがワークスペースメンバーではないため除外する
 # （メンバーに含めると `cargo test`/`cargo clippy --workspace` 等が第三者コードである
 # vendoring 先まで対象にしてしまう。詳細は third_party/wasmtime/README.veil.md）。
@@ -350,7 +350,7 @@ full-openbsd = [
 # （rustls=ring、quiche=boringssl-boring-crate）。
 # システムアロケータ（mimalloc/jemalloc とも無効化）を使う点も OpenBSD と同じ。
 #
-# **wasm を含む（B-55 解消）**。NetBSD は全アーキテクチャで crates.io wasmtime 40 の
+# **wasm を含む（B-55 解消）**。NetBSD は全アーキテクチャで crates.io wasmtime（36 / 40 とも）の
 # ビルドが通らない（`signals.rs` に NetBSD 向け ucontext 分岐が一切無く、x86_64 でも
 # `compile_error!("unsupported platform")` になる）が、FreeBSD/OpenBSD aarch64 と同様に
 # `third_party/wasmtime`（`veil-wasmtime`）＋ Pulley インタープリタ実行で解消した。
@@ -568,7 +568,7 @@ boring = "4.3"
 # Wasmtime: WebAssembly ランタイム (Proxy-Wasm v0.2.1) のターゲット別選択（B-55）
 # ====================
 # <BSD_NOSIG> = netbsd 全アーキ ∪ (openbsd, aarch64) ∪ (freebsd, aarch64)。
-# これらのターゲットは crates.io wasmtime 40 の signals.rs に ucontext 分岐が無く
+# これらのターゲットは crates.io wasmtime（36 / 40 とも）の signals.rs に ucontext 分岐が無く
 # `compile_error!("unsupported platform")` になるため third_party/wasmtime
 # （`veil-wasmtime`、Pulley 専用、詳細は third_party/wasmtime/README.veil.md）に切り替える。
 # 依存キーを分けているのは、同一キー `wasmtime` に対し crates.io と path の 2 つの
@@ -582,7 +582,7 @@ boring = "4.3"
 # - pulley: ポータブルバイトコードインタープリタ（`Config::target("pulleyNN")`）。
 #   `[wasm] interpreter = true`（F-135）・OpenBSD（B-52）・<BSD_NOSIG>（B-55）で常時使用。
 [target.'cfg(not(any(target_os = "netbsd", all(target_os = "openbsd", target_arch = "aarch64"), all(target_os = "freebsd", target_arch = "aarch64"))))'.dependencies]
-wasmtime = { version = "40.0.0", optional = true, features = ["pooling-allocator", "cranelift", "pulley"] }
+wasmtime = { version = "36.0.17", optional = true, features = ["pooling-allocator", "cranelift", "pulley"] }
 
 [target.'cfg(any(target_os = "netbsd", all(target_os = "openbsd", target_arch = "aarch64"), all(target_os = "freebsd", target_arch = "aarch64")))'.dependencies]
 veil-wasmtime = { path = "third_party/wasmtime", optional = true, features = ["pooling-allocator", "cranelift", "pulley"] }
@@ -756,7 +756,7 @@ required-features = ["wasm"]
 # 入れてはならない（重複シンボルでリンクが壊れる）。
 [target.'cfg(target_os = "linux")'.dependencies]
 quiche = { version = "0.24.9", default-features = false, optional = true }
-aws-lc-sys = { version = "0.41", features = ["ssl", "bindgen"] }
+aws-lc-sys = { version = "0.45", features = ["ssl", "bindgen"] }
 
 # FreeBSD は capsicum capability mode 下でも証明書ホットリロードが
 # 動作する in-memory SSL_CTX API（`Config::with_boring_ssl_ctx_builder`、F-136）が
