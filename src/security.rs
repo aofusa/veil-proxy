@@ -263,7 +263,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     16,  // ioctl (ソケット、kTLS 設定)
     39,  // getpid
     63,  // uname (カーネルバージョン検出)
-    147, // prctl (PR_SET_NAME、seccomp)
+    157, // prctl (PR_SET_NAME、seccomp)。B-103: 以前は 147（sched_get_priority_min）を書いていた
     158, // arch_prctl
     302, // prlimit64
     318, // getrandom (TLS 乱数生成)
@@ -405,7 +405,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     16,  // ioctl (ソケット、kTLS 設定)
     39,  // getpid
     63,  // uname (カーネルバージョン検出)
-    147, // prctl (PR_SET_NAME、seccomp)
+    157, // prctl (PR_SET_NAME、seccomp)。B-103: 以前は 147（sched_get_priority_min）を書いていた
     158, // arch_prctl
     302, // prlimit64
     318, // getrandom (TLS 乱数生成)
@@ -490,7 +490,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     215, // munmap
     222, // mmap
     226, // mprotect
-    227, // mremap
+    216, // mremap。B-103: 以前は 227（msync）を書いていた
     233, // madvise
     228, // mlock
     229, // munlock
@@ -521,10 +521,10 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     // ============================================
     // ユーザー・権限管理
     // ============================================
-    146, // setresuid
-    147, // getresuid
-    148, // setresgid
-    149, // getresgid
+    147, // setresuid（B-103: 以前は 146〜149 と 1 つずれており、setuid を許可し getresgid を拒否していた）
+    148, // getresuid
+    149, // setresgid
+    150, // getresgid
     172, // getpid
     173, // getppid
     174, // getuid
@@ -543,8 +543,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     // ============================================
     25,  // fcntl
     29,  // ioctl
-    63,  // uname
-    160, // uname (alias)
+    160, // uname（B-103: 以前は 63 = read を uname として重複記載していた）
     167, // prctl
     261, // prlimit64
     278, // getrandom
@@ -624,7 +623,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     215, // munmap
     222, // mmap
     226, // mprotect
-    227, // mremap
+    216, // mremap。B-103: 以前は 227（msync）を書いていた
     233, // madvise
     228, // mlock
     229, // munlock
@@ -655,10 +654,10 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     // ============================================
     // ユーザー・権限管理
     // ============================================
-    146, // setresuid
-    147, // getresuid
-    148, // setresgid
-    149, // getresgid
+    147, // setresuid（B-103: 以前は 146〜149 と 1 つずれており、setuid を許可し getresgid を拒否していた）
+    148, // getresuid
+    149, // setresgid
+    150, // getresgid
     172, // getpid
     173, // getppid
     174, // getuid
@@ -677,8 +676,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     // ============================================
     25,  // fcntl
     29,  // ioctl
-    63,  // uname
-    160, // uname (alias)
+    160, // uname（B-103: 以前は 63 = read を uname として重複記載していた）
     167, // prctl
     261, // prlimit64
     278, // getrandom
@@ -3792,6 +3790,37 @@ mod tests {
         assert!(!ALLOWED_SYSCALLS.contains(&427)); // io_uring_register
                                                    // eventfd2 は offload 用に両バックエンド共通で許可される。
         assert!(ALLOWED_SYSCALLS.contains(&290));
+    }
+
+    /// B-103: 許可リストは番号の手書きなので、コメントと番号がずれても気づけない
+    /// （x86_64 の prctl を 147 = sched_get_priority_min と書いていた）。
+    /// 実際に使う syscall を `libc::SYS_*`（アーキごとの正しい番号）で引いて確認する。
+    #[test]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn test_allowed_syscalls_match_libc_numbers() {
+        // 権限降格（set*id）は seccomp 適用より前に終わるのでここでは要求しない。
+        let required: &[(&str, libc::c_long)] = &[
+            ("read", libc::SYS_read),
+            ("write", libc::SYS_write),
+            ("prctl", libc::SYS_prctl),
+            ("mremap", libc::SYS_mremap),
+            ("uname", libc::SYS_uname),
+            ("getrandom", libc::SYS_getrandom),
+            ("prlimit64", libc::SYS_prlimit64),
+            ("rt_sigreturn", libc::SYS_rt_sigreturn),
+            ("futex", libc::SYS_futex),
+            ("openat2", libc::SYS_openat2),
+            ("eventfd2", libc::SYS_eventfd2),
+        ];
+        for (name, nr) in required {
+            assert!(
+                ALLOWED_SYSCALLS.contains(&(*nr as i64)),
+                "{name} ({nr}) が seccomp 許可リストに無い"
+            );
+        }
     }
 
     // ALLOWED_SYSCALLS は Linux syscall 番号表のため、参照するテストは Linux 限定
