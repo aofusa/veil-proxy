@@ -3802,7 +3802,7 @@ mod tests {
     ))]
     fn test_allowed_syscalls_match_libc_numbers() {
         // 権限降格（set*id）は seccomp 適用より前に終わるのでここでは要求しない。
-        let required: &[(&str, libc::c_long)] = &[
+        let required: &[(&str, i64)] = &[
             ("read", libc::SYS_read),
             ("write", libc::SYS_write),
             ("prctl", libc::SYS_prctl),
@@ -3817,7 +3817,7 @@ mod tests {
         ];
         for (name, nr) in required {
             assert!(
-                ALLOWED_SYSCALLS.contains(&(*nr as i64)),
+                ALLOWED_SYSCALLS.contains(nr),
                 "{name} ({nr}) が seccomp 許可リストに無い"
             );
         }
