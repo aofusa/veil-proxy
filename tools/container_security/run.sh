@@ -97,7 +97,13 @@ run_trivy_scan() {
     # 集計（lib/report.sh）は「レポートに ': ok' があるか」で成否を判定するため、
     # 判定行を必ず書き出す。これが無いと **脆弱性ゼロでも failed に分類される**。
     # Trivy は `--exit-code 0` で常に 0 を返す運用なので、検出有無は本文から判定する。
-    if grep -qE '^(Total: 0|.*│[[:space:]]*0[[:space:]]*│)' "${report}" 2>/dev/null \
+    if grep -q 'Supported files for scanner(s) not found' "${report}" 2>/dev/null; then
+        # musl の静的バイナリイメージには OS パッケージ DB も言語マニフェストも無く、
+        # Trivy は何も走査しない（表は「-: Not scanned」）。脆弱性があったわけではないので
+        # failed にしない。Rust 依存の勧告は cargo_audit / cargo_deny が見る。
+        echo "trivy: skipped (nothing to scan in ${VEIL_IMAGE}; Rust dependencies are covered by cargo_audit)" \
+            | tee -a "${report}"
+    elif grep -qE '^(Total: 0|.*│[[:space:]]*0[[:space:]]*│)' "${report}" 2>/dev/null \
         || grep -q 'No vulnerabilities found' "${report}" 2>/dev/null; then
         echo "trivy: ok (0 ${TRIVY_SEVERITY} vulnerabilities)" | tee -a "${report}"
     else
