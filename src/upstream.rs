@@ -1449,11 +1449,26 @@ mod tests {
         assert!(result, "listening port should return true");
     }
 
+    /// モックサーバの応答 → 正常クローズ。
+    ///
+    /// 未読の受信データを残したまま close すると、Windows は FIN ではなく RST を送り、
+    /// クライアントがまだ読んでいない応答まで捨てられることがある（負荷時にだけ
+    /// `test_perform_grpc_health_check_success` が落ちた）。送信側を閉じてから
+    /// 相手の close まで読み捨てる。
+    fn reply_and_close_gracefully(mut conn: std::net::TcpStream, response: &[u8]) {
+        use std::io::{Read, Write};
+        let _ = conn.write_all(response);
+        let _ = conn.shutdown(std::net::Shutdown::Write);
+        let _ = conn.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut sink = [0u8; 512];
+        while matches!(conn.read(&mut sink), Ok(n) if n > 0) {}
+    }
+
     #[test]
     fn test_perform_grpc_health_check_success() {
         // gRPC ヘルスチェックに対して SERVING を返すモックサーバー
         // H2C 試行 + H1 フォールバックで最大 2 接続を受け付ける
-        use std::io::{Read, Write};
+        use std::io::Read;
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1467,7 +1482,7 @@ mod tests {
                     let _ = conn.read(&mut buf);
                     // H2C preface には HTTP/1.1 応答（無視されて H1 フォールバック）
                     let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/grpc\r\ngrpc-status: 0\r\n\r\n";
-                    let _ = conn.write_all(response);
+                    reply_and_close_gracefully(conn, response);
                 } else {
                     break;
                 }
@@ -1485,7 +1500,7 @@ mod tests {
     #[test]
     fn test_perform_grpc_health_check_not_serving() {
         // gRPC ヘルスチェックに対して NOT_SERVING を返すモックサーバー
-        use std::io::{Read, Write};
+        use std::io::Read;
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1498,7 +1513,7 @@ mod tests {
                     let _ = conn.read(&mut buf);
                     let response =
                         b"HTTP/1.1 200 OK\r\nContent-Type: application/grpc\r\ngrpc-status: 2\r\n\r\n";
-                    let _ = conn.write_all(response);
+                    reply_and_close_gracefully(conn, response);
                 } else {
                     break;
                 }
