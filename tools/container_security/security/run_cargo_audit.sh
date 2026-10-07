@@ -26,5 +26,6 @@ docker run --rm \
             cargo install cargo-audit --locked --quiet
         fi
         timeout 300 cargo audit --color never 2>&1 | tee /results/cargo_audit_report.txt
-        echo "cargo_audit: ok"
+        # 判定マーカーはレポートファイルへ書く（lib/report.sh がファイルを grep する）。
+        echo "cargo_audit: ok" | tee -a /results/cargo_audit_report.txt
     '

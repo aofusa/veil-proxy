@@ -37,12 +37,17 @@ echo "testssl start target=${TARGET}" | tee "${REPORT}"
 
 docker pull "${TESTSSL_IMAGE}" >/dev/null 2>&1 || true
 
-if docker run --rm \
+docker run --rm \
     --network "${NET_NAME}" \
     -v "${RESULTS_DIR}:/results:rw" \
     "${TESTSSL_IMAGE}" \
-    --warnings off -p --openssl-timeout 5 "${TARGET}" \
-    2>&1 | tee -a "${REPORT}" | grep -qiE 'TLS1_2|TLS1_3'; then
+    --warnings off --color 0 -p --openssl-timeout 5 "${TARGET}" \
+    2>&1 | tee -a "${REPORT}" >/dev/null || true
+
+# testssl の出力は「 TLS 1.2    offered (OK)」形式（以前は TLS1_2 を grep していて一度も ok に
+# ならなかった）。TLS 1.2 / 1.3 のどちらかを提供し、SSLv2/SSLv3/TLS 1.0/1.1 を提供しないこと。
+if grep -qE '^ *TLS 1\.[23] +offered' "${REPORT}" \
+    && ! grep -qE '^ *(SSLv2|SSLv3|TLS 1|TLS 1\.1) +offered' "${REPORT}"; then
     echo "testssl: ok" | tee -a "${REPORT}"
 else
     echo "testssl: completed with review recommended" | tee -a "${REPORT}"
